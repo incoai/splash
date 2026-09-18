@@ -1,4 +1,5 @@
 #include "model/Runtime.hpp"
+#include "model/KvPageTier.hpp"
 #include "model/QwenState.hpp"
 #include "model/QwenTarget.hpp"
 #include "model/RuntimeArenas.hpp"
@@ -102,6 +103,18 @@ private:
   std::optional<std::vector<ModelStepResult>> results_;
   double wallMilliseconds_ = 0.0;
 };
+
+// Wakes the engine and, when the command carried KV copies, reports the
+// batch they rode on.
+metal::CommandCompletion commandNotify(KvPageTier *tier, uint64_t transfers,
+                                       std::function<void()> completion) {
+  return [tier, transfers, completion = std::move(completion)](uint64_t) {
+    if (transfers)
+      tier->commandCompleted(transfers);
+    if (completion)
+      completion();
+  };
+}
 
 using kv::Q8ChunkedPrefillParams;
 
@@ -247,6 +260,7 @@ struct Runtime::Impl {
   const ops::ExecutionPlans &operators;
   kv::PageStorage &kvPages;
   QwenStateStorage &states;
+  KvPageTier *kvTier;
   std::unique_ptr<PrefillArena> prefillArena;
   std::unique_ptr<DecodeArena> decodeArena;
   std::unordered_map<uint64_t, Request> requests;
@@ -282,6 +296,7 @@ struct Runtime::Impl {
         operators(value.operators),
         kvPages(value.kvPages),
         states(requireQwenStateStorage(value.stateStorage)),
+        kvTier(value.kvTier),
         maximumImagePatches(value.maximumImagePatches),
         pipelineReserveBytes(value.pipelineReserveBytes),
         runtimeOverheadReserveBytes(value.runtimeOverheadReserveBytes),
@@ -1918,6 +1933,25 @@ void Runtime::restore(uint64_t requestId, uint32_t restoredPrefixLength,
         "reusable Qwen prefix must leave an input token to replay");
   }
   impl_->states.restore(entry.slot, *restoredState, restoreDraftState);
+  finishRestore(requestId, restoredPrefixLength, restoreDraftState);
+}
+
+std::unique_ptr<StateRestore> Runtime::beginRestore(
+    uint64_t requestId, uint32_t boundary,
+    std::shared_ptr<const CompositeState> state, bool restoreDraft,
+    std::function<void()> completion) {
+  Impl::Request &entry = impl_->request(requestId);
+  if (!entry.resident || !state || boundary >= entry.promptTokens)
+    throw std::invalid_argument("invalid state restore");
+  return impl_->states.beginRestore(entry.slot, *state, restoreDraft,
+      std::move(completion), [this, requestId, boundary, restoreDraft] {
+        finishRestore(requestId, boundary, restoreDraft);
+      });
+}
+
+void Runtime::finishRestore(uint64_t requestId, uint32_t restoredPrefixLength,
+                            bool restoreDraftState) {
+  Impl::Request &entry = impl_->request(requestId);
   if (!restoreDraftState)
     ++impl_->counters.draftStateRestoreSkipped;
   const QwenLogicalLengths &lengths =
@@ -1998,12 +2032,10 @@ Runtime::prefillAsync(const BatchPlan &plan,
                            });
       });
   std::vector<ModelBatchItem> copiedItems(items.begin(), items.end());
-  auto notify = [completion = std::move(completion)](uint64_t) {
-    if (completion)
-      completion();
-  };
-  CommandTicket command =
-      impl_->backend.submitCommandAsync(graph.dispatches(), std::move(notify));
+  const uint64_t transfers = impl_->kvTier ? impl_->kvTier->encode(graph) : 0;
+  CommandTicket command = impl_->backend.submitCommandAsync(
+      graph.dispatches(),
+      commandNotify(impl_->kvTier, transfers, std::move(completion)));
   Impl *impl = impl_.get();
   auto finish = [impl, entries,
                  items = std::move(copiedItems)](CommandTiming timing) mutable {
@@ -2299,17 +2331,32 @@ Runtime::decodeAsync(const BatchPlan &plan,
                                               priorTiming.wallSeconds * 1000.0);
   }
 
-  auto notify = [completion = std::move(completion)](uint64_t) {
-    if (completion)
-      completion();
-  };
+  const uint64_t transfers =
+      impl_->kvTier ? impl_->kvTier->encode(commandGraph) : 0;
   CommandTicket command = impl_->backend.submitCommandAsync(
-      commandGraph.dispatches(), std::move(notify));
+      commandGraph.dispatches(),
+      commandNotify(impl_->kvTier, transfers, std::move(completion)));
   return std::make_unique<DeferredMetalTicket>(
       std::move(command), std::move(finish), priorTiming.wallSeconds * 1000.0);
 }
 
-std::shared_ptr<const CompositeState> Runtime::snapshot(uint64_t requestId) {
+KvTier *Runtime::kvTier() noexcept { return impl_->kvTier; }
+
+std::unique_ptr<ModelBatchTicket>
+Runtime::submitTransfers(std::function<void()> completion) {
+  if (!impl_->kvTier || !impl_->kvTier->copiesQueued())
+    return nullptr;
+  CommandGraph graph;
+  const uint64_t transfers = impl_->kvTier->encode(graph);
+  CommandTicket command = impl_->backend.submitCommandAsync(
+      graph.dispatches(),
+      commandNotify(impl_->kvTier, transfers, std::move(completion)));
+  return std::make_unique<DeferredMetalTicket>(
+      std::move(command),
+      [](CommandTiming) { return std::vector<ModelStepResult>{}; });
+}
+
+uint32_t Runtime::committedStateSlot(uint64_t requestId) {
   Impl::Request &entry = impl_->request(requestId);
   if (!entry.resident)
     throw std::logic_error("request is not resident");
@@ -2318,7 +2365,20 @@ std::shared_ptr<const CompositeState> Runtime::snapshot(uint64_t requestId) {
       metadata.lengths.targetTokens % kv::kPageTokens) {
     throw std::logic_error("cannot snapshot uncommitted draft state");
   }
-  return impl_->states.snapshot(entry.slot);
+  return entry.slot;
+}
+
+std::shared_ptr<const CompositeState> Runtime::snapshot(uint64_t requestId) {
+  return impl_->states.snapshot(committedStateSlot(requestId));
+}
+
+bool Runtime::canSnapshotToDisk() const noexcept {
+  return impl_->states.canSnapshotToDisk();
+}
+
+std::unique_ptr<StateOffload>
+Runtime::snapshotToDisk(uint64_t requestId, std::function<void()> completion) {
+  return impl_->states.snapshotToDisk(committedStateSlot(requestId), std::move(completion));
 }
 
 uint64_t Runtime::reclaimIdleState() noexcept {
@@ -2737,10 +2797,10 @@ ModelMemoryPlan plannedRuntimeMemory(const DeviceCapabilities &device,
 std::unique_ptr<StateStorage>
 createStateStorage(metal::MetalBackend &backend,
                    metal::AllocationAdmission admitAllocation,
-                   const ModelPackage &package) {
+                   const ModelPackage &package, std::shared_ptr<SlotFile> file) {
   requireCompatibleModelPackage(package);
   return std::make_unique<QwenStateStorage>(
-      backend, std::move(admitAllocation), package.stateLayout());
+      backend, std::move(admitAllocation), package.stateLayout(), std::move(file));
 }
 
 std::unique_ptr<RuntimeModel> createRuntime(RuntimeContext context) {

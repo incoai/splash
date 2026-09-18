@@ -443,6 +443,8 @@ void NativeRuntime::requestError(uint64_t requestId, std::string code,
 }
 
 void NativeRuntime::engineError(std::string code, std::string message) {
+  if (engineFailure_.empty())
+    engineFailure_ = code + ": " + message;
   send(protocol::ErrorEvent{protocol::FailureClass::EngineUnhealthy, 0, false,
                             std::move(code), std::move(message)});
   engineHealthy_ = false;

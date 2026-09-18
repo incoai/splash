@@ -689,6 +689,63 @@ memory is still short, and at most for the 30 s resource wait; suspended
 requests then resume first, each within its own resource wait. Readiness does
 not guarantee that a request-sized allocation fits.
 
+### Disk cache
+
+`--max-cache-disk` adds an optional SSD tier for cached request states (GDN cell
+plus draft ring) and KV pages. Default: `0` (off). RAM and disk copies share the
+same block tree and recency order. Restoring a prefix keeps its disk copy, so
+its next eviction needs no write while that copy remains cached.
+
+Writes happen when RAM reclamation selects a victim. States copy through one
+host staging buffer, freeing their RAM immediately. KV leaves needed by a state
+or a disk child copy through a 128-page staging ring and are released after the
+write succeeds. Unneeded tails are dropped without writing. When staging is
+busy, admission waits for the transfer instead of evicting additional victims.
+Demotions may occupy half the ring and restores three quarters, leaving room
+for the other direction. Copies ride Metal commands, including a copy-only
+command when inference is idle.
+
+A state with no available RAM cache slot can be written directly from its lane.
+Rolling checkpoints use free disk quota only and retire when replaced or no
+longer needed. With the disk tier enabled, a checkpoint less than one full
+prefill chunk (2048 tokens) before the final replay boundary is captured only
+if a RAM slot is available without reclamation. Otherwise its predecessor stays
+usable for cancellation recovery; the final reusable state still uses the disk
+tier. Matched KV restores start from the root toward the selected
+state, with the state read alongside. Cancellation drops unsubmitted, unshared
+reads; submitted transfers drain before their buffers can be reused. Restored
+states remain usable even when there is no room to promote them into RAM cache.
+
+Two unlinked temporary files share one quota for live slots. A full quota
+replaces the oldest redundant copy first, then the oldest sole copy, across
+both KV and states. A quota smaller than the working set can cause repeated
+reads and writes; it is not a write-rate limit. Each file retains its allocated
+high-water mark until shutdown, so filesystem space can exceed the live-slot
+quota. Closing the server releases both files.
+
+Transfers use `pread`/`pwrite` with `F_NOCACHE`. The KV staging ring, 128
+pages that the GPU copies through, is Metal memory within `--max-memory`: about
+42 MiB for 35B and 130 MiB for 27B with INT8 KV, 80 MiB and 256 MiB with BF16 KV.
+The state staging buffer, one state (109 MiB for 35B, 187 MiB for 27B), is host
+memory outside `--max-memory`.
+A quota too small for one state leaves the tier disabled.
+A failed write disables further writes to that file. Failed KV writes retain
+RAM pages; failed state writes invalidate the disk copy. A failed read
+invalidates its cached data, allowing lookup to fall back to the surviving
+prefix.
+
+`/status` reports the shared quota and KV transfers under `disk`. Its cumulative
+`read_bytes` and `written_bytes` count bytes transferred by file IO across KV
+and state files, including partial or cancelled transfers. They exclude
+filesystem metadata and physical SSD write amplification. State transfers appear
+under `state` (`disk_bytes`, `offloads`, `disk_hits`, `disk_promotions`). Cache
+counters include:
+
+- `kv_disk_hit_tokens`: tokens restored by completed KV transfers. Shared
+  transfers count once, including those completed before cancellation or a
+  resource retry.
+- `lost_state_misses`: lookups that matched KV where a reusable state used to be.
+
 ### Judgment contracts
 
 `POST /v1/systemone` accepts the [TypeSafe System One](https://docs.typesafe.ai/)

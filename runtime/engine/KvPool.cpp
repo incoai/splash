@@ -140,6 +140,8 @@ uint32_t KvPool::freePageCount() const noexcept {
   return freeResidentPages_ + freeUnbacked_.count;
 }
 
+uint32_t KvPool::freeResidentPageCount() const noexcept { return freeResidentPages_; }
+
 uint32_t KvPool::activeReferences(uint32_t page) const {
   return pages_.at(page).activeReferences;
 }

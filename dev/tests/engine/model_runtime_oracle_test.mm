@@ -891,7 +891,7 @@ int main(int argc, char **argv) {
                                     admission,
                                     model.stateLayout());
     model::RuntimeContext context{
-        backend, admission, model, pages, states, operators,
+        backend, admission, model, pages, states, nullptr, operators,
         ops::kMaximumImagePatches, budget.pipelineReserveBytes,
         budget.runtimeOverheadReserveBytes};
     require(executorPlan.sharedDecodePlannedAllocatedBytes <=

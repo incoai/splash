@@ -242,8 +242,8 @@ int main(int argc, char **argv) {
                                       governor.allocationAdmission(),
                                       model.stateLayout());
       model::RuntimeContext context{
-          backend, governor.allocationAdmission(), model, pages, states, operators,
-          ops::kMaximumImagePatches, executorPlan.pipelineReserveBytes,
+          backend, governor.allocationAdmission(), model, pages, states, nullptr,
+          operators, ops::kMaximumImagePatches, executorPlan.pipelineReserveBytes,
           executorPlan.runtimeOverheadReserveBytes};
       model::Runtime executor(context);
 

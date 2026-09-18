@@ -1816,6 +1816,15 @@ def _parse_max_context(value):
     return parsed
 
 
+def _parse_max_cache_disk(value):
+    if value.strip() == "0":
+        return 0
+    result = _parse_max_memory(value)
+    if result is None:
+        raise argparse.ArgumentTypeError("use 0 to disable, or a size such as 5G")
+    return result
+
+
 def _parse_max_memory(value):
     if value == "auto":
         return None
@@ -1911,6 +1920,13 @@ def parse_args(argv=None):
         help="maximum HTTP request body size (default: 128M); "
         "shared input budget is max(512M, twice this limit)",
     )
+    parser.add_argument(
+        "--max-cache-disk",
+        "--max-state-disk",
+        dest="max_cache_disk",
+        type=_parse_max_cache_disk,
+        default=0,
+    )
     parser.add_argument("--max-image-pixels", type=int, default=image_input.MAX_PIXELS)
     parser.add_argument("--max-new-tokens", type=int, default=32768)
     parser.add_argument("--request-timeout", type=float, default=1800)
@@ -1959,6 +1975,8 @@ def _native_command(args):
         "auto" if args.max_context is None else str(args.max_context),
         "auto" if args.max_memory is None else str(args.max_memory),
     ]
+    if args.max_cache_disk:
+        command.append(str(args.max_cache_disk))
     if args.kv_format != "int8":
         command.extend(("--kv-format", args.kv_format))
     return command

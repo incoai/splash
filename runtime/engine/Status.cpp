@@ -178,18 +178,43 @@ std::string runtimeStatusJson(
       << ",\"checkpoint_entries\":" << state.checkpointEntries
       << ",\"checkpoint_bytes\":" << state.checkpointBytes
       << ",\"checkpoint_evictions\":" << state.checkpointEvictions
-      << ",\"checkpoint_retirements\":" << state.checkpointRetirements << "}"
+      << ",\"checkpoint_retirements\":" << state.checkpointRetirements
+      << ",\"disk_hits\":" << state.diskHits
+      << ",\"disk_promotions\":" << state.promotions
+      << ",\"disk_promotions_skipped\":" << state.promotionsSkipped
+      << ",\"disk_bytes\":" << state.diskBytes
+      << ",\"offloads\":" << state.offloads
+      << ",\"offload_failures\":" << state.offloadFailures
+      << ",\"invalidations\":" << state.invalidations
+      << "}"
+      << ",\"disk\":{\"capacity_bytes\":" << resources.kvTier.capacityBytes
+      << ",\"used_bytes\":" << resources.kvTier.usedBytes
+      << ",\"read_bytes\":" << resources.kvTier.readBytes
+      << ",\"written_bytes\":" << resources.kvTier.writtenBytes
+      << ",\"kv_blocks\":" << resources.kvTier.diskBlocks
+      << ",\"kv_bytes\":" << resources.kvTier.diskBytes
+      << ",\"kv_demotions\":" << resources.kvTier.demotions
+      << ",\"kv_demotion_failures\":" << resources.kvTier.demotionFailures
+      << ",\"kv_demotions_refused\":" << resources.kvTier.demotionsRefused
+      << ",\"kv_restores\":" << resources.kvTier.restores
+      << ",\"kv_restore_failures\":" << resources.kvTier.restoreFailures
+      << ",\"kv_pending_pages\":" << resources.kvTier.pendingPages
+      << ",\"state_bytes\":" << state.diskBytes
+      << "}"
       << ",\"cache\":{\"lookups\":" << lookup.lookups
       << ",\"hits\":" << core.cacheHits
       << ",\"cold_misses\":" << core.coldMisses << ",\"hit_rate\":" << hitRate
       << ",\"kv_hit_tokens\":" << lookup.kvHitTokens
+      << ",\"kv_disk_hit_tokens\":" << resources.kvTier.restores * kv::kPageTokens
       << ",\"state_hit_tokens\":" << lookup.stateHitTokens
+      << ",\"lost_state_misses\":" << lookup.lostStateMisses
       << ",\"reused_tokens\":" << core.reusedTokens
       << ",\"replay_state_publications\":" << core.replayStatePublications
       << ",\"deduplicated_state_publications\":"
       << core.deduplicatedStatePublications
       << ",\"recycled_state_publications\":"
       << core.recycledStatePublications
+      << ",\"disk_state_publications\":" << core.diskStatePublications
       << ",\"replay_state_publication_failures\":"
       << core.replayStatePublicationFailures
       << ",\"lazy_junctions\":" << lookup.lazyJunctions

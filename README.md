@@ -145,6 +145,7 @@ that a long uncached prompt will reach its first token quickly.
 - `--port`: HTTP port. Defaults to `SPLASH_PORT` or `8000`.
 - `--max-memory`: ceiling on Metal allocations, e.g. `28G`. Default: auto.
 - `--max-context`: context limit, up to `256K`, e.g. `100K`. Default: auto.
+- `--max-cache-disk`: SSD tier for the cache, e.g. `5G`. Default: 0 (off).
 - `--kv-format`: target KV cache storage, `int8` (default) or `bf16`.
 - `--max-image-pixels`: maximum resized pixels per image. Default: 4,194,304.
 - `--allowed-host`: extra HTTP `Host` name to accept, such as `mymac.local`;
@@ -167,14 +168,17 @@ Restart the server to switch formats. Omit `--kv-format` or use
 If the model does not fit in the memory available, startup prints a memory
 budget breakdown and stops.
 
+`--max-cache-disk` works with either KV format and preserves its stored bytes
+without further quantization. Disk cache is temporary and does not survive a
+server restart. For disk cache behavior and memory overhead, see
+[disk cache](DEVELOPMENT.md#disk-cache).
+
 Authentication is off by default. Set `SPLASH_API_KEY` in the shell that runs
 `splash serve` and in the shell that runs an agent, and both sides use it.
 Health and readiness probes stay public.
 
 For LAN access and multiple servers, see
 [server configuration](DEVELOPMENT.md#server-configuration).
-
-Experimental cache offloading: [PR #3](https://github.com/incoai/splash/pull/3).
 
 ## Performance
 

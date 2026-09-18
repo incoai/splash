@@ -230,6 +230,8 @@ def serve(args):
             )
         if args.max_request_size is not None:
             command.extend(["--max-request-size", str(args.max_request_size)])
+        if args.max_cache_disk:
+            command.extend(["--max-cache-disk", str(args.max_cache_disk)])
         if args.max_image_pixels is not None:
             command.extend(["--max-image-pixels", str(args.max_image_pixels)])
         if args.no_webui:
@@ -314,6 +316,15 @@ def _parse_port(value):
     if not 1 <= port <= 65535:
         raise argparse.ArgumentTypeError("port must be between 1 and 65535")
     return port
+
+
+def _parse_max_cache_disk(value):
+    if value.strip() == "0":
+        return 0
+    result = _parse_max_memory(value)
+    if result is None:
+        raise argparse.ArgumentTypeError("use 0 to disable, or a size such as 5G")
+    return result
 
 
 def _parse_max_memory(value):
@@ -487,6 +498,14 @@ def parse_args(argv=None):
         "--max-memory",
         type=_parse_max_memory,
         help="Metal budget ceiling, e.g. 28G (default: auto)",
+    )
+    server.add_argument(
+        "--max-cache-disk",
+        "--max-state-disk",
+        dest="max_cache_disk",
+        type=_parse_max_cache_disk,
+        default=0,
+        help="SSD quota for cached KV pages and states, e.g. 5G (default: 0, disabled)",
     )
     server.add_argument(
         "--max-context",

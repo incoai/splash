@@ -110,6 +110,8 @@ class RealServer:
             command.extend(("--max-context", str(arguments.max_context)))
         if arguments.max_memory is not None:
             command.extend(("--max-memory", arguments.max_memory))
+        if arguments.max_cache_disk is not None:
+            command.extend(("--max-cache-disk", arguments.max_cache_disk))
         command.extend(("--kv-format", arguments.kv_format))
         self.process = subprocess.Popen(
             command,
@@ -1281,7 +1283,10 @@ def run_judgments(port: int, model: str, nonce: str) -> None:
         timeout=300,
     )
     elapsed = time.monotonic() - started
-    require(code == 504, f"expected a scoring timeout, got HTTP {code}: {timed_out!r}")
+    require(
+        code == 504 and timed_out.get("error", {}).get("code") == "request_timeout",
+        f"expected a scoring timeout, got HTTP {code}: {timed_out!r}",
+    )
     require(
         elapsed < forward,
         f"the deadline did not cut prefill short: {elapsed:.2f}s of {forward:.2f}s",
@@ -1316,6 +1321,7 @@ def add_server_arguments(parser):
     parser.add_argument("--model", type=model_artifacts.parse_model_id, required=True)
     parser.add_argument("--max-context", type=int)
     parser.add_argument("--max-memory")
+    parser.add_argument("--max-cache-disk")
     parser.add_argument("--kv-format", choices=("int8", "bf16"), default="int8")
     parser.add_argument("--startup-timeout", type=float, default=1800)
 

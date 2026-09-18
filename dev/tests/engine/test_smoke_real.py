@@ -140,6 +140,7 @@ class SmokeRealTests(unittest.TestCase):
                         model="test-model",
                         max_context=None,
                         max_memory=None,
+                        max_cache_disk=None,
                         kv_format="bf16" if absolute else "int8",
                     )
                     with (

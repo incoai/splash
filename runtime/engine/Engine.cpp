@@ -161,6 +161,7 @@ void Engine::provideMask(uint64_t id, std::span<const uint32_t> words) {
 
 void Engine::setCompletionNotifier(std::function<void()> notifier) {
   completionNotifier_ = std::move(notifier);
+  cache_.setCompletionNotifier(completionNotifier_);
 }
 
 bool Engine::tick(double now) {
@@ -169,6 +170,12 @@ bool Engine::tick(double now) {
   bool progressed = scheduler_.expireDeadlines(now);
   if (now >= drainEndMilliseconds_)
     drainEndMilliseconds_ = 0.0;
+  if (cache_.pollTransfers()) {
+    // Demoted pages and written states are back; waiting lanes retry now.
+    signalResourceProgress();
+    progressed = true;
+  }
+  progressed = pollRestores(now) || progressed;
   const bool draining = drainingForRecovery();
   for (auto &[_, active] : requests_) {
     // Admission is deliberately paused while resident peers finish. Start a
@@ -177,8 +184,10 @@ bool Engine::tick(double now) {
       active.resourceWait.deadlineMilliseconds = 0.0;
       continue;
     }
-    if (!active.finalized && active.resourceWait.deadlineMilliseconds > 0.0 &&
-        now >= active.resourceWait.deadlineMilliseconds) {
+    const ResourceWait &wait = active.resourceWait;
+    const bool stalled = !(wait.pending && wait.epoch != resourceEpoch_);
+    if (!active.finalized && wait.deadlineMilliseconds > 0.0 &&
+        now >= wait.deadlineMilliseconds && stalled) {
       finishFailure(active, {"resource_timeout", "memory did not become available within the resource wait limit", true});
       progressed = true;
     }
@@ -213,31 +222,42 @@ bool Engine::tick(double now) {
     Pending command = std::move(*pending_);
     pending_.reset();
     std::vector<ModelStepResult> results = command.ticket->wait();
-    apply(command.plan, results, command.ticket->wallMilliseconds(),
-          command.ticket->prefillTimingIsRepresentative());
+    if (!command.plan.empty())
+      apply(command.plan, results, command.ticket->wallMilliseconds(),
+            command.ticket->prefillTimingIsRepresentative());
     sweepTerminal();
     return true;
   }
 
   progressed = admitQueued(now) || progressed;
   sweepTerminal();
-  auto plan = scheduler_.next();
-  if (!plan)
-    return progressed;
-  std::vector<ModelBatchItem> items;
-  if (!prepare(*plan, items, now)) {
-    sweepTerminal();
+  if (auto plan = scheduler_.next()) {
+    std::vector<ModelBatchItem> items;
+    switch (prepare(*plan, items, now)) {
+    case Prepared::Runnable: {
+      std::unique_ptr<ModelBatchTicket> ticket =
+          model_.submit(*plan, items, completionNotifier_);
+      if (!ticket) {
+        throw std::logic_error("model returned an empty command ticket");
+      }
+      scheduler_.commit(*plan);
+      pending_ = Pending{std::move(*plan), std::move(ticket)};
+      return true;
+    }
+    case Prepared::Yielded:
+      sweepTerminal();
+      return true;
+    case Prepared::Waiting:
+      break;
+    }
+  }
+  // No model work runs: queued KV copies ride a command of their own, so a
+  // restore or a demotion never waits for the next batch.
+  if (auto ticket = model_.submitTransfers(completionNotifier_)) {
+    pending_ = Pending{BatchPlan{}, std::move(ticket)};
     return true;
   }
-
-  std::unique_ptr<ModelBatchTicket> ticket =
-      model_.submit(*plan, items, completionNotifier_);
-  if (!ticket) {
-    throw std::logic_error("model returned an empty command ticket");
-  }
-  scheduler_.commit(*plan);
-  pending_ = Pending{std::move(*plan), std::move(ticket)};
-  return true;
+  return progressed;
 }
 
 bool Engine::idle() const noexcept { return requests_.empty() && !pending_; }
@@ -329,7 +349,7 @@ bool Engine::admitQueued(double now) {
   if (recovering) {
     for (uint64_t id : order) {
       Request &active = request(id);
-      if (active.suspended && resourceRetryReady(active, now) && admit(active, now))
+      if (active.suspended && !active.restore && resourceRetryReady(active, now) && admit(active, now))
         return true;
     }
     return false;
@@ -345,7 +365,7 @@ bool Engine::admitQueued(double now) {
   std::vector<PrefillAdmission> candidates;
   for (uint64_t id : order) {
     Request &active = request(id);
-    if (!resourceRetryReady(active, now))
+    if (active.restore || !resourceRetryReady(active, now))
       continue;
     if (cellsFull) {
       scheduler_.waitForResources(id);
@@ -436,9 +456,12 @@ bool Engine::admit(Request &active, double now) {
   ModelRequest modelRequest = active.request.modelView();
   if (resuming)
     modelRequest.prompt = active.exactTokens;
-  CacheLookup lookup = cache_.lookup(
-      modelRequest.prompt, active.request.images,
-      active.admissionProbe ? &*active.admissionProbe : nullptr);
+  CacheLookup lookup =
+      active.skipCache
+          ? CacheLookup{}
+          : cache_.lookup(modelRequest.prompt, active.request.images,
+                          active.admissionProbe ? &*active.admissionProbe
+                                                : nullptr);
   active.admissionProbe.reset();
   // Only unstarted requests wait for a resident producer. Recheck planned
   // boundaries each step so producer loss leaves no stale dependency or lease.
@@ -453,25 +476,22 @@ bool Engine::admit(Request &active, double now) {
     const auto activate = [&] {
       return resuming ? model_.resume(modelRequest) : model_.begin(modelRequest);
     };
-    // Memory a resident lane holds returns when it finishes.
-    const auto anotherResident = [&] {
-      return std::any_of(
-          requests_.begin(), requests_.end(), [&](const auto &entry) {
-            return entry.first != active.request.id && entry.second.stateCell;
-          });
-    };
     const uint64_t releaseGeneration = cache_.releaseGeneration();
     StateAdmission admission = activate();
     bool reclaimedForAdmission = false;
+    Denial denial;
     while (!admission.granted() &&
            admission.failure == StateFailure::MemoryPressure) {
       const bool hostPressure =
           admission.allocationFailure == metal::AllocationFailure::HostPressure;
-      if (hostPressure ? reclaimIdleState() : reclaimForGrowth()) {
+      const CacheReclaimResult reclaimed =
+          hostPressure ? CacheReclaimResult{reclaimIdleState()} : reclaimForGrowth();
+      if (reclaimed.madeProgress) {
         reclaimedForAdmission = true;
         admission = activate();
         continue;
       }
+      denial.pending = reclaimed.pending;
       if (hostPressure)
         break;
       // A useful restore remains pinned throughout ordinary eviction. If
@@ -484,15 +504,18 @@ bool Engine::admit(Request &active, double now) {
       break;
     }
     if (!admission.granted()) {
-      if (admission.failure == StateFailure::MemoryPressure)
+      // Memory the tier is already freeing does not hold the recovery drain.
+      if (admission.failure == StateFailure::MemoryPressure && !denial.pending)
         allocationFailed_ = true;
-      const bool terminalAllocation =
+      // A cell the budget or the driver refused comes back only with a
+      // release in flight; any other refusal passes by itself.
+      const bool refused =
           admission.allocationFailure == metal::AllocationFailure::EngineBudget ||
           admission.allocationFailure == metal::AllocationFailure::DriverRejected;
-      const bool releasingBudget = budgetMayRecover(
-          admission.allocationFailure, releaseGeneration, reclaimedForAdmission);
-      if (terminalAllocation && !growthPaused() && !anotherResident() &&
-          !releasingBudget) {
+      denial.allocationFailure = admission.allocationFailure;
+      denial.retryable = !refused || budgetMayRecover(admission.allocationFailure,
+                                                      releaseGeneration, reclaimedForAdmission);
+      if (judge(denial, active.request.id) == Verdict::Fail) {
         finishFailure(active,
                       {"capacity_exhausted",
                        std::string("could not allocate request state: ") +
@@ -502,7 +525,7 @@ bool Engine::admit(Request &active, double now) {
         return true;
       }
       scheduler_.waitForResources(active.request.id);
-      deferResourceRetry(active, now, admission.failure);
+      deferResourceRetry(active, now, admission.failure, denial.pending);
       return false;
     }
     executorStarted = true;
@@ -510,73 +533,61 @@ bool Engine::admit(Request &active, double now) {
     resourcesStarted = true;
     active.stateCell = *admission.cell;
     const uint32_t resumeBoundary = lookup.resumeBoundary();
+    const uint64_t requestId = active.request.id;
+    // The matched chain first, then the first work's pages for a lane that
+    // will not go through ordinary prefill admission before it runs: one
+    // that resumes, or one that waits for a restore.
+    KvAdmission kv;
     if (lookup.state)
-      cache_.restoreRequest(active.request.id, lookup);
-    if (resuming) {
-      const auto [kv, retryableBudget] =
-          admitKv(active, active.resumeKvTargetTokens);
-      if (!kv.granted()) {
-        // The host continuation survives this failed admission. No recurrent
-        // state restore or replay has run, and all temporary leases are freed.
-        model_.suspend(active.request.id);
-        cache_.endRequest(active.request.id);
-        active.stateCell.reset();
-        executorStarted = resourcesStarted = false;
-        if (!growthPaused() && !retryableBudget && !anotherResident() &&
-            kv.allocationFailure != metal::AllocationFailure::HostPressure) {
-          finishCapacity(active, kv);
-          return true;
-        }
+      kv = admitKv([&] { return cache_.restoreRequest(requestId, lookup); });
+    const bool restoring =
+        lookup.state && (!lookup.state->state()->residentBytes() ||
+                         cache_.kvRestoreStatus(requestId) == KvRestoreStatus::Pending);
+    if (kv.allocation.granted() && (resuming || restoring)) {
+      const uint64_t workEnd =
+          resuming ? active.resumeKvTargetTokens : uint64_t{resumeBoundary} + 1;
+      kv = admitKv([&] { return cache_.ensureTokens(requestId, workEnd); });
+    }
+    if (!kv.allocation.granted()) {
+      // The host continuation survives this failed admission. No recurrent
+      // state restore or replay has run, and all temporary leases are freed.
+      if (resuming) model_.suspend(requestId);
+      else model_.end(requestId);
+      cache_.endRequest(requestId);
+      active.stateCell.reset();
+      executorStarted = resourcesStarted = false;
+      const Verdict verdict = judge(kv.denial, requestId);
+      if (verdict == Verdict::Fail && restoring) {
+        // Release the prefix pin before retrying without its memory footprint.
+        active.skipCache = true;
+        scheduler_.waitForResources(requestId);
         deferResourceRetry(active, now);
         return false;
       }
-      active.resumeKvTargetTokens = 0;
+      if (verdict == Verdict::Fail) {
+        finishCapacity(active, kv.allocation);
+        return true;
+      }
+      scheduler_.waitForResources(requestId);
+      deferResourceRetry(active, now, StateFailure::MemoryPressure, kv.denial.pending);
+      return false;
     }
+    active.resumeKvTargetTokens = 0;
     active.resourceWait = {};
-    if (resuming)
-      scheduler_.resumeFromResources(active.request.id, resumeBoundary,
-                                     active.replayTokens);
     DraftContextPlan draft = configureDraftStatePlan(
         active, resumeBoundary, lookup.junctionBoundary());
-    active.latestCheckpoint = {};
+    std::unique_ptr<StateRestore> transfer;
     if (lookup.state) {
-      model_.restore(active.request.id, resumeBoundary, lookup.state->state(),
-                     !draft.draftStateRestoreSkipped);
-      active.latestCheckpoint = cache_.checkpointState(lookup.state->kvBlock());
-      // A restored endpoint already has the ordinary replay state we need.
-      // Other restored progress points retain their rolling lifetime.
-      if (active.latestCheckpoint &&
-          resumeBoundary == replayStateBoundary(active.replayTokens)) {
-        static_cast<void>(
-            cache_.reuseCompositeState(active.latestCheckpoint.kvBlock));
-        ++counters_.deduplicatedStatePublications;
-        active.latestCheckpoint = {};
-      }
+      transfer = model_.beginRestore(requestId, resumeBoundary, lookup.state->state(),
+                                     !draft.draftStateRestoreSkipped,
+                                     completionNotifier_);
     }
-    model_.setDraftContextPlan(active.request.id, std::move(draft));
-    if (resuming) {
-      active.suspended = false;
-      active.replaying = true;
-      ++counters_.resourceResumptions;
+    if (transfer || cache_.kvRestoreStatus(requestId) == KvRestoreStatus::Pending) {
+      active.restore.emplace(Request::Restore{
+          std::move(lookup), std::move(draft), std::move(transfer)});
       return true;
     }
-    active.exactTokens = std::move(active.request.prompt);
-    scheduler_.resourcesReady(active.request.id, resumeBoundary);
-    cache_.recordLookup(lookup);
-    events_.started(active.request.id,
-                    resumeBoundary ? EngineCacheStatus::PrefixHit
-                                   : EngineCacheStatus::Miss,
-                    resumeBoundary, *admission.cell);
-    if (active.request.returnProgress) {
-      active.reportedPromptTokens = resumeBoundary;
-      events_.promptProgress(active.request.id, resumeBoundary);
-    }
-    if (resumeBoundary) {
-      ++counters_.cacheHits;
-      counters_.reusedTokens += resumeBoundary;
-    } else {
-      ++counters_.coldMisses;
-    }
+    completeAdmission(active, lookup, std::move(draft));
     return true;
   } catch (...) {
     discardPendingStateBoundaries(active);
@@ -589,6 +600,102 @@ bool Engine::admit(Request &active, double now) {
   }
 }
 
+void Engine::completeAdmission(Request &active, CacheLookup &lookup,
+                                DraftContextPlan draft) {
+  const bool resuming = active.suspended;
+  active.skipCache = false;
+  const uint32_t resumeBoundary = lookup.resumeBoundary();
+  if (resuming)
+    scheduler_.resumeFromResources(active.request.id, resumeBoundary, active.replayTokens);
+  active.latestCheckpoint = {};
+  if (lookup.state) {
+    active.latestCheckpoint = cache_.checkpointState(lookup.state->kvBlock());
+    // A restored endpoint already has the ordinary replay state we need.
+    // Other restored progress points retain their rolling lifetime.
+    if (active.latestCheckpoint &&
+        resumeBoundary == replayStateBoundary(active.replayTokens)) {
+      static_cast<void>(
+          cache_.reuseCompositeState(active.latestCheckpoint.kvBlock));
+      ++counters_.deduplicatedStatePublications;
+      active.latestCheckpoint = {};
+    }
+  }
+  model_.setDraftContextPlan(active.request.id, std::move(draft));
+  if (resuming) {
+    active.suspended = false;
+    active.replaying = true;
+    armNextStateBoundary(active);
+    ++counters_.resourceResumptions;
+    return;
+  }
+  active.exactTokens = std::move(active.request.prompt);
+  scheduler_.resourcesReady(active.request.id, resumeBoundary);
+  armNextStateBoundary(active);
+  cache_.recordLookup(lookup);
+  events_.started(active.request.id,
+                  resumeBoundary ? EngineCacheStatus::PrefixHit
+                                 : EngineCacheStatus::Miss,
+                  resumeBoundary, *active.stateCell);
+  if (active.request.returnProgress) {
+    active.reportedPromptTokens = resumeBoundary;
+    events_.promptProgress(active.request.id, resumeBoundary);
+  }
+  if (resumeBoundary) {
+    ++counters_.cacheHits;
+    counters_.reusedTokens += resumeBoundary;
+  } else {
+    ++counters_.coldMisses;
+  }
+}
+
+bool Engine::pollRestores(double now) {
+  bool progressed = false;
+  for (auto &[id, active] : requests_) {
+    if (!active.restore) continue;
+    if (!active.failure && active.request.deadlineMilliseconds <= now)
+      active.failure = Failure{"deadline_exceeded", "request deadline elapsed"};
+    StateRestore *ticket = active.restore->ticket.get();
+    if (active.failure && ticket) ticket->cancel();
+    // The state's read must drain before its cell is reused; KV restores
+    // belong to their blocks and outlive a request that gives up.
+    if (ticket && !ticket->ready()) continue;
+    const KvRestoreStatus kv = cache_.kvRestoreStatus(id);
+    if (!active.failure && kv == KvRestoreStatus::Pending) continue;
+    auto restore = std::move(*active.restore);
+    active.restore.reset();
+    progressed = true;
+    if (active.failure) {
+      restore.ticket.reset();
+      restore.lookup = {};
+      if (active.failure->code == "cancelled") finish(active, EngineFinishReason::Cancelled, {});
+      else finishFailure(active, std::move(*active.failure));
+      continue;
+    }
+    const bool stateRestored = !restore.ticket || restore.ticket->finish();
+    if (stateRestored && kv == KvRestoreStatus::None) {
+      if (restore.ticket) cache_.promoteState(restore.lookup, *restore.ticket);
+      completeAdmission(active, restore.lookup, std::move(restore.draft));
+      continue;
+    }
+    // The prefix could not be brought back. What failed is gone from the
+    // cache, so the next attempt matches the prefix that remains.
+    if (!stateRestored) {
+      cache_.discardState(restore.lookup.state->kvBlock(),
+                          restore.lookup.state->state().get());
+    }
+    restore.ticket.reset();
+    restore.lookup = {};
+    discardPendingStateBoundaries(active);
+    if (active.suspended) model_.suspend(id);
+    else model_.end(id);
+    cache_.endRequest(id);
+    active.stateCell.reset();
+    signalResourceProgress();
+    scheduler_.waitForResources(id);
+  }
+  return progressed;
+}
+
 bool Engine::resourceRetryReady(const Request &active,
                                 double now) const noexcept {
   return active.resourceWait.retryMilliseconds <= 0.0 ||
@@ -597,14 +704,16 @@ bool Engine::resourceRetryReady(const Request &active,
 }
 
 void Engine::deferResourceRetry(Request &active, double now,
-                                StateFailure reason) noexcept {
+                                StateFailure reason, bool pending) noexcept {
   auto &wait = active.resourceWait;
   if (!wait.startedMilliseconds)
     wait.startedMilliseconds = now;
+  const bool progressed = wait.pending && wait.epoch != resourceEpoch_;
   wait.reason = reason;
+  wait.pending = pending;
   if (reason == StateFailure::ConcurrencyLimit)
     wait.deadlineMilliseconds = 0.0;
-  else if (wait.deadlineMilliseconds <= 0.0)
+  else if (progressed || wait.deadlineMilliseconds <= 0.0)
     wait.deadlineMilliseconds = now + config_.resourceWaitTimeoutMilliseconds;
   wait.epoch = resourceEpoch_;
   wait.retryMilliseconds = now + kResourceRetryBackoffMilliseconds;
@@ -657,9 +766,7 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
   static_cast<void>(addSharedPrefillBoundaries(active, stateBoundary));
 
   try {
-    DraftContextPlan draft = pendingDraftStatePlan(active, stateBoundary);
-    armNextStateBoundary(active);
-    return draft;
+    return pendingDraftStatePlan(active, stateBoundary);
   } catch (...) {
     discardPendingStateBoundaries(active);
     throw;
@@ -768,24 +875,45 @@ void Engine::publishReachedStateBoundaries(Request &active,
       if (cache_.reuseCompositeState(block, checkpoint)) {
         ++counters_.deduplicatedStatePublications;
       } else {
+        std::shared_ptr<const CompositeState> state;
+        // A checkpoint close to the final reusable state is only worth
+        // capturing if it fits now. Otherwise keep the previous recovery
+        // point instead of evicting it or writing a short-lived replacement.
+        if (checkpoint && model_.canSnapshotToDisk() &&
+            uint64_t{objective.tokens} + model::ExecutionLimits::prefillTokenBudget >
+                replayStateBoundary(active.replayTokens)) {
+          state = model_.snapshot(active.request.id);
+          if (!state)
+            continue;
+        }
         // Recycle the previous recovery point before allocating its replacement.
         // A restore lease can delay this optional publication.
         if (!retireCheckpoint(active) && checkpoint) {
           ++failures;
           continue;
         }
-        std::shared_ptr<const CompositeState> state =
-            model_.snapshot(active.request.id);
+        if (!state)
+          state = model_.snapshot(active.request.id);
         if (!state && cache_.reclaimOneState(checkpoint)) {
           state = model_.snapshot(active.request.id);
           if (state)
             ++counters_.recycledStatePublications;
         }
-        if (!state) {
+        if (state) {
+          cache_.publishCompositeState(block, std::move(state), checkpoint);
+        } else if (model_.canSnapshotToDisk() &&
+                   cache_.publishStateToDisk(
+                       block,
+                       [&](std::function<void()> completion) {
+                         return model_.snapshotToDisk(active.request.id, std::move(completion));
+                       },
+                       checkpoint)) {
+          // No cache slot holds the state; the tier takes it from the lane.
+          ++counters_.diskStatePublications;
+        } else {
           ++failures;
           continue;
         }
-        cache_.publishCompositeState(block, std::move(state), checkpoint);
         ++publications;
       }
       if (active.latestCheckpoint.kvBlock != block)
@@ -808,8 +936,8 @@ void Engine::publishReachedStateBoundaries(Request &active,
   armNextStateBoundary(active);
 }
 
-bool Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &items,
-                     double now) {
+Engine::Prepared Engine::prepare(BatchPlan &plan,
+                                 std::vector<ModelBatchItem> &items, double now) {
   items.reserve(plan.items.size());
   std::vector<BatchItem> admitted;
   admitted.reserve(plan.items.size());
@@ -817,7 +945,7 @@ bool Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &items,
     uint64_t requestId = 0;
     TokenAdmission admission;
     uint64_t workEnd;
-    bool retryableBudget;
+    Denial denial;
   };
   std::vector<Denied> denied;
   denied.reserve(plan.items.size());
@@ -832,13 +960,15 @@ bool Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &items,
         plan.kind == WorkKind::Prefill
             ? position + scheduled.tokenCount
             : position + model::ExecutionLimits::targetVerifyRows;
-    const auto [admission, retryableBudget] = admitKv(active, workEnd);
-    if (!admission.granted()) {
-      denied.push_back(
-          Denied{active.request.id, admission, workEnd, retryableBudget});
+    const KvAdmission kv =
+        admitKv([&] { return cache_.ensureTokens(active.request.id, workEnd); });
+    if (!kv.allocation.granted()) {
+      denied.push_back(Denied{active.request.id, kv.allocation, workEnd, kv.denial});
       continue;
     }
     admitted.push_back(scheduled);
+    // A lane that runs is waiting for nothing.
+    active.resourceWait = {};
     ModelBatchItem item;
     item.requestId = active.request.id;
     item.stateSlot = *active.stateCell;
@@ -858,7 +988,7 @@ bool Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &items,
   }
   if (!admitted.empty()) {
     plan.items = std::move(admitted);
-    return true;
+    return Prepared::Runnable;
   }
 
   // Partial admissions execute at their actual width. If no lane fits, choose
@@ -881,6 +1011,16 @@ bool Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &items,
       return aPhase == Phase::Prefill;
     return completedTokens(a) < completedTokens(b);
   };
+  // Memory on its way back arrives without anyone yielding. The lanes still
+  // take a retry deadline: the transfer's completion wakes the engine, and
+  // the deadline is what makes the wait end if that wake is ever missed.
+  if (std::any_of(denied.begin(), denied.end(),
+                  [](const Denied &entry) { return entry.denial.pending; })) {
+    for (const Denied &entry : denied)
+      deferResourceRetry(request(entry.requestId), now, StateFailure::MemoryPressure,
+                         entry.denial.pending);
+    return Prepared::Waiting;
+  }
   const Denied &victim = *std::min_element(
       denied.begin(), denied.end(),
       [&](const Denied &left, const Denied &right) {
@@ -903,43 +1043,61 @@ bool Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &items,
     }
   }
   Request &active = *selected;
-  const bool anotherResident =
-      std::any_of(requests_.begin(), requests_.end(), [&](const auto &entry) {
-        return entry.first != active.request.id && entry.second.stateCell;
-      });
-  if (growthPaused() || anotherResident || victim.retryableBudget ||
-      victim.admission.allocationFailure ==
-          metal::AllocationFailure::HostPressure) {
+  if (judge(victim.denial, active.request.id) == Verdict::Fail)
+    finishCapacity(request(victim.requestId), victim.admission);
+  else
     suspendForGrowth(active, resumeTarget, victim.admission.allocationFailure,
                      now);
-    return false;
-  }
-  finishCapacity(request(victim.requestId), victim.admission);
-  return false;
+  return Prepared::Yielded;
 }
 
-Engine::KvAdmission Engine::admitKv(Request &active, uint64_t workEnd) {
+bool Engine::anotherResident(uint64_t requestId) const {
+  return std::any_of(requests_.begin(), requests_.end(), [&](const auto &entry) {
+    return entry.first != requestId && entry.second.stateCell;
+  });
+}
+
+Engine::Verdict Engine::judge(const Denial &denial, uint64_t requestId) const {
+  if (denial.pending)
+    return Verdict::Wait;
+  // Pages held by resident lanes come back when they finish; only a lane
+  // that cannot fit on its own has hit the capacity.
+  if (growthPaused() || denial.retryable || anotherResident(requestId) ||
+      denial.allocationFailure == metal::AllocationFailure::HostPressure)
+    return Verdict::Yield;
+  return Verdict::Fail;
+}
+
+Engine::KvAdmission Engine::admitKv(const std::function<TokenAdmission()> &attempt) {
   const uint64_t releaseGeneration = cache_.releaseGeneration();
   bool reclaimed = false;
-  TokenAdmission admission = cache_.ensureTokens(active.request.id, workEnd);
+  bool pendingReclaim = false;
+  TokenAdmission admission = attempt();
   while (!admission.granted() &&
          admission.failure == KvPageAcquireFailure::PhysicalCapacity) {
     const bool paused = growthPaused() ||
         admission.allocationFailure == metal::AllocationFailure::HostPressure;
-    const bool progressed = paused
-        ? reuseIdleBackingWhilePaused(admission)
+    const CacheReclaimResult progress = paused
+        ? CacheReclaimResult{reuseIdleBackingWhilePaused(admission)}
         : reclaimForGrowth(CacheReclaimMode::ReuseBacking);
-    if (!progressed)
+    if (!progress.madeProgress) {
+      pendingReclaim = progress.pending;
       break;
+    }
     reclaimed = true;
-    admission = cache_.ensureTokens(active.request.id, workEnd);
+    admission = attempt();
   }
-  if (!admission.granted())
-    allocationFailed_ = true;
-  return {admission,
-          !admission.granted() &&
-              budgetMayRecover(admission.allocationFailure, releaseGeneration,
-                               reclaimed)};
+  Denial denial;
+  if (!admission.granted()) {
+    denial.allocationFailure = admission.allocationFailure;
+    denial.pending = admission.failure == KvPageAcquireFailure::Pending || pendingReclaim;
+    // Pages on their way back end the shortage without the residents.
+    if (!denial.pending)
+      allocationFailed_ = true;
+    denial.retryable = denial.pending || budgetMayRecover(admission.allocationFailure,
+                                                          releaseGeneration, reclaimed);
+  }
+  return {admission, denial};
 }
 
 bool Engine::budgetMayRecover(metal::AllocationFailure failure,
@@ -954,18 +1112,18 @@ bool Engine::growthPaused() const {
   return config_.growthPaused && config_.growthPaused();
 }
 
-bool Engine::reclaimForGrowth(CacheReclaimMode mode) {
+CacheReclaimResult Engine::reclaimForGrowth(CacheReclaimMode mode) {
   if (reclaimIdleState())
-    return true;
+    return {true, 0};
   // The background pressure controller owns physical shrink. Retrying a
   // paused allocator here would drain the cache before macOS can acknowledge
   // any reclaimed bytes.
   if (growthPaused())
-    return false;
+    return {};
   const CacheReclaimResult reclaimed = cache_.reclaimOne(mode);
   if (reclaimed.madeProgress)
     signalResourceProgress();
-  return reclaimed.madeProgress;
+  return reclaimed;
 }
 
 bool Engine::reclaimIdleState() noexcept {
@@ -1184,6 +1342,11 @@ void Engine::apply(const BatchPlan &plan,
 
 void Engine::finish(Request &active, EngineFinishReason reason,
                     std::span<const float> optionLogits) {
+  if (active.restore) {
+    if (!active.failure) active.failure = Failure{"cancelled", "request cancelled"};
+    if (active.restore->ticket) active.restore->ticket->cancel();
+    return;
+  }
   if (active.finalized)
     return;
   if (reason == EngineFinishReason::Cancelled) {
@@ -1207,6 +1370,11 @@ void Engine::finish(Request &active, EngineFinishReason reason,
 }
 
 void Engine::finishFailure(Request &active, Failure failure) {
+  if (active.restore) {
+    if (!active.failure) active.failure = std::move(failure);
+    if (active.restore->ticket) active.restore->ticket->cancel();
+    return;
+  }
   if (active.finalized)
     return;
   scheduler_.fail(active.request.id);

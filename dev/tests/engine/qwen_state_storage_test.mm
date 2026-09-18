@@ -1,14 +1,21 @@
 #include "engine/MemoryGovernor.hpp"
+#include "tests/engine/AllocationFailure.hpp"
 #include "model/QwenState.hpp"
 #include "ops/PageStorage.hpp"
 
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
+#include <future>
+#include <chrono>
+#include <new>
 #include <iostream>
+#include <cstring>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <vector>
 
 using namespace splash;
 using namespace splash::engine;
@@ -43,6 +50,26 @@ uint32_t &word(const metal::MetalBuffer &buffer, uint64_t byteOffset = 0) {
   return *reinterpret_cast<uint32_t *>(bytes + byteOffset);
 }
 
+void fill(const metal::MetalBuffer &buffer, uint64_t seed) {
+  auto *bytes = static_cast<uint8_t *>(buffer.contents());
+  require(bytes != nullptr, "test buffer is not CPU-visible");
+  uint64_t x = seed | 1;
+  for (uint64_t i = 0; i < buffer.sizeBytes(); ++i) {
+    x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+    bytes[i] = static_cast<uint8_t>(x);
+  }
+}
+
+std::vector<uint8_t> bytesOf(const metal::MetalBuffer &buffer) {
+  auto *bytes = static_cast<const uint8_t *>(buffer.contents());
+  return std::vector<uint8_t>(bytes, bytes + buffer.sizeBytes());
+}
+
+bool sameBytes(const metal::MetalBuffer &buffer, const std::vector<uint8_t> &image) {
+  return image.size() == buffer.sizeBytes() &&
+         std::memcmp(buffer.contents(), image.data(), image.size()) == 0;
+}
+
 void testLayoutFormulas() {
   require(kTargetState.convolutionLayerBytes() == 65'536,
           "GDN convolution layer formula is wrong");
@@ -66,6 +93,228 @@ void testLayoutFormulas() {
           "prefix byte formula is wrong");
 }
 
+void testOffloadAllocationFailure(metal::MetalBackend &backend) {
+  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
+  constexpr model::CompositeStateLayout layout{{1, 3, 128, 1, 128, 128},
+                                               {1, 1, 2048, 4}};
+  auto file = std::make_shared<model::SlotFile>(layout.cachedBytes(), 3 * layout.cachedBytes());
+  model::QwenStateStorage storage(backend, governor.allocationAdmission(), layout, file);
+  require(static_cast<bool>(storage.tryActivateSlot(0, 1)), "fault source activation failed");
+  storage.updateLengths(0, {4096, 2048, 2048, 0});
+  auto source = storage.snapshot(0);
+  auto held = file->acquire();
+  std::vector<std::byte> bytes(layout.cachedBytes());
+  struct Result {
+    bool failed;
+    std::unique_ptr<StateOffload> transfer;
+  };
+  for (int failure = 0; failure < 64; ++failure) {
+    // Keep the worker behind a barrier so a submitted write cannot finish
+    // before the failure path has either drained it or returned unsafely.
+    auto reached = std::make_shared<std::promise<void>>();
+    std::promise<void> release;
+    auto released = release.get_future().share();
+    auto barrier = file->read(held, {bytes}, [reached, released] {
+      reached->set_value();
+      released.wait();
+    });
+    reached->get_future().wait();
+    auto attempt = std::async(std::launch::async, [&] {
+      allocationFailureAfter = failure;
+      try {
+        auto transfer = source->offload({});
+        allocationFailureAfter = -1;
+        return Result{false, std::move(transfer)};
+      } catch (const std::bad_alloc &) {
+        allocationFailureAfter = -1;
+        return Result{true, {}};
+      }
+    });
+    const bool returned = attempt.wait_for(std::chrono::milliseconds(100)) ==
+                          std::future_status::ready;
+    const bool pending = !file->idle();
+    release.set_value();
+    auto result = attempt.get();
+    while (!file->idle()) std::this_thread::yield();
+    require(!(result.failed && returned && pending),
+            "allocation failure released staging before the submitted write drained");
+    if (!result.failed) {
+      require(result.transfer && result.transfer->finish(),
+              "offload did not recover after allocation failures");
+      return;
+    }
+    require(file->usedBytes() == layout.cachedBytes(),
+            "failed offload leaked its disk quota");
+  }
+  throw std::runtime_error("offload allocation failure sweep never reached success");
+}
+
+void testDiskRestore(metal::MetalBackend &backend) {
+  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
+  model::QwenStateStorage storage(
+      backend, governor.allocationAdmission(), kStateLayout,
+      std::make_shared<model::SlotFile>(kStateLayout.cachedBytes(), kStateLayout.cachedBytes()));
+  require(static_cast<bool>(storage.tryActivateSlot(0, 123)), "disk source activation failed");
+  const auto &buffers = storage.buffers(0);
+  // Every byte of the state travels through the file; markers alone would
+  // not notice a misplaced or truncated span.
+  fill(buffers.gdn[0].stateBase, 1);
+  word(buffers.gdn[0].stateBase) = 0x12345678;
+  for (size_t layer = 0; layer < buffers.draft.size(); ++layer) {
+    fill(buffers.draft[layer].keys, 2 + 2 * layer);
+    fill(buffers.draft[layer].values, 3 + 2 * layer);
+    word(buffers.draft[layer].keys) = 100 + layer;
+    word(buffers.draft[layer].values) = 200 + layer;
+  }
+  std::vector<std::vector<uint8_t>> images{bytesOf(buffers.gdn[0].stateBase)};
+  for (const auto &layer : buffers.draft) {
+    images.push_back(bytesOf(layer.keys));
+    images.push_back(bytesOf(layer.values));
+  }
+  const auto restoredExactly = [&] {
+    bool same = sameBytes(buffers.gdn[0].stateBase, images[0]);
+    for (size_t layer = 0; layer < buffers.draft.size(); ++layer)
+      same = same && sameBytes(buffers.draft[layer].keys, images[1 + 2 * layer]) &&
+             sameBytes(buffers.draft[layer].values, images[2 + 2 * layer]);
+    return same;
+  };
+  storage.updateLengths(0, {4096, 2048, 2048, 0});
+  auto source = storage.snapshot(0);
+  auto write = source->offload({});
+  require(write != nullptr, "disk offload not admitted");
+  auto disk = write->state();
+  require(disk && !disk->residentBytes(), "disk state retained resident allocation");
+  // The write owns its copy: the source buffers are free before it finishes.
+  source.reset();
+  require(storage.idleCells() == 1 && storage.idleRings() == 1,
+          "demotion did not return the source buffers at once");
+  static_cast<void>(storage.releaseIdle(0, 0));
+  while (!write->ready()) std::this_thread::yield();
+  require(write->finish(), "disk write failed");
+  write.reset();
+  const auto beforeRestore = storage.actualAllocatedBytes();
+  word(buffers.gdn[0].stateBase) = 0;
+  storage.updateLengths(0, {});
+  bool committed = false;
+  auto read = storage.beginRestore(0, *disk, true, {}, [&] { committed = true; });
+  require(read && !committed, "disk restore committed before IO was consumed");
+  while (!read->ready()) std::this_thread::yield();
+  require(read->finish() && committed, "disk restore failed");
+  read.reset();
+  require(storage.actualAllocatedBytes() == beforeRestore, "restore allocated a second state");
+  require(restoredExactly(), "disk restore did not reproduce every state byte");
+  require(word(buffers.gdn[0].stateBase) == 0x12345678 &&
+              storage.metadata(0).lengths.targetTokens == 4096,
+          "disk state changed target values or metadata");
+  for (size_t layer = 0; layer < buffers.draft.size(); ++layer) {
+    require(word(buffers.draft[layer].keys) == 100 + layer &&
+                word(buffers.draft[layer].values) == 200 + layer,
+            "disk state changed draft values");
+  }
+  read = storage.beginRestore(0, *disk, false, {}, [] {});
+  while (!read->ready()) std::this_thread::yield();
+  require(read->finish() && storage.metadata(0).lengths.draftLength == 0 &&
+              storage.metadata(0).lengths.draftBase == 4096,
+          "skipped draft restore retained stale context");
+  auto promoted = read->snapshot();
+  require(promoted && promoted->residentBytes() == kStateLayout.cachedBytes(),
+          "completed disk restore could not create a resident snapshot");
+  require(storage.metadata(0).lengths.draftLength == 0,
+          "promotion changed the executing request's draft plan");
+  word(buffers.gdn[0].stateBase) = 0;
+  for (auto &layer : buffers.draft) {
+    word(layer.keys) = 0;
+    word(layer.values) = 0;
+  }
+  storage.restore(0, *promoted, true);
+  require(word(buffers.gdn[0].stateBase) == 0x12345678 &&
+              storage.metadata(0).lengths.hasCompleteDraftWindow(2048),
+          "promotion lost the original complete state when execution skipped draft");
+  for (size_t layer = 0; layer < buffers.draft.size(); ++layer)
+    require(word(buffers.draft[layer].keys) == 100 + layer &&
+                word(buffers.draft[layer].values) == 200 + layer,
+            "promotion aliased mutable active buffers");
+  require(restoredExactly(), "promoted snapshot did not reproduce every state byte");
+  read.reset();
+  disk.reset();
+  promoted.reset();
+  storage.releaseSlot(0, 123);
+}
+
+// A lane whose state no cache slot can hold writes it from its own cells: no
+// cache buffer is taken, the disk copy restores every byte of the active
+// parity, one write holds the staging buffer at a time, and a full quota
+// refuses until a disk copy is dropped.
+void testDirectDiskSnapshot(metal::MetalBackend &backend) {
+  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
+  model::QwenStateStorage storage(
+      backend, governor.allocationAdmission(), kStateLayout,
+      std::make_shared<model::SlotFile>(kStateLayout.cachedBytes(), kStateLayout.cachedBytes()));
+  require(storage.canSnapshotToDisk(), "a state file that holds one state refuses writes");
+  require(static_cast<bool>(storage.tryActivateSlot(0, 321)), "lane activation failed");
+  const auto &buffers = storage.buffers(0);
+  storage.swapParity(0);
+  fill(buffers.gdn[0].stateBase, 8);
+  fill(buffers.gdn[1].stateBase, 7);
+  word(buffers.gdn[1].stateBase) = 0x0badf00d;
+  for (size_t layer = 0; layer < buffers.draft.size(); ++layer) {
+    fill(buffers.draft[layer].keys, 20 + 2 * layer);
+    fill(buffers.draft[layer].values, 21 + 2 * layer);
+  }
+  const auto inactive = bytesOf(buffers.gdn[0].stateBase);
+  std::vector<std::vector<uint8_t>> images{bytesOf(buffers.gdn[1].stateBase)};
+  for (const auto &layer : buffers.draft) {
+    images.push_back(bytesOf(layer.keys));
+    images.push_back(bytesOf(layer.values));
+  }
+  storage.updateLengths(0, {4096, 2048, 2048, 0});
+  const uint64_t before = storage.actualAllocatedBytes();
+  auto write = storage.snapshotToDisk(0, {});
+  require(write != nullptr, "direct disk snapshot was not admitted");
+  require(storage.actualAllocatedBytes() == before && storage.idleCells() == 0 &&
+              storage.idleRings() == 0,
+          "direct disk snapshot took a cache slot");
+  auto disk = write->state();
+  require(disk && !disk->residentBytes() && disk->bytes() == kStateLayout.cachedBytes(),
+          "the ticket does not carry a disk copy");
+  // The write reads staging, so the lane may move on at once; one write
+  // holds the staging buffer at a time.
+  word(buffers.gdn[1].stateBase) = 0;
+  requireThrows<std::logic_error>([&] { static_cast<void>(storage.snapshotToDisk(0, {})); },
+                                  "a second write joined the one in flight");
+  while (!write->ready()) std::this_thread::yield();
+  require(write->finish(), "direct disk write failed");
+  write.reset();
+  require(storage.snapshotToDisk(0, {}) == nullptr, "a full quota admitted a second state");
+
+  fill(buffers.gdn[1].stateBase, 99);
+  for (const auto &layer : buffers.draft) {
+    fill(layer.keys, 98);
+    fill(layer.values, 97);
+  }
+  storage.updateLengths(0, {});
+  bool committed = false;
+  auto read = storage.beginRestore(0, *disk, true, {}, [&] { committed = true; });
+  while (!read->ready()) std::this_thread::yield();
+  require(read->finish() && committed, "restore of the direct disk copy failed");
+  read.reset();
+  bool same = sameBytes(buffers.gdn[1].stateBase, images[0]);
+  for (size_t layer = 0; layer < buffers.draft.size(); ++layer)
+    same = same && sameBytes(buffers.draft[layer].keys, images[1 + 2 * layer]) &&
+           sameBytes(buffers.draft[layer].values, images[2 + 2 * layer]);
+  require(same && word(buffers.gdn[1].stateBase) == 0x0badf00d &&
+              storage.metadata(0).lengths.targetTokens == 4096,
+          "the disk copy did not reproduce the lane's active state");
+  require(sameBytes(buffers.gdn[0].stateBase, inactive), "the inactive parity was touched");
+  disk.reset();
+  auto again = storage.snapshotToDisk(0, {});
+  require(again != nullptr, "the dropped disk copy did not free its quota");
+  while (!again->ready()) std::this_thread::yield();
+  require(again->finish(), "the second direct disk write failed");
+  again.reset();
+  storage.releaseSlot(0, 321);
+}
+
 void run(const std::string &metallib) {
   using model::QwenCompositeState;
   using model::QwenLogicalLengths;
@@ -73,6 +322,9 @@ void run(const std::string &metallib) {
 
   testLayoutFormulas();
   metal::MetalBackend backend(metallib);
+  testOffloadAllocationFailure(backend);
+  testDiskRestore(backend);
+  testDirectDiskSnapshot(backend);
   MemoryGovernor governor(
       backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
   // Switched off to prove that a pooled cache slot needs no new admission.

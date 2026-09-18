@@ -120,7 +120,7 @@ void testCanonicalPagesAndSparseState() {
               !lookup.junctionBoundary(),
           "KV-first lookup did not coordinate the sparse state");
   resources.beginRequest(2);
-  resources.restoreRequest(2, lookup);
+  require(resources.restoreRequest(2, lookup).granted(), "restore pages were denied");
   require(resources.pageTable(2).pages.size() == 2,
           "restored request did not retain the state KV chain");
   resources.endRequest(2);

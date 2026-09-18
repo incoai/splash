@@ -543,6 +543,7 @@ def main_args(**overrides):
             "default_reasoning_effort": None,
             "max_context": None,
             "max_memory": None,
+            "max_cache_disk": 0,
             "max_image_pixels": api.image_input.MAX_PIXELS,
             "max_new_tokens": 16,
             "request_timeout": 2,
@@ -3366,10 +3367,25 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(Path(args.tokenizer), package / "tokenizer")
         self.assertIsNone(args.max_context)
         self.assertIsNone(args.max_memory)
+        self.assertEqual(args.max_cache_disk, 0)
+        disk_args = api.parse_args([*required, "--max-cache-disk", "5G"])
+        self.assertEqual(disk_args.max_cache_disk, 5 * 1024**3)
+        self.assertEqual(api._native_command(disk_args)[-1], str(5 * 1024**3))
+        self.assertEqual(
+            api.parse_args([*required, "--max-state-disk", "5G"]).max_cache_disk,
+            5 * 1024**3,
+        )
         self.assertEqual(args.kv_format, "int8")
         self.assertNotIn("--kv-format", api._native_command(args))
         bf16_args = api.parse_args([*required, "--kv-format", "bf16"])
         self.assertEqual(api._native_command(bf16_args)[-2:], ["--kv-format", "bf16"])
+        disk_bf16_args = api.parse_args(
+            [*required, "--max-cache-disk", "5G", "--kv-format", "bf16"]
+        )
+        self.assertEqual(
+            api._native_command(disk_bf16_args)[-3:],
+            [str(5 * 1024**3), "--kv-format", "bf16"],
+        )
         with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
             api.parse_args([*required, "--kv-format", "fp16"])
         self.assertEqual(
