@@ -4,12 +4,15 @@
 #include "model/DFlashDraft.hpp"
 #include "model/Model.hpp"
 #include "model/StateLayout.hpp"
+#include "model/SlotFile.hpp"
 #include "ops/PagedKv.hpp"
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string_view>
 #include <vector>
 
@@ -99,6 +102,17 @@ struct QwenBufferPool final {
   bool open = true;
 };
 
+// One host copy of a state on its way to disk. The write reads this copy,
+// so the state's own buffers return to the pool as soon as it is taken.
+struct StateStaging final {
+  struct Free {
+    void operator()(void *memory) const noexcept { std::free(memory); }
+  };
+  std::unique_ptr<std::byte, Free> bytes;
+  uint64_t size = 0;
+  bool busy = false;
+};
+
 // An immutable composite snapshot owns a private copy of the state that
 // cannot be recovered from sealed Q8 pages. No mutating buffers are exposed
 // after construction; its buffers return to the pool when it is dropped.
@@ -111,15 +125,40 @@ public:
   [[nodiscard]] uint64_t bytes() const noexcept override {
     return layout_.cachedBytes();
   }
+  [[nodiscard]] uint64_t residentBytes() const noexcept override {
+    return disk_ ? 0 : bytes();
+  }
+  [[nodiscard]] bool canOffload() const noexcept override {
+    return file_ && !disk_ && file_->writable() && file_->capacityBytes() >= bytes();
+  }
+  [[nodiscard]] std::unique_ptr<StateOffload>
+  offload(std::function<void()> completion) const override;
 
 private:
   QwenCompositeState(std::shared_ptr<QwenBufferPool> pool, QwenCacheSlot slot,
-                     CompositeStateLayout layout, QwenLogicalLengths lengths);
+                     CompositeStateLayout layout, QwenLogicalLengths lengths,
+                     std::shared_ptr<SlotFile> file,
+                     std::shared_ptr<StateStaging> staging);
+  QwenCompositeState(CompositeStateLayout layout, QwenLogicalLengths lengths,
+                     std::shared_ptr<SlotFile> file,
+                     std::shared_ptr<SlotFile::Slot> disk);
+  // Copies the spans of one state into staging and starts the write that
+  // carries them to disk; the ticket's state() is the disk copy. Null when
+  // the tier cannot admit another state.
+  [[nodiscard]] static std::unique_ptr<StateOffload>
+  write(const std::shared_ptr<SlotFile> &file,
+        const std::shared_ptr<StateStaging> &staging,
+        const std::vector<std::span<std::byte>> &spans,
+        CompositeStateLayout layout, QwenLogicalLengths lengths,
+        std::function<void()> completion);
 
   std::shared_ptr<QwenBufferPool> pool_;
   QwenCacheSlot slot_;
   CompositeStateLayout layout_;
   QwenLogicalLengths lengths_;
+  std::shared_ptr<SlotFile> file_;
+  std::shared_ptr<StateStaging> staging_;
+  std::shared_ptr<SlotFile::Slot> disk_;
 
   friend class QwenStateStorage;
 };
@@ -129,7 +168,8 @@ class QwenStateStorage final : public model::StateStorage {
 public:
   QwenStateStorage(metal::MetalBackend &backend,
                    metal::AllocationAdmission admitAllocation,
-                   CompositeStateLayout layout);
+                   CompositeStateLayout layout,
+                   std::shared_ptr<SlotFile> file = nullptr);
 
   ~QwenStateStorage() override;
   QwenStateStorage(const QwenStateStorage &) = delete;
@@ -161,8 +201,20 @@ public:
   // dropping a cached state makes its slot available for retry.
   [[nodiscard]] std::shared_ptr<const QwenCompositeState>
   snapshot(uint32_t slot);
+  // Writes the lane's committed state to the disk tier from its own cells,
+  // taking no cache slot; the ticket carries the disk copy. Null without a
+  // tier that accepts writes, or when the quota cannot admit another state.
+  [[nodiscard]] bool canSnapshotToDisk() const noexcept {
+    return file_ && file_->writable();
+  }
+  [[nodiscard]] std::unique_ptr<StateOffload>
+  snapshotToDisk(uint32_t slot, std::function<void()> completion);
   void restore(uint32_t slot, const CompositeState &state,
                bool restoreDraftState);
+
+  [[nodiscard]] std::unique_ptr<StateRestore> beginRestore(
+      uint32_t slot, const CompositeState &state, bool restoreDraftState,
+      std::function<void()> completion, std::function<void()> committed);
 
   [[nodiscard]] uint64_t actualAllocatedBytes() const noexcept override {
     return allocations_->bytes.load(std::memory_order_relaxed);
@@ -194,6 +246,9 @@ private:
   allocateDraftRing(std::string_view label,
                     metal::AllocationFailure *failure = nullptr);
   static void refreshViews(Slot &slot);
+  void restoreLengths(uint32_t slot, QwenLogicalLengths lengths, bool restoreDraft);
+  [[nodiscard]] std::shared_ptr<const QwenCompositeState>
+  snapshot(uint32_t slot, QwenLogicalLengths lengths);
 
   metal::MetalBackend &backend_;
   metal::AllocationAdmission admitAllocation_;
@@ -201,6 +256,8 @@ private:
   std::shared_ptr<StateAllocationTracker> allocations_;
   std::shared_ptr<QwenBufferPool> pool_;
   std::array<Slot, ExecutionLimits::maximumBatchWidth> slots_;
+  std::shared_ptr<SlotFile> file_;
+  std::shared_ptr<StateStaging> staging_;
 };
 
 } // namespace splash::model

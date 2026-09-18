@@ -72,6 +72,22 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(args.max_memory, 28 * 1024**3)
         self.assertEqual(args.max_context, 102400)
 
+    def test_cache_disk_quota(self):
+        required = ["serve", "--model", MODEL_ID]
+        self.assertEqual(launcher.parse_args(required).max_cache_disk, 0)
+        self.assertEqual(
+            launcher.parse_args([*required, "--max-cache-disk", "5G"]).max_cache_disk,
+            5 * 1024**3,
+        )
+        # The earlier name still works.
+        self.assertEqual(
+            launcher.parse_args([*required, "--max-state-disk", "5G"]).max_cache_disk,
+            5 * 1024**3,
+        )
+        for invalid in ("auto", "-1", "nan"):
+            with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
+                launcher.parse_args([*required, "--max-cache-disk", invalid])
+
     def test_size_validation(self):
         for value in ("1G", "1GB", "1GiB", "1073741824"):
             self.assertEqual(launcher._parse_max_memory(value), 1024**3)
@@ -117,6 +133,9 @@ class LauncherTests(unittest.TestCase):
                 )
                 self.assertEqual(argv[argv.index("--model") + 1], MODEL_ID)
                 self.assertEqual(
+                    argv[argv.index("--max-cache-disk") + 1], str(5 * 1024**3)
+                )
+                self.assertEqual(
                     argv[-4:],
                     ["--allowed-host", "splash.local", "--allowed-host", "proxy.local"],
                 )
@@ -154,6 +173,8 @@ class LauncherTests(unittest.TestCase):
                         "100K",
                         "--max-memory",
                         "28G",
+                        "--max-cache-disk",
+                        "5G",
                         "--allowed-host",
                         "splash.local",
                         "--allowed-host",

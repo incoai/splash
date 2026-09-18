@@ -3,6 +3,7 @@
 #include "engine/KvCache.hpp"
 #include "engine/KvPool.hpp"
 #include "engine/StateCache.hpp"
+#include "model/Model.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -15,7 +16,12 @@ namespace splash::engine {
 
 struct CacheLookup final {
   uint32_t kvBoundary = 0;
+  // Blocks of the chain up to the state that live only on disk.
+  uint32_t diskBlocks = 0;
   std::optional<CompositeStateLease> state;
+  // A matched block deeper than the state once held a reusable state that
+  // is gone from both tiers.
+  bool lostState = false;
 
   [[nodiscard]] uint32_t resumeBoundary() const noexcept {
     return state ? state->boundary() : 0;
@@ -28,14 +34,36 @@ struct CacheLookup final {
 struct CacheLookupSnapshot final {
   uint64_t lookups = 0;
   uint64_t kvHitTokens = 0;
+  // Restored tokens whose KV came back from disk.
+  uint64_t kvDiskHitTokens = 0;
   uint64_t stateHitTokens = 0;
   uint64_t lazyJunctions = 0;
+  // Lookups that matched KV where a reusable state used to be.
+  uint64_t lostStateMisses = 0;
+};
+
+struct KvTierSnapshot final {
+  // The disk quota shared by KV pages and states, and its current use.
+  uint64_t capacityBytes = 0;
+  uint64_t usedBytes = 0;
+  uint64_t demotions = 0;
+  uint64_t demotionFailures = 0;
+  // Demotions the ring had no room for; the leaf stayed and the requester
+  // waited.
+  uint64_t demotionsRefused = 0;
+  uint64_t restores = 0;
+  uint64_t restoreFailures = 0;
+  // Pages whose demotion is in flight.
+  uint32_t pendingPages = 0;
+  uint32_t diskBlocks = 0;
+  uint64_t diskBytes = 0;
 };
 
 struct CacheSnapshot final {
   KvPoolSnapshot pool;
   KvCache::Snapshot kvCache;
   StateCacheSnapshot stateCache;
+  KvTierSnapshot kvTier;
   CacheLookupSnapshot lookup;
   uint32_t activeRequests = 0;
 };
@@ -59,18 +87,34 @@ struct PageTableView final {
 struct CacheReclaimResult final {
   bool madeProgress = false;
   uint64_t reclaimedBytes = 0;
+  // Nothing was reclaimed, but a transfer in flight holds what the next
+  // reclaim needs: the staging buffer of the one state write, or the ring.
+  // Retry when it lands rather than treating the cache as empty.
+  bool pending = false;
 };
 
 enum class CacheReclaimMode { ReuseBacking, ReleaseBacking };
+
+// KV restores a request waits for before it can run.
+enum class KvRestoreStatus : uint8_t { None, Pending, Failed };
 
 // Owns active Q8 page leases, the content-addressed KV graph and cached
 // composite states. Physical recurrent-state cells remain model-owned.
 class Cache final {
 public:
-  Cache(KvPool &pool, CacheNamespace cacheNamespace);
+  Cache(KvPool &pool, CacheNamespace cacheNamespace, model::KvTier *kvTier = nullptr);
   Cache(const Cache &) = delete;
   Cache &operator=(const Cache &) = delete;
 
+  void setCompletionNotifier(std::function<void()> notifier) {
+    completionNotifier_ = std::move(notifier);
+  }
+  // Consumes finished transfers: a written state or KV page frees its RAM, a
+  // restored block becomes usable, and restores waiting for staging start.
+  [[nodiscard]] bool pollTransfers();
+  void discardState(uint64_t block, const CompositeState *state) {
+    states_.invalidate(block, state);
+  }
   void beginRequest(uint64_t requestId);
   void endRequest(uint64_t requestId);
 
@@ -79,7 +123,13 @@ public:
   [[nodiscard]] CacheLookup lookup(std::span<const uint32_t> prompt,
                                    std::span<const ImageSpan> images = {});
   void recordLookup(const CacheLookup &lookup);
-  void restoreRequest(uint64_t requestId, const CacheLookup &lookup);
+  void promoteState(const CacheLookup &lookup, StateRestore &transfer);
+  // Gives the request the matched chain up to its state. Disk-only blocks
+  // get fresh pages and start their restores; the request waits on
+  // kvRestoreStatus() before it runs. Pages are admitted like ensureTokens().
+  [[nodiscard]] TokenAdmission restoreRequest(uint64_t requestId,
+                                              const CacheLookup &lookup);
+  [[nodiscard]] KvRestoreStatus kvRestoreStatus(uint64_t requestId) const;
 
   [[nodiscard]] TokenAdmission ensureTokens(uint64_t requestId,
                                             uint64_t tokenCount);
@@ -96,13 +146,27 @@ public:
   void publishCompositeState(uint64_t kvBlock,
                              std::shared_ptr<const CompositeState> state,
                              bool checkpoint = false);
+  // Publishes the state of the lane at this block straight to disk, for a
+  // state no cache slot can hold: `write` starts the write from the lane. A
+  // checkpoint takes free quota only. False when the tier cannot take the
+  // state now; nothing is published then.
+  [[nodiscard]] bool publishStateToDisk(uint64_t kvBlock, const StateWriter &write,
+                                        bool checkpoint = false);
   [[nodiscard]] StateCheckpoint checkpointState(uint64_t kvBlock) const noexcept;
   // False only while this exact disposable publication is pinned.
   bool retireCheckpointState(StateCheckpoint checkpoint) noexcept;
 
   // One cache reclaimer for memory growth and pressure warnings. After empty
   // backing, disposable checkpoints are reclaimed first. Ordinary states and
-  // state-free KV leaves retain their shared oldest-first access order.
+  // resident KV leaves share one oldest-first access order. A chosen state
+  // keeps its disk copy when it has one, is written when the tier admits it
+  // and dropped otherwise; its RAM is free when the call returns. A chosen
+  // KV leaf frees its page at once when a disk copy exists, is dropped when
+  // nothing depends on it, and is otherwise written first: its page returns
+  // when the copy has landed, which ensureTokens() reports as Pending so
+  // callers wait instead of evicting more. A full disk quota replaces the
+  // oldest redundant copy of either kind, then the oldest copy that is the
+  // only one.
   // Active requests and pinned restores are never selected. Physical release
   // is paced by the backing: while an earlier release is still being torn
   // down, this pass stops instead of evicting cache whose extents could not
@@ -113,8 +177,8 @@ public:
   // page reusable without immediately emptying its extent.
   [[nodiscard]] CacheReclaimResult reclaimOne(
       CacheReclaimMode mode = CacheReclaimMode::ReleaseBacking);
-  // Recycles an unpinned state, preferring checkpoints, for a required state
-  // publication. KV bytes only return once an extent unmaps.
+  // Recycles exactly one unpinned state, preferring checkpoints, for a
+  // required state publication; the disk tier keeps it when it admits it.
   [[nodiscard]] bool reclaimOneState(bool checkpointsOnly = false);
   // Empty resident backing exists but the previous release is still in
   // flight; more reclaim work becomes possible without evicting anything.
@@ -132,22 +196,77 @@ private:
     std::vector<uint32_t> pages;
     std::vector<uint64_t> cachedBlocks;
     uint64_t pageTableRevision = 0;
+    uint32_t pendingRestores = 0;
+    bool restoreFailed = false;
+  };
+  struct Demotion final {
+    uint64_t block = 0;
+    std::unique_ptr<model::KvTransfer> transfer;
+  };
+  struct Restore final {
+    // Null until the tier has staging for it.
+    std::unique_ptr<model::KvTransfer> transfer;
+    std::vector<uint64_t> waiters;
   };
 
   [[nodiscard]] Request &request(uint64_t requestId);
   [[nodiscard]] const Request &request(uint64_t requestId) const;
-  [[nodiscard]] bool makeLogicalPages(uint32_t count);
-  [[nodiscard]] bool evictOneKvBlock();
-  [[nodiscard]] std::optional<CacheEvictionCandidate>
-  oldestStateFreeKvBlock() const;
+  // Pending, in every verdict below and in the results above, means the
+  // same thing: a transfer in flight holds what this needs, and it comes
+  // back when the transfer lands. Only transfersInFlight() may report it:
+  // a caller told to wait for nothing would wait for ever.
+  enum class Shortfall : uint8_t { Covered, Pending, Exhausted };
+  enum class Eviction : uint8_t {
+    Evicted,
+    // Every remaining leaf waits for the tier to take it.
+    Pending,
+    None,
+  };
+  enum class LeafReclaim : uint8_t {
+    Started,
+    // The ring or the quota is held by transfers in flight.
+    Pending,
+    // Nothing can be written: no tier, or its file failed.
+    Impossible,
+  };
+
+  [[nodiscard]] TokenAdmission admitPages(uint32_t count,
+                                          std::vector<uint32_t> &pages);
+  [[nodiscard]] Shortfall makeLogicalPages(uint32_t count);
+  [[nodiscard]] Eviction evictOneKvBlock();
+  // Oldest resident KV leaf after `after` whose state, if any, is not in RAM.
+  [[nodiscard]] std::optional<CacheEvictionCandidate> oldestKvLeaf(uint64_t after) const;
+  // Frees the RAM of one resident KV leaf: through its disk copy when it has
+  // one, by demotion when a state or disk children depend on it, by erasure
+  // otherwise. Pending when the tier cannot take it right now; a leaf that a
+  // disk subtree depends on is never dropped.
+  [[nodiscard]] LeafReclaim reclaimKvLeaf(uint64_t block);
+  [[nodiscard]] LeafReclaim demoteKv(uint64_t block);
+  // A slot for a new KV copy, replacing older copies while the quota is full.
+  [[nodiscard]] std::shared_ptr<model::KvDiskSlot> acquireDiskSlot();
+  // Gives up one disk copy: the oldest redundant one, KV or state, else the
+  // oldest that is the only copy. False when the disk holds nothing to give.
+  [[nodiscard]] bool freeDiskSpace();
+  void startRestore(uint64_t block);
+  // A KV copy, a KV write or the one state write is in flight, so memory or
+  // quota returns by itself and its completion wakes the engine.
+  [[nodiscard]] bool transfersInFlight() const noexcept;
+  [[nodiscard]] uint64_t pendingBytes() const noexcept;
   [[nodiscard]] uint64_t reclaimEmptyExtents();
 
   KvPool &pool_;
+  model::KvTier *tier_;
   CacheRecency recency_;
   KvCache kv_;
   StateCache states_;
+  std::function<bool()> makeRoom_;
   std::unordered_map<uint64_t, Request> requests_;
+  std::vector<Demotion> demotions_;
+  std::unordered_map<uint64_t, Restore> restores_;
+  uint32_t pendingPages_ = 0;
+  KvTierSnapshot kvTier_;
   CacheLookupSnapshot lookup_;
+  std::function<void()> completionNotifier_;
 };
 
 } // namespace splash::engine

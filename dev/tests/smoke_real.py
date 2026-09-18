@@ -96,6 +96,8 @@ class RealServer:
             command.extend(("--max-context", str(arguments.max_context)))
         if arguments.max_memory is not None:
             command.extend(("--max-memory", arguments.max_memory))
+        if arguments.max_cache_disk is not None:
+            command.extend(("--max-cache-disk", arguments.max_cache_disk))
         self.process = subprocess.Popen(
             command,
             cwd=ROOT,
@@ -752,6 +754,7 @@ def add_server_arguments(parser):
     parser.add_argument("--model", type=model_artifacts.parse_repo_id, required=True)
     parser.add_argument("--max-context", type=int)
     parser.add_argument("--max-memory")
+    parser.add_argument("--max-cache-disk")
     parser.add_argument("--startup-timeout", type=float, default=1800)
 
 
