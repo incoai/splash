@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <stdexcept>
 #include <vector>
 
 namespace splash::kv {
@@ -51,7 +52,11 @@ public:
   void awaitRelease() override;
   [[nodiscard]] uint32_t extentFirstPage(uint32_t page) const override;
   [[nodiscard]] uint32_t extentPageCount(uint32_t page) const override;
-  [[nodiscard]] const Q8LayerStorage &layer(uint32_t index) const;
+  [[nodiscard]] const Q8LayerStorage &layer(uint32_t index) const {
+    if (index >= layers_.size())
+      throw std::out_of_range("invalid attention layer index");
+    return layers_[index];
+  }
 
 private:
   struct Extent {
