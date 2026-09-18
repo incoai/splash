@@ -46,11 +46,14 @@ MODEL_OPERATOR_SOURCES := \
 	runtime/ops/Embedding.cpp \
 	runtime/ops/ExecutionPlans.cpp \
 	runtime/ops/GDN.cpp \
+	runtime/ops/KvCopy.cpp \
 	runtime/ops/Linear.cpp \
 	runtime/ops/MoE.cpp \
 	runtime/ops/Normalization.cpp \
 	runtime/ops/PagedAttention.cpp \
 	runtime/ops/Sampling.cpp
+TEST_SLOT_FILE_ASAN := $(ENGINE_SANITIZER_BUILD)/slot-file-asan-ubsan
+TEST_SLOT_FILE_TSAN := $(ENGINE_SANITIZER_BUILD)/slot-file-tsan
 TEST_BACKEND_ASAN := $(ENGINE_SANITIZER_BUILD)/kv-first-engine-asan-ubsan
 TEST_BACKEND_TSAN := $(ENGINE_SANITIZER_BUILD)/kv-first-engine-tsan
 TEST_FD_TRANSPORT_ASAN := $(ENGINE_SANITIZER_BUILD)/native-fd-asan-ubsan
@@ -124,7 +127,9 @@ TEST_METAL_BACKEND_TEST := $(ENGINE_TEST_BUILD)/metal-backend
 TEST_METAL_BACKEND_AIR := $(ENGINE_TEST_BUILD)/metal-backend.air
 TEST_METAL_BACKEND_LIB := $(ENGINE_TEST_BUILD)/metal-backend.metallib
 
-TEST_CPU_TARGETS := $(TEST_OPERATOR_WORKSPACE) \
+TEST_SLOT_FILE := $(ENGINE_TEST_BUILD)/slot-file
+
+TEST_CPU_TARGETS := $(TEST_SLOT_FILE) $(TEST_OPERATOR_WORKSPACE) \
 	$(TEST_DEVICE_QUERIES) \
 	$(TEST_TUNING_WORKLOADS) \
 	$(TEST_LINEAR_TUNING) $(TEST_ATTENTION_TUNING) \
@@ -184,7 +189,8 @@ TEST_CONFIG_TARGETS := $(filter-out $(LIB),$(TEST_UNIT_TEST_TARGETS)) \
 	$(TEST_Q8_AIR) $(TEST_Q8_KERNEL_AIRS) $(TEST_METAL_BACKEND_AIR)
 PRODUCTION_CONFIG_TARGETS += $(TEST_Q4_PREFILL_PROFILE) \
 	$(TEST_Q4_DECODE_PROFILE) $(TEST_BACKEND_BENCHMARK) $(TUNE_KERNELS)
-SANITIZER_CONFIG_TARGETS := $(TEST_BACKEND_ASAN) $(TEST_BACKEND_TSAN) \
+SANITIZER_CONFIG_TARGETS := $(TEST_SLOT_FILE_ASAN) $(TEST_SLOT_FILE_TSAN) \
+	$(TEST_BACKEND_ASAN) $(TEST_BACKEND_TSAN) \
 	$(TEST_FD_TRANSPORT_ASAN) $(TEST_FD_TRANSPORT_TSAN) \
 	$(TEST_OPERATOR_TUNING_ASAN) $(TEST_OPERATOR_TUNING_TSAN) \
 	$(TEST_OPERATOR_MEASUREMENT_ASAN) $(TEST_OPERATOR_MEASUREMENT_TSAN)
@@ -299,6 +305,9 @@ $(TEST_MEMORY_AUDIT_TEST): runtime/metal/DeviceCapabilities.cpp \
 		dev/tests/engine/memory_audit_test.cpp | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
+$(TEST_SLOT_FILE): runtime/model/SlotFile.cpp dev/tests/engine/slot_file_test.cpp | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
+
 $(TEST_QWEN_STATE_TEST): runtime/metal/DeviceCapabilities.cpp \
 		runtime/metal/MetalBackend.mm \
 		runtime/engine/MemoryGovernor.cpp \
@@ -306,6 +315,7 @@ $(TEST_QWEN_STATE_TEST): runtime/metal/DeviceCapabilities.cpp \
 		runtime/model/WeightStore.cpp \
 		runtime/model/DFlashDraft.cpp \
 		$(MODEL_OPERATOR_SOURCES) \
+		runtime/model/SlotFile.cpp \
 		runtime/model/QwenState.cpp \
 		dev/tests/engine/qwen_state_storage_test.mm | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
@@ -550,6 +560,7 @@ METAL_TEST_ENV := MTL_SHADER_VALIDATION=1
 test-engine: test-engine-cpu test-engine-metal
 
 test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TUNE_KERNELS)
+	$(TEST_SLOT_FILE)
 	$(TEST_DEVICE_QUERIES)
 	$(TEST_TUNING_WORKLOADS)
 	$(TEST_LINEAR_TUNING) --cpu
@@ -636,6 +647,12 @@ benchmark-attention-sweep: $(TEST_ATTENTION_SWEEP) $(LIB)
 benchmark-backend: preflight $(TARGET) $(TEST_BACKEND_BENCHMARK) $(LIB)
 	$(TEST_BACKEND_BENCHMARK) $(LIB) $(MODEL_ROOT)
 
+$(TEST_SLOT_FILE_ASAN): runtime/model/SlotFile.cpp dev/tests/engine/slot_file_test.cpp | $(ENGINE_SANITIZER_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_SANITIZER_CXXFLAGS) -fsanitize=address,undefined $(TEST_INPUTS) -o $@
+
+$(TEST_SLOT_FILE_TSAN): runtime/model/SlotFile.cpp dev/tests/engine/slot_file_test.cpp | $(ENGINE_SANITIZER_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_SANITIZER_CXXFLAGS) -fsanitize=thread $(TEST_INPUTS) -o $@
+
 $(TEST_BACKEND_ASAN): $(BACKEND_CONTROL_SOURCES) \
 		dev/tests/engine/kv_first_engine_test.cpp | $(ENGINE_SANITIZER_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_SANITIZER_CXXFLAGS) -fsanitize=address,undefined \
@@ -679,10 +696,15 @@ $(TEST_OPERATOR_MEASUREMENT_TSAN): dev/tuning/Tuning.cpp dev/tuning/Measurement.
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_SANITIZER_CXXFLAGS) -fsanitize=thread $(TEST_INPUTS) -o $@
 
 .PHONY: test-sanitizers
-test-sanitizers: $(TEST_BACKEND_ASAN) $(TEST_BACKEND_TSAN) \
+test-sanitizers: $(TEST_SLOT_FILE_ASAN) $(TEST_SLOT_FILE_TSAN) \
+		$(TEST_BACKEND_ASAN) $(TEST_BACKEND_TSAN) \
 		$(TEST_FD_TRANSPORT_ASAN) $(TEST_FD_TRANSPORT_TSAN) \
 		$(TEST_OPERATOR_TUNING_ASAN) $(TEST_OPERATOR_TUNING_TSAN) \
 		$(TEST_OPERATOR_MEASUREMENT_ASAN) $(TEST_OPERATOR_MEASUREMENT_TSAN)
+	ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 \
+		UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+		$(TEST_SLOT_FILE_ASAN)
+	TSAN_OPTIONS=halt_on_error=1 $(TEST_SLOT_FILE_TSAN)
 	ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 \
 		UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
 		$(TEST_BACKEND_ASAN)
