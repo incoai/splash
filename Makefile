@@ -231,6 +231,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/QwenTarget.cpp \
 	runtime/model/DFlashDraft.cpp \
 	runtime/model/ModelFactory.cpp \
+	runtime/model/SlotFile.cpp \
 	runtime/model/QwenState.cpp
 ENGINE_MM_SOURCES := \
 	runtime/model/ModelDescriptor.mm \
