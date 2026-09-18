@@ -208,11 +208,4 @@ void Q8PageStorage::awaitRelease() {
     backend_.drainSparseUnmaps();
 }
 
-const Q8LayerStorage &Q8PageStorage::layer(uint32_t index) const {
-    if (index >= layers_.size()) {
-        throw std::out_of_range("invalid attention layer index");
-    }
-    return layers_[index];
-}
-
 }  // namespace splash::kv
