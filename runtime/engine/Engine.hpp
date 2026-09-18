@@ -54,6 +54,8 @@ struct EngineSnapshot final {
   uint64_t deduplicatedStatePublications = 0;
   // Publications completed after reclaiming a cached state.
   uint64_t recycledStatePublications = 0;
+  // Publications written straight to disk because no cache slot was free.
+  uint64_t diskStatePublications = 0;
   uint64_t replayStatePublicationFailures = 0;
   uint64_t junctionMaterializations = 0;
   uint64_t junctionMaterializationFailures = 0;
@@ -112,6 +114,8 @@ private:
     double deadlineMilliseconds = 0.0;
     double retryMilliseconds = 0.0;
     uint64_t epoch = 0;
+    // Memory is on its way back; the limit fires only without progress.
+    bool pending = false;
   };
 
   struct Request final {
@@ -139,17 +143,39 @@ private:
     bool finalized = false;
     std::optional<Failure> failure;
     bool replaying = false;
+    bool skipCache = false;
+    // Admission that waits for its state's read, its KV pages' restores,
+    // or both, before the lane runs.
+    struct Restore {
+      CacheLookup lookup;
+      DraftContextPlan draft;
+      // Null when the state was in RAM.
+      std::unique_ptr<StateRestore> ticket;
+    };
+    std::optional<Restore> restore;
   };
 
+  // An empty plan carries only KV copies for the disk tier.
   struct Pending final {
     BatchPlan plan;
     std::unique_ptr<ModelBatchTicket> ticket;
+  };
+  enum class Prepared : uint8_t {
+    // Some lanes were admitted and the plan runs with them.
+    Runnable,
+    // Every lane was denied and one yielded its memory or failed.
+    Yielded,
+    // Every lane was denied while pages are on their way back; nothing
+    // changed, the lanes retry when the pages land.
+    Waiting,
   };
   double nextHealthCheckMilliseconds_ = 0.0;
 
   [[nodiscard]] Request &request(uint64_t requestId);
   [[nodiscard]] bool admitQueued(double nowMilliseconds);
   [[nodiscard]] bool admit(Request &request, double nowMilliseconds);
+  void completeAdmission(Request &request, CacheLookup &lookup, DraftContextPlan draft);
+  [[nodiscard]] bool pollRestores(double nowMilliseconds);
   [[nodiscard]] DraftContextPlan
   configureDraftStatePlan(Request &request, uint32_t stateBoundary,
                           uint32_t junctionBoundary);
@@ -158,27 +184,52 @@ private:
   [[nodiscard]] bool retireCheckpoint(Request &request);
   void publishReachedStateBoundaries(Request &request,
                                      uint32_t promptProcessed);
-  [[nodiscard]] bool prepare(BatchPlan &plan,
-                             std::vector<ModelBatchItem> &items,
-                             double nowMilliseconds);
-  [[nodiscard]] bool reclaimForGrowth(
+  [[nodiscard]] Prepared prepare(BatchPlan &plan,
+                                 std::vector<ModelBatchItem> &items,
+                                 double nowMilliseconds);
+  [[nodiscard]] CacheReclaimResult reclaimForGrowth(
       CacheReclaimMode mode = CacheReclaimMode::ReleaseBacking);
   [[nodiscard]] bool reclaimIdleState() noexcept;
   [[nodiscard]] bool reuseIdleBackingWhilePaused(const TokenAdmission &admission);
   [[nodiscard]] bool growthPaused() const;
+  // Memory a lane could not get, and what the engine knows about its return.
+  struct Denial {
+    metal::AllocationFailure allocationFailure = metal::AllocationFailure::None;
+    // On its way back: pages whose copies are being written, or a reclaim
+    // that waits for the transfer in flight. The lane waits; nobody yields.
+    bool pending = false;
+    // Still moving: a release or a reclaim in progress, a budget that can
+    // recover, or the above. Waiting or yielding beats failing.
+    bool retryable = false;
+  };
   struct KvAdmission {
     TokenAdmission allocation;
-    bool retryableBudget = false;
+    Denial denial;
   };
-  [[nodiscard]] KvAdmission admitKv(Request &request, uint64_t workEnd);
+  // What a lane does about memory it could not get. Pending memory returns
+  // by itself: the lane waits. Otherwise a lane fails only when it is alone
+  // with nothing left to reclaim; while other lanes hold memory, growth is
+  // paused or the budget may recover, a running lane yields its memory and
+  // a lane being admitted waits.
+  enum class Verdict : uint8_t { Wait, Yield, Fail };
+  [[nodiscard]] Verdict judge(const Denial &denial, uint64_t requestId) const;
+  [[nodiscard]] bool anotherResident(uint64_t requestId) const;
+  // Runs one page admission, reclaiming cache between attempts while that
+  // makes progress.
+  [[nodiscard]] KvAdmission admitKv(const std::function<TokenAdmission()> &attempt);
   [[nodiscard]] bool budgetMayRecover(metal::AllocationFailure failure,
                                       uint64_t generation, bool reclaimed) const;
   void suspendForGrowth(Request &request, uint64_t workEnd,
                         double nowMilliseconds);
   [[nodiscard]] bool resourceRetryReady(const Request &request,
                                         double nowMilliseconds) const noexcept;
+  // With `pending`, memory is on its way back (pages of demoted blocks land
+  // within commands): the wait limit measures time without progress, so it
+  // moves out with every retry that follows progress and never fires while
+  // progress has been made since the last attempt.
   void deferResourceRetry(Request &request, double nowMilliseconds,
-                          StateFailure reason = StateFailure::MemoryPressure) noexcept;
+                          StateFailure reason = StateFailure::MemoryPressure,
+                          bool pending = false) noexcept;
   void signalResourceProgress() noexcept;
   void apply(const BatchPlan &plan, std::span<const ModelStepResult> results,
              double wallMilliseconds, bool representativePrefillTiming);

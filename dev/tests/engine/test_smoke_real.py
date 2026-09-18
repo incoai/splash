@@ -22,6 +22,7 @@ class SmokeRealTests(unittest.TestCase):
                         model="test-model",
                         max_context=None,
                         max_memory=None,
+                        max_cache_disk=None,
                     )
                     with (
                         mock.patch.object(

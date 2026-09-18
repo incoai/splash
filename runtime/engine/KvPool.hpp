@@ -26,6 +26,8 @@ enum class KvPageAcquireFailure : uint8_t {
   None,
   LogicalCapacity,
   PhysicalCapacity,
+  // Pages of demoted blocks return once their disk copies land; retry then.
+  Pending,
 };
 
 struct KvPageAcquisition {
@@ -56,6 +58,8 @@ public:
   [[nodiscard]] uint32_t pageCount() const noexcept;
   [[nodiscard]] uint64_t bytesPerPage() const noexcept;
   [[nodiscard]] uint32_t freePageCount() const noexcept;
+  // Free pages whose backing is mapped; acquisition hands these out first.
+  [[nodiscard]] uint32_t freeResidentPageCount() const noexcept;
   [[nodiscard]] uint32_t activeReferences(uint32_t page) const;
   [[nodiscard]] bool pageFree(uint32_t page) const;
   [[nodiscard]] uint64_t residentBackingBytes() const noexcept;

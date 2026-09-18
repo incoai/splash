@@ -28,16 +28,26 @@ public:
   void restore(uint64_t requestId, uint32_t restoredPrefixLength,
                      std::shared_ptr<const CompositeState> restoredState,
                      bool restoreDraftState) override;
+  [[nodiscard]] std::unique_ptr<StateRestore> beginRestore(
+      uint64_t requestId, uint32_t boundary,
+      std::shared_ptr<const CompositeState> state, bool restoreDraft,
+      std::function<void()> completion) override;
   void setDraftContextPlan(uint64_t requestId, DraftContextPlan plan) override;
   [[nodiscard]] std::vector<ModelStepResult>
   prefill(const BatchPlan &plan, std::span<const ModelBatchItem> items);
   [[nodiscard]] std::unique_ptr<ModelBatchTicket>
   submit(const BatchPlan &plan, std::span<const ModelBatchItem> items,
               std::function<void()> completion) override;
+  [[nodiscard]] KvTier *kvTier() noexcept override;
+  [[nodiscard]] std::unique_ptr<ModelBatchTicket>
+  submitTransfers(std::function<void()> completion) override;
   [[nodiscard]] std::vector<ModelStepResult>
   decode(const BatchPlan &plan, std::span<const ModelBatchItem> items);
   [[nodiscard]] std::shared_ptr<const CompositeState>
   snapshot(uint64_t requestId) override;
+  [[nodiscard]] bool canSnapshotToDisk() const noexcept override;
+  [[nodiscard]] std::unique_ptr<StateOffload>
+  snapshotToDisk(uint64_t requestId, std::function<void()> completion) override;
   [[nodiscard]] uint64_t reclaimIdleState() noexcept override;
   void provideMask(uint64_t requestId,
                    std::span<const uint32_t> words) override;
@@ -56,6 +66,10 @@ public:
   telemetry() const noexcept override;
 
 private:
+  // The state slot of a resident request whose committed state can be
+  // snapshotted: page-aligned, with a complete draft window.
+  [[nodiscard]] uint32_t committedStateSlot(uint64_t requestId);
+  void finishRestore(uint64_t requestId, uint32_t boundary, bool restoreDraft);
   void prepareWarmupDecode(uint64_t requestId, uint32_t anchor);
   [[nodiscard]] metal::AllocationResult beginAt(const ModelRequest &request,
                                        uint32_t stateSlot);
