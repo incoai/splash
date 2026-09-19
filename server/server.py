@@ -354,7 +354,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             typed = {
                 "name": self.app.model,
                 "description": "Splash resident model",
-                "release_date": None,
+                "release_date": "",
             }
             if path == "/v1/models":
                 self._json(200, {"object": "list", "data": [model], "models": [typed]})
@@ -469,13 +469,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 job, row = self.app.prepare_judgment(body, deadline=deadline)
                 remaining_request_time(deadline)
                 if self._client_disconnected():
-                    raise ConnectionResetError(
-                        "client disconnected before submission"
-                    )
+                    raise ConnectionResetError("client disconnected before submission")
                 if not self.app.backend.submit(job):
-                    raise APIError(
-                        429, "request queue is full", "rate_limit_exceeded"
-                    )
+                    raise APIError(429, "request queue is full", "rate_limit_exceeded")
                 submitted = True
                 self._judgment_complete(job, row)
                 return
@@ -562,6 +558,8 @@ class FrontendHandler(BaseHTTPRequestHandler):
         except APIError as error:
             if submitted:
                 self.app.backend.cancel(job)
+            if systemone and error.status == 503:
+                error = APIError(529, error.message, error.code)
             # The native outcome was already logged; a server-side failure
             # after submission must still reach the console.
             self._safe_error(error, anthropic, log=not submitted or error.status >= 500)
@@ -590,7 +588,6 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 self._body_reservation = None
             admission.release()
 
-
     def _judgment_complete(self, job, row):
         result = None
         while result is None:
@@ -611,28 +608,23 @@ class FrontendHandler(BaseHTTPRequestHandler):
         )
 
     def _systemone(self, body, deadline):
-        jobs = []
+        active_job = None
         try:
             entries = self.app.prepare_systemone(body, deadline=deadline)
             remaining_request_time(deadline)
             if self._client_disconnected():
-                raise ConnectionResetError(
-                    "client disconnected before submission"
-                )
-            for _qid, _spec, job in entries:
-                if job is None:
-                    continue
-                jobs.append(job)
-                if not self.app.backend.submit(job):
-                    raise APIError(
-                        429, "request queue is full", "rate_limit_exceeded"
-                    )
+                raise ConnectionResetError("client disconnected before submission")
             answers = {}
             input_tokens = 0
             for qid, spec, job in entries:
                 if job is None:
                     answers[qid] = judgments.deterministic_answer(spec)
                     continue
+                # One admitted job per HTTP request preserves the existing
+                # queue bound and lets later questions reuse the state prefix.
+                active_job = job
+                if not self.app.backend.submit(job):
+                    raise APIError(429, "request queue is full", "rate_limit_exceeded")
                 result = None
                 while result is None:
                     kind, value = self._next_event(job)
@@ -640,23 +632,20 @@ class FrontendHandler(BaseHTTPRequestHandler):
                         result = value
                 if result.reason == "cancelled":
                     if job.timed_out:
-                        raise APIError(
-                            504, "request timed out", "request_timeout"
-                        )
+                        raise APIError(504, "request timed out", "request_timeout")
                     raise APIError(500, "request cancelled", "request_cancelled")
                 if result.reason != "stop" or len(result.option_logits) != len(
                     job.score_tokens
                 ):
-                    raise APIError(
-                        500, "runtime protocol error", "protocol_error"
-                    )
+                    raise APIError(500, "runtime protocol error", "protocol_error")
                 input_tokens += result.prompt_tokens
                 answers[qid] = judgments.systemone_answer(
                     spec, judgments.softmax(list(result.option_logits))
                 )
+                active_job = None
         except BaseException:
-            for job in jobs:
-                self.app.backend.cancel(job)
+            if active_job is not None:
+                self.app.backend.cancel(active_job)
             raise
         self._json(
             200,

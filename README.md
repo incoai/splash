@@ -56,6 +56,24 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 Reasoning is on by default. `"reasoning_effort": "none"` turns it off, and
 Qwen3.8-27B also takes `low`, `medium`, and `xhigh`.
 
+### Typed judgments without generation
+
+`POST /v1/systemone` accepts the [TypeSafe System One](https://docs.typesafe.ai/)
+`noul`, `choice` and `score` request and response shapes over a shared state, and
+works with the official `typesafe-sdk` (verified with 0.7.0). `POST /v1/judgments`
+serves [SemIf](https://github.com/TheoLeeCJ/SemIf)'s `direct-options-v1` prompt and
+raw option logits. Both are text-only, disable thinking, and read final-position
+logits without sampling or decoding, so output-token usage is zero.
+[DEVELOPMENT.md](DEVELOPMENT.md#judgment-contracts) has examples and the full
+contract.
+
+**These are local model scores, not Jev predictions or calibrated confidence.**
+Probabilities are a softmax over the declared answer slots. Choice/score
+`confidence` is normalized entropy concentration, `1 - H(p) / log(K)`, not an
+estimate of correctness. Score answers are probability-weighted level indices.
+Measure accuracy and calibrate on representative held-out data before using
+thresholds to make consequential decisions.
+
 ## Models
 
 | Package (`--model`) | Contents | Download |

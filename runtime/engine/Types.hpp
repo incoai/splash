@@ -40,7 +40,7 @@ struct EngineRequest final {
   // Nonempty selects score-only mode: prefill runs to completion, no token is
   // generated, and the raw final-position logits at these ids are returned in
   // the completion callback. maxNewTokens must be zero.
-  std::vector<uint32_t> scoreTokens;
+  std::vector<uint32_t> scoreTokens{};
 
   [[nodiscard]] ModelRequest modelView() const noexcept {
     return {id,        cohort,   prompt,     images, imagePixels,

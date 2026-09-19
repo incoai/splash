@@ -1,3 +1,26 @@
+# SemIf direct-options prompt and helpers:
+# https://github.com/TheoLeeCJ/SemIf
+# MIT License
+# Copyright (c) 2026 TheoLeeCJ
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
 """Direct finite-option scoring shared by /v1/judgments and /v1/systemone.
 
 Both endpoints render the SemIf direct-options-v1 prompt shape (a fixed
@@ -22,14 +45,14 @@ DIRECT_SYSTEM = (
     "listed option. Respond with only its uppercase letter, with no explanation "
     "or reasoning."
 )
+SYSTEMONE_SYSTEM = DIRECT_SYSTEM.replace("uppercase letter", "uppercase slot")
 PROMPT_VERSION = "direct-options-v1"
 READOUT = (
-    "native full-vocabulary last-position logits restricted to declared "
-    "answer slots"
+    "native full-vocabulary last-position logits restricted to declared answer slots"
 )
 PROBABILITY_STATUS = "conditional option score; uncalibrated as decision confidence"
 # Native score-only requests carry at most this many option tokens.
-MAX_OPTIONS = 16
+MAX_OPTIONS = 255
 
 _MISSING = object()
 
@@ -194,9 +217,7 @@ def encode_prompt(tokenizer, messages, labels, *, admit=None, checkpoint=None):
     for label, token in zip(labels, slots):
         if checkpoint is not None:
             checkpoint()
-        if tokenizer.encode(prompt + label, add_special_tokens=False) != ids + [
-            token
-        ]:
+        if tokenizer.encode(prompt + label, add_special_tokens=False) != ids + [token]:
             raise ScoringUnsupported(
                 f"answer boundary changes tokenization for slot {label!r}"
             )
@@ -237,7 +258,6 @@ class SystemOneQuestion:
     deterministic: bool
 
 
-_QUESTION_KEYS = {"type", "instructions", "criteria"}
 _QUESTION_TYPES = {"noul", "choice", "score"}
 
 
@@ -251,15 +271,9 @@ def _question_spec(qid, question):
     if not isinstance(question, dict):
         return None, [detail(loc, "question must be an object", "model_type")]
     details = []
-    for key in sorted(set(question) - _QUESTION_KEYS):
-        details.append(
-            detail([*loc, key], "extra field not permitted", "extra_forbidden")
-        )
     kind = question.get("type")
-    if kind not in _QUESTION_TYPES:
-        details.append(
-            detail([*loc, "type"], "type must be noul, choice, or score")
-        )
+    if not isinstance(kind, str) or kind not in _QUESTION_TYPES:
+        details.append(detail([*loc, "type"], "type must be noul, choice, or score"))
         return None, details
     instructions = question.get("instructions")
     if instructions is not None and not isinstance(instructions, (str, dict, list)):
@@ -276,9 +290,10 @@ def _question_spec(qid, question):
     if kind == "noul":
         if criteria is not None and (
             not isinstance(criteria, dict)
-            or not criteria
-            or set(criteria) - {"true", "false"}
-            or any(not _json_description(value) for value in criteria.values())
+            or any(
+                not _json_description(criteria.get(label))
+                for label in ("true", "false")
+            )
         ):
             details.append(
                 detail(
@@ -289,7 +304,9 @@ def _question_spec(qid, question):
             )
         labels = ("true", "false")
         descriptions = tuple(
-            criteria.get(label) if criteria and criteria.get(label) is not None else label
+            criteria.get(label)
+            if isinstance(criteria, dict) and criteria.get(label) is not None
+            else label
             for label in labels
         )
     elif kind == "choice":
@@ -308,12 +325,8 @@ def _question_spec(qid, question):
                     f"choice supports at most {MAX_OPTIONS} options",
                 )
             )
-        elif any(
-            not isinstance(label, str) or not label for label in criteria
-        ):
-            details.append(
-                detail([*loc, "criteria"], "choice labels must be nonempty strings")
-            )
+        elif any(not isinstance(label, str) for label in criteria):
+            details.append(detail([*loc, "criteria"], "choice labels must be strings"))
         elif any(not _json_description(value) for value in criteria.values()):
             details.append(
                 detail(
@@ -374,18 +387,14 @@ def validate_systemone(body):
     if state is _MISSING:
         details.append(detail(["state"], "field required", "missing"))
     elif not isinstance(state, (str, dict, list)):
-        details.append(
-            detail(["state"], "state must be a string, object, or array")
-        )
+        details.append(detail(["state"], "state must be a string, object, or array"))
         state = None
     questions = body.get("questions", _MISSING)
     specs = []
     if questions is _MISSING:
         details.append(detail(["questions"], "field required", "missing"))
     elif not isinstance(questions, dict) or not questions:
-        details.append(
-            detail(["questions"], "questions must be a nonempty object")
-        )
+        details.append(detail(["questions"], "questions must be a nonempty object"))
     else:
         for qid, question in questions.items():
             spec, errors = _question_spec(qid, question)
@@ -399,17 +408,15 @@ def systemone_messages(state, spec, slots):
     instructions and descriptions stay JSON values; labels keep their
     meaning alongside the answer slot."""
     options = [
-        {"letter": slot, "label": label, "description": description}
-        for slot, label, description in zip(
-            slots, spec.labels, spec.descriptions
-        )
+        {"slot": slot, "label": label, "description": description}
+        for slot, label, description in zip(slots, spec.labels, spec.descriptions)
     ]
     payload = {"evidence": state}
     if spec.instructions is not None:
         payload["criterion"] = spec.instructions
     payload["options"] = options
     return [
-        {"role": "system", "content": DIRECT_SYSTEM},
+        {"role": "system", "content": SYSTEMONE_SYSTEM},
         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
     ]
 
@@ -432,8 +439,7 @@ def systemone_answer(spec, probabilities):
         ),
         "legend": spec.legend,
         "probabilities": {
-            str(index): probability
-            for index, probability in enumerate(probabilities)
+            str(index): probability for index, probability in enumerate(probabilities)
         },
         "confidence": concentration(probabilities),
     }

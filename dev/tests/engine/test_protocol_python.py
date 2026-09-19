@@ -409,6 +409,22 @@ class ProtocolPythonTests(unittest.TestCase):
             lambda: p.decode_frame(parse_all(bad)[0]),
         )
 
+    def test_maximum_score_domain_roundtrips_without_truncation(self):
+        request = replace(example_score_request(), score_tokens=tuple(range(255)))
+        done = p.DoneEvent(
+            91,
+            p.FinishReason.STOP,
+            3,
+            0,
+            1000,
+            0,
+            1000,
+            tuple(float(index) for index in range(255)),
+        )
+        for message in (request, done):
+            encoded = p.serialize_message(message)
+            self.assertEqual(p.decode_frame(parse_all(encoded)[0]), message)
+
     def test_score_request_rejects_generation_combinations(self):
         base = example_score_request()
         cases = (
@@ -489,9 +505,7 @@ class ProtocolPythonTests(unittest.TestCase):
         )
         wire = p.serialize_message(done)
         self.assertEqual(struct.unpack_from("<I", wire, 24 + 41)[0], 3)
-        self.assertEqual(
-            struct.unpack_from("<3f", wire, 24 + 45), done.option_logits
-        )
+        self.assertEqual(struct.unpack_from("<3f", wire, 24 + 45), done.option_logits)
         self.assertEqual(p.decode_frame(parse_all(wire)[0]), done)
         # A wrong logit count must fail closed, not truncate.
         bad = mutate_u32(wire, 24 + 41, 2)

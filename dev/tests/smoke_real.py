@@ -13,6 +13,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -508,6 +509,7 @@ def run(port: int, model: str) -> None:
 
     run_images(port, model, nonce)
     run_protocol_extensions(port, model)
+    run_judgments(port, model, nonce)
 
 
 def run_protocol_extensions(port: int, model: str) -> None:
@@ -740,6 +742,251 @@ def run_protocol_extensions(port: int, model: str) -> None:
         "Anthropic count/beta, hidden-thinking continuation, structured output and nullable Responses: PASS",
         flush=True,
     )
+
+
+JUDGMENT_QUESTION = "What is the approval status of the proposal?"
+JUDGMENT_OPTIONS = [
+    {"id": "approved", "description": "Approval was explicitly given."},
+    {"id": "pending", "description": "Approval has not been given yet."},
+    {"id": "rejected", "description": "The proposal was turned down."},
+]
+
+
+def judgment_body(model: str, state: str, **extra) -> dict:
+    body = {
+        "id": "smoke",
+        "model": model,
+        "state": state,
+        "question": JUDGMENT_QUESTION,
+        "options": JUDGMENT_OPTIONS,
+    }
+    body.update(extra)
+    return body
+
+
+def filler(nonce: str, label: str, items: int) -> str:
+    """Distinct bulk evidence: the label recurs in every item, so two fillers
+    share no reusable prefix."""
+    return " ".join(
+        f"Appendix {label} item {index} of request {nonce} records routine "
+        "correspondence that has no bearing on the decision."
+        for index in range(items)
+    )
+
+
+def counters(port: int) -> dict:
+    code, status = request(port, "GET", "/status")
+    require(code == 200, f"status read failed with HTTP {code}")
+    return {
+        "submitted": status["requests"]["submitted"],
+        "cancelled": status["requests"]["cancelled"],
+        "failed": status["requests"]["failed"],
+        "reused_tokens": status["cache"]["reused_tokens"],
+        "restarts": status["transport"]["restarts"],
+    }
+
+
+def run_judgments(port: int, model: str, nonce: str) -> None:
+    approved = (
+        "Minutes of the review board: the board voted unanimously to approve "
+        f"the proposal and entered the approval in the register. Request {nonce}."
+    )
+    code, judgment = request(
+        port, "POST", "/v1/judgments", judgment_body(model, approved)
+    )
+    require(code == 200, f"judgment failed with HTTP {code}: {judgment!r}")
+    ids, logits = judgment["option_ids"], judgment["option_logits"]
+    probabilities = judgment["probabilities"]
+    require(
+        len(ids) == len(logits) == len(probabilities) == len(JUDGMENT_OPTIONS),
+        f"judgment returned a ragged score: {judgment!r}",
+    )
+    require(
+        abs(sum(probabilities) - 1.0) < 1e-6,
+        f"judgment probabilities are not normalized: {probabilities!r}",
+    )
+    best = ids[max(range(len(ids)), key=probabilities.__getitem__)]
+    require(
+        best == "approved",
+        f"judgment scored the wrong option: {dict(zip(ids, probabilities))}",
+    )
+    require(
+        len(judgment["prompt_sha256"]) == 64
+        and len(judgment["answer_token_ids"]) == len(ids)
+        and judgment["prompt_version"] == "direct-options-v1",
+        f"judgment provenance is incomplete: {judgment!r}",
+    )
+    usage = judgment["usage"]
+    require(
+        usage["completion_tokens"] == 0 and usage["prompt_tokens"] > 0,
+        f"scoring generated tokens: {usage!r}",
+    )
+    print("judgments scoring: PASS", flush=True)
+
+    code, systemone = request(
+        port,
+        "POST",
+        "/v1/systemone",
+        {
+            "model": model,
+            "state": {"message": f"I was charged twice. Fix this today. {nonce}"},
+            "questions": {
+                "billing": {
+                    "type": "noul",
+                    "instructions": "Is this message about billing?",
+                },
+                "department": {
+                    "type": "choice",
+                    "instructions": "Which team should handle this?",
+                    "criteria": {"billing": None, "technical": None, "sales": None},
+                },
+                "urgency": {
+                    "type": "score",
+                    "instructions": "How urgent is the request?",
+                    "criteria": ["No urgency", "This week", "Today"],
+                },
+                "sole": {"type": "choice", "criteria": {"only": None}},
+            },
+        },
+    )
+    require(code == 200, f"System One failed with HTTP {code}: {systemone!r}")
+    answers = systemone["answers"]
+    require(
+        answers["billing"]["noul"] > 0.5,
+        f"System One missed the billing topic: {answers['billing']!r}",
+    )
+    require(
+        answers["department"]["choice"] == "billing",
+        f"System One routed to the wrong team: {answers['department']!r}",
+    )
+    require(
+        answers["urgency"]["score"] >= 1.0,
+        f"System One under-scored an urgent request: {answers['urgency']!r}",
+    )
+    require(
+        answers["sole"]["choice"] == "only" and answers["sole"]["confidence"] == 1.0,
+        f"a singleton domain did not answer itself: {answers['sole']!r}",
+    )
+    require(
+        systemone["usage"]["output_tokens"] == 0,
+        f"System One generated tokens: {systemone['usage']!r}",
+    )
+    print("system one answers: PASS", flush=True)
+
+    shared = judgment_body(model, f"{approved} {filler(nonce, 'reuse', 200)}")
+    code, cold = request(port, "POST", "/v1/judgments", shared, timeout=300)
+    require(code == 200, f"cold scored prompt failed with HTTP {code}: {cold!r}")
+    before = counters(port)
+    code, warm = request(port, "POST", "/v1/judgments", shared, timeout=300)
+    require(code == 200, f"repeated scored prompt failed with HTTP {code}: {warm!r}")
+    after = counters(port)
+    prompt_tokens = warm["usage"]["prompt_tokens"]
+    reused = after["reused_tokens"] - before["reused_tokens"]
+    require(
+        cold["usage"]["prompt_tokens"] == prompt_tokens,
+        "the repeated scored prompt changed length",
+    )
+    # The tail below the last reusable block boundary is always recomputed.
+    require(
+        reused * 10 >= prompt_tokens * 9,
+        f"scoring reused only {reused} of {prompt_tokens} prompt tokens",
+    )
+    print(f"judgments cache reuse: PASS ({reused}/{prompt_tokens})", flush=True)
+
+    outcomes = {}
+    quiet = counters(port)
+
+    def score() -> None:
+        outcomes["score"] = request(
+            port,
+            "POST",
+            "/v1/judgments",
+            judgment_body(model, f"{approved} Concurrent."),
+            timeout=300,
+        )
+
+    def chat() -> None:
+        outcomes["chat"] = request(
+            port,
+            "POST",
+            "/v1/chat/completions",
+            chat_body(model, f"Reply with one short word. Concurrent {nonce}."),
+            timeout=300,
+        )
+
+    workers = [threading.Thread(target=score), threading.Thread(target=chat)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(300)
+    require(len(outcomes) == 2, "a concurrent scoring/chat request did not finish")
+    score_code, scored = outcomes["score"]
+    chat_code, chatted = outcomes["chat"]
+    require(score_code == 200, f"concurrent scoring failed: {scored!r}")
+    require(chat_code == 200, f"concurrent chat failed: {chatted!r}")
+    require(
+        scored["usage"]["completion_tokens"] == 0,
+        f"concurrent scoring generated tokens: {scored['usage']!r}",
+    )
+    require(
+        chatted["usage"]["completion_tokens"] > 0,
+        f"concurrent chat generated nothing: {chatted['usage']!r}",
+    )
+    mixed = counters(port)
+    require(
+        mixed["failed"] == quiet["failed"] and mixed["restarts"] == 0,
+        f"mixed scoring and chat destabilized the runtime: {quiet!r} -> {mixed!r}",
+    )
+    print("mixed scoring and chat: PASS", flush=True)
+
+    code, long_score = request(
+        port,
+        "POST",
+        "/v1/judgments",
+        judgment_body(model, filler(nonce, "warm", 250)),
+        timeout=300,
+    )
+    require(code == 200, f"long scored prompt failed with HTTP {code}: {long_score!r}")
+    forward = long_score["forward_seconds"]
+    require(forward > 0.5, f"prefill is too fast to cancel: {forward:.2f}s")
+    before = counters(port)
+    started = time.monotonic()
+    code, timed_out = request(
+        port,
+        "POST",
+        "/v1/judgments",
+        judgment_body(model, filler(nonce, "stop", 250), timeout=forward / 3),
+        timeout=300,
+    )
+    elapsed = time.monotonic() - started
+    require(code == 504, f"expected a scoring timeout, got HTTP {code}: {timed_out!r}")
+    require(
+        elapsed < forward,
+        f"the deadline did not cut prefill short: {elapsed:.2f}s of {forward:.2f}s",
+    )
+    # The 504 is the frontend giving up; the engine reports the cancellation
+    # once the in-flight prefill chunk unwinds.
+    limit = time.monotonic() + 120
+    after = counters(port)
+    while time.monotonic() < limit and after["cancelled"] == before["cancelled"]:
+        time.sleep(0.5)
+        after = counters(port)
+    require(
+        after["submitted"] > before["submitted"],
+        f"the timed-out score never reached the engine: {before!r} -> {after!r}",
+    )
+    require(
+        after["cancelled"] > before["cancelled"],
+        f"the timed-out score was not cancelled natively: {before!r} -> {after!r}",
+    )
+    code, recovered = request(
+        port, "POST", "/v1/judgments", judgment_body(model, approved)
+    )
+    require(
+        code == 200 and recovered["usage"]["completion_tokens"] == 0,
+        f"scoring did not recover after cancellation: {recovered!r}",
+    )
+    print(f"judgments cancellation: PASS (504 after {elapsed:.2f}s)", flush=True)
 
 
 def add_server_arguments(parser):

@@ -193,8 +193,8 @@ struct ModelStepResult final {
   uint64_t requestId = 0;
   uint32_t consumedPromptTokens = 0;
   std::vector<uint32_t> outputTokens;
-  // True when a stop token ended the sequence; budget exhaustion is the
-  // engine's decision.
+  // True after a stop token or the final score-only prefill chunk.
+  // Generation budget exhaustion is the engine's decision.
   bool finished = false;
   DecodeStage nextDecodeStage = DecodeStage::Regular;
   uint32_t draftedTokens = 0;
