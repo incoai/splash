@@ -12,6 +12,13 @@
 namespace splash::engine {
 namespace {
 
+static_assert(protocol::kMaximumScoreOptions ==
+                  model::ExecutionLimits::maximumScoreOptions,
+              "native protocol and model score option bounds must match");
+static_assert(protocol::kMinimumScoreOptions ==
+                  model::ExecutionLimits::minimumScoreOptions,
+              "native protocol and model score option bounds must match");
+
 RequestPriority mapPriority(protocol::RequestPriority priority) {
   switch (priority) {
   case protocol::RequestPriority::Foreground:
@@ -267,6 +274,7 @@ bool NativeRuntime::handleRequest(protocol::RequestFrame &request) {
     }
     engineRequest.imagePixels = std::move(request.imagePixels);
     engineRequest.maxNewTokens = request.logicalMaxOutputTokens;
+    engineRequest.scoreTokens = std::move(request.scoreTokens);
     engineRequest.sampling = {request.sampling.temperature,
                               request.sampling.topP, request.sampling.topK,
                               request.seed};
@@ -541,8 +549,8 @@ void NativeRuntime::maskRequested(uint64_t requestId,
 }
 
 void NativeRuntime::completed(uint64_t requestId, EngineFinishReason reason,
-                              uint32_t promptTokens,
-                              uint32_t completionTokens) {
+                              uint32_t promptTokens, uint32_t completionTokens,
+                              std::span<const float> optionLogits) {
   RequestTelemetry &telemetry = telemetry_.at(requestId);
   double now = clocks_.monotonicMilliseconds();
   double started = telemetry.startedMilliseconds > 0.0
@@ -553,7 +561,8 @@ void NativeRuntime::completed(uint64_t requestId, EngineFinishReason reason,
       requestId, mapFinishReason(reason), promptTokens, completionTokens,
       durationMicros(started, first),
       telemetry.firstTokenMilliseconds ? durationMicros(first, now) : 0,
-      durationMicros(telemetry.arrivedMilliseconds, now)});
+      durationMicros(telemetry.arrivedMilliseconds, now),
+      std::vector<float>(optionLogits.begin(), optionLogits.end())});
   pendingMasks_.erase(requestId);
   telemetry_.erase(requestId);
 }

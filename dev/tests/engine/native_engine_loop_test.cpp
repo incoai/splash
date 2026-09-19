@@ -74,9 +74,12 @@ public:
          ++slot) {
       const bool used = std::any_of(
           requests_.begin(), requests_.end(),
-          [slot](const auto &entry) { return entry.second == slot; });
+          [slot](const auto &entry) { return entry.second.slot == slot; });
       if (!used) {
-        requests_.emplace(request.id, slot);
+        requests_.emplace(
+            request.id,
+            Active{slot, static_cast<uint32_t>(request.prompt.size()),
+                   {request.scoreTokens.begin(), request.scoreTokens.end()}});
         return {slot, StateFailure::None};
       }
     }
@@ -98,13 +101,22 @@ public:
   prefill(const BatchPlan &, std::span<const ModelBatchItem> items) {
     std::vector<ModelStepResult> results;
     for (const auto &item : items) {
-      results.push_back({item.requestId,
-                         item.tokenCount,
-                         {},
-                         false,
-                         DecodeStage::Regular,
-                         0,
-                         0});
+      auto found = requests_.find(item.requestId);
+      const bool last =
+          found != requests_.end() &&
+          item.logicalPosition + item.tokenCount == found->second.promptTokens;
+      const bool scoring =
+          found != requests_.end() && !found->second.scoreTokens.empty();
+      std::vector<float> logits;
+      if (scoring && last) {
+        logits.reserve(found->second.scoreTokens.size());
+        for (size_t index = 0; index < found->second.scoreTokens.size();
+             ++index) {
+          logits.push_back(static_cast<float>(index) + 0.5f);
+        }
+      }
+      results.push_back({item.requestId, item.tokenCount, {}, scoring && last,
+                         DecodeStage::Regular, 0, 0, 0, std::move(logits)});
     }
     return results;
   }
@@ -144,7 +156,12 @@ public:
   uint32_t restored() const noexcept { return restored_; }
 
 private:
-  std::unordered_map<uint64_t, uint32_t> requests_;
+  struct Active {
+    uint32_t slot = 0;
+    uint32_t promptTokens = 0;
+    std::vector<uint32_t> scoreTokens;
+  };
+  std::unordered_map<uint64_t, Active> requests_;
   uint32_t restored_ = 0;
 };
 
@@ -757,6 +774,101 @@ void testStepTokensFitTheWire() {
   }
 }
 
+protocol::RequestFrame scoreRequest(uint64_t id, uint32_t promptTokens) {
+  protocol::RequestFrame result = request(id, 0);
+  result.promptTokens.resize(promptTokens);
+  for (uint32_t i = 0; i < result.promptTokens.size(); ++i)
+    result.promptTokens[i] = i + 1;
+  result.scoreTokens = {10, 20, 30};
+  return result;
+}
+
+void testScoreRequestCompletesAfterFullPrompt() {
+  Backing backing(512);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  std::vector<uint8_t> output;
+  engine::NativeLoopConfig config;
+  config.engine.maxContext = 8192;
+  engine::NativeRuntime loop(
+      config, resources, executor,
+      [&](std::span<const uint8_t> bytes) {
+        output.insert(output.end(), bytes.begin(), bytes.end());
+      },
+      [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
+      {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
+  loop.announceReady();
+  auto encoded = protocol::serializeMessage(
+      protocol::Message{scoreRequest(9, 3000)});
+  require(encoded && loop.receive(*encoded.value), "score request failed");
+  runUntilIdle(loop);
+
+  uint32_t tokensEvents = 0;
+  uint32_t doneCount = 0;
+  for (const protocol::Message &message : decodeMessages(output)) {
+    if (std::holds_alternative<protocol::TokensEvent>(message))
+      ++tokensEvents;
+    if (const auto *done = std::get_if<protocol::DoneEvent>(&message)) {
+      ++doneCount;
+      require(done->requestId == 9, "score done id mismatch");
+      require(done->completionTokens == 0, "score done emitted completion");
+      require(done->decodeMicros == 0, "score done reported decode time");
+      require(done->promptTokens == 3000, "score done prompt count mismatch");
+      require(done->optionLogits.size() == 3, "score done logit count mismatch");
+      require(done->optionLogits[0] == 0.5f && done->optionLogits[1] == 1.5f &&
+                  done->optionLogits[2] == 2.5f,
+              "score done logits are not in request order");
+      require(done->reason == protocol::FinishReason::Stop,
+              "score done reason is not stop");
+    }
+  }
+  require(doneCount == 1 && tokensEvents == 0,
+          "score request did not complete without generating tokens");
+}
+
+void testCancelledScoreReturnsEmptyLogits() {
+  Backing backing(32);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  executor.ticketReady = std::make_shared<bool>(false);
+  std::vector<uint8_t> output;
+  engine::NativeLoopConfig config;
+  config.engine.maxContext = 1024;
+  engine::NativeRuntime loop(
+      config, resources, executor,
+      [&](std::span<const uint8_t> bytes) {
+        output.insert(output.end(), bytes.begin(), bytes.end());
+      },
+      [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
+      {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
+  loop.announceReady();
+  auto encoded = protocol::serializeMessage(
+      protocol::Message{scoreRequest(11, 65)});
+  require(encoded && loop.receive(*encoded.value), "cancel-score request failed");
+  require(loop.tick() && loop.commandInFlight(), "score prefill was not held");
+  protocol::CancelFrame cancel{11};
+  auto cancelWire = protocol::serializeMessage(protocol::Message{cancel});
+  require(cancelWire && loop.receive(*cancelWire.value), "score cancel failed");
+  *executor.ticketReady = true;
+  runUntilIdle(loop);
+
+  uint32_t doneCount = 0;
+  for (const protocol::Message &message : decodeMessages(output)) {
+    if (const auto *done = std::get_if<protocol::DoneEvent>(&message)) {
+      ++doneCount;
+      require(done->reason == protocol::FinishReason::Cancelled,
+              "cancelled score did not report Cancelled");
+      require(done->optionLogits.empty(),
+              "cancelled score returned logits");
+      require(done->completionTokens == 0, "cancelled score emitted tokens");
+    }
+  }
+  require(doneCount == 1, "cancelled score did not emit Done");
+}
+
+
 } // namespace
 
 int main() {
@@ -771,6 +883,8 @@ int main() {
     testControlFailureUsesExecutionBoundary();
     testInvalidPromptTokensStayRequestScoped();
     testStepTokensFitTheWire();
+    testScoreRequestCompletesAfterFullPrompt();
+    testCancelledScoreReturnsEmptyLogits();
     std::cout << "native KV-first loop tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {
