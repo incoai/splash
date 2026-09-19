@@ -4,6 +4,7 @@
 #include "model/Model.hpp"
 #include "ops/PagedKv.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -72,16 +73,10 @@ struct EngineMemoryPolicy {
                : automatic;
   }
 
-  // Host VM statistics gate each new physical allocation against this
-  // reserve, independently of the Metal working-set ceiling.
-  static constexpr uint32_t hostAvailableReservePercent = 10;
-
+  // A bounded host cushion, independent of the engine's Metal capacity.
   [[nodiscard]] static constexpr uint64_t
   hostAvailableReserveBytes(uint64_t physicalMemoryBytes) noexcept {
-    uint64_t proportional =
-        (physicalMemoryBytes / 100) * hostAvailableReservePercent +
-        ((physicalMemoryBytes % 100) * hostAvailableReservePercent) / 100;
-    return proportional;
+    return std::min<uint64_t>(physicalMemoryBytes / 10, 2 * kGiB);
   }
 };
 

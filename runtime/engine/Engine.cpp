@@ -737,8 +737,7 @@ bool Engine::budgetMayRecover(metal::AllocationFailure failure,
 }
 
 bool Engine::growthPaused() const {
-  return config_.memoryPressure &&
-         config_.memoryPressure() != MemoryPressure::Normal;
+  return config_.growthPaused && config_.growthPaused();
 }
 
 bool Engine::reclaimForGrowth(CacheReclaimMode mode) {

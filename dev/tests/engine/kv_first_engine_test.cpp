@@ -891,7 +891,7 @@ void testActiveCellGrowthReclaimsCachedStateAndRetries() {
     Executor executor(1);
     Events events;
     EngineConfig config;
-    config.memoryPressure = [] { return MemoryPressure::Normal; };
+    config.growthPaused = [] { return false; };
     engine::Engine engine(config, resources, executor, events);
 
     engine.submit(request(20, std::vector<uint32_t>(65, 7)));
@@ -938,7 +938,7 @@ void testKvGrowthReclaimsIdleStateBeforeCache() {
     Executor executor(1);
     Events events;
     EngineConfig config;
-    config.memoryPressure = [] { return MemoryPressure::Normal; };
+    config.growthPaused = [] { return false; };
     engine::Engine engine(config, resources, executor, events);
 
     engine.submit(request(25, std::vector<uint32_t>(65, 25)));
@@ -1086,7 +1086,7 @@ void testHostPressureDoesNotDrainCacheOnStateAdmission() {
   Events events;
   MemoryPressure pressure = MemoryPressure::Normal;
   EngineConfig config;
-  config.memoryPressure = [&] { return pressure; };
+  config.growthPaused = [&] { return pressure != MemoryPressure::Normal; };
   engine::Engine engine(config, resources, executor, events);
   engine.submit(request(200, std::vector<uint32_t>(65, 200)));
   runUntilIdle(engine);
@@ -1130,7 +1130,7 @@ void testHostPressureStillRecyclesLruStateForDeniedSnapshot() {
   Events events;
   MemoryPressure pressure = MemoryPressure::Normal;
   EngineConfig config;
-  config.memoryPressure = [&] { return pressure; };
+  config.growthPaused = [&] { return pressure != MemoryPressure::Normal; };
   engine::Engine engine(config, resources, executor, events);
   engine.submit(request(210, std::vector<uint32_t>(65, 210)));
   runUntilIdle(engine);
@@ -1167,7 +1167,7 @@ void testSingletonHostPressureReusesIdleCacheInsteadOfSuspending() {
   Events events;
   MemoryPressure pressure = MemoryPressure::Normal;
   EngineConfig config;
-  config.memoryPressure = [&] { return pressure; };
+  config.growthPaused = [&] { return pressure != MemoryPressure::Normal; };
   engine::Engine engine(config, resources, executor, events);
   engine.submit(request(230, std::vector<uint32_t>(65, 230)));
   runUntilIdle(engine);
@@ -1200,7 +1200,7 @@ void testSingletonHostPressureWaitRecoversOrTerminates() {
     Events events;
     MemoryPressure pressure = MemoryPressure::Normal;
     EngineConfig config;
-    config.memoryPressure = [&] { return pressure; };
+    config.growthPaused = [&] { return pressure != MemoryPressure::Normal; };
     config.resourceWaitTimeoutMilliseconds = outcome == 3 ? 100.0 : 30000.0;
     engine::Engine engine(config, resources, executor, events);
     engine.submit(request(220, std::vector<uint32_t>(65, 220)));
@@ -1458,7 +1458,7 @@ void testPhysicalPressureRetryIsBackedOffWithoutProgress() {
   Events events;
   MemoryPressure pressure = MemoryPressure::Warning;
   EngineConfig config;
-  config.memoryPressure = [&] { return pressure; };
+  config.growthPaused = [&] { return pressure != MemoryPressure::Normal; };
   engine::Engine engine(config, resources, executor, events);
 
   backing.growthBlocked = true;
@@ -1615,7 +1615,7 @@ void testLongDecodePreemptionPlansTheCurrentReplayBoundary() {
   EngineConfig config;
   // Keep the old 4096-token replay boundary distinct from checkpoints.
   config.prefillCheckpointTokens = 8192;
-  config.memoryPressure = [&] { return pressure; };
+  config.growthPaused = [&] { return pressure != MemoryPressure::Normal; };
   engine::Engine engine(config, resources, executor, events);
 
   constexpr uint64_t id = 255;
@@ -1731,7 +1731,7 @@ void testRepeatedPreemptionRespectsBackoffAndCancellation() {
     executor.unblockGrowthOnSuspend = false;
     Events events;
     EngineConfig config;
-    config.memoryPressure = [] { return MemoryPressure::Warning; };
+    config.growthPaused = [] { return true; };
     engine::Engine engine(config, resources, executor, events);
     backing.growthBlocked = true;
     auto value = request(270, {270});
@@ -1956,7 +1956,7 @@ void testRecoveryAdmitsFailedKvTargetBeforeReplaying() {
     Events events;
     EngineConfig config;
     // Models the request-sized headroom denial while global pressure is Normal.
-    config.memoryPressure = [] { return MemoryPressure::Normal; };
+    config.growthPaused = [] { return false; };
     engine::Engine engine(config, resources, executor, events);
     const std::vector<uint32_t> prompt(129, 280);
     if (sharePrefix) {
@@ -2025,7 +2025,7 @@ void testAdmissionReopensAfterLastSuspendedRequestResumes() {
   Events events;
   MemoryPressure pressure = MemoryPressure::Warning;
   EngineConfig config;
-  config.memoryPressure = [&] { return pressure; };
+  config.growthPaused = [&] { return pressure != MemoryPressure::Normal; };
   engine::Engine engine(config, resources, executor, events);
 
   backing.growthBlocked = true;

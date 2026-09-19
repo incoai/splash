@@ -1,4 +1,5 @@
 #include "engine/RuntimeResources.hpp"
+#include "engine/MemoryPlan.hpp"
 
 #import <Foundation/Foundation.h>
 
@@ -6,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -21,7 +23,10 @@ void require(bool value, const char *message) {
 
 class TemporaryModelRoot final {
 public:
-  TemporaryModelRoot() {
+  // Placeholders are sparse: a package larger than the machine's memory
+  // costs three extents on disk.
+  explicit TemporaryModelRoot(uint64_t bytesPerComponent = 16 * 1024)
+      : fileBytes(bytesPerComponent), packageBytes(3 * bytesPerComponent) {
     path = std::filesystem::temp_directory_path() /
            ("splash-budget-" +
             std::string([NSUUID UUID].UUIDString.UTF8String));
@@ -38,13 +43,13 @@ public:
     std::filesystem::remove_all(path, ignored);
   }
 
-  static constexpr uint64_t fileBytes = 16 * 1024;
-  static constexpr uint64_t packageBytes = 3 * fileBytes;
+  uint64_t fileBytes;
+  uint64_t packageBytes;
   std::filesystem::path path;
 };
 
-void testWeightBudgetBeforeLoading(const char *metallibPath) {
-  TemporaryModelRoot root;
+RuntimeResourcesConfig budgetConfig(const char *metallibPath,
+                                    const TemporaryModelRoot &root) {
   RuntimeResourcesConfig config;
   config.metallibPath = metallibPath;
   config.modelRoot = root.path;
@@ -52,6 +57,47 @@ void testWeightBudgetBeforeLoading(const char *metallibPath) {
       "budget-test", model::Qwen3_8Layout{}, model::DFlashDraftLayout{},
       ops::VisionLayout{});
   config.buildId = "budget-test";
+  return config;
+}
+
+// Startup fails at the loader, whose weight files are deliberately absent.
+// Reaching it is the assertion: everything the engine checks before opening
+// the package let this configuration through.
+void requireReachesModelLoader(RuntimeResourcesConfig config,
+                               const std::filesystem::path &root,
+                               const char *message) {
+  try {
+    auto resources = RuntimeResources::create(config);
+    throw std::runtime_error("placeholder model unexpectedly loaded");
+  } catch (const RuntimeResourcesError &error) {
+    require(error.failure() == RuntimeResourceFailure::Other &&
+                std::string(error.what()).find("[model_loading]") !=
+                    std::string::npos &&
+                error.message().find("unable to open") != std::string::npos &&
+                error.message().find((root / "target").string()) !=
+                    std::string::npos,
+            message);
+  }
+}
+
+void testWeightBudgetBeforeLoading(const char *metallibPath) {
+  TemporaryModelRoot root;
+  RuntimeResourcesConfig config = budgetConfig(metallibPath, root);
+
+  {
+    config.memoryPressure = [] { return MemoryPressure::Critical; };
+    try {
+      auto resources = RuntimeResources::create(config);
+      throw std::runtime_error("model load ignored system pressure");
+    } catch (const RuntimeResourcesError &error) {
+      require(error.failure() == RuntimeResourceFailure::HostCapacity,
+              "startup pressure did not remain retryable");
+      require(error.message().find("not enough free memory") !=
+                  std::string::npos,
+              "startup pressure reached the weight loader");
+    }
+  }
+  config.memoryPressure = [] { return MemoryPressure::Warning; };
 
   // Each low ceiling fits two components, so every directory must be counted.
   // The other ceilings must reach the real loader, whose expected weight files
@@ -76,14 +122,44 @@ void testWeightBudgetBeforeLoading(const char *metallibPath) {
       } else {
         require(error.failure() == RuntimeResourceFailure::Other,
                 "missing model file was misclassified as allocation pressure");
-        require(std::string(error.what()).find("[model_loading]") !=
-                    std::string::npos &&
-                    error.message().find("unable to open") !=
-                        std::string::npos &&
-                    error.message().find((root.path / "target").string()) !=
-                        std::string::npos,
-                "a sufficient weight budget did not reach the model loader");
       }
+    }
+  }
+  config.maximumMemoryBytes = 0;
+  requireReachesModelLoader(config, root.path,
+                            "a sufficient weight budget did not reach the "
+                            "model loader");
+}
+
+// The rule that keeps users off the startup floor: admission weighs
+// reclaimable memory against the macOS reserve, never against the model.
+// A package far larger than everything reclaimable still starts, because
+// mapped weights become resident page by page under the operation guard.
+void testStartupAdmissionIgnoresPackageSize(const char *metallibPath) {
+  TemporaryModelRoot root(2 * kGiB);
+  RuntimeResourcesConfig config = budgetConfig(metallibPath, root);
+  require(root.packageBytes > 3 * kGiB, "the package must exceed the sample");
+  config.hostAvailableMemory = [] {
+    return std::optional<uint64_t>(3 * kGiB);
+  };
+  requireReachesModelLoader(config, root.path,
+                            "a package larger than reclaimable host memory "
+                            "refused to start");
+
+  // Below the reserve macOS is the one at risk, so startup waits instead.
+  // Unmeasurable telemetry waits the same way.
+  for (std::optional<uint64_t> available :
+       {std::optional<uint64_t>(64 * kMiB), std::optional<uint64_t>()}) {
+    config.hostAvailableMemory = [available] { return available; };
+    try {
+      auto resources = RuntimeResources::create(config);
+      throw std::runtime_error("model load ignored the macOS reserve");
+    } catch (const RuntimeResourcesError &error) {
+      require(error.failure() == RuntimeResourceFailure::HostCapacity,
+              "exhausted host memory did not remain retryable");
+      require(error.message().find("not enough free memory") !=
+                  std::string::npos,
+              "exhausted host memory reached the weight loader");
     }
   }
 }
@@ -95,6 +171,7 @@ int main(int argc, char **argv) {
     try {
       require(argc == 2, "expected metallib path");
       testWeightBudgetBeforeLoading(argv[1]);
+      testStartupAdmissionIgnoresPackageSize(argv[1]);
       std::cout << "runtime resources tests passed\n";
       return EXIT_SUCCESS;
     } catch (const std::exception &error) {

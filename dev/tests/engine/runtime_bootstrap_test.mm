@@ -595,6 +595,24 @@ void testRequiredWarmupPreservesAllocationFailure() {
   }
 }
 
+void testFinalHostPressurePreventsReady() {
+  const EngineMemoryPlan plan = memoryPlan();
+  Harness harness(plan);
+  try {
+    static_cast<void>(RuntimeBootstrap::requireWarmupAndAnnounce(
+        plan, harness.executor(),
+        [](uint64_t) -> ActualMemoryReport {
+          throw metal::MetalAllocationError("pressure after warmup",
+                                             metal::AllocationFailure::HostPressure);
+        }, harness.loop()));
+    throw std::runtime_error("final pressure check announced ready");
+  } catch (const RuntimeBootstrapError &error) {
+    require(error.report().resourceFailure == RuntimeResourceFailure::HostCapacity &&
+                !harness.loop().ready() && harness.output().empty(),
+            "final host pressure lost retryability or announced ready");
+  }
+}
+
 void testEveryWarmupFailureIsFailClosed() {
   const EngineMemoryPlan plan = memoryPlan();
   constexpr engine::RuntimeBootstrapStage expected[] = {
@@ -753,6 +771,7 @@ int main() {
     testOptionalAllocationFailuresAreMemoryLimited();
     testResourceFailureClassificationSurvivesBootstrap();
     testRequiredWarmupPreservesAllocationFailure();
+    testFinalHostPressurePreventsReady();
     testEveryWarmupFailureIsFailClosed();
     testWarmupErrorsCannotMasqueradeAsMemoryLimits();
     testExceptionsMemoryAndReadyWriteAreFailClosed();

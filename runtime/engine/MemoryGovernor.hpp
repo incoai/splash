@@ -33,11 +33,25 @@ enum class MemoryPressure : uint8_t {
   Critical,
 };
 
-// Growth stops while host memory available is within this margin above the
-// reserve (or inside it); recovery needs the larger margin. Reaching the
-// reserve is a warning that sheds cache in paced passes; critical, which
-// drops every evictable entry, is the OS's own critical notification, a lost
-// measurement, or availability below half the reserve.
+// One spelling of the levels for status JSON and startup diagnostics.
+[[nodiscard]] inline const char *
+memoryPressureName(MemoryPressure pressure) noexcept {
+  switch (pressure) {
+  case MemoryPressure::Normal:
+    return "normal";
+  case MemoryPressure::Warning:
+    return "warning";
+  case MemoryPressure::Critical:
+    return "critical";
+  }
+  return "critical";
+}
+
+[[nodiscard]] std::optional<MemoryPressure> querySystemMemoryPressure() noexcept;
+
+// Allocation and recovery use separate watermarks to avoid oscillation.
+// Low availability causes paced reclaim; unavailable telemetry pauses growth;
+// the OS critical signal causes full eviction of unpinned cache entries.
 inline constexpr uint64_t kHostWarningMarginBytes = 1ULL << 30;
 inline constexpr uint64_t kHostRecoveryMarginBytes = 2ULL << 30;
 
@@ -55,6 +69,7 @@ struct MemoryGovernorSnapshot {
   uint64_t hostHeadroomBytes = 0;
   MemoryPressure systemPressure = MemoryPressure::Normal;
   bool growthAllowed = true;
+  bool hostGrowthAllowed = true;
 };
 
 struct MemoryReclaimDirective {
@@ -141,7 +156,7 @@ private:
   uint64_t reservedBytes_ = 0;
   uint64_t deniedReservations_ = 0;
   MemoryPressure systemPressure_ = MemoryPressure::Normal;
-  mutable MemoryPressure effectivePressure_ = MemoryPressure::Normal;
+  mutable bool hostConstrained_ = false;
 };
 
 } // namespace splash::engine

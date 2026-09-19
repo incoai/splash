@@ -359,11 +359,7 @@ struct CommandTicket::State {
 };
 
 struct MetalBackend::Impl {
-    std::function<bool()> cancelled;
-    void checkCancellation() const {
-        if (cancelled && cancelled())
-            throw MetalBackendError("Metal operation cancelled");
-    }
+    std::function<void()> operationGuard;
 
     bool dispatchProfiling = false;
     std::vector<DispatchTiming> dispatchProfile;
@@ -822,15 +818,19 @@ const std::array<uint8_t, 32> &MetalBackend::metallibSha256() const noexcept {
     return impl_->metallibSha256;
 }
 
-void MetalBackend::setCancellationProbe(std::function<bool()> probe) {
-    impl_->cancelled = std::move(probe);
+void MetalBackend::checkOperation() const {
+    impl_->ensureHealthy();
+    if (impl_->operationGuard) impl_->operationGuard();
+}
+
+void MetalBackend::setOperationGuard(std::function<void()> guard) {
+    impl_->operationGuard = std::move(guard);
 }
 
 MetalBuffer MetalBackend::allocateBuffer(uint64_t bytes,
                                          BufferStorage storage,
                                          std::string_view label) {
-    impl_->checkCancellation();
-    impl_->ensureHealthy();
+    checkOperation();
     if (!bytes) throw MetalBackendError("Metal buffer size must be positive");
     if (bytes > impl_->capabilities.maxBufferLengthBytes) {
         throw MetalBackendError("Metal buffer exceeds maxBufferLength");
@@ -848,8 +848,7 @@ MetalBuffer MetalBackend::allocateBuffer(uint64_t bytes,
 
 MetalBuffer MetalBackend::allocatePlacementSparseBuffer(
     uint64_t virtualBytes, uint64_t sparsePageBytes, std::string_view label) {
-    impl_->checkCancellation();
-    impl_->ensureHealthy();
+    checkOperation();
     const MTLSparsePageSize pageSize = metalSparsePageSize(sparsePageBytes);
     if (!impl_->capabilities.supportsPlacementSparse) {
         throw MetalBackendError("placement-sparse Metal is unavailable");
@@ -1123,8 +1122,7 @@ void MetalBackend::drainSparseUnmaps() {
 MetalBuffer MetalBackend::wrapSharedMemory(
     void *address, uint64_t bytes, std::shared_ptr<void> lifetime,
     std::string_view label) {
-    impl_->checkCancellation();
-    impl_->ensureHealthy();
+    checkOperation();
     if (!address || !bytes) {
         throw MetalBackendError("shared memory address and size are required");
     }
@@ -1214,7 +1212,7 @@ std::vector<DispatchTiming> MetalBackend::takeDispatchProfile() {
 CommandTicket MetalBackend::submitCommandAsync(
     std::span<const ComputeDispatch> dispatches,
     CommandCompletion completion) {
-    impl_->checkCancellation();
+    checkOperation();
     if (dispatches.empty()) {
         throw MetalBackendError("Metal command must contain a dispatch");
     }

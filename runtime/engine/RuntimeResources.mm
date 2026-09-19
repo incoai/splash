@@ -102,30 +102,29 @@ uint64_t packedModelFileBytes(const std::filesystem::path &root) {
   return bytes;
 }
 
-void requireHostCapacity(uint64_t requiredBytes, uint64_t reserveBytes,
-                         RuntimeResourceStage stage, std::string_view phase,
-                         std::string statusJson,
-                         std::string budgetDescription = {}) {
-  std::optional<uint64_t> available = queryHostAvailableMemory();
-  uint64_t total =
-      checkedAdd(requiredBytes, reserveBytes, "host memory preflight");
-  if (!available) {
-    throw RuntimeResourcesError(stage,
-        std::string(phase) +
-        " cannot measure reclaimable host memory; refusing to risk "
-        "unified-memory exhaustion", std::move(statusJson),
-        std::move(budgetDescription), RuntimeResourceFailure::HostCapacity);
-  }
-  if (*available < total) {
+uint64_t mebibytes(uint64_t bytes) noexcept { return bytes / kMiB; }
+
+// The startup admission rule. Deliberately independent of the model size:
+// weights are mapped, not copied, so the package never has to fit in
+// reclaimable memory at once. Residency is what must fit, and it is checked
+// here again at every Metal operation as loading and warmup build it up.
+void requireStartupHeadroom(
+    const MemoryGovernor::HostAvailableMemoryProvider &hostAvailableMemory,
+    uint64_t reserveBytes, MemoryPressure pressure) {
+  const std::optional<uint64_t> available = hostAvailableMemory();
+  if (!available || *available <= reserveBytes ||
+      pressure == MemoryPressure::Critical) {
     std::ostringstream message;
-    message << phase << " needs " << requiredBytes << " bytes plus "
-            << reserveBytes << " bytes protected for macOS, but only "
-            << *available
-            << " bytes are currently available; close memory-heavy "
-               "applications and retry";
-    throw RuntimeResourcesError(stage, message.str(), std::move(statusJson),
-                                std::move(budgetDescription),
-                                RuntimeResourceFailure::HostCapacity);
+    message << "not enough free memory to start: ";
+    if (!available)
+      message << "reclaimable host memory cannot be measured";
+    else
+      message << mebibytes(*available) << " MiB reclaimable, "
+              << mebibytes(reserveBytes) << " MiB protected for macOS, system "
+              << "pressure " << memoryPressureName(pressure);
+    message << "; close memory-heavy applications and retry";
+    throw metal::MetalAllocationError(message.str(),
+                                      metal::AllocationFailure::HostPressure);
   }
 }
 
@@ -199,15 +198,6 @@ void requireLoadedModel(const model::ModelPackage &package) {
     throw std::invalid_argument(
         "loaded model package has incomplete allocation accounting");
   }
-}
-
-// The model package is already resident when the second startup preflight
-// runs. Requiring fixedRuntimeBytes again would double-count both weight
-// mappings against live host availability.
-uint64_t
-remainingFixedRuntimeBytesAfterModelLoad(const EngineMemoryBreakdown &budget) {
-  return budget.fixedRuntimeBytes - budget.targetWeightsBytes -
-         budget.draftWeightsBytes - budget.visionWeightsBytes;
 }
 
 } // namespace
@@ -298,7 +288,6 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
   try {
     backend =
         std::make_unique<metal::MetalBackend>(config.metallibPath.string());
-    backend->setCancellationProbe(config.cancelled);
   } catch (const metal::MetalAllocationError &error) {
     throw RuntimeResourcesError(RuntimeResourceStage::BackendCreation,
                                 error.what(), {}, {},
@@ -316,6 +305,17 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
 
   const uint64_t hostReserveBytes =
       EngineMemoryPolicy::hostAvailableReserveBytes(device.physicalMemoryBytes);
+  MemoryGovernor::HostAvailableMemoryProvider hostAvailableMemory =
+      config.hostAvailableMemory ? config.hostAvailableMemory
+                                 : queryHostAvailableMemory;
+  backend->setOperationGuard(
+      [cancelled = config.cancelled, pressure = config.memoryPressure,
+       hostAvailableMemory, hostReserveBytes] {
+        if (cancelled && cancelled())
+          throw metal::MetalBackendError("Metal operation cancelled");
+        requireStartupHeadroom(hostAvailableMemory, hostReserveBytes,
+            pressure ? pressure() : MemoryPressure::Normal);
+      });
   try {
     const uint64_t modelBytes = packedModelFileBytes(config.modelRoot);
     const uint64_t hardBudgetBytes = EngineMemoryPolicy::hardBudgetBytes(
@@ -330,11 +330,16 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
               std::to_string(hardBudgetBytes) + " bytes",
           deviceStatusJson(device), {}, RuntimeResourceFailure::EngineCapacity);
     }
-    requireHostCapacity(modelBytes, hostReserveBytes,
-                        RuntimeResourceStage::ModelLoading,
-                        "model loading", deviceStatusJson(device));
+    // Fail before opening the package when the machine has no headroom at
+    // all; the guard installed above keeps checking as residency grows.
+    requireStartupHeadroom(hostAvailableMemory, hostReserveBytes,
+        config.memoryPressure ? config.memoryPressure() : MemoryPressure::Normal);
   } catch (const RuntimeResourcesError &) {
     throw;
+  } catch (const metal::MetalAllocationError &error) {
+    throw RuntimeResourcesError(RuntimeResourceStage::ModelLoading,
+                                error.what(), deviceStatusJson(device), {},
+                                resourceAllocationFailure(error.failure()));
   } catch (const std::exception &error) {
     throw RuntimeResourcesError(RuntimeResourceStage::ModelLoading,
                                 error.what(), deviceStatusJson(device));
@@ -392,18 +397,6 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
           planResult.status.toStatusJson(), planResult.status.describe());
     }
     EngineMemoryPlan memoryPlan = std::move(*planResult.plan);
-    try {
-      requireHostCapacity(
-          remainingFixedRuntimeBytesAfterModelLoad(memoryPlan.breakdown()),
-          hostReserveBytes, RuntimeResourceStage::MemoryPlanning, "runtime startup",
-          memoryPlan.toStatusJson(), memoryPlan.breakdown().describe());
-    } catch (const RuntimeResourcesError &) {
-      throw;
-    } catch (const std::exception &error) {
-      throw RuntimeResourcesError(RuntimeResourceStage::MemoryPlanning,
-                                  error.what(), memoryPlan.toStatusJson(),
-                                  memoryPlan.breakdown().describe());
-    }
     return memoryPlan;
   };
   // Establish the serving baseline and the one real memory governor before
@@ -438,7 +431,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
     const uint64_t elasticGrowthCeiling =
         baselineBudget.hardBudgetBytes - runtimeReserve;
     auto memoryGovernor = std::make_unique<MemoryGovernor>(
-        *backend, elasticGrowthCeiling, hostReserveBytes);
+        *backend, elasticGrowthCeiling, hostReserveBytes, hostAvailableMemory);
     if (config.memoryPressure)
       memoryGovernor->setPressure(config.memoryPressure());
     std::string rejected;

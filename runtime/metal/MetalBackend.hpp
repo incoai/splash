@@ -265,7 +265,9 @@ public:
   explicit MetalBackend(std::string metallibPath,
                         double commandTimeoutSeconds = 120.0);
   ~MetalBackend();
-  void setCancellationProbe(std::function<bool()> probe);
+  // Invoked before allocations and submissions; may throw to stop bootstrap.
+  void setOperationGuard(std::function<void()> guard);
+  void checkOperation() const;
   // Stop new submissions and cancel dependency waits before teardown.
   // Commands already committed to the GPU retain their normal lifetime.
   void stop() noexcept;

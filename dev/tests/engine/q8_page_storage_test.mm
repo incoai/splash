@@ -82,6 +82,13 @@ void run(const std::string &metallib) {
                 estimateHostAvailableMemory(pages, 0, maximum) == 0 &&
                 estimateHostAvailableMemory(pages, pageSize, 0) == 0,
             "invalid host counters or arithmetic overflow did not fail closed");
+    require(EngineMemoryPolicy::hostAvailableReserveBytes(16 * (1ULL << 30)) ==
+                16 * (1ULL << 30) / 10 &&
+            EngineMemoryPolicy::hostAvailableReserveBytes(48 * (1ULL << 30)) ==
+                2 * (1ULL << 30) &&
+            EngineMemoryPolicy::hostAvailableReserveBytes(128 * (1ULL << 30)) ==
+                2 * (1ULL << 30),
+            "the macOS reserve is a tenth of a small machine, 2 GiB above 20 GiB");
     constexpr kv::Q8Layout q8Layout{16, 4, 256};
     constexpr kv::Q8Layout compactLayout{10, 2, 256};
     // 64 KiB sparse tiles: the 512-byte-per-page scale buffers force
@@ -156,14 +163,13 @@ void run(const std::string &metallib) {
     require(!bounded.tryReserve(1).has_value(),
             "host reserve did not stop unified-memory growth");
     // Reaching the reserve is a warning that sheds cache in paced passes;
-    // only the OS's critical verdict or a host deep inside the reserve drops
-    // every evictable entry.
+    // only the OS critical verdict drops every evictable entry.
     require(bounded.snapshot().pressure == MemoryPressure::Warning,
             "reaching the host reserve was treated as critical");
     fakeHostAvailable = hostReserve / 2;
-    require(bounded.snapshot().pressure == MemoryPressure::Critical &&
+    require(bounded.snapshot().pressure == MemoryPressure::Warning &&
                 !bounded.tryReserve(1).has_value(),
-            "host memory deep inside the reserve was not critical");
+            "low availability escalated to destructive system pressure");
     fakeHostAvailable = hostReserve + giB / 2;
     require(bounded.snapshot().pressure == MemoryPressure::Warning &&
                 !bounded.snapshot().growthAllowed &&
@@ -176,10 +182,28 @@ void run(const std::string &metallib) {
     require(bounded.snapshot().pressure == MemoryPressure::Normal &&
                 bounded.snapshot().growthAllowed,
             "host recovery did not reopen physical admission");
+    {
+        auto reservation = bounded.tryReserve(64 * 1024);
+        require(reservation.has_value(), "engine capacity reservation failed");
+        const auto full = bounded.snapshot();
+        require(!full.growthAllowed && full.hostGrowthAllowed,
+                "engine budget exhaustion was confused with host pressure");
+    }
     fakeHostAvailable.reset();
     require(!bounded.tryReserve(1).has_value() &&
                 !bounded.snapshot().hostMeasurementValid,
             "missing host memory telemetry did not fail closed");
+    MemoryPressurePolicy missingPolicy;
+    auto missing = bounded.snapshot();
+    auto missingDirective = missingPolicy.update(missing, 0.0);
+    require(missing.pressure == MemoryPressure::Warning &&
+                !missingDirective.evictAllUnpinnedPrefixes &&
+                missingDirective.targetBytes == 0,
+            "missing telemetry discarded valid cache");
+    bounded.setPressure(MemoryPressure::Critical);
+    require(missingPolicy.update(bounded.snapshot(), 1.0).evictAllUnpinnedPrefixes,
+            "missing telemetry hid critical system pressure");
+    bounded.setPressure(MemoryPressure::Normal);
     fakeHostAvailable = hostReserve + 3 * giB;
     require(bounded.snapshot().hostHeadroomBytes == 3 * giB,
             "host memory headroom accounting is wrong");
@@ -206,20 +230,27 @@ void run(const std::string &metallib) {
                 !hostPolicy.update(bounded.snapshot(), 1000.0).reclaimEmptyKvExtents,
             "reclaimable host recovery did not reopen normal admission");
     bounded.setPressure(MemoryPressure::Warning);
+    require(bounded.snapshot().pressure == MemoryPressure::Warning &&
+                bounded.snapshot().growthAllowed &&
+                bounded.tryReserve(1).has_value(),
+            "system warning blocked growth despite sufficient host headroom");
+    fakeHostAvailable = hostReserve + giB / 2;
     require(!bounded.tryReserve(1).has_value(),
-            "file-cache credit bypassed real system pressure");
+            "system warning bypassed insufficient host headroom");
+    fakeHostAvailable = hostReserve + 3 * giB;
     bounded.setPressure(MemoryPressure::Normal);
 
     MemoryPressurePolicy policy;
     MemoryGovernorSnapshot policySnapshot;
     policySnapshot.pressure = MemoryPressure::Warning;
+    policySnapshot.hostMeasurementValid = true;
     policySnapshot.systemPressure = MemoryPressure::Warning;
     policySnapshot.hostHeadroomBytes = 3 * giB / 2;
     auto firstDirective = policy.update(policySnapshot, 0.0);
     require(firstDirective.reclaimEmptyKvExtents &&
                 !firstDirective.evictAllUnpinnedPrefixes &&
-                firstDirective.targetBytes == giB,
-            "warning pressure did not request one incremental reclaim target");
+                firstDirective.targetBytes == giB / 2,
+            "warning pressure ignored measured headroom");
     require(policy.update(policySnapshot, 500.0).targetBytes == 0 &&
                 policy.update(policySnapshot, 999.0).targetBytes == 0,
             "warning pressure reclaimed again before telemetry settled");
@@ -238,6 +269,12 @@ void run(const std::string &metallib) {
     policySnapshot.pressure = MemoryPressure::Warning;
     require(policy.update(policySnapshot, 2101.0).targetBytes == giB / 4,
             "a new pressure episode inherited an old cooldown");
+    policySnapshot.systemPressure = MemoryPressure::Warning;
+    policySnapshot.hostHeadroomBytes = 3 * giB;
+    const auto advisory = policy.update(policySnapshot, 3101.0);
+    require(advisory.reclaimEmptyKvExtents && !advisory.evictAllUnpinnedPrefixes &&
+                advisory.targetBytes == 0,
+            "system warning discarded live cache despite sufficient headroom");
     policySnapshot.pressure = MemoryPressure::Critical;
     auto criticalDirective = policy.update(policySnapshot, 2102.0);
     require(criticalDirective.reclaimEmptyKvExtents &&

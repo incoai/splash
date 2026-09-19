@@ -108,7 +108,10 @@ public:
   MemoryPressureMonitor(const MemoryPressureMonitor &) = delete;
   MemoryPressureMonitor &operator=(const MemoryPressureMonitor &) = delete;
   [[nodiscard]] engine::MemoryPressure pressure() const noexcept {
-    return pending_->load(std::memory_order_acquire);
+    // Notifications select individual processes and may arrive late. Sample
+    // the current system level at the same safe points as host availability.
+    return engine::querySystemMemoryPressure().value_or(
+        pending_->load(std::memory_order_acquire));
   }
 
 private:
@@ -342,9 +345,9 @@ int runNative(const NativeArguments &arguments) {
   }
   if (transport.shutdownRequested())
     return static_cast<int>(engine::NativeProcessExit::CleanEof);
-  // During serving, the transport handles shutdown between engine ticks.
-  // The allocation/submission probe is only for interrupting bootstrap.
-  bootstrap->resources().backend().setCancellationProbe({});
+  // Serving handles shutdown and memory pressure between engine ticks.
+  // The per-operation guard is only needed during bootstrap.
+  bootstrap->resources().backend().setOperationGuard({});
   published = bootstrap.get();
 
   transport.setControlHandler([&pressureMonitor, published,

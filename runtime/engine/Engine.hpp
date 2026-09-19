@@ -26,9 +26,9 @@ struct EngineConfig final {
   // Patches per image the model's vision scratch covers.
   uint32_t maxImagePatches = ops::kMaximumImagePatches;
   double resourceWaitTimeoutMilliseconds = 30000.0;
-  // Live host pressure, supplied by the runtime governor. Queried only on
+  // Host growth admission, supplied by the runtime governor. Queried only on
   // failed allocation, never on the successful decode path.
-  std::function<MemoryPressure()> memoryPressure;
+  std::function<bool()> growthPaused;
 };
 
 struct ResourceWaitSnapshot final {

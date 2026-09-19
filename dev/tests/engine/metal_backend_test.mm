@@ -30,6 +30,8 @@
 
 namespace {
 
+using splash::metal::AllocationFailure;
+using splash::metal::MetalAllocationError;
 using splash::metal::BufferBinding;
 using splash::metal::BufferStorage;
 using splash::metal::BytesBinding;
@@ -276,7 +278,7 @@ void placementProbeFailures(const std::string &metallibPath) {
         try {
             MetalBackend backend(metallibPath);
             fail("probe allocation failure was reported as unsupported");
-        } catch (const splash::metal::MetalAllocationError &error) {
+        } catch (const MetalAllocationError &error) {
             require(error.failure() == splash::metal::AllocationFailure::DriverRejected &&
                         std::string(error.what()).find("probe could not allocate") !=
                             std::string::npos,
@@ -674,6 +676,22 @@ void run(const std::string &metallibPath) {
     require([libraryData writeToFile:temporaryPath options:0 error:nullptr],
             "could not copy test metallib");
     MetalBackend backend(temporary.path);
+    const auto guardedBytes = backend.memoryStats().allocatedBytes;
+    const auto denyOperation = [] {
+        throw MetalAllocationError("test host pressure", AllocationFailure::HostPressure);
+    };
+    backend.setOperationGuard(denyOperation);
+    try {
+        (void)backend.allocateBuffer(16384, BufferStorage::Shared);
+        fail("operation guard admitted an allocation");
+    } catch (const MetalAllocationError &error) {
+        require(error.failure() == AllocationFailure::HostPressure,
+                "operation guard lost its failure classification");
+    }
+    require(backend.healthy() && backend.memoryStats().allocatedBytes == guardedBytes,
+            "operation guard leaked memory or poisoned the backend");
+    backend.setOperationGuard({});
+
     require(backend.metallibSha256() == expectedDigest,
             "backend digest does not match the loaded library bytes");
     NSData *replacement = [@"replaced after library loading"
@@ -762,6 +780,17 @@ void run(const std::string &metallibPath) {
             BytesBinding{2, &kIncrement, sizeof(kIncrement)});
         dispatch.threadgroups = {1, 1, 1};
         dispatch.threadsPerThreadgroup = {kViewElementCount, 1, 1};
+
+        backend.setOperationGuard(denyOperation);
+        try {
+            (void)backend.submit(dispatch);
+            fail("operation guard admitted a GPU submission");
+        } catch (const MetalAllocationError &error) {
+            require(error.failure() == AllocationFailure::HostPressure &&
+                        backend.healthy() && backend.submissionCount() == 0,
+                    "guarded submission lost its cause or altered the backend");
+        }
+        backend.setOperationGuard({});
 
         for (int runIndex = 0; runIndex < 2; ++runIndex) {
             splash::metal::CommandTiming timing;

@@ -1,5 +1,6 @@
 #include "engine/MemoryGovernor.hpp"
 
+#include <dispatch/dispatch.h>
 #include <mach/mach.h>
 #include <mach/mach_host.h>
 #include <mach/vm_statistics.h>
@@ -66,6 +67,20 @@ std::optional<uint64_t> queryHostAvailableMemory() noexcept {
        .fileBacked = statistics.external_page_count,
        .purgeable = statistics.purgeable_count},
       pageSize, physicalMemoryBytes);
+}
+
+std::optional<MemoryPressure> querySystemMemoryPressure() noexcept {
+  uint32_t level = 0;
+  size_t size = sizeof(level);
+  if (sysctlbyname("kern.memorystatus_vm_pressure_level", &level, &size,
+                   nullptr, 0) != 0 || size != sizeof(level))
+    return std::nullopt;
+  switch (level) {
+  case DISPATCH_MEMORYPRESSURE_NORMAL: return MemoryPressure::Normal;
+  case DISPATCH_MEMORYPRESSURE_WARN: return MemoryPressure::Warning;
+  case DISPATCH_MEMORYPRESSURE_CRITICAL: return MemoryPressure::Critical;
+  default: return std::nullopt;
+  }
 }
 
 MemoryGovernor::Reservation::Reservation(MemoryGovernor *owner, uint64_t bytes)
@@ -194,7 +209,8 @@ MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure *failure) {
                     requested <= limitBytes_ - observed;
   bool hostFits =
       hostHeadroomBytes(hostAvailable, requested) >= kHostWarningMarginBytes;
-  if (!engineFits || !hostFits || pressure != MemoryPressure::Normal) {
+  if (!engineFits || !hostFits || hostConstrained_ ||
+      pressure == MemoryPressure::Critical) {
     if (failure)
       *failure = !engineFits ? metal::AllocationFailure::EngineBudget
                             : metal::AllocationFailure::HostPressure;
@@ -243,8 +259,9 @@ MemoryGovernorSnapshot MemoryGovernor::snapshot() const noexcept {
   uint64_t hostHeadroom = hostHeadroomBytes(hostAvailable, reservedBytes_);
   MemoryPressure effectivePressure = updateEffectivePressure(
       hostAvailable, reservedBytes_);
-  bool growthAllowed = effectivePressure == MemoryPressure::Normal &&
-      hostHeadroom >= kHostWarningMarginBytes && used < limitBytes_;
+  bool hostGrowthAllowed = effectivePressure != MemoryPressure::Critical &&
+      !hostConstrained_ && hostHeadroom >= kHostWarningMarginBytes;
+  bool growthAllowed = hostGrowthAllowed && used < limitBytes_;
   return {
       limitBytes_,
       observed,
@@ -258,6 +275,7 @@ MemoryGovernorSnapshot MemoryGovernor::snapshot() const noexcept {
       hostHeadroom,
       systemPressure_,
       growthAllowed,
+      hostGrowthAllowed,
   };
 }
 
@@ -266,22 +284,17 @@ MemoryPressure MemoryGovernor::updateEffectivePressure(
     uint64_t reservedBytes) const noexcept {
   uint64_t hostHeadroom = hostHeadroomBytes(hostAvailable, reservedBytes);
 
-  // Reaching the reserve pauses growth and sheds cache in paced passes.
-  // Critical pressure, lost telemetry or a deeper deficit drains all cache.
-  const bool deepInReserve =
-      hostAvailable && *hostAvailable <= hostReserveBytes_ / 2;
+  // Availability controls growth and paced reclaim. Only the system's
+  // critical signal warrants dropping every evictable cache entry.
+  hostConstrained_ = !hostAvailable ||
+      hostHeadroom < kHostWarningMarginBytes ||
+      (hostConstrained_ && hostHeadroom < kHostRecoveryMarginBytes);
   MemoryPressure next = MemoryPressure::Normal;
-  if (!hostAvailable || deepInReserve ||
-      systemPressure_ == MemoryPressure::Critical) {
+  if (systemPressure_ == MemoryPressure::Critical) {
     next = MemoryPressure::Critical;
-  } else if (systemPressure_ == MemoryPressure::Warning ||
-             *hostAvailable <= hostReserveBytes_ ||
-             hostHeadroom < kHostWarningMarginBytes ||
-             (effectivePressure_ != MemoryPressure::Normal &&
-              hostHeadroom < kHostRecoveryMarginBytes)) {
+  } else if (hostConstrained_ || systemPressure_ == MemoryPressure::Warning) {
     next = MemoryPressure::Warning;
   }
-  effectivePressure_ = next;
   return next;
 }
 
@@ -309,12 +322,15 @@ MemoryReclaimDirective MemoryPressurePolicy::update(
   // but keep responding if another application continues consuming memory.
   nextReclaimMilliseconds_ = nowMilliseconds + 1000.0;
 
+  // Missing telemetry pauses allocation, but is not evidence that live
+  // cache must be discarded. Empty backing can still be returned.
+  if (!snapshot.hostMeasurementValid &&
+      snapshot.systemPressure == MemoryPressure::Normal)
+    return {true, false, 0};
+
   uint64_t desired = snapshot.hostHeadroomBytes < kHostRecoveryMarginBytes
       ? kHostRecoveryMarginBytes - snapshot.hostHeadroomBytes
       : 0;
-  if (snapshot.systemPressure == MemoryPressure::Warning) {
-    desired = std::max(desired, kHostWarningMarginBytes);
-  }
   return {true, false, std::min(desired, kHostWarningMarginBytes)};
 }
 

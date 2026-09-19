@@ -181,6 +181,10 @@ RuntimeBootstrapReport RuntimeBootstrap::requireWarmupAndAnnounce(
   ActualMemoryReport actual;
   try {
     actual = memoryReporter(estimatedPeakBytes);
+  } catch (const metal::MetalAllocationError &error) {
+    report.resourceFailure = resourceAllocationFailure(error.failure());
+    fail(report, RuntimeBootstrapStage::MemoryAudit,
+         std::string("actual memory reporting failed: ") + error.what());
   } catch (const std::exception &error) {
     fail(report, RuntimeBootstrapStage::MemoryAudit,
          std::string("actual memory reporting failed: ") + error.what());
@@ -289,9 +293,9 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
   }
   std::unique_ptr<NativeRuntime> nativeLoop;
   try {
-    config.nativeLoop.engine.memoryPressure =
+    config.nativeLoop.engine.growthPaused =
         [governor = &resources->memoryGovernor()] {
-          return governor->snapshot().pressure;
+          return !governor->snapshot().hostGrowthAllowed;
         };
     nativeLoop = std::make_unique<NativeRuntime>(
         config.nativeLoop, resources->cache(), *modelRuntime,
@@ -311,6 +315,7 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
   RuntimeBootstrapReport report = requireWarmupAndAnnounce(
       resources->memoryPlan(), *modelRuntime,
       [resourcesPointer, modelPointer](uint64_t estimatedPeakBytes) {
+        resourcesPointer->backend().checkOperation();
         // Audit every attempted warmup before reclaiming idle buffers.
         // Wider batches and cache backing grow on demand after Ready.
         ActualMemoryReport report = resourcesPointer->actualMemoryReport(

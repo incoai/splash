@@ -16,18 +16,6 @@ namespace {
 
 const char *boolean(bool value) noexcept { return value ? "true" : "false"; }
 
-const char *pressureName(MemoryPressure pressure) noexcept {
-  switch (pressure) {
-  case MemoryPressure::Normal:
-    return "normal";
-  case MemoryPressure::Warning:
-    return "warning";
-  case MemoryPressure::Critical:
-    return "critical";
-  }
-  return "critical";
-}
-
 uint64_t saturatingAdd(uint64_t left, uint64_t right) noexcept {
   return right > std::numeric_limits<uint64_t>::max() - left
              ? std::numeric_limits<uint64_t>::max()
@@ -102,7 +90,7 @@ std::string runtimeStatusJson(
       << "\"ready\":" << boolean(ready)
       << ",\"maximum_context_tokens\":" << core.maximumContextTokens
       << ",\"memory_pressure\":"
-      << json::quote(pressureName(memoryGovernor.pressure))
+      << json::quote(memoryPressureName(memoryGovernor.pressure))
       << ",\"admission\":{\"waiting\":"
       << resourceWait.memory + resourceWait.concurrency
       << ",\"waiting_memory\":" << resourceWait.memory
@@ -137,7 +125,7 @@ std::string runtimeStatusJson(
       << ",\"growth_allowed\":" << boolean(memoryGovernor.growthAllowed)
       << ",\"denied_reservations\":" << memoryGovernor.deniedReservations
       << ",\"system_pressure\":"
-      << json::quote(pressureName(memoryGovernor.systemPressure))
+      << json::quote(memoryPressureName(memoryGovernor.systemPressure))
       << ",\"host_measurement_valid\":"
       << boolean(memoryGovernor.hostMeasurementValid)
       << ",\"host_available_bytes\":" << memoryGovernor.hostAvailableBytes
