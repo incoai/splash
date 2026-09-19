@@ -16,6 +16,7 @@ from jinja2 import TemplateError
 
 if __package__:
     from . import images as image_input
+    from . import judgments
     from . import protocol as wire
     from .api_shapes import (
         IMAGE_PAD_TOKEN,
@@ -39,6 +40,7 @@ if __package__:
     )
 else:
     import images as image_input
+    import judgments
     import protocol as wire
     from api_shapes import (
         IMAGE_PAD_TOKEN,
@@ -280,7 +282,7 @@ class Frontend:
     ):
         if check_context and tokens >= self.max_context:
             raise ContextLengthError(
-                tokens, self.max_context, image_tokens_only=image_tokens_only
+                tokens, self.max_context - 1, image_tokens_only=image_tokens_only
             )
         frame_bytes = (
             wire.REQUEST_FIXED_BYTES
@@ -419,6 +421,149 @@ class Frontend:
                 raise APIError(400, "content could not be tokenized") from error
             remaining_request_time(deadline)
             return tokens
+
+    def _priority(self, body):
+        priority_name = body.get("priority", "normal")
+        if (
+            not isinstance(priority_name, str)
+            or priority_name not in REQUEST_PRIORITIES
+        ):
+            raise APIError(400, "priority must be foreground, normal, or background")
+        return REQUEST_PRIORITIES[priority_name]
+
+    def _score_job(self, prompt_tokens, slot_ids, deadline, priority, meta):
+        return Job(
+            request_id=next(self.ids),
+            prompt_tokens=prompt_tokens,
+            max_new_tokens=0,
+            seed=0,
+            temperature=0.0,
+            top_p=1.0,
+            top_k=0,
+            deadline=deadline,
+            priority=priority,
+            score_tokens=tuple(slot_ids),
+            public_id=secrets.token_hex(16),
+            meta=meta,
+        )
+
+    def prepare_judgment(self, body, *, deadline=None):
+        unknown = sorted(
+            set(body)
+            - {"id", "state", "question", "options", "model", "timeout", "priority"}
+        )
+        if unknown:
+            raise APIError(400, f"unsupported fields: {', '.join(unknown)}")
+        if body.get("model", self.model) != self.model:
+            raise APIError(404, f"model {body['model']} not found", "model_not_found")
+        try:
+            judgments.validate_row(body)
+        except ValueError as error:
+            raise APIError(400, str(error)) from error
+        if deadline is None:
+            deadline = self.request_deadline(body)
+        priority = self._priority(body)
+        with self._preparation(deadline):
+            try:
+                tokens, slots, prompt = judgments.encode_prompt(
+                    self.tokenizer,
+                    judgments.judgment_messages(body),
+                    judgments.LETTERS[: len(body["options"])],
+                )
+            except judgments.ScoringUnsupported as error:
+                raise APIError(500, str(error), "scoring_unsupported") from error
+            except Exception as error:
+                raise APIError(400, "judgment prompt could not be rendered") from error
+            remaining_request_time(deadline)
+            if len(tokens) > self.max_context:
+                raise ContextLengthError(len(tokens), self.max_context)
+            job = self._score_job(
+                tokens,
+                slots,
+                deadline,
+                priority,
+                {
+                    "prompt_sha256": judgments.digest(prompt),
+                    "answer_token_ids": tuple(slots),
+                },
+            )
+        return job, body
+
+    def prepare_systemone(self, body, *, deadline=None):
+        details = []
+        model = body.get("model")
+        if not isinstance(model, str) or not model:
+            details.append(judgments.detail(["model"], "field required", "missing"))
+        elif model != self.model:
+            details.append(
+                judgments.detail(
+                    ["model"], f"model {model} is not served by this endpoint"
+                )
+            )
+        state, specs, question_details = judgments.validate_systemone(body)
+        details.extend(question_details)
+        priority_name = body.get("priority", "normal")
+        if (
+            not isinstance(priority_name, str)
+            or priority_name not in REQUEST_PRIORITIES
+        ):
+            details.append(
+                judgments.detail(
+                    ["priority"],
+                    "priority must be foreground, normal, or background",
+                )
+            )
+        if details:
+            raise judgments.SystemOneError(details)
+        if deadline is None:
+            deadline = self.request_deadline(body)
+        priority = REQUEST_PRIORITIES[priority_name]
+        jobs = []
+        with self._preparation(deadline):
+            for qid, spec in specs:
+                if spec.deterministic:
+                    jobs.append((qid, spec, None))
+                    continue
+                slots = judgments.slot_labels(self.tokenizer)
+                if len(spec.labels) > len(slots):
+                    raise judgments.SystemOneError(
+                        [
+                            judgments.detail(
+                                ["questions", qid, "criteria"],
+                                f"the served tokenizer supports "
+                                f"{len(slots)} answer slots; "
+                                f"{len(spec.labels)} were requested",
+                            )
+                        ]
+                    )
+                labels = slots[: len(spec.labels)]
+                try:
+                    tokens, slot_ids, prompt = judgments.encode_prompt(
+                        self.tokenizer,
+                        judgments.systemone_messages(state, spec, labels),
+                        labels,
+                    )
+                except judgments.ScoringUnsupported as error:
+                    raise APIError(500, str(error), "scoring_unsupported") from error
+                except Exception as error:
+                    raise APIError(
+                        500, "question prompt could not be rendered"
+                    ) from error
+                remaining_request_time(deadline)
+                if len(tokens) > self.max_context:
+                    raise ContextLengthError(len(tokens), self.max_context)
+                job = self._score_job(
+                    tokens,
+                    slot_ids,
+                    deadline,
+                    priority,
+                    {
+                        "prompt_sha256": judgments.digest(prompt),
+                        "answer_token_ids": tuple(slot_ids),
+                    },
+                )
+                jobs.append((qid, spec, job))
+        return jobs
 
     def apply_template(self, body, *, deadline=None):
         add_generation_prompt = body.get("add_generation_prompt", True)
@@ -694,7 +839,7 @@ class Frontend:
             )
         remaining_request_time(deadline)
         if len(prompt_tokens) >= self.max_context:
-            raise ContextLengthError(len(prompt_tokens), self.max_context)
+            raise ContextLengthError(len(prompt_tokens), self.max_context - 1)
         max_new = body.get(
             "max_completion_tokens",
             body.get(
@@ -719,12 +864,7 @@ class Frontend:
             seed = secrets.randbits(64)
         if not isinstance(seed, int) or isinstance(seed, bool) or not 0 <= seed < 2**64:
             raise APIError(400, "seed must be an unsigned 64-bit integer")
-        priority_name = body.get("priority", "normal")
-        if (
-            not isinstance(priority_name, str)
-            or priority_name not in REQUEST_PRIORITIES
-        ):
-            raise APIError(400, "priority must be foreground, normal, or background")
+        priority = self._priority(body)
         request_id = next(self.ids)
         job = Job(
             request_id=request_id,
@@ -735,7 +875,7 @@ class Frontend:
             top_p=top_p,
             top_k=top_k,
             deadline=deadline,
-            priority=REQUEST_PRIORITIES[priority_name],
+            priority=priority,
             stop_sequences=stop_sequences,
             thinking=thinking,
             thinking_display=body.get("thinking_display", "summarized"),

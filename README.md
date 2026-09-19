@@ -56,6 +56,70 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 Reasoning is on by default. `"reasoning_effort": "none"` turns it off, and
 Qwen3.8-27B also takes `low`, `medium`, and `xhigh`.
 
+### Typed judgments without generation
+
+`POST /v1/systemone` accepts the [TypeSafe System One](https://docs.typesafe.ai/)
+request and response shapes: `noul`, `choice`, and `score` questions over a
+shared state. It works with the official `typesafe-sdk` (verified with 0.7.0):
+
+```python
+from typesafe_sdk import Choice, Noul, Score, TypeSafeClient
+
+with TypeSafeClient(
+    base_url="http://127.0.0.1:8000",
+    api_key="local",  # Use SPLASH_API_KEY's value if server authentication is on.
+    model="incoai/Qwen3.8-27B-Splash",
+) as client:
+    result = client.system_one(
+        state={"message": "I was charged twice. Please fix this today."},
+        questions={
+            "billing": Noul(instructions="Is this about billing?"),
+            "department": Choice(
+                instructions="Which team should handle this?",
+                criteria={"billing": None, "technical": None, "sales": None},
+            ),
+            "urgency": Score(
+                instructions="How urgent is the request?",
+                criteria=["No urgency", "This week", "Today"],
+            ),
+        },
+    )
+    print(result.choices["department"].choice)
+```
+
+Use the actual served model ID, not a hosted Jev model name. `/v1/models`
+supports both OpenAI model discovery and the TypeSafe SDK's `models.list()`.
+
+For [SemIf](https://github.com/TheoLeeCJ/SemIf)'s `direct-options-v1` prompt and
+raw option logits, use `POST /v1/judgments`:
+
+```bash
+curl http://127.0.0.1:8000/v1/judgments \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "id": "approval",
+    "state": "The proposal is awaiting approval.",
+    "question": "What is the current approval status?",
+    "options": [
+      {"id": "approved", "description": "Approval was explicitly given."},
+      {"id": "pending", "description": "Approval has not been given."}
+    ]
+  }'
+```
+
+SemIf accepts 2–16 options; System One accepts up to 255 choice labels or score
+levels, subject to single-token slot availability. Both endpoints are text-only,
+disable thinking, and read final-position logits without sampling or decoding.
+Output-token usage is zero. Prompts that exceed the context limit are rejected,
+not truncated.
+
+**These are local model scores, not Jev predictions or calibrated confidence.**
+Probabilities are a softmax over the declared answer slots. Choice/score
+`confidence` is normalized entropy concentration, `1 - H(p) / log(K)`, not an
+estimate of correctness. Score answers are probability-weighted level indices.
+Measure accuracy and calibrate on representative held-out data before using
+thresholds to make consequential decisions.
+
 ## Models
 
 | Package (`--model`) | Contents | Download |

@@ -139,7 +139,10 @@ private:
     bool finalized = false;
     std::optional<Failure> failure;
     bool replaying = false;
+    // Captured once the final prompt chunk completes; emitted with Done.
+    std::vector<float> scoreLogits;
   };
+
 
   struct Pending final {
     BatchPlan plan;
@@ -182,7 +185,8 @@ private:
   void signalResourceProgress() noexcept;
   void apply(const BatchPlan &plan, std::span<const ModelStepResult> results,
              double wallMilliseconds, bool representativePrefillTiming);
-  void finish(Request &request, EngineFinishReason reason);
+  void finish(Request &request, EngineFinishReason reason,
+              std::span<const float> optionLogits);
   void finishFailure(Request &request, Failure failure);
   void finishCapacity(Request &request, const TokenAdmission &admission);
   void release(Request &request);

@@ -37,10 +37,14 @@ struct EngineRequest final {
   ConstraintMode constraint = ConstraintMode::None;
   double deadlineMilliseconds = 0.0;
   bool returnProgress = false;
+  // Nonempty selects score-only mode: prefill runs to completion, no token is
+  // generated, and the raw final-position logits at these ids are returned in
+  // the completion callback. maxNewTokens must be zero.
+  std::vector<uint32_t> scoreTokens{};
 
   [[nodiscard]] ModelRequest modelView() const noexcept {
-    return {id, cohort, prompt, images, imagePixels, maxNewTokens, sampling,
-            constraint};
+    return {id,        cohort,   prompt,     images, imagePixels,
+            maxNewTokens, sampling, constraint, scoreTokens};
   }
 };
 
@@ -56,7 +60,8 @@ public:
   virtual void maskRequested(uint64_t requestId,
                              std::span<const uint32_t> simulationTokens) = 0;
   virtual void completed(uint64_t requestId, EngineFinishReason reason,
-                         uint32_t promptTokens, uint32_t completionTokens) = 0;
+                         uint32_t promptTokens, uint32_t completionTokens,
+                         std::span<const float> optionLogits) = 0;
   virtual void failed(uint64_t requestId, std::string code, std::string message,
                       bool retryable) = 0;
   virtual void capacityExhausted(uint64_t requestId, uint32_t requiredKvPages,

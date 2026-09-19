@@ -15,22 +15,22 @@ ROOT = Path(__file__).parents[3]
 
 
 REQUEST_GOLDEN = (
-    "53504c480500180001000000500000000000000000000000efcdab8967452301"
+    "53504c480600180001000000540000000000000000000000efcdab8967452301"
     "000201008098281765060040a5ae0200000000008000000500000000000000cd"
-    "cc4c3f3333733f200000001032547698badcfe0000000000010000002a000000"
-    "00000080ffffffff"
+    "cc4c3f3333733f200000001032547698badcfe00000000000000000001000000"
+    "2a00000000000080ffffffff"
 )
 ERROR_GOLDEN = (
-    "53504c4805001800050100002700000000000000000000000200000000000000"
+    "53504c4806001800050100002700000000000000000000000200000000000000"
     "0000090000000c0000006770755f6661756c744d6574616c206661696c6564"
 )
 STATUS_GOLDEN = (
-    "53504c4805001800070100002d00000000000000000000002803000000000000"
+    "53504c4806001800070100002d00000000000000000000002803000000000000"
     "050000007b22736368656d615f76657273696f6e223a342c227265616479223a"
     "747275657d"
 )
 INITIAL_MASK_GOLDEN = (
-    "53504c4805001800030100001800000000000000000000005b00000000000000"
+    "53504c4806001800030100001800000000000000000000005b00000000000000"
     "06000000000000000400000000000000"
 )
 
@@ -77,6 +77,14 @@ int main() {
         image.imagePixels[i] = static_cast<uint8_t>(i * 7 + 1);
     }
     show(image);
+    RequestFrame score = request;
+    score.promptTokens = {5, 6, 7};
+    score.logicalMaxOutputTokens = 0;
+    score.sampling = {0.0f, 1.0f, 0};
+    score.cohort = Cohort::Greedy;
+    score.constraint = ConstraintMode::None;
+    score.scoreTokens = {101, 202, 303};
+    show(score);
     show(CancelFrame{91});
     show(MaskResponseFrame{91, 7, {0xffffffffU, 0, 0xa5a5a5a5U}});
     show(StatusRequestFrame{808});
@@ -92,6 +100,9 @@ int main() {
     show(MaskRequestEvent{91, 7, 4, {101, 102, 103}});
     show(DoneEvent{91, FinishReason::Stop, 4096, 512,
                    1000, 2000, 3500});
+    DoneEvent scored{91, FinishReason::Stop, 4096, 0, 1000, 0, 3500};
+    scored.optionLogits = {1.5f, -2.25f, 0.5f};
+    show(scored);
     show(ErrorEvent{FailureClass::RequestError, 91, true,
                     "deadline_exceeded", "request deadline expired"});
     show(ErrorEvent{FailureClass::EngineUnhealthy, 0, false,
@@ -135,10 +146,23 @@ def example_image_request():
     )
 
 
+def example_score_request():
+    return replace(
+        example_request(),
+        logical_max_output_tokens=0,
+        prompt_tokens=(5, 6, 7),
+        sampling=p.SamplingParameters(),
+        cohort=p.Cohort.GREEDY,
+        constraint=p.ConstraintMode.NONE,
+        score_tokens=(101, 202, 303),
+    )
+
+
 def all_messages():
     return [
         example_request(),
         example_image_request(),
+        example_score_request(),
         p.CancelFrame(91),
         p.MaskResponseFrame(91, 7, (0xFFFFFFFF, 0, 0xA5A5A5A5)),
         p.StatusRequestFrame(808),
@@ -159,6 +183,16 @@ def all_messages():
         p.MaskRequestEvent(91, 6, 4, ()),
         p.MaskRequestEvent(91, 7, 4, (101, 102, 103)),
         p.DoneEvent(91, p.FinishReason.STOP, 4096, 512, 1000, 2000, 3500),
+        p.DoneEvent(
+            91,
+            p.FinishReason.STOP,
+            4096,
+            0,
+            1000,
+            0,
+            3500,
+            (1.5, -2.25, 0.5),
+        ),
         p.ErrorEvent(
             p.FailureClass.REQUEST_ERROR,
             91,
@@ -353,24 +387,196 @@ class ProtocolPythonTests(unittest.TestCase):
             with self.subTest(event=event), self.assertRaises(p.ProtocolError):
                 p.serialize_message(event)
 
+    def test_score_request_wire_layout_and_roundtrip(self):
+        request = example_score_request()
+        wire = p.serialize_message(request)
+        self.assertEqual(
+            struct.unpack_from("<I", wire, 24 + 60)[0], len(request.score_tokens)
+        )
+        self.assertEqual(
+            struct.unpack_from("<3I", wire, 24 + 64 + 4 * 3),
+            request.score_tokens,
+        )
+        self.assertEqual(
+            p.decode_frame(parse_all(wire)[0]),
+            request,
+        )
+        # A wrong score count desynchronizes the tail and must fail closed.
+        bad = mutate_u32(wire, 24 + 60, 2)
+        self.assert_protocol_error(
+            p.FailureClass.REQUEST_ERROR,
+            p.IssueCode.INVALID_PAYLOAD_LENGTH,
+            lambda: p.decode_frame(parse_all(bad)[0]),
+        )
+
+    def test_maximum_score_domain_roundtrips_without_truncation(self):
+        request = replace(example_score_request(), score_tokens=tuple(range(255)))
+        done = p.DoneEvent(
+            91,
+            p.FinishReason.STOP,
+            3,
+            0,
+            1000,
+            0,
+            1000,
+            tuple(float(index) for index in range(255)),
+        )
+        for message in (request, done):
+            encoded = p.serialize_message(message)
+            self.assertEqual(p.decode_frame(parse_all(encoded)[0]), message)
+
+    def test_score_request_rejects_generation_combinations(self):
+        base = example_score_request()
+        cases = (
+            (replace(base, logical_max_output_tokens=8), p.IssueCode.INVALID_COUNT),
+            (replace(base, score_tokens=(101,)), p.IssueCode.INVALID_COUNT),
+            (replace(base, score_tokens=(101, 101)), p.IssueCode.INVALID_COUNT),
+            (replace(base, score_tokens=tuple(range(256))), p.IssueCode.INVALID_COUNT),
+            (
+                replace(base, sampling=p.SamplingParameters(0.5, 1.0, 8)),
+                p.IssueCode.INVALID_SAMPLING,
+            ),
+            (
+                replace(base, sampling=p.SamplingParameters(0.0, 0.5, 0)),
+                p.IssueCode.INVALID_SAMPLING,
+            ),
+            (
+                replace(base, constraint=p.ConstraintMode.TOKEN_MASK),
+                p.IssueCode.INVALID_COHORT_CONSTRAINT,
+            ),
+            (
+                replace(base, cohort=p.Cohort.SAMPLING),
+                p.IssueCode.INVALID_COHORT_CONSTRAINT,
+            ),
+            (
+                replace(
+                    base,
+                    image_spans=(p.ImageSpan(0, 1, 2, 2, 1, 2),),
+                    image_pixels=bytes(48),
+                ),
+                p.IssueCode.INVALID_COUNT,
+            ),
+        )
+        for request, code in cases:
+            with self.subTest(request=request):
+                issue = self.assert_protocol_error(
+                    p.FailureClass.REQUEST_ERROR,
+                    code,
+                    lambda request=request: p.serialize_message(request),
+                )
+                self.assertEqual(issue.request_id, request.request_id)
+        # Ordinary generation still requires a positive output budget.
+        self.assert_protocol_error(
+            p.FailureClass.REQUEST_ERROR,
+            p.IssueCode.LIMIT_EXCEEDED,
+            lambda: p.serialize_message(
+                replace(example_request(), logical_max_output_tokens=0)
+            ),
+        )
+
+    def test_malformed_score_frames_preserve_request_error_codes(self):
+        request = example_score_request()
+        payload = p.encode_message(request).payload
+        score_offset = 64 + 4 * len(request.prompt_tokens)
+        for tokens, output_tokens in (
+            ((101,), 0),
+            ((101, 101), 0),
+            (tuple(range(256)), 0),
+            (request.score_tokens, 1),
+        ):
+            with self.subTest(
+                tokens=tokens[:4], count=len(tokens), output=output_tokens
+            ):
+                malformed = bytearray(payload[:score_offset])
+                struct.pack_into("<I", malformed, 27, output_tokens)
+                struct.pack_into("<I", malformed, 60, len(tokens))
+                malformed.extend(struct.pack(f"<{len(tokens)}I", *tokens))
+                wire = p.serialize_frame(p.Frame(p.FrameType.REQUEST, bytes(malformed)))
+                issue = self.assert_protocol_error(
+                    p.FailureClass.REQUEST_ERROR,
+                    p.IssueCode.INVALID_COUNT,
+                    lambda: p.decode_frame(parse_all(wire)[0]),
+                )
+                self.assertEqual(issue.request_id, request.request_id)
+
+    def test_done_option_logits_wire_layout_and_roundtrip(self):
+        done = p.DoneEvent(
+            91, p.FinishReason.STOP, 4096, 0, 1000, 0, 3500, (1.5, -2.25, 0.5)
+        )
+        wire = p.serialize_message(done)
+        self.assertEqual(struct.unpack_from("<I", wire, 24 + 41)[0], 3)
+        self.assertEqual(struct.unpack_from("<3f", wire, 24 + 45), done.option_logits)
+        self.assertEqual(p.decode_frame(parse_all(wire)[0]), done)
+        # A wrong logit count must fail closed, not truncate.
+        bad = mutate_u32(wire, 24 + 41, 2)
+        self.assert_protocol_error(
+            p.FailureClass.PROTOCOL_FATAL,
+            p.IssueCode.INVALID_PAYLOAD_LENGTH,
+            lambda: p.decode_frame(parse_all(bad)[0]),
+        )
+        # A v5-shaped 41-byte Done payload is below the v6 minimum.
+        short = wire[: 24 + 41]
+        short = mutate_u64(short, 12, 41)
+        issue = parser_issue(short)
+        self.assertEqual(issue.code, p.IssueCode.INVALID_PAYLOAD_LENGTH)
+
+    def test_done_option_logits_validation(self):
+        base = dict(
+            request_id=91,
+            reason=p.FinishReason.STOP,
+            prompt_tokens=4,
+            completion_tokens=0,
+            prefill_micros=100,
+            decode_micros=0,
+            wall_micros=200,
+        )
+        for logits in (
+            (1.0,),
+            tuple(float(i) for i in range(256)),
+            (1.0, float("nan")),
+            (1.0, float("inf")),
+            (1.0, 1e300),
+        ):
+            with self.subTest(logits=logits[:4]):
+                self.assert_protocol_error(
+                    p.FailureClass.ENGINE_UNHEALTHY,
+                    p.IssueCode.INVALID_COUNT,
+                    lambda logits=logits: p.serialize_message(
+                        p.DoneEvent(**base, option_logits=logits)
+                    ),
+                )
+        self.assert_protocol_error(
+            p.FailureClass.ENGINE_UNHEALTHY,
+            p.IssueCode.INVALID_COUNT,
+            lambda: p.serialize_message(
+                p.DoneEvent(
+                    **{
+                        **base,
+                        "reason": p.FinishReason.CANCELLED,
+                    },
+                    option_logits=(1.0, 2.0),
+                )
+            ),
+        )
+
     def test_request_header_and_binary_prompt(self):
         request = example_request()
         wire = p.serialize_message(request)
         self.assertEqual(wire[:4], b"SPLH")
         self.assertEqual(
             struct.unpack_from("<HHHHQI", wire, 4),
-            (p.PROTOCOL_VERSION, 24, int(p.FrameType.REQUEST), 0, 80, 0),
+            (p.PROTOCOL_VERSION, 24, int(p.FrameType.REQUEST), 0, 84, 0),
         )
         self.assertEqual(struct.unpack_from("<Q", wire, 24)[0], request.request_id)
         self.assertEqual(struct.unpack_from("<I", wire, 24 + 31)[0], 5)
         self.assertEqual(struct.unpack_from("<I", wire, 24 + 35)[0], 0)
         self.assertEqual(
-            struct.unpack_from("<5I", wire, 24 + 60), request.prompt_tokens
+            struct.unpack_from("<5I", wire, 24 + 64), request.prompt_tokens
         )
 
         image = example_image_request()
         wire = p.serialize_message(image)
-        span_offset = 24 + 60 + 4 * len(image.prompt_tokens)
+        span_offset = 24 + 64 + 4 * len(image.prompt_tokens)
         self.assertEqual(struct.unpack_from("<I", wire, 24 + 35)[0], 1)
         self.assertEqual(
             struct.unpack_from("<IIIIQQ", wire, span_offset),

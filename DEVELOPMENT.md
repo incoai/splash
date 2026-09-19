@@ -48,8 +48,8 @@ New architectures require engine support; ordinary HF weights need conversion.
 
 ## Code and API boundaries
 
-- `server/`: OpenAI Chat/Responses, Anthropic Messages/count_tokens, templates,
-  streaming and input processing. No client-version branches.
+- `server/`: OpenAI Chat/Responses, Anthropic Messages/count_tokens, typed
+  judgments, templates, streaming and input processing. No client-version branches.
 - `runtime/engine/`: scheduling, memory admission and reusable request state.
 - `runtime/model/`: target/draft execution and vision.
 - `runtime/ops/` and `runtime/metal/`: operators and Metal kernels.
@@ -57,10 +57,11 @@ New architectures require engine support; ordinary HF weights need conversion.
 - `dev/`: maintained tests, benchmarks and build/release tools.
 
 Within `server/`, `server.py` owns HTTP and startup; `frontend.py` prepares
-requests and history; `backend.py` owns native request lifecycles. `output.py`
-parses generated text for both streaming and complete responses, and
-`constraints.py` compiles token constraints. `make architecture-check` prevents
-lower layers from importing the HTTP entry module.
+requests and history; `backend.py` owns native request lifecycles. `judgments.py`
+owns finite-choice prompts, validation and typed answer math. `output.py` parses
+generated text for both streaming and complete responses, and `constraints.py`
+compiles token constraints. `make architecture-check` prevents lower layers from
+importing the HTTP entry module.
 
 Tools can be combined with structured answers. Original schemas validate output
 even when generation cannot enforce every assertion. Tool arguments must declare
@@ -108,6 +109,40 @@ Long prefill uses disposable rolling checkpoints every 4096 tokens. Contended
 prefill adapts toward a 500 ms slice, keeping 2048-token chunks for long unopposed
 work. These policies do not extend client deadlines. Memory recovery waits are
 bounded, but readiness does not guarantee that a request-sized allocation fits.
+
+### Judgment contracts
+
+`POST /v1/judgments` preserves SemIf's `direct-options-v1` JSON serialization,
+system prompt and A–P option order. It returns the exact rendered prompt's SHA-256,
+answer token IDs, raw option logits, normalized probabilities and zero completion
+tokens. Every answer label must round-trip as one token, including at the actual
+assistant prompt boundary. Unsupported generation controls return errors rather
+than silently changing the scoring protocol. SemIf-derived code retains its MIT
+notice in `server/judgments.py`.
+
+`POST /v1/systemone` requires the served `model`, a string/object/array `state`,
+and a nonempty `questions` map. Instructions may be omitted, null or structured;
+criteria descriptions may also be structured. Noul criteria may be omitted.
+Choice and score domains contain 1–255 entries. Singletons return their sole
+answer without inference. Other domains use deterministic, distinct single-token
+slots selected from the tokenizer. All questions are validated before any inference.
+Questions run sequentially within a request under one shared deadline, allowing
+prefix reuse without filling the admission queue; independent HTTP requests still
+share the scheduler. Disconnects and timeouts cancel the current question.
+
+System One validation uses 422 `detail` arrays; successful responses contain
+`model`, `answers`, and `usage`, plus an `x-typesafe-request-id` header. SDK model
+discovery reports an empty `release_date` because packages do not record one.
+The official SDK is a client only, not a server dependency. API compatibility does
+not imply Jev weights, accuracy, proprietary confidence semantics or calibration.
+
+Native wire version 6 appends score-token IDs to requests and selected f32 logits
+to Done events; a version mismatch is fatal. Scoring requires 2–255 distinct,
+in-vocabulary tokens, no images or generation constraints, and a zero output budget.
+It may use the full context window because no generated token needs a reserved
+position. The final prefill chunk runs the target head but no sampling policy or
+DFlash decode. Successful scoring emits no Tokens event, finishes with Stop, and
+reports zero decode time. Cancelled requests carry no logits.
 
 ## Validate
 

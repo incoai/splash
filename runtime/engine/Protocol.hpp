@@ -14,7 +14,7 @@
 
 namespace splash::protocol {
 
-inline constexpr uint16_t kProtocolVersion = 5;
+inline constexpr uint16_t kProtocolVersion = 6;
 inline constexpr size_t kFrameHeaderBytes = 24;
 inline constexpr uint32_t kStatusSchemaVersion = 5;
 // Image pixels travel inside the request frame; a multi-image agent turn can
@@ -113,6 +113,12 @@ struct ProtocolLimits {
   // value, so a frame limit violation is never a late allocation failure.
   uint32_t maxImagePatches = ops::kMaximumImagePatches;
 };
+// Direct finite-option scoring (SemIf/Jev System One): a request carrying
+// scoreTokens runs prefill only and returns the raw final-position logits at
+// those token ids in DoneEvent.optionLogits. The option count is bounded by
+// the wire contract; the engine additionally requires vocabulary bounds.
+inline constexpr uint32_t kMinimumScoreOptions = 2;
+inline constexpr uint32_t kMaximumScoreOptions = 255;
 
 enum class RequestPriority : uint8_t {
   Foreground = 0,
@@ -180,6 +186,10 @@ struct RequestFrame {
   Cohort cohort = Cohort::Greedy;
   ConstraintMode constraint = ConstraintMode::None;
   bool returnProgress = false;
+  // Empty selects ordinary generation. Nonempty selects score-only mode:
+  // 2..255 distinct token ids, logicalMaxOutputTokens must be zero, and the
+  // request must be text-only, unconstrained, and greedy.
+  std::vector<uint32_t> scoreTokens{};
 
   bool operator==(const RequestFrame &) const = default;
 };
@@ -282,6 +292,9 @@ struct DoneEvent {
   uint64_t prefillMicros = 0;
   uint64_t decodeMicros = 0;
   uint64_t wallMicros = 0;
+  // Raw final-prompt-position logits at the request's scoreTokens, in
+  // requested order. Empty for generation and for cancelled/failed scoring.
+  std::vector<float> optionLogits{};
 
   bool operator==(const DoneEvent &) const = default;
 };

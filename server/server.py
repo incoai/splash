@@ -22,6 +22,7 @@ from transformers import AutoTokenizer
 
 if __package__:
     from . import images as image_input
+    from . import judgments
     from . import runtime as engine_runtime
     from .api_shapes import (
         anthropic_response,
@@ -60,6 +61,7 @@ if __package__:
     from .tool_schema import strict_json_loads
 else:
     import images as image_input
+    import judgments
     from api_shapes import (
         anthropic_response,
         anthropic_stop,
@@ -175,6 +177,11 @@ class FrontendHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Connection", "close")
+        if getattr(self, "path", "").partition("?")[0] in (
+            "/v1/systemone",
+            "/v1/models",
+        ) or getattr(self, "path", "").startswith("/v1/models/"):
+            self.send_header("x-typesafe-request-id", f"req_{secrets.token_hex(12)}")
         self._response_started = True
         self.end_headers()
         if self.command != "HEAD":
@@ -322,8 +329,15 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 "created": 0,
                 "owned_by": "splash",
             }
+            # TypeSafe SDK compatibility: models.list() reads "models" entries.
+            # The release date is not tracked locally and stays unknown.
+            typed = {
+                "name": self.app.model,
+                "description": "Splash resident model",
+                "release_date": "",
+            }
             if path == "/v1/models":
-                self._json(200, {"object": "list", "data": [model]})
+                self._json(200, {"object": "list", "data": [model], "models": [typed]})
             elif unquote(path.removeprefix("/v1/models/")) == self.app.model:
                 self._json(200, model)
             else:
@@ -356,6 +370,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         count_tokens = path == "/v1/messages/count_tokens"
         prompt_only = count_tokens or path in ("/tokenize", "/apply-template")
         anthropic = path == "/v1/messages" or count_tokens
+        systemone = path == "/v1/systemone"
         if path not in (
             "/v1/chat/completions",
             "/v1/responses",
@@ -363,13 +378,17 @@ class FrontendHandler(BaseHTTPRequestHandler):
             "/v1/messages/count_tokens",
             "/tokenize",
             "/apply-template",
+            "/v1/judgments",
+            "/v1/systemone",
         ):
             self._safe_error(APIError(404, "not found", "not_found"))
             return
         if not prompt_only and not self.app.backend.can_submit():
             self._safe_error(
                 APIError(
-                    503, "engine is recovering; retry shortly", "engine_recovering"
+                    529 if systemone else 503,
+                    "engine is recovering; retry shortly",
+                    "engine_recovering",
                 ),
                 anthropic,
                 log=False,
@@ -382,7 +401,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
         if not admission.acquire():
             self._safe_error(
                 APIError(
-                    503, "frontend request capacity is exhausted", "frontend_overloaded"
+                    529 if systemone else 503,
+                    "frontend request capacity is exhausted",
+                    "frontend_overloaded",
                 ),
                 anthropic,
             )
@@ -390,8 +411,19 @@ class FrontendHandler(BaseHTTPRequestHandler):
         try:
             body = self._read_json_body()
             if not isinstance(body, dict):
+                if systemone:
+                    raise judgments.SystemOneError(
+                        [judgments.detail([], "request body must be an object")]
+                    )
                 raise APIError(400, "request body must be an object")
-            deadline = self.app.request_deadline(body, started_at)
+            try:
+                deadline = self.app.request_deadline(body, started_at)
+            except APIError as error:
+                if systemone:
+                    raise judgments.SystemOneError(
+                        [judgments.detail(["timeout"], error.message)]
+                    ) from error
+                raise
             if path == "/tokenize":
                 self._json(200, {"tokens": self.app.tokenize(body, deadline=deadline)})
                 return
@@ -410,6 +442,19 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     deadline=deadline,
                 )
                 self._json(200, {"input_tokens": tokens})
+                return
+            if path == "/v1/judgments":
+                job, row = self.app.prepare_judgment(body, deadline=deadline)
+                remaining_request_time(deadline)
+                if self._client_disconnected():
+                    raise ConnectionResetError("client disconnected before submission")
+                if not self.app.backend.submit(job):
+                    raise APIError(429, "request queue is full", "rate_limit_exceeded")
+                submitted = True
+                self._judgment_complete(job, row)
+                return
+            if systemone:
+                self._systemone(body, deadline)
                 return
             responses = path == "/v1/responses"
             stream = body.get("stream", False)
@@ -468,6 +513,10 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 self._stream(job, thinking, has_tools, stream_options)
             else:
                 self._complete(job, thinking, has_tools)
+        except judgments.SystemOneError as error:
+            if submitted:
+                self.app.backend.cancel(job)
+            self._systemone_error(error)
         except (BrokenPipeError, ConnectionResetError):
             if submitted:
                 self.app.backend.cancel(job)
@@ -479,14 +528,23 @@ class FrontendHandler(BaseHTTPRequestHandler):
         except APIError as error:
             if submitted:
                 self.app.backend.cancel(job)
+            if systemone and error.status == 503:
+                error = APIError(529, error.message, error.code)
             # The native outcome was already logged; a server-side failure
             # after submission must still reach the console.
             self._safe_error(error, anthropic, log=not submitted or error.status >= 500)
         except (ValueError, RecursionError):
             if submitted:
                 self.app.backend.cancel(job)
-            error = APIError(400, "invalid JSON request body")
-            self._safe_error(error, anthropic, log=not submitted)
+            if systemone:
+                self._systemone_error(
+                    judgments.SystemOneError(
+                        [judgments.detail([], "invalid JSON request body")]
+                    )
+                )
+            else:
+                error = APIError(400, "invalid JSON request body")
+                self._safe_error(error, anthropic, log=not submitted)
         except Exception as error:
             if submitted:
                 self.app.backend.cancel(job)
@@ -495,6 +553,85 @@ class FrontendHandler(BaseHTTPRequestHandler):
             self._safe_error(error, anthropic, log=False)
         finally:
             admission.release()
+
+    def _judgment_complete(self, job, row):
+        result = None
+        while result is None:
+            kind, value = self._next_event(job)
+            if kind == "done":
+                result = value
+        if result.reason == "cancelled":
+            if job.timed_out:
+                raise APIError(504, "request timed out", "request_timeout")
+            raise APIError(500, "request cancelled", "request_cancelled")
+        if result.reason != "stop" or len(result.option_logits) != len(
+            job.score_tokens
+        ):
+            raise APIError(500, "runtime protocol error", "protocol_error")
+        self._json(
+            200,
+            judgments.judgment_response(self.app.model, row, job.meta, result),
+        )
+
+    def _systemone(self, body, deadline):
+        active_job = None
+        try:
+            entries = self.app.prepare_systemone(body, deadline=deadline)
+            remaining_request_time(deadline)
+            if self._client_disconnected():
+                raise ConnectionResetError("client disconnected before submission")
+            answers = {}
+            input_tokens = 0
+            for qid, spec, job in entries:
+                if job is None:
+                    answers[qid] = judgments.deterministic_answer(spec)
+                    continue
+                # One admitted job per HTTP request preserves the existing
+                # queue bound and lets later questions reuse the state prefix.
+                active_job = job
+                if not self.app.backend.submit(job):
+                    raise APIError(429, "request queue is full", "rate_limit_exceeded")
+                result = None
+                while result is None:
+                    kind, value = self._next_event(job)
+                    if kind == "done":
+                        result = value
+                if result.reason == "cancelled":
+                    if job.timed_out:
+                        raise APIError(504, "request timed out", "request_timeout")
+                    raise APIError(500, "request cancelled", "request_cancelled")
+                if result.reason != "stop" or len(result.option_logits) != len(
+                    job.score_tokens
+                ):
+                    raise APIError(500, "runtime protocol error", "protocol_error")
+                input_tokens += result.prompt_tokens
+                answers[qid] = judgments.systemone_answer(
+                    spec, judgments.softmax(list(result.option_logits))
+                )
+                active_job = None
+        except BaseException:
+            if active_job is not None:
+                self.app.backend.cancel(active_job)
+            raise
+        self._json(
+            200,
+            {
+                "model": self.app.model,
+                "answers": answers,
+                "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+            },
+        )
+
+    def _systemone_error(self, error):
+        if self._response_started:
+            return
+        self._log_api_error(
+            APIError(422, error.details[0]["msg"], "unprocessable_entity")
+        )
+        try:
+            self._json(422, {"detail": error.details})
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            pass
 
     def _next_event(self, job, on_idle=None):
         while True:

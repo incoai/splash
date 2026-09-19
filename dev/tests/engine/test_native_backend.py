@@ -314,6 +314,47 @@ class NativeBackendContractTests(unittest.TestCase):
         )
         self.assertEqual(self.terminal(job)[0], "done")
 
+    def test_score_job_maps_to_score_only_request_and_returns_logits(self):
+        factory = FakeFactory()
+        native = runtime.MultiplexedRuntime(
+            process_factory=factory,
+            pending_limit=4,
+        )
+        transport, _runtime = self.make_transport(native)
+        job = make_job(404)
+        job.max_new_tokens = 0
+        job.temperature = 0.0
+        job.top_p = 1.0
+        job.top_k = 0
+        job.score_tokens = (101, 202, 303)
+
+        self.assertTrue(transport.submit(job))
+        process = factory.processes[0]
+        frame = process.stdin.wait_for(wire.RequestFrame)[0]
+        self.assertEqual(frame.score_tokens, (101, 202, 303))
+        self.assertEqual(frame.logical_max_output_tokens, 0)
+        self.assertEqual(frame.cohort, wire.Cohort.GREEDY)
+
+        process.send(
+            wire.StartEvent(frame.request_id, wire.CacheDisposition.MISS, 0, 0, 4096)
+        )
+        process.send(
+            wire.DoneEvent(
+                frame.request_id,
+                wire.FinishReason.STOP,
+                4,
+                0,
+                100,
+                0,
+                350,
+                (1.5, -2.25, 0.5),
+            )
+        )
+        kind, result = self.terminal(job)
+        self.assertEqual(kind, "done")
+        self.assertEqual(result.option_logits, (1.5, -2.25, 0.5))
+        self.assertEqual(result.completion_tokens, 0)
+
     def test_real_runtime_correlates_initial_and_verify_mask_rows(self):
         factory = FakeFactory()
         native = runtime.MultiplexedRuntime(
