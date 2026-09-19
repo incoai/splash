@@ -111,6 +111,8 @@ T roundTrip(const T &message, const ProtocolLimits &limits = {}) {
   return std::get<T>(std::move(*decoded.value));
 }
 
+Frame decodeSingleFrame(const std::vector<uint8_t> &wire);
+
 RequestFrame exampleRequest() {
   RequestFrame request;
   request.requestId = 0x0123456789abcdefULL;
@@ -138,6 +140,22 @@ RequestFrame exampleImageRequest() {
   return request;
 }
 
+RequestFrame exampleScoreRequest() {
+  RequestFrame request;
+  request.requestId = 0x1111111111111111ULL;
+  request.priority = RequestPriority::Normal;
+  request.absoluteDeadlineUnixMicros = 1'800'000'000'000'000ULL;
+  request.remainingDeadlineMicros = 45'000'000;
+  request.logicalMaxOutputTokens = 0;
+  request.promptTokens = {1, 2, 3, 4};
+  request.sampling = {0.0f, 1.0f, 0};
+  request.seed = 7;
+  request.cohort = Cohort::Greedy;
+  request.constraint = ConstraintMode::None;
+  request.scoreTokens = {32, 65, 97};
+  return request;
+}
+
 void testRequestWireAndRoundTrip() {
   constexpr std::string_view test = "request wire and round trip";
   RequestFrame request = exampleRequest();
@@ -148,21 +166,21 @@ void testRequestWireAndRoundTrip() {
   const auto &wire = *serialized.value;
 
   CHECK(test, wire.size() ==
-                  kFrameHeaderBytes + 60 + request.promptTokens.size() * 4);
+                  kFrameHeaderBytes + 64 + request.promptTokens.size() * 4);
   CHECK(test, std::string(wire.begin(), wire.begin() + 4) == "SPLH");
   CHECK(test, loadU16(wire, 4) == kProtocolVersion);
   CHECK(test, loadU16(wire, 6) == kFrameHeaderBytes);
   CHECK(test, loadU16(wire, 8) == static_cast<uint16_t>(FrameType::Request));
   CHECK(test, loadU16(wire, 10) == 0);
-  CHECK(test, loadU64(wire, 12) == 60 + request.promptTokens.size() * 4);
+  CHECK(test, loadU64(wire, 12) == 64 + request.promptTokens.size() * 4);
   CHECK(test, loadU32(wire, 20) == 0);
   CHECK(test, loadU64(wire, kFrameHeaderBytes) == request.requestId);
   CHECK(test,
         loadU32(wire, kFrameHeaderBytes + 31) == request.promptTokens.size());
   CHECK(test, loadU32(wire, kFrameHeaderBytes + 35) == 0);
   CHECK(test, loadU32(wire, kFrameHeaderBytes + 60) == 0);
-  CHECK(test, loadU32(wire, kFrameHeaderBytes + 60 + 16) == 0xffffffffU);
-
+  CHECK(test, loadU32(wire, kFrameHeaderBytes + 64) == 0);
+  CHECK(test, loadU32(wire, kFrameHeaderBytes + 64 + 16) == 0xffffffffU);
   RequestFrame decoded = roundTrip(request);
   CHECK(test, decoded == request);
 
@@ -172,7 +190,7 @@ void testRequestWireAndRoundTrip() {
   if (!imageWire)
     return;
   const size_t spanOffset =
-      kFrameHeaderBytes + 60 + withImage.promptTokens.size() * 4;
+      kFrameHeaderBytes + 64 + withImage.promptTokens.size() * 4;
   CHECK(test, imageWire.value->size() ==
                   spanOffset + 32 + withImage.imagePixels.size());
   CHECK(test, loadU32(*imageWire.value, kFrameHeaderBytes + 35) == 1);
@@ -184,6 +202,163 @@ void testRequestWireAndRoundTrip() {
                   withImage.imageSpans[0].digestLo);
   CHECK(test, roundTrip(withImage) == withImage);
 }
+
+void testScoreRequestAndDoneLogits() {
+  constexpr std::string_view test = "score request and done logits";
+  RequestFrame request = exampleScoreRequest();
+  auto serialized = serializeMessage(Message{request});
+  CHECK(test, serialized);
+  if (!serialized)
+    return;
+  const auto &wire = *serialized.value;
+  const size_t scoreOffset =
+      kFrameHeaderBytes + 64 + request.promptTokens.size() * 4;
+  CHECK(test, wire.size() == scoreOffset + request.scoreTokens.size() * 4);
+  CHECK(test, loadU32(wire, kFrameHeaderBytes + 27) == 0);
+  CHECK(test, loadU32(wire, kFrameHeaderBytes + 60) ==
+                  request.scoreTokens.size());
+  CHECK(test, roundTrip(request) == request);
+
+  RequestFrame emptyScores = request;
+  emptyScores.scoreTokens.clear();
+  emptyScores.logicalMaxOutputTokens = 16;
+  CHECK(test, roundTrip(emptyScores) == emptyScores);
+
+  auto expectRequestIssue = [&](RequestFrame invalid, IssueCode code) {
+    auto encoded = encodeMessage(Message{invalid});
+    CHECK(test, !encoded);
+    if (encoded.issue) {
+      CHECK(test, encoded.issue->failureClass == FailureClass::RequestError);
+      CHECK(test, encoded.issue->code == code);
+      CHECK(test, encoded.issue->requestId == invalid.requestId);
+    }
+  };
+
+  RequestFrame tooFew = request;
+  tooFew.scoreTokens = {32};
+  expectRequestIssue(tooFew, IssueCode::InvalidCount);
+
+  RequestFrame tooMany = request;
+  tooMany.scoreTokens.resize(kMaximumScoreOptions + 1);
+  for (uint32_t index = 0; index < tooMany.scoreTokens.size(); ++index)
+    tooMany.scoreTokens[index] = index;
+  expectRequestIssue(tooMany, IssueCode::InvalidCount);
+
+  auto oversizedWire = wire;
+  oversizedWire.resize(scoreOffset + tooMany.scoreTokens.size() * 4);
+  storeU32(oversizedWire, kFrameHeaderBytes + 60, tooMany.scoreTokens.size());
+  storeU64(oversizedWire, 12, oversizedWire.size() - kFrameHeaderBytes);
+  for (size_t index = 0; index < tooMany.scoreTokens.size(); ++index)
+    storeU32(oversizedWire, scoreOffset + index * 4, tooMany.scoreTokens[index]);
+  auto oversizedDecoded = decodeFrame(decodeSingleFrame(oversizedWire));
+  CHECK(test, !oversizedDecoded);
+  if (oversizedDecoded.issue) {
+    CHECK(test, oversizedDecoded.issue->failureClass == FailureClass::RequestError);
+    CHECK(test, oversizedDecoded.issue->code == IssueCode::InvalidCount);
+    CHECK(test, oversizedDecoded.issue->requestId == request.requestId);
+  }
+
+  RequestFrame duplicates = request;
+  duplicates.scoreTokens = {32, 65, 32};
+  expectRequestIssue(duplicates, IssueCode::InvalidCount);
+
+  RequestFrame withOutput = request;
+  withOutput.logicalMaxOutputTokens = 8;
+  expectRequestIssue(withOutput, IssueCode::InvalidCount);
+
+  RequestFrame withImage = request;
+  withImage.imageSpans = {
+      {0, 1, 2, 2, 0x1111222233334444ULL, 0x5555666677778888ULL}};
+  withImage.imagePixels.resize(withImage.imageSpans[0].pixelBytes());
+  expectRequestIssue(withImage, IssueCode::InvalidCount);
+
+  RequestFrame constrained = request;
+  constrained.constraint = ConstraintMode::TokenMask;
+  constrained.cohort = Cohort::Constrained;
+  expectRequestIssue(constrained, IssueCode::InvalidCohortConstraint);
+
+  RequestFrame sampling = request;
+  sampling.sampling = {0.8f, 0.95f, 32};
+  sampling.cohort = Cohort::Sampling;
+  expectRequestIssue(sampling, IssueCode::InvalidSampling);
+
+  DoneEvent scored{91, FinishReason::Stop, 4096, 0, 1000, 0, 3500, {1.5f, -2.0f, 0.25f}};
+  CHECK(test, roundTrip(scored) == scored);
+
+  auto encodedDone = serializeMessage(Message{scored});
+  CHECK(test, encodedDone);
+  if (encodedDone) {
+    CHECK(test, encodedDone.value->size() == kFrameHeaderBytes + 45 + 12);
+    CHECK(test, loadU32(*encodedDone.value, kFrameHeaderBytes + 41) == 3);
+  }
+
+  DoneEvent generation{91, FinishReason::Length, 10, 4, 1, 2, 3, {}};
+  CHECK(test, roundTrip(generation) == generation);
+
+  DoneEvent cancelled{91, FinishReason::Cancelled, 10, 0, 1, 0, 3, {}};
+  CHECK(test, roundTrip(cancelled) == cancelled);
+
+  auto expectDoneIssue = [&](DoneEvent invalid, IssueCode code) {
+    auto encoded = encodeMessage(Message{invalid});
+    CHECK(test, !encoded);
+    if (encoded.issue) {
+      CHECK(test, encoded.issue->failureClass == FailureClass::EngineUnhealthy);
+      CHECK(test, encoded.issue->code == code);
+    }
+  };
+
+  DoneEvent oneLogit = scored;
+  oneLogit.optionLogits = {1.0f};
+  expectDoneIssue(oneLogit, IssueCode::InvalidCount);
+
+  DoneEvent nanLogit = scored;
+  nanLogit.optionLogits = {1.0f, std::numeric_limits<float>::quiet_NaN()};
+  expectDoneIssue(nanLogit, IssueCode::InvalidCount);
+
+  DoneEvent infLogit = scored;
+  infLogit.optionLogits = {1.0f, std::numeric_limits<float>::infinity()};
+  expectDoneIssue(infLogit, IssueCode::InvalidCount);
+
+  DoneEvent withCompletion = scored;
+  withCompletion.completionTokens = 1;
+  expectDoneIssue(withCompletion, IssueCode::InvalidCount);
+
+  DoneEvent withDecode = scored;
+  withDecode.decodeMicros = 5;
+  expectDoneIssue(withDecode, IssueCode::InvalidCount);
+
+  DoneEvent cancelledScored = scored;
+  cancelledScored.reason = FinishReason::Cancelled;
+  expectDoneIssue(cancelledScored, IssueCode::InvalidCount);
+
+  DoneEvent lengthScored = scored;
+  lengthScored.reason = FinishReason::Length;
+  expectDoneIssue(lengthScored, IssueCode::InvalidCount);
+
+  if (encodedDone) {
+    auto truncated = *encodedDone.value;
+    truncated.resize(truncated.size() - 4);
+    storeU64(truncated, 12, truncated.size() - kFrameHeaderBytes);
+    auto result = decodeFrame(decodeSingleFrame(truncated));
+    CHECK(test, !result);
+    if (result.issue) {
+      CHECK(test, result.issue->failureClass == FailureClass::ProtocolFatal);
+      CHECK(test, result.issue->code == IssueCode::InvalidPayloadLength);
+    }
+
+    auto lengthWire = *encodedDone.value;
+    lengthWire[kFrameHeaderBytes + 8] =
+        static_cast<uint8_t>(FinishReason::Length);
+    auto lengthResult = decodeFrame(decodeSingleFrame(lengthWire));
+    CHECK(test, !lengthResult);
+    if (lengthResult.issue) {
+      CHECK(test,
+            lengthResult.issue->failureClass == FailureClass::ProtocolFatal);
+      CHECK(test, lengthResult.issue->code == IssueCode::InvalidCount);
+    }
+  }
+}
+
 
 std::vector<Message> everyOtherMessage() {
   return {
@@ -754,6 +929,7 @@ void testFuzzLikeInputsAndMutations() {
 int main() {
   try {
     testRequestWireAndRoundTrip();
+    testScoreRequestAndDoneLogits();
     testEveryMessageAndMultiplexedStream();
     testOneByteIncrementalParsing();
     testLargeIncrementalFrameHasNoGeometricCapacitySlack();

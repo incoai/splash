@@ -1030,6 +1030,45 @@ int main(int argc, char **argv) {
     beginCold(executor, reusedId, 0);
     executor.end(1);
 
+    // Direct score-only prefill: raw final-position logits, no sampling or
+    // decode. The greedy first generated token must be the max among options.
+    {
+      const uint32_t greedy = decoded.outputTokens.front();
+      const uint32_t otherA = greedy == 1 ? 2u : 1u;
+      const uint32_t otherB = greedy == 7 ? 8u : 7u;
+      EngineRequest scored = makeRequest(99, prompt128, 0);
+      scored.scoreTokens = {greedy, otherA, otherB};
+      scored.imagePixels = {0};
+      bool pixelsRejected = false;
+      try {
+        beginCold(executor, scored, 0);
+      } catch (const std::invalid_argument &) {
+        pixelsRejected = true;
+      }
+      require(pixelsRejected, "score request accepted image pixels without spans");
+      scored.imagePixels.clear();
+      beginCold(executor, scored, 0);
+      ModelStepResult scoredResult =
+          prefillChunk(executor, 99, 0, 0, 0, prompt128, pageTable);
+      require(scoredResult.finished && scoredResult.outputTokens.empty() &&
+                  scoredResult.scoreLogits.size() == 3,
+              "score prefill did not return ordered logits without tokens");
+      for (float logit : scoredResult.scoreLogits)
+        require(std::isfinite(logit), "score logit is not finite");
+      require(scoredResult.scoreLogits[0] >= scoredResult.scoreLogits[1] &&
+                  scoredResult.scoreLogits[0] >= scoredResult.scoreLogits[2],
+              "greedy decode token is not the maximum scored logit");
+      bool decodeRejected = false;
+      try {
+        decodeOne(executor, 99, 0, 128, pageTable, BatchCohort::Greedy);
+      } catch (const std::exception &) {
+        decodeRejected = true;
+      }
+      require(decodeRejected, "score request allowed a decode step");
+      executor.end(99);
+    }
+
+
     // Compare the active GDN state from one 16-row chunk and two M8 commits
     // within the numerical tolerance below. Their next-token decisions are
     // diagnostic because the command partitions round differently.

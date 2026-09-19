@@ -359,7 +359,7 @@ public:
         requestId, std::vector<uint32_t>(simulation.begin(), simulation.end()));
   }
   void completed(uint64_t id, EngineFinishReason, uint32_t prompt,
-                 uint32_t completion) override {
+                 uint32_t completion, std::span<const float>) override {
     ++completedCount;
     usage[id] = {prompt, completion};
   }

@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -211,6 +212,9 @@ struct Runtime::Impl {
     // every cache hit replays one input token and regenerates this value.
     std::vector<uint16_t> finalTargetHidden;
     std::array<float, kSamplingUniformCount> cycleUniforms{};
+    // Nonempty selects score-only mode: the final prefill chunk computes raw
+    // logits at these token ids instead of selecting an anchor.
+    std::vector<uint32_t> scoreTokens;
     std::vector<uint32_t> maskWords;
     // Set only while the current scheduler-owned ticket overlaps grammar-mask
     // computation with target verification. This is model runtime state, not a
@@ -1037,6 +1041,7 @@ struct Runtime::Impl {
       if (entry.replayingGeneration ||
           item.logicalPosition + item.tokenCount != entry.promptTokens)
         continue;
+      const bool scoring = !entry.scoreTokens.empty();
       auto d = [&](DecodeTensor tensor) {
         return decodeArena->get(sequence.lane, tensor);
       };
@@ -1047,7 +1052,13 @@ struct Runtime::Impl {
                      item.tokenCount, geometry.target.hiddenSize),
           d(DecodeTensor::Hidden0), item.tokenCount,
           geometry.target.hiddenSize);
-      if (entry.constraint == ConstraintMode::None) {
+      if (scoring) {
+        // Score-only: compute raw logits at the final prompt position; no
+        // policy selection, sampling, or anchor is produced.
+        targetModel.addHead(graph, d(DecodeTensor::Hidden0),
+                            d(DecodeTensor::FinalHidden),
+                            d(DecodeTensor::Logits), lastRows);
+      } else if (entry.constraint == ConstraintMode::None) {
         if (samplingEnabled(entry)) {
           entry.cycleUniforms.fill(0.0F);
           entry.cycleUniforms[0] = nextUniform(entry);
@@ -1837,6 +1848,28 @@ metal::AllocationResult Runtime::beginAt(const ModelRequest &request, uint32_t s
       (Impl::samplingEnabled(entry) && !entry.sampling.topK)) {
     throw std::invalid_argument("request sampling/cohort contract is invalid");
   }
+  if (!request.scoreTokens.empty()) {
+    if (request.maxNewTokens != 0 ||
+        request.constraint != ConstraintMode::None ||
+        request.cohort != BatchCohort::Greedy || !request.images.empty() ||
+        !request.imagePixels.empty() ||
+        request.scoreTokens.size() < ExecutionLimits::minimumScoreOptions ||
+        request.scoreTokens.size() > ExecutionLimits::maximumScoreOptions) {
+      throw std::invalid_argument("invalid score request");
+    }
+    std::vector<uint32_t> distinct(request.scoreTokens.begin(),
+                                   request.scoreTokens.end());
+    std::sort(distinct.begin(), distinct.end());
+    if (std::adjacent_find(distinct.begin(), distinct.end()) !=
+            distinct.end() ||
+        std::any_of(distinct.begin(), distinct.end(), [&](uint32_t token) {
+          return token >= impl_->geometry.target.vocabularySize;
+        })) {
+      throw std::invalid_argument("score token is out of vocabulary");
+    }
+    entry.scoreTokens.assign(request.scoreTokens.begin(),
+                             request.scoreTokens.end());
+  }
   entry.decodeStage = entry.cohort == BatchCohort::Constrained
                           ? DecodeStage::RequestInitialMask
                           : DecodeStage::Regular;
@@ -2016,7 +2049,32 @@ Runtime::prefillAsync(const BatchPlan &plan,
                              entry.decodeStage, 0, 0};
       if (entry.promptComplete && !entry.replayingGeneration) {
         entry.pendingToken.reset();
-        if (entry.constraint == ConstraintMode::None) {
+        if (!entry.scoreTokens.empty()) {
+          // Score-only: read the raw bf16 logits at the final prompt position
+          // (row lastRows-1 of the gathered head input) in requested order.
+          const uint32_t lastRows = std::min(item.tokenCount, kDecodeRows);
+          const uint16_t *logits = contents<uint16_t>(
+              impl->decodeArena->get(lane, DecodeTensor::Logits),
+              "score logits");
+          const uint16_t *row =
+              logits + uint64_t{lastRows - 1} *
+                           impl->geometry.target.vocabularySize;
+          result.scoreLogits.reserve(entry.scoreTokens.size());
+          for (uint32_t token : entry.scoreTokens) {
+            const float logit =
+                std::bit_cast<float>(uint32_t{row[token]} << 16);
+            if (!std::isfinite(logit)) {
+              // A numerical outcome for this request, not a broken invariant:
+              // report it as a lane failure so the engine drops this request
+              // before cache publication or output and the batch survives.
+              result.scoreLogits.clear();
+              result.failure = "score logit is not finite";
+              break;
+            }
+            result.scoreLogits.push_back(logit);
+          }
+          result.finished = true;
+        } else if (entry.constraint == ConstraintMode::None) {
           entry.pendingToken = *contents<uint32_t>(
               impl->decodeArena->get(lane, DecodeTensor::OutputTokens),
               "prefill next token");

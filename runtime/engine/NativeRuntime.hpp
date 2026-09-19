@@ -121,7 +121,8 @@ private:
   void maskRequested(uint64_t requestId,
                      std::span<const uint32_t> simulationTokens) override;
   void completed(uint64_t requestId, EngineFinishReason reason,
-                 uint32_t promptTokens, uint32_t completionTokens) override;
+                 uint32_t promptTokens, uint32_t completionTokens,
+                 std::span<const float> optionLogits) override;
   void failed(uint64_t requestId, std::string code, std::string message,
               bool retryable) override;
   void capacityExhausted(uint64_t requestId, uint32_t requiredKvPages,

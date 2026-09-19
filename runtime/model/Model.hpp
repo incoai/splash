@@ -47,6 +47,10 @@ struct ModelRequest final {
   uint32_t maxNewTokens = 0;
   SamplingParameters sampling;
   ConstraintMode constraint = ConstraintMode::None;
+  // Nonempty selects score-only mode: prefill runs to completion, no token is
+  // generated, and the raw final-position logits at these ids are returned in
+  // ModelStepResult::scoreLogits. maxNewTokens must be zero.
+  std::span<const uint32_t> scoreTokens{};
 };
 
 struct ImageSpan final {
@@ -199,6 +203,14 @@ struct ModelStepResult final {
   // last budgeted token is emitted as soon as it is selected instead of
   // spending one more verify cycle on it. They never enter a cached block.
   uint32_t outputTokensWithoutKv = 0;
+  // Raw final-prompt-position logits at the request's scoreTokens, in
+  // requested order. Empty for generation and for cancelled/failed scoring.
+  std::vector<float> scoreLogits{};
+  // Set when the model computed an unusable result for this lane alone, such
+  // as a non-finite score logit. The engine fails that one request before it
+  // publishes cache state or emits output, and the rest of the batch stands.
+  // Broken invariants and GPU faults stay exceptions and remain engine-fatal.
+  std::string failure{};
 
   bool operator==(const ModelStepResult &) const = default;
 };
@@ -257,6 +269,10 @@ struct ExecutionLimits final {
   // One step emits at most its retained verify rows plus a terminal anchor
   // (a stop token or the last budgeted token) that never receives a KV row.
   static constexpr uint32_t maximumStepTokens = targetVerifyRows + 1;
+  // Direct finite-option scoring (SemIf/Jev): a score-only request carries
+  // 2..255 distinct token ids and returns their raw final-position logits.
+  static constexpr uint32_t minimumScoreOptions = 2;
+  static constexpr uint32_t maximumScoreOptions = 255;
 };
 
 static_assert(ExecutionLimits::draftQueryRows ==

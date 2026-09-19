@@ -37,7 +37,9 @@ Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
 }
 
 void Engine::submit(EngineRequest value) {
-  if (!value.id || value.prompt.empty() || !value.maxNewTokens ||
+  const bool scoring = !value.scoreTokens.empty();
+  if (!value.id || value.prompt.empty() ||
+      (scoring ? value.maxNewTokens != 0 : !value.maxNewTokens) ||
       value.prompt.size() + value.maxNewTokens > config_.maxContext ||
       !std::isfinite(value.deadlineMilliseconds) ||
       value.deadlineMilliseconds <= 0.0) {
@@ -66,6 +68,26 @@ void Engine::submit(EngineRequest value) {
     throw std::invalid_argument("invalid backend request image pixels");
   }
   const uint64_t id = value.id;
+  if (scoring) {
+    if (value.cohort != BatchCohort::Greedy ||
+        value.constraint != ConstraintMode::None || !value.images.empty() ||
+        value.sampling.temperature != 0.0f || value.sampling.topP != 1.0f ||
+        value.sampling.topK != 0 ||
+        value.scoreTokens.size() < model::ExecutionLimits::minimumScoreOptions ||
+        value.scoreTokens.size() > model::ExecutionLimits::maximumScoreOptions) {
+      throw std::invalid_argument("invalid score request");
+    }
+    std::vector<uint32_t> distinct(value.scoreTokens.begin(),
+                                   value.scoreTokens.end());
+    std::sort(distinct.begin(), distinct.end());
+    if (std::adjacent_find(distinct.begin(), distinct.end()) !=
+            distinct.end() ||
+        std::any_of(distinct.begin(), distinct.end(), [&](uint32_t token) {
+          return token >= config_.vocabularySize;
+        })) {
+      throw std::invalid_argument("score token is out of vocabulary");
+    }
+  }
   Request requestState;
   requestState.promptTokens = static_cast<uint32_t>(value.prompt.size());
   requestState.replayTokens = requestState.promptTokens;
@@ -99,7 +121,7 @@ void Engine::cancel(uint64_t id) {
       }
     }
   }
-  finish(found->second, EngineFinishReason::Cancelled);
+  finish(found->second, EngineFinishReason::Cancelled, {});
 }
 
 void Engine::failRequest(uint64_t id, std::string code, std::string message) {
@@ -996,10 +1018,16 @@ void Engine::apply(const BatchPlan &plan,
       throw std::logic_error("model result order changed");
     }
     Request &active = request(result.requestId);
+    if (!result.failure.empty() && !active.failure) {
+      // The model rejected this lane's own numerical result. An earlier
+      // cancellation or deadline failure of the same lane still stands.
+      active.failure = Failure{"model_result_invalid", result.failure};
+    }
     if (active.failure) {
       // An in-flight Metal command cannot be revoked safely. Its provisional
-      // writes remain invisible, but a cancelled/deadline-expired request
-      // must not publish cache state or emit output when that command drains.
+      // writes remain invisible, but a cancelled, deadline-expired or
+      // model-rejected request must not publish cache state or emit output
+      // when that command drains.
       schedulerResults.push_back({active.request.id,
                                   result.consumedPromptTokens, true,
                                   result.nextDecodeStage});
@@ -1050,8 +1078,27 @@ void Engine::apply(const BatchPlan &plan,
     }
     const uint64_t completionTokens =
         active.exactTokens.size() - active.promptTokens;
+    const bool scoring = !active.request.scoreTokens.empty();
+    if (scoring && !result.outputTokens.empty()) {
+      throw std::logic_error("score request produced output tokens");
+    }
+    if (!result.scoreLogits.empty()) {
+      if (!scoring ||
+          result.scoreLogits.size() != active.request.scoreTokens.size()) {
+        throw std::logic_error("model returned mismatched score logits");
+      }
+      active.scoreLogits = result.scoreLogits;
+    }
+    // Score requests carry maxNewTokens == 0; only the model's finished flag
+    // on the final prompt chunk completes them.
     const bool complete =
-        result.finished || completionTokens >= active.request.maxNewTokens;
+        result.finished ||
+        (!scoring && completionTokens >= active.request.maxNewTokens);
+    if (scoring && complete &&
+        item.promptOffset + result.consumedPromptTokens !=
+            active.promptTokens) {
+      throw std::logic_error("score request finished before the prompt ended");
+    }
     if (result.outputTokensWithoutKv && !complete) {
       throw std::logic_error("model emitted an uncommitted token and continued");
     }
@@ -1073,18 +1120,20 @@ void Engine::apply(const BatchPlan &plan,
       Failure failure = std::move(*active.failure);
       active.failure.reset();
       if (failure.code == "cancelled") {
-        finish(active, EngineFinishReason::Cancelled);
+        finish(active, EngineFinishReason::Cancelled, {});
       } else {
         finishFailure(active, std::move(failure));
       }
     } else if (schedulerResults[index].finished) {
       finish(active, result.finished ? EngineFinishReason::Stop
-                                     : EngineFinishReason::Length);
+                                     : EngineFinishReason::Length,
+             active.scoreLogits);
     }
   }
 }
 
-void Engine::finish(Request &active, EngineFinishReason reason) {
+void Engine::finish(Request &active, EngineFinishReason reason,
+                    std::span<const float> optionLogits) {
   if (active.finalized)
     return;
   if (reason == EngineFinishReason::Cancelled) {
@@ -1097,7 +1146,7 @@ void Engine::finish(Request &active, EngineFinishReason reason) {
                                   active.promptTokens)
           : 0;
   events_.completed(active.request.id, reason, active.promptTokens,
-                    completionTokens);
+                    completionTokens, optionLogits);
   if (reason == EngineFinishReason::Cancelled) {
     ++counters_.cancelled;
   } else {

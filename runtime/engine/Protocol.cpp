@@ -20,8 +20,7 @@ std::string_view frameTypeName(FrameType type);
 std::string_view failureClassName(FailureClass failureClass);
 
 constexpr std::array<uint8_t, 4> kMagic{'S', 'P', 'L', 'H'};
-
-constexpr uint64_t kRequestFixedBytes = 60;
+constexpr uint64_t kRequestFixedBytes = 64;
 constexpr uint64_t kImageSpanBytes = 32;
 constexpr uint64_t kCancelFixedBytes = 8;
 constexpr uint64_t kMaskResponseFixedBytes = 20;
@@ -31,7 +30,7 @@ constexpr uint64_t kStartFixedBytes = 21;
 constexpr uint64_t kPromptProgressFixedBytes = 20;
 constexpr uint64_t kTokensFixedBytes = 16;
 constexpr uint64_t kMaskRequestFixedBytes = 24;
-constexpr uint64_t kDoneFixedBytes = 41;
+constexpr uint64_t kDoneFixedBytes = 45;
 constexpr uint64_t kErrorFixedBytes = 18;
 constexpr uint64_t kCapacityExhaustedFixedBytes = 24;
 constexpr uint64_t kStatusJsonFixedBytes = 12;
@@ -58,7 +57,7 @@ std::optional<ProtocolIssue> validateLimits(const ProtocolLimits &limits) {
   if (limits.maxFramePayloadBytes < kRequestFixedBytes ||
       limits.maxFramePayloadBytes > kAbsoluteMaxFramePayloadBytes) {
     return makeIssue(FailureClass::ProtocolFatal, IssueCode::LimitExceeded, 0,
-                     "maxFramePayloadBytes must be in [60, 256 MiB]");
+                     "maxFramePayloadBytes must be in [64, 256 MiB]");
   }
   if (limits.maxStatusJsonBytes >
       limits.maxFramePayloadBytes - kStatusJsonFixedBytes) {
@@ -125,7 +124,11 @@ std::optional<PayloadBounds> payloadBounds(FrameType type,
     }
     return bounded(kMaskRequestFixedBytes, maximum);
   case FrameType::Done:
-    return bounded(kDoneFixedBytes, kDoneFixedBytes);
+    if (!checkedMultiply(kMaximumScoreOptions, sizeof(float), variable) ||
+        !checkedAdd(kDoneFixedBytes, variable, maximum)) {
+      return std::nullopt;
+    }
+    return bounded(kDoneFixedBytes, maximum);
   case FrameType::Error:
     if (!checkedMultiply(limits.maxErrorStringBytes, 2, variable) ||
         !checkedAdd(kErrorFixedBytes, variable, maximum)) {
@@ -368,8 +371,14 @@ std::optional<ProtocolIssue> validateRequest(const RequestFrame &request,
     return invalid(IssueCode::InvalidDeadline,
                    "absolute and remaining deadlines must be non-zero");
   }
-  if (!request.logicalMaxOutputTokens ||
-      request.logicalMaxOutputTokens > limits.maxLogicalOutputTokens) {
+  const bool scoring = !request.scoreTokens.empty();
+  if (scoring) {
+    if (request.logicalMaxOutputTokens != 0) {
+      return invalid(IssueCode::InvalidCount,
+                     "score requests must not produce output tokens");
+    }
+  } else if (!request.logicalMaxOutputTokens ||
+             request.logicalMaxOutputTokens > limits.maxLogicalOutputTokens) {
     return invalid(IssueCode::LimitExceeded,
                    "logical max output token count exceeds its limit");
   }
@@ -409,6 +418,25 @@ std::optional<ProtocolIssue> validateRequest(const RequestFrame &request,
     return invalid(IssueCode::InvalidCount,
                    "image pixels do not match the image grids");
   }
+  if (scoring) {
+    if (!request.imageSpans.empty()) {
+      return invalid(IssueCode::InvalidCount,
+                     "score requests are text-only");
+    }
+    if (request.scoreTokens.size() < kMinimumScoreOptions ||
+        request.scoreTokens.size() > kMaximumScoreOptions) {
+      return invalid(IssueCode::InvalidCount,
+                     "score option count must be in [2, 255]");
+    }
+    std::vector<uint32_t> distinct(request.scoreTokens.begin(),
+                                   request.scoreTokens.end());
+    std::sort(distinct.begin(), distinct.end());
+    if (std::adjacent_find(distinct.begin(), distinct.end()) !=
+        distinct.end()) {
+      return invalid(IssueCode::InvalidCount,
+                     "score option token ids must be distinct");
+    }
+  }
   const SamplingParameters &sampling = request.sampling;
   if (!std::isfinite(sampling.temperature) || sampling.temperature < 0.0f ||
       !std::isfinite(sampling.topP) || sampling.topP <= 0.0f ||
@@ -426,6 +454,17 @@ std::optional<ProtocolIssue> validateRequest(const RequestFrame &request,
   if (request.cohort != expected) {
     return invalid(IssueCode::InvalidCohortConstraint,
                    "cohort does not match sampling and constraint semantics");
+  }
+  if (scoring) {
+    if (request.constraint != ConstraintMode::None) {
+      return invalid(IssueCode::InvalidCohortConstraint,
+                     "score requests cannot carry a constraint");
+    }
+    if (sampling.temperature != 0.0f || sampling.topP != 1.0f ||
+        sampling.topK != 0) {
+      return invalid(IssueCode::InvalidSampling,
+                     "score requests require greedy default sampling");
+    }
   }
   return std::nullopt;
 }
@@ -542,6 +581,25 @@ std::optional<ProtocolIssue> validateDone(const DoneEvent &event,
     return makeIssue(failureClass, IssueCode::InvalidEnumValue, event.requestId,
                      "done finish reason is invalid");
   }
+  if (!event.optionLogits.empty()) {
+    if (event.optionLogits.size() < kMinimumScoreOptions ||
+        event.optionLogits.size() > kMaximumScoreOptions) {
+      return makeIssue(failureClass, IssueCode::InvalidCount, event.requestId,
+                       "done option logit count must be in [2, 255]");
+    }
+    if (event.reason != FinishReason::Stop || event.completionTokens != 0 ||
+        event.decodeMicros != 0) {
+      return makeIssue(failureClass, IssueCode::InvalidCount, event.requestId,
+                       "scored done events must stop and carry no completion "
+                       "or decode activity");
+    }
+    for (float logit : event.optionLogits) {
+      if (!std::isfinite(logit)) {
+        return makeIssue(failureClass, IssueCode::InvalidCount, event.requestId,
+                         "done option logits must be finite");
+      }
+    }
+  }
   return std::nullopt;
 }
 
@@ -606,12 +664,16 @@ ProtocolResult<Frame> encodeRequest(const RequestFrame &request,
   uint64_t payloadBytes = 0;
   uint64_t tokenBytes = 0;
   uint64_t spanBytes = 0;
+  uint64_t scoreBytes = 0;
   if (!checkedMultiply(request.promptTokens.size(), sizeof(uint32_t),
                        tokenBytes) ||
       !checkedMultiply(request.imageSpans.size(), kImageSpanBytes, spanBytes) ||
+      !checkedMultiply(request.scoreTokens.size(), sizeof(uint32_t),
+                       scoreBytes) ||
       !checkedAdd(kRequestFixedBytes, tokenBytes, payloadBytes) ||
       !checkedAdd(payloadBytes, spanBytes, payloadBytes) ||
       !checkedAdd(payloadBytes, request.imagePixels.size(), payloadBytes) ||
+      !checkedAdd(payloadBytes, scoreBytes, payloadBytes) ||
       payloadBytes > std::numeric_limits<size_t>::max()) {
     return failure<Frame>(
         makeIssue(FailureClass::RequestError, IssueCode::IntegerOverflow,
@@ -632,6 +694,7 @@ ProtocolResult<Frame> encodeRequest(const RequestFrame &request,
   writer.u32(request.sampling.topK);
   writer.u64(request.seed);
   writer.u8(request.returnProgress);
+  writer.u32(static_cast<uint32_t>(request.scoreTokens.size()));
   for (uint32_t token : request.promptTokens)
     writer.u32(token);
   for (const ImageSpanFrame &span : request.imageSpans) {
@@ -643,6 +706,8 @@ ProtocolResult<Frame> encodeRequest(const RequestFrame &request,
     writer.u64(span.digestHi);
   }
   writer.raw(request.imagePixels);
+  for (uint32_t token : request.scoreTokens)
+    writer.u32(token);
   return success(Frame{FrameType::Request, writer.take()});
 }
 
@@ -759,7 +824,8 @@ ProtocolResult<Frame> encodeDone(const DoneEvent &event) {
   if (auto issue = validateDone(event, FailureClass::EngineUnhealthy)) {
     return failure<Frame>(std::move(*issue));
   }
-  Writer writer(kDoneFixedBytes);
+  Writer writer(kDoneFixedBytes +
+                event.optionLogits.size() * sizeof(float));
   writer.u64(event.requestId);
   writer.u8(static_cast<uint8_t>(event.reason));
   writer.u32(event.promptTokens);
@@ -767,6 +833,9 @@ ProtocolResult<Frame> encodeDone(const DoneEvent &event) {
   writer.u64(event.prefillMicros);
   writer.u64(event.decodeMicros);
   writer.u64(event.wallMicros);
+  writer.u32(static_cast<uint32_t>(event.optionLogits.size()));
+  for (float logit : event.optionLogits)
+    writer.f32(logit);
   return success(Frame{FrameType::Done, writer.take()});
 }
 
@@ -824,6 +893,7 @@ ProtocolResult<Message> decodeRequest(const Frame &frame,
   uint8_t returnProgress = 0;
   uint32_t promptCount = 0;
   uint32_t imageSpanCount = 0;
+  uint32_t scoreCount = 0;
   if (!reader.u64(request.requestId) || !reader.u8(priority) ||
       !reader.u8(cohort) || !reader.u8(constraint) ||
       !reader.u64(request.absoluteDeadlineUnixMicros) ||
@@ -833,7 +903,7 @@ ProtocolResult<Message> decodeRequest(const Frame &frame,
       !reader.f32(request.sampling.temperature) ||
       !reader.f32(request.sampling.topP) ||
       !reader.u32(request.sampling.topK) || !reader.u64(request.seed) ||
-      !reader.u8(returnProgress)) {
+      !reader.u8(returnProgress) || !reader.u32(scoreCount)) {
     return failure<Message>(makeIssue(FailureClass::ProtocolFatal,
                                       IssueCode::InvalidPayloadLength, 0,
                                       "request fixed payload is truncated"));
@@ -847,6 +917,11 @@ ProtocolResult<Message> decodeRequest(const Frame &frame,
   request.priority = static_cast<RequestPriority>(priority);
   request.cohort = static_cast<Cohort>(cohort);
   request.constraint = static_cast<ConstraintMode>(constraint);
+  if (scoreCount > kMaximumScoreOptions) {
+    return failure<Message>(
+        makeIssue(FailureClass::RequestError, IssueCode::InvalidCount,
+                  request.requestId, "score option count exceeds its limit"));
+  }
   if (promptCount > limits.maxPromptTokens) {
     return failure<Message>(
         makeIssue(FailureClass::RequestError, IssueCode::LimitExceeded,
@@ -875,12 +950,15 @@ ProtocolResult<Message> decodeRequest(const Frame &frame,
                     request.requestId, "image span payload is malformed"));
     }
   }
-  if (reader.remaining() != pixelBytes ||
-      !reader.bytes(pixelBytes, request.imagePixels)) {
+  uint64_t scoreBytes = 0;
+  if (!checkedMultiply(scoreCount, sizeof(uint32_t), scoreBytes) ||
+      reader.remaining() != pixelBytes + scoreBytes ||
+      !reader.bytes(pixelBytes, request.imagePixels) ||
+      !reader.words(scoreCount, request.scoreTokens)) {
     return failure<Message>(
         makeIssue(FailureClass::RequestError, IssueCode::InvalidPayloadLength,
                   request.requestId,
-                  "image pixel payload does not match the image grids"));
+                  "image pixel or score payload does not match its counts"));
   }
   if (auto issue = validateRequest(request, limits)) {
     return failure<Message>(std::move(*issue));
@@ -1063,19 +1141,42 @@ ProtocolResult<Message> decodeDone(const Frame &frame) {
   Reader reader(frame.payload);
   DoneEvent event;
   uint8_t reason = 0;
+  uint32_t logitCount = 0;
   if (!reader.u64(event.requestId) || !reader.u8(reason) ||
       !reader.u32(event.promptTokens) || !reader.u32(event.completionTokens) ||
       !reader.u64(event.prefillMicros) || !reader.u64(event.decodeMicros) ||
-      !reader.u64(event.wallMicros) || reader.remaining()) {
+      !reader.u64(event.wallMicros) || !reader.u32(logitCount)) {
     return failure<Message>(makeIssue(FailureClass::ProtocolFatal,
                                       IssueCode::InvalidPayloadLength, 0,
                                       "done payload has an invalid length"));
+  }
+  if (logitCount > kMaximumScoreOptions) {
+    return failure<Message>(
+        makeIssue(FailureClass::ProtocolFatal, IssueCode::LimitExceeded,
+                  event.requestId,
+                  "done option logit count exceeds its limit"));
+  }
+  uint64_t logitBytes = 0;
+  if (!checkedMultiply(logitCount, sizeof(float), logitBytes) ||
+      reader.remaining() != logitBytes) {
+    return failure<Message>(makeIssue(FailureClass::ProtocolFatal,
+                                      IssueCode::InvalidPayloadLength, 0,
+                                      "done option logits do not match the "
+                                      "payload length"));
+  }
+  event.optionLogits.resize(logitCount);
+  for (float &logit : event.optionLogits) {
+    if (!reader.f32(logit)) {
+      return failure<Message>(makeIssue(FailureClass::ProtocolFatal,
+                                        IssueCode::InvalidPayloadLength, 0,
+                                        "done option logits are truncated"));
+    }
   }
   event.reason = static_cast<FinishReason>(reason);
   if (auto issue = validateDone(event, FailureClass::ProtocolFatal)) {
     return failure<Message>(std::move(*issue));
   }
-  return success(Message{event});
+  return success(Message{std::move(event)});
 }
 
 ProtocolResult<Message> decodeError(const Frame &frame,
