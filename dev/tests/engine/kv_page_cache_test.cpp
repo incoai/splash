@@ -323,6 +323,159 @@ void testHashCollisionStillRequiresExactTokens() {
           "KV block matching trusted a colliding index hash");
 }
 
+struct FakeSlot final : model::KvDiskSlot {};
+
+// A resident block gains a disk copy, gives up its page, and takes a page
+// back; the orders and the parent follow each step.
+void testDiskTierTransitions() {
+  test::TestKvBacking backing(8, 100);
+  KvPool pool(backing);
+  CacheRecency recency;
+  KvCache cache(pool, cacheNamespace(), recency);
+  auto acquired = pool.acquirePages(4, false);
+  require(acquired.granted(), "test pages were not acquired");
+  const auto rootTokens = page(21);
+  const auto leafTokens = page(22);
+  auto root = cache.insert(0, rootTokens, acquired.pages[0]);
+  auto leaf = cache.insert(root.id, leafTokens, acquired.pages[1]);
+  pool.releasePage(acquired.pages[0], false);
+  pool.releasePage(acquired.pages[1], false);
+  require(cache.evictionCandidate().value().id == leaf.id &&
+              !cache.diskCandidate(true) && !cache.diskCandidate(false),
+          "fresh blocks hold disk copies");
+  requireThrows<std::logic_error>([&] { cache.dropPage(leaf.id); },
+                                  "a block without a disk copy dropped its page");
+
+  // A copy of a resident block is redundant; the block stays a RAM leaf.
+  cache.setSlot(leaf.id, std::make_shared<FakeSlot>());
+  require(cache.diskCandidate(true).value().id == leaf.id &&
+              !cache.diskCandidate(false) &&
+              cache.evictionCandidate().value().id == leaf.id &&
+              cache.snapshot().blocks == 2 && cache.snapshot().diskBlocks == 1,
+          "a resident block with a disk copy is not a duplicate");
+  cache.setSlot(leaf.id, nullptr);
+  require(!cache.diskCandidate(true) && cache.snapshot().diskBlocks == 0,
+          "a resident block could not drop its copy");
+  cache.setSlot(leaf.id, std::make_shared<FakeSlot>());
+
+  // Dropping the page leaves a disk-only leaf. The parent is the RAM leaf
+  // now, no newer than the child was.
+  cache.touch(leaf.id);
+  const uint64_t leafUsed = cache.evictionCandidate().value().lastUsed;
+  cache.dropPage(leaf.id);
+  require(pool.pageFree(acquired.pages[1]) && cache.snapshot().blocks == 1 &&
+              cache.snapshot().diskBlocks == 1 && cache.page(leaf.id) == KvCache::noPage,
+          "dropped page did not return to the pool");
+  require(cache.evictionCandidate().value().id == root.id &&
+              cache.evictionCandidate().value().lastUsed == leafUsed &&
+              !cache.evictionCandidate(root.id) && cache.hasDiskChildren(root.id),
+          "parent did not become the RAM leaf with the child's recency");
+  require(cache.diskCandidate(false).value().id == leaf.id && !cache.diskCandidate(true),
+          "disk-only leaf is not replaceable");
+  auto found = cache.find(root.id, leafTokens);
+  require(found && found->id == leaf.id && found->physicalPage == KvCache::noPage &&
+              cache.chain(leaf.id).pages ==
+                  std::vector<uint32_t>{acquired.pages[0], KvCache::noPage},
+          "disk-only block did not match through the chain");
+  requireThrows<std::logic_error>([&] { cache.setSlot(leaf.id, nullptr); },
+                                  "a disk-only block was stripped instead of erased");
+  requireThrows<std::logic_error>([&] { cache.erase(root.id); },
+                                  "a parent with a disk child was erased");
+
+  // A user protects a disk copy; a transfer hides the block from every order.
+  cache.retainActive(leaf.id);
+  require(!cache.diskCandidate(false), "a used disk block stayed replaceable");
+  cache.releaseActive(leaf.id);
+  require(cache.diskCandidate(false).value().id == leaf.id, "released disk block left the order");
+  cache.setTransferring(leaf.id, true);
+  require(!cache.diskCandidate(false) && cache.transferring(leaf.id),
+          "a block in transfer stayed replaceable");
+  requireThrows<std::logic_error>([&] { cache.erase(leaf.id); },
+                                  "a block in transfer was erased");
+
+  // Adopting a page makes the block resident again while its content is on
+  // the way; a writer that recomputes it meanwhile keeps its own page.
+  cache.adoptPage(leaf.id, acquired.pages[2]);
+  pool.releasePage(acquired.pages[2], false);
+  require(cache.page(leaf.id) == acquired.pages[2] && !cache.evictionCandidate() &&
+              cache.snapshot().blocks == 2 && !pool.pageFree(acquired.pages[2]),
+          "adopted page was not retained by the block");
+  auto writer = cache.insert(root.id, leafTokens, acquired.pages[3]);
+  require(!writer.inserted && writer.id == leaf.id && writer.physicalPage == acquired.pages[3],
+          "a writer was switched to a page still being filled");
+  pool.releasePage(acquired.pages[3], false);
+  cache.setTransferring(leaf.id, false);
+  require(cache.evictionCandidate().value().id == leaf.id &&
+              cache.diskCandidate(true).value().id == leaf.id,
+          "restored block did not rejoin the orders");
+  requireThrows<std::logic_error>([&] { cache.adoptPage(leaf.id, acquired.pages[3]); },
+                                  "a resident block adopted a second page");
+
+  cache.erase(leaf.id);
+  cache.erase(root.id);
+  require(cache.snapshot().blocks == 0 && cache.snapshot().diskBlocks == 0 &&
+              pool.freePageCount() == pool.pageCount(),
+          "erasing both tiers leaked a page or a copy");
+}
+
+// Publishing the content of a disk-only block gives it the writer's page. A
+// poisoned block matches nothing, leaves with its last user, and takes a
+// poisoned parent with it once the subtree is gone.
+void testDiskOnlyAdoptionAndPoison() {
+  test::TestKvBacking backing(8, 100);
+  KvPool pool(backing);
+  CacheRecency recency;
+  KvCache cache(pool, cacheNamespace(), recency);
+  auto acquired = pool.acquirePages(4, false);
+  require(acquired.granted(), "test pages were not acquired");
+  const auto rootTokens = page(31);
+  const auto leafTokens = page(32);
+  auto root = cache.insert(0, rootTokens, acquired.pages[0]);
+  auto leaf = cache.insert(root.id, leafTokens, acquired.pages[1]);
+  pool.releasePage(acquired.pages[0], false);
+  pool.releasePage(acquired.pages[1], false);
+  cache.setSlot(leaf.id, std::make_shared<FakeSlot>());
+  cache.dropPage(leaf.id);
+
+  auto adopted = cache.insert(root.id, leafTokens, acquired.pages[2]);
+  require(!adopted.inserted && adopted.id == leaf.id &&
+              adopted.physicalPage == acquired.pages[2] &&
+              cache.page(leaf.id) == acquired.pages[2] &&
+              cache.diskCandidate(true).value().id == leaf.id,
+          "a disk-only block did not adopt the writer's page");
+  pool.releasePage(acquired.pages[2], false);
+  require(!pool.pageFree(acquired.pages[2]), "adopted page was not retained");
+
+  // A restore that fails: the block is unmatchable at once, keeps nothing
+  // on disk, and a fresh publication of the same content stands beside it.
+  cache.dropPage(leaf.id);
+  cache.adoptPage(leaf.id, acquired.pages[2]);
+  cache.retainActive(leaf.id);
+  cache.setTransferring(leaf.id, true);
+  cache.setTransferring(leaf.id, false);
+  cache.poison(leaf.id);
+  require(!cache.find(root.id, leafTokens) && cache.contains(leaf.id) &&
+              cache.snapshot().diskBlocks == 0 && !cache.evictionCandidate() &&
+              !cache.diskCandidate(true) && !cache.diskCandidate(false),
+          "poisoned block still matched or waited in an order");
+  auto fresh = cache.insert(root.id, leafTokens, acquired.pages[3]);
+  pool.releasePage(acquired.pages[3], false);
+  require(fresh.inserted && fresh.id != leaf.id &&
+              cache.find(root.id, leafTokens).value().id == fresh.id,
+          "poisoned block blocked republication of its content");
+  cache.releaseActive(leaf.id);
+  require(!cache.contains(leaf.id) && pool.pageFree(acquired.pages[2]) &&
+              cache.snapshot().blocks == 2,
+          "poisoned block outlived its last user");
+
+  cache.poison(root.id);
+  require(cache.contains(root.id) && !cache.find(0, rootTokens),
+          "a poisoned parent left before its child");
+  cache.erase(fresh.id);
+  require(cache.snapshot().blocks == 0 && pool.freePageCount() == pool.pageCount(),
+          "a poisoned parent outlived its subtree");
+}
+
 } // namespace
 
 int main() {
@@ -333,6 +486,8 @@ int main() {
     testInputValidation();
     testCandidateOrderThroughChurn();
     testHashCollisionStillRequiresExactTokens();
+    testDiskTierTransitions();
+    testDiskOnlyAdoptionAndPoison();
     std::cout << "KV page cache tests passed\n";
     return 0;
   } catch (const std::exception &error) {

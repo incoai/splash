@@ -203,6 +203,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/Embedding.cpp \
 	runtime/ops/ExecutionPlans.cpp \
 	runtime/ops/GDN.cpp \
+	runtime/ops/KvCopy.cpp \
 	runtime/ops/Linear.cpp \
 	runtime/ops/MoE.cpp \
 	runtime/ops/Normalization.cpp \
@@ -231,6 +232,8 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/QwenTarget.cpp \
 	runtime/model/DFlashDraft.cpp \
 	runtime/model/ModelFactory.cpp \
+	runtime/model/SlotFile.cpp \
+	runtime/model/KvPageTier.cpp \
 	runtime/model/QwenState.cpp
 ENGINE_MM_SOURCES := \
 	runtime/model/ModelDescriptor.mm \

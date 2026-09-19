@@ -2509,6 +2509,14 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(Path(args.tokenizer), package / "tokenizer")
         self.assertIsNone(args.max_context)
         self.assertIsNone(args.max_memory)
+        self.assertEqual(args.max_cache_disk, 0)
+        disk_args = api.parse_args([*required, "--max-cache-disk", "5G"])
+        self.assertEqual(disk_args.max_cache_disk, 5 * 1024**3)
+        self.assertEqual(api._native_command(disk_args)[-1], str(5 * 1024**3))
+        self.assertEqual(
+            api.parse_args([*required, "--max-state-disk", "5G"]).max_cache_disk,
+            5 * 1024**3,
+        )
         self.assertEqual(
             api.parse_args([*required, "--max-context", "262144"]).max_context, 262144
         )
@@ -2601,6 +2609,7 @@ class ServerTest(unittest.TestCase):
             model="test-model",
             max_context=None,
             max_memory=None,
+            max_cache_disk=0,
             max_image_pixels=api.image_input.MAX_PIXELS,
             max_new_tokens=16,
             request_timeout=2,
@@ -2701,6 +2710,7 @@ class ServerTest(unittest.TestCase):
             model="test-model",
             max_context=128,
             max_memory=32 * 1024**3,
+            max_cache_disk=0,
             max_new_tokens=16,
             request_timeout=2,
             queue_size=1,
@@ -2746,6 +2756,7 @@ class ServerTest(unittest.TestCase):
             model="test-model",
             max_context=None,
             max_memory=None,
+            max_cache_disk=0,
             max_image_pixels=api.image_input.MAX_PIXELS,
             max_new_tokens=16,
             request_timeout=2,

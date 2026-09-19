@@ -5,6 +5,7 @@
 #include "engine/Cache.hpp"
 #include "engine/MemoryGovernor.hpp"
 #include "ops/Q8PageStorage.hpp"
+#include "model/KvPageTier.hpp"
 #include "model/ModelFactory.hpp"
 #include "engine/MemoryAudit.hpp"
 #include "ops/ExecutionPlans.hpp"
@@ -72,6 +73,8 @@ struct RuntimeResourcesConfig {
   model::ModelDescriptor model;
   std::string buildId;
   uint64_t maximumMemoryBytes = 0;
+  // Disk quota shared by cached KV pages and states; zero disables the tier.
+  uint64_t maximumCacheDiskBytes = 0;
   // Patches per image the vision scratch covers; the protocol limit and the
   // engine's request validation use the same value.
   uint32_t maximumImagePatches = ops::kMaximumImagePatches;
@@ -187,6 +190,7 @@ private:
                    std::unique_ptr<MemoryGovernor> memoryGovernor,
                    std::unique_ptr<kv::Q8PageStorage> kvPages,
                    std::unique_ptr<model::StateStorage> stateStorage,
+                   std::unique_ptr<model::KvPageTier> kvTier,
                    std::unique_ptr<KvPool> kvPool,
                    std::unique_ptr<engine::Cache> cache,
                    uint32_t maximumImagePatches);
@@ -200,6 +204,7 @@ private:
   std::unique_ptr<MemoryGovernor> memoryGovernor_;
   std::unique_ptr<kv::Q8PageStorage> kvPages_;
   std::unique_ptr<model::StateStorage> stateStorage_;
+  std::unique_ptr<model::KvPageTier> kvTier_;
   std::unique_ptr<KvPool> kvPool_;
   std::unique_ptr<engine::Cache> cache_;
   uint32_t maximumImagePatches_ = 0;

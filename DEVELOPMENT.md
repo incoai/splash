@@ -104,10 +104,49 @@ Origin must match Host. `--allowed-host` permits additional hostnames. Request
 logs omit bodies; full crash traces require explicit `SPLASH_CRASH_TRACE=1` and
 can contain private conversation data.
 
-Long prefill uses disposable rolling checkpoints every 4096 tokens. Contended
+Long prefill uses disposable rolling checkpoints every 4096 tokens, none within
+the last 4096 before the prompt's own state. Contended
 prefill adapts toward a 500 ms slice, keeping 2048-token chunks for long unopposed
 work. These policies do not extend client deadlines. Memory recovery waits are
 bounded, but readiness does not guarantee that a request-sized allocation fits.
+
+Cached request state (GDN cell plus draft ring: 109 MiB for the 35B model,
+187 MiB for the 27B model) and cached KV pages (344 KiB for the 35B model,
+1040 KiB for the 27B model) live in RAM; `--max-cache-disk` adds an unlinked
+temporary file per kind, both drawing on one byte quota, as a second tier. A
+block or state holds a RAM copy, a disk copy, or both. Reclaim is one operation
+per victim in a shared least-recently-used order: an ordinary state is copied
+into the file's staging buffer and its RAM returns at once while the write runs
+in the background; a KV leaf that a state or a disk child depends on is copied
+out by a kernel riding the next Metal command and written from staging, and
+its page returns when the copy has landed, which the allocator reports as
+`Pending` so a lane short of pages waits instead of the cache evicting more,
+as it does while the one state write in flight holds the staging buffer the
+next state eviction needs; a leaf nothing depends on is dropped, never
+written; a copy that already exists
+on disk makes the reclaim free. A rolling checkpoint is written like any other
+state when RAM has no room for it, into free quota only, and leaves both tiers
+when the next one lands, so a preempted long prefill comes back from disk. A
+state whose boundary finds no free cache slot, and no cached state to recycle,
+is written straight from the lane's cells, so a long session keeps its prefix
+when RAM holds only the lanes instead of losing the turn's KV as a tail. A
+matched prefix comes back through disk restores the request waits for, with
+the state read alongside; restored blocks and states keep their disk copies,
+so a returning prefix costs one read per page and no second write. A full quota
+replaces the oldest redundant copy first, then the oldest copy that is the only
+one, across KV and states alike. A failed write leaves the block or state in
+RAM and stops further writes for the process; a failed read poisons the block,
+and the next lookup matches the prefix that remains. Transfers are plain
+`pread`/`pwrite` with `F_NOCACHE`: about 14 ms per direction for the 35B state
+and 22 ms for the 27B state on an M5 Pro; KV copies ride model commands, or a
+copy-only command when the model is idle. Staging is 128 KV pages plus one
+state of host memory outside the Metal budget while the tier is on; demotions
+may hold half of those pages and restores three quarters, so neither kind
+starves the other. `/status` reports the quota and the KV tier under `disk`,
+the state tier under `state` (`disk_bytes`, `offloads`, `disk_hits`,
+`disk_promotions`) and, under `cache`,
+tokens restored from disk KV (`kv_disk_hit_tokens`) and lookups that matched
+KV where a reusable state used to be (`lost_state_misses`).
 
 ## Validate
 

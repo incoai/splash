@@ -71,6 +71,7 @@ void testCleanRuntimeStatus() {
   engine.resourceReplayTokens = 1234;
   engine.deduplicatedStatePublications = 2;
   engine.recycledStatePublications = 1;
+  engine.diskStatePublications = 4;
   engine.scheduler.prefillBatches = 4;
   engine.scheduler.prefillRows = 4096;
   engine.scheduler.decodeBatches = 4;
@@ -83,7 +84,7 @@ void testCleanRuntimeStatus() {
   engine.resources.stateCache.checkpointBytes = 64;
   engine.resources.stateCache.checkpointEvictions = 4;
   engine.resources.stateCache.checkpointRetirements = 3;
-  engine.resources.lookup = {3, 128, 64, 1};
+  engine.resources.lookup = {.lookups = 3, .kvHitTokens = 128, .stateHitTokens = 64, .lazyJunctions = 1};
   engine.resources.activeRequests = 1;
 
   WarmupReport warmup;
@@ -225,7 +226,8 @@ void testCleanRuntimeStatus() {
       json.find("\"dynamic_budget_bytes\"") != std::string::npos &&
           json.find("\"resource_replay_tokens\":1234") != std::string::npos &&
           json.find("\"deduplicated_state_publications\":2,"
-                    "\"recycled_state_publications\":1,") !=
+                    "\"recycled_state_publications\":1,"
+                    "\"disk_state_publications\":4,") !=
               std::string::npos &&
           json.find("\"lazy_junctions\":1") != std::string::npos &&
           json.find("\"checkpoint_publications\":3,"

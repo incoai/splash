@@ -79,6 +79,7 @@ depends on available memory.
 
 - `--max-memory`: ceiling on Metal allocations, e.g. `28G`. Default: auto.
 - `--max-context`: context limit, up to `256K`, e.g. `100K`. Default: auto.
+- `--max-cache-disk`: SSD tier for the cache, e.g. `5G`. Default: 0 (off).
 - `--max-image-pixels`: maximum resized pixels per image. Default: 4,194,304.
 - `--allowed-host`: extra HTTP `Host` name to accept, for a proxy. Repeatable.
 - `--api-key`: require this key on API requests, as a bearer token or
@@ -87,6 +88,15 @@ depends on available memory.
 
 If the model does not fit in the memory available, startup prints a memory
 budget breakdown and stops.
+
+`--max-cache-disk` adds an SSD tier to the cache. Cached KV pages and request
+states are written only when memory pressure would evict them, so nothing is
+written while the cache fits in memory, and a prefix that comes back from disk
+keeps its copy there. It pays off when prefixes come back, as they do across
+the turns of an agent session. Transfers stage through host memory outside
+`--max-memory` (151 MiB for the 35B model, 317 MiB for the 27B), a quota too
+small to hold one request state leaves the tier off, and the temporary files
+are removed when the server exits.
 
 Authentication is off by default. Set `SPLASH_API_KEY` in the shell that runs
 `splash serve` and in the shell that runs an agent, and both sides use it.
