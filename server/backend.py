@@ -71,6 +71,8 @@ class NativeResult:
     cache: CacheInfo = field(default_factory=CacheInfo)
     stop_sequence: str | None = None
     first_token_batch_tokens: int = 0
+    # Raw option logits for score-only jobs, in requested token order.
+    option_logits: tuple = ()
 
 
 @dataclass
@@ -110,6 +112,10 @@ class Job:
     response_previous_id: str | None = None
     response_history_items: list | None = None
     return_progress: bool = False
+    # Option token ids for score-only jobs; empty means ordinary generation.
+    score_tokens: tuple = ()
+    # Endpoint-specific metadata carried to the response builder.
+    meta: dict | None = None
 
 
 class CallbackStreamer:
@@ -461,6 +467,7 @@ class NativeBackend:
             image_pixels=job.image_pixels,
             image_owner=job.image_owner,
             return_progress=job.return_progress,
+            score_tokens=job.score_tokens,
         )
 
     def submit(self, job):
@@ -664,6 +671,7 @@ class NativeBackend:
                     if stop_sequence is not None
                     else done.completion_tokens
                 ),
+                option_logits=done.option_logits,
                 start_to_first_token_ms=done.prefill_micros / 1000.0,
                 first_token_to_done_ms=done.decode_micros / 1000.0,
                 request_wall_ms=done.wall_micros / 1000.0,

@@ -224,6 +224,7 @@ def request(
     constraint=wire.ConstraintMode.NONE,
     mask_provider=None,
     image_owner=None,
+    score_tokens=(),
 ):
     return engine_runtime.GenerationRequest(
         prompt_tokens=(token, token + 1),
@@ -236,6 +237,7 @@ def request(
         constraint=constraint,
         mask_provider=mask_provider,
         image_owner=image_owner,
+        score_tokens=score_tokens,
     )
 
 
@@ -615,6 +617,138 @@ class RuntimeTests(unittest.TestCase):
         self.assertIsNone(result.start)
         self.assertEqual(result.tokens, ())
         self.assertFalse(call.cancel())
+
+    def test_score_request_passes_slots_and_returns_option_logits(self):
+        factory = FakeFactory()
+        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        self.addCleanup(runtime.close)
+        process = factory.processes[0]
+        call = runtime.submit(
+            request(10, logical_max_output_tokens=0, score_tokens=(101, 202, 303))
+        )
+        frame = process.stdin.wait_for(wire.RequestFrame)[0]
+        self.assertEqual(frame.score_tokens, (101, 202, 303))
+        self.assertEqual(frame.logical_max_output_tokens, 0)
+        process.send(
+            wire.StartEvent(
+                call.request_id, wire.CacheDisposition.MISS, 0, 0, 4096
+            )
+        )
+        process.send(
+            wire.DoneEvent(
+                call.request_id,
+                wire.FinishReason.STOP,
+                2,
+                0,
+                100,
+                0,
+                350,
+                (1.5, -2.25, 0.5),
+            )
+        )
+        result = call.result(1.0)
+        self.assertEqual(result.tokens, ())
+        self.assertEqual(result.done.option_logits, (1.5, -2.25, 0.5))
+
+    def test_score_done_requires_exactly_the_requested_logits(self):
+        for logits in ((), (1.5, -2.25)):
+            with self.subTest(logits=logits):
+                factory = FakeFactory()
+                runtime = engine_runtime.MultiplexedRuntime(
+                    process_factory=factory
+                )
+                process = factory.processes[0]
+                call = runtime.submit(
+                    request(
+                        10,
+                        logical_max_output_tokens=0,
+                        score_tokens=(101, 202, 303),
+                    )
+                )
+                try:
+                    process.send(
+                        wire.StartEvent(
+                            call.request_id,
+                            wire.CacheDisposition.MISS,
+                            0,
+                            0,
+                            4096,
+                        )
+                    )
+                    process.send(
+                        wire.DoneEvent(
+                            call.request_id,
+                            wire.FinishReason.STOP,
+                            2,
+                            0,
+                            100,
+                            0,
+                            350,
+                            logits,
+                        )
+                    )
+                    with self.assertRaisesRegex(
+                        engine_runtime.ProtocolFatal, "option logits"
+                    ):
+                        call.result(1.0)
+                    self.assertFalse(runtime.ready)
+                finally:
+                    runtime.close()
+
+    def test_generation_done_with_option_logits_is_fatal(self):
+        factory = FakeFactory()
+        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        process = factory.processes[0]
+        call = runtime.submit(request(10))
+        try:
+            process.send(
+                wire.StartEvent(
+                    call.request_id, wire.CacheDisposition.MISS, 0, 0, 4096
+                )
+            )
+            process.send(
+                wire.DoneEvent(
+                    call.request_id,
+                    wire.FinishReason.STOP,
+                    2,
+                    0,
+                    100,
+                    0,
+                    350,
+                    (1.5, -2.25),
+                )
+            )
+            with self.assertRaisesRegex(
+                engine_runtime.ProtocolFatal, "option logits"
+            ):
+                call.result(1.0)
+            self.assertFalse(runtime.ready)
+        finally:
+            runtime.close()
+
+    def test_cancelled_score_done_returns_no_logits(self):
+        factory = FakeFactory()
+        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        self.addCleanup(runtime.close)
+        process = factory.processes[0]
+        call = runtime.submit(
+            request(10, logical_max_output_tokens=0, score_tokens=(101, 202))
+        )
+        self.assertTrue(call.cancel())
+        process.send(
+            wire.DoneEvent(
+                call.request_id,
+                wire.FinishReason.CANCELLED,
+                2,
+                0,
+                0,
+                0,
+                10,
+            )
+        )
+        result = call.result(1.0)
+        self.assertEqual(result.done.reason, wire.FinishReason.CANCELLED)
+        self.assertEqual(result.done.option_logits, ())
 
     def test_generate_is_the_blocking_convenience_over_direct_submit(self):
         def handler(process, message):

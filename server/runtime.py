@@ -171,6 +171,8 @@ class GenerationRequest:
     # mask work. It is ownership only and is never serialized to the engine.
     image_owner: object | None = None
     return_progress: bool = False
+    # Option token ids for score-only requests; empty means generation.
+    score_tokens: tuple[int, ...] = ()
 
 
 @dataclass(slots=True, frozen=True)
@@ -363,6 +365,22 @@ class RuntimeCall:
                 raise ProtocolFatal(
                     f"length-finished DoneEvent has {completion_tokens} tokens; "
                     f"expected logical maximum {logical_max}"
+                )
+            expected_scores = len(self.request.score_tokens)
+            if expected_scores:
+                if done.reason is wire.FinishReason.STOP:
+                    if len(done.option_logits) != expected_scores:
+                        raise ProtocolFatal(
+                            f"score DoneEvent returned {len(done.option_logits)} "
+                            f"option logits; expected {expected_scores}"
+                        )
+                elif done.option_logits:
+                    raise ProtocolFatal(
+                        "unfinished score DoneEvent returned option logits"
+                    )
+            elif done.option_logits:
+                raise ProtocolFatal(
+                    "DoneEvent returned option logits for a generation request"
                 )
             tokens = tuple(
                 token
@@ -584,6 +602,7 @@ class MultiplexedRuntime:
                 image_spans=request.image_spans,
                 image_pixels=request.image_pixels,
                 return_progress=request.return_progress,
+                score_tokens=request.score_tokens,
             )
             try:
                 encoded = wire.serialize_message(protocol_request)

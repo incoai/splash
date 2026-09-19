@@ -13,18 +13,23 @@ from dataclasses import dataclass
 from enum import IntEnum, IntFlag
 from typing import TypeAlias
 
-PROTOCOL_VERSION = 5
+PROTOCOL_VERSION = 6
 FRAME_HEADER_BYTES = 24
 STATUS_SCHEMA_VERSION = 5
 # Largest top-k the native sampler keeps as candidates.
 MAX_TOP_K = 32
+# Score-only requests carry 2..16 distinct option token ids and produce no
+# generated tokens; a successful score DoneEvent returns one raw
+# final-position logit per requested token, in request order.
+MIN_SCORE_TOKENS = 2
+MAX_SCORE_TOKENS = 16
 ABSOLUTE_MAX_FRAME_PAYLOAD_BYTES = 256 * 1024 * 1024
 
 _MAGIC = b"SPLH"
 _HEADER = struct.Struct("<4sHHHHQI")
 # Replay can update the integer deadlines without decoding sampling floats.
 _REQUEST_HEAD = struct.Struct("<QBBBQQ")
-_REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIffIQB")
+_REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIffIQBI")
 _IMAGE_SPAN = struct.Struct("<IIIIQQ")
 _CANCEL = struct.Struct("<Q")
 _MASK_RESPONSE = struct.Struct("<QQI")
@@ -39,9 +44,13 @@ _ERROR = struct.Struct("<BBQII")
 _CAPACITY_EXHAUSTED = struct.Struct("<QIIQ")
 _STATUS_JSON = struct.Struct("<QI")
 
-assert array.array("I").itemsize == 4 and sys.byteorder == "little"
+assert (
+    array.array("I").itemsize == 4
+    and array.array("f").itemsize == 4
+    and sys.byteorder == "little"
+)
 assert _HEADER.size == FRAME_HEADER_BYTES
-assert _REQUEST.size == 60
+assert _REQUEST.size == 64
 assert _IMAGE_SPAN.size == 32
 assert _START.size == 21
 assert _DONE.size == 41
@@ -209,6 +218,9 @@ class RequestFrame:
     image_spans: tuple[ImageSpan, ...] = ()
     image_pixels: bytes = b""
     return_progress: bool = False
+    # Option token ids for score-only requests; empty means ordinary
+    # generation. Score tokens serialize after the image pixel bytes.
+    score_tokens: tuple[int, ...] = ()
 
 
 @dataclass(slots=True, frozen=True)
@@ -304,6 +316,9 @@ class DoneEvent:
     prefill_micros: int
     decode_micros: int
     wall_micros: int
+    # Raw final-position logits for a score-only request, in requested token
+    # order; empty for generation and for cancelled or failed scoring.
+    option_logits: tuple[float, ...] = ()
 
 
 @dataclass(slots=True, frozen=True)
@@ -454,7 +469,7 @@ def _limits_issue(limits: ProtocolLimits) -> ProtocolIssue | None:
         return _issue(
             FailureClass.PROTOCOL_FATAL,
             IssueCode.LIMIT_EXCEEDED,
-            "maxFramePayloadBytes must be in [60, 256 MiB]",
+            f"maxFramePayloadBytes must be in [{_REQUEST.size}, 256 MiB]",
         )
     if max_status > max_frame - _STATUS_JSON.size:
         return _issue(
@@ -510,7 +525,10 @@ def _payload_bounds(frame_type: FrameType, limits: ProtocolLimits) -> tuple[int,
                 _MASK_REQUEST.size + limits.max_simulation_tokens * 4,
             )
         case FrameType.DONE:
-            bounds = (_DONE.size, _DONE.size)
+            bounds = (
+                _DONE.size + 4,
+                _DONE.size + 4 + MAX_SCORE_TOKENS * 4,
+            )
         case FrameType.ERROR:
             bounds = (
                 _ERROR.size,
@@ -570,6 +588,35 @@ def _unpack_prefix_words(payload: bytes, offset: int, count: int) -> tuple[int, 
     words = array.array("I")
     words.frombytes(payload[offset : offset + byte_count])
     return tuple(words)
+
+def _pack_floats(values: tuple[float, ...]) -> bytes:
+    if not values:
+        return b""
+    return array.array("f", values).tobytes()
+
+
+def _unpack_floats(payload: bytes, offset: int, count: int) -> tuple[float, ...]:
+    byte_count = count * 4
+    if len(payload) - offset != byte_count:
+        raise ValueError("float count does not match binary payload")
+    if not count:
+        return ()
+    floats = array.array("f")
+    floats.frombytes(payload[offset : offset + byte_count])
+    return tuple(floats)
+
+
+def _score_logits(values: object, label: str) -> tuple[float, ...]:
+    if type(values) is not tuple:
+        raise ValueError(f"{label} must be a tuple of finite float32 values")
+    logits = tuple(_float32(value, f"{label} element") for value in values)
+    if any(not math.isfinite(value) for value in logits):
+        raise ValueError(f"{label} must be finite")
+    if logits and not MIN_SCORE_TOKENS <= len(logits) <= MAX_SCORE_TOKENS:
+        raise ValueError(
+            f"{label} must be empty or {MIN_SCORE_TOKENS}..{MAX_SCORE_TOKENS} values"
+        )
+    return logits
 
 
 def _image_spans_check(request: RequestFrame, prompt_tokens: int, limits) -> None:
@@ -645,7 +692,16 @@ def _request_issue(
     try:
         output_tokens = _u32(request.logical_max_output_tokens, "logical max output")
         prompt = _words(request.prompt_tokens, "prompt tokens")
-        if not output_tokens or output_tokens > limits.max_logical_output_tokens:
+        scores = _words(request.score_tokens, "score tokens")
+        if scores:
+            if output_tokens:
+                return _issue(
+                    FailureClass.REQUEST_ERROR,
+                    IssueCode.INVALID_COUNT,
+                    "score requests must not generate output tokens",
+                    request_id,
+                )
+        elif not output_tokens or output_tokens > limits.max_logical_output_tokens:
             raise ValueError("logical max output token count exceeds its limit")
         if not prompt or len(prompt) > limits.max_prompt_tokens:
             raise ValueError("prompt token count exceeds its limit")
@@ -660,6 +716,17 @@ def _request_issue(
         )
     try:
         _image_spans_check(request, len(prompt), limits)
+        if scores and (request.image_spans or request.image_pixels):
+            raise ValueError("score requests are text-only")
+        if scores and (
+            len(scores) < MIN_SCORE_TOKENS
+            or len(scores) > MAX_SCORE_TOKENS
+            or len(set(scores)) != len(scores)
+        ):
+            raise ValueError(
+                f"score requests need {MIN_SCORE_TOKENS}..{MAX_SCORE_TOKENS} "
+                "distinct option tokens"
+            )
     except ValueError as error:
         return _issue(
             FailureClass.REQUEST_ERROR,
@@ -683,11 +750,20 @@ def _request_issue(
                 "sampling requires temperature>=0, top_p in (0,1], and "
                 "top_k in [1,32] when sampling is enabled"
             )
+        if scores and (temperature != 0.0 or top_p != 1.0 or top_k):
+            raise ValueError("score requests require default greedy sampling")
     except (AttributeError, ValueError) as error:
         return _issue(
             FailureClass.REQUEST_ERROR,
             IssueCode.INVALID_SAMPLING,
             str(error),
+            request_id,
+        )
+    if scores and constraint is not ConstraintMode.NONE:
+        return _issue(
+            FailureClass.REQUEST_ERROR,
+            IssueCode.INVALID_COHORT_CONSTRAINT,
+            "score requests do not accept output constraints",
             request_id,
         )
     expected = Cohort.CONSTRAINED
@@ -902,7 +978,7 @@ def _done_issue(event: DoneEvent, failure: FailureClass) -> ProtocolIssue | None
     except ValueError as error:
         return _issue(failure, IssueCode.INVALID_REQUEST_ID, str(error), request_id)
     try:
-        _enum_value(event.reason, FinishReason, "finish reason")
+        reason = _enum_value(event.reason, FinishReason, "finish reason")
     except ValueError as error:
         return _issue(failure, IssueCode.INVALID_ENUM_VALUE, str(error), request_id)
     try:
@@ -911,6 +987,14 @@ def _done_issue(event: DoneEvent, failure: FailureClass) -> ProtocolIssue | None
         _u64(event.prefill_micros, "prefill microseconds")
         _u64(event.decode_micros, "decode microseconds")
         _u64(event.wall_micros, "wall microseconds")
+        logits = _score_logits(event.option_logits, "option logits")
+        if logits:
+            if reason is not FinishReason.STOP:
+                raise ValueError("scored done events must finish with stop")
+            if event.completion_tokens or event.decode_micros:
+                raise ValueError(
+                    "scored done events carry no completion or decode activity"
+                )
     except ValueError as error:
         return _issue(failure, IssueCode.INVALID_COUNT, str(error), request_id)
     return None
@@ -1024,8 +1108,9 @@ def _encode_message(
     if isinstance(message, RequestFrame):
         _raise_issue(_request_issue(message, limits))
         prompt = _words(message.prompt_tokens, "prompt tokens")
-        temperature = _float32(message.sampling.temperature, "temperature")
+        scores = _words(message.score_tokens, "score tokens")
         top_p = _float32(message.sampling.top_p, "top_p")
+        temperature = _float32(message.sampling.temperature, "temperature")
         payload = (
             _REQUEST.pack(
                 message.request_id,
@@ -1042,6 +1127,7 @@ def _encode_message(
                 message.sampling.top_k,
                 message.seed,
                 message.return_progress,
+                len(scores),
             )
             + _pack_words(prompt)
             + b"".join(
@@ -1056,6 +1142,7 @@ def _encode_message(
                 for span in message.image_spans
             )
             + bytes(message.image_pixels)
+            + _pack_words(scores)
         )
         frame_type = FrameType.REQUEST
     elif isinstance(message, CancelFrame):
@@ -1129,14 +1216,18 @@ def _encode_message(
         frame_type = FrameType.MASK_REQUEST
     elif isinstance(message, DoneEvent):
         _raise_issue(_done_issue(message, FailureClass.ENGINE_UNHEALTHY))
-        payload = _DONE.pack(
-            message.request_id,
-            int(message.reason),
-            message.prompt_tokens,
-            message.completion_tokens,
-            message.prefill_micros,
-            message.decode_micros,
-            message.wall_micros,
+        payload = (
+            _DONE.pack(
+                message.request_id,
+                int(message.reason),
+                message.prompt_tokens,
+                message.completion_tokens,
+                message.prefill_micros,
+                message.decode_micros,
+                message.wall_micros,
+            )
+            + struct.pack("<I", len(message.option_logits))
+            + _pack_floats(message.option_logits)
         )
         frame_type = FrameType.DONE
     elif isinstance(message, ErrorEvent):
@@ -1318,6 +1409,7 @@ def _decode_request(payload: bytes, limits: ProtocolLimits) -> RequestFrame:
         top_k,
         seed,
         return_progress,
+        score_count,
     ) = _REQUEST.unpack_from(payload)
     if return_progress > 1:
         _fail(
@@ -1347,9 +1439,14 @@ def _decode_request(payload: bytes, limits: ProtocolLimits) -> RequestFrame:
         for _ in range(image_span_count):
             image_spans.append(ImageSpan(*_IMAGE_SPAN.unpack_from(payload, cursor)))
             cursor += _IMAGE_SPAN.size
-        image_pixels = payload[cursor:]
+        score_bytes = 4 * score_count
+        score_offset = len(payload) - score_bytes
+        if score_offset < cursor:
+            raise ValueError("score tokens")
+        image_pixels = payload[cursor:score_offset]
         if len(image_pixels) != sum(span.pixel_bytes for span in image_spans):
             raise ValueError("image pixels")
+        score_tokens = _unpack_prefix_words(payload, score_offset, score_count)
     except (ValueError, struct.error):
         _fail(
             FailureClass.REQUEST_ERROR,
@@ -1389,6 +1486,7 @@ def _decode_request(payload: bytes, limits: ProtocolLimits) -> RequestFrame:
         tuple(image_spans),
         bytes(image_pixels),
         bool(return_progress),
+        score_tokens,
     )
     _raise_issue(_request_issue(request, limits))
     return request
@@ -1495,8 +1593,18 @@ def _decode_frame(frame: Frame, limits: ProtocolLimits = ProtocolLimits()) -> Me
         _raise_issue(_mask_request_issue(message, limits, FailureClass.PROTOCOL_FATAL))
         return message
     if frame_type is FrameType.DONE:
-        values = _DONE.unpack(payload)
+        values = _DONE.unpack_from(payload)
         request_id = values[0]
+        score_count = struct.unpack_from("<I", payload, _DONE.size)[0]
+        try:
+            logits = _unpack_floats(payload, _DONE.size + 4, score_count)
+        except ValueError:
+            _fail(
+                FailureClass.PROTOCOL_FATAL,
+                IssueCode.INVALID_PAYLOAD_LENGTH,
+                "option logit count does not match the binary event payload",
+                request_id,
+            )
         message = DoneEvent(
             request_id,
             _decode_enum(
@@ -1507,6 +1615,7 @@ def _decode_frame(frame: Frame, limits: ProtocolLimits = ProtocolLimits()) -> Me
                 request_id,
             ),
             *values[2:],
+            logits,
         )
         _raise_issue(_done_issue(message, FailureClass.PROTOCOL_FATAL))
         return message

@@ -28,6 +28,7 @@ from server import frontend as request_frontend
 from server import output as model_output
 from server import protocol as native_wire
 from server import server as api
+from server import judgments
 from server.api_shapes import _namespace_alias, normalize_responses_input
 from server.tool_schema import MAX_JSON_NESTING, _grammar_compatible_schema
 
@@ -261,6 +262,7 @@ class Plan:
         before_start=False,
         after_terminal=False,
         matched_tokens=1,
+        logits=None,
     ):
         self.batches = list(batches)
         self.reason = reason
@@ -268,6 +270,7 @@ class Plan:
         self.exception = exception
         self.delay = delay
         self.matched_tokens = matched_tokens
+        self.logits = logits
         self.started = threading.Event()
         self.release = threading.Event()
         if not block:
@@ -468,6 +471,7 @@ class FakeRuntime:
             1_000,
             2_000,
             3_000,
+            tuple(plan.logits) if plan.logits is not None else (),
         )
         call.complete(
             result=api.engine_runtime.GenerationResult(
@@ -1129,6 +1133,277 @@ class ServerTest(unittest.TestCase):
         )
         self.assertNotIn("queue_ms", response["metrics"])
         self.assertEqual(runtime.requests[0].seed, 7)
+
+    class CharTokenizer(FakeTokenizer):
+        """One token per character, so single-letter answer slots are exact."""
+
+        def encode(self, text, **kwargs):
+            return [ord(char) for char in text]
+
+        def decode(self, token_ids, **kwargs):
+            return "".join(chr(token) for token in token_ids)
+
+    class BoundaryCountingTokenizer(CharTokenizer):
+        """Counts whole-prompt tokenizations: one to prepare the prompt plus
+        one per answer-slot boundary check. An optional clock advances on each
+        of them so a test can expire a deadline inside the boundary pass."""
+
+        def __init__(self, clock=None, step=0.0):
+            super().__init__()
+            self.clock = clock
+            self.step = step
+            self.prompt = None
+            self.prompt_encodes = 0
+
+        def apply_chat_template(self, messages, **kwargs):
+            rendered = super().apply_chat_template(messages, **kwargs)
+            if kwargs.get("tokenize") is False:
+                self.prompt = rendered
+            return rendered
+
+        def encode(self, text, **kwargs):
+            if self.prompt is not None and text.startswith(self.prompt):
+                self.prompt_encodes += 1
+                if self.clock is not None:
+                    self.clock[0] += self.step
+            return super().encode(text, **kwargs)
+
+    @staticmethod
+    def judgment_body(**overrides):
+        body = {
+            "id": "row-1",
+            "state": {"evidence": "the sky is blue"},
+            "question": "Is the claim supported?",
+            "options": [
+                {"id": "yes", "description": "supported"},
+                {"id": "no", "description": "not supported"},
+            ],
+        }
+        body.update(overrides)
+        return body
+
+    def test_judgments_scores_options_without_generation(self):
+        runtime = FakeRuntime(Plan(logits=(1.5, -2.25)))
+        harness = self.harness(
+            runtime, tokenizer=self.CharTokenizer(), max_context=8192
+        )
+        status, content_type, payload = harness.request(
+            "POST", "/v1/judgments", self.judgment_body()
+        )
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(content_type, "application/json")
+        response = json.loads(payload)
+        self.assertEqual(response["id"], "row-1")
+        self.assertEqual(response["option_ids"], ["yes", "no"])
+        self.assertEqual(response["option_logits"], [1.5, -2.25])
+        probabilities = response["probabilities"]
+        self.assertEqual(len(probabilities), 2)
+        self.assertAlmostEqual(sum(probabilities), 1.0)
+        self.assertGreater(probabilities[0], probabilities[1])
+        expected = math.exp(1.5) / (math.exp(1.5) + math.exp(-2.25))
+        self.assertAlmostEqual(probabilities[0], expected)
+        self.assertEqual(response["prompt_version"], "direct-options-v1")
+        self.assertEqual(response["model"]["id"], "test-model")
+        self.assertEqual(response["answer_token_ids"], [ord("A"), ord("B")])
+        self.assertEqual(len(response["prompt_sha256"]), 64)
+        self.assertEqual(
+            response["probability_status"],
+            "conditional option score; uncalibrated as decision confidence",
+        )
+        self.assertEqual(
+            response["usage"],
+            {
+                "prompt_tokens": response["input_tokens"],
+                "completion_tokens": 0,
+                "total_tokens": response["input_tokens"],
+            },
+        )
+        self.assertGreaterEqual(response["forward_seconds"], 0)
+        self.assertGreaterEqual(response["total_seconds"], 0)
+
+        request = runtime.requests[0]
+        self.assertEqual(request.score_tokens, (ord("A"), ord("B")))
+        self.assertEqual(request.logical_max_output_tokens, 0)
+        self.assertEqual(request.sampling.temperature, 0.0)
+        self.assertEqual(request.cohort, native_wire.Cohort.GREEDY)
+        self.assertEqual(request.constraint, native_wire.ConstraintMode.NONE)
+        self.assertEqual(len(request.prompt_tokens), response["input_tokens"])
+        # The rendered prompt plus one slot token is exactly the boundary the
+        # engine scores; verify it against the tokenizer, not the response.
+        prompt_text = harness.tokenizer.decode(request.prompt_tokens)
+        self.assertEqual(
+            harness.tokenizer.encode(prompt_text + "A"),
+            list(request.prompt_tokens) + [ord("A")],
+        )
+        messages, kwargs = harness.tokenizer.templates[-1]
+        self.assertIs(kwargs["enable_thinking"], False)
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertEqual(messages[0]["content"], judgments.DIRECT_SYSTEM)
+        payload_json = json.loads(messages[1]["content"])
+        self.assertEqual(payload_json["evidence"], {"evidence": "the sky is blue"})
+        self.assertEqual(payload_json["criterion"], "Is the claim supported?")
+        self.assertEqual(
+            payload_json["options"],
+            [
+                {"letter": "A", "description": "supported"},
+                {"letter": "B", "description": "not supported"},
+            ],
+        )
+
+    def test_judgments_rejects_invalid_rows_before_inference(self):
+        runtime = FakeRuntime()
+        harness = self.harness(
+            runtime, tokenizer=self.CharTokenizer(), max_context=8192
+        )
+        cases = (
+            {},
+            self.judgment_body(id=""),
+            self.judgment_body(state={}),
+            self.judgment_body(question=42),
+            self.judgment_body(
+                options=[{"id": "a", "description": "x"}]
+            ),
+            self.judgment_body(
+                options=[
+                    {"id": "a", "description": "x"},
+                    {"id": "a", "description": "y"},
+                ]
+            ),
+            self.judgment_body(
+                options=[
+                    {"id": "a", "description": "x"},
+                    {"id": "b"},
+                ]
+            ),
+            self.judgment_body(
+                options=[
+                    {"id": str(i), "description": "x"} for i in range(17)
+                ]
+            ),
+            self.judgment_body(model="other-model"),
+            self.judgment_body(stream=True),
+            self.judgment_body(priority="urgent"),
+        )
+        for body in cases:
+            with self.subTest(body=body):
+                status, _, payload = harness.request(
+                    "POST", "/v1/judgments", body
+                )
+                self.assertIn(status, (400, 404), payload)
+        self.assertEqual(runtime.requests, [])
+
+    def test_judgments_rejects_nonfinite_state(self):
+        runtime = FakeRuntime()
+        harness = self.harness(
+            runtime, tokenizer=self.CharTokenizer(), max_context=8192
+        )
+        connection = http.client.HTTPConnection(
+            *harness.server.server_address, timeout=3
+        )
+        connection.request(
+            "POST",
+            "/v1/judgments",
+            '{"id":"r","state":NaN,"question":"q",'
+            '"options":[{"id":"a","description":"x"},'
+            '{"id":"b","description":"y"}]}',
+            {"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        self.assertEqual(response.status, 400)
+        connection.close()
+        self.assertEqual(runtime.requests, [])
+
+    def test_judgments_requires_auth_when_configured(self):
+        runtime = FakeRuntime(Plan(logits=(0.0, 1.0)))
+        harness = self.harness(
+            runtime,
+            tokenizer=self.CharTokenizer(),
+            max_context=8192,
+            api_key="secret",
+        )
+        status, _, _ = harness.request(
+            "POST", "/v1/judgments", self.judgment_body()
+        )
+        self.assertEqual(status, 401)
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/judgments",
+            self.judgment_body(),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bearer secret",
+            },
+        )
+        self.assertEqual(status, 200, payload)
+
+    def test_judgments_missing_logits_is_a_server_error(self):
+        runtime = FakeRuntime(Plan())
+        harness = self.harness(
+            runtime, tokenizer=self.CharTokenizer(), max_context=8192
+        )
+        status, _, payload = harness.request(
+            "POST", "/v1/judgments", self.judgment_body()
+        )
+        self.assertEqual(status, 500, payload)
+        self.assertEqual(
+            json.loads(payload)["error"]["code"], "protocol_error"
+        )
+
+    def test_judgments_deadline_cancels_the_score_request(self):
+        plan = Plan(logits=(0.0, 1.0), block=True)
+        runtime = FakeRuntime(plan)
+        harness = self.harness(
+            runtime,
+            tokenizer=self.CharTokenizer(),
+            max_context=8192,
+            timeout=0.05,
+        )
+        status, _, payload = harness.request(
+            "POST", "/v1/judgments", self.judgment_body()
+        )
+        self.assertEqual(status, 504, payload)
+        self.assertEqual(runtime.cancel_count, 1)
+
+    def test_judgment_deadline_stops_the_slot_boundary_pass(self):
+        clock = [100.0]
+        tokenizer = self.BoundaryCountingTokenizer(clock, 0.5)
+        app = request_frontend.Frontend(tokenizer, None, "test-model", 8192, 16, 10, 2)
+        body = self.judgment_body(
+            options=[
+                {"id": f"opt{index}", "description": f"case {index}"}
+                for index in range(16)
+            ],
+            timeout=1.0,
+        )
+        with (
+            mock.patch.object(api.time, "monotonic", side_effect=lambda: clock[0]),
+            self.assertRaises(api.APIError) as error,
+        ):
+            app.prepare_judgment(body)
+        self.assertEqual(
+            (error.exception.status, error.exception.code), (504, "request_timeout")
+        )
+        # The prepare pass and one boundary check; all 17 ran before the fix.
+        self.assertEqual(tokenizer.prompt_encodes, 2)
+
+    def test_judgment_context_budget_precedes_the_slot_boundary_pass(self):
+        tokenizer = self.BoundaryCountingTokenizer()
+        app = request_frontend.Frontend(tokenizer, None, "test-model", 8, 16, 10, 2)
+        with self.assertRaises(api.APIError) as error:
+            app.prepare_judgment(
+                self.judgment_body(
+                    options=[
+                        {"id": f"opt{index}", "description": f"case {index}"}
+                        for index in range(16)
+                    ]
+                )
+            )
+        self.assertEqual(
+            (error.exception.status, error.exception.code),
+            (400, "context_length_exceeded"),
+        )
+        # Only the prepare pass; the 16 boundary checks ran first before the fix.
+        self.assertEqual(tokenizer.prompt_encodes, 1)
 
     class ImagePadTokenizer(FakeTokenizer):
         """Renders one image placeholder per image part like the pinned
