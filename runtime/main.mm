@@ -363,12 +363,14 @@ int runNative(const NativeArguments &arguments) {
                            .count();
     static_cast<void>(resources.backend().refreshMemoryStats());
     const auto memory = governor.snapshot();
-    const std::string diagnostic = memoryReporter.update(
-        published->nativeLoop().resourceWaitSnapshot(), memory.growthAllowed);
+    const engine::ResourceWaitSnapshot wait =
+        published->nativeLoop().resourceWaitSnapshot();
+    const std::string diagnostic =
+        memoryReporter.update(wait, memory.growthAllowed);
     if (!diagnostic.empty())
       std::cerr << diagnostic << '\n';
     engine::MemoryReclaimDirective directive =
-        pressurePolicy.update(memory, now);
+        pressurePolicy.update(memory, now, wait.memory || wait.suspended);
     if (!directive.reclaimEmptyKvExtents)
       return false;
     static_cast<void>(published->nativeLoop().reclaimMemory(directive));

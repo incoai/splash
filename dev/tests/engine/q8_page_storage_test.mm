@@ -195,13 +195,13 @@ void run(const std::string &metallib) {
             "missing host memory telemetry did not fail closed");
     MemoryPressurePolicy missingPolicy;
     auto missing = bounded.snapshot();
-    auto missingDirective = missingPolicy.update(missing, 0.0);
+    auto missingDirective = missingPolicy.update(missing, 0.0, false);
     require(missing.pressure == MemoryPressure::Warning &&
                 !missingDirective.evictAllUnpinnedPrefixes &&
                 missingDirective.targetBytes == 0,
             "missing telemetry discarded valid cache");
     bounded.setPressure(MemoryPressure::Critical);
-    require(missingPolicy.update(bounded.snapshot(), 1.0).evictAllUnpinnedPrefixes,
+    require(missingPolicy.update(bounded.snapshot(), 1.0, false).evictAllUnpinnedPrefixes,
             "missing telemetry hid critical system pressure");
     bounded.setPressure(MemoryPressure::Normal);
     fakeHostAvailable = hostReserve + 3 * giB;
@@ -215,7 +215,7 @@ void run(const std::string &metallib) {
     fakeHostAvailable = estimateHostAvailableMemory(
         pressurePages, 1, hostReserve + 24 * giB);
     MemoryPressurePolicy hostPolicy;
-    auto hostDirective = hostPolicy.update(bounded.snapshot(), 0.0);
+    auto hostDirective = hostPolicy.update(bounded.snapshot(), 0.0, false);
     require(!bounded.tryReserve(1).has_value() &&
                 bounded.snapshot().pressure == MemoryPressure::Warning &&
                 hostDirective.reclaimEmptyKvExtents &&
@@ -227,7 +227,7 @@ void run(const std::string &metallib) {
         pressurePages, 1, hostReserve + 24 * giB);
     require(bounded.snapshot().growthAllowed &&
                 bounded.tryReserve(1).has_value() &&
-                !hostPolicy.update(bounded.snapshot(), 1000.0).reclaimEmptyKvExtents,
+                !hostPolicy.update(bounded.snapshot(), 1000.0, false).reclaimEmptyKvExtents,
             "reclaimable host recovery did not reopen normal admission");
     bounded.setPressure(MemoryPressure::Warning);
     require(bounded.snapshot().pressure == MemoryPressure::Warning &&
@@ -246,39 +246,51 @@ void run(const std::string &metallib) {
     policySnapshot.hostMeasurementValid = true;
     policySnapshot.systemPressure = MemoryPressure::Warning;
     policySnapshot.hostHeadroomBytes = 3 * giB / 2;
-    auto firstDirective = policy.update(policySnapshot, 0.0);
+    auto firstDirective = policy.update(policySnapshot, 0.0, false);
     require(firstDirective.reclaimEmptyKvExtents &&
                 !firstDirective.evictAllUnpinnedPrefixes &&
                 firstDirective.targetBytes == giB / 2,
             "warning pressure ignored measured headroom");
-    require(policy.update(policySnapshot, 500.0).targetBytes == 0 &&
-                policy.update(policySnapshot, 999.0).targetBytes == 0,
+    require(policy.update(policySnapshot, 500.0, false).targetBytes == 0 &&
+                policy.update(policySnapshot, 999.0, false).targetBytes == 0,
             "warning pressure reclaimed again before telemetry settled");
     // Another application consumed more memory in the SAME warning episode.
     // Earlier reclaimed bytes must not offset this new deficit.
     policySnapshot.hostHeadroomBytes = giB / 4;
-    require(policy.update(policySnapshot, 1000.0).targetBytes == giB,
+    require(policy.update(policySnapshot, 1000.0, false).targetBytes == giB,
             "persistent warning did not request a new bounded shrink pass");
     policySnapshot.systemPressure = MemoryPressure::Normal;
     policySnapshot.hostHeadroomBytes = 7 * giB / 4;
-    require(policy.update(policySnapshot, 2000.0).targetBytes == giB / 4,
+    require(policy.update(policySnapshot, 2000.0, false).targetBytes == giB / 4,
             "pressure recovery ignored the current smaller deficit");
     policySnapshot.pressure = MemoryPressure::Normal;
-    require(!policy.update(policySnapshot, 2100.0).reclaimEmptyKvExtents,
+    require(!policy.update(policySnapshot, 2100.0, false).reclaimEmptyKvExtents,
             "normal pressure requested cache reclaim");
     policySnapshot.pressure = MemoryPressure::Warning;
-    require(policy.update(policySnapshot, 2101.0).targetBytes == giB / 4,
+    require(policy.update(policySnapshot, 2101.0, false).targetBytes == giB / 4,
             "a new pressure episode inherited an old cooldown");
     policySnapshot.systemPressure = MemoryPressure::Warning;
     policySnapshot.hostHeadroomBytes = 3 * giB;
-    const auto advisory = policy.update(policySnapshot, 3101.0);
+    const auto advisory = policy.update(policySnapshot, 3101.0, false);
     require(advisory.reclaimEmptyKvExtents && !advisory.evictAllUnpinnedPrefixes &&
                 advisory.targetBytes == 0,
             "system warning discarded live cache despite sufficient headroom");
+    // The newest publication is what a follow-up resumes from; rebuilding it
+    // costs a whole prefill, so a shrink nothing is waiting for leaves it and
+    // takes the rest. A waiting request outranks it, and Critical takes all.
+    policySnapshot.systemPressure = MemoryPressure::Warning;
+    policySnapshot.hostHeadroomBytes = giB / 4;
+    const auto speculative = policy.update(policySnapshot, 4101.0, false);
+    require(speculative.targetBytes == giB && speculative.keepResumePoint,
+            "a speculative shrink discarded the resume point");
+    const auto demanded = policy.update(policySnapshot, 5101.0, true);
+    require(demanded.targetBytes == giB && !demanded.keepResumePoint,
+            "a waiting request could not reach the resume point");
     policySnapshot.pressure = MemoryPressure::Critical;
-    auto criticalDirective = policy.update(policySnapshot, 2102.0);
+    auto criticalDirective = policy.update(policySnapshot, 2102.0, false);
     require(criticalDirective.reclaimEmptyKvExtents &&
-                criticalDirective.evictAllUnpinnedPrefixes,
+                criticalDirective.evictAllUnpinnedPrefixes &&
+                !criticalDirective.keepResumePoint,
             "critical pressure did not request aggressive reclaim");
 
     std::optional<uint64_t> elasticHostAvailable = 2ULL * 1024 * 1024 * 1024;

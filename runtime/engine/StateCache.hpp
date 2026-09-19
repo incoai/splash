@@ -102,8 +102,12 @@ public:
 
   [[nodiscard]] bool contains(uint64_t kvBlock) const noexcept;
   // Unpinned checkpoints precede ordinary states regardless of recency.
+  // keepResumePoint withholds the publication a follow-up request would
+  // resume from, leaving no candidate when it is the only one. Checkpoints
+  // keep their disposable priority: one is withheld only when no ordinary
+  // state exists.
   [[nodiscard]] std::optional<CacheEvictionCandidate>
-  evictionCandidate() const noexcept;
+  evictionCandidate(bool keepResumePoint = false) const noexcept;
   [[nodiscard]] StateEviction evict(uint64_t kvBlock) noexcept;
   [[nodiscard]] StateCacheSnapshot snapshot() const noexcept;
 
@@ -126,6 +130,9 @@ private:
     uint64_t newest = 0;
   };
 
+  // The unpinned publication a follow-up request would resume from: the
+  // newest ordinary state, or the newest checkpoint when none exists.
+  [[nodiscard]] uint64_t resumePoint() const noexcept;
   [[nodiscard]] StateEviction erase(uint64_t kvBlock, bool retirement) noexcept;
   void release(uint64_t kvBlock) noexcept;
   [[nodiscard]] std::optional<CompositeStateLease>

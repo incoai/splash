@@ -308,7 +308,8 @@ void MemoryGovernor::release(uint64_t bytes) noexcept {
 }
 
 MemoryReclaimDirective MemoryPressurePolicy::update(
-    const MemoryGovernorSnapshot &snapshot, double nowMilliseconds) noexcept {
+    const MemoryGovernorSnapshot &snapshot, double nowMilliseconds,
+    bool requestWaiting) noexcept {
   if (snapshot.pressure == MemoryPressure::Normal) {
     nextReclaimMilliseconds_ = 0.0;
     return {};
@@ -331,7 +332,11 @@ MemoryReclaimDirective MemoryPressurePolicy::update(
   uint64_t desired = snapshot.hostHeadroomBytes < kHostRecoveryMarginBytes
       ? kHostRecoveryMarginBytes - snapshot.hostHeadroomBytes
       : 0;
-  return {true, false, std::min(desired, kHostWarningMarginBytes)};
+  // Recovering the last stretch to the watermark is worth far less than the
+  // resume point it would otherwise discard, so a pass with nothing waiting
+  // keeps that publication and takes the rest. A waiting request outranks it.
+  return {true, false, std::min(desired, kHostWarningMarginBytes),
+          !requestWaiting};
 }
 
 } // namespace splash::engine

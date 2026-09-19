@@ -76,15 +76,20 @@ struct MemoryReclaimDirective {
   bool reclaimEmptyKvExtents = false;
   bool evictAllUnpinnedPrefixes = false;
   uint64_t targetBytes = 0;
+  // Keep the newest state publication, the point a follow-up request resumes
+  // from. Only a shrink that nothing is waiting for can afford to.
+  bool keepResumePoint = false;
 };
 
 // Bounded shrink passes separated by a telemetry settling interval. New host
 // pressure is never offset by bytes reclaimed earlier in the same episode.
 class MemoryPressurePolicy final {
 public:
+  // requestWaiting reports whether a request cannot proceed for want of
+  // memory. Without one the pass is speculative and keeps the resume point.
   [[nodiscard]] MemoryReclaimDirective
-  update(const MemoryGovernorSnapshot &snapshot,
-         double nowMilliseconds) noexcept;
+  update(const MemoryGovernorSnapshot &snapshot, double nowMilliseconds,
+         bool requestWaiting) noexcept;
 
 private:
   double nextReclaimMilliseconds_ = 0.0;

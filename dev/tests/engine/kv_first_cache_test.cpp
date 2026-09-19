@@ -207,6 +207,49 @@ void testByteLruAndPins() {
           "released state pins did not restore LRU eligibility");
 }
 
+// The field failure this guards: under host pressure a shrink that no request
+// was waiting for discarded the only published state one second after it
+// appeared, and the follow-up replayed its whole prompt instead of resuming.
+void testSpeculativeReclaimKeepsTheResumePoint() {
+  CacheFixture fixture;
+  fixture.publish(0, 100);
+  fixture.publish(2, 100);
+  const uint64_t everything = std::numeric_limits<uint64_t>::max();
+  static_cast<void>(fixture.cache.reclaimCache(everything, false, true));
+  require(fixture.cache.snapshot().stateCache.entries == 1,
+          "an unbounded speculative shrink did not stop at the resume point");
+  // The chain the kept publication needs survives with it: its own KV block
+  // is not state-free, and every ancestor still has a child.
+  auto resumed = fixture.cache.lookup(fixture.prompt);
+  require(resumed.resumeBoundary() == 96,
+          "the kept publication could not resume the next request");
+  resumed.state.reset();
+  static_cast<void>(fixture.cache.reclaimCache(everything, false, false));
+  require(fixture.cache.snapshot().stateCache.entries == 0,
+          "a demanded shrink could not reach the resume point");
+}
+
+// A checkpoint belongs to a request that is still running and republishes as
+// it goes. Keeping one because it is the most recent publication would evict
+// the finished state a different conversation resumes from, inverting the
+// disposable-first order.
+void testCheckpointDoesNotOutrankTheResumePoint() {
+  CacheFixture fixture;
+  fixture.publish(0, 100);
+  auto warm = fixture.lookup(33);
+  require(warm.resumeBoundary() == 32, "the warm prefix did not resume");
+  warm.state.reset();
+  fixture.cache.publishCompositeState(fixture.blocks.at(2),
+                                      std::make_shared<TestState>(100), true);
+  const CacheReclaimResult step =
+      fixture.cache.reclaimOne(CacheReclaimMode::ReleaseBacking, true);
+  const auto kept = fixture.cache.snapshot().stateCache;
+  require(step.madeProgress && kept.entries == 1 && kept.checkpointEntries == 0,
+          "a disposable checkpoint outranked the resume point");
+  require(fixture.lookup(33).resumeBoundary() == 32,
+          "the warm conversation lost its resumable prefix");
+}
+
 void testKvEvictionInvalidatesStateFirst() {
   CacheFixture fixture;
   fixture.publish(3);
@@ -565,6 +608,8 @@ int main() {
     testPage31Page32Page33Backoff();
     testLazyJunctionMaterialization();
     testByteLruAndPins();
+    testSpeculativeReclaimKeepsTheResumePoint();
+    testCheckpointDoesNotOutrankTheResumePoint();
     testKvEvictionInvalidatesStateFirst();
     testStatePublicationValidation();
     testDuplicateProbePromotesStateWithoutLookupAccounting();

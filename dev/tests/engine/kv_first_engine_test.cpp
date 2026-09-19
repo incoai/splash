@@ -1018,8 +1018,17 @@ void testPressureReclaimRespectsStateLifetimes() {
   require(cached.stateCache.entries == 1 && cached.kvCache.blocks == 2,
           "pressure setup did not retain KV and composite state");
 
+  // A shrink that nothing is waiting for stops at the resume point. Freeing
+  // its cell gains the host a little; the next request pays a full replay.
+  static_cast<void>(engine.reclaimMemory({.reclaimEmptyKvExtents = true,
+                                          .targetBytes = 64,
+                                          .keepResumePoint = true}));
+  require(resources.snapshot().stateCache.entries == 1,
+          "a speculative shrink discarded the only resume point");
+
   executor.reclaimableIdleStateBytes = 128;
-  const uint64_t first = engine.reclaimMemory({true, false, 64});
+  const uint64_t first = engine.reclaimMemory(
+      {.reclaimEmptyKvExtents = true, .targetBytes = 64});
   require(first >= 128 && executor.reclaimedIdleStateBytes == 128,
           "pressure reclaim did not release idle active-state backing first");
   require(
@@ -1028,8 +1037,9 @@ void testPressureReclaimRespectsStateLifetimes() {
 
   // Drain any initially resident but unused test extents, then prove cached
   // state is the next lifecycle selected while its parent KV remains usable.
-  static_cast<void>(engine.reclaimMemory({true, false, 0}));
-  require(engine.reclaimMemory({true, false, 64}) >= 64,
+  static_cast<void>(engine.reclaimMemory({.reclaimEmptyKvExtents = true}));
+  require(engine.reclaimMemory({.reclaimEmptyKvExtents = true,
+                                .targetBytes = 64}) >= 64,
           "pressure reclaim did not release immutable cached state");
   const auto stateEvicted = resources.snapshot();
   require(stateEvicted.stateCache.entries == 0 &&
@@ -1037,7 +1047,9 @@ void testPressureReclaimRespectsStateLifetimes() {
           "cached-state eviction incorrectly removed target KV");
 
   static_cast<void>(
-      engine.reclaimMemory({true, true, std::numeric_limits<uint64_t>::max()}));
+      engine.reclaimMemory({.reclaimEmptyKvExtents = true,
+                            .evictAllUnpinnedPrefixes = true,
+                            .targetBytes = std::numeric_limits<uint64_t>::max()}));
   const auto critical = resources.snapshot();
   require(critical.stateCache.entries == 0 && critical.kvCache.blocks == 0 &&
               critical.pool.residentBackingBytes == 0,

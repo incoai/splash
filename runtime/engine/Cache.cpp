@@ -221,7 +221,8 @@ bool Cache::retireCheckpointState(StateCheckpoint checkpoint) noexcept {
   return states_.retireCheckpoint(checkpoint);
 }
 
-uint64_t Cache::reclaimCache(uint64_t targetBytes, bool evictAll) {
+uint64_t Cache::reclaimCache(uint64_t targetBytes, bool evictAll,
+                             bool keepResumePoint) {
   // Empty backing that is waiting behind an in-flight release will satisfy
   // part of the target by itself; evicting more cache now would only
   // discard reusable prefixes without returning memory any sooner.
@@ -230,7 +231,8 @@ uint64_t Cache::reclaimCache(uint64_t targetBytes, bool evictAll) {
   uint64_t released = reclaimEmptyExtents();
   auto needsMore = [&] { return evictAll || released < targetBytes; };
   while (needsMore() && !releaseDeferred()) {
-    const CacheReclaimResult result = reclaimOne();
+    const CacheReclaimResult result =
+        reclaimOne(CacheReclaimMode::ReleaseBacking, keepResumePoint);
     if (!result.madeProgress)
       break;
     released += result.reclaimedBytes;
@@ -238,7 +240,8 @@ uint64_t Cache::reclaimCache(uint64_t targetBytes, bool evictAll) {
   return released;
 }
 
-CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode) {
+CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode,
+                                     bool keepResumePoint) {
   if (mode == CacheReclaimMode::ReleaseBacking) {
     if (releaseDeferred())
       return {};
@@ -247,7 +250,7 @@ CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode) {
   }
 
   const std::optional<CacheEvictionCandidate> state =
-      states_.evictionCandidate();
+      states_.evictionCandidate(keepResumePoint);
   const bool checkpoint = state && states_.checkpoint(state->id);
   const std::optional<CacheEvictionCandidate> kv =
       checkpoint ? std::nullopt : oldestStateFreeKvBlock();

@@ -107,12 +107,19 @@ public:
   // is paced by the backing: while an earlier release is still being torn
   // down, this pass stops instead of evicting cache whose extents could not
   // be released yet; the caller retries once releaseDeferred() clears.
-  [[nodiscard]] uint64_t reclaimCache(uint64_t targetBytes, bool evictAll);
+  // keepResumePoint stops short of the newest state publication. A shrink
+  // that no request is waiting for gains the one cell that publication holds
+  // and costs the next request a replay of its whole prompt, because a
+  // hybrid model cannot resume from cached KV without the recurrent state.
+  // Empty backing, older publications and state-free KV are still reclaimed.
+  [[nodiscard]] uint64_t reclaimCache(uint64_t targetBytes, bool evictAll,
+                                      bool keepResumePoint = false);
   // One bounded reclaim step for an allocation retry. Progress is distinct
   // from physical bytes because evicting a KV reference can make a resident
   // page reusable without immediately emptying its extent.
   [[nodiscard]] CacheReclaimResult reclaimOne(
-      CacheReclaimMode mode = CacheReclaimMode::ReleaseBacking);
+      CacheReclaimMode mode = CacheReclaimMode::ReleaseBacking,
+      bool keepResumePoint = false);
   // Recycles an unpinned state, preferring checkpoints, for a required state
   // publication. KV bytes only return once an extent unmaps.
   [[nodiscard]] bool reclaimOneState(bool checkpointsOnly = false);
