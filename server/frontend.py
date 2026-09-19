@@ -282,7 +282,7 @@ class Frontend:
     ):
         if check_context and tokens >= self.max_context:
             raise ContextLengthError(
-                tokens, self.max_context, image_tokens_only=image_tokens_only
+                tokens, self.max_context - 1, image_tokens_only=image_tokens_only
             )
         frame_bytes = (
             wire.REQUEST_FIXED_BYTES
@@ -434,7 +434,7 @@ class Frontend:
     def _score_job(self, prompt_tokens, slot_ids, deadline, priority, meta):
         return Job(
             request_id=next(self.ids),
-            prompt_tokens=list(prompt_tokens),
+            prompt_tokens=prompt_tokens,
             max_new_tokens=0,
             seed=0,
             temperature=0.0,
@@ -449,7 +449,8 @@ class Frontend:
 
     def prepare_judgment(self, body, *, deadline=None):
         unknown = sorted(
-            set(body) - {"id", "state", "question", "options", "model", "timeout", "priority"}
+            set(body)
+            - {"id", "state", "question", "options", "model", "timeout", "priority"}
         )
         if unknown:
             raise APIError(400, f"unsupported fields: {', '.join(unknown)}")
@@ -474,7 +475,7 @@ class Frontend:
             except Exception as error:
                 raise APIError(400, "judgment prompt could not be rendered") from error
             remaining_request_time(deadline)
-            if len(tokens) >= self.max_context:
+            if len(tokens) > self.max_context:
                 raise ContextLengthError(len(tokens), self.max_context)
             job = self._score_job(
                 tokens,
@@ -489,16 +490,10 @@ class Frontend:
         return job, body
 
     def prepare_systemone(self, body, *, deadline=None):
-        unknown = sorted(set(body) - {"state", "model", "questions", "timeout", "priority"})
-        details = [
-            judgments.detail([field], "extra field not permitted", "extra_forbidden")
-            for field in unknown
-        ]
+        details = []
         model = body.get("model")
         if not isinstance(model, str) or not model:
-            details.append(
-                judgments.detail(["model"], "field required", "missing")
-            )
+            details.append(judgments.detail(["model"], "field required", "missing"))
         elif model != self.model:
             details.append(
                 judgments.detail(
@@ -555,7 +550,7 @@ class Frontend:
                         500, "question prompt could not be rendered"
                     ) from error
                 remaining_request_time(deadline)
-                if len(tokens) >= self.max_context:
+                if len(tokens) > self.max_context:
                     raise ContextLengthError(len(tokens), self.max_context)
                 job = self._score_job(
                     tokens,
@@ -844,7 +839,7 @@ class Frontend:
             )
         remaining_request_time(deadline)
         if len(prompt_tokens) >= self.max_context:
-            raise ContextLengthError(len(prompt_tokens), self.max_context)
+            raise ContextLengthError(len(prompt_tokens), self.max_context - 1)
         max_new = body.get(
             "max_completion_tokens",
             body.get(

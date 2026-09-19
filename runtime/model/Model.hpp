@@ -50,7 +50,7 @@ struct ModelRequest final {
   // Nonempty selects score-only mode: prefill runs to completion, no token is
   // generated, and the raw final-position logits at these ids are returned in
   // ModelStepResult::scoreLogits. maxNewTokens must be zero.
-  std::span<const uint32_t> scoreTokens;
+  std::span<const uint32_t> scoreTokens{};
 };
 
 struct ImageSpan final {
@@ -193,8 +193,8 @@ struct ModelStepResult final {
   uint64_t requestId = 0;
   uint32_t consumedPromptTokens = 0;
   std::vector<uint32_t> outputTokens;
-  // True when a stop token ended the sequence; budget exhaustion is the
-  // engine's decision.
+  // True after a stop token or the final score-only prefill chunk.
+  // Generation budget exhaustion is the engine's decision.
   bool finished = false;
   DecodeStage nextDecodeStage = DecodeStage::Regular;
   uint32_t draftedTokens = 0;
@@ -205,7 +205,7 @@ struct ModelStepResult final {
   uint32_t outputTokensWithoutKv = 0;
   // Raw final-prompt-position logits at the request's scoreTokens, in
   // requested order. Empty for generation and for cancelled/failed scoring.
-  std::vector<float> scoreLogits;
+  std::vector<float> scoreLogits{};
 
   bool operator==(const ModelStepResult &) const = default;
 };

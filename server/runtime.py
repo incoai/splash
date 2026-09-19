@@ -368,6 +368,15 @@ class RuntimeCall:
                 )
             expected_scores = len(self.request.score_tokens)
             if expected_scores:
+                if done.decode_micros:
+                    raise ProtocolFatal(
+                        "score DoneEvent reported autoregressive decoding"
+                    )
+                if done.reason not in (
+                    wire.FinishReason.STOP,
+                    wire.FinishReason.CANCELLED,
+                ):
+                    raise ProtocolFatal("score DoneEvent has an invalid finish reason")
                 if done.reason is wire.FinishReason.STOP:
                     if len(done.option_logits) != expected_scores:
                         raise ProtocolFatal(

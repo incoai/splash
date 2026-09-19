@@ -630,9 +630,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(frame.score_tokens, (101, 202, 303))
         self.assertEqual(frame.logical_max_output_tokens, 0)
         process.send(
-            wire.StartEvent(
-                call.request_id, wire.CacheDisposition.MISS, 0, 0, 4096
-            )
+            wire.StartEvent(call.request_id, wire.CacheDisposition.MISS, 0, 0, 4096)
         )
         process.send(
             wire.DoneEvent(
@@ -650,13 +648,17 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(result.tokens, ())
         self.assertEqual(result.done.option_logits, (1.5, -2.25, 0.5))
 
-    def test_score_done_requires_exactly_the_requested_logits(self):
-        for logits in ((), (1.5, -2.25)):
-            with self.subTest(logits=logits):
+    def test_score_done_rejects_invalid_terminal_results(self):
+        for reason, logits, decode_micros in (
+            (wire.FinishReason.STOP, (1.5, -2.25), 0),
+            (wire.FinishReason.LENGTH, (), 0),
+            (wire.FinishReason.STOP, (1.5, -2.25, 0.5), 1),
+        ):
+            with self.subTest(
+                reason=reason, logits=logits, decode_micros=decode_micros
+            ):
                 factory = FakeFactory()
-                runtime = engine_runtime.MultiplexedRuntime(
-                    process_factory=factory
-                )
+                runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
                 process = factory.processes[0]
                 call = runtime.submit(
                     request(
@@ -678,18 +680,16 @@ class RuntimeTests(unittest.TestCase):
                     process.send(
                         wire.DoneEvent(
                             call.request_id,
-                            wire.FinishReason.STOP,
+                            reason,
                             2,
                             0,
                             100,
-                            0,
+                            decode_micros,
                             350,
                             logits,
                         )
                     )
-                    with self.assertRaisesRegex(
-                        engine_runtime.ProtocolFatal, "option logits"
-                    ):
+                    with self.assertRaises(engine_runtime.ProtocolFatal):
                         call.result(1.0)
                     self.assertFalse(runtime.ready)
                 finally:
@@ -702,9 +702,7 @@ class RuntimeTests(unittest.TestCase):
         call = runtime.submit(request(10))
         try:
             process.send(
-                wire.StartEvent(
-                    call.request_id, wire.CacheDisposition.MISS, 0, 0, 4096
-                )
+                wire.StartEvent(call.request_id, wire.CacheDisposition.MISS, 0, 0, 4096)
             )
             process.send(
                 wire.DoneEvent(
@@ -718,9 +716,7 @@ class RuntimeTests(unittest.TestCase):
                     (1.5, -2.25),
                 )
             )
-            with self.assertRaisesRegex(
-                engine_runtime.ProtocolFatal, "option logits"
-            ):
+            with self.assertRaisesRegex(engine_runtime.ProtocolFatal, "option logits"):
                 call.result(1.0)
             self.assertFalse(runtime.ready)
         finally:

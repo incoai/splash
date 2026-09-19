@@ -472,7 +472,7 @@ class ProtocolRecoveryTests(unittest.TestCase):
         with mock.patch.object(
             harness.app,
             "_prepare_images",
-            side_effect=api_errors.ContextLengthError(100, 2, image_tokens_only=True),
+            side_effect=api_errors.ContextLengthError(100, 1, image_tokens_only=True),
         ):
             status, _, raw = harness.request("POST", "/v1/messages", request_body())
         self.assertEqual(status, 400)

@@ -189,7 +189,7 @@ struct RequestFrame {
   // Empty selects ordinary generation. Nonempty selects score-only mode:
   // 2..255 distinct token ids, logicalMaxOutputTokens must be zero, and the
   // request must be text-only, unconstrained, and greedy.
-  std::vector<uint32_t> scoreTokens;
+  std::vector<uint32_t> scoreTokens{};
 
   bool operator==(const RequestFrame &) const = default;
 };
@@ -294,7 +294,7 @@ struct DoneEvent {
   uint64_t wallMicros = 0;
   // Raw final-prompt-position logits at the request's scoreTokens, in
   // requested order. Empty for generation and for cancelled/failed scoring.
-  std::vector<float> optionLogits;
+  std::vector<float> optionLogits{};
 
   bool operator==(const DoneEvent &) const = default;
 };

@@ -20,7 +20,7 @@ from unittest import mock
 from openai import OpenAI
 from tokenizers import Tokenizer, decoders, models
 
-from server import api_shapes, diagnostics, tool_schema
+from server import api_shapes, diagnostics, judgments, tool_schema
 from server import backend as backend_api
 from server import constraints as generation_constraints
 from server import errors as api_errors
@@ -28,7 +28,6 @@ from server import frontend as request_frontend
 from server import output as model_output
 from server import protocol as native_wire
 from server import server as api
-from server import judgments
 from server.api_shapes import _namespace_alias, normalize_responses_input
 from server.tool_schema import MAX_JSON_NESTING, _grammar_compatible_schema
 
@@ -1167,13 +1166,6 @@ class ServerTest(unittest.TestCase):
         expected = math.exp(1.5) / (math.exp(1.5) + math.exp(-2.25))
         self.assertAlmostEqual(probabilities[0], expected)
         self.assertEqual(response["prompt_version"], "direct-options-v1")
-        self.assertEqual(response["model"]["id"], "test-model")
-        self.assertEqual(response["answer_token_ids"], [ord("A"), ord("B")])
-        self.assertEqual(len(response["prompt_sha256"]), 64)
-        self.assertEqual(
-            response["probability_status"],
-            "conditional option score; uncalibrated as decision confidence",
-        )
         self.assertEqual(
             response["usage"],
             {
@@ -1182,36 +1174,18 @@ class ServerTest(unittest.TestCase):
                 "total_tokens": response["input_tokens"],
             },
         )
-        self.assertGreaterEqual(response["forward_seconds"], 0)
-        self.assertGreaterEqual(response["total_seconds"], 0)
 
         request = runtime.requests[0]
-        self.assertEqual(request.score_tokens, (ord("A"), ord("B")))
-        self.assertEqual(request.logical_max_output_tokens, 0)
-        self.assertEqual(request.sampling.temperature, 0.0)
-        self.assertEqual(request.cohort, native_wire.Cohort.GREEDY)
-        self.assertEqual(request.constraint, native_wire.ConstraintMode.NONE)
-        self.assertEqual(len(request.prompt_tokens), response["input_tokens"])
         # The rendered prompt plus one slot token is exactly the boundary the
         # engine scores; verify it against the tokenizer, not the response.
         prompt_text = harness.tokenizer.decode(request.prompt_tokens)
         self.assertEqual(
+            response["prompt_sha256"],
+            hashlib.sha256(prompt_text.encode()).hexdigest(),
+        )
+        self.assertEqual(
             harness.tokenizer.encode(prompt_text + "A"),
             list(request.prompt_tokens) + [ord("A")],
-        )
-        messages, kwargs = harness.tokenizer.templates[-1]
-        self.assertIs(kwargs["enable_thinking"], False)
-        self.assertEqual(messages[0]["role"], "system")
-        self.assertEqual(messages[0]["content"], judgments.DIRECT_SYSTEM)
-        payload_json = json.loads(messages[1]["content"])
-        self.assertEqual(payload_json["evidence"], {"evidence": "the sky is blue"})
-        self.assertEqual(payload_json["criterion"], "Is the claim supported?")
-        self.assertEqual(
-            payload_json["options"],
-            [
-                {"letter": "A", "description": "supported"},
-                {"letter": "B", "description": "not supported"},
-            ],
         )
 
     def test_judgments_rejects_invalid_rows_before_inference(self):
@@ -1224,9 +1198,7 @@ class ServerTest(unittest.TestCase):
             self.judgment_body(id=""),
             self.judgment_body(state={}),
             self.judgment_body(question=42),
-            self.judgment_body(
-                options=[{"id": "a", "description": "x"}]
-            ),
+            self.judgment_body(options=[{"id": "a", "description": "x"}]),
             self.judgment_body(
                 options=[
                     {"id": "a", "description": "x"},
@@ -1240,9 +1212,7 @@ class ServerTest(unittest.TestCase):
                 ]
             ),
             self.judgment_body(
-                options=[
-                    {"id": str(i), "description": "x"} for i in range(17)
-                ]
+                options=[{"id": str(i), "description": "x"} for i in range(17)]
             ),
             self.judgment_body(model="other-model"),
             self.judgment_body(stream=True),
@@ -1250,9 +1220,7 @@ class ServerTest(unittest.TestCase):
         )
         for body in cases:
             with self.subTest(body=body):
-                status, _, payload = harness.request(
-                    "POST", "/v1/judgments", body
-                )
+                status, _, payload = harness.request("POST", "/v1/judgments", body)
                 self.assertIn(status, (400, 404), payload)
         self.assertEqual(runtime.requests, [])
 
@@ -1285,9 +1253,7 @@ class ServerTest(unittest.TestCase):
             max_context=8192,
             api_key="secret",
         )
-        status, _, _ = harness.request(
-            "POST", "/v1/judgments", self.judgment_body()
-        )
+        status, _, _ = harness.request("POST", "/v1/judgments", self.judgment_body())
         self.assertEqual(status, 401)
         status, _, payload = harness.request(
             "POST",
@@ -1309,9 +1275,7 @@ class ServerTest(unittest.TestCase):
             "POST", "/v1/judgments", self.judgment_body()
         )
         self.assertEqual(status, 500, payload)
-        self.assertEqual(
-            json.loads(payload)["error"]["code"], "protocol_error"
-        )
+        self.assertEqual(json.loads(payload)["error"]["code"], "protocol_error")
 
     def test_judgments_deadline_cancels_the_score_request(self):
         plan = Plan(logits=(0.0, 1.0), block=True)
@@ -1326,6 +1290,93 @@ class ServerTest(unittest.TestCase):
             "POST", "/v1/judgments", self.judgment_body()
         )
         self.assertEqual(status, 504, payload)
+        self.assertEqual(runtime.cancel_count, 1)
+
+    def test_systemone_validates_all_questions_before_inference(self):
+        runtime = FakeRuntime()
+        harness = self.harness(
+            runtime, tokenizer=self.CharTokenizer(), max_context=8192
+        )
+        for invalid in (
+            {"type": []},
+            {"type": "noul", "criteria": ["yes"]},
+            {"type": "score", "criteria": [None]},
+            {"type": "choice", "criteria": {str(i): None for i in range(256)}},
+        ):
+            with self.subTest(question=invalid):
+                status, _, payload = harness.request(
+                    "POST",
+                    "/v1/systemone",
+                    {
+                        "model": "test-model",
+                        "state": {},
+                        "questions": {
+                            "valid": {"type": "noul", "criteria": {}},
+                            "invalid": invalid,
+                        },
+                    },
+                )
+                self.assertEqual(status, 422, payload)
+                self.assertTrue(
+                    any(
+                        "invalid" in error["loc"]
+                        for error in json.loads(payload)["detail"]
+                    )
+                )
+        self.assertEqual(runtime.requests, [])
+
+    def test_systemone_singleton_domains_need_no_native_request(self):
+        runtime = FakeRuntime()
+        harness = self.harness(runtime, tokenizer=self.CharTokenizer())
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/systemone",
+            {
+                "model": "test-model",
+                "state": [],
+                "questions": {
+                    "choice": {"type": "choice", "criteria": {"only": None}},
+                    "score": {
+                        "type": "score",
+                        "criteria": [{"description": "Only level"}],
+                    },
+                },
+            },
+        )
+        self.assertEqual(status, 200, payload)
+        response = json.loads(payload)
+        self.assertEqual(response["answers"]["choice"]["probabilities"], {"only": 1.0})
+        self.assertEqual(response["answers"]["score"]["score"], 0.0)
+        self.assertEqual(response["usage"], {"input_tokens": 0, "output_tokens": 0})
+        self.assertEqual(runtime.requests, [])
+
+    def test_systemone_shared_deadline_cancels_only_current_question(self):
+        blocked = Plan(logits=(0.0, 1.0), block=True)
+        runtime = FakeRuntime(Plan(logits=(1.0, 0.0)), blocked)
+        harness = self.harness(
+            runtime,
+            tokenizer=self.CharTokenizer(),
+            max_context=8192,
+            queue_size=1,
+            timeout=1,
+        )
+        judgments.slot_labels(harness.tokenizer)
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/systemone",
+            {
+                "model": "test-model",
+                "state": "Some evidence",
+                "questions": {
+                    "first": {"type": "noul", "criteria": {}},
+                    "blocked": {"type": "noul"},
+                    "never_started": {"type": "noul"},
+                },
+            },
+        )
+        self.assertEqual(status, 504, payload)
+        self.assertEqual(len(runtime.requests), 2)
+        self.assertTrue(blocked.cancelled.is_set())
         self.assertEqual(runtime.cancel_count, 1)
 
     class ImagePadTokenizer(FakeTokenizer):

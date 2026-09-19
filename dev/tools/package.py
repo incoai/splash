@@ -35,6 +35,7 @@ SERVER_FILES = (
     "constraints.py",
     "output.py",
     "frontend.py",
+    "judgments.py",
     "diagnostics.py",
     "api_shapes.py",
     "tool_schema.py",

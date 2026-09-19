@@ -18,11 +18,11 @@ FRAME_HEADER_BYTES = 24
 STATUS_SCHEMA_VERSION = 5
 # Largest top-k the native sampler keeps as candidates.
 MAX_TOP_K = 32
-# Score-only requests carry 2..16 distinct option token ids and produce no
+# Score-only requests carry 2..255 distinct option token ids and produce no
 # generated tokens; a successful score DoneEvent returns one raw
 # final-position logit per requested token, in request order.
 MIN_SCORE_TOKENS = 2
-MAX_SCORE_TOKENS = 16
+MAX_SCORE_TOKENS = 255
 ABSOLUTE_MAX_FRAME_PAYLOAD_BYTES = 256 * 1024 * 1024
 
 _MAGIC = b"SPLH"
@@ -588,6 +588,7 @@ def _unpack_prefix_words(payload: bytes, offset: int, count: int) -> tuple[int, 
     words = array.array("I")
     words.frombytes(payload[offset : offset + byte_count])
     return tuple(words)
+
 
 def _pack_floats(values: tuple[float, ...]) -> bytes:
     if not values:
