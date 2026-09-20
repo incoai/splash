@@ -45,7 +45,10 @@ class DocumentBudget:
     def charge(self, size):
         self.remaining_time()
         if size > self.remaining_bytes:
-            raise APIError(400, "documents exceed the request size limit")
+            raise APIError(
+                400,
+                "PDF sources and rendered pages exceed the shared request size limit",
+            )
         self.remaining_bytes -= size
 
     def charge_pages(self, count):
@@ -70,6 +73,7 @@ class RenderLimits:
     page_pixels: int
     text_characters: int
     rendered_bytes: int
+    request_bytes: int = MAX_REQUEST_DOCUMENT_BYTES
 
 
 def _render_limits():
@@ -94,7 +98,7 @@ def _render(payload, budget):
     limits = replace(
         limits,
         pages=min(limits.pages, budget.remaining_pages),
-        rendered_bytes=min(limits.rendered_bytes, budget.remaining_bytes),
+        request_bytes=budget.remaining_bytes,
     )
     values = render(payload, asdict(limits), budget.remaining_time())
     pages = tuple(Page(**value) for value in values)
@@ -154,9 +158,9 @@ def render_pages(payload, budget, limits=None):
                     ).decode("ascii")
                     prepared = Page(f"PDF page {index + 1}:\n{text}\n", image_url)
                     total_bytes += prepared.size
+                    budget.charge(prepared.size)
                     if total_bytes > limits.rendered_bytes:
                         raise APIError(400, "rendered PDF exceeds the size limit")
-                    budget.charge(prepared.size)
                     pages.append(prepared)
             return tuple(pages)
     except APIError:

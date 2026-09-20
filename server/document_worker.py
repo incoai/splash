@@ -167,7 +167,9 @@ def main():
         resource.setrlimit(resource.RLIMIT_AS, (MAX_MEMORY_BYTES, MAX_MEMORY_BYTES))
     # On macOS RLIMIT_AS aliases the advisory RSS limit. The parent instead
     # measures resident/physical footprint and terminates an over-budget child.
-    budget = DocumentBudget(deadline=time.monotonic() + duration)
+    budget = DocumentBudget(
+        deadline=time.monotonic() + duration, remaining_bytes=limits.request_bytes
+    )
     try:
         payload = sys.stdin.buffer.read(MAX_PDF_BYTES + 1)
         if len(payload) > MAX_PDF_BYTES:

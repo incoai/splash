@@ -291,6 +291,30 @@ class DocumentTests(unittest.TestCase):
             self.assertEqual(render.call_count, 1 if keep_cache else 2)
             self.assertEqual(budget.remaining_bytes, size - 1)
 
+    def test_shared_budget_error_matches_on_cold_and_cached_pdf(self):
+        payload = pdf_bytes()
+        block = document_block(payload)
+        for cached in (False, True):
+            for remaining in (len(payload), len(payload) + 1):
+                with self.subTest(cached=cached, remaining=remaining):
+                    self.setUp()
+                    if cached:
+                        documents.document_content(block)
+                    with self.assertRaises(APIError) as raised:
+                        documents.document_content(
+                            block,
+                            budget=documents.DocumentBudget(remaining_bytes=remaining),
+                        )
+                    self.assertEqual(raised.exception.status, 400)
+                    self.assertEqual(
+                        raised.exception.message,
+                        "PDF sources and rendered pages exceed the shared request size limit",
+                    )
+                    self.assertEqual(bool(documents._cache), cached)
+                    self.assertIn(
+                        "ALPHA 42", documents.document_content(block)[0]["text"]
+                    )
+
     def test_waiting_for_renderer_expires_without_decoding_more_pdf_bytes(self):
         block = document_block()
         with (
