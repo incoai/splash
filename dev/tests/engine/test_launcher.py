@@ -91,6 +91,63 @@ class LauncherTests(unittest.TestCase):
                             ["serve", "--model", MODEL_ID, f"{flag}={value}"]
                         )
 
+    def test_host_controls_probe_and_server_independently_of_allowed_host(self):
+        for host in (None, "0.0.0.0", "192.0.2.10", "localhost"):
+            with (
+                self.subTest(host=host),
+                tempfile.TemporaryDirectory() as temporary,
+                mock.patch.object(launcher, "RUNTIME_DIR", Path(temporary)),
+                mock.patch.object(launcher.socket, "socket") as factory,
+                mock.patch.object(launcher, "_ensure_installed"),
+                mock.patch.object(launcher.catalog, "spawn_refresh"),
+                mock.patch.object(launcher.os, "execve") as execute,
+            ):
+                arguments = [
+                    "serve",
+                    "--model",
+                    MODEL_ID,
+                    "--port",
+                    "9123",
+                    "--allowed-host",
+                    "proxy.example",
+                ]
+                if host is not None:
+                    arguments.extend(["--host", host])
+                launcher.main(arguments)
+                expected = host or "127.0.0.1"
+                factory.return_value.__enter__.return_value.bind.assert_called_once_with(
+                    (expected, 9123)
+                )
+                argv = execute.call_args.args[1]
+                self.assertEqual(argv[argv.index("--host") + 1], expected)
+                self.assertEqual(
+                    argv[argv.index("--allowed-host") + 1], "proxy.example"
+                )
+
+    def test_invalid_bind_address_fails_before_model_work(self):
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.object(launcher, "RUNTIME_DIR", Path(temporary)),
+            mock.patch.object(launcher, "_ensure_installed") as install,
+            mock.patch.object(launcher.os, "execve") as execute,
+            mock.patch("sys.stderr", io.StringIO()) as error,
+        ):
+            self.assertEqual(
+                launcher.main(
+                    [
+                        "serve",
+                        "--model",
+                        MODEL_ID,
+                        "--host",
+                        "http://127.0.0.1",
+                    ]
+                ),
+                1,
+            )
+            self.assertIn("cannot bind http://127.0.0.1:", error.getvalue())
+            install.assert_not_called()
+            execute.assert_not_called()
+
     def test_foreground_exec_preserves_terminal_and_holds_lock(self):
         with tempfile.TemporaryDirectory() as temporary:
             runtime = Path(temporary)
@@ -291,37 +348,49 @@ class LauncherTests(unittest.TestCase):
                 install.assert_not_called()
 
     def test_real_port_probe_allows_time_wait_but_rejects_live_listener(self):
-        for closed in (False, True):
+        for host, closed in (
+            ("127.0.0.1", False),
+            ("127.0.0.1", True),
+            ("0.0.0.0", False),
+            ("0.0.0.0", True),
+        ):
             with (
-                self.subTest(closed=closed),
+                self.subTest(host=host, closed=closed),
                 tempfile.TemporaryDirectory() as temporary,
                 socket.socket() as listener,
-                socket.socket() as probe,
             ):
                 listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 listener.settimeout(2)
-                listener.bind(("127.0.0.1", 0))
-                address = listener.getsockname()
+                listener.bind((host, 0))
+                port = listener.getsockname()[1]
                 listener.listen()
                 if closed:
-                    with socket.create_connection(address, timeout=2) as client:
+                    with socket.create_connection(
+                        ("127.0.0.1", port), timeout=2
+                    ) as client:
                         connection, _ = listener.accept()
                         connection.close()
                         self.assertEqual(client.recv(1), b"")
                     listener.close()
                 # Exercise the production probe against a real ephemeral port,
                 # without interfering with a user's server on port 8000.
-                mapped_probe = mock.Mock(wraps=probe)
-                mapped_probe.bind.side_effect = lambda _: probe.bind(address)
                 with (
                     mock.patch.object(launcher, "RUNTIME_DIR", Path(temporary)),
-                    mock.patch.object(launcher.socket, "socket") as factory,
                     mock.patch.object(launcher, "_ensure_installed") as install,
                     mock.patch.object(launcher.os, "execve") as execute,
                     mock.patch("sys.stderr", io.StringIO()),
                 ):
-                    factory.return_value.__enter__.return_value = mapped_probe
-                    result = launcher.main(["serve", "--model", MODEL_ID])
+                    result = launcher.main(
+                        [
+                            "serve",
+                            "--model",
+                            MODEL_ID,
+                            "--host",
+                            host,
+                            "--port",
+                            str(port),
+                        ]
+                    )
                 if closed:
                     self.assertIsNone(result)
                     install.assert_called_once()

@@ -520,6 +520,8 @@ class Harness:
         api_key=None,
         webui=True,
         max_request_bytes=api.DEFAULT_MAX_REQUEST_BYTES,
+        host="127.0.0.1",
+        allowed_hosts=(),
     ):
         self.tokenizer = tokenizer or FakeTokenizer()
         runtime.pending_limit = queue_size
@@ -538,13 +540,14 @@ class Harness:
             thinking_codec=thinking_codec,
         )
         self.server = api.FrontendServer(
-            ("127.0.0.1", 0),
+            (host, 0),
             self.app,
             io_timeout,
             request_capacity=queue_size,
             api_key=api_key,
             webui=webui,
             max_request_bytes=max_request_bytes,
+            allowed_hosts=allowed_hosts,
         )
         self.thread = threading.Thread(target=self.server.serve_forever)
         self.thread.start()

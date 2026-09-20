@@ -14,6 +14,34 @@ from server import server
 
 
 class ServerAccessTests(unittest.TestCase):
+    def test_wildcard_listener_keeps_host_and_api_key_validation(self):
+        harness = self.harness(
+            host="0.0.0.0", allowed_hosts=("splash.local",), api_key="test-server-key"
+        )
+        self.assertEqual(harness.server.server_address[0], "0.0.0.0")
+        port = harness.server.server_address[1]
+        for host, key, expected in (
+            (f"127.0.0.1:{port}", "test-server-key", 200),
+            (f"127.0.0.1:{port}", "wrong", 401),
+            (f"splash.local:{port}", "test-server-key", 200),
+            (f"unknown.example:{port}", "test-server-key", 403),
+        ):
+            with self.subTest(host=host, expected=expected):
+                connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+                try:
+                    connection.request(
+                        "GET",
+                        "/v1/models",
+                        headers={
+                            "Host": host,
+                            "Authorization": f"Bearer {key}",
+                        },
+                    )
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, expected, response.read())
+                finally:
+                    connection.close()
+
     def test_authenticated_streams_and_disconnect_cleanup(self):
         paths = (
             (

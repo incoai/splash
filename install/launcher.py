@@ -150,10 +150,10 @@ def serve(args):
             # not block a restart; a live listener still owns the address.
             probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
-                probe.bind(("127.0.0.1", args.port))
-            except OSError:
+                probe.bind((args.host, args.port))
+            except OSError as error:
                 raise LauncherError(
-                    f"127.0.0.1:{args.port} is in use; stop that service first"
+                    f"cannot bind {args.host}:{args.port}: {error}"
                 ) from None
         _ensure_installed(args.model)
         root = model_artifacts.installed_root(paths.MODELS, args.model)
@@ -169,6 +169,8 @@ def serve(args):
             args.model,
             "--binary",
             str(paths.BINARY),
+            "--host",
+            args.host,
             "--port",
             str(args.port),
             "--max-memory",
@@ -325,10 +327,15 @@ def parse_args(argv=None):
     commands = parser.add_subparsers(dest="command", required=True)
     server = commands.add_parser("serve", help="run the local server; Ctrl+C stops it")
     server.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="HTTP bind address (default: 127.0.0.1; 0.0.0.0 for all IPv4 interfaces)",
+    )
+    server.add_argument(
         "--port",
         type=_parse_port,
         default=os.environ.get("SPLASH_PORT", str(PORT)),
-        help="local HTTP port (default: SPLASH_PORT or 8000)",
+        help="HTTP port (default: SPLASH_PORT or 8000)",
     )
     server.add_argument(
         "--model",
@@ -352,7 +359,8 @@ def parse_args(argv=None):
         action="append",
         default=[],
         metavar="HOST",
-        help="additional HTTP Host name to accept (repeatable)",
+        help="additional HTTP Host name to accept; does not change the bind address "
+        "(repeatable)",
     )
     server.add_argument(
         "--max-request-size",

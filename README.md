@@ -104,14 +104,19 @@ depends on available memory.
 
 `splash serve` accepts these optional flags:
 
-- `--port`: local HTTP port. Defaults to `SPLASH_PORT` or `8000`.
+- `--host`: bind address. Default: `127.0.0.1`; use `0.0.0.0` for LAN access.
+- `--port`: HTTP port. Defaults to `SPLASH_PORT` or `8000`.
 - `--max-memory`: ceiling on Metal allocations, e.g. `28G`. Default: auto.
 - `--max-context`: context limit, up to `256K`, e.g. `100K`. Default: auto.
 - `--max-image-pixels`: maximum resized pixels per image. Default: 4,194,304.
-- `--allowed-host`: extra HTTP `Host` name to accept, for a proxy. Repeatable.
+- `--allowed-host`: extra HTTP `Host` name to accept, for a proxy. Does not change
+  the bind address. Repeatable.
 - `--api-key`: require this key on API requests, as a bearer token or
   `x-api-key`. Defaults to `SPLASH_API_KEY`.
 - `--no-webui`: turn off the chat page.
+
+For LAN access, use `--host 0.0.0.0 --api-key YOUR_KEY` and connect to the
+server's LAN IP.
 
 Set `SPLASH_PORT` in both the server and agent shells to use another port.
 Separate ports allow separate servers; their memory limits are independent.
