@@ -31,8 +31,16 @@ class LauncherError(RuntimeError):
     pass
 
 
-def _request_json(path, timeout=2):
-    request = urllib.request.Request(BASE_URL + path)
+def _base_url(port):
+    return f"http://127.0.0.1:{port}"
+
+
+def _runtime_dir(port):
+    return RUNTIME_DIR if port == PORT else RUNTIME_DIR / "ports" / str(port)
+
+
+def _request_json(path, timeout=2, *, port=PORT):
+    request = urllib.request.Request(_base_url(port) + path)
     if key := os.environ.get("SPLASH_API_KEY"):
         request.add_header("Authorization", f"Bearer {key}")
     try:
@@ -54,8 +62,8 @@ def _request_json(path, timeout=2):
         return None
 
 
-def _running_status():
-    status = _request_json("/status", timeout=10)
+def _running_status(port=PORT):
+    status = _request_json("/status", timeout=10, port=port)
     if not isinstance(status, dict):
         return None
     return status
@@ -63,12 +71,17 @@ def _running_status():
 
 def _ensure_installed(model_id):
     if not paths.PACKAGED:
-        for command in (
-            ["make", "platform-check", "install-environment"],
-            ["make", "-j4", "all"],
-        ):
-            if subprocess.run(command, cwd=ROOT).returncode:
-                raise LauncherError("source build failed; see the output above")
+        # Different ports still build the same source tree.
+        with (RUNTIME_DIR / "build.lock").open("a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            for command in (
+                ["make", "platform-check", "install-environment"],
+                ["make", "-j4", "all"],
+            ):
+                if subprocess.run(
+                    command, cwd=ROOT, pass_fds=(lock.fileno(),)
+                ).returncode:
+                    raise LauncherError("source build failed; see the output above")
     command = [
         str(paths.PYTHON),
         str(ROOT / "install/models.py"),
@@ -105,10 +118,20 @@ def _serve_lock_owner(lock):
 
 
 def serve(args):
-    # Keep this descriptor across exec: the foreground server owns the lock
-    # until it exits.
+    # Keep both locks across exec until the foreground server exits.
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-    with (RUNTIME_DIR / "serve.lock").open("a+") as lock:
+    with (
+        (RUNTIME_DIR / "serve.lock").open("a+") as installation,
+        (RUNTIME_DIR / f"serve-{args.port}.lock").open("a+") as lock,
+    ):
+        # Servers share the installation; upgrades require exclusive access.
+        try:
+            fcntl.flock(installation, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise LauncherError(
+                "Splash installation is busy; "
+                "stop the running server or wait for the upgrade to finish"
+            ) from None
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -118,19 +141,19 @@ def serve(args):
             ) from None
         lock.seek(0)
         lock.truncate()
-        json.dump({"pid": os.getpid(), "model": args.model, "port": PORT}, lock)
+        json.dump({"pid": os.getpid(), "model": args.model, "port": args.port}, lock)
         lock.flush()
-        # Fail before downloads/builds if another service owns the default port.
+        # Fail before downloads/builds if another service owns the selected port.
         # The HTTP server also binds before loading weights, closing the race.
         with socket.socket() as probe:
             # Match the HTTP listener: closed connections in TIME_WAIT must
             # not block a restart; a live listener still owns the address.
             probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
-                probe.bind(("127.0.0.1", PORT))
+                probe.bind(("127.0.0.1", args.port))
             except OSError:
                 raise LauncherError(
-                    f"127.0.0.1:{PORT} is in use; stop that service first"
+                    f"127.0.0.1:{args.port} is in use; stop that service first"
                 ) from None
         _ensure_installed(args.model)
         root = model_artifacts.installed_root(paths.MODELS, args.model)
@@ -146,6 +169,8 @@ def serve(args):
             args.model,
             "--binary",
             str(paths.BINARY),
+            "--port",
+            str(args.port),
             "--max-memory",
             "auto" if args.max_memory is None else str(args.max_memory),
             "--max-context",
@@ -165,19 +190,21 @@ def serve(args):
         # Detached, because execve replaces this process a line later and a
         # thread would not survive it. Failure is silent by design.
         catalog.spawn_refresh()
+        os.set_inheritable(installation.fileno(), True)
         os.set_inheritable(lock.fileno(), True)
         os.execve(command[0], command, environment)
 
 
 def coding_client(args):
     path = clients.find_executable(args.command)
-    snapshot = _running_status()
+    snapshot = _running_status(args.port)
     if snapshot is None:
         raise LauncherError(
-            "No ready Splash server. Run 'splash serve --model <HF_REPO_ID>' "
+            f"No ready Splash server at {_base_url(args.port)}. "
+            "Run 'splash serve --model <HF_REPO_ID>' "
             "in another terminal first."
         )
-    catalog = _request_json("/v1/models")
+    catalog = _request_json("/v1/models", port=args.port)
     models = catalog.get("data", []) if isinstance(catalog, dict) else []
     if (
         not isinstance(models, list)
@@ -194,10 +221,10 @@ def coding_client(args):
     command, environment = clients.command(
         args.command,
         path,
-        BASE_URL,
+        _base_url(args.port),
         model,
         context,
-        RUNTIME_DIR,
+        _runtime_dir(args.port),
         client_args=args.client_args,
     )
     print(f"Starting {args.command}: {model} · {context:,} context tokens", flush=True)
@@ -214,6 +241,18 @@ def coding_client(args):
             flush=True,
         )
     os.execvpe(path, command, environment)
+
+
+def _parse_port(value):
+    try:
+        port = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            "port must be an integer from 1 to 65535"
+        ) from None
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("port must be between 1 and 65535")
+    return port
 
 
 def _parse_max_memory(value):
@@ -277,6 +316,12 @@ def parse_args(argv=None):
     commands = parser.add_subparsers(dest="command", required=True)
     server = commands.add_parser("serve", help="run the local server; Ctrl+C stops it")
     server.add_argument(
+        "--port",
+        type=_parse_port,
+        default=os.environ.get("SPLASH_PORT", str(PORT)),
+        help="local HTTP port (default: SPLASH_PORT or 8000)",
+    )
+    server.add_argument(
         "--model",
         type=model_artifacts.parse_repo_id,
         required=True,
@@ -312,6 +357,11 @@ def parse_args(argv=None):
     for name in clients.INSTALL_URLS:
         commands.add_parser(name, help=f"connect {name} to the running server")
     args = parser.parse_args(argv)
+    if args.command in clients.INSTALL_URLS:
+        try:
+            args.port = _parse_port(os.environ.get("SPLASH_PORT", str(PORT)))
+        except argparse.ArgumentTypeError as error:
+            parser.error(f"SPLASH_PORT: {error}")
     if args.command == "serve" and args.api_key is not None:
         if not args.api_key or any(ord(c) <= 32 or ord(c) >= 127 for c in args.api_key):
             parser.error("API key must contain only visible ASCII characters")

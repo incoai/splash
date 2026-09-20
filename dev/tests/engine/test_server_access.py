@@ -209,13 +209,12 @@ class ServerAccessTests(unittest.TestCase):
 
     def test_launcher_uses_key_and_reports_auth_failure(self):
         harness = self.harness(api_key="test-server-key")
-        base = "http://%s:%s" % harness.server.server_address
-        with mock.patch.object(launcher, "BASE_URL", base):
-            with mock.patch.dict(os.environ, {"SPLASH_API_KEY": "test-server-key"}):
-                self.assertIn("data", launcher._request_json("/v1/models"))
-            with mock.patch.dict(os.environ, {"SPLASH_API_KEY": "incorrect"}):
-                with self.assertRaisesRegex(launcher.LauncherError, "SPLASH_API_KEY"):
-                    launcher._request_json("/v1/models")
+        port = harness.server.server_port
+        with mock.patch.dict(os.environ, {"SPLASH_API_KEY": "test-server-key"}):
+            self.assertIn("data", launcher._request_json("/v1/models", port=port))
+        with mock.patch.dict(os.environ, {"SPLASH_API_KEY": "incorrect"}):
+            with self.assertRaisesRegex(launcher.LauncherError, "SPLASH_API_KEY"):
+                launcher._request_json("/v1/models", port=port)
 
     def test_unauthenticated_request_has_bearer_challenge(self):
         harness = self.harness(api_key="test-server-key")

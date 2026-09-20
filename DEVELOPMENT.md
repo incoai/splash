@@ -98,8 +98,24 @@ recovery; they are not a time estimate. Chat uses empty-delta chunks, Responses
 uses `response.in_progress`, and Messages uses `ping`. Queueing and prompt
 preparation do not advance this counter. Non-streaming requests cannot enable it.
 
-`/status` identifies the instance and effective context limit; `/metrics` exposes
-memory and request counters. HTTP bodies require Content-Length, and browser
+`GET /status` returns instance identity and the effective context limit as JSON.
+Proxy consumers can use these fields; additional fields may be added:
+
+| Field | Meaning |
+| --- | --- |
+| `requests.submitted`, `completed`, `cancelled`, `failed` | Native request counters since engine start |
+| `memory_actual.current_bytes`, `peak_bytes` | Metal allocations, not process RSS |
+| `metrics.decode_tokens_per_second` | Aggregate native decode throughput, not a request's end-to-end rate |
+| `maximum_context_tokens` | Declared context limit; available memory may limit admission |
+
+`GET /metrics` exposes the same counters in Prometheus text format. Both endpoints
+require the API key when authentication is enabled. Consumers should tolerate
+missing native fields while the engine is unavailable, and counter resets after
+an engine restart. Chat streams include token usage when the request sets
+`"stream_options":{"include_usage":true}`; non-streaming Chat responses always
+include usage. A proxy must consume these fields to display statistics.
+
+HTTP bodies require Content-Length, and browser
 Origin must match Host. `--allowed-host` permits additional hostnames. Request
 logs omit bodies; full crash traces require explicit `SPLASH_CRASH_TRACE=1` and
 can contain private conversation data.

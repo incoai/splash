@@ -478,11 +478,14 @@ class InstallerTests(unittest.TestCase):
         with lock_path.open("a+") as lock:
             lock.write('{"pid":123,"model":"test/model","port":8000}')
             lock.flush()
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            blocked = self.install()
-            self.assertKeepsFirstVersion(blocked, command)
-            self.assertIn("stop the running Splash server", blocked.stderr)
-            self.assertEqual(self.installed(), ["splash-1.0-arm64-macos26"])
+            for mode in (fcntl.LOCK_EX, fcntl.LOCK_SH):
+                with self.subTest(lock_mode=mode):
+                    fcntl.flock(lock, mode | fcntl.LOCK_NB)
+                    blocked = self.install()
+                    self.assertKeepsFirstVersion(blocked, command)
+                    self.assertIn("stop the running Splash server", blocked.stderr)
+                    self.assertEqual(self.installed(), ["splash-1.0-arm64-macos26"])
+                    fcntl.flock(lock, fcntl.LOCK_UN)
         self.assertEqual(self.install().returncode, 0)
         self.assertEqual(self.current(), "splash-2.0-arm64-macos26")
 

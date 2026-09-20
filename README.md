@@ -69,14 +69,23 @@ Transformers checkpoints do not work. Private repositories need `HF_TOKEN`.
 Packages download into the Hugging Face cache, and `brew upgrade splash` keeps
 them, along with model links and agent sessions.
 
+To download new models to another disk, set `HF_HUB_CACHE` before the first run:
+
+```bash
+HF_HUB_CACHE=/Volumes/Models/huggingface splash serve --model incoai/Qwen3.8-27B-Splash
+```
+
+This does not move models already installed.
+
 ## Settings
 
-There is no config file. The server binds `127.0.0.1:8000`, one server at a
-time. Context supports up to the model’s native 256K window; usable capacity
+There is no config file. The server binds `127.0.0.1:8000` by default.
+Context supports up to the model’s native 256K window; usable capacity
 depends on available memory.
 
 `splash serve` accepts these optional flags:
 
+- `--port`: local HTTP port. Defaults to `SPLASH_PORT` or `8000`.
 - `--max-memory`: ceiling on Metal allocations, e.g. `28G`. Default: auto.
 - `--max-context`: context limit, up to `256K`, e.g. `100K`. Default: auto.
 - `--max-image-pixels`: maximum resized pixels per image. Default: 4,194,304.
@@ -84,6 +93,9 @@ depends on available memory.
 - `--api-key`: require this key on API requests, as a bearer token or
   `x-api-key`. Defaults to `SPLASH_API_KEY`.
 - `--no-webui`: turn off the chat page.
+
+Set `SPLASH_PORT` in both the server and agent shells to use another port.
+Separate ports allow separate servers; their memory limits are independent.
 
 If the model does not fit in the memory available, startup prints a memory
 budget breakdown and stops.

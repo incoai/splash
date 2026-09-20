@@ -6,6 +6,8 @@ import io
 import json
 import shutil
 import struct
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -366,6 +368,49 @@ class ModelArtifactTest(unittest.TestCase):
             ],
             **common,
         )
+
+    def test_custom_hub_cache_installs_offline_without_copying_weights(self):
+        for variable in ("HF_HOME", "HF_HUB_CACHE"):
+            with self.subTest(variable=variable):
+                snapshot, _ = self.package_fixture()
+                location = self.root / variable / "external disk"
+                cache = location / "hub" if variable == "HF_HOME" else location
+                repository = cache / snapshot.parent.parent.name
+                repository.parent.mkdir(parents=True)
+                shutil.move(str(snapshot.parent.parent), repository)
+                snapshot = repository / "snapshots" / self.REVISION
+                (repository / "refs").mkdir()
+                (repository / "refs/main").write_text(self.REVISION)
+                models = self.root / variable / "installed"
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        str(Path(artifacts.__file__).resolve()),
+                        "--models",
+                        str(models),
+                        "--model",
+                        self.MODEL_ID,
+                        "prepare",
+                    ],
+                    env={
+                        "HOME": str(self.root / "home"),
+                        "HF_HUB_OFFLINE": "1",
+                        variable: str(location),
+                    },
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                installed = models / self.MODEL_ID
+                self.assertTrue(installed.is_symlink())
+                self.assertEqual(installed.resolve(), snapshot.resolve())
+                self.assertTrue(
+                    (installed / "target/embedding.bin").samefile(
+                        snapshot / "target/embedding.bin"
+                    )
+                )
+                self.assertEqual(len(list((repository / "refs/splash").glob("*/*"))), 1)
 
     def test_missing_or_oversize_remote_manifest_fails_before_any_download(self):
         snapshot, _ = self.package_fixture()
