@@ -552,7 +552,8 @@ class NativeBackend:
                     # deadline.
                     request = self._generation_request(job)
             with self.lock:
-                state.call = call
+                if not state.detached:
+                    state.call = call
                 cancel = state.detached or self.closing or job.cancelled.is_set()
             if cancel:
                 call.cancel()

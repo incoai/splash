@@ -86,8 +86,16 @@ def _thinking_from_prefix(rendered):
 
 @dataclass(frozen=True, slots=True)
 class StoredResponse:
-    response: dict
-    history_items: list
+    response_json: bytes
+    history_json: bytes
+
+    @property
+    def size(self):
+        return len(self.response_json) + len(self.history_json)
+
+    @property
+    def response(self):
+        return json.loads(self.response_json)
 
 
 class ResponseStore:
@@ -116,31 +124,27 @@ class ResponseStore:
                 return None
             self.records[response_id] = record
             self.hits += 1
-        payload, _ = record
-        decoded = json.loads(payload)
-        return StoredResponse(decoded["response"], decoded["history"])
+        return record
 
     def put(self, response, history_items):
-        payload = json.dumps(
-            {"response": response, "history": history_items},
-            ensure_ascii=False,
-            allow_nan=False,
-            separators=(",", ":"),
-        ).encode()
-        size = len(payload)
-        if size > self.budget_bytes:
+        def encode(value):
+            return json.dumps(
+                value, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+            ).encode()
+
+        record = StoredResponse(encode(response), encode(history_items))
+        if record.size > self.budget_bytes:
             return False
         response_id = response["id"]
-        record = (payload, size)
         with self.lock:
             previous = self.records.pop(response_id, None)
             if previous is not None:
-                self.bytes -= previous[1]
+                self.bytes -= previous.size
             self.records[response_id] = record
-            self.bytes += size
+            self.bytes += record.size
             while self.bytes > self.budget_bytes:
                 _, evicted = self.records.popitem(last=False)
-                self.bytes -= evicted[1]
+                self.bytes -= evicted.size
                 self.evictions += 1
         return True
 
@@ -149,7 +153,7 @@ class ResponseStore:
             record = self.records.pop(response_id, None)
             if record is None:
                 return False
-            self.bytes -= record[1]
+            self.bytes -= record.size
             return True
 
     def stats(self):
@@ -763,22 +767,24 @@ class Frontend:
             not isinstance(previous_id, str) or not previous_id
         ):
             raise APIError(400, "previous_response_id must be a non-empty string")
-        previous = None
-        if previous_id is not None:
-            previous = self.response_store.get(previous_id)
-            if previous is None:
-                raise APIError(404, "response not found", "not_found_error")
-        previous_items = previous.history_items if previous is not None else []
-        chat = responses_to_chat_body(body, previous_items)
-        namespaces = chat.pop("_tool_namespaces")
-        job, thinking, has_tools = self.prepare(chat, namespaces, deadline=deadline)
-        job.response_store = store
-        job.response_previous_id = previous_id
-        job.response_history_items = [
-            *copy.deepcopy(previous_items),
-            *canonical_responses_input(body.get("input")),
-        ]
-        return job, thinking, has_tools
+        with self._preparation(deadline):
+            previous_items = []
+            if previous_id is not None:
+                previous = self.response_store.get(previous_id)
+                if previous is None:
+                    raise APIError(404, "response not found", "not_found_error")
+                previous_items = json.loads(previous.history_json)
+            chat = responses_to_chat_body(body, previous_items)
+            namespaces = chat.pop("_tool_namespaces")
+            job, thinking, has_tools = self._prepare(chat, namespaces, deadline)
+            job.response_store = store
+            job.response_previous_id = previous_id
+            if store:
+                job.response_history_items = [
+                    *previous_items,
+                    *canonical_responses_input(body.get("input")),
+                ]
+            return job, thinking, has_tools
 
     def persist_response(self, job, response, output):
         if not job.response_store:
