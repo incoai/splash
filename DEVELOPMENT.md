@@ -120,6 +120,13 @@ Origin must match Host. `--allowed-host` permits additional hostnames. Request
 logs omit bodies; full crash traces require explicit `SPLASH_CRASH_TRACE=1` and
 can contain private conversation data.
 
+Requests sharing a cold prefix can wait for a resident request's planned recovery
+point, then enter through the ordinary cache restore path. Waiting requests hold
+no active state cell or KV pages and return to ordinary admission when no useful
+producer remains. Late arrivals can extend the plan at complete state boundaries.
+Higher-priority work does not wait for a lower-priority producer. `/status` exposes
+`scheduler.waiting_prefix` separately from resource waits.
+
 Long prefill uses disposable rolling checkpoints every 4096 tokens. Contended
 prefill adapts toward a 500 ms slice, keeping 2048-token chunks for long unopposed
 work. These policies do not extend client deadlines. Memory recovery waits are

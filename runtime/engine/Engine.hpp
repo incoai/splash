@@ -150,9 +150,16 @@ private:
   [[nodiscard]] Request &request(uint64_t requestId);
   [[nodiscard]] bool admitQueued(double nowMilliseconds);
   [[nodiscard]] bool admit(Request &request, double nowMilliseconds);
+  [[nodiscard]] static uint32_t sharedPrefillBoundary(const Request &left,
+                                                      const Request &right);
+  [[nodiscard]] bool pendingSharedPrefill(const Request &request,
+                                          uint32_t resumeBoundary) const;
   [[nodiscard]] DraftContextPlan
   configureDraftStatePlan(Request &request, uint32_t stateBoundary,
                           uint32_t junctionBoundary);
+  [[nodiscard]] bool addSharedPrefillBoundaries(Request &request, uint32_t after);
+  [[nodiscard]] DraftContextPlan
+  pendingDraftStatePlan(const Request &request, uint32_t stateBoundary) const;
   void armNextStateBoundary(Request &request);
   void discardPendingStateBoundaries(Request &request) noexcept;
   [[nodiscard]] bool retireCheckpoint(Request &request);

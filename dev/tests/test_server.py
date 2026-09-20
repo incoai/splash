@@ -955,6 +955,7 @@ class ServerTest(unittest.TestCase):
                     "scheduler": {
                         "queued": 1,
                         "waiting_resources": 3,
+                        "waiting_prefix": 2,
                         "prefilling": 2,
                         "decoding": 1,
                         "waiting_mask": 0,
@@ -1038,6 +1039,7 @@ class ServerTest(unittest.TestCase):
         self.assertIn('splash_memory_pressure{state="normal"} 1', metrics)
         self.assertIn("splash_requests_submitted_total 7", metrics)
         self.assertIn("splash_scheduler_waiting_resources 3", metrics)
+        self.assertIn("splash_scheduler_waiting_prefix 2", metrics)
         self.assertIn("splash_admission_waiting_memory 2", metrics)
         self.assertIn("splash_admission_waiting_concurrency 1", metrics)
         self.assertIn("splash_admission_suspended 1", metrics)

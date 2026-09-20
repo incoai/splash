@@ -27,7 +27,8 @@ void Scheduler::submit(RequestSpec request) {
 void Scheduler::resourcesReady(uint64_t id, uint32_t processed) {
   Request &request = get(id);
   if (request.phase != Phase::Queued &&
-      request.phase != Phase::WaitingResources) {
+      request.phase != Phase::WaitingResources &&
+      request.phase != Phase::WaitingPrefix) {
     throw std::logic_error("only queued work can be admitted");
   }
   if (processed > request.spec.promptTokens) {
@@ -71,10 +72,22 @@ void Scheduler::resumeFromResources(uint64_t id, uint32_t processed,
 void Scheduler::waitForResources(uint64_t id) {
   Request &request = get(id);
   if (request.phase != Phase::Queued &&
-      request.phase != Phase::WaitingResources) {
+      request.phase != Phase::WaitingResources &&
+      request.phase != Phase::WaitingPrefix) {
     throw std::logic_error("resident request cannot wait before admission");
   }
   request.phase = Phase::WaitingResources;
+}
+
+void Scheduler::waitForPrefix(uint64_t id) {
+  Request &request = get(id);
+  if (request.suspendedForResources ||
+      (request.phase != Phase::Queued &&
+       request.phase != Phase::WaitingResources &&
+       request.phase != Phase::WaitingPrefix)) {
+    throw std::logic_error("only unstarted requests can wait for a prefix");
+  }
+  request.phase = Phase::WaitingPrefix;
 }
 
 void Scheduler::maskReady(uint64_t id) {
@@ -146,7 +159,8 @@ std::vector<uint64_t> Scheduler::admissionOrder() const {
   ready.reserve(requests_.size());
   for (const auto &[_, request] : requests_) {
     if (request.phase == Phase::Queued ||
-        request.phase == Phase::WaitingResources) {
+        request.phase == Phase::WaitingResources ||
+        request.phase == Phase::WaitingPrefix) {
       ready.push_back(&request);
     }
   }
@@ -421,6 +435,9 @@ SchedulerSnapshot Scheduler::snapshot() const noexcept {
       break;
     case Phase::WaitingResources:
       ++result.waitingResources;
+      break;
+    case Phase::WaitingPrefix:
+      ++result.waitingPrefix;
       break;
     case Phase::Prefill:
       ++result.prefilling;

@@ -71,6 +71,7 @@ void testCleanRuntimeStatus() {
   engine.resourceReplayTokens = 1234;
   engine.deduplicatedStatePublications = 2;
   engine.recycledStatePublications = 1;
+  engine.scheduler.waitingPrefix = 3;
   engine.scheduler.prefillBatches = 4;
   engine.scheduler.prefillRows = 4096;
   engine.scheduler.decodeBatches = 4;
@@ -224,6 +225,7 @@ void testCleanRuntimeStatus() {
   require(
       json.find("\"dynamic_budget_bytes\"") != std::string::npos &&
           json.find("\"resource_replay_tokens\":1234") != std::string::npos &&
+          json.find("\"waiting_prefix\":3") != std::string::npos &&
           json.find("\"deduplicated_state_publications\":2,"
                     "\"recycled_state_publications\":1,") !=
               std::string::npos &&

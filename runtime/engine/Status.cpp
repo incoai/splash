@@ -230,6 +230,7 @@ std::string runtimeStatusJson(
       << "}"
       << ",\"scheduler\":{\"queued\":" << scheduler.queued
       << ",\"waiting_resources\":" << scheduler.waitingResources
+      << ",\"waiting_prefix\":" << scheduler.waitingPrefix
       << ",\"prefilling\":" << scheduler.prefilling
       << ",\"decoding\":" << scheduler.decoding
       << ",\"waiting_mask\":" << scheduler.waitingMask

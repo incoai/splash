@@ -298,6 +298,49 @@ bool Engine::admitQueued(double now) {
   return progressed;
 }
 
+uint32_t Engine::sharedPrefillBoundary(const Request &left,
+                                       const Request &right) {
+  const auto prompt = [](const Request &value) -> std::span<const uint32_t> {
+    return value.exactTokens.empty()
+               ? std::span<const uint32_t>(value.request.prompt)
+               : std::span<const uint32_t>(value.exactTokens)
+                     .first(value.promptTokens);
+  };
+  const auto a = prompt(left);
+  const auto b = prompt(right);
+  const auto end = std::mismatch(a.begin(), a.end(), b.begin(), b.end()).first;
+  uint32_t boundary = std::min<uint32_t>(
+      static_cast<uint32_t>(end - a.begin()),
+      std::min(replayStateBoundary(left.promptTokens),
+               replayStateBoundary(right.promptTokens)));
+  boundary -= boundary % KvCache::pageTokens;
+  if (!left.request.images.empty() || !right.request.images.empty()) {
+    for (uint32_t offset = 0; offset < boundary; offset += KvCache::pageTokens) {
+      if (blockImageIdentity(offset, KvCache::pageTokens, left.request.images) !=
+          blockImageIdentity(offset, KvCache::pageTokens, right.request.images))
+        return offset;
+    }
+  }
+  return boundary;
+}
+
+bool Engine::pendingSharedPrefill(const Request &active,
+                                  uint32_t resumeBoundary) const {
+  for (const auto &[id, peer] : requests_) {
+    if (!peer.stateCell || peer.finalized || peer.failure ||
+        peer.request.priority > active.request.priority ||
+        scheduler_.phase(id) != Phase::Prefill)
+      continue;
+    const uint32_t shared = sharedPrefillBoundary(active, peer);
+    for (size_t i = peer.stateBoundaryCursor; i < peer.stateBoundaries.size(); ++i) {
+      const uint32_t boundary = peer.stateBoundaries[i].tokens;
+      if (boundary > resumeBoundary && boundary <= shared)
+        return true;
+    }
+  }
+  return false;
+}
+
 bool Engine::admit(Request &active, double now) {
   const bool resuming = active.suspended;
   ModelRequest modelRequest = active.request.modelView();
@@ -305,6 +348,13 @@ bool Engine::admit(Request &active, double now) {
     modelRequest.prompt = active.exactTokens;
   CacheLookup lookup =
       cache_.lookup(modelRequest.prompt, active.request.images);
+  // Only unstarted requests wait for a resident producer. Recheck planned
+  // boundaries each step so producer loss leaves no stale dependency or lease.
+  if (!resuming && pendingSharedPrefill(active, lookup.resumeBoundary())) {
+    active.resourceWait = {};
+    scheduler_.waitForPrefix(active.request.id);
+    return false;
+  }
   bool executorStarted = false;
   bool resourcesStarted = false;
   try {
@@ -507,21 +557,55 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
               return left.tokens < right.tokens;
             });
 
+  static_cast<void>(addSharedPrefillBoundaries(active, stateBoundary));
+
   try {
-    std::vector<uint32_t> materializationBoundaries;
-    materializationBoundaries.reserve(active.stateBoundaries.size());
-    for (const auto &boundary : active.stateBoundaries)
-      materializationBoundaries.push_back(boundary.tokens);
-    DraftContextPlan draft = planDraftContext(
-        stateBoundary, active.replayTokens,
-        stateBoundary ? std::optional<uint32_t>(stateBoundary) : std::nullopt,
-        materializationBoundaries);
+    DraftContextPlan draft = pendingDraftStatePlan(active, stateBoundary);
     armNextStateBoundary(active);
     return draft;
   } catch (...) {
     discardPendingStateBoundaries(active);
     throw;
   }
+}
+
+bool Engine::addSharedPrefillBoundaries(Request &active, uint32_t after) {
+  if (active.suspended || active.replaying)
+    return false;
+  bool changed = false;
+  const uint32_t replay = replayStateBoundary(active.replayTokens);
+  for (const auto &[id, peer] : requests_) {
+    if (id == active.request.id || peer.stateCell || peer.suspended ||
+        peer.finalized || peer.failure ||
+        peer.request.priority < active.request.priority)
+      continue;
+    const uint32_t shared = sharedPrefillBoundary(active, peer);
+    if (shared <= after || shared >= replay)
+      continue;
+    auto found = std::lower_bound(
+        active.stateBoundaries.begin(), active.stateBoundaries.end(), shared,
+        [](const auto &point, uint32_t tokens) { return point.tokens < tokens; });
+    if (found == active.stateBoundaries.end() || found->tokens != shared) {
+      active.stateBoundaries.insert(
+          found, {shared, Request::StateBoundary::Purpose::Junction});
+      changed = true;
+    } else if (found->purpose == Request::StateBoundary::Purpose::Checkpoint) {
+      found->purpose = Request::StateBoundary::Purpose::Junction;
+    }
+  }
+  return changed;
+}
+
+DraftContextPlan Engine::pendingDraftStatePlan(const Request &active,
+                                               uint32_t stateBoundary) const {
+  std::vector<uint32_t> boundaries;
+  boundaries.reserve(active.stateBoundaries.size() - active.stateBoundaryCursor);
+  for (size_t i = active.stateBoundaryCursor; i < active.stateBoundaries.size(); ++i)
+    boundaries.push_back(active.stateBoundaries[i].tokens);
+  return planDraftContext(
+      stateBoundary, active.replayTokens,
+      stateBoundary ? std::optional<uint32_t>(stateBoundary) : std::nullopt,
+      boundaries);
 }
 
 void Engine::armNextStateBoundary(Request &active) {
@@ -559,6 +643,7 @@ bool Engine::retireCheckpoint(Request &active) {
 
 void Engine::publishReachedStateBoundaries(Request &active,
                                            uint32_t promptProcessed) {
+  bool materialized = false;
   while (active.stateBoundaryCursor < active.stateBoundaries.size() &&
          active.stateBoundaries[active.stateBoundaryCursor].tokens <=
              promptProcessed) {
@@ -580,6 +665,7 @@ void Engine::publishReachedStateBoundaries(Request &active,
       ++failures;
       continue;
     }
+    materialized = true;
     try {
       const uint64_t block = cache_.blockAt(active.request.id, objective.tokens);
       if (cache_.reuseCompositeState(block, checkpoint)) {
@@ -613,6 +699,11 @@ void Engine::publishReachedStateBoundaries(Request &active,
       ++failures;
     }
   }
+  // Late siblings can extend the remaining plan only where both target and
+  // draft states are complete, never at an arbitrary in-flight chunk boundary.
+  if (materialized && addSharedPrefillBoundaries(active, promptProcessed))
+    model_.setDraftContextPlan(
+        active.request.id, pendingDraftStatePlan(active, promptProcessed));
   if (active.stateBoundaryCursor == active.stateBoundaries.size()) {
     active.stateBoundaries.clear();
     active.stateBoundaryCursor = 0;

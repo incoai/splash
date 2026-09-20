@@ -15,6 +15,7 @@ namespace splash::engine {
 enum class Phase : uint8_t {
   Queued,
   WaitingResources,
+  WaitingPrefix,
   Prefill,
   Decode,
   WaitingMask,
@@ -34,6 +35,7 @@ struct RequestSpec final {
 struct SchedulerSnapshot final {
   uint32_t queued = 0;
   uint32_t waitingResources = 0;
+  uint32_t waitingPrefix = 0;
   uint32_t prefilling = 0;
   uint32_t decoding = 0;
   uint32_t waitingMask = 0;
@@ -54,6 +56,7 @@ class Scheduler final {
 public:
   void submit(RequestSpec request);
   void waitForResources(uint64_t requestId);
+  void waitForPrefix(uint64_t requestId);
   void resourcesReady(uint64_t requestId, uint32_t alreadyProcessed);
   void suspendForResources(uint64_t requestId);
   void resumeFromResources(uint64_t requestId, uint32_t alreadyProcessed,
