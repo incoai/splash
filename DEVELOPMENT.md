@@ -110,12 +110,14 @@ generated text for both streaming and complete responses, and `constraints.py`
 compiles token constraints. `make architecture-check` prevents lower layers from
 importing the HTTP entry module.
 
-Tools can be combined with structured answers. Original schemas validate output
-even when generation cannot enforce every assertion. Tool arguments must declare
-object properties directly; root references, composition, conditionals,
-dependencies, object-wide `enum`/`const`, property-count limits and
-`patternProperties` return 400. Hosted search is unsupported;
-configure client-owned tools such as MCP. Omitted effort uses the model default.
+Tools can be combined with structured answers. Tool argument framing resolves
+local references and projects object fields through schema composition. The
+original schema validates complete arguments, including cross-field conditions,
+dependencies and property-count rules that framing alone cannot enforce. Extra
+properties use JSON-encoded values; statically typed strings retain raw text.
+Remote schema references and parameter names containing XML delimiters are
+unsupported. Hosted search is unsupported; configure client-owned tools such as
+MCP. Omitted effort uses the model default.
 Hidden thinking signatures use a persistent user key; imported encrypted thinking
 preserves visible history without recovering the private reasoning.
 

@@ -4662,6 +4662,37 @@ class ServerTest(unittest.TestCase):
                 json.loads(payload)["error"]["code"], "invalid_model_output"
             )
 
+    def test_cyclic_tool_alternatives_reject_before_inference_and_recover(self):
+        runtime = FakeRuntime()
+        factory = FakeConstraintFactory()
+        harness = self.harness(runtime, constraint_factory=factory)
+        for keyword in ("anyOf", "oneOf"):
+            schema = {
+                "$defs": {
+                    "node": {keyword: [{"$ref": "#/$defs/node"}, {"type": "string"}]}
+                },
+                "properties": {"value": {"$ref": "#/$defs/node"}},
+            }
+            tools = [
+                {"type": "function", "function": {"name": "test", "parameters": schema}}
+            ]
+            with self.subTest(keyword=keyword):
+                status, _, payload = harness.request(
+                    "POST",
+                    "/v1/chat/completions",
+                    self.body(
+                        tools=tools, tool_choice="required", reasoning_effort="none"
+                    ),
+                )
+                self.assertEqual(status, 400)
+                self.assertIn(
+                    "cyclic tool parameter alternatives",
+                    json.loads(payload)["error"]["message"],
+                )
+        self.assertEqual(runtime.requests, [])
+        status, _, _ = harness.request("POST", "/v1/chat/completions", self.body())
+        self.assertEqual(status, 200)
+
     def test_remote_tool_schema_ref_is_rejected_before_inference(self):
         runtime = FakeRuntime()
         harness = self.harness(runtime)
@@ -5369,10 +5400,10 @@ class ServerTest(unittest.TestCase):
                     "name": "bad",
                     "parameters": {
                         "type": "object",
-                        "allOf": [{"type": "object"}],
+                        "$ref": "#/$defs/missing",
                     },
                 },
-                "unsupported top-level tool schema",
+                "unresolved tool parameter reference",
             ),
             (
                 {

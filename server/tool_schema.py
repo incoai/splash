@@ -6,6 +6,8 @@ import copy
 import json
 import re
 from dataclasses import dataclass, field
+from functools import cached_property
+from urllib.parse import unquote
 
 from jsonschema.exceptions import SchemaError
 from referencing import Registry
@@ -48,6 +50,12 @@ class ToolPolicy:
     required: bool
     parallel: bool
     namespaces: dict = field(default_factory=dict)
+
+    @cached_property
+    def argument_schemas(self):
+        return {
+            name: tool_argument_schema(schema) for name, schema in self.schemas.items()
+        }
 
 
 def json_value(value):
@@ -176,23 +184,46 @@ def _grammar_compatible_schema(schema):
     return output
 
 
+def _lookup_tool_reference(ref, root):
+    if not isinstance(ref, str) or not ref.startswith("#"):
+        raise APIError(400, "unsupported tool parameter reference")
+    fragment = unquote(ref[1:])
+    if not fragment:
+        return root
+    if fragment.startswith("/"):
+        current = root
+        for part in fragment[1:].split("/"):
+            part = part.replace("~1", "/").replace("~0", "~")
+            if isinstance(current, list) and re.fullmatch(r"0|[1-9][0-9]*", part):
+                index = int(part)
+                if index < len(current):
+                    current = current[index]
+                    continue
+            elif isinstance(current, dict) and part in current:
+                current = current[part]
+                continue
+            raise APIError(400, f"unresolved tool parameter reference: {ref}")
+        return current
+    for node in _schemas(root):
+        if isinstance(node, dict) and fragment in (
+            node.get("$anchor"),
+            node.get("$dynamicAnchor"),
+        ):
+            return node
+    raise APIError(400, f"unresolved tool parameter reference: {ref}")
+
+
 def _resolve_tool_schema(schema, root):
     seen = set()
     while isinstance(schema, dict) and "$ref" in schema:
         ref = schema["$ref"]
-        if not isinstance(ref, str) or not (ref == "#" or ref.startswith("#/")):
-            raise APIError(400, "unsupported tool parameter reference")
-        constrained = bool(set(schema) - {"$ref"} - SCHEMA_ANNOTATIONS)
+        constrained = bool(
+            set(schema) - {"$ref", "$defs", "definitions"} - SCHEMA_ANNOTATIONS
+        )
         if ref in seen:
             raise APIError(400, "cyclic direct tool parameter reference")
         seen.add(ref)
-        current = root
-        if ref != "#":
-            for part in ref[2:].split("/"):
-                part = part.replace("~1", "/").replace("~0", "~")
-                if not isinstance(current, dict) or part not in current:
-                    raise APIError(400, f"unresolved tool parameter reference: {ref}")
-                current = current[part]
+        current = _lookup_tool_reference(ref, root)
         if constrained:
             # Keep the reference and its intersecting assertions together in
             # the JSON grammar instead of choosing a raw-string encoding.
@@ -220,7 +251,8 @@ def _schema_with_root(schema, root):
     def rebase(value):
         output = copy.deepcopy(value)
         for node in local_refs(output):
-            node["$ref"] = prefix + node["$ref"][1:]
+            if node["$ref"] == "#" or node["$ref"].startswith("#/"):
+                node["$ref"] = prefix + node["$ref"][1:]
         return output
 
     output = rebase(schema)
@@ -231,9 +263,16 @@ def _schema_with_root(schema, root):
 
 
 def raw_string_schema(schema, root):
+    return _raw_string_schema(schema, root, frozenset())
+
+
+def _raw_string_schema(schema, root, ancestors):
     schema = _resolve_tool_schema(schema, root)
     if not isinstance(schema, dict):
         return None
+    if id(schema) in ancestors:
+        raise APIError(400, "cyclic tool parameter alternatives without a nested value")
+    ancestors = ancestors | {id(schema)}
     union = schema.get("anyOf", schema.get("oneOf"))
     if union is not None:
         options = []
@@ -253,7 +292,7 @@ def raw_string_schema(schema, root):
             if null_only:
                 allows_null = True
                 continue
-            option = raw_string_schema(option_schema, root)
+            option = _raw_string_schema(option_schema, root, ancestors)
             if option is None:
                 has_other_type = True
             else:
@@ -315,42 +354,226 @@ def raw_string_schema(schema, root):
     return "literal", values
 
 
-def _tool_arguments_grammar(schema):
-    if schema is True:
-        schema = {}
-    if not isinstance(schema, dict):
-        raise APIError(400, "tool parameters must allow a JSON object")
-    schema_type = schema.get("type")
-    properties = schema.get("properties", {})
-    required = schema.get("required", [])
-    unsupported = set(schema) & {
-        "$ref",
-        "$dynamicRef",
-        "allOf",
-        "anyOf",
-        "oneOf",
-        "not",
-        "if",
-        "then",
-        "else",
-        "dependentRequired",
-        "dependentSchemas",
-        "enum",
-        "const",
-        "minProperties",
-        "maxProperties",
-        "patternProperties",
+def _schema_combination(keyword, values):
+    identity = keyword == "allOf"
+    values = [value for value in values if value is not identity]
+    if not values:
+        return identity
+    if any(value is not identity and isinstance(value, bool) for value in values):
+        return not identity
+    if len(values) == 1:
+        return values[0]
+    combined = {keyword: values}
+    # Keep the raw-string transport when every union branch, or at least one
+    # intersection, requires a string. Other unions use JSON-encoded values.
+    strings = [value.get("type") == "string" for value in values]
+    if all(strings) if keyword == "anyOf" else any(strings):
+        combined["type"] = "string"
+    return combined
+
+
+def tool_argument_schema(root):
+    """Project object fields for XML framing; validate the untouched schema.
+
+    Cross-field assertions remain on ToolPolicy.validators. This projection
+    preserves the set of possible field values rather than choosing a branch
+    before the model has supplied the discriminator or dependent properties.
+    """
+
+    def combine(shapes, union=False):
+        if union:
+            shapes = [shape for shape in shapes if shape is not None]
+            if not shapes:
+                return None
+        elif any(shape is None for shape in shapes):
+            return None
+        if not shapes:
+            return {"properties": {}, "required": [], "additionalProperties": True}
+        names = dict.fromkeys(name for shape in shapes for name in shape["properties"])
+        required = set(shapes[0]["required"])
+        for shape in shapes[1:]:
+            if union:
+                required.intersection_update(shape["required"])
+            else:
+                required.update(shape["required"])
+        keyword = "anyOf" if union else "allOf"
+        return {
+            "properties": {
+                name: _schema_combination(
+                    keyword,
+                    [
+                        shape["properties"].get(name, shape["additionalProperties"])
+                        for shape in shapes
+                    ],
+                )
+                for name in names
+            },
+            "required": sorted(required),
+            "additionalProperties": _schema_combination(
+                keyword, [shape["additionalProperties"] for shape in shapes]
+            ),
+        }
+
+    def project(node, visiting):
+        if node is False:
+            return None
+        if node is True:
+            node = {}
+        if not isinstance(node, dict):
+            raise APIError(400, "tool parameters must allow a JSON object")
+        kind = node.get("type", "object")
+        if kind != "object" and not (isinstance(kind, list) and "object" in kind):
+            return None
+        properties = dict(node.get("properties", {}))
+        additional = node.get("additionalProperties", True)
+        patterns = list(node.get("patternProperties", {}).values())
+        if patterns:
+            additional = _schema_combination("anyOf", [additional, *patterns])
+        required = node.get("required", [])
+        for name in required:
+            properties.setdefault(name, additional)
+        shape = {
+            "properties": properties,
+            "required": required,
+            "additionalProperties": additional,
+        }
+        shapes = [shape]
+        ref = node.get("$ref")
+        if ref is not None:
+            if ref in visiting:
+                raise APIError(400, "cyclic direct tool argument reference")
+            resolved = _lookup_tool_reference(ref, root)
+            shapes.append(project(resolved, visiting | {ref}))
+        for child in node.get("allOf", []):
+            shapes.append(project(child, visiting))
+        for keyword in ("anyOf", "oneOf"):
+            if keyword in node:
+                shapes.append(
+                    combine([project(child, visiting) for child in node[keyword]], True)
+                )
+        if "if" in node:
+            shapes.append(
+                combine(
+                    [
+                        project(node.get("then", {}), visiting),
+                        project(node.get("else", {}), visiting),
+                    ],
+                    True,
+                )
+            )
+        for child in node.get("dependentSchemas", {}).values():
+            shapes.append(
+                combine([project(child, visiting), project({}, visiting)], True)
+            )
+        choices = [node["const"]] if "const" in node else node.get("enum")
+        if choices is not None:
+            objects = [value for value in choices if isinstance(value, dict)]
+            if not objects:
+                return None
+            shapes.append(
+                combine(
+                    [
+                        {
+                            "properties": {
+                                name: {"const": value} for name, value in obj.items()
+                            },
+                            "required": list(obj),
+                            "additionalProperties": False,
+                        }
+                        for obj in objects
+                    ],
+                    True,
+                )
+            )
+        return combine(shapes)
+
+    shape = project(root, set())
+    if shape is None:
+        raise APIError(400, "tool parameters must allow a top-level JSON object")
+    shape["type"] = "object"
+    shape["properties"] = {
+        name: _schema_with_root(value, root)
+        for name, value in shape["properties"].items()
     }
-    if unsupported:
-        names = ", ".join(sorted(unsupported))
-        raise APIError(400, f"unsupported top-level tool schema keyword(s): {names}")
-    if schema_type not in (None, "object") or not isinstance(properties, dict):
-        raise APIError(400, "tool parameters must be a top-level JSON object")
-    if any(name not in properties for name in required):
-        raise APIError(400, "required tool parameters must declare properties")
+    shape["additionalProperties"] = _schema_with_root(
+        shape["additionalProperties"], root
+    )
+    return shape
+
+
+def _extra_parameter_names(names, rules):
+    # A trie expresses the complement of declared names without lookaround,
+    # which the grammar engine's regular-expression dialect does not support.
+    trie = {}
+    for name in names:
+        node = trie
+        for char in name:
+            node = node.setdefault(char, {})
+        node[None] = True
+    counter = 0
+
+    def emit(node, depth):
+        nonlocal counter
+        rule = f"extra_name_{counter}"
+        counter += 1
+        children = [char for char in node if char is not None]
+        excluded = "".join(re.escape(char).replace("/", r"\/") for char in children)
+        options = [f"/[^<>\\n\\r{excluded}][^<>\\n\\r]*/"]
+        for char in children:
+            options.append(f"{json.dumps(char)} {emit(node[char], depth + 1)}")
+        if depth and None not in node:
+            options.append("")
+        rules.append(f"{rule}: " + " | ".join(options))
+        return rule
+
+    return emit(trie, 0)
+
+
+def _tool_arguments_grammar(schema):
+    return _argument_grammar(tool_argument_schema(schema))
+
+
+def _parameter_rules(rule, prefix, value_schema):
+    rules = []
+    closing = json.dumps(PARAMETER_CLOSE)
+    string_schema = raw_string_schema(value_schema, value_schema)
+    value_schema = _grammar_compatible_schema(value_schema)
+    if string_schema is None:
+        rules.append(
+            f"{rule}: {prefix} "
+            f"%json {json.dumps(value_schema, separators=(',', ':'))} "
+            f"{closing}"
+        )
+    elif string_schema[0] == "raw":
+        value_rule = f"{rule}_value"
+        rules.append(f"{rule}: {prefix} {value_rule}")
+        rules.append(f"{value_rule}[suffix={closing}]: /(?s:.*)/")
+    else:
+        choices = []
+        for choice_index, value in enumerate(string_schema[1]):
+            text = "null" if value is None else value
+            if text:
+                choices.append(json.dumps(text))
+            else:
+                empty_rule = f"{rule}_empty_{choice_index}"
+                rules.append(f"{empty_rule}:")
+                choices.append(empty_rule)
+        rules.append(f"{rule}: {prefix} ({' | '.join(choices)}) {closing}")
+    return rules
+
+
+def _argument_grammar(schema):
+    properties = schema["properties"]
+    required = schema["required"]
     rules = []
     sequence = []
     for index, (name, value_schema) in enumerate(properties.items()):
+        if value_schema is False:
+            if name in required:
+                raise APIError(
+                    400, f"required tool parameter cannot have a value: {name}"
+                )
+            continue
         if (
             not isinstance(name, str)
             or not name
@@ -358,35 +581,16 @@ def _tool_arguments_grammar(schema):
             or any(character in name for character in "<>\n\r")
         ):
             raise APIError(400, "invalid tool parameter name")
-        string_schema = raw_string_schema(value_schema, schema)
-        value_schema = _schema_with_root(value_schema, schema)
-        value_schema = _grammar_compatible_schema(value_schema)
         rule = f"parameter_{index}"
-        suffix = "" if name in required else "?"
-        sequence.append(rule + suffix)
+        sequence.append(rule + ("" if name in required else "?"))
         prefix = json.dumps(f"{PARAMETER_OPEN}{name}>\n")
-        closing = json.dumps(PARAMETER_CLOSE)
-        if string_schema is None:
-            rules.append(
-                f"{rule}: {prefix} "
-                f"%json {json.dumps(value_schema, separators=(',', ':'))} "
-                f"{closing}"
-            )
-        elif string_schema[0] == "raw":
-            value_rule = f"{rule}_value"
-            rules.append(f"{rule}: {prefix} {value_rule}")
-            rules.append(f"{value_rule}[suffix={closing}]: /(?s:.*)/")
-        else:
-            choices = []
-            for choice_index, value in enumerate(string_schema[1]):
-                text = "null" if value is None else value
-                if text:
-                    choices.append(json.dumps(text))
-                else:
-                    empty_rule = f"{rule}_empty_{choice_index}"
-                    rules.append(f"{empty_rule}:")
-                    choices.append(empty_rule)
-            rules.append(f"{rule}: {prefix} ({' | '.join(choices)}) {closing}")
+        rules.extend(_parameter_rules(rule, prefix, value_schema))
+    additional = schema["additionalProperties"]
+    if additional is not False:
+        name_rule = _extra_parameter_names(properties, rules)
+        prefix = f"{json.dumps(PARAMETER_OPEN)} {name_rule} {json.dumps('>' + chr(10))}"
+        rules.extend(_parameter_rules("extra", prefix, additional))
+        sequence.append("extra*")
     start = " ".join(sequence)
     return (
         "%llguidance {}\nstart:"
@@ -510,10 +714,10 @@ THINK_END = "</think>"
 def tool_grammar(policy, thinking, response_schema=None):
     side_grammars = []
     tag_rules = []
-    for index, (name, schema) in enumerate(policy.schemas.items()):
+    for index, (name, schema) in enumerate(policy.argument_schemas.items()):
         grammar_name = f"arguments_{index}"
         side_grammars.append(
-            {"name": grammar_name, "lark_grammar": _tool_arguments_grammar(schema)}
+            {"name": grammar_name, "lark_grammar": _argument_grammar(schema)}
         )
         tag_rules.append(
             f"tool_{index}: {'WS' if response_schema is not None else 'TEXT'} {TOOL_CALL_OPEN} "

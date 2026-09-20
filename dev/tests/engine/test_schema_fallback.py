@@ -280,7 +280,7 @@ class SchemaFallbackTests(unittest.TestCase):
                 finally:
                     harness.close()
 
-    def test_top_level_tool_layout_constraints_are_explicit_errors(self):
+    def test_top_level_tool_layout_constraints_compile_and_preserve_validation(self):
         constraints = {
             "$ref": "#/$defs/Value",
             "$dynamicRef": "#/$defs/Value",
@@ -308,13 +308,35 @@ class SchemaFallbackTests(unittest.TestCase):
             }
             original = copy.deepcopy(schema)
             with self.subTest(keyword=keyword):
-                with self.assertRaises(api.APIError) as caught:
-                    tool_schema.tool_grammar(self.policy(schema), False)
-                self.assertEqual(caught.exception.status, 400)
-                self.assertIn(keyword, str(caught.exception))
+                policy = self.policy(schema)
+                grammar = tool_schema.tool_grammar(policy, False)
+                self.assertFalse(LLMatcher.validate_grammar(grammar, self.guidance))
                 self.assertEqual(schema, original)
+                self.assertEqual(policy.schemas["test"], original)
+                from jsonschema import Draft202012Validator
 
-    def test_missing_remote_and_composed_root_schemas_remain_explicit_errors(self):
+                validator = Draft202012Validator(original)
+                for arguments in (
+                    {},
+                    {"value": "ok"},
+                    {"value": 7},
+                    {"value": "ok", "other": True},
+                ):
+                    calls = [
+                        {
+                            "function": {
+                                "name": "test",
+                                "arguments": json.dumps(arguments),
+                            }
+                        }
+                    ]
+                    if validator.is_valid(arguments):
+                        model_output.validate_tool_calls(calls, policy)
+                    else:
+                        with self.assertRaises(api.APIError):
+                            model_output.validate_tool_calls(calls, policy)
+
+    def test_missing_and_remote_references_remain_explicit_errors(self):
         for reference in ("#/$defs/missing", "https://example.com/schema.json"):
             schema = {
                 "type": "object",
@@ -326,11 +348,6 @@ class SchemaFallbackTests(unittest.TestCase):
             ):
                 tool_schema.tool_grammar(self.policy(schema), False)
             self.assertEqual(caught.exception.status, 400)
-        root = {
-            "type": "object",
-            "allOf": [{"properties": {"value": {"type": "string"}}}],
-        }
         with self.assertRaises(api.APIError) as caught:
-            tool_schema.tool_grammar(self.policy(root), False)
+            tool_schema.tool_grammar(self.policy({"$ref": "#/$defs/missing"}), False)
         self.assertEqual(caught.exception.status, 400)
-        self.assertIn("allOf", str(caught.exception))

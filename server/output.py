@@ -407,11 +407,13 @@ def argument_deltas(arguments):
 def _tool_property_schema(policy, tool_name, parameter_name):
     if policy is None:
         return None, None
-    root = policy.schemas.get(tool_name)
+    root = policy.argument_schemas.get(tool_name)
     if not isinstance(root, dict):
         return None, None
-    schema = root.get("properties", {}).get(parameter_name)
-    return schema, root
+    schema = root.get("properties", {}).get(
+        parameter_name, root.get("additionalProperties", {})
+    )
+    return schema, schema
 
 
 def _typed_tool_value(value, schema, root):
