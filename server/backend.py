@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from tokenizers.decoders import DecodeStream
 
 if __package__:
+    from . import json_codec
     from . import protocol as wire
     from . import runtime as engine_runtime
     from .constraints import TokenConstraint
@@ -16,15 +17,16 @@ if __package__:
     from .latency import RequestLatency
     from .metrics import metrics_dict
     from .output import hold_partial
-    from .tool_schema import THINK_END, ToolPolicy, strict_json_loads
+    from .tool_schema import THINK_END, ToolPolicy
 else:
+    import json_codec
     import protocol as wire
     from constraints import TokenConstraint
     from errors import APIError, NativeError
     from latency import RequestLatency
     from metrics import metrics_dict
     from output import hold_partial
-    from tool_schema import THINK_END, ToolPolicy, strict_json_loads
+    from tool_schema import THINK_END, ToolPolicy
 
     import runtime as engine_runtime
 
@@ -293,7 +295,7 @@ class NativeBackend:
 
     @staticmethod
     def _decode_status_event(event):
-        snapshot = strict_json_loads(event.json)
+        snapshot = json_codec.loads(event.json)
         if (
             event.schema_version != wire.STATUS_SCHEMA_VERSION
             or not isinstance(snapshot, dict)

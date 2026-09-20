@@ -16,7 +16,7 @@ from jinja2 import TemplateError
 
 if __package__:
     from . import images as image_input
-    from . import judgments
+    from . import json_codec, judgments
     from . import protocol as wire
     from .api_shapes import (
         IMAGE_PAD_TOKEN,
@@ -41,6 +41,7 @@ if __package__:
     )
 else:
     import images as image_input
+    import json_codec
     import judgments
     import protocol as wire
     from api_shapes import (
@@ -103,7 +104,7 @@ class StoredResponse:
 
     @property
     def response(self):
-        return json.loads(self.response_json)
+        return json_codec.loads(self.response_json)
 
 
 class ResponseStore:
@@ -135,12 +136,9 @@ class ResponseStore:
         return record
 
     def put(self, response, history_items):
-        def encode(value):
-            return json.dumps(
-                value, ensure_ascii=False, allow_nan=False, separators=(",", ":")
-            ).encode()
-
-        record = StoredResponse(encode(response), encode(history_items))
+        record = StoredResponse(
+            json_codec.encode(response), json_codec.encode(history_items)
+        )
         if record.size > self.budget_bytes:
             return False
         response_id = response["id"]
@@ -967,7 +965,7 @@ class Frontend:
                 # Reserve its input bytes before materializing the history.
                 if reserve_input is not None:
                     reserve_input(len(previous.history_json))
-                previous_items = json.loads(previous.history_json)
+                previous_items = json_codec.loads(previous.history_json)
             chat = responses_to_chat_body(body, previous_items)
             namespaces = chat.pop("_tool_namespaces")
             job, thinking, has_tools = self._prepare(chat, namespaces, deadline)

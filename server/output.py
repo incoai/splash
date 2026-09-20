@@ -1,11 +1,12 @@
 """Incremental model-output parsing and final tool/answer validation."""
 
-import json
+import re
 
 from jsonschema.exceptions import ValidationError
 from referencing.exceptions import Unresolvable
 
 if __package__:
+    from . import json_codec
     from .errors import APIError
     from .schema_validation import SchemaEvaluationError
     from .tool_schema import (
@@ -18,9 +19,9 @@ if __package__:
         TOOL_CALL_OPEN,
         json_value,
         raw_string_schema,
-        strict_json_loads,
     )
 else:
+    import json_codec
     from errors import APIError
     from schema_validation import SchemaEvaluationError
     from tool_schema import (
@@ -33,11 +34,34 @@ else:
         TOOL_CALL_OPEN,
         json_value,
         raw_string_schema,
-        strict_json_loads,
     )
 
 
 TOOL_ARGUMENT_DELTA_CHARS = 16 * 1024
+_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def _validate_tool_unicode(value):
+    # Validate decoded values, so literal backslash-u text remains unchanged.
+    if isinstance(value, str):
+        if _SURROGATE.search(value):
+            raise APIError(
+                500,
+                "model returned invalid Unicode in tool arguments",
+                "invalid_model_output",
+            )
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            _validate_tool_unicode(key)
+            _validate_tool_unicode(item)
+    elif isinstance(value, list):
+        for item in value:
+            _validate_tool_unicode(item)
+
+
+def _tool_json(value):
+    _validate_tool_unicode(value)
+    return json_codec.dumps(value)
 
 
 def hold_partial(text, marker):
@@ -185,7 +209,7 @@ class StreamingToolCallProjector:
         if not value:
             return
         self.parameter_value_fragments.append(value)
-        self._emit_argument(json.dumps(value, ensure_ascii=False)[1:-1], events)
+        self._emit_argument(_tool_json(value)[1:-1], events)
 
     def _finish_parameter(self, events):
         value_end = self.pending.find(self._PARAMETER_CLOSE)
@@ -207,17 +231,7 @@ class StreamingToolCallProjector:
             )
             prefix = "" if len(self.arguments) == 0 else ","
             fragment = (
-                prefix
-                + json.dumps(
-                    self.parameter_name,
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                    allow_nan=False,
-                )
-                + ":"
-                + json.dumps(
-                    value, ensure_ascii=False, separators=(",", ":"), allow_nan=False
-                )
+                prefix + _tool_json(self.parameter_name) + ":" + _tool_json(value)
             )
             self._emit_argument(fragment, events)
         self.arguments[self.parameter_name] = value
@@ -230,9 +244,7 @@ class StreamingToolCallProjector:
         return True
 
     def _finish_call(self, events):
-        arguments = json.dumps(
-            self.arguments, ensure_ascii=False, separators=(",", ":"), allow_nan=False
-        )
+        arguments = _tool_json(self.arguments)
         call = {
             "id": self.call_id,
             "type": "function",
@@ -331,14 +343,7 @@ class StreamingToolCallProjector:
                 if self.streaming_string:
                     prefix = "" if len(self.arguments) == 0 else ","
                     self._emit_argument(
-                        prefix
-                        + json.dumps(
-                            name,
-                            ensure_ascii=False,
-                            separators=(",", ":"),
-                            allow_nan=False,
-                        )
-                        + ':"',
+                        prefix + _tool_json(name) + ':"',
                         events,
                     )
                 self.state = "parameter_value"
@@ -494,12 +499,7 @@ def parse_tool_calls(text, request_id, policy=None):
                 "type": "function",
                 "function": {
                     "name": name,
-                    "arguments": json.dumps(
-                        arguments,
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                        allow_nan=False,
-                    ),
+                    "arguments": _tool_json(arguments),
                 },
             }
         )
@@ -538,7 +538,9 @@ def validate_tool_calls(calls, policy):
                 500, f"model called unknown tool {name}", "invalid_model_output"
             )
         try:
-            validator.validate(strict_json_loads(function["arguments"]))
+            arguments = json_codec.loads(function["arguments"])
+            _validate_tool_unicode(arguments)
+            validator.validate(arguments)
         except SchemaEvaluationError as error:
             raise APIError(500, str(error), "output_validation_failed") from error
         except ValidationError as error:
@@ -557,7 +559,7 @@ def validate_response_content(content, validator):
     if validator is None:
         return
     try:
-        value = strict_json_loads(content)
+        value = json_codec.loads(content)
         validator.validate(value)
     except SchemaEvaluationError as error:
         raise APIError(500, str(error), "output_validation_failed") from error

@@ -8,15 +8,15 @@ import json
 import re
 
 if __package__:
+    from . import json_codec
     from .documents import DocumentBudget, document_content, file_content
     from .errors import APIError
     from .metrics import metrics_dict, usage_dict
-    from .tool_schema import strict_json_loads
 else:  # ``python server/server.py`` from the repo root.
+    import json_codec
     from documents import DocumentBudget, document_content, file_content
     from errors import APIError
     from metrics import metrics_dict, usage_dict
-    from tool_schema import strict_json_loads
 
 IMAGE_PAD_TOKEN = "<|image_pad|>"
 
@@ -227,7 +227,7 @@ def normalize_messages(messages, *, deadline=None):
                 arguments = function.get("arguments", {})
                 if isinstance(arguments, str):
                     try:
-                        arguments = strict_json_loads(arguments)
+                        arguments = json_codec.loads(arguments)
                     except ValueError as error:
                         # Preserve calls truncated by the output limit in history
                         # so the conversation can continue. Invalid complete JSON
@@ -1114,7 +1114,7 @@ def anthropic_response(
     parsed_calls = []
     for call in tool_calls:
         try:
-            arguments = strict_json_loads(call["function"]["arguments"])
+            arguments = json_codec.loads(call["function"]["arguments"])
         except ValueError:
             if result.reason != "length":
                 raise

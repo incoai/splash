@@ -15,7 +15,7 @@ from PIL import Image
 
 from dev.tests import test_server as fixtures
 from install import launcher
-from server import frontend
+from server import frontend, json_codec
 from server import server as api
 
 
@@ -116,7 +116,7 @@ class HttpBodyBudgetTests(unittest.TestCase):
                     payload = json.dumps(value, ensure_ascii=False).encode(
                         encoding, "surrogatepass"
                     )
-                    self.assertEqual(parse(payload), api.strict_json_loads(payload))
+                    self.assertEqual(parse(payload), json_codec.loads(payload))
         for payload in (
             b"{",
             b"\xff",
@@ -128,7 +128,7 @@ class HttpBodyBudgetTests(unittest.TestCase):
         ):
             with self.subTest(payload=payload):
                 with self.assertRaises(ValueError):
-                    api.strict_json_loads(payload)
+                    json_codec.loads(payload)
                 with self.assertRaises(ValueError):
                     parse(payload)
 

@@ -35,14 +35,6 @@ THINK_END_TOKEN_ID = 248069  # the chat template's think-close token
 LOCAL_REGISTRY = Registry()
 
 
-def _reject_json_constant(value):
-    raise ValueError(f"invalid JSON constant: {value}")
-
-
-def strict_json_loads(value):
-    return json.loads(value, parse_constant=_reject_json_constant)
-
-
 @dataclass(frozen=True)
 class ToolPolicy:
     validators: dict

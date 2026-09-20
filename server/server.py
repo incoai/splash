@@ -23,7 +23,7 @@ from transformers import AutoTokenizer
 
 if __package__:
     from . import images as image_input
-    from . import judgments
+    from . import json_codec, judgments
     from . import runtime as engine_runtime
     from .api_shapes import (
         anthropic_response,
@@ -60,9 +60,9 @@ if __package__:
         validate_tool_calls,
     )
     from .thinking import ThinkingCodec, ThinkingKeyError, load_thinking_key
-    from .tool_schema import strict_json_loads
 else:
     import images as image_input
+    import json_codec
     import judgments
     from api_shapes import (
         anthropic_response,
@@ -94,7 +94,6 @@ else:
         validate_tool_calls,
     )
     from thinking import ThinkingCodec, ThinkingKeyError, load_thinking_key
-    from tool_schema import strict_json_loads
 
     import runtime as engine_runtime
 
@@ -222,7 +221,15 @@ class FrontendHandler(BaseHTTPRequestHandler):
             self.wfile.write(data)
 
     def _json(self, status, payload):
-        data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+        try:
+            data = json_codec.encode(payload)
+        except json_codec.JSONEncodingError as error:
+            log_unexpected(error)
+            self._error(
+                APIError(500, "internal server error", "internal_server_error"),
+                self.path.partition("?")[0].startswith("/v1/messages"),
+            )
+            return
         self._send(status, data, "application/json")
 
     def _error(self, error, anthropic=False):
@@ -321,7 +328,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             self.connection.settimeout(self.server.io_timeout)
         text = payload.decode(json.detect_encoding(payload), "surrogatepass")
         payload.clear()
-        return strict_json_loads(text)
+        return json_codec.loads(text)
 
     def do_HEAD(self):
         self.do_GET()
@@ -1100,17 +1107,17 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
     def _sse(self, payload):
         data = (
-            payload
+            payload.encode("utf-8")
             if isinstance(payload, str)
-            else json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            else json_codec.encode(payload)
         )
-        self.wfile.write(f"data: {data}\n\n".encode())
+        self.wfile.write(b"data: " + data + b"\n\n")
         self.wfile.flush()
         self._last_sse_write = time.monotonic()
 
     def _responses_sse(self, event, payload):
-        data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        self.wfile.write(f"event: {event}\ndata: {data}\n\n".encode())
+        data = json_codec.encode(payload)
+        self.wfile.write(f"event: {event}\ndata: ".encode() + data + b"\n\n")
         self.wfile.flush()
         self._last_sse_write = time.monotonic()
 
@@ -1617,13 +1624,8 @@ class RequestBodyReservation:
             policy.namespaces if policy else None,
             job.stop_sequences,
         )
-        encoder = json.JSONEncoder(ensure_ascii=False, separators=(",", ":"))
         retained = [value for value in retained if value]
-        size = (
-            sum(len(part.encode()) for part in encoder.iterencode(retained))
-            if retained
-            else 0
-        )
+        size = json_codec.encoded_size(retained) if retained else 0
         if size > self.size:
             self.grow(size - self.size)
         else:
