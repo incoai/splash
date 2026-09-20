@@ -112,6 +112,136 @@ private:
     Method method_ = nullptr;
 };
 
+thread_local bool inCompletionHandler = false;
+IMP originalCompletedHandler = nullptr;
+IMP originalAllocatedSize = nullptr;
+std::promise<void> completedOnGpu;
+std::promise<void> completionReturned;
+std::shared_future<void> releaseMemoryQuery;
+std::atomic<unsigned> completionMemoryQueries{0};
+std::atomic<unsigned> memoryQueries{0};
+
+void observeCompletion(id command, SEL selector, MTLCommandBufferHandler handler) {
+    reinterpret_cast<void (*)(id, SEL, MTLCommandBufferHandler)>(
+        originalCompletedHandler)(command, selector, ^(id<MTLCommandBuffer> completed) {
+        completedOnGpu.set_value();
+        inCompletionHandler = true;
+        handler(completed);
+        inCompletionHandler = false;
+        completionReturned.set_value();
+    });
+}
+
+NSUInteger delayedCompletionMemoryQuery(id device, SEL selector) {
+    ++memoryQueries;
+    if (inCompletionHandler) {
+        ++completionMemoryQueries;
+        releaseMemoryQuery.wait();
+    }
+    return reinterpret_cast<NSUInteger (*)(id, SEL)>(originalAllocatedSize)(device, selector);
+}
+
+void completionDoesNotWaitForMemoryTelemetry(const std::string &metallibPath) {
+    MetalBackend backend(metallibPath, 0.1);
+    auto buffer = backend.allocateBuffer(sizeof(uint32_t));
+    *static_cast<uint32_t *>(buffer.contents()) = 0;
+    const uint32_t count = 1, increment = 7;
+    ComputeDispatch dispatch;
+    dispatch.pipelineName = "test_add_u32";
+    dispatch.buffers = {{0, buffer}};
+    dispatch.bytes = {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}};
+    dispatch.threadgroups = {1, 1, 1};
+    dispatch.threadsPerThreadgroup = {1, 1, 1};
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    id<MTLCommandQueue> queue = [device newCommandQueue];
+    id<MTLCommandBuffer> command = [queue commandBuffer];
+    std::promise<void> release;
+    releaseMemoryQuery = release.get_future().share();
+    auto gpuDone = completedOnGpu.get_future();
+    auto callbackDone = completionReturned.get_future();
+    MethodReplacement completion(command, @selector(addCompletedHandler:),
+                                 reinterpret_cast<IMP>(observeCompletion));
+    originalCompletedHandler = completion.original;
+    MethodReplacement memory(device, @selector(currentAllocatedSize),
+                             reinterpret_cast<IMP>(delayedCompletionMemoryQuery));
+    originalAllocatedSize = memory.original;
+    auto ticket = backend.submitAsync(dispatch);
+    const bool completed = gpuDone.wait_for(std::chrono::seconds(5)) ==
+                           std::future_status::ready;
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    const bool ready = ticket.ready();
+    bool healthy = true;
+    try { backend.checkHealth(); }
+    catch (const MetalBackendError &) { healthy = false; }
+    release.set_value();
+    const unsigned queriesBeforeConsumption = memoryQueries;
+    (void)ticket.wait();
+    require(callbackDone.wait_for(std::chrono::seconds(5)) == std::future_status::ready,
+            "completion handler did not drain after telemetry was released");
+    require(completed, "test GPU command did not complete");
+    require(ready && healthy && completionMemoryQueries == 0,
+            "completed GPU work depends on memory telemetry and can trip the watchdog");
+    require(memoryQueries > queriesBeforeConsumption,
+            "consuming a completed command did not refresh admission telemetry");
+    const unsigned queriesAfterConsumption = memoryQueries;
+    (void)ticket.wait();
+    require(memoryQueries == queriesAfterConsumption,
+            "an already-released ticket queried device memory again");
+    require(*static_cast<uint32_t *>(buffer.contents()) == increment,
+            "completion telemetry test produced the wrong result");
+    std::cout << "PASS GPU completion independent of memory telemetry\n";
+}
+
+id<MTLSharedEvent> commandWatchdogGate = nil;
+IMP originalCommandCommit = nullptr;
+void commitBehindWatchdogGate(id command, SEL selector) {
+    [command encodeWaitForEvent:commandWatchdogGate value:1];
+    reinterpret_cast<void (*)(id, SEL)>(originalCommandCommit)(command, selector);
+}
+
+void pendingCommandStillTimesOut(const std::string &metallibPath) {
+    MetalBackend backend(metallibPath, 0.1);
+    auto buffer = backend.allocateBuffer(sizeof(uint32_t));
+    *static_cast<uint32_t *>(buffer.contents()) = 0;
+    const uint32_t count = 1, increment = 7;
+    ComputeDispatch dispatch;
+    dispatch.pipelineName = "test_add_u32";
+    dispatch.buffers = {{0, buffer}};
+    dispatch.bytes = {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}};
+    dispatch.threadgroups = {1, 1, 1};
+    dispatch.threadsPerThreadgroup = {1, 1, 1};
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    id<MTLCommandQueue> queue = [device newCommandQueue];
+    id<MTLCommandBuffer> command = [queue commandBuffer];
+    commandWatchdogGate = [device newSharedEvent];
+    splash::metal::CommandTicket ticket;
+    {
+        MethodReplacement commit(command, @selector(commit),
+                                 reinterpret_cast<IMP>(commitBehindWatchdogGate));
+        originalCommandCommit = commit.original;
+        ticket = backend.submitAsync(dispatch);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    const bool pending = !ticket.ready();
+    std::string failure;
+    try { backend.checkHealth(); }
+    catch (const MetalBackendError &error) { failure = error.what(); }
+    commandWatchdogGate.signaledValue = 1;
+    (void)ticket.wait();
+    commandWatchdogGate = nil;
+    require(pending && !backend.healthy(), "pending GPU command escaped the watchdog");
+    require(failure.find("sequence=1") != std::string::npos &&
+                failure.find("dispatches=1") != std::string::npos &&
+                (failure.find("status=committed") != std::string::npos ||
+                 failure.find("status=scheduled") != std::string::npos),
+            "command timeout lost its submission diagnostics: " + failure);
+    requireBackendError([&] { (void)backend.submitAsync(dispatch); },
+                        "timed-out backend accepted more work");
+    require(*static_cast<uint32_t *>(buffer.contents()) == increment,
+            "timed-out command lost resources before GPU completion");
+    std::cout << "PASS pending GPU command watchdog and resource lifetime\n";
+}
+
 id<MTLSharedEvent> submissionGate = nil;
 id<MTLSharedEvent> delayedMappingEvent = nil;
 IMP originalSparseSignal = nullptr;
@@ -1019,6 +1149,8 @@ int main(int argc, const char *argv[]) {
             return 2;
         }
         try {
+            completionDoesNotWaitForMemoryTelemetry(argv[1]);
+            pendingCommandStillTimesOut(argv[1]);
             run(argv[1]);
         } catch (const std::exception &error) {
             std::cerr << "FAIL: unexpected exception: " << error.what()

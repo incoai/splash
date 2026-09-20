@@ -122,6 +122,18 @@ double steadySeconds() noexcept {
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+const char *commandStatusName(MTLCommandBufferStatus status) noexcept {
+    switch (status) {
+    case MTLCommandBufferStatusNotEnqueued: return "not_enqueued";
+    case MTLCommandBufferStatusEnqueued: return "enqueued";
+    case MTLCommandBufferStatusCommitted: return "committed";
+    case MTLCommandBufferStatusScheduled: return "scheduled";
+    case MTLCommandBufferStatusCompleted: return "completed";
+    case MTLCommandBufferStatusError: return "error";
+    }
+    return "unknown";
+}
+
 template <typename T>
 void raisePeak(std::atomic<T> &peak, T value) noexcept {
     T current = peak.load(std::memory_order_relaxed);
@@ -215,6 +227,8 @@ struct BackendAsyncState {
     mutable std::mutex gateMutex;
     uint64_t nextSequence = 0;
     uint64_t activeSequence = 0;
+    size_t activeDispatchCount = 0;
+    __weak id<MTLCommandBuffer> activeCommand = nil;
     CommandWatchdog commandWatchdog;
     std::stop_source stopping;
     std::atomic<uint64_t> mapWaitEvent{0};
@@ -244,7 +258,7 @@ struct BackendAsyncState {
         healthy.store(false, std::memory_order_release);
     }
 
-    uint64_t beginSubmission() {
+    uint64_t beginSubmission(size_t dispatchCount) {
         ensureHealthy();
         std::lock_guard lock(gateMutex);
         if (stopping.stop_requested())
@@ -257,12 +271,14 @@ struct BackendAsyncState {
             throw MetalBackendError("Metal command sequence exhausted");
         }
         activeSequence = ++nextSequence;
+        activeDispatchCount = dispatchCount;
         return activeSequence;
     }
 
     bool commitSubmission(uint64_t sequence, id<MTLCommandBuffer> command) {
         std::lock_guard lock(gateMutex);
         if (stopping.stop_requested()) return false;
+        activeCommand = command;
         commandWatchdog.start(sequence, steadySeconds());
         [command commit];
         return true;
@@ -271,7 +287,10 @@ struct BackendAsyncState {
     void releaseSubmission(uint64_t sequence) noexcept {
         std::lock_guard lock(gateMutex);
         commandWatchdog.complete(sequence);
-        if (activeSequence == sequence) activeSequence = 0;
+        if (activeSequence == sequence) {
+            activeSequence = 0;
+            activeCommand = nil;
+        }
     }
 
     void completeSubmission(uint64_t sequence) noexcept {
@@ -283,9 +302,14 @@ struct BackendAsyncState {
         {
             std::lock_guard lock(gateMutex);
             if (commandWatchdog.expired(steadySeconds())) {
-                markUnhealthy("Metal command exceeded " +
-                    std::to_string(commandWatchdog.timeoutSeconds()) +
-                    " seconds without completing");
+                id<MTLCommandBuffer> command = activeCommand;
+                std::ostringstream message;
+                message << "Metal command completion timed out after "
+                        << commandWatchdog.timeoutSeconds()
+                        << " seconds (sequence=" << activeSequence
+                        << ", status=" << (command ? commandStatusName(command.status) : "unavailable")
+                        << ", dispatches=" << activeDispatchCount << ')';
+                markUnhealthy(message.str());
             }
         }
         ensureHealthy();
@@ -345,6 +369,10 @@ struct CommandTicket::State {
             }
         }
         if (shouldRelease && backend) {
+            // Refresh admission telemetry on the consuming thread after GPU
+            // completion, before allowing the next submission.
+            if (backend->healthy.load(std::memory_order_acquire))
+                backend->sampleDeviceMemory();
             backend->releaseSubmission(sequence);
         }
     }
@@ -1230,7 +1258,7 @@ CommandTicket MetalBackend::submitCommandAsync(
         }
         auto ticketState = std::make_shared<CommandTicket::State>();
         ticketState->backend = impl_->asyncState;
-        ticketState->sequence = impl_->asyncState->beginSubmission();
+        ticketState->sequence = impl_->asyncState->beginSubmission(dispatches.size());
         ticketState->timing = total;
         ticketState->completed = true;
         if (completion) completion(ticketState->sequence);
@@ -1316,7 +1344,7 @@ CommandTicket MetalBackend::submitCommandAsync(
             }
         }
     }
-    ticketState->sequence = impl_->asyncState->beginSubmission();
+    ticketState->sequence = impl_->asyncState->beginSubmission(dispatches.size());
 
     auto failBeforeCommit = [&](std::string message) {
         impl_->markUnhealthy(message);
@@ -1369,15 +1397,10 @@ CommandTicket MetalBackend::submitCommandAsync(
         }
     }
 
-    // currentAllocatedSize is instantaneous rather than a historical peak.
-    // The shared observer survives backend destruction while Metal owns the
-    // command, and the ticket retains every referenced allocation.
+    // Driver callbacks only complete the ticket. Device-wide memory telemetry
+    // is sampled on the host before submission and when consuming the result.
     std::shared_ptr<BackendAsyncState> observer = impl_->asyncState;
-    [command addScheduledHandler:^(id<MTLCommandBuffer>) {
-      observer->sampleDeviceMemory();
-    }];
     [command addCompletedHandler:^(id<MTLCommandBuffer> completedCommand) {
-      observer->sampleDeviceMemory();
       auto wallEnd = std::chrono::steady_clock::now();
       CommandTiming timing;
       timing.gpuSeconds =
@@ -1441,7 +1464,6 @@ CommandTicket MetalBackend::submitCommandAsync(
                 ticketState->finish({}, "Metal backend stopped before command submission");
                 return;
             }
-            observer->sampleDeviceMemory();
         }, observer->stopping.get_token());
     impl_->pendingSparseEventValue = 0;
     return CommandTicket(std::move(ticketState));
