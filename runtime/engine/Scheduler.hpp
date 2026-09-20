@@ -50,6 +50,10 @@ struct SchedulerSnapshot final {
   uint64_t decodeBatches = 0;
   std::array<uint64_t, model::ExecutionLimits::maximumBatchWidth>
       decodeBatchesByWidth{};
+  // Decode batches mixing Greedy and Sampling lanes. Mixed batches pay the
+  // sampled verify path (top32+probs) for every lane; issue #78 tracks whether
+  // segregating them beats the packing loss. Telemetry only, no dispatch change.
+  uint64_t decodeMixedGreedySamplingBatches = 0;
 };
 
 // One single-owner policy for the specialized backend. Prefill packs the

@@ -416,6 +416,15 @@ void Scheduler::commit(const BatchPlan &plan) {
       get(item.requestId).lastDecodeDispatch = dispatchOrder;
     ++counters_.decodeBatches;
     ++counters_.decodeBatchesByWidth[plan.width() - 1];
+    bool hasGreedy = false;
+    bool hasSampling = false;
+    for (const BatchItem &item : plan.items) {
+      const BatchCohort cohort = get(item.requestId).spec.cohort;
+      hasGreedy = hasGreedy || cohort == BatchCohort::Greedy;
+      hasSampling = hasSampling || cohort == BatchCohort::Sampling;
+    }
+    if (hasGreedy && hasSampling)
+      ++counters_.decodeMixedGreedySamplingBatches;
   }
 }
 

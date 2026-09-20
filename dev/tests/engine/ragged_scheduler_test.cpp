@@ -377,6 +377,26 @@ void testMixedSamplingBatch() {
   }
 }
 
+void testDecodeMixTelemetryCountsMixedBatches() {
+  Scheduler mixed;
+  mixed.submit(request(1, 1, BatchCohort::Greedy));
+  mixed.submit(request(2, 1, BatchCohort::Sampling));
+  mixed.resourcesReady(1, 1);
+  mixed.resourcesReady(2, 1);
+  completeDecode(mixed);
+  require(mixed.snapshot().decodeMixedGreedySamplingBatches == 1,
+          "mixed greedy/sampling batch was not counted");
+
+  Scheduler pure;
+  pure.submit(request(1, 1, BatchCohort::Greedy));
+  pure.submit(request(2, 1, BatchCohort::Greedy));
+  pure.resourcesReady(1, 1);
+  pure.resourcesReady(2, 1);
+  completeDecode(pure);
+  require(pure.snapshot().decodeMixedGreedySamplingBatches == 0,
+          "pure greedy batch was miscounted as mixed");
+}
+
 void testConstrainedDecodeRemainsSeparate() {
   Scheduler scheduler;
   scheduler.submit(request(1, 1, BatchCohort::Constrained));
@@ -885,6 +905,7 @@ int main() {
     testServedLaneResetsOvertaking();
     testRealDecodeWidths();
     testMixedSamplingBatch();
+    testDecodeMixTelemetryCountsMixedBatches();
     testConstrainedDecodeRemainsSeparate();
     testPrefillAndDecodeAlternateWithoutStarvation();
     testMeasuredBudgetOnlyLimitsContendedWork();

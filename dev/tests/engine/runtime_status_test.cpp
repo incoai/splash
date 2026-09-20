@@ -76,6 +76,7 @@ void testCleanRuntimeStatus() {
   engine.scheduler.prefillRows = 4096;
   engine.scheduler.decodeBatches = 4;
   engine.scheduler.decodeBatchesByWidth = {1, 1, 1, 1};
+  engine.scheduler.decodeMixedGreedySamplingBatches = 2;
   engine.resources.pool = {256, 200, 24, 32, 128, 72, 1, 128 * 4096ULL,
                            32 * 4096ULL};
   engine.resources.kvCache = {32, 32 * 4096ULL};
@@ -222,6 +223,8 @@ void testCleanRuntimeStatus() {
               json.find("\"decode_batches_by_width\":{\"b1\":1,\"b2\":1,\"b3\":"
                         "1,\"b4\":1}") != std::string::npos,
           "Page32 or real B3 status is missing");
+  require(json.find("decode_mixed_greedy_sampling_batches") != std::string::npos,
+          "mixed greedy/sampling decode telemetry is missing from status");
   require(
       json.find("\"dynamic_budget_bytes\"") != std::string::npos &&
           json.find("\"resource_replay_tokens\":1234") != std::string::npos &&
