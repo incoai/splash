@@ -30,6 +30,7 @@ if __package__:
     from .errors import APIError, ContextLengthError
     from .metrics import is_finite_number
     from .thinking import ThinkingCodec
+    from .tokenization import TokenizationCache
     from .tool_schema import (
         THINK_END,
         ToolPolicy,
@@ -54,6 +55,7 @@ else:
     from errors import APIError, ContextLengthError
     from metrics import is_finite_number
     from thinking import ThinkingCodec
+    from tokenization import TokenizationCache
     from tool_schema import (
         THINK_END,
         ToolPolicy,
@@ -207,6 +209,7 @@ class Frontend:
         if not isinstance(preparation_capacity, int) or preparation_capacity <= 0:
             raise ValueError("frontend preparation capacity must be positive")
         self.tokenizer = tokenizer
+        self.tokenization = TokenizationCache(tokenizer)
         self.backend = backend
         self.model = model
         self.max_context = max_context
@@ -238,6 +241,7 @@ class Frontend:
             status["grammar_cache"] = self.constraint_factory.stats()
         status["response_store"] = self.response_store.stats()
         status["image_cache"] = self.images.stats()
+        status["tokenization_cache"] = self.tokenization.stats()
         return status
 
     def _prepare_images(self, messages, *, check_context=True):
@@ -297,7 +301,7 @@ class Frontend:
         if frame_bytes > wire.ABSOLUTE_MAX_FRAME_PAYLOAD_BYTES:
             raise APIError(400, "images exceed the request size limit")
 
-    def _render_image_tokens(self, messages, template):
+    def _render_image_tokens(self, messages, template, deadline):
         """Track placeholders emitted by the template, not quoted in input text.
 
         A temporary render marker is removed before tokenization, so the pinned
@@ -323,11 +327,7 @@ class Frontend:
             image_offsets.add((offset, offset + len(IMAGE_PAD_TOKEN)))
             offset += len(IMAGE_PAD_TOKEN)
         rendered = IMAGE_PAD_TOKEN.join(parts)
-        encoded = self.tokenizer(
-            rendered,
-            add_special_tokens=False,
-            return_offsets_mapping=True,
-        )
+        encoded = self.tokenization.encode(rendered, deadline, offsets=True)
         positions = [
             index
             for index, span in enumerate(encoded["offset_mapping"])
@@ -418,9 +418,11 @@ class Frontend:
             deadline = self.request_deadline(body)
         with self._preparation(deadline):
             try:
-                tokens = self.tokenizer(content, add_special_tokens=add_special)[
-                    "input_ids"
-                ]
+                tokens = self.tokenization.encode(
+                    content, deadline, add_special_tokens=add_special
+                )["input_ids"]
+            except APIError:
+                raise
             except Exception as error:
                 raise APIError(400, "content could not be tokenized") from error
             remaining_request_time(deadline)
@@ -731,11 +733,11 @@ class Frontend:
         try:
             if images:
                 tokens, positions, rendered = self._render_image_tokens(
-                    prompt.messages, template
+                    prompt.messages, template, deadline
                 )
             else:
                 rendered = self._apply_chat_template(prompt.messages, template)
-                tokens = self.tokenizer(rendered, add_special_tokens=False)["input_ids"]
+                tokens = self.tokenization.encode(rendered, deadline)["input_ids"]
         except APIError:
             raise
         except Exception as error:

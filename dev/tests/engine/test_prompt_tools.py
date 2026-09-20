@@ -109,6 +109,20 @@ class PromptToolsTests(unittest.TestCase):
         self.assertEqual(actual, status, data)
         return json.loads(data)
 
+    def test_rendered_input_cache_is_shared_without_skipping_template_evaluation(self):
+        app = self.harness.app
+        encode = mock.Mock(wraps=self.tokenizer)
+        app.tokenization.tokenizer = encode
+        body = {"messages": [{"role": "user", "content": "hello world"}]}
+        app.apply_template(body)
+        count = app.count_tokens(body)
+        job, _, _ = app.prepare(body)
+        self.assertEqual(count, len(job.prompt_tokens))
+        self.assertEqual(encode.call_count, 1)
+        self.tokenizer.chat_template += " world"
+        self.assertNotEqual(app.count_tokens(body), count)
+        self.assertEqual(encode.call_count, 2)
+
     def test_raw_tokens_preserve_text_and_special_tokens(self):
         for text in (
             "",

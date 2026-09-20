@@ -130,6 +130,12 @@ isolated rendering limits also apply. URL inputs, opening passwords and citation
 are unsupported.
 Responses automatic truncation and unsupported history edits return errors.
 
+Rendered prompt tokenization is reused in a per-model LRU (32 entries, 8 MiB
+of packed token IDs and character offsets). Templates still run on every request
+so dynamic values stay current. Concurrent identical encodes share work; waiting
+respects each request deadline. `/status.tokenization_cache` reports use; `hits`
+counts both cached results and shared in-flight results.
+
 `POST /tokenize` accepts `{"content":"hello","add_special":false}` and returns
 `{"tokens":[...]}` using the loaded tokenizer. Special-token strings are recognized;
 `parse_special:false` and `with_pieces:true` are unsupported.

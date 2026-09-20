@@ -1692,6 +1692,9 @@ class ServerTest(unittest.TestCase):
         )
         app = object.__new__(request_frontend.Frontend)
         app.tokenizer = tokenizer
+        from server.tokenization import TokenizationCache
+
+        app.tokenization = TokenizationCache(tokenizer)
         app.max_context = 1024
         quoted = "中文 📷 <|vision_start|><|image_pad|><|vision_end|>"
         messages = [
@@ -1716,7 +1719,9 @@ class ServerTest(unittest.TestCase):
         pad_id = tokenizer.convert_tokens_to_ids(api_shapes.IMAGE_PAD_TOKEN)
         all_pads = [i for i, token in enumerate(baseline) if token == pad_id]
         self.assertEqual(len(all_pads), 5)
-        tokens, positions, rendered = app._render_image_tokens(messages, template)
+        tokens, positions, rendered = app._render_image_tokens(
+            messages, template, time.monotonic() + 10
+        )
         self.assertEqual(tokens, baseline)
         self.assertEqual(
             rendered, tokenizer.apply_chat_template(messages, tokenize=False)
@@ -1724,7 +1729,8 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(positions, [all_pads[1], all_pads[3]])
         # Render markers must not change prompt/cache identity on a repeat.
         self.assertEqual(
-            app._render_image_tokens(messages, template), (tokens, positions, rendered)
+            app._render_image_tokens(messages, template, time.monotonic() + 10),
+            (tokens, positions, rendered),
         )
         prepared = [
             SimpleNamespace(
@@ -5637,6 +5643,10 @@ class ServerTest(unittest.TestCase):
                 self.assertEqual(runtime.requests[-1].logical_max_output_tokens, 8)
                 self.assertEqual(runtime.requests[-1].prompt_tokens, (101, 102))
 
+        # This test changes the tokenizer between requests to probe context edges.
+        from server.tokenization import TokenizationCache
+
+        harness.app.tokenization = TokenizationCache(harness.tokenizer, max_entries=0)
         harness.app.max_context = 100000
         harness.app.default_max_new = 32768
         for length, expected in ((90000, 10000), (99999, 1)):
