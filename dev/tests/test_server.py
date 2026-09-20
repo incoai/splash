@@ -664,7 +664,14 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(Matcher.builds, ["one", "two", "three", "one"])
         self.assertEqual(
             factory.stats(),
-            {"entries": 2, "capacity": 2, "hits": 1, "misses": 4},
+            {
+                "entries": 2,
+                "capacity": 2,
+                "source_bytes": 8,
+                "source_budget_bytes": factory.DEFAULT_CACHE_SOURCE_BYTES,
+                "hits": 1,
+                "misses": 4,
+            },
         )
 
     def test_constraint_factory_shares_concurrent_cold_grammar_build(self):
