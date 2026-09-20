@@ -211,7 +211,7 @@ public:
           for (uint32_t d = 0; d < kDimension; ++d) {
             chunkKeys[base + row * kDimension + d] =
                 bf16(float(int((row * 37 + head * 101 + d * 17 + lane * 7) % 255) - 127) * 0.006f);
-            chunkValues[base + d * plan_.stride + row] =
+            chunkValues[base + uint64_t{d} * plan_.stride + row] =
                 bf16(float(int((row * 53 + head * 79 + d * 29 + lane * 19) % 255) - 127) * 0.007f);
           }
         }
