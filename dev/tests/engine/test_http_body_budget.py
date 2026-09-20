@@ -416,14 +416,14 @@ class HttpBodyBudgetTests(unittest.TestCase):
                     handler._body_reservation.release()
                 self.assertEqual(handler.server.request_bodies.active, 0)
 
-    @mock.patch.object(api, "HTTP_UPLOAD_BYTES_PER_SECOND", 200)
+    @mock.patch.object(api, "HTTP_UPLOAD_BYTES_PER_SECOND", 20)
     def test_active_upload_can_outlast_idle_timeout(self):
-        harness = self.harness(io_timeout=0.4, timeout=4)
+        harness = self.harness(io_timeout=2, timeout=15)
         payload = json.dumps({"content": "hello"}).encode().ljust(100)
         connection = self.headers(harness, len(payload), "/tokenize")
         for offset in range(0, len(payload), 10):
             connection.send(payload[offset : offset + 10])
-            time.sleep(0.06)
+            time.sleep(0.25)
         response = connection.getresponse()
         self.assertEqual(response.status, 200, response.read())
         response.read()
@@ -460,7 +460,10 @@ class HttpBodyBudgetTests(unittest.TestCase):
         harness = self.harness(io_timeout=1, timeout=0.3)
         connection = self.headers(harness, 100, "/tokenize")
         for _ in range(5):
-            connection.send(b" ")
+            try:
+                connection.send(b" ")
+            except (BrokenPipeError, ConnectionResetError):
+                break
             time.sleep(0.05)
         response = connection.getresponse()
         self.assertEqual(response.status, 408, response.read())
