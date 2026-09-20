@@ -185,7 +185,7 @@ class StreamingToolCallProjector:
         if not value:
             return
         self.parameter_value_fragments.append(value)
-        self._emit_argument(json.dumps(value)[1:-1], events)
+        self._emit_argument(json.dumps(value, ensure_ascii=False)[1:-1], events)
 
     def _finish_parameter(self, events):
         value_end = self.pending.find(self._PARAMETER_CLOSE)
@@ -209,10 +209,15 @@ class StreamingToolCallProjector:
             fragment = (
                 prefix
                 + json.dumps(
-                    self.parameter_name, separators=(",", ":"), allow_nan=False
+                    self.parameter_name,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    allow_nan=False,
                 )
                 + ":"
-                + json.dumps(value, separators=(",", ":"), allow_nan=False)
+                + json.dumps(
+                    value, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+                )
             )
             self._emit_argument(fragment, events)
         self.arguments[self.parameter_name] = value
@@ -225,7 +230,9 @@ class StreamingToolCallProjector:
         return True
 
     def _finish_call(self, events):
-        arguments = json.dumps(self.arguments, separators=(",", ":"), allow_nan=False)
+        arguments = json.dumps(
+            self.arguments, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+        )
         call = {
             "id": self.call_id,
             "type": "function",
@@ -325,7 +332,12 @@ class StreamingToolCallProjector:
                     prefix = "" if len(self.arguments) == 0 else ","
                     self._emit_argument(
                         prefix
-                        + json.dumps(name, separators=(",", ":"), allow_nan=False)
+                        + json.dumps(
+                            name,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                            allow_nan=False,
+                        )
                         + ':"',
                         events,
                     )
@@ -483,7 +495,10 @@ def parse_tool_calls(text, request_id, policy=None):
                 "function": {
                     "name": name,
                     "arguments": json.dumps(
-                        arguments, separators=(",", ":"), allow_nan=False
+                        arguments,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        allow_nan=False,
                     ),
                 },
             }

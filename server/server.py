@@ -222,7 +222,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             self.wfile.write(data)
 
     def _json(self, status, payload):
-        data = json.dumps(payload, separators=(",", ":")).encode()
+        data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
         self._send(status, data, "application/json")
 
     def _error(self, error, anthropic=False):
@@ -1102,14 +1102,14 @@ class FrontendHandler(BaseHTTPRequestHandler):
         data = (
             payload
             if isinstance(payload, str)
-            else json.dumps(payload, separators=(",", ":"))
+            else json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         )
         self.wfile.write(f"data: {data}\n\n".encode())
         self.wfile.flush()
         self._last_sse_write = time.monotonic()
 
     def _responses_sse(self, event, payload):
-        data = json.dumps(payload, separators=(",", ":"))
+        data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         self.wfile.write(f"event: {event}\ndata: {data}\n\n".encode())
         self.wfile.flush()
         self._last_sse_write = time.monotonic()

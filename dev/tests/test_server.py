@@ -3359,6 +3359,93 @@ class ServerTest(unittest.TestCase):
             '{"city":"Paris"}',
         )
 
+    def test_unicode_output_stays_utf8_on_the_wire(self):
+        tokenizer = FakeTokenizer()
+        tokenizer.fragments[40] = (
+            "Hello 你好世界 こんにちは世界 안녕하세요 세계 Café 🌍\n"
+        )
+        tokenizer.fragments[41] = (
+            "<tool_call>\n<function=echo>\n<parameter=text>\n"
+            "你好世界\n</parameter>\n</function>\n</tool_call>\n"
+        )
+        tokenizer.backend_tokenizer = _byte_backend(tokenizer.fragments)
+        runtime = FakeRuntime(
+            Plan([[40]]), Plan([[40]]), Plan([[40]]), Plan([[41]]), Plan([[41]])
+        )
+        harness = self.harness(runtime, tokenizer=tokenizer)
+        text = tokenizer.fragments[40]
+        wire_text = json.dumps(text, ensure_ascii=False)[1:-1].encode()
+        tools = [{"type": "function", "function": {"name": "echo"}}]
+
+        status, _, payload = harness.request(
+            "POST", "/v1/chat/completions", self.body(reasoning_effort="none")
+        )
+        self.assertEqual(status, 200)
+        self.assertIn(wire_text, payload)
+        self.assertNotIn(b"\\u4f60", payload)
+        self.assertNotIn(b"\\ud83c", payload)
+        self.assertEqual(json.loads(payload)["choices"][0]["message"]["content"], text)
+
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/chat/completions",
+            self.body(stream=True, reasoning_effort="none"),
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("🌍".encode(), payload)
+        self.assertNotIn(b"\\ud83c", payload)
+        chunks = [
+            json.loads(line[6:])
+            for line in payload.decode().splitlines()
+            if line.startswith("data: {")
+        ]
+        streamed = "".join(
+            chunk["choices"][0]["delta"].get("content", "") for chunk in chunks
+        )
+        self.assertEqual(streamed, text)
+
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/responses",
+            self.responses_body(stream=True, reasoning={"effort": "none"}),
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("🌍".encode(), payload)
+        self.assertNotIn(b"\\ud83c", payload)
+        events = self.response_events(payload)
+        streamed = "".join(
+            event["delta"]
+            for event in events
+            if event["type"] == "response.output_text.delta"
+        )
+        self.assertEqual(streamed, text)
+
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                status, _, payload = harness.request(
+                    "POST",
+                    "/v1/chat/completions",
+                    self.body(tools=tools, stream=stream, reasoning_effort="none"),
+                )
+                self.assertEqual(status, 200)
+                self.assertIn("你好世界".encode(), payload)
+                self.assertNotIn(b"\\u4f60", payload)
+                if stream:
+                    chunks = [
+                        json.loads(line[6:])
+                        for line in payload.decode().splitlines()
+                        if line.startswith("data: {")
+                    ]
+                    arguments = "".join(
+                        delta["function"].get("arguments", "")
+                        for chunk in chunks
+                        for delta in chunk["choices"][0]["delta"].get("tool_calls", [])
+                    )
+                else:
+                    message = json.loads(payload)["choices"][0]["message"]
+                    arguments = message["tool_calls"][0]["function"]["arguments"]
+                self.assertEqual(arguments, '{"text":"你好世界"}')
+
     def test_streaming_tool_call_arrives_before_native_done(self):
         plan = Plan([[13]], reason="length", after_terminal=True)
         harness = self.harness(FakeRuntime(plan))
