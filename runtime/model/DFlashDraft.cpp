@@ -142,7 +142,7 @@ void DFlashDraft::addContextPrefill(
 
 void DFlashDraft::addDecode(
     metal::CommandGraph &graph, DFlashDecodeBuffers buffers,
-    const ops::Q4Projection &vocabularyProjection,
+    const ops::VocabularyProjection &vocabularyProjection,
     std::span<const uint32_t> cacheLengths, uint32_t lanes,
     ops::Q4DispatchStats &stats) const {
   if (!lanes || lanes > ExecutionLimits::maximumBatchWidth ||
@@ -230,8 +230,10 @@ void DFlashDraft::addDecode(
                              weights_.finalNorm,
                              buffers.finalHidden, layout.hiddenSize, rows, buffers.linearScratch);
   const ops::LinearMatrix head{layout.vocabularySize, layout.hiddenSize};
-  operators_.linear().addDecodeBatch(graph, buffers.finalHidden,
-                     vocabularyProjection, buffers.logits, head, lanes, stats, buffers.linearScratch, true);
+  std::visit([&](const auto &vocab) {
+    operators_.linear().addDecodeBatch(graph, buffers.finalHidden,
+                       vocab, buffers.logits, head, lanes, stats, buffers.linearScratch, true);
+  }, vocabularyProjection);
   const ops::LinearMatrix selector{layout.selectorRank, layout.hiddenSize};
   operators_.linear().addDecodeBatch(graph,
                      buffers.finalHidden, weights_.selectorProjection,

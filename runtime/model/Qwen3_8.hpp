@@ -94,4 +94,83 @@ loadQwen3_8Weights(metal::MetalBackend &backend,
                    const std::filesystem::path &directory,
                    Qwen3_8Layout layout = {});
 
+struct Qwen3_8Q8Layout final {
+  static constexpr std::string_view layerMagic = "MDFL0008";
+  static constexpr std::string_view headMagic = "MDFL0008";
+  static constexpr std::array<uint32_t, 5> hiddenCaptureLayers{
+      5, 19, 33, 47, 61};
+
+  uint32_t maximumContextTokens = kv::kMaximumLogicalTokens;
+  uint32_t layers = 64;
+  uint32_t hiddenSize = 5120;
+  uint32_t vocabularySize = 248320;
+  uint32_t packedGdnWidth = 16640;
+  uint32_t packedFullWidth = 14336;
+  uint32_t convolutionDimension = 10240;
+  uint32_t gdnKeyHeads = 16;
+  uint32_t gdnValueHeads = 48;
+  uint32_t gdnHeadDimension = 128;
+  uint32_t attentionWidth = 6144;
+  uint32_t intermediateSize = 17408;
+  uint32_t attentionQueryHeads = 24;
+  uint32_t attentionKvHeads = 4;
+  uint32_t attentionHeadDimension = 256;
+  uint32_t rotaryPairs = 32;
+  float rotaryTheta = 10'000'000.0F;
+  uint32_t fullAttentionPeriod = 4;
+  uint32_t maskToken = 248070;
+  std::array<uint32_t, 2> stopTokens{248044, 248046};
+
+  [[nodiscard]] constexpr bool
+  isFullAttentionLayer(uint32_t layer) const noexcept {
+    return fullAttentionPeriod && (layer + 1) % fullAttentionPeriod == 0;
+  }
+  [[nodiscard]] constexpr uint32_t attentionLayerCount() const noexcept {
+    return fullAttentionPeriod ? layers / fullAttentionPeriod : 0;
+  }
+  [[nodiscard]] constexpr kv::Layout kvLayout() const noexcept {
+    return {attentionLayerCount(), attentionKvHeads,
+            attentionHeadDimension};
+  }
+  [[nodiscard]] constexpr GdnStateLayout gdnStateLayout() const noexcept {
+    return {layers - attentionLayerCount(), kGdnConvolutionTaps - 1,
+            convolutionDimension,
+            gdnValueHeads, gdnHeadDimension, gdnHeadDimension};
+  }
+  [[nodiscard]] constexpr QwenMixerGeometry mixerGeometry() const noexcept {
+    return {hiddenSize,     packedGdnWidth, packedFullWidth,
+            convolutionDimension, gdnValueHeads,  gdnHeadDimension,
+            attentionWidth, attentionHeadDimension};
+  }
+  [[nodiscard]] constexpr uint32_t capturedHiddenSize() const noexcept {
+    return hiddenSize * hiddenCaptureLayers.size();
+  }
+  bool operator==(const Qwen3_8Q8Layout &) const = default;
+};
+
+struct Qwen3_8Q8LayerWeights final {
+  metal::MetalBuffer inputNorm;
+  QwenMixerWeights mixer;
+  metal::MetalBuffer postAttentionNorm;
+  ops::Q8Projection gateProjection;
+  ops::Q8Projection upProjection;
+  ops::Q8Projection downProjection;
+};
+
+struct Qwen3_8Q8Weights final {
+  Qwen3_8Q8Layout layout;
+  std::vector<Qwen3_8Q8LayerWeights> layers;
+  metal::MetalBuffer finalNorm;
+  ops::Q8Projection logitsProjection;
+  ops::Q8Projection tokenEmbedding;
+  std::vector<WeightFileRecord> files;
+  uint64_t actualAllocatedBytes = 0;
+  std::string manifestFingerprintSha256;
+};
+
+[[nodiscard]] Qwen3_8Q8Weights
+loadQwen3_8Q8Weights(metal::MetalBackend &backend,
+                     const std::filesystem::path &directory,
+                     Qwen3_8Q8Layout layout = {});
+
 } // namespace splash::model

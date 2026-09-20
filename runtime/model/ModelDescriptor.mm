@@ -173,6 +173,11 @@ ModelDescriptor qwen38Descriptor(std::string name) {
                              DFlashDraftLayout{}, ops::VisionLayout{});
 }
 
+ModelDescriptor qwen38Q8Descriptor(std::string name) {
+  return makeModelDescriptor(std::move(name), Qwen3_8Q8Layout{},
+                             DFlashDraftLayout{}, ops::VisionLayout{});
+}
+
 ModelDescriptor qwen36Descriptor(std::string name) {
   constexpr Qwen3_6MoeLayout target;
   ops::VisionLayout vision;
@@ -219,8 +224,25 @@ void validateQwen38(NSDictionary *manifest,
   validateTokenizer(root, descriptor, "qwen3_5_text");
 }
 
-void validateLayerTypes(NSDictionary *target,
-                        const Qwen3_6MoeLayout &layout) {
+void validateQwen38Q8(NSDictionary *manifest,
+                      const std::filesystem::path &root,
+                      const ModelDescriptor &descriptor) {
+  requireEqual(requireUnsigned(manifest, @"schema_version", "schema_version"),
+               5, "schema_version");
+  NSDictionary *format =
+      requireObject(manifest, @"format", "model weight format");
+  requireEqual(requireUnsigned(format, @"q8_bits", "q8_bits"), 8,
+               "q8_bits");
+  requireEqual(requireUnsigned(format, @"quant_group_size", "quant_group_size"),
+               kQ4GroupElements, "quant_group_size");
+  requireEqual(requireUnsigned(format, @"storage_n", "storage_n"),
+               kQ4StorageN, "storage_n");
+  validateCommonFormat(format, Qwen3_8Q8Layout::layerMagic);
+  validateTokenizer(root, descriptor, "qwen3_5_text");
+}
+
+template <class Layout>
+void validateLayerTypes(NSDictionary *target, const Layout &layout) {
   NSArray *types = requireArray(target, @"layer_types", "target layer_types");
   requireEqual(types.count, layout.layers, "target layer_types count");
   for (uint32_t layer = 0; layer < layout.layers; ++layer) {
@@ -386,6 +408,9 @@ ModelDescriptor inspectModelPackage(const std::filesystem::path &root) {
     if (format == "splash-packed-q4") {
       descriptor = qwen38Descriptor(model);
       validateQwen38(manifest, root, descriptor);
+    } else if (format == "splash-packed-q8") {
+      descriptor = qwen38Q8Descriptor(model);
+      validateQwen38Q8(manifest, root, descriptor);
     } else if (format == "splash-packed-q4-moe") {
       descriptor = qwen36Descriptor(model);
       validateQwen36(manifest, root, descriptor);

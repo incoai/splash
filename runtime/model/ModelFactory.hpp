@@ -15,7 +15,8 @@
 
 namespace splash::model {
 
-using TargetWeights = std::variant<Qwen3_8Weights, Qwen3_6MoeWeights>;
+using TargetWeights =
+    std::variant<Qwen3_8Weights, Qwen3_6MoeWeights, Qwen3_8Q8Weights>;
 
 struct ModelPackage final {
   ModelDescriptor descriptor;

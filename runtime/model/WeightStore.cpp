@@ -280,6 +280,21 @@ ops::Q8Projection readQ8Projection(WeightFile &file,
     };
 }
 
+ops::Q8Projection readQ8ProjectionComponents(WeightFile &file,
+                                             uint32_t outputSize,
+                                             uint32_t inputSize,
+                                             std::string_view label) {
+    const uint64_t elements = q4Elements(outputSize, inputSize);
+    const std::string prefix(label);
+    return {
+        file.section(elements, prefix + "-weights"),
+        file.section(elements / 32, prefix + "-scales"),
+        file.section(elements / 32, prefix + "-biases"),
+        outputSize,
+        inputSize,
+    };
+}
+
 ops::ExpertQ4Projection
 readExpertQ4Projection(WeightFile &file, uint32_t experts,
                        uint32_t outputSize, uint32_t inputSize,

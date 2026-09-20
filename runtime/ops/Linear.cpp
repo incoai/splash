@@ -81,6 +81,26 @@ void requireProjection(const Q4Projection &p, LinearMatrix matrix) {
   requireBytes(p.biases, bytes);
 }
 
+void requireProjection(const Q8Projection &p, LinearMatrix matrix) {
+  if (p.outputSize != matrix.outputSize || p.inputSize != matrix.inputSize)
+    throw std::invalid_argument("Q8 projection does not match plan");
+  requireBytes(p.weights, uint64_t{matrix.outputSize} * matrix.inputSize);
+  const uint64_t bytes = uint64_t{matrix.outputSize} * (matrix.inputSize / kQuantGroup) * 2;
+  requireBytes(p.scales, bytes);
+  requireBytes(p.biases, bytes);
+}
+
+std::string q8PipelineName(std::string_view q4Name) {
+  std::string name(q4Name);
+  const std::string from = "_q4_";
+  const std::string to = "_q8_";
+  size_t pos = name.find(from);
+  if (pos != std::string::npos) {
+    name.replace(pos, from.length(), to);
+  }
+  return name;
+}
+
 void account(Q4DispatchStats &stats, uint32_t lanes, uint32_t count) noexcept {
   if (lanes == 1) return;
   stats.fusedSourceOperations += uint64_t{lanes} * count;
@@ -441,6 +461,46 @@ LinearConfig Q4Linear::baseline(LinearWorkload w) const {
           groups(tiles128, lanes == 2 ? kN128M16Groups : kN128Groups)};
 }
 
+// The decode policy of Splash 1.0, which only selects tiles with Q8 kernels.
+LinearConfig Q4Linear::q8Baseline(LinearWorkload w) const {
+  validate(w);
+  const uint32_t tiles128 = w.matrix.outputSize / 128;
+  const uint32_t tiles256 = w.matrix.outputSize / 256;
+  if (w.phase == LinearPhase::Prefill) return baseline(w);
+  const uint32_t lanes = w.rows / SPLASH_TARGET_VERIFY_ROWS;
+  const auto groups = [&](uint32_t tiles, DecodeGroupPolicy policy) {
+    return appleGpuFamily_ >= 10 ? decodeGroups(tiles, gpuCores_, policy)
+                                 : tiles;
+  };
+  if (w.epilogue == LinearEpilogue::GateUp) {
+    if (appleGpuFamily_ < 10) {
+      const auto resident = static_cast<uint32_t>(
+          std::max(1L, std::lround(kApple9GateUpGroupsPerCore * gpuCores_)));
+      return {LinearTile::N256, std::min(tiles256, resident)};
+    }
+    return {LinearTile::N256, groups(tiles256, kGateUpGroups)};
+  }
+  if (lanes == 1) return {LinearTile::Paired128, groups(tiles128, kN128Groups)};
+  if (lanes == 3 && (appleGpuFamily_ >= 10 ||
+      (appleGpuFamily_ == 9 && w.epilogue == LinearEpilogue::None)))
+    return {LinearTile::N128, groups(tiles128, kFourSimdgroupGroups),
+            LinearSimdgroups::Four};
+  if (lanes >= 3 && w.epilogue == LinearEpilogue::None &&
+      tiles256 >= kWideDecodeTilesPerCore * gpuCores_)
+    return {LinearTile::N256, groups(tiles256, kN256Groups)};
+  return {LinearTile::N128,
+          groups(tiles128, lanes == 2 ? kN128M16Groups : kN128Groups)};
+}
+
+LinearPlan Q4Linear::q8Plan(LinearWorkload workload) const {
+  LinearPlan selected = plan(workload);
+  const LinearTile tile = selected.configuration().tile;
+  if (tile == LinearTile::N128 || tile == LinearTile::N256 ||
+      tile == LinearTile::Paired128)
+    return selected;
+  return LinearPlan(workload, q8Baseline(workload));
+}
+
 LinearPlan Q4Linear::plan(LinearWorkload workload) const {
   const auto found = std::lower_bound(choices_.begin(), choices_.end(), workload,
       [](const LinearChoice &choice, LinearWorkload key) { return choice.workload < key; });
@@ -650,6 +710,104 @@ void Q4Linear::addGateUpBatch(metal::CommandGraph &graph, metal::MetalBuffer inp
     const Q4Projection &gate, const Q4Projection &up, metal::MetalBuffer gateScratch,
     metal::MetalBuffer output, LinearMatrix matrix, uint32_t lanes, Q4DispatchStats &stats, LinearScratch scratch, bool inputPrepared) const {
   add(graph, {input, output, {}, {}, gateScratch, {}, scratch, inputPrepared}, up, plan(decode(matrix, lanes, LinearEpilogue::GateUp)), &gate, &stats);
+}
+
+void Q4Linear::add(metal::CommandGraph &graph, LinearBuffers b,
+    const Q8Projection &p, const LinearPlan &selected, const Q8Projection *gate,
+    Q4DispatchStats *stats) const {
+  const LinearWorkload w = selected.workload();
+  const auto [n, k] = w.matrix;
+  requireProjection(p, w.matrix);
+  requireBytes(b.input, uint64_t{selected.storageRows()} * k * 2);
+  requireBytes(b.output, uint64_t{selected.storageRows()} * n * 2);
+  requireBytes(b.sums, selected.sumsBytes());
+  requireBytes(b.gateScratch, selected.gateScratchBytes());
+  requireBytes(b.downSums, selected.downSumsBytes());
+  if (w.epilogue == LinearEpilogue::Residual)
+    requireBytes(b.residual, uint64_t{selected.storageRows()} * n * 2);
+  if (w.epilogue == LinearEpilogue::GateUp) {
+    if (!gate) throw std::invalid_argument("Q8 gate projection is missing");
+    requireProjection(*gate, w.matrix);
+  } else if (gate) throw std::invalid_argument("unexpected Q8 gate projection");
+  const auto dispatch = [&](std::string_view name,
+      std::initializer_list<metal::MetalBuffer> bindings) {
+    const std::string q8Name = q8PipelineName(name);
+    if (w.phase == LinearPhase::Prefill)
+      graph.add(q8Name, bindings,
+          Q4PrefillParams{w.matrix.outputSize, w.matrix.inputSize},
+          {selected.storageRows() / kPrefillRows, n / selected.tileColumns(), 1},
+          {selected.threadsPerThreadgroup(), 1, 1});
+    else {
+      const uint32_t groups = selected.configuration().groups;
+      graph.add(q8Name, bindings, Q4Params{n, k, groups}, {groups, 1, 1},
+          {selected.threadsPerThreadgroup(), 1, 1});
+    }
+  };
+  if (w.epilogue == LinearEpilogue::GateUp) {
+    if (selected.secondPipeline().empty())
+      dispatch(selected.pipeline(), {b.input, gate->weights, gate->scales, gate->biases,
+          b.output, p.weights, p.scales, p.biases});
+    else {
+      dispatch(selected.pipeline(), {b.input, gate->weights, gate->scales, gate->biases, b.gateScratch});
+      dispatch(selected.secondPipeline(), {b.input, p.weights, p.scales, p.biases, b.gateScratch, b.output});
+    }
+  } else if (w.epilogue == LinearEpilogue::UpWithGate)
+    dispatch(selected.pipeline(), {b.input, p.weights, p.scales, p.biases,
+        b.gateScratch, b.output, b.sums, b.downSums});
+  else if (w.epilogue == LinearEpilogue::Residual) {
+    if (w.phase == LinearPhase::Prefill)
+      dispatch(selected.pipeline(), {b.input, p.weights, p.scales, p.biases, b.residual, b.output, b.sums});
+    else dispatch(selected.pipeline(), {b.input, p.weights, p.scales, p.biases, b.residual, b.output});
+  } else if (w.phase == LinearPhase::Prefill)
+    dispatch(selected.pipeline(), {b.input, p.weights, p.scales, p.biases, b.output, b.sums});
+  else dispatch(selected.pipeline(), {b.input, p.weights, p.scales, p.biases, b.output});
+  if (stats && w.phase == LinearPhase::Decode)
+    account(*stats, w.rows / SPLASH_TARGET_VERIFY_ROWS, selected.secondPipeline().empty() ? 1 : 2);
+}
+
+void Q4Linear::addPrefill(metal::CommandGraph &graph, metal::MetalBuffer input,
+    const Q8Projection &p, metal::MetalBuffer output, metal::MetalBuffer sums,
+    LinearMatrix matrix, uint32_t rows) const {
+  add(graph, {input, output, sums, {}, {}, {}}, p,
+      q8Plan({matrix, rows, LinearPhase::Prefill, LinearEpilogue::None}));
+}
+
+void Q4Linear::addPrefillResidual(metal::CommandGraph &graph, metal::MetalBuffer input,
+    const Q8Projection &p, metal::MetalBuffer residual, metal::MetalBuffer output,
+    metal::MetalBuffer sums, LinearMatrix matrix, uint32_t rows) const {
+  add(graph, {input, output, sums, residual, {}, {}}, p,
+      q8Plan({matrix, rows, LinearPhase::Prefill, LinearEpilogue::Residual}));
+}
+
+void Q4Linear::addPrefillUpWithGate(metal::CommandGraph &graph, metal::MetalBuffer input,
+    const Q8Projection &up, metal::MetalBuffer gateScratch, metal::MetalBuffer output,
+    metal::MetalBuffer sums, metal::MetalBuffer downSums, LinearMatrix matrix, uint32_t rows) const {
+  add(graph, {input, output, sums, {}, gateScratch, downSums}, up,
+      q8Plan({matrix, rows, LinearPhase::Prefill, LinearEpilogue::UpWithGate}));
+}
+
+void Q4Linear::addDecode(metal::CommandGraph &graph, metal::MetalBuffer input,
+    const Q8Projection &p, metal::MetalBuffer output, LinearMatrix matrix,
+    LinearScratch) const {
+  add(graph, {input, output, {}, {}, {}, {}}, p, q8Plan(decode(matrix, 1, LinearEpilogue::None)));
+}
+
+void Q4Linear::addDecodeBatch(metal::CommandGraph &graph, metal::MetalBuffer input,
+    const Q8Projection &p, metal::MetalBuffer output, LinearMatrix matrix,
+    uint32_t lanes, Q4DispatchStats &stats, LinearScratch, bool) const {
+  add(graph, {input, output, {}, {}, {}, {}}, p, q8Plan(decode(matrix, lanes, LinearEpilogue::None)), nullptr, &stats);
+}
+
+void Q4Linear::addResidualBatch(metal::CommandGraph &graph, metal::MetalBuffer input,
+    const Q8Projection &p, metal::MetalBuffer residual, metal::MetalBuffer output,
+    LinearMatrix matrix, uint32_t lanes, Q4DispatchStats &stats, LinearScratch, bool) const {
+  add(graph, {input, output, {}, residual, {}, {}}, p, q8Plan(decode(matrix, lanes, LinearEpilogue::Residual)), nullptr, &stats);
+}
+
+void Q4Linear::addGateUpBatch(metal::CommandGraph &graph, metal::MetalBuffer input,
+    const Q8Projection &gate, const Q8Projection &up, metal::MetalBuffer gateScratch,
+    metal::MetalBuffer output, LinearMatrix matrix, uint32_t lanes, Q4DispatchStats &stats, LinearScratch, bool) const {
+  add(graph, {input, output, {}, {}, gateScratch, {}}, up, q8Plan(decode(matrix, lanes, LinearEpilogue::GateUp)), &gate, &stats);
 }
 
 } // namespace splash::ops

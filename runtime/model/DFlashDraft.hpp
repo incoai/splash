@@ -196,7 +196,7 @@ public:
                          std::span<const DFlashPrefillSpan> spans) const;
 
   void addDecode(metal::CommandGraph &graph, DFlashDecodeBuffers buffers,
-                 const ops::Q4Projection &vocabularyProjection,
+                 const ops::VocabularyProjection &vocabularyProjection,
                  std::span<const uint32_t> cacheLengths, uint32_t lanes,
                  ops::Q4DispatchStats &stats) const;
   void addSelection(metal::CommandGraph &graph,

@@ -43,6 +43,7 @@ REPO_ID = re.compile(
 PACKAGE_FORMATS = {
     "splash-packed-q4": (3, "MDFL0006"),
     "splash-packed-q4-moe": (4, "MDFM0001"),
+    "splash-packed-q8": (5, "MDFL0008"),
 }
 
 
@@ -174,7 +175,7 @@ def validate_package_manifest(path: Path):
         for parent in PurePosixPath(name).parents
     ):
         raise ModelError("runtime package artifact paths overlap")
-    target_layers, draft_layers = (64, 5) if layout[0] == 3 else (40, 6)
+    target_layers, draft_layers = (64, 5) if layout[0] in (3, 5) else (40, 6)
     required_files = {
         "target/embedding.bin",
         "target/head.bin",

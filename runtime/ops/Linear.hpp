@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <span>
 #include <string_view>
+#include <variant>
 #include <vector>
 
 namespace splash::ops {
@@ -31,6 +32,8 @@ struct Q8Projection final {
   uint32_t outputSize = 0;
   uint32_t inputSize = 0;
 };
+
+using VocabularyProjection = std::variant<Q4Projection, Q8Projection>;
 
 // Expert-major Q4 slabs keep one complete StorageN-packed projection per
 // expert. The operator selects expertStrideBytes directly; no per-expert
@@ -224,8 +227,58 @@ public:
                         uint32_t lanes, Q4DispatchStats &stats,
                         LinearScratch scratch = {}, bool inputPrepared = false) const;
 
+  // Q8 projections share the Q4 planner but only have kernels for the N128,
+  // N256 and Paired128 tiles; any other planned tile falls back to
+  // q8Baseline(). Q8 kernels read the bf16 input directly, so the Q4 scratch
+  // workspace and inputPrepared are accepted for call-site symmetry and ignored.
+  void add(metal::CommandGraph &graph, LinearBuffers buffers,
+           const Q8Projection &projection, const LinearPlan &plan,
+           const Q8Projection *gate = nullptr,
+           Q4DispatchStats *stats = nullptr) const;
+  void addPrefill(metal::CommandGraph &graph, metal::MetalBuffer input,
+                  const Q8Projection &projection, metal::MetalBuffer output,
+                  metal::MetalBuffer sums, LinearMatrix matrix,
+                  uint32_t rows) const;
+  void addPrefillUpWithGate(
+      metal::CommandGraph &graph, metal::MetalBuffer input,
+      const Q8Projection &up, metal::MetalBuffer gateScratch,
+      metal::MetalBuffer output, metal::MetalBuffer sums,
+      metal::MetalBuffer downSums, LinearMatrix matrix,
+      uint32_t rows) const;
+  void addPrefillResidual(metal::CommandGraph &graph,
+                          metal::MetalBuffer input,
+                          const Q8Projection &projection,
+                          metal::MetalBuffer residual,
+                          metal::MetalBuffer output, metal::MetalBuffer sums,
+                          LinearMatrix matrix, uint32_t rows) const;
+  void addDecode(metal::CommandGraph &graph,
+                 metal::MetalBuffer input, const Q8Projection &projection,
+                 metal::MetalBuffer output, LinearMatrix matrix,
+                 LinearScratch scratch = {}) const;
+  void addDecodeBatch(metal::CommandGraph &graph,
+                      metal::MetalBuffer input,
+                      const Q8Projection &projection,
+                      metal::MetalBuffer output, LinearMatrix matrix,
+                      uint32_t lanes, Q4DispatchStats &stats,
+                      LinearScratch scratch = {}, bool inputPrepared = false) const;
+  void addGateUpBatch(metal::CommandGraph &graph, metal::MetalBuffer input,
+                      const Q8Projection &gate, const Q8Projection &up,
+                      metal::MetalBuffer gateScratch,
+                      metal::MetalBuffer output, LinearMatrix matrix,
+                      uint32_t lanes, Q4DispatchStats &stats,
+                      LinearScratch scratch = {}, bool inputPrepared = false) const;
+  void addResidualBatch(metal::CommandGraph &graph,
+                        metal::MetalBuffer input,
+                        const Q8Projection &projection,
+                        metal::MetalBuffer residual,
+                        metal::MetalBuffer output, LinearMatrix matrix,
+                        uint32_t lanes, Q4DispatchStats &stats,
+                        LinearScratch scratch = {}, bool inputPrepared = false) const;
+
 private:
   [[nodiscard]] LinearConfig baseline(LinearWorkload workload) const;
+  [[nodiscard]] LinearConfig q8Baseline(LinearWorkload workload) const;
+  [[nodiscard]] LinearPlan q8Plan(LinearWorkload workload) const;
   uint32_t appleGpuFamily_ = 0;
   uint32_t gpuCores_ = 0;
   std::vector<LinearChoice> choices_;

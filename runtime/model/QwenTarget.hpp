@@ -21,6 +21,7 @@ namespace splash::model {
 
 struct Qwen3_8Weights;
 struct Qwen3_6MoeWeights;
+struct Qwen3_8Q8Weights;
 
 enum class QwenFfnKind : uint8_t { Dense, SparseMoe };
 
@@ -42,7 +43,26 @@ struct QwenAttentionWeights final {
   ops::Q4Projection outputProjection;
 };
 
-using QwenMixerWeights = std::variant<QwenGdnWeights, QwenAttentionWeights>;
+struct QwenGdnQ8Weights final {
+  ops::Q8Projection inputProjection;
+  metal::MetalBuffer convolutionWeights;
+  metal::MetalBuffer decay;
+  metal::MetalBuffer timeBias;
+  metal::MetalBuffer mixerNorm;
+  ops::Q8Projection outputProjection;
+};
+
+struct QwenAttentionQ8Weights final {
+  ops::Q8Projection inputProjection;
+  metal::MetalBuffer queryNorm;
+  metal::MetalBuffer keyNorm;
+  ops::Q8Projection outputProjection;
+};
+
+using QwenMixerWeights = std::variant<QwenGdnWeights, QwenAttentionWeights,
+                                      QwenGdnQ8Weights, QwenAttentionQ8Weights>;
+
+using VocabularyProjection = ops::VocabularyProjection;
 
 // Sizes of the mixer sections in a packed layer file.
 struct QwenMixerGeometry final {
@@ -61,8 +81,13 @@ struct QwenMixerGeometry final {
                                              metal::MetalBackend &backend,
                                              const QwenMixerGeometry &geometry,
                                              bool fullAttention);
+[[nodiscard]] QwenMixerWeights readQwenQ8Mixer(WeightFile &file,
+                                               metal::MetalBackend &backend,
+                                               const QwenMixerGeometry &geometry,
+                                               bool fullAttention);
 
 inline constexpr std::string_view kEmbeddingMagic = "MDFE0001";
+inline constexpr std::string_view kEmbeddingQ8Magic = "MDFE0008";
 
 // Reads a packed target directory: one file per hybrid layer (input norm,
 // mixer, post-attention norm, then the architecture's FFN through readFfn),
@@ -73,6 +98,7 @@ loadQwenTargetWeights(metal::MetalBackend &backend,
                       const std::filesystem::path &directory,
                       const Layout &layout, std::string_view headMagic,
                       ReadFfn readFfn) {
+  constexpr bool isQ8 = std::is_same_v<decltype(Weights{}.logitsProjection), ops::Q8Projection>;
   const uint64_t allocationBaseline = backend.memoryStats().allocatedBytes;
   Weights result;
   result.layout = layout;
@@ -88,8 +114,13 @@ loadQwenTargetWeights(metal::MetalBackend &backend,
                     Layout::layerMagic, layerIndex, fullAttention ? 1U : 0U);
     auto &layer = result.layers.emplace_back();
     layer.inputNorm = file.section(hiddenBytes, "input-norm");
-    layer.mixer =
-        readQwenMixer(file, backend, layout.mixerGeometry(), fullAttention);
+    if constexpr (isQ8) {
+      layer.mixer =
+          readQwenQ8Mixer(file, backend, layout.mixerGeometry(), fullAttention);
+    } else {
+      layer.mixer =
+          readQwenMixer(file, backend, layout.mixerGeometry(), fullAttention);
+    }
     layer.postAttentionNorm =
         file.section(hiddenBytes, "post-attention-norm");
     readFfn(file, layer);
@@ -101,17 +132,28 @@ loadQwenTargetWeights(metal::MetalBackend &backend,
     WeightFile file(backend, directory / "head.bin", "target/head.bin",
                     headMagic, layout.layers, 2);
     result.finalNorm = file.section(hiddenBytes, "final-norm");
-    result.logitsProjection = readQ4Projection(
-        file, backend, layout.vocabularySize, layout.hiddenSize, "logits");
+    if constexpr (isQ8) {
+      result.logitsProjection = readQ8Projection(
+          file, backend, layout.vocabularySize, layout.hiddenSize, "logits");
+    } else {
+      result.logitsProjection = readQ4Projection(
+          file, backend, layout.vocabularySize, layout.hiddenSize, "logits");
+    }
     file.finish();
     result.files.push_back(file.record());
   }
   {
+    constexpr std::string_view embeddingMagic = isQ8 ? kEmbeddingQ8Magic : kEmbeddingMagic;
     WeightFile file(backend, directory / "embedding.bin",
-                    "target/embedding.bin", kEmbeddingMagic,
+                    "target/embedding.bin", embeddingMagic,
                     layout.vocabularySize, layout.hiddenSize);
-    result.tokenEmbedding = readQ4ProjectionComponents(
-        file, layout.vocabularySize, layout.hiddenSize, "embedding");
+    if constexpr (isQ8) {
+      result.tokenEmbedding = readQ8ProjectionComponents(
+          file, layout.vocabularySize, layout.hiddenSize, "embedding");
+    } else {
+      result.tokenEmbedding = readQ4ProjectionComponents(
+          file, layout.vocabularySize, layout.hiddenSize, "embedding");
+    }
     file.finish();
     result.files.push_back(file.record());
   }
@@ -313,6 +355,8 @@ struct QwenTargetCommitBuffers final {
 qwenTargetGeometry(const Qwen3_8Weights &weights);
 [[nodiscard]] QwenTargetGeometry
 qwenTargetGeometry(const Qwen3_6MoeWeights &weights);
+[[nodiscard]] QwenTargetGeometry
+qwenTargetGeometry(const Qwen3_8Q8Weights &weights);
 
 // Builds the shared Qwen GDN/attention layer graph with the target's dense
 // or sparse-MoE FFN. Architecture-specific loaders supply the package tensors.
@@ -324,11 +368,14 @@ public:
   QwenTarget(const Qwen3_6MoeWeights &weights, metal::MetalBackend &backend,
              const ops::ExecutionPlans &operators,
              kv::Format format = kv::Format::Int8);
+  QwenTarget(const Qwen3_8Q8Weights &weights, metal::MetalBackend &backend,
+             const ops::ExecutionPlans &operators,
+             kv::Format format = kv::Format::Int8);
 
   [[nodiscard]] const QwenTargetGeometry &geometry() const noexcept {
     return geometry_;
   }
-  [[nodiscard]] const ops::Q4Projection &
+  [[nodiscard]] VocabularyProjection
   vocabularyProjection() const noexcept;
 
   void addPrefill(
@@ -351,7 +398,8 @@ public:
 
 private:
   using WeightView =
-      std::variant<const Qwen3_8Weights *, const Qwen3_6MoeWeights *>;
+      std::variant<const Qwen3_8Weights *, const Qwen3_6MoeWeights *,
+                   const Qwen3_8Q8Weights *>;
 
   template <class Weights>
   void addPrefillImpl(

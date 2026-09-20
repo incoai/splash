@@ -34,6 +34,10 @@ using splash::model::QwenAttentionWeights;
 using splash::model::QwenGdnWeights;
 using splash::model::Qwen3_8Layout;
 using splash::model::Qwen3_8Weights;
+using splash::model::QwenAttentionQ8Weights;
+using splash::model::QwenGdnQ8Weights;
+using splash::model::Qwen3_8Q8Layout;
+using splash::model::Qwen3_8Q8Weights;
 using splash::ops::VisionLayout;
 using splash::model::kWeightFileAlignment;
 using splash::model::loadModelPackage;
@@ -47,6 +51,9 @@ constexpr std::string_view kDraftLayerMagic = "MDFD0004";
 constexpr std::string_view kTargetEmbeddingMagic = "MDFE0001";
 constexpr std::string_view kTargetHeadMagic = "MDFL0002";
 constexpr std::string_view kTargetLayerMagic = "MDFL0006";
+constexpr std::string_view kTargetQ8LayerMagic = "MDFL0008";
+constexpr std::string_view kTargetQ8HeadMagic = "MDFL0008";
+constexpr std::string_view kTargetQ8EmbeddingMagic = "MDFE0008";
 constexpr std::string_view kVisionMagic = "MDFV0001";
 
 [[noreturn]] void fail(const std::string &message) {
@@ -201,6 +208,42 @@ std::vector<uint64_t> targetLayerSections(
     return result;
 }
 
+uint64_t q8Bytes(uint32_t outputSize, uint32_t inputSize) {
+    return checkedProduct(outputSize, inputSize) * 17 / 16;
+}
+
+std::vector<uint64_t> targetLayerQ8Sections(
+    const Qwen3_8Q8Layout &layout, bool full) {
+    constexpr uint64_t bf16 = 2;
+    std::vector<uint64_t> result{
+        uint64_t(layout.hiddenSize) * bf16,
+        q8Bytes(full ? layout.packedFullWidth : layout.packedGdnWidth,
+                layout.hiddenSize),
+    };
+    if (full) {
+        result.insert(result.end(), {
+            uint64_t(layout.attentionHeadDimension) * bf16,
+            uint64_t(layout.attentionHeadDimension) * bf16,
+            q8Bytes(layout.hiddenSize, layout.attentionWidth),
+        });
+    } else {
+        result.insert(result.end(), {
+            uint64_t(layout.convolutionDimension) * 4 * bf16,
+            uint64_t(layout.gdnValueHeads) * 4,
+            uint64_t(layout.gdnValueHeads) * bf16,
+            uint64_t(layout.gdnHeadDimension) * bf16,
+            q8Bytes(layout.hiddenSize, layout.attentionWidth),
+        });
+    }
+    result.insert(result.end(), {
+        uint64_t(layout.hiddenSize) * bf16,
+        q8Bytes(layout.intermediateSize, layout.hiddenSize),
+        q8Bytes(layout.intermediateSize, layout.hiddenSize),
+        q8Bytes(layout.hiddenSize, layout.intermediateSize),
+    });
+    return result;
+}
+
 std::vector<uint64_t> draftLayerSections(const DFlashDraftLayout &layout) {
     constexpr uint64_t bf16 = 2;
     return {
@@ -282,6 +325,60 @@ SyntheticAccounting writeSyntheticPackage(
     };
     result.targetBytes += writeWeightFile(
         root / "target/embedding.bin", kTargetEmbeddingMagic,
+        target.vocabularySize, target.hiddenSize, embeddingSections);
+
+    for (uint32_t layer = 0; layer < draft.layers; ++layer) {
+        auto sections = draftLayerSections(draft);
+        result.draftBytes += writeWeightFile(
+            root / "draft" / ("layer-" + std::to_string(layer) + ".bin"),
+            kDraftLayerMagic, layer, 0, sections);
+    }
+    uint64_t codebookBytes =
+        uint64_t(draft.vocabularySize) * draft.selectorRank * 2;
+    std::array<uint64_t, 6> modelSections{
+        q4Bytes(draft.hiddenSize, draft.targetHiddenSize),
+        uint64_t(draft.hiddenSize) * 2,
+        uint64_t(draft.hiddenSize) * 2,
+        q4Bytes(draft.selectorRank, draft.hiddenSize),
+        codebookBytes,
+        codebookBytes,
+    };
+    result.draftBytes += writeWeightFile(
+        root / "draft/model.bin", kDraftLayerMagic, draft.layers, 1,
+        modelSections);
+    auto sections = visionSections(vision);
+    result.visionBytes += writeWeightFile(
+        root / "vision/model.bin", kVisionMagic, vision.depth, 0, sections);
+    return result;
+}
+
+SyntheticAccounting writeSyntheticQ8Package(
+    const std::filesystem::path &root, const Qwen3_8Q8Layout &target,
+    const DFlashDraftLayout &draft, const VisionLayout &vision) {
+    SyntheticAccounting result;
+    for (uint32_t layer = 0; layer < target.layers; ++layer) {
+        bool full = target.isFullAttentionLayer(layer);
+        auto sections = targetLayerQ8Sections(target, full);
+        result.targetBytes += writeWeightFile(
+            root / "target" / ("layer-" + std::to_string(layer) + ".bin"),
+            kTargetQ8LayerMagic, layer, full ? 1U : 0U, sections);
+    }
+    std::array<uint64_t, 2> headSections{
+        uint64_t(target.hiddenSize) * 2,
+        q8Bytes(target.vocabularySize, target.hiddenSize),
+    };
+    result.targetBytes += writeWeightFile(
+        root / "target/head.bin", kTargetQ8HeadMagic, target.layers, 2,
+        headSections);
+    uint64_t embeddingElements =
+        uint64_t(target.vocabularySize) * target.hiddenSize;
+    std::array<uint64_t, 3> embeddingSections{
+        embeddingElements,
+        embeddingElements / 32,
+        embeddingElements / 32,
+    };
+    result.targetBytes += writeWeightFile(
+        root / "target/embedding.bin", kTargetQ8EmbeddingMagic,
         target.vocabularySize, target.hiddenSize, embeddingSections);
 
     for (uint32_t layer = 0; layer < draft.layers; ++layer) {
@@ -586,6 +683,113 @@ void testSyntheticPackage(MetalBackend &backend,
               << " actual_tracked=" << actualTrackedBytes << '\n';
 }
 
+void testSyntheticQ8Package(MetalBackend &backend,
+                            const std::filesystem::path &root) {
+    Qwen3_8Q8Layout target;
+    target.layers = 4;
+    target.hiddenSize = 256;
+    target.vocabularySize = 256;
+    target.packedGdnWidth = 256;
+    target.packedFullWidth = 256;
+    target.convolutionDimension = 256;
+    target.gdnKeyHeads = 2;
+    target.gdnValueHeads = 4;
+    target.gdnHeadDimension = 64;
+    target.attentionWidth = 64;
+    target.intermediateSize = 256;
+    target.attentionQueryHeads = 1;
+    target.attentionKvHeads = 1;
+    target.attentionHeadDimension = 64;
+    target.fullAttentionPeriod = 4;
+
+    DFlashDraftLayout draft;
+    draft.layers = 2;
+    draft.hiddenSize = 256;
+    draft.vocabularySize = 256;
+    draft.dynamicSize = 256;
+    draft.qkvSize = 256;
+    draft.attentionSize = 64;
+    draft.intermediateSize = 256;
+    draft.attentionHeadDimension = 64;
+    draft.targetHiddenSize = target.capturedHiddenSize();
+    draft.selectorRank = 256;
+
+    VisionLayout vision;
+    vision.depth = 2;
+    vision.hiddenSize = 128;
+    vision.patchDimension = 1536;
+    vision.intermediateSize = 200;
+    vision.paddedIntermediateSize = 256;
+    vision.mergedHiddenSize = 512;
+    vision.outputHiddenSize = 256;
+    vision.heads = 2;
+    vision.headDimension = 64;
+    vision.positionGridSide = 4;
+
+    SyntheticAccounting expected =
+        writeSyntheticQ8Package(root, target, draft, vision);
+    uint64_t baseline = backend.memoryStats().allocatedBytes;
+    uint64_t actualTrackedBytes = 0;
+    {
+        auto package = loadModelPackage(
+            backend, root,
+            makeModelDescriptor("Qwen dense Q8 loader oracle", target, draft,
+                                vision));
+        const auto &loadedTarget = std::get<Qwen3_8Q8Weights>(package.target);
+        require(loadedTarget.layers.size() == target.layers,
+                "target Q8 layer vector is incomplete");
+        require(package.draft.layers.size() == draft.layers,
+                "draft layer vector is incomplete");
+        require(std::holds_alternative<QwenGdnQ8Weights>(
+                    loadedTarget.layers[0].mixer),
+                "target GDN Q8 layer has the wrong typed layout");
+        require(std::holds_alternative<QwenAttentionQ8Weights>(
+                    loadedTarget.layers[3].mixer),
+                "target full-attention Q8 layer has the wrong typed layout");
+        require(loadedTarget.files.size() == target.layers + 2,
+                "target Q8 file records are incomplete");
+        require(package.draft.files.size() == draft.layers + 1,
+                "draft file records are incomplete");
+        require(declaredBytes(loadedTarget.files) == expected.targetBytes,
+                "target Q8 declared byte accounting is wrong");
+        require(declaredBytes(package.draft.files) == expected.draftBytes,
+                "draft declared byte accounting is wrong");
+        require(package.vision.tensors.blocks.size() == vision.depth &&
+                    package.vision.files.size() == 1 &&
+                    declaredBytes(package.vision.files) == expected.visionBytes,
+                "vision role records are incomplete");
+        require(loadedTarget.actualAllocatedBytes +
+                    package.draft.actualAllocatedBytes +
+                    package.vision.actualAllocatedBytes ==
+                    backend.memoryStats().allocatedBytes - baseline,
+                "actual package allocation accounting is wrong");
+        require(package.manifestFingerprintSha256.size() == 64,
+                "manifest SHA-256 has the wrong length");
+
+        std::vector<WeightFileRecord> records = loadedTarget.files;
+        records.insert(records.end(), package.draft.files.begin(),
+                       package.draft.files.end());
+        records.insert(records.end(), package.vision.files.begin(),
+                       package.vision.files.end());
+        require(weightManifestFingerprint(records) ==
+                    package.manifestFingerprintSha256,
+                "combined manifest fingerprint is not reproducible");
+        actualTrackedBytes =
+            backend.memoryStats().allocatedBytes - baseline;
+        require(actualTrackedBytes >= expected.targetBytes +
+                                          expected.draftBytes +
+                                          expected.visionBytes,
+                "backend actual allocation accounting is below logical bytes");
+    }
+    require(backend.memoryStats().allocatedBytes == baseline,
+            "model package allocations survived package destruction");
+
+    std::cout << "synthetic Q8 declared_target=" << expected.targetBytes
+              << " declared_draft=" << expected.draftBytes
+              << " declared_vision=" << expected.visionBytes
+              << " actual_tracked=" << actualTrackedBytes << '\n';
+}
+
 void validateRealPackage(MetalBackend &backend,
                          const std::filesystem::path &root) {
     uint64_t baseline = backend.memoryStats().allocatedBytes;
@@ -633,8 +837,12 @@ void testRealPackageMetadata(const std::filesystem::path &root) {
     require(bool(input), "unable to read model manifest for format test");
     const std::string original{std::istreambuf_iterator<char>(input),
                                std::istreambuf_iterator<char>()};
-    const std::string_view originalPrefix = "splash-packed-q4";
-    const size_t offset = original.find(originalPrefix);
+    std::string_view originalPrefix = "splash-packed-q4";
+    size_t offset = original.find(originalPrefix);
+    if (offset == std::string::npos) {
+        originalPrefix = "splash-packed-q8";
+        offset = original.find(originalPrefix);
+    }
     require(offset != std::string::npos, "model manifest lacks a known format");
 
     TempDirectory temporary;
@@ -644,7 +852,7 @@ void testRealPackageMetadata(const std::filesystem::path &root) {
     const auto expected = splash::model::inspectModelPackage(root);
     for (std::string_view name : {std::string_view(expected.name),
                                   std::string_view("Community fine-tune")}) {
-        for (std::string_view prefix : {"splash-packed-q4", "unknown-packed-q4"}) {
+        for (std::string_view prefix : {originalPrefix, std::string_view("unknown-packed-q4")}) {
             std::string manifest = original;
             manifest.replace(offset, originalPrefix.size(), prefix);
             const std::string originalName = '"' + expected.name + '"';
@@ -691,6 +899,7 @@ int main(int argc, const char *argv[]) {
         TempDirectory temporary;
         testWeightFileValidationAndLifetime(backend, temporary.path());
         testSyntheticPackage(backend, temporary.path() / "package");
+        testSyntheticQ8Package(backend, temporary.path() / "package_q8");
         if (argc == 3) {
             testRealPackageMetadata(argv[2]);
             validateRealPackage(backend, argv[2]);

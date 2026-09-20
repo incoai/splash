@@ -103,39 +103,48 @@ TuningWorkloads collectTuningWorkloads(
 
   TuningWorkloads result;
   std::visit([&](const auto &target) {
+    using T = std::remove_cvref_t<decltype(target)>;
     const auto geometry = qwenTargetGeometry(target);
     result.targetAttention = {geometry.attentionQueryHeads,
                               geometry.attentionKvHeads,
                               geometry.attentionHeadDimension};
-    if (target.layers.empty())
-      throw std::invalid_argument("operator probes require target layers");
-    for (const auto &layer : target.layers) {
-      std::visit([&](const auto &mixer) {
-        bothPhases(mixer.inputProjection);
-        bothPhases(mixer.outputProjection, LinearEpilogue::Residual);
-      }, layer.mixer);
-      if constexpr (requires { layer.gateProjection; }) {
-        projection(layer.gateProjection, LinearPhase::Prefill,
-                     LinearEpilogue::None);
-        projection(layer.upProjection, LinearPhase::Prefill,
-                     LinearEpilogue::UpWithGate);
-        projection(layer.upProjection, LinearPhase::Decode,
-                     LinearEpilogue::GateUp, &layer.gateProjection);
-        bothPhases(layer.downProjection, LinearEpilogue::Residual);
-      } else {
-        for (uint32_t rows : prefillRows) {
-          ops::MoeWorkload workload{geometry.moe, rows, ops::MoePhase::Prefill};
-          appendDistinct(moe, workload, layer.ffn);
-        }
-        for (uint32_t width : decodeWidths) {
-          ops::MoeWorkload workload{geometry.moe,
-              width * ExecutionLimits::targetVerifyRows, ops::MoePhase::Decode};
-          appendDistinct(moe, workload, layer.ffn);
+    if constexpr (std::is_same_v<T, Qwen3_8Q8Weights>) {
+      return;
+    } else {
+      if (target.layers.empty())
+        throw std::invalid_argument("operator probes require target layers");
+      for (const auto &layer : target.layers) {
+        std::visit([&](const auto &mixer) {
+          using M = std::remove_cvref_t<decltype(mixer)>;
+          if constexpr (!std::is_same_v<M, QwenGdnQ8Weights> &&
+                        !std::is_same_v<M, QwenAttentionQ8Weights>) {
+            bothPhases(mixer.inputProjection);
+            bothPhases(mixer.outputProjection, LinearEpilogue::Residual);
+          }
+        }, layer.mixer);
+        if constexpr (requires { layer.gateProjection; }) {
+          projection(layer.gateProjection, LinearPhase::Prefill,
+                       LinearEpilogue::None);
+          projection(layer.upProjection, LinearPhase::Prefill,
+                       LinearEpilogue::UpWithGate);
+          projection(layer.upProjection, LinearPhase::Decode,
+                       LinearEpilogue::GateUp, &layer.gateProjection);
+          bothPhases(layer.downProjection, LinearEpilogue::Residual);
+        } else {
+          for (uint32_t rows : prefillRows) {
+            ops::MoeWorkload workload{geometry.moe, rows, ops::MoePhase::Prefill};
+            appendDistinct(moe, workload, layer.ffn);
+          }
+          for (uint32_t width : decodeWidths) {
+            ops::MoeWorkload workload{geometry.moe,
+                width * ExecutionLimits::targetVerifyRows, ops::MoePhase::Decode};
+            appendDistinct(moe, workload, layer.ffn);
+          }
         }
       }
+      projection(target.logitsProjection, LinearPhase::Decode,
+                   LinearEpilogue::None);
     }
-    projection(target.logitsProjection, LinearPhase::Decode,
-                 LinearEpilogue::None);
   }, package.target);
 
   const auto &draft = package.draft;

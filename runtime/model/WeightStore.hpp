@@ -76,6 +76,10 @@ readQ8Projection(WeightFile &file, metal::MetalBackend &backend,
                  uint32_t outputSize, uint32_t inputSize,
                  std::string_view label);
 
+[[nodiscard]] ops::Q8Projection
+readQ8ProjectionComponents(WeightFile &file, uint32_t outputSize,
+                           uint32_t inputSize, std::string_view label);
+
 [[nodiscard]] ops::ExpertQ4Projection
 readExpertQ4Projection(WeightFile &file, uint32_t experts,
                        uint32_t outputSize, uint32_t inputSize,
