@@ -208,9 +208,8 @@ struct MetalMemoryStats {
   // command lifecycle boundaries refresh it; status reads never synchronize
   // with an in-flight GPU command.
   uint64_t deviceCurrentAllocatedBytes = 0;
-  // Highest sampled device.currentAllocatedSize. Sampling occurs after
-  // allocations and pipeline creation, and at the pre-commit, post-commit,
-  // scheduled and completed command boundaries.
+  // Highest sampled device.currentAllocatedSize. Sampled after allocations
+  // and pipeline creation, before submission, and on host-side retirement.
   uint64_t devicePeakAllocatedBytes = 0;
 
   // Placement-sparse buffers reserve virtual GPU address space without

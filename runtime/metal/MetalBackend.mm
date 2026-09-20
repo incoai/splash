@@ -303,13 +303,24 @@ struct BackendAsyncState {
             std::lock_guard lock(gateMutex);
             if (commandWatchdog.expired(steadySeconds())) {
                 id<MTLCommandBuffer> command = activeCommand;
-                std::ostringstream message;
-                message << "Metal command completion timed out after "
-                        << commandWatchdog.timeoutSeconds()
-                        << " seconds (sequence=" << activeSequence
-                        << ", status=" << (command ? commandStatusName(command.status) : "unavailable")
-                        << ", dispatches=" << activeDispatchCount << ')';
-                markUnhealthy(message.str());
+                const auto status = command ? command.status
+                                            : MTLCommandBufferStatusNotEnqueued;
+                // GPU completion and delivery of its handler are separate.
+                // A terminal command must not time out while its handler waits
+                // for a CPU thread; the handler still publishes the result.
+                if (command && (status == MTLCommandBufferStatusCompleted ||
+                                status == MTLCommandBufferStatusError)) {
+                    commandWatchdog.complete(activeSequence);
+                } else {
+                    std::ostringstream message;
+                    message << "Metal command completion timed out after "
+                            << commandWatchdog.timeoutSeconds()
+                            << " seconds (sequence=" << activeSequence
+                            << ", status=" << (command ? commandStatusName(status)
+                                                       : "unavailable")
+                            << ", dispatches=" << activeDispatchCount << ')';
+                    markUnhealthy(message.str());
+                }
             }
         }
         ensureHealthy();
