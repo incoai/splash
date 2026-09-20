@@ -129,7 +129,11 @@ class ConstraintFactory:
             or cache_size <= 0
         ):
             raise ValueError("constraint cache size must be positive")
-        if type(cache_source_bytes) is not int or cache_source_bytes <= 0:
+        if (
+            not isinstance(cache_source_bytes, int)
+            or isinstance(cache_source_bytes, bool)
+            or cache_source_bytes <= 0
+        ):
             raise ValueError("constraint cache byte budget must be positive")
         self.tokenizer = guidance_tokenizer(
             tokenizer,
