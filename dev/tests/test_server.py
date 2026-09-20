@@ -1692,6 +1692,9 @@ class ServerTest(unittest.TestCase):
         )
         app = object.__new__(request_frontend.Frontend)
         app.tokenizer = tokenizer
+        from server.latency import LatencyMetrics
+
+        app.latencies = LatencyMetrics()
         app.max_context = 1024
         quoted = "中文 📷 <|vision_start|><|image_pad|><|vision_end|>"
         messages = [
@@ -2860,6 +2863,39 @@ class ServerTest(unittest.TestCase):
         self.assertNotIn("hello", line)
         self.assertNotIn("\n", line)
         self.assertTrue(output.call_args.kwargs["flush"])
+
+    def test_latency_histograms_cover_http_preparation_and_token_batches(self):
+        harness = self.harness(FakeRuntime(Plan([[4, 4], [4]], delay=0.01)))
+        status, _, payload = harness.request(
+            "POST", "/v1/chat/completions", self.body(reasoning_effort="none")
+        )
+        self.assertEqual(status, 200, payload)
+        # The response may arrive just before the handler records its final timer.
+        until = time.monotonic() + 1
+        while time.monotonic() < until:
+            snapshot = harness.app.latencies.snapshot()
+            if snapshot["http_request"]["count"]:
+                break
+            time.sleep(0.001)
+        for stage in (
+            "http_request",
+            "upload",
+            "preparation_queue",
+            "preparation",
+            "template",
+            "tokenization",
+            "images",
+            "ttft",
+            "output_interval",
+        ):
+            with self.subTest(stage=stage):
+                self.assertEqual(snapshot[stage]["count"], 1)
+                self.assertGreater(snapshot[stage]["sum"], 0)
+        self.assertGreater(snapshot["http_request"]["sum"], snapshot["ttft"]["sum"])
+        status, _, payload = harness.request("GET", "/metrics")
+        self.assertEqual(status, 200, payload)
+        self.assertIn(b"splash_ttft_seconds_count 1", payload)
+        self.assertIn(b"splash_output_interval_seconds_count 1", payload)
 
     def test_console_request_summary(self):
         record = {

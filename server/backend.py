@@ -13,6 +13,7 @@ if __package__:
     from . import runtime as engine_runtime
     from .constraints import TokenConstraint
     from .errors import APIError, NativeError
+    from .latency import RequestLatency
     from .metrics import metrics_dict
     from .output import hold_partial
     from .tool_schema import THINK_END, ToolPolicy, strict_json_loads
@@ -20,6 +21,7 @@ else:
     import protocol as wire
     from constraints import TokenConstraint
     from errors import APIError, NativeError
+    from latency import RequestLatency
     from metrics import metrics_dict
     from output import hold_partial
     from tool_schema import THINK_END, ToolPolicy, strict_json_loads
@@ -116,6 +118,7 @@ class Job:
     score_tokens: tuple = ()
     # Endpoint-specific metadata carried to the response builder.
     meta: dict | None = None
+    latency: RequestLatency | None = None
 
 
 class CallbackStreamer:
@@ -611,6 +614,8 @@ class NativeBackend:
                     )
                 )
             elif isinstance(event, wire.TokensEvent):
+                if job.latency is not None and event.tokens:
+                    job.latency.tokens()
                 if event.sequence_offset == 0:
                     state.first_token_batch_tokens = len(event.tokens)
                 if job.constraint is not None:
@@ -680,6 +685,11 @@ class NativeBackend:
                 stop_sequence=stop_sequence,
                 first_token_batch_tokens=state.first_token_batch_tokens,
             )
+            if job.latency is not None:
+                latency = metrics_dict(result)["request_latency"]
+                queued = latency.get("queue_to_start_ms")
+                if queued is not None:
+                    job.latency.metrics.observe("native_queue", queued / 1000.0)
         except Exception as unexpected:
             error = self._api_error(unexpected)
         finally:

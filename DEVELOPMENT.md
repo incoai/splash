@@ -165,6 +165,18 @@ an engine restart. Chat streams include token usage when the request sets
 `"stream_options":{"include_usage":true}`; non-streaming Chat responses always
 include usage. A proxy must consume these fields to display statistics.
 
+`/metrics` also exports fixed latency histograms in seconds, with a bounded
+set of stages in `/status.latency`. HTTP duration includes body upload and
+response writing for admitted API requests. Preparation, queue, template,
+tokenization and image preparation are measured separately; preparation includes
+its nested stages. Tokenization covers the encoding call, including reuse when
+available. Histogram buckets are cumulative and labeled by upper bound.
+TTFT starts before upload and ends at the first native token
+event. Output intervals are between native token events, which can contain
+multiple speculative tokens; they are not per-token latency. Native queue timing
+is recorded from successful completions. These histograms live with the HTTP
+process and survive a native engine restart.
+
 HTTP bodies require Content-Length, and browser
 Origin must match Host. `--allowed-host` permits additional hostnames. Request
 logs omit bodies; full crash traces require explicit `SPLASH_CRASH_TRACE=1` and

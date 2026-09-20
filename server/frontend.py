@@ -28,6 +28,7 @@ if __package__:
     from .backend import REQUEST_PRIORITIES, Job, remaining_request_time
     from .diagnostics import print_status
     from .errors import APIError, ContextLengthError
+    from .latency import LatencyMetrics
     from .metrics import is_finite_number
     from .thinking import ThinkingCodec
     from .tool_schema import (
@@ -52,6 +53,7 @@ else:
     from backend import REQUEST_PRIORITIES, Job, remaining_request_time
     from diagnostics import print_status
     from errors import APIError, ContextLengthError
+    from latency import LatencyMetrics
     from metrics import is_finite_number
     from thinking import ThinkingCodec
     from tool_schema import (
@@ -206,6 +208,7 @@ class Frontend:
     ):
         if not isinstance(preparation_capacity, int) or preparation_capacity <= 0:
             raise ValueError("frontend preparation capacity must be positive")
+        self.latencies = LatencyMetrics()
         self.tokenizer = tokenizer
         self.backend = backend
         self.model = model
@@ -238,6 +241,7 @@ class Frontend:
             status["grammar_cache"] = self.constraint_factory.stats()
         status["response_store"] = self.response_store.stats()
         status["image_cache"] = self.images.stats()
+        status["latency"] = self.latencies.snapshot()
         return status
 
     def _prepare_images(self, messages, *, check_context=True):
@@ -323,7 +327,7 @@ class Frontend:
             image_offsets.add((offset, offset + len(IMAGE_PAD_TOKEN)))
             offset += len(IMAGE_PAD_TOKEN)
         rendered = IMAGE_PAD_TOKEN.join(parts)
-        encoded = self.tokenizer(
+        encoded = self._tokenize(
             rendered,
             add_special_tokens=False,
             return_offsets_mapping=True,
@@ -418,7 +422,7 @@ class Frontend:
             deadline = self.request_deadline(body)
         with self._preparation(deadline):
             try:
-                tokens = self.tokenizer(content, add_special_tokens=add_special)[
+                tokens = self._tokenize(content, add_special_tokens=add_special)[
                     "input_ids"
                 ]
             except Exception as error:
@@ -617,9 +621,10 @@ class Frontend:
         remaining = remaining_request_time(deadline)
         with self.preparation_lock:
             self.preparation_waiting += 1
-        acquired = self.preparation_slots.acquire(
-            timeout=min(remaining, PREPARATION_WAIT_SECONDS)
-        )
+        with self.latencies.measure("preparation_queue"):
+            acquired = self.preparation_slots.acquire(
+                timeout=min(remaining, PREPARATION_WAIT_SECONDS)
+            )
         with self.preparation_lock:
             self.preparation_waiting -= 1
             if acquired:
@@ -633,7 +638,8 @@ class Frontend:
             )
         try:
             remaining_request_time(deadline)
-            yield
+            with self.latencies.measure("preparation"):
+                yield
         finally:
             with self.preparation_lock:
                 self.preparation_active -= 1
@@ -696,7 +702,15 @@ class Frontend:
             preserve_thinking,
         )
 
+    def _tokenize(self, text, **options):
+        with self.latencies.measure("tokenization"):
+            return self.tokenizer(text, **options)
+
     def _apply_chat_template(self, messages, template):
+        with self.latencies.measure("template"):
+            return self._render_template(messages, template)
+
+    def _render_template(self, messages, template):
         try:
             return self.tokenizer.apply_chat_template(messages, **template)
         except TemplateError:
@@ -723,7 +737,8 @@ class Frontend:
             template["preserve_thinking"] = prompt.preserve_thinking
         if prompt.tools:
             template["tools"] = prompt.tools
-        images = self._prepare_images(prompt.messages, check_context=check_context)
+        with self.latencies.measure("images"):
+            images = self._prepare_images(prompt.messages, check_context=check_context)
         remaining_request_time(deadline)
         if images and self.tokenizer.convert_tokens_to_ids(IMAGE_PAD_TOKEN) is None:
             raise APIError(400, "the tokenizer does not define the image pad token")
@@ -735,7 +750,7 @@ class Frontend:
                 )
             else:
                 rendered = self._apply_chat_template(prompt.messages, template)
-                tokens = self.tokenizer(rendered, add_special_tokens=False)["input_ids"]
+                tokens = self._tokenize(rendered, add_special_tokens=False)["input_ids"]
         except APIError:
             raise
         except Exception as error:

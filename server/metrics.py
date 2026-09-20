@@ -4,6 +4,11 @@ from __future__ import annotations
 
 import math
 
+if __package__:
+    from .latency import prometheus_latency
+else:
+    from latency import prometheus_latency
+
 
 def is_finite_number(value):
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -194,6 +199,7 @@ def prometheus_metrics(status):
         metric_value = value(path)
         if metric_value is not None:
             lines.append(f"{name} {metric_value}")
+    lines.extend(prometheus_latency(status.get("latency", {})))
     return "\n".join(lines) + "\n"
 
 

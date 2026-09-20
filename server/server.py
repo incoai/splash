@@ -44,6 +44,7 @@ if __package__:
     from .errors import APIError, ContextLengthError
     from .frontend import Frontend
     from .http_security import authenticate, validate_api_key, validate_headers
+    from .latency import RequestLatency
     from .metrics import (
         is_finite_number,
         metrics_dict,
@@ -82,6 +83,7 @@ else:
     from errors import APIError, ContextLengthError
     from frontend import Frontend
     from http_security import authenticate, validate_api_key, validate_headers
+    from latency import RequestLatency
     from metrics import is_finite_number, metrics_dict, prometheus_metrics, usage_dict
     from output import (
         ReasoningSplitter,
@@ -460,7 +462,8 @@ class FrontendHandler(BaseHTTPRequestHandler):
             )
             return
         try:
-            body = self._read_json_body(started_at + self.app.request_timeout)
+            with self.app.latencies.measure("upload"):
+                body = self._read_json_body(started_at + self.app.request_timeout)
             if not isinstance(body, dict):
                 if systemone:
                     raise judgments.SystemOneError(
@@ -554,6 +557,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             self._body_reservation.retain_for(job)
             self._body_reservation = None
             job.return_progress = return_progress
+            job.latency = RequestLatency(self.app.latencies, started_at)
             remaining_request_time(deadline)
             if self._client_disconnected():
                 raise ConnectionResetError("client disconnected before submission")
@@ -616,6 +620,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 self._body_reservation.release()
                 self._body_reservation = None
             admission.release()
+            self.app.latencies.observe("http_request", time.monotonic() - started_at)
 
     def _judgment_complete(self, job, row):
         result = None
