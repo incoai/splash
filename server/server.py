@@ -100,6 +100,7 @@ DEFAULT_MAX_REQUEST_BYTES = 128 * 1024 * 1024
 DEFAULT_REQUEST_BODY_BUDGET = 512 * 1024 * 1024
 MAX_CONTEXT_TOKENS = 262144
 HTTP_IO_TIMEOUT = 30.0
+HTTP_UPLOAD_BYTES_PER_SECOND = 512 * 1024
 CLIENT_DISCONNECT_POLL = 0.01
 SSE_KEEPALIVE_SECONDS = 2.0
 NATIVE_START_TIMEOUT = 600.0
@@ -258,6 +259,13 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 f"{self.server.max_request_bytes} bytes (--max-request-size)",
                 "request_too_large",
             )
+        # Bound total upload time even when a client keeps the socket active.
+        deadline = min(
+            deadline,
+            time.monotonic()
+            + self.server.io_timeout
+            + length / HTTP_UPLOAD_BYTES_PER_SECOND,
+        )
         self._body_reservation = RequestBodyReservation(
             self.server.request_bodies, length
         )

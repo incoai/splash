@@ -370,6 +370,53 @@ class HttpBodyBudgetTests(unittest.TestCase):
         self.wait_bytes(harness, 0)
         self.assertEqual(harness.app.preparation_active, 0)
 
+    def test_upload_deadline_scales_with_body_size_and_caps_at_request_deadline(self):
+        for length, request_seconds, expected in (
+            (1024, 1800, 30 + 1 / 512),
+            (128 * 1024**2, 1800, 286),
+            (256 * 1024**2, 1800, 542),
+            (128 * 1024**2, 5, 5),
+        ):
+            with self.subTest(length=length, request_seconds=request_seconds):
+                now = 0.0
+                socket_timeout = 30.0
+
+                def settimeout(value):
+                    nonlocal socket_timeout
+                    socket_timeout = value
+
+                def drip(size):
+                    nonlocal now
+                    now += min(10, socket_timeout)
+                    if socket_timeout < 10:
+                        raise TimeoutError
+                    return b" "
+
+                handler = object.__new__(api.FrontendHandler)
+                handler.headers = http.client.HTTPMessage()
+                handler.headers["Content-Type"] = "application/json"
+                handler.headers["Content-Length"] = str(length)
+                handler.server = SimpleNamespace(
+                    max_request_bytes=length,
+                    request_bodies=api.HttpAdmission(length),
+                    io_timeout=30,
+                )
+                handler.connection = SimpleNamespace(settimeout=settimeout)
+                handler.rfile = SimpleNamespace(read1=drip)
+                try:
+                    with (
+                        mock.patch.object(
+                            api.time, "monotonic", side_effect=lambda: now
+                        ),
+                        self.assertRaises(TimeoutError),
+                    ):
+                        handler._read_json_body(request_seconds)
+                    self.assertAlmostEqual(now, expected)
+                finally:
+                    handler._body_reservation.release()
+                self.assertEqual(handler.server.request_bodies.active, 0)
+
+    @mock.patch.object(api, "HTTP_UPLOAD_BYTES_PER_SECOND", 200)
     def test_active_upload_can_outlast_idle_timeout(self):
         harness = self.harness(io_timeout=0.4, timeout=4)
         payload = json.dumps({"content": "hello"}).encode().ljust(100)
@@ -380,6 +427,33 @@ class HttpBodyBudgetTests(unittest.TestCase):
         response = connection.getresponse()
         self.assertEqual(response.status, 200, response.read())
         response.read()
+        self.wait_bytes(harness, 0)
+
+    @mock.patch.object(api, "HTTP_UPLOAD_BYTES_PER_SECOND", 256)
+    def test_drip_uploads_expire_and_restore_shared_capacity(self):
+        with mock.patch.object(api, "DEFAULT_REQUEST_BODY_BUDGET", 256):
+            harness = self.harness(max_request_bytes=128, io_timeout=0.4, timeout=4)
+        uploads = [self.headers(harness, 128, "/tokenize") for _ in range(2)]
+        self.wait_bytes(harness, 256)
+        response = self.headers(harness, 1, "/tokenize").getresponse()
+        self.assertEqual(response.status, 503, response.read())
+        response.read()
+        for _ in range(14):
+            for connection in uploads:
+                try:
+                    connection.send(b" ")
+                except OSError:
+                    pass
+            time.sleep(0.08)
+        for connection in uploads:
+            response = connection.getresponse()
+            self.assertEqual(response.status, 408, response.read())
+            response.read()
+        self.wait_bytes(harness, 0)
+        self.assertEqual(harness.request("GET", "/health")[0], 200)
+        self.assertEqual(
+            harness.request("POST", "/tokenize", {"content": "hello"})[0], 200
+        )
         self.wait_bytes(harness, 0)
 
     def test_active_upload_still_obeys_request_deadline(self):

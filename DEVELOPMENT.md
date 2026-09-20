@@ -39,7 +39,9 @@ and object-heavy JSON need additional memory. Oversized requests return 413;
 exhausted ingress capacity returns 503. Image and model context limits apply
 independently.
 Stored Responses history is charged before decoding. Uploads allow 30 seconds
-of inactivity and share the server's overall request deadline (default 30 minutes).
+of inactivity; total upload time is limited to 30 seconds plus the body size
+at 512 KiB/s (286 seconds for 128 MiB), capped by the overall request deadline.
+Timed-out uploads return 408 and release their input reservation.
 `/status` reports `http.request_body_bytes` and `http.max_request_bytes`.
 
 Source `install/completions/splash.bash` for Bash or
