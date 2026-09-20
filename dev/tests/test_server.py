@@ -1752,6 +1752,15 @@ class ServerTest(unittest.TestCase):
         with self.assertRaisesRegex(api.APIError, "image count"):
             app._expand_image_pads(tokens, prepared[:1], positions)
 
+    def test_image_render_marker_is_stable_across_requests(self):
+        app = self.harness(FakeRuntime(), tokenizer=self.ImagePadTokenizer()).app
+        template = {"tokenize": False, "return_dict": False}
+        app._render_image_tokens([self._image_message()], template)
+        app._render_image_tokens([self._image_message()], template)
+        first_source = app.tokenizer.templates[-2][1]["chat_template"]
+        second_source = app.tokenizer.templates[-1][1]["chat_template"]
+        self.assertEqual(first_source, second_source)
+
     def test_image_size_is_checked_before_pixel_concatenation(self):
         app = self.harness(FakeRuntime(), tokenizer=self.ImagePadTokenizer()).app
 

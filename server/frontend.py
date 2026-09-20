@@ -76,6 +76,10 @@ MIN_FLOAT32_SUBNORMAL = float.fromhex("0x1p-149")
 RESPONSE_STORE_BUDGET_BYTES = 64 * 1024 * 1024
 
 
+# A stable marker lets repeated image requests reuse the compiled template.
+IMAGE_RENDER_MARKER = f"__splash_image_{secrets.token_hex(16)}__"
+
+
 def _thinking_from_prefix(rendered):
     marker = "<|im_start|>"
     start = rendered.rfind(marker)
@@ -310,16 +314,15 @@ class Frontend:
         documentation or source containing literal vision tokens.
         """
         source = self.tokenizer.get_chat_template(tools=template.get("tools"))
-        marker = f"__splash_image_{secrets.token_hex(16)}__"
         rendered = self._apply_chat_template(
             messages,
             {
                 **template,
                 "tokenize": False,
-                "chat_template": source.replace(IMAGE_PAD_TOKEN, marker),
+                "chat_template": source.replace(IMAGE_PAD_TOKEN, IMAGE_RENDER_MARKER),
             },
         )
-        parts = rendered.split(marker)
+        parts = rendered.split(IMAGE_RENDER_MARKER)
         image_offsets = set()
         offset = 0
         for part in parts[:-1]:

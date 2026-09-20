@@ -208,9 +208,8 @@ struct MetalMemoryStats {
   // command lifecycle boundaries refresh it; status reads never synchronize
   // with an in-flight GPU command.
   uint64_t deviceCurrentAllocatedBytes = 0;
-  // Highest sampled device.currentAllocatedSize. Sampling occurs after
-  // allocations and pipeline creation, and at the pre-commit, post-commit,
-  // scheduled and completed command boundaries.
+  // Highest sampled device.currentAllocatedSize. Sampled after allocations
+  // and pipeline creation, before submission, and on host-side retirement.
   uint64_t devicePeakAllocatedBytes = 0;
 
   // Placement-sparse buffers reserve virtual GPU address space without
@@ -361,7 +360,8 @@ public:
   [[nodiscard]] uint64_t submissionCount() const noexcept;
   [[nodiscard]] size_t pipelineCount() const noexcept;
   [[nodiscard]] bool healthy() const noexcept;
-  // Nonblocking serving-loop check of actual GPU commands and pending unmaps.
+  // Serving-loop check of actual GPU commands and pending unmaps. Terminal
+  // results may invoke completion here if the driver callback is delayed.
   // Timeout marks the backend unhealthy without releasing in-flight resources.
   void checkHealth();
   [[nodiscard]] bool needsHealthCheck() const noexcept;
