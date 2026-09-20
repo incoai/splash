@@ -194,7 +194,7 @@ class SchemaFallbackTests(unittest.TestCase):
         guidance = self.guidance
 
         class CompilingFactory(FakeConstraintFactory):
-            def create(self, grammar):
+            def create(self, grammar, *, timeout=None):
                 error = LLMatcher.validate_grammar(grammar, guidance)
                 if error:
                     raise AssertionError(error)

@@ -2,6 +2,7 @@
 
 import threading
 from collections import OrderedDict
+from concurrent.futures import Future, wait
 
 from llguidance import LLExecutor, LLMatcher, LLTokenizer
 from llguidance.hf import from_tokenizer as guidance_tokenizer
@@ -147,43 +148,65 @@ class ConstraintFactory:
         self.source_bytes = 0
         self.cache = OrderedDict()
         self.lock = threading.Lock()
+        self.pending = {}
         self.hits = 0
         self.misses = 0
 
-    def create(self, grammar):
-        # Cached matchers are immutable templates. Serializing the rare miss
-        # avoids compiling an identical tool grammar for concurrent requests;
-        # hits only deep-copy LLGuidance state.
+    def create(self, grammar, *, timeout=None):
+        matcher = self._matcher(grammar, timeout)
+        return TokenConstraint(matcher.deep_copy(), self.executor)
+
+    def _matcher(self, grammar, timeout):
+        # Compilation uses the frontend's bounded preparation slots. Share
+        # identical misses without blocking unrelated immutable templates.
         with self.lock:
-            cached = self.cache.pop(grammar, None)
-            if cached is None:
-                error = LLMatcher.validate_grammar(grammar, self.tokenizer)
-                if error:
-                    raise APIError(400, f"unsupported output schema: {error}")
-                matcher = LLMatcher(self.tokenizer, grammar, log_level=0)
-                if matcher.is_error():
-                    raise APIError(
-                        400, f"unsupported output schema: {matcher.get_error()}"
-                    )
-                self.misses += 1
-                size = len(grammar.encode())
-            else:
-                matcher, size = cached
-                self.source_bytes -= size
+            cached = self.cache.get(grammar)
+            if cached is not None:
+                self.cache.move_to_end(grammar)
                 self.hits += 1
+                return cached[0]
+            pending = self.pending.get(grammar)
+            owner = pending is None
+            if owner:
+                pending = self.pending[grammar] = Future()
+        if not owner:
+            if not wait((pending,), timeout=timeout).done:
+                raise APIError(504, "request timed out", "request_timeout")
+            matcher = pending.result()
+            with self.lock:
+                if grammar in self.cache:
+                    self.cache.move_to_end(grammar)
+                self.hits += 1
+            return matcher
+        try:
+            error = LLMatcher.validate_grammar(grammar, self.tokenizer)
+            if error:
+                raise APIError(400, f"unsupported output schema: {error}")
+            matcher = LLMatcher(self.tokenizer, grammar, log_level=0)
+            if matcher.is_error():
+                raise APIError(400, f"unsupported output schema: {matcher.get_error()}")
+            size = len(grammar.encode())
             # Oversized grammars remain usable without displacing the cache.
             # This bounds source bytes; LLGuidance bounds compiler complexity.
-            if size <= self.cache_source_bytes:
-                self.cache[grammar] = (matcher, size)
-                self.source_bytes += size
-                while (
-                    len(self.cache) > self.cache_size
-                    or self.source_bytes > self.cache_source_bytes
-                ):
-                    _, (_, evicted_size) = self.cache.popitem(last=False)
-                    self.source_bytes -= evicted_size
-            instance = matcher.deep_copy()
-        return TokenConstraint(instance, self.executor)
+            with self.lock:
+                self.misses += 1
+                if size <= self.cache_source_bytes:
+                    self.cache[grammar] = (matcher, size)
+                    self.source_bytes += size
+                    while (
+                        len(self.cache) > self.cache_size
+                        or self.source_bytes > self.cache_source_bytes
+                    ):
+                        _, (_, evicted_size) = self.cache.popitem(last=False)
+                        self.source_bytes -= evicted_size
+            pending.set_result(matcher)
+            return matcher
+        except BaseException as error:
+            pending.set_exception(error)
+            raise
+        finally:
+            with self.lock:
+                del self.pending[grammar]
 
     def stats(self):
         with self.lock:

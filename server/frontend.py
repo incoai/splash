@@ -851,11 +851,13 @@ class Frontend:
         if self.constraint_factory is not None:
             if tools:
                 constraint = self.constraint_factory.create(
-                    tool_grammar(tool_policy, thinking, response_schema)
+                    tool_grammar(tool_policy, thinking, response_schema),
+                    timeout=remaining_request_time(deadline),
                 )
             elif response_schema is not None:
                 constraint = self.constraint_factory.create(
-                    json_grammar(response_schema, thinking)
+                    json_grammar(response_schema, thinking),
+                    timeout=remaining_request_time(deadline),
                 )
         remaining_request_time(deadline)
         tools_signature = None

@@ -496,7 +496,7 @@ class FakeConstraintFactory:
     def __init__(self):
         self.grammars = []
 
-    def create(self, grammar):
+    def create(self, grammar, *, timeout=None):
         self.grammars.append(grammar)
         return SimpleNamespace(consume=lambda _tokens: None)
 
