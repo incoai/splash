@@ -1728,13 +1728,21 @@ int main(int argc, char **argv) {
     std::array<std::vector<uint32_t>, 4> raggedPages{
         pageRange(52, 1), pageRange(53, 2), pageRange(55, 9),
         pageRange(64, 56)};
+    const auto raggedRequest = [&](uint64_t id, uint32_t lane) {
+      const bool sampled = lane % 2;
+      auto value = makeRequest(
+          id, raggedPrompts[lane], 16,
+          sampled ? BatchCohort::Sampling : BatchCohort::Greedy);
+      value.sampling = {sampled ? 0.8F : 0.0F, 0.95F, 20, 731 + lane};
+      return value;
+    };
     BatchPlan raggedPrefillPlan;
     raggedPrefillPlan.kind = WorkKind::Prefill;
     raggedPrefillPlan.cohort = BatchCohort::Greedy;
     std::array<ModelBatchItem, 4> raggedPrefillItems;
     for (uint32_t lane = 0; lane < raggedIds.size(); ++lane) {
       beginCold(executor,
-          makeRequest(raggedIds[lane], raggedPrompts[lane], 16),
+          raggedRequest(raggedIds[lane], lane),
           raggedSlots[lane]);
       raggedPrefillPlan.items.push_back({raggedIds[lane], raggedRows[lane]});
       raggedPrefillItems[lane] = {raggedIds[lane],  raggedSlots[lane], 0, 0,
@@ -1757,7 +1765,7 @@ int main(int argc, char **argv) {
 
     BatchPlan raggedDecodePlan;
     raggedDecodePlan.kind = WorkKind::Decode;
-    raggedDecodePlan.cohort = BatchCohort::Greedy;
+    raggedDecodePlan.cohort = BatchCohort::Sampling;
     std::array<ModelBatchItem, 4> raggedDecodeItems;
     for (uint32_t lane = 0; lane < raggedIds.size(); ++lane) {
       raggedDecodePlan.items.push_back({raggedIds[lane], 0});
@@ -1790,7 +1798,7 @@ int main(int argc, char **argv) {
       const uint32_t lane = raggedPermutation[order];
       const uint64_t referenceId = 104 + lane;
       beginCold(executor,
-          makeRequest(referenceId, raggedPrompts[lane], 16),
+          raggedRequest(referenceId, lane),
           referenceSlots[order]);
       raggedReferencePrefillPlan.items.push_back(
           {referenceId, raggedRows[lane]});
@@ -1806,7 +1814,7 @@ int main(int argc, char **argv) {
 
     BatchPlan raggedReferenceDecodePlan;
     raggedReferenceDecodePlan.kind = WorkKind::Decode;
-    raggedReferenceDecodePlan.cohort = BatchCohort::Greedy;
+    raggedReferenceDecodePlan.cohort = BatchCohort::Sampling;
     std::array<ModelBatchItem, 4> raggedReferenceDecodeItems;
     for (uint32_t order = 0; order < raggedPermutation.size(); ++order) {
       const uint32_t lane = raggedPermutation[order];

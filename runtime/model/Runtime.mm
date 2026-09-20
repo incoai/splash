@@ -2130,7 +2130,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
   for (uint32_t lane = 0; lane < items.size(); ++lane) {
     const ModelBatchItem &item = items[lane];
     Impl::Request &entry = impl_->request(item.requestId);
-    if (entry.cohort != plan.cohort) {
+    if ((entry.cohort == BatchCohort::Constrained) != constrained) {
       throw std::invalid_argument("request does not belong to batch cohort");
     }
     if (entry.decodeStage != plan.decodeStage) {

@@ -177,6 +177,10 @@ producer remains. Late arrivals can extend the plan at complete state boundaries
 Higher-priority work does not wait for a lower-priority producer. `/status` exposes
 `scheduler.waiting_prefix` separately from resource waits.
 
+Greedy and sampled requests can share an unconstrained decode batch; each lane
+keeps its own sampling policy and RNG. Pure greedy batches retain their argmax
+path. Constrained requests use a separate batch for the host mask exchange.
+
 Long prefill uses disposable rolling checkpoints every 4096 tokens. Contended
 prefill adapts toward a 500 ms slice, keeping 2048-token chunks for long unopposed
 work. These policies do not extend client deadlines. Memory recovery waits are

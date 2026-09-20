@@ -122,13 +122,9 @@ void Sampling::addVerify(metal::CommandGraph &graph,
   const bool sampling = std::any_of(
       policies.begin(), policies.end(),
       [](const SamplingPolicy &policy) { return policy.samples(); });
-  // The engine batches one cohort at a time. An unconstrained batch that
-  // mixed greedy and sampling lanes would take the argmax path for lanes
-  // whose acceptance later reads candidates nobody wrote.
-  if (!constrained && sampling &&
-      !std::all_of(policies.begin(), policies.end(),
-                   [](const SamplingPolicy &policy) { return policy.samples(); }))
-    throw std::invalid_argument("sampling batch mixes greedy and sampling lanes");
+  const bool greedy = std::any_of(
+      policies.begin(), policies.end(),
+      [](const SamplingPolicy &policy) { return !policy.samples(); });
   const bool distributed = constrained || sampling;
   const uint32_t rows = lanes * rowsPerLane_;
 
@@ -165,7 +161,9 @@ void Sampling::addVerify(metal::CommandGraph &graph,
             {buffers.partialIds, buffers.partialValues, buffers.topIds,
              buffers.topProbabilities},
             params, {rows, 1, 1}, {1, 1, 1});
-  if (constrained) {
+  // Acceptance consumes argmax tokens for greedy lanes and distributions
+  // for sampling lanes, including when both share the same target forward.
+  if (constrained || greedy) {
     graph.add("decode_sample_sparse_top1",
               {buffers.topIds, buffers.topProbabilities,
                buffers.outputTokens},

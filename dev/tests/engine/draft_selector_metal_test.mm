@@ -285,6 +285,71 @@ void runCase(MetalBackend &backend, const Case &c) {
   }
 }
 
+// Compare every mixed policy mask against isolated lane execution. Poison
+// outputs so a missing greedy argmax cannot pass by reading old token data.
+void mixedVerify(MetalBackend &backend, uint32_t lanes, uint32_t samplingMask) {
+  constexpr uint32_t vocabulary = 1003;
+  Sampling sampling(backend, vocabulary, kRows);
+  auto buffers = [&](uint32_t width) {
+    const uint32_t rows = width * kRows;
+    const auto space = Sampling::workspace(rows);
+    return SamplingBuffers{
+        allocate(backend, uint64_t{rows} * vocabulary * 2),
+        allocate(backend, space.partialIdsBytes),
+        allocate(backend, space.partialValuesBytes),
+        allocate(backend, space.topIdsBytes),
+        allocate(backend, space.topProbabilitiesBytes),
+        allocate(backend, uint64_t{width} * 2 * kRows * sizeof(float)),
+        allocate(backend, uint64_t{rows} * ((vocabulary + 31) / 32) * 4),
+        allocate(backend, uint64_t{rows} * sizeof(uint32_t)),
+        allocate(backend, space.argmaxValuesBytes),
+        allocate(backend, space.argmaxIndicesBytes)};
+  };
+  auto batch = buffers(lanes);
+  std::memset(batch.outputTokens.contents(), 0xFF, batch.outputTokens.sizeBytes());
+  Random random(9831 + lanes);
+  std::vector<SamplingPolicy> policies;
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    policies.push_back(
+        {8 + lane, (samplingMask & (1U << lane)) ? 0.7F : 0.0F, 0.9F, false});
+    for (uint32_t row = 0; row < kRows; ++row)
+      fillRow(static_cast<uint16_t *>(batch.logits.contents()) +
+                  (lane * kRows + row) * vocabulary,
+              vocabulary, row % 2 ? Pattern::Ties : Pattern::Peaked, random);
+  }
+  CommandGraph graph;
+  sampling.addVerify(graph, policies, batch);
+  static_cast<void>(backend.submitCommand(graph.dispatches()));
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    auto single = buffers(1);
+    std::memcpy(single.logits.contents(),
+                static_cast<uint16_t *>(batch.logits.contents()) +
+                    lane * kRows * vocabulary,
+                single.logits.sizeBytes());
+    CommandGraph reference;
+    sampling.addVerify(reference, std::span(policies).subspan(lane, 1), single);
+    static_cast<void>(backend.submitCommand(reference.dispatches()));
+    if (policies[lane].samples()) {
+      const uint64_t offset = uint64_t{lane} * kRows * kTargetSamplingCandidates;
+      require(std::memcmp(static_cast<uint32_t *>(batch.topIds.contents()) + offset,
+                          single.topIds.contents(), single.topIds.sizeBytes()) == 0,
+              "mixed verification changed sampling candidates");
+      const auto *actual = static_cast<float *>(batch.topProbabilities.contents());
+      const auto *expected =
+          static_cast<float *>(single.topProbabilities.contents());
+      for (uint32_t i = 0; i < kRows * kTargetSamplingCandidates; ++i)
+        require(std::abs(actual[offset + i] - expected[i]) < 1e-6F,
+                "mixed verification changed sampling probabilities");
+    } else {
+      require(std::memcmp(static_cast<uint32_t *>(batch.outputTokens.contents()) +
+                              lane * kRows,
+                          single.outputTokens.contents(),
+                          single.outputTokens.sizeBytes()) == 0,
+              "mixed verification changed greedy tokens");
+    }
+  }
+}
+
 void invalidRequests(MetalBackend &backend) {
   Sampling sampling(backend, 1024, kRows);
   const auto workspace = Sampling::draftWorkspace(kPositions);
@@ -321,6 +386,9 @@ int main(int argc, char **argv) {
       throw std::invalid_argument("usage: draft-selector METALLIB");
     MetalBackend backend(argv[1]);
     invalidRequests(backend);
+    for (uint32_t lanes = 1; lanes <= kLanes; ++lanes)
+      for (uint32_t mask = 0; mask < (1U << lanes); ++mask)
+        mixedVerify(backend, lanes, mask);
     for (const uint32_t vocabulary : {248320U, 1003U, 270005U}) {
       for (uint32_t lanes = 1; lanes <= kLanes; ++lanes) {
         runCase(backend, {vocabulary, lanes, false});

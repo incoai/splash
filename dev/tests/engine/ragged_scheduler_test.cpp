@@ -361,15 +361,44 @@ void testRealDecodeWidths() {
   }
 }
 
-void testNoCrossCohortBatch() {
-  engine::Scheduler scheduler;
-  scheduler.submit(request(1, 1, BatchCohort::Greedy));
-  scheduler.submit(request(2, 1, BatchCohort::Sampling));
+void testMixedSamplingBatch() {
+  for (uint32_t mask = 0; mask < 16; ++mask) {
+    Scheduler scheduler;
+    for (uint32_t lane = 0; lane < 4; ++lane) {
+      const auto cohort = (mask & (1U << lane)) ? BatchCohort::Sampling
+                                              : BatchCohort::Greedy;
+      scheduler.submit(request(lane + 1, 1, cohort));
+      scheduler.resourcesReady(lane + 1, 1);
+    }
+    const BatchPlan plan = *scheduler.next();
+    require(plan.width() == 4 && plan.cohort ==
+                (mask ? BatchCohort::Sampling : BatchCohort::Greedy),
+            "compatible greedy and sampling requests were split");
+  }
+}
+
+void testConstrainedDecodeRemainsSeparate() {
+  Scheduler scheduler;
+  scheduler.submit(request(1, 1, BatchCohort::Constrained));
   scheduler.resourcesReady(1, 1);
+  const BatchPlan initial = *scheduler.next();
+  scheduler.commit(initial);
+  const std::array mask{StepResult{1, 0, false, DecodeStage::ApplyInitialMask}};
+  scheduler.complete(initial, mask);
+  scheduler.maskReady(1);
+  completeDecode(scheduler);
+  scheduler.submit(request(2, 1, BatchCohort::Greedy));
+  scheduler.submit(request(3, 1, BatchCohort::Sampling));
   scheduler.resourcesReady(2, 1);
-  BatchPlan plan = *scheduler.next();
-  require(plan.width() == 1,
-          "decode mixed incompatible consumer policies in one graph");
+  scheduler.resourcesReady(3, 1);
+  const BatchPlan mixed = *scheduler.next();
+  require(mixed.width() == 2 && mixed.cohort == BatchCohort::Sampling,
+          "mixed decode included a constrained lane");
+  completeDecode(scheduler);
+  const BatchPlan constrained = *scheduler.next();
+  require(constrained.width() == 1 && constrained.items[0].requestId == 1 &&
+              constrained.cohort == BatchCohort::Constrained,
+          "constrained decode lost its independent mask pipeline");
 }
 
 void testPrefillAndDecodeAlternateWithoutStarvation() {
@@ -680,25 +709,10 @@ void testDecodeCohortsAndLanesRotate() {
   scheduler.complete(first, firstResults);
 
   BatchPlan second = *scheduler.next();
-  require(second.kind == WorkKind::Decode &&
-              std::any_of(second.items.begin(), second.items.end(),
-                          [](const BatchItem &item) {
-                            return item.requestId == 5;
-                          }),
-          "an unscheduled lane was starved by the previous B4 members");
-  scheduler.commit(second);
-  std::vector<StepResult> secondResults;
-  for (const BatchItem &item : second.items) {
-    secondResults.push_back(
-        {item.requestId, 0, false, DecodeStage::Regular});
-  }
-  scheduler.complete(second, secondResults);
-
-  BatchPlan third = *scheduler.next();
-  require(third.kind == WorkKind::Decode && third.width() == 1 &&
-              third.items[0].requestId == 6 &&
-              third.cohort == BatchCohort::Sampling,
-          "a different decode cohort was starved by a continuous leader");
+  require(second.kind == WorkKind::Decode && second.width() == 4 &&
+              second.cohort == BatchCohort::Sampling &&
+              second.items[0].requestId == 5 && second.items[1].requestId == 6,
+          "mixed decode did not prioritize lanes omitted by the previous batch");
 }
 
 void testMaskStagesNeverMix() {
@@ -833,7 +847,8 @@ int main() {
     testLaneOvertakenThreeTimesLeadsTheNextCommand();
     testServedLaneResetsOvertaking();
     testRealDecodeWidths();
-    testNoCrossCohortBatch();
+    testMixedSamplingBatch();
+    testConstrainedDecodeRemainsSeparate();
     testPrefillAndDecodeAlternateWithoutStarvation();
     testMeasuredBudgetOnlyLimitsContendedWork();
     testAuxiliaryWorkDoesNotTrainTextPrefillTiming();

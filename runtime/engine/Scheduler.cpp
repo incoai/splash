@@ -358,9 +358,12 @@ std::optional<BatchPlan> Scheduler::nextDecode() const {
           : model::ExecutionLimits::maximumBatchWidth;
   for (const Request *request : ready) {
     if (request->spec.priority != selectedPriority ||
-        request->spec.cohort != cohort ||
+        (request->spec.cohort == BatchCohort::Constrained) !=
+            (cohort == BatchCohort::Constrained) ||
         request->decodeStage != decodeStage)
       continue;
+    if (request->spec.cohort == BatchCohort::Sampling)
+      plan.cohort = BatchCohort::Sampling;
     plan.items.push_back({request->spec.id, 0, 0});
     if (plan.width() == maximumWidth)
       break;
