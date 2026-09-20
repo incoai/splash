@@ -71,7 +71,7 @@ def _running_status(port=PORT):
 
 def _ensure_installed(model_id):
     if not paths.PACKAGED:
-        # Different ports still build the same source tree.
+        # Serialize builds across ports; make keeps the lock if the launcher exits.
         with (RUNTIME_DIR / "build.lock").open("a+") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             for command in (

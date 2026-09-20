@@ -75,7 +75,8 @@ To download new models to another disk, set `HF_HUB_CACHE` before the first run:
 HF_HUB_CACHE=/Volumes/Models/huggingface splash serve --model incoai/Qwen3.8-27B-Splash
 ```
 
-This does not move models already installed.
+Model links and agent sessions stay in Splash's data directory. Existing models
+are not moved.
 
 ## Settings
 
