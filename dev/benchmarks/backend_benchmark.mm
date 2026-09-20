@@ -897,8 +897,8 @@ int main(int argc, char **argv) {
     engine::EngineConfig engineConfig;
     engineConfig.maxContext = resources->memoryPlan().maximumContextTokens();
     engineConfig.vocabularySize = capabilities.vocabularySize;
-    engineConfig.memoryPressure = [resources] {
-      return resources->memoryGovernor().snapshot().pressure;
+    engineConfig.growthPaused = [resources] {
+      return !resources->memoryGovernor().snapshot().hostGrowthAllowed;
     };
     engine::Engine engine(engineConfig, resources->cache(),
                                   *executor, events);
