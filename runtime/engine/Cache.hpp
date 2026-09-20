@@ -74,6 +74,11 @@ public:
   void beginRequest(uint64_t requestId);
   void endRequest(uint64_t requestId);
 
+  // Scheduling probe only: does not pin, touch recency, or count a hit.
+  [[nodiscard]] uint32_t
+  cachedTokens(std::span<const uint32_t> prompt,
+               std::span<const ImageSpan> images = {}) const;
+
   // Pin the usable prefix before potentially evicting for active allocations.
   // Accounting is separate: failed admission retries are not extra samples.
   [[nodiscard]] CacheLookup lookup(std::span<const uint32_t> prompt,
@@ -135,6 +140,10 @@ public:
   [[nodiscard]] CacheSnapshot snapshot() const;
 
 private:
+  [[nodiscard]] std::vector<uint64_t>
+  matchedBlocks(std::span<const uint32_t> prompt,
+                std::span<const ImageSpan> images) const;
+
   struct Request final {
     std::vector<uint32_t> pages;
     std::vector<uint64_t> cachedBlocks;

@@ -284,16 +284,50 @@ bool Engine::admitQueued(double now) {
     recoveringResources_ = false;
   if (drainingForRecovery())
     return false;
-  bool progressed = false;
-  for (uint64_t requestId : scheduler_.admissionOrder()) {
-    Request &active = request(requestId);
-    if (recovering && !active.suspended)
-      continue;
+  const std::vector<uint64_t> order = scheduler_.admissionOrder();
+  if (recovering) {
+    for (uint64_t id : order) {
+      Request &active = request(id);
+      if (active.suspended && resourceRetryReady(active, now) && admit(active, now))
+        return true;
+    }
+    return false;
+  }
+
+  std::vector<PrefillAdmission> candidates;
+  for (uint64_t id : order) {
+    Request &active = request(id);
     if (!resourceRetryReady(active, now))
       continue;
-    progressed = admit(active, now) || progressed;
-    if (recovering && progressed)
+    const uint32_t cached =
+        cache_.cachedTokens(active.request.prompt, active.request.images);
+    if (pendingSharedPrefill(active, cached)) {
+      active.resourceWait = {};
+      scheduler_.waitForPrefix(id);
+      continue;
+    }
+    candidates.push_back({id, cached});
+  }
+  bool progressed = false;
+  while (!candidates.empty()) {
+    const auto selected = scheduler_.prefillAdmissionOrder(candidates);
+    if (selected.empty())
       break;
+    for (uint64_t id : selected) {
+      progressed = admit(request(id), now) || progressed;
+      std::erase_if(candidates, [id](const auto &value) {
+        return value.requestId == id;
+      });
+    }
+    // Failed admissions must not prevent other eligible work from running.
+    if (progressed)
+      break;
+  }
+  // Waiting for scheduling does not consume the memory-retry deadline.
+  for (const auto &candidate : candidates) {
+    Request &active = request(candidate.requestId);
+    active.resourceWait = {};
+    scheduler_.deferAdmission(candidate.requestId);
   }
   return progressed;
 }

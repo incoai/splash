@@ -32,6 +32,11 @@ struct RequestSpec final {
   double deadlineMilliseconds = 0.0;
 };
 
+struct PrefillAdmission final {
+  uint64_t requestId = 0;
+  uint32_t cachedTokens = 0;
+};
+
 struct SchedulerSnapshot final {
   uint32_t queued = 0;
   uint32_t waitingResources = 0;
@@ -55,6 +60,8 @@ struct SchedulerSnapshot final {
 class Scheduler final {
 public:
   void submit(RequestSpec request);
+  void observePrefill(uint32_t rows, double wallMilliseconds);
+  void deferAdmission(uint64_t requestId);
   void waitForResources(uint64_t requestId);
   void waitForPrefix(uint64_t requestId);
   void resourcesReady(uint64_t requestId, uint32_t alreadyProcessed);
@@ -73,6 +80,9 @@ public:
 
   [[nodiscard]] bool expireDeadlines(double nowMilliseconds);
   [[nodiscard]] std::vector<uint64_t> admissionOrder() const;
+  // Preview the dispatch row budget before allocating new resident cells.
+  [[nodiscard]] std::vector<uint64_t>
+  prefillAdmissionOrder(std::span<const PrefillAdmission> candidates) const;
   [[nodiscard]] std::optional<BatchPlan> next() const;
   void commit(const BatchPlan &plan);
   void complete(const BatchPlan &plan, std::span<const StepResult> results,
@@ -107,7 +117,11 @@ private:
                                                 const Request *b) noexcept;
   [[nodiscard]] std::optional<BatchPlan> nextPrefill() const;
   [[nodiscard]] std::optional<BatchPlan> nextDecode() const;
-  [[nodiscard]] uint32_t prefillBudget(const Request &leader) const;
+  [[nodiscard]] std::optional<BatchPlan>
+  planPrefill(std::vector<const Request *> ready) const;
+  [[nodiscard]] uint32_t
+  prefillBudget(const Request &leader,
+                std::span<const Request *const> ready) const;
 
   std::unordered_map<uint64_t, Request> requests_;
   std::optional<BatchPlan> active_;

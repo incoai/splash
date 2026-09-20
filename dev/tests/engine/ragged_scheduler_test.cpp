@@ -47,6 +47,97 @@ void completeDecode(engine::Scheduler &scheduler, bool finished = false,
   scheduler.complete(plan, results, wallMilliseconds);
 }
 
+void testAdmissionSharesDispatchOrderAndBudget() {
+  Scheduler scheduler;
+  scheduler.submit(request(1, 8193));
+  scheduler.resourcesReady(1, 0);
+  scheduler.submit(request(2, 8193));
+  scheduler.submit(request(3, 4097));
+  scheduler.submit(request(4, 65));
+  const std::array candidates{PrefillAdmission{2, 0},
+                              PrefillAdmission{3, 4096},
+                              PrefillAdmission{4, 0}};
+  require(scheduler.prefillAdmissionOrder(candidates) ==
+              std::vector<uint64_t>({3, 4}),
+          "admission did not pack cached and short work ahead of cold work");
+  scheduler.resourcesReady(3, 4096);
+  scheduler.resourcesReady(4, 0);
+  const auto plan = *scheduler.next();
+  require(plan.items.size() == 3 && plan.items[0].requestId == 3 &&
+              plan.items[1].requestId == 4 && plan.items[2].requestId == 1 &&
+              plan.items[2].tokenCount == 1982,
+          "dispatch disagreed with admission work accounting");
+
+  Scheduler shortPrompts;
+  std::vector<PrefillAdmission> many;
+  for (uint64_t id = 1; id <= 8; ++id) {
+    shortPrompts.submit(request(id, 65));
+    many.push_back({id, 0});
+  }
+  require(shortPrompts.prefillAdmissionOrder(many) ==
+              std::vector<uint64_t>({1, 2, 3, 4}),
+          "short prefill admission lost batching or exceeded the real width");
+}
+
+void testAdmissionRespectsContendedBudgetAndDecodePriority() {
+  Scheduler scheduler;
+  scheduler.observePrefill(2048, 6144.0);
+  std::vector<PrefillAdmission> candidates;
+  for (uint64_t id = 1; id <= 4; ++id) {
+    scheduler.submit(request(id, 65));
+    candidates.push_back({id, 0});
+  }
+  require(scheduler.prefillAdmissionOrder(candidates) ==
+              std::vector<uint64_t>({1, 2}),
+          "admission ignored the contended actual-row budget");
+  scheduler.submit(request(5, 1, BatchCohort::Greedy, RequestPriority::Foreground));
+  scheduler.resourcesReady(5, 1);
+  require(scheduler.prefillAdmissionOrder(candidates).empty(),
+          "lower-priority prefill reserved cells ahead of runnable foreground decode");
+  scheduler.cancel(5);
+  require(!scheduler.prefillAdmissionOrder(candidates).empty(),
+          "prefill admission did not resume after foreground decode left");
+}
+
+void testQueuedPrefillCannotBeOvertakenIndefinitely() {
+  Scheduler scheduler;
+  scheduler.submit(request(1, 8193));
+  for (uint64_t id = 2; id <= 4; ++id) {
+    scheduler.submit(request(id, 2048));
+    const std::array candidates{PrefillAdmission{1, 0}, PrefillAdmission{id, 0}};
+    require(scheduler.prefillAdmissionOrder(candidates) == std::vector<uint64_t>{id},
+            "short work did not overtake queued long work");
+    scheduler.resourcesReady(id, 0);
+    completePrefill(scheduler, *scheduler.next());
+    scheduler.cancel(id);
+    scheduler.remove(id);
+  }
+  scheduler.submit(request(5, 65));
+  const std::array candidates{PrefillAdmission{1, 0}, PrefillAdmission{5, 0}};
+  require(scheduler.prefillAdmissionOrder(candidates) == std::vector<uint64_t>{1},
+          "queued long prefill starved behind short arrivals");
+}
+
+void testWarmupTimingSeedsFirstContendedCommand() {
+  for (double sample : {0.0, -1.0, std::numeric_limits<double>::infinity(),
+                        std::numeric_limits<double>::quiet_NaN(), 6144.0}) {
+    Scheduler scheduler;
+    scheduler.observePrefill(2048, sample);
+    scheduler.observePrefill(1, 10000.0);
+    scheduler.submit(request(1, 8193));
+    scheduler.resourcesReady(1, 0);
+    require(scheduler.next()->items[0].tokenCount == 2048,
+            "warmup shrank an uncontended prefill");
+    scheduler.submit(request(2, 1));
+    scheduler.resourcesReady(2, 1);
+    completeDecode(scheduler);
+    const auto first = *scheduler.next();
+    require(first.kind == WorkKind::Prefill &&
+                first.items[0].tokenCount == (sample == 6144.0 ? 128 : 2048),
+            "first contended prefill ignored warmup or accepted invalid timing");
+  }
+}
+
 void testShortestRemainingFirstUsesActualRows() {
   engine::Scheduler scheduler;
   scheduler.submit(request(1, 17));
@@ -729,6 +820,10 @@ void testResourceSuspensionReplaysFromCacheAndPreservesDecodeStage() {
 
 int main() {
   try {
+    testAdmissionSharesDispatchOrderAndBudget();
+    testAdmissionRespectsContendedBudgetAndDecodePriority();
+    testQueuedPrefillCannotBeOvertakenIndefinitely();
+    testWarmupTimingSeedsFirstContendedCommand();
     testShortestRemainingFirstUsesActualRows();
     testPerRequestBoundary();
     testEqualPromptsFinishInArrivalOrder();

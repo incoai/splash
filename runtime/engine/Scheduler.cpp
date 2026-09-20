@@ -69,6 +69,16 @@ void Scheduler::resumeFromResources(uint64_t id, uint32_t processed,
   request.suspendedForResources = false;
 }
 
+void Scheduler::deferAdmission(uint64_t id) {
+  Request &request = get(id);
+  if (request.suspendedForResources ||
+      (request.phase != Phase::Queued &&
+       request.phase != Phase::WaitingResources &&
+       request.phase != Phase::WaitingPrefix))
+    throw std::logic_error("only unstarted work can wait for scheduling");
+  request.phase = Phase::Queued;
+}
+
 void Scheduler::waitForResources(uint64_t id) {
   Request &request = get(id);
   if (request.phase != Phase::Queued &&
@@ -172,6 +182,40 @@ std::vector<uint64_t> Scheduler::admissionOrder() const {
   return result;
 }
 
+std::vector<uint64_t> Scheduler::prefillAdmissionOrder(
+    std::span<const PrefillAdmission> candidates) const {
+  std::vector<Request> pending;
+  pending.reserve(candidates.size());
+  for (const auto &candidate : candidates) {
+    Request value = get(candidate.requestId);
+    if (value.suspendedForResources ||
+        (value.phase != Phase::Queued && value.phase != Phase::WaitingResources &&
+         value.phase != Phase::WaitingPrefix) ||
+        candidate.cachedTokens >= value.spec.promptTokens)
+      throw std::logic_error("invalid pending prefill admission");
+    value.promptProcessed = candidate.cachedTokens;
+    pending.push_back(std::move(value));
+  }
+  std::vector<const Request *> ready;
+  ready.reserve(requests_.size());
+  for (const auto &[_, request] : requests_)
+    if (request.phase == Phase::Prefill)
+      ready.push_back(&request);
+  for (const auto &request : pending)
+    ready.push_back(&request);
+  std::vector<uint64_t> result;
+  if (const auto plan = planPrefill(std::move(ready))) {
+    const auto decode = nextDecode();
+    if (decode && get(decode->items.front().requestId).spec.priority <
+                      get(plan->items.front().requestId).spec.priority)
+      return result;
+    for (const auto &item : plan->items)
+      if (get(item.requestId).phase != Phase::Prefill)
+        result.push_back(item.requestId);
+  }
+  return result;
+}
+
 std::optional<BatchPlan> Scheduler::next() const {
   if (active_)
     return std::nullopt;
@@ -204,6 +248,11 @@ std::optional<BatchPlan> Scheduler::nextPrefill() const {
     if (request.phase == Phase::Prefill)
       ready.push_back(&request);
   }
+  return planPrefill(std::move(ready));
+}
+
+std::optional<BatchPlan>
+Scheduler::planPrefill(std::vector<const Request *> ready) const {
   if (ready.empty())
     return std::nullopt;
   const auto dispatchRemaining = [](const Request *request) {
@@ -236,9 +285,10 @@ std::optional<BatchPlan> Scheduler::nextPrefill() const {
 
   BatchPlan plan;
   plan.kind = WorkKind::Prefill;
-  uint32_t budget = prefillBudget(*ready.front());
+  uint32_t budget = prefillBudget(*ready.front(), ready);
   for (const Request *request : ready) {
-    if (!budget || request->spec.priority != selectedPriority)
+    if (!budget || request->spec.priority != selectedPriority ||
+        plan.width() == model::ExecutionLimits::maximumBatchWidth)
       break;
     const uint32_t rows = std::min(dispatchRemaining(request), budget);
     plan.items.push_back({request->spec.id, rows, request->promptProcessed});
@@ -247,7 +297,8 @@ std::optional<BatchPlan> Scheduler::nextPrefill() const {
   return plan;
 }
 
-uint32_t Scheduler::prefillBudget(const Request &leader) const {
+uint32_t Scheduler::prefillBudget(
+    const Request &leader, std::span<const Request *const> ready) const {
   const uint32_t maximum = model::ExecutionLimits::prefillTokenBudget;
   if (prefillMillisecondsPerToken_ <= 0.0)
     return maximum;
@@ -260,12 +311,13 @@ uint32_t Scheduler::prefillBudget(const Request &leader) const {
   const bool contended = std::any_of(
       requests_.begin(), requests_.end(), [&](const auto &entry) {
         const Request &peer = entry.second;
-        return peer.spec.id != leader.spec.id &&
-               peer.spec.priority <= leader.spec.priority &&
-               (peer.phase == Phase::Decode ||
-                (peer.phase == Phase::Prefill &&
-                 (leaderFinishing ||
-                  peer.spec.promptTokens - peer.promptProcessed <= rows)));
+        return peer.phase == Phase::Decode &&
+               peer.spec.priority <= leader.spec.priority;
+      }) || std::any_of(ready.begin(), ready.end(), [&](const Request *peer) {
+        return peer->spec.id != leader.spec.id &&
+               peer->spec.priority <= leader.spec.priority &&
+               (leaderFinishing ||
+                peer->spec.promptTokens - peer->promptProcessed <= rows);
       });
   if (!contended)
     return maximum;
@@ -344,7 +396,8 @@ void Scheduler::commit(const BatchPlan &plan) {
     for (const BatchItem &item : plan.items)
       youngestServed = std::max(youngestServed, get(item.requestId).order);
     for (auto &[id, request] : requests_) {
-      if (request.phase != Phase::Prefill)
+      if (terminal(request.phase) || request.phase == Phase::Decode ||
+          request.phase == Phase::WaitingMask || request.suspendedForResources)
         continue;
       const bool served = std::any_of(
           plan.items.begin(), plan.items.end(),
@@ -402,22 +455,25 @@ void Scheduler::complete(const BatchPlan &plan,
                           : Phase::Decode;
     }
   }
-  if (representativePrefillTiming && plan.kind == WorkKind::Prefill &&
-      std::isfinite(wallMilliseconds) &&
-      wallMilliseconds > 0.0) {
+  if (representativePrefillTiming && plan.kind == WorkKind::Prefill) {
     uint32_t rows = 0;
     for (const BatchItem &item : plan.items)
       rows += item.tokenCount;
-    // Tiny tails are dominated by fixed command costs, not prefill throughput.
-    if (rows >= kMinimumPrefillRows) {
-      const double observed = wallMilliseconds / rows;
-      prefillMillisecondsPerToken_ =
-          prefillMillisecondsPerToken_ > 0.0
-              ? 0.75 * prefillMillisecondsPerToken_ + 0.25 * observed
-              : observed;
-    }
+    observePrefill(rows, wallMilliseconds);
   }
   active_.reset();
+}
+
+void Scheduler::observePrefill(uint32_t rows, double wallMilliseconds) {
+  // Tiny tails are dominated by fixed command costs, not prefill throughput.
+  if (rows < kMinimumPrefillRows || !std::isfinite(wallMilliseconds) ||
+      wallMilliseconds <= 0.0)
+    return;
+  const double observed = wallMilliseconds / rows;
+  prefillMillisecondsPerToken_ =
+      prefillMillisecondsPerToken_ > 0.0
+          ? 0.75 * prefillMillisecondsPerToken_ + 0.25 * observed
+          : observed;
 }
 
 Phase Scheduler::phase(uint64_t id) const { return get(id).phase; }

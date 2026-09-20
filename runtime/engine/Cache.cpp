@@ -34,16 +34,15 @@ void Cache::endRequest(uint64_t requestId) {
   requests_.erase(found);
 }
 
-CacheLookup Cache::lookup(std::span<const uint32_t> prompt,
-                          std::span<const ImageSpan> images) {
-  CacheLookup result;
+std::vector<uint64_t>
+Cache::matchedBlocks(std::span<const uint32_t> prompt,
+                     std::span<const ImageSpan> images) const {
+  std::vector<uint64_t> blocks;
   if (prompt.empty())
-    return result;
-
+    return blocks;
   // Leave one real input token to regenerate request-specific anchor logits.
   const size_t maximumBlocks = (prompt.size() - 1) / KvCache::pageTokens;
-  std::vector<uint64_t> matchedKvBlocks;
-  matchedKvBlocks.reserve(maximumBlocks);
+  blocks.reserve(maximumBlocks);
   uint64_t parent = 0;
   for (size_t index = 0; index < maximumBlocks; ++index) {
     const size_t begin = index * KvCache::pageTokens;
@@ -53,15 +52,29 @@ CacheLookup Cache::lookup(std::span<const uint32_t> prompt,
     if (!match)
       break;
     parent = match->id;
-    matchedKvBlocks.push_back(parent);
+    blocks.push_back(parent);
   }
-  if (matchedKvBlocks.empty())
-    return result;
+  return blocks;
+}
 
-  kv_.touch(parent);
-  result.kvBoundary =
-      static_cast<uint32_t>(matchedKvBlocks.size() * KvCache::pageTokens);
-  result.state = states_.acquireDeepest(matchedKvBlocks);
+uint32_t Cache::cachedTokens(std::span<const uint32_t> prompt,
+                              std::span<const ImageSpan> images) const {
+  const auto blocks = matchedBlocks(prompt, images);
+  for (size_t i = blocks.size(); i > 0; --i)
+    if (states_.contains(blocks[i - 1]))
+      return static_cast<uint32_t>(i * KvCache::pageTokens);
+  return 0;
+}
+
+CacheLookup Cache::lookup(std::span<const uint32_t> prompt,
+                          std::span<const ImageSpan> images) {
+  CacheLookup result;
+  const auto blocks = matchedBlocks(prompt, images);
+  if (!blocks.empty()) {
+    kv_.touch(blocks.back());
+    result.kvBoundary = static_cast<uint32_t>(blocks.size() * KvCache::pageTokens);
+    result.state = states_.acquireDeepest(blocks);
+  }
   return result;
 }
 

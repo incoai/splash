@@ -134,6 +134,24 @@ struct CacheFixture {
   }
 };
 
+void testSchedulingProbeDoesNotChangeCachePolicy() {
+  CacheFixture fixture;
+  require(fixture.cache.cachedTokens(fixture.prompt) == 0,
+          "KV without recurrent state was counted as reusable work");
+  fixture.publish(0);
+  fixture.publish(3);
+  const auto prefix = std::span<const uint32_t>(fixture.prompt).first(33);
+  require(fixture.cache.cachedTokens(prefix) == 32 &&
+              fixture.cache.cachedTokens(fixture.prompt) == 128 &&
+              fixture.cache.snapshot().stateCache.pinned == 0 &&
+              fixture.cache.snapshot().lookup.lookups == 0,
+          "scheduling probe pinned backing or counted a cache hit");
+  require(fixture.cache.reclaimOneState() &&
+              fixture.cache.cachedTokens(prefix) == 0 &&
+              fixture.cache.cachedTokens(fixture.prompt) == 128,
+          "scheduling probe refreshed the oldest state's eviction order");
+}
+
 void testCacheLookupAndOneTokenReplay() {
   CacheFixture fixture;
   fixture.publish(0);
@@ -602,6 +620,7 @@ int main() {
     testCheckpointPinsAndBoundaryUpgrade();
     testCheckpointPressurePreservesHotPrefix();
     testLogicalKvPressureStillReclaimsPages();
+    testSchedulingProbeDoesNotChangeCachePolicy();
     testCacheLookupAndOneTokenReplay();
     testPage31Page32Page33Backoff();
     testLazyJunctionMaterialization();

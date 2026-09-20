@@ -1693,6 +1693,113 @@ void testSingletonCapacityFailureTerminatesCleanly() {
           "B1 capacity failure leaked backend resources");
 }
 
+void testQueuedLongPrefillsLeaveRoomForShortWork() {
+  Backing backing(2048);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  for (uint64_t id = 1; id <= 4; ++id)
+    engine.submit(request(id, std::vector<uint32_t>(8193, id)));
+  require(engine.tick(1) && engine.tick(2) &&
+              executor.requests.size() == 1 && executor.prefillRows == 2048,
+          "long prefills reserved cells without executable work");
+  engine.submit(request(5, std::vector<uint32_t>(65, 5)));
+  require(engine.tick(3) && executor.requests.contains(5) &&
+              executor.requests.at(5).position > 0 && events.completedCount == 0,
+          "short arrival waited for a long prefill to finish");
+  for (uint32_t now = 4; now < 200 && !engine.idle(); ++now)
+    static_cast<void>(engine.tick(now));
+  require(engine.idle() && events.completedCount == 5 &&
+              events.failedCount == 0 && events.capacityExhaustedCount == 0 &&
+              executor.prefillRows == 4 * 8193 + 65 && executor.suspensions == 0,
+          "admission lost work, introduced replay, or stranded queued requests");
+}
+
+void testAdmissionUsesCachedRemainingWork() {
+  Backing backing(1024);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  const std::vector<uint32_t> warm(4097, 47);
+  engine.submit(request(1, warm));
+  runUntilIdle(engine);
+  engine.submit(request(2, std::vector<uint32_t>(8193, 48)));
+  require(engine.tick(1) && engine.tick(2), "cold prefill did not start");
+  engine.submit(request(3, warm));
+  require(engine.tick(3) && executor.requests.contains(3) &&
+              executor.restored == 4096 && executor.requests.at(3).position == 4097,
+          "cached prompt was scheduled by total length instead of remaining work");
+  runUntilIdle(engine);
+  require(events.completedCount == 3 && events.failedCount == 0,
+          "cache-aware admission failed to finish");
+}
+
+void testFailedAdmissionDoesNotBlockOtherWork() {
+  Backing backing(1024);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
+  executor.beginGrowthBlocked = [&] { return executor.beginAttempts == 1; };
+  engine.submit(request(1, std::vector<uint32_t>(4097, 47)));
+  engine.submit(request(2, std::vector<uint32_t>(8193, 48)));
+  require(engine.tick(1) && executor.requests.contains(2),
+          "failed prefill admission blocked a runnable peer");
+  runUntilIdle(engine);
+  require(events.completedCount == 2 && events.failedCount == 0,
+          "failed admission did not recover");
+}
+
+void testSchedulingWaitDoesNotConsumeMemoryTimeout() {
+  Backing backing(1024);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  Events events;
+  engine::Engine engine({.resourceWaitTimeoutMilliseconds = 1000.0},
+                        resources, executor, events);
+  executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
+  executor.beginGrowthBlocked = [&] { return executor.beginAttempts == 1; };
+  engine.submit(request(1, std::vector<uint32_t>(8193, 47)));
+  static_cast<void>(engine.tick(1));
+  auto urgent = request(2, std::vector<uint32_t>(4097, 48));
+  urgent.priority = RequestPriority::Foreground;
+  engine.submit(std::move(urgent));
+  require(engine.tick(102) && engine.resourceWaitSnapshot(102).memory == 0,
+          "scheduler delay retained a stale memory wait");
+  for (uint32_t now = 1100; now < 1200 && !engine.idle(); ++now)
+    static_cast<void>(engine.tick(now));
+  require(engine.idle() && events.completedCount == 2 && events.failedCount == 0,
+          "scheduling delay triggered the memory wait timeout");
+}
+
+void testUnadmittedRequestsHonorCancellationAndDeadline() {
+  Backing backing(1024);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  engine.submit(request(1, std::vector<uint32_t>(8193, 1)));
+  engine.submit(request(2, std::vector<uint32_t>(8193, 2)));
+  auto expiring = request(3, std::vector<uint32_t>(8193, 3));
+  expiring.deadlineMilliseconds = 3;
+  engine.submit(std::move(expiring));
+  require(engine.tick(1) && engine.tick(2), "long prefill did not start");
+  engine.cancel(2);
+  static_cast<void>(engine.tick(3));
+  runUntilIdle(engine);
+  require(engine.snapshot().cancelled == 1 && events.failedCount == 1 &&
+              events.completedCount == 2 && executor.beginAttempts == 1,
+          "queued cancellation or deadline allocated resources or failed cleanup");
+}
+
 void testGrowthKeepsPrefillProgressWhenAnUnstartedPeerCanYield() {
   for (RequestPriority priority : {RequestPriority::Normal,
                                    RequestPriority::Background}) {
@@ -1715,16 +1822,23 @@ void testGrowthKeepsPrefillProgressWhenAnUnstartedPeerCanYield() {
     engine.submit(std::move(peer));
     require(engine.tick(1) && engine.tick(2) &&
                 executor.requests.at(48).position == 2048 &&
-                executor.requests.at(49).position == 0,
-            "growth fixture did not isolate a started and an unstarted prefill");
-    require(engine.tick(3) && executor.suspensions == 1 &&
-                executor.requests.at(48).resident &&
-                !executor.requests.at(49).resident,
-            "KV growth discarded completed prefill instead of its unstarted peer");
+                !executor.requests.contains(49),
+            "unstarted prefill reserved a cell before it had scheduled work");
+    require(engine.tick(3) && executor.requests.at(48).resident,
+            "KV growth discarded completed prefill");
+    if (priority == RequestPriority::Normal) {
+      // The final prefill slice admits a peer into its remaining row budget;
+      // if that cell prevents KV growth, the unstarted peer must yield.
+      require(executor.suspensions == 1 && !executor.requests.at(49).resident,
+              "KV growth did not yield the unstarted peer");
+    } else {
+      require(executor.suspensions == 0 && !executor.requests.contains(49),
+              "lower-priority work reserved a cell before its dispatch");
+    }
     runUntilIdle(engine);
     require(events.completedCount == 2 && events.failedCount == 0 &&
                 events.capacityExhaustedCount == 0 && executor.prefillRows == 12288,
-            "yielding an unstarted peer lost work or failed to resume");
+            "work-aware admission lost prefill work or failed to complete");
   }
 }
 
@@ -3250,6 +3364,11 @@ int main() {
     testAdmissionPinsDesiredStateAndCountsOnlySuccess();
     testAdmissionCanDropItsOwnCachePinToMakeProgress();
     testSingletonCapacityFailureTerminatesCleanly();
+    testQueuedLongPrefillsLeaveRoomForShortWork();
+    testAdmissionUsesCachedRemainingWork();
+    testFailedAdmissionDoesNotBlockOtherWork();
+    testSchedulingWaitDoesNotConsumeMemoryTimeout();
+    testUnadmittedRequestsHonorCancellationAndDeadline();
     testGrowthKeepsPrefillProgressWhenAnUnstartedPeerCanYield();
     testGrowthYieldsLowerPriorityResidentOutsideBatch();
     testPrefillGrowthPreservesAnActiveDecodePeer();

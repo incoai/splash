@@ -51,6 +51,10 @@ public:
     core_.setCompletionNotifier(std::move(notifier));
   }
 
+  void observePrefill(uint32_t rows, double wallMilliseconds) {
+    core_.observePrefill(rows, wallMilliseconds);
+  }
+
   void announceReady();
 
   [[nodiscard]] bool ready() const noexcept { return ready_; }

@@ -73,6 +73,9 @@ public:
          EngineEventSink &events);
 
   void submit(EngineRequest request);
+  void observePrefill(uint32_t rows, double wallMilliseconds) {
+    scheduler_.observePrefill(rows, wallMilliseconds);
+  }
   void cancel(uint64_t requestId);
   void failRequest(uint64_t requestId, std::string code, std::string message);
   void provideMask(uint64_t requestId, std::span<const uint32_t> words);
