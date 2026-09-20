@@ -360,7 +360,8 @@ public:
   [[nodiscard]] uint64_t submissionCount() const noexcept;
   [[nodiscard]] size_t pipelineCount() const noexcept;
   [[nodiscard]] bool healthy() const noexcept;
-  // Nonblocking serving-loop check of actual GPU commands and pending unmaps.
+  // Serving-loop check of actual GPU commands and pending unmaps. Terminal
+  // results may invoke completion here if the driver callback is delayed.
   // Timeout marks the backend unhealthy without releasing in-flight resources.
   void checkHealth();
   [[nodiscard]] bool needsHealthCheck() const noexcept;

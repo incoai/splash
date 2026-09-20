@@ -229,6 +229,7 @@ struct BackendAsyncState {
     uint64_t activeSequence = 0;
     size_t activeDispatchCount = 0;
     __weak id<MTLCommandBuffer> activeCommand = nil;
+    std::function<void(id<MTLCommandBuffer>)> activeCompletion;
     CommandWatchdog commandWatchdog;
     std::stop_source stopping;
     std::atomic<uint64_t> mapWaitEvent{0};
@@ -275,10 +276,12 @@ struct BackendAsyncState {
         return activeSequence;
     }
 
-    bool commitSubmission(uint64_t sequence, id<MTLCommandBuffer> command) {
+    bool commitSubmission(uint64_t sequence, id<MTLCommandBuffer> command,
+                          std::function<void(id<MTLCommandBuffer>)> completion) {
         std::lock_guard lock(gateMutex);
         if (stopping.stop_requested()) return false;
         activeCommand = command;
+        activeCompletion = std::move(completion);
         commandWatchdog.start(sequence, steadySeconds());
         [command commit];
         return true;
@@ -290,6 +293,7 @@ struct BackendAsyncState {
         if (activeSequence == sequence) {
             activeSequence = 0;
             activeCommand = nil;
+            activeCompletion = {};
         }
     }
 
@@ -299,18 +303,19 @@ struct BackendAsyncState {
     }
 
     void checkCommandHealth() {
+        id<MTLCommandBuffer> command = nil;
+        std::function<void(id<MTLCommandBuffer>)> complete;
         {
             std::lock_guard lock(gateMutex);
             if (commandWatchdog.expired(steadySeconds())) {
-                id<MTLCommandBuffer> command = activeCommand;
+                command = activeCommand;
                 const auto status = command ? command.status
                                             : MTLCommandBufferStatusNotEnqueued;
-                // GPU completion and delivery of its handler are separate.
-                // A terminal command must not time out while its handler waits
-                // for a CPU thread; the handler still publishes the result.
+                // Recover terminal results even if the driver has not delivered
+                // its callback. Finish outside the gate: it takes the ticket lock.
                 if (command && (status == MTLCommandBufferStatusCompleted ||
                                 status == MTLCommandBufferStatusError)) {
-                    commandWatchdog.complete(activeSequence);
+                    complete = activeCompletion;
                 } else {
                     std::ostringstream message;
                     message << "Metal command completion timed out after "
@@ -323,6 +328,7 @@ struct BackendAsyncState {
                 }
             }
         }
+        if (complete) complete(command);
         ensureHealthy();
     }
 
@@ -340,16 +346,43 @@ struct CommandTicket::State {
     std::condition_variable condition;
     uint64_t sequence = 0;
     CommandTiming timing;
+    std::chrono::steady_clock::time_point wallStart;
+    uint64_t sparseEventValue = 0;
     std::string error;
     bool completed = false;
     bool released = false;
+
+    void finishCommand(id<MTLCommandBuffer> command) {
+        auto wallEnd = std::chrono::steady_clock::now();
+        CommandTiming timing;
+        timing.gpuSeconds =
+            command.GPUEndTime - command.GPUStartTime;
+        if (!std::isfinite(timing.gpuSeconds) || timing.gpuSeconds < 0.0) {
+            timing.gpuSeconds = 0.0;
+        }
+        timing.wallSeconds =
+            std::chrono::duration<double>(wallEnd - wallStart).count();
+
+        std::string error;
+        if (command.status != MTLCommandBufferStatusCompleted) {
+            std::ostringstream message;
+            message << "Metal command " << sequence
+                    << " failed (sparse event " << sparseEventValue << ')';
+            if (command.error) {
+                message << ": " << errorDescription(command.error);
+            }
+            error = message.str();
+        }
+
+        finish(timing, std::move(error));
+    }
 
     void finish(CommandTiming result, std::string failure = {}) {
         CommandCompletion notify;
         {
             std::lock_guard lock(mutex);
-            // Metal may invoke a completion handler when an uncommitted
-            // command is discarded after its dependency has already failed.
+            // Host recovery, late callbacks, and discarded commands all share
+            // this completion path; only the first result may publish or notify.
             if (completed) return;
             backend->completeSubmission(sequence);
             if (!failure.empty()) backend->markUnhealthy(failure);
@@ -1369,6 +1402,8 @@ CommandTicket MetalBackend::submitCommandAsync(
         failBeforeCommit("unable to create Metal command buffer");
     }
     const uint64_t sparseEventValue = impl_->pendingSparseEventValue;
+    ticketState->wallStart = wallStart;
+    ticketState->sparseEventValue = sparseEventValue;
     if (sparseEventValue) {
         // Keep the queue dependency explicit; the CPU resolves it before commit.
         [command encodeWaitForEvent:impl_->sparseEvent value:sparseEventValue];
@@ -1412,28 +1447,7 @@ CommandTicket MetalBackend::submitCommandAsync(
     // is sampled on the host before submission and when consuming the result.
     std::shared_ptr<BackendAsyncState> observer = impl_->asyncState;
     [command addCompletedHandler:^(id<MTLCommandBuffer> completedCommand) {
-      auto wallEnd = std::chrono::steady_clock::now();
-      CommandTiming timing;
-      timing.gpuSeconds =
-          completedCommand.GPUEndTime - completedCommand.GPUStartTime;
-      if (!std::isfinite(timing.gpuSeconds) || timing.gpuSeconds < 0.0) {
-          timing.gpuSeconds = 0.0;
-      }
-      timing.wallSeconds =
-          std::chrono::duration<double>(wallEnd - wallStart).count();
-
-      std::string error;
-      if (completedCommand.status != MTLCommandBufferStatusCompleted) {
-          std::ostringstream message;
-          message << "Metal command " << ticketState->sequence
-                  << " failed (sparse event " << sparseEventValue << ')';
-          if (completedCommand.error) {
-              message << ": " << errorDescription(completedCommand.error);
-          }
-          error = message.str();
-      }
-
-      ticketState->finish(timing, std::move(error));
+        ticketState->finishCommand(completedCommand);
     }];
     impl_->sampleDeviceMemory();
     id<MTLSharedEvent> event = impl_->sparseEvent;
@@ -1471,7 +1485,10 @@ CommandTicket MetalBackend::submitCommandAsync(
                 ticketState->finish(timing, message.str());
                 return;
             }
-            if (!observer->commitSubmission(ticketState->sequence, command)) {
+            if (!observer->commitSubmission(ticketState->sequence, command,
+                    [weakTicket = std::weak_ptr(ticketState)](id<MTLCommandBuffer> completed) {
+                        if (auto ticket = weakTicket.lock()) ticket->finishCommand(completed);
+                    })) {
                 ticketState->finish({}, "Metal backend stopped before command submission");
                 return;
             }
