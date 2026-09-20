@@ -688,7 +688,7 @@ bool Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &items,
       return a.request.priority > b.request.priority;
     const Phase aPhase = scheduler_.phase(a.request.id);
     const Phase bPhase = scheduler_.phase(b.request.id);
-    // Do not interrupt an equal-priority decode stream to preserve prefill.
+    // At equal priority, prefer uninterrupted streaming over less replay work.
     if (aPhase != bPhase)
       return aPhase == Phase::Prefill;
     return completedTokens(a) < completedTokens(b);
@@ -703,6 +703,7 @@ bool Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &items,
   for (auto &[id, candidate] : requests_) {
     if (!candidate.stateCell)
       continue;
+    // Requests enter the scheduler before they can acquire a resident cell.
     const Phase phase = scheduler_.phase(id);
     if ((phase == Phase::Prefill || phase == Phase::Decode) &&
         yieldsBefore(candidate, *selected)) {
@@ -724,7 +725,7 @@ bool Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &items,
     suspendForGrowth(active, resumeTarget, now);
     return false;
   }
-  finishCapacity(active, victim.admission);
+  finishCapacity(request(victim.requestId), victim.admission);
   return false;
 }
 
