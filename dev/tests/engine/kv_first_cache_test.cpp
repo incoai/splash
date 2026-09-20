@@ -229,10 +229,8 @@ void testSpeculativeReclaimKeepsTheResumePoint() {
           "a demanded shrink could not reach the resume point");
 }
 
-// A checkpoint belongs to a request that is still running and republishes as
-// it goes. Keeping one because it is the most recent publication would evict
-// the finished state a different conversation resumes from, inverting the
-// disposable-first order.
+// A newer disposable checkpoint must not displace a warmed ordinary state
+// during speculative reclaim.
 void testCheckpointDoesNotOutrankTheResumePoint() {
   CacheFixture fixture;
   fixture.publish(0, 100);

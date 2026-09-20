@@ -157,10 +157,8 @@ bool StateCache::contains(uint64_t kvBlock) const noexcept {
 }
 
 uint64_t StateCache::resumePoint() const noexcept {
-  // A follow-up resumes from a finished publication. An unpinned checkpoint
-  // belongs to a request that is still running and republishes as it goes, so
-  // it becomes the resume point only when nothing better exists. Preferring it
-  // on recency alone would invert the disposable-first order below.
+  // Checkpoints can survive cancellation but remain disposable. Prefer an
+  // ordinary state for speculative protection, regardless of recency.
   return ordinaryEviction_.newest ? ordinaryEviction_.newest
                                   : checkpointEviction_.newest;
 }
