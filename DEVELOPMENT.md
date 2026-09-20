@@ -76,8 +76,10 @@ requests, recovery draining and the oldest current wait age. Memory transitions
 also appear in the console. Warning pressure can pause growth while `/ready`
 remains healthy for work that fits existing allocations.
 
-PDF input supports base64 documents up to 10 MiB / 20 pages, subject to cumulative
-rendering budgets. URL inputs, opening passwords and citations are unsupported.
+PDF input supports base64 documents within a shared 64 MiB source/rendering
+budget and the native 64-image limit (one image per page). Model context and
+isolated rendering limits also apply. URL inputs, opening passwords and citations
+are unsupported.
 Responses automatic truncation and unsupported history edits return errors.
 
 `POST /tokenize` accepts `{"content":"hello","add_special":false}` and returns

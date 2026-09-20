@@ -12,7 +12,9 @@ from server import documents, images
 from server.errors import APIError
 
 
-def pdf_bytes(text="ALPHA 42", *, pages=1, width=200, height=200, encrypted=False):
+def pdf_bytes(
+    text="ALPHA 42", *, pages=1, width=200, height=200, encrypted=False, padding_bytes=0
+):
     objects = [
         b"<< /Type /Catalog /Pages 2 0 R >>",
         b"",
@@ -37,6 +39,12 @@ def pdf_bytes(text="ALPHA 42", *, pages=1, width=200, height=200, encrypted=Fals
             + b"\nendstream"
         )
     objects[1] = f"<< /Type /Pages /Kids [{' '.join(kids)}] /Count {pages} >>".encode()
+    if padding_bytes:
+        objects.append(
+            f"<< /Length {padding_bytes} >>\nstream\n".encode()
+            + b" " * padding_bytes
+            + b"\nendstream"
+        )
     encryption = ""
     if encrypted:
         objects.append(
@@ -218,20 +226,67 @@ class DocumentTests(unittest.TestCase):
         self.assertTrue(results[1][1]["image_url"]["url"].startswith("data:image/png"))
         self.assertIn("ALPHA 42", documents.document_content(block)[0]["text"])
 
+    def test_small_pdf_uses_native_page_limit_instead_of_twenty_pages(self):
+        from server.protocol import ProtocolLimits
+
+        self.assertEqual(documents.MAX_PAGES, ProtocolLimits().max_image_spans)
+        for pages in (21, documents.MAX_PAGES):
+            with self.subTest(pages=pages):
+                parts = documents.document_content(
+                    document_block(pdf_bytes(pages=pages, width=64, height=64))
+                )
+                self.assertEqual(len(parts), pages * 2)
+                self.assertIn(f"PDF page {pages}:", parts[-2]["text"])
+
+    def test_source_larger_than_ten_mib_within_conversion_budget(self):
+        payload = pdf_bytes(padding_bytes=11 * 1024 * 1024)
+        budget = documents.DocumentBudget()
+        parts = documents.document_content(document_block(payload), budget=budget)
+        self.assertIn("ALPHA 42", parts[0]["text"])
+        self.assertLess(
+            budget.remaining_bytes, documents.MAX_REQUEST_DOCUMENT_BYTES - len(payload)
+        )
+
+    def test_pdf_pages_and_source_bytes_share_request_budget_on_cache_hits(self):
+        block = document_block(pdf_bytes(pages=2))
+        documents.document_content(block)
+        with mock.patch.object(documents, "_render") as render:
+            budget = documents.DocumentBudget(remaining_pages=3)
+            documents.document_content(block, budget=budget)
+            self.assertEqual(budget.remaining_pages, 1)
+            with self.assertRaisesRegex(APIError, "request page limit"):
+                documents.document_content(block, budget=budget)
+            with self.assertRaisesRegex(APIError, "request size limit"):
+                documents.document_content(
+                    block, budget=documents.DocumentBudget(remaining_bytes=1)
+                )
+            render.assert_not_called()
+
+    def test_cold_pdf_obeys_remaining_page_budget(self):
+        with self.assertRaisesRegex(APIError, "pages"):
+            documents.document_content(
+                document_block(pdf_bytes(pages=3)),
+                budget=documents.DocumentBudget(remaining_pages=2),
+            )
+        self.assertFalse(documents._cache)
+
     def test_request_budget_counts_repeated_pdfs_with_and_without_cache(self):
         block = document_block()
         documents.document_content(block)
         size = sum(page.size for pages in documents._cache.values() for page in pages)
+        source_size = len(base64.b64decode(block["source"]["data"]))
         for keep_cache in (False, True):
             self.setUp()
-            budget = documents.DocumentBudget(remaining_bytes=2 * size - 1)
+            budget = documents.DocumentBudget(
+                remaining_bytes=2 * (size + source_size) - 1
+            )
             with mock.patch.object(
                 documents, "_render", wraps=documents._render
             ) as render:
                 documents.document_content(block, budget=budget)
                 if not keep_cache:
                     self.setUp()
-                with self.assertRaisesRegex(APIError, "request size limit"):
+                with self.assertRaisesRegex(APIError, "size limit"):
                     documents.document_content(block, budget=budget)
             self.assertEqual(render.call_count, 1 if keep_cache else 2)
             self.assertEqual(budget.remaining_bytes, size - 1)
