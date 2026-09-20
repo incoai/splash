@@ -778,6 +778,43 @@ void testWaitingMaskExpiresAtRequestDeadline() {
   require(rejectedLateMask, "late mask revived an expired request");
 }
 
+void testWaitingMaskBoundsPeerPrefill() {
+  for (const RequestPriority priority : {RequestPriority::Foreground,
+                                         RequestPriority::Normal,
+                                         RequestPriority::Background}) {
+    Scheduler scheduler;
+    scheduler.observePrefill(2048, 4096.0);
+    scheduler.submit(request(1, 1, BatchCohort::Constrained, priority));
+    scheduler.resourcesReady(1, 1);
+    const BatchPlan initial = *scheduler.next();
+    scheduler.commit(initial);
+    const std::array result{
+        StepResult{1, 0, false, DecodeStage::ApplyInitialMask}};
+    scheduler.complete(initial, result);
+
+    scheduler.submit(request(2, 20'000));
+    scheduler.resourcesReady(2, 0);
+    const BatchPlan prefill = *scheduler.next();
+    const bool protectedPeer = priority <= RequestPriority::Normal;
+    require(prefill.kind == WorkKind::Prefill &&
+                prefill.items[0].requestId == 2 &&
+                prefill.items[0].tokenCount == (protectedPeer ? 128u : 2048u),
+            "mask wait lost prefill latency protection or priority ordering");
+    // A mask arriving during the command must get the next decode turn.
+    scheduler.maskReady(1);
+    completePrefill(scheduler, prefill);
+    if (protectedPeer) {
+      const BatchPlan decode = *scheduler.next();
+      require(decode.kind == WorkKind::Decode &&
+                  decode.items[0].requestId == 1,
+              "ready mask did not resume after bounded prefill");
+    }
+    scheduler.cancel(1);
+    require(scheduler.next()->items[0].tokenCount == 2048,
+            "cancelled mask request kept isolated prefill throttled");
+  }
+}
+
 void testResourceSuspensionReplaysFromCacheAndPreservesDecodeStage() {
   engine::Scheduler scheduler;
   scheduler.submit(request(1, 4096));
@@ -851,6 +888,7 @@ int main() {
     testDecodeCohortsAndLanesRotate();
     testMaskStagesNeverMix();
     testWaitingMaskExpiresAtRequestDeadline();
+    testWaitingMaskBoundsPeerPrefill();
     testResourceSuspensionReplaysFromCacheAndPreservesDecodeStage();
     std::cout << "ragged scheduler tests passed\n";
     return EXIT_SUCCESS;

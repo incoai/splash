@@ -311,7 +311,7 @@ uint32_t Scheduler::prefillBudget(
   const bool contended = std::any_of(
       requests_.begin(), requests_.end(), [&](const auto &entry) {
         const Request &peer = entry.second;
-        return peer.phase == Phase::Decode &&
+        return (peer.phase == Phase::Decode || peer.phase == Phase::WaitingMask) &&
                peer.spec.priority <= leader.spec.priority;
       }) || std::any_of(ready.begin(), ready.end(), [&](const Request *peer) {
         return peer->spec.id != leader.spec.id &&
@@ -322,9 +322,9 @@ uint32_t Scheduler::prefillBudget(
   if (!contended)
     return maximum;
 
-  // Keep long prefills packed. Bound commands when a peer needs decode or
-  // can finish prefill within this slice, so filling the batch does not delay
-  // its first token. The first sample and minimum matrix shape remain limits.
+  // Keep long prefills packed. Bound commands for peers decoding or waiting
+  // for a CPU mask, and for peers that can finish prefill within this slice.
+  // The first sample and minimum matrix shape remain limits.
   return rows;
 }
 
