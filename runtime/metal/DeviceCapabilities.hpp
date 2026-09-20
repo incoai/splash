@@ -15,8 +15,9 @@ struct DeviceCapabilities {
     uint32_t macosMajor = 0;
     uint32_t macosMinor = 0;
     uint32_t macosPatch = 0;
-    // Highest supported MTLGPUFamilyAppleN.
-    static constexpr uint32_t kMinimumAppleGpuFamily = 9;
+    // Highest supported MTLGPUFamilyAppleN. M2 is Apple8; actual sparse
+    // support is probed separately rather than inferred from the GPU family.
+    static constexpr uint32_t kMinimumAppleGpuFamily = 8;
     uint32_t appleGpuFamily = 0;
     // IORegistry gpu-core-count; zero means unavailable. Kernel policy then
     // assumes a large GPU when choosing parallelism.
