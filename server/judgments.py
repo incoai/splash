@@ -53,6 +53,12 @@ READOUT = (
 PROBABILITY_STATUS = "conditional option score; uncalibrated as decision confidence"
 # Native score-only requests carry at most this many option tokens.
 MAX_OPTIONS = 255
+# A /v1/systemone batch prepares every question before the first inference
+# and runs them under one shared deadline, so the batch carries its own
+# caps: at most this many questions holding at most this many prepared
+# prompt tokens in total.
+MAX_SYSTEMONE_QUESTIONS = 64
+MAX_SYSTEMONE_TOTAL_TOKENS = 1 << 20
 
 _MISSING = object()
 
@@ -395,6 +401,13 @@ def validate_systemone(body):
         details.append(detail(["questions"], "field required", "missing"))
     elif not isinstance(questions, dict) or not questions:
         details.append(detail(["questions"], "questions must be a nonempty object"))
+    elif len(questions) > MAX_SYSTEMONE_QUESTIONS:
+        details.append(
+            detail(
+                ["questions"],
+                f"questions must contain at most {MAX_SYSTEMONE_QUESTIONS} entries",
+            )
+        )
     else:
         for qid, question in questions.items():
             spec, errors = _question_spec(qid, question)

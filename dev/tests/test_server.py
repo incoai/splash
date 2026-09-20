@@ -1456,6 +1456,115 @@ class ServerTest(unittest.TestCase):
         self.assertTrue(blocked.cancelled.is_set())
         self.assertEqual(runtime.cancel_count, 1)
 
+    def test_models_routes_use_normalized_paths(self):
+        harness = self.harness(FakeRuntime())
+
+        def get(path):
+            connection = http.client.HTTPConnection(
+                *harness.server.server_address, timeout=3
+            )
+            connection.request("GET", path)
+            response = connection.getresponse()
+            result = (
+                response.status,
+                response.getheader("x-typesafe-request-id"),
+                response.read(),
+            )
+            connection.close()
+            return result
+
+        status, request_id, payload = get("/v1/models")
+        self.assertEqual(status, 200)
+        self.assertTrue((request_id or "").startswith("req_"))
+        body = json.loads(payload)
+        self.assertEqual(body["data"][0]["id"], "test-model")
+        self.assertEqual(body["models"][0]["name"], "test-model")
+
+        # Encoded spellings of the route and model id resolve identically.
+        for path in (
+            "/v1/models/test-model",
+            "/v1/models/test-%6Dodel",
+            "/v1%2Fmodels",
+            "/v1/models/../models",
+        ):
+            with self.subTest(path=path):
+                status, request_id, _ = get(path)
+                self.assertEqual(status, 200)
+                self.assertTrue((request_id or "").startswith("req_"))
+
+        # Unknown models still 404 under the normalized prefix.
+        status, request_id, _ = get("/v1/models/unknown")
+        self.assertEqual(status, 404)
+        self.assertTrue((request_id or "").startswith("req_"))
+        status, request_id, _ = get("/v1/models/")
+        self.assertEqual(status, 404)
+        self.assertTrue((request_id or "").startswith("req_"))
+
+        # Paths that normalize away from the catalog get no request id.
+        status, request_id, _ = get("/health")
+        self.assertEqual(status, 200)
+        self.assertIsNone(request_id)
+        status, request_id, _ = get("/v1/models/%2e%2e/%2e%2e/health")
+        self.assertEqual(status, 404)
+        self.assertIsNone(request_id)
+
+    def test_systemone_question_count_budget_rejects_before_inference(self):
+        runtime = FakeRuntime()
+        harness = self.harness(
+            runtime, tokenizer=self.CharTokenizer(), max_context=8192
+        )
+        fitting = {
+            f"q{index}": {"type": "choice", "criteria": {"only": None}}
+            for index in range(judgments.MAX_SYSTEMONE_QUESTIONS)
+        }
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/systemone",
+            {"model": "test-model", "state": [], "questions": fitting},
+        )
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(
+            len(json.loads(payload)["answers"]), judgments.MAX_SYSTEMONE_QUESTIONS
+        )
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/systemone",
+            {
+                "model": "test-model",
+                "state": [],
+                "questions": {**fitting, "extra": {"type": "noul"}},
+            },
+        )
+        self.assertEqual(status, 422, payload)
+        self.assertIn("questions", json.loads(payload)["detail"][0]["loc"])
+        self.assertEqual(runtime.requests, [])
+
+    def test_systemone_total_token_budget_rejects_before_inference(self):
+        class PaddedPromptTokenizer(self.BoundaryCountingTokenizer):
+            def apply_chat_template(self, messages, **kwargs):
+                self.templates.append((messages, kwargs))
+                self.prompt = "p" * 600_000
+                return self.prompt
+
+        runtime = FakeRuntime()
+        tokenizer = PaddedPromptTokenizer()
+        harness = self.harness(runtime, tokenizer=tokenizer, max_context=700_000)
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/systemone",
+            {
+                "model": "test-model",
+                "state": "evidence",
+                "questions": {"a": {"type": "noul"}, "b": {"type": "noul"}},
+            },
+        )
+        self.assertEqual(status, 422, payload)
+        self.assertIn("total prepared", json.loads(payload)["detail"][0]["msg"])
+        self.assertEqual(runtime.requests, [])
+        # Question a prepares and checks both slot boundaries; question b is
+        # rejected on its prepare pass. Before the fix b also ran both checks.
+        self.assertEqual(tokenizer.prompt_encodes, 4)
+
     class ImagePadTokenizer(FakeTokenizer):
         """Renders one image placeholder per image part like the pinned
         Qwen template, with pad id 50."""

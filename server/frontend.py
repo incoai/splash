@@ -531,6 +531,7 @@ class Frontend:
             deadline = self.request_deadline(body)
         priority = REQUEST_PRIORITIES[priority_name]
         jobs = []
+        total_tokens = 0
         with self._preparation(deadline):
             for qid, spec in specs:
                 if spec.deterministic:
@@ -550,10 +551,20 @@ class Frontend:
                     )
                 labels = slots[: len(spec.labels)]
 
-                def admit(prompt_tokens):
+                def admit(prompt_tokens, qid=qid, prepared=total_tokens):
                     remaining_request_time(deadline)
                     if prompt_tokens > self.max_context:
                         raise ContextLengthError(prompt_tokens, self.max_context)
+                    if prepared + prompt_tokens > judgments.MAX_SYSTEMONE_TOTAL_TOKENS:
+                        raise judgments.SystemOneError(
+                            [
+                                judgments.detail(
+                                    ["questions", qid],
+                                    "total prepared question tokens exceed "
+                                    f"{judgments.MAX_SYSTEMONE_TOTAL_TOKENS}",
+                                )
+                            ]
+                        )
 
                 try:
                     tokens, slot_ids, prompt = judgments.encode_prompt(
@@ -572,6 +583,7 @@ class Frontend:
                         500, "question prompt could not be rendered"
                     ) from error
                 remaining_request_time(deadline)
+                total_tokens += len(tokens)
                 job = self._score_job(
                     tokens,
                     slot_ids,

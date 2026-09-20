@@ -216,6 +216,8 @@ criteria descriptions may also be structured. Noul criteria may be omitted.
 Choice and score domains contain 1–255 entries. Singletons return their sole
 answer without inference. Other domains use deterministic, distinct single-token
 slots selected from the tokenizer. All questions are validated before any inference.
+A request holds at most 64 questions and 1M total prepared prompt tokens;
+larger batches are rejected before any inference.
 Questions run sequentially within a request under one shared deadline, allowing
 prefix reuse without filling the admission queue; independent HTTP requests still
 share the scheduler. Disconnects and timeouts cancel the current question.

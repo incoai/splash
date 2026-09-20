@@ -499,6 +499,19 @@ class ProtocolPythonTests(unittest.TestCase):
                 )
                 self.assertEqual(issue.request_id, request.request_id)
 
+    def test_oversized_score_count_rejected_before_tail_decode(self):
+        request = example_score_request()
+        wire = p.serialize_message(request)
+        for count in (p.MAX_SCORE_TOKENS + 1, 1_000_000, 0xFFFFFFFF):
+            with self.subTest(count=count):
+                bad = mutate_u32(wire, 24 + 60, count)
+                issue = self.assert_protocol_error(
+                    p.FailureClass.REQUEST_ERROR,
+                    p.IssueCode.INVALID_COUNT,
+                    lambda: p.decode_frame(parse_all(bad)[0]),
+                )
+                self.assertEqual(issue.request_id, request.request_id)
+
     def test_done_option_logits_wire_layout_and_roundtrip(self):
         done = p.DoneEvent(
             91, p.FinishReason.STOP, 4096, 0, 1000, 0, 3500, (1.5, -2.25, 0.5)

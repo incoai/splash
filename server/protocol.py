@@ -1419,6 +1419,13 @@ def _decode_request(payload: bytes, limits: ProtocolLimits) -> RequestFrame:
             "return_progress must be a boolean",
             request_id,
         )
+    if score_count > MAX_SCORE_TOKENS:
+        _fail(
+            FailureClass.REQUEST_ERROR,
+            IssueCode.INVALID_COUNT,
+            "score option count exceeds its limit",
+            request_id,
+        )
     if prompt_count > limits.max_prompt_tokens:
         _fail(
             FailureClass.REQUEST_ERROR,

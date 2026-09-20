@@ -110,6 +110,32 @@ ROOT = Path(__file__).parents[1]
 CHAT_HTML = Path(__file__).with_name("chat.html").read_bytes()
 
 
+def _normalize_path(raw_path):
+    """Canonicalize a request target for route and header decisions.
+
+    Strips any query string or fragment, percent-decodes, and resolves
+    ``.`` and ``..`` segments so encoded or dotted spellings of a route
+    are treated exactly like the route itself.
+    """
+    decoded = unquote(raw_path.partition("?")[0].partition("#")[0])
+    if not decoded.startswith("/"):
+        return decoded
+    trailing = decoded.endswith("/") and len(decoded) > 1
+    segments = []
+    for segment in decoded.split("/"):
+        if segment in ("", "."):
+            continue
+        if segment == "..":
+            if segments:
+                segments.pop()
+            continue
+        segments.append(segment)
+    normalized = "/" + "/".join(segments)
+    if trailing and normalized != "/":
+        normalized += "/"
+    return normalized
+
+
 class FrontendHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -181,10 +207,12 @@ class FrontendHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Connection", "close")
-        if getattr(self, "path", "").partition("?")[0] in (
-            "/v1/systemone",
-            "/v1/models",
-        ) or getattr(self, "path", "").startswith("/v1/models/"):
+        path = _normalize_path(getattr(self, "path", ""))
+        if (
+            path == "/v1/systemone"
+            or path == "/v1/models"
+            or path.startswith("/v1/models/")
+        ):
             self.send_header("x-typesafe-request-id", f"req_{secrets.token_hex(12)}")
         self._response_started = True
         self.end_headers()
@@ -342,7 +370,8 @@ class FrontendHandler(BaseHTTPRequestHandler):
             else:
                 self._json(200, stored.response)
             return
-        if path == "/v1/models" or path.startswith("/v1/models/"):
+        model_path = _normalize_path(self.path)
+        if model_path == "/v1/models" or model_path.startswith("/v1/models/"):
             model = {
                 "id": self.app.model,
                 "object": "model",
@@ -356,9 +385,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 "description": "Splash resident model",
                 "release_date": "",
             }
-            if path == "/v1/models":
+            if model_path == "/v1/models":
                 self._json(200, {"object": "list", "data": [model], "models": [typed]})
-            elif unquote(path.removeprefix("/v1/models/")) == self.app.model:
+            elif model_path.removeprefix("/v1/models/") == self.app.model:
                 self._json(200, model)
             else:
                 self._safe_error(APIError(404, "model not found", "model_not_found"))
