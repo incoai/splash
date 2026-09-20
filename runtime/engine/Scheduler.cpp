@@ -408,6 +408,10 @@ void Scheduler::complete(const BatchPlan &plan,
 
 Phase Scheduler::phase(uint64_t id) const { return get(id).phase; }
 
+uint32_t Scheduler::promptProcessed(uint64_t id) const {
+  return get(id).promptProcessed;
+}
+
 SchedulerSnapshot Scheduler::snapshot() const noexcept {
   SchedulerSnapshot result = counters_;
   for (const auto &[_, request] : requests_) {

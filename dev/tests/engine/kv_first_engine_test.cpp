@@ -1425,6 +1425,99 @@ void testSingletonCapacityFailureTerminatesCleanly() {
           "B1 capacity failure leaked backend resources");
 }
 
+void testGrowthKeepsPrefillProgressWhenAnUnstartedPeerCanYield() {
+  for (RequestPriority priority : {RequestPriority::Normal,
+                                   RequestPriority::Background}) {
+    Backing backing(512);
+    KvPool pool(backing);
+    engine::Cache resources(pool, CacheNamespace{});
+    Executor executor(2);
+    Events events;
+    engine::Engine engine({}, resources, executor, events);
+    backing.growthAllowed = [&] {
+      const auto started = executor.requests.find(48);
+      return started == executor.requests.end() ||
+             started->second.position < 2048 ||
+             std::count_if(executor.requests.begin(), executor.requests.end(),
+                           [](const auto &entry) { return entry.second.resident; }) < 2;
+    };
+    engine.submit(request(48, std::vector<uint32_t>(4096, 48)));
+    auto peer = request(49, std::vector<uint32_t>(8192, 49));
+    peer.priority = priority;
+    engine.submit(std::move(peer));
+    require(engine.tick(1) && engine.tick(2) &&
+                executor.requests.at(48).position == 2048 &&
+                executor.requests.at(49).position == 0,
+            "growth fixture did not isolate a started and an unstarted prefill");
+    require(engine.tick(3) && executor.suspensions == 1 &&
+                executor.requests.at(48).resident &&
+                !executor.requests.at(49).resident,
+            "KV growth discarded completed prefill instead of its unstarted peer");
+    runUntilIdle(engine);
+    require(events.completedCount == 2 && events.failedCount == 0 &&
+                events.capacityExhaustedCount == 0 && executor.prefillRows == 12288,
+            "yielding an unstarted peer lost work or failed to resume");
+  }
+}
+
+void testGrowthYieldsLowerPriorityResidentOutsideBatch() {
+  Backing backing(512);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(2);
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  backing.growthAllowed = [&] {
+    return std::count_if(executor.requests.begin(), executor.requests.end(),
+                         [](const auto &entry) { return entry.second.resident; }) < 2;
+  };
+  engine.submit(request(48, std::vector<uint32_t>(4096, 48)));
+  require(engine.tick(1) && engine.tick(2) &&
+              executor.requests.at(48).position == 2048,
+          "priority fixture did not advance the initial request");
+  auto foreground = request(49, std::vector<uint32_t>(8192, 49));
+  foreground.priority = RequestPriority::Foreground;
+  engine.submit(std::move(foreground));
+  require(engine.tick(3) && executor.suspensions == 1 &&
+              !executor.requests.at(48).resident &&
+              executor.requests.at(49).resident,
+          "resource recovery preempted foreground work for a lower-priority peer");
+  runUntilIdle(engine);
+  require(events.completedCount == 2 && events.failedCount == 0 &&
+              events.capacityExhaustedCount == 0,
+          "priority preemption failed to finish both requests");
+}
+
+void testPrefillGrowthPreservesAnActiveDecodePeer() {
+  Backing backing(512);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(2);
+  executor.decodeFinishes = false;
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  engine.submit(request(48, std::vector<uint32_t>(8192, 48)));
+  require(engine.tick(1) && engine.tick(2), "prefill setup did not progress");
+  auto decoding = request(49, {49});
+  decoding.maxNewTokens = 32;
+  engine.submit(std::move(decoding));
+  require(engine.tick(3) && engine.tick(4) &&
+              executor.requests.at(49).position == 1,
+          "short peer did not enter decode");
+  backing.growthBlocked = true;
+  for (uint32_t step = 5; step < 15 && !executor.suspensions; ++step)
+    static_cast<void>(engine.tick(step));
+  require(executor.suspensions == 1 && !executor.requests.at(48).resident &&
+              executor.requests.at(49).resident,
+          "prefill growth interrupted an equal-priority decode stream");
+  backing.growthBlocked = false;
+  executor.decodeFinishes = true;
+  runUntilIdle(engine);
+  require(events.completedCount == 2 && events.failedCount == 0 &&
+              events.capacityExhaustedCount == 0,
+          "mixed-phase pressure failed to finish both requests");
+}
+
 void testPhysicalKvPressureSuspendsInsteadOfKillingActiveWork() {
   Backing backing(8);
   KvPool pool(backing);
@@ -2877,6 +2970,9 @@ int main() {
     testAdmissionPinsDesiredStateAndCountsOnlySuccess();
     testAdmissionCanDropItsOwnCachePinToMakeProgress();
     testSingletonCapacityFailureTerminatesCleanly();
+    testGrowthKeepsPrefillProgressWhenAnUnstartedPeerCanYield();
+    testGrowthYieldsLowerPriorityResidentOutsideBatch();
+    testPrefillGrowthPreservesAnActiveDecodePeer();
     testPhysicalKvPressureSuspendsInsteadOfKillingActiveWork();
     testRecoveryDrainDoesNotConsumeResourceWaitBudget();
     testPhysicalPressureRetryIsBackedOffWithoutProgress();

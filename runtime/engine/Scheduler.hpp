@@ -77,6 +77,7 @@ public:
                 bool representativePrefillTiming = true);
 
   [[nodiscard]] Phase phase(uint64_t requestId) const;
+  [[nodiscard]] uint32_t promptProcessed(uint64_t requestId) const;
   [[nodiscard]] SchedulerSnapshot snapshot() const noexcept;
 
 private:

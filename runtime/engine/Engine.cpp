@@ -673,33 +673,55 @@ bool Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &items,
     return true;
   }
 
-  // A partially admitted plan executes the real narrower B1/B2/B3 shape.
-  // When every lane is blocked, the lane with the lowest priority and then
-  // the least completed work yields. Physical pressure suspends it so another
-  // request can use its backing. Host continuation is retained; committed
-  // history is replayed through normal prefill on resumption. A lone request
-  // that cannot fit the hard capacity fails; transient host pressure waits
-  // for recovery or the existing request deadline instead.
+  // Partial admissions execute at their actual width. If no lane fits, choose
+  // among all runnable residents: an unstarted peer can release its state
+  // cell before completed prefill is discarded.
   if (denied.empty())
     throw std::logic_error("empty resource admission result");
+  const auto completedTokens = [&](const Request &active) -> uint64_t {
+    return scheduler_.phase(active.request.id) == Phase::Prefill
+               ? scheduler_.promptProcessed(active.request.id)
+               : active.exactTokens.size();
+  };
+  const auto yieldsBefore = [&](const Request &a, const Request &b) {
+    if (a.request.priority != b.request.priority)
+      return a.request.priority > b.request.priority;
+    const Phase aPhase = scheduler_.phase(a.request.id);
+    const Phase bPhase = scheduler_.phase(b.request.id);
+    // Do not interrupt an equal-priority decode stream to preserve prefill.
+    if (aPhase != bPhase)
+      return aPhase == Phase::Prefill;
+    return completedTokens(a) < completedTokens(b);
+  };
   const Denied &victim = *std::min_element(
       denied.begin(), denied.end(),
       [&](const Denied &left, const Denied &right) {
-        const Request &a = request(left.requestId);
-        const Request &b = request(right.requestId);
-        if (a.request.priority != b.request.priority)
-          return a.request.priority > b.request.priority;
-        return a.exactTokens.size() < b.exactTokens.size();
+        return yieldsBefore(request(left.requestId), request(right.requestId));
       });
-  Request &active = request(victim.requestId);
+  Request *selected = &request(victim.requestId);
+  uint64_t resumeTarget = victim.workEnd;
+  for (auto &[id, candidate] : requests_) {
+    if (!candidate.stateCell)
+      continue;
+    const Phase phase = scheduler_.phase(id);
+    if ((phase == Phase::Prefill || phase == Phase::Decode) &&
+        yieldsBefore(candidate, *selected)) {
+      selected = &candidate;
+      // This peer has not failed a growth attempt. Retain its current KV
+      // capacity as the resume target, not the blocked lane's requirement.
+      resumeTarget =
+          uint64_t{cache_.pageTable(id).pages.size()} * KvCache::pageTokens;
+    }
+  }
+  Request &active = *selected;
   const bool anotherResident =
       std::any_of(requests_.begin(), requests_.end(), [&](const auto &entry) {
-        return entry.first != victim.requestId && entry.second.stateCell;
+        return entry.first != active.request.id && entry.second.stateCell;
       });
   if (growthPaused() || anotherResident || victim.retryableBudget ||
       victim.admission.allocationFailure ==
           metal::AllocationFailure::HostPressure) {
-    suspendForGrowth(active, victim.workEnd, now);
+    suspendForGrowth(active, resumeTarget, now);
     return false;
   }
   finishCapacity(active, victim.admission);
