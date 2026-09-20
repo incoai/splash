@@ -151,6 +151,7 @@ class ThinkingKeyTests(unittest.TestCase):
             allowed_host=[],
             api_key=None,
             no_webui=False,
+            max_request_size=api.DEFAULT_MAX_REQUEST_BYTES,
         )
         with (
             mock.patch.object(api, "parse_args", return_value=args),

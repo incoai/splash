@@ -30,6 +30,18 @@ and readiness probes and the chat page remain public; enter the key in the
 chat page to send requests. The page does not persist the key. Use
 `serve --no-webui` to disable the page. Authentication is off by default.
 
+HTTP request bodies are limited to 128 MiB; `serve --max-request-size 256M`
+overrides this. Concurrent input bytes share a budget of at least 512 MiB
+(or twice the request limit), including retained generation inputs. This is
+an input-byte budget, not a process RSS limit: large ASCII/base64 strings can
+use roughly twice their encoded size during JSON parsing alone. Decoded images
+and object-heavy JSON need additional memory. Oversized requests return 413;
+exhausted ingress capacity returns 503. Image and model context limits apply
+independently.
+Stored Responses history is charged before decoding. Uploads allow 30 seconds
+of inactivity and share the server's overall request deadline (default 30 minutes).
+`/status` reports `http.request_body_bytes` and `http.max_request_bytes`.
+
 Source `install/completions/splash.bash` for Bash or
 `install/completions/_splash` for Zsh after `compinit`. Completion suggests
 commands, bundled official model IDs and installed models without network access.

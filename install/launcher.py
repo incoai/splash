@@ -176,6 +176,8 @@ def serve(args):
             "--max-context",
             "auto" if args.max_context is None else str(args.max_context),
         ]
+        if args.max_request_size is not None:
+            command.extend(["--max-request-size", str(args.max_request_size)])
         if args.max_image_pixels is not None:
             command.extend(["--max-image-pixels", str(args.max_image_pixels)])
         if args.no_webui:
@@ -278,6 +280,13 @@ def _parse_max_memory(value):
     return result
 
 
+def _parse_request_size(value):
+    size = _parse_max_memory(value)
+    if size is None:
+        raise argparse.ArgumentTypeError("use a positive byte count such as 128M")
+    return size
+
+
 def _parse_max_context(value):
     normalized = value.strip().upper()
     if normalized == "AUTO":
@@ -344,6 +353,12 @@ def parse_args(argv=None):
         default=[],
         metavar="HOST",
         help="additional HTTP Host name to accept (repeatable)",
+    )
+    server.add_argument(
+        "--max-request-size",
+        type=_parse_request_size,
+        help="maximum HTTP request body size, e.g. 128M (default: 128M); "
+        "shared input budget is max(512M, twice this limit)",
     )
     server.add_argument(
         "--max-image-pixels", type=int, help="maximum resized pixels per image"

@@ -13,6 +13,7 @@ import socket
 import sys
 import threading
 import time
+import weakref
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote
@@ -94,7 +95,9 @@ else:
     import runtime as engine_runtime
 
 
-MAX_REQUEST_BYTES = 16 * 1024 * 1024
+DEFAULT_MAX_REQUEST_BYTES = 128 * 1024 * 1024
+# Match the former generation ingress envelope (32 slots × 16 MiB).
+DEFAULT_REQUEST_BODY_BUDGET = 512 * 1024 * 1024
 MAX_CONTEXT_TOKENS = 262144
 HTTP_IO_TIMEOUT = 30.0
 CLIENT_DISCONNECT_POLL = 0.01
@@ -222,7 +225,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, TimeoutError):
             pass
 
-    def _read_json_body(self):
+    def _read_json_body(self, deadline):
         if self.headers.get_all("Transfer-Encoding"):
             raise APIError(400, "transfer encoding is not supported")
         encodings = self.headers.get_all("Content-Encoding", [])
@@ -248,23 +251,32 @@ class FrontendHandler(BaseHTTPRequestHandler):
         length = int(lengths[0])
         if length <= 0:
             raise APIError(400, "request body must not be empty")
-        if length > MAX_REQUEST_BYTES:
-            raise APIError(413, "request body is too large")
-        deadline = time.monotonic() + self.server.io_timeout
+        if length > self.server.max_request_bytes:
+            raise APIError(
+                413,
+                f"request body is {length} bytes; limit is "
+                f"{self.server.max_request_bytes} bytes (--max-request-size)",
+                "request_too_large",
+            )
+        self._body_reservation = RequestBodyReservation(
+            self.server.request_bodies, length
+        )
         payload = bytearray()
         try:
             while len(payload) < length:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError
-                self.connection.settimeout(remaining)
+                self.connection.settimeout(min(remaining, self.server.io_timeout))
                 chunk = self.rfile.read1(min(65536, length - len(payload)))
                 if not chunk:
                     raise APIError(400, "request body ended before Content-Length")
                 payload.extend(chunk)
         finally:
             self.connection.settimeout(self.server.io_timeout)
-        return strict_json_loads(payload)
+        text = payload.decode(json.detect_encoding(payload), "surrogatepass")
+        payload.clear()
+        return strict_json_loads(text)
 
     def do_HEAD(self):
         self.do_GET()
@@ -349,6 +361,8 @@ class FrontendHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         started_at = time.monotonic()
         job = None
+        body = None
+        self._body_reservation = None
         submitted = False
         # Route on the URL path so standard protocol query parameters do not
         # turn a supported endpoint into an unknown one.
@@ -388,7 +402,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             )
             return
         try:
-            body = self._read_json_body()
+            body = self._read_json_body(started_at + self.app.request_timeout)
             if not isinstance(body, dict):
                 raise APIError(400, "request body must be an object")
             deadline = self.app.request_deadline(body, started_at)
@@ -435,7 +449,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 stream_options = None
             elif responses:
                 job, thinking, has_tools = self.app.prepare_responses(
-                    body, deadline=deadline
+                    body,
+                    deadline=deadline,
+                    reserve_input=self._body_reservation.grow,
                 )
                 stream_options = None
             else:
@@ -448,7 +464,13 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     or not isinstance(stream_options.get("include_usage", False), bool)
                 ):
                     raise APIError(400, "invalid streaming options")
+                stream_options = {
+                    "include_usage": stream_options.get("include_usage", False)
+                }
                 job, thinking, has_tools = self.app.prepare(body, deadline=deadline)
+            body = None
+            self._body_reservation.retain_for(job)
+            self._body_reservation = None
             job.return_progress = return_progress
             remaining_request_time(deadline)
             if self._client_disconnected():
@@ -494,6 +516,10 @@ class FrontendHandler(BaseHTTPRequestHandler):
             error = APIError(500, "internal server error", "internal_server_error")
             self._safe_error(error, anthropic, log=False)
         finally:
+            body = None
+            if self._body_reservation is not None:
+                self._body_reservation.release()
+                self._body_reservation = None
             admission.release()
 
     def _next_event(self, job, on_idle=None):
@@ -1342,36 +1368,90 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
 
 class HttpAdmission:
-    """Nonwaiting request-capacity gate."""
+    """Nonwaiting capacity gate, in request counts or input bytes."""
 
     def __init__(self, capacity):
         if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity <= 0:
             raise ValueError("HTTP admission capacity must be a positive integer")
         self.capacity = capacity
         self.active = 0
-        self.lock = threading.Lock()
+        # Input finalizers can run during a stats snapshot on this thread.
+        self.lock = threading.RLock()
         self.idle = threading.Event()
         self.idle.set()
 
-    def acquire(self):
+    def acquire(self, amount=1):
         with self.lock:
-            if self.active == self.capacity:
+            if self.active + amount > self.capacity:
                 return False
-            self.active += 1
+            self.active += amount
             self.idle.clear()
             return True
 
-    def release(self):
+    def release(self, amount=1):
         with self.lock:
-            if self.active == 0:
+            if amount > self.active:
                 raise RuntimeError("HTTP admission slot released without acquisition")
-            self.active -= 1
+            self.active -= amount
             if self.active == 0:
                 self.idle.set()
 
     def stats(self):
         with self.lock:
             return {"active": self.active, "capacity": self.capacity}
+
+
+class RequestBodyReservation:
+    """Account input bytes until preparation and any retained input are released."""
+
+    def __init__(self, admission, size):
+        if not admission.acquire(size):
+            raise APIError(
+                503,
+                "request body capacity is exhausted; retry shortly",
+                "frontend_overloaded",
+            )
+        self.admission = admission
+        self.size = size
+
+    def release(self):
+        self.admission.release(self.size)
+        self.size = 0
+
+    def grow(self, size):
+        if not self.admission.acquire(size):
+            raise APIError(
+                503,
+                "retained input capacity is exhausted; retry shortly",
+                "frontend_overloaded",
+            )
+        self.size += size
+
+    def retain_for(self, job):
+        # Generation retains schemas and, for Responses, conversation history.
+        # Text/image prompts have otherwise become tokens and prepared pixels.
+        policy = job.tool_policy
+        retained = (
+            job.response_history_items,
+            job.response_format,
+            policy.schemas if policy else None,
+            policy.namespaces if policy else None,
+            job.stop_sequences,
+        )
+        encoder = json.JSONEncoder(ensure_ascii=False, separators=(",", ":"))
+        retained = [value for value in retained if value]
+        size = (
+            sum(len(part.encode()) for part in encoder.iterencode(retained))
+            if retained
+            else 0
+        )
+        if size > self.size:
+            self.grow(size - self.size)
+        else:
+            self.admission.release(self.size - size)
+        self.size = size
+        if size:
+            weakref.finalize(job, self.release)
 
 
 class FrontendServer(ThreadingHTTPServer):
@@ -1392,9 +1472,20 @@ class FrontendServer(ThreadingHTTPServer):
         allowed_hosts=(),
         api_key=None,
         webui=True,
+        max_request_bytes=DEFAULT_MAX_REQUEST_BYTES,
     ):
         if not is_finite_number(io_timeout) or io_timeout <= 0:
             raise ValueError("io_timeout must be positive and finite")
+        if (
+            isinstance(max_request_bytes, bool)
+            or not isinstance(max_request_bytes, int)
+            or max_request_bytes <= 0
+        ):
+            raise ValueError("max_request_bytes must be a positive integer")
+        self.max_request_bytes = max_request_bytes
+        self.request_bodies = HttpAdmission(
+            max(DEFAULT_REQUEST_BODY_BUDGET, 2 * max_request_bytes)
+        )
         self.io_timeout = io_timeout
         self.api_key = validate_api_key(api_key) if api_key is not None else None
         self.webui = webui
@@ -1425,6 +1516,8 @@ class FrontendServer(ThreadingHTTPServer):
         }
         status["http"] = {
             "requests": self.requests.stats(),
+            "request_body_bytes": self.request_bodies.stats(),
+            "max_request_bytes": self.max_request_bytes,
             "token_counts": self.token_counts.stats(),
             "connections": self.connections.stats(),
         }
@@ -1525,6 +1618,13 @@ def _parse_max_memory(value):
     return result
 
 
+def _parse_request_size(value):
+    size = _parse_max_memory(value)
+    if size is None:
+        raise argparse.ArgumentTypeError("must be a positive byte count such as 128M")
+    return size
+
+
 def _parse_model_id(value):
     if value.count("/") != 1:
         raise argparse.ArgumentTypeError(
@@ -1547,6 +1647,13 @@ def parse_args(argv=None):
     )
     parser.add_argument("--max-context", type=_parse_max_context, default=None)
     parser.add_argument("--max-memory", type=_parse_max_memory, default=None)
+    parser.add_argument(
+        "--max-request-size",
+        type=_parse_request_size,
+        default=DEFAULT_MAX_REQUEST_BYTES,
+        help="maximum HTTP request body size (default: 128M); "
+        "shared input budget is max(512M, twice this limit)",
+    )
     parser.add_argument("--max-image-pixels", type=int, default=image_input.MAX_PIXELS)
     parser.add_argument("--max-new-tokens", type=int, default=32768)
     parser.add_argument("--request-timeout", type=float, default=1800)
@@ -1616,6 +1723,7 @@ def main():
             allowed_hosts=args.allowed_host,
             api_key=args.api_key,
             webui=not args.no_webui,
+            max_request_bytes=args.max_request_size,
         )
         server.server_bind()
         thinking_codec = ThinkingCodec(load_thinking_key())

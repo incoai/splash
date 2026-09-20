@@ -82,6 +82,7 @@ class LauncherTests(unittest.TestCase):
         for flag, values in (
             ("--max-context", ("0", "-1", "257K", "bad")),
             ("--max-memory", ("0", "-1G", "bad", str(2**64))),
+            ("--max-request-size", ("auto", "0", "-1G", "bad", str(2**64))),
         ):
             for value in values:
                 with self.subTest(value=value), mock.patch("sys.stderr", io.StringIO()):
@@ -121,6 +122,9 @@ class LauncherTests(unittest.TestCase):
                 )
                 self.assertEqual(argv[argv.index("--model") + 1], MODEL_ID)
                 self.assertEqual(
+                    argv[argv.index("--max-request-size") + 1], str(256 * 1024**2)
+                )
+                self.assertEqual(
                     argv[-4:],
                     ["--allowed-host", "splash.local", "--allowed-host", "proxy.local"],
                 )
@@ -158,6 +162,8 @@ class LauncherTests(unittest.TestCase):
                         "--api-key",
                         "test-server-key",
                         "--no-webui",
+                        "--max-request-size",
+                        "256M",
                         "--max-context",
                         "100K",
                         "--max-memory",

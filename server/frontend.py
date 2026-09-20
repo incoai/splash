@@ -742,7 +742,9 @@ class Frontend:
             priority=REQUEST_PRIORITIES[priority_name],
             stop_sequences=stop_sequences,
             thinking=thinking,
-            thinking_display=body.get("thinking_display", "summarized"),
+            thinking_display=(
+                "omitted" if body.get("thinking_display") == "omitted" else "summarized"
+            ),
             tool_policy=tool_policy,
             response_validator=response_validator,
             response_format=body.get("response_format"),
@@ -755,7 +757,7 @@ class Frontend:
         )
         return job, thinking, bool(tools)
 
-    def prepare_responses(self, body, *, deadline=None):
+    def prepare_responses(self, body, *, deadline=None, reserve_input=None):
         if deadline is None:
             deadline = self.request_deadline(body)
         store = body.get("store")
@@ -773,6 +775,10 @@ class Frontend:
                 previous = self.response_store.get(previous_id)
                 if previous is None:
                     raise APIError(404, "response not found", "not_found_error")
+                # The immutable record remains valid if the store evicts it.
+                # Reserve its input bytes before materializing the history.
+                if reserve_input is not None:
+                    reserve_input(len(previous.history_json))
                 previous_items = json.loads(previous.history_json)
             chat = responses_to_chat_body(body, previous_items)
             namespaces = chat.pop("_tool_namespaces")
