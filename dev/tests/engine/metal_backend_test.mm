@@ -1,4 +1,5 @@
 #include "../../../runtime/metal/MetalBackend.hpp"
+#include "../../../runtime/metal/DeviceQueries.hpp"
 #include "../../../runtime/ops/PagedKv.hpp"
 
 #import <Foundation/Foundation.h>
@@ -233,7 +234,7 @@ void backendDeferredSubmission(const std::string &metallibPath) {
 
 BOOL noPlacementSupport(id, SEL) { return NO; }
 BOOL failPlacementQuery(id, SEL) {
-    id<MTLDevice> backing = (id<MTLDevice>)[NSObject new];
+    id<SplashPlacementSparseDevice> backing = (id<SplashPlacementSparseDevice>)[NSObject new];
     return backing.supportsPlacementSparse;
 }
 id<MTLHeap> refuseProbeHeap(id, SEL, MTLHeapDescriptor *) { return nil; }

@@ -17,7 +17,7 @@
 
 @implementation ForwardingDevice
 - (BOOL)supportsPlacementSparse {
-    id<MTLDevice> backing = (id<MTLDevice>)[NSObject new];
+    id<SplashPlacementSparseDevice> backing = (id<SplashPlacementSparseDevice>)[NSObject new];
     return backing.supportsPlacementSparse;
 }
 @end
