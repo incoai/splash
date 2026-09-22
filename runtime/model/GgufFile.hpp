@@ -42,8 +42,8 @@ struct GgufTensor {
   uint64_t offset = 0;        // relative to the data section
   uint64_t bytes = 0;
   [[nodiscard]] uint64_t columns() const noexcept { return dims.empty() ? 0 : dims[0]; }
-  [[nodiscard]] uint64_t rows() const noexcept;
-  [[nodiscard]] uint64_t elements() const noexcept;
+  [[nodiscard]] uint64_t rows() const;
+  [[nodiscard]] uint64_t elements() const;
 };
 
 class GgufFile final {

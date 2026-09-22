@@ -34,6 +34,9 @@ BACKEND_CONTROL_SOURCES := \
 	runtime/engine/Engine.cpp
 MODEL_SOURCES := \
 	runtime/model/WeightStore.cpp \
+	runtime/model/GgufFile.cpp \
+	runtime/model/GgufImage.cpp \
+	runtime/model/GgufTarget.cpp \
 	runtime/model/Qwen3_6Moe.cpp \
 	runtime/model/Qwen3_8.cpp \
 	runtime/model/QwenVision.cpp \
@@ -61,6 +64,9 @@ TEST_OPERATOR_MEASUREMENT_ASAN := $(ENGINE_SANITIZER_BUILD)/operator-measurement
 TEST_OPERATOR_MEASUREMENT_TSAN := $(ENGINE_SANITIZER_BUILD)/operator-measurement-tsan
 TEST_MEMORY_TEST := $(ENGINE_TEST_BUILD)/engine-memory-plan
 TEST_DEVICE_QUERIES := $(ENGINE_TEST_BUILD)/device-queries
+TEST_GGUF_FILE := $(ENGINE_TEST_BUILD)/gguf-file
+TEST_KQUANT := $(ENGINE_TEST_BUILD)/kquant-projection
+TEST_KQUANT_LIB := $(ENGINE_TEST_BUILD)/kquant-dequant.metallib
 TEST_KV_PAGE_CACHE_TEST := $(ENGINE_TEST_BUILD)/kv-page-cache
 TEST_KV_FIRST_CACHE_TEST := $(ENGINE_TEST_BUILD)/kv-first-cache
 TEST_DRAFT_CONTEXT_PLAN_TEST := $(ENGINE_TEST_BUILD)/draft-context-plan
@@ -127,6 +133,7 @@ TEST_METAL_BACKEND_AIR := $(ENGINE_TEST_BUILD)/metal-backend.air
 TEST_METAL_BACKEND_LIB := $(ENGINE_TEST_BUILD)/metal-backend.metallib
 
 TEST_CPU_TARGETS := $(TEST_OPERATOR_WORKSPACE) \
+	$(TEST_GGUF_FILE) \
 	$(TEST_DEVICE_QUERIES) \
 	$(TEST_TUNING_WORKLOADS) \
 	$(TEST_LINEAR_PLAN) $(TEST_LINEAR_TUNING) $(TEST_ATTENTION_TUNING) \
@@ -153,6 +160,7 @@ TEST_CPU_TARGETS := $(TEST_OPERATOR_WORKSPACE) \
 	$(TEST_Q8_CPU_TEST)
 
 TEST_METAL_TARGETS := $(TEST_Q4_SGMATRIX_TEST) $(TEST_TUNING_WORKLOADS) \
+	$(TEST_KQUANT) \
 	$(TEST_LINEAR_TUNING) \
 	$(TEST_ATTENTION_TUNING) \
 	$(TEST_DRAFT_ATTENTION_TUNING) \
@@ -207,6 +215,19 @@ $(ENGINE_TEST_BUILD):
 
 $(ENGINE_SANITIZER_BUILD):
 	mkdir -p $@
+
+$(TEST_GGUF_FILE): dev/tests/engine/gguf_file_test.cpp runtime/model/GgufFile.cpp | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
+
+$(TEST_KQUANT): dev/benchmarks/kquant/harness_prod.mm dev/benchmarks/kquant/iq3s_grid.inc $(TEST_KQUANT_LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LINKFLAGS) -o $@
+
+$(ENGINE_TEST_BUILD)/kquant-dequant.air: dev/tests/engine/kquant_dequant_test.metal \
+		runtime/metal/kernels/shared/kquant.metal $(KERNEL_HEADERS) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(METAL) $(PROD_METALFLAGS) -c $< -o $@
+
+$(TEST_KQUANT_LIB): $(ENGINE_TEST_BUILD)/kquant-dequant.air
+	$(RUN_CONFIGURED) $(METALLIB) $< -o $@
 
 $(TEST_DEVICE_QUERIES): dev/tests/engine/device_queries_test.mm | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
@@ -559,6 +580,7 @@ METAL_TEST_ENV := MTL_SHADER_VALIDATION=1
 test-engine: test-engine-cpu test-engine-metal
 
 test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TUNE_KERNELS)
+	$(TEST_GGUF_FILE)
 	$(TEST_DEVICE_QUERIES)
 	$(TEST_TUNING_WORKLOADS)
 	$(TEST_LINEAR_PLAN) --cpu
@@ -594,6 +616,8 @@ $(TEST_Q4_SGMATRIX_TEST): dev/tests/engine/q4_sgmatrix_metal_test.mm $(ENGINE_LI
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
 
 test-engine-metal: $(TEST_METAL_TARGETS)
+	$(METAL_TEST_ENV) $(TEST_KQUANT) $(TEST_KQUANT_LIB) dequant
+	$(METAL_TEST_ENV) $(TEST_KQUANT) $(LIB) full
 	$(METAL_TEST_ENV) $(TEST_TUNING_WORKLOADS) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_LINEAR_TUNING) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_ATTENTION_TUNING) --metal $(LIB)

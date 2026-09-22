@@ -40,13 +40,13 @@ struct Q4Projection final {
   uint32_t outputSize = 0;
   uint32_t inputSize = 0;
   // Non-empty: a GGUF K-quant projection; weights/scales/biases are unused.
-  std::vector<KQuantSegment> kq;
+  std::vector<KQuantSegment> kq{};
   // GDN out_proj: permute 128-wide input head blocks (grouped -> tiled) first.
   bool kqPermuteHeads = false;
-  metal::MetalBuffer kqPartials;    // fp32 split-K partials scratch (shared)
-  metal::MetalBuffer kqPermuted;    // bf16 permuted activations scratch (shared)
-  metal::MetalBuffer kqPermutation; // uint32 head permutation table
-  metal::MetalBuffer kqCounters;    // split-K arrival counters (one uint per 64-column tile, zero at rest)
+  metal::MetalBuffer kqPartials{};    // fp32 split-K partials scratch (shared)
+  metal::MetalBuffer kqPermuted{};    // bf16 permuted activations scratch (shared)
+  metal::MetalBuffer kqPermutation{}; // uint32 head permutation table
+  metal::MetalBuffer kqCounters{};    // split-K arrival counters (one uint per 64-column tile, zero at rest)
 };
 
 // Q8 affine projections use per-64-input quantization and StorageN=256 order.

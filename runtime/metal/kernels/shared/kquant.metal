@@ -1,5 +1,6 @@
-// GGUF K-quant GEMMs (Q4_K, IQ4_XS, IQ4_NL, Q5_K, Q6_K, Q3_K, Q8_0, IQ3_S) for splash on Apple10.
-// K-quant GEMMs for splash on Apple10 (M5): Q4_K, IQ4_XS, IQ4_NL, Q5_K, Q6_K, Q3_K, Q8_0, IQ3_S.
+// GGUF K-quant GEMMs for Apple9 and Apple10.
+// Decode weights with FP32 group coefficients, then round once to the half tile,
+// matching llama.cpp Metal dequantize.h / mul_mm.metal. Keep activations BF16.
 // Weight layout: plane0 [tile(256 cols)][group32][256 cols][P0 bytes], plane1 likewise with P1 bytes (0 = none).
 // Metadata: [tile][unit][256 cols][MetaBytes], unit = super-block (256 K) or group32 (IQ4_NL, Q8_0).
 // Activations fp16 or bf16 [rows][K]; weights staged as fp16 in threadgroup memory; fp32 accumulation; bf16 output.
@@ -17,44 +18,47 @@ constant half2 kIQ4NL2[256] = {half2(-127.0h, -127.0h), half2(-104.0h, -127.0h),
 constant uint kIQ3S_GRID[512] = {0x01010101,0x01010103,0x01010105,0x0101010b,0x0101010f,0x01010301,0x01010303,0x01010305,0x01010309,0x0101030d,0x01010501,0x01010503,0x0101050b,0x01010707,0x01010901,0x01010905,0x0101090b,0x0101090f,0x01010b03,0x01010b07,0x01010d01,0x01010d05,0x01010f03,0x01010f09,0x01010f0f,0x01030101,0x01030103,0x01030105,0x01030109,0x01030301,0x01030303,0x0103030b,0x01030501,0x01030507,0x0103050f,0x01030703,0x0103070b,0x01030909,0x01030d03,0x01030d0b,0x01030f05,0x01050101,0x01050103,0x0105010b,0x0105010f,0x01050301,0x01050307,0x0105030d,0x01050503,0x0105050b,0x01050701,0x01050709,0x01050905,0x0105090b,0x0105090f,0x01050b03,0x01050b07,0x01050f01,0x01050f07,0x01070107,0x01070303,0x0107030b,0x01070501,0x01070505,0x01070703,0x01070707,0x0107070d,0x01070909,0x01070b01,0x01070b05,0x01070d0f,0x01070f03,0x01070f0b,0x01090101,0x01090307,0x0109030f,0x01090503,0x01090509,0x01090705,0x01090901,0x01090907,0x01090b03,0x01090f01,0x010b0105,0x010b0109,0x010b0501,0x010b0505,0x010b050d,0x010b0707,0x010b0903,0x010b090b,0x010b090f,0x010b0d0d,0x010b0f07,0x010d010d,0x010d0303,0x010d0307,0x010d0703,0x010d0b05,0x010d0f03,0x010f0101,0x010f0105,0x010f0109,0x010f0501,0x010f0505,0x010f050d,0x010f0707,0x010f0b01,0x010f0b09,0x03010101,0x03010103,0x03010105,0x03010109,0x03010301,0x03010303,0x03010307,0x0301030b,0x0301030f,0x03010501,0x03010505,0x03010703,0x03010709,0x0301070d,0x03010b09,0x03010b0d,0x03010d03,0x03010f05,0x03030101,0x03030103,0x03030107,0x0303010d,0x03030301,0x03030309,0x03030503,0x03030701,0x03030707,0x03030903,0x03030b01,0x03030b05,0x03030f01,0x03030f0d,0x03050101,0x03050305,0x0305030b,0x0305030f,0x03050501,0x03050509,0x03050705,0x03050901,0x03050907,0x03050b0b,0x03050d01,0x03050f05,0x03070103,0x03070109,0x0307010f,0x03070301,0x03070307,0x03070503,0x0307050f,0x03070701,0x03070709,0x03070903,0x03070d05,0x03070f01,0x03090107,0x0309010b,0x03090305,0x03090309,0x03090703,0x03090707,0x03090905,0x0309090d,0x03090b01,0x03090b09,0x030b0103,0x030b0301,0x030b0307,0x030b0503,0x030b0701,0x030b0705,0x030b0b03,0x030d0501,0x030d0509,0x030d050f,0x030d0909,0x030d090d,0x030f0103,0x030f0107,0x030f0301,0x030f0305,0x030f0503,0x030f070b,0x030f0903,0x030f0d05,0x030f0f01,0x05010101,0x05010103,0x05010107,0x0501010b,0x0501010f,0x05010301,0x05010305,0x05010309,0x0501030d,0x05010503,0x05010507,0x0501050f,0x05010701,0x05010705,0x05010903,0x05010907,0x0501090b,0x05010b01,0x05010b05,0x05010d0f,0x05010f01,0x05010f07,0x05010f0b,0x05030101,0x05030105,0x05030301,0x05030307,0x0503030f,0x05030505,0x0503050b,0x05030703,0x05030709,0x05030905,0x05030b03,0x05050103,0x05050109,0x0505010f,0x05050503,0x05050507,0x05050701,0x0505070f,0x05050903,0x05050b07,0x05050b0f,0x05050f03,0x05050f09,0x05070101,0x05070105,0x0507010b,0x05070303,0x05070505,0x05070509,0x05070703,0x05070707,0x05070905,0x05070b01,0x05070d0d,0x05090103,0x0509010f,0x05090501,0x05090507,0x05090705,0x0509070b,0x05090903,0x05090f05,0x05090f0b,0x050b0109,0x050b0303,0x050b0505,0x050b070f,0x050b0901,0x050b0b07,0x050b0f01,0x050d0101,0x050d0105,0x050d010f,0x050d0503,0x050d0b0b,0x050d0d03,0x050f010b,0x050f0303,0x050f050d,0x050f0701,0x050f0907,0x050f0b01,0x07010105,0x07010303,0x07010307,0x0701030b,0x0701030f,0x07010505,0x07010703,0x07010707,0x0701070b,0x07010905,0x07010909,0x0701090f,0x07010b03,0x07010d07,0x07010f03,0x07030103,0x07030107,0x0703010b,0x07030309,0x07030503,0x07030507,0x07030901,0x07030d01,0x07030f05,0x07030f0d,0x07050101,0x07050305,0x07050501,0x07050705,0x07050709,0x07050b01,0x07070103,0x07070301,0x07070309,0x07070503,0x07070507,0x0707050f,0x07070701,0x07070903,0x07070907,0x0707090f,0x07070b0b,0x07070f07,0x07090107,0x07090303,0x0709030d,0x07090505,0x07090703,0x07090b05,0x07090d01,0x07090d09,0x070b0103,0x070b0301,0x070b0305,0x070b050b,0x070b0705,0x070b0909,0x070b0b0d,0x070b0f07,0x070d030d,0x070d0903,0x070f0103,0x070f0107,0x070f0501,0x070f0505,0x070f070b,0x09010101,0x09010109,0x09010305,0x09010501,0x09010509,0x0901050f,0x09010705,0x09010903,0x09010b01,0x09010f01,0x09030105,0x0903010f,0x09030303,0x09030307,0x09030505,0x09030701,0x0903070b,0x09030907,0x09030b03,0x09030b0b,0x09050103,0x09050107,0x09050301,0x0905030b,0x09050503,0x09050707,0x09050901,0x09050b0f,0x09050d05,0x09050f01,0x09070109,0x09070303,0x09070307,0x09070501,0x09070505,0x09070703,0x0907070b,0x09090101,0x09090105,0x09090509,0x0909070f,0x09090901,0x09090f03,0x090b010b,0x090b010f,0x090b0503,0x090b0d05,0x090d0307,0x090d0709,0x090d0d01,0x090f0301,0x090f030b,0x090f0701,0x090f0907,0x090f0b03,0x0b010105,0x0b010301,0x0b010309,0x0b010505,0x0b010901,0x0b010909,0x0b01090f,0x0b010b05,0x0b010d0d,0x0b010f09,0x0b030103,0x0b030107,0x0b03010b,0x0b030305,0x0b030503,0x0b030705,0x0b030f05,0x0b050101,0x0b050303,0x0b050507,0x0b050701,0x0b05070d,0x0b050b07,0x0b070105,0x0b07010f,0x0b070301,0x0b07050f,0x0b070909,0x0b070b03,0x0b070d0b,0x0b070f07,0x0b090103,0x0b090109,0x0b090501,0x0b090705,0x0b09090d,0x0b0b0305,0x0b0b050d,0x0b0b0b03,0x0b0b0b07,0x0b0d0905,0x0b0f0105,0x0b0f0109,0x0b0f0505,0x0d010303,0x0d010307,0x0d01030b,0x0d010703,0x0d010707,0x0d010d01,0x0d030101,0x0d030501,0x0d03050f,0x0d030d09,0x0d050305,0x0d050709,0x0d050905,0x0d050b0b,0x0d050d05,0x0d050f01,0x0d070101,0x0d070309,0x0d070503,0x0d070901,0x0d09050b,0x0d090907,0x0d090d05,0x0d0b0101,0x0d0b0107,0x0d0b0709,0x0d0b0d01,0x0d0d010b,0x0d0d0901,0x0d0f0303,0x0d0f0307,0x0f010101,0x0f010109,0x0f01010f,0x0f010501,0x0f010505,0x0f01070d,0x0f010901,0x0f010b09,0x0f010d05,0x0f030105,0x0f030303,0x0f030509,0x0f030907,0x0f03090b,0x0f050103,0x0f050109,0x0f050301,0x0f05030d,0x0f050503,0x0f050701,0x0f050b03,0x0f070105,0x0f070705,0x0f07070b,0x0f070b07,0x0f090103,0x0f09010b,0x0f090307,0x0f090501,0x0f090b01,0x0f0b0505,0x0f0b0905,0x0f0d0105,0x0f0d0703,0x0f0f0101};
 
 // ---- shared helpers: 8 weights per word. Interleaved order: weights (2p, 2p+1) at bits 4p and 16+4p.
-inline void store_affine8(uint v, half2 s2, half2 m2, threadgroup half *dst) {
+inline void store_affine8(uint v, float2 s2, float2 m2, threadgroup half *dst) {
   const half2 k = half2(1024.0h);
   half4 o0, o1;
-  o0.xy = fma(as_type<half2>(((v >> 0) & 0x000F000Fu) | 0x64006400u) - k, s2, m2);
-  o0.zw = fma(as_type<half2>(((v >> 4) & 0x000F000Fu) | 0x64006400u) - k, s2, m2);
-  o1.xy = fma(as_type<half2>(((v >> 8) & 0x000F000Fu) | 0x64006400u) - k, s2, m2);
-  o1.zw = fma(as_type<half2>(((v >> 12) & 0x000F000Fu) | 0x64006400u) - k, s2, m2);
+  o0.xy = half2(fma(float2(as_type<half2>(((v >> 0) & 0x000F000Fu) | 0x64006400u) - k), s2, m2));
+  o0.zw = half2(fma(float2(as_type<half2>(((v >> 4) & 0x000F000Fu) | 0x64006400u) - k), s2, m2));
+  o1.xy = half2(fma(float2(as_type<half2>(((v >> 8) & 0x000F000Fu) | 0x64006400u) - k), s2, m2));
+  o1.zw = half2(fma(float2(as_type<half2>(((v >> 12) & 0x000F000Fu) | 0x64006400u) - k), s2, m2));
   *((threadgroup half4 *)dst) = o0; *((threadgroup half4 *)(dst + 4)) = o1;
 }
 // IQ4 codebook, interleaved order, 16-entry constant table
-inline void store_lut8(uint v, half2 s2, threadgroup half *dst) {
+template <typename Scale>
+inline void store_lut8(uint v, Scale s2, threadgroup half *dst) {
   half4 o0, o1;
-  o0.xy = half2(kIQ4NL[(v >> 0) & 15], kIQ4NL[(v >> 16) & 15]) * s2;
-  o0.zw = half2(kIQ4NL[(v >> 4) & 15], kIQ4NL[(v >> 20) & 15]) * s2;
-  o1.xy = half2(kIQ4NL[(v >> 8) & 15], kIQ4NL[(v >> 24) & 15]) * s2;
-  o1.zw = half2(kIQ4NL[(v >> 12) & 15], kIQ4NL[(v >> 28) & 15]) * s2;
+  o0.xy = half2(Scale(half2(kIQ4NL[(v >> 0) & 15], kIQ4NL[(v >> 16) & 15])) * s2);
+  o0.zw = half2(Scale(half2(kIQ4NL[(v >> 4) & 15], kIQ4NL[(v >> 20) & 15])) * s2);
+  o1.xy = half2(Scale(half2(kIQ4NL[(v >> 8) & 15], kIQ4NL[(v >> 24) & 15])) * s2);
+  o1.zw = half2(Scale(half2(kIQ4NL[(v >> 12) & 15], kIQ4NL[(v >> 28) & 15])) * s2);
   *((threadgroup half4 *)dst) = o0; *((threadgroup half4 *)(dst + 4)) = o1;
 }
 // IQ4 codebook, natural byte order (weights 2p, 2p+1 in byte p), 256-entry half2 table (constant or threadgroup)
-inline void store_lutb8(uint v, half2 s2, threadgroup half *dst) {
+template <typename Scale>
+inline void store_lutb8(uint v, Scale s2, threadgroup half *dst) {
   half4 o0, o1;
-  o0.xy = kIQ4NL2[v & 255] * s2; o0.zw = kIQ4NL2[(v >> 8) & 255] * s2;
-  o1.xy = kIQ4NL2[(v >> 16) & 255] * s2; o1.zw = kIQ4NL2[v >> 24] * s2;
+  o0.xy = half2(Scale(kIQ4NL2[v & 255]) * s2); o0.zw = half2(Scale(kIQ4NL2[(v >> 8) & 255]) * s2);
+  o1.xy = half2(Scale(kIQ4NL2[(v >> 16) & 255]) * s2); o1.zw = half2(Scale(kIQ4NL2[v >> 24]) * s2);
   *((threadgroup half4 *)dst) = o0; *((threadgroup half4 *)(dst + 4)) = o1;
 }
-inline void store_lutt8(uint v, half2 s2, threadgroup half2 *tl, threadgroup half *dst) {
+template <typename Scale>
+inline void store_lutt8(uint v, Scale s2, threadgroup half2 *tl, threadgroup half *dst) {
   half4 o0, o1;
-  o0.xy = tl[v & 255] * s2; o0.zw = tl[(v >> 8) & 255] * s2;
-  o1.xy = tl[(v >> 16) & 255] * s2; o1.zw = tl[v >> 24] * s2;
+  o0.xy = half2(Scale(tl[v & 255]) * s2); o0.zw = half2(Scale(tl[(v >> 8) & 255]) * s2);
+  o1.xy = half2(Scale(tl[(v >> 16) & 255]) * s2); o1.zw = half2(Scale(tl[v >> 24]) * s2);
   *((threadgroup half4 *)dst) = o0; *((threadgroup half4 *)(dst + 4)) = o1;
 }
-inline void k4_scale_min(uint4 hdr, ushort j, thread half2 &s2, thread half2 &m2) {   // block_q4_K / block_q5_K header
+inline void k4_scale_min(uint4 hdr, ushort j, thread float2 &s2, thread float2 &m2) {   // block_q4_K / block_q5_K header
   const uchar4 q0 = as_type<uchar4>(hdr.y), q1 = as_type<uchar4>(hdr.z), q2 = as_type<uchar4>(hdr.w);
   const uchar q[12] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w, q2.x, q2.y, q2.z, q2.w};
   uchar sc, m;
   if (j < 4) { sc = q[j] & 63; m = q[j + 4] & 63; } else { sc = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4); m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4); }
   const half d = as_type<half>(ushort(hdr.x & 0xFFFF)), dmin = as_type<half>(ushort(hdr.x >> 16));
-  s2 = half2(half(float(d) * float(sc))); m2 = half2(half(-float(dmin) * float(m)));
+  s2 = float2(float(d) * float(sc)); m2 = float2(-float(dmin) * float(m));
 }
 
 struct P16 { uint4 a; };
@@ -69,7 +73,7 @@ struct FmtQ4K {
   static Payload load(device uchar *p0, device uchar *) { return {*((device uint4 *)p0)}; }
   static Meta loadMeta(device uchar *m) { return *((device uint4 *)m); }
   static void dequant32(Payload w, Meta hdr, ushort j, threadgroup half2 *, threadgroup half *dst) {
-    half2 s2, m2; k4_scale_min(hdr, j, s2, m2);
+    float2 s2, m2; k4_scale_min(hdr, j, s2, m2);
 #pragma unroll
     for (ushort k = 0; k < 4; ++k) store_affine8(w.a[k], s2, m2, dst + 8 * k);
   }
@@ -83,7 +87,7 @@ template <int Lut> struct FmtIQ4XS {
   static void dequant32(Payload w, Meta mt, ushort j, threadgroup half2 *tl, threadgroup half *dst) {
     const half d = as_type<half>(ushort(mt.x & 0xFFFF)); const uint sh = mt.x >> 16;
     const int ls = int((mt.y >> (4 * j)) & 0xF) | int(((sh >> (2 * j)) & 3) << 4);
-    const half2 s2 = half2(half(float(d) * float(ls - 32)));
+    const float2 s2 = float2(float(d) * float(ls - 32));
 #pragma unroll
     for (ushort k = 0; k < 4; ++k) {
       if constexpr (Lut == 0) store_lut8(w.a[k], s2, dst + 8 * k);
@@ -114,15 +118,15 @@ struct FmtQ5K {
   static Payload load(device uchar *p0, device uchar *p1) { return {*((device uint4 *)p0), *((device uint *)p1)}; }
   static Meta loadMeta(device uchar *m) { return *((device uint4 *)m); }
   static void dequant32(Payload w, Meta hdr, ushort j, threadgroup half2 *, threadgroup half *dst) {
-    half2 s2, m2; k4_scale_min(hdr, j, s2, m2);
+    float2 s2, m2; k4_scale_min(hdr, j, s2, m2);
     const half2 k = half2(1024.0h);
 #pragma unroll
     for (ushort kk = 0; kk < 4; ++kk) {
       const uint v = w.a[kk]; half4 o0, o1;
-      o0.xy = fma(as_type<half2>(((v >> 0) & 0x000F000Fu) | (((w.b >> (4 * kk + 0)) & 0x00010001u) << 4) | 0x64006400u) - k, s2, m2);
-      o0.zw = fma(as_type<half2>(((v >> 4) & 0x000F000Fu) | (((w.b >> (4 * kk + 1)) & 0x00010001u) << 4) | 0x64006400u) - k, s2, m2);
-      o1.xy = fma(as_type<half2>(((v >> 8) & 0x000F000Fu) | (((w.b >> (4 * kk + 2)) & 0x00010001u) << 4) | 0x64006400u) - k, s2, m2);
-      o1.zw = fma(as_type<half2>(((v >> 12) & 0x000F000Fu) | (((w.b >> (4 * kk + 3)) & 0x00010001u) << 4) | 0x64006400u) - k, s2, m2);
+      o0.xy = half2(fma(float2(as_type<half2>(((v >> 0) & 0x000F000Fu) | (((w.b >> (4 * kk + 0)) & 0x00010001u) << 4) | 0x64006400u) - k), s2, m2));
+      o0.zw = half2(fma(float2(as_type<half2>(((v >> 4) & 0x000F000Fu) | (((w.b >> (4 * kk + 1)) & 0x00010001u) << 4) | 0x64006400u) - k), s2, m2));
+      o1.xy = half2(fma(float2(as_type<half2>(((v >> 8) & 0x000F000Fu) | (((w.b >> (4 * kk + 2)) & 0x00010001u) << 4) | 0x64006400u) - k), s2, m2));
+      o1.zw = half2(fma(float2(as_type<half2>(((v >> 12) & 0x000F000Fu) | (((w.b >> (4 * kk + 3)) & 0x00010001u) << 4) | 0x64006400u) - k), s2, m2));
       *((threadgroup half4 *)(dst + 8 * kk)) = o0; *((threadgroup half4 *)(dst + 8 * kk + 4)) = o1;
     }
   }
@@ -138,16 +142,16 @@ struct FmtQ6K {
     const float d = float(as_type<half>(ushort(mt.d & 0xFFFF)));
     const uint scw = mt.sc[j >> 1];                                   // scales 4(j>>1) .. +3; we need 2j, 2j+1 -> bytes 2(j&1), 2(j&1)+1
     const char4 sc4 = as_type<char4>(scw);
-    const half2 sA = half2(half(d * float(sc4[2 * (j & 1)]))), sB = half2(half(d * float(sc4[2 * (j & 1) + 1])));
+    const float2 sA = float2(d * float(sc4[2 * (j & 1)])), sB = float2(d * float(sc4[2 * (j & 1) + 1]));
     const half2 k = half2(1056.0h);   // 1024 + 32
 #pragma unroll
     for (ushort kk = 0; kk < 4; ++kk) {
-      const uint v = w.a[kk], H = w.b[kk >> 1]; const ushort kp = (kk & 1) * 8; const half2 s2 = kk < 2 ? sA : sB;
+      const uint v = w.a[kk], H = w.b[kk >> 1]; const ushort kp = (kk & 1) * 8; const float2 s2 = kk < 2 ? sA : sB;
       half4 o0, o1;
-      o0.xy = (as_type<half2>(((v >> 0) & 0x000F000Fu) | (((H >> (kp + 0)) & 0x00030003u) << 4) | 0x64006400u) - k) * s2;
-      o0.zw = (as_type<half2>(((v >> 4) & 0x000F000Fu) | (((H >> (kp + 2)) & 0x00030003u) << 4) | 0x64006400u) - k) * s2;
-      o1.xy = (as_type<half2>(((v >> 8) & 0x000F000Fu) | (((H >> (kp + 4)) & 0x00030003u) << 4) | 0x64006400u) - k) * s2;
-      o1.zw = (as_type<half2>(((v >> 12) & 0x000F000Fu) | (((H >> (kp + 6)) & 0x00030003u) << 4) | 0x64006400u) - k) * s2;
+      o0.xy = half2(float2(as_type<half2>(((v >> 0) & 0x000F000Fu) | (((H >> (kp + 0)) & 0x00030003u) << 4) | 0x64006400u) - k) * s2);
+      o0.zw = half2(float2(as_type<half2>(((v >> 4) & 0x000F000Fu) | (((H >> (kp + 2)) & 0x00030003u) << 4) | 0x64006400u) - k) * s2);
+      o1.xy = half2(float2(as_type<half2>(((v >> 8) & 0x000F000Fu) | (((H >> (kp + 4)) & 0x00030003u) << 4) | 0x64006400u) - k) * s2);
+      o1.zw = half2(float2(as_type<half2>(((v >> 12) & 0x000F000Fu) | (((H >> (kp + 6)) & 0x00030003u) << 4) | 0x64006400u) - k) * s2);
       *((threadgroup half4 *)(dst + 8 * kk)) = o0; *((threadgroup half4 *)(dst + 8 * kk + 4)) = o1;
     }
   }
@@ -170,15 +174,15 @@ struct FmtQ3K {
       default: aux = ((t1 >> 4) & 0x0f0f0f0fu) | (((t2 >> 6) & 0x03030303u) << 4); break;
     }
     const uchar4 a4 = as_type<uchar4>(aux);
-    const half2 sA = half2(half(d * float(int(a4[2 * (j & 1)]) - 32))), sB = half2(half(d * float(int(a4[2 * (j & 1) + 1]) - 32)));
+    const float2 sA = float2(d * float(int(a4[2 * (j & 1)]) - 32)), sB = float2(d * float(int(a4[2 * (j & 1) + 1]) - 32));
     const half2 k = half2(1028.0h);   // 1024 + 4
 #pragma unroll
     for (ushort h = 0; h < 2; ++h) {
-      const uint v = w.a[h]; const half2 s2 = h ? sB : sA; half4 o[4];
+      const uint v = w.a[h]; const float2 s2 = h ? sB : sA; half4 o[4];
 #pragma unroll
       for (ushort q = 0; q < 4; ++q) {
-        o[q].xy = (as_type<half2>(((v >> (4 * q)) & 0x00030003u) | (((w.b >> (8 * h + 2 * q)) & 0x00010001u) << 2) | 0x64006400u) - k) * s2;
-        o[q].zw = (as_type<half2>(((v >> (4 * q + 2)) & 0x00030003u) | (((w.b >> (8 * h + 2 * q + 1)) & 0x00010001u) << 2) | 0x64006400u) - k) * s2;
+        o[q].xy = half2(float2(as_type<half2>(((v >> (4 * q)) & 0x00030003u) | (((w.b >> (8 * h + 2 * q)) & 0x00010001u) << 2) | 0x64006400u) - k) * s2);
+        o[q].zw = half2(float2(as_type<half2>(((v >> (4 * q + 2)) & 0x00030003u) | (((w.b >> (8 * h + 2 * q + 1)) & 0x00010001u) << 2) | 0x64006400u) - k) * s2);
         *((threadgroup half4 *)(dst + 16 * h + 4 * q)) = o[q];
       }
     }
@@ -207,7 +211,7 @@ struct FmtIQ3S {
   static Meta loadMeta(device uchar *m) { return *((device ushort *)m); }
   static void dequant32(Payload w, Meta mt, ushort, threadgroup half2 *, threadgroup half *dst) {
     const uint qh = w.a.w & 0xFF, scale = (w.a.w >> 8) & 0xF;
-    const half db = half(float(as_type<half>(mt)) * float(1 + 2 * scale));
+    const float db = float(as_type<half>(mt)) * float(1 + 2 * scale);
     const uchar4 sg = as_type<uchar4>(w.a.z);
 #pragma unroll
     for (ushort l = 0; l < 4; ++l) {
@@ -215,7 +219,7 @@ struct FmtIQ3S {
       const uint q1 = (qsw >> sh) & 0xFF, q2 = (qsw >> (sh + 8)) & 0xFF;
       const uint g1 = kIQ3S_GRID[q1 | ((qh << (8 - 2 * l)) & 256)], g2 = kIQ3S_GRID[q2 | ((qh << (7 - 2 * l)) & 256)];
       const uchar s = sg[l];
-      half4 v1 = half4(as_type<uchar4>(g1)) * db, v2 = half4(as_type<uchar4>(g2)) * db;
+      half4 v1 = half4(float4(as_type<uchar4>(g1)) * db), v2 = half4(float4(as_type<uchar4>(g2)) * db);
       v1 = select(v1, -v1, bool4(s & 1, s & 2, s & 4, s & 8));
       v2 = select(v2, -v2, bool4(s & 16, s & 32, s & 64, s & 128));
       *((threadgroup half4 *)(dst + 8 * l)) = v1; *((threadgroup half4 *)(dst + 8 * l + 4)) = v2;
@@ -426,6 +430,8 @@ kernel void kq_splitk_reduce(device float *partials [[buffer(0)]], device bfloat
                                    p.output_size, p.input_size, group.y * N, stage, tl, simd_lane, simd_group, p.out_stride, p.out_offset); }
 // ---------------- sg_accum: the decode tile loop without the store; acc is created by the caller (kq_make_acc) so
 // several formats can accumulate into the same cooperative tensor type (fused segments, gate+up).
+// Initialize in the caller after construction: returning an initialized cooperative tensor
+// loses its initial values on Apple9 in runtime-format kernels (also with shader validation).
 template <typename TA, ushort Rows, ushort Cols, ushort KS>
 inline auto kq_make_acc(device TA *input, uint input_size, threadgroup half *stage) {
   auto a = tensor(input, dextents<int, 2>{int(input_size), Rows}, array<int, 2>{1, int(input_size)});
@@ -434,10 +440,7 @@ inline auto kq_make_acc(device TA *input, uint input_size, threadgroup half *sta
   auto a0 = a.template slice<KS, Rows>(0, 0);
   tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt0(stage, dextents<int, 2>{KS, Cols}, array<int, 2>{1, KS});
   auto b0 = bt0.slice<KS, Cols>(0, 0);
-  auto acc = operation.template get_destination_cooperative_tensor<decltype(a0), decltype(b0), float>();
-#pragma unroll
-  for (ushort i = 0; i < acc.get_capacity(); ++i) acc[i] = 0.0f;
-  return acc;
+  return operation.template get_destination_cooperative_tensor<decltype(a0), decltype(b0), float>();
 }
 template <class F, typename TA, ushort Rows, ushort Cols, ushort KS, ushort Buffers, ushort Prefetch, class Acc>
 inline void sg_accum(device TA *input, device uchar *w0, device uchar *w1, device uchar *meta, uint input_size, uint output_origin,
@@ -529,7 +532,8 @@ inline void kq_init_lut(threadgroup half2 *tl, uint thread_index, uint threads) 
     else if (group >= t0) { w0 = w0b; w1 = w1b; meta = mb; fmt = p.fmt[1]; off = p.offset[1]; local = group - t0; }                \
     const uint origin = local * 64 + simd_group * 32, steps = p.input_size / 32;                            \
     threadgroup half *my = stage + simd_group * (2 * 32 * 32);                                              \
-    auto acc = kq_make_acc<bfloat, R, 32, 32>(input, p.input_size, my);                                    \
+    auto acc = kq_make_acc<bfloat, R, 32, 32>(input, p.input_size, my);                                     \
+    for (ushort i = 0; i < acc.get_capacity(); ++i) acc[i] = 0.0f;                                    \
     kq_accum_any<bfloat, R, 32, 32, 2, 1>(fmt, input, w0, w1, meta, p.input_size, origin, my, tl, simd_lane, 0, steps, acc); \
     for (ushort i = 0; i < acc.get_capacity(); ++i) {                                                       \
       if (!acc.is_valid_element(i)) continue;                                                              \
@@ -548,9 +552,11 @@ KQF_K(8) KQF_K(16) KQF_K(24) KQF_K(32)
     kq_init_lut(tl, simd_group * 32 + simd_lane, 64);                                                      \
     const uint origin = group * 64 + simd_group * 32, steps = p.input_size / 32;                           \
     threadgroup half *my = stage + simd_group * (2 * 32 * 32);   /* one 8 KB stage for both passes: occupancy */ \
-    auto gate = kq_make_acc<bfloat, R, 32, 32>(input, p.input_size, my);                                   \
+    auto gate = kq_make_acc<bfloat, R, 32, 32>(input, p.input_size, my);                                    \
+    for (ushort i = 0; i < gate.get_capacity(); ++i) gate[i] = 0.0f;                                   \
     kq_accum_any<bfloat, R, 32, 32, 2, 1>(p.gate_fmt, input, gw0, gw1, gm, p.input_size, origin, my, tl, simd_lane, 0, steps, gate); \
-    auto up = kq_make_acc<bfloat, R, 32, 32>(input, p.input_size, my);                                     \
+    auto up = kq_make_acc<bfloat, R, 32, 32>(input, p.input_size, my);                                      \
+    for (ushort i = 0; i < up.get_capacity(); ++i) up[i] = 0.0f;                                     \
     kq_accum_any<bfloat, R, 32, 32, 2, 1>(p.up_fmt, input, uw0, uw1, um, p.input_size, origin, my, tl, simd_lane, 0, steps, up); \
     for (ushort i = 0; i < gate.get_capacity(); ++i) {                                                      \
       if (!gate.is_valid_element(i)) continue;                                                             \
@@ -570,6 +576,8 @@ inline void kq_splitk_tile(device bfloat *input, device uchar *w0, device uchar 
   const uint origin = group.x * 64 + simd_group * 32;
   threadgroup half *my = stage + simd_group * (2 * 32 * 32);
   auto acc = kq_make_acc<bfloat, Rows, 32, 32>(input, p.input_size, my);
+#pragma unroll
+  for (ushort i = 0; i < acc.get_capacity(); ++i) acc[i] = 0.0f;
   sg_accum<F, bfloat, Rows, 32, 32, 2, 1>(input, w0, w1, meta, p.input_size, origin, my, tl, simd_lane, group.y * per, (group.y + 1) * per, acc);
   const ulong N = p.output_size;
 #pragma unroll

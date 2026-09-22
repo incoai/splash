@@ -225,6 +225,9 @@ ENGINE_CPP_SOURCES := \
 	runtime/engine/MemoryAudit.cpp \
 	runtime/engine/Status.cpp \
 	runtime/model/WeightStore.cpp \
+	runtime/model/GgufFile.cpp \
+	runtime/model/GgufImage.cpp \
+	runtime/model/GgufTarget.cpp \
 	runtime/model/Qwen3_6Moe.cpp \
 	runtime/model/Qwen3_8.cpp \
 	runtime/model/QwenVision.cpp \

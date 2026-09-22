@@ -8,6 +8,12 @@
 namespace splash::model {
 namespace {
 
+uint64_t checkedMultiply(uint64_t a, uint64_t b) {
+  if (b && a > std::numeric_limits<uint64_t>::max() / b)
+    throw GgufError("GGUF size overflows uint64");
+  return a * b;
+}
+
 // (id, name, block elements, block bytes) for every ggml type that can appear
 // in a Qwen3.8 GGUF; sizes follow ggml-common.h.
 constexpr std::array<std::pair<uint32_t, GgmlTypeTraits>, 30> kTypes{{
@@ -31,10 +37,11 @@ enum ValueType : uint32_t {
 
 class Reader {
 public:
-  explicit Reader(const std::filesystem::path &path) : stream_(path, std::ios::binary) {
+  Reader(const std::filesystem::path &path, uint64_t size) : stream_(path, std::ios::binary), size_(size) {
     if (!stream_) throw GgufError("cannot open GGUF file: " + path.string());
   }
   void bytes(void *destination, uint64_t count) {
+    requireRemaining(count);
     if (count > std::numeric_limits<std::streamsize>::max())
       throw GgufError("GGUF field is too large");
     stream_.read(static_cast<char *>(destination), static_cast<std::streamsize>(count));
@@ -42,6 +49,7 @@ public:
     position_ += count;
   }
   void skip(uint64_t count) {
+    requireRemaining(count);
     stream_.seekg(static_cast<std::streamoff>(count), std::ios::cur);
     if (!stream_) throw GgufError("GGUF header is truncated");
     position_ += count;
@@ -61,7 +69,12 @@ public:
   [[nodiscard]] uint64_t position() const noexcept { return position_; }
 
 private:
+  void requireRemaining(uint64_t count) const {
+    if (count > size_ - position_ || count > std::numeric_limits<std::streamoff>::max())
+      throw GgufError("GGUF header is truncated");
+  }
   std::ifstream stream_;
+  uint64_t size_;
   uint64_t position_ = 0;
 };
 
@@ -76,16 +89,17 @@ uint64_t scalarBytes(uint32_t type) {
 }
 
 // Skips a value whose contents are not kept (arrays, mostly the tokenizer).
-void skipValue(Reader &reader, uint32_t type) {
+void skipValue(Reader &reader, uint32_t type, unsigned depth = 0) {
+  if (depth > 16) throw GgufError("GGUF metadata nesting is too deep");
   if (type == kString) {
     (void)reader.string();
   } else if (type == kArray) {
     const uint32_t element = reader.scalar<uint32_t>();
     const uint64_t count = reader.scalar<uint64_t>();
     if (element == kString || element == kArray) {
-      for (uint64_t i = 0; i < count; ++i) skipValue(reader, element);
+      for (uint64_t i = 0; i < count; ++i) skipValue(reader, element, depth + 1);
     } else {
-      reader.skip(count * scalarBytes(element));
+      reader.skip(checkedMultiply(count, scalarBytes(element)));
     }
   } else {
     reader.skip(scalarBytes(type));
@@ -105,15 +119,15 @@ std::string ggmlTypeName(uint32_t type) {
   return traits ? traits->name : "type-" + std::to_string(type);
 }
 
-uint64_t GgufTensor::rows() const noexcept {
+uint64_t GgufTensor::rows() const {
   uint64_t rows = 1;
-  for (size_t i = 1; i < dims.size(); ++i) rows *= dims[i];
+  for (size_t i = 1; i < dims.size(); ++i) rows = checkedMultiply(rows, dims[i]);
   return rows;
 }
 
-uint64_t GgufTensor::elements() const noexcept {
+uint64_t GgufTensor::elements() const {
   uint64_t elements = 1;
-  for (uint64_t dim : dims) elements *= dim;
+  for (uint64_t dim : dims) elements = checkedMultiply(elements, dim);
   return elements;
 }
 
@@ -121,7 +135,7 @@ GgufFile::GgufFile(std::filesystem::path path) : path_(std::move(path)) {
   std::error_code error;
   fileBytes_ = std::filesystem::file_size(path_, error);
   if (error) throw GgufError("cannot stat GGUF file: " + path_.string());
-  Reader reader(path_);
+  Reader reader(path_, fileBytes_);
   char magic[4];
   reader.bytes(magic, 4);
   if (std::memcmp(magic, "GGUF", 4) != 0) throw GgufError("not a GGUF file: " + path_.string());
@@ -159,22 +173,32 @@ GgufFile::GgufFile(std::filesystem::path path) : path_(std::move(path)) {
     tensor.name = reader.string();
     const uint32_t dimensions = reader.scalar<uint32_t>();
     if (dimensions == 0 || dimensions > 4) throw GgufError("invalid tensor rank for " + tensor.name);
-    for (uint32_t d = 0; d < dimensions; ++d) tensor.dims.push_back(reader.scalar<uint64_t>());
+    for (uint32_t d = 0; d < dimensions; ++d) {
+      const uint64_t dim = reader.scalar<uint64_t>();
+      if (!dim) throw GgufError("zero tensor dimension for " + tensor.name);
+      tensor.dims.push_back(dim);
+    }
+    (void)tensor.elements(); // Reject overflowing shapes even when quantized bytes would fit.
     tensor.type = reader.scalar<uint32_t>();
     tensor.offset = reader.scalar<uint64_t>();
     const GgmlTypeTraits *traits = ggmlTypeTraits(tensor.type);
     if (!traits) throw GgufError("unknown ggml type " + std::to_string(tensor.type) + " for " + tensor.name);
     if (tensor.columns() % traits->blockElements)
       throw GgufError("tensor row is not block aligned: " + tensor.name);
-    tensor.bytes = tensor.rows() * (tensor.columns() / traits->blockElements) * traits->blockBytes;
-    index_[tensor.name] = tensors_.size();
+    tensor.bytes = checkedMultiply(checkedMultiply(tensor.rows(), tensor.columns() / traits->blockElements),
+                                   traits->blockBytes);
+    if (!index_.emplace(tensor.name, tensors_.size()).second)
+      throw GgufError("duplicate GGUF tensor: " + tensor.name);
     tensors_.push_back(std::move(tensor));
   }
   const uint64_t headerEnd = reader.position();
-  dataOffset_ = (headerEnd + alignment_ - 1) / alignment_ * alignment_;
+  const uint64_t padding = (alignment_ - headerEnd % alignment_) % alignment_;
+  if (padding > fileBytes_ - headerEnd) throw GgufError("GGUF data section is truncated");
+  dataOffset_ = headerEnd + padding;
   for (const GgufTensor &tensor : tensors_) {
     if (tensor.offset % alignment_) throw GgufError("tensor data is misaligned: " + tensor.name);
-    if (dataOffset_ + tensor.offset + tensor.bytes > fileBytes_)
+    if (tensor.offset > fileBytes_ - dataOffset_ ||
+        tensor.bytes > fileBytes_ - dataOffset_ - tensor.offset)
       throw GgufError("tensor data runs past the end of the file: " + tensor.name);
   }
 }

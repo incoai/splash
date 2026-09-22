@@ -1,43 +1,30 @@
-// M5 harness: splash native kernels under splash's Apple10 dispatch policy vs Q4_K kernels (staged fp16 + direct uint4b),
-// all real Qwen3.8-27B projection shapes, decode M=8/16/24/32, prefill rows 17..2048. `validate` mode checks vs fp64.
+// Production K-quant correctness oracle for Apple9/Apple10, with optional timing modes.
+// Decode rows 8/16/24/32; full mode covers every gate/up format pair.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
-#include <fstream>
+#include <cstdlib>
+#include <dlfcn.h>
+#include <stdexcept>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <iostream>
 #include <random>
-#include <sstream>
 #include <string>
 #include <map>
 #include <vector>
 struct Q4KParams { uint32_t output_size, input_size, persistent_groups; };
 struct KQParams { uint32_t output_size, input_size, persistent_groups, out_stride, out_offset; };
-struct Q4KHeader { uint16_t d, dmin; uint8_t scales[12]; };
-struct Q4PrefillParams { uint32_t output_size, input_size; };
-static id<MTLDevice> dev; static id<MTLCommandQueue> queue; static std::mt19937 rng(42); static uint32_t CORES = 16;
+static id<MTLDevice> dev; static id<MTLCommandQueue> queue; static std::mt19937 rng(42);
 static uint16_t f2h(float f) { __fp16 h = (__fp16)f; uint16_t u; memcpy(&u, &h, 2); return u; }
 static float h2f(uint16_t u) { __fp16 h; memcpy(&h, &u, 2); return (float)h; }
 static uint16_t f2bf(float f) { uint32_t u; memcpy(&u, &f, 4); return (uint16_t)((u + 0x8000) >> 16); }
 static float bf2f(uint16_t b) { uint32_t u = (uint32_t)b << 16; float f; memcpy(&f, &u, 4); return f; }
-static void scale_min(const Q4KHeader &h, int j, float &s, float &m) {
-  const uint8_t *q = h.scales; uint8_t sc, mn;
-  if (j < 4) { sc = q[j] & 63; mn = q[j + 4] & 63; } else { sc = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4); mn = (q[j + 4] >> 4) | ((q[j] >> 6) << 4); }
-  s = h2f(h.d) * sc; m = -h2f(h.dmin) * mn;
-}
-static id<MTLLibrary> compile(const char *path) {
-  std::ifstream f(path); std::stringstream ss; ss << f.rdbuf();
-  MTLCompileOptions *opt = [MTLCompileOptions new]; opt.languageVersion = (MTLLanguageVersion)((4 << 16) + 0); opt.mathMode = MTLMathModeFast;
-  NSError *err = nil; id<MTLLibrary> lib = [dev newLibraryWithSource:[NSString stringWithUTF8String:ss.str().c_str()] options:opt error:&err];
-  if (!lib) { std::cerr << "COMPILE FAILED " << path << ": " << err.localizedDescription.UTF8String << "\n"; exit(1); }
-  return lib;
-}
 static std::map<std::string, id<MTLComputePipelineState>> psoCache;
 static id<MTLComputePipelineState> pso(id<MTLLibrary> lib, const std::string &name) {
   auto it = psoCache.find(name); if (it != psoCache.end()) return it->second;
@@ -63,33 +50,27 @@ static double runOnce(const std::vector<Dispatch> &ds, int n) {
 static double timeIt(const std::vector<Dispatch> &ds, int iters) { runOnce(ds, 2); double best = 1e9; for (int r = 0; r < 5; ++r) best = std::min(best, runOnce(ds, iters)); return best; }
 template <class T> static std::vector<uint8_t> bytes(const T &v) { return std::vector<uint8_t>((const uint8_t *)&v, (const uint8_t *)&v + sizeof v); }
 static id<MTLBuffer> mkbuf(uint64_t n) { return [dev newBufferWithLength:n options:MTLResourceStorageModeShared]; }
-// ---- splash Apple10 decode policy (ops/Linear.cpp)
-struct Policy { uint32_t full, wave, many; };
-static uint32_t maxCoreTiles(uint32_t tiles, uint32_t groups, uint32_t cores) { uint32_t worst = 0; for (uint32_t c = 0; c < cores; ++c) { uint32_t load = 0; for (uint32_t g = c; g < groups; g += cores) load += (tiles - g + groups - 1) / groups; worst = std::max(worst, load); } return worst; }
-static uint32_t decodeGroups(uint32_t tiles, uint32_t cores, Policy p) {
-  const uint32_t wave = p.wave * cores; if (tiles <= p.full * cores || tiles >= p.many * cores) return tiles;
-  const uint32_t twoTile = (tiles + 1) / 2; if (twoTile > wave) return wave;
-  const uint32_t balanced = (tiles + cores - 1) / cores; uint32_t groups = std::max(twoTile, p.full * cores * 3 / 4);
-  while (maxCoreTiles(tiles, groups, cores) != balanced) ++groups; return groups; }
-struct SplashCfg { std::string pipe; uint32_t tileN, groups, threads; };
-static SplashCfg splashDecode(uint32_t n, uint32_t k, uint32_t lanes) {
-  const uint32_t t128 = n / 128, t256 = n / 256;
-  if (lanes == 1) {
-    if (t256 >= 8 * CORES) return {"decode_linear_q4_n256_paired_sg4", 256, std::min(t256, 4 * CORES), 128};
-    return {"decode_linear_q4_n128_paired", 128, decodeGroups(t128, CORES, {4, 4, 12}), 256};
-  }
-  if (lanes == 3) {
-    if (t128 <= CORES && k >= 4096) return {"decode_linear_q4_n128_m24", 128, t128, 256};
-    return {"decode_linear_q4_n128_m24_sg4", 128, decodeGroups(t128, CORES, {8, 8, 24}), 128};
-  }
-  if (lanes >= 3 && t256 >= 2 * CORES) return {"decode_linear_q4_n256_m32", 256, decodeGroups(t256, CORES, {3, 3, 8}), 256};
-  if (lanes == 2) return {"decode_linear_q4_n128_m16", 128, decodeGroups(t128, CORES, {5, 4, 12}), 256};
-  return {"decode_linear_q4_n128_m32", 128, decodeGroups(t128, CORES, {4, 4, 12}), 256};
-}
-
 // ================= formats: native GGUF blocks -> llama.cpp-faithful reference values + tile repack (planes + meta)
 enum Fmt { Q4K = 0, IQ4XS, IQ4NL, Q5K, Q6K, Q3K, Q80, IQ3S, FMT_COUNT };
 static const char *fmtName[FMT_COUNT] = {"q4k", "iq4xs", "iq4nl", "q5k", "q6k", "q3k", "q80", "iq3s"};
+// Optional external oracle: compile unmodified llama.cpp ggml-base and provide its
+// dylib via SPLASH_GGML_ORACLE. The normal test remains self-contained/offline.
+static void *ggmlOracle = nullptr;
+static void verifyNativeReference(Fmt f, const std::vector<uint8_t> &native, std::vector<float> &values) {
+  if (!ggmlOracle) return;
+  static const char *symbols[FMT_COUNT] = {
+    "dequantize_row_q4_K", "dequantize_row_iq4_xs", "dequantize_row_iq4_nl", "dequantize_row_q5_K",
+    "dequantize_row_q6_K", "dequantize_row_q3_K", "dequantize_row_q8_0", "dequantize_row_iq3_s"};
+  using Dequantize = void (*)(const void *, float *, int64_t);
+  auto decode = reinterpret_cast<Dequantize>(dlsym(ggmlOracle, symbols[f]));
+  if (!decode) throw std::runtime_error(dlerror());
+  std::vector<float> official(values.size());
+  decode(native.data(), official.data(), official.size());
+  if (memcmp(official.data(), values.data(), values.size() * sizeof(float)))
+    throw std::runtime_error(std::string("CPU reference differs from upstream GGML: ") + fmtName[f]);
+  values = std::move(official);
+}
+
 struct FmtInfo { uint32_t blockK, blockBytes, p0, p1, metaBytes, metaGroups; };
 static FmtInfo finfo(Fmt f) {
   switch (f) { case Q4K: return {256, 144, 16, 0, 16, 8}; case IQ4XS: return {256, 136, 16, 0, 8, 8}; case IQ4NL: return {32, 18, 16, 0, 2, 1};
@@ -160,37 +141,28 @@ static void metaPack(Fmt f, const uint8_t *row, uint32_t unit, uint8_t *dst) {
     case Q3K: memcpy(dst, blk + 108, 2); dst[2] = dst[3] = 0; memcpy(dst + 4, blk + 96, 12); break; default: break; }
 }
 struct Packed { std::vector<uint8_t> w0, w1, meta; };
-static Packed repack(Fmt f, bool interleave, const std::vector<uint8_t> &native, uint32_t N, uint32_t K, std::vector<float> *Wf) {
+static Packed repack(Fmt f, bool interleave, const std::vector<uint8_t> &native, uint32_t N, uint32_t K, std::vector<float> *Wf, std::vector<float> *Ws = nullptr) {
   const FmtInfo fi = finfo(f); const uint32_t G = K / 32, rb = rowBytes(f, K), units = G / fi.metaGroups;
-  Packed p; p.w0.assign((size_t)N * G * fi.p0, 0); p.w1.assign(fi.p1 ? (size_t)N * G * fi.p1 : 16, 0); p.meta.assign((size_t)N * units * fi.metaBytes, 0); if (Wf) Wf->assign((size_t)N * K, 0.f);
+  Packed p; p.w0.assign((size_t)N * G * fi.p0, 0); p.w1.assign(fi.p1 ? (size_t)N * G * fi.p1 : 16, 0); p.meta.assign((size_t)N * units * fi.metaBytes, 0); if (Wf) Wf->assign((size_t)N * K, 0.f); if (Ws) Ws->assign((size_t)N * K, 0.f);
   for (uint32_t n = 0; n < N; ++n) { const uint8_t *row = native.data() + (size_t)n * rb; const uint32_t tile = n / 256, c = n % 256;
     for (uint32_t g = 0; g < G; ++g) { float vals[32]; uint8_t p0[32], p1[8]; groupPack(f, interleave, row, g, vals, p0, p1);
       memcpy(p.w0.data() + (((size_t)tile * G + g) * 256 + c) * fi.p0, p0, fi.p0); if (fi.p1) memcpy(p.w1.data() + (((size_t)tile * G + g) * 256 + c) * fi.p1, p1, fi.p1);
-      if (Wf) for (int k = 0; k < 32; ++k) (*Wf)[(size_t)n * K + g * 32 + k] = vals[k]; }
+      if (Wf) for (int k = 0; k < 32; ++k) (*Wf)[(size_t)n * K + g * 32 + k] = vals[k];
+      if (Ws) for (int k = 0; k < 32; ++k) (*Ws)[(size_t)n * K + g * 32 + k] = h2f(f2h(vals[k])); }
     for (uint32_t u = 0; u < units; ++u) metaPack(f, row, u, p.meta.data() + (((size_t)tile * units + u) * 256 + c) * fi.metaBytes); }
   return p;
 }
 static id<MTLBuffer> upload(const std::vector<uint8_t> &v) { id<MTLBuffer> b = mkbuf(v.size()); memcpy(b.contents, v.data(), v.size()); return b; }
-static std::vector<uint8_t> readFile(const char *path) { std::ifstream f(path, std::ios::binary); std::vector<uint8_t> v((std::istreambuf_iterator<char>(f)), {}); return v; }
-struct Variant { const char *name; Fmt fmt; bool interleave; };
-static const std::vector<Variant> kVariants = {{"q4k", Q4K, true}, {"iq4xs", IQ4XS, true}, {"iq4xsB", IQ4XS, false}, {"iq4xsT", IQ4XS, false}, {"iq4nl", IQ4NL, true}, {"iq4nlB", IQ4NL, false},
-                                               {"q5k", Q5K, true}, {"q6k", Q6K, true}, {"q3k", Q3K, true}, {"q80", Q80, true}, {"iq3s", IQ3S, true}};
-struct SGc { int C, S, KS, B, P; };
-static const std::vector<SGc> kSg = {{32,4,32,2,1},{32,2,32,2,1},{32,1,32,2,1},{32,4,32,1,1},{32,2,32,2,2},{16,8,64,1,1},{64,1,32,2,1}};
-static const std::vector<SGc> kSk = {{32,4,32,2,1},{32,2,32,2,1},{16,8,64,1,1}};
-struct PFc { int R, S, N, KS; };
-static const std::vector<PFc> kPf = {{32,4,64,64},{32,4,64,32},{16,8,64,64},{32,8,64,64},{16,4,128,32},{16,4,64,64}};
-
-
 // harness_prod: validate the production kernels (kquant.metal ABI) from a compiled .metallib against the C++ reference.
 //   harness_prod <splash.metallib>
-struct Seg { Fmt fmt; bool interleave; uint32_t N; uint32_t colOffset; id<MTLBuffer> w0, w1, meta; std::vector<float> Wf; };
+struct Seg { Fmt fmt; bool interleave; uint32_t N; uint32_t colOffset; id<MTLBuffer> w0, w1, meta; std::vector<float> Wf, Ws; };
 static const bool kProdInterleave[FMT_COUNT] = {true, false, true, true, true, true, true, true};
 static const uint32_t kFmtId[FMT_COUNT] = {0, 1, 2, 3, 4, 5, 6, 7};
 static Seg makeSegK(Fmt f, uint32_t N, uint32_t K, uint32_t colOffset);
 static Seg makeSeg(Fmt f, uint32_t N, uint32_t K, uint32_t colOffset) {
   Seg s; s.fmt = f; s.interleave = kProdInterleave[f]; s.N = N; s.colOffset = colOffset;
-  std::vector<uint8_t> native = makeNative(f, N, K); Packed pk = repack(f, s.interleave, native, N, K, &s.Wf);
+  std::vector<uint8_t> native = makeNative(f, N, K); Packed pk = repack(f, s.interleave, native, N, K, &s.Wf, &s.Ws);
+  verifyNativeReference(f, native, s.Wf);
   s.w0 = upload(pk.w0); s.w1 = upload(pk.w1); s.meta = upload(pk.meta); if (!finfo(f).p1) s.w1 = s.meta; return s;
 }
 static Seg makeSegK(Fmt f, uint32_t N, uint32_t K, uint32_t colOffset) {   // no float reference (large shapes)
@@ -202,58 +174,109 @@ struct KQFusedParams { uint32_t input_size, out_stride, segments, reserved, cols
 struct KQGateUpParams { uint32_t input_size, output_size, out_stride, gate_fmt, up_fmt; };
 struct KQSplitParams { uint32_t output_size, input_size, splits, out_stride, out_offset, epilogue; };
 int main(int argc, char **argv) { @autoreleasepool {
+  if (argc < 2) { std::cerr << "usage: harness_prod <metallib> [full|dequant|time-gu] [input-scale] [seed]\n"; return 2; }
   dev = MTLCreateSystemDefaultDevice(); queue = [dev newCommandQueue];
   NSError *err = nil; id<MTLLibrary> lib = [dev newLibraryWithURL:[NSURL fileURLWithPath:[NSString stringWithUTF8String:argv[1]]] error:&err];
   if (!lib) { std::cerr << "library load failed: " << err.localizedDescription.UTF8String << "\n"; return 1; }
+  if (const char *oracle = std::getenv("SPLASH_GGML_ORACLE")) {
+    ggmlOracle = dlopen(oracle, RTLD_NOW | RTLD_LOCAL);
+    if (!ggmlOracle) { std::cerr << dlerror() << "\n"; return 2; }
+    printf("Checking CPU dequantization against upstream GGML\n");
+  }
+  if (argc > 2 && std::string(argv[2]) == "dequant") {
+    int failures = 0;
+    for (int fi = 0; fi < FMT_COUNT; ++fi) {
+      const uint32_t N = 256, K = 1024;
+      Seg s = makeSeg(Fmt(fi), N, K, 0);
+      id<MTLBuffer> Y = mkbuf(uint64_t(N) * K * 2);
+      KQParams p{N, K, 0, 0, 0};
+      const std::string name = std::string("kq_test_dequant_") + fmtName[fi];
+      Dispatch d{pso(lib, name), {s.w0, s.w1, s.meta, Y}, bytes(p), 4,
+                 MTLSizeMake(N * (K / 32) / 32, 1, 1), MTLSizeMake(32, 1, 1)};
+      runOnce({d}, 1);
+      const uint16_t *got = (const uint16_t *)Y.contents;
+      size_t mismatch = 0;
+      for (size_t i = 0; i < s.Wf.size(); ++i) mismatch += got[i] != f2h(s.Wf[i]);
+      printf("%s: %zu weights, %zu different from FP16(GGML FP32 dequantization)\n", fmtName[fi], s.Wf.size(), mismatch);
+      failures += mismatch != 0;
+    }
+    return failures ? 1 : 0;
+  }
+  const bool full = argc > 2 && std::string(argv[2]) == "full";
+  const float inputScale = argc > 3 ? std::stof(argv[3]) : 1.f;
+  if (argc > 4) rng.seed(std::stoul(argv[4]));
+  printf("input scale %.0f, %s CPU oracle\n", inputScale, inputScale == 1.f ? "native GGUF + staged" : "sparse staged");
   const uint32_t K = 1024; int failures = 0;
-  auto inputs = [&](uint32_t rows) { id<MTLBuffer> Xbf = mkbuf(uint64_t(rows) * K * 2), X16 = mkbuf(uint64_t(rows) * K * 2); uint16_t *a = (uint16_t *)Xbf.contents, *b = (uint16_t *)X16.contents; std::uniform_real_distribution<float> d(-1.f, 1.f); for (uint64_t i = 0; i < uint64_t(rows) * K; ++i) { float v = bf2f(f2bf(d(rng))); a[i] = f2bf(v); b[i] = f2h(v); } return std::make_pair(Xbf, X16); };
-  auto refGemm = [&](id<MTLBuffer> X16, const Seg &s, uint32_t rows, uint32_t stride, std::vector<double> &out) { const uint16_t *x = (const uint16_t *)X16.contents;
-    for (uint32_t r = 0; r < rows; ++r) for (uint32_t n = 0; n < s.N; ++n) { double acc = 0; for (uint32_t k = 0; k < K; ++k) acc += (double)h2f(x[(size_t)r * K + k]) * s.Wf[(size_t)n * K + k]; out[(size_t)r * stride + s.colOffset + n] = acc; } };
-  auto compare = [&](const char *name, id<MTLBuffer> Y, const std::vector<double> &ref, uint32_t rows, uint32_t stride) { const uint16_t *y = (const uint16_t *)Y.contents; double maxerr = 0, sumrel = 0; size_t cnt = 0;
-    for (uint32_t r = 0; r < rows; ++r) for (uint32_t n = 0; n < stride; ++n) { double got = bf2f(y[(size_t)r * stride + n]), want = ref[(size_t)r * stride + n]; maxerr = std::max(maxerr, std::fabs(got - want)); sumrel += std::fabs(got - want) / (std::fabs(want) + 1e-3); ++cnt; }
-    const bool soft = strstr(name, "vs fp64") != nullptr; const bool ok = sumrel / cnt < 0.02 && (soft || maxerr < 0.5); if (!ok) ++failures; printf("%-46s rows=%-3u maxabs=%.2e meanrel=%.1e %s\n", name, rows, maxerr, sumrel / cnt, ok ? "ok" : "FAIL"); };
+  auto inputs = [&](uint32_t rows) {
+    id<MTLBuffer> X = mkbuf(uint64_t(rows) * K * 2);
+    auto *values = (uint16_t *)X.contents;
+    std::uniform_real_distribution<float> random(-1.f, 1.f);
+    for (uint64_t i = 0; i < uint64_t(rows) * K; ++i) {
+      // Sparse large values isolate BF16 input range from cancellation error.
+      float value = inputScale == 1.f ? random(rng) :
+          (i % K == (i / K * 31) % K ? (i / K % 2 ? -inputScale : inputScale) : 0.f);
+      values[i] = f2bf(value);
+    }
+    return std::make_pair(X, X); // The CPU oracle reads the exact BF16 input bits.
+  };
+  auto refGemm = [&](id<MTLBuffer> Xref, const Seg &s, uint32_t rows, uint32_t stride, std::vector<double> &out, bool staged = false) { const auto &weights = (staged || inputScale != 1.f) ? s.Ws : s.Wf; const uint16_t *x = (const uint16_t *)Xref.contents;
+    for (uint32_t r = 0; r < rows; ++r) for (uint32_t n = 0; n < s.N; ++n) { double acc = 0; for (uint32_t k = 0; k < K; ++k) acc += (double)bf2f(x[(size_t)r * K + k]) * weights[(size_t)n * K + k]; out[(size_t)r * stride + s.colOffset + n] = acc; } };
+  auto compare = [&](const char *name, id<MTLBuffer> Y, const std::vector<double> &ref, uint32_t rows, uint32_t stride) { const uint16_t *y = (const uint16_t *)Y.contents; double maxerr = 0, maxOutsideRounding = 0, sumrel = 0; size_t cnt = 0;
+    for (uint32_t r = 0; r < rows; ++r) for (uint32_t n = 0; n < stride; ++n) { double got = bf2f(y[(size_t)r * stride + n]), want = ref[(size_t)r * stride + n]; maxerr = std::max(maxerr, std::fabs(got - want));
+      // Account separately for the final BF16 rounding cell; the pre-output
+      // absolute error budget and the native-GGUF relative-error gate stay fixed.
+      const uint16_t bits = y[(size_t)r * stride + n];
+      const double halfUlp = 0.5 * std::max(std::fabs(bf2f(uint16_t(bits + 1)) - got), std::fabs(bf2f(uint16_t(bits - 1)) - got));
+      maxOutsideRounding = std::max(maxOutsideRounding, std::fabs(got - want) - halfUlp); sumrel += std::fabs(got - want) / (std::fabs(want) + 1e-3); ++cnt; }
+    const bool soft = strstr(name, "vs fp64") != nullptr; const bool ok = sumrel / cnt < 0.02 && (soft || maxOutsideRounding < 0.5 * inputScale); if (!ok) ++failures; printf("%-46s rows=%-3u maxabs=%.2e meanrel=%.1e %s\n", name, rows, maxerr, sumrel / cnt, ok ? "ok" : "FAIL"); };
   const uint32_t rowsList[4] = {8, 16, 24, 32};
   // 1) fused three-segment dispatch, one format triple per row count
   const Fmt triples[4][3] = {{Q4K, IQ4XS, Q80}, {Q5K, Q4K, Q6K}, {IQ4NL, Q3K, IQ3S}, {IQ4XS, Q5K, Q4K}};
   for (int ti = 0; ti < 4; ++ti) { const uint32_t rows = rowsList[ti]; Seg s0 = makeSeg(triples[ti][0], 1024, K, 0), s1 = makeSeg(triples[ti][1], 512, K, 1024), s2 = makeSeg(triples[ti][2], 256, K, 1536);
-    const uint32_t N = 1792; auto [Xbf, X16] = inputs(rows); id<MTLBuffer> Y = mkbuf(uint64_t(rows) * N * 2); std::vector<double> ref((size_t)rows * N);
-    for (auto *s : {&s0, &s1, &s2}) refGemm(X16, *s, rows, N, ref);
+    const uint32_t N = 1792; auto [Xbf, Xref] = inputs(rows); id<MTLBuffer> Y = mkbuf(uint64_t(rows) * N * 2); std::vector<double> ref((size_t)rows * N);
+    for (auto *s : {&s0, &s1, &s2}) refGemm(Xref, *s, rows, N, ref);
     KQFusedParams fp{K, N, 3, 0, {s0.N, s1.N, s2.N}, {kFmtId[s0.fmt], kFmtId[s1.fmt], kFmtId[s2.fmt]}, {s0.colOffset, s1.colOffset, s2.colOffset}};
     char name[64]; snprintf(name, sizeof name, "kqf_m%u", rows); id<MTLComputePipelineState> ps = pso(lib, name); if (!ps) { ++failures; continue; }
     Dispatch d{ps, {Xbf, s0.w0, s0.w1, s0.meta, s1.w0, s1.w1, s1.meta, s2.w0, s2.w1, s2.meta, Y}, bytes(fp), 11, MTLSizeMake(N / 64, 1, 1), MTLSizeMake(64, 1, 1)};
     runOnce({d}, 1); char label[96]; snprintf(label, sizeof label, "%s [%s|%s|%s]", name, fmtName[s0.fmt], fmtName[s1.fmt], fmtName[s2.fmt]); compare(label, Y, ref, rows, N); }
   // 2) gate + up fused
   const Fmt gu[4][2] = {{IQ4XS, Q4K}, {Q5K, Q5K}, {Q4K, IQ4XS}, {Q3K, Q6K}};
-  for (int ti = 0; ti < 4; ++ti) { const uint32_t rows = rowsList[ti], N = 1024; Seg g = makeSeg(gu[ti][0], N, K, 0), u = makeSeg(gu[ti][1], N, K, 0);
-    auto [Xbf, X16] = inputs(rows); id<MTLBuffer> Y = mkbuf(uint64_t(rows) * N * 2); std::vector<double> rg((size_t)rows * N), ru((size_t)rows * N), ref((size_t)rows * N);
-    refGemm(X16, g, rows, N, rg); refGemm(X16, u, rows, N, ru);
+  for (int ti = 0; ti < (full ? 4 * FMT_COUNT * FMT_COUNT : 4); ++ti) {
+    const uint32_t rows = rowsList[full ? ti / (FMT_COUNT * FMT_COUNT) : ti], N = full ? 256 : 1024;
+    const Fmt gf = full ? Fmt((ti / FMT_COUNT) % FMT_COUNT) : gu[ti][0];
+    const Fmt uf = full ? Fmt(ti % FMT_COUNT) : gu[ti][1];
+    Seg g = makeSeg(gf, N, K, 0), u = makeSeg(uf, N, K, 0);
+    auto [Xbf, Xref] = inputs(rows); id<MTLBuffer> Y = mkbuf(uint64_t(rows) * N * 2); std::vector<double> rg((size_t)rows * N), ru((size_t)rows * N), ref((size_t)rows * N);
+    refGemm(Xref, g, rows, N, rg); refGemm(Xref, u, rows, N, ru);
     for (size_t i = 0; i < ref.size(); ++i) { double gg = bf2f(f2bf((float)rg[i])), uu = bf2f(f2bf((float)ru[i])); ref[i] = gg / (1.0 + std::exp(-gg)) * uu; }
     KQGateUpParams gp{K, N, N, kFmtId[g.fmt], kFmtId[u.fmt]}; char name[64]; snprintf(name, sizeof name, "kqgu_m%u", rows); id<MTLComputePipelineState> ps = pso(lib, name); if (!ps) { ++failures; continue; }
     Dispatch d{ps, {Xbf, g.w0, g.w1, g.meta, u.w0, u.w1, u.meta, Y}, bytes(gp), 8, MTLSizeMake(N / 64, 1, 1), MTLSizeMake(64, 1, 1)};
     runOnce({d}, 1); char label[96]; snprintf(label, sizeof label, "%s [%s|%s] vs fp64", name, fmtName[g.fmt], fmtName[u.fmt]); compare(label, Y, ref, rows, N);
+    refGemm(Xref, g, rows, N, rg, true); refGemm(Xref, u, rows, N, ru, true);
+    for (size_t i = 0; i < ref.size(); ++i) { double gg = bf2f(f2bf((float)rg[i])), uu = bf2f(f2bf((float)ru[i])); ref[i] = gg / (1.0 + std::exp(-gg)) * uu; }
     // bf16 rounding of the gate before silu makes the fp64 reference flip by one bf16 ulp on rare elements; the two-kernel GPU path
     // (validated sga gate -> bf16 scratch, sgg up with silu epilogue) has the same accumulation and must match near-exactly.
     id<MTLBuffer> G = mkbuf(uint64_t(rows) * N * 2), Y2 = mkbuf(uint64_t(rows) * N * 2); KQParams pq{N, K, N / 64, 0, 0}; char n1[80], n2[80];
     snprintf(n1, sizeof n1, "sga_%s_m%u_c32_sg2_k32_b2_p1", fmtName[g.fmt], rows); snprintf(n2, sizeof n2, "sgg_%s_m%u_c32_sg2_k32_b2_p1", fmtName[u.fmt], rows);
     id<MTLComputePipelineState> p1 = pso(lib, n1), p2 = pso(lib, n2);
     if (p1 && p2) { Dispatch d1{p1, {Xbf, g.w0, g.w1, g.meta, G}, bytes(pq), 5, MTLSizeMake(N / 64, 1, 1), MTLSizeMake(64, 1, 1)}, d2{p2, {Xbf, u.w0, u.w1, u.meta, Y2, G}, bytes(pq), 6, MTLSizeMake(N / 64, 1, 1), MTLSizeMake(64, 1, 1)};
-      runOnce({d1, d2}, 1); const uint16_t *a = (const uint16_t *)Y.contents, *b2 = (const uint16_t *)Y2.contents; double maxd = 0; size_t diff = 0;
-      for (size_t i = 0; i < (size_t)rows * N; ++i) { double dd = std::fabs(bf2f(a[i]) - bf2f(b2[i])); if (dd > 0) ++diff; maxd = std::max(maxd, dd); }
+      runOnce({d1, d2}, 1); const uint16_t *a = (const uint16_t *)Y.contents, *b2 = (const uint16_t *)Y2.contents; double maxd = 0; size_t diff = 0; bool finite = true;
+      for (size_t i = 0; i < (size_t)rows * N; ++i) { double dd = std::fabs(bf2f(a[i]) - bf2f(b2[i])); finite &= std::isfinite(dd); if (!std::isfinite(dd) || dd > 0) ++diff; maxd = std::max(maxd, dd); }
       // remaining differences must be bf16 rounding-boundary flips of gate or up (fp32 accumulation order differs from fp64)
-      size_t unexplained = 0; const uint16_t *xx = (const uint16_t *)X16.contents; (void)xx;
+      size_t unexplained = 0; const uint16_t *xx = (const uint16_t *)Xref.contents; (void)xx;
       for (size_t i = 0; i < (size_t)rows * N; ++i) { double got = bf2f(a[i]); if (std::fabs(got - ref[i]) <= 0.02 * std::fabs(ref[i]) + 0.02) continue;
         bool expl = false; for (int dg = -1; dg <= 1 && !expl; ++dg) for (int du = -1; du <= 1 && !expl; ++du) {
           uint16_t gb = f2bf((float)rg[i]); uint16_t ub = f2bf((float)ru[i]); gb = (uint16_t)(gb + dg); ub = (uint16_t)(ub + du);
           double gg = bf2f(gb), uu = bf2f(ub), alt = gg / (1.0 + std::exp(-gg)) * uu; if (std::fabs(got - alt) <= 0.02 * std::fabs(alt) + 0.02) expl = true; }
         if (!expl) ++unexplained; }
-      const bool ok = maxd < 1e-2 && unexplained == 0; if (!ok) ++failures;
-      printf("%-46s rows=%-3u fp64 mismatches not explained by a 1-ulp bf16 flip of gate/up: %zu\n", name, rows, unexplained);
+      const bool ok = finite && maxd < 1e-2 && unexplained == 0; if (!ok) ++failures;
+      printf("%-46s rows=%-3u staged fp64 mismatches not explained by a 1-ulp bf16 flip of gate/up: %zu\n", name, rows, unexplained);
       printf("%-46s rows=%-3u vs two-kernel path: %zu differing elements, max diff %.2e %s\n", name, rows, diff, maxd, ok ? "ok" : "FAIL"); } }
   // 3) split-K with last-arriver reduction + residual epilogue, every format, splits 4, strided output (out_stride 2N, offset N)
   for (int fi = 0; fi < FMT_COUNT; ++fi) { const uint32_t rows = rowsList[fi % 4], N = 512, splits = 4; Seg s = makeSeg((Fmt)fi, N, K, 0);
-    auto [Xbf, X16] = inputs(rows); id<MTLBuffer> Y = mkbuf(uint64_t(rows) * 2 * N * 2), R = mkbuf(uint64_t(rows) * 2 * N * 2), partials = mkbuf(uint64_t(splits) * rows * N * 4), counters = mkbuf(4096);
+    auto [Xbf, Xref] = inputs(rows); id<MTLBuffer> Y = mkbuf(uint64_t(rows) * 2 * N * 2), R = mkbuf(uint64_t(rows) * 2 * N * 2), partials = mkbuf(uint64_t(splits) * rows * N * 4), counters = mkbuf(4096);
     memset(counters.contents, 0, 4096); { uint16_t *rr = (uint16_t *)R.contents; std::uniform_real_distribution<float> d(-1.f, 1.f); for (uint64_t i = 0; i < uint64_t(rows) * 2 * N; ++i) rr[i] = f2bf(d(rng)); }
-    std::vector<double> ref((size_t)rows * 2 * N, 0.0), part((size_t)rows * N); refGemm(X16, s, rows, N, part);
+    std::vector<double> ref((size_t)rows * 2 * N, 0.0), part((size_t)rows * N); refGemm(Xref, s, rows, N, part);
     for (uint32_t r = 0; r < rows; ++r) for (uint32_t n = 0; n < N; ++n) ref[(size_t)r * 2 * N + N + n] = part[(size_t)r * N + n] + bf2f(((uint16_t *)R.contents)[(size_t)r * 2 * N + N + n]);
     for (uint32_t r = 0; r < rows; ++r) for (uint32_t n = 0; n < N; ++n) { ((uint16_t *)Y.contents)[(size_t)r * 2 * N + n] = 0; ref[(size_t)r * 2 * N + n] = 0; }
     KQSplitParams sp{N, K, splits, 2 * N, N, 1}; char name[64]; snprintf(name, sizeof name, "kqs_%s_m%u", fmtName[fi], rows); id<MTLComputePipelineState> ps = pso(lib, name); if (!ps) { ++failures; continue; }
@@ -262,17 +285,38 @@ int main(int argc, char **argv) { @autoreleasepool {
   // 4) single-segment sga / sgr / sgg (production ABI) and prefill pfa/pfr/pfg
   for (int fi = 0; fi < FMT_COUNT; ++fi) { const uint32_t N = 1024; Seg s = makeSeg((Fmt)fi, N, K, 0);
     for (const char *fam : {"sga", "sgr", "sgg"}) { const uint32_t rows = rowsList[(fi + (fam[2] == 'r') + 2 * (fam[2] == 'g')) % 4];
-      auto [Xbf, X16] = inputs(rows); id<MTLBuffer> Y = mkbuf(uint64_t(rows) * N * 2), A = mkbuf(uint64_t(rows) * N * 2); { uint16_t *aa = (uint16_t *)A.contents; std::uniform_real_distribution<float> d(-1.f, 1.f); for (uint64_t i = 0; i < uint64_t(rows) * N; ++i) aa[i] = f2bf(d(rng)); }
-      std::vector<double> ref((size_t)rows * N); refGemm(X16, s, rows, N, ref);
+      auto [Xbf, Xref] = inputs(rows); id<MTLBuffer> Y = mkbuf(uint64_t(rows) * N * 2), A = mkbuf(uint64_t(rows) * N * 2); { uint16_t *aa = (uint16_t *)A.contents; std::uniform_real_distribution<float> d(-1.f, 1.f); for (uint64_t i = 0; i < uint64_t(rows) * N; ++i) aa[i] = f2bf(d(rng)); }
+      std::vector<double> ref((size_t)rows * N); refGemm(Xref, s, rows, N, ref);
       if (fam[2] == 'r') for (size_t i = 0; i < ref.size(); ++i) ref[i] += bf2f(((uint16_t *)A.contents)[i]);
       if (fam[2] == 'g') for (size_t i = 0; i < ref.size(); ++i) { double gg = bf2f(((uint16_t *)A.contents)[i]); ref[i] *= gg / (1.0 + std::exp(-gg)); }
       KQParams pq{N, K, N / 64, 0, 0}; char name[80]; snprintf(name, sizeof name, "%s_%s_m%u_c32_sg2_k32_b2_p1", fam, fmtName[fi], rows); id<MTLComputePipelineState> ps = pso(lib, name); if (!ps) { ++failures; continue; }
       std::vector<id<MTLBuffer>> bufs{Xbf, s.w0, s.w1, s.meta, Y}; if (fam[2] != 'a') bufs.push_back(A);
       Dispatch d{ps, bufs, bytes(pq), (int)bufs.size(), MTLSizeMake(N / 64, 1, 1), MTLSizeMake(64, 1, 1)}; runOnce({d}, 1); compare(name, Y, ref, rows, N); }
-    { const uint32_t rows = 128; auto [Xbf, X16] = inputs(rows); id<MTLBuffer> Y = mkbuf(uint64_t(rows) * N * 2); std::vector<double> ref((size_t)rows * N); refGemm(X16, s, rows, N, ref);
+    { const uint32_t rows = 128; auto [Xbf, Xref] = inputs(rows); id<MTLBuffer> Y = mkbuf(uint64_t(rows) * N * 2); std::vector<double> ref((size_t)rows * N); refGemm(Xref, s, rows, N, ref);
       KQParams pq{N, K, 0, 0, 0}; char name[80]; snprintf(name, sizeof name, "pfa_%s_r32_sg4_n64_k64_p1", fmtName[fi]); id<MTLComputePipelineState> ps = pso(lib, name); if (!ps) { ++failures; continue; }
       Dispatch d{ps, {Xbf, s.w0, s.w1, s.meta, Y}, bytes(pq), 5, MTLSizeMake(rows / 128, N / 64, 1), MTLSizeMake(128, 1, 1)}; runOnce({d}, 1); compare(name, Y, ref, rows, N); } }
   printf("%s (%d failures)\n", failures ? "VALIDATION FAILED" : "all production kernels validated", failures);
+  if (argc > 2 && std::string(argv[2]) == "time-gu") {
+    const uint32_t NN = 17408, KK = 5120;
+    for (auto pair : gu) {
+      Seg g = makeSegK(pair[0], NN, KK, 0), u = makeSegK(pair[1], NN, KK, 0);
+      for (uint32_t rows : rowsList) {
+        id<MTLBuffer> X = mkbuf(uint64_t(rows) * KK * 2), Y = mkbuf(uint64_t(rows) * NN * 2), G = mkbuf(uint64_t(rows) * NN * 2);
+        std::fill_n((uint16_t *)X.contents, size_t(rows) * KK, f2bf(0.25f));
+        KQGateUpParams gp{KK, NN, NN, kFmtId[g.fmt], kFmtId[u.fmt]};
+        KQParams pq{NN, KK, NN / 64, 0, 0};
+        char fused[40], gate[80], up[80];
+        snprintf(fused, sizeof fused, "kqgu_m%u", rows);
+        snprintf(gate, sizeof gate, "sga_%s_m%u_c32_sg2_k32_b2_p1", fmtName[g.fmt], rows);
+        snprintf(up, sizeof up, "sgg_%s_m%u_c32_sg2_k32_b2_p1", fmtName[u.fmt], rows);
+        Dispatch df{pso(lib, fused), {X, g.w0, g.w1, g.meta, u.w0, u.w1, u.meta, Y}, bytes(gp), 8, MTLSizeMake(NN / 64, 1, 1), MTLSizeMake(64, 1, 1)};
+        Dispatch dg{pso(lib, gate), {X, g.w0, g.w1, g.meta, G}, bytes(pq), 5, MTLSizeMake(NN / 64, 1, 1), MTLSizeMake(64, 1, 1)};
+        Dispatch du{pso(lib, up), {X, u.w0, u.w1, u.meta, Y, G}, bytes(pq), 6, MTLSizeMake(NN / 64, 1, 1), MTLSizeMake(64, 1, 1)};
+        const double tf = timeIt({df}, 10), ts = timeIt({dg, du}, 10);
+        printf("BENCH gate=%s up=%s rows=%u fused_ms=%.6f separate_ms=%.6f\n", fmtName[g.fmt], fmtName[u.fmt], rows, tf * 1e3, ts * 1e3);
+      }
+    }
+  }
   if (argc > 2 && std::string(argv[2]) == "time") {   // runtime-format-switch cost: kqf (1 segment) vs sga, serialized by a dependent touch kernel
     const uint32_t KK = 5120, rows = 8; id<MTLComputePipelineState> touch = pso(lib, "kq_touch");
     for (uint32_t NN : {16640u, 17408u}) for (int fi : {0, 1, 3}) { Seg s = makeSegK((Fmt)fi, NN, KK, 0);
