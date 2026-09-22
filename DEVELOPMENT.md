@@ -394,6 +394,11 @@ it does not include generation-time masks. The `grammar_cache` counters show
 whether compiled output grammars are reused. Tool definitions still contribute
 tokens to the prompt; saving their JSON alone cannot avoid model prefill.
 Existing exact-prefix caching reuses model work while the server remains alive.
+Text requests also reuse tokenized history at literal message-end boundaries
+when the tokenizer supports independent encoding there. This process-local
+cache retains at most four prefixes and 8 MiB of text/token storage; it falls
+back to full encoding for other tokenizer pipelines. `/status.tokenizer_cache`
+reports its usage. It does not alter prompt text, token IDs or the GPU KV cache.
 Server restarts require recomputation until persistent model-state caching is
 available; see the separate [SSD cache proposal](https://github.com/incoai/splash/pull/3).
 
