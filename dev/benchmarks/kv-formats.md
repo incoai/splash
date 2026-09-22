@@ -46,12 +46,38 @@ power condition.
   width, order main/INT8/BF16/BF16/INT8/main: default INT8 cycle-time changes
   ranged from -0.08% to +0.81% on M3 and -0.71% to +0.07% on M5.
 - Native long-context runs completed through 256K for 35B in both formats on
-  both devices. The 27B native 256K format matrix is incomplete; the 256K
-  kernel checks above must not be presented as a completed native model gate.
+  both devices. Follow-up integration with PR92 completed the 27B 256K matrix
+  as well: both formats on both devices, 262,016 input tokens plus 128 output
+  tokens, followed by exact-prefix replay. Each replay reused 261,984 tokens
+  and matched its cold run's 128-token output exactly. Active KV pages and
+  state cells returned to zero after each request. The M5 INT8 output also
+  matched the retained main run on the same input token-for-token.
 
 The benchmark tools accept `--kv-format int8|bf16`. `attention-sweep` accepts
 `--compare-metallib BASELINE` and checks exact output equality;
 `paged-attention-plan METALLIB --long` runs the long independent references.
+
+## Combined serving validation with PR92
+
+The integrated build passed all four real HTTP and runtime-oracle combinations
+(27B/35B, INT8/BF16) on M5 Pro 20. HTTP coverage includes tools, structured
+output, images, prefix reuse, mixed scoring/chat, and timeout recovery. One
+initial 35B load was refused by the host-memory preflight after switching
+models; an unchanged retry passed. No memory guard or numerical threshold was
+relaxed. M5 Pro 16 also passed all four runtime oracles and shader-validated
+128K/256K independent attention references in both formats.
+
+The combined Python suite ran 766 tests: 764 passed and two opt-in external CLI
+routing tests were skipped. Production/CPU/sanitizers and Python 3.12–3.14 CI
+passed, as did the full Metal gate with shader validation on M5 Pro 20.
+
+The real HTTP smoke and ABBA tools now accept `--kv-format int8|bf16` and check
+the running format and its quantization/scale identity. M5 Pro 20 HTTP ABBA
+against main passed transcript/usage equality and the unchanged 2% regression
+limit for both models (three samples per build, 2K/8K cold and cached requests,
+plus 64-token decode). Native 256K runs establish completion and cache/resource
+behavior on a synthetic repeated prompt; they are not a task-quality score or
+a universal performance guarantee.
 
 ## State-oracle scope and numerical investigation
 
