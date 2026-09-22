@@ -3,14 +3,18 @@
 
 import argparse
 import fcntl
+import hashlib
 import http.client
 import json
 import os
+import re
+import secrets
 import socket
 import subprocess
 import sys
 import urllib.error
 import urllib.request
+from pathlib import Path, PurePosixPath
 
 try:
     from . import catalog, clients, paths
@@ -26,9 +30,14 @@ RUNTIME_DIR = paths.RUNTIME
 PORT = 8000
 REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 BASE_URL = f"http://127.0.0.1:{PORT}"
+LOCAL_SCHEMA = "splash-local-qwen4-affine-v1"
 
 
 class LauncherError(RuntimeError):
+    pass
+
+
+class LocalSourceMismatch(LauncherError):
     pass
 
 
@@ -96,6 +105,255 @@ def _ensure_installed(model_id):
         raise LauncherError("model download or verification failed")
 
 
+def _local_file(root, name):
+    pure = PurePosixPath(name) if isinstance(name, str) else None
+    if (
+        pure is None
+        or pure.is_absolute()
+        or ".." in pure.parts
+        or not pure.parts
+        or pure.as_posix() != name
+    ):
+        raise LauncherError("local package contains an invalid file path")
+    path = root / name
+    if not path.resolve().is_relative_to(root.resolve()):
+        raise LauncherError("local package file escapes its directory")
+    return path
+
+
+def local_bundle_manifest(package, source=None, *, full_source=False):
+    """Check launch metadata; native loading validates the tensor layout."""
+    package = Path(package).resolve()
+    try:
+        manifest = model_artifacts.read_json(package / "manifest.json")
+        expected = (package / "manifest.sha256").read_text().strip()
+        if (
+            manifest.get("schema") != LOCAL_SCHEMA
+            or manifest.get("alignment") != model_artifacts.ALIGNMENT
+            or not model_artifacts.is_hex_digest(
+                manifest.get("source_identity_sha256"), 64
+            )
+            or expected != model_artifacts.sha256(package / "manifest.json")
+        ):
+            raise LauncherError("local package has invalid identity or format metadata")
+        records = manifest.get("small_files")
+        if not isinstance(records, list):
+            raise LauncherError("local package has no tokenizer/config metadata")
+        required = {
+            "config.json",
+            "model.safetensors.index.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "chat_template.jinja",
+        }
+        seen = set()
+        for record in records:
+            if not isinstance(record, dict):
+                raise LauncherError("local package has invalid metadata records")
+            path = _local_file(package, record.get("path"))
+            size, digest = record.get("bytes"), record.get("sha256")
+            if (
+                record["path"] in seen
+                or type(size) is not int
+                or size <= 0
+                or not model_artifacts.is_hex_digest(digest, 64)
+                or path.stat().st_size != size
+                or model_artifacts.sha256(path) != digest
+            ):
+                raise LauncherError("local package tokenizer/config metadata changed")
+            seen.add(record["path"])
+            if source is not None:
+                original = _local_file(Path(source).resolve(), record["path"])
+                if (
+                    original.stat().st_size != size
+                    or model_artifacts.sha256(original) != digest
+                ):
+                    raise LauncherError(
+                        "local package does not match the original model metadata"
+                    )
+        if not required <= seen:
+            raise LauncherError("local package is missing tokenizer/config metadata")
+        shards = manifest.get("shards")
+        if not isinstance(shards, list) or not shards:
+            raise LauncherError("local package has no weight shards")
+        if source is not None and full_source:
+            print(
+                f"Verifying original local-model weights · {len(shards)} shards",
+                flush=True,
+            )
+        for index, record in enumerate(shards, 1):
+            if not isinstance(record, dict):
+                raise LauncherError("local package has invalid shard metadata")
+            path = _local_file(package, record.get("path"))
+            size = record.get("bytes")
+            if (
+                type(size) is not int
+                or size <= 0
+                or size % model_artifacts.ALIGNMENT
+                or path.stat().st_size != size
+                or not model_artifacts.is_hex_digest(record.get("sha256"), 64)
+                or not model_artifacts.is_hex_digest(record.get("source_sha256"), 64)
+            ):
+                raise LauncherError("local package weight shard size changed")
+            if source is not None:
+                original = _local_file(
+                    Path(source).resolve(), record.get("source_path")
+                )
+                source_size = record.get("source_bytes")
+                if (
+                    type(source_size) is not int
+                    or original.stat().st_size != source_size
+                ):
+                    raise LauncherError(
+                        "local package does not match the original model shards"
+                    )
+                if full_source:
+                    print(
+                        f"Verifying source shard {index}/{len(shards)} · {original.name}",
+                        flush=True,
+                    )
+                    before = original.stat()
+                    digest = model_artifacts.sha256(original)
+                    after = original.stat()
+                    if (
+                        before.st_ino,
+                        before.st_size,
+                        before.st_mtime_ns,
+                        before.st_ctime_ns,
+                    ) != (
+                        after.st_ino,
+                        after.st_size,
+                        after.st_mtime_ns,
+                        after.st_ctime_ns,
+                    ) or digest != record["source_sha256"]:
+                        raise LocalSourceMismatch(
+                            "local package does not match the original model weight checksums"
+                        )
+        source_records = [
+            {
+                "path": record["source_path"],
+                "bytes": record["source_bytes"],
+                "sha256": record["source_sha256"],
+            }
+            for record in shards
+        ] + [
+            {key: record[key] for key in ("path", "bytes", "sha256")}
+            for record in records
+        ]
+        identity = hashlib.sha256(
+            json.dumps(
+                {
+                    "schema": LOCAL_SCHEMA,
+                    "source_files": sorted(
+                        source_records, key=lambda item: item["path"]
+                    ),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            ).encode()
+        ).hexdigest()
+        if identity != manifest["source_identity_sha256"]:
+            raise LauncherError("local package source identity is inconsistent")
+    except (
+        model_artifacts.ModelError,
+        OSError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as error:
+        raise LauncherError(
+            f"unable to validate local package {package}: {error}"
+        ) from error
+    return manifest
+
+
+def _ensure_local_installed(source, package):
+    if source is None and package is None:
+        raise LauncherError("select --local-model or --local-package")
+    source = None if source is None else source.resolve()
+    if source is not None and not source.is_dir():
+        raise LauncherError("--local-model must name an existing MLX model directory")
+    if package is not None:
+        package = package.resolve()
+        local_bundle_manifest(package, source, full_source=source is not None)
+        return package
+    packages = (
+        paths.DATA / "local-models" if paths.PACKAGED else ROOT / "install/local-models"
+    )
+    matches = []
+    for manifest in sorted(packages.glob("*/manifest.json")):
+        try:
+            local_bundle_manifest(manifest.parent, source)
+        except LauncherError:
+            continue
+        matches.append(manifest.parent.resolve())
+    if len(matches) == 1:
+        try:
+            local_bundle_manifest(matches[0], source, full_source=True)
+        except LocalSourceMismatch:
+            pass  # Import a new snapshot while preserving the previous bundle.
+        else:
+            return matches[0]
+    if len(matches) > 1:
+        raise LauncherError(
+            "multiple local packages match; select one with --local-package"
+        )
+    importer = ROOT / "dev/tools/import_flash_next.py"
+    if not importer.is_file():
+        raise LauncherError(
+            "no matching local package; supply an imported --local-package"
+        )
+    identity = model_artifacts.sha256(source / "config.json")[:12]
+    name = re.sub(r"[^A-Za-z0-9._-]+", "-", source.name).strip("._-") or "local-model"
+    alias = f"{name[:108]}-{identity}"
+    if (packages / alias).exists() or (packages / alias).is_symlink():
+        alias += "-" + secrets.token_hex(3)
+    print(
+        f"Importing local model into {packages / alias}; original files are preserved.",
+        flush=True,
+    )
+    command = [
+        str(paths.PYTHON),
+        str(importer),
+        str(source),
+        "--output-root",
+        str(packages),
+        "--alias",
+        alias,
+    ]
+    if subprocess.run(command, cwd=ROOT, check=False).returncode:
+        raise LauncherError("local model import or verification failed")
+    package = packages / alias
+    local_bundle_manifest(package, source, full_source=True)
+    return package.resolve()
+
+
+def _ensure_local_runtime(binary):
+    if not paths.PYTHON.is_file() and not paths.PACKAGED:
+        if subprocess.run(
+            ["make", "platform-check", "install-environment"], cwd=ROOT, check=False
+        ).returncode:
+            raise LauncherError("local serving environment setup failed")
+    if (
+        not binary.is_file() or not binary.with_name("splash.metallib").is_file()
+    ) and not paths.PACKAGED:
+        if subprocess.run(
+            ["make", "-j4", "flash-next", "BUILD=build/flash-next"],
+            cwd=ROOT,
+            check=False,
+        ).returncode:
+            raise LauncherError("native Flash-Next build failed; see the output above")
+    if (
+        not paths.PYTHON.is_file()
+        or not binary.is_file()
+        or not binary.with_name("splash.metallib").is_file()
+    ):
+        raise LauncherError(
+            "local serving requires the bundled Python, splash-flash and splash.metallib"
+        )
+
+
 def _serve_lock_owner(lock):
     try:
         lock.seek(0)
@@ -156,20 +414,35 @@ def serve(args):
                 raise LauncherError(
                     f"cannot bind {args.host}:{args.port}: {error}"
                 ) from None
-        _ensure_installed(args.model)
-        root = model_artifacts.installed_root(paths.MODELS, args.model)
+        local = args.local_model is not None or args.local_package is not None
+        if local:
+            binary = ROOT / (
+                "engine/splash-flash"
+                if paths.PACKAGED
+                else "build/flash-next/splash-flash"
+            )
+            _ensure_local_runtime(binary)
+            root = _ensure_local_installed(args.local_model, args.local_package)
+            model_arguments = ["--local-package", str(root), "--tokenizer", str(root)]
+        else:
+            _ensure_installed(args.model)
+            root = model_artifacts.installed_root(paths.MODELS, args.model)
+            binary = paths.BINARY
+            model_arguments = [
+                str(root / "target"),
+                str(root / "draft"),
+                "--tokenizer",
+                str(root / "tokenizer"),
+            ]
         command = [
             str(paths.PYTHON),
             "-u",
             str(ROOT / "server/server.py"),
-            str(root / "target"),
-            str(root / "draft"),
-            "--tokenizer",
-            str(root / "tokenizer"),
+            *model_arguments,
             "--model",
             args.model,
             "--binary",
-            str(paths.BINARY),
+            str(binary),
             "--host",
             args.host,
             "--port",
@@ -198,11 +471,26 @@ def serve(args):
         environment = dict(
             os.environ, PYTHONUNBUFFERED="1", TRANSFORMERS_VERBOSITY="error"
         )
+        if local:
+            if args.ple_ssd_streaming is not None:
+                environment["SPLASH_FLASH_PLE_SSD_STREAMING"] = (
+                    "1" if args.ple_ssd_streaming else "0"
+                )
+            if args.ple_ssd_cache_mb is not None:
+                if environment.get("SPLASH_FLASH_PLE_SSD_STREAMING") != "1":
+                    raise LauncherError(
+                        "--ple-ssd-cache-mb requires --ple-ssd-streaming "
+                        "or SPLASH_FLASH_PLE_SSD_STREAMING=1"
+                    )
+                environment["SPLASH_FLASH_PLE_SSD_CACHE_MB"] = str(
+                    args.ple_ssd_cache_mb
+                )
         if args.api_key is not None:
             environment["SPLASH_API_KEY"] = args.api_key
         # Detached, because execve replaces this process a line later and a
         # thread would not survive it. Failure is silent by design.
-        catalog.spawn_refresh()
+        if not local:
+            catalog.spawn_refresh()
         os.set_inheritable(installation.fileno(), True)
         os.set_inheritable(lock.fileno(), True)
         os.execve(command[0], command, environment)
@@ -345,6 +633,19 @@ def _parse_max_image_pixels(value):
     return pixels
 
 
+def _parse_ple_ssd_cache_mb(value):
+    if not value.isascii() or not value.isdecimal() or str(int(value)) != value:
+        raise argparse.ArgumentTypeError(
+            "PLE SSD cache must be a decimal MiB size from 0 to 1024"
+        )
+    size = int(value)
+    if not 0 <= size <= 1024:
+        raise argparse.ArgumentTypeError(
+            "PLE SSD cache must be a decimal MiB size from 0 to 1024"
+        )
+    return size
+
+
 def parse_args(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     client_args = []
@@ -399,7 +700,32 @@ def parse_args(argv=None):
         type=model_artifacts.parse_repo_id,
         required=True,
         metavar="OWNER/REPO",
-        help="Hugging Face repository containing a Splash package",
+        help="served owner/repo ID (a local alias when using --local-model)",
+    )
+    server.add_argument(
+        "--local-model", type=Path, help="existing local Flash-Next MLX directory"
+    )
+    server.add_argument(
+        "--local-package", type=Path, help="imported local Flash-Next bundle"
+    )
+    placement = server.add_mutually_exclusive_group()
+    placement.add_argument(
+        "--ple-ssd-streaming",
+        action="store_true",
+        default=None,
+        help="read n-gram table rows from SSD (local Flash-Next only)",
+    )
+    placement.add_argument(
+        "--no-ple-ssd-streaming",
+        action="store_false",
+        dest="ple_ssd_streaming",
+        help="keep the n-gram table in GPU-accessible memory (local Flash-Next only)",
+    )
+    server.add_argument(
+        "--ple-ssd-cache-mb",
+        type=_parse_ple_ssd_cache_mb,
+        metavar="MIB",
+        help="bounded n-gram SSD row cache in MiB, 0 to 1024 (default: 64)",
     )
     server.add_argument(
         "--served-model-name",
@@ -471,6 +797,14 @@ def parse_args(argv=None):
             args.port = _parse_port(os.environ.get("SPLASH_PORT", str(PORT)))
         except argparse.ArgumentTypeError as error:
             parser.error(f"SPLASH_PORT: {error}")
+    if args.command == "serve" and not 1 <= args.port <= 65535:
+        parser.error("--port must be in [1, 65535]")
+    if args.command == "serve":
+        local = args.local_model is not None or args.local_package is not None
+        if (
+            args.ple_ssd_streaming is not None or args.ple_ssd_cache_mb is not None
+        ) and not local:
+            parser.error("PLE SSD options require --local-model or --local-package")
     if args.command == "serve" and args.api_key is not None:
         if not args.api_key or any(ord(c) <= 32 or ord(c) >= 127 for c in args.api_key):
             parser.error("API key must contain only visible ASCII characters")

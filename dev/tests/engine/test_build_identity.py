@@ -1,6 +1,8 @@
 import hashlib
 import json
+import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -209,6 +211,178 @@ class CompileConfigurationTests(unittest.TestCase):
             "    stream.write(str(output) + '\\n')\n"
         )
         return compiler, log
+
+    def test_precision_profile_flags_keep_host_and_test_abi_aligned(self):
+        # Parse the actual Make rules in an isolated checkout. The explicit
+        # empty target and dry-run database cannot build the real executable
+        # or consume the developer's machine-local preference.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for relative in (
+                "Makefile",
+                "dev/Makefile",
+                "dev/native.mk",
+                "dev/tools/build_config.py",
+            ):
+                destination = root / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(build_identity.ROOT / relative, destination)
+            (root / "runtime").mkdir()
+            preference = root / ".splash-build.mk"
+            preference.write_text("SPLASH_PRECISION ?= hybrid\n")
+            capture = root / "capture.mk"
+            capture.write_text(
+                ".PHONY: capture-precision-flags\ncapture-precision-flags:\n\t@:\n"
+            )
+            environment = dict(os.environ)
+            for name in (
+                "MAKEFLAGS",
+                "MFLAGS",
+                "MAKEOVERRIDES",
+                "GNUMAKEFLAGS",
+                "MAKEFILES",
+                "SPLASH_PRECISION",
+            ):
+                environment.pop(name, None)
+
+            variables = (
+                "MACOS_MIN_VERSION",
+                "ENGINE_CXXFLAGS",
+                "ENGINE_OBJCXXFLAGS",
+                "ENGINE_TEST_CXXFLAGS",
+                "ENGINE_SANITIZER_CXXFLAGS",
+                "PROD_METALFLAGS",
+                "TEST_METALFLAGS",
+            )
+
+            def flags(*assignments):
+                result = subprocess.run(
+                    (
+                        "make",
+                        "-np",
+                        "-f",
+                        "Makefile",
+                        "-f",
+                        "capture.mk",
+                        f"BUILD_ID_PYTHON={sys.executable}",
+                        *assignments,
+                        "capture-precision-flags",
+                    ),
+                    cwd=root,
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                effective = {}
+                for variable in variables:
+                    match = re.search(
+                        rf"^{variable}\s*(?::=|=)\s*(.*)$",
+                        result.stdout,
+                        re.MULTILINE,
+                    )
+                    self.assertIsNotNone(match, variable)
+                    effective[variable] = shlex.split(match.group(1))
+                self.assertFalse((root / "build").exists())
+                return effective
+
+            def precision_defines(values):
+                return [
+                    value
+                    for value in values
+                    if re.fullmatch(
+                        r"-[DU]SPLASH_(?:INT8|METAL41)_EXPERIMENT(?:=.*)?",
+                        value,
+                    )
+                ]
+
+            cases = (
+                (
+                    "local hybrid",
+                    (),
+                    "27.0",
+                    "metal4.1",
+                    ["-DSPLASH_INT8_EXPERIMENT=1"],
+                    ["-DSPLASH_INT8_EXPERIMENT=1"],
+                ),
+                (
+                    "command-line q4",
+                    ("SPLASH_PRECISION=q4",),
+                    "26.4",
+                    "metal4.0",
+                    [],
+                    [],
+                ),
+                (
+                    "explicit FP8 flags",
+                    (
+                        "ENGINE_CXXFLAGS=-std=c++20 -O3 -Iruntime "
+                        "-mmacosx-version-min=27.0 -DSPLASH_METAL41_EXPERIMENT=1",
+                        "PROD_METALFLAGS=-std=metal4.1 -O3 -Iruntime "
+                        "-mmacosx-version-min=27.0",
+                    ),
+                    "27.0",
+                    "metal4.1",
+                    ["-DSPLASH_METAL41_EXPERIMENT=1"],
+                    [],
+                ),
+                (
+                    "ordered precision define then undefine",
+                    (
+                        "ENGINE_CXXFLAGS=-std=c++20 -O3 -Iruntime "
+                        "-mmacosx-version-min=27.0 -DSPLASH_INT8_EXPERIMENT=1 "
+                        "-USPLASH_INT8_EXPERIMENT -DSPLASH_METAL41_EXPERIMENT=1 "
+                        "-USPLASH_METAL41_EXPERIMENT",
+                        "PROD_METALFLAGS=-std=metal4.1 -O3 -Iruntime "
+                        "-mmacosx-version-min=27.0",
+                    ),
+                    "27.0",
+                    "metal4.1",
+                    [
+                        "-DSPLASH_INT8_EXPERIMENT=1",
+                        "-USPLASH_INT8_EXPERIMENT",
+                        "-DSPLASH_METAL41_EXPERIMENT=1",
+                        "-USPLASH_METAL41_EXPERIMENT",
+                    ],
+                    [],
+                ),
+            )
+            for label, assignments, minimum, metal, defines, metal_defines in cases:
+                with self.subTest(profile=label):
+                    effective = flags(*assignments)
+                    self.assertEqual(effective["MACOS_MIN_VERSION"], [minimum])
+                    for variable in variables[1:5]:
+                        self.assertEqual(
+                            precision_defines(effective[variable]), defines, variable
+                        )
+                        self.assertIn(
+                            f"-mmacosx-version-min={minimum}",
+                            effective[variable],
+                            variable,
+                        )
+                    for variable in variables[5:]:
+                        self.assertIn(f"-std={metal}", effective[variable], variable)
+                        self.assertEqual(
+                            precision_defines(effective[variable]),
+                            metal_defines,
+                            variable,
+                        )
+                        self.assertIn(
+                            f"-mmacosx-version-min={minimum}",
+                            effective[variable],
+                            variable,
+                        )
+                    self.assertEqual(
+                        preference.read_text(), "SPLASH_PRECISION ?= hybrid\n"
+                    )
+            # Without the local preference, the repository's portable Q4
+            # defaults must remain intact.
+            preference.unlink()
+            effective = flags()
+            self.assertEqual(effective["MACOS_MIN_VERSION"], ["26.4"])
+            for variable in variables[1:5]:
+                self.assertEqual(precision_defines(effective[variable]), [], variable)
+            self.assertIn("-std=metal4.0", effective["PROD_METALFLAGS"])
 
     def test_actual_flag_changes_and_reversions(self):
         with tempfile.TemporaryDirectory() as directory:

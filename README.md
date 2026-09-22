@@ -68,6 +68,13 @@ See [judgment contracts](DEVELOPMENT.md#judgment-contracts) for details.
 | [`incoai/Qwen3.8-27B-Splash`](https://huggingface.co/incoai/Qwen3.8-27B-Splash) | Qwen3.8-27B, 4-bit, with its DFlash 2 draft | 17.4 GB |
 | [`incoai/Qwen3.6-35B-A3B-Splash`](https://huggingface.co/incoai/Qwen3.6-35B-A3B-Splash) | Qwen3.6-35B-A3B, 4-bit, with its DFlash 2 draft | 20.9 GB |
 
+An experimental local Qwen3.8 Flash-Next path is available for imported MLX
+checkpoints. It has a separate native worker and Metal kernels, including
+optional M5 Ultra prefill and speculative decode routes. It does not yet have
+a published Splash model package or a general hardware default. See
+[Flash-Next development](dev/FLASH_NEXT.md) for the import, build, and run
+steps.
+
 `--model` takes any `owner/repo` that holds a Splash package, a format
 [DEVELOPMENT.md](DEVELOPMENT.md#model-packages) describes. Plain MLX or
 Transformers checkpoints do not work. Private repositories need `HF_TOKEN`.

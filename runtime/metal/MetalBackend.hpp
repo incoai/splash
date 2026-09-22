@@ -63,6 +63,7 @@ enum class BufferStorage {
 class MetalBackend;
 class CommandTicket;
 class SparseHeap;
+class ResidencyLease;
 
 // A cheap, copyable reference to a backend-owned Metal allocation. Views keep
 // the base allocation alive and do not increase the tracked allocation count.
@@ -116,6 +117,34 @@ private:
   friend class MetalBackend;
 };
 
+// Opt-in residency request for caller-enumerated immutable model weights.
+// The lease retains complete base allocations and their host mappings. The
+// backend also retains the registration until stop() and ticket consumption,
+// so destroying an early lease cannot release resources used by queued work.
+// This requests GPU accessibility; it does not guarantee physical pinning.
+class ResidencyLease final {
+public:
+  ResidencyLease();
+  ~ResidencyLease();
+  ResidencyLease(const ResidencyLease &) = delete;
+  ResidencyLease &operator=(const ResidencyLease &) = delete;
+  ResidencyLease(ResidencyLease &&) noexcept;
+  ResidencyLease &operator=(ResidencyLease &&) noexcept;
+
+  [[nodiscard]] explicit operator bool() const noexcept;
+  [[nodiscard]] uint64_t bufferCount() const noexcept;
+  // Sum of the existing ledger's allocatedSize bytes, once per native base
+  // allocation. These bytes are already charged; acquiring a lease adds no
+  // second weight allocation or accounting charge.
+  [[nodiscard]] uint64_t byteCount() const noexcept;
+
+private:
+  struct Impl;
+  explicit ResidencyLease(std::shared_ptr<Impl> impl);
+  std::shared_ptr<Impl> impl_;
+  friend class MetalBackend;
+};
+
 struct SparseMapping {
   MetalBuffer buffer;
   uint64_t bufferOffsetBytes = 0;
@@ -149,15 +178,214 @@ struct ComputeDispatch {
   DispatchSize threadsPerThreadgroup;
 };
 
+// Normal command-boundary instrumentation. Durations use steady_clock only;
+// callback arrival is not a GPU schedule timestamp. Preparation is outside
+// CommandTiming.wallSeconds. Submission/wait/memory-query intervals can overlap
+// GPU execution and one another, so their totals must not be added as overhead.
+// Sample counts distinguish absent/incomplete asynchronous spans from zero.
+struct CommandHostTiming {
+  uint64_t timedCommands = 0, commitSamples = 0, scheduledCallbackSamples = 0,
+      completedCallbackSamples = 0, preCommitMemorySamples = 0,
+      postCommitMemorySamples = 0, scheduledMemorySamples = 0,
+      completedMemorySamples = 0, ticketWaitCalls = 0;
+  double preparationSeconds = 0.0, encodingSeconds = 0.0,
+      beforeCommitSeconds = 0.0, dependencyWaitSeconds = 0.0,
+      commitSeconds = 0.0, commitToScheduledCallbackSeconds = 0.0,
+      commitToCompletedCallbackSeconds = 0.0,
+      completionCallbackBeforeWallEndSeconds = 0.0,
+      submissionReturnSeconds = 0.0, ticketBlockingWaitSeconds = 0.0,
+      preCommitMemorySampleSeconds = 0.0, postCommitMemorySampleSeconds = 0.0,
+      scheduledMemorySampleSeconds = 0.0, completedMemorySampleSeconds = 0.0;
+  void add(const CommandHostTiming &other) noexcept {
+    timedCommands += other.timedCommands; commitSamples += other.commitSamples;
+    scheduledCallbackSamples += other.scheduledCallbackSamples;
+    completedCallbackSamples += other.completedCallbackSamples;
+    preCommitMemorySamples += other.preCommitMemorySamples;
+    postCommitMemorySamples += other.postCommitMemorySamples;
+    scheduledMemorySamples += other.scheduledMemorySamples;
+    completedMemorySamples += other.completedMemorySamples; ticketWaitCalls += other.ticketWaitCalls;
+    preparationSeconds += other.preparationSeconds; encodingSeconds += other.encodingSeconds;
+    beforeCommitSeconds += other.beforeCommitSeconds; dependencyWaitSeconds += other.dependencyWaitSeconds;
+    commitSeconds += other.commitSeconds;
+    commitToScheduledCallbackSeconds += other.commitToScheduledCallbackSeconds;
+    commitToCompletedCallbackSeconds += other.commitToCompletedCallbackSeconds;
+    completionCallbackBeforeWallEndSeconds += other.completionCallbackBeforeWallEndSeconds;
+    submissionReturnSeconds += other.submissionReturnSeconds;
+    ticketBlockingWaitSeconds += other.ticketBlockingWaitSeconds;
+    preCommitMemorySampleSeconds += other.preCommitMemorySampleSeconds;
+    postCommitMemorySampleSeconds += other.postCommitMemorySampleSeconds;
+    scheduledMemorySampleSeconds += other.scheduledMemorySampleSeconds;
+    completedMemorySampleSeconds += other.completedMemorySampleSeconds;
+  }
+};
+
 struct CommandTiming {
   double gpuSeconds = 0.0;
   double wallSeconds = 0.0;
+  CommandHostTiming host{};
 };
 
 // GPU time of one dispatch replayed as its own command while profiling.
 struct DispatchTiming {
   std::string pipelineName;
   double gpuSeconds = 0.0;
+};
+
+// Command captures host/command timing without counters or encoder changes.
+// Counter profiling also keeps one asynchronous command. StagePerDispatch
+// introduces an encoder boundary for each dispatch; DispatchBoundary introduces
+// timestamp barriers within the original encoder. Neither is an uninstrumented
+// performance baseline, and unsupported modes never select a fallback.
+enum class CommandDispatchProfilingMode : uint8_t {
+  Off,
+  DispatchBoundary,
+  StagePerDispatch,
+  Command,
+};
+
+[[nodiscard]] constexpr const char *commandDispatchProfilingModeName(
+    CommandDispatchProfilingMode mode) noexcept {
+  switch (mode) {
+  case CommandDispatchProfilingMode::Off: return "off";
+  case CommandDispatchProfilingMode::DispatchBoundary: return "dispatch";
+  case CommandDispatchProfilingMode::StagePerDispatch: return "stage";
+  case CommandDispatchProfilingMode::Command: return "command";
+  }
+  return "unknown";
+}
+
+struct CommandDispatchProfilingCapability {
+  bool timestampCounterSet = false;
+  bool dispatchBoundary = false;
+  bool stageBoundary = false;
+  std::string reason;
+
+  [[nodiscard]] bool supports(CommandDispatchProfilingMode mode) const noexcept {
+    return mode == CommandDispatchProfilingMode::Off ||
+           mode == CommandDispatchProfilingMode::Command ||
+           (timestampCounterSet &&
+            ((mode == CommandDispatchProfilingMode::DispatchBoundary &&
+              dispatchBoundary) ||
+             (mode == CommandDispatchProfilingMode::StagePerDispatch &&
+              stageBoundary)));
+  }
+};
+
+enum class CommandDispatchProfileStatus : uint8_t {
+  Pending,
+  Complete,
+  Unsupported,
+  SampleLimitExceeded,
+  AllocationFailed,
+  ResolveFailed,
+  InvalidTimestamps,
+  CommandFailed,
+};
+
+[[nodiscard]] constexpr const char *commandDispatchProfileStatusName(
+    CommandDispatchProfileStatus status) noexcept {
+  switch (status) {
+  case CommandDispatchProfileStatus::Pending: return "pending";
+  case CommandDispatchProfileStatus::Complete: return "complete";
+  case CommandDispatchProfileStatus::Unsupported: return "unsupported";
+  case CommandDispatchProfileStatus::SampleLimitExceeded: return "sample_limit_exceeded";
+  case CommandDispatchProfileStatus::AllocationFailed: return "allocation_failed";
+  case CommandDispatchProfileStatus::ResolveFailed: return "resolve_failed";
+  case CommandDispatchProfileStatus::InvalidTimestamps: return "invalid_timestamps";
+  case CommandDispatchProfileStatus::CommandFailed: return "command_failed";
+  }
+  return "unknown";
+}
+
+struct DispatchProfileBinding {
+  uint32_t index = 0;
+  uint64_t sizeBytes = 0;
+  bool inlineBytes = false;
+};
+
+struct CommandDispatchTimestamp {
+  uint64_t index = 0;
+  std::string pipelineName;
+  DispatchSize threadgroups;
+  DispatchSize threadsPerThreadgroup;
+  std::vector<DispatchProfileBinding> bindings;
+  uint64_t executionWidth = 0;
+  uint64_t maxTotalThreadsPerThreadgroup = 0;
+  uint64_t staticThreadgroupMemoryBytes = 0;
+  uint64_t gpuStartTimestamp = 0;
+  uint64_t gpuEndTimestamp = 0;
+  // Valid only when timestampsValid is true. Converted to the CPU clock using
+  // the two calibration pairs below; raw GPU ticks are not assumed to be ns.
+  bool timestampsValid = false;
+  double calibratedStartSeconds = 0.0;
+  double calibratedEndSeconds = 0.0;
+  double gpuSeconds = 0.0;
+};
+
+struct DeviceMemorySampleTiming {
+  double beganSteadySeconds = 0.0;
+  double endedSteadySeconds = 0.0;
+  double seconds = 0.0;
+  // A post-commit read can still be running when GPU completion is published.
+  // Its start is retained, but its duration is unavailable until valid is true.
+  bool valid = false;
+};
+
+struct MachSteadyClockBridge {
+  double beganSteadySeconds = 0.0;
+  double endedSteadySeconds = 0.0;
+  uint64_t machAbsoluteTimestamp = 0;
+  uint32_t timebaseNumer = 0;
+  uint32_t timebaseDenom = 0;
+  double machSeconds = 0.0;
+  // Add this offset to Metal's system-Mach seconds to compare to host spans.
+  double steadyMinusMachSeconds = 0.0;
+  double uncertaintySeconds = 0.0;
+  bool valid = false;
+};
+
+struct CommandDispatchProfile {
+  uint64_t sequence = 0;
+  CommandDispatchProfilingMode mode = CommandDispatchProfilingMode::Off;
+  CommandDispatchProfileStatus status = CommandDispatchProfileStatus::Pending;
+  std::string reason;
+  bool encoderBoundariesAltered = false;
+  bool samplingBarriers = false;
+  uint64_t droppedProfilesBefore = 0;
+  uint64_t dispatchCount = 0;
+  bool dispatchMetadataTruncated = false;
+  CommandTiming timing;
+  double commandGpuStartSeconds = 0.0;
+  double commandGpuEndSeconds = 0.0;
+  double commandKernelStartSeconds = 0.0;
+  double commandKernelEndSeconds = 0.0;
+  bool commandKernelTimingValid = false;
+  double hostPreparationSeconds = 0.0;
+  double hostEncodingSeconds = 0.0;
+  double sparseDependencyWaitSeconds = 0.0;
+  double hostCommitSeconds = 0.0;
+  bool hostCommitTimingValid = false;
+  // Absolute steady_clock seconds, matching host model-phase instrumentation.
+  // Calibration CPU timestamps below are a separate Metal-provided ns axis.
+  double hostSubmissionStartSeconds = 0.0;
+  double hostEncodingStartSeconds = 0.0;
+  double hostEncodingEndSeconds = 0.0;
+  double hostCommitBeginSeconds = 0.0;
+  double hostCommitEndSeconds = 0.0;
+  double hostScheduledSeconds = 0.0;
+  double hostCompletedSeconds = 0.0;
+  double hostReadySeconds = 0.0;
+  DeviceMemorySampleTiming preCommitDeviceMemorySample;
+  DeviceMemorySampleTiming postCommitDeviceMemorySample;
+  DeviceMemorySampleTiming scheduledDeviceMemorySample;
+  DeviceMemorySampleTiming completedDeviceMemorySample;
+  MachSteadyClockBridge commitClockBridge;
+  MachSteadyClockBridge completedClockBridge;
+  uint64_t calibrationCpuStart = 0;
+  uint64_t calibrationGpuStart = 0;
+  uint64_t calibrationCpuEnd = 0;
+  uint64_t calibrationGpuEnd = 0;
+  std::vector<CommandDispatchTimestamp> dispatches;
 };
 
 // Move-only ownership of one submitted Metal command, including any resource
@@ -280,6 +508,7 @@ public:
   // Digest of the immutable bytes used to create this backend's library,
   // independent of later replacement or removal of its original file path.
   [[nodiscard]] const std::array<uint8_t, 32> &metallibSha256() const noexcept;
+  void setCancellationProbe(std::function<bool()> probe);
 
   [[nodiscard]] MetalBuffer
   allocateBuffer(uint64_t bytes, BufferStorage storage = BufferStorage::Shared,
@@ -325,6 +554,29 @@ public:
   [[nodiscard]] MetalBuffer view(const MetalBuffer &base, uint64_t offsetBytes,
                                  uint64_t lengthBytes) const;
 
+  // Immutable Tier 2 pointer argument buffers for direct access to existing
+  // source allocations. Resource bindings use dense argument indices 0..n-1;
+  // Shared and Private views are both supported. Nested argument buffers and
+  // sparse resources are rejected. Their indirect resources remain owned by
+  // the returned buffer and every submitted ticket, and are declared Read to
+  // Metal's residency/hazard tracking. Callers must never modify the result.
+  [[nodiscard]] bool supportsArgumentBuffersTier2() const noexcept;
+  // CPU metadata query only; permits memory planning before allocation.
+  [[nodiscard]] uint64_t readOnlyArgumentBufferByteCount(
+      std::string_view pipelineName, uint32_t bufferIndex);
+  [[nodiscard]] MetalBuffer makeReadOnlyArgumentBuffer(
+      std::string_view pipelineName, uint32_t bufferIndex,
+      std::span<const BufferBinding> resources,
+      std::string_view label = {});
+
+  // Diagnostic startup only, before warmup or any outstanding command ticket.
+  // Only the supplied immutable-weight views participate; each becomes its
+  // entire base allocation. One lease per backend, excluding sparse backing.
+  // Creates and requests one queue-attached residency set; command submission
+  // and the existing bindings/hazard tracking remain unchanged.
+  [[nodiscard]] ResidencyLease requestWeightResidency(
+      std::span<const MetalBuffer> weights, std::string_view label = {});
+
   // Encodes exactly one compute dispatch, commits it, waits for completion,
   // and reports both GPU and end-to-end wall time.
   [[nodiscard]] CommandTiming submit(const ComputeDispatch &dispatch);
@@ -349,8 +601,18 @@ public:
   // invokes completion inline and returns an already-completed ticket.
   // Production serving leaves this disabled. Benchmarks read and clear the
   // per-dispatch timings with takeDispatchProfile().
-  void setDispatchProfiling(bool enabled) noexcept;
+  void setDispatchProfiling(bool enabled);
   [[nodiscard]] std::vector<DispatchTiming> takeDispatchProfile();
+
+  [[nodiscard]] CommandDispatchProfilingCapability
+  commandDispatchProfilingCapability() const;
+  // Configure at a safe point with no outstanding ticket. Unsupported requests
+  // preserve normal execution and produce an explicit Unsupported profile.
+  // Legacy replay and counter profiling may not be enabled simultaneously.
+  void setCommandDispatchProfiling(CommandDispatchProfilingMode mode);
+  // Completed commands only; never waits. At most eight profiles are retained,
+  // with a cumulative droppedProfilesBefore count when the consumer lags.
+  [[nodiscard]] std::vector<CommandDispatchProfile> takeCommandDispatchProfiles();
 
   [[nodiscard]] MetalMemoryStats memoryStats() const noexcept;
   // Explicit safe-point refresh for memory admission/reclamation code. A

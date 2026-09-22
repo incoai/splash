@@ -5,6 +5,14 @@ binary=$1
 work=$(mktemp -d "${TMPDIR:-/tmp}/splash-tuning-cli.XXXXXX")
 trap 'rm -rf "$work"' EXIT HUP INT TERM
 
+"$binary" --help >"$work/help"
+for option in --decode-only --linear-only; do
+    if ! grep -Fq -- "$option" "$work/help"; then
+        echo "tune-kernels help omits $option" >&2
+        exit 1
+    fi
+done
+
 reject() {
     expected=$1
     shift
@@ -23,6 +31,15 @@ reject() {
 sentinel='unknown option or missing value: --sentinel'
 reject "$sentinel" --sentinel
 reject "$sentinel" --confirm --sentinel
+for option in --decode-only --linear-only; do
+    # Missing artifact paths must never be touched before parsing the filters.
+    reject "$sentinel" "$option" --sentinel
+    reject 'unknown option or missing value: 1' "$option" 1
+    reject "unknown option or missing value: $option=true" "$option=true"
+done
+reject "$sentinel" --decode-only --linear-only --confirm --candidates --sentinel
+reject "$sentinel" --confirm 12 --linear-only --decode-only --pairs 64 --sentinel
+reject '--confirm requires an integer between 12 and 64' --decode-only --linear-only --confirm 11
 for option in --pairs --confirm; do
     for value in 12 13 32 63 64; do
         reject "$sentinel" "$option" "$value" --sentinel
