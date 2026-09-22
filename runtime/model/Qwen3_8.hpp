@@ -61,7 +61,7 @@ struct Qwen3_8Layout final {
   [[nodiscard]] constexpr QwenMixerGeometry mixerGeometry() const noexcept {
     return {hiddenSize,     packedGdnWidth, packedFullWidth,
             convolutionDimension, gdnValueHeads,  gdnHeadDimension,
-            attentionWidth, attentionHeadDimension, gdnKeyHeads};
+            attentionWidth, attentionHeadDimension};
   }
   [[nodiscard]] constexpr uint32_t capturedHiddenSize() const noexcept {
     return hiddenSize * hiddenCaptureLayers.size();

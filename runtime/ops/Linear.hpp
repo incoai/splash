@@ -41,10 +41,11 @@ struct Q4Projection final {
   uint32_t inputSize = 0;
   // Non-empty: a GGUF GGUF projection; weights/scales/biases are unused.
   std::vector<GgufSegment> gguf{};
-  // GDN out_proj: the weight's K columns follow llama.cpp's tiled value-head order while the
-  // activation is grouped; key_heads | (groups << 16) makes the kernels remap K (0 = identity).
-  uint32_t ggufPermuteK = 0;
+  // GDN out_proj: permute 128-wide input head blocks (grouped -> tiled) first.
+  bool ggufPermuteHeads = false;
   metal::MetalBuffer kqPartials{};    // fp32 split-K partials scratch (shared)
+  metal::MetalBuffer kqPermuted{};    // bf16 permuted activations scratch (shared)
+  metal::MetalBuffer kqPermutation{}; // uint32 head permutation table
   metal::MetalBuffer kqCounters{};    // split-K arrival counters (one uint per 64-column tile, zero at rest)
 };
 

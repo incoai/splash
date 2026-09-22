@@ -14,10 +14,8 @@ struct GgufParams {
   uint32_t persistent_groups; // decode: threadgroups (>= tiles); split-K: splits
   uint32_t out_stride;        // row stride of the destination (0 = output_size)
   uint32_t out_offset;        // first destination column of this segment
-  uint32_t k_permute;         // 0, or key_heads | (groups << 16): the weight's K columns follow
-                              // llama.cpp's tiled value-head order while the activation is grouped
 };
-static_assert(sizeof(GgufParams) == 24, "GGUF parameters are 24 bytes on both sides");
+static_assert(sizeof(GgufParams) == 20, "GGUF parameters are 20 bytes on both sides");
 
 struct GgufReduceParams {
   uint32_t splits;
@@ -35,6 +33,13 @@ struct GgufEmbedParams {
   uint32_t hidden;
 };
 static_assert(sizeof(GgufEmbedParams) == 12, "GGUF embedding parameters are 12 bytes on both sides");
+
+struct GgufPermuteParams {
+  uint32_t rows;
+  uint32_t width;
+  uint32_t block;
+};
+static_assert(sizeof(GgufPermuteParams) == 12, "GGUF permute parameters are 12 bytes on both sides");
 
 // Runtime format ids for kernels that select the dequantizer per tile.
 #define GGUF_FMT_Q4K 0u
@@ -79,9 +84,8 @@ struct GgufSplitParams {
   uint32_t out_stride;
   uint32_t out_offset;
   uint32_t epilogue;
-  uint32_t k_permute;         // as GgufParams::k_permute
 };
-static_assert(sizeof(GgufSplitParams) == 28, "GGUF split parameters are 28 bytes on both sides");
+static_assert(sizeof(GgufSplitParams) == 24, "GGUF split parameters are 24 bytes on both sides");
 
 // One dispatch over up to three column segments of different formats (fused qkv|z|ab, q|k|v).
 struct GgufFusedParams {
