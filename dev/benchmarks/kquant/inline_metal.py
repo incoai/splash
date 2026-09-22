@@ -4,7 +4,7 @@ import os
 import re
 import sys
 
-ROOT = os.path.expanduser("~/dev/splash/runtime")
+ROOT = os.environ.get("SPLASH_RUNTIME", os.path.expanduser("~/dev/splash/runtime"))
 seen = set()
 
 

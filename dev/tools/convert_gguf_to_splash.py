@@ -357,7 +357,9 @@ def main():
     if not a.skip_embedding:
         w = Writer(os.path.join(a.out, "target", "embedding.bin"), 0, 3)
         x, ty, N, K = raw("token_embd.weight")
-        assert ty == "Q4_K"
+        # Native rows, gathered by kq_embed_<type>; the descriptor carries the type.
+        assert ty in ("Q4_K", "Q6_K", "Q8_0"), f"unsupported embedding type {ty}"
+        types_used["token_embd"] = ty
         desc = (
             struct.pack("<8I", TYPE_ID[ty], N, K, 0, 0, 0, 0, 0)
             + struct.pack("<3Q", x.nbytes, 0, 0)
