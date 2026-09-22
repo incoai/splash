@@ -1,9 +1,22 @@
 #include "Normalization.hpp"
 
+#include "metal/abi/ExecutionGeometry.h"
+
 #include <utility>
 #include <stdexcept>
 
 namespace splash::ops {
+namespace {
+// The staging array in norm_rms_staged bounds the row width it can hold. Both
+// served models normalize rows of 2048 or 5120 bfloat, so the bound costs
+// nothing today; wider rows keep the unstaged kernel. The kernel binds bfloat4
+// views, so callers pass 8-byte aligned buffers, which every arena and weight
+// section already is. The 1024-thread dispatch is a hard requirement: every
+// supported GPU family admits it, and the backend throws rather than running
+// a pipeline that cannot.
+constexpr uint32_t kStagedWidth = SPLASH_STAGED_NORM_WIDTH;
+constexpr uint32_t kStagedThreads = SPLASH_STAGED_NORM_THREADS;
+} // namespace
 
 void Normalization::addRms(metal::CommandGraph &graph,
                            metal::MetalBuffer input,
@@ -16,6 +29,12 @@ void Normalization::addRms(metal::CommandGraph &graph,
       throw std::invalid_argument("Q4 normalization scratch is below requirement");
     graph.add("norm_rms_q4_decode", {input, weight, output, scratch.input, scratch.sums},
               width, {rows, 1, 1});
+    return;
+  }
+  if (width <= kStagedWidth && width % 4 == 0) {
+    graph.add("norm_rms_staged",
+              {std::move(input), std::move(weight), std::move(output)}, width,
+              {rows, 1, 1}, {kStagedThreads, 1, 1});
     return;
   }
   graph.add("norm_rms",

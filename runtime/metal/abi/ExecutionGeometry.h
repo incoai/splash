@@ -31,4 +31,10 @@
 // prefill/gdn.metal ties the two literals together.
 #define SPLASH_GDN_SCAN_STATE_ROWS 16u
 #define SPLASH_GDN_SCAN_THREADS 128u
+// Widest row norm_rms_staged holds in threadgroup memory, and the thread count
+// its load and store loops stride by. shared/normalization.metal sizes the
+// staging array from the width and ops/Normalization.cpp selects the kernel
+// and dispatch width from the same two literals.
+#define SPLASH_STAGED_NORM_WIDTH 5120u
+#define SPLASH_STAGED_NORM_THREADS 1024u
 #define SPLASH_ALLOCATION_EXTENT_TARGET_BYTES (128ull * 1024ull * 1024ull)

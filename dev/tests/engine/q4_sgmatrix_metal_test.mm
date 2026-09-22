@@ -156,13 +156,47 @@ void fusedNorm(metal::MetalBackend &backend, uint32_t k, uint32_t rows) {
   for (uint32_t i=0;i<k*rows;++i) x[i]=floatToBf16(float(int(hash(i)%257)-128)*8192);
   for (uint32_t i=0;i<k;++i) w[i]=floatToBf16(float(int(i%17)-8)/4);
   metal::CommandGraph graph;
-  Normalization::addRms(graph,input,weight,output,k,rows);
+  graph.add("norm_rms",{input,weight,output},k,{rows,1,1});
   graph.add("decode_linear_q4_prepare",{output,a,sa},k,{k/32,rows/8,1},{128,1,1});
   Normalization::addRms(graph,input,weight,fused,k,rows,{b,sb,{},{}});
   (void)backend.submitCommand(graph.dispatches());
   require(!std::memcmp(output.contents(),fused.contents(),k*rows*2),"fused norm changed bf16 output");
   require(!std::memcmp(a.contents(),b.contents(),k*rows*2),"fused operand permutation mismatch");
   require(!std::memcmp(sa.contents(),sb.contents(),k*rows/16),"fused input sums mismatch");
+}
+// norm_rms_staged must agree with norm_rms byte for byte, so the comparison is
+// a memcmp: a tolerance would hide a changed reduction order, and the order is
+// the one thing the staged dispatch shape may not change. The case also
+// checks that addRms selected the staged kernel for these widths.
+void stagedNorm(metal::MetalBackend &backend, uint32_t width, uint32_t rows) {
+  const uint64_t bytes = uint64_t{width} * rows * 2;
+  auto input = backend.allocateBuffer(bytes), weight = backend.allocateBuffer(width * 2);
+  Guarded baseline(backend, bytes), staged(backend, bytes);
+  auto *x = static_cast<uint16_t *>(input.contents());
+  auto *w = static_cast<uint16_t *>(weight.contents());
+  for (uint32_t trial = 0; trial < 8; ++trial) {
+    const uint32_t seed = hash(trial * 0x9e3779b9u + width * 131u + rows);
+    // Exponents around one keep the squared sum finite in bf16 and fp32 alike.
+    for (uint64_t i = 0; i < uint64_t{width} * rows; ++i) {
+      const uint32_t r = hash(seed + uint32_t(i));
+      x[i] = uint16_t((0x3000u + r % 0x1200u) | ((r >> 20 & 1u) << 15));
+    }
+    for (uint32_t i = 0; i < width; ++i) {
+      const uint32_t r = hash(seed ^ (i + 1));
+      w[i] = uint16_t((0x3000u + r % 0x1200u) | ((r >> 20 & 1u) << 15));
+    }
+    metal::CommandGraph graph;
+    graph.add("norm_rms", {input, weight, baseline.view}, width, {rows, 1, 1});
+    Normalization::addRms(graph, input, weight, staged.view, width, rows);
+    require(graph.dispatches().back().pipelineName == "norm_rms_staged",
+            "addRms did not select the staged kernel");
+    (void)backend.submitCommand(graph.dispatches());
+    require(std::memcmp(x, baseline.view.contents(), bytes) != 0, "normalization wrote nothing");
+    require(!std::memcmp(baseline.view.contents(), staged.view.contents(), bytes),
+            "staged normalization is not bit-identical");
+  }
+  baseline.check();
+  staged.check();
 }
 void fusedAttentionGate(metal::MetalBackend &backend, uint32_t heads, uint32_t kvHeads, uint32_t lanes) {
   const uint32_t width = heads * 256, packedWidth = 2 * width + 2 * kvHeads * 256;
@@ -213,6 +247,8 @@ int main(int argc,char **argv) {
       }
     for (uint32_t width : {64U, 320U, 2048U, 5120U, 17408U})
       for (uint32_t rows : {8U,16U,24U,32U}) fusedNorm(backend, width, rows);
-    std::cout << "Q4 simdgroup: PASS cases=" << cases << " (fp64, range, cancellation, guards, repeated dispatch, fused norm)\n";
+    for (uint32_t width : {2048U, 5120U})
+      for (uint32_t rows : {8U,16U,24U,32U}) stagedNorm(backend, width, rows);
+    std::cout << "Q4 simdgroup: PASS cases=" << cases << " (fp64, range, cancellation, guards, repeated dispatch, fused norm, staged norm)\n";
   } catch (const std::exception &e) { std::cerr << "Q4 simdgroup: FAIL: " << e.what() << '\n'; return 1; }
 }
