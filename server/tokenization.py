@@ -36,6 +36,17 @@ class PromptTokenizer:
         # normalization/pretokenization. Do not assume this for other pipelines.
         if type(backend.model).__name__ != "BPE" or backend.model.dropout:
             return False
+        if backend.pre_tokenizer is None:
+            return False
+        pre = json.loads(backend.pre_tokenizer.__getstate__())
+        parts = pre["pretokenizers"] if pre.get("type") == "Sequence" else [pre]
+        if [part.get("type") for part in parts] not in (
+            ["ByteLevel"],
+            ["Split", "ByteLevel"],
+        ) or parts[-1].get("add_prefix_space"):
+            # For example, Metaspace's prepend_scheme="first" depends on
+            # whether a segment starts the complete input, not just a split.
+            return False
         for component, allowed in (
             (backend.normalizer, {"NFC"}),
             (backend.post_processor, {"ByteLevel"}),

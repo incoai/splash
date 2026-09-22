@@ -145,3 +145,23 @@ class PromptTokenizationTests(unittest.TestCase):
         text = "Hello world!" * 500 + "hello<|im_end|>suffix"
         self.assert_encoding(text, cache)
         self.assertEqual(cache.stats()["entries"], 0)
+
+    def test_input_start_sensitive_pretokenizer_falls_back(self):
+        backend = Tokenizer(models.BPE())
+        backend.pre_tokenizer = pre_tokenizers.Metaspace(prepend_scheme="first")
+        backend.post_processor = processors.ByteLevel(trim_offsets=False)
+        backend.train_from_iterator(
+            ["hello world tail"],
+            trainers.BpeTrainer(vocab_size=50, show_progress=False),
+        )
+        backend.add_special_tokens([AddedToken("<|im_end|>", normalized=False)])
+        t = PreTrainedTokenizerFast(tokenizer_object=backend)
+        cache = PromptTokenizer(t)
+        self.assertFalse(cache.enabled)
+        prefix, tail = "hello world " * 500 + "<|im_end|>", "tail"
+        expected = t(prefix + tail, add_special_tokens=False)["input_ids"]
+        split = t(prefix, add_special_tokens=False)["input_ids"]
+        split += t(tail, add_special_tokens=False)["input_ids"]
+        self.assertNotEqual(split, expected)
+        self.assertEqual(cache.encode(prefix + tail), expected)
+        self.assertEqual(cache.stats()["entries"], 0)
