@@ -88,12 +88,23 @@ depends on available memory.
 - `--port`: HTTP port. Defaults to `SPLASH_PORT` or `8000`.
 - `--max-memory`: ceiling on Metal allocations, e.g. `28G`. Default: auto.
 - `--max-context`: context limit, up to `256K`, e.g. `100K`. Default: auto.
-- `--kv-format`: target KV cache storage, `int8` (default) or `bf16`. BF16 avoids KV quantization, uses approximately twice the KV memory, and can be slower at long contexts. Model weights are unchanged. The format is fixed while the server is running.
+- `--kv-format`: target KV cache storage, `int8` (default) or `bf16`.
 - `--max-image-pixels`: maximum resized pixels per image. Default: 4,194,304.
 - `--allowed-host`: extra HTTP `Host` name to accept, not a bind address. Repeatable.
 - `--api-key`: require this key on API requests, as a bearer token or
   `x-api-key`. Defaults to `SPLASH_API_KEY`.
 - `--no-webui`: turn off the chat page.
+
+To use BF16 target KV, select it when starting the server:
+
+```bash
+splash serve --model incoai/Qwen3.8-27B-Splash --kv-format bf16
+```
+
+BF16 avoids target KV quantization, uses approximately twice the target KV
+memory, and can be slower at long contexts. Model weights are unchanged.
+Restart the server to switch formats. Omit `--kv-format` or use
+`--kv-format int8` for the default INT8 cache.
 
 If the model does not fit in the memory available, startup prints a memory
 budget breakdown and stops.
