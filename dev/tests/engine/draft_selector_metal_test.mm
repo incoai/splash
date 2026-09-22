@@ -350,6 +350,90 @@ void mixedVerify(MetalBackend &backend, uint32_t lanes, uint32_t samplingMask) {
   }
 }
 
+// Top-k=1 and constrained greedy must agree with a full-vocabulary CPU
+// argmax, including ties, row offsets and masks. Poison every scratch/output
+// buffer: the compact path must not consume stale top-32 entries.
+void targetTop1(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes) {
+  const uint32_t rows = lanes * kRows;
+  const uint32_t words = (vocabulary + 31) / 32;
+  const auto space = Sampling::workspace(rows);
+  Sampling sampling(backend, vocabulary, kRows);
+  SamplingBuffers b{
+      allocate(backend, uint64_t{rows} * vocabulary * 2),
+      allocate(backend, space.partialIdsBytes),
+      allocate(backend, space.partialValuesBytes),
+      allocate(backend, space.topIdsBytes),
+      allocate(backend, space.topProbabilitiesBytes),
+      allocate(backend, uint64_t{lanes} * 2 * kRows * sizeof(float)),
+      allocate(backend, uint64_t{lanes} * (kRows + 1) * words * 4),
+      allocate(backend, uint64_t{rows} * sizeof(uint32_t)),
+      allocate(backend, space.argmaxValuesBytes),
+      allocate(backend, space.argmaxIndicesBytes)};
+  auto *logits = static_cast<uint16_t *>(b.logits.contents());
+  auto *masks = static_cast<uint32_t *>(b.constraintMasks.contents());
+  for (uint32_t row = 0; row < rows; ++row)
+    for (uint32_t token = 0; token < vocabulary; ++token)
+      logits[uint64_t{row} * vocabulary + token] =
+          toBfloat(float(int((token * 7 + row * 13) % 23) - 11));
+  for (uint32_t row = 0; row < lanes * (kRows + 1); ++row)
+    for (uint32_t token = 0; token < vocabulary; ++token)
+      if ((token + row) % 17 == 0)
+        masks[uint64_t{row} * words + token / 32] |= 1U << (token % 32);
+  auto expected = [&](uint32_t row, uint32_t maskRow) {
+    float best = -INFINITY;
+    uint32_t id = ~0U;
+    for (uint32_t token = 0; token < vocabulary; ++token) {
+      if (!(masks[uint64_t{maskRow} * words + token / 32] & (1U << (token % 32))))
+        continue;
+      const float value = fromBfloat(logits[uint64_t{row} * vocabulary + token]);
+      if (value > best) { best = value; id = token; }
+    }
+    return id;
+  };
+  auto poison = [&] {
+    for (const auto &buffer : {b.partialIds, b.partialValues, b.topIds,
+                              b.topProbabilities, b.outputTokens})
+      std::memset(buffer.contents(), 0xA5, buffer.sizeBytes());
+  };
+  auto check = [&](uint32_t row, uint32_t id) {
+    const auto *ids = static_cast<uint32_t *>(b.topIds.contents());
+    const auto *probabilities = static_cast<float *>(b.topProbabilities.contents());
+    double mass = 0;
+    for (uint32_t rank = 0; rank < 32; ++rank) {
+      const uint32_t index = row * 32 + rank;
+      require(std::isfinite(probabilities[index]), "nonfinite target probability");
+      require(probabilities[index] == (ids[index] == id ? 1.0F : 0.0F),
+              "top-1 target differs from masked CPU argmax");
+      mass += probabilities[index];
+    }
+    require(mass == 1.0, "top-1 target is not normalized");
+  };
+  for (const float temperature : {0.0F, 0.8F}) {
+    poison();
+    CommandGraph initial;
+    sampling.addInitial(initial, {1, temperature, 0.5F, true}, b, kRows - 1);
+    static_cast<void>(backend.submitCommand(initial.dispatches()));
+    const uint32_t id = expected(kRows - 1, 0);
+    require(static_cast<uint32_t *>(b.outputTokens.contents())[0] == id,
+            "initial target differs from masked CPU argmax");
+    check(0, id);
+  }
+  poison();
+  std::vector<SamplingPolicy> policies(lanes);
+  for (uint32_t lane = 0; lane < lanes; ++lane)
+    policies[lane] = {1, lane % 2 ? 0.8F : 0.0F, 0.5F, true};
+  CommandGraph verify;
+  sampling.addVerify(verify, policies, b);
+  static_cast<void>(backend.submitCommand(verify.dispatches()));
+  for (uint32_t row = 0; row < rows; ++row) {
+    const uint32_t maskRow = row / kRows * (kRows + 1) + row % kRows + 1;
+    const uint32_t id = expected(row, maskRow);
+    check(row, id);
+    require(static_cast<uint32_t *>(b.outputTokens.contents())[row] == id,
+            "batched target differs from masked CPU argmax");
+  }
+}
+
 void invalidRequests(MetalBackend &backend) {
   Sampling sampling(backend, 1024, kRows);
   const auto workspace = Sampling::draftWorkspace(kPositions);
@@ -386,6 +470,9 @@ int main(int argc, char **argv) {
       throw std::invalid_argument("usage: draft-selector METALLIB");
     MetalBackend backend(argv[1]);
     invalidRequests(backend);
+    for (const uint32_t vocabulary : {1003U, 248320U})
+      for (uint32_t lanes = 1; lanes <= kLanes; ++lanes)
+        targetTop1(backend, vocabulary, lanes);
     for (uint32_t lanes = 1; lanes <= kLanes; ++lanes)
       for (uint32_t mask = 0; mask < (1U << lanes); ++mask)
         mixedVerify(backend, lanes, mask);

@@ -23,9 +23,9 @@ inline void top_insert(thread float *values, thread uint *ids, float value,
 template <uint K>
 __attribute__((always_inline)) inline void top_shard_store(
     thread float (&local_values)[K], thread uint (&local_ids)[K],
-    threadgroup float (&group_values)[8 * K],
-    threadgroup uint (&group_ids)[8 * K], device uint *partial_ids,
-    device float *partial_values, uint group, uint thread_index, uint lane,
+    threadgroup float *group_values, threadgroup uint *group_ids,
+    device uint *partial_ids, device float *partial_values,
+    uint group, uint thread_index, uint lane,
     uint simd_group) {
   uint cursor = 0;
   for (uint rank = 0; rank < K; ++rank) {
@@ -61,6 +61,35 @@ __attribute__((always_inline)) inline void top_shard_store(
   }
 }
 
+// Keep the existing sparse-buffer layout for both top-1 and top-32. The
+// choice is uniform across a threadgroup; greedy lanes need only one winner.
+template <uint K>
+__attribute__((always_inline)) inline void target_top_shard(
+    device const bfloat *source, uint vocabulary,
+    device const uint *token_mask, bool constrained, ulong mask_origin,
+    device uint *partial_ids, device float *partial_values,
+    uint group, uint thread_index, uint lane, uint simd_group,
+    threadgroup float *group_values, threadgroup uint *group_ids) {
+  constexpr uint Shards = SPLASH_TARGET_SAMPLING_SHARDS;
+  float values[K];
+  uint ids[K];
+  for (uint i = 0; i < K; ++i) {
+    values[i] = -INFINITY;
+    ids[i] = 0xffffffffu;
+  }
+  for (uint token = (group % Shards) * 256 + thread_index; token < vocabulary;
+       token += Shards * 256) {
+    if (constrained &&
+        (token_mask[mask_origin + token / 32] & (1u << (token % 32))) == 0)
+      continue;
+    top_insert<K>(values, ids, float(source[token]), token);
+  }
+  top_shard_store<K>(values, ids, group_values, group_ids,
+                     partial_ids + ulong(group) * 32,
+                     partial_values + ulong(group) * 32,
+                     0, thread_index, lane, simd_group);
+}
+
 // Merges the Shards partials of one row into its sorted top-K.
 template <uint K, uint Shards>
 __attribute__((always_inline)) inline void top_partials_reduce(
@@ -79,11 +108,31 @@ __attribute__((always_inline)) inline void top_partials_reduce(
 // One row's sparse target distribution: the merged top-32 is softmaxed at
 // temperature over its first top_k entries, truncated by top_p, renormalized
 // and written in ascending token-id order; slots past the valid count carry
-// ~0u. The constant references keep the divisions inside the loops.
+// ~0u. Top-k=1 stores only its unit-probability winner. The constant
+// references keep the divisions inside the loops.
 __attribute__((always_inline)) inline void top32_probs_row(
     device const uint *partial_ids, device const float *partial_values,
     device uint *top_ids, device float *top_probs, uint row,
     constant uint &top_k, constant float &temperature, constant float &top_p) {
+  if (top_k == 1) {
+    float best = -INFINITY;
+    uint token = 0xffffffffu;
+    for (uint shard = 0; shard < SPLASH_TARGET_SAMPLING_SHARDS; ++shard) {
+      ulong index = (ulong(row) * SPLASH_TARGET_SAMPLING_SHARDS + shard) * 32;
+      float value = partial_values[index];
+      uint id = partial_ids[index];
+      if (value > best || (value == best && id < token)) {
+        best = value;
+        token = id;
+      }
+    }
+    for (uint rank = 0; rank < 32; ++rank) {
+      top_ids[ulong(row) * 32 + rank] = rank == 0 ? token : 0xffffffffu;
+      top_probs[ulong(row) * 32 + rank] =
+          rank == 0 && token != 0xffffffffu ? 1.0f : 0.0f;
+    }
+    return;
+  }
   float values[32];
   uint ids[32];
   top_partials_reduce<32, SPLASH_TARGET_SAMPLING_SHARDS>(partial_ids, partial_values, row, values, ids);
@@ -143,31 +192,22 @@ decode_sample_top32_sharded(device const bfloat *logits [[buffer(0)]],
                      uint thread_index [[thread_index_in_threadgroup]],
                      uint lane [[thread_index_in_simdgroup]],
                      uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  constexpr uint Shards = SPLASH_TARGET_SAMPLING_SHARDS;
-  uint row = group / Shards;
-  uint shard = group % Shards;
   threadgroup float group_values[8 * 32];
   threadgroup uint group_ids[8 * 32];
+  uint row = group / SPLASH_TARGET_SAMPLING_SHARDS;
   device const bfloat *source =
       logits + ulong(params.row_offset + row) * params.vocabulary;
-  float local_values[32];
-  uint local_ids[32];
-  for (uint i = 0; i < 32; ++i) {
-    local_values[i] = -INFINITY;
-    local_ids[i] = 0xffffffffu;
-  }
-  for (uint token = shard * 256 + thread_index; token < params.vocabulary;
-       token += Shards * 256) {
-    uint mask_row = params.mask_row_offset + row;
-    if (params.constrained &&
-        (token_mask[mask_row * params.mask_words + token / 32] &
-         (1u << (token % 32))) == 0)
-      continue;
-    top_insert<32>(local_values, local_ids, float(source[token]), token);
-  }
-  top_shard_store<32>(local_values, local_ids, group_values, group_ids,
-                      partial_ids, partial_values, group, thread_index, lane,
-                      simd_group);
+  ulong mask_origin = ulong(params.mask_row_offset + row) * params.mask_words;
+  if (params.top_k == 1)
+    target_top_shard<1>(source, params.vocabulary, token_mask, params.constrained,
+                        mask_origin, partial_ids, partial_values,
+                        group, thread_index, lane, simd_group,
+                        group_values, group_ids);
+  else
+    target_top_shard<32>(source, params.vocabulary, token_mask, params.constrained,
+                         mask_origin, partial_ids, partial_values,
+                         group, thread_index, lane, simd_group,
+                         group_values, group_ids);
 }
 
 kernel void decode_sample_sparse_top1(device const uint *top_ids [[buffer(0)]],
@@ -214,36 +254,28 @@ kernel void decode_sample_top32_sharded_batch(
     uint thread_index [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  constexpr uint Shards = SPLASH_TARGET_SAMPLING_SHARDS;
-  uint global_row = group / Shards;
-  uint shard = group % Shards;
+  threadgroup float group_values[8 * 32];
+  threadgroup uint group_ids[8 * 32];
+  uint global_row = group / SPLASH_TARGET_SAMPLING_SHARDS;
   uint batch = global_row / params.rows_per_lane;
   uint row = global_row % params.rows_per_lane;
   if (batch >= params.lanes)
     return;
-  threadgroup float group_values[8 * 32];
-  threadgroup uint group_ids[8 * 32];
   device const bfloat *source = logits + ulong(global_row) * params.vocabulary;
-  float local_values[32];
-  uint local_ids[32];
-  for (uint i = 0; i < 32; ++i) {
-    local_values[i] = -INFINITY;
-    local_ids[i] = 0xffffffffu;
-  }
   bool constrained = (params.constrained_mask & (1u << batch)) != 0;
   ulong mask_origin =
       ulong(batch) * (SPLASH_TARGET_VERIFY_ROWS + 1) * params.mask_words +
       ulong(row + 1) * params.mask_words;
-  for (uint token = shard * 256 + thread_index; token < params.vocabulary;
-       token += Shards * 256) {
-    if (constrained &&
-        (token_mask[mask_origin + token / 32] & (1u << (token % 32))) == 0)
-      continue;
-    top_insert<32>(local_values, local_ids, float(source[token]), token);
-  }
-  top_shard_store<32>(local_values, local_ids, group_values, group_ids,
-                      partial_ids, partial_values, group, thread_index, lane,
-                      simd_group);
+  if (params.top_k[batch] == 1)
+    target_top_shard<1>(source, params.vocabulary, token_mask, constrained,
+                        mask_origin, partial_ids, partial_values,
+                        group, thread_index, lane, simd_group,
+                        group_values, group_ids);
+  else
+    target_top_shard<32>(source, params.vocabulary, token_mask, constrained,
+                         mask_origin, partial_ids, partial_values,
+                         group, thread_index, lane, simd_group,
+                         group_values, group_ids);
 }
 
 kernel void decode_sample_top32_probs_batch(
