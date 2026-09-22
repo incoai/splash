@@ -133,7 +133,7 @@ Qwen3.8-27B can be served straight from a llama.cpp GGUF (for example Unsloth's
 may select:
 
 ```json
-"format": {"name": "gguf", "target_layer_magic": "MDKQ0001", ...},
+"format": {"name": "gguf", "target_layer_magic": "MDGG0001", ...},
 "target": {"gguf": {"repo_id": "unsloth/Qwen3.8-27B-GGUF", "revision": "<commit>",
                     "variants": {"UD-Q4_K_M": {"file": "Qwen3.8-27B-UD-Q4_K_M.gguf",
                                                "size": 16464440224, "sha256": "..."}, ...}}}
@@ -146,9 +146,9 @@ files and that one GGUF into the Hub cache, checks them against the manifest, an
 subdirectories of one root). Nothing is written to disk besides the download.
 
 At load time the engine parses the GGUF header (`runtime/model/GgufFile.cpp`), plans one
-in-memory image per layer in the `MDKQ0001` layout (`GgufImage.cpp`: descriptor, payload plane,
+in-memory image per layer in the `MDGG0001` layout (`GgufImage.cpp`: descriptor, payload plane,
 optional high-bit plane and superblock headers in 256-column tiles, small tensors converted on
-the CPU) and fills it with the `kq_repack` / `kq_copy` kernels reading the mmapped file
+the CPU) and fills it with the `gguf_repack` / `gguf_copy` kernels reading the mmapped file
 (`GgufTarget.cpp`). The images are anonymous Metal memory, so under memory pressure they are
 compressed or swapped rather than dropped and refaulted like mapped package files. Supported
 tensor types are Q4_K, Q5_K, Q6_K, Q3_K, IQ4_XS, IQ4_NL, Q8_0 and IQ3_S for linears and Q4_K,
@@ -158,7 +158,7 @@ and Q8_0; the 2-bit, IQ2/IQ3_XXS, IQ1, Q4_0/Q4_1 and BF16-bearing files need ker
 exist yet.
 
 The GEMM kernels are in
-`runtime/metal/kernels/shared/kquant.metal` (ABI in `runtime/metal/abi/KQuant.h`), the dispatch
+`runtime/metal/kernels/shared/gguf_linear.metal` (ABI in `runtime/metal/abi/Gguf.h`), the dispatch
 policy in `runtime/ops/Linear.cpp`, and `make test-engine-metal` checks the kernels against fp64
 and, with `SPLASH_GGML_ORACLE=<libggml-base.dylib>`, against upstream GGML's dequantization.
 

@@ -2,7 +2,7 @@
 
 // Loads a Qwen3.8 target straight from a llama.cpp GGUF: each layer image is
 // planned (GgufImage), allocated as one anonymous Metal buffer, filled by the
-// CPU (header, descriptors, small tensors) and by the kq_repack / kq_copy
+// CPU (header, descriptors, small tensors) and by the gguf_repack / gguf_copy
 // kernels reading the mmapped file, then handed out as a WeightFile so the
 // section readers are the ones used for packed files.
 

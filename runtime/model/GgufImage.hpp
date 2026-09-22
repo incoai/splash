@@ -1,6 +1,6 @@
 #pragma once
 
-// Plans the in-memory MDKQ0001 images of a Qwen3.8 target read straight from a
+// Plans the in-memory MDGG0001 images of a Qwen3.8 target read straight from a
 // llama.cpp GGUF: section offsets, the bytes the CPU fills (header, descriptors,
 // norms, convolution, decay, time bias, alpha/beta) and the GPU repacks/copies
 // that move quantized rows into 256-column tiles. Layout: 16-byte header
@@ -12,13 +12,13 @@
 #include <string>
 #include <vector>
 
-#include "metal/abi/KQuant.h"
+#include "metal/abi/Gguf.h"
 #include "model/GgufFile.hpp"
 
 namespace splash::model::gguf {
 
 inline constexpr uint64_t kSectionAlignment = 16384;
-inline constexpr char kImageMagic[9] = "MDKQ0001";
+inline constexpr char kImageMagic[9] = "MDGG0001";
 
 struct TargetGeometry {
   uint32_t layers = 64;
@@ -42,12 +42,12 @@ struct Fill {
   std::vector<uint8_t> bytes;
 };
 struct Repack {
-  KQRepackParams params{}; // src_offset is relative to sourceOffset until the executor binds it
+  GgufRepackParams params{}; // src_offset is relative to sourceOffset until the executor binds it
   uint64_t sourceOffset = 0; // absolute file offset of the tensor data
   uint64_t sourceBytes = 0;
 };
 struct Copy {
-  KQCopyParams params{};
+  GgufCopyParams params{};
   uint64_t sourceOffset = 0;
   uint64_t sourceBytes = 0;
 };

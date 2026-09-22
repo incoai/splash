@@ -42,13 +42,13 @@ void validateLayout(const Qwen3_8Layout &layout) {
 
 Qwen3_8Weights loadQwen3_8Weights(metal::MetalBackend &backend,
                                   const std::filesystem::path &directory,
-                                  Qwen3_8Layout layout, bool kquant) {
+                                  Qwen3_8Layout layout, bool ggufTarget) {
   validateLayout(layout);
   auto readFfn = [&](WeightFile &file, Qwen3_8LayerWeights &layer) {
-    if (kquant) {
-      layer.gateProjection = readKQuantProjection(file, "mlp-gate");
-      layer.upProjection = readKQuantProjection(file, "mlp-up");
-      layer.downProjection = readKQuantProjection(file, "mlp-down");
+    if (ggufTarget) {
+      layer.gateProjection = readGgufProjection(file, "mlp-gate");
+      layer.upProjection = readGgufProjection(file, "mlp-up");
+      layer.downProjection = readGgufProjection(file, "mlp-down");
       return;
     }
     layer.gateProjection = readQ4Projection(
@@ -62,7 +62,7 @@ Qwen3_8Weights loadQwen3_8Weights(metal::MetalBackend &backend,
         "mlp-down");
   };
   Qwen3_8Weights weights;
-  if (kquant) {
+  if (ggufTarget) {
     // The target directory holds the llama.cpp GGUF; every layer image is
     // repacked into memory as it is read.
     gguf::TargetGeometry geometry;
@@ -90,23 +90,23 @@ Qwen3_8Weights loadQwen3_8Weights(metal::MetalBackend &backend,
     weights = loadQwenTargetWeights<Qwen3_8Weights>(backend, directory, layout, kHeadMagic,
                                                     readFfn);
   }
-  if (!kquant) return weights;
-  // Shared scratch for the K-quant kernels: split-K partials (8 splits x 32 rows x
+  if (!ggufTarget) return weights;
+  // Shared scratch for the GGUF kernels: split-K partials (8 splits x 32 rows x
   // widest projection), permuted GDN out_proj activations for the prefill budget,
   // and the grouped -> tiled value-head permutation.
   const uint32_t widest = std::max({layout.packedGdnWidth, layout.packedFullWidth,
                                     layout.intermediateSize, layout.hiddenSize});
   metal::MetalBuffer partials = backend.allocateBuffer(
-      uint64_t{8} * 32 * widest * 4, metal::BufferStorage::Shared, "kquant-partials");
+      uint64_t{8} * 32 * widest * 4, metal::BufferStorage::Shared, "gguf-partials");
   metal::MetalBuffer permuted = backend.allocateBuffer(
       uint64_t{SPLASH_PREFILL_TOKEN_BUDGET} * layout.attentionWidth * 2,
-      metal::BufferStorage::Shared, "kquant-permuted");
+      metal::BufferStorage::Shared, "gguf-permuted");
   const uint32_t heads = layout.gdnValueHeads, keyHeads = layout.gdnKeyHeads;
   const uint32_t perHead = heads / keyHeads;
   metal::MetalBuffer permutation = backend.allocateBuffer(
-      uint64_t{heads} * 4, metal::BufferStorage::Shared, "kquant-permutation");
+      uint64_t{heads} * 4, metal::BufferStorage::Shared, "gguf-permutation");
   metal::MetalBuffer counters = backend.allocateBuffer(
-      uint64_t{widest / 64} * 4, metal::BufferStorage::Shared, "kquant-counters");
+      uint64_t{widest / 64} * 4, metal::BufferStorage::Shared, "gguf-counters");
   std::memset(counters.contents(), 0, counters.sizeBytes());
   auto *table = static_cast<uint32_t *>(permutation.contents());
   for (uint32_t tiled = 0; tiled < heads; ++tiled)

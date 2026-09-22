@@ -1,16 +1,16 @@
-// GGUF K-quant GEMMs for Apple9 and Apple10.
+// GGUF quantized GEMMs (K-quants, i-quants, Q8_0) for Apple9 and Apple10.
 // Decode weights with FP32 group coefficients, then round once to the half tile,
 // matching llama.cpp Metal dequantize.h / mul_mm.metal. Keep activations BF16.
 // Weight layout: plane0 [tile(256 cols)][group32][256 cols][P0 bytes], plane1 likewise with P1 bytes (0 = none).
 // Metadata: [tile][unit][256 cols][MetaBytes], unit = super-block (256 K) or group32 (IQ4_NL, Q8_0).
 // Activations fp16 or bf16 [rows][K]; weights staged as fp16 in threadgroup memory; fp32 accumulation; bf16 output.
-#include "metal/abi/KQuant.h"
+#include "metal/abi/Gguf.h"
 
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 #include <metal_stdlib>
 using namespace metal;
 using namespace mpp::tensor_ops;
-enum Epilogue : ushort { EpNone = KQ_EPILOGUE_NONE, EpResidual = KQ_EPILOGUE_RESIDUAL, EpUpWithGate = KQ_EPILOGUE_UP_WITH_GATE };
+enum Epilogue : ushort { EpNone = GGUF_EPILOGUE_NONE, EpResidual = GGUF_EPILOGUE_RESIDUAL, EpUpWithGate = GGUF_EPILOGUE_UP_WITH_GATE };
 inline float silu_gate(float g) { return g / (1.0f + fast::exp2(-1.44269504089f * g)); }
 constant constexpr ushort kStorageN = 256;
 constant half kIQ4NL[16] = {-127.0h, -104.0h, -83.0h, -65.0h, -49.0h, -35.0h, -22.0h, -10.0h, 1.0h, 13.0h, 25.0h, 38.0h, 53.0h, 69.0h, 89.0h, 113.0h};
@@ -378,9 +378,9 @@ inline void pf_tile(device TA *input, device uchar *w0, device uchar *w1, device
   threadgroup half2 tl[F::TgLut ? F::TgLut : 1];                                                          \
   if constexpr (F::TgLut) { for (uint i = simd_group * 32 + simd_lane; i < F::TgLut; i += Threads) tl[i] = kIQ4NL2[i]; threadgroup_barrier(mem_flags::mem_threadgroup); }
 #define ABUF(TA) device TA *input [[buffer(0)]], device uchar *w0 [[buffer(1)]], device uchar *w1 [[buffer(2)]], \
-                 device uchar *meta [[buffer(3)]], device bfloat *output [[buffer(4)]], constant KQParams &p [[buffer(5)]]
+                 device uchar *meta [[buffer(3)]], device bfloat *output [[buffer(4)]], constant GgufParams &p [[buffer(5)]]
 #define ABUFE device bfloat *input [[buffer(0)]], device uchar *w0 [[buffer(1)]], device uchar *w1 [[buffer(2)]], \
-                 device uchar *meta [[buffer(3)]], device bfloat *output [[buffer(4)]], device bfloat *aux [[buffer(5)]], constant KQParams &p [[buffer(6)]]
+                 device uchar *meta [[buffer(3)]], device bfloat *output [[buffer(4)]], device bfloat *aux [[buffer(5)]], constant GgufParams &p [[buffer(6)]]
 #define IDS uint simd_lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]]
 // decode: one simdgroup per C columns, S simdgroups per threadgroup, grid = tiles (persistent_groups >= tiles)
 #define SG_K(F, f, TA, ta, R, C, S, KS, B, P)                                                             \
@@ -393,14 +393,14 @@ inline void pf_tile(device TA *input, device uchar *w0, device uchar *w1, device
 // split-K decode: group.y = split, p.persistent_groups = splits, fp32 partials [split][R][N]
 #define SGK_K(F, f, TA, ta, R, C, S, KS, B, P)                                                            \
   kernel void sgk##ta##_##f##_m##R##_c##C##_sg##S##_k##KS##_b##B##_p##P(device TA *input [[buffer(0)]], device uchar *w0 [[buffer(1)]], \
-             device uchar *w1 [[buffer(2)]], device uchar *meta [[buffer(3)]], device float *partials [[buffer(4)]], constant KQParams &p [[buffer(5)]], \
+             device uchar *w1 [[buffer(2)]], device uchar *meta [[buffer(3)]], device float *partials [[buffer(4)]], constant GgufParams &p [[buffer(5)]], \
              uint2 group [[threadgroup_position_in_grid]], IDS) {                                          \
     constexpr ushort Threads = S * 32; TGLUT_INIT(F)                                                      \
     threadgroup half stage[S * B * KS * C]; const uint steps = p.input_size / KS, per = steps / p.persistent_groups; \
     sg_tile<F, TA, float, R, C, KS, B, P>(input, w0, w1, meta, partials + ulong(group.y) * R * p.output_size, p.output_size, p.input_size, \
         group.x * (S * C) + simd_group * C, stage + simd_group * (B * KS * C), tl, simd_lane, group.y * per, (group.y + 1) * per); }
-kernel void kq_splitk_reduce(device float *partials [[buffer(0)]], device bfloat *output [[buffer(1)]], device bfloat *aux [[buffer(2)]],
-                             constant KQReduceParams &rp [[buffer(3)]], uint tid [[thread_position_in_grid]]) {
+kernel void gguf_splitk_reduce(device float *partials [[buffer(0)]], device bfloat *output [[buffer(1)]], device bfloat *aux [[buffer(2)]],
+                             constant GgufReduceParams &rp [[buffer(3)]], uint tid [[thread_position_in_grid]]) {
   const uint count = rp.rows * rp.cols; if (tid >= count) return; float s = 0.0f;
   for (uint k = 0; k < rp.splits; ++k) s += partials[ulong(k) * count + tid];
   const uint row = tid / rp.cols, col = tid % rp.cols; const ulong o = ulong(row) * (rp.out_stride ? rp.out_stride : rp.cols) + rp.out_offset + col;
@@ -428,12 +428,12 @@ kernel void kq_splitk_reduce(device float *partials [[buffer(0)]], device bfloat
     threadgroup half stage[2 * KS * N];                                                                   \
     pf_tile<F, TA, R, S, N, KS, P>(input + ulong(group.x) * (R * S) * p.input_size, w0, w1, meta, output + ulong(group.x) * (R * S) * (p.out_stride ? p.out_stride : p.output_size), \
                                    p.output_size, p.input_size, group.y * N, stage, tl, simd_lane, simd_group, p.out_stride, p.out_offset); }
-// ---------------- sg_accum: the decode tile loop without the store; acc is created by the caller (kq_make_acc) so
+// ---------------- sg_accum: the decode tile loop without the store; acc is created by the caller (gguf_make_acc) so
 // several formats can accumulate into the same cooperative tensor type (fused segments, gate+up).
 // Initialize in the caller after construction: returning an initialized cooperative tensor
 // loses its initial values on Apple9 in runtime-format kernels (also with shader validation).
 template <typename TA, ushort Rows, ushort Cols, ushort KS>
-inline auto kq_make_acc(device TA *input, uint input_size, threadgroup half *stage) {
+inline auto gguf_make_acc(device TA *input, uint input_size, threadgroup half *stage) {
   auto a = tensor(input, dextents<int, 2>{int(input_size), Rows}, array<int, 2>{1, int(input_size)});
   constexpr auto descriptor = matmul2d_descriptor(Rows, Cols, KS, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<descriptor, execution_simdgroups<1>> operation;
@@ -500,64 +500,64 @@ inline void sg_accum(device TA *input, device uchar *w0, device uchar *w1, devic
 }
 // runtime dequantizer selection (uniform per threadgroup)
 template <typename TA, ushort Rows, ushort Cols, ushort KS, ushort Buffers, ushort Prefetch, class Acc>
-inline void kq_accum_any(uint fmt, device TA *input, device uchar *w0, device uchar *w1, device uchar *meta, uint input_size, uint origin,
+inline void gguf_accum_any(uint fmt, device TA *input, device uchar *w0, device uchar *w1, device uchar *meta, uint input_size, uint origin,
                          threadgroup half *stage, threadgroup half2 *tl, uint simd_lane, uint sb, uint se, thread Acc &acc) {
   switch (fmt) {
-  case KQ_FMT_Q4K: sg_accum<FmtQ4K, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, acc); break;
-  case KQ_FMT_IQ4XS: sg_accum<FmtIQ4XS<3>, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, acc); break;
-  case KQ_FMT_IQ4NL: sg_accum<FmtIQ4NL<0>, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, acc); break;
-  case KQ_FMT_Q5K: sg_accum<FmtQ5K, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, acc); break;
-  case KQ_FMT_Q6K: sg_accum<FmtQ6K, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, acc); break;
-  case KQ_FMT_Q3K: sg_accum<FmtQ3K, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, acc); break;
-  case KQ_FMT_Q80: sg_accum<FmtQ80, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, acc); break;
+  case GGUF_FMT_Q4K: sg_accum<FmtQ4K, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, acc); break;
+  case GGUF_FMT_IQ4XS: sg_accum<FmtIQ4XS<3>, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, acc); break;
+  case GGUF_FMT_IQ4NL: sg_accum<FmtIQ4NL<0>, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, acc); break;
+  case GGUF_FMT_Q5K: sg_accum<FmtQ5K, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, acc); break;
+  case GGUF_FMT_Q6K: sg_accum<FmtQ6K, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, acc); break;
+  case GGUF_FMT_Q3K: sg_accum<FmtQ3K, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, acc); break;
+  case GGUF_FMT_Q80: sg_accum<FmtQ80, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, acc); break;
   default: sg_accum<FmtIQ3S, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, acc); break;
   }
 }
-inline void kq_init_lut(threadgroup half2 *tl, uint thread_index, uint threads) {
+inline void gguf_init_lut(threadgroup half2 *tl, uint thread_index, uint threads) {
   for (uint i = thread_index; i < 256; i += threads) tl[i] = kIQ4NL2[i];
   threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
 // ---------------- fused segments: one dispatch over up to three column segments of different formats (decode rows)
 #define SEGBUF(i, w0, w1, m) device uchar *w0 [[buffer(i)]], device uchar *w1 [[buffer(i + 1)]], device uchar *m [[buffer(i + 2)]]
-#define KQF_K(R)                                                                                            \
-  kernel void kqf_m##R(device bfloat *input [[buffer(0)]], SEGBUF(1, w0a, w1a, ma), SEGBUF(4, w0b, w1b, mb), SEGBUF(7, w0c, w1c, mc), \
-                       device bfloat *output [[buffer(10)]], constant KQFusedParams &p [[buffer(11)]],       \
+#define GGUF_FUSED_K(R)                                                                                            \
+  kernel void gguf_fused_m##R(device bfloat *input [[buffer(0)]], SEGBUF(1, w0a, w1a, ma), SEGBUF(4, w0b, w1b, mb), SEGBUF(7, w0c, w1c, mc), \
+                       device bfloat *output [[buffer(10)]], constant GgufFusedParams &p [[buffer(11)]],       \
                        uint group [[threadgroup_position_in_grid]], IDS) {                                   \
     threadgroup half stage[2 * 2 * 32 * 32]; threadgroup half2 tl[256];                                     \
-    kq_init_lut(tl, simd_group * 32 + simd_lane, 64);                                                      \
+    gguf_init_lut(tl, simd_group * 32 + simd_lane, 64);                                                      \
     const uint t0 = p.cols[0] / 64, t1 = t0 + p.cols[1] / 64;                                              \
     device uchar *w0 = w0a; device uchar *w1 = w1a; device uchar *meta = ma; uint fmt = p.fmt[0], off = p.offset[0], local = group; \
     if (group >= t1) { w0 = w0c; w1 = w1c; meta = mc; fmt = p.fmt[2]; off = p.offset[2]; local = group - t1; }                    \
     else if (group >= t0) { w0 = w0b; w1 = w1b; meta = mb; fmt = p.fmt[1]; off = p.offset[1]; local = group - t0; }                \
     const uint origin = local * 64 + simd_group * 32, steps = p.input_size / 32;                            \
     threadgroup half *my = stage + simd_group * (2 * 32 * 32);                                              \
-    auto acc = kq_make_acc<bfloat, R, 32, 32>(input, p.input_size, my);                                     \
+    auto acc = gguf_make_acc<bfloat, R, 32, 32>(input, p.input_size, my);                                     \
     for (ushort i = 0; i < acc.get_capacity(); ++i) acc[i] = 0.0f;                                    \
-    kq_accum_any<bfloat, R, 32, 32, 2, 1>(fmt, input, w0, w1, meta, p.input_size, origin, my, tl, simd_lane, 0, steps, acc); \
+    gguf_accum_any<bfloat, R, 32, 32, 2, 1>(fmt, input, w0, w1, meta, p.input_size, origin, my, tl, simd_lane, 0, steps, acc); \
     for (ushort i = 0; i < acc.get_capacity(); ++i) {                                                       \
       if (!acc.is_valid_element(i)) continue;                                                              \
       auto index = acc.get_multidimensional_index(i);                                                      \
       output[ulong(index[1]) * p.out_stride + off + origin + index[0]] = bfloat(acc[i]);                   \
     }                                                                                                       \
   }
-KQF_K(8) KQF_K(16) KQF_K(24) KQF_K(32)
+GGUF_FUSED_K(8) GGUF_FUSED_K(16) GGUF_FUSED_K(24) GGUF_FUSED_K(32)
 
 // ---------------- gate + up in one dispatch: output = silu(gate) * up (both rounded to bf16 first, as splash does)
-#define KQGU_K(R)                                                                                           \
-  kernel void kqgu_m##R(device bfloat *input [[buffer(0)]], SEGBUF(1, gw0, gw1, gm), SEGBUF(4, uw0, uw1, um),  \
-                        device bfloat *output [[buffer(7)]], constant KQGateUpParams &p [[buffer(8)]],        \
+#define GGUF_GATEUP_K(R)                                                                                           \
+  kernel void gguf_gateup_m##R(device bfloat *input [[buffer(0)]], SEGBUF(1, gw0, gw1, gm), SEGBUF(4, uw0, uw1, um),  \
+                        device bfloat *output [[buffer(7)]], constant GgufGateUpParams &p [[buffer(8)]],        \
                         uint group [[threadgroup_position_in_grid]], IDS) {                                  \
     threadgroup half stage[2 * 2 * 32 * 32]; threadgroup half2 tl[256];                                     \
-    kq_init_lut(tl, simd_group * 32 + simd_lane, 64);                                                      \
+    gguf_init_lut(tl, simd_group * 32 + simd_lane, 64);                                                      \
     const uint origin = group * 64 + simd_group * 32, steps = p.input_size / 32;                           \
     threadgroup half *my = stage + simd_group * (2 * 32 * 32);   /* one 8 KB stage for both passes: occupancy */ \
-    auto gate = kq_make_acc<bfloat, R, 32, 32>(input, p.input_size, my);                                    \
+    auto gate = gguf_make_acc<bfloat, R, 32, 32>(input, p.input_size, my);                                    \
     for (ushort i = 0; i < gate.get_capacity(); ++i) gate[i] = 0.0f;                                   \
-    kq_accum_any<bfloat, R, 32, 32, 2, 1>(p.gate_fmt, input, gw0, gw1, gm, p.input_size, origin, my, tl, simd_lane, 0, steps, gate); \
-    auto up = kq_make_acc<bfloat, R, 32, 32>(input, p.input_size, my);                                      \
+    gguf_accum_any<bfloat, R, 32, 32, 2, 1>(p.gate_fmt, input, gw0, gw1, gm, p.input_size, origin, my, tl, simd_lane, 0, steps, gate); \
+    auto up = gguf_make_acc<bfloat, R, 32, 32>(input, p.input_size, my);                                      \
     for (ushort i = 0; i < up.get_capacity(); ++i) up[i] = 0.0f;                                     \
-    kq_accum_any<bfloat, R, 32, 32, 2, 1>(p.up_fmt, input, uw0, uw1, um, p.input_size, origin, my, tl, simd_lane, 0, steps, up); \
+    gguf_accum_any<bfloat, R, 32, 32, 2, 1>(p.up_fmt, input, uw0, uw1, um, p.input_size, origin, my, tl, simd_lane, 0, steps, up); \
     for (ushort i = 0; i < gate.get_capacity(); ++i) {                                                      \
       if (!gate.is_valid_element(i)) continue;                                                             \
       auto index = gate.get_multidimensional_index(i);                                                     \
@@ -565,17 +565,17 @@ KQF_K(8) KQF_K(16) KQF_K(24) KQF_K(32)
       output[ulong(index[1]) * p.out_stride + origin + index[0]] = bfloat(silu_gate(g) * u);               \
     }                                                                                                       \
   }
-KQGU_K(8) KQGU_K(16) KQGU_K(24) KQGU_K(32)
+GGUF_GATEUP_K(8) GGUF_GATEUP_K(16) GGUF_GATEUP_K(24) GGUF_GATEUP_K(32)
 
 // ---------------- split-K with last-arriver reduction (per format), epilogue applied by the reducing threadgroup
 template <class F, ushort Rows>
-inline void kq_splitk_tile(device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta, device float *partials,
-                           device atomic_uint *counters, device bfloat *output, device bfloat *aux, constant KQSplitParams &p,
+inline void gguf_splitk_tile(device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta, device float *partials,
+                           device atomic_uint *counters, device bfloat *output, device bfloat *aux, constant GgufSplitParams &p,
                            uint2 group, uint simd_lane, uint simd_group, threadgroup half *stage, threadgroup half2 *tl, threadgroup uint *arrival) {
   const uint steps = p.input_size / 32, per = steps / p.splits, thread_index = simd_group * 32 + simd_lane;
   const uint origin = group.x * 64 + simd_group * 32;
   threadgroup half *my = stage + simd_group * (2 * 32 * 32);
-  auto acc = kq_make_acc<bfloat, Rows, 32, 32>(input, p.input_size, my);
+  auto acc = gguf_make_acc<bfloat, Rows, 32, 32>(input, p.input_size, my);
 #pragma unroll
   for (ushort i = 0; i < acc.get_capacity(); ++i) acc[i] = 0.0f;
   sg_accum<F, bfloat, Rows, 32, 32, 2, 1>(input, w0, w1, meta, p.input_size, origin, my, tl, simd_lane, group.y * per, (group.y + 1) * per, acc);
@@ -602,22 +602,22 @@ inline void kq_splitk_tile(device bfloat *input, device uchar *w0, device uchar 
     for (uint s = 0; s < p.splits; ++s)
       total += s == group.y ? acc[i] : partials[(ulong(s) * Rows + index[1]) * N + origin + index[0]];
     const ulong o = ulong(index[1]) * p.out_stride + p.out_offset + origin + index[0];
-    if (p.epilogue == KQ_EPILOGUE_RESIDUAL) total += float(aux[o]);
-    if (p.epilogue == KQ_EPILOGUE_UP_WITH_GATE) total = float(bfloat(total)) * silu_gate(float(aux[o]));
+    if (p.epilogue == GGUF_EPILOGUE_RESIDUAL) total += float(aux[o]);
+    if (p.epilogue == GGUF_EPILOGUE_UP_WITH_GATE) total = float(bfloat(total)) * silu_gate(float(aux[o]));
     output[o] = bfloat(total);
   }
   if (thread_index == 0) atomic_store_explicit(counters + group.x, 0u, memory_order_relaxed);
 }
-#define KQS_K(F, f, R)                                                                                      \
-  kernel void kqs_##f##_m##R(device bfloat *input [[buffer(0)]], SEGBUF(1, w0, w1, meta), device float *partials [[buffer(4)]], \
+#define GGUF_SPLITK_K(F, f, R)                                                                                      \
+  kernel void gguf_splitk_##f##_m##R(device bfloat *input [[buffer(0)]], SEGBUF(1, w0, w1, meta), device float *partials [[buffer(4)]], \
                              device atomic_uint *counters [[buffer(5)]], device bfloat *output [[buffer(6)]], device bfloat *aux [[buffer(7)]], \
-                             constant KQSplitParams &p [[buffer(8)]], uint2 group [[threadgroup_position_in_grid]], IDS) { \
+                             constant GgufSplitParams &p [[buffer(8)]], uint2 group [[threadgroup_position_in_grid]], IDS) { \
     threadgroup half stage[2 * 2 * 32 * 32]; threadgroup half2 tl[F::TgLut ? F::TgLut : 1]; threadgroup uint arrival; \
-    if constexpr (F::TgLut) kq_init_lut(tl, simd_group * 32 + simd_lane, 64);                                \
-    kq_splitk_tile<F, R>(input, w0, w1, meta, partials, counters, output, aux, p, group, simd_lane, simd_group, stage, tl, &arrival); }
-#define KQS_SET(F, f) KQS_K(F, f, 8) KQS_K(F, f, 16) KQS_K(F, f, 24) KQS_K(F, f, 32)
-KQS_SET(FmtQ4K, q4k) KQS_SET(FmtIQ4XS<3>, iq4xs) KQS_SET(FmtIQ4NL<0>, iq4nl) KQS_SET(FmtQ5K, q5k)
-KQS_SET(FmtQ6K, q6k) KQS_SET(FmtQ3K, q3k) KQS_SET(FmtQ80, q80) KQS_SET(FmtIQ3S, iq3s)
+    if constexpr (F::TgLut) gguf_init_lut(tl, simd_group * 32 + simd_lane, 64);                                \
+    gguf_splitk_tile<F, R>(input, w0, w1, meta, partials, counters, output, aux, p, group, simd_lane, simd_group, stage, tl, &arrival); }
+#define GGUF_SPLITK_SET(F, f) GGUF_SPLITK_K(F, f, 8) GGUF_SPLITK_K(F, f, 16) GGUF_SPLITK_K(F, f, 24) GGUF_SPLITK_K(F, f, 32)
+GGUF_SPLITK_SET(FmtQ4K, q4k) GGUF_SPLITK_SET(FmtIQ4XS<3>, iq4xs) GGUF_SPLITK_SET(FmtIQ4NL<0>, iq4nl) GGUF_SPLITK_SET(FmtQ5K, q5k)
+GGUF_SPLITK_SET(FmtQ6K, q6k) GGUF_SPLITK_SET(FmtQ3K, q3k) GGUF_SPLITK_SET(FmtQ80, q80) GGUF_SPLITK_SET(FmtIQ3S, iq3s)
 
 #define PROD_SET(F, f)                                                                                    \
   SG_K(F, f, bfloat, a, 8, 32, 2, 32, 2, 1) SG_K(F, f, bfloat, a, 16, 32, 2, 32, 2, 1) SG_K(F, f, bfloat, a, 24, 32, 2, 32, 2, 1) SG_K(F, f, bfloat, a, 32, 32, 2, 32, 2, 1) \
@@ -634,8 +634,8 @@ PROD_SET(FmtQ80, q80)
 PROD_SET(FmtIQ3S, iq3s)
 
 // ---------------- token embedding gather from native block_q4_K rows (row = K/256 blocks of 144 B)
-kernel void kq_embed_q4k(device const uint *tokens [[buffer(0)]], device const uchar *table [[buffer(1)]], device bfloat *output [[buffer(2)]],
-                      constant KQEmbedParams &p [[buffer(3)]], uint index [[thread_position_in_grid]]) {
+kernel void gguf_embed_q4k(device const uint *tokens [[buffer(0)]], device const uchar *table [[buffer(1)]], device bfloat *output [[buffer(2)]],
+                      constant GgufEmbedParams &p [[buffer(3)]], uint index [[thread_position_in_grid]]) {
   const uint elements = p.rows * p.hidden; if (index >= elements) return;
   const uint row = index / p.hidden, dim = index % p.hidden;
   uint token = tokens[row]; token = token < p.vocabulary ? token : 0;
@@ -648,8 +648,8 @@ kernel void kq_embed_q4k(device const uint *tokens [[buffer(0)]], device const u
   output[index] = bfloat(float(d) * float(s) * float(q) - float(dmin) * float(m));
 }
 // native block_q6_K rows (210 B per 256 weights): ql[128] | qh[64] | int8 scales[16] | half d
-kernel void kq_embed_q6k(device const uint *tokens [[buffer(0)]], device const uchar *table [[buffer(1)]], device bfloat *output [[buffer(2)]],
-                      constant KQEmbedParams &p [[buffer(3)]], uint index [[thread_position_in_grid]]) {
+kernel void gguf_embed_q6k(device const uint *tokens [[buffer(0)]], device const uchar *table [[buffer(1)]], device bfloat *output [[buffer(2)]],
+                      constant GgufEmbedParams &p [[buffer(3)]], uint index [[thread_position_in_grid]]) {
   const uint elements = p.rows * p.hidden; if (index >= elements) return;
   const uint row = index / p.hidden, dim = index % p.hidden;
   uint token = tokens[row]; token = token < p.vocabulary ? token : 0;
@@ -662,8 +662,8 @@ kernel void kq_embed_q6k(device const uint *tokens [[buffer(0)]], device const u
   output[index] = bfloat(float(d) * float(sc) * float(int(lo | (hi << 4)) - 32));
 }
 // native block_q8_0 rows (34 B per 32 weights): half d | int8 qs[32]
-kernel void kq_embed_q80(device const uint *tokens [[buffer(0)]], device const uchar *table [[buffer(1)]], device bfloat *output [[buffer(2)]],
-                      constant KQEmbedParams &p [[buffer(3)]], uint index [[thread_position_in_grid]]) {
+kernel void gguf_embed_q80(device const uint *tokens [[buffer(0)]], device const uchar *table [[buffer(1)]], device bfloat *output [[buffer(2)]],
+                      constant GgufEmbedParams &p [[buffer(3)]], uint index [[thread_position_in_grid]]) {
   const uint elements = p.rows * p.hidden; if (index >= elements) return;
   const uint row = index / p.hidden, dim = index % p.hidden;
   uint token = tokens[row]; token = token < p.vocabulary ? token : 0;
@@ -672,24 +672,24 @@ kernel void kq_embed_q80(device const uint *tokens [[buffer(0)]], device const u
   output[index] = bfloat(float(d) * float(as_type<char>(blk[2 + dim % 32])));
 }
 // permute the K columns (in 128-wide head blocks) of a bf16 activation: out[row][h*128+e] = in[row][perm[h]*128+e]
-kernel void kq_permute_heads(device const bfloat *input [[buffer(0)]], device bfloat *output [[buffer(1)]], device const uint *perm [[buffer(2)]],
-                          constant KQPermuteParams &p [[buffer(3)]], uint index [[thread_position_in_grid]]) {
+kernel void gguf_permute_heads(device const bfloat *input [[buffer(0)]], device bfloat *output [[buffer(1)]], device const uint *perm [[buffer(2)]],
+                          constant GgufPermuteParams &p [[buffer(3)]], uint index [[thread_position_in_grid]]) {
   if (index >= p.rows * p.width) return;
   const uint row = index / p.width, col = index % p.width, h = col / p.block, e = col % p.block;
   output[index] = input[ulong(row) * p.width + perm[h] * p.block + e];
 }
 
-// ---- load-time repack: native GGUF rows -> MDKQ0001 planes (layout documented in model/GgufImage.hpp) ----
+// ---- load-time repack: native GGUF rows -> MDGG0001 planes (layout documented in model/GgufImage.hpp) ----
 // One thread per (destination row n, 32-wide K group g). Rows >= permute_from_row are read from
 // llama.cpp's tiled value-head order so the image holds splash's grouped order.
-static inline uint kq_repack_source_row(uint n, constant KQRepackParams &p) {
+static inline uint gguf_repack_source_row(uint n, constant GgufRepackParams &p) {
   if (n < p.permute_from_row) return n;
   const uint head = (n - p.permute_from_row) / p.permute_head_rows, e = (n - p.permute_from_row) % p.permute_head_rows;
   const uint source = (head % p.permute_groups) * p.permute_group_heads + head / p.permute_groups;
   return p.permute_from_row + source * p.permute_head_rows + e;
 }
 // 32 codes (< 16) -> 4 words; interleaved: code j of each 8 sits at nibble (j&1)*4 + (j>>1) of a 16-bit half.
-static inline void kq_pack_words(thread const uchar *codes, bool interleave, device uint *dst) {
+static inline void gguf_pack_words(thread const uchar *codes, bool interleave, device uint *dst) {
   for (uint k = 0; k < 4; ++k) {
     uint w = 0;
     for (uint j = 0; j < 8; ++j) w |= uint(codes[8 * k + j]) << (interleave ? (j & 1) * 16 + 4 * (j >> 1) : 4 * j);
@@ -697,27 +697,27 @@ static inline void kq_pack_words(thread const uchar *codes, bool interleave, dev
   }
 }
 // 16 small values -> one word: even k at bit step*(k/2), odd k at 16 + step*(k/2).
-static inline uint kq_pair_word(thread const uchar *v, uint step) {
+static inline uint gguf_pair_word(thread const uchar *v, uint step) {
   uint w = 0;
   for (uint k = 0; k < 16; ++k) w |= uint(v[k]) << (((k & 1) ? 16 : 0) + step * (k >> 1));
   return w;
 }
-kernel void kq_repack(device const uchar *src [[buffer(0)]], device uchar *dst [[buffer(1)]],
-                      constant KQRepackParams &p [[buffer(2)]], uint t [[thread_position_in_grid]]) {
+kernel void gguf_repack(device const uchar *src [[buffer(0)]], device uchar *dst [[buffer(1)]],
+                      constant GgufRepackParams &p [[buffer(2)]], uint t [[thread_position_in_grid]]) {
   const uint G = p.input_size / 32;
   if (t >= p.rows * G) return;
-  const uint n = t / G, g = t % G, r = kq_repack_source_row(n, p);
-  const bool k256 = !(p.fmt == KQ_FMT_IQ4NL || p.fmt == KQ_FMT_Q80);
+  const uint n = t / G, g = t % G, r = gguf_repack_source_row(n, p);
+  const bool k256 = !(p.fmt == GGUF_FMT_IQ4NL || p.fmt == GGUF_FMT_Q80);
   const uint b = k256 ? g / 8 : g, j = k256 ? g % 8 : 0, mg = k256 ? 8 : 1;
   uint blockBytes, p0, p1, mb;
   switch (p.fmt) {
-    case KQ_FMT_Q4K: blockBytes = 144; p0 = 16; p1 = 0; mb = 16; break;
-    case KQ_FMT_IQ4XS: blockBytes = 136; p0 = 16; p1 = 0; mb = 8; break;
-    case KQ_FMT_IQ4NL: blockBytes = 18; p0 = 16; p1 = 0; mb = 2; break;
-    case KQ_FMT_Q5K: blockBytes = 176; p0 = 16; p1 = 4; mb = 16; break;
-    case KQ_FMT_Q6K: blockBytes = 210; p0 = 16; p1 = 8; mb = 20; break;
-    case KQ_FMT_Q3K: blockBytes = 110; p0 = 8; p1 = 4; mb = 16; break;
-    case KQ_FMT_Q80: blockBytes = 34; p0 = 32; p1 = 0; mb = 2; break;
+    case GGUF_FMT_Q4K: blockBytes = 144; p0 = 16; p1 = 0; mb = 16; break;
+    case GGUF_FMT_IQ4XS: blockBytes = 136; p0 = 16; p1 = 0; mb = 8; break;
+    case GGUF_FMT_IQ4NL: blockBytes = 18; p0 = 16; p1 = 0; mb = 2; break;
+    case GGUF_FMT_Q5K: blockBytes = 176; p0 = 16; p1 = 4; mb = 16; break;
+    case GGUF_FMT_Q6K: blockBytes = 210; p0 = 16; p1 = 8; mb = 20; break;
+    case GGUF_FMT_Q3K: blockBytes = 110; p0 = 8; p1 = 4; mb = 16; break;
+    case GGUF_FMT_Q80: blockBytes = 34; p0 = 32; p1 = 0; mb = 2; break;
     default: blockBytes = 110; p0 = 16; p1 = 0; mb = 2; break;  // IQ3_S
   }
   device const uchar *blk = src + p.src_offset + ulong(r) * p.src_row_bytes + ulong(b) * blockBytes;
@@ -727,57 +727,57 @@ kernel void kq_repack(device const uchar *src [[buffer(0)]], device uchar *dst [
   device uchar *meta = dst + p.dst_meta + (ulong((n / 256) * (G / mg) + b) * 256 + (n % 256)) * mb;
   uchar codes[32], bits[32];
   switch (p.fmt) {
-    case KQ_FMT_Q4K: {
+    case GGUF_FMT_Q4K: {
       for (uint l = 0; l < 32; ++l) codes[l] = (blk[16 + (j / 2) * 32 + l] >> (4 * (j % 2))) & 15;
-      kq_pack_words(codes, true, (device uint *)out0);
+      gguf_pack_words(codes, true, (device uint *)out0);
       if (j == 0) for (uint i = 0; i < 16; ++i) meta[i] = blk[i];
       break;
     }
-    case KQ_FMT_Q5K: {
+    case GGUF_FMT_Q5K: {
       for (uint l = 0; l < 32; ++l) { codes[l] = (blk[48 + (j / 2) * 32 + l] >> (4 * (j % 2))) & 15; bits[l] = (blk[16 + l] >> j) & 1; }
-      kq_pack_words(codes, true, (device uint *)out0);
+      gguf_pack_words(codes, true, (device uint *)out0);
       uint w = 0;
       for (uint l = 0; l < 32; ++l) w |= uint(bits[l]) << (((l & 1) ? 16 : 0) + 4 * (l / 8) + (l % 8) / 2);
       *(device uint *)out1 = w;
       if (j == 0) for (uint i = 0; i < 16; ++i) meta[i] = blk[i];
       break;
     }
-    case KQ_FMT_IQ4XS: {
+    case GGUF_FMT_IQ4XS: {
       for (uint l = 0; l < 16; ++l) { const uchar q = blk[8 + 16 * j + l]; codes[l] = q & 15; codes[16 + l] = q >> 4; }
-      kq_pack_words(codes, false, (device uint *)out0);
+      gguf_pack_words(codes, false, (device uint *)out0);
       if (j == 0) for (uint i = 0; i < 8; ++i) meta[i] = blk[i];
       break;
     }
-    case KQ_FMT_IQ4NL: {
+    case GGUF_FMT_IQ4NL: {
       for (uint l = 0; l < 16; ++l) { const uchar q = blk[2 + l]; codes[l] = q & 15; codes[16 + l] = q >> 4; }
-      kq_pack_words(codes, true, (device uint *)out0);
+      gguf_pack_words(codes, true, (device uint *)out0);
       meta[0] = blk[0]; meta[1] = blk[1];
       break;
     }
-    case KQ_FMT_Q6K: {
+    case GGUF_FMT_Q6K: {
       const uint hb = j / 4, quarter = j % 4;
       for (uint l = 0; l < 32; ++l) {
         codes[l] = (blk[64 * hb + 32 * (quarter & 1) + l] >> (4 * (quarter >> 1))) & 15;
         bits[l] = (blk[128 + 32 * hb + l] >> (2 * quarter)) & 3;
       }
-      kq_pack_words(codes, true, (device uint *)out0);
-      ((device uint *)out1)[0] = kq_pair_word(bits, 2);
-      ((device uint *)out1)[1] = kq_pair_word(bits + 16, 2);
+      gguf_pack_words(codes, true, (device uint *)out0);
+      ((device uint *)out1)[0] = gguf_pair_word(bits, 2);
+      ((device uint *)out1)[1] = gguf_pair_word(bits + 16, 2);
       if (j == 0) { for (uint i = 0; i < 16; ++i) meta[i] = blk[192 + i]; meta[16] = blk[208]; meta[17] = blk[209]; meta[18] = 0; meta[19] = 0; }
       break;
     }
-    case KQ_FMT_Q3K: {
+    case GGUF_FMT_Q3K: {
       const uint hb = j / 4, jj = j % 4;
       for (uint l = 0; l < 32; ++l) { codes[l] = (blk[32 + 32 * hb + l] >> (2 * jj)) & 3; bits[l] = (blk[l] >> j) & 1; }
-      ((device uint *)out0)[0] = kq_pair_word(codes, 2);
-      ((device uint *)out0)[1] = kq_pair_word(codes + 16, 2);
+      ((device uint *)out0)[0] = gguf_pair_word(codes, 2);
+      ((device uint *)out0)[1] = gguf_pair_word(codes + 16, 2);
       uint w = 0;
       for (uint l = 0; l < 32; ++l) w |= uint(bits[l]) << (((l & 1) ? 16 : 0) + l / 2);
       *(device uint *)out1 = w;
       if (j == 0) { meta[0] = blk[108]; meta[1] = blk[109]; meta[2] = 0; meta[3] = 0; for (uint i = 0; i < 12; ++i) meta[4 + i] = blk[96 + i]; }
       break;
     }
-    case KQ_FMT_Q80: {
+    case GGUF_FMT_Q80: {
       for (uint i = 0; i < 32; ++i) out0[i] = blk[2 + i];
       meta[0] = blk[0]; meta[1] = blk[1];
       break;
@@ -794,8 +794,8 @@ kernel void kq_repack(device const uchar *src [[buffer(0)]], device uchar *dst [
   }
 }
 // byte copy for native embedding rows: one thread per 16 bytes
-kernel void kq_copy(device const uchar *src [[buffer(0)]], device uchar *dst [[buffer(1)]],
-                    constant KQCopyParams &p [[buffer(2)]], uint t [[thread_position_in_grid]]) {
+kernel void gguf_copy(device const uchar *src [[buffer(0)]], device uchar *dst [[buffer(1)]],
+                    constant GgufCopyParams &p [[buffer(2)]], uint t [[thread_position_in_grid]]) {
   const uint begin = t * 16;
   if (begin >= p.bytes) return;
   if (begin + 16 <= p.bytes) *(device uint4 *)(dst + p.dst_offset + begin) = *(device const uint4 *)(src + p.src_offset + begin);
@@ -803,4 +803,4 @@ kernel void kq_copy(device const uchar *src [[buffer(0)]], device uchar *dst [[b
 }
 
 // dependency kernel for serialized profiling: touching the output forces the next dispatch to wait
-kernel void kq_touch(device bfloat *y [[buffer(0)]], uint tid [[thread_position_in_grid]]) { if (tid == 0) y[0] = bfloat(float(y[0]) + 0.0f); }
+kernel void gguf_touch(device bfloat *y [[buffer(0)]], uint tid [[thread_position_in_grid]]) { if (tid == 0) y[0] = bfloat(float(y[0]) + 0.0f); }

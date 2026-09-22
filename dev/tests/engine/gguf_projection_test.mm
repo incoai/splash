@@ -19,7 +19,7 @@
 #include <map>
 #include <vector>
 struct Q4KParams { uint32_t output_size, input_size, persistent_groups; };
-struct KQParams { uint32_t output_size, input_size, persistent_groups, out_stride, out_offset; };
+struct GgufParams { uint32_t output_size, input_size, persistent_groups, out_stride, out_offset; };
 static id<MTLDevice> dev; static id<MTLCommandQueue> queue; static std::mt19937 rng(42);
 static uint16_t f2h(float f) { __fp16 h = (__fp16)f; uint16_t u; memcpy(&u, &h, 2); return u; }
 static float h2f(uint16_t u) { __fp16 h; memcpy(&h, &u, 2); return (float)h; }
@@ -153,7 +153,7 @@ static Packed repack(Fmt f, bool interleave, const std::vector<uint8_t> &native,
   return p;
 }
 static id<MTLBuffer> upload(const std::vector<uint8_t> &v) { id<MTLBuffer> b = mkbuf(v.size()); memcpy(b.contents, v.data(), v.size()); return b; }
-// harness_prod: validate the production kernels (kquant.metal ABI) from a compiled .metallib against the C++ reference.
+// harness_prod: validate the production kernels (gguf_linear.metal ABI) from a compiled .metallib against the C++ reference.
 //   harness_prod <splash.metallib>
 struct Seg { Fmt fmt; bool interleave; uint32_t N; uint32_t colOffset; id<MTLBuffer> w0, w1, meta; std::vector<float> Wf, Ws; };
 static const bool kProdInterleave[FMT_COUNT] = {true, false, true, true, true, true, true, true};
@@ -170,9 +170,9 @@ static Seg makeSegK(Fmt f, uint32_t N, uint32_t K, uint32_t colOffset) {   // no
   std::vector<uint8_t> native = makeNative(f, N, K); Packed pk = repack(f, s.interleave, native, N, K, nullptr);
   s.w0 = upload(pk.w0); s.w1 = upload(pk.w1); s.meta = upload(pk.meta); if (!finfo(f).p1) s.w1 = s.meta; return s;
 }
-struct KQFusedParams { uint32_t input_size, out_stride, segments, reserved, cols[3], fmt[3], offset[3]; };
-struct KQGateUpParams { uint32_t input_size, output_size, out_stride, gate_fmt, up_fmt; };
-struct KQSplitParams { uint32_t output_size, input_size, splits, out_stride, out_offset, epilogue; };
+struct GgufFusedParams { uint32_t input_size, out_stride, segments, reserved, cols[3], fmt[3], offset[3]; };
+struct GgufGateUpParams { uint32_t input_size, output_size, out_stride, gate_fmt, up_fmt; };
+struct GgufSplitParams { uint32_t output_size, input_size, splits, out_stride, out_offset, epilogue; };
 int main(int argc, char **argv) { @autoreleasepool {
   if (argc < 2) { std::cerr << "usage: harness_prod <metallib> [full|dequant|time-gu] [input-scale] [seed]\n"; return 2; }
   dev = MTLCreateSystemDefaultDevice(); queue = [dev newCommandQueue];
@@ -189,8 +189,8 @@ int main(int argc, char **argv) { @autoreleasepool {
       const uint32_t N = 256, K = 1024;
       Seg s = makeSeg(Fmt(fi), N, K, 0);
       id<MTLBuffer> Y = mkbuf(uint64_t(N) * K * 2);
-      KQParams p{N, K, 0, 0, 0};
-      const std::string name = std::string("kq_test_dequant_") + fmtName[fi];
+      GgufParams p{N, K, 0, 0, 0};
+      const std::string name = std::string("gguf_test_dequant_") + fmtName[fi];
       Dispatch d{pso(lib, name), {s.w0, s.w1, s.meta, Y}, bytes(p), 4,
                  MTLSizeMake(N * (K / 32) / 32, 1, 1), MTLSizeMake(32, 1, 1)};
       runOnce({d}, 1);
@@ -235,8 +235,8 @@ int main(int argc, char **argv) { @autoreleasepool {
   for (int ti = 0; ti < 4; ++ti) { const uint32_t rows = rowsList[ti]; Seg s0 = makeSeg(triples[ti][0], 1024, K, 0), s1 = makeSeg(triples[ti][1], 512, K, 1024), s2 = makeSeg(triples[ti][2], 256, K, 1536);
     const uint32_t N = 1792; auto [Xbf, Xref] = inputs(rows); id<MTLBuffer> Y = mkbuf(uint64_t(rows) * N * 2); std::vector<double> ref((size_t)rows * N);
     for (auto *s : {&s0, &s1, &s2}) refGemm(Xref, *s, rows, N, ref);
-    KQFusedParams fp{K, N, 3, 0, {s0.N, s1.N, s2.N}, {kFmtId[s0.fmt], kFmtId[s1.fmt], kFmtId[s2.fmt]}, {s0.colOffset, s1.colOffset, s2.colOffset}};
-    char name[64]; snprintf(name, sizeof name, "kqf_m%u", rows); id<MTLComputePipelineState> ps = pso(lib, name); if (!ps) { ++failures; continue; }
+    GgufFusedParams fp{K, N, 3, 0, {s0.N, s1.N, s2.N}, {kFmtId[s0.fmt], kFmtId[s1.fmt], kFmtId[s2.fmt]}, {s0.colOffset, s1.colOffset, s2.colOffset}};
+    char name[64]; snprintf(name, sizeof name, "gguf_fused_m%u", rows); id<MTLComputePipelineState> ps = pso(lib, name); if (!ps) { ++failures; continue; }
     Dispatch d{ps, {Xbf, s0.w0, s0.w1, s0.meta, s1.w0, s1.w1, s1.meta, s2.w0, s2.w1, s2.meta, Y}, bytes(fp), 11, MTLSizeMake(N / 64, 1, 1), MTLSizeMake(64, 1, 1)};
     runOnce({d}, 1); char label[96]; snprintf(label, sizeof label, "%s [%s|%s|%s]", name, fmtName[s0.fmt], fmtName[s1.fmt], fmtName[s2.fmt]); compare(label, Y, ref, rows, N); }
   // 2) gate + up fused
@@ -249,14 +249,14 @@ int main(int argc, char **argv) { @autoreleasepool {
     auto [Xbf, Xref] = inputs(rows); id<MTLBuffer> Y = mkbuf(uint64_t(rows) * N * 2); std::vector<double> rg((size_t)rows * N), ru((size_t)rows * N), ref((size_t)rows * N);
     refGemm(Xref, g, rows, N, rg); refGemm(Xref, u, rows, N, ru);
     for (size_t i = 0; i < ref.size(); ++i) { double gg = bf2f(f2bf((float)rg[i])), uu = bf2f(f2bf((float)ru[i])); ref[i] = gg / (1.0 + std::exp(-gg)) * uu; }
-    KQGateUpParams gp{K, N, N, kFmtId[g.fmt], kFmtId[u.fmt]}; char name[64]; snprintf(name, sizeof name, "kqgu_m%u", rows); id<MTLComputePipelineState> ps = pso(lib, name); if (!ps) { ++failures; continue; }
+    GgufGateUpParams gp{K, N, N, kFmtId[g.fmt], kFmtId[u.fmt]}; char name[64]; snprintf(name, sizeof name, "gguf_gateup_m%u", rows); id<MTLComputePipelineState> ps = pso(lib, name); if (!ps) { ++failures; continue; }
     Dispatch d{ps, {Xbf, g.w0, g.w1, g.meta, u.w0, u.w1, u.meta, Y}, bytes(gp), 8, MTLSizeMake(N / 64, 1, 1), MTLSizeMake(64, 1, 1)};
     runOnce({d}, 1); char label[96]; snprintf(label, sizeof label, "%s [%s|%s] vs fp64", name, fmtName[g.fmt], fmtName[u.fmt]); compare(label, Y, ref, rows, N);
     refGemm(Xref, g, rows, N, rg, true); refGemm(Xref, u, rows, N, ru, true);
     for (size_t i = 0; i < ref.size(); ++i) { double gg = bf2f(f2bf((float)rg[i])), uu = bf2f(f2bf((float)ru[i])); ref[i] = gg / (1.0 + std::exp(-gg)) * uu; }
     // bf16 rounding of the gate before silu makes the fp64 reference flip by one bf16 ulp on rare elements; the two-kernel GPU path
     // (validated sga gate -> bf16 scratch, sgg up with silu epilogue) has the same accumulation and must match near-exactly.
-    id<MTLBuffer> G = mkbuf(uint64_t(rows) * N * 2), Y2 = mkbuf(uint64_t(rows) * N * 2); KQParams pq{N, K, N / 64, 0, 0}; char n1[80], n2[80];
+    id<MTLBuffer> G = mkbuf(uint64_t(rows) * N * 2), Y2 = mkbuf(uint64_t(rows) * N * 2); GgufParams pq{N, K, N / 64, 0, 0}; char n1[80], n2[80];
     snprintf(n1, sizeof n1, "sga_%s_m%u_c32_sg2_k32_b2_p1", fmtName[g.fmt], rows); snprintf(n2, sizeof n2, "sgg_%s_m%u_c32_sg2_k32_b2_p1", fmtName[u.fmt], rows);
     id<MTLComputePipelineState> p1 = pso(lib, n1), p2 = pso(lib, n2);
     if (p1 && p2) { Dispatch d1{p1, {Xbf, g.w0, g.w1, g.meta, G}, bytes(pq), 5, MTLSizeMake(N / 64, 1, 1), MTLSizeMake(64, 1, 1)}, d2{p2, {Xbf, u.w0, u.w1, u.meta, Y2, G}, bytes(pq), 6, MTLSizeMake(N / 64, 1, 1), MTLSizeMake(64, 1, 1)};
@@ -279,7 +279,7 @@ int main(int argc, char **argv) { @autoreleasepool {
     std::vector<double> ref((size_t)rows * 2 * N, 0.0), part((size_t)rows * N); refGemm(Xref, s, rows, N, part);
     for (uint32_t r = 0; r < rows; ++r) for (uint32_t n = 0; n < N; ++n) ref[(size_t)r * 2 * N + N + n] = part[(size_t)r * N + n] + bf2f(((uint16_t *)R.contents)[(size_t)r * 2 * N + N + n]);
     for (uint32_t r = 0; r < rows; ++r) for (uint32_t n = 0; n < N; ++n) { ((uint16_t *)Y.contents)[(size_t)r * 2 * N + n] = 0; ref[(size_t)r * 2 * N + n] = 0; }
-    KQSplitParams sp{N, K, splits, 2 * N, N, 1}; char name[64]; snprintf(name, sizeof name, "kqs_%s_m%u", fmtName[fi], rows); id<MTLComputePipelineState> ps = pso(lib, name); if (!ps) { ++failures; continue; }
+    GgufSplitParams sp{N, K, splits, 2 * N, N, 1}; char name[64]; snprintf(name, sizeof name, "gguf_splitk_%s_m%u", fmtName[fi], rows); id<MTLComputePipelineState> ps = pso(lib, name); if (!ps) { ++failures; continue; }
     Dispatch d{ps, {Xbf, s.w0, s.w1, s.meta, partials, counters, Y, R}, bytes(sp), 8, MTLSizeMake(N / 64, splits, 1), MTLSizeMake(64, 1, 1)};
     runOnce({d}, 3); compare(name, Y, ref, rows, 2 * N); const uint32_t *cnt = (const uint32_t *)counters.contents; for (uint32_t t = 0; t < N / 64; ++t) if (cnt[t]) { printf("  counter %u not reset (%u)\n", t, cnt[t]); ++failures; } }
   // 4) single-segment sga / sgr / sgg (production ABI) and prefill pfa/pfr/pfg
@@ -289,11 +289,11 @@ int main(int argc, char **argv) { @autoreleasepool {
       std::vector<double> ref((size_t)rows * N); refGemm(Xref, s, rows, N, ref);
       if (fam[2] == 'r') for (size_t i = 0; i < ref.size(); ++i) ref[i] += bf2f(((uint16_t *)A.contents)[i]);
       if (fam[2] == 'g') for (size_t i = 0; i < ref.size(); ++i) { double gg = bf2f(((uint16_t *)A.contents)[i]); ref[i] *= gg / (1.0 + std::exp(-gg)); }
-      KQParams pq{N, K, N / 64, 0, 0}; char name[80]; snprintf(name, sizeof name, "%s_%s_m%u_c32_sg2_k32_b2_p1", fam, fmtName[fi], rows); id<MTLComputePipelineState> ps = pso(lib, name); if (!ps) { ++failures; continue; }
+      GgufParams pq{N, K, N / 64, 0, 0}; char name[80]; snprintf(name, sizeof name, "%s_%s_m%u_c32_sg2_k32_b2_p1", fam, fmtName[fi], rows); id<MTLComputePipelineState> ps = pso(lib, name); if (!ps) { ++failures; continue; }
       std::vector<id<MTLBuffer>> bufs{Xbf, s.w0, s.w1, s.meta, Y}; if (fam[2] != 'a') bufs.push_back(A);
       Dispatch d{ps, bufs, bytes(pq), (int)bufs.size(), MTLSizeMake(N / 64, 1, 1), MTLSizeMake(64, 1, 1)}; runOnce({d}, 1); compare(name, Y, ref, rows, N); }
     { const uint32_t rows = 128; auto [Xbf, Xref] = inputs(rows); id<MTLBuffer> Y = mkbuf(uint64_t(rows) * N * 2); std::vector<double> ref((size_t)rows * N); refGemm(Xref, s, rows, N, ref);
-      KQParams pq{N, K, 0, 0, 0}; char name[80]; snprintf(name, sizeof name, "pfa_%s_r32_sg4_n64_k64_p1", fmtName[fi]); id<MTLComputePipelineState> ps = pso(lib, name); if (!ps) { ++failures; continue; }
+      GgufParams pq{N, K, 0, 0, 0}; char name[80]; snprintf(name, sizeof name, "pfa_%s_r32_sg4_n64_k64_p1", fmtName[fi]); id<MTLComputePipelineState> ps = pso(lib, name); if (!ps) { ++failures; continue; }
       Dispatch d{ps, {Xbf, s.w0, s.w1, s.meta, Y}, bytes(pq), 5, MTLSizeMake(rows / 128, N / 64, 1), MTLSizeMake(128, 1, 1)}; runOnce({d}, 1); compare(name, Y, ref, rows, N); } }
   printf("%s (%d failures)\n", failures ? "VALIDATION FAILED" : "all production kernels validated", failures);
   if (argc > 2 && std::string(argv[2]) == "time-gu") {
@@ -303,10 +303,10 @@ int main(int argc, char **argv) { @autoreleasepool {
       for (uint32_t rows : rowsList) {
         id<MTLBuffer> X = mkbuf(uint64_t(rows) * KK * 2), Y = mkbuf(uint64_t(rows) * NN * 2), G = mkbuf(uint64_t(rows) * NN * 2);
         std::fill_n((uint16_t *)X.contents, size_t(rows) * KK, f2bf(0.25f));
-        KQGateUpParams gp{KK, NN, NN, kFmtId[g.fmt], kFmtId[u.fmt]};
-        KQParams pq{NN, KK, NN / 64, 0, 0};
+        GgufGateUpParams gp{KK, NN, NN, kFmtId[g.fmt], kFmtId[u.fmt]};
+        GgufParams pq{NN, KK, NN / 64, 0, 0};
         char fused[40], gate[80], up[80];
-        snprintf(fused, sizeof fused, "kqgu_m%u", rows);
+        snprintf(fused, sizeof fused, "gguf_gateup_m%u", rows);
         snprintf(gate, sizeof gate, "sga_%s_m%u_c32_sg2_k32_b2_p1", fmtName[g.fmt], rows);
         snprintf(up, sizeof up, "sgg_%s_m%u_c32_sg2_k32_b2_p1", fmtName[u.fmt], rows);
         Dispatch df{pso(lib, fused), {X, g.w0, g.w1, g.meta, u.w0, u.w1, u.meta, Y}, bytes(gp), 8, MTLSizeMake(NN / 64, 1, 1), MTLSizeMake(64, 1, 1)};
@@ -317,21 +317,21 @@ int main(int argc, char **argv) { @autoreleasepool {
       }
     }
   }
-  if (argc > 2 && std::string(argv[2]) == "time") {   // runtime-format-switch cost: kqf (1 segment) vs sga, serialized by a dependent touch kernel
-    const uint32_t KK = 5120, rows = 8; id<MTLComputePipelineState> touch = pso(lib, "kq_touch");
+  if (argc > 2 && std::string(argv[2]) == "time") {   // runtime-format-switch cost: gguf_fused (1 segment) vs sga, serialized by a dependent touch kernel
+    const uint32_t KK = 5120, rows = 8; id<MTLComputePipelineState> touch = pso(lib, "gguf_touch");
     for (uint32_t NN : {16640u, 17408u}) for (int fi : {0, 1, 3}) { Seg s = makeSegK((Fmt)fi, NN, KK, 0);
       id<MTLBuffer> Xbf = mkbuf(uint64_t(rows) * KK * 2), Y = mkbuf(uint64_t(rows) * NN * 2); { uint16_t *a = (uint16_t *)Xbf.contents; std::uniform_real_distribution<float> d(-1.f, 1.f); for (uint64_t i = 0; i < uint64_t(rows) * KK; ++i) a[i] = f2bf(d(rng)); }
-      KQFusedParams fp{KK, NN, 1, 0, {NN, 0, 0}, {kFmtId[s.fmt], 0, 0}, {0, 0, 0}}; KQParams pq{NN, KK, NN / 64, 0, 0};
-      Dispatch df{pso(lib, "kqf_m8"), {Xbf, s.w0, s.w1, s.meta, s.w0, s.w1, s.meta, s.w0, s.w1, s.meta, Y}, bytes(fp), 11, MTLSizeMake(NN / 64, 1, 1), MTLSizeMake(64, 1, 1)};
+      GgufFusedParams fp{KK, NN, 1, 0, {NN, 0, 0}, {kFmtId[s.fmt], 0, 0}, {0, 0, 0}}; GgufParams pq{NN, KK, NN / 64, 0, 0};
+      Dispatch df{pso(lib, "gguf_fused_m8"), {Xbf, s.w0, s.w1, s.meta, s.w0, s.w1, s.meta, s.w0, s.w1, s.meta, Y}, bytes(fp), 11, MTLSizeMake(NN / 64, 1, 1), MTLSizeMake(64, 1, 1)};
       char nm[80]; snprintf(nm, sizeof nm, "sga_%s_m8_c32_sg2_k32_b2_p1", fmtName[fi]); Dispatch ds{pso(lib, nm), {Xbf, s.w0, s.w1, s.meta, Y}, bytes(pq), 5, MTLSizeMake(NN / 64, 1, 1), MTLSizeMake(64, 1, 1)};
       Dispatch dt{touch ? touch : pso(lib, nm), {Y}, {}, -1, MTLSizeMake(1, 1, 1), MTLSizeMake(32, 1, 1)};
       auto timeS = [&](Dispatch d) { auto run = [&](int n) { id<MTLCommandBuffer> cb = [queue commandBuffer]; id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
           for (int it = 0; it < n; ++it) for (auto *x : {&d, &dt}) { [enc setComputePipelineState:x->p]; for (size_t i = 0; i < x->bufs.size(); ++i) [enc setBuffer:x->bufs[i] offset:0 atIndex:i]; if (x->paramIndex >= 0) [enc setBytes:x->params.data() length:x->params.size() atIndex:x->paramIndex]; [enc dispatchThreadgroups:x->grid threadsPerThreadgroup:x->tg]; }
           [enc endEncoding]; [cb commit]; [cb waitUntilCompleted]; return (cb.GPUEndTime - cb.GPUStartTime) / n; }; run(2); double best = 1e9; for (int r = 0; r < 5; ++r) best = std::min(best, run(20)); return best; };
       const double bytes = double(streamBytes((Fmt)fi, NN, KK)); const double tf = timeS(df), ts = timeS(ds);
-      printf("N=%u %-6s serialized: kqf(switch) %.3f ms (%.0f GB/s)  sga(compile-time) %.3f ms (%.0f GB/s)\n", NN, fmtName[fi], tf * 1e3, bytes / tf / 1e9, ts * 1e3, bytes / ts / 1e9); } }
+      printf("N=%u %-6s serialized: gguf_fused(switch) %.3f ms (%.0f GB/s)  sga(compile-time) %.3f ms (%.0f GB/s)\n", NN, fmtName[fi], tf * 1e3, bytes / tf / 1e9, ts * 1e3, bytes / ts / 1e9); } }
   if (argc > 2 && std::string(argv[2]) == "time2") {   // narrow projections at M=8, serialized: split-K counts vs splash's residual_paired kernel
-    id<MTLComputePipelineState> touch = pso(lib, "kq_touch");
+    id<MTLComputePipelineState> touch = pso(lib, "gguf_touch");
     auto timeS = [&](Dispatch d, id<MTLBuffer> y) { Dispatch dt{touch, {y}, {}, -1, MTLSizeMake(1, 1, 1), MTLSizeMake(32, 1, 1)};
       auto run = [&](int n) { id<MTLCommandBuffer> cb = [queue commandBuffer]; id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         for (int it = 0; it < n; ++it) for (auto *x : {&d, &dt}) { [enc setComputePipelineState:x->p]; for (size_t i = 0; i < x->bufs.size(); ++i) [enc setBuffer:x->bufs[i] offset:0 atIndex:i]; if (x->paramIndex >= 0) [enc setBytes:x->params.data() length:x->params.size() atIndex:x->paramIndex]; [enc dispatchThreadgroups:x->grid threadsPerThreadgroup:x->tg]; }
@@ -347,16 +347,16 @@ int main(int argc, char **argv) { @autoreleasepool {
       Dispatch dsp{pso(lib, "decode_linear_q4_n128_residual_paired"), {Xbf, Ws, Ss, Bs, R, Y}, bytes(qp), 6, MTLSizeMake(sgroups, 1, 1), MTLSizeMake(256, 1, 1)};
       const double tsp = timeS(dsp, Y); printf("\n== %ux%u  splash residual_paired: %.3f ms (%.0f GB/s)\n", N, KK, tsp * 1e3, (wb + 2 * sb) / tsp / 1e9);
       for (int fi : {0, 1, 3, 4}) { Seg s = makeSegK((Fmt)fi, N, KK, 0); const double gb = double(streamBytes((Fmt)fi, N, KK));
-        char nm[80]; snprintf(nm, sizeof nm, "sgr_%s_m8_c32_sg2_k32_b2_p1", fmtName[fi]); KQParams pq{N, KK, N / 64, 0, 0};
+        char nm[80]; snprintf(nm, sizeof nm, "sgr_%s_m8_c32_sg2_k32_b2_p1", fmtName[fi]); GgufParams pq{N, KK, N / 64, 0, 0};
         Dispatch d1{pso(lib, nm), {Xbf, s.w0, s.w1, s.meta, Y, R}, bytes(pq), 6, MTLSizeMake(N / 64, 1, 1), MTLSizeMake(64, 1, 1)}; double t1 = timeS(d1, Y);
         printf("  %-6s no-split %.3f ms (%.0f GB/s, ratio %.2f)", fmtName[fi], t1 * 1e3, gb / t1 / 1e9, tsp / t1);
-        for (uint32_t splits : {2u, 4u, 8u}) { if ((KK / 32) % splits) continue; snprintf(nm, sizeof nm, "kqs_%s_m8", fmtName[fi]); KQSplitParams sp{N, KK, splits, N, 0, 1};
+        for (uint32_t splits : {2u, 4u, 8u}) { if ((KK / 32) % splits) continue; snprintf(nm, sizeof nm, "gguf_splitk_%s_m8", fmtName[fi]); GgufSplitParams sp{N, KK, splits, N, 0, 1};
           Dispatch d2{pso(lib, nm), {Xbf, s.w0, s.w1, s.meta, partials, counters, Y, R}, bytes(sp), 8, MTLSizeMake(N / 64, splits, 1), MTLSizeMake(64, 1, 1)}; double t2 = timeS(d2, Y);
           printf(" | splits %u: %.3f ms (%.0f GB/s, %.2f)", splits, t2 * 1e3, gb / t2 / 1e9, tsp / t2); }
         printf("\n"); } }
   }
   if (argc > 2 && std::string(argv[2]) == "mmap") {   // lm_head Q6_K from the real package file (mmap + no-copy buffers) vs Metal-allocated copies, serialized
-    const char *path = argc > 3 ? argv[3] : "/Users/liang2kl/dev/q4k-m5/pkg-kq/target/head.bin";
+    const char *path = argc > 3 ? argv[3] : "/Users/liang2kl/dev/q4k-m5/pkg-gguf/target/head.bin";
     int fd = open(path, O_RDONLY); struct stat st{}; fstat(fd, &st); void *map = mmap(nullptr, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
     if (map == MAP_FAILED) { perror("mmap"); return 1; }
     const uint32_t N = 248320, KK = 5120, rows = 8; const uint64_t page = 16384;
@@ -367,7 +367,7 @@ int main(int argc, char **argv) { @autoreleasepool {
     id<MTLBuffer> W0 = wrap(off0, p0), W1 = wrap(off1, p1), Mt = wrap(offm, mb);
     id<MTLBuffer> C0 = mkbuf(p0), C1 = mkbuf(p1), Cm = mkbuf(mb); memcpy(C0.contents, (uint8_t *)map + off0, p0); memcpy(C1.contents, (uint8_t *)map + off1, p1); memcpy(Cm.contents, (uint8_t *)map + offm, mb);
     id<MTLBuffer> Xbf = mkbuf(uint64_t(rows) * KK * 2), Y = mkbuf(uint64_t(rows) * N * 2), Y2 = mkbuf(uint64_t(rows) * N * 2); { uint16_t *a = (uint16_t *)Xbf.contents; std::uniform_real_distribution<float> d(-1.f, 1.f); for (uint64_t i = 0; i < uint64_t(rows) * KK; ++i) a[i] = f2bf(d(rng)); }
-    id<MTLComputePipelineState> touch = pso(lib, "kq_touch"), ps = pso(lib, "sga_q6k_m8_c32_sg2_k32_b2_p1"); KQParams pq{N, KK, N / 64, 0, 0};
+    id<MTLComputePipelineState> touch = pso(lib, "gguf_touch"), ps = pso(lib, "sga_q6k_m8_c32_sg2_k32_b2_p1"); GgufParams pq{N, KK, N / 64, 0, 0};
     Dispatch dm{ps, {Xbf, W0, W1, Mt, Y}, bytes(pq), 5, MTLSizeMake(N / 64, 1, 1), MTLSizeMake(64, 1, 1)}, dc{ps, {Xbf, C0, C1, Cm, Y2}, bytes(pq), 5, MTLSizeMake(N / 64, 1, 1), MTLSizeMake(64, 1, 1)};
     auto timeS = [&](Dispatch d, id<MTLBuffer> y, int reps) { Dispatch dt{touch, {y}, {}, -1, MTLSizeMake(1, 1, 1), MTLSizeMake(32, 1, 1)}; std::vector<double> ts;
       for (int r = 0; r < reps; ++r) { id<MTLCommandBuffer> cb = [queue commandBuffer]; id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];

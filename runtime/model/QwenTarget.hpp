@@ -61,7 +61,7 @@ struct QwenMixerGeometry final {
                                              metal::MetalBackend &backend,
                                              const QwenMixerGeometry &geometry,
                                              bool fullAttention,
-                                             bool kquant = false);
+                                             bool ggufTarget = false);
 
 inline constexpr std::string_view kEmbeddingMagic = "MDFE0001";
 
@@ -94,7 +94,7 @@ struct PackedTargetFiles final {
 template <class Weights, class Layout, class Files, class ReadFfn>
 [[nodiscard]] Weights
 readQwenTargetWeights(metal::MetalBackend &backend, const Layout &layout, Files &&files,
-                      ReadFfn readFfn, bool kquant) {
+                      ReadFfn readFfn, bool ggufTarget) {
   const uint64_t allocationBaseline = backend.memoryStats().allocatedBytes;
   Weights result;
   result.layout = layout;
@@ -108,7 +108,7 @@ readQwenTargetWeights(metal::MetalBackend &backend, const Layout &layout, Files 
     auto &layer = result.layers.emplace_back();
     layer.inputNorm = file.section(hiddenBytes, "input-norm");
     layer.mixer = readQwenMixer(file, backend, layout.mixerGeometry(),
-                                fullAttention, kquant);
+                                fullAttention, ggufTarget);
     layer.postAttentionNorm =
         file.section(hiddenBytes, "post-attention-norm");
     readFfn(file, layer);
@@ -119,8 +119,8 @@ readQwenTargetWeights(metal::MetalBackend &backend, const Layout &layout, Files 
   {
     WeightFile file = files.head(layout.layers);
     result.finalNorm = file.section(hiddenBytes, "final-norm");
-    result.logitsProjection = kquant
-        ? readKQuantProjection(file, "logits")
+    result.logitsProjection = ggufTarget
+        ? readGgufProjection(file, "logits")
         : readQ4Projection(file, backend, layout.vocabularySize,
                            layout.hiddenSize, "logits");
     file.finish();
@@ -128,8 +128,8 @@ readQwenTargetWeights(metal::MetalBackend &backend, const Layout &layout, Files 
   }
   {
     WeightFile file = files.embedding(layout.vocabularySize, layout.hiddenSize);
-    result.tokenEmbedding = kquant
-        ? readKQuantEmbedding(file, "embedding")
+    result.tokenEmbedding = ggufTarget
+        ? readGgufEmbedding(file, "embedding")
         : readQ4ProjectionComponents(file, layout.vocabularySize,
                                      layout.hiddenSize, "embedding");
     file.finish();

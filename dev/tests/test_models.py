@@ -105,7 +105,7 @@ class ModelArtifactTest(unittest.TestCase):
             "artifacts": records,
         }
         if variants is not None:
-            manifest["format"].update(name="gguf", target_layer_magic="MDKQ0001")
+            manifest["format"].update(name="gguf", target_layer_magic="MDGG0001")
             manifest["target"] = {
                 "gguf": {
                     "repo_id": self.GGUF_REPO,

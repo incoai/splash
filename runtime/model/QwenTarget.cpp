@@ -89,8 +89,8 @@ constexpr bool isGdnMixer =
 } // namespace
 
 namespace {
-// Concatenates K-quant tensors into one fused projection along output columns.
-ops::Q4Projection readKQuantFused(WeightFile &file, uint32_t outputSize,
+// Concatenates GGUF tensors into one fused projection along output columns.
+ops::Q4Projection readGgufFused(WeightFile &file, uint32_t outputSize,
                                   uint32_t inputSize,
                                   std::initializer_list<const char *> labels) {
   ops::Q4Projection p;
@@ -98,25 +98,25 @@ ops::Q4Projection readKQuantFused(WeightFile &file, uint32_t outputSize,
   p.inputSize = inputSize;
   uint32_t offset = 0;
   for (const char *label : labels) {
-    ops::KQuantSegment s = readKQuantSegment(file, label);
+    ops::GgufSegment s = readGgufSegment(file, label);
     s.columnOffset = offset;
     offset += s.outputSize;
-    p.kq.push_back(std::move(s));
+    p.gguf.push_back(std::move(s));
   }
-  if (offset != outputSize || p.kq.front().inputSize != inputSize)
-    throw WeightStoreError("K-quant fused projection does not match the layout");
+  if (offset != outputSize || p.gguf.front().inputSize != inputSize)
+    throw WeightStoreError("GGUF fused projection does not match the layout");
   return p;
 }
 } // namespace
 
 QwenMixerWeights readQwenMixer(WeightFile &file, metal::MetalBackend &backend,
                                const QwenMixerGeometry &geometry,
-                               bool fullAttention, bool kquant) {
+                               bool fullAttention, bool ggufTarget) {
   constexpr uint64_t kFloat32Bytes = 4;
   if (fullAttention) {
     QwenAttentionWeights attention;
-    attention.inputProjection = kquant
-        ? readKQuantFused(file, geometry.packedAttentionWidth, geometry.hiddenSize,
+    attention.inputProjection = ggufTarget
+        ? readGgufFused(file, geometry.packedAttentionWidth, geometry.hiddenSize,
                           {"attn-q", "attn-k", "attn-v"})
         : readQ4Projection(file, backend, geometry.packedAttentionWidth,
                            geometry.hiddenSize, "attention-input");
@@ -124,15 +124,15 @@ QwenMixerWeights readQwenMixer(WeightFile &file, metal::MetalBackend &backend,
         geometry.attentionHeadDimension, kBFloat16Bytes, "head norm bytes");
     attention.queryNorm = file.section(headNormBytes, "query-norm");
     attention.keyNorm = file.section(headNormBytes, "key-norm");
-    attention.outputProjection = kquant
-        ? readKQuantProjection(file, "attn-output")
+    attention.outputProjection = ggufTarget
+        ? readGgufProjection(file, "attn-output")
         : readQ4Projection(file, backend, geometry.hiddenSize,
                            geometry.attentionWidth, "attention-output");
     return attention;
   }
   QwenGdnWeights gdn;
-  gdn.inputProjection = kquant
-      ? readKQuantFused(file, geometry.packedGdnWidth, geometry.hiddenSize,
+  gdn.inputProjection = ggufTarget
+      ? readGgufFused(file, geometry.packedGdnWidth, geometry.hiddenSize,
                         {"gdn-qkv", "gdn-z", "gdn-ab"})
       : readQ4Projection(file, backend, geometry.packedGdnWidth,
                          geometry.hiddenSize, "gdn-input");
@@ -154,11 +154,11 @@ QwenMixerWeights readQwenMixer(WeightFile &file, metal::MetalBackend &backend,
       checkedWeightMultiply(geometry.gdnHeadDimension, kBFloat16Bytes,
                             "GDN norm bytes"),
       "gdn-norm");
-  if (kquant) {
+  if (ggufTarget) {
     // The GGUF keeps out_proj's input columns in llama.cpp's tiled value-head
     // order; the GDN kernel emits grouped order, so the activation is permuted.
-    gdn.outputProjection = readKQuantProjection(file, "gdn-output");
-    gdn.outputProjection.kqPermuteHeads = true;
+    gdn.outputProjection = readGgufProjection(file, "gdn-output");
+    gdn.outputProjection.ggufPermuteHeads = true;
   } else {
     gdn.outputProjection = readQ4Projection(
         file, backend, geometry.hiddenSize, geometry.attentionWidth, "gdn-output");

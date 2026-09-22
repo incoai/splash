@@ -44,7 +44,7 @@ REPO_ID = re.compile(
 PACKAGE_FORMATS = {
     "splash-packed-q4": (3, "MDFL0006"),
     "splash-packed-q4-moe": (4, "MDFM0001"),
-    "gguf": (3, "MDKQ0001"),
+    "gguf": (3, "MDGG0001"),
 }
 # GGUF packages ship no target weights: manifest.target.gguf names a source
 # repository and its files; owner/repo:VARIANT selects one, downloaded into the

@@ -391,9 +391,9 @@ ModelDescriptor inspectModelPackage(const std::filesystem::path &root) {
       requireEqual(requireUnsigned(manifest, @"schema_version", "schema_version"),
                    3, "schema_version");
       validateCommonFormat(requireObject(manifest, @"format", "model weight format"),
-                           kKQuantMagic);
+                           kGgufImageMagic);
       validateTokenizer(root, descriptor, "qwen3_5_text");
-      descriptor.kquantTarget = true;
+      descriptor.ggufTarget = true;
     } else if (format == "splash-packed-q4-moe") {
       descriptor = qwen36Descriptor(model);
       validateQwen36(manifest, root, descriptor);

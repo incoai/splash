@@ -10,14 +10,14 @@ namespace {
 
 // Per-32-weight plane layout of every supported type.
 constexpr std::array<FormatLayout, 8> kFormats{{
-    {KQ_FMT_Q4K, ggml::kQ4_K, 256, 144, 16, 0, 16, 8, 1},
-    {KQ_FMT_IQ4XS, ggml::kIQ4_XS, 256, 136, 16, 0, 8, 8, 0},
-    {KQ_FMT_IQ4NL, ggml::kIQ4_NL, 32, 18, 16, 0, 2, 1, 1},
-    {KQ_FMT_Q5K, ggml::kQ5_K, 256, 176, 16, 4, 16, 8, 1},
-    {KQ_FMT_Q6K, ggml::kQ6_K, 256, 210, 16, 8, 20, 8, 1},
-    {KQ_FMT_Q3K, ggml::kQ3_K, 256, 110, 8, 4, 16, 8, 1},
-    {KQ_FMT_Q80, ggml::kQ8_0, 32, 34, 32, 0, 2, 1, 1},
-    {KQ_FMT_IQ3S, ggml::kIQ3_S, 256, 110, 16, 0, 2, 8, 1},
+    {GGUF_FMT_Q4K, ggml::kQ4_K, 256, 144, 16, 0, 16, 8, 1},
+    {GGUF_FMT_IQ4XS, ggml::kIQ4_XS, 256, 136, 16, 0, 8, 8, 0},
+    {GGUF_FMT_IQ4NL, ggml::kIQ4_NL, 32, 18, 16, 0, 2, 1, 1},
+    {GGUF_FMT_Q5K, ggml::kQ5_K, 256, 176, 16, 4, 16, 8, 1},
+    {GGUF_FMT_Q6K, ggml::kQ6_K, 256, 210, 16, 8, 20, 8, 1},
+    {GGUF_FMT_Q3K, ggml::kQ3_K, 256, 110, 8, 4, 16, 8, 1},
+    {GGUF_FMT_Q80, ggml::kQ8_0, 32, 34, 32, 0, 2, 1, 1},
+    {GGUF_FMT_IQ3S, ggml::kIQ3_S, 256, 110, 16, 0, 2, 8, 1},
 }};
 
 constexpr uint32_t kNoPermute = 0xFFFFFFFFu;

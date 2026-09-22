@@ -95,31 +95,31 @@ WeightFile GgufTargetLoader::build(const gguf::Image &image, uint32_t expectedLa
       sink ^= static_cast<const uint8_t *>(mapping->address)[offset];
     metal::MetalBuffer source = backend_->wrapSharedMemory(
         mapping->address, length, mapping, "gguf/" + image.name);
-    std::vector<KQRepackParams> repackParams;
-    std::vector<KQCopyParams> copyParams;
+    std::vector<GgufRepackParams> repackParams;
+    std::vector<GgufCopyParams> copyParams;
     repackParams.reserve(image.repacks.size());
     copyParams.reserve(image.copies.size());
     std::vector<metal::ComputeDispatch> dispatches;
     for (const gguf::Repack &repack : image.repacks) {
-      KQRepackParams params = repack.params;
+      GgufRepackParams params = repack.params;
       params.src_offset = static_cast<uint32_t>(repack.sourceOffset - base);
       repackParams.push_back(params);
       const uint64_t threads = uint64_t{params.rows} * (params.input_size / 32);
-      dispatches.push_back({"kq_repack", {{0, source}, {1, buffer}},
-                            {{2, &repackParams.back(), sizeof(KQRepackParams)}},
+      dispatches.push_back({"gguf_repack", {{0, source}, {1, buffer}},
+                            {{2, &repackParams.back(), sizeof(GgufRepackParams)}},
                             {(threads + 255) / 256, 1, 1}, {256, 1, 1}});
     }
     for (const gguf::Copy &copy : image.copies) {
-      KQCopyParams params = copy.params;
+      GgufCopyParams params = copy.params;
       params.src_offset = static_cast<uint32_t>(copy.sourceOffset - base);
       copyParams.push_back(params);
-      dispatches.push_back({"kq_copy", {{0, source}, {1, buffer}},
-                            {{2, &copyParams.back(), sizeof(KQCopyParams)}},
+      dispatches.push_back({"gguf_copy", {{0, source}, {1, buffer}},
+                            {{2, &copyParams.back(), sizeof(GgufCopyParams)}},
                             {(uint64_t{params.bytes} / 16 + 255) / 256, 1, 1}, {256, 1, 1}});
     }
     static_cast<void>(backend_->submitCommand(dispatches));
   }
-  return WeightFile(*backend_, std::move(buffer), "target/" + image.name, kKQuantMagic,
+  return WeightFile(*backend_, std::move(buffer), "target/" + image.name, kGgufImageMagic,
                     expectedLayer, expectedType);
 }
 
