@@ -154,8 +154,12 @@ Only the shared files and the selected variant are downloaded. The installed mod
 python3 dev/tools/convert_gguf_to_splash.py Qwen3.8-27B-UD-Q5_K_M.gguf out   # writes out/target/
 ```
 
-Upload `out/target/` as `variants/UD-Q5_K_M/target/` and add the variant's artifact records
-to the manifest. The kernels are in `runtime/metal/kernels/shared/kquant.metal` (ABI in
+`dev/tools/publish_gguf_variant.py --repo <owner/repo> --variant UD-Q5_K_M --target out/target
+--source-repo unsloth/Qwen3.8-27B-GGUF --source-file Qwen3.8-27B-UD-Q5_K_M.gguf` uploads it as
+`variants/UD-Q5_K_M/target/`, verifies the Hub copy and adds the variant to the manifest.
+Unsloth variants whose tensor types are all supported (the UD-Q4_K_M/XL, Q5_K_M/S/XL, Q6_K,
+Q6_K_L/M/XL, Q8_K_L and Q8_0 files) convert as they are; the 2-bit, IQ2/IQ3_XXS, IQ1, Q4_0/Q4_1
+and BF16-bearing files need kernels that do not exist yet. The kernels are in `runtime/metal/kernels/shared/kquant.metal` (ABI in
 `runtime/metal/abi/KQuant.h`), the dispatch policy in `runtime/ops/Linear.cpp`. Measurements,
 harnesses and the design note for loading GGUF files without a package are in
 `dev/benchmarks/kquant/`.
