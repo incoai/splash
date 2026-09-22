@@ -14,12 +14,39 @@ namespace splash::ops {
 
 // Immutable views of one packed Q4 projection.  StorageN is part of the
 // package ABI; the operator may choose a different compute tile at runtime.
+// One GGUF K-quant tensor occupying output columns [columnOffset,
+// columnOffset + outputSize) of a projection. Layouts and kernels live in
+// metal/abi/KQuant.h and kernels/shared/kquant.metal.
+struct KQuantSegment final {
+  metal::MetalBuffer plane0;
+  metal::MetalBuffer plane1;
+  metal::MetalBuffer meta;
+  uint32_t type = 0;
+  uint32_t outputSize = 0;
+  uint32_t inputSize = 0;
+  uint32_t p0 = 0;
+  uint32_t p1 = 0;
+  uint32_t metaBytes = 0;
+  uint32_t metaGroups = 0;
+  uint32_t columnOffset = 0;
+  uint32_t formatId = 0;    // KQ_FMT_* runtime id (metal/abi/KQuant.h)
+  const char *format = "";
+};
+
 struct Q4Projection final {
   metal::MetalBuffer weights;
   metal::MetalBuffer scales;
   metal::MetalBuffer biases;
   uint32_t outputSize = 0;
   uint32_t inputSize = 0;
+  // Non-empty: a GGUF K-quant projection; weights/scales/biases are unused.
+  std::vector<KQuantSegment> kq;
+  // GDN out_proj: permute 128-wide input head blocks (grouped -> tiled) first.
+  bool kqPermuteHeads = false;
+  metal::MetalBuffer kqPartials;    // fp32 split-K partials scratch (shared)
+  metal::MetalBuffer kqPermuted;    // bf16 permuted activations scratch (shared)
+  metal::MetalBuffer kqPermutation; // uint32 head permutation table
+  metal::MetalBuffer kqCounters;    // split-K arrival counters (one uint per 64-column tile, zero at rest)
 };
 
 // Q8 affine projections use per-64-input quantization and StorageN=256 order.

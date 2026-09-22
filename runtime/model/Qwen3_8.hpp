@@ -92,6 +92,6 @@ struct Qwen3_8Weights final {
 [[nodiscard]] Qwen3_8Weights
 loadQwen3_8Weights(metal::MetalBackend &backend,
                    const std::filesystem::path &directory,
-                   Qwen3_8Layout layout = {});
+                   Qwen3_8Layout layout = {}, bool kquant = false);
 
 } // namespace splash::model

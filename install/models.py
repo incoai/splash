@@ -43,6 +43,7 @@ REPO_ID = re.compile(
 PACKAGE_FORMATS = {
     "splash-packed-q4": (3, "MDFL0006"),
     "splash-packed-q4-moe": (4, "MDFM0001"),
+    "gguf-kquant": (3, "MDKQ0001"),
 }
 
 

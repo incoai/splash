@@ -125,6 +125,28 @@ fine-tunes may use any nonempty manifest model name. Native loading validates
 geometry, tensor sizes, binary headers, tokenizer and target/draft compatibility.
 New architectures require engine support; ordinary HF weights need conversion.
 
+### GGUF K-quant packages
+
+Qwen3.8-27B can also be served from a llama.cpp GGUF (for example Unsloth's
+`Qwen3.8-27B-UD-Q4_K_M.gguf`) through the `gguf-kquant` format (schema 3, target layer
+magic `MDKQ0001`). The quantized values are kept bit for bit: `dev/tools/convert_gguf_to_splash.py`
+splits every block into a payload plane, an optional high-bit plane and a per-superblock
+header plane, and stores them in 256-column tiles so decode reads are coalesced. Supported
+tensor types are Q4_K, Q5_K, Q6_K, Q3_K, IQ4_XS, IQ4_NL, Q8_0 and IQ3_S; the token embedding
+stays in native `block_q4_K` rows. The draft, vision and tokenizer come from the matching
+`splash-packed-q4` package.
+
+```sh
+python3 dev/tools/convert_gguf_to_splash.py Qwen3.8-27B-UD-Q4_K_M.gguf pkg   # writes pkg/target/
+```
+
+Add `draft/`, `vision/`, `tokenizer/` and a manifest with `format.name` `gguf-kquant`,
+`format.target_layer_magic` `MDKQ0001` and the artifact list, then serve `pkg` like any other
+package. The kernels are in `runtime/metal/kernels/shared/kquant.metal` (ABI in
+`runtime/metal/abi/KQuant.h`), the dispatch policy in `runtime/ops/Linear.cpp`. Measurements,
+harnesses and the design note for loading GGUF files without a package are in
+`dev/benchmarks/kquant/`.
+
 ## Code and API boundaries
 
 - `server/`: OpenAI Chat/Responses, Anthropic Messages/count_tokens, typed

@@ -29,6 +29,8 @@ struct ModelDescriptor final {
   // Exact bytes parsed during package inspection, including artifact digests.
   // Synthetic descriptors retain zero; this is separate from layout identity.
   std::array<uint8_t, 32> packageManifestSha256{};
+  // Target weights are GGUF K-quant tensors (format "gguf-kquant").
+  bool kquantTarget = false;
 
   [[nodiscard]] bool valid() const noexcept;
 };

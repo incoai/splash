@@ -65,6 +65,17 @@ readQ4Projection(WeightFile &file, metal::MetalBackend &backend,
                  uint32_t outputSize, uint32_t inputSize,
                  std::string_view label);
 
+// GGUF K-quant sections: a 64-byte descriptor, then plane0, optional plane1
+// and metadata, each 16 KiB aligned (see convert_gguf_to_splash.py).
+inline constexpr std::string_view kKQuantMagic = "MDKQ0001";
+[[nodiscard]] ops::KQuantSegment readKQuantSegment(WeightFile &file,
+                                                   std::string_view label);
+[[nodiscard]] ops::Q4Projection readKQuantProjection(WeightFile &file,
+                                                     std::string_view label);
+// Native block_q4_K rows for the token table (gathered, never multiplied).
+[[nodiscard]] ops::Q4Projection readKQuantEmbedding(WeightFile &file,
+                                                    std::string_view label);
+
 // Embedding weights, scales and biases are independently aligned sections
 // so token gather can bind each table directly.
 [[nodiscard]] ops::Q4Projection

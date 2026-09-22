@@ -60,7 +60,8 @@ struct QwenMixerGeometry final {
 [[nodiscard]] QwenMixerWeights readQwenMixer(WeightFile &file,
                                              metal::MetalBackend &backend,
                                              const QwenMixerGeometry &geometry,
-                                             bool fullAttention);
+                                             bool fullAttention,
+                                             bool kquant = false);
 
 inline constexpr std::string_view kEmbeddingMagic = "MDFE0001";
 
@@ -72,7 +73,9 @@ template <class Weights, class Layout, class ReadFfn>
 loadQwenTargetWeights(metal::MetalBackend &backend,
                       const std::filesystem::path &directory,
                       const Layout &layout, std::string_view headMagic,
-                      ReadFfn readFfn) {
+                      ReadFfn readFfn, bool kquant = false) {
+  const std::string_view layerMagic = kquant ? kKQuantMagic : Layout::layerMagic;
+  if (kquant) headMagic = kKQuantMagic;
   const uint64_t allocationBaseline = backend.memoryStats().allocatedBytes;
   Weights result;
   result.layout = layout;
@@ -85,11 +88,11 @@ loadQwenTargetWeights(metal::MetalBackend &backend,
     const std::string filename =
         "layer-" + std::to_string(layerIndex) + ".bin";
     WeightFile file(backend, directory / filename, "target/" + filename,
-                    Layout::layerMagic, layerIndex, fullAttention ? 1U : 0U);
+                    layerMagic, layerIndex, fullAttention ? 1U : 0U);
     auto &layer = result.layers.emplace_back();
     layer.inputNorm = file.section(hiddenBytes, "input-norm");
-    layer.mixer =
-        readQwenMixer(file, backend, layout.mixerGeometry(), fullAttention);
+    layer.mixer = readQwenMixer(file, backend, layout.mixerGeometry(),
+                                fullAttention, kquant);
     layer.postAttentionNorm =
         file.section(hiddenBytes, "post-attention-norm");
     readFfn(file, layer);
@@ -101,17 +104,22 @@ loadQwenTargetWeights(metal::MetalBackend &backend,
     WeightFile file(backend, directory / "head.bin", "target/head.bin",
                     headMagic, layout.layers, 2);
     result.finalNorm = file.section(hiddenBytes, "final-norm");
-    result.logitsProjection = readQ4Projection(
-        file, backend, layout.vocabularySize, layout.hiddenSize, "logits");
+    result.logitsProjection = kquant
+        ? readKQuantProjection(file, "logits")
+        : readQ4Projection(file, backend, layout.vocabularySize,
+                           layout.hiddenSize, "logits");
     file.finish();
     result.files.push_back(file.record());
   }
   {
     WeightFile file(backend, directory / "embedding.bin",
-                    "target/embedding.bin", kEmbeddingMagic,
+                    "target/embedding.bin",
+                    kquant ? kKQuantMagic : kEmbeddingMagic,
                     layout.vocabularySize, layout.hiddenSize);
-    result.tokenEmbedding = readQ4ProjectionComponents(
-        file, layout.vocabularySize, layout.hiddenSize, "embedding");
+    result.tokenEmbedding = kquant
+        ? readKQuantEmbedding(file, "embedding")
+        : readQ4ProjectionComponents(file, layout.vocabularySize,
+                                     layout.hiddenSize, "embedding");
     file.finish();
     result.files.push_back(file.record());
   }
