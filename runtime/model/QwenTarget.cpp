@@ -156,9 +156,10 @@ QwenMixerWeights readQwenMixer(WeightFile &file, metal::MetalBackend &backend,
       "gdn-norm");
   if (ggufTarget) {
     // The GGUF keeps out_proj's input columns in llama.cpp's tiled value-head
-    // order; the GDN kernel emits grouped order, so the activation is permuted.
+    // order; the GDN kernel emits grouped order, so the GEMM remaps K per slice.
     gdn.outputProjection = readGgufProjection(file, "gdn-output");
-    gdn.outputProjection.ggufPermuteHeads = true;
+    gdn.outputProjection.ggufPermuteK =
+        geometry.gdnKeyHeads | ((geometry.gdnValueHeads / geometry.gdnKeyHeads) << 16);
   } else {
     gdn.outputProjection = readQ4Projection(
         file, backend, geometry.hiddenSize, geometry.attentionWidth, "gdn-output");

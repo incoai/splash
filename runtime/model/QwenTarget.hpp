@@ -54,6 +54,7 @@ struct QwenMixerGeometry final {
   uint32_t gdnHeadDimension = 0;
   uint32_t attentionWidth = 0;
   uint32_t attentionHeadDimension = 0;
+  uint32_t gdnKeyHeads = 0;
 };
 
 // Reads the mixer sections that follow a layer's input norm, in file order.

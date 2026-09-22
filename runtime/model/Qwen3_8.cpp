@@ -91,30 +91,17 @@ Qwen3_8Weights loadQwen3_8Weights(metal::MetalBackend &backend,
                                                     readFfn);
   }
   if (!ggufTarget) return weights;
-  // Shared scratch for the GGUF kernels: split-K partials (8 splits x 32 rows x
-  // widest projection), permuted GDN out_proj activations for the prefill budget,
-  // and the grouped -> tiled value-head permutation.
+  // Shared scratch for the GGUF kernels: split-K partials (8 splits x 32 rows x the
+  // widest projection) and the per-tile split-K arrival counters.
   const uint32_t widest = std::max({layout.packedGdnWidth, layout.packedFullWidth,
                                     layout.intermediateSize, layout.hiddenSize});
   metal::MetalBuffer partials = backend.allocateBuffer(
       uint64_t{8} * 32 * widest * 4, metal::BufferStorage::Shared, "gguf-partials");
-  metal::MetalBuffer permuted = backend.allocateBuffer(
-      uint64_t{SPLASH_PREFILL_TOKEN_BUDGET} * layout.attentionWidth * 2,
-      metal::BufferStorage::Shared, "gguf-permuted");
-  const uint32_t heads = layout.gdnValueHeads, keyHeads = layout.gdnKeyHeads;
-  const uint32_t perHead = heads / keyHeads;
-  metal::MetalBuffer permutation = backend.allocateBuffer(
-      uint64_t{heads} * 4, metal::BufferStorage::Shared, "gguf-permutation");
   metal::MetalBuffer counters = backend.allocateBuffer(
       uint64_t{widest / 64} * 4, metal::BufferStorage::Shared, "gguf-counters");
   std::memset(counters.contents(), 0, counters.sizeBytes());
-  auto *table = static_cast<uint32_t *>(permutation.contents());
-  for (uint32_t tiled = 0; tiled < heads; ++tiled)
-    table[tiled] = (tiled % keyHeads) * perHead + tiled / keyHeads;
   const auto attach = [&](ops::Q4Projection &p) {
     p.kqPartials = partials;
-    p.kqPermuted = permuted;
-    p.kqPermutation = permutation;
     p.kqCounters = counters;
   };
   for (Qwen3_8LayerWeights &layer : weights.layers) {

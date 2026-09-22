@@ -227,11 +227,21 @@ struct FmtIQ3S {
   }
 };
 
+// The GDN out_proj weight keeps its K columns in llama.cpp's tiled value-head order while splash's GDN
+// kernel emits grouped order; k_permute = key_heads | (groups << 16) maps a weight K offset to the
+// activation column it multiplies (K slices never straddle a head, so one remap per slice suffices).
+inline uint gguf_permute_k(uint k, uint input_size, uint spec) {
+  if (spec == 0) return k;
+  const uint key_heads = spec & 0xFFFFu, groups = spec >> 16, width = input_size / (key_heads * groups);
+  const uint t = k / width;
+  return ((t % key_heads) * groups + t / key_heads) * width + k % width;
+}
+
 // ---------------- sg: each simdgroup stages its own Cols x KS sub-tile privately and runs matmul2d alone
 template <class F, typename TA, typename TO, ushort Rows, ushort Cols, ushort KS, ushort Buffers, ushort Prefetch, ushort Ep = EpNone>
 inline void sg_tile(device TA *input, device uchar *w0, device uchar *w1, device uchar *meta, device TO *output,
                     uint output_size, uint input_size, uint output_origin, threadgroup half *stage, threadgroup half2 *tl,
-                    uint simd_lane, uint step_begin, uint step_end, uint out_stride = 0, uint out_offset = 0, device bfloat *aux = nullptr) {
+                    uint simd_lane, uint step_begin, uint step_end, uint kperm, uint out_stride = 0, uint out_offset = 0, device bfloat *aux = nullptr) {
   if (out_stride == 0) out_stride = output_size;
   constexpr ushort GPS = KS / 32, Items = Cols * GPS, IPT = (Items + 31) / 32;
   auto a = tensor(input, dextents<int, 2>{int(input_size), Rows}, array<int, 2>{1, int(input_size)});
@@ -285,7 +295,7 @@ inline void sg_tile(device TA *input, device uchar *w0, device uchar *w1, device
         packed[Prefetch - 1][it] = F::load(tw0 + (g * kStorageN + col) * F::P0, tw1 + (g * kStorageN + col) * F::P1);
       }
     }
-    auto a_slice = a.template slice<KS, Rows>(step * KS, 0);
+    auto a_slice = a.template slice<KS, Rows>(gguf_permute_k(step * KS, input_size, kperm), 0);
     if (Buffers > 1 && (step & 1)) operation.run(a_slice, b1, acc); else operation.run(a_slice, b0, acc);
   }
 #pragma unroll
@@ -306,7 +316,7 @@ inline void sg_tile(device TA *input, device uchar *w0, device uchar *w1, device
 template <class F, typename TA, ushort RowsPerSG, ushort Simdgroups, ushort TileN, ushort KS, ushort Prefetch, ushort Ep = EpNone>
 inline void pf_tile(device TA *input, device uchar *w0, device uchar *w1, device uchar *meta, device bfloat *output,
                     uint output_size, uint input_size, uint output_origin, threadgroup half *stage, threadgroup half2 *tl,
-                    uint simd_lane, uint simd_group, uint out_stride = 0, uint out_offset = 0, device bfloat *aux = nullptr) {
+                    uint simd_lane, uint simd_group, uint out_stride = 0, uint out_offset = 0, device bfloat *aux = nullptr, uint kperm = 0) {
   if (out_stride == 0) out_stride = output_size;
   constexpr ushort Threads = Simdgroups * 32, GPS = KS / 32, Items = TileN * GPS, IPT = (Items + Threads - 1) / Threads;
   auto a = tensor(input + ulong(simd_group) * RowsPerSG * input_size, dextents<int, 2>{int(input_size), RowsPerSG}, array<int, 2>{1, int(input_size)});
@@ -359,7 +369,7 @@ inline void pf_tile(device TA *input, device uchar *w0, device uchar *w1, device
         packed[Prefetch - 1][it] = F::load(tw0 + (g * kStorageN + col) * F::P0, tw1 + (g * kStorageN + col) * F::P1);
       }
     }
-    auto a_slice = a.template slice<KS, RowsPerSG>(step * KS, 0);
+    auto a_slice = a.template slice<KS, RowsPerSG>(gguf_permute_k(step * KS, input_size, kperm), 0);
     if (step & 1) operation.run(a_slice, b1, acc); else operation.run(a_slice, b0, acc);
   }
 #pragma unroll
@@ -389,7 +399,7 @@ inline void pf_tile(device TA *input, device uchar *w0, device uchar *w1, device
     threadgroup half stage[S * B * KS * C]; const uint tiles = p.output_size / (S * C), steps = p.input_size / KS; \
     for (uint tile = group; tile < tiles; tile += p.persistent_groups)                                    \
       sg_tile<F, TA, bfloat, R, C, KS, B, P>(input, w0, w1, meta, output, p.output_size, p.input_size, tile * (S * C) + simd_group * C, \
-                                             stage + simd_group * (B * KS * C), tl, simd_lane, 0, steps, p.out_stride, p.out_offset); }
+                                             stage + simd_group * (B * KS * C), tl, simd_lane, 0, steps, p.k_permute, p.out_stride, p.out_offset); }
 // split-K decode: group.y = split, p.persistent_groups = splits, fp32 partials [split][R][N]
 #define SGK_K(F, f, TA, ta, R, C, S, KS, B, P)                                                            \
   kernel void sgk##ta##_##f##_m##R##_c##C##_sg##S##_k##KS##_b##B##_p##P(device TA *input [[buffer(0)]], device uchar *w0 [[buffer(1)]], \
@@ -398,7 +408,7 @@ inline void pf_tile(device TA *input, device uchar *w0, device uchar *w1, device
     constexpr ushort Threads = S * 32; TGLUT_INIT(F)                                                      \
     threadgroup half stage[S * B * KS * C]; const uint steps = p.input_size / KS, per = steps / p.persistent_groups; \
     sg_tile<F, TA, float, R, C, KS, B, P>(input, w0, w1, meta, partials + ulong(group.y) * R * p.output_size, p.output_size, p.input_size, \
-        group.x * (S * C) + simd_group * C, stage + simd_group * (B * KS * C), tl, simd_lane, group.y * per, (group.y + 1) * per); }
+        group.x * (S * C) + simd_group * C, stage + simd_group * (B * KS * C), tl, simd_lane, group.y * per, (group.y + 1) * per, p.k_permute); }
 kernel void gguf_splitk_reduce(device float *partials [[buffer(0)]], device bfloat *output [[buffer(1)]], device bfloat *aux [[buffer(2)]],
                              constant GgufReduceParams &rp [[buffer(3)]], uint tid [[thread_position_in_grid]]) {
   const uint count = rp.rows * rp.cols; if (tid >= count) return; float s = 0.0f;
@@ -415,19 +425,19 @@ kernel void gguf_splitk_reduce(device float *partials [[buffer(0)]], device bflo
     threadgroup half stage[S * B * KS * C]; const uint tiles = p.output_size / (S * C), steps = p.input_size / KS; \
     for (uint tile = group; tile < tiles; tile += p.persistent_groups)                                    \
       sg_tile<F, bfloat, bfloat, R, C, KS, B, P, EP>(input, w0, w1, meta, output, p.output_size, p.input_size, tile * (S * C) + simd_group * C, \
-                                             stage + simd_group * (B * KS * C), tl, simd_lane, 0, steps, p.out_stride, p.out_offset, aux); }
+                                             stage + simd_group * (B * KS * C), tl, simd_lane, 0, steps, p.k_permute, p.out_stride, p.out_offset, aux); }
 #define PFE_K(F, f, EP, ep, R, S, N, KS, P)                                                               \
   kernel void pf##ep##_##f##_r##R##_sg##S##_n##N##_k##KS##_p##P(ABUFE, uint2 group [[threadgroup_position_in_grid]], IDS) { \
     constexpr ushort Threads = S * 32; TGLUT_INIT(F)                                                      \
     threadgroup half stage[2 * KS * N]; const uint rs = p.out_stride ? p.out_stride : p.output_size;      \
     pf_tile<F, bfloat, R, S, N, KS, P, EP>(input + ulong(group.x) * (R * S) * p.input_size, w0, w1, meta, output + ulong(group.x) * (R * S) * rs, \
-                                   p.output_size, p.input_size, group.y * N, stage, tl, simd_lane, simd_group, p.out_stride, p.out_offset, aux + ulong(group.x) * (R * S) * rs); }
+                                   p.output_size, p.input_size, group.y * N, stage, tl, simd_lane, simd_group, p.out_stride, p.out_offset, aux + ulong(group.x) * (R * S) * rs, p.k_permute); }
 #define PF_K(F, f, TA, ta, R, S, N, KS, P)                                                                \
   kernel void pf##ta##_##f##_r##R##_sg##S##_n##N##_k##KS##_p##P(ABUF(TA), uint2 group [[threadgroup_position_in_grid]], IDS) { \
     constexpr ushort Threads = S * 32; TGLUT_INIT(F)                                                      \
     threadgroup half stage[2 * KS * N];                                                                   \
     pf_tile<F, TA, R, S, N, KS, P>(input + ulong(group.x) * (R * S) * p.input_size, w0, w1, meta, output + ulong(group.x) * (R * S) * (p.out_stride ? p.out_stride : p.output_size), \
-                                   p.output_size, p.input_size, group.y * N, stage, tl, simd_lane, simd_group, p.out_stride, p.out_offset); }
+                                   p.output_size, p.input_size, group.y * N, stage, tl, simd_lane, simd_group, p.out_stride, p.out_offset, nullptr, p.k_permute); }
 // ---------------- sg_accum: the decode tile loop without the store; acc is created by the caller (gguf_make_acc) so
 // several formats can accumulate into the same cooperative tensor type (fused segments, gate+up).
 // Initialize in the caller after construction: returning an initialized cooperative tensor
@@ -444,7 +454,7 @@ inline auto gguf_make_acc(device TA *input, uint input_size, threadgroup half *s
 }
 template <class F, typename TA, ushort Rows, ushort Cols, ushort KS, ushort Buffers, ushort Prefetch, class Acc>
 inline void sg_accum(device TA *input, device uchar *w0, device uchar *w1, device uchar *meta, uint input_size, uint output_origin,
-                     threadgroup half *stage, threadgroup half2 *tl, uint simd_lane, uint step_begin, uint step_end, thread Acc &acc) {
+                     threadgroup half *stage, threadgroup half2 *tl, uint simd_lane, uint step_begin, uint step_end, uint kperm, thread Acc &acc) {
   constexpr ushort GPS = KS / 32, Items = Cols * GPS, IPT = (Items + 31) / 32;
   auto a = tensor(input, dextents<int, 2>{int(input_size), Rows}, array<int, 2>{1, int(input_size)});
   constexpr auto descriptor = matmul2d_descriptor(Rows, Cols, KS, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
@@ -493,7 +503,7 @@ inline void sg_accum(device TA *input, device uchar *w0, device uchar *w1, devic
         packed[Prefetch - 1][it] = F::load(tw0 + (g * kStorageN + col) * F::P0, tw1 + (g * kStorageN + col) * F::P1);
       }
     }
-    auto a_slice = a.template slice<KS, Rows>(step * KS, 0);
+    auto a_slice = a.template slice<KS, Rows>(gguf_permute_k(step * KS, input_size, kperm), 0);
     if (Buffers > 1 && (step & 1)) operation.run(a_slice, b1, acc); else operation.run(a_slice, b0, acc);
   }
   simdgroup_barrier(mem_flags::mem_threadgroup);   // the stage may be reused by a following accumulate
@@ -501,16 +511,16 @@ inline void sg_accum(device TA *input, device uchar *w0, device uchar *w1, devic
 // runtime dequantizer selection (uniform per threadgroup)
 template <typename TA, ushort Rows, ushort Cols, ushort KS, ushort Buffers, ushort Prefetch, class Acc>
 inline void gguf_accum_any(uint fmt, device TA *input, device uchar *w0, device uchar *w1, device uchar *meta, uint input_size, uint origin,
-                         threadgroup half *stage, threadgroup half2 *tl, uint simd_lane, uint sb, uint se, thread Acc &acc) {
+                         threadgroup half *stage, threadgroup half2 *tl, uint simd_lane, uint sb, uint se, uint kperm, thread Acc &acc) {
   switch (fmt) {
-  case GGUF_FMT_Q4K: sg_accum<FmtQ4K, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, acc); break;
-  case GGUF_FMT_IQ4XS: sg_accum<FmtIQ4XS<3>, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, acc); break;
-  case GGUF_FMT_IQ4NL: sg_accum<FmtIQ4NL<0>, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, acc); break;
-  case GGUF_FMT_Q5K: sg_accum<FmtQ5K, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, acc); break;
-  case GGUF_FMT_Q6K: sg_accum<FmtQ6K, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, acc); break;
-  case GGUF_FMT_Q3K: sg_accum<FmtQ3K, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, acc); break;
-  case GGUF_FMT_Q80: sg_accum<FmtQ80, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, acc); break;
-  default: sg_accum<FmtIQ3S, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, acc); break;
+  case GGUF_FMT_Q4K: sg_accum<FmtQ4K, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, kperm, acc); break;
+  case GGUF_FMT_IQ4XS: sg_accum<FmtIQ4XS<3>, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, kperm, acc); break;
+  case GGUF_FMT_IQ4NL: sg_accum<FmtIQ4NL<0>, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, kperm, acc); break;
+  case GGUF_FMT_Q5K: sg_accum<FmtQ5K, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, kperm, acc); break;
+  case GGUF_FMT_Q6K: sg_accum<FmtQ6K, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, kperm, acc); break;
+  case GGUF_FMT_Q3K: sg_accum<FmtQ3K, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, kperm, acc); break;
+  case GGUF_FMT_Q80: sg_accum<FmtQ80, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, kperm, acc); break;
+  default: sg_accum<FmtIQ3S, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, kperm, acc); break;
   }
 }
 inline void gguf_init_lut(threadgroup half2 *tl, uint thread_index, uint threads) {
@@ -534,7 +544,7 @@ inline void gguf_init_lut(threadgroup half2 *tl, uint thread_index, uint threads
     threadgroup half *my = stage + simd_group * (2 * 32 * 32);                                              \
     auto acc = gguf_make_acc<bfloat, R, 32, 32>(input, p.input_size, my);                                     \
     for (ushort i = 0; i < acc.get_capacity(); ++i) acc[i] = 0.0f;                                    \
-    gguf_accum_any<bfloat, R, 32, 32, 2, 1>(fmt, input, w0, w1, meta, p.input_size, origin, my, tl, simd_lane, 0, steps, acc); \
+    gguf_accum_any<bfloat, R, 32, 32, 2, 1>(fmt, input, w0, w1, meta, p.input_size, origin, my, tl, simd_lane, 0, steps, 0, acc); \
     for (ushort i = 0; i < acc.get_capacity(); ++i) {                                                       \
       if (!acc.is_valid_element(i)) continue;                                                              \
       auto index = acc.get_multidimensional_index(i);                                                      \
@@ -554,10 +564,10 @@ GGUF_FUSED_K(8) GGUF_FUSED_K(16) GGUF_FUSED_K(24) GGUF_FUSED_K(32)
     threadgroup half *my = stage + simd_group * (2 * 32 * 32);   /* one 8 KB stage for both passes: occupancy */ \
     auto gate = gguf_make_acc<bfloat, R, 32, 32>(input, p.input_size, my);                                    \
     for (ushort i = 0; i < gate.get_capacity(); ++i) gate[i] = 0.0f;                                   \
-    gguf_accum_any<bfloat, R, 32, 32, 2, 1>(p.gate_fmt, input, gw0, gw1, gm, p.input_size, origin, my, tl, simd_lane, 0, steps, gate); \
+    gguf_accum_any<bfloat, R, 32, 32, 2, 1>(p.gate_fmt, input, gw0, gw1, gm, p.input_size, origin, my, tl, simd_lane, 0, steps, 0, gate); \
     auto up = gguf_make_acc<bfloat, R, 32, 32>(input, p.input_size, my);                                      \
     for (ushort i = 0; i < up.get_capacity(); ++i) up[i] = 0.0f;                                     \
-    gguf_accum_any<bfloat, R, 32, 32, 2, 1>(p.up_fmt, input, uw0, uw1, um, p.input_size, origin, my, tl, simd_lane, 0, steps, up); \
+    gguf_accum_any<bfloat, R, 32, 32, 2, 1>(p.up_fmt, input, uw0, uw1, um, p.input_size, origin, my, tl, simd_lane, 0, steps, 0, up); \
     for (ushort i = 0; i < gate.get_capacity(); ++i) {                                                      \
       if (!gate.is_valid_element(i)) continue;                                                             \
       auto index = gate.get_multidimensional_index(i);                                                     \
@@ -578,7 +588,7 @@ inline void gguf_splitk_tile(device bfloat *input, device uchar *w0, device ucha
   auto acc = gguf_make_acc<bfloat, Rows, 32, 32>(input, p.input_size, my);
 #pragma unroll
   for (ushort i = 0; i < acc.get_capacity(); ++i) acc[i] = 0.0f;
-  sg_accum<F, bfloat, Rows, 32, 32, 2, 1>(input, w0, w1, meta, p.input_size, origin, my, tl, simd_lane, group.y * per, (group.y + 1) * per, acc);
+  sg_accum<F, bfloat, Rows, 32, 32, 2, 1>(input, w0, w1, meta, p.input_size, origin, my, tl, simd_lane, group.y * per, (group.y + 1) * per, p.k_permute, acc);
   const ulong N = p.output_size;
 #pragma unroll
   for (ushort i = 0; i < acc.get_capacity(); ++i) {
@@ -671,14 +681,6 @@ kernel void gguf_embed_q80(device const uint *tokens [[buffer(0)]], device const
   const half d = as_type<half>(ushort(blk[0] | (blk[1] << 8)));
   output[index] = bfloat(float(d) * float(as_type<char>(blk[2 + dim % 32])));
 }
-// permute the K columns (in 128-wide head blocks) of a bf16 activation: out[row][h*128+e] = in[row][perm[h]*128+e]
-kernel void gguf_permute_heads(device const bfloat *input [[buffer(0)]], device bfloat *output [[buffer(1)]], device const uint *perm [[buffer(2)]],
-                          constant GgufPermuteParams &p [[buffer(3)]], uint index [[thread_position_in_grid]]) {
-  if (index >= p.rows * p.width) return;
-  const uint row = index / p.width, col = index % p.width, h = col / p.block, e = col % p.block;
-  output[index] = input[ulong(row) * p.width + perm[h] * p.block + e];
-}
-
 // ---- load-time repack: native GGUF rows -> MDGG0001 planes (layout documented in model/GgufImage.hpp) ----
 // One thread per (destination row n, 32-wide K group g). Rows >= permute_from_row are read from
 // llama.cpp's tiled value-head order so the image holds splash's grouped order.

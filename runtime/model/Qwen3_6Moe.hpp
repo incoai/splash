@@ -69,7 +69,7 @@ struct Qwen3_6MoeLayout final {
   [[nodiscard]] constexpr QwenMixerGeometry mixerGeometry() const noexcept {
     return {hiddenSize,     packedGdnWidth, packedFullWidth,
             convolutionDimension, gdnValueHeads,  gdnHeadDimension,
-            attentionWidth, attentionHeadDimension};
+            attentionWidth, attentionHeadDimension, gdnKeyHeads};
   }
 
   bool operator==(const Qwen3_6MoeLayout &) const = default;
