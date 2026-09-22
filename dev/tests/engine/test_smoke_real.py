@@ -10,6 +10,34 @@ from dev.tests import smoke_real
 
 
 class SmokeRealTests(unittest.TestCase):
+    def test_status_checks_selected_kv_format_and_legacy_int8(self):
+        for format in ("int8", "bf16"):
+            kv = {
+                "format": format,
+                "quantization": "symmetric_int8" if format == "int8" else "none",
+                "scale_type": "float32" if format == "int8" else "none",
+            }
+            status = {
+                "ready": True,
+                "metal": {"healthy": True},
+                "transport": {"restarts": 0},
+                "identity": {"cache": {"block_tokens": 32}, "kv": kv},
+            }
+            smoke_real.validate_status(status, format)
+            with self.assertRaises(smoke_real.SmokeFailure):
+                smoke_real.validate_status(
+                    status, "bf16" if format == "int8" else "int8"
+                )
+            if format == "int8":
+                old = {k: v for k, v in kv.items() if k != "format"}
+                self.assertEqual(smoke_real.kv_identity({"q8": old}), kv)
+                status["identity"] = {"cache": {"block_tokens": 32}, "q8": old}
+                smoke_real.validate_status(status, "int8")
+            else:
+                kv["scale_type"] = "float32"
+                with self.assertRaises(smoke_real.SmokeFailure):
+                    smoke_real.validate_status(status, "bf16")
+
     def test_server_paths_are_resolved_from_caller_directory(self):
         with TemporaryDirectory() as directory, contextlib.chdir(directory):
             package = Path("model package")
@@ -22,6 +50,7 @@ class SmokeRealTests(unittest.TestCase):
                         model="test-model",
                         max_context=None,
                         max_memory=None,
+                        kv_format="bf16" if absolute else "int8",
                     )
                     with (
                         mock.patch.object(
@@ -33,6 +62,10 @@ class SmokeRealTests(unittest.TestCase):
                         server = smoke_real.RealServer(arguments)
                         try:
                             command = popen.call_args.args[0]
+                            self.assertEqual(
+                                command[command.index("--kv-format") + 1],
+                                arguments.kv_format,
+                            )
                             self.assertEqual(
                                 popen.call_args.kwargs["cwd"], smoke_real.ROOT
                             )
