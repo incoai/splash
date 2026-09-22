@@ -155,7 +155,7 @@ tensor types are Q4_K, Q5_K, Q6_K, Q3_K, IQ4_XS, IQ4_NL, Q8_0 and IQ3_S for line
 Q6_K or Q8_0 token embeddings; the loader lists every unsupported tensor in one error. Of
 Unsloth's files that covers UD-Q4_K_M/XL, UD-Q5_K_M/S/XL, UD-Q6_K and Q6_K_L/M/XL, UD-Q8_K_L
 and Q8_0; the 2-bit, IQ2/IQ3_XXS, IQ1, Q4_0/Q4_1 and BF16-bearing files need kernels that do not
-exist yet (`dev/tools/gguf_survey.py` reports a file's types from its header).
+exist yet.
 
 The GEMM kernels are in
 `runtime/metal/kernels/shared/kquant.metal` (ABI in `runtime/metal/abi/KQuant.h`), the dispatch
