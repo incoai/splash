@@ -329,23 +329,26 @@ uint32_t Scheduler::prefillBudget(
 }
 
 std::optional<BatchPlan> Scheduler::nextDecode() const {
-  std::vector<const Request *> ready;
-  for (const auto &[_, request] : requests_) {
-    if (request.phase == Phase::Decode)
-      ready.push_back(&request);
-  }
-  if (ready.empty())
-    return std::nullopt;
-  std::sort(ready.begin(), ready.end(), [](const Request *a, const Request *b) {
+  const auto before = [](const Request *a, const Request *b) {
     if (a->spec.priority != b->spec.priority)
       return a->spec.priority < b->spec.priority;
     if (a->lastDecodeDispatch != b->lastDecodeDispatch)
       return a->lastDecodeDispatch < b->lastDecodeDispatch;
     return a->order < b->order;
-  });
-  const BatchCohort cohort = ready.front()->spec.cohort;
-  const DecodeStage decodeStage = ready.front()->decodeStage;
-  const RequestPriority selectedPriority = ready.front()->spec.priority;
+  };
+
+  const Request *leader = nullptr;
+  for (const auto &[_, request] : requests_) {
+    if (request.phase == Phase::Decode &&
+        (!leader || before(&request, leader)))
+      leader = &request;
+  }
+  if (!leader)
+    return std::nullopt;
+
+  const BatchCohort cohort = leader->spec.cohort;
+  const DecodeStage decodeStage = leader->decodeStage;
+  const RequestPriority selectedPriority = leader->spec.priority;
   BatchPlan plan;
   plan.kind = WorkKind::Decode;
   plan.cohort = cohort;
@@ -356,12 +359,33 @@ std::optional<BatchPlan> Scheduler::nextDecode() const {
       decodeStage == DecodeStage::ApplyInitialMask
           ? 1
           : model::ExecutionLimits::maximumBatchWidth;
-  for (const Request *request : ready) {
-    if (request->spec.priority != selectedPriority ||
-        (request->spec.cohort == BatchCohort::Constrained) !=
+  std::array<const Request *, model::ExecutionLimits::maximumBatchWidth>
+      selected{};
+  uint32_t selectedCount = 0;
+  for (const auto &[_, request] : requests_) {
+    const Request *candidate = &request;
+    if (candidate->phase != Phase::Decode ||
+        candidate->spec.priority != selectedPriority ||
+        (candidate->spec.cohort == BatchCohort::Constrained) !=
             (cohort == BatchCohort::Constrained) ||
-        request->decodeStage != decodeStage)
+        candidate->decodeStage != decodeStage)
       continue;
+
+    uint32_t position = 0;
+    while (position < selectedCount &&
+           !before(candidate, selected[position]))
+      ++position;
+    if (position >= maximumWidth)
+      continue;
+    if (selectedCount < maximumWidth)
+      ++selectedCount;
+    for (uint32_t index = selectedCount - 1; index > position; --index)
+      selected[index] = selected[index - 1];
+    selected[position] = candidate;
+  }
+
+  for (uint32_t index = 0; index < selectedCount; ++index) {
+    const Request *request = selected[index];
     if (request->spec.cohort == BatchCohort::Sampling)
       plan.cohort = BatchCohort::Sampling;
     plan.items.push_back({request->spec.id, 0, 0});
