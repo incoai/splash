@@ -3,9 +3,10 @@
 // Plans the in-memory MDKQ0001 images of a Qwen3.8 target read straight from a
 // llama.cpp GGUF: section offsets, the bytes the CPU fills (header, descriptors,
 // norms, convolution, decay, time bias, alpha/beta) and the GPU repacks/copies
-// that move quantized rows into 256-column tiles. The byte layout is the one
-// dev/tools/convert_gguf_to_splash.py writes to disk, so images can be checked
-// against converter output.
+// that move quantized rows into 256-column tiles. Layout: 16-byte header
+// (magic, layer, type), then 16 KiB-aligned sections; each quantized tensor is a
+// 64-byte descriptor, plane0 [tile][group32][256 cols][p0], optional plane1 and
+// a per-superblock meta plane [tile][unit][256][metaBytes] (see FormatLayout).
 
 #include <cstdint>
 #include <string>

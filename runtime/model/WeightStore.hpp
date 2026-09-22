@@ -73,8 +73,7 @@ readQ4Projection(WeightFile &file, metal::MetalBackend &backend,
                  std::string_view label);
 
 // GGUF K-quant sections: a 64-byte descriptor, then plane0, optional plane1
-// and metadata, each 16 KiB aligned (model/GgufImage.hpp; the same layout
-// dev/tools/convert_gguf_to_splash.py writes to disk).
+// and metadata, each 16 KiB aligned (layout in model/GgufImage.hpp).
 inline constexpr std::string_view kKQuantMagic = "MDKQ0001";
 [[nodiscard]] ops::KQuantSegment readKQuantSegment(WeightFile &file,
                                                    std::string_view label);

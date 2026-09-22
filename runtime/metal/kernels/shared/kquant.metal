@@ -679,7 +679,7 @@ kernel void kq_permute_heads(device const bfloat *input [[buffer(0)]], device bf
   output[index] = input[ulong(row) * p.width + perm[h] * p.block + e];
 }
 
-// ---- load-time repack: native GGUF rows -> MDKQ0001 planes (byte layout of convert_gguf_to_splash.py) ----
+// ---- load-time repack: native GGUF rows -> MDKQ0001 planes (layout documented in model/GgufImage.hpp) ----
 // One thread per (destination row n, 32-wide K group g). Rows >= permute_from_row are read from
 // llama.cpp's tiled value-head order so the image holds splash's grouped order.
 static inline uint kq_repack_source_row(uint n, constant KQRepackParams &p) {

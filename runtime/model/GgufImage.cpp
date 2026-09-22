@@ -8,7 +8,7 @@
 namespace splash::model::gguf {
 namespace {
 
-// Per-32-weight plane layout of every supported type (convert_gguf_to_splash.py FMT).
+// Per-32-weight plane layout of every supported type.
 constexpr std::array<FormatLayout, 8> kFormats{{
     {KQ_FMT_Q4K, ggml::kQ4_K, 256, 144, 16, 0, 16, 8, 1},
     {KQ_FMT_IQ4XS, ggml::kIQ4_XS, 256, 136, 16, 0, 8, 8, 0},

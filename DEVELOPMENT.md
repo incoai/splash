@@ -157,8 +157,7 @@ Unsloth's files that covers UD-Q4_K_M/XL, UD-Q5_K_M/S/XL, UD-Q6_K and Q6_K_L/M/X
 and Q8_0; the 2-bit, IQ2/IQ3_XXS, IQ1, Q4_0/Q4_1 and BF16-bearing files need kernels that do not
 exist yet (`dev/tools/gguf_survey.py` reports a file's types from its header).
 
-`dev/tools/convert_gguf_to_splash.py` writes the same images to disk and is the reference the
-load-time repack is checked against. The GEMM kernels are in
+The GEMM kernels are in
 `runtime/metal/kernels/shared/kquant.metal` (ABI in `runtime/metal/abi/KQuant.h`), the dispatch
 policy in `runtime/ops/Linear.cpp`, and `make test-engine-metal` checks the kernels against fp64
 and, with `SPLASH_GGML_ORACLE=<libggml-base.dylib>`, against upstream GGML's dequantization.
