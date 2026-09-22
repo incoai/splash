@@ -47,10 +47,10 @@ PACKAGE_FORMATS = {
     "gguf": (3, "MDKQ0001"),
 }
 # GGUF packages ship no target weights: manifest.target.gguf names a source
-# repository and its files; owner/repo::VARIANT selects one, downloaded into the
+# repository and its files; owner/repo:VARIANT selects one, downloaded into the
 # Hub cache and repacked in memory by the engine.
 VARIANT_FORMATS = {"gguf"}
-VARIANT_SEPARATOR = "::"
+VARIANT_SEPARATOR = ":"
 VARIANT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 
 
@@ -86,7 +86,7 @@ def parse_repo_id(value: str) -> str:
 
 
 def split_model_id(value: str) -> tuple[str, str | None]:
-    """owner/repo[::variant] -> (repository ID, variant or None)."""
+    """owner/repo[:variant] -> (repository ID, variant or None)."""
     if not isinstance(value, str):
         raise ModelError("model must be a full Hugging Face repository ID (owner/repo)")
     repo_id, separator, variant = value.partition(VARIANT_SEPARATOR)
@@ -215,7 +215,7 @@ def validate_package_manifest(path: Path):
     )
     if format_name in VARIANT_FORMATS:
         # The target is a llama.cpp GGUF in another repository; the model ID's
-        # ::VARIANT names one of its files, repacked in memory at load time.
+        # :VARIANT names one of its files, repacked in memory at load time.
         if (
             not isinstance(gguf, dict)
             or not isinstance(gguf.get("variants"), dict)
@@ -296,14 +296,14 @@ def select_variant(manifest, variant: str | None) -> str | None:
     if table is None:
         if variant is not None:
             raise ModelError(
-                "this runtime package has no variants; drop the ::VARIANT suffix"
+                "this runtime package has no variants; drop the :VARIANT suffix"
             )
         return None
     if variant is None:
         variant = table.get("default")
     if variant is None or variant not in table["variants"]:
         raise ModelError(
-            "select a variant with owner/repo::VARIANT; available: "
+            "select a variant with owner/repo:VARIANT; available: "
             + ", ".join(sorted(table["variants"]))
         )
     return variant
@@ -791,7 +791,7 @@ def parse_args(argv=None):
         "--model",
         required=True,
         type=parse_model_id,
-        help="Hugging Face repository ID (owner/repo[::variant])",
+        help="Hugging Face repository ID (owner/repo[:variant])",
     )
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("prepare")

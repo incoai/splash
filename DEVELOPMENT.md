@@ -139,9 +139,9 @@ may select:
                                                "size": 16464440224, "sha256": "..."}, ...}}}
 ```
 
-`splash serve --model incoai-internal/Qwen3.8-27B-Splash-GGUF::UD-Q4_K_M` downloads the shared
+`splash serve --model incoai-internal/Qwen3.8-27B-Splash-GGUF:UD-Q4_K_M` downloads the shared
 files and that one GGUF into the Hub cache, checks them against the manifest, and installs
-`models/<owner>/<repo>::UD-Q4_K_M/` as a real directory of per-file symlinks whose
+`models/<owner>/<repo>:UD-Q4_K_M/` as a real directory of per-file symlinks whose
 `target/<file>.gguf` links the cached GGUF (the engine requires `target/` and `draft/` to be
 subdirectories of one root). Nothing is written to disk besides the download.
 

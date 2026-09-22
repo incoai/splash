@@ -360,9 +360,9 @@ def parse_args(argv=None):
         "--model",
         type=model_artifacts.parse_model_id,
         required=True,
-        metavar="OWNER/REPO[::VARIANT]",
+        metavar="OWNER/REPO[:VARIANT]",
         help="Hugging Face repository containing a Splash package, with the "
-        "variant of a multi-variant package after '::' (e.g. ::UD-Q4_K_M)",
+        "variant of a GGUF package after ':' (e.g. :UD-Q4_K_M)",
     )
     server.add_argument(
         "--served-model-name",

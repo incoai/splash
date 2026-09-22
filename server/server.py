@@ -1818,10 +1818,10 @@ def _parse_request_size(value):
 
 
 def _parse_model_id(value):
-    repo_id, separator, variant = value.partition("::")
+    repo_id, separator, variant = value.partition(":")
     if repo_id.count("/") != 1:
         raise argparse.ArgumentTypeError(
-            "use a full Hugging Face repository ID: owner/repo[::variant]"
+            "use a full Hugging Face repository ID: owner/repo[:variant]"
         )
     try:
         validate_repo_id(repo_id)

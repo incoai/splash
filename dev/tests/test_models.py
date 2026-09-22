@@ -660,23 +660,23 @@ class ModelArtifactTest(unittest.TestCase):
 
     def test_variant_model_ids_parse_and_name_installed_roots(self):
         self.assertEqual(
-            artifacts.split_model_id("owner/repo::UD-Q4_K_M"),
+            artifacts.split_model_id("owner/repo:UD-Q4_K_M"),
             ("owner/repo", "UD-Q4_K_M"),
         )
         self.assertEqual(artifacts.split_model_id("owner/repo"), ("owner/repo", None))
         self.assertEqual(
-            artifacts.validate_model_id("owner/repo::UD-Q4_K_M"),
-            "owner/repo::UD-Q4_K_M",
+            artifacts.validate_model_id("owner/repo:UD-Q4_K_M"),
+            "owner/repo:UD-Q4_K_M",
         )
-        for bad in ("owner/repo::", "owner/repo::a b", "owner/repo::..", "owner::v"):
+        for bad in ("owner/repo:", "owner/repo:a b", "owner/repo:..", "owner:v"):
             with self.assertRaises(artifacts.ModelError):
                 artifacts.split_model_id(bad)
         with self.assertRaises(argparse.ArgumentTypeError):
-            artifacts.parse_model_id("owner/repo::")
+            artifacts.parse_model_id("owner/repo:")
         models = self.root / "models"
         self.assertEqual(
-            artifacts.installed_root(models, "owner/repo::UD-Q4_K_M"),
-            models / "owner" / "repo::UD-Q4_K_M",
+            artifacts.installed_root(models, "owner/repo:UD-Q4_K_M"),
+            models / "owner" / "repo:UD-Q4_K_M",
         )
         self.assertEqual(
             artifacts.installed_root(models, "owner/repo"), models / "owner/repo"
@@ -741,7 +741,7 @@ class ModelArtifactTest(unittest.TestCase):
         self.configure_hub(snapshot)
         gguf = self.gguf_fixture("UD-Q5_K_M", 1)
         models = self.root / "models"
-        model_id = f"{self.MODEL_ID}::UD-Q5_K_M"
+        model_id = f"{self.MODEL_ID}:UD-Q5_K_M"
         with (
             mock.patch.object(artifacts, "resolve_gguf", return_value=gguf) as fetch,
             contextlib.redirect_stdout(io.StringIO()),
@@ -760,7 +760,7 @@ class ModelArtifactTest(unittest.TestCase):
         root = (
             models
             / self.MODEL_ID.split("/")[0]
-            / (self.MODEL_ID.split("/")[1] + "::UD-Q5_K_M")
+            / (self.MODEL_ID.split("/")[1] + ":UD-Q5_K_M")
         )
         self.assertTrue(root.is_dir() and not root.is_symlink())
         for subdirectory in ("target", "draft", "vision", "tokenizer"):
@@ -796,13 +796,13 @@ class ModelArtifactTest(unittest.TestCase):
             artifacts.main(["--models", str(models), "--model", model_id, "prepare"])
         self.assertTrue((root / "target/Model-UD-Q5_K_M.gguf").is_symlink())
         self.assertEqual(self.download.call_count, 2)
-        foreign = models / "owner" / "repo::v"
+        foreign = models / "owner" / "repo:v"
         foreign.mkdir(parents=True)
         with (
             self.assertRaisesRegex(artifacts.ModelError, "move it aside"),
             contextlib.redirect_stdout(io.StringIO()),
         ):
-            artifacts.prepare(SimpleNamespace(models=models, model="owner/repo::v"))
+            artifacts.prepare(SimpleNamespace(models=models, model="owner/repo:v"))
 
     def test_gguf_download_checks_hub_metadata_against_the_manifest(self):
         snapshot, manifest = self.package_fixture(variants=("UD-Q4_K_M",))
