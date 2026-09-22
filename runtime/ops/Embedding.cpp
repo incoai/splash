@@ -29,7 +29,12 @@ void Embedding::add(metal::CommandGraph &graph, metal::MetalBuffer tokens,
     throw std::invalid_argument("invalid Q4 embedding shape");
   if (!table.kq.empty()) {
     const KQEmbedParams params{rows, table.outputSize, table.inputSize};
-    graph.add("kq_embed_q4k", {std::move(tokens), table.kq.front().plane0, std::move(output)},
+    const uint32_t type = table.kq.front().type;
+    const char *kernel = type == 12 ? "kq_embed_q4k"
+                         : type == 14 ? "kq_embed_q6k"
+                         : type == 8 ? "kq_embed_q80" : nullptr;
+    if (!kernel) throw std::invalid_argument("unsupported K-quant embedding type");
+    graph.add(kernel, {std::move(tokens), table.kq.front().plane0, std::move(output)},
               params, {(rows * table.inputSize + 255) / 256, 1, 1}, {256, 1, 1});
     return;
   }

@@ -329,12 +329,19 @@ ops::Q4Projection readKQuantProjection(WeightFile &file, std::string_view label)
 
 ops::Q4Projection readKQuantEmbedding(WeightFile &file, std::string_view label) {
     const KQuantDescriptor d = readKQuantDescriptor(file, label);
-    if (d.type != 12 || d.plane0Bytes != uint64_t{d.outputSize} * (d.inputSize / 256) * 144)
-        throw WeightStoreError("K-quant embedding must be native block_q4_K rows");
+    // Native rows, gathered by kq_embed_<type>: block_q4_K (144 B / 256), block_q6_K
+    // (210 B / 256) or block_q8_0 (34 B / 32).
+    const char *format = nullptr;
+    uint64_t rowBytes = 0;
+    if (d.type == 12) { format = "q4k-native"; rowBytes = uint64_t{d.inputSize / 256} * 144; }
+    else if (d.type == 14) { format = "q6k-native"; rowBytes = uint64_t{d.inputSize / 256} * 210; }
+    else if (d.type == 8) { format = "q80-native"; rowBytes = uint64_t{d.inputSize / 32} * 34; }
+    if (!format || d.inputSize % 256 || d.plane0Bytes != uint64_t{d.outputSize} * rowBytes)
+        throw WeightStoreError("K-quant embedding must be native block_q4_K, block_q6_K or block_q8_0 rows");
     ops::Q4Projection p;
     ops::KQuantSegment s;
     s.plane0 = file.section(d.plane0Bytes, std::string(label) + "-native");
-    s.type = d.type; s.outputSize = d.outputSize; s.inputSize = d.inputSize; s.format = "q4k-native";
+    s.type = d.type; s.outputSize = d.outputSize; s.inputSize = d.inputSize; s.format = format;
     p.kq.push_back(std::move(s));
     p.outputSize = d.outputSize;
     p.inputSize = d.inputSize;

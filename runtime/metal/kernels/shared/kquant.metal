@@ -639,6 +639,30 @@ kernel void kq_embed_q4k(device const uint *tokens [[buffer(0)]], device const u
   const uchar q = (blk[16 + (j / 2) * 32 + l] >> ((j % 2) * 4)) & 15;
   output[index] = bfloat(float(d) * float(s) * float(q) - float(dmin) * float(m));
 }
+// native block_q6_K rows (210 B per 256 weights): ql[128] | qh[64] | int8 scales[16] | half d
+kernel void kq_embed_q6k(device const uint *tokens [[buffer(0)]], device const uchar *table [[buffer(1)]], device bfloat *output [[buffer(2)]],
+                      constant KQEmbedParams &p [[buffer(3)]], uint index [[thread_position_in_grid]]) {
+  const uint elements = p.rows * p.hidden; if (index >= elements) return;
+  const uint row = index / p.hidden, dim = index % p.hidden;
+  uint token = tokens[row]; token = token < p.vocabulary ? token : 0;
+  device const uchar *blk = table + (ulong(token) * (p.hidden / 256) + dim / 256) * 210;
+  const uint l = dim % 256, n = l / 128, r = l % 128, quarter = r / 32, pos = r % 32;
+  const uchar lo = (blk[n * 64 + (quarter & 1) * 32 + pos] >> ((quarter >> 1) * 4)) & 15;
+  const uchar hi = (blk[128 + n * 32 + pos] >> (2 * quarter)) & 3;
+  const char sc = as_type<char>(blk[192 + n * 8 + 2 * quarter + pos / 16]);
+  const half d = as_type<half>(ushort(blk[208] | (blk[209] << 8)));
+  output[index] = bfloat(float(d) * float(sc) * float(int(lo | (hi << 4)) - 32));
+}
+// native block_q8_0 rows (34 B per 32 weights): half d | int8 qs[32]
+kernel void kq_embed_q80(device const uint *tokens [[buffer(0)]], device const uchar *table [[buffer(1)]], device bfloat *output [[buffer(2)]],
+                      constant KQEmbedParams &p [[buffer(3)]], uint index [[thread_position_in_grid]]) {
+  const uint elements = p.rows * p.hidden; if (index >= elements) return;
+  const uint row = index / p.hidden, dim = index % p.hidden;
+  uint token = tokens[row]; token = token < p.vocabulary ? token : 0;
+  device const uchar *blk = table + (ulong(token) * (p.hidden / 32) + dim / 32) * 34;
+  const half d = as_type<half>(ushort(blk[0] | (blk[1] << 8)));
+  output[index] = bfloat(float(d) * float(as_type<char>(blk[2 + dim % 32])));
+}
 // permute the K columns (in 128-wide head blocks) of a bf16 activation: out[row][h*128+e] = in[row][perm[h]*128+e]
 kernel void kq_permute_heads(device const bfloat *input [[buffer(0)]], device bfloat *output [[buffer(1)]], device const uint *perm [[buffer(2)]],
                           constant KQPermuteParams &p [[buffer(3)]], uint index [[thread_position_in_grid]]) {
