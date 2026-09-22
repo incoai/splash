@@ -399,8 +399,9 @@ when the tokenizer supports independent encoding there. This process-local
 cache retains at most four prefixes and 8 MiB of text/token storage; it falls
 back to full encoding for other tokenizer pipelines. `/status.tokenizer_cache`
 reports its usage. It does not alter prompt text, token IDs or the GPU KV cache.
-Server restarts require recomputation until persistent model-state caching is
-available; see the separate [SSD cache proposal](https://github.com/incoai/splash/pull/3).
+Server restarts require recomputation. The separate
+[SSD cache proposal](https://github.com/incoai/splash/pull/3) preserves evicted
+model state during a server session; its temporary files do not survive shutdown.
 
 ## Package
 
