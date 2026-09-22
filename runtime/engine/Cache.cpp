@@ -58,7 +58,7 @@ Cache::matchedBlocks(std::span<const uint32_t> prompt,
 }
 
 uint32_t Cache::cachedTokens(std::span<const uint32_t> prompt,
-                             std::span<const ImageSpan> images) const {
+                              std::span<const ImageSpan> images) const {
   const auto blocks = matchedBlocks(prompt, images);
   for (size_t i = blocks.size(); i > 0; --i)
     if (states_.contains(blocks[i - 1]))
