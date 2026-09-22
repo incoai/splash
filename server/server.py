@@ -1818,14 +1818,19 @@ def _parse_request_size(value):
 
 
 def _parse_model_id(value):
-    if value.count("/") != 1:
+    repo_id, separator, variant = value.partition("::")
+    if repo_id.count("/") != 1:
         raise argparse.ArgumentTypeError(
-            "use a full Hugging Face repository ID: owner/repo"
+            "use a full Hugging Face repository ID: owner/repo[::variant]"
         )
     try:
-        validate_repo_id(value)
+        validate_repo_id(repo_id)
     except ValueError as error:
         raise argparse.ArgumentTypeError(str(error)) from None
+    if separator and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", variant):
+        raise argparse.ArgumentTypeError(
+            "model variant must be a short name such as UD-Q4_K_M"
+        )
     return value
 
 

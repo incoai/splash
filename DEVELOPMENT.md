@@ -133,16 +133,29 @@ magic `MDKQ0001`). The quantized values are kept bit for bit: `dev/tools/convert
 splits every block into a payload plane, an optional high-bit plane and a per-superblock
 header plane, and stores them in 256-column tiles so decode reads are coalesced. Supported
 tensor types are Q4_K, Q5_K, Q6_K, Q3_K, IQ4_XS, IQ4_NL, Q8_0 and IQ3_S; the token embedding
-stays in native `block_q4_K` rows. The draft, vision and tokenizer come from the matching
-`splash-packed-q4` package.
+stays in native `block_q4_K` rows.
+
+A `gguf-kquant` package is multi-variant: one repository holds the shared `draft/`,
+`vision/` and `tokenizer/` and one converted target per quantization under
+`variants/<NAME>/target/`. The manifest lists the shared files in `artifacts` and each
+variant's files in `variants.<NAME>.artifacts` (optionally with `source`, the GGUF it was
+converted from, and `default_variant`). The model ID selects the variant:
 
 ```sh
-python3 dev/tools/convert_gguf_to_splash.py Qwen3.8-27B-UD-Q4_K_M.gguf pkg   # writes pkg/target/
+splash serve --model incoai-internal/Qwen3.8-27B-Splash-GGUF::UD-Q4_K_M
 ```
 
-Add `draft/`, `vision/`, `tokenizer/` and a manifest with `format.name` `gguf-kquant`,
-`format.target_layer_magic` `MDKQ0001` and the artifact list, then serve `pkg` like any other
-package. The kernels are in `runtime/metal/kernels/shared/kquant.metal` (ABI in
+Only the shared files and the selected variant are downloaded. The installed model root
+`models/<owner>/<repo>::<NAME>/` is a real directory whose `target/`, `draft/`, `vision/` and
+`tokenizer/` hold per-file symlinks into the Hub snapshot (the engine requires `target/` and
+`draft/` to be subdirectories of one root) and whose `manifest.json` links to the snapshot's.
+
+```sh
+python3 dev/tools/convert_gguf_to_splash.py Qwen3.8-27B-UD-Q5_K_M.gguf out   # writes out/target/
+```
+
+Upload `out/target/` as `variants/UD-Q5_K_M/target/` and add the variant's artifact records
+to the manifest. The kernels are in `runtime/metal/kernels/shared/kquant.metal` (ABI in
 `runtime/metal/abi/KQuant.h`), the dispatch policy in `runtime/ops/Linear.cpp`. Measurements,
 harnesses and the design note for loading GGUF files without a package are in
 `dev/benchmarks/kquant/`.

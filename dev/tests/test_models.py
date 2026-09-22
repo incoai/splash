@@ -54,7 +54,7 @@ class ModelArtifactTest(unittest.TestCase):
             file.seek(artifacts.ALIGNMENT - 1)
             file.write(b"\0")
 
-    def package_fixture(self, *, schema=3, model_id=None, revision=None):
+    def package_fixture(self, *, schema=3, model_id=None, revision=None, variants=None):
         self.fixture_number += 1
         snapshot = (
             self.root
@@ -64,12 +64,20 @@ class ModelArtifactTest(unittest.TestCase):
             / (revision or self.REVISION)
         )
         target_layers, draft_layers = (64, 5) if schema == 3 else (40, 6)
+        target_files = (
+            "embedding.bin",
+            "head.bin",
+            *(f"layer-{index}.bin" for index in range(target_layers)),
+        )
+        target_roots = (
+            ["target"]
+            if variants is None
+            else [f"variants/{name}/target" for name in variants]
+        )
         for name in (
-            "target/embedding.bin",
-            "target/head.bin",
             "draft/model.bin",
             "vision/model.bin",
-            *(f"target/layer-{index}.bin" for index in range(target_layers)),
+            *(f"{root}/{file}" for root in target_roots for file in target_files),
             *(f"draft/layer-{index}.bin" for index in range(draft_layers)),
         ):
             self.packed_file(snapshot / name)
@@ -100,6 +108,21 @@ class ModelArtifactTest(unittest.TestCase):
             "execution_geometry": {},
             "artifacts": records,
         }
+        if variants is not None:
+            manifest["format"].update(name="gguf-kquant", target_layer_magic="MDKQ0001")
+            manifest["artifacts"] = [
+                r for r in records if not r["path"].startswith("variants/")
+            ]
+            manifest["variants"] = {
+                name: {
+                    "artifacts": [
+                        r
+                        for r in records
+                        if r["path"].startswith(f"variants/{name}/target/")
+                    ]
+                }
+                for name in variants
+            }
         if schema == 4:
             manifest.update(
                 target={"architecture": "qwen3_5_moe"},
@@ -107,6 +130,15 @@ class ModelArtifactTest(unittest.TestCase):
             )
         self.write_manifest(snapshot, manifest)
         return snapshot, manifest
+
+    @staticmethod
+    def hub_records(snapshot):
+        manifest = json.loads((snapshot / "manifest.json").read_text())
+        records = list(manifest.get("artifacts", []))
+        for variant in (manifest.get("variants") or {}).values():
+            if isinstance(variant, dict):
+                records += variant.get("artifacts", [])
+        return records
 
     @staticmethod
     def write_manifest(snapshot, manifest):
@@ -123,9 +155,7 @@ class ModelArtifactTest(unittest.TestCase):
             ]
             + [
                 SimpleNamespace(rfilename=r["path"], size=r["size"])
-                for r in json.loads((snapshot / "manifest.json").read_text()).get(
-                    "artifacts", []
-                )
+                for r in self.hub_records(snapshot)
                 if isinstance(r, dict) and "path" in r and "size" in r
             ],
         )
@@ -626,6 +656,141 @@ class ModelArtifactTest(unittest.TestCase):
         second.assert_not_called()
         hash_file.assert_not_called()
         self.api.assert_not_called()
+
+    def test_variant_model_ids_parse_and_name_installed_roots(self):
+        self.assertEqual(
+            artifacts.split_model_id("owner/repo::UD-Q4_K_M"),
+            ("owner/repo", "UD-Q4_K_M"),
+        )
+        self.assertEqual(artifacts.split_model_id("owner/repo"), ("owner/repo", None))
+        self.assertEqual(
+            artifacts.validate_model_id("owner/repo::UD-Q4_K_M"),
+            "owner/repo::UD-Q4_K_M",
+        )
+        for bad in ("owner/repo::", "owner/repo::a b", "owner/repo::..", "owner::v"):
+            with self.assertRaises(artifacts.ModelError):
+                artifacts.split_model_id(bad)
+        with self.assertRaises(argparse.ArgumentTypeError):
+            artifacts.parse_model_id("owner/repo::")
+        models = self.root / "models"
+        self.assertEqual(
+            artifacts.installed_root(models, "owner/repo::UD-Q4_K_M"),
+            models / "owner" / "repo::UD-Q4_K_M",
+        )
+        self.assertEqual(
+            artifacts.installed_root(models, "owner/repo"), models / "owner/repo"
+        )
+
+    def test_multi_variant_manifest_selects_one_target_per_model_id(self):
+        snapshot, manifest = self.package_fixture(variants=("UD-Q4_K_M", "UD-Q5_K_M"))
+        validated = artifacts.validate_package_manifest(snapshot / "manifest.json")
+        self.assertEqual(artifacts.select_variant(validated, "UD-Q5_K_M"), "UD-Q5_K_M")
+        with self.assertRaisesRegex(artifacts.ModelError, "UD-Q4_K_M, UD-Q5_K_M"):
+            artifacts.select_variant(validated, None)
+        with self.assertRaisesRegex(artifacts.ModelError, "available"):
+            artifacts.select_variant(validated, "UD-Q6_K")
+        installed = artifacts.artifact_records(validated, "UD-Q4_K_M", installed=True)
+        self.assertIn("target/layer-0.bin", {r["path"] for r in installed})
+        self.assertNotIn(
+            "variants/UD-Q4_K_M/target/layer-0.bin", {r["path"] for r in installed}
+        )
+        self.assertFalse(
+            any(r["path"].startswith("variants/UD-Q5_K_M") for r in installed)
+        )
+        manifest["default_variant"] = "UD-Q5_K_M"
+        self.write_manifest(snapshot, manifest)
+        validated = artifacts.validate_package_manifest(snapshot / "manifest.json")
+        self.assertEqual(artifacts.select_variant(validated, None), "UD-Q5_K_M")
+        # Plain packages take no variant; variant formats require a variant table.
+        plain_snapshot, plain = self.package_fixture()
+        with self.assertRaisesRegex(artifacts.ModelError, "no variants"):
+            artifacts.select_variant(plain, "UD-Q4_K_M")
+        broken = copy.deepcopy(manifest)
+        del broken["variants"]
+        self.write_manifest(snapshot, broken)
+        with self.assertRaisesRegex(artifacts.ModelError, "variant table"):
+            artifacts.validate_package_manifest(snapshot / "manifest.json")
+        broken = copy.deepcopy(manifest)
+        broken["variants"]["UD-Q4_K_M"]["artifacts"][0]["path"] = "target/stray.bin"
+        self.write_manifest(snapshot, broken)
+        with self.assertRaisesRegex(artifacts.ModelError, "outside"):
+            artifacts.validate_package_manifest(snapshot / "manifest.json")
+        broken = copy.deepcopy(manifest)
+        del broken["variants"]["UD-Q4_K_M"]["artifacts"][0]
+        self.write_manifest(snapshot, broken)
+        with self.assertRaisesRegex(
+            artifacts.ModelError, "missing: variants/UD-Q4_K_M"
+        ):
+            artifacts.validate_package_manifest(snapshot / "manifest.json")
+        plain["variants"] = manifest["variants"]
+        self.write_manifest(plain_snapshot, plain)
+        with self.assertRaisesRegex(artifacts.ModelError, "does not support variants"):
+            artifacts.validate_package_manifest(plain_snapshot / "manifest.json")
+
+    def test_variant_install_builds_real_root_and_downloads_only_its_target(self):
+        snapshot, _ = self.package_fixture(variants=("UD-Q4_K_M", "UD-Q5_K_M"))
+        self.configure_hub(snapshot)
+        models = self.root / "models"
+        model_id = f"{self.MODEL_ID}::UD-Q5_K_M"
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(
+                artifacts.main(
+                    ["--models", str(models), "--model", model_id, "prepare"]
+                ),
+                0,
+            )
+        patterns = self.download.call_args.kwargs["allow_patterns"]
+        self.assertIn("variants/UD-Q5_K_M/target/layer-0.bin", patterns)
+        self.assertIn("draft/model.bin", patterns)
+        self.assertFalse(any(p.startswith("variants/UD-Q4_K_M") for p in patterns))
+        root = (
+            models
+            / self.MODEL_ID.split("/")[0]
+            / (self.MODEL_ID.split("/")[1] + "::UD-Q5_K_M")
+        )
+        self.assertTrue(root.is_dir() and not root.is_symlink())
+        for subdirectory in ("target", "draft", "vision", "tokenizer"):
+            self.assertTrue((root / subdirectory).is_dir())
+            self.assertFalse((root / subdirectory).is_symlink())
+        self.assertEqual(
+            (root / "target/layer-0.bin").resolve(),
+            (snapshot / "variants/UD-Q5_K_M/target/layer-0.bin").resolve(),
+        )
+        self.assertEqual(
+            (root / "manifest.json").resolve(), (snapshot / "manifest.json").resolve()
+        )
+        self.assertEqual(artifacts.installed_snapshot(root), snapshot.resolve())
+        self.download.assert_called_once()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(
+                artifacts.main(
+                    ["--models", str(models), "--model", model_id, "verify", "--full"]
+                ),
+                0,
+            )
+            artifacts.main(["--models", str(models), "--model", model_id, "prepare"])
+        self.download.assert_called_once()
+        # A damaged variant root is rebuilt in place; a foreign directory is not touched.
+        (root / "target/layer-3.bin").unlink()
+        with contextlib.redirect_stdout(io.StringIO()):
+            artifacts.main(["--models", str(models), "--model", model_id, "prepare"])
+        self.assertTrue((root / "target/layer-3.bin").is_symlink())
+        self.assertEqual(self.download.call_count, 2)
+        foreign = models / "owner" / "repo::v"
+        foreign.mkdir(parents=True)
+        with (
+            self.assertRaisesRegex(artifacts.ModelError, "move it aside"),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            artifacts.prepare(SimpleNamespace(models=models, model="owner/repo::v"))
+        self.download.assert_called_with(
+            allow_patterns=mock.ANY,
+            repo_id=self.MODEL_ID,
+            repo_type="model",
+            token=False,
+            endpoint=artifacts.HUB_ENDPOINT,
+            revision=self.REVISION,
+        )
 
     def test_publish_refuses_to_replace_a_real_directory(self):
         snapshot, _ = self.package_fixture()

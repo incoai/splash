@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sys
 import tempfile
 from contextlib import contextmanager
@@ -45,6 +46,11 @@ PACKAGE_FORMATS = {
     "splash-packed-q4-moe": (4, "MDFM0001"),
     "gguf-kquant": (3, "MDKQ0001"),
 }
+# Multi-variant packages (one repository, one target/ per quantization) keep
+# their targets under variants/<name>/target/; the model ID selects one.
+VARIANT_FORMATS = {"gguf-kquant"}
+VARIANT_SEPARATOR = "::"
+VARIANT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 
 
 class ModelError(RuntimeError):
@@ -78,6 +84,34 @@ def parse_repo_id(value: str) -> str:
         raise argparse.ArgumentTypeError(str(error)) from error
 
 
+def split_model_id(value: str) -> tuple[str, str | None]:
+    """owner/repo[::variant] -> (repository ID, variant or None)."""
+    if not isinstance(value, str):
+        raise ModelError("model must be a full Hugging Face repository ID (owner/repo)")
+    repo_id, separator, variant = value.partition(VARIANT_SEPARATOR)
+    validate_repo_id(repo_id)
+    if not separator:
+        return repo_id, None
+    if not VARIANT.fullmatch(variant) or ".." in variant:
+        raise ModelError(
+            "model variant must be a short name such as UD-Q4_K_M "
+            f"(owner/repo{VARIANT_SEPARATOR}VARIANT)"
+        )
+    return repo_id, variant
+
+
+def validate_model_id(value: str) -> str:
+    repo_id, variant = split_model_id(value)
+    return repo_id if variant is None else f"{repo_id}{VARIANT_SEPARATOR}{variant}"
+
+
+def parse_model_id(value: str) -> str:
+    try:
+        return validate_model_id(value)
+    except ModelError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as file:
@@ -96,6 +130,37 @@ def read_json(path: Path):
     if not isinstance(value, dict):
         raise ModelError(f"expected a JSON object in {path}")
     return value
+
+
+def _validate_records(records, artifact_paths):
+    for record in records:
+        if (
+            not isinstance(record, dict)
+            or set(record) != {"path", "size", "sha256"}
+            or not isinstance(record["path"], str)
+        ):
+            raise ModelError("runtime package manifest has an invalid artifact")
+        pure = PurePosixPath(record["path"])
+        if (
+            pure.is_absolute()
+            or not pure.parts
+            or ".." in pure.parts
+            or pure.as_posix() != record["path"]
+            or any(character in record["path"] for character in "\\*?[]")
+            or any(ord(character) < 32 for character in record["path"])
+            or record["path"] == "manifest.json"
+            or type(record["size"]) is not int
+            or record["size"] <= 0
+            or not is_hex_digest(record["sha256"], 64)
+        ):
+            raise ModelError("runtime package manifest has an invalid artifact")
+        if record["path"] in artifact_paths:
+            raise ModelError("runtime package artifact paths are not unique")
+        if pure.suffix == ".bin" and record["size"] % ALIGNMENT:
+            raise ModelError(
+                f"runtime package packed file is unaligned: {record['path']}"
+            )
+        artifact_paths.add(record["path"])
 
 
 def validate_package_manifest(path: Path):
@@ -141,34 +206,32 @@ def validate_package_manifest(path: Path):
     if not isinstance(records, list) or not records:
         raise ModelError("runtime package manifest has no artifact list")
     artifact_paths = set()
-    for record in records:
-        if (
-            not isinstance(record, dict)
-            or set(record) != {"path", "size", "sha256"}
-            or not isinstance(record["path"], str)
-        ):
-            raise ModelError("runtime package manifest has an invalid artifact")
-        pure = PurePosixPath(record["path"])
-        if (
-            pure.is_absolute()
-            or not pure.parts
-            or ".." in pure.parts
-            or pure.as_posix() != record["path"]
-            or any(character in record["path"] for character in "\\*?[]")
-            or any(ord(character) < 32 for character in record["path"])
-            or record["path"] == "manifest.json"
-            or type(record["size"]) is not int
-            or record["size"] <= 0
-            or not is_hex_digest(record["sha256"], 64)
-        ):
-            raise ModelError("runtime package manifest has an invalid artifact")
-        if record["path"] in artifact_paths:
-            raise ModelError("runtime package artifact paths are not unique")
-        if pure.suffix == ".bin" and record["size"] % ALIGNMENT:
-            raise ModelError(
-                f"runtime package packed file is unaligned: {record['path']}"
-            )
-        artifact_paths.add(record["path"])
+    _validate_records(records, artifact_paths)
+    variants = manifest.get("variants")
+    if format_name in VARIANT_FORMATS:
+        if not isinstance(variants, dict) or not variants:
+            raise ModelError("runtime package manifest has no variant table")
+        for name, variant in variants.items():
+            prefix = f"variants/{name}/target/"
+            if (
+                not isinstance(name, str)
+                or not VARIANT.fullmatch(name)
+                or ".." in name
+                or not isinstance(variant, dict)
+                or not isinstance(variant.get("artifacts"), list)
+                or not variant["artifacts"]
+            ):
+                raise ModelError("runtime package manifest has an invalid variant")
+            _validate_records(variant["artifacts"], artifact_paths)
+            if any(not r["path"].startswith(prefix) for r in variant["artifacts"]):
+                raise ModelError(
+                    f"runtime package variant {name} lists files outside {prefix}"
+                )
+        default = manifest.get("default_variant")
+        if default is not None and default not in variants:
+            raise ModelError("runtime package default variant is not in the table")
+    elif variants is not None:
+        raise ModelError("runtime package format does not support variants")
     if any(
         parent.as_posix() in artifact_paths
         for name in artifact_paths
@@ -176,15 +239,22 @@ def validate_package_manifest(path: Path):
     ):
         raise ModelError("runtime package artifact paths overlap")
     target_layers, draft_layers = (64, 5) if layout[0] == 3 else (40, 6)
+    target_files = {
+        "embedding.bin",
+        "head.bin",
+        *(f"layer-{index}.bin" for index in range(target_layers)),
+    }
     required_files = {
-        "target/embedding.bin",
-        "target/head.bin",
         "draft/model.bin",
         "vision/model.bin",
-        *(f"target/layer-{index}.bin" for index in range(target_layers)),
         *(f"draft/layer-{index}.bin" for index in range(draft_layers)),
         *(f"tokenizer/{name}" for name in TOKENIZER_FILES),
     }
+    if format_name in VARIANT_FORMATS:
+        for name in variants:
+            required_files.update(f"variants/{name}/target/{f}" for f in target_files)
+    else:
+        required_files.update(f"target/{f}" for f in target_files)
     missing = required_files - artifact_paths
     if missing:
         raise ModelError(
@@ -193,8 +263,47 @@ def validate_package_manifest(path: Path):
     return manifest
 
 
-def verify_artifacts(root: Path, manifest, *, full: bool):
-    for record in manifest["artifacts"]:
+def select_variant(manifest, variant: str | None) -> str | None:
+    """The variant a model ID selects in this manifest (None for plain packages)."""
+    variants = manifest.get("variants")
+    if variants is None:
+        if variant is not None:
+            raise ModelError(
+                "this runtime package has no variants; drop the ::VARIANT suffix"
+            )
+        return None
+    if variant is None:
+        variant = manifest.get("default_variant")
+    if variant is None or variant not in variants:
+        raise ModelError(
+            "select a variant with owner/repo::VARIANT; available: "
+            + ", ".join(sorted(variants))
+        )
+    return variant
+
+
+def installed_path(path: str, variant: str | None) -> str:
+    """Where an artifact lives in an installed model root."""
+    prefix = f"variants/{variant}/target/"
+    if variant is not None and path.startswith(prefix):
+        return "target/" + path[len(prefix) :]
+    return path
+
+
+def artifact_records(manifest, variant: str | None, *, installed: bool):
+    """Shared records plus the selected variant's, with installed-root paths if asked."""
+    records = list(manifest["artifacts"])
+    if variant is not None:
+        records += manifest["variants"][variant]["artifacts"]
+    if not installed:
+        return records
+    return [dict(r, path=installed_path(r["path"], variant)) for r in records]
+
+
+def verify_artifacts(
+    root: Path, manifest, *, full: bool, variant: str | None = None, installed=False
+):
+    for record in artifact_records(manifest, variant, installed=installed):
         path = root / record["path"]
         if not path.is_file() or path.stat().st_size != record["size"]:
             raise ModelError(f"installed artifact has the wrong size: {record['path']}")
@@ -205,7 +314,20 @@ def verify_artifacts(root: Path, manifest, *, full: bool):
 
 
 def installed_root(models: Path, model_id: str) -> Path:
-    return models / validate_repo_id(model_id)
+    repo_id, variant = split_model_id(model_id)
+    if variant is None:
+        return models / repo_id
+    return models / f"{repo_id}{VARIANT_SEPARATOR}{variant}"
+
+
+def installed_snapshot(root: Path) -> Path:
+    """The Hub snapshot an installed root points into (symlinked root or variant root)."""
+    if root.is_symlink():
+        return root.resolve()
+    manifest = root / "manifest.json"
+    if not manifest.is_symlink():
+        raise ModelError(f"installed model root is not a Splash installation: {root}")
+    return manifest.resolve().parent
 
 
 def verify_installed(
@@ -214,9 +336,12 @@ def verify_installed(
     model_id: str,
     full: bool,
 ):
+    repo_id, variant = split_model_id(model_id)
     root = installed_root(models, model_id)
     manifest = validate_package_manifest(root / "manifest.json")
-    verify_artifacts(root, manifest, full=full)
+    variant = select_variant(manifest, variant)
+    _snapshot_revision(installed_snapshot(root), repo_id)
+    verify_artifacts(root, manifest, full=full, variant=variant, installed=True)
     return model_id
 
 
@@ -262,6 +387,7 @@ def _retain_snapshot_ref(snapshot: Path, model_id: str, installation: Path):
 def _download_snapshot(model_id: str, token):
     from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 
+    model_id, variant = split_model_id(model_id)
     options = {
         "repo_id": model_id,
         "repo_type": "model",
@@ -309,8 +435,11 @@ def _download_snapshot(model_id: str, token):
         )
         manifest = validate_package_manifest(manifest_path)
     manifest_sha = sha256(manifest_path)
+    records = artifact_records(
+        manifest, select_variant(manifest, variant), installed=False
+    )
     published = {item.rfilename: item for item in info.siblings}
-    for record in manifest["artifacts"]:
+    for record in records:
         item = published.get(record["path"])
         if item is None or item.size != record["size"]:
             raise ModelError(f"Hub artifact does not match manifest: {record['path']}")
@@ -321,10 +450,7 @@ def _download_snapshot(model_id: str, token):
             )
     snapshot = Path(
         snapshot_download(
-            allow_patterns=[
-                "manifest.json",
-                *(r["path"] for r in manifest["artifacts"]),
-            ],
+            allow_patterns=["manifest.json", *(r["path"] for r in records)],
             **options,
         )
     )
@@ -334,7 +460,7 @@ def _download_snapshot(model_id: str, token):
         raise ModelError("Hub returned a different runtime package revision")
     # Repair only corrupt cached artifacts. A manifest error is deterministic
     # and must not trigger a second download of all model weights.
-    for record in manifest["artifacts"]:
+    for record in records:
         path = snapshot / record["path"]
         if (
             not path.is_file()
@@ -349,6 +475,7 @@ def _download_snapshot(model_id: str, token):
 def _cached_snapshot(model_id):
     from huggingface_hub import try_to_load_from_cache
 
+    model_id, variant = split_model_id(model_id)
     path = try_to_load_from_cache(model_id, "manifest.json", revision="main")
     if not isinstance(path, str):
         return None
@@ -356,14 +483,16 @@ def _cached_snapshot(model_id):
     try:
         _snapshot_revision(snapshot, model_id)
         manifest = validate_package_manifest(snapshot / "manifest.json")
-        verify_artifacts(snapshot, manifest, full=True)
+        verify_artifacts(
+            snapshot, manifest, full=True, variant=select_variant(manifest, variant)
+        )
     except (ModelError, OSError):
         return None
     return snapshot.resolve()
 
 
 def resolve_snapshot(model_id: str):
-    validate_repo_id(model_id)
+    validate_model_id(model_id)
     try:
         from huggingface_hub import get_token
         from huggingface_hub.errors import HfHubHTTPError
@@ -434,18 +563,59 @@ def install_snapshot(snapshot: Path, destination: Path):
         stage.rmdir()
 
 
+def install_variant(snapshot: Path, destination: Path, manifest, variant: str):
+    """Publish a variant root: real target/, draft/, vision/, tokenizer/ directories
+    of per-file symlinks into the snapshot, plus a manifest.json symlink. The
+    engine requires target/ and draft/ to be real subdirectories of one root."""
+    if destination.exists() and not (
+        destination.is_symlink() or (destination / "manifest.json").is_symlink()
+    ):
+        raise ModelError(f"refusing to replace non-symlink model path: {destination}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    stage = Path(
+        tempfile.mkdtemp(prefix=f".prepare-{destination.name}-", dir=destination.parent)
+    )
+    try:
+        os.symlink(snapshot / "manifest.json", stage / "manifest.json")
+        for record in artifact_records(manifest, variant, installed=False):
+            link = stage / installed_path(record["path"], variant)
+            link.parent.mkdir(parents=True, exist_ok=True)
+            os.symlink(snapshot / record["path"], link)
+        retired = None
+        if destination.is_symlink():
+            destination.unlink()
+        elif destination.exists():
+            retired = Path(
+                tempfile.mkdtemp(
+                    prefix=f".retired-{destination.name}-", dir=destination.parent
+                )
+            )
+            os.rename(destination, retired / "root")
+        os.rename(stage, destination)
+    except BaseException:
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
+    if retired is not None:
+        shutil.rmtree(retired, ignore_errors=True)
+
+
 def prepare(args):
-    validate_repo_id(args.model)
+    repo_id, variant = split_model_id(args.model)
     models = args.models.resolve()
     models.mkdir(parents=True, exist_ok=True)
     root = installed_root(models, args.model)
     with installation_lock(models):
         try:
-            _snapshot_revision(root.resolve(), args.model)
+            _snapshot_revision(installed_snapshot(root), repo_id)
             manifest = validate_package_manifest(root / "manifest.json")
-            verify_artifacts(root, manifest, full=False)
+            selected = select_variant(manifest, variant)
+            verify_artifacts(
+                root, manifest, full=False, variant=selected, installed=True
+            )
         except (ModelError, OSError):
-            if root.exists() and not root.is_symlink():
+            if root.exists() and not (
+                root.is_symlink() or (root / "manifest.json").is_symlink()
+            ):
                 raise ModelError(
                     f"cannot identify the local package at {root}; move it aside before installing"
                 ) from None
@@ -454,15 +624,22 @@ def prepare(args):
                 flush=True,
             )
             snapshot = resolve_snapshot(args.model)
-            ref = _retain_snapshot_ref(snapshot, args.model, root)
-            install_snapshot(snapshot, root)
+            manifest = validate_package_manifest(snapshot / "manifest.json")
+            selected = select_variant(manifest, variant)
+            ref = _retain_snapshot_ref(snapshot, repo_id, root)
+            if selected is None:
+                install_snapshot(snapshot, root)
+            else:
+                install_variant(snapshot, root, manifest, selected)
             manifest = validate_package_manifest(root / "manifest.json")
-            verify_artifacts(root, manifest, full=False)
+            verify_artifacts(
+                root, manifest, full=False, variant=selected, installed=True
+            )
             print(f"Installed verified Splash model {args.model} in {root}")
         else:
             print(f"Splash model {args.model} is already installed in {root}")
             try:
-                ref = _retain_snapshot_ref(root.resolve(), args.model, root)
+                ref = _retain_snapshot_ref(installed_snapshot(root), repo_id, root)
             except OSError as error:
                 if error.errno not in (errno.EACCES, errno.EPERM, errno.EROFS):
                     raise
@@ -494,8 +671,8 @@ def parse_args(argv=None):
     parser.add_argument(
         "--model",
         required=True,
-        type=parse_repo_id,
-        help="Hugging Face repository ID (owner/repo)",
+        type=parse_model_id,
+        help="Hugging Face repository ID (owner/repo[::variant])",
     )
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("prepare")
