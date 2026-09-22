@@ -16,7 +16,7 @@ class ToolSchemaCompositionTests(unittest.TestCase):
         cls.tokenizer = structured.StructuredToolGrammarTest.tokenizer
         cls.guidance = structured.StructuredToolGrammarTest.guidance
 
-    def check_arguments(self, schema, arguments, invalid):
+    def check_arguments(self, schema, arguments, invalid, *, order=None):
         original = copy.deepcopy(schema)
         tools = [
             {"type": "function", "function": {"name": "test", "parameters": schema}}
@@ -27,6 +27,9 @@ class ToolSchemaCompositionTests(unittest.TestCase):
         shape = policy.argument_schemas["test"]
         names = [name for name in shape["properties"] if name in arguments]
         names += [name for name in arguments if name not in shape["properties"]]
+        if order is not None:
+            self.assertEqual(set(order), set(names))
+            names = order
         xml = "<tool_call>\n<function=test>\n"
         for name in names:
             value = arguments[name]
@@ -59,6 +62,42 @@ class ToolSchemaCompositionTests(unittest.TestCase):
         with self.assertRaises(APIError):
             output.validate_tool_calls(calls, policy)
         return policy, xml
+
+    def test_early_optional_fields_remain_available_after_required_fields(self):
+        schema = {
+            "type": "object",
+            "properties": {
+                "content": {"type": "string"},
+                "name": {"type": "string"},
+                "tags": {"type": "array", "items": {"type": "string"}},
+                "type": {"enum": ["txt", "group"]},
+            },
+            "required": ["name", "type"],
+            "additionalProperties": False,
+        }
+        arguments = {
+            "content": "正文\nSecond line",
+            "name": "Note",
+            "tags": [],
+            "type": "txt",
+        }
+        for order in (list(schema["properties"]), ["name", "type", "content", "tags"]):
+            with self.subTest(order=order):
+                policy, xml = self.check_arguments(
+                    schema, arguments, {"content": "missing name/type"}, order=order
+                )
+                grammar = tool_schema.tool_grammar(policy, False)
+                for bad in (
+                    xml.replace("<parameter=name>\nNote\n</parameter>\n", ""),
+                    xml.replace(
+                        "<parameter=name>\nNote\n</parameter>\n",
+                        "<parameter=name>\nNote\n</parameter>\n" * 2,
+                    ),
+                ):
+                    matcher = LLMatcher(self.guidance, grammar)
+                    tokens = self.tokenizer.encode(bad).ids
+                    self.assertLess(matcher.validate_tokens(tokens), len(tokens))
+        self.check_arguments(schema, {"name": "Folder", "type": "group"}, {})
 
     def test_note_content_survives_protocol_conversion_and_streaming(self):
         schema = {

@@ -559,6 +559,8 @@ def _argument_grammar(schema):
     required = schema["required"]
     rules = []
     sequence = []
+    required_sequence = []
+    optional_sequence = []
     for index, (name, value_schema) in enumerate(properties.items()):
         if value_schema is False:
             if name in required:
@@ -574,7 +576,9 @@ def _argument_grammar(schema):
         ):
             raise APIError(400, "invalid tool parameter name")
         rule = f"parameter_{index}"
-        sequence.append(rule + ("" if name in required else "?"))
+        item = rule + ("" if name in required else "?")
+        sequence.append(item)
+        (required_sequence if name in required else optional_sequence).append(item)
         prefix = json.dumps(f"{PARAMETER_OPEN}{name}>\n")
         rules.extend(_parameter_rules(rule, prefix, value_schema))
     additional = schema["additionalProperties"]
@@ -582,8 +586,16 @@ def _argument_grammar(schema):
         name_rule = _extra_parameter_names(properties, rules)
         prefix = f"{json.dumps(PARAMETER_OPEN)} {name_rule} {json.dumps('>' + chr(10))}"
         rules.extend(_parameter_rules("extra", prefix, additional))
-        sequence.append("extra*")
+    # A skipped optional field cannot be revisited in an ordered grammar.
+    # Also accept required-first order so a model that starts with the required
+    # fields can still supply earlier optional fields. Two linear sequences
+    # retain required/unique fields without enumerating every permutation.
+    required_first = required_sequence + optional_sequence
     start = " ".join(sequence)
+    if required_first != sequence:
+        start = f"({start}) | ({' '.join(required_first)})"
+    if additional is not False:
+        start = f"({start}) extra*" if start else "extra*"
     return (
         "%llguidance {}\nstart:"
         + (" " + start if start else "")
