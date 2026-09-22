@@ -22,7 +22,9 @@ needed):
 - `harness_embed.mm`: the three native-row embedding gathers against a CPU reference.
 - `harness_image.mm`: builds layer/head/embedding images straight from a GGUF with the
   load-time `kq_repack` / `kq_copy` kernels and compares them byte for byte with converter
-  output (`convert_gguf_to_splash.py`).
+  output (`convert_gguf_to_splash.py`). Checked on an M4 with UD-Q4_K_M: layers 0, 1, 3 and 11
+  (all eight tensor types), head (Q6_K) and embedding identical; 0.05-0.2 s per layer image
+  from the page cache, 0.9 s for the 1 GB head.
 - `bench_e2e.py`, `run_e2e.sh`, `accept_probe.sh`, `e2e_summary.py`: end-to-end ABAB benchmark
   against `server/server.py` (single stream, 4 concurrent, prefill) with a one-minute gap
   between runs; `entries.py` and `inspect_pkg.py` build the per-tensor result tables from
