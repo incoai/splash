@@ -130,6 +130,7 @@ private:
     uint32_t promptTokens = 0;
     uint32_t reportedPromptTokens = 0;
     uint32_t replayTokens = 0;
+    std::vector<uint64_t> promptPageFingerprints;
     // A failed dispatch must fit before replay can consume any model work.
     uint64_t resumeKvTargetTokens = 0;
     ResourceWait resourceWait;

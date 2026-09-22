@@ -10,6 +10,34 @@ namespace {
 
 constexpr double kResourceRetryBackoffMilliseconds = 100.0;
 constexpr double kHealthCheckIntervalMilliseconds = 1000.0;
+constexpr uint64_t kPromptFingerprintSeed = 0x6a09e667f3bcc909ULL;
+
+uint64_t mixPromptFingerprint(uint64_t hash, uint64_t value) noexcept {
+  hash ^= value + 0x9e3779b97f4a7c15ULL + (hash << 6) + (hash >> 2);
+  return hash;
+}
+
+std::vector<uint64_t>
+promptPageFingerprints(std::span<const uint32_t> prompt,
+                      std::span<const ImageSpan> images) {
+  const size_t pageCount = prompt.size() > 1
+                               ? (prompt.size() - 1) / KvCache::pageTokens
+                               : 0;
+  std::vector<uint64_t> fingerprints;
+  fingerprints.reserve(pageCount);
+  for (size_t page = 0; page < pageCount; ++page) {
+    const size_t begin = page * KvCache::pageTokens;
+    uint64_t hash = mixPromptFingerprint(kPromptFingerprintSeed, begin);
+    for (uint32_t token : prompt.subspan(begin, KvCache::pageTokens))
+      hash = mixPromptFingerprint(hash, token);
+    const ImageIdentity image =
+        blockImageIdentity(begin, KvCache::pageTokens, images);
+    hash = mixPromptFingerprint(hash, image.lo);
+    hash = mixPromptFingerprint(hash, image.hi);
+    fingerprints.push_back(hash);
+  }
+  return fingerprints;
+}
 
 uint32_t replayStateBoundary(uint32_t tokens) noexcept {
   return tokens > 1 ? (tokens - 1) / KvCache::pageTokens * KvCache::pageTokens
@@ -91,6 +119,8 @@ void Engine::submit(EngineRequest value) {
   Request requestState;
   requestState.promptTokens = static_cast<uint32_t>(value.prompt.size());
   requestState.replayTokens = requestState.promptTokens;
+  requestState.promptPageFingerprints =
+      promptPageFingerprints(value.prompt, value.images);
   requestState.request = std::move(value);
   auto [entry, inserted] = requests_.emplace(id, std::move(requestState));
   if (!inserted)
@@ -364,7 +394,17 @@ uint32_t Engine::sharedPrefillBoundary(const Request &left,
   };
   const auto a = prompt(left);
   const auto b = prompt(right);
-  const auto end = std::mismatch(a.begin(), a.end(), b.begin(), b.end()).first;
+  const size_t pageCount = std::min(left.promptPageFingerprints.size(),
+                                    right.promptPageFingerprints.size());
+  size_t firstDifferingPage = 0;
+  while (firstDifferingPage < pageCount &&
+         left.promptPageFingerprints[firstDifferingPage] ==
+             right.promptPageFingerprints[firstDifferingPage])
+    ++firstDifferingPage;
+  const size_t exactStart = firstDifferingPage * KvCache::pageTokens;
+  const auto end = std::mismatch(a.begin() + exactStart, a.end(),
+                                 b.begin() + exactStart, b.end())
+                       .first;
   uint32_t boundary = std::min<uint32_t>(
       static_cast<uint32_t>(end - a.begin()),
       std::min(replayStateBoundary(left.promptTokens),
