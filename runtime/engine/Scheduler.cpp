@@ -197,7 +197,7 @@ std::vector<uint64_t> Scheduler::prefillAdmissionOrder(
     pending.push_back(std::move(value));
   }
   std::vector<const Request *> ready;
-  ready.reserve(requests_.size() + pending.size());
+  ready.reserve(requests_.size());
   for (const auto &[_, request] : requests_)
     if (request.phase == Phase::Prefill)
       ready.push_back(&request);
