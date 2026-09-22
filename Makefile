@@ -237,7 +237,7 @@ ENGINE_MM_SOURCES := \
 	runtime/model/Runtime.mm \
 	runtime/model/RuntimeArenas.mm \
 	runtime/ops/Vision.mm \
-	runtime/ops/Q8PageStorage.mm \
+	runtime/ops/PageStorage.mm \
 	runtime/engine/RuntimeResources.mm \
 	runtime/engine/Bootstrap.mm
 ENGINE_OBJECTS := \

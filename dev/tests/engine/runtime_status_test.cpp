@@ -106,8 +106,8 @@ void testCleanRuntimeStatus() {
   engine::RuntimeCacheIdentity identity;
   identity.modelLayoutSha256 = std::string(64, 'a');
   identity.buildId = "build";
-  identity.q8Layout = kv::makeQ8LayoutGuard({16, 4, 256}, {});
-  identity.q8Layout.modelArtifactSha256.fill(0xbc);
+  identity.kvLayout = kv::makeLayoutGuard({16, 4, 256}, {});
+  identity.kvLayout.modelArtifactSha256.fill(0xbc);
   identity.namespaceSha256 = std::string(64, 'd');
 
   metal::MetalMemoryStats metal;
@@ -168,6 +168,17 @@ void testCleanRuntimeStatus() {
   const std::string json =
       runtimeStatusJson(memoryPlan, engine, metal, warmup, audit(memoryPlan),
                         metrics, executorTelemetry, identity, governor, true);
+  require(json.find("\"kv\":{\"target_model_sha256\"") != std::string::npos &&
+              json.find("\"q8\":{\"target_model_sha256\"") != std::string::npos,
+          "INT8 status lost its generic or legacy identity");
+  auto bf16Identity = identity;
+  bf16Identity.kvLayout = kv::makeLayoutGuard({16, 4, 256, kv::Format::BFloat16}, {});
+  const auto bf16Status = runtimeStatusJson(memoryPlan, engine, metal, warmup, audit(memoryPlan),
+                        metrics, executorTelemetry, bf16Identity, governor, true);
+  require(bf16Status.find("\"format\":\"bf16\"") != std::string::npos &&
+              bf16Status.find("\"scale_type\":\"none\"") != std::string::npos &&
+              bf16Status.find("\"q8\":") == std::string::npos,
+          "BF16 cache identity advertised INT8 storage");
   require(json.find("\"schema_version\":5") != std::string::npos &&
               json.find("\"ready\":true") != std::string::npos,
           "status readiness/schema is wrong");

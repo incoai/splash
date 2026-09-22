@@ -47,8 +47,8 @@ constexpr std::array moeFields{
     &MoeWorkspace::groupedInputBytes, &MoeWorkspace::expertIntermediateBytes,
     &MoeWorkspace::expertOutputBytes};
 
-kv::Q8Layout layout(AttentionShape shape, uint32_t layers = 1) {
-  return {layers, shape.kvHeads, shape.headDimension};
+kv::Layout layout(AttentionShape shape, uint32_t layers = 1) {
+  return {layers, shape.kvHeads, shape.headDimension, shape.format};
 }
 DeviceCapabilities device(uint32_t family = 10) {
   DeviceCapabilities value;
@@ -348,6 +348,16 @@ void policyKeysAndBounds() {
                                       {PrefillSplitMultiplier::Two}});
   plans.install(choices);
   requireMixed(plans);
+  const kv::Layout bf16{1, 4, 256, kv::Format::BFloat16};
+  const std::array<uint32_t, 3> bf16Histories{31, 32, 2049};
+  require(plans.prefillAttention(2048, 24, bf16, 2049).configuration ==
+              PrefillAttentionConfig{} &&
+              plans.verifyAttention(3, 24, bf16, bf16Histories).configuration ==
+              VerifyAttentionConfig{},
+          "INT8 calibration leaked into the BF16 policy");
+  require(!plans.prefillAttention(2048, 24, bf16, 2049).sameExecutionAs(
+              plans.prefillAttention(2048, 24, layout(attentionShapes[0]), 2049)),
+          "different cache formats aliased the same execution plan");
   require(plans.prefillAttention(2048, 24, layout(attentionShapes[0], 64), 0).sameExecutionAs(
               plans.prefillAttention(2048, 24, layout(attentionShapes[0]), 0)),
           "layer count leaked into one-layer plan identity");

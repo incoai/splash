@@ -47,7 +47,7 @@ float fp32(uint16_t value) {
   return std::bit_cast<float>(uint32_t{value} << 16);
 }
 
-void checkPrefillSlotOrientation(uint32_t queryHeads, kv::Q8Layout layout,
+void checkPrefillSlotOrientation(uint32_t queryHeads, kv::Layout layout,
                                 ops::PrefillAttentionConfig config) {
   bool unequalAxes = false, partialTile = false, multipleSplits = false;
   // Enumerate nonsquare grids and partial final tiles. Each logical partial
@@ -88,12 +88,12 @@ void checkPrefillSlotOrientation(uint32_t queryHeads, kv::Q8Layout layout,
           "prefill slot orientation cases omitted unequal axes, partial tiles or splits");
 }
 
-void checkPlans(uint32_t queryHeads, kv::Q8Layout layout) {
+void checkPlans(uint32_t queryHeads, kv::Layout layout) {
   const std::string geometrySuffix = layout.kvHeads == 4 ? "" : "_kv2_g8";
   const std::array<uint32_t, 4> zeroHistory{};
   for (const auto config : ops::PagedAttention::prefillCandidates()) {
-    const std::string splitPipeline = std::string("prefill_attention_q8_split") +
-        (config.scalePlacement == ops::AttentionScalePlacement::Cooperative
+    const std::string splitPipeline = std::string(layout.format == kv::Format::Int8 ? "prefill_attention_q8_split" : "prefill_attention_bf16_split") +
+        (layout.format == kv::Format::Int8 && config.scalePlacement == ops::AttentionScalePlacement::Cooperative
              ? "_cooperative_scale" : "") + geometrySuffix;
     const std::string reducePipeline = "prefill_attention_q8_reduce" + geometrySuffix;
     checkPrefillSlotOrientation(queryHeads, layout, config);
@@ -127,8 +127,8 @@ void checkPlans(uint32_t queryHeads, kv::Q8Layout layout) {
       }
   }
   for (const auto config : ops::PagedAttention::verifyCandidates()) {
-    const std::string splitPipeline = std::string("verify_attention_q8_split") +
-        (config.scalePlacement == ops::AttentionScalePlacement::Cooperative
+    const std::string splitPipeline = std::string(layout.format == kv::Format::Int8 ? "verify_attention_q8_split" : "verify_attention_bf16_split") +
+        (layout.format == kv::Format::Int8 && config.scalePlacement == ops::AttentionScalePlacement::Cooperative
              ? "_cooperative_scale" : "") + geometrySuffix;
     const std::string reducePipeline = "verify_attention_q8_reduce" + geometrySuffix;
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
@@ -216,11 +216,11 @@ void checkPlans(uint32_t queryHeads, kv::Q8Layout layout) {
 
 struct Case final {
   uint32_t queryHeads;
-  kv::Q8Layout layout;
+  kv::Layout layout;
   uint32_t lanes;
   uint32_t rows;
   uint32_t stride;
-  kv::Q8LayerStorage layer;
+  kv::LayerStorage layer;
   metal::MetalBuffer keys;
   metal::MetalBuffer values;
   metal::MetalBuffer queries;
@@ -247,6 +247,8 @@ struct Case final {
   float key(uint32_t lane, uint32_t head, uint32_t token,
              uint32_t dimension) const {
     const uint64_t index = scaleIndex(lane, head, token);
+    if (layout.format == kv::Format::BFloat16)
+      return fp32(static_cast<const uint16_t *>(layer.keyData.contents())[index * 256 + dimension]);
     return static_cast<const int8_t *>(layer.keyData.contents())[index * 256 +
                                                                  dimension] *
            static_cast<const float *>(layer.keyScales.contents())[index];
@@ -256,19 +258,22 @@ struct Case final {
                uint32_t dimension) const {
     const uint64_t index = scaleIndex(lane, head, token);
     const uint64_t dataIndex = (index / 32 * 256 + dimension) * 32 + index % 32;
+    if (layout.format == kv::Format::BFloat16)
+      return fp32(static_cast<const uint16_t *>(layer.valueData.contents())[dataIndex]);
     return static_cast<const int8_t *>(layer.valueData.contents())[dataIndex] *
            static_cast<const float *>(layer.valueScales.contents())[index];
   }
 };
 
 metal::MetalBuffer allocate(metal::MetalBackend &backend, uint64_t bytes) {
+  if (!bytes) return {};
   auto buffer = backend.allocateBuffer(bytes);
   std::memset(buffer.contents(), 0, bytes);
   return buffer;
 }
 
 Case makeCase(metal::MetalBackend &backend, uint32_t queryHeads,
-               kv::Q8Layout layout, uint32_t lanes, uint32_t rows,
+               kv::Layout layout, uint32_t lanes, uint32_t rows,
                uint32_t history, bool verify) {
   Case data{queryHeads, layout, lanes, rows, (rows + 31) / 32 * 32,
             {}, {}, {}, {}, {}, {}, {}};
@@ -286,7 +291,7 @@ Case makeCase(metal::MetalBackend &backend, uint32_t queryHeads,
   const uint64_t dataBytes = physicalPages * layout.dataBytesPerLayerPage();
   const uint64_t scaleBytes = physicalPages * layout.scaleBytesPerLayerPage();
   data.layer = {allocate(backend, dataBytes), allocate(backend, scaleBytes),
-                allocate(backend, dataBytes), allocate(backend, scaleBytes)};
+                allocate(backend, dataBytes), allocate(backend, scaleBytes), layout.format};
   data.keys = allocate(backend, uint64_t{lanes} * layout.kvHeads * data.stride * 256 * 2);
   data.values = allocate(backend, data.keys.sizeBytes());
   data.queries = allocate(backend, uint64_t{lanes} * queryHeads * data.stride * 256 * 2);
@@ -306,17 +311,24 @@ Case makeCase(metal::MetalBackend &backend, uint32_t queryHeads,
     for (uint32_t token = 0; token < historyLengths[lane]; ++token) {
       for (uint32_t head = 0; head < layout.kvHeads; ++head) {
         const uint64_t scaleIndex = data.scaleIndex(lane, head, token);
-        static_cast<float *>(data.layer.keyScales.contents())[scaleIndex] = 0.006f;
-        static_cast<float *>(data.layer.valueScales.contents())[scaleIndex] = 0.007f;
+        if (layout.format == kv::Format::Int8) {
+          static_cast<float *>(data.layer.keyScales.contents())[scaleIndex] = 0.006f;
+          static_cast<float *>(data.layer.valueScales.contents())[scaleIndex] = 0.007f;
+        }
         for (uint32_t dimension = 0; dimension < 256; ++dimension) {
           const int key = int((token * 37 + head * 101 + dimension * 17 +
                                token * dimension * 3 + lane * 7) % 255) - 127;
           const int value = int((token * 53 + head * 79 + dimension * 29 +
                                  token * dimension * 5 + lane * 19) % 255) - 127;
-          static_cast<int8_t *>(data.layer.keyData.contents())[scaleIndex * 256 + dimension] = key;
           const uint64_t valueIndex =
               (scaleIndex / 32 * 256 + dimension) * 32 + scaleIndex % 32;
-          static_cast<int8_t *>(data.layer.valueData.contents())[valueIndex] = value;
+          if (layout.format == kv::Format::Int8) {
+            static_cast<int8_t *>(data.layer.keyData.contents())[scaleIndex * 256 + dimension] = key;
+            static_cast<int8_t *>(data.layer.valueData.contents())[valueIndex] = value;
+          } else {
+            static_cast<uint16_t *>(data.layer.keyData.contents())[scaleIndex * 256 + dimension] = bf16(key * 0.006f);
+            static_cast<uint16_t *>(data.layer.valueData.contents())[valueIndex] = bf16(value * 0.007f);
+          }
         }
       }
     }
@@ -346,9 +358,9 @@ Case makeCase(metal::MetalBackend &backend, uint32_t queryHeads,
   return data;
 }
 
-// Independent scalar softmax over the exact Q8 pages produced by the store.
+// Independent scalar softmax over the exact KV pages produced by the store.
 // Sampling query rows bounds the full-2048 oracle cost. Each prefill candidate
-// and host chunk is checked independently against its own causal Q8 history.
+// and host chunk is checked independently against its own causal KV history.
 void checkReference(const Case &data, const std::vector<uint16_t> &actual) {
   double dot = 0, actualSquared = 0, expectedSquared = 0;
   float maximumError = 0;
@@ -397,7 +409,7 @@ void checkReference(const Case &data, const std::vector<uint16_t> &actual) {
   const double cosine = dot / std::sqrt(actualSquared * expectedSquared);
   if (!(maximumError < 0.02f && cosine > 0.9995))
     throw std::runtime_error(
-        "attention candidate failed scalar Q8 oracle: history=" +
+        "attention candidate failed scalar KV oracle: history=" +
         std::to_string(data.stores[0].committed_tokens) + " rows=" +
         std::to_string(data.rows) + " maximum_absolute_error=" +
         std::to_string(maximumError) + " cosine=" + std::to_string(cosine));
@@ -427,6 +439,62 @@ void checkEquivalent(const Case &data, const std::vector<uint16_t> &baseline,
         std::to_string(data.stores[0].committed_tokens) + " rows=" +
         std::to_string(data.rows) + " maximum_absolute_error=" +
         std::to_string(maximumError) + " cosine=" + std::to_string(cosine));
+}
+
+// Construct expected pages from the source bits, independently of GPU stores.
+std::array<std::vector<uint16_t>, 2> expectedBf16Store(const Case &data) {
+  std::array<std::vector<uint16_t>, 2> result;
+  for (unsigned tensor = 0; tensor < 2; ++tensor) {
+    const auto cache = tensor ? data.layer.valueData : data.layer.keyData;
+    const auto *before = static_cast<const uint16_t *>(cache.contents());
+    result[tensor].assign(before, before + cache.sizeBytes() / 2);
+    const auto *source = static_cast<const uint16_t *>(
+        (tensor ? data.values : data.keys).contents());
+    for (uint32_t lane = 0; lane < data.lanes; ++lane) {
+      const auto *table = static_cast<const uint32_t *>(data.tables[lane].contents());
+      for (uint32_t row = 0; row < data.stores[lane].chunk_tokens; ++row) {
+        const uint32_t token = data.stores[lane].committed_tokens + row;
+        for (uint32_t head = 0; head < data.layout.kvHeads; ++head)
+          for (uint32_t d = 0; d < 256; ++d) {
+            const uint64_t pageHead = uint64_t{table[token / 32]} * data.layout.kvHeads + head;
+            const uint64_t destination = tensor ? (pageHead * 256 + d) * 32 + token % 32
+                                                : (pageHead * 32 + token % 32) * 256 + d;
+            const uint64_t base = (uint64_t{lane} * data.layout.kvHeads + head) * data.stride * 256;
+            const uint64_t input = base + (tensor ? d * data.stride + row : row * 256 + d);
+            result[tensor][destination] = source[input];
+          }
+      }
+    }
+  }
+  return result;
+}
+
+void checkBf16Store(const Case &data, const std::array<std::vector<uint16_t>, 2> &expected) {
+  for (unsigned tensor = 0; tensor < 2; ++tensor) {
+    const auto cache = tensor ? data.layer.valueData : data.layer.keyData;
+    require(std::memcmp(cache.contents(), expected[tensor].data(), cache.sizeBytes()) == 0,
+            "BF16 store changed source bits, history, or an unused page slot");
+  }
+}
+
+void checkBf16StoreEdges(metal::MetalBackend &backend) {
+  for (uint32_t heads : {16U, 24U}) {
+    auto data = makeCase(backend, heads, {1, heads == 24 ? 4U : 2U, 256,
+                                         kv::Format::BFloat16}, 1, 33, 31, false);
+    // Signed zero, subnormals, large finite values, infinities and NaN payloads.
+    constexpr std::array<uint16_t, 12> bits{0, 0x8000, 1, 0x8001, 0x007f, 0x0080,
+                                          0x4960, 0x7f7f, 0xff7f, 0x7f80, 0xff80, 0x7fc3};
+    for (auto buffer : {data.keys, data.values}) {
+      auto *source = static_cast<uint16_t *>(buffer.contents());
+      for (uint64_t i = 0; i < buffer.sizeBytes() / 2; ++i) source[i] = bits[i % bits.size()];
+    }
+    const auto expected = expectedBf16Store(data);
+    metal::CommandGraph graph;
+    ops::PagedAttention::addPrefillStore(graph, data.layer, data.keys, data.values,
+                                        data.tables[0], data.stores[0], data.layout);
+    (void)backend.submitCommand(graph.dispatches());
+    checkBf16Store(data, expected);
+  }
 }
 
 template <class Config>
@@ -470,6 +538,11 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data,
   };
   if (testBounds) {
     metal::CommandGraph shortGraph;
+    const auto originalFormat = data.layer.format;
+    data.layer.format = originalFormat == kv::Format::Int8 ? kv::Format::BFloat16 : kv::Format::Int8;
+    rejects([&] { encode(shortGraph, partials, statistics); });
+    data.layer.format = originalFormat;
+    require(shortGraph.empty(), "mismatched KV format partially encoded a graph");
     if constexpr (std::is_same_v<Config, ops::PrefillAttentionConfig>) {
       auto mismatch = data.stores[0];
       mismatch.chunk_tokens = plan.rows == 1 ? 2 : plan.rows - 1;
@@ -533,7 +606,11 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data,
                 reduce.threadgroups.z == plan.reduceGroups.z,
             "production verify encoding departed from its plan");
   }
+  const auto expected = data.layout.format == kv::Format::BFloat16
+                            ? expectedBf16Store(data)
+                            : std::array<std::vector<uint16_t>, 2>{};
   (void)backend.submitCommand(graph.dispatches());
+  if (data.layout.format == kv::Format::BFloat16) checkBf16Store(data, expected);
   for (size_t i = 0; i < sizes.size(); ++i) {
     const auto *bytes = static_cast<const uint8_t *>(backing[i].contents());
     for (uint64_t byte = 0; byte < guardBytes; ++byte)
@@ -551,7 +628,7 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data,
   return {values, values + output.sizeBytes() / 2};
 }
 
-void checkPrefill(metal::MetalBackend &backend, uint32_t heads, kv::Q8Layout layout,
+void checkPrefill(metal::MetalBackend &backend, uint32_t heads, kv::Layout layout,
                    uint32_t history, uint32_t rows) {
   auto data = makeCase(backend, heads, layout, 1, rows, history, false);
   std::vector<uint16_t> defaultOutput;
@@ -566,7 +643,7 @@ void checkPrefill(metal::MetalBackend &backend, uint32_t heads, kv::Q8Layout lay
   checkEquivalent(data, defaultOutput,
                   run(backend, data, ops::PrefillAttentionConfig{}, false));
   if (rows == 1057) {
-    // Reuse the identical packed BF16 inputs and Q8 history across unaligned
+    // Reuse the identical packed BF16 inputs and KV history across unaligned
     // host chunks, checking each path against its independent causal oracle.
     const auto copy = [](metal::MetalBuffer buffer) {
       const auto *begin = static_cast<const uint16_t *>(buffer.contents());
@@ -601,11 +678,11 @@ void checkPrefill(metal::MetalBackend &backend, uint32_t heads, kv::Q8Layout lay
       require(offset == rows, "chunk comparison dropped logical query rows");
     }
   }
-  std::cout << "paged prefill candidates: q=" << heads << " history=" << history
+  std::cout << "paged prefill candidates: format=" << kv::formatName(layout.format) << " q=" << heads << " history=" << history
             << " rows=" << rows << " PASS\n";
 }
 
-void checkVerify(metal::MetalBackend &backend, uint32_t heads, kv::Q8Layout layout,
+void checkVerify(metal::MetalBackend &backend, uint32_t heads, kv::Layout layout,
                   uint32_t history, uint32_t lanes) {
   auto data = makeCase(backend, heads, layout, lanes, 8, history, true);
   std::vector<uint16_t> baseline;
@@ -616,7 +693,7 @@ void checkVerify(metal::MetalBackend &backend, uint32_t heads, kv::Q8Layout layo
       baseline = output;
     checkEquivalent(data, baseline, output);
   }
-  std::cout << "paged verify candidates: q=" << heads << " history=" << history
+  std::cout << "paged verify candidates: format=" << kv::formatName(layout.format) << " q=" << heads << " history=" << history
             << " lanes=" << lanes << " PASS\n";
 }
 
@@ -624,16 +701,35 @@ void checkVerify(metal::MetalBackend &backend, uint32_t heads, kv::Q8Layout layo
 
 int main(int argc, char **argv) {
   try {
-    require(argc == 1 || argc == 2, "usage: paged-attention-plan [production.metallib]");
-    for (uint32_t heads : {24U, 16U})
-      checkPlans(heads, {1, heads == 24 ? 4U : 2U, 256});
+    require(argc >= 1 && argc <= 3, "usage: paged-attention-plan [METALLIB [--long]]");
+    for (auto format : {kv::Format::Int8, kv::Format::BFloat16})
+      for (uint32_t heads : {24U, 16U})
+        checkPlans(heads, {1, heads == 24 ? 4U : 2U, 256, format});
     if (argc == 1) {
       std::cout << "paged attention plans: CPU PASS\n";
       return 0;
     }
     metal::MetalBackend backend(argv[1]);
+    checkBf16StoreEdges(backend);
+    if (argc == 3 && std::string_view(argv[2]) == "--long") {
+      for (auto format : {kv::Format::Int8, kv::Format::BFloat16})
+        for (uint32_t heads : {24U, 16U})
+          for (uint32_t history : {131072U, 260096U}) {
+            const kv::Layout layout{1, heads == 24 ? 4U : 2U, 256, format};
+            auto prefill = makeCase(backend, heads, layout, 1, 2048, history, false);
+            checkReference(prefill, run(backend, prefill, ops::PrefillAttentionConfig{}, true));
+            auto verify = makeCase(backend, heads, layout, 4, 8, history, true);
+            checkReference(verify, run(backend, verify, ops::VerifyAttentionConfig{}, true));
+            std::cout << "long attention: format=" << kv::formatName(format)
+                      << " q=" << heads << " history=" << history << " PASS\n" << std::flush;
+          }
+      std::cout << "long paged attention plans: PASS\n";
+      return 0;
+    }
+    require(argc == 2, "usage: paged-attention-plan [METALLIB [--long]]");
+    for (auto format : {kv::Format::Int8, kv::Format::BFloat16})
     for (uint32_t heads : {24U, 16U}) {
-      const kv::Q8Layout layout{1, heads == 24 ? 4U : 2U, 256};
+      const kv::Layout layout{1, heads == 24 ? 4U : 2U, 256, format};
       for (const auto [history, rows] :
            std::array<std::array<uint32_t, 2>, 10>{{{0, 1}, {33, 7}, {255, 17},
                                                   {1023, 8}, {0, 2048},

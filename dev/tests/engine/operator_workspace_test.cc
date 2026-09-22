@@ -26,7 +26,7 @@ template <class Function> void rejects(Function function) {
 void attention() {
   using namespace splash;
   for (const uint32_t queryHeads : {16U, 24U}) {
-    const kv::Q8Layout layout{1, queryHeads == 16 ? 2U : 4U, 256};
+    const kv::Layout layout{1, queryHeads == 16 ? 2U : 4U, 256};
     for (const auto config : ops::PagedAttention::prefillCandidates()) {
       uint32_t maximumSlots = 0;
       for (uint32_t rows = 1; rows <= 2048; ++rows) {

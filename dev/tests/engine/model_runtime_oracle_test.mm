@@ -3,7 +3,7 @@
 #include "engine/Types.hpp"
 #include "model/Runtime.hpp"
 #include "model/QwenState.hpp"
-#include "ops/Q8PageStorage.hpp"
+#include "ops/PageStorage.hpp"
 #include "ops/Vision.hpp"
 
 #include <algorithm>
@@ -11,6 +11,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <limits>
@@ -120,79 +121,33 @@ Similarity compareFloat(const metal::MetalBuffer &left,
   return accumulator.result();
 }
 
-void requireCommittedStateEquivalent(const model::QwenStateStorage &states,
-                                     uint32_t speculativeSlot,
-                                     uint32_t replaySlot,
-                                     const std::string &label) {
-  const model::QwenSlotMetadata &speculative = states.metadata(speculativeSlot);
-  const model::QwenSlotMetadata &replayed = states.metadata(replaySlot);
-  require(speculative.lengths == replayed.lengths,
-          label + " logical state differs from replay");
-
-  const model::QwenSlotBuffers &speculativeBuffers =
-      states.buffers(speculativeSlot);
-  const model::QwenSlotBuffers &replayedBuffers = states.buffers(replaySlot);
-  const Similarity convolution = compareBfloat(
-      speculativeBuffers.gdn[speculative.activeParity].convolutionBase,
-      replayedBuffers.gdn[replayed.activeParity].convolutionBase);
-  const Similarity recurrent = compareFloat(
-      speculativeBuffers.gdn[speculative.activeParity].recurrentBase,
-      replayedBuffers.gdn[replayed.activeParity].recurrentBase);
-  const Similarity firstConvolution = compareBfloat(
-      speculativeBuffers.gdn[speculative.activeParity].convolutionLayers.front(),
-      replayedBuffers.gdn[replayed.activeParity].convolutionLayers.front());
-  const Similarity firstRecurrent = compareFloat(
-      speculativeBuffers.gdn[speculative.activeParity].recurrentLayers.front(),
-      replayedBuffers.gdn[replayed.activeParity].recurrentLayers.front());
-  constexpr double aggregateStateCosine = 0.99;
-  constexpr double firstLayerStateCosine = 0.9999;
-  const bool stateEquivalent =
-      convolution.cosine > aggregateStateCosine &&
-      recurrent.cosine > aggregateStateCosine &&
-      firstConvolution.cosine > firstLayerStateCosine &&
-      firstRecurrent.cosine > firstLayerStateCosine;
-  if (!stateEquivalent) {
-    std::cerr << label << " gdn conv_cos=" << convolution.cosine
-              << " conv_max_abs=" << convolution.maximumAbsolute
-              << " conv_norms=" << convolution.leftNorm << '/'
-              << convolution.rightNorm << " recurrent_cos=" << recurrent.cosine
-              << " recurrent_max_abs=" << recurrent.maximumAbsolute
-              << " recurrent_norms=" << recurrent.leftNorm << '/'
-              << recurrent.rightNorm << '\n';
-    for (uint32_t layer = 0; layer < states.layout().target.layers; ++layer) {
-      const Similarity layerConvolution = compareBfloat(
-          speculativeBuffers.gdn[speculative.activeParity]
-              .convolutionLayers[layer],
-          replayedBuffers.gdn[replayed.activeParity].convolutionLayers[layer]);
-      const Similarity layerRecurrent = compareFloat(
-          speculativeBuffers.gdn[speculative.activeParity]
-              .recurrentLayers[layer],
-          replayedBuffers.gdn[replayed.activeParity].recurrentLayers[layer]);
-      std::cerr << "  layer=" << layer
-                << " conv_cos=" << layerConvolution.cosine
-                << " recurrent_cos=" << layerRecurrent.cosine << '\n';
-    }
-  }
-  // The committed state consumes the optimized M8/M16/M24/M32 target path;
-  // teacher-forced replay consumes the ragged-prefill path. Sparse-MoE routing
-  // can amplify their BF16/Q4 rounding differences in later layers. Requiring
-  // the first GDN layer to remain nearly identical still catches commit-count,
-  // stride and state-addressing errors before that amplification is possible.
-  require(stateEquivalent, label + " committed GDN state differs from replay");
-
+// Budgeted greedy decoding and masked verification of the same prefix must
+// commit identical state. Both use the same target arithmetic; compare bytes.
+// The GDN kernel tests independently check each retained count against FP64.
+void requireCommittedStateIdentical(const model::QwenStateStorage &states,
+                                    uint32_t budgetSlot, uint32_t maskedSlot,
+                                    const std::string &label) {
+  const auto &budget = states.metadata(budgetSlot);
+  const auto &masked = states.metadata(maskedSlot);
+  require(budget.lengths == masked.lengths,
+          label + " logical state differs between budget and mask commits");
+  const auto &left = states.buffers(budgetSlot);
+  const auto &right = states.buffers(maskedSlot);
+  auto identical = [&](const metal::MetalBuffer &a, const metal::MetalBuffer &b,
+                       const std::string &part) {
+    require(a.sizeBytes() == b.sizeBytes() && a.contents() && b.contents() &&
+                std::memcmp(a.contents(), b.contents(), a.sizeBytes()) == 0,
+            label + " " + part + " differs between budget and mask commits");
+  };
+  identical(left.gdn[budget.activeParity].convolutionBase,
+            right.gdn[masked.activeParity].convolutionBase, "GDN convolution");
+  identical(left.gdn[budget.activeParity].recurrentBase,
+            right.gdn[masked.activeParity].recurrentBase, "GDN recurrent");
   for (uint32_t layer = 0; layer < states.layout().draft.layers; ++layer) {
-    const Similarity keys = compareBfloat(speculativeBuffers.draft[layer].keys,
-                                          replayedBuffers.draft[layer].keys);
-    const Similarity values =
-        compareBfloat(speculativeBuffers.draft[layer].values,
-                      replayedBuffers.draft[layer].values);
-    if (!(keys.cosine > 0.99 && values.cosine > 0.99)) {
-      std::cerr << label << " draft layer=" << layer
-                << " key_cos=" << keys.cosine
-                << " value_cos=" << values.cosine << '\n';
-    }
-    require(keys.cosine > 0.99 && values.cosine > 0.99,
-            label + " committed draft state differs from replay");
+    identical(left.draft[layer].keys, right.draft[layer].keys,
+              "draft keys layer=" + std::to_string(layer));
+    identical(left.draft[layer].values, right.draft[layer].values,
+              "draft values layer=" + std::to_string(layer));
   }
 }
 
@@ -806,13 +761,18 @@ void warmupEos(model::RuntimeContext context, model::ModelPackage &package) {
 
 int main(int argc, char **argv) {
   try {
-    const bool imagesOnly = argc == 4 && std::string_view(argv[3]) == "--images-only";
-    const bool warmupEosOnly = argc == 4 &&
-        std::string_view(argv[3]) == "--warmup-eos-only";
-    if (argc != 3 && !imagesOnly && !warmupEosOnly) {
-      std::cerr << "usage: model-runtime-oracle METALLIB MODEL_ROOT "
-                   "[--images-only|--warmup-eos-only]\n";
-      return 2;
+    bool imagesOnly = false, warmupEosOnly = false;
+    kv::Format format = kv::Format::Int8;
+    if (argc < 3) fail("usage: model-runtime-oracle METALLIB MODEL_ROOT [--kv-format int8|bf16]");
+    for (int i = 3; i < argc; ++i) {
+      const std::string_view option(argv[i]);
+      if (option == "--images-only") imagesOnly = true;
+      else if (option == "--warmup-eos-only") warmupEosOnly = true;
+      else if (option == "--kv-format" && i + 1 < argc) {
+        const std::string_view value(argv[++i]);
+        if (value != "int8" && value != "bf16") fail("invalid KV format");
+        format = value == "int8" ? kv::Format::Int8 : kv::Format::BFloat16;
+      } else fail("unknown model-runtime-oracle option");
     }
     metal::MetalBackend backend(argv[1]);
     const auto &device = backend.capabilities();
@@ -848,7 +808,7 @@ int main(int argc, char **argv) {
         model::loadModelPackage(backend, modelRoot);
     ops::ExecutionPlans operators(backend.capabilities());
     model::ModelMemoryPlan executorPlan =
-        model::plannedRuntimeMemory(backend.capabilities(), model, operators);
+        model::plannedRuntimeMemory(backend.capabilities(), model, operators, format);
     ModelMemoryFootprint footprint{
         model.targetActualAllocatedBytes(),
         model.draft.actualAllocatedBytes,
@@ -860,14 +820,14 @@ int main(int argc, char **argv) {
         executorPlan.runtimeOverheadReserveBytes};
     ModelMemoryProfile profile{
         model.name(), model.maximumContextTokens(),
-        model.targetKvLayout(), footprint};
+        model.targetKvLayout(format), footprint};
     EngineMemoryPlan memoryPlan =
         requireEngineMemoryPlan(backend.capabilities(), profile);
 
     // The pool is a whole number of sparse-mapping batches: the 4-head layout
     // maps 128 pages at a time, the 2-head layout 256 (64 KiB tiles).
     const uint32_t pageCount =
-        std::max(128U, model.targetKvLayout().sparseMappingBatchPages());
+        std::max(128U, model.targetKvLayout(format).sparseMappingBatchPages());
     const EngineMemoryBreakdown &budget = memoryPlan.breakdown();
     require(budget.pipelineReserveBytes <= budget.hardBudgetBytes &&
                 budget.runtimeOverheadReserveBytes <
@@ -898,7 +858,7 @@ int main(int argc, char **argv) {
           return true;
         };
     metal::AllocationFailure kvAdmissionFailure = metal::AllocationFailure::None;
-    kv::Q8PageStorage pages(
+    kv::PageStorage pages(
         backend,
         [governed = governor.allocationAdmission(), &kvAdmissionFailure](
             uint64_t bytes, const std::function<void()> &allocate)
@@ -907,7 +867,7 @@ int main(int argc, char **argv) {
             return kvAdmissionFailure;
           return governed(bytes, allocate);
         },
-        model.targetKvLayout(), pageCount);
+        model.targetKvLayout(format), pageCount);
     model::QwenStateStorage states(backend,
                                     admission,
                                     model.stateLayout());
@@ -945,7 +905,7 @@ int main(int argc, char **argv) {
         static_cast<void>(executor.warmupPrefill(1));
       } catch (const metal::MetalAllocationError &error) {
         rejected = error.failure() == failure &&
-            std::string(error.what()).find("Q8 page backing") != std::string::npos;
+            std::string(error.what()).find("KV page backing") != std::string::npos;
       }
       require(rejected && !states.metadata(0).assigned &&
                   executor.telemetry().targetPrefillRows == beforeWarmupRows &&
@@ -1222,13 +1182,13 @@ int main(int argc, char **argv) {
             "constrained short prefill final hidden is unusable");
     executor.end(56);
 
-    // Output limits only change the token-exact commit count. Every executable
-    // decode still runs one anchor plus seven proposal rows.  Compare each
-    // retained prefix against a teacher-forced replay of precisely the tokens
-    // exposed by the commit cursor; rejected speculative rows must be absent
-    // from both the active GDN state and the persistent draft ring. A final
-    // budgeted token is emitted without a KV row and is not part of the
-    // committed prefix (a one-token budget is emitted by prefill itself).
+    // Every decode executes an anchor plus seven proposal rows. Compare each
+    // budgeted commit with a constrained cycle that retains the same prefix,
+    // rejecting the next proposal unless all eight rows are retained. The
+    // constrained request has a larger budget, so both acceptance paths agree on
+    // the exact GDN state and draft ring. Kernel tests cover the recurrence's
+    // FP64 accuracy; this check does not mix prefill and decode summation
+    // orders, whose tiny differences can amplify through the full model.
     for (uint32_t outputLimit = 2; outputLimit <= 8; ++outputLimit) {
       uint64_t id = 10 + outputLimit;
       EngineRequest variant = makeRequest(id, prompt129, outputLimit);
@@ -1253,26 +1213,53 @@ int main(int argc, char **argv) {
                                  129 + stored,
               "fixed DFlash-8 state length mismatch");
 
-      std::vector<uint32_t> replayPrompt = prompt129;
-      replayPrompt.insert(replayPrompt.end(), result.outputTokens.begin(),
-                          result.outputTokens.begin() + stored);
       const uint64_t replayId = 100 + outputLimit;
-      // The composite state deliberately excludes target KV.  A valid replay
-      // therefore shares the four sealed Page32 history blocks and owns only
-      // its writable block; using an unrelated empty page table would test a
-      // corrupt hybrid restore rather than GDN commit equivalence.
       std::vector<uint32_t> replayPages = pageTable;
+      // Composite snapshots exclude KV: share sealed history and give the
+      // comparison its own writable page for the speculative suffix.
       replayPages[4] = 80;
-      beginCold(executor, makeRequest(replayId, replayPrompt, 1), 1);
-      restoreActivePrefix(executor, replayId, replayPrompt.size(), 128,
+      EngineRequest replayRequest = makeRequest(
+          replayId, prompt129, static_cast<uint32_t>(stored + 2),
+          BatchCohort::Constrained);
+      replayRequest.constraint = ConstraintMode::TokenMask;
+      beginCold(executor, replayRequest, 1);
+      restoreActivePrefix(executor, replayId, prompt129.size(), 128,
                           promptSnapshot);
       prefillChunk(executor, replayId, 1, 128, 128,
-                   std::span<const uint32_t>(replayPrompt).subspan(128, 1),
-                   replayPages);
-      prefillChunk(executor, replayId, 1, 129, 129,
-                   std::span<const uint32_t>(replayPrompt).subspan(129, stored),
-                   replayPages);
-      requireCommittedStateEquivalent(
+                   std::span<const uint32_t>(prompt129).subspan(128, 1),
+                   replayPages, BatchCohort::Constrained);
+      const auto initial = decodeOne(executor, replayId, 1, 129, replayPages,
+                                     BatchCohort::Constrained,
+                                     DecodeStage::RequestInitialMask);
+      require(initial.nextDecodeStage == DecodeStage::ApplyInitialMask,
+              "replay did not request its initial mask");
+      const std::array<uint32_t, 1> firstAnchor{result.outputTokens.front()};
+      executor.provideMask(replayId, singletonMasks(firstAnchor));
+      auto pending = beginMaskedDecodeOne(executor, replayId, 1, 129,
+                                          replayPages,
+                                          DecodeStage::ApplyInitialMask);
+      require(pending.maskRequests.size() == 1 &&
+                  pending.maskRequests[0].simulationTokens.size() == 8,
+              "replay proposals were not exposed");
+      const auto &proposed = pending.maskRequests[0].simulationTokens;
+      std::array<uint32_t, 9> maskTokens{};
+      maskTokens.fill(100);
+      for (size_t row = 0; row < stored; ++row) {
+        require(proposed[row] == result.outputTokens[row],
+                "replay proposal differs from committed token");
+        maskTokens[row] = result.outputTokens[row];
+      }
+      if (stored < proposed.size())
+        maskTokens[stored] = proposed[stored] == 101 ? 102 : 101;
+      executor.provideMask(replayId, singletonMasks(maskTokens));
+      const auto replayed = finishMaskedDecode(std::move(pending));
+      require(replayed.size() == 1 &&
+                  replayed[0].acceptedDraftTokens == stored - 1 &&
+                  replayed[0].outputTokens.size() -
+                          replayed[0].outputTokensWithoutKv == stored &&
+                  states.metadata(1).lengths.targetTokens == 129 + stored,
+              "replay did not commit exactly the supplied prefix");
+      requireCommittedStateIdentical(
           states, 0, 1, "fixed DFlash-8 retained=" + std::to_string(stored));
       executor.end(replayId);
       executor.end(id);
@@ -1376,6 +1363,8 @@ int main(int argc, char **argv) {
             "sampling restore replay reused producer policy state");
     executor.end(32);
     samplingPromptSnapshot.reset();
+
+    const auto beforeConstrained = executor.telemetry();
 
     // The constraint handshake exposes the pending anchor plus all seven
     // DFlash proposals. The next mask therefore has nine rows: the current
@@ -1589,10 +1578,12 @@ int main(int argc, char **argv) {
             "B2 constrained overlap corrupted a lane");
     const model::ModelTelemetry constrainedTelemetry =
         executor.telemetry();
-    require(constrainedTelemetry.constrainedMaskOverlapBatches == 3 &&
-                constrainedTelemetry.constrainedMaskOverlapRequests == 4 &&
+    require(constrainedTelemetry.constrainedMaskOverlapBatches -
+                    beforeConstrained.constrainedMaskOverlapBatches == 3 &&
+                constrainedTelemetry.constrainedMaskOverlapRequests -
+                    beforeConstrained.constrainedMaskOverlapRequests == 4 &&
                 constrainedTelemetry.totalConstrainedTargetForwardGpuSeconds >
-                    0.0,
+                    beforeConstrained.totalConstrainedTargetForwardGpuSeconds,
             "constrained overlap telemetry does not match B1/B2 execution");
     executor.end(42);
     executor.end(43);

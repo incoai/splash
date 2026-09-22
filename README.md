@@ -88,6 +88,7 @@ depends on available memory.
 - `--port`: HTTP port. Defaults to `SPLASH_PORT` or `8000`.
 - `--max-memory`: ceiling on Metal allocations, e.g. `28G`. Default: auto.
 - `--max-context`: context limit, up to `256K`, e.g. `100K`. Default: auto.
+- `--kv-format`: target KV cache storage, `int8` (default) or `bf16`. BF16 avoids KV quantization, uses approximately twice the KV memory, and can be slower at long contexts. Model weights are unchanged. The format is fixed while the server is running.
 - `--max-image-pixels`: maximum resized pixels per image. Default: 4,194,304.
 - `--allowed-host`: extra HTTP `Host` name to accept, not a bind address. Repeatable.
 - `--api-key`: require this key on API requests, as a bearer token or

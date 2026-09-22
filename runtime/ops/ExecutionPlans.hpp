@@ -16,6 +16,7 @@ struct AttentionShape final {
   uint32_t queryHeads = 0;
   uint32_t kvHeads = 0;
   uint32_t headDimension = 0;
+  kv::Format format = kv::Format::Int8;
   auto operator<=>(const AttentionShape &) const = default;
 };
 
@@ -94,10 +95,10 @@ public:
   void install(const OperatorChoices &choices);
 
   [[nodiscard]] PrefillAttentionPlan prefillAttention(
-      uint32_t rows, uint32_t queryHeads, kv::Q8Layout layout,
+      uint32_t rows, uint32_t queryHeads, kv::Layout layout,
       uint32_t historyTokens) const;
   [[nodiscard]] VerifyAttentionPlan verifyAttention(
-      uint32_t lanes, uint32_t queryHeads, kv::Q8Layout layout,
+      uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
       std::span<const uint32_t> historyTokens) const;
   [[nodiscard]] DraftAttentionPlan draftAttention(
       DraftAttentionShape shape, uint32_t lanes) const;
@@ -112,9 +113,9 @@ public:
   // currently requested row count. Packed decode arenas use a per-lane stride
   // of max_B ceil(requiredBytes(B)/B), independently for each scratch field.
   [[nodiscard]] AttentionWorkspace prefillAttentionWorkspace(
-      uint32_t maximumRows, uint32_t queryHeads, kv::Q8Layout layout) const;
+      uint32_t maximumRows, uint32_t queryHeads, kv::Layout layout) const;
   [[nodiscard]] AttentionWorkspace verifyAttentionWorkspacePerLane(
-      uint32_t queryHeads, kv::Q8Layout layout) const;
+      uint32_t queryHeads, kv::Layout layout) const;
   [[nodiscard]] DraftAttentionWorkspace draftAttentionWorkspacePerLane(
       DraftAttentionShape shape) const;
   [[nodiscard]] MoeWorkspace moePrefillWorkspace(

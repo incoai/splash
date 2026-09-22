@@ -179,6 +179,8 @@ def serve(args):
             "--max-context",
             "auto" if args.max_context is None else str(args.max_context),
         ]
+        if args.kv_format != "int8":
+            command.extend(("--kv-format", args.kv_format))
         for name in args.served_model_name:
             command.append(f"--served-model-name={name}")
         if args.default_reasoning_effort is not None:
@@ -375,6 +377,12 @@ def parse_args(argv=None):
         choices=REASONING_EFFORTS,
         default=os.environ.get("SPLASH_DEFAULT_REASONING_EFFORT"),
         help="Chat/Responses effort when unspecified (default: SPLASH_DEFAULT_REASONING_EFFORT or model template)",
+    )
+    server.add_argument(
+        "--kv-format",
+        choices=("int8", "bf16"),
+        default="int8",
+        help="target KV cache storage (default: int8); bf16 uses more memory",
     )
     server.add_argument(
         "--max-memory",

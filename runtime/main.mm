@@ -55,6 +55,7 @@ struct NativeArguments final {
   model::ModelDescriptor model;
   uint32_t maxContext = 0;
   uint64_t maxMemoryBytes = 0;
+  kv::Format kvFormat = kv::Format::Int8;
 };
 
 // One observer spans bootstrap and serving. The dispatch queue only records
@@ -124,7 +125,7 @@ private:
 void printUsage(std::string_view executable) {
   std::cerr << "usage: " << executable
             << " serve-native TARGET_DIRECTORY DRAFT_DIRECTORY"
-               " MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto\n";
+               " MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto [--kv-format int8|bf16]\n";
 }
 
 template <typename T>
@@ -183,10 +184,17 @@ std::filesystem::path requireModelRoot(std::string_view targetArgument,
 }
 
 NativeArguments parseArguments(int argc, char **argv) {
-  if (argc != 6 || std::string_view(argv[1]) != "serve-native") {
+  if ((argc != 6 && argc != 8) || std::string_view(argv[1]) != "serve-native") {
     throw UsageError("expected the serve-native command");
   }
   NativeArguments result;
+  if (argc == 8) {
+    const std::string_view format(argv[7]);
+    if (std::string_view(argv[6]) != "--kv-format" ||
+        (format != "int8" && format != "bf16"))
+      throw UsageError("--kv-format requires int8 or bf16");
+    result.kvFormat = format == "int8" ? kv::Format::Int8 : kv::Format::BFloat16;
+  }
   result.modelRoot = requireModelRoot(argv[2], argv[3]);
   result.model = model::inspectModelPackage(result.modelRoot);
   result.maxContext = parseMaxContext(argv[4], result.model.capabilities);
@@ -232,6 +240,7 @@ bootstrapConfig(const NativeArguments &arguments) {
   config.resources.model = arguments.model;
   config.resources.buildId = SPLASH_BUILD_ID;
   config.resources.maximumMemoryBytes = arguments.maxMemoryBytes;
+  config.resources.kvFormat = arguments.kvFormat;
   config.resources.maximumImagePatches = kMaximumImagePatches;
   config.nativeLoop.engine.maxContext = arguments.maxContext;
   config.nativeLoop.engine.maxImagePatches = kMaximumImagePatches;

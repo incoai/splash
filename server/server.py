@@ -1853,6 +1853,12 @@ def parse_args(argv=None):
     parser.add_argument("--max-context", type=_parse_max_context, default=None)
     parser.add_argument("--max-memory", type=_parse_max_memory, default=None)
     parser.add_argument(
+        "--kv-format",
+        choices=("int8", "bf16"),
+        default="int8",
+        help="target KV cache storage (default: int8); bf16 uses more memory",
+    )
+    parser.add_argument(
         "--max-request-size",
         type=_parse_request_size,
         default=DEFAULT_MAX_REQUEST_BYTES,
@@ -1907,6 +1913,8 @@ def _native_command(args):
         "auto" if args.max_context is None else str(args.max_context),
         "auto" if args.max_memory is None else str(args.max_memory),
     ]
+    if args.kv_format != "int8":
+        command.extend(("--kv-format", args.kv_format))
     return command
 
 

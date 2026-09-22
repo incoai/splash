@@ -146,7 +146,8 @@ def validate_status(status: dict) -> None:
         status.get("identity", {}).get("cache", {}).get("block_tokens") == 32,
         "runtime did not expose Page32 KV identity",
     )
-    q8 = status.get("identity", {}).get("q8", {})
+    identity = status.get("identity", {})
+    q8 = identity.get("kv", identity.get("q8", {}))
     require(q8.get("quantization") == "symmetric_int8", "wrong KV quantization")
     require(q8.get("scale_type") == "float32", "wrong KV scale type")
 

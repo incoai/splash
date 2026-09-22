@@ -4,7 +4,7 @@
 #include "engine/MemoryPlan.hpp"
 #include "engine/Cache.hpp"
 #include "engine/MemoryGovernor.hpp"
-#include "ops/Q8PageStorage.hpp"
+#include "ops/PageStorage.hpp"
 #include "model/ModelFactory.hpp"
 #include "engine/MemoryAudit.hpp"
 #include "ops/ExecutionPlans.hpp"
@@ -33,9 +33,6 @@ enum class RuntimeResourceStage {
 [[nodiscard]] std::string_view
 runtimeResourceStageName(RuntimeResourceStage stage);
 
-inline constexpr std::string_view kQ8FormatName =
-    "q8s8_f32_scale_per_token_head_k_token_major_v_dimension_major";
-
 [[nodiscard]] inline std::string
 digestHex(const std::array<uint8_t, 32> &digest) {
   constexpr char hex[] = "0123456789abcdef";
@@ -54,9 +51,9 @@ struct RuntimeCacheIdentity {
   // One process-wide content namespace. KV blocks never copy model/build
   // strings or physical layout metadata.
   CacheNamespace cacheNamespace;
-  // Stable binary layout guard for physical Q8 pages.
-  kv::Q8LayoutGuard q8Layout;
-  // SHA-256 of the versioned model/build/Q8 compatibility tuple.
+  // Stable binary layout guard for physical KV pages.
+  kv::LayoutGuard kvLayout;
+  // SHA-256 of the versioned model/build/KV compatibility tuple.
   std::string namespaceSha256;
 };
 
@@ -64,9 +61,10 @@ struct RuntimeCacheIdentity {
 makeRuntimeCacheIdentity(std::string_view combinedManifestSha256,
                          std::string_view targetManifestSha256,
                          std::string_view buildId,
-                         kv::Q8Layout targetKvLayout);
+                         kv::Layout targetKvLayout);
 
 struct RuntimeResourcesConfig {
+  kv::Format kvFormat = kv::Format::Int8;
   std::filesystem::path metallibPath;
   std::filesystem::path modelRoot;
   model::ModelDescriptor model;
@@ -138,7 +136,7 @@ private:
 };
 
 // Owns every process-wide native resource exactly once. Destruction order is
-// Cache -> logical KV pool -> state -> Q8 backing -> governor ->
+// Cache -> logical KV pool -> state -> KV backing -> governor ->
 // model package -> Metal backend.
 class RuntimeResources final {
 public:
@@ -189,7 +187,7 @@ private:
                    model::ModelMemoryPlan modelMemoryPlan,
                    RuntimeCacheIdentity cacheIdentity,
                    std::unique_ptr<MemoryGovernor> memoryGovernor,
-                   std::unique_ptr<kv::Q8PageStorage> kvPages,
+                   std::unique_ptr<kv::PageStorage> kvPages,
                    std::unique_ptr<model::StateStorage> stateStorage,
                    std::unique_ptr<KvPool> kvPool,
                    std::unique_ptr<engine::Cache> cache,
@@ -202,7 +200,7 @@ private:
   model::ModelMemoryPlan modelMemoryPlan_;
   RuntimeCacheIdentity cacheIdentity_;
   std::unique_ptr<MemoryGovernor> memoryGovernor_;
-  std::unique_ptr<kv::Q8PageStorage> kvPages_;
+  std::unique_ptr<kv::PageStorage> kvPages_;
   std::unique_ptr<model::StateStorage> stateStorage_;
   std::unique_ptr<KvPool> kvPool_;
   std::unique_ptr<engine::Cache> cache_;

@@ -194,26 +194,33 @@ void testDescriptorRetainsInspectedManifestDigest() {
 }
 
 void testRuntimeCacheNamespaceBindsIdentityOnce() {
-  constexpr kv::Q8Layout q8Layout{16, 4, 256};
+  constexpr kv::Layout kvLayout{16, 4, 256};
   const std::string combinedA(64, 'a');
   const std::string combinedB(64, 'b');
   const std::string targetA(64, 'c');
   const std::string targetB(64, 'd');
   const engine::RuntimeCacheIdentity first =
       engine::makeRuntimeCacheIdentity(combinedA, targetA, "build-a",
-                                       q8Layout);
+                                       kvLayout);
   const engine::RuntimeCacheIdentity same =
       engine::makeRuntimeCacheIdentity(combinedA, targetA, "build-a",
-                                       q8Layout);
+                                       kvLayout);
   const engine::RuntimeCacheIdentity modelChanged =
       engine::makeRuntimeCacheIdentity(combinedB, targetA, "build-a",
-                                       q8Layout);
+                                       kvLayout);
   const engine::RuntimeCacheIdentity targetChanged =
       engine::makeRuntimeCacheIdentity(combinedA, targetB, "build-a",
-                                       q8Layout);
+                                       kvLayout);
   const engine::RuntimeCacheIdentity buildChanged =
       engine::makeRuntimeCacheIdentity(combinedA, targetA, "build-b",
-                                       q8Layout);
+                                       kvLayout);
+  auto bf16Layout = kvLayout;
+  bf16Layout.format = kv::Format::BFloat16;
+  const auto formatChanged = engine::makeRuntimeCacheIdentity(
+      combinedA, targetA, "build-a", bf16Layout);
+  require(first.cacheNamespace != formatChanged.cacheNamespace &&
+              first.namespaceSha256 != formatChanged.namespaceSha256,
+          "INT8 and BF16 aliased the same prefix-cache namespace");
   require(first.cacheNamespace == same.cacheNamespace &&
               first.namespaceSha256 == same.namespaceSha256,
           "runtime cache namespace is not deterministic");
@@ -221,9 +228,9 @@ void testRuntimeCacheNamespaceBindsIdentityOnce() {
               first.cacheNamespace != targetChanged.cacheNamespace &&
               first.cacheNamespace != buildChanged.cacheNamespace,
           "runtime cache namespace omitted model, layout, or build identity");
-  require(kv::matchesQ8Layout(first.q8Layout, q8Layout) &&
-              first.q8Layout.modelArtifactSha256 !=
-                  targetChanged.q8Layout.modelArtifactSha256,
+  require(kv::matchesLayout(first.kvLayout, kvLayout) &&
+              first.kvLayout.modelArtifactSha256 !=
+                  targetChanged.kvLayout.modelArtifactSha256,
           "runtime Q8 layout guard omitted the target artifact");
 }
 

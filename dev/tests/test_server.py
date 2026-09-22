@@ -3006,6 +3006,12 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(Path(args.tokenizer), package / "tokenizer")
         self.assertIsNone(args.max_context)
         self.assertIsNone(args.max_memory)
+        self.assertEqual(args.kv_format, "int8")
+        self.assertNotIn("--kv-format", api._native_command(args))
+        bf16_args = api.parse_args([*required, "--kv-format", "bf16"])
+        self.assertEqual(api._native_command(bf16_args)[-2:], ["--kv-format", "bf16"])
+        with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
+            api.parse_args([*required, "--kv-format", "fp16"])
         self.assertEqual(
             api.parse_args([*required, "--max-context", "262144"]).max_context, 262144
         )
@@ -3111,6 +3117,7 @@ class ServerTest(unittest.TestCase):
             max_request_size=api.DEFAULT_MAX_REQUEST_BYTES,
             port=0,
             binary="splash",
+            kv_format="int8",
         )
         runtime = mock.Mock()
         runtime.readiness = native_wire.ReadyEvent(
@@ -3213,6 +3220,7 @@ class ServerTest(unittest.TestCase):
             max_request_size=api.DEFAULT_MAX_REQUEST_BYTES,
             port=0,
             binary="splash",
+            kv_format="int8",
         )
         runtime = mock.Mock()
         runtime.wait_ready.side_effect = api.engine_runtime.EngineUnhealthy("late")
@@ -3262,6 +3270,7 @@ class ServerTest(unittest.TestCase):
             max_request_size=api.DEFAULT_MAX_REQUEST_BYTES,
             port=8000,
             binary="splash",
+            kv_format="int8",
         )
         server = mock.Mock()
         server.server_bind.side_effect = OSError(48, "Address already in use")

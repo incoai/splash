@@ -181,6 +181,7 @@ struct VerifyAttentionConfig final {
 // encoding. Each prefill uses one split dispatch followed by one reduction.
 // Callers cannot replace a dispatch or reduce its scratch bound.
 struct PrefillAttentionPlan final {
+  const kv::Format format;
   const PrefillAttentionConfig configuration;
   const uint32_t rows;
   const uint32_t historyTokens;
@@ -200,14 +201,16 @@ private:
                        uint32_t historyTokens, uint32_t splits,
                        AttentionWorkspace workspace,
                        std::string_view splitPipeline, std::string_view reducePipeline,
-                       metal::DispatchSize splitGroups, metal::DispatchSize reduceGroups)
-      : configuration(configuration), rows(rows), historyTokens(historyTokens),
+                       metal::DispatchSize splitGroups, metal::DispatchSize reduceGroups,
+                       kv::Format format)
+      : format(format), configuration(configuration), rows(rows), historyTokens(historyTokens),
         splits(splits), workspace(workspace),
         splitPipeline(splitPipeline), reducePipeline(reducePipeline),
         splitGroups(splitGroups), reduceGroups(reduceGroups) {}
 };
 
 struct VerifyAttentionPlan final {
+  const kv::Format format;
   const VerifyAttentionConfig configuration;
   const uint32_t lanes;
   // Each lane's history-scaled split count; splits is their maximum, the
@@ -235,8 +238,8 @@ private:
                       std::string_view splitPipeline, std::string_view reducePipeline,
                       metal::DispatchSize splitGroups, metal::DispatchSize reduceGroups,
                       std::string_view storePipeline, metal::DispatchSize storeGroups,
-                      metal::DispatchSize storeThreads)
-      : configuration(configuration), lanes(lanes), laneSplits(laneSplits),
+                      metal::DispatchSize storeThreads, kv::Format format)
+      : format(format), configuration(configuration), lanes(lanes), laneSplits(laneSplits),
         splits(splits), workspace(workspace),
         splitPipeline(splitPipeline), reducePipeline(reducePipeline),
         splitGroups(splitGroups), reduceGroups(reduceGroups),
@@ -263,12 +266,12 @@ public:
   [[nodiscard]] static std::span<const VerifyAttentionConfig>
   verifyCandidates() noexcept;
   [[nodiscard]] static PrefillAttentionPlan
-  prefillPlan(uint32_t rows, uint32_t queryHeads, kv::Q8Layout layout,
+  prefillPlan(uint32_t rows, uint32_t queryHeads, kv::Layout layout,
               uint32_t historyTokens, PrefillAttentionConfig configuration = {});
   // historyTokens holds each lane's committed tokens before its verify rows,
   // sized to the batch width or to the maximum width with inactive lanes zero.
   [[nodiscard]] static VerifyAttentionPlan
-  verifyPlan(uint32_t lanes, uint32_t queryHeads, kv::Q8Layout layout,
+  verifyPlan(uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
              std::span<const uint32_t> historyTokens,
              VerifyAttentionConfig configuration = {});
 
@@ -278,10 +281,10 @@ public:
   // the maximum split count.
   [[nodiscard]] static AttentionWorkspace
   prefillWorkspace(uint32_t maximumRows, uint32_t queryHeads,
-                   kv::Q8Layout layout,
+                   kv::Layout layout,
                    PrefillAttentionConfig configuration = {});
   [[nodiscard]] static AttentionWorkspace
-  verifyWorkspace(uint32_t lanes, uint32_t queryHeads, kv::Q8Layout layout,
+  verifyWorkspace(uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
                   VerifyAttentionConfig configuration = {});
 
   static void
@@ -291,13 +294,13 @@ public:
                        metal::MetalBuffer queries, metal::MetalBuffer chunkKeys,
                        metal::MetalBuffer chunkValues, uint32_t tokens,
                        uint32_t cacheStride, uint32_t rowStride,
-                       uint32_t queryHeads, kv::Q8Layout layout);
+                       uint32_t queryHeads, kv::Layout layout);
   static void addPrefillGate(metal::CommandGraph &graph,
                              metal::MetalBuffer packed,
                              metal::MetalBuffer attention,
                              metal::MetalBuffer hidden, uint32_t tokens,
                              uint32_t cacheStride, uint32_t rowStride,
-                             uint32_t queryHeads, kv::Q8Layout layout);
+                             uint32_t queryHeads, kv::Layout layout);
   static void
   addVerifyProjection(metal::CommandGraph &graph, metal::MetalBuffer packed,
                       metal::MetalBuffer queryNorm, metal::MetalBuffer keyNorm,
@@ -305,14 +308,14 @@ public:
                       metal::MetalBuffer queries, metal::MetalBuffer chunkKeys,
                       metal::MetalBuffer chunkValues, uint32_t rowsPerLane,
                       uint32_t cacheStride, uint32_t rowStride,
-                      uint32_t queryHeads, kv::Q8Layout layout,
+                      uint32_t queryHeads, kv::Layout layout,
                       uint32_t lanes);
   static void addVerifyGate(metal::CommandGraph &graph,
                             metal::MetalBuffer packed,
                             metal::MetalBuffer attention,
                             metal::MetalBuffer hidden, uint32_t rowsPerLane,
                             uint32_t cacheStride, uint32_t rowStride,
-                            uint32_t queryHeads, kv::Q8Layout layout,
+                            uint32_t queryHeads, kv::Layout layout,
                             uint32_t lanes, LinearScratch scratch = {});
 
   [[nodiscard]] static kv::Q8ChunkedPrefillParams
@@ -321,19 +324,19 @@ public:
                 uint32_t physicalPageCount);
 
   static void addPrefillStore(metal::CommandGraph &graph,
-                              const kv::Q8LayerStorage &layer,
+                              const kv::LayerStorage &layer,
                               metal::MetalBuffer chunkKeys,
                               metal::MetalBuffer chunkValues,
                               metal::MetalBuffer pageTable,
                               const kv::Q8ChunkedPrefillParams &params,
-                              kv::Q8Layout layout);
+                              kv::Layout layout);
   // Queries and output are [KV head][row][query head in group][dimension] and
   // must not alias. Encode the store before attention; both stay in one
   // compute encoder. The plan owns both dispatch grids and their exact scratch.
   // prefillWorkspace() bounds every legal history for
   // the command's largest sequence and configuration.
   static void addPrefill(metal::CommandGraph &graph,
-                         const kv::Q8LayerStorage &layer,
+                         const kv::LayerStorage &layer,
                          metal::MetalBuffer queries, metal::MetalBuffer output,
                          metal::MetalBuffer partials,
                          metal::MetalBuffer statistics,
@@ -341,7 +344,7 @@ public:
                          const kv::Q8ChunkedPrefillParams &chunk,
                          const PrefillAttentionPlan &plan);
   static void
-  addVerify(metal::CommandGraph &graph, const kv::Q8LayerStorage &layer,
+  addVerify(metal::CommandGraph &graph, const kv::LayerStorage &layer,
             PagedVerifyBuffers buffers,
             std::span<const kv::Q8ChunkedPrefillParams> storeParams,
             std::span<const kv::Q8VerifyAttentionParams> attentionParams,

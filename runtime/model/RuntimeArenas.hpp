@@ -40,11 +40,13 @@ struct RuntimeGeometry final {
   DFlashDraftLayout draft;
   DraftStateLayout draftState;
 
-  [[nodiscard]] static RuntimeGeometry from(const ModelPackage &package) {
+  [[nodiscard]] static RuntimeGeometry from(
+      const ModelPackage &package, kv::Format format = kv::Format::Int8) {
     RuntimeGeometry result;
     result.target = std::visit(
         [](const auto &weights) { return qwenTargetGeometry(weights); },
         package.target);
+    result.target.kvLayout = package.targetKvLayout(format);
     result.draft = package.draft.layout;
     result.draftState = result.draft.stateLayout();
     if (!result.target.valid() || !result.draftState.valid() ||

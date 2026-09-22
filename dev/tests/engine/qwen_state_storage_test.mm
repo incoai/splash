@@ -1,6 +1,6 @@
 #include "engine/MemoryGovernor.hpp"
 #include "model/QwenState.hpp"
-#include "ops/Q8PageStorage.hpp"
+#include "ops/PageStorage.hpp"
 
 #include <cstdint>
 #include <cstdlib>
@@ -89,10 +89,10 @@ void run(const std::string &metallib) {
     reservation->commit();
     return true;
   };
-  constexpr kv::Q8Layout q8Layout{16, 4, 256};
-  kv::Q8PageStorage pageStorage(backend, governor.allocationAdmission(),
-                                q8Layout,
-                                q8Layout.sparseMappingBatchPages());
+  constexpr kv::Layout kvLayout{16, 4, 256};
+  kv::PageStorage pageStorage(backend, governor.allocationAdmission(),
+                                kvLayout,
+                                kvLayout.sparseMappingBatchPages());
   uint64_t beforeStorage = backend.memoryStats().allocatedBytes;
   uint64_t observedStorageActual = 0;
   uint64_t observedSlotActual = 0;

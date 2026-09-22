@@ -338,7 +338,7 @@ ModelDescriptor makeModelDescriptor(std::string name, TargetLayout target,
             ExecutionLimits::targetVerifyRows,
             ExecutionLimits::draftContextTokens,
         };
-        result.targetKvLayout = layout.q8Layout();
+        result.targetKvLayout = layout.kvLayout();
         result.stateLayout = {layout.gdnStateLayout(), draft.stateLayout()};
       },
       target);
@@ -366,7 +366,7 @@ bool ModelDescriptor::valid() const noexcept {
                    capabilities.maximumContextTokens &&
                layout.hiddenSize == draft.hiddenSize &&
                layout.capturedHiddenSize() == draft.targetHiddenSize &&
-               layout.q8Layout() == targetKvLayout &&
+               layout.kvLayout() == targetKvLayout &&
                layout.gdnStateLayout() == stateLayout.target;
       },
       target);

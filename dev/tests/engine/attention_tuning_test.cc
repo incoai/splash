@@ -50,7 +50,7 @@ std::vector<PrefillAttentionTuningResult> prefillEvidence(AttentionShape shape,
   std::vector<PrefillAttentionTuningResult> probes;
   for (const auto workload : prefillAttentionPolicyWorkloads(shape)) {
     PrefillAttentionTuningResult probe{{workload, {}}, {}, true, {}};
-    const kv::Q8Layout layout{1, shape.kvHeads, shape.headDimension};
+    const kv::Layout layout{1, shape.kvHeads, shape.headDimension};
     const auto baseline = PagedAttention::prefillPlan(workload.rows, shape.queryHeads, layout,
                                                      workload.historyTokens);
     const auto configs = PagedAttention::prefillCandidates();
@@ -70,7 +70,7 @@ std::vector<PrefillAttentionTuningResult> prefillEvidence(AttentionShape shape,
 
 void planExecutionTests() {
   for (auto shape : {AttentionShape{24, 4, 256}, AttentionShape{16, 2, 256}}) {
-    const kv::Q8Layout layout{1, shape.kvHeads, shape.headDimension};
+    const kv::Layout layout{1, shape.kvHeads, shape.headDimension};
     for (uint32_t rows : {1U, 7U, 8U}) {
       const auto baseline = PagedAttention::prefillPlan(rows, shape.queryHeads, layout, 33);
       const auto alias = PagedAttention::prefillPlan(rows, shape.queryHeads, layout, 33,
@@ -110,7 +110,7 @@ void planExecutionTests() {
 
 void verifyExecutionTests() {
   for (auto shape : {AttentionShape{24, 4, 256}, AttentionShape{16, 2, 256}}) {
-    const kv::Q8Layout layout{1, shape.kvHeads, shape.headDimension};
+    const kv::Layout layout{1, shape.kvHeads, shape.headDimension};
     const auto baseline = VerifyAttentionConfig{};
     auto alternative = baseline;
     alternative.splitCount = VerifySplitCount::Eight;
@@ -436,7 +436,8 @@ void metalTests(const char *metallib) {
   // The sweep's verify IDs index the tuning order of this device's baseline.
   const auto verifyBaseline = VerifyAttentionConfig{};
   const auto verifyCandidates = verifyAttentionTuningCandidates(verifyBaseline);
-  for (auto shape : {AttentionShape{24, 4, 256}, AttentionShape{16, 2, 256}}) {
+  for (auto format : {kv::Format::Int8, kv::Format::BFloat16})
+  for (auto shape : {AttentionShape{24, 4, 256, format}, AttentionShape{16, 2, 256, format}}) {
     for (uint32_t history : {0U, 2048U}) {
       const PrefillAttentionWorkload workload{shape, 2048, history};
       const size_t calls = admissionCalls;

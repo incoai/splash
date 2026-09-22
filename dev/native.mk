@@ -305,7 +305,7 @@ $(TEST_MEMORY_AUDIT_TEST): runtime/metal/DeviceCapabilities.cpp \
 $(TEST_QWEN_STATE_TEST): runtime/metal/DeviceCapabilities.cpp \
 		runtime/metal/MetalBackend.mm \
 		runtime/engine/MemoryGovernor.cpp \
-		runtime/ops/Q8PageStorage.mm \
+		runtime/ops/PageStorage.mm \
 		runtime/model/WeightStore.cpp \
 		runtime/model/DFlashDraft.cpp \
 		$(MODEL_OPERATOR_SOURCES) \
@@ -491,7 +491,7 @@ $(TEST_Q8_METAL_TEST): dev/tests/engine/q8_paged_kv_metal_test.mm \
 $(TEST_Q8_STORAGE_TEST): runtime/metal/DeviceCapabilities.cpp \
 		runtime/metal/MetalBackend.mm \
 		runtime/engine/MemoryGovernor.cpp \
-		runtime/ops/Q8PageStorage.mm \
+		runtime/ops/PageStorage.mm \
 		dev/tests/engine/q8_page_storage_test.mm | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
 		$(ENGINE_LINKFLAGS) -o $@

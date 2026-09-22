@@ -251,7 +251,7 @@ struct Runtime::Impl {
   const ModelPackage &package;
   const RuntimeGeometry geometry;
   const ops::ExecutionPlans &operators;
-  kv::Q8PageStorage &kvPages;
+  kv::PageStorage &kvPages;
   QwenStateStorage &states;
   std::unique_ptr<PrefillArena> prefillArena;
   std::unique_ptr<DecodeArena> decodeArena;
@@ -283,7 +283,8 @@ struct Runtime::Impl {
   explicit Impl(RuntimeContext value)
       : backend(value.backend),
         admitAllocation(std::move(value.admitAllocation)),
-        package(value.package), geometry(RuntimeGeometry::from(value.package)),
+        package(value.package),
+        geometry(RuntimeGeometry::from(value.package, value.kvPages.layout().format)),
         operators(value.operators),
         kvPages(value.kvPages),
         states(requireQwenStateStorage(value.stateStorage)),
@@ -293,7 +294,8 @@ struct Runtime::Impl {
         sampling(value.backend, geometry.target.vocabularySize, kDecodeRows),
         targetModel(std::visit(
                         [&](const auto &weights) {
-                          return QwenTarget(weights, value.backend, operators);
+                          return QwenTarget(weights, value.backend, operators,
+                                            value.kvPages.layout().format);
                         },
                         value.package.target)),
         draftModel(value.package.draft, value.backend, operators) {
@@ -301,7 +303,7 @@ struct Runtime::Impl {
       throw std::invalid_argument(
           "model runtime requires allocation admission");
     if (states.layout() != package.stateLayout() ||
-        kvPages.layout() != package.targetKvLayout()) {
+        kvPages.layout() != package.targetKvLayout(kvPages.layout().format)) {
       throw std::invalid_argument(
           "model runtime resources do not match the loaded package");
     }
@@ -571,7 +573,7 @@ struct Runtime::Impl {
     add(states.actualAllocatedBytes(), "warmup state slots");
     add(prefillArena->bytes(), "warmup prefill arena");
     add(decodeArena->bytes(), "warmup decode arena");
-    add(kvPages.actualAllocatedBytes(), "warmup Q8 pool");
+    add(kvPages.actualAllocatedBytes(), "warmup KV pool");
     add(pipelineReserveBytes, "warmup pipeline reserve");
     add(runtimeOverheadReserveBytes, "warmup runtime reserve");
     return result;
@@ -1025,7 +1027,7 @@ struct Runtime::Impl {
     buffers.groupedInput = p(PrefillTensor::MoeGroupedInput);
     buffers.expertIntermediate = p(PrefillTensor::MoeExpertIntermediate);
     buffers.expertOutput = p(PrefillTensor::MoeExpertOutput);
-    std::vector<kv::Q8LayerStorage> kvLayers(
+    std::vector<kv::LayerStorage> kvLayers(
         geometry.target.kvLayout.attentionLayers);
     for (uint32_t layer = 0; layer < kvLayers.size(); ++layer)
       kvLayers[layer] = kvPages.layer(layer);
@@ -1270,7 +1272,7 @@ struct Runtime::Impl {
           q8[lane].chunk_stride, q8[lane].page_table_entries,
           q8[lane].physical_page_count);
       if (!kv::q8VerifyAttentionValidationError(verify[lane]).empty())
-        throw std::invalid_argument("invalid batched Q8 verify geometry");
+        throw std::invalid_argument("invalid batched KV verify geometry");
       Request &entry = laneEntry(entries, lane);
       buffers.pageTables[lane] =
           decodeArena->get(entry.slot, DecodeTensor::PageTable);
@@ -1290,7 +1292,7 @@ struct Runtime::Impl {
       gdnBeta[layer] = decodeArena->gdnBatchSlice(
           DecodeTensor::VerifyBetaBase, layer, lanes);
     }
-    std::vector<kv::Q8LayerStorage> kvLayers(attentionLayers);
+    std::vector<kv::LayerStorage> kvLayers(attentionLayers);
     for (uint32_t layer = 0; layer < attentionLayers; ++layer) {
       chunkKeys[layer] = decodeArena->attentionBatchSlice(
           DecodeTensor::ChunkKeysBase, layer, lanes);
@@ -2393,17 +2395,17 @@ WarmupStepResult warmupResult(uint64_t estimatedPeakBytes, double wallSeconds,
   return {true, estimatedPeakBytes, std::move(detail), wallSeconds, {}};
 }
 
-std::vector<uint32_t> warmupPages(kv::Q8PageStorage &storage, uint32_t first,
+std::vector<uint32_t> warmupPages(kv::PageStorage &storage, uint32_t first,
                                   uint32_t count) {
   if (!count || uint64_t{first} + count > storage.pageCount()) {
-    throw std::invalid_argument("warmup Q8 page range is unavailable");
+    throw std::invalid_argument("warmup KV page range is unavailable");
   }
   std::vector<uint32_t> result(count);
   for (uint32_t index = 0; index < count; ++index) {
     const uint32_t page = first + index;
     if (auto admission = storage.ensureResident(page); !admission) {
       throw metal::MetalAllocationError(
-          std::string("warmup could not reserve Q8 page backing: ") +
+          std::string("warmup could not reserve KV page backing: ") +
               metal::allocationFailureName(admission.failure), admission.failure);
     }
     result[index] = page;
@@ -2463,7 +2465,7 @@ WarmupStepResult Runtime::warmupPrefill(uint32_t rows) {
   }
   auto result = warmupResult(impl_->estimatedWarmupPeak(), wallSeconds,
                             "real " + std::to_string(rows) +
-                                "-row packed Q8 target+draft prefill [M32]");
+                                "-row packed KV target+draft prefill [M32]");
   result.lanes = std::move(lanes);
   return result;
 }
@@ -2623,7 +2625,7 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
   try {
     if (impl_->kvPages.pageCount() <= 12) {
       throw std::runtime_error(
-          "historical prefix warmup requires at least 13 Q8 pages");
+          "historical prefix warmup requires at least 13 KV pages");
     }
     // Deliberately non-contiguous physical ids exercise page-table lookup.
     const std::vector<uint32_t> pages{12, 10, 11};
@@ -2654,7 +2656,7 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
       throw std::runtime_error("prefix restore length mismatch");
     }
 
-    // Continue from committed Q8 history. This M8 command teacher-forces a
+    // Continue from committed KV history. This M8 command teacher-forces a
     // new chunk, then the real speculative cycle overwrites its speculative
     // page suffix and advances only the accepted commit length.
     BatchPlan suffixPlan{WorkKind::Prefill,
@@ -2696,7 +2698,7 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
   }
   return warmupResult(
       estimatedPeakBytes, wallSeconds,
-      "real direct-Q8 state restore, arbitrary page table, slot move, "
+      "real paged-KV state restore, arbitrary page table, slot move, "
       "bounded restore continuation, and decode");
 }
 
@@ -2714,12 +2716,13 @@ ModelTelemetry Runtime::telemetry() const noexcept {
 
 ModelMemoryPlan plannedRuntimeMemory(const DeviceCapabilities &device,
                                      const ModelPackage &package,
-                                     const ops::ExecutionPlans &operators) {
+                                     const ops::ExecutionPlans &operators,
+                                     kv::Format format) {
   requireCompatibleModelPackage(package);
   if (device.appleGpuFamily < DeviceCapabilities::kMinimumAppleGpuFamily) {
     throw std::invalid_argument("model runtime requires Apple tensor BF16");
   }
-  const RuntimeGeometry geometry = RuntimeGeometry::from(package);
+  const RuntimeGeometry geometry = RuntimeGeometry::from(package, format);
   return {package.stateLayout().activeCellBytes(),
           plannedPrefillBytes(geometry, operators),
           plannedDecodeBytes(geometry, operators), kPipelineReserveBytes,

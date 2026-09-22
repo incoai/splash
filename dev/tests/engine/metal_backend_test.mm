@@ -645,7 +645,7 @@ void sparseExtentChurn(MetalBackend &backend) {
     // Match the production per-layer data/scale mapping sizes. Rotate three
     // virtual extents, retaining one as a witness while its replacement is
     // mapped and used: at most two 130-MiB heaps plus one extent of readback.
-    constexpr splash::kv::Q8Layout layout{16, 4, 256};
+    constexpr splash::kv::Layout layout{16, 4, 256};
     constexpr uint32_t kSegments = layout.attentionLayers * 4;
     constexpr uint32_t kExtentCount = 3;
     constexpr uint32_t kRepetitions = 256;

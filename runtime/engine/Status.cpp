@@ -85,6 +85,17 @@ std::string runtimeStatusJson(
           ? double(core.cacheHits) / double(core.cacheHits + core.coldMisses)
           : 0.0;
 
+  std::ostringstream kvIdentity;
+  kvIdentity << "{\"target_model_sha256\":"
+      << json::quote(digestHex(cacheIdentity.kvLayout.modelArtifactSha256))
+      << ",\"format\":" << json::quote(kv::formatName(cacheIdentity.kvLayout.format()))
+      << ",\"quantization\":" << json::quote(
+          cacheIdentity.kvLayout.format() == kv::Format::Int8 ? "symmetric_int8" : "none")
+      << ",\"scale_type\":" << json::quote(
+          cacheIdentity.kvLayout.format() == kv::Format::Int8 ? "float32" : "none")
+      << ",\"key_layout\":\"token_major\""
+      << ",\"value_layout\":\"dimension_major\"}";
+
   std::ostringstream out;
   out << std::setprecision(10) << '{' << "\"schema_version\":" << protocol::kStatusSchemaVersion << ','
       << "\"ready\":" << boolean(ready)
@@ -104,14 +115,13 @@ std::string runtimeStatusJson(
       << ",\"runtime_cache_namespace\":"
       << json::quote(cacheIdentity.namespaceSha256)
       << ",\"build_id\":" << json::quote(cacheIdentity.buildId)
-      << ",\"dtype\":" << json::quote(kQ8FormatName)
+      << ",\"dtype\":" << json::quote(kv::storageFormatName(cacheIdentity.kvLayout.format()))
       << ",\"block_tokens\":" << kv::kPageTokens
-      << "},\"q8\":{\"target_model_sha256\":"
-      << json::quote(digestHex(cacheIdentity.q8Layout.modelArtifactSha256))
-      << ",\"quantization\":\"symmetric_int8\""
-      << ",\"scale_type\":\"float32\""
-      << ",\"key_layout\":\"token_major\""
-      << ",\"value_layout\":\"dimension_major\"}},"
+      << "},\"kv\":" << kvIdentity.str();
+  // Additive status evolution: retain the previous INT8 identity field.
+  if (cacheIdentity.kvLayout.format() == kv::Format::Int8)
+    out << ",\"q8\":" << kvIdentity.str();
+  out << "},"
       << "\"memory_plan\":" << plan.toStatusJson()
       << ",\"memory_actual\":{\"dense_bytes\":" << metalMemory.allocatedBytes
       << ",\"sparse_virtual_bytes\":" << metalMemory.sparseVirtualBytes

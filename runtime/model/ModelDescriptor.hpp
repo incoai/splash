@@ -24,7 +24,7 @@ struct ModelDescriptor final {
   DFlashDraftLayout draft;
   ops::VisionLayout vision;
   ModelCapabilities capabilities;
-  kv::Q8Layout targetKvLayout;
+  kv::Layout targetKvLayout;
   CompositeStateLayout stateLayout;
   // Exact bytes parsed during package inspection, including artifact digests.
   // Synthetic descriptors retain zero; this is separate from layout identity.

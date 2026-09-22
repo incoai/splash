@@ -36,7 +36,7 @@ QwenTargetGeometry commonGeometry(const Layout &layout) {
   result.gdnHeadDimension = layout.gdnHeadDimension;
   result.maskToken = layout.maskToken;
   result.stopTokens = layout.stopTokens;
-  result.kvLayout = layout.q8Layout();
+  result.kvLayout = layout.kvLayout();
   result.stateLayout = layout.gdnStateLayout();
   result.captureLayerCount =
       static_cast<uint32_t>(layout.hiddenCaptureLayers.size());
@@ -134,17 +134,19 @@ QwenMixerWeights readQwenMixer(WeightFile &file, metal::MetalBackend &backend,
 
 QwenTarget::QwenTarget(const Qwen3_8Weights &weights,
                        metal::MetalBackend &backend,
-                       const ops::ExecutionPlans &operators)
+                       const ops::ExecutionPlans &operators, kv::Format format)
     : weights_(&weights), geometry_(qwenTargetGeometry(weights)),
       backend_(backend), operators_(operators) {
+  geometry_.kvLayout.format = format;
   requireWeights(weights, geometry_);
 }
 
 QwenTarget::QwenTarget(const Qwen3_6MoeWeights &weights,
                        metal::MetalBackend &backend,
-                       const ops::ExecutionPlans &operators)
+                       const ops::ExecutionPlans &operators, kv::Format format)
     : weights_(&weights), geometry_(qwenTargetGeometry(weights)),
       backend_(backend), operators_(operators) {
+  geometry_.kvLayout.format = format;
   requireWeights(weights, geometry_);
 }
 
@@ -165,7 +167,7 @@ const ops::Q4Projection &QwenTarget::vocabularyProjection() const noexcept {
 void QwenTarget::addPrefill(
     metal::CommandGraph &graph, QwenTargetPrefillBuffers buffers,
     std::span<const QwenTargetPrefillSequence> sequences, uint32_t rows,
-    std::span<const kv::Q8LayerStorage> kvLayers) const {
+    std::span<const kv::LayerStorage> kvLayers) const {
   std::visit(
       [&](const auto *weights) {
         addPrefillImpl(*weights, graph, std::move(buffers), sequences, rows,
@@ -179,7 +181,7 @@ void QwenTarget::addPrefillImpl(
     const Weights &weights, metal::CommandGraph &graph,
     QwenTargetPrefillBuffers buffers,
     std::span<const QwenTargetPrefillSequence> sequences, uint32_t rows,
-    std::span<const kv::Q8LayerStorage> kvLayers) const {
+    std::span<const kv::LayerStorage> kvLayers) const {
   if (sequences.empty() ||
       sequences.size() > ExecutionLimits::maximumBatchWidth || !rows ||
       rows > ExecutionLimits::prefillTokenBudget ||
@@ -388,7 +390,7 @@ void QwenTarget::addPrefillImpl(
 
 void QwenTarget::addVerify(
     metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
-    std::span<const kv::Q8LayerStorage> kvLayers,
+    std::span<const kv::LayerStorage> kvLayers,
     std::span<const kv::Q8ChunkedPrefillParams> q8,
     std::span<const kv::Q8VerifyAttentionParams> verify, uint32_t lanes,
     ops::Q4DispatchStats &stats) const {
@@ -404,7 +406,7 @@ template <class Weights>
 void QwenTarget::addVerifyImpl(
     const Weights &weights, metal::CommandGraph &graph,
     QwenTargetVerifyBuffers buffers,
-    std::span<const kv::Q8LayerStorage> kvLayers,
+    std::span<const kv::LayerStorage> kvLayers,
     std::span<const kv::Q8ChunkedPrefillParams> q8,
     std::span<const kv::Q8VerifyAttentionParams> verify, uint32_t lanes,
     ops::Q4DispatchStats &stats) const {

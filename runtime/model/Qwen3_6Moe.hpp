@@ -54,7 +54,7 @@ struct Qwen3_6MoeLayout final {
   [[nodiscard]] constexpr uint32_t actualGdnWidth() const noexcept {
     return convolutionDimension + attentionWidth + 2 * gdnValueHeads;
   }
-  [[nodiscard]] constexpr kv::Q8Layout q8Layout() const noexcept {
+  [[nodiscard]] constexpr kv::Layout kvLayout() const noexcept {
     return {attentionLayerCount(), attentionKvHeads,
             attentionHeadDimension};
   }

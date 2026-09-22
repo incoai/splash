@@ -16,29 +16,29 @@ namespace splash::kv {
 using BFloat16Bits = uint16_t;
 
 // This oracle targets the Qwen3.8 kernel specialization.
-inline constexpr Q8Layout kOracleQ8Layout{16, 4, 256};
-inline constexpr uint32_t kKvHeads = kOracleQ8Layout.kvHeads;
-inline constexpr uint32_t kHeadDimension = kOracleQ8Layout.headDimension;
+inline constexpr Layout kOracleLayout{16, 4, 256};
+inline constexpr uint32_t kKvHeads = kOracleLayout.kvHeads;
+inline constexpr uint32_t kHeadDimension = kOracleLayout.headDimension;
 inline constexpr uint64_t kElementsPerLayerPage =
-    kOracleQ8Layout.elementsPerLayerPage();
+    kOracleLayout.elementsPerLayerPage();
 inline constexpr uint64_t kScalesPerTensorLayerPage =
-    kOracleQ8Layout.scalesPerTensorLayerPage();
+    kOracleLayout.scalesPerTensorLayerPage();
 inline constexpr uint64_t kKeyDataBytesPerLayerPage =
-    kOracleQ8Layout.dataBytesPerLayerPage();
+    kOracleLayout.dataBytesPerLayerPage();
 inline constexpr uint64_t kKeyScaleBytesPerLayerPage =
-    kOracleQ8Layout.scaleBytesPerLayerPage();
+    kOracleLayout.scaleBytesPerLayerPage();
 inline constexpr uint64_t kValueDataBytesPerLayerPage =
-    kOracleQ8Layout.dataBytesPerLayerPage();
+    kOracleLayout.dataBytesPerLayerPage();
 inline constexpr uint64_t kValueScaleBytesPerLayerPage =
-    kOracleQ8Layout.scaleBytesPerLayerPage();
+    kOracleLayout.scaleBytesPerLayerPage();
 inline constexpr uint64_t kBytesPerLayerPage =
-    kOracleQ8Layout.bytesPerLayerPage();
+    kOracleLayout.bytesPerLayerPage();
 inline constexpr uint64_t kBytesPerModelPage =
-    kOracleQ8Layout.bytesPerModelPage();
+    kOracleLayout.bytesPerModelPage();
 
 [[nodiscard]] constexpr StorageByteCounts
 storageByteCounts(uint64_t pages) noexcept {
-  return kOracleQ8Layout.storageByteCounts(pages);
+  return kOracleLayout.storageByteCounts(pages);
 }
 
 struct Q8LayerPage final {
@@ -221,8 +221,8 @@ inline void dequantizeLayerPage(const Q8LayerPage &source,
 
 // Test-only guard checks: production compares guards through the runtime
 // cache identity, so these helpers live with the tests that assert on them.
-[[nodiscard]] inline bool isValidQ8LayoutGuard(const Q8LayoutGuard &guard) {
-  const Q8Layout layout{guard.attentionLayers, guard.kvHeads,
+[[nodiscard]] inline bool isValidLayoutGuard(const LayoutGuard &guard) {
+  const Layout layout{guard.attentionLayers, guard.kvHeads,
                         guard.headDimension};
   return layout.valid() &&
          guard.quantization == uint32_t(Quantization::SymmetricInt8) &&
@@ -237,9 +237,9 @@ inline void dequantizeLayerPage(const Q8LayerPage &source,
          guard.bytesPerModelPage == layout.bytesPerModelPage();
 }
 
-[[nodiscard]] inline bool matchesQ8Layout(const Q8LayoutGuard &guard,
-                                          Q8Layout layout) {
-  return isValidQ8LayoutGuard(guard) &&
+[[nodiscard]] inline bool matchesLayout(const LayoutGuard &guard,
+                                          Layout layout) {
+  return isValidLayoutGuard(guard) &&
          guard.attentionLayers == layout.attentionLayers &&
          guard.kvHeads == layout.kvHeads &&
          guard.headDimension == layout.headDimension;

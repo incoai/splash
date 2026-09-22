@@ -24,6 +24,15 @@ MODEL_IDS = (
 
 
 class LauncherTests(unittest.TestCase):
+    def test_kv_format_is_an_explicit_load_option(self):
+        base = ["serve", "--model", MODEL_ID]
+        self.assertEqual(launcher.parse_args(base).kv_format, "int8")
+        self.assertEqual(
+            launcher.parse_args(base + ["--kv-format", "bf16"]).kv_format, "bf16"
+        )
+        with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
+            launcher.parse_args(base + ["--kv-format", "fp16"])
+
     def test_serve_requires_exact_repository_id_before_build(self):
         for arguments in (
             ["serve"],
@@ -178,6 +187,7 @@ class LauncherTests(unittest.TestCase):
                     argv[argv.index("--binary") + 1], str(launcher.paths.BINARY)
                 )
                 self.assertEqual(argv[argv.index("--model") + 1], MODEL_ID)
+                self.assertEqual(argv[argv.index("--kv-format") + 1], "bf16")
                 self.assertEqual(
                     argv[argv.index("--max-request-size") + 1], str(256 * 1024**2)
                 )
@@ -216,6 +226,8 @@ class LauncherTests(unittest.TestCase):
                         "serve",
                         "--model",
                         MODEL_ID,
+                        "--kv-format",
+                        "bf16",
                         "--api-key",
                         "test-server-key",
                         "--no-webui",

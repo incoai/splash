@@ -31,7 +31,7 @@ void requireLayout(const Qwen3_6MoeLayout &layout) {
               2 * layout.attentionKvHeads * layout.attentionHeadDimension ||
       layout.expertsPerToken > layout.experts ||
       layout.hiddenCaptureLayers.back() >= layout.layers ||
-      !layout.q8Layout().valid() || !layout.gdnStateLayout().valid()) {
+      !layout.kvLayout().valid() || !layout.gdnStateLayout().valid()) {
     throw WeightStoreError("Qwen3.6 MoE layout is inconsistent");
   }
   validateQ4Layout(layout.packedGdnWidth, layout.hiddenSize);

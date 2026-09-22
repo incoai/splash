@@ -6,7 +6,7 @@
 #include "Qwen3_6Moe.hpp"
 #include "Qwen3_8.hpp"
 #include "QwenVision.hpp"
-#include "ops/Q8PageStorage.hpp"
+#include "ops/PageStorage.hpp"
 #include "ops/ExecutionPlans.hpp"
 
 #include <filesystem>
@@ -27,8 +27,11 @@ struct ModelPackage final {
   [[nodiscard]] const std::string &name() const noexcept {
     return descriptor.name;
   }
-  [[nodiscard]] kv::Q8Layout targetKvLayout() const noexcept {
-    return descriptor.targetKvLayout;
+  [[nodiscard]] kv::Layout targetKvLayout(
+      kv::Format format = kv::Format::Int8) const noexcept {
+    auto layout = descriptor.targetKvLayout;
+    layout.format = format;
+    return layout;
   }
   [[nodiscard]] CompositeStateLayout stateLayout() const noexcept {
     return descriptor.stateLayout;
@@ -60,7 +63,7 @@ struct RuntimeContext final {
   metal::MetalBackend &backend;
   metal::AllocationAdmission admitAllocation;
   const ModelPackage &package;
-  kv::Q8PageStorage &kvPages;
+  kv::PageStorage &kvPages;
   StateStorage &stateStorage;
   const ops::ExecutionPlans &operators;
   uint32_t maximumImagePatches = ops::kMaximumImagePatches;
@@ -85,7 +88,8 @@ loadModelPackage(metal::MetalBackend &backend,
 [[nodiscard]] ModelMemoryPlan
 plannedRuntimeMemory(const DeviceCapabilities &device,
                      const ModelPackage &package,
-                     const ops::ExecutionPlans &operators);
+                     const ops::ExecutionPlans &operators,
+                     kv::Format format = kv::Format::Int8);
 [[nodiscard]] std::unique_ptr<StateStorage>
 createStateStorage(metal::MetalBackend &backend,
                    metal::AllocationAdmission admitAllocation,

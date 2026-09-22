@@ -151,7 +151,7 @@ struct QwenTargetGeometry final {
   std::array<uint32_t, 2> stopTokens{};
   std::array<uint32_t, maximumCaptureLayers> captureLayerValues{};
   uint32_t captureLayerCount = 0;
-  kv::Q8Layout kvLayout{};
+  kv::Layout kvLayout{};
   GdnStateLayout stateLayout{};
 
   [[nodiscard]] constexpr uint32_t gdnKeyWidth() const noexcept {
@@ -319,9 +319,11 @@ qwenTargetGeometry(const Qwen3_6MoeWeights &weights);
 class QwenTarget final {
 public:
   QwenTarget(const Qwen3_8Weights &weights, metal::MetalBackend &backend,
-             const ops::ExecutionPlans &operators);
+             const ops::ExecutionPlans &operators,
+             kv::Format format = kv::Format::Int8);
   QwenTarget(const Qwen3_6MoeWeights &weights, metal::MetalBackend &backend,
-             const ops::ExecutionPlans &operators);
+             const ops::ExecutionPlans &operators,
+             kv::Format format = kv::Format::Int8);
 
   [[nodiscard]] const QwenTargetGeometry &geometry() const noexcept {
     return geometry_;
@@ -332,10 +334,10 @@ public:
   void addPrefill(
       metal::CommandGraph &graph, QwenTargetPrefillBuffers buffers,
       std::span<const QwenTargetPrefillSequence> sequences, uint32_t rows,
-      std::span<const kv::Q8LayerStorage> kvLayers) const;
+      std::span<const kv::LayerStorage> kvLayers) const;
   void addVerify(
       metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
-      std::span<const kv::Q8LayerStorage> kvLayers,
+      std::span<const kv::LayerStorage> kvLayers,
       std::span<const kv::Q8ChunkedPrefillParams> q8,
       std::span<const kv::Q8VerifyAttentionParams> verify, uint32_t lanes,
       ops::Q4DispatchStats &stats) const;
@@ -356,12 +358,12 @@ private:
       const Weights &weights, metal::CommandGraph &graph,
       QwenTargetPrefillBuffers buffers,
       std::span<const QwenTargetPrefillSequence> sequences, uint32_t rows,
-      std::span<const kv::Q8LayerStorage> kvLayers) const;
+      std::span<const kv::LayerStorage> kvLayers) const;
   template <class Weights>
   void addVerifyImpl(
       const Weights &weights, metal::CommandGraph &graph,
       QwenTargetVerifyBuffers buffers,
-      std::span<const kv::Q8LayerStorage> kvLayers,
+      std::span<const kv::LayerStorage> kvLayers,
       std::span<const kv::Q8ChunkedPrefillParams> q8,
       std::span<const kv::Q8VerifyAttentionParams> verify, uint32_t lanes,
       ops::Q4DispatchStats &stats) const;
