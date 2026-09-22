@@ -197,7 +197,7 @@ std::vector<uint64_t> Scheduler::prefillAdmissionOrder(
     pending.push_back(std::move(value));
   }
   std::vector<const Request *> ready;
-  ready.reserve(requests_.size());
+  ready.reserve(requests_.size() + pending.size());
   for (const auto &[_, request] : requests_)
     if (request.phase == Phase::Prefill)
       ready.push_back(&request);
@@ -285,6 +285,7 @@ Scheduler::planPrefill(std::vector<const Request *> ready) const {
 
   BatchPlan plan;
   plan.kind = WorkKind::Prefill;
+  plan.items.reserve(model::ExecutionLimits::maximumBatchWidth);
   uint32_t budget = prefillBudget(*ready.front(), ready);
   for (const Request *request : ready) {
     if (!budget || request->spec.priority != selectedPriority ||
@@ -350,6 +351,7 @@ std::optional<BatchPlan> Scheduler::nextDecode() const {
   plan.kind = WorkKind::Decode;
   plan.cohort = cohort;
   plan.decodeStage = decodeStage;
+  plan.items.reserve(model::ExecutionLimits::maximumBatchWidth);
   // Applying the initial mask can terminate a request or start drafting.
   // Classify that branch one request at a time; regular decode can batch.
   const uint32_t maximumWidth =

@@ -58,12 +58,27 @@ Cache::matchedBlocks(std::span<const uint32_t> prompt,
 }
 
 uint32_t Cache::cachedTokens(std::span<const uint32_t> prompt,
-                              std::span<const ImageSpan> images) const {
-  const auto blocks = matchedBlocks(prompt, images);
-  for (size_t i = blocks.size(); i > 0; --i)
-    if (states_.contains(blocks[i - 1]))
-      return static_cast<uint32_t>(i * KvCache::pageTokens);
-  return 0;
+                             std::span<const ImageSpan> images) const {
+  if (prompt.empty())
+    return 0;
+
+  // This is a scheduling probe. Keep the matched-block walk streaming so a
+  // queued request does not allocate a temporary vector before admission.
+  const size_t maximumBlocks = (prompt.size() - 1) / KvCache::pageTokens;
+  uint64_t parent = 0;
+  uint32_t cached = 0;
+  for (size_t index = 0; index < maximumBlocks; ++index) {
+    const size_t begin = index * KvCache::pageTokens;
+    auto match =
+        kv_.find(parent, prompt.subspan(begin, KvCache::pageTokens),
+                 blockImageIdentity(begin, KvCache::pageTokens, images));
+    if (!match)
+      break;
+    parent = match->id;
+    if (states_.contains(parent))
+      cached = static_cast<uint32_t>((index + 1) * KvCache::pageTokens);
+  }
+  return cached;
 }
 
 CacheLookup Cache::lookup(std::span<const uint32_t> prompt,
