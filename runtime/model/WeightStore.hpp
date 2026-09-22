@@ -39,10 +39,17 @@ public:
   WeightFile(metal::MetalBackend &backend, std::filesystem::path path,
              std::string relativePath, std::string_view expectedMagic,
              uint32_t expectedLayer, uint32_t expectedType);
+  // An image built in memory (GGUF load-time repack); same header and
+  // section rules as a mapped file.
+  WeightFile(metal::MetalBackend &backend, metal::MetalBuffer image,
+             std::string relativePath, std::string_view expectedMagic,
+             uint32_t expectedLayer, uint32_t expectedType);
   ~WeightFile();
 
   WeightFile(const WeightFile &) = delete;
   WeightFile &operator=(const WeightFile &) = delete;
+  WeightFile(WeightFile &&) noexcept;
+  WeightFile &operator=(WeightFile &&) noexcept;
 
   [[nodiscard]] metal::MetalBuffer section(uint64_t bytes,
                                             std::string_view label = {});
@@ -66,7 +73,8 @@ readQ4Projection(WeightFile &file, metal::MetalBackend &backend,
                  std::string_view label);
 
 // GGUF K-quant sections: a 64-byte descriptor, then plane0, optional plane1
-// and metadata, each 16 KiB aligned (see convert_gguf_to_splash.py).
+// and metadata, each 16 KiB aligned (model/GgufImage.hpp; the same layout
+// dev/tools/convert_gguf_to_splash.py writes to disk).
 inline constexpr std::string_view kKQuantMagic = "MDKQ0001";
 [[nodiscard]] ops::KQuantSegment readKQuantSegment(WeightFile &file,
                                                    std::string_view label);

@@ -22,6 +22,7 @@ from install import models as artifacts
 
 class ModelArtifactTest(unittest.TestCase):
     MODEL_ID = "community/My-Splash.Model_1"
+    GGUF_REPO = "quantizer/My-Model-GGUF"
     REVISION = "a" * 40
 
     def setUp(self):
@@ -69,15 +70,10 @@ class ModelArtifactTest(unittest.TestCase):
             "head.bin",
             *(f"layer-{index}.bin" for index in range(target_layers)),
         )
-        target_roots = (
-            ["target"]
-            if variants is None
-            else [f"variants/{name}/target" for name in variants]
-        )
         for name in (
             "draft/model.bin",
             "vision/model.bin",
-            *(f"{root}/{file}" for root in target_roots for file in target_files),
+            *(() if variants else (f"target/{file}" for file in target_files)),
             *(f"draft/layer-{index}.bin" for index in range(draft_layers)),
         ):
             self.packed_file(snapshot / name)
@@ -109,19 +105,20 @@ class ModelArtifactTest(unittest.TestCase):
             "artifacts": records,
         }
         if variants is not None:
-            manifest["format"].update(name="gguf-kquant", target_layer_magic="MDKQ0001")
-            manifest["artifacts"] = [
-                r for r in records if not r["path"].startswith("variants/")
-            ]
-            manifest["variants"] = {
-                name: {
-                    "artifacts": [
-                        r
-                        for r in records
-                        if r["path"].startswith(f"variants/{name}/target/")
-                    ]
+            manifest["format"].update(name="gguf", target_layer_magic="MDKQ0001")
+            manifest["target"] = {
+                "gguf": {
+                    "repo_id": self.GGUF_REPO,
+                    "revision": "b" * 40,
+                    "variants": {
+                        name: {
+                            "file": f"Model-{name}.gguf",
+                            "size": 4096 * (index + 1),
+                            "sha256": artifacts.sha256(self.gguf_fixture(name, index)),
+                        }
+                        for index, name in enumerate(variants)
+                    },
                 }
-                for name in variants
             }
         if schema == 4:
             manifest.update(
@@ -134,11 +131,15 @@ class ModelArtifactTest(unittest.TestCase):
     @staticmethod
     def hub_records(snapshot):
         manifest = json.loads((snapshot / "manifest.json").read_text())
-        records = list(manifest.get("artifacts", []))
-        for variant in (manifest.get("variants") or {}).values():
-            if isinstance(variant, dict):
-                records += variant.get("artifacts", [])
-        return records
+        return list(manifest.get("artifacts", []))
+
+    def gguf_fixture(self, name, index):
+        """A stand-in GGUF in a fake Hub cache; 4 KiB per variant index."""
+        path = self.root / "gguf-cache" / f"Model-{name}.gguf"
+        if not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(bytes([index + 1]) * (4096 * (index + 1)))
+        return path
 
     @staticmethod
     def write_manifest(snapshot, manifest):
@@ -681,7 +682,7 @@ class ModelArtifactTest(unittest.TestCase):
             artifacts.installed_root(models, "owner/repo"), models / "owner/repo"
         )
 
-    def test_multi_variant_manifest_selects_one_target_per_model_id(self):
+    def test_gguf_manifest_selects_one_source_file_per_model_id(self):
         snapshot, manifest = self.package_fixture(variants=("UD-Q4_K_M", "UD-Q5_K_M"))
         validated = artifacts.validate_package_manifest(snapshot / "manifest.json")
         self.assertEqual(artifacts.select_variant(validated, "UD-Q5_K_M"), "UD-Q5_K_M")
@@ -689,60 +690,73 @@ class ModelArtifactTest(unittest.TestCase):
             artifacts.select_variant(validated, None)
         with self.assertRaisesRegex(artifacts.ModelError, "available"):
             artifacts.select_variant(validated, "UD-Q6_K")
-        installed = artifacts.artifact_records(validated, "UD-Q4_K_M", installed=True)
-        self.assertIn("target/layer-0.bin", {r["path"] for r in installed})
+        record = artifacts.gguf_record(validated, "UD-Q5_K_M")
+        self.assertEqual(record["path"], "target/Model-UD-Q5_K_M.gguf")
+        installed = artifacts.artifact_records(validated, "UD-Q5_K_M", installed=True)
+        self.assertIn(record, installed)
         self.assertNotIn(
-            "variants/UD-Q4_K_M/target/layer-0.bin", {r["path"] for r in installed}
+            record, artifacts.artifact_records(validated, "UD-Q5_K_M", installed=False)
         )
-        self.assertFalse(
-            any(r["path"].startswith("variants/UD-Q5_K_M") for r in installed)
-        )
-        manifest["default_variant"] = "UD-Q5_K_M"
+        manifest["target"]["gguf"]["default"] = "UD-Q5_K_M"
         self.write_manifest(snapshot, manifest)
         validated = artifacts.validate_package_manifest(snapshot / "manifest.json")
         self.assertEqual(artifacts.select_variant(validated, None), "UD-Q5_K_M")
-        # Plain packages take no variant; variant formats require a variant table.
+        # Packed targets take no variant; GGUF packages need the table and no target files.
         plain_snapshot, plain = self.package_fixture()
         with self.assertRaisesRegex(artifacts.ModelError, "no variants"):
             artifacts.select_variant(plain, "UD-Q4_K_M")
-        broken = copy.deepcopy(manifest)
-        del broken["variants"]
-        self.write_manifest(snapshot, broken)
-        with self.assertRaisesRegex(artifacts.ModelError, "variant table"):
-            artifacts.validate_package_manifest(snapshot / "manifest.json")
-        broken = copy.deepcopy(manifest)
-        broken["variants"]["UD-Q4_K_M"]["artifacts"][0]["path"] = "target/stray.bin"
-        self.write_manifest(snapshot, broken)
-        with self.assertRaisesRegex(artifacts.ModelError, "outside"):
-            artifacts.validate_package_manifest(snapshot / "manifest.json")
-        broken = copy.deepcopy(manifest)
-        del broken["variants"]["UD-Q4_K_M"]["artifacts"][0]
-        self.write_manifest(snapshot, broken)
-        with self.assertRaisesRegex(
-            artifacts.ModelError, "missing: variants/UD-Q4_K_M"
+        for mutate, message in (
+            (lambda m: m["target"].pop("gguf"), "variant table"),
+            (lambda m: m["target"]["gguf"].update(repo_id="nope"), "repository ID"),
+            (lambda m: m["target"]["gguf"].update(revision="main"), "commit hash"),
+            (
+                lambda m: m["target"]["gguf"]["variants"]["UD-Q4_K_M"].update(
+                    file="x.bin"
+                ),
+                "invalid GGUF variant",
+            ),
+            (
+                lambda m: m["target"]["gguf"].update(default="UD-Q6_K"),
+                "default variant",
+            ),
+            (
+                lambda m: m["artifacts"].append(
+                    {"path": "target/head.bin", "size": 16384, "sha256": "0" * 64}
+                ),
+                "must not ship",
+            ),
         ):
-            artifacts.validate_package_manifest(snapshot / "manifest.json")
-        plain["variants"] = manifest["variants"]
+            broken = copy.deepcopy(manifest)
+            mutate(broken)
+            self.write_manifest(snapshot, broken)
+            with self.assertRaisesRegex(artifacts.ModelError, message):
+                artifacts.validate_package_manifest(snapshot / "manifest.json")
+        plain["target"] = manifest["target"]
         self.write_manifest(plain_snapshot, plain)
-        with self.assertRaisesRegex(artifacts.ModelError, "does not support variants"):
+        with self.assertRaisesRegex(artifacts.ModelError, "does not support GGUF"):
             artifacts.validate_package_manifest(plain_snapshot / "manifest.json")
 
-    def test_variant_install_builds_real_root_and_downloads_only_its_target(self):
-        snapshot, _ = self.package_fixture(variants=("UD-Q4_K_M", "UD-Q5_K_M"))
+    def test_gguf_variant_install_links_shared_files_and_the_source_gguf(self):
+        snapshot, manifest = self.package_fixture(variants=("UD-Q4_K_M", "UD-Q5_K_M"))
         self.configure_hub(snapshot)
+        gguf = self.gguf_fixture("UD-Q5_K_M", 1)
         models = self.root / "models"
         model_id = f"{self.MODEL_ID}::UD-Q5_K_M"
-        with contextlib.redirect_stdout(io.StringIO()):
+        with (
+            mock.patch.object(artifacts, "resolve_gguf", return_value=gguf) as fetch,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
             self.assertEqual(
                 artifacts.main(
                     ["--models", str(models), "--model", model_id, "prepare"]
                 ),
                 0,
             )
+        fetch.assert_called_once()
+        self.assertEqual(fetch.call_args.args[1], "UD-Q5_K_M")
         patterns = self.download.call_args.kwargs["allow_patterns"]
-        self.assertIn("variants/UD-Q5_K_M/target/layer-0.bin", patterns)
         self.assertIn("draft/model.bin", patterns)
-        self.assertFalse(any(p.startswith("variants/UD-Q4_K_M") for p in patterns))
+        self.assertFalse(any(p.startswith("target/") for p in patterns))
         root = (
             models
             / self.MODEL_ID.split("/")[0]
@@ -753,15 +767,17 @@ class ModelArtifactTest(unittest.TestCase):
             self.assertTrue((root / subdirectory).is_dir())
             self.assertFalse((root / subdirectory).is_symlink())
         self.assertEqual(
-            (root / "target/layer-0.bin").resolve(),
-            (snapshot / "variants/UD-Q5_K_M/target/layer-0.bin").resolve(),
+            (root / "target/Model-UD-Q5_K_M.gguf").resolve(), gguf.resolve()
         )
         self.assertEqual(
             (root / "manifest.json").resolve(), (snapshot / "manifest.json").resolve()
         )
         self.assertEqual(artifacts.installed_snapshot(root), snapshot.resolve())
         self.download.assert_called_once()
-        with contextlib.redirect_stdout(io.StringIO()):
+        with (
+            mock.patch.object(artifacts, "resolve_gguf") as second,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
             self.assertEqual(
                 artifacts.main(
                     ["--models", str(models), "--model", model_id, "verify", "--full"]
@@ -769,12 +785,16 @@ class ModelArtifactTest(unittest.TestCase):
                 0,
             )
             artifacts.main(["--models", str(models), "--model", model_id, "prepare"])
+        second.assert_not_called()
         self.download.assert_called_once()
-        # A damaged variant root is rebuilt in place; a foreign directory is not touched.
-        (root / "target/layer-3.bin").unlink()
-        with contextlib.redirect_stdout(io.StringIO()):
+        # A damaged variant root is rebuilt; a foreign directory is left alone.
+        (root / "target/Model-UD-Q5_K_M.gguf").unlink()
+        with (
+            mock.patch.object(artifacts, "resolve_gguf", return_value=gguf),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
             artifacts.main(["--models", str(models), "--model", model_id, "prepare"])
-        self.assertTrue((root / "target/layer-3.bin").is_symlink())
+        self.assertTrue((root / "target/Model-UD-Q5_K_M.gguf").is_symlink())
         self.assertEqual(self.download.call_count, 2)
         foreign = models / "owner" / "repo::v"
         foreign.mkdir(parents=True)
@@ -783,14 +803,39 @@ class ModelArtifactTest(unittest.TestCase):
             contextlib.redirect_stdout(io.StringIO()),
         ):
             artifacts.prepare(SimpleNamespace(models=models, model="owner/repo::v"))
-        self.download.assert_called_with(
-            allow_patterns=mock.ANY,
-            repo_id=self.MODEL_ID,
+
+    def test_gguf_download_checks_hub_metadata_against_the_manifest(self):
+        snapshot, manifest = self.package_fixture(variants=("UD-Q4_K_M",))
+        gguf = self.gguf_fixture("UD-Q4_K_M", 0)
+        entry = manifest["target"]["gguf"]["variants"]["UD-Q4_K_M"]
+        self.api.return_value.model_info.return_value = SimpleNamespace(
+            sha="c" * 40,
+            siblings=[
+                SimpleNamespace(
+                    rfilename=entry["file"],
+                    size=entry["size"],
+                    lfs=SimpleNamespace(sha256=entry["sha256"]),
+                )
+            ],
+        )
+        self.manifest_download.return_value = str(gguf)
+        self.assertEqual(
+            artifacts.resolve_gguf(manifest, "UD-Q4_K_M", None), gguf.resolve()
+        )
+        self.manifest_download.assert_called_with(
+            repo_id=self.GGUF_REPO,
+            filename=entry["file"],
+            revision="c" * 40,
             repo_type="model",
             token=False,
             endpoint=artifacts.HUB_ENDPOINT,
-            revision=self.REVISION,
         )
+        self.api.return_value.model_info.return_value.siblings[0].lfs.sha256 = "0" * 64
+        with self.assertRaisesRegex(artifacts.ModelError, "hash does not match"):
+            artifacts.resolve_gguf(manifest, "UD-Q4_K_M", None)
+        self.api.return_value.model_info.return_value.siblings = []
+        with self.assertRaisesRegex(artifacts.ModelError, "does not match"):
+            artifacts.resolve_gguf(manifest, "UD-Q4_K_M", None)
 
     def test_publish_refuses_to_replace_a_real_directory(self):
         snapshot, _ = self.package_fixture()

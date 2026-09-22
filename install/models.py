@@ -44,11 +44,12 @@ REPO_ID = re.compile(
 PACKAGE_FORMATS = {
     "splash-packed-q4": (3, "MDFL0006"),
     "splash-packed-q4-moe": (4, "MDFM0001"),
-    "gguf-kquant": (3, "MDKQ0001"),
+    "gguf": (3, "MDKQ0001"),
 }
-# Multi-variant packages (one repository, one target/ per quantization) keep
-# their targets under variants/<name>/target/; the model ID selects one.
-VARIANT_FORMATS = {"gguf-kquant"}
+# GGUF packages ship no target weights: manifest.target.gguf names a source
+# repository and its files; owner/repo::VARIANT selects one, downloaded into the
+# Hub cache and repacked in memory by the engine.
+VARIANT_FORMATS = {"gguf"}
 VARIANT_SEPARATOR = "::"
 VARIANT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 
@@ -207,31 +208,52 @@ def validate_package_manifest(path: Path):
         raise ModelError("runtime package manifest has no artifact list")
     artifact_paths = set()
     _validate_records(records, artifact_paths)
-    variants = manifest.get("variants")
+    gguf = (
+        manifest.get("target", {}).get("gguf")
+        if isinstance(manifest.get("target"), dict)
+        else None
+    )
     if format_name in VARIANT_FORMATS:
-        if not isinstance(variants, dict) or not variants:
-            raise ModelError("runtime package manifest has no variant table")
-        for name, variant in variants.items():
-            prefix = f"variants/{name}/target/"
+        # The target is a llama.cpp GGUF in another repository; the model ID's
+        # ::VARIANT names one of its files, repacked in memory at load time.
+        if (
+            not isinstance(gguf, dict)
+            or not isinstance(gguf.get("variants"), dict)
+            or not gguf["variants"]
+        ):
+            raise ModelError("runtime package manifest has no GGUF variant table")
+        try:
+            validate_repo_id(gguf.get("repo_id"))
+        except ModelError:
+            raise ModelError("runtime package GGUF repository ID is invalid") from None
+        revision = gguf.get("revision")
+        if revision is not None and not is_hex_digest(revision, 40):
+            raise ModelError("runtime package GGUF revision must be a commit hash")
+        for name, variant in gguf["variants"].items():
             if (
                 not isinstance(name, str)
                 or not VARIANT.fullmatch(name)
                 or ".." in name
                 or not isinstance(variant, dict)
-                or not isinstance(variant.get("artifacts"), list)
-                or not variant["artifacts"]
+                or set(variant) != {"file", "size", "sha256"}
+                or not isinstance(variant["file"], str)
+                or not variant["file"].endswith(".gguf")
+                or "/" in variant["file"]
+                or variant["file"] in ("", ".gguf")
+                or type(variant["size"]) is not int
+                or variant["size"] <= 0
+                or not is_hex_digest(variant["sha256"], 64)
             ):
-                raise ModelError("runtime package manifest has an invalid variant")
-            _validate_records(variant["artifacts"], artifact_paths)
-            if any(not r["path"].startswith(prefix) for r in variant["artifacts"]):
-                raise ModelError(
-                    f"runtime package variant {name} lists files outside {prefix}"
-                )
-        default = manifest.get("default_variant")
-        if default is not None and default not in variants:
+                raise ModelError("runtime package manifest has an invalid GGUF variant")
+        default = gguf.get("default")
+        if default is not None and default not in gguf["variants"]:
             raise ModelError("runtime package default variant is not in the table")
-    elif variants is not None:
-        raise ModelError("runtime package format does not support variants")
+        if any(r["path"].startswith("target/") for r in records):
+            raise ModelError(
+                "runtime package with a GGUF target must not ship target files"
+            )
+    elif gguf is not None:
+        raise ModelError("runtime package format does not support GGUF targets")
     if any(
         parent.as_posix() in artifact_paths
         for name in artifact_paths
@@ -239,22 +261,21 @@ def validate_package_manifest(path: Path):
     ):
         raise ModelError("runtime package artifact paths overlap")
     target_layers, draft_layers = (64, 5) if layout[0] == 3 else (40, 6)
-    target_files = {
-        "embedding.bin",
-        "head.bin",
-        *(f"layer-{index}.bin" for index in range(target_layers)),
-    }
     required_files = {
         "draft/model.bin",
         "vision/model.bin",
         *(f"draft/layer-{index}.bin" for index in range(draft_layers)),
         *(f"tokenizer/{name}" for name in TOKENIZER_FILES),
     }
-    if format_name in VARIANT_FORMATS:
-        for name in variants:
-            required_files.update(f"variants/{name}/target/{f}" for f in target_files)
-    else:
-        required_files.update(f"target/{f}" for f in target_files)
+    if format_name not in VARIANT_FORMATS:
+        required_files.update(
+            f"target/{f}"
+            for f in (
+                "embedding.bin",
+                "head.bin",
+                *(f"layer-{index}.bin" for index in range(target_layers)),
+            )
+        )
     missing = required_files - artifact_paths
     if missing:
         raise ModelError(
@@ -263,41 +284,47 @@ def validate_package_manifest(path: Path):
     return manifest
 
 
+def gguf_table(manifest):
+    """The GGUF variant table of a manifest, or None for packed targets."""
+    target = manifest.get("target")
+    return target.get("gguf") if isinstance(target, dict) else None
+
+
 def select_variant(manifest, variant: str | None) -> str | None:
-    """The variant a model ID selects in this manifest (None for plain packages)."""
-    variants = manifest.get("variants")
-    if variants is None:
+    """The variant a model ID selects in this manifest (None for packed targets)."""
+    table = gguf_table(manifest)
+    if table is None:
         if variant is not None:
             raise ModelError(
                 "this runtime package has no variants; drop the ::VARIANT suffix"
             )
         return None
     if variant is None:
-        variant = manifest.get("default_variant")
-    if variant is None or variant not in variants:
+        variant = table.get("default")
+    if variant is None or variant not in table["variants"]:
         raise ModelError(
             "select a variant with owner/repo::VARIANT; available: "
-            + ", ".join(sorted(variants))
+            + ", ".join(sorted(table["variants"]))
         )
     return variant
 
 
-def installed_path(path: str, variant: str | None) -> str:
-    """Where an artifact lives in an installed model root."""
-    prefix = f"variants/{variant}/target/"
-    if variant is not None and path.startswith(prefix):
-        return "target/" + path[len(prefix) :]
-    return path
+def gguf_record(manifest, variant: str):
+    """The installed-root record of a variant's GGUF: target/<file>."""
+    entry = gguf_table(manifest)["variants"][variant]
+    return {
+        "path": "target/" + entry["file"],
+        "size": entry["size"],
+        "sha256": entry["sha256"],
+    }
 
 
 def artifact_records(manifest, variant: str | None, *, installed: bool):
-    """Shared records plus the selected variant's, with installed-root paths if asked."""
+    """Records to verify: the shared files, plus the GGUF in an installed root."""
     records = list(manifest["artifacts"])
-    if variant is not None:
-        records += manifest["variants"][variant]["artifacts"]
-    if not installed:
-        return records
-    return [dict(r, path=installed_path(r["path"], variant)) for r in records]
+    if variant is not None and installed:
+        records.append(gguf_record(manifest, variant))
+    return records
 
 
 def verify_artifacts(
@@ -472,6 +499,57 @@ def _download_snapshot(model_id: str, token):
     return snapshot.resolve()
 
 
+def _hub_gguf_matches(item, entry, name):
+    lfs = getattr(item, "lfs", None) if item is not None else None
+    if item is None or item.size != entry["size"]:
+        raise ModelError(f"Hub GGUF does not match manifest: {name}")
+    if lfs is not None and lfs.sha256.lower() != entry["sha256"].lower():
+        raise ModelError(f"Hub GGUF hash does not match manifest: {name}")
+
+
+def resolve_gguf(manifest, variant: str, token) -> Path:
+    """Downloads the variant's GGUF from its source repository into the Hub cache."""
+    from huggingface_hub import HfApi, hf_hub_download
+
+    table = gguf_table(manifest)
+    entry = table["variants"][variant]
+    revision = table.get("revision") or "main"
+    info = HfApi(endpoint=HUB_ENDPOINT, token=token or False).model_info(
+        table["repo_id"], revision=revision, files_metadata=True
+    )
+    published = {item.rfilename: item for item in info.siblings}
+    _hub_gguf_matches(published.get(entry["file"]), entry, entry["file"])
+    path = Path(
+        hf_hub_download(
+            repo_id=table["repo_id"],
+            filename=entry["file"],
+            revision=info.sha if is_hex_digest(info.sha, 40) else revision,
+            repo_type="model",
+            token=token or False,
+            endpoint=HUB_ENDPOINT,
+        )
+    ).resolve()
+    if not path.is_file() or path.stat().st_size != entry["size"]:
+        raise ModelError(f"downloaded GGUF has the wrong size: {entry['file']}")
+    return path
+
+
+def _cached_gguf(manifest, variant: str):
+    from huggingface_hub import try_to_load_from_cache
+
+    table = gguf_table(manifest)
+    entry = table["variants"][variant]
+    path = try_to_load_from_cache(
+        table["repo_id"], entry["file"], revision=table.get("revision") or "main"
+    )
+    if not isinstance(path, str):
+        return None
+    resolved = Path(path).resolve()
+    if not resolved.is_file() or resolved.stat().st_size != entry["size"]:
+        return None
+    return resolved
+
+
 def _cached_snapshot(model_id):
     from huggingface_hub import try_to_load_from_cache
 
@@ -483,9 +561,8 @@ def _cached_snapshot(model_id):
     try:
         _snapshot_revision(snapshot, model_id)
         manifest = validate_package_manifest(snapshot / "manifest.json")
-        verify_artifacts(
-            snapshot, manifest, full=True, variant=select_variant(manifest, variant)
-        )
+        select_variant(manifest, variant)
+        verify_artifacts(snapshot, manifest, full=True)
     except (ModelError, OSError):
         return None
     return snapshot.resolve()
@@ -529,6 +606,41 @@ def resolve_snapshot(model_id: str):
         ) from error
 
 
+def resolve_target_gguf(manifest, variant: str) -> Path:
+    import httpx
+    from huggingface_hub import get_token
+    from huggingface_hub.errors import HfHubHTTPError, OfflineModeIsEnabled
+
+    token = os.environ.get("HF_TOKEN") or get_token()
+    entry = gguf_table(manifest)["variants"][variant]
+    print(
+        f"Fetching {entry['file']} ({entry['size'] / 1e9:.1f} GB) from "
+        f"{gguf_table(manifest)['repo_id']}; cached files are reused.",
+        flush=True,
+    )
+    try:
+        return resolve_gguf(manifest, variant, token)
+    except Exception as error:
+        if isinstance(error, (OfflineModeIsEnabled, httpx.TransportError)):
+            if cached := _cached_gguf(manifest, variant):
+                print("Using the cached GGUF while offline.", flush=True)
+                return cached
+        if isinstance(error, ModelError):
+            raise
+        message = str(error)
+        if token:
+            message = message.replace(token, "[redacted]")
+        if (
+            isinstance(error, HfHubHTTPError)
+            and error.response is not None
+            and error.response.status_code in (401, 403)
+        ):
+            message += (
+                "; set HF_TOKEN or run 'hf auth login' with access to this repository"
+            )
+        raise ModelError(f"could not download {entry['file']}: {message}") from error
+
+
 @contextmanager
 def installation_lock(models: Path):
     lock_path = models / ".install.lock"
@@ -563,10 +675,13 @@ def install_snapshot(snapshot: Path, destination: Path):
         stage.rmdir()
 
 
-def install_variant(snapshot: Path, destination: Path, manifest, variant: str):
-    """Publish a variant root: real target/, draft/, vision/, tokenizer/ directories
-    of per-file symlinks into the snapshot, plus a manifest.json symlink. The
-    engine requires target/ and draft/ to be real subdirectories of one root."""
+def install_variant(
+    snapshot: Path, destination: Path, manifest, variant: str, gguf: Path
+):
+    """Publish a variant root: real draft/, vision/, tokenizer/ directories of
+    per-file symlinks into the snapshot, target/<file>.gguf linking the cached
+    GGUF, and a manifest.json symlink. The engine requires target/ and draft/
+    to be real subdirectories of one root."""
     if destination.exists() and not (
         destination.is_symlink() or (destination / "manifest.json").is_symlink()
     ):
@@ -577,10 +692,13 @@ def install_variant(snapshot: Path, destination: Path, manifest, variant: str):
     )
     try:
         os.symlink(snapshot / "manifest.json", stage / "manifest.json")
-        for record in artifact_records(manifest, variant, installed=False):
-            link = stage / installed_path(record["path"], variant)
+        for record in manifest["artifacts"]:
+            link = stage / record["path"]
             link.parent.mkdir(parents=True, exist_ok=True)
             os.symlink(snapshot / record["path"], link)
+        target = stage / gguf_record(manifest, variant)["path"]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(gguf, target)
         retired = None
         if destination.is_symlink():
             destination.unlink()
@@ -630,7 +748,8 @@ def prepare(args):
             if selected is None:
                 install_snapshot(snapshot, root)
             else:
-                install_variant(snapshot, root, manifest, selected)
+                gguf = resolve_target_gguf(manifest, selected)
+                install_variant(snapshot, root, manifest, selected, gguf)
             manifest = validate_package_manifest(root / "manifest.json")
             verify_artifacts(
                 root, manifest, full=False, variant=selected, installed=True

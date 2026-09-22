@@ -65,17 +65,36 @@ struct QwenMixerGeometry final {
 
 inline constexpr std::string_view kEmbeddingMagic = "MDFE0001";
 
-// Reads a packed target directory: one file per hybrid layer (input norm,
-// mixer, post-attention norm, then the architecture's FFN through readFfn),
-// head.bin and embedding.bin. Weights is the architecture's weight struct.
-template <class Weights, class Layout, class ReadFfn>
+// Opens the packed files of a target directory: one per hybrid layer, head.bin
+// and embedding.bin.
+struct PackedTargetFiles final {
+  metal::MetalBackend &backend;
+  std::filesystem::path directory;
+  std::string_view layerMagic;
+  std::string_view headMagic;
+  std::string_view embeddingMagic;
+  [[nodiscard]] WeightFile layer(uint32_t index, bool fullAttention) const {
+    const std::string filename = "layer-" + std::to_string(index) + ".bin";
+    return WeightFile(backend, directory / filename, "target/" + filename, layerMagic, index,
+                      fullAttention ? 1U : 0U);
+  }
+  [[nodiscard]] WeightFile head(uint32_t layers) const {
+    return WeightFile(backend, directory / "head.bin", "target/head.bin", headMagic, layers, 2);
+  }
+  [[nodiscard]] WeightFile embedding(uint32_t vocabulary, uint32_t hidden) const {
+    return WeightFile(backend, directory / "embedding.bin", "target/embedding.bin",
+                      embeddingMagic, vocabulary, hidden);
+  }
+};
+
+// Reads a target through Files (packed files or GGUF images built in memory):
+// per layer the input norm, mixer, post-attention norm and the architecture's
+// FFN through readFfn, then the head and the token embedding. Weights is the
+// architecture's weight struct.
+template <class Weights, class Layout, class Files, class ReadFfn>
 [[nodiscard]] Weights
-loadQwenTargetWeights(metal::MetalBackend &backend,
-                      const std::filesystem::path &directory,
-                      const Layout &layout, std::string_view headMagic,
-                      ReadFfn readFfn, bool kquant = false) {
-  const std::string_view layerMagic = kquant ? kKQuantMagic : Layout::layerMagic;
-  if (kquant) headMagic = kKQuantMagic;
+readQwenTargetWeights(metal::MetalBackend &backend, const Layout &layout, Files &&files,
+                      ReadFfn readFfn, bool kquant) {
   const uint64_t allocationBaseline = backend.memoryStats().allocatedBytes;
   Weights result;
   result.layout = layout;
@@ -85,10 +104,7 @@ loadQwenTargetWeights(metal::MetalBackend &backend,
       layout.hiddenSize, kBFloat16Bytes, "Qwen norm bytes");
   for (uint32_t layerIndex = 0; layerIndex < layout.layers; ++layerIndex) {
     const bool fullAttention = layout.isFullAttentionLayer(layerIndex);
-    const std::string filename =
-        "layer-" + std::to_string(layerIndex) + ".bin";
-    WeightFile file(backend, directory / filename, "target/" + filename,
-                    layerMagic, layerIndex, fullAttention ? 1U : 0U);
+    WeightFile file = files.layer(layerIndex, fullAttention);
     auto &layer = result.layers.emplace_back();
     layer.inputNorm = file.section(hiddenBytes, "input-norm");
     layer.mixer = readQwenMixer(file, backend, layout.mixerGeometry(),
@@ -101,8 +117,7 @@ loadQwenTargetWeights(metal::MetalBackend &backend,
   }
 
   {
-    WeightFile file(backend, directory / "head.bin", "target/head.bin",
-                    headMagic, layout.layers, 2);
+    WeightFile file = files.head(layout.layers);
     result.finalNorm = file.section(hiddenBytes, "final-norm");
     result.logitsProjection = kquant
         ? readKQuantProjection(file, "logits")
@@ -112,10 +127,7 @@ loadQwenTargetWeights(metal::MetalBackend &backend,
     result.files.push_back(file.record());
   }
   {
-    WeightFile file(backend, directory / "embedding.bin",
-                    "target/embedding.bin",
-                    kquant ? kKQuantMagic : kEmbeddingMagic,
-                    layout.vocabularySize, layout.hiddenSize);
+    WeightFile file = files.embedding(layout.vocabularySize, layout.hiddenSize);
     result.tokenEmbedding = kquant
         ? readKQuantEmbedding(file, "embedding")
         : readQ4ProjectionComponents(file, layout.vocabularySize,
@@ -128,6 +140,19 @@ loadQwenTargetWeights(metal::MetalBackend &backend,
   result.actualAllocatedBytes = metal::allocationDelta(
       allocationBaseline, backend.memoryStats().allocatedBytes);
   return result;
+}
+
+// Reads a packed target directory (splash-packed-q4 formats).
+template <class Weights, class Layout, class ReadFfn>
+[[nodiscard]] Weights
+loadQwenTargetWeights(metal::MetalBackend &backend,
+                      const std::filesystem::path &directory,
+                      const Layout &layout, std::string_view headMagic,
+                      ReadFfn readFfn) {
+  return readQwenTargetWeights<Weights>(
+      backend, layout,
+      PackedTargetFiles{backend, directory, Layout::layerMagic, headMagic, kEmbeddingMagic},
+      readFfn, false);
 }
 
 // Runtime-visible tensor geometry shared by the supported Qwen hybrid

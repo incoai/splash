@@ -1,5 +1,7 @@
 #include "model/Qwen3_8.hpp"
 
+#include "model/GgufTarget.hpp"
+
 #include <algorithm>
 #include <cstring>
 #include <string_view>
@@ -42,26 +44,52 @@ Qwen3_8Weights loadQwen3_8Weights(metal::MetalBackend &backend,
                                   const std::filesystem::path &directory,
                                   Qwen3_8Layout layout, bool kquant) {
   validateLayout(layout);
-  Qwen3_8Weights weights = loadQwenTargetWeights<Qwen3_8Weights>(
-      backend, directory, layout, kHeadMagic,
-      [&](WeightFile &file, Qwen3_8LayerWeights &layer) {
-        if (kquant) {
-          layer.gateProjection = readKQuantProjection(file, "mlp-gate");
-          layer.upProjection = readKQuantProjection(file, "mlp-up");
-          layer.downProjection = readKQuantProjection(file, "mlp-down");
-          return;
-        }
-        layer.gateProjection = readQ4Projection(
-            file, backend, layout.intermediateSize, layout.hiddenSize,
-            "mlp-gate");
-        layer.upProjection = readQ4Projection(
-            file, backend, layout.intermediateSize, layout.hiddenSize,
-            "mlp-up");
-        layer.downProjection = readQ4Projection(
-            file, backend, layout.hiddenSize, layout.intermediateSize,
-            "mlp-down");
-      },
-      kquant);
+  auto readFfn = [&](WeightFile &file, Qwen3_8LayerWeights &layer) {
+    if (kquant) {
+      layer.gateProjection = readKQuantProjection(file, "mlp-gate");
+      layer.upProjection = readKQuantProjection(file, "mlp-up");
+      layer.downProjection = readKQuantProjection(file, "mlp-down");
+      return;
+    }
+    layer.gateProjection = readQ4Projection(
+        file, backend, layout.intermediateSize, layout.hiddenSize,
+        "mlp-gate");
+    layer.upProjection = readQ4Projection(
+        file, backend, layout.intermediateSize, layout.hiddenSize,
+        "mlp-up");
+    layer.downProjection = readQ4Projection(
+        file, backend, layout.hiddenSize, layout.intermediateSize,
+        "mlp-down");
+  };
+  Qwen3_8Weights weights;
+  if (kquant) {
+    // The target directory holds the llama.cpp GGUF; every layer image is
+    // repacked into memory as it is read.
+    gguf::TargetGeometry geometry;
+    geometry.layers = layout.layers;
+    geometry.hiddenSize = layout.hiddenSize;
+    geometry.vocabularySize = layout.vocabularySize;
+    geometry.intermediateSize = layout.intermediateSize;
+    geometry.gdnKeyHeads = layout.gdnKeyHeads;
+    geometry.gdnValueHeads = layout.gdnValueHeads;
+    geometry.gdnHeadDimension = layout.gdnHeadDimension;
+    geometry.convolutionDimension = layout.convolutionDimension;
+    geometry.attentionWidth = layout.attentionWidth;
+    geometry.attentionHeadDimension = layout.attentionHeadDimension;
+    geometry.fullAttentionPeriod = layout.fullAttentionPeriod;
+    GgufTargetLoader loader(backend, findTargetGguf(directory), geometry);
+    struct GgufFiles {
+      GgufTargetLoader &loader;
+      WeightFile layer(uint32_t index, bool) { return loader.layer(index); }
+      WeightFile head(uint32_t) { return loader.head(); }
+      WeightFile embedding(uint32_t, uint32_t) { return loader.embedding(); }
+    };
+    weights = readQwenTargetWeights<Qwen3_8Weights>(backend, layout, GgufFiles{loader},
+                                                    readFfn, true);
+  } else {
+    weights = loadQwenTargetWeights<Qwen3_8Weights>(backend, directory, layout, kHeadMagic,
+                                                    readFfn);
+  }
   if (!kquant) return weights;
   // Shared scratch for the K-quant kernels: split-K partials (8 splits x 32 rows x
   // widest projection), permuted GDN out_proj activations for the prefill budget,

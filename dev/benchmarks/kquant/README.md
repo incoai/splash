@@ -19,6 +19,10 @@ needed):
   kernels vs. the repacked layout and vs. splash's Q4 kernels (`results-native-vs-repacked.md`).
 - `compile_check.mm`, `inline_metal.py`: runtime compilation helpers (inline `#include`s, then
   `newLibraryWithSource:`).
+- `harness_embed.mm`: the three native-row embedding gathers against a CPU reference.
+- `harness_image.mm`: builds layer/head/embedding images straight from a GGUF with the
+  load-time `kq_repack` / `kq_copy` kernels and compares them byte for byte with converter
+  output (`convert_gguf_to_splash.py`).
 - `bench_e2e.py`, `run_e2e.sh`, `accept_probe.sh`, `e2e_summary.py`: end-to-end ABAB benchmark
   against `server/server.py` (single stream, 4 concurrent, prefill) with a one-minute gap
   between runs; `entries.py` and `inspect_pkg.py` build the per-tensor result tables from
@@ -34,5 +38,5 @@ Results:
 - `results-native-vs-repacked.md`: why the repacked layout is kept (native layout is 25-40 %
   slower at 8 rows).
 
-Design note: `gguf-in-memory-loading.md` describes loading a GGUF directly, repacking into the
-`MDKQ0001` layout in memory at load time instead of shipping a converted package.
+Design note: `gguf-in-memory-loading.md` is the plan the GGUF loader (`runtime/model/Gguf*.cpp`)
+implements: load the GGUF directly and repack into the `MDKQ0001` layout in memory.

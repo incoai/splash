@@ -386,7 +386,7 @@ ModelDescriptor inspectModelPackage(const std::filesystem::path &root) {
     if (format == "splash-packed-q4") {
       descriptor = qwen38Descriptor(model);
       validateQwen38(manifest, root, descriptor);
-    } else if (format == "gguf-kquant") {
+    } else if (format == "gguf") {
       descriptor = qwen38Descriptor(model);
       requireEqual(requireUnsigned(manifest, @"schema_version", "schema_version"),
                    3, "schema_version");

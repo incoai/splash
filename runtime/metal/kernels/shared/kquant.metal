@@ -671,5 +671,128 @@ kernel void kq_permute_heads(device const bfloat *input [[buffer(0)]], device bf
   output[index] = input[ulong(row) * p.width + perm[h] * p.block + e];
 }
 
+// ---- load-time repack: native GGUF rows -> MDKQ0001 planes (byte layout of convert_gguf_to_splash.py) ----
+// One thread per (destination row n, 32-wide K group g). Rows >= permute_from_row are read from
+// llama.cpp's tiled value-head order so the image holds splash's grouped order.
+static inline uint kq_repack_source_row(uint n, constant KQRepackParams &p) {
+  if (n < p.permute_from_row) return n;
+  const uint head = (n - p.permute_from_row) / p.permute_head_rows, e = (n - p.permute_from_row) % p.permute_head_rows;
+  const uint source = (head % p.permute_groups) * p.permute_group_heads + head / p.permute_groups;
+  return p.permute_from_row + source * p.permute_head_rows + e;
+}
+// 32 codes (< 16) -> 4 words; interleaved: code j of each 8 sits at nibble (j&1)*4 + (j>>1) of a 16-bit half.
+static inline void kq_pack_words(thread const uchar *codes, bool interleave, device uint *dst) {
+  for (uint k = 0; k < 4; ++k) {
+    uint w = 0;
+    for (uint j = 0; j < 8; ++j) w |= uint(codes[8 * k + j]) << (interleave ? (j & 1) * 16 + 4 * (j >> 1) : 4 * j);
+    dst[k] = w;
+  }
+}
+// 16 small values -> one word: even k at bit step*(k/2), odd k at 16 + step*(k/2).
+static inline uint kq_pair_word(thread const uchar *v, uint step) {
+  uint w = 0;
+  for (uint k = 0; k < 16; ++k) w |= uint(v[k]) << (((k & 1) ? 16 : 0) + step * (k >> 1));
+  return w;
+}
+kernel void kq_repack(device const uchar *src [[buffer(0)]], device uchar *dst [[buffer(1)]],
+                      constant KQRepackParams &p [[buffer(2)]], uint t [[thread_position_in_grid]]) {
+  const uint G = p.input_size / 32;
+  if (t >= p.rows * G) return;
+  const uint n = t / G, g = t % G, r = kq_repack_source_row(n, p);
+  const bool k256 = !(p.fmt == KQ_FMT_IQ4NL || p.fmt == KQ_FMT_Q80);
+  const uint b = k256 ? g / 8 : g, j = k256 ? g % 8 : 0, mg = k256 ? 8 : 1;
+  uint blockBytes, p0, p1, mb;
+  switch (p.fmt) {
+    case KQ_FMT_Q4K: blockBytes = 144; p0 = 16; p1 = 0; mb = 16; break;
+    case KQ_FMT_IQ4XS: blockBytes = 136; p0 = 16; p1 = 0; mb = 8; break;
+    case KQ_FMT_IQ4NL: blockBytes = 18; p0 = 16; p1 = 0; mb = 2; break;
+    case KQ_FMT_Q5K: blockBytes = 176; p0 = 16; p1 = 4; mb = 16; break;
+    case KQ_FMT_Q6K: blockBytes = 210; p0 = 16; p1 = 8; mb = 20; break;
+    case KQ_FMT_Q3K: blockBytes = 110; p0 = 8; p1 = 4; mb = 16; break;
+    case KQ_FMT_Q80: blockBytes = 34; p0 = 32; p1 = 0; mb = 2; break;
+    default: blockBytes = 110; p0 = 16; p1 = 0; mb = 2; break;  // IQ3_S
+  }
+  device const uchar *blk = src + p.src_offset + ulong(r) * p.src_row_bytes + ulong(b) * blockBytes;
+  const uint tile = ((n / 256) * G + g) * 256 + (n % 256);
+  device uchar *out0 = dst + p.dst_plane0 + ulong(tile) * p0;
+  device uchar *out1 = dst + p.dst_plane1 + ulong(tile) * p1;
+  device uchar *meta = dst + p.dst_meta + (ulong((n / 256) * (G / mg) + b) * 256 + (n % 256)) * mb;
+  uchar codes[32], bits[32];
+  switch (p.fmt) {
+    case KQ_FMT_Q4K: {
+      for (uint l = 0; l < 32; ++l) codes[l] = (blk[16 + (j / 2) * 32 + l] >> (4 * (j % 2))) & 15;
+      kq_pack_words(codes, true, (device uint *)out0);
+      if (j == 0) for (uint i = 0; i < 16; ++i) meta[i] = blk[i];
+      break;
+    }
+    case KQ_FMT_Q5K: {
+      for (uint l = 0; l < 32; ++l) { codes[l] = (blk[48 + (j / 2) * 32 + l] >> (4 * (j % 2))) & 15; bits[l] = (blk[16 + l] >> j) & 1; }
+      kq_pack_words(codes, true, (device uint *)out0);
+      uint w = 0;
+      for (uint l = 0; l < 32; ++l) w |= uint(bits[l]) << (((l & 1) ? 16 : 0) + 4 * (l / 8) + (l % 8) / 2);
+      *(device uint *)out1 = w;
+      if (j == 0) for (uint i = 0; i < 16; ++i) meta[i] = blk[i];
+      break;
+    }
+    case KQ_FMT_IQ4XS: {
+      for (uint l = 0; l < 16; ++l) { const uchar q = blk[8 + 16 * j + l]; codes[l] = q & 15; codes[16 + l] = q >> 4; }
+      kq_pack_words(codes, false, (device uint *)out0);
+      if (j == 0) for (uint i = 0; i < 8; ++i) meta[i] = blk[i];
+      break;
+    }
+    case KQ_FMT_IQ4NL: {
+      for (uint l = 0; l < 16; ++l) { const uchar q = blk[2 + l]; codes[l] = q & 15; codes[16 + l] = q >> 4; }
+      kq_pack_words(codes, true, (device uint *)out0);
+      meta[0] = blk[0]; meta[1] = blk[1];
+      break;
+    }
+    case KQ_FMT_Q6K: {
+      const uint hb = j / 4, quarter = j % 4;
+      for (uint l = 0; l < 32; ++l) {
+        codes[l] = (blk[64 * hb + 32 * (quarter & 1) + l] >> (4 * (quarter >> 1))) & 15;
+        bits[l] = (blk[128 + 32 * hb + l] >> (2 * quarter)) & 3;
+      }
+      kq_pack_words(codes, true, (device uint *)out0);
+      ((device uint *)out1)[0] = kq_pair_word(bits, 2);
+      ((device uint *)out1)[1] = kq_pair_word(bits + 16, 2);
+      if (j == 0) { for (uint i = 0; i < 16; ++i) meta[i] = blk[192 + i]; meta[16] = blk[208]; meta[17] = blk[209]; meta[18] = 0; meta[19] = 0; }
+      break;
+    }
+    case KQ_FMT_Q3K: {
+      const uint hb = j / 4, jj = j % 4;
+      for (uint l = 0; l < 32; ++l) { codes[l] = (blk[32 + 32 * hb + l] >> (2 * jj)) & 3; bits[l] = (blk[l] >> j) & 1; }
+      ((device uint *)out0)[0] = kq_pair_word(codes, 2);
+      ((device uint *)out0)[1] = kq_pair_word(codes + 16, 2);
+      uint w = 0;
+      for (uint l = 0; l < 32; ++l) w |= uint(bits[l]) << (((l & 1) ? 16 : 0) + l / 2);
+      *(device uint *)out1 = w;
+      if (j == 0) { meta[0] = blk[108]; meta[1] = blk[109]; meta[2] = 0; meta[3] = 0; for (uint i = 0; i < 12; ++i) meta[4 + i] = blk[96 + i]; }
+      break;
+    }
+    case KQ_FMT_Q80: {
+      for (uint i = 0; i < 32; ++i) out0[i] = blk[2 + i];
+      meta[0] = blk[0]; meta[1] = blk[1];
+      break;
+    }
+    default: {  // IQ3_S: qs(8) | signs(4) | qh(1) | 4-bit scale (1) | 0 0
+      for (uint i = 0; i < 8; ++i) out0[i] = blk[2 + 8 * j + i];
+      for (uint i = 0; i < 4; ++i) out0[8 + i] = blk[74 + 4 * j + i];
+      out0[12] = blk[66 + j];
+      out0[13] = (blk[106 + j / 2] >> (4 * (j % 2))) & 15;
+      out0[14] = 0; out0[15] = 0;
+      if (j == 0) { meta[0] = blk[0]; meta[1] = blk[1]; }
+      break;
+    }
+  }
+}
+// byte copy for native embedding rows: one thread per 16 bytes
+kernel void kq_copy(device const uchar *src [[buffer(0)]], device uchar *dst [[buffer(1)]],
+                    constant KQCopyParams &p [[buffer(2)]], uint t [[thread_position_in_grid]]) {
+  const uint begin = t * 16;
+  if (begin >= p.bytes) return;
+  if (begin + 16 <= p.bytes) *(device uint4 *)(dst + p.dst_offset + begin) = *(device const uint4 *)(src + p.src_offset + begin);
+  else for (uint i = begin; i < p.bytes; ++i) dst[p.dst_offset + i] = src[p.src_offset + i];
+}
+
 // dependency kernel for serialized profiling: touching the output forces the next dispatch to wait
 kernel void kq_touch(device bfloat *y [[buffer(0)]], uint tid [[thread_position_in_grid]]) { if (tid == 0) y[0] = bfloat(float(y[0]) + 0.0f); }

@@ -125,43 +125,42 @@ fine-tunes may use any nonempty manifest model name. Native loading validates
 geometry, tensor sizes, binary headers, tokenizer and target/draft compatibility.
 New architectures require engine support; ordinary HF weights need conversion.
 
-### GGUF K-quant packages
+### GGUF targets
 
-Qwen3.8-27B can also be served from a llama.cpp GGUF (for example Unsloth's
-`Qwen3.8-27B-UD-Q4_K_M.gguf`) through the `gguf-kquant` format (schema 3, target layer
-magic `MDKQ0001`). The quantized values are kept bit for bit: `dev/tools/convert_gguf_to_splash.py`
-splits every block into a payload plane, an optional high-bit plane and a per-superblock
-header plane, and stores them in 256-column tiles so decode reads are coalesced. Supported
-tensor types are Q4_K, Q5_K, Q6_K, Q3_K, IQ4_XS, IQ4_NL, Q8_0 and IQ3_S; the token embedding
-stays in native `block_q4_K` rows.
+Qwen3.8-27B can be served straight from a llama.cpp GGUF (for example Unsloth's
+`Qwen3.8-27B-UD-Q4_K_M.gguf`). A `gguf` package (schema 3) ships only the shared `draft/`,
+`vision/` and `tokenizer/`; its manifest names the source repository and the files a model ID
+may select:
 
-A `gguf-kquant` package is multi-variant: one repository holds the shared `draft/`,
-`vision/` and `tokenizer/` and one converted target per quantization under
-`variants/<NAME>/target/`. The manifest lists the shared files in `artifacts` and each
-variant's files in `variants.<NAME>.artifacts` (optionally with `source`, the GGUF it was
-converted from, and `default_variant`). The model ID selects the variant:
-
-```sh
-splash serve --model incoai-internal/Qwen3.8-27B-Splash-GGUF::UD-Q4_K_M
+```json
+"format": {"name": "gguf", "target_layer_magic": "MDKQ0001", ...},
+"target": {"gguf": {"repo_id": "unsloth/Qwen3.8-27B-GGUF", "revision": "<commit>",
+                    "variants": {"UD-Q4_K_M": {"file": "Qwen3.8-27B-UD-Q4_K_M.gguf",
+                                               "size": 16464440224, "sha256": "..."}, ...}}}
 ```
 
-Only the shared files and the selected variant are downloaded. The installed model root
-`models/<owner>/<repo>::<NAME>/` is a real directory whose `target/`, `draft/`, `vision/` and
-`tokenizer/` hold per-file symlinks into the Hub snapshot (the engine requires `target/` and
-`draft/` to be subdirectories of one root) and whose `manifest.json` links to the snapshot's.
+`splash serve --model incoai-internal/Qwen3.8-27B-Splash-GGUF::UD-Q4_K_M` downloads the shared
+files and that one GGUF into the Hub cache, checks them against the manifest, and installs
+`models/<owner>/<repo>::UD-Q4_K_M/` as a real directory of per-file symlinks whose
+`target/<file>.gguf` links the cached GGUF (the engine requires `target/` and `draft/` to be
+subdirectories of one root). Nothing is written to disk besides the download.
 
-```sh
-python3 dev/tools/convert_gguf_to_splash.py Qwen3.8-27B-UD-Q5_K_M.gguf out   # writes out/target/
-```
+At load time the engine parses the GGUF header (`runtime/model/GgufFile.cpp`), plans one
+in-memory image per layer in the `MDKQ0001` layout (`GgufImage.cpp`: descriptor, payload plane,
+optional high-bit plane and superblock headers in 256-column tiles, small tensors converted on
+the CPU) and fills it with the `kq_repack` / `kq_copy` kernels reading the mmapped file
+(`GgufTarget.cpp`). The images are anonymous Metal memory, so under memory pressure they are
+compressed or swapped rather than dropped and refaulted like mapped package files. Supported
+tensor types are Q4_K, Q5_K, Q6_K, Q3_K, IQ4_XS, IQ4_NL, Q8_0 and IQ3_S for linears and Q4_K,
+Q6_K or Q8_0 token embeddings; the loader lists every unsupported tensor in one error. Of
+Unsloth's files that covers UD-Q4_K_M/XL, UD-Q5_K_M/S/XL, UD-Q6_K and Q6_K_L/M/XL, UD-Q8_K_L
+and Q8_0; the 2-bit, IQ2/IQ3_XXS, IQ1, Q4_0/Q4_1 and BF16-bearing files need kernels that do not
+exist yet (`dev/tools/gguf_survey.py` reports a file's types from its header).
 
-`dev/tools/publish_gguf_variant.py --repo <owner/repo> --variant UD-Q5_K_M --target out/target
---source-repo unsloth/Qwen3.8-27B-GGUF --source-file Qwen3.8-27B-UD-Q5_K_M.gguf` uploads it as
-`variants/UD-Q5_K_M/target/`, verifies the Hub copy and adds the variant to the manifest.
-Unsloth variants whose tensor types are all supported (the UD-Q4_K_M/XL, Q5_K_M/S/XL, Q6_K,
-Q6_K_L/M/XL, Q8_K_L and Q8_0 files) convert as they are; the 2-bit, IQ2/IQ3_XXS, IQ1, Q4_0/Q4_1
-and BF16-bearing files need kernels that do not exist yet. The kernels are in `runtime/metal/kernels/shared/kquant.metal` (ABI in
-`runtime/metal/abi/KQuant.h`), the dispatch policy in `runtime/ops/Linear.cpp`. Measurements,
-harnesses and the design note for loading GGUF files without a package are in
+`dev/tools/convert_gguf_to_splash.py` writes the same images to disk and is the reference the
+load-time repack is checked against (`dev/benchmarks/kquant/harness_image.mm`). The GEMM
+kernels are in `runtime/metal/kernels/shared/kquant.metal` (ABI in `runtime/metal/abi/KQuant.h`),
+the dispatch policy in `runtime/ops/Linear.cpp`; measurements and harnesses are in
 `dev/benchmarks/kquant/`.
 
 ## Code and API boundaries

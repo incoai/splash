@@ -151,12 +151,32 @@ private:
 
 struct WeightFile::Impl {
     metal::MetalBackend *backend = nullptr;
-    std::shared_ptr<MappedRegion> mapping;
+    std::shared_ptr<MappedRegion> mapping; // null for in-memory images
     metal::MetalBuffer base;
+    uint64_t bytes = 0;
     WeightFileRecord record;
     uint64_t offset = 16;
     bool finished = false;
 };
+
+namespace {
+void checkWeightHeader(const uint8_t *header, uint64_t bytes, std::string_view expectedMagic,
+                       uint32_t expectedLayer, uint32_t expectedType,
+                       const std::string &what) {
+    if (expectedMagic.size() != 8) {
+        throw WeightStoreError("packed file magic must contain eight bytes");
+    }
+    if (bytes < 16 || bytes % kWeightFileAlignment) {
+        throw WeightStoreError("packed file size is not 16 KiB-aligned: " + what);
+    }
+    uint32_t layer = loadLittleEndian32(header + 8);
+    uint32_t type = loadLittleEndian32(header + 12);
+    if (std::memcmp(header, expectedMagic.data(), 8) != 0 ||
+        layer != expectedLayer || type != expectedType) {
+        throw WeightStoreError("packed file header mismatch: " + what);
+    }
+}
+} // namespace
 
 WeightFile::WeightFile(metal::MetalBackend &backend,
                        std::filesystem::path path,
@@ -165,33 +185,40 @@ WeightFile::WeightFile(metal::MetalBackend &backend,
                        uint32_t expectedLayer,
                        uint32_t expectedType)
     : impl_(std::make_unique<Impl>()) {
-    if (expectedMagic.size() != 8) {
-        throw WeightStoreError("packed file magic must contain eight bytes");
-    }
     impl_->backend = &backend;
     impl_->mapping = MappedRegion::openReadOnly(path);
-    if (impl_->mapping->bytes() < 16 ||
-        impl_->mapping->bytes() % kWeightFileAlignment) {
-        throw WeightStoreError(
-            "packed file size is not 16 KiB-aligned: " + path.string());
-    }
-    const auto *header = static_cast<const uint8_t *>(
-        impl_->mapping->address());
-    uint32_t layer = loadLittleEndian32(header + 8);
-    uint32_t type = loadLittleEndian32(header + 12);
-    if (std::memcmp(header, expectedMagic.data(), 8) != 0 ||
-        layer != expectedLayer || type != expectedType) {
-        throw WeightStoreError("packed file header mismatch: " + path.string());
-    }
-
+    impl_->bytes = impl_->mapping->bytes();
+    checkWeightHeader(static_cast<const uint8_t *>(impl_->mapping->address()),
+                      impl_->bytes, expectedMagic, expectedLayer, expectedType,
+                      path.string());
     impl_->record = {
-        std::move(relativePath), std::string(expectedMagic), layer, type,
-        impl_->mapping->bytes(),
+        std::move(relativePath), std::string(expectedMagic), expectedLayer, expectedType,
+        impl_->bytes,
     };
     impl_->base = backend.wrapSharedMemory(
-        impl_->mapping->address(), impl_->mapping->bytes(), impl_->mapping,
+        impl_->mapping->address(), impl_->bytes, impl_->mapping,
         impl_->record.relativePath);
 }
+
+WeightFile::WeightFile(metal::MetalBackend &backend, metal::MetalBuffer image,
+                       std::string relativePath, std::string_view expectedMagic,
+                       uint32_t expectedLayer, uint32_t expectedType)
+    : impl_(std::make_unique<Impl>()) {
+    impl_->backend = &backend;
+    impl_->bytes = image.sizeBytes();
+    const auto *header = static_cast<const uint8_t *>(image.contents());
+    if (!header) throw WeightStoreError("weight image is not host visible: " + relativePath);
+    checkWeightHeader(header, impl_->bytes, expectedMagic, expectedLayer, expectedType,
+                      relativePath);
+    impl_->record = {
+        std::move(relativePath), std::string(expectedMagic), expectedLayer, expectedType,
+        impl_->bytes,
+    };
+    impl_->base = std::move(image);
+}
+
+WeightFile::WeightFile(WeightFile &&) noexcept = default;
+WeightFile &WeightFile::operator=(WeightFile &&) noexcept = default;
 
 WeightFile::~WeightFile() = default;
 
@@ -203,7 +230,7 @@ metal::MetalBuffer WeightFile::section(uint64_t bytes,
     if (!bytes) throw WeightStoreError("packed section must not be empty");
     uint64_t start = alignPacked(impl_->offset);
     uint64_t end = checkedWeightAdd(start, bytes, "packed section end");
-    if (start % kWeightFileAlignment || end > impl_->mapping->bytes()) {
+    if (start % kWeightFileAlignment || end > impl_->bytes) {
         throw WeightStoreError(
             "packed file is truncated at section " + std::string(label));
     }
@@ -214,7 +241,7 @@ metal::MetalBuffer WeightFile::section(uint64_t bytes,
 void WeightFile::finish() {
     if (impl_->finished) return;
     uint64_t consumed = alignPacked(impl_->offset);
-    if (consumed != impl_->mapping->bytes()) {
+    if (consumed != impl_->bytes) {
         throw WeightStoreError(
             "packed file has unconsumed or missing bytes: " +
             impl_->record.relativePath);

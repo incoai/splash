@@ -348,14 +348,14 @@ def main():
         size = w.close()
         print(f"layer {L} {'attn' if full else 'gdn'} {size / 1e6:.1f} MB", flush=True)
     if not a.skip_head:
-        w = Writer(os.path.join(a.out, "target", "head.bin"), 0, 2)
+        w = Writer(os.path.join(a.out, "target", "head.bin"), LAYERS, 2)
         w.section(bf16(f32("output_norm.weight")), "final-norm")
         x, ty, N, K = raw("output.weight")
         w.kq(ty, x, N, K, "logits")
         types_used["output"] = ty
         print("head", w.close() / 1e6, "MB", ty)
     if not a.skip_embedding:
-        w = Writer(os.path.join(a.out, "target", "embedding.bin"), 0, 3)
+        w = Writer(os.path.join(a.out, "target", "embedding.bin"), VOCAB, H)
         x, ty, N, K = raw("token_embd.weight")
         # Native rows, gathered by kq_embed_<type>; the descriptor carries the type.
         assert ty in ("Q4_K", "Q6_K", "Q8_0"), f"unsupported embedding type {ty}"
