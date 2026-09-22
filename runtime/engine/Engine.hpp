@@ -134,6 +134,7 @@ private:
     uint64_t resumeKvTargetTokens = 0;
     ResourceWait resourceWait;
     std::vector<uint32_t> exactTokens;
+    std::optional<CacheProbe> admissionProbe;
     std::vector<StateBoundary> stateBoundaries;
     size_t stateBoundaryCursor = 0;
     StateCheckpoint latestCheckpoint;

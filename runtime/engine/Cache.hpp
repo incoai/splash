@@ -25,6 +25,11 @@ struct CacheLookup final {
   }
 };
 
+struct CacheProbe final {
+  std::vector<uint64_t> blocks;
+  uint32_t cachedTokens = 0;
+};
+
 struct CacheLookupSnapshot final {
   uint64_t lookups = 0;
   uint64_t kvHitTokens = 0;
@@ -78,11 +83,16 @@ public:
   [[nodiscard]] uint32_t
   cachedTokens(std::span<const uint32_t> prompt,
                std::span<const ImageSpan> images = {}) const;
+  [[nodiscard]] CacheProbe
+  probe(std::span<const uint32_t> prompt,
+        std::span<const ImageSpan> images = {}) const;
 
   // Pin the usable prefix before potentially evicting for active allocations.
   // Accounting is separate: failed admission retries are not extra samples.
-  [[nodiscard]] CacheLookup lookup(std::span<const uint32_t> prompt,
-                                   std::span<const ImageSpan> images = {});
+  [[nodiscard]] CacheLookup lookup(
+      std::span<const uint32_t> prompt,
+      std::span<const ImageSpan> images = {},
+      const CacheProbe *probe = nullptr);
   void recordLookup(const CacheLookup &lookup);
   void restoreRequest(uint64_t requestId, const CacheLookup &lookup);
 

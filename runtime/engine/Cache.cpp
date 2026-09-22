@@ -58,18 +58,43 @@ Cache::matchedBlocks(std::span<const uint32_t> prompt,
 }
 
 uint32_t Cache::cachedTokens(std::span<const uint32_t> prompt,
-                              std::span<const ImageSpan> images) const {
-  const auto blocks = matchedBlocks(prompt, images);
-  for (size_t i = blocks.size(); i > 0; --i)
-    if (states_.contains(blocks[i - 1]))
-      return static_cast<uint32_t>(i * KvCache::pageTokens);
-  return 0;
+                             std::span<const ImageSpan> images) const {
+  return probe(prompt, images).cachedTokens;
+}
+
+CacheProbe Cache::probe(std::span<const uint32_t> prompt,
+                        std::span<const ImageSpan> images) const {
+  CacheProbe result;
+  result.blocks = matchedBlocks(prompt, images);
+  for (size_t i = result.blocks.size(); i > 0; --i) {
+    if (states_.contains(result.blocks[i - 1])) {
+      result.cachedTokens = static_cast<uint32_t>(i * KvCache::pageTokens);
+      break;
+    }
+  }
+  return result;
 }
 
 CacheLookup Cache::lookup(std::span<const uint32_t> prompt,
-                          std::span<const ImageSpan> images) {
+                          std::span<const ImageSpan> images,
+                          const CacheProbe *probe) {
   CacheLookup result;
-  const auto blocks = matchedBlocks(prompt, images);
+  const auto validProbe = [&] {
+    if (!probe)
+      return false;
+    for (uint64_t block : probe->blocks)
+      if (!kv_.contains(block))
+        return false;
+    return true;
+  };
+  std::vector<uint64_t> fallback;
+  std::span<const uint64_t> blocks;
+  if (validProbe()) {
+    blocks = probe->blocks;
+  } else {
+    fallback = matchedBlocks(prompt, images);
+    blocks = fallback;
+  }
   if (!blocks.empty()) {
     kv_.touch(blocks.back());
     result.kvBoundary = static_cast<uint32_t>(blocks.size() * KvCache::pageTokens);
