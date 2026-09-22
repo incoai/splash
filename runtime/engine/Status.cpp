@@ -252,7 +252,9 @@ std::string runtimeStatusJson(
       << scheduler.decodeBatchesByWidth[0]
       << ",\"b2\":" << scheduler.decodeBatchesByWidth[1]
       << ",\"b3\":" << scheduler.decodeBatchesByWidth[2]
-      << ",\"b4\":" << scheduler.decodeBatchesByWidth[3] << "}}"
+      << ",\"b4\":" << scheduler.decodeBatchesByWidth[3] << "}"
+      << ",\"decode_mixed_greedy_sampling_batches\":"
+      << scheduler.decodeMixedGreedySamplingBatches << "}"
       << ",\"requests\":{\"submitted\":" << core.submitted
       << ",\"completed\":" << core.completed
       << ",\"cancelled\":" << core.cancelled << ",\"failed\":" << core.failed

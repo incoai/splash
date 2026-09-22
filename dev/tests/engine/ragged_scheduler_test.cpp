@@ -377,6 +377,59 @@ void testMixedSamplingBatch() {
   }
 }
 
+void testDecodeMixTelemetryCountsMixedBatches() {
+  for (uint32_t width = 1; width <= 4; ++width) {
+    for (uint32_t sampled = 0; sampled < (1u << width); ++sampled) {
+      Scheduler scheduler;
+      for (uint32_t lane = 0; lane < width; ++lane) {
+        const auto cohort = (sampled & (1u << lane)) ? BatchCohort::Sampling
+                                                    : BatchCohort::Greedy;
+        scheduler.submit(request(lane + 1, 1, cohort));
+        scheduler.resourcesReady(lane + 1, 0);
+      }
+      completePrefill(scheduler, *scheduler.next());
+      const bool mixed = sampled != 0 && sampled != (1u << width) - 1;
+      for (uint64_t step = 0; step < 2; ++step) {
+        const BatchPlan preview = *scheduler.next();
+        require(preview.width() == width &&
+                    scheduler.snapshot().decodeMixedGreedySamplingBatches ==
+                        (mixed ? step : 0),
+                "prefill or decode preview changed mixed telemetry");
+        completeDecode(scheduler);
+        const auto snapshot = scheduler.snapshot();
+        require(snapshot.decodeMixedGreedySamplingBatches ==
+                    (mixed ? step + 1 : 0) &&
+                    snapshot.decodeBatches == step + 1 &&
+                    snapshot.decodeBatchesByWidth[width - 1] == step + 1,
+                "decode mix or width counters disagree with committed batches");
+      }
+    }
+  }
+}
+
+void testDecodeMixTelemetryIgnoresRejectedCommits() {
+  Scheduler scheduler;
+  scheduler.submit(request(1, 1, BatchCohort::Greedy));
+  scheduler.submit(request(2, 1, BatchCohort::Sampling));
+  scheduler.resourcesReady(1, 1);
+  scheduler.resourcesReady(2, 1);
+  const BatchPlan stale = *scheduler.next();
+  scheduler.cancel(2);
+  bool rejected = false;
+  try {
+    scheduler.commit(stale);
+  } catch (const std::logic_error &) {
+    rejected = true;
+  }
+  require(rejected && scheduler.snapshot().decodeBatches == 0 &&
+              scheduler.snapshot().decodeMixedGreedySamplingBatches == 0,
+          "rejected commit incremented decode counters");
+  completeDecode(scheduler);
+  require(scheduler.snapshot().decodeBatches == 1 &&
+              scheduler.snapshot().decodeMixedGreedySamplingBatches == 0,
+          "cancelled sampling request was counted in a greedy dispatch");
+}
+
 void testConstrainedDecodeRemainsSeparate() {
   Scheduler scheduler;
   scheduler.submit(request(1, 1, BatchCohort::Constrained));
@@ -399,6 +452,9 @@ void testConstrainedDecodeRemainsSeparate() {
   require(constrained.width() == 1 && constrained.items[0].requestId == 1 &&
               constrained.cohort == BatchCohort::Constrained,
           "constrained decode lost its independent mask pipeline");
+  completeDecode(scheduler);
+  require(scheduler.snapshot().decodeMixedGreedySamplingBatches == 1,
+          "constrained mask or verify dispatch was counted as mixed sampling");
 }
 
 void testPrefillAndDecodeAlternateWithoutStarvation() {
@@ -885,6 +941,8 @@ int main() {
     testServedLaneResetsOvertaking();
     testRealDecodeWidths();
     testMixedSamplingBatch();
+    testDecodeMixTelemetryCountsMixedBatches();
+    testDecodeMixTelemetryIgnoresRejectedCommits();
     testConstrainedDecodeRemainsSeparate();
     testPrefillAndDecodeAlternateWithoutStarvation();
     testMeasuredBudgetOnlyLimitsContendedWork();

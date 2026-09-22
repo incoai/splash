@@ -59,6 +59,10 @@ def prometheus_metrics(status):
         "splash_scheduler_prefill_batches_total": ("scheduler", "prefill_batches"),
         "splash_scheduler_prefill_rows_total": ("scheduler", "prefill_rows"),
         "splash_scheduler_decode_batches_total": ("scheduler", "decode_batches"),
+        "splash_scheduler_decode_mixed_greedy_sampling_batches_total": (
+            "scheduler",
+            "decode_mixed_greedy_sampling_batches",
+        ),
         "splash_scheduler_decode_b1_total": (
             "scheduler",
             "decode_batches_by_width",

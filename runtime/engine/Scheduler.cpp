@@ -412,10 +412,19 @@ void Scheduler::commit(const BatchPlan &plan) {
     }
   } else {
     const uint64_t dispatchOrder = ++decodeDispatchOrder_;
-    for (const BatchItem &item : plan.items)
-      get(item.requestId).lastDecodeDispatch = dispatchOrder;
+    bool hasGreedy = false;
+    bool hasSampling = false;
+    for (const BatchItem &item : plan.items) {
+      Request &request = get(item.requestId);
+      request.lastDecodeDispatch = dispatchOrder;
+      const BatchCohort cohort = request.spec.cohort;
+      hasGreedy = hasGreedy || cohort == BatchCohort::Greedy;
+      hasSampling = hasSampling || cohort == BatchCohort::Sampling;
+    }
     ++counters_.decodeBatches;
     ++counters_.decodeBatchesByWidth[plan.width() - 1];
+    if (hasGreedy && hasSampling)
+      ++counters_.decodeMixedGreedySamplingBatches;
   }
 }
 

@@ -980,6 +980,7 @@ class ServerTest(unittest.TestCase):
                         "prefill_batches": 10,
                         "prefill_rows": 2048,
                         "decode_batches": 7,
+                        "decode_mixed_greedy_sampling_batches": 2,
                         "decode_batches_by_width": {
                             "b1": 1,
                             "b2": 2,
@@ -1064,6 +1065,10 @@ class ServerTest(unittest.TestCase):
         self.assertIn("splash_admission_oldest_wait_milliseconds 1250.0", metrics)
         self.assertIn("splash_scheduler_prefill_rows_total 2048", metrics)
         self.assertIn("splash_scheduler_decode_b3_total 3", metrics)
+        self.assertIn(
+            "splash_scheduler_decode_mixed_greedy_sampling_batches_total 2",
+            metrics,
+        )
         self.assertIn("splash_kv_pages_free 24", metrics)
         self.assertIn("splash_state_entries 2", metrics)
         self.assertIn("splash_state_hits_total 7", metrics)
