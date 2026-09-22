@@ -4,6 +4,7 @@
 #include "engine/KvPool.hpp"
 #include "engine/StateCache.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -25,9 +26,23 @@ struct CacheLookup final {
   }
 };
 
-struct CacheProbe final {
-  std::vector<uint64_t> blocks;
-  uint32_t cachedTokens = 0;
+class Cache;
+
+class CacheProbe final {
+public:
+  [[nodiscard]] uint32_t cachedTokens() const noexcept { return cachedTokens_; }
+
+private:
+  friend class Cache;
+
+  std::vector<uint64_t> blocks_;
+  // Only pages examined by matchedBlocks can affect this probe's result.
+  std::vector<uint32_t> checkedTokens_;
+  std::vector<ImageSpan> images_;
+  const Cache *owner_ = nullptr;
+  size_t promptSize_ = 0;
+  uint64_t kvGeneration_ = 0;
+  uint32_t cachedTokens_ = 0;
 };
 
 struct CacheLookupSnapshot final {

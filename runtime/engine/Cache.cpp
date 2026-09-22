@@ -1,5 +1,6 @@
 #include "engine/Cache.hpp"
 
+#include <algorithm>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -59,16 +60,32 @@ Cache::matchedBlocks(std::span<const uint32_t> prompt,
 
 uint32_t Cache::cachedTokens(std::span<const uint32_t> prompt,
                              std::span<const ImageSpan> images) const {
-  return probe(prompt, images).cachedTokens;
+  const auto blocks = matchedBlocks(prompt, images);
+  for (size_t i = blocks.size(); i > 0; --i)
+    if (states_.contains(blocks[i - 1]))
+      return static_cast<uint32_t>(i * KvCache::pageTokens);
+  return 0;
 }
 
 CacheProbe Cache::probe(std::span<const uint32_t> prompt,
                         std::span<const ImageSpan> images) const {
   CacheProbe result;
-  result.blocks = matchedBlocks(prompt, images);
-  for (size_t i = result.blocks.size(); i > 0; --i) {
-    if (states_.contains(result.blocks[i - 1])) {
-      result.cachedTokens = static_cast<uint32_t>(i * KvCache::pageTokens);
+  result.owner_ = this;
+  result.blocks_ = matchedBlocks(prompt, images);
+  result.kvGeneration_ = kv_.generation();
+  result.promptSize_ = prompt.size();
+  result.images_.assign(images.begin(), images.end());
+  // Include the first missed page: it may hold different tokens at lookup.
+  const size_t maximumBlocks =
+      prompt.empty() ? 0 : (prompt.size() - 1) / KvCache::pageTokens;
+  const size_t checkedBlocks =
+      std::min(maximumBlocks, result.blocks_.size() + 1);
+  if (checkedBlocks)
+    result.checkedTokens_.assign(
+        prompt.begin(), prompt.begin() + checkedBlocks * KvCache::pageTokens);
+  for (size_t i = result.blocks_.size(); i > 0; --i) {
+    if (states_.contains(result.blocks_[i - 1])) {
+      result.cachedTokens_ = static_cast<uint32_t>(i * KvCache::pageTokens);
       break;
     }
   }
@@ -80,9 +97,15 @@ CacheLookup Cache::lookup(std::span<const uint32_t> prompt,
                           const CacheProbe *probe) {
   CacheLookup result;
   const auto validProbe = [&] {
-    if (!probe)
+    if (!probe || probe->owner_ != this ||
+        probe->kvGeneration_ != kv_.generation() ||
+        probe->promptSize_ != prompt.size() ||
+        !std::equal(probe->checkedTokens_.begin(),
+                    probe->checkedTokens_.end(), prompt.begin()) ||
+        !std::equal(probe->images_.begin(), probe->images_.end(),
+                    images.begin(), images.end()))
       return false;
-    for (uint64_t block : probe->blocks)
+    for (uint64_t block : probe->blocks_)
       if (!kv_.contains(block))
         return false;
     return true;
@@ -90,7 +113,7 @@ CacheLookup Cache::lookup(std::span<const uint32_t> prompt,
   std::vector<uint64_t> fallback;
   std::span<const uint64_t> blocks;
   if (validProbe()) {
-    blocks = probe->blocks;
+    blocks = probe->blocks_;
   } else {
     fallback = matchedBlocks(prompt, images);
     blocks = fallback;
