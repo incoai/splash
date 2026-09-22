@@ -115,7 +115,6 @@ TEST_Q4_PREFILL_PROFILE := $(ENGINE_TEST_BUILD)/q4-prefill-profile
 TEST_Q4_DECODE_PROFILE := $(ENGINE_TEST_BUILD)/q4-decode-profile
 TEST_BACKEND_BENCHMARK := $(ENGINE_TEST_BUILD)/backend-benchmark
 TEST_DECODE_PROFILE := $(ENGINE_TEST_BUILD)/decode-profile
-TEST_SCORE_PREFIX := $(ENGINE_TEST_BUILD)/score-prefix
 TEST_ATTENTION_SWEEP := $(ENGINE_TEST_BUILD)/attention-sweep
 TEST_MODEL_RUNTIME_ORACLE := $(ENGINE_TEST_BUILD)/model-runtime-oracle
 TEST_VISION_ENCODER_TEST := $(ENGINE_TEST_BUILD)/vision-encoder
@@ -192,7 +191,7 @@ TEST_UNIT_TEST_TARGETS := $(sort $(TEST_CPU_TARGETS) $(TEST_METAL_TARGETS))
 # benchmarks, real-model tests and intermediate test AIRs/metallibs.
 TEST_CONFIG_TARGETS := $(filter-out $(LIB),$(TEST_UNIT_TEST_TARGETS)) \
 	$(TEST_MODEL_RUNTIME_ORACLE) $(TEST_VISION_ENCODER_TEST) \
-	$(TEST_DECODE_PROFILE) $(TEST_SCORE_PREFIX) $(TEST_ATTENTION_SWEEP) \
+	$(TEST_DECODE_PROFILE) $(TEST_ATTENTION_SWEEP) \
 	$(TEST_Q8_AIR) $(TEST_Q8_KERNEL_AIRS) $(TEST_METAL_BACKEND_AIR)
 PRODUCTION_CONFIG_TARGETS += $(TEST_Q4_PREFILL_PROFILE) \
 	$(TEST_Q4_DECODE_PROFILE) $(TEST_BACKEND_BENCHMARK) $(TUNE_KERNELS)
@@ -220,7 +219,7 @@ $(ENGINE_SANITIZER_BUILD):
 $(TEST_GGUF_FILE): dev/tests/engine/gguf_file_test.cpp runtime/model/GgufFile.cpp | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
-$(TEST_KQUANT): dev/benchmarks/kquant/harness_prod.mm dev/benchmarks/kquant/iq3s_grid.inc $(TEST_KQUANT_LIB) | $(ENGINE_TEST_BUILD)
+$(TEST_KQUANT): dev/tests/engine/kquant_projection_test.mm dev/tests/engine/iq3s_grid.inc $(TEST_KQUANT_LIB) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LINKFLAGS) -o $@
 
 $(ENGINE_TEST_BUILD)/kquant-dequant.air: dev/tests/engine/kquant_dequant_test.metal \
@@ -553,12 +552,6 @@ $(TEST_DECODE_PROFILE): dev/benchmarks/decode_profile.mm \
 		$(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
 
-$(TEST_SCORE_PREFIX): dev/benchmarks/score_prefix.mm \
-		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
-		$(ENGINE_LIBRARY) \
-		$(ENGINE_LINKFLAGS) -o $@
-
 $(TEST_ATTENTION_SWEEP): dev/benchmarks/attention_sweep.mm \
 		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
@@ -673,9 +666,6 @@ benchmark-decode: all $(TEST_Q4_DECODE_PROFILE)
 # separate dispatches; DECODE_PROFILE_ARGS passes --prompt-tokens/--cycles.
 benchmark-decode-profile: preflight $(TARGET) $(TEST_DECODE_PROFILE) $(LIB)
 	$(TEST_DECODE_PROFILE) $(LIB) $(MODEL_ROOT) $(DECODE_PROFILE_ARGS)
-benchmark-score-prefix: $(TEST_SCORE_PREFIX) $(LIB)
-	$(TEST_SCORE_PREFIX) $(LIB) $(MODEL_ROOT)
-
 
 # Attention kernels alone on one layer of synthetic Q8 history across cache
 # lengths; ATTENTION_SWEEP_ARGS passes --histories/--shapes/--lanes/--repeat.
