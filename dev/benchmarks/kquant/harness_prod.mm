@@ -183,6 +183,36 @@ int main(int argc, char **argv) { @autoreleasepool {
     if (!ggmlOracle) { std::cerr << dlerror() << "\n"; return 2; }
     printf("Checking CPU dequantization against upstream GGML\n");
   }
+  if (argc > 3 && std::string(argv[2]) == "file") {   // same-tensor GEMM comparison with another engine (see ggml_gemm_parity.cpp)
+    // <dir>/meta.txt: "<fmt> <N> <K> <rows>"; <dir>/W.native: N rows of native GGUF blocks; <dir>/X.bf16: rows x K bf16.
+    // Writes <dir>/Y_splash.f32 (production kernel output, bf16 widened), <dir>/Y_ref_native.f64 and <dir>/Y_ref_staged.f64
+    // (fp64 GEMMs over the native-dequantized and the fp16-staged weights, both with the exact bf16 inputs).
+    const std::string dir = argv[3]; char fname[16]; uint32_t N, K, rows;
+    { FILE *m = fopen((dir + "/meta.txt").c_str(), "r"); if (!m || fscanf(m, "%15s %u %u %u", fname, &N, &K, &rows) != 4) { std::cerr << "bad meta.txt\n"; return 2; } fclose(m); }
+    int fi = -1; for (int i = 0; i < FMT_COUNT; ++i) if (std::string(fmtName[i]) == fname) fi = i;
+    if (fi < 0) { std::cerr << "unknown format " << fname << "\n"; return 2; }
+    const Fmt f = (Fmt)fi; const uint32_t rb = rowBytes(f, K);
+    std::vector<uint8_t> native((size_t)N * rb); std::vector<uint16_t> x((size_t)rows * K);
+    { FILE *w = fopen((dir + "/W.native").c_str(), "rb"); if (!w || fread(native.data(), 1, native.size(), w) != native.size()) { std::cerr << "W.native short\n"; return 2; } fclose(w);
+      FILE *xf = fopen((dir + "/X.bf16").c_str(), "rb"); if (!xf || fread(x.data(), 2, x.size(), xf) != x.size()) { std::cerr << "X.bf16 short\n"; return 2; } fclose(xf); }
+    Seg s; s.fmt = f; s.interleave = kProdInterleave[f]; s.N = N; s.colOffset = 0;
+    Packed pk = repack(f, s.interleave, native, N, K, &s.Wf, &s.Ws); if (ggmlOracle) verifyNativeReference(f, native, s.Wf);
+    s.w0 = upload(pk.w0); s.w1 = upload(pk.w1); s.meta = upload(pk.meta); if (!finfo(f).p1) s.w1 = s.meta;
+    id<MTLBuffer> X = mkbuf((uint64_t)rows * K * 2); memcpy(X.contents, x.data(), x.size() * 2); id<MTLBuffer> Y = mkbuf((uint64_t)rows * N * 2);
+    char name[96]; Dispatch d; KQParams pq{N, K, rows <= 32 ? N / 64 : 0, 0, 0};
+    if (rows <= 32) { snprintf(name, sizeof name, "sga_%s_m%u_c32_sg2_k32_b2_p1", fmtName[f], rows); d = Dispatch{pso(lib, name), {X, s.w0, s.w1, s.meta, Y}, bytes(pq), 5, MTLSizeMake(N / 64, 1, 1), MTLSizeMake(64, 1, 1)}; }
+    else { snprintf(name, sizeof name, "pfa_%s_r32_sg4_n64_k64_p1", fmtName[f]); d = Dispatch{pso(lib, name), {X, s.w0, s.w1, s.meta, Y}, bytes(pq), 5, MTLSizeMake(rows / 128, N / 64, 1), MTLSizeMake(128, 1, 1)}; }
+    if (!d.p) { std::cerr << "no pipeline " << name << "\n"; return 2; }
+    runOnce({d}, 1);
+    std::vector<float> y((size_t)rows * N); const uint16_t *yb = (const uint16_t *)Y.contents; for (size_t i = 0; i < y.size(); ++i) y[i] = bf2f(yb[i]);
+    std::vector<double> rn((size_t)rows * N), rs((size_t)rows * N);
+    for (uint32_t r = 0; r < rows; ++r) for (uint32_t n = 0; n < N; ++n) { double a = 0, b = 0; for (uint32_t k = 0; k < K; ++k) { const double xv = bf2f(x[(size_t)r * K + k]); a += xv * s.Wf[(size_t)n * K + k]; b += xv * s.Ws[(size_t)n * K + k]; } rn[(size_t)r * N + n] = a; rs[(size_t)r * N + n] = b; }
+    auto dump = [&](const char *nm, const void *p, size_t bytesN) { FILE *o = fopen((dir + "/" + nm).c_str(), "wb"); fwrite(p, 1, bytesN, o); fclose(o); };
+    dump("Y_splash.f32", y.data(), y.size() * 4); dump("Y_ref_native.f64", rn.data(), rn.size() * 8); dump("Y_ref_staged.f64", rs.data(), rs.size() * 8);
+    double maxabs = 0, sumrel = 0; for (size_t i = 0; i < y.size(); ++i) { maxabs = std::max(maxabs, std::fabs(y[i] - rn[i])); sumrel += std::fabs(y[i] - rn[i]) / (std::fabs(rn[i]) + 1e-3); }
+    printf("file mode: %s N=%u K=%u rows=%u kernel %s: max abs err vs native fp64 %.4g, mean rel err %.3e\n", fname, N, K, rows, name, maxabs, sumrel / y.size());
+    return 0;
+  }
   if (argc > 2 && std::string(argv[2]) == "dequant") {
     int failures = 0;
     for (int fi = 0; fi < FMT_COUNT; ++fi) {
