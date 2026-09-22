@@ -33,6 +33,7 @@ STAGES = (
     "preparation",
     "template",
     "tokenization",
+    "grammar",
     "images",
     "native_queue",
     "ttft",

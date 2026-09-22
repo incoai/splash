@@ -74,13 +74,25 @@ Transformers checkpoints do not work. Private repositories need `HF_TOKEN`.
 Packages download into the Hugging Face cache, and `brew upgrade splash` keeps
 them, along with model links and agent sessions.
 
+For LM Studio Bionic, follow its [Splash setup guide](https://lmstudio.ai/blog/splash-engine):
+install the Splash runtime, then paste the full Hugging Face model link into its
+model search. These integrations manage their own runtime and settings.
+
+If a client’s model catalog does not list a package, the full repository ID in
+this table still works with `splash serve --model OWNER/REPO`. The browser chat
+and the agent launchers connect to that server without a catalog search.
+
 For a custom model download location, see [model cache](DEVELOPMENT.md#model-cache).
 
 ## Settings
 
 There is no config file. The server binds `127.0.0.1:8000` by default.
 Context supports up to the model’s native 256K window; usable capacity
-depends on available memory.
+depends on available memory. `splash serve --help` lists server options and examples.
+The startup summary and the `maximum_context_tokens` field in `/status` show
+the effective server limit; clients can impose a smaller one. With enough memory,
+request the full window using `--max-context 256K`. This is a capacity limit, not a guarantee
+that a long uncached prompt will reach its first token quickly.
 
 `splash serve` accepts these optional flags:
 
@@ -123,6 +135,8 @@ Splash led on every measure at every prompt length we tested, and the lead
 grows with load: 3.8× at four concurrent 32K requests on the 35B. The
 [launch post](https://inco.ai/blog/splash/) has the method and the full
 comparison against oMLX, Lily, uzu, and Ollama.
+
+For repeatable measurements on your Mac, see [local benchmarks](DEVELOPMENT.md#local-benchmarks).
 
 ## Design
 

@@ -76,6 +76,25 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(args.max_memory, 28 * 1024**3)
         self.assertEqual(args.max_context, 102400)
 
+    def test_image_budget_fails_before_installation(self):
+        for value in ("-1", "0", "65535", "4194305", "invalid"):
+            with (
+                self.subTest(value=value),
+                mock.patch.object(launcher, "_ensure_installed") as install,
+                mock.patch("sys.stderr", io.StringIO()),
+                self.assertRaises(SystemExit) as failed,
+            ):
+                launcher.main(
+                    ["serve", "--model", MODEL_ID, "--max-image-pixels", value]
+                )
+            self.assertEqual(failed.exception.code, 2)
+            install.assert_not_called()
+        for value in (65_536, 4_194_304):
+            args = launcher.parse_args(
+                ["serve", "--model", MODEL_ID, "--max-image-pixels", str(value)]
+            )
+            self.assertEqual(args.max_image_pixels, value)
+
     def test_size_validation(self):
         for value in ("1G", "1GB", "1GiB", "1073741824"):
             self.assertEqual(launcher._parse_max_memory(value), 1024**3)

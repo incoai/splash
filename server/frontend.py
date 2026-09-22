@@ -898,17 +898,20 @@ class Frontend:
         image_positions, thinking = rendered.image_positions, rendered.thinking
         constraint = None
         remaining_request_time(deadline)
-        if self.constraint_factory is not None:
-            if tools:
-                constraint = self.constraint_factory.create(
-                    tool_grammar(tool_policy, thinking, response_schema),
-                    timeout=remaining_request_time(deadline),
-                )
-            elif response_schema is not None:
-                constraint = self.constraint_factory.create(
-                    json_grammar(response_schema, thinking),
-                    timeout=remaining_request_time(deadline),
-                )
+        if self.constraint_factory is not None and (
+            tools or response_schema is not None
+        ):
+            with self.latencies.measure("grammar"):
+                if tools:
+                    constraint = self.constraint_factory.create(
+                        tool_grammar(tool_policy, thinking, response_schema),
+                        timeout=remaining_request_time(deadline),
+                    )
+                elif response_schema is not None:
+                    constraint = self.constraint_factory.create(
+                        json_grammar(response_schema, thinking),
+                        timeout=remaining_request_time(deadline),
+                    )
         remaining_request_time(deadline)
         tools_signature = None
         if tools:

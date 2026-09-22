@@ -167,6 +167,26 @@ class PromptToolsTests(unittest.TestCase):
         self.assertNotIn("<think>", rendered)
         self.assertNotIn("<|im_start|>assistant\n", rendered)
 
+    def test_grammar_timing_is_separate_and_records_failed_preparation(self):
+        app = self.harness.app
+        app.constraint_factory = mock.Mock()
+        app.constraint_factory.create.return_value = None
+        body = {
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{"type": "function", "function": {"name": "note"}}],
+        }
+        for _ in range(2):
+            app.prepare(body)
+        self.assertEqual(app.latencies.snapshot()["grammar"]["count"], 2)
+        app.prepare({"messages": body["messages"]})
+        self.assertEqual(app.latencies.snapshot()["grammar"]["count"], 2)
+        app.constraint_factory.create.side_effect = ValueError("compile failed")
+        with self.assertRaisesRegex(ValueError, "compile failed"):
+            app.prepare(body)
+        sample = app.latencies.snapshot()["grammar"]
+        self.assertEqual(sample["count"], 3)
+        self.assertGreaterEqual(sample["sum"], 0)
+
     def test_input_validation_and_template_errors(self):
         for body in (
             {},

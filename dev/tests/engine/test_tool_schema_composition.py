@@ -5,7 +5,7 @@ import unittest
 from llguidance import LLMatcher
 
 from dev.tests.engine import test_structured_tools as structured
-from server import output, tool_schema
+from server import api_shapes, output, tool_schema
 from server.errors import APIError
 
 
@@ -59,6 +59,45 @@ class ToolSchemaCompositionTests(unittest.TestCase):
         with self.assertRaises(APIError):
             output.validate_tool_calls(calls, policy)
         return policy, xml
+
+    def test_note_content_survives_protocol_conversion_and_streaming(self):
+        schema = {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "content": {"type": "string", "description": "Optional note body"},
+            },
+            "required": ["name"],
+            "additionalProperties": False,
+        }
+        function = {"name": "test", "parameters": schema}
+        chat = {"tools": [{"type": "function", "function": function}]}
+        responses = api_shapes.responses_to_chat_body(
+            {
+                "input": "Create a note",
+                "tools": [{"type": "function", **function}],
+            }
+        )
+        messages = api_shapes.anthropic_to_chat_body(
+            {
+                "model": "test",
+                "max_tokens": 128,
+                "messages": [{"role": "user", "content": "Create a note"}],
+                "tools": [{"name": "test", "input_schema": schema}],
+            }
+        )
+        for body in (chat, responses, messages):
+            with self.subTest(body=body):
+                converted = body["tools"][0]["function"]["parameters"]
+                self.assertEqual(converted, schema)
+                self.check_arguments(
+                    converted,
+                    {"name": "Release", "content": '第一行\n"quoted"\nliteral \\n'},
+                    {"content": "missing required name"},
+                )
+                # Optional means optional: folder/group creation must not be
+                # forced to invent a note body by the transport or grammar.
+                self.check_arguments(converted, {"name": "Folder"}, {})
 
     def test_cyclic_alternatives_fail_without_recursing(self):
         for keyword in ("anyOf", "oneOf"):

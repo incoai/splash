@@ -331,6 +331,18 @@ def _parse_served_model_name(value):
     return value
 
 
+def _parse_max_image_pixels(value):
+    try:
+        pixels = int(value)
+    except ValueError:
+        pixels = 0
+    # Match the server's supported image budget without importing its runtime
+    # dependencies before help, argument validation or first-time installation.
+    if not 65_536 <= pixels <= 4_194_304:
+        raise argparse.ArgumentTypeError("must be between 65536 and 4194304 pixels")
+    return pixels
+
+
 def parse_args(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     client_args = []
@@ -341,10 +353,34 @@ def parse_args(argv=None):
     elif "--" in argv:
         boundary = argv.index("--")
         argv, client_args = argv[:boundary], argv[boundary + 1 :]
-    parser = argparse.ArgumentParser(prog="splash", description=__doc__)
+    parser = argparse.ArgumentParser(
+        prog="splash",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Quick start:\n"
+            "  splash serve --model incoai/Qwen3.8-27B-Splash\n"
+            "  splash opencode  # in another terminal, after Ready\n\n"
+            "Use splash serve --help for server settings. Client arguments,\n"
+            "including --help, are passed through to the installed agent."
+        ),
+    )
     parser.add_argument("--version", action="version", version=_version())
     commands = parser.add_subparsers(dest="command", required=True)
-    server = commands.add_parser("serve", help="run the local server; Ctrl+C stops it")
+    server = commands.add_parser(
+        "serve",
+        help="run the local server; Ctrl+C stops it",
+        description="Download a Splash model package if needed, then serve in the foreground.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  splash serve --model incoai/Qwen3.8-27B-Splash\n"
+            "  splash serve --model incoai/Qwen3.6-35B-A3B-Splash --max-context 128K\n\n"
+            "After Ready, open http://127.0.0.1:8000 or connect an installed agent.\n"
+            "The startup summary and /status report the effective context limit.\n"
+            "A client may impose a smaller limit. Keep this terminal open; Ctrl+C stops serving."
+        ),
+    )
     server.add_argument(
         "--host",
         default="127.0.0.1",
@@ -384,7 +420,7 @@ def parse_args(argv=None):
     server.add_argument(
         "--max-context",
         type=_parse_max_context,
-        help="context limit, e.g. 100K (default: auto)",
+        help="context token limit, up to 256K (K = 1024; default: auto within the memory budget)",
     )
     server.add_argument(
         "--allowed-host",
@@ -401,7 +437,9 @@ def parse_args(argv=None):
         "shared input budget is max(512M, twice this limit)",
     )
     server.add_argument(
-        "--max-image-pixels", type=int, help="maximum resized pixels per image"
+        "--max-image-pixels",
+        type=_parse_max_image_pixels,
+        help="maximum resized pixels per image, 65536–4194304 (default: 4194304)",
     )
     server.add_argument(
         "--api-key",

@@ -202,8 +202,8 @@ include usage. A proxy must consume these fields to display statistics.
 `/metrics` also exports fixed latency histograms in seconds, with a bounded
 set of stages in `/status.latency`. HTTP duration includes body upload and
 response writing for admitted API requests. Preparation, queue, template,
-tokenization and image preparation are measured separately; preparation includes
-its nested stages. Tokenization covers the encoding call, including reuse when
+tokenization, output grammar preparation and image preparation are measured
+separately; preparation includes its nested stages. Tokenization covers the encoding call, including reuse when
 available. Histogram buckets are cumulative and labeled by upper bound.
 TTFT starts before upload and ends at the first native token
 event. Output intervals are between native token events, which can contain
@@ -355,6 +355,47 @@ real HTTP/client behavior and performance checks.
 Compare performance on the same idle Mac with the same model and workload.
 `make tune-kernels MODEL=...` measures kernel policies. Keep generated reports,
 profiles, local paths and experiment notes out of the source tree and commits.
+
+### Local benchmarks
+
+From a source checkout with the model installed, use the existing native
+benchmark for prefill, decode and batch measurements:
+
+```sh
+make test-performance-real MODEL=incoai/Qwen3.8-27B-Splash
+```
+
+It writes `build/release/backend-benchmark.json`. Repeat with the 35B package
+for that model. This characterizes one build; it is not a comparison with
+another engine or a test of agent task quality.
+
+For a same-machine HTTP regression check, retain the previous `splash` binary
+**and its adjacent `splash.metallib`**, then run from the candidate checkout:
+
+```sh
+.venv/bin/python -m dev.benchmarks.http_regression \
+  --model incoai/Qwen3.8-27B-Splash \
+  --baseline-binary /path/to/baseline/build/splash \
+  --contexts 2048,10000 --samples 5
+```
+
+This starts isolated servers in alternating order, compares matched cold,
+exact-prefix and decode requests, and saves `build/release/http-regression.json`.
+It does not contact your running server. Use the same power mode and charger,
+stop other GPU workloads, and report chip/GPU cores, memory, Splash version,
+model revision, actual input/output token counts, and cache hits with results.
+Keep cold prefill, cached TTFT and sustained decode separate; a UI token rate
+alone does not measure end-to-end agent performance.
+
+For slow tool-bearing requests, the `latency` section of `/status` separates
+preparation, tokenization, grammar preparation, native queueing and TTFT. Grammar preparation
+includes construction, compilation/cache lookup and per-request cloning;
+it does not include generation-time masks. The `grammar_cache` counters show
+whether compiled output grammars are reused. Tool definitions still contribute
+tokens to the prompt; saving their JSON alone cannot avoid model prefill.
+Existing exact-prefix caching reuses model work while the server remains alive.
+Server restarts require recomputation until persistent model-state caching is
+available; see the separate [SSD cache proposal](https://github.com/incoai/splash/pull/3).
 
 ## Package
 
