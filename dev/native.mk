@@ -1,6 +1,7 @@
 ENGINE_TEST_BUILD := $(BUILD)/engine-tests
 ENGINE_TEST_CXXFLAGS := -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev \
-	$(MACOS_TARGET_FLAG)
+	$(MACOS_TARGET_FLAG) \
+	$(filter -DSPLASH_INT8_EXPERIMENT% -DSPLASH_METAL41_EXPERIMENT% -USPLASH_INT8_EXPERIMENT -USPLASH_METAL41_EXPERIMENT,$(ENGINE_CXXFLAGS))
 # Test kernels compile like production ones without the release optimizer.
 TEST_METALFLAGS := $(filter-out -O3,$(PROD_METALFLAGS))
 # Include the shared tools and production flags: some tests also link the
@@ -10,7 +11,8 @@ TEST_CONFIG_DIGEST := $(shell printf '%s\0' $(CONFIG_DIGEST) \
 	$(call shell-quote,$(TEST_METALFLAGS)) | shasum -a 256 | cut -c1-16)
 ENGINE_SANITIZER_BUILD := $(BUILD)/sanitizers
 ENGINE_SANITIZER_CXXFLAGS := -std=c++20 -O1 -g -fno-omit-frame-pointer \
-	-Wall -Wextra -Werror -Iruntime -Idev $(MACOS_TARGET_FLAG)
+	-Wall -Wextra -Werror -Iruntime -Idev $(MACOS_TARGET_FLAG) \
+	$(filter -DSPLASH_INT8_EXPERIMENT% -DSPLASH_METAL41_EXPERIMENT% -USPLASH_INT8_EXPERIMENT -USPLASH_METAL41_EXPERIMENT,$(ENGINE_CXXFLAGS))
 SANITIZER_CONFIG_DIGEST := $(shell printf '%s\0' $(CONFIG_DIGEST) \
 	$(call shell-quote,$(ENGINE_SANITIZER_CXXFLAGS)) \
 	| shasum -a 256 | cut -c1-16)
@@ -109,6 +111,9 @@ TEST_Q4_PREFILL_PROFILE := $(ENGINE_TEST_BUILD)/q4-prefill-profile
 TEST_Q4_DECODE_PROFILE := $(ENGINE_TEST_BUILD)/q4-decode-profile
 TEST_BACKEND_BENCHMARK := $(ENGINE_TEST_BUILD)/backend-benchmark
 TEST_DECODE_PROFILE := $(ENGINE_TEST_BUILD)/decode-profile
+TEST_PREFILL_TRACE := $(ENGINE_TEST_BUILD)/prefill-trace
+TEST_PRECONVERT_WEIGHTS := $(ENGINE_TEST_BUILD)/preconvert-weights
+TEST_PRECONVERTED_INT8 := $(ENGINE_TEST_BUILD)/preconverted-int8
 TEST_ATTENTION_SWEEP := $(ENGINE_TEST_BUILD)/attention-sweep
 TEST_MODEL_RUNTIME_ORACLE := $(ENGINE_TEST_BUILD)/model-runtime-oracle
 TEST_VISION_ENCODER_TEST := $(ENGINE_TEST_BUILD)/vision-encoder
@@ -127,6 +132,7 @@ TEST_METAL_BACKEND_AIR := $(ENGINE_TEST_BUILD)/metal-backend.air
 TEST_METAL_BACKEND_LIB := $(ENGINE_TEST_BUILD)/metal-backend.metallib
 
 TEST_CPU_TARGETS := $(TEST_OPERATOR_WORKSPACE) \
+	$(TEST_PRECONVERTED_INT8) \
 	$(TEST_DEVICE_QUERIES) \
 	$(TEST_TUNING_WORKLOADS) \
 	$(TEST_LINEAR_PLAN) $(TEST_LINEAR_TUNING) $(TEST_ATTENTION_TUNING) \
@@ -183,7 +189,7 @@ TEST_UNIT_TEST_TARGETS := $(sort $(TEST_CPU_TARGETS) $(TEST_METAL_TARGETS))
 # benchmarks, real-model tests and intermediate test AIRs/metallibs.
 TEST_CONFIG_TARGETS := $(filter-out $(LIB),$(TEST_UNIT_TEST_TARGETS)) \
 	$(TEST_MODEL_RUNTIME_ORACLE) $(TEST_VISION_ENCODER_TEST) \
-	$(TEST_DECODE_PROFILE) $(TEST_ATTENTION_SWEEP) \
+	$(TEST_DECODE_PROFILE) $(TEST_PREFILL_TRACE) $(TEST_PRECONVERT_WEIGHTS) $(TEST_ATTENTION_SWEEP) \
 	$(TEST_Q8_AIR) $(TEST_Q8_KERNEL_AIRS) $(TEST_METAL_BACKEND_AIR)
 PRODUCTION_CONFIG_TARGETS += $(TEST_Q4_PREFILL_PROFILE) \
 	$(TEST_Q4_DECODE_PROFILE) $(TEST_BACKEND_BENCHMARK) $(TUNE_KERNELS)
@@ -531,6 +537,24 @@ $(TEST_DECODE_PROFILE): dev/benchmarks/decode_profile.mm \
 		$(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
 
+$(TEST_PREFILL_TRACE): dev/benchmarks/prefill_trace.mm \
+		runtime/metal/ProfilingJson.hpp \
+		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
+		$(ENGINE_LIBRARY) \
+		$(ENGINE_LINKFLAGS) -o $@
+
+$(TEST_PRECONVERT_WEIGHTS): dev/benchmarks/preconvert_weights.mm \
+		runtime/model/PreconvertedINT8.hpp \
+		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
+		$(ENGINE_LIBRARY) \
+		$(ENGINE_LINKFLAGS) -o $@
+
+$(TEST_PRECONVERTED_INT8): dev/tests/engine/preconverted_int8_test.cpp \
+		runtime/model/PreconvertedINT8.hpp | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $< -o $@
+
 $(TEST_ATTENTION_SWEEP): dev/benchmarks/attention_sweep.mm \
 		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
@@ -559,6 +583,7 @@ METAL_TEST_ENV := MTL_SHADER_VALIDATION=1
 test-engine: test-engine-cpu test-engine-metal
 
 test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TUNE_KERNELS)
+	$(TEST_PRECONVERTED_INT8)
 	$(TEST_DEVICE_QUERIES)
 	$(TEST_TUNING_WORKLOADS)
 	$(TEST_LINEAR_PLAN) --cpu
@@ -631,7 +656,7 @@ test-real: preflight $(TARGET) $(TEST_MODEL_RUNTIME_ORACLE) \
 	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) $(MODEL_ROOT)
 
 .PHONY: benchmark-prefill benchmark-decode benchmark-backend \
-	benchmark-decode-profile benchmark-attention-sweep
+	benchmark-decode-profile benchmark-prefill-trace benchmark-attention-sweep
 benchmark-prefill: all $(TEST_Q4_PREFILL_PROFILE)
 	$(TEST_Q4_PREFILL_PROFILE) $(LIB)
 
@@ -642,6 +667,12 @@ benchmark-decode: all $(TEST_Q4_DECODE_PROFILE)
 # separate dispatches; DECODE_PROFILE_ARGS passes --prompt-tokens/--cycles.
 benchmark-decode-profile: preflight $(TARGET) $(TEST_DECODE_PROFILE) $(LIB)
 	$(TEST_DECODE_PROFILE) $(LIB) $(MODEL_ROOT) $(DECODE_PROFILE_ARGS)
+
+# Surround optional tracing with ordinary fused-command controls. Stage mode
+# is explicit because it adds compute-encoder boundaries between kernels.
+benchmark-prefill-trace: preflight $(TARGET) $(TEST_PREFILL_TRACE) $(LIB)
+	$(TEST_PREFILL_TRACE) $(LIB) $(MODEL_ROOT) \
+		--output $(BUILD)/prefill-trace.json $(PREFILL_TRACE_ARGS)
 
 # Attention kernels alone on one layer of synthetic Q8 history across cache
 # lengths; ATTENTION_SWEEP_ARGS passes --histories/--shapes/--lanes/--repeat.

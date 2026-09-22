@@ -14,6 +14,9 @@ REQUIREMENTS := install/requirements.txt
 PYTHON_CANDIDATES := python3.13 python3 python3.12 python3.14
 BUILD_ID_PYTHON ?= python3
 SPLASH_MAKEFILE := $(abspath $(firstword $(MAKEFILE_LIST)))
+# Optional machine preference; command-line assignments still take precedence.
+-include $(dir $(SPLASH_MAKEFILE))/.splash-build.mk
+SPLASH_PRECISION ?= q4
 MODEL_INSTALL = $(PYTHON) install/models.py
 MODEL ?=
 MODEL_ROOT := install/models/$(MODEL)
@@ -39,11 +42,20 @@ KERNEL_HEADERS := $(sort $(wildcard runtime/metal/abi/*.h \
 # (MTLDevice.supportsPlacementSparse). The engine refuses older systems at
 # startup; every binary and metallib records the same floor.
 MACOS_MIN_VERSION := 26.4
+METAL_LANGUAGE_VERSION := metal4.0
+PRECISION_FLAGS :=
+ifeq ($(SPLASH_PRECISION),hybrid)
+MACOS_MIN_VERSION := 27.0
+METAL_LANGUAGE_VERSION := metal4.1
+PRECISION_FLAGS := -DSPLASH_INT8_EXPERIMENT=1
+else ifneq ($(SPLASH_PRECISION),q4)
+$(error SPLASH_PRECISION must be q4 or hybrid)
+endif
 MACOS_TARGET_FLAG := -mmacosx-version-min=$(MACOS_MIN_VERSION)
-PROD_METALFLAGS := -std=metal4.0 -O3 -Wall -Wextra -Werror -Iruntime \
-	$(MACOS_TARGET_FLAG)
+PROD_METALFLAGS := -std=$(METAL_LANGUAGE_VERSION) -O3 -Wall -Wextra -Werror -Iruntime \
+	$(MACOS_TARGET_FLAG) $(PRECISION_FLAGS)
 ENGINE_CXXFLAGS := -std=c++20 -O3 -Wall -Wextra -Werror -Iruntime \
-	$(MACOS_TARGET_FLAG)
+	$(MACOS_TARGET_FLAG) $(PRECISION_FLAGS)
 ENGINE_OBJCXXFLAGS := $(ENGINE_CXXFLAGS) -fobjc-arc
 LIB := $(BUILD)/splash.metallib
 .PHONY: all clean force-build-identity install _install \

@@ -2,8 +2,11 @@ build/
 .venv
 .venv.install.lock
 install/models/
+install/preconverted/
+install/local-models/
 .DS_Store
 __pycache__/
 .ruff_cache/
 dist/
 install/download-token
+.splash-build.mk

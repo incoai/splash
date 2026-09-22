@@ -32,6 +32,7 @@ HTTP_SMOKE_ARGS ?=
 
 # Define native targets before aggregate prerequisites expand.
 -include dev/native.mk
+-include dev/flash.mk
 
 .PHONY: agent-preflight architecture-check check check-source \
 	check-native-engine check-native-cpu check-native-metal check-python-engine \

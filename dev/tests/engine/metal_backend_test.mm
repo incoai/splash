@@ -641,6 +641,292 @@ void sharedMemoryCompletionLifetime(MetalBackend &backend) {
             "external memory leaked after Metal released its buffer");
 }
 
+void weightResidencyLeaseTests(const std::string &metallibPath) {
+    MetalBackend backend(metallibPath);
+    if (backend.capabilities().appleGpuFamily < 6) {
+        std::cout << "SKIP weight residency lease: Apple6 residency sets unavailable\n";
+        return;
+    }
+    struct Gate {
+        std::mutex mutex;
+        std::condition_variable condition;
+        bool entered = false;
+        bool release = false;
+    };
+    auto gate = std::make_shared<Gate>();
+    std::weak_ptr<void> ownershipWitness;
+    constexpr uint32_t count = 64, increment = 9;
+    {
+        @autoreleasepool {
+            const size_t bytes = static_cast<size_t>(getpagesize());
+            void *address = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANON, -1, 0);
+            require(address != MAP_FAILED, "unable to allocate residency lease input");
+            auto owner = std::shared_ptr<void>(address, [bytes](void *memory) {
+                munmap(memory, bytes);
+            });
+            ownershipWitness = owner;
+            const uint64_t allocatedBefore = backend.memoryStats().allocatedBytes;
+            auto input = backend.wrapSharedMemory(address, bytes, owner);
+            owner.reset();
+            auto *inputValues = static_cast<uint32_t *>(input.contents());
+            for (uint32_t i = 0; i < count; ++i)
+                inputValues[i] = i + increment;
+            const uint64_t allocatedAfterInput = backend.memoryStats().allocatedBytes;
+            require(allocatedAfterInput >= allocatedBefore,
+                    "residency input allocation accounting regressed");
+            const uint64_t expectedLeaseBytes = allocatedAfterInput - allocatedBefore;
+            auto firstView = backend.view(input, 0, count / 2 * sizeof(uint32_t));
+            auto secondView = backend.view(input, count / 2 * sizeof(uint32_t),
+                                           count / 2 * sizeof(uint32_t));
+            std::array<MetalBuffer, 4> weights{firstView, secondView, input, firstView};
+            auto lease = backend.requestWeightResidency(weights, "test immutable weight base");
+            require(lease && lease.bufferCount() == 1 &&
+                        lease.byteCount() == expectedLeaseBytes,
+                    "weight residency lease counted views instead of their unique ledger base");
+            require(backend.memoryStats().allocatedBytes == allocatedAfterInput,
+                    "weight residency lease charged a second weight allocation");
+            auto movedLease = std::move(lease);
+            require(!lease && movedLease && movedLease.bufferCount() == 1 &&
+                        movedLease.byteCount() == expectedLeaseBytes,
+                    "moving a residency lease lost its ownership or accounting");
+            weights = {};
+            firstView = {};
+            secondView = {};
+            auto scratch = backend.allocateBuffer(count * sizeof(uint32_t));
+            auto output = backend.allocateBuffer(count * sizeof(uint32_t));
+            std::fill_n(static_cast<uint32_t *>(scratch.contents()), count, 0);
+            auto *outputValues = static_cast<uint32_t *>(output.contents());
+            for (uint32_t i = 0; i < count; ++i)
+                outputValues[i] = 0;
+            std::array<ComputeDispatch, 2> dispatches{
+                ComputeDispatch{"test_copy_u32", {{0, input}, {1, scratch}},
+                    {{2, &count, sizeof(count)}}, {1, 1, 1}, {count, 1, 1}},
+                ComputeDispatch{"test_copy_u32", {{0, scratch}, {1, output}},
+                    {{2, &count, sizeof(count)}}, {1, 1, 1}, {count, 1, 1}}};
+            const uint64_t submissionsBefore = backend.submissionCount();
+            auto ticket = backend.submitCommandAsync(dispatches, [gate](uint64_t) {
+                std::unique_lock lock(gate->mutex);
+                gate->entered = true;
+                gate->condition.notify_all();
+                gate->condition.wait_for(lock, std::chrono::seconds(5),
+                                        [&] { return gate->release; });
+            });
+            dispatches = {};
+            input = {};
+            scratch = {};
+            movedLease = splash::metal::ResidencyLease{};
+            require(!ownershipWitness.expired(),
+                    "destroying a caller residency lease released an active mapping");
+            const std::array<MetalBuffer, 1> anotherWeight{output};
+            try {
+                (void)backend.requestWeightResidency(anotherWeight, "active ticket");
+                fail("another weight residency lease was accepted with an outstanding ticket");
+            } catch (const MetalBackendError &error) {
+                require(std::string(error.what()).find("no outstanding command ticket") !=
+                            std::string::npos,
+                        "active-ticket residency rejection was masked by another guard");
+            }
+            {
+                std::unique_lock lock(gate->mutex);
+                require(gate->condition.wait_for(lock, std::chrono::seconds(5),
+                                                 [&] { return gate->entered; }),
+                        "residency lease command completion did not arrive");
+            }
+            backend.stop();
+            require(!ownershipWitness.expired(),
+                    "backend stop released weights before ticket consumption");
+            (void)ticket.wait();
+            require(backend.submissionCount() == submissionsBefore + 1,
+                    "weight residency changed a two-dispatch command into multiple submissions");
+            for (uint32_t i = 0; i < count; ++i)
+                require(outputValues[i] == i + increment,
+                        "residency lease changed the command output or mapping lifetime");
+            {
+                std::lock_guard lock(gate->mutex);
+                gate->release = true;
+            }
+            gate->condition.notify_all();
+        }
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!ownershipWitness.expired() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    require(ownershipWitness.expired(),
+            "stopped residency registration leaked its no-copy mapping after command release");
+    std::cout << "weight_residency_lease=PASS\n";
+}
+
+void commandDispatchProfilingTests(const std::string &metallibPath) {
+    using Mode = splash::metal::CommandDispatchProfilingMode;
+    using Status = splash::metal::CommandDispatchProfileStatus;
+    MetalBackend backend(metallibPath);
+    const auto capability = backend.commandDispatchProfilingCapability();
+    require(capability.supports(Mode::Off) && capability.supports(Mode::Command),
+            "normal command profiling unexpectedly requires GPU counters");
+    require(backend.takeCommandDispatchProfiles().empty(),
+            "new backend already contains command profiles");
+
+    constexpr uint32_t count = 64, increment = 7;
+    const auto runCommand = [&](Mode mode, bool dropCallerReferences = false)
+        -> std::optional<splash::metal::CommandDispatchProfile> {
+        if (mode != Mode::Off)
+            backend.setCommandDispatchProfiling(mode);
+        const size_t bytes = static_cast<size_t>(getpagesize());
+        void *address = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANON, -1, 0);
+        require(address != MAP_FAILED, "unable to allocate profiling input");
+        auto owner = std::shared_ptr<void>(address, [bytes](void *memory) {
+            munmap(memory, bytes);
+        });
+        const std::weak_ptr<void> ownershipWitness = owner;
+        auto input = backend.wrapSharedMemory(address, bytes, owner);
+        owner.reset();
+        auto output = backend.allocateBuffer(count * sizeof(uint32_t));
+        auto *inputValues = static_cast<uint32_t *>(input.contents());
+        auto *outputValues = static_cast<uint32_t *>(output.contents());
+        for (uint32_t i = 0; i < count; ++i) {
+            inputValues[i] = i;
+            outputValues[i] = 0;
+        }
+        std::array<ComputeDispatch, 2> dispatches{
+            ComputeDispatch{"test_add_u32", {{0, input}},
+                {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
+                {1, 1, 1}, {count, 1, 1}},
+            ComputeDispatch{"test_copy_u32", {{0, input}, {1, output}},
+                {{2, &count, sizeof(count)}}, {1, 1, 1}, {count, 1, 1}}};
+        const ComputeDispatch rejected{"test_add_u32", {{0, output}},
+            {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
+            {1, 1, 1}, {count, 1, 1}};
+        const uint64_t submissionsBefore = backend.submissionCount();
+        std::promise<uint64_t> notification;
+        auto notified = notification.get_future();
+        auto ticket = backend.submitCommandAsync(
+            dispatches, [&](uint64_t sequence) { notification.set_value(sequence); });
+        require(ticket && ticket.sequence() > 0,
+                "profiled command did not return an async ticket");
+        if (dropCallerReferences) {
+            dispatches = {};
+            input = {};
+            require(!ownershipWitness.expired(),
+                    "profiled ticket did not retain its input after caller release");
+            requireBackendError([&] { (void)backend.submitAsync(rejected); },
+                                "profiled ticket allowed a second outstanding command");
+            requireBackendError([&] { backend.setCommandDispatchProfiling(Mode::Off); },
+                                "profiling mode changed before its ticket was applied");
+            requireBackendError([&] { backend.setDispatchProfiling(true); },
+                                "legacy profiling changed with an outstanding ticket");
+        }
+        const auto timing = ticket.wait();
+        require(ticket.ready() && std::isfinite(timing.gpuSeconds) &&
+                    timing.gpuSeconds >= 0.0 && std::isfinite(timing.wallSeconds) &&
+                    timing.wallSeconds > 0.0,
+                "profiled command returned invalid completion timing");
+        require(notified.wait_for(std::chrono::seconds(5)) == std::future_status::ready &&
+                    notified.get() == ticket.sequence(),
+                "profiled command completion notification was not delivered");
+        require(backend.submissionCount() == submissionsBefore + 1,
+                "two profiled dispatches used more than one command submission");
+        for (uint32_t i = 0; i < count; ++i)
+            require(outputValues[i] == i + increment,
+                    "profiling changed dependent dispatch output or resource lifetime");
+        auto profiles = backend.takeCommandDispatchProfiles();
+        require(backend.takeCommandDispatchProfiles().empty(),
+                "taking command profiles did not consume them");
+        if (mode == Mode::Off) {
+            require(profiles.empty(), "default-off execution emitted a command profile");
+            return std::nullopt;
+        }
+        require(profiles.size() == 1 && profiles[0].sequence == ticket.sequence() &&
+                    profiles[0].mode == mode && profiles[0].dispatchCount == 2 &&
+                    !profiles[0].dispatchMetadataTruncated &&
+                    profiles[0].dispatches.size() == 2,
+                "command profile lost its sequence, requested mode or dispatch count");
+        const auto &profile = profiles.front();
+        require(profile.hostSubmissionStartSeconds > 0.0 &&
+                    profile.hostEncodingStartSeconds >= profile.hostSubmissionStartSeconds &&
+                    profile.hostEncodingEndSeconds >= profile.hostEncodingStartSeconds &&
+                    profile.hostCompletedSeconds >= profile.hostEncodingEndSeconds &&
+                    profile.hostReadySeconds >= profile.hostCompletedSeconds &&
+                    std::isfinite(profile.hostPreparationSeconds) &&
+                    profile.hostPreparationSeconds >= 0.0 &&
+                    std::isfinite(profile.hostEncodingSeconds) &&
+                    profile.hostEncodingSeconds >= 0.0,
+                "command profile omitted or misordered its host timing milestones");
+        require(profiles[0].dispatches[0].pipelineName == "test_add_u32" &&
+                    profiles[0].dispatches[1].pipelineName == "test_copy_u32" &&
+                    profiles[0].dispatches[0].index == 0 &&
+                    profiles[0].dispatches[1].index == 1,
+                "command profile did not retain copied dispatch metadata");
+        require(backend.healthy(), "optional profiling poisoned normal execution");
+        return std::move(profiles.front());
+    };
+
+    (void)runCommand(Mode::Off);
+    const auto command = runCommand(Mode::Command, true);
+    require(command && command->status == Status::Complete &&
+                !command->encoderBoundariesAltered && !command->samplingBarriers &&
+                std::isfinite(command->commandGpuStartSeconds) &&
+                command->commandGpuEndSeconds >= command->commandGpuStartSeconds,
+            "normal fused Command mode changed encoding or lacked command timing");
+    for (const auto &dispatch : command->dispatches)
+        require(!dispatch.timestampsValid,
+                "Command mode claimed counter timestamps without sampling");
+
+    if (capability.supports(Mode::StagePerDispatch)) {
+        const auto stage = runCommand(Mode::StagePerDispatch, true);
+        require(stage && stage->status == Status::Complete &&
+                    stage->encoderBoundariesAltered && !stage->samplingBarriers &&
+                    stage->calibrationCpuEnd > stage->calibrationCpuStart &&
+                    stage->calibrationGpuEnd > stage->calibrationGpuStart,
+                "supported stage profiling did not resolve calibrated timestamps");
+        for (const auto &dispatch : stage->dispatches) {
+            require(dispatch.timestampsValid && dispatch.gpuStartTimestamp > 0 &&
+                        dispatch.gpuEndTimestamp >= dispatch.gpuStartTimestamp &&
+                        dispatch.gpuStartTimestamp >= stage->calibrationGpuStart &&
+                        dispatch.gpuEndTimestamp <= stage->calibrationGpuEnd &&
+                        std::isfinite(dispatch.calibratedStartSeconds) &&
+                        std::isfinite(dispatch.calibratedEndSeconds) &&
+                        dispatch.calibratedEndSeconds >= dispatch.calibratedStartSeconds &&
+                        std::isfinite(dispatch.gpuSeconds) && dispatch.gpuSeconds >= 0.0,
+                    "stage profile reported missing or invalid dispatch timestamps");
+        }
+    } else {
+        std::cout << "SKIP command profiling stage timestamps: "
+                  << capability.reason << '\n';
+    }
+
+    bool testedUnsupported = false;
+    for (const Mode mode : {Mode::DispatchBoundary, Mode::StagePerDispatch}) {
+        if (capability.supports(mode)) continue;
+        const auto unsupported = runCommand(mode);
+        require(unsupported && unsupported->status == Status::Unsupported &&
+                    !unsupported->reason.empty() &&
+                    !unsupported->encoderBoundariesAltered &&
+                    !unsupported->samplingBarriers,
+                "unsupported profiling mode silently selected another encoding path");
+        for (const auto &dispatch : unsupported->dispatches)
+            require(!dispatch.timestampsValid,
+                    "unsupported profiling fabricated valid timestamps");
+        testedUnsupported = true;
+        break;
+    }
+    if (!testedUnsupported)
+        std::cout << "SKIP unsupported profiling case: both counter modes supported\n";
+
+    backend.setCommandDispatchProfiling(Mode::Off);
+    backend.setDispatchProfiling(true);
+    requireBackendError([&] { backend.setCommandDispatchProfiling(Mode::Command); },
+                        "counter profiling was enabled alongside legacy replay");
+    backend.setDispatchProfiling(false);
+    backend.setCommandDispatchProfiling(Mode::Command);
+    requireBackendError([&] { backend.setDispatchProfiling(true); },
+                        "legacy replay was enabled alongside command profiling");
+    backend.setCommandDispatchProfiling(Mode::Off);
+    (void)runCommand(Mode::Off);
+    std::cout << "command_dispatch_profiling=PASS\n";
+}
+
 void sparseExtentChurn(MetalBackend &backend) {
     // Match the production per-layer data/scale mapping sizes. Rotate three
     // virtual extents, retaining one as a witness while its replacement is
@@ -944,6 +1230,8 @@ void sparsePacedRelease(MetalBackend &backend) {
 void run(const std::string &metallibPath) {
     placementProbeFailures(metallibPath);
     backendDeferredSubmission(metallibPath);
+    commandDispatchProfilingTests(metallibPath);
+    weightResidencyLeaseTests(metallibPath);
     NSData *libraryData = [NSData dataWithContentsOfFile:
         [NSString stringWithUTF8String:metallibPath.c_str()]];
     const auto expectedDigest = libraryDigest(libraryData);

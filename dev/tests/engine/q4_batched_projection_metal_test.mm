@@ -28,6 +28,12 @@ constexpr uint32_t kInput = 5120;
 constexpr uint32_t kOutput = 16640;
 constexpr uint32_t kGroups = 60;
 constexpr uint32_t kQuantGroup = 64;
+constexpr std::array<const char *, kMaximumBatch> kN64AffinePipelines{
+    "decode_linear_q4_n64", "decode_linear_q4_n64_m16",
+    "decode_linear_q4_n64_m24", "decode_linear_q4_n64_m32"};
+constexpr std::array<const char *, kMaximumBatch> kN64ResidualPipelines{
+    "decode_linear_q4_n64_residual", "decode_linear_q4_n64_residual_m16",
+    "decode_linear_q4_n64_residual_m24", "decode_linear_q4_n64_residual_m32"};
 
 [[noreturn]] void fail(const std::string &message) {
   std::cerr << "FAIL: " << message << '\n';
@@ -152,6 +158,99 @@ ComputeDispatch upSilu(std::string pipeline, MetalBuffer input,
   return result;
 }
 
+ComputeDispatch residual(std::string pipeline, MetalBuffer input,
+                         MetalBuffer weights, MetalBuffer scales,
+                         MetalBuffer biases, MetalBuffer residualInput,
+                         MetalBuffer output, const Q4Params &params) {
+  ComputeDispatch result;
+  result.pipelineName = std::move(pipeline);
+  result.buffers = {{0, std::move(input)},
+                    {1, std::move(weights)},
+                    {2, std::move(scales)},
+                    {3, std::move(biases)},
+                    {4, std::move(residualInput)},
+                    {5, std::move(output)}};
+  result.bytes = {{6, &params, sizeof(params)}};
+  result.threadgroups = {params.persistent_groups, 1, 1};
+  result.threadsPerThreadgroup = {256, 1, 1};
+  return result;
+}
+
+void checkN64Persistent(MetalBackend &backend, MetalBuffer input,
+                        MetalBuffer weights, MetalBuffer scales,
+                        MetalBuffer biases, uint32_t inputSize,
+                        std::mt19937 &random) {
+  constexpr uint32_t outputSize = 768;
+  const uint64_t laneInputBytes = uint64_t{kRows} * inputSize * sizeof(__bf16);
+  const uint64_t laneOutputBytes = uint64_t{kRows} * outputSize * sizeof(__bf16);
+  const uint64_t maximumOutputBytes = kMaximumBatch * laneOutputBytes;
+  MetalBuffer residualInput = shared(backend, maximumOutputBytes,
+                                      "q4-n64-residual-input");
+  std::uniform_real_distribution<float> residualValues(-1.0f, 1.0f);
+  auto *residualValuesPtr = static_cast<__bf16 *>(residualInput.contents());
+  for (uint64_t index = 0; index < maximumOutputBytes / sizeof(__bf16); ++index)
+    residualValuesPtr[index] = __bf16(residualValues(random));
+
+  const Q4Params referenceParams{outputSize, inputSize, outputSize / 128};
+  const Q4Params singleGroupParams{outputSize, inputSize, 1};
+  const Q4Params fullGridParams{outputSize, inputSize, outputSize / 64};
+  for (const bool addResidual : {false, true}) {
+    MetalBuffer reference = shared(backend, maximumOutputBytes,
+                                    "q4-n64-m8-reference");
+    std::memset(reference.contents(), 0, maximumOutputBytes);
+    std::vector<ComputeDispatch> singles;
+    for (uint32_t lane = 0; lane < kMaximumBatch; ++lane) {
+      auto laneInput = backend.view(input, lane * laneInputBytes, laneInputBytes);
+      auto laneOutput = backend.view(reference, lane * laneOutputBytes,
+                                      laneOutputBytes);
+      if (addResidual) {
+        singles.push_back(residual(
+            "decode_linear_q4_n128_residual", std::move(laneInput),
+            weights, scales, biases,
+            backend.view(residualInput, lane * laneOutputBytes, laneOutputBytes),
+            std::move(laneOutput), referenceParams));
+      } else {
+        singles.push_back(affine("decode_linear_q4_n128", std::move(laneInput),
+                                 weights, scales, biases, std::move(laneOutput),
+                                 referenceParams));
+      }
+    }
+    (void)backend.submitCommand(singles);
+    for (uint32_t width = 1; width <= kMaximumBatch; ++width) {
+      const uint64_t comparedBytes = width * laneOutputBytes;
+      MetalBuffer candidate = shared(backend, comparedBytes, "q4-n64-output");
+      for (const bool persistent : {false, true}) {
+        // Sentinel catches missing output rows or columns in a fragment.
+        std::memset(candidate.contents(), 0xA5, comparedBytes);
+        const Q4Params &params = persistent ? singleGroupParams : fullGridParams;
+        auto batchInput = backend.view(input, 0, width * laneInputBytes);
+        ComputeDispatch dispatch;
+        if (addResidual) {
+          dispatch = residual(kN64ResidualPipelines[width - 1],
+                              std::move(batchInput), weights, scales, biases,
+                              backend.view(residualInput, 0, comparedBytes),
+                              candidate, params);
+        } else {
+          dispatch = affine(kN64AffinePipelines[width - 1], std::move(batchInput),
+                            weights, scales, biases, candidate, params);
+        }
+        (void)backend.submitCommand({&dispatch, 1});
+        if (std::memcmp(reference.contents(), candidate.contents(), comparedBytes))
+          fail("N64 M" + std::to_string(width * kRows) +
+               (addResidual ? " residual" : " affine") +
+               " K=" + std::to_string(inputSize) +
+               " groups=" + std::to_string(params.persistent_groups) +
+               " differs from its N128 M8 references");
+        std::cout << "PASS q4 N64 M" << width * kRows
+                  << (addResidual ? " residual" : " affine")
+                  << " K=" << inputSize
+                  << " groups=" << params.persistent_groups
+                  << " exact=true\n";
+      }
+    }
+  }
+}
+
 void run(const std::string &metallibPath) {
   MetalBackend backend(metallibPath);
   const uint64_t inputElements = uint64_t{kRows} * kInput;
@@ -250,6 +349,25 @@ void run(const std::string &metallibPath) {
               << " exact=true wall_seconds=" << timing.wallSeconds << '\n';
   }
 
+  // Reuse the production-sized fixture without multiplying its long serial
+  // workloads: persistent scratch is exercised on the small cases below.
+  const Q4Params n64FullGrid{kOutput, kInput, kOutput / 64};
+  for (uint32_t width = 1; width <= kMaximumBatch; ++width) {
+    const uint64_t comparedBytes = uint64_t{width} * outputElements * sizeof(__bf16);
+    MetalBuffer candidate = shared(backend, comparedBytes, "q4-n64-wide-output");
+    std::memset(candidate.contents(), 0xA5, comparedBytes);
+    ComputeDispatch dispatch = affine(
+        kN64AffinePipelines[width - 1],
+        backend.view(input, 0, uint64_t{width} * inputElements * sizeof(__bf16)),
+        weights, scales, biases, candidate, n64FullGrid);
+    (void)backend.submitCommand({&dispatch, 1});
+    if (std::memcmp(reference.contents(), candidate.contents(), comparedBytes))
+      fail("wide N64 M" + std::to_string(width * kRows) +
+           " projection differs from its N128 M8 references");
+    std::cout << "PASS q4 wide N64 M" << width * kRows
+              << " exact=true\n";
+  }
+
   const uint64_t m24Bytes = uint64_t{3} * outputElements * sizeof(__bf16);
   MetalBuffer gateUpReference =
       shared(backend, m24Bytes, "q4-m8-gate-up-reference");
@@ -319,6 +437,8 @@ void run(const std::string &metallibPath) {
            " differs from its single-tile M8 references");
     std::cout << "PASS q4 persistent M24 K=" << persistentInput
               << " exact=true\n";
+    checkN64Persistent(backend, input, weights, scales, biases, persistentInput,
+                       random);
   }
 
   // One-lane tiles against the sequential N128 reference (lane 0). The
