@@ -519,19 +519,30 @@ def resolve_gguf(manifest, variant: str, token) -> Path:
     )
     published = {item.rfilename: item for item in info.siblings}
     _hub_gguf_matches(published.get(entry["file"]), entry, entry["file"])
-    path = Path(
-        hf_hub_download(
-            repo_id=table["repo_id"],
-            filename=entry["file"],
-            revision=info.sha if is_hex_digest(info.sha, 40) else revision,
-            repo_type="model",
-            token=token or False,
-            endpoint=HUB_ENDPOINT,
-        )
-    ).resolve()
-    if not path.is_file() or path.stat().st_size != entry["size"]:
-        raise ModelError(f"downloaded GGUF has the wrong size: {entry['file']}")
+    options = dict(
+        repo_id=table["repo_id"],
+        filename=entry["file"],
+        revision=info.sha if is_hex_digest(info.sha, 40) else revision,
+        repo_type="model",
+        token=token or False,
+        endpoint=HUB_ENDPOINT,
+    )
+    path = Path(hf_hub_download(**options)).resolve()
+    # Hub metadata authenticates the expected file, not the local cache contents.
+    # As for shared artifacts, repair a corrupt cached file once before failing.
+    if not _gguf_content_matches(path, entry):
+        path = Path(hf_hub_download(force_download=True, **options)).resolve()
+        if not _gguf_content_matches(path, entry):
+            raise ModelError(f"downloaded GGUF checksum or size changed: {entry['file']}")
     return path
+
+
+def _gguf_content_matches(path: Path, entry) -> bool:
+    return (
+        path.is_file()
+        and path.stat().st_size == entry["size"]
+        and sha256(path) == entry["sha256"].lower()
+    )
 
 
 def _cached_gguf(manifest, variant: str):
@@ -545,7 +556,7 @@ def _cached_gguf(manifest, variant: str):
     if not isinstance(path, str):
         return None
     resolved = Path(path).resolve()
-    if not resolved.is_file() or resolved.stat().st_size != entry["size"]:
+    if not _gguf_content_matches(resolved, entry):
         return None
     return resolved
 

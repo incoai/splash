@@ -15,6 +15,9 @@ needed):
   bandwidth), `real <variant> <raw> <ref.f32> <N> <K>` (exported GGUF tensors).
 - `harness_prod.mm`: validates the production `kquant.metal` kernels (same ABI as the engine)
   against fp64 and times the fused multi-segment, gate+up and split-K paths.
+  `full` covers every gate/up format pair at 8/16/24/32 rows; `time-gu` measures
+  fused and separate FFN projections. An optional input scale and seed follow
+  the mode; a non-unit scale uses sparse activations to test BF16 input range.
 - `harness_native.mm` + `kqn.metal`: the "no repack" experiment, native GGUF block layout
   kernels vs. the repacked layout and vs. splash's Q4 kernels (`results-native-vs-repacked.md`).
 - `compile_check.mm`, `inline_metal.py`: runtime compilation helpers (inline `#include`s, then
@@ -31,6 +34,27 @@ needed):
   harness logs and a converted package.
 
 Results:
+
+Correctness gates are built by `make build/engine-tests/kquant-projection` and
+run by `make test-engine-metal`. The test-only `kquant-dequant.metallib` exposes
+the production dequantizers: `kquant-projection <that-library> dequant` requires
+exact agreement with FP16 rounding of the FP32 GGUF values, before any GEMM.
+The projection checks retain a native-GGUF error check and separately check
+the FP16-staged oracle and fused/separate equivalence. The absolute GEMM error
+budget excludes the final BF16 rounding cell.
+
+The precision contract follows llama.cpp's
+[`dequantize.h`](https://github.com/ggml-org/llama.cpp/blob/7ab4ee7baad2d920464cbacfad4f4b07cf111fd2/ggml/src/ggml-metal/kernels/dequantize.h)
+and [`mul_mm.metal`](https://github.com/ggml-org/llama.cpp/blob/7ab4ee7baad2d920464cbacfad4f4b07cf111fd2/ggml/src/ggml-metal/kernels/mul_mm.metal):
+FP32 computed group coefficients, one rounding into a half weight tile, FP32
+accumulation. Stored half scales without a group multiplier (IQ4_NL/Q8_0) can
+use a single half multiply with the same rounding. Activations remain BF16.
+To independently verify the CPU reference, build unmodified upstream
+`ggml-base` and set `SPLASH_GGML_ORACLE` to its dylib when running the harness.
+Every generated native tensor is then checked bit-for-bit against upstream's
+`dequantize_row_*` output. This is a development-only optional dependency.
+
+Historical performance results below predate the precision and Apple9 fixes:
 
 - `results-kernels-m5.md`: per-format kernel timings vs. splash's native Q4 kernels,
   bits/weight and theoretical vs. measured speedup.
