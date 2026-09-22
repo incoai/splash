@@ -121,13 +121,15 @@ private:
   [[nodiscard]] std::optional<BatchPlan> nextPrefill() const;
   [[nodiscard]] std::optional<BatchPlan> nextDecode() const;
   [[nodiscard]] std::optional<BatchPlan>
-  planPrefill(std::vector<const Request *> ready) const;
+  planPrefill(std::vector<const Request *> &ready) const;
   [[nodiscard]] uint32_t
   prefillBudget(const Request &leader,
                 std::span<const Request *const> ready) const;
 
   std::unordered_map<uint64_t, Request> requests_;
   std::optional<BatchPlan> active_;
+  mutable std::vector<const Request *> prefillReadyScratch_;
+  mutable std::vector<const Request *> decodeReadyScratch_;
   uint64_t order_ = 0;
   uint64_t decodeDispatchOrder_ = 0;
   double prefillMillisecondsPerToken_ = 0.0;
