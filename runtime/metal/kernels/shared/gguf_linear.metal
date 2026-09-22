@@ -238,7 +238,7 @@ inline uint gguf_permute_k(uint k, uint input_size, uint spec) {
 }
 
 // ---------------- sg: each simdgroup stages its own Cols x KS sub-tile privately and runs matmul2d alone
-template <class F, typename TA, typename TO, ushort Rows, ushort Cols, ushort KS, ushort Buffers, ushort Prefetch, ushort Ep = EpNone>
+template <class F, typename TA, typename TO, ushort Rows, ushort Cols, ushort KS, ushort Buffers, ushort Prefetch, ushort Ep = EpNone, bool Perm = false>
 inline void sg_tile(device TA *input, device uchar *w0, device uchar *w1, device uchar *meta, device TO *output,
                     uint output_size, uint input_size, uint output_origin, threadgroup half *stage, threadgroup half2 *tl,
                     uint simd_lane, uint step_begin, uint step_end, uint kperm, uint out_stride = 0, uint out_offset = 0, device bfloat *aux = nullptr) {
@@ -295,7 +295,7 @@ inline void sg_tile(device TA *input, device uchar *w0, device uchar *w1, device
         packed[Prefetch - 1][it] = F::load(tw0 + (g * kStorageN + col) * F::P0, tw1 + (g * kStorageN + col) * F::P1);
       }
     }
-    auto a_slice = a.template slice<KS, Rows>(gguf_permute_k(step * KS, input_size, kperm), 0);
+    auto a_slice = a.template slice<KS, Rows>(Perm ? gguf_permute_k(step * KS, input_size, kperm) : step * KS, 0);
     if (Buffers > 1 && (step & 1)) operation.run(a_slice, b1, acc); else operation.run(a_slice, b0, acc);
   }
 #pragma unroll
@@ -313,7 +313,7 @@ inline void sg_tile(device TA *input, device uchar *w0, device uchar *w1, device
 
 
 // ---------------- pf: prefill with a shared B stage (TileN x KS, all threads dequantize), each simdgroup owns RowsPerSG rows
-template <class F, typename TA, ushort RowsPerSG, ushort Simdgroups, ushort TileN, ushort KS, ushort Prefetch, ushort Ep = EpNone>
+template <class F, typename TA, ushort RowsPerSG, ushort Simdgroups, ushort TileN, ushort KS, ushort Prefetch, ushort Ep = EpNone, bool Perm = false>
 inline void pf_tile(device TA *input, device uchar *w0, device uchar *w1, device uchar *meta, device bfloat *output,
                     uint output_size, uint input_size, uint output_origin, threadgroup half *stage, threadgroup half2 *tl,
                     uint simd_lane, uint simd_group, uint out_stride = 0, uint out_offset = 0, device bfloat *aux = nullptr, uint kperm = 0) {
@@ -369,7 +369,7 @@ inline void pf_tile(device TA *input, device uchar *w0, device uchar *w1, device
         packed[Prefetch - 1][it] = F::load(tw0 + (g * kStorageN + col) * F::P0, tw1 + (g * kStorageN + col) * F::P1);
       }
     }
-    auto a_slice = a.template slice<KS, RowsPerSG>(gguf_permute_k(step * KS, input_size, kperm), 0);
+    auto a_slice = a.template slice<KS, RowsPerSG>(Perm ? gguf_permute_k(step * KS, input_size, kperm) : step * KS, 0);
     if (step & 1) operation.run(a_slice, b1, acc); else operation.run(a_slice, b0, acc);
   }
 #pragma unroll
@@ -426,6 +426,21 @@ kernel void gguf_splitk_reduce(device float *partials [[buffer(0)]], device bflo
     for (uint tile = group; tile < tiles; tile += p.persistent_groups)                                    \
       sg_tile<F, bfloat, bfloat, R, C, KS, B, P, EP>(input, w0, w1, meta, output, p.output_size, p.input_size, tile * (S * C) + simd_group * C, \
                                              stage + simd_group * (B * KS * C), tl, simd_lane, 0, steps, p.k_permute, p.out_stride, p.out_offset, aux); }
+// _kp variants: the weight's K columns are in llama.cpp's tiled value-head order (GDN out_proj); the
+// activation column is remapped per K slice at compile time so the plain kernels carry no such check.
+#define SGE_KP(F, f, EP, ep, R, C, S, KS, B, P)                                                           \
+  kernel void sg##ep##_##f##_m##R##_c##C##_sg##S##_k##KS##_b##B##_p##P##_kp(ABUFE, uint group [[threadgroup_position_in_grid]], IDS) { \
+    constexpr ushort Threads = S * 32; TGLUT_INIT(F)                                                      \
+    threadgroup half stage[S * B * KS * C]; const uint tiles = p.output_size / (S * C), steps = p.input_size / KS; \
+    for (uint tile = group; tile < tiles; tile += p.persistent_groups)                                    \
+      sg_tile<F, bfloat, bfloat, R, C, KS, B, P, EP, true>(input, w0, w1, meta, output, p.output_size, p.input_size, tile * (S * C) + simd_group * C, \
+                                             stage + simd_group * (B * KS * C), tl, simd_lane, 0, steps, p.k_permute, p.out_stride, p.out_offset, aux); }
+#define PFE_KP(F, f, EP, ep, R, S, N, KS, P)                                                              \
+  kernel void pf##ep##_##f##_r##R##_sg##S##_n##N##_k##KS##_p##P##_kp(ABUFE, uint2 group [[threadgroup_position_in_grid]], IDS) { \
+    constexpr ushort Threads = S * 32; TGLUT_INIT(F)                                                      \
+    threadgroup half stage[2 * KS * N]; const uint rs = p.out_stride ? p.out_stride : p.output_size;      \
+    pf_tile<F, bfloat, R, S, N, KS, P, EP, true>(input + ulong(group.x) * (R * S) * p.input_size, w0, w1, meta, output + ulong(group.x) * (R * S) * rs, \
+                                   p.output_size, p.input_size, group.y * N, stage, tl, simd_lane, simd_group, p.out_stride, p.out_offset, aux + ulong(group.x) * (R * S) * rs, p.k_permute); }
 #define PFE_K(F, f, EP, ep, R, S, N, KS, P)                                                               \
   kernel void pf##ep##_##f##_r##R##_sg##S##_n##N##_k##KS##_p##P(ABUFE, uint2 group [[threadgroup_position_in_grid]], IDS) { \
     constexpr ushort Threads = S * 32; TGLUT_INIT(F)                                                      \
@@ -452,7 +467,7 @@ inline auto gguf_make_acc(device TA *input, uint input_size, threadgroup half *s
   auto b0 = bt0.slice<KS, Cols>(0, 0);
   return operation.template get_destination_cooperative_tensor<decltype(a0), decltype(b0), float>();
 }
-template <class F, typename TA, ushort Rows, ushort Cols, ushort KS, ushort Buffers, ushort Prefetch, class Acc>
+template <class F, typename TA, ushort Rows, ushort Cols, ushort KS, ushort Buffers, ushort Prefetch, bool Perm = false, class Acc>
 inline void sg_accum(device TA *input, device uchar *w0, device uchar *w1, device uchar *meta, uint input_size, uint output_origin,
                      threadgroup half *stage, threadgroup half2 *tl, uint simd_lane, uint step_begin, uint step_end, uint kperm, thread Acc &acc) {
   constexpr ushort GPS = KS / 32, Items = Cols * GPS, IPT = (Items + 31) / 32;
@@ -503,7 +518,7 @@ inline void sg_accum(device TA *input, device uchar *w0, device uchar *w1, devic
         packed[Prefetch - 1][it] = F::load(tw0 + (g * kStorageN + col) * F::P0, tw1 + (g * kStorageN + col) * F::P1);
       }
     }
-    auto a_slice = a.template slice<KS, Rows>(gguf_permute_k(step * KS, input_size, kperm), 0);
+    auto a_slice = a.template slice<KS, Rows>(Perm ? gguf_permute_k(step * KS, input_size, kperm) : step * KS, 0);
     if (Buffers > 1 && (step & 1)) operation.run(a_slice, b1, acc); else operation.run(a_slice, b0, acc);
   }
   simdgroup_barrier(mem_flags::mem_threadgroup);   // the stage may be reused by a following accumulate
@@ -578,7 +593,7 @@ GGUF_FUSED_K(8) GGUF_FUSED_K(16) GGUF_FUSED_K(24) GGUF_FUSED_K(32)
 GGUF_GATEUP_K(8) GGUF_GATEUP_K(16) GGUF_GATEUP_K(24) GGUF_GATEUP_K(32)
 
 // ---------------- split-K with last-arriver reduction (per format), epilogue applied by the reducing threadgroup
-template <class F, ushort Rows>
+template <class F, ushort Rows, bool Perm = false>
 inline void gguf_splitk_tile(device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta, device float *partials,
                            device atomic_uint *counters, device bfloat *output, device bfloat *aux, constant GgufSplitParams &p,
                            uint2 group, uint simd_lane, uint simd_group, threadgroup half *stage, threadgroup half2 *tl, threadgroup uint *arrival) {
@@ -588,7 +603,7 @@ inline void gguf_splitk_tile(device bfloat *input, device uchar *w0, device ucha
   auto acc = gguf_make_acc<bfloat, Rows, 32, 32>(input, p.input_size, my);
 #pragma unroll
   for (ushort i = 0; i < acc.get_capacity(); ++i) acc[i] = 0.0f;
-  sg_accum<F, bfloat, Rows, 32, 32, 2, 1>(input, w0, w1, meta, p.input_size, origin, my, tl, simd_lane, group.y * per, (group.y + 1) * per, p.k_permute, acc);
+  sg_accum<F, bfloat, Rows, 32, 32, 2, 1, Perm>(input, w0, w1, meta, p.input_size, origin, my, tl, simd_lane, group.y * per, (group.y + 1) * per, p.k_permute, acc);
   const ulong N = p.output_size;
 #pragma unroll
   for (ushort i = 0; i < acc.get_capacity(); ++i) {
@@ -625,7 +640,15 @@ inline void gguf_splitk_tile(device bfloat *input, device uchar *w0, device ucha
     threadgroup half stage[2 * 2 * 32 * 32]; threadgroup half2 tl[F::TgLut ? F::TgLut : 1]; threadgroup uint arrival; \
     if constexpr (F::TgLut) gguf_init_lut(tl, simd_group * 32 + simd_lane, 64);                                \
     gguf_splitk_tile<F, R>(input, w0, w1, meta, partials, counters, output, aux, p, group, simd_lane, simd_group, stage, tl, &arrival); }
-#define GGUF_SPLITK_SET(F, f) GGUF_SPLITK_K(F, f, 8) GGUF_SPLITK_K(F, f, 16) GGUF_SPLITK_K(F, f, 24) GGUF_SPLITK_K(F, f, 32)
+#define GGUF_SPLITK_KP(F, f, R)                                                                                     \
+  kernel void gguf_splitk_##f##_m##R##_kp(device bfloat *input [[buffer(0)]], SEGBUF(1, w0, w1, meta), device float *partials [[buffer(4)]], \
+                             device atomic_uint *counters [[buffer(5)]], device bfloat *output [[buffer(6)]], device bfloat *aux [[buffer(7)]], \
+                             constant GgufSplitParams &p [[buffer(8)]], uint2 group [[threadgroup_position_in_grid]], IDS) { \
+    threadgroup half stage[2 * 2 * 32 * 32]; threadgroup half2 tl[F::TgLut ? F::TgLut : 1]; threadgroup uint arrival; \
+    if constexpr (F::TgLut) gguf_init_lut(tl, simd_group * 32 + simd_lane, 64);                                \
+    gguf_splitk_tile<F, R, true>(input, w0, w1, meta, partials, counters, output, aux, p, group, simd_lane, simd_group, stage, tl, &arrival); }
+#define GGUF_SPLITK_SET(F, f) GGUF_SPLITK_K(F, f, 8) GGUF_SPLITK_K(F, f, 16) GGUF_SPLITK_K(F, f, 24) GGUF_SPLITK_K(F, f, 32) \
+  GGUF_SPLITK_KP(F, f, 8) GGUF_SPLITK_KP(F, f, 16) GGUF_SPLITK_KP(F, f, 24) GGUF_SPLITK_KP(F, f, 32)
 GGUF_SPLITK_SET(FmtQ4K, q4k) GGUF_SPLITK_SET(FmtIQ4XS<3>, iq4xs) GGUF_SPLITK_SET(FmtIQ4NL<0>, iq4nl) GGUF_SPLITK_SET(FmtQ5K, q5k)
 GGUF_SPLITK_SET(FmtQ6K, q6k) GGUF_SPLITK_SET(FmtQ3K, q3k) GGUF_SPLITK_SET(FmtQ80, q80) GGUF_SPLITK_SET(FmtIQ3S, iq3s)
 
@@ -633,7 +656,9 @@ GGUF_SPLITK_SET(FmtQ6K, q6k) GGUF_SPLITK_SET(FmtQ3K, q3k) GGUF_SPLITK_SET(FmtQ80
   SG_K(F, f, bfloat, a, 8, 32, 2, 32, 2, 1) SG_K(F, f, bfloat, a, 16, 32, 2, 32, 2, 1) SG_K(F, f, bfloat, a, 24, 32, 2, 32, 2, 1) SG_K(F, f, bfloat, a, 32, 32, 2, 32, 2, 1) \
   SGE_K(F, f, EpResidual, r, 8, 32, 2, 32, 2, 1) SGE_K(F, f, EpResidual, r, 16, 32, 2, 32, 2, 1) SGE_K(F, f, EpResidual, r, 24, 32, 2, 32, 2, 1) SGE_K(F, f, EpResidual, r, 32, 32, 2, 32, 2, 1) \
   SGE_K(F, f, EpUpWithGate, g, 8, 32, 2, 32, 2, 1) SGE_K(F, f, EpUpWithGate, g, 16, 32, 2, 32, 2, 1) SGE_K(F, f, EpUpWithGate, g, 24, 32, 2, 32, 2, 1) SGE_K(F, f, EpUpWithGate, g, 32, 32, 2, 32, 2, 1) \
-  PF_K(F, f, bfloat, a, 32, 4, 64, 64, 1) PFE_K(F, f, EpResidual, r, 32, 4, 64, 64, 1) PFE_K(F, f, EpUpWithGate, g, 32, 4, 64, 64, 1)
+  PF_K(F, f, bfloat, a, 32, 4, 64, 64, 1) PFE_K(F, f, EpResidual, r, 32, 4, 64, 64, 1) PFE_K(F, f, EpUpWithGate, g, 32, 4, 64, 64, 1) \
+  SGE_KP(F, f, EpResidual, r, 8, 32, 2, 32, 2, 1) SGE_KP(F, f, EpResidual, r, 16, 32, 2, 32, 2, 1) SGE_KP(F, f, EpResidual, r, 24, 32, 2, 32, 2, 1) SGE_KP(F, f, EpResidual, r, 32, 32, 2, 32, 2, 1) \
+  PFE_KP(F, f, EpResidual, r, 32, 4, 64, 64, 1)
 PROD_SET(FmtQ4K, q4k)
 PROD_SET(FmtIQ4XS<3>, iq4xs)
 PROD_SET(FmtIQ4NL<0>, iq4nl)

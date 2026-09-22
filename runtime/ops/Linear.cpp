@@ -544,11 +544,13 @@ constexpr uint32_t kKQPrefillRows = 128;
 constexpr uint32_t kKQPrefillTileColumns = 64;
 constexpr uint32_t kKQPrefillThreads = 128;
 
-std::string kqKernel(const char *family, const char *format, uint32_t rows) {
-  return std::string(family) + "_" + format + "_m" + std::to_string(rows) + "_c32_sg2_k32_b2_p1";
+// The _kp variants remap the activation's K columns (GDN out_proj); only the residual-epilogue
+// decode/prefill kernels and split-K exist in that form.
+std::string kqKernel(const char *family, const char *format, uint32_t rows, bool permuted = false) {
+  return std::string(family) + "_" + format + "_m" + std::to_string(rows) + "_c32_sg2_k32_b2_p1" + (permuted ? "_kp" : "");
 }
-std::string kqPrefillKernel(const char *family, const char *format) {
-  return std::string(family) + "_" + format + "_r32_sg4_n64_k64_p1";
+std::string kqPrefillKernel(const char *family, const char *format, bool permuted = false) {
+  return std::string(family) + "_" + format + "_r32_sg4_n64_k64_p1" + (permuted ? "_kp" : "");
 }
 uint32_t ggufSplits(uint32_t n, uint32_t k, uint32_t rows) {
   if (n <= 1024) return 8;
@@ -597,6 +599,9 @@ void addGguf(metal::CommandGraph &graph, const LinearBuffers &b, const Q4Project
   if (w.epilogue == LinearEpilogue::UpWithGate || w.epilogue == LinearEpilogue::GateUp)
     need(b.gateScratch, uint64_t{rows} * n * 2, "gate scratch");
   const metal::MetalBuffer &input = b.input;
+  const bool permuted = p.ggufPermuteK != 0;
+  if (permuted && w.epilogue != LinearEpilogue::Residual)
+    throw std::invalid_argument("GGUF K-permuted projections are only implemented with the residual epilogue");
   const auto epilogueId = [](LinearEpilogue e) { return e == LinearEpilogue::Residual ? GGUF_EPILOGUE_RESIDUAL
                                                       : e == LinearEpilogue::UpWithGate ? GGUF_EPILOGUE_UP_WITH_GATE : GGUF_EPILOGUE_NONE; };
   const auto plane1 = [](const GgufSegment &s) { return s.plane1 ? s.plane1 : s.meta; };
@@ -635,14 +640,14 @@ void addGguf(metal::CommandGraph &graph, const LinearBuffers &b, const Q4Project
       if (splits > 1) {
         need(p.kqPartials, uint64_t{splits} * rows * n * 4, "partials");
         need(p.kqCounters, uint64_t{tiles} * 4, "counters");
-        graph.add(std::string("gguf_splitk_") + s.format + "_m" + std::to_string(rows),
+        graph.add(std::string("gguf_splitk_") + s.format + "_m" + std::to_string(rows) + (permuted ? "_kp" : ""),
                   {input, s.plane0, plane1(s), s.meta, p.kqPartials, p.kqCounters, b.output, aux},
                   GgufSplitParams{n, k, splits, n, 0, epilogueId(w.epilogue), p.ggufPermuteK}, {tiles, splits, 1}, {kKQDecodeThreads, 1, 1});
       } else if (w.epilogue == LinearEpilogue::None) {
         graph.add(kqKernel("sga", s.format, rows), {input, s.plane0, plane1(s), s.meta, b.output},
                   GgufParams{n, k, tiles, n, 0, p.ggufPermuteK}, {tiles, 1, 1}, {kKQDecodeThreads, 1, 1});
       } else {
-        graph.add(kqKernel(w.epilogue == LinearEpilogue::Residual ? "sgr" : "sgg", s.format, rows),
+        graph.add(kqKernel(w.epilogue == LinearEpilogue::Residual ? "sgr" : "sgg", s.format, rows, permuted),
                   {input, s.plane0, plane1(s), s.meta, b.output, aux}, GgufParams{n, k, tiles, n, 0, p.ggufPermuteK}, {tiles, 1, 1}, {kKQDecodeThreads, 1, 1});
       }
     }
@@ -656,7 +661,7 @@ void addGguf(metal::CommandGraph &graph, const LinearBuffers &b, const Q4Project
           graph.add(kqPrefillKernel("pfa", s.format), {input, s.plane0, plane1(s), s.meta, output}, params,
                     {rows / kKQPrefillRows, tiles, 1}, {kKQPrefillThreads, 1, 1});
         else
-          graph.add(kqPrefillKernel(epilogue == GGUF_EPILOGUE_RESIDUAL ? "pfr" : "pfg", s.format),
+          graph.add(kqPrefillKernel(epilogue == GGUF_EPILOGUE_RESIDUAL ? "pfr" : "pfg", s.format, proj.ggufPermuteK != 0),
                     {input, s.plane0, plane1(s), s.meta, output, aux}, params, {rows / kKQPrefillRows, tiles, 1}, {kKQPrefillThreads, 1, 1});
       }
     };

@@ -295,21 +295,22 @@ int main(int argc, char **argv) { @autoreleasepool {
     { const uint32_t rows = 128; auto [Xbf, Xref] = inputs(rows); id<MTLBuffer> Y = mkbuf(uint64_t(rows) * N * 2); std::vector<double> ref((size_t)rows * N); refGemm(Xref, s, rows, N, ref);
       GgufParams pq{N, K, 0, 0, 0, 0}; char name[80]; snprintf(name, sizeof name, "pfa_%s_r32_sg4_n64_k64_p1", fmtName[fi]); id<MTLComputePipelineState> ps = pso(lib, name); if (!ps) { ++failures; continue; }
       Dispatch d{ps, {Xbf, s.w0, s.w1, s.meta, Y}, bytes(pq), 5, MTLSizeMake(rows / 128, N / 64, 1), MTLSizeMake(128, 1, 1)}; runOnce({d}, 1); compare(name, Y, ref, rows, N); } }
-  // 5) K-permuted activation read (GDN out_proj): kernel reads x[perm(k)] for weight column k; reference permutes x on the CPU.
+  // 5) K-permuted activation read (GDN out_proj, _kp kernels): the kernel reads x[perm(k)] for weight column k; the
+  //    reference permutes x on the CPU. sgr/pfr take a zero residual.
   for (int fi = 0; fi < FMT_COUNT; ++fi) { const uint32_t N = 512, keyHeads = 4, groups = 2, width = K / (keyHeads * groups), spec = keyHeads | (groups << 16);
     for (uint32_t rows : {8u, 128u}) { Seg s = makeSeg((Fmt)fi, N, K, 0); auto [Xbf, Xref] = inputs(rows);
       id<MTLBuffer> Xp = mkbuf(uint64_t(rows) * K * 2); { const uint16_t *x = (const uint16_t *)Xbf.contents; uint16_t *xp = (uint16_t *)Xp.contents;
         for (uint32_t r = 0; r < rows; ++r) for (uint32_t k = 0; k < K; ++k) { const uint32_t t = k / width, h = (t % keyHeads) * groups + t / keyHeads; xp[(size_t)r * K + k] = x[(size_t)r * K + h * width + k % width]; } }
-      std::vector<double> ref((size_t)rows * N); refGemm(Xp, s, rows, N, ref); id<MTLBuffer> Y = mkbuf(uint64_t(rows) * N * 2); char name[80];
-      if (rows <= 32) { snprintf(name, sizeof name, "sga_%s_m%u_c32_sg2_k32_b2_p1", fmtName[fi], rows); GgufParams pq{N, K, N / 64, 0, 0, spec}; id<MTLComputePipelineState> ps = pso(lib, name); if (!ps) { ++failures; continue; }
-        Dispatch d{ps, {Xbf, s.w0, s.w1, s.meta, Y}, bytes(pq), 5, MTLSizeMake(N / 64, 1, 1), MTLSizeMake(64, 1, 1)}; runOnce({d}, 1); }
-      else { snprintf(name, sizeof name, "pfa_%s_r32_sg4_n64_k64_p1", fmtName[fi]); GgufParams pq{N, K, 0, 0, 0, spec}; id<MTLComputePipelineState> ps = pso(lib, name); if (!ps) { ++failures; continue; }
-        Dispatch d{ps, {Xbf, s.w0, s.w1, s.meta, Y}, bytes(pq), 5, MTLSizeMake(rows / 128, N / 64, 1), MTLSizeMake(128, 1, 1)}; runOnce({d}, 1); }
-      char label[96]; snprintf(label, sizeof label, "%s k_permute", name); compare(label, Y, ref, rows, N);
+      std::vector<double> ref((size_t)rows * N); refGemm(Xp, s, rows, N, ref); id<MTLBuffer> Y = mkbuf(uint64_t(rows) * N * 2), Z = mkbuf(uint64_t(rows) * N * 2); memset(Z.contents, 0, uint64_t(rows) * N * 2); char name[96];
+      if (rows <= 32) { snprintf(name, sizeof name, "sgr_%s_m%u_c32_sg2_k32_b2_p1_kp", fmtName[fi], rows); GgufParams pq{N, K, N / 64, 0, 0, spec}; id<MTLComputePipelineState> ps = pso(lib, name); if (!ps) { ++failures; continue; }
+        Dispatch d{ps, {Xbf, s.w0, s.w1, s.meta, Y, Z}, bytes(pq), 6, MTLSizeMake(N / 64, 1, 1), MTLSizeMake(64, 1, 1)}; runOnce({d}, 1); }
+      else { snprintf(name, sizeof name, "pfr_%s_r32_sg4_n64_k64_p1_kp", fmtName[fi]); GgufParams pq{N, K, 0, 0, 0, spec}; id<MTLComputePipelineState> ps = pso(lib, name); if (!ps) { ++failures; continue; }
+        Dispatch d{ps, {Xbf, s.w0, s.w1, s.meta, Y, Z}, bytes(pq), 6, MTLSizeMake(rows / 128, N / 64, 1), MTLSizeMake(128, 1, 1)}; runOnce({d}, 1); }
+      char label[110]; snprintf(label, sizeof label, "%s", name); compare(label, Y, ref, rows, N);
       if (rows <= 32) { const uint32_t splits = 4; id<MTLBuffer> Ys = mkbuf(uint64_t(rows) * N * 2), partials = mkbuf(uint64_t(splits) * rows * N * 4), counters = mkbuf(4096); memset(counters.contents, 0, 4096);
-        GgufSplitParams sp{N, K, splits, N, 0, 0, spec}; snprintf(name, sizeof name, "gguf_splitk_%s_m%u", fmtName[fi], rows); id<MTLComputePipelineState> ps = pso(lib, name); if (!ps) { ++failures; continue; }
+        GgufSplitParams sp{N, K, splits, N, 0, 0, spec}; snprintf(name, sizeof name, "gguf_splitk_%s_m%u_kp", fmtName[fi], rows); id<MTLComputePipelineState> ps = pso(lib, name); if (!ps) { ++failures; continue; }
         Dispatch d{ps, {Xbf, s.w0, s.w1, s.meta, partials, counters, Ys, Ys}, bytes(sp), 8, MTLSizeMake(N / 64, splits, 1), MTLSizeMake(64, 1, 1)}; runOnce({d}, 1);
-        snprintf(label, sizeof label, "%s k_permute", name); compare(label, Ys, ref, rows, N); } } }
+        compare(name, Ys, ref, rows, N); } } }
   printf("%s (%d failures)\n", failures ? "VALIDATION FAILED" : "all production kernels validated", failures);
   if (argc > 2 && std::string(argv[2]) == "time-gu") {
     const uint32_t NN = 17408, KK = 5120;
