@@ -1,6 +1,5 @@
 #pragma once
 
-
 #include "metal/abi/PagedAttention.h"
 #include "metal/kernels/common/q8_paging.h"
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
@@ -9,7 +8,8 @@
 using namespace metal;
 using namespace mpp::tensor_ops;
 
-// Paged INT8 attention with one fp32 scale per (token, KV head). The preceding
+// Paged attention over INT8 or BF16 KV. INT8 has one fp32 scale per
+// (token, KV head); BF16 reads the stored values directly. The preceding
 // store writes current rows to their final slots; committed_tokens controls
 // visibility, and the next command overwrites rejected verify rows.
 //
