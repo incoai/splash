@@ -96,6 +96,7 @@ public:
   [[nodiscard]] Chain chain(uint64_t blockId) const;
   [[nodiscard]] bool contains(uint64_t blockId) const noexcept;
   [[nodiscard]] uint32_t chainLength(uint64_t blockId) const;
+  [[nodiscard]] uint64_t generation() const noexcept { return generation_; }
 
   // Only a leaf unused by active requests can be removed. The caller handles
   // any composite state attached to the returned block before erase().
@@ -142,6 +143,8 @@ private:
   std::unordered_map<uint64_t, Block> blocks_;
   std::unordered_multimap<uint64_t, uint64_t> index_;
   uint64_t nextBlockId_ = 1;
+  // Any graph change invalidates previews, including a newly matched block.
+  uint64_t generation_ = 1;
   EvictionOrder evictionOrder_;
 };
 

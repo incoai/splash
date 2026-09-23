@@ -321,9 +321,11 @@ bool Engine::admitQueued(double now) {
     Request &active = request(id);
     if (!resourceRetryReady(active, now))
       continue;
-    const uint32_t cached =
-        cache_.cachedTokens(active.request.prompt, active.request.images);
+    active.admissionProbe =
+        cache_.probe(active.request.prompt, active.request.images);
+    const uint32_t cached = active.admissionProbe->cachedTokens();
     if (pendingSharedPrefill(active, cached)) {
+      active.admissionProbe.reset();
       active.resourceWait = {};
       scheduler_.waitForPrefix(id);
       continue;
@@ -348,6 +350,7 @@ bool Engine::admitQueued(double now) {
   // Waiting for scheduling does not consume the memory-retry deadline.
   for (const auto &candidate : candidates) {
     Request &active = request(candidate.requestId);
+    active.admissionProbe.reset();
     active.resourceWait = {};
     scheduler_.deferAdmission(candidate.requestId);
   }
@@ -402,8 +405,10 @@ bool Engine::admit(Request &active, double now) {
   ModelRequest modelRequest = active.request.modelView();
   if (resuming)
     modelRequest.prompt = active.exactTokens;
-  CacheLookup lookup =
-      cache_.lookup(modelRequest.prompt, active.request.images);
+  CacheLookup lookup = cache_.lookup(
+      modelRequest.prompt, active.request.images,
+      active.admissionProbe ? &*active.admissionProbe : nullptr);
+  active.admissionProbe.reset();
   // Only unstarted requests wait for a resident producer. Recheck planned
   // boundaries each step so producer loss leaves no stale dependency or lease.
   if (!resuming && pendingSharedPrefill(active, lookup.resumeBoundary())) {

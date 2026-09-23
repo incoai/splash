@@ -231,6 +231,11 @@ def coding_client(args):
         raise LauncherError(
             "Splash is running but its context limit is not available yet; wait and retry"
         )
+    # Only opencode needs its major version: the launch defaults changed
+    # between its first and second major releases. A failed probe adds nothing.
+    client_version = (
+        clients.probe_major_version(path) if args.command == "opencode" else None
+    )
     command, environment = clients.command(
         args.command,
         path,
@@ -239,6 +244,7 @@ def coding_client(args):
         context,
         _runtime_dir(args.port),
         client_args=args.client_args,
+        client_version=client_version,
     )
     print(f"Starting {args.command}: {model} · {context:,} context tokens", flush=True)
     if args.command == "claude":
