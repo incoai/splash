@@ -60,22 +60,34 @@ inline bfloat2 operand(typename F::Chunk ch, uint f, threadgroup const bfloat2 *
   }
 }
 
-// Coefficient j of a column in coefficient unit u: group gi = j / CG of the
-// unit, 16-group half h = j % CG. Formats with a min return (s, m - 128 s).
+// What coefficient j of a column in coefficient unit u is decoded from: its
+// meta unit and, for IQ3_S, chunk 0 of its group (which holds the scale).
+template <class F> struct CoefSource {
+  typename F::Meta meta;
+  typename F::Chunk chunk;
+};
 template <class F>
-inline Coef<F> coefficient(device uchar *w0, device uchar *w1, device uchar *meta, uint tile,
-                           uint groups, uint column, uint u, uint j) {
+inline CoefSource<F> coefficient_source(device uchar *w0, device uchar *w1, device uchar *meta, uint tile,
+                                        uint groups, uint column, uint u, uint j) {
   typedef Shape<F> S;
-  const uint g = u * 2 * S::UnitSpans + j / S::CG, h = j % S::CG;
+  const uint g = u * 2 * S::UnitSpans + j / S::CG;
   const uint units = groups / F::MetaGroups;
-  device uchar *mt = meta + ((ulong(tile) * units + g / F::MetaGroups) * 256 + column) * F::MetaBytes;
-  QuantCoef k;
+  CoefSource<F> src;
+  src.meta = F::loadMeta(meta + ((ulong(tile) * units + g / F::MetaGroups) * 256 + column) * F::MetaBytes);
   if constexpr (F::Kind == QuantGrid) {
     const ulong at = (ulong(tile) * groups + g) * 256 + column;
-    k = F::coef(F::loadMeta(mt), F::loadChunk(w0 + at * F::P0, w1 + at * F::P1, 0));
-  } else {
-    k = F::coef(F::loadMeta(mt), ushort(g % F::MetaGroups));
+    src.chunk = F::loadChunk(w0 + at * F::P0, w1 + at * F::P1, 0);
   }
+  return src;
+}
+// Coefficient j of a column in coefficient unit u: group gi = j / CG of the
+// unit, 16-group half h = j % CG. Formats with a min return (s, m - 128 s).
+template <class F> inline Coef<F> coefficient(CoefSource<F> src, uint u, uint j) {
+  typedef Shape<F> S;
+  const uint g = u * 2 * S::UnitSpans + j / S::CG, h = j % S::CG;
+  QuantCoef k;
+  if constexpr (F::Kind == QuantGrid) k = F::coef(src.meta, src.chunk);
+  else k = F::coef(src.meta, ushort(g % F::MetaGroups));
   if constexpr (S::HasMin) return float2(k.s.x, fma(-128.0f, k.s.x, k.m));
   else return h ? k.s.y : k.s.x;
 }
@@ -131,12 +143,23 @@ inline void decode(device const bfloat *table, device const float *sums, device 
   for (uint r = 0; r < L; ++r) acc[r][0] = acc[r][1] = float2(0);
   load(cur);
   for (uint u = u0; u < u1; ++u) {
-    // This unit's coefficients for the simdgroup's 16 columns, each decoded once.
+    // This unit's coefficients for the simdgroup's 16 columns, each decoded
+    // once. Every source load is issued before the first decode waits for one:
+    // on the 40-core M3 the zero-point formats (16 coefficients per column and
+    // unit) gain at one to four lanes, Q6_K 5120x17408 2.5/3.8/3.1/1.1% and
+    // Q3_K 7.6/4.3/3.3/2.2%; the other formats stay within 0.7%.
+    constexpr uint I = (16 * S::J + 31) / 32;
+    CoefSource<F> src[I];
+#pragma unroll
+    for (uint i = 0; i < I; ++i) {
+      const uint e = lane + 32 * i;
+      if (e < 16 * S::J) src[i] = coefficient_source<F>(w0, w1, meta, tile, groups, col0 + (e & 15), u, e >> 4);
+    }
     simdgroup_barrier(mem_flags::mem_threadgroup);
 #pragma unroll
-    for (uint i = 0; i < (16 * S::J + 31) / 32; ++i) {
+    for (uint i = 0; i < I; ++i) {
       const uint e = lane + 32 * i;
-      if (e < 16 * S::J) cu[e] = coefficient<F>(w0, w1, meta, tile, groups, col0 + (e & 15), u, e >> 4);
+      if (e < 16 * S::J) cu[e] = coefficient<F>(src[i], u, e >> 4);
     }
     simdgroup_barrier(mem_flags::mem_threadgroup);
 #pragma unroll
