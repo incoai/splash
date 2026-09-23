@@ -36,20 +36,37 @@ inline bfloat gdn_conv_carry(device const bfloat *packed,
 // The gates of one (token, value head): beta = sigmoid(b) and
 // decay = exp(a_scale * softplus(bf16(a + dt_bias))), the softplus rounded to
 // bf16 as the reference does.
-inline void gdn_write_gates(device const bfloat *packed_row,
-                            device const bfloat *dt_bias,
-                            device const float *a_scale, uint b_offset,
-                            uint a_offset, uint head, device bfloat &beta,
-                            device float &decay) {
+struct GdnGates {
+  bfloat beta;
+  float decay;
+};
+
+inline GdnGates gdn_gates(device const bfloat *packed_row,
+                          device const bfloat *dt_bias,
+                          device const float *a_scale, uint b_offset,
+                          uint a_offset, uint head) {
   float b = float(packed_row[b_offset + head]);
-  beta = bfloat(1.0f / (1.0f + fast::exp2(-1.44269504089f * b)));
+  GdnGates gates;
+  gates.beta = bfloat(1.0f / (1.0f + fast::exp2(-1.44269504089f * b)));
   bfloat x = bfloat(float(packed_row[a_offset + head]) + float(dt_bias[head]));
   float xf = float(x);
   bfloat softplus =
       bfloat(max(xf, 0.0f) +
              fast::log2(1.0f + fast::exp2(-1.44269504089f * abs(xf))) *
                  0.69314718056f);
-  decay = fast::exp(a_scale[head] * float(softplus));
+  gates.decay = fast::exp(a_scale[head] * float(softplus));
+  return gates;
+}
+
+inline void gdn_write_gates(device const bfloat *packed_row,
+                            device const bfloat *dt_bias,
+                            device const float *a_scale, uint b_offset,
+                            uint a_offset, uint head, device bfloat &beta,
+                            device float &decay) {
+  const GdnGates gates =
+      gdn_gates(packed_row, dt_bias, a_scale, b_offset, a_offset, head);
+  beta = gates.beta;
+  decay = gates.decay;
 }
 
 // The position of value head `head` among the GDN output's head blocks: the
