@@ -64,6 +64,30 @@ WeightFile GgufTargetLoader::embedding() {
                planner_.geometry().hiddenSize);
 }
 
+metal::MetalBuffer GgufTargetLoader::mapTensor(uint64_t offset, uint64_t bytes) {
+  const long pageSize = sysconf(_SC_PAGESIZE);
+  if (pageSize <= 0) throw GgufError("unable to determine the page size");
+  const uint64_t page = static_cast<uint64_t>(pageSize);
+  const uint64_t base = offset / page * page;
+  const uint64_t length = (offset - base + bytes + page - 1) / page * page;
+  auto mapping = std::make_shared<Mapping>();
+  mapping->address = mmap(nullptr, length, PROT_READ, MAP_SHARED, descriptor_,
+                          static_cast<off_t>(base));
+  if (mapping->address == MAP_FAILED) {
+    mapping->address = nullptr;
+    throw GgufError(describe("cannot map GGUF tensor", errno));
+  }
+  mapping->bytes = length;
+  // Fault only this tensor's pages. GGUF offsets are 64-bit and tensors of
+  // one layer need not be adjacent; neither gaps nor other layers need to
+  // be resident for this upload. The shader reads a tensor-local view.
+  volatile uint8_t sink = 0;
+  for (uint64_t at = 0; at < length; at += page)
+    sink ^= static_cast<const uint8_t *>(mapping->address)[at];
+  const auto source = backend_->wrapSharedMemory(mapping->address, length, mapping, "gguf/source");
+  return backend_->view(source, offset - base, bytes);
+}
+
 WeightFile GgufTargetLoader::build(const gguf::Image &image, uint32_t expectedLayer,
                                    uint32_t expectedType) {
   metal::MetalBuffer buffer = backend_->allocateBuffer(
@@ -74,27 +98,7 @@ WeightFile GgufTargetLoader::build(const gguf::Image &image, uint32_t expectedLa
   for (const gguf::Fill &fill : image.fills)
     std::memcpy(host + fill.offset, fill.bytes.data(), fill.bytes.size());
 
-  if (image.sourceEnd > image.sourceBegin) {
-    const long pageSize = sysconf(_SC_PAGESIZE);
-    if (pageSize <= 0) throw GgufError("unable to determine the page size");
-    const uint64_t page = static_cast<uint64_t>(pageSize);
-    const uint64_t base = image.sourceBegin / page * page;
-    const uint64_t length = (image.sourceEnd - base + page - 1) / page * page;
-    auto mapping = std::make_shared<Mapping>();
-    mapping->address = mmap(nullptr, length, PROT_READ, MAP_SHARED, descriptor_,
-                            static_cast<off_t>(base));
-    if (mapping->address == MAP_FAILED) {
-      mapping->address = nullptr;
-      throw GgufError(describe("cannot map GGUF tensors", errno));
-    }
-    mapping->bytes = length;
-    // Fault the pages in on the CPU: sequential reads run at disk speed and
-    // keep the GPU from stalling on page faults inside the command.
-    volatile uint8_t sink = 0;
-    for (uint64_t offset = 0; offset < length; offset += page)
-      sink ^= static_cast<const uint8_t *>(mapping->address)[offset];
-    metal::MetalBuffer source = backend_->wrapSharedMemory(
-        mapping->address, length, mapping, "gguf/" + image.name);
+  if (!image.repacks.empty() || !image.copies.empty()) {
     std::vector<GgufRepackParams> repackParams;
     std::vector<GgufCopyParams> copyParams;
     repackParams.reserve(image.repacks.size());
@@ -102,7 +106,8 @@ WeightFile GgufTargetLoader::build(const gguf::Image &image, uint32_t expectedLa
     std::vector<metal::ComputeDispatch> dispatches;
     for (const gguf::Repack &repack : image.repacks) {
       GgufRepackParams params = repack.params;
-      params.src_offset = static_cast<uint32_t>(repack.sourceOffset - base);
+      params.src_offset = 0;
+      const auto source = mapTensor(repack.sourceOffset, repack.sourceBytes);
       repackParams.push_back(params);
       const uint64_t threads = uint64_t{params.rows} * (params.input_size / 32);
       dispatches.push_back({"gguf_repack", {{0, source}, {1, buffer}},
@@ -111,7 +116,8 @@ WeightFile GgufTargetLoader::build(const gguf::Image &image, uint32_t expectedLa
     }
     for (const gguf::Copy &copy : image.copies) {
       GgufCopyParams params = copy.params;
-      params.src_offset = static_cast<uint32_t>(copy.sourceOffset - base);
+      params.src_offset = 0;
+      const auto source = mapTensor(copy.sourceOffset, copy.sourceBytes);
       copyParams.push_back(params);
       dispatches.push_back({"gguf_copy", {{0, source}, {1, buffer}},
                             {{2, &copyParams.back(), sizeof(GgufCopyParams)}},

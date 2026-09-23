@@ -55,7 +55,7 @@ struct Fill {
   std::vector<uint8_t> bytes;
 };
 struct Repack {
-  GgufRepackParams params{}; // src_offset is relative to sourceOffset until the executor binds it
+  GgufRepackParams params{}; // src_offset is zero: the executor binds a tensor-local view
   uint64_t sourceOffset = 0; // absolute file offset of the tensor data
   uint64_t sourceBytes = 0;
 };
@@ -72,8 +72,6 @@ struct Image {
   std::vector<Fill> fills;
   std::vector<Repack> repacks;
   std::vector<Copy> copies;
-  uint64_t sourceBegin = ~uint64_t{0}; // covering range of GPU-read source bytes
-  uint64_t sourceEnd = 0;
 };
 
 class ImagePlanner final {

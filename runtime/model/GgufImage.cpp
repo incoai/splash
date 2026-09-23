@@ -158,8 +158,6 @@ public:
     repack.params.permute_groups = geometry_.gdnValueHeads / geometry_.gdnKeyHeads;
     repack.sourceOffset = file_.absoluteOffset(tensor);
     repack.sourceBytes = tensor.bytes;
-    image_.sourceBegin = std::min(image_.sourceBegin, repack.sourceOffset);
-    image_.sourceEnd = std::max(image_.sourceEnd, repack.sourceOffset + repack.sourceBytes);
     image_.repacks.push_back(repack);
   }
 
@@ -230,7 +228,6 @@ public:
 
   Image finish() {
     image_.bytes = alignUp(cursor_);
-    if (image_.repacks.empty() && image_.copies.empty()) image_.sourceBegin = image_.sourceEnd = 0;
     return std::move(image_);
   }
 
@@ -258,8 +255,6 @@ private:
     copy.params.bytes = static_cast<uint32_t>(tensor.bytes);
     copy.sourceOffset = file_.absoluteOffset(tensor);
     copy.sourceBytes = tensor.bytes;
-    image_.sourceBegin = std::min(image_.sourceBegin, copy.sourceOffset);
-    image_.sourceEnd = std::max(image_.sourceEnd, copy.sourceOffset + copy.sourceBytes);
     image_.copies.push_back(copy);
   }
 
@@ -369,8 +364,9 @@ Image ImagePlanner::layer(uint32_t index) const {
   b.floatNorm((p + "attn_norm.weight").c_str(), g.hiddenSize);
   if (full) {
     b.quantized(file_.require(p + "attn_q.weight"), 2ull * g.attentionHeadDimension * (g.attentionWidth / g.attentionHeadDimension), g.hiddenSize);
-    b.quantized(file_.require(p + "attn_k.weight"), file_.require(p + "attn_k.weight").rows(), g.hiddenSize);
-    b.quantized(file_.require(p + "attn_v.weight"), file_.require(p + "attn_v.weight").rows(), g.hiddenSize);
+    const uint64_t kvRows = uint64_t{g.attentionKvHeads} * g.attentionHeadDimension;
+    b.quantized(file_.require(p + "attn_k.weight"), kvRows, g.hiddenSize);
+    b.quantized(file_.require(p + "attn_v.weight"), kvRows, g.hiddenSize);
     b.floatNorm((p + "attn_q_norm.weight").c_str(), g.attentionHeadDimension);
     b.floatNorm((p + "attn_k_norm.weight").c_str(), g.attentionHeadDimension);
     b.quantized(file_.require(p + "attn_output.weight"), g.hiddenSize, g.attentionWidth);

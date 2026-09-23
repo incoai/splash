@@ -34,6 +34,7 @@ public:
   [[nodiscard]] const gguf::ImagePlanner &planner() const noexcept { return planner_; }
 
 private:
+  [[nodiscard]] metal::MetalBuffer mapTensor(uint64_t offset, uint64_t bytes);
   [[nodiscard]] WeightFile build(const gguf::Image &image, uint32_t expectedLayer,
                                  uint32_t expectedType);
 

@@ -14,6 +14,7 @@
 #include "GgufFormatReference.hpp"
 #include "metal/abi/Gguf.h"
 #include "model/GgufImage.hpp"
+#include "model/GgufTarget.hpp"
 
 #include <CommonCrypto/CommonDigest.h>
 
@@ -137,7 +138,8 @@ std::vector<std::pair<std::string, uint32_t>> metadata(const splash::model::gguf
 
 // A version 3 GGUF of the tensors of the geometry's architecture, in order and
 // 32-byte aligned.
-std::vector<uint8_t> ggufFile(const std::vector<Tensor> &tensors, const splash::model::gguf::TargetGeometry &geometry) {
+std::vector<uint8_t> ggufFile(const std::vector<Tensor> &tensors, const splash::model::gguf::TargetGeometry &geometry,
+                             const std::string &displaced = {}) {
   constexpr uint32_t kString = 8, kUint32 = 4, kAlignment = 32;
   const std::string architecture = geometry.architecture();
   const auto keys = metadata(geometry);
@@ -159,7 +161,7 @@ std::vector<uint8_t> ggufFile(const std::vector<Tensor> &tensors, const splash::
     append<uint32_t>(out, tensor.dims.size());
     for (uint64_t dim : tensor.dims) append(out, dim);
     append(out, tensor.type);
-    append(out, offset);
+    append(out, offset + (tensor.name == displaced ? uint64_t{1} << 32 : 0));
     offset += (tensor.data.size() + kAlignment - 1) / kAlignment * kAlignment;
   }
   for (const Tensor &tensor : tensors) {
@@ -270,6 +272,7 @@ void checkFloatTensors() {
   geometry.gdnHeadDimension = 64;
   geometry.convolutionDimension = 1280; // q and k of 4 heads, v of 12
   geometry.attentionWidth = 512;        // two query heads of 256
+  geometry.attentionKvHeads = 2;
   geometry.fullAttentionPeriod = 2;     // layer 1
   const uint32_t hidden = geometry.hiddenSize, heads = geometry.gdnValueHeads, head = 256;
   const uint64_t valueRows = uint64_t{heads} * geometry.gdnHeadDimension;
@@ -327,8 +330,8 @@ void checkFloatTensors() {
   add(norms[2], {hidden}, kF32, norm(hidden));
   add(norms[3], {hidden}, kF32, norm(hidden));
   add("blk.1.attn_q.weight", {hidden, 2 * geometry.attentionWidth}, kQ4_K);
-  add("blk.1.attn_k.weight", {hidden, head}, kQ4_K);
-  add("blk.1.attn_v.weight", {hidden, head}, kQ4_K);
+  add("blk.1.attn_k.weight", {hidden, geometry.attentionKvHeads * head}, kQ4_K);
+  add("blk.1.attn_v.weight", {hidden, geometry.attentionKvHeads * head}, kQ4_K);
   add(norms[4], {head}, kF32, norm(head));
   add(norms[5], {head}, kF32, norm(head));
   add("blk.1.attn_output.weight", {geometry.attentionWidth, hidden}, kQ4_K);
@@ -375,6 +378,17 @@ void checkFloatTensors() {
   });
   if (!error.empty()) std::fprintf(stderr, "%s\n", error.c_str());
   check(stored && !bfloatExact, "planner keeps every norm's F32 values as stored");
+  for (const char *name : {"blk.1.attn_k.weight", "blk.1.attn_v.weight"}) {
+    for (uint64_t rows : {uint64_t{head}, uint64_t{3 * head}}) {
+      std::vector<Tensor> malformed = tensors;
+      auto &t = *std::find_if(malformed.begin(), malformed.end(),
+                              [&](const Tensor &value) { return value.name == name; });
+      t.dims[1] = rows;
+      t.data.resize(rows * hidden / 256 * 144);
+      check(plan(malformed, images) == std::string("unexpected shape for ") + name,
+            std::string("planner rejects mismatched KV rows: ") + name + " rows=" + std::to_string(rows));
+    }
+  }
   for (const char *name : {"blk.0.ssm_conv1d.weight", "blk.0.ssm_dt.bias"}) {
     std::vector<Tensor> inexact = tensors;
     const float value = 1.0f + 0x1p-10f;
@@ -389,7 +403,7 @@ void checkFloatTensors() {
 // rows, in grouped head order, values as stored), the F32 router and
 // shared-expert gate copied as stored, and each 3-D expert tensor repacked as
 // one tensor of experts * N rows. The metadata and architecture must match.
-void checkMoeLayer() {
+void checkMoeLayer(const char *metallib) {
   namespace model = splash::model;
   using namespace model::ggml;
   model::gguf::TargetGeometry geometry;
@@ -517,6 +531,47 @@ void checkMoeLayer() {
   dense.intermediateSize = 256;
   check(planError(dense).find("GGUF architecture is qwen35, but the package's target is qwen35moe") != std::string::npos,
         "planner checks the architecture against the package");
+  if (metallib) {
+    // A layer may have tensors on opposite sides of the 4 GiB boundary.
+    // Keep the file sparse and poison the old location so a truncated offset
+    // cannot accidentally read the right data. Exercise both repack and copy.
+    try {
+      splash::metal::MetalBackend backend(metallib);
+      auto &down = *std::find_if(tensors.begin(), tensors.end(), [](const Tensor &t) {
+        return t.name == "blk.0.ffn_down_exps.weight";
+      });
+      down.data = fixture(Q5K, experts * hidden, width, 507);
+      const auto load = [&] {
+        model::GgufTargetLoader loader(backend, path, geometry);
+        auto weights = loader.layer(0);
+        const auto bytes = weights.section(weights.record().declaredBytes - model::kWeightFileAlignment);
+        const auto *begin = static_cast<const uint8_t *>(bytes.contents());
+        std::vector<uint8_t> image(begin, begin + bytes.sizeBytes());
+        weights.finish();
+        return image;
+      };
+      write(geometry);
+      const auto expected = load();
+      for (const char *name : {"blk.0.ffn_down_exps.weight", "blk.0.ffn_gate_inp.weight"}) {
+        write(geometry);
+        const model::GgufFile original(path);
+        const uint64_t offset = original.absoluteOffset(original.require(name));
+        const auto &tensor = *std::find_if(tensors.begin(), tensors.end(),
+                                          [&](const Tensor &t) { return t.name == name; });
+        auto bytes = ggufFile(tensors, geometry, name);
+        std::fill_n(bytes.begin() + offset, tensor.data.size(), 0);
+        {
+          std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+          stream.write(reinterpret_cast<const char *>(bytes.data()), bytes.size());
+          stream.seekp(static_cast<std::streamoff>(offset + (uint64_t{1} << 32)));
+          stream.write(reinterpret_cast<const char *>(tensor.data.data()), tensor.data.size());
+        }
+        check(load() == expected, std::string("loader keeps weights exact beyond 4 GiB: ") + name);
+      }
+    } catch (const std::exception &error) {
+      check(false, std::string("large-offset loader: ") + error.what());
+    }
+  }
   std::filesystem::remove_all(directory);
 }
 
@@ -644,7 +699,7 @@ int main(int argc, char **argv) {
     checkGoldens(ggml);
     checkAlphaBeta();
     checkFloatTensors();
-    checkMoeLayer();
+    checkMoeLayer(std::string(argv[1]) == "--cpu" ? nullptr : argv[1]);
     if (std::string(argv[1]) != "--cpu") {
       Gpu gpu{MTLCreateSystemDefaultDevice(), nil, nil, nil};
       gpu.queue = [gpu.device newCommandQueue];

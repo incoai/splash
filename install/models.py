@@ -530,15 +530,18 @@ def resolve_gguf(manifest, variant: str, token) -> Path:
         token=token or False,
         endpoint=HUB_ENDPOINT,
     )
-    path = Path(hf_hub_download(**options)).resolve()
+    # Keep the snapshot path: resolving its file symlink to a blob loses the
+    # revision we must retain while an installed model uses these weights.
+    path = Path(hf_hub_download(**options)).absolute()
     # Hub metadata authenticates the expected file, not the local cache contents.
     # As for shared artifacts, repair a corrupt cached file once before failing.
     if not _gguf_content_matches(path, entry):
-        path = Path(hf_hub_download(force_download=True, **options)).resolve()
+        path = Path(hf_hub_download(force_download=True, **options)).absolute()
         if not _gguf_content_matches(path, entry):
             raise ModelError(
                 f"downloaded GGUF checksum or size changed: {entry['file']}"
             )
+    _snapshot_revision(path.parent, table["repo_id"])
     return path
 
 
@@ -560,10 +563,11 @@ def _cached_gguf(manifest, variant: str):
     )
     if not isinstance(path, str):
         return None
-    resolved = Path(path).resolve()
-    if not _gguf_content_matches(resolved, entry):
+    cached = Path(path).absolute()
+    if not _gguf_content_matches(cached, entry):
         return None
-    return resolved
+    _snapshot_revision(cached.parent, table["repo_id"])
+    return cached
 
 
 def _cached_snapshot(model_id):
@@ -743,6 +747,11 @@ def prepare(args):
             _snapshot_revision(installed_snapshot(root), repo_id)
             manifest = validate_package_manifest(root / "manifest.json")
             selected = select_variant(manifest, variant)
+            source_snapshot = None
+            if selected is not None:
+                target = root / gguf_record(manifest, selected)["path"]
+                source_snapshot = target.readlink().parent
+                _snapshot_revision(source_snapshot, gguf_table(manifest)["repo_id"])
             verify_artifacts(
                 root, manifest, full=False, variant=selected, installed=True
             )
@@ -760,11 +769,16 @@ def prepare(args):
             snapshot = resolve_snapshot(args.model)
             manifest = validate_package_manifest(snapshot / "manifest.json")
             selected = select_variant(manifest, variant)
-            ref = _retain_snapshot_ref(snapshot, repo_id, root)
+            refs = [_retain_snapshot_ref(snapshot, repo_id, root)]
             if selected is None:
                 install_snapshot(snapshot, root)
             else:
                 gguf = resolve_target_gguf(manifest, selected)
+                refs.append(
+                    _retain_snapshot_ref(
+                        gguf.parent, gguf_table(manifest)["repo_id"], root
+                    )
+                )
                 install_variant(snapshot, root, manifest, selected, gguf)
             manifest = validate_package_manifest(root / "manifest.json")
             verify_artifacts(
@@ -774,7 +788,13 @@ def prepare(args):
         else:
             print(f"Splash model {args.model} is already installed in {root}")
             try:
-                ref = _retain_snapshot_ref(installed_snapshot(root), repo_id, root)
+                refs = [_retain_snapshot_ref(installed_snapshot(root), repo_id, root)]
+                if source_snapshot is not None:
+                    refs.append(
+                        _retain_snapshot_ref(
+                            source_snapshot, gguf_table(manifest)["repo_id"], root
+                        )
+                    )
             except OSError as error:
                 if error.errno not in (errno.EACCES, errno.EPERM, errno.EROFS):
                     raise
@@ -788,9 +808,10 @@ def prepare(args):
         # Retire this installation's previous pins only after publishing and
         # verifying its new destination. Other installations own other folders.
         try:
-            for previous in ref.parent.iterdir():
-                if previous != ref and is_hex_digest(previous.name, 40):
-                    previous.unlink()
+            for ref in refs:
+                for previous in ref.parent.iterdir():
+                    if previous not in refs and is_hex_digest(previous.name, 40):
+                        previous.unlink()
         except OSError as error:
             # Keeping an old pin uses cache space but cannot invalidate the
             # verified installation or its successfully retained current pin.

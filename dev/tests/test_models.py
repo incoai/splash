@@ -133,10 +133,16 @@ class ModelArtifactTest(unittest.TestCase):
 
     def gguf_fixture(self, name, index):
         """A stand-in GGUF in a fake Hub cache; 4 KiB per variant index."""
-        path = self.root / "gguf-cache" / f"Model-{name}.gguf"
+        repository = (
+            self.root / "gguf-cache" / ("models--" + self.GGUF_REPO.replace("/", "--"))
+        )
+        path = repository / "snapshots" / ("b" * 40) / f"Model-{name}.gguf"
         if not path.exists():
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(bytes([index + 1]) * (4096 * (index + 1)))
+            blob = repository / "blobs" / f"blob-{index}"
+            blob.parent.mkdir(exist_ok=True)
+            blob.write_bytes(bytes([index + 1]) * (4096 * (index + 1)))
+            path.symlink_to(blob)
         return path
 
     @staticmethod
@@ -837,9 +843,7 @@ class ModelArtifactTest(unittest.TestCase):
             ],
         )
         self.manifest_download.return_value = str(gguf)
-        self.assertEqual(
-            artifacts.resolve_gguf(manifest, "UD-Q4_K_M", None), gguf.resolve()
-        )
+        self.assertEqual(artifacts.resolve_gguf(manifest, "UD-Q4_K_M", None), gguf)
         self.manifest_download.assert_called_with(
             repo_id=self.GGUF_REPO,
             filename=entry["file"],
@@ -854,6 +858,54 @@ class ModelArtifactTest(unittest.TestCase):
         self.api.return_value.model_info.return_value.siblings = []
         with self.assertRaisesRegex(artifacts.ModelError, "does not match"):
             artifacts.resolve_gguf(manifest, "UD-Q4_K_M", None)
+
+    def test_gguf_install_retains_source_snapshot_and_repairs_pin_offline(self):
+        from huggingface_hub import scan_cache_dir
+
+        snapshot, _ = self.package_fixture(variants=("UD-Q4_K_M",))
+        source = self.gguf_fixture("UD-Q4_K_M", 0)
+        self.configure_hub(snapshot)
+        args = SimpleNamespace(
+            models=self.root / "models", model=self.MODEL_ID + ":UD-Q4_K_M"
+        )
+        with (
+            mock.patch.object(artifacts, "resolve_gguf", return_value=source),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            artifacts.prepare(args)
+        cache = self.root / "gguf-cache"
+        scanned = scan_cache_dir(cache)
+        self.assertFalse(scanned.warnings)
+        revision = next(iter(next(iter(scanned.repos)).revisions))
+        self.assertTrue(revision.refs)
+        # Detached-revision pruning must leave the installed target intact.
+        detached = [
+            r.commit_hash
+            for repo in scanned.repos
+            for r in repo.revisions
+            if not r.refs
+        ]
+        scanned.delete_revisions(*detached).execute()
+        root = artifacts.installed_root(args.models, args.model)
+        target = root / "target/Model-UD-Q4_K_M.gguf"
+        self.assertEqual(target.readlink(), source)
+        self.assertEqual(target.read_bytes(), source.read_bytes())
+
+        ref_root = source.parent.parent.parent / "refs/splash"
+        refs = list(ref_root.glob("*/*"))
+        self.assertEqual(len(refs), 1)
+        refs[0].unlink()
+        with (
+            mock.patch.object(
+                artifacts, "resolve_target_gguf", side_effect=AssertionError("network")
+            ),
+            mock.patch.object(
+                artifacts, "resolve_snapshot", side_effect=AssertionError("network")
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            artifacts.prepare(args)
+        self.assertEqual(refs[0].read_text(), "b" * 40)
 
     def test_gguf_repairs_same_size_corruption_and_rejects_bad_download(self):
         _, manifest = self.package_fixture(variants=("UD-Q4_K_M",))
@@ -878,9 +930,7 @@ class ModelArtifactTest(unittest.TestCase):
             return str(gguf)
 
         self.manifest_download.side_effect = fetch
-        self.assertEqual(
-            artifacts.resolve_gguf(manifest, "UD-Q4_K_M", None), gguf.resolve()
-        )
+        self.assertEqual(artifacts.resolve_gguf(manifest, "UD-Q4_K_M", None), gguf)
         self.assertEqual(self.manifest_download.call_count, 2)
         self.assertTrue(self.manifest_download.call_args.kwargs["force_download"])
         self.assertEqual(gguf.read_bytes(), good)
@@ -896,9 +946,7 @@ class ModelArtifactTest(unittest.TestCase):
         ):
             self.assertIsNone(artifacts._cached_gguf(manifest, "UD-Q4_K_M"))
             gguf.write_bytes(good)
-            self.assertEqual(
-                artifacts._cached_gguf(manifest, "UD-Q4_K_M"), gguf.resolve()
-            )
+            self.assertEqual(artifacts._cached_gguf(manifest, "UD-Q4_K_M"), gguf)
 
     def test_publish_refuses_to_replace_a_real_directory(self):
         snapshot, _ = self.package_fixture()
