@@ -96,15 +96,14 @@ MoeWorkspace workspaceFor(MoeShape shape, uint32_t rows, uint32_t tileRows,
   const uint64_t groupedRows = uint64_t{tiles} * tileRows;
   const uint32_t widest = std::max(shape.hiddenSize, shape.expertIntermediateSize);
   const uint32_t outputWidth = splitExperts ? widest : shape.hiddenSize;
-  // The router's rows x 256 scores (bf16, fp32 for a GGUF's F32 router) live
-  // in the grouped input until the gather overwrites them. Register plans
-  // also hold the down pass's Table16 tiles there, and one tile's row sums
-  // take 3 K / 4 fp32 (kernels/common/gguf_sgmatrix.h).
-  const uint64_t scoreBytes = uint64_t{rows} * 256 *
-      (shape.quant == QuantFamily::Gguf ? sizeof(float) : sizeof(uint16_t));
+  // The router's rows x 256 fp32 scores live in the grouped input until the
+  // gather overwrites them. Register plans also hold the down pass's Table16
+  // tiles there, and one tile's row sums take 3 K / 4 fp32
+  // (kernels/common/gguf_sgmatrix.h).
+  const uint64_t scoreBytes = uint64_t{rows} * 256 * sizeof(float);
   const uint64_t sumsBytes = ggufTile == MoeGgufTile::Register
       ? uint64_t{tiles} * (uint64_t{widest} * 3 / 4) * sizeof(float) : 0;
-  return {routes * sizeof(uint32_t), routes * sizeof(uint16_t),
+  return {routes * sizeof(uint32_t), routes * sizeof(float),
           uint64_t{tiles} * sizeof(MoeTileDescriptor), sizeof(uint32_t),
           groupedRows * sizeof(uint32_t), routes * sizeof(uint32_t),
           std::max(groupedRows * (ggufTile == MoeGgufTile::Register ? widest : shape.hiddenSize) *

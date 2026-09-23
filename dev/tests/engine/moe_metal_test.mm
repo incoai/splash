@@ -323,7 +323,7 @@ void check(const Fixture &fixture, uint32_t rows, uint32_t tileRows,
   const auto *selected =
       static_cast<const uint32_t *>(fixture.buffers.selectedExperts.contents());
   const auto *routing =
-      static_cast<const __bf16 *>(fixture.buffers.routingWeights.contents());
+      static_cast<const float *>(fixture.buffers.routingWeights.contents());
   const auto *actual = static_cast<const __bf16 *>(fixture.buffers.output.contents());
   const auto *tileCount =
       static_cast<const uint32_t *>(fixture.buffers.tileCount.contents());
@@ -368,8 +368,8 @@ void check(const Fixture &fixture, uint32_t rows, uint32_t tileRows,
     std::array<uint32_t, kExperts> ordered;
     std::iota(ordered.begin(), ordered.end(), 0);
     std::sort(ordered.begin(), ordered.end(), [&](uint32_t left, uint32_t right) {
-      const float a = bf16(4.0F * x[left]);
-      const float b = bf16(4.0F * x[right]);
+      const float a = 4.0F * x[left];
+      const float b = 4.0F * x[right];
       return a != b ? a > b : left < right;
     });
     const uint32_t first = selected[row * kRoutesPerRow];
@@ -377,20 +377,20 @@ void check(const Fixture &fixture, uint32_t rows, uint32_t tileRows,
     require(first == ordered[0] && second == ordered[1],
             label + ": routing does not follow the router scores at row " +
                 std::to_string(row));
-    const float route0 = float(routing[row * kRoutesPerRow]);
-    const float route1 = float(routing[row * kRoutesPerRow + 1]);
-    const float expectedRoute0 = bf16(1.0F / (1.0F + std::exp(
-        bf16(4.0F * x[ordered[1]]) - bf16(4.0F * x[ordered[0]]))));
-    const float expectedRoute1 = bf16(1.0F / (1.0F + std::exp(
-        bf16(4.0F * x[ordered[0]]) - bf16(4.0F * x[ordered[1]]))));
-    require(std::abs(route0 + route1 - 1.0F) < 0.01F &&
-                std::abs(route0 - expectedRoute0) < 0.004F &&
-                std::abs(route1 - expectedRoute1) < 0.004F,
+    const float route0 = routing[row * kRoutesPerRow];
+    const float route1 = routing[row * kRoutesPerRow + 1];
+    const float expectedRoute0 = 1.0F / (1.0F + std::exp(
+        4.0F * x[ordered[1]] - 4.0F * x[ordered[0]]));
+    const float expectedRoute1 = 1.0F / (1.0F + std::exp(
+        4.0F * x[ordered[0]] - 4.0F * x[ordered[1]]));
+    require(std::abs(route0 + route1 - 1.0F) < 1e-5F &&
+                std::abs(route0 - expectedRoute0) < 1e-5F &&
+                std::abs(route1 - expectedRoute1) < 1e-5F,
             label + ": routing weights differ from CPU softmax");
     // The shared expert is the last route: its id is the expert count and
     // its weight the sigmoid of the scalar gate, here bias-only 0.003 * sum.
     const uint32_t sharedRoute = row * kRoutesPerRow + kTopK;
-    const float sharedWeight = float(routing[sharedRoute]);
+    const float sharedWeight = routing[sharedRoute];
     const float expectedSharedWeight =
         1.0F / (1.0F + std::exp(-sum * bf16(0.003F)));
     require(selected[sharedRoute] == kExperts &&
@@ -441,7 +441,7 @@ void check(const Fixture &fixture, uint32_t rows, uint32_t tileRows,
                         0.02F + 0.01F * std::abs(down[n]),
                 label + ": grouped down differs from CPU reference");
       const float weight = slot == 0 ? expectedRoute0 :
-                           slot == 1 ? expectedRoute1 : bf16(expectedSharedWeight);
+                           slot == 1 ? expectedRoute1 : expectedSharedWeight;
       for (uint32_t column = 0; column < kHidden; ++column) {
         expected[column] += weight * down[column];
         magnitude[column] += std::abs(weight * down[column]);
@@ -462,7 +462,7 @@ void check(const Fixture &fixture, uint32_t rows, uint32_t tileRows,
              std::to_string(expectedRoute0) + ", " +
              std::to_string(route1) + "/" + std::to_string(expectedRoute1) +
              ", shared " + std::to_string(sharedWeight) + "/" +
-             std::to_string(bf16(expectedSharedWeight)) +
+             std::to_string(expectedSharedWeight) +
              ", contribution magnitude " + std::to_string(magnitude[column]) + ")");
       }
     }
@@ -507,11 +507,11 @@ void checkPlan(const MoePlan &plan) {
   const auto &w = plan.workspace();
   require(plan.maximumTiles() == tiles &&
               w.selectedExpertsBytes == routes * 4 &&
-              w.routingWeightsBytes == routes * 2 &&
+              w.routingWeightsBytes == routes * 4 &&
               w.tileDescriptorsBytes == tiles * 8 && w.tileCountBytes == 4 &&
               w.groupedRoutesBytes == grouped * 4 && w.routeRowsBytes == routes * 4 &&
               w.groupedInputBytes == std::max<uint64_t>(
-                  grouped * shape.hiddenSize * 2, rows * 256 * 2) &&
+                  grouped * shape.hiddenSize * 2, rows * 256 * 4) &&
               w.expertIntermediateBytes == grouped * shape.expertIntermediateSize * 2 &&
               w.expertOutputBytes == grouped * outputWidth * 2,
           "candidate workspace disagrees with independent geometry bound");
@@ -770,15 +770,16 @@ Q8Projection randomRouter(MetalBackend &backend, Random &random) {
 }
 
 // Both scores tiles must write bitwise-identical scores for the same rows, so
-// routing never depends on the tile the row count selects, and the scores
-// must match an fp64 reference of the affine Q8 projection to bf16 rounding.
+// routing never depends on the tile the row count selects, and the fp32
+// scores must match an fp64 reference of the affine Q8 projection to fp32
+// accumulation: K u (u = 2^-24) times the magnitudes its terms sum.
 void routerTiles(MetalBackend &backend, const Fixture &fixture) {
   Random random(0x7a11);
   const Q8Projection router = randomRouter(backend, random);
   const auto *weights = static_cast<const uint8_t *>(router.weights.contents());
   const auto *scales = static_cast<const __bf16 *>(router.scales.contents());
   const auto *biases = static_cast<const __bf16 *>(router.biases.contents());
-  const uint64_t scoreBytes = uint64_t{kMaximumRows} * kStorageN * 2;
+  const uint64_t scoreBytes = uint64_t{kMaximumRows} * kStorageN * 4;
   MetalBuffer narrow = shared(backend, scoreBytes, "scores-m8");
   MetalBuffer wide = shared(backend, scoreBytes, "scores-m32");
   for (const uint32_t rows : {8U, 33U, kMaximumRows}) {
@@ -795,27 +796,29 @@ void routerTiles(MetalBackend &backend, const Fixture &fixture) {
     (void)backend.submitCommand(graph.dispatches());
     const std::string label = "router tiles rows=" + std::to_string(rows);
     require(std::memcmp(narrow.contents(), wide.contents(),
-                        uint64_t{rows} * kStorageN * 2) == 0,
+                        uint64_t{rows} * kStorageN * 4) == 0,
             label + ": 8-row and 32-row tiles disagree");
-    const auto *values = static_cast<const __bf16 *>(narrow.contents());
+    const auto *values = static_cast<const float *>(narrow.contents());
     for (uint32_t row = 0; row < rows; ++row) {
       for (uint32_t expert = 0; expert < kStorageN; ++expert) {
         double reference = 0;
+        double magnitude = 0;
         for (uint32_t g = 0; g < kHidden / 64; ++g) {
-          double dot = 0;
-          double sum = 0;
+          const double scale = float(scales[g * kStorageN + expert]);
+          const double bias = float(biases[g * kStorageN + expert]);
           for (uint32_t k = g * 64; k < g * 64 + 64; ++k) {
             const double x = fixture.input[row][k];
-            dot += x * weights[(uint64_t{g} * kStorageN + expert) * 64 +
-                               k % 64];
-            sum += x;
+            const double q =
+                weights[(uint64_t{g} * kStorageN + expert) * 64 + k % 64];
+            reference += x * (q * scale + bias);
+            // The kernel sums the two affine terms apart.
+            magnitude += std::abs(x) * (q * std::abs(scale) + std::abs(bias));
           }
-          reference += dot * float(scales[g * kStorageN + expert]) +
-                       sum * float(biases[g * kStorageN + expert]);
         }
-        const float value = float(values[uint64_t{row} * kStorageN + expert]);
-        require(std::isfinite(value) && std::abs(value - reference) <=
-                                            std::abs(reference) / 128 + 1e-3,
+        const float value = values[uint64_t{row} * kStorageN + expert];
+        require(std::isfinite(value) &&
+                    std::abs(value - reference) <=
+                        std::ldexp(magnitude * kHidden, -24),
                 label + ": scores differ from the fp64 reference");
       }
     }
@@ -837,7 +840,7 @@ void run(const std::string &metallibPath) {
     // count: another lane count or chunk size changes a row's tile position
     // and neighbours, never its routes (the B1..B4 invariant).
     std::vector<uint32_t> sharedSelected;
-    std::vector<uint16_t> sharedRouting;
+    std::vector<float> sharedRouting;
     auto execute = [&](const MoePlan &plan, const std::string &label) {
       allocateScratch(backend, fixture, plan);
       CommandGraph graph;
@@ -851,7 +854,7 @@ void run(const std::string &metallibPath) {
       ++cases;
       const auto *selected = static_cast<const uint32_t *>(
           fixture.buffers.selectedExperts.contents());
-      const auto *routing = static_cast<const uint16_t *>(
+      const auto *routing = static_cast<const float *>(
           fixture.buffers.routingWeights.contents());
       const size_t routes = size_t{plan.rows()} * kRoutesPerRow;
       const size_t common = std::min(routes, sharedSelected.size());

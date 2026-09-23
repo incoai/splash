@@ -423,7 +423,7 @@ std::vector<uint16_t> runPlan(MetalBackend &backend, const Model &m, Buffers &b,
   MoE::add(graph, b.moe, m.weights, plan);
   static_cast<void>(backend.submitCommand(graph.dispatches()));
   const auto *selected = static_cast<const uint32_t *>(b.moe.selectedExperts.contents());
-  const auto *routing = static_cast<const __bf16 *>(b.moe.routingWeights.contents());
+  const auto *routing = static_cast<const float *>(b.moe.routingWeights.contents());
   const auto *routeRows = static_cast<const uint32_t *>(b.moe.routeRows.contents());
   const auto *intermediate = static_cast<const __bf16 *>(b.moe.expertIntermediate.contents());
   const auto *down = static_cast<const __bf16 *>(b.moe.expertOutput.contents());
@@ -451,16 +451,23 @@ std::vector<uint16_t> runPlan(MetalBackend &backend, const Model &m, Buffers &b,
               label + ": row " + std::to_string(r) + " routes expert " + std::to_string(got) + " at rank " +
                   std::to_string(rank) + ", fp64 ranks " + std::to_string(want));
     }
-    double denominator = 0;
-    for (uint32_t rank = 0; rank < kTopK; ++rank) denominator += std::exp(score[order[rank]] - score[order[0]]);
+    // fp32 weights: a softmax weight moves by at most twice the largest score
+    // error of the routes (relative), a sigmoid by its argument's error.
+    double denominator = 0, scoreError = 0;
+    for (uint32_t rank = 0; rank < kTopK; ++rank) {
+      denominator += std::exp(score[order[rank]] - score[order[0]]);
+      scoreError = std::max(scoreError, bound[order[rank]]);
+    }
     for (uint32_t rank = 0; rank < kTopK; ++rank) {
       const double want = std::exp(score[order[rank]] - score[order[0]]) / denominator;
-      require(std::fabs(float(routing[r * kRoutes + rank]) - want) <= std::ldexp(want, -7) + 1e-6,
+      require(std::fabs(routing[r * kRoutes + rank] - want) <= want * (2 * scoreError + std::ldexp(1.0, -18)),
               label + ": routing weight of row " + std::to_string(r) + " differs from the fp64 softmax");
     }
-    const double sharedWeight = 1.0 / (1.0 + std::exp(-dot(x, m.sharedGate.row(0), kHidden).value));
+    const Dot gate = dot(x, m.sharedGate.row(0), kHidden);
+    const double sharedWeight = 1.0 / (1.0 + std::exp(-gate.value));
     require(selected[r * kRoutes + kTopK] == kExperts &&
-                std::fabs(float(routing[r * kRoutes + kTopK]) - sharedWeight) <= std::ldexp(sharedWeight, -7),
+                std::fabs(routing[r * kRoutes + kTopK] - sharedWeight) <=
+                    sharedWeight * (floatBound(gate, kHidden) + std::ldexp(1.0, -18)),
             label + ": shared expert route of row " + std::to_string(r) + " is wrong");
 
     // Each route: silu(gate) * up from the fp64 products, then down over the
@@ -521,7 +528,7 @@ std::vector<uint16_t> runPlan(MetalBackend &backend, const Model &m, Buffers &b,
         stats.downFlips += got != bf16(y.value);
         stats.downWorst = std::max(stats.downWorst, std::fabs(got - y.value) / y.magnitude);
         ++stats.outputs;
-        const double weight = float(routing[route]);
+        const double weight = routing[route];
         expected[n] += weight * got;
         magnitude[n] += std::fabs(weight * got);
       }

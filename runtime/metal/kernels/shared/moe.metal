@@ -7,7 +7,7 @@
 // carries top_k routed experts plus the shared expert (id `experts`), weighted
 // by the sigmoid of its scalar gate. Experts use the StorageN=256 Q4 layout.
 //
-// Routing first writes 256 bf16 scores per row, then sorts them. Q8 affine
+// Routing first writes 256 fp32 scores per row, then sorts them. Q8 affine
 // terms accumulate per K slice, and slices sum in fixed order so both score
 // tile shapes produce identical results. The 8-row tile favors short chunks;
 // the 32-row tile amortizes weight loads over longer chunks. Measurements
@@ -40,7 +40,7 @@ kernel void moe_route_scores_q8_m8(
     device uint8_t *router_weights [[buffer(1)]],
     device bfloat *router_scales [[buffer(2)]],
     device bfloat *router_biases [[buffer(3)]],
-    device bfloat *scores [[buffer(4)]],
+    device float *scores [[buffer(4)]],
     constant MoeRouteParams &params [[buffer(5)]],
     uint2 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
@@ -144,8 +144,7 @@ kernel void moe_route_scores_q8_m8(
   for (uint s = 0; s < kMoeRouteSlices; ++s)
     total += partials[(s * Rows + row) * TileN + column];
   if (row < live_rows) {
-    scores[ulong(row_base + row) * StorageN + expert_origin + column] =
-        bfloat(total);
+    scores[ulong(row_base + row) * StorageN + expert_origin + column] = total;
   }
 }
 
@@ -157,7 +156,7 @@ kernel void moe_route_scores_q8_m32(
     device uint8_t *router_weights [[buffer(1)]],
     device bfloat *router_scales [[buffer(2)]],
     device bfloat *router_biases [[buffer(3)]],
-    device bfloat *scores [[buffer(4)]],
+    device float *scores [[buffer(4)]],
     constant MoeRouteParams &params [[buffer(5)]],
     uint2 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
@@ -259,7 +258,7 @@ kernel void moe_route_scores_q8_m32(
     auto index = total.get_multidimensional_index(i);
     if (uint(index[1]) < live_rows) {
       scores[ulong(row_base + index[1]) * StorageN + expert_origin +
-             index[0]] = bfloat(total[i]);
+             index[0]] = total[i];
     }
   });
 }
@@ -292,11 +291,15 @@ inline float moe_shared_gate_weight(MoeSharedGateF32 gate, uint dimension) {
 // reduces the shared expert's scalar gate with a fixed partial-sum order, and
 // simdgroup 0 orders the experts, descending score then ascending id, which
 // is the order the shape's routing and tie-break contract requires. Scores
-// are the bf16 Q8 router scores or the fp32 scores of a GGUF's F32 router.
-template <typename Score, class SharedGate>
-inline void moe_route_select(device const Score *scores, device bfloat *input,
+// and routing weights are fp32. On 40,960 router rows each of real 35B prose,
+// code and chat, top-8 sets chosen from bf16-rounded scores differ from the
+// fp64 choice on 12-15% of rows (fp32: at most 0.0024%), and bf16 weights
+// round 19-20% of the combine's outputs away from bf16 of its exact sum
+// (fp32: 0.008%).
+template <class SharedGate>
+inline void moe_route_select(device const float *scores, device bfloat *input,
                              SharedGate shared_gate, device uint *selected,
-                             device bfloat *routing_weights,
+                             device float *routing_weights,
                              constant MoeRouteParams &params, uint group,
                              uint thread_index, uint simd_lane,
                              uint simd_group, threadgroup float *row_scores,
@@ -310,7 +313,7 @@ inline void moe_route_select(device const Score *scores, device bfloat *input,
     return;
   row_scores[thread_index] =
       thread_index < params.experts
-          ? float(scores[ulong(row) * StorageN + thread_index])
+          ? scores[ulong(row) * StorageN + thread_index]
           : -numeric_limits<float>::infinity();
 
   device bfloat *row_input = input + ulong(row) * params.input_size;
@@ -331,7 +334,7 @@ inline void moe_route_select(device const Score *scores, device bfloat *input,
       total += scalar_partials[partial];
     selected[row_routes + params.top_k] = params.experts;
     routing_weights[row_routes + params.top_k] =
-        bfloat(1.0f / (1.0f + fast::exp2(-1.44269504089f * total)));
+        1.0f / (1.0f + fast::exp2(-1.44269504089f * total));
   }
   if (simd_group != 0)
     return;
@@ -367,20 +370,20 @@ inline void moe_route_select(device const Score *scores, device bfloat *input,
       denominator +=
           fast::exp2((ordered[other] - ordered[0]) * 1.44269504089f);
     }
-    routing_weights[row_routes + rank] = bfloat(
+    routing_weights[row_routes + rank] =
         fast::exp2((ordered[rank] - ordered[0]) * 1.44269504089f) /
-        denominator);
+        denominator;
   }
 }
 
 kernel void moe_route_select_q8(
-    device const bfloat *scores [[buffer(0)]],
+    device const float *scores [[buffer(0)]],
     device bfloat *input [[buffer(1)]],
     device uint8_t *shared_weights [[buffer(2)]],
     device bfloat *shared_scales [[buffer(3)]],
     device bfloat *shared_biases [[buffer(4)]],
     device uint *selected [[buffer(5)]],
-    device bfloat *routing_weights [[buffer(6)]],
+    device float *routing_weights [[buffer(6)]],
     constant MoeRouteParams &params [[buffer(7)]],
     uint group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
@@ -402,7 +405,7 @@ kernel void moe_route_select_f32(
     device bfloat *input [[buffer(1)]],
     device const float *shared_gate [[buffer(2)]],
     device uint *selected [[buffer(3)]],
-    device bfloat *routing_weights [[buffer(4)]],
+    device float *routing_weights [[buffer(4)]],
     constant MoeRouteParams &params [[buffer(5)]],
     uint group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
@@ -760,7 +763,7 @@ kernel void moe_expert_down_q4_m8_n256_sg4(
 kernel void moe_combine(
     device const bfloat *expert_output [[buffer(0)]],
     device const uint *route_rows [[buffer(1)]],
-    device const bfloat *routing_weights [[buffer(2)]],
+    device const float *routing_weights [[buffer(2)]],
     device const bfloat *residual [[buffer(3)]],
     device bfloat *output [[buffer(4)]],
     constant MoeCombineParams &params [[buffer(5)]],
@@ -773,7 +776,7 @@ kernel void moe_combine(
   float value = float(residual[ulong(row) * params.hidden_size + dimension]);
   ulong route = ulong(row) * params.routes_per_row;
   for (uint slot = 0; slot < params.routes_per_row; ++slot) {
-    value += float(routing_weights[route + slot]) *
+    value += routing_weights[route + slot] *
              float(expert_output[ulong(route_rows[route + slot]) *
                                      params.hidden_size +
                                  dimension]);

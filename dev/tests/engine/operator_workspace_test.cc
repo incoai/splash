@@ -84,7 +84,7 @@ void checkMoe(splash::ops::MoeWorkspace workspace,
                          (rows + tileRows - 1) / tileRows;
   const uint64_t grouped = tiles * tileRows;
   require(workspace.selectedExpertsBytes == routes * 4 &&
-              workspace.routingWeightsBytes == routes * 2 &&
+              workspace.routingWeightsBytes == routes * 4 &&
               workspace.tileDescriptorsBytes == tiles * 8 &&
               workspace.tileCountBytes == 4 &&
               workspace.groupedRoutesBytes == grouped * 4 &&

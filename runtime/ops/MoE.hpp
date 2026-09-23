@@ -231,12 +231,12 @@ struct MoeBuffers final {
   metal::MetalBuffer input;
   metal::MetalBuffer residual;
   metal::MetalBuffer output;
-  // rows * routesPerToken() routes: expert ids and routing weights.
+  // rows * routesPerToken() routes: expert ids and fp32 routing weights.
   metal::MetalBuffer selectedExperts;
   metal::MetalBuffer routingWeights;
   // Sized by moeMaximumTiles(): tile descriptors, one tile count, the route
   // at each grouped row, each route's grouped row, and the grouped rows'
-  // inputs, intermediates and outputs. The router parks its bf16 scores in
+  // inputs, intermediates and outputs. The router parks its fp32 scores in
   // groupedInput until the gather claims it.
   metal::MetalBuffer tileDescriptors;
   metal::MetalBuffer tileCount;
