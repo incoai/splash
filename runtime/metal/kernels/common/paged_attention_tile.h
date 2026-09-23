@@ -1,6 +1,5 @@
 #pragma once
 
-
 #include "metal/abi/PagedAttention.h"
 #include "metal/kernels/common/q8_paging.h"
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
@@ -9,7 +8,8 @@
 using namespace metal;
 using namespace mpp::tensor_ops;
 
-// Paged INT8 attention with one fp32 scale per (token, KV head). The preceding
+// Paged attention over INT8 or BF16 KV. INT8 has one fp32 scale per
+// (token, KV head); BF16 reads the stored values directly. The preceding
 // store writes current rows to their final slots; committed_tokens controls
 // visibility, and the next command overwrites rejected verify rows.
 //
@@ -85,8 +85,9 @@ inline uint splash_attention_pages_per_split(uint pages, uint splits) {
 // flag. Existing threadgroup barriers separate reset, concurrent set, and
 // read; relaxed atomics make the same-value writes safe without changing
 // arithmetic.
-template <uint QueryHeadsPerKVHead, uint RowsPerTile, bool ScaleInSoftmax>
-inline void splash_q8_page_softmax(
+template <uint QueryHeadsPerKVHead, uint RowsPerTile, bool ScaleInSoftmax,
+          bool Quantized>
+inline void splash_attention_page_softmax(
     threadgroup const float *scores, threadgroup bfloat *probabilities,
     threadgroup float *row_max, threadgroup float *row_sum,
     threadgroup float *previous_scale, threadgroup atomic_uint *rescale,
@@ -117,7 +118,7 @@ inline void splash_q8_page_softmax(
   float score[TokensPerLane];
   {
     float4 low = scores4[0], high = scores4[1];
-    if constexpr (ScaleInSoftmax) {
+    if constexpr (Quantized && ScaleInSoftmax) {
       low *= key_scales[vector];
       high *= key_scales[vector + 1];
     }
@@ -156,8 +157,11 @@ inline void splash_q8_page_softmax(
       atomic_store_explicit(rescale, 1u, memory_order_relaxed);
   }
   // Masked tokens stay exactly zero whatever their stored value scale holds.
-  const float4 low_scales = value_scales[vector],
-               high_scales = value_scales[vector + 1];
+  float4 low_scales(1.0f), high_scales(1.0f);
+  if constexpr (Quantized) {
+    low_scales = value_scales[vector];
+    high_scales = value_scales[vector + 1];
+  }
   const float4 low(token + 0 < limit ? probability[0] * low_scales.x : 0.0f,
                    token + 1 < limit ? probability[1] * low_scales.y : 0.0f,
                    token + 2 < limit ? probability[2] * low_scales.z : 0.0f,
@@ -179,11 +183,11 @@ inline void splash_q8_page_softmax(
 // fused rows form one contiguous M x D tensor. Three barriers per page order
 // the score store, the softmax and the probability reads of PV.
 template <uint KVHeads, uint QueryHeadsPerKVHead, uint RowsPerTile,
-          bool ScaleInSoftmax>
-inline void splash_q8_attention_direct_tile(
-    device bfloat *tile_queries, device int8_t *q8_keys,
-    device const float *q8_key_scales, device int8_t *q8_values,
-    device const float *q8_value_scales, device const uint *page_table,
+          bool ScaleInSoftmax, typename CacheElement>
+inline void splash_paged_attention_tile(
+    device bfloat *tile_queries, device CacheElement *cache_keys,
+    device const float *key_scales_buffer, device CacheElement *cache_values,
+    device const float *value_scales_buffer, device const uint *page_table,
     uint kv_head, uint committed_tokens, uint active_rows, uint splits,
     uint split, device float *partials, device float *statistics, ulong slot,
     threadgroup float *scores, threadgroup bfloat *probabilities,
@@ -191,6 +195,7 @@ inline void splash_q8_attention_direct_tile(
     threadgroup float *previous_scale, threadgroup atomic_uint *rescale,
     uint thread_index) {
   constexpr ushort M = RowsPerTile * QueryHeadsPerKVHead;
+  constexpr bool Quantized = is_same<CacheElement, int8_t>::value;
   constexpr ushort N = SplashQ8PageTokens;
   constexpr ushort D = SplashQ8HeadDimension;
   uint visible_tokens = committed_tokens + active_rows;
@@ -210,12 +215,12 @@ inline void splash_q8_attention_direct_tile(
   auto st = tensor(scores, dextents<int, 2>{N, M}, array<int, 2>{1, N});
   auto pt = tensor(probabilities, dextents<int, 2>{N, M}, array<int, 2>{1, N});
   auto p0 = pt.slice<N, M>(0, 0);
-  auto key_type = tensor(q8_keys, dextents<int, 2>{D, N}, array<int, 2>{1, D});
+  auto key_type = tensor(cache_keys, dextents<int, 2>{D, N}, array<int, 2>{1, D});
   auto value_type =
-      tensor(q8_values, dextents<int, 2>{N, D}, array<int, 2>{1, N});
+      tensor(cache_values, dextents<int, 2>{N, D}, array<int, 2>{1, N});
   auto q0 = qt.slice<D, M>(0, 0);
-  auto k0 = key_type.slice<D, N>(0, 0);
-  auto v0 = value_type.slice<N, D>(0, 0);
+  auto k0 = key_type.template slice<D, N>(0, 0);
+  auto v0 = value_type.template slice<N, D>(0, 0);
   // QK writes a complete page score tile; PV accumulates the running output.
   // Key scaling is a precompiled placement choice; both use the same QK/PV.
   constexpr auto qk_descriptor =
@@ -242,21 +247,25 @@ inline void splash_q8_attention_direct_tile(
     uint physical = page_table[page];
     uint token_start = page * N;
     auto kt = tensor(
-        q8_keys + splash_q8_key_index<KVHeads>(physical, kv_head, 0, 0),
+        cache_keys + splash_q8_key_index<KVHeads>(physical, kv_head, 0, 0),
         dextents<int, 2>{D, N}, array<int, 2>{1, D});
     auto vt = tensor(
-        q8_values + splash_q8_value_index<KVHeads>(physical, kv_head, 0, 0),
+        cache_values + splash_q8_value_index<KVHeads>(physical, kv_head, 0, 0),
         dextents<int, 2>{N, D}, array<int, 2>{1, N});
-    ulong scale_index = splash_q8_scale_index<KVHeads>(physical, kv_head, 0);
-    device const float *key_scales = q8_key_scales + scale_index;
-    device const float *value_scales = q8_value_scales + scale_index;
+    device const float *key_scales = nullptr;
+    device const float *value_scales = nullptr;
+    if constexpr (Quantized) {
+      ulong scale_index = splash_q8_scale_index<KVHeads>(physical, kv_head, 0);
+      key_scales = key_scales_buffer + scale_index;
+      value_scales = value_scales_buffer + scale_index;
+    }
 
     auto page_scores = qk.template get_destination_cooperative_tensor<
         decltype(q0), decltype(k0), float>();
     // One full-dimension product initializes the score CT through MPP.
     auto ks = kt.template slice<D, N>(0, 0);
     qk.run(q0, ks, page_scores);
-    if constexpr (!ScaleInSoftmax) {
+    if constexpr (Quantized && !ScaleInSoftmax) {
       const bool scores_full =
           uint(page_scores.get_capacity()) * (8u * 32u) == uint(M) * N;
 #pragma unroll
@@ -271,8 +280,8 @@ inline void splash_q8_attention_direct_tile(
     if (thread_index == 0)
       atomic_store_explicit(rescale, 0u, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    splash_q8_page_softmax<QueryHeadsPerKVHead, RowsPerTile,
-                             ScaleInSoftmax>(
+    splash_attention_page_softmax<QueryHeadsPerKVHead, RowsPerTile,
+                             ScaleInSoftmax, Quantized>(
         scores, probabilities, row_max, row_sum, previous_scale, rescale,
         reinterpret_cast<device const float4 *>(key_scales),
         reinterpret_cast<device const float4 *>(value_scales), token_start,

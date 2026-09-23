@@ -1,4 +1,4 @@
-#include "ops/Q8PageStorage.hpp"
+#include "ops/PageStorage.hpp"
 #include "engine/MemoryGovernor.hpp"
 #include "engine/MemoryPlan.hpp"
 
@@ -89,14 +89,14 @@ void run(const std::string &metallib) {
             EngineMemoryPolicy::hostAvailableReserveBytes(128 * (1ULL << 30)) ==
                 2 * (1ULL << 30),
             "the macOS reserve is a tenth of a small machine, 2 GiB above 20 GiB");
-    constexpr kv::Q8Layout q8Layout{16, 4, 256};
-    constexpr kv::Q8Layout compactLayout{10, 2, 256};
+    constexpr kv::Layout kvLayout{16, 4, 256};
+    constexpr kv::Layout compactLayout{10, 2, 256};
     // 64 KiB sparse tiles: the 512-byte-per-page scale buffers force
     // 128-page mapping batches for four KV heads and 256 for two.
     static_assert(kv::kSparseMappingAlignmentBytes == 64 * 1024);
-    static_assert(q8Layout.bytesPerModelPage() == 1'064'960);
-    static_assert(q8Layout.sparseMappingBatchPages() == 128);
-    static_assert(q8Layout.backingExtentPages() == 128);
+    static_assert(kvLayout.bytesPerModelPage() == 1'064'960);
+    static_assert(kvLayout.sparseMappingBatchPages() == 128);
+    static_assert(kvLayout.backingExtentPages() == 128);
     static_assert(compactLayout.bytesPerModelPage() == 332'800);
     static_assert(compactLayout.sparseMappingBatchPages() == 256);
     static_assert(compactLayout.backingExtentPages() == 512);
@@ -298,8 +298,8 @@ void run(const std::string &metallib) {
         backend, backend.capabilities().recommendedMaxWorkingSetBytes,
         128ULL * 1024 * 1024,
         [&elasticHostAvailable] { return elasticHostAvailable; });
-    kv::Q8PageStorage hostGatedStorage(
-        backend, hostGated.allocationAdmission(), q8Layout, 256);
+    kv::PageStorage hostGatedStorage(
+        backend, hostGated.allocationAdmission(), kvLayout, 256);
     if (hostGatedStorage.residentPages() != 128) {
         throw std::runtime_error(
             "elastic Q8 storage started with " +
@@ -317,16 +317,16 @@ void run(const std::string &metallib) {
 
     MemoryGovernor governor(
         backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
-    kv::Q8PageStorage storage(backend, governor.allocationAdmission(),
-                              q8Layout,
-                              q8Layout.sparseMappingBatchPages());
+    kv::PageStorage storage(backend, governor.allocationAdmission(),
+                              kvLayout,
+                              kvLayout.sparseMappingBatchPages());
     require(storage.declaredBytes() ==
-                q8Layout.sparseMappingBatchPages() *
-                    q8Layout.bytesPerModelPage(),
+                kvLayout.sparseMappingBatchPages() *
+                    kvLayout.bytesPerModelPage(),
             "declared Q8 pool bytes are wrong");
     require(storage.actualAllocatedBytes() == storage.declaredBytes(),
             "granularity-aligned Q8 pool has hidden Metal rounding");
-    require(storage.residentPages() == q8Layout.sparseMappingBatchPages() &&
+    require(storage.residentPages() == kvLayout.sparseMappingBatchPages() &&
                 storage.isResident(0),
             "initial Q8 runway residency is incorrect");
     const auto residentBefore = backend.memoryStats().sparseResidentBytes;
@@ -353,7 +353,7 @@ void run(const std::string &metallib) {
     storage.awaitRelease();
     require(storage.releaseReady(), "drained Q8 storage still reports a pending release");
 
-    kv::Q8PageStorage compactStorage(
+    kv::PageStorage compactStorage(
         backend, governor.allocationAdmission(), compactLayout,
         compactLayout.sparseMappingBatchPages());
     require(static_cast<bool>(compactStorage.layer(9).keyData) &&
@@ -364,7 +364,27 @@ void run(const std::string &metallib) {
                     compactLayout.sparseMappingBatchPages(),
             "model-provided compact Q8 geometry was not honored");
 
-    std::cout << "q8 page storage tests passed\n";
+    for (auto layout : {kvLayout, compactLayout}) {
+        layout.format = kv::Format::BFloat16;
+        const uint32_t extent = layout.backingExtentPages();
+        kv::PageStorage bf16(backend, governor.allocationAdmission(), layout,
+                             2 * extent);
+        const auto &layer = bf16.layer(layout.attentionLayers - 1);
+        require(layer.format == kv::Format::BFloat16 && layer.keyData && layer.valueData &&
+                    !layer.keyScales && !layer.valueScales,
+                "BF16 allocated quantization scales or omitted data");
+        require(bf16.residentPages() == extent && !bf16.isResident(extent) &&
+                    bf16.actualAllocatedBytes() == extent * layout.bytesPerModelPage(),
+                "BF16 initial residency escaped its admitted extent");
+        require(bf16.ensureResident(extent) && bf16.residentPages() == 2 * extent &&
+                    bf16.actualAllocatedBytes() == bf16.declaredBytes(),
+                "BF16 growth did not account for both mapped extents");
+        require(bf16.releaseBackingForPage(extent), "BF16 extent release failed");
+        bf16.awaitRelease();
+        require(!bf16.isResident(extent) && bf16.ensureResident(extent),
+                "BF16 extent could not be remapped after release");
+    }
+    std::cout << "KV page storage tests passed\n";
 }
 
 }  // namespace

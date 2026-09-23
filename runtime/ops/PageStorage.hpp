@@ -10,19 +10,19 @@
 
 namespace splash::kv {
 
-// Physical storage for Q8 pages. Active requests may overwrite slots at or
+// Physical storage for paged KV. Active requests may overwrite slots at or
 // beyond their logical commit index. Cached KV blocks reference only fully
 // committed pages, which are immutable while shared.
-class Q8PageStorage final : public Backing {
+class PageStorage final : public Backing {
 public:
-  Q8PageStorage(metal::MetalBackend &backend,
+  PageStorage(metal::MetalBackend &backend,
                 metal::AllocationAdmission admitAllocation,
-                Q8Layout layout,
+                Layout layout,
                 uint32_t pageCount);
-  ~Q8PageStorage() override;
+  ~PageStorage() override;
 
-  Q8PageStorage(const Q8PageStorage &) = delete;
-  Q8PageStorage &operator=(const Q8PageStorage &) = delete;
+  PageStorage(const PageStorage &) = delete;
+  PageStorage &operator=(const PageStorage &) = delete;
 
   [[nodiscard]] uint32_t pageCount() const noexcept override {
     return pageCount_;
@@ -30,7 +30,7 @@ public:
   [[nodiscard]] uint64_t bytesPerPage() const noexcept override {
     return layout_.bytesPerModelPage();
   }
-  [[nodiscard]] Q8Layout layout() const noexcept { return layout_; }
+  [[nodiscard]] Layout layout() const noexcept { return layout_; }
   [[nodiscard]] uint32_t sparseMappingBatchPages() const noexcept {
     return layout_.sparseMappingBatchPages();
   }
@@ -51,7 +51,7 @@ public:
   void awaitRelease() override;
   [[nodiscard]] uint32_t extentFirstPage(uint32_t page) const override;
   [[nodiscard]] uint32_t extentPageCount(uint32_t page) const override;
-  [[nodiscard]] const Q8LayerStorage &layer(uint32_t index) const;
+  [[nodiscard]] const LayerStorage &layer(uint32_t index) const;
 
 private:
   struct Extent {
@@ -66,9 +66,9 @@ private:
 
   metal::MetalBackend &backend_;
   metal::AllocationAdmission admitAllocation_;
-  Q8Layout layout_;
+  Layout layout_;
   uint32_t pageCount_ = 0;
-  std::vector<Q8LayerStorage> layers_;
+  std::vector<LayerStorage> layers_;
   std::vector<Extent> extents_;
   uint64_t residentBackingBytes_ = 0;
   uint32_t residentPages_ = 0;

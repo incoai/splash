@@ -76,6 +76,7 @@ void testCleanRuntimeStatus() {
   engine.scheduler.prefillRows = 4096;
   engine.scheduler.decodeBatches = 4;
   engine.scheduler.decodeBatchesByWidth = {1, 1, 1, 1};
+  engine.scheduler.decodeMixedGreedySamplingBatches = 2;
   engine.resources.pool = {256, 200, 24, 32, 128, 72, 1, 128 * 4096ULL,
                            32 * 4096ULL};
   engine.resources.kvCache = {32, 32 * 4096ULL};
@@ -106,8 +107,8 @@ void testCleanRuntimeStatus() {
   engine::RuntimeCacheIdentity identity;
   identity.modelLayoutSha256 = std::string(64, 'a');
   identity.buildId = "build";
-  identity.q8Layout = kv::makeQ8LayoutGuard({16, 4, 256}, {});
-  identity.q8Layout.modelArtifactSha256.fill(0xbc);
+  identity.kvLayout = kv::makeLayoutGuard({16, 4, 256}, {});
+  identity.kvLayout.modelArtifactSha256.fill(0xbc);
   identity.namespaceSha256 = std::string(64, 'd');
 
   metal::MetalMemoryStats metal;
@@ -168,6 +169,17 @@ void testCleanRuntimeStatus() {
   const std::string json =
       runtimeStatusJson(memoryPlan, engine, metal, warmup, audit(memoryPlan),
                         metrics, executorTelemetry, identity, governor, true);
+  require(json.find("\"kv\":{\"target_model_sha256\"") != std::string::npos &&
+              json.find("\"q8\":{\"target_model_sha256\"") != std::string::npos,
+          "INT8 status lost its generic or legacy identity");
+  auto bf16Identity = identity;
+  bf16Identity.kvLayout = kv::makeLayoutGuard({16, 4, 256, kv::Format::BFloat16}, {});
+  const auto bf16Status = runtimeStatusJson(memoryPlan, engine, metal, warmup, audit(memoryPlan),
+                        metrics, executorTelemetry, bf16Identity, governor, true);
+  require(bf16Status.find("\"format\":\"bf16\"") != std::string::npos &&
+              bf16Status.find("\"scale_type\":\"none\"") != std::string::npos &&
+              bf16Status.find("\"q8\":") == std::string::npos,
+          "BF16 cache identity advertised INT8 storage");
   require(json.find("\"schema_version\":5") != std::string::npos &&
               json.find("\"ready\":true") != std::string::npos,
           "status readiness/schema is wrong");
@@ -222,6 +234,17 @@ void testCleanRuntimeStatus() {
               json.find("\"decode_batches_by_width\":{\"b1\":1,\"b2\":1,\"b3\":"
                         "1,\"b4\":1}") != std::string::npos,
           "Page32 or real B3 status is missing");
+  require(json.find("\"decode_mixed_greedy_sampling_batches\":2}") !=
+              std::string::npos,
+          "status lost the mixed greedy/sampling decode count");
+  auto idleEngine = engine;
+  idleEngine.scheduler = {};
+  const auto idleJson = runtimeStatusJson(
+      memoryPlan, idleEngine, metal, warmup, audit(memoryPlan), metrics,
+      executorTelemetry, identity, governor, true);
+  require(idleJson.find("\"decode_mixed_greedy_sampling_batches\":0}") !=
+              std::string::npos,
+          "status omitted the zero mixed decode count");
   require(
       json.find("\"dynamic_budget_bytes\"") != std::string::npos &&
           json.find("\"resource_replay_tokens\":1234") != std::string::npos &&

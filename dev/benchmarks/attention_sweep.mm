@@ -8,7 +8,7 @@
 //
 // usage: attention-sweep METALLIB [--histories 0,2048,...] [--shapes 27b,35b]
 //                        [--lanes 1,4] [--repeat N] [--phases both|verify|prefill]
-//                        [--compare-metallib PATH]
+//                        [--compare-metallib PATH] [--kv-format int8|bf16]
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "ops/ExecutionPlans.hpp"
@@ -70,7 +70,7 @@ struct Plan final {
   std::array<uint64_t, kTensorCount> sizes{};
   uint64_t bytes = 0;
 
-  kv::Q8Layout layout() const { return {1, shape.kvHeads, shape.headDimension}; }
+  kv::Layout layout() const { return {1, shape.kvHeads, shape.headDimension, shape.format}; }
   // The verify plan scales each lane's split count with its own history.
   std::span<const uint32_t> laneHistories() const { return {histories.data(), lanes}; }
   void size(Tensor tensor, uint64_t value) { sizes[tensorIndex(tensor)] = value; }
@@ -137,7 +137,7 @@ public:
       offset += aligned(plan_.sizes[i]);
     }
     layer_ = {get(Tensor::Keys), get(Tensor::KeyScales), get(Tensor::Values),
-              get(Tensor::ValueScales)};
+              get(Tensor::ValueScales), plan_.shape.format};
     for (uint32_t lane = 0; lane < plan_.lanes; ++lane) {
       tables_[lane] = get(static_cast<Tensor>(tensorIndex(Tensor::Table0) + lane));
       stores_[lane] = {plan_.histories[lane], plan_.rows, plan_.stride, plan_.pages[lane],
@@ -179,12 +179,18 @@ public:
     return result;
   }
 
-  uint64_t historyBytesInt8() const {
-    // Key and value int8 payload plus one float scale per 32-token page row.
+  bool sameOutput(const Fixture &other) const {
+    const auto left = get(Tensor::Output), right = other.get(Tensor::Output);
+    return left.sizeBytes() == right.sizeBytes() &&
+           std::memcmp(left.contents(), right.contents(), left.sizeBytes()) == 0;
+  }
+
+  uint64_t historyBytes() const {
+    // Both cache payloads, including scales only for INT8.
     uint64_t tokens = 0;
     for (uint32_t lane = 0; lane < plan_.lanes; ++lane)
       tokens += uint64_t{plan_.histories[lane]} + plan_.rows;
-    return tokens * plan_.shape.kvHeads * (2 * kDimension + 2 * sizeof(float));
+    return tokens * (plan_.layout().bytesPerLayerPage() / kPageRows);
   }
 
 private:
@@ -209,13 +215,22 @@ private:
           const uint64_t scale =
               (uint64_t{table[token / kPageRows]} * plan_.shape.kvHeads + head) * kPageRows +
               token % kPageRows;
-          keyScales[scale] = 0.006f;
-          valueScales[scale] = 0.007f;
+          if (plan_.shape.format == kv::Format::Int8) {
+            keyScales[scale] = 0.006f;
+            valueScales[scale] = 0.007f;
+          }
           for (uint32_t d = 0; d < kDimension; ++d) {
-            keys[scale * kDimension + d] =
-                int((uint64_t{token} * 37 + head * 101 + d * 17 + lane * 7) % 255) - 127;
-            values[(scale / kPageRows * kDimension + d) * kPageRows + scale % kPageRows] =
-                int((uint64_t{token} * 53 + head * 79 + d * 29 + lane * 19) % 255) - 127;
+            const int key = int((uint64_t{token} * 37 + head * 101 + d * 17 + lane * 7) % 255) - 127;
+            const int value = int((uint64_t{token} * 53 + head * 79 + d * 29 + lane * 19) % 255) - 127;
+            const uint64_t ki = scale * kDimension + d;
+            const uint64_t vi = (scale / kPageRows * kDimension + d) * kPageRows + scale % kPageRows;
+            if (plan_.shape.format == kv::Format::Int8) {
+              keys[ki] = key;
+              values[vi] = value;
+            } else {
+              static_cast<uint16_t *>(get(Tensor::Keys).contents())[ki] = bf16(key * 0.006f);
+              static_cast<uint16_t *>(get(Tensor::Values).contents())[vi] = bf16(value * 0.007f);
+            }
           }
         }
       }
@@ -252,7 +267,7 @@ private:
   Plan plan_;
   metal::MetalBuffer base_;
   std::array<metal::MetalBuffer, kTensorCount> buffers_{};
-  kv::Q8LayerStorage layer_;
+  kv::LayerStorage layer_;
   std::array<metal::MetalBuffer, kMaximumLanes> tables_{};
   std::array<kv::Q8ChunkedPrefillParams, kMaximumLanes> stores_{};
   std::array<kv::Q8VerifyAttentionParams, kMaximumLanes> attention_{};
@@ -261,7 +276,7 @@ private:
 struct Case final {
   double fusedMilliseconds = 0.0;
   std::map<std::string, double> pipelineMilliseconds;
-  uint64_t int8Bytes = 0;
+  uint64_t kvBytes = 0;
 };
 
 double median(std::vector<double> values) {
@@ -277,13 +292,16 @@ std::vector<Case> measure(std::span<metal::MetalBackend *> backends,
   for (size_t i = 0; i < backends.size(); ++i) {
     fixtures.push_back(std::make_unique<Fixture>(*backends[i], plan));
     graphs.push_back(fixtures.back()->graph());
-    results[i].int8Bytes = fixtures.back()->historyBytesInt8();
+    results[i].kvBytes = fixtures.back()->historyBytes();
   }
   // Warm every variant, then alternate order to limit clock/thermal drift.
   double warmup = 0.0;
   while (warmup < 0.1)
     for (size_t i = 0; i < backends.size(); ++i)
       warmup += backends[i]->submitCommand(graphs[i].dispatches()).gpuSeconds;
+  for (size_t i = 1; i < fixtures.size(); ++i)
+    if (!fixtures[0]->sameOutput(*fixtures[i]))
+      throw std::runtime_error("comparison metallib changed attention output bits");
   std::vector<std::vector<double>> fused(backends.size());
   std::vector<std::map<std::string, std::vector<double>>> perPipeline(backends.size());
   for (uint32_t round = 0; round < repeat; ++round)
@@ -343,7 +361,7 @@ std::string json(const Case &item, const std::string &shape, uint32_t history,
   std::string out = "{\"variant\":" + std::to_string(variant) + ",\"shape\":\"" + shape + "\",\"history\":" + std::to_string(history) +
                     ",\"kind\":\"" + kind + "\",\"lanes\":" + std::to_string(lanes) +
                     ",\"fused_ms\":" + std::to_string(item.fusedMilliseconds) +
-                    ",\"int8_kv_bytes\":" + std::to_string(item.int8Bytes) + ",\"pipelines\":{";
+                    ",\"kv_bytes\":" + std::to_string(item.kvBytes) + ",\"pipelines\":{";
   bool first = true;
   for (const auto &[name, milliseconds] : item.pipelineMilliseconds) {
     out += (first ? "" : ",") + std::string("\"") + name + "\":" + std::to_string(milliseconds);
@@ -359,13 +377,14 @@ int main(int argc, const char *argv[]) {
     if (argc < 2) {
       std::cerr << "usage: attention-sweep METALLIB [--histories LIST] [--shapes 27b,35b] "
                    "[--lanes LIST] [--repeat N] [--phases both|verify|prefill] "
-                   "[--compare-metallib PATH]\n";
+                   "[--compare-metallib PATH] [--kv-format int8|bf16]\n";
       return 64;
     }
     std::vector<uint32_t> histories{0, 2048, 8192, 16384, 32768, 65536, 131072};
     std::vector<uint32_t> lanes{1, 4};
     std::vector<std::string> shapes{"27b", "35b"};
     uint32_t repeat = 5;
+    kv::Format format = kv::Format::Int8;
     std::string comparisonLibrary, phases = "both";
     for (int index = 2; index < argc; index += 2) {
       const std::string option(argv[index]);
@@ -378,6 +397,12 @@ int main(int argc, const char *argv[]) {
         lanes = parseList(argv[index + 1], 1, kMaximumLanes, option);
       else if (option == "--repeat")
         repeat = parseCount(argv[index + 1], 1, std::numeric_limits<uint32_t>::max(), option);
+      else if (option == "--kv-format") {
+        const std::string_view value(argv[index + 1]);
+        if (value != "int8" && value != "bf16")
+          throw std::invalid_argument("--kv-format takes int8 or bf16");
+        format = value == "int8" ? kv::Format::Int8 : kv::Format::BFloat16;
+      }
       else if (option == "--compare-metallib") comparisonLibrary = argv[index + 1];
       else if (option == "--phases") {
         phases = argv[index + 1];
@@ -408,12 +433,12 @@ int main(int argc, const char *argv[]) {
       backends.push_back(comparison.get());
     }
     std::cerr << "device " << backend.capabilities().deviceName << ", one attention layer, "
-              << "Page32 Q8 KV, median of " << repeat << " fused graphs (ms)\n";
-    std::cout << "{\"device\":\"" << backend.capabilities().deviceName << "\",\"cases\":[";
+              << "Page32 " << kv::formatName(format) << " KV, median of " << repeat << " fused graphs (ms)\n";
+    std::cout << "{\"device\":\"" << backend.capabilities().deviceName << "\",\"kv_format\":\"" << kv::formatName(format) << "\",\"cases\":[";
     bool firstCase = true;
     for (const std::string &shape : shapes) {
-      const AttentionShape geometry = shape == "27b" ? AttentionShape{24, 4, 256}
-                                                     : AttentionShape{16, 2, 256};
+      const AttentionShape geometry = shape == "27b" ? AttentionShape{24, 4, 256, format}
+                                                     : AttentionShape{16, 2, 256, format};
       const std::string name = shape == "27b" ? "qwen3.8-27b" : "qwen3.6-35b-a3b";
       std::cerr << "\n" << name << "  (" << geometry.queryHeads << " query heads, "
                 << geometry.kvHeads << " KV heads, d=" << geometry.headDimension << ")\n";

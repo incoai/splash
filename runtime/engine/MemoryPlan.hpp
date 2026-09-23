@@ -35,7 +35,7 @@ struct ModelMemoryFootprint final {
 struct ModelMemoryProfile final {
   std::string name;
   uint32_t maximumContextTokens = 0;
-  kv::Q8Layout targetKvLayout;
+  kv::Layout targetKvLayout;
   ModelMemoryFootprint footprint;
 
   [[nodiscard]] std::optional<std::string> validationError() const;

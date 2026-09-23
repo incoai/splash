@@ -49,7 +49,7 @@ struct Qwen3_8Layout final {
   [[nodiscard]] constexpr uint32_t attentionLayerCount() const noexcept {
     return fullAttentionPeriod ? layers / fullAttentionPeriod : 0;
   }
-  [[nodiscard]] constexpr kv::Q8Layout q8Layout() const noexcept {
+  [[nodiscard]] constexpr kv::Layout kvLayout() const noexcept {
     return {attentionLayerCount(), attentionKvHeads,
             attentionHeadDimension};
   }

@@ -49,6 +49,7 @@ if __package__:
         is_finite_number,
         metrics_dict,
         prometheus_metrics,
+        timings_dict,
         usage_dict,
     )
     from .output import (
@@ -84,7 +85,13 @@ else:
     from frontend import REASONING_EFFORTS, Frontend, validate_served_model_name
     from http_security import authenticate, validate_api_key, validate_headers
     from latency import RequestLatency
-    from metrics import is_finite_number, metrics_dict, prometheus_metrics, usage_dict
+    from metrics import (
+        is_finite_number,
+        metrics_dict,
+        prometheus_metrics,
+        timings_dict,
+        usage_dict,
+    )
     from output import (
         ReasoningSplitter,
         StreamingToolCallProjector,
@@ -387,6 +394,8 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     "object": "model",
                     "created": 0,
                     "owned_by": "splash",
+                    "max_model_len": self.app.max_context,
+                    "context_length": self.app.max_context,
                     **({"root": self.app.model} if name != self.app.model else {}),
                 }
                 for name in self.app.model_names
@@ -1534,6 +1543,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     created,
                     {},
                     finish_reason(result, tool_calls),
+                    timings=timings_dict(result),
                 )
             )
             if stream_options.get("include_usage"):
@@ -1858,6 +1868,12 @@ def parse_args(argv=None):
     parser.add_argument("--max-context", type=_parse_max_context, default=None)
     parser.add_argument("--max-memory", type=_parse_max_memory, default=None)
     parser.add_argument(
+        "--kv-format",
+        choices=("int8", "bf16"),
+        default="int8",
+        help="target KV cache storage (default: int8); bf16 uses more memory",
+    )
+    parser.add_argument(
         "--max-request-size",
         type=_parse_request_size,
         default=DEFAULT_MAX_REQUEST_BYTES,
@@ -1912,6 +1928,8 @@ def _native_command(args):
         "auto" if args.max_context is None else str(args.max_context),
         "auto" if args.max_memory is None else str(args.max_memory),
     ]
+    if args.kv_format != "int8":
+        command.extend(("--kv-format", args.kv_format))
     return command
 
 

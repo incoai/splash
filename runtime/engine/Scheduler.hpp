@@ -50,6 +50,9 @@ struct SchedulerSnapshot final {
   uint64_t decodeBatches = 0;
   std::array<uint64_t, model::ExecutionLimits::maximumBatchWidth>
       decodeBatchesByWidth{};
+  // Committed decode batches containing both Greedy and Sampling requests.
+  // Counts scheduler dispatches, not completed GPU commands or sampled tokens.
+  uint64_t decodeMixedGreedySamplingBatches = 0;
 };
 
 // One single-owner policy for the specialized backend. Prefill packs the
@@ -110,6 +113,11 @@ private:
     uint32_t overtaken = 0;
   };
 
+  struct PrefillRequestView final {
+    const Request *request = nullptr;
+    uint32_t promptProcessed = 0;
+  };
+
   [[nodiscard]] Request &get(uint64_t requestId);
   [[nodiscard]] const Request &get(uint64_t requestId) const;
   [[nodiscard]] static bool terminal(Phase phase) noexcept;
@@ -118,10 +126,10 @@ private:
   [[nodiscard]] std::optional<BatchPlan> nextPrefill() const;
   [[nodiscard]] std::optional<BatchPlan> nextDecode() const;
   [[nodiscard]] std::optional<BatchPlan>
-  planPrefill(std::vector<const Request *> ready) const;
+  planPrefill(std::vector<PrefillRequestView> ready) const;
   [[nodiscard]] uint32_t
-  prefillBudget(const Request &leader,
-                std::span<const Request *const> ready) const;
+  prefillBudget(const PrefillRequestView &leader,
+                std::span<const PrefillRequestView> ready) const;
 
   std::unordered_map<uint64_t, Request> requests_;
   std::optional<BatchPlan> active_;

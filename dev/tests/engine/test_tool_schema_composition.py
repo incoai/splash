@@ -5,7 +5,7 @@ import unittest
 from llguidance import LLMatcher
 
 from dev.tests.engine import test_structured_tools as structured
-from server import output, tool_schema
+from server import api_shapes, output, tool_schema
 from server.errors import APIError
 
 
@@ -16,7 +16,7 @@ class ToolSchemaCompositionTests(unittest.TestCase):
         cls.tokenizer = structured.StructuredToolGrammarTest.tokenizer
         cls.guidance = structured.StructuredToolGrammarTest.guidance
 
-    def check_arguments(self, schema, arguments, invalid):
+    def check_arguments(self, schema, arguments, invalid, *, order=None):
         original = copy.deepcopy(schema)
         tools = [
             {"type": "function", "function": {"name": "test", "parameters": schema}}
@@ -27,6 +27,9 @@ class ToolSchemaCompositionTests(unittest.TestCase):
         shape = policy.argument_schemas["test"]
         names = [name for name in shape["properties"] if name in arguments]
         names += [name for name in arguments if name not in shape["properties"]]
+        if order is not None:
+            self.assertEqual(set(order), set(names))
+            names = order
         xml = "<tool_call>\n<function=test>\n"
         for name in names:
             value = arguments[name]
@@ -59,6 +62,81 @@ class ToolSchemaCompositionTests(unittest.TestCase):
         with self.assertRaises(APIError):
             output.validate_tool_calls(calls, policy)
         return policy, xml
+
+    def test_early_optional_fields_remain_available_after_required_fields(self):
+        schema = {
+            "type": "object",
+            "properties": {
+                "content": {"type": "string"},
+                "name": {"type": "string"},
+                "tags": {"type": "array", "items": {"type": "string"}},
+                "type": {"enum": ["txt", "group"]},
+            },
+            "required": ["name", "type"],
+            "additionalProperties": False,
+        }
+        arguments = {
+            "content": "正文\nSecond line",
+            "name": "Note",
+            "tags": [],
+            "type": "txt",
+        }
+        for order in (list(schema["properties"]), ["name", "type", "content", "tags"]):
+            with self.subTest(order=order):
+                policy, xml = self.check_arguments(
+                    schema, arguments, {"content": "missing name/type"}, order=order
+                )
+                grammar = tool_schema.tool_grammar(policy, False)
+                for bad in (
+                    xml.replace("<parameter=name>\nNote\n</parameter>\n", ""),
+                    xml.replace(
+                        "<parameter=name>\nNote\n</parameter>\n",
+                        "<parameter=name>\nNote\n</parameter>\n" * 2,
+                    ),
+                ):
+                    matcher = LLMatcher(self.guidance, grammar)
+                    tokens = self.tokenizer.encode(bad).ids
+                    self.assertLess(matcher.validate_tokens(tokens), len(tokens))
+        self.check_arguments(schema, {"name": "Folder", "type": "group"}, {})
+
+    def test_note_content_survives_protocol_conversion_and_streaming(self):
+        schema = {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "content": {"type": "string", "description": "Optional note body"},
+            },
+            "required": ["name"],
+            "additionalProperties": False,
+        }
+        function = {"name": "test", "parameters": schema}
+        chat = {"tools": [{"type": "function", "function": function}]}
+        responses = api_shapes.responses_to_chat_body(
+            {
+                "input": "Create a note",
+                "tools": [{"type": "function", **function}],
+            }
+        )
+        messages = api_shapes.anthropic_to_chat_body(
+            {
+                "model": "test",
+                "max_tokens": 128,
+                "messages": [{"role": "user", "content": "Create a note"}],
+                "tools": [{"name": "test", "input_schema": schema}],
+            }
+        )
+        for body in (chat, responses, messages):
+            with self.subTest(body=body):
+                converted = body["tools"][0]["function"]["parameters"]
+                self.assertEqual(converted, schema)
+                self.check_arguments(
+                    converted,
+                    {"name": "Release", "content": '第一行\n"quoted"\nliteral \\n'},
+                    {"content": "missing required name"},
+                )
+                # Optional means optional: folder/group creation must not be
+                # forced to invent a note body by the transport or grammar.
+                self.check_arguments(converted, {"name": "Folder"}, {})
 
     def test_cyclic_alternatives_fail_without_recursing(self):
         for keyword in ("anyOf", "oneOf"):

@@ -56,6 +56,7 @@ class ClientTests(unittest.TestCase):
         model="incoai/Qwen3.6-35B-A3B-Splash",
         env=None,
         client_args=(),
+        client_version=None,
     ):
         return clients.command(
             name,
@@ -66,6 +67,7 @@ class ClientTests(unittest.TestCase):
             self.runtime,
             {} if env is None else env,
             client_args=client_args,
+            client_version=client_version,
         )
 
     def test_missing_clients_have_actionable_install_message(self):
@@ -259,6 +261,99 @@ class ClientTests(unittest.TestCase):
         for value in ("invalid", "[]", "null", '{"provider":[]}'):
             with self.subTest(value=value), self.assertRaises(clients.ClientError):
                 self.command("opencode", env={"OPENCODE_CONFIG_CONTENT": value})
+
+    def test_opencode_two_requests_a_private_server_for_the_inline_config(self):
+        # OpenCode 2 loads OPENCODE_CONFIG_CONTENT inside its server process;
+        # a persistent background service started earlier never sees this
+        # environment, so the provider block must go to a private server.
+        for version in (2, 3):
+            with self.subTest(version=version):
+                argv, env = self.command("opencode", client_version=version)
+                self.assertEqual(argv, ["/bin/opencode", "--standalone"])
+                self.assertIn("OPENCODE_CONFIG_CONTENT", env)
+
+    def test_opencode_one_or_unknown_versions_keep_the_environment_launch(self):
+        # OpenCode 1 reads the environment in-process and rejects the flag;
+        # an unparsable or failed probe must not change the launch either.
+        for version in (None, 0, 1, True, "2", 1.5):
+            with self.subTest(version=version):
+                argv, _ = self.command("opencode", client_version=version)
+                self.assertEqual(argv, ["/bin/opencode"])
+
+    def test_opencode_two_respects_a_user_selected_server(self):
+        cases = {
+            ("--standalone",): ["/bin/opencode", "--standalone"],
+            ("--server", "http://127.0.0.1:9999"): [
+                "/bin/opencode",
+                "--server",
+                "http://127.0.0.1:9999",
+            ],
+            ("--server=http://127.0.0.1:9999",): [
+                "/bin/opencode",
+                "--server=http://127.0.0.1:9999",
+            ],
+        }
+        for args, expected in cases.items():
+            with self.subTest(args=args):
+                argv, _ = self.command(
+                    "opencode", client_args=list(args), client_version=2
+                )
+                self.assertEqual(argv, expected)
+
+    def test_opencode_two_places_private_server_flag_after_the_subcommand(self):
+        args = ["run", "A prompt"]
+        argv, _ = self.command("opencode", client_args=args, client_version=2)
+        self.assertEqual(argv, ["/bin/opencode", *args, "--standalone"])
+
+    def test_opencode_two_preserves_the_end_of_options_separator(self):
+        args = ["run", "--", "--server"]
+        argv, _ = self.command("opencode", client_args=args, client_version=2)
+        self.assertEqual(
+            argv, ["/bin/opencode", "run", "--standalone", "--", "--server"]
+        )
+
+    def test_version_probe_parses_client_output_and_fails_closed(self):
+        def completed(stdout, returncode=0):
+            return subprocess.CompletedProcess(
+                ["opencode", "--version"], returncode, stdout=stdout, stderr=""
+            )
+
+        outputs = {
+            "1.18.31\n": 1,
+            "2.0.12": 2,
+            "opencode v2.0.12\n": 2,
+            "v2.0.12": 2,
+            "opencode v2.0.12-beta.1\n": 2,
+            "opencode 10.0.1 (build 7)\n": 10,
+            "": None,
+            "unknown\n": None,
+            "2\n": None,
+            "warning: requires macOS 26.4\n": None,
+        }
+        for stdout, expected in outputs.items():
+            with self.subTest(stdout=stdout):
+                with mock.patch.object(
+                    clients.subprocess, "run", return_value=completed(stdout)
+                ) as run:
+                    self.assertEqual(
+                        clients.probe_major_version("/bin/opencode"), expected
+                    )
+                self.assertEqual(run.call_args.args[0], ["/bin/opencode", "--version"])
+        with mock.patch.object(
+            clients.subprocess, "run", return_value=completed("2.0.12", 1)
+        ):
+            self.assertIsNone(clients.probe_major_version("/bin/opencode"))
+        for error in (
+            FileNotFoundError,
+            PermissionError,
+            subprocess.TimeoutExpired(cmd="opencode", timeout=5),
+            UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad"),
+        ):
+            with (
+                self.subTest(error=error),
+                mock.patch.object(clients.subprocess, "run", side_effect=error),
+            ):
+                self.assertIsNone(clients.probe_major_version("/bin/opencode"))
 
     def test_codex_uses_responses_and_actual_context_without_replacing_prompt(self):
         argv, env = self.command("codex")
@@ -523,6 +618,89 @@ class ClientLifecycleTests(unittest.TestCase):
             )
             self.assertEqual(argv[-2:], ["exec", "hello"])
 
+    def test_opencode_launch_probes_the_installed_version(self):
+        for version, expected in (
+            (2, ["/bin/opencode", "--standalone"]),
+            (1, ["/bin/opencode"]),
+            (None, ["/bin/opencode"]),
+        ):
+            with (
+                self.subTest(version=version),
+                mock.patch.object(
+                    clients, "find_executable", return_value="/bin/opencode"
+                ),
+                mock.patch.object(
+                    clients, "probe_major_version", return_value=version
+                ) as probe,
+                mock.patch.object(
+                    launcher,
+                    "_running_status",
+                    return_value={"ready": True, "maximum_context_tokens": 102400},
+                ),
+                mock.patch.object(
+                    launcher,
+                    "_request_json",
+                    return_value={
+                        "data": [
+                            {
+                                "id": "incoai/Qwen3.6-35B-A3B-Splash",
+                                "owned_by": "splash",
+                            }
+                        ]
+                    },
+                ),
+                mock.patch.object(launcher.os, "execvpe") as execute,
+                mock.patch("sys.stdout", io.StringIO()),
+            ):
+                launcher.main(["opencode"])
+            self.assertEqual(execute.call_args.args[1], expected)
+            probe.assert_called_once_with("/bin/opencode")
+
+    def test_unready_server_never_probes_or_launches(self):
+        with (
+            mock.patch.object(clients, "find_executable", return_value="/bin/opencode"),
+            mock.patch.object(clients, "probe_major_version") as probe,
+            mock.patch.object(launcher, "_running_status", return_value=None),
+            mock.patch.object(launcher.os, "execvpe") as execute,
+            mock.patch("sys.stderr", io.StringIO()),
+        ):
+            self.assertEqual(launcher.main(["opencode"]), 1)
+        probe.assert_not_called()
+        execute.assert_not_called()
+
+    def test_version_probe_is_scoped_to_opencode(self):
+        # hermes is excluded here, not from the guarantee: its launch writes a
+        # real profile into the runtime directory, which tests must not touch.
+        for name in ("claude", "codex"):
+            with (
+                self.subTest(name=name),
+                mock.patch.object(
+                    clients, "find_executable", return_value=f"/bin/{name}"
+                ),
+                mock.patch.object(clients, "probe_major_version") as probe,
+                mock.patch.object(
+                    launcher,
+                    "_running_status",
+                    return_value={"ready": True, "maximum_context_tokens": 102400},
+                ),
+                mock.patch.object(
+                    launcher,
+                    "_request_json",
+                    return_value={
+                        "data": [
+                            {
+                                "id": "incoai/Qwen3.6-35B-A3B-Splash",
+                                "owned_by": "splash",
+                            }
+                        ]
+                    },
+                ),
+                mock.patch.object(launcher.os, "execvpe"),
+                mock.patch("sys.stdout", io.StringIO()),
+            ):
+                launcher.main([name])
+            probe.assert_not_called()
+
     def test_unready_server_never_launches_or_downloads(self):
         for payload in ([], ["--help"]):
             with (
@@ -562,6 +740,74 @@ class ClientLifecycleTests(unittest.TestCase):
             ):
                 self.assertEqual(launcher.main(["codex"]), 1)
             execute.assert_not_called()
+
+
+@unittest.skipUnless(
+    os.environ.get("SPLASH_OPENCODE_BINARY"),
+    "set SPLASH_OPENCODE_BINARY for private-server configuration test",
+)
+class InstalledOpenCodeTests(unittest.TestCase):
+    def test_private_server_configuration_is_isolated_from_the_existing_service(self):
+        binary = str(Path(os.environ["SPLASH_OPENCODE_BINARY"]).resolve())
+        version = clients.probe_major_version(binary)
+        self.assertIsNotNone(version)
+        if version < 2:
+            self.skipTest("private servers require OpenCode 2")
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            environment = {"PATH": os.environ["PATH"]}
+            for name in ("config", "data", "cache", "state"):
+                environment[f"XDG_{name.upper()}_HOME"] = str(work / name)
+            (work / "tmp").mkdir()
+            environment["TMPDIR"] = str(work / "tmp")
+
+            def run(argv, env):
+                result = subprocess.run(
+                    argv,
+                    cwd=work,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    stdin=subprocess.DEVNULL,
+                    timeout=30,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return result.stdout
+
+            query = [binary, "api", "GET", "/api/config"]
+            model = "incoai/Qwen3.8-27B-Splash"
+            argv, configured = clients.command(
+                "opencode",
+                binary,
+                "http://127.0.0.1:18997",
+                model,
+                102400,
+                work / "runtime",
+                environment,
+                client_version=version,
+                client_args=query[1:],
+            )
+            try:
+                run([binary, "service", "start"], environment)
+                before = json.loads(run(query, environment))
+                self.assertEqual(json.loads(run(query, configured)), before)
+                sources = json.loads(run(argv, configured))
+                info = next(
+                    source["info"]
+                    for source in sources
+                    if source.get("type") == "document"
+                    and "splash" in source["info"].get("providers", {})
+                )
+                self.assertEqual(
+                    info["model"], {"providerID": "splash", "model": model}
+                )
+                self.assertEqual(
+                    info["providers"]["splash"]["settings"]["baseURL"],
+                    "http://127.0.0.1:18997/v1",
+                )
+                self.assertEqual(json.loads(run(query, environment)), before)
+            finally:
+                run([binary, "service", "stop"], environment)
 
 
 @unittest.skipUnless(

@@ -164,27 +164,27 @@ canonicalRuntimeCacheNamespace(const RuntimeCacheIdentity &identity) {
             << '\n'
             << "build_id_bytes=" << identity.buildId.size() << '\n'
             << "build_id=" << identity.buildId << '\n'
-            << "dtype=" << kQ8FormatName << '\n'
-            << "page_tokens=" << identity.q8Layout.pageTokens << '\n'
-            << "elements_per_scale=" << identity.q8Layout.elementsPerScale
+            << "dtype=" << kv::storageFormatName(identity.kvLayout.format()) << '\n'
+            << "page_tokens=" << identity.kvLayout.pageTokens << '\n'
+            << "elements_per_scale=" << identity.kvLayout.elementsPerScale
             << '\n'
             << "target_model_sha256="
-            << digestHex(identity.q8Layout.modelArtifactSha256) << '\n'
-            << "q8_quantization=" << identity.q8Layout.quantization << '\n'
-            << "q8_scale_type=" << identity.q8Layout.scaleType << '\n'
-            << "q8_key_layout=" << identity.q8Layout.keyLayout << '\n'
-            << "q8_value_layout=" << identity.q8Layout.valueLayout << '\n'
-            << "q8_attention_layers=" << identity.q8Layout.attentionLayers
+            << digestHex(identity.kvLayout.modelArtifactSha256) << '\n'
+            << "q8_quantization=" << identity.kvLayout.quantization << '\n'
+            << "q8_scale_type=" << identity.kvLayout.scaleType << '\n'
+            << "q8_key_layout=" << identity.kvLayout.keyLayout << '\n'
+            << "q8_value_layout=" << identity.kvLayout.valueLayout << '\n'
+            << "q8_attention_layers=" << identity.kvLayout.attentionLayers
             << '\n'
-            << "q8_kv_heads=" << identity.q8Layout.kvHeads << '\n'
-            << "q8_head_dimension=" << identity.q8Layout.headDimension << '\n'
-            << "q8_quantized_minimum=" << identity.q8Layout.quantizedMinimum
+            << "q8_kv_heads=" << identity.kvLayout.kvHeads << '\n'
+            << "q8_head_dimension=" << identity.kvLayout.headDimension << '\n'
+            << "q8_quantized_minimum=" << identity.kvLayout.quantizedMinimum
             << '\n'
-            << "q8_quantized_maximum=" << identity.q8Layout.quantizedMaximum
+            << "q8_quantized_maximum=" << identity.kvLayout.quantizedMaximum
             << '\n'
-            << "q8_bytes_per_layer_page=" << identity.q8Layout.bytesPerLayerPage
+            << "q8_bytes_per_layer_page=" << identity.kvLayout.bytesPerLayerPage
             << '\n'
-            << "q8_bytes_per_model_page=" << identity.q8Layout.bytesPerModelPage
+            << "q8_bytes_per_model_page=" << identity.kvLayout.bytesPerModelPage
             << '\n';
   return sha256(canonical.str());
 }
@@ -224,7 +224,7 @@ RuntimeCacheIdentity
 makeRuntimeCacheIdentity(std::string_view combinedManifestSha256,
                          std::string_view targetManifestSha256,
                          std::string_view buildId,
-                         kv::Q8Layout targetKvLayout) {
+                         kv::Layout targetKvLayout) {
   if (buildId.empty()) {
     throw std::invalid_argument("runtime build id is required");
   }
@@ -238,7 +238,7 @@ makeRuntimeCacheIdentity(std::string_view combinedManifestSha256,
   RuntimeCacheIdentity result;
   result.modelLayoutSha256 = digestHex(combinedDigest);
   result.buildId = buildId;
-  result.q8Layout = kv::makeQ8LayoutGuard(targetKvLayout, targetDigest);
+  result.kvLayout = kv::makeLayoutGuard(targetKvLayout, targetDigest);
   result.namespaceSha256 = canonicalRuntimeCacheNamespace(result);
   result.cacheNamespace.digest = parseSha256(result.namespaceSha256);
   return result;
@@ -260,7 +260,7 @@ RuntimeResources::RuntimeResources(
     EngineMemoryPlan memoryPlan, model::ModelMemoryPlan modelMemoryPlan,
     RuntimeCacheIdentity cacheIdentity,
     std::unique_ptr<MemoryGovernor> memoryGovernor,
-    std::unique_ptr<kv::Q8PageStorage> kvPages,
+    std::unique_ptr<kv::PageStorage> kvPages,
     std::unique_ptr<model::StateStorage> stateStorage,
     std::unique_ptr<KvPool> kvPool, std::unique_ptr<engine::Cache> cache,
     uint32_t maximumImagePatches)
@@ -276,6 +276,7 @@ RuntimeResources::RuntimeResources(
 std::unique_ptr<RuntimeResources>
 RuntimeResources::create(const RuntimeResourcesConfig &config) {
   if (config.metallibPath.empty() || config.modelRoot.empty() ||
+      !kv::validFormat(config.kvFormat) ||
       !config.model.valid() ||
       config.buildId.empty() || !config.maximumImagePatches ||
       config.maximumImagePatches % 4) {
@@ -364,7 +365,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
   model::ModelMemoryPlan modelMemoryPlan;
   auto prepareMemory = [&]() -> EngineMemoryPlan {
     try {
-      modelMemoryPlan = model::plannedRuntimeMemory(device, package, operators);
+      modelMemoryPlan = model::plannedRuntimeMemory(device, package, operators, config.kvFormat);
       if (auto error = modelMemoryPlan.validationError()) {
         throw std::invalid_argument(*error);
       }
@@ -388,7 +389,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
 
     ModelMemoryProfile modelProfile{
         package.name(), package.maximumContextTokens(),
-        package.targetKvLayout(), footprint};
+        package.targetKvLayout(config.kvFormat), footprint};
     EngineMemoryPlanResult planResult =
         evaluateEngineMemoryPlan(device, modelProfile, config.maximumMemoryBytes);
     if (!planResult.plan) {
@@ -409,7 +410,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
     cacheIdentity = makeRuntimeCacheIdentity(
         package.manifestFingerprintSha256,
         package.targetManifestFingerprint(), config.buildId,
-        package.targetKvLayout());
+        package.targetKvLayout(config.kvFormat));
   } catch (const std::exception &error) {
     throw RuntimeResourcesError(RuntimeResourceStage::ModelLoading,
                                 error.what(), memoryPlan.toStatusJson(),
@@ -466,8 +467,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
     }
 
     const EngineMemoryBreakdown &budget = memoryPlan.breakdown();
-    auto kvPages = std::make_unique<kv::Q8PageStorage>(
-        *backend, memoryGovernor->allocationAdmission(), package.targetKvLayout(),
+    auto kvPages = std::make_unique<kv::PageStorage>(
+        *backend, memoryGovernor->allocationAdmission(), package.targetKvLayout(config.kvFormat),
         budget.kvVirtualPages);
     auto stateStorage = model::createStateStorage(
         *backend, memoryGovernor->allocationAdmission(), package);
@@ -481,7 +482,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
     if (kvPages->declaredBytes() != budget.kvVirtualBytes ||
         kvPages->actualAllocatedBytes() > budget.kvVirtualBytes) {
       throw std::runtime_error(
-          "actual Q8 page storage exceeds its planned category");
+          "actual KV page storage exceeds its planned category");
     }
     if (stateStorage->actualAllocatedBytes() != 0) {
       throw std::runtime_error("state cells were allocated eagerly");

@@ -31,6 +31,7 @@ if __package__:
     from .latency import LatencyMetrics
     from .metrics import is_finite_number
     from .thinking import ThinkingCodec
+    from .tokenization import PromptTokenizer
     from .tool_schema import (
         THINK_END,
         ToolPolicy,
@@ -57,6 +58,7 @@ else:
     from latency import LatencyMetrics
     from metrics import is_finite_number
     from thinking import ThinkingCodec
+    from tokenization import PromptTokenizer
     from tool_schema import (
         THINK_END,
         ToolPolicy,
@@ -228,6 +230,7 @@ class Frontend:
             raise ValueError("frontend preparation capacity must be positive")
         self.latencies = LatencyMetrics()
         self.tokenizer = tokenizer
+        self.prompt_tokenizer = PromptTokenizer(tokenizer)
         self.backend = backend
         self.model = model
         self.model_names = tuple(
@@ -276,6 +279,7 @@ class Frontend:
             status["grammar_cache"] = self.constraint_factory.stats()
         status["response_store"] = self.response_store.stats()
         status["image_cache"] = self.images.stats()
+        status["tokenizer_cache"] = self.prompt_tokenizer.stats()
         status["latency"] = self.latencies.snapshot()
         return status
 
@@ -785,7 +789,8 @@ class Frontend:
                 )
             else:
                 rendered = self._apply_chat_template(prompt.messages, template)
-                tokens = self._tokenize(rendered, add_special_tokens=False)["input_ids"]
+                with self.latencies.measure("tokenization"):
+                    tokens = self.prompt_tokenizer.encode(rendered)
         except APIError:
             raise
         except Exception as error:
@@ -898,17 +903,20 @@ class Frontend:
         image_positions, thinking = rendered.image_positions, rendered.thinking
         constraint = None
         remaining_request_time(deadline)
-        if self.constraint_factory is not None:
-            if tools:
-                constraint = self.constraint_factory.create(
-                    tool_grammar(tool_policy, thinking, response_schema),
-                    timeout=remaining_request_time(deadline),
-                )
-            elif response_schema is not None:
-                constraint = self.constraint_factory.create(
-                    json_grammar(response_schema, thinking),
-                    timeout=remaining_request_time(deadline),
-                )
+        if self.constraint_factory is not None and (
+            tools or response_schema is not None
+        ):
+            with self.latencies.measure("grammar"):
+                if tools:
+                    constraint = self.constraint_factory.create(
+                        tool_grammar(tool_policy, thinking, response_schema),
+                        timeout=remaining_request_time(deadline),
+                    )
+                elif response_schema is not None:
+                    constraint = self.constraint_factory.create(
+                        json_grammar(response_schema, thinking),
+                        timeout=remaining_request_time(deadline),
+                    )
         remaining_request_time(deadline)
         tools_signature = None
         if tools:

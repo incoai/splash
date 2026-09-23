@@ -224,14 +224,15 @@ def main(argv=None):
             server = smoke.RealServer(run_args)
             try:
                 status = server.wait_ready(args.startup_timeout)
-                smoke.validate_status(status)
+                smoke.validate_status(status, args.kv_format)
                 if document["rounds"]:
                     expected = document["rounds"][0]["identity"]
                     smoke.require(
-                        status["identity"]["q8"] == expected["q8"]
+                        smoke.kv_identity(status["identity"])
+                        == smoke.kv_identity(expected)
                         and status["identity"]["cache"]["loaded_model_layout_sha256"]
                         == expected["cache"]["loaded_model_layout_sha256"],
-                        "loaded target/draft or Q8 identity changed",
+                        "loaded target/draft or KV identity changed",
                     )
                 for previous in document["rounds"]:
                     if previous["version"] == version:

@@ -69,6 +69,29 @@ void testUnifiedElasticBudget() {
           "elastic state/KV budget is missing from memory status");
 }
 
+void testBf16BudgetAndStatus() {
+  auto profile = model();
+  profile.targetKvLayout.format = kv::Format::BFloat16;
+  const auto bf16 = requireEngineMemoryPlan(device(), profile);
+  const auto int8 = requireEngineMemoryPlan(device(), model());
+  const auto &budget = bf16.breakdown();
+  require(budget.kvPageBytes == profile.targetKvLayout.bytesPerModelPage() &&
+              budget.kvPageBytes > int8.breakdown().kvPageBytes &&
+              budget.kvSparseMappingBatchPages == 1 && budget.kvExtentPages == 64,
+          "BF16 planning did not use its payload size and sparse alignment");
+  require(budget.kvVirtualBytes <= budget.dynamicBudgetBytes &&
+              budget.kvVirtualPages < int8.breakdown().kvVirtualPages,
+          "BF16 virtual capacity exceeded the shared budget");
+  const auto json = bf16.toStatusJson();
+  require(json.find("\"kv_format\":\"bf16\"") != std::string::npos &&
+              json.find("\"kv_scale_value_bytes\":0") != std::string::npos &&
+              json.find("\"q8_page_bytes\"") == std::string::npos,
+          "BF16 memory status reported INT8 scales or pages");
+  const uint64_t minimum = budget.minimumRequiredBytes;
+  require(!evaluateEngineMemoryPlan(device(), profile, minimum - 1).plan,
+          "BF16 startup admitted less than its minimum resident footprint");
+}
+
 void testUserCeilingAndFailure() {
   EngineMemoryPlan automatic = requireEngineMemoryPlan(device(), model());
   const uint64_t ceiling =
@@ -152,6 +175,7 @@ void testDeviceValidationNamesTheMacosFloor() {
 int main() {
   try {
     testUnifiedElasticBudget();
+    testBf16BudgetAndStatus();
     testUserCeilingAndFailure();
     testHardBudgetBoundaries();
     testModelProvidedKvGeometry();

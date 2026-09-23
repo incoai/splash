@@ -52,7 +52,7 @@ struct FixturePlan final {
   std::array<uint64_t, kTensorCount> sizes{};
   uint64_t bytes = 0;
 
-  kv::Q8Layout layout() const { return {1, shape.kvHeads, shape.headDimension}; }
+  kv::Layout layout() const { return {1, shape.kvHeads, shape.headDimension, shape.format}; }
   void size(Tensor tensor, uint64_t bytes) { sizes[tensorIndex(tensor)] = bytes; }
   uint64_t queryIndex(uint32_t lane, uint32_t head, uint32_t row,
                       uint32_t dimension) const {
@@ -155,7 +155,7 @@ public:
       offset += aligned(plan_.sizes[i]);
     }
     layer_ = {get(Tensor::Keys), get(Tensor::KeyScales), get(Tensor::Values),
-               get(Tensor::ValueScales)};
+               get(Tensor::ValueScales), plan_.shape.format};
     for (uint32_t lane = 0; lane < plan_.lanes; ++lane) {
       tables_[lane] = get(static_cast<Tensor>(tensorIndex(Tensor::Table0) + lane));
       stores_[lane] = {plan_.histories[lane], plan_.rows, plan_.stride,
@@ -192,15 +192,22 @@ public:
         if (token % 256 == 0 && stop && stop()) return false;
         for (uint32_t head = 0; head < plan_.shape.kvHeads; ++head) {
           const uint64_t scale = scaleIndex(lane, head, token);
-          keyScales[scale] = 0.006f;
-          valueScales[scale] = 0.007f;
+          if (plan_.shape.format == kv::Format::Int8) {
+            keyScales[scale] = 0.006f;
+            valueScales[scale] = 0.007f;
+          }
           for (uint32_t d = 0; d < kDimension; ++d) {
-            keys[scale * kDimension + d] =
-                int((uint64_t{token} * 37 + head * 101 + d * 17 +
+            const int key = int((uint64_t{token} * 37 + head * 101 + d * 17 +
                      uint64_t{token} * d * 3 + lane * 7) % 255) - 127;
-            values[valueIndex(scale, d)] =
-                int((uint64_t{token} * 53 + head * 79 + d * 29 +
+            const int value = int((uint64_t{token} * 53 + head * 79 + d * 29 +
                      uint64_t{token} * d * 5 + lane * 19) % 255) - 127;
+            if (plan_.shape.format == kv::Format::Int8) {
+              keys[scale * kDimension + d] = key;
+              values[valueIndex(scale, d)] = value;
+            } else {
+              data<uint16_t>(Tensor::Keys)[scale * kDimension + d] = bf16(key * 0.006f);
+              data<uint16_t>(Tensor::Values)[valueIndex(scale, d)] = bf16(value * 0.007f);
+            }
           }
         }
       }
@@ -236,7 +243,7 @@ public:
         return PagedAttention::verifyPlan(plan_.lanes, plan_.shape.queryHeads,
                                           plan_.layout(), plan_.histories, config);
     }();
-    // Each repeated subgraph begins with the deterministic Q8 store and ends
+    // Each repeated subgraph begins with the deterministic KV store and ends
     // with split reduction. It never consumes the previous attention output:
     // queries/chunk K/V/history remain unchanged and current KV slots are
     // overwritten with identical values. Do not repeat individual dispatches.
@@ -272,11 +279,18 @@ public:
       for (uint32_t row = 0; row < plan_.rows; ++row)
         for (uint32_t head = 0; head < plan_.shape.kvHeads; ++head) {
           const uint64_t scale = scaleIndex(lane, head, plan_.histories[lane] + row);
-          keyScales[scale] = 0;
-          valueScales[scale] = 0;
-          std::memset(keys + scale * kDimension, 0, kDimension);
-          for (uint32_t d = 0; d < kDimension; ++d)
-            values[valueIndex(scale, d)] = 0;
+          if (plan_.shape.format == kv::Format::Int8) {
+            keyScales[scale] = 0;
+            valueScales[scale] = 0;
+            std::memset(keys + scale * kDimension, 0, kDimension);
+            for (uint32_t d = 0; d < kDimension; ++d)
+              values[valueIndex(scale, d)] = 0;
+          } else {
+            std::memset(data<uint16_t>(Tensor::Keys) + scale * kDimension,
+                        0, kDimension * sizeof(uint16_t));
+            for (uint32_t d = 0; d < kDimension; ++d)
+              data<uint16_t>(Tensor::Values)[valueIndex(scale, d)] = 0;
+          }
         }
   }
 
@@ -325,7 +339,7 @@ private:
   FixturePlan plan_;
   metal::MetalBuffer base_;
   std::array<metal::MetalBuffer, kTensorCount> buffers_{};
-  kv::Q8LayerStorage layer_;
+  kv::LayerStorage layer_;
   std::array<metal::MetalBuffer, kMaximumLanes> tables_{};
   std::array<kv::Q8ChunkedPrefillParams, kMaximumLanes> stores_{};
   std::array<kv::Q8VerifyAttentionParams, kMaximumLanes> attention_{};
@@ -334,7 +348,7 @@ private:
 
 template <typename Workload, typename Config>
 bool equivalentToBaseline(const Workload &workload, Config baseline, Config config) {
-  const kv::Q8Layout layout{1, workload.shape.kvHeads, workload.shape.headDimension};
+  const kv::Layout layout{1, workload.shape.kvHeads, workload.shape.headDimension, workload.shape.format};
   const auto plan = [&](Config selected) {
     if constexpr (std::is_same_v<Config, PrefillAttentionConfig>)
       return PagedAttention::prefillPlan(workload.rows, workload.shape.queryHeads,
@@ -588,7 +602,7 @@ std::array<PrefillAttentionWorkload, 4>
 prefillAttentionPolicyWorkloads(AttentionShape shape) {
   constexpr uint32_t rows = SPLASH_PREFILL_TOKEN_BUDGET;
   (void)PagedAttention::prefillPlan(rows, shape.queryHeads,
-                                   {1, shape.kvHeads, shape.headDimension}, 0);
+                                   {1, shape.kvHeads, shape.headDimension, shape.format}, 0);
   return {{{shape, rows, 0}, {shape, rows, 2048},
            {shape, rows, 16384}, {shape, rows, 131072}}};
 }
@@ -598,7 +612,7 @@ verifyAttentionPolicyWorkloads(VerifyAttentionPolicy policy) {
   const auto shape = policy.shape;
   const std::array<uint32_t, kMaximumLanes> histories{};
   (void)PagedAttention::verifyPlan(policy.lanes, shape.queryHeads,
-                                    {1, shape.kvHeads, shape.headDimension}, histories);
+                                    {1, shape.kvHeads, shape.headDimension, shape.format}, histories);
   std::vector<VerifyAttentionWorkload> result;
   for (uint32_t history : {1U, 25U, 2048U, 131072U}) {
     VerifyAttentionWorkload workload{shape, policy.lanes, {}};

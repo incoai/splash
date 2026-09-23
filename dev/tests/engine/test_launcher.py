@@ -24,6 +24,15 @@ MODEL_IDS = (
 
 
 class LauncherTests(unittest.TestCase):
+    def test_kv_format_is_an_explicit_load_option(self):
+        base = ["serve", "--model", MODEL_ID]
+        self.assertEqual(launcher.parse_args(base).kv_format, "int8")
+        self.assertEqual(
+            launcher.parse_args(base + ["--kv-format", "bf16"]).kv_format, "bf16"
+        )
+        with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
+            launcher.parse_args(base + ["--kv-format", "fp16"])
+
     def test_serve_requires_exact_repository_id_before_build(self):
         for arguments in (
             ["serve"],
@@ -75,6 +84,25 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(args.model, MODEL_ID)
         self.assertEqual(args.max_memory, 28 * 1024**3)
         self.assertEqual(args.max_context, 102400)
+
+    def test_image_budget_fails_before_installation(self):
+        for value in ("-1", "0", "65535", "4194305", "invalid"):
+            with (
+                self.subTest(value=value),
+                mock.patch.object(launcher, "_ensure_installed") as install,
+                mock.patch("sys.stderr", io.StringIO()),
+                self.assertRaises(SystemExit) as failed,
+            ):
+                launcher.main(
+                    ["serve", "--model", MODEL_ID, "--max-image-pixels", value]
+                )
+            self.assertEqual(failed.exception.code, 2)
+            install.assert_not_called()
+        for value in (65_536, 4_194_304):
+            args = launcher.parse_args(
+                ["serve", "--model", MODEL_ID, "--max-image-pixels", str(value)]
+            )
+            self.assertEqual(args.max_image_pixels, value)
 
     def test_size_validation(self):
         for value in ("1G", "1GB", "1GiB", "1073741824"):
@@ -178,6 +206,7 @@ class LauncherTests(unittest.TestCase):
                     argv[argv.index("--binary") + 1], str(launcher.paths.BINARY)
                 )
                 self.assertEqual(argv[argv.index("--model") + 1], MODEL_ID)
+                self.assertEqual(argv[argv.index("--kv-format") + 1], "bf16")
                 self.assertEqual(
                     argv[argv.index("--max-request-size") + 1], str(256 * 1024**2)
                 )
@@ -216,6 +245,8 @@ class LauncherTests(unittest.TestCase):
                         "serve",
                         "--model",
                         MODEL_ID,
+                        "--kv-format",
+                        "bf16",
                         "--api-key",
                         "test-server-key",
                         "--no-webui",

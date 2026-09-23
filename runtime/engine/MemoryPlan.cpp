@@ -113,11 +113,18 @@ std::string modelStatusJson(const ModelMemoryProfile &model) {
       << "\"kv_heads\":" << model.targetKvLayout.kvHeads << ','
       << "\"head_dimension\":" << model.targetKvLayout.headDimension << ','
       << "\"kv_page_tokens\":" << kv::kPageTokens << ','
-      << "\"kv_quantization_bits\":8,"
+      << "\"kv_quantization_bits\":"
+      << (model.targetKvLayout.format == kv::Format::Int8 ? 8 : 16) << ','
+      << "\"kv_format\":" << json::quote(kv::formatName(model.targetKvLayout.format)) << ','
       << "\"kv_elements_per_scale\":"
       << model.targetKvLayout.elementsPerScale() << ','
-      << "\"kv_scale_value_bytes\":" << sizeof(float) << ','
-      << "\"q8_page_bytes\":" << model.targetKvLayout.bytesPerModelPage()
+      << "\"kv_scale_value_bytes\":"
+      << (model.targetKvLayout.format == kv::Format::Int8 ? sizeof(float) : 0) << ','
+      << "\"kv_page_bytes\":" << model.targetKvLayout.bytesPerModelPage();
+  // Keep the legacy field for existing INT8 status consumers.
+  if (model.targetKvLayout.format == kv::Format::Int8)
+    out << ",\"q8_page_bytes\":" << model.targetKvLayout.bytesPerModelPage();
+  out
       << ','
       << "\"memory\":{" << "\"target_weights_bytes\":"
       << model.footprint.targetWeightsBytes << ','
@@ -192,9 +199,9 @@ std::string EngineMemoryBreakdown::describe() const {
       << bytesAndMiB(runtimeOverheadReserveBytes) << '\n'
       << "fixed runtime: " << bytesAndMiB(fixedRuntimeBytes) << '\n'
       << "elastic state/KV budget: " << bytesAndMiB(dynamicBudgetBytes) << '\n'
-      << "Q8 KV page: " << kvPageTokens << " tokens, "
+      << "KV page: " << kvPageTokens << " tokens, "
       << bytesAndMiB(kvPageBytes) << '\n'
-      << "Q8 physical extent: " << kvExtentPages << " pages, "
+      << "KV physical extent: " << kvExtentPages << " pages, "
       << bytesAndMiB(kvExtentBytes) << '\n'
       << "KV virtual address space: " << kvVirtualPages << " pages / "
       << kvVirtualTokens << " tokens (geometry maximum " << maximumKvPages
@@ -354,7 +361,7 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
         failure(
             BudgetErrorCode::KvPoolDoesNotFit,
             "hard budget or Metal geometry cannot fit one active state cell "
-            "and one Q8 physical extent",
+            "and one KV physical extent",
             std::move(breakdown))};
   }
 

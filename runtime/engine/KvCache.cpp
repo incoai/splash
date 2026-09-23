@@ -153,6 +153,7 @@ KvCache::InsertResult KvCache::insert(uint64_t parentBlock,
   }
   const uint64_t id = nextBlockId_++;
   insertEvictable(id, recency_.next());
+  ++generation_;
   InsertResult result;
   result.id = id;
   result.physicalPage = physicalPage;
@@ -242,6 +243,7 @@ void KvCache::erase(uint64_t blockId) {
   removeEvictable(blockId);
   index_.erase(indexed);
   blocks_.erase(blockId);
+  ++generation_;
   if (parentId) {
     Block &parent = block(parentId);
     if (!parent.children)

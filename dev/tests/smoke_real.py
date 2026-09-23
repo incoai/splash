@@ -97,6 +97,7 @@ class RealServer:
             command.extend(("--max-context", str(arguments.max_context)))
         if arguments.max_memory is not None:
             command.extend(("--max-memory", arguments.max_memory))
+        command.extend(("--kv-format", arguments.kv_format))
         self.process = subprocess.Popen(
             command,
             cwd=ROOT,
@@ -135,7 +136,12 @@ class RealServer:
         self.log.close()
 
 
-def validate_status(status: dict) -> None:
+def kv_identity(identity: dict) -> dict:
+    # Older INT8 builds expose only q8 and have no explicit format field.
+    return {"format": "int8", **identity.get("kv", identity.get("q8", {}))}
+
+
+def validate_status(status: dict, kv_format: str | None = None) -> None:
     require(status.get("ready") is True, "runtime is not ready")
     require(status.get("metal", {}).get("healthy") is True, "Metal is unhealthy")
     require(
@@ -146,9 +152,17 @@ def validate_status(status: dict) -> None:
         status.get("identity", {}).get("cache", {}).get("block_tokens") == 32,
         "runtime did not expose Page32 KV identity",
     )
-    q8 = status.get("identity", {}).get("q8", {})
-    require(q8.get("quantization") == "symmetric_int8", "wrong KV quantization")
-    require(q8.get("scale_type") == "float32", "wrong KV scale type")
+    identity = status.get("identity", {})
+    kv = kv_identity(identity)
+    actual = kv["format"]
+    require(actual in ("int8", "bf16"), "unknown KV format")
+    if kv_format is not None:
+        require(actual == kv_format, "runtime KV format differs from requested format")
+    quantization, scale_type = (
+        ("symmetric_int8", "float32") if actual == "int8" else ("none", "none")
+    )
+    require(kv.get("quantization") == quantization, "wrong KV quantization")
+    require(kv.get("scale_type") == scale_type, "wrong KV scale type")
 
 
 def chat_body(model: str, prompt: str, **extra) -> dict:
@@ -1030,6 +1044,7 @@ def add_server_arguments(parser):
     parser.add_argument("--model", type=model_artifacts.parse_repo_id, required=True)
     parser.add_argument("--max-context", type=int)
     parser.add_argument("--max-memory")
+    parser.add_argument("--kv-format", choices=("int8", "bf16"), default="int8")
     parser.add_argument("--startup-timeout", type=float, default=1800)
 
 
@@ -1051,9 +1066,11 @@ def main(argv=None) -> int:
     arguments = parse_args(argv)
     server = RealServer(arguments)
     try:
-        validate_status(server.wait_ready(arguments.startup_timeout))
+        validate_status(
+            server.wait_ready(arguments.startup_timeout), arguments.kv_format
+        )
         run(server.port, arguments.model)
-        validate_status(request(server.port, "GET", "/status")[1])
+        validate_status(request(server.port, "GET", "/status")[1], arguments.kv_format)
         print("http smoke: PASS", flush=True)
         return 0
     except Exception:

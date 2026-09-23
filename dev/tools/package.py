@@ -39,6 +39,7 @@ SERVER_FILES = (
     "diagnostics.py",
     "api_shapes.py",
     "tool_schema.py",
+    "tokenization.py",
     "json_codec.py",
     "latency.py",
     "metrics.py",

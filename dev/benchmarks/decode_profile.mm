@@ -1,6 +1,6 @@
 // Per-kernel GPU time attribution for the production executor.
 //
-//   decode-profile METALLIB MODEL_ROOT [--prompt-tokens N] [--cycles K]
+//   decode-profile METALLIB MODEL_ROOT [--prompt-tokens N] [--cycles K] [--kv-format int8|bf16]
 //
 // Drives the real model runtime with Metal dispatch profiling enabled, so
 // every dispatch of a packed prefill command and B1 through B4 DFlash cycles
@@ -11,7 +11,7 @@
 
 #include "engine/Types.hpp"
 #include "model/Runtime.hpp"
-#include "ops/Q8PageStorage.hpp"
+#include "ops/PageStorage.hpp"
 #include "metal/MetalBackend.hpp"
 #include "model/ModelFactory.hpp"
 #include "engine/MemoryGovernor.hpp"
@@ -190,11 +190,12 @@ int main(int argc, char **argv) {
     try {
       if (argc < 3) {
         std::cerr << "usage: decode-profile METALLIB MODEL_ROOT "
-                     "[--prompt-tokens N] [--cycles K]\n";
+                     "[--prompt-tokens N] [--cycles K] [--kv-format int8|bf16]\n";
         return 2;
       }
       uint32_t promptTokens = 512;
       uint32_t cycles = 4;
+      kv::Format format = kv::Format::Int8;
       for (int index = 3; index < argc; index += 2) {
         const std::string_view option(argv[index]);
         if (index + 1 >= argc)
@@ -203,7 +204,12 @@ int main(int argc, char **argv) {
           promptTokens = parseCount(argv[index + 1], "--prompt-tokens");
         else if (option == "--cycles")
           cycles = parseCount(argv[index + 1], "--cycles");
-        else
+        else if (option == "--kv-format") {
+          const std::string_view value(argv[index + 1]);
+          if (value != "int8" && value != "bf16")
+            throw std::invalid_argument("--kv-format takes int8 or bf16");
+          format = value == "int8" ? kv::Format::Int8 : kv::Format::BFloat16;
+        } else
           throw std::invalid_argument("unknown option");
       }
 
@@ -212,7 +218,7 @@ int main(int argc, char **argv) {
           backend, std::filesystem::path(argv[2]));
       ops::ExecutionPlans operators(backend.capabilities());
       model::ModelMemoryPlan executorPlan =
-          model::plannedRuntimeMemory(backend.capabilities(), model, operators);
+          model::plannedRuntimeMemory(backend.capabilities(), model, operators, format);
 
       // Enough Page32 pages for four lanes of prompt plus generated rows.
       const uint32_t pagesPerLane =
@@ -220,14 +226,14 @@ int main(int argc, char **argv) {
               kv::kPageTokens +
           2;
       const uint32_t pageCount =
-          (pagesPerLane * 4 + model.targetKvLayout().sparseMappingBatchPages() -
+          (pagesPerLane * 4 + model.targetKvLayout(format).sparseMappingBatchPages() -
            1) /
-          model.targetKvLayout().sparseMappingBatchPages() *
-          model.targetKvLayout().sparseMappingBatchPages();
+          model.targetKvLayout(format).sparseMappingBatchPages() *
+          model.targetKvLayout(format).sparseMappingBatchPages();
       MemoryGovernor governor(
           backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
-      kv::Q8PageStorage pages(backend, governor.allocationAdmission(),
-                              model.targetKvLayout(), pageCount);
+      kv::PageStorage pages(backend, governor.allocationAdmission(),
+                              model.targetKvLayout(format), pageCount);
       for (uint32_t page = 0; page < pageCount; ++page) {
         if (!pages.ensureResident(page))
           throw std::runtime_error("could not back the KV pages");

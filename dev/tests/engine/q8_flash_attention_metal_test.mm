@@ -33,7 +33,7 @@ struct Shape {
   const char *suffix;
   uint32_t queryHeads() const { return kvHeads * queryHeadsPerKvHead; }
   uint32_t fusedRows() const { return kRows * queryHeadsPerKvHead; }
-  Q8Layout layout() const { return {1, kvHeads, kHeadDimension}; }
+  Layout layout() const { return {1, kvHeads, kHeadDimension}; }
 };
 constexpr std::array<Shape, 2> kShapes{{{4, 6, ""}, {2, 8, "_kv2_g8"}}};
 
@@ -179,7 +179,7 @@ Case makeCase(id<MTLDevice> device, Shape shape, uint32_t committed,
               uint32_t activeRows, uint32_t splits) {
   Case result;
   result.shape = shape;
-  const Q8Layout layout = shape.layout();
+  const Layout layout = shape.layout();
   uint32_t pages = (committed + activeRows + kPageTokens - 1) / kPageTokens;
   uint32_t physicalPages = pages * 2 + 1;
   result.params = {committed,     activeRows, kStride, pages,
@@ -209,7 +209,7 @@ Case makeCase(id<MTLDevice> device, Shape shape, uint32_t committed,
 // and store the layout's own head count.
 void fill(Case &data) {
   const Shape shape = data.shape;
-  const Q8Layout layout = shape.layout();
+  const Layout layout = shape.layout();
   auto *storedKeys = static_cast<int8_t *>(data.q8Keys.contents);
   auto *storedKeyScales = static_cast<float *>(data.keyScales.contents);
   auto *storedValues = static_cast<int8_t *>(data.q8Values.contents);
@@ -260,7 +260,7 @@ void fill(Case &data) {
 
 float loadKey(const Case &data, uint32_t token, uint32_t head,
               uint32_t dimension) {
-  const Q8Layout layout = data.shape.layout();
+  const Layout layout = data.shape.layout();
   uint32_t physical = data.pageTable[token / kPageTokens];
   uint32_t pageToken = token % kPageTokens;
   float scale = static_cast<const float *>(
@@ -274,7 +274,7 @@ float loadKey(const Case &data, uint32_t token, uint32_t head,
 
 float loadValue(const Case &data, uint32_t token, uint32_t head,
                 uint32_t dimension) {
-  const Q8Layout layout = data.shape.layout();
+  const Layout layout = data.shape.layout();
   uint32_t physical = data.pageTable[token / kPageTokens];
   uint32_t pageToken = token % kPageTokens;
   float scale = static_cast<const float *>(

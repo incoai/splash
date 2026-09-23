@@ -184,25 +184,24 @@ std::vector<uint64_t> Scheduler::admissionOrder() const {
 
 std::vector<uint64_t> Scheduler::prefillAdmissionOrder(
     std::span<const PrefillAdmission> candidates) const {
-  std::vector<Request> pending;
+  std::vector<PrefillRequestView> pending;
   pending.reserve(candidates.size());
   for (const auto &candidate : candidates) {
-    Request value = get(candidate.requestId);
+    const Request &value = get(candidate.requestId);
     if (value.suspendedForResources ||
         (value.phase != Phase::Queued && value.phase != Phase::WaitingResources &&
          value.phase != Phase::WaitingPrefix) ||
         candidate.cachedTokens >= value.spec.promptTokens)
       throw std::logic_error("invalid pending prefill admission");
-    value.promptProcessed = candidate.cachedTokens;
-    pending.push_back(std::move(value));
+    pending.push_back({&value, candidate.cachedTokens});
   }
-  std::vector<const Request *> ready;
+  std::vector<PrefillRequestView> ready;
   ready.reserve(requests_.size());
   for (const auto &[_, request] : requests_)
     if (request.phase == Phase::Prefill)
-      ready.push_back(&request);
+      ready.push_back({&request, request.promptProcessed});
   for (const auto &request : pending)
-    ready.push_back(&request);
+    ready.push_back(request);
   std::vector<uint64_t> result;
   if (const auto plan = planPrefill(std::move(ready))) {
     const auto decode = nextDecode();
@@ -243,62 +242,64 @@ std::optional<BatchPlan> Scheduler::next() const {
 }
 
 std::optional<BatchPlan> Scheduler::nextPrefill() const {
-  std::vector<const Request *> ready;
+  std::vector<PrefillRequestView> ready;
   for (const auto &[_, request] : requests_) {
     if (request.phase == Phase::Prefill)
-      ready.push_back(&request);
+      ready.push_back({&request, request.promptProcessed});
   }
   return planPrefill(std::move(ready));
 }
 
 std::optional<BatchPlan>
-Scheduler::planPrefill(std::vector<const Request *> ready) const {
+Scheduler::planPrefill(std::vector<PrefillRequestView> ready) const {
   if (ready.empty())
     return std::nullopt;
-  const auto dispatchRemaining = [](const Request *request) {
-    uint32_t end = request->spec.promptTokens;
-    if (request->prefillBoundary)
-      end = std::min(end, *request->prefillBoundary);
-    return end - request->promptProcessed;
+  const auto dispatchRemaining = [](const PrefillRequestView &view) {
+    uint32_t end = view.request->spec.promptTokens;
+    if (view.request->prefillBoundary)
+      end = std::min(end, *view.request->prefillBoundary);
+    return end - view.promptProcessed;
   };
   // Order by the complete remaining prompt, independently of state capture
   // boundaries. After kMaximumOvertakes consecutive skips,
   // an older lane leads the next command to prevent starvation.
-  const auto overdue = [](const Request *request) {
-    return request->overtaken >= kMaximumOvertakes;
+  const auto overdue = [](const PrefillRequestView &view) {
+    return view.request->overtaken >= kMaximumOvertakes;
   };
   std::sort(ready.begin(), ready.end(),
-            [&](const Request *a, const Request *b) {
-              if (a->spec.priority != b->spec.priority)
-                return a->spec.priority < b->spec.priority;
+            [&](const PrefillRequestView &a, const PrefillRequestView &b) {
+              if (a.request->spec.priority != b.request->spec.priority)
+                return a.request->spec.priority < b.request->spec.priority;
               if (overdue(a) != overdue(b))
                 return overdue(a);
               const uint32_t remainingA =
-                  a->spec.promptTokens - a->promptProcessed;
+                  a.request->spec.promptTokens - a.promptProcessed;
               const uint32_t remainingB =
-                  b->spec.promptTokens - b->promptProcessed;
+                  b.request->spec.promptTokens - b.promptProcessed;
               if (remainingA != remainingB)
                 return remainingA < remainingB;
-              return a->order < b->order;
+              return a.request->order < b.request->order;
             });
-  const RequestPriority selectedPriority = ready.front()->spec.priority;
+  const RequestPriority selectedPriority = ready.front().request->spec.priority;
 
   BatchPlan plan;
   plan.kind = WorkKind::Prefill;
-  uint32_t budget = prefillBudget(*ready.front(), ready);
-  for (const Request *request : ready) {
-    if (!budget || request->spec.priority != selectedPriority ||
+  uint32_t budget = prefillBudget(ready.front(), ready);
+  for (const PrefillRequestView &view : ready) {
+    if (!budget || view.request->spec.priority != selectedPriority ||
         plan.width() == model::ExecutionLimits::maximumBatchWidth)
       break;
-    const uint32_t rows = std::min(dispatchRemaining(request), budget);
-    plan.items.push_back({request->spec.id, rows, request->promptProcessed});
+    const uint32_t rows = std::min(dispatchRemaining(view), budget);
+    plan.items.push_back(
+        {view.request->spec.id, rows, view.promptProcessed});
     budget -= rows;
   }
   return plan;
 }
 
 uint32_t Scheduler::prefillBudget(
-    const Request &leader, std::span<const Request *const> ready) const {
+    const PrefillRequestView &leader,
+    std::span<const PrefillRequestView> ready) const {
   const uint32_t maximum = model::ExecutionLimits::prefillTokenBudget;
   if (prefillMillisecondsPerToken_ <= 0.0)
     return maximum;
@@ -307,17 +308,18 @@ uint32_t Scheduler::prefillBudget(
          rows * prefillMillisecondsPerToken_ > kContendedPrefillMilliseconds)
     rows /= 2;
   const bool leaderFinishing =
-      leader.spec.promptTokens - leader.promptProcessed <= rows;
+      leader.request->spec.promptTokens - leader.promptProcessed <= rows;
   const bool contended = std::any_of(
       requests_.begin(), requests_.end(), [&](const auto &entry) {
         const Request &peer = entry.second;
         return (peer.phase == Phase::Decode || peer.phase == Phase::WaitingMask) &&
-               peer.spec.priority <= leader.spec.priority;
-      }) || std::any_of(ready.begin(), ready.end(), [&](const Request *peer) {
-        return peer->spec.id != leader.spec.id &&
-               peer->spec.priority <= leader.spec.priority &&
-               (leaderFinishing ||
-                peer->spec.promptTokens - peer->promptProcessed <= rows);
+               peer.spec.priority <= leader.request->spec.priority;
+      }) || std::any_of(ready.begin(), ready.end(), [&](
+                           const PrefillRequestView &peer) {
+        return peer.request->spec.id != leader.request->spec.id &&
+               peer.request->spec.priority <= leader.request->spec.priority &&
+               (leaderFinishing || peer.request->spec.promptTokens -
+                                       peer.promptProcessed <= rows);
       });
   if (!contended)
     return maximum;
@@ -412,10 +414,19 @@ void Scheduler::commit(const BatchPlan &plan) {
     }
   } else {
     const uint64_t dispatchOrder = ++decodeDispatchOrder_;
-    for (const BatchItem &item : plan.items)
-      get(item.requestId).lastDecodeDispatch = dispatchOrder;
+    bool hasGreedy = false;
+    bool hasSampling = false;
+    for (const BatchItem &item : plan.items) {
+      Request &request = get(item.requestId);
+      request.lastDecodeDispatch = dispatchOrder;
+      const BatchCohort cohort = request.spec.cohort;
+      hasGreedy = hasGreedy || cohort == BatchCohort::Greedy;
+      hasSampling = hasSampling || cohort == BatchCohort::Sampling;
+    }
     ++counters_.decodeBatches;
     ++counters_.decodeBatchesByWidth[plan.width() - 1];
+    if (hasGreedy && hasSampling)
+      ++counters_.decodeMixedGreedySamplingBatches;
   }
 }
 
