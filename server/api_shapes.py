@@ -11,12 +11,12 @@ if __package__:
     from . import json_codec
     from .documents import DocumentBudget, document_content, file_content
     from .errors import APIError
-    from .metrics import metrics_dict, usage_dict
+    from .metrics import metrics_dict, timings_dict, usage_dict
 else:  # ``python server/server.py`` from the repo root.
     import json_codec
     from documents import DocumentBudget, document_content, file_content
     from errors import APIError
-    from metrics import metrics_dict, usage_dict
+    from metrics import metrics_dict, timings_dict, usage_dict
 
 IMAGE_PAD_TOKEN = "<|image_pad|>"
 
@@ -1016,11 +1016,19 @@ def completion_response(model, job, result, message, tool_calls):
         ],
         "usage": usage_dict(result, job),
         "metrics": metrics_dict(result),
+        "timings": timings_dict(result),
     }
 
 
 def stream_chunk(
-    model, request_id, created, delta, finish_reason=None, usage=None, metrics=None
+    model,
+    request_id,
+    created,
+    delta,
+    finish_reason=None,
+    usage=None,
+    metrics=None,
+    timings=None,
 ):
     chunk = {
         "id": f"chatcmpl-{request_id}",
@@ -1034,6 +1042,8 @@ def stream_chunk(
         chunk["usage"] = usage
     if metrics is not None:
         chunk["metrics"] = metrics
+    if timings is not None:
+        chunk["timings"] = timings
     return chunk
 
 
