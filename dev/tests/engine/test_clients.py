@@ -300,10 +300,17 @@ class ClientTests(unittest.TestCase):
                 )
                 self.assertEqual(argv, expected)
 
-    def test_opencode_two_keeps_passthrough_arguments_last(self):
-        args = ["run", "--variant", "none", "A prompt"]
+    def test_opencode_two_places_private_server_flag_after_the_subcommand(self):
+        args = ["run", "A prompt"]
         argv, _ = self.command("opencode", client_args=args, client_version=2)
-        self.assertEqual(argv, ["/bin/opencode", "--standalone", *args])
+        self.assertEqual(argv, ["/bin/opencode", *args, "--standalone"])
+
+    def test_opencode_two_preserves_the_end_of_options_separator(self):
+        args = ["run", "--", "--server"]
+        argv, _ = self.command("opencode", client_args=args, client_version=2)
+        self.assertEqual(
+            argv, ["/bin/opencode", "run", "--standalone", "--", "--server"]
+        )
 
     def test_version_probe_parses_client_output_and_fails_closed(self):
         def completed(stdout, returncode=0):
@@ -314,10 +321,14 @@ class ClientTests(unittest.TestCase):
         outputs = {
             "1.18.31\n": 1,
             "2.0.12": 2,
+            "opencode v2.0.12\n": 2,
+            "v2.0.12": 2,
+            "opencode v2.0.12-beta.1\n": 2,
             "opencode 10.0.1 (build 7)\n": 10,
             "": None,
             "unknown\n": None,
             "2\n": None,
+            "warning: requires macOS 26.4\n": None,
         }
         for stdout, expected in outputs.items():
             with self.subTest(stdout=stdout):
@@ -338,8 +349,9 @@ class ClientTests(unittest.TestCase):
             subprocess.TimeoutExpired(cmd="opencode", timeout=5),
             UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad"),
         ):
-            with self.subTest(error=error), mock.patch.object(
-                clients.subprocess, "run", side_effect=error
+            with (
+                self.subTest(error=error),
+                mock.patch.object(clients.subprocess, "run", side_effect=error),
             ):
                 self.assertIsNone(clients.probe_major_version("/bin/opencode"))
 
@@ -646,9 +658,7 @@ class ClientLifecycleTests(unittest.TestCase):
 
     def test_unready_server_never_probes_or_launches(self):
         with (
-            mock.patch.object(
-                clients, "find_executable", return_value="/bin/opencode"
-            ),
+            mock.patch.object(clients, "find_executable", return_value="/bin/opencode"),
             mock.patch.object(clients, "probe_major_version") as probe,
             mock.patch.object(launcher, "_running_status", return_value=None),
             mock.patch.object(launcher.os, "execvpe") as execute,
@@ -730,6 +740,74 @@ class ClientLifecycleTests(unittest.TestCase):
             ):
                 self.assertEqual(launcher.main(["codex"]), 1)
             execute.assert_not_called()
+
+
+@unittest.skipUnless(
+    os.environ.get("SPLASH_OPENCODE_BINARY"),
+    "set SPLASH_OPENCODE_BINARY for private-server configuration test",
+)
+class InstalledOpenCodeTests(unittest.TestCase):
+    def test_private_server_configuration_is_isolated_from_the_existing_service(self):
+        binary = str(Path(os.environ["SPLASH_OPENCODE_BINARY"]).resolve())
+        version = clients.probe_major_version(binary)
+        self.assertIsNotNone(version)
+        if version < 2:
+            self.skipTest("private servers require OpenCode 2")
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            environment = {"PATH": os.environ["PATH"]}
+            for name in ("config", "data", "cache", "state"):
+                environment[f"XDG_{name.upper()}_HOME"] = str(work / name)
+            (work / "tmp").mkdir()
+            environment["TMPDIR"] = str(work / "tmp")
+
+            def run(argv, env):
+                result = subprocess.run(
+                    argv,
+                    cwd=work,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    stdin=subprocess.DEVNULL,
+                    timeout=30,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return result.stdout
+
+            query = [binary, "api", "GET", "/api/config"]
+            model = "incoai/Qwen3.8-27B-Splash"
+            argv, configured = clients.command(
+                "opencode",
+                binary,
+                "http://127.0.0.1:18997",
+                model,
+                102400,
+                work / "runtime",
+                environment,
+                client_version=version,
+                client_args=query[1:],
+            )
+            try:
+                run([binary, "service", "start"], environment)
+                before = json.loads(run(query, environment))
+                self.assertEqual(json.loads(run(query, configured)), before)
+                sources = json.loads(run(argv, configured))
+                info = next(
+                    source["info"]
+                    for source in sources
+                    if source.get("type") == "document"
+                    and "splash" in source["info"].get("providers", {})
+                )
+                self.assertEqual(
+                    info["model"], {"providerID": "splash", "model": model}
+                )
+                self.assertEqual(
+                    info["providers"]["splash"]["settings"]["baseURL"],
+                    "http://127.0.0.1:18997/v1",
+                )
+                self.assertEqual(json.loads(run(query, environment)), before)
+            finally:
+                run([binary, "service", "stop"], environment)
 
 
 @unittest.skipUnless(

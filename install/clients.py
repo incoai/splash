@@ -55,7 +55,10 @@ def probe_major_version(path):
         return None
     if result.returncode:
         return None
-    match = re.search(r"\b(\d+)\.\d+", result.stdout)
+    match = re.match(
+        r"(?:opencode\s+)?v?(\d+)\.\d+(?:\.\d+)?(?:[-+\s]|$)",
+        result.stdout.strip(),
+    )
     return int(match.group(1)) if match else None
 
 
@@ -124,6 +127,8 @@ def _codex_config_args(arguments):
 
 def _selects_opencode_server(arguments):
     """The user already chose the server: an explicit URL or a private one."""
+    if "--" in arguments:
+        arguments = arguments[: arguments.index("--")]
     return any(
         argument == "--standalone"
         or argument == "--server"
@@ -252,8 +257,13 @@ def command(
             and client_version >= 2
             and not _selects_opencode_server(client_args)
         )
-        argv = [path, "--standalone"] if standalone else [path]
-        return [*argv, *client_args], environment
+        argv = [path, *client_args]
+        if standalone:
+            # V2 parses this as a command-local flag, so it must follow any
+            # subcommand and precede the end-of-options separator.
+            index = argv.index("--") if "--" in argv else len(argv)
+            argv.insert(index, "--standalone")
+        return argv, environment
 
     if name == "codex":
         environment["SPLASH_API_KEY"] = api_key
