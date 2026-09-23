@@ -6,7 +6,9 @@ inventories, prompts and permission enforcement remain the client's responsibili
 
 import json
 import os
+import re
 import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -34,6 +36,27 @@ def find_executable(name):
             f"Install it first: {INSTALL_URLS[name]}"
         )
     return path
+
+
+def probe_major_version(path):
+    """Best-effort major version of an installed client; None if probing fails.
+
+    Callers treat None as 'unknown' and keep the launch they already had.
+    """
+    try:
+        result = subprocess.run(
+            [path, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    if result.returncode:
+        return None
+    match = re.search(r"\b(\d+)\.\d+", result.stdout)
+    return int(match.group(1)) if match else None
 
 
 def _hermes_config(home, model, endpoint, context, api_key):
@@ -99,6 +122,16 @@ def _codex_config_args(arguments):
     return config, remaining
 
 
+def _selects_opencode_server(arguments):
+    """The user already chose the server: an explicit URL or a private one."""
+    return any(
+        argument == "--standalone"
+        or argument == "--server"
+        or argument.startswith("--server=")
+        for argument in arguments
+    )
+
+
 def command(
     name,
     path,
@@ -109,6 +142,7 @@ def command(
     environment=None,
     *,
     client_args=(),
+    client_version=None,
 ):
     """Return argv and a private environment; never mutate the caller's env."""
     if not isinstance(model, str) or not model:
@@ -209,7 +243,17 @@ def command(
                 "OPENCODE_CONFIG_CONTENT must be a JSON object"
             ) from error
         environment["OPENCODE_CONFIG_CONTENT"] = json.dumps(config)
-        return [path, *client_args], environment
+        # OpenCode 2 loads configuration inside its persistent background
+        # service, which this process's environment never reaches; a private
+        # server keeps the inline configuration authoritative. OpenCode 1
+        # reads the environment directly and rejects the flag.
+        standalone = (
+            type(client_version) is int
+            and client_version >= 2
+            and not _selects_opencode_server(client_args)
+        )
+        argv = [path, "--standalone"] if standalone else [path]
+        return [*argv, *client_args], environment
 
     if name == "codex":
         environment["SPLASH_API_KEY"] = api_key
