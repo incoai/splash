@@ -126,6 +126,21 @@ struct LinearScratchSize final {
   [[nodiscard]] uint64_t bytes() const noexcept { return input + sums + partials + counters; }
 };
 
+// The activation layout a decode plan reads: the producer's bf16 rows, or an
+// X^T table with fp32 row sums in LinearScratch that a producer can emit
+// alongside its ordinary output.
+enum class LinearInput : uint8_t {
+  Plain,    // bf16 [rows][K]
+  Table64,  // affine simdgroup table, one sum per 64 inputs (kernels/common/q4_sgmatrix.h)
+};
+// The scratch table currently holds `source` in `layout`. Plain means the
+// scratch describes nothing. Producers return it, consumers accept it and
+// return what the scratch describes after their dispatch.
+struct PreparedInput final {
+  metal::MetalBuffer source;
+  LinearInput layout = LinearInput::Plain;
+};
+
 class LinearPlan final {
 public:
   [[nodiscard]] LinearWorkload workload() const noexcept { return workload_; }
@@ -139,6 +154,7 @@ public:
   // also reassociates within each quantization group, even with one split.
   [[nodiscard]] uint32_t partialSums() const noexcept;
   [[nodiscard]] bool usesSimdgroup() const noexcept;
+  [[nodiscard]] LinearInput input() const noexcept;
   [[nodiscard]] LinearScratchSize scratchSize() const noexcept;
   [[nodiscard]] uint64_t sumsBytes() const noexcept;
   [[nodiscard]] uint64_t gateScratchBytes() const noexcept;
@@ -166,9 +182,9 @@ struct LinearBuffers final {
   metal::MetalBuffer gateScratch;
   metal::MetalBuffer downSums;
   LinearScratch scratch{};
-  // The scratch table and sums already describe input (for example after
-  // fused RMSNorm). They must survive unchanged until this dispatch.
-  bool inputPrepared = false;
+  // What the scratch table holds (for example after fused RMSNorm). A plan
+  // that reads a table prepares one unless this describes its input.
+  PreparedInput prepared{};
 };
 
 struct Q4DispatchStats final {
@@ -193,15 +209,19 @@ public:
   static constexpr std::size_t kMaximumCandidates = 20;
 
   [[nodiscard]] LinearPlan plan(LinearWorkload workload) const;
+  // The layout the decode plan of this projection reads, for its producer.
+  [[nodiscard]] LinearInput decodeInput(const Q4Projection &projection, uint32_t lanes,
+                                        LinearEpilogue epilogue = LinearEpilogue::None) const;
   [[nodiscard]] LinearScratchSize decodeScratchSize(LinearWorkload workload) const;
   [[nodiscard]] static LinearPlan plan(LinearWorkload workload, LinearConfig config);
   [[nodiscard]] std::vector<LinearPlan> candidates(LinearWorkload workload) const;
   // Installed only at startup; encoding does a read-only lookup, never tuning.
   void setChoices(std::span<const LinearChoice> choices);
-  void add(metal::CommandGraph &graph, LinearBuffers buffers,
-           const Q4Projection &projection, const LinearPlan &plan,
-           const Q4Projection *gate = nullptr,
-           Q4DispatchStats *stats = nullptr) const;
+  // Returns what the scratch table describes after the dispatch.
+  PreparedInput add(metal::CommandGraph &graph, LinearBuffers buffers,
+                    const Q4Projection &projection, const LinearPlan &plan,
+                    const Q4Projection *gate = nullptr,
+                    Q4DispatchStats *stats = nullptr) const;
 
   void addPrefillSums(metal::CommandGraph &graph, metal::MetalBuffer input,
                       metal::MetalBuffer sums, LinearMatrix matrix,
@@ -223,29 +243,29 @@ public:
                           metal::MetalBuffer output, metal::MetalBuffer sums,
                           LinearMatrix matrix, uint32_t rows) const;
 
-  void addDecode(metal::CommandGraph &graph,
-                 metal::MetalBuffer input, const Q4Projection &projection,
-                 metal::MetalBuffer output, LinearMatrix matrix,
-                 LinearScratch scratch = {}) const;
-  void addDecodeBatch(metal::CommandGraph &graph,
-                      metal::MetalBuffer input,
-                      const Q4Projection &projection,
-                      metal::MetalBuffer output, LinearMatrix matrix,
-                      uint32_t lanes, Q4DispatchStats &stats,
-                      LinearScratch scratch = {}, bool inputPrepared = false) const;
-  void addGateUpBatch(metal::CommandGraph &graph, metal::MetalBuffer input,
-                      const Q4Projection &gate, const Q4Projection &up,
-                      metal::MetalBuffer gateScratch,
-                      metal::MetalBuffer output, LinearMatrix matrix,
-                      uint32_t lanes, Q4DispatchStats &stats,
-                      LinearScratch scratch = {}, bool inputPrepared = false) const;
-  void addResidualBatch(metal::CommandGraph &graph,
-                        metal::MetalBuffer input,
-                        const Q4Projection &projection,
-                        metal::MetalBuffer residual,
-                        metal::MetalBuffer output, LinearMatrix matrix,
-                        uint32_t lanes, Q4DispatchStats &stats,
-                        LinearScratch scratch = {}, bool inputPrepared = false) const;
+  PreparedInput addDecode(metal::CommandGraph &graph,
+                          metal::MetalBuffer input, const Q4Projection &projection,
+                          metal::MetalBuffer output, LinearMatrix matrix,
+                          LinearScratch scratch = {}) const;
+  PreparedInput addDecodeBatch(metal::CommandGraph &graph,
+                               metal::MetalBuffer input,
+                               const Q4Projection &projection,
+                               metal::MetalBuffer output, LinearMatrix matrix,
+                               uint32_t lanes, Q4DispatchStats &stats,
+                               LinearScratch scratch = {}, PreparedInput prepared = {}) const;
+  PreparedInput addGateUpBatch(metal::CommandGraph &graph, metal::MetalBuffer input,
+                               const Q4Projection &gate, const Q4Projection &up,
+                               metal::MetalBuffer gateScratch,
+                               metal::MetalBuffer output, LinearMatrix matrix,
+                               uint32_t lanes, Q4DispatchStats &stats,
+                               LinearScratch scratch = {}, PreparedInput prepared = {}) const;
+  PreparedInput addResidualBatch(metal::CommandGraph &graph,
+                                 metal::MetalBuffer input,
+                                 const Q4Projection &projection,
+                                 metal::MetalBuffer residual,
+                                 metal::MetalBuffer output, LinearMatrix matrix,
+                                 uint32_t lanes, Q4DispatchStats &stats,
+                                 LinearScratch scratch = {}, PreparedInput prepared = {}) const;
 
 private:
   [[nodiscard]] LinearConfig baseline(LinearWorkload workload) const;

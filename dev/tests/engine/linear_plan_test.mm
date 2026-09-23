@@ -703,6 +703,57 @@ void planContracts(uint32_t family, uint32_t cores, size_t &widestCandidates) {
 // Exercise continuous core counts, not just measured SKU anchors. These
 // contracts check legal grids, bounded candidates and override workspace;
 // they do not claim performance on simulated hardware.
+// Every affine plan (configuration, pipelines, input layout and scratch) for
+// families 9-11, core counts 0-128 and a grid of shapes covering the rule
+// boundaries, hashed. The expected value was recorded from the policy before
+// GGUF projections joined LinearPlan; affine planning must not move. Run with
+// LINEAR_POLICY_HASH=print to see the current value.
+void affinePolicyIdentity() {
+  constexpr uint64_t kExpected = 0xcb12687a116bc240ULL;  // 893970 plans
+  uint64_t hash = 1469598103934665603ULL;
+  const auto mix = [&](const void *data, size_t bytes) {
+    const auto *p = static_cast<const unsigned char *>(data);
+    for (size_t i = 0; i < bytes; ++i) hash = (hash ^ p[i]) * 1099511628211ULL;
+  };
+  const auto mixValue = [&](uint64_t value) { mix(&value, sizeof value); };
+  const auto mixText = [&](std::string_view text) { mixValue(text.size()); mix(text.data(), text.size()); };
+  uint64_t plans = 0;
+  for (const uint32_t family : {9U, 10U, 11U})
+    for (uint32_t cores = 0; cores <= 128; ++cores) {
+      DeviceCapabilities device;
+      device.appleGpuFamily = family;
+      device.gpuCoreCount = cores;
+      const Q4Linear linear(device);
+      for (const uint32_t n : {256U, 512U, 1024U, 2048U, 4096U, 5120U, 6144U, 9216U, 10240U,
+                               12544U, 14336U, 16640U, 17408U, 248320U})
+        for (const uint32_t k : {2048U, 4096U, 5120U, 6144U, 17408U}) {
+          const auto record = [&](LinearWorkload w) {
+            const LinearPlan plan = linear.plan(w);
+            const LinearConfig c = plan.configuration();
+            const LinearScratchSize scratch = plan.scratchSize();
+            for (const uint64_t v : {uint64_t{family}, uint64_t{cores}, uint64_t{n}, uint64_t{k},
+                                     uint64_t{w.rows}, uint64_t(w.phase), uint64_t(w.epilogue),
+                                     uint64_t(c.tile), uint64_t{c.groups}, uint64_t(c.simdgroups),
+                                     uint64_t{c.splits}, uint64_t(plan.input()), scratch.input,
+                                     scratch.sums, scratch.partials, scratch.counters})
+              mixValue(v);
+            mixText(plan.pipeline());
+            mixText(plan.secondPipeline());
+            ++plans;
+          };
+          for (uint32_t lanes = 1; lanes <= 4; ++lanes)
+            for (const auto e : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp})
+              record({{n, k}, lanes * 8, LinearPhase::Decode, e});
+          for (const uint32_t rows : {1U, 8U, 32U, 33U, 128U, 512U, 2048U})
+            for (const auto e : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate})
+              record({{n, k}, rows, LinearPhase::Prefill, e});
+        }
+    }
+  if (const char *mode = std::getenv("LINEAR_POLICY_HASH"); mode && std::string_view(mode) == "print")
+    std::cout << "affine policy hash " << plans << " plans 0x" << std::hex << hash << std::dec << '\n';
+  require(hash == kExpected, "affine Linear policy changed (LINEAR_POLICY_HASH=print shows the new hash)");
+}
+
 void scalingContracts() {
   for (uint32_t family : {9U, 10U, 11U}) {
     for (uint32_t index = 0; index <= 129; ++index) {
@@ -1200,6 +1251,7 @@ int main(int argc, char **argv) {
   try {
     require(argc == 2, "usage: linear-plan <production.metallib|--cpu>");
     baselinePlans();
+    affinePolicyIdentity();
     narrowM24BoundaryPlans();
     scalingContracts();
     // Apple9 at the assumed core count reaches the expanded split set;

@@ -307,13 +307,15 @@ public:
                       uint32_t cacheStride, uint32_t rowStride,
                       uint32_t queryHeads, kv::Q8Layout layout,
                       uint32_t lanes);
-  static void addVerifyGate(metal::CommandGraph &graph,
-                            metal::MetalBuffer packed,
-                            metal::MetalBuffer attention,
-                            metal::MetalBuffer hidden, uint32_t rowsPerLane,
-                            uint32_t cacheStride, uint32_t rowStride,
-                            uint32_t queryHeads, kv::Q8Layout layout,
-                            uint32_t lanes, LinearScratch scratch = {});
+  // Also writes the out-projection's `input` table when it needs one.
+  static PreparedInput addVerifyGate(metal::CommandGraph &graph,
+                                     metal::MetalBuffer packed,
+                                     metal::MetalBuffer attention,
+                                     metal::MetalBuffer hidden, uint32_t rowsPerLane,
+                                     uint32_t cacheStride, uint32_t rowStride,
+                                     uint32_t queryHeads, kv::Q8Layout layout,
+                                     uint32_t lanes, LinearScratch scratch = {},
+                                     LinearInput input = LinearInput::Plain);
 
   [[nodiscard]] static kv::Q8ChunkedPrefillParams
   prefillParams(uint64_t logicalPosition, uint32_t chunkTokens,

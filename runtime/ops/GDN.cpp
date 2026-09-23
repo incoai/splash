@@ -68,15 +68,15 @@ void GDN::addPrefill(metal::CommandGraph &graph, GdnPrefillBuffers buffers,
             {uint64_t{tokens} * shape.valueHeads, 1, 1}, {128, 1, 1});
 }
 
-void GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffers,
-                    GdnShape shape, uint32_t lanes, uint32_t layer,
-                    GdnStateStrides state, GdnHeadOrder order) {
+PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffers,
+                             GdnShape shape, uint32_t lanes, uint32_t layer,
+                             GdnStateStrides state, GdnHeadOrder order, LinearInput input) {
   if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH || !state.valid())
     throw std::invalid_argument("invalid GDN decode geometry");
   const KernelLayout kernel = kernelShape(shape);
   std::vector<metal::MetalBuffer> bindings{buffers.packed,
                                            buffers.convolutionWeights};
-  const bool prepare = bool(buffers.linearScratch.input);
+  const bool prepare = input == LinearInput::Table64 && buffers.linearScratch.input;
   const uint64_t outputWidth = uint64_t{shape.valueHeads} * shape.headDimension;
   if (prepare && (buffers.linearScratch.input.sizeBytes() < outputWidth * 16 * lanes ||
                   buffers.linearScratch.sums.sizeBytes() < outputWidth / 2 * lanes))
@@ -100,6 +100,8 @@ void GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffers,
   graph.add(prepare ? kernelName(kernel, "verify_gdn_fused_q4", "verify_gdn_fused_q4_vh32")
                     : kernelName(kernel, "verify_gdn_fused", "verify_gdn_fused_vh32"),
             std::move(bindings), params, {shape.valueHeads, lanes, 1});
+  if (!prepare) return {};
+  return {buffers.hidden, LinearInput::Table64};
 }
 
 void GDN::addCommit(metal::CommandGraph &graph, GdnCommitBuffers buffers,

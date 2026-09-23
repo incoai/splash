@@ -140,6 +140,9 @@ uint32_t LinearPlan::partialSums() const noexcept {
   return usesSimdgroup() ? config_.splits : splitTile(config_.tile) ? kSplitPartitions : 1;
 }
 bool LinearPlan::usesSimdgroup() const noexcept { return config_.tile == LinearTile::Simdgroup; }
+LinearInput LinearPlan::input() const noexcept {
+  return usesSimdgroup() ? LinearInput::Table64 : LinearInput::Plain;
+}
 LinearScratchSize LinearPlan::scratchSize() const noexcept {
   if (!usesSimdgroup()) return {};
   const auto [n, k] = workload_.matrix;
@@ -522,6 +525,13 @@ std::vector<LinearPlan> Q4Linear::candidates(LinearWorkload w) const {
   return result;
 }
 
+LinearInput Q4Linear::decodeInput(const Q4Projection &p, uint32_t lanes,
+                                  LinearEpilogue epilogue) const {
+  // GGUF kernels read the bf16 rows.
+  if (!p.gguf.empty()) return LinearInput::Plain;
+  return plan(decode({p.outputSize, p.inputSize}, lanes, epilogue)).input();
+}
+
 LinearScratchSize Q4Linear::decodeScratchSize(LinearWorkload w) const {
   auto size = LinearPlan(w, baseline(w)).scratchSize();
   const auto selected = plan(w).scratchSize();
@@ -679,10 +689,10 @@ void addGguf(metal::CommandGraph &graph, const LinearBuffers &b, const Q4Project
 
 } // namespace
 
-void Q4Linear::add(metal::CommandGraph &graph, LinearBuffers b,
+PreparedInput Q4Linear::add(metal::CommandGraph &graph, LinearBuffers b,
     const Q4Projection &p, const LinearPlan &selected, const Q4Projection *gate,
     Q4DispatchStats *stats) const {
-  if (!p.gguf.empty()) { addGguf(graph, b, p, selected.workload(), gate, stats); return; }
+  if (!p.gguf.empty()) { addGguf(graph, b, p, selected.workload(), gate, stats); return b.prepared; }
   const LinearWorkload w = selected.workload();
   const auto [n, k] = w.matrix;
   requireProjection(p, w.matrix);
@@ -703,7 +713,7 @@ void Q4Linear::add(metal::CommandGraph &graph, LinearBuffers b,
     requireBytes(b.scratch.sums, size.sums);
     requireBytes(b.scratch.partials, size.partials);
     requireBytes(b.scratch.counters, size.counters);
-    if (!b.inputPrepared)
+    if (b.prepared.layout != LinearInput::Table64 || !b.prepared.source.sameView(b.input))
       graph.add("decode_linear_q4_prepare", {b.input, b.scratch.input, b.scratch.sums},
                 k, {k / 32, w.rows / SPLASH_TARGET_VERIFY_ROWS, 1}, {128, 1, 1});
     const auto &first = gate ? *gate : p;
@@ -717,7 +727,7 @@ void Q4Linear::add(metal::CommandGraph &graph, LinearBuffers b,
         {selected.configuration().groups, selected.configuration().splits,
          w.rows / SPLASH_TARGET_VERIFY_ROWS}, {128, 1, 1});
     if (stats) account(*stats, w.rows / SPLASH_TARGET_VERIFY_ROWS, 1);
-    return;
+    return {b.input, LinearInput::Table64};
   }
   const auto dispatch = [&](std::string_view name,
       std::initializer_list<metal::MetalBuffer> bindings) {
@@ -752,6 +762,7 @@ void Q4Linear::add(metal::CommandGraph &graph, LinearBuffers b,
   else dispatch(selected.pipeline(), {b.input, p.weights, p.scales, p.biases, b.output});
   if (stats && w.phase == LinearPhase::Decode)
     account(*stats, w.rows / SPLASH_TARGET_VERIFY_ROWS, selected.secondPipeline().empty() ? 1 : 2);
+  return b.prepared;
 }
 
 void Q4Linear::addPrefillSums(metal::CommandGraph &graph, metal::MetalBuffer input,
@@ -782,24 +793,27 @@ void Q4Linear::addPrefillUpWithGate(metal::CommandGraph &graph, metal::MetalBuff
   add(graph, {input, output, sums, {}, gateScratch, downSums}, up,
       plan({matrix, rows, LinearPhase::Prefill, LinearEpilogue::UpWithGate}));
 }
-void Q4Linear::addDecode(metal::CommandGraph &graph, metal::MetalBuffer input,
+PreparedInput Q4Linear::addDecode(metal::CommandGraph &graph, metal::MetalBuffer input,
     const Q4Projection &p, metal::MetalBuffer output, LinearMatrix matrix, LinearScratch scratch) const {
-  add(graph, {input, output, {}, {}, {}, {}, scratch}, p, plan(decode(matrix, 1, LinearEpilogue::None)));
+  return add(graph, {input, output, {}, {}, {}, {}, scratch}, p, plan(decode(matrix, 1, LinearEpilogue::None)));
 }
-void Q4Linear::addDecodeBatch(metal::CommandGraph &graph, metal::MetalBuffer input,
+PreparedInput Q4Linear::addDecodeBatch(metal::CommandGraph &graph, metal::MetalBuffer input,
     const Q4Projection &p, metal::MetalBuffer output, LinearMatrix matrix,
-    uint32_t lanes, Q4DispatchStats &stats, LinearScratch scratch, bool inputPrepared) const {
-  add(graph, {input, output, {}, {}, {}, {}, scratch, inputPrepared}, p, plan(decode(matrix, lanes, LinearEpilogue::None)), nullptr, &stats);
+    uint32_t lanes, Q4DispatchStats &stats, LinearScratch scratch, PreparedInput prepared) const {
+  return add(graph, {input, output, {}, {}, {}, {}, scratch, prepared}, p,
+             plan(decode(matrix, lanes, LinearEpilogue::None)), nullptr, &stats);
 }
-void Q4Linear::addResidualBatch(metal::CommandGraph &graph, metal::MetalBuffer input,
+PreparedInput Q4Linear::addResidualBatch(metal::CommandGraph &graph, metal::MetalBuffer input,
     const Q4Projection &p, metal::MetalBuffer residual, metal::MetalBuffer output,
-    LinearMatrix matrix, uint32_t lanes, Q4DispatchStats &stats, LinearScratch scratch, bool inputPrepared) const {
-  add(graph, {input, output, {}, residual, {}, {}, scratch, inputPrepared}, p, plan(decode(matrix, lanes, LinearEpilogue::Residual)), nullptr, &stats);
+    LinearMatrix matrix, uint32_t lanes, Q4DispatchStats &stats, LinearScratch scratch, PreparedInput prepared) const {
+  return add(graph, {input, output, {}, residual, {}, {}, scratch, prepared}, p,
+             plan(decode(matrix, lanes, LinearEpilogue::Residual)), nullptr, &stats);
 }
-void Q4Linear::addGateUpBatch(metal::CommandGraph &graph, metal::MetalBuffer input,
+PreparedInput Q4Linear::addGateUpBatch(metal::CommandGraph &graph, metal::MetalBuffer input,
     const Q4Projection &gate, const Q4Projection &up, metal::MetalBuffer gateScratch,
-    metal::MetalBuffer output, LinearMatrix matrix, uint32_t lanes, Q4DispatchStats &stats, LinearScratch scratch, bool inputPrepared) const {
-  add(graph, {input, output, {}, {}, gateScratch, {}, scratch, inputPrepared}, up, plan(decode(matrix, lanes, LinearEpilogue::GateUp)), &gate, &stats);
+    metal::MetalBuffer output, LinearMatrix matrix, uint32_t lanes, Q4DispatchStats &stats, LinearScratch scratch, PreparedInput prepared) const {
+  return add(graph, {input, output, {}, {}, gateScratch, {}, scratch, prepared}, up,
+             plan(decode(matrix, lanes, LinearEpilogue::GateUp)), &gate, &stats);
 }
 
 } // namespace splash::ops

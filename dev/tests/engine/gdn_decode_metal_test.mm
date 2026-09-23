@@ -584,7 +584,8 @@ void fusedPreparation(MetalBackend &backend, const GdnShape &shape, uint32_t lan
   auto buffers = fixture.decodeBuffers(0);
   buffers.linearScratch = {table, sums, {}, {}};
   CommandGraph fused;
-  GDN::addDecode(fused, buffers, shape, lanes, 0, fixture.cell.strides());
+  GDN::addDecode(fused, buffers, shape, lanes, 0, fixture.cell.strides(), GdnHeadOrder::Grouped,
+                 splash::ops::LinearInput::Table64);
   (void)backend.submitCommand(fused.dispatches());
   require(!std::memcmp(expected.data(), fixture.hidden.contents(), expected.size()),
           "fused GDN changed output");
@@ -623,7 +624,8 @@ void tiledHeadOrder(MetalBackend &backend, const GdnShape &shape, uint32_t lanes
   auto buffers = fixture.decodeBuffers(0);
   buffers.linearScratch = {table, sums, {}, {}};
   CommandGraph tiled;
-  GDN::addDecode(tiled, buffers, shape, lanes, 0, fixture.cell.strides(), GdnHeadOrder::Tiled);
+  GDN::addDecode(tiled, buffers, shape, lanes, 0, fixture.cell.strides(), GdnHeadOrder::Tiled,
+                 splash::ops::LinearInput::Table64);
   tiled.add("decode_linear_q4_prepare", {fixture.hidden, referenceTable, referenceSums},
             width, {width / 32, lanes, 1}, {128, 1, 1});
   (void)backend.submitCommand(tiled.dispatches());
@@ -660,7 +662,8 @@ void rejectsInvalid(MetalBackend &backend) {
     auto buffers = fixture.decodeBuffers(0);
     buffers.linearScratch.input = backend.allocateBuffer(16);
     buffers.linearScratch.sums = backend.allocateBuffer(4);
-    GDN::addDecode(graph, buffers, shape, 1, 0, fixture.cell.strides());
+    GDN::addDecode(graph, buffers, shape, 1, 0, fixture.cell.strides(), GdnHeadOrder::Grouped,
+                   splash::ops::LinearInput::Table64);
   });
   require(graph.empty(), "invalid GDN request partially encoded a graph");
 }

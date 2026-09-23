@@ -97,10 +97,13 @@ public:
   static void addPrefill(metal::CommandGraph &graph, GdnPrefillBuffers buffers,
                          GdnShape shape, uint32_t tokens,
                          GdnHeadOrder order = GdnHeadOrder::Grouped);
-  static void addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffers,
-                        GdnShape shape, uint32_t lanes, uint32_t layer,
-                        GdnStateStrides state,
-                        GdnHeadOrder order = GdnHeadOrder::Grouped);
+  // Also writes the out-projection's `input` table into
+  // buffers.linearScratch when it needs one.
+  static PreparedInput addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffers,
+                                 GdnShape shape, uint32_t lanes, uint32_t layer,
+                                 GdnStateStrides state,
+                                 GdnHeadOrder order = GdnHeadOrder::Grouped,
+                                 LinearInput input = LinearInput::Plain);
   static void addCommit(metal::CommandGraph &graph, GdnCommitBuffers buffers,
                         GdnShape shape, uint32_t layers, uint32_t lanes,
                         GdnStateStrides state);

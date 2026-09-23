@@ -299,7 +299,7 @@ void fusedNorm(metal::MetalBackend &backend, uint32_t k, uint32_t rows) {
   metal::CommandGraph graph;
   Normalization::addRms(graph,input,weight,output,k,rows);
   graph.add("decode_linear_q4_prepare",{output,a,sa},k,{k/32,rows/8,1},{128,1,1});
-  Normalization::addRms(graph,input,weight,fused,k,rows,{b,sb,{},{}});
+  Normalization::addRms(graph,input,weight,fused,k,rows,{b,sb,{},{}},splash::ops::LinearInput::Table64);
   (void)backend.submitCommand(graph.dispatches());
   require(!std::memcmp(output.contents(),fused.contents(),k*rows*2),"fused norm changed bf16 output");
   require(!std::memcmp(a.contents(),b.contents(),k*rows*2),"fused operand permutation mismatch");
@@ -323,7 +323,8 @@ void fusedAttentionGate(metal::MetalBackend &backend, uint32_t heads, uint32_t k
   graph.add("decode_linear_q4_prepare", {output.view, a.view, sa.view}, width,
             {width / 32, lanes, 1}, {128, 1, 1});
   PagedAttention::addVerifyGate(graph, packed, attention, fused.view, 8, 32, 32,
-                                heads, {1, kvHeads, 256}, lanes, {b.view, sb.view, {}, {}});
+                                heads, {1, kvHeads, 256}, lanes, {b.view, sb.view, {}, {}},
+                                splash::ops::LinearInput::Table64);
   (void)backend.submitCommand(graph.dispatches());
   require(!std::memcmp(output.view.contents(), fused.view.contents(), width * 16 * lanes),
           "fused attention gate output");
