@@ -13,6 +13,17 @@ struct GgufParams {
 };
 static_assert(sizeof(GgufParams) == 20, "GGUF parameters are 20 bytes on both sides");
 
+// Prefill tiles (pf kernels): the grid covers whole 128-row tiles of the chunk; the simdgroups of the last tile
+// whose rows start past `rows` skip their matmuls.
+struct GgufPrefillParams {
+  uint32_t output_size; // columns of this segment
+  uint32_t input_size;  // K
+  uint32_t rows;        // rows of the chunk
+  uint32_t out_stride;  // row stride of the destination (0 = output_size)
+  uint32_t out_offset;  // first destination column of this segment
+};
+static_assert(sizeof(GgufPrefillParams) == 20, "GGUF prefill parameters are 20 bytes on both sides");
+
 // Apple9 register decode (kernels/decode/linear_gguf_sgmatrix.metal): one
 // tensor per dispatch, over the dispatch's 64-column tiles.
 struct GgufSgParams {

@@ -14,20 +14,18 @@ namespace splash::ops {
 namespace {
 
 // Decode tiles: 64 output columns per threadgroup, two simdgroups of 32
-// columns each. Prefill tiles: 64 columns, four simdgroups of 32 or 8 rows.
+// columns each. Prefill tiles: 64 columns, four simdgroups of 32 rows.
 constexpr uint32_t kDecodeTileColumns = 64;
 constexpr uint32_t kDecodeThreads = 64;
 constexpr uint32_t kPrefillTileColumns = 64;
 constexpr uint32_t kPrefillThreads = 128;
 constexpr uint32_t kPrefillRows = 128;
-constexpr uint32_t kSmallPrefillRows = 32;
 
-std::string decodeKernel(const char *family, const char *format, uint32_t rows) {
-  return std::string(family) + "_" + format + "_m" + std::to_string(rows) + "_c32_sg2_k32_b2_p1";
+std::string decodeKernel(const std::string &family, const char *format, uint32_t rows) {
+  return family + "_" + format + "_m" + std::to_string(rows) + "_c32_sg2_k32_b2_p1";
 }
-std::string prefillKernel(const char *family, const char *format, uint32_t tileRows) {
-  return std::string(family) + "_" + format + (tileRows == kSmallPrefillRows ? "_r8" : "_r32") +
-         "_sg4_n64_k64_p1";
+std::string prefillKernel(const std::string &family, const char *format) {
+  return family + "_" + format + "_r32_sg4_n64_k64_p1";
 }
 
 // Staged tile: split K until the grid holds 32 threadgroups per core,
@@ -82,7 +80,17 @@ void requireSegments(const Q4Projection &p, LinearMatrix matrix) {
 } // namespace
 
 LinearConfig Q4Linear::ggufBaseline(LinearWorkload w, uint32_t segments) const {
-  if (w.phase == LinearPhase::Prefill) return {LinearTile::GgufStaged, 0, LinearSimdgroups::Four};
+  // Prefill: 128-row tiles. A chunk of up to 32 rows runs the decode tile
+  // of its rows rounded up to eight-row lanes (two simdgroups): the same
+  // half stage and matmul rows, so its outputs equal the prefill tile's bit
+  // for bit (gguf-projection full), and each simdgroup streams its own 32
+  // columns instead of four 8-row simdgroups sharing a stage. On a 17408 x
+  // 5120 Q4_K projection that is 1.8-2.9x faster on a 16-core M5 Pro (its
+  // neural accelerator pads 8 rows to 16) and 1.1-2.8x on a 40-core M3 Max.
+  if (w.phase == LinearPhase::Prefill)
+    return {LinearTile::GgufStaged, 0,
+            w.rows <= SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS ? LinearSimdgroups::Two
+                                                                              : LinearSimdgroups::Four};
   const auto [n, k] = w.matrix;
   // Apple9 runs matrix operations on the FP32 pipe, so the exact register
   // kernel beats staging (scratchpad DESIGN); every segment and gate/up split.
@@ -134,21 +142,28 @@ void Q4Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
     return;
   }
   if (w.phase == LinearPhase::Prefill) {
-    // One dispatch per segment over 128-row tiles (32-row tiles for short
-    // chunks); rows past w.rows stay inside the budget-sized prefill buffers.
-    const uint32_t tileRows = rows == kSmallPrefillRows ? kSmallPrefillRows : kPrefillRows;
+    // One dispatch per segment, over the decode tiles (ggufBaseline) or
+    // 128-row tiles; rows past w.rows stay inside the budget-sized prefill
+    // buffers, and the simdgroups of a 128-row tile that only hold them skip
+    // their matmuls.
     const metal::MetalBuffer aux = w.epilogue == LinearEpilogue::Residual ? b.residual
                                  : w.epilogue == LinearEpilogue::UpWithGate ? b.gateScratch
                                                                              : b.output;
+    const char epilogue = w.epilogue == LinearEpilogue::None       ? 'a'
+                        : w.epilogue == LinearEpilogue::Residual   ? 'r'
+                                                                   : 'g';
     for (const GgufSegment &s : p.gguf) {
-      const GgufParams params{s.outputSize, k, 0, n, s.columnOffset};
-      const metal::DispatchSize grid{rows / tileRows, s.outputSize / kPrefillTileColumns, 1};
-      if (w.epilogue == LinearEpilogue::None)
-        graph.add(prefillKernel("pfa", s.format, tileRows), {b.input, s.plane0, plane1(s), s.meta, b.output},
-                  params, grid, {kPrefillThreads, 1, 1});
-      else
-        graph.add(prefillKernel(w.epilogue == LinearEpilogue::Residual ? "pfr" : "pfg", s.format, tileRows),
-                  {b.input, s.plane0, plane1(s), s.meta, b.output, aux}, params, grid, {kPrefillThreads, 1, 1});
+      std::vector<metal::MetalBuffer> bindings{b.input, s.plane0, plane1(s), s.meta, b.output};
+      if (w.epilogue != LinearEpilogue::None) bindings.push_back(aux);
+      if (config.simdgroups == LinearSimdgroups::Two) {
+        const uint32_t tiles = s.outputSize / kDecodeTileColumns;
+        graph.add(decodeKernel(std::string("sg") + epilogue, s.format, rows), std::move(bindings),
+                  GgufParams{s.outputSize, k, tiles, n, s.columnOffset}, {tiles, 1, 1}, {kDecodeThreads, 1, 1});
+      } else {
+        graph.add(prefillKernel(std::string("pf") + epilogue, s.format), std::move(bindings),
+                  GgufPrefillParams{s.outputSize, k, w.rows, n, s.columnOffset},
+                  {rows / kPrefillRows, s.outputSize / kPrefillTileColumns, 1}, {kPrefillThreads, 1, 1});
+      }
     }
     return;
   }

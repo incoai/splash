@@ -803,15 +803,19 @@ void ggufPlans() {
   require(fused.configuration().splits == 1 && fused.scratchSize().bytes() == 0 &&
               gateUp.configuration().splits == 1 && gateUp.gateScratchBytes() == 0,
           "GGUF fused and gate/up plans take no K splits");
-  for (const auto [rows, storage] : {std::pair{1U, 32U}, {20U, 32U}, {32U, 32U}, {33U, 128U},
-                                     {100U, 128U}, {2048U, 2048U}}) {
+  for (const auto [rows, storage] : {std::pair{1U, 8U}, {8U, 8U}, {9U, 16U}, {17U, 24U}, {25U, 32U}, {32U, 32U},
+                                     {33U, 128U}, {100U, 128U}, {129U, 256U}, {2048U, 2048U}}) {
     const LinearPlan prefill = linear.plan({{5120, 17408}, rows, LinearPhase::Prefill, LinearEpilogue::UpWithGate},
                                            projection(5120, 17408, 1));
     require(prefill.storageRows() == storage && prefill.sumsBytes() == 0 && prefill.downSumsBytes() == 0 &&
                 prefill.gateScratchBytes() == uint64_t{storage} * 5120 * 2 &&
-                prefill.scratchSize().bytes() == 0,
+                prefill.scratchSize().bytes() == 0 &&
+                prefill.threadsPerThreadgroup() == (rows <= 32 ? 64U : 128U),
             "GGUF prefill tile rows");
   }
+  // The decode tiles hold at most a decode batch.
+  LinearWorkload longPrefill{{5120, 17408}, 33, LinearPhase::Prefill, LinearEpilogue::None, QuantFamily::Gguf};
+  rejects([&] { (void)Q4Linear::plan(longPrefill, {LinearTile::GgufStaged, 0, LinearSimdgroups::Two}); });
   // Affine and GGUF plans do not mix.
   rejects([&] { (void)Q4Linear::plan(down, {LinearTile::GgufStaged, 80, LinearSimdgroups::Two, 8}); });
   LinearWorkload gguf = down;

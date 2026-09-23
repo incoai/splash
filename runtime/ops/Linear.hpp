@@ -83,9 +83,10 @@ enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate };
 // uses bf16 8x8 matrix operations and an explicit activation/split workspace.
 // GgufStaged dequantizes GGUF weights per simdgroup into threadgroup memory
 // for matmul2d: 64 columns per decode threadgroup (two simdgroups) with
-// optional K splits, 128- or 32-row prefill tiles. GgufSimdgroup is the
-// GGUF register kernel on bf16 8x8 matrix operations (Apple9): 64 columns
-// per threadgroup, every request lane in one threadgroup, optional K splits.
+// optional K splits; prefill runs 128-row tiles, or the decode tiles for
+// chunks of up to 32 rows. GgufSimdgroup is the GGUF register kernel on
+// bf16 8x8 matrix operations (Apple9): 64 columns per threadgroup, every
+// request lane in one threadgroup, optional K splits.
 enum class LinearTile : uint8_t {
   N128, N256, Paired128, Split32, Split64, Paired256, Simdgroup, GgufStaged, GgufSimdgroup
 };

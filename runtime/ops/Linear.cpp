@@ -119,9 +119,13 @@ bool supportsFourSimdgroups(LinearWorkload w, LinearTile tile) noexcept {
 
 uint32_t LinearPlan::storageRows() const noexcept {
   if (workload_.phase != LinearPhase::Prefill) return workload_.rows;
-  // GGUF prefill runs 32-row tiles for short chunks and 128-row tiles otherwise.
-  if (config_.tile == LinearTile::GgufStaged)
-    return workload_.rows <= kPrefillRows ? kPrefillRows : (workload_.rows + 127) / 128 * 128;
+  // GGUF prefill: 128-row tiles, or the decode tile of one to four
+  // eight-row lanes (two simdgroups, LinearGguf.cpp).
+  if (config_.tile == LinearTile::GgufStaged) {
+    const uint32_t rows = workload_.rows, tile = config_.simdgroups == LinearSimdgroups::Four
+        ? 128 : SPLASH_TARGET_VERIFY_ROWS;
+    return (rows + tile - 1) / tile * tile;
+  }
   return ((workload_.rows + kPrefillRows - 1) / kPrefillRows) * kPrefillRows;
 }
 uint32_t LinearPlan::tileColumns() const noexcept {
@@ -213,7 +217,12 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config)
       return;
     }
     if (w.phase == LinearPhase::Prefill) {
-      if (config.groups || config.splits != 1 || config.simdgroups != LinearSimdgroups::Four)
+      // Four simdgroups: 128-row prefill tiles. Two: the decode tiles, which
+      // hold at most the rows of a full decode batch.
+      const bool decodeTile = config.simdgroups == LinearSimdgroups::Two &&
+          w.rows <= SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS;
+      if (config.groups || config.splits != 1 ||
+          (config.simdgroups != LinearSimdgroups::Four && !decodeTile))
         throw std::invalid_argument("invalid GGUF prefill configuration");
     } else if (config.groups != w.matrix.outputSize / tileColumns() ||
                config.simdgroups != LinearSimdgroups::Two || !config.splits ||
