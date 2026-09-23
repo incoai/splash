@@ -754,6 +754,68 @@ void affinePolicyIdentity() {
   require(hash == kExpected, "affine Linear policy changed (LINEAR_POLICY_HASH=print shows the new hash)");
 }
 
+// GGUF projections plan with their segments: the staged split policy for
+// single tensors, no K splits for fused tensors and gate/up, exact split
+// scratch, and prefill tiles of 32 or 128 rows.
+void ggufPlans() {
+  DeviceCapabilities device;
+  device.appleGpuFamily = 10;
+  device.gpuCoreCount = 16;
+  const Q4Linear linear(device);
+  const auto projection = [](uint32_t n, uint32_t k, uint32_t segments) {
+    Q4Projection p;
+    p.outputSize = n;
+    p.inputSize = k;
+    for (uint32_t i = 0; i < segments; ++i) {
+      GgufSegment s;
+      s.outputSize = n / segments;
+      s.inputSize = k;
+      s.columnOffset = i * (n / segments);
+      p.gguf.push_back(s);
+    }
+    return p;
+  };
+  const LinearWorkload down{{5120, 17408}, 8, LinearPhase::Decode, LinearEpilogue::Residual};
+  const LinearPlan single = linear.plan(down, projection(5120, 17408, 1));
+  require(single.workload().quant == QuantFamily::Gguf &&
+              single.configuration() == LinearConfig{LinearTile::GgufStaged, 80, LinearSimdgroups::Two, 8} &&
+              single.input() == LinearInput::Plain && single.partialSums() == 8 &&
+              single.scratchSize().partials == uint64_t{8} * 8 * 5120 * 4 &&
+              single.scratchSize().counters == 80 * 4 && single.scratchSize().input == 0,
+          "GGUF single-tensor decode plan");
+  require(linear.plan({{5120, 6144}, 32, LinearPhase::Decode, LinearEpilogue::Residual},
+                      projection(5120, 6144, 1)).configuration().splits == 4 &&
+              linear.plan({{10240, 5120}, 24, LinearPhase::Decode, LinearEpilogue::None},
+                          projection(10240, 5120, 1)).configuration().splits == 2,
+          "GGUF staged split policy");
+  const LinearPlan fused = linear.plan({{10240, 5120}, 8, LinearPhase::Decode, LinearEpilogue::None},
+                                       projection(10240, 5120, 2));
+  const LinearPlan gateUp = linear.plan({{17408, 5120}, 16, LinearPhase::Decode, LinearEpilogue::GateUp},
+                                        projection(17408, 5120, 1));
+  require(fused.configuration().splits == 1 && fused.scratchSize().bytes() == 0 &&
+              gateUp.configuration().splits == 1 && gateUp.gateScratchBytes() == 0,
+          "GGUF fused and gate/up plans take no K splits");
+  for (const auto [rows, storage] : {std::pair{1U, 32U}, {20U, 32U}, {32U, 32U}, {33U, 128U},
+                                     {100U, 128U}, {2048U, 2048U}}) {
+    const LinearPlan prefill = linear.plan({{5120, 17408}, rows, LinearPhase::Prefill, LinearEpilogue::UpWithGate},
+                                           projection(5120, 17408, 1));
+    require(prefill.storageRows() == storage && prefill.sumsBytes() == 0 && prefill.downSumsBytes() == 0 &&
+                prefill.gateScratchBytes() == uint64_t{storage} * 5120 * 2 &&
+                prefill.scratchSize().bytes() == 0,
+            "GGUF prefill tile rows");
+  }
+  // Affine and GGUF plans do not mix.
+  rejects([&] { (void)Q4Linear::plan(down, {LinearTile::GgufStaged, 80, LinearSimdgroups::Two, 8}); });
+  LinearWorkload gguf = down;
+  gguf.quant = QuantFamily::Gguf;
+  rejects([&] { (void)Q4Linear::plan(gguf, {LinearTile::N128, 40}); });
+  rejects([&] { (void)Q4Linear::plan(gguf, {LinearTile::GgufStaged, 40, LinearSimdgroups::Two, 8}); });
+  rejects([&] { (void)Q4Linear::plan(gguf, {LinearTile::GgufStaged, 80, LinearSimdgroups::Two, 3}); });
+  // The arena bound is the single-tensor plan.
+  require(linear.decodeScratchSize(gguf).partials == single.scratchSize().partials,
+          "GGUF decode scratch bound");
+}
+
 void scalingContracts() {
   for (uint32_t family : {9U, 10U, 11U}) {
     for (uint32_t index = 0; index <= 129; ++index) {
@@ -1252,6 +1314,7 @@ int main(int argc, char **argv) {
     require(argc == 2, "usage: linear-plan <production.metallib|--cpu>");
     baselinePlans();
     affinePolicyIdentity();
+    ggufPlans();
     narrowM24BoundaryPlans();
     scalingContracts();
     // Apple9 at the assumed core count reaches the expanded split set;

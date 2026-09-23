@@ -189,6 +189,8 @@ struct QwenTargetGeometry final {
   uint32_t captureLayerCount = 0;
   kv::Q8Layout kvLayout{};
   GdnStateLayout stateLayout{};
+  // The target projections' weight format (the draft is always affine).
+  ops::QuantFamily quant = ops::QuantFamily::Affine;
 
   [[nodiscard]] constexpr uint32_t gdnKeyWidth() const noexcept {
     return gdnKeyHeads * gdnHeadDimension;

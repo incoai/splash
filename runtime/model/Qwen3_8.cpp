@@ -90,28 +90,6 @@ Qwen3_8Weights loadQwen3_8Weights(metal::MetalBackend &backend,
     weights = loadQwenTargetWeights<Qwen3_8Weights>(backend, directory, layout, kHeadMagic,
                                                     readFfn);
   }
-  if (!ggufTarget) return weights;
-  // Shared split-K scratch for the GGUF kernels: partials for 8 splits x 32
-  // rows x the widest projection, and one arrival counter per 64 columns.
-  const uint32_t widest = std::max({layout.packedGdnWidth, layout.packedFullWidth,
-                                    layout.intermediateSize, layout.hiddenSize});
-  metal::MetalBuffer partials = backend.allocateBuffer(
-      uint64_t{8} * 32 * widest * 4, metal::BufferStorage::Shared, "gguf-partials");
-  metal::MetalBuffer counters = backend.allocateBuffer(
-      uint64_t{widest / 64} * 4, metal::BufferStorage::Shared, "gguf-counters");
-  std::memset(counters.contents(), 0, counters.sizeBytes());
-  const auto attach = [&](ops::Q4Projection &p) {
-    p.kqPartials = partials;
-    p.kqCounters = counters;
-  };
-  for (Qwen3_8LayerWeights &layer : weights.layers) {
-    std::visit([&](auto &mixer) { attach(mixer.inputProjection); attach(mixer.outputProjection); },
-               layer.mixer);
-    attach(layer.gateProjection);
-    attach(layer.upProjection);
-    attach(layer.downProjection);
-  }
-  attach(weights.logitsProjection);
   return weights;
 }
 

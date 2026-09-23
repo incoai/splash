@@ -84,6 +84,8 @@ TuningWorkloads collectTuningWorkloads(
                          const ops::Q4Projection *gate = nullptr) {
     if (!weight.inputSize || !weight.outputSize)
       throw std::invalid_argument("operator probe projection has no geometry");
+    // GGUF projections are not tuned yet; their plans ignore installed choices.
+    if (!weight.gguf.empty()) return;
     const auto sizes = phase == LinearPhase::Prefill ? prefillRows : decodeWidths;
     for (uint32_t size : sizes) {
       const uint32_t rows = phase == LinearPhase::Prefill

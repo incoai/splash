@@ -39,10 +39,8 @@ struct Q4Projection final {
   metal::MetalBuffer biases;
   uint32_t outputSize = 0;
   uint32_t inputSize = 0;
-  // Non-empty: a GGUF GGUF projection; weights/scales/biases are unused.
+  // Non-empty: a GGUF projection; weights/scales/biases are unused.
   std::vector<GgufSegment> gguf{};
-  metal::MetalBuffer kqPartials{};    // fp32 split-K partials scratch (shared)
-  metal::MetalBuffer kqCounters{};    // split-K arrival counters (one uint per 64-column tile, zero at rest)
 };
 
 // Q8 affine projections use per-64-input quantization and StorageN=256 order.
@@ -73,6 +71,9 @@ struct LinearMatrix final {
 };
 
 enum class LinearPhase : uint8_t { Prefill, Decode };
+// How a projection stores its weights: MLX affine int4 (weights, scales,
+// biases) or GGUF segments (metal/abi/QuantFormat.h).
+enum class QuantFamily : uint8_t { Affine, Gguf };
 enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate };
 // Compute tiles over the StorageN=256 packing. Paired tiles pipeline two
 // quant groups of one lane. Split tiles keep one 8-row tile per threadgroup
@@ -80,16 +81,20 @@ enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate };
 // the bf16 rounding; they take one lane, K % 1024 == 0 and one threadgroup
 // per tile. Paired256 is the four-simdgroup N256 paired tile. Simdgroup
 // uses bf16 8x8 matrix operations and an explicit activation/split workspace.
+// GgufStaged dequantizes GGUF weights per simdgroup into threadgroup memory
+// for matmul2d: 64 columns per decode threadgroup (two simdgroups) with
+// optional K splits, 128- or 32-row prefill tiles.
 enum class LinearTile : uint8_t {
-  N128, N256, Paired128, Split32, Split64, Paired256, Simdgroup
+  N128, N256, Paired128, Split32, Split64, Paired256, Simdgroup, GgufStaged
 };
-enum class LinearSimdgroups : uint8_t { Four = 4, Eight = 8 };
+enum class LinearSimdgroups : uint8_t { Two = 2, Four = 4, Eight = 8 };
 
 struct LinearWorkload final {
   LinearMatrix matrix;
   uint32_t rows = 0;
   LinearPhase phase = LinearPhase::Decode;
   LinearEpilogue epilogue = LinearEpilogue::None;
+  QuantFamily quant = QuantFamily::Affine;
   auto operator<=>(const LinearWorkload &) const = default;
 };
 
@@ -209,6 +214,9 @@ public:
   static constexpr std::size_t kMaximumCandidates = 20;
 
   [[nodiscard]] LinearPlan plan(LinearWorkload workload) const;
+  // The plan that runs for this projection: GGUF plans also depend on its
+  // segments (the fused multi-tensor kernels take no K splits).
+  [[nodiscard]] LinearPlan plan(LinearWorkload workload, const Q4Projection &projection) const;
   // The layout the decode plan of this projection reads, for its producer.
   [[nodiscard]] LinearInput decodeInput(const Q4Projection &projection, uint32_t lanes,
                                         LinearEpilogue epilogue = LinearEpilogue::None) const;
@@ -269,6 +277,12 @@ public:
 
 private:
   [[nodiscard]] LinearConfig baseline(LinearWorkload workload) const;
+  // GGUF policy and dispatch (LinearGguf.cpp). `segments` is the number of
+  // tensors the projection concatenates; one is the largest-scratch case.
+  [[nodiscard]] LinearConfig ggufBaseline(LinearWorkload workload, uint32_t segments) const;
+  void addGguf(metal::CommandGraph &graph, const LinearBuffers &buffers,
+               const Q4Projection &projection, const LinearPlan &plan,
+               const Q4Projection *gate, Q4DispatchStats *stats) const;
   uint32_t appleGpuFamily_ = 0;
   uint32_t gpuCores_ = 0;
   std::vector<LinearChoice> choices_;

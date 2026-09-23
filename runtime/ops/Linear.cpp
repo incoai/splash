@@ -1,7 +1,5 @@
 #include "Linear.hpp"
 
-#include "metal/abi/Gguf.h"
-
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Linear.h"
 
@@ -43,7 +41,8 @@ std::optional<LinearSimdgroups> fixedSimdgroups(LinearTile tile) noexcept {
   case LinearTile::Split64: return LinearSimdgroups::Eight;
   case LinearTile::N128:
   case LinearTile::N256:
-  case LinearTile::Paired128: return std::nullopt;
+  case LinearTile::Paired128:
+  case LinearTile::GgufStaged: return std::nullopt;
   }
   return std::nullopt;
 }
@@ -118,14 +117,18 @@ bool supportsFourSimdgroups(LinearWorkload w, LinearTile tile) noexcept {
 } // namespace
 
 uint32_t LinearPlan::storageRows() const noexcept {
-  return workload_.phase == LinearPhase::Prefill
-      ? ((workload_.rows + kPrefillRows - 1) / kPrefillRows) * kPrefillRows : workload_.rows;
+  if (workload_.phase != LinearPhase::Prefill) return workload_.rows;
+  // GGUF prefill runs 32-row tiles for short chunks and 128-row tiles otherwise.
+  if (config_.tile == LinearTile::GgufStaged)
+    return workload_.rows <= kPrefillRows ? kPrefillRows : (workload_.rows + 127) / 128 * 128;
+  return ((workload_.rows + kPrefillRows - 1) / kPrefillRows) * kPrefillRows;
 }
 uint32_t LinearPlan::tileColumns() const noexcept {
   switch (config_.tile) {
   case LinearTile::Simdgroup: return workload_.epilogue == LinearEpilogue::GateUp ? 32 : 64;
   case LinearTile::Split32: return 32;
-  case LinearTile::Split64: return 64;
+  case LinearTile::Split64:
+  case LinearTile::GgufStaged: return 64;
   case LinearTile::N256:
   case LinearTile::Paired256: return 256;
   case LinearTile::N128:
@@ -137,15 +140,23 @@ uint32_t LinearPlan::threadsPerThreadgroup() const noexcept {
   return static_cast<uint32_t>(config_.simdgroups) * 32;
 }
 uint32_t LinearPlan::partialSums() const noexcept {
-  return usesSimdgroup() ? config_.splits : splitTile(config_.tile) ? kSplitPartitions : 1;
+  if (usesSimdgroup() || config_.tile == LinearTile::GgufStaged) return config_.splits;
+  return splitTile(config_.tile) ? kSplitPartitions : 1;
 }
 bool LinearPlan::usesSimdgroup() const noexcept { return config_.tile == LinearTile::Simdgroup; }
 LinearInput LinearPlan::input() const noexcept {
   return usesSimdgroup() ? LinearInput::Table64 : LinearInput::Plain;
 }
 LinearScratchSize LinearPlan::scratchSize() const noexcept {
-  if (!usesSimdgroup()) return {};
   const auto [n, k] = workload_.matrix;
+  // GGUF split-K: [split][row][column] fp32 partials and one counter per
+  // 64-column tile (a tile covers every row of the dispatch).
+  if (config_.tile == LinearTile::GgufStaged)
+    return workload_.phase == LinearPhase::Decode && config_.splits > 1
+        ? LinearScratchSize{0, 0, uint64_t{config_.splits} * workload_.rows * n * sizeof(float),
+                            uint64_t{n / tileColumns()} * sizeof(uint32_t)}
+        : LinearScratchSize{};
+  if (!usesSimdgroup()) return {};
   const uint64_t rows = workload_.rows;
   const uint64_t lanes = rows / SPLASH_TARGET_VERIFY_ROWS;
   // Each row tile owns two fp32 fragment streams per K partition and one
@@ -156,7 +167,7 @@ LinearScratchSize LinearPlan::scratchSize() const noexcept {
 }
 
 uint64_t LinearPlan::sumsBytes() const noexcept {
-  return workload_.phase == LinearPhase::Prefill
+  return workload_.phase == LinearPhase::Prefill && workload_.quant == QuantFamily::Affine
       ? uint64_t{storageRows()} * (workload_.matrix.inputSize / kQuantGroup) * 4 : 0;
 }
 uint64_t LinearPlan::gateScratchBytes() const noexcept {
@@ -165,13 +176,28 @@ uint64_t LinearPlan::gateScratchBytes() const noexcept {
   return needed ? uint64_t{storageRows()} * workload_.matrix.outputSize * 2 : 0;
 }
 uint64_t LinearPlan::downSumsBytes() const noexcept {
-  return workload_.epilogue == LinearEpilogue::UpWithGate
+  return workload_.epilogue == LinearEpilogue::UpWithGate && workload_.quant == QuantFamily::Affine
       ? uint64_t{storageRows()} * (workload_.matrix.outputSize / kQuantGroup) * 4 : 0;
 }
 
 LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config)
     : workload_(w), config_(config) {
   validate(w);
+  if (config.tile == LinearTile::GgufStaged || w.quant == QuantFamily::Gguf) {
+    if (config.tile != LinearTile::GgufStaged || w.quant != QuantFamily::Gguf)
+      throw std::invalid_argument("GGUF projections run the GGUF tiles");
+    if (w.phase == LinearPhase::Prefill) {
+      if (config.groups || config.splits != 1 || config.simdgroups != LinearSimdgroups::Four)
+        throw std::invalid_argument("invalid GGUF prefill configuration");
+    } else if (config.groups != w.matrix.outputSize / tileColumns() ||
+               config.simdgroups != LinearSimdgroups::Two || !config.splits ||
+               config.splits > kMaximumSimdgroupSplits || (config.splits & (config.splits - 1)) ||
+               (w.matrix.inputSize / 32) % config.splits) {
+      throw std::invalid_argument("GGUF decode requires the full column grid and whole K-group partitions");
+    }
+    // Kernel names follow the segment formats (LinearGguf.cpp).
+    return;
+  }
   if (config.tile != LinearTile::Simdgroup && config.splits != 1)
     throw std::invalid_argument("K splits require the simdgroup Q4 tile");
   if (config.tile != LinearTile::N128 && config.tile != LinearTile::N256 &&
@@ -382,6 +408,7 @@ Q4Linear::Q4Linear(const DeviceCapabilities &device) noexcept
 // parallelism.
 LinearConfig Q4Linear::baseline(LinearWorkload w) const {
   validate(w);
+  if (w.quant == QuantFamily::Gguf) return ggufBaseline(w, 1);
   const uint32_t tiles128 = w.matrix.outputSize / 128;
   const uint32_t tiles256 = w.matrix.outputSize / 256;
   if (w.phase == LinearPhase::Prefill) {
@@ -455,6 +482,12 @@ LinearPlan Q4Linear::plan(LinearWorkload workload) const {
 LinearPlan Q4Linear::plan(LinearWorkload workload, LinearConfig config) {
   return LinearPlan(workload, config);
 }
+// GGUF plans are not tuned yet: installed choices do not apply to them.
+LinearPlan Q4Linear::plan(LinearWorkload w, const Q4Projection &p) const {
+  if (p.gguf.empty()) return plan(w);
+  w.quant = QuantFamily::Gguf;
+  return LinearPlan(w, ggufBaseline(w, static_cast<uint32_t>(p.gguf.size())));
+}
 void Q4Linear::setChoices(std::span<const LinearChoice> choices) {
   std::vector<LinearChoice> pending(choices.begin(), choices.end());
   for (const auto &choice : pending) (void)plan(choice.workload, choice.configuration);
@@ -471,6 +504,7 @@ std::vector<LinearPlan> Q4Linear::candidates(LinearWorkload w) const {
   std::vector<LinearPlan> result;
   result.reserve(kMaximumCandidates);
   result.push_back(LinearPlan(w, baseline(w)));
+  if (w.quant == QuantFamily::Gguf) return result;
   const auto append = [&](LinearConfig config) {
     for (const auto &existing : result)
       if (existing.configuration() == config) return;
@@ -527,9 +561,7 @@ std::vector<LinearPlan> Q4Linear::candidates(LinearWorkload w) const {
 
 LinearInput Q4Linear::decodeInput(const Q4Projection &p, uint32_t lanes,
                                   LinearEpilogue epilogue) const {
-  // GGUF kernels read the bf16 rows.
-  if (!p.gguf.empty()) return LinearInput::Plain;
-  return plan(decode({p.outputSize, p.inputSize}, lanes, epilogue)).input();
+  return plan(decode({p.outputSize, p.inputSize}, lanes, epilogue), p).input();
 }
 
 LinearScratchSize Q4Linear::decodeScratchSize(LinearWorkload w) const {
@@ -543,156 +575,15 @@ LinearScratchSize Q4Linear::decodeScratchSize(LinearWorkload w) const {
 }
 
 
-namespace {
-
-// ---- GGUF quantized dispatch (see kernels/shared/gguf_linear.metal). Decode-style
-// kernels stage per-simdgroup fp16 tiles for <= 32 rows; prefill uses shared
-// 128-row tiles. Narrow projections use split-K with an fp32 reduce.
-constexpr uint32_t kKQDecodeTileColumns = 64;
-constexpr uint32_t kKQDecodeThreads = 64;
-constexpr uint32_t kKQPrefillRows = 128;
-constexpr uint32_t kKQPrefillTileColumns = 64;
-constexpr uint32_t kKQPrefillThreads = 128;
-
-std::string kqKernel(const char *family, const char *format, uint32_t rows) {
-  return std::string(family) + "_" + format + "_m" + std::to_string(rows) + "_c32_sg2_k32_b2_p1";
-}
-std::string kqPrefillKernel(const char *family, const char *format) {
-  return std::string(family) + "_" + format + "_r32_sg4_n64_k64_p1";
-}
-uint32_t ggufSplits(uint32_t n, uint32_t k, uint32_t rows) {
-  if (n <= 1024) return 8;
-  if (n <= 6144) return k <= 6144 ? 4 : 8;   // serialized M=8 sweep: 4 splits best for out (K 6144), 8 for down (K 17408)
-  if (n <= 12288) return rows <= 16 ? 4 : 2;
-  return 1;
-}
-
-void addGguf(metal::CommandGraph &graph, const LinearBuffers &b, const Q4Projection &p,
-               LinearWorkload w, const Q4Projection *gate, Q4DispatchStats *stats) {
-  const auto [n, k] = w.matrix;
-  const auto requireSegments = [&](const Q4Projection &proj) {
-    uint32_t covered = 0;
-    for (const GgufSegment &s : proj.gguf) {
-      if (s.inputSize != k || s.columnOffset != covered || s.outputSize % kKQDecodeTileColumns)
-        throw std::invalid_argument("GGUF segments do not tile the projection");
-      covered += s.outputSize;
-    }
-    if (covered != n) throw std::invalid_argument("GGUF segments do not cover the projection");
-  };
-  requireSegments(p);
-  if (w.epilogue == LinearEpilogue::GateUp) {
-    if (!gate || gate->gguf.empty()) throw std::invalid_argument("GGUF gate projection is missing");
-    requireSegments(*gate);
-  } else if (gate) throw std::invalid_argument("unexpected GGUF gate projection");
-  // Rows the kernels compute: 8/16/32 for decode (24 lanes-rows run as a zero-padded 32-row
-  // tile), otherwise 128-row prefill tiles. Arena buffers hold 32 decode rows and the full
-  // prefill token budget, so the padded rows stay inside every bound buffer.
-  // Decode rows are exact (8/16/24/32 kernels); prefill rounds up to 128-row tiles inside
-  // the budget-sized prefill buffers, and <= 32 prefill rows use the 32-row decode kernels.
-  const bool small = w.rows <= 32;
-  const uint32_t rows = w.phase == LinearPhase::Decode ? w.rows
-                        : small ? 32u : (w.rows + kKQPrefillRows - 1) / kKQPrefillRows * kKQPrefillRows;
-  if (small && rows != 8 && rows != 16 && rows != 24 && rows != 32)
-    throw std::invalid_argument("GGUF decode rows must be 8, 16, 24 or 32");
-  const auto need = [&](const metal::MetalBuffer &buffer, uint64_t bytes, const char *what) {
-    if (buffer.sizeBytes() < bytes)
-      throw std::invalid_argument(std::string("GGUF ") + what + " buffer holds " +
-                                  std::to_string(buffer.sizeBytes()) + " bytes, needs " +
-                                  std::to_string(bytes) + " (rows " + std::to_string(rows) +
-                                  ", workload rows " + std::to_string(w.rows) + ", n " + std::to_string(n) + ")");
-  };
-  need(b.input, uint64_t{rows} * k * 2, "input");
-  need(b.output, uint64_t{rows} * n * 2, "output");
-  if (w.epilogue == LinearEpilogue::Residual) need(b.residual, uint64_t{rows} * n * 2, "residual");
-  // Only the two-pass forms use a gate buffer: UpWithGate reads it, and prefill
-  // GateUp writes the gate there first. Decode gate/up is one fused kernel.
-  if (w.epilogue == LinearEpilogue::UpWithGate || (w.epilogue == LinearEpilogue::GateUp && !small))
-    need(b.gateScratch, uint64_t{rows} * n * 2, "gate scratch");
-  const auto epilogueId = [](LinearEpilogue e) { return e == LinearEpilogue::Residual ? GGUF_EPILOGUE_RESIDUAL
-                                                      : e == LinearEpilogue::UpWithGate ? GGUF_EPILOGUE_UP_WITH_GATE : GGUF_EPILOGUE_NONE; };
-  const auto plane1 = [](const GgufSegment &s) { return s.plane1 ? s.plane1 : s.meta; };
-  if (small) {
-    // Decode rows: one dispatch per projection. Fused multi-type segments (qkv|z|ab, q|k|v), gate+up in one kernel,
-    // split-K with in-kernel reduction for narrow projections, plain tiles otherwise.
-    if (w.epilogue == LinearEpilogue::GateUp) {
-      if (gate->gguf.size() != 1 || p.gguf.size() != 1) throw std::invalid_argument("GGUF gate/up must be single tensors");
-      const GgufSegment &g = gate->gguf.front(), &u = p.gguf.front();
-      graph.add("gguf_gateup_m" + std::to_string(rows), {b.input, g.plane0, plane1(g), g.meta, u.plane0, plane1(u), u.meta, b.output},
-                GgufGateUpParams{k, n, n, g.formatId, u.formatId}, {n / kKQDecodeTileColumns, 1, 1}, {kKQDecodeThreads, 1, 1});
-    } else if (p.gguf.size() > 1) {
-      if (p.gguf.size() > 3 || w.epilogue != LinearEpilogue::None) throw std::invalid_argument("GGUF fused projection needs <= 3 segments and no epilogue");
-      // Dispatch order = tile order: put the segments with the most bytes per tile first so their
-      // threadgroups start early instead of forming the tail of the dispatch (alpha/beta are Q8_0).
-      std::vector<const GgufSegment *> order;
-      for (const GgufSegment &s : p.gguf) order.push_back(&s);
-      const auto bitsPerWeight = [](const GgufSegment &s) {
-        return (s.p0 + s.p1) * 8.0 / 32.0 + s.metaBytes * 8.0 / (32.0 * s.metaGroups); };
-      std::stable_sort(order.begin(), order.end(), [&](const GgufSegment *a, const GgufSegment *c) {
-        return bitsPerWeight(*a) > bitsPerWeight(*c); });
-      GgufFusedParams fp{k, n, static_cast<uint32_t>(p.gguf.size()), 0, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}};
-      std::vector<metal::MetalBuffer> bufs{b.input};
-      for (size_t i = 0; i < 3; ++i) {
-        const GgufSegment &s = *order[std::min(i, order.size() - 1)];
-        if (i < order.size()) { fp.cols[i] = s.outputSize; fp.fmt[i] = s.formatId; fp.offset[i] = s.columnOffset; }
-        bufs.insert(bufs.end(), {s.plane0, plane1(s), s.meta});
-      }
-      bufs.push_back(b.output);
-      graph.add("gguf_fused_m" + std::to_string(rows), std::move(bufs), fp, {n / kKQDecodeTileColumns, 1, 1}, {kKQDecodeThreads, 1, 1});
-    } else {
-      const GgufSegment &s = p.gguf.front();
-      const uint32_t tiles = n / kKQDecodeTileColumns, splits = ggufSplits(n, k, rows);
-      const metal::MetalBuffer aux = w.epilogue == LinearEpilogue::Residual ? b.residual
-                                   : w.epilogue == LinearEpilogue::UpWithGate ? b.gateScratch : b.output;
-      if (splits > 1) {
-        // Each split covers K / 32 / splits groups; the kernel would drop a remainder.
-        if ((k / 32) % splits) throw std::invalid_argument("GGUF split count does not divide the K groups");
-        need(p.kqPartials, uint64_t{splits} * rows * n * 4, "partials");
-        need(p.kqCounters, uint64_t{tiles} * 4, "counters");
-        graph.add(std::string("gguf_splitk_") + s.format + "_m" + std::to_string(rows),
-                  {b.input, s.plane0, plane1(s), s.meta, p.kqPartials, p.kqCounters, b.output, aux},
-                  GgufSplitParams{n, k, splits, n, 0, epilogueId(w.epilogue)}, {tiles, splits, 1}, {kKQDecodeThreads, 1, 1});
-      } else if (w.epilogue == LinearEpilogue::None) {
-        graph.add(kqKernel("sga", s.format, rows), {b.input, s.plane0, plane1(s), s.meta, b.output},
-                  GgufParams{n, k, tiles, n, 0}, {tiles, 1, 1}, {kKQDecodeThreads, 1, 1});
-      } else {
-        graph.add(kqKernel(w.epilogue == LinearEpilogue::Residual ? "sgr" : "sgg", s.format, rows),
-                  {b.input, s.plane0, plane1(s), s.meta, b.output, aux}, GgufParams{n, k, tiles, n, 0}, {tiles, 1, 1}, {kKQDecodeThreads, 1, 1});
-      }
-    }
-  } else {
-    // Prefill: 128-row shared-B tiles, one dispatch per segment; gate+up as gate then up-with-gate.
-    const auto gemm = [&](const Q4Projection &proj, const metal::MetalBuffer &output, uint32_t epilogue, const metal::MetalBuffer &aux) {
-      for (const GgufSegment &s : proj.gguf) {
-        const uint32_t tiles = s.outputSize / kKQPrefillTileColumns;
-        const GgufParams params{s.outputSize, k, 0, n, s.columnOffset};
-        if (epilogue == GGUF_EPILOGUE_NONE)
-          graph.add(kqPrefillKernel("pfa", s.format), {b.input, s.plane0, plane1(s), s.meta, output}, params,
-                    {rows / kKQPrefillRows, tiles, 1}, {kKQPrefillThreads, 1, 1});
-        else
-          graph.add(kqPrefillKernel(epilogue == GGUF_EPILOGUE_RESIDUAL ? "pfr" : "pfg", s.format),
-                    {b.input, s.plane0, plane1(s), s.meta, output, aux}, params, {rows / kKQPrefillRows, tiles, 1}, {kKQPrefillThreads, 1, 1});
-      }
-    };
-    switch (w.epilogue) {
-    case LinearEpilogue::None: gemm(p, b.output, GGUF_EPILOGUE_NONE, {}); break;
-    case LinearEpilogue::Residual: gemm(p, b.output, GGUF_EPILOGUE_RESIDUAL, b.residual); break;
-    case LinearEpilogue::UpWithGate: gemm(p, b.output, GGUF_EPILOGUE_UP_WITH_GATE, b.gateScratch); break;
-    case LinearEpilogue::GateUp:
-      gemm(*gate, b.gateScratch, GGUF_EPILOGUE_NONE, {});
-      gemm(p, b.output, GGUF_EPILOGUE_UP_WITH_GATE, b.gateScratch);
-      break;
-    }
-  }
-  if (stats && w.phase == LinearPhase::Decode)
-    account(*stats, w.rows / SPLASH_TARGET_VERIFY_ROWS, 1);
-}
-
-} // namespace
-
 PreparedInput Q4Linear::add(metal::CommandGraph &graph, LinearBuffers b,
     const Q4Projection &p, const LinearPlan &selected, const Q4Projection *gate,
     Q4DispatchStats *stats) const {
-  if (!p.gguf.empty()) { addGguf(graph, b, p, selected.workload(), gate, stats); return b.prepared; }
+  if (!p.gguf.empty()) {
+    addGguf(graph, b, p, selected, gate, stats);
+    return b.prepared;
+  }
+  if (selected.workload().quant != QuantFamily::Affine)
+    throw std::invalid_argument("affine projection requires an affine plan");
   const LinearWorkload w = selected.workload();
   const auto [n, k] = w.matrix;
   requireProjection(p, w.matrix);
@@ -779,41 +670,41 @@ void Q4Linear::addPrefill(metal::CommandGraph &graph, metal::MetalBuffer input,
     const Q4Projection &p, metal::MetalBuffer output, metal::MetalBuffer sums,
     LinearMatrix matrix, uint32_t rows) const {
   add(graph, {input, output, sums, {}, {}, {}}, p,
-      plan({matrix, rows, LinearPhase::Prefill, LinearEpilogue::None}));
+      plan({matrix, rows, LinearPhase::Prefill, LinearEpilogue::None}, p));
 }
 void Q4Linear::addPrefillResidual(metal::CommandGraph &graph, metal::MetalBuffer input,
     const Q4Projection &p, metal::MetalBuffer residual, metal::MetalBuffer output,
     metal::MetalBuffer sums, LinearMatrix matrix, uint32_t rows) const {
   add(graph, {input, output, sums, residual, {}, {}}, p,
-      plan({matrix, rows, LinearPhase::Prefill, LinearEpilogue::Residual}));
+      plan({matrix, rows, LinearPhase::Prefill, LinearEpilogue::Residual}, p));
 }
 void Q4Linear::addPrefillUpWithGate(metal::CommandGraph &graph, metal::MetalBuffer input,
     const Q4Projection &up, metal::MetalBuffer gateScratch, metal::MetalBuffer output,
     metal::MetalBuffer sums, metal::MetalBuffer downSums, LinearMatrix matrix, uint32_t rows) const {
   add(graph, {input, output, sums, {}, gateScratch, downSums}, up,
-      plan({matrix, rows, LinearPhase::Prefill, LinearEpilogue::UpWithGate}));
+      plan({matrix, rows, LinearPhase::Prefill, LinearEpilogue::UpWithGate}, up));
 }
 PreparedInput Q4Linear::addDecode(metal::CommandGraph &graph, metal::MetalBuffer input,
     const Q4Projection &p, metal::MetalBuffer output, LinearMatrix matrix, LinearScratch scratch) const {
-  return add(graph, {input, output, {}, {}, {}, {}, scratch}, p, plan(decode(matrix, 1, LinearEpilogue::None)));
+  return add(graph, {input, output, {}, {}, {}, {}, scratch}, p, plan(decode(matrix, 1, LinearEpilogue::None), p));
 }
 PreparedInput Q4Linear::addDecodeBatch(metal::CommandGraph &graph, metal::MetalBuffer input,
     const Q4Projection &p, metal::MetalBuffer output, LinearMatrix matrix,
     uint32_t lanes, Q4DispatchStats &stats, LinearScratch scratch, PreparedInput prepared) const {
   return add(graph, {input, output, {}, {}, {}, {}, scratch, prepared}, p,
-             plan(decode(matrix, lanes, LinearEpilogue::None)), nullptr, &stats);
+             plan(decode(matrix, lanes, LinearEpilogue::None), p), nullptr, &stats);
 }
 PreparedInput Q4Linear::addResidualBatch(metal::CommandGraph &graph, metal::MetalBuffer input,
     const Q4Projection &p, metal::MetalBuffer residual, metal::MetalBuffer output,
     LinearMatrix matrix, uint32_t lanes, Q4DispatchStats &stats, LinearScratch scratch, PreparedInput prepared) const {
   return add(graph, {input, output, {}, residual, {}, {}, scratch, prepared}, p,
-             plan(decode(matrix, lanes, LinearEpilogue::Residual)), nullptr, &stats);
+             plan(decode(matrix, lanes, LinearEpilogue::Residual), p), nullptr, &stats);
 }
 PreparedInput Q4Linear::addGateUpBatch(metal::CommandGraph &graph, metal::MetalBuffer input,
     const Q4Projection &gate, const Q4Projection &up, metal::MetalBuffer gateScratch,
     metal::MetalBuffer output, LinearMatrix matrix, uint32_t lanes, Q4DispatchStats &stats, LinearScratch scratch, PreparedInput prepared) const {
   return add(graph, {input, output, {}, {}, gateScratch, {}, scratch, prepared}, up,
-             plan(decode(matrix, lanes, LinearEpilogue::GateUp)), &gate, &stats);
+             plan(decode(matrix, lanes, LinearEpilogue::GateUp), up), &gate, &stats);
 }
 
 } // namespace splash::ops

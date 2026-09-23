@@ -126,6 +126,7 @@ std::string_view name(LinearTile tile) {
   case LinearTile::Split32: return "LinearTile::Split32";
   case LinearTile::Split64: return "LinearTile::Split64";
   case LinearTile::Paired256: return "LinearTile::Paired256";
+  case LinearTile::GgufStaged: return "LinearTile::GgufStaged";
   }
   return "LinearTile::N128";
 }
@@ -142,7 +143,9 @@ std::string_view name(LinearEpilogue epilogue) {
   return "LinearEpilogue::None";
 }
 std::string_view name(LinearSimdgroups groups) {
-  return groups == LinearSimdgroups::Four ? "LinearSimdgroups::Four" : "LinearSimdgroups::Eight";
+  return groups == LinearSimdgroups::Two    ? "LinearSimdgroups::Two"
+         : groups == LinearSimdgroups::Four ? "LinearSimdgroups::Four"
+                                            : "LinearSimdgroups::Eight";
 }
 std::string_view name(AttentionScalePlacement placement) {
   return placement == AttentionScalePlacement::Softmax ? "AttentionScalePlacement::Softmax"

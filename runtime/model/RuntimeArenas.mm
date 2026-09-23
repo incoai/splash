@@ -326,13 +326,13 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
   const auto &t = geometry.target;
   const auto &d = geometry.draft;
   ops::LinearScratchSize result;
-  const auto include = [&](ops::LinearMatrix matrix) {
+  const auto include = [&](ops::LinearMatrix matrix, ops::QuantFamily quant) {
     if (!matrix.outputSize || !matrix.inputSize) return;
     for (uint32_t lanes = 1; lanes <= kLaneCount; ++lanes) {
       for (auto epilogue : {ops::LinearEpilogue::None, ops::LinearEpilogue::Residual,
                             ops::LinearEpilogue::GateUp}) {
         const auto size = operators.linear().decodeScratchSize(
-            {matrix, lanes * kDecodeRows, ops::LinearPhase::Decode, epilogue});
+            {matrix, lanes * kDecodeRows, ops::LinearPhase::Decode, epilogue, quant});
         result.input = std::max(result.input, size.input);
         result.sums = std::max(result.sums, size.sums);
         result.partials = std::max(result.partials, size.partials);
@@ -343,12 +343,15 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
   for (auto matrix : {ops::LinearMatrix{t.packedGdnWidth, t.hiddenSize},
        {t.packedAttentionWidth, t.hiddenSize}, {t.hiddenSize, t.attentionWidth},
        {t.denseIntermediateSize, t.hiddenSize}, {t.hiddenSize, t.denseIntermediateSize},
-       {t.vocabularySize, t.hiddenSize}, {d.dynamicSize, d.hiddenSize},
+       {t.vocabularySize, t.hiddenSize}})
+    include(matrix, t.quant);
+  // The draft shares the target's vocabulary head.
+  include({d.vocabularySize, d.hiddenSize}, t.quant);
+  for (auto matrix : {ops::LinearMatrix{d.dynamicSize, d.hiddenSize},
        {d.qkvSize, d.hiddenSize}, {d.hiddenSize, d.attentionSize},
        {d.intermediateSize, d.hiddenSize}, {d.hiddenSize, d.intermediateSize},
-       {d.vocabularySize, d.hiddenSize}, {d.selectorRank, d.hiddenSize},
-       {d.hiddenSize, d.targetHiddenSize}})
-    include(matrix);
+       {d.selectorRank, d.hiddenSize}, {d.hiddenSize, d.targetHiddenSize}})
+    include(matrix, ops::QuantFamily::Affine);
   return result;
 }
 

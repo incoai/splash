@@ -183,7 +183,9 @@ QwenTarget::QwenTarget(const Qwen3_6MoeWeights &weights,
 }
 
 QwenTargetGeometry qwenTargetGeometry(const Qwen3_8Weights &weights) {
-  return geometryFor(weights.layout);
+  QwenTargetGeometry geometry = geometryFor(weights.layout);
+  if (!weights.logitsProjection.gguf.empty()) geometry.quant = ops::QuantFamily::Gguf;
+  return geometry;
 }
 
 QwenTargetGeometry qwenTargetGeometry(const Qwen3_6MoeWeights &weights) {

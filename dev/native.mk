@@ -50,6 +50,7 @@ MODEL_OPERATOR_SOURCES := \
 	runtime/ops/ExecutionPlans.cpp \
 	runtime/ops/GDN.cpp \
 	runtime/ops/Linear.cpp \
+	runtime/ops/LinearGguf.cpp \
 	runtime/ops/MoE.cpp \
 	runtime/ops/Normalization.cpp \
 	runtime/ops/PagedAttention.cpp \
@@ -394,7 +395,7 @@ $(TEST_Q4_PREFILL_TEST): runtime/metal/DeviceCapabilities.cpp \
 
 $(TEST_MOE_METAL_TEST): runtime/metal/DeviceCapabilities.cpp \
 		runtime/metal/MetalBackend.mm runtime/model/WeightStore.cpp \
-		runtime/ops/Linear.cpp runtime/ops/MoE.cpp \
+		runtime/ops/Linear.cpp runtime/ops/LinearGguf.cpp runtime/ops/MoE.cpp \
 		dev/tests/engine/moe_metal_test.mm $(LIB) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
 		$(ENGINE_LINKFLAGS) -o $@
@@ -473,7 +474,7 @@ $(TEST_ATTENTION_PLAN): runtime/metal/DeviceCapabilities.cpp \
 		$(ENGINE_LINKFLAGS) -o $@
 
 $(TEST_LINEAR_PLAN): runtime/metal/DeviceCapabilities.cpp \
-		runtime/metal/MetalBackend.mm runtime/ops/Linear.cpp \
+		runtime/metal/MetalBackend.mm runtime/ops/Linear.cpp runtime/ops/LinearGguf.cpp \
 		dev/tests/engine/linear_plan_test.mm $(LIB) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
 		$(ENGINE_LINKFLAGS) -o $@

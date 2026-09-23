@@ -425,7 +425,8 @@ GGUF_SPLITK_SET(FmtQ6K, q6k) GGUF_SPLITK_SET(FmtQ3K, q3k) GGUF_SPLITK_SET(FmtQ80
   SG_K(F, f, bfloat, a, 8, 32, 2, 32, 2, 1) SG_K(F, f, bfloat, a, 16, 32, 2, 32, 2, 1) SG_K(F, f, bfloat, a, 24, 32, 2, 32, 2, 1) SG_K(F, f, bfloat, a, 32, 32, 2, 32, 2, 1) \
   SGE_K(F, f, EpResidual, r, 8, 32, 2, 32, 2, 1) SGE_K(F, f, EpResidual, r, 16, 32, 2, 32, 2, 1) SGE_K(F, f, EpResidual, r, 24, 32, 2, 32, 2, 1) SGE_K(F, f, EpResidual, r, 32, 32, 2, 32, 2, 1) \
   SGE_K(F, f, EpUpWithGate, g, 8, 32, 2, 32, 2, 1) SGE_K(F, f, EpUpWithGate, g, 16, 32, 2, 32, 2, 1) SGE_K(F, f, EpUpWithGate, g, 24, 32, 2, 32, 2, 1) SGE_K(F, f, EpUpWithGate, g, 32, 32, 2, 32, 2, 1) \
-  PF_K(F, f, bfloat, a, 32, 4, 64, 64, 1) PFE_K(F, f, EpResidual, r, 32, 4, 64, 64, 1) PFE_K(F, f, EpUpWithGate, g, 32, 4, 64, 64, 1)
+  PF_K(F, f, bfloat, a, 32, 4, 64, 64, 1) PFE_K(F, f, EpResidual, r, 32, 4, 64, 64, 1) PFE_K(F, f, EpUpWithGate, g, 32, 4, 64, 64, 1) \
+  PF_K(F, f, bfloat, a, 8, 4, 64, 64, 1) PFE_K(F, f, EpResidual, r, 8, 4, 64, 64, 1) PFE_K(F, f, EpUpWithGate, g, 8, 4, 64, 64, 1)
 PROD_SET(FmtQ4K, q4k)
 PROD_SET(FmtIQ4XS, iq4xs)
 PROD_SET(FmtIQ4NL, iq4nl)
