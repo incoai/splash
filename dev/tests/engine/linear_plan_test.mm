@@ -856,19 +856,27 @@ void ggufPlans() {
             "Apple9 GGUF register plan");
     return plan.configuration().splits;
   };
-  // Sixteen column/K threadgroups per core, at least two 256-input units per
-  // partition: 27B down, out_proj, gdn_in, attn_in, gate/up and the
-  // vocabulary head on 40 and 10 cores, and narrow tensors.
+  // One wave (four threadgroups per core) down to one 256-input unit per
+  // partition, eight waves while partitions keep 1024 inputs, at most eight:
+  // 27B down, out_proj, gdn_in, attn_in, gate/up and the vocabulary head on
+  // 40 and 10 cores, the 35B GDN input on 40 and 80 cores, its shared
+  // expert, output projection and vocabulary head, and narrow tensors.
   require(registerSplits(40, 5120, 17408, 8, LinearEpilogue::Residual, 1) == 8 &&
-              registerSplits(40, 5120, 6144, 32, LinearEpilogue::Residual, 1) == 8 &&
+              registerSplits(40, 5120, 6144, 32, LinearEpilogue::Residual, 1) == 4 &&
               registerSplits(40, 16640, 5120, 16, LinearEpilogue::None, 3) == 4 &&
               registerSplits(40, 14336, 5120, 8, LinearEpilogue::None, 3) == 4 &&
               registerSplits(40, 17408, 5120, 24, LinearEpilogue::GateUp, 1) == 4 &&
               registerSplits(40, 248320, 5120, 8, LinearEpilogue::None, 1) == 1 &&
-              registerSplits(10, 5120, 17408, 8, LinearEpilogue::Residual, 1) == 2 &&
-              registerSplits(10, 16640, 5120, 8, LinearEpilogue::None, 3) == 1 &&
+              registerSplits(10, 5120, 17408, 8, LinearEpilogue::Residual, 1) == 4 &&
+              registerSplits(10, 16640, 5120, 8, LinearEpilogue::None, 3) == 2 &&
+              registerSplits(40, 12288, 2048, 8, LinearEpilogue::None, 2) == 2 &&
+              registerSplits(80, 12288, 2048, 8, LinearEpilogue::None, 2) == 2 &&
+              registerSplits(40, 512, 2048, 8, LinearEpilogue::GateUp, 1) == 8 &&
+              registerSplits(40, 2048, 512, 8, LinearEpilogue::Residual, 1) == 2 &&
+              registerSplits(40, 2048, 4096, 8, LinearEpilogue::Residual, 1) == 8 &&
+              registerSplits(40, 248320, 2048, 8, LinearEpilogue::None, 1) == 1 &&
               registerSplits(40, 1024, 5120, 8, LinearEpilogue::None, 1) == 8 &&
-              registerSplits(40, 1024, 1024, 8, LinearEpilogue::None, 1) == 2,
+              registerSplits(40, 1024, 1024, 8, LinearEpilogue::None, 1) == 4,
           "Apple9 GGUF register split policy");
   DeviceCapabilities apple9;
   apple9.appleGpuFamily = 9;
@@ -921,7 +929,7 @@ void ggufPlans() {
 // - a request's sums do not depend on the requests it is batched with: the whole
 //   plan is the same at every batch width;
 // - a split count is a power of two up to eight whose partitions keep the kernel's
-//   floor (register: two 256-input units, staged: 512 inputs in whole 32-input
+//   floor (register: one 256-input unit, staged: 512 inputs in whole 32-input
 //   groups);
 // - it depends on the grid per core only: doubling the width and the core count
 //   keeps it, more cores never lower it and a wider grid never raises it;
@@ -973,7 +981,7 @@ void ggufCoreLaws() {
               require(c.tile == (family == 9 ? LinearTile::GgufSimdgroup : LinearTile::GgufStaged) &&
                           c.groups == n / 64 && s >= 1 && s <= 8 && (s & (s - 1)) == 0,
                       "GGUF decode plan tile or split count");
-              require(s == 1 || (staged ? k / s >= 512 && (k / 32) % s == 0 : k / 256 / s >= 2),
+              require(s == 1 || (staged ? k / s >= 512 && (k / 32) % s == 0 : k / 256 / s >= 1),
                       "GGUF decode partition below the kernel floor");
               require(one.storageRows() == 8 && plan(linear, n, 24).storageRows() == (staged ? 32U : 24U),
                       "GGUF decode tile rows");

@@ -6,6 +6,7 @@
 #include "metal/abi/Gguf.h"
 
 #include <algorithm>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -28,36 +29,49 @@ std::string prefillKernel(const std::string &family, const char *format) {
   return family + "_" + format + "_r32_sg4_n64_k64_p1";
 }
 
-// Staged tile, every projection kind and batch width: split K until the grid
-// holds six threadgroups (twelve simdgroups) per core, keeping at least two
-// 256-input units per partition. Six is fitted, not a residency (12-17 of
-// these threadgroups run at once per core on the M5 Pro): past it a core's
-// memory and neural accelerator are busy and more partitions only add
-// reduction. Over 27B and 35B dense shapes, all formats, one to four lanes,
-// on the 16- and 20-core M5 Pro and emulated 10-, 30- and 40-core GPUs
-// (DRAM-cold medians): 3.6% over the fastest split of each shape in total,
-// against 6.4% for the previous 32 per core and 1024 inputs without splits
-// for fused and gate/up projections.
-uint32_t stagedSplits(uint32_t n, uint32_t k, uint32_t cores) {
-  const uint32_t grid = n / kDecodeTileColumns, groups = k / 32;
+// K splits of a decode tile, one rule for both tiles. A tier asks for more
+// partitions while the grid holds fewer than `threadgroups` threadgroups per
+// core and each partition would still keep `inputs` inputs; the split count
+// doubles, up to eight, while some tier asks. Decode K is a multiple of 256,
+// so eight partitions always hold whole 32-input groups. The rule ignores the
+// batch width: bounds that depended on it did not pay on either family.
+struct SplitTier {
+  uint32_t threadgroups;
+  uint32_t inputs;
+};
+uint32_t decodeSplits(uint32_t n, uint32_t k, uint32_t cores, std::span<const SplitTier> tiers) {
+  const uint64_t grid = n / kDecodeTileColumns;
   uint32_t splits = 1;
-  while (splits < 8 && uint64_t(grid) * splits < 6ULL * cores && groups % (2 * splits) == 0 &&
-         groups / (2 * splits) >= 16)
-    splits *= 2;
+  const auto asks = [&](const SplitTier &t) {
+    return grid * splits < uint64_t{t.threadgroups} * cores && k / (2 * splits) >= t.inputs;
+  };
+  while (splits < 8 && std::any_of(tiers.begin(), tiers.end(), asks)) splits *= 2;
   return splits;
 }
 
-// Apple9 register tile: split K until the grid holds sixteen threadgroups
-// per core, keeping at least two 256-input coefficient units per partition.
-// On a 40-core M3 over the 27B shapes at one to four lanes, within 3.3% of
-// the fastest split everywhere and 0.4% in total.
-uint32_t simdgroupSplits(uint32_t n, uint32_t k, uint32_t cores) {
-  const uint32_t grid = n / kDecodeTileColumns, units = k / 256;
-  uint32_t splits = 1;
-  while (splits < 8 && uint64_t(grid) * splits < 16ULL * cores && units / (2 * splits) >= 2)
-    splits *= 2;
-  return splits;
-}
+// Apple9 register tile (128 threads). Four of its threadgroups are resident
+// on a core at once: on a 40-core M3 Max its time steps every four per core
+// (Q4_K, K = 8192, one lane, ms: 3 per core 0.156, 4 0.157, 5 0.220, 7 0.281,
+// 8 0.286; the same steps at two to four lanes and for Q8_0). Below one wave
+// a core must fill it, down to one 256-input coefficient unit per partition;
+// below eight waves more threadgroups shrink the last wave's tail while
+// partitions of 1024 inputs amortize the partial sums (flat from eight to 32
+// waves). Over every 27B and 35B projection kind at one to four lanes and
+// 10-80 cores emulated by width, the decode step's projections run 0.95%
+// slower than the fastest split of each shape on average and 2.3% at worst
+// (sixteen threadgroups per core with two units per partition: 2.8%, 7.8%).
+constexpr SplitTier kSimdgroupTiers[] = {{4, 256}, {32, 1024}};
+
+// Staged tile (64 threads): one fitted tier, six threadgroups per core with
+// 512 inputs per partition. Six is not a residency (12-17 of these
+// threadgroups run at once per core on the M5 Pro): past it a core's memory
+// and neural accelerator are busy and more partitions only add reduction.
+// Over the 27B and 35B dense shapes, all formats, one to four lanes, on the
+// 16- and 20-core M5 Pro and 10-, 30- and 40-core GPUs emulated by width:
+// 3.6% over the fastest split of each shape in total and 36% at worst on a
+// 15-us shape (the register tiers in threads per core: 6.6%; the previous 32
+// per core with 1024 inputs and unsplit fused and gate/up kernels: 6.4%).
+constexpr SplitTier kStagedTiers[] = {{6, 512}};
 
 const metal::MetalBuffer &plane1(const GgufSegment &s) { return s.plane1 ? s.plane1 : s.meta; }
 
@@ -104,13 +118,14 @@ LinearConfig Q4Linear::ggufBaseline(LinearWorkload w) const {
   // projections split in two gain 24-37% more on the 16-core M5 Pro.
   if (w.phase == LinearPhase::Prefill)
     return w.rows <= SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS
-        ? LinearConfig{LinearTile::GgufStaged, 0, LinearSimdgroups::Two, stagedSplits(n, k, gpuCores_)}
+        ? LinearConfig{LinearTile::GgufStaged, 0, LinearSimdgroups::Two,
+                       decodeSplits(n, k, gpuCores_, kStagedTiers)}
         : LinearConfig{LinearTile::GgufStaged, 0, LinearSimdgroups::Four};
   if (ggufDecodeTile() == LinearTile::GgufSimdgroup)
     return {LinearTile::GgufSimdgroup, n / kDecodeTileColumns, LinearSimdgroups::Four,
-            simdgroupSplits(n, k, gpuCores_)};
+            decodeSplits(n, k, gpuCores_, kSimdgroupTiers)};
   return {LinearTile::GgufStaged, n / kDecodeTileColumns, LinearSimdgroups::Two,
-          stagedSplits(n, k, gpuCores_)};
+          decodeSplits(n, k, gpuCores_, kStagedTiers)};
 }
 
 void Q4Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
