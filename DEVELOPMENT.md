@@ -127,10 +127,11 @@ New architectures require engine support; ordinary HF weights need conversion.
 
 ### GGUF targets
 
-Qwen3.8-27B can be served straight from a llama.cpp GGUF (for example Unsloth's
-`Qwen3.8-27B-UD-Q4_K_M.gguf`). A `gguf` package (schema 3) ships only the shared `draft/`,
-`vision/` and `tokenizer/`; its manifest names the source repository and the files a model ID
-may select:
+Qwen3.8-27B and Qwen3.6-35B-A3B can be served straight from a llama.cpp GGUF (for example
+Unsloth's `Qwen3.8-27B-UD-Q4_K_M.gguf` and `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf`). A `gguf` package
+ships only the shared `draft/`, `vision/` and `tokenizer/`; `schema_version` 3 describes a dense
+Qwen3.8 target and 4 a Qwen3.6 MoE target, and the loader checks the GGUF's architecture against
+it. The manifest names the source repository and the files a model ID may select:
 
 ```json
 "format": {"name": "gguf", "target_layer_magic": "MDGG0001", ...},
@@ -145,29 +146,44 @@ files and that one GGUF into the Hub cache, checks them against the manifest, an
 `target/<file>.gguf` links the cached GGUF (the engine requires `target/` and `draft/` to be
 subdirectories of one root). Nothing is written to disk besides the download.
 
-At load time the engine parses the GGUF header (`runtime/model/GgufFile.cpp`), plans one
+At load time the engine parses the GGUF header (`runtime/model/GgufFile.cpp`), checks the
+architecture's metadata (layer, head, SSM and expert counts) against its layout, plans one
 in-memory image per layer in the `MDGG0001` layout (`GgufImage.cpp`: descriptor, payload plane,
-optional high-bit plane and superblock headers in 256-column tiles, small tensors converted on
-the CPU) and fills it with the `gguf_repack` / `gguf_copy` kernels reading the mmapped file
-(`GgufTarget.cpp`). The images are anonymous Metal memory, so under memory pressure they are
-compressed or swapped rather than dropped and refaulted like mapped package files. Supported
-tensor types are Q4_K, Q5_K, Q6_K, Q3_K, IQ4_XS, IQ4_NL, Q8_0 and IQ3_S for linears and Q4_K,
-Q6_K or Q8_0 token embeddings; the loader lists every unsupported tensor in one error. Of
-Unsloth's files that covers UD-Q4_K_M/XL, UD-Q5_K_M/S/XL, UD-Q6_K and Q6_K_L/M/XL, UD-Q8_K_L
-and Q8_0; the 2-bit, IQ2/IQ3_XXS, IQ1, Q4_0/Q4_1 and BF16-bearing files need kernels that do not
-exist yet.
+optional high-bit plane and superblock headers in 256-column tiles; a 3-D expert tensor is one
+segment of experts x N rows) and fills it with the `gguf_repack` / `gguf_copy` kernels reading the
+mmapped file (`GgufTarget.cpp`). Every tensor keeps its stored format: the F32 norm multipliers,
+the MoE router and shared-expert gate, and GDN alpha/beta when a file stores them as F32 stay F32
+and run in fp32, as llama.cpp keeps them; the other small F32 tensors (the GDN convolution and
+time-step bias) become bf16 only when every value converts exactly, and loading fails otherwise.
+The images are anonymous Metal memory, so under memory pressure they are compressed or swapped
+rather than dropped and refaulted like mapped package files. Supported tensor types are Q4_K,
+Q5_K, Q6_K, Q3_K, IQ4_XS, IQ4_NL, Q8_0 and IQ3_S for linears and experts, F32 for the tensors
+above, and Q4_K, Q6_K or Q8_0 token embeddings; the loader lists every unsupported tensor in one
+error. Of Unsloth's files that covers UD-Q4_K_M/XL, UD-Q5_K_M/S/XL, UD-Q6_K and Q6_K_L/M/XL,
+UD-Q8_K_L and Q8_0; the 2-bit, IQ2/IQ3_XXS, IQ1, Q4_0/Q4_1, MXFP4 and BF16-bearing files need
+kernels that do not exist yet.
 
-The GEMM kernels are in
-`runtime/metal/kernels/shared/gguf_linear.metal` (ABI in `runtime/metal/abi/Gguf.h`, the image
-formats in `runtime/metal/abi/QuantFormat.h`, their decoding in
-`runtime/metal/kernels/common/quant_formats.h`), the dispatch
-policy in `runtime/ops/Linear.cpp`. The tests' CPU reference (`dev/tests/engine/GgufFormatReference.hpp`)
-must reproduce checked-in hashes of upstream GGML's dequantization (llama.cpp 7ab4ee7) in
-`make test-engine-cpu`, which also checks the planner's CPU-built alpha/beta tensor against it;
-`make test-engine-metal` checks the production `gguf_repack` and
-`gguf_copy` kernels bitwise against it and the GEMM kernels against fp64. With
-`SPLASH_GGML_ORACLE=<libggml-base.dylib>` the reference is also compared with GGML directly and
-`gguf-repack --cpu` prints GGML's hashes.
+Decode runs one of two kernel families, chosen by GPU family in `runtime/ops/LinearGguf.cpp`. On
+Apple9 (M3, M4) the register kernels of `runtime/metal/kernels/decode/linear_gguf_sgmatrix.metal`
+feed the codes themselves to bf16 matrix operations with one fp32 epilogue per coefficient
+group, so every output is the bf16 rounding of its fp32-accumulated sum. On Apple10 (M5) the
+staged kernels of `runtime/metal/kernels/shared/gguf_linear.metal` dequantize each weight once
+to half in threadgroup memory for MPP `matmul2d`, the neural accelerator's path; a step of three
+request lanes runs the 32-row tile over four lanes of storage. Prefill runs the staged kernels
+on both families, chunks of up to 32 rows on the decode tiles. Every projection splits its K
+across threadgroups by one rule (`decodeSplits`: each tile's tiers of threadgroups per core and
+inputs per partition, from measured occupancy) that does not depend on the batch width. The MoE
+experts (`runtime/ops/MoE.cpp`) run the same numerics per family over the grouped rows. The ABIs
+are in `runtime/metal/abi/Gguf.h` and `MoE.h`, the image formats in
+`runtime/metal/abi/QuantFormat.h`, their decoding in `runtime/metal/kernels/common/quant_formats.h`.
+
+The tests' CPU reference (`dev/tests/engine/GgufFormatReference.hpp`) must reproduce checked-in
+hashes of upstream GGML's dequantization (llama.cpp 7ab4ee7) in `make test-engine-cpu`, which
+also checks the planner's CPU-built tensors against it; `make test-engine-metal` checks the
+production `gguf_repack` and `gguf_copy` kernels bitwise against it, the projection kernels
+(`gguf-projection full`) and the MoE layer in every format (`gguf-moe`) against fp64, and the
+F32 norm, router and alpha/beta paths. With `SPLASH_GGML_ORACLE=<libggml-base.dylib>` the
+reference is also compared with GGML directly and `gguf-repack --cpu` prints GGML's hashes.
 
 ## Code and API boundaries
 
