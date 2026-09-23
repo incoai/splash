@@ -5,8 +5,8 @@
 // norms, convolution, decay, time bias, alpha/beta) and the GPU repacks/copies
 // that move quantized rows into 256-column tiles. Layout: 16-byte header
 // (magic, layer, type), then 16 KiB-aligned sections; each quantized tensor is a
-// 64-byte descriptor, plane0 [tile][group32][256 cols][p0], optional plane1 and
-// a per-superblock meta plane [tile][unit][256][metaBytes] (see FormatLayout).
+// 64-byte descriptor, then its plane0, optional plane1 and meta planes in the
+// layout of its format (metal/abi/QuantFormat.h).
 
 #include <cstdint>
 #include <string>
@@ -62,12 +62,6 @@ struct Image {
   uint64_t sourceBegin = ~uint64_t{0}; // covering range of GPU-read source bytes
   uint64_t sourceEnd = 0;
 };
-
-struct FormatLayout {
-  uint32_t fmt, ggmlType, blockElements, blockBytes, p0, p1, metaBytes, metaGroups, interleave;
-};
-// nullptr when the type has no repack/GEMM support.
-[[nodiscard]] const FormatLayout *formatLayout(uint32_t ggmlType) noexcept;
 
 class ImagePlanner final {
 public:

@@ -158,7 +158,8 @@ and Q8_0; the 2-bit, IQ2/IQ3_XXS, IQ1, Q4_0/Q4_1 and BF16-bearing files need ker
 exist yet.
 
 The GEMM kernels are in
-`runtime/metal/kernels/shared/gguf_linear.metal` (ABI in `runtime/metal/abi/Gguf.h`), the dispatch
+`runtime/metal/kernels/shared/gguf_linear.metal` (ABI in `runtime/metal/abi/Gguf.h`, per-format
+plane sizes in `runtime/metal/abi/QuantFormat.h`), the dispatch
 policy in `runtime/ops/Linear.cpp`, and `make test-engine-metal` checks the kernels against fp64
 and, with `SPLASH_GGML_ORACLE=<libggml-base.dylib>`, against upstream GGML's dequantization.
 

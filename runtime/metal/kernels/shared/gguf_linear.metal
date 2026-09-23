@@ -67,6 +67,11 @@ inline void k4_scale_min(uint4 hdr, ushort j, thread float2 &s2, thread float2 &
   s2 = float2(float(d) * float(sc)); m2 = float2(-float(dmin) * float(m));
 }
 
+// Plane and meta sizes of a format id (metal/abi/QuantFormat.h).
+#define QUANT_LAYOUT(F)                                                                                 \
+  enum : uint { P0 = kQuantFormats[F].plane0_bytes, P1 = kQuantFormats[F].plane1_bytes, MetaBytes = kQuantFormats[F].meta_bytes }; \
+  enum : ushort { MetaGroups = kQuantFormats[F].meta_groups }
+
 struct P16 { uint4 a; };
 struct P20 { uint4 a; uint b; };
 struct P24 { uint4 a; uint2 b; };
@@ -74,7 +79,7 @@ struct P12 { uint2 a; uint b; };
 struct P32 { uint4 a; uint4 b; };
 
 struct FmtQ4K {
-  enum : uint { P0 = 16, P1 = 0, MetaBytes = 16 }; enum : ushort { MetaGroups = 8, TgLut = 0 };
+  QUANT_LAYOUT(GGUF_FMT_Q4K); enum : ushort { TgLut = 0 };
   typedef P16 Payload; typedef uint4 Meta;
   static Payload load(device uchar *p0, device uchar *) { return {*((device uint4 *)p0)}; }
   static Meta loadMeta(device uchar *m) { return *((device uint4 *)m); }
@@ -86,7 +91,7 @@ struct FmtQ4K {
 };
 // Lut 0: interleaved nibbles + 16-entry constant table; 2: byte order + 256-entry constant half2 table; 3: byte order + threadgroup table
 template <int Lut> struct FmtIQ4XS {
-  enum : uint { P0 = 16, P1 = 0, MetaBytes = 8 }; enum : ushort { MetaGroups = 8, TgLut = Lut == 3 ? 256 : 0 };
+  QUANT_LAYOUT(GGUF_FMT_IQ4XS); enum : ushort { TgLut = Lut == 3 ? 256 : 0 };
   typedef P16 Payload; typedef uint2 Meta;
   static Payload load(device uchar *p0, device uchar *) { return {*((device uint4 *)p0)}; }
   static Meta loadMeta(device uchar *m) { return *((device uint2 *)m); }
@@ -103,7 +108,7 @@ template <int Lut> struct FmtIQ4XS {
   }
 };
 template <int Lut> struct FmtIQ4NL {
-  enum : uint { P0 = 16, P1 = 0, MetaBytes = 2 }; enum : ushort { MetaGroups = 1, TgLut = Lut == 3 ? 256 : 0 };
+  QUANT_LAYOUT(GGUF_FMT_IQ4NL); enum : ushort { TgLut = Lut == 3 ? 256 : 0 };
   typedef P16 Payload; typedef ushort Meta;
   static Payload load(device uchar *p0, device uchar *) { return {*((device uint4 *)p0)}; }
   static Meta loadMeta(device uchar *m) { return *((device ushort *)m); }
@@ -119,7 +124,7 @@ template <int Lut> struct FmtIQ4NL {
 };
 // Q5_K: plane0 interleaved low nibbles; plane1 one uint of 5th bits: bit (4k+p) = weight 8k+2p, bit (16+4k+p) = weight 8k+2p+1
 struct FmtQ5K {
-  enum : uint { P0 = 16, P1 = 4, MetaBytes = 16 }; enum : ushort { MetaGroups = 8, TgLut = 0 };
+  QUANT_LAYOUT(GGUF_FMT_Q5K); enum : ushort { TgLut = 0 };
   typedef P20 Payload; typedef uint4 Meta;
   static Payload load(device uchar *p0, device uchar *p1) { return {*((device uint4 *)p0), *((device uint *)p1)}; }
   static Meta loadMeta(device uchar *m) { return *((device uint4 *)m); }
@@ -140,7 +145,7 @@ struct FmtQ5K {
 // Q6_K: plane0 interleaved low nibbles; plane1 two uints of 2-bit highs (H_h for weights 16h..16h+15): bits 2(4k'+p) / 16+2(4k'+p), k' = k&1.
 // Meta 20 B: packed_uint4 of 16 int8 scales, then half d. value = d*sc[2j+h]*(q6-32).
 struct FmtQ6K {
-  enum : uint { P0 = 16, P1 = 8, MetaBytes = 20 }; enum : ushort { MetaGroups = 8, TgLut = 0 };
+  QUANT_LAYOUT(GGUF_FMT_Q6K); enum : ushort { TgLut = 0 };
   typedef P24 Payload; struct Meta { packed_uint4 sc; uint d; };
   static Payload load(device uchar *p0, device uchar *p1) { return {*((device uint4 *)p0), *((device uint2 *)p1)}; }
   static Meta loadMeta(device uchar *m) { Meta r; r.sc = *((device packed_uint4 *)m); r.d = *((device uint *)(m + 16)); return r; }
@@ -166,7 +171,7 @@ struct FmtQ6K {
 // Q3_K: plane0 two uints of 2-bit codes (word h = pairs 8h..8h+7: lo weight at bits 2i', hi weight at 16+2i'), plane1 one uint of high bits
 // (pair i: lo at bit i, hi at 16+i). Meta 16 B: half d, 2 pad, 12 scale bytes. value = d*(sc6-32)*((q2 | h<<2) - 4).
 struct FmtQ3K {
-  enum : uint { P0 = 8, P1 = 4, MetaBytes = 16 }; enum : ushort { MetaGroups = 8, TgLut = 0 };
+  QUANT_LAYOUT(GGUF_FMT_Q3K); enum : ushort { TgLut = 0 };
   typedef P12 Payload; typedef uint4 Meta;
   static Payload load(device uchar *p0, device uchar *p1) { return {*((device uint2 *)p0), *((device uint *)p1)}; }
   static Meta loadMeta(device uchar *m) { return *((device uint4 *)m); }
@@ -197,7 +202,7 @@ struct FmtQ3K {
 };
 // Q8_0: plane0 32 int8 (natural order); meta half d per 32
 struct FmtQ80 {
-  enum : uint { P0 = 32, P1 = 0, MetaBytes = 2 }; enum : ushort { MetaGroups = 1, TgLut = 0 };
+  QUANT_LAYOUT(GGUF_FMT_Q80); enum : ushort { TgLut = 0 };
   typedef P32 Payload; typedef ushort Meta;
   static Payload load(device uchar *p0, device uchar *) { return {*((device uint4 *)p0), *((device uint4 *)(p0 + 16))}; }
   static Meta loadMeta(device uchar *m) { return *((device ushort *)m); }
@@ -212,7 +217,7 @@ struct FmtQ80 {
 };
 // IQ3_S: plane0 16 B = qs[8] | signs[4] | qh (byte 12) | scale nibble (byte 13) | pad; meta half d per 256. value = d*(1+2*scale)*grid*sign
 struct FmtIQ3S {
-  enum : uint { P0 = 16, P1 = 0, MetaBytes = 2 }; enum : ushort { MetaGroups = 8, TgLut = 0 };
+  QUANT_LAYOUT(GGUF_FMT_IQ3S); enum : ushort { TgLut = 0 };
   typedef P16 Payload; typedef ushort Meta;
   static Payload load(device uchar *p0, device uchar *) { return {*((device uint4 *)p0)}; }
   static Meta loadMeta(device uchar *m) { return *((device ushort *)m); }
@@ -714,24 +719,13 @@ kernel void gguf_repack(device const uchar *src [[buffer(0)]], device uchar *dst
   const uint G = p.input_size / 32;
   if (t >= p.rows * G) return;
   const uint n = t / G, g = t % G, r = gguf_repack_source_row(n, p);
-  const bool k256 = !(p.fmt == GGUF_FMT_IQ4NL || p.fmt == GGUF_FMT_Q80);
-  const uint b = k256 ? g / 8 : g, j = k256 ? g % 8 : 0, mg = k256 ? 8 : 1;
-  uint blockBytes, p0, p1, mb;
-  switch (p.fmt) {
-    case GGUF_FMT_Q4K: blockBytes = 144; p0 = 16; p1 = 0; mb = 16; break;
-    case GGUF_FMT_IQ4XS: blockBytes = 136; p0 = 16; p1 = 0; mb = 8; break;
-    case GGUF_FMT_IQ4NL: blockBytes = 18; p0 = 16; p1 = 0; mb = 2; break;
-    case GGUF_FMT_Q5K: blockBytes = 176; p0 = 16; p1 = 4; mb = 16; break;
-    case GGUF_FMT_Q6K: blockBytes = 210; p0 = 16; p1 = 8; mb = 20; break;
-    case GGUF_FMT_Q3K: blockBytes = 110; p0 = 8; p1 = 4; mb = 16; break;
-    case GGUF_FMT_Q80: blockBytes = 34; p0 = 32; p1 = 0; mb = 2; break;
-    default: blockBytes = 110; p0 = 16; p1 = 0; mb = 2; break;  // IQ3_S
-  }
-  device const uchar *blk = src + p.src_offset + ulong(r) * p.src_row_bytes + ulong(b) * blockBytes;
+  constant QuantFormat &f = kQuantFormats[p.fmt];
+  const uint b = g / f.meta_groups, j = g % f.meta_groups;   // native block b holds meta unit b
+  device const uchar *blk = src + p.src_offset + ulong(r) * p.src_row_bytes + ulong(b) * f.block_bytes;
   const uint tile = ((n / 256) * G + g) * 256 + (n % 256);
-  device uchar *out0 = dst + p.dst_plane0 + ulong(tile) * p0;
-  device uchar *out1 = dst + p.dst_plane1 + ulong(tile) * p1;
-  device uchar *meta = dst + p.dst_meta + (ulong((n / 256) * (G / mg) + b) * 256 + (n % 256)) * mb;
+  device uchar *out0 = dst + p.dst_plane0 + ulong(tile) * f.plane0_bytes;
+  device uchar *out1 = dst + p.dst_plane1 + ulong(tile) * f.plane1_bytes;
+  device uchar *meta = dst + p.dst_meta + (ulong((n / 256) * (G / f.meta_groups) + b) * 256 + (n % 256)) * f.meta_bytes;
   uchar codes[32], bits[32];
   switch (p.fmt) {
     case GGUF_FMT_Q4K: {

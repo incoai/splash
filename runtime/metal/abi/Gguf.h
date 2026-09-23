@@ -2,11 +2,7 @@
 
 // GGUF quantized projection parameters shared by host dispatch code and Metal
 // kernels (kernels/shared/gguf_linear.metal).
-#ifdef __METAL_VERSION__
-#include <metal_stdlib>
-#else
-#include <stdint.h>
-#endif
+#include "metal/abi/QuantFormat.h"
 
 struct GgufParams {
   uint32_t output_size;       // columns of this segment
@@ -40,16 +36,6 @@ struct GgufPermuteParams {
   uint32_t block;
 };
 static_assert(sizeof(GgufPermuteParams) == 12, "GGUF permute parameters are 12 bytes on both sides");
-
-// Runtime format ids for kernels that select the dequantizer per tile.
-#define GGUF_FMT_Q4K 0u
-#define GGUF_FMT_IQ4XS 1u
-#define GGUF_FMT_IQ4NL 2u
-#define GGUF_FMT_Q5K 3u
-#define GGUF_FMT_Q6K 4u
-#define GGUF_FMT_Q3K 5u
-#define GGUF_FMT_Q80 6u
-#define GGUF_FMT_IQ3S 7u
 
 // Load-time repack of native GGUF rows into the MDGG0001 planes (gguf_repack):
 // one thread per (destination row, 32-wide K group).

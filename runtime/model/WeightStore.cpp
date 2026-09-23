@@ -1,5 +1,7 @@
 #include "WeightStore.hpp"
 
+#include "metal/abi/QuantFormat.h"
+
 #include <CommonCrypto/CommonDigest.h>
 
 #include <algorithm>
@@ -291,31 +293,18 @@ ops::Q4Projection readQ4ProjectionComponents(WeightFile &file,
 
 namespace {
 struct GgufDescriptor {
-    uint32_t type, outputSize, inputSize, p0, p1, metaBytes, metaGroups, flags;
+    uint32_t type, outputSize, inputSize, p0, p1, metaBytes, metaGroups;
     uint64_t plane0Bytes, plane1Bytes, metaTotalBytes;
 };
-const char *ggufFormatName(uint32_t type) {
-    switch (type) {
-    case 12: return "q4k";
-    case 23: return "iq4xs";
-    case 20: return "iq4nl";
-    case 13: return "q5k";
-    case 14: return "q6k";
-    case 11: return "q3k";
-    case 8: return "q80";
-    case 21: return "iq3s";
-    default: throw WeightStoreError("unsupported GGUF tensor type " + std::to_string(type));
-    }
-}
 GgufDescriptor readGgufDescriptor(WeightFile &file, std::string_view label) {
     metal::MetalBuffer section = file.section(64, std::string(label) + "-desc");
     const uint8_t *bytes = static_cast<const uint8_t *>(section.contents());
     if (!bytes) throw WeightStoreError("GGUF descriptor is not host visible");
     GgufDescriptor d{};
-    uint32_t words[8];
+    uint32_t words[7];
     std::memcpy(words, bytes, sizeof words);
     d.type = words[0]; d.outputSize = words[1]; d.inputSize = words[2]; d.p0 = words[3];
-    d.p1 = words[4]; d.metaBytes = words[5]; d.metaGroups = words[6]; d.flags = words[7];
+    d.p1 = words[4]; d.metaBytes = words[5]; d.metaGroups = words[6];
     std::memcpy(&d.plane0Bytes, bytes + 32, 8);
     std::memcpy(&d.plane1Bytes, bytes + 40, 8);
     std::memcpy(&d.metaTotalBytes, bytes + 48, 8);
@@ -327,22 +316,26 @@ GgufDescriptor readGgufDescriptor(WeightFile &file, std::string_view label) {
 
 ops::GgufSegment readGgufSegment(WeightFile &file, std::string_view label) {
     const GgufDescriptor d = readGgufDescriptor(file, label);
+    const uint32_t format = gguf_format_of(d.type);
+    if (format == GGUF_FMT_COUNT)
+        throw WeightStoreError("unsupported GGUF tensor type " + std::to_string(d.type));
+    const QuantFormat &layout = kQuantFormats[format];
     const uint64_t groups = uint64_t{d.inputSize} / 32;
-    if (d.plane0Bytes != uint64_t{d.outputSize} * groups * d.p0 ||
-        d.plane1Bytes != uint64_t{d.outputSize} * groups * d.p1 ||
-        d.metaTotalBytes != uint64_t{d.outputSize} * (groups / d.metaGroups) * d.metaBytes)
+    if (d.p0 != layout.plane0_bytes || d.p1 != layout.plane1_bytes ||
+        d.metaBytes != layout.meta_bytes || d.metaGroups != layout.meta_groups ||
+        d.plane0Bytes != uint64_t{d.outputSize} * groups * layout.plane0_bytes ||
+        d.plane1Bytes != uint64_t{d.outputSize} * groups * layout.plane1_bytes ||
+        d.metaTotalBytes != uint64_t{d.outputSize} * (groups / layout.meta_groups) * layout.meta_bytes)
         throw WeightStoreError("GGUF section sizes are inconsistent: " + std::string(label));
     ops::GgufSegment s;
     s.plane0 = file.section(d.plane0Bytes, std::string(label) + "-plane0");
     if (d.plane1Bytes) s.plane1 = file.section(d.plane1Bytes, std::string(label) + "-plane1");
     s.meta = file.section(d.metaTotalBytes, std::string(label) + "-meta");
     s.type = d.type; s.outputSize = d.outputSize; s.inputSize = d.inputSize;
-    s.p0 = d.p0; s.p1 = d.p1; s.metaBytes = d.metaBytes; s.metaGroups = d.metaGroups;
-    s.format = ggufFormatName(d.type);
-    switch (d.type) {
-    case 12: s.formatId = 0; break; case 23: s.formatId = 1; break; case 20: s.formatId = 2; break; case 13: s.formatId = 3; break;
-    case 14: s.formatId = 4; break; case 11: s.formatId = 5; break; case 8: s.formatId = 6; break; default: s.formatId = 7; break;
-    }
+    s.p0 = layout.plane0_bytes; s.p1 = layout.plane1_bytes;
+    s.metaBytes = layout.meta_bytes; s.metaGroups = layout.meta_groups;
+    s.formatId = format;
+    s.format = layout.name;
     return s;
 }
 
@@ -356,19 +349,16 @@ ops::Q4Projection readGgufProjection(WeightFile &file, std::string_view label) {
 
 ops::Q4Projection readGgufEmbedding(WeightFile &file, std::string_view label) {
     const GgufDescriptor d = readGgufDescriptor(file, label);
-    // Native rows, gathered by gguf_embed_<type>: block_q4_K (144 B / 256), block_q6_K
-    // (210 B / 256) or block_q8_0 (34 B / 32).
-    const char *format = nullptr;
-    uint64_t rowBytes = 0;
-    if (d.type == 12) { format = "q4k-native"; rowBytes = uint64_t{d.inputSize / 256} * 144; }
-    else if (d.type == 14) { format = "q6k-native"; rowBytes = uint64_t{d.inputSize / 256} * 210; }
-    else if (d.type == 8) { format = "q80-native"; rowBytes = uint64_t{d.inputSize / 32} * 34; }
-    if (!format || d.inputSize % 256 || d.plane0Bytes != uint64_t{d.outputSize} * rowBytes)
+    // Native rows, gathered by gguf_embed_<type>: block_q4_K, block_q6_K or block_q8_0.
+    const uint32_t format = gguf_format_of(d.type);
+    if ((format != GGUF_FMT_Q4K && format != GGUF_FMT_Q6K && format != GGUF_FMT_Q80) || d.inputSize % 256 ||
+        d.plane0Bytes != uint64_t{d.outputSize} * (d.inputSize / kQuantFormats[format].block_elements) *
+                             kQuantFormats[format].block_bytes)
         throw WeightStoreError("GGUF embedding must be native block_q4_K, block_q6_K or block_q8_0 rows");
     ops::Q4Projection p;
     ops::GgufSegment s;
     s.plane0 = file.section(d.plane0Bytes, std::string(label) + "-native");
-    s.type = d.type; s.outputSize = d.outputSize; s.inputSize = d.inputSize; s.format = format;
+    s.type = d.type; s.outputSize = d.outputSize; s.inputSize = d.inputSize;
     p.gguf.push_back(std::move(s));
     p.outputSize = d.outputSize;
     p.inputSize = d.inputSize;

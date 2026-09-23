@@ -29,7 +29,7 @@ struct GgufSegment final {
   uint32_t metaBytes = 0;
   uint32_t metaGroups = 0;
   uint32_t columnOffset = 0;
-  uint32_t formatId = 0;    // GGUF_FMT_* runtime id (metal/abi/Gguf.h)
+  uint32_t formatId = 0;    // GGUF_FMT_* (metal/abi/QuantFormat.h)
   const char *format = "";
 };
 

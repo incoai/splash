@@ -1,6 +1,5 @@
 #include "model/GgufImage.hpp"
 
-#include <array>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -8,17 +7,15 @@
 namespace splash::model::gguf {
 namespace {
 
-// Per-32-weight plane layout of every supported type.
-constexpr std::array<FormatLayout, 8> kFormats{{
-    {GGUF_FMT_Q4K, ggml::kQ4_K, 256, 144, 16, 0, 16, 8, 1},
-    {GGUF_FMT_IQ4XS, ggml::kIQ4_XS, 256, 136, 16, 0, 8, 8, 0},
-    {GGUF_FMT_IQ4NL, ggml::kIQ4_NL, 32, 18, 16, 0, 2, 1, 1},
-    {GGUF_FMT_Q5K, ggml::kQ5_K, 256, 176, 16, 4, 16, 8, 1},
-    {GGUF_FMT_Q6K, ggml::kQ6_K, 256, 210, 16, 8, 20, 8, 1},
-    {GGUF_FMT_Q3K, ggml::kQ3_K, 256, 110, 8, 4, 16, 8, 1},
-    {GGUF_FMT_Q80, ggml::kQ8_0, 32, 34, 32, 0, 2, 1, 1},
-    {GGUF_FMT_IQ3S, ggml::kIQ3_S, 256, 110, 16, 0, 2, 8, 1},
-}};
+static_assert(kQuantFormats[GGUF_FMT_Q4K].ggml_type == ggml::kQ4_K &&
+                  kQuantFormats[GGUF_FMT_IQ4XS].ggml_type == ggml::kIQ4_XS &&
+                  kQuantFormats[GGUF_FMT_IQ4NL].ggml_type == ggml::kIQ4_NL &&
+                  kQuantFormats[GGUF_FMT_Q5K].ggml_type == ggml::kQ5_K &&
+                  kQuantFormats[GGUF_FMT_Q6K].ggml_type == ggml::kQ6_K &&
+                  kQuantFormats[GGUF_FMT_Q3K].ggml_type == ggml::kQ3_K &&
+                  kQuantFormats[GGUF_FMT_Q80].ggml_type == ggml::kQ8_0 &&
+                  kQuantFormats[GGUF_FMT_IQ3S].ggml_type == ggml::kIQ3_S,
+              "format table types are the GGUF type ids");
 
 constexpr uint32_t kNoPermute = 0xFFFFFFFFu;
 
@@ -127,22 +124,26 @@ public:
   // llama.cpp's tiled value-head order.
   void quantized(const GgufTensor &tensor, uint64_t rows, uint64_t columns,
                  uint32_t permuteFrom = kNoPermute, uint32_t headRows = 0) {
-    const FormatLayout *layout = formatLayout(tensor.type);
-    if (!layout) throw GgufError("unsupported tensor type " + ggmlTypeName(tensor.type) + " for " + tensor.name);
+    const uint32_t format = gguf_format_of(tensor.type);
+    if (format == GGUF_FMT_COUNT)
+      throw GgufError("unsupported tensor type " + ggmlTypeName(tensor.type) + " for " + tensor.name);
+    const QuantFormat &layout = kQuantFormats[format];
     if (tensor.rows() != rows || tensor.columns() != columns)
       throw GgufError("unexpected shape for " + tensor.name);
     if (rows % 256 || columns % 256) throw GgufError("tensor is not tile aligned: " + tensor.name);
+    const uint64_t rowBytes = columns / layout.block_elements * layout.block_bytes;
+    if (tensor.bytes != rows * rowBytes) throw GgufError("unexpected size for " + tensor.name);
     const uint64_t groups = columns / 32;
-    const uint64_t plane0 = rows * groups * layout->p0;
-    const uint64_t plane1 = rows * groups * layout->p1;
-    const uint64_t meta = rows * (groups / layout->metaGroups) * layout->metaBytes;
-    descriptor(layout->ggmlType, rows, columns, layout->p0, layout->p1, layout->metaBytes,
-               layout->metaGroups, layout->interleave, plane0, plane1, meta);
+    const uint64_t plane0 = rows * groups * layout.plane0_bytes;
+    const uint64_t plane1 = rows * groups * layout.plane1_bytes;
+    const uint64_t meta = rows * (groups / layout.meta_groups) * layout.meta_bytes;
+    descriptor(layout.ggml_type, rows, columns, layout.plane0_bytes, layout.plane1_bytes,
+               layout.meta_bytes, layout.meta_groups, plane0, plane1, meta);
     Repack repack;
     repack.params.rows = static_cast<uint32_t>(rows);
     repack.params.input_size = static_cast<uint32_t>(columns);
-    repack.params.fmt = layout->fmt;
-    repack.params.src_row_bytes = static_cast<uint32_t>(columns / layout->blockElements * layout->blockBytes);
+    repack.params.fmt = format;
+    repack.params.src_row_bytes = static_cast<uint32_t>(rowBytes);
     repack.params.dst_plane0 = offset32(section(plane0));
     repack.params.dst_plane1 = plane1 ? offset32(section(plane1)) : 0;
     repack.params.dst_meta = offset32(section(meta));
@@ -164,9 +165,12 @@ public:
     for (const GgufTensor *t : {&beta, &alpha})
       if (t->type != ggml::kQ8_0 || t->rows() != heads || t->columns() != hidden)
         throw GgufError("alpha/beta must be Q8_0 [" + std::to_string(heads) + ", hidden]: " + t->name);
+    const QuantFormat &q8 = kQuantFormats[GGUF_FMT_Q80];
     const uint32_t groups = hidden / 32, rows = 256;
-    const uint64_t plane0 = uint64_t{rows} * groups * 32, meta = uint64_t{rows} * groups * 2;
-    descriptor(ggml::kQ8_0, rows, hidden, 32, 0, 2, 1, 1, plane0, 0, meta);
+    const uint64_t plane0 = uint64_t{rows} * groups * q8.plane0_bytes;
+    const uint64_t meta = uint64_t{rows} * groups * q8.meta_bytes;
+    descriptor(q8.ggml_type, rows, hidden, q8.plane0_bytes, q8.plane1_bytes, q8.meta_bytes,
+               q8.meta_groups, plane0, 0, meta);
     std::vector<uint8_t> betaBytes = readBytes(file_, beta), alphaBytes = readBytes(file_, alpha);
     std::vector<uint8_t> plane(plane0, 0), metaBytes(meta, 0);
     const uint32_t groupHeads = geometry_.gdnKeyHeads, valueGroups = heads / groupHeads;
@@ -174,10 +178,10 @@ public:
       const std::vector<uint8_t> &source = n < heads ? betaBytes : alphaBytes;
       const uint32_t row = sourceHead(n % heads, groupHeads, valueGroups);
       for (uint32_t g = 0; g < groups; ++g) {
-        const uint8_t *block = source.data() + (size_t(row) * groups + g) * 34;
+        const uint8_t *block = source.data() + (size_t(row) * groups + g) * q8.block_bytes;
         const size_t tile = (size_t(g) * 256 + n);
-        std::memcpy(plane.data() + tile * 32, block + 2, 32);
-        std::memcpy(metaBytes.data() + tile * 2, block, 2);
+        std::memcpy(plane.data() + tile * q8.plane0_bytes, block + 2, 32);
+        std::memcpy(metaBytes.data() + tile * q8.meta_bytes, block, 2);
       }
     }
     fill(std::move(plane));
@@ -189,7 +193,7 @@ public:
       throw GgufError("unsupported token embedding type " + ggmlTypeName(tensor.type));
     if (tensor.rows() != geometry_.vocabularySize || tensor.columns() != geometry_.hiddenSize)
       throw GgufError("unexpected shape for " + tensor.name);
-    descriptor(tensor.type, tensor.rows(), tensor.columns(), 0, 0, 0, 0, 0, tensor.bytes, 0, 0);
+    descriptor(tensor.type, tensor.rows(), tensor.columns(), 0, 0, 0, 0, tensor.bytes, 0, 0);
     Copy copy;
     copy.params.dst_offset = offset32(section(tensor.bytes));
     copy.params.bytes = static_cast<uint32_t>(tensor.bytes);
@@ -207,12 +211,13 @@ public:
   }
 
 private:
+  // Word 7 is reserved (0).
   void descriptor(uint32_t type, uint64_t rows, uint64_t columns, uint32_t p0, uint32_t p1,
-                  uint32_t metaBytes, uint32_t metaGroups, uint32_t interleave,
+                  uint32_t metaBytes, uint32_t metaGroups,
                   uint64_t plane0Bytes, uint64_t plane1Bytes, uint64_t metaTotal) {
     std::vector<uint8_t> bytes;
     for (uint32_t word : {type, static_cast<uint32_t>(rows), static_cast<uint32_t>(columns), p0, p1,
-                          metaBytes, metaGroups, interleave})
+                          metaBytes, metaGroups, 0u})
       appendLittle32(bytes, word);
     appendLittle64(bytes, plane0Bytes);
     appendLittle64(bytes, plane1Bytes);
@@ -236,12 +241,6 @@ std::string prefix(uint32_t layer) { return "blk." + std::to_string(layer) + "."
 
 } // namespace
 
-const FormatLayout *formatLayout(uint32_t ggmlType) noexcept {
-  for (const FormatLayout &layout : kFormats)
-    if (layout.ggmlType == ggmlType) return &layout;
-  return nullptr;
-}
-
 ImagePlanner::ImagePlanner(const GgufFile &file, TargetGeometry geometry)
     : file_(file), geometry_(geometry) {
   if (file.architecture() != "qwen35")
@@ -263,7 +262,7 @@ ImagePlanner::ImagePlanner(const GgufFile &file, TargetGeometry geometry)
     }
     const bool ok = embedding ? tensor->type == ggml::kQ4_K || tensor->type == ggml::kQ6_K ||
                                     tensor->type == ggml::kQ8_0
-                              : formatLayout(tensor->type) != nullptr;
+                              : gguf_format_of(tensor->type) != GGUF_FMT_COUNT;
     if (!ok) unsupported += (unsupported.empty() ? "" : ", ") + name + " (" + ggmlTypeName(tensor->type) + ")";
   };
   for (uint32_t layer = 0; layer < geometry.layers; ++layer) {
