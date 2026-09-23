@@ -1,11 +1,12 @@
 #include "metal/abi/KernelABI.h"
 #include "metal/kernels/common/gguf_sgmatrix.h"
+#include "metal/kernels/common/rms_inverse.h"
 
 // Every norm reads its weights in their stored type W: bfloat in the packed
 // formats, float for a GGUF's F32 norms (the _f32 entry points). Both widen to
 // fp32 exactly, so W changes only the loads.
 //
-// Decode norms hold their row in registers, kNormChunk columns at a time:
+// Wide decode norms hold their row in registers, kNormChunk columns at a time:
 // 256 threads of kNormColumns columns each, one chunk for every hidden size
 // in use. The first chunk's input and weight loads are all issued before the
 // reduction instead of per output iteration, so the (cold) weights arrive in
@@ -15,6 +16,11 @@
 constant constexpr uint kNormColumns = 32;
 constant constexpr uint kNormThreads = 256;
 constant constexpr uint kNormChunk = kNormThreads * kNormColumns;
+// Rows of at most eight values per thread stream instead: a chunk would leave
+// most of the 256 threads idle (a 2048-wide row fills 64), which made the
+// 35B's MoE-input norms ~25% slower on a 40-core M3 Max. Both paths give the
+// same bits.
+constant constexpr uint kNormStreamingWidth = kNormThreads * 8;
 
 // Columns begin + tid + 256 i of a row, zero past its end.
 template <class T>
@@ -69,6 +75,14 @@ inline void norm_rms_row(device const bfloat *input, device const W *weight,
                          uint thread_index, uint lane, uint simd_group,
                          threadgroup float *reductions) {
 #pragma clang fp reassociate(off)
+  if (width <= kNormStreamingWidth) {
+    const float inverse = rms_inverse(input + row * width, width, reductions,
+                                      thread_index, lane, simd_group);
+    for (uint column = thread_index; column < width; column += kNormThreads)
+      output[row * width + column] =
+          bfloat((float(input[row * width + column]) * inverse) * float(weight[column]));
+    return;
+  }
   device const bfloat *row_input = input + row * width;
   bfloat x[kNormColumns];
   W w[kNormColumns];
@@ -113,6 +127,21 @@ inline void norm_rms_table(device const bfloat *input, device const W *weight,
                            uint width, uint row, uint tid, uint lane, uint sg,
                            threadgroup float *reductions) {
 #pragma clang fp reassociate(off)
+  if (width <= kNormStreamingWidth) {
+    device const bfloat *row_input = input + row * width;
+    const float inverse = rms_inverse(row_input, width, reductions, tid, lane, sg);
+    for (uint g = sg; g < width / 64; g += 8) {
+      const uint k = g * 64 + lane * 2;
+      const bfloat a = bfloat((float(row_input[k]) * inverse) * float(weight[k]));
+      const bfloat b = bfloat((float(row_input[k + 1]) * inverse) * float(weight[k + 1]));
+      output[row * width + k] = a;
+      output[row * width + k + 1] = b;
+      Table::write(table + ulong(row / 8) * width * 8,
+                   sums + ulong(row / 8) * Table::sums_per_tile(width),
+                   width, g, row % 8, lane, a, b);
+    }
+    return;
+  }
   constexpr uint Spans = kNormChunk / 64 / 8;  // per simdgroup and chunk
   device const bfloat *row_input = input + row * width;
   bfloat x[kNormColumns];

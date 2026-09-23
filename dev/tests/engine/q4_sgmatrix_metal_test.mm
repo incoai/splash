@@ -412,7 +412,7 @@ int main(int argc,char **argv) {
       }
     for (bool float32 : {false, true}) {
       for (LinearInput layout : {LinearInput::Table64, LinearInput::Table16})
-        for (uint32_t width : {64U, 320U, 2048U, 5120U, 17408U})
+        for (uint32_t width : {64U, 320U, 1984U, 2048U, 2112U, 5120U, 17408U})
           for (uint32_t rows : {8U,16U,24U,32U}) fusedNorm(backend, width, rows, layout, float32);
       for (uint32_t width : {64U, 5120U, 17408U})
         for (uint32_t rows : {1U,37U,64U}) prefillNorm(backend, width, rows, float32);
