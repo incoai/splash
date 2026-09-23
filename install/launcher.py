@@ -209,7 +209,7 @@ def serve(args):
 
 
 def coding_client(args):
-    path = clients.find_executable(args.command)
+    path = args.command if args.config_only else clients.find_executable(args.command)
     snapshot = _running_status(args.port)
     if snapshot is None:
         raise LauncherError(
@@ -246,6 +246,10 @@ def coding_client(args):
         client_args=args.client_args,
         client_version=client_version,
     )
+    if args.config_only:
+        print(f"Configured Pi: {clients.pi_config_path(environment)}", flush=True)
+        print(f"Run pi --provider splash --model {model}", flush=True)
+        return 0
     print(f"Starting {args.command}: {model} · {context:,} context tokens", flush=True)
     if args.command == "claude":
         print(
@@ -353,6 +357,9 @@ def _parse_max_image_pixels(value):
 
 def parse_args(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
+    config_only = argv[:2] == ["pi", "--config"]
+    if config_only:
+        argv = [argv[0], *argv[2:]]
     client_args = []
     if argv and argv[0] in clients.INSTALL_URLS:
         argv, client_args = argv[:1], argv[1:]
@@ -371,6 +378,7 @@ def parse_args(argv=None):
             "  splash opencode  # in another terminal, after Ready\n\n"
             "Use splash serve --help for server settings. Client arguments,\n"
             "including --help, are passed through to the installed agent."
+            "\nUse splash pi --config to configure Pi without launching it."
         ),
     )
     parser.add_argument("--version", action="version", version=_version())
@@ -464,6 +472,9 @@ def parse_args(argv=None):
     for name in clients.INSTALL_URLS:
         commands.add_parser(name, help=f"connect {name} to the running server")
     args = parser.parse_args(argv)
+    if config_only and client_args:
+        parser.error("splash pi --config does not accept client arguments")
+    args.config_only = config_only
     if (
         args.command == "serve"
         and args.default_reasoning_effort is not None

@@ -24,8 +24,8 @@ publish-test:
 		--repo "$(TEST_RELEASE_REPO)"
 
 ENGINE_PYTHON_TEST_PATTERN ?= test_*.py
-# Comma-separated subset of claude,opencode,codex,hermes for the real client
-# gates on a machine that lacks one of them; empty runs all four.
+# Comma-separated subset of claude,opencode,codex,hermes,pi for the real client
+# gates on a machine that lacks one of them; empty runs all five.
 AGENT_CLIENTS ?=
 AGENT_CLIENT_ARGS = $(if $(AGENT_CLIENTS),--clients $(AGENT_CLIENTS),)
 HTTP_SMOKE_ARGS ?=
@@ -94,7 +94,7 @@ test-agent-real: preflight $(TARGET) agent-preflight verify-build-identity
 	TRANSFORMERS_VERBOSITY=error $(PYTHON) dev/tests/agent_real.py --model "$(MODEL)" \
 		$(AGENT_CLIENT_ARGS)
 
-# The release path loads the model once for generic HTTP and all four official
+# The release path loads the model once for generic HTTP and all five official
 # clients. The individual targets remain useful while diagnosing one surface.
 test-release-real: preflight $(TARGET) agent-preflight verify-build-identity
 	TRANSFORMERS_VERBOSITY=error $(PYTHON) dev/tests/agent_real.py \
@@ -119,7 +119,7 @@ test-performance-real: preflight $(TARGET) $(TEST_BACKEND_BENCHMARK) $(LIB)
 	@echo "native backend characterization: PASS (build/release/backend-benchmark.json)"
 
 # One final source identity: model-free correctness, sanitizers, real-model
-# correctness, one shared HTTP/four-client server, then native performance.
+# correctness, one shared HTTP/five-client server, then native performance.
 release-check: check preflight
 	@test -z "$$(git status --porcelain)" || { \
 		echo "error: release checkout is not clean" >&2; \

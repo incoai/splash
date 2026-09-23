@@ -17,6 +17,7 @@ INSTALL_URLS = {
     "opencode": "https://opencode.ai/docs/",
     "codex": "https://developers.openai.com/codex/cli/",
     "hermes": "https://hermes-agent.nousresearch.com/docs/getting-started/installation/",
+    "pi": "https://pi.dev/",
 }
 
 
@@ -123,6 +124,58 @@ def _codex_config_args(arguments):
         else:
             remaining.append(argument)
     return config, remaining
+
+
+def pi_config_path(environment):
+    home = environment.get("PI_CODING_AGENT_DIR")
+    return (
+        Path(home).expanduser() if home else Path.home() / ".pi/agent"
+    ) / "models.json"
+
+
+def _pi_config(environment, model, endpoint, context):
+    path = pi_config_path(environment)
+    try:
+        config = json.loads(path.read_text()) if path.exists() else {}
+        if not isinstance(config, dict) or not isinstance(
+            config.get("providers", {}), dict
+        ):
+            raise ValueError("expected provider mappings")
+    except (ValueError, UnicodeError) as error:
+        raise ClientError(f"Invalid Pi config: {path}") from error
+    provider = {
+        "baseUrl": endpoint,
+        "api": "openai-completions",
+        # Pi resolves this at request time. Never persist the server's secret
+        # (or interpret a secret beginning with ! as a credential command).
+        "apiKey": "$SPLASH_API_KEY" if environment.get("SPLASH_API_KEY") else "local",
+        "models": [
+            {
+                "id": model,
+                "name": model,
+                "reasoning": True,
+                "thinkingLevelMap": {"off": "none"},
+                "input": ["text", "image"],
+                "contextWindow": context,
+                "maxTokens": _output_budget(context),
+                "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+            }
+        ],
+    }
+    config = {
+        **config,
+        "providers": {**config.get("providers", {}), "splash": provider},
+    }
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as output:
+        temporary = Path(output.name)
+        try:
+            json.dump(config, output, indent=2)
+            output.write("\n")
+            output.close()
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 def _selects_opencode_server(arguments):
@@ -289,6 +342,17 @@ def command(
         # a subcommand's overrides cannot replace the connection settings.
         overrides, arguments = _codex_config_args(client_args)
         return [*argv, *overrides, *arguments], environment
+
+    if name == "pi":
+        _pi_config(environment, model, endpoint, context)
+        return [
+            path,
+            "--provider",
+            "splash",
+            "--model",
+            model,
+            *client_args,
+        ], environment
 
     if name == "hermes":
         home = runtime_dir / "hermes"

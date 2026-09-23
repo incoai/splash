@@ -18,6 +18,73 @@ MODEL_IDS = (
 
 
 class AgentRunnerTests(unittest.TestCase):
+    def test_pi_counts_only_successful_bash_results(self):
+        for is_error in (False, True):
+            with self.subTest(is_error=is_error):
+                parsed = [
+                    {
+                        "type": "tool_execution_start",
+                        "toolName": "bash",
+                        "toolCallId": "t1",
+                        "args": {"command": agent.TEST_COMMAND},
+                    },
+                    {
+                        "type": "tool_execution_end",
+                        "toolName": "bash",
+                        "toolCallId": "unknown",
+                        "isError": False,
+                    },
+                    {
+                        "type": "tool_execution_end",
+                        "toolName": "bash",
+                        "toolCallId": "t1",
+                        "isError": is_error,
+                    },
+                ]
+                self.assertEqual(
+                    agent.executed_commands("pi", parsed),
+                    [] if is_error else [agent.TEST_COMMAND],
+                )
+
+    def test_pi_completion_requires_final_successful_assistant_text(self):
+        def message(reason, text):
+            return {
+                "type": "message_end",
+                "message": {
+                    "role": "assistant",
+                    "stopReason": reason,
+                    "content": [{"type": "text", "text": text}],
+                },
+            }
+
+        success = message("stop", "Done")
+        ended = {"type": "agent_end"}
+        for parsed, expected in (
+            ([success, ended], True),
+            ([message("toolUse", ""), success, ended], True),
+            ([success], False),
+            ([ended], False),
+            ([message("stop", " "), ended], False),
+            ([success, message("error", "failed"), ended], False),
+            ([message("aborted", "partial"), ended], False),
+            ([message("length", "partial"), ended], False),
+        ):
+            with self.subTest(parsed=parsed):
+                self.assertEqual(agent.pi_completed(parsed), expected)
+
+    def test_pi_compaction_reads_saved_session_entries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = agent.ClientRun(
+                "pi", "/bin/pi", Path(directory) / "run", "test-model", 102400, 10
+            )
+            runner.session = "selected-id"
+            sessions = runner.folder / "pi-sessions"
+            sessions.mkdir()
+            entry = {"type": "compaction", "summary": "Earlier work"}
+            (sessions / "time_selected-id.jsonl").write_text(json.dumps(entry) + "\n")
+            (sessions / "time_other-id.jsonl").write_text(json.dumps(entry) + "\n")
+            self.assertEqual(runner.compaction(), [entry])
+
     def test_hermes_session_lookup_uses_canonical_workspace(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -442,6 +509,7 @@ class AgentRunnerTests(unittest.TestCase):
                     runner.model, runner.context = "Actual-model", 102400
                     runner.workspace = Path("/test/project")
                     runner.codex_home = Path(directory) / "codex-home"
+                    runner.folder = Path(directory)
                     runner.session = session
                     with mock.patch.object(
                         agent.clients, "command", return_value=([runner.path], {})
@@ -479,6 +547,15 @@ class AgentRunnerTests(unittest.TestCase):
                             argv[argv.index("--allowedTools") + 1],
                             f"Bash({agent.TEST_COMMAND})",
                         )
+                    if name == "pi":
+                        self.assertIn("--print", argv)
+                        self.assertEqual(argv[argv.index("--mode") + 1], "json")
+                        self.assertEqual(
+                            argv[argv.index("--session-dir") + 1],
+                            str((Path(directory) / "pi-sessions").resolve()),
+                        )
+                        if session:
+                            self.assertEqual(argv[argv.index("--session") + 1], session)
 
     def test_artifact_oracle_rejects_stub_and_wrong_semantics(self):
         with tempfile.TemporaryDirectory() as directory:

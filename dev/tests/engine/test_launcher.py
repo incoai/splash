@@ -609,7 +609,11 @@ class LauncherTests(unittest.TestCase):
                 with (
                     mock.patch.dict(
                         os.environ,
-                        {"SPLASH_PORT": str(port), "SPLASH_API_KEY": "test-key"},
+                        {
+                            "SPLASH_PORT": str(port),
+                            "SPLASH_API_KEY": "test-key",
+                            "PI_CODING_AGENT_DIR": str(Path(temporary) / "pi"),
+                        },
                     ),
                     mock.patch.object(launcher, "RUNTIME_DIR", Path(temporary)),
                     mock.patch.object(
@@ -632,7 +636,9 @@ class LauncherTests(unittest.TestCase):
                         self.assertEqual(
                             command.call_args.args[5], launcher._runtime_dir(port)
                         )
-                    self.assertEqual(execute.call_count, 4)
+                    self.assertEqual(
+                        execute.call_count, len(launcher.clients.INSTALL_URLS)
+                    )
             finally:
                 server.shutdown()
                 worker.join(timeout=5)
@@ -640,7 +646,7 @@ class LauncherTests(unittest.TestCase):
                 requests,
                 [
                     (path, "Bearer test-key")
-                    for _ in range(4)
+                    for _ in launcher.clients.INSTALL_URLS
                     for path in ("/status", "/v1/models")
                 ],
             )

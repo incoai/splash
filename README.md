@@ -30,10 +30,21 @@ Once it prints `Ready`, leave this terminal open. Open <http://127.0.0.1:8000>
 in your browser, or run an installed coding agent from another terminal:
 
 ```bash
-splash opencode    # or: splash claude / splash codex / splash hermes
+splash opencode    # or: splash claude / splash codex / splash hermes / splash pi
 ```
 
 Press Ctrl+C in the server terminal to stop Splash.
+
+For [Pi](https://pi.dev/), `splash pi` configures the running server's model
+and context limit, then launches Pi. `splash pi --config` writes the same
+configuration without launching; the server must be ready in both cases.
+The Splash provider is saved in `~/.pi/agent/models.json` (or under
+`PI_CODING_AGENT_DIR`), preserving other providers, settings and sessions.
+Select it later with `pi --provider splash --model <served-model-id>`.
+If authentication is enabled, keep `SPLASH_API_KEY` set when running Pi;
+the config references that variable instead of saving the key.
+Other Pi arguments pass through, for example `splash pi --continue` or
+`splash pi --print "Explain this project"`.
 
 ## Use the API
 

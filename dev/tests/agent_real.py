@@ -118,6 +118,15 @@ def executed_commands(name, parsed, messages=()):
                     commands.append(calls[message["tool_call_id"]])
         return commands
     for event in parsed:
+        if name == "pi" and event.get("toolName") == "bash":
+            if event.get("type") == "tool_execution_start":
+                calls[event["toolCallId"]] = event.get("args", {}).get("command", "")
+            if (
+                event.get("type") == "tool_execution_end"
+                and event.get("isError") is False
+                and event.get("toolCallId") in calls
+            ):
+                commands.append(calls[event["toolCallId"]])
         if name == "codex" and event.get("type") == "item.completed":
             item = event.get("item", {})
             if item.get("type") == "command_execution" and item.get("exit_code") == 0:
@@ -147,6 +156,23 @@ def executed_commands(name, parsed, messages=()):
                 ):
                     commands.append(calls[block["tool_use_id"]])
     return commands
+
+
+def pi_completed(parsed):
+    messages = [
+        event["message"]
+        for event in parsed
+        if event.get("type") == "message_end"
+        and event.get("message", {}).get("role") == "assistant"
+    ]
+    return bool(
+        messages
+        and messages[-1].get("stopReason") == "stop"
+        and any(
+            block.get("text", "").strip() for block in messages[-1].get("content", [])
+        )
+        and any(event.get("type") == "agent_end" for event in parsed)
+    )
 
 
 # The engine's own critical verdict drops every evictable cache entry and
@@ -419,6 +445,16 @@ class ClientRun:
             if self.session:
                 argv += ["resume", self.session]
             argv += ["--json", "-"]
+        elif self.name == "pi":
+            argv += [
+                "--print",
+                "--mode",
+                "json",
+                "--session-dir",
+                str((self.folder / "pi-sessions").resolve()),
+            ]
+            if self.session:
+                argv += ["--session", self.session]
         else:
             argv += ["--oneshot", "--query-file", "-"]
             if self.session:
@@ -542,6 +578,8 @@ class ClientRun:
         text = log.read_text(errors="replace")
         parsed = events(text)
         for e in parsed:
+            if self.name == "pi" and e.get("type") == "session":
+                self.session = e.get("id", self.session)
             self.session = e.get(
                 "session_id", e.get("sessionID", e.get("thread_id", self.session))
             )
@@ -616,6 +654,11 @@ class ClientRun:
             elif self.name == "codex":
                 if not any(e.get("type") == "turn.completed" for e in parsed):
                     raise AgentFailure("Codex did not complete its turn")
+            elif self.name == "pi":
+                if not pi_completed(parsed):
+                    raise AgentFailure(
+                        "Pi did not finish its user turn with assistant text"
+                    )
             else:
                 if any(e.get("type") == "error" for e in parsed):
                     raise AgentFailure("OpenCode reported a request error")
@@ -637,6 +680,15 @@ class ClientRun:
         return parsed
 
     def compaction(self):
+        if self.name == "pi":
+            return [
+                entry
+                for path in (self.folder / "pi-sessions").glob(
+                    f"*_{self.session}.jsonl"
+                )
+                for entry in events(path.read_text())
+                if entry.get("type") == "compaction"
+            ]
         if self.name == "hermes":
             return [
                 {"message_id": m["id"]}

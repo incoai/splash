@@ -149,7 +149,7 @@ case ":$PATH:" in
     *) echo "Add it to your PATH first:  export PATH=\"$dir:\$PATH\"" ;;
 esac
 echo "  splash serve --model incoai/Qwen3.6-35B-A3B-Splash"
-echo "  splash claude|opencode|codex|hermes   connect a coding agent to it"
+echo "  splash claude|opencode|codex|hermes|pi   connect a coding agent to it"
 if [ -f "$APP/current/install/completions/splash.bash" ] && [ -f "$APP/current/install/completions/_splash" ]; then
     echo "  Optional shell completion (Zsh needs compinit initialized):"
     echo '    Bash: source "$HOME/Library/Application Support/Splash/app/current/install/completions/splash.bash"'

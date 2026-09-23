@@ -35,6 +35,12 @@ class ClientTests(unittest.TestCase):
                         config["provider"]["splash"]["options"]["apiKey"],
                         "test-server-key",
                     )
+                elif name == "pi":
+                    self.assertEqual(env["SPLASH_API_KEY"], "test-server-key")
+                    config = json.loads(clients.pi_config_path(env).read_text())
+                    self.assertEqual(
+                        config["providers"]["splash"]["apiKey"], "$SPLASH_API_KEY"
+                    )
                 else:
                     self.assertEqual(env["OPENAI_API_KEY"], "test-server-key")
                     profile = Path(env["HERMES_HOME"]) / "config.yaml"
@@ -65,7 +71,7 @@ class ClientTests(unittest.TestCase):
             model,
             context,
             self.runtime,
-            {} if env is None else env,
+            {"PI_CODING_AGENT_DIR": str(self.runtime / "pi"), **(env or {})},
             client_args=client_args,
             client_version=client_version,
         )
@@ -492,7 +498,7 @@ class ClientTests(unittest.TestCase):
             self.command("codex", client_args=["exec", "-c"])
 
     def test_other_clients_preserve_passthrough_arguments(self):
-        for name in ("claude", "opencode", "hermes"):
+        for name in ("claude", "opencode", "hermes", "pi"):
             with self.subTest(name=name):
                 args = ["--help", "--", "literal"]
                 argv, _ = self.command(name, client_args=args)

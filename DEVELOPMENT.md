@@ -23,7 +23,7 @@ or `hf auth login`. Ctrl+C stops serving; stop before upgrading.
 
 Use `--max-context 100K` or `--max-memory 28G` to set optional limits. Memory
 limits cap Metal allocations, not combined process RSS. Agents must already be
-installed; `./splash claude|opencode|codex|hermes` connects to the running server.
+installed; `./splash claude|opencode|codex|hermes|pi` connects to the running server.
 Arguments pass through, for example `./splash codex resume --last`.
 
 Set `SPLASH_API_KEY` in the server and agent shells to require authentication;
@@ -361,9 +361,20 @@ includes both. Hosted CI runs CPU checks and sanitizers; the hardware release
 gate runs the full suite.
 
 Repeat model tests with `MODEL=incoai/Qwen3.6-35B-A3B-Splash`.
-Before release, install all four agents and run `make release-check MODEL=...`
+Before release, install all five agents (Claude, OpenCode, Codex, Hermes and Pi)
+and run `make release-check MODEL=...`
 for both models from a clean checkout. It includes correctness, sanitizers,
 real HTTP/client behavior and performance checks.
+
+To check an installed Pi client against Splash's HTTP adapter without model
+weights:
+
+```sh
+SPLASH_PI_BINARY="$(command -v pi)" .venv/bin/python -m unittest dev.tests.engine.test_pi
+```
+
+This uses temporary Pi configuration and a controlled runtime to test
+authentication, streamed text, tools, reasoning and session resume.
 
 Compare performance on the same idle Mac with the same model and workload.
 `make tune-kernels MODEL=...` measures kernel policies. Keep generated reports,

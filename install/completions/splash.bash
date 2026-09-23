@@ -10,7 +10,7 @@ _splash() {
     cur=${COMP_WORDS[COMP_CWORD]}
     prev=${COMP_WORDS[COMP_CWORD-1]}
     if [[ $COMP_CWORD -eq 1 ]]; then
-        COMPREPLY=($(compgen -W 'serve claude codex opencode hermes' -- "$cur"))
+        COMPREPLY=($(compgen -W 'serve claude codex opencode hermes pi' -- "$cur"))
         return 0
     fi
     [[ ${COMP_WORDS[1]} == serve ]] || return 0
