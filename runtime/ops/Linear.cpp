@@ -643,6 +643,8 @@ void addGguf(metal::CommandGraph &graph, const LinearBuffers &b, const Q4Project
       const metal::MetalBuffer aux = w.epilogue == LinearEpilogue::Residual ? b.residual
                                    : w.epilogue == LinearEpilogue::UpWithGate ? b.gateScratch : b.output;
       if (splits > 1) {
+        // Each split covers K / 32 / splits groups; the kernel would drop a remainder.
+        if ((k / 32) % splits) throw std::invalid_argument("GGUF split count does not divide the K groups");
         need(p.kqPartials, uint64_t{splits} * rows * n * 4, "partials");
         need(p.kqCounters, uint64_t{tiles} * 4, "counters");
         graph.add(std::string("gguf_splitk_") + s.format + "_m" + std::to_string(rows),
