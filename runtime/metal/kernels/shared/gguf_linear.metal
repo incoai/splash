@@ -282,18 +282,10 @@ inline void pf_tile(device TA *input, device uchar *w0, device uchar *w1, device
 template <typename TA, ushort Rows, ushort Cols, ushort KS, ushort Buffers, ushort Prefetch, class Acc>
 inline void gguf_accum_any(uint fmt, device TA *input, device uchar *w0, device uchar *w1, device uchar *meta, uint input_size, uint origin,
                            threadgroup half *stage, threadgroup half2 *tl, uint simd_lane, uint sb, uint se, thread Acc &acc) {
-#define GGUF_ACCUM(F) sg_accum<F, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, acc)
-  switch (fmt) {
-  case GGUF_FMT_Q4K: GGUF_ACCUM(FmtQ4K); break;
-  case GGUF_FMT_IQ4XS: GGUF_ACCUM(FmtIQ4XS); break;
-  case GGUF_FMT_IQ4NL: GGUF_ACCUM(FmtIQ4NL); break;
-  case GGUF_FMT_Q5K: GGUF_ACCUM(FmtQ5K); break;
-  case GGUF_FMT_Q6K: GGUF_ACCUM(FmtQ6K); break;
-  case GGUF_FMT_Q3K: GGUF_ACCUM(FmtQ3K); break;
-  case GGUF_FMT_Q80: GGUF_ACCUM(FmtQ80); break;
-  default: GGUF_ACCUM(FmtIQ3S); break;
-  }
-#undef GGUF_ACCUM
+  quant_format_switch(fmt, [&](auto format) {
+    sg_accum<decltype(format), TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl,
+                                                                     simd_lane, sb, se, acc);
+  });
 }
 
 // ---------------- decode dispatches over (64-column tiles, K partitions): two simdgroups of 32 columns per
