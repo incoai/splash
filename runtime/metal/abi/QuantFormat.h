@@ -6,7 +6,21 @@
 //   plane0 [N / 256][G][256][plane0_bytes]
 //   plane1 [N / 256][G][256][plane1_bytes]   (none when plane1_bytes is 0)
 //   meta   [N / 256][G / meta_groups][256][meta_bytes]
-// A meta unit is one native block.
+// A meta unit is one native block and holds its scale fields.
+//
+// Inside a group of 32 the elements are in lane-owned chunk order: chunk c
+// (0..3) holds elements 4c..4c+3 and 16+4c..16+4c+3 as pairs p = 0..3, pair p
+// being elements e0 and e0 + 1 with e0 = 16 (p >> 1) + 4c + 2 (p & 1).
+// Element e is at slot quant_slot(e) = 8c + 2p + (e & 1). The planes pack the
+// slots as follows.
+//   4-bit linear codes (Q4_K, the low bits of Q5_K and Q6_K): word c holds
+//     slots 8c..8c+7, pair p's e0 at bits 4p and e1 at bits 16 + 4p.
+//   Every other field is a little-endian bit string of the 32 slots: IQ4
+//     indices (4 bits, so byte p of word c is pair p), Q8_0 values (8), Q6_K
+//     high and Q3_K low bits (2), Q5_K fifth and Q3_K hmask bits (1).
+//   IQ3_S word c: bits 0..7 and 8..15 the low grid index bits of elements
+//     4c..4c+3 and 16+4c..16+4c+3, 16..23 the sign bits of slots 8c..8c+7,
+//     24 and 25 the two ninth index bits, 26..29 the group's scale.
 #ifdef __METAL_VERSION__
 #include <metal_stdlib>
 #define QUANT_CONSTANT constant constexpr
@@ -54,6 +68,15 @@ inline constexpr uint32_t gguf_format_of(uint32_t ggml_type) {
   for (uint32_t format = 0; format < GGUF_FMT_COUNT; ++format)
     if (kQuantFormats[format].ggml_type == ggml_type) return format;
   return GGUF_FMT_COUNT;
+}
+
+// The chunk order slot of element e (0..31) of a group.
+inline constexpr uint32_t quant_slot(uint32_t e) { return 8 * ((e >> 2) & 3) + 4 * (e >> 4) + (e & 3); }
+
+// Index of (row, block) in a [rows / 256][blocks][256] plane (blocks = G) or
+// meta plane (blocks = meta units per row).
+inline constexpr uint64_t quant_tile_index(uint32_t row, uint32_t block, uint32_t blocks) {
+  return (uint64_t(row / 256) * blocks + block) * 256 + row % 256;
 }
 
 #undef QUANT_CONSTANT

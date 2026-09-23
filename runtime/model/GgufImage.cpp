@@ -179,8 +179,8 @@ public:
       const uint32_t row = sourceHead(n % heads, groupHeads, valueGroups);
       for (uint32_t g = 0; g < groups; ++g) {
         const uint8_t *block = source.data() + (size_t(row) * groups + g) * q8.block_bytes;
-        const size_t tile = (size_t(g) * 256 + n);
-        std::memcpy(plane.data() + tile * q8.plane0_bytes, block + 2, 32);
+        const uint64_t tile = quant_tile_index(n, g, groups);
+        for (uint32_t e = 0; e < 32; ++e) plane[tile * q8.plane0_bytes + quant_slot(e)] = block[2 + e];
         std::memcpy(metaBytes.data() + tile * q8.meta_bytes, block, 2);
       }
     }

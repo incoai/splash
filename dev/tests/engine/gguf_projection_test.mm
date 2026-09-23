@@ -89,45 +89,51 @@ static std::vector<uint8_t> makeNative(Fmt f, uint32_t N, uint32_t K) {
   return v;
 }
 static void scale_min_k4(const uint8_t *sc, int j, uint8_t &s, uint8_t &m) { if (j < 4) { s = sc[j] & 63; m = sc[j + 4] & 63; } else { s = (sc[j + 4] & 0xF) | ((sc[j - 4] >> 6) << 4); m = (sc[j + 4] >> 4) | ((sc[j] >> 6) << 4); } }
-static uint32_t interleave8(const uint8_t *codes) { uint32_t v = 0; for (int k = 0; k < 8; ++k) { uint32_t lane = (k & 1) ? 16 + 4 * (k / 2) : 4 * (k / 2); v |= uint32_t(codes[k] & 15) << lane; } return v; }
-static uint32_t natural8(const uint8_t *codes) { uint32_t v = 0; for (int k = 0; k < 8; ++k) v |= uint32_t(codes[k] & 15) << (4 * k); return v; }
+// Planes in chunk order (metal/abi/QuantFormat.h): 4-bit linear codes pair-interleaved in chunk words, every
+// other field a little-endian bit string over the slots.
+static void packBits(const uint8_t *slots, uint32_t bits, uint8_t *dst) {
+  for (uint32_t w = 0, per = 32 / bits; w < bits; ++w) { uint32_t v = 0; for (uint32_t i = 0; i < per; ++i) v |= uint32_t(slots[w * per + i]) << (bits * i); memcpy(dst + 4 * w, &v, 4); } }
+static void packPairs(const uint8_t *slots, uint8_t *dst) {
+  for (uint32_t c = 0; c < 4; ++c) { uint32_t v = 0; for (uint32_t i = 0; i < 8; ++i) v |= uint32_t(slots[8 * c + i]) << ((i & 1) * 16 + 4 * (i >> 1)); memcpy(dst + 4 * c, &v, 4); } }
 // reference values (llama.cpp dequantize_row_* semantics) + plane bytes for group g of one row
-static void groupPack(Fmt f, bool interleave, const uint8_t *row, uint32_t g, float vals[32], uint8_t p0[32], uint8_t p1[8]) {
+static void groupPack(Fmt f, const uint8_t *row, uint32_t g, float vals[32], uint8_t p0[32], uint8_t p1[8]) {
   const QuantFormat &fi = kQuantFormats[f]; const uint8_t *blk = row + (g * 32 / fi.block_elements) * fi.block_bytes; const uint32_t j = (g * 32 % fi.block_elements) / 32;
-  uint8_t codes[32]; uint32_t w[4] = {0, 0, 0, 0}; uint32_t h[2] = {0, 0};
+  uint8_t lo[32], hi[32];   // per slot: the (low) code and its high bits
   switch (f) {
     case Q4K: { const uint8_t *q = blk + 16 + (j / 2) * 32; int sh = (j % 2) * 4; uint16_t d16, m16; memcpy(&d16, blk, 2); memcpy(&m16, blk + 2, 2); uint8_t sc, mn; scale_min_k4(blk + 4, j, sc, mn);
-      for (int k = 0; k < 32; ++k) { codes[k] = (q[k] >> sh) & 15; vals[k] = h2f(d16) * sc * codes[k] - h2f(m16) * mn; }
-      for (int k = 0; k < 4; ++k) w[k] = interleave8(codes + 8 * k); memcpy(p0, w, 16); return; }
+      for (int k = 0; k < 32; ++k) { const uint8_t code = (q[k] >> sh) & 15; lo[quant_slot(k)] = code; vals[k] = h2f(d16) * sc * code - h2f(m16) * mn; }
+      packPairs(lo, p0); return; }
     case IQ4XS: { const uint8_t *qs = blk + 8 + j * 16; uint16_t d16, shh; memcpy(&d16, blk, 2); memcpy(&shh, blk + 2, 2); const uint8_t *sl = blk + 4;
       int ls = ((sl[j / 2] >> 4 * (j % 2)) & 0xf) | (((shh >> 2 * j) & 3) << 4); float s = h2f(d16) * (ls - 32);
-      for (int k = 0; k < 32; ++k) { codes[k] = k < 16 ? (qs[k] & 15) : (qs[k - 16] >> 4); vals[k] = s * kv_iq4nl[codes[k]]; }
-      for (int k = 0; k < 4; ++k) w[k] = interleave ? interleave8(codes + 8 * k) : natural8(codes + 8 * k); memcpy(p0, w, 16); return; }
+      for (int k = 0; k < 32; ++k) { const uint8_t code = k < 16 ? (qs[k] & 15) : (qs[k - 16] >> 4); lo[quant_slot(k)] = code; vals[k] = s * kv_iq4nl[code]; }
+      packBits(lo, 4, p0); return; }
     case IQ4NL: { const uint8_t *qs = blk + 2; uint16_t d16; memcpy(&d16, blk, 2); float s = h2f(d16);
-      for (int k = 0; k < 32; ++k) { codes[k] = k < 16 ? (qs[k] & 15) : (qs[k - 16] >> 4); vals[k] = s * kv_iq4nl[codes[k]]; }
-      for (int k = 0; k < 4; ++k) w[k] = interleave ? interleave8(codes + 8 * k) : natural8(codes + 8 * k); memcpy(p0, w, 16); return; }
+      for (int k = 0; k < 32; ++k) { const uint8_t code = k < 16 ? (qs[k] & 15) : (qs[k - 16] >> 4); lo[quant_slot(k)] = code; vals[k] = s * kv_iq4nl[code]; }
+      packBits(lo, 4, p0); return; }
     case Q5K: { const uint8_t *qh = blk + 16, *ql = blk + 48 + (j / 2) * 32; int sh = (j % 2) * 4; uint16_t d16, m16; memcpy(&d16, blk, 2); memcpy(&m16, blk + 2, 2); uint8_t sc, mn; scale_min_k4(blk + 4, j, sc, mn);
-      uint32_t hb = 0; for (int k = 0; k < 32; ++k) { uint8_t lo = (ql[k] >> sh) & 15, hi = (qh[k] >> j) & 1; codes[k] = lo; vals[k] = h2f(d16) * sc * (lo + 16 * hi) - h2f(m16) * mn;
-        int ww = k / 8, p = (k % 8) / 2; if (k & 1) hb |= uint32_t(hi) << (16 + 4 * ww + p); else hb |= uint32_t(hi) << (4 * ww + p); }
-      for (int k = 0; k < 4; ++k) w[k] = interleave8(codes + 8 * k); memcpy(p0, w, 16); memcpy(p1, &hb, 4); return; }
+      for (int k = 0; k < 32; ++k) { uint8_t l4 = (ql[k] >> sh) & 15, h1 = (qh[k] >> j) & 1; lo[quant_slot(k)] = l4; hi[quant_slot(k)] = h1; vals[k] = h2f(d16) * sc * (l4 + 16 * h1) - h2f(m16) * mn; }
+      packPairs(lo, p0); packBits(hi, 1, p1); return; }
     case Q6K: { const uint32_t n = j / 4, r = j % 4; const uint8_t *ql = blk + 64 * n, *qh = blk + 128 + 32 * n; const int8_t *sc = (const int8_t *)(blk + 192) + 8 * n; uint16_t d16; memcpy(&d16, blk + 208, 2); float d = h2f(d16);
-      for (int k = 0; k < 32; ++k) { uint8_t lo = (ql[k + 32 * (r & 1)] >> (4 * (r >> 1))) & 15, hi = (qh[k] >> (2 * r)) & 3; int q6 = (lo | (hi << 4)) - 32; codes[k] = lo; vals[k] = d * sc[2 * r + k / 16] * q6;
-        int hh = k / 16, ip = (k % 16) / 2; if (k & 1) h[hh] |= uint32_t(hi) << (16 + 2 * ip); else h[hh] |= uint32_t(hi) << (2 * ip); }
-      for (int k = 0; k < 4; ++k) w[k] = interleave8(codes + 8 * k); memcpy(p0, w, 16); memcpy(p1, h, 8); return; }
+      for (int k = 0; k < 32; ++k) { uint8_t l4 = (ql[k + 32 * (r & 1)] >> (4 * (r >> 1))) & 15, h2 = (qh[k] >> (2 * r)) & 3; int q6 = (l4 | (h2 << 4)) - 32; lo[quant_slot(k)] = l4; hi[quant_slot(k)] = h2; vals[k] = d * sc[2 * r + k / 16] * q6; }
+      packPairs(lo, p0); packBits(hi, 2, p1); return; }
     case Q3K: { const uint32_t n = j / 4, jj = j % 4; const uint8_t *hm = blk, *q = blk + 32 + 32 * n; uint32_t aux[4]; memcpy(aux, blk + 96, 12); uint32_t tmp = aux[2];
       const uint32_t kmask1 = 0x03030303, kmask2 = 0x0f0f0f0f;
       aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4); aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
       aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4); aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
-      const int8_t *scales = (const int8_t *)aux; uint16_t d16; memcpy(&d16, blk + 108, 2); float d = h2f(d16); uint32_t hb = 0;
-      for (int k = 0; k < 32; ++k) { int c2 = (q[k] >> (2 * jj)) & 3, hb1 = (hm[k] >> j) & 1; vals[k] = d * (scales[2 * j + k / 16] - 32) * (c2 - (hb1 ? 0 : 4));
-        int hh = k / 16, ip = (k % 16) / 2, i = k / 2; if (k & 1) { h[hh] |= uint32_t(c2) << (16 + 2 * ip); hb |= uint32_t(hb1) << (16 + i); } else { h[hh] |= uint32_t(c2) << (2 * ip); hb |= uint32_t(hb1) << i; } }
-      memcpy(p0, h, 8); memcpy(p1, &hb, 4); return; }
-    case Q80: { uint16_t d16; memcpy(&d16, blk, 2); const int8_t *qs = (const int8_t *)(blk + 2); for (int k = 0; k < 32; ++k) vals[k] = h2f(d16) * qs[k]; memcpy(p0, qs, 32); return; }
+      const int8_t *scales = (const int8_t *)aux; uint16_t d16; memcpy(&d16, blk + 108, 2); float d = h2f(d16);
+      for (int k = 0; k < 32; ++k) { int c2 = (q[k] >> (2 * jj)) & 3, hb1 = (hm[k] >> j) & 1; lo[quant_slot(k)] = uint8_t(c2); hi[quant_slot(k)] = uint8_t(hb1); vals[k] = d * (scales[2 * j + k / 16] - 32) * (c2 - (hb1 ? 0 : 4)); }
+      packBits(lo, 2, p0); packBits(hi, 1, p1); return; }
+    case Q80: { uint16_t d16; memcpy(&d16, blk, 2); const int8_t *qs = (const int8_t *)(blk + 2); for (int k = 0; k < 32; ++k) { vals[k] = h2f(d16) * qs[k]; lo[quant_slot(k)] = uint8_t(qs[k]); }
+      packBits(lo, 8, p0); return; }
     default: { const uint8_t *qs = blk + 2 + 8 * j, *qh = blk + 66, *signs = blk + 74 + 4 * j, *scales = blk + 106; uint16_t d16; memcpy(&d16, blk, 2);
       const uint32_t sc = (scales[j / 2] >> (4 * (j % 2))) & 0xf; const float db = h2f(d16) * (1 + 2 * sc);
       for (int l = 0; l < 4; ++l) { const uint8_t *g1 = (const uint8_t *)(iq3s_grid + (qs[2 * l] | ((qh[j] << (8 - 2 * l)) & 256))), *g2 = (const uint8_t *)(iq3s_grid + (qs[2 * l + 1] | ((qh[j] << (7 - 2 * l)) & 256)));
         for (int k = 0; k < 4; ++k) { vals[8 * l + k] = db * g1[k] * ((signs[l] & (1 << k)) ? -1.f : 1.f); vals[8 * l + 4 + k] = db * g2[k] * ((signs[l] & (1 << (4 + k))) ? -1.f : 1.f); } }
-      memcpy(p0, qs, 8); memcpy(p0 + 8, signs, 4); p0[12] = qh[j]; p0[13] = (uint8_t)sc; p0[14] = p0[15] = 0; return; }
+      // word c: grid indices of elements 4c.. and 16+4c.. (qs[c], qs[4 + c]), chunk c's signs, their ninth bits, the scale
+      for (int k = 0; k < 32; ++k) hi[quant_slot(k)] = (signs[k / 8] >> (k % 8)) & 1;
+      uint8_t sign[4]; packBits(hi, 1, sign);
+      for (int c = 0; c < 4; ++c) { const uint32_t v = qs[c] | uint32_t(qs[4 + c]) << 8 | uint32_t(sign[c]) << 16 | ((qh[j] >> c) & 1u) << 24 | ((qh[j] >> (4 + c)) & 1u) << 25 | sc << 26; memcpy(p0 + 4 * c, &v, 4); }
+      return; }
   }
 }
 static void metaPack(Fmt f, const uint8_t *row, uint32_t unit, uint8_t *dst) {
@@ -137,32 +143,31 @@ static void metaPack(Fmt f, const uint8_t *row, uint32_t unit, uint8_t *dst) {
     case Q3K: memcpy(dst, blk + 108, 2); dst[2] = dst[3] = 0; memcpy(dst + 4, blk + 96, 12); break; default: break; }
 }
 struct Packed { std::vector<uint8_t> w0, w1, meta; };
-static Packed repack(Fmt f, bool interleave, const std::vector<uint8_t> &native, uint32_t N, uint32_t K, std::vector<float> *Wf, std::vector<float> *Ws = nullptr) {
+static Packed repack(Fmt f, const std::vector<uint8_t> &native, uint32_t N, uint32_t K, std::vector<float> *Wf, std::vector<float> *Ws = nullptr) {
   const QuantFormat &fi = kQuantFormats[f]; const uint32_t G = K / 32, rb = rowBytes(f, K), units = G / fi.meta_groups;
   Packed p; p.w0.assign((size_t)N * G * fi.plane0_bytes, 0); p.w1.assign(fi.plane1_bytes ? (size_t)N * G * fi.plane1_bytes : 16, 0); p.meta.assign((size_t)N * units * fi.meta_bytes, 0); if (Wf) Wf->assign((size_t)N * K, 0.f); if (Ws) Ws->assign((size_t)N * K, 0.f);
-  for (uint32_t n = 0; n < N; ++n) { const uint8_t *row = native.data() + (size_t)n * rb; const uint32_t tile = n / 256, c = n % 256;
-    for (uint32_t g = 0; g < G; ++g) { float vals[32]; uint8_t p0[32], p1[8]; groupPack(f, interleave, row, g, vals, p0, p1);
-      memcpy(p.w0.data() + (((size_t)tile * G + g) * 256 + c) * fi.plane0_bytes, p0, fi.plane0_bytes); if (fi.plane1_bytes) memcpy(p.w1.data() + (((size_t)tile * G + g) * 256 + c) * fi.plane1_bytes, p1, fi.plane1_bytes);
+  for (uint32_t n = 0; n < N; ++n) { const uint8_t *row = native.data() + (size_t)n * rb;
+    for (uint32_t g = 0; g < G; ++g) { float vals[32]; uint8_t p0[32], p1[8]; groupPack(f, row, g, vals, p0, p1);
+      memcpy(p.w0.data() + quant_tile_index(n, g, G) * fi.plane0_bytes, p0, fi.plane0_bytes); if (fi.plane1_bytes) memcpy(p.w1.data() + quant_tile_index(n, g, G) * fi.plane1_bytes, p1, fi.plane1_bytes);
       if (Wf) for (int k = 0; k < 32; ++k) (*Wf)[(size_t)n * K + g * 32 + k] = vals[k];
       if (Ws) for (int k = 0; k < 32; ++k) (*Ws)[(size_t)n * K + g * 32 + k] = h2f(f2h(vals[k])); }
-    for (uint32_t u = 0; u < units; ++u) metaPack(f, row, u, p.meta.data() + (((size_t)tile * units + u) * 256 + c) * fi.meta_bytes); }
+    for (uint32_t u = 0; u < units; ++u) metaPack(f, row, u, p.meta.data() + quant_tile_index(n, u, units) * fi.meta_bytes); }
   return p;
 }
 static id<MTLBuffer> upload(const std::vector<uint8_t> &v) { id<MTLBuffer> b = mkbuf(v.size()); memcpy(b.contents, v.data(), v.size()); return b; }
 // harness_prod: validate the production kernels (gguf_linear.metal ABI) from a compiled .metallib against the C++ reference.
 //   harness_prod <splash.metallib>
-struct Seg { Fmt fmt; bool interleave; uint32_t N; uint32_t colOffset; id<MTLBuffer> w0, w1, meta; std::vector<float> Wf, Ws; };
-static const bool kProdInterleave[FMT_COUNT] = {true, false, true, true, true, true, true, true};
+struct Seg { Fmt fmt; uint32_t N; uint32_t colOffset; id<MTLBuffer> w0, w1, meta; std::vector<float> Wf, Ws; };
 static Seg makeSegK(Fmt f, uint32_t N, uint32_t K, uint32_t colOffset);
 static Seg makeSeg(Fmt f, uint32_t N, uint32_t K, uint32_t colOffset) {
-  Seg s; s.fmt = f; s.interleave = kProdInterleave[f]; s.N = N; s.colOffset = colOffset;
-  std::vector<uint8_t> native = makeNative(f, N, K); Packed pk = repack(f, s.interleave, native, N, K, &s.Wf, &s.Ws);
+  Seg s; s.fmt = f; s.N = N; s.colOffset = colOffset;
+  std::vector<uint8_t> native = makeNative(f, N, K); Packed pk = repack(f, native, N, K, &s.Wf, &s.Ws);
   verifyNativeReference(f, native, s.Wf);
   s.w0 = upload(pk.w0); s.w1 = upload(pk.w1); s.meta = upload(pk.meta); if (!kQuantFormats[f].plane1_bytes) s.w1 = s.meta; return s;
 }
 static Seg makeSegK(Fmt f, uint32_t N, uint32_t K, uint32_t colOffset) {   // no float reference (large shapes)
-  Seg s; s.fmt = f; s.interleave = kProdInterleave[f]; s.N = N; s.colOffset = colOffset;
-  std::vector<uint8_t> native = makeNative(f, N, K); Packed pk = repack(f, s.interleave, native, N, K, nullptr);
+  Seg s; s.fmt = f; s.N = N; s.colOffset = colOffset;
+  std::vector<uint8_t> native = makeNative(f, N, K); Packed pk = repack(f, native, N, K, nullptr);
   s.w0 = upload(pk.w0); s.w1 = upload(pk.w1); s.meta = upload(pk.meta); if (!kQuantFormats[f].plane1_bytes) s.w1 = s.meta; return s;
 }
 int main(int argc, char **argv) { @autoreleasepool {
