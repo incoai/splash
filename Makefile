@@ -96,7 +96,7 @@ _install-environment:
 		bootstrap=; \
 		for candidate in $(PYTHON_CANDIDATES); do \
 			command -v "$$candidate" >/dev/null 2>&1 || continue; \
-			base=$$("$$candidate" -c 'import sys; print(getattr(sys, "_base_executable", sys.executable))') \
+			base=$$("$$candidate" -c 'import os, sys; print(os.path.realpath(getattr(sys, "_base_executable", sys.executable)))') \
 				|| continue; \
 			"$$base" -c 'import sys; raise SystemExit(not ((3, 12) <= sys.version_info[:2] < (3, 15)))' \
 				>/dev/null 2>&1 || continue; \
