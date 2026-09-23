@@ -293,23 +293,72 @@ void splitVisibility(metal::MetalBackend &backend,
 const char *prepareKernel(LinearInput layout) {
   return layout == LinearInput::Table16 ? "decode_linear_gguf_prepare" : "decode_linear_q4_prepare";
 }
-void fusedNorm(metal::MetalBackend &backend, uint32_t k, uint32_t rows, LinearInput layout) {
+// Rows of widely spread values and a norm's weights, bf16 or F32 as a GGUF
+// stores them; the F32 weights carry bits a bf16 rounding would drop.
+struct NormCase {
+  metal::MetalBuffer input;
+  NormWeights weight;
+  std::vector<double> weights;  // the values the kernels read
+};
+NormCase normCase(metal::MetalBackend &backend, uint32_t k, uint32_t rows, bool float32) {
+  NormCase c{backend.allocateBuffer(k*rows*2), {backend.allocateBuffer(k*(float32?4:2)), float32},
+             std::vector<double>(k)};
+  auto *x=static_cast<uint16_t *>(c.input.contents());
+  for (uint32_t i=0;i<k*rows;++i) x[i]=floatToBf16(float(int(hash(i)%257)-128)*8192);
+  for (uint32_t i=0;i<k;++i) {
+    const float value=float(int(i%17)-8)/4;
+    if (float32) {
+      const float exact=value*(1+float(hash(i)%4093)/65536);
+      static_cast<float *>(c.weight.buffer.contents())[i]=exact;
+      c.weights[i]=exact;
+    } else {
+      static_cast<uint16_t *>(c.weight.buffer.contents())[i]=floatToBf16(value);
+      c.weights[i]=bf16ToFloat(floatToBf16(value));
+    }
+  }
+  return c;
+}
+// Every output is the fp64 norm rounded once to bf16, up to the fp32
+// arithmetic's noise (well below 2^-8 of half an ulp): weights rounded to
+// bf16 anywhere on the way would miss the bound on about a quarter of them.
+void requireNorm(const NormCase &c, const metal::MetalBuffer &output, uint32_t k, uint32_t rows,
+                 const char *what) {
+  const auto *x=static_cast<const uint16_t *>(c.input.contents());
+  const auto *out=static_cast<const uint16_t *>(output.contents());
+  for (uint32_t r=0;r<rows;++r) {
+    double squares=0;
+    for (uint32_t i=0;i<k;++i) squares+=double(bf16ToFloat(x[r*k+i]))*bf16ToFloat(x[r*k+i]);
+    const double inverse=1/std::sqrt(squares/k+1e-6);
+    for (uint32_t i=0;i<k;++i) {
+      const double exact=bf16ToFloat(x[r*k+i])*inverse*c.weights[i];
+      require(std::fabs(bf16ToFloat(out[r*k+i])-exact)<=0.5*ulpBf16(float(exact))*(1+1.0/256),what);
+    }
+  }
+}
+void fusedNorm(metal::MetalBackend &backend, uint32_t k, uint32_t rows, LinearInput layout, bool float32) {
   const uint64_t sumsBytes = tableSumsBytes(layout, k, rows);
-  auto input=backend.allocateBuffer(k*rows*2), weight=backend.allocateBuffer(k*2);
+  const NormCase c=normCase(backend,k,rows,float32);
   auto output=backend.allocateBuffer(k*rows*2), fused=backend.allocateBuffer(k*rows*2);
   auto a=backend.allocateBuffer(tableBytes(k,rows)), b=backend.allocateBuffer(tableBytes(k,rows));
   auto sa=backend.allocateBuffer(sumsBytes), sb=backend.allocateBuffer(sumsBytes);
-  auto *x=static_cast<uint16_t *>(input.contents()), *w=static_cast<uint16_t *>(weight.contents());
-  for (uint32_t i=0;i<k*rows;++i) x[i]=floatToBf16(float(int(hash(i)%257)-128)*8192);
-  for (uint32_t i=0;i<k;++i) w[i]=floatToBf16(float(int(i%17)-8)/4);
   metal::CommandGraph graph;
-  Normalization::addRms(graph,input,weight,output,k,rows);
+  Normalization::addRms(graph,c.input,c.weight,output,k,rows);
   graph.add(prepareKernel(layout),{output,a,sa},k,{k/32,rows/8,1},{128,1,1});
-  Normalization::addRms(graph,input,weight,fused,k,rows,{b,sb,{},{}},layout);
+  Normalization::addRms(graph,c.input,c.weight,fused,k,rows,{b,sb,{},{}},layout);
   (void)backend.submitCommand(graph.dispatches());
+  requireNorm(c,output,k,rows,"norm differs from the fp64 reference");
   require(!std::memcmp(output.contents(),fused.contents(),k*rows*2),"fused norm changed bf16 output");
   require(!std::memcmp(a.contents(),b.contents(),tableBytes(k,rows)),"fused operand permutation mismatch");
   require(!std::memcmp(sa.contents(),sb.contents(),sumsBytes),"fused input sums mismatch");
+}
+// The packed prefill's norm, whose rows need not fill its 32-row sum tiles.
+void prefillNorm(metal::MetalBackend &backend, uint32_t k, uint32_t rows, bool float32) {
+  const NormCase c=normCase(backend,k,rows,float32);
+  auto output=backend.allocateBuffer(k*rows*2), sums=backend.allocateBuffer((rows+31)/32*32*(k/64)*4);
+  metal::CommandGraph graph;
+  Normalization::addRmsWithQ4Sums(graph,c.input,c.weight,output,sums,k,rows);
+  (void)backend.submitCommand(graph.dispatches());
+  requireNorm(c,output,k,rows,"prefill norm differs from the fp64 reference");
 }
 void fusedAttentionGate(metal::MetalBackend &backend, uint32_t heads, uint32_t kvHeads, uint32_t lanes,
                         LinearInput layout) {
@@ -361,9 +410,13 @@ int main(int argc,char **argv) {
           for (uint32_t fixture=0;fixture<4;++fixture)
             for (uint32_t rows : {8U,16U,24U,32U}) { runCase(backend,n,k,splits,e,fixture,rows); ++cases; }
       }
-    for (LinearInput layout : {LinearInput::Table64, LinearInput::Table16})
-      for (uint32_t width : {64U, 320U, 2048U, 5120U, 17408U})
-        for (uint32_t rows : {8U,16U,24U,32U}) fusedNorm(backend, width, rows, layout);
+    for (bool float32 : {false, true}) {
+      for (LinearInput layout : {LinearInput::Table64, LinearInput::Table16})
+        for (uint32_t width : {64U, 320U, 2048U, 5120U, 17408U})
+          for (uint32_t rows : {8U,16U,24U,32U}) fusedNorm(backend, width, rows, layout, float32);
+      for (uint32_t width : {64U, 5120U, 17408U})
+        for (uint32_t rows : {1U,37U,64U}) prefillNorm(backend, width, rows, float32);
+    }
     // 27B out_proj then down, and gdn_in then gate/up: K 6144, 17408 and 5120.
     for (uint32_t lanes : {1U, 4U}) {
       splitVisibility(backend, {{{{5120, 6144}, LinearEpilogue::Residual}, {{5120, 17408}, LinearEpilogue::Residual}}}, lanes);
@@ -371,6 +424,6 @@ int main(int argc,char **argv) {
     }
     std::cout << "Q4 simdgroup: PASS cases=" << cases
               << " (fp64, range, cancellation, guards, repeated dispatch, fused norm and attention gate in both"
-                 " table layouts, shared split scratch)\n";
+                 " table layouts, norms with bf16 and F32 weights, shared split scratch)\n";
   } catch (const std::exception &e) { std::cerr << "Q4 simdgroup: FAIL: " << e.what() << '\n'; return 1; }
 }

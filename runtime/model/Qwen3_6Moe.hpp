@@ -76,16 +76,16 @@ struct Qwen3_6MoeLayout final {
 };
 
 struct Qwen3_6MoeLayerWeights final {
-  metal::MetalBuffer inputNorm;
+  ops::NormWeights inputNorm;
   QwenMixerWeights mixer;
-  metal::MetalBuffer postAttentionNorm;
+  ops::NormWeights postAttentionNorm;
   ops::MoeWeights ffn;
 };
 
 struct Qwen3_6MoeWeights final {
   Qwen3_6MoeLayout layout;
   std::vector<Qwen3_6MoeLayerWeights> layers;
-  metal::MetalBuffer finalNorm;
+  ops::NormWeights finalNorm;
   ops::Q4Projection logitsProjection;
   ops::Q4Projection tokenEmbedding;
   std::vector<WeightFileRecord> files;

@@ -2,10 +2,12 @@
 
 #include "metal/abi/KernelABI.h"
 
-template <uint QHeads, uint KHeads>
+// q_norm and k_norm are read in their stored type W: bfloat in the packed
+// formats, float for a GGUF's F32 norms.
+template <uint QHeads, uint KHeads, class W>
 inline void full_qkv_storage_phase(
-    device const bfloat *qkv, device const bfloat *q_norm,
-    device const bfloat *k_norm, device const float *rope_cos,
+    device const bfloat *qkv, device const W *q_norm,
+    device const W *k_norm, device const float *rope_cos,
     device const float *rope_sin, device bfloat *queries,
     device bfloat *key_cache, device bfloat *value_cache,
     FullPrefillParams params, threadgroup float *reductions,
@@ -25,7 +27,7 @@ inline void full_qkv_storage_phase(
   device const bfloat *source =
       query ? qkv + ulong(row) * PackedStride + head_index * QStride
             : qkv + ulong(row) * PackedStride + QWidth + head_index * HeadDim;
-  device const bfloat *weight = query ? q_norm : k_norm;
+  device const W *weight = query ? q_norm : k_norm;
   uint kv_head = head_index / (QHeads / KHeads);
   uint local_head = head_index % (QHeads / KHeads);
   device bfloat *destination =

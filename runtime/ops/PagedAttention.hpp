@@ -5,6 +5,7 @@
 #include "metal/abi/PagedAttention.h"
 #include "ops/PagedKv.hpp"
 #include "ops/Linear.hpp"
+#include "ops/Normalization.hpp"
 
 #include <algorithm>
 #include <array>
@@ -286,7 +287,7 @@ public:
 
   static void
   addPrefillProjection(metal::CommandGraph &graph, metal::MetalBuffer packed,
-                       metal::MetalBuffer queryNorm, metal::MetalBuffer keyNorm,
+                       const NormWeights &queryNorm, const NormWeights &keyNorm,
                        metal::MetalBuffer ropeCos, metal::MetalBuffer ropeSin,
                        metal::MetalBuffer queries, metal::MetalBuffer chunkKeys,
                        metal::MetalBuffer chunkValues, uint32_t tokens,
@@ -300,7 +301,7 @@ public:
                              uint32_t queryHeads, kv::Q8Layout layout);
   static void
   addVerifyProjection(metal::CommandGraph &graph, metal::MetalBuffer packed,
-                      metal::MetalBuffer queryNorm, metal::MetalBuffer keyNorm,
+                      const NormWeights &queryNorm, const NormWeights &keyNorm,
                       metal::MetalBuffer ropeCos, metal::MetalBuffer ropeSin,
                       metal::MetalBuffer queries, metal::MetalBuffer chunkKeys,
                       metal::MetalBuffer chunkValues, uint32_t rowsPerLane,

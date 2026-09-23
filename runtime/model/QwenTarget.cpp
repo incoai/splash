@@ -120,10 +120,10 @@ QwenMixerWeights readQwenMixer(WeightFile &file, metal::MetalBackend &backend,
                           {"attn-q", "attn-k", "attn-v"})
         : readQ4Projection(file, backend, geometry.packedAttentionWidth,
                            geometry.hiddenSize, "attention-input");
-    const uint64_t headNormBytes = checkedWeightMultiply(
-        geometry.attentionHeadDimension, kBFloat16Bytes, "head norm bytes");
-    attention.queryNorm = file.section(headNormBytes, "query-norm");
-    attention.keyNorm = file.section(headNormBytes, "key-norm");
+    attention.queryNorm =
+        readNorm(file, geometry.attentionHeadDimension, ggufTarget, "query-norm");
+    attention.keyNorm =
+        readNorm(file, geometry.attentionHeadDimension, ggufTarget, "key-norm");
     attention.outputProjection = ggufTarget
         ? readGgufProjection(file, "attn-output")
         : readQ4Projection(file, backend, geometry.hiddenSize,
@@ -150,10 +150,7 @@ QwenMixerWeights readQwenMixer(WeightFile &file, metal::MetalBackend &backend,
       checkedWeightMultiply(geometry.gdnValueHeads, kBFloat16Bytes,
                             "GDN time bias bytes"),
       "gdn-time-bias");
-  gdn.mixerNorm = file.section(
-      checkedWeightMultiply(geometry.gdnHeadDimension, kBFloat16Bytes,
-                            "GDN norm bytes"),
-      "gdn-norm");
+  gdn.mixerNorm = readNorm(file, geometry.gdnHeadDimension, ggufTarget, "gdn-norm");
   if (ggufTarget) {
     // The GGUF keeps out_proj's input columns in llama.cpp's tiled value-head
     // order, so the GDN writes its output in that order.
@@ -618,7 +615,7 @@ void QwenTarget::addHead(metal::CommandGraph &graph,
       normalizedRows > ExecutionLimits::targetVerifyRows) {
     throw std::invalid_argument("invalid Qwen head row count");
   }
-  const metal::MetalBuffer norm = std::visit(
+  const ops::NormWeights norm = std::visit(
       [](const auto *weights) { return weights->finalNorm; }, weights_);
   ops::Normalization::addRms(graph, std::move(hidden), norm, finalHidden,
                              geometry_.hiddenSize, normalizedRows);

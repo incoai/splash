@@ -29,6 +29,7 @@ using splash::ops::GDN;
 using splash::ops::GdnHeadOrder;
 using splash::ops::GdnPrefillBuffers;
 using splash::ops::GdnShape;
+using splash::ops::NormWeights;
 
 constexpr uint32_t kHeadDim = 128;
 constexpr double kEpsilon = 1e-6;
@@ -109,7 +110,7 @@ GdnPrefillBuffers prefillBuffers(MetalBackend &backend, const GdnShape &shape,
                                  MetalBuffer recurrentIn,
                                  MetalBuffer convolutionWeights,
                                  MetalBuffer decayWeights,
-                                 MetalBuffer timeBias, MetalBuffer mixerNorm) {
+                                 MetalBuffer timeBias, NormWeights mixerNorm) {
   const uint32_t convDim = shape.convolutionDimension;
   const uint32_t keyWidth = shape.keyHeads * kHeadDim;
   const uint32_t valueWidth = shape.valueHeads * kHeadDim;
@@ -133,8 +134,9 @@ GdnPrefillBuffers prefillBuffers(MetalBackend &backend, const GdnShape &shape,
           shared(backend, uint64_t{tokens} * valueWidth * 2, "hidden")};
 }
 
+// The mixer norm is bf16, or F32 as a GGUF stores it.
 GdnPrefillBuffers randomPrefill(MetalBackend &backend, const GdnShape &shape,
-                                uint32_t tokens) {
+                                uint32_t tokens, bool float32 = false) {
   const uint32_t valueHeads = shape.valueHeads;
   const uint32_t convDim = shape.convolutionDimension;
   const uint32_t packedWidth = shape.packedWidth;
@@ -147,7 +149,7 @@ GdnPrefillBuffers randomPrefill(MetalBackend &backend, const GdnShape &shape,
       shared(backend, uint64_t{convDim} * 4 * 2, "conv weights"),
       shared(backend, valueHeads * 4, "a scale"),
       shared(backend, valueHeads * 2, "dt bias"),
-      shared(backend, kHeadDim * 2, "mixer norm"));
+      {shared(backend, kHeadDim * (float32 ? 4 : 2), "mixer norm"), float32});
 
   Random random(0x9E3779B97F4A7C15ULL ^ (uint64_t{valueHeads} << 32) ^ tokens);
   auto *packed = data<uint16_t>(buffers.packed);
@@ -171,10 +173,19 @@ GdnPrefillBuffers randomPrefill(MetalBackend &backend, const GdnShape &shape,
   auto *stateIn = data<float>(buffers.recurrentIn);
   for (uint64_t i = 0; i < stateElements; ++i)
     stateIn[i] = 0.05F * random.gauss();
-  auto *mixerNorm = data<uint16_t>(buffers.mixerNorm);
-  for (uint32_t i = 0; i < kHeadDim; ++i)
-    mixerNorm[i] = toBf16(1.0 + 0.2 * random.gauss());
+  for (uint32_t i = 0; i < kHeadDim; ++i) {
+    const double weight = 1.0 + 0.2 * random.gauss();
+    if (float32)
+      data<float>(buffers.mixerNorm.buffer)[i] = static_cast<float>(weight);
+    else
+      data<uint16_t>(buffers.mixerNorm.buffer)[i] = toBf16(weight);
+  }
   return buffers;
+}
+
+double normWeight(const NormWeights &norm, uint32_t index) {
+  return norm.float32 ? data<float>(norm.buffer)[index]
+                      : fromBf16(data<uint16_t>(norm.buffer)[index]);
 }
 
 void submitPrefill(MetalBackend &backend, const GdnPrefillBuffers &buffers,
@@ -188,7 +199,8 @@ void submitPrefill(MetalBackend &backend, const GdnPrefillBuffers &buffers,
   (void)backend.submitCommand(graph.dispatches());
 }
 
-void runCase(MetalBackend &backend, const GdnShape &shape, uint32_t tokens) {
+void runCase(MetalBackend &backend, const GdnShape &shape, uint32_t tokens,
+             bool float32 = false) {
   const uint32_t keyHeads = shape.keyHeads, valueHeads = shape.valueHeads;
   const uint32_t convDim = shape.convolutionDimension;
   const uint32_t packedWidth = shape.packedWidth;
@@ -197,16 +209,16 @@ void runCase(MetalBackend &backend, const GdnShape &shape, uint32_t tokens) {
   const uint32_t headsPerKey = valueHeads / keyHeads;
   const uint32_t bOffset = convDim + valueWidth, aOffset = bOffset + valueHeads;
   const std::string label = "vh" + std::to_string(valueHeads) + " tokens=" +
-                            std::to_string(tokens) + ": ";
+                            std::to_string(tokens) +
+                            (float32 ? " f32 norm: " : ": ");
 
-  GdnPrefillBuffers buffers = randomPrefill(backend, shape, tokens);
+  GdnPrefillBuffers buffers = randomPrefill(backend, shape, tokens, float32);
   const auto *packed = data<uint16_t>(buffers.packed);
   const auto *convWeights = data<uint16_t>(buffers.convolutionWeights);
   const auto *convIn = data<uint16_t>(buffers.convolutionIn);
   const auto *aScale = data<float>(buffers.decayWeights);
   const auto *dtBias = data<uint16_t>(buffers.timeBias);
   const auto *stateIn = data<float>(buffers.recurrentIn);
-  const auto *mixerNorm = data<uint16_t>(buffers.mixerNorm);
   submitPrefill(backend, buffers, shape, tokens, label);
 
   // Prepare pass: convolution + SiLU per channel, q/k RMS normalisation.
@@ -351,9 +363,13 @@ void runCase(MetalBackend &backend, const GdnShape &shape, uint32_t tokens) {
           label + "recurrent state differs from the fp64 reference by " +
               std::to_string(worstState.error));
 
-  // Gated output norm from the GPU's recurrent rows.
+  // Gated output norm from the GPU's recurrent rows. Almost every output is
+  // the reference's own double rounding; the rest are rounding ties the
+  // kernel's fp32 math breaks the other way. Norm weights rounded to bf16
+  // would move a large fraction of them.
   const auto *hidden = data<uint16_t>(buffers.hidden);
   double hiddenUlps = 0.0;
+  uint64_t hiddenInexact = 0;
   for (uint32_t token = 0; token < tokens; ++token) {
     for (uint32_t head = 0; head < valueHeads; ++head) {
       const uint64_t base = (uint64_t{token} * valueHeads + head) * kHeadDim;
@@ -367,21 +383,28 @@ void runCase(MetalBackend &backend, const GdnShape &shape, uint32_t tokens) {
         const double z = fromBf16(packed[uint64_t{token} * packedWidth + convDim +
                                          head * kHeadDim + dim]);
         const double ref = roundBf16(
-            roundBf16(row[dim] * inverse * fromBf16(mixerNorm[dim])) * silu(z));
+            roundBf16(row[dim] * inverse * normWeight(buffers.mixerNorm, dim)) *
+            silu(z));
         const double got = fromBf16(hidden[base + dim]);
         require(std::isfinite(got), label + "gated output is not finite");
         hiddenUlps = std::max(hiddenUlps, std::fabs(got - ref) / bf16Ulp(ref));
+        hiddenInexact += got != ref;
       }
     }
   }
   require(hiddenUlps <= 2.0, label + "gated output is off by " +
                                  std::to_string(hiddenUlps) + " bf16 ulps");
+  const double inexact =
+      double(hiddenInexact) / (uint64_t{tokens} * valueWidth);
+  require(inexact <= 0.01, label + "gated output differs from the reference in " +
+                               std::to_string(inexact * 100) + "% of values");
 
   std::cout << label << "prepare " << prepareUlps << " ulps (max|err| "
             << worstPrepare.error << "), beta max|err| " << worstBeta.error
             << ", decay max|err| " << worstDecay.error << ", rows " << rowUlps
             << " ulps (max|err| " << worstRows.error << "), state max|err| "
-            << worstState.error << ", hidden " << hiddenUlps << " ulps\n";
+            << worstState.error << ", hidden " << hiddenUlps << " ulps ("
+            << inexact * 100 << "% inexact)\n";
 }
 
 void requireSameBytes(const MetalBuffer &got, const MetalBuffer &want,
@@ -489,6 +512,8 @@ void run(const std::string &metallib) {
        {GdnShape{16, 48, 128, 10240, 16640}, GdnShape{16, 32, 128, 8192, 12544}}) {
     for (uint32_t tokens : {1u, 37u, 1000u, 2048u})
       runCase(backend, shape, tokens);
+    for (uint32_t tokens : {1u, 37u})
+      runCase(backend, shape, tokens, true);
     runSplitCase(backend, shape, 2048, 1000);
     runSplitCase(backend, shape, 37, 17);
     for (uint32_t tokens : {1u, 37u, 1000u})

@@ -2,6 +2,7 @@
 
 #include "metal/MetalBackend.hpp"
 #include "ops/Linear.hpp"
+#include "ops/Normalization.hpp"
 
 #include <cstdint>
 #include <filesystem>
@@ -71,6 +72,11 @@ void validateQ4Layout(uint32_t outputSize, uint32_t inputSize);
 readQ4Projection(WeightFile &file, metal::MetalBackend &backend,
                  uint32_t outputSize, uint32_t inputSize,
                  std::string_view label);
+
+// A norm of `width` multipliers: F32 when `float32` (a GGUF image keeps its
+// norms as the GGUF stores them), bf16 otherwise.
+[[nodiscard]] ops::NormWeights readNorm(WeightFile &file, uint32_t width,
+                                        bool float32, std::string_view label);
 
 // GGUF GGUF sections: a 64-byte descriptor, then plane0, optional plane1
 // and metadata, each 16 KiB aligned (layout in model/GgufImage.hpp).

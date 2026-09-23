@@ -1,6 +1,10 @@
 #include "metal/abi/KernelABI.h"
 #include "metal/kernels/common/gguf_sgmatrix.h"
 
+// Every norm reads its weights in their stored type W: bfloat in the packed
+// formats, float for a GGUF's F32 norms (the _f32 entry points). Both widen to
+// fp32 exactly, so W changes only the loads.
+//
 // Decode norms hold their row in registers, kNormChunk columns at a time:
 // 256 threads of kNormColumns columns each, one chunk for every hidden size
 // in use. The first chunk's input and weight loads are all issued before the
@@ -13,11 +17,12 @@ constant constexpr uint kNormThreads = 256;
 constant constexpr uint kNormChunk = kNormThreads * kNormColumns;
 
 // Columns begin + tid + 256 i of a row, zero past its end.
-inline void load_norm_chunk(device const bfloat *row, uint width, uint begin,
-                            uint tid, thread bfloat (&x)[kNormColumns]) {
+template <class T>
+inline void load_norm_chunk(device const T *row, uint width, uint begin,
+                            uint tid, thread T (&x)[kNormColumns]) {
   for (uint i = 0; i < kNormColumns; ++i) {
     const uint column = begin + tid + kNormThreads * i;
-    x[i] = column < width ? row[column] : bfloat(0.0f);
+    x[i] = column < width ? row[column] : T(0.0f);
   }
 }
 
@@ -58,18 +63,15 @@ inline float rms_inverse_of(thread const bfloat (&first)[kNormColumns],
   return reductions[0];
 }
 
-kernel void norm_rms(device const bfloat *input [[buffer(0)]],
-                        device const bfloat *weight [[buffer(1)]],
-                        device bfloat *output [[buffer(2)]],
-                        constant uint &width [[buffer(3)]],
-                        uint row [[threadgroup_position_in_grid]],
-                        uint thread_index [[thread_index_in_threadgroup]],
-                        uint lane [[thread_index_in_simdgroup]],
-                        uint simd_group [[simdgroup_index_in_threadgroup]]) {
+template <class W>
+inline void norm_rms_row(device const bfloat *input, device const W *weight,
+                         device bfloat *output, uint width, uint row,
+                         uint thread_index, uint lane, uint simd_group,
+                         threadgroup float *reductions) {
 #pragma clang fp reassociate(off)
-  threadgroup float reductions[8];
   device const bfloat *row_input = input + row * width;
-  bfloat x[kNormColumns], w[kNormColumns];
+  bfloat x[kNormColumns];
+  W w[kNormColumns];
   load_norm_chunk(row_input, width, 0, thread_index, x);
   load_norm_chunk(weight, width, 0, thread_index, w);
   const float inverse_rms = rms_inverse_of(x, row_input, width, reductions,
@@ -87,14 +89,26 @@ kernel void norm_rms(device const bfloat *input [[buffer(0)]],
     }
   }
 }
+#define NORM_RMS(Name, W) \
+  kernel void Name(device const bfloat *input [[buffer(0)]], \
+      device const W *weight [[buffer(1)]], device bfloat *output [[buffer(2)]], \
+      constant uint &width [[buffer(3)]], uint row [[threadgroup_position_in_grid]], \
+      uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]], \
+      uint sg [[simdgroup_index_in_threadgroup]]) { \
+    threadgroup float reductions[8]; \
+    norm_rms_row(input, weight, output, width, row, tid, lane, sg, reductions); \
+  }
+NORM_RMS(norm_rms, bfloat)
+NORM_RMS(norm_rms_f32, float)
+#undef NORM_RMS
 
 // Keep the ordinary output for non-matrix consumers, and emit the consumer's
 // matrix operand table (Table: q4sg::Table64 affine, q16sg::Table16 GGUF) from
 // the same rounded bfloat values. No additional dispatch is needed. The table
 // takes a simdgroup per 64-column span, so the first chunk's span pairs are
 // loaded (L2-hot input, weights) alongside the reduction's columns.
-template <class Table>
-inline void norm_rms_table(device const bfloat *input, device const bfloat *weight,
+template <class Table, class W>
+inline void norm_rms_table(device const bfloat *input, device const W *weight,
                            device bfloat *output, device bfloat *table, device float *sums,
                            uint width, uint row, uint tid, uint lane, uint sg,
                            threadgroup float *reductions) {
@@ -103,12 +117,13 @@ inline void norm_rms_table(device const bfloat *input, device const bfloat *weig
   device const bfloat *row_input = input + row * width;
   bfloat x[kNormColumns];
   load_norm_chunk(row_input, width, 0, tid, x);
-  bfloat2 in[Spans], w[Spans];
+  bfloat2 in[Spans];
+  vec<W, 2> w[Spans];
   const auto load_spans = [&](uint begin) {
     for (uint j = 0; j < Spans; ++j) {
       const uint k = begin + (sg + 8 * j) * 64 + lane * 2;
       in[j] = k < width ? bfloat2(row_input[k], row_input[k + 1]) : bfloat2(bfloat(0.0f));
-      w[j] = k < width ? bfloat2(weight[k], weight[k + 1]) : bfloat2(bfloat(0.0f));
+      w[j] = k < width ? vec<W, 2>(weight[k], weight[k + 1]) : vec<W, 2>(W(0.0f));
     }
   };
   load_spans(0);
@@ -130,9 +145,9 @@ inline void norm_rms_table(device const bfloat *input, device const bfloat *weig
     }
   }
 }
-#define NORM_RMS_TABLE(Name, Table) \
+#define NORM_RMS_TABLE(Name, Table, W) \
   kernel void Name(device const bfloat *input [[buffer(0)]], \
-      device const bfloat *weight [[buffer(1)]], device bfloat *output [[buffer(2)]], \
+      device const W *weight [[buffer(1)]], device bfloat *output [[buffer(2)]], \
       device bfloat *table [[buffer(3)]], device float *sums [[buffer(4)]], \
       constant uint &width [[buffer(5)]], uint row [[threadgroup_position_in_grid]], \
       uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]], \
@@ -140,6 +155,8 @@ inline void norm_rms_table(device const bfloat *input, device const bfloat *weig
     threadgroup float reductions[8]; \
     norm_rms_table<Table>(input, weight, output, table, sums, width, row, tid, lane, sg, reductions); \
   }
-NORM_RMS_TABLE(norm_rms_q4_decode, q4sg::Table64)
-NORM_RMS_TABLE(norm_rms_q16_decode, q16sg::Table16)
+NORM_RMS_TABLE(norm_rms_q4_decode, q4sg::Table64, bfloat)
+NORM_RMS_TABLE(norm_rms_q16_decode, q16sg::Table16, bfloat)
+NORM_RMS_TABLE(norm_rms_q4_decode_f32, q4sg::Table64, float)
+NORM_RMS_TABLE(norm_rms_q16_decode_f32, q16sg::Table16, float)
 #undef NORM_RMS_TABLE

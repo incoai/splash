@@ -289,8 +289,6 @@ loadDFlashDraftWeights(metal::MetalBackend &backend,
   DFlashDraftWeights result;
   result.layout = layout;
   result.layers.reserve(layout.layers);
-  const uint64_t hiddenBytes = checkedWeightMultiply(
-      layout.hiddenSize, kBFloat16Bytes, "draft norm bytes");
   const uint64_t convolutionBytes = checkedWeightMultiply(
       checkedWeightMultiply(4, layout.hiddenSize,
                             "draft convolution elements"),
@@ -305,7 +303,7 @@ loadDFlashDraftWeights(metal::MetalBackend &backend,
     WeightFile file(backend, directory / filename, "draft/" + filename,
                     kDFlashLayerMagic, layerIndex, 0);
     DFlashDraftLayerWeights layer;
-    layer.inputNorm = file.section(hiddenBytes, "input-norm");
+    layer.inputNorm = readNorm(file, layout.hiddenSize, false, "input-norm");
     layer.attentionConvolution =
         file.section(convolutionBytes, "attention-convolution");
     layer.attentionDynamic = readQ4Projection(
@@ -319,7 +317,7 @@ loadDFlashDraftWeights(metal::MetalBackend &backend,
         file, backend, layout.hiddenSize, layout.attentionSize,
         "attention-output");
     layer.postAttentionNorm =
-        file.section(hiddenBytes, "post-attention-norm");
+        readNorm(file, layout.hiddenSize, false, "post-attention-norm");
     layer.mlpConvolution = file.section(convolutionBytes, "mlp-convolution");
     layer.mlpDynamic = readQ4Projection(
         file, backend, layout.dynamicSize, layout.hiddenSize, "mlp-dynamic");
@@ -341,8 +339,8 @@ loadDFlashDraftWeights(metal::MetalBackend &backend,
     result.contextProjection = readQ4Projection(
         file, backend, layout.hiddenSize, layout.targetHiddenSize,
         "context-projection");
-    result.hiddenNorm = file.section(hiddenBytes, "hidden-norm");
-    result.finalNorm = file.section(hiddenBytes, "final-norm");
+    result.hiddenNorm = readNorm(file, layout.hiddenSize, false, "hidden-norm");
+    result.finalNorm = readNorm(file, layout.hiddenSize, false, "final-norm");
     result.selectorProjection = readQ4Projection(
         file, backend, layout.selectorRank, layout.hiddenSize, "selector");
     const uint64_t codebookBytes = checkedWeightMultiply(

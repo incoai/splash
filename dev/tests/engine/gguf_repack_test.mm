@@ -1,8 +1,9 @@
 // The GGUF load kernels (gguf_repack, gguf_copy) of the production metallib
 // and the image planner's CPU-built alpha/beta tensor against the CPU
 // reference, and that reference's values against hashes of upstream GGML's
-// dequantization.
-//   gguf-repack --cpu        golden hashes and the alpha/beta tensor
+// dequantization; the planner's norms are the GGUF's F32 values as stored and
+// its bf16 tensors exact conversions.
+//   gguf-repack --cpu        golden hashes, the alpha/beta tensor and the float tensors
 //   gguf-repack <metallib>   also the kernels
 // With SPLASH_GGML_ORACLE=<libggml-base.dylib> the reference is also compared
 // with GGML directly and GGML's hashes are printed; a build of llama.cpp
@@ -232,6 +233,138 @@ void checkAlphaBeta() {
   check(matches, "planner alpha/beta tensor matches the CPU reference");
 }
 
+// Every norm of a GDN layer, a full-attention layer and the head goes into
+// its image as the GGUF stores it: F32 values that bf16 would round. The
+// convolution and time-bias tensors, which the kernels read as bf16, convert
+// when every value is bf16-exact and are refused by name otherwise.
+void checkFloatTensors() {
+  namespace model = splash::model;
+  using namespace model::ggml;
+  model::gguf::TargetGeometry geometry;
+  geometry.layers = 2;
+  geometry.hiddenSize = 512;
+  geometry.vocabularySize = 256;
+  geometry.intermediateSize = 256;
+  geometry.gdnKeyHeads = 4;
+  geometry.gdnValueHeads = 12;
+  geometry.gdnHeadDimension = 64;
+  geometry.convolutionDimension = 1280; // q and k of 4 heads, v of 12
+  geometry.attentionWidth = 512;        // two query heads of 256
+  geometry.fullAttentionPeriod = 2;     // layer 1
+  const uint32_t hidden = geometry.hiddenSize, heads = geometry.gdnValueHeads, head = 256;
+  const uint64_t valueRows = uint64_t{heads} * geometry.gdnHeadDimension;
+  std::mt19937 rng(400);
+  std::uniform_real_distribution<float> spread(0.5f, 2.5f);
+  bool bfloatExact = true;
+  const auto norm = [&](uint64_t elements) {
+    std::vector<uint8_t> bytes(elements * 4);
+    for (uint64_t i = 0; i < elements; ++i) {
+      const float value = spread(rng);
+      uint32_t bits;
+      std::memcpy(&bits, &value, 4);
+      bfloatExact &= (bits & 0xFFFF) == 0;
+      std::memcpy(bytes.data() + i * 4, &value, 4);
+    }
+    return bytes;
+  };
+  // F32 values of a bf16 checkpoint: the low half of every word is zero.
+  const auto bfloatValues = [&](uint64_t elements) {
+    std::vector<uint8_t> bytes(elements * 4);
+    for (uint64_t i = 0; i < elements; ++i) {
+      const float value = spread(rng);
+      uint32_t bits;
+      std::memcpy(&bits, &value, 4);
+      bits &= 0xFFFF0000u;
+      std::memcpy(bytes.data() + i * 4, &bits, 4);
+    }
+    return bytes;
+  };
+  std::vector<Tensor> tensors;
+  auto add = [&](std::string name, std::vector<uint64_t> dims, uint32_t type, std::vector<uint8_t> data = {}) {
+    if (data.empty()) {
+      const model::GgmlTypeTraits &traits = *model::ggmlTypeTraits(type);
+      uint64_t elements = 1;
+      for (uint64_t dim : dims) elements *= dim;
+      data.assign(elements / traits.blockElements * traits.blockBytes, 0);
+    }
+    tensors.push_back({std::move(name), std::move(dims), type, std::move(data)});
+  };
+  const std::vector<std::string> norms{"blk.0.attn_norm.weight", "blk.0.ssm_norm.weight",
+                                       "blk.0.post_attention_norm.weight", "blk.1.attn_norm.weight",
+                                       "blk.1.attn_q_norm.weight", "blk.1.attn_k_norm.weight",
+                                       "blk.1.post_attention_norm.weight", "output_norm.weight"};
+  add(norms[0], {hidden}, kF32, norm(hidden));
+  add("blk.0.attn_qkv.weight", {hidden, geometry.convolutionDimension}, kQ4_K);
+  add("blk.0.attn_gate.weight", {hidden, valueRows}, kQ4_K);
+  add("blk.0.ssm_beta.weight", {hidden, heads}, kQ8_0);
+  add("blk.0.ssm_alpha.weight", {hidden, heads}, kQ8_0);
+  add("blk.0.ssm_conv1d.weight", {4, geometry.convolutionDimension}, kF32,
+      bfloatValues(uint64_t{4} * geometry.convolutionDimension));
+  add("blk.0.ssm_a", {heads}, kF32);
+  add("blk.0.ssm_dt.bias", {heads}, kF32, bfloatValues(heads));
+  add(norms[1], {geometry.gdnHeadDimension}, kF32, norm(geometry.gdnHeadDimension));
+  add("blk.0.ssm_out.weight", {valueRows, hidden}, kQ4_K);
+  add(norms[2], {hidden}, kF32, norm(hidden));
+  add(norms[3], {hidden}, kF32, norm(hidden));
+  add("blk.1.attn_q.weight", {hidden, 2 * geometry.attentionWidth}, kQ4_K);
+  add("blk.1.attn_k.weight", {hidden, head}, kQ4_K);
+  add("blk.1.attn_v.weight", {hidden, head}, kQ4_K);
+  add(norms[4], {head}, kF32, norm(head));
+  add(norms[5], {head}, kF32, norm(head));
+  add("blk.1.attn_output.weight", {geometry.attentionWidth, hidden}, kQ4_K);
+  add(norms[6], {hidden}, kF32, norm(hidden));
+  for (uint32_t layer = 0; layer < 2; ++layer) {
+    const std::string p = "blk." + std::to_string(layer) + ".";
+    add(p + "ffn_gate.weight", {hidden, geometry.intermediateSize}, kQ4_K);
+    add(p + "ffn_up.weight", {hidden, geometry.intermediateSize}, kQ4_K);
+    add(p + "ffn_down.weight", {geometry.intermediateSize, hidden}, kQ4_K);
+  }
+  add(norms[7], {hidden}, kF32, norm(hidden));
+  add("output.weight", {hidden, geometry.vocabularySize}, kQ4_K);
+  add("token_embd.weight", {hidden, geometry.vocabularySize}, kQ4_K);
+
+  char directory[] = "/tmp/splash-gguf-floats-XXXXXX";
+  if (!mkdtemp(directory)) {
+    check(false, "create a temporary directory");
+    return;
+  }
+  const std::filesystem::path path = std::filesystem::path(directory) / "floats.gguf";
+  const auto tensor = [&](std::vector<Tensor> &list, const std::string &name) -> std::vector<uint8_t> & {
+    return std::find_if(list.begin(), list.end(), [&](const Tensor &t) { return t.name == name; })->data;
+  };
+  // Plans every image of the file of `list`; the error, empty if none.
+  const auto plan = [&](const std::vector<Tensor> &list, std::vector<model::gguf::Image> &images) {
+    const std::vector<uint8_t> file = ggufFile(list, geometry.layers, hidden);
+    std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char *>(file.data()), file.size());
+    try {
+      const model::GgufFile gguf(path);
+      const model::gguf::ImagePlanner planner(gguf, geometry);
+      images = {planner.layer(0), planner.layer(1), planner.head()};
+    } catch (const model::GgufError &error) {
+      return std::string(error.what());
+    }
+    return std::string();
+  };
+  std::vector<model::gguf::Image> images;
+  const std::string error = plan(tensors, images);
+  const bool stored = error.empty() && std::all_of(norms.begin(), norms.end(), [&](const std::string &name) {
+    return std::any_of(images.begin(), images.end(), [&](const model::gguf::Image &image) {
+      return std::any_of(image.fills.begin(), image.fills.end(),
+                         [&](const model::gguf::Fill &fill) { return fill.bytes == tensor(tensors, name); });
+    });
+  });
+  if (!error.empty()) std::fprintf(stderr, "%s\n", error.c_str());
+  check(stored && !bfloatExact, "planner keeps every norm's F32 values as stored");
+  for (const char *name : {"blk.0.ssm_conv1d.weight", "blk.0.ssm_dt.bias"}) {
+    std::vector<Tensor> inexact = tensors;
+    const float value = 1.0f + 0x1p-10f;
+    std::memcpy(tensor(inexact, name).data() + 12, &value, 4);
+    check(plan(inexact, images) == std::string(name) + " is not bf16-exact; it needs an F32 path",
+          std::string("planner refuses to round ") + name + " to bf16");
+  }
+  std::filesystem::remove_all(directory);
+}
+
 constexpr uint64_t kSection = 16384; // image section alignment, as the planner lays out images
 constexpr uint32_t kSourceOffset = 96; // tensor data offset inside the mapped source window
 constexpr uint8_t kPoison = 0xA5;
@@ -355,6 +488,7 @@ int main(int argc, char **argv) {
     }
     checkGoldens(ggml);
     checkAlphaBeta();
+    checkFloatTensors();
     if (std::string(argv[1]) != "--cpu") {
       Gpu gpu{MTLCreateSystemDefaultDevice(), nil, nil, nil};
       gpu.queue = [gpu.device newCommandQueue];

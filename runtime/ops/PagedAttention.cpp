@@ -49,6 +49,16 @@ std::string_view pipeline(KernelLayout layout, std::string_view kv4Group6,
   return layout == KernelLayout::Kv4Group6 ? kv4Group6 : kv2Group8;
 }
 
+// One dispatch normalizes both the queries and the keys, so their norms must
+// share a stored type.
+std::string qkNormKernel(std::string_view name, const NormWeights &queryNorm,
+                         const NormWeights &keyNorm, uint32_t headDimension) {
+  std::string kernel = normKernel(name, queryNorm, headDimension);
+  if (normKernel(name, keyNorm, headDimension) != kernel)
+    throw std::invalid_argument("query and key norms differ in type");
+  return kernel;
+}
+
 AttentionWorkspace attentionWorkspace(uint64_t rows, uint32_t headDimension) {
   return {rows * headDimension * sizeof(float), rows * 2 * sizeof(float)};
 }
@@ -243,7 +253,7 @@ AttentionWorkspace PagedAttention::verifyWorkspace(
 
 void PagedAttention::addPrefillProjection(
     metal::CommandGraph &graph, metal::MetalBuffer packed,
-    metal::MetalBuffer queryNorm, metal::MetalBuffer keyNorm,
+    const NormWeights &queryNorm, const NormWeights &keyNorm,
     metal::MetalBuffer ropeCos, metal::MetalBuffer ropeSin,
     metal::MetalBuffer queries, metal::MetalBuffer chunkKeys,
     metal::MetalBuffer chunkValues, uint32_t tokens, uint32_t cacheStride,
@@ -252,9 +262,10 @@ void PagedAttention::addPrefillProjection(
   if (!tokens || !cacheStride || !rowStride)
     throw std::invalid_argument("invalid paged prefill projection geometry");
   const FullPrefillParams params{tokens, cacheStride, rowStride};
-  graph.add(std::string(pipeline(kernel, "prefill_attention_qkv",
-                                 "prefill_attention_qkv_kv2_g8")),
-            {std::move(packed), std::move(queryNorm), std::move(keyNorm),
+  graph.add(qkNormKernel(pipeline(kernel, "prefill_attention_qkv",
+                                  "prefill_attention_qkv_kv2_g8"),
+                         queryNorm, keyNorm, layout.headDimension),
+            {std::move(packed), queryNorm.buffer, keyNorm.buffer,
              std::move(ropeCos), std::move(ropeSin), std::move(queries),
              std::move(chunkKeys), std::move(chunkValues)},
             params,
@@ -278,7 +289,7 @@ void PagedAttention::addPrefillGate(
 
 void PagedAttention::addVerifyProjection(
     metal::CommandGraph &graph, metal::MetalBuffer packed,
-    metal::MetalBuffer queryNorm, metal::MetalBuffer keyNorm,
+    const NormWeights &queryNorm, const NormWeights &keyNorm,
     metal::MetalBuffer ropeCos, metal::MetalBuffer ropeSin,
     metal::MetalBuffer queries, metal::MetalBuffer chunkKeys,
     metal::MetalBuffer chunkValues, uint32_t rowsPerLane,
@@ -290,9 +301,10 @@ void PagedAttention::addVerifyProjection(
     throw std::invalid_argument("invalid paged verify projection geometry");
   const FullDecodeBatchParams params{rowsPerLane, cacheStride, rowStride,
                                      lanes};
-  graph.add(std::string(pipeline(kernel, "verify_attention_qkv",
-                                 "verify_attention_qkv_kv2_g8")),
-            {std::move(packed), std::move(queryNorm), std::move(keyNorm),
+  graph.add(qkNormKernel(pipeline(kernel, "verify_attention_qkv",
+                                  "verify_attention_qkv_kv2_g8"),
+                         queryNorm, keyNorm, layout.headDimension),
+            {std::move(packed), queryNorm.buffer, keyNorm.buffer,
              std::move(ropeCos), std::move(ropeSin), std::move(queries),
              std::move(chunkKeys), std::move(chunkValues)},
             params,

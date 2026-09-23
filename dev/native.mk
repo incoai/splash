@@ -401,7 +401,7 @@ $(TEST_MOE_METAL_TEST): runtime/metal/DeviceCapabilities.cpp \
 		$(ENGINE_LINKFLAGS) -o $@
 
 $(TEST_GDN_METAL_TEST): runtime/metal/DeviceCapabilities.cpp \
-		runtime/metal/MetalBackend.mm runtime/ops/GDN.cpp \
+		runtime/metal/MetalBackend.mm runtime/ops/GDN.cpp runtime/ops/Normalization.cpp \
 		dev/tests/engine/gdn_metal_test.mm $(LIB) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
 		$(ENGINE_LINKFLAGS) -o $@
@@ -468,7 +468,7 @@ tune-kernels: preflight $(TARGET) $(TUNE_KERNELS) $(LIB)
 	$(TUNE_KERNELS) $(LIB) $(MODEL_ROOT) $(TUNE_ARGS)
 
 $(TEST_ATTENTION_PLAN): runtime/metal/DeviceCapabilities.cpp \
-		runtime/metal/MetalBackend.mm runtime/ops/PagedAttention.cpp \
+		runtime/metal/MetalBackend.mm runtime/ops/PagedAttention.cpp runtime/ops/Normalization.cpp \
 		dev/tests/engine/paged_attention_plan_test.mm $(LIB) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
 		$(ENGINE_LINKFLAGS) -o $@
@@ -492,7 +492,7 @@ $(TEST_DRAFT_ATTENTION_TEST): runtime/metal/DeviceCapabilities.cpp \
 		$(ENGINE_LINKFLAGS) -o $@
 
 $(TEST_GDN_DECODE_TEST): runtime/metal/DeviceCapabilities.cpp \
-		runtime/metal/MetalBackend.mm runtime/ops/GDN.cpp \
+		runtime/metal/MetalBackend.mm runtime/ops/GDN.cpp runtime/ops/Normalization.cpp \
 		dev/tests/engine/gdn_decode_metal_test.mm $(LIB) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
 		$(ENGINE_LINKFLAGS) -o $@

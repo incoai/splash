@@ -148,14 +148,14 @@ struct DFlashSelectionBuffers final {
 };
 
 struct DFlashDraftLayerWeights final {
-  metal::MetalBuffer inputNorm;
+  ops::NormWeights inputNorm;
   metal::MetalBuffer attentionConvolution;
   ops::Q4Projection attentionDynamic;
   ops::Q4Projection qkvProjection;
   metal::MetalBuffer queryNorm;
   metal::MetalBuffer keyNorm;
   ops::Q4Projection outputProjection;
-  metal::MetalBuffer postAttentionNorm;
+  ops::NormWeights postAttentionNorm;
   metal::MetalBuffer mlpConvolution;
   ops::Q4Projection mlpDynamic;
   ops::Q4Projection gateProjection;
@@ -167,8 +167,8 @@ struct DFlashDraftWeights final {
   DFlashDraftLayout layout;
   std::vector<DFlashDraftLayerWeights> layers;
   ops::Q4Projection contextProjection;
-  metal::MetalBuffer hiddenNorm;
-  metal::MetalBuffer finalNorm;
+  ops::NormWeights hiddenNorm;
+  ops::NormWeights finalNorm;
   ops::Q4Projection selectorProjection;
   metal::MetalBuffer predecessorCodebook;
   metal::MetalBuffer successorCodebook;

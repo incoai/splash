@@ -23,13 +23,6 @@ uint64_t alignUp(uint64_t value) {
   return (value + kSectionAlignment - 1) / kSectionAlignment * kSectionAlignment;
 }
 
-uint16_t bfloat16(float value) {
-  uint32_t bits;
-  std::memcpy(&bits, &value, sizeof bits);
-  bits = (bits + 0x7FFFu + ((bits >> 16) & 1u)) >> 16;
-  return static_cast<uint16_t>(bits);
-}
-
 void appendLittle32(std::vector<uint8_t> &out, uint32_t value) {
   for (int i = 0; i < 4; ++i) out.push_back(static_cast<uint8_t>(value >> (8 * i)));
 }
@@ -76,13 +69,18 @@ std::vector<T> unreorderRows(std::vector<T> values, uint32_t rowWidth, uint32_t 
   return out;
 }
 
-std::vector<uint8_t> toBfloat16(const std::vector<float> &values) {
+// The GDN kernels read the convolution weights and the time bias as bf16,
+// which holds them exactly when they come from a bf16 checkpoint. Any other
+// value would be rounded silently, so the tensor is refused by name.
+std::vector<uint8_t> exactBfloat16(const std::vector<float> &values, const std::string &name) {
   std::vector<uint8_t> out;
   out.reserve(values.size() * 2);
   for (float value : values) {
-    const uint16_t bits = bfloat16(value);
-    out.push_back(static_cast<uint8_t>(bits));
-    out.push_back(static_cast<uint8_t>(bits >> 8));
+    uint32_t bits;
+    std::memcpy(&bits, &value, sizeof bits);
+    if (bits & 0xFFFFu) throw GgufError(name + " is not bf16-exact; it needs an F32 path");
+    out.push_back(static_cast<uint8_t>(bits >> 16));
+    out.push_back(static_cast<uint8_t>(bits >> 24));
   }
   return out;
 }
@@ -114,10 +112,13 @@ public:
     image_.fills.push_back({offset, std::move(bytes)});
   }
 
-  void bfloatNorm(const char *name, uint64_t elements) {
+  // A norm as stored: F32, which the norm kernels read unrounded, as
+  // llama.cpp does (ops::NormWeights).
+  void floatNorm(const char *name, uint64_t elements) {
     const GgufTensor &tensor = file_.require(name);
     if (tensor.elements() != elements) throw GgufError("unexpected shape for " + tensor.name);
-    fill(toBfloat16(readFloats(file_, tensor)));
+    if (tensor.type != ggml::kF32) throw GgufError("expected an F32 tensor: " + tensor.name);
+    fill(readBytes(file_, tensor));
   }
 
   // Quantized rows [N, K] repacked into planes; rows >= permuteFrom come from
@@ -290,13 +291,13 @@ Image ImagePlanner::layer(uint32_t index) const {
   const std::string p = prefix(index);
   const bool full = g.isFullAttentionLayer(index);
   Builder b(file_, g, "layer-" + std::to_string(index) + ".bin", index, full ? 1u : 0u);
-  b.bfloatNorm((p + "attn_norm.weight").c_str(), g.hiddenSize);
+  b.floatNorm((p + "attn_norm.weight").c_str(), g.hiddenSize);
   if (full) {
     b.quantized(file_.require(p + "attn_q.weight"), 2ull * g.attentionHeadDimension * (g.attentionWidth / g.attentionHeadDimension), g.hiddenSize);
     b.quantized(file_.require(p + "attn_k.weight"), file_.require(p + "attn_k.weight").rows(), g.hiddenSize);
     b.quantized(file_.require(p + "attn_v.weight"), file_.require(p + "attn_v.weight").rows(), g.hiddenSize);
-    b.bfloatNorm((p + "attn_q_norm.weight").c_str(), g.attentionHeadDimension);
-    b.bfloatNorm((p + "attn_k_norm.weight").c_str(), g.attentionHeadDimension);
+    b.floatNorm((p + "attn_q_norm.weight").c_str(), g.attentionHeadDimension);
+    b.floatNorm((p + "attn_k_norm.weight").c_str(), g.attentionHeadDimension);
     b.quantized(file_.require(p + "attn_output.weight"), g.hiddenSize, g.attentionWidth);
   } else {
     const uint32_t valueRows = g.gdnValueHeads * g.gdnHeadDimension;       // 6144
@@ -307,7 +308,8 @@ Image ImagePlanner::layer(uint32_t index) const {
     b.alphaBeta(file_.require(p + "ssm_beta.weight"), file_.require(p + "ssm_alpha.weight"));
     const GgufTensor &conv = file_.require(p + "ssm_conv1d.weight");
     if (conv.elements() != uint64_t{g.convolutionDimension} * 4) throw GgufError("unexpected shape for " + conv.name);
-    b.fill(toBfloat16(unreorderRows(readFloats(file_, conv), 4, keyRows, g.gdnHeadDimension, g.gdnKeyHeads, groups)));
+    b.fill(exactBfloat16(unreorderRows(readFloats(file_, conv), 4, keyRows, g.gdnHeadDimension, g.gdnKeyHeads, groups),
+                         conv.name));
     const GgufTensor &decay = file_.require(p + "ssm_a");
     if (decay.elements() != g.gdnValueHeads) throw GgufError("unexpected shape for " + decay.name);
     std::vector<float> decayValues = unreorderRows(readFloats(file_, decay), 1, 0, 1, g.gdnKeyHeads, groups);
@@ -316,11 +318,11 @@ Image ImagePlanner::layer(uint32_t index) const {
     b.fill(std::move(decayBytes));
     const GgufTensor &timeBias = file_.require(p + "ssm_dt.bias");
     if (timeBias.elements() != g.gdnValueHeads) throw GgufError("unexpected shape for " + timeBias.name);
-    b.fill(toBfloat16(unreorderRows(readFloats(file_, timeBias), 1, 0, 1, g.gdnKeyHeads, groups)));
-    b.bfloatNorm((p + "ssm_norm.weight").c_str(), g.gdnHeadDimension);
+    b.fill(exactBfloat16(unreorderRows(readFloats(file_, timeBias), 1, 0, 1, g.gdnKeyHeads, groups), timeBias.name));
+    b.floatNorm((p + "ssm_norm.weight").c_str(), g.gdnHeadDimension);
     b.quantized(file_.require(p + "ssm_out.weight"), g.hiddenSize, valueRows);
   }
-  b.bfloatNorm((p + "post_attention_norm.weight").c_str(), g.hiddenSize);
+  b.floatNorm((p + "post_attention_norm.weight").c_str(), g.hiddenSize);
   b.quantized(file_.require(p + "ffn_gate.weight"), g.intermediateSize, g.hiddenSize);
   b.quantized(file_.require(p + "ffn_up.weight"), g.intermediateSize, g.hiddenSize);
   b.quantized(file_.require(p + "ffn_down.weight"), g.hiddenSize, g.intermediateSize);
@@ -329,7 +331,7 @@ Image ImagePlanner::layer(uint32_t index) const {
 
 Image ImagePlanner::head() const {
   Builder b(file_, geometry_, "head.bin", geometry_.layers, 2);
-  b.bfloatNorm("output_norm.weight", geometry_.hiddenSize);
+  b.floatNorm("output_norm.weight", geometry_.hiddenSize);
   b.quantized(file_.require("output.weight"), geometry_.vocabularySize, geometry_.hiddenSize);
   return b.finish();
 }

@@ -293,11 +293,13 @@ GDN_PREPARE_PREFILL_ENTRY(prefill_gdn_prepare, 16, 48, 128, 10240)
 GDN_PREPARE_PREFILL_ENTRY(prefill_gdn_prepare_vh32, 16, 32, 128, 8192)
 #undef GDN_PREPARE_PREFILL_ENTRY
 
-#define GDN_GATE_PREFILL_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim)   \
+// W: the norm weights' stored type (float: a GGUF's F32 norms, _f32).
+#define GDN_GATE_PREFILL_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim,  \
+                               W)                                             \
   kernel void Name(                                                           \
       device const bfloat *recurrent [[buffer(0)]],                           \
       device const bfloat *packed [[buffer(1)]],                              \
-      device const bfloat *norm_weight [[buffer(2)]],                         \
+      device const W *norm_weight [[buffer(2)]],                              \
       device bfloat *hidden [[buffer(3)]],                                    \
       constant GDNGatePrefillParams &params [[buffer(4)]],                    \
       uint task [[threadgroup_position_in_grid]],                             \
@@ -312,6 +314,8 @@ GDN_PREPARE_PREFILL_ENTRY(prefill_gdn_prepare_vh32, 16, 32, 128, 8192)
         simd_group);                                                          \
   }
 
-GDN_GATE_PREFILL_ENTRY(prefill_gdn_gate, 16, 48, 128, 10240)
-GDN_GATE_PREFILL_ENTRY(prefill_gdn_gate_vh32, 16, 32, 128, 8192)
+GDN_GATE_PREFILL_ENTRY(prefill_gdn_gate, 16, 48, 128, 10240, bfloat)
+GDN_GATE_PREFILL_ENTRY(prefill_gdn_gate_vh32, 16, 32, 128, 8192, bfloat)
+GDN_GATE_PREFILL_ENTRY(prefill_gdn_gate_f32, 16, 48, 128, 10240, float)
+GDN_GATE_PREFILL_ENTRY(prefill_gdn_gate_vh32_f32, 16, 32, 128, 8192, float)
 #undef GDN_GATE_PREFILL_ENTRY

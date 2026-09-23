@@ -7,6 +7,7 @@
 #include "ops/ExecutionPlans.hpp"
 #include "ops/Linear.hpp"
 #include "ops/MoE.hpp"
+#include "ops/Normalization.hpp"
 #include "ops/PagedAttention.hpp"
 
 #include <array>
@@ -31,7 +32,7 @@ struct QwenGdnWeights final {
   metal::MetalBuffer convolutionWeights;
   metal::MetalBuffer decay;
   metal::MetalBuffer timeBias;
-  metal::MetalBuffer mixerNorm;
+  ops::NormWeights mixerNorm;
   ops::Q4Projection outputProjection;
   // The value-head order of outputProjection's input columns, in which the
   // GDN writes its output.
@@ -40,8 +41,8 @@ struct QwenGdnWeights final {
 
 struct QwenAttentionWeights final {
   ops::Q4Projection inputProjection;
-  metal::MetalBuffer queryNorm;
-  metal::MetalBuffer keyNorm;
+  ops::NormWeights queryNorm;
+  ops::NormWeights keyNorm;
   ops::Q4Projection outputProjection;
 };
 
@@ -93,7 +94,8 @@ struct PackedTargetFiles final {
 // Reads a target through Files (packed files or GGUF images built in memory):
 // per layer the input norm, mixer, post-attention norm and the architecture's
 // FFN through readFfn, then the head and the token embedding. Weights is the
-// architecture's weight struct.
+// architecture's weight struct. The norms of a GGUF image are F32, those of
+// packed files bf16.
 template <class Weights, class Layout, class Files, class ReadFfn>
 [[nodiscard]] Weights
 readQwenTargetWeights(metal::MetalBackend &backend, const Layout &layout, Files &&files,
@@ -103,17 +105,15 @@ readQwenTargetWeights(metal::MetalBackend &backend, const Layout &layout, Files 
   result.layout = layout;
   result.layers.reserve(layout.layers);
 
-  const uint64_t hiddenBytes = checkedWeightMultiply(
-      layout.hiddenSize, kBFloat16Bytes, "Qwen norm bytes");
   for (uint32_t layerIndex = 0; layerIndex < layout.layers; ++layerIndex) {
     const bool fullAttention = layout.isFullAttentionLayer(layerIndex);
     WeightFile file = files.layer(layerIndex, fullAttention);
     auto &layer = result.layers.emplace_back();
-    layer.inputNorm = file.section(hiddenBytes, "input-norm");
+    layer.inputNorm = readNorm(file, layout.hiddenSize, ggufTarget, "input-norm");
     layer.mixer = readQwenMixer(file, backend, layout.mixerGeometry(),
                                 fullAttention, ggufTarget);
     layer.postAttentionNorm =
-        file.section(hiddenBytes, "post-attention-norm");
+        readNorm(file, layout.hiddenSize, ggufTarget, "post-attention-norm");
     readFfn(file, layer);
     file.finish();
     result.files.push_back(file.record());
@@ -121,7 +121,7 @@ readQwenTargetWeights(metal::MetalBackend &backend, const Layout &layout, Files 
 
   {
     WeightFile file = files.head(layout.layers);
-    result.finalNorm = file.section(hiddenBytes, "final-norm");
+    result.finalNorm = readNorm(file, layout.hiddenSize, ggufTarget, "final-norm");
     result.logitsProjection = ggufTarget
         ? readGgufProjection(file, "logits")
         : readQ4Projection(file, backend, layout.vocabularySize,

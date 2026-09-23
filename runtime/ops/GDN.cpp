@@ -40,6 +40,8 @@ void GDN::addPrefill(metal::CommandGraph &graph, GdnPrefillBuffers buffers,
   if (!tokens)
     throw std::invalid_argument("invalid GDN prefill geometry");
   const KernelLayout kernel = kernelShape(shape);
+  const std::string gate = normKernel(kernelName(kernel, "prefill_gdn_gate", "prefill_gdn_gate_vh32"),
+                                      buffers.mixerNorm, shape.headDimension);
   const GDNPreparePrefillParams prepare{tokens, shape.packedWidth};
   graph.add(kernelName(kernel, "prefill_gdn_prepare",
                        "prefill_gdn_prepare_vh32"),
@@ -59,9 +61,8 @@ void GDN::addPrefill(metal::CommandGraph &graph, GdnPrefillBuffers buffers,
                  SPLASH_GDN_SCAN_STATE_ROWS,
              1, 1},
             {SPLASH_GDN_SCAN_THREADS, 1, 1});
-  graph.add(kernelName(kernel, "prefill_gdn_gate",
-                       "prefill_gdn_gate_vh32"),
-            {buffers.recurrentRows, buffers.packed, buffers.mixerNorm,
+  graph.add(gate,
+            {buffers.recurrentRows, buffers.packed, buffers.mixerNorm.buffer,
              buffers.hidden},
             GDNGatePrefillParams{tokens, shape.packedWidth,
                                  order == GdnHeadOrder::Tiled},
@@ -87,7 +88,7 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
   bindings.insert(bindings.end(),
                   {buffers.mixed, buffers.decayWeights, buffers.timeBias,
                    buffers.decay, buffers.beta, buffers.recurrent,
-                   buffers.mixerNorm, buffers.hidden, buffers.arrived,
+                   buffers.mixerNorm.buffer, buffers.hidden, buffers.arrived,
                    buffers.generation});
   if (prepare)
     bindings.insert(bindings.end(), {buffers.linearScratch.input, buffers.linearScratch.sums});
@@ -101,7 +102,8 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
   const std::string name = !prepare ? kernelName(kernel, "verify_gdn_fused", "verify_gdn_fused_vh32")
       : input == LinearInput::Table16 ? kernelName(kernel, "verify_gdn_fused_q16", "verify_gdn_fused_q16_vh32")
                                       : kernelName(kernel, "verify_gdn_fused_q4", "verify_gdn_fused_q4_vh32");
-  graph.add(name, std::move(bindings), params, {shape.valueHeads, lanes, 1});
+  graph.add(normKernel(name, buffers.mixerNorm, shape.headDimension), std::move(bindings), params,
+            {shape.valueHeads, lanes, 1});
   if (!prepare) return {};
   return {buffers.hidden, input};
 }

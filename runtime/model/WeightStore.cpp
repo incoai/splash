@@ -291,6 +291,13 @@ ops::Q4Projection readQ4ProjectionComponents(WeightFile &file,
     return result;
 }
 
+ops::NormWeights readNorm(WeightFile &file, uint32_t width, bool float32,
+                          std::string_view label) {
+    ops::NormWeights norm{{}, float32};
+    norm.buffer = file.section(norm.bytes(width), label);
+    return norm;
+}
+
 namespace {
 struct GgufDescriptor {
     uint32_t type, outputSize, inputSize, p0, p1, metaBytes, metaGroups;

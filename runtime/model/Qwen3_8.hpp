@@ -70,9 +70,9 @@ struct Qwen3_8Layout final {
 };
 
 struct Qwen3_8LayerWeights final {
-  metal::MetalBuffer inputNorm;
+  ops::NormWeights inputNorm;
   QwenMixerWeights mixer;
-  metal::MetalBuffer postAttentionNorm;
+  ops::NormWeights postAttentionNorm;
   ops::Q4Projection gateProjection;
   ops::Q4Projection upProjection;
   ops::Q4Projection downProjection;
@@ -81,7 +81,7 @@ struct Qwen3_8LayerWeights final {
 struct Qwen3_8Weights final {
   Qwen3_8Layout layout;
   std::vector<Qwen3_8LayerWeights> layers;
-  metal::MetalBuffer finalNorm;
+  ops::NormWeights finalNorm;
   ops::Q4Projection logitsProjection;
   ops::Q4Projection tokenEmbedding;
   std::vector<WeightFileRecord> files;

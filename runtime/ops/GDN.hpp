@@ -2,6 +2,7 @@
 
 #include "metal/CommandGraph.hpp"
 #include "ops/Linear.hpp"
+#include "ops/Normalization.hpp"
 
 #include <cstdint>
 #include <span>
@@ -60,7 +61,7 @@ struct GdnPrefillBuffers final {
   metal::MetalBuffer recurrentIn;
   metal::MetalBuffer recurrentOut;
   metal::MetalBuffer recurrentRows;
-  metal::MetalBuffer mixerNorm;
+  NormWeights mixerNorm;
   metal::MetalBuffer hidden;
 };
 
@@ -75,7 +76,7 @@ struct GdnDecodeBuffers final {
   metal::MetalBuffer decay;
   metal::MetalBuffer beta;
   metal::MetalBuffer recurrent;
-  metal::MetalBuffer mixerNorm;
+  NormWeights mixerNorm;
   metal::MetalBuffer hidden;
   metal::MetalBuffer arrived;
   metal::MetalBuffer generation;
