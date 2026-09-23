@@ -844,10 +844,13 @@ class ModelArtifactTest(unittest.TestCase):
         entry = manifest["target"]["gguf"]["variants"]["UD-Q4_K_M"]
         self.api.return_value.model_info.return_value = SimpleNamespace(
             sha="c" * 40,
-            siblings=[SimpleNamespace(
-                rfilename=entry["file"], size=entry["size"],
-                lfs=SimpleNamespace(sha256=entry["sha256"]),
-            )],
+            siblings=[
+                SimpleNamespace(
+                    rfilename=entry["file"],
+                    size=entry["size"],
+                    lfs=SimpleNamespace(sha256=entry["sha256"]),
+                )
+            ],
         )
         gguf.write_bytes(b"x" * len(good))
 
@@ -857,7 +860,9 @@ class ModelArtifactTest(unittest.TestCase):
             return str(gguf)
 
         self.manifest_download.side_effect = fetch
-        self.assertEqual(artifacts.resolve_gguf(manifest, "UD-Q4_K_M", None), gguf.resolve())
+        self.assertEqual(
+            artifacts.resolve_gguf(manifest, "UD-Q4_K_M", None), gguf.resolve()
+        )
         self.assertEqual(self.manifest_download.call_count, 2)
         self.assertTrue(self.manifest_download.call_args.kwargs["force_download"])
         self.assertEqual(gguf.read_bytes(), good)
@@ -868,10 +873,14 @@ class ModelArtifactTest(unittest.TestCase):
         with self.assertRaisesRegex(artifacts.ModelError, "checksum"):
             artifacts.resolve_gguf(manifest, "UD-Q4_K_M", None)
         self.assertEqual(self.manifest_download.call_count, 2)
-        with mock.patch("huggingface_hub.try_to_load_from_cache", return_value=str(gguf)):
+        with mock.patch(
+            "huggingface_hub.try_to_load_from_cache", return_value=str(gguf)
+        ):
             self.assertIsNone(artifacts._cached_gguf(manifest, "UD-Q4_K_M"))
             gguf.write_bytes(good)
-            self.assertEqual(artifacts._cached_gguf(manifest, "UD-Q4_K_M"), gguf.resolve())
+            self.assertEqual(
+                artifacts._cached_gguf(manifest, "UD-Q4_K_M"), gguf.resolve()
+            )
 
     def test_publish_refuses_to_replace_a_real_directory(self):
         snapshot, _ = self.package_fixture()

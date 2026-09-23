@@ -533,7 +533,9 @@ def resolve_gguf(manifest, variant: str, token) -> Path:
     if not _gguf_content_matches(path, entry):
         path = Path(hf_hub_download(force_download=True, **options)).resolve()
         if not _gguf_content_matches(path, entry):
-            raise ModelError(f"downloaded GGUF checksum or size changed: {entry['file']}")
+            raise ModelError(
+                f"downloaded GGUF checksum or size changed: {entry['file']}"
+            )
     return path
 
 
