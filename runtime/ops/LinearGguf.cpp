@@ -30,14 +30,17 @@ std::string prefillKernel(const char *family, const char *format, uint32_t tileR
          "_sg4_n64_k64_p1";
 }
 
-// Measured with serialized M=8 sweeps on a 16-core Apple10 GPU: four splits
-// for out_proj (K 6144), eight for down (K 17408). Not derived from the core
-// count yet.
-uint32_t stagedSplits(uint32_t n, uint32_t k, uint32_t rows) {
-  if (n <= 1024) return 8;
-  if (n <= 6144) return k <= 6144 ? 4 : 8;
-  if (n <= 12288) return rows <= 16 ? 4 : 2;
-  return 1;
+// Staged tile: split K (whole 32-input groups, as decode K is a multiple of
+// 256) until the grid holds 32 threadgroups per core at one or two lanes and
+// 8 at three or four, whose rows lengthen every threadgroup. On a 16-core M5
+// Pro over the 27B shapes at one to four lanes, DRAM-cold: 1.1% over the
+// fastest split in total (the fixed table it replaces: 1.9%).
+uint32_t stagedSplits(uint32_t n, uint32_t rows, uint32_t cores) {
+  const uint32_t grid = n / kDecodeTileColumns;
+  const uint64_t target = uint64_t(rows <= 16 ? 32 : 8) * cores;
+  uint32_t splits = 1;
+  while (splits < 8 && uint64_t(grid) * splits < target) splits *= 2;
+  return splits;
 }
 
 // Apple9 register tile: split K until the grid holds sixteen threadgroups
@@ -53,6 +56,16 @@ uint32_t simdgroupSplits(uint32_t n, uint32_t k, uint32_t cores) {
 }
 
 const metal::MetalBuffer &plane1(const GgufSegment &s) { return s.plane1 ? s.plane1 : s.meta; }
+
+// The request lanes one decode dispatch fuses, whatever its tile height.
+void recordLanes(Q4DispatchStats *stats, uint32_t rows) {
+  if (!stats || rows <= SPLASH_TARGET_VERIFY_ROWS) return;
+  const uint32_t lanes = rows / SPLASH_TARGET_VERIFY_ROWS;
+  stats->fusedSourceOperations += lanes;
+  if (lanes == 2) ++stats->m16Dispatches;
+  else if (lanes == 3) ++stats->m24Dispatches;
+  else ++stats->m32Dispatches;
+}
 
 void requireSegments(const Q4Projection &p, LinearMatrix matrix) {
   uint32_t covered = 0;
@@ -78,7 +91,7 @@ LinearConfig Q4Linear::ggufBaseline(LinearWorkload w, uint32_t segments) const {
             simdgroupSplits(n, k, gpuCores_)};
   // The fused multi-tensor and gate/up kernels take no K splits.
   const uint32_t splits =
-      segments > 1 || w.epilogue == LinearEpilogue::GateUp ? 1 : stagedSplits(n, k, w.rows);
+      segments > 1 || w.epilogue == LinearEpilogue::GateUp ? 1 : stagedSplits(n, w.rows, gpuCores_);
   return {LinearTile::GgufStaged, n / kDecodeTileColumns, LinearSimdgroups::Two, splits};
 }
 
@@ -117,13 +130,7 @@ void Q4Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
   };
   if (config.tile == LinearTile::GgufSimdgroup) {
     addGgufSimdgroup(graph, b, p, plan, gate);
-    if (stats && rows > SPLASH_TARGET_VERIFY_ROWS) {
-      const uint32_t lanes = rows / SPLASH_TARGET_VERIFY_ROWS;
-      stats->fusedSourceOperations += lanes;
-      if (lanes == 2) ++stats->m16Dispatches;
-      else if (lanes == 3) ++stats->m24Dispatches;
-      else ++stats->m32Dispatches;
-    }
+    recordLanes(stats, w.rows);
     return;
   }
   if (w.phase == LinearPhase::Prefill) {
@@ -204,13 +211,7 @@ void Q4Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
                 {tiles, 1, 1}, {kDecodeThreads, 1, 1});
     }
   }
-  if (stats && rows > SPLASH_TARGET_VERIFY_ROWS) {
-    const uint32_t lanes = rows / SPLASH_TARGET_VERIFY_ROWS;
-    stats->fusedSourceOperations += lanes;
-    if (lanes == 2) ++stats->m16Dispatches;
-    else if (lanes == 3) ++stats->m24Dispatches;
-    else ++stats->m32Dispatches;
-  }
+  recordLanes(stats, w.rows);
 }
 
 // All lanes in each threadgroup. Single tensors run their format's kernel;

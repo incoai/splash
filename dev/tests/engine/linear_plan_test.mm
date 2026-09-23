@@ -783,10 +783,19 @@ void ggufPlans() {
               single.scratchSize().partials == uint64_t{8} * 8 * 5120 * 4 &&
               single.scratchSize().counters == 80 * 4 && single.scratchSize().input == 0,
           "GGUF single-tensor decode plan");
-  require(linear.plan({{5120, 6144}, 32, LinearPhase::Decode, LinearEpilogue::Residual},
-                      projection(5120, 6144, 1)).configuration().splits == 4 &&
-              linear.plan({{10240, 5120}, 24, LinearPhase::Decode, LinearEpilogue::None},
-                          projection(10240, 5120, 1)).configuration().splits == 2,
+  // 32 threadgroups per core at one or two lanes, 8 at three or four.
+  const auto stagedSplits = [&](uint32_t cores, uint32_t n, uint32_t k, uint32_t rows) {
+    DeviceCapabilities apple10;
+    apple10.appleGpuFamily = 10;
+    apple10.gpuCoreCount = cores;
+    return Q4Linear(apple10).plan({{n, k}, rows, LinearPhase::Decode, LinearEpilogue::Residual},
+                                  projection(n, k, 1)).configuration().splits;
+  };
+  require(stagedSplits(16, 5120, 6144, 8) == 8 && stagedSplits(16, 5120, 6144, 32) == 2 &&
+              stagedSplits(16, 10240, 5120, 16) == 4 && stagedSplits(16, 10240, 5120, 24) == 1 &&
+              stagedSplits(16, 248320, 5120, 8) == 1 && stagedSplits(10, 5120, 17408, 8) == 4 &&
+              stagedSplits(40, 10240, 5120, 8) == 8 && stagedSplits(16, 1024, 256, 8) == 8 &&
+              stagedSplits(16, 1024, 3072, 8) == 8,
           "GGUF staged split policy");
   const LinearPlan fused = linear.plan({{10240, 5120}, 8, LinearPhase::Decode, LinearEpilogue::None},
                                        projection(10240, 5120, 2));
