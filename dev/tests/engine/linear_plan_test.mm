@@ -783,7 +783,7 @@ void ggufPlans() {
               single.scratchSize().partials == uint64_t{8} * 8 * 5120 * 4 &&
               single.scratchSize().counters == 80 * 4 && single.scratchSize().input == 0,
           "GGUF single-tensor decode plan");
-  // 32 threadgroups per core at one or two lanes, 8 at three or four.
+  // 32 threadgroups per core, at least 1024 inputs per partition.
   const auto stagedSplits = [&](uint32_t cores, uint32_t n, uint32_t k, uint32_t rows) {
     DeviceCapabilities apple10;
     apple10.appleGpuFamily = 10;
@@ -791,12 +791,28 @@ void ggufPlans() {
     return Q4Linear(apple10).plan({{n, k}, rows, LinearPhase::Decode, LinearEpilogue::Residual},
                                   projection(n, k, 1)).configuration().splits;
   };
-  require(stagedSplits(16, 5120, 6144, 8) == 8 && stagedSplits(16, 5120, 6144, 32) == 2 &&
-              stagedSplits(16, 10240, 5120, 16) == 4 && stagedSplits(16, 10240, 5120, 24) == 1 &&
-              stagedSplits(16, 248320, 5120, 8) == 1 && stagedSplits(10, 5120, 17408, 8) == 4 &&
-              stagedSplits(40, 10240, 5120, 8) == 8 && stagedSplits(16, 1024, 256, 8) == 8 &&
-              stagedSplits(16, 1024, 3072, 8) == 8,
+  require(stagedSplits(16, 5120, 17408, 8) == 8 && stagedSplits(16, 5120, 6144, 8) == 4 &&
+              stagedSplits(16, 10240, 5120, 16) == 4 && stagedSplits(16, 248320, 5120, 8) == 1 &&
+              stagedSplits(10, 5120, 17408, 8) == 4 && stagedSplits(40, 10240, 5120, 8) == 4 &&
+              stagedSplits(16, 1024, 256, 8) == 1 && stagedSplits(16, 1024, 3072, 8) == 2,
           "GGUF staged split policy");
+  // A request's sums do not depend on the requests it is batched with: every
+  // GGUF decode plan splits K the same way at every lane count.
+  for (const uint32_t family : {9U, 10U})
+    for (const uint32_t cores : {8U, 10U, 16U, 20U, 32U, 40U, 60U, 80U})
+      for (const auto [n, k] : std::array<std::pair<uint32_t, uint32_t>, 7>{
+               {{256, 5120}, {1024, 5120}, {5120, 6144}, {5120, 17408}, {10240, 5120}, {17408, 5120}, {248320, 5120}}})
+        for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp}) {
+          DeviceCapabilities device;
+          device.appleGpuFamily = family;
+          device.gpuCoreCount = cores;
+          const Q4Linear gpu(device);
+          const auto splits = [&](uint32_t rows) {
+            return gpu.plan({{n, k}, rows, LinearPhase::Decode, epilogue}, projection(n, k, 1)).configuration().splits;
+          };
+          require(splits(8) == splits(16) && splits(8) == splits(24) && splits(8) == splits(32),
+                  "GGUF decode splits depend on the batch width");
+        }
   const LinearPlan fused = linear.plan({{10240, 5120}, 8, LinearPhase::Decode, LinearEpilogue::None},
                                        projection(10240, 5120, 2));
   const LinearPlan gateUp = linear.plan({{17408, 5120}, 16, LinearPhase::Decode, LinearEpilogue::GateUp},

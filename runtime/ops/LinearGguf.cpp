@@ -30,16 +30,16 @@ std::string prefillKernel(const char *family, const char *format, uint32_t tileR
          "_sg4_n64_k64_p1";
 }
 
-// Staged tile: split K (whole 32-input groups, as decode K is a multiple of
-// 256) until the grid holds 32 threadgroups per core at one or two lanes and
-// 8 at three or four, whose rows lengthen every threadgroup. On a 16-core M5
-// Pro over the 27B shapes at one to four lanes, DRAM-cold: 1.1% over the
-// fastest split in total (the fixed table it replaces: 1.9%).
-uint32_t stagedSplits(uint32_t n, uint32_t rows, uint32_t cores) {
+// Staged tile: split K until the grid holds 32 threadgroups per core,
+// keeping at least 1024 inputs (whole 32-input groups) per partition. Like
+// the register rule it ignores the batch width, so a request's sums do not
+// depend on the requests it is batched with. On a 16-core M5 Pro over the 27B
+// shapes at one to four lanes (DRAM-cold medians): 2.2% over the fastest
+// split in total, 1.2% on the single tensors the 27B splits.
+uint32_t stagedSplits(uint32_t n, uint32_t k, uint32_t cores) {
   const uint32_t grid = n / kDecodeTileColumns;
-  const uint64_t target = uint64_t(rows <= 16 ? 32 : 8) * cores;
   uint32_t splits = 1;
-  while (splits < 8 && uint64_t(grid) * splits < target) splits *= 2;
+  while (splits < 8 && uint64_t(grid) * splits < 32ULL * cores && k / (2 * splits) >= 1024) splits *= 2;
   return splits;
 }
 
@@ -91,7 +91,7 @@ LinearConfig Q4Linear::ggufBaseline(LinearWorkload w, uint32_t segments) const {
             simdgroupSplits(n, k, gpuCores_)};
   // The fused multi-tensor and gate/up kernels take no K splits.
   const uint32_t splits =
-      segments > 1 || w.epilogue == LinearEpilogue::GateUp ? 1 : stagedSplits(n, w.rows, gpuCores_);
+      segments > 1 || w.epilogue == LinearEpilogue::GateUp ? 1 : stagedSplits(n, k, gpuCores_);
   return {LinearTile::GgufStaged, n / kDecodeTileColumns, LinearSimdgroups::Two, splits};
 }
 
