@@ -84,7 +84,7 @@ inline void groupPack(Fmt f, const uint8_t *row, uint32_t g, float vals[32], uin
   }
 }
 inline void metaPack(Fmt f, const uint8_t *row, uint32_t unit, uint8_t *dst) {
-  const QuantFormat &fi = kQuantFormats[f]; const uint8_t *blk = row + (f == IQ4NL || f == Q80 ? unit * fi.block_bytes : unit * fi.block_bytes);
+  const uint8_t *blk = row + unit * kQuantFormats[f].block_bytes;
   switch (f) { case Q4K: case Q5K: memcpy(dst, blk, 16); break; case IQ4XS: memcpy(dst, blk, 8); break; case IQ4NL: case Q80: case IQ3S: memcpy(dst, blk, 2); break;
     case Q6K: memcpy(dst, blk + 192, 16); memcpy(dst + 16, blk + 208, 2); dst[18] = dst[19] = 0; break;
     case Q3K: memcpy(dst, blk + 108, 2); dst[2] = dst[3] = 0; memcpy(dst + 4, blk + 96, 12); break; default: break; }
