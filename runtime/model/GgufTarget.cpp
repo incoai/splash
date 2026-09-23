@@ -115,7 +115,7 @@ WeightFile GgufTargetLoader::build(const gguf::Image &image, uint32_t expectedLa
       copyParams.push_back(params);
       dispatches.push_back({"gguf_copy", {{0, source}, {1, buffer}},
                             {{2, &copyParams.back(), sizeof(GgufCopyParams)}},
-                            {(uint64_t{params.bytes} / 16 + 255) / 256, 1, 1}, {256, 1, 1}});
+                            {((uint64_t{params.bytes} + 15) / 16 + 255) / 256, 1, 1}, {256, 1, 1}});
     }
     static_cast<void>(backend_->submitCommand(dispatches));
   }

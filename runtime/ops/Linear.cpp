@@ -595,7 +595,9 @@ void addGguf(metal::CommandGraph &graph, const LinearBuffers &b, const Q4Project
   need(b.input, uint64_t{rows} * k * 2, "input");
   need(b.output, uint64_t{rows} * n * 2, "output");
   if (w.epilogue == LinearEpilogue::Residual) need(b.residual, uint64_t{rows} * n * 2, "residual");
-  if (w.epilogue == LinearEpilogue::UpWithGate || w.epilogue == LinearEpilogue::GateUp)
+  // Only the two-pass forms use a gate buffer: UpWithGate reads it, and prefill
+  // GateUp writes the gate there first. Decode gate/up is one fused kernel.
+  if (w.epilogue == LinearEpilogue::UpWithGate || (w.epilogue == LinearEpilogue::GateUp && !small))
     need(b.gateScratch, uint64_t{rows} * n * 2, "gate scratch");
   metal::MetalBuffer input = b.input;
   if (p.ggufPermuteHeads) {
