@@ -20,10 +20,6 @@ enum Fmt { Q4K = GGUF_FMT_Q4K, IQ4XS = GGUF_FMT_IQ4XS, IQ4NL = GGUF_FMT_IQ4NL, Q
 inline const char *fmtName(uint32_t f) { return kQuantFormats[f].name; }
 inline uint16_t f2h(float f) { __fp16 h = (__fp16)f; uint16_t u; memcpy(&u, &h, 2); return u; }
 inline float h2f(uint16_t u) { __fp16 h; memcpy(&h, &u, 2); return (float)h; }
-inline const float kv_iq4nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
-inline const uint32_t iq3s_grid[512] = {
-#include "iq3s_grid.inc"
-};
 inline uint32_t rowBytes(Fmt f, uint32_t K) { const QuantFormat &i = kQuantFormats[f]; return K / i.block_elements * i.block_bytes; }
 // N native rows of random bytes whose half scales (d, and dmin for Q4_K/Q5_K) are scale().
 template <class Scale>
@@ -52,10 +48,10 @@ inline void groupPack(Fmt f, const uint8_t *row, uint32_t g, float vals[32], uin
       packPairs(lo, p0); return; }
     case IQ4XS: { const uint8_t *qs = blk + 8 + j * 16; uint16_t d16, shh; memcpy(&d16, blk, 2); memcpy(&shh, blk + 2, 2); const uint8_t *sl = blk + 4;
       int ls = ((sl[j / 2] >> 4 * (j % 2)) & 0xf) | (((shh >> 2 * j) & 3) << 4); float s = h2f(d16) * (ls - 32);
-      for (int k = 0; k < 32; ++k) { const uint8_t code = k < 16 ? (qs[k] & 15) : (qs[k - 16] >> 4); lo[quant_slot(k)] = code; vals[k] = s * kv_iq4nl[code]; }
+      for (int k = 0; k < 32; ++k) { const uint8_t code = k < 16 ? (qs[k] & 15) : (qs[k - 16] >> 4); lo[quant_slot(k)] = code; vals[k] = s * kIQ4NLValues[code]; }
       packBits(lo, 4, p0); return; }
     case IQ4NL: { const uint8_t *qs = blk + 2; uint16_t d16; memcpy(&d16, blk, 2); float s = h2f(d16);
-      for (int k = 0; k < 32; ++k) { const uint8_t code = k < 16 ? (qs[k] & 15) : (qs[k - 16] >> 4); lo[quant_slot(k)] = code; vals[k] = s * kv_iq4nl[code]; }
+      for (int k = 0; k < 32; ++k) { const uint8_t code = k < 16 ? (qs[k] & 15) : (qs[k - 16] >> 4); lo[quant_slot(k)] = code; vals[k] = s * kIQ4NLValues[code]; }
       packBits(lo, 4, p0); return; }
     case Q5K: { const uint8_t *qh = blk + 16, *ql = blk + 48 + (j / 2) * 32; int sh = (j % 2) * 4; uint16_t d16, m16; memcpy(&d16, blk, 2); memcpy(&m16, blk + 2, 2); uint8_t sc, mn; scale_min_k4(blk + 4, j, sc, mn);
       for (int k = 0; k < 32; ++k) { uint8_t l4 = (ql[k] >> sh) & 15, h1 = (qh[k] >> j) & 1; lo[quant_slot(k)] = l4; hi[quant_slot(k)] = h1; vals[k] = h2f(d16) * sc * (l4 + 16 * h1) - h2f(m16) * mn; }
@@ -74,7 +70,7 @@ inline void groupPack(Fmt f, const uint8_t *row, uint32_t g, float vals[32], uin
       packBits(lo, 8, p0); return; }
     default: { const uint8_t *qs = blk + 2 + 8 * j, *qh = blk + 66, *signs = blk + 74 + 4 * j, *scales = blk + 106; uint16_t d16; memcpy(&d16, blk, 2);
       const uint32_t sc = (scales[j / 2] >> (4 * (j % 2))) & 0xf; const float db = h2f(d16) * (1 + 2 * sc);
-      for (int l = 0; l < 4; ++l) { const uint8_t *g1 = (const uint8_t *)(iq3s_grid + (qs[2 * l] | ((qh[j] << (8 - 2 * l)) & 256))), *g2 = (const uint8_t *)(iq3s_grid + (qs[2 * l + 1] | ((qh[j] << (7 - 2 * l)) & 256)));
+      for (int l = 0; l < 4; ++l) { const uint8_t *g1 = (const uint8_t *)(kIQ3SGrid + (qs[2 * l] | ((qh[j] << (8 - 2 * l)) & 256))), *g2 = (const uint8_t *)(kIQ3SGrid + (qs[2 * l + 1] | ((qh[j] << (7 - 2 * l)) & 256)));
         for (int k = 0; k < 4; ++k) { vals[8 * l + k] = db * g1[k] * ((signs[l] & (1 << k)) ? -1.f : 1.f); vals[8 * l + 4 + k] = db * g2[k] * ((signs[l] & (1 << (4 + k))) ? -1.f : 1.f); } }
       // word c: grid indices of elements 4c.. and 16+4c.. (qs[c], qs[4 + c]), chunk c's signs, their ninth bits, the scale
       for (int k = 0; k < 32; ++k) hi[quant_slot(k)] = (signs[k / 8] >> (k % 8)) & 1;

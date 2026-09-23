@@ -223,11 +223,10 @@ $(TEST_GGUF_FILE): dev/tests/engine/gguf_file_test.cpp runtime/model/GgufFile.cp
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
 $(TEST_GGUF_PROJECTION): dev/tests/engine/gguf_projection_test.mm dev/tests/engine/GgufFormatReference.hpp \
-		dev/tests/engine/iq3s_grid.inc $(TEST_GGUF_DEQUANT_LIB) | $(ENGINE_TEST_BUILD)
+		$(TEST_GGUF_DEQUANT_LIB) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LINKFLAGS) -o $@
 
-$(TEST_GGUF_REPACK): dev/tests/engine/gguf_repack_test.mm dev/tests/engine/GgufFormatReference.hpp \
-		dev/tests/engine/iq3s_grid.inc | $(ENGINE_TEST_BUILD)
+$(TEST_GGUF_REPACK): dev/tests/engine/gguf_repack_test.mm dev/tests/engine/GgufFormatReference.hpp | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LINKFLAGS) -o $@
 
 $(ENGINE_TEST_BUILD)/gguf-dequant.air: dev/tests/engine/gguf_dequant_test.metal \
