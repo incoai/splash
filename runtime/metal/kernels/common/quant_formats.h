@@ -53,12 +53,21 @@ inline uint4 quant_nibble_pairs(uint word) { return (uint4(word) >> uint4(0, 4, 
 inline uint quant_spread1(uint bits) { return (bits & 0x5555u) | ((bits & 0xAAAAu) << 15); }
 inline uint quant_spread2(uint bits) { return (bits & 0x3333u) | ((bits & 0xCCCCu) << 14); }
 
-// block_q4_K / block_q5_K header: s = d * sc and m = -dmin * mn with the 6-bit sc, mn of group j.
+// block_q4_K / block_q5_K header: s = d * sc and m = -dmin * mn with the 6-bit sc, mn of group j. The 12 scale
+// bytes are hdr.y (0-3), hdr.z (4-7) and hdr.w (8-11), taken with shifts: the group index is not a compile-time
+// constant, and indexing a thread-local byte array or vector by it costs ~8% of the eight-row staged kernel on
+// Apple10 (Yesheng Liang's measurement in incoai/splash 77beaed).
 inline QuantCoef quant_k4_coef(uint4 hdr, ushort j) {
-  const uchar4 q0 = as_type<uchar4>(hdr.y), q1 = as_type<uchar4>(hdr.z), q2 = as_type<uchar4>(hdr.w);
-  const uchar q[12] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w, q2.x, q2.y, q2.z, q2.w};
-  uchar sc, m;
-  if (j < 4) { sc = q[j] & 63; m = q[j + 4] & 63; } else { sc = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4); m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4); }
+  uint sc, m;
+  if (j < 4) {
+    const uint sh = 8u * j;
+    sc = (hdr.y >> sh) & 63u;
+    m = (hdr.z >> sh) & 63u;
+  } else {
+    const uint sh = 8u * (j - 4), w = hdr.w >> sh;
+    sc = (w & 0xFu) | (((hdr.y >> sh) >> 6) & 3u) << 4;
+    m = ((w >> 4) & 0xFu) | (((hdr.z >> sh) >> 6) & 3u) << 4;
+  }
   const half d = as_type<half>(ushort(hdr.x & 0xFFFF)), dmin = as_type<half>(ushort(hdr.x >> 16));
   return {float2(float(d) * float(sc)), -float(dmin) * float(m)};
 }
@@ -101,8 +110,9 @@ struct FmtQ6K {
   static uint4 codes(Chunk q) { return quant_nibble_pairs(q.x) | (((uint4(q.y) >> uint4(0, 4, 8, 12)) & 0x00030003u) << 4); }
   static QuantCoef coef(Meta mt, ushort j) {
     const float d = float(as_type<half>(ushort(mt.d & 0xFFFF)));
-    const char4 sc4 = as_type<char4>(mt.sc[j >> 1]);   // scales 2j, 2j + 1 are bytes 2(j & 1), 2(j & 1) + 1
-    return {float2(d * float(sc4[2 * (j & 1)]), d * float(sc4[2 * (j & 1) + 1])), 0.0f};
+    // int8 scales 2j, 2j + 1 are bytes 2(j & 1), 2(j & 1) + 1 of word j >> 1 (shifts, as for Q4_K).
+    const uint word = j < 2 ? mt.sc.x : j < 4 ? mt.sc.y : j < 6 ? mt.sc.z : mt.sc.w, pair = word >> (16u * (j & 1));
+    return {float2(d * float(as_type<char>(uchar(pair & 0xFFu))), d * float(as_type<char>(uchar(pair >> 8)))), 0.0f};
   }
 };
 // Q3_K: plane0 low 2 bits (halfword c = chunk c), plane1 the hmask bits (byte c = chunk c); meta half d, 2 zero
@@ -129,8 +139,8 @@ struct FmtQ3K {
       case 2: aux = ((t0 >> 4) & 0x0f0f0f0fu) | (((t2 >> 4) & 0x03030303u) << 4); break;
       default: aux = ((t1 >> 4) & 0x0f0f0f0fu) | (((t2 >> 6) & 0x03030303u) << 4); break;
     }
-    const uchar4 a4 = as_type<uchar4>(aux);
-    return {float2(d * float(int(a4[2 * (j & 1)]) - 32), d * float(int(a4[2 * (j & 1) + 1]) - 32)), 0.0f};
+    const uint pair = aux >> (16u * (j & 1));   // 6-bit scales 2j, 2j + 1 (shifts, as for Q4_K)
+    return {float2(d * float(int(pair & 0xFFu) - 32), d * float(int((pair >> 8) & 0xFFu) - 32)), 0.0f};
   }
 };
 // IQ4_XS: plane0 codebook indices; meta half d, scales_h, scales_l[4]. value = d * (ls - 32) * codebook.
