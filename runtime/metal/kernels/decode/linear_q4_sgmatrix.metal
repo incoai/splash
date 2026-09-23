@@ -1,3 +1,7 @@
+// Keep the source order of float operations, which Metal's default fast math
+// lets the compiler reassociate, so the epilogue order below is fixed. Set
+// before the includes, so it also holds for their code compiled here.
+#pragma clang fp reassociate(off)
 #include "metal/kernels/common/q4_sgmatrix.h"
 #include "metal/kernels/common/split_reduce.h"
 

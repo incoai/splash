@@ -3,6 +3,9 @@
 // matching llama.cpp Metal dequantize.h / mul_mm.metal. Keep activations BF16.
 // Weight planes and meta in the MDGG0001 layout (metal/abi/QuantFormat.h), decoded by kernels/common/quant_formats.h.
 // Activations fp16 or bf16 [rows][K]; weights staged as fp16 in threadgroup memory; fp32 accumulation; bf16 output.
+// Keep the source order of float operations, which Metal's default fast math lets the compiler reassociate. Set
+// before the includes, so it also holds for the shared format and reduction code compiled here.
+#pragma clang fp reassociate(off)
 #include "metal/abi/Gguf.h"
 #include "metal/kernels/common/quant_formats.h"
 #include "metal/kernels/common/split_reduce.h"
