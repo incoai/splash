@@ -59,41 +59,111 @@ inline void dequant32(typename F::Payload w, typename F::Meta meta, ushort j, th
   }
 }
 
-// ---------------- sg: each simdgroup stages its own Cols x KS sub-tile privately and runs matmul2d alone
-template <class F, typename TA, ushort Rows, ushort Cols, ushort KS, ushort Buffers, ushort Prefetch, ushort Ep = EpNone>
-inline void sg_tile(device TA *input, device uchar *w0, device uchar *w1, device uchar *meta, device bfloat *output,
-                    uint output_size, uint input_size, uint output_origin, threadgroup half *stage, threadgroup half2 *tl,
-                    uint simd_lane, uint out_stride = 0, uint out_offset = 0, device bfloat *aux = nullptr) {
-  if (out_stride == 0) out_stride = output_size;
-  constexpr ushort GPS = KS / 32, Items = Cols * GPS, IPT = (Items + 31) / 32;
+// ---------------- decode tiles: each simdgroup stages its own Cols x KS sub-tile privately and runs matmul2d alone.
+// MPP computes 16-row fragments and pads a 24-row descriptor to 32 rows with masked loads, 13-50% slower than a
+// 32-row tile on Apple10, so a 24-row tile runs as a 16-row and an 8-row destination on the same stage. Rows do not
+// depend on the destination height: the results are the 24-row descriptor's bit for bit.
+template <ushort Rows> struct Fragments { enum : ushort { First = Rows == 24 ? 16 : Rows, Second = Rows - First }; };
+
+// The destination of `Rows` rows of the tile. Initialize it in the caller after construction: returning an
+// initialized cooperative tensor loses its initial values on Apple9 in runtime-format kernels (also with shader
+// validation).
+template <typename TA, ushort Rows, ushort Cols, ushort KS>
+inline auto gguf_make_acc(device TA *input, uint input_size, threadgroup half *stage) {
   auto a = tensor(input, dextents<int, 2>{int(input_size), Rows}, array<int, 2>{1, int(input_size)});
   constexpr auto descriptor = matmul2d_descriptor(Rows, Cols, KS, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<descriptor, execution_simdgroups<1>> operation;
-  const uint groups = input_size / 32, steps = groups / GPS, units = groups / F::MetaGroups;
+  auto a0 = a.template slice<KS, Rows>(0, 0);
+  tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt0(stage, dextents<int, 2>{KS, Cols}, array<int, 2>{1, KS});
+  auto b0 = bt0.slice<KS, Cols>(0, 0);
+  return operation.template get_destination_cooperative_tensor<decltype(a0), decltype(b0), float>();
+}
+// The destinations of both fragments of a Rows-row tile, zeroed (the second is unused below 24 rows).
+#define GGUF_TILE(R, first, second, input, input_size, stage)                                                     \
+  auto first = gguf_make_acc<bfloat, Fragments<R>::First, 32, 32>(input, input_size, stage);                    \
+  auto second = gguf_make_acc<bfloat, Fragments<R>::Second ? Fragments<R>::Second : 8, 32, 32>(input, input_size, stage); \
+  gguf_zero<R>(first, second)
+template <ushort Rows, class Acc0, class Acc1>
+inline void gguf_zero(thread Acc0 &first, thread Acc1 &second) {
+#pragma unroll
+  for (ushort i = 0; i < first.get_capacity(); ++i) first[i] = 0.0f;
+  if constexpr (Fragments<Rows>::Second) {
+#pragma unroll
+    for (ushort i = 0; i < second.get_capacity(); ++i) second[i] = 0.0f;
+  }
+}
+// fn(row, column, value) for every element of a Rows-row tile's destinations.
+template <ushort Rows, class Acc0, class Acc1, class Fn>
+inline void gguf_elements(thread Acc0 &first, thread Acc1 &second, Fn fn) {
+#pragma unroll
+  for (ushort i = 0; i < first.get_capacity(); ++i) {
+    if (!first.is_valid_element(i)) continue;
+    const auto index = first.get_multidimensional_index(i);
+    fn(uint(index[1]), uint(index[0]), float(first[i]));
+  }
+  if constexpr (Fragments<Rows>::Second) {
+#pragma unroll
+    for (ushort i = 0; i < second.get_capacity(); ++i) {
+      if (!second.is_valid_element(i)) continue;
+      const auto index = second.get_multidimensional_index(i);
+      fn(Fragments<Rows>::First + uint(index[1]), uint(index[0]), float(second[i]));
+    }
+  }
+}
+// fn(row, column, gate, up) for every element of two tiles of the same shape.
+template <ushort Rows, class G0, class G1, class U0, class U1, class Fn>
+inline void gguf_element_pairs(thread G0 &gate, thread G1 &gate2, thread U0 &up, thread U1 &up2, Fn fn) {
+#pragma unroll
+  for (ushort i = 0; i < gate.get_capacity(); ++i) {
+    if (!gate.is_valid_element(i)) continue;
+    const auto index = gate.get_multidimensional_index(i);
+    fn(uint(index[1]), uint(index[0]), float(gate[i]), float(up[i]));
+  }
+  if constexpr (Fragments<Rows>::Second) {
+#pragma unroll
+    for (ushort i = 0; i < gate2.get_capacity(); ++i) {
+      if (!gate2.is_valid_element(i)) continue;
+      const auto index = gate2.get_multidimensional_index(i);
+      fn(Fragments<Rows>::First + uint(index[1]), uint(index[0]), float(gate2[i]), float(up2[i]));
+    }
+  }
+}
+
+// The decode tile loop without the store: dequantize one KS-input step of the Cols columns into the stage, then
+// run each fragment's matmul2d on it. Several formats can accumulate into the same destinations (fused segments).
+template <class F, typename TA, ushort Rows, ushort Cols, ushort KS, ushort Buffers, ushort Prefetch, class Acc0, class Acc1>
+inline void sg_accum(device TA *input, device uchar *w0, device uchar *w1, device uchar *meta, uint input_size, uint output_origin,
+                     threadgroup half *stage, threadgroup half2 *tl, uint simd_lane, uint step_begin, uint step_end,
+                     thread Acc0 &first, thread Acc1 &second) {
+  typedef Fragments<Rows> R;
+  constexpr ushort GPS = KS / 32, Items = Cols * GPS, IPT = (Items + 31) / 32;
+  auto a = tensor(input, dextents<int, 2>{int(input_size), Rows}, array<int, 2>{1, int(input_size)});
+  constexpr auto d0 = matmul2d_descriptor(R::First, Cols, KS, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+  constexpr auto d1 = matmul2d_descriptor(R::Second ? R::Second : 8, Cols, KS, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<d0, execution_simdgroups<1>> op0;
+  matmul2d<d1, execution_simdgroups<1>> op1;
+  const uint groups = input_size / 32, units = groups / F::MetaGroups;
   const uint tile = output_origin / kStorageN, tile_offset = output_origin % kStorageN;
   device uchar *tw0 = w0 + (ulong(tile) * groups * kStorageN + tile_offset) * F::P0;
   device uchar *tw1 = w1 + (ulong(tile) * groups * kStorageN + tile_offset) * F::P1;
   device uchar *tmeta = meta + (ulong(tile) * units * kStorageN + tile_offset) * F::MetaBytes;
-  auto a0 = a.template slice<KS, Rows>(0, 0);
   tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt0(stage, dextents<int, 2>{KS, Cols}, array<int, 2>{1, KS});
   tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt1(stage + (Buffers > 1 ? KS * Cols : 0), dextents<int, 2>{KS, Cols}, array<int, 2>{1, KS});
   auto b0 = bt0.slice<KS, Cols>(0, 0), b1 = bt1.slice<KS, Cols>(0, 0);
-  auto acc = operation.template get_destination_cooperative_tensor<decltype(a0), decltype(b0), float>();
-#pragma unroll
-  for (ushort i = 0; i < acc.get_capacity(); ++i) acc[i] = 0.0f;
   typename F::Payload packed[Prefetch][IPT]; typename F::Meta hdr[IPT]; uint hdr_unit[IPT];
+  const uint unit0 = (step_begin * GPS) / F::MetaGroups;
 #pragma unroll
   for (ushort it = 0; it < IPT; ++it) {
     const uint item = simd_lane + it * 32; const bool live = item < Items;
     const uint col = live ? item % Cols : 0, gi = live ? item / Cols : 0;
 #pragma unroll
     for (ushort pf = 0; pf < Prefetch; ++pf) {
-      const ulong g = ulong(pf) * GPS + gi;
-      if (live && pf < steps) packed[pf][it] = F::load(tw0 + (g * kStorageN + col) * F::P0, tw1 + (g * kStorageN + col) * F::P1);
+      const ulong g = ulong(step_begin + pf) * GPS + gi;
+      if (live && step_begin + pf < step_end) packed[pf][it] = F::load(tw0 + (g * kStorageN + col) * F::P0, tw1 + (g * kStorageN + col) * F::P1);
     }
-    hdr[it] = F::loadMeta(tmeta + col * F::MetaBytes); hdr_unit[it] = 0;
+    hdr[it] = F::loadMeta(tmeta + (ulong(unit0) * kStorageN + col) * F::MetaBytes); hdr_unit[it] = unit0;
   }
-  for (uint step = 0; step < steps; ++step) {
+  for (uint step = step_begin; step < step_end; ++step) {
     threadgroup half *buf = stage + (Buffers > 1 ? (step & 1) * (KS * Cols) : 0);
     if constexpr (Buffers == 1) simdgroup_barrier(mem_flags::mem_threadgroup);
 #pragma unroll
@@ -108,7 +178,7 @@ inline void sg_tile(device TA *input, device uchar *w0, device uchar *w1, device
     for (ushort pf = 0; pf + 1 < Prefetch; ++pf)
 #pragma unroll
       for (ushort it = 0; it < IPT; ++it) packed[pf][it] = packed[pf + 1][it];
-    if (step + Prefetch < steps) {
+    if (step + Prefetch < step_end) {
 #pragma unroll
       for (ushort it = 0; it < IPT; ++it) {
         const uint item = simd_lane + it * 32; if (item >= Items) break;
@@ -116,22 +186,36 @@ inline void sg_tile(device TA *input, device uchar *w0, device uchar *w1, device
         packed[Prefetch - 1][it] = F::load(tw0 + (g * kStorageN + col) * F::P0, tw1 + (g * kStorageN + col) * F::P1);
       }
     }
-    auto a_slice = a.template slice<KS, Rows>(step * KS, 0);
-    if (Buffers > 1 && (step & 1)) operation.run(a_slice, b1, acc); else operation.run(a_slice, b0, acc);
+    // Both fragments' matmuls issue back to back on the step's stage.
+    auto a0 = a.template slice<KS, R::First>(step * KS, 0);
+    auto a1 = a.template slice<KS, (R::Second ? R::Second : R::First)>(step * KS, R::Second ? R::First : 0);
+    if (Buffers > 1 && (step & 1)) {
+      op0.run(a0, b1, first);
+      if constexpr (R::Second) op1.run(a1, b1, second);
+    } else {
+      op0.run(a0, b0, first);
+      if constexpr (R::Second) op1.run(a1, b0, second);
+    }
   }
-#pragma unroll
-  for (ushort i = 0; i < acc.get_capacity(); ++i) {
-    if (!acc.is_valid_element(i)) continue;
-    auto index = acc.get_multidimensional_index(i);
-    const ulong o = ulong(index[1]) * out_stride + out_offset + output_origin + index[0];
-    float v = acc[i];
+  simdgroup_barrier(mem_flags::mem_threadgroup);   // the stage may be reused by a following accumulate
+}
+
+// Single-tensor decode tile of one simdgroup.
+template <class F, typename TA, ushort Rows, ushort Cols, ushort KS, ushort Buffers, ushort Prefetch, ushort Ep = EpNone>
+inline void sg_tile(device TA *input, device uchar *w0, device uchar *w1, device uchar *meta, device bfloat *output,
+                    uint output_size, uint input_size, uint output_origin, threadgroup half *stage, threadgroup half2 *tl,
+                    uint simd_lane, uint out_stride = 0, uint out_offset = 0, device bfloat *aux = nullptr) {
+  if (out_stride == 0) out_stride = output_size;
+  GGUF_TILE(Rows, first, second, input, input_size, stage);
+  sg_accum<F, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, output_origin, stage, tl, simd_lane, 0,
+                                                     input_size / KS, first, second);
+  gguf_elements<Rows>(first, second, [&](uint row, uint column, float v) {
+    const ulong o = ulong(row) * out_stride + out_offset + output_origin + column;
     if constexpr (Ep == EpResidual) v += float(aux[o]);
     if constexpr (Ep == EpUpWithGate) v = float(bfloat(v)) * silu_gate(float(aux[o]));
     output[o] = bfloat(v);
-  }
-  simdgroup_barrier(mem_flags::mem_threadgroup);
+  });
 }
-
 
 // ---------------- pf: prefill with a shared B stage (TileN x KS, all threads dequantize), each simdgroup owns RowsPerSG rows
 template <class F, typename TA, ushort RowsPerSG, ushort Simdgroups, ushort TileN, ushort KS, ushort Prefetch, ushort Ep = EpNone>
@@ -241,90 +325,23 @@ inline void pf_tile(device TA *input, device uchar *w0, device uchar *w1, device
     threadgroup half stage[2 * KS * N];                                                                   \
     pf_tile<F, TA, R, S, N, KS, P>(input + ulong(group.x) * (R * S) * p.input_size, w0, w1, meta, output + ulong(group.x) * (R * S) * (p.out_stride ? p.out_stride : p.output_size), \
                                    p.output_size, p.input_size, group.y * N, stage, tl, simd_lane, simd_group, p.out_stride, p.out_offset); }
-// ---------------- sg_accum: the decode tile loop without the store; acc is created by the caller (gguf_make_acc) so
-// several formats can accumulate into the same cooperative tensor type (fused segments, gate+up).
-// Initialize in the caller after construction: returning an initialized cooperative tensor
-// loses its initial values on Apple9 in runtime-format kernels (also with shader validation).
-template <typename TA, ushort Rows, ushort Cols, ushort KS>
-inline auto gguf_make_acc(device TA *input, uint input_size, threadgroup half *stage) {
-  auto a = tensor(input, dextents<int, 2>{int(input_size), Rows}, array<int, 2>{1, int(input_size)});
-  constexpr auto descriptor = matmul2d_descriptor(Rows, Cols, KS, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
-  matmul2d<descriptor, execution_simdgroups<1>> operation;
-  auto a0 = a.template slice<KS, Rows>(0, 0);
-  tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt0(stage, dextents<int, 2>{KS, Cols}, array<int, 2>{1, KS});
-  auto b0 = bt0.slice<KS, Cols>(0, 0);
-  return operation.template get_destination_cooperative_tensor<decltype(a0), decltype(b0), float>();
-}
-template <class F, typename TA, ushort Rows, ushort Cols, ushort KS, ushort Buffers, ushort Prefetch, class Acc>
-inline void sg_accum(device TA *input, device uchar *w0, device uchar *w1, device uchar *meta, uint input_size, uint output_origin,
-                     threadgroup half *stage, threadgroup half2 *tl, uint simd_lane, uint step_begin, uint step_end, thread Acc &acc) {
-  constexpr ushort GPS = KS / 32, Items = Cols * GPS, IPT = (Items + 31) / 32;
-  auto a = tensor(input, dextents<int, 2>{int(input_size), Rows}, array<int, 2>{1, int(input_size)});
-  constexpr auto descriptor = matmul2d_descriptor(Rows, Cols, KS, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
-  matmul2d<descriptor, execution_simdgroups<1>> operation;
-  const uint groups = input_size / 32, units = groups / F::MetaGroups;
-  const uint tile = output_origin / kStorageN, tile_offset = output_origin % kStorageN;
-  device uchar *tw0 = w0 + (ulong(tile) * groups * kStorageN + tile_offset) * F::P0;
-  device uchar *tw1 = w1 + (ulong(tile) * groups * kStorageN + tile_offset) * F::P1;
-  device uchar *tmeta = meta + (ulong(tile) * units * kStorageN + tile_offset) * F::MetaBytes;
-  tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt0(stage, dextents<int, 2>{KS, Cols}, array<int, 2>{1, KS});
-  tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt1(stage + (Buffers > 1 ? KS * Cols : 0), dextents<int, 2>{KS, Cols}, array<int, 2>{1, KS});
-  auto b0 = bt0.slice<KS, Cols>(0, 0), b1 = bt1.slice<KS, Cols>(0, 0);
-  typename F::Payload packed[Prefetch][IPT]; typename F::Meta hdr[IPT]; uint hdr_unit[IPT];
-  const uint unit0 = (step_begin * GPS) / F::MetaGroups;
-#pragma unroll
-  for (ushort it = 0; it < IPT; ++it) {
-    const uint item = simd_lane + it * 32; const bool live = item < Items;
-    const uint col = live ? item % Cols : 0, gi = live ? item / Cols : 0;
-#pragma unroll
-    for (ushort pf = 0; pf < Prefetch; ++pf) {
-      const ulong g = ulong(step_begin + pf) * GPS + gi;
-      if (live && step_begin + pf < step_end) packed[pf][it] = F::load(tw0 + (g * kStorageN + col) * F::P0, tw1 + (g * kStorageN + col) * F::P1);
-    }
-    hdr[it] = F::loadMeta(tmeta + (ulong(unit0) * kStorageN + col) * F::MetaBytes); hdr_unit[it] = unit0;
-  }
-  for (uint step = step_begin; step < step_end; ++step) {
-    threadgroup half *buf = stage + (Buffers > 1 ? (step & 1) * (KS * Cols) : 0);
-    if constexpr (Buffers == 1) simdgroup_barrier(mem_flags::mem_threadgroup);
-#pragma unroll
-    for (ushort it = 0; it < IPT; ++it) {
-      const uint item = simd_lane + it * 32; if (item >= Items) break;
-      const uint col = item % Cols, gi = item / Cols, g = step * GPS + gi, unit = g / F::MetaGroups; const ushort j = g % F::MetaGroups;
-      if (unit != hdr_unit[it]) { hdr[it] = F::loadMeta(tmeta + (ulong(unit) * kStorageN + col) * F::MetaBytes); hdr_unit[it] = unit; }
-      dequant32<F>(packed[0][it], hdr[it], j, tl, buf + col * KS + gi * 32);
-    }
-    simdgroup_barrier(mem_flags::mem_threadgroup);
-#pragma unroll
-    for (ushort pf = 0; pf + 1 < Prefetch; ++pf)
-#pragma unroll
-      for (ushort it = 0; it < IPT; ++it) packed[pf][it] = packed[pf + 1][it];
-    if (step + Prefetch < step_end) {
-#pragma unroll
-      for (ushort it = 0; it < IPT; ++it) {
-        const uint item = simd_lane + it * 32; if (item >= Items) break;
-        const uint col = item % Cols, gi = item / Cols; const ulong g = ulong(step + Prefetch) * GPS + gi;
-        packed[Prefetch - 1][it] = F::load(tw0 + (g * kStorageN + col) * F::P0, tw1 + (g * kStorageN + col) * F::P1);
-      }
-    }
-    auto a_slice = a.template slice<KS, Rows>(step * KS, 0);
-    if (Buffers > 1 && (step & 1)) operation.run(a_slice, b1, acc); else operation.run(a_slice, b0, acc);
-  }
-  simdgroup_barrier(mem_flags::mem_threadgroup);   // the stage may be reused by a following accumulate
-}
 // runtime dequantizer selection (uniform per threadgroup)
-template <typename TA, ushort Rows, ushort Cols, ushort KS, ushort Buffers, ushort Prefetch, class Acc>
+template <typename TA, ushort Rows, ushort Cols, ushort KS, ushort Buffers, ushort Prefetch, class Acc0, class Acc1>
 inline void gguf_accum_any(uint fmt, device TA *input, device uchar *w0, device uchar *w1, device uchar *meta, uint input_size, uint origin,
-                         threadgroup half *stage, threadgroup half2 *tl, uint simd_lane, uint sb, uint se, thread Acc &acc) {
+                           threadgroup half *stage, threadgroup half2 *tl, uint simd_lane, uint sb, uint se, thread Acc0 &first,
+                           thread Acc1 &second) {
+#define GGUF_ACCUM(F) sg_accum<F, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, first, second)
   switch (fmt) {
-  case GGUF_FMT_Q4K: sg_accum<FmtQ4K, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, acc); break;
-  case GGUF_FMT_IQ4XS: sg_accum<FmtIQ4XS, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, acc); break;
-  case GGUF_FMT_IQ4NL: sg_accum<FmtIQ4NL, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, acc); break;
-  case GGUF_FMT_Q5K: sg_accum<FmtQ5K, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, acc); break;
-  case GGUF_FMT_Q6K: sg_accum<FmtQ6K, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, acc); break;
-  case GGUF_FMT_Q3K: sg_accum<FmtQ3K, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, acc); break;
-  case GGUF_FMT_Q80: sg_accum<FmtQ80, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, acc); break;
-  default: sg_accum<FmtIQ3S, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, acc); break;
+  case GGUF_FMT_Q4K: GGUF_ACCUM(FmtQ4K); break;
+  case GGUF_FMT_IQ4XS: GGUF_ACCUM(FmtIQ4XS); break;
+  case GGUF_FMT_IQ4NL: GGUF_ACCUM(FmtIQ4NL); break;
+  case GGUF_FMT_Q5K: GGUF_ACCUM(FmtQ5K); break;
+  case GGUF_FMT_Q6K: GGUF_ACCUM(FmtQ6K); break;
+  case GGUF_FMT_Q3K: GGUF_ACCUM(FmtQ3K); break;
+  case GGUF_FMT_Q80: GGUF_ACCUM(FmtQ80); break;
+  default: GGUF_ACCUM(FmtIQ3S); break;
   }
+#undef GGUF_ACCUM
 }
 
 // ---------------- fused segments: one dispatch over up to three column segments of different formats (decode rows)
@@ -341,14 +358,11 @@ inline void gguf_accum_any(uint fmt, device TA *input, device uchar *w0, device 
     else if (group >= t0) { w0 = w0b; w1 = w1b; meta = mb; fmt = p.fmt[1]; off = p.offset[1]; local = group - t0; }                \
     const uint origin = local * 64 + simd_group * 32, steps = p.input_size / 32;                            \
     threadgroup half *my = stage + simd_group * (2 * 32 * 32);                                              \
-    auto acc = gguf_make_acc<bfloat, R, 32, 32>(input, p.input_size, my);                                     \
-    for (ushort i = 0; i < acc.get_capacity(); ++i) acc[i] = 0.0f;                                    \
-    gguf_accum_any<bfloat, R, 32, 32, 2, 1>(fmt, input, w0, w1, meta, p.input_size, origin, my, tl, simd_lane, 0, steps, acc); \
-    for (ushort i = 0; i < acc.get_capacity(); ++i) {                                                       \
-      if (!acc.is_valid_element(i)) continue;                                                              \
-      auto index = acc.get_multidimensional_index(i);                                                      \
-      output[ulong(index[1]) * p.out_stride + off + origin + index[0]] = bfloat(acc[i]);                   \
-    }                                                                                                       \
+    GGUF_TILE(R, first, second, input, p.input_size, my);                                                   \
+    gguf_accum_any<bfloat, R, 32, 32, 2, 1>(fmt, input, w0, w1, meta, p.input_size, origin, my, tl, simd_lane, 0, steps, first, second); \
+    gguf_elements<R>(first, second, [&](uint row, uint column, float v) {                                  \
+      output[ulong(row) * p.out_stride + off + origin + column] = bfloat(v);                                \
+    });                                                                                                     \
   }
 GGUF_FUSED_K(8) GGUF_FUSED_K(16) GGUF_FUSED_K(24) GGUF_FUSED_K(32)
 
@@ -361,18 +375,13 @@ GGUF_FUSED_K(8) GGUF_FUSED_K(16) GGUF_FUSED_K(24) GGUF_FUSED_K(32)
     quant_iq4_pair_table(tl, simd_group * 32 + simd_lane, 64);                                               \
     const uint origin = group * 64 + simd_group * 32, steps = p.input_size / 32;                           \
     threadgroup half *my = stage + simd_group * (2 * 32 * 32);   /* one 8 KB stage for both passes: occupancy */ \
-    auto gate = gguf_make_acc<bfloat, R, 32, 32>(input, p.input_size, my);                                    \
-    for (ushort i = 0; i < gate.get_capacity(); ++i) gate[i] = 0.0f;                                   \
-    gguf_accum_any<bfloat, R, 32, 32, 2, 1>(p.gate_fmt, input, gw0, gw1, gm, p.input_size, origin, my, tl, simd_lane, 0, steps, gate); \
-    auto up = gguf_make_acc<bfloat, R, 32, 32>(input, p.input_size, my);                                      \
-    for (ushort i = 0; i < up.get_capacity(); ++i) up[i] = 0.0f;                                     \
-    gguf_accum_any<bfloat, R, 32, 32, 2, 1>(p.up_fmt, input, uw0, uw1, um, p.input_size, origin, my, tl, simd_lane, 0, steps, up); \
-    for (ushort i = 0; i < gate.get_capacity(); ++i) {                                                      \
-      if (!gate.is_valid_element(i)) continue;                                                             \
-      auto index = gate.get_multidimensional_index(i);                                                     \
-      const float g = float(bfloat(gate[i])), u = float(bfloat(up[i]));                                    \
-      output[ulong(index[1]) * p.out_stride + origin + index[0]] = bfloat(silu_gate(g) * u);               \
-    }                                                                                                       \
+    GGUF_TILE(R, gate, gate2, input, p.input_size, my);                                                     \
+    gguf_accum_any<bfloat, R, 32, 32, 2, 1>(p.gate_fmt, input, gw0, gw1, gm, p.input_size, origin, my, tl, simd_lane, 0, steps, gate, gate2); \
+    GGUF_TILE(R, up, up2, input, p.input_size, my);                                                         \
+    gguf_accum_any<bfloat, R, 32, 32, 2, 1>(p.up_fmt, input, uw0, uw1, um, p.input_size, origin, my, tl, simd_lane, 0, steps, up, up2); \
+    gguf_element_pairs<R>(gate, gate2, up, up2, [&](uint row, uint column, float g, float u) {               \
+      output[ulong(row) * p.out_stride + origin + column] = bfloat(silu_gate(float(bfloat(g))) * float(bfloat(u))); \
+    });                                                                                                     \
   }
 GGUF_GATEUP_K(8) GGUF_GATEUP_K(16) GGUF_GATEUP_K(24) GGUF_GATEUP_K(32)
 
@@ -385,29 +394,22 @@ inline void gguf_splitk_tile(device bfloat *input, device uchar *w0, device ucha
   const uint steps = p.input_size / 32, per = steps / p.splits, thread_index = simd_group * 32 + simd_lane;
   const uint origin = group.x * 64 + simd_group * 32;
   threadgroup half *my = stage + simd_group * (2 * 32 * 32);
-  auto acc = gguf_make_acc<bfloat, Rows, 32, 32>(input, p.input_size, my);
-#pragma unroll
-  for (ushort i = 0; i < acc.get_capacity(); ++i) acc[i] = 0.0f;
-  sg_accum<F, bfloat, Rows, 32, 32, 2, 1>(input, w0, w1, meta, p.input_size, origin, my, tl, simd_lane, group.y * per, (group.y + 1) * per, acc);
+  GGUF_TILE(Rows, first, second, input, p.input_size, my);
+  sg_accum<F, bfloat, Rows, 32, 32, 2, 1>(input, w0, w1, meta, p.input_size, origin, my, tl, simd_lane, group.y * per,
+                                          (group.y + 1) * per, first, second);
   const ulong N = p.output_size;
-#pragma unroll
-  for (ushort i = 0; i < acc.get_capacity(); ++i) {
-    if (!acc.is_valid_element(i)) continue;
-    auto index = acc.get_multidimensional_index(i);
-    partials[(ulong(group.y) * Rows + index[1]) * N + origin + index[0]] = acc[i];
-  }
+  gguf_elements<Rows>(first, second, [&](uint row, uint column, float v) {
+    partials[(ulong(group.y) * Rows + row) * N + origin + column] = v;
+  });
   if (!split_arrive_last(counters + group.x, p.splits, thread_index, arrival)) return;
-#pragma unroll
-  for (ushort i = 0; i < acc.get_capacity(); ++i) {
-    if (!acc.is_valid_element(i)) continue;
-    auto index = acc.get_multidimensional_index(i);
-    float total = split_sum(float(acc[i]), group.y, p.splits,
-                            [&](uint s) { return partials[(ulong(s) * Rows + index[1]) * N + origin + index[0]]; });
-    const ulong o = ulong(index[1]) * p.out_stride + p.out_offset + origin + index[0];
+  gguf_elements<Rows>(first, second, [&](uint row, uint column, float v) {
+    float total = split_sum(v, group.y, p.splits,
+                            [&](uint s) { return partials[(ulong(s) * Rows + row) * N + origin + column]; });
+    const ulong o = ulong(row) * p.out_stride + p.out_offset + origin + column;
     if (p.epilogue == GGUF_EPILOGUE_RESIDUAL) total += float(aux[o]);
     if (p.epilogue == GGUF_EPILOGUE_UP_WITH_GATE) total = float(bfloat(total)) * silu_gate(float(aux[o]));
     output[o] = bfloat(total);
-  }
+  });
   split_release(counters + group.x, thread_index);
 }
 #define GGUF_SPLITK_K(F, f, R)                                                                                      \
