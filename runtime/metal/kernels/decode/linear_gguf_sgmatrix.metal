@@ -17,6 +17,7 @@
 #pragma clang fp reassociate(off)
 #include "metal/abi/Gguf.h"
 #include "metal/kernels/common/gguf_sgmatrix.h"
+#include "metal/kernels/common/moe_expert_slab.h"
 #include "metal/kernels/common/quant_formats.h"
 #include "metal/kernels/common/split_reduce.h"
 
@@ -375,3 +376,51 @@ GGUF_SG_FUSED(4)
 #undef GGUF_SG_FUSED
 #undef GGUF_SG_DECODE
 #undef GGUF_SG_SEGMENT
+
+// MoE experts (ops/MoE.cpp): threadgroup (x, y) computes 64 columns of grouped 8-row tile y from its Table16 tile
+// (kernels/shared/moe.metal) with the weights of the tile's expert (moe_gguf_segment), in the format the tile picks
+// at run time: on the 40-core M3 Max one run-time-format kernel is within +1.6% of the per-format kernels
+// (time-sg at 23040x2048 Q4_K and 92160x512 Q5_K, one to four lanes). No K splits, so no partials or counters.
+// aux is the gate of the up pass. Grid (N / 64, tiles), 128 threads.
+template <uint Ep>
+inline void gguf_sg_expert(device const bfloat *table, device const float *sums, device const MoeTileDescriptor *tiles,
+                           device const uint *tile_count, device uchar *w0, device uchar *w1, device uchar *meta,
+                           device uchar *sw0, device uchar *sw1, device uchar *smeta, device bfloat *out,
+                           device const bfloat *aux, constant MoeGgufExpertParams &p, uint2 tg, uint tid, uint sg,
+                           uint lane, threadgroup bfloat2 *lut, threadgroup float2 *coefs, threadgroup uint *arrival) {
+  if (tg.y >= *tile_count) return;
+  const MoeGgufSegment s = moe_gguf_segment(tiles[tg.y].expert, p, w0, w1, meta, sw0, sw1, smeta);
+  if (s.format == GGUF_FMT_IQ4XS || s.format == GGUF_FMT_IQ4NL) {
+    for (uint i = tid; i < 256; i += 128)
+      lut[i] = bfloat2(float2(float(kIQ4NLValues[i & 15]), float(kIQ4NLValues[i >> 4])));
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  const uint K = p.input_size, N = p.output_size;
+  const ulong rows = ulong(tg.y) * 8;
+  const GgufDecodeParams q{K, 1, N, 0};
+  quant_format_switch(s.format, [&](auto format) {
+    typedef decltype(format) F;
+    gguf_sg::decode<F, 1, Ep>(
+        table + rows * K, sums + tg.y * q16sg::sums_per_tile(K), s.w0, s.w1, s.meta, out + rows * N, nullptr, nullptr,
+        aux + rows * N, q, uint2(tg.x, 0), tid, sg, lane, lut, reinterpret_cast<threadgroup gguf_sg::Coef<F> *>(coefs),
+        arrival);
+  });
+}
+#define GGUF_SG_EXPERT(Name, EP)                                                                                    \
+  kernel void Name(device const bfloat *table [[buffer(0)]], device const float *sums [[buffer(1)]],              \
+                   device const MoeTileDescriptor *tiles [[buffer(2)]], device const uint *tile_count [[buffer(3)]], \
+                   device uchar *w0 [[buffer(4)]], device uchar *w1 [[buffer(5)]], device uchar *meta [[buffer(6)]], \
+                   device uchar *sw0 [[buffer(7)]], device uchar *sw1 [[buffer(8)]], device uchar *smeta [[buffer(9)]], \
+                   device bfloat *out [[buffer(10)]], device const bfloat *aux [[buffer(11)]],                      \
+                   constant MoeGgufExpertParams &p [[buffer(12)]], uint2 tg [[threadgroup_position_in_grid]],       \
+                   uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],            \
+                   uint lane [[thread_index_in_simdgroup]]) {                                                       \
+    threadgroup bfloat2 lut[256];                                                                                   \
+    threadgroup float2 coefs[4 * 16 * 8];                                                                           \
+    threadgroup uint arrival;                                                                                       \
+    gguf_sg_expert<EP>(table, sums, tiles, tile_count, w0, w1, meta, sw0, sw1, smeta, out, aux, p, tg, tid, sg, lane, \
+                       lut, coefs, &arrival);                                                                       \
+  }
+GGUF_SG_EXPERT(moe_expert_gguf_sg, GGUF_EPILOGUE_NONE)
+GGUF_SG_EXPERT(moe_expert_gguf_sg_up, GGUF_EPILOGUE_UP_WITH_GATE)
+#undef GGUF_SG_EXPERT

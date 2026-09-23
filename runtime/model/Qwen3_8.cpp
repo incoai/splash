@@ -65,26 +65,8 @@ Qwen3_8Weights loadQwen3_8Weights(metal::MetalBackend &backend,
   if (ggufTarget) {
     // The target directory holds the llama.cpp GGUF; every layer image is
     // repacked into memory as it is read.
-    gguf::TargetGeometry geometry;
-    geometry.layers = layout.layers;
-    geometry.hiddenSize = layout.hiddenSize;
-    geometry.vocabularySize = layout.vocabularySize;
-    geometry.intermediateSize = layout.intermediateSize;
-    geometry.gdnKeyHeads = layout.gdnKeyHeads;
-    geometry.gdnValueHeads = layout.gdnValueHeads;
-    geometry.gdnHeadDimension = layout.gdnHeadDimension;
-    geometry.convolutionDimension = layout.convolutionDimension;
-    geometry.attentionWidth = layout.attentionWidth;
-    geometry.attentionHeadDimension = layout.attentionHeadDimension;
-    geometry.fullAttentionPeriod = layout.fullAttentionPeriod;
-    GgufTargetLoader loader(backend, findTargetGguf(directory), geometry);
-    struct GgufFiles {
-      GgufTargetLoader &loader;
-      WeightFile layer(uint32_t index, bool) { return loader.layer(index); }
-      WeightFile head(uint32_t) { return loader.head(); }
-      WeightFile embedding(uint32_t, uint32_t) { return loader.embedding(); }
-    };
-    weights = readQwenTargetWeights<Qwen3_8Weights>(backend, layout, GgufFiles{loader},
+    GgufTargetLoader loader(backend, findTargetGguf(directory), ggufTargetGeometry(layout));
+    weights = readQwenTargetWeights<Qwen3_8Weights>(backend, layout, GgufTargetFiles{loader},
                                                     readFfn, true);
   } else {
     weights = loadQwenTargetWeights<Qwen3_8Weights>(backend, directory, layout, kHeadMagic,

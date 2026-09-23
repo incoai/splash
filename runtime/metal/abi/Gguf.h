@@ -70,6 +70,19 @@ struct GgufCopyParams {
 };
 static_assert(sizeof(GgufCopyParams) == 12, "GGUF copy parameters are 12 bytes on both sides");
 
+// fp32 projection of a GGUF float tensor (kernels/shared/gguf_float.metal):
+// out[r][out_offset + n] = sum_k x[r][k] * W[n][k] for rows r < rows, W as
+// stored ([output_size][input_size] floats of ggml type GGUF_TYPE_F32).
+#define GGUF_TYPE_F32 0u
+struct GgufFloatParams {
+  uint32_t rows;
+  uint32_t input_size;  // K, a multiple of 8
+  uint32_t output_size; // N, a multiple of 8
+  uint32_t out_stride;  // columns of a destination row
+  uint32_t out_offset;  // first destination column
+};
+static_assert(sizeof(GgufFloatParams) == 20, "GGUF float parameters are 20 bytes on both sides");
+
 #define GGUF_EPILOGUE_NONE 0u
 #define GGUF_EPILOGUE_RESIDUAL 1u
 #define GGUF_EPILOGUE_UP_WITH_GATE 2u

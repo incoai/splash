@@ -67,6 +67,7 @@ TEST_MEMORY_TEST := $(ENGINE_TEST_BUILD)/engine-memory-plan
 TEST_DEVICE_QUERIES := $(ENGINE_TEST_BUILD)/device-queries
 TEST_GGUF_FILE := $(ENGINE_TEST_BUILD)/gguf-file
 TEST_GGUF_PROJECTION := $(ENGINE_TEST_BUILD)/gguf-projection
+TEST_GGUF_MOE := $(ENGINE_TEST_BUILD)/gguf-moe
 TEST_GGUF_REPACK := $(ENGINE_TEST_BUILD)/gguf-repack
 TEST_GGUF_DEQUANT_LIB := $(ENGINE_TEST_BUILD)/gguf-dequant.metallib
 TEST_KV_PAGE_CACHE_TEST := $(ENGINE_TEST_BUILD)/kv-page-cache
@@ -164,6 +165,7 @@ TEST_CPU_TARGETS := $(TEST_OPERATOR_WORKSPACE) \
 
 TEST_METAL_TARGETS := $(TEST_Q4_SGMATRIX_TEST) $(TEST_TUNING_WORKLOADS) \
 	$(TEST_GGUF_PROJECTION) \
+	$(TEST_GGUF_MOE) \
 	$(TEST_GGUF_REPACK) \
 	$(TEST_LINEAR_TUNING) \
 	$(TEST_ATTENTION_TUNING) \
@@ -400,6 +402,14 @@ $(TEST_MOE_METAL_TEST): runtime/metal/DeviceCapabilities.cpp \
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
 		$(ENGINE_LINKFLAGS) -o $@
 
+$(TEST_GGUF_MOE): runtime/metal/DeviceCapabilities.cpp \
+		runtime/metal/MetalBackend.mm runtime/ops/Linear.cpp runtime/ops/LinearGguf.cpp \
+		runtime/ops/MoE.cpp runtime/ops/ExecutionPlans.cpp runtime/ops/PagedAttention.cpp \
+		runtime/ops/DraftAttention.cpp runtime/ops/Normalization.cpp dev/tests/engine/gguf_moe_test.mm \
+		dev/tests/engine/GgufFormatReference.hpp $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
+		$(ENGINE_LINKFLAGS) -o $@
+
 $(TEST_GDN_METAL_TEST): runtime/metal/DeviceCapabilities.cpp \
 		runtime/metal/MetalBackend.mm runtime/ops/GDN.cpp runtime/ops/Normalization.cpp \
 		dev/tests/engine/gdn_metal_test.mm $(LIB) | $(ENGINE_TEST_BUILD)
@@ -629,6 +639,7 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 	$(METAL_TEST_ENV) $(TEST_GGUF_REPACK) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_GGUF_PROJECTION) $(TEST_GGUF_DEQUANT_LIB) dequant
 	$(METAL_TEST_ENV) $(TEST_GGUF_PROJECTION) $(LIB) full
+	$(METAL_TEST_ENV) $(TEST_GGUF_MOE) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_TUNING_WORKLOADS) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_LINEAR_TUNING) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_ATTENTION_TUNING) --metal $(LIB)

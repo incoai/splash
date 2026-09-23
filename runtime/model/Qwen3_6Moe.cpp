@@ -1,5 +1,7 @@
 #include "Qwen3_6Moe.hpp"
 
+#include "model/GgufTarget.hpp"
+
 #include <string_view>
 
 namespace splash::model {
@@ -47,8 +49,30 @@ void requireLayout(const Qwen3_6MoeLayout &layout) {
 Qwen3_6MoeWeights
 loadQwen3_6MoeWeights(metal::MetalBackend &backend,
                       const std::filesystem::path &directory,
-                      Qwen3_6MoeLayout layout) {
+                      Qwen3_6MoeLayout layout, bool ggufTarget) {
   requireLayout(layout);
+  if (ggufTarget) {
+    // The target directory holds the llama.cpp GGUF; every layer image is
+    // repacked into memory as it is read (model/GgufImage.hpp).
+    GgufTargetLoader loader(backend, findTargetGguf(directory),
+                            ggufTargetGeometry(layout));
+    return readQwenTargetWeights<Qwen3_6MoeWeights>(
+        backend, layout, GgufTargetFiles{loader},
+        [](WeightFile &file, Qwen3_6MoeLayerWeights &layer) {
+          ops::GgufMoeWeights ffn;
+          ffn.router = readGgufSegment(file, "router");
+          ffn.gate.routed = readGgufSegment(file, "experts-gate");
+          ffn.up.routed = readGgufSegment(file, "experts-up");
+          ffn.down.routed = readGgufSegment(file, "experts-down");
+          ffn.gate.shared = readGgufSegment(file, "shared-expert-gate");
+          ffn.up.shared = readGgufSegment(file, "shared-expert-up");
+          ffn.down.shared = readGgufSegment(file, "shared-expert-down");
+          ffn.sharedExpertGate =
+              readGgufSegment(file, "shared-expert-scalar-gate");
+          layer.ffn.gguf = std::move(ffn);
+        },
+        true);
+  }
   return loadQwenTargetWeights<Qwen3_6MoeWeights>(
       backend, directory, layout, kHeadMagic,
       [&](WeightFile &file, Qwen3_6MoeLayerWeights &layer) {

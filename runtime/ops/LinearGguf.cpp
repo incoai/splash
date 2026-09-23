@@ -85,6 +85,9 @@ void recordLanes(Q4DispatchStats *stats, uint32_t rows) {
   else ++stats->m32Dispatches;
 }
 
+// Segments tile the leading columns of the destination rows; the columns past
+// the last segment are padding no kernel writes. The 35B GGUF's packed GDN row
+// is 12544 columns (the affine layout's), its qkv|z|alpha-beta segments 12352.
 void requireSegments(const Q4Projection &p, LinearMatrix matrix) {
   uint32_t covered = 0;
   for (const GgufSegment &s : p.gguf) {
@@ -93,8 +96,15 @@ void requireSegments(const Q4Projection &p, LinearMatrix matrix) {
       throw std::invalid_argument("GGUF segments do not tile the projection");
     covered += s.outputSize;
   }
-  if (covered != matrix.outputSize)
-    throw std::invalid_argument("GGUF segments do not cover the projection");
+  if (covered > matrix.outputSize)
+    throw std::invalid_argument("GGUF segments exceed the projection");
+}
+
+// Columns of the segments, which the fused kernels' grids cover.
+uint32_t segmentColumns(const Q4Projection &p) {
+  uint32_t columns = 0;
+  for (const GgufSegment &s : p.gguf) columns += s.outputSize;
+  return columns;
 }
 
 } // namespace
@@ -143,6 +153,14 @@ void Q4Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
     requireSegments(*gate, w.matrix);
   } else if (gate) {
     throw std::invalid_argument("unexpected GGUF gate projection");
+  }
+  if (std::any_of(p.gguf.begin(), p.gguf.end(), [](const GgufSegment &s) { return s.isFloat(); })) {
+    // The quantized segments, which precede the float ones, run the plan's tiles.
+    addGgufFloatSegments(graph, b, p, plan);
+    Q4Projection quantized = p;
+    std::erase_if(quantized.gguf, [](const GgufSegment &s) { return s.isFloat(); });
+    if (!quantized.gguf.empty()) addGguf(graph, b, quantized, plan, gate, stats);
+    return;
   }
   const uint32_t rows = plan.storageRows();
   const auto need = [&](const metal::MetalBuffer &buffer, uint64_t bytes, const char *what) {
@@ -260,7 +278,7 @@ void Q4Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
   }
   bindings.insert(bindings.end(), {b.output, partials, counters});
   graph.add("gguf_decode_fused_m" + std::to_string(rows), std::move(bindings), params,
-            {n / kDecodeTileColumns, splits, 1}, {kDecodeThreads, 1, 1});
+            {segmentColumns(p) / kDecodeTileColumns, splits, 1}, {kDecodeThreads, 1, 1});
 }
 
 // All lanes in each threadgroup. Single tensors run their format's kernel;
@@ -286,7 +304,7 @@ void Q4Linear::addGgufSimdgroup(metal::CommandGraph &graph, const LinearBuffers 
   if (b.prepared.layout != LinearInput::Table16 || !b.prepared.source.sameView(b.input))
     graph.add("decode_linear_gguf_prepare", {b.input, b.scratch.input, b.scratch.sums}, k,
               {k / 32, lanes, 1}, {128, 1, 1});
-  const metal::DispatchSize grid{n / kDecodeTileColumns, config.splits, 1};
+  const metal::DispatchSize grid{segmentColumns(p) / kDecodeTileColumns, config.splits, 1};
   const std::string suffix = "_l" + std::to_string(lanes);
   if (p.gguf.size() > 1) {
     if (p.gguf.size() > 3 || w.epilogue != LinearEpilogue::None)
@@ -323,6 +341,33 @@ void Q4Linear::addGgufSimdgroup(metal::CommandGraph &graph, const LinearBuffers 
     break;
   case LinearEpilogue::UpWithGate: throw std::invalid_argument("GGUF decode has no up-with-gate projection");
   }
+}
+
+// Float segments of a projection (GgufSegment::isFloat): the fp32 kernel over
+// the step's rows, whatever the rows of the plan's tiles.
+void Q4Linear::addGgufFloatSegments(metal::CommandGraph &graph, const LinearBuffers &b,
+                                    const Q4Projection &p, const LinearPlan &plan) const {
+  const LinearWorkload w = plan.workload();
+  if (w.epilogue != LinearEpilogue::None) throw std::invalid_argument("GGUF float segments take no epilogue");
+  for (const GgufSegment &s : p.gguf)
+    if (s.isFloat()) addGgufFloat(graph, b.input, s, b.output, w.rows, w.matrix.outputSize, s.columnOffset);
+}
+
+bool GgufSegment::isFloat() const noexcept { return type == GGUF_TYPE_F32; }
+
+// 8 columns of 32 rows per threadgroup of 16 simdgroups (kernels/shared/gguf_float.metal).
+void addGgufFloat(metal::CommandGraph &graph, metal::MetalBuffer input, const GgufSegment &weights,
+                  metal::MetalBuffer output, uint32_t rows, uint32_t outStride, uint32_t outOffset,
+                  FloatOutput type) {
+  const uint32_t n = weights.outputSize, k = weights.inputSize;
+  const uint64_t element = type == FloatOutput::Float32 ? sizeof(float) : sizeof(uint16_t);
+  if (!weights.isFloat() || !rows || !n || n % 8 || !k || k % 8 || outOffset + uint64_t{n} > outStride ||
+      weights.plane0.sizeBytes() < uint64_t{n} * k * sizeof(float) || input.sizeBytes() < uint64_t{rows} * k * 2 ||
+      output.sizeBytes() < (uint64_t{rows - 1} * outStride + outOffset + n) * element)
+    throw std::invalid_argument("invalid GGUF float projection");
+  graph.add(type == FloatOutput::Float32 ? "gguf_float_f32" : "gguf_float_bf16",
+            {std::move(input), weights.plane0, std::move(output)}, GgufFloatParams{rows, k, n, outStride, outOffset},
+            {n / 8, (rows + 31) / 32, 1}, {512, 1, 1});
 }
 
 } // namespace splash::ops

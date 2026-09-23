@@ -31,7 +31,19 @@ struct GgufSegment final {
   uint32_t columnOffset = 0;
   uint32_t formatId = 0;    // GGUF_FMT_* (metal/abi/QuantFormat.h)
   const char *format = "";
+  // A float tensor the GGUF keeps unquantized (F32, as llama.cpp keeps the
+  // MoE router): plane0 holds its [outputSize][inputSize] floats, multiplied
+  // unrounded in fp32 (kernels/shared/gguf_float.metal).
+  [[nodiscard]] bool isFloat() const noexcept;
 };
+
+// The destination element type of a float segment's projection.
+enum class FloatOutput : uint8_t { BFloat16, Float32 };
+// out[r][outOffset + n] = sum_k input[r][k] W[n][k] for rows r < `rows` of a
+// float segment, into a destination of `outStride` columns (LinearGguf.cpp).
+void addGgufFloat(metal::CommandGraph &graph, metal::MetalBuffer input, const GgufSegment &weights,
+                  metal::MetalBuffer output, uint32_t rows, uint32_t outStride, uint32_t outOffset,
+                  FloatOutput type = FloatOutput::BFloat16);
 
 struct Q4Projection final {
   metal::MetalBuffer weights;
@@ -308,6 +320,8 @@ private:
   void addGgufSimdgroup(metal::CommandGraph &graph, const LinearBuffers &buffers,
                         const Q4Projection &projection, const LinearPlan &plan,
                         const Q4Projection *gate) const;
+  void addGgufFloatSegments(metal::CommandGraph &graph, const LinearBuffers &buffers,
+                            const Q4Projection &projection, const LinearPlan &plan) const;
   uint32_t appleGpuFamily_ = 0;
   uint32_t gpuCores_ = 0;
   std::vector<LinearChoice> choices_;

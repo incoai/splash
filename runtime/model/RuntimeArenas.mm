@@ -154,6 +154,7 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
     put(PrefillTensor::MoeGroupedInput, workspace.groupedInputBytes);
     put(PrefillTensor::MoeExpertIntermediate, workspace.expertIntermediateBytes);
     put(PrefillTensor::MoeExpertOutput, workspace.expertOutputBytes);
+    put(PrefillTensor::MoeGroupedSums, workspace.groupedSumsBytes);
   }
   return result;
 }
@@ -335,6 +336,7 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
     put(DecodeTensor::MoeGroupedInput, workspace.groupedInputBytes);
     put(DecodeTensor::MoeExpertIntermediate, workspace.expertIntermediateBytes);
     put(DecodeTensor::MoeExpertOutput, workspace.expertOutputBytes);
+    put(DecodeTensor::MoeGroupedSums, workspace.groupedSumsBytes);
   }
   return result;
 }

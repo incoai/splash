@@ -1,12 +1,14 @@
 #pragma once
 
-// Plans the in-memory MDGG0001 images of a Qwen3.8 target read straight from a
-// llama.cpp GGUF: section offsets, the bytes the CPU fills (header, descriptors,
-// norms, convolution, decay, time bias, alpha/beta) and the GPU repacks/copies
-// that move quantized rows into 256-column tiles. Layout: 16-byte header
-// (magic, layer, type), then 16 KiB-aligned sections; each quantized tensor is a
-// 64-byte descriptor, then its plane0, optional plane1 and meta planes in the
-// layout of its format (metal/abi/QuantFormat.h).
+// Plans the in-memory MDGG0001 images of a Qwen3.8 (qwen35) or Qwen3.6 MoE
+// (qwen35moe) target read straight from a llama.cpp GGUF: section offsets, the
+// bytes the CPU fills (header, descriptors, norms, convolution, decay, time
+// bias, alpha/beta) and the GPU repacks/copies that move quantized rows into
+// 256-column tiles. Layout: 16-byte header (magic, layer, type), then 16
+// KiB-aligned sections; each quantized tensor is a 64-byte descriptor, then its
+// plane0, optional plane1 and meta planes in the layout of its format
+// (metal/abi/QuantFormat.h); each float tensor (F32) a descriptor and its rows
+// as stored. A 3-D expert tensor is one quantized tensor of experts * N rows.
 
 #include <cstdint>
 #include <string>
@@ -24,16 +26,27 @@ struct TargetGeometry {
   uint32_t layers = 64;
   uint32_t hiddenSize = 5120;
   uint32_t vocabularySize = 248320;
-  uint32_t intermediateSize = 17408;
+  uint32_t intermediateSize = 17408; // dense FFN
   uint32_t gdnKeyHeads = 16;
   uint32_t gdnValueHeads = 48;
   uint32_t gdnHeadDimension = 128;
   uint32_t convolutionDimension = 10240;
   uint32_t attentionWidth = 6144;
+  uint32_t attentionKvHeads = 4;
   uint32_t attentionHeadDimension = 256;
   uint32_t fullAttentionPeriod = 4;
+  // A sparse MoE FFN (qwen35moe) when experts is set; the shared expert has
+  // the routed experts' intermediate width.
+  uint32_t experts = 0;
+  uint32_t expertsPerToken = 0;
+  uint32_t expertIntermediateSize = 0;
   [[nodiscard]] bool isFullAttentionLayer(uint32_t layer) const noexcept {
     return (layer + 1) % fullAttentionPeriod == 0;
+  }
+  [[nodiscard]] bool sparseMoe() const noexcept { return experts != 0; }
+  // The general.architecture of a GGUF of this target.
+  [[nodiscard]] const char *architecture() const noexcept {
+    return sparseMoe() ? "qwen35moe" : "qwen35";
   }
 };
 

@@ -195,3 +195,19 @@ struct FmtIQ3S {
 };
 
 #undef QUANT_FORMAT
+
+// Runs body(F()) with the format type of run-time format id `format` (GGUF_FMT_*), for kernels whose tiles pick
+// their tensor, and so its format, at run time. The branch is uniform in a threadgroup.
+template <class Body>
+inline void quant_format_switch(uint format, Body body) {
+  switch (format) {
+  case GGUF_FMT_Q4K: body(FmtQ4K()); break;
+  case GGUF_FMT_IQ4XS: body(FmtIQ4XS()); break;
+  case GGUF_FMT_IQ4NL: body(FmtIQ4NL()); break;
+  case GGUF_FMT_Q5K: body(FmtQ5K()); break;
+  case GGUF_FMT_Q6K: body(FmtQ6K()); break;
+  case GGUF_FMT_Q3K: body(FmtQ3K()); break;
+  case GGUF_FMT_Q80: body(FmtQ80()); break;
+  default: body(FmtIQ3S()); break;
+  }
+}

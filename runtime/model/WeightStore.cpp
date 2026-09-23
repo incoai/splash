@@ -1,6 +1,6 @@
 #include "WeightStore.hpp"
 
-#include "metal/abi/QuantFormat.h"
+#include "metal/abi/Gguf.h"
 
 #include <CommonCrypto/CommonDigest.h>
 
@@ -315,7 +315,9 @@ GgufDescriptor readGgufDescriptor(WeightFile &file, std::string_view label) {
     std::memcpy(&d.plane0Bytes, bytes + 32, 8);
     std::memcpy(&d.plane1Bytes, bytes + 40, 8);
     std::memcpy(&d.metaTotalBytes, bytes + 48, 8);
-    if (!d.outputSize || !d.inputSize || d.outputSize % kQ4StorageN || d.inputSize % 256)
+    // Float tensors are rows as stored; quantized ones fill 256-column tiles.
+    if (!d.outputSize || !d.inputSize ||
+        (d.type != GGUF_TYPE_F32 && (d.outputSize % kQ4StorageN || d.inputSize % 256)))
         throw WeightStoreError("GGUF tensor shape is not tile aligned: " + std::string(label));
     return d;
 }
@@ -323,6 +325,17 @@ GgufDescriptor readGgufDescriptor(WeightFile &file, std::string_view label) {
 
 ops::GgufSegment readGgufSegment(WeightFile &file, std::string_view label) {
     const GgufDescriptor d = readGgufDescriptor(file, label);
+    if (d.type == GGUF_TYPE_F32) {
+        if (d.p0 || d.p1 || d.metaBytes || d.metaGroups || d.plane1Bytes || d.metaTotalBytes ||
+            d.plane0Bytes != uint64_t{d.outputSize} * d.inputSize * sizeof(float))
+            throw WeightStoreError("GGUF float section sizes are inconsistent: " + std::string(label));
+        ops::GgufSegment s;
+        s.plane0 = file.section(d.plane0Bytes, std::string(label) + "-floats");
+        s.type = d.type; s.outputSize = d.outputSize; s.inputSize = d.inputSize;
+        s.formatId = GGUF_FMT_COUNT;
+        s.format = "f32";
+        return s;
+    }
     const uint32_t format = gguf_format_of(d.type);
     if (format == GGUF_FMT_COUNT)
         throw WeightStoreError("unsupported GGUF tensor type " + std::to_string(d.type));

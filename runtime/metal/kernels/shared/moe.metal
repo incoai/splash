@@ -1,4 +1,5 @@
 #include "metal/abi/KernelABI.h"
+#include "metal/kernels/common/gguf_sgmatrix.h"
 #include "metal/kernels/common/moe_expert_slab.h"
 #include "metal/kernels/common/q4_mpp_tiles.h"
 
@@ -263,29 +264,47 @@ kernel void moe_route_scores_q8_m32(
   });
 }
 
+// The shared expert's scalar gate weight of input `dimension`: the Q8 affine
+// row of a packed model, or the F32 tensor of a GGUF (ffn_gate_inp_shexp),
+// which runs unrounded.
+struct MoeSharedGateQ8 {
+  device uint8_t *weights;
+  device bfloat *scales;
+  device bfloat *biases;
+};
+struct MoeSharedGateF32 {
+  device const float *weights;
+};
+inline float moe_shared_gate_weight(MoeSharedGateQ8 gate, uint dimension) {
+  constexpr uint StorageN = 256;
+  uint quant_group = dimension / 64;
+  uint within_group = dimension % 64;
+  ulong weight_index = ulong(quant_group) * StorageN * 64 + within_group;
+  ulong parameter = ulong(quant_group) * StorageN;
+  return float(gate.weights[weight_index]) * float(gate.scales[parameter]) +
+         float(gate.biases[parameter]);
+}
+inline float moe_shared_gate_weight(MoeSharedGateF32 gate, uint dimension) {
+  return gate.weights[dimension];
+}
+
 // One row per threadgroup: thread e holds expert e's score, the threadgroup
 // reduces the shared expert's scalar gate with a fixed partial-sum order, and
 // simdgroup 0 orders the experts, descending score then ascending id, which
-// is the order the shape's routing and tie-break contract requires.
-kernel void moe_route_select_q8(
-    device const bfloat *scores [[buffer(0)]],
-    device bfloat *input [[buffer(1)]],
-    device uint8_t *shared_weights [[buffer(2)]],
-    device bfloat *shared_scales [[buffer(3)]],
-    device bfloat *shared_biases [[buffer(4)]],
-    device uint *selected [[buffer(5)]],
-    device bfloat *routing_weights [[buffer(6)]],
-    constant MoeRouteParams &params [[buffer(7)]],
-    uint group [[threadgroup_position_in_grid]],
-    uint thread_index [[thread_index_in_threadgroup]],
-    uint simd_lane [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+// is the order the shape's routing and tie-break contract requires. Scores
+// are the bf16 Q8 router scores or the fp32 scores of a GGUF's F32 router.
+template <typename Score, class SharedGate>
+inline void moe_route_select(device const Score *scores, device bfloat *input,
+                             SharedGate shared_gate, device uint *selected,
+                             device bfloat *routing_weights,
+                             constant MoeRouteParams &params, uint group,
+                             uint thread_index, uint simd_lane,
+                             uint simd_group, threadgroup float *row_scores,
+                             threadgroup float *ordered,
+                             threadgroup float *scalar_partials) {
   constexpr uint StorageN = 256;
   constexpr uint Simdgroups = StorageN / 32;
   constexpr uint ExpertsPerLane = StorageN / 32;
-  threadgroup float row_scores[StorageN];
-  threadgroup float ordered[StorageN];
-  threadgroup float scalar_partials[Simdgroups];
   const uint row = group;
   if (row >= params.rows)
     return;
@@ -298,14 +317,8 @@ kernel void moe_route_select_q8(
   float scalar = 0.0f;
   for (uint dimension = thread_index; dimension < params.input_size;
        dimension += StorageN) {
-    uint quant_group = dimension / 64;
-    uint within_group = dimension % 64;
-    ulong weight_index = ulong(quant_group) * StorageN * 64 + within_group;
-    ulong parameter = ulong(quant_group) * StorageN;
-    float dequantized = float(shared_weights[weight_index]) *
-                            float(shared_scales[parameter]) +
-                        float(shared_biases[parameter]);
-    scalar += float(row_input[dimension]) * dequantized;
+    scalar += float(row_input[dimension]) *
+              moe_shared_gate_weight(shared_gate, dimension);
   }
   scalar = simd_sum(scalar);
   if (simd_lane == 0)
@@ -358,6 +371,49 @@ kernel void moe_route_select_q8(
         fast::exp2((ordered[rank] - ordered[0]) * 1.44269504089f) /
         denominator);
   }
+}
+
+kernel void moe_route_select_q8(
+    device const bfloat *scores [[buffer(0)]],
+    device bfloat *input [[buffer(1)]],
+    device uint8_t *shared_weights [[buffer(2)]],
+    device bfloat *shared_scales [[buffer(3)]],
+    device bfloat *shared_biases [[buffer(4)]],
+    device uint *selected [[buffer(5)]],
+    device bfloat *routing_weights [[buffer(6)]],
+    constant MoeRouteParams &params [[buffer(7)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float row_scores[256];
+  threadgroup float ordered[256];
+  threadgroup float scalar_partials[8];
+  moe_route_select(scores, input,
+                   MoeSharedGateQ8{shared_weights, shared_scales, shared_biases},
+                   selected, routing_weights, params, group, thread_index,
+                   simd_lane, simd_group, row_scores, ordered, scalar_partials);
+}
+
+// The GGUF router: fp32 scores (kernels/shared/gguf_float.metal) and the F32
+// shared-expert gate.
+kernel void moe_route_select_f32(
+    device const float *scores [[buffer(0)]],
+    device bfloat *input [[buffer(1)]],
+    device const float *shared_gate [[buffer(2)]],
+    device uint *selected [[buffer(3)]],
+    device bfloat *routing_weights [[buffer(4)]],
+    constant MoeRouteParams &params [[buffer(5)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float row_scores[256];
+  threadgroup float ordered[256];
+  threadgroup float scalar_partials[8];
+  moe_route_select(scores, input, MoeSharedGateF32{shared_gate}, selected,
+                   routing_weights, params, group, thread_index, simd_lane,
+                   simd_group, row_scores, ordered, scalar_partials);
 }
 
 // Sorts one command's routes by expert. Tile t covers grouped rows
@@ -469,6 +525,68 @@ kernel void moe_gather_rows(device const bfloat *input [[buffer(0)]],
             : input[ulong(route / params.routes_per_row) * params.input_size +
                     column];
   }
+}
+
+// The grouped rows as Table16 tiles (kernels/common/gguf_sgmatrix.h), the
+// input of the Apple9 GGUF register expert tile. Threadgroup (tile, part)
+// writes the four 64-input spans [4 part, 4 part + 4) of an 8-row tile, one
+// simdgroup per row: 8 us per 35B decode layer at one lane on the 40-core M3
+// Max and 14 us at four, against 15 and 44 us for a threadgroup per span pair
+// (most of a decode dispatch's tiles are past the tile count) and 19 and 23 us
+// for one per tile. The gather reads each grouped row's route like
+// moe_gather_rows (padding rows are zero); the prepare reads grouped rows (the
+// down pass's intermediate). Grid (tiles, width / 256), 256 threads.
+template <class Source>
+inline void moe_table16_tile(Source source, device bfloat *table,
+                             device float *sums, uint width, uint2 group,
+                             uint simd_lane, uint simd_group) {
+  for (uint span = group.y * 4; span < group.y * 4 + 4; ++span) {
+    const bfloat2 values = source(simd_group, span * 64 + 2 * simd_lane);
+    q16sg::write_input(table + ulong(group.x) * width * 8,
+                       sums + ulong(group.x) * q16sg::sums_per_tile(width),
+                       width, span, simd_group, simd_lane, values.x, values.y);
+  }
+}
+
+kernel void moe_gather_table16(device const bfloat *input [[buffer(0)]],
+                               device const uint *grouped_routes [[buffer(1)]],
+                               device const uint *tile_count [[buffer(2)]],
+                               device bfloat *table [[buffer(3)]],
+                               device float *sums [[buffer(4)]],
+                               constant MoeGatherParams &params [[buffer(5)]],
+                               uint2 group [[threadgroup_position_in_grid]],
+                               uint simd_lane [[thread_index_in_simdgroup]],
+                               uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  if (group.x >= *tile_count)
+    return;
+  moe_table16_tile(
+      [&](uint row, uint k) {
+        const uint route = grouped_routes[group.x * 8 + row];
+        return route == ~0u
+                   ? bfloat2(bfloat(0.0f))
+                   : *reinterpret_cast<device const bfloat2 *>(
+                         input + ulong(route / params.routes_per_row) *
+                                     params.input_size + k);
+      },
+      table, sums, params.input_size, group, simd_lane, simd_group);
+}
+
+kernel void moe_prepare_table16(device const bfloat *rows [[buffer(0)]],
+                                device const uint *tile_count [[buffer(1)]],
+                                device bfloat *table [[buffer(2)]],
+                                device float *sums [[buffer(3)]],
+                                constant uint &width [[buffer(4)]],
+                                uint2 group [[threadgroup_position_in_grid]],
+                                uint simd_lane [[thread_index_in_simdgroup]],
+                                uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  if (group.x >= *tile_count)
+    return;
+  moe_table16_tile(
+      [&](uint row, uint k) {
+        return *reinterpret_cast<device const bfloat2 *>(
+            rows + (ulong(group.x) * 8 + row) * width + k);
+      },
+      table, sums, width, group, simd_lane, simd_group);
 }
 
 // One expert tile: Rows grouped rows times TileN output columns, read through

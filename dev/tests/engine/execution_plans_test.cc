@@ -45,7 +45,7 @@ constexpr std::array moeFields{
     &MoeWorkspace::tileDescriptorsBytes, &MoeWorkspace::tileCountBytes,
     &MoeWorkspace::groupedRoutesBytes, &MoeWorkspace::routeRowsBytes,
     &MoeWorkspace::groupedInputBytes, &MoeWorkspace::expertIntermediateBytes,
-    &MoeWorkspace::expertOutputBytes};
+    &MoeWorkspace::expertOutputBytes, &MoeWorkspace::groupedSumsBytes};
 
 kv::Q8Layout layout(AttentionShape shape, uint32_t layers = 1) {
   return {layers, shape.kvHeads, shape.headDimension};
@@ -204,6 +204,62 @@ void moeDeviceTiles() {
       }
     }
   }
+}
+
+// GGUF MoE plans (MoeShape::quant == Gguf) run the three expert passes: the
+// exact register tile on Apple9, with its Table16 row sums in the workspace
+// bounds, staged tiles everywhere else (64-row tiles for prefill chunks past
+// 8 routes per expert), and no installed choices.
+void ggufMoePlans() {
+  MoeShape shape = routedShape;
+  shape.quant = QuantFamily::Gguf;
+  for (uint32_t family : {0U, 9U, 10U, 11U}) {
+    ExecutionPlans plans(device(family));
+    const MoeGgufTile expected = family == 9 ? MoeGgufTile::Register : MoeGgufTile::Staged;
+    require(moeGgufTile(family) == expected, "GGUF expert tile is not gated on GPU family 9");
+    // A valid choice of the other tile, which the plans must ignore.
+    OperatorChoices choices;
+    choices.moe.push_back({MoeWorkload{shape, 16, MoePhase::Decode},
+                           MoeConfig{MoeExpertTile::M8, kMoeRouteWideRows, MoeExpertSimdgroups::Eight,
+                                     expected == MoeGgufTile::Register ? MoeGgufTile::Staged
+                                                                       : MoeGgufTile::Register}});
+    plans.install(choices);
+    for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
+      const MoePlan plan = plans.moeDecode(shape, lanes);
+      require(plan.config().ggufTile == expected && plan.tileRows() == 8 && plan.splitExperts(),
+              "GGUF MoE decode plan left its device tile or took an installed choice");
+      // Sums of the widest input (hidden, 3 K / 4 fp32) per 8-row tile.
+      require(plan.workspace().groupedSumsBytes ==
+                  (expected == MoeGgufTile::Register ? uint64_t{plan.maximumTiles()} * 2048 * 3 : 0),
+              "GGUF register plan sums its Table16 tiles");
+      covers(plans.moeDecodeWorkspacePerLane(shape), plan.workspace(), lanes, moeFields);
+      require(plans.moeDecode(routedShape, lanes).config().ggufTile == MoeGgufTile::Staged &&
+                  plans.moeDecode(routedShape, lanes).workspace().groupedSumsBytes == 0,
+              "affine MoE plan took the GGUF register tile");
+    }
+    // Prefill: the register tile's 8 rows, or staged 8-row tiles while the
+    // routes average at most 8 rows per expert (256 rows of 8 of 256 experts).
+    for (uint32_t rows : {1U, 8U, 17U, 100U, 256U, 257U, 2048U}) {
+      const MoePlan plan = plans.moePrefill(shape, rows);
+      const uint32_t tileRows = expected == MoeGgufTile::Register || rows <= 256 ? 8 : 64;
+      require(plan.config().ggufTile == expected && plan.tileRows() == tileRows && plan.splitExperts() &&
+                  (plan.workspace().groupedSumsBytes > 0) == (expected == MoeGgufTile::Register),
+              "GGUF MoE prefill plan left the device's tile");
+      covers(plans.moePrefillWorkspace(shape, 2048), plan.workspace(), 1, moeFields);
+      for (const MoePlan &candidate : plans.moeCandidates({shape, rows, MoePhase::Prefill}))
+        require(candidate.config() == plan.config(), "GGUF MoE prefill candidate is not the device's plan");
+    }
+  }
+  // The register tile reads GGUF 8-row tiles only.
+  rejects([&] { (void)MoE::decodePlan(routedShape, 1, {MoeExpertTile::M8, kMoeRouteWideRows,
+                                                       MoeExpertSimdgroups::Eight, MoeGgufTile::Register}); });
+  rejects([&] { (void)MoE::decodePlan(shape, 1, {MoeExpertTile::M32, kMoeRouteWideRows,
+                                                 MoeExpertSimdgroups::Eight, MoeGgufTile::Register}); });
+  // GGUF kernels exist for 8-row tiles and 64-row prefill tiles only, and
+  // affine ones for 8- and 32-row tiles.
+  rejects([&] { (void)MoE::prefillPlan(shape, 33, {MoeExpertTile::M32}); });
+  rejects([&] { (void)MoE::decodePlan(shape, 1, {MoeExpertTile::M64}); });
+  rejects([&] { (void)MoE::prefillPlan(routedShape, 33, {MoeExpertTile::M64}); });
 }
 
 void allCandidates() {
@@ -513,6 +569,7 @@ int main() {
   try {
     baselinePlans();
     moeDeviceTiles();
+    ggufMoePlans();
     allCandidates();
     policyKeysAndBounds();
     atomicInvalidChoices();

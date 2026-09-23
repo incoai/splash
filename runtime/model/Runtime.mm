@@ -1027,6 +1027,7 @@ struct Runtime::Impl {
     buffers.groupedInput = p(PrefillTensor::MoeGroupedInput);
     buffers.expertIntermediate = p(PrefillTensor::MoeExpertIntermediate);
     buffers.expertOutput = p(PrefillTensor::MoeExpertOutput);
+    buffers.groupedSums = p(PrefillTensor::MoeGroupedSums);
     std::vector<kv::Q8LayerStorage> kvLayers(
         geometry.target.kvLayout.attentionLayers);
     for (uint32_t layer = 0; layer < kvLayers.size(); ++layer)
@@ -1266,6 +1267,7 @@ struct Runtime::Impl {
     buffers.groupedInput = d(DecodeTensor::MoeGroupedInput);
     buffers.expertIntermediate = d(DecodeTensor::MoeExpertIntermediate);
     buffers.expertOutput = d(DecodeTensor::MoeExpertOutput);
+    buffers.groupedSums = d(DecodeTensor::MoeGroupedSums);
     for (uint32_t lane = 0; lane < kLaneCount; ++lane) {
       const ModelBatchItem &item = paddedItem(lane);
       q8[lane] = q8Params(item.logicalPosition, kDecodeRows, kTileRows,

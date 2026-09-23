@@ -20,13 +20,13 @@ constexpr std::array kScratchFields{
     &MoeBuffers::tileDescriptors, &MoeBuffers::tileCount,
     &MoeBuffers::groupedRoutes, &MoeBuffers::routeRows,
     &MoeBuffers::groupedInput, &MoeBuffers::expertIntermediate,
-    &MoeBuffers::expertOutput};
+    &MoeBuffers::expertOutput, &MoeBuffers::groupedSums};
 constexpr std::array kWorkspaceFields{
     &MoeWorkspace::selectedExpertsBytes, &MoeWorkspace::routingWeightsBytes,
     &MoeWorkspace::tileDescriptorsBytes, &MoeWorkspace::tileCountBytes,
     &MoeWorkspace::groupedRoutesBytes, &MoeWorkspace::routeRowsBytes,
     &MoeWorkspace::groupedInputBytes, &MoeWorkspace::expertIntermediateBytes,
-    &MoeWorkspace::expertOutputBytes};
+    &MoeWorkspace::expertOutputBytes, &MoeWorkspace::groupedSumsBytes};
 
 uint64_t aligned(uint64_t value, uint64_t alignment) {
   if (value > std::numeric_limits<uint64_t>::max() - alignment + 1)
@@ -41,7 +41,7 @@ struct Fixture final {
 };
 
 struct FixtureLayout final {
-  std::array<uint64_t, 13> sizes;
+  std::array<uint64_t, 4 + kWorkspaceFields.size()> sizes;
   uint64_t bytes = 0;
 };
 
@@ -88,7 +88,10 @@ Fixture allocateFixture(metal::MetalBackend &backend,
   if (!fixture.arena)
     throw std::logic_error("MoE tuning admission did not allocate its fixture");
   uint64_t offset = 0;
+  // A field no candidate uses (the grouped sums of non-register plans) stays
+  // empty, as in the runtime arenas.
   auto view = [&](size_t index) {
+    if (!layout.sizes[index]) return metal::MetalBuffer{};
     auto result = backend.view(fixture.arena, offset, layout.sizes[index]);
     offset += aligned(layout.sizes[index], 256);
     return result;

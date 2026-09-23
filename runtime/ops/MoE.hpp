@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <optional>
 
 namespace splash::ops {
 
@@ -17,6 +18,9 @@ struct MoeShape final {
   uint32_t experts = 0;
   uint32_t expertsPerToken = 0;
   uint32_t expertIntermediateSize = 0;
+  // How the weights are stored: affine Q4/Q8 slabs, or the tensors of a GGUF
+  // (GgufMoeWeights), which run their own router and expert kernels.
+  QuantFamily quant = QuantFamily::Affine;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
     return hiddenSize && hiddenSize % 256 == 0 && experts && experts <= 256 &&
@@ -27,6 +31,25 @@ struct MoeShape final {
   [[nodiscard]] constexpr uint32_t routesPerToken() const noexcept {
     return expertsPerToken + 1;
   }
+};
+
+// A GGUF expert projection: every routed expert in one segment of experts *
+// N rows, expert e's planes from tile e * N / 256 on (moe_gguf_segment in
+// kernels/common/moe_expert_slab.h), and the shared expert's segment, whose
+// format may differ.
+struct GgufExpertProjection final {
+  GgufSegment routed;
+  GgufSegment shared;
+};
+
+// The sparse MoE block of a GGUF target. The router and the shared-expert
+// gate are float tensors llama.cpp keeps unquantized, and they run in fp32.
+struct GgufMoeWeights final {
+  GgufSegment router;           // [experts][hidden]
+  GgufSegment sharedExpertGate; // [1][hidden]
+  GgufExpertProjection gate;
+  GgufExpertProjection up;
+  GgufExpertProjection down;
 };
 
 // All weights for one sparse MoE block. The model package owns the buffers;
@@ -41,6 +64,9 @@ struct MoeWeights final {
   ExpertQ4Projection sharedUp;
   ExpertQ4Projection sharedDown;
   Q8Projection sharedExpertGate;
+  // Set for a GGUF target (MoeShape::quant == Gguf); the fields above are
+  // then unused.
+  std::optional<GgufMoeWeights> gguf{};
 };
 
 // Grouped-row scratch. Routes are sorted by expert into tiles of tileRows
@@ -86,16 +112,25 @@ struct MoeWorkspace final {
   uint64_t groupedInputBytes = 0;
   uint64_t expertIntermediateBytes = 0;
   uint64_t expertOutputBytes = 0;
+  // The row sums of the Table16 tiles the GGUF register expert tile reads.
+  uint64_t groupedSumsBytes = 0;
 };
 
-// Both configurations consume affine Q4 expert slabs in StorageN=256 order.
 // The tile applies to grouping, gather and both expert projections together;
-// changing it never changes the physical rows in a command. M8 plans and
-// decode plans run the fused gate/up tile; the M32 prefill plan runs the
-// experts as three N256 passes (gate, up with the silu gate, down) whose
-// tiles shrink to the descriptor's live rows, bit-identical to the fused
-// tile.
-enum class MoeExpertTile : uint8_t { M8 = 8, M32 = 32 };
+// changing it never changes the physical rows in a command. Affine plans
+// consume Q4 expert slabs in StorageN=256 order: M8 plans and decode plans
+// run the fused gate/up tile; the M32 prefill plan runs the experts as three
+// N256 passes (gate, up with the silu gate, down) whose tiles shrink to the
+// descriptor's live rows, bit-identical to the fused tile. GGUF plans run
+// three passes of M8 tiles, or of M64 tiles to prefill (moeGgufPrefillTile).
+enum class MoeExpertTile : uint8_t { M8 = 8, M32 = 32, M64 = 64 };
+
+// The device-independent tile of prefill plans: 32 rows for affine plans, 64
+// for GGUF plans (the staged 64-row tile; ExecutionPlans applies the device
+// policy of moeGgufPrefillTile).
+[[nodiscard]] constexpr MoeExpertTile moePrefillTile(MoeShape shape) noexcept {
+  return shape.quant == QuantFamily::Gguf ? MoeExpertTile::M64 : MoeExpertTile::M32;
+}
 
 // Simdgroups per 8-row expert tile: a device policy the execution plans set,
 // not a tuned choice. Eight is the shipped N128 tile for both projections.
@@ -122,6 +157,36 @@ moeDecodeSimdgroups(uint32_t appleGpuFamily) noexcept {
                              : MoeExpertSimdgroups::Eight;
 }
 
+// The expert tile of GGUF plans, which run three grouped passes (gate, up
+// with silu(gate), down) over the GGUF image: the half-staged tiles of
+// kernels/shared/gguf_linear.metal, or Register, the exact register tile of
+// kernels/decode/linear_gguf_sgmatrix.metal over Table16 tiles of the
+// grouped rows (8-row tiles only). Apple9 runs Register in both phases. In
+// decode, as its dense GGUF projections do (LinearGguf.cpp): its matrix
+// operations share the FP32 pipe, where the register tile beats staging. In
+// prefill, the exact register tile is faster at every chunk size measured
+// (one 35B MoE layer on the 40-core M3 Max against 64-row staged tiles: 512
+// rows 3.8 vs 6.4 ms, 2048 rows 13.2 vs 13.4) and equals the decode numerics.
+enum class MoeGgufTile : uint8_t { Staged, Register };
+
+[[nodiscard]] constexpr MoeGgufTile moeGgufTile(uint32_t appleGpuFamily) noexcept {
+  return appleGpuFamily == 9 ? MoeGgufTile::Register : MoeGgufTile::Staged;
+}
+
+// The rows of a GGUF prefill plan's tiles on the device's `tile`: 8 on the
+// register tile. Staged: 8-row tiles while the chunk's routed rows average at
+// most one 8-row tile per expert (rows * topK <= 8 * experts), 64-row tiles
+// beyond, where staging an expert's weights once per 64 rows outweighs the
+// padding (one 35B MoE layer on the 16-core M5 Pro: 3.2 vs 4.3 ms at 256
+// rows; 64-row tiles win from 512 rows, 4.8 vs 5.3 ms).
+[[nodiscard]] constexpr MoeExpertTile moeGgufPrefillTile(MoeShape shape, uint32_t rows,
+                                                         MoeGgufTile tile) noexcept {
+  return tile == MoeGgufTile::Register ||
+                 uint64_t{rows} * shape.expertsPerToken <= uint64_t{8} * shape.experts
+             ? MoeExpertTile::M8
+             : MoeExpertTile::M64;
+}
+
 struct MoeConfig final {
   MoeExpertTile expertTile = MoeExpertTile::M32;
   // Rows from which the router uses the 32-row scores tile; the execution
@@ -130,6 +195,8 @@ struct MoeConfig final {
   // Simdgroups of the 8-row expert tiles; the execution plans derive it from
   // the GPU family for decode plans and keep eight for prefill plans.
   MoeExpertSimdgroups m8Simdgroups = MoeExpertSimdgroups::Eight;
+  // GGUF plans only; the execution plans derive it from the GPU family.
+  MoeGgufTile ggufTile = MoeGgufTile::Staged;
   bool operator==(const MoeConfig &) const = default;
 };
 
@@ -178,24 +245,29 @@ struct MoeBuffers final {
   metal::MetalBuffer groupedInput;
   metal::MetalBuffer expertIntermediate;
   metal::MetalBuffer expertOutput;
+  // GGUF register plans: the row sums of the Table16 tiles in groupedInput.
+  metal::MetalBuffer groupedSums;
 };
 
 // Routes and executes grouped experts from immutable weight views.
 struct MoE final {
-  [[nodiscard]] static MoePlan prefillPlan(
-      MoeShape shape, uint32_t rows,
-      MoeConfig config = {MoeExpertTile::M32});
+  // The shipped prefill plan (moePrefillTile) or the one of config.
+  [[nodiscard]] static MoePlan prefillPlan(MoeShape shape, uint32_t rows);
+  [[nodiscard]] static MoePlan prefillPlan(MoeShape shape, uint32_t rows,
+                                           MoeConfig config);
   [[nodiscard]] static MoePlan decodePlan(
       MoeShape shape, uint32_t lanes,
       MoeConfig config = {MoeExpertTile::M8});
   // Bounded precompiled candidates, shipped baseline first. ExecutionPlans
   // supplies the device's router threshold to every expert-tile candidate
-  // and its 8-row tile simdgroups to the decode candidates.
+  // and its 8-row tile simdgroups to the decode candidates. GGUF plans are
+  // not tuned: both candidates are the baseline.
   [[nodiscard]] static std::array<MoePlan, 2>
   prefillCandidates(MoeShape shape, uint32_t rows, uint32_t routeWideRows);
   [[nodiscard]] static std::array<MoePlan, 2>
   decodeCandidates(MoeShape shape, uint32_t lanes, uint32_t routeWideRows,
-                   MoeExpertSimdgroups m8Simdgroups = MoeExpertSimdgroups::Eight);
+                   MoeExpertSimdgroups m8Simdgroups = MoeExpertSimdgroups::Eight,
+                   MoeGgufTile ggufTile = MoeGgufTile::Staged);
   static void add(metal::CommandGraph &graph, const MoeBuffers &buffers,
                   const MoeWeights &weights, const MoePlan &plan);
 };

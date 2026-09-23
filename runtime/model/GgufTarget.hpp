@@ -1,6 +1,6 @@
 #pragma once
 
-// Loads a Qwen3.8 target straight from a llama.cpp GGUF: each layer image is
+// Loads a Qwen target straight from a llama.cpp GGUF: each layer image is
 // planned (GgufImage), allocated as one anonymous Metal buffer, filled by the
 // CPU (header, descriptors, small tensors) and by the gguf_repack / gguf_copy
 // kernels reading the mmapped file, then handed out as a WeightFile so the
@@ -41,6 +41,41 @@ private:
   GgufFile file_;
   gguf::ImagePlanner planner_;
   int descriptor_ = -1;
+};
+
+// The GGUF geometry of a Qwen layout: a dense FFN, or a sparse MoE when the
+// layout has experts.
+template <class Layout>
+[[nodiscard]] gguf::TargetGeometry ggufTargetGeometry(const Layout &layout) {
+  gguf::TargetGeometry geometry;
+  geometry.layers = layout.layers;
+  geometry.hiddenSize = layout.hiddenSize;
+  geometry.vocabularySize = layout.vocabularySize;
+  geometry.gdnKeyHeads = layout.gdnKeyHeads;
+  geometry.gdnValueHeads = layout.gdnValueHeads;
+  geometry.gdnHeadDimension = layout.gdnHeadDimension;
+  geometry.convolutionDimension = layout.convolutionDimension;
+  geometry.attentionWidth = layout.attentionWidth;
+  geometry.attentionKvHeads = layout.attentionKvHeads;
+  geometry.attentionHeadDimension = layout.attentionHeadDimension;
+  geometry.fullAttentionPeriod = layout.fullAttentionPeriod;
+  if constexpr (requires { layout.experts; }) {
+    geometry.intermediateSize = 0;
+    geometry.experts = layout.experts;
+    geometry.expertsPerToken = layout.expertsPerToken;
+    geometry.expertIntermediateSize = layout.expertIntermediateSize;
+  } else {
+    geometry.intermediateSize = layout.intermediateSize;
+  }
+  return geometry;
+}
+
+// readQwenTargetWeights' files (QwenTarget.hpp): the images of a loader.
+struct GgufTargetFiles final {
+  GgufTargetLoader &loader;
+  [[nodiscard]] WeightFile layer(uint32_t index, bool) const { return loader.layer(index); }
+  [[nodiscard]] WeightFile head(uint32_t) const { return loader.head(); }
+  [[nodiscard]] WeightFile embedding(uint32_t, uint32_t) const { return loader.embedding(); }
 };
 
 } // namespace splash::model

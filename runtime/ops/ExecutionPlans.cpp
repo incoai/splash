@@ -18,7 +18,7 @@ auto shapeKey(DraftAttentionShape s) noexcept {
 }
 auto shapeKey(MoeShape s) noexcept {
   return std::tuple{s.hiddenSize, s.experts, s.expertsPerToken,
-                    s.expertIntermediateSize};
+                    s.expertIntermediateSize, s.quant};
 }
 AttentionShape attentionShape(uint32_t queryHeads, kv::Q8Layout layout) {
   return {queryHeads, layout.kvHeads, layout.headDimension};
@@ -79,7 +79,7 @@ constexpr std::array moeFields{
     &MoeWorkspace::tileDescriptorsBytes, &MoeWorkspace::tileCountBytes,
     &MoeWorkspace::groupedRoutesBytes, &MoeWorkspace::routeRowsBytes,
     &MoeWorkspace::groupedInputBytes, &MoeWorkspace::expertIntermediateBytes,
-    &MoeWorkspace::expertOutputBytes};
+    &MoeWorkspace::expertOutputBytes, &MoeWorkspace::groupedSumsBytes};
 
 template <typename Workspace, size_t N>
 void include(Workspace &bound, const Workspace &required,
@@ -115,7 +115,8 @@ bool MoeWorkload::operator==(const MoeWorkload &other) const noexcept {
 ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device)
     : linear_(device), baselineLinear_(device),
       moeRouteWideRows_(moeRouteWideRows(device.gpuCoreCount)),
-      moeDecodeSimdgroups_(moeDecodeSimdgroups(device.appleGpuFamily)) {}
+      moeDecodeSimdgroups_(moeDecodeSimdgroups(device.appleGpuFamily)),
+      moeGgufTile_(moeGgufTile(device.appleGpuFamily)) {}
 
 void ExecutionPlans::install(const OperatorChoices &choices) {
   OperatorChoices pending = choices;
@@ -185,10 +186,16 @@ DraftAttentionPlan ExecutionPlans::draftAttention(DraftAttentionShape shape,
                        DraftAttentionConfiguration{}));
 }
 
+// GGUF MoE plans are not tuned yet: installed choices do not apply to them,
+// and they take the device's tiles.
 MoePlan ExecutionPlans::moePrefill(MoeShape shape, uint32_t rows) const {
-  MoeConfig config =
-      configurationFor(choices_.moe, MoeWorkload{shape, rows, MoePhase::Prefill},
-                       MoeConfig{MoeExpertTile::M32});
+  MoeConfig config{MoeExpertTile::M32};
+  if (shape.quant == QuantFamily::Gguf) {
+    config.expertTile = moeGgufPrefillTile(shape, rows, moeGgufTile_);
+    config.ggufTile = moeGgufTile_;
+  } else {
+    config = configurationFor(choices_.moe, MoeWorkload{shape, rows, MoePhase::Prefill}, config);
+  }
   config.routeWideRows = moeRouteWideRows_;
   // The four-simdgroup 8-row tiles are measured at decode occupancy only; a
   // prefill chunk's much larger expert grid keeps the shipped tile.
@@ -200,21 +207,30 @@ MoePlan ExecutionPlans::moeDecode(MoeShape shape, uint32_t lanes) const {
   // Validate before multiplying an untrusted width into a physical-row key.
   if (!lanes || lanes > kMaximumLanes)
     throw std::invalid_argument("invalid MoE decode width");
-  MoeConfig config = configurationFor(
-      choices_.moe, MoeWorkload{shape, lanes * kDecodeRows, MoePhase::Decode},
-      MoeConfig{MoeExpertTile::M8});
+  const MoeConfig baseline{MoeExpertTile::M8};
+  MoeConfig config = shape.quant == QuantFamily::Gguf
+      ? baseline
+      : configurationFor(choices_.moe, MoeWorkload{shape, lanes * kDecodeRows, MoePhase::Decode},
+                         baseline);
   config.routeWideRows = moeRouteWideRows_;
   config.m8Simdgroups = moeDecodeSimdgroups_;
+  if (shape.quant == QuantFamily::Gguf) config.ggufTile = moeGgufTile_;
   return MoE::decodePlan(shape, lanes, config);
 }
 
 std::array<MoePlan, 2> ExecutionPlans::moeCandidates(const MoeWorkload &workload) const {
+  // GGUF plans are not tuned: both candidates are the device's plan.
+  if (workload.phase == MoePhase::Prefill && workload.shape.quant == QuantFamily::Gguf) {
+    const MoePlan plan = moePrefill(workload.shape, workload.rows);
+    return {plan, plan};
+  }
   if (workload.phase == MoePhase::Prefill)
     return MoE::prefillCandidates(workload.shape, workload.rows, moeRouteWideRows_);
   if (workload.phase != MoePhase::Decode || workload.rows % kDecodeRows)
     throw std::invalid_argument("invalid MoE candidate workload");
-  return MoE::decodeCandidates(workload.shape, workload.rows / kDecodeRows,
-                               moeRouteWideRows_, moeDecodeSimdgroups_);
+  return MoE::decodeCandidates(
+      workload.shape, workload.rows / kDecodeRows, moeRouteWideRows_, moeDecodeSimdgroups_,
+      workload.shape.quant == QuantFamily::Gguf ? moeGgufTile_ : MoeGgufTile::Staged);
 }
 
 AttentionWorkspace ExecutionPlans::prefillAttentionWorkspace(
@@ -269,8 +285,12 @@ MoeWorkspace ExecutionPlans::moePrefillWorkspace(MoeShape shape,
   // Validate the bound before iterating; every row is included even if a
   // future grouped layout's largest field is not monotone in row count.
   auto bound = MoE::prefillPlan(shape, maximumRows).workspace();
-  for (uint32_t rows = 1; rows < maximumRows; ++rows)
-    include(bound, MoE::prefillPlan(shape, rows).workspace(), moeFields);
+  for (uint32_t rows = 1; rows <= maximumRows; ++rows) {
+    if (rows < maximumRows) include(bound, MoE::prefillPlan(shape, rows).workspace(), moeFields);
+    // The device's plan too: GGUF plans take the device's tiles, and a
+    // register plan adds its Table16 sums.
+    include(bound, moePrefill(shape, rows).workspace(), moeFields);
+  }
   for (const auto &choice : choices_.moe) {
     const auto &w = choice.workload;
     if (w.phase == MoePhase::Prefill && shapeKey(w.shape) == shapeKey(shape) &&
@@ -283,8 +303,11 @@ MoeWorkspace ExecutionPlans::moePrefillWorkspace(MoeShape shape,
 
 MoeWorkspace ExecutionPlans::moeDecodeWorkspacePerLane(MoeShape shape) const {
   MoeWorkspace bound;
-  for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes)
+  // The device's plan too: a GGUF register plan adds its Table16 sums.
+  for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes) {
     include(bound, MoE::decodePlan(shape, lanes).workspace(), moeFields, lanes);
+    include(bound, moeDecode(shape, lanes).workspace(), moeFields, lanes);
+  }
   for (const auto &choice : choices_.moe) {
     const auto &w = choice.workload;
     if (w.phase == MoePhase::Decode && shapeKey(w.shape) == shapeKey(shape)) {

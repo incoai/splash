@@ -289,6 +289,7 @@ struct QwenTargetPrefillBuffers final {
   metal::MetalBuffer groupedInput;
   metal::MetalBuffer expertIntermediate;
   metal::MetalBuffer expertOutput;
+  metal::MetalBuffer groupedSums;
 };
 
 struct QwenTargetVerifyBuffers final {
@@ -335,6 +336,7 @@ struct QwenTargetVerifyBuffers final {
   metal::MetalBuffer groupedInput;
   metal::MetalBuffer expertIntermediate;
   metal::MetalBuffer expertOutput;
+  metal::MetalBuffer groupedSums;
 };
 
 struct QwenTargetCommitBuffers final {

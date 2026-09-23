@@ -1,9 +1,9 @@
-// The GGUF load kernels (gguf_repack, gguf_copy) of the production metallib
-// and the image planner's CPU-built alpha/beta tensor against the CPU
-// reference, and that reference's values against hashes of upstream GGML's
-// dequantization; the planner's norms are the GGUF's F32 values as stored and
-// its bf16 tensors exact conversions.
-//   gguf-repack --cpu        golden hashes, the alpha/beta tensor and the float tensors
+// The GGUF load kernels (gguf_repack, gguf_copy) of the production metallib,
+// the image planner's CPU-built alpha/beta tensors and its sparse MoE layer
+// (qwen35moe) against the CPU reference, and that reference's values against
+// hashes of upstream GGML's dequantization; the planner's norms are the GGUF's
+// F32 values as stored and its bf16 tensors exact conversions.
+//   gguf-repack --cpu        golden hashes, the alpha/beta tensors, the float tensors and the MoE layer
 //   gguf-repack <metallib>   also the kernels
 // With SPLASH_GGML_ORACLE=<libggml-base.dylib> the reference is also compared
 // with GGML directly and GGML's hashes are printed; a build of llama.cpp
@@ -117,22 +117,42 @@ struct Tensor {
   std::vector<uint8_t> data;
 };
 
-// A version 3 qwen35 GGUF of the tensors, in order and 32-byte aligned.
-std::vector<uint8_t> ggufFile(const std::vector<Tensor> &tensors, uint32_t blocks, uint32_t hidden) {
+// The architecture metadata a GGUF of the geometry declares.
+std::vector<std::pair<std::string, uint32_t>> metadata(const splash::model::gguf::TargetGeometry &g) {
+  std::vector<std::pair<std::string, uint32_t>> keys{
+      {"block_count", g.layers}, {"embedding_length", g.hiddenSize},
+      {"attention.head_count", g.attentionWidth / g.attentionHeadDimension}, {"attention.head_count_kv", g.attentionKvHeads},
+      {"attention.key_length", g.attentionHeadDimension}, {"attention.value_length", g.attentionHeadDimension},
+      {"full_attention_interval", g.fullAttentionPeriod}, {"ssm.conv_kernel", 4}, {"ssm.group_count", g.gdnKeyHeads},
+      {"ssm.time_step_rank", g.gdnValueHeads}, {"ssm.state_size", g.gdnHeadDimension},
+      {"ssm.inner_size", g.gdnValueHeads * g.gdnHeadDimension}};
+  if (g.sparseMoe())
+    keys.insert(keys.end(), {{"expert_count", g.experts}, {"expert_used_count", g.expertsPerToken},
+                             {"expert_feed_forward_length", g.expertIntermediateSize},
+                             {"expert_shared_feed_forward_length", g.expertIntermediateSize}});
+  else
+    keys.push_back({"feed_forward_length", g.intermediateSize});
+  return keys;
+}
+
+// A version 3 GGUF of the tensors of the geometry's architecture, in order and
+// 32-byte aligned.
+std::vector<uint8_t> ggufFile(const std::vector<Tensor> &tensors, const splash::model::gguf::TargetGeometry &geometry) {
   constexpr uint32_t kString = 8, kUint32 = 4, kAlignment = 32;
+  const std::string architecture = geometry.architecture();
+  const auto keys = metadata(geometry);
   std::vector<uint8_t> out{'G', 'G', 'U', 'F'};
   append<uint32_t>(out, 3);
   append<uint64_t>(out, tensors.size());
-  append<uint64_t>(out, 3);
+  append<uint64_t>(out, keys.size() + 1);
   appendString(out, "general.architecture");
   append(out, kString);
-  appendString(out, "qwen35");
-  appendString(out, "qwen35.block_count");
-  append(out, kUint32);
-  append(out, blocks);
-  appendString(out, "qwen35.embedding_length");
-  append(out, kUint32);
-  append(out, hidden);
+  appendString(out, architecture);
+  for (const auto &[key, value] : keys) {
+    appendString(out, architecture + "." + key);
+    append(out, kUint32);
+    append(out, value);
+  }
   uint64_t offset = 0;
   for (const Tensor &tensor : tensors) {
     appendString(out, tensor.name);
@@ -211,7 +231,7 @@ void checkAlphaBeta() {
     return;
   }
   const std::filesystem::path path = std::filesystem::path(directory) / "alpha-beta.gguf";
-  const std::vector<uint8_t> file = ggufFile(tensors, geometry.layers, hidden);
+  const std::vector<uint8_t> file = ggufFile(tensors, geometry);
   std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char *>(file.data()), file.size());
   bool matches = false;
   try {
@@ -334,7 +354,7 @@ void checkFloatTensors() {
   };
   // Plans every image of the file of `list`; the error, empty if none.
   const auto plan = [&](const std::vector<Tensor> &list, std::vector<model::gguf::Image> &images) {
-    const std::vector<uint8_t> file = ggufFile(list, geometry.layers, hidden);
+    const std::vector<uint8_t> file = ggufFile(list, geometry);
     std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char *>(file.data()), file.size());
     try {
       const model::GgufFile gguf(path);
@@ -362,6 +382,141 @@ void checkFloatTensors() {
     check(plan(inexact, images) == std::string(name) + " is not bf16-exact; it needs an F32 path",
           std::string("planner refuses to round ") + name + " to bf16");
   }
+  std::filesystem::remove_all(directory);
+}
+
+// A qwen35moe layer: F32 alpha/beta as one float tensor (beta rows, then alpha
+// rows, in grouped head order, values as stored), the F32 router and
+// shared-expert gate copied as stored, and each 3-D expert tensor repacked as
+// one tensor of experts * N rows. The metadata and architecture must match.
+void checkMoeLayer() {
+  namespace model = splash::model;
+  using namespace model::ggml;
+  model::gguf::TargetGeometry geometry;
+  geometry.layers = 1;
+  geometry.hiddenSize = 512;
+  geometry.vocabularySize = 256;
+  geometry.intermediateSize = 0;
+  geometry.gdnKeyHeads = 4;
+  geometry.gdnValueHeads = 8;
+  geometry.gdnHeadDimension = 64;
+  geometry.convolutionDimension = 1024; // q and k of 4 heads, v of 8
+  geometry.experts = 4;
+  geometry.expertsPerToken = 2;
+  geometry.expertIntermediateSize = 256;
+  const uint32_t hidden = geometry.hiddenSize, heads = geometry.gdnValueHeads, experts = geometry.experts;
+  const uint32_t width = geometry.expertIntermediateSize, valueRows = heads * geometry.gdnHeadDimension;
+  std::mt19937 rng(300);
+  std::normal_distribution<float> normal(0.0f, 1.0f);
+  const auto floats = [&](uint64_t elements) {
+    std::vector<uint8_t> bytes(elements * 4);
+    for (uint64_t i = 0; i < elements; ++i) {
+      const float value = normal(rng);
+      std::memcpy(bytes.data() + i * 4, &value, 4);
+    }
+    return bytes;
+  };
+  const std::vector<uint8_t> beta = floats(uint64_t{heads} * hidden), alpha = floats(uint64_t{heads} * hidden);
+  const std::vector<uint8_t> router = floats(uint64_t{experts} * hidden), sharedGate = floats(hidden);
+  std::vector<Tensor> tensors;
+  auto add = [&](std::string name, std::vector<uint64_t> dims, uint32_t type, std::vector<uint8_t> data = {}) {
+    if (data.empty()) {
+      const model::GgmlTypeTraits &traits = *model::ggmlTypeTraits(type);
+      uint64_t elements = 1;
+      for (uint64_t dim : dims) elements *= dim;
+      data.assign(elements / traits.blockElements * traits.blockBytes, 0);
+    }
+    tensors.push_back({std::move(name), std::move(dims), type, std::move(data)});
+  };
+  add("blk.0.attn_norm.weight", {hidden}, kF32);
+  add("blk.0.attn_qkv.weight", {hidden, geometry.convolutionDimension}, kQ8_0);
+  add("blk.0.attn_gate.weight", {hidden, valueRows}, kQ8_0);
+  add("blk.0.ssm_beta.weight", {hidden, heads}, kF32, beta);
+  add("blk.0.ssm_alpha.weight", {hidden, heads}, kF32, alpha);
+  add("blk.0.ssm_conv1d.weight", {4, geometry.convolutionDimension}, kF32);
+  add("blk.0.ssm_a", {heads}, kF32);
+  add("blk.0.ssm_dt.bias", {heads}, kF32);
+  add("blk.0.ssm_norm.weight", {geometry.gdnHeadDimension}, kF32);
+  add("blk.0.ssm_out.weight", {valueRows, hidden}, kQ8_0);
+  add("blk.0.post_attention_norm.weight", {hidden}, kF32);
+  add("blk.0.ffn_gate_inp.weight", {hidden, experts}, kF32, router);
+  add("blk.0.ffn_gate_exps.weight", {hidden, width, experts}, kQ4_K);
+  add("blk.0.ffn_up_exps.weight", {hidden, width, experts}, kQ4_K);
+  add("blk.0.ffn_down_exps.weight", {width, hidden, experts}, kQ5_K);
+  add("blk.0.ffn_gate_shexp.weight", {hidden, width}, kQ8_0);
+  add("blk.0.ffn_up_shexp.weight", {hidden, width}, kQ8_0);
+  add("blk.0.ffn_down_shexp.weight", {width, hidden}, kQ8_0);
+  add("blk.0.ffn_gate_inp_shexp.weight", {hidden}, kF32, sharedGate);
+  add("output.weight", {hidden, geometry.vocabularySize}, kQ6_K);
+  add("token_embd.weight", {hidden, geometry.vocabularySize}, kQ8_0);
+
+  // beta then alpha rows, each in grouped head order.
+  std::vector<uint8_t> gates;
+  for (const std::vector<uint8_t> *rows : {&beta, &alpha})
+    for (uint32_t n = 0; n < heads; ++n) {
+      const uint8_t *row = rows->data() + size_t{sourceRow(n, 0, 1, geometry.gdnKeyHeads, heads / geometry.gdnKeyHeads)} * hidden * 4;
+      gates.insert(gates.end(), row, row + size_t{hidden} * 4);
+    }
+  char directory[] = "/tmp/splash-gguf-moe-XXXXXX";
+  if (!mkdtemp(directory)) {
+    check(false, "create a temporary directory");
+    return;
+  }
+  const std::filesystem::path path = std::filesystem::path(directory) / "moe.gguf";
+  const auto write = [&](const model::gguf::TargetGeometry &declared) {
+    const std::vector<uint8_t> file = ggufFile(tensors, declared);
+    std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char *>(file.data()), file.size());
+  };
+  // The error of planning a file that declares `declared`, empty if none.
+  const auto planError = [&](const model::gguf::TargetGeometry &declared) {
+    write(declared);
+    try {
+      const model::GgufFile gguf(path);
+      static_cast<void>(model::gguf::ImagePlanner(gguf, geometry));
+    } catch (const model::GgufError &error) {
+      return std::string(error.what());
+    }
+    return std::string();
+  };
+  bool gatesMatch = false, copies = false, experts3d = false;
+  write(geometry);
+  try {
+    const model::GgufFile gguf(path);
+    const model::gguf::Image image = model::gguf::ImagePlanner(gguf, geometry).layer(0);
+    for (size_t i = 0; i + 1 < image.fills.size(); ++i) {
+      const std::vector<uint8_t> &descriptor = image.fills[i].bytes;
+      uint32_t words[3] = {};
+      if (descriptor.size() == 64) std::memcpy(words, descriptor.data(), sizeof words);
+      if (words[0] == kF32 && words[1] == 2 * heads && words[2] == hidden) gatesMatch = image.fills[i + 1].bytes == gates;
+    }
+    const auto copied = [&](const char *name) {
+      const model::GgufTensor &tensor = gguf.require(name);
+      return std::any_of(image.copies.begin(), image.copies.end(), [&](const model::gguf::Copy &copy) {
+        return copy.sourceOffset == gguf.absoluteOffset(tensor) && copy.params.bytes == tensor.bytes;
+      });
+    };
+    copies = image.copies.size() == 2 && copied("blk.0.ffn_gate_inp.weight") && copied("blk.0.ffn_gate_inp_shexp.weight");
+    std::vector<std::pair<uint32_t, uint32_t>> shapes;
+    for (const model::gguf::Repack &repack : image.repacks) shapes.push_back({repack.params.rows, repack.params.input_size});
+    const std::vector<std::pair<uint32_t, uint32_t>> expected{
+        {geometry.convolutionDimension, hidden}, {valueRows, hidden}, {hidden, valueRows}, {experts * width, hidden},
+        {experts * width, hidden}, {experts * hidden, width}, {width, hidden}, {width, hidden}, {hidden, width}};
+    experts3d = shapes == expected;
+  } catch (const model::GgufError &error) {
+    std::fprintf(stderr, "%s\n", error.what());
+  }
+  check(gatesMatch, "planner F32 alpha/beta tensor: beta then alpha rows in grouped order");
+  check(copies, "planner copies the F32 router and shared-expert gate as stored");
+  check(experts3d, "planner repacks each expert tensor as experts * N rows");
+  model::gguf::TargetGeometry wrongExperts = geometry;
+  wrongExperts.experts = 5;
+  check(planError(wrongExperts).find("expert_count 5 (expected 4)") != std::string::npos,
+        "planner names a metadata mismatch");
+  model::gguf::TargetGeometry dense = geometry;
+  dense.experts = 0;
+  dense.intermediateSize = 256;
+  check(planError(dense).find("GGUF architecture is qwen35, but the package's target is qwen35moe") != std::string::npos,
+        "planner checks the architecture against the package");
   std::filesystem::remove_all(directory);
 }
 
@@ -489,6 +644,7 @@ int main(int argc, char **argv) {
     checkGoldens(ggml);
     checkAlphaBeta();
     checkFloatTensors();
+    checkMoeLayer();
     if (std::string(argv[1]) != "--cpu") {
       Gpu gpu{MTLCreateSystemDefaultDevice(), nil, nil, nil};
       gpu.queue = [gpu.device newCommandQueue];

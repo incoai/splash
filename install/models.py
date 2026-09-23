@@ -41,10 +41,12 @@ REPO_ID = re.compile(
     r"[A-Za-z0-9_](?:[A-Za-z0-9._-]*[A-Za-z0-9_])?/"
     r"[A-Za-z0-9_](?:[A-Za-z0-9._-]{0,94}[A-Za-z0-9_])?"
 )
+# Format name -> (schema versions, target layer magic). The schema names the
+# target: 3 a Qwen3.8 (64 layers, 5 draft layers), 4 a Qwen3.6 MoE (40, 6).
 PACKAGE_FORMATS = {
-    "splash-packed-q4": (3, "MDFL0006"),
-    "splash-packed-q4-moe": (4, "MDFM0001"),
-    "gguf": (3, "MDGG0001"),
+    "splash-packed-q4": ((3,), "MDFL0006"),
+    "splash-packed-q4-moe": ((4,), "MDFM0001"),
+    "gguf": ((3, 4), "MDGG0001"),
 }
 # GGUF packages ship no target weights: manifest.target.gguf names a source
 # repository and its files; owner/repo:VARIANT selects one, downloaded into the
@@ -172,7 +174,7 @@ def validate_package_manifest(path: Path):
     if (
         layout is None
         or type(manifest.get("schema_version")) is not int
-        or manifest["schema_version"] != layout[0]
+        or manifest["schema_version"] not in layout[0]
         or not isinstance(manifest.get("model"), str)
         or not manifest["model"].strip()
         or not isinstance(manifest.get("execution_geometry"), dict)
@@ -189,7 +191,8 @@ def validate_package_manifest(path: Path):
         for key, value in expected_format.items()
     ):
         raise ModelError("runtime package has an unsupported packed weight format")
-    if layout[0] == 4:
+    schema = manifest["schema_version"]
+    if schema == 4:
         for key, architecture in (
             ("target", "qwen3_5_moe"),
             ("draft", "DFlash2DraftModel"),
@@ -260,7 +263,7 @@ def validate_package_manifest(path: Path):
         for parent in PurePosixPath(name).parents
     ):
         raise ModelError("runtime package artifact paths overlap")
-    target_layers, draft_layers = (64, 5) if layout[0] == 3 else (40, 6)
+    target_layers, draft_layers = (64, 5) if schema == 3 else (40, 6)
     required_files = {
         "draft/model.bin",
         "vision/model.bin",

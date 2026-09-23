@@ -121,10 +121,8 @@ class ModelArtifactTest(unittest.TestCase):
                 }
             }
         if schema == 4:
-            manifest.update(
-                target={"architecture": "qwen3_5_moe"},
-                draft={"architecture": "DFlash2DraftModel"},
-            )
+            manifest.setdefault("target", {})["architecture"] = "qwen3_5_moe"
+            manifest["draft"] = {"architecture": "DFlash2DraftModel"}
         self.write_manifest(snapshot, manifest)
         return snapshot, manifest
 
@@ -735,6 +733,23 @@ class ModelArtifactTest(unittest.TestCase):
         self.write_manifest(plain_snapshot, plain)
         with self.assertRaisesRegex(artifacts.ModelError, "does not support GGUF"):
             artifacts.validate_package_manifest(plain_snapshot / "manifest.json")
+
+    def test_gguf_schema_names_the_target(self):
+        # Schema 4 is a Qwen3.6 MoE GGUF package: its declarations and six draft
+        # layers are checked as for the packed MoE format; other schemas fail.
+        snapshot, manifest = self.package_fixture(schema=4, variants=("UD-Q4_K_M",))
+        validated = artifacts.validate_package_manifest(snapshot / "manifest.json")
+        self.assertEqual(artifacts.select_variant(validated, "UD-Q4_K_M"), "UD-Q4_K_M")
+        for mutate, message in (
+            (lambda m: m["target"].update(architecture="qwen3_5"), "target architecture"),
+            (lambda m: m.update(schema_version=5), "not a supported"),
+            (lambda m: m["artifacts"].pop(), "missing"),
+        ):
+            broken = copy.deepcopy(manifest)
+            mutate(broken)
+            self.write_manifest(snapshot, broken)
+            with self.assertRaisesRegex(artifacts.ModelError, message):
+                artifacts.validate_package_manifest(snapshot / "manifest.json")
 
     def test_gguf_variant_install_links_shared_files_and_the_source_gguf(self):
         snapshot, manifest = self.package_fixture(variants=("UD-Q4_K_M", "UD-Q5_K_M"))

@@ -103,7 +103,9 @@ ops::Q4Projection readGgufFused(WeightFile &file, uint32_t outputSize,
     offset += s.outputSize;
     p.gguf.push_back(std::move(s));
   }
-  if (offset != outputSize || p.gguf.front().inputSize != inputSize)
+  // The segments may leave the padding columns of a destination row
+  // unwritten (LinearGguf.cpp requireSegments).
+  if (offset > outputSize || p.gguf.front().inputSize != inputSize)
     throw WeightStoreError("GGUF fused projection does not match the layout");
   return p;
 }
@@ -186,7 +188,10 @@ QwenTargetGeometry qwenTargetGeometry(const Qwen3_8Weights &weights) {
 }
 
 QwenTargetGeometry qwenTargetGeometry(const Qwen3_6MoeWeights &weights) {
-  return geometryFor(weights.layout);
+  QwenTargetGeometry geometry = geometryFor(weights.layout);
+  if (!weights.logitsProjection.gguf.empty())
+    geometry.quant = geometry.moe.quant = ops::QuantFamily::Gguf;
+  return geometry;
 }
 
 const ops::Q4Projection &QwenTarget::vocabularyProjection() const noexcept {
@@ -397,7 +402,8 @@ void QwenTarget::addPrefillImpl(
           {buffers.normalized, residual, output, buffers.selectedExperts,
            buffers.routingWeights, buffers.tileDescriptors, buffers.tileCount,
            buffers.groupedRoutes, buffers.routeRows, buffers.groupedInput,
-           buffers.expertIntermediate, buffers.expertOutput},
+           buffers.expertIntermediate, buffers.expertOutput,
+           buffers.groupedSums},
           layer.ffn, *moePlan);
     }
 
@@ -576,7 +582,8 @@ void QwenTarget::addVerifyImpl(
           {buffers.normalized, residual, output, buffers.selectedExperts,
            buffers.routingWeights, buffers.tileDescriptors, buffers.tileCount,
            buffers.groupedRoutes, buffers.routeRows, buffers.groupedInput,
-           buffers.expertIntermediate, buffers.expertOutput},
+           buffers.expertIntermediate, buffers.expertOutput,
+           buffers.groupedSums},
           layer.ffn, *moePlan);
     }
 

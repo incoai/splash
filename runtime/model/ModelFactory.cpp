@@ -37,7 +37,8 @@ ModelPackage loadPackage(metal::MetalBackend &backend,
           return loadQwen3_8Weights(backend, root / "target", layout,
                                     result.descriptor.ggufTarget);
         else
-          return loadQwen3_6MoeWeights(backend, root / "target", layout);
+          return loadQwen3_6MoeWeights(backend, root / "target", layout,
+                                       result.descriptor.ggufTarget);
       },
       result.descriptor.target);
   result.draft = loadDFlashDraftWeights(
