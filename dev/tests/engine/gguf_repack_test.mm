@@ -1,8 +1,9 @@
 // The GGUF load kernels (gguf_repack, gguf_copy) of the production metallib
-// against the CPU reference, and that reference's values against hashes of
-// upstream GGML's dequantization.
-//   gguf-repack --cpu        golden hashes only
-//   gguf-repack <metallib>   golden hashes and the kernels
+// and the image planner's CPU-built alpha/beta tensor against the CPU
+// reference, and that reference's values against hashes of upstream GGML's
+// dequantization.
+//   gguf-repack --cpu        golden hashes and the alpha/beta tensor
+//   gguf-repack <metallib>   also the kernels
 // With SPLASH_GGML_ORACLE=<libggml-base.dylib> the reference is also compared
 // with GGML directly and GGML's hashes are printed; a build of llama.cpp
 // 7ab4ee7 regenerates kGolden.
@@ -11,12 +12,15 @@
 
 #include "GgufFormatReference.hpp"
 #include "metal/abi/Gguf.h"
+#include "model/GgufImage.hpp"
 
 #include <CommonCrypto/CommonDigest.h>
 
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -87,6 +91,147 @@ void checkGoldens(void *ggml) {
   }
 }
 
+// Rows [from, rows) of the image come from llama.cpp's tiled value-head order:
+// destination head h reads source head (h % groups) * groupHeads + h / groups.
+uint32_t sourceRow(uint32_t n, uint32_t from, uint32_t headRows, uint32_t groupHeads, uint32_t groups) {
+  if (n < from) return n;
+  const uint32_t head = (n - from) / headRows;
+  return from + ((head % groups) * groupHeads + head / groups) * headRows + (n - from) % headRows;
+}
+
+template <class T> void append(std::vector<uint8_t> &out, T value) {
+  const auto *bytes = reinterpret_cast<const uint8_t *>(&value);
+  out.insert(out.end(), bytes, bytes + sizeof value);
+}
+
+void appendString(std::vector<uint8_t> &out, const std::string &value) {
+  append<uint64_t>(out, value.size());
+  out.insert(out.end(), value.begin(), value.end());
+}
+
+struct Tensor {
+  std::string name;
+  std::vector<uint64_t> dims; // dims[0] is the row length
+  uint32_t type;
+  std::vector<uint8_t> data;
+};
+
+// A version 3 qwen35 GGUF of the tensors, in order and 32-byte aligned.
+std::vector<uint8_t> ggufFile(const std::vector<Tensor> &tensors, uint32_t blocks, uint32_t hidden) {
+  constexpr uint32_t kString = 8, kUint32 = 4, kAlignment = 32;
+  std::vector<uint8_t> out{'G', 'G', 'U', 'F'};
+  append<uint32_t>(out, 3);
+  append<uint64_t>(out, tensors.size());
+  append<uint64_t>(out, 3);
+  appendString(out, "general.architecture");
+  append(out, kString);
+  appendString(out, "qwen35");
+  appendString(out, "qwen35.block_count");
+  append(out, kUint32);
+  append(out, blocks);
+  appendString(out, "qwen35.embedding_length");
+  append(out, kUint32);
+  append(out, hidden);
+  uint64_t offset = 0;
+  for (const Tensor &tensor : tensors) {
+    appendString(out, tensor.name);
+    append<uint32_t>(out, tensor.dims.size());
+    for (uint64_t dim : tensor.dims) append(out, dim);
+    append(out, tensor.type);
+    append(out, offset);
+    offset += (tensor.data.size() + kAlignment - 1) / kAlignment * kAlignment;
+  }
+  for (const Tensor &tensor : tensors) {
+    out.resize((out.size() + kAlignment - 1) / kAlignment * kAlignment, 0);
+    out.insert(out.end(), tensor.data.begin(), tensor.data.end());
+  }
+  return out;
+}
+
+// The planner builds the GDN alpha/beta projection on the CPU: beta rows, alpha
+// rows, then zero rows up to one 256-row tile, as one Q8_0 tensor with rows in
+// grouped head order. Its plane0 and meta must equal the reference's repack of
+// those native rows. The layer's other tensors are zero; only their shapes and
+// types matter to the planner.
+void checkAlphaBeta() {
+  namespace model = splash::model;
+  using namespace model::ggml;
+  model::gguf::TargetGeometry geometry;
+  geometry.layers = 1;
+  geometry.hiddenSize = 512;
+  geometry.vocabularySize = 256;
+  geometry.intermediateSize = 256;
+  geometry.gdnKeyHeads = 4;
+  geometry.gdnValueHeads = 12;
+  geometry.gdnHeadDimension = 64;
+  geometry.convolutionDimension = 1280; // q and k of 4 heads, v of 12
+  const uint32_t hidden = geometry.hiddenSize, heads = geometry.gdnValueHeads;
+  const uint32_t groupHeads = geometry.gdnKeyHeads, groups = heads / groupHeads;
+  const uint64_t valueRows = uint64_t{heads} * geometry.gdnHeadDimension;
+  const std::vector<uint8_t> beta = fixture(Q80, heads, hidden, 200), alpha = fixture(Q80, heads, hidden, 201);
+
+  std::vector<Tensor> tensors;
+  auto add = [&](std::string name, std::vector<uint64_t> dims, uint32_t type, std::vector<uint8_t> data = {}) {
+    if (data.empty()) {
+      const model::GgmlTypeTraits &traits = *model::ggmlTypeTraits(type);
+      uint64_t elements = 1;
+      for (uint64_t dim : dims) elements *= dim;
+      data.assign(elements / traits.blockElements * traits.blockBytes, 0);
+    }
+    tensors.push_back({std::move(name), std::move(dims), type, std::move(data)});
+  };
+  add("blk.0.attn_norm.weight", {hidden}, kF32);
+  add("blk.0.attn_qkv.weight", {hidden, geometry.convolutionDimension}, kQ4_K);
+  add("blk.0.attn_gate.weight", {hidden, valueRows}, kQ4_K);
+  add("blk.0.ssm_beta.weight", {hidden, heads}, kQ8_0, beta);
+  add("blk.0.ssm_alpha.weight", {hidden, heads}, kQ8_0, alpha);
+  add("blk.0.ssm_conv1d.weight", {4, geometry.convolutionDimension}, kF32);
+  add("blk.0.ssm_a", {heads}, kF32);
+  add("blk.0.ssm_dt.bias", {heads}, kF32);
+  add("blk.0.ssm_norm.weight", {geometry.gdnHeadDimension}, kF32);
+  add("blk.0.ssm_out.weight", {valueRows, hidden}, kQ4_K);
+  add("blk.0.post_attention_norm.weight", {hidden}, kF32);
+  add("blk.0.ffn_gate.weight", {hidden, geometry.intermediateSize}, kQ4_K);
+  add("blk.0.ffn_up.weight", {hidden, geometry.intermediateSize}, kQ4_K);
+  add("blk.0.ffn_down.weight", {geometry.intermediateSize, hidden}, kQ4_K);
+  add("output.weight", {hidden, geometry.vocabularySize}, kQ4_K);
+  add("token_embd.weight", {hidden, geometry.vocabularySize}, kQ4_K);
+
+  const uint32_t stride = rowBytes(Q80, hidden);
+  std::vector<uint8_t> rows(size_t{256} * stride, 0);
+  for (uint32_t n = 0; n < 2 * heads; ++n)
+    std::memcpy(rows.data() + size_t{n} * stride,
+                (n < heads ? beta : alpha).data() + size_t{sourceRow(n % heads, 0, 1, groupHeads, groups)} * stride, stride);
+  const Packed expected = repack(Q80, rows, 256, hidden, nullptr);
+
+  char directory[] = "/tmp/splash-gguf-repack-XXXXXX";
+  if (!mkdtemp(directory)) {
+    check(false, "create a temporary directory");
+    return;
+  }
+  const std::filesystem::path path = std::filesystem::path(directory) / "alpha-beta.gguf";
+  const std::vector<uint8_t> file = ggufFile(tensors, geometry.layers, hidden);
+  std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char *>(file.data()), file.size());
+  bool matches = false;
+  try {
+    const model::GgufFile gguf(path);
+    const model::gguf::Image image = model::gguf::ImagePlanner(gguf, geometry).layer(0);
+    // The layer's only Q8_0 descriptor is alpha/beta's; its plane0 and meta fills follow it.
+    for (size_t i = 0; i + 2 < image.fills.size(); ++i) {
+      const std::vector<uint8_t> &descriptor = image.fills[i].bytes;
+      uint32_t type = 0;
+      if (descriptor.size() == 64) std::memcpy(&type, descriptor.data(), sizeof type);
+      if (type != kQ8_0) continue;
+      matches = image.fills[i + 1].bytes == expected.w0 && image.fills[i + 2].bytes == expected.meta;
+      break;
+    }
+  } catch (const model::GgufError &error) {
+    std::fprintf(stderr, "%s\n", error.what());
+  }
+  std::filesystem::remove_all(directory);
+  check(matches, "planner alpha/beta tensor matches the CPU reference");
+}
+
 constexpr uint64_t kSection = 16384; // image section alignment, as the planner lays out images
 constexpr uint32_t kSourceOffset = 96; // tensor data offset inside the mapped source window
 constexpr uint8_t kPoison = 0xA5;
@@ -146,14 +291,6 @@ bool imageMatches(id<MTLBuffer> image, const std::vector<Expected> &sections) {
   for (uint64_t i = 0; i < image.length; ++i)
     if (!covered[i] && data[i] != kPoison) return false;
   return true;
-}
-
-// Rows [from, rows) of the image come from llama.cpp's tiled value-head order:
-// destination head h reads source head (h % groups) * groupHeads + h / groups.
-uint32_t sourceRow(uint32_t n, uint32_t from, uint32_t headRows, uint32_t groupHeads, uint32_t groups) {
-  if (n < from) return n;
-  const uint32_t head = (n - from) / headRows;
-  return from + ((head % groups) * groupHeads + head / groups) * headRows + (n - from) % headRows;
 }
 
 // Row tiles are whole (the planner requires rows and K to be multiples of 256);
@@ -217,6 +354,7 @@ int main(int argc, char **argv) {
       check(ggml, std::string("load ") + oracle + (ggml ? "" : std::string(": ") + dlerror()));
     }
     checkGoldens(ggml);
+    checkAlphaBeta();
     if (std::string(argv[1]) != "--cpu") {
       Gpu gpu{MTLCreateSystemDefaultDevice(), nil, nil, nil};
       gpu.queue = [gpu.device newCommandQueue];

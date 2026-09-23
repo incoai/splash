@@ -226,8 +226,9 @@ $(TEST_GGUF_PROJECTION): dev/tests/engine/gguf_projection_test.mm dev/tests/engi
 		$(TEST_GGUF_DEQUANT_LIB) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LINKFLAGS) -o $@
 
-$(TEST_GGUF_REPACK): dev/tests/engine/gguf_repack_test.mm dev/tests/engine/GgufFormatReference.hpp | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LINKFLAGS) -o $@
+$(TEST_GGUF_REPACK): runtime/model/GgufFile.cpp runtime/model/GgufImage.cpp \
+		dev/tests/engine/gguf_repack_test.mm dev/tests/engine/GgufFormatReference.hpp | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) $(ENGINE_LINKFLAGS) -o $@
 
 $(ENGINE_TEST_BUILD)/gguf-dequant.air: dev/tests/engine/gguf_dequant_test.metal \
 		runtime/metal/kernels/shared/gguf_linear.metal $(KERNEL_HEADERS) | $(ENGINE_TEST_BUILD)
