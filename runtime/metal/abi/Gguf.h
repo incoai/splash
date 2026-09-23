@@ -7,21 +7,11 @@
 struct GgufParams {
   uint32_t output_size;       // columns of this segment
   uint32_t input_size;        // K
-  uint32_t persistent_groups; // decode: threadgroups (>= tiles); split-K: splits
+  uint32_t persistent_groups; // decode: threadgroups (>= tiles)
   uint32_t out_stride;        // row stride of the destination (0 = output_size)
   uint32_t out_offset;        // first destination column of this segment
 };
 static_assert(sizeof(GgufParams) == 20, "GGUF parameters are 20 bytes on both sides");
-
-struct GgufReduceParams {
-  uint32_t splits;
-  uint32_t rows;
-  uint32_t cols;
-  uint32_t out_stride;
-  uint32_t out_offset;
-  uint32_t epilogue;
-};
-static_assert(sizeof(GgufReduceParams) == 24, "GGUF reduce parameters are 24 bytes on both sides");
 
 struct GgufEmbedParams {
   uint32_t rows;
