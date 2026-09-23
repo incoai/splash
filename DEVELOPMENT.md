@@ -161,8 +161,12 @@ The GEMM kernels are in
 `runtime/metal/kernels/shared/gguf_linear.metal` (ABI in `runtime/metal/abi/Gguf.h`, the image
 formats in `runtime/metal/abi/QuantFormat.h`, their decoding in
 `runtime/metal/kernels/common/quant_formats.h`), the dispatch
-policy in `runtime/ops/Linear.cpp`, and `make test-engine-metal` checks the kernels against fp64
-and, with `SPLASH_GGML_ORACLE=<libggml-base.dylib>`, against upstream GGML's dequantization.
+policy in `runtime/ops/Linear.cpp`. The tests' CPU reference (`dev/tests/engine/GgufFormatReference.hpp`)
+must reproduce checked-in hashes of upstream GGML's dequantization (llama.cpp 7ab4ee7) in
+`make test-engine-cpu`; `make test-engine-metal` checks the production `gguf_repack` and
+`gguf_copy` kernels bitwise against it and the GEMM kernels against fp64. With
+`SPLASH_GGML_ORACLE=<libggml-base.dylib>` the reference is also compared with GGML directly and
+`gguf-repack --cpu` prints GGML's hashes.
 
 ## Code and API boundaries
 

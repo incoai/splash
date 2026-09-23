@@ -66,6 +66,7 @@ TEST_MEMORY_TEST := $(ENGINE_TEST_BUILD)/engine-memory-plan
 TEST_DEVICE_QUERIES := $(ENGINE_TEST_BUILD)/device-queries
 TEST_GGUF_FILE := $(ENGINE_TEST_BUILD)/gguf-file
 TEST_GGUF_PROJECTION := $(ENGINE_TEST_BUILD)/gguf-projection
+TEST_GGUF_REPACK := $(ENGINE_TEST_BUILD)/gguf-repack
 TEST_GGUF_DEQUANT_LIB := $(ENGINE_TEST_BUILD)/gguf-dequant.metallib
 TEST_KV_PAGE_CACHE_TEST := $(ENGINE_TEST_BUILD)/kv-page-cache
 TEST_KV_FIRST_CACHE_TEST := $(ENGINE_TEST_BUILD)/kv-first-cache
@@ -134,6 +135,7 @@ TEST_METAL_BACKEND_LIB := $(ENGINE_TEST_BUILD)/metal-backend.metallib
 
 TEST_CPU_TARGETS := $(TEST_OPERATOR_WORKSPACE) \
 	$(TEST_GGUF_FILE) \
+	$(TEST_GGUF_REPACK) \
 	$(TEST_DEVICE_QUERIES) \
 	$(TEST_TUNING_WORKLOADS) \
 	$(TEST_LINEAR_PLAN) $(TEST_LINEAR_TUNING) $(TEST_ATTENTION_TUNING) \
@@ -161,6 +163,7 @@ TEST_CPU_TARGETS := $(TEST_OPERATOR_WORKSPACE) \
 
 TEST_METAL_TARGETS := $(TEST_Q4_SGMATRIX_TEST) $(TEST_TUNING_WORKLOADS) \
 	$(TEST_GGUF_PROJECTION) \
+	$(TEST_GGUF_REPACK) \
 	$(TEST_LINEAR_TUNING) \
 	$(TEST_ATTENTION_TUNING) \
 	$(TEST_DRAFT_ATTENTION_TUNING) \
@@ -219,7 +222,12 @@ $(ENGINE_SANITIZER_BUILD):
 $(TEST_GGUF_FILE): dev/tests/engine/gguf_file_test.cpp runtime/model/GgufFile.cpp | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
-$(TEST_GGUF_PROJECTION): dev/tests/engine/gguf_projection_test.mm dev/tests/engine/iq3s_grid.inc $(TEST_GGUF_DEQUANT_LIB) | $(ENGINE_TEST_BUILD)
+$(TEST_GGUF_PROJECTION): dev/tests/engine/gguf_projection_test.mm dev/tests/engine/GgufFormatReference.hpp \
+		dev/tests/engine/iq3s_grid.inc $(TEST_GGUF_DEQUANT_LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LINKFLAGS) -o $@
+
+$(TEST_GGUF_REPACK): dev/tests/engine/gguf_repack_test.mm dev/tests/engine/GgufFormatReference.hpp \
+		dev/tests/engine/iq3s_grid.inc | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LINKFLAGS) -o $@
 
 $(ENGINE_TEST_BUILD)/gguf-dequant.air: dev/tests/engine/gguf_dequant_test.metal \
@@ -581,6 +589,7 @@ test-engine: test-engine-cpu test-engine-metal
 
 test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TUNE_KERNELS)
 	$(TEST_GGUF_FILE)
+	$(TEST_GGUF_REPACK) --cpu
 	$(TEST_DEVICE_QUERIES)
 	$(TEST_TUNING_WORKLOADS)
 	$(TEST_LINEAR_PLAN) --cpu
@@ -616,6 +625,7 @@ $(TEST_Q4_SGMATRIX_TEST): dev/tests/engine/q4_sgmatrix_metal_test.mm $(ENGINE_LI
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
 
 test-engine-metal: $(TEST_METAL_TARGETS)
+	$(METAL_TEST_ENV) $(TEST_GGUF_REPACK) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_GGUF_PROJECTION) $(TEST_GGUF_DEQUANT_LIB) dequant
 	$(METAL_TEST_ENV) $(TEST_GGUF_PROJECTION) $(LIB) full
 	$(METAL_TEST_ENV) $(TEST_TUNING_WORKLOADS) $(LIB)
