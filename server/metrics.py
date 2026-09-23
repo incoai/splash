@@ -217,6 +217,27 @@ def usage_dict(result, job):
     }
 
 
+def timings_dict(result):
+    """llama-server-compatible counts and request lifecycle timings.
+
+    Counts are final totals. Rates exclude cached prompt tokens and the first
+    emission respectively: those tokens precede the intervals being measured.
+    These are elapsed request intervals, not isolated GPU execution times.
+    """
+    latency = metrics_dict(result)["request_latency"]
+    prompt_ms = latency.get("start_to_first_token_ms", 0.0)
+    prompt_rate = result.prefill_tokens * 1000.0 / prompt_ms if prompt_ms else 0.0
+    return {
+        "prompt_n": result.prompt_tokens,
+        "prompt_ms": prompt_ms,
+        "prompt_per_second": prompt_rate if math.isfinite(prompt_rate) else 0.0,
+        "predicted_n": result.completion_tokens,
+        "predicted_ms": latency.get("first_token_to_done_ms", 0.0),
+        "predicted_per_second": latency.get("stream_tokens_per_second", 0.0),
+        "cache_n": result.cache.matched_tokens,
+    }
+
+
 def metrics_dict(result):
     # The first native emission can contain a whole speculative block. Its
     # generation precedes TTFT, so none of those tokens belong in the interval

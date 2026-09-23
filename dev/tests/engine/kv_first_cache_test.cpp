@@ -152,6 +152,164 @@ void testSchedulingProbeDoesNotChangeCachePolicy() {
           "scheduling probe refreshed the oldest state's eviction order");
 }
 
+void testValidAdmissionProbePreservesLookupAndAccounting() {
+  CacheFixture fixture;
+  fixture.publish(0);
+  fixture.publish(2);
+  const CacheProbe probe = fixture.cache.probe(fixture.prompt);
+  const auto before = fixture.cache.snapshot();
+  require(probe.cachedTokens() == 96 && before.stateCache.pinned == 0 &&
+              before.lookup.lookups == 0,
+          "admission probe changed cache ownership or accounting");
+  auto lookup = fixture.cache.lookup(fixture.prompt, {}, &probe);
+  require(lookup.kvBoundary == 128 && lookup.resumeBoundary() == 96 &&
+              lookup.junctionBoundary() == 128,
+          "valid admission probe lost the deepest state or KV tail");
+  fixture.cache.recordLookup(lookup);
+  const auto after = fixture.cache.snapshot();
+  require(after.lookup.lookups == 1 && after.lookup.kvHitTokens == 128 &&
+              after.lookup.stateHitTokens == 96 &&
+              after.lookup.lazyJunctions == 1 &&
+              after.stateCache.pinned == 1,
+          "admission probe changed lookup accounting or lease ownership");
+}
+
+void testProbeFallsBackWhenPromptChanges() {
+  CacheFixture fixture;
+  fixture.publish(0);
+  const CacheProbe probe = fixture.cache.probe(fixture.prompt);
+  fixture.prompt.front() += 1;
+  const auto lookup = fixture.cache.lookup(fixture.prompt, {}, &probe);
+  require(lookup.kvBoundary == 0 && lookup.resumeBoundary() == 0,
+          "a same-buffer prompt edit reused a different prompt's cache");
+}
+
+void testProbeRechecksFirstMissAndPromptLength() {
+  CacheFixture fixture;
+  fixture.publish(0);
+  fixture.publish(3);
+  auto changed = fixture.prompt;
+  changed[32] += 1;
+  const CacheProbe partial = fixture.cache.probe(changed);
+  require(partial.cachedTokens() == 32, "partial probe missed its first page");
+  // Restoring the first missed page must reveal the already-cached suffix,
+  // even though the matched pages and KV generation did not change.
+  auto restored = fixture.cache.lookup(fixture.prompt, {}, &partial);
+  require(restored.kvBoundary == 128 && restored.resumeBoundary() == 128,
+          "probe hid a prefix after an edit to its first missed page");
+  restored.state.reset();
+
+  const CacheProbe full = fixture.cache.probe(fixture.prompt);
+  for (size_t size : {size_t{0}, size_t{1}, size_t{32}, size_t{33}}) {
+    const auto shorter = std::span<const uint32_t>(fixture.prompt).first(size);
+    const auto lookup = fixture.cache.lookup(shorter, {}, &full);
+    const uint32_t expected = size == 33 ? 32 : 0;
+    require(lookup.kvBoundary == expected && lookup.resumeBoundary() == expected,
+            "probe reused pages past a shortened prompt's replay boundary");
+  }
+  const auto shortPrompt = std::span<const uint32_t>(fixture.prompt).first(33);
+  const CacheProbe shortProbe = fixture.cache.probe(shortPrompt);
+  const auto longer = fixture.cache.lookup(fixture.prompt, {}, &shortProbe);
+  require(longer.kvBoundary == 128 && longer.resumeBoundary() == 128,
+          "probe hid cached pages after the prompt grew");
+}
+
+void testProbeRechecksStateChanges() {
+  CacheFixture fixture;
+  fixture.publish(3);
+  fixture.publish(0);
+  const CacheProbe probe = fixture.cache.probe(fixture.prompt);
+  require(probe.cachedTokens() == 128 && fixture.cache.reclaimOneState(),
+          "state eviction fixture did not remove the deepest state");
+  auto lookup = fixture.cache.lookup(fixture.prompt, {}, &probe);
+  require(lookup.kvBoundary == 128 && lookup.resumeBoundary() == 32,
+          "admission probe reused an evicted state");
+  lookup.state.reset();
+
+  CacheFixture published;
+  const CacheProbe cold = published.cache.probe(published.prompt);
+  published.publish(2);
+  auto newlyPublished = published.cache.lookup(published.prompt, {}, &cold);
+  require(cold.cachedTokens() == 0 && newlyPublished.resumeBoundary() == 96,
+          "admission probe missed a state published after preview");
+}
+
+void testProbeFallsBackWhenKvChanges() {
+  CacheFixture fixture;
+  fixture.publish(0);
+  const CacheProbe probe = fixture.cache.probe(fixture.prompt);
+  require(fixture.cache.reclaimOne(CacheReclaimMode::ReuseBacking).madeProgress &&
+              fixture.cache.snapshot().kvCache.blocks == 3,
+          "KV eviction fixture did not evict the cached tail");
+  auto lookup = fixture.cache.lookup(fixture.prompt, {}, &probe);
+  require(lookup.kvBoundary == 96 && lookup.resumeBoundary() == 32,
+          "admission probe reused an evicted KV block");
+
+  test::TestKvBacking backing{1, 100};
+  KvPool pool{backing};
+  engine::Cache cache{pool, cacheNamespace()};
+  std::vector<uint32_t> prompt(33, 77);
+  const CacheProbe cold = cache.probe(prompt);
+  require(cold.cachedTokens() == 0, "cold admission probe found cached work");
+  cache.beginRequest(1);
+  require(cache.ensureTokens(1, 32).granted(), "new KV page was not acquired");
+  const uint64_t block = cache.publishCommittedBlocks(1, prompt, 32);
+  cache.publishCompositeState(block, std::make_shared<TestState>(100));
+  cache.endRequest(1);
+  auto newlyCached = cache.lookup(prompt, {}, &cold);
+  require(newlyCached.kvBoundary == 32 &&
+              newlyCached.resumeBoundary() == 32,
+          "cold probe hid a prefix published after preview");
+}
+
+void testProbeBindsImageIdentity() {
+  test::TestKvBacking backing{1, 100};
+  KvPool pool{backing};
+  engine::Cache cache{pool, cacheNamespace()};
+  std::vector<uint32_t> prompt(33, 77);
+  ImageSpan image{0, 32, 1, 1, 101, 202};
+  const std::span<const ImageSpan> images(&image, 1);
+  cache.beginRequest(1);
+  require(cache.ensureTokens(1, 32).granted(), "image KV page was not acquired");
+  const uint64_t block = cache.publishCommittedBlocks(1, prompt, 32, images);
+  cache.publishCompositeState(block, std::make_shared<TestState>(100));
+  cache.endRequest(1);
+  const CacheProbe probe = cache.probe(prompt, images);
+  auto valid = cache.lookup(prompt, images, &probe);
+  require(valid.kvBoundary == 32 && valid.resumeBoundary() == 32,
+          "matching image probe lost its cached prefix");
+  valid.state.reset();
+  image.digestLo += 1;
+  auto changed = cache.lookup(prompt, images, &probe);
+  require(changed.kvBoundary == 0 && changed.resumeBoundary() == 0,
+          "image digest change reused a different image's cache");
+}
+
+void testProbeCannotCrossCaches() {
+  test::TestKvBacking firstBacking{1, 100};
+  test::TestKvBacking secondBacking{1, 100};
+  KvPool firstPool{firstBacking};
+  KvPool secondPool{secondBacking};
+  engine::Cache first{firstPool, cacheNamespace()};
+  engine::Cache second{secondPool, cacheNamespace()};
+  const std::vector<uint32_t> firstPrompt(33, 11);
+  const std::vector<uint32_t> secondPrompt(33, 22);
+  const auto populate = [](engine::Cache &cache,
+                           const std::vector<uint32_t> &prompt) {
+    cache.beginRequest(1);
+    require(cache.ensureTokens(1, 32).granted(), "KV page was not acquired");
+    const uint64_t block = cache.publishCommittedBlocks(1, prompt, 32);
+    cache.publishCompositeState(block, std::make_shared<TestState>(100));
+    cache.endRequest(1);
+  };
+  populate(first, firstPrompt);
+  populate(second, secondPrompt);
+  const CacheProbe probe = first.probe(firstPrompt);
+  const auto lookup = second.lookup(firstPrompt, {}, &probe);
+  require(lookup.kvBoundary == 0 && lookup.resumeBoundary() == 0,
+          "a probe from another cache reused a colliding block id");
+}
+
 void testCacheLookupAndOneTokenReplay() {
   CacheFixture fixture;
   fixture.publish(0);
@@ -621,6 +779,13 @@ int main() {
     testCheckpointPressurePreservesHotPrefix();
     testLogicalKvPressureStillReclaimsPages();
     testSchedulingProbeDoesNotChangeCachePolicy();
+    testValidAdmissionProbePreservesLookupAndAccounting();
+    testProbeFallsBackWhenPromptChanges();
+    testProbeRechecksFirstMissAndPromptLength();
+    testProbeRechecksStateChanges();
+    testProbeFallsBackWhenKvChanges();
+    testProbeBindsImageIdentity();
+    testProbeCannotCrossCaches();
     testCacheLookupAndOneTokenReplay();
     testPage31Page32Page33Backoff();
     testLazyJunctionMaterialization();
