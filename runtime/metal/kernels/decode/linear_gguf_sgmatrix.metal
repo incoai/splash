@@ -1,11 +1,12 @@
 // GGUF decode on Apple9's register simdgroup_matrix path. The 8x8x8 MMA runs
 // on the FP32 pipe there, so the kernel keeps every other FP32 operation to
 // the minimum a group scale needs, and does the rest on the integer pipe:
-// - weights enter the MMA as exact bf16: 128 + code for linear codes (one OR),
-//   or the codebook, int8 or grid value;
+// - weights enter the MMA as exact bf16: 128 + code for linear codes with a
+//   min, 160 + code - zero for linear codes with a zero point (one add), or
+//   the codebook, int8 or grid value;
 // - one MMA chain per coefficient group, closed by the fp32 epilogue
 //   s * chain + b * sum (b = m - 128 s, formats with a min) or s * chain with
-//   the chain seeded by -(128 + zero) * sum (formats with a zero point);
+//   the chain seeded by -160 * sum from the table (formats with a zero point);
 // - coefficients decoded once per simdgroup into threadgroup memory;
 // - L request lanes per threadgroup share the weight operands and coefficients;
 //   each lane's chains and epilogue run as with L = 1, so its result does not
@@ -29,8 +30,10 @@ template <class F> struct Shape {
   enum : uint {
     Linear = F::Kind == QuantLinear,
     HasMin = Linear && CodeZero<F::Kind, F>::Value == 0,      // Q4_K, Q5_K: s code + m
-    Zero = Linear && !HasMin ? 128 + CodeZero<F::Kind, F>::Value : 0,  // Q6_K, Q3_K: chain seed factor
-    CG = Linear && !HasMin ? 2 : 1,                           // coefficient groups per 32 inputs
+    ZeroPoint = Linear && !HasMin,                            // Q6_K, Q3_K: s (code - zero)
+    // bf16 bits of the operand of code 0: 128, or 160 - zero with a zero point
+    Operand = 0x4300 + (ZeroPoint ? q16sg::kZeroPointOffset - 128 - CodeZero<F::Kind, F>::Value : 0),
+    CG = ZeroPoint ? 2 : 1,                                   // coefficient groups per 32 inputs
     UnitSpans = F::MetaGroups == 8 ? 4 : 1,                   // spans decoded per coefficient unit
     J = 2 * UnitSpans * CG,                                   // coefficients per column and unit
   };
@@ -40,8 +43,9 @@ template <class F> using Coef = metal::conditional_t<Shape<F>::HasMin != 0, floa
 // The exact bf16 operand of pair f of a chunk.
 template <class F>
 inline bfloat2 operand(typename F::Chunk ch, uint f, threadgroup const bfloat2 *lut) {
+  typedef Shape<F> S;
   if constexpr (F::Kind == QuantLinear) {
-    return as_type<bfloat2>(F::codes(ch)[f] | 0x43004300u);
+    return as_type<bfloat2>(F::codes(ch)[f] + S::Operand * 0x00010001u);
   } else if constexpr (F::Kind == QuantCodebook) {
     return lut[(F::indices(ch) >> (8 * f)) & 0xFFu];
   } else if constexpr (F::Kind == QuantInt8) {
@@ -119,7 +123,7 @@ inline void decode(device const bfloat *table, device const float *sums, device 
   };
   device const vec<bfloat, 8> *xt =
       reinterpret_cast<device const vec<bfloat, 8> *>(table + ulong(first) * q4sg::kXtPerGroup);
-  device const float *s16 = sums + ulong(first) * 32;
+  device const float *seeds = sums + ulong(first) * 32;
   device const float *s32 = sums + q16sg::sums32_offset(K) + ulong(first) * 16;
 
   float2 acc[L][2];
@@ -158,24 +162,23 @@ inline void decode(device const bfloat *table, device const float *sums, device 
 #pragma unroll
         for (uint r = 0; r < L; ++r) {
           const vec<bfloat, 8> bq = xt[ulong(r) * K + (8 * q + fm) * 4 + c];
-          float2 sum[S::CG];
+          float2 sum = float2(0), seed[S::CG];
+          if (S::HasMin) sum = *(device const float2 *)(s32 + ulong(r) * tileSums + q * 8 + fn);
+#pragma unroll
+          for (uint h = 0; h < S::CG; ++h)
+            seed[h] = S::ZeroPoint ? *(device const float2 *)(seeds + ulong(r) * tileSums + (2 * q + h) * 8 + fn)
+                                   : float2(0);
 #pragma unroll
           for (uint h = 0; h < S::CG; ++h) {
-            if (S::HasMin) sum[h] = *(device const float2 *)(s32 + ulong(r) * tileSums + q * 8 + fn);
-            else if (S::Zero) sum[h] = *(device const float2 *)(s16 + ulong(r) * tileSums + (2 * q + h) * 8 + fn);
-          }
-#pragma unroll
-          for (uint h = 0; h < S::CG; ++h) {
-            const float2 seed = S::Zero ? -float(S::Zero) * sum[h] : float2(0);
 #pragma unroll
             for (uint nf = 0; nf < 2; ++nf) {
-              float2 dot = seed;
+              float2 dot = seed[h];
 #pragma unroll
               for (uint f = h * FG; f < (h + 1) * FG; ++f)
                 q4sg::mma_acc<bfloat>(dot, a[nf][f], reinterpret_cast<thread const bfloat2 *>(&bq)[f]);
               if constexpr (S::HasMin) {
                 acc[r][nf] = fma(dot, cs[h][nf].x, acc[r][nf]);
-                acc[r][nf] = fma(sum[h], cs[h][nf].y, acc[r][nf]);
+                acc[r][nf] = fma(sum, cs[h][nf].y, acc[r][nf]);
               } else {
                 acc[r][nf] = fma(dot, float(cs[h][nf]), acc[r][nf]);
               }
@@ -184,7 +187,7 @@ inline void decode(device const bfloat *table, device const float *sums, device 
         }
       }
       xt += 64;
-      s16 += 32;
+      seeds += 32;
       s32 += 16;
       if (more) {
 #pragma unroll
