@@ -15,8 +15,8 @@ using namespace metal;
 // and one element accessor, by Kind:
 //   QuantLinear    codes(Chunk) -> uint4, pair p in component p with e0 at
 //                  bit 0 and e1 at bit 16; value = s * (code - Zero) + m
-//   QuantCodebook  indices(Chunk) -> uint, byte p indexes a value pair
-//                  (low nibble e0) of kIQ4NLValues; value = s * table value
+//   QuantCodebook  indices(Chunk) -> uint, byte p indexes pair p in the
+//                  quant_iq4_pair_table; value = s * table value
 //   QuantInt8      values(Chunk) -> uint2, the int8 values of pairs 0, 1 (x)
 //                  and 2, 3 (y); value = s * int8
 //   (both with Scale, the narrowest type that holds s exactly)
@@ -35,6 +35,14 @@ struct QuantCoef {
   enum : uint { P0 = kQuantFormats[F].plane0_bytes, P1 = kQuantFormats[F].plane1_bytes, MetaBytes = kQuantFormats[F].meta_bytes }; \
   enum : ushort { MetaGroups = kQuantFormats[F].meta_groups };                                                   \
   static constexpr constant QuantKind Kind = K
+
+// Fills the codebook formats' threadgroup table of IQ4 value pairs, entry b =
+// (kIQ4NLValues[b & 15], kIQ4NLValues[b >> 4]) for the index byte b of a pair;
+// called by all threads of the threadgroup.
+inline void quant_iq4_pair_table(threadgroup half2 *table, uint thread_index, uint threads) {
+  for (uint i = thread_index; i < 256; i += threads) table[i] = half2(half(kIQ4NLValues[i & 15]), half(kIQ4NLValues[i >> 4]));
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+}
 
 // The pair words of a word of 4-bit codes: pair p's e0 at bits 4p, e1 at 16 + 4p.
 inline uint4 quant_nibble_pairs(uint word) { return (uint4(word) >> uint4(0, 4, 8, 12)) & 0x000F000Fu; }

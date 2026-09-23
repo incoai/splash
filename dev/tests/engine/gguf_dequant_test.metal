@@ -8,7 +8,7 @@ kernel void gguf_test_dequant_##name(device uchar *w0 [[buffer(0)]], \
     uint tid [[thread_position_in_grid]], uint lane [[thread_index_in_threadgroup]]) { \
   threadgroup half stage[32 * 32]; \
   threadgroup half2 lut[256]; \
-  gguf_init_lut(lut, lane, 32); \
+  quant_iq4_pair_table(lut, lane, 32); \
   const uint groups = p.input_size / 32, row = tid / groups, g = tid % groups; \
   const ulong payload = quant_tile_index(row, g, groups); \
   const ulong header = quant_tile_index(row, g / F::MetaGroups, groups / F::MetaGroups); \

@@ -22,11 +22,6 @@ inline half2 staged_linear(uint pair, float s, float m) {
   if constexpr (F::Zero) return half2(code * s);
   else return half2(fma(code, float2(s), float2(m)));
 }
-// IQ4 value pairs for the codebook formats' threadgroup table: entry b = (value[b & 15], value[b >> 4]).
-inline void gguf_init_lut(threadgroup half2 *tl, uint thread_index, uint threads) {
-  for (uint i = thread_index; i < 256; i += threads) tl[i] = half2(half(kIQ4NLValues[i & 15]), half(kIQ4NLValues[i >> 4]));
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-}
 template <class F>
 inline void dequant32(typename F::Payload w, typename F::Meta meta, ushort j, threadgroup half2 *tl, threadgroup half *dst) {
   QuantCoef k;
@@ -209,7 +204,7 @@ inline void pf_tile(device TA *input, device uchar *w0, device uchar *w1, device
 
 #define TGLUT_INIT(F)                                                                                     \
   threadgroup half2 tl[F::Kind == QuantCodebook ? 256 : 1];                                                \
-  if constexpr (F::Kind == QuantCodebook) gguf_init_lut(tl, simd_group * 32 + simd_lane, Threads);
+  if constexpr (F::Kind == QuantCodebook) quant_iq4_pair_table(tl, simd_group * 32 + simd_lane, Threads);
 #define ABUF(TA) device TA *input [[buffer(0)]], device uchar *w0 [[buffer(1)]], device uchar *w1 [[buffer(2)]], \
                  device uchar *meta [[buffer(3)]], device bfloat *output [[buffer(4)]], constant GgufParams &p [[buffer(5)]]
 #define ABUFE device bfloat *input [[buffer(0)]], device uchar *w0 [[buffer(1)]], device uchar *w1 [[buffer(2)]], \
@@ -354,7 +349,7 @@ inline void gguf_accum_any(uint fmt, device TA *input, device uchar *w0, device 
                        device bfloat *output [[buffer(10)]], constant GgufFusedParams &p [[buffer(11)]],       \
                        uint group [[threadgroup_position_in_grid]], IDS) {                                   \
     threadgroup half stage[2 * 2 * 32 * 32]; threadgroup half2 tl[256];                                     \
-    gguf_init_lut(tl, simd_group * 32 + simd_lane, 64);                                                      \
+    quant_iq4_pair_table(tl, simd_group * 32 + simd_lane, 64);                                               \
     const uint t0 = p.cols[0] / 64, t1 = t0 + p.cols[1] / 64;                                              \
     device uchar *w0 = w0a; device uchar *w1 = w1a; device uchar *meta = ma; uint fmt = p.fmt[0], off = p.offset[0], local = group; \
     if (group >= t1) { w0 = w0c; w1 = w1c; meta = mc; fmt = p.fmt[2]; off = p.offset[2]; local = group - t1; }                    \
@@ -378,7 +373,7 @@ GGUF_FUSED_K(8) GGUF_FUSED_K(16) GGUF_FUSED_K(24) GGUF_FUSED_K(32)
                         device bfloat *output [[buffer(7)]], constant GgufGateUpParams &p [[buffer(8)]],        \
                         uint group [[threadgroup_position_in_grid]], IDS) {                                  \
     threadgroup half stage[2 * 2 * 32 * 32]; threadgroup half2 tl[256];                                     \
-    gguf_init_lut(tl, simd_group * 32 + simd_lane, 64);                                                      \
+    quant_iq4_pair_table(tl, simd_group * 32 + simd_lane, 64);                                               \
     const uint origin = group * 64 + simd_group * 32, steps = p.input_size / 32;                           \
     threadgroup half *my = stage + simd_group * (2 * 32 * 32);   /* one 8 KB stage for both passes: occupancy */ \
     auto gate = gguf_make_acc<bfloat, R, 32, 32>(input, p.input_size, my);                                    \
@@ -442,7 +437,7 @@ inline void gguf_splitk_tile(device bfloat *input, device uchar *w0, device ucha
                              device atomic_uint *counters [[buffer(5)]], device bfloat *output [[buffer(6)]], device bfloat *aux [[buffer(7)]], \
                              constant GgufSplitParams &p [[buffer(8)]], uint2 group [[threadgroup_position_in_grid]], IDS) { \
     threadgroup half stage[2 * 2 * 32 * 32]; threadgroup half2 tl[F::Kind == QuantCodebook ? 256 : 1]; threadgroup uint arrival; \
-    if constexpr (F::Kind == QuantCodebook) gguf_init_lut(tl, simd_group * 32 + simd_lane, 64);               \
+    if constexpr (F::Kind == QuantCodebook) quant_iq4_pair_table(tl, simd_group * 32 + simd_lane, 64);        \
     gguf_splitk_tile<F, R>(input, w0, w1, meta, partials, counters, output, aux, p, group, simd_lane, simd_group, stage, tl, &arrival); }
 #define GGUF_SPLITK_SET(F, f) GGUF_SPLITK_K(F, f, 8) GGUF_SPLITK_K(F, f, 16) GGUF_SPLITK_K(F, f, 24) GGUF_SPLITK_K(F, f, 32)
 GGUF_SPLITK_SET(FmtQ4K, q4k) GGUF_SPLITK_SET(FmtIQ4XS, iq4xs) GGUF_SPLITK_SET(FmtIQ4NL, iq4nl) GGUF_SPLITK_SET(FmtQ5K, q5k)
