@@ -220,10 +220,12 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config)
     }
     if (w.phase == LinearPhase::Prefill) {
       // Four simdgroups: 128-row prefill tiles. Two: the decode tiles, which
-      // hold at most the rows of a full decode batch.
+      // hold at most the rows of a full decode batch and split K as in decode.
       const bool decodeTile = config.simdgroups == LinearSimdgroups::Two &&
           w.rows <= SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS;
-      if (config.groups || config.splits != 1 ||
+      if (config.groups || !config.splits || (config.splits > 1 && !decodeTile) ||
+          config.splits > kMaximumSimdgroupSplits || (config.splits & (config.splits - 1)) ||
+          (w.matrix.inputSize / 32) % config.splits ||
           (config.simdgroups != LinearSimdgroups::Four && !decodeTile))
         throw std::invalid_argument("invalid GGUF prefill configuration");
     } else if (config.groups != w.matrix.outputSize / tileColumns() ||
@@ -710,20 +712,21 @@ void Q4Linear::addPrefillSums(metal::CommandGraph &graph, metal::MetalBuffer inp
 }
 void Q4Linear::addPrefill(metal::CommandGraph &graph, metal::MetalBuffer input,
     const Q4Projection &p, metal::MetalBuffer output, metal::MetalBuffer sums,
-    LinearMatrix matrix, uint32_t rows) const {
-  add(graph, {input, output, sums, {}, {}, {}}, p,
+    LinearMatrix matrix, uint32_t rows, LinearScratch scratch) const {
+  add(graph, {input, output, sums, {}, {}, {}, scratch}, p,
       plan({matrix, rows, LinearPhase::Prefill, LinearEpilogue::None}, p));
 }
 void Q4Linear::addPrefillResidual(metal::CommandGraph &graph, metal::MetalBuffer input,
     const Q4Projection &p, metal::MetalBuffer residual, metal::MetalBuffer output,
-    metal::MetalBuffer sums, LinearMatrix matrix, uint32_t rows) const {
-  add(graph, {input, output, sums, residual, {}, {}}, p,
+    metal::MetalBuffer sums, LinearMatrix matrix, uint32_t rows, LinearScratch scratch) const {
+  add(graph, {input, output, sums, residual, {}, {}, scratch}, p,
       plan({matrix, rows, LinearPhase::Prefill, LinearEpilogue::Residual}, p));
 }
 void Q4Linear::addPrefillUpWithGate(metal::CommandGraph &graph, metal::MetalBuffer input,
     const Q4Projection &up, metal::MetalBuffer gateScratch, metal::MetalBuffer output,
-    metal::MetalBuffer sums, metal::MetalBuffer downSums, LinearMatrix matrix, uint32_t rows) const {
-  add(graph, {input, output, sums, {}, gateScratch, downSums}, up,
+    metal::MetalBuffer sums, metal::MetalBuffer downSums, LinearMatrix matrix, uint32_t rows,
+    LinearScratch scratch) const {
+  add(graph, {input, output, sums, {}, gateScratch, downSums, scratch}, up,
       plan({matrix, rows, LinearPhase::Prefill, LinearEpilogue::UpWithGate}, up));
 }
 PreparedInput Q4Linear::addDecode(metal::CommandGraph &graph, metal::MetalBuffer input,

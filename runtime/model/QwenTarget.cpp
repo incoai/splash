@@ -274,7 +274,7 @@ void QwenTarget::addPrefillImpl(
           if constexpr (isGdnMixer<decltype(mixer)>) {
             operators_.linear().addPrefill(graph, buffers.normalized,
                            mixer.inputProjection, buffers.gdnPacked,
-                           buffers.projectionSums, gdnInput, rows);
+                           buffers.projectionSums, gdnInput, rows, buffers.linearScratch);
             for (const QwenTargetPrefillSequence &sequence : sequences) {
               ops::GDN::addPrefill(
                   graph,
@@ -307,13 +307,13 @@ void QwenTarget::addPrefillImpl(
             operators_.linear().addPrefillResidual(
                 graph, buffers.gdnHidden, mixer.outputProjection, input,
                 buffers.gdnOutput, buffers.projectionSums, mixerOutput,
-                rows);
+                rows, buffers.linearScratch);
             residual = buffers.gdnOutput;
             ++gdnIndex;
           } else {
             operators_.linear().addPrefill(graph, buffers.normalized,
                            mixer.inputProjection, buffers.fullPacked,
-                           buffers.projectionSums, attentionInput, rows);
+                           buffers.projectionSums, attentionInput, rows, buffers.linearScratch);
             for (const QwenTargetPrefillSequence &sequence : sequences) {
               const uint64_t queryBytes =
                   uint64_t{geometry_.attentionQueryHeads} *
@@ -369,7 +369,7 @@ void QwenTarget::addPrefillImpl(
             operators_.linear().addPrefillResidual(
                 graph, buffers.attentionHidden, mixer.outputProjection, input,
                 buffers.attentionOutput, buffers.projectionSums, mixerOutput,
-                rows);
+                rows, buffers.linearScratch);
             residual = buffers.attentionOutput;
             ++attentionIndex;
           }
@@ -386,14 +386,14 @@ void QwenTarget::addPrefillImpl(
                                      geometry_.denseIntermediateSize};
       operators_.linear().addPrefill(graph, buffers.normalized, layer.gateProjection,
                      buffers.denseGateScratch, buffers.projectionSums, up,
-                     rows);
+                     rows, buffers.linearScratch);
       operators_.linear().addPrefillUpWithGate(
           graph, buffers.normalized, layer.upProjection,
           buffers.denseGateScratch, buffers.denseIntermediate,
-          buffers.projectionSums, buffers.downProjectionSums, up, rows);
+          buffers.projectionSums, buffers.downProjectionSums, up, rows, buffers.linearScratch);
       operators_.linear().addPrefillResidual(
           graph, buffers.denseIntermediate, layer.downProjection, residual,
-          output, buffers.downProjectionSums, down, rows);
+          output, buffers.downProjectionSums, down, rows, buffers.linearScratch);
     } else {
       ops::MoE::add(
           graph,

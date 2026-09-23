@@ -250,22 +250,25 @@ public:
   void addPrefillSums(metal::CommandGraph &graph, metal::MetalBuffer input,
                       metal::MetalBuffer sums, LinearMatrix matrix,
                       uint32_t rows) const;
+  // `scratch` holds the partials and counters of split plans (GGUF chunks of
+  // up to 32 rows); reused serially within one command stream, as in decode.
   void addPrefill(metal::CommandGraph &graph, metal::MetalBuffer input,
                   const Q4Projection &projection, metal::MetalBuffer output,
                   metal::MetalBuffer sums, LinearMatrix matrix,
-                  uint32_t rows) const;
+                  uint32_t rows, LinearScratch scratch = {}) const;
   void addPrefillUpWithGate(
       metal::CommandGraph &graph, metal::MetalBuffer input,
       const Q4Projection &up, metal::MetalBuffer gateScratch,
       metal::MetalBuffer output, metal::MetalBuffer sums,
       metal::MetalBuffer downSums, LinearMatrix matrix,
-      uint32_t rows) const;
+      uint32_t rows, LinearScratch scratch = {}) const;
   void addPrefillResidual(metal::CommandGraph &graph,
                           metal::MetalBuffer input,
                           const Q4Projection &projection,
                           metal::MetalBuffer residual,
                           metal::MetalBuffer output, metal::MetalBuffer sums,
-                          LinearMatrix matrix, uint32_t rows) const;
+                          LinearMatrix matrix, uint32_t rows,
+                          LinearScratch scratch = {}) const;
 
   PreparedInput addDecode(metal::CommandGraph &graph,
                           metal::MetalBuffer input, const Q4Projection &projection,

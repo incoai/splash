@@ -3,6 +3,17 @@
 #include "ops/Sampling.hpp"
 
 namespace splash::model {
+namespace {
+
+// The target's projection matrices; the draft also runs its vocabulary head.
+std::array<ops::LinearMatrix, 6> targetProjections(const QwenTargetGeometry &t) {
+  return {ops::LinearMatrix{t.packedGdnWidth, t.hiddenSize},
+          {t.packedAttentionWidth, t.hiddenSize}, {t.hiddenSize, t.attentionWidth},
+          {t.denseIntermediateSize, t.hiddenSize}, {t.hiddenSize, t.denseIntermediateSize},
+          {t.vocabularySize, t.hiddenSize}};
+}
+
+} // namespace
 
 std::array<uint64_t, prefillTensorCount>
 prefillTensorBytes(const RuntimeGeometry &geometry,
@@ -113,6 +124,24 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
       bytesFor<uint16_t>(uint64_t{geometry.target.attentionKvHeads} *
                          kPackedAttentionRows *
                          geometry.target.attentionHeadDimension));
+  // Chunks of up to 32 rows run the decode tiles with the decode split rule
+  // (LinearGguf.cpp): fp32 partials and counters for the largest such plan.
+  ops::LinearScratchSize linear;
+  const uint32_t decodeTileRows =
+      ExecutionLimits::maximumBatchWidth * ExecutionLimits::targetVerifyRows;
+  for (const ops::LinearMatrix matrix : targetProjections(geometry.target)) {
+    if (!matrix.outputSize || !matrix.inputSize) continue;
+    for (uint32_t rows = 1; rows <= decodeTileRows; ++rows)
+      for (const auto epilogue : {ops::LinearEpilogue::None, ops::LinearEpilogue::Residual,
+                                  ops::LinearEpilogue::UpWithGate}) {
+        const ops::LinearScratchSize size = operators.linear().plan(
+            {matrix, rows, ops::LinearPhase::Prefill, epilogue, geometry.target.quant}).scratchSize();
+        linear.partials = std::max(linear.partials, size.partials);
+        linear.counters = std::max(linear.counters, size.counters);
+      }
+  }
+  put(PrefillTensor::LinearPartials, linear.partials);
+  put(PrefillTensor::LinearCounters, linear.counters);
   if (geometry.target.ffnKind == QwenFfnKind::SparseMoe) {
     const ops::MoeWorkspace workspace =
         operators.moePrefillWorkspace(geometry.target.moe, kPrefillRows);
@@ -340,11 +369,7 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
       }
     }
   };
-  for (auto matrix : {ops::LinearMatrix{t.packedGdnWidth, t.hiddenSize},
-       {t.packedAttentionWidth, t.hiddenSize}, {t.hiddenSize, t.attentionWidth},
-       {t.denseIntermediateSize, t.hiddenSize}, {t.hiddenSize, t.denseIntermediateSize},
-       {t.vocabularySize, t.hiddenSize}})
-    include(matrix, t.quant);
+  for (const ops::LinearMatrix matrix : targetProjections(t)) include(matrix, t.quant);
   // The draft shares the target's vocabulary head.
   include({d.vocabularySize, d.hiddenSize}, t.quant);
   for (auto matrix : {ops::LinearMatrix{d.dynamicSize, d.hiddenSize},

@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cmath>
 #include <array>
+#include <cstring>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
@@ -141,6 +142,8 @@ enum class PrefillTensor : uint32_t {
   MoeGroupedInput,
   MoeExpertIntermediate,
   MoeExpertOutput,
+  LinearPartials,
+  LinearCounters,
   Count,
 };
 
@@ -187,6 +190,9 @@ public:
       draft[dim] = std::pow(geometry.draft.rotaryTheta,
                             -static_cast<float>(dim) / draftRotaryPairs);
     }
+    // Split projections return their counters to zero; they start there.
+    if (const metal::MetalBuffer counters = get(PrefillTensor::LinearCounters))
+      std::memset(counters.contents(), 0, counters.sizeBytes());
   }
 
   [[nodiscard]] metal::MetalBuffer get(PrefillTensor tensor) const {

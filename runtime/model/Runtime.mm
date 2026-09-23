@@ -989,6 +989,8 @@ struct Runtime::Impl {
       }
     }
     QwenTargetPrefillBuffers buffers;
+    buffers.linearScratch = {{}, {}, p(PrefillTensor::LinearPartials),
+                             p(PrefillTensor::LinearCounters)};
     buffers.hidden = {p(PrefillTensor::Hidden0), p(PrefillTensor::Hidden1)};
     buffers.normalized = p(PrefillTensor::Normalized);
     buffers.captured = p(PrefillTensor::Captured);

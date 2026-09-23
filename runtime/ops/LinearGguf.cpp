@@ -92,18 +92,20 @@ LinearTile Q4Linear::ggufDecodeTile() const noexcept {
 }
 
 LinearConfig Q4Linear::ggufBaseline(LinearWorkload w) const {
-  // Prefill: 128-row tiles. A chunk of up to 32 rows runs the decode tile
-  // of its rows (8, 16 or 32, two simdgroups): the same half stage and
-  // matmul rows, so its outputs equal the prefill tile's bit for bit
-  // (gguf-projection full), and each simdgroup streams its own 32 columns
-  // instead of four 8-row simdgroups sharing a stage. On a 17408 x 5120
-  // Q4_K projection that is 1.8-2.9x faster on a 16-core M5 Pro (its neural
-  // accelerator pads 8 rows to 16) and 1.1-2.8x on a 40-core M3 Max.
-  if (w.phase == LinearPhase::Prefill)
-    return {LinearTile::GgufStaged, 0,
-            w.rows <= SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS ? LinearSimdgroups::Two
-                                                                              : LinearSimdgroups::Four};
   const auto [n, k] = w.matrix;
+  // Prefill: 128-row tiles. A chunk of up to 32 rows runs the decode tile
+  // of its rows (8, 16 or 32, two simdgroups) with the decode split rule:
+  // the same half stage and matmul rows, so its outputs equal the prefill
+  // tile's up to the K split's fp32 reassociation (gguf-projection full),
+  // and each simdgroup streams its own 32 columns instead of four 8-row
+  // simdgroups sharing a stage. Unsplit, on a 17408 x 5120 Q4_K projection
+  // that is 1.8-2.9x faster on a 16-core M5 Pro (its neural accelerator pads
+  // 8 rows to 16) and 1.1-2.8x on a 40-core M3 Max; the 27B down and output
+  // projections split in two gain 24-37% more on the 16-core M5 Pro.
+  if (w.phase == LinearPhase::Prefill)
+    return w.rows <= SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS
+        ? LinearConfig{LinearTile::GgufStaged, 0, LinearSimdgroups::Two, stagedSplits(n, k, gpuCores_)}
+        : LinearConfig{LinearTile::GgufStaged, 0, LinearSimdgroups::Four};
   if (ggufDecodeTile() == LinearTile::GgufSimdgroup)
     return {LinearTile::GgufSimdgroup, n / kDecodeTileColumns, LinearSimdgroups::Four,
             simdgroupSplits(n, k, gpuCores_)};

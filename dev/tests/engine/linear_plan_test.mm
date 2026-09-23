@@ -816,11 +816,15 @@ void ggufPlans() {
                                      {33U, 128U}, {100U, 128U}, {129U, 256U}, {2048U, 2048U}}) {
     const LinearPlan prefill = linear.plan({{5120, 17408}, rows, LinearPhase::Prefill, LinearEpilogue::UpWithGate},
                                            projection(5120, 17408, 1));
+    // Chunks of up to 32 rows take the decode tile and its split rule (two
+    // partitions of the 80-tile grid on 16 cores); 128-row tiles take none.
+    const uint32_t splits = rows <= 32 ? 2 : 1;
     require(prefill.storageRows() == storage && prefill.sumsBytes() == 0 && prefill.downSumsBytes() == 0 &&
                 prefill.gateScratchBytes() == uint64_t{storage} * 5120 * 2 &&
-                prefill.scratchSize().bytes() == 0 &&
+                prefill.configuration().splits == splits && prefill.partialSums() == splits &&
+                prefill.scratchSize().partials == (splits > 1 ? uint64_t{splits} * storage * 5120 * 4 : 0) &&
                 prefill.threadsPerThreadgroup() == (rows <= 32 ? 64U : 128U),
-            "GGUF prefill tile rows");
+            "GGUF prefill tile rows and splits");
   }
   // The decode tiles hold at most a decode batch.
   LinearWorkload longPrefill{{5120, 17408}, 33, LinearPhase::Prefill, LinearEpilogue::None, QuantFamily::Gguf};
