@@ -53,10 +53,16 @@ inline void store_lutt8(uint v, Scale s2, threadgroup half2 *tl, threadgroup hal
   *((threadgroup half4 *)dst) = o0; *((threadgroup half4 *)(dst + 4)) = o1;
 }
 inline void k4_scale_min(uint4 hdr, ushort j, thread float2 &s2, thread float2 &m2) {   // block_q4_K / block_q5_K header
-  const uchar4 q0 = as_type<uchar4>(hdr.y), q1 = as_type<uchar4>(hdr.z), q2 = as_type<uchar4>(hdr.w);
-  const uchar q[12] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w, q2.x, q2.y, q2.z, q2.w};
-  uchar sc, m;
-  if (j < 4) { sc = q[j] & 63; m = q[j + 4] & 63; } else { sc = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4); m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4); }
+  // scales[12] = bytes of hdr.y (0-3), hdr.z (4-7), hdr.w (8-11). Extracted with shifts: a thread-local byte array indexed
+  // by the group costs ~8% of the M=8 kernel time on Apple10 (the dequantizer is ALU-bound at eight rows).
+  uint sc, m;
+  if (j < 4) {
+    const uint sh = 8u * j;
+    sc = (hdr.y >> sh) & 63u; m = (hdr.z >> sh) & 63u;
+  } else {
+    const uint sh = 8u * (j - 4), w = hdr.w >> sh;
+    sc = (w & 0xFu) | (((hdr.y >> sh) >> 6) & 3u) << 4; m = ((w >> 4) & 0xFu) | (((hdr.z >> sh) >> 6) & 3u) << 4;
+  }
   const half d = as_type<half>(ushort(hdr.x & 0xFFFF)), dmin = as_type<half>(ushort(hdr.x >> 16));
   s2 = float2(float(d) * float(sc)); m2 = float2(-float(dmin) * float(m));
 }
@@ -140,9 +146,10 @@ struct FmtQ6K {
   static Meta loadMeta(device uchar *m) { Meta r; r.sc = *((device packed_uint4 *)m); r.d = *((device uint *)(m + 16)); return r; }
   static void dequant32(Payload w, Meta mt, ushort j, threadgroup half2 *, threadgroup half *dst) {
     const float d = float(as_type<half>(ushort(mt.d & 0xFFFF)));
-    const uint scw = mt.sc[j >> 1];                                   // scales 4(j>>1) .. +3; we need 2j, 2j+1 -> bytes 2(j&1), 2(j&1)+1
-    const char4 sc4 = as_type<char4>(scw);
-    const float2 sA = float2(d * float(sc4[2 * (j & 1)])), sB = float2(d * float(sc4[2 * (j & 1) + 1]));
+    // scales 4(j>>1) .. +3 in word j>>1; we need int8 scales 2j, 2j+1 = bytes 2(j&1), 2(j&1)+1 (shifts, no dynamic vector index)
+    const uint scw = j < 2 ? mt.sc.x : j < 4 ? mt.sc.y : j < 6 ? mt.sc.z : mt.sc.w;
+    const uint pair = scw >> (16u * (j & 1));
+    const float2 sA = float2(d * float(int(as_type<char>(uchar(pair & 0xFFu))))), sB = float2(d * float(int(as_type<char>(uchar((pair >> 8) & 0xFFu)))));
     const half2 k = half2(1056.0h);   // 1024 + 32
 #pragma unroll
     for (ushort kk = 0; kk < 4; ++kk) {
@@ -173,8 +180,8 @@ struct FmtQ3K {
       case 2: aux = ((t0 >> 4) & 0x0f0f0f0fu) | (((t2 >> 4) & 0x03030303u) << 4); break;
       default: aux = ((t1 >> 4) & 0x0f0f0f0fu) | (((t2 >> 6) & 0x03030303u) << 4); break;
     }
-    const uchar4 a4 = as_type<uchar4>(aux);
-    const float2 sA = float2(d * float(int(a4[2 * (j & 1)]) - 32)), sB = float2(d * float(int(a4[2 * (j & 1) + 1]) - 32));
+    const uint ap = aux >> (16u * (j & 1));   // 6-bit scales 2j, 2j+1 (shifts, no dynamic vector index)
+    const float2 sA = float2(d * float(int(ap & 0xFFu) - 32)), sB = float2(d * float(int((ap >> 8) & 0xFFu) - 32));
     const half2 k = half2(1028.0h);   // 1024 + 4
 #pragma unroll
     for (ushort h = 0; h < 2; ++h) {
