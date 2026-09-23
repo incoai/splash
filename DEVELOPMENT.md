@@ -161,9 +161,10 @@ The images are anonymous Metal memory, so under memory pressure they are compres
 rather than dropped and refaulted like mapped package files. Supported tensor types are Q4_K,
 Q5_K, Q6_K, Q3_K, IQ4_XS, IQ4_NL, Q8_0 and IQ3_S for linears and experts, F32 for the tensors
 above, and Q4_K, Q6_K or Q8_0 token embeddings; the loader lists every unsupported tensor in one
-error. Of Unsloth's files that covers UD-Q4_K_M/XL, UD-Q5_K_M/S/XL, UD-Q6_K and Q6_K_L/M/XL,
-UD-Q8_K_L and Q8_0; the 2-bit, IQ2/IQ3_XXS, IQ1, Q4_0/Q4_1, MXFP4 and BF16-bearing files need
-kernels that do not exist yet.
+error. Of Unsloth's files that covers, for Qwen3.8-27B, UD-Q4_K_M and every larger file but
+Q4_1, UD-Q8_K_XL and BF16, and for Qwen3.6-35B-A3B, UD-IQ4_XS and every larger file but
+MXFP4_MOE, UD-Q8_K_XL and BF16. The smaller files need IQ3_XXS, IQ2, IQ1 or Q2_K kernels and the
+others Q4_0/Q4_1, MXFP4 or BF16 ones, which do not exist yet.
 
 Decode runs one of two kernel families, chosen by GPU family in `runtime/ops/LinearGguf.cpp`. On
 Apple9 (M3, M4) the register kernels of `runtime/metal/kernels/decode/linear_gguf_sgmatrix.metal`
