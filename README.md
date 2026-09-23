@@ -89,8 +89,9 @@ For a custom model download location, see [model cache](DEVELOPMENT.md#model-cac
 There is no config file. The server binds `127.0.0.1:8000` by default.
 Context supports up to the model’s native 256K window; usable capacity
 depends on available memory. `splash serve --help` lists server options and examples.
-The startup summary and the `maximum_context_tokens` field in `/status` show
-the effective server limit; clients can impose a smaller one. With enough memory,
+The startup summary, `maximum_context_tokens` in `/status`, and `max_model_len`
+on each model in `/v1/models` show the effective server limit; clients can impose
+a smaller one. With enough memory,
 request the full window using `--max-context 256K`. This is a capacity limit, not a guarantee
 that a long uncached prompt will reach its first token quickly.
 

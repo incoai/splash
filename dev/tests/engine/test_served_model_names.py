@@ -48,6 +48,20 @@ class ServedModelNamesTests(unittest.TestCase):
                 self.assertEqual(json.loads(payload)["id"], name)
         self.assertEqual(harness.request("GET", "/v1/models/missing")[0], 404)
 
+    def test_catalog_and_aliases_report_the_effective_context_limit(self):
+        for context in (32768, 102400, 262144):
+            with self.subTest(context=context):
+                harness = self.harness(max_context=context)
+                status, _, payload = harness.request("GET", "/v1/models")
+                self.assertEqual(status, 200)
+                for model in json.loads(payload)["data"]:
+                    self.assertEqual(model["max_model_len"], context)
+                    status, _, detail = harness.request(
+                        "GET", "/v1/models/" + quote(model["id"], safe="")
+                    )
+                    self.assertEqual(status, 200)
+                    self.assertEqual(json.loads(detail), model)
+
     def test_all_generation_apis_accept_aliases_but_report_real_model(self):
         harness = self.harness()
         for path in PATHS:
