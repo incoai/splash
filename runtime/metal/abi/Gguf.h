@@ -4,15 +4,6 @@
 // kernels (kernels/shared/gguf_linear.metal).
 #include "metal/abi/QuantFormat.h"
 
-struct GgufParams {
-  uint32_t output_size;       // columns of this segment
-  uint32_t input_size;        // K
-  uint32_t persistent_groups; // decode: threadgroups (>= tiles)
-  uint32_t out_stride;        // row stride of the destination (0 = output_size)
-  uint32_t out_offset;        // first destination column of this segment
-};
-static_assert(sizeof(GgufParams) == 20, "GGUF parameters are 20 bytes on both sides");
-
 // Prefill tiles (pf kernels): the grid covers whole 128-row tiles of the chunk; the simdgroups of the last tile
 // whose rows start past `rows` skip their matmuls.
 struct GgufPrefillParams {
@@ -24,19 +15,20 @@ struct GgufPrefillParams {
 };
 static_assert(sizeof(GgufPrefillParams) == 20, "GGUF prefill parameters are 20 bytes on both sides");
 
-// Apple9 register decode (kernels/decode/linear_gguf_sgmatrix.metal): one
-// tensor per dispatch, over the dispatch's 64-column tiles.
-struct GgufSgParams {
+// Decode tiles of both families (kernels/decode/linear_gguf_sgmatrix.metal on
+// Apple9, kernels/shared/gguf_linear.metal elsewhere): one tensor per dispatch,
+// over the dispatch's 64-column tiles (grid.x) and K partitions (grid.y).
+struct GgufDecodeParams {
   uint32_t input_size;  // K
   uint32_t splits;      // K partitions; 1 = no cross-threadgroup reduction
   uint32_t out_stride;  // columns of a destination row
   uint32_t out_offset;  // first destination column of the tensor
 };
-static_assert(sizeof(GgufSgParams) == 16, "GGUF register decode parameters are 16 bytes on both sides");
+static_assert(sizeof(GgufDecodeParams) == 16, "GGUF decode parameters are 16 bytes on both sides");
 
-// Apple9 register decode of a fused projection: up to three column segments
-// of any formats in one dispatch, tiles in segment order.
-struct GgufSgFusedParams {
+// Decode of a fused projection: up to three column segments of any formats in
+// one dispatch, tiles in segment order.
+struct GgufDecodeFusedParams {
   uint32_t input_size;  // K
   uint32_t splits;      // K partitions of every segment
   uint32_t out_stride;  // columns of a destination row
@@ -44,7 +36,7 @@ struct GgufSgFusedParams {
   uint32_t fmt[3];      // GGUF_FMT_* per segment
   uint32_t offset[3];   // first destination column per segment
 };
-static_assert(sizeof(GgufSgFusedParams) == 48, "GGUF register fused parameters are 48 bytes on both sides");
+static_assert(sizeof(GgufDecodeFusedParams) == 48, "GGUF fused decode parameters are 48 bytes on both sides");
 
 struct GgufEmbedParams {
   uint32_t rows;
@@ -77,39 +69,6 @@ struct GgufCopyParams {
   uint32_t bytes;
 };
 static_assert(sizeof(GgufCopyParams) == 12, "GGUF copy parameters are 12 bytes on both sides");
-
-// Split-K with in-kernel last-arriver reduction (counters: one uint per 64-column tile, zero at rest).
-struct GgufSplitParams {
-  uint32_t output_size;
-  uint32_t input_size;
-  uint32_t splits;
-  uint32_t out_stride;
-  uint32_t out_offset;
-  uint32_t epilogue;
-};
-static_assert(sizeof(GgufSplitParams) == 24, "GGUF split parameters are 24 bytes on both sides");
-
-// One dispatch over up to three column segments of different formats (fused qkv|z|ab, q|k|v).
-struct GgufFusedParams {
-  uint32_t input_size;
-  uint32_t out_stride;
-  uint32_t segments;
-  uint32_t reserved;
-  uint32_t cols[3];
-  uint32_t fmt[3];
-  uint32_t offset[3];
-};
-static_assert(sizeof(GgufFusedParams) == 52, "GGUF fused parameters are 52 bytes on both sides");
-
-// Gate and up projections in one dispatch: output = silu(gate) * up.
-struct GgufGateUpParams {
-  uint32_t input_size;
-  uint32_t output_size;
-  uint32_t out_stride;
-  uint32_t gate_fmt;
-  uint32_t up_fmt;
-};
-static_assert(sizeof(GgufGateUpParams) == 20, "GGUF gate/up parameters are 20 bytes on both sides");
 
 #define GGUF_EPILOGUE_NONE 0u
 #define GGUF_EPILOGUE_RESIDUAL 1u

@@ -198,6 +198,11 @@ const ops::Q4Projection &QwenTarget::vocabularyProjection() const noexcept {
   }, weights_);
 }
 
+uint32_t QwenTarget::decodeStorageLanes(uint32_t lanes) const {
+  return operators_.linear().decodeStorageRows(lanes * ExecutionLimits::targetVerifyRows, geometry_.quant) /
+         ExecutionLimits::targetVerifyRows;
+}
+
 void QwenTarget::addPrefill(
     metal::CommandGraph &graph, QwenTargetPrefillBuffers buffers,
     std::span<const QwenTargetPrefillSequence> sequences, uint32_t rows,

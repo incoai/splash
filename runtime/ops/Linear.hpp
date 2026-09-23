@@ -82,11 +82,11 @@ enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate };
 // per tile. Paired256 is the four-simdgroup N256 paired tile. Simdgroup
 // uses bf16 8x8 matrix operations and an explicit activation/split workspace.
 // GgufStaged dequantizes GGUF weights per simdgroup into threadgroup memory
-// for matmul2d: 64 columns per decode threadgroup (two simdgroups) with
-// optional K splits; prefill runs 128-row tiles, or the decode tiles for
-// chunks of up to 32 rows. GgufSimdgroup is the GGUF register kernel on
-// bf16 8x8 matrix operations (Apple9): 64 columns per threadgroup, every
-// request lane in one threadgroup, optional K splits.
+// for matmul2d: 64 columns per decode threadgroup (two simdgroups) of 8, 16
+// or 32 rows with optional K splits; prefill runs 128-row tiles, or the
+// decode tiles for chunks of up to 32 rows. GgufSimdgroup is the GGUF
+// register kernel on bf16 8x8 matrix operations (Apple9): 64 columns per
+// threadgroup, every request lane in one threadgroup, optional K splits.
 enum class LinearTile : uint8_t {
   N128, N256, Paired128, Split32, Split64, Paired256, Simdgroup, GgufStaged, GgufSimdgroup
 };
@@ -226,9 +226,13 @@ public:
   static constexpr std::size_t kMaximumCandidates = 20;
 
   [[nodiscard]] LinearPlan plan(LinearWorkload workload) const;
-  // The plan that runs for this projection: GGUF plans also depend on its
-  // segments (the fused multi-tensor kernels take no K splits).
+  // The plan that runs for this projection (GGUF projections plan their
+  // own tiles).
   [[nodiscard]] LinearPlan plan(LinearWorkload workload, const Q4Projection &projection) const;
+  // Rows of storage a decode step of `rows` rows binds for this device's
+  // projection tiles (LinearPlan::storageRows of its decode plans): the step's
+  // rows, or the staged GGUF tile's 8, 16 or 32.
+  [[nodiscard]] uint32_t decodeStorageRows(uint32_t rows, QuantFamily quant) const noexcept;
   // The layout the decode plan of this projection reads, for its producer.
   [[nodiscard]] LinearInput decodeInput(const Q4Projection &projection, uint32_t lanes,
                                         LinearEpilogue epilogue = LinearEpilogue::None) const;
@@ -289,12 +293,15 @@ public:
 
 private:
   [[nodiscard]] LinearConfig baseline(LinearWorkload workload) const;
-  // GGUF policy and dispatch (LinearGguf.cpp). `segments` is the number of
-  // tensors the projection concatenates; one is the largest-scratch case.
-  [[nodiscard]] LinearConfig ggufBaseline(LinearWorkload workload, uint32_t segments) const;
+  // GGUF policy and dispatch (LinearGguf.cpp).
+  [[nodiscard]] LinearTile ggufDecodeTile() const noexcept;
+  [[nodiscard]] LinearConfig ggufBaseline(LinearWorkload workload) const;
   void addGguf(metal::CommandGraph &graph, const LinearBuffers &buffers,
                const Q4Projection &projection, const LinearPlan &plan,
                const Q4Projection *gate, Q4DispatchStats *stats) const;
+  void addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &buffers,
+                     const Q4Projection &projection, const LinearPlan &plan,
+                     const Q4Projection *gate) const;
   void addGgufSimdgroup(metal::CommandGraph &graph, const LinearBuffers &buffers,
                         const Q4Projection &projection, const LinearPlan &plan,
                         const Q4Projection *gate) const;

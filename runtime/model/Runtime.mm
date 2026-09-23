@@ -1141,8 +1141,10 @@ struct Runtime::Impl {
       throw std::invalid_argument("invalid draft decode batch");
     }
     const uint32_t lanes = static_cast<uint32_t>(entries.size());
+    // The draft shares the target's vocabulary head and its storage rows.
+    const uint32_t storage = targetModel.decodeStorageLanes(lanes);
     auto d = [&](DecodeTensor tensor) {
-      return decodeArena->packed(tensor, lanes);
+      return decodeArena->packed(tensor, storage);
     };
     std::array<uint32_t, kLaneCount> cacheLengths{};
     for (uint32_t lane = 0; lane < kLaneCount; ++lane) {
@@ -1205,8 +1207,9 @@ struct Runtime::Impl {
       throw std::invalid_argument("invalid target verify batch");
     }
     const uint32_t lanes = static_cast<uint32_t>(entries.size());
+    const uint32_t storage = targetModel.decodeStorageLanes(lanes);
     auto d = [&](DecodeTensor tensor) {
-      return decodeArena->packed(tensor, lanes);
+      return decodeArena->packed(tensor, storage);
     };
     auto paddedItem = [&](uint32_t lane) -> const ModelBatchItem & {
       return items[std::min(lane, lanes - 1)];
@@ -1282,20 +1285,20 @@ struct Runtime::Impl {
     }
     for (uint32_t layer = 0; layer < gdnLayers; ++layer) {
       gdnPacked[layer] = decodeArena->gdnBatchSlice(
-          DecodeTensor::VerifyPackedBase, layer, lanes);
+          DecodeTensor::VerifyPackedBase, layer, storage);
       gdnMixed[layer] = decodeArena->gdnBatchSlice(
-          DecodeTensor::VerifyMixedBase, layer, lanes);
+          DecodeTensor::VerifyMixedBase, layer, storage);
       gdnDecay[layer] = decodeArena->gdnBatchSlice(
-          DecodeTensor::VerifyDecayBase, layer, lanes);
+          DecodeTensor::VerifyDecayBase, layer, storage);
       gdnBeta[layer] = decodeArena->gdnBatchSlice(
-          DecodeTensor::VerifyBetaBase, layer, lanes);
+          DecodeTensor::VerifyBetaBase, layer, storage);
     }
     std::vector<kv::Q8LayerStorage> kvLayers(attentionLayers);
     for (uint32_t layer = 0; layer < attentionLayers; ++layer) {
       chunkKeys[layer] = decodeArena->attentionBatchSlice(
-          DecodeTensor::ChunkKeysBase, layer, lanes);
+          DecodeTensor::ChunkKeysBase, layer, storage);
       chunkValues[layer] = decodeArena->attentionBatchSlice(
-          DecodeTensor::ChunkValuesBase, layer, lanes);
+          DecodeTensor::ChunkValuesBase, layer, storage);
       kvLayers[layer] = kvPages.layer(layer);
     }
     targetModel.addVerify(graph, std::move(buffers), kvLayers, q8, verify,

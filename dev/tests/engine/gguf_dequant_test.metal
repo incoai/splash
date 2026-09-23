@@ -4,7 +4,7 @@
 #define DEQUANT_TEST(F, name) \
 kernel void gguf_test_dequant_##name(device uchar *w0 [[buffer(0)]], \
     device uchar *w1 [[buffer(1)]], device uchar *meta [[buffer(2)]], \
-    device half *output [[buffer(3)]], constant GgufParams &p [[buffer(4)]], \
+    device half *output [[buffer(3)]], constant GgufDecodeParams &p [[buffer(4)]], \
     uint tid [[thread_position_in_grid]], uint lane [[thread_index_in_threadgroup]]) { \
   threadgroup half stage[32 * 32]; \
   threadgroup half2 lut[256]; \

@@ -755,8 +755,8 @@ void affinePolicyIdentity() {
 }
 
 // GGUF projections plan with their segments: the staged split policy for
-// single tensors, no K splits for fused tensors and gate/up, exact split
-// scratch, and prefill tiles of 32 or 128 rows.
+// every projection kind, exact split scratch over the tile's rows, and
+// prefill tiles of 8, 16, 32 or 128 rows.
 void ggufPlans() {
   DeviceCapabilities device;
   device.appleGpuFamily = 10;
@@ -778,32 +778,41 @@ void ggufPlans() {
   const LinearWorkload down{{5120, 17408}, 8, LinearPhase::Decode, LinearEpilogue::Residual};
   const LinearPlan single = linear.plan(down, projection(5120, 17408, 1));
   require(single.workload().quant == QuantFamily::Gguf &&
-              single.configuration() == LinearConfig{LinearTile::GgufStaged, 80, LinearSimdgroups::Two, 8} &&
-              single.input() == LinearInput::Plain && single.partialSums() == 8 &&
-              single.scratchSize().partials == uint64_t{8} * 8 * 5120 * 4 &&
+              single.configuration() == LinearConfig{LinearTile::GgufStaged, 80, LinearSimdgroups::Two, 2} &&
+              single.input() == LinearInput::Plain && single.partialSums() == 2 &&
+              single.scratchSize().partials == uint64_t{2} * 8 * 5120 * 4 &&
               single.scratchSize().counters == 80 * 4 && single.scratchSize().input == 0,
           "GGUF single-tensor decode plan");
-  // 32 threadgroups per core, at least 1024 inputs per partition.
-  const auto stagedSplits = [&](uint32_t cores, uint32_t n, uint32_t k, uint32_t rows) {
+  // Six threadgroups per core, at least 512 inputs per partition, for every
+  // projection kind: 27B down on 10/16/20/40 cores, a 35B output projection
+  // and shared-expert gate/up, fused projections, the vocabulary head.
+  const auto stagedSplits = [&](uint32_t cores, uint32_t n, uint32_t k, LinearEpilogue epilogue, uint32_t segments) {
     DeviceCapabilities apple10;
     apple10.appleGpuFamily = 10;
     apple10.gpuCoreCount = cores;
-    return Q4Linear(apple10).plan({{n, k}, rows, LinearPhase::Decode, LinearEpilogue::Residual},
-                                  projection(n, k, 1)).configuration().splits;
+    return Q4Linear(apple10).plan({{n, k}, 8, LinearPhase::Decode, epilogue},
+                                  projection(n, k, segments)).configuration().splits;
   };
-  require(stagedSplits(16, 5120, 17408, 8) == 8 && stagedSplits(16, 5120, 6144, 8) == 4 &&
-              stagedSplits(16, 10240, 5120, 16) == 4 && stagedSplits(16, 248320, 5120, 8) == 1 &&
-              stagedSplits(10, 5120, 17408, 8) == 4 && stagedSplits(40, 10240, 5120, 8) == 4 &&
-              stagedSplits(16, 1024, 256, 8) == 1 && stagedSplits(16, 1024, 3072, 8) == 2,
+  const auto residual = LinearEpilogue::Residual, none = LinearEpilogue::None, gateUp = LinearEpilogue::GateUp;
+  require(stagedSplits(16, 5120, 17408, residual, 1) == 2 && stagedSplits(20, 5120, 17408, residual, 1) == 2 &&
+              stagedSplits(10, 5120, 17408, residual, 1) == 1 && stagedSplits(40, 5120, 17408, residual, 1) == 4 &&
+              stagedSplits(16, 2048, 4096, residual, 1) == 4 && stagedSplits(16, 512, 2048, gateUp, 1) == 4 &&
+              stagedSplits(16, 17408, 5120, gateUp, 1) == 1 && stagedSplits(16, 4096, 5120, none, 2) == 2 &&
+              stagedSplits(40, 16640, 5120, none, 3) == 1 && stagedSplits(16, 248320, 5120, none, 1) == 1 &&
+              stagedSplits(16, 1024, 256, none, 1) == 1 && stagedSplits(16, 1024, 3072, none, 1) == 4,
           "GGUF staged split policy");
-  const LinearPlan fused = linear.plan({{10240, 5120}, 8, LinearPhase::Decode, LinearEpilogue::None},
-                                       projection(10240, 5120, 2));
-  const LinearPlan gateUp = linear.plan({{17408, 5120}, 16, LinearPhase::Decode, LinearEpilogue::GateUp},
-                                        projection(17408, 5120, 1));
-  require(fused.configuration().splits == 1 && fused.scratchSize().bytes() == 0 &&
-              gateUp.configuration().splits == 1 && gateUp.gateScratchBytes() == 0,
-          "GGUF fused and gate/up plans take no K splits");
-  for (const auto [rows, storage] : {std::pair{1U, 8U}, {8U, 8U}, {9U, 16U}, {17U, 24U}, {25U, 32U}, {32U, 32U},
+  const LinearPlan gateUpPlan = linear.plan({{512, 2048}, 16, LinearPhase::Decode, LinearEpilogue::GateUp},
+                                            projection(512, 2048, 1));
+  require(gateUpPlan.gateScratchBytes() == uint64_t{16} * 512 * 2 &&
+              gateUpPlan.scratchSize().partials == uint64_t{4} * 16 * 512 * 4,
+          "GGUF staged gate/up runs a gate pass into the gate scratch");
+  // Decode tiles hold 8, 16 or 32 rows: three lanes run the 32-row tile.
+  const LinearPlan three = linear.plan({{5120, 17408}, 24, LinearPhase::Decode, LinearEpilogue::Residual},
+                                       projection(5120, 17408, 1));
+  require(three.storageRows() == 32 && three.configuration() == single.configuration() &&
+              three.scratchSize().partials == uint64_t{2} * 32 * 5120 * 4,
+          "GGUF staged three-lane plans run the 32-row tile");
+  for (const auto [rows, storage] : {std::pair{1U, 8U}, {8U, 8U}, {9U, 16U}, {17U, 32U}, {25U, 32U}, {32U, 32U},
                                      {33U, 128U}, {100U, 128U}, {129U, 256U}, {2048U, 2048U}}) {
     const LinearPlan prefill = linear.plan({{5120, 17408}, rows, LinearPhase::Prefill, LinearEpilogue::UpWithGate},
                                            projection(5120, 17408, 1));
@@ -823,7 +832,7 @@ void ggufPlans() {
   rejects([&] { (void)Q4Linear::plan(gguf, {LinearTile::N128, 40}); });
   rejects([&] { (void)Q4Linear::plan(gguf, {LinearTile::GgufStaged, 40, LinearSimdgroups::Two, 8}); });
   rejects([&] { (void)Q4Linear::plan(gguf, {LinearTile::GgufStaged, 80, LinearSimdgroups::Two, 3}); });
-  // The arena bound is the single-tensor plan.
+  // The arena bound is the single-tensor plan, which fused and gate/up plans share.
   require(linear.decodeScratchSize(gguf).partials == single.scratchSize().partials,
           "GGUF decode scratch bound");
 
@@ -908,8 +917,8 @@ void ggufPlans() {
 // - a request's sums do not depend on the requests it is batched with: the whole
 //   plan is the same at every batch width;
 // - a split count is a power of two up to eight whose partitions keep the kernel's
-//   floor (register: two 256-input units, staged: 1024 inputs in whole 32-input
-//   groups); the staged fused and gate/up kernels take none;
+//   floor (register: two 256-input units, staged: 512 inputs in whole 32-input
+//   groups);
 // - it depends on the grid per core only: doubling the width and the core count
 //   keeps it, more cores never lower it and a wider grid never raises it;
 // - the arena bound (the single-tensor plan) covers every segment count.
@@ -960,10 +969,10 @@ void ggufCoreLaws() {
               require(c.tile == (family == 9 ? LinearTile::GgufSimdgroup : LinearTile::GgufStaged) &&
                           c.groups == n / 64 && s >= 1 && s <= 8 && (s & (s - 1)) == 0,
                       "GGUF decode plan tile or split count");
-              require(s == 1 || (staged ? k / s >= 1024 && (k / 32) % s == 0 : k / 256 / s >= 2),
+              require(s == 1 || (staged ? k / s >= 512 && (k / 32) % s == 0 : k / 256 / s >= 2),
                       "GGUF decode partition below the kernel floor");
-              require(!staged || s == 1 || (segments == 1 && epilogue != LinearEpilogue::GateUp),
-                      "GGUF staged fused or gate/up plan splits K");
+              require(one.storageRows() == 8 && plan(linear, n, 24).storageRows() == (staged ? 32U : 24U),
+                      "GGUF decode tile rows");
               if (cores) {
                 require(plan(twice, 2 * n, 8).configuration().splits == s,
                         "GGUF split count depends on more than the grid per core");

@@ -100,7 +100,7 @@ template <class F, uint L, uint Ep>
 inline void decode(device const bfloat *table, device const float *sums, device uchar *w0,
                    device uchar *w1, device uchar *meta, device bfloat *out,
                    device coherent(device) float *partials, device atomic_uint *counters,
-                   device const bfloat *aux, const GgufSgParams p, uint2 tg, uint tid, uint sg,
+                   device const bfloat *aux, const GgufDecodeParams p, uint2 tg, uint tid, uint sg,
                    uint lane, threadgroup const bfloat2 *lut, threadgroup Coef<F> *coefs,
                    threadgroup uint *arrival) {
   typedef Shape<F> S;
@@ -282,7 +282,7 @@ kernel void decode_linear_gguf_prepare(device const bfloat *input [[buffer(0)]],
                    device uchar *meta [[buffer(4)]], device bfloat *out [[buffer(5)]],                      \
                    device coherent(device) float *partials [[buffer(6)]],                                   \
                    device atomic_uint *counters [[buffer(7)]], device const bfloat *aux [[buffer(8)]],      \
-                   constant GgufSgParams &p [[buffer(9)]], uint2 tg [[threadgroup_position_in_grid]],       \
+                   constant GgufDecodeParams &p [[buffer(9)]], uint2 tg [[threadgroup_position_in_grid]],       \
                    uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],    \
                    uint lane [[thread_index_in_simdgroup]]) {                                               \
     threadgroup bfloat2 lut[F::Kind == QuantCodebook ? 256 : 1];                                            \
@@ -328,14 +328,14 @@ template <uint L>
 inline void gguf_sg_fused(device const bfloat *table, device const float *sums, device uchar *w0a, device uchar *w1a,
                           device uchar *ma, device uchar *w0b, device uchar *w1b, device uchar *mb, device uchar *w0c,
                           device uchar *w1c, device uchar *mc, device bfloat *out, device coherent(device) float *partials,
-                          device atomic_uint *counters, constant GgufSgFusedParams &p, uint2 tg, uint tid, uint sg,
+                          device atomic_uint *counters, constant GgufDecodeFusedParams &p, uint2 tg, uint tid, uint sg,
                           uint lane, threadgroup bfloat2 *lut, threadgroup float2 *coefs, threadgroup uint &arrival) {
   const uint t0 = p.cols[0] / 64, t1 = t0 + p.cols[1] / 64;
   const uint s = tg.x < t0 ? 0 : tg.x < t1 ? 1 : 2;
   device uchar *w0 = s == 0 ? w0a : s == 1 ? w0b : w0c;
   device uchar *w1 = s == 0 ? w1a : s == 1 ? w1b : w1c;
   device uchar *meta = s == 0 ? ma : s == 1 ? mb : mc;
-  const GgufSgParams q{p.input_size, p.splits, p.out_stride, p.offset[s]};
+  const GgufDecodeParams q{p.input_size, p.splits, p.out_stride, p.offset[s]};
   const uint2 local(tg.x - (s == 0 ? 0 : s == 1 ? t0 : t1), tg.y);
   const uint fmt = p.fmt[s];
   if (fmt == GGUF_FMT_IQ4XS || fmt == GGUF_FMT_IQ4NL) {
@@ -359,7 +359,7 @@ inline void gguf_sg_fused(device const bfloat *table, device const float *sums, 
       device const bfloat *table [[buffer(0)]], device const float *sums [[buffer(1)]],                          \
       GGUF_SG_SEGMENT(2, w0a, w1a, ma), GGUF_SG_SEGMENT(5, w0b, w1b, mb), GGUF_SG_SEGMENT(8, w0c, w1c, mc),       \
       device bfloat *out [[buffer(11)]], device coherent(device) float *partials [[buffer(12)]],                  \
-      device atomic_uint *counters [[buffer(13)]], constant GgufSgFusedParams &p [[buffer(14)]],                  \
+      device atomic_uint *counters [[buffer(13)]], constant GgufDecodeFusedParams &p [[buffer(14)]],                  \
       uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],                       \
       uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {                     \
     threadgroup bfloat2 lut[256];                                                                                 \

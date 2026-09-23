@@ -115,17 +115,19 @@ bool supportsFourSimdgroups(LinearWorkload w, LinearTile tile) noexcept {
                         w.epilogue == LinearEpilogue::Residual));
 }
 
+// The staged GGUF decode tile that holds `rows` rows: MPP computes 16-row
+// fragments, so the tile holds 8, 16 or 32 rows and a three-lane step runs
+// the 32-row tile over four lanes of storage (LinearGguf.cpp).
+constexpr uint32_t stagedTileRows(uint32_t rows) noexcept { return rows <= 8 ? 8 : rows <= 16 ? 16 : 32; }
+
 } // namespace
 
 uint32_t LinearPlan::storageRows() const noexcept {
+  // GGUF staged tiles: the decode tile, or 128-row prefill tiles.
+  if (config_.tile == LinearTile::GgufStaged)
+    return config_.simdgroups == LinearSimdgroups::Four ? (workload_.rows + 127) / 128 * 128
+                                                       : stagedTileRows(workload_.rows);
   if (workload_.phase != LinearPhase::Prefill) return workload_.rows;
-  // GGUF prefill: 128-row tiles, or the decode tile of one to four
-  // eight-row lanes (two simdgroups, LinearGguf.cpp).
-  if (config_.tile == LinearTile::GgufStaged) {
-    const uint32_t rows = workload_.rows, tile = config_.simdgroups == LinearSimdgroups::Four
-        ? 128 : SPLASH_TARGET_VERIFY_ROWS;
-    return (rows + tile - 1) / tile * tile;
-  }
   return ((workload_.rows + kPrefillRows - 1) / kPrefillRows) * kPrefillRows;
 }
 uint32_t LinearPlan::tileColumns() const noexcept {
@@ -158,11 +160,11 @@ LinearInput LinearPlan::input() const noexcept {
 }
 LinearScratchSize LinearPlan::scratchSize() const noexcept {
   const auto [n, k] = workload_.matrix;
-  // GGUF split-K: [split][row][column] fp32 partials and one counter per
-  // 64-column tile (a tile covers every row of the dispatch).
+  // GGUF split-K: [split][row][column] fp32 partials over the tile's rows and
+  // one counter per 64-column tile (a tile covers every row of the dispatch).
   if (config_.tile == LinearTile::GgufStaged)
-    return workload_.phase == LinearPhase::Decode && config_.splits > 1
-        ? LinearScratchSize{0, 0, uint64_t{config_.splits} * workload_.rows * n * sizeof(float),
+    return config_.splits > 1
+        ? LinearScratchSize{0, 0, uint64_t{config_.splits} * storageRows() * n * sizeof(float),
                             uint64_t{n / tileColumns()} * sizeof(uint32_t)}
         : LinearScratchSize{};
   // GGUF register tile: the Table16 table and sums (3 K / 4 fp32 per eight
@@ -189,10 +191,10 @@ uint64_t LinearPlan::sumsBytes() const noexcept {
       ? uint64_t{storageRows()} * (workload_.matrix.inputSize / kQuantGroup) * 4 : 0;
 }
 uint64_t LinearPlan::gateScratchBytes() const noexcept {
-  // The GGUF register tile runs gate/up as a gate pass and an up-with-gate pass.
+  // GGUF tiles run gate/up as a gate pass and an up-with-gate pass.
   const bool needed = workload_.epilogue == LinearEpilogue::UpWithGate ||
       (workload_.epilogue == LinearEpilogue::GateUp &&
-       (!secondPipeline_.empty() || config_.tile == LinearTile::GgufSimdgroup));
+       (!secondPipeline_.empty() || workload_.quant == QuantFamily::Gguf));
   return needed ? uint64_t{storageRows()} * workload_.matrix.outputSize * 2 : 0;
 }
 uint64_t LinearPlan::downSumsBytes() const noexcept {
@@ -441,9 +443,13 @@ Q4Linear::Q4Linear(const DeviceCapabilities &device) noexcept
 
 // GPU family selects variants; core count and workload tile counts determine
 // parallelism.
+uint32_t Q4Linear::decodeStorageRows(uint32_t rows, QuantFamily quant) const noexcept {
+  return quant == QuantFamily::Gguf && ggufDecodeTile() == LinearTile::GgufStaged ? stagedTileRows(rows) : rows;
+}
+
 LinearConfig Q4Linear::baseline(LinearWorkload w) const {
   validate(w);
-  if (w.quant == QuantFamily::Gguf) return ggufBaseline(w, 1);
+  if (w.quant == QuantFamily::Gguf) return ggufBaseline(w);
   const uint32_t tiles128 = w.matrix.outputSize / 128;
   const uint32_t tiles256 = w.matrix.outputSize / 256;
   if (w.phase == LinearPhase::Prefill) {
@@ -521,7 +527,7 @@ LinearPlan Q4Linear::plan(LinearWorkload workload, LinearConfig config) {
 LinearPlan Q4Linear::plan(LinearWorkload w, const Q4Projection &p) const {
   if (p.gguf.empty()) return plan(w);
   w.quant = QuantFamily::Gguf;
-  return LinearPlan(w, ggufBaseline(w, static_cast<uint32_t>(p.gguf.size())));
+  return LinearPlan(w, ggufBaseline(w));
 }
 void Q4Linear::setChoices(std::span<const LinearChoice> choices) {
   std::vector<LinearChoice> pending(choices.begin(), choices.end());
