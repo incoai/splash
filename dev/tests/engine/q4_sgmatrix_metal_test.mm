@@ -1,4 +1,5 @@
 #include "metal/MetalBackend.hpp"
+#include "metal/abi/Gguf.h"
 #include "ops/Linear.hpp"
 #include "ops/Normalization.hpp"
 #include "ops/PagedAttention.hpp"
@@ -9,7 +10,9 @@
 #include <cmath>
 #include <cstring>
 #include <iostream>
+#include <set>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 using namespace splash;
@@ -45,8 +48,10 @@ Q4Projection weights(metal::MetalBackend &backend, LinearMatrix shape, uint32_t 
   }
   return p;
 }
-struct Reference { double value, error; };
-Reference reference(const Q4Projection &p, const uint16_t *input, uint32_t row, uint32_t col, uint32_t splits) {
+// The fp64 projection of one output and the operand magnitudes its error
+// bound scales with.
+struct Exact { double value, quantMagnitude, magnitude; };
+Exact exact(const Q4Projection &p, const uint16_t *input, uint32_t row, uint32_t col) {
   const auto *q = static_cast<const uint8_t *>(p.weights.contents());
   const auto *sc = static_cast<const uint16_t *>(p.scales.contents());
   const auto *bi = static_cast<const uint16_t *>(p.biases.contents());
@@ -65,15 +70,38 @@ Reference reference(const Q4Projection &p, const uint16_t *input, uint32_t row, 
     quantMagnitude += absolute * std::abs(scale);
     magnitude += absolute * (15 * std::abs(scale) + std::abs(bias));
   }
+  return {value, quantMagnitude, magnitude};
+}
+struct Reference { double value, error; };
+// The kernel's bf16 projection and its error bound with K split `splits` ways.
+Reference reference(const Exact &e, uint32_t groups, uint32_t splits) {
   // gamma_n bounds a chain of n fp32 roundings. Within a 64-element group,
   // operands are <=143|x|; budget 64 dot steps plus 8 for the row sum and
   // offset correction. Across groups budget two affine FMAs and S additions.
   // Absolute operand magnitudes make this valid even under cancellation.
   constexpr double u = 0x1p-24;
   const auto gamma = [&](double n) { return n * u / (1 - n * u); };
-  const double error = gamma(72) * 143 * quantMagnitude + gamma(2 * groups + splits) * magnitude;
-  return {double(bf16ToFloat(floatToBf16(float(value)))),
-          error + ulpBf16(float(value))};
+  const double error = gamma(72) * 143 * e.quantMagnitude + gamma(2 * groups + splits) * e.magnitude;
+  return {double(bf16ToFloat(floatToBf16(float(e.value)))),
+          error + ulpBf16(float(e.value))};
+}
+// The reference of an output after its epilogue: plus the residual, or
+// times silu(gate) for GateUp.
+Reference withEpilogue(Reference ref, LinearEpilogue epilogue, double residual, Reference gate) {
+  if (epilogue == LinearEpilogue::Residual) ref.value += residual;
+  if (epilogue == LinearEpilogue::GateUp) {
+    const double activation = gate.value / (1 + std::exp(-gate.value));
+    ref.error = 1.1 * gate.error * (std::abs(ref.value) + ref.error) + std::abs(activation) * ref.error;
+    ref.value *= activation;
+  }
+  return ref;
+}
+// Whether a bf16 output is finite and within the reference's bound.
+bool within(const Reference &ref, uint16_t actual) {
+  const double expected = bf16ToFloat(floatToBf16(float(ref.value)));
+  const double value = bf16ToFloat(actual);
+  return std::isfinite(value) &&
+         std::abs(value - expected) <= ref.error + ulpBf16(float(expected)) + ulpBf16(float(value));
 }
 void runCase(metal::MetalBackend &backend, uint32_t n, uint32_t k, uint32_t splits,
              LinearEpilogue epilogue, uint32_t fixture, uint32_t rows) {
@@ -125,27 +153,140 @@ void runCase(metal::MetalBackend &backend, uint32_t n, uint32_t k, uint32_t spli
   for (uint64_t i = 0; i < size.counters / 4; ++i) require(counts[i] == 0, "counter not reset");
   for (uint32_t row = 0; row < rows; ++row) {
     for (uint32_t col : {0U, 7U, 8U, 31U, 32U, 63U, 64U, 127U, 128U, 255U, n-1}) {
-      auto ref = reference(p, x, row, col, splits);
-      if (epilogue == LinearEpilogue::Residual) ref.value += bf16ToFloat(r[row * n + col]);
-      if (epilogue == LinearEpilogue::GateUp) {
-        const auto g = reference(gate, x, row, col, splits);
-        const double activation = g.value / (1 + std::exp(-g.value));
-        ref.error = 1.1 * g.error * (std::abs(ref.value) + ref.error) + std::abs(activation) * ref.error;
-        ref.value *= activation;
-      }
-      const double expected = bf16ToFloat(floatToBf16(float(ref.value)));
-      const double value = bf16ToFloat(actual[row * n + col]);
-      const double bound = ref.error + ulpBf16(float(expected)) + ulpBf16(float(value));
-      if (!std::isfinite(value) || std::abs(value - expected) > bound) {
+      const auto ref = withEpilogue(reference(exact(p, x, row, col), k / 64, splits), epilogue,
+                                    bf16ToFloat(r[row * n + col]),
+                                    epilogue == LinearEpilogue::GateUp
+                                        ? reference(exact(gate, x, row, col), k / 64, splits) : Reference{});
+      const uint16_t value = actual[row * n + col];
+      if (!within(ref, value)) {
         std::cerr << "M=" << rows << " N=" << n << " K=" << k << " S=" << splits << " epilogue=" << int(epilogue)
                   << " fixture=" << fixture << " row=" << row << " col=" << col
-                  << " actual=" << value << " reference=" << expected << " bound=" << bound << '\n';
+                  << " actual=" << bf16ToFloat(value) << " reference=" << ref.value << " error=" << ref.error << '\n';
         throw std::runtime_error("simdgroup result exceeds independent fp64 error bound");
       }
-      if (fixture == 3) require(value == expected, "zero-weight offset cancellation is not exact");
+      if (fixture == 3)
+        require(bf16ToFloat(value) == bf16ToFloat(floatToBf16(float(ref.value))),
+                "zero-weight offset cancellation is not exact");
     }
   }
   for (auto *guard : {&input,&output,&residual,&table,&sums,&partials,&counters}) guard->check();
+}
+// Two production projections that run back to back in a decode step share
+// one LinearScratch, as every projection there does, at each pair of K
+// splits the Apple9 policy picks for one core count. The partials are
+// overwritten before each projection, with a large finite value and in
+// another run with NaN, so reading a partial before its writer published it
+// changes the output. Every output element must meet the fp64 bound, as the
+// unsplit outputs must, and not depend on the poison or the run; every
+// counter must return to zero.
+struct SplitOperand {
+  LinearWorkload workload;
+  Q4Projection weights, gate;
+  metal::MetalBuffer input, residual, output;
+  std::vector<Exact> exact, gateExact;
+};
+void requireFp64(const SplitOperand &o, uint32_t splits, const std::string &what) {
+  const auto [n, k] = o.workload.matrix;
+  const auto *actual = static_cast<const uint16_t *>(o.output.contents());
+  const auto *r = static_cast<const uint16_t *>(o.residual.contents());
+  const bool gateUp = o.workload.epilogue == LinearEpilogue::GateUp;
+  for (uint64_t i = 0; i < uint64_t{o.workload.rows} * n; ++i) {
+    const auto ref = withEpilogue(reference(o.exact[i], k / 64, splits), o.workload.epilogue, bf16ToFloat(r[i]),
+                                  gateUp ? reference(o.gateExact[i], k / 64, splits) : Reference{});
+    if (!within(ref, actual[i]))
+      throw std::runtime_error(what + ": element " + std::to_string(i) + " exceeds the fp64 bound");
+  }
+}
+void splitVisibility(metal::MetalBackend &backend,
+                     std::array<std::pair<LinearMatrix, LinearEpilogue>, 2> pair, uint32_t lanes) {
+  const uint32_t rows = lanes * 8;
+  std::vector<SplitOperand> operands;
+  for (uint32_t i = 0; i < 2; ++i) {
+    const auto [matrix, epilogue] = pair[i];
+    const auto [n, k] = matrix;
+    SplitOperand o{{matrix, rows, LinearPhase::Decode, epilogue},
+                   weights(backend, matrix, 31 + 100 * i, false), weights(backend, matrix, 177 + 100 * i, false),
+                   backend.allocateBuffer(2ULL * rows * k), backend.allocateBuffer(2ULL * rows * n),
+                   backend.allocateBuffer(2ULL * rows * n), {}, {}};
+    auto *x = static_cast<uint16_t *>(o.input.contents());
+    auto *r = static_cast<uint16_t *>(o.residual.contents());
+    for (uint32_t j = 0; j < rows * k; ++j) x[j] = floatToBf16(float(int(hash(j + 37 + 1000 * i) % 257) - 128) / 32);
+    for (uint32_t j = 0; j < rows * n; ++j) r[j] = floatToBf16(float(int(j % 31) - 15) / 8);
+    for (uint32_t row = 0; row < rows; ++row)
+      for (uint32_t col = 0; col < n; ++col) {
+        o.exact.push_back(exact(o.weights, x, row, col));
+        if (epilogue == LinearEpilogue::GateUp) o.gateExact.push_back(exact(o.gate, x, row, col));
+      }
+    operands.push_back(std::move(o));
+  }
+  std::set<std::array<uint32_t, 2>> splitPairs;
+  for (uint32_t cores = 8; cores <= 80; ++cores) {
+    DeviceCapabilities device;
+    device.appleGpuFamily = 9;
+    device.gpuCoreCount = cores;
+    const Q4Linear policy(device);
+    const auto a = policy.plan(operands[0].workload).configuration();
+    const auto b = policy.plan(operands[1].workload).configuration();
+    if (a.tile == LinearTile::Simdgroup && b.tile == LinearTile::Simdgroup && std::max(a.splits, b.splits) > 1)
+      splitPairs.insert({a.splits, b.splits});
+  }
+  require(!splitPairs.empty(), "the policy splits neither projection");
+  const auto plan = [&](uint32_t i, uint32_t splits) {
+    const LinearWorkload &w = operands[i].workload;
+    return Q4Linear::plan(w, {LinearTile::Simdgroup, w.matrix.outputSize / (w.epilogue == LinearEpilogue::GateUp ? 32 : 64),
+                              LinearSimdgroups::Four, splits});
+  };
+  LinearScratchSize size;
+  const auto grow = [&](const LinearPlan &p) {
+    const auto s = p.scratchSize();
+    size = {std::max(size.input, s.input), std::max(size.sums, s.sums), std::max(size.partials, s.partials),
+            std::max(size.counters, s.counters)};
+  };
+  for (uint32_t i = 0; i < 2; ++i) grow(plan(i, 1));
+  for (const auto &splits : splitPairs) for (uint32_t i = 0; i < 2; ++i) grow(plan(i, splits[i]));
+  Guarded table(backend, size.input), sums(backend, size.sums), partials(backend, size.partials), counters(backend, size.counters);
+  std::memset(counters.view.contents(), 0, size.counters);
+  const LinearScratch scratch{table.view, sums.view, partials.view, counters.view};
+  const auto poison = backend.allocateBuffer(size.partials);
+  const Q4Linear linear(backend.capabilities());
+  const auto add = [&](metal::CommandGraph &graph, uint32_t i, uint32_t splits) {
+    const SplitOperand &o = operands[i];
+    const bool gateUp = o.workload.epilogue == LinearEpilogue::GateUp;
+    linear.add(graph, {o.input, o.output, {}, o.workload.epilogue == LinearEpilogue::Residual ? o.residual : metal::MetalBuffer{},
+                       {}, {}, scratch}, o.weights, plan(i, splits), gateUp ? &o.gate : nullptr);
+  };
+  const std::string shape = std::to_string(lanes) + " lanes, " + std::to_string(pair[0].first.outputSize) + "x" +
+      std::to_string(pair[0].first.inputSize) + " then " + std::to_string(pair[1].first.outputSize) + "x" +
+      std::to_string(pair[1].first.inputSize);
+  metal::CommandGraph unsplit;
+  for (uint32_t i = 0; i < 2; ++i) add(unsplit, i, 1);
+  (void)backend.submitCommand(unsplit.dispatches());
+  for (uint32_t i = 0; i < 2; ++i) requireFp64(operands[i], 1, shape + " unsplit");
+  for (const auto &splits : splitPairs) {
+    const std::string what = shape + " splits " + std::to_string(splits[0]) + "/" + std::to_string(splits[1]);
+    metal::CommandGraph graph;
+    for (uint32_t i = 0; i < 2; ++i) {
+      // gguf_copy, the production byte copy, poisons the partials in order.
+      graph.add("gguf_copy", {poison, partials.view}, GgufCopyParams{0, 0, uint32_t(size.partials)},
+                {uint32_t((size.partials + 4095) / 4096), 1, 1}, {256, 1, 1});
+      add(graph, i, splits[i]);
+    }
+    std::vector<std::vector<uint8_t>> first;
+    for (uint32_t bits : {0x7E800000U, 0x7FC00000U, 0x7E800000U}) {
+      std::fill_n(static_cast<uint32_t *>(poison.contents()), size.partials / 4, bits);
+      (void)backend.submitCommand(graph.dispatches());
+      const auto *counts = static_cast<const uint32_t *>(counters.view.contents());
+      for (uint64_t c = 0; c < size.counters / 4; ++c) require(counts[c] == 0, "counter not reset");
+      for (uint32_t i = 0; i < 2; ++i) {
+        const auto *bytes = static_cast<const uint8_t *>(operands[i].output.contents());
+        const std::vector<uint8_t> output(bytes, bytes + operands[i].output.sizeBytes());
+        if (first.size() < 2) first.push_back(output);
+        else if (output != first[i]) throw std::runtime_error(what + ": output depends on the poison or the run");
+      }
+    }
+    for (uint32_t i = 0; i < 2; ++i) requireFp64(operands[i], splits[i], what);
+  }
+  for (auto *guard : {&table, &sums, &partials, &counters}) guard->check();
 }
 void fusedNorm(metal::MetalBackend &backend, uint32_t k, uint32_t rows) {
   auto input=backend.allocateBuffer(k*rows*2), weight=backend.allocateBuffer(k*2);
@@ -213,6 +354,12 @@ int main(int argc,char **argv) {
       }
     for (uint32_t width : {64U, 320U, 2048U, 5120U, 17408U})
       for (uint32_t rows : {8U,16U,24U,32U}) fusedNorm(backend, width, rows);
-    std::cout << "Q4 simdgroup: PASS cases=" << cases << " (fp64, range, cancellation, guards, repeated dispatch, fused norm)\n";
+    // 27B out_proj then down, and gdn_in then gate/up: K 6144, 17408 and 5120.
+    for (uint32_t lanes : {1U, 4U}) {
+      splitVisibility(backend, {{{{5120, 6144}, LinearEpilogue::Residual}, {{5120, 17408}, LinearEpilogue::Residual}}}, lanes);
+      splitVisibility(backend, {{{{16640, 5120}, LinearEpilogue::None}, {{17408, 5120}, LinearEpilogue::GateUp}}}, lanes);
+    }
+    std::cout << "Q4 simdgroup: PASS cases=" << cases
+              << " (fp64, range, cancellation, guards, repeated dispatch, fused norm, shared split scratch)\n";
   } catch (const std::exception &e) { std::cerr << "Q4 simdgroup: FAIL: " << e.what() << '\n'; return 1; }
 }

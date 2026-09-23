@@ -206,6 +206,59 @@ int main(int argc, char **argv) { @autoreleasepool {
     { const uint32_t rows = 128; auto [Xbf, Xref] = inputs(rows); id<MTLBuffer> Y = mkbuf(uint64_t(rows) * N * 2); std::vector<double> ref((size_t)rows * N); refGemm(Xref, s, rows, N, ref);
       GgufParams pq{N, K, 0, 0, 0}; char name[80]; snprintf(name, sizeof name, "pfa_%s_r32_sg4_n64_k64_p1", fmtName(fi)); id<MTLComputePipelineState> ps = pso(lib, name); if (!ps) { ++failures; continue; }
       Dispatch d{ps, {Xbf, s.w0, s.w1, s.meta, Y}, bytes(pq), 5, MTLSizeMake(rows / 128, N / 64, 1), MTLSizeMake(128, 1, 1)}; runOnce({d}, 1); compare(name, Y, ref, rows, N); } }
+  // 5) split-K visibility at production K: two projections back to back share the partials and counters, as every
+  //    GGUF split projection of a decode step does, at the splits addGguf picks (ggufSplits: n <= 1024 -> 8,
+  //    n <= 6144 -> 4 for K <= 6144 else 8, n <= 12288 -> 4 for <= 16 rows else 2). The partials are poisoned before
+  //    each dispatch, with a large finite value and in another run with NaN, so a partial read before its writer
+  //    published it changes the output. Both outputs must pass the fp64 check the unsplit kernels pass, not depend
+  //    on the poison or the run, and leave every counter at zero.
+  struct SplitCase { Fmt fmt; uint32_t N, K, splits, epilogue; };
+  for (uint32_t rows : {8u, 32u}) {
+    const SplitCase pairs[2][2] = {{{Q4K, 5120, 6144, 4, GGUF_EPILOGUE_RESIDUAL}, {Q6K, 5120, 17408, 8, GGUF_EPILOGUE_RESIDUAL}},
+                                   {{IQ4XS, 12288, 5120, rows <= 16 ? 4u : 2u, GGUF_EPILOGUE_NONE}, {Q80, 1024, 5120, 8, GGUF_EPILOGUE_RESIDUAL}}};
+    for (const auto &pair : pairs) {
+      struct Operand { id<MTLBuffer> X, R, Y, w0, w1, meta; std::vector<double> ref; };
+      std::vector<Operand> ops; uint64_t partialBytes = 0, counterBytes = 0;
+      for (const SplitCase &c : pair) {
+        Operand o; std::vector<uint8_t> native = makeNative(c.fmt, c.N, c.K); Packed pk = repack(c.fmt, native, c.N, c.K, nullptr);
+        o.w0 = upload(pk.w0); o.w1 = upload(pk.w1); o.meta = upload(pk.meta); if (!kQuantFormats[c.fmt].plane1_bytes) o.w1 = o.meta;
+        o.X = mkbuf(uint64_t(rows) * c.K * 2); o.R = mkbuf(uint64_t(rows) * c.N * 2); o.Y = mkbuf(uint64_t(rows) * c.N * 2);
+        std::uniform_real_distribution<float> d(-1.f, 1.f); uint16_t *x = (uint16_t *)o.X.contents, *r = (uint16_t *)o.R.contents;
+        for (uint64_t i = 0; i < uint64_t(rows) * c.K; ++i) x[i] = f2bf(d(rng));
+        for (uint64_t i = 0; i < uint64_t(rows) * c.N; ++i) r[i] = f2bf(d(rng));
+        // fp64 over the GGML fp32 values, one weight row at a time (no N x K float copy at these shapes)
+        o.ref.assign(size_t(rows) * c.N, 0.0); std::vector<float> w(c.K);
+        for (uint32_t n = 0; n < c.N; ++n) { const uint8_t *row = native.data() + size_t(n) * rowBytes(c.fmt, c.K);
+          for (uint32_t g = 0; g < c.K / 32; ++g) { uint8_t p0[32], p1[8]; groupPack(c.fmt, row, g, w.data() + g * 32, p0, p1); }
+          for (uint32_t m = 0; m < rows; ++m) { double acc = 0; for (uint32_t k = 0; k < c.K; ++k) acc += (double)bf2f(x[size_t(m) * c.K + k]) * w[k];
+            o.ref[size_t(m) * c.N + n] = acc + (c.epilogue == GGUF_EPILOGUE_RESIDUAL ? bf2f(r[size_t(m) * c.N + n]) : 0.0); } }
+        partialBytes = std::max(partialBytes, uint64_t(c.splits) * rows * c.N * 4); counterBytes = std::max(counterBytes, uint64_t(c.N / 64) * 4);
+        ops.push_back(std::move(o));
+      }
+      id<MTLBuffer> partials = mkbuf(partialBytes), poison = mkbuf(partialBytes), counters = mkbuf(counterBytes); memset(counters.contents, 0, counterBytes);
+      id<MTLComputePipelineState> copy = pso(lib, "gguf_copy"); if (!copy) { ++failures; continue; }
+      std::vector<Dispatch> unsplit, split;
+      for (size_t j = 0; j < 2; ++j) { const SplitCase &c = pair[j]; const Operand &o = ops[j]; const bool residual = c.epilogue == GGUF_EPILOGUE_RESIDUAL;
+        char name[80]; snprintf(name, sizeof name, "%s_%s_m%u_c32_sg2_k32_b2_p1", residual ? "sgr" : "sga", fmtName(c.fmt), rows);
+        std::vector<id<MTLBuffer>> bufs{o.X, o.w0, o.w1, o.meta, o.Y}; if (residual) bufs.push_back(o.R);
+        unsplit.push_back({pso(lib, name), bufs, bytes(GgufParams{c.N, c.K, c.N / 64, 0, 0}), (int)bufs.size(), MTLSizeMake(c.N / 64, 1, 1), MTLSizeMake(64, 1, 1)});
+        snprintf(name, sizeof name, "gguf_splitk_%s_m%u", fmtName(c.fmt), rows);
+        // gguf_copy, the production byte copy, poisons the partials in dispatch order.
+        split.push_back({copy, {poison, partials}, bytes(GgufCopyParams{0, 0, uint32_t(partialBytes)}), 2, MTLSizeMake((partialBytes + 4095) / 4096, 1, 1), MTLSizeMake(256, 1, 1)});
+        split.push_back({pso(lib, name), {o.X, o.w0, o.w1, o.meta, partials, counters, o.Y, residual ? o.R : o.Y},
+                         bytes(GgufSplitParams{c.N, c.K, c.splits, c.N, 0, c.epilogue}), 8, MTLSizeMake(c.N / 64, c.splits, 1), MTLSizeMake(64, 1, 1)}); }
+      if (std::any_of(split.begin(), split.end(), [](const Dispatch &d) { return !d.p; }) ||
+          std::any_of(unsplit.begin(), unsplit.end(), [](const Dispatch &d) { return !d.p; })) { ++failures; continue; }
+      runOnce(unsplit, 1);
+      for (size_t j = 0; j < 2; ++j) { char label[96]; snprintf(label, sizeof label, "unsplit %s %ux%u", fmtName(pair[j].fmt), pair[j].N, pair[j].K); compare(label, ops[j].Y, ops[j].ref, rows, pair[j].N); }
+      std::vector<std::vector<uint8_t>> first;
+      for (uint32_t bits : {0x7E800000u, 0x7FC00000u, 0x7E800000u}) {
+        std::fill_n((uint32_t *)poison.contents, partialBytes / 4, bits); runOnce(split, 1);
+        const uint32_t *cnt = (const uint32_t *)counters.contents; for (uint64_t t = 0; t < counterBytes / 4; ++t) if (cnt[t]) { printf("  counter %llu not reset (%u)\n", (unsigned long long)t, cnt[t]); ++failures; }
+        for (size_t j = 0; j < 2; ++j) { const uint8_t *y = (const uint8_t *)ops[j].Y.contents; std::vector<uint8_t> out(y, y + ops[j].Y.length);
+          if (first.size() < 2) first.push_back(out);
+          else if (out != first[j]) { printf("  %s %ux%u S=%u: output depends on the poison or the run FAIL\n", fmtName(pair[j].fmt), pair[j].N, pair[j].K, pair[j].splits); ++failures; } } }
+      for (size_t j = 0; j < 2; ++j) { char label[96]; snprintf(label, sizeof label, "shared split %s %ux%u S=%u", fmtName(pair[j].fmt), pair[j].N, pair[j].K, pair[j].splits); compare(label, ops[j].Y, ops[j].ref, rows, pair[j].N); } } }
   failures += oracleFailures;
   printf("%s (%d failures)\n", failures ? "VALIDATION FAILED" : "all production kernels validated", failures);
   if (argc > 2 && std::string(argv[2]) == "time-gu") {
