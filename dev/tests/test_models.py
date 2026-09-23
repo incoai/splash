@@ -741,7 +741,10 @@ class ModelArtifactTest(unittest.TestCase):
         validated = artifacts.validate_package_manifest(snapshot / "manifest.json")
         self.assertEqual(artifacts.select_variant(validated, "UD-Q4_K_M"), "UD-Q4_K_M")
         for mutate, message in (
-            (lambda m: m["target"].update(architecture="qwen3_5"), "target architecture"),
+            (
+                lambda m: m["target"].update(architecture="qwen3_5"),
+                "target architecture",
+            ),
             (lambda m: m.update(schema_version=5), "not a supported"),
             (lambda m: m["artifacts"].pop(), "missing"),
         ):
