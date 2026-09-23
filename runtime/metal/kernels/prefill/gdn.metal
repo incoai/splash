@@ -293,24 +293,25 @@ GDN_PREPARE_PREFILL_ENTRY(prefill_gdn_prepare, 16, 48, 128, 10240)
 GDN_PREPARE_PREFILL_ENTRY(prefill_gdn_prepare_vh32, 16, 32, 128, 8192)
 #undef GDN_PREPARE_PREFILL_ENTRY
 
-#define GDN_GATE_PREFILL_ENTRY(Name, ValueHeads, HeadDim, ConvDim)             \
+#define GDN_GATE_PREFILL_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim)   \
   kernel void Name(                                                           \
       device const bfloat *recurrent [[buffer(0)]],                           \
       device const bfloat *packed [[buffer(1)]],                              \
       device const bfloat *norm_weight [[buffer(2)]],                         \
       device bfloat *hidden [[buffer(3)]],                                    \
-      constant GDNPreparePrefillParams &params [[buffer(4)]],                 \
+      constant GDNGatePrefillParams &params [[buffer(4)]],                    \
       uint task [[threadgroup_position_in_grid]],                             \
       uint thread_index [[thread_index_in_threadgroup]],                      \
       uint lane [[thread_index_in_simdgroup]],                                \
       uint simd_group [[simdgroup_index_in_threadgroup]]) {                   \
     threadgroup float reductions[4];                                          \
-    gdn_gate_phase<ValueHeads, HeadDim, ConvDim, 4>(                          \
+    gdn_gate_phase<KeyHeads, ValueHeads, HeadDim, ConvDim, 4>(                \
         recurrent, packed, norm_weight, hidden, params.tokens * ValueHeads,   \
-        params.tokens * ValueHeads, params.packed_width, reductions, task,     \
-        thread_index, lane, simd_group);                                      \
+        params.tokens * ValueHeads, params.packed_width,                      \
+        params.tiled_heads != 0, reductions, task, thread_index, lane,        \
+        simd_group);                                                          \
   }
 
-GDN_GATE_PREFILL_ENTRY(prefill_gdn_gate, 48, 128, 10240)
-GDN_GATE_PREFILL_ENTRY(prefill_gdn_gate_vh32, 32, 128, 8192)
+GDN_GATE_PREFILL_ENTRY(prefill_gdn_gate, 16, 48, 128, 10240)
+GDN_GATE_PREFILL_ENTRY(prefill_gdn_gate_vh32, 16, 32, 128, 8192)
 #undef GDN_GATE_PREFILL_ENTRY

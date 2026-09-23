@@ -22,8 +22,21 @@ struct GDNPreparePrefillParams {
 static_assert(sizeof(GDNPreparePrefillParams) == 8,
               "GDN prefill prepare parameters are 8 bytes on both sides");
 
+// tiled_heads (0 or 1) selects the value-head order of the GDN output, the
+// out_proj input columns: 0 keeps a key head's value heads adjacent (head h
+// at h); 1 is llama.cpp's tiled GGUF order, head h at
+// (h % heads per key) * key heads + h / heads per key.
+struct GDNGatePrefillParams {
+  uint32_t tokens;
+  uint32_t packed_width;
+  uint32_t tiled_heads;
+};
+
+static_assert(sizeof(GDNGatePrefillParams) == 12,
+              "GDN prefill gate parameters are 12 bytes on both sides");
+
 struct GDNDecodeBatchParams {
-  uint32_t reserved0; // Explicit zero padding for the uint64_t strides.
+  uint32_t tiled_heads; // As in GDNGatePrefillParams.
   uint32_t packed_width;
   uint32_t lanes;
   uint32_t layer;

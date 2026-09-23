@@ -595,6 +595,46 @@ void fusedPreparation(MetalBackend &backend, const GdnShape &shape, uint32_t lan
   for (uint32_t lane=0;lane<lanes;++lane) checkDecode(fixture, 0, lane);
 }
 
+// The tiled head order only moves each value head's output block: the tiled
+// output, and the Q4 table prepared from it in the same dispatch, are the
+// grouped output with head h at (h % heads per key) * key heads + h / heads
+// per key, byte for byte.
+void tiledHeadOrder(MetalBackend &backend, const GdnShape &shape, uint32_t lanes) {
+  Fixture fixture(backend, shape, lanes);
+  const uint32_t width = shape.valueHeads * shape.headDimension;
+  const uint32_t headsPerKey = shape.valueHeads / shape.keyHeads;
+  const uint64_t headBytes = uint64_t{shape.headDimension} * 2;
+  CommandGraph grouped;
+  GDN::addDecode(grouped, fixture.decodeBuffers(0), shape, lanes, 0, fixture.cell.strides());
+  (void)backend.submitCommand(grouped.dispatches());
+  const auto *hidden = static_cast<const uint8_t *>(fixture.hidden.contents());
+  std::vector<uint8_t> expected(fixture.hidden.sizeBytes());
+  for (uint64_t row = 0; row < uint64_t{kMaxLanes} * kRows; ++row)
+    for (uint32_t head = 0; head < shape.valueHeads; ++head) {
+      const uint32_t tiled = (head % headsPerKey) * shape.keyHeads + head / headsPerKey;
+      std::memcpy(expected.data() + (row * shape.valueHeads + tiled) * headBytes,
+                  hidden + (row * shape.valueHeads + head) * headBytes, headBytes);
+    }
+  fixture.clear();
+  auto table = backend.allocateBuffer(width * 16 * lanes);
+  auto sums = backend.allocateBuffer(width / 2 * lanes);
+  auto referenceTable = backend.allocateBuffer(width * 16 * lanes);
+  auto referenceSums = backend.allocateBuffer(width / 2 * lanes);
+  auto buffers = fixture.decodeBuffers(0);
+  buffers.linearScratch = {table, sums, {}, {}};
+  CommandGraph tiled;
+  GDN::addDecode(tiled, buffers, shape, lanes, 0, fixture.cell.strides(), GdnHeadOrder::Tiled);
+  tiled.add("decode_linear_q4_prepare", {fixture.hidden, referenceTable, referenceSums},
+            width, {width / 32, lanes, 1}, {128, 1, 1});
+  (void)backend.submitCommand(tiled.dispatches());
+  require(!std::memcmp(expected.data(), hidden, expected.size()),
+          "tiled GDN output is not the grouped output in tiled head order");
+  require(!std::memcmp(table.contents(), referenceTable.contents(), width * 16 * lanes),
+          "tiled GDN table mismatch");
+  require(!std::memcmp(sums.contents(), referenceSums.contents(), width / 2 * lanes),
+          "tiled GDN sums mismatch");
+}
+
 void rejectsInvalid(MetalBackend &backend) {
   const GdnShape &shape = kShapes[1];
   Fixture fixture(backend, shape, 1);
@@ -635,6 +675,8 @@ int main(int argc, char **argv) {
     rejectsInvalid(backend);
     for (const GdnShape &shape : kShapes)
       for (uint32_t lanes=1;lanes<=kMaxLanes;++lanes) fusedPreparation(backend, shape, lanes);
+    for (const GdnShape &shape : kShapes)
+      for (uint32_t lanes = 1; lanes <= kMaxLanes; ++lanes) tiledHeadOrder(backend, shape, lanes);
     for (const GdnShape &shape : kShapes)
       for (uint32_t lanes = 1; lanes <= kMaxLanes; ++lanes)
         runDecode(backend, shape, lanes);

@@ -36,7 +36,7 @@ enum class KernelLayout : uint8_t { Value48, Value32 };
 } // namespace
 
 void GDN::addPrefill(metal::CommandGraph &graph, GdnPrefillBuffers buffers,
-                     GdnShape shape, uint32_t tokens) {
+                     GdnShape shape, uint32_t tokens, GdnHeadOrder order) {
   if (!tokens)
     throw std::invalid_argument("invalid GDN prefill geometry");
   const KernelLayout kernel = kernelShape(shape);
@@ -63,13 +63,14 @@ void GDN::addPrefill(metal::CommandGraph &graph, GdnPrefillBuffers buffers,
                        "prefill_gdn_gate_vh32"),
             {buffers.recurrentRows, buffers.packed, buffers.mixerNorm,
              buffers.hidden},
-            prepare, {uint64_t{tokens} * shape.valueHeads, 1, 1},
-            {128, 1, 1});
+            GDNGatePrefillParams{tokens, shape.packedWidth,
+                                 order == GdnHeadOrder::Tiled},
+            {uint64_t{tokens} * shape.valueHeads, 1, 1}, {128, 1, 1});
 }
 
 void GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffers,
                     GdnShape shape, uint32_t lanes, uint32_t layer,
-                    GdnStateStrides state) {
+                    GdnStateStrides state, GdnHeadOrder order) {
   if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH || !state.valid())
     throw std::invalid_argument("invalid GDN decode geometry");
   const KernelLayout kernel = kernelShape(shape);
@@ -89,7 +90,7 @@ void GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffers,
                    buffers.generation});
   if (prepare)
     bindings.insert(bindings.end(), {buffers.linearScratch.input, buffers.linearScratch.sums});
-  const GDNDecodeBatchParams params{0,
+  const GDNDecodeBatchParams params{order == GdnHeadOrder::Tiled,
                                     shape.packedWidth,
                                     lanes,
                                     layer,

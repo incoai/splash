@@ -29,6 +29,11 @@ struct GdnShape final {
   bool operator==(const GdnShape &) const = default;
 };
 
+// The value-head order of the GDN output, the out_proj input columns. Grouped
+// keeps a key head's value heads adjacent; Tiled is llama.cpp's GGUF order,
+// value head h at (h % heads per key) * key heads + h / heads per key.
+enum class GdnHeadOrder : uint8_t { Grouped, Tiled };
+
 struct GdnStateStrides final {
   uint64_t convolutionLayerBytes = 0;
   uint64_t recurrentLayerBytes = 0;
@@ -90,10 +95,12 @@ struct GdnCommitBuffers final {
 class GDN final {
 public:
   static void addPrefill(metal::CommandGraph &graph, GdnPrefillBuffers buffers,
-                         GdnShape shape, uint32_t tokens);
+                         GdnShape shape, uint32_t tokens,
+                         GdnHeadOrder order = GdnHeadOrder::Grouped);
   static void addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffers,
                         GdnShape shape, uint32_t lanes, uint32_t layer,
-                        GdnStateStrides state);
+                        GdnStateStrides state,
+                        GdnHeadOrder order = GdnHeadOrder::Grouped);
   static void addCommit(metal::CommandGraph &graph, GdnCommitBuffers buffers,
                         GdnShape shape, uint32_t layers, uint32_t lanes,
                         GdnStateStrides state);

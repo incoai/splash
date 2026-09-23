@@ -363,16 +363,18 @@ inline void gdn_decode_batch_phase(
       mixed, decay, beta, state_in, state_out, lane_recurrent, queries, keys,
       group.x, lane, simd_group);
   threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-  gdn_gate_phase<ValueHeads, HeadDim, ConvDim, kDecodeSimdgroups>(
+  const bool tiled = params.tiled_heads != 0;
+  gdn_gate_phase<KeyHeads, ValueHeads, HeadDim, ConvDim, kDecodeSimdgroups>(
       lane_recurrent, packed, gdn_norm_weight, lane_hidden, Rows * ValueHeads,
-      ValueHeads, params.packed_width, scratch, group.x, thread_index, lane,
-      simd_group);
+      ValueHeads, params.packed_width, tiled, scratch, group.x, thread_index,
+      lane, simd_group);
   if (q4_table) {
     // Each group owns this head for all eight rows. Publish its rounded
     // outputs before the eight SIMD groups transpose one row each.
     threadgroup_barrier(mem_flags::mem_device);
+    const uint head = gdn_output_head<KeyHeads, ValueHeads>(group.x, tiled);
     for (uint g = 0; g < HeadDim / 64; ++g) {
-      const uint column = group.x * HeadDim + g * 64 + 2 * lane;
+      const uint column = head * HeadDim + g * 64 + 2 * lane;
       const uint index = simd_group * ValueWidth + column;
       q4sg::write_input(q4_table + ulong(batch) * ValueWidth * Rows,
                         q4_sums + ulong(batch) * ValueWidth / 8,

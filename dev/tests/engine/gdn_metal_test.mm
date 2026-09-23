@@ -26,6 +26,7 @@ using splash::metal::CommandGraph;
 using splash::metal::MetalBackend;
 using splash::metal::MetalBuffer;
 using splash::ops::GDN;
+using splash::ops::GdnHeadOrder;
 using splash::ops::GdnPrefillBuffers;
 using splash::ops::GdnShape;
 
@@ -178,9 +179,10 @@ GdnPrefillBuffers randomPrefill(MetalBackend &backend, const GdnShape &shape,
 
 void submitPrefill(MetalBackend &backend, const GdnPrefillBuffers &buffers,
                    const GdnShape &shape, uint32_t tokens,
-                   const std::string &label) {
+                   const std::string &label,
+                   GdnHeadOrder order = GdnHeadOrder::Grouped) {
   CommandGraph graph;
-  GDN::addPrefill(graph, buffers, shape, tokens);
+  GDN::addPrefill(graph, buffers, shape, tokens, order);
   require(graph.dispatches().size() == 3,
           label + "prefill is not three dispatches");
   (void)backend.submitCommand(graph.dispatches());
@@ -444,6 +446,43 @@ void runSplitCase(MetalBackend &backend, const GdnShape &shape,
   std::cout << label << "byte-identical to the single pass\n";
 }
 
+// The tiled head order only moves each value head's output block: over the
+// same inputs, the tiled hidden rows are the grouped ones with head h at
+// (h % heads per key) * key heads + h / heads per key, byte for byte, and the
+// recurrent rows and state are unchanged.
+void runTiledCase(MetalBackend &backend, const GdnShape &shape,
+                  uint32_t tokens) {
+  const std::string label = "vh" + std::to_string(shape.valueHeads) +
+                            " tokens=" + std::to_string(tokens) + " tiled: ";
+  const uint32_t headsPerKey = shape.valueHeads / shape.keyHeads;
+  const uint64_t headBytes = uint64_t{kHeadDim} * 2;
+  GdnPrefillBuffers grouped = randomPrefill(backend, shape, tokens);
+  submitPrefill(backend, grouped, shape, tokens, label);
+  GdnPrefillBuffers tiled = prefillBuffers(
+      backend, shape, tokens, grouped.packed, grouped.convolutionIn,
+      grouped.recurrentIn, grouped.convolutionWeights, grouped.decayWeights,
+      grouped.timeBias, grouped.mixerNorm);
+  submitPrefill(backend, tiled, shape, tokens, label, GdnHeadOrder::Tiled);
+  requireSameBytes(tiled.recurrentRows, grouped.recurrentRows, 0,
+                   grouped.recurrentRows.sizeBytes(),
+                   label + "recurrent rows differ");
+  requireSameBytes(tiled.recurrentOut, grouped.recurrentOut, 0,
+                   grouped.recurrentOut.sizeBytes(),
+                   label + "recurrent state differs");
+  const auto *got = data<const uint8_t>(tiled.hidden);
+  const auto *want = data<const uint8_t>(grouped.hidden);
+  for (uint64_t token = 0; token < tokens; ++token)
+    for (uint32_t head = 0; head < shape.valueHeads; ++head) {
+      const uint32_t position =
+          (head % headsPerKey) * shape.keyHeads + head / headsPerKey;
+      require(std::memcmp(got + (token * shape.valueHeads + position) * headBytes,
+                          want + (token * shape.valueHeads + head) * headBytes,
+                          headBytes) == 0,
+              label + "hidden rows are not the grouped rows in tiled head order");
+    }
+  std::cout << label << "byte-identical to the grouped order\n";
+}
+
 void run(const std::string &metallib) {
   MetalBackend backend(metallib);
   for (const GdnShape &shape :
@@ -452,6 +491,8 @@ void run(const std::string &metallib) {
       runCase(backend, shape, tokens);
     runSplitCase(backend, shape, 2048, 1000);
     runSplitCase(backend, shape, 37, 17);
+    for (uint32_t tokens : {1u, 37u, 1000u})
+      runTiledCase(backend, shape, tokens);
   }
   std::cout << "gdn_metal_test passed\n";
 }
