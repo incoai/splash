@@ -199,6 +199,19 @@ an engine restart. Chat streams include token usage when the request sets
 `"stream_options":{"include_usage":true}`; non-streaming Chat responses always
 include usage. A proxy must consume these fields to display statistics.
 
+Chat completions also include a llama-server-style `timings` object, both in
+non-streaming responses and in the final finish-reason chunk of a stream,
+even without `include_usage`. `prompt_n` and `predicted_n` are the full prompt
+and output counts; `cache_n` is the cached prompt count. `prompt_ms` measures
+native start to first emission, and `predicted_ms` measures first emission to
+completion. These elapsed intervals exclude the initial admission queue and
+are not isolated GPU timings. `prompt_per_second` uses only uncached prompt
+tokens; `predicted_per_second` excludes the entire first emission (which can
+contain multiple speculative tokens). Thus rates use tokens processed in the
+measured interval, not the full counts. An unavailable rate is zero, including
+responses completed in one emission. Per-request draft counters are omitted
+because the native runtime only reports them at batch level.
+
 `/metrics` also exports fixed latency histograms in seconds, with a bounded
 set of stages in `/status.latency`. HTTP duration includes body upload and
 response writing for admitted API requests. Preparation, queue, template,

@@ -49,6 +49,7 @@ if __package__:
         is_finite_number,
         metrics_dict,
         prometheus_metrics,
+        timings_dict,
         usage_dict,
     )
     from .output import (
@@ -84,7 +85,13 @@ else:
     from frontend import REASONING_EFFORTS, Frontend, validate_served_model_name
     from http_security import authenticate, validate_api_key, validate_headers
     from latency import RequestLatency
-    from metrics import is_finite_number, metrics_dict, prometheus_metrics, usage_dict
+    from metrics import (
+        is_finite_number,
+        metrics_dict,
+        prometheus_metrics,
+        timings_dict,
+        usage_dict,
+    )
     from output import (
         ReasoningSplitter,
         StreamingToolCallProjector,
@@ -387,6 +394,8 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     "object": "model",
                     "created": 0,
                     "owned_by": "splash",
+                    "max_model_len": self.app.max_context,
+                    "context_length": self.app.max_context,
                     **({"root": self.app.model} if name != self.app.model else {}),
                 }
                 for name in self.app.model_names
@@ -1534,6 +1543,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     created,
                     {},
                     finish_reason(result, tool_calls),
+                    timings=timings_dict(result),
                 )
             )
             if stream_options.get("include_usage"):

@@ -4,6 +4,7 @@
 #include "engine/KvPool.hpp"
 #include "engine/StateCache.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -23,6 +24,25 @@ struct CacheLookup final {
   [[nodiscard]] uint32_t junctionBoundary() const noexcept {
     return kvBoundary > resumeBoundary() ? kvBoundary : 0;
   }
+};
+
+class Cache;
+
+class CacheProbe final {
+public:
+  [[nodiscard]] uint32_t cachedTokens() const noexcept { return cachedTokens_; }
+
+private:
+  friend class Cache;
+
+  std::vector<uint64_t> blocks_;
+  // Only pages examined by matchedBlocks can affect this probe's result.
+  std::vector<uint32_t> checkedTokens_;
+  std::vector<ImageSpan> images_;
+  const Cache *owner_ = nullptr;
+  size_t promptSize_ = 0;
+  uint64_t kvGeneration_ = 0;
+  uint32_t cachedTokens_ = 0;
 };
 
 struct CacheLookupSnapshot final {
@@ -78,11 +98,16 @@ public:
   [[nodiscard]] uint32_t
   cachedTokens(std::span<const uint32_t> prompt,
                std::span<const ImageSpan> images = {}) const;
+  [[nodiscard]] CacheProbe
+  probe(std::span<const uint32_t> prompt,
+        std::span<const ImageSpan> images = {}) const;
 
   // Pin the usable prefix before potentially evicting for active allocations.
   // Accounting is separate: failed admission retries are not extra samples.
-  [[nodiscard]] CacheLookup lookup(std::span<const uint32_t> prompt,
-                                   std::span<const ImageSpan> images = {});
+  [[nodiscard]] CacheLookup lookup(
+      std::span<const uint32_t> prompt,
+      std::span<const ImageSpan> images = {},
+      const CacheProbe *probe = nullptr);
   void recordLookup(const CacheLookup &lookup);
   void restoreRequest(uint64_t requestId, const CacheLookup &lookup);
 
