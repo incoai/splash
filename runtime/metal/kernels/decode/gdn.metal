@@ -1,6 +1,6 @@
 #include "metal/abi/KernelABI.h"
 #include "metal/kernels/common/gdn_primitives.h"
-#include "metal/kernels/common/q4_sgmatrix.h"
+#include "metal/kernels/common/gguf_sgmatrix.h"
 
 // Decode threadgroups are 256 threads: one simdgroup per verify row in the
 // prologue, and in the scan the head's 128 state rows strided over the eight
@@ -308,7 +308,7 @@ GDN_COMMIT_ENTRY(verify_gdn_commit_vh32, 16, 32, 128, 8192)
 #undef GDN_COMMIT_ENTRY
 
 template <uint KeyHeads, uint ValueHeads, uint HeadDim, uint ConvDim,
-          uint RowsInFlight>
+          uint RowsInFlight, class Table>
 inline void gdn_decode_batch_phase(
     device const bfloat *packed, device const bfloat *conv_weights,
     device const uchar *current0, device const uchar *current1,
@@ -376,10 +376,9 @@ inline void gdn_decode_batch_phase(
     for (uint g = 0; g < HeadDim / 64; ++g) {
       const uint column = head * HeadDim + g * 64 + 2 * lane;
       const uint index = simd_group * ValueWidth + column;
-      q4sg::write_input(q4_table + ulong(batch) * ValueWidth * Rows,
-                        q4_sums + ulong(batch) * ValueWidth / 8,
-                        column / 64, simd_group, lane,
-                        lane_hidden[index], lane_hidden[index + 1]);
+      Table::write(q4_table + ulong(batch) * ValueWidth * Rows,
+                   q4_sums + ulong(batch) * Table::sums_per_tile(ValueWidth), ValueWidth,
+                   column / 64, simd_group, lane, lane_hidden[index], lane_hidden[index + 1]);
     }
   }
   grid_completion(arrived[batch], generation[batch], ValueHeads,
@@ -402,10 +401,10 @@ inline void gdn_decode_batch_phase(
     uint2 group [[threadgroup_position_in_grid]], \
     uint thread_index [[thread_index_in_threadgroup]], \
     uint lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]]
-#define GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, Table, Sums) \
+#define GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, Table, Sums, Layout) \
     threadgroup float scratch[kDecodeSimdgroups]; \
     threadgroup bfloat prepared[2 * SPLASH_TARGET_VERIFY_ROWS * HeadDim]; \
-    gdn_decode_batch_phase<KeyHeads, ValueHeads, HeadDim, ConvDim, 2>( \
+    gdn_decode_batch_phase<KeyHeads, ValueHeads, HeadDim, ConvDim, 2, Layout>( \
         packed, conv_weights, current0, current1, current2, current3, next0, \
         next1, next2, next3, mixed, a_scale, dt_bias, decay, beta, recurrent, \
         gdn_norm_weight, gdn_hidden, arrived, generation, params, group, \
@@ -413,22 +412,25 @@ inline void gdn_decode_batch_phase(
 #define GDN_DECODE_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim) \
   kernel void Name(GDN_DECODE_BUFFERS, \
       constant GDNDecodeBatchParams &params [[buffer(20)]], GDN_DECODE_THREADS) { \
-    GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, nullptr, nullptr) \
+    GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, nullptr, nullptr, q4sg::Table64) \
   }
-#define GDN_DECODE_Q4_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim) \
+// The out-projection's table (Layout: q4sg::Table64 affine, q16sg::Table16 GGUF).
+#define GDN_DECODE_TABLE_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, Layout) \
   kernel void Name(GDN_DECODE_BUFFERS, \
       device bfloat *q4_table [[buffer(20)]], device float *q4_sums [[buffer(21)]], \
       constant GDNDecodeBatchParams &params [[buffer(22)]], GDN_DECODE_THREADS) { \
-    GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, q4_table, q4_sums) \
+    GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, q4_table, q4_sums, Layout) \
   }
 
 // Two rows overlap reductions and arithmetic without the register cost of four.
 GDN_DECODE_ENTRY(verify_gdn_fused, 16, 48, 128, 10240)
 GDN_DECODE_ENTRY(verify_gdn_fused_vh32, 16, 32, 128, 8192)
-GDN_DECODE_Q4_ENTRY(verify_gdn_fused_q4, 16, 48, 128, 10240)
-GDN_DECODE_Q4_ENTRY(verify_gdn_fused_q4_vh32, 16, 32, 128, 8192)
+GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_q4, 16, 48, 128, 10240, q4sg::Table64)
+GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_q4_vh32, 16, 32, 128, 8192, q4sg::Table64)
+GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_q16, 16, 48, 128, 10240, q16sg::Table16)
+GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_q16_vh32, 16, 32, 128, 8192, q16sg::Table16)
 #undef GDN_DECODE_ENTRY
-#undef GDN_DECODE_Q4_ENTRY
+#undef GDN_DECODE_TABLE_ENTRY
 #undef GDN_DECODE_BODY
 #undef GDN_DECODE_THREADS
 #undef GDN_DECODE_BUFFERS

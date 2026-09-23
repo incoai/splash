@@ -13,6 +13,28 @@ struct GgufParams {
 };
 static_assert(sizeof(GgufParams) == 20, "GGUF parameters are 20 bytes on both sides");
 
+// Apple9 register decode (kernels/decode/linear_gguf_sgmatrix.metal): one
+// tensor per dispatch, over the dispatch's 64-column tiles.
+struct GgufSgParams {
+  uint32_t input_size;  // K
+  uint32_t splits;      // K partitions; 1 = no cross-threadgroup reduction
+  uint32_t out_stride;  // columns of a destination row
+  uint32_t out_offset;  // first destination column of the tensor
+};
+static_assert(sizeof(GgufSgParams) == 16, "GGUF register decode parameters are 16 bytes on both sides");
+
+// Apple9 register decode of a fused projection: up to three column segments
+// of any formats in one dispatch, tiles in segment order.
+struct GgufSgFusedParams {
+  uint32_t input_size;  // K
+  uint32_t splits;      // K partitions of every segment
+  uint32_t out_stride;  // columns of a destination row
+  uint32_t cols[3];     // columns per segment; 0 past the last
+  uint32_t fmt[3];      // GGUF_FMT_* per segment
+  uint32_t offset[3];   // first destination column per segment
+};
+static_assert(sizeof(GgufSgFusedParams) == 48, "GGUF register fused parameters are 48 bytes on both sides");
+
 struct GgufEmbedParams {
   uint32_t rows;
   uint32_t vocabulary;

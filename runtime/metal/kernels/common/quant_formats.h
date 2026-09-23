@@ -10,6 +10,7 @@ using namespace metal;
 // has its sizes P0, P1, MetaBytes and MetaGroups from kQuantFormats and
 //   load(plane0, plane1) -> Payload, loadMeta(meta) -> Meta
 //   chunk(Payload, c) -> Chunk
+//   loadChunk(plane0, plane1, c) -> Chunk, the same chunk read on its own
 //   coef(Meta, j) -> QuantCoef of group j of the meta unit
 //     (IQ3_S: coef(Meta, Chunk), its group scale is in every chunk)
 // and one element accessor, by Kind:
@@ -69,6 +70,7 @@ struct FmtQ4K {
   static Payload load(device uchar *p0, device uchar *) { return {*((device uint4 *)p0)}; }
   static Meta loadMeta(device uchar *m) { return *((device uint4 *)m); }
   static Chunk chunk(Payload w, ushort c) { return w.a[c]; }
+  static Chunk loadChunk(device uchar *p0, device uchar *, ushort c) { return *((device uint *)(p0 + 4 * c)); }
   static uint4 codes(Chunk q) { return quant_nibble_pairs(q); }
   static QuantCoef coef(Meta hdr, ushort j) { return quant_k4_coef(hdr, j); }
 };
@@ -79,6 +81,9 @@ struct FmtQ5K {
   static Payload load(device uchar *p0, device uchar *p1) { return {*((device uint4 *)p0), *((device uint *)p1)}; }
   static Meta loadMeta(device uchar *m) { return *((device uint4 *)m); }
   static Chunk chunk(Payload w, ushort c) { return uint2(w.a[c], quant_spread1(w.b >> (16 * (c >> 1))) >> (8 * (c & 1))); }
+  static Chunk loadChunk(device uchar *p0, device uchar *p1, ushort c) {
+    return uint2(*((device uint *)(p0 + 4 * c)), quant_spread1(p1[c]));
+  }
   static uint4 codes(Chunk q) { return quant_nibble_pairs(q.x) | (((uint4(q.y) >> uint4(0, 2, 4, 6)) & 0x00010001u) << 4); }
   static QuantCoef coef(Meta hdr, ushort j) { return quant_k4_coef(hdr, j); }
 };
@@ -90,6 +95,9 @@ struct FmtQ6K {
   static Payload load(device uchar *p0, device uchar *p1) { return {*((device uint4 *)p0), *((device uint2 *)p1)}; }
   static Meta loadMeta(device uchar *m) { Meta r; r.sc = *((device packed_uint4 *)m); r.d = *((device uint *)(m + 16)); return r; }
   static Chunk chunk(Payload w, ushort c) { return uint2(w.a[c], quant_spread2(w.b[c >> 1] >> (16 * (c & 1)))); }
+  static Chunk loadChunk(device uchar *p0, device uchar *p1, ushort c) {
+    return uint2(*((device uint *)(p0 + 4 * c)), quant_spread2(*((device ushort *)(p1 + 2 * c))));
+  }
   static uint4 codes(Chunk q) { return quant_nibble_pairs(q.x) | (((uint4(q.y) >> uint4(0, 4, 8, 12)) & 0x00030003u) << 4); }
   static QuantCoef coef(Meta mt, ushort j) {
     const float d = float(as_type<half>(ushort(mt.d & 0xFFFF)));
@@ -106,6 +114,9 @@ struct FmtQ3K {
   static Meta loadMeta(device uchar *m) { return *((device uint4 *)m); }
   static Chunk chunk(Payload w, ushort c) {
     return uint2(quant_spread2(w.a[c >> 1] >> (16 * (c & 1))), quant_spread1(w.b >> (16 * (c >> 1))) >> (8 * (c & 1)));
+  }
+  static Chunk loadChunk(device uchar *p0, device uchar *p1, ushort c) {
+    return uint2(quant_spread2(*((device ushort *)(p0 + 2 * c))), quant_spread1(p1[c]));
   }
   static uint4 codes(Chunk q) { return ((uint4(q.x) >> uint4(0, 4, 8, 12)) & 0x00030003u) | (((uint4(q.y) >> uint4(0, 2, 4, 6)) & 0x00010001u) << 2); }
   static QuantCoef coef(Meta mt, ushort j) {
@@ -129,6 +140,7 @@ struct FmtIQ4XS {
   static Payload load(device uchar *p0, device uchar *) { return {*((device uint4 *)p0)}; }
   static Meta loadMeta(device uchar *m) { return *((device uint2 *)m); }
   static Chunk chunk(Payload w, ushort c) { return w.a[c]; }
+  static Chunk loadChunk(device uchar *p0, device uchar *, ushort c) { return *((device uint *)(p0 + 4 * c)); }
   static uint indices(Chunk q) { return q; }
   static QuantCoef coef(Meta mt, ushort j) {
     const half d = as_type<half>(ushort(mt.x & 0xFFFF)); const uint sh = mt.x >> 16;
@@ -143,6 +155,7 @@ struct FmtIQ4NL {
   static Payload load(device uchar *p0, device uchar *) { return {*((device uint4 *)p0)}; }
   static Meta loadMeta(device uchar *m) { return *((device ushort *)m); }
   static Chunk chunk(Payload w, ushort c) { return w.a[c]; }
+  static Chunk loadChunk(device uchar *p0, device uchar *, ushort c) { return *((device uint *)(p0 + 4 * c)); }
   static uint indices(Chunk q) { return q; }
   static QuantCoef coef(Meta mt, ushort) { return {float2(float(as_type<half>(mt))), 0.0f}; }
 };
@@ -153,6 +166,7 @@ struct FmtQ80 {
   static Payload load(device uchar *p0, device uchar *) { return {*((device uint4 *)p0), *((device uint4 *)(p0 + 16))}; }
   static Meta loadMeta(device uchar *m) { return *((device ushort *)m); }
   static Chunk chunk(Payload w, ushort c) { const uint4 h = c < 2 ? w.a : w.b; return (c & 1) ? h.zw : h.xy; }
+  static Chunk loadChunk(device uchar *p0, device uchar *, ushort c) { return *((device uint2 *)(p0 + 8 * c)); }
   static uint2 values(Chunk q) { return q; }
   static QuantCoef coef(Meta mt, ushort) { return {float2(float(as_type<half>(mt))), 0.0f}; }
 };
@@ -164,6 +178,7 @@ struct FmtIQ3S {
   static Payload load(device uchar *p0, device uchar *) { return {*((device uint4 *)p0)}; }
   static Meta loadMeta(device uchar *m) { return *((device ushort *)m); }
   static Chunk chunk(Payload w, ushort c) { return w.a[c]; }
+  static Chunk loadChunk(device uchar *p0, device uchar *, ushort c) { return *((device uint *)(p0 + 4 * c)); }
   static uint2 grid(Chunk q) { return uint2(kIQ3SGrid[(q & 0xFF) | ((q >> 16) & 0x100)], kIQ3SGrid[((q >> 8) & 0xFF) | ((q >> 17) & 0x100)]); }
   static uint signs(Chunk q) { return (q >> 16) & 0xFF; }
   static QuantCoef coef(Meta mt, Chunk q) { return {float2(float(as_type<half>(mt)) * float(1 + 2 * ((q >> 26) & 0xF))), 0.0f}; }

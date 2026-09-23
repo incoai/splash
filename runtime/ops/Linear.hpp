@@ -83,9 +83,11 @@ enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate };
 // uses bf16 8x8 matrix operations and an explicit activation/split workspace.
 // GgufStaged dequantizes GGUF weights per simdgroup into threadgroup memory
 // for matmul2d: 64 columns per decode threadgroup (two simdgroups) with
-// optional K splits, 128- or 32-row prefill tiles.
+// optional K splits, 128- or 32-row prefill tiles. GgufSimdgroup is the
+// GGUF register kernel on bf16 8x8 matrix operations (Apple9): 64 columns
+// per threadgroup, every request lane in one threadgroup, optional K splits.
 enum class LinearTile : uint8_t {
-  N128, N256, Paired128, Split32, Split64, Paired256, Simdgroup, GgufStaged
+  N128, N256, Paired128, Split32, Split64, Paired256, Simdgroup, GgufStaged, GgufSimdgroup
 };
 enum class LinearSimdgroups : uint8_t { Two = 2, Four = 4, Eight = 8 };
 
@@ -137,7 +139,16 @@ struct LinearScratchSize final {
 enum class LinearInput : uint8_t {
   Plain,    // bf16 [rows][K]
   Table64,  // affine simdgroup table, one sum per 64 inputs (kernels/common/q4_sgmatrix.h)
+  Table16,  // GGUF simdgroup table, sums per 16 and 32 inputs (kernels/common/gguf_sgmatrix.h)
 };
+// Scratch bytes a producer writes for `rows` rows of `width` inputs.
+[[nodiscard]] constexpr uint64_t tableBytes(uint32_t width, uint32_t rows) noexcept {
+  return uint64_t{width} * rows * 2;
+}
+[[nodiscard]] constexpr uint64_t tableSumsBytes(LinearInput layout, uint32_t width, uint32_t rows) noexcept {
+  return layout == LinearInput::Table16 ? uint64_t{width} * rows * 3 / 8
+       : layout == LinearInput::Table64 ? uint64_t{width} * rows / 16 : 0;
+}
 // The scratch table currently holds `source` in `layout`. Plain means the
 // scratch describes nothing. Producers return it, consumers accept it and
 // return what the scratch describes after their dispatch.
@@ -283,6 +294,9 @@ private:
   void addGguf(metal::CommandGraph &graph, const LinearBuffers &buffers,
                const Q4Projection &projection, const LinearPlan &plan,
                const Q4Projection *gate, Q4DispatchStats *stats) const;
+  void addGgufSimdgroup(metal::CommandGraph &graph, const LinearBuffers &buffers,
+                        const Q4Projection &projection, const LinearPlan &plan,
+                        const Q4Projection *gate) const;
   uint32_t appleGpuFamily_ = 0;
   uint32_t gpuCores_ = 0;
   std::vector<LinearChoice> choices_;

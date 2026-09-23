@@ -76,10 +76,11 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
   const KernelLayout kernel = kernelShape(shape);
   std::vector<metal::MetalBuffer> bindings{buffers.packed,
                                            buffers.convolutionWeights};
-  const bool prepare = input == LinearInput::Table64 && buffers.linearScratch.input;
-  const uint64_t outputWidth = uint64_t{shape.valueHeads} * shape.headDimension;
-  if (prepare && (buffers.linearScratch.input.sizeBytes() < outputWidth * 16 * lanes ||
-                  buffers.linearScratch.sums.sizeBytes() < outputWidth / 2 * lanes))
+  const bool prepare = input != LinearInput::Plain && buffers.linearScratch.input;
+  const uint32_t outputWidth = shape.valueHeads * shape.headDimension;
+  const uint32_t rows = lanes * SPLASH_TARGET_VERIFY_ROWS;
+  if (prepare && (buffers.linearScratch.input.sizeBytes() < tableBytes(outputWidth, rows) ||
+                  buffers.linearScratch.sums.sizeBytes() < tableSumsBytes(input, outputWidth, rows)))
     throw std::invalid_argument("Q4 GDN preparation scratch is below requirement");
   bindings.reserve(prepare ? 22 : 20);
   appendLaneBindings(bindings, buffers.currentStates, buffers.nextStates);
@@ -97,11 +98,12 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
                                     state.convolutionLayerBytes,
                                     state.recurrentLayerBytes,
                                     state.convolutionStateBytes};
-  graph.add(prepare ? kernelName(kernel, "verify_gdn_fused_q4", "verify_gdn_fused_q4_vh32")
-                    : kernelName(kernel, "verify_gdn_fused", "verify_gdn_fused_vh32"),
-            std::move(bindings), params, {shape.valueHeads, lanes, 1});
+  const std::string name = !prepare ? kernelName(kernel, "verify_gdn_fused", "verify_gdn_fused_vh32")
+      : input == LinearInput::Table16 ? kernelName(kernel, "verify_gdn_fused_q16", "verify_gdn_fused_q16_vh32")
+                                      : kernelName(kernel, "verify_gdn_fused_q4", "verify_gdn_fused_q4_vh32");
+  graph.add(name, std::move(bindings), params, {shape.valueHeads, lanes, 1});
   if (!prepare) return {};
-  return {buffers.hidden, LinearInput::Table64};
+  return {buffers.hidden, input};
 }
 
 void GDN::addCommit(metal::CommandGraph &graph, GdnCommitBuffers buffers,

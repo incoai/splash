@@ -42,7 +42,8 @@ std::optional<LinearSimdgroups> fixedSimdgroups(LinearTile tile) noexcept {
   case LinearTile::N128:
   case LinearTile::N256:
   case LinearTile::Paired128:
-  case LinearTile::GgufStaged: return std::nullopt;
+  case LinearTile::GgufStaged:
+  case LinearTile::GgufSimdgroup: return std::nullopt;
   }
   return std::nullopt;
 }
@@ -128,7 +129,8 @@ uint32_t LinearPlan::tileColumns() const noexcept {
   case LinearTile::Simdgroup: return workload_.epilogue == LinearEpilogue::GateUp ? 32 : 64;
   case LinearTile::Split32: return 32;
   case LinearTile::Split64:
-  case LinearTile::GgufStaged: return 64;
+  case LinearTile::GgufStaged:
+  case LinearTile::GgufSimdgroup: return 64;
   case LinearTile::N256:
   case LinearTile::Paired256: return 256;
   case LinearTile::N128:
@@ -140,11 +142,14 @@ uint32_t LinearPlan::threadsPerThreadgroup() const noexcept {
   return static_cast<uint32_t>(config_.simdgroups) * 32;
 }
 uint32_t LinearPlan::partialSums() const noexcept {
-  if (usesSimdgroup() || config_.tile == LinearTile::GgufStaged) return config_.splits;
+  if (usesSimdgroup() || config_.tile == LinearTile::GgufStaged ||
+      config_.tile == LinearTile::GgufSimdgroup)
+    return config_.splits;
   return splitTile(config_.tile) ? kSplitPartitions : 1;
 }
 bool LinearPlan::usesSimdgroup() const noexcept { return config_.tile == LinearTile::Simdgroup; }
 LinearInput LinearPlan::input() const noexcept {
+  if (config_.tile == LinearTile::GgufSimdgroup) return LinearInput::Table16;
   return usesSimdgroup() ? LinearInput::Table64 : LinearInput::Plain;
 }
 LinearScratchSize LinearPlan::scratchSize() const noexcept {
@@ -156,6 +161,15 @@ LinearScratchSize LinearPlan::scratchSize() const noexcept {
         ? LinearScratchSize{0, 0, uint64_t{config_.splits} * workload_.rows * n * sizeof(float),
                             uint64_t{n / tileColumns()} * sizeof(uint32_t)}
         : LinearScratchSize{};
+  // GGUF register tile: the Table16 table and sums (3 K / 4 fp32 per eight
+  // rows), [lane][split][row][column] partials and one counter per 64-column
+  // tile, which covers every lane. Every binding exists even without splits.
+  if (config_.tile == LinearTile::GgufSimdgroup) {
+    const uint64_t rows = workload_.rows;
+    return {rows * k * sizeof(uint16_t), rows / SPLASH_TARGET_VERIFY_ROWS * (k * 3 / 4) * sizeof(float),
+            config_.splits > 1 ? config_.splits * rows * n * sizeof(float) : sizeof(float),
+            config_.splits > 1 ? uint64_t{n / tileColumns()} * sizeof(uint32_t) : sizeof(uint32_t)};
+  }
   if (!usesSimdgroup()) return {};
   const uint64_t rows = workload_.rows;
   const uint64_t lanes = rows / SPLASH_TARGET_VERIFY_ROWS;
@@ -171,8 +185,10 @@ uint64_t LinearPlan::sumsBytes() const noexcept {
       ? uint64_t{storageRows()} * (workload_.matrix.inputSize / kQuantGroup) * 4 : 0;
 }
 uint64_t LinearPlan::gateScratchBytes() const noexcept {
+  // The GGUF register tile runs gate/up as a gate pass and an up-with-gate pass.
   const bool needed = workload_.epilogue == LinearEpilogue::UpWithGate ||
-      (workload_.epilogue == LinearEpilogue::GateUp && !secondPipeline_.empty());
+      (workload_.epilogue == LinearEpilogue::GateUp &&
+       (!secondPipeline_.empty() || config_.tile == LinearTile::GgufSimdgroup));
   return needed ? uint64_t{storageRows()} * workload_.matrix.outputSize * 2 : 0;
 }
 uint64_t LinearPlan::downSumsBytes() const noexcept {
@@ -183,9 +199,19 @@ uint64_t LinearPlan::downSumsBytes() const noexcept {
 LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config)
     : workload_(w), config_(config) {
   validate(w);
-  if (config.tile == LinearTile::GgufStaged || w.quant == QuantFamily::Gguf) {
-    if (config.tile != LinearTile::GgufStaged || w.quant != QuantFamily::Gguf)
+  const bool ggufTile = config.tile == LinearTile::GgufStaged || config.tile == LinearTile::GgufSimdgroup;
+  if (ggufTile || w.quant == QuantFamily::Gguf) {
+    if (!ggufTile || w.quant != QuantFamily::Gguf)
       throw std::invalid_argument("GGUF projections run the GGUF tiles");
+    if (config.tile == LinearTile::GgufSimdgroup) {
+      // Split boundaries fall on 256-input coefficient units.
+      if (w.phase != LinearPhase::Decode || config.groups != w.matrix.outputSize / tileColumns() ||
+          config.simdgroups != LinearSimdgroups::Four || !config.splits ||
+          config.splits > kMaximumSimdgroupSplits || (config.splits & (config.splits - 1)) ||
+          w.matrix.inputSize / 256 < config.splits)
+        throw std::invalid_argument("GGUF simdgroup decode requires the full column grid and a K unit per split");
+      return;
+    }
     if (w.phase == LinearPhase::Prefill) {
       if (config.groups || config.splits != 1 || config.simdgroups != LinearSimdgroups::Four)
         throw std::invalid_argument("invalid GGUF prefill configuration");
@@ -580,7 +606,8 @@ PreparedInput Q4Linear::add(metal::CommandGraph &graph, LinearBuffers b,
     Q4DispatchStats *stats) const {
   if (!p.gguf.empty()) {
     addGguf(graph, b, p, selected, gate, stats);
-    return b.prepared;
+    return selected.input() == LinearInput::Plain ? b.prepared
+                                                  : PreparedInput{b.input, selected.input()};
   }
   if (selected.workload().quant != QuantFamily::Affine)
     throw std::invalid_argument("affine projection requires an affine plan");

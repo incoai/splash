@@ -403,7 +403,8 @@ public:
         {geometry.draft.intermediateSize, geometry.draft.hiddenSize});
     const uint64_t target = geometry.target.denseIntermediateSize
         ? operators.gateUpWorkspace({geometry.target.denseIntermediateSize,
-                                     geometry.target.hiddenSize})
+                                     geometry.target.hiddenSize},
+                                    geometry.target.quant)
         : 0;
     return std::max(target, draft);
   }

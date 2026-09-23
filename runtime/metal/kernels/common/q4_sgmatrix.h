@@ -68,4 +68,15 @@ inline void write_input(device bfloat *table, device float *sums,
   const float sum = simd_sum(float(a) + float(b));
   if (lane == 0) sums[group * kRows + row] = sum;
 }
+
+// The affine table as a producer target (LinearInput::Table64): per 8-row
+// tile of width K, K * 8 bfloat and K / 8 sums. One simdgroup writes one
+// 64-element group of one row; the lane holds elements 2 lane, 2 lane + 1.
+struct Table64 {
+  static ulong sums_per_tile(uint width) { return width / 8; }
+  static void write(device bfloat *table, device float *sums, uint, uint group, uint row,
+                    uint lane, bfloat a, bfloat b) {
+    write_input(table, sums, group, row, lane, a, b);
+  }
+};
 } // namespace q4sg

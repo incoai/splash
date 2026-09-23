@@ -8,6 +8,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <dlfcn.h>
+#include <functional>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -83,6 +84,327 @@ static Seg makeSegK(Fmt f, uint32_t N, uint32_t K, uint32_t colOffset) {   // no
   std::vector<uint8_t> native = makeNative(f, N, K); Packed pk = repack(f, native, N, K, nullptr);
   s.w0 = upload(pk.w0); s.w1 = upload(pk.w1); s.meta = upload(pk.meta); if (!kQuantFormats[f].plane1_bytes) s.w1 = s.meta; return s;
 }
+// Round to nearest even, as the GPU converts to bf16.
+static uint16_t bf16Rne(float f) { uint32_t u; memcpy(&u, &f, 4); return (uint16_t)((u + 0x7FFF + ((u >> 16) & 1)) >> 16); }
+// Apple9 register kernels (decode/linear_gguf_sgmatrix.metal): decode_linear_gguf_prepare writes the Table16 table
+// of L eight-row lanes, then the segment kernel writes columns [N, 2N) of a 2N-wide destination. Every format,
+// L = 1..4, splits 1..8 and every epilogue, at input scale 1 and with sparse inputs of 1e5. The kernels are exact up
+// to fp32 accumulation: an output must be the bf16 rounding of a value within 2^-16 sum|x| max|w| of the fp64 result
+// over GGML's fp32 weights, and at most 1% of the outputs may differ from the rounded fp64 result (staging the
+// weights in half changes 7-11%). Lane r of an L-lane dispatch equals the one-lane dispatch on its rows bitwise,
+// under partials poisoned with NaN or a large finite value; the other destination rows and columns stay untouched
+// and every counter returns to zero.
+static int registerKernels(id<MTLLibrary> lib) {
+  constexpr uint32_t N = 512, K = 2048, kMaxLanes = 4, kRows = 8 * kMaxLanes, stride = 2 * N, kSentinel = 0xFFFF;
+  int failures = 0;
+  id<MTLComputePipelineState> prepare = pso(lib, "decode_linear_gguf_prepare");
+  if (!prepare) return 1;
+  id<MTLBuffer> table = mkbuf(uint64_t(kRows) * K * 2), sums = mkbuf(uint64_t(kMaxLanes) * (K * 3 / 4) * 4);
+  id<MTLBuffer> partials = mkbuf(uint64_t(8) * kRows * stride * 4), counters = mkbuf(stride / 64 * 4);
+  memset(counters.contents, 0, counters.length);
+  for (const float scale : {1.f, 1e5f})
+    for (int fi = 0; fi < FMT_COUNT; ++fi) {
+      const Seg s = makeSeg(Fmt(fi), N, K, 0);
+      // Dense activations in [-1, 1], or one +-scale entry per 256 inputs.
+      std::uniform_real_distribution<float> random(-1.f, 1.f);
+      std::vector<uint16_t> x(size_t(kRows) * K, 0), aux(size_t(kRows) * stride);
+      for (uint32_t r = 0; r < kRows; ++r)
+        for (uint32_t k = 0; k < K; ++k)
+          if (scale == 1.f) x[size_t(r) * K + k] = f2bf(random(rng));
+          else if (k % 256 == (r * 31 + k / 256 * 97) % 256) x[size_t(r) * K + k] = f2bf((r + k / 256) % 2 ? -scale : scale);
+      for (uint16_t &v : aux) v = f2bf(random(rng));
+      std::vector<double> dot(size_t(kRows) * N), bound(size_t(kRows) * N);
+      for (uint32_t n = 0; n < N; ++n) {
+        const float *w = s.Wf.data() + size_t(n) * K;
+        double wmax = 0;
+        for (uint32_t k = 0; k < K; ++k) wmax = std::max(wmax, double(std::fabs(w[k])));
+        for (uint32_t r = 0; r < kRows; ++r) {
+          double acc = 0, mag = 0;
+          for (uint32_t k = 0; k < K; ++k) { const double v = bf2f(x[size_t(r) * K + k]); acc += v * w[k]; mag += std::fabs(v); }
+          dot[size_t(r) * N + n] = acc;
+          bound[size_t(r) * N + n] = std::ldexp(mag * wmax, -16);
+        }
+      }
+      const auto rowsOf = [&](const std::vector<uint16_t> &v, uint32_t width, uint32_t first, uint32_t rows) {
+        id<MTLBuffer> b = mkbuf(uint64_t(rows) * width * 2); memcpy(b.contents, v.data() + size_t(first) * width, b.length); return b; };
+      id<MTLBuffer> X = rowsOf(x, K, 0, kRows), A = rowsOf(aux, stride, 0, kRows), Y = mkbuf(uint64_t(kRows) * stride * 2);
+      id<MTLBuffer> Yfused = mkbuf(Y.length);
+      id<MTLBuffer> laneX[kMaxLanes], laneA[kMaxLanes], laneY[kMaxLanes];
+      for (uint32_t r = 0; r < kMaxLanes; ++r) { laneX[r] = rowsOf(x, K, 8 * r, 8); laneA[r] = rowsOf(aux, stride, 8 * r, 8); laneY[r] = mkbuf(uint64_t(8) * stride * 2); }
+      int formatFailures = 0; double worstFlips = 0;
+      for (const char ep : {'a', 'r', 'g'})
+        for (const uint32_t splits : {1u, 2u, 4u, 8u}) {
+          char where[96];
+          const auto run = [&](uint32_t lanes, id<MTLBuffer> in, id<MTLBuffer> gate, id<MTLBuffer> out, uint32_t poison) {
+            char name[64]; snprintf(name, sizeof name, "decode_linear_gguf_sg_%s_l%u_%c", fmtName(fi), lanes, ep);
+            id<MTLComputePipelineState> ps = pso(lib, name);
+            if (!ps) { ++formatFailures; return; }
+            std::fill_n((uint32_t *)partials.contents, partials.length / 4, poison);
+            std::fill_n((uint16_t *)out.contents, out.length / 2, uint16_t(kSentinel));
+            const Dispatch table16{prepare, {in, table, sums}, bytes(K), 3, MTLSizeMake(K / 32, lanes, 1), MTLSizeMake(128, 1, 1)};
+            const Dispatch segment{ps, {table, sums, s.w0, s.w1, s.meta, out, partials, counters, gate},
+                                   bytes(GgufSgParams{K, splits, stride, N}), 9, MTLSizeMake(N / 64, splits, 1), MTLSizeMake(128, 1, 1)};
+            runOnce({table16, segment}, 1);
+            uint32_t *cnt = (uint32_t *)counters.contents; uint32_t live = 0;
+            for (uint32_t t = 0; t < stride / 64; ++t) live += cnt[t] != 0;
+            if (live) { printf("  %s L=%u: %u counters not reset FAIL\n", where, lanes, live); ++formatFailures; memset(cnt, 0, counters.length); }
+            const uint16_t *y = (const uint16_t *)out.contents; size_t touched = 0;
+            for (size_t i = 0; i < out.length / 2; ++i) touched += (i / stride >= 8 * lanes || i % stride < N) && y[i] != kSentinel;
+            if (touched) { printf("  %s L=%u: %zu writes outside the segment's rows and columns FAIL\n", where, lanes, touched); ++formatFailures; }
+          };
+          snprintf(where, sizeof where, "%s scale %.0e %c S=%u", fmtName(fi), scale, ep, splits);
+          for (uint32_t r = 0; r < kMaxLanes; ++r) run(1, laneX[r], laneA[r], laneY[r], 0x7FC00000u);
+          for (uint32_t lanes = 1; lanes <= kMaxLanes; ++lanes) {
+            run(lanes, X, A, Y, 0x7E800000u);
+            for (uint32_t r = 0; r < lanes; ++r)
+              if (memcmp((const uint16_t *)Y.contents + size_t(8 * r) * stride, laneY[r].contents, laneY[r].length)) {
+                printf("  %s L=%u: lane %u differs from its one-lane dispatch FAIL\n", where, lanes, r); ++formatFailures; }
+            if (ep != 'a') continue;
+            // The fused kernel on the same table with one segment: the same bits.
+            id<MTLComputePipelineState> fused = pso(lib, "decode_linear_gguf_sg_fused_l" + std::to_string(lanes));
+            if (!fused) { ++formatFailures; continue; }
+            std::fill_n((uint32_t *)partials.contents, partials.length / 4, 0x7FC00000u);
+            std::fill_n((uint16_t *)Yfused.contents, Yfused.length / 2, uint16_t(kSentinel));
+            const GgufSgFusedParams fp{K, splits, stride, {N, 0, 0}, {uint32_t(fi), 0, 0}, {N, 0, 0}};
+            runOnce({Dispatch{fused, {table, sums, s.w0, s.w1, s.meta, s.w0, s.w1, s.meta, s.w0, s.w1, s.meta, Yfused, partials, counters},
+                              bytes(fp), 14, MTLSizeMake(N / 64, splits, 1), MTLSizeMake(128, 1, 1)}}, 1);
+            if (memcmp(Y.contents, Yfused.contents, Y.length)) { printf("  %s L=%u: fused kernel differs FAIL\n", where, lanes); ++formatFailures; }
+          }
+          // fp64 over all four lanes: the interval of bf16 values within the bound, and the flip count.
+          const uint16_t *y = (const uint16_t *)Y.contents; size_t flips = 0, outside = 0;
+          for (uint32_t r = 0; r < kRows; ++r)
+            for (uint32_t n = 0; n < N; ++n) {
+              const size_t i = size_t(r) * N + n, at = size_t(r) * stride + N + n;
+              const double d = dot[i], e = bound[i], a = bf2f(aux[at]), got = bf2f(y[at]);
+              double lo = d - e, hi = d + e, exact = d;
+              if (ep == 'r') { exact = d + a; lo = exact - e - std::ldexp(std::fabs(exact), -22); hi = exact + e + std::ldexp(std::fabs(exact), -22); }
+              if (ep == 'g') {
+                const double sg = a / (1.0 + std::exp(-a)), u0 = bf2f(bf16Rne(float(lo))), u1 = bf2f(bf16Rne(float(hi)));
+                const double p0 = u0 * sg, p1 = u1 * sg, slack = std::ldexp(std::max(std::fabs(p0), std::fabs(p1)), -18);
+                lo = std::min(p0, p1) - slack; hi = std::max(p0, p1) + slack; exact = bf2f(bf16Rne(float(d))) * sg;
+              }
+              if (!(got >= bf2f(bf16Rne(float(lo))) && got <= bf2f(bf16Rne(float(hi))))) {
+                if (outside++ < 3) printf("  %s row %u col %u: %.9g outside [%.9g, %.9g] (fp64 %.9g)\n", where, r, n, got, lo, hi, exact); }
+              flips += y[at] != bf16Rne(float(exact));
+            }
+          worstFlips = std::max(worstFlips, double(flips) / (kRows * N));
+          if (outside || flips * 100 > size_t(kRows) * N) {
+            printf("  %s: %zu outputs outside the bound, %zu of %u differ from bf16(fp64) FAIL\n", where, outside, flips, kRows * N); ++formatFailures; }
+        }
+      printf("%-6s register scale %.0e: L 1-4, S 1-8, a/r/g: at most %.2f%% of outputs differ from bf16(fp64) %s\n",
+             fmtName(fi), scale, 100 * worstFlips, formatFailures ? "FAIL" : "ok");
+      failures += formatFailures;
+    }
+  // One fused dispatch over three segments of different formats writes the bits of the three single-tensor
+  // dispatches: columns [0, 512) in format f, [512, 768) in f + 3 and [768, 1024) in f + 5.
+  for (int fi = 0; fi < FMT_COUNT; ++fi) {
+    const Fmt formats[3] = {Fmt(fi), Fmt((fi + 3) % FMT_COUNT), Fmt((fi + 5) % FMT_COUNT)};
+    const uint32_t cols[3] = {512, 256, 256}, offsets[3] = {0, 512, 768};
+    Seg segs[3];
+    for (int i = 0; i < 3; ++i) segs[i] = makeSegK(formats[i], cols[i], K, offsets[i]);
+    id<MTLBuffer> X = mkbuf(uint64_t(kRows) * K * 2), Y = mkbuf(uint64_t(kRows) * stride * 2), Yf = mkbuf(Y.length);
+    { std::uniform_real_distribution<float> d(-1.f, 1.f); uint16_t *xx = (uint16_t *)X.contents; for (uint64_t i = 0; i < uint64_t(kRows) * K; ++i) xx[i] = f2bf(d(rng)); }
+    int fusedFailures = 0;
+    for (uint32_t lanes = 1; lanes <= kMaxLanes; ++lanes)
+      for (const uint32_t splits : {1u, 4u, 8u}) {
+        id<MTLComputePipelineState> fused = pso(lib, "decode_linear_gguf_sg_fused_l" + std::to_string(lanes));
+        if (!fused) { ++fusedFailures; continue; }
+        const Dispatch table16{prepare, {X, table, sums}, bytes(K), 3, MTLSizeMake(K / 32, lanes, 1), MTLSizeMake(128, 1, 1)};
+        std::vector<Dispatch> apart{table16};
+        for (int i = 0; i < 3; ++i) {
+          char name[64]; snprintf(name, sizeof name, "decode_linear_gguf_sg_%s_l%u_a", fmtName(formats[i]), lanes);
+          id<MTLComputePipelineState> tensor = pso(lib, name);
+          if (!tensor) { ++fusedFailures; break; }
+          apart.push_back({tensor, {table, sums, segs[i].w0, segs[i].w1, segs[i].meta, Y, partials, counters, Y},
+                           bytes(GgufSgParams{K, splits, stride, offsets[i]}), 9, MTLSizeMake(cols[i] / 64, splits, 1), MTLSizeMake(128, 1, 1)});
+        }
+        if (apart.size() != 4) continue;
+        const GgufSgFusedParams all{K, splits, stride, {cols[0], cols[1], cols[2]},
+                                    {uint32_t(formats[0]), uint32_t(formats[1]), uint32_t(formats[2])}, {offsets[0], offsets[1], offsets[2]}};
+        const Dispatch one{fused, {table, sums, segs[0].w0, segs[0].w1, segs[0].meta, segs[1].w0, segs[1].w1, segs[1].meta,
+                                   segs[2].w0, segs[2].w1, segs[2].meta, Yf, partials, counters}, bytes(all), 14,
+                           MTLSizeMake(stride / 64, splits, 1), MTLSizeMake(128, 1, 1)};
+        std::fill_n((uint16_t *)Y.contents, Y.length / 2, uint16_t(kSentinel));
+        std::fill_n((uint16_t *)Yf.contents, Yf.length / 2, uint16_t(kSentinel));
+        std::fill_n((uint32_t *)partials.contents, partials.length / 4, 0x7FC00000u);
+        runOnce(apart, 1);
+        runOnce({table16, one}, 1);
+        uint32_t live = 0;
+        for (uint32_t t = 0; t < stride / 64; ++t) live += ((uint32_t *)counters.contents)[t] != 0;
+        if (live || memcmp(Y.contents, Yf.contents, Y.length)) {
+          printf("  fused [%s|%s|%s] L=%u S=%u: differs from the single-tensor dispatches or leaves %u counters FAIL\n",
+                 fmtName(formats[0]), fmtName(formats[1]), fmtName(formats[2]), lanes, splits, live);
+          ++fusedFailures; memset(counters.contents, 0, counters.length);
+        }
+      }
+    printf("register fused [%s|%s|%s]: L 1-4, S 1/4/8 equal to one dispatch per tensor %s\n",
+           fmtName(formats[0]), fmtName(formats[1]), fmtName(formats[2]), fusedFailures ? "FAIL" : "ok");
+    failures += fusedFailures;
+  }
+  return failures;
+}
+// time-sg <rounds> <per> <fmt[+fmt..]> <N[+N..]> <K> <a|r|g> [S+S..]: the Apple9 register kernels against the
+// staged kernels on one projection of up to three column segments, L = 1..4 lanes and every valid K split, with the
+// weights DRAM-cold (a ring of copies of at least 384 MiB) and the cases in ABBA order; prints medians. The register
+// path runs one dispatch per segment, at one split count for all or at the per-segment list, and the fused kernel over
+// all segments; the staged path runs plain tiles and split-K (one segment) or its fused kernel. g is gate/up: the staged
+// fused kernel
+// against the register gate pass plus up pass, each streaming its own weights. The prepare dispatch is timed alone.
+static int timeRegister(id<MTLLibrary> lib, int argc, char **argv) {
+  if (argc < 9) { std::cerr << "usage: harness_prod <metallib> time-sg <rounds> <per> <fmt[+fmt]> <N[+N]> <K> <a|r|g> [S+S]\n"; return 2; }
+  const auto list = [](const std::string &text) { std::vector<std::string> out; size_t at = 0;
+    for (size_t plus; (plus = text.find('+', at)) != std::string::npos; at = plus + 1) out.push_back(text.substr(at, plus - at));
+    out.push_back(text.substr(at)); return out; };
+  const uint32_t rounds = std::stoul(argv[3]), per = std::stoul(argv[4]), K = std::stoul(argv[7]);
+  const char ep = argv[8][0];
+  struct Segment { int fmt; uint32_t N, offset, splits; Seg image; std::vector<Seg> ring; };
+  std::vector<Segment> segs;
+  const auto formats = list(argv[5]), widths = list(argv[6]), splitList = argc > 9 ? list(argv[9]) : std::vector<std::string>{};
+  uint32_t N = 0;
+  for (size_t i = 0; i < widths.size(); ++i) {
+    Segment g{-1, uint32_t(std::stoul(widths[i])), N, splitList.size() == widths.size() ? uint32_t(std::stoul(splitList[i])) : 0u, {}, {}};
+    for (int f = 0; f < FMT_COUNT; ++f) if (formats[std::min(i, formats.size() - 1)] == fmtName(f)) g.fmt = f;
+    if (g.fmt < 0 || !g.N || g.N % 256) { std::cerr << "bad segment\n"; return 2; }
+    N += g.N; segs.push_back(std::move(g));
+  }
+  if (!K || K % 256 || !strchr("arg", ep) || segs.size() > 3 || (segs.size() > 1 && ep != 'a')) { std::cerr << "bad case\n"; return 2; }
+  constexpr uint32_t kMaxLanes = 4, kRows = 8 * kMaxLanes;
+  uint64_t imageBytes = 0;
+  for (Segment &g : segs) { g.image = makeSegK(Fmt(g.fmt), g.N, K, g.offset); imageBytes += streamBytes(Fmt(g.fmt), g.N, K); }
+  const uint32_t copies = (uint32_t)std::min<uint64_t>(64, std::max<uint64_t>(3, ((384ull << 20) + imageBytes - 1) / imageBytes));
+  const auto clone = [](id<MTLBuffer> b) { id<MTLBuffer> c = mkbuf(b.length); memcpy(c.contents, b.contents, b.length); return c; };
+  for (Segment &g : segs)
+    for (uint32_t i = 0; i < copies; ++i) {
+      Seg c = g.image; c.w0 = clone(g.image.w0); c.meta = clone(g.image.meta);
+      c.w1 = kQuantFormats[g.fmt].plane1_bytes ? clone(g.image.w1) : c.meta;
+      g.ring.push_back(c);
+    }
+  id<MTLBuffer> X = mkbuf(uint64_t(kRows) * K * 2), table = mkbuf(uint64_t(kRows) * K * 2), sums = mkbuf(uint64_t(kMaxLanes) * (K * 3 / 4) * 4);
+  id<MTLBuffer> Y = mkbuf(uint64_t(kRows) * N * 2), A = mkbuf(uint64_t(kRows) * N * 2), G = mkbuf(uint64_t(kRows) * N * 2);
+  id<MTLBuffer> partials = mkbuf(uint64_t(8) * kRows * N * 4), counters = mkbuf(N / 64 * 4);
+  memset(counters.contents, 0, counters.length);
+  { std::uniform_real_distribution<float> d(-1.f, 1.f); uint16_t *x = (uint16_t *)X.contents, *a = (uint16_t *)A.contents;
+    for (uint64_t i = 0; i < uint64_t(kRows) * K; ++i) x[i] = f2bf(d(rng));
+    for (uint64_t i = 0; i < uint64_t(kRows) * N; ++i) a[i] = f2bf(d(rng)); }
+  const auto encode = [](id<MTLComputeCommandEncoder> enc, id<MTLComputePipelineState> p, std::initializer_list<id<MTLBuffer>> bufs,
+                         const std::vector<uint8_t> &params, MTLSize grid, MTLSize tg) {
+    [enc setComputePipelineState:p]; NSUInteger i = 0;
+    for (id<MTLBuffer> b : bufs) [enc setBuffer:b offset:0 atIndex:i++];
+    [enc setBytes:params.data() length:params.size() atIndex:i];
+    [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+  };
+  id<MTLComputePipelineState> prepare = pso(lib, "decode_linear_gguf_prepare");
+  if (!prepare) return 1;
+  // A case encodes one projection with weight copy c of every segment (gate/up: the up weights are copy c + 1).
+  struct Case { std::string label; uint32_t lanes, weights; std::function<void(id<MTLComputeCommandEncoder>, uint32_t)> run; std::vector<double> t; };
+  std::vector<Case> cases;
+  const uint32_t epilogue = ep == 'r' ? GGUF_EPILOGUE_RESIDUAL : GGUF_EPILOGUE_NONE;
+  const Segment &one = segs.front();
+  for (uint32_t lanes = 1; lanes <= kMaxLanes; ++lanes) {
+    const uint32_t rows = 8 * lanes;
+    cases.push_back({"prepare", lanes, 0, [=](id<MTLComputeCommandEncoder> enc, uint32_t) {
+      encode(enc, prepare, {X, table, sums}, bytes(K), MTLSizeMake(K / 32, lanes, 1), MTLSizeMake(128, 1, 1)); }, {}});
+    if (segs.size() > 1) {
+      id<MTLComputePipelineState> p = pso(lib, "gguf_fused_m" + std::to_string(rows));
+      if (!p) return 1;
+      GgufFusedParams fp{K, N, uint32_t(segs.size()), 0, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}};
+      for (size_t i = 0; i < segs.size(); ++i) { fp.cols[i] = segs[i].N; fp.fmt[i] = segs[i].fmt; fp.offset[i] = segs[i].offset; }
+      const auto params = bytes(fp);
+      cases.push_back({"staged fused", lanes, 1, [&, p, params](id<MTLComputeCommandEncoder> enc, uint32_t c) {
+        const Seg &a = segs[0].ring[c], &b = segs[std::min<size_t>(1, segs.size() - 1)].ring[c], &d = segs.back().ring[c];
+        encode(enc, p, {X, a.w0, a.w1, a.meta, b.w0, b.w1, b.meta, d.w0, d.w1, d.meta, Y}, params, MTLSizeMake(N / 64, 1, 1), MTLSizeMake(64, 1, 1)); }, {}});
+    } else if (ep == 'g') {
+      id<MTLComputePipelineState> p = pso(lib, "gguf_gateup_m" + std::to_string(rows));
+      if (!p) return 1;
+      const auto params = bytes(GgufGateUpParams{K, N, N, uint32_t(one.fmt), uint32_t(one.fmt)});
+      cases.push_back({"staged", lanes, 2, [&, p, params](id<MTLComputeCommandEncoder> enc, uint32_t c) {
+        const Seg &g = one.ring[c], &u = one.ring[(c + 1) % copies];
+        encode(enc, p, {X, g.w0, g.w1, g.meta, u.w0, u.w1, u.meta, Y}, params, MTLSizeMake(N / 64, 1, 1), MTLSizeMake(64, 1, 1)); }, {}});
+    } else {
+      for (const uint32_t splits : {1u, 2u, 4u, 8u}) {
+        if ((K / 32) % splits) continue;
+        char name[80];
+        if (splits == 1) snprintf(name, sizeof name, "%s_%s_m%u_c32_sg2_k32_b2_p1", ep == 'r' ? "sgr" : "sga", fmtName(one.fmt), rows);
+        else snprintf(name, sizeof name, "gguf_splitk_%s_m%u", fmtName(one.fmt), rows);
+        id<MTLComputePipelineState> p = pso(lib, name);
+        if (!p) return 1;
+        const auto params = splits == 1 ? bytes(GgufParams{N, K, N / 64, N, 0}) : bytes(GgufSplitParams{N, K, splits, N, 0, epilogue});
+        cases.push_back({"staged S" + std::to_string(splits), lanes, 1, [&, p, params, splits](id<MTLComputeCommandEncoder> enc, uint32_t c) {
+          const Seg &w = one.ring[c];
+          if (splits == 1 && ep == 'a') encode(enc, p, {X, w.w0, w.w1, w.meta, Y}, params, MTLSizeMake(N / 64, 1, 1), MTLSizeMake(64, 1, 1));
+          else if (splits == 1) encode(enc, p, {X, w.w0, w.w1, w.meta, Y, A}, params, MTLSizeMake(N / 64, 1, 1), MTLSizeMake(64, 1, 1));
+          else encode(enc, p, {X, w.w0, w.w1, w.meta, partials, counters, Y, A}, params, MTLSizeMake(N / 64, splits, 1), MTLSizeMake(64, 1, 1)); }, {}});
+      }
+    }
+    // register: one dispatch per segment, splits on 256-input units; gate/up is a gate pass and an up pass
+    std::vector<uint32_t> variants{1u, 2u, 4u, 8u};
+    if (segs.front().splits) variants.push_back(0);   // the per-segment list
+    for (const uint32_t uniform : variants) {
+      bool valid = true;
+      std::vector<std::pair<id<MTLComputePipelineState>, id<MTLComputePipelineState>>> kernels;
+      std::vector<std::vector<uint8_t>> params;
+      std::string label = "register S";
+      for (const Segment &g : segs) {
+        const uint32_t splits = uniform ? uniform : g.splits;
+        valid &= K / 256 >= splits;
+        label += (label.back() == 'S' ? "" : "+") + std::to_string(splits);
+        char name[80];
+        snprintf(name, sizeof name, "decode_linear_gguf_sg_%s_l%u_%c", fmtName(g.fmt), lanes, ep);
+        kernels.push_back({pso(lib, name), pso(lib, std::string(name).replace(strlen(name) - 1, 1, "a"))});
+        if (!kernels.back().first || !kernels.back().second) return 1;
+        params.push_back(bytes(GgufSgParams{K, splits, N, g.offset}));
+      }
+      if (!valid) continue;
+      cases.push_back({label, lanes, ep == 'g' ? 2u : 1u, [&, kernels, params, uniform](id<MTLComputeCommandEncoder> enc, uint32_t c) {
+        for (size_t i = 0; i < segs.size(); ++i) {
+          const Segment &g = segs[i];
+          const uint32_t splits = uniform ? uniform : g.splits;
+          const MTLSize grid = MTLSizeMake(g.N / 64, splits, 1);
+          const Seg &w = g.ring[c], &u = g.ring[(c + 1) % copies];
+          if (ep == 'g') {
+            encode(enc, kernels[i].second, {table, sums, w.w0, w.w1, w.meta, G, partials, counters, G}, params[i], grid, MTLSizeMake(128, 1, 1));
+            encode(enc, kernels[i].first, {table, sums, u.w0, u.w1, u.meta, Y, partials, counters, G}, params[i], grid, MTLSizeMake(128, 1, 1));
+          } else {
+            encode(enc, kernels[i].first, {table, sums, w.w0, w.w1, w.meta, Y, partials, counters, A}, params[i], grid, MTLSizeMake(128, 1, 1));
+          }
+        } }, {}});
+    }
+    // the fused kernel: every segment in one dispatch
+    for (const uint32_t splits : {1u, 2u, 4u, 8u}) {
+      if (K / 256 < splits || ep != 'a') continue;
+      id<MTLComputePipelineState> p = pso(lib, "decode_linear_gguf_sg_fused_l" + std::to_string(lanes));
+      if (!p) return 1;
+      GgufSgFusedParams fp{K, splits, N, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}};
+      for (size_t i = 0; i < segs.size(); ++i) { fp.cols[i] = segs[i].N; fp.fmt[i] = segs[i].fmt; fp.offset[i] = segs[i].offset; }
+      const auto params = bytes(fp);
+      cases.push_back({"fused S" + std::to_string(splits), lanes, 1, [&, p, params, splits](id<MTLComputeCommandEncoder> enc, uint32_t c) {
+        const Seg &a = segs[0].ring[c], &b = segs[std::min<size_t>(1, segs.size() - 1)].ring[c], &d = segs.back().ring[c];
+        encode(enc, p, {table, sums, a.w0, a.w1, a.meta, b.w0, b.w1, b.meta, d.w0, d.w1, d.meta, Y, partials, counters}, params,
+               MTLSizeMake(N / 64, splits, 1), MTLSizeMake(128, 1, 1)); }, {}});
+    }
+  }
+  // Every register case reads the four-lane table.
+  runOnce({Dispatch{prepare, {X, table, sums}, bytes(K), 3, MTLSizeMake(K / 32, kMaxLanes, 1), MTLSizeMake(128, 1, 1)}}, 1);
+  uint32_t next = 0;
+  const auto time = [&](Case &c) {
+    id<MTLCommandBuffer> cb = [queue commandBuffer]; id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    for (uint32_t i = 0; i < per; ++i) { c.run(enc, next % copies); next += c.weights; }
+    [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
+    if (cb.error) { std::cerr << "GPU error: " << cb.error.localizedDescription.UTF8String << "\n"; exit(1); }
+    return (cb.GPUEndTime - cb.GPUStartTime) / per;
+  };
+  for (Case &c : cases) { double spent = 0; while (spent < 0.1) spent += time(c) * per; }
+  for (uint32_t r = 0; r < rounds; ++r)
+    for (size_t i = 0; i < cases.size(); ++i) { Case &c = cases[(r & 1) ? cases.size() - 1 - i : i]; c.t.push_back(time(c) * 1e3); }
+  for (uint32_t t = 0; t < N / 64; ++t) if (((const uint32_t *)counters.contents)[t]) { std::cerr << "counters not reset\n"; return 1; }
+  printf("%s %sx%u %c, %u weight copies of %.1f MB, median ms of %u rounds x %u:\n", argv[5], argv[6], K, ep, copies, imageBytes / 1e6, rounds, per);
+  for (uint32_t lanes = 1; lanes <= kMaxLanes; ++lanes) {
+    printf("  L%u", lanes);
+    for (Case &c : cases) if (c.lanes == lanes) { std::sort(c.t.begin(), c.t.end()); printf(" | %s %.4f", c.label.c_str(), c.t[c.t.size() / 2]); }
+    printf("\n");
+  }
+  return 0;
+}
 int main(int argc, char **argv) { @autoreleasepool {
   if (argc < 2) { std::cerr << "usage: harness_prod <metallib> [full|dequant|time-gu] [input-scale] [seed]\n"; return 2; }
   dev = MTLCreateSystemDefaultDevice(); queue = [dev newCommandQueue];
@@ -113,6 +435,7 @@ int main(int argc, char **argv) { @autoreleasepool {
     failures += oracleFailures;
     return failures ? 1 : 0;
   }
+  if (argc > 2 && std::string(argv[2]) == "time-sg") return timeRegister(lib, argc, argv);
   const bool full = argc > 2 && std::string(argv[2]) == "full";
   const float inputScale = argc > 3 ? std::stof(argv[3]) : 1.f;
   if (argc > 4) rng.seed(std::stoul(argv[4]));
@@ -259,6 +582,8 @@ int main(int argc, char **argv) { @autoreleasepool {
           if (first.size() < 2) first.push_back(out);
           else if (out != first[j]) { printf("  %s %ux%u S=%u: output depends on the poison or the run FAIL\n", fmtName(pair[j].fmt), pair[j].N, pair[j].K, pair[j].splits); ++failures; } } }
       for (size_t j = 0; j < 2; ++j) { char label[96]; snprintf(label, sizeof label, "shared split %s %ux%u S=%u", fmtName(pair[j].fmt), pair[j].N, pair[j].K, pair[j].splits); compare(label, ops[j].Y, ops[j].ref, rows, pair[j].N); } } }
+  // 6) Apple9 register kernels
+  failures += registerKernels(lib);
   failures += oracleFailures;
   printf("%s (%d failures)\n", failures ? "VALIDATION FAILED" : "all production kernels validated", failures);
   if (argc > 2 && std::string(argv[2]) == "time-gu") {

@@ -288,25 +288,33 @@ void splitVisibility(metal::MetalBackend &backend,
   }
   for (auto *guard : {&table, &sums, &partials, &counters}) guard->check();
 }
-void fusedNorm(metal::MetalBackend &backend, uint32_t k, uint32_t rows) {
+// The kernel that prepares a plain bf16 input in `layout`, the reference for
+// the producers that write the table themselves.
+const char *prepareKernel(LinearInput layout) {
+  return layout == LinearInput::Table16 ? "decode_linear_gguf_prepare" : "decode_linear_q4_prepare";
+}
+void fusedNorm(metal::MetalBackend &backend, uint32_t k, uint32_t rows, LinearInput layout) {
+  const uint64_t sumsBytes = tableSumsBytes(layout, k, rows);
   auto input=backend.allocateBuffer(k*rows*2), weight=backend.allocateBuffer(k*2);
   auto output=backend.allocateBuffer(k*rows*2), fused=backend.allocateBuffer(k*rows*2);
-  auto a=backend.allocateBuffer(k*rows*2), b=backend.allocateBuffer(k*rows*2);
-  auto sa=backend.allocateBuffer(k*rows/16), sb=backend.allocateBuffer(k*rows/16);
+  auto a=backend.allocateBuffer(tableBytes(k,rows)), b=backend.allocateBuffer(tableBytes(k,rows));
+  auto sa=backend.allocateBuffer(sumsBytes), sb=backend.allocateBuffer(sumsBytes);
   auto *x=static_cast<uint16_t *>(input.contents()), *w=static_cast<uint16_t *>(weight.contents());
   for (uint32_t i=0;i<k*rows;++i) x[i]=floatToBf16(float(int(hash(i)%257)-128)*8192);
   for (uint32_t i=0;i<k;++i) w[i]=floatToBf16(float(int(i%17)-8)/4);
   metal::CommandGraph graph;
   Normalization::addRms(graph,input,weight,output,k,rows);
-  graph.add("decode_linear_q4_prepare",{output,a,sa},k,{k/32,rows/8,1},{128,1,1});
-  Normalization::addRms(graph,input,weight,fused,k,rows,{b,sb,{},{}},splash::ops::LinearInput::Table64);
+  graph.add(prepareKernel(layout),{output,a,sa},k,{k/32,rows/8,1},{128,1,1});
+  Normalization::addRms(graph,input,weight,fused,k,rows,{b,sb,{},{}},layout);
   (void)backend.submitCommand(graph.dispatches());
   require(!std::memcmp(output.contents(),fused.contents(),k*rows*2),"fused norm changed bf16 output");
-  require(!std::memcmp(a.contents(),b.contents(),k*rows*2),"fused operand permutation mismatch");
-  require(!std::memcmp(sa.contents(),sb.contents(),k*rows/16),"fused input sums mismatch");
+  require(!std::memcmp(a.contents(),b.contents(),tableBytes(k,rows)),"fused operand permutation mismatch");
+  require(!std::memcmp(sa.contents(),sb.contents(),sumsBytes),"fused input sums mismatch");
 }
-void fusedAttentionGate(metal::MetalBackend &backend, uint32_t heads, uint32_t kvHeads, uint32_t lanes) {
-  const uint32_t width = heads * 256, packedWidth = 2 * width + 2 * kvHeads * 256;
+void fusedAttentionGate(metal::MetalBackend &backend, uint32_t heads, uint32_t kvHeads, uint32_t lanes,
+                        LinearInput layout) {
+  const uint32_t width = heads * 256, packedWidth = 2 * width + 2 * kvHeads * 256, rows = lanes * 8;
+  const uint64_t sumsBytes = tableSumsBytes(layout, width, rows);
   auto packed = backend.allocateBuffer(uint64_t{packedWidth} * 16 * lanes);
   auto attention = backend.allocateBuffer(uint64_t{width} * 32 * 2 * lanes);
   for (auto buffer : {packed, attention}) {
@@ -315,22 +323,21 @@ void fusedAttentionGate(metal::MetalBackend &backend, uint32_t heads, uint32_t k
       data[i] = floatToBf16(float(int(hash(uint32_t(i)) % 257) - 128) / 16);
   }
   Guarded output(backend, width * 16 * lanes), fused(backend, width * 16 * lanes);
-  Guarded a(backend, width * 16 * lanes), b(backend, width * 16 * lanes);
-  Guarded sa(backend, width / 2 * lanes), sb(backend, width / 2 * lanes);
+  Guarded a(backend, tableBytes(width, rows)), b(backend, tableBytes(width, rows));
+  Guarded sa(backend, sumsBytes), sb(backend, sumsBytes);
   metal::CommandGraph graph;
   PagedAttention::addVerifyGate(graph, packed, attention, output.view, 8, 32, 32,
                                 heads, {1, kvHeads, 256}, lanes);
-  graph.add("decode_linear_q4_prepare", {output.view, a.view, sa.view}, width,
+  graph.add(prepareKernel(layout), {output.view, a.view, sa.view}, width,
             {width / 32, lanes, 1}, {128, 1, 1});
   PagedAttention::addVerifyGate(graph, packed, attention, fused.view, 8, 32, 32,
-                                heads, {1, kvHeads, 256}, lanes, {b.view, sb.view, {}, {}},
-                                splash::ops::LinearInput::Table64);
+                                heads, {1, kvHeads, 256}, lanes, {b.view, sb.view, {}, {}}, layout);
   (void)backend.submitCommand(graph.dispatches());
   require(!std::memcmp(output.view.contents(), fused.view.contents(), width * 16 * lanes),
           "fused attention gate output");
-  require(!std::memcmp(a.view.contents(), b.view.contents(), width * 16 * lanes),
+  require(!std::memcmp(a.view.contents(), b.view.contents(), tableBytes(width, rows)),
           "fused attention gate table");
-  require(!std::memcmp(sa.view.contents(), sb.view.contents(), width / 2 * lanes),
+  require(!std::memcmp(sa.view.contents(), sb.view.contents(), sumsBytes),
           "fused attention gate sums");
   for (auto *buffer : {&output, &fused, &a, &b, &sa, &sb}) buffer->check();
 }
@@ -341,10 +348,11 @@ int main(int argc,char **argv) {
   try {
     require(argc==2,"usage: q4-sgmatrix <production.metallib>");
     metal::MetalBackend backend(argv[1]);
-    for (uint32_t lanes : {1U,2U,3U,4U}) {
-      fusedAttentionGate(backend, 24, 4, lanes);
-      fusedAttentionGate(backend, 16, 2, lanes);
-    }
+    for (LinearInput layout : {LinearInput::Table64, LinearInput::Table16})
+      for (uint32_t lanes : {1U,2U,3U,4U}) {
+        fusedAttentionGate(backend, 24, 4, lanes, layout);
+        fusedAttentionGate(backend, 16, 2, lanes, layout);
+      }
     uint32_t cases=0;
     for (auto [n,k] : std::array<std::array<uint32_t,2>,4>{{{256,256},{768,768},{512,5120},{512,17408}}})
       for (uint32_t splits : {1U,2U,4U,8U}) {
@@ -353,14 +361,16 @@ int main(int argc,char **argv) {
           for (uint32_t fixture=0;fixture<4;++fixture)
             for (uint32_t rows : {8U,16U,24U,32U}) { runCase(backend,n,k,splits,e,fixture,rows); ++cases; }
       }
-    for (uint32_t width : {64U, 320U, 2048U, 5120U, 17408U})
-      for (uint32_t rows : {8U,16U,24U,32U}) fusedNorm(backend, width, rows);
+    for (LinearInput layout : {LinearInput::Table64, LinearInput::Table16})
+      for (uint32_t width : {64U, 320U, 2048U, 5120U, 17408U})
+        for (uint32_t rows : {8U,16U,24U,32U}) fusedNorm(backend, width, rows, layout);
     // 27B out_proj then down, and gdn_in then gate/up: K 6144, 17408 and 5120.
     for (uint32_t lanes : {1U, 4U}) {
       splitVisibility(backend, {{{{5120, 6144}, LinearEpilogue::Residual}, {{5120, 17408}, LinearEpilogue::Residual}}}, lanes);
       splitVisibility(backend, {{{{16640, 5120}, LinearEpilogue::None}, {{17408, 5120}, LinearEpilogue::GateUp}}}, lanes);
     }
     std::cout << "Q4 simdgroup: PASS cases=" << cases
-              << " (fp64, range, cancellation, guards, repeated dispatch, fused norm, shared split scratch)\n";
+              << " (fp64, range, cancellation, guards, repeated dispatch, fused norm and attention gate in both"
+                 " table layouts, shared split scratch)\n";
   } catch (const std::exception &e) { std::cerr << "Q4 simdgroup: FAIL: " << e.what() << '\n'; return 1; }
 }

@@ -127,6 +127,7 @@ std::string_view name(LinearTile tile) {
   case LinearTile::Split64: return "LinearTile::Split64";
   case LinearTile::Paired256: return "LinearTile::Paired256";
   case LinearTile::GgufStaged: return "LinearTile::GgufStaged";
+  case LinearTile::GgufSimdgroup: return "LinearTile::GgufSimdgroup";
   }
   return "LinearTile::N128";
 }

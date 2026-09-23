@@ -814,6 +814,80 @@ void ggufPlans() {
   // The arena bound is the single-tensor plan.
   require(linear.decodeScratchSize(gguf).partials == single.scratchSize().partials,
           "GGUF decode scratch bound");
+
+  // Apple9 decodes every GGUF width with the exact register tile, all lanes
+  // in one threadgroup, and K splits from the core count; prefill stages.
+  const auto registerSplits = [&](uint32_t cores, uint32_t n, uint32_t k, uint32_t rows,
+                                  LinearEpilogue epilogue, uint32_t segments) {
+    DeviceCapabilities apple9;
+    apple9.appleGpuFamily = 9;
+    apple9.gpuCoreCount = cores;
+    const LinearPlan plan = Q4Linear(apple9).plan({{n, k}, rows, LinearPhase::Decode, epilogue},
+                                                  projection(n, k, segments));
+    require(plan.configuration().tile == LinearTile::GgufSimdgroup &&
+                plan.configuration().groups == n / 64 &&
+                plan.configuration().simdgroups == LinearSimdgroups::Four &&
+                plan.input() == LinearInput::Table16,
+            "Apple9 GGUF register plan");
+    return plan.configuration().splits;
+  };
+  // Sixteen column/K threadgroups per core, at least two 256-input units per
+  // partition: 27B down, out_proj, gdn_in, attn_in, gate/up and the
+  // vocabulary head on 40 and 10 cores, and narrow tensors.
+  require(registerSplits(40, 5120, 17408, 8, LinearEpilogue::Residual, 1) == 8 &&
+              registerSplits(40, 5120, 6144, 32, LinearEpilogue::Residual, 1) == 8 &&
+              registerSplits(40, 16640, 5120, 16, LinearEpilogue::None, 3) == 4 &&
+              registerSplits(40, 14336, 5120, 8, LinearEpilogue::None, 3) == 4 &&
+              registerSplits(40, 17408, 5120, 24, LinearEpilogue::GateUp, 1) == 4 &&
+              registerSplits(40, 248320, 5120, 8, LinearEpilogue::None, 1) == 1 &&
+              registerSplits(10, 5120, 17408, 8, LinearEpilogue::Residual, 1) == 2 &&
+              registerSplits(10, 16640, 5120, 8, LinearEpilogue::None, 3) == 1 &&
+              registerSplits(40, 1024, 5120, 8, LinearEpilogue::None, 1) == 8 &&
+              registerSplits(40, 1024, 1024, 8, LinearEpilogue::None, 1) == 2,
+          "Apple9 GGUF register split policy");
+  DeviceCapabilities apple9;
+  apple9.appleGpuFamily = 9;
+  apple9.gpuCoreCount = 40;
+  const Q4Linear m3(apple9);
+  for (const uint32_t rows : {8U, 32U}) {
+    const LinearPlan plan = m3.plan({{5120, 17408}, rows, LinearPhase::Decode, LinearEpilogue::Residual},
+                                    projection(5120, 17408, 1));
+    const LinearScratchSize size = plan.scratchSize();
+    require(plan.partialSums() == 8 && size.input == uint64_t{rows} * 17408 * 2 &&
+                size.sums == uint64_t{rows} / 8 * (17408 * 3 / 4) * 4 &&
+                size.partials == uint64_t{8} * rows * 5120 * 4 && size.counters == 80 * 4 &&
+                plan.gateScratchBytes() == 0,
+            "Apple9 GGUF register scratch");
+  }
+  const LinearPlan head = m3.plan({{248320, 5120}, 8, LinearPhase::Decode, LinearEpilogue::None},
+                                  projection(248320, 5120, 1));
+  require(head.scratchSize().partials == 4 && head.scratchSize().counters == 4,
+          "Apple9 GGUF register scratch without splits binds placeholders");
+  const LinearPlan registerGateUp = m3.plan({{17408, 5120}, 16, LinearPhase::Decode, LinearEpilogue::GateUp},
+                                            projection(17408, 5120, 1));
+  require(registerGateUp.gateScratchBytes() == uint64_t{16} * 17408 * 2,
+          "Apple9 GGUF gate/up runs a gate pass into the gate scratch");
+  require(m3.plan({{5120, 17408}, 100, LinearPhase::Prefill, LinearEpilogue::Residual},
+                  projection(5120, 17408, 1)).configuration().tile == LinearTile::GgufStaged,
+          "Apple9 GGUF prefill stages");
+  LinearWorkload registerDown = down;
+  registerDown.quant = QuantFamily::Gguf;
+  require(m3.decodeScratchSize(registerDown).partials == uint64_t{8} * 8 * 5120 * 4,
+          "Apple9 GGUF decode scratch bound");
+  for (const LinearConfig config : {LinearConfig{LinearTile::GgufSimdgroup, 80, LinearSimdgroups::Four, 3},
+                                    LinearConfig{LinearTile::GgufSimdgroup, 80, LinearSimdgroups::Four, 16},
+                                    LinearConfig{LinearTile::GgufSimdgroup, 40, LinearSimdgroups::Four, 8},
+                                    LinearConfig{LinearTile::GgufSimdgroup, 80, LinearSimdgroups::Two, 8}})
+    rejects([&] { (void)Q4Linear::plan(registerDown, config); });
+  // Split boundaries fall on 256-input units, and prefill has no register tile.
+  rejects([&] {
+    (void)Q4Linear::plan({{5120, 512}, 8, LinearPhase::Decode, LinearEpilogue::None, QuantFamily::Gguf},
+                         {LinearTile::GgufSimdgroup, 80, LinearSimdgroups::Four, 4});
+  });
+  rejects([&] {
+    (void)Q4Linear::plan({{5120, 17408}, 128, LinearPhase::Prefill, LinearEpilogue::None, QuantFamily::Gguf},
+                         {LinearTile::GgufSimdgroup, 0, LinearSimdgroups::Four, 1});
+  });
 }
 
 void scalingContracts() {

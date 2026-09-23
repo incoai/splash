@@ -1,4 +1,4 @@
-#include "metal/kernels/common/q4_sgmatrix.h"
+#include "metal/kernels/common/gguf_sgmatrix.h"
 #include "metal/abi/KernelABI.h"
 #include "metal/kernels/common/attention_qkv_prepare.h"
 
@@ -131,7 +131,7 @@ kernel void verify_attention_gate_kv2_g8(
       packed_qkv, attention, hidden, params, index, grid_size);
 }
 
-#define ATTENTION_GATE_Q4(Name, QHeads, KHeads) \
+#define ATTENTION_GATE_TABLE(Name, QHeads, KHeads, Layout) \
   kernel void Name( \
       device const bfloat *packed [[buffer(0)]], \
       device const bfloat *attention [[buffer(1)]], \
@@ -146,9 +146,11 @@ kernel void verify_attention_gate_kv2_g8(
     const bfloat b = full_attention_gate_value<QHeads, KHeads>(packed, attention, params, element + 1); \
     hidden[element] = a; hidden[element + 1] = b; \
     const uint row = element / width; \
-    q4sg::write_input(table + ulong(row / 8) * width * 8, sums + ulong(row / 8) * width / 8, \
-                      (element % width) / 64, row % 8, lane, a, b); \
+    Layout::write(table + ulong(row / 8) * width * 8, sums + ulong(row / 8) * Layout::sums_per_tile(width), \
+                  width, (element % width) / 64, row % 8, lane, a, b); \
   }
-ATTENTION_GATE_Q4(verify_attention_gate_q4, 24, 4)
-ATTENTION_GATE_Q4(verify_attention_gate_q4_kv2_g8, 16, 2)
-#undef ATTENTION_GATE_Q4
+ATTENTION_GATE_TABLE(verify_attention_gate_q4, 24, 4, q4sg::Table64)
+ATTENTION_GATE_TABLE(verify_attention_gate_q4_kv2_g8, 16, 2, q4sg::Table64)
+ATTENTION_GATE_TABLE(verify_attention_gate_q16, 24, 4, q16sg::Table16)
+ATTENTION_GATE_TABLE(verify_attention_gate_q16_kv2_g8, 16, 2, q16sg::Table16)
+#undef ATTENTION_GATE_TABLE
