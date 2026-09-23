@@ -184,6 +184,36 @@ void testProbeFallsBackWhenPromptChanges() {
           "a same-buffer prompt edit reused a different prompt's cache");
 }
 
+void testProbeRechecksFirstMissAndPromptLength() {
+  CacheFixture fixture;
+  fixture.publish(0);
+  fixture.publish(3);
+  auto changed = fixture.prompt;
+  changed[32] += 1;
+  const CacheProbe partial = fixture.cache.probe(changed);
+  require(partial.cachedTokens() == 32, "partial probe missed its first page");
+  // Restoring the first missed page must reveal the already-cached suffix,
+  // even though the matched pages and KV generation did not change.
+  auto restored = fixture.cache.lookup(fixture.prompt, {}, &partial);
+  require(restored.kvBoundary == 128 && restored.resumeBoundary() == 128,
+          "probe hid a prefix after an edit to its first missed page");
+  restored.state.reset();
+
+  const CacheProbe full = fixture.cache.probe(fixture.prompt);
+  for (size_t size : {size_t{0}, size_t{1}, size_t{32}, size_t{33}}) {
+    const auto shorter = std::span<const uint32_t>(fixture.prompt).first(size);
+    const auto lookup = fixture.cache.lookup(shorter, {}, &full);
+    const uint32_t expected = size == 33 ? 32 : 0;
+    require(lookup.kvBoundary == expected && lookup.resumeBoundary() == expected,
+            "probe reused pages past a shortened prompt's replay boundary");
+  }
+  const auto shortPrompt = std::span<const uint32_t>(fixture.prompt).first(33);
+  const CacheProbe shortProbe = fixture.cache.probe(shortPrompt);
+  const auto longer = fixture.cache.lookup(fixture.prompt, {}, &shortProbe);
+  require(longer.kvBoundary == 128 && longer.resumeBoundary() == 128,
+          "probe hid cached pages after the prompt grew");
+}
+
 void testProbeRechecksStateChanges() {
   CacheFixture fixture;
   fixture.publish(3);
@@ -751,6 +781,7 @@ int main() {
     testSchedulingProbeDoesNotChangeCachePolicy();
     testValidAdmissionProbePreservesLookupAndAccounting();
     testProbeFallsBackWhenPromptChanges();
+    testProbeRechecksFirstMissAndPromptLength();
     testProbeRechecksStateChanges();
     testProbeFallsBackWhenKvChanges();
     testProbeBindsImageIdentity();
