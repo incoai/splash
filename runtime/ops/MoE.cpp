@@ -222,8 +222,7 @@ void addGgufExperts(metal::CommandGraph &graph, const MoeBuffers &buffers,
     graph.add(kernel + (up ? "_up" : ""), std::move(bindings),
               MoeGgufExpertParams{k, n, shape.experts, projection.routed.formatId,
                                   projection.shared.formatId},
-              {n / 64, tiles, 1},
-              {table16 || plan.tileRows() == 64 ? 128u : 64u, 1, 1});
+              {n / 64, tiles, 1}, {table16 ? 128u : 64u, 1, 1});
   };
   const uint32_t hidden = shape.hiddenSize;
   const uint32_t intermediate = shape.expertIntermediateSize;
@@ -249,11 +248,11 @@ MoePlan::MoePlan(MoeShape shape, uint32_t rows, MoeConfig config,
     : shape_(shape), rows_(rows), config_(config),
       splitExperts_(shape.quant == QuantFamily::Gguf ||
                     (prefill && config.expertTile == MoeExpertTile::M32)) {
-  // GGUF plans have 8-row kernels in both phases and 64-row prefill kernels;
-  // affine plans 8- and 32-row kernels in both phases.
+  // Affine plans have 8- and 32-row kernels in both phases, GGUF plans 8-row
+  // kernels in both phases and 32-row prefill kernels.
   const bool gguf = shape.quant == QuantFamily::Gguf;
-  if (gguf ? config.expertTile != MoeExpertTile::M8 && (!prefill || config.expertTile != MoeExpertTile::M64)
-           : config.expertTile != MoeExpertTile::M8 && config.expertTile != MoeExpertTile::M32)
+  if ((config.expertTile != MoeExpertTile::M8 && config.expertTile != MoeExpertTile::M32) ||
+      (gguf && !prefill && config.expertTile != MoeExpertTile::M8))
     throw std::invalid_argument("invalid MoE expert tile configuration");
   if (config.m8Simdgroups != MoeExpertSimdgroups::Eight &&
       config.m8Simdgroups != MoeExpertSimdgroups::Four)
@@ -296,7 +295,7 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
   if (gguf) {
     // fp32 scores of the F32 router in rows of 256, as the select kernel reads.
     addGgufFloat(graph, buffers.input, gguf->router, buffers.groupedInput, rows,
-                 256, 0, FloatOutput::Float32);
+                 256, 0, FloatOutput::Float32, plan.config().ggufRouterTile);
     graph.add("moe_route_select_f32",
               {buffers.groupedInput, buffers.input,
                gguf->sharedExpertGate.plane0, buffers.selectedExperts,
@@ -347,7 +346,7 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
 }
 
 MoePlan MoE::prefillPlan(MoeShape shape, uint32_t rows) {
-  return prefillPlan(shape, rows, {moePrefillTile(shape)});
+  return prefillPlan(shape, rows, {MoeExpertTile::M32});
 }
 
 MoePlan MoE::prefillPlan(MoeShape shape, uint32_t rows, MoeConfig config) {
@@ -364,7 +363,7 @@ MoePlan MoE::decodePlan(MoeShape shape, uint32_t lanes, MoeConfig config) {
 
 std::array<MoePlan, 2> MoE::prefillCandidates(MoeShape shape, uint32_t rows,
                                           uint32_t routeWideRows) {
-  const MoePlan baseline = prefillPlan(shape, rows, {moePrefillTile(shape), routeWideRows});
+  const MoePlan baseline = prefillPlan(shape, rows, {MoeExpertTile::M32, routeWideRows});
   if (shape.quant == QuantFamily::Gguf) return {baseline, baseline};
   return {baseline, prefillPlan(shape, rows, {MoeExpertTile::M8, routeWideRows})};
 }

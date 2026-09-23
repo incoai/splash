@@ -839,6 +839,19 @@ void ggufPlans() {
   // The arena bound is the single-tensor plan, which fused and gate/up plans share.
   require(linear.decodeScratchSize(gguf).partials == single.scratchSize().partials,
           "GGUF decode scratch bound");
+  // Float projections take the neural accelerator tile from three of its
+  // 64 x 32 tiles per two cores: on 16 cores the 35B router (N 256) from 129
+  // rows, alpha/beta (N 64) from 705; never on Apple9 or below 16 rows.
+  DeviceCapabilities oneCore = device;
+  oneCore.gpuCoreCount = 1;
+  require(linear.ggufFloatTile(32, 256) == FloatTile::Simdgroup && linear.ggufFloatTile(128, 256) == FloatTile::Simdgroup &&
+              linear.ggufFloatTile(129, 256) == FloatTile::NeuralAccelerator &&
+              linear.ggufFloatTile(2048, 256) == FloatTile::NeuralAccelerator &&
+              linear.ggufFloatTile(704, 64) == FloatTile::Simdgroup &&
+              linear.ggufFloatTile(705, 64) == FloatTile::NeuralAccelerator &&
+              Q4Linear(oneCore).ggufFloatTile(15, 256) == FloatTile::Simdgroup &&
+              Q4Linear(oneCore).ggufFloatTile(16, 256) == FloatTile::NeuralAccelerator,
+          "GGUF float tile rule");
 
   // Apple9 decodes every GGUF width with the exact register tile, all lanes
   // in one threadgroup, and K splits from the core count; prefill stages.
@@ -903,6 +916,7 @@ void ggufPlans() {
   require(m3.plan({{5120, 17408}, 100, LinearPhase::Prefill, LinearEpilogue::Residual},
                   projection(5120, 17408, 1)).configuration().tile == LinearTile::GgufStaged,
           "Apple9 GGUF prefill stages");
+  require(m3.ggufFloatTile(2048, 256) == FloatTile::Simdgroup, "Apple9 float projections take the simdgroup tile");
   LinearWorkload registerDown = down;
   registerDown.quant = QuantFamily::Gguf;
   require(m3.decodeScratchSize(registerDown).partials == uint64_t{8} * 8 * 5120 * 4,
@@ -999,6 +1013,22 @@ void ggufCoreLaws() {
                           bound.counters >= need.counters,
                       "GGUF decode arena bound below a plan");
             }
+    }
+  // The float tile follows the grid per core: once a chunk takes the neural
+  // accelerator, longer chunks and fewer cores keep it; never below 16 rows or
+  // on Apple9.
+  for (uint32_t cores = 1; cores <= 128; ++cores)
+    for (const uint32_t n : {16U, 64U, 256U, 1024U}) {
+      const Q4Linear linear = gpu(10, cores), more = gpu(10, cores + 1);
+      bool accelerator = false;
+      for (uint32_t rows = 1; rows <= 2048; ++rows) {
+        const bool now = linear.ggufFloatTile(rows, n) == FloatTile::NeuralAccelerator;
+        require((!accelerator || now) && (!now || rows >= 16) &&
+                    (more.ggufFloatTile(rows, n) == FloatTile::Simdgroup || now),
+                "GGUF float tile is not monotone in rows and cores");
+        accelerator = now;
+      }
+      require(gpu(9, cores).ggufFloatTile(2048, n) == FloatTile::Simdgroup, "Apple9 GGUF float tile");
     }
 }
 

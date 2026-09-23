@@ -1,12 +1,15 @@
 // GGUF sparse MoE (ops::MoE over GgufMoeWeights) and the fp32 projection of
 // GGUF float tensors, against fp64 references over GGML's dequantized weights
 // (GgufFormatReference.hpp), through the production dispatch code.
-// - Float projection: every row count a decode or prefill dispatch takes (with
-//   ragged 32-row tails), the router and alpha/beta widths, bf16 and fp32
-//   destinations at a column offset of a wider row; neighbours stay untouched.
-// - Float segments of a fused GGUF projection (Q4Linear): the quantized
-//   segments' outputs unchanged, the padding past the segments unwritten.
-// - MoE: every GGUF plan (the staged 8- and 64-row tiles and the Apple9
+// - Float projection, both tiles (fp32 simdgroup MMA, and the neural
+//   accelerator on three exact bf16 parts per weight): every row count a
+//   decode or prefill dispatch takes (with ragged tile tails), the router and
+//   alpha/beta widths, bf16 and fp32 destinations at a column offset of a
+//   wider row; neighbours stay untouched.
+// - Float segments of a fused GGUF projection (Q4Linear), on either float
+//   tile: the quantized segments' outputs unchanged, the padding past the
+//   segments unwritten.
+// - MoE: every GGUF plan (the staged 8- and 32-row tiles and the Apple9
 //   register tile, whatever GPU runs the test; decode steps and prefill
 //   chunks) for all 8 formats, gate, up and down in three formats and the
 //   shared expert in three more; routes and weights against the fp64 router,
@@ -47,6 +50,7 @@ using splash::metal::CommandGraph;
 using splash::metal::MetalBackend;
 using splash::metal::MetalBuffer;
 using splash::ops::FloatOutput;
+using splash::ops::FloatTile;
 using splash::ops::GgufExpertProjection;
 using splash::ops::GgufMoeWeights;
 using splash::ops::GgufSegment;
@@ -189,8 +193,12 @@ Dot dot(const float *x, const float *w, uint32_t K) {
   return d;
 }
 
-// fp32 accumulation of K exact products: at most K u sum |x w| (u = 2^-24).
-double floatBound(const Dot &d, uint32_t K) { return std::ldexp(d.magnitude * K, -24) + 1e-30; }
+// fp32 accumulation of n exact products: at most n u sum |x w| (u = 2^-24).
+// The simdgroup float tile adds K products, the neural accelerator tile the
+// 3 K products of the weights' bf16 parts.
+double floatBound(const Dot &d, uint32_t K, FloatTile tile = FloatTile::Simdgroup) {
+  return std::ldexp(d.magnitude * K * (tile == FloatTile::NeuralAccelerator ? 3 : 1), -24) + 1e-30;
+}
 
 // The fp64 interval a quantized projection's result lies in: the register
 // tile is exact up to fp32 accumulation (2^-16 sum|x| max|w|, the dense
@@ -206,69 +214,84 @@ bool inside(float got, double exact, double bound) {
 }
 
 // ---------------------------------------------------------------- float projection
+// The input holds exactly the dispatch's rows, so a tile reading past them
+// would fail shader validation.
 int floatProjection(MetalBackend &backend) {
   int failures = 0;
   for (const uint32_t K : {512u, 2048u})
-    for (const uint32_t N : {64u, 256u}) {
+    for (const uint32_t N : {16u, 64u, 256u}) {
       const Tensor w = floating(backend, N, K, 0.05f);
-      double worst = 0;
-      for (const uint32_t rows : {1u, 7u, 8u, 16u, 24u, 32u, 33u, 263u, 2048u}) {
-        if (rows == 2048 && (K != 2048 || N != 256)) continue;   // the router's prefill width
-        const std::vector<float> x = activations(uint64_t{rows} * K);
-        const MetalBuffer input = bfloatBuffer(backend, x, "float-input");
-        for (const FloatOutput type : {FloatOutput::BFloat16, FloatOutput::Float32}) {
-          // A destination row of N + 96 columns at offset 32, one row more than
-          // the dispatch writes; the sentinel must survive outside the tile.
-          const uint32_t stride = N + 96, offset = 32;
-          const uint64_t element = type == FloatOutput::Float32 ? 4 : 2;
-          MetalBuffer output = backend.allocateBuffer(uint64_t{rows + 1} * stride * element, BufferStorage::Shared,
-                                                      "float-output");
-          std::memset(output.contents(), 0x7F, output.sizeBytes());
-          CommandGraph graph;
-          splash::ops::addGgufFloat(graph, input, w.segment, output, rows, stride, offset, type);
-          static_cast<void>(backend.submitCommand(graph.dispatches()));
-          size_t outside = 0, touched = 0;
-          for (uint32_t r = 0; r <= rows; ++r)
-            for (uint32_t c = 0; c < stride; ++c) {
-              const uint64_t at = uint64_t{r} * stride + c;
-              const bool live = r < rows && c >= offset && c < offset + N;
-              const uint8_t *bytes = static_cast<const uint8_t *>(output.contents()) + at * element;
-              if (!live) {
-                for (uint64_t b = 0; b < element; ++b) touched += bytes[b] != 0x7F;
-                continue;
+      for (const FloatTile tile : {FloatTile::Simdgroup, FloatTile::NeuralAccelerator}) {
+        const bool accelerator = tile == FloatTile::NeuralAccelerator;
+        double worst = 0, sum = 0;
+        size_t outputs = 0;
+        int tileFailures = 0;
+        for (const uint32_t rows : {1u, 7u, 8u, 16u, 24u, 32u, 33u, 80u, 263u, 2048u}) {
+          if (rows == 2048 && (K != 2048 || N != 256)) continue;   // the router's prefill width
+          if (accelerator && rows < 16) continue;
+          const std::vector<float> x = activations(uint64_t{rows} * K);
+          const MetalBuffer input = bfloatBuffer(backend, x, "float-input");
+          for (const FloatOutput type : {FloatOutput::BFloat16, FloatOutput::Float32}) {
+            // A destination row of N + 96 columns at offset 32, one row more than
+            // the dispatch writes; the sentinel must survive outside the tile.
+            const uint32_t stride = N + 96, offset = 32;
+            const uint64_t element = type == FloatOutput::Float32 ? 4 : 2;
+            MetalBuffer output = backend.allocateBuffer(uint64_t{rows + 1} * stride * element, BufferStorage::Shared,
+                                                        "float-output");
+            std::memset(output.contents(), 0x7F, output.sizeBytes());
+            CommandGraph graph;
+            splash::ops::addGgufFloat(graph, input, w.segment, output, rows, stride, offset, type, tile);
+            static_cast<void>(backend.submitCommand(graph.dispatches()));
+            size_t outside = 0, touched = 0;
+            for (uint32_t r = 0; r <= rows; ++r)
+              for (uint32_t c = 0; c < stride; ++c) {
+                const uint64_t at = uint64_t{r} * stride + c;
+                const bool live = r < rows && c >= offset && c < offset + N;
+                const uint8_t *bytes = static_cast<const uint8_t *>(output.contents()) + at * element;
+                if (!live) {
+                  for (uint64_t b = 0; b < element; ++b) touched += bytes[b] != 0x7F;
+                  continue;
+                }
+                const Dot d = dot(x.data() + uint64_t{r} * K, w.row(c - offset), K);
+                const double bound = floatBound(d, K, tile);
+                float got;
+                if (type == FloatOutput::Float32) {
+                  std::memcpy(&got, bytes, 4);
+                  outside += !(std::fabs(got - d.value) <= bound);
+                  const double error = std::fabs(got - d.value) / (d.magnitude + 1e-30);
+                  worst = std::max(worst, error);
+                  sum += error;
+                  ++outputs;
+                } else {
+                  __bf16 half;
+                  std::memcpy(&half, bytes, 2);
+                  got = float(half);
+                  outside += !inside(got, d.value, bound);
+                }
               }
-              const Dot d = dot(x.data() + uint64_t{r} * K, w.row(c - offset), K);
-              const double bound = floatBound(d, K);
-              float got;
-              if (type == FloatOutput::Float32) {
-                std::memcpy(&got, bytes, 4);
-                outside += !(std::fabs(got - d.value) <= bound);
-              } else {
-                __bf16 half;
-                std::memcpy(&half, bytes, 2);
-                got = float(half);
-                outside += !inside(got, d.value, bound);
-              }
-              worst = std::max(worst, std::fabs(got - d.value) / (d.magnitude + 1e-30));
+            if (outside || touched) {
+              printf("  float %s K=%u N=%u rows=%u %s: %zu outputs outside the fp32 bound, %zu bytes written outside "
+                     "FAIL\n", accelerator ? "accelerator" : "simdgroup", K, N, rows,
+                     type == FloatOutput::Float32 ? "f32" : "bf16", outside, touched);
+              ++tileFailures;
             }
-          if (outside || touched) {
-            printf("  float K=%u N=%u rows=%u %s: %zu outputs outside the fp32 bound, %zu bytes written outside FAIL\n",
-                   K, N, rows, type == FloatOutput::Float32 ? "f32" : "bf16", outside, touched);
-            ++failures;
           }
         }
+        printf("float %-11s K=%u N=%3u: rows %u-2048, bf16/f32 at a column offset: |error| / sum|x w| mean %.2e "
+               "worst %.2e %s\n", accelerator ? "accelerator" : "simdgroup", K, N, accelerator ? 16u : 1u,
+               sum / outputs, worst, tileFailures ? "FAIL" : "ok");
+        failures += tileFailures;
       }
-      printf("float K=%u N=%u: rows 1-2048, bf16/f32 at a column offset: worst |error| / sum|x w| %.2e %s\n", K, N,
-             worst, failures ? "FAIL" : "ok");
     }
   return failures;
 }
 
 // A fused projection with a float segment, as the 35B's GDN input (qkv | z |
-// alpha-beta): the fp32 kernel writes the float segment's columns, the
+// alpha-beta): the float projection writes the float segment's columns, the
 // quantized kernels the others bit for bit as without it, and the padding
 // past the last segment stays unwritten; decode through both GGUF decode
-// families (register, staged) at one to four lanes, and prefill.
+// families (register, staged) at one to four lanes, and prefill, where a
+// one-core device takes the neural accelerator float tile from 16 rows.
 int floatSegments(MetalBackend &backend) {
   constexpr uint32_t K = 1024, N = 768, kFloatColumn = 512, kCovered = 576;
   const Tensor q80 = quantized(backend, Q80, 256, K), q4k = quantized(backend, Q4K, 256, K);
@@ -280,9 +303,10 @@ int floatSegments(MetalBackend &backend) {
   full.gguf = {at(q80.segment, 0), at(q4k.segment, 256), at(gates.segment, kFloatColumn)};
   quantizedOnly.gguf = {at(q80.segment, 0), at(q4k.segment, 256)};
   int failures = 0;
-  for (const uint32_t family : {9u, 10u}) {
+  for (const auto [family, cores] : {std::pair{9u, 0u}, std::pair{10u, 0u}, std::pair{10u, 1u}}) {
     DeviceCapabilities device = backend.capabilities();
     device.appleGpuFamily = family;
+    if (cores) device.gpuCoreCount = cores;
     const Q4Linear linear(device);
     const auto check = [&](uint32_t rows, uint32_t storage, const std::string &label,
                            const std::function<void(CommandGraph &, MetalBuffer, const Q4Projection &, MetalBuffer)> &add) {
@@ -307,12 +331,13 @@ int floatSegments(MetalBackend &backend) {
             const Dot d = dot(x.data() + uint64_t{r} * K, gates.row(c - kFloatColumn), K);
             __bf16 value;
             std::memcpy(&value, got + i, 2);
-            outside += !inside(float(value), d.value, floatBound(d, K));
+            outside += !inside(float(value), d.value, floatBound(d, K, linear.ggufFloatTile(rows, 64)));
           }
         }
       if (differ || outside || written) {
-        printf("  float segment %s family %u: %zu quantized outputs differ, %zu float outputs outside the fp32 bound, "
-               "%zu padding outputs written FAIL\n", label.c_str(), family, differ, outside, written);
+        printf("  float segment %s family %u, %u cores: %zu quantized outputs differ, %zu float outputs outside the "
+               "fp32 bound, %zu padding outputs written FAIL\n", label.c_str(), family, device.gpuCoreCount, differ,
+               outside, written);
         ++failures;
       }
     };
@@ -345,8 +370,8 @@ int floatSegments(MetalBackend &backend) {
             });
     }
   }
-  printf("float segment: fused Q8_0|Q4_K|F32 decode B1-4 (register, staged) and prefill 1/24/33/263 rows %s\n",
-         failures ? "FAIL" : "ok");
+  printf("float segment: fused Q8_0|Q4_K|F32 decode B1-4 (register, staged) and prefill 1/24/33/263 rows, both float "
+         "tiles %s\n", failures ? "FAIL" : "ok");
   return failures;
 }
 
@@ -438,7 +463,7 @@ std::vector<uint16_t> runPlan(MetalBackend &backend, const Model &m, Buffers &b,
     for (uint32_t e = 0; e < kExperts; ++e) {
       const Dot d = dot(x, m.router.row(e), kHidden);
       score[e] = d.value;
-      bound[e] = floatBound(d, kHidden);
+      bound[e] = floatBound(d, kHidden, plan.config().ggufRouterTile);
     }
     std::array<uint32_t, kExperts> order;
     std::iota(order.begin(), order.end(), 0u);
@@ -595,22 +620,32 @@ int moe(MetalBackend &backend) {
              100.0 * stats.gateUpFlips / (stats.outputs / 2), 100.0 * stats.downFlips / stats.outputs,
              stats.gateUpWorst, stats.downWorst, "ok");
     }
-    Stats stats;
-    std::vector<uint16_t> widest;
-    for (const uint32_t rows : {kMaximumRows, 33u, 9u}) {
-      const MoePlan plan = MoE::prefillPlan(shape, rows);
-      const std::string label = formats + " prefill rows=" + std::to_string(rows);
-      const std::vector<uint16_t> result = runPlan(backend, m, b, plan, true, products, stats, label);
-      if (widest.empty()) widest = result;
-      else if (!std::equal(result.begin(), result.end(), widest.begin())) {
-        printf("  %s: rows differ from the %u-row chunk FAIL\n", label.c_str(), kMaximumRows);
-        ++failures;
+    // The 32-row tiles, whose 16- and 32-row matmuls both run at 263 rows,
+    // with the router on each float tile: a row's result is the same in every
+    // chunk on one tile (either tile's scores of a row depend on that row
+    // alone).
+    for (const FloatTile router : {FloatTile::Simdgroup, FloatTile::NeuralAccelerator}) {
+      Stats stats;
+      std::vector<uint16_t> widest;
+      for (const uint32_t rows : {kMaximumRows, 33u, 16u}) {
+        MoeConfig config{MoeExpertTile::M32};
+        config.ggufRouterTile = router;
+        const MoePlan plan = MoE::prefillPlan(shape, rows, config);
+        const std::string label = formats + " prefill rows=" + std::to_string(rows) +
+                                  (router == FloatTile::NeuralAccelerator ? " (accelerator router)" : "");
+        const std::vector<uint16_t> result = runPlan(backend, m, b, plan, true, products, stats, label);
+        if (widest.empty()) widest = result;
+        else if (!std::equal(result.begin(), result.end(), widest.begin())) {
+          printf("  %s: rows differ from the %u-row chunk FAIL\n", label.c_str(), kMaximumRows);
+          ++failures;
+        }
       }
+      printf("%-20s staged   prefill 263/33/16 (32-row tiles, %s router): gate/up %.2f%% and down %.2f%% of outputs "
+             "differ from bf16(fp64), errors at most %.1e/%.1e of sum|x w| ok\n",
+             formats.c_str(), router == FloatTile::NeuralAccelerator ? "accelerator" : "simdgroup",
+             100.0 * stats.gateUpFlips / (stats.outputs / 2), 100.0 * stats.downFlips / stats.outputs, stats.gateUpWorst,
+             stats.downWorst);
     }
-    printf("%-20s staged   prefill 263/33/9 (64-row tiles): gate/up %.2f%% and down %.2f%% of outputs differ from bf16(fp64), "
-           "errors at most %.1e/%.1e of sum|x w| ok\n",
-           formats.c_str(), 100.0 * stats.gateUpFlips / (stats.outputs / 2), 100.0 * stats.downFlips / stats.outputs,
-           stats.gateUpWorst, stats.downWorst);
   }
   return failures;
 }

@@ -39,11 +39,16 @@ struct GgufSegment final {
 
 // The destination element type of a float segment's projection.
 enum class FloatOutput : uint8_t { BFloat16, Float32 };
+// The tile of a float projection (kernels/shared/gguf_float.metal): fp32
+// simdgroup MMA on the weights as stored, or the neural accelerator's bf16
+// matmul on each weight's three bf16 parts, which sum to it exactly. Both
+// round only in fp32 accumulation; Q4Linear::ggufFloatTile picks one.
+enum class FloatTile : uint8_t { Simdgroup, NeuralAccelerator };
 // out[r][outOffset + n] = sum_k input[r][k] W[n][k] for rows r < `rows` of a
 // float segment, into a destination of `outStride` columns (LinearGguf.cpp).
 void addGgufFloat(metal::CommandGraph &graph, metal::MetalBuffer input, const GgufSegment &weights,
                   metal::MetalBuffer output, uint32_t rows, uint32_t outStride, uint32_t outOffset,
-                  FloatOutput type = FloatOutput::BFloat16);
+                  FloatOutput type, FloatTile tile);
 
 struct Q4Projection final {
   metal::MetalBuffer weights;
@@ -249,6 +254,9 @@ public:
   [[nodiscard]] LinearInput decodeInput(const Q4Projection &projection, uint32_t lanes,
                                         LinearEpilogue epilogue = LinearEpilogue::None) const;
   [[nodiscard]] LinearScratchSize decodeScratchSize(LinearWorkload workload) const;
+  // The tile of a float projection of `rows` rows into `outputSize` columns
+  // on this device (LinearGguf.cpp).
+  [[nodiscard]] FloatTile ggufFloatTile(uint32_t rows, uint32_t outputSize) const noexcept;
   [[nodiscard]] static LinearPlan plan(LinearWorkload workload, LinearConfig config);
   [[nodiscard]] std::vector<LinearPlan> candidates(LinearWorkload workload) const;
   // Installed only at startup; encoding does a read-only lookup, never tuning.

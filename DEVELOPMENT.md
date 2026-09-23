@@ -153,7 +153,9 @@ optional high-bit plane and superblock headers in 256-column tiles; a 3-D expert
 segment of experts x N rows) and fills it with the `gguf_repack` / `gguf_copy` kernels reading the
 mmapped file (`GgufTarget.cpp`). Every tensor keeps its stored format: the F32 norm multipliers,
 the MoE router and shared-expert gate, and GDN alpha/beta when a file stores them as F32 stay F32
-and run in fp32, as llama.cpp keeps them; the other small F32 tensors (the GDN convolution and
+and run in fp32, as llama.cpp keeps them (Apple10 prefill chunks multiply the router and
+alpha/beta on the neural accelerator as three bf16 parts per weight that sum to it exactly, so
+only fp32 accumulation rounds); the other small F32 tensors (the GDN convolution and
 time-step bias) become bf16 only when every value converts exactly, and loading fails otherwise.
 The images are anonymous Metal memory, so under memory pressure they are compressed or swapped
 rather than dropped and refaulted like mapped package files. Supported tensor types are Q4_K,

@@ -122,15 +122,10 @@ struct MoeWorkspace final {
 // run the fused gate/up tile; the M32 prefill plan runs the experts as three
 // N256 passes (gate, up with the silu gate, down) whose tiles shrink to the
 // descriptor's live rows, bit-identical to the fused tile. GGUF plans run
-// three passes of M8 tiles, or of M64 tiles to prefill (moeGgufPrefillTile).
-enum class MoeExpertTile : uint8_t { M8 = 8, M32 = 32, M64 = 64 };
-
-// The device-independent tile of prefill plans: 32 rows for affine plans, 64
-// for GGUF plans (the staged 64-row tile; ExecutionPlans applies the device
-// policy of moeGgufPrefillTile).
-[[nodiscard]] constexpr MoeExpertTile moePrefillTile(MoeShape shape) noexcept {
-  return shape.quant == QuantFamily::Gguf ? MoeExpertTile::M64 : MoeExpertTile::M32;
-}
+// three passes of M8 tiles, or of M32 tiles to prefill (moeGgufPrefillTile).
+// M32 is the device-independent tile of prefill plans; ExecutionPlans applies
+// the device policy of GGUF plans.
+enum class MoeExpertTile : uint8_t { M8 = 8, M32 = 32 };
 
 // Simdgroups per 8-row expert tile: a device policy the execution plans set,
 // not a tuned choice. Eight is the shipped N128 tile for both projections.
@@ -164,9 +159,9 @@ moeDecodeSimdgroups(uint32_t appleGpuFamily) noexcept {
 // grouped rows (8-row tiles only). Apple9 runs Register in both phases. In
 // decode, as its dense GGUF projections do (LinearGguf.cpp): its matrix
 // operations share the FP32 pipe, where the register tile beats staging. In
-// prefill, the exact register tile is faster at every chunk size measured
-// (one 35B MoE layer on the 40-core M3 Max against 64-row staged tiles: 512
-// rows 3.8 vs 6.4 ms, 2048 rows 13.2 vs 13.4) and equals the decode numerics.
+// prefill it equals the decode numerics; against the staged 32-row tiles, on
+// the 35B's real routes on the 40-core M3 Max (ms per layer), it is faster at
+// 512 rows (3.52 vs 3.72) and slower at 2048 (12.6-13.1 vs 11.0-11.7).
 enum class MoeGgufTile : uint8_t { Staged, Register };
 
 [[nodiscard]] constexpr MoeGgufTile moeGgufTile(uint32_t appleGpuFamily) noexcept {
@@ -174,17 +169,19 @@ enum class MoeGgufTile : uint8_t { Staged, Register };
 }
 
 // The rows of a GGUF prefill plan's tiles on the device's `tile`: 8 on the
-// register tile. Staged: 8-row tiles while the chunk's routed rows average at
-// most one 8-row tile per expert (rows * topK <= 8 * experts), 64-row tiles
-// beyond, where staging an expert's weights once per 64 rows outweighs the
-// padding (one 35B MoE layer on the 16-core M5 Pro: 3.2 vs 4.3 ms at 256
-// rows; 64-row tiles win from 512 rows, 4.8 vs 5.3 ms).
+// register tile. Staged: 8-row tiles while the chunk's routes average at most
+// one row per expert (rows * topK <= experts), 32-row tiles beyond, which
+// stream an expert's weights once for up to 32 of its rows (its tiles run 16-
+// or 32-row matmuls by their live rows). On the 35B's real prefill routes
+// (wikitext, 16-core M5 Pro, the three expert passes of a layer, ms) 8- vs
+// 32-row tiles: 32 rows 0.72 / 0.71, 64 rows 1.03 / 0.97, 128 rows 1.59 / 1.29,
+// 256 rows 2.60 / 1.71.
 [[nodiscard]] constexpr MoeExpertTile moeGgufPrefillTile(MoeShape shape, uint32_t rows,
                                                          MoeGgufTile tile) noexcept {
   return tile == MoeGgufTile::Register ||
-                 uint64_t{rows} * shape.expertsPerToken <= uint64_t{8} * shape.experts
+                 uint64_t{rows} * shape.expertsPerToken <= shape.experts
              ? MoeExpertTile::M8
-             : MoeExpertTile::M64;
+             : MoeExpertTile::M32;
 }
 
 struct MoeConfig final {
@@ -197,6 +194,9 @@ struct MoeConfig final {
   MoeExpertSimdgroups m8Simdgroups = MoeExpertSimdgroups::Eight;
   // GGUF plans only; the execution plans derive it from the GPU family.
   MoeGgufTile ggufTile = MoeGgufTile::Staged;
+  // The tile of a GGUF plan's F32 router; the execution plans derive it from
+  // the device and the plan's rows (Q4Linear::ggufFloatTile).
+  FloatTile ggufRouterTile = FloatTile::Simdgroup;
   bool operator==(const MoeConfig &) const = default;
 };
 
@@ -251,7 +251,7 @@ struct MoeBuffers final {
 
 // Routes and executes grouped experts from immutable weight views.
 struct MoE final {
-  // The shipped prefill plan (moePrefillTile) or the one of config.
+  // The shipped prefill plan (M32 tiles) or the one of config.
   [[nodiscard]] static MoePlan prefillPlan(MoeShape shape, uint32_t rows);
   [[nodiscard]] static MoePlan prefillPlan(MoeShape shape, uint32_t rows,
                                            MoeConfig config);

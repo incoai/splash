@@ -368,62 +368,55 @@ PROD_SET(FmtIQ3S, iq3s)
 // 64 columns of grouped tile y with the weights of the tile's expert (moe_gguf_segment), in the format the tile picks
 // at run time: on a 16-core M5 Pro one run-time-format dispatch over two segments is within -11..+8% of a dispatch
 // per format (time-sg at 23040x2048 Q4_K and 92160x512 Q5_K, one to four lanes). aux is the gate of the up pass.
-// Decode: 8-row tiles, two simdgroups of 32 columns, grid (N / 64, tiles).
-template <ushort Ep>
-inline void moe_gguf_decode_tile(device bfloat *input, device const MoeTileDescriptor *tiles, device const uint *tile_count,
+// Two simdgroups each stream their own 32 columns through the decode tile, grid (N / 64, tiles), on 8-row tiles
+// (decode steps, short prefill chunks) or 32-row tiles (longer chunks, ops::moeGgufPrefillTile), where a tile runs the
+// 16- or 32-row matmul that holds its live rows: an expert's last tile is mostly partial. On the 35B's real prefill
+// routes (wikitext, chat, code; the three passes of a layer on a 16-core M5 Pro) 32-row tiles take 2.42-2.78 ms at
+// 512 rows and 6.70-6.83 ms at 2048 rows against 3.44-3.86 and 8.20-8.23 for 64-row tiles sharing one 64-column stage
+// over four 16-row simdgroups, and 1.29-1.71 ms against 1.59-2.60 for 8-row tiles at 128-256 rows.
+template <ushort Rows, ushort Ep>
+inline void moe_gguf_expert_tile(device bfloat *input, device const MoeTileDescriptor *tiles, device const uint *tile_count,
                                  device uchar *w0, device uchar *w1, device uchar *meta, device uchar *sw0, device uchar *sw1,
                                  device uchar *smeta, device bfloat *output, device bfloat *aux,
                                  constant MoeGgufExpertParams &p, uint2 group, uint simd_lane, uint simd_group,
                                  threadgroup half *stage, threadgroup half2 *tl) {
   if (group.y >= *tile_count) return;
-  const MoeGgufSegment s = moe_gguf_segment(tiles[group.y].expert, p, w0, w1, meta, sw0, sw1, smeta);
-  device bfloat *x = input + ulong(group.y) * 8 * p.input_size;
-  const ulong out = ulong(group.y) * 8 * p.output_size;
+  const MoeTileDescriptor tile = tiles[group.y];
+  const MoeGgufSegment s = moe_gguf_segment(tile.expert, p, w0, w1, meta, sw0, sw1, smeta);
+  device bfloat *x = input + ulong(group.y) * Rows * p.input_size;
+  const ulong out = ulong(group.y) * Rows * p.output_size;
   const uint origin = group.x * 64 + simd_group * 32;
   threadgroup half *my = stage + simd_group * (2 * 32 * 32);
   quant_iq4_pair_table(tl, simd_group * 32 + simd_lane, 64);
-  auto acc = gguf_make_acc<bfloat, 8, 32, 32>(x, p.input_size, my);
-  gguf_zero(acc);
-  gguf_accum_any<bfloat, 8, 32, 32, 2, 1>(s.format, x, s.w0, s.w1, s.meta, p.input_size, origin, my, tl, simd_lane, 0,
-                                          p.input_size / 32, acc);
-  gguf_elements(acc, [&](uint row, uint column, float v) {
-    const ulong o = out + ulong(row) * p.output_size + origin + column;
-    if constexpr (Ep == EpUpWithGate) v = float(bfloat(v)) * silu_gate(float(aux[o]));
-    output[o] = bfloat(v);
-  });
+  const auto run = [&](auto rows) {
+    constexpr ushort R = decltype(rows)::value;
+    auto acc = gguf_make_acc<bfloat, R, 32, 32>(x, p.input_size, my);
+    gguf_zero(acc);
+    gguf_accum_any<bfloat, R, 32, 32, 2, 1>(s.format, x, s.w0, s.w1, s.meta, p.input_size, origin, my, tl, simd_lane, 0,
+                                            p.input_size / 32, acc);
+    gguf_elements(acc, [&](uint row, uint column, float v) {
+      const ulong o = out + ulong(row) * p.output_size + origin + column;
+      if constexpr (Ep == EpUpWithGate) v = float(bfloat(v)) * silu_gate(float(aux[o]));
+      output[o] = bfloat(v);
+    });
+  };
+  if constexpr (Rows == 8) run(integral_constant<ushort, 8>{});
+  else if (tile.rows <= 16) run(integral_constant<ushort, 16>{});
+  else run(integral_constant<ushort, 32>{});
 }
-// Prefill: 64-row tiles, four simdgroups of 16 rows on a shared 64-column stage, grid (N / 64, tiles). Simdgroups past
-// the tile's rows (an expert's last tile) skip their matmuls, not the stage, and 64 rows balance the stage against that
-// padding: one 35B MoE layer of 2048 rows (256 experts, top 8) on a 20-core M5 Pro, 32/64/128-row tiles 13.3/8.6/9.3 ms.
-template <ushort Ep>
-inline void moe_gguf_prefill_tile(device bfloat *input, device const MoeTileDescriptor *tiles, device const uint *tile_count,
-                                  device uchar *w0, device uchar *w1, device uchar *meta, device uchar *sw0, device uchar *sw1,
-                                  device uchar *smeta, device bfloat *output, device bfloat *aux,
-                                  constant MoeGgufExpertParams &p, uint2 group, uint simd_lane, uint simd_group,
-                                  threadgroup half *stage, threadgroup half2 *tl) {
-  if (group.y >= *tile_count) return;
-  const MoeGgufSegment s = moe_gguf_segment(tiles[group.y].expert, p, w0, w1, meta, sw0, sw1, smeta);
-  const ulong in = ulong(group.y) * 64 * p.input_size, out = ulong(group.y) * 64 * p.output_size;
-  quant_iq4_pair_table(tl, simd_group * 32 + simd_lane, 128);
-  quant_format_switch(s.format, [&](auto format) {
-    pf_tile<decltype(format), bfloat, 16, 4, 64, 64, 1, Ep>(input + in, s.w0, s.w1, s.meta, output + out, p.output_size,
-                                                            p.input_size, group.x * 64, tiles[group.y].rows, stage, tl,
-                                                            simd_lane, simd_group, p.output_size, 0, aux + out);
-  });
-}
-#define MOE_GGUF_K(Name, Tile, Stage)                                                                                   \
+#define MOE_GGUF_K(Name, Rows, Ep)                                                                                      \
   kernel void Name(device bfloat *input [[buffer(0)]], device const MoeTileDescriptor *tiles [[buffer(1)]],            \
                    device const uint *tile_count [[buffer(2)]], SEGBUF(3, w0, w1, meta), SEGBUF(6, sw0, sw1, smeta),     \
                    device bfloat *output [[buffer(9)]], device bfloat *aux [[buffer(10)]],                               \
                    constant MoeGgufExpertParams &p [[buffer(11)]], uint2 group [[threadgroup_position_in_grid]], IDS) {  \
-    threadgroup half stage[Stage]; threadgroup half2 tl[256];                                                          \
-    Tile(input, tiles, tile_count, w0, w1, meta, sw0, sw1, smeta, output, aux, p, group, simd_lane, simd_group,        \
-         stage, tl);                                                                                                   \
+    threadgroup half stage[2 * 2 * 32 * 32]; threadgroup half2 tl[256];                                                \
+    moe_gguf_expert_tile<Rows, Ep>(input, tiles, tile_count, w0, w1, meta, sw0, sw1, smeta, output, aux, p, group,     \
+                                   simd_lane, simd_group, stage, tl);                                                  \
   }
-MOE_GGUF_K(moe_expert_gguf_m8, moe_gguf_decode_tile<EpNone>, 2 * 2 * 32 * 32)
-MOE_GGUF_K(moe_expert_gguf_m8_up, moe_gguf_decode_tile<EpUpWithGate>, 2 * 2 * 32 * 32)
-MOE_GGUF_K(moe_expert_gguf_m64, moe_gguf_prefill_tile<EpNone>, 2 * 64 * 64)
-MOE_GGUF_K(moe_expert_gguf_m64_up, moe_gguf_prefill_tile<EpUpWithGate>, 2 * 64 * 64)
+MOE_GGUF_K(moe_expert_gguf_m8, 8, EpNone)
+MOE_GGUF_K(moe_expert_gguf_m8_up, 8, EpUpWithGate)
+MOE_GGUF_K(moe_expert_gguf_m32, 32, EpNone)
+MOE_GGUF_K(moe_expert_gguf_m32_up, 32, EpUpWithGate)
 #undef MOE_GGUF_K
 
 // ---------------- token embedding gather from native block_q4_K rows (row = K/256 blocks of 144 B)

@@ -193,6 +193,7 @@ MoePlan ExecutionPlans::moePrefill(MoeShape shape, uint32_t rows) const {
   if (shape.quant == QuantFamily::Gguf) {
     config.expertTile = moeGgufPrefillTile(shape, rows, moeGgufTile_);
     config.ggufTile = moeGgufTile_;
+    config.ggufRouterTile = linear_.ggufFloatTile(rows, shape.experts);
   } else {
     config = configurationFor(choices_.moe, MoeWorkload{shape, rows, MoePhase::Prefill}, config);
   }
@@ -214,7 +215,10 @@ MoePlan ExecutionPlans::moeDecode(MoeShape shape, uint32_t lanes) const {
                          baseline);
   config.routeWideRows = moeRouteWideRows_;
   config.m8Simdgroups = moeDecodeSimdgroups_;
-  if (shape.quant == QuantFamily::Gguf) config.ggufTile = moeGgufTile_;
+  if (shape.quant == QuantFamily::Gguf) {
+    config.ggufTile = moeGgufTile_;
+    config.ggufRouterTile = linear_.ggufFloatTile(lanes * kDecodeRows, shape.experts);
+  }
   return MoE::decodePlan(shape, lanes, config);
 }
 

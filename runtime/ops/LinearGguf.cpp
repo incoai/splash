@@ -343,31 +343,57 @@ void Q4Linear::addGgufSimdgroup(metal::CommandGraph &graph, const LinearBuffers 
   }
 }
 
-// Float segments of a projection (GgufSegment::isFloat): the fp32 kernel over
-// the step's rows, whatever the rows of the plan's tiles.
+// Float segments of a projection (GgufSegment::isFloat): a float projection
+// over the step's rows, whatever the rows of the plan's tiles.
 void Q4Linear::addGgufFloatSegments(metal::CommandGraph &graph, const LinearBuffers &b,
                                     const Q4Projection &p, const LinearPlan &plan) const {
   const LinearWorkload w = plan.workload();
   if (w.epilogue != LinearEpilogue::None) throw std::invalid_argument("GGUF float segments take no epilogue");
   for (const GgufSegment &s : p.gguf)
-    if (s.isFloat()) addGgufFloat(graph, b.input, s, b.output, w.rows, w.matrix.outputSize, s.columnOffset);
+    if (s.isFloat())
+      addGgufFloat(graph, b.input, s, b.output, w.rows, w.matrix.outputSize, s.columnOffset, FloatOutput::BFloat16,
+                   ggufFloatTile(w.rows, s.outputSize));
+}
+
+// The neural accelerator tile needs one (Apple9's matrix operations share the
+// FP32 pipe, where three bf16 matmuls cost three fp32 ones) and a grid of its
+// 64-row by 32-column tiles of at least three threadgroups per two cores. A
+// tile runs K / 32 dependent steps (~50 us at the 35B's K = 2048), while the
+// fp32 kernel spreads fewer rows over 8-column tiles with 16 K partitions
+// each and finishes first below that: at K = 2048 its time equals the
+// accelerator's at 1.4-1.6 tiles per core for both float projections of the
+// 35B on the 16- and 20-core M5 Pro (router, N 256: 170 and 210 rows;
+// alpha/beta, N 64: 720 and 850 rows). Above it the accelerator is up to
+// 2.2x (router) and 2.3x (alpha/beta) faster at 2048 rows, ms per dispatch
+// 0.81 -> 0.36 and 0.20 -> 0.083 on 16 cores.
+FloatTile Q4Linear::ggufFloatTile(uint32_t rows, uint32_t outputSize) const noexcept {
+  const uint64_t tiles = uint64_t{(rows + 63) / 64} * ((outputSize + 31) / 32);
+  return appleGpuFamily_ != 9 && rows >= 16 && 2 * tiles >= uint64_t{3} * gpuCores_ ? FloatTile::NeuralAccelerator
+                                                                                     : FloatTile::Simdgroup;
 }
 
 bool GgufSegment::isFloat() const noexcept { return type == GGUF_TYPE_F32; }
 
-// 8 columns of 32 rows per threadgroup of 16 simdgroups (kernels/shared/gguf_float.metal).
+// Simdgroup: 8 columns of 32 rows per threadgroup of 16 simdgroups. Neural
+// accelerator: 32 columns of 64 rows per threadgroup of 4 simdgroups, at least
+// 16 rows and K a multiple of 32 (kernels/shared/gguf_float.metal).
 void addGgufFloat(metal::CommandGraph &graph, metal::MetalBuffer input, const GgufSegment &weights,
                   metal::MetalBuffer output, uint32_t rows, uint32_t outStride, uint32_t outOffset,
-                  FloatOutput type) {
+                  FloatOutput type, FloatTile tile) {
   const uint32_t n = weights.outputSize, k = weights.inputSize;
   const uint64_t element = type == FloatOutput::Float32 ? sizeof(float) : sizeof(uint16_t);
+  const bool accelerator = tile == FloatTile::NeuralAccelerator;
   if (!weights.isFloat() || !rows || !n || n % 8 || !k || k % 8 || outOffset + uint64_t{n} > outStride ||
-      weights.plane0.sizeBytes() < uint64_t{n} * k * sizeof(float) || input.sizeBytes() < uint64_t{rows} * k * 2 ||
+      (accelerator && (rows < 16 || k % 32)) || weights.plane0.sizeBytes() < uint64_t{n} * k * sizeof(float) ||
+      input.sizeBytes() < uint64_t{rows} * k * 2 ||
       output.sizeBytes() < (uint64_t{rows - 1} * outStride + outOffset + n) * element)
     throw std::invalid_argument("invalid GGUF float projection");
-  graph.add(type == FloatOutput::Float32 ? "gguf_float_f32" : "gguf_float_bf16",
-            {std::move(input), weights.plane0, std::move(output)}, GgufFloatParams{rows, k, n, outStride, outOffset},
-            {n / 8, (rows + 31) / 32, 1}, {512, 1, 1});
+  const std::string kernel = std::string(accelerator ? "gguf_float_na_" : "gguf_float_") +
+                             (type == FloatOutput::Float32 ? "f32" : "bf16");
+  const metal::DispatchSize grid = accelerator ? metal::DispatchSize{(n + 31) / 32, (rows + 63) / 64, 1}
+                                               : metal::DispatchSize{n / 8, (rows + 31) / 32, 1};
+  graph.add(kernel, {std::move(input), weights.plane0, std::move(output)},
+            GgufFloatParams{rows, k, n, outStride, outOffset}, grid, {accelerator ? 128u : 512u, 1, 1});
 }
 
 } // namespace splash::ops
