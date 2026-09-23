@@ -543,7 +543,6 @@ constexpr uint32_t kKQDecodeThreads = 64;
 constexpr uint32_t kKQPrefillRows = 128;
 constexpr uint32_t kKQPrefillTileColumns = 64;
 constexpr uint32_t kKQPrefillThreads = 128;
-constexpr uint32_t kKQHeadBlock = 128;
 
 std::string kqKernel(const char *family, const char *format, uint32_t rows) {
   return std::string(family) + "_" + format + "_m" + std::to_string(rows) + "_c32_sg2_k32_b2_p1";
@@ -599,14 +598,6 @@ void addGguf(metal::CommandGraph &graph, const LinearBuffers &b, const Q4Project
   // GateUp writes the gate there first. Decode gate/up is one fused kernel.
   if (w.epilogue == LinearEpilogue::UpWithGate || (w.epilogue == LinearEpilogue::GateUp && !small))
     need(b.gateScratch, uint64_t{rows} * n * 2, "gate scratch");
-  metal::MetalBuffer input = b.input;
-  if (p.ggufPermuteHeads) {
-    need(p.kqPermuted, uint64_t{rows} * k * 2, "permuted");
-    need(p.kqPermutation, uint64_t{k / kKQHeadBlock} * 4, "permutation");
-    graph.add("gguf_permute_heads", {b.input, p.kqPermuted, p.kqPermutation},
-              GgufPermuteParams{rows, k, kKQHeadBlock}, {(rows * k + 255) / 256, 1, 1}, {256, 1, 1});
-    input = p.kqPermuted;
-  }
   const auto epilogueId = [](LinearEpilogue e) { return e == LinearEpilogue::Residual ? GGUF_EPILOGUE_RESIDUAL
                                                       : e == LinearEpilogue::UpWithGate ? GGUF_EPILOGUE_UP_WITH_GATE : GGUF_EPILOGUE_NONE; };
   const auto plane1 = [](const GgufSegment &s) { return s.plane1 ? s.plane1 : s.meta; };
@@ -616,7 +607,7 @@ void addGguf(metal::CommandGraph &graph, const LinearBuffers &b, const Q4Project
     if (w.epilogue == LinearEpilogue::GateUp) {
       if (gate->gguf.size() != 1 || p.gguf.size() != 1) throw std::invalid_argument("GGUF gate/up must be single tensors");
       const GgufSegment &g = gate->gguf.front(), &u = p.gguf.front();
-      graph.add("gguf_gateup_m" + std::to_string(rows), {input, g.plane0, plane1(g), g.meta, u.plane0, plane1(u), u.meta, b.output},
+      graph.add("gguf_gateup_m" + std::to_string(rows), {b.input, g.plane0, plane1(g), g.meta, u.plane0, plane1(u), u.meta, b.output},
                 GgufGateUpParams{k, n, n, g.formatId, u.formatId}, {n / kKQDecodeTileColumns, 1, 1}, {kKQDecodeThreads, 1, 1});
     } else if (p.gguf.size() > 1) {
       if (p.gguf.size() > 3 || w.epilogue != LinearEpilogue::None) throw std::invalid_argument("GGUF fused projection needs <= 3 segments and no epilogue");
@@ -629,7 +620,7 @@ void addGguf(metal::CommandGraph &graph, const LinearBuffers &b, const Q4Project
       std::stable_sort(order.begin(), order.end(), [&](const GgufSegment *a, const GgufSegment *c) {
         return bitsPerWeight(*a) > bitsPerWeight(*c); });
       GgufFusedParams fp{k, n, static_cast<uint32_t>(p.gguf.size()), 0, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}};
-      std::vector<metal::MetalBuffer> bufs{input};
+      std::vector<metal::MetalBuffer> bufs{b.input};
       for (size_t i = 0; i < 3; ++i) {
         const GgufSegment &s = *order[std::min(i, order.size() - 1)];
         if (i < order.size()) { fp.cols[i] = s.outputSize; fp.fmt[i] = s.formatId; fp.offset[i] = s.columnOffset; }
@@ -648,14 +639,14 @@ void addGguf(metal::CommandGraph &graph, const LinearBuffers &b, const Q4Project
         need(p.kqPartials, uint64_t{splits} * rows * n * 4, "partials");
         need(p.kqCounters, uint64_t{tiles} * 4, "counters");
         graph.add(std::string("gguf_splitk_") + s.format + "_m" + std::to_string(rows),
-                  {input, s.plane0, plane1(s), s.meta, p.kqPartials, p.kqCounters, b.output, aux},
+                  {b.input, s.plane0, plane1(s), s.meta, p.kqPartials, p.kqCounters, b.output, aux},
                   GgufSplitParams{n, k, splits, n, 0, epilogueId(w.epilogue)}, {tiles, splits, 1}, {kKQDecodeThreads, 1, 1});
       } else if (w.epilogue == LinearEpilogue::None) {
-        graph.add(kqKernel("sga", s.format, rows), {input, s.plane0, plane1(s), s.meta, b.output},
+        graph.add(kqKernel("sga", s.format, rows), {b.input, s.plane0, plane1(s), s.meta, b.output},
                   GgufParams{n, k, tiles, n, 0}, {tiles, 1, 1}, {kKQDecodeThreads, 1, 1});
       } else {
         graph.add(kqKernel(w.epilogue == LinearEpilogue::Residual ? "sgr" : "sgg", s.format, rows),
-                  {input, s.plane0, plane1(s), s.meta, b.output, aux}, GgufParams{n, k, tiles, n, 0}, {tiles, 1, 1}, {kKQDecodeThreads, 1, 1});
+                  {b.input, s.plane0, plane1(s), s.meta, b.output, aux}, GgufParams{n, k, tiles, n, 0}, {tiles, 1, 1}, {kKQDecodeThreads, 1, 1});
       }
     }
   } else {
@@ -665,11 +656,11 @@ void addGguf(metal::CommandGraph &graph, const LinearBuffers &b, const Q4Project
         const uint32_t tiles = s.outputSize / kKQPrefillTileColumns;
         const GgufParams params{s.outputSize, k, 0, n, s.columnOffset};
         if (epilogue == GGUF_EPILOGUE_NONE)
-          graph.add(kqPrefillKernel("pfa", s.format), {input, s.plane0, plane1(s), s.meta, output}, params,
+          graph.add(kqPrefillKernel("pfa", s.format), {b.input, s.plane0, plane1(s), s.meta, output}, params,
                     {rows / kKQPrefillRows, tiles, 1}, {kKQPrefillThreads, 1, 1});
         else
           graph.add(kqPrefillKernel(epilogue == GGUF_EPILOGUE_RESIDUAL ? "pfr" : "pfg", s.format),
-                    {input, s.plane0, plane1(s), s.meta, output, aux}, params, {rows / kKQPrefillRows, tiles, 1}, {kKQPrefillThreads, 1, 1});
+                    {b.input, s.plane0, plane1(s), s.meta, output, aux}, params, {rows / kKQPrefillRows, tiles, 1}, {kKQPrefillThreads, 1, 1});
       }
     };
     switch (w.epilogue) {

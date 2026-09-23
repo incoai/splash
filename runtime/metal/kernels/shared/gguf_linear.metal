@@ -473,13 +473,6 @@ kernel void gguf_embed_q80(device const uint *tokens [[buffer(0)]], device const
   const half d = as_type<half>(ushort(blk[0] | (blk[1] << 8)));
   output[index] = bfloat(float(d) * float(as_type<char>(blk[2 + dim % 32])));
 }
-// permute the K columns (in 128-wide head blocks) of a bf16 activation: out[row][h*128+e] = in[row][perm[h]*128+e]
-kernel void gguf_permute_heads(device const bfloat *input [[buffer(0)]], device bfloat *output [[buffer(1)]], device const uint *perm [[buffer(2)]],
-                          constant GgufPermuteParams &p [[buffer(3)]], uint index [[thread_position_in_grid]]) {
-  if (index >= p.rows * p.width) return;
-  const uint row = index / p.width, col = index % p.width, h = col / p.block, e = col % p.block;
-  output[index] = input[ulong(row) * p.width + perm[h] * p.block + e];
-}
 
 // ---- load-time repack: native GGUF rows -> MDGG0001 planes (metal/abi/QuantFormat.h) ----
 // One thread per (destination row n, 32-wide K group g). Rows >= permute_from_row are read from

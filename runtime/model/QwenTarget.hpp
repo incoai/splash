@@ -33,6 +33,9 @@ struct QwenGdnWeights final {
   metal::MetalBuffer timeBias;
   metal::MetalBuffer mixerNorm;
   ops::Q4Projection outputProjection;
+  // The value-head order of outputProjection's input columns, in which the
+  // GDN writes its output.
+  ops::GdnHeadOrder outputHeadOrder = ops::GdnHeadOrder::Grouped;
 };
 
 struct QwenAttentionWeights final {

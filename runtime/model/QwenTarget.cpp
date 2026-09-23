@@ -156,9 +156,9 @@ QwenMixerWeights readQwenMixer(WeightFile &file, metal::MetalBackend &backend,
       "gdn-norm");
   if (ggufTarget) {
     // The GGUF keeps out_proj's input columns in llama.cpp's tiled value-head
-    // order; the GDN kernel emits grouped order, so the activation is permuted.
+    // order, so the GDN writes its output in that order.
     gdn.outputProjection = readGgufProjection(file, "gdn-output");
-    gdn.outputProjection.ggufPermuteHeads = true;
+    gdn.outputHeadOrder = ops::GdnHeadOrder::Tiled;
   } else {
     gdn.outputProjection = readQ4Projection(
         file, backend, geometry.hiddenSize, geometry.attentionWidth, "gdn-output");
@@ -293,7 +293,7 @@ void QwenTarget::addPrefillImpl(
                    mixer.mixerNorm,
                    u16(buffers.gdnHidden, sequence.rowBegin, sequence.rows,
                        geometry_.attentionWidth)},
-                  geometry_.gdnShape(), sequence.rows);
+                  geometry_.gdnShape(), sequence.rows, mixer.outputHeadOrder);
             }
             operators_.linear().addPrefillSums(graph, buffers.gdnHidden,
                                buffers.projectionSums, mixerOutput, rows);
@@ -498,7 +498,8 @@ void QwenTarget::addVerifyImpl(
                 geometry_.gdnShape(), lanes, gdnIndex,
                 {geometry_.stateLayout.convolutionLayerBytes(),
                  geometry_.stateLayout.recurrentLayerBytes(),
-                 geometry_.stateLayout.convolutionBytes()});
+                 geometry_.stateLayout.convolutionBytes()},
+                mixer.outputHeadOrder);
             operators_.linear().addResidualBatch(
                 graph, buffers.gdnHidden,
                 mixer.outputProjection, input, buffers.gdnOutput, mixerOutput,

@@ -20,13 +20,6 @@ struct GgufEmbedParams {
 };
 static_assert(sizeof(GgufEmbedParams) == 12, "GGUF embedding parameters are 12 bytes on both sides");
 
-struct GgufPermuteParams {
-  uint32_t rows;
-  uint32_t width;
-  uint32_t block;
-};
-static_assert(sizeof(GgufPermuteParams) == 12, "GGUF permute parameters are 12 bytes on both sides");
-
 // Load-time repack of native GGUF rows into the MDGG0001 planes (gguf_repack):
 // one thread per (destination row, 32-wide K group).
 struct GgufRepackParams {
