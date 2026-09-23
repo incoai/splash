@@ -343,18 +343,20 @@ public:
       gateScratch_ = backend_.allocateBuffer(
           denseScratchBytes, metal::BufferStorage::Private, "qwen-gate-scratch");
     }
+    // Each field exists only when some plan uses it (split-only plans have
+    // partials and counters but no activation table).
     const auto linearSize = linearScratchSize(geometry_, operators);
-    if (linearSize.bytes()) {
-      linearScratch_.input = backend_.allocateBuffer(
-          linearSize.input, metal::BufferStorage::Private, "q4-input");
-      linearScratch_.sums = backend_.allocateBuffer(
-          linearSize.sums, metal::BufferStorage::Private, "q4-sums");
-      linearScratch_.partials = backend_.allocateBuffer(
-          linearSize.partials, metal::BufferStorage::Private, "q4-partials");
-      linearScratch_.counters = backend_.allocateBuffer(
-          linearSize.counters, metal::BufferStorage::Shared, "q4-counters");
+    const auto allocate = [&](uint64_t bytes, metal::BufferStorage storage, const char *label) {
+      return bytes ? backend_.allocateBuffer(bytes, storage, label) : metal::MetalBuffer{};
+    };
+    linearScratch_.input = allocate(linearSize.input, metal::BufferStorage::Private, "q4-input");
+    linearScratch_.sums = allocate(linearSize.sums, metal::BufferStorage::Private, "q4-sums");
+    linearScratch_.partials =
+        allocate(linearSize.partials, metal::BufferStorage::Private, "q4-partials");
+    linearScratch_.counters =
+        allocate(linearSize.counters, metal::BufferStorage::Shared, "q4-counters");
+    if (linearSize.counters)
       std::memset(linearScratch_.counters.contents(), 0, linearSize.counters);
-    }
     bytes_ = checkedAdd(checkedAdd(baseBytes, denseScratchBytes, "decode arena"),
                         linearSize.bytes(), "Q4 decode scratch");
   }
