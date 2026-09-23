@@ -5,6 +5,7 @@
 // Activations fp16 or bf16 [rows][K]; weights staged as fp16 in threadgroup memory; fp32 accumulation; bf16 output.
 #include "metal/abi/Gguf.h"
 #include "metal/kernels/common/quant_formats.h"
+#include "metal/kernels/common/split_reduce.h"
 
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 #include <metal_stdlib>
@@ -372,9 +373,10 @@ GGUF_FUSED_K(8) GGUF_FUSED_K(16) GGUF_FUSED_K(24) GGUF_FUSED_K(32)
   }
 GGUF_GATEUP_K(8) GGUF_GATEUP_K(16) GGUF_GATEUP_K(24) GGUF_GATEUP_K(32)
 
-// ---------------- split-K with last-arriver reduction (per format), epilogue applied by the reducing threadgroup
+// ---------------- split-K with last-arriver reduction (kernels/common/split_reduce.h, per format), fp32 partials
+// [split][Rows][N], epilogue applied by the reducing threadgroup
 template <class F, ushort Rows>
-inline void gguf_splitk_tile(device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta, device float *partials,
+inline void gguf_splitk_tile(device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta, device coherent(device) float *partials,
                            device atomic_uint *counters, device bfloat *output, device bfloat *aux, constant GgufSplitParams &p,
                            uint2 group, uint simd_lane, uint simd_group, threadgroup half *stage, threadgroup half2 *tl, threadgroup uint *arrival) {
   const uint steps = p.input_size / 32, per = steps / p.splits, thread_index = simd_group * 32 + simd_lane;
@@ -391,30 +393,22 @@ inline void gguf_splitk_tile(device bfloat *input, device uchar *w0, device ucha
     auto index = acc.get_multidimensional_index(i);
     partials[(ulong(group.y) * Rows + index[1]) * N + origin + index[0]] = acc[i];
   }
-  threadgroup_barrier(mem_flags::mem_device);
-  if (thread_index == 0) {
-    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope::thread_scope_device);
-    *arrival = atomic_fetch_add_explicit(counters + group.x, 1u, memory_order_relaxed);
-    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope::thread_scope_device);
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
-  if (*arrival != p.splits - 1) return;
+  if (!split_arrive_last(counters + group.x, p.splits, thread_index, arrival)) return;
 #pragma unroll
   for (ushort i = 0; i < acc.get_capacity(); ++i) {
     if (!acc.is_valid_element(i)) continue;
     auto index = acc.get_multidimensional_index(i);
-    float total = 0.0f;
-    for (uint s = 0; s < p.splits; ++s)
-      total += s == group.y ? acc[i] : partials[(ulong(s) * Rows + index[1]) * N + origin + index[0]];
+    float total = split_sum(float(acc[i]), group.y, p.splits,
+                            [&](uint s) { return partials[(ulong(s) * Rows + index[1]) * N + origin + index[0]]; });
     const ulong o = ulong(index[1]) * p.out_stride + p.out_offset + origin + index[0];
     if (p.epilogue == GGUF_EPILOGUE_RESIDUAL) total += float(aux[o]);
     if (p.epilogue == GGUF_EPILOGUE_UP_WITH_GATE) total = float(bfloat(total)) * silu_gate(float(aux[o]));
     output[o] = bfloat(total);
   }
-  if (thread_index == 0) atomic_store_explicit(counters + group.x, 0u, memory_order_relaxed);
+  split_release(counters + group.x, thread_index);
 }
 #define GGUF_SPLITK_K(F, f, R)                                                                                      \
-  kernel void gguf_splitk_##f##_m##R(device bfloat *input [[buffer(0)]], SEGBUF(1, w0, w1, meta), device float *partials [[buffer(4)]], \
+  kernel void gguf_splitk_##f##_m##R(device bfloat *input [[buffer(0)]], SEGBUF(1, w0, w1, meta), device coherent(device) float *partials [[buffer(4)]], \
                              device atomic_uint *counters [[buffer(5)]], device bfloat *output [[buffer(6)]], device bfloat *aux [[buffer(7)]], \
                              constant GgufSplitParams &p [[buffer(8)]], uint2 group [[threadgroup_position_in_grid]], IDS) { \
     threadgroup half stage[2 * 2 * 32 * 32]; threadgroup half2 tl[F::Kind == QuantCodebook ? 256 : 1]; threadgroup uint arrival; \
