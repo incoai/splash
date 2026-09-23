@@ -243,6 +243,81 @@ static int registerKernels(id<MTLLibrary> lib) {
   }
   return failures;
 }
+// Staged decode kernels (gguf_linear.metal) put every request lane in one matmul2d destination of 8, 16, 24 or 32
+// rows, so their lane invariance is the MPP property that a row's result does not depend on the destination height.
+// Lane r of every 16-, 24- and 32-row kernel must equal the 8-row kernel on its rows bitwise: plain, residual and
+// up-with-gate tiles, split-K at 2, 4 and 8 partitions (partials poisoned with NaN), fused segments and gate/up.
+static int stagedLanes(id<MTLLibrary> lib) {
+  constexpr uint32_t N = 768, K = 2048, kMaxLanes = 4, kRows = 8 * kMaxLanes;
+  int failures = 0;
+  std::uniform_real_distribution<float> random(-1.f, 1.f);
+  const auto filled = [&](uint64_t elements) {
+    id<MTLBuffer> b = mkbuf(elements * 2); uint16_t *v = (uint16_t *)b.contents;
+    for (uint64_t i = 0; i < elements; ++i) v[i] = f2bf(random(rng));
+    return b; };
+  id<MTLBuffer> X = filled(uint64_t(kRows) * K), A = filled(uint64_t(kRows) * N);
+  id<MTLBuffer> laneX[kMaxLanes], laneA[kMaxLanes];
+  for (uint32_t r = 0; r < kMaxLanes; ++r) {
+    laneX[r] = mkbuf(uint64_t(8) * K * 2); memcpy(laneX[r].contents, (const uint16_t *)X.contents + size_t(8 * r) * K, laneX[r].length);
+    laneA[r] = mkbuf(uint64_t(8) * N * 2); memcpy(laneA[r].contents, (const uint16_t *)A.contents + size_t(8 * r) * N, laneA[r].length);
+  }
+  id<MTLBuffer> partials = mkbuf(uint64_t(8) * kRows * N * 4), counters = mkbuf(N / 64 * 4);
+  memset(counters.contents, 0, counters.length);
+  for (int fi = 0; fi < FMT_COUNT; ++fi) {
+    const Fmt f = Fmt(fi), f2 = Fmt((fi + 3) % FMT_COUNT), f3 = Fmt((fi + 5) % FMT_COUNT);
+    const Seg s = makeSegK(f, N, K, 0), g = makeSegK(f2, N, K, 0);
+    const Seg parts[3] = {makeSegK(f, 256, K, 0), makeSegK(f2, 256, K, 256), makeSegK(f3, 256, K, 512)};
+    // One dispatch of `rows` rows reading x and aux, writing y (rows x N), by kernel kind.
+    const auto dispatch = [&](const std::string &kind, uint32_t splits, uint32_t rows, id<MTLBuffer> x, id<MTLBuffer> aux,
+                              id<MTLBuffer> y) -> Dispatch {
+      const std::string m = "_m" + std::to_string(rows);
+      if (kind == "fused") {
+        const GgufFusedParams fp{K, N, 3, 0, {256, 256, 256}, {uint32_t(f), uint32_t(f2), uint32_t(f3)}, {0, 256, 512}};
+        return {pso(lib, "gguf_fused" + m), {x, parts[0].w0, parts[0].w1, parts[0].meta, parts[1].w0, parts[1].w1, parts[1].meta,
+                                             parts[2].w0, parts[2].w1, parts[2].meta, y}, bytes(fp), 11, MTLSizeMake(N / 64, 1, 1), MTLSizeMake(64, 1, 1)};
+      }
+      if (kind == "gateup")
+        return {pso(lib, "gguf_gateup" + m), {x, g.w0, g.w1, g.meta, s.w0, s.w1, s.meta, y}, bytes(GgufGateUpParams{K, N, N, uint32_t(f2), uint32_t(f)}), 8,
+                MTLSizeMake(N / 64, 1, 1), MTLSizeMake(64, 1, 1)};
+      const uint32_t epilogue = kind == "r" ? GGUF_EPILOGUE_RESIDUAL : kind == "g" ? GGUF_EPILOGUE_UP_WITH_GATE : GGUF_EPILOGUE_NONE;
+      if (splits > 1)
+        return {pso(lib, std::string("gguf_splitk_") + fmtName(f) + m), {x, s.w0, s.w1, s.meta, partials, counters, y, aux},
+                bytes(GgufSplitParams{N, K, splits, N, 0, epilogue}), 8, MTLSizeMake(N / 64, splits, 1), MTLSizeMake(64, 1, 1)};
+      const std::string name = "sg" + kind + "_" + fmtName(f) + m + "_c32_sg2_k32_b2_p1";
+      if (kind == "a") return {pso(lib, name), {x, s.w0, s.w1, s.meta, y}, bytes(GgufParams{N, K, N / 64, 0, 0}), 5, MTLSizeMake(N / 64, 1, 1), MTLSizeMake(64, 1, 1)};
+      return {pso(lib, name), {x, s.w0, s.w1, s.meta, y, aux}, bytes(GgufParams{N, K, N / 64, 0, 0}), 6, MTLSizeMake(N / 64, 1, 1), MTLSizeMake(64, 1, 1)};
+    };
+    int formatFailures = 0;
+    for (const auto &[kind, splits] : std::vector<std::pair<std::string, uint32_t>>{
+             {"a", 1}, {"r", 1}, {"g", 1}, {"a", 2}, {"r", 4}, {"g", 8}, {"fused", 1}, {"gateup", 1}}) {
+      const auto run = [&](uint32_t rows, id<MTLBuffer> x, id<MTLBuffer> aux, id<MTLBuffer> y) {
+        const Dispatch d = dispatch(kind, splits, rows, x, aux, y);
+        if (!d.p) return false;
+        std::fill_n((uint32_t *)partials.contents, partials.length / 4, 0x7FC00000u);
+        runOnce({d}, 1);
+        return true; };
+      id<MTLBuffer> laneY[kMaxLanes];
+      bool ok = true;
+      for (uint32_t r = 0; r < kMaxLanes && ok; ++r) ok = run(8, laneX[r], laneA[r], laneY[r] = mkbuf(uint64_t(8) * N * 2));
+      for (uint32_t lanes = 2; lanes <= kMaxLanes && ok; ++lanes) {
+        id<MTLBuffer> Y = mkbuf(uint64_t(8) * lanes * N * 2);
+        ok = run(8 * lanes, X, A, Y);
+        for (uint32_t r = 0; r < lanes && ok; ++r)
+          if (memcmp((const uint16_t *)Y.contents + size_t(8 * r) * N, laneY[r].contents, laneY[r].length)) {
+            printf("  staged %s %s S=%u: lane %u of %u rows differs from the 8-row kernel FAIL\n", fmtName(f), kind.c_str(), splits, r, 8 * lanes);
+            ++formatFailures;
+          }
+      }
+      if (!ok) ++formatFailures;
+      for (uint32_t t = 0; t < N / 64; ++t)
+        if (((uint32_t *)counters.contents)[t]) { printf("  staged %s %s: counters not reset FAIL\n", fmtName(f), kind.c_str()); ++formatFailures; break; }
+    }
+    printf("%-6s staged lanes: 16/24/32-row plain, residual, gate, split 2/4/8, fused, gate/up equal to 8-row kernels %s\n",
+           fmtName(f), formatFailures ? "FAIL" : "ok");
+    failures += formatFailures;
+  }
+  return failures;
+}
 // time-sg <rounds> <per> <fmt[+fmt..]> <N[+N..]> <K> <a|r|g> [S+S..]: the Apple9 register kernels against the
 // staged kernels on one projection of up to three column segments, L = 1..4 lanes and every valid K split, with the
 // weights DRAM-cold (a ring of copies of at least 384 MiB) and the cases in ABBA order; prints medians. The register
@@ -268,7 +343,8 @@ static int timeRegister(id<MTLLibrary> lib, int argc, char **argv) {
     N += g.N; segs.push_back(std::move(g));
   }
   if (!K || K % 256 || !strchr("arg", ep) || segs.size() > 3 || (segs.size() > 1 && ep != 'a')) { std::cerr << "bad case\n"; return 2; }
-  constexpr uint32_t kMaxLanes = 4, kRows = 8 * kMaxLanes;
+  // Up to 16 K splits, one more than production takes, to see whether its cap of 8 binds on large GPUs.
+  constexpr uint32_t kMaxLanes = 4, kRows = 8 * kMaxLanes, kMaxSplits = 16;
   uint64_t imageBytes = 0;
   for (Segment &g : segs) { g.image = makeSegK(Fmt(g.fmt), g.N, K, g.offset); imageBytes += streamBytes(Fmt(g.fmt), g.N, K); }
   const uint32_t copies = (uint32_t)std::min<uint64_t>(64, std::max<uint64_t>(3, ((384ull << 20) + imageBytes - 1) / imageBytes));
@@ -281,7 +357,7 @@ static int timeRegister(id<MTLLibrary> lib, int argc, char **argv) {
     }
   id<MTLBuffer> X = mkbuf(uint64_t(kRows) * K * 2), table = mkbuf(uint64_t(kRows) * K * 2), sums = mkbuf(uint64_t(kMaxLanes) * (K * 3 / 4) * 4);
   id<MTLBuffer> Y = mkbuf(uint64_t(kRows) * N * 2), A = mkbuf(uint64_t(kRows) * N * 2), G = mkbuf(uint64_t(kRows) * N * 2);
-  id<MTLBuffer> partials = mkbuf(uint64_t(8) * kRows * N * 4), counters = mkbuf(N / 64 * 4);
+  id<MTLBuffer> partials = mkbuf(uint64_t(kMaxSplits) * kRows * N * 4), counters = mkbuf(N / 64 * 4);
   memset(counters.contents, 0, counters.length);
   { std::uniform_real_distribution<float> d(-1.f, 1.f); uint16_t *x = (uint16_t *)X.contents, *a = (uint16_t *)A.contents;
     for (uint64_t i = 0; i < uint64_t(kRows) * K; ++i) x[i] = f2bf(d(rng));
@@ -313,6 +389,26 @@ static int timeRegister(id<MTLLibrary> lib, int argc, char **argv) {
       cases.push_back({"staged fused", lanes, 1, [&, p, params](id<MTLComputeCommandEncoder> enc, uint32_t c) {
         const Seg &a = segs[0].ring[c], &b = segs[std::min<size_t>(1, segs.size() - 1)].ring[c], &d = segs.back().ring[c];
         encode(enc, p, {X, a.w0, a.w1, a.meta, b.w0, b.w1, b.meta, d.w0, d.w1, d.meta, Y}, params, MTLSizeMake(N / 64, 1, 1), MTLSizeMake(64, 1, 1)); }, {}});
+      // The alternative a split rule could take: one plain or split-K dispatch per segment at one split count.
+      for (const uint32_t splits : {1u, 2u, 4u, 8u, 16u}) {
+        if ((K / 32) % splits) continue;
+        std::vector<id<MTLComputePipelineState>> kernels;
+        for (const Segment &g : segs) {
+          char name[80];
+          if (splits == 1) snprintf(name, sizeof name, "sga_%s_m%u_c32_sg2_k32_b2_p1", fmtName(g.fmt), rows);
+          else snprintf(name, sizeof name, "gguf_splitk_%s_m%u", fmtName(g.fmt), rows);
+          kernels.push_back(pso(lib, name));
+          if (!kernels.back()) return 1;
+        }
+        cases.push_back({"staged per-segment S" + std::to_string(splits), lanes, 1, [&, kernels, splits](id<MTLComputeCommandEncoder> enc, uint32_t c) {
+          for (size_t i = 0; i < segs.size(); ++i) {
+            const Segment &g = segs[i]; const Seg &w = g.ring[c];
+            if (splits == 1) encode(enc, kernels[i], {X, w.w0, w.w1, w.meta, Y}, bytes(GgufParams{g.N, K, g.N / 64, N, g.offset}),
+                                    MTLSizeMake(g.N / 64, 1, 1), MTLSizeMake(64, 1, 1));
+            else encode(enc, kernels[i], {X, w.w0, w.w1, w.meta, partials, counters, Y, Y},
+                        bytes(GgufSplitParams{g.N, K, splits, N, g.offset, GGUF_EPILOGUE_NONE}), MTLSizeMake(g.N / 64, splits, 1), MTLSizeMake(64, 1, 1));
+          } }, {}});
+      }
     } else if (ep == 'g') {
       id<MTLComputePipelineState> p = pso(lib, "gguf_gateup_m" + std::to_string(rows));
       if (!p) return 1;
@@ -320,8 +416,34 @@ static int timeRegister(id<MTLLibrary> lib, int argc, char **argv) {
       cases.push_back({"staged", lanes, 2, [&, p, params](id<MTLComputeCommandEncoder> enc, uint32_t c) {
         const Seg &g = one.ring[c], &u = one.ring[(c + 1) % copies];
         encode(enc, p, {X, g.w0, g.w1, g.meta, u.w0, u.w1, u.meta, Y}, params, MTLSizeMake(N / 64, 1, 1), MTLSizeMake(64, 1, 1)); }, {}});
+      // The alternative a split rule could take: a gate pass into G and an up pass whose epilogue applies silu(G),
+      // plain tiles or split-K at one split count (the same bf16 gate and up values as the fused kernel).
+      for (const uint32_t splits : {1u, 2u, 4u, 8u, 16u}) {
+        if ((K / 32) % splits) continue;
+        char gname[80], uname[80];
+        if (splits == 1) {
+          snprintf(gname, sizeof gname, "sga_%s_m%u_c32_sg2_k32_b2_p1", fmtName(one.fmt), rows);
+          snprintf(uname, sizeof uname, "sgg_%s_m%u_c32_sg2_k32_b2_p1", fmtName(one.fmt), rows);
+        } else {
+          snprintf(gname, sizeof gname, "gguf_splitk_%s_m%u", fmtName(one.fmt), rows);
+          snprintf(uname, sizeof uname, "gguf_splitk_%s_m%u", fmtName(one.fmt), rows);
+        }
+        id<MTLComputePipelineState> pg = pso(lib, gname), pu = pso(lib, uname);
+        if (!pg || !pu) return 1;
+        cases.push_back({"staged 2-pass S" + std::to_string(splits), lanes, 2, [&, pg, pu, splits](id<MTLComputeCommandEncoder> enc, uint32_t c) {
+          const Seg &g = one.ring[c], &u = one.ring[(c + 1) % copies];
+          if (splits == 1) {
+            encode(enc, pg, {X, g.w0, g.w1, g.meta, G}, bytes(GgufParams{N, K, N / 64, N, 0}), MTLSizeMake(N / 64, 1, 1), MTLSizeMake(64, 1, 1));
+            encode(enc, pu, {X, u.w0, u.w1, u.meta, Y, G}, bytes(GgufParams{N, K, N / 64, N, 0}), MTLSizeMake(N / 64, 1, 1), MTLSizeMake(64, 1, 1));
+          } else {
+            encode(enc, pg, {X, g.w0, g.w1, g.meta, partials, counters, G, G}, bytes(GgufSplitParams{N, K, splits, N, 0, GGUF_EPILOGUE_NONE}),
+                   MTLSizeMake(N / 64, splits, 1), MTLSizeMake(64, 1, 1));
+            encode(enc, pu, {X, u.w0, u.w1, u.meta, partials, counters, Y, G}, bytes(GgufSplitParams{N, K, splits, N, 0, GGUF_EPILOGUE_UP_WITH_GATE}),
+                   MTLSizeMake(N / 64, splits, 1), MTLSizeMake(64, 1, 1));
+          } }, {}});
+      }
     } else {
-      for (const uint32_t splits : {1u, 2u, 4u, 8u}) {
+      for (const uint32_t splits : {1u, 2u, 4u, 8u, 16u}) {
         if ((K / 32) % splits) continue;
         char name[80];
         if (splits == 1) snprintf(name, sizeof name, "%s_%s_m%u_c32_sg2_k32_b2_p1", ep == 'r' ? "sgr" : "sga", fmtName(one.fmt), rows);
@@ -337,7 +459,7 @@ static int timeRegister(id<MTLLibrary> lib, int argc, char **argv) {
       }
     }
     // register: one dispatch per segment, splits on 256-input units; gate/up is a gate pass and an up pass
-    std::vector<uint32_t> variants{1u, 2u, 4u, 8u};
+    std::vector<uint32_t> variants{1u, 2u, 4u, 8u, 16u};
     if (segs.front().splits) variants.push_back(0);   // the per-segment list
     for (const uint32_t uniform : variants) {
       bool valid = true;
@@ -370,7 +492,7 @@ static int timeRegister(id<MTLLibrary> lib, int argc, char **argv) {
         } }, {}});
     }
     // the fused kernel: every segment in one dispatch
-    for (const uint32_t splits : {1u, 2u, 4u, 8u}) {
+    for (const uint32_t splits : {1u, 2u, 4u, 8u, 16u}) {
       if (K / 256 < splits || ep != 'a') continue;
       id<MTLComputePipelineState> p = pso(lib, "decode_linear_gguf_sg_fused_l" + std::to_string(lanes));
       if (!p) return 1;
@@ -530,8 +652,8 @@ int main(int argc, char **argv) { @autoreleasepool {
       GgufParams pq{N, K, 0, 0, 0}; char name[80]; snprintf(name, sizeof name, "pfa_%s_r32_sg4_n64_k64_p1", fmtName(fi)); id<MTLComputePipelineState> ps = pso(lib, name); if (!ps) { ++failures; continue; }
       Dispatch d{ps, {Xbf, s.w0, s.w1, s.meta, Y}, bytes(pq), 5, MTLSizeMake(rows / 128, N / 64, 1), MTLSizeMake(128, 1, 1)}; runOnce({d}, 1); compare(name, Y, ref, rows, N); } }
   // 5) split-K visibility at production K: two projections back to back share the partials and counters, as every
-  //    GGUF split projection of a decode step does, at the splits addGguf picks (ggufSplits: n <= 1024 -> 8,
-  //    n <= 6144 -> 4 for K <= 6144 else 8, n <= 12288 -> 4 for <= 16 rows else 2). The partials are poisoned before
+  //    GGUF split projection of a decode step does, at split counts 2, 4 and 8 (stagedSplits takes each for
+  //    such shapes at some core count; 8 is its cap). The partials are poisoned before
   //    each dispatch, with a large finite value and in another run with NaN, so a partial read before its writer
   //    published it changes the output. Both outputs must pass the fp64 check the unsplit kernels pass, not depend
   //    on the poison or the run, and leave every counter at zero.
@@ -584,6 +706,8 @@ int main(int argc, char **argv) { @autoreleasepool {
       for (size_t j = 0; j < 2; ++j) { char label[96]; snprintf(label, sizeof label, "shared split %s %ux%u S=%u", fmtName(pair[j].fmt), pair[j].N, pair[j].K, pair[j].splits); compare(label, ops[j].Y, ops[j].ref, rows, pair[j].N); } } }
   // 6) Apple9 register kernels
   failures += registerKernels(lib);
+  // 7) staged lane invariance (Apple10 decode)
+  failures += stagedLanes(lib);
   failures += oracleFailures;
   printf("%s (%d failures)\n", failures ? "VALIDATION FAILED" : "all production kernels validated", failures);
   if (argc > 2 && std::string(argv[2]) == "time-gu") {

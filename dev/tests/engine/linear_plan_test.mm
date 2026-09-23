@@ -796,23 +796,6 @@ void ggufPlans() {
               stagedSplits(10, 5120, 17408, 8) == 4 && stagedSplits(40, 10240, 5120, 8) == 4 &&
               stagedSplits(16, 1024, 256, 8) == 1 && stagedSplits(16, 1024, 3072, 8) == 2,
           "GGUF staged split policy");
-  // A request's sums do not depend on the requests it is batched with: every
-  // GGUF decode plan splits K the same way at every lane count.
-  for (const uint32_t family : {9U, 10U})
-    for (const uint32_t cores : {8U, 10U, 16U, 20U, 32U, 40U, 60U, 80U})
-      for (const auto [n, k] : std::array<std::pair<uint32_t, uint32_t>, 7>{
-               {{256, 5120}, {1024, 5120}, {5120, 6144}, {5120, 17408}, {10240, 5120}, {17408, 5120}, {248320, 5120}}})
-        for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp}) {
-          DeviceCapabilities device;
-          device.appleGpuFamily = family;
-          device.gpuCoreCount = cores;
-          const Q4Linear gpu(device);
-          const auto splits = [&](uint32_t rows) {
-            return gpu.plan({{n, k}, rows, LinearPhase::Decode, epilogue}, projection(n, k, 1)).configuration().splits;
-          };
-          require(splits(8) == splits(16) && splits(8) == splits(24) && splits(8) == splits(32),
-                  "GGUF decode splits depend on the batch width");
-        }
   const LinearPlan fused = linear.plan({{10240, 5120}, 8, LinearPhase::Decode, LinearEpilogue::None},
                                        projection(10240, 5120, 2));
   const LinearPlan gateUp = linear.plan({{17408, 5120}, 16, LinearPhase::Decode, LinearEpilogue::GateUp},
@@ -913,6 +896,85 @@ void ggufPlans() {
     (void)Q4Linear::plan({{5120, 17408}, 128, LinearPhase::Prefill, LinearEpilogue::None, QuantFamily::Gguf},
                          {LinearTile::GgufSimdgroup, 0, LinearSimdgroups::Four, 1});
   });
+}
+
+// The GGUF decode split rules are per-core laws, checked at every core count
+// (zero is the fallback), both families and a grid of widths, inputs, epilogues
+// and segment counts rather than at the measured machines:
+// - a request's sums do not depend on the requests it is batched with: the whole
+//   plan is the same at every batch width;
+// - a split count is a power of two up to eight whose partitions keep the kernel's
+//   floor (register: two 256-input units, staged: 1024 inputs in whole 32-input
+//   groups); the staged fused and gate/up kernels take none;
+// - it depends on the grid per core only: doubling the width and the core count
+//   keeps it, more cores never lower it and a wider grid never raises it;
+// - the arena bound (the single-tensor plan) covers every segment count.
+void ggufCoreLaws() {
+  const auto projection = [](uint32_t n, uint32_t k, uint32_t segments) {
+    Q4Projection p;
+    p.outputSize = n;
+    p.inputSize = k;
+    for (uint32_t i = 0; i < segments; ++i) {
+      GgufSegment s;
+      s.outputSize = n / segments;
+      s.inputSize = k;
+      s.columnOffset = i * (n / segments);
+      p.gguf.push_back(s);
+    }
+    return p;
+  };
+  const auto gpu = [](uint32_t family, uint32_t cores) {
+    DeviceCapabilities device;
+    device.appleGpuFamily = family;
+    device.gpuCoreCount = cores;
+    return Q4Linear(device);
+  };
+  constexpr std::array<uint32_t, 16> widths{256, 512, 768, 1024, 1536, 2048, 3072, 4096, 5120,
+                                            6144, 8192, 12288, 16384, 24576, 65536, 248320};
+  constexpr std::array<uint32_t, 11> inputs{256, 512, 1024, 2048, 3072, 4096, 5120, 6144, 8192, 12288, 17408};
+  for (const uint32_t family : {9U, 10U})
+    for (uint32_t cores = 0; cores <= 128; ++cores) {
+      const Q4Linear linear = gpu(family, cores), more = gpu(family, cores + 1), twice = gpu(family, 2 * cores);
+      for (const uint32_t n : widths)
+        for (const uint32_t k : inputs)
+          for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp})
+            for (uint32_t segments = 1; segments <= (epilogue == LinearEpilogue::None ? 3U : 1U); ++segments) {
+              const Q4Projection p = projection(n, k, segments);
+              const auto plan = [&](const Q4Linear &l, uint32_t width, uint32_t rows) {
+                return l.plan({{width, k}, rows, LinearPhase::Decode, epilogue}, projection(width, k, segments));
+              };
+              const LinearPlan one = plan(linear, n, 8);
+              const LinearConfig c = one.configuration();
+              for (const uint32_t rows : {16U, 24U, 32U}) {
+                const LinearPlan wider = plan(linear, n, rows);
+                require(wider.configuration() == c && wider.partialSums() == one.partialSums() &&
+                            wider.input() == one.input(),
+                        "GGUF decode plan depends on the batch width");
+              }
+              const uint32_t s = c.splits;
+              const bool staged = c.tile == LinearTile::GgufStaged;
+              require(c.tile == (family == 9 ? LinearTile::GgufSimdgroup : LinearTile::GgufStaged) &&
+                          c.groups == n / 64 && s >= 1 && s <= 8 && (s & (s - 1)) == 0,
+                      "GGUF decode plan tile or split count");
+              require(s == 1 || (staged ? k / s >= 1024 && (k / 32) % s == 0 : k / 256 / s >= 2),
+                      "GGUF decode partition below the kernel floor");
+              require(!staged || s == 1 || (segments == 1 && epilogue != LinearEpilogue::GateUp),
+                      "GGUF staged fused or gate/up plan splits K");
+              if (cores) {
+                require(plan(twice, 2 * n, 8).configuration().splits == s,
+                        "GGUF split count depends on more than the grid per core");
+                require(plan(more, n, 8).configuration().splits >= s,
+                        "GGUF split count falls with more cores");
+                require(plan(linear, 2 * n, 8).configuration().splits <= s,
+                        "GGUF split count rises with the width");
+              }
+              LinearWorkload w{{n, k}, 32, LinearPhase::Decode, epilogue, QuantFamily::Gguf};
+              const LinearScratchSize bound = linear.decodeScratchSize(w), need = linear.plan(w, p).scratchSize();
+              require(bound.input >= need.input && bound.sums >= need.sums && bound.partials >= need.partials &&
+                          bound.counters >= need.counters,
+                      "GGUF decode arena bound below a plan");
+            }
+    }
 }
 
 void scalingContracts() {
@@ -1414,6 +1476,7 @@ int main(int argc, char **argv) {
     baselinePlans();
     affinePolicyIdentity();
     ggufPlans();
+    ggufCoreLaws();
     narrowM24BoundaryPlans();
     scalingContracts();
     // Apple9 at the assumed core count reaches the expanded split set;
