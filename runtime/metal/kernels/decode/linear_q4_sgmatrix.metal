@@ -11,7 +11,7 @@ template <Epilogue E>
 __attribute__((always_inline)) inline void decode(device const bfloat *table, device const uchar *w0,
                    device const bfloat *sc0, device const bfloat *bi0,
                    device bfloat *out, device const float *sums,
-                   device float *partials, device atomic_uint *counters,
+                   device coherent(device) float *partials, device atomic_uint *counters,
                    device const bfloat *residual, device const uchar *w1,
                    device const bfloat *sc1, device const bfloat *bi1,
                    constant Q4Params &p, uint3 tg, uint tid, uint sg, uint lane,
@@ -85,7 +85,7 @@ __attribute__((always_inline)) inline void decode(device const bfloat *table, de
 #pragma unroll
     for (uint nf = 0; nf < 2; ++nf) {
       const uint n = base + fm + (gateUp ? 0 : nf * 8);
-      device float *slot = partials + ulong(tg.y * 2 + nf) * 8 * N + n;
+      device coherent(device) float *slot = partials + ulong(tg.y * 2 + nf) * 8 * N + n;
       slot[fn * N] = acc[nf].x;
       slot[(fn + 1) * N] = acc[nf].y;
     }
@@ -107,7 +107,7 @@ __attribute__((always_inline)) inline void decode(device const bfloat *table, de
 #pragma unroll
       for (uint nf = 0; nf < 2; ++nf) {
         const uint n = base + fm + (gateUp ? 0 : nf * 8);
-        device const float *slot = partials + ulong(s * 2 + nf) * 8 * N + n;
+        const device coherent(device) float *slot = partials + ulong(s * 2 + nf) * 8 * N + n;
         total[nf] += s == tg.y ? acc[nf] : float2(slot[fn * N], slot[(fn + 1) * N]);
       }
     }
