@@ -86,9 +86,8 @@ repository or a local directory. The tokenizer, configuration and chat template 
 from the target repository for MLX and from the selected GGUF file itself for
 GGUF, never from another repository: unsupported or incomplete tokenizer
 metadata is an error. GGUF variants whose tensor types Splash cannot load are
-rejected before download. Of Unsloth's files, UD-Q4_K_M and every larger one
-load for Qwen3.8-27B, and UD-IQ4_XS and every larger one for Qwen3.6-35B-A3B,
-except Q4_1, MXFP4_MOE, UD-Q8_K_XL and BF16
+rejected before download. Of Unsloth's files, every one loads for both models,
+from UD-IQ1_S up, except UD-Q8_K_XL and BF16
 ([GGUF targets](DEVELOPMENT.md#gguf-targets)). Legacy Splash packages such as
 `incoai/Qwen3.8-27B-Splash` remain loadable.
 

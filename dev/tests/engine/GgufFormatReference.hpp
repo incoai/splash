@@ -22,7 +22,10 @@
 namespace gguf_reference {
 
 enum Fmt { Q4K = GGUF_FMT_Q4K, IQ4XS = GGUF_FMT_IQ4XS, IQ4NL = GGUF_FMT_IQ4NL, Q5K = GGUF_FMT_Q5K, Q6K = GGUF_FMT_Q6K,
-           Q3K = GGUF_FMT_Q3K, Q80 = GGUF_FMT_Q80, IQ3S = GGUF_FMT_IQ3S, FMT_COUNT = GGUF_FMT_COUNT };
+           Q3K = GGUF_FMT_Q3K, Q80 = GGUF_FMT_Q80, IQ3S = GGUF_FMT_IQ3S, Q2K = GGUF_FMT_Q2K, IQ3XXS = GGUF_FMT_IQ3XXS,
+           IQ2XXS = GGUF_FMT_IQ2XXS, IQ2XS = GGUF_FMT_IQ2XS, IQ2S = GGUF_FMT_IQ2S, IQ1S = GGUF_FMT_IQ1S,
+           IQ1M = GGUF_FMT_IQ1M, Q40 = GGUF_FMT_Q40, Q41 = GGUF_FMT_Q41, MXFP4 = GGUF_FMT_MXFP4,
+           FMT_COUNT = GGUF_FMT_COUNT };
 inline const char *fmtName(uint32_t f) { return kQuantFormats[f].name; }
 inline uint16_t f2h(float f) { __fp16 h = (__fp16)f; uint16_t u; memcpy(&u, &h, 2); return u; }
 inline float h2f(uint16_t u) { __fp16 h; memcpy(&h, &u, 2); return (float)h; }
@@ -35,23 +38,41 @@ inline uint32_t rowBytes(Fmt f, uint32_t K) {
 }
 
 // Field offsets of the GGML blocks whose half scale d is not their first field:
-// block_q6_K {ql[128], qh[64], scales[16], d} and block_q3_K {hmask[32],
-// qs[64], scales[12], d}.
+// block_q6_K {ql[128], qh[64], scales[16], d}, block_q3_K {hmask[32], qs[64],
+// scales[12], d} and block_q2_K {scales[16], qs[64], d, dmin}; block_iq1_m
+// {qs[32], qh[16], scales[8]} spreads its d over the top nibbles of the four
+// halfwords of its scales.
 constexpr uint32_t kQ6KScales = 128 + 64, kQ6KD = kQ6KScales + 16;
 constexpr uint32_t kQ3KScales = 32 + 64, kQ3KD = kQ3KScales + 12;
+constexpr uint32_t kQ2KD = 16 + 64, kIQ1MScales = 32 + 16;
 
-// N native rows of random bytes whose half scales (d, and dmin for Q4_K/Q5_K) are scale().
+// llama.cpp's GGML_E8M0_TO_FP32_HALF: 2^(e - 128), subnormal below e = 2.
+inline float e8m0Half(uint8_t e) {
+  const uint32_t bits = e < 2 ? 0x00200000u << e : uint32_t(e - 1) << 23;
+  float value; memcpy(&value, &bits, 4); return value;
+}
+
+// N native rows of random bytes whose half scales (d, and dmin or m for Q4_K, Q5_K, Q2_K and Q4_1) are scale(), and
+// MXFP4's exponents the power of two at or below it.
 template <class Scale>
 std::vector<uint8_t> makeNative(Fmt f, uint32_t N, uint32_t K, std::mt19937 &rng, Scale scale) {
   const QuantFormat &fi = kQuantFormats[f];
   std::vector<uint8_t> v((size_t)N * rowBytes(f, K));
   for (auto &b : v) b = (uint8_t)rng();
-  const uint32_t off = f == Q6K ? kQ6KD : f == Q3K ? kQ3KD : 0;
+  const uint32_t off = f == Q6K ? kQ6KD : f == Q3K ? kQ3KD : f == Q2K ? kQ2KD : 0;
   for (size_t b = 0; b < v.size() / fi.block_bytes; ++b) {
     uint8_t *blk = v.data() + b * fi.block_bytes;
     const uint16_t d = scale();
-    memcpy(blk + off, &d, 2);
-    if (f == Q4K || f == Q5K) { const uint16_t m = scale(); memcpy(blk + 2, &m, 2); }
+    if (f == IQ1M) {
+      uint16_t sc[4]; memcpy(sc, blk + kIQ1MScales, 8);
+      for (int k = 0; k < 4; ++k) sc[k] = uint16_t((sc[k] & 0x0FFF) | ((d >> (4 * k)) & 0xF) << 12);
+      memcpy(blk + kIQ1MScales, sc, 8);
+    } else if (f == MXFP4) {
+      blk[0] = uint8_t(std::ilogb(h2f(d)) + 128);
+    } else {
+      memcpy(blk + off, &d, 2);
+    }
+    if (f == Q4K || f == Q5K || f == Q2K || f == Q41) { const uint16_t m = scale(); memcpy(blk + off + 2, &m, 2); }
   }
   return v;
 }
@@ -59,10 +80,13 @@ std::vector<uint8_t> makeNative(Fmt f, uint32_t N, uint32_t K, std::mt19937 &rng
 // model's have (a few hundredths), so the GEMM checks see realistic sums.
 inline std::uniform_real_distribution<float> scaleRange(Fmt f) {
   switch (f) {
-    case Q4K: case Q5K: case Q3K: case IQ4NL: case Q80: return std::uniform_real_distribution<float>(0.0005f, 0.004f);
+    case Q4K: case Q5K: case Q3K: case IQ4NL: case Q80: case Q2K: case Q40: case Q41: case MXFP4:
+      return std::uniform_real_distribution<float>(0.0005f, 0.004f);
     case IQ4XS: return std::uniform_real_distribution<float>(0.00002f, 0.00015f);
     case Q6K: return std::uniform_real_distribution<float>(0.00002f, 0.0001f);
-    case IQ3S: return std::uniform_real_distribution<float>(0.0001f, 0.0005f);
+    case IQ3S: case IQ3XXS: return std::uniform_real_distribution<float>(0.0001f, 0.0005f);
+    case IQ2XXS: case IQ2XS: case IQ2S: return std::uniform_real_distribution<float>(0.0002f, 0.001f);
+    case IQ1S: case IQ1M: return std::uniform_real_distribution<float>(0.001f, 0.008f);
     case FMT_COUNT: break;
   }
   unknownFormat(f);
@@ -93,6 +117,10 @@ inline void packPairs(const uint8_t *slots, uint8_t *dst) {
     memcpy(dst + 4 * c, &v, 4);
   }
 }
+// llama.cpp's ksigns_iq2xs: the eight signs of a 7-bit sign index, bit 7 their parity.
+inline uint8_t signs7(uint32_t index) { return uint8_t(index | (__builtin_popcount(index) & 1) << 7); }
+// The grid value (-1, 0 or 1) of element k of a kIQ1SGrid entry.
+inline int iq1Value(uint32_t entry, int k) { return int((entry >> (8 * (k % 4) + 4 * (k / 4))) & 0xF) - 1; }
 // reference values (llama.cpp dequantize_row_* semantics) + plane bytes for group g of one row
 inline void groupPack(Fmt f, const uint8_t *row, uint32_t g, float vals[32], uint8_t p0[32], uint8_t p1[8]) {
   const QuantFormat &fi = kQuantFormats[f];
@@ -213,6 +241,94 @@ inline void groupPack(Fmt f, const uint8_t *row, uint32_t g, float vals[32], uin
       }
       return;
     }
+    case Q2K: {
+      const uint8_t *q = blk + 16 + 32 * (j / 4), *sc = blk + 2 * j;
+      uint16_t d16, m16; memcpy(&d16, blk + kQ2KD, 2); memcpy(&m16, blk + kQ2KD + 2, 2);
+      for (int k = 0; k < 32; ++k) {
+        const uint8_t code = (q[k] >> (2 * (j % 4))) & 3, s = sc[k / 16];
+        lo[quant_slot(k)] = code;
+        vals[k] = h2f(d16) * (s & 0xF) * code - h2f(m16) * (s >> 4);
+      }
+      packBits(lo, 2, p0); return;
+    }
+    case Q40: case Q41: case MXFP4: {
+      const uint8_t *qs = blk + fi.meta_bytes;
+      uint16_t d16, m16 = 0; memcpy(&d16, blk, 2); if (f == Q41) memcpy(&m16, blk + 2, 2);
+      for (int k = 0; k < 32; ++k) {
+        const uint8_t code = k < 16 ? (qs[k] & 15) : (qs[k - 16] >> 4);
+        lo[quant_slot(k)] = code;
+        vals[k] = f == Q40 ? (code - 8) * h2f(d16) : f == Q41 ? code * h2f(d16) + h2f(m16) : kFP4Values[code] * e8m0Half(blk[0]);
+      }
+      if (f == MXFP4) packBits(lo, 4, p0); else packPairs(lo, p0);
+      return;
+    }
+    // The IQ3_XXS, IQ2 and IQ1 planes are the group's native bytes (metal/abi/QuantFormat.h).
+    case IQ3XXS: {
+      const uint8_t *qs = blk + 2 + 8 * j;
+      uint16_t d16; memcpy(&d16, blk, 2);
+      uint32_t aux; memcpy(&aux, blk + 66 + 4 * j, 4);
+      const float db = h2f(d16) * (0.5f + (aux >> 28)) * 0.5f;
+      for (int l = 0; l < 4; ++l) {
+        const uint8_t signs = signs7((aux >> 7 * l) & 127);
+        const uint8_t *g1 = (const uint8_t *)(kIQ3XXSGrid + qs[2 * l]), *g2 = (const uint8_t *)(kIQ3XXSGrid + qs[2 * l + 1]);
+        for (int k = 0; k < 4; ++k) {
+          vals[8 * l + k] = db * g1[k] * (signs & (1 << k) ? -1.f : 1.f);
+          vals[8 * l + 4 + k] = db * g2[k] * (signs & (1 << (4 + k)) ? -1.f : 1.f);
+        }
+      }
+      memcpy(p0, qs, 8); memcpy(p1, &aux, 4); return;
+    }
+    case IQ2XXS: {
+      uint16_t d16; memcpy(&d16, blk, 2);
+      uint32_t aux[2]; memcpy(aux, blk + 2 + 8 * j, 8);
+      const float db = h2f(d16) * (0.5f + (aux[1] >> 28)) * 0.25f;
+      for (int l = 0; l < 4; ++l) {
+        const uint8_t *grid = (const uint8_t *)(kIQ2XXSGrid + ((aux[0] >> 8 * l) & 0xFF));
+        const uint8_t signs = signs7((aux[1] >> 7 * l) & 127);
+        for (int k = 0; k < 8; ++k) vals[8 * l + k] = db * grid[k] * (signs & (1 << k) ? -1.f : 1.f);
+      }
+      memcpy(p0, aux, 8); return;
+    }
+    case IQ2XS: case IQ2S: {
+      uint16_t d16; memcpy(&d16, blk, 2);
+      const uint8_t sc = blk[(f == IQ2XS ? 66 : 74) + j];
+      const float db[2] = {h2f(d16) * (0.5f + (sc & 0xf)) * 0.25f, h2f(d16) * (0.5f + (sc >> 4)) * 0.25f};
+      uint16_t qs[4]; memcpy(qs, blk + 2 + 8 * j, 8);   // IQ2_XS
+      const uint8_t *qs8 = blk + 2 + 4 * j, *signs = qs8 + 32, qh = blk[66 + j];   // IQ2_S
+      for (int l = 0; l < 4; ++l) {
+        const uint8_t *grid = f == IQ2XS ? (const uint8_t *)(kIQ2XSGrid + (qs[l] & 511))
+                                         : (const uint8_t *)(kIQ2SGrid + (qs8[l] | (qh << (8 - 2 * l) & 0x300)));
+        const uint8_t sign = f == IQ2XS ? signs7(qs[l] >> 9) : signs[l];
+        for (int k = 0; k < 8; ++k) vals[8 * l + k] = db[l / 2] * grid[k] * (sign & (1 << k) ? -1.f : 1.f);
+      }
+      if (f == IQ2XS) { memcpy(p0, qs, 8); p1[0] = sc; }
+      else { memcpy(p0, qs8, 4); memcpy(p0 + 4, signs, 4); p1[0] = qh; p1[1] = sc; }
+      return;
+    }
+    case IQ1S: {
+      const uint8_t *qs = blk + 2 + 4 * j;
+      uint16_t d16, qh; memcpy(&d16, blk, 2); memcpy(&qh, blk + 34 + 2 * j, 2);
+      const float dl = h2f(d16) * (2 * ((qh >> 12) & 7) + 1), delta = qh & 0x8000 ? -0.125f : 0.125f;
+      for (int l = 0; l < 4; ++l) {
+        const uint32_t entry = kIQ1SGrid[qs[l] | (((qh >> 3 * l) & 7) << 8)];
+        for (int k = 0; k < 8; ++k) vals[8 * l + k] = dl * (iq1Value(entry, k) + delta);
+      }
+      memcpy(p0, qs, 4); memcpy(p1, &qh, 2); return;
+    }
+    case IQ1M: {
+      const uint8_t *qs = blk + 4 * j, *qh = blk + 32 + 2 * j;
+      uint16_t sc[4]; memcpy(sc, blk + kIQ1MScales, 8);
+      const uint16_t d16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
+      const float dl[2] = {h2f(d16) * (2 * ((sc[j / 2] >> (6 * (j % 2))) & 7) + 1),
+                           h2f(d16) * (2 * ((sc[j / 2] >> (6 * (j % 2) + 3)) & 7) + 1)};
+      for (int l = 0; l < 4; ++l) {
+        const uint8_t h = qh[l / 2] >> (4 * (l % 2));
+        const uint32_t entry = kIQ1SGrid[qs[l] | ((h & 7) << 8)];
+        const float delta = h & 8 ? -0.125f : 0.125f;
+        for (int k = 0; k < 8; ++k) vals[8 * l + k] = dl[l / 2] * (iq1Value(entry, k) + delta);
+      }
+      memcpy(p0, qs, 4); memcpy(p1, qh, 2); return;
+    }
     case FMT_COUNT: break;
   }
   unknownFormat(f);
@@ -222,9 +338,14 @@ inline void metaPack(Fmt f, const uint8_t *row, uint32_t unit, uint8_t *dst) {
   switch (f) {
     case Q4K: case Q5K: memcpy(dst, blk, 16); return;
     case IQ4XS: memcpy(dst, blk, 8); return;
-    case IQ4NL: case Q80: case IQ3S: memcpy(dst, blk, 2); return;
+    case IQ4NL: case Q80: case IQ3S: case IQ3XXS: case IQ2XXS: case IQ2XS: case IQ2S: case IQ1S: case Q40:
+      memcpy(dst, blk, 2); return;
+    case Q41: memcpy(dst, blk, 4); return;
+    case MXFP4: dst[0] = blk[0]; return;
     case Q6K: memcpy(dst, blk + kQ6KScales, 16); memcpy(dst + 16, blk + kQ6KD, 2); dst[18] = dst[19] = 0; return;
     case Q3K: memcpy(dst, blk + kQ3KD, 2); dst[2] = dst[3] = 0; memcpy(dst + 4, blk + kQ3KScales, 12); return;
+    case Q2K: memcpy(dst, blk + kQ2KD, 4); memcpy(dst + 4, blk, 16); return;
+    case IQ1M: memcpy(dst, blk + kIQ1MScales, 8); return;
     case FMT_COUNT: break;
   }
   unknownFormat(f);
@@ -266,7 +387,10 @@ inline bool ggmlDequantize(void *ggml, Fmt f, const std::vector<uint8_t> &native
                            std::string &error) {
   static const char *symbols[FMT_COUNT] = {
     "dequantize_row_q4_K", "dequantize_row_iq4_xs", "dequantize_row_iq4_nl", "dequantize_row_q5_K",
-    "dequantize_row_q6_K", "dequantize_row_q3_K", "dequantize_row_q8_0", "dequantize_row_iq3_s"};
+    "dequantize_row_q6_K", "dequantize_row_q3_K", "dequantize_row_q8_0", "dequantize_row_iq3_s",
+    "dequantize_row_q2_K", "dequantize_row_iq3_xxs", "dequantize_row_iq2_xxs", "dequantize_row_iq2_xs",
+    "dequantize_row_iq2_s", "dequantize_row_iq1_s", "dequantize_row_iq1_m", "dequantize_row_q4_0",
+    "dequantize_row_q4_1", "dequantize_row_mxfp4"};
   using Dequantize = void (*)(const void *, float *, int64_t);
   auto decode = reinterpret_cast<Dequantize>(dlsym(ggml, symbols[f]));
   if (!decode) { error = dlerror(); return false; }
@@ -298,7 +422,9 @@ inline Dot dot(const float *x, const float *w, uint32_t K) {
 // chain of 256 fp32 additions over sum|x w| <= sum|x| max|w|; the longer
 // chains of a large K round independently, so their error grows with the
 // square root of their length. The register tile (Apple9) is exact up to that
-// accumulation. The staged tile rounds every weight once to half: 2^-11 of
+// accumulation, but for Q2_K's mins, which it adds as m / -160 times the seed
+// (-160 times the sum of 16 inputs): two more roundings of |m| sum|x| <=
+// max|w| sum|x|. The staged tile rounds every weight once to half: 2^-11 of
 // each product, and 2^-25 of each |x| for weights below half's normal range.
 inline double projectionBound(const Dot &d, bool staged) {
   const double accumulation = std::ldexp(d.inputs * d.largest, -16);

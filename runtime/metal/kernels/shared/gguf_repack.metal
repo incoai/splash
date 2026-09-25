@@ -94,6 +94,50 @@ kernel void gguf_repack(device const uchar *src [[buffer(0)]], device uchar *dst
       meta[0] = blk[0]; meta[1] = blk[1];
       break;
     }
+    case GGUF_FMT_Q2K: {   // block_q2_K {scales[16], qs[64], d, dmin}: group j is bits 2 (j % 4) of qs[32 (j / 4)..]
+      for (uint e = 0; e < 32; ++e) lo[quant_slot(e)] = (blk[16 + 32 * (j / 4) + e] >> (2 * (j % 4))) & 3;
+      gguf_store_bits(lo, 2, out0);
+      if (j == 0) { for (uint i = 0; i < 4; ++i) meta[i] = blk[80 + i]; for (uint i = 0; i < 16; ++i) meta[4 + i] = blk[i]; }
+      break;
+    }
+    case GGUF_FMT_Q40: case GGUF_FMT_Q41: case GGUF_FMT_MXFP4: {   // the meta unit (d, d and m, or e), then qs[16]
+      for (uint l = 0; l < 16; ++l) { const uchar q = blk[f.meta_bytes + l]; lo[quant_slot(l)] = q & 15; lo[quant_slot(16 + l)] = q >> 4; }
+      if (p.fmt == GGUF_FMT_MXFP4) gguf_store_bits(lo, 4, out0); else gguf_store_pairs(lo, out0);
+      for (uint i = 0; i < f.meta_bytes; ++i) meta[i] = blk[i];
+      break;
+    }
+    // The IQ3_XXS, IQ2 and IQ1 groups keep their native bytes (metal/abi/QuantFormat.h): block_*'s fields for the
+    // group, copied into plane0, plane1 and, once per block, the meta unit.
+    case GGUF_FMT_IQ3XXS: {   // {d, qs[64], signs and scales[32]}
+      for (uint i = 0; i < 8; ++i) out0[i] = blk[2 + 8 * j + i];
+      for (uint i = 0; i < 4; ++i) out1[i] = blk[66 + 4 * j + i];
+      if (j == 0) { meta[0] = blk[0]; meta[1] = blk[1]; }
+      break;
+    }
+    case GGUF_FMT_IQ2XXS: case GGUF_FMT_IQ2XS: {   // {d, qs[32] (, scales[8])}
+      for (uint i = 0; i < 8; ++i) out0[i] = blk[2 + 8 * j + i];
+      if (p.fmt == GGUF_FMT_IQ2XS) out1[0] = blk[66 + j];
+      if (j == 0) { meta[0] = blk[0]; meta[1] = blk[1]; }
+      break;
+    }
+    case GGUF_FMT_IQ2S: {   // {d, qs[32], signs[32], qh[8], scales[8]}
+      for (uint i = 0; i < 4; ++i) { out0[i] = blk[2 + 4 * j + i]; out0[4 + i] = blk[34 + 4 * j + i]; }
+      out1[0] = blk[66 + j]; out1[1] = blk[74 + j];
+      if (j == 0) { meta[0] = blk[0]; meta[1] = blk[1]; }
+      break;
+    }
+    case GGUF_FMT_IQ1S: {   // {d, qs[32], qh[8] (16-bit)}
+      for (uint i = 0; i < 4; ++i) out0[i] = blk[2 + 4 * j + i];
+      out1[0] = blk[34 + 2 * j]; out1[1] = blk[35 + 2 * j];
+      if (j == 0) { meta[0] = blk[0]; meta[1] = blk[1]; }
+      break;
+    }
+    case GGUF_FMT_IQ1M: {   // {qs[32], qh[16], scales[8]}
+      for (uint i = 0; i < 4; ++i) out0[i] = blk[4 * j + i];
+      out1[0] = blk[32 + 2 * j]; out1[1] = blk[33 + 2 * j];
+      if (j == 0) for (uint i = 0; i < 8; ++i) meta[i] = blk[48 + i];
+      break;
+    }
     case GGUF_FMT_IQ3S:
     default: {  // IQ3_S: grid entry t covers elements 4t..4t+3 (qs[t], ninth bit t of qh); sign bit e negates element e
       device const uchar *qs = blk + 2 + 8 * j, *signs = blk + 74 + 4 * j;

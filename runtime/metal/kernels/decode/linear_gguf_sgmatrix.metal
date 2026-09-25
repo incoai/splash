@@ -2,11 +2,13 @@
 // on the FP32 pipe there, so the kernel keeps every other FP32 operation to
 // the minimum a group scale needs, and does the rest on the integer pipe:
 // - weights enter the MMA as exact bf16: 128 + code for linear codes with a
-//   min, 160 + code - zero for linear codes with a zero point (one add), or
-//   the codebook, int8 or grid value;
+//   min, 160 + code - zero for seeded linear codes (one add), or the
+//   codebook, int8 or grid value;
 // - one MMA chain per coefficient group, closed by the fp32 epilogue
-//   s * chain + b * sum (b = m - 128 s, formats with a min) or s * chain with
-//   the chain seeded by -160 * sum from the table (formats with a zero point);
+//   s * chain + b * sum (b = m - 128 s, formats with a min per 32 inputs) or
+//   s * chain with the chain seeded by -160 * sum from the table (formats
+//   with a zero point, and Q2_K, whose min per 16 inputs adds b * seed with
+//   b = m / -160);
 // - coefficients decoded once per simdgroup into threadgroup memory;
 // - L request lanes per threadgroup share the weight operands and coefficients;
 //   each lane's chains and epilogue run as with L = 1, so its result does not
@@ -25,25 +27,32 @@
 
 namespace gguf_sg {
 
+// The coefficients of a threadgroup's simdgroups for one unit fit the storage of a unit of Q4_K's, eight groups of
+// one (s, b) per column; the run-time-format kernels hold every format's in it.
+constant constexpr uint kCoefFloat2s = GGUF_TILE_COLUMNS * 8;
 template <class F> struct Shape {
   enum : uint {
     Linear = F::Kind == QuantLinear,
-    HasMin = Linear && F::Zero == 0,                          // Q4_K, Q5_K: s code + m
-    ZeroPoint = Linear && !HasMin,                            // Q6_K, Q3_K: s (code - zero)
-    // bf16 bits of the operand of code 0: 128, or 160 - zero with a zero point
-    Operand = 0x4300 + (ZeroPoint ? kZeroPointOffset - 128 - F::Zero : 0),
-    CG = ZeroPoint ? 2 : 1,                                   // coefficient groups per 32 inputs
-    UnitSpans = F::MetaGroups == 8 ? 4 : 1,                   // spans decoded per coefficient unit
+    HasMin = Linear && F::Zero == 0,                          // Q4_K, Q5_K, Q4_1, Q2_K: s code + m
+    // Linear codes chained from the table's seed of their 16 inputs: s (code - zero) with a zero point (Q6_K, Q3_K,
+    // Q4_0, IQ1), and Q2_K's min per 16 inputs
+    Seeded = Linear && (!HasMin || F::Group == 16),
+    // bf16 bits of the operand of code 0: 128, or 160 - zero when seeded
+    Operand = 0x4300 + (Seeded ? kZeroPointOffset - 128 - F::Zero : 0),
+    CG = Seeded || F::Group == 16 ? 2 : 1,                    // coefficient groups per 32 inputs
+    // Spans decoded per coefficient unit: every span of a meta unit of eight groups when their coefficients fit,
+    // else half of them (Q2_K's (s, b) per 16 inputs)
+    UnitSpans = F::MetaGroups == 1                                                   ? 1
+                : GGUF_TILE_COLUMNS * 8 * CG * (HasMin ? 2 : 1) <= kCoefFloat2s * 2 ? 4
+                                                                                     : 2,
     J = 2 * UnitSpans * CG,                                   // coefficients per column and unit
   };
   static_assert(F::MetaGroups == 8 || F::MetaGroups == 1, "a meta unit is one or eight groups");
 };
 template <class F> using Coef = metal::conditional_t<Shape<F>::HasMin != 0, float2, float>;
-// The coefficients of a threadgroup's simdgroups for one unit; the run-time-format kernels hold every format's in
-// storage of the largest size.
 template <class F> constant constexpr uint kCoefs = GGUF_TILE_COLUMNS * Shape<F>::J;
 static_assert(GGUF_REGISTER_COLUMNS == 2 * 8, "a simdgroup's columns are its two 8-column MMA fragments");
-constant constexpr uint kCoefFloat2s = kCoefs<FmtQ4K>;
+static_assert(kCoefs<FmtQ4K> == kCoefFloat2s, "the storage holds a unit of Q4_K's coefficients");
 #define GGUF_SG_COEF_BYTES(F, f) static_assert(kCoefs<F> * sizeof(Coef<F>) <= kCoefFloat2s * sizeof(float2), #f " coefficients fit");
 QUANT_FORMATS(GGUF_SG_COEF_BYTES)
 #undef GGUF_SG_COEF_BYTES
@@ -69,7 +78,8 @@ inline bfloat2 operand(typename F::Chunk ch, uint f, threadgroup const bfloat2 *
 }
 
 // What coefficient j of a column in coefficient unit u is decoded from: its
-// meta unit and, for IQ3_S, chunk 0 of its group (which holds the scale).
+// meta unit and, with ScaleInChunk, chunk 0 of its group (which holds the
+// scale).
 template <class F> struct CoefSource {
   typename F::Meta meta;
   typename F::Chunk chunk;
@@ -82,22 +92,26 @@ inline CoefSource<F> coefficient_source(device uchar *w0, device uchar *w1, devi
   const uint units = groups / F::MetaGroups;
   CoefSource<F> src;
   src.meta = F::loadMeta(meta + ((ulong(plane_tile) * units + g / F::MetaGroups) * QUANT_TILE_ROWS + column) * F::MetaBytes);
-  if constexpr (F::ScaleInPlane0) {
+  if constexpr (F::ScaleInChunk) {
     const ulong at = (ulong(plane_tile) * groups + g) * QUANT_TILE_ROWS + column;
     src.chunk = F::loadChunk(w0 + at * F::P0, w1 + at * F::P1, 0);
   }
   return src;
 }
 // Coefficient j of a column in coefficient unit u: group gi = j / CG of the
-// unit, 16-group half h = j % CG. Formats with a min return (s, m - 128 s).
+// unit, 16-group half h = j % CG. Formats with a min return (s, m - 128 s),
+// or with a seeded min (s, m / -160), whose product with the seed is m times
+// the sum of the inputs.
 template <class F> inline Coef<F> coefficient(CoefSource<F> src, uint u, uint j) {
   typedef Shape<F> S;
   const uint g = u * 2 * S::UnitSpans + j / S::CG, h = j % S::CG;
   QuantCoef k;
-  if constexpr (F::ScaleInPlane0) k = F::coef(src.meta, src.chunk);
+  if constexpr (F::ScaleInChunk) k = F::coef(src.meta, src.chunk);
   else k = F::coef(src.meta, ushort(g % F::MetaGroups));
-  if constexpr (S::HasMin) return float2(k.s.x, fma(-128.0f, k.s.x, k.m));
-  else return h ? k.s.y : k.s.x;
+  const float s = h ? k.s.y : k.s.x, m = h ? k.m.y : k.m.x;
+  if constexpr (S::HasMin && S::Seeded) return float2(s, m * (-1.0f / kZeroPointOffset));
+  else if constexpr (S::HasMin) return float2(s, fma(-128.0f, s, m));
+  else return s;
 }
 
 // One threadgroup: 4 simdgroups x GGUF_REGISTER_COLUMNS = GGUF_TILE_COLUMNS columns of one segment,
@@ -194,11 +208,11 @@ inline void decode(device const bfloat *table, device const float *sums, device 
         for (uint r = 0; r < L; ++r) {
           const vec<bfloat, 8> bq = xt[ulong(r) * K + (8 * q + fm) * 4 + c];
           float2 sum = float2(0), seed[S::CG];
-          if (S::HasMin) sum = *(device const float2 *)(s32 + ulong(r) * tileSums + q * 8 + fn);
+          if (S::HasMin && !S::Seeded) sum = *(device const float2 *)(s32 + ulong(r) * tileSums + q * 8 + fn);
 #pragma unroll
           for (uint h = 0; h < S::CG; ++h)
-            seed[h] = S::ZeroPoint ? *(device const float2 *)(seeds + ulong(r) * tileSums + (2 * q + h) * 8 + fn)
-                                   : float2(0);
+            seed[h] = S::Seeded ? *(device const float2 *)(seeds + ulong(r) * tileSums + (2 * q + h) * 8 + fn)
+                                : float2(0);
 #pragma unroll
           for (uint h = 0; h < S::CG; ++h) {
 #pragma unroll
@@ -209,7 +223,7 @@ inline void decode(device const bfloat *table, device const float *sums, device 
                 sgmatrix::mma_acc<bfloat>(dot, a[nf][f], reinterpret_cast<thread const bfloat2 *>(&bq)[f]);
               if constexpr (S::HasMin) {
                 acc[r][nf] = fma(dot, cs[h][nf].x, acc[r][nf]);
-                acc[r][nf] = fma(sum, cs[h][nf].y, acc[r][nf]);
+                acc[r][nf] = fma(S::Seeded ? seed[h] : sum, cs[h][nf].y, acc[r][nf]);
               } else {
                 acc[r][nf] = fma(dot, float(cs[h][nf]), acc[r][nf]);
               }
@@ -281,12 +295,12 @@ kernel void decode_linear_gguf_prepare(device const bfloat *input [[buffer(0)]],
                      span, row, lane, input[row * width + k], input[row * width + k + 1]);
 }
 
-// The IQ4 codebook pair table of the codebook formats: the threadgroup fills
-// it, then every simdgroup reads it.
+// The pair table of a codebook format (quant_pair_table's, as bf16): the
+// threadgroup fills it, then every simdgroup reads it.
 template <class F> inline void codebook_lut(threadgroup bfloat2 *lut, uint tid) {
   if constexpr (F::Kind == QuantCodebook) {
     for (uint i = tid; i < kQuantPairTableEntries; i += GGUF_REGISTER_THREADS)
-      lut[i] = bfloat2(float2(float(kIQ4NLValues[i & 15]), float(kIQ4NLValues[i >> 4])));
+      lut[i] = bfloat2(float2(F::value(i & 15), F::value(i >> 4)));
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
 }

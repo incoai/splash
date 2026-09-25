@@ -32,11 +32,14 @@ NORMAL, UNKNOWN, CONTROL, USER_DEFINED, UNUSED, BYTE = 1, 2, 3, 4, 5, 6
 GGML = {
     "F32": 0,
     "F16": 1,
+    "Q5_0": 6,
     "Q8_0": 8,
+    "Q2_K": 10,
     "Q4_K": 12,
     "IQ2_XXS": 16,
     "IQ3_XXS": 18,
     "IQ4_XS": 23,
+    "IQ1_M": 29,
     "BF16": 30,
     "MXFP4": 39,
 }
@@ -296,22 +299,27 @@ class GgufMetadataTests(unittest.TestCase):
         # 40) is never loaded, so its types do not matter.
         tensors |= {"blk.1.ssm_alpha.weight": GGML["F32"]}
         tensors |= {"blk.1.ssm_beta.weight": GGML["F32"]}
-        tensors |= {"blk.40.ffn_up_exps.weight": GGML["IQ2_XXS"]}
+        tensors |= {"blk.40.ffn_up_exps.weight": GGML["BF16"]}
         tensors |= {"blk.0.ffn_down_exps.weight": GGML["IQ4_XS"]}
+        # The low-bit formats of Unsloth's smaller files, the embedding too.
+        tensors |= {"blk.4.ffn_gate_exps.weight": GGML["IQ3_XXS"]}
+        tensors |= {"blk.2.attn_qkv.weight": GGML["IQ1_M"]}
+        tensors |= {"blk.5.ffn_up_exps.weight": GGML["IQ2_XXS"]}
+        tensors |= {"token_embd.weight": GGML["Q2_K"]}
         path = write_gguf(self.root / "ok.gguf", values, tensors.items())
         gguf.require_loadable(gguf.Metadata(path, tensors=True))
         f32 = {name: GGML["F32"] for name in tensors}
         for changes, reason in (
             (
-                {"blk.4.ffn_gate_exps.weight": GGML["IQ3_XXS"]},
-                "ffn_gate_exps.weight IQ3_XXS [(]1 tensor[)]",
+                {"blk.4.ffn_gate_exps.weight": GGML["Q5_0"]},
+                "ffn_gate_exps.weight Q5_0 [(]1 tensor[)]",
             ),
             (
                 {
-                    "blk.0.attn_qkv.weight": GGML["MXFP4"],
-                    "blk.1.attn_qkv.weight": GGML["MXFP4"],
+                    "blk.0.attn_qkv.weight": GGML["BF16"],
+                    "blk.1.attn_qkv.weight": GGML["BF16"],
                 },
-                "attn_qkv.weight MXFP4 [(]2 tensors[)]",
+                "attn_qkv.weight BF16 [(]2 tensors[)]",
             ),
             ({"token_embd.weight": GGML["IQ4_XS"]}, "token_embd.weight IQ4_XS"),
             ({"blk.3.attn_q.weight": GGML["BF16"]}, "attn_q.weight BF16"),

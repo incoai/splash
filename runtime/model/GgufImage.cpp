@@ -21,14 +21,24 @@ static_assert(kQuantFormats[GGUF_FMT_Q4K].ggml_type == ggml::kQ4_K &&
                   kQuantFormats[GGUF_FMT_Q6K].ggml_type == ggml::kQ6_K &&
                   kQuantFormats[GGUF_FMT_Q3K].ggml_type == ggml::kQ3_K &&
                   kQuantFormats[GGUF_FMT_Q80].ggml_type == ggml::kQ8_0 &&
-                  kQuantFormats[GGUF_FMT_IQ3S].ggml_type == ggml::kIQ3_S,
+                  kQuantFormats[GGUF_FMT_IQ3S].ggml_type == ggml::kIQ3_S &&
+                  kQuantFormats[GGUF_FMT_Q2K].ggml_type == ggml::kQ2_K &&
+                  kQuantFormats[GGUF_FMT_IQ3XXS].ggml_type == ggml::kIQ3_XXS &&
+                  kQuantFormats[GGUF_FMT_IQ2XXS].ggml_type == ggml::kIQ2_XXS &&
+                  kQuantFormats[GGUF_FMT_IQ2XS].ggml_type == ggml::kIQ2_XS &&
+                  kQuantFormats[GGUF_FMT_IQ2S].ggml_type == ggml::kIQ2_S &&
+                  kQuantFormats[GGUF_FMT_IQ1S].ggml_type == ggml::kIQ1_S &&
+                  kQuantFormats[GGUF_FMT_IQ1M].ggml_type == ggml::kIQ1_M &&
+                  kQuantFormats[GGUF_FMT_Q40].ggml_type == ggml::kQ4_0 &&
+                  kQuantFormats[GGUF_FMT_Q41].ggml_type == ggml::kQ4_1 &&
+                  kQuantFormats[GGUF_FMT_MXFP4].ggml_type == ggml::kMXFP4,
               "format table types are the GGUF type ids");
 static_assert(GGUF_TYPE_F32 == ggml::kF32, "float segments carry the GGUF type id");
 
 bool quantizedType(uint32_t type) { return gguf_format_of(type) != GGUF_FMT_COUNT; }
 bool floatType(uint32_t type) { return type == ggml::kF32; }
 // The token rows the embedding kernel gathers.
-bool embeddingType(uint32_t type) { return type == ggml::kQ4_K || type == ggml::kQ6_K || type == ggml::kQ8_0; }
+bool embeddingType(uint32_t type) { return gguf_embedding_format(gguf_format_of(type)); }
 // alpha/beta run in their stored format: both Q8_0 (one repacked tensor) or
 // both F32 (one float tensor).
 bool alphaBetaType(uint32_t type) { return type == ggml::kQ8_0 || type == ggml::kF32; }
