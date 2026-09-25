@@ -1,10 +1,16 @@
 # Development
 
-Use Apple Silicon with macOS 26.4+, Xcode 26 or newer, Python 3.12–3.14,
+Use Apple M2 or newer with macOS 26.4+, Xcode 26 or newer, Python 3.12–3.14,
 and a Metal 4 compiler with `uint4b_format` tensor support.
 The macOS 26.2 SDK can compile the host code, but Xcode 26.2's default Metal
 component cannot compile the kernels; select a newer Metal toolchain when
 using that SDK. Packaged users need none of these development tools.
+
+M2 compatibility was validated on an M2 Max (64 GB, macOS 26.6.2) with
+`make -j4 all test-engine-cpu test-engine-metal`, including Metal shader
+validation. The runtime still requires placement-sparse support and checks it
+with an actual map/unmap probe. This validation covers the model-free native
+suite; it does not establish full-model generation quality or M2 throughput.
 
 ## Build and run
 

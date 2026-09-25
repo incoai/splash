@@ -172,8 +172,38 @@ void testDeviceValidationNamesTheMacosFloor() {
   require(!newer.validationError(), "a newer macOS major was refused");
 }
 
+namespace {
+
+void testAppleSiliconGenerationAndFeatures() {
+  for (uint32_t family : {8u, 9u, 10u}) {
+    auto supported = device();
+    supported.appleGpuFamily = family;
+    require(!supported.validationError(), "M2 or newer GPU was refused");
+    require(evaluateEngineMemoryPlan(supported, model()).plan.has_value(),
+            "supported GPU could not produce a memory plan");
+  }
+  auto unsupported = device();
+  unsupported.appleGpuFamily = 7;
+  require(unsupported.validationError().value_or("") ==
+              "apple_gpu_family_8_required",
+          "older GPU was accepted or reported the wrong requirement");
+  auto m2 = device();
+  m2.appleGpuFamily = 8;
+  m2.supportsPlacementSparse = false;
+  require(m2.validationError().value_or("") == "placement_sparse_required" &&
+              !evaluateEngineMemoryPlan(m2, model()).plan,
+          "M2 bypassed the required sparse capability check");
+  m2.supportsPlacementSparse = true;
+  m2.maxThreadgroupMemoryBytes = 16 * 1024;
+  require(m2.validationError().value_or("") == "threadgroup_memory_below_32_kib",
+          "M2 bypassed the threadgroup memory requirement");
+}
+
+} // namespace
+
 int main() {
   try {
+    testAppleSiliconGenerationAndFeatures();
     testUnifiedElasticBudget();
     testBf16BudgetAndStatus();
     testUserCeilingAndFailure();

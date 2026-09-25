@@ -15,8 +15,12 @@ there is nothing to configure.
 
 ## Quick start
 
-Apple M3 or newer, macOS 26.4 or later, [Homebrew](https://brew.sh), and 36 GB
+Apple M2 or newer, macOS 26.4 or later, [Homebrew](https://brew.sh), and 36 GB
 of unified memory (48 GB or more recommended).
+M2 support requires the same macOS 26.4+ Metal placement-sparse capability,
+which is checked at startup. The current models do not fit on 8–24 GB Macs.
+Build this checkout from source using [DEVELOPMENT.md](DEVELOPMENT.md) to use
+the M2 compatibility change; the Homebrew release may not include it yet.
 
 ```bash
 brew install incoai/tap/splash
