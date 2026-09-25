@@ -20,6 +20,7 @@
 #include <iostream>
 #include <limits.h>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -50,7 +51,8 @@ struct NativeArguments final {
   model::ModelDescriptor model;
   uint32_t maxContext = 0;
   uint64_t maxMemoryBytes = 0;
-  uint64_t maxCacheDiskBytes = 0;
+  // Zero disables the disk tier; none sizes it automatically.
+  std::optional<uint64_t> maxCacheDiskBytes = 0;
   kv::Format kvFormat = kv::Format::Int8;
 };
 
@@ -121,7 +123,7 @@ private:
 void printUsage(std::string_view executable) {
   std::cerr << "usage: " << executable
             << " serve-native TARGET_DIRECTORY DRAFT_DIRECTORY"
-               " MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto [MAX_CACHE_DISK_BYTES]"
+               " MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto [MAX_CACHE_DISK_BYTES|auto]"
                " [--kv-format int8|bf16]\n";
 }
 
@@ -188,8 +190,13 @@ NativeArguments parseArguments(int argc, char **argv) {
   int next = 6;
   if (next < argc && std::string_view(argv[next]) != "--kv-format") {
     const std::string_view quota(argv[next++]);
-    if (quota != "0" && !parsePositive(quota, result.maxCacheDiskBytes))
-      throw UsageError("MAX_CACHE_DISK_BYTES must be a nonnegative integer");
+    uint64_t bytes = 0;
+    if (quota == "auto")
+      result.maxCacheDiskBytes.reset();
+    else if (quota == "0" || parsePositive(quota, bytes))
+      result.maxCacheDiskBytes = bytes;
+    else
+      throw UsageError("MAX_CACHE_DISK_BYTES must be auto or a nonnegative integer");
   }
   if (next < argc) {
     if (argc - next != 2 || std::string_view(argv[next]) != "--kv-format")

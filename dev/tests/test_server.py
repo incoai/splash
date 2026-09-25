@@ -543,7 +543,7 @@ def main_args(**overrides):
             "default_reasoning_effort": None,
             "max_context": None,
             "max_memory": None,
-            "max_cache_disk": 0,
+            "max_cache_disk": None,
             "max_image_pixels": api.image_input.MAX_PIXELS,
             "max_new_tokens": 16,
             "request_timeout": 2,
@@ -3367,7 +3367,11 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(Path(args.tokenizer), package / "tokenizer")
         self.assertIsNone(args.max_context)
         self.assertIsNone(args.max_memory)
-        self.assertEqual(args.max_cache_disk, 0)
+        # Without a quota the engine sizes the disk tier; 0 turns it off.
+        self.assertIsNone(args.max_cache_disk)
+        self.assertEqual(api._native_command(args)[6], "auto")
+        off_args = api.parse_args([*required, "--max-cache-disk", "0"])
+        self.assertEqual(api._native_command(off_args)[6], "0")
         disk_args = api.parse_args([*required, "--max-cache-disk", "5G"])
         self.assertEqual(disk_args.max_cache_disk, 5 * 1024**3)
         self.assertEqual(api._native_command(disk_args)[-1], str(5 * 1024**3))
@@ -3546,6 +3550,7 @@ class ServerTest(unittest.TestCase):
                 "serve-native",
                 "target",
                 "draft",
+                "auto",
                 "auto",
                 "auto",
             ],

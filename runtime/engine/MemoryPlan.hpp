@@ -78,6 +78,21 @@ struct EngineMemoryPolicy {
   hostAvailableReserveBytes(uint64_t physicalMemoryBytes) noexcept {
     return std::min<uint64_t>(physicalMemoryBytes / 10, 2 * kGiB);
   }
+
+  // The disk tier's quota when the configuration leaves it automatic: none
+  // while memory holds one request of the model's full context, else a tenth
+  // of the free space of the volume the tier writes to, at most 16 GiB. Only
+  // a Mac whose memory cannot hold the cache pays the tier's staging memory
+  // and SSD writes.
+  static constexpr uint64_t maximumAutomaticCacheDiskBytes = 16 * kGiB;
+  [[nodiscard]] static constexpr uint64_t
+  automaticCacheDiskBytes(uint32_t memoryContextTokens,
+                          uint32_t modelContextTokens,
+                          uint64_t freeDiskBytes) noexcept {
+    return memoryContextTokens >= modelContextTokens
+               ? 0
+               : std::min(freeDiskBytes / 10, maximumAutomaticCacheDiskBytes);
+  }
 };
 
 enum class BudgetErrorCode {

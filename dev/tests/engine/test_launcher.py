@@ -108,7 +108,14 @@ class LauncherTests(unittest.TestCase):
 
     def test_cache_disk_quota(self):
         required = ["serve", "--model", MODEL_ID]
-        self.assertEqual(launcher.parse_args(required).max_cache_disk, 0)
+        # The engine sizes the tier unless a quota is given; 0 turns it off.
+        self.assertIsNone(launcher.parse_args(required).max_cache_disk)
+        self.assertIsNone(
+            launcher.parse_args([*required, "--max-cache-disk", "auto"]).max_cache_disk
+        )
+        self.assertEqual(
+            launcher.parse_args([*required, "--max-cache-disk", "0"]).max_cache_disk, 0
+        )
         self.assertEqual(
             launcher.parse_args([*required, "--max-cache-disk", "5G"]).max_cache_disk,
             5 * 1024**3,
@@ -118,7 +125,7 @@ class LauncherTests(unittest.TestCase):
             launcher.parse_args([*required, "--max-state-disk", "5G"]).max_cache_disk,
             5 * 1024**3,
         )
-        for invalid in ("auto", "-1", "nan"):
+        for invalid in ("-1", "nan", "5X"):
             with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
                 launcher.parse_args([*required, "--max-cache-disk", invalid])
 

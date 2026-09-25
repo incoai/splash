@@ -81,6 +81,16 @@ uint8_t hexNibble(char value) {
 
 uint64_t mebibytes(uint64_t bytes) noexcept { return bytes / kMiB; }
 
+// Free bytes of the volume the disk tier's slot files go to (model::SlotFile's
+// default directory); zero when it cannot be measured.
+uint64_t temporaryVolumeFreeBytes() noexcept {
+  std::error_code error;
+  const std::filesystem::path directory = std::filesystem::temp_directory_path(error);
+  if (error) return 0;
+  const std::filesystem::space_info space = std::filesystem::space(directory, error);
+  return error ? 0 : space.available;
+}
+
 // The startup admission rule. Deliberately independent of the model size:
 // weights are mapped, not copied, so the package never has to fit in
 // reclaimable memory at once. Residency is what must fit, and it is checked
@@ -484,8 +494,16 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
     std::shared_ptr<model::DiskBudget> diskBudget;
     std::shared_ptr<model::SlotFile> stateFile;
     const uint64_t stateBytes = package.stateLayout().cachedBytes();
-    if (config.maximumCacheDiskBytes) {
-      diskBudget = std::make_shared<model::DiskBudget>(config.maximumCacheDiskBytes);
+    const uint32_t memoryContext = memoryPlan.maximumContextTokens();
+    const uint64_t diskQuota = config.maximumCacheDiskBytes.value_or(
+        EngineMemoryPolicy::automaticCacheDiskBytes(memoryContext, package.maximumContextTokens(),
+                                                    temporaryVolumeFreeBytes()));
+    const std::string automatic =
+        config.maximumCacheDiskBytes ? std::string()
+                                     : " (automatic: memory holds " + std::to_string(memoryContext) + " of the model's " +
+                                           std::to_string(package.maximumContextTokens()) + " context tokens)";
+    if (diskQuota) {
+      diskBudget = std::make_shared<model::DiskBudget>(diskQuota);
       try {
         stateFile = std::make_shared<model::SlotFile>(stateBytes, diskBudget);
       } catch (const std::exception &error) {
@@ -506,8 +524,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
             *backend, *kvPages, std::make_shared<model::SlotFile>(slotBytes, diskBudget));
         const uint64_t kvStagingBytes =
             uint64_t{model::KvPageTier::kDefaultStagingSlots} * slotBytes;
-        logKernelStartup("Cache disk tier: ", config.maximumCacheDiskBytes / kMiB,
-                         " MiB for KV pages of ", slotBytes / 1024, " KiB and states of ",
+        logKernelStartup("Cache disk tier: ", diskQuota / kMiB, " MiB", automatic,
+                         " for KV pages of ", slotBytes / 1024, " KiB and states of ",
                          stateBytes / kMiB, " MiB; KV pages stage through ",
                          kvStagingBytes / kMiB, " MiB of Metal memory",
                          stateFile ? ", states through host memory." : ".");

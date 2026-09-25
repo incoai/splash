@@ -693,8 +693,12 @@ not guarantee that a request-sized allocation fits.
 
 ### Disk cache
 
-`--max-cache-disk` adds an optional SSD tier for cached request states (GDN cell
-plus draft ring) and KV pages. Default: `0` (off). RAM and disk copies share the
+`--max-cache-disk` adds an SSD tier for cached request states (GDN cell plus
+draft ring) and KV pages; `0` turns it off. By default (`auto`) the tier is on
+when the memory plan cannot hold one request of the model's full context, with
+a tenth of the free space of the temporary directory's volume, at most 16 GiB
+(`EngineMemoryPolicy::automaticCacheDiskBytes`), and the startup line that
+states the quota says so. RAM and disk copies share the
 same block tree and recency order. Restoring a prefix keeps its disk copy, so
 its next eviction needs no write while that copy remains cached.
 

@@ -128,6 +128,19 @@ void testHardBudgetBoundaries() {
           "maximum working set overflowed the preflight ceiling");
 }
 
+// The disk tier's automatic quota: off while memory holds the model's full
+// context, else a tenth of the free disk space, at most 16 GiB.
+void testAutomaticCacheDisk() {
+  constexpr uint32_t context = 262144;
+  require(EngineMemoryPolicy::automaticCacheDiskBytes(context, context, 500 * kGiB) == 0 &&
+              EngineMemoryPolicy::automaticCacheDiskBytes(context + 1, context, 500 * kGiB) == 0,
+          "memory holding the full context still enabled the disk tier");
+  require(EngineMemoryPolicy::automaticCacheDiskBytes(context - 1, context, 500 * kGiB) == 16 * kGiB &&
+              EngineMemoryPolicy::automaticCacheDiskBytes(90000, context, 40 * kGiB) == 4 * kGiB &&
+              EngineMemoryPolicy::automaticCacheDiskBytes(90000, context, 0) == 0,
+          "automatic disk quota is not a tenth of free space capped at 16 GiB");
+}
+
 void testModelProvidedKvGeometry() {
   ModelMemoryProfile compact = model();
   compact.name = "compact-test-model";
@@ -178,6 +191,7 @@ int main() {
     testBf16BudgetAndStatus();
     testUserCeilingAndFailure();
     testHardBudgetBoundaries();
+    testAutomaticCacheDisk();
     testModelProvidedKvGeometry();
     testDeviceValidationNamesTheMacosFloor();
     std::cout << "elastic memory plan tests passed\n";

@@ -144,7 +144,9 @@ that a long uncached prompt will reach its first token quickly.
 - `--port`: HTTP port. Defaults to `SPLASH_PORT` or `8000`.
 - `--max-memory`: ceiling on Metal allocations, e.g. `28G`. Default: auto.
 - `--max-context`: context limit, up to `256K`, e.g. `100K`. Default: auto.
-- `--max-cache-disk`: SSD tier for the cache, e.g. `5G`. Default: 0 (off).
+- `--max-cache-disk`: SSD tier for the cache, e.g. `5G`, or `0` for none.
+  Default: auto, on when this Mac's memory cannot hold the model's full
+  context.
 - `--kv-format`: target KV cache storage, `int8` (default) or `bf16`.
 - `--max-image-pixels`: maximum resized pixels per image. Default: 4,194,304.
 - `--allowed-host`: extra HTTP `Host` name to accept, such as `mymac.local`;

@@ -1817,12 +1817,8 @@ def _parse_max_context(value):
 
 
 def _parse_max_cache_disk(value):
-    if value.strip() == "0":
-        return 0
-    result = _parse_max_memory(value)
-    if result is None:
-        raise argparse.ArgumentTypeError("use 0 to disable, or a size such as 5G")
-    return result
+    """0 disables the disk tier; auto (None) lets the engine size it."""
+    return 0 if value.strip() == "0" else _parse_max_memory(value)
 
 
 def _parse_max_memory(value):
@@ -1925,7 +1921,7 @@ def parse_args(argv=None):
         "--max-state-disk",
         dest="max_cache_disk",
         type=_parse_max_cache_disk,
-        default=0,
+        default=None,
     )
     parser.add_argument("--max-image-pixels", type=int, default=image_input.MAX_PIXELS)
     parser.add_argument("--max-new-tokens", type=int, default=32768)
@@ -1975,8 +1971,7 @@ def _native_command(args):
         "auto" if args.max_context is None else str(args.max_context),
         "auto" if args.max_memory is None else str(args.max_memory),
     ]
-    if args.max_cache_disk:
-        command.append(str(args.max_cache_disk))
+    command.append("auto" if args.max_cache_disk is None else str(args.max_cache_disk))
     if args.kv_format != "int8":
         command.extend(("--kv-format", args.kv_format))
     return command
