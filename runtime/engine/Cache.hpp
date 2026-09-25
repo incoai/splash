@@ -202,8 +202,17 @@ public:
   // and costs the next request a replay of its whole prompt, because a
   // hybrid model cannot resume from cached KV without the recurrent state.
   // Empty backing, older publications and state-free KV are still reclaimed.
+  // What copies or a release in flight hold back of the target stays
+  // outstanding: a KV chain gives up one leaf at a time, each after its copy
+  // is written. A pass without a target of its own (targetBytes 0, not
+  // evictAll), the pressure controller's paced one, continues it.
   [[nodiscard]] uint64_t reclaimCache(uint64_t targetBytes, bool evictAll,
                                       bool keepResumePoint = false);
+  // A reclaim target is outstanding: the caller should pass again as soon as
+  // a command allows.
+  [[nodiscard]] bool reclaimContinuing() const noexcept {
+    return outstanding_.bytes || outstanding_.evictAll;
+  }
   // One bounded reclaim step for an allocation retry. Progress is distinct
   // from physical bytes because evicting a KV reference can make a resident
   // page reusable without immediately emptying its extent.
@@ -308,6 +317,13 @@ private:
   // cancellation can discard an unread suffix without stranding its parents.
   std::map<uint64_t, Restore> restores_;
   uint32_t pendingPages_ = 0;
+  // The part of the last reclaim target that transfers held back.
+  struct ReclaimTarget {
+    uint64_t bytes = 0;
+    bool evictAll = false;
+    bool keepResumePoint = false;
+  };
+  ReclaimTarget outstanding_;
   KvTierSnapshot kvTier_;
   CacheLookupSnapshot lookup_;
   std::function<void()> completionNotifier_;

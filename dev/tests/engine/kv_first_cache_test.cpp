@@ -1967,6 +1967,32 @@ void testReclaimCacheCountsPendingPages() {
           "reclaim wrote more than the target while a page was on its way back");
 }
 
+// A chain gives up one leaf at a time, each after its copy is written: the
+// target a pass could not start stays outstanding, and passes without a
+// target of their own continue it until it is met, and then stop.
+void testReclaimContinuesAlongChain() {
+  test::TestKvTier tier;
+  CacheFixture fixture(&tier);
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control));
+  static_cast<void>(fixture.cache.reclaimCache(100, false));
+  require(fixture.cache.pollTransfers() && !fixture.cache.reclaimContinuing(), "state write was not consumed");
+  require(fixture.cache.reclaimCache(300, false) == 0 && tier.demotions == 1 && fixture.cache.reclaimContinuing(),
+          "a chain's parents did not stay outstanding behind its leaf's copy");
+  for (uint32_t demoted = 2; demoted <= 3; ++demoted) {
+    tier.complete();
+    require(fixture.cache.pollTransfers(), "a written page was not consumed");
+    static_cast<void>(fixture.cache.reclaimCache(0, false));
+    require(tier.demotions == demoted, "a paced pass did not continue the outstanding target");
+  }
+  require(!fixture.cache.reclaimContinuing(), "the target stayed outstanding once its pages were in flight");
+  tier.complete();
+  require(fixture.cache.pollTransfers(), "the last written page was not consumed");
+  static_cast<void>(fixture.cache.reclaimCache(0, false));
+  require(tier.demotions == 3 && fixture.pool.freePageCount() == 3, "reclaim went past its target");
+}
+
 void testBusyRingPreservesDiskVictim() {
   constexpr auto reuse = CacheReclaimMode::ReuseBacking;
   for (const bool restored : {false, true}) {
@@ -2169,6 +2195,7 @@ int main() {
     testPendingPagesGateAllocation();
     testTransferFailures();
     testReclaimCacheCountsPendingPages();
+    testReclaimContinuesAlongChain();
     testDemotionCostsNoSecondState();
     testPromotionIdentityAndDenial();
     testRepublicationKeepsTheDiskCopy();

@@ -99,10 +99,11 @@ public:
   // state/KV in LRU order.
   // Live command buffers are never eviction candidates. Physical KV release
   // is paced one extent at a time; reclaimDeferred() reports that the pass
-  // stopped behind an in-flight release and should run again shortly.
+  // stopped behind an in-flight release or copy and should run again
+  // shortly, which continues its target (Cache::reclaimCache).
   [[nodiscard]] uint64_t reclaimMemory(const MemoryReclaimDirective &directive);
   [[nodiscard]] bool reclaimDeferred() const noexcept {
-    return cache_.releaseDeferred();
+    return cache_.releaseDeferred() || cache_.reclaimContinuing();
   }
 
 private:

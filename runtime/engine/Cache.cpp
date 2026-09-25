@@ -343,12 +343,20 @@ Cache::Eviction Cache::evictOneKvBlock() {
 
 uint64_t Cache::reclaimCache(uint64_t targetBytes, bool evictAll,
                              bool keepResumePoint) {
+  if (!targetBytes && !evictAll) {
+    targetBytes = outstanding_.bytes;
+    evictAll = outstanding_.evictAll;
+    keepResumePoint = outstanding_.keepResumePoint;
+  }
+  outstanding_ = {};
   // Empty backing that is waiting behind an in-flight release will satisfy
   // part of the target by itself; evicting more cache now would only
   // discard reusable prefixes without returning memory any sooner. Pages
   // whose copies are being written count the same way.
-  if (releaseDeferred())
+  if (releaseDeferred()) {
+    outstanding_ = {targetBytes, evictAll, keepResumePoint};
     return 0;
+  }
   uint64_t released = reclaimEmptyExtents();
   auto needsMore = [&] { return evictAll || released + pendingBytes() < targetBytes; };
   while (needsMore() && !releaseDeferred()) {
@@ -358,6 +366,9 @@ uint64_t Cache::reclaimCache(uint64_t targetBytes, bool evictAll,
       break;
     released += result.reclaimedBytes;
   }
+  // Pages in flight count again in the next pass, pending or released.
+  if (needsMore() && (releaseDeferred() || transfersInFlight()))
+    outstanding_ = {evictAll ? 0 : targetBytes - released, evictAll, keepResumePoint};
   return released;
 }
 
