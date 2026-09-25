@@ -39,8 +39,9 @@ void require(bool value, const std::string &message) {
     throw std::runtime_error(message);
 }
 
-// Available host memory is what macOS can hand out without compressing or
-// swapping: free pages and pageable file-backed and purgeable pages.
+// Available host memory is what macOS can hand out without swapping: free
+// pages and pageable file-backed and purgeable pages, and with compression
+// what compressing the anonymous pages frees.
 void testHostAvailabilityCountsReclaimablePages() {
   constexpr uint64_t pageSize = 16384;
   auto availablePages = [](const HostMemoryPages &pages) {
@@ -90,6 +91,20 @@ void testHostAvailabilityCountsReclaimablePages() {
               estimateHostAvailableMemory({.free = maximum}, 1) == maximum &&
               estimateHostAvailableMemory(pages, 0) == 0,
           "invalid host counters or arithmetic overflow did not fail closed");
+  // With compression (below critical system pressure), compressing the
+  // anonymous pages frees what the compressor would not keep: at its
+  // present ratio, at most 2:1, and 2:1 while it holds nothing.
+  const auto compressedPages = [](uint64_t compressor, uint64_t compressed) {
+    return estimateHostAvailableMemory({.free = 10, .fileBacked = 20, .anonymous = 40,
+                                        .compressor = compressor, .compressed = compressed},
+                                       1, true);
+  };
+  require(estimateHostAvailableMemory({.free = 10, .fileBacked = 20, .anonymous = 40}, 1) == 30 &&
+              compressedPages(0, 0) == 50 && compressedPages(10, 15) == 44 && compressedPages(10, 40) == 50 &&
+              compressedPages(10, 10) == 30 && compressedPages(10, 5) == 30,
+          "compression credit is not the anonymous pages' savings at the compressor's ratio, at most 2:1");
+  require(estimateHostAvailableMemory({.free = maximum, .anonymous = 2}, 1, true) == 0,
+          "compression credit overflowed");
   require(EngineMemoryPolicy::hostAvailableReserveBytes(16 * kGiB) ==
                   16 * kGiB / 10 &&
               EngineMemoryPolicy::hostAvailableReserveBytes(48 * kGiB) ==

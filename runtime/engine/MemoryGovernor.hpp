@@ -15,15 +15,28 @@ struct HostMemoryPages {
   uint64_t speculative = 0;
   uint64_t fileBacked = 0;
   uint64_t purgeable = 0;
+  // Anonymous pages outside the compressor, and the compressor's own pages
+  // and the pages it holds, whose ratio is what compressing them saves.
+  uint64_t anonymous = 0;
+  uint64_t compressor = 0;
+  uint64_t compressed = 0;
 };
 
-// The pages macOS can hand out without compressing or swapping: free pages
-// plus pageable file-backed and purgeable pages, regardless of
-// active/inactive status. Memory in no VM queue (the firmware carve-out, tag
-// storage) is never available. The governor also enforces the engine
-// budget, host reserve and system pressure.
+// The pages macOS can hand out without swapping: free pages plus pageable
+// file-backed and purgeable pages, regardless of active/inactive status,
+// and, with compression, what compressing the anonymous pages frees at the
+// compressor's present ratio, counted at most at 2:1 (half of them; 2:1 also
+// while the compressor holds nothing). Memory in no VM queue (the firmware
+// carve-out, tag storage) is never available. The governor also enforces
+// the engine budget, host reserve and system pressure.
 [[nodiscard]] uint64_t estimateHostAvailableMemory(
-    const HostMemoryPages &pages, uint64_t pageSize) noexcept;
+    const HostMemoryPages &pages, uint64_t pageSize,
+    bool compression = false) noexcept;
+// The live estimate, counting compression unless macOS reports critical
+// memory pressure (or none): a Mac that uses its compressor as designed keeps
+// serving, the credit shrinking as the anonymous pages it counts are
+// compressed, and one in critical pressure falls back to the pages it can
+// hand out as they are.
 [[nodiscard]] std::optional<uint64_t> queryHostAvailableMemory() noexcept;
 
 enum class MemoryPressure : uint8_t {
