@@ -189,11 +189,14 @@ struct AffineTargetLoader::Impl {
       weights.push_back(affine::affineImageWeight(image, "target", directory.string()));
     }
   }
+  WeightWriter writer(size_t index) const {
+    return [image = &images[index]](int destination, const PreparationCheck &admit) {
+      affine::writeAffineImage(destination, *image, admit);
+    };
+  }
   WeightFile open(size_t index) {
     const Image &image = images[index];
-    return files.open(backend, weights[index],
-        [&](int destination, const PreparationCheck &admit) { affine::writeAffineImage(destination, image, admit); },
-        image.magic, image.layer, image.type);
+    return files.open(backend, weights[index], writer(index), image.magic, image.layer, image.type);
   }
 };
 AffineTargetLoader::AffineTargetLoader(metal::MetalBackend &backend, const std::filesystem::path &directory,
@@ -204,6 +207,10 @@ AffineTargetLoader::AffineTargetLoader(metal::MetalBackend &backend, const std::
     : impl_(std::make_unique<Impl>(backend, directory, layout, std::move(admitConversion))) {}
 AffineTargetLoader::~AffineTargetLoader() = default;
 std::span<const PreparedWeight> AffineTargetLoader::weights() const noexcept { return impl_->weights; }
+void AffineTargetLoader::prepare() {
+  for (size_t index = 0; index < impl_->images.size(); ++index)
+    static_cast<void>(impl_->files.prepare(impl_->weights[index], impl_->writer(index)));
+}
 WeightFile AffineTargetLoader::layer(uint32_t index) {
   if (index >= impl_->images.size() - 2) throw WeightStoreError("target layer is out of range");
   return impl_->open(index);
