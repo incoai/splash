@@ -28,12 +28,15 @@ public:
   // Every image's cache identity and size, layers first, for the model's
   // disk check before the first image is written.
   [[nodiscard]] std::span<const PreparedWeight> weights() const noexcept { return weights_; }
+  // Writes every missing image and maps none.
+  void prepare();
 
   [[nodiscard]] WeightFile layer(uint32_t index);
   [[nodiscard]] WeightFile head();
   [[nodiscard]] WeightFile embedding();
 
 private:
+  [[nodiscard]] WeightWriter writer(size_t index);
   [[nodiscard]] WeightFile open(size_t index);
 
   metal::MetalBackend &backend_;
