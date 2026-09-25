@@ -25,6 +25,14 @@ static inline void gguf_store_pairs(thread const uchar *slots, device uchar *dst
     ((device uint *)dst)[c] = word;
   }
 }
+// A group of a format that keeps its native bytes (metal/abi/QuantFormat.h): group j's plane0 and plane1 bytes of
+// the block from `at0` and `at1` on, and once per block the meta unit from `atMeta`.
+static inline void gguf_copy_native(device const uchar *blk, uint j, constant QuantFormat &f, uint at0, uint at1,
+                                    uint atMeta, device uchar *out0, device uchar *out1, device uchar *meta) {
+  for (uint i = 0; i < f.plane0_bytes; ++i) out0[i] = blk[at0 + f.plane0_bytes * j + i];
+  for (uint i = 0; i < f.plane1_bytes; ++i) out1[i] = blk[at1 + f.plane1_bytes * j + i];
+  if (j == 0) for (uint i = 0; i < f.meta_bytes; ++i) meta[i] = blk[atMeta + i];
+}
 kernel void gguf_repack(device const uchar *src [[buffer(0)]], device uchar *dst [[buffer(1)]],
                       constant GgufRepackParams &p [[buffer(2)]], uint t [[thread_position_in_grid]]) {
   const uint G = p.input_size / 32;
@@ -60,12 +68,6 @@ kernel void gguf_repack(device const uchar *src [[buffer(0)]], device uchar *dst
       if (j == 0) for (uint i = 0; i < 8; ++i) meta[i] = blk[i];
       break;
     }
-    case GGUF_FMT_IQ4NL: {
-      for (uint l = 0; l < 16; ++l) { const uchar q = blk[2 + l]; lo[quant_slot(l)] = q & 15; lo[quant_slot(16 + l)] = q >> 4; }
-      gguf_store_bits(lo, 4, out0);
-      meta[0] = blk[0]; meta[1] = blk[1];
-      break;
-    }
     case GGUF_FMT_Q6K: {
       const uint hb = j / 4, quarter = j % 4;
       for (uint e = 0; e < 32; ++e) {
@@ -92,6 +94,33 @@ kernel void gguf_repack(device const uchar *src [[buffer(0)]], device uchar *dst
       for (uint e = 0; e < 32; ++e) lo[quant_slot(e)] = blk[2 + e];
       gguf_store_bits(lo, 8, out0);
       meta[0] = blk[0]; meta[1] = blk[1];
+      break;
+    }
+    case GGUF_FMT_Q2K: {   // block_q2_K {scales[16], qs[64], d, dmin}: group j is bits 2 (j % 4) of qs[32 (j / 4)..]
+      for (uint e = 0; e < 32; ++e) lo[quant_slot(e)] = (blk[16 + 32 * (j / 4) + e] >> (2 * (j % 4))) & 3;
+      gguf_store_bits(lo, 2, out0);
+      if (j == 0) { for (uint i = 0; i < 4; ++i) meta[i] = blk[80 + i]; for (uint i = 0; i < 16; ++i) meta[4 + i] = blk[i]; }
+      break;
+    }
+    case GGUF_FMT_IQ4NL: case GGUF_FMT_Q40: case GGUF_FMT_Q41: case GGUF_FMT_MXFP4: {   // the meta unit, then qs[16]
+      for (uint l = 0; l < 16; ++l) { const uchar q = blk[f.meta_bytes + l]; lo[quant_slot(l)] = q & 15; lo[quant_slot(16 + l)] = q >> 4; }
+      if (p.fmt == GGUF_FMT_Q40 || p.fmt == GGUF_FMT_Q41) gguf_store_pairs(lo, out0); else gguf_store_bits(lo, 4, out0);
+      for (uint i = 0; i < f.meta_bytes; ++i) meta[i] = blk[i];
+      break;
+    }
+    case GGUF_FMT_IQ3XXS: case GGUF_FMT_IQ2XXS: case GGUF_FMT_IQ2XS:   // {d, qs[64 | 32], signs and scales[32] | scales[8]}
+      gguf_copy_native(blk, j, f, 2, 66, 0, out0, out1, meta);
+      break;
+    case GGUF_FMT_IQ1S:   // {d, qs[32], qh[8] (16-bit)}
+      gguf_copy_native(blk, j, f, 2, 34, 0, out0, out1, meta);
+      break;
+    case GGUF_FMT_IQ1M:   // {qs[32], qh[16], scales[8]}
+      gguf_copy_native(blk, j, f, 0, 32, 48, out0, out1, meta);
+      break;
+    case GGUF_FMT_IQ2S: {   // {d, qs[32], signs[32], qh[8], scales[8]}: plane0 the group's qs, then its signs
+      for (uint i = 0; i < 4; ++i) { out0[i] = blk[2 + 4 * j + i]; out0[4 + i] = blk[34 + 4 * j + i]; }
+      out1[0] = blk[66 + j]; out1[1] = blk[74 + j];
+      if (j == 0) { meta[0] = blk[0]; meta[1] = blk[1]; }
       break;
     }
     case GGUF_FMT_IQ3S:

@@ -97,12 +97,14 @@ inline void staged_accumulate(device bfloat *input, device uchar *w0, device uch
   simdgroup_barrier(mem_flags::mem_threadgroup);   // the stage may be reused by a following accumulate
 }
 
-// runtime dequantizer selection (uniform per threadgroup)
+// runtime dequantizer selection (uniform per threadgroup): the format's pair table, which every thread of the
+// threadgroup fills, then its tile loop
 template <ushort Rows, ushort Cols, ushort KS, class Acc>
 inline void staged_accumulate_any(uint fmt, device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta, uint input_size, uint origin,
-                           threadgroup half *stage, threadgroup half2 *tl, uint simd_lane, uint sb, uint se, thread Acc &acc) {
+                           threadgroup half *stage, threadgroup half2 *tl, uint thread_index, uint simd_lane, uint sb, uint se, thread Acc &acc) {
   quant_format_switch(fmt, [&](auto format) {
-    staged_accumulate<decltype(format), Rows, Cols, KS>(input, w0, w1, meta, input_size, origin, stage, tl,
-                                                                     simd_lane, sb, se, acc);
+    typedef decltype(format) F;
+    quant_pair_table<F>(tl, thread_index, GGUF_STAGED_THREADS);
+    staged_accumulate<F, Rows, Cols, KS>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, acc);
   });
 }

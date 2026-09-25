@@ -11,7 +11,7 @@
 //   segments' outputs unchanged, the padding past the segments unwritten.
 // - MoE: every GGUF plan (the staged 8- and 32-row tiles and the Apple9
 //   register tile, whatever GPU runs the test; decode steps and prefill
-//   chunks) for all 8 formats, gate, up and down in three formats and the
+//   chunks) for every format, gate, up and down in three formats and the
 //   shared expert in three more; routes and weights against the fp64 router,
 //   each pass inside the fp64 interval its numerics allow, the block's output,
 //   and a row's output bitwise equal at every lane count and chunk of one

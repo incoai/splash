@@ -151,9 +151,8 @@ public:
   FloatOutput destination = FloatOutput::BFloat16;
 };
 
-// A token table's rows as the GGUF stores them: block_q4_K, block_q6_K or
-// block_q8_0 (GGUF_FMT_Q4K, _Q6K or _Q80), gathered, never multiplied
-// (Embedding.cpp).
+// A token table's rows as the GGUF stores them, in a gguf_embedding_format
+// (metal/abi/Gguf.h), gathered, never multiplied (Embedding.cpp).
 struct NativeRows final {
   NativeRows(metal::MetalBuffer rows, uint32_t formatId);
   metal::MetalBuffer rows;

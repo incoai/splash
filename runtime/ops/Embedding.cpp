@@ -10,8 +10,7 @@
 namespace splash::ops {
 
 NativeRows::NativeRows(metal::MetalBuffer rows, uint32_t formatId) : rows(std::move(rows)), formatId(formatId) {
-  if (formatId != GGUF_FMT_Q4K && formatId != GGUF_FMT_Q6K && formatId != GGUF_FMT_Q80)
-    throw std::invalid_argument("unsupported native embedding format");
+  if (!gguf_embedding_format(formatId)) throw std::invalid_argument("unsupported native embedding format");
 }
 const char *NativeRows::name() const noexcept { return kQuantFormats[formatId].name; }
 

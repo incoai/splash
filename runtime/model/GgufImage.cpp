@@ -14,21 +14,26 @@
 namespace splash::model::gguf {
 namespace {
 
-static_assert(kQuantFormats[GGUF_FMT_Q4K].ggml_type == ggml::kQ4_K &&
-                  kQuantFormats[GGUF_FMT_IQ4XS].ggml_type == ggml::kIQ4_XS &&
-                  kQuantFormats[GGUF_FMT_IQ4NL].ggml_type == ggml::kIQ4_NL &&
-                  kQuantFormats[GGUF_FMT_Q5K].ggml_type == ggml::kQ5_K &&
-                  kQuantFormats[GGUF_FMT_Q6K].ggml_type == ggml::kQ6_K &&
-                  kQuantFormats[GGUF_FMT_Q3K].ggml_type == ggml::kQ3_K &&
-                  kQuantFormats[GGUF_FMT_Q80].ggml_type == ggml::kQ8_0 &&
-                  kQuantFormats[GGUF_FMT_IQ3S].ggml_type == ggml::kIQ3_S,
-              "format table types are the GGUF type ids");
+static_assert([] {
+  for (const QuantFormat &format : kQuantFormats) {
+    const GgmlTypeTraits *type = ggmlTypeTraits(format.ggml_type);
+    if (!type || type->blockElements != format.block_elements || type->blockBytes != format.block_bytes)
+      return false;
+  }
+  return true;
+}(), "format table types are the GGUF types, block for block");
+// The repack and the reference find meta unit u in native block u.
+static_assert([] {
+  for (const QuantFormat &format : kQuantFormats)
+    if (format.meta_groups * 32 != format.block_elements) return false;
+  return true;
+}(), "a meta unit is one native block");
 static_assert(GGUF_TYPE_F32 == ggml::kF32, "float segments carry the GGUF type id");
 
 bool quantizedType(uint32_t type) { return gguf_format_of(type) != GGUF_FMT_COUNT; }
 bool floatType(uint32_t type) { return type == ggml::kF32; }
 // The token rows the embedding kernel gathers.
-bool embeddingType(uint32_t type) { return type == ggml::kQ4_K || type == ggml::kQ6_K || type == ggml::kQ8_0; }
+bool embeddingType(uint32_t type) { return gguf_embedding_format(gguf_format_of(type)); }
 // alpha/beta run in their stored format: both Q8_0 (one repacked tensor) or
 // both F32 (one float tensor).
 bool alphaBetaType(uint32_t type) { return type == ggml::kQ8_0 || type == ggml::kF32; }

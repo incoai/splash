@@ -1,7 +1,6 @@
 #include "model/GgufFile.hpp"
 
 #include <algorithm>
-#include <array>
 #include <cstring>
 #include <limits>
 
@@ -13,21 +12,6 @@ uint64_t checkedMultiply(uint64_t a, uint64_t b) {
     throw GgufError("GGUF size overflows uint64");
   return a * b;
 }
-
-// (id, name, block elements, block bytes) of the ggml types this parser can
-// size, as ggml-common.h defines them; a tensor of another type is rejected.
-constexpr std::array<std::pair<uint32_t, GgmlTypeTraits>, 30> kTypes{{
-    {0, {"F32", 1, 4}},         {1, {"F16", 1, 2}},         {2, {"Q4_0", 32, 18}},
-    {3, {"Q4_1", 32, 20}},      {6, {"Q5_0", 32, 22}},      {7, {"Q5_1", 32, 24}},
-    {8, {"Q8_0", 32, 34}},      {9, {"Q8_1", 32, 36}},      {10, {"Q2_K", 256, 84}},
-    {11, {"Q3_K", 256, 110}},   {12, {"Q4_K", 256, 144}},   {13, {"Q5_K", 256, 176}},
-    {14, {"Q6_K", 256, 210}},   {15, {"Q8_K", 256, 292}},   {16, {"IQ2_XXS", 256, 66}},
-    {17, {"IQ2_XS", 256, 74}},  {18, {"IQ3_XXS", 256, 98}}, {19, {"IQ1_S", 256, 50}},
-    {20, {"IQ4_NL", 32, 18}},   {21, {"IQ3_S", 256, 110}},  {22, {"IQ2_S", 256, 82}},
-    {23, {"IQ4_XS", 256, 136}}, {24, {"I8", 1, 1}},         {25, {"I16", 1, 2}},
-    {26, {"I32", 1, 4}},        {27, {"I64", 1, 8}},        {28, {"F64", 1, 8}},
-    {29, {"IQ1_M", 256, 56}},   {30, {"BF16", 1, 2}},       {39, {"MXFP4", 32, 17}},
-}};
 
 enum ValueType : uint32_t {
   kUint8 = 0, kInt8 = 1, kUint16 = 2, kInt16 = 3, kUint32 = 4, kInt32 = 5,
@@ -145,12 +129,6 @@ void skipValue(Reader &reader, uint32_t type, unsigned depth) {
 }
 
 } // namespace
-
-const GgmlTypeTraits *ggmlTypeTraits(uint32_t type) noexcept {
-  for (const auto &[id, traits] : kTypes)
-    if (id == type) return &traits;
-  return nullptr;
-}
 
 std::string ggmlTypeName(uint32_t type) {
   const GgmlTypeTraits *traits = ggmlTypeTraits(type);
