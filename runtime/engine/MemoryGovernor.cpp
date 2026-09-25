@@ -13,14 +13,28 @@
 
 namespace splash::engine {
 
+namespace {
+
+// What compressing the anonymous pages frees: the share the compressor does
+// not keep at its ratio of held to own pages, at most half of them.
+uint64_t compressionSavings(const HostMemoryPages &pages) noexcept {
+  if (!pages.compressor || pages.compressed / 2 >= pages.compressor) return pages.anonymous / 2;
+  if (pages.compressed <= pages.compressor) return 0;
+  return pages.anonymous -
+         static_cast<uint64_t>(static_cast<unsigned __int128>(pages.anonymous) * pages.compressor / pages.compressed);
+}
+
+} // namespace
+
 uint64_t estimateHostAvailableMemory(const HostMemoryPages &statistics,
-                                     uint64_t pageSize) noexcept {
+                                     uint64_t pageSize, bool compression) noexcept {
   // free_count includes the speculative pages, which external_page_count
   // also counts; wired file pages are in neither.
   if (!pageSize || statistics.speculative > statistics.free) return 0;
   const uint64_t maximum = std::numeric_limits<uint64_t>::max();
   uint64_t pages = statistics.free - statistics.speculative;
-  for (uint64_t reclaimable : {statistics.fileBacked, statistics.purgeable}) {
+  for (uint64_t reclaimable : {statistics.fileBacked, statistics.purgeable,
+                               compression ? compressionSavings(statistics) : 0}) {
     if (reclaimable > maximum - pages) return 0;
     pages += reclaimable;
   }
@@ -45,8 +59,11 @@ std::optional<uint64_t> queryHostAvailableMemory() noexcept {
       {.free = statistics.free_count,
        .speculative = statistics.speculative_count,
        .fileBacked = statistics.external_page_count,
-       .purgeable = statistics.purgeable_count},
-      pageSize);
+       .purgeable = statistics.purgeable_count,
+       .anonymous = statistics.internal_page_count,
+       .compressor = statistics.compressor_page_count,
+       .compressed = statistics.total_uncompressed_pages_in_compressor},
+      pageSize, querySystemMemoryPressure().value_or(MemoryPressure::Critical) != MemoryPressure::Critical);
 }
 
 std::optional<MemoryPressure> querySystemMemoryPressure() noexcept {
