@@ -284,6 +284,7 @@ Scheduler::planPrefill(std::vector<PrefillRequestView> ready) const {
 
   BatchPlan plan;
   plan.kind = WorkKind::Prefill;
+  plan.items.reserve(model::ExecutionLimits::maximumBatchWidth);
   uint32_t budget = prefillBudget(ready.front(), ready);
   for (const PrefillRequestView &view : ready) {
     if (!budget || view.request->spec.priority != selectedPriority ||
@@ -352,6 +353,7 @@ std::optional<BatchPlan> Scheduler::nextDecode() const {
   plan.kind = WorkKind::Decode;
   plan.cohort = cohort;
   plan.decodeStage = decodeStage;
+  plan.items.reserve(model::ExecutionLimits::maximumBatchWidth);
   // Applying the initial mask can terminate a request or start drafting.
   // Classify that branch one request at a time; regular decode can batch.
   const uint32_t maximumWidth =
