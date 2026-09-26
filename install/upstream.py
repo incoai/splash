@@ -174,9 +174,16 @@ def _mlx_target(repo, language_only):
     if not language_only:
         required.add("preprocessor_config.json")
     if missing := required - repo.files:
+        # --language-only drops the processor requirement and no other.
+        hint = (
+            "; use --language-only to serve text only"
+            if missing == {"preprocessor_config.json"}
+            else ""
+        )
         raise models.ModelError(
             f"target repository {repo.name} is missing: {', '.join(sorted(missing))}. "
-            "Configuration, tokenizer and processor must come from the target repository."
+            "Configuration, tokenizer and processor must come from the target "
+            f"repository{hint}."
         )
     config = models.read_json(repo.file("config.json"))
     # MLX states its quantization under "quantization"; a transformers
