@@ -117,7 +117,7 @@ void StateCache::publish(uint64_t kvBlock,
   if (state->residentBytes() != state->bytes())
     throw std::invalid_argument("published state must be in RAM");
   if (!kv_.contains(kvBlock)) {
-    throw std::invalid_argument("composite state KV block is not resident");
+    throw std::invalid_argument("composite state KV block is unknown");
   }
   if (publications_ == std::numeric_limits<uint64_t>::max())
     throw std::overflow_error("composite state publication count overflowed");
@@ -159,7 +159,7 @@ bool StateCache::publishToDisk(uint64_t kvBlock, const StateWriter &write,
                                const std::function<void()> &completion,
                                const std::function<bool()> &makeRoom, bool checkpoint) {
   if (!kv_.contains(kvBlock)) {
-    throw std::invalid_argument("composite state KV block is not resident");
+    throw std::invalid_argument("composite state KV block is unknown");
   }
   if (publications_ == std::numeric_limits<uint64_t>::max())
     throw std::overflow_error("composite state publication count overflowed");

@@ -26,7 +26,8 @@ enum class KvPageAcquireFailure : uint8_t {
   None,
   LogicalCapacity,
   PhysicalCapacity,
-  // Pages of demoted blocks return once their disk copies land; retry then.
+  // A transfer in flight (a KV copy, a restore or the one state write) holds
+  // what the request needs; retry when it lands.
   Pending,
 };
 

@@ -309,7 +309,8 @@ TokenAdmission Cache::admitPages(uint32_t count, std::vector<uint32_t> &pages) {
     // their backing back: wait once those on their way cover what the free
     // backed pages do not, and until then reclaim more.
     const uint32_t missing = count - std::min(count, pool_.freeResidentPageCount());
-    const bool covered = pendingPages_ > 0 && pendingPages_ >= missing;
+    const uint32_t pending = pendingPages();
+    const bool covered = pending > 0 && pending >= missing;
     return {covered ? KvPageAcquireFailure::Pending : acquired.failure,
             count, pool_.freePageCount(), acquired.allocationFailure};
   }
@@ -321,7 +322,7 @@ Cache::Shortfall Cache::makeLogicalPages(uint32_t count) {
   while (pool_.freePageCount() < count) {
     // Pages already on their way back cover the shortfall: wait for them
     // rather than demoting more.
-    if (pendingPages_ >= count - pool_.freePageCount())
+    if (pendingPages() >= count - pool_.freePageCount())
       return Shortfall::Pending;
     switch (evictOneKvBlock()) {
     case Eviction::Evicted:
@@ -457,7 +458,7 @@ Cache::LeafReclaim Cache::reclaimKvLeaf(uint64_t block) {
   // tier, rather than being written for nothing. A state already on disk
   // costs nothing and stays; one whose write must wait keeps its leaf until
   // then.
-  if (states_.resident(block) && (kv_.slot(block) || (tier_ && tier_->writable()))) {
+  if (states_.resident(block) && (kv_.slot(block) || kvTierWritable())) {
     const StateEviction eviction =
         states_.reclaim(block, completionNotifier_, makeRoom_, true);
     if (!eviction.evicted)
@@ -467,10 +468,9 @@ Cache::LeafReclaim Cache::reclaimKvLeaf(uint64_t block) {
     kv_.dropPage(block);
     return LeafReclaim::Started;
   }
-  // Only a state restores a disk-only chain: the leaf is written for one on
-  // it or below it, and disk copies below that no state needs go with it.
-  const bool keep = states_.contains(block) || kv_.stateBelow(block);
-  if (keep) {
+  // The leaf is written for a state on it or below it, and disk copies below
+  // that no state needs go with it.
+  if (kvNeededByState(block)) {
     const LeafReclaim demotion = demoteKv(block);
     if (demotion != LeafReclaim::Impossible)
       return demotion;
@@ -478,7 +478,7 @@ Cache::LeafReclaim Cache::reclaimKvLeaf(uint64_t block) {
     // still write it: dropping it would orphan every copy below it. Once a
     // failed write has closed the tier, the subtree goes with it, as without
     // a tier, rather than holding the leaf's RAM until the server restarts.
-    if (kv_.stateBelow(block) && tier_->writable())
+    if (kv_.stateBelow(block) && kvTierWritable())
       return LeafReclaim::Impossible;
   }
   if (kv_.hasDiskChildren(block) && !dropDiskSubtree(block))
@@ -523,12 +523,11 @@ uint64_t Cache::reclaimEmptyExtents() {
 }
 
 bool Cache::transfersInFlight() const noexcept {
-  return pendingPages_ > 0 || !restores_.empty() || !demotions_.empty() ||
-         states_.writing();
+  return !restores_.empty() || !demotions_.empty() || states_.writing();
 }
 
 uint64_t Cache::pendingBytes() const noexcept {
-  return uint64_t{pendingPages_} * pool_.bytesPerPage();
+  return uint64_t{pendingPages()} * pool_.bytesPerPage();
 }
 
 bool Cache::releaseDeferred() const noexcept {
@@ -666,7 +665,7 @@ void Cache::promoteState(const CacheLookup &lookup, StateRestore &transfer) {
 }
 
 Cache::LeafReclaim Cache::demoteKv(uint64_t block) {
-  if (!tier_ || !tier_->writable())
+  if (!kvTierWritable())
     return LeafReclaim::Impossible;
   // Do not discard a disk copy for a transfer that cannot start yet.
   if (!tier_->canDemote()) {
@@ -680,7 +679,7 @@ Cache::LeafReclaim Cache::demoteKv(uint64_t block) {
     return transfersInFlight() ? LeafReclaim::Pending : LeafReclaim::Impossible;
   // Making room may have taken the states the leaf was kept for; it then
   // goes like any leaf nothing needs.
-  if (!states_.contains(block) && !kv_.stateBelow(block))
+  if (!kvNeededByState(block))
     return LeafReclaim::Impossible;
   auto transfer = tier_->demote(kv_.page(block), slot, completionNotifier_);
   if (!transfer) {
@@ -689,7 +688,6 @@ Cache::LeafReclaim Cache::demoteKv(uint64_t block) {
   }
   kv_.setSlot(block, std::move(slot));
   kv_.setTransferring(block, true);
-  ++pendingPages_;
   demotions_.push_back({block, std::move(transfer)});
   return LeafReclaim::Started;
 }
@@ -782,7 +780,6 @@ bool Cache::pollTransfers() {
     const uint64_t block = demotion->block;
     const bool written = demotion->transfer->finish();
     demotion = demotions_.erase(demotion);
-    --pendingPages_;
     kv_.setTransferring(block, false);
     if (!written) {
       ++kvTier_.demotionFailures;
@@ -804,7 +801,7 @@ bool Cache::pollTransfers() {
 
 CacheSnapshot Cache::snapshot() const {
   KvTierSnapshot tier = kvTier_;
-  tier.pendingPages = pendingPages_;
+  tier.pendingPages = pendingPages();
   tier.diskBlocks = kv_.snapshot().diskBlocks;
   if (diskBudget_) {
     tier.capacityBytes = diskBudget_->capacityBytes();

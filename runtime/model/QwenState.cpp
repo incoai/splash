@@ -57,8 +57,7 @@ public:
         staging_(std::move(staging)) {}
   // The staging copy is the write's source until the worker has stopped.
   ~FileOffload() override {
-    operation_->cancel();
-    static_cast<void>(operation_->wait());
+    operation_->drain();
     staging_->busy = false;
   }
   bool ready() const noexcept override { return operation_->ready(); }
@@ -79,10 +78,7 @@ public:
               std::function<std::shared_ptr<const CompositeState>()> snapshot)
       : operation_(std::move(operation)), committed_(std::move(committed)),
         snapshot_(std::move(snapshot)) {}
-  ~FileRestore() override {
-    cancel();
-    static_cast<void>(operation_->wait());
-  }
+  ~FileRestore() override { operation_->drain(); }
   bool ready() const noexcept override { return operation_->ready(); }
   void cancel() noexcept override { operation_->cancel(); }
   bool finish() override {
@@ -191,10 +187,8 @@ std::unique_ptr<StateOffload> QwenCompositeState::write(
         std::move(completion));
     return std::make_unique<FileOffload>(operation, std::move(result), staging);
   } catch (...) {
-    if (operation) {
-      operation->cancel();
-      static_cast<void>(operation->wait());
-    }
+    if (operation)
+      operation->drain();
     staging->busy = false;
     throw;
   }
@@ -465,8 +459,7 @@ std::unique_ptr<StateRestore> QwenStateStorage::beginRestore(
     return std::make_unique<FileRestore>(operation, std::move(commit),
         [this, index, lengths = typed->lengths_] { return snapshot(index, lengths); });
   } catch (...) {
-    operation->cancel();
-    static_cast<void>(operation->wait());
+    operation->drain();
     throw;
   }
 }

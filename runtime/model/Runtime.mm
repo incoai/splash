@@ -104,19 +104,6 @@ private:
   double wallMilliseconds_ = 0.0;
 };
 
-// Wakes the engine and, when the command carried KV copies, reports the
-// batch they rode on.
-metal::CommandCompletion commandNotify(std::function<void()> transfers,
-                                       std::function<void()> completion) {
-  return [transfers = std::move(transfers),
-          completion = std::move(completion)](uint64_t) {
-    if (transfers)
-      transfers();
-    if (completion)
-      completion();
-  };
-}
-
 using kv::Q8ChunkedPrefillParams;
 
 bool isStopToken(const RuntimeGeometry &geometry, uint32_t token) noexcept {
@@ -1577,10 +1564,21 @@ struct Runtime::Impl {
   // or demotion waiting for as long as the model stays busy.
   CommandTicket submitWithCopies(CommandGraph &graph,
                                  std::function<void()> completion) {
-    std::function<void()> transfers = kvTier ? kvTier->encode(graph) : nullptr;
+    // The copies are reported before the engine wakes, so the tick the wake
+    // starts can retire their batch in poll().
+    std::function<void()> report = kvTier ? kvTier->encode(graph) : nullptr;
     return backend.submitCommandAsync(
         graph.dispatches(),
-        commandNotify(std::move(transfers), std::move(completion)));
+        [report = std::move(report),
+         completion = std::move(completion)](uint64_t) {
+          if (report)
+            report();
+          if (completion)
+            completion();
+        });
+  }
+  [[nodiscard]] bool copiesQueued() const noexcept {
+    return kvTier && kvTier->copiesQueued();
   }
 
   // A constrained DFlash cycle has one host dependency between three Metal
@@ -2338,8 +2336,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
 
   // A mask stage encodes no work; while copies are queued it still submits a
   // command for them, and the plan finishes with that command.
-  if (commandGraph.empty() &&
-      !(impl_->kvTier && impl_->kvTier->copiesQueued())) {
+  if (commandGraph.empty() && !impl_->copiesQueued()) {
     std::vector<ModelStepResult> ready = finish(CommandTiming{});
     return std::make_unique<ReadyModelTicket>(std::move(ready),
                                               priorTiming.wallSeconds * 1000.0);
@@ -2355,7 +2352,7 @@ KvTier *Runtime::kvTier() noexcept { return impl_->kvTier; }
 
 std::unique_ptr<ModelBatchTicket>
 Runtime::submitTransfers(std::function<void()> completion) {
-  if (!impl_->kvTier || !impl_->kvTier->copiesQueued())
+  if (!impl_->copiesQueued())
     return nullptr;
   CommandGraph graph;
   CommandTicket command = impl_->submitWithCopies(graph, std::move(completion));

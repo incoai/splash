@@ -85,6 +85,13 @@ public:
     [[nodiscard]] bool ready() const noexcept;
     [[nodiscard]] bool wait();
     void cancel() noexcept { cancelled_.store(true, std::memory_order_relaxed); }
+    // Stops the operation before its next chunk, or before it starts, and
+    // waits until the worker has let go of the memory it moves; the owner may
+    // free that memory afterwards.
+    void drain() {
+      cancel();
+      static_cast<void>(wait());
+    }
 
   private:
     friend class SlotFile;
@@ -116,8 +123,8 @@ public:
   // False once a write has failed; complete slots stay readable.
   [[nodiscard]] bool writable() const noexcept;
   // True when the worker holds nothing: no operation queued and none running.
-  // Whoever owns the memory an operation moves waits for this, or for the
-  // operation itself, before releasing that memory.
+  // Owners drain their own operations; tests use this to check that none is
+  // left.
   [[nodiscard]] bool idle() const;
   // The spans total one slot and stay valid until the operation is ready.
   [[nodiscard]] std::shared_ptr<Operation> write(

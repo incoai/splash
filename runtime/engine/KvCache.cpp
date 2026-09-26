@@ -119,7 +119,7 @@ KvCache::InsertResult KvCache::insert(uint64_t parentBlock,
     return result;
   }
   if (parentBlock && !blocks_.contains(parentBlock)) {
-    throw std::invalid_argument("KV cache parent block is not resident");
+    throw std::invalid_argument("KV cache parent block is unknown");
   }
   if (parentBlock && block(parentBlock).page == noPage) {
     throw std::logic_error("KV cache parent block has no page");

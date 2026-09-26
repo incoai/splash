@@ -99,10 +99,8 @@ KvPageTier::KvPageTier(metal::MetalBackend &backend, kv::PageStorage &pages,
 // cancelled write leaves behind, because the tier that maps pages to them is
 // going away too.
 KvPageTier::~KvPageTier() {
-  for (const std::shared_ptr<Transfer> &transfer : io_) {
-    transfer->io->cancel();
-    static_cast<void>(transfer->io->wait());
-  }
+  for (const std::shared_ptr<Transfer> &transfer : io_)
+    transfer->io->drain();
 }
 
 uint64_t KvPageTier::slotBytes() const noexcept { return slotBytes_; }

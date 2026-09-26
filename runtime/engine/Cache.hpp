@@ -120,6 +120,9 @@ enum class KvRestoreStatus : uint8_t { None, Pending, Failed };
 
 // Owns active KV page leases, the content-addressed KV graph and cached
 // composite states. Physical recurrent-state cells remain model-owned.
+// A state in RAM always sits on a resident KV block: reclaimKvLeaf frees or
+// drops the state before the block's page, and endRequest, pollTransfers and
+// freeDiskSpace leave such a block its page.
 class Cache final {
 public:
   // The disk budget is the quota the states' file shares with the KV tier;
@@ -257,6 +260,11 @@ private:
 
   [[nodiscard]] Request &request(uint64_t requestId);
   [[nodiscard]] const Request &request(uint64_t requestId) const;
+  // Pages whose demotion is in flight; each keeps its page until the copy
+  // lands.
+  [[nodiscard]] uint32_t pendingPages() const noexcept {
+    return static_cast<uint32_t>(demotions_.size());
+  }
   // Pending, in every verdict below and in the results above, means the
   // same thing: a transfer in flight holds what this needs, and it comes
   // back when the transfer lands. Only transfersInFlight() may report it:
@@ -270,7 +278,8 @@ private:
   };
   enum class LeafReclaim : uint8_t {
     Started,
-    // The ring or the quota is held by transfers in flight.
+    // The ring, the quota or the state write's staging buffer is held by
+    // transfers in flight.
     Pending,
     // Nothing can be written: no tier, or its file failed. A demotion also
     // reports it when making room took the states the leaf was kept for.
@@ -291,6 +300,13 @@ private:
   // that subtree.
   [[nodiscard]] LeafReclaim reclaimKvLeaf(uint64_t block);
   [[nodiscard]] LeafReclaim demoteKv(uint64_t block);
+  // A failed write closes the tier; existing copies stay readable.
+  [[nodiscard]] bool kvTierWritable() const noexcept { return tier_ && tier_->writable(); }
+  // Only a state restores a disk-only chain, through its own block and every
+  // block above.
+  [[nodiscard]] bool kvNeededByState(uint64_t block) const {
+    return states_.contains(block) || kv_.stateBelow(block);
+  }
   // Erases the disk-only subtree below a resident leaf and the states on it;
   // false, erasing nothing, while a block of it is in transfer or in use (a
   // lookup holding a state uses its block) or a state write is in flight.
@@ -326,7 +342,6 @@ private:
   std::map<uint64_t, Restore> restores_;
   // Blocks whose read failed, until they have left.
   std::vector<uint64_t> poisoned_;
-  uint32_t pendingPages_ = 0;
   KvTierSnapshot kvTier_;
   CacheLookupSnapshot lookup_;
   std::function<void()> completionNotifier_;
