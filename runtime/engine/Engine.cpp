@@ -388,10 +388,11 @@ bool Engine::admitQueued(double now) {
       break;
     for (uint64_t id : selected) {
       progressed = admit(request(id), now) || progressed;
-      std::erase_if(candidates, [id](const auto &value) {
-        return value.requestId == id;
-      });
     }
+    std::erase_if(candidates, [&](const auto &value) {
+      return std::find(selected.begin(), selected.end(), value.requestId) !=
+             selected.end();
+    });
     // Failed admissions must not prevent other eligible work from running.
     if (progressed)
       break;
