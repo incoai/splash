@@ -26,6 +26,16 @@ void Embedding::add(metal::CommandGraph &graph, metal::MetalBuffer tokens,
   if (table.layout() == WeightLayout::Block32) {
     const NativeRows &native = table.blocks();
     const GgufEmbedParams params{rows, table.outputSize, table.inputSize};
+    if (table.rotation) {
+      // One threadgroup per rotation block of a row, which gathers the block
+      // and inverts its rotation in fp32 (kernels/shared/gguf_rotation.metal).
+      if (native.formatId != GGUF_FMT_PQ20 || table.inputSize % GGUF_ROTATION_BLOCK ||
+          table.rotation.signs.sizeBytes() < table.inputSize)
+        throw std::invalid_argument("a rotated token table takes PQ2_0 rows of whole rotation blocks and their signs");
+      graph.add("gguf_embed_rotated_pq20", {std::move(tokens), native.rows, table.rotation.signs, std::move(output)},
+                params, {table.inputSize / GGUF_ROTATION_BLOCK, rows, 1}, {GGUF_ROTATION_THREADS, 1, 1});
+      return;
+    }
     graph.add(std::string("gguf_embed_") + native.name(),
               {std::move(tokens), native.rows, std::move(output)}, params,
               {(rows * table.inputSize + 255) / 256, 1, 1}, {256, 1, 1});

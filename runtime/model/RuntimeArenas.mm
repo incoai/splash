@@ -118,6 +118,8 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
     const ops::LinearScratchSize linear = operators.linear().prefillScratchSize(projection);
     put(PrefillTensor::LinearPartials, linear.partials);
     put(PrefillTensor::LinearCounters, linear.counters);
+    // A chunk's plans store at most kPrefillRows rows (whole 128-row tiles).
+    if (projection.rotated) put(PrefillTensor::LinearRotated, ops::rotatedBytes(projection.inputSize, kPrefillRows));
   }
   if (geometry.target.ffnKind == QwenFfnKind::SparseMoe) {
     const ops::MoeWorkspace workspace =
@@ -331,8 +333,12 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
       }
     }
   };
-  // Includes the vocabulary head shared with the draft.
-  for (const auto &p : t.decodeProjections) include({p.outputSize, p.inputSize}, p.layout);
+  // Includes the vocabulary head shared with the draft. Decode plans store at
+  // most every lane's rows.
+  for (const auto &p : t.decodeProjections) {
+    include({p.outputSize, p.inputSize}, p.layout);
+    if (p.rotated) result.rotated = std::max(result.rotated, ops::rotatedBytes(p.inputSize, kLaneCount * kDecodeRows));
+  }
   for (auto matrix : {ops::LinearMatrix{d.dynamicSize, d.hiddenSize},
        {d.qkvSize, d.hiddenSize}, {d.hiddenSize, d.attentionSize},
        {d.intermediateSize, d.hiddenSize}, {d.hiddenSize, d.intermediateSize},

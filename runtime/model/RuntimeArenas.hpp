@@ -140,6 +140,8 @@ enum class PrefillTensor : uint32_t {
   MoeScratchLast = MoeScratch + ops::kMoeScratchFields.size() - 1,
   LinearPartials,
   LinearCounters,
+  // The rotated input of a rotated projection (ops::LinearScratch::rotated).
+  LinearRotated,
   Count,
 };
 
@@ -364,6 +366,7 @@ public:
         allocate(linearSize.partials, metal::BufferStorage::Private, "q4-partials");
     linearScratch_.counters =
         allocate(linearSize.counters, metal::BufferStorage::Shared, "q4-counters");
+    linearScratch_.rotated = allocate(linearSize.rotated, metal::BufferStorage::Private, "linear-rotated");
     if (linearSize.counters)
       std::memset(linearScratch_.counters.contents(), 0, linearSize.counters);
     bytes_ = checkedAdd(checkedAdd(baseBytes, denseScratchBytes, "decode arena"),

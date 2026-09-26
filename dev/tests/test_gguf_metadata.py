@@ -288,6 +288,54 @@ class GgufMetadataTests(unittest.TestCase):
                 with self.assertRaises(models.ModelError):
                     gguf.tokenizer_files(self.metadata(values))
 
+    def test_screening_takes_the_rotation_the_native_loader_runs(self):
+        # A dense target stored for rotated inputs, as Prism ML's GGUFs are:
+        # PQ2_0 projections and token table, BF16 alpha and beta.
+        values = {
+            key.replace("qwen35moe.", "qwen35."): value
+            for key, value in fixture().items()
+            if not key.startswith("qwen35moe.expert")
+        }
+        values["general.architecture"] = "qwen35"
+        rotation = {
+            "prism.hadamard.version": 1,
+            "prism.hadamard.block_size": 1024,
+            "prism.hadamard.transform": "normalized-sylvester-walsh-hadamard",
+            "prism.hadamard.axis": "input-last-dimension",
+            "prism.hadamard.sign_mode": "explicit",
+            "prism.hadamard.gdn_v_grouped": True,
+        }
+        tensors = {
+            name: GGML["F32"] if kind == GGML["F32"] else GGML["PQ2_0"]
+            for name, kind in loadable_tensors(values, self.root).items()
+        }
+        tensors |= {
+            n: GGML["BF16"]
+            for n in tensors
+            if n.endswith((".ssm_alpha.weight", ".ssm_beta.weight"))
+        }
+        path = write_gguf(self.root / "ok.gguf", values | rotation, tensors.items())
+        gguf.require_loadable(gguf.Metadata(path, tensors=True))
+        for changes in (
+            {"prism.hadamard.version": 2},
+            {"prism.hadamard.block_size": 512},
+            {"prism.hadamard.sign_mode": "identity"},
+            {"prism.hadamard.gdn_v_grouped": False},
+        ):
+            with self.subTest(changes=changes):
+                path = write_gguf(
+                    self.root / "bad.gguf", values | rotation | changes, tensors.items()
+                )
+                with self.assertRaisesRegex(models.ModelError, "input rotation"):
+                    gguf.require_loadable(gguf.Metadata(path, tensors=True))
+        # The loader rotates dense targets only.
+        moe = fixture() | rotation
+        path = write_gguf(
+            self.root / "moe.gguf", moe, loadable_tensors(fixture(), self.root).items()
+        )
+        with self.assertRaisesRegex(models.ModelError, "input rotation"):
+            gguf.require_loadable(gguf.Metadata(path, tensors=True))
+
     def test_screening_accepts_each_tensor_as_the_native_loader_reads_it(self):
         values = fixture()
         values["qwen35moe.block_count"] = 41

@@ -73,11 +73,13 @@ struct Fill {
   std::vector<uint8_t> bytes;
 };
 // Rows written back to back as stored or, for F32 rows the kernels read as
-// bf16, as the bf16 values they equal exactly.
+// bf16, as the bf16 values they equal exactly, or for BF16 rows the kernels
+// read as F32, as the F32 values they equal.
 struct Copy {
   uint64_t destination = 0;
   TensorRows source;
   bool bfloat16 = false;
+  bool float32 = false;
 };
 // Quantized rows repacked into the planes of their format; the rows of the
 // sources in order, then zero rows up to `rows`.
