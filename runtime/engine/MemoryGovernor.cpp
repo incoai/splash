@@ -324,10 +324,11 @@ MemoryReclaimDirective MemoryPressurePolicy::update(
     return {true, true, std::numeric_limits<uint64_t>::max()};
   }
   if (nowMilliseconds < nextReclaimMilliseconds_)
-    return {true, false, 0};
+    return continued_.value_or(MemoryReclaimDirective{true, false, 0});
   // The host samples every 500 ms. Allow counters to settle between batches,
   // but keep responding if another application continues consuming memory.
   nextReclaimMilliseconds_ = nowMilliseconds + 1000.0;
+  continued_.reset();
 
   // Missing telemetry pauses allocation, but is not evidence that live
   // cache must be discarded. Empty backing can still be returned.
@@ -343,6 +344,16 @@ MemoryReclaimDirective MemoryPressurePolicy::update(
   // keeps that publication and takes the rest. A waiting request outranks it.
   return {true, false, std::min(desired, kHostWarningMarginBytes),
           !requestWaiting};
+}
+
+void MemoryPressurePolicy::reclaimed(const MemoryReclaimDirective &directive,
+                                     const MemoryReclaimResult &result) noexcept {
+  continued_.reset();
+  // Every critical pass evicts everything again by itself.
+  if (result.outcome != ReclaimOutcome::Pending || directive.evictAllUnpinnedPrefixes)
+    return;
+  continued_ = directive;
+  continued_->targetBytes -= std::min(result.releasedBytes, directive.targetBytes);
 }
 
 } // namespace splash::engine

@@ -256,6 +256,34 @@ void testHostRefusalStartsReclaim() {
           "the waiting request did not fit after the reclaim");
 }
 
+// The paced passes up to the next measurement continue what transfers held
+// back of a pass's target, less what each releases, until it is met. A new
+// measurement replaces it, and every critical pass evicts everything afresh.
+void testPolicyContinuesHeldBackTarget() {
+  MemoryPressurePolicy policy;
+  MemoryGovernorSnapshot pressure{.pressure = MemoryPressure::Warning,
+                                  .hostMeasurementValid = true,
+                                  .hostHeadroomBytes = kHostRecoveryMarginBytes - 300};
+  const auto pass = [&](double now, MemoryReclaimResult result) {
+    const MemoryReclaimDirective directive = policy.update(pressure, now, true);
+    policy.reclaimed(directive, result);
+    return directive.targetBytes;
+  };
+  constexpr MemoryReclaimResult none{};
+  require(pass(0.0, {100, ReclaimOutcome::Pending}) == 300 &&
+              pass(100.0, {50, ReclaimOutcome::Pending}) == 200 &&
+              pass(200.0, {0, ReclaimOutcome::Met}) == 150 && pass(300.0, none) == 0,
+          "the paced passes did not continue a held-back target until it was met");
+  require(pass(1000.0, {0, ReclaimOutcome::Pending}) == 300, "the pass was not measured");
+  pressure.hostHeadroomBytes = kHostRecoveryMarginBytes - 100;
+  require(pass(2000.0, none) == 100 && pass(2100.0, none) == 0,
+          "a measurement did not replace the held-back target");
+  pressure.pressure = MemoryPressure::Critical;
+  static_cast<void>(pass(2200.0, {0, ReclaimOutcome::Pending}));
+  pressure.pressure = MemoryPressure::Warning;
+  require(pass(2300.0, none) == 0, "evicting everything was continued after critical pressure");
+}
+
 } // namespace
 
 int main() {
@@ -263,6 +291,7 @@ int main() {
     testHostAvailabilityCountsReclaimablePages();
     testAdvertisedContextIsGrantable();
     testHostRefusalStartsReclaim();
+    testPolicyContinuesHeldBackTarget();
     std::cout << "memory governor tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

@@ -95,6 +95,24 @@ struct MemoryReclaimDirective {
   bool keepResumePoint = false;
 };
 
+// What a reclaim pass made of its directive's target.
+enum class ReclaimOutcome : uint8_t {
+  // The directive set none; the pass returned only empty backing.
+  Untargeted,
+  // Released, counting the pages whose copies are being written.
+  Met,
+  // Transfers or a release in flight hold back the rest, which a pass can
+  // take once they land.
+  Pending,
+  // Nothing is left to release.
+  Exhausted,
+};
+
+struct MemoryReclaimResult {
+  uint64_t releasedBytes = 0;
+  ReclaimOutcome outcome = ReclaimOutcome::Untargeted;
+};
+
 // Bounded shrink passes separated by a telemetry settling interval. New host
 // pressure is never offset by bytes reclaimed earlier in the same episode.
 class MemoryPressurePolicy final {
@@ -104,9 +122,15 @@ public:
   [[nodiscard]] MemoryReclaimDirective
   update(const MemoryGovernorSnapshot &snapshot, double nowMilliseconds,
          bool requestWaiting) noexcept;
+  // What the pass of `directive` achieved. The passes up to the next
+  // measurement continue the part of its target that transfers held back:
+  // a KV chain gives up one leaf at a time, each after its copy is written.
+  void reclaimed(const MemoryReclaimDirective &directive,
+                 const MemoryReclaimResult &result) noexcept;
 
 private:
   double nextReclaimMilliseconds_ = 0.0;
+  std::optional<MemoryReclaimDirective> continued_;
 };
 
 // The sole physical-memory admission ledger. It does not allocate, evict, or

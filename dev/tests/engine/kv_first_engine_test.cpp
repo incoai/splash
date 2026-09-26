@@ -1,4 +1,5 @@
 #include "TestImmediateTicket.hpp"
+#include "TestKvPool.hpp"
 #include "TestKvTier.hpp"
 #include "engine/Engine.hpp"
 
@@ -7,6 +8,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <stdexcept>
 
@@ -1407,9 +1409,10 @@ void testPressureReclaimRespectsStateLifetimes() {
           "a speculative shrink discarded the only resume point");
 
   executor.reclaimableIdleStateBytes = 128;
-  const uint64_t first = engine.reclaimMemory(
+  const MemoryReclaimResult first = engine.reclaimMemory(
       {.reclaimEmptyKvExtents = true, .targetBytes = 64});
-  require(first >= 128 && executor.reclaimedIdleStateBytes == 128,
+  require(first.releasedBytes >= 128 && first.outcome == ReclaimOutcome::Met &&
+              executor.reclaimedIdleStateBytes == 128,
           "pressure reclaim did not release idle active-state backing first");
   require(
       resources.snapshot().stateCache.entries == 1,
@@ -1417,23 +1420,80 @@ void testPressureReclaimRespectsStateLifetimes() {
 
   // Drain any initially resident but unused test extents, then prove cached
   // state is the next lifecycle selected while its parent KV remains usable.
-  static_cast<void>(engine.reclaimMemory({.reclaimEmptyKvExtents = true}));
-  require(engine.reclaimMemory({.reclaimEmptyKvExtents = true,
-                                .targetBytes = 64}) >= 64,
+  require(engine.reclaimMemory({.reclaimEmptyKvExtents = true}).outcome ==
+              ReclaimOutcome::Untargeted,
+          "a pass without a target reported one");
+  const MemoryReclaimResult state =
+      engine.reclaimMemory({.reclaimEmptyKvExtents = true, .targetBytes = 64});
+  require(state.releasedBytes >= 64 && state.outcome == ReclaimOutcome::Met,
           "pressure reclaim did not release immutable cached state");
   const auto stateEvicted = resources.snapshot();
   require(stateEvicted.stateCache.entries == 0 &&
               stateEvicted.kvCache.blocks == 2,
           "cached-state eviction incorrectly removed target KV");
 
-  static_cast<void>(
-      engine.reclaimMemory({.reclaimEmptyKvExtents = true,
-                            .evictAllUnpinnedPrefixes = true,
-                            .targetBytes = std::numeric_limits<uint64_t>::max()}));
+  require(engine.reclaimMemory({.reclaimEmptyKvExtents = true,
+                                .evictAllUnpinnedPrefixes = true,
+                                .targetBytes = std::numeric_limits<uint64_t>::max()})
+                  .outcome == ReclaimOutcome::Exhausted,
+          "evicting everything left something to reclaim");
   const auto critical = resources.snapshot();
   require(critical.stateCache.entries == 0 && critical.kvCache.blocks == 0 &&
               critical.pool.residentBackingBytes == 0,
           "critical pressure left evictable cached state or KV backing");
+  const MemoryReclaimResult empty =
+      engine.reclaimMemory({.reclaimEmptyKvExtents = true, .targetBytes = 64});
+  require(!empty.releasedBytes && empty.outcome == ReclaimOutcome::Exhausted,
+          "an empty cache did not report reclaim exhausted");
+}
+
+// A KV chain gives up one leaf at a time, each after its copy is written. A
+// pass reports that transfers hold back the rest of its target, and passes
+// with that rest (MemoryPressurePolicy continues it) take the chain as the
+// copies land, each leaf after its child, and stop at the target.
+void testPressureReclaimFollowsTheChain() {
+  test::TestKvBacking backing(4, 100);
+  KvPool pool(backing);
+  test::TestKvTier tier;
+  engine::Cache cache(pool, CacheNamespace{}, &tier);
+  Executor executor;
+  executor.tier = &tier;
+  Events events;
+  engine::Engine engine({}, cache, executor, events);
+  std::vector<uint32_t> prompt(129);
+  std::iota(prompt.begin(), prompt.end(), 1000);
+  cache.beginRequest(1);
+  require(cache.ensureTokens(1, 128).granted(), "fixture KV failed");
+  const uint64_t leaf = cache.publishCommittedBlocks(1, prompt, 128);
+  auto transfer = std::make_shared<OffloadControl>();
+  transfer->ready = true;
+  cache.publishCompositeState(leaf, std::make_shared<OffloadState>(transfer));
+  cache.endRequest(1);
+
+  const auto reclaim = [&](uint64_t target) {
+    return engine.reclaimMemory({.reclaimEmptyKvExtents = true, .targetBytes = target});
+  };
+  // The state's RAM, then the chain's leaf, whose parent waits for its copy.
+  MemoryReclaimResult result = reclaim(364);
+  require(result.releasedBytes == 64 && result.outcome == ReclaimOutcome::Pending &&
+              tier.demotions == 1,
+          "the leaf's copy did not hold back the rest of the target");
+  uint64_t target = 364 - result.releasedBytes;
+  for (uint32_t demoted = 2; demoted <= 3; ++demoted) {
+    tier.complete();
+    require(cache.pollTransfers(), "a written page was not consumed");
+    result = reclaim(target);
+    target -= result.releasedBytes;
+    require(result.releasedBytes == 100 && tier.demotions == demoted &&
+                result.outcome == (demoted < 3 ? ReclaimOutcome::Pending : ReclaimOutcome::Met),
+            "the rest of the target did not take the chain leaf by leaf");
+  }
+  tier.complete();
+  require(cache.pollTransfers(), "the last written page was not consumed");
+  result = engine.reclaimMemory({.reclaimEmptyKvExtents = true});
+  require(result.releasedBytes == 100 && result.outcome == ReclaimOutcome::Untargeted &&
+              tier.demotions == 3 && pool.freePageCount() == 3,
+          "reclaim went past its target");
 }
 
 // A request starts only in a free state cell. While every cell is resident,
@@ -4864,6 +4924,7 @@ int main() {
     testKvGrowthReclaimsIdleStateBeforeCache();
     testKvGrowthDenialKeepsEveryLaneReplayState();
     testPressureReclaimRespectsStateLifetimes();
+    testPressureReclaimFollowsTheChain();
     testFullStateCellsSkipAdmissionAttempts();
     testConcurrencyLimitDoesNotEvictCache();
     testHostPressureDoesNotDrainCacheOnStateAdmission();

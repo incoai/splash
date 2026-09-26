@@ -1200,9 +1200,9 @@ void Engine::suspendForGrowth(Request &active, uint64_t workEnd,
   ++counters_.resourceSuspensions;
 }
 
-uint64_t Engine::reclaimMemory(const MemoryReclaimDirective &directive) {
+MemoryReclaimResult Engine::reclaimMemory(const MemoryReclaimDirective &directive) {
   if (!directive.reclaimEmptyKvExtents)
-    return 0;
+    return {};
 
   uint64_t released = 0;
   while (const uint64_t idle = model_.reclaimIdleState())
@@ -1210,15 +1210,23 @@ uint64_t Engine::reclaimMemory(const MemoryReclaimDirective &directive) {
   const uint64_t remaining =
       released >= directive.targetBytes ? 0 : directive.targetBytes - released;
   // Even a zero-byte directive may release completely empty KV extents.
-  released += cache_.reclaimCache(remaining, directive.evictAllUnpinnedPrefixes,
-                                 directive.keepResumePoint);
+  const uint64_t fromCache = cache_.reclaimCache(
+      remaining, directive.evictAllUnpinnedPrefixes, directive.keepResumePoint);
+  released += fromCache;
   // Evicted states park their buffers in the model's pool; a pressure pass
   // returns that memory to the host now rather than keeping it warm.
   while (model_.reclaimIdleState()) {
   }
   if (released)
     signalResourceProgress();
-  return released;
+  if (!directive.targetBytes && !directive.evictAllUnpinnedPrefixes)
+    return {released, ReclaimOutcome::Untargeted};
+  if (cache_.reclaimMet(fromCache, remaining,
+                        directive.evictAllUnpinnedPrefixes))
+    return {released, ReclaimOutcome::Met};
+  return {released, cache_.releaseDeferred() || cache_.transfersInFlight()
+                        ? ReclaimOutcome::Pending
+                        : ReclaimOutcome::Exhausted};
 }
 
 void Engine::apply(const BatchPlan &plan,

@@ -386,12 +386,16 @@ int runNative(const NativeArguments &arguments) {
         pressurePolicy.update(memory, now, wait.memory || wait.suspended);
     if (!directive.reclaimEmptyKvExtents)
       return false;
-    static_cast<void>(published->nativeLoop().reclaimMemory(directive));
+    const engine::MemoryReclaimResult reclaim =
+        published->nativeLoop().reclaimMemory(directive);
+    pressurePolicy.reclaimed(directive, reclaim);
     static_cast<void>(resources.backend().refreshMemoryStats());
-    // KV backing is returned one extent at a time. Ask to run again at the
-    // next command-free point while a release is still in flight, so the
-    // rest of the empty backing follows without a burst of kernel work.
-    return published->nativeLoop().reclaimDeferred();
+    // KV backing is returned one extent at a time, and a target that
+    // transfers held back continues as they land. Ask to run again at the
+    // next command-free point meanwhile, so the rest follows without a
+    // burst of kernel work.
+    return published->nativeLoop().reclaimDeferred() ||
+           reclaim.outcome == engine::ReclaimOutcome::Pending;
   });
   const auto exit = transport.run(bootstrap->nativeLoop());
   switch (exit) {
