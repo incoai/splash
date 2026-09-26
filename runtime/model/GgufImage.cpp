@@ -73,7 +73,7 @@ public:
 
   // beta (value heads rows) | alpha (value heads rows), rows in grouped head
   // order: Q8_0 as one 256-row tensor padded with zero rows, or F32 as one
-  // float tensor.
+  // float tensor, which BF16 is widened to exactly.
   void alphaBeta(const std::string &betaName, const std::string &alphaName) {
     const GgufTensor *beta = file_.find(betaName), *alpha = file_.find(alphaName);
     if (!beta || !alpha || beta->type != alpha->type || !alphaBetaType(beta->type)) {
