@@ -92,7 +92,7 @@ bool StateCache::touchIfStored(uint64_t kvBlock, bool checkpoint) {
   }
   Entry &entry = found->second;
   if (!checkpoint)
-    makeOrdinary(entry);
+    makeOrdinary(kvBlock, entry);
   if (!entry.pins)
     entry.lastUsed = recency_.next();
   reindex(kvBlock, entry);
@@ -125,28 +125,12 @@ void StateCache::publish(uint64_t kvBlock,
   if (bytes_ > std::numeric_limits<uint64_t>::max() - stateBytes) {
     throw std::overflow_error("composite state byte count overflowed");
   }
-
-  // Repeated checkpoint publication preserves its lifetime; an ordinary
-  // publication upgrades either tier so rolling retirement cannot erase it.
-  const bool fresh = !entries_.contains(kvBlock);
-  Entry &entry = entryFor(kvBlock);
-  if (entry.ram)
+  if (resident(kvBlock))
     throw std::logic_error("duplicate composite state key");
-  // The RAM copy joins the disk copy, or replaces one a failed read
-  // condemned (a failed write leaves none); readers of that copy keep
-  // their own handle to it.
-  if (entry.invalid) {
-    discardDisk(entry);
-    entry.invalid = false;
-  }
-  if (!checkpoint)
-    makeOrdinary(entry);
+
+  Entry &entry = publicationEntry(kvBlock, checkpoint);
   entry.ram = std::move(state);
   bytes_ += stateBytes;
-  if (fresh && checkpoint) {
-    entry.checkpoint = true;
-    ++checkpointEntries_;
-  }
   if (entry.checkpoint)
     checkpointBytes_ += stateBytes;
   if (!entry.pins)
@@ -163,41 +147,18 @@ bool StateCache::publishToDisk(uint64_t kvBlock, const StateWriter &write,
   }
   if (publications_ == std::numeric_limits<uint64_t>::max())
     throw std::overflow_error("composite state publication count overflowed");
-  if (auto found = entries_.find(kvBlock); found != entries_.end()) {
-    Entry &existing = found->second;
-    if (existing.ram)
-      throw std::logic_error("duplicate composite state key");
-    if (!existing.invalid) {
-      // The state is on disk already; a second copy would add nothing.
-      if (!checkpoint)
-        makeOrdinary(existing);
-      if (!existing.pins)
-        existing.lastUsed = recency_.next();
-      reindex(kvBlock, existing);
-      ++deduplicatedPublications_;
-      return true;
-    }
-  }
+  if (resident(kvBlock))
+    throw std::logic_error("duplicate composite state key");
+  // The state is on disk already; a second copy would add nothing.
+  if (touchIfStored(kvBlock, checkpoint))
+    return true;
   // A checkpoint is disposable: it takes the quota's free room but never
   // replaces another copy.
   std::unique_ptr<StateOffload> transfer =
       startWrite(write, completion, checkpoint ? std::function<bool()>{} : makeRoom);
   if (!transfer)
     return false;
-  const bool fresh = !entries_.contains(kvBlock);
-  Entry &entry = entryFor(kvBlock);
-  if (entry.invalid) {
-    // The copy a failed read condemned gives way to the new one (a failed
-    // write leaves none).
-    discardDisk(entry);
-    entry.invalid = false;
-  }
-  if (fresh && checkpoint) {
-    entry.checkpoint = true;
-    ++checkpointEntries_;
-  }
-  if (!checkpoint)
-    makeOrdinary(entry);
+  Entry &entry = publicationEntry(kvBlock, checkpoint);
   beginWrite(kvBlock, entry, std::move(transfer));
   if (!entry.pins)
     entry.lastUsed = recency_.next();
@@ -221,7 +182,8 @@ bool StateCache::retireCheckpoint(StateCheckpoint checkpoint) noexcept {
   return erase(checkpoint.kvBlock, true).evicted;
 }
 
-void StateCache::makeOrdinary(Entry &entry) noexcept {
+void StateCache::makeOrdinary(uint64_t kvBlock, Entry &entry) {
+  kv_.noteState(kvBlock);
   if (!entry.checkpoint)
     return;
   --checkpointEntries_;
@@ -473,6 +435,24 @@ StateCache::Entry &StateCache::entryFor(uint64_t kvBlock) {
   Entry &placed = entries_.emplace(kvBlock, std::move(fresh)).first->second;
   kv_.countState(kvBlock, true);
   return placed;
+}
+
+StateCache::Entry &StateCache::publicationEntry(uint64_t kvBlock, bool checkpoint) {
+  const bool fresh = !entries_.contains(kvBlock);
+  Entry &entry = entryFor(kvBlock);
+  // An entry a failed read condemned gives its copy up (one a failed write
+  // condemned has none); readers of that copy keep their own handle to it.
+  if (entry.invalid) {
+    discardDisk(entry);
+    entry.invalid = false;
+  }
+  if (fresh && checkpoint) {
+    entry.checkpoint = true;
+    ++checkpointEntries_;
+  }
+  if (!checkpoint)
+    makeOrdinary(kvBlock, entry);
+  return entry;
 }
 
 std::unique_ptr<StateOffload> StateCache::startWrite(const StateWriter &write,

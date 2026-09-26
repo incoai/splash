@@ -225,33 +225,21 @@ uint64_t Cache::blockAt(uint64_t requestId, uint32_t boundary) const {
 }
 
 bool Cache::reuseCompositeState(uint64_t kvBlock, bool checkpoint) {
-  const bool reused = states_.touchIfResident(kvBlock, checkpoint);
-  if (reused && !checkpoint)
-    kv_.noteState(kvBlock);
-  return reused;
+  return states_.touchIfResident(kvBlock, checkpoint);
 }
 
 bool Cache::reuseStoredState(uint64_t kvBlock, bool checkpoint) {
-  const bool reused = states_.touchIfStored(kvBlock, checkpoint);
-  if (reused && !checkpoint)
-    kv_.noteState(kvBlock);
-  return reused;
+  return states_.touchIfStored(kvBlock, checkpoint);
 }
 
 void Cache::publishCompositeState(uint64_t kvBlock,
                                   std::shared_ptr<const CompositeState> state,
                                   bool checkpoint) {
   states_.publish(kvBlock, std::move(state), checkpoint);
-  if (!checkpoint)
-    kv_.noteState(kvBlock);
 }
 
 bool Cache::publishStateToDisk(uint64_t kvBlock, const StateWriter &write, bool checkpoint) {
-  if (!states_.publishToDisk(kvBlock, write, completionNotifier_, makeRoom_, checkpoint))
-    return false;
-  if (!checkpoint)
-    kv_.noteState(kvBlock);
-  return true;
+  return states_.publishToDisk(kvBlock, write, completionNotifier_, makeRoom_, checkpoint);
 }
 
 StateCheckpoint Cache::checkpointState(uint64_t kvBlock) const noexcept {
