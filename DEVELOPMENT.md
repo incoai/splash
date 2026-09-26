@@ -283,7 +283,8 @@ upstream fixtures are in `dev/tests/fixtures/chat_templates/`.
 
 Vision comes from the target repository: MLX's `vision_tower.*` tensors,
 linking only `config.json` and the shards holding them, or the GGUF
-repository's root `mmproj*.gguf` projector, chosen by its header: a `clip`
+repository's root projector, a GGUF whose name holds `mmproj` (as
+`mmproj-BF16.gguf` or `MODEL-mmproj-BF16.gguf`), chosen by its header: a `clip`
 projector whose weights are BF16, or F32; BF16 is preferred. F16 has a narrower
 exponent than BF16, so an F16 projector has already rounded small weights and
 is not used. The processor configuration (MLX `preprocessor_config.json`, the
@@ -446,18 +447,36 @@ quantized types to `runtime/metal/abi/QuantFormat.h`). The native loader checks 
 and lists every unsupported tensor in one error:
 
 - linears and experts: Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, Q4_1,
-  IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL or
-  MXFP4;
-- token embeddings: Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, Q4_0 or Q4_1;
+  IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL,
+  MXFP4 or PQ2_0;
+- token embeddings: Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, Q4_1 or PQ2_0;
 - norms, the MoE router and shared-expert scalar gate, and the GDN
   convolution, decay and time-step bias: F32;
-- GDN alpha and beta: both Q8_0 or both F32.
+- GDN alpha and beta: both Q8_0, both F32 or both BF16, which preparation
+  widens to the F32 values it equals.
 
 Of Unsloth's files in September 2026 that covers every file of Qwen3.8-27B
 and Qwen3.6-35B-A3B, from UD-IQ1_S up, but UD-Q8_K_XL and BF16, whose BF16
-tensors need kernels that do not exist yet. A format's image takes the bits
-per weight of its GGUF blocks, but for Q3_K's and Q6_K's padded meta units
-(1/16 bit more) and IQ3_S's chunk words (4.06 bits for its 3.44).
+tensors need kernels that do not exist yet. PQ2_0 is Prism ML's type 142,
+`block_pq2_0` of PrismML-Eng/llama.cpp, which upstream GGML does not define:
+2-bit codes q worth d (q - 1) with one half d per 128 weights. A format's
+image takes the bits per weight of its GGUF blocks, but for Q3_K's and Q6_K's
+padded meta units (1/16 bit more) and IQ3_S's chunk words (4.06 bits for its
+3.44).
+
+Prism ML's GGUFs, such as `prism-ml/Ternary-Bonsai-2-27B-gguf:PQ2_0`, store
+every projection for rotated inputs: the `prism.hadamard.*` metadata names the
+tensors whose weights multiply H (D x), H the normalized Walsh-Hadamard
+transform of each block of 1024 inputs and D an explicit sign per input, and
+the token table, whose rows are stored as H (D e). The engine runs that one
+form, on dense targets whose rotation names exactly the tensors the planner
+repacks (every quantized projection and the head, and alpha/beta when Q8_0),
+a PQ2_0 token table, and GDN value heads in grouped order (the installer
+screens the parameters, `GgufFile` and the planner check the rest).
+A rotated projection rotates its input once into `LinearScratch::rotated`
+(`gguf_rotate`, in fp32 and rounded once to bf16) before its quantized
+segments, whose kernels are the format's, while float segments read the input
+as it is; the table gathers each row through the inverse (`gguf_embed_rotated_pq20`).
 
 At load time the engine validates the GGUF metadata, including the rotary
 embedding and norm epsilon the kernels assume (`rope.freq_base`,
@@ -521,13 +540,16 @@ llama.cpp's and the decoding follows its Metal kernels: both keep llama.cpp's MI
 `THIRD_PARTY_NOTICES`, which the package ships.
 
 The tests' CPU reference (`dev/tests/engine/GgufFormatReference.hpp`) must reproduce the golden
-hashes of upstream GGML's dequantization (llama.cpp 7ab4ee7) in `gguf-reference`, and
-`gguf-planner` checks the planner's plans; both run in `make test-engine-cpu`.
+hashes of upstream GGML's dequantization (llama.cpp 7ab4ee7; for PQ2_0, which upstream lacks,
+PrismML-Eng/llama.cpp 01ae597) in `gguf-reference`, and `gguf-planner` checks the planner's
+plans; both run in `make test-engine-cpu`.
 `make test-engine-metal` runs `gguf-preparation`, which checks every format's planes, as the
 production executor and its `gguf_repack` kernel prepare them, bitwise against the reference,
 the prepared alpha/beta, norm, convolution and router bytes and the golden images; then
 `gguf-dequant`, the staged tile's dequantizer, built with the production Metal flags, against
-the half rounding of every reference weight; `gguf-projection`, every GGUF projection through
+the half rounding of every reference weight; `gguf-rotation`, `gguf_rotate` and the rotated
+PQ2_0 token gather bitwise against the fp32 butterflies and within one bf16 step of fp64;
+`gguf-projection`, every GGUF projection through
 `ops::Linear` with each tile forced, so both decode tiles run on every GPU, at one to four
 lanes, every K split and epilogue, fused segments, every gate/up format pair and the prefill
 tiles, each output inside the fp64 bound of `GgufFormatReference.hpp`; and `gguf-moe`: the float

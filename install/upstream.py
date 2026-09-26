@@ -64,6 +64,12 @@ def _root_ggufs(files):
     return sorted(n for n in files if "/" not in n and n.endswith(".gguf"))
 
 
+def _projector_named(name):
+    """Whether a root GGUF is named as a vision projector: mmproj-*.gguf, or
+    MODEL-mmproj-*.gguf as Prism ML names theirs."""
+    return "mmproj" in Path(name).stem.lower()
+
+
 def select_gguf(files, variant):
     """The target GGUF among a repository's root files, and whether it was
     taken by its -VARIANT ending from several, which the caller reports.
@@ -73,7 +79,7 @@ def select_gguf(files, variant):
     variant apart from its model, so its one match needs no report. Without
     :VARIANT, the only target GGUF. Anything else is an error listing the
     candidates."""
-    candidates = [n for n in _root_ggufs(files) if not n.lower().startswith("mmproj")]
+    candidates = [n for n in _root_ggufs(files) if not _projector_named(n)]
     if variant is None:
         if len(candidates) == 1:
             return candidates[0], False
@@ -99,7 +105,7 @@ def select_gguf(files, variant):
 
 def select_vision(repo):
     """The name and header of the GGUF repository's vision projector, chosen
-    by content among its root mmproj*.gguf files, whatever the publisher
+    by content among its root GGUF files named mmproj, whatever the publisher
     calls them: a clip model whose weights are BF16, or F32, which
     preparation converts only where every value is exact; BF16 is preferred.
     The tower runs in BF16 and preparation never rounds a weight: F16 has a
@@ -107,9 +113,7 @@ def select_vision(repo):
     small weights, as a quantized one has. Each header costs a few range
     requests."""
     usable, found = {"BF16": [], "F32": []}, []
-    for name in _root_ggufs(repo.files):
-        if not name.lower().startswith("mmproj"):
-            continue
+    for name in filter(_projector_named, _root_ggufs(repo.files)):
         with repo.open(name) as stream:
             header = gguf.Metadata(stream, tensors=True)
         architecture = header.values.get("general.architecture")
@@ -131,7 +135,7 @@ def select_vision(repo):
             )
     raise models.ModelError(
         "the GGUF repository has no BF16 or F32 vision projector ("
-        + ("; ".join(found) or "no mmproj*.gguf")
+        + ("; ".join(found) or "no GGUF named mmproj")
         + "); use --language-only to serve text only"
     )
 

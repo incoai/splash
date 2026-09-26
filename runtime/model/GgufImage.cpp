@@ -35,8 +35,8 @@ bool floatType(uint32_t type) { return type == ggml::kF32; }
 // The token rows the embedding kernel gathers.
 bool embeddingType(uint32_t type) { return gguf_embedding_format(gguf_format_of(type)); }
 // alpha/beta run in their stored format: both Q8_0 (one repacked tensor) or
-// both F32 (one float tensor).
-bool alphaBetaType(uint32_t type) { return type == ggml::kQ8_0 || type == ggml::kF32; }
+// both F32 (one float tensor), which both BF16 become exactly.
+bool alphaBetaType(uint32_t type) { return type == ggml::kQ8_0 || type == ggml::kF32 || type == ggml::kBF16; }
 
 // Plans one image. A missing tensor or one of a type this build cannot load
 // is added to `problems` and left out of the image, so the planner can name
@@ -73,7 +73,7 @@ public:
 
   // beta (value heads rows) | alpha (value heads rows), rows in grouped head
   // order: Q8_0 as one 256-row tensor padded with zero rows, or F32 as one
-  // float tensor.
+  // float tensor, which BF16 is widened to exactly.
   void alphaBeta(const std::string &betaName, const std::string &alphaName) {
     const GgufTensor *beta = file_.find(betaName), *alpha = file_.find(alphaName);
     if (!beta || !alpha || beta->type != alpha->type || !alphaBetaType(beta->type)) {
@@ -85,12 +85,15 @@ public:
     for (const GgufTensor *t : {beta, alpha})
       if (t->rows() != heads || t->columns() != hidden)
         throw GgufError("alpha/beta must be [" + std::to_string(heads) + ", hidden]: " + t->name);
-    if (beta->type == ggml::kF32) {
-      descriptor(ggml::kF32, 2ull * heads, hidden, {}, {beta->bytes + alpha->bytes, 0, 0}, betaName);
-      uint64_t destination = section(beta->bytes + alpha->bytes);
+    if (beta->type == ggml::kF32 || beta->type == ggml::kBF16) {
+      const uint64_t widening = beta->type == ggml::kBF16 ? 2 : 1;
+      const uint64_t bytes = (beta->bytes + alpha->bytes) * widening;
+      descriptor(ggml::kF32, 2ull * heads, hidden, {}, {bytes, 0, 0}, betaName);
+      uint64_t destination = section(bytes);
       for (const GgufTensor *t : {beta, alpha}) {
-        image_.copies.push_back({destination, tensorRows(*t, heads, t->bytes / heads, grouped(0, 1))});
-        destination += t->bytes;
+        image_.copies.push_back(
+            {destination, tensorRows(*t, heads, t->bytes / heads, grouped(0, 1)), false, widening == 2});
+        destination += t->bytes * widening;
       }
       return;
     }
@@ -337,6 +340,27 @@ Image layerImage(const GgufFile &file, const TargetGeometry &g, std::vector<std:
   return b.finish();
 }
 
+// A rotated GGUF (GgufRotation) must name exactly what the loader rotates:
+// every tensor the images of a dense target repack, whose segments read
+// H (D x) (ops::InputRotation) while float segments (F32 or BF16 alpha/beta)
+// read x as it is, and the token table, which the rotated gather decodes from
+// PQ2_0 rows, with the GDN value heads of the rotated inputs grouped.
+void requireRotation(const GgufFile &file, const TargetGeometry &g, const std::vector<Image> &images) {
+  const GgufRotation &rotation = *file.rotation();
+  if (g.sparseMoe()) throw GgufError("rotated weights are supported for dense targets only");
+  if (!rotation.valueHeadsGrouped)
+    throw GgufError("rotated GDN inputs must keep their value heads grouped (prism.hadamard.gdn_v_grouped)");
+  std::set<std::string, std::less<>> repacked;
+  for (const Image &image : images)
+    for (const Repack &repack : image.repacks)
+      for (const TensorRows &source : repack.sources) repacked.insert(source.name);
+  if (rotation.weights != repacked)
+    throw GgufError("the rotation must name every quantized tensor of the target and nothing else");
+  if (rotation.tables != std::set<std::string, std::less<>>{"token_embd.weight"} ||
+      file.require("token_embd.weight").type != ggml::kPQ2_0)
+    throw GgufError("the rotation's one token table must be token_embd.weight in PQ2_0");
+}
+
 } // namespace
 
 std::vector<Image> planImages(const GgufFile &file, const TargetGeometry &geometry) {
@@ -357,6 +381,7 @@ std::vector<Image> planImages(const GgufFile &file, const TargetGeometry &geomet
     for (const std::string &problem : problems) names += (names.empty() ? "" : ", ") + problem;
     throw GgufError("GGUF tensors this build cannot load: " + names);
   }
+  if (file.rotation()) requireRotation(file, geometry, images);
   return images;
 }
 

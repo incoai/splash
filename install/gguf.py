@@ -406,6 +406,7 @@ TENSOR_TYPES = {
     29: "IQ1_M",
     30: "BF16",
     39: "MXFP4",
+    142: "PQ2_0",
 }
 QUANTIZED_TYPES = {
     "Q2_K",
@@ -426,14 +427,26 @@ QUANTIZED_TYPES = {
     "IQ4_NL",
     "IQ4_XS",
     "MXFP4",
+    "PQ2_0",
 }
 # The token rows the embedding kernels gather (gguf_embedding_format in
 # runtime/metal/abi/Gguf.h).
-EMBEDDING_TYPES = {"Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q8_0", "Q4_0", "Q4_1"}
+EMBEDDING_TYPES = {
+    "Q2_K",
+    "Q3_K",
+    "Q4_K",
+    "Q5_K",
+    "Q6_K",
+    "Q8_0",
+    "Q4_0",
+    "Q4_1",
+    "PQ2_0",
+}
 # The tensors the native loader reads from a target, and the types it accepts
 # for each (runtime/model/GgufImage.cpp): quantized projections; F32 norms,
 # small GDN vectors and MoE routers, which llama.cpp keeps unquantized and
-# which run unrounded; GDN alpha and beta both Q8_0 or both F32.
+# which run unrounded; GDN alpha and beta both Q8_0, both F32 or both BF16,
+# which preparation widens to the F32 values it equals.
 F32 = {"F32"}
 MODEL_TENSORS = {
     "token_embd.weight": EMBEDDING_TYPES,
@@ -452,8 +465,8 @@ ATTENTION_TENSORS = {
 GDN_TENSORS = {
     "attn_qkv.weight": QUANTIZED_TYPES,
     "attn_gate.weight": QUANTIZED_TYPES,
-    "ssm_alpha.weight": {"Q8_0", "F32"},
-    "ssm_beta.weight": {"Q8_0", "F32"},
+    "ssm_alpha.weight": {"Q8_0", "F32", "BF16"},
+    "ssm_beta.weight": {"Q8_0", "F32", "BF16"},
     "ssm_conv1d.weight": F32,
     "ssm_a": F32,
     "ssm_dt.bias": F32,
@@ -492,10 +505,52 @@ def loaded_tensors(metadata):
     return tensors
 
 
+# Prism ML's input rotation of a dense target: the parameters and keys
+# GgufFile::readRotation (runtime/model/GgufFile.cpp) accepts;
+# gguf::planImages (runtime/model/GgufImage.cpp, requireRotation) refuses MoE
+# targets and ungrouped GDN value heads and checks the names.
+ROTATION_PREFIX = "prism.hadamard."
+ROTATION = {
+    "version": 1,
+    "block_size": 1024,
+    "transform": "normalized-sylvester-walsh-hadamard",
+    "axis": "input-last-dimension",
+    "sign_mode": "explicit",
+    "gdn_v_grouped": True,
+}
+ROTATION_ARRAYS = {"weight_names", "inverse_weight_names", "sign_widths", "sign_values"}
+
+
+def require_rotation(metadata):
+    """Reject a rotated target (Prism ML's GGUFs) whose rotation the native
+    loader does not run: a MoE target, other rotation parameters or a
+    rotation key it does not know."""
+    keys = {
+        key[len(ROTATION_PREFIX) :]
+        for key in metadata.values
+        if key.startswith(ROTATION_PREFIX)
+    }
+    if not keys:
+        return
+    if (
+        text_architecture(metadata) != "qwen35"
+        or not keys <= ROTATION.keys() | ROTATION_ARRAYS
+        or any(
+            type(metadata.values.get(ROTATION_PREFIX + key)) is not type(value)
+            or metadata.values.get(ROTATION_PREFIX + key) != value
+            for key, value in ROTATION.items()
+        )
+    ):
+        raise ModelError(
+            "this GGUF's input rotation is not one Splash runs; choose another variant"
+        )
+
+
 def require_loadable(metadata):
     """Reject a target the native loader cannot read, from its header alone,
     so an unusable file is never downloaded: every tensor it reads must be
     present, with a type it accepts for that tensor."""
+    require_rotation(metadata)
     unsupported = collections.Counter()
     for name, types in loaded_tensors(metadata).items():
         kind = metadata.tensors.get(name)

@@ -106,19 +106,28 @@ struct LinearScratch final {
   metal::MetalBuffer sums;
   metal::MetalBuffer partials;
   metal::MetalBuffer counters;
+  // The bf16 input rows a rotated projection's quantized segments read
+  // (ProjectionShape::rotated): rotatedBytes() of its plan.
+  metal::MetalBuffer rotated{};
 };
 struct LinearScratchSize final {
-  uint64_t input = 0, sums = 0, partials = 0, counters = 0;
-  [[nodiscard]] uint64_t bytes() const noexcept { return input + sums + partials + counters; }
+  uint64_t input = 0, sums = 0, partials = 0, counters = 0, rotated = 0;
+  [[nodiscard]] uint64_t bytes() const noexcept { return input + sums + partials + counters + rotated; }
   // Grows each field to hold `other`'s too.
   LinearScratchSize &include(const LinearScratchSize &other) noexcept {
     input = std::max(input, other.input);
     sums = std::max(sums, other.sums);
     partials = std::max(partials, other.partials);
     counters = std::max(counters, other.counters);
+    rotated = std::max(rotated, other.rotated);
     return *this;
   }
 };
+// LinearScratch::rotated bytes of a rotated projection's plan of storageRows
+// rows of `width` inputs.
+[[nodiscard]] constexpr uint64_t rotatedBytes(uint32_t width, uint64_t storageRows) noexcept {
+  return uint64_t{width} * storageRows * 2;
+}
 
 // The activation layout a decode plan reads: the producer's bf16 rows, or an
 // X^T table with fp32 row sums in LinearScratch that a producer can emit

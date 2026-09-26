@@ -87,8 +87,21 @@ static_assert(sizeof(GgufEmbedParams) == 12, "GGUF embedding parameters are 12 b
 // (kernels/shared/embedding.metal, gguf_embed_<kQuantFormats name>).
 inline constexpr bool gguf_embedding_format(uint32_t format) {
   return format == GGUF_FMT_Q4K || format == GGUF_FMT_Q5K || format == GGUF_FMT_Q6K || format == GGUF_FMT_Q3K ||
-         format == GGUF_FMT_Q2K || format == GGUF_FMT_Q80 || format == GGUF_FMT_Q40 || format == GGUF_FMT_Q41;
+         format == GGUF_FMT_Q2K || format == GGUF_FMT_Q80 || format == GGUF_FMT_Q40 || format == GGUF_FMT_Q41 ||
+         format == GGUF_FMT_PQ20;
 }
+
+// Prism ML's input rotation (kernels/shared/gguf_rotation.metal): weights
+// stored for rotated inputs multiply H (D x), H the normalized Walsh-Hadamard
+// transform of every block of GGUF_ROTATION_BLOCK inputs and D their int8
+// signs (+1 or -1); an embedding row stored rotated gathers as D (H r).
+// One threadgroup of GGUF_ROTATION_THREADS threads per block and row.
+#define GGUF_ROTATION_BLOCK 1024u
+#define GGUF_ROTATION_THREADS 256u
+struct GgufRotationParams {
+  uint32_t width; // a multiple of GGUF_ROTATION_BLOCK
+};
+static_assert(sizeof(GgufRotationParams) == 4, "GGUF rotation parameters are 4 bytes on both sides");
 
 // fp32 projection of a GGUF float tensor (kernels/shared/gguf_float.metal):
 // out[r][out_offset + n] = sum_k x[r][k] * W[n][k] for rows r < rows, W as

@@ -302,8 +302,29 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
     addGgufFloatSegments(graph, b, p, plan);
     BlockWeights weights{segments};
     std::erase_if(weights.segments, [](const QuantizedSegment &s) { return s.isFloat(); });
-    if (!weights.segments.empty())
-      addGguf(graph, b, Projection(p.outputSize, p.inputSize, std::move(weights)), plan, gate, stats);
+    if (!weights.segments.empty()) {
+      Projection quantized(p.outputSize, p.inputSize, std::move(weights));
+      quantized.rotation = p.rotation;
+      addGguf(graph, b, quantized, plan, gate, stats);
+    }
+    return;
+  }
+  if (p.rotation) {
+    // Weights stored for rotated inputs (InputRotation): the quantized
+    // segments, and a gate/up pair's gate too, read H (D x) from the scratch,
+    // rotated once. Rows past the workload's are padding the tiles discard.
+    if (gate && !gate->rotation.signs.sameView(p.rotation.signs))
+      throw std::invalid_argument("a rotated gate/up pair takes one rotation");
+    if (k % GGUF_ROTATION_BLOCK || p.rotation.signs.sizeBytes() < k)
+      throw std::invalid_argument("a rotated projection takes whole rotation blocks and their signs");
+    graph.add("gguf_rotate", {b.input, p.rotation.signs, b.scratch.rotated}, GgufRotationParams{k},
+              {k / GGUF_ROTATION_BLOCK, w.rows, 1}, {GGUF_ROTATION_THREADS, 1, 1});
+    LinearBuffers rotated = b;
+    rotated.input = b.scratch.rotated;
+    rotated.prepared = {};
+    Projection plain = p;
+    plain.rotation = {};
+    addGguf(graph, rotated, plain, plan, gate, stats);
     return;
   }
   if (config.tile == LinearTile::GgufRegister) {

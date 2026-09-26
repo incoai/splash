@@ -20,7 +20,20 @@ struct ProjectionShape final {
   uint32_t outputSize = 0;
   uint32_t inputSize = 0;
   WeightLayout layout = WeightLayout::Affine64;
+  // Its quantized segments multiply the rotated input (InputRotation), which
+  // takes LinearScratch::rotated.
+  bool rotated = false;
   auto operator<=>(const ProjectionShape &) const = default;
+};
+
+// Prism ML's input rotation (metal/abi/Gguf.h, GGUF_ROTATION_BLOCK): a block
+// projection whose weights were stored for rotated inputs multiplies H (D x)
+// of its input x in its quantized segments, its float segments x itself; a
+// token table stored rotated gathers its rows as D (H r). D is one int8 sign
+// per input.
+struct InputRotation final {
+  metal::MetalBuffer signs;
+  [[nodiscard]] explicit operator bool() const noexcept { return static_cast<bool>(signs); }
 };
 
 // The element type a projection writes: bf16, or fp32 for the vocabulary
@@ -141,7 +154,7 @@ public:
   }
 
   [[nodiscard]] ProjectionShape shape() const noexcept {
-    return {outputSize, inputSize, layout()};
+    return {outputSize, inputSize, layout(), static_cast<bool>(rotation)};
   }
 
   uint32_t outputSize = 0;
@@ -149,6 +162,8 @@ public:
   // fp32 only for plain decode plans (Linear::plan), which keep the tile of
   // the bf16 plan.
   FloatOutput destination = FloatOutput::BFloat16;
+  // Block projections only.
+  InputRotation rotation;
 };
 
 // A token table's rows as the GGUF stores them, in a gguf_embedding_format
@@ -173,6 +188,8 @@ public:
 
   uint32_t outputSize = 0;
   uint32_t inputSize = 0;
+  // Native rows stored rotated, gathered as D (H r) (InputRotation).
+  InputRotation rotation;
 };
 
 } // namespace splash::ops

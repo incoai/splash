@@ -49,7 +49,9 @@ struct AffineTargetFormat final {
 // Prepared GGUF images hold each GGUF tensor as one block-quantized segment,
 // a fused projection as its tensors in output column order, and the GGUF's
 // F32 norms. The GGUF keeps the GDN output projection's input columns in
-// llama.cpp's tiled value-head order, so the GDN writes its output in it.
+// llama.cpp's tiled value-head order, so the GDN writes its output in it; a
+// rotated Prism ML GGUF keeps them grouped, and rotateInputs (Qwen3_8.cpp)
+// switches its GDN to that order.
 struct BlockTargetFormat final {
   static constexpr ops::GdnHeadOrder gdnOutputOrder = ops::GdnHeadOrder::Tiled;
 

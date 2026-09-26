@@ -1,8 +1,9 @@
-// The GGUF image planner on the small dense and MoE targets: where each
-// tensor goes and in which row order, which F32 tensors it narrows to bf16,
-// and the sources it refuses.
+// The GGUF image planner on the small dense and MoE targets and a rotated
+// dense one: where each tensor goes and in which row order, which F32 tensors
+// it narrows to bf16, and the sources it refuses.
 //   gguf-planner
 #include "GgufFixtures.hpp"
+#include "metal/abi/Gguf.h"
 
 #include <optional>
 
@@ -186,6 +187,64 @@ void checkRotary(const std::filesystem::path &directory) {
         "planner requires the rotary and norm metadata");
 }
 
+// A dense target stored for rotated inputs, every rotated input one rotation
+// block wide: the rotation must name exactly the tensors the planner repacks,
+// so Q8_0 alpha/beta, whose segment reads the rotated input, and not F32 ones.
+void checkRotation(const std::filesystem::path &directory) {
+  model::gguf::TargetGeometry g;
+  g.layers = 2;
+  g.hiddenSize = GGUF_ROTATION_BLOCK;
+  g.vocabularySize = 256;
+  g.intermediateSize = GGUF_ROTATION_BLOCK;
+  g.gdnKeyHeads = 4;
+  g.gdnValueHeads = 16;
+  g.gdnHeadDimension = 64;
+  g.convolutionDimension = 1536; // q and k of 4 heads, v of 16
+  g.attentionWidth = GGUF_ROTATION_BLOCK; // four query heads of 256
+  g.attentionKvHeads = 1;
+  g.attentionHeadDimension = 256;
+  g.rotaryPairs = 32;
+  g.rotaryTheta = 1e7F;
+  g.fullAttentionPeriod = 2; // layer 1
+  const auto path = directory / "rotated.gguf";
+  // PQ2_0 projections and token table, alpha/beta of type `alphaBeta`, and a
+  // rotation that names every quantized tensor but the table, alpha/beta only
+  // when `namesAlphaBeta`.
+  const auto planned = [&](uint32_t alphaBeta, bool namesAlphaBeta) {
+    TensorTypes types{{"ssm_beta.weight", alphaBeta}, {"ssm_alpha.weight", alphaBeta}};
+    for (const char *name : {"attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight", "attn_qkv.weight",
+                             "attn_gate.weight", "ssm_out.weight", "ffn_gate.weight", "ffn_up.weight",
+                             "ffn_down.weight", "output.weight", "token_embd.weight"})
+      types[name] = model::ggml::kPQ2_0;
+    const std::vector<Tensor> tensors = targetTensors(g, types);
+    std::vector<std::string> weights;
+    for (const Tensor &tensor : tensors)
+      if (gguf_format_of(tensor.type) != GGUF_FMT_COUNT && tensor.name != "token_embd.weight" &&
+          (namesAlphaBeta || !(tensor.name.ends_with("_alpha.weight") || tensor.name.ends_with("_beta.weight"))))
+        weights.push_back(tensor.name);
+    std::vector<test_gguf::Key> keys = metadata(g);
+    const auto key = [](const char *name) { return std::string("prism.hadamard.") + name; };
+    keys.push_back(test_gguf::uint32Key(key("version"), 1));
+    keys.push_back(test_gguf::uint32Key(key("block_size"), GGUF_ROTATION_BLOCK));
+    keys.push_back(test_gguf::stringKey(key("transform"), "normalized-sylvester-walsh-hadamard"));
+    keys.push_back(test_gguf::stringKey(key("axis"), "input-last-dimension"));
+    keys.push_back(test_gguf::stringKey(key("sign_mode"), "explicit"));
+    keys.push_back(test_gguf::boolKey(key("gdn_v_grouped"), true));
+    keys.push_back(test_gguf::int32ArrayKey(key("sign_widths"), {GGUF_ROTATION_BLOCK}));
+    keys.push_back(test_gguf::int32ArrayKey(key("sign_values"), std::vector<int32_t>(GGUF_ROTATION_BLOCK, 1)));
+    keys.push_back(test_gguf::stringArrayKey(key("weight_names"), weights));
+    keys.push_back(test_gguf::stringArrayKey(key("inverse_weight_names"), {"token_embd.weight"}));
+    splash::test::writeFile(path, test_gguf::file(keys, tensors));
+    return plan(path, g);
+  };
+  const Plan floats = planned(model::ggml::kF32, false);
+  check(!floats.error, "planner plans a rotation of F32 alpha/beta" + (floats.error ? ": " + *floats.error : ""));
+  const Plan q8 = planned(model::ggml::kQ8_0, true);
+  check(!q8.error, "planner plans a rotation that names Q8_0 alpha/beta" + (q8.error ? ": " + *q8.error : ""));
+  check(names(planned(model::ggml::kQ8_0, false), {"the rotation must name every quantized tensor"}),
+        "planner refuses a rotation that leaves out Q8_0 alpha/beta");
+}
+
 } // namespace
 
 int main() {
@@ -194,6 +253,7 @@ int main() {
     guarded("planner on the dense target", [&] { checkDense(directory.path()); });
     guarded("planner on the MoE target", [&] { checkMoe(directory.path()); });
     guarded("planner on the rotary metadata", [&] { checkRotary(directory.path()); });
+    guarded("planner on a rotated target", [&] { checkRotation(directory.path()); });
     std::printf("%s (%d failures)\n", failures ? "GGUF planner tests FAILED" : "GGUF planner tests passed", failures);
     return failures ? 1 : 0;
   }

@@ -253,6 +253,37 @@ void checkMoe(MetalBackend &backend, const std::filesystem::path &directory, con
   }
 }
 
+// The MoE layer with BF16 alpha/beta, which preparation widens to the F32
+// values they equal.
+void checkWidenedAlphaBeta(MetalBackend &backend, const std::filesystem::path &directory) {
+  SmallTarget target = smallTarget(true);
+  const model::gguf::TargetGeometry &g = target.geometry;
+  const auto path = directory / "moe-bf16.gguf";
+  std::map<std::string, std::vector<uint8_t>> floats; // the F32 values of the BF16 tensors
+  uint32_t seed = 960;
+  for (const std::string name : {"blk.0.ssm_beta.weight", "blk.0.ssm_alpha.weight"}) {
+    floats[name] = floatValues(uint64_t{g.gdnValueHeads} * g.hiddenSize, ++seed, true);
+    Tensor &tensor = tensorNamed(target.tensors, name);
+    tensor.type = model::ggml::kBF16;
+    tensor.data = bfloat16Halves(floats[name]);
+  }
+  writeGguf(path, target.tensors, g);
+  const std::vector<model::gguf::Image> images = planned(path, g);
+  const auto *beta = copyOf(images[0], "blk.0.ssm_beta.weight"), *alpha = copyOf(images[0], "blk.0.ssm_alpha.weight");
+  if (!beta || !alpha) throw std::runtime_error("the plan has no alpha/beta tensor");
+  check(beta->float32 && alpha->float32 && !beta->bfloat16 && !alpha->bfloat16 &&
+            alpha->destination == beta->destination + 2 * target.data(beta->source.name).size(),
+        "planner widens BF16 alpha/beta into one F32 tensor");
+  model::GgufTargetLoader loader(backend, path, g);
+  const std::vector<uint8_t> image = cachedImage(loader.layer(0));
+  const uint64_t rowBytes = uint64_t{g.hiddenSize} * sizeof(float);
+  std::vector<uint8_t> gates = orderedRows(floats[beta->source.name], rowBytes, beta->source.order);
+  const auto alphaRows = orderedRows(floats[alpha->source.name], rowBytes, alpha->source.order);
+  gates.insert(gates.end(), alphaRows.begin(), alphaRows.end());
+  check(slice(image, beta->destination, gates.size()) == gates,
+        "prepared BF16 alpha/beta: their F32 values, beta then alpha rows in grouped order");
+}
+
 // The segments of a block projection of `n` x `k`, by output width.
 bool blockProjection(const ops::Projection &p, uint32_t n, uint32_t k, std::vector<uint32_t> widths) {
   if (p.layout() != ops::WeightLayout::Block32 || p.outputSize != n || p.inputSize != k ||
@@ -451,6 +482,7 @@ int main(int argc, char **argv) {
     MetalBackend backend(argv[1]);
     guarded("preparation of the dense target", [&] { checkDense(backend, directory.path(), hashes); });
     guarded("preparation of the MoE target", [&] { checkMoe(backend, directory.path(), hashes); });
+    guarded("preparation of BF16 alpha/beta", [&] { checkWidenedAlphaBeta(backend, directory.path()); });
     guarded("the target loader", [&] { checkDenseTarget(backend, directory.path()); });
     checkExecutor(backend, directory.path());
     std::printf("%s (%d failures)\n", failures ? "GGUF preparation tests FAILED" : "GGUF preparation tests passed",
