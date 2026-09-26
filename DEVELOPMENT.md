@@ -283,7 +283,8 @@ upstream fixtures are in `dev/tests/fixtures/chat_templates/`.
 
 Vision comes from the target repository: MLX's `vision_tower.*` tensors,
 linking only `config.json` and the shards holding them, or the GGUF
-repository's root `mmproj*.gguf` projector, chosen by its header: a `clip`
+repository's root projector, a GGUF whose name holds `mmproj` (as
+`mmproj-BF16.gguf` or `MODEL-mmproj-BF16.gguf`), chosen by its header: a `clip`
 projector whose weights are BF16, or F32; BF16 is preferred. F16 has a narrower
 exponent than BF16, so an F16 projector has already rounded small weights and
 is not used. The processor configuration (MLX `preprocessor_config.json`, the

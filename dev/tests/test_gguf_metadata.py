@@ -562,7 +562,14 @@ class GgufMetadataTests(unittest.TestCase):
             models.ModelError, "several BF16 vision projectors"
         ):
             upstream.select_vision(projectors(**{"mmproj-a": bf16, "mmproj-b": bf16}))
-        with self.assertRaisesRegex(models.ModelError, "no mmproj"):
+        # Prism ML prefixes the model's name.
+        self.assertEqual(
+            upstream.select_vision(
+                projectors(**{"Model-mmproj-BF16": bf16, "Model-PQ2_0": text})
+            )[0],
+            "Model-mmproj-BF16.gguf",
+        )
+        with self.assertRaisesRegex(models.ModelError, "no GGUF named mmproj"):
             upstream.select_vision(projectors())
 
     def test_metadata_cache_hit_integrity_and_atomic_failure(self):

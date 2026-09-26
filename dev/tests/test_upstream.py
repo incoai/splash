@@ -114,6 +114,11 @@ class UpstreamTest(unittest.TestCase):
             "Qwen3.8-27B-XL-Q4_K_M.gguf",
         ):
             upstream.select_gguf(files | {"Qwen3.8-27B-XL-Q4_K_M.gguf"}, "Q4_K_M")
+        # A projector is never a target, however its publisher names it.
+        self.assertEqual(
+            upstream.select_gguf({"Model-PQ2_0.gguf", "Model-mmproj-BF16.gguf"}, None),
+            ("Model-PQ2_0.gguf", False),
+        )
         # A repository of one GGUF has no shared name to strip, and needs no
         # variant.
         for variant in ("UD-Q4_K_M", "Q4_K_M", None):
