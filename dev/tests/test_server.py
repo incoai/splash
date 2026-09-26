@@ -3371,6 +3371,14 @@ class ServerTest(unittest.TestCase):
         disk_args = api.parse_args([*required, "--max-cache-disk", "5G"])
         self.assertEqual(disk_args.max_cache_disk, 5 * 1024**3)
         self.assertEqual(api._native_command(disk_args)[-1], str(5 * 1024**3))
+        for invalid in ("auto", "-1", "0G", "5X"):
+            with (
+                self.subTest(invalid=invalid),
+                mock.patch("sys.stderr", io.StringIO()) as error,
+                self.assertRaises(SystemExit),
+            ):
+                api.parse_args([*required, "--max-cache-disk", invalid])
+            self.assertIn("use 0 to disable, or a size such as 5G", error.getvalue())
         self.assertEqual(args.kv_format, "int8")
         self.assertNotIn("--kv-format", api._native_command(args))
         bf16_args = api.parse_args([*required, "--kv-format", "bf16"])

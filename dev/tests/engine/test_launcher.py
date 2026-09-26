@@ -113,9 +113,14 @@ class LauncherTests(unittest.TestCase):
             launcher.parse_args([*required, "--max-cache-disk", "5G"]).max_cache_disk,
             5 * 1024**3,
         )
-        for invalid in ("auto", "-1", "nan"):
-            with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
+        for invalid in ("auto", "-1", "0G", "5X", "nan"):
+            with (
+                self.subTest(invalid=invalid),
+                mock.patch("sys.stderr", io.StringIO()) as error,
+                self.assertRaises(SystemExit),
+            ):
                 launcher.parse_args([*required, "--max-cache-disk", invalid])
+            self.assertIn("use 0 to disable, or a size such as 5G", error.getvalue())
 
     def test_image_budget_fails_before_installation(self):
         for value in ("-1", "0", "65535", "4194305", "invalid"):

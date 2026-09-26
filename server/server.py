@@ -1819,7 +1819,10 @@ def _parse_max_context(value):
 def _parse_max_cache_disk(value):
     if value.strip() == "0":
         return 0
-    result = _parse_max_memory(value)
+    try:
+        result = _parse_max_memory(value)
+    except argparse.ArgumentTypeError:
+        result = None
     if result is None:
         raise argparse.ArgumentTypeError("use 0 to disable, or a size such as 5G")
     return result
