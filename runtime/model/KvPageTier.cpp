@@ -48,11 +48,22 @@ std::shared_ptr<KvPageTier::DiskSlot> diskSlot(const std::shared_ptr<KvDiskSlot>
   if (!disk) throw std::invalid_argument("KV disk slot belongs to another tier");
   return disk;
 }
+
+uint64_t alignedBytes(uint64_t bytes) noexcept {
+  const uint64_t unit = SlotFile::kAlignmentBytes;
+  return (bytes + unit - 1) / unit * unit;
+}
 } // namespace
 
 uint64_t KvPageTier::slotBytesFor(const kv::PageStorage &pages) noexcept {
-  const uint64_t unit = SlotFile::kAlignmentBytes;
-  return (pages.bytesPerPage() + unit - 1) / unit * unit;
+  return alignedBytes(pages.bytesPerPage());
+}
+
+// The ring as allocated, and the small table rounded up to a whole 16 KiB
+// page as a bound on its allocation.
+uint64_t KvPageTier::stagingBytesFor(kv::Layout layout, uint32_t stagingSlots) noexcept {
+  return uint64_t{stagingSlots} * alignedBytes(layout.bytesPerModelPage()) +
+         alignedBytes(ops::KvCopy::tableBytes(stagingSlots));
 }
 
 KvPageTier::KvPageTier(metal::MetalBackend &backend, kv::PageStorage &pages,
@@ -69,10 +80,13 @@ KvPageTier::KvPageTier(metal::MetalBackend &backend, kv::PageStorage &pages,
   // until the operation is tracked and drained.
   io_.reserve(stagingSlots_);
   const uint64_t bytes = uint64_t{stagingSlots_} * slotBytes_;
+  const uint64_t before = backend_.memoryStats().allocatedBytes;
   memory_ = allocateStaging(bytes);
   staging_ = backend_.wrapSharedMemory(memory_.get(), bytes, memory_, "kv-staging");
   table_ = backend_.allocateBuffer(ops::KvCopy::tableBytes(stagingSlots_),
                                    metal::BufferStorage::Shared, "kv-copy-table");
+  actualAllocatedBytes_ =
+      metal::allocationDelta(before, backend_.memoryStats().allocatedBytes);
   for (uint32_t slot = 0; slot < stagingSlots_; ++slot)
     setTable(slot, 0, ops::KvCopy::Direction::None);
   freeStaging_.reserve(stagingSlots_);

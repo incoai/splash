@@ -30,6 +30,8 @@ struct ModelMemoryFootprint final {
   uint64_t sharedDecodeBytes = 0;
   uint64_t pipelineReserveBytes = 0;
   uint64_t runtimeOverheadReserveBytes = 0;
+  // Metal staging of the disk tier's KV transfers; zero without the tier.
+  uint64_t kvStagingBytes = 0;
 };
 
 struct ModelMemoryProfile final {
@@ -109,6 +111,7 @@ struct EngineMemoryBreakdown {
   uint64_t sharedDecodeBytes = 0;
   uint64_t pipelineReserveBytes = 0;
   uint64_t runtimeOverheadReserveBytes = 0;
+  uint64_t kvStagingBytes = 0;
   uint64_t fixedRuntimeBytes = 0;
 
   // All active state cells, cached composite states, and physical KV

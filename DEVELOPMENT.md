@@ -407,13 +407,13 @@ replaced or changed after `prepare` checked it is refused.
 Runtime admission counts prepared weights, draft and vision exactly once
 (`preparedModelWeightBytes`, which `tune-kernels` and the runtime oracle use
 too). Before loading, startup refuses a model whose prepared weights, with the
-pipeline and runtime reserves, one state cell and one KV extent, exceed the
-hard budget, so a model that can never fit is not prepared. File backing does
-not make Metal-resident pages reclaimable, and `WeightFile` keeps its buffer
-resident (`MetalBackend::keepResident`): the weights stay wired between
-requests until 10 minutes pass without a command, and the next command wires
-them again. macOS page cache, driver allocations and other applications still
-affect memory pressure and swap.
+pipeline and runtime reserves, one state cell, one KV extent and any disk tier
+KV staging, exceed the hard budget, so a model that can never fit is not
+prepared. File backing does not make Metal-resident pages reclaimable, and
+`WeightFile` keeps its buffer resident (`MetalBackend::keepResident`): the
+weights stay wired between requests until 10 minutes pass without a command,
+and the next command wires them again. macOS page cache, driver allocations and
+other applications still affect memory pressure and swap.
 
 `loadQwenTarget` (`QwenTargetLoader.hpp`) reads a target's files
 (`QwenTargetFiles`: packed files, or the files `AffineTargetLoader` or
@@ -727,6 +727,8 @@ quota. Closing the server releases both files.
 Transfers use `pread`/`pwrite` with `F_NOCACHE`. The KV staging ring, 128
 pages that the GPU copies through, is Metal memory within `--max-memory`: about
 42 MiB for 35B and 130 MiB for 27B with INT8 KV, 80 MiB and 256 MiB with BF16 KV.
+The memory plan sets it aside whenever the flag is set, even if the tier then
+fails to start, so the KV pool and the advertised context shrink by it.
 The state staging buffer, one state (109 MiB for 35B, 187 MiB for 27B), is host
 memory outside `--max-memory`.
 A quota too small for one state leaves the tier disabled.

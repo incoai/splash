@@ -182,6 +182,9 @@ void testCleanRuntimeStatus() {
   require(json.find("\"read_bytes\":12345") != std::string::npos &&
               json.find("\"written_bytes\":67890") != std::string::npos,
           "disk byte accounting was not exposed");
+  require(json.find("\"kv_staging_bytes\":0,\"fixed_runtime_bytes\"") !=
+              std::string::npos,
+          "the memory plan status omitted the disk tier's KV staging");
   require(json.find("\"kv\":{\"target_model_sha256\"") != std::string::npos &&
               json.find("\"q8\":{\"target_model_sha256\"") != std::string::npos,
           "INT8 status lost its generic or legacy identity");

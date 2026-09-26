@@ -615,6 +615,7 @@ struct Runtime::Impl {
     add(prefillArena->bytes(), "warmup prefill arena");
     add(decodeArena->bytes(), "warmup decode arena");
     add(kvPages.actualAllocatedBytes(), "warmup KV pool");
+    add(kvTier ? kvTier->actualAllocatedBytes() : 0, "warmup KV staging");
     add(pipelineReserveBytes, "warmup pipeline reserve");
     add(runtimeOverheadReserveBytes, "warmup runtime reserve");
     return result;

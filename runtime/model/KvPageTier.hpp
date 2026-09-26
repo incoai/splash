@@ -36,6 +36,10 @@ public:
 
   // Disk bytes per page: the page rounded up for uncached IO.
   [[nodiscard]] static uint64_t slotBytesFor(const kv::PageStorage &pages) noexcept;
+  // Metal bytes a tier allocates for pages of this layout: its staging ring
+  // and copy table. The memory plan sets them aside before the pool exists.
+  [[nodiscard]] static uint64_t
+  stagingBytesFor(kv::Layout layout, uint32_t stagingSlots = kDefaultStagingSlots) noexcept;
 
   KvPageTier(metal::MetalBackend &backend, kv::PageStorage &pages,
              std::shared_ptr<SlotFile> file,
@@ -44,6 +48,8 @@ public:
   KvPageTier(const KvPageTier &) = delete;
   KvPageTier &operator=(const KvPageTier &) = delete;
 
+  // Metal bytes the staging ring and copy table actually hold.
+  [[nodiscard]] uint64_t actualAllocatedBytes() const noexcept { return actualAllocatedBytes_; }
   [[nodiscard]] uint64_t slotBytes() const noexcept override;
   [[nodiscard]] uint64_t capacityBytes() const noexcept override;
   [[nodiscard]] uint64_t usedBytes() const noexcept override;
@@ -93,6 +99,7 @@ private:
   metal::MetalBuffer staging_;
   // One entry per staging slot, non-idle exactly while its copy is encoded.
   metal::MetalBuffer table_;
+  uint64_t actualAllocatedBytes_ = 0;
   std::vector<uint32_t> freeStaging_;
   uint32_t demotionSlots_;
   uint32_t restoreSlots_;
