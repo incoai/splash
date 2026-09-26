@@ -23,7 +23,7 @@ from transformers import AutoTokenizer
 
 if __package__:
     from . import images as image_input
-    from . import json_codec, judgments
+    from . import json_codec, judgments, systemone
     from . import runtime as engine_runtime
     from .api_shapes import (
         anthropic_response,
@@ -66,6 +66,7 @@ else:
     import images as image_input
     import json_codec
     import judgments
+    import systemone
     from api_shapes import (
         anthropic_response,
         anthropic_stop,
@@ -699,12 +700,42 @@ class FrontendHandler(BaseHTTPRequestHandler):
         )
 
     def _systemone(self, body, deadline):
+        prepared = self.app.prepare_systemone(body, deadline=deadline)
+        if isinstance(prepared, judgments.SystemOnePlan):
+            self._systemone_extended(prepared, deadline)
+            return
+        entries = prepared
         active_job = None
         try:
-            entries = self.app.prepare_systemone(body, deadline=deadline)
             remaining_request_time(deadline)
             if self._client_disconnected():
                 raise ConnectionResetError("client disconnected before submission")
+            # One score job over the shared prefix lets every question resume
+            # from its published state; it adds nothing to usage or answers.
+            jobs = [job for _, _, job in entries if job is not None]
+            warmup = None
+            if len(jobs) > 1:
+                warmup = systemone.warmup_job(
+                    self.app, jobs, jobs[0].priority, deadline
+                )
+            if warmup is not None:
+                active_job = warmup
+                if not self.app.backend.submit(warmup):
+                    raise APIError(429, "request queue is full", "rate_limit_exceeded")
+                result = None
+                while result is None:
+                    kind, value = self._next_event(warmup)
+                    if kind == "done":
+                        result = value
+                if result.reason == "cancelled":
+                    if warmup.timed_out:
+                        raise APIError(504, "request timed out", "request_timeout")
+                    raise APIError(500, "request cancelled", "request_cancelled")
+                if result.reason != "stop" or len(result.option_logits) != len(
+                    warmup.score_tokens
+                ):
+                    raise APIError(500, "runtime protocol error", "protocol_error")
+                active_job = None
             answers = {}
             input_tokens = 0
             for qid, spec, job in entries:
@@ -746,6 +777,78 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 "usage": {"input_tokens": input_tokens, "output_tokens": 0},
             },
         )
+
+    def _systemone_extended(self, plan, deadline):
+        remaining_request_time(deadline)
+        if self._client_disconnected():
+            raise ConnectionResetError("client disconnected before submission")
+
+        def run_jobs(jobs):
+            return self._run_systemone_jobs(jobs, deadline)
+
+        self._json(200, systemone.execute(self.app, run_jobs, plan, deadline))
+
+    def _run_systemone_jobs(self, jobs, deadline):
+        """Submit a phase of System One jobs with bounded parallelism.
+
+        Every in-flight job's event queue is polled without blocking; the
+        first terminal or error event ends its watch. Idle passes check the
+        client connection and the shared deadline. Any failure cancels all
+        in-flight jobs. Returns results in submission order."""
+        if not jobs:
+            return []
+        results = [None] * len(jobs)
+        pending = list(range(len(jobs)))
+        active = []
+        borrowed = 0
+        try:
+            for _ in range(min(len(jobs), self.app.preparation_capacity) - 1):
+                if not self.server.requests.acquire():
+                    break
+                borrowed += 1
+            limit = min(self.app.preparation_capacity, 1 + borrowed)
+            while pending or active:
+                while pending and len(active) < limit:
+                    index = pending.pop(0)
+                    job = jobs[index]
+                    if not self.app.backend.submit(job):
+                        raise APIError(
+                            429, "request queue is full", "rate_limit_exceeded"
+                        )
+                    active.append((index, job))
+                progressed = False
+                for entry in list(active):
+                    index, job = entry
+                    while True:
+                        try:
+                            kind, value = job.events.get_nowait()
+                        except queue.Empty:
+                            break
+                        if kind == "done":
+                            results[index] = value
+                            active.remove(entry)
+                            progressed = True
+                            break
+                        if kind == "error":
+                            raise value
+                        # text, start and progress events carry no outcome.
+                if pending or active:
+                    if not progressed:
+                        if self._client_disconnected():
+                            raise ConnectionResetError("client disconnected")
+                        if time.monotonic() >= deadline:
+                            for _, job in active:
+                                self.app.backend.cancel(job, timed_out=True)
+                            raise APIError(504, "request timed out", "request_timeout")
+                        time.sleep(CLIENT_DISCONNECT_POLL)
+        except BaseException:
+            for _, job in active:
+                self.app.backend.cancel(job)
+            raise
+        finally:
+            if borrowed:
+                self.server.requests.release(borrowed)
+        return results
 
     def _systemone_error(self, error):
         if self._response_started:

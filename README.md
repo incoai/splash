@@ -73,7 +73,10 @@ is configured. `"reasoning_effort": "none"` turns it off, and
 Qwen3.8-27B also takes `low`, `medium`, and `xhigh`.
 
 `/v1/judgments` and `/v1/systemone` provide scoring without generation.
-See [judgment contracts](DEVELOPMENT.md#judgment-contracts) for details.
+Optional `/v1/systemone` fields add thinking, typed `string`, `integer` and
+`number` answers, dependent questions, permutation averaging, seeded sampling
+and images; requests without them keep their prompts and answers. See
+[judgment contracts](DEVELOPMENT.md#judgment-contracts) for details.
 
 ## Models
 

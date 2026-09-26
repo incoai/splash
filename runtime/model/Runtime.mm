@@ -124,6 +124,18 @@ T *contents(const MetalBuffer &buffer, std::string_view label) {
   return static_cast<T *>(buffer.contents());
 }
 
+// Pixel bytes must exactly cover the declared spans: staging memcpy's each
+// span's payload without re-checking the boundary.
+void requireConsistentImagePixels(const ModelRequest &request) {
+  uint64_t pixelBytes = 0;
+  for (const ImageSpan &span : request.images) {
+    pixelBytes += span.pixelBytes();
+  }
+  if (request.imagePixels.size() != pixelBytes) {
+    throw std::invalid_argument("image pixels do not match the image spans");
+  }
+}
+
 void validatePlan(const BatchPlan &plan, std::span<const ModelBatchItem> items,
                   WorkKind expected) {
   if (plan.kind != expected || plan.empty() || plan.width() > kLaneCount ||
@@ -439,6 +451,7 @@ struct Runtime::Impl {
   // shared vision scratch and per-image pixel and embedding buffers, all
   // through the governor, preserving the allocation refusal reason.
   metal::AllocationResult stageImages(const ModelRequest &request) {
+    requireConsistentImagePixels(request);
     if (request.images.empty() || stagedImages.contains(request.id))
       return true;
     // The engine rejects image requests at submission when there is no vision.
@@ -1891,11 +1904,11 @@ metal::AllocationResult Runtime::beginAt(const ModelRequest &request, uint32_t s
       (Impl::samplingEnabled(entry) && !entry.sampling.topK)) {
     throw std::invalid_argument("request sampling/cohort contract is invalid");
   }
+  requireConsistentImagePixels(request);
   if (!request.scoreTokens.empty()) {
     if (request.maxNewTokens != 0 ||
         request.constraint != ConstraintMode::None ||
-        request.cohort != BatchCohort::Greedy || !request.images.empty() ||
-        !request.imagePixels.empty() ||
+        request.cohort != BatchCohort::Greedy ||
         request.scoreTokens.size() < ExecutionLimits::minimumScoreOptions ||
         request.scoreTokens.size() > ExecutionLimits::maximumScoreOptions) {
       throw std::invalid_argument("invalid score request");

@@ -73,6 +73,8 @@ public:
   // Prefill chunks each request received, to prove a failure was isolated to
   // the last one rather than to a prefill that never chunked.
   std::unordered_map<uint64_t, uint32_t> prefillChunks;
+  // Image spans admitted per request, kept after the request ends.
+  std::unordered_map<uint64_t, uint32_t> admittedImageSpans;
   uint32_t widestBatch = 0;
   void checkHealth() override {
     if (onHealthCheck)
@@ -86,6 +88,8 @@ public:
           requests_.begin(), requests_.end(),
           [slot](const auto &entry) { return entry.second.slot == slot; });
       if (!used) {
+        admittedImageSpans[request.id] =
+            static_cast<uint32_t>(request.images.size());
         requests_.emplace(
             request.id,
             Active{slot, static_cast<uint32_t>(request.prompt.size()),
@@ -1011,6 +1015,55 @@ void testScoreRequestCompletesAfterFullPrompt() {
           "score request did not complete without generating tokens");
 }
 
+// A score request may carry image spans: the engine admits it, the model
+// sees the image, and the final prompt chunk still returns its logits.
+void testScoreRequestWithImageCompletes() {
+  Backing backing(512);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  std::vector<uint8_t> output;
+  engine::NativeLoopConfig config;
+  config.engine.maxContext = 8192;
+  engine::NativeRuntime loop(
+      config, resources, executor,
+      [&](std::span<const uint8_t> bytes) {
+        output.insert(output.end(), bytes.begin(), bytes.end());
+      },
+      [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
+      {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
+  loop.announceReady();
+  auto scored = scoreRequest(9, 3000);
+  scored.imageSpans = {
+      {4, 1, 2, 2, 0x1111222233334444ULL, 0x5555666677778888ULL}};
+  scored.imagePixels.resize(scored.imageSpans[0].pixelBytes());
+  for (size_t index = 0; index < scored.imagePixels.size(); ++index) {
+    scored.imagePixels[index] = static_cast<uint8_t>(index * 5 + 1);
+  }
+  auto encoded = protocol::serializeMessage(protocol::Message{scored});
+  require(encoded && loop.receive(*encoded.value), "score+image wire failed");
+  runUntilIdle(loop);
+  require(executor.admittedImageSpans[9] == 1,
+          "score image span did not reach the model");
+
+  uint32_t tokensEvents = 0;
+  uint32_t doneCount = 0;
+  for (const protocol::Message &message : decodeMessages(output)) {
+    if (std::holds_alternative<protocol::TokensEvent>(message))
+      ++tokensEvents;
+    if (const auto *done = std::get_if<protocol::DoneEvent>(&message)) {
+      ++doneCount;
+      require(done->requestId == 9 &&
+                  done->reason == protocol::FinishReason::Stop &&
+                  done->completionTokens == 0 &&
+                  done->optionLogits.size() == 3,
+              "score+image done is malformed");
+    }
+  }
+  require(doneCount == 1 && tokensEvents == 0,
+          "score+image request did not complete without generating tokens");
+}
+
 void testCancelledScoreReturnsEmptyLogits() {
   Backing backing(32);
   KvPool pool(backing);
@@ -1291,6 +1344,7 @@ int main() {
     testImageRequestWithoutVisionStaysRequestScoped();
     testStepTokensFitTheWire();
     testScoreRequestCompletesAfterFullPrompt();
+    testScoreRequestWithImageCompletes();
     testCancelledScoreReturnsEmptyLogits();
     testInvalidScoreFailsOneRequestAndKeepsTheBatch();
     testConstrainedMaskExchange();

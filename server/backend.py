@@ -79,6 +79,8 @@ class NativeResult:
     first_token_batch_tokens: int = 0
     # Raw option logits for score-only jobs, in requested token order.
     option_logits: tuple = ()
+    # Every generated token id, including a consumed stop token.
+    output_tokens: tuple = ()
 
 
 @dataclass
@@ -93,6 +95,9 @@ class Job:
     deadline: float
     priority: int = REQUEST_PRIORITIES["normal"]
     stop_sequences: tuple[str, ...] = ()
+    # Token ids that stop generation like a matched stop string: the token is
+    # kept in the output and reported as the stop sequence.
+    stop_token_ids: tuple = ()
     thinking: bool = False
     thinking_display: str = "summarized"
     reasoning_tokens: int = 0
@@ -126,10 +131,13 @@ class Job:
 
 
 class CallbackStreamer:
-    def __init__(self, tokenizer, callback, stop_sequences=(), on_stop=None):
+    def __init__(
+        self, tokenizer, callback, stop_sequences=(), on_stop=None, stop_token_ids=()
+    ):
         self.tokenizer = tokenizer
         self.callback = callback
         self.stop_sequences = tuple(stop_sequences)
+        self.stop_token_ids = frozenset(stop_token_ids)
         self.on_stop = on_stop
         self.backend = getattr(tokenizer, "backend_tokenizer", None)
         self.decode_stream = (
@@ -181,6 +189,11 @@ class CallbackStreamer:
         for token_id in token_ids:
             token_id = int(token_id)
             self.token_ids.append(token_id)
+            if token_id in self.stop_token_ids:
+                self.stop_sequence = self.tokenizer.decode([token_id])
+                if self.on_stop is not None:
+                    self.on_stop()
+                return
             if self.decode_stream is None:
                 continue
             try:
@@ -517,7 +530,11 @@ class NativeBackend:
             job.events.put(("text", text))
 
         streamer = CallbackStreamer(
-            self.tokenizer, emit, job.stop_sequences, stop_matched
+            self.tokenizer,
+            emit,
+            job.stop_sequences,
+            stop_matched,
+            job.stop_token_ids,
         )
         state = _JobState(job, streamer)
         try:
@@ -714,6 +731,7 @@ class NativeBackend:
                 cache=job.cache,
                 stop_sequence=stop_sequence,
                 first_token_batch_tokens=state.first_token_batch_tokens,
+                output_tokens=tuple(getattr(state.streamer, "token_ids", ())),
             )
             if job.latency is not None:
                 latency = metrics_dict(result)["request_latency"]

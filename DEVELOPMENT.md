@@ -115,7 +115,9 @@ splash serve --model mlx-community/Qwen3.8-27B-4bit --default-reasoning-effort n
 ```
 
 `/apply-template` uses the same default. Anthropic `thinking` keeps its protocol
-semantics (off when omitted); judgment endpoints always disable thinking.
+semantics (off when omitted). `/v1/judgments` always disables thinking;
+`/v1/systemone` only enables it through the extension fields described under
+judgment contracts.
 
 ## Upstream model loading
 
@@ -855,7 +857,12 @@ A request holds at most 64 questions and 1M total prepared prompt tokens;
 larger batches are rejected before any inference.
 Questions run sequentially within a request under one shared deadline, allowing
 prefix reuse without filling the admission queue; independent HTTP requests still
-share the scheduler. Disconnects and timeouts cancel the current question.
+share the scheduler. When two or more question prompts share at least 256
+leading tokens, one score-only request over the shared tokens runs first, so
+every question resumes from its cached state. Otherwise the second question
+recomputes the shared prefix while the runtime saves state where the prompts
+diverge. That request is not counted in `usage`. Disconnects and timeouts
+cancel the current request.
 
 Preparation renders each prompt once, then enforces the context limit and the
 batch token budget before the per-slot boundary checks, which re-tokenize the
@@ -877,7 +884,8 @@ calibrate on representative held-out data before using decision thresholds.
 
 Native wire version 6 appends score-token IDs to requests and selected f32 logits
 to Done events; a version mismatch is fatal. Scoring requires 2–255 distinct,
-in-vocabulary tokens, no images or generation constraints, and a zero output budget.
+in-vocabulary tokens, a zero output budget, and no generation constraints;
+image spans are allowed.
 It may use the full context window because no generated token needs a reserved
 position. The final prefill chunk runs the target head but no sampling policy or
 DFlash decode. Successful scoring emits no Tokens event, finishes with Stop, and
@@ -889,6 +897,85 @@ publishes the failing step's cache state or any output, and the rest of the
 batch finishes normally. Prompt chunks that already succeeded keep the blocks
 they committed, exactly as they do for a cancelled request. GPU faults and
 broken engine invariants stay fatal and still mark the runtime unhealthy.
+
+#### System One extensions
+
+`/v1/systemone` accepts optional fields beyond the TypeSafe request shape. A
+request without any of them runs exactly as described above. Any extension
+field, even at its default value, or an open question type selects the
+extended executor. The TypeSafe SDK sends top-level fields through
+`extra_body` and per-question fields in raw-dict questions. It drops answer
+types it does not model; they remain readable from `response.raw_http_response`.
+
+| Request field | Default | Meaning |
+| --- | --- | --- |
+| `thinking` | `false` | Reason before answering each question |
+| `thinking_budget` | `null` | Reasoning tokens per question variant; `null` is bounded by context and `--max-new-tokens` |
+| `reasoning_effort` | template default | Effort for thinking prompts: `minimal`, `low`, `medium`, `high`, `xhigh` or `max` |
+| `execution` | `auto` | `batch`, `sequential` or `dag`; `auto` is `dag` when any question has `depends_on` |
+| `mode` | `argmax` | `sample` draws selections from the tempered distribution |
+| `temperature` | `1.0` | In (0, 2]; used only in `sample` mode |
+| `seed` | random | Unsigned 64-bit; fixes permutation orders, draws and native sampling seeds |
+| `images` | none | 1–64 `data:` URLs, placed before the evidence in every prompt |
+| `numeric_max_digits` | `32` | 1–64 digits for unbounded `integer` and `number` answers |
+| `text_max_tokens` | `512` | Output tokens for a `string` answer, up to `--max-new-tokens` |
+| `return_reasoning` | `false` | Adds `reasoning` and `reasoning_truncated` to answers that thought |
+
+| Question field | Types | Meaning |
+| --- | --- | --- |
+| `type` | | Also `string`, `integer` or `number`; these reject `criteria` |
+| `thinking`, `thinking_budget` | all | Override the request values; a `null` budget removes the limit |
+| `permutations` | `noul`, `choice`, `score` | Integer or `"all"`: average over `min(n, K!)` option orders, at most 720 |
+| `depends_on` | all | Other question ids whose answers this question sees |
+| `nullable` | open | The answer may be `null` |
+| `maxLength` | `string` | 0–32768 characters |
+| `minimum`, `maximum` | `integer`, `number` | Inclusive bounds; `integer` bounds must be integers |
+
+Open answers have the form `{"type": "number", "number": 324.5}`. Nullable
+answers add `null_probability`; the value is `null` when that probability is at
+least one half, or when a `sample` draw selects it. Finite answers keep their
+TypeSafe shape. `images` require a server started with vision, i.e. not
+`--language-only`.
+
+Open questions use their own system instruction and describe the expected
+value with TypeLLM's type and answer lines. The model continues `{"answer":`
+under an llguidance grammar: `%json` for strings and bounded numbers, and a
+digit-limited expression without exponents otherwise. A nullable question first
+scores the tokens that start `null` against the tokens that start a value.
+Answers that reach their token limit or fail the declared type return 500
+`invalid_model_output`.
+
+Thinking uses the chat template's thinking prompt and samples at temperature
+0.6, top-p 0.95 and top-k 20. It stops at `</think>`, which is kept and
+followed by a blank line. At the budget limit or an end-of-turn token, the
+reasoning is closed with `\n\nI will now give the final answer.\n</think>\n\n`;
+unfinished reasoning without text returns 500 `invalid_model_output`. The
+prompt reserves room for that close and for the answer, or the request returns
+400 `context_length_exceeded`. Answer prompts extend the generated thinking
+tokens exactly.
+
+`batch` questions are independent. `sequential` shows each question the answers
+of all earlier questions; `dag` shows the answers of its direct and transitive
+dependencies. Answers appear in the question payload as `dependency_results`,
+in declaration order, with each dependency's `criterion`; question ids never
+enter a prompt. Dependent layers are prepared after their dependencies finish,
+and a failure stops the request. Within a layer, up to the engine's concurrent
+request limit run at once while the HTTP request queue has free slots. A
+disconnect, deadline or failure cancels every running job.
+
+Permutation variants list the options in another order and assign slots by
+position; the identity order comes first. Their probabilities, tempered in
+`sample` mode, are mapped back to the original options and averaged. With
+thinking on, each variant thinks separately. Variant prompts count toward the
+prepared-token limit.
+
+Before a phase, a group of two or more prompts with the same system
+instruction that share at least 256 leading tokens first runs one score-only
+request over the shared tokens, so the others resume from its cached state.
+These warm-up requests are excluded from `usage`. `input_tokens` counts every
+other prompt, including answer prompts that repeat the reasoning;
+`output_tokens` counts generated reasoning and open answers; `reasoning_tokens`
+appears when any question thinks.
 
 ## Validate
 

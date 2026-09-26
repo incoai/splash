@@ -8476,6 +8476,917 @@ class ServerTest(unittest.TestCase):
         )
 
 
+class SystemOneChatMLTokenizer(FakeTokenizer):
+    """ChatML prompt rendering with char-level ids and single-id specials;
+    covers the extended System One executor's thinking, nullable, and image
+    paths without a backend tokenizer."""
+
+    PAD = api_shapes.IMAGE_PAD_TOKEN
+    PAD_ID = 50
+    SPECIALS = {
+        "<|im_start|>": 300,
+        "<|im_end|>": 301,
+        "<think>": 302,
+        "</think>": 303,
+        "<|endoftext|>": 304,
+        " null": 305,
+        " -": 306,
+        ' "': 307,
+        ' ""': 308,
+    }
+    THINK_END_ID = 303
+    EOS_ID = 304
+    eos_token_id = 304
+
+    # Stands for the template like ImagePadTokenizer: rendering emits the
+    # source per image part, so the frontend's render marker replaces it.
+    chat_template = api_shapes.IMAGE_PAD_TOKEN
+
+    def __init__(self):
+        super().__init__()
+        self.backend_tokenizer = None
+        self._ordered = sorted(self.SPECIALS.items(), key=lambda item: -len(item[0]))
+
+    def _encode_tokens(self, text):
+        ids = []
+        index = 0
+        while index < len(text):
+            for token, token_id in self._ordered:
+                if text.startswith(token, index):
+                    ids.append(token_id)
+                    index += len(token)
+                    break
+            else:
+                ids.append(ord(text[index]))
+                index += 1
+        return ids
+
+    def encode(self, text, add_special_tokens=False, **kwargs):
+        return self._encode_tokens(text)
+
+    def decode(self, token_ids, skip_special_tokens=False, **kwargs):
+        reverse = {token_id: token for token, token_id in self.SPECIALS.items()}
+        parts = []
+        for token_id in token_ids:
+            if token_id in reverse:
+                if not skip_special_tokens:
+                    parts.append(reverse[token_id])
+            else:
+                parts.append(chr(token_id))
+        return "".join(parts)
+
+    def convert_tokens_to_ids(self, token):
+        if token == self.PAD:
+            return self.PAD_ID
+        return self.SPECIALS.get(token)
+
+    def apply_chat_template(self, messages, **kwargs):
+        self.templates.append((messages, kwargs))
+        rendered = ""
+        for message in messages:
+            content = message.get("content")
+            if isinstance(content, list):
+                content = "".join(
+                    kwargs.get("chat_template", self.PAD)
+                    if part.get("type") == "image_url"
+                    else part.get("text", "")
+                    for part in content
+                )
+            rendered += f"<|im_start|>{message['role']}\n{content}<|im_end|>\n"
+        if kwargs.get("add_generation_prompt", True):
+            rendered += "<|im_start|>assistant\n"
+            if kwargs.get("enable_thinking", False):
+                rendered += "<think>\n"
+            else:
+                rendered += "<think>\n\n</think>\n\n"
+        if kwargs.get("tokenize") is False:
+            return rendered
+        return self._encode_tokens(rendered)
+
+    def __call__(self, text, **kwargs):
+        ids = []
+        offsets = []
+        index = 0
+        while index < len(text):
+            if text.startswith(self.PAD, index):
+                ids.append(self.PAD_ID)
+                offsets.append((index, index + len(self.PAD)))
+                index += len(self.PAD)
+                continue
+            for token, token_id in self._ordered:
+                if text.startswith(token, index):
+                    ids.append(token_id)
+                    offsets.append((index, index + len(token)))
+                    index += len(token)
+                    break
+            else:
+                ids.append(ord(text[index]))
+                offsets.append((index, index + 1))
+                index += 1
+        return {"input_ids": ids, "offset_mapping": offsets}
+
+
+class SystemOneExtensionTest(unittest.TestCase):
+    """TypeLLM-style /v1/systemone extensions: thinking, open types,
+    permutations, sampling, dependencies, warm-ups and parallelism."""
+
+    def setUp(self):
+        self._close = []
+
+    def tearDown(self):
+        for harness in self._close:
+            harness.close()
+
+    def harness(self, runtime, **kwargs):
+        kwargs.setdefault("tokenizer", SystemOneChatMLTokenizer())
+        kwargs.setdefault("max_context", 8192)
+        harness = Harness(runtime, **kwargs)
+        self._close.append(harness)
+        return harness
+
+    def body(self, questions, **extra):
+        return {
+            "model": "test-model",
+            "state": {"case": 1},
+            "questions": questions,
+            **extra,
+        }
+
+    @staticmethod
+    def user_payload(tokenizer, index):
+        messages, _ = tokenizer.templates[index]
+        content = messages[1]["content"]
+        if isinstance(content, list):
+            content = next(
+                part["text"] for part in content if part.get("type") == "text"
+            )
+        return json.loads(content)
+
+    def test_extended_request_matches_legacy_prompts_slots_and_answers(self):
+        runtime = FakeRuntime(
+            Plan(logits=(2.0, 1.0, 0.0)), Plan(logits=(2.0, 1.0, 0.0))
+        )
+        harness = self.harness(runtime)
+        question = {
+            "type": "choice",
+            "criteria": {"red": "warm", "blue": "cool", "green": "fresh"},
+        }
+        body = self.body({"q": question})
+        status, _, payload = harness.request("POST", "/v1/systemone", body)
+        self.assertEqual(status, 200, payload)
+        legacy_request = runtime.requests[0]
+        status, _, seeded = harness.request(
+            "POST", "/v1/systemone", {**body, "seed": 11}
+        )
+        self.assertEqual(status, 200, seeded)
+        extended_request = runtime.requests[1]
+        self.assertEqual(extended_request.prompt_tokens, legacy_request.prompt_tokens)
+        self.assertEqual(extended_request.score_tokens, legacy_request.score_tokens)
+        self.assertEqual(json.loads(payload)["answers"], json.loads(seeded)["answers"])
+
+    def test_extension_validation_rejects_before_inference(self):
+        runtime = FakeRuntime()
+        harness = self.harness(runtime)
+        base = self.body({"q": {"type": "noul"}})
+        top_cases = [
+            ({"thinking": "yes"}, ["thinking"]),
+            ({"thinking_budget": 0}, ["thinking_budget"]),
+            ({"thinking_budget": "x"}, ["thinking_budget"]),
+            ({"reasoning_effort": "bogus"}, ["reasoning_effort"]),
+            ({"reasoning_effort": "low"}, ["reasoning_effort"]),
+            ({"execution": "bogus"}, ["execution"]),
+            ({"mode": "bogus"}, ["mode"]),
+            ({"temperature": 0}, ["temperature"]),
+            ({"temperature": 2.5}, ["temperature"]),
+            ({"temperature": True}, ["temperature"]),
+            ({"seed": -1}, ["seed"]),
+            ({"seed": 2**64}, ["seed"]),
+            ({"seed": True}, ["seed"]),
+            ({"images": []}, ["images"]),
+            ({"images": ["https://example.com/i.png"]}, ["images"]),
+            ({"images": "data:image/png;base64,AA=="}, ["images"]),
+            ({"images": [42]}, ["images"]),
+            ({"numeric_max_digits": 0}, ["numeric_max_digits"]),
+            ({"numeric_max_digits": 65}, ["numeric_max_digits"]),
+            ({"text_max_tokens": 0}, ["text_max_tokens"]),
+            (
+                {"text_max_tokens": harness.app.default_max_new + 1},
+                ["text_max_tokens"],
+            ),
+            ({"return_reasoning": "yes"}, ["return_reasoning"]),
+        ]
+        question_cases = [
+            ({"type": "noul", "thinking": "yes"}, ["thinking"]),
+            ({"type": "noul", "thinking_budget": 0}, ["thinking_budget"]),
+            ({"type": "noul", "thinking_budget": "x"}, ["thinking_budget"]),
+            ({"type": "integer", "permutations": 2}, ["permutations"]),
+            ({"type": "noul", "permutations": 0}, ["permutations"]),
+            ({"type": "noul", "permutations": "bogus"}, ["permutations"]),
+            ({"type": "noul", "depends_on": "q"}, ["depends_on"]),
+            ({"type": "noul", "depends_on": [""]}, ["depends_on"]),
+            ({"type": "noul", "depends_on": [["a"]]}, ["depends_on"]),
+            ({"type": "noul", "depends_on": [{"a": 1}]}, ["depends_on"]),
+            ({"type": "noul", "depends_on": ["q", "q"]}, ["depends_on"]),
+            ({"type": "noul", "depends_on": ["q"]}, ["depends_on"]),
+            ({"type": "noul", "depends_on": ["missing"]}, ["depends_on"]),
+            ({"type": "noul", "nullable": True}, ["nullable"]),
+            ({"type": "string", "nullable": "yes"}, ["nullable"]),
+            ({"type": "integer", "maxLength": 3}, ["maxLength"]),
+            ({"type": "string", "maxLength": -1}, ["maxLength"]),
+            ({"type": "string", "maxLength": 32769}, ["maxLength"]),
+            ({"type": "string", "maxLength": "x"}, ["maxLength"]),
+            ({"type": "string", "minimum": 0}, ["minimum"]),
+            ({"type": "noul", "maximum": 1}, ["maximum"]),
+            ({"type": "integer", "minimum": 0.5}, ["minimum"]),
+            ({"type": "integer", "minimum": True}, ["minimum"]),
+            ({"type": "number", "maximum": "x"}, ["maximum"]),
+            (
+                {"type": "integer", "minimum": 5, "maximum": 2},
+                ["minimum"],
+            ),
+            ({"type": "string", "criteria": {"a": "b"}}, ["criteria"]),
+        ]
+        bodies = [{**base, **patch} for patch, _ in top_cases]
+        bodies += [self.body({"q": question}) for question, _ in question_cases]
+        bodies += [
+            self.body(
+                {
+                    "a": {"type": "noul"},
+                    "b": {"type": "noul", "depends_on": ["a"]},
+                },
+                execution=execution,
+            )
+            for execution in ("batch", "sequential")
+        ]
+        bodies.append(
+            self.body(
+                {
+                    "a": {"type": "noul", "depends_on": ["b"]},
+                    "b": {"type": "noul", "depends_on": ["a"]},
+                }
+            )
+        )
+        bodies.append(
+            self.body(
+                {
+                    "q": {
+                        "type": "choice",
+                        "permutations": "all",
+                        "criteria": {str(i): str(i) for i in range(7)},
+                    }
+                }
+            )
+        )
+        locs = [loc for _, loc in top_cases] + [loc for _, loc in question_cases]
+        locs += [["execution"], ["execution"], ["depends_on"], ["permutations"]]
+        for body, expected in zip(bodies, locs):
+            with self.subTest(body=body):
+                status, _, payload = harness.request("POST", "/v1/systemone", body)
+                self.assertEqual(status, 422, payload)
+                tails = [
+                    entry["loc"][-len(expected) :]
+                    for entry in json.loads(payload)["detail"]
+                ]
+                self.assertIn(expected, tails)
+                self.assertEqual(runtime.requests, [])
+
+    def test_thinking_natural_close_prefix_usage_and_reasoning(self):
+        tokenizer = SystemOneChatMLTokenizer()
+        reasoning = tokenizer.encode("the evidence points to true")
+        runtime = FakeRuntime(
+            Plan([[*reasoning, tokenizer.THINK_END_ID]]),
+            Plan(logits=(3.0, 1.0)),
+        )
+        harness = self.harness(runtime, tokenizer=tokenizer)
+        body = self.body(
+            {"q": {"type": "noul", "thinking": True, "instructions": "Pick."}},
+            seed=7,
+            return_reasoning=True,
+        )
+        status, _, payload = harness.request("POST", "/v1/systemone", body)
+        self.assertEqual(status, 200, payload)
+        think, score = runtime.requests
+        self.assertEqual(think.sampling.temperature, 0.6)
+        self.assertEqual(think.sampling.top_p, 0.95)
+        self.assertEqual(think.sampling.top_k, 20)
+        self.assertEqual(
+            think.seed,
+            int.from_bytes(hashlib.sha256(b"7:q:0:thinking").digest()[:8], "little"),
+        )
+        natural = (tokenizer.THINK_END_ID, *tokenizer.encode("\n\n"))
+        self.assertEqual(
+            score.prompt_tokens,
+            tuple(think.prompt_tokens) + tuple(reasoning) + natural,
+        )
+        response = json.loads(payload)
+        answer = response["answers"]["q"]
+        self.assertEqual(answer["reasoning"], "the evidence points to true")
+        self.assertFalse(answer["reasoning_truncated"])
+        usage = response["usage"]
+        self.assertEqual(usage["output_tokens"], len(reasoning) + 1)
+        self.assertEqual(usage["reasoning_tokens"], len(reasoning) + 1)
+        self.assertEqual(
+            usage["input_tokens"],
+            len(think.prompt_tokens) + len(score.prompt_tokens),
+        )
+
+    def test_thinking_forced_close_on_length(self):
+        tokenizer = SystemOneChatMLTokenizer()
+        reasoning = tokenizer.encode("still considering")
+        runtime = FakeRuntime(
+            Plan([list(reasoning)], reason="length"),
+            Plan(logits=(1.0, 3.0)),
+        )
+        harness = self.harness(runtime, tokenizer=tokenizer)
+        body = self.body(
+            {"q": {"type": "noul", "thinking": True}}, return_reasoning=True
+        )
+        status, _, payload = harness.request("POST", "/v1/systemone", body)
+        self.assertEqual(status, 200, payload)
+        think, score = runtime.requests
+        forced = tuple(tokenizer.encode(judgments.FORCED_THINKING_CLOSE))
+        self.assertEqual(
+            score.prompt_tokens,
+            tuple(think.prompt_tokens) + tuple(reasoning) + forced,
+        )
+        answer = json.loads(payload)["answers"]["q"]
+        self.assertEqual(answer["reasoning"], "still considering")
+        self.assertTrue(answer["reasoning_truncated"])
+
+    def test_thinking_eos_strips_terminator_and_forces_close(self):
+        tokenizer = SystemOneChatMLTokenizer()
+        reasoning = tokenizer.encode("done thinking")
+        runtime = FakeRuntime(
+            Plan([[*reasoning, tokenizer.EOS_ID]]),
+            Plan(logits=(1.0, 3.0)),
+        )
+        harness = self.harness(runtime, tokenizer=tokenizer)
+        body = self.body(
+            {"q": {"type": "noul", "thinking": True}}, return_reasoning=True
+        )
+        status, _, payload = harness.request("POST", "/v1/systemone", body)
+        self.assertEqual(status, 200, payload)
+        think, score = runtime.requests
+        forced = tuple(tokenizer.encode(judgments.FORCED_THINKING_CLOSE))
+        self.assertEqual(
+            score.prompt_tokens,
+            tuple(think.prompt_tokens) + tuple(reasoning) + forced,
+        )
+        answer = json.loads(payload)["answers"]["q"]
+        self.assertEqual(answer["reasoning"], "done thinking")
+        self.assertTrue(answer["reasoning_truncated"])
+
+    def test_thinking_empty_reasoning_fails(self):
+        runtime = FakeRuntime(Plan([[SystemOneChatMLTokenizer.EOS_ID]]))
+        harness = self.harness(runtime)
+        body = self.body({"q": {"type": "noul", "thinking": True}})
+        status, _, payload = harness.request("POST", "/v1/systemone", body)
+        self.assertEqual(status, 500, payload)
+        self.assertIn(b"invalid_model_output", payload)
+        self.assertEqual(len(runtime.requests), 1)
+
+    def test_thinking_empty_natural_close_is_accepted(self):
+        tokenizer = SystemOneChatMLTokenizer()
+        runtime = FakeRuntime(Plan([[tokenizer.THINK_END_ID]]), Plan(logits=(1.0, 3.0)))
+        harness = self.harness(runtime, tokenizer=tokenizer)
+        body = self.body(
+            {"q": {"type": "noul", "thinking": True}}, return_reasoning=True
+        )
+        status, _, payload = harness.request("POST", "/v1/systemone", body)
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(json.loads(payload)["answers"]["q"]["reasoning"], "")
+
+    def test_thinking_without_context_room_fails(self):
+        harness = self.harness(FakeRuntime(), max_context=64)
+        body = self.body({"q": {"type": "noul", "thinking": True}})
+        status, _, payload = harness.request("POST", "/v1/systemone", body)
+        self.assertEqual(status, 400, payload)
+        self.assertIn(b"context_length_exceeded", payload)
+        self.assertIn(b"question q leaves no room", payload)
+        self.assertEqual(harness.backend.runtime.requests, [])
+
+    def test_reasoning_fields_appear_only_with_thinking(self):
+        runtime = FakeRuntime(
+            Plan(logits=(3.0, 1.0)),
+            Plan([[ord("r"), SystemOneChatMLTokenizer.THINK_END_ID]]),
+            Plan(logits=(3.0, 1.0)),
+        )
+        harness = self.harness(runtime)
+        plain = self.body({"q": {"type": "noul"}}, seed=3)
+        status, _, payload = harness.request("POST", "/v1/systemone", plain)
+        self.assertEqual(status, 200, payload)
+        response = json.loads(payload)
+        self.assertNotIn("reasoning", response["answers"]["q"])
+        self.assertNotIn("reasoning_tokens", response["usage"])
+        thinking = self.body({"q": {"type": "noul", "thinking": True}})
+        status, _, payload = harness.request("POST", "/v1/systemone", thinking)
+        self.assertEqual(status, 200, payload)
+        response = json.loads(payload)
+        self.assertNotIn("reasoning", response["answers"]["q"])
+        self.assertIn("reasoning_tokens", response["usage"])
+
+    def test_permutations_all_submits_every_order_with_identity_first(self):
+        tokenizer = SystemOneChatMLTokenizer()
+        logits = ((4.0, 0.0, 0.0), (0.0, 4.0, 0.0), (0.0, 0.0, 4.0))
+        runtime = FakeRuntime(*[Plan(logits=value) for value in logits * 2])
+        harness = self.harness(runtime, tokenizer=tokenizer)
+        criteria = {"one": "first", "two": "second", "three": "third"}
+        body = self.body(
+            {"q": {"type": "choice", "permutations": "all", "criteria": criteria}}
+        )
+        status, _, payload = harness.request("POST", "/v1/systemone", body)
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(len(runtime.requests), 6)
+        first = self.user_payload(tokenizer, 0)
+        self.assertEqual(
+            [option["label"] for option in first["options"]],
+            list(criteria),
+        )
+        expected = [0.0] * 3
+        for index in range(6):
+            order = [
+                list(criteria).index(option["label"])
+                for option in self.user_payload(tokenizer, index)["options"]
+            ]
+            probabilities = judgments.softmax(logits[index % 3])
+            for position, original in enumerate(order):
+                expected[original] += probabilities[position] / 6
+        answer = json.loads(payload)["answers"]["q"]
+        for label, probability in answer["probabilities"].items():
+            self.assertAlmostEqual(expected[list(criteria).index(label)], probability)
+
+    def test_integer_permutations_with_seed_are_deterministic(self):
+        tokenizer = SystemOneChatMLTokenizer()
+        criteria = {"one": "first", "two": "second", "three": "third"}
+        body = self.body(
+            {"q": {"type": "choice", "permutations": 4, "criteria": criteria}},
+            seed=9,
+        )
+        prompts = []
+        for _ in range(2):
+            runtime = FakeRuntime(*[Plan(logits=(1.0, 0.0, 0.0)) for _ in range(4)])
+            harness = self.harness(runtime, tokenizer=tokenizer)
+            status, _, payload = harness.request("POST", "/v1/systemone", body)
+            self.assertEqual(status, 200, payload)
+            self.assertEqual(len(runtime.requests), 4)
+            prompts.append([request.prompt_tokens for request in runtime.requests])
+        self.assertEqual(prompts[0], prompts[1])
+
+    def test_sample_mode_tempers_and_seeds_choice(self):
+        logits = (2.0, 1.0, 0.0)
+        choices = []
+        responses = []
+        for _ in range(2):
+            runtime = FakeRuntime(Plan(logits=logits))
+            harness = self.harness(runtime)
+            body = self.body(
+                {
+                    "q": {
+                        "type": "choice",
+                        "criteria": {"a": "x", "b": "y", "c": "z"},
+                    }
+                },
+                mode="sample",
+                temperature=0.5,
+                seed=5,
+            )
+            status, _, payload = harness.request("POST", "/v1/systemone", body)
+            self.assertEqual(status, 200, payload)
+            responses.append(json.loads(payload)["answers"]["q"])
+            choices.append(responses[-1]["choice"])
+        self.assertEqual(choices[0], choices[1])
+        self.assertEqual(responses[0], responses[1])
+        tempered = judgments.softmax([logit / 0.5 for logit in logits])
+        for label, probability in responses[0]["probabilities"].items():
+            self.assertAlmostEqual(
+                tempered[{"a": 0, "b": 1, "c": 2}[label]], probability
+            )
+
+    def test_open_integer_bounds_and_json_grammar(self):
+        factory = FakeConstraintFactory()
+        harness = self.harness(
+            FakeRuntime(Plan([[ord(char) for char in " 5}"]])),
+            constraint_factory=factory,
+        )
+        body = self.body({"q": {"type": "integer", "minimum": 1, "maximum": 9}})
+        status, _, payload = harness.request("POST", "/v1/systemone", body)
+        self.assertEqual(status, 200, payload)
+        response = json.loads(payload)
+        self.assertEqual(response["answers"]["q"], {"type": "integer", "integer": 5})
+        self.assertEqual(len(factory.grammars), 1)
+        self.assertIn(
+            '%json {"type":"integer","minimum":1,"maximum":9}',
+            factory.grammars[0],
+        )
+        request = harness.backend.runtime.requests[0]
+        self.assertEqual(request.logical_max_output_tokens, 32 + 8)
+
+    def test_open_number_uses_regex_grammar(self):
+        factory = FakeConstraintFactory()
+        harness = self.harness(
+            FakeRuntime(Plan([[ord(char) for char in " 3.5}"]])),
+            constraint_factory=factory,
+        )
+        body = self.body({"q": {"type": "number"}}, numeric_max_digits=4)
+        status, _, payload = harness.request("POST", "/v1/systemone", body)
+        self.assertEqual(status, 200, payload)
+        response = json.loads(payload)
+        self.assertEqual(response["answers"]["q"], {"type": "number", "number": 3.5})
+        self.assertIn("NUMBER: /-?(?:0(?:\\.[0-9]{1,3})?|", factory.grammars[0])
+        self.assertEqual(len(harness.backend.runtime.requests), 1)
+
+    def test_open_string_max_length(self):
+        factory = FakeConstraintFactory()
+        harness = self.harness(
+            FakeRuntime(Plan([[ord(char) for char in ' "ok"}']])),
+            constraint_factory=factory,
+        )
+        body = self.body({"q": {"type": "string", "maxLength": 4}})
+        status, _, payload = harness.request("POST", "/v1/systemone", body)
+        self.assertEqual(status, 200, payload)
+        response = json.loads(payload)
+        self.assertEqual(response["answers"]["q"], {"type": "string", "string": "ok"})
+        self.assertIn('%json {"type":"string","maxLength":4}', factory.grammars[0])
+        request = harness.backend.runtime.requests[0]
+        self.assertEqual(request.logical_max_output_tokens, 512)
+
+    def test_open_value_length_finish_fails(self):
+        harness = self.harness(
+            FakeRuntime(Plan([[ord("x")]], reason="length")),
+            constraint_factory=FakeConstraintFactory(),
+        )
+        body = self.body({"q": {"type": "string"}})
+        status, _, payload = harness.request("POST", "/v1/systemone", body)
+        self.assertEqual(status, 500, payload)
+        self.assertIn(b"invalid_model_output", payload)
+
+    def test_nullable_null_decision_skips_value_job(self):
+        runtime = FakeRuntime(Plan(logits=(6.0, 0.0, 0.0)))
+        harness = self.harness(runtime, constraint_factory=FakeConstraintFactory())
+        body = self.body({"q": {"type": "string", "nullable": True}})
+        status, _, payload = harness.request("POST", "/v1/systemone", body)
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(len(runtime.requests), 1)
+        decide = runtime.requests[0]
+        self.assertEqual(tuple(decide.score_tokens), (305, 307, 308))
+        answer = json.loads(payload)["answers"]["q"]
+        self.assertIsNone(answer["string"])
+        null_logit = judgments.logsumexp([6.0])
+        value_logit = judgments.logsumexp([0.0, 0.0])
+        expected = judgments.softmax([null_logit, value_logit])[0]
+        self.assertAlmostEqual(answer["null_probability"], expected)
+
+    def test_nullable_value_decision_generates_answer(self):
+        runtime = FakeRuntime(
+            Plan(logits=(0.0, 6.0, 6.0)),
+            Plan([[ord(char) for char in ' "yes"}']]),
+        )
+        harness = self.harness(runtime, constraint_factory=FakeConstraintFactory())
+        body = self.body({"q": {"type": "string", "nullable": True}})
+        status, _, payload = harness.request("POST", "/v1/systemone", body)
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(len(runtime.requests), 2)
+        answer = json.loads(payload)["answers"]["q"]
+        self.assertEqual(answer["string"], "yes")
+        self.assertAlmostEqual(
+            answer["null_probability"],
+            judgments.softmax([0.0, judgments.logsumexp([6.0, 6.0])])[0],
+        )
+
+    def test_sequential_feeds_earlier_answers_in_declaration_order(self):
+        tokenizer = SystemOneChatMLTokenizer()
+        runtime = FakeRuntime(Plan(logits=(3.0, 1.0)), Plan(logits=(1.0, 3.0)))
+        harness = self.harness(runtime, tokenizer=tokenizer)
+        body = self.body(
+            {
+                "first": {"type": "noul", "instructions": "Is it safe?"},
+                "second": {
+                    "type": "choice",
+                    "criteria": {"keep": "stay", "drop": "remove"},
+                },
+            },
+            execution="sequential",
+        )
+        status, _, payload = harness.request("POST", "/v1/systemone", body)
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(len(runtime.requests), 2)
+        dependency = self.user_payload(tokenizer, 1)["dependency_results"]
+        self.assertEqual(dependency, [{"criterion": "Is it safe?", "answer": True}])
+        answers = json.loads(payload)["answers"]
+        self.assertEqual(answers["second"]["choice"], "drop")
+
+    def test_dag_layers_dependencies_and_transitive_results(self):
+        tokenizer = SystemOneChatMLTokenizer()
+        plans = [
+            Plan(logits=(3.0, 1.0), block=True),
+            Plan(logits=(3.0, 1.0)),
+            Plan(logits=(1.0, 3.0)),
+        ]
+        runtime = FakeRuntime(*plans)
+        harness = self.harness(runtime, tokenizer=tokenizer)
+        body = self.body(
+            {
+                "a": {"type": "noul", "instructions": "A?"},
+                "b": {"type": "noul", "depends_on": ["a"], "instructions": "B?"},
+                "c": {"type": "noul", "depends_on": ["b"]},
+            }
+        )
+        outcome = {}
+        thread = threading.Thread(
+            target=lambda: outcome.setdefault(
+                "result", harness.request("POST", "/v1/systemone", body)
+            ),
+            daemon=True,
+        )
+        thread.start()
+        first_plan = plans[0]
+        self.assertTrue(first_plan.started.wait(2))
+        self.assertEqual(len(runtime.requests), 1)
+        first_plan.release.set()
+        thread.join(5)
+        status, _, payload = outcome["result"]
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(len(harness.backend.runtime.requests), 3)
+        middle = self.user_payload(tokenizer, 1)["dependency_results"]
+        self.assertEqual(middle, [{"criterion": "A?", "answer": True}])
+        last = self.user_payload(tokenizer, 2)["dependency_results"]
+        self.assertEqual(
+            last,
+            [
+                {"criterion": "A?", "answer": True},
+                {"criterion": "B?", "answer": True},
+            ],
+        )
+
+    def test_batch_keeps_jobs_in_flight_and_releases_admission(self):
+        plans = [
+            Plan(logits=(1.0, 2.0), block=True),
+            Plan(logits=(2.0, 1.0), block=True),
+        ]
+        runtime = FakeRuntime(*plans)
+        harness = self.harness(runtime)
+        body = self.body(
+            {"a": {"type": "noul"}, "b": {"type": "noul"}}, execution="batch"
+        )
+        outcome = {}
+        thread = threading.Thread(
+            target=lambda: outcome.setdefault(
+                "result", harness.request("POST", "/v1/systemone", body)
+            ),
+            daemon=True,
+        )
+        thread.start()
+        self.assertTrue(plans[0].started.wait(2))
+        self.assertTrue(plans[1].started.wait(2))
+        in_flight = [call for call in runtime.calls if not call.done]
+        self.assertGreaterEqual(len(in_flight), 2)
+        for plan in plans:
+            plan.release.set()
+        thread.join(5)
+        status, _, payload = outcome["result"]
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(harness.server.requests.stats()["active"], 0)
+        self.assertEqual(harness.app.preparation_active, 0)
+
+    def test_long_shared_prefix_gets_warmup_excluded_from_usage(self):
+        state = "evidence " * 64
+        runtime = FakeRuntime(
+            Plan(logits=(1.0, 1.0)),
+            Plan(logits=(3.0, 1.0)),
+            Plan(logits=(1.0, 3.0)),
+        )
+        harness = self.harness(runtime)
+        body = self.body(
+            {
+                "a": {"type": "noul", "instructions": "First?"},
+                "b": {"type": "noul", "instructions": "Second?"},
+            },
+            seed=4,
+        )
+        body["state"] = state
+        status, _, payload = harness.request("POST", "/v1/systemone", body)
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(len(runtime.requests), 3)
+        warmup, first, second = runtime.requests
+        self.assertEqual(tuple(warmup.score_tokens), (65, 66))
+        self.assertGreaterEqual(len(warmup.prompt_tokens), 256)
+        self.assertLess(len(warmup.prompt_tokens), len(first.prompt_tokens))
+        self.assertEqual(
+            warmup.prompt_tokens,
+            first.prompt_tokens[: len(warmup.prompt_tokens)],
+        )
+        self.assertEqual(
+            warmup.prompt_tokens,
+            second.prompt_tokens[: len(warmup.prompt_tokens)],
+        )
+        usage = json.loads(payload)["usage"]
+        self.assertEqual(
+            usage["input_tokens"],
+            len(first.prompt_tokens) + len(second.prompt_tokens),
+        )
+        self.assertEqual(usage["output_tokens"], 0)
+
+    def test_images_reach_every_generated_and_scored_job(self):
+        tokenizer = SystemOneChatMLTokenizer()
+        reasoning = tokenizer.encode("looked at the image")
+        runtime = FakeRuntime(
+            Plan([[*reasoning, tokenizer.THINK_END_ID]]),
+            Plan(logits=(3.0, 1.0)),
+        )
+        harness = self.harness(runtime, tokenizer=tokenizer)
+        body = self.body(
+            {"q": {"type": "noul", "thinking": True}},
+            images=[ServerTest._png_data_url()],
+        )
+        status, _, payload = harness.request("POST", "/v1/systemone", body)
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(len(runtime.requests), 2)
+        for request in runtime.requests:
+            self.assertEqual(len(request.image_spans), 1)
+            self.assertTrue(request.image_pixels)
+
+    def test_images_rejected_without_vision(self):
+        runtime = FakeRuntime()
+        harness = self.harness(runtime, vision=False)
+        body = self.body(
+            {"q": {"type": "noul"}},
+            images=[ServerTest._png_data_url()],
+        )
+        status, _, payload = harness.request("POST", "/v1/systemone", body)
+        self.assertEqual(status, 422, payload)
+        details = json.loads(payload)["detail"]
+        self.assertEqual(details[0]["loc"], ["body", "images"])
+        self.assertIn("language-only", details[0]["msg"])
+        self.assertEqual(runtime.requests, [])
+
+    def test_deadline_cancels_every_in_flight_job(self):
+        plans = [Plan(block=True), Plan(block=True)]
+        runtime = FakeRuntime(*plans)
+        harness = self.harness(runtime)
+        body = self.body(
+            {"a": {"type": "noul"}, "b": {"type": "noul"}},
+            execution="batch",
+            timeout=0.4,
+        )
+        status, _, payload = harness.request("POST", "/v1/systemone", body)
+        self.assertEqual(status, 504, payload)
+        self.assertEqual(runtime.cancel_count, 2)
+        self.assertEqual(harness.server.requests.stats()["active"], 0)
+
+    def test_disconnect_cancels_every_in_flight_job(self):
+        plans = [Plan(block=True), Plan(block=True)]
+        runtime = FakeRuntime(*plans)
+        harness = self.harness(runtime)
+        body = self.body(
+            {"a": {"type": "noul"}, "b": {"type": "noul"}}, execution="batch"
+        )
+        with (
+            mock.patch.object(
+                api.FrontendHandler,
+                "_client_disconnected",
+                side_effect=[False, True],
+            ),
+            self.assertRaises((http.client.HTTPException, OSError)),
+        ):
+            harness.request("POST", "/v1/systemone", body)
+        for _ in range(50):
+            if runtime.cancel_count >= 2:
+                break
+            time.sleep(0.02)
+        self.assertEqual(runtime.cancel_count, 2)
+
+    def test_legacy_long_shared_prefix_gets_warmup(self):
+        runtime = FakeRuntime(
+            Plan(logits=(1.0, 2.0)),
+            Plan(logits=(3.0, 1.0)),
+            Plan(logits=(1.0, 3.0)),
+        )
+        harness = self.harness(runtime)
+        body = self.body(
+            {
+                "a": {"type": "noul", "instructions": "First?"},
+                "b": {"type": "noul", "instructions": "Second?"},
+            },
+            state="evidence " * 64,
+        )
+        status, _, payload = harness.request("POST", "/v1/systemone", body)
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(len(runtime.requests), 3)
+        warmup, first, second = runtime.requests
+        self.assertGreaterEqual(len(warmup.prompt_tokens), 256)
+        self.assertLess(len(warmup.prompt_tokens), len(first.prompt_tokens))
+        self.assertLess(len(warmup.prompt_tokens), len(second.prompt_tokens))
+        self.assertEqual(
+            first.prompt_tokens[: len(warmup.prompt_tokens)],
+            warmup.prompt_tokens,
+        )
+        self.assertEqual(
+            second.prompt_tokens[: len(warmup.prompt_tokens)],
+            warmup.prompt_tokens,
+        )
+        self.assertEqual(len(warmup.score_tokens), 2)
+        self.assertEqual(len(set(warmup.score_tokens)), 2)
+        response = json.loads(payload)
+        self.assertGreater(response["answers"]["a"]["noul"], 0.5)
+        self.assertLess(response["answers"]["b"]["noul"], 0.5)
+        self.assertEqual(
+            response["usage"],
+            {
+                "input_tokens": len(first.prompt_tokens) + len(second.prompt_tokens),
+                "output_tokens": 0,
+            },
+        )
+
+    def test_legacy_short_shared_prefix_skips_warmup(self):
+        runtime = FakeRuntime(
+            Plan(logits=(3.0, 1.0)),
+            Plan(logits=(3.0, 1.0)),
+        )
+        harness = self.harness(runtime)
+        body = self.body(
+            {
+                "a": {"type": "noul", "instructions": "First?"},
+                "b": {"type": "noul", "instructions": "Second?"},
+            }
+        )
+        status, _, payload = harness.request("POST", "/v1/systemone", body)
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(len(runtime.requests), 2)
+        self.assertEqual(
+            json.loads(payload)["usage"]["input_tokens"],
+            sum(len(request.prompt_tokens) for request in runtime.requests),
+        )
+
+    def test_legacy_warmup_deadline_cancels_before_questions(self):
+        runtime = FakeRuntime(Plan(logits=(1.0, 2.0), block=True))
+        harness = self.harness(runtime)
+        body = self.body(
+            {
+                "a": {"type": "noul", "instructions": "First?"},
+                "b": {"type": "noul", "instructions": "Second?"},
+            },
+            state="evidence " * 64,
+            timeout=0.3,
+        )
+        status, _, payload = harness.request("POST", "/v1/systemone", body)
+        self.assertEqual(status, 504, payload)
+        for _ in range(50):
+            if runtime.cancel_count:
+                break
+            time.sleep(0.02)
+        self.assertEqual(runtime.cancel_count, 1)
+        self.assertEqual(len(runtime.requests), 1)
+
+    def test_open_grammars_accept_and_reject_with_llguidance(self):
+        from llguidance import LLMatcher
+
+        from dev.tests.engine.test_structured_tools import (
+            StructuredToolGrammarTest,
+        )
+
+        StructuredToolGrammarTest.setUpClass()
+        guidance = StructuredToolGrammarTest.guidance
+
+        def accepts(grammar, text):
+            matcher = LLMatcher(guidance, grammar)
+            self.assertFalse(LLMatcher.validate_grammar(grammar, guidance), text)
+            tokens = list(text.encode())
+            self.assertEqual(matcher.validate_tokens(tokens), len(tokens), text)
+            self.assertTrue(matcher.consume_tokens(tokens), text)
+            self.assertTrue(matcher.is_accepting(), text)
+
+        def rejects(grammar, text):
+            matcher = LLMatcher(guidance, grammar)
+            tokens = list(text.encode())
+            accepted = matcher.validate_tokens(tokens)
+            if accepted == len(tokens):
+                matcher.consume_tokens(tokens)
+                self.assertFalse(matcher.is_accepting(), text)
+
+        bounded = judgments.SystemOneQuestion(
+            "integer", None, (), (), None, False, minimum=2, maximum=9
+        )
+        grammar = judgments.value_grammar(bounded, 8)
+        for text in (" 7}", " 2}"):
+            accepts(grammar, text)
+        for text in (" 10}", " 1}", " 1e2}"):
+            rejects(grammar, text)
+
+        number = judgments.SystemOneQuestion("number", None, (), (), None, False)
+        grammar = judgments.value_grammar(number, 2)
+        for text in (" 1.5}", " -4}", " 0.9}"):
+            accepts(grammar, text)
+        for text in (" 123}", " 1e3}", " 9.99}"):
+            rejects(grammar, text)
+
+        text_spec = judgments.SystemOneQuestion(
+            "string", None, (), (), None, False, max_length=3
+        )
+        grammar = judgments.value_grammar(text_spec, 4)
+        accepts(grammar, ' "ab"}')
+        rejects(grammar, ' "abcd"}')
+
+
 class MessageNormalizationTest(unittest.TestCase):
     def test_unfinished_tool_call_arguments_stay_history_text(self):
         # A tool call cut short by the client's output limit comes back as

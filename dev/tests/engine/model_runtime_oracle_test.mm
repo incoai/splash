@@ -1054,6 +1054,80 @@ int main(int argc, char **argv) {
       executor.end(99);
     }
 
+    // A score request may carry an image span: staging admits its pixels, the
+    // prefill encodes and injects the image rows, and the final-position
+    // logits reflect them. The generation request encodes first; the score
+    // request uses identical pixels under a different digest so its own
+    // prefill runs the encoder rather than the embedding cache.
+    {
+      const std::vector<uint32_t> imagePages = pageRange(120, 8);
+      for (uint32_t page : imagePages)
+        require(static_cast<bool>(pages.ensureResident(page)),
+                "image score KV backing is unavailable");
+      const ImageSpan imageSpan{56, 16, 8, 8, 271, 449};
+      std::vector<uint8_t> imagePixels(imageSpan.pixelBytes());
+      for (size_t index = 0; index < imagePixels.size(); ++index)
+        imagePixels[index] = static_cast<uint8_t>(index * 5 + 1);
+
+      EngineRequest imageGeneration = makeRequest(110, prompt128, 4);
+      imageGeneration.images = {imageSpan};
+      imageGeneration.imagePixels = imagePixels;
+      const StateAdmission generationAdmission =
+          executor.begin(imageGeneration.modelView());
+      require(generationAdmission.granted(),
+              "image generation request was not admitted");
+      const uint32_t generationSlot = *generationAdmission.cell;
+      executor.setDraftContextPlan(
+          imageGeneration.id,
+          planDraftContext(0, static_cast<uint32_t>(prompt128.size()),
+                           std::nullopt, {}));
+      ModelStepResult imageFirst = firstStep(
+          executor,
+          prefillChunk(executor, imageGeneration.id, generationSlot, 0, 0,
+                       prompt128, imagePages, BatchCohort::Greedy, false),
+          imageGeneration.id, generationSlot, prompt128.size(), imagePages,
+          BatchCohort::Greedy);
+      require(!imageFirst.outputTokens.empty(),
+              "image prompt produced no first token");
+      executor.end(imageGeneration.id);
+
+      const uint32_t imageGreedy = imageFirst.outputTokens.front();
+      const uint32_t imageOtherA = imageGreedy == 1 ? 2u : 1u;
+      const uint32_t imageOtherB = imageGreedy == 7 ? 8u : 7u;
+      EngineRequest imageScored = makeRequest(111, prompt128, 0);
+      imageScored.images = {imageSpan};
+      imageScored.images.front().digestLo = 283;
+      imageScored.images.front().digestHi = 457;
+      imageScored.imagePixels = imagePixels;
+      imageScored.scoreTokens = {imageGreedy, imageOtherA, imageOtherB};
+      const uint64_t encodesBeforeScored = executor.telemetry().imageEncodes;
+      const StateAdmission scoreAdmission =
+          executor.begin(imageScored.modelView());
+      require(scoreAdmission.granted(), "image score request was not admitted");
+      const uint32_t scoreSlot = *scoreAdmission.cell;
+      executor.setDraftContextPlan(
+          imageScored.id,
+          planDraftContext(0, static_cast<uint32_t>(prompt128.size()),
+                           std::nullopt, {}));
+      ModelStepResult imageScoredResult = prefillChunk(
+          executor, imageScored.id, scoreSlot, 0, 0, prompt128, imagePages,
+          BatchCohort::Greedy, false);
+      require(executor.telemetry().imageEncodes == encodesBeforeScored + 1,
+              "score request did not encode its image");
+      require(imageScoredResult.finished &&
+                  imageScoredResult.outputTokens.empty() &&
+                  imageScoredResult.scoreLogits.size() == 3,
+              "image score prefill did not return ordered logits");
+      for (float logit : imageScoredResult.scoreLogits)
+        require(std::isfinite(logit), "image score logit is not finite");
+      require(imageScoredResult.scoreLogits[0] >=
+                      imageScoredResult.scoreLogits[1] &&
+                  imageScoredResult.scoreLogits[0] >=
+                      imageScoredResult.scoreLogits[2],
+              "greedy image token is not the maximum scored logit");
+      executor.end(imageScored.id);
+    }
+
 
     // Compare the active GDN state from one 16-row chunk and two M8 commits
     // within the numerical tolerance below. Their next-token decisions are

@@ -419,10 +419,6 @@ std::optional<ProtocolIssue> validateRequest(const RequestFrame &request,
                    "image pixels do not match the image grids");
   }
   if (scoring) {
-    if (!request.imageSpans.empty()) {
-      return invalid(IssueCode::InvalidCount,
-                     "score requests are text-only");
-    }
     if (request.scoreTokens.size() < kMinimumScoreOptions ||
         request.scoreTokens.size() > kMaximumScoreOptions) {
       return invalid(IssueCode::InvalidCount,

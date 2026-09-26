@@ -731,8 +731,6 @@ def _request_issue(
         )
     try:
         _image_spans_check(request, len(prompt), limits)
-        if scores and (request.image_spans or request.image_pixels):
-            raise ValueError("score requests are text-only")
         if scores and (
             len(scores) < MIN_SCORE_TOKENS
             or len(scores) > MAX_SCORE_TOKENS

@@ -1309,6 +1309,377 @@ def run_judgments(port: int, model: str, nonce: str) -> None:
         "scoring recovery replaced the runtime",
     )
     print(f"judgments timeout recovery: PASS (504 after {elapsed:.2f}s)", flush=True)
+    run_systemone_extensions(port, model, nonce)
+
+
+SYSTEMONE_ROUTING = {
+    "billing": {"type": "noul", "instructions": "Is this message about billing?"},
+    "department": {
+        "type": "choice",
+        "instructions": "Which team should handle this?",
+        "criteria": {"billing": None, "technical": None, "sales": None},
+    },
+    "urgency": {
+        "type": "score",
+        "instructions": "How urgent is the request?",
+        "criteria": ["No urgency", "This week", "Today"],
+    },
+}
+
+
+def systemone(port: int, body: dict, *, timeout: float = 300) -> dict:
+    code, response = request(port, "POST", "/v1/systemone", body, timeout=timeout)
+    require(code == 200, f"System One failed with HTTP {code}: {response!r}")
+    return response
+
+
+def distribution_close(left: dict, right: dict, tolerance: float) -> bool:
+    return left.keys() == right.keys() and all(
+        abs(left[key] - right[key]) <= tolerance for key in left
+    )
+
+
+def run_systemone_extensions(port: int, model: str, nonce: str) -> None:
+    # Typed values without thinking: strings, bounded numbers, integers,
+    # a nullable value that is absent, and an ordinary choice.
+    receipt = (
+        "Receipt from Hilton London, 22 Park Lane. Employee travelled to London "
+        "for a client meeting. Room charge for 2 guests. Total: £324.50. "
+        f"Paid by VISA. Reference {nonce}."
+    )
+    typed = systemone(
+        port,
+        {
+            "model": model,
+            "state": receipt,
+            "questions": {
+                "merchant": {
+                    "type": "string",
+                    "maxLength": 40,
+                    "instructions": "Return only the merchant name.",
+                },
+                "total": {
+                    "type": "number",
+                    "minimum": 0,
+                    "instructions": "What is the total amount in GBP?",
+                },
+                "guests": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "instructions": "How many guests does the room charge cover?",
+                },
+                "tip": {
+                    "type": "number",
+                    "minimum": 0,
+                    "nullable": True,
+                    "instructions": "What tip amount is shown on the receipt?",
+                },
+                "expense": {
+                    "type": "choice",
+                    "instructions": "What type of expense is this?",
+                    "criteria": {"meal": None, "travel": None, "equipment": None},
+                },
+            },
+        },
+    )
+    answers = typed["answers"]
+    require(
+        answers["merchant"]["type"] == "string"
+        and "hilton" in answers["merchant"]["string"].lower()
+        and len(answers["merchant"]["string"]) <= 40,
+        f"typed string answer is wrong: {answers['merchant']!r}",
+    )
+    require(
+        answers["total"]["type"] == "number"
+        and abs(answers["total"]["number"] - 324.5) < 1e-6,
+        f"typed number answer is wrong: {answers['total']!r}",
+    )
+    require(
+        answers["guests"] == {"type": "integer", "integer": 2},
+        f"typed integer answer is wrong: {answers['guests']!r}",
+    )
+    require(
+        answers["tip"]["number"] is None and answers["tip"]["null_probability"] > 0.5,
+        f"absent nullable value was not null: {answers['tip']!r}",
+    )
+    require(
+        answers["expense"]["choice"] == "travel",
+        f"typed request mis-scored a choice: {answers['expense']!r}",
+    )
+    usage = typed["usage"]
+    require(
+        usage["input_tokens"] > 0
+        and usage["output_tokens"] > 0
+        and "reasoning_tokens" not in usage,
+        f"typed usage is wrong: {usage!r}",
+    )
+    print("system one typed values: PASS", flush=True)
+
+    # Thinking before a choice and a nullable number, with reasoning returned.
+    thought = systemone(
+        port,
+        {
+            "model": model,
+            "state": (
+                f"Order {nonce}: the customer paid for express shipping, but the "
+                "parcel arrived nine days late. The item itself is fine. They "
+                "want the shipping fee back."
+            ),
+            "thinking": True,
+            "thinking_budget": 768,
+            "reasoning_effort": "low",
+            "return_reasoning": True,
+            "questions": {
+                "reason": {
+                    "type": "choice",
+                    "instructions": "Why is the customer asking for money back?",
+                    "criteria": {
+                        "late_delivery": None,
+                        "damaged_item": None,
+                        "wrong_item": None,
+                    },
+                },
+                "amount": {
+                    "type": "number",
+                    "minimum": 0,
+                    "nullable": True,
+                    "instructions": "What refund amount, in dollars, does the message state?",
+                },
+            },
+        },
+        timeout=900,
+    )
+    answers = thought["answers"]
+    require(
+        answers["reason"]["choice"] == "late_delivery",
+        f"thinking choice is wrong: {answers['reason']!r}",
+    )
+    require(
+        answers["amount"]["number"] is None,
+        f"thinking invented an absent amount: {answers['amount']!r}",
+    )
+    for name in ("reason", "amount"):
+        require(
+            isinstance(answers[name].get("reasoning"), str)
+            and answers[name]["reasoning"].strip()
+            and isinstance(answers[name].get("reasoning_truncated"), bool),
+            f"reasoning was not returned for {name}: {answers[name]!r}",
+        )
+    usage = thought["usage"]
+    require(
+        usage["reasoning_tokens"] > 0
+        and usage["output_tokens"] >= usage["reasoning_tokens"],
+        f"thinking usage is wrong: {usage!r}",
+    )
+    print(
+        "system one thinking: PASS "
+        f"(reasoning_tokens={usage['reasoning_tokens']}, "
+        f"truncated={[answers[n]['reasoning_truncated'] for n in ('reason', 'amount')]})",
+        flush=True,
+    )
+
+    # Dependency graph: severity and deployment_related see system; rollback
+    # sees both of them (and system transitively).
+    incident = systemone(
+        port,
+        {
+            "model": model,
+            "state": (
+                "The payments service has returned errors since this morning's "
+                f"deployment. Request {nonce}."
+            ),
+            "questions": {
+                "system": {
+                    "type": "choice",
+                    "instructions": "Which system is affected?",
+                    "criteria": {"payments": None, "accounts": None, "search": None},
+                },
+                "severity": {
+                    "type": "score",
+                    "instructions": "How severe is the incident for the affected system?",
+                    "criteria": ["Low", "Medium", "High"],
+                    "depends_on": ["system"],
+                },
+                "deployment_related": {
+                    "type": "noul",
+                    "instructions": "Is the incident related to a deployment?",
+                    "depends_on": ["system"],
+                },
+                "rollback": {
+                    "type": "noul",
+                    "instructions": (
+                        "Based on the incident assessments, should the deployment "
+                        "be rolled back?"
+                    ),
+                    "depends_on": ["severity", "deployment_related"],
+                },
+            },
+        },
+    )
+    answers = incident["answers"]
+    require(
+        list(answers) == ["system", "severity", "deployment_related", "rollback"],
+        f"dependency answers are out of declaration order: {list(answers)!r}",
+    )
+    require(
+        answers["system"]["choice"] == "payments",
+        f"dependency root is wrong: {answers['system']!r}",
+    )
+    require(
+        answers["deployment_related"]["noul"] > 0.5,
+        f"dependent noul is wrong: {answers['deployment_related']!r}",
+    )
+    require(
+        set(answers["severity"]["probabilities"]) == {"0", "1", "2"}
+        and abs(sum(answers["severity"]["probabilities"].values()) - 1.0) < 1e-6
+        and 0.0 <= answers["rollback"]["noul"] <= 1.0,
+        f"dependent answers are malformed: {answers!r}",
+    )
+    print("system one dependencies: PASS", flush=True)
+
+    # Sequential execution: the second question sees the first answer.
+    ticket = systemone(
+        port,
+        {
+            "model": model,
+            "state": (
+                f"Ticket {nonce}: I can't log in to my account because the "
+                "password reset email never arrived."
+            ),
+            "execution": "sequential",
+            "questions": {
+                "topic": {
+                    "type": "choice",
+                    "instructions": "What is the ticket about?",
+                    "criteria": {"login": None, "billing": None, "shipping": None},
+                },
+                "team": {
+                    "type": "choice",
+                    "instructions": "Which team should own this ticket?",
+                    "criteria": {"accounts": None, "payments": None, "logistics": None},
+                },
+            },
+        },
+    )
+    require(
+        ticket["answers"]["topic"]["choice"] == "login"
+        and ticket["answers"]["team"]["choice"] == "accounts",
+        f"sequential answers are wrong: {ticket['answers']!r}",
+    )
+    print("system one sequential: PASS", flush=True)
+
+    # Permutation averaging over every ordering; the seed fixes the orders
+    # and the scored prompts, so a repeat reproduces the distribution.
+    permuted_body = {
+        "model": model,
+        "state": {"message": f"I was charged twice. Fix this today. {nonce}"},
+        "seed": 7,
+        "questions": {
+            "department": {**SYSTEMONE_ROUTING["department"], "permutations": "all"}
+        },
+    }
+    first = systemone(port, permuted_body)["answers"]["department"]
+    second = systemone(port, permuted_body)["answers"]["department"]
+    require(
+        first["choice"] == "billing"
+        and abs(sum(first["probabilities"].values()) - 1.0) < 1e-6,
+        f"permutation-averaged choice is wrong: {first!r}",
+    )
+    require(
+        distribution_close(first["probabilities"], second["probabilities"], 1e-3),
+        f"seeded permutations did not reproduce: {first!r} vs {second!r}",
+    )
+    print("system one permutations: PASS", flush=True)
+
+    # Images reach score-only requests: the answer must follow the pixels.
+    for color in ("red", "blue"):
+        pictured = systemone(
+            port,
+            {
+                "model": model,
+                "state": f"Classify the attached image. Request {nonce}.",
+                "images": [image_data_url(color)],
+                "questions": {
+                    "color": {
+                        "type": "choice",
+                        "instructions": "What color fills the image?",
+                        "criteria": {"red": None, "green": None, "blue": None},
+                    }
+                },
+            },
+        )
+        answer = pictured["answers"]["color"]
+        require(
+            answer["choice"] == color and answer["probabilities"][color] > 0.5,
+            f"{color} image was scored as {answer!r}",
+        )
+    print("system one images: PASS", flush=True)
+
+    # The extended executor must score plain questions like the legacy path.
+    state = {"message": f"I was charged twice. Fix this today. {nonce} parity"}
+    legacy = systemone(
+        port, {"model": model, "state": state, "questions": SYSTEMONE_ROUTING}
+    )
+    extended = systemone(
+        port,
+        {"model": model, "state": state, "questions": SYSTEMONE_ROUTING, "seed": 1},
+    )
+    require(
+        abs(
+            legacy["answers"]["billing"]["noul"]
+            - extended["answers"]["billing"]["noul"]
+        )
+        < 1e-3
+        and distribution_close(
+            legacy["answers"]["department"]["probabilities"],
+            extended["answers"]["department"]["probabilities"],
+            1e-3,
+        )
+        and distribution_close(
+            legacy["answers"]["urgency"]["probabilities"],
+            extended["answers"]["urgency"]["probabilities"],
+            1e-3,
+        ),
+        f"extended scoring diverged from legacy: {legacy!r} vs {extended!r}",
+    )
+    require(
+        set(legacy["usage"]) == {"input_tokens", "output_tokens"}
+        and legacy["usage"]["output_tokens"] == 0,
+        f"legacy usage changed shape: {legacy['usage']!r}",
+    )
+    print("system one legacy parity: PASS", flush=True)
+
+    # Shared-prefix reuse across questions over one long state. Both schedules
+    # warm the shared prefix once, so every question resumes from it.
+    reuse, submitted = {}, {}
+    for label, extra in (("legacy", {}), ("extended", {"seed": 1})):
+        before = counters(port)
+        systemone(
+            port,
+            {
+                "model": model,
+                "state": f"{filler(nonce, label, 150)} I was charged twice.",
+                "questions": SYSTEMONE_ROUTING,
+                **extra,
+            },
+        )
+        after = counters(port)
+        reuse[label] = after["reused_tokens"] - before["reused_tokens"]
+        submitted[label] = after["submitted"] - before["submitted"]
+    expected = len(SYSTEMONE_ROUTING) + 1
+    require(
+        submitted == {"legacy": expected, "extended": expected},
+        f"the shared prefix was not warmed exactly once: {submitted!r}",
+    )
+    require(
+        reuse["extended"] > 0 and reuse["legacy"] >= 0.9 * reuse["extended"],
+        f"questions did not resume from the warmed prefix: {reuse!r}",
+    )
+    print(
+        "system one prefix reuse: PASS "
+        f"(legacy reused {reuse['legacy']}, extended reused {reuse['extended']})",
+        flush=True,
+    )
 
 
 def add_server_arguments(parser):

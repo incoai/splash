@@ -18,6 +18,7 @@ if __package__:
     from . import protocol as wire
     from .api_shapes import (
         IMAGE_PAD_TOKEN,
+        VISION_UNAVAILABLE,
         canonical_responses_input,
         normalize_messages,
         responses_to_chat_body,
@@ -50,6 +51,7 @@ else:
     import protocol as wire
     from api_shapes import (
         IMAGE_PAD_TOKEN,
+        VISION_UNAVAILABLE,
         canonical_responses_input,
         normalize_messages,
         responses_to_chat_body,
@@ -498,7 +500,18 @@ class Frontend:
             raise APIError(400, "priority must be foreground, normal, or background")
         return REQUEST_PRIORITIES[priority_name]
 
-    def _score_job(self, prompt_tokens, slot_ids, deadline, priority, meta):
+    def _score_job(
+        self,
+        prompt_tokens,
+        slot_ids,
+        deadline,
+        priority,
+        meta,
+        *,
+        image_spans=(),
+        image_pixels=b"",
+        image_owner=None,
+    ):
         return Job(
             request_id=next(self.ids),
             prompt_tokens=prompt_tokens,
@@ -510,9 +523,85 @@ class Frontend:
             deadline=deadline,
             priority=priority,
             score_tokens=tuple(slot_ids),
+            image_spans=image_spans,
+            image_pixels=image_pixels,
+            image_owner=image_owner,
             public_id=secrets.token_hex(16),
             meta=meta,
         )
+
+    def _systemone_job(
+        self,
+        prompt_tokens,
+        max_new_tokens,
+        *,
+        seed,
+        temperature,
+        top_p,
+        top_k,
+        deadline,
+        priority,
+        thinking=False,
+        stop_token_ids=(),
+        constraint=None,
+        image_spans=(),
+        image_pixels=b"",
+        image_owner=None,
+    ):
+        """A generation job for the extended System One executor: thinking
+        and open-value phases share this shape."""
+        return Job(
+            request_id=next(self.ids),
+            prompt_tokens=list(prompt_tokens),
+            max_new_tokens=max_new_tokens,
+            seed=seed,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            deadline=deadline,
+            priority=priority,
+            thinking=thinking,
+            stop_token_ids=tuple(stop_token_ids),
+            constraint=constraint,
+            image_spans=image_spans,
+            image_pixels=image_pixels,
+            image_owner=image_owner,
+            public_id=secrets.token_hex(16),
+        )
+
+    def _systemone_render(self, messages, thinking, reasoning_effort, prepared):
+        """Render one System One prompt to tokens plus image spans/pixels.
+
+        The non-image path renders exactly like judgments.encode_prompt:
+        the same chat-template arguments and one whole-string encode."""
+        template = {
+            "tokenize": False,
+            "chat_template": self.chat_templates.select(None).source,
+            **template_options(
+                reasoning_effort=reasoning_effort if thinking else "none",
+                preserve_thinking=None,
+                tools=None,
+                add_generation_prompt=True,
+            ),
+        }
+        if thinking and reasoning_effort is None:
+            template["enable_thinking"] = True
+        try:
+            if prepared:
+                tokens, positions, rendered = self._render_image_tokens(
+                    messages, template
+                )
+            else:
+                rendered = self._apply_chat_template(messages, template)
+                tokens = list(self.tokenizer.encode(rendered, add_special_tokens=False))
+        except APIError:
+            raise
+        except Exception as error:
+            raise APIError(500, "question prompt could not be rendered") from error
+        if not prepared:
+            return tokens, rendered, (), b""
+        tokens, spans, pixels = self._expand_image_pads(tokens, prepared, positions)
+        return tokens, rendered, spans, pixels
 
     def prepare_judgment(self, body, *, deadline=None):
         unknown = sorted(
@@ -576,7 +665,9 @@ class Frontend:
                     ["model"], f"model {model} is not served by this endpoint"
                 )
             )
-        state, specs, question_details = judgments.validate_systemone(body)
+        state, specs, options, question_details = judgments.validate_systemone(
+            body, self.default_max_new
+        )
         details.extend(question_details)
         priority_name = body.get("priority", "normal")
         if (
@@ -594,6 +685,44 @@ class Frontend:
         if deadline is None:
             deadline = self.request_deadline(body)
         priority = REQUEST_PRIORITIES[priority_name]
+        if judgments.systemone_is_extended(body):
+            images = ()
+            if options.images:
+                if not self.vision:
+                    raise judgments.SystemOneError(
+                        [
+                            judgments.detail(
+                                ["images"],
+                                f"image input is not supported: {VISION_UNAVAILABLE}",
+                            )
+                        ]
+                    )
+                # Decode and prepare the request images once under the
+                # bounded preparation slot, like chat; every variant prompt
+                # and native job references this batch.
+                with self._preparation(deadline):
+                    images = self._prepare_images(
+                        [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {"url": url},
+                                    }
+                                    for url in options.images
+                                ],
+                            }
+                        ]
+                    )
+            remaining_request_time(deadline)
+            return judgments.SystemOnePlan(
+                state=state,
+                specs=specs,
+                options=options,
+                images=images,
+                priority=priority,
+            )
         jobs = []
         total_tokens = 0
         with self._preparation(deadline):
