@@ -93,7 +93,9 @@ GGUF, never from another repository: unsupported or incomplete tokenizer
 metadata is an error. GGUF variants whose tensor types Splash cannot load are
 rejected before download. Of Unsloth's files, every one loads for both models,
 from UD-IQ1_S up, except UD-Q8_K_XL and BF16
-([GGUF targets](DEVELOPMENT.md#gguf-targets)). Legacy Splash packages such as
+([GGUF targets](DEVELOPMENT.md#gguf-targets)). Prism ML's
+`prism-ml/Ternary-Bonsai-2-27B-gguf:PQ2_0`, a Qwen3.8-27B target, loads as well,
+with its input rotation and vision projector. Legacy Splash packages such as
 `incoai/Qwen3.8-27B-Splash` remain loadable.
 
 Vision comes from the same source: embedded vision tensors for MLX, or the
