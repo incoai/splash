@@ -129,7 +129,7 @@ public:
     return disk_ ? 0 : bytes();
   }
   [[nodiscard]] bool canOffload() const noexcept override {
-    return file_ && !disk_ && file_->writable() && file_->capacityBytes() >= bytes();
+    return !disk_ && file_ && file_->writable();
   }
   [[nodiscard]] std::unique_ptr<StateOffload>
   offload(std::function<void()> completion) const override;

@@ -69,11 +69,11 @@ struct RuntimeContext final {
   const ModelPackage &package;
   kv::PageStorage &kvPages;
   StateStorage &stateStorage;
-  KvPageTier *kvTier = nullptr;
   const ops::ExecutionPlans &operators;
   uint32_t maximumImagePatches = ops::kMaximumImagePatches;
   uint64_t pipelineReserveBytes = 0;
   uint64_t runtimeOverheadReserveBytes = 0;
+  KvPageTier *kvTier = nullptr;
 };
 
 // Validates only the interface between independently defined target and draft

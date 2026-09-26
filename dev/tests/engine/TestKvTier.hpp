@@ -23,8 +23,6 @@ public:
   };
 
   uint64_t slotBytes() const noexcept override { return 100; }
-  uint64_t capacityBytes() const noexcept override { return uint64_t{capacity} * 100; }
-  uint64_t usedBytes() const noexcept override { return uint64_t{slots} * 100; }
   bool writable() const noexcept override { return writableFile; }
   bool canDemote() const noexcept override { return writableFile && staging < stagingSlots; }
   std::shared_ptr<model::KvDiskSlot> acquireSlot() override {

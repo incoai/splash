@@ -119,7 +119,6 @@ public:
   // A state sits below the block. Without one, the disk-only blocks below
   // it are never read again.
   [[nodiscard]] bool stateBelow(uint64_t blockId) const;
-  [[nodiscard]] uint32_t activeUsers(uint64_t blockId) const;
   // A reusable state was published at this block at some point; lookups that
   // find the block without one report a lost state.
   void noteState(uint64_t blockId);

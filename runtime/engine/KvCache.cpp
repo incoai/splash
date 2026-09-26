@@ -258,10 +258,6 @@ void KvCache::countState(uint64_t blockId, bool added) noexcept {
 
 bool KvCache::stateBelow(uint64_t blockId) const { return block(blockId).statesBelow > 0; }
 
-uint32_t KvCache::activeUsers(uint64_t blockId) const {
-  return block(blockId).activeUsers;
-}
-
 void KvCache::noteState(uint64_t blockId) { block(blockId).hadState = true; }
 
 bool KvCache::hadState(uint64_t blockId) const { return block(blockId).hadState; }

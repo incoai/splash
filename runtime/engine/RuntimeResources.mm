@@ -577,11 +577,11 @@ model::RuntimeContext RuntimeResources::modelContext() noexcept {
       model_,
       *kvPages_,
       *stateStorage_,
-      kvTier_.get(),
       operators_,
       maximumImagePatches_,
       budget.pipelineReserveBytes,
       budget.runtimeOverheadReserveBytes,
+      kvTier_.get(),
   };
 }
 

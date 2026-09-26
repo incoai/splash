@@ -334,12 +334,6 @@ class KvTier {
 public:
   virtual ~KvTier() = default;
   [[nodiscard]] virtual uint64_t slotBytes() const noexcept = 0;
-  // The disk quota, shared with the states' file, and its current use.
-  [[nodiscard]] virtual uint64_t capacityBytes() const noexcept = 0;
-  [[nodiscard]] virtual uint64_t usedBytes() const noexcept = 0;
-  // Cumulative IO across the shared disk budget (KV and composite states).
-  [[nodiscard]] virtual uint64_t readBytes() const noexcept { return 0; }
-  [[nodiscard]] virtual uint64_t writtenBytes() const noexcept { return 0; }
   // False once a write has failed; existing copies stay readable.
   [[nodiscard]] virtual bool writable() const noexcept = 0;
   // Engine-thread admission probe, before replacing any disk copies.

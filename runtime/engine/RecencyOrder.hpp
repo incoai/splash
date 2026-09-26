@@ -71,8 +71,6 @@ public:
     return order_.empty() ? 0 : order_.rbegin()->second;
   }
 
-  [[nodiscard]] size_t size() const noexcept { return order_.size(); }
-
 private:
   std::set<std::pair<uint64_t, uint64_t>> order_;
 };

@@ -107,10 +107,6 @@ KvPageTier::~KvPageTier() {
 
 uint64_t KvPageTier::slotBytes() const noexcept { return slotBytes_; }
 
-uint64_t KvPageTier::capacityBytes() const noexcept { return file_->capacityBytes(); }
-
-uint64_t KvPageTier::usedBytes() const noexcept { return file_->usedBytes(); }
-
 bool KvPageTier::writable() const noexcept { return file_->writable(); }
 
 bool KvPageTier::canDemote() const noexcept {

@@ -51,10 +51,6 @@ public:
   // Metal bytes the staging ring and copy table actually hold.
   [[nodiscard]] uint64_t actualAllocatedBytes() const noexcept { return actualAllocatedBytes_; }
   [[nodiscard]] uint64_t slotBytes() const noexcept override;
-  [[nodiscard]] uint64_t capacityBytes() const noexcept override;
-  [[nodiscard]] uint64_t usedBytes() const noexcept override;
-  [[nodiscard]] uint64_t readBytes() const noexcept override { return file_->readBytes(); }
-  [[nodiscard]] uint64_t writtenBytes() const noexcept override { return file_->writtenBytes(); }
   [[nodiscard]] bool writable() const noexcept override;
   [[nodiscard]] bool canDemote() const noexcept override;
   [[nodiscard]] std::shared_ptr<KvDiskSlot> acquireSlot() override;
