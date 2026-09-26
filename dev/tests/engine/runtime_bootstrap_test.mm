@@ -767,6 +767,25 @@ void testStartupRetryWindowOpensAtFirstFailure() {
   }
 }
 
+// The disk tier suggestion follows the plan within the host's headroom
+// beyond its reserve and the warning margin; a host with no more than those
+// holds nothing.
+void testMemoryMayNotHoldBeyondHostHeadroom() {
+  const EngineMemoryPlan plan = memoryPlan();
+  const auto &budget = plan.breakdown();
+  const uint64_t held = EngineMemoryPolicy::hostAvailableReserveBytes(
+                            budget.physicalMemoryBytes) +
+                        kHostWarningMarginBytes;
+  const uint64_t available = held + budget.minimumRequiredBytes + 64 * kMiB;
+  const uint32_t fits = plan.contextTokensWithin(available - held);
+  require(fits && fits < plan.maximumContextTokens() &&
+              !memoryMayNotHold(plan, available, fits) &&
+              memoryMayNotHold(plan, available, fits + 1) &&
+              !memoryMayNotHold(plan, 64 * kGiB, plan.maximumContextTokens()) &&
+              memoryMayNotHold(plan, held, 1),
+          "the disk tier suggestion does not follow the host's headroom");
+}
+
 } // namespace
 
 int main() {
@@ -784,6 +803,7 @@ int main() {
     testWarmupErrorsCannotMasqueradeAsMemoryLimits();
     testExceptionsMemoryAndReadyWriteAreFailClosed();
     testStartupRetryWindowOpensAtFirstFailure();
+    testMemoryMayNotHoldBeyondHostHeadroom();
     std::cout << "native bootstrap tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

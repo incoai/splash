@@ -170,6 +170,23 @@ void testHardBudgetBoundaries() {
           "maximum working set overflowed the preflight ceiling");
 }
 
+// What memory holds below the plan's budget, where the host has less: the
+// plan made there, within the configured limit, and nothing where one request
+// does not fit.
+void testContextTokensWithin() {
+  const EngineMemoryPlan plan = requireEngineMemoryPlan(device(), model());
+  const auto &budget = plan.breakdown();
+  const uint64_t ceiling = budget.minimumRequiredBytes + 64 * kMiB;
+  const EngineMemoryPlan limited = requireEngineMemoryPlan(device(), model(), ceiling);
+  require(plan.contextTokensWithin(16 * kGiB) == plan.maximumContextTokens() &&
+              plan.contextTokensWithin(ceiling) == limited.maximumContextTokens() &&
+              limited.maximumContextTokens() < plan.maximumContextTokens() &&
+              limited.contextTokensWithin(16 * kGiB) == limited.maximumContextTokens() &&
+              !plan.contextTokensWithin(budget.minimumRequiredBytes - 1) &&
+              !plan.contextTokensWithin(0),
+          "the context memory holds is not the plan's within the host's memory");
+}
+
 void testModelProvidedKvGeometry() {
   ModelMemoryProfile compact = model();
   compact.name = "compact-test-model";
@@ -221,6 +238,7 @@ int main() {
     testUserCeilingAndFailure();
     testDiskTierKvStagingIsBudgeted();
     testHardBudgetBoundaries();
+    testContextTokensWithin();
     testModelProvidedKvGeometry();
     testDeviceValidationNamesTheMacosFloor();
     std::cout << "elastic memory plan tests passed\n";

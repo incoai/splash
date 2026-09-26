@@ -145,6 +145,9 @@ that a long uncached prompt will reach its first token quickly.
 - `--max-memory`: ceiling on Metal allocations, e.g. `28G`. Default: auto.
 - `--max-context`: context limit, up to `256K`, e.g. `100K`. Default: auto.
 - `--max-cache-disk`: SSD tier for the cache, e.g. `5G`. Default: 0 (off).
+  Startup suggests it when memory cannot hold the context; with it, a long
+  request that runs out of memory keeps its progress on SSD and replays far
+  less of its prompt.
 - `--kv-format`: target KV cache storage, `int8` (default) or `bf16`.
 - `--max-image-pixels`: maximum resized pixels per image. Default: 4,194,304.
 - `--allowed-host`: extra HTTP `Host` name to accept, such as `mymac.local`;

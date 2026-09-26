@@ -703,6 +703,14 @@ plus draft ring) and KV pages. Default: `0` (off). RAM and disk copies share the
 same block tree and recency order. Restoring a prefix keeps its disk copy, so
 its next eviction needs no write while that copy remains cached.
 
+Without the tier, a request that runs out of memory cannot publish its progress
+checkpoints and replays its prompt after each suspension. With the tier off,
+startup suggests it in one line when memory may not hold the advertised
+context: the memory plan within what the host had available at startup beyond
+its reserve and the warning margin (`EngineMemoryPlan::contextTokensWithin`).
+The estimate is conservative, since macOS compresses other applications further
+once the engine loads. The tier does not raise the context limit.
+
 Writes happen when RAM reclamation selects a victim. States copy through one
 host staging buffer, freeing their RAM immediately. KV leaves needed by a state
 on them or below them copy through a 128-page staging ring and are released

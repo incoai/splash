@@ -1,4 +1,5 @@
 #include "engine/Bootstrap.hpp"
+#include "engine/StartupLog.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -93,6 +94,16 @@ StartupRetryWindow::retryUntil(const RuntimeBootstrapReport &failure,
   if (now >= *deadline_)
     return std::nullopt;
   return deadline_;
+}
+
+bool memoryMayNotHold(const EngineMemoryPlan &plan,
+                      uint64_t hostAvailableBytes, uint32_t contextTokens) {
+  const uint64_t held = EngineMemoryPolicy::hostAvailableReserveBytes(
+                            plan.breakdown().physicalMemoryBytes) +
+                        kHostWarningMarginBytes;
+  return plan.contextTokensWithin(
+             hostAvailableBytes > held ? hostAvailableBytes - held : 0) <
+         contextTokens;
 }
 
 RuntimeBootstrap::RuntimeBootstrap(std::unique_ptr<RuntimeResources> resources,
@@ -265,6 +276,20 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
     fail(std::move(base), RuntimeBootstrapStage::ModelCreation,
          "logical max_context exceeds the model or physical "
          "single-request Q8 KV capacity");
+  }
+  // Without the disk tier a request that runs out of memory cannot publish
+  // its progress checkpoints and replays its prompt.
+  const std::optional<uint64_t> hostAvailable =
+      resources->hostAvailableAtStart();
+  if (!config.resources.maximumCacheDiskBytes && hostAvailable &&
+      memoryMayNotHold(resources->memoryPlan(), *hostAvailable,
+                       config.nativeLoop.engine.maxContext)) {
+    logKernelStartup("The ", *hostAvailable / kMiB,
+                     " MiB this Mac had available at startup may not hold a ",
+                     config.nativeLoop.engine.maxContext,
+                     "-token request; one that runs out of memory is suspended"
+                     " and replays its prompt. --max-cache-disk SIZE keeps its"
+                     " progress and cached prefixes on SSD.");
   }
   // The parser and engine consume the same resolved ceiling. In automatic
   // mode these limits cannot be known until resource planning has measured
