@@ -85,6 +85,53 @@ Use `--port 8001` or set `SPLASH_PORT=8001` to select another port. Set the same
 their memory limits are independent. The packaged agent launchers connect to
 loopback, so use a listener that includes loopback when launching agents locally.
 
+### Server options
+
+`splash serve --help` lists all options and examples. Common options:
+
+| Option | Default | Purpose |
+| --- | --- | --- |
+| `--revision` | Default branch | Select an upstream target branch, tag, or commit. See [revisions](#revisions). |
+| `--draft-model` | Matching DFlash2 checkpoint | Override the draft with a compatible repository or local directory. See [drafts](#drafts). |
+| `--language-only` | Off | Skip vision loading; image and PDF input is rejected. See [vision](#vision). |
+| `--host` | `127.0.0.1` | HTTP bind address. |
+| `--port` | `SPLASH_PORT` or `8000` | HTTP port. |
+| `--max-memory` | Auto | Ceiling on Metal allocations, e.g. `28G`; not combined process RSS. |
+| `--max-context` | Auto | Context limit, up to `256K`, e.g. `100K`. |
+| `--max-cache-disk` | `0` (off) | Session-local SSD cache, e.g. `16G`. See [disk cache](#disk-cache). |
+| `--kv-format` | `int8` | Target KV storage: `int8` or `bf16`. |
+| `--max-image-pixels` | `4194304` | Maximum resized pixels per image. |
+| `--allowed-host` | No extra names | Additional HTTP Host name, e.g. `mymac.local`; repeatable. |
+| `--api-key` | `SPLASH_API_KEY` or none | Require a bearer token or `x-api-key`. |
+| `--no-webui` | Off | Disable the chat page. |
+
+The startup summary and `maximum_context_tokens` in `/status` show the effective
+context limit. `/v1/models` and `/v1/models/{id}` report the same limit as
+`max_model_len` and its compatibility alias `context_length`, including model
+aliases. Clients can impose a smaller limit. With enough memory, request the
+full native window with `--max-context 256K`. This is a capacity limit, not a
+guarantee of a fast first token for a long uncached prompt. If the model
+cannot fit, startup prints a memory budget breakdown and stops.
+
+`splash pi` adds a `splash` provider to Pi's `models.json` (`splash-<port>` for
+a server on another port), preserving other providers, settings and sessions.
+The browser chat and agent launchers connect to the running server; a model
+need not appear in a client's catalog to serve it by its full repository ID.
+
+### KV cache precision
+
+Select the target KV format when starting the server:
+
+```bash
+splash serve --model mlx-community/Qwen3.8-27B-4bit --kv-format bf16
+```
+
+BF16 avoids target KV quantization, uses approximately twice the target KV
+memory, and can be slower at long contexts. Model weights are unchanged.
+Restart to switch formats. Omit `--kv-format` or use `--kv-format int8` for the
+default. The [SSD cache](#disk-cache) supports both formats, preserving their
+stored bytes without further quantization; it does not survive a restart.
+
 ## API model aliases
 
 Repeat `--served-model-name NAME` to accept additional API model IDs. The full
@@ -192,6 +239,16 @@ records for the branch, never of another revision. Only files downloaded before
 are available, which is enough to rebuild a damaged or deleted assembly; a new
 selection needs the Hub once for its draft's default branch. The installer
 never rewrites upstream files.
+
+### Model storage
+
+Allow space for the target and BF16 draft downloads plus prepared copies of
+their weights: up to about 40 GB in total for the Qwen3.8-27B 4-bit examples
+and 48 GB for Qwen3.6-35B-A3B. Other variants have different sizes. Downloads
+use the Hugging Face cache; prepared weights use `~/Library/Caches/Splash/weights`
+(`SPLASH_WEIGHT_CACHE` relocates them). Later starts reuse prepared weights,
+and `brew upgrade splash` preserves models and agent sessions.
+See [weight preparation](#weight-preparation) for cache validation and cleanup.
 
 ### Model cache
 
@@ -1090,15 +1147,18 @@ a temporary tap and remove their installation; they refuse to replace an existin
 Splash installation. The install check requires a poured bottle and runs the
 bundled launcher without a compiler or separate Python installation.
 
-To publish: create a GitHub Release on the public mirror `incoai/splash` with
-the archive, bottle, checksum files and `SHA256SUMS`, then copy `dist/splash.rb`
-over `Formula/splash.rb` in `incoai/homebrew-tap`. Both public repositories
-hold exactly one squashed commit of this repository's `main`, authored by Jian
-Chen with Zhijian Liu as co-author, and are updated by force-push, never by
-pull request. Before re-squashing, `main` must contain no references to the internal
-or academic mirrors of the model repositories. Then, on a clean machine:
-`brew install incoai/tap/splash && splash --help`, and
-`brew audit --strict --online incoai/tap/splash`.
+To publish, tag the verified release commit in `incoai/splash` with the
+version (no `v` prefix), preserving existing history and tags. Create a GitHub
+Release with the runtime archive, bottle, checksum files and `SHA256SUMS`.
+Open a pull request in `incoai/homebrew-tap` replacing `Formula/splash.rb`
+with `dist/splash.rb`; its URLs must point to the published release assets.
+After the tap update merges, verify a fresh install and an upgrade from the
+previous release through the public tap, including a real model request and
+preservation of user data. Run `brew audit --strict --online incoai/tap/splash`.
+
+Before publishing, verify that default model and draft repositories are
+publicly accessible. Check the installed bottle on a supported Mac without
+developer tools; building from the source tree is not an installation check.
 
 The runtime package allowlists engine, Python, server and launcher files; tests,
 benchmarks and developer documents are excluded. User model links and Hermes
