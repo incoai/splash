@@ -203,7 +203,7 @@ std::vector<uint64_t> Scheduler::prefillAdmissionOrder(
   for (const auto &request : pending)
     ready.push_back(request);
   std::vector<uint64_t> result;
-  if (const auto plan = planPrefill(std::move(ready))) {
+  if (const auto plan = planPrefill(ready)) {
     const auto decode = nextDecode();
     if (decode && get(decode->items.front().requestId).spec.priority <
                       get(plan->items.front().requestId).spec.priority)
@@ -242,16 +242,16 @@ std::optional<BatchPlan> Scheduler::next() const {
 }
 
 std::optional<BatchPlan> Scheduler::nextPrefill() const {
-  std::vector<PrefillRequestView> ready;
+  prefillReadyScratch_.clear();
   for (const auto &[_, request] : requests_) {
     if (request.phase == Phase::Prefill)
-      ready.push_back({&request, request.promptProcessed});
+      prefillReadyScratch_.push_back({&request, request.promptProcessed});
   }
-  return planPrefill(std::move(ready));
+  return planPrefill(prefillReadyScratch_);
 }
 
 std::optional<BatchPlan>
-Scheduler::planPrefill(std::vector<PrefillRequestView> ready) const {
+Scheduler::planPrefill(std::vector<PrefillRequestView> &ready) const {
   if (ready.empty())
     return std::nullopt;
   const auto dispatchRemaining = [](const PrefillRequestView &view) {
@@ -331,23 +331,25 @@ uint32_t Scheduler::prefillBudget(
 }
 
 std::optional<BatchPlan> Scheduler::nextDecode() const {
-  std::vector<const Request *> ready;
+  decodeReadyScratch_.clear();
   for (const auto &[_, request] : requests_) {
     if (request.phase == Phase::Decode)
-      ready.push_back(&request);
+      decodeReadyScratch_.push_back(&request);
   }
-  if (ready.empty())
+  if (decodeReadyScratch_.empty())
     return std::nullopt;
-  std::sort(ready.begin(), ready.end(), [](const Request *a, const Request *b) {
-    if (a->spec.priority != b->spec.priority)
-      return a->spec.priority < b->spec.priority;
-    if (a->lastDecodeDispatch != b->lastDecodeDispatch)
-      return a->lastDecodeDispatch < b->lastDecodeDispatch;
-    return a->order < b->order;
-  });
-  const BatchCohort cohort = ready.front()->spec.cohort;
-  const DecodeStage decodeStage = ready.front()->decodeStage;
-  const RequestPriority selectedPriority = ready.front()->spec.priority;
+  std::sort(decodeReadyScratch_.begin(), decodeReadyScratch_.end(),
+            [](const Request *a, const Request *b) {
+              if (a->spec.priority != b->spec.priority)
+                return a->spec.priority < b->spec.priority;
+              if (a->lastDecodeDispatch != b->lastDecodeDispatch)
+                return a->lastDecodeDispatch < b->lastDecodeDispatch;
+              return a->order < b->order;
+            });
+  const BatchCohort cohort = decodeReadyScratch_.front()->spec.cohort;
+  const DecodeStage decodeStage = decodeReadyScratch_.front()->decodeStage;
+  const RequestPriority selectedPriority =
+      decodeReadyScratch_.front()->spec.priority;
   BatchPlan plan;
   plan.kind = WorkKind::Decode;
   plan.cohort = cohort;
@@ -358,7 +360,7 @@ std::optional<BatchPlan> Scheduler::nextDecode() const {
       decodeStage == DecodeStage::ApplyInitialMask
           ? 1
           : model::ExecutionLimits::maximumBatchWidth;
-  for (const Request *request : ready) {
+  for (const Request *request : decodeReadyScratch_) {
     if (request->spec.priority != selectedPriority ||
         (request->spec.cohort == BatchCohort::Constrained) !=
             (cohort == BatchCohort::Constrained) ||
