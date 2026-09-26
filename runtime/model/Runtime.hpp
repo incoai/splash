@@ -38,7 +38,6 @@ public:
   [[nodiscard]] std::unique_ptr<ModelBatchTicket>
   submit(const BatchPlan &plan, std::span<const ModelBatchItem> items,
               std::function<void()> completion) override;
-  [[nodiscard]] KvTier *kvTier() noexcept override;
   [[nodiscard]] std::unique_ptr<ModelBatchTicket>
   submitTransfers(std::function<void()> completion) override;
   [[nodiscard]] std::vector<ModelStepResult>

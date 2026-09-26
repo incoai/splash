@@ -482,8 +482,6 @@ public:
   [[nodiscard]] virtual std::unique_ptr<ModelBatchTicket>
   submit(const BatchPlan &plan, std::span<const ModelBatchItem> items,
          std::function<void()> completion) = 0;
-  // The KV disk tier, or null without one.
-  [[nodiscard]] virtual KvTier *kvTier() noexcept { return nullptr; }
   // A command carrying only queued KV copies, for an idle model; null when
   // nothing is queued. Its ticket yields no step results.
   [[nodiscard]] virtual std::unique_ptr<ModelBatchTicket>

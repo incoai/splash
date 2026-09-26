@@ -2348,8 +2348,6 @@ Runtime::decodeAsync(const BatchPlan &plan,
       std::move(command), std::move(finish), priorTiming.wallSeconds * 1000.0);
 }
 
-KvTier *Runtime::kvTier() noexcept { return impl_->kvTier; }
-
 std::unique_ptr<ModelBatchTicket>
 Runtime::submitTransfers(std::function<void()> completion) {
   if (!impl_->copiesQueued())

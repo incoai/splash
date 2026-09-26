@@ -193,7 +193,7 @@ uint64_t totalBytes(const std::vector<Span> &spans) {
   uint64_t total = 0;
   for (auto span : spans) {
     if (span.size() > std::numeric_limits<uint64_t>::max() - total)
-      throw std::invalid_argument("state transfer size overflow");
+      throw std::invalid_argument("slot transfer size overflowed");
     total += span.size();
   }
   return total;
@@ -226,7 +226,7 @@ std::shared_ptr<SlotFile::Operation> SlotFile::write(
     std::shared_ptr<Slot> slot, std::vector<std::span<const std::byte>> source,
     std::function<void()> completion) {
   if (!slot || slot->backing_ != backing_ || totalBytes(source) != backing_->slotBytes)
-    throw std::invalid_argument("state write size mismatch");
+    throw std::invalid_argument("slot write does not match this file's slots");
   if (!writable())
     throw std::logic_error("slot file no longer takes writes");
   return submit([slot, source = std::move(source)](const std::atomic<bool> &cancelled) {
@@ -252,7 +252,7 @@ std::shared_ptr<SlotFile::Operation> SlotFile::read(
     std::shared_ptr<Slot> slot, std::vector<std::span<std::byte>> destination,
     std::function<void()> completion) {
   if (!slot || slot->backing_ != backing_ || totalBytes(destination) != backing_->slotBytes)
-    throw std::invalid_argument("state read size mismatch");
+    throw std::invalid_argument("slot read does not match this file's slots");
   return submit([slot, destination = std::move(destination)](const std::atomic<bool> &cancelled) {
     if (!slot->written_) return false;
     Backing &backing = *slot->backing_;

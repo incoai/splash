@@ -15,8 +15,6 @@ namespace splash::test {
 class TestKvTier final : public model::KvTier {
 public:
   struct Transfer final {
-    bool demotion = false;
-    uint32_t page = 0;
     bool ready = false;
     bool success = true;
     bool finished = false;
@@ -30,16 +28,16 @@ public:
     return std::make_shared<Slot>(*this);
   }
   std::unique_ptr<model::KvTransfer>
-  demote(uint32_t page, std::shared_ptr<model::KvDiskSlot>, std::function<void()>) override {
+  demote(uint32_t, std::shared_ptr<model::KvDiskSlot>, std::function<void()>) override {
     if (!canDemote()) return {};
     ++demotions;
-    return start(true, page);
+    return start();
   }
   std::unique_ptr<model::KvTransfer>
-  restore(std::shared_ptr<model::KvDiskSlot>, uint32_t page, std::function<void()>) override {
+  restore(std::shared_ptr<model::KvDiskSlot>, uint32_t, std::function<void()>) override {
     if (staging >= stagingSlots) return {};
     ++restores;
-    return start(false, page);
+    return start();
   }
   bool copiesQueued() const noexcept override { return queued; }
   void poll() override {}
@@ -93,10 +91,8 @@ private:
     std::shared_ptr<Transfer> transfer_;
   };
 
-  std::unique_ptr<model::KvTransfer> start(bool demotion, uint32_t page) {
+  std::unique_ptr<model::KvTransfer> start() {
     auto transfer = std::make_shared<Transfer>();
-    transfer->demotion = demotion;
-    transfer->page = page;
     transfers.push_back(transfer);
     ++staging;
     queued = true;

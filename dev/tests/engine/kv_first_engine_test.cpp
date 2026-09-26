@@ -398,7 +398,6 @@ public:
       overlap->provided = true;
   }
   void end(uint64_t id) override { requests.erase(id); }
-  model::KvTier *kvTier() noexcept override { return tier; }
   // A command that carries only the tier's queued copies; the test finishes
   // the transfers themselves.
   std::unique_ptr<ModelBatchTicket>
