@@ -407,12 +407,24 @@ void printBootstrapError(const engine::RuntimeBootstrapReport &report) {
   }
 }
 
+// The engine's device rule, which the launcher runs before any download:
+// serve-native applies it only once the model is prepared.
+int checkDevice() {
+  const auto message = metal::probeDeviceCapabilities().validationMessage();
+  if (!message)
+    return 0;
+  std::cerr << "error: " << *message << '\n';
+  return static_cast<int>(engine::NativeProcessExit::EngineFailure);
+}
+
 } // namespace
 } // namespace splash
 
 int main(int argc, char **argv) {
   @autoreleasepool {
     try {
+      if (argc == 2 && std::string_view(argv[1]) == "device-check")
+        return splash::checkDevice();
       splash::NativeArguments arguments = splash::parseArguments(argc, argv);
       return splash::runNative(arguments);
     } catch (const splash::UsageError &error) {

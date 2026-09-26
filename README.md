@@ -26,9 +26,10 @@ brew install incoai/tap/splash
 splash serve --model mlx-community/Qwen3.8-27B-4bit
 ```
 
-The first run downloads the model and its matching DFlash2 draft, prepares
-weights for the Metal kernels, checks available memory, and starts serving on
-`127.0.0.1:8000`. Later starts reuse the prepared weights.
+The first run checks that the Mac's GPU and macOS are supported, downloads the
+model and its matching DFlash2 draft, prepares weights for the Metal kernels,
+checks available memory, and starts serving on `127.0.0.1:8000`. Later starts
+reuse the prepared weights.
 
 Once it prints `Ready`, leave this terminal open. Open <http://127.0.0.1:8000>
 in your browser, or run an installed coding agent from another terminal:
