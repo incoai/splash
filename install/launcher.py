@@ -501,7 +501,6 @@ def parse_args(argv=None):
     )
     server.add_argument(
         "--max-cache-disk",
-        "--max-state-disk",
         dest="max_cache_disk",
         type=_parse_max_cache_disk,
         default=0,

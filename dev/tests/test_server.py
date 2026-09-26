@@ -3371,10 +3371,6 @@ class ServerTest(unittest.TestCase):
         disk_args = api.parse_args([*required, "--max-cache-disk", "5G"])
         self.assertEqual(disk_args.max_cache_disk, 5 * 1024**3)
         self.assertEqual(api._native_command(disk_args)[-1], str(5 * 1024**3))
-        self.assertEqual(
-            api.parse_args([*required, "--max-state-disk", "5G"]).max_cache_disk,
-            5 * 1024**3,
-        )
         self.assertEqual(args.kv_format, "int8")
         self.assertNotIn("--kv-format", api._native_command(args))
         bf16_args = api.parse_args([*required, "--kv-format", "bf16"])

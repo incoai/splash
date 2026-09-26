@@ -113,11 +113,6 @@ class LauncherTests(unittest.TestCase):
             launcher.parse_args([*required, "--max-cache-disk", "5G"]).max_cache_disk,
             5 * 1024**3,
         )
-        # The earlier name still works.
-        self.assertEqual(
-            launcher.parse_args([*required, "--max-state-disk", "5G"]).max_cache_disk,
-            5 * 1024**3,
-        )
         for invalid in ("auto", "-1", "nan"):
             with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
                 launcher.parse_args([*required, "--max-cache-disk", invalid])
