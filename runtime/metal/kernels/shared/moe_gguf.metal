@@ -27,13 +27,12 @@ inline void moe_gguf_expert_tile(device bfloat *input, device const MoeTileDescr
   const ulong out = ulong(group.y) * Rows * p.output_size;
   const uint origin = group.x * GGUF_TILE_COLUMNS + simd_group * GGUF_STAGED_COLUMNS;
   threadgroup half *my = stage + simd_group * kStagedSimdgroupStage;
-  quant_iq4_pair_table(tl, simd_group * 32 + simd_lane, GGUF_STAGED_THREADS);
   const auto run = [&](auto rows) {
     constexpr ushort R = decltype(rows)::value;
     auto acc = staged_accumulator<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(x, p.input_size, my);
     gguf_zero(acc);
-    staged_accumulate_any<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(s.format, x, s.w0, s.w1, s.meta, p.input_size, origin, my, tl, simd_lane, 0,
-                                            p.input_size / GGUF_STAGED_STEP, acc);
+    staged_accumulate_any<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(s.format, x, s.w0, s.w1, s.meta, p.input_size, origin, my, tl,
+                                            simd_group * 32 + simd_lane, simd_lane, 0, p.input_size / GGUF_STAGED_STEP, acc);
     gguf_elements(acc, [&](uint row, uint column, float v) {
       // gguf_epilogue inline: calling it here reorders the lambda's captures.
       const ulong o = out + ulong(row) * p.output_size + origin + column;

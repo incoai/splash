@@ -214,7 +214,7 @@ void ggufMoePlans() {
   for (uint32_t family : {0U, 9U, 10U, 11U}) {
     ExecutionPlans plans(device(family));
     const MoeGgufTile expected = family == 9 ? MoeGgufTile::Register : MoeGgufTile::Staged;
-    require(moeGgufTile(family) == expected, "GGUF expert tile is not gated on GPU family 9");
+    require(moeGgufTile(family, shape) == expected, "GGUF expert tile is not gated on GPU family 9");
     // GGUF plans are not tuned: a table may not hold a choice for them.
     OperatorChoices choices;
     choices.moe.push_back({MoeWorkload{shape, 16, MoePhase::Decode}, MoeConfig{MoeExpertTile::M8}});
@@ -234,6 +234,19 @@ void ggufMoePlans() {
       require(plans.moeDecode(routedShape, lanes).configuration().ggufTile == MoeGgufTile::Staged &&
                   plans.moeDecode(routedShape, lanes).workspace().groupedSumsBytes == 0,
               "affine MoE plan took the GGUF register tile");
+    }
+    // Apple9 stages experts mostly in a format it stages (IQ2_XS: UD-Q2_K_XL)
+    // and keeps the register tile for the others (Q4_K: UD-Q4_K_M).
+    MoeShape staged = shape, q4k = shape;
+    staged.expertFormat = GGUF_FMT_IQ2XS;
+    q4k.expertFormat = GGUF_FMT_Q4K;
+    require(moeGgufTile(family, staged) == MoeGgufTile::Staged && moeGgufTile(family, q4k) == expected,
+            "GGUF expert tile does not follow the experts' format on GPU family 9");
+    for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
+      const MoePlan plan = plans.moeDecode(staged, lanes);
+      require(plan.configuration().ggufTile == MoeGgufTile::Staged && plan.workspace().groupedSumsBytes == 0,
+              "GGUF MoE plan of staged experts took the register tile");
+      covers(plans.moeDecodeWorkspacePerLane(staged), plan.workspace(), lanes, kMoeWorkspaceFields);
     }
     // Prefill: the register tile's 8 rows, or staged 8-row tiles while the
     // routes average at most one row per expert (32 rows of 8 of 256

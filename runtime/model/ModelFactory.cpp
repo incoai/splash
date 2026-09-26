@@ -64,23 +64,29 @@ ModelPackage loadPackage(metal::MetalBackend &backend,
       [&](const auto &layout) -> TargetWeights {
         using Layout = std::remove_cvref_t<decltype(layout)>;
         const std::filesystem::path directory = root / "target";
+        // Every missing file is written before the first is mapped: conversion
+        // needs normal memory pressure, which the residency of the files
+        // mapped before it would take away on a Mac with little memory.
         const auto read = [&](const QwenTargetFiles<Layout> &files,
-                              std::span<const PreparedWeight> target) {
+                              std::span<const PreparedWeight> target, const auto &prepareTarget) {
           prepared.insert(prepared.end(), target.begin(), target.end());
           if (!prepared.empty()) PreparedWeights().requireSpace(prepared, check);
+          if (vision) static_cast<void>(vision->prepare());
+          if (draft) draft->prepare();
+          prepareTarget();
           return readTarget(backend, layout, files);
         };
         switch (result.descriptor.targetSource) {
         case TargetSource::Packed:
-          return read(PackedTargetFiles<Layout>{backend, directory, layout}, {});
+          return read(PackedTargetFiles<Layout>{backend, directory, layout}, {}, [] {});
         case TargetSource::Mlx: {
           AffineTargetLoader loader(backend, directory, layout, admitConversion);
-          return read(loader, loader.weights());
+          return read(loader, loader.weights(), [&] { loader.prepare(); });
         }
         case TargetSource::Gguf: {
           GgufTargetLoader loader(backend, findTargetGguf(directory), ggufTargetGeometry(layout),
                                   admitConversion);
-          return read(loader, loader.weights());
+          return read(loader, loader.weights(), [&] { loader.prepare(); });
         }
         }
         throw std::invalid_argument("unknown target source");

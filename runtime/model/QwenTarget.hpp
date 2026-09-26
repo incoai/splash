@@ -94,8 +94,10 @@ struct QwenTargetGeometry final {
   uint32_t expertsPerToken = 0;
   uint32_t expertIntermediateSize = 0;
   QwenFfnKind ffnKind = QwenFfnKind::Dense;
-  // The weight layout every sparse MoE block of the target shares.
+  // The weight layout every sparse MoE block of the target shares, and in a
+  // GGUF the format of most of its routed expert weights.
   ops::WeightLayout moeLayout = ops::WeightLayout::Affine64;
+  uint32_t moeExpertFormat = GGUF_FMT_COUNT;
   uint32_t maskToken = 0;
   std::array<uint32_t, 2> stopTokens{};
   std::array<uint32_t, maximumCaptureLayers> captureLayerValues{};
@@ -114,7 +116,7 @@ struct QwenTargetGeometry final {
     return hiddenSize * captureLayerCount;
   }
   [[nodiscard]] constexpr ops::MoeShape moeShape() const noexcept {
-    return {hiddenSize, experts, expertsPerToken, expertIntermediateSize, moeLayout};
+    return {hiddenSize, experts, expertsPerToken, expertIntermediateSize, moeLayout, moeExpertFormat};
   }
   [[nodiscard]] constexpr uint32_t ffnScratchWidth() const noexcept {
     return ffnKind == QwenFfnKind::Dense ? denseIntermediateSize

@@ -13,14 +13,28 @@
 
 namespace splash::engine {
 
+namespace {
+
+// What compressing the anonymous pages frees: the share the compressor does
+// not keep at its ratio of held to own pages, at most half of them.
+uint64_t compressionSavings(const HostMemoryPages &pages) noexcept {
+  if (!pages.compressor || pages.compressed / 2 >= pages.compressor) return pages.anonymous / 2;
+  if (pages.compressed <= pages.compressor) return 0;
+  return pages.anonymous -
+         static_cast<uint64_t>(static_cast<unsigned __int128>(pages.anonymous) * pages.compressor / pages.compressed);
+}
+
+} // namespace
+
 uint64_t estimateHostAvailableMemory(const HostMemoryPages &statistics,
-                                     uint64_t pageSize) noexcept {
+                                     uint64_t pageSize, bool compression) noexcept {
   // free_count includes the speculative pages, which external_page_count
   // also counts; wired file pages are in neither.
   if (!pageSize || statistics.speculative > statistics.free) return 0;
   const uint64_t maximum = std::numeric_limits<uint64_t>::max();
   uint64_t pages = statistics.free - statistics.speculative;
-  for (uint64_t reclaimable : {statistics.fileBacked, statistics.purgeable}) {
+  for (uint64_t reclaimable : {statistics.fileBacked, statistics.purgeable,
+                               compression ? compressionSavings(statistics) : 0}) {
     if (reclaimable > maximum - pages) return 0;
     pages += reclaimable;
   }
@@ -45,8 +59,11 @@ std::optional<uint64_t> queryHostAvailableMemory() noexcept {
       {.free = statistics.free_count,
        .speculative = statistics.speculative_count,
        .fileBacked = statistics.external_page_count,
-       .purgeable = statistics.purgeable_count},
-      pageSize);
+       .purgeable = statistics.purgeable_count,
+       .anonymous = statistics.internal_page_count,
+       .compressor = statistics.compressor_page_count,
+       .compressed = statistics.total_uncompressed_pages_in_compressor},
+      pageSize, querySystemMemoryPressure().value_or(MemoryPressure::Critical) != MemoryPressure::Critical);
 }
 
 std::optional<MemoryPressure> querySystemMemoryPressure() noexcept {
@@ -198,7 +215,7 @@ MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure *failure) {
   // so the paced reclaim frees toward the recovery margin for it.
   if (engineFits && !hostFits)
     hostConstrained_ = true;
-  if (!engineFits || !hostFits || hostConstrained_ ||
+  if (!engineFits || !hostFits || hostHeld() ||
       pressure == MemoryPressure::Critical) {
     if (failure)
       *failure = !engineFits ? metal::AllocationFailure::EngineBudget
@@ -235,6 +252,13 @@ void MemoryGovernor::setPressure(MemoryPressure pressure) noexcept {
   systemPressure_ = pressure;
 }
 
+void MemoryGovernor::reclaimed(ReclaimOutcome outcome) noexcept {
+  if (outcome == ReclaimOutcome::Untargeted)
+    return;
+  std::lock_guard lock(mutex_);
+  reclaimExhausted_ = outcome == ReclaimOutcome::Exhausted;
+}
+
 MemoryGovernorSnapshot MemoryGovernor::snapshot() const noexcept {
   std::lock_guard lock(mutex_);
   uint64_t observed = observedResidentBytes();
@@ -249,7 +273,7 @@ MemoryGovernorSnapshot MemoryGovernor::snapshot() const noexcept {
   MemoryPressure effectivePressure = updateEffectivePressure(
       hostAvailable, reservedBytes_);
   bool hostGrowthAllowed = effectivePressure != MemoryPressure::Critical &&
-      !hostConstrained_ && hostHeadroom >= kHostWarningMarginBytes;
+      !hostHeld() && hostHeadroom >= kHostWarningMarginBytes;
   bool growthAllowed = hostGrowthAllowed && used < limitBytes_;
   return {
       limitBytes_,
@@ -278,6 +302,7 @@ MemoryPressure MemoryGovernor::updateEffectivePressure(
   hostConstrained_ = !hostAvailable ||
       hostHeadroom < kHostWarningMarginBytes ||
       (hostConstrained_ && hostHeadroom < kHostRecoveryMarginBytes);
+  reclaimExhausted_ = reclaimExhausted_ && hostConstrained_;
   MemoryPressure next = MemoryPressure::Normal;
   if (systemPressure_ == MemoryPressure::Critical) {
     next = MemoryPressure::Critical;
@@ -307,10 +332,11 @@ MemoryReclaimDirective MemoryPressurePolicy::update(
     return {true, true, std::numeric_limits<uint64_t>::max()};
   }
   if (nowMilliseconds < nextReclaimMilliseconds_)
-    return {true, false, 0};
+    return continued_.value_or(MemoryReclaimDirective{true, false, 0});
   // The host samples every 500 ms. Allow counters to settle between batches,
   // but keep responding if another application continues consuming memory.
   nextReclaimMilliseconds_ = nowMilliseconds + 1000.0;
+  continued_.reset();
 
   // Missing telemetry pauses allocation, but is not evidence that live
   // cache must be discarded. Empty backing can still be returned.
@@ -326,6 +352,16 @@ MemoryReclaimDirective MemoryPressurePolicy::update(
   // keeps that publication and takes the rest. A waiting request outranks it.
   return {true, false, std::min(desired, kHostWarningMarginBytes),
           !requestWaiting};
+}
+
+void MemoryPressurePolicy::reclaimed(const MemoryReclaimDirective &directive,
+                                     const MemoryReclaimResult &result) noexcept {
+  continued_.reset();
+  // Every critical pass evicts everything again by itself.
+  if (result.outcome != ReclaimOutcome::Pending || directive.evictAllUnpinnedPrefixes)
+    return;
+  continued_ = directive;
+  continued_->targetBytes -= std::min(result.releasedBytes, directive.targetBytes);
 }
 
 } // namespace splash::engine

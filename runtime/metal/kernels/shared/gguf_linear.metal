@@ -153,7 +153,7 @@ kernel void gguf_decode(device bfloat *input [[buffer(0)]], device uchar *w0 [[b
                         uint2 group [[threadgroup_position_in_grid]], uint simd_lane [[thread_index_in_simdgroup]],
                         uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup half2 tl[F::Kind == QuantCodebook ? kQuantPairTableEntries : 1];
-  if constexpr (F::Kind == QuantCodebook) quant_iq4_pair_table(tl, simd_group * 32 + simd_lane, GGUF_STAGED_THREADS);
+  quant_pair_table<F>(tl, simd_group * 32 + simd_lane, GGUF_STAGED_THREADS);
   threadgroup half stage[kStagedStages];
   threadgroup uint arrival;
   gguf_decode_tile<F, Rows, Ep>(input, w0, w1, meta, output, partials, counters, aux, p, group, simd_lane, simd_group,
@@ -191,7 +191,6 @@ QUANT_FORMATS(GGUF_DECODE_FORMAT)
                                      uint simd_lane [[thread_index_in_simdgroup]],                                \
                                      uint simd_group [[simdgroup_index_in_threadgroup]]) {                        \
     threadgroup half stage[kStagedStages]; threadgroup half2 tl[kQuantPairTableEntries]; threadgroup uint arrival; \
-    quant_iq4_pair_table(tl, simd_group * 32 + simd_lane, GGUF_STAGED_THREADS);                                    \
     const uint t0 = p.cols[0] / GGUF_TILE_COLUMNS, t1 = t0 + p.cols[1] / GGUF_TILE_COLUMNS;                        \
     const uint s = group.x < t0 ? 0 : group.x < t1 ? 1 : 2;                                                       \
     device uchar *w0 = s == 0 ? w0a : s == 1 ? w0b : w0c;                                                         \
@@ -202,8 +201,8 @@ QUANT_FORMATS(GGUF_DECODE_FORMAT)
     threadgroup half *my = stage + simd_group * kStagedSimdgroupStage;                                            \
     auto acc = staged_accumulator<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(input, p.input_size, my);                                         \
     gguf_zero(acc);                                                                                               \
-    staged_accumulate_any<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(p.fmt[s], input, w0, w1, meta, p.input_size, origin, my, tl, simd_lane, \
-                                            group.y * per, (group.y + 1) * per, acc);                            \
+    staged_accumulate_any<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(p.fmt[s], input, w0, w1, meta, p.input_size, origin, my, tl, \
+                                            simd_group * 32 + simd_lane, simd_lane, group.y * per, (group.y + 1) * per, acc); \
     gguf_store_sums<R>(acc, p.splits, group.y, partials, counters + p.offset[s] / GGUF_TILE_COLUMNS + local,       \
                        p.out_stride, column0, simd_group * 32 + simd_lane, &arrival,                              \
                        [&](uint row, uint column, float v) { output[ulong(row) * p.out_stride + column0 + column] = bfloat(v); }); \
@@ -222,7 +221,7 @@ GGUF_DECODE_FUSED(8) GGUF_DECODE_FUSED(16) GGUF_DECODE_FUSED(32)
       uint simd_group [[simdgroup_index_in_threadgroup]]
 #define GGUF_PREFILL_TABLES(F)                                                                                     \
   threadgroup half2 tl[F::Kind == QuantCodebook ? kQuantPairTableEntries : 1];                                     \
-  if constexpr (F::Kind == QuantCodebook) quant_iq4_pair_table(tl, simd_group * 32 + simd_lane, GGUF_PREFILL_THREADS); \
+  quant_pair_table<F>(tl, simd_group * 32 + simd_lane, GGUF_PREFILL_THREADS);                                      \
   threadgroup half stage[kPrefillStages]
 #define GGUF_PREFILL(F, f)                                                                                         \
   kernel void gguf_prefill_##f##_a(GGUF_PREFILL_BUFFERS, constant GgufPrefillParams &p [[buffer(5)]],            \

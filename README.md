@@ -19,7 +19,12 @@ there is nothing to configure.
 Apple M3 or newer, macOS 26.4 or later, [Homebrew](https://brew.sh), 36 GB
 of unified memory (48 GB or more recommended), and free disk for the model,
 its draft and a prepared copy of their weights (up to about 40 GB in total for
-Qwen3.8-27B and 48 GB for Qwen3.6-35B-A3B).
+Qwen3.8-27B and 48 GB for Qwen3.6-35B-A3B). Macs with 24 GB run the smaller
+GGUF files: on a 24 GB M6 (12-core GPU), `unsloth/Qwen3.8-27B-GGUF:UD-IQ3_XXS`
+with its DFlash2 draft advertises a 102,393-token context and decodes code at
+43.5 tok/s, and `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q2_K_XL` advertises the full
+256K context and decodes at about 100 tok/s. Where memory cannot hold a long
+context, startup suggests `--max-cache-disk`.
 
 ```bash
 brew install incoai/tap/splash
@@ -87,9 +92,8 @@ repository or a local directory. The tokenizer, configuration and chat template 
 from the target repository for MLX and from the selected GGUF file itself for
 GGUF, never from another repository: unsupported or incomplete tokenizer
 metadata is an error. GGUF variants whose tensor types Splash cannot load are
-rejected before download. Of Unsloth's files, UD-Q4_K_M and every larger one
-load for Qwen3.8-27B, and UD-IQ4_XS and every larger one for Qwen3.6-35B-A3B,
-except Q4_1, MXFP4_MOE, UD-Q8_K_XL and BF16
+rejected before download. Of Unsloth's files, every one loads for both models,
+from UD-IQ1_S up, except UD-Q8_K_XL and BF16
 ([GGUF targets](DEVELOPMENT.md#gguf-targets)). Legacy Splash packages such as
 `incoai/Qwen3.8-27B-Splash` remain loadable.
 
@@ -147,6 +151,9 @@ that a long uncached prompt will reach its first token quickly.
 - `--max-memory`: ceiling on Metal allocations, e.g. `28G`. Default: auto.
 - `--max-context`: context limit, up to `256K`, e.g. `100K`. Default: auto.
 - `--max-cache-disk`: SSD tier for the cache, e.g. `5G`. Default: 0 (off).
+  Startup suggests it when memory cannot hold the context; with it, a long
+  request that runs out of memory keeps its progress on SSD and replays far
+  less of its prompt.
 - `--kv-format`: target KV cache storage, `int8` (default) or `bf16`.
 - `--max-image-pixels`: maximum resized pixels per image. Default: 4,194,304.
 - `--allowed-host`: extra HTTP `Host` name to accept, such as `mymac.local`;
@@ -257,10 +264,10 @@ per model:
   attention, GDN and MoE dimensions, with dispatch policies measured offline
   per GPU family and core count. MLX weights are prepared once into layouts
   packed for these kernels. GGUF weights keep their llama.cpp quantization,
-  repacked once into planes that kernels chosen by GPU family and core count
-  decode directly, without per-shape tuning. Both are mapped zero-copy from
-  disk. Everything ships precompiled: no Xcode, no compiler toolchain, nothing
-  tuned on your machine.
+  repacked once into planes that kernels chosen by GPU family, core count and
+  format decode directly, without per-shape tuning. Both are mapped zero-copy
+  from disk. Everything ships precompiled: no Xcode, no compiler toolchain,
+  nothing tuned on your machine.
 - **A memory plan computed for this machine.** Context, KV capacity, and batch
   limits are worked out at startup from the memory Metal recommends, less the
   weights, the draft, and each request's state.

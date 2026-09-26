@@ -407,8 +407,29 @@ TENSOR_TYPES = {
     30: "BF16",
     39: "MXFP4",
 }
-QUANTIZED_TYPES = {"Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q8_0", "IQ3_S", "IQ4_NL", "IQ4_XS"}
-EMBEDDING_TYPES = {"Q4_K", "Q6_K", "Q8_0"}
+QUANTIZED_TYPES = {
+    "Q2_K",
+    "Q3_K",
+    "Q4_K",
+    "Q5_K",
+    "Q6_K",
+    "Q8_0",
+    "Q4_0",
+    "Q4_1",
+    "IQ1_S",
+    "IQ1_M",
+    "IQ2_XXS",
+    "IQ2_XS",
+    "IQ2_S",
+    "IQ3_XXS",
+    "IQ3_S",
+    "IQ4_NL",
+    "IQ4_XS",
+    "MXFP4",
+}
+# The token rows the embedding kernels gather (gguf_embedding_format in
+# runtime/metal/abi/Gguf.h).
+EMBEDDING_TYPES = {"Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q8_0", "Q4_0", "Q4_1"}
 # The tensors the native loader reads from a target, and the types it accepts
 # for each (runtime/model/GgufImage.cpp): quantized projections; F32 norms,
 # small GDN vectors and MoE routers, which llama.cpp keeps unquantized and

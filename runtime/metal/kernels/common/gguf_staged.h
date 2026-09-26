@@ -17,15 +17,15 @@ inline half2 staged_linear(uint pair, float s, float m) {
 template <class F>
 inline void dequant32(typename F::Payload w, typename F::Meta meta, ushort j, threadgroup half2 *tl, threadgroup half *dst) {
   QuantCoef k;
-  if constexpr (F::ScaleInPlane0) k = F::coef(meta, F::chunk(w, 0)); else k = F::coef(meta, j);
+  if constexpr (F::ScaleInChunk) k = F::coef(meta, F::chunk(w, 0)); else k = F::coef(meta, j);
 #pragma unroll
   for (ushort c = 0; c < 4; ++c) {
     const typename F::Chunk q = F::chunk(w, c);
     half4 lo, hi;
     if constexpr (F::Kind == QuantLinear) {
       const uint4 p = F::codes(q);
-      lo = half4(staged_linear<F>(p.x, k.s.x, k.m), staged_linear<F>(p.y, k.s.x, k.m));
-      hi = half4(staged_linear<F>(p.z, k.s.y, k.m), staged_linear<F>(p.w, k.s.y, k.m));
+      lo = half4(staged_linear<F>(p.x, k.s.x, k.m.x), staged_linear<F>(p.y, k.s.x, k.m.x));
+      hi = half4(staged_linear<F>(p.z, k.s.y, k.m.y), staged_linear<F>(p.w, k.s.y, k.m.y));
     } else if constexpr (F::Kind == QuantCodebook) {   // value * s in Scale: one rounding to half either way
       typedef typename F::Scale S;
       const uchar4 b = as_type<uchar4>(F::indices(q));

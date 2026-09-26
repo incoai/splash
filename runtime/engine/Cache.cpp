@@ -356,7 +356,7 @@ uint64_t Cache::reclaimCache(uint64_t targetBytes, bool evictAll,
   if (releaseDeferred())
     return 0;
   uint64_t released = reclaimEmptyExtents();
-  auto needsMore = [&] { return evictAll || released + pendingBytes() < targetBytes; };
+  auto needsMore = [&] { return !reclaimMet(released, targetBytes, evictAll); };
   while (needsMore() && !releaseDeferred()) {
     const CacheReclaimResult result =
         reclaimOne(CacheReclaimMode::ReleaseBacking, keepResumePoint);
@@ -514,6 +514,11 @@ bool Cache::transfersInFlight() const noexcept {
 
 uint64_t Cache::pendingBytes() const noexcept {
   return uint64_t{pendingPages()} * pool_.bytesPerPage();
+}
+
+bool Cache::reclaimMet(uint64_t releasedBytes, uint64_t targetBytes,
+                       bool evictAll) const noexcept {
+  return !evictAll && releasedBytes + pendingBytes() >= targetBytes;
 }
 
 bool Cache::releaseDeferred() const noexcept {

@@ -174,6 +174,11 @@ public:
   [[nodiscard]] const RuntimeCacheIdentity &cacheIdentity() const noexcept {
     return cacheIdentity_;
   }
+  // What other applications left, measured before the engine took any;
+  // empty when the host could not be measured.
+  [[nodiscard]] std::optional<uint64_t> hostAvailableAtStart() const noexcept {
+    return hostAvailableAtStart_;
+  }
 
   [[nodiscard]] model::RuntimeContext modelContext() noexcept;
   [[nodiscard]] ActualMemoryReport
@@ -200,7 +205,8 @@ private:
                    std::unique_ptr<model::KvPageTier> kvTier,
                    std::unique_ptr<KvPool> kvPool,
                    std::unique_ptr<engine::Cache> cache,
-                   uint32_t maximumImagePatches);
+                   uint32_t maximumImagePatches,
+                   std::optional<uint64_t> hostAvailableAtStart);
 
   std::unique_ptr<metal::MetalBackend> backend_;
   model::ModelPackage model_;
@@ -215,6 +221,7 @@ private:
   std::unique_ptr<KvPool> kvPool_;
   std::unique_ptr<engine::Cache> cache_;
   uint32_t maximumImagePatches_ = 0;
+  std::optional<uint64_t> hostAvailableAtStart_;
 };
 
 } // namespace splash::engine

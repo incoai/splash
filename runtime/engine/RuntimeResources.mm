@@ -1,13 +1,12 @@
 #include "engine/RuntimeResources.hpp"
 #include "engine/Checked.hpp"
+#include "engine/StartupLog.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 
 #import <Foundation/Foundation.h>
 #include <CommonCrypto/CommonDigest.h>
 
 #include <array>
-#include <ctime>
-#include <iostream>
 #include <limits>
 #include <optional>
 #include <sstream>
@@ -15,30 +14,6 @@
 
 namespace splash::engine {
 namespace {
-
-template <typename... Parts>
-void logKernelStartup(const Parts &...parts) noexcept {
-  try {
-    std::ostringstream text;
-    (text << ... << parts);
-    const std::string message = text.str();
-    const std::time_t now = std::time(nullptr);
-    std::tm local{};
-    char timestamp[9] = "--:--:--";
-    if (localtime_r(&now, &local))
-      std::strftime(timestamp, sizeof(timestamp), "%H:%M:%S", &local);
-    std::ostringstream line;
-    line << timestamp << ' ';
-    // Native stderr is inherited by serve. Keep each optional startup notice
-    // bounded and on one line, including messages from caught exceptions.
-    for (unsigned char character : std::string_view(message).substr(0, 768))
-      line << (character < 32 || character == 127 ? ' ' : char(character));
-    if (message.size() > 768) line << "...";
-    std::cerr << line.str() << '\n';
-  } catch (...) {
-    // Optional diagnostics must not affect startup or serving.
-  }
-}
 
 static_assert(model::ExecutionLimits::maximumBatchWidth ==
               SPLASH_MAXIMUM_BATCH_WIDTH);
@@ -241,7 +216,7 @@ RuntimeResources::RuntimeResources(
     std::unique_ptr<model::StateStorage> stateStorage,
     std::unique_ptr<model::KvPageTier> kvTier,
     std::unique_ptr<KvPool> kvPool, std::unique_ptr<engine::Cache> cache,
-    uint32_t maximumImagePatches)
+    uint32_t maximumImagePatches, std::optional<uint64_t> hostAvailableAtStart)
     : backend_(std::move(backend)), model_(std::move(model)),
       operators_(std::move(operators)),
       memoryPlan_(std::move(memoryPlan)),
@@ -250,7 +225,8 @@ RuntimeResources::RuntimeResources(
       memoryGovernor_(std::move(memoryGovernor)), kvPages_(std::move(kvPages)),
       stateStorage_(std::move(stateStorage)), kvTier_(std::move(kvTier)),
       kvPool_(std::move(kvPool)),
-      cache_(std::move(cache)), maximumImagePatches_(maximumImagePatches) {}
+      cache_(std::move(cache)), maximumImagePatches_(maximumImagePatches),
+      hostAvailableAtStart_(hostAvailableAtStart) {}
 
 std::unique_ptr<RuntimeResources>
 RuntimeResources::create(const RuntimeResourcesConfig &config) {
@@ -290,6 +266,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
   MemoryGovernor::HostAvailableMemoryProvider hostAvailableMemory =
       config.hostAvailableMemory ? config.hostAvailableMemory
                                  : queryHostAvailableMemory;
+  // What other applications leave, measured before the engine takes any.
+  const std::optional<uint64_t> hostAvailableAtStart = hostAvailableMemory();
   // Startup work stops on cancellation and keeps its reserve of host memory.
   const auto throwIfCancelled = [cancelled = config.cancelled] {
     if (cancelled && cancelled())
@@ -555,7 +533,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
         std::move(modelMemoryPlan), std::move(cacheIdentity),
         std::move(memoryGovernor), std::move(kvPages), std::move(stateStorage),
         std::move(kvTier), std::move(kvPool), std::move(cache),
-        config.maximumImagePatches));
+        config.maximumImagePatches, hostAvailableAtStart));
     return result;
   } catch (const metal::MetalAllocationError &error) {
     throw RuntimeResourcesError(RuntimeResourceStage::StorageAllocation,

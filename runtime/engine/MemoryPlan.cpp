@@ -253,6 +253,15 @@ uint32_t EngineMemoryPlan::maximumContextTokens() const noexcept {
       std::min<uint64_t>(model_.maximumContextTokens, logicalCapacity));
 }
 
+uint32_t EngineMemoryPlan::contextTokensWithin(uint64_t memoryBytes) const {
+  if (!memoryBytes)
+    return 0;
+  const uint64_t configured = breakdown_.configuredMemoryLimitBytes;
+  const EngineMemoryPlanResult within = evaluateEngineMemoryPlan(
+      device_, model_, configured ? std::min(configured, memoryBytes) : memoryBytes);
+  return within.plan ? within.plan->maximumContextTokens() : 0;
+}
+
 std::string EngineMemoryPlan::toStatusJson() const {
   std::ostringstream out;
   out << '{' << "\"valid\":true,"

@@ -2,6 +2,7 @@
 
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/ExecutionGeometry.h"
+#include "metal/abi/QuantFormat.h"
 #include "ops/Linear.hpp"
 
 #include <algorithm>
@@ -21,6 +22,9 @@ struct MoeShape final {
   // How the weights are stored: affine Q4/Q8 slabs, or the tensors of a GGUF
   // (BlockMoeWeights), which run their own router and expert kernels.
   WeightLayout weightLayout = WeightLayout::Affine64;
+  // A GGUF's format of most routed expert weights, which picks the expert
+  // tile on Apple9 (moeGgufTile); GGUF_FMT_COUNT for affine weights.
+  uint32_t expertFormat = GGUF_FMT_COUNT;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
     return (weightLayout == WeightLayout::Affine64 || weightLayout == WeightLayout::Block32) &&
@@ -205,16 +209,22 @@ moeDecodeSimdgroups(uint32_t appleGpuFamily) noexcept {
 // with silu(gate), down) over the GGUF image: the half-staged tiles of
 // kernels/shared/moe_gguf.metal, or Register, the exact register tile of
 // kernels/decode/linear_gguf_sgmatrix.metal over Table16 tiles of the
-// grouped rows (8-row tiles only). Apple9 runs Register in both phases. In
-// decode, as its dense GGUF projections do (LinearGguf.cpp): its matrix
-// operations share the FP32 pipe, where the register tile beats staging. In
-// prefill it equals the decode numerics; against the staged 32-row tiles, on
-// the 35B's real routes on the 40-core M3 Max (ms per layer), it is faster at
-// 512 rows (3.52 vs 3.72) and slower at 2048 (12.6-13.1 vs 11.0-11.7).
+// grouped rows (8-row tiles only). Apple9 runs Register in both phases but
+// for experts mostly in a format it stages. In decode, as its dense GGUF
+// projections do (LinearGguf.cpp): its matrix operations share the FP32 pipe,
+// where the register tile beats staging. In prefill it equals the decode
+// numerics; against the staged 32-row tiles, on the 35B's real routes on the
+// 40-core M3 Max (ms per layer), it is faster at 512 rows (3.52 vs 3.72) and
+// slower at 2048 (12.6-13.1 vs 11.0-11.7).
 enum class MoeGgufTile : uint8_t { Staged, Register };
 
-[[nodiscard]] constexpr MoeGgufTile moeGgufTile(uint32_t appleGpuFamily) noexcept {
-  return appleGpuFamily == 9 ? MoeGgufTile::Register : MoeGgufTile::Staged;
+// Apple9 stages experts mostly in a format apple9StagesFormat names: one
+// 35B-shaped layer on a 40-core M3 Max decodes UD-Q2_K_XL's IQ2_XS and
+// IQ3_XXS experts, and the IQ2, IQ3_XXS and IQ1 formats alone, 4-21% faster
+// staged at B1-B4, where Q4_K/Q5_K, Q2_K and IQ4_XS experts take 3-34% longer.
+[[nodiscard]] inline MoeGgufTile moeGgufTile(uint32_t appleGpuFamily, MoeShape shape) noexcept {
+  return appleGpuFamily == 9 && !apple9StagesFormat(shape.expertFormat) ? MoeGgufTile::Register
+                                                                         : MoeGgufTile::Staged;
 }
 
 // The rows of a GGUF prefill plan's tiles on the device's `tile`: 8 on the

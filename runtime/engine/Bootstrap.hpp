@@ -81,6 +81,14 @@ private:
     RuntimeBootstrapStage stage_ = RuntimeBootstrapStage::ResourceAssembly;
 };
 
+// Whether memory may not hold a request of contextTokens: the plan within
+// what the host had available at startup, beyond its reserve and the warning
+// margin, holds less. The estimate is conservative, since macOS compresses
+// other applications further once the engine loads.
+[[nodiscard]] bool memoryMayNotHold(const EngineMemoryPlan &plan,
+                                    uint64_t hostAvailableBytes,
+                                    uint32_t contextTokens);
+
 struct RuntimeBootstrapConfig {
     RuntimeResourcesConfig resources;
     NativeLoopConfig nativeLoop;

@@ -75,7 +75,7 @@ ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device)
     : linear_(device), baselineLinear_(device),
       moeRouteWideRows_(moeRouteWideRows(device.gpuCoreCount)),
       moeDecodeSimdgroups_(moeDecodeSimdgroups(device.appleGpuFamily)),
-      moeGgufTile_(moeGgufTile(device.appleGpuFamily)) {}
+      appleGpuFamily_(device.appleGpuFamily) {}
 
 void ExecutionPlans::install(const OperatorChoices &choices) {
   OperatorChoices pending = choices;
@@ -154,8 +154,9 @@ MoePlan ExecutionPlans::moePlan(const MoeWorkload &workload, MoeConfig config) c
   // prefill chunk's much larger expert grid keeps the shipped tile.
   config.m8Simdgroups = prefill ? MoeExpertSimdgroups::Eight : moeDecodeSimdgroups_;
   if (shape.weightLayout == WeightLayout::Block32) {
-    config.expertTile = prefill ? moeGgufPrefillTile(shape, workload.rows, moeGgufTile_) : MoeExpertTile::M8;
-    config.ggufTile = moeGgufTile_;
+    const MoeGgufTile tile = moeGgufTile(appleGpuFamily_, shape);
+    config.expertTile = prefill ? moeGgufPrefillTile(shape, workload.rows, tile) : MoeExpertTile::M8;
+    config.ggufTile = tile;
     config.ggufRouterTile = linear_.ggufFloatTile(workload.rows, shape.experts);
   }
   return phasePlan(workload, config);

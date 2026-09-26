@@ -417,9 +417,9 @@ void Linear::account(LinearDispatchStats &stats, uint32_t lanes, uint32_t dispat
 
 // GPU family selects variants; core count and workload tile counts determine
 // parallelism.
-LinearConfig Linear::baseline(LinearWorkload w) const {
+LinearConfig Linear::baseline(LinearWorkload w, std::span<const Projection *const> projections) const {
   validate(w);
-  if (w.weightLayout == WeightLayout::Block32) return ggufBaseline(w);
+  if (w.weightLayout == WeightLayout::Block32) return ggufBaseline(w, projections);
   const uint32_t tiles128 = w.matrix.outputSize / 128;
   const uint32_t tiles256 = w.matrix.outputSize / 256;
   if (w.phase == LinearPhase::Prefill) {
@@ -488,9 +488,10 @@ LinearPlan Linear::plan(LinearWorkload workload) const {
 LinearPlan Linear::plan(LinearWorkload workload, LinearConfig config, FloatOutput destination) {
   return LinearPlan(workload, config, destination);
 }
-LinearPlan Linear::plan(LinearWorkload w, const Projection &p) const {
+LinearPlan Linear::plan(LinearWorkload w, const Projection &p, const Projection *gate) const {
   w.weightLayout = p.layout();
-  return LinearPlan(w, chosenConfiguration(choices_, w, baseline(w)), p.destination);
+  const std::array<const Projection *, 2> projections{&p, gate};
+  return LinearPlan(w, chosenConfiguration(choices_, w, baseline(w, projections)), p.destination);
 }
 void Linear::setChoices(std::span<const LinearChoice> choices) {
   std::vector<LinearChoice> pending(choices.begin(), choices.end());
@@ -562,14 +563,16 @@ std::vector<LinearPlan> Linear::candidates(LinearWorkload w) const {
   return result;
 }
 
-LinearPlan Linear::decodePlan(const Projection &p, uint32_t lanes, LinearEpilogue epilogue) const {
-  return plan(decode({p.outputSize, p.inputSize}, lanes, epilogue), p);
+LinearPlan Linear::decodePlan(const Projection &p, uint32_t lanes, LinearEpilogue epilogue,
+                              const Projection *gate) const {
+  return plan(decode({p.outputSize, p.inputSize}, lanes, epilogue), p, gate);
 }
 LinearPlan Linear::prefillPlan(const Projection &p, uint32_t rows, LinearEpilogue epilogue) const {
   return plan({{p.outputSize, p.inputSize}, rows, LinearPhase::Prefill, epilogue}, p);
 }
 
 LinearScratchSize Linear::decodeScratchSize(LinearWorkload w) const {
+  if (w.weightLayout == WeightLayout::Block32) return ggufDecodeScratchSize(w);
   return LinearPlan(w, baseline(w)).scratchSize().include(plan(w).scratchSize());
 }
 
@@ -721,7 +724,7 @@ PreparedInput Linear::addGateUpBatch(metal::CommandGraph &graph, metal::MetalBuf
   return add(graph,
              {.input = input, .output = output, .gateScratch = gateScratch, .scratch = scratch,
               .prepared = prepared},
-             up, decodePlan(up, lanes, LinearEpilogue::GateUp), &gate, &stats);
+             up, decodePlan(up, lanes, LinearEpilogue::GateUp, &gate), &gate, &stats);
 }
 
 } // namespace splash::ops

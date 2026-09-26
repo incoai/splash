@@ -117,6 +117,22 @@ void includeFfn(QwenTargetGeometry &geometry, const Qwen3_6MoeLayerWeights &laye
     throw WeightStoreError("the MoE blocks of a target must share one weight layout");
 }
 
+// The format of most routed expert weights of a GGUF target's MoE blocks,
+// GGUF_FMT_COUNT for none (ops::MoeShape::expertFormat).
+uint32_t routedExpertFormat(std::span<const Qwen3_8LayerWeights>) { return GGUF_FMT_COUNT; }
+uint32_t routedExpertFormat(std::span<const Qwen3_6MoeLayerWeights> layers) {
+  std::array<uint64_t, GGUF_FMT_COUNT> weights{};
+  for (const Qwen3_6MoeLayerWeights &layer : layers) {
+    if (layer.ffn.layout() != ops::WeightLayout::Block32) return GGUF_FMT_COUNT;
+    const ops::BlockMoeWeights &block = layer.ffn.blocks();
+    for (const ops::BlockExpertProjection *projection : {&block.gate, &block.up, &block.down})
+      if (!projection->routed.isFloat())
+        weights[projection->routed.formatId] += uint64_t{projection->routed.outputSize} * projection->routed.inputSize;
+  }
+  const auto most = std::max_element(weights.begin(), weights.end());
+  return *most ? uint32_t(most - weights.begin()) : GGUF_FMT_COUNT;
+}
+
 } // namespace
 
 template <class Layout, class Layer>
@@ -129,6 +145,7 @@ QwenTargetGeometry qwenTargetGeometry(const QwenTargetWeights<Layout, Layer> &we
     }, layer.mixer);
     includeFfn(geometry, layer, &layer == &weights.layers.front());
   }
+  geometry.moeExpertFormat = routedExpertFormat(weights.layers);
   geometry.prefillProjections = geometry.decodeProjections;
   includeProjection(geometry, weights.logitsProjection);
   for (auto *shapes : {&geometry.prefillProjections, &geometry.decodeProjections,
@@ -462,7 +479,8 @@ void QwenTarget::addVerifyFfn(VerifyStep &step, const Qwen3_8LayerWeights &layer
   const ops::Linear &linear = operators_.linear();
   const ops::PreparedInput normalized = ops::Normalization::addRms(
       step.graph, residual, layer.postAttentionNorm, b.normalized, geometry_.hiddenSize, step.rows,
-      b.linearScratch, linear.decodePlan(layer.upProjection, step.lanes, ops::LinearEpilogue::GateUp).input());
+      b.linearScratch,
+      linear.decodePlan(layer.upProjection, step.lanes, ops::LinearEpilogue::GateUp, &layer.gateProjection).input());
   linear.addGateUpBatch(step.graph, b.normalized, layer.gateProjection, layer.upProjection, b.denseGateScratch,
                         b.denseIntermediate, step.lanes, step.stats, b.linearScratch, normalized);
   linear.addResidualBatch(step.graph, b.denseIntermediate, layer.downProjection, residual, output, step.lanes,

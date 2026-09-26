@@ -85,11 +85,10 @@ int main(int argc, char **argv) {
       uint32_t N = 0;
       uint64_t bytes = 0;
       for (size_t i = 0; i < formats.size(); ++i) {
-        int f = 0;
-        while (f < FMT_COUNT && formats[i] != fmtName(f)) ++f;
+        const Fmt f = fmtNamed(formats[i]);
         const uint32_t n = uint32_t(std::stoul(widths[i]));
         if (f == FMT_COUNT || !n || n % 256 || !K || K % 256) throw std::invalid_argument("bad segment " + formats[i]);
-        images.push_back({Fmt(f), n, N, repack(Fmt(f), makeNative(Fmt(f), n, K, rng), n, K, nullptr)});
+        images.push_back({f, n, N, repack(f, makeNative(f, n, K, rng), n, K, nullptr)});
         N += n;
         for (const std::vector<uint8_t> *plane : {&images.back().planes.w0, &images.back().planes.w1,
                                                   &images.back().planes.meta})

@@ -39,8 +39,9 @@ void require(bool value, const std::string &message) {
     throw std::runtime_error(message);
 }
 
-// Available host memory is what macOS can hand out without compressing or
-// swapping: free pages and pageable file-backed and purgeable pages.
+// Available host memory is what macOS can hand out without swapping: free
+// pages and pageable file-backed and purgeable pages, and with compression
+// what compressing the anonymous pages frees.
 void testHostAvailabilityCountsReclaimablePages() {
   constexpr uint64_t pageSize = 16384;
   auto availablePages = [](const HostMemoryPages &pages) {
@@ -90,6 +91,20 @@ void testHostAvailabilityCountsReclaimablePages() {
               estimateHostAvailableMemory({.free = maximum}, 1) == maximum &&
               estimateHostAvailableMemory(pages, 0) == 0,
           "invalid host counters or arithmetic overflow did not fail closed");
+  // With compression (below critical system pressure), compressing the
+  // anonymous pages frees what the compressor would not keep: at its
+  // present ratio, at most 2:1, and 2:1 while it holds nothing.
+  const auto compressedPages = [](uint64_t compressor, uint64_t compressed) {
+    return estimateHostAvailableMemory({.free = 10, .fileBacked = 20, .anonymous = 40,
+                                        .compressor = compressor, .compressed = compressed},
+                                       1, true);
+  };
+  require(estimateHostAvailableMemory({.free = 10, .fileBacked = 20, .anonymous = 40}, 1) == 30 &&
+              compressedPages(0, 0) == 50 && compressedPages(10, 15) == 44 && compressedPages(10, 40) == 50 &&
+              compressedPages(10, 10) == 30 && compressedPages(10, 5) == 30,
+          "compression credit is not the anonymous pages' savings at the compressor's ratio, at most 2:1");
+  require(estimateHostAvailableMemory({.free = maximum, .anonymous = 2}, 1, true) == 0,
+          "compression credit overflowed");
   require(EngineMemoryPolicy::hostAvailableReserveBytes(16 * kGiB) ==
                   16 * kGiB / 10 &&
               EngineMemoryPolicy::hostAvailableReserveBytes(48 * kGiB) ==
@@ -241,6 +256,70 @@ void testHostRefusalStartsReclaim() {
           "the waiting request did not fit after the reclaim");
 }
 
+// The paced passes up to the next measurement continue what transfers held
+// back of a pass's target, less what each releases, until it is met. A new
+// measurement replaces it, and every critical pass evicts everything afresh.
+void testPolicyContinuesHeldBackTarget() {
+  MemoryPressurePolicy policy;
+  MemoryGovernorSnapshot pressure{.pressure = MemoryPressure::Warning,
+                                  .hostMeasurementValid = true,
+                                  .hostHeadroomBytes = kHostRecoveryMarginBytes - 300};
+  const auto pass = [&](double now, MemoryReclaimResult result) {
+    const MemoryReclaimDirective directive = policy.update(pressure, now, true);
+    policy.reclaimed(directive, result);
+    return directive.targetBytes;
+  };
+  constexpr MemoryReclaimResult none{};
+  require(pass(0.0, {100, ReclaimOutcome::Pending}) == 300 &&
+              pass(100.0, {50, ReclaimOutcome::Pending}) == 200 &&
+              pass(200.0, {0, ReclaimOutcome::Met}) == 150 && pass(300.0, none) == 0,
+          "the paced passes did not continue a held-back target until it was met");
+  require(pass(1000.0, {0, ReclaimOutcome::Pending}) == 300, "the pass was not measured");
+  pressure.hostHeadroomBytes = kHostRecoveryMarginBytes - 100;
+  require(pass(2000.0, none) == 100 && pass(2100.0, none) == 0,
+          "a measurement did not replace the held-back target");
+  pressure.pressure = MemoryPressure::Critical;
+  static_cast<void>(pass(2200.0, {0, ReclaimOutcome::Pending}));
+  pressure.pressure = MemoryPressure::Warning;
+  require(pass(2300.0, none) == 0, "evicting everything was continued after critical pressure");
+}
+
+// With nothing left to reclaim, the hold for the recovery margin could only be
+// lifted by other applications: every request, however small, would wait.
+// While reclaim reports that, growth that clears the warning margin proceeds
+// and a request beyond it holds no other. A pass that finds memory again, or
+// a new episode of host pressure, brings the hold back.
+void testExhaustedReclaimWaivesTheHold() {
+  metal::statistics = {};
+  metal::statistics.allocatedBytes = 12 * kGiB;
+  metal::statistics.deviceCurrentAllocatedBytes = 12 * kGiB;
+  metal::MetalBackend backend("unused");
+  const uint64_t hostReserve = 2 * kGiB;
+  std::optional<uint64_t> available = hostReserve + kGiB + kGiB / 2;
+  MemoryGovernor governor(backend, 40 * kGiB, hostReserve, [&available] { return available; });
+  metal::AllocationFailure failure;
+  require(!governor.tryReserve(kGiB, &failure) && failure == metal::AllocationFailure::HostPressure,
+          "growth past the warning margin was admitted");
+  governor.reclaimed(ReclaimOutcome::Untargeted);
+  require(!governor.tryReserve(100 * kMiB) && !governor.snapshot().hostGrowthAllowed,
+          "the host refusal did not hold growth for the recovery margin");
+  governor.reclaimed(ReclaimOutcome::Exhausted);
+  require(governor.snapshot().hostGrowthAllowed && governor.tryReserve(100 * kMiB).has_value(),
+          "growth within the warning margin still waited after reclaim was exhausted");
+  require(!governor.tryReserve(kGiB, &failure) && failure == metal::AllocationFailure::HostPressure &&
+              governor.snapshot().pressure == MemoryPressure::Warning &&
+              governor.tryReserve(100 * kMiB).has_value(),
+          "a request past the warning margin was admitted or held the others");
+  governor.reclaimed(ReclaimOutcome::Pending);
+  require(!governor.tryReserve(100 * kMiB), "the hold did not return with memory to reclaim");
+  governor.reclaimed(ReclaimOutcome::Exhausted);
+  available = hostReserve + 3 * kGiB;
+  require(governor.snapshot().pressure == MemoryPressure::Normal, "the host did not recover");
+  available = hostReserve + kGiB + kGiB / 2;
+  require(!governor.tryReserve(kGiB) && !governor.tryReserve(100 * kMiB),
+          "an earlier episode's exhausted reclaim waived the hold");
+}
+
 } // namespace
 
 int main() {
@@ -248,6 +327,8 @@ int main() {
     testHostAvailabilityCountsReclaimablePages();
     testAdvertisedContextIsGrantable();
     testHostRefusalStartsReclaim();
+    testPolicyContinuesHeldBackTarget();
+    testExhaustedReclaimWaivesTheHold();
     std::cout << "memory governor tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

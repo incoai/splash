@@ -58,6 +58,11 @@ enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate };
 enum class LinearTile : uint8_t {
   N128, N256, Paired128, Split32, Split64, Paired256, Simdgroup, GgufStaged, GgufRegister
 };
+// The GGUF formats Apple9's staged tiles decode faster than its register
+// tiles, dense and MoE: IQ3_XXS, the IQ2 formats and IQ1, whose operands the
+// register tiles build from grid lookups beside their matrix operations
+// (LinearGguf.cpp, MoE.hpp).
+[[nodiscard]] bool apple9StagesFormat(uint32_t format) noexcept;
 enum class LinearSimdgroups : uint8_t { Two = 2, Four = 4, Eight = 8 };
 
 struct LinearWorkload final {
@@ -211,8 +216,10 @@ public:
   static constexpr std::size_t kMaximumCandidates = 20;
 
   [[nodiscard]] LinearPlan plan(LinearWorkload workload) const;
-  // The plan of `workload` in the projection's weight layout, into its destination type.
-  [[nodiscard]] LinearPlan plan(LinearWorkload workload, const Projection &projection) const;
+  // The plan of `workload` in the projection's weight layout, into its destination type; a gate/up plan also runs
+  // `gate`.
+  [[nodiscard]] LinearPlan plan(LinearWorkload workload, const Projection &projection,
+                                const Projection *gate = nullptr) const;
   // Rows of storage a decode step of `rows` rows binds for a projection of
   // `shape`: the storageRows of its decode plans, which every epilogue shares.
   [[nodiscard]] uint32_t decodeStorageRows(uint32_t rows, ProjectionShape shape) const;
@@ -221,7 +228,8 @@ public:
   [[nodiscard]] LinearPlan prefillPlan(const Projection &projection, uint32_t rows,
                                        LinearEpilogue epilogue) const;
   [[nodiscard]] LinearPlan decodePlan(const Projection &projection, uint32_t lanes,
-                                      LinearEpilogue epilogue = LinearEpilogue::None) const;
+                                      LinearEpilogue epilogue = LinearEpilogue::None,
+                                      const Projection *gate = nullptr) const;
   [[nodiscard]] LinearScratchSize decodeScratchSize(LinearWorkload workload) const;
   // The scratch of every prefill chunk and epilogue of a projection of
   // `shape`: the split partials and counters of the chunks that run the GGUF
@@ -274,11 +282,17 @@ public:
                                  LinearScratch scratch = {}, PreparedInput prepared = {}) const;
 
 private:
-  [[nodiscard]] LinearConfig baseline(LinearWorkload workload) const;
+  // The device's configuration of the workload; a block plan's tile may follow the formats of the projections it
+  // runs.
+  [[nodiscard]] LinearConfig baseline(LinearWorkload workload,
+                                      std::span<const Projection *const> projections = {}) const;
   // Counts `dispatches` dispatches that each fuse `lanes` request lanes.
   static void account(LinearDispatchStats &stats, uint32_t lanes, uint32_t dispatches) noexcept;
-  // GGUF policy and dispatch (LinearGguf.cpp).
-  [[nodiscard]] LinearConfig ggufBaseline(LinearWorkload workload) const;
+  // GGUF policy and dispatch (LinearGguf.cpp). Block plans are not tuned.
+  [[nodiscard]] LinearConfig ggufBaseline(LinearWorkload workload,
+                                          std::span<const Projection *const> projections) const;
+  // The scratch of every tile a block decode plan of the workload may take.
+  [[nodiscard]] LinearScratchSize ggufDecodeScratchSize(LinearWorkload workload) const;
   void addGguf(metal::CommandGraph &graph, const LinearBuffers &buffers,
                const Projection &projection, const LinearPlan &plan,
                const Projection *gate, LinearDispatchStats *stats) const;

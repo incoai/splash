@@ -1,8 +1,9 @@
 // GPU time of one sparse MoE layer at the 35B shape (hidden 2048, 256 experts, top 8, intermediate 512) in GGUF
-// (Q4_K gate/up, Q5_K down, a Q8_0 shared expert, F32 router) against the affine Q4 layer, on the device's plans and
-// the other GGUF tile: a 2048-row prefill chunk, decode B1-B4 and prefill chunks of their rows, then every dispatch
-// of the long chunk, B1 and B4 replayed as its own command. The numbers behind the MoE plans of ops/MoE.cpp:
-//   gguf-moe-benchmark <metallib> [rounds]
+// (by default the 35B UD-Q4_K_M's Q4_K gate/up and Q5_K down experts, a Q8_0 shared expert, F32 router) against the
+// affine Q4 layer, on the device's plans and the other GGUF tile: a 2048-row prefill chunk, decode B1-B4 and prefill
+// chunks of their rows, then every dispatch of the long chunk, B1 and B4 replayed as its own command. The numbers
+// behind the MoE plans of ops/MoE.cpp:
+//   gguf-moe-benchmark <metallib> [rounds] [gate/up format] [down format]
 // Printed are medians of GPU ms per layer over `rounds` (20) commands. Every row routes to 8 experts of a pool of 24
 // per request lane (decode, short chunks) or of all 256 (the long chunk), identically for both formats: expert e
 // scores 4 x[e], so the first 256 inputs pick the routes. The weights exceed the system cache, so each layer streams
@@ -87,9 +88,10 @@ void allocate(MetalBackend &backend, MoeBuffers &m, const MoePlan &plan) {
     m.scratch.*field.buffer = zeros(backend, w.*field.bytes, "moe-scratch");
 }
 
-int timing(MetalBackend &backend, uint32_t rounds) {
+int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFormat) {
   constexpr uint32_t H = 2048, I = 512, E = 256, kRowsMax = 2048;
-  const MoeShape affineShape{H, E, 8, I}, ggufShape{H, E, 8, I, WeightLayout::Block32};
+  // gate and up hold most of the routed expert weights.
+  const MoeShape affineShape{H, E, 8, I}, ggufShape{H, E, 8, I, WeightLayout::Block32, uint32_t(gateUpFormat)};
   std::mt19937 local(9);
   // Affine: random Q4 slabs with finite scales, the router and shared gate of the routing fixture.
   const auto affineExperts = [&](uint32_t experts, uint32_t n, uint32_t k) {
@@ -126,7 +128,7 @@ int timing(MetalBackend &backend, uint32_t rounds) {
       .sharedDown = affineExperts(1, H, I),
       .sharedScalarGate = affineRouter(false),
   };
-  // GGUF: the same routing in an F32 router, experts in the 35B UD-Q4_K_M formats.
+  // GGUF: the same routing in an F32 router.
   const auto planes = [&](Fmt f, uint32_t rows, uint32_t k) {
     std::uniform_real_distribution<float> d(0.0005f, 0.004f);
     const std::vector<uint8_t> native = makeNative(f, rows, k, local, [&] { return f2h(d(local)); });
@@ -138,9 +140,9 @@ int timing(MetalBackend &backend, uint32_t rounds) {
   const QuantizedSegment sharedGateSegment = floatSegment(backend, sharedGate, 1, H);
   MoeWeights gguf;
   gguf = BlockMoeWeights{routerSegment, sharedGateSegment,
-                             {planes(Q4K, E * I, H), planes(Q80, I, H)},
-                             {planes(Q4K, E * I, H), planes(Q80, I, H)},
-                             {planes(Q5K, E * H, I), planes(Q80, H, I)}};
+                             {planes(gateUpFormat, E * I, H), planes(Q80, I, H)},
+                             {planes(gateUpFormat, E * I, H), planes(Q80, I, H)},
+                             {planes(downFormat, E * H, I), planes(Q80, H, I)}};
   // Rows route to 8 of a pool of 24 experts per lane of 8 rows (decode) or of all 256 (prefill).
   const auto input = [&](uint32_t rows, uint32_t pool) {
     std::uniform_real_distribution<float> unit(-1.0f, 1.0f);
@@ -172,7 +174,7 @@ int timing(MetalBackend &backend, uint32_t rounds) {
     std::sort(samples.begin(), samples.end());
     return samples[samples.size() / 2];
   };
-  const MoeGgufTile device = splash::ops::moeGgufTile(backend.capabilities().appleGpuFamily);
+  const MoeGgufTile device = splash::ops::moeGgufTile(backend.capabilities().appleGpuFamily, ggufShape);
   const MoeGgufTile other = device == MoeGgufTile::Register ? MoeGgufTile::Staged : MoeGgufTile::Register;
   printf("%s, GPU family %u, %u cores: median GPU ms per MoE layer of %u rounds\n",
          backend.capabilities().deviceName.c_str(), backend.capabilities().appleGpuFamily,
@@ -224,13 +226,14 @@ int timing(MetalBackend &backend, uint32_t rounds) {
 
 int main(int argc, const char *argv[]) {
   @autoreleasepool {
-    if (argc < 2 || argc > 3) {
-      std::cerr << "usage: gguf-moe-benchmark <metallib> [rounds]\n";
+    const Fmt gateUp = argc > 3 ? fmtNamed(argv[3]) : Q4K, down = argc > 4 ? fmtNamed(argv[4]) : Q5K;
+    if (argc < 2 || argc > 5 || gateUp == FMT_COUNT || down == FMT_COUNT) {
+      std::cerr << "usage: gguf-moe-benchmark <metallib> [rounds] [gate/up format] [down format]\n";
       return 2;
     }
     try {
       MetalBackend backend(argv[1]);
-      return timing(backend, argc > 2 ? std::stoul(argv[2]) : 20);
+      return timing(backend, argc > 2 ? std::stoul(argv[2]) : 20, gateUp, down);
     } catch (const std::exception &error) {
       std::cerr << "gguf-moe-benchmark: " << error.what() << '\n';
       return 1;

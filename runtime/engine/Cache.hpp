@@ -216,6 +216,13 @@ public:
   // Empty backing, older publications and state-free KV are still reclaimed.
   [[nodiscard]] uint64_t reclaimCache(uint64_t targetBytes, bool evictAll,
                                       bool keepResumePoint = false);
+  // reclaimCache's stop rule: releasedBytes and the pages whose copies are
+  // being written meet targetBytes. A pass with evictAll has no target.
+  [[nodiscard]] bool reclaimMet(uint64_t releasedBytes, uint64_t targetBytes,
+                                bool evictAll) const noexcept;
+  // A KV demotion, a KV restore or the one state write is in flight, so
+  // memory or quota returns by itself and its completion wakes the engine.
+  [[nodiscard]] bool transfersInFlight() const noexcept;
   // One bounded reclaim step for an allocation retry. Progress is distinct
   // from physical bytes because evicting a KV reference can make a resident
   // page reusable without immediately emptying its extent.
@@ -327,9 +334,6 @@ private:
   // the disk holds nothing to give.
   [[nodiscard]] bool freeDiskSpace();
   void startRestore(uint64_t block);
-  // A KV copy, a KV write or the one state write is in flight, so memory or
-  // quota returns by itself and its completion wakes the engine.
-  [[nodiscard]] bool transfersInFlight() const noexcept;
   [[nodiscard]] uint64_t pendingBytes() const noexcept;
   [[nodiscard]] uint64_t reclaimEmptyExtents();
 

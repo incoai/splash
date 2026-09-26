@@ -445,17 +445,19 @@ every tensor the loader reads with a type it accepts for that tensor
 quantized types to `runtime/metal/abi/QuantFormat.h`). The native loader checks again
 and lists every unsupported tensor in one error:
 
-- linears and experts: Q4_K, Q5_K, Q6_K, Q3_K, IQ4_XS, IQ4_NL, Q8_0 or IQ3_S;
-- token embeddings: Q4_K, Q6_K or Q8_0;
+- linears and experts: Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, Q4_1,
+  IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL or
+  MXFP4;
+- token embeddings: Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, Q4_0 or Q4_1;
 - norms, the MoE router and shared-expert scalar gate, and the GDN
   convolution, decay and time-step bias: F32;
 - GDN alpha and beta: both Q8_0 or both F32.
 
-Of Unsloth's files in September 2026 that covers, for Qwen3.8-27B, UD-Q4_K_M
-and every larger file but Q4_1, UD-Q8_K_XL and BF16, and for Qwen3.6-35B-A3B,
-UD-IQ4_XS and every larger file but MXFP4_MOE, UD-Q8_K_XL and BF16. The smaller
-files need IQ3_XXS, IQ2, IQ1 or Q2_K kernels and the others Q4_0/Q4_1, MXFP4 or
-BF16 ones, which do not exist yet.
+Of Unsloth's files in September 2026 that covers every file of Qwen3.8-27B
+and Qwen3.6-35B-A3B, from UD-IQ1_S up, but UD-Q8_K_XL and BF16, whose BF16
+tensors need kernels that do not exist yet. A format's image takes the bits
+per weight of its GGUF blocks, but for Q3_K's and Q6_K's padded meta units
+(1/16 bit more) and IQ3_S's chunk words (4.06 bits for its 3.44).
 
 At load time the engine validates the GGUF metadata, including the rotary
 embedding and norm epsilon the kernels assume (`rope.freq_base`,
@@ -480,20 +482,25 @@ Apple9 (M3, M4) the register tile (`LinearTile::GgufRegister`) runs the kernels 
 bf16 matrix operations with one fp32 epilogue per coefficient group, so every output is the bf16
 rounding of its fp32-accumulated sum. They read their activations as the Table16 table
 (`kernels/common/gguf_sgmatrix.h`) that the input's producer writes, or
-`decode_linear_gguf_prepare` when none did. On Apple10 (M5) the staged tile
+`decode_linear_gguf_prepare` when none did. The formats whose operands those kernels build from
+grid lookups, IQ3_XXS, the IQ2 formats and IQ1 (`apple9StagesFormat`), and Q2_K from two lanes
+decode faster on the staged tile there, which a projection all of whose segments are in them
+takes wherever the tile holds its lanes' rows unpadded. On Apple10 (M5) the staged tile
 (`LinearTile::GgufStaged`) runs the kernels of `runtime/metal/kernels/shared/gguf_linear.metal`,
 which dequantize each weight once to half in threadgroup memory (`kernels/common/gguf_staged.h`)
 for MPP `matmul2d`, the neural accelerator's path, on bf16 activations; a step of three request
 lanes runs the 32-row tile over four lanes of storage. Prefill runs the staged kernels on both
 families, chunks of up to 32 rows on the decode tiles. Every projection splits its K across
 threadgroups by one rule (`decodeSplits`: each tile's tiers of threadgroups per core and inputs
-per partition, from measured occupancy) that does not depend on the batch width. The MoE experts
-(`runtime/ops/MoE.cpp`) run the same numerics per family over the grouped rows: the register form
-in `linear_gguf_sgmatrix.metal`, the staged one in `kernels/shared/moe_gguf.metal`. The float
-router and alpha/beta projections run in `kernels/shared/gguf_float.metal`, and the token rows are
-gathered by one template in `kernels/shared/embedding.metal`. These plans are fixed rules of GPU
-family, core count and shape: `Linear::setChoices` and `ExecutionPlans::install` reject tuned
-entries for block projections and GGUF MoE blocks.
+per partition, from measured occupancy, Apple9's staged tile taking the register tile's) that
+does not depend on the batch width. The MoE experts (`runtime/ops/MoE.cpp`) run the same numerics
+per family over the grouped rows: the register form in `linear_gguf_sgmatrix.metal`, the staged
+one in `kernels/shared/moe_gguf.metal`, which Apple9 takes for experts mostly in the formats it
+stages (`MoeShape::expertFormat`). The float router and alpha/beta projections run in
+`kernels/shared/gguf_float.metal`, and the token rows are gathered by one template in
+`kernels/shared/embedding.metal`. These plans are fixed rules of GPU family, core count, shape and
+format: `Linear::setChoices` and `ExecutionPlans::install` reject tuned entries for block
+projections and GGUF MoE blocks.
 
 A GGUF kernel of one quantized tensor names its epilogue last: `a` none, `r` residual, `g` the
 up pass with the silu gate. The staged ones are `gguf_decode_<format>_m<rows>_<e>` and
@@ -695,6 +702,14 @@ not guarantee that a request-sized allocation fits.
 plus draft ring) and KV pages. Default: `0` (off). RAM and disk copies share the
 same block tree and recency order. Restoring a prefix keeps its disk copy, so
 its next eviction needs no write while that copy remains cached.
+
+Without the tier, a request that runs out of memory cannot publish its progress
+checkpoints and replays its prompt after each suspension. With the tier off,
+startup suggests it in one line when memory may not hold the advertised
+context: the memory plan within what the host had available at startup beyond
+its reserve and the warning margin (`EngineMemoryPlan::contextTokensWithin`).
+The estimate is conservative, since macOS compresses other applications further
+once the engine loads. The tier does not raise the context limit.
 
 Writes happen when RAM reclamation selects a victim. States copy through one
 host staging buffer, freeing their RAM immediately. KV leaves needed by a state

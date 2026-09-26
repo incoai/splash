@@ -22,6 +22,8 @@ public:
   // Every file's cache identity and size, layers first, for the model's disk
   // check before the first file is written.
   [[nodiscard]] std::span<const PreparedWeight> weights() const noexcept;
+  // Writes every missing file and maps none.
+  void prepare();
   [[nodiscard]] WeightFile layer(uint32_t index);
   [[nodiscard]] WeightFile model();
 

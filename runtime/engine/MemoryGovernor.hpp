@@ -15,15 +15,28 @@ struct HostMemoryPages {
   uint64_t speculative = 0;
   uint64_t fileBacked = 0;
   uint64_t purgeable = 0;
+  // Anonymous pages outside the compressor, and the compressor's own pages
+  // and the pages it holds, whose ratio is what compressing them saves.
+  uint64_t anonymous = 0;
+  uint64_t compressor = 0;
+  uint64_t compressed = 0;
 };
 
-// The pages macOS can hand out without compressing or swapping: free pages
-// plus pageable file-backed and purgeable pages, regardless of
-// active/inactive status. Memory in no VM queue (the firmware carve-out, tag
-// storage) is never available. The governor also enforces the engine
-// budget, host reserve and system pressure.
+// The pages macOS can hand out without swapping: free pages plus pageable
+// file-backed and purgeable pages, regardless of active/inactive status,
+// and, with compression, what compressing the anonymous pages frees at the
+// compressor's present ratio, counted at most at 2:1 (half of them; 2:1 also
+// while the compressor holds nothing). Memory in no VM queue (the firmware
+// carve-out, tag storage) is never available. The governor also enforces
+// the engine budget, host reserve and system pressure.
 [[nodiscard]] uint64_t estimateHostAvailableMemory(
-    const HostMemoryPages &pages, uint64_t pageSize) noexcept;
+    const HostMemoryPages &pages, uint64_t pageSize,
+    bool compression = false) noexcept;
+// The live estimate, counting compression unless macOS reports critical
+// memory pressure (or none): a Mac that uses its compressor as designed keeps
+// serving, the credit shrinking as the anonymous pages it counts are
+// compressed, and one in critical pressure falls back to the pages it can
+// hand out as they are.
 [[nodiscard]] std::optional<uint64_t> queryHostAvailableMemory() noexcept;
 
 enum class MemoryPressure : uint8_t {
@@ -82,6 +95,24 @@ struct MemoryReclaimDirective {
   bool keepResumePoint = false;
 };
 
+// What a reclaim pass made of its directive's target.
+enum class ReclaimOutcome : uint8_t {
+  // The directive set none; the pass returned only empty backing.
+  Untargeted,
+  // Released, counting the pages whose copies are being written.
+  Met,
+  // Transfers or a release in flight hold back the rest, which a pass can
+  // take once they land.
+  Pending,
+  // Nothing is left to release.
+  Exhausted,
+};
+
+struct MemoryReclaimResult {
+  uint64_t releasedBytes = 0;
+  ReclaimOutcome outcome = ReclaimOutcome::Untargeted;
+};
+
 // Bounded shrink passes separated by a telemetry settling interval. New host
 // pressure is never offset by bytes reclaimed earlier in the same episode.
 class MemoryPressurePolicy final {
@@ -91,9 +122,15 @@ public:
   [[nodiscard]] MemoryReclaimDirective
   update(const MemoryGovernorSnapshot &snapshot, double nowMilliseconds,
          bool requestWaiting) noexcept;
+  // What the pass of `directive` achieved. The passes up to the next
+  // measurement continue the part of its target that transfers held back:
+  // a KV chain gives up one leaf at a time, each after its copy is written.
+  void reclaimed(const MemoryReclaimDirective &directive,
+                 const MemoryReclaimResult &result) noexcept;
 
 private:
   double nextReclaimMilliseconds_ = 0.0;
+  std::optional<MemoryReclaimDirective> continued_;
 };
 
 // The sole physical-memory admission ledger. It does not allocate, evict, or
@@ -144,6 +181,13 @@ public:
   // reverse dependency on engine policy.
   [[nodiscard]] metal::AllocationAdmission allocationAdmission() noexcept;
   void setPressure(MemoryPressure pressure) noexcept;
+  // The outcome of the engine's last reclaim pass with a target. While one
+  // finds nothing left to release, the hold for the recovery margin is
+  // waived: growth that clears the warning margin proceeds, since only other
+  // applications could restore the rest, and the paced passes keep looking.
+  // A pass that releases or waits for memory again, or the host's recovery,
+  // ends the waiver.
+  void reclaimed(ReclaimOutcome outcome) noexcept;
   [[nodiscard]] MemoryGovernorSnapshot snapshot() const noexcept;
 
 private:
@@ -156,6 +200,10 @@ private:
   [[nodiscard]] MemoryPressure updateEffectivePressure(
       const std::optional<uint64_t> &hostAvailable,
       uint64_t reservedBytes) const noexcept;
+  // Growth waits for the recovery margin.
+  [[nodiscard]] bool hostHeld() const noexcept {
+    return hostConstrained_ && !reclaimExhausted_;
+  }
   void release(uint64_t bytes) noexcept;
 
   metal::MetalBackend &backend_;
@@ -168,6 +216,8 @@ private:
   uint64_t deniedReservations_ = 0;
   MemoryPressure systemPressure_ = MemoryPressure::Normal;
   mutable bool hostConstrained_ = false;
+  // Reclaim found nothing to release in this episode of host pressure.
+  mutable bool reclaimExhausted_ = false;
 };
 
 } // namespace splash::engine
