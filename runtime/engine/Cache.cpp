@@ -374,12 +374,14 @@ CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode,
       return {true, bytes};
   }
 
-  // Oldest first across both kinds. A state whose write must wait for the
-  // one in flight stays, as does a KV leaf the ring cannot take now; the
-  // other kind may still give, and the next pass takes what waited.
-  const std::optional<CacheEvictionCandidate> state =
+  // Oldest first across both kinds, after the checkpoints, which are
+  // disposable. A state whose write must wait for the one in flight stays,
+  // as does a KV leaf the ring cannot take now; the other kind may still
+  // give, and the next pass takes what waited. A waiting checkpoint holds
+  // back neither kind.
+  std::optional<CacheEvictionCandidate> state =
       states_.evictionCandidate(keepResumePoint);
-  const bool checkpoint = state && states_.checkpoint(state->id);
+  bool checkpoint = state && states_.checkpoint(state->id);
   bool stateOpen = state.has_value();
   bool kvOpen = !checkpoint;
   bool pending = false;
@@ -394,6 +396,13 @@ CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode,
         throw std::logic_error("state eviction candidate became pinned");
       stateOpen = false;
       pending = pending || transfersInFlight();
+      if (checkpoint) {
+        checkpoint = false;
+        state = states_.evictionCandidate(keepResumePoint, false);
+        stateOpen = state.has_value();
+        kvOpen = true;
+        kv = oldestKvLeaf(0);
+      }
       continue;
     }
     switch (reclaimKvLeaf(kv->id)) {

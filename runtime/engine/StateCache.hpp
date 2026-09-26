@@ -138,9 +138,9 @@ public:
   // A RAM copy exists.
   [[nodiscard]] bool resident(uint64_t kvBlock) const noexcept;
   // Oldest RAM copy to free; unpinned checkpoints precede ordinary states
-  // regardless of recency.
+  // regardless of recency. Without checkpoints, the oldest ordinary state.
   [[nodiscard]] std::optional<CacheEvictionCandidate>
-  evictionCandidate(bool keepResumePoint = false) const noexcept;
+  evictionCandidate(bool keepResumePoint = false, bool checkpoints = true) const noexcept;
   // Frees an unpinned RAM copy: for nothing when a disk copy exists, by
   // writing one when the tier takes it (makeRoom frees quota on its behalf;
   // a disposable checkpoint takes free quota only), by dropping the state

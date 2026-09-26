@@ -1879,6 +1879,43 @@ void testSecondStateWaitsForTheWrite() {
           "second write did not land beside the first");
 }
 
+// A checkpoint goes first, but one whose write must wait for the one in
+// flight holds back nothing else: the KV leaves and ordinary states behind
+// it go in recency order meanwhile, and the pass after the write takes it.
+void testWaitingCheckpointHoldsBackNothingElse() {
+  constexpr auto reuse = CacheReclaimMode::ReuseBacking;
+  CacheFixture fixture;
+  auto control = std::make_shared<TransferControl>();
+  fixture.cache.publishCompositeState(fixture.blocks[0], std::make_shared<TieredState>(control));
+  require(fixture.cache.reclaimOneState(), "first state was not written");
+  fixture.publish(2);
+  fixture.cache.publishCompositeState(fixture.blocks[1], std::make_shared<TieredState>(control),
+                                      true);
+  // The idle tail is the oldest and needs no transfer; the ordinary state
+  // cannot be written and goes next, then the leaf it stood on.
+  require(fixture.cache.reclaimOne(reuse).madeProgress &&
+              fixture.cache.snapshot().kvCache.blocks == 3,
+          "the waiting checkpoint held back an idle KV tail");
+  require(fixture.cache.reclaimOne(reuse).reclaimedBytes == 100 &&
+              fixture.cache.snapshot().stateCache.entries == 2,
+          "the waiting checkpoint held back an ordinary state");
+  require(fixture.cache.reclaimOne(reuse).madeProgress &&
+              fixture.cache.snapshot().kvCache.blocks == 2,
+          "the waiting checkpoint held back the leaf a state left");
+  const CacheReclaimResult waiting = fixture.cache.reclaimOne(reuse);
+  auto stats = fixture.cache.snapshot().stateCache;
+  require(!waiting.madeProgress && waiting.pending && stats.bytes == 100 &&
+              stats.checkpointEntries == 1 && stats.checkpointEvictions == 0,
+          "the checkpoint did not wait for the write in flight");
+  control->ready = true;
+  require(fixture.cache.pollTransfers() && fixture.cache.reclaimOne(reuse).reclaimedBytes == 100,
+          "the checkpoint was not written after the first landed");
+  stats = fixture.cache.snapshot().stateCache;
+  require(stats.offloads == 2 && stats.bytes == 0 && stats.checkpointEntries == 1 &&
+              control->slots == 2,
+          "the checkpoint did not land beside the first write");
+}
+
 // A refusal ends the scan: the ring is full for every leaf alike, so one
 // attempt costs one refusal, not one per cached block.
 void testRefusedRingStopsTheScan() {
@@ -2432,6 +2469,7 @@ int main() {
     testUnusableTierDropsTheLeafInstead();
     testStateLeavesWithALeafTheTierCannotKeep();
     testSecondStateWaitsForTheWrite();
+    testWaitingCheckpointHoldsBackNothingElse();
     testRefusedRingStopsTheScan();
     testRestoresInFlightMakeAShortfallPending();
     testParentOfDiskChildrenSurvivesRefusal();

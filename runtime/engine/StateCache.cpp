@@ -243,9 +243,10 @@ bool StateCache::resident(uint64_t kvBlock) const noexcept {
 }
 
 std::optional<CacheEvictionCandidate>
-StateCache::evictionCandidate(bool keepResumePoint) const noexcept {
+StateCache::evictionCandidate(bool keepResumePoint, bool checkpoints) const noexcept {
   const uint64_t kept = keepResumePoint ? resumePoint() : 0;
-  for (const auto candidate : {checkpoints_.oldest(), ordinary_.oldest()})
+  for (const auto candidate :
+       {checkpoints ? checkpoints_.oldest() : std::nullopt, ordinary_.oldest()})
     if (candidate && candidate->id != kept)
       return candidate;
   return std::nullopt;
