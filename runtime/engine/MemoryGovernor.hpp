@@ -181,6 +181,13 @@ public:
   // reverse dependency on engine policy.
   [[nodiscard]] metal::AllocationAdmission allocationAdmission() noexcept;
   void setPressure(MemoryPressure pressure) noexcept;
+  // The outcome of the engine's last reclaim pass with a target. While one
+  // finds nothing left to release, the hold for the recovery margin is
+  // waived: growth that clears the warning margin proceeds, since only other
+  // applications could restore the rest, and the paced passes keep looking.
+  // A pass that releases or waits for memory again, or the host's recovery,
+  // ends the waiver.
+  void reclaimed(ReclaimOutcome outcome) noexcept;
   [[nodiscard]] MemoryGovernorSnapshot snapshot() const noexcept;
 
 private:
@@ -193,6 +200,10 @@ private:
   [[nodiscard]] MemoryPressure updateEffectivePressure(
       const std::optional<uint64_t> &hostAvailable,
       uint64_t reservedBytes) const noexcept;
+  // Growth waits for the recovery margin.
+  [[nodiscard]] bool hostHeld() const noexcept {
+    return hostConstrained_ && !reclaimExhausted_;
+  }
   void release(uint64_t bytes) noexcept;
 
   metal::MetalBackend &backend_;
@@ -205,6 +216,8 @@ private:
   uint64_t deniedReservations_ = 0;
   MemoryPressure systemPressure_ = MemoryPressure::Normal;
   mutable bool hostConstrained_ = false;
+  // Reclaim found nothing to release in this episode of host pressure.
+  mutable bool reclaimExhausted_ = false;
 };
 
 } // namespace splash::engine

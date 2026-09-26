@@ -215,7 +215,7 @@ MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure *failure) {
   // so the paced reclaim frees toward the recovery margin for it.
   if (engineFits && !hostFits)
     hostConstrained_ = true;
-  if (!engineFits || !hostFits || hostConstrained_ ||
+  if (!engineFits || !hostFits || hostHeld() ||
       pressure == MemoryPressure::Critical) {
     if (failure)
       *failure = !engineFits ? metal::AllocationFailure::EngineBudget
@@ -252,6 +252,13 @@ void MemoryGovernor::setPressure(MemoryPressure pressure) noexcept {
   systemPressure_ = pressure;
 }
 
+void MemoryGovernor::reclaimed(ReclaimOutcome outcome) noexcept {
+  if (outcome == ReclaimOutcome::Untargeted)
+    return;
+  std::lock_guard lock(mutex_);
+  reclaimExhausted_ = outcome == ReclaimOutcome::Exhausted;
+}
+
 MemoryGovernorSnapshot MemoryGovernor::snapshot() const noexcept {
   std::lock_guard lock(mutex_);
   uint64_t observed = observedResidentBytes();
@@ -266,7 +273,7 @@ MemoryGovernorSnapshot MemoryGovernor::snapshot() const noexcept {
   MemoryPressure effectivePressure = updateEffectivePressure(
       hostAvailable, reservedBytes_);
   bool hostGrowthAllowed = effectivePressure != MemoryPressure::Critical &&
-      !hostConstrained_ && hostHeadroom >= kHostWarningMarginBytes;
+      !hostHeld() && hostHeadroom >= kHostWarningMarginBytes;
   bool growthAllowed = hostGrowthAllowed && used < limitBytes_;
   return {
       limitBytes_,
@@ -295,6 +302,7 @@ MemoryPressure MemoryGovernor::updateEffectivePressure(
   hostConstrained_ = !hostAvailable ||
       hostHeadroom < kHostWarningMarginBytes ||
       (hostConstrained_ && hostHeadroom < kHostRecoveryMarginBytes);
+  reclaimExhausted_ = reclaimExhausted_ && hostConstrained_;
   MemoryPressure next = MemoryPressure::Normal;
   if (systemPressure_ == MemoryPressure::Critical) {
     next = MemoryPressure::Critical;

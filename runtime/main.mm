@@ -389,6 +389,7 @@ int runNative(const NativeArguments &arguments) {
     const engine::MemoryReclaimResult reclaim =
         published->nativeLoop().reclaimMemory(directive);
     pressurePolicy.reclaimed(directive, reclaim);
+    governor.reclaimed(reclaim.outcome);
     static_cast<void>(resources.backend().refreshMemoryStats());
     // KV backing is returned one extent at a time, and a target that
     // transfers held back continues as they land. Ask to run again at the

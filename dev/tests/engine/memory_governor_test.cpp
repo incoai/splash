@@ -284,6 +284,42 @@ void testPolicyContinuesHeldBackTarget() {
   require(pass(2300.0, none) == 0, "evicting everything was continued after critical pressure");
 }
 
+// With nothing left to reclaim, the hold for the recovery margin could only be
+// lifted by other applications: every request, however small, would wait.
+// While reclaim reports that, growth that clears the warning margin proceeds
+// and a request beyond it holds no other. A pass that finds memory again, or
+// a new episode of host pressure, brings the hold back.
+void testExhaustedReclaimWaivesTheHold() {
+  metal::statistics = {};
+  metal::statistics.allocatedBytes = 12 * kGiB;
+  metal::statistics.deviceCurrentAllocatedBytes = 12 * kGiB;
+  metal::MetalBackend backend("unused");
+  const uint64_t hostReserve = 2 * kGiB;
+  std::optional<uint64_t> available = hostReserve + kGiB + kGiB / 2;
+  MemoryGovernor governor(backend, 40 * kGiB, hostReserve, [&available] { return available; });
+  metal::AllocationFailure failure;
+  require(!governor.tryReserve(kGiB, &failure) && failure == metal::AllocationFailure::HostPressure,
+          "growth past the warning margin was admitted");
+  governor.reclaimed(ReclaimOutcome::Untargeted);
+  require(!governor.tryReserve(100 * kMiB) && !governor.snapshot().hostGrowthAllowed,
+          "the host refusal did not hold growth for the recovery margin");
+  governor.reclaimed(ReclaimOutcome::Exhausted);
+  require(governor.snapshot().hostGrowthAllowed && governor.tryReserve(100 * kMiB).has_value(),
+          "growth within the warning margin still waited after reclaim was exhausted");
+  require(!governor.tryReserve(kGiB, &failure) && failure == metal::AllocationFailure::HostPressure &&
+              governor.snapshot().pressure == MemoryPressure::Warning &&
+              governor.tryReserve(100 * kMiB).has_value(),
+          "a request past the warning margin was admitted or held the others");
+  governor.reclaimed(ReclaimOutcome::Pending);
+  require(!governor.tryReserve(100 * kMiB), "the hold did not return with memory to reclaim");
+  governor.reclaimed(ReclaimOutcome::Exhausted);
+  available = hostReserve + 3 * kGiB;
+  require(governor.snapshot().pressure == MemoryPressure::Normal, "the host did not recover");
+  available = hostReserve + kGiB + kGiB / 2;
+  require(!governor.tryReserve(kGiB) && !governor.tryReserve(100 * kMiB),
+          "an earlier episode's exhausted reclaim waived the hold");
+}
+
 } // namespace
 
 int main() {
@@ -292,6 +328,7 @@ int main() {
     testAdvertisedContextIsGrantable();
     testHostRefusalStartsReclaim();
     testPolicyContinuesHeldBackTarget();
+    testExhaustedReclaimWaivesTheHold();
     std::cout << "memory governor tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {
