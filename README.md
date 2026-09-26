@@ -19,7 +19,12 @@ there is nothing to configure.
 Apple M3 or newer, macOS 26.4 or later, [Homebrew](https://brew.sh), 36 GB
 of unified memory (48 GB or more recommended), and free disk for the model,
 its draft and a prepared copy of their weights (up to about 40 GB in total for
-Qwen3.8-27B and 48 GB for Qwen3.6-35B-A3B).
+Qwen3.8-27B and 48 GB for Qwen3.6-35B-A3B). Macs with 24 GB run the smaller
+GGUF files: on a 24 GB M6 (12-core GPU), `unsloth/Qwen3.8-27B-GGUF:UD-IQ3_XXS`
+with its DFlash2 draft advertises a 102,393-token context and decodes code at
+43.5 tok/s, and `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q2_K_XL` advertises the full
+256K context and decodes at about 100 tok/s. Where memory cannot hold a long
+context, startup suggests `--max-cache-disk`.
 
 ```bash
 brew install incoai/tap/splash
