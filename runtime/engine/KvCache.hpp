@@ -149,9 +149,10 @@ public:
   // without children.
   [[nodiscard]] std::optional<CacheEvictionCandidate>
   diskCandidate(bool duplicate) const noexcept;
-  // The blocks below a block, each after its children; empty when one of
-  // them is in transfer or in use. Below a resident leaf they are disk-only;
-  // below a poisoned block some may be resident.
+  // The blocks below a block, each after its children, visiting only that
+  // subtree; empty when one of them is in transfer or in use. Below a
+  // resident leaf they are disk-only; below a poisoned block some may be
+  // resident.
   [[nodiscard]] std::vector<uint64_t> subtree(uint64_t blockId) const;
   // Only a block without children, users or transfer can be removed. The
   // caller handles any composite state attached to it first.
@@ -163,6 +164,11 @@ private:
   struct Block {
     uint64_t id = 0;
     uint64_t parent = 0;
+    // Blocks come and go only as leaves, so insert and erase keep these
+    // links in O(1) and subtree() never scans the whole cache.
+    uint64_t firstChild = 0;
+    uint64_t previousSibling = 0;
+    uint64_t nextSibling = 0;
     uint64_t indexHash = 0;
     std::array<uint32_t, pageTokens> tokens{};
     ImageIdentity images;

@@ -310,6 +310,84 @@ void testCandidateOrderThroughChurn() {
           "candidate churn leaked a block or physical reference");
 }
 
+// On random trees grown by inserts and shrunk by leaf erasures, subtree()
+// returns every block below each block, each before its parent, or nothing
+// while one of them is in use.
+void testSubtreeThroughChurn() {
+  constexpr uint32_t steps = 1000;
+  test::TestKvBacking backing(1, 100);
+  KvPool pool(backing);
+  CacheRecency recency;
+  KvCache cache(pool, cacheNamespace(), recency);
+  struct Reference {
+    uint64_t parent = 0;
+    bool live = false;
+    bool used = false;
+  };
+  std::vector<Reference> blocks(steps + 1);
+  uint64_t inserted = 0;
+  std::mt19937 random(907);
+  for (uint32_t step = 0; step < steps; ++step) {
+    const uint64_t pick = inserted ? 1 + random() % inserted : 0;
+    const bool live = pick && blocks[pick].live;
+    switch (random() % 5) {
+    case 0:
+    case 1: {
+      // Every block shares page 0: only the shape of the tree matters here.
+      const uint64_t parent = live ? pick : 0;
+      const auto result = cache.insert(parent, page(step + 1), 0);
+      require(result.inserted && result.id == ++inserted, "unexpected test block identity");
+      blocks[result.id] = {parent, true};
+      break;
+    }
+    case 2:
+    case 3:
+      if (live && !blocks[pick].used &&
+          std::none_of(blocks.begin(), blocks.end(), [&](const Reference &other) {
+            return other.live && other.parent == pick;
+          })) {
+        cache.erase(pick);
+        blocks[pick].live = false;
+      }
+      break;
+    case 4:
+      if (!live) break;
+      if (blocks[pick].used)
+        cache.releaseActive(pick);
+      else
+        cache.retainActive(pick);
+      blocks[pick].used = !blocks[pick].used;
+      break;
+    }
+    std::vector<std::vector<uint64_t>> below(inserted + 1);
+    std::vector<bool> busy(inserted + 1);
+    for (uint64_t id = 1; id <= inserted; ++id) {
+      if (!blocks[id].live) continue;
+      for (uint64_t above = blocks[id].parent; above; above = blocks[above].parent) {
+        below[above].push_back(id);
+        busy[above] = busy[above] || blocks[id].used;
+      }
+    }
+    for (uint64_t id = 1; id <= inserted; ++id) {
+      if (!blocks[id].live) continue;
+      const std::vector<uint64_t> order = cache.subtree(id);
+      for (auto at = order.begin(); at != order.end(); ++at)
+        require(blocks[*at].parent == id ||
+                    std::find(at + 1, order.end(), blocks[*at].parent) != order.end(),
+                "subtree listed a block before one of its children");
+      std::vector<uint64_t> sorted = order;
+      std::sort(sorted.begin(), sorted.end());
+      require(busy[id] ? order.empty() : sorted == below[id],
+              "subtree disagrees with the reference tree");
+    }
+  }
+  for (uint64_t id = 1; id <= inserted; ++id)
+    if (blocks[id].live && blocks[id].used) cache.releaseActive(id);
+  while (auto candidate = cache.evictionCandidate()) cache.erase(candidate->id);
+  require(cache.snapshot().blocks == 0 && pool.freePageCount() == pool.pageCount(),
+          "subtree churn leaked a block or a page reference");
+}
+
 void testHashCollisionStillRequiresExactTokens() {
   const auto left = page(7);
   auto right = left;
@@ -485,6 +563,7 @@ int main() {
     testErasedLeafParentInheritsRecency();
     testInputValidation();
     testCandidateOrderThroughChurn();
+    testSubtreeThroughChurn();
     testHashCollisionStillRequiresExactTokens();
     testDiskTierTransitions();
     testDiskOnlyAdoptionAndPoison();

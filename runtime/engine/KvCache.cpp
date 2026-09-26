@@ -159,13 +159,17 @@ KvCache::InsertResult KvCache::insert(uint64_t parentBlock,
   }
   const uint64_t id = nextBlockId_++;
   ++residentBlocks_;
+  Block &placed = block(id);
   if (parentBlock) {
     Block &parent = block(parentBlock);
     ++parent.children;
     ++parent.residentChildren;
+    if (parent.firstChild)
+      block(parent.firstChild).previousSibling = id;
+    placed.nextSibling = parent.firstChild;
+    parent.firstChild = id;
     reindex(parent);
   }
-  Block &placed = block(id);
   placed.lastUsed = recency_.next();
   reindex(placed);
   ++generation_;
@@ -373,10 +377,6 @@ KvCache::diskCandidate(bool duplicate) const noexcept {
 }
 
 std::vector<uint64_t> KvCache::subtree(uint64_t blockId) const {
-  std::unordered_map<uint64_t, std::vector<uint64_t>> children;
-  for (const auto &[id, entry] : blocks_)
-    if (entry.parent)
-      children[entry.parent].push_back(id);
   std::vector<uint64_t> order;
   std::vector<std::pair<uint64_t, bool>> pending{{blockId, false}};
   while (!pending.empty()) {
@@ -391,9 +391,8 @@ std::vector<uint64_t> KvCache::subtree(uint64_t blockId) const {
     if (id != blockId && (entry.transferring || entry.activeUsers))
       return {};
     pending.push_back({id, true});
-    if (const auto found = children.find(id); found != children.end())
-      for (uint64_t child : found->second)
-        pending.push_back({child, false});
+    for (uint64_t child = entry.firstChild; child; child = block(child).nextSibling)
+      pending.push_back({child, false});
   }
   return order;
 }
@@ -404,6 +403,8 @@ void KvCache::erase(uint64_t blockId) {
     throw std::logic_error("cannot evict a referenced KV cache block");
   }
   const uint64_t parentId = candidate.parent;
+  const uint64_t previous = candidate.previousSibling;
+  const uint64_t next = candidate.nextSibling;
   const uint64_t hash = candidate.indexHash;
   const uint32_t page = candidate.page;
   const uint64_t lastUsed = candidate.lastUsed;
@@ -426,6 +427,9 @@ void KvCache::erase(uint64_t blockId) {
     if (!parent.children)
       throw std::logic_error("KV child count underflowed");
     --parent.children;
+    (previous ? block(previous).nextSibling : parent.firstChild) = next;
+    if (next)
+      block(next).previousSibling = previous;
     if (page != noPage)
       --parent.residentChildren;
     inherit(parent, lastUsed);
