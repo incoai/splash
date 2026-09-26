@@ -888,7 +888,7 @@ class ClientLifecycleTests(unittest.TestCase):
         status = {"ready": True, "maximum_context_tokens": context}
         with (
             tempfile.TemporaryDirectory() as runtime,
-            mock.patch.object(launcher, "RUNTIME_DIR", Path(runtime)),
+            mock.patch.object(launcher, "PROFILES_DIR", Path(runtime)),
             mock.patch.object(
                 clients, "find_executable", return_value=f"/bin/{client}"
             ),
@@ -1046,6 +1046,33 @@ class ClientLifecycleTests(unittest.TestCase):
                 launcher.main([name])
             execute.assert_called_once()
             probe.assert_not_called()
+
+    def test_source_checkout_keeps_hermes_sessions_out_of_build(self):
+        # make clean removes build/, and a Hermes home there with it.
+        self.assertFalse(launcher.paths.PACKAGED)
+        model = {"id": MODEL, "owned_by": "splash", "input_modalities": ["text"]}
+        status = {"ready": True, "maximum_context_tokens": 102400}
+        for port in (launcher.PORT, launcher.PORT + 1):
+            with (
+                self.subTest(port=port),
+                mock.patch.dict(os.environ, {"SPLASH_PORT": str(port)}),
+                mock.patch.object(
+                    clients, "find_executable", return_value="/bin/hermes"
+                ),
+                # The launcher's own home; nothing is written into the checkout.
+                mock.patch.object(clients, "_write_hermes_profile") as write,
+                mock.patch.object(launcher, "_running_status", return_value=status),
+                mock.patch.object(
+                    launcher, "_request_json", return_value={"data": [model]}
+                ),
+                mock.patch.object(launcher.os, "execvpe") as execute,
+                mock.patch("sys.stdout", io.StringIO()),
+            ):
+                launcher.main(["hermes"])
+            home = Path(execute.call_args.args[2]["HERMES_HOME"])
+            write.assert_called_once_with(home, mock.ANY)
+            self.assertTrue(home.is_relative_to(launcher.ROOT))
+            self.assertFalse(home.is_relative_to(launcher.ROOT / "build"))
 
     def test_unready_server_never_launches_or_downloads(self):
         for payload in ([], ["--help"]):

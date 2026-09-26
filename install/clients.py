@@ -91,7 +91,7 @@ def command(
     base_url,
     model,
     context,
-    runtime_dir,
+    profiles_dir,
     environment=None,
     *,
     input_modalities,
@@ -131,7 +131,7 @@ def command(
         case "codex":
             argv = _codex(path, server, environment, client_args)
         case "hermes":
-            argv = _hermes(path, server, environment, client_args, runtime_dir)
+            argv = _hermes(path, server, environment, client_args, profiles_dir)
         case "pi":
             argv = _pi(path, server, environment, client_args)
         case _:
@@ -300,10 +300,10 @@ def _codex_config_args(arguments):
     return config, remaining
 
 
-def _hermes(path, server, environment, arguments, runtime_dir):
+def _hermes(path, server, environment, arguments, profiles_dir):
     # HERMES_HOME is Hermes's supported profile boundary. Keep sessions and
     # the complete default tool surface, without touching ~/.hermes/config.yaml.
-    home = runtime_dir / "hermes"
+    home = profiles_dir / "hermes"
     _write_hermes_profile(home, server)
     environment.update(
         HERMES_HOME=str(home),

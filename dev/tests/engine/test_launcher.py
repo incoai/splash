@@ -678,7 +678,7 @@ class LauncherTests(unittest.TestCase):
                             "PI_CODING_AGENT_DIR": str(Path(temporary) / "pi"),
                         },
                     ),
-                    mock.patch.object(launcher, "RUNTIME_DIR", Path(temporary)),
+                    mock.patch.object(launcher, "PROFILES_DIR", Path(temporary)),
                     mock.patch.object(
                         launcher.clients, "find_executable", return_value="/bin/echo"
                     ),
@@ -697,7 +697,7 @@ class LauncherTests(unittest.TestCase):
                             command.call_args.args[3:5], (MODEL_ID, 102400)
                         )
                         self.assertEqual(
-                            command.call_args.args[5], launcher._runtime_dir(port)
+                            command.call_args.args[5], launcher._profiles_dir(port)
                         )
                     self.assertEqual(
                         execute.call_count, len(launcher.clients.INSTALL_URLS)

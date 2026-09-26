@@ -166,6 +166,8 @@ class PackageTests(unittest.TestCase):
                     self.assertTrue(namespace["PACKAGED"])
                     self.assertEqual(namespace["BINARY"], prefix / "engine/splash")
                     self.assertEqual(namespace["PYTHON"], prefix / "python/bin/python3")
+                    # Hermes's sessions stay where earlier releases kept them.
+                    self.assertEqual(namespace["PROFILES"], namespace["RUNTIME"])
                     results.append((namespace["MODELS"], namespace["RUNTIME"]))
                 self.assertEqual(results[0], results[1])
                 self.assertTrue(results[0][0].is_relative_to(root / "home"))
