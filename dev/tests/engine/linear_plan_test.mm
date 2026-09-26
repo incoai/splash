@@ -17,9 +17,11 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -720,16 +722,21 @@ void affinePolicyLaws() {
     }
 }
 
-// A block projection of `segments` equal Q4_K segments tiling its columns;
-// planning reads only their geometry.
-Projection blockProjection(uint32_t n, uint32_t k, uint32_t segments) {
+// A block projection of equal segments tiling its columns, one per format;
+// planning reads only their geometry and formats.
+Projection blockProjection(uint32_t n, uint32_t k, std::span<const uint32_t> formats) {
   BlockWeights weights;
-  for (uint32_t i = 0; i < segments; ++i) {
-    QuantizedSegment s = QuantizedSegment::planes(GGUF_FMT_Q4K, n / segments, k, {}, {}, {});
-    s.columnOffset = i * (n / segments);
+  const uint32_t width = n / uint32_t(formats.size());
+  for (const uint32_t format : formats) {
+    QuantizedSegment s = QuantizedSegment::planes(format, width, k, {}, {}, {});
+    s.columnOffset = uint32_t(weights.segments.size()) * width;
     weights.segments.push_back(s);
   }
   return Projection(n, k, std::move(weights));
+}
+// ... of `segments` segments in `format`, Q4_K unless it says otherwise.
+Projection blockProjection(uint32_t n, uint32_t k, uint32_t segments, uint32_t format = GGUF_FMT_Q4K) {
+  return blockProjection(n, k, std::vector<uint32_t>(segments, format));
 }
 
 // fp32 destinations (the logits): the plan of a projection with an fp32
@@ -967,6 +974,63 @@ void ggufPlans() {
   require(m3.decodeScratchSize(registerDown).partials ==
               m3.plan(down, blockProjection(5120, 17408, 1)).scratchSize().partials,
           "Apple9 GGUF decode scratch bound");
+  // Apple9 stages the IQ2, IQ3_XXS and IQ1 formats wherever the staged tile
+  // holds the lanes' rows unpadded, and Q2_K from two lanes. A projection
+  // stages only when every quantized segment's format does; its plan binds
+  // the register tile's rows, and the decode scratch bound covers both tiles.
+  for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
+    const auto plan = [&](std::initializer_list<uint32_t> formats) {
+      const uint32_t n = uint32_t(formats.size()) * 1024;
+      return m3.plan({{n, 5120}, lanes * 8, LinearPhase::Decode, LinearEpilogue::None},
+                     blockProjection(n, 5120, formats));
+    };
+    const LinearTile iq = lanes == 3 ? LinearTile::GgufRegister : LinearTile::GgufStaged;
+    const LinearTile q2k = lanes == 2 || lanes == 4 ? LinearTile::GgufStaged : LinearTile::GgufRegister;
+    bool staged = true;
+    for (const uint32_t format :
+         {GGUF_FMT_IQ3XXS, GGUF_FMT_IQ2XXS, GGUF_FMT_IQ2XS, GGUF_FMT_IQ2S, GGUF_FMT_IQ1S, GGUF_FMT_IQ1M})
+      staged = staged && plan({format}).configuration().tile == iq;
+    require(staged && plan({GGUF_FMT_IQ3XXS, GGUF_FMT_IQ2S, GGUF_FMT_IQ1M}).configuration().tile == iq,
+            "Apple9 stages the IQ2, IQ3_XXS and IQ1 formats at unpadded lanes");
+    require(plan({GGUF_FMT_Q2K}).configuration().tile == q2k, "Apple9 stages Q2_K from two unpadded lanes");
+    for (const uint32_t format : {GGUF_FMT_Q4K, GGUF_FMT_Q6K, GGUF_FMT_IQ4XS, GGUF_FMT_IQ3S, GGUF_FMT_Q80,
+                                  GGUF_FMT_Q40, GGUF_FMT_MXFP4})
+      require(plan({format}).configuration().tile == LinearTile::GgufRegister, "Apple9 keeps other formats' registers");
+    require(plan({GGUF_FMT_IQ3XXS, GGUF_FMT_Q4K}).configuration().tile == LinearTile::GgufRegister &&
+                plan({GGUF_FMT_IQ3XXS}).storageRows() == plan({GGUF_FMT_Q4K}).storageRows(),
+            "Apple9 keeps a mixed projection's registers, and a staged plan binds the register rows");
+    // A gate/up plan runs its gate on the same tile: it stages only when the gate's formats do too.
+    const LinearWorkload gateUp{{1024, 5120}, lanes * 8, LinearPhase::Decode, LinearEpilogue::GateUp};
+    const Projection up = blockProjection(1024, 5120, 1, GGUF_FMT_IQ2XXS),
+                     iqGate = blockProjection(1024, 5120, 1, GGUF_FMT_IQ2XS), q4kGate = blockProjection(1024, 5120, 1);
+    require(m3.plan(gateUp, up, &iqGate).configuration().tile == iq &&
+                m3.plan(gateUp, up, &q4kGate).configuration().tile == LinearTile::GgufRegister,
+            "Apple9 staged a gate/up plan whose gate keeps the register tile");
+    const LinearPlan stagedDown = m3.plan({down.matrix, lanes * 8, LinearPhase::Decode, LinearEpilogue::Residual},
+                                          blockProjection(5120, 17408, 1, GGUF_FMT_IQ2XS));
+    const LinearPlan registerPlan = m3.plan({down.matrix, lanes * 8, LinearPhase::Decode, LinearEpilogue::Residual},
+                                            blockProjection(5120, 17408, 1));
+    const LinearScratchSize bound = m3.decodeScratchSize(
+        {down.matrix, lanes * 8, LinearPhase::Decode, LinearEpilogue::Residual, WeightLayout::Block32});
+    for (const LinearScratchSize size : {stagedDown.scratchSize(), registerPlan.scratchSize()})
+      require(bound.input >= size.input && bound.sums >= size.sums && bound.partials >= size.partials &&
+                  bound.counters >= size.counters,
+              "Apple9 GGUF decode scratch bound covers both tiles");
+  }
+  require(linear.plan({{5120, 17408}, 24, LinearPhase::Decode, LinearEpilogue::Residual},
+                      blockProjection(5120, 17408, 1, GGUF_FMT_IQ2XXS)).configuration().tile == LinearTile::GgufStaged,
+          "Apple10 stages every format");
+  // Apple9's staged tile, in decode and in prefill chunks, splits K by the
+  // register tile's tiers: on 40 cores 17408 x 5120 in four, 5120 x 17408 in
+  // eight.
+  for (const auto [n, k, splits] : {std::tuple{17408U, 5120U, 4U}, {5120U, 17408U, 8U}}) {
+    const LinearPlan decode = m3.plan({{n, k}, 8, LinearPhase::Decode, LinearEpilogue::None},
+                                      blockProjection(n, k, 1, GGUF_FMT_IQ2XXS));
+    const LinearPlan chunk = m3.plan({{n, k}, 8, LinearPhase::Prefill, LinearEpilogue::None}, blockProjection(n, k, 1));
+    require(decode.configuration() == LinearConfig{LinearTile::GgufStaged, n / 64, LinearSimdgroups::Two, splits} &&
+                chunk.configuration().splits == splits,
+            "Apple9 staged split tiers");
+  }
   for (const LinearConfig config : {LinearConfig{LinearTile::GgufRegister, 80, LinearSimdgroups::Four, 3},
                                     LinearConfig{LinearTile::GgufRegister, 80, LinearSimdgroups::Four, 16},
                                     LinearConfig{LinearTile::GgufRegister, 40, LinearSimdgroups::Four, 8},

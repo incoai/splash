@@ -128,7 +128,7 @@ private:
   Linear baselineLinear_;
   uint32_t moeRouteWideRows_ = kMoeRouteWideRows;
   MoeExpertSimdgroups moeDecodeSimdgroups_ = MoeExpertSimdgroups::Eight;
-  MoeGgufTile moeGgufTile_ = MoeGgufTile::Staged;
+  uint32_t appleGpuFamily_ = 0;
   OperatorChoices choices_;
 };
 

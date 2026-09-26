@@ -255,10 +255,10 @@ per model:
   attention, GDN and MoE dimensions, with dispatch policies measured offline
   per GPU family and core count. MLX weights are prepared once into layouts
   packed for these kernels. GGUF weights keep their llama.cpp quantization,
-  repacked once into planes that kernels chosen by GPU family and core count
-  decode directly, without per-shape tuning. Both are mapped zero-copy from
-  disk. Everything ships precompiled: no Xcode, no compiler toolchain, nothing
-  tuned on your machine.
+  repacked once into planes that kernels chosen by GPU family, core count and
+  format decode directly, without per-shape tuning. Both are mapped zero-copy
+  from disk. Everything ships precompiled: no Xcode, no compiler toolchain,
+  nothing tuned on your machine.
 - **A memory plan computed for this machine.** Context, KV capacity, and batch
   limits are worked out at startup from the memory Metal recommends, less the
   weights, the draft, and each request's state.

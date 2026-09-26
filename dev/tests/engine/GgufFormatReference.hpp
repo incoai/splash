@@ -27,6 +27,12 @@ enum Fmt { Q4K = GGUF_FMT_Q4K, IQ4XS = GGUF_FMT_IQ4XS, IQ4NL = GGUF_FMT_IQ4NL, Q
            IQ1M = GGUF_FMT_IQ1M, Q40 = GGUF_FMT_Q40, Q41 = GGUF_FMT_Q41, MXFP4 = GGUF_FMT_MXFP4,
            FMT_COUNT = GGUF_FMT_COUNT };
 inline const char *fmtName(uint32_t f) { return kQuantFormats[f].name; }
+// The format of kQuantFormats name `name`, FMT_COUNT for none.
+inline Fmt fmtNamed(const std::string &name) {
+  int f = 0;
+  while (f < FMT_COUNT && name != fmtName(f)) ++f;
+  return Fmt(f);
+}
 inline uint16_t f2h(float f) { __fp16 h = (__fp16)f; uint16_t u; memcpy(&u, &h, 2); return u; }
 inline float h2f(uint16_t u) { __fp16 h; memcpy(&h, &u, 2); return (float)h; }
 inline uint32_t rowBytes(Fmt f, uint32_t K) {
