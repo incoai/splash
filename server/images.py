@@ -115,7 +115,14 @@ def prepare(payload: bytes, max_pixels: int = MAX_PIXELS) -> PreparedImage:
                 pass  # A malformed tag leaves the stored orientation.
             if decoded.size != stored:
                 height, width = width, height
-            image = decoded.convert("RGB")
+            if decoded.has_transparency_data:
+                # Composite onto white as Qwen's preprocessing does: transparent
+                # pixels usually store black, which hides dark content.
+                rgba = decoded.convert("RGBA")
+                image = Image.new("RGB", rgba.size, (255, 255, 255))
+                image.paste(rgba, mask=rgba)
+            else:
+                image = decoded.convert("RGB")
             if (image.height, image.width) != (height, width):
                 image = image.resize((width, height), Image.Resampling.BICUBIC)
             pixels = image.tobytes()

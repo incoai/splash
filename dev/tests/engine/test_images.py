@@ -124,6 +124,28 @@ class PrepareTest(unittest.TestCase):
         malformed = b"Exif\x00\x00not a tiff header"
         self.assertEqual(prepared(stored, malformed), prepared(stored))
 
+    def test_transparent_pixels_are_composited_onto_white(self):
+        from PIL import Image
+
+        # Opaque black on the top half, transparent pixels storing black below.
+        rgba = Image.new("RGBA", (256, 256), (0, 0, 0, 0))
+        rgba.paste((0, 0, 0, 255), (0, 0, 256, 128))
+        palette = Image.new("P", (256, 256), 0)
+        palette.putpalette([0, 0, 0, 0, 0, 0])
+        palette.paste(1, (0, 0, 256, 128))
+        expected = bytes(256 * 128 * 3) + b"\xff" * (256 * 128 * 3)
+        for image, encoding, params in (
+            (rgba, "PNG", {}),
+            (rgba.convert("LA"), "PNG", {}),
+            (palette, "PNG", {"transparency": 0}),
+            (palette, "GIF", {"transparency": 0}),
+        ):
+            with self.subTest(mode=image.mode, encoding=encoding):
+                buffer = io.BytesIO()
+                image.save(buffer, format=encoding, **params)
+                prepared = images.prepare(buffer.getvalue(), images.MAX_PIXELS)
+                self.assertEqual(prepared.pixels, expected)
+
     def test_small_image_preparation_obeys_cap_after_upscale(self):
         prepared = images.prepare(png_bytes(1, 100), images.MIN_PIXELS)
         self.assertLessEqual(len(prepared.pixels), 3 * images.MIN_PIXELS)
