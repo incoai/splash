@@ -152,10 +152,9 @@ bool StateCache::publishToDisk(uint64_t kvBlock, const StateWriter &write,
   // The state is on disk already; a second copy would add nothing.
   if (touchIfStored(kvBlock, checkpoint))
     return true;
-  // A checkpoint is disposable: it takes the quota's free room but never
-  // replaces another copy.
-  std::unique_ptr<StateOffload> transfer =
-      startWrite(write, completion, checkpoint ? std::function<bool()>{} : makeRoom);
+  // A checkpoint replaces older copies like any state: it is the only
+  // progress a suspended request keeps once the quota is full.
+  std::unique_ptr<StateOffload> transfer = startWrite(write, completion, makeRoom);
   if (!transfer)
     return false;
   Entry &entry = publicationEntry(kvBlock, checkpoint);
@@ -231,8 +230,7 @@ StateEviction StateCache::reclaim(uint64_t kvBlock, std::function<void()> comple
     return {};
   Entry &entry = found->second;
   const uint64_t reclaimed = entry.ram->bytes();
-  // One write at a time. A disposable checkpoint takes the quota's free room
-  // but never replaces another copy.
+  // One write at a time.
   const bool writable = !entry.disk && entry.ram->canOffload();
   if (writable && pending_ && waitForWrite)
     return {false, 0, true};
@@ -241,7 +239,7 @@ StateEviction StateCache::reclaim(uint64_t kvBlock, std::function<void()> comple
             [state = entry.ram](std::function<void()> done) {
               return state->offload(std::move(done));
             },
-            completion, entry.checkpoint ? std::function<bool()>{} : makeRoom))
+            completion, makeRoom))
       beginWrite(kvBlock, entry, std::move(transfer));
   }
   if (!entry.disk)

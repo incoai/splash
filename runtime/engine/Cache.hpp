@@ -183,9 +183,8 @@ public:
                              std::shared_ptr<const CompositeState> state,
                              bool checkpoint = false);
   // Publishes the state of the lane at this block straight to disk, for a
-  // state no cache slot can hold: `write` starts the write from the lane. A
-  // checkpoint takes free quota only. False when the tier cannot take the
-  // state now; nothing is published then.
+  // state no cache slot can hold: `write` starts the write from the lane.
+  // False when the tier cannot take the state now; nothing is published then.
   [[nodiscard]] bool publishStateToDisk(uint64_t kvBlock, const StateWriter &write,
                                         bool checkpoint = false);
   [[nodiscard]] StateCheckpoint checkpointState(uint64_t kvBlock) const noexcept;

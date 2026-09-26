@@ -122,7 +122,7 @@ public:
   // block whose state is on disk already is published as it is. False when
   // the one write in flight holds the staging buffer, or when the quota
   // cannot admit the state after makeRoom gave up what it could; nothing is
-  // published then. A checkpoint takes free quota only.
+  // published then.
   [[nodiscard]] bool publishToDisk(uint64_t kvBlock, const StateWriter &write,
                                    const std::function<void()> &completion,
                                    const std::function<bool()> &makeRoom,
@@ -144,9 +144,8 @@ public:
   [[nodiscard]] std::optional<CacheEvictionCandidate>
   evictionCandidate(bool keepResumePoint = false, bool checkpoints = true) const noexcept;
   // Frees an unpinned RAM copy: for nothing when a disk copy exists, by
-  // writing one when the tier takes it (makeRoom frees quota on its behalf;
-  // a disposable checkpoint takes free quota only), by dropping the state
-  // otherwise. The RAM is free when the call returns.
+  // writing one when the tier takes it (makeRoom frees quota on its behalf),
+  // by dropping the state otherwise. The RAM is free when the call returns.
   // With waitForWrite, a state that could be written once the write in
   // flight has finished is kept and reported pending instead of dropped.
   [[nodiscard]] StateEviction reclaim(uint64_t kvBlock,
