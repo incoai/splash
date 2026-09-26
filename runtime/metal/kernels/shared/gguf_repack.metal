@@ -102,6 +102,12 @@ kernel void gguf_repack(device const uchar *src [[buffer(0)]], device uchar *dst
       if (j == 0) { for (uint i = 0; i < 4; ++i) meta[i] = blk[80 + i]; for (uint i = 0; i < 16; ++i) meta[4 + i] = blk[i]; }
       break;
     }
+    case GGUF_FMT_PQ20: {   // block_pq2_0 {d, qs[32]}: element e of group j is bits 2 (e % 4) of qs[8 j + e / 4]
+      for (uint e = 0; e < 32; ++e) lo[quant_slot(e)] = (blk[2 + 8 * j + e / 4] >> (2 * (e % 4))) & 3;
+      gguf_store_bits(lo, 2, out0);
+      if (j == 0) { meta[0] = blk[0]; meta[1] = blk[1]; }
+      break;
+    }
     case GGUF_FMT_IQ4NL: case GGUF_FMT_Q40: case GGUF_FMT_Q41: case GGUF_FMT_MXFP4: {   // the meta unit, then qs[16]
       for (uint l = 0; l < 16; ++l) { const uchar q = blk[f.meta_bytes + l]; lo[quant_slot(l)] = q & 15; lo[quant_slot(16 + l)] = q >> 4; }
       if (p.fmt == GGUF_FMT_Q40 || p.fmt == GGUF_FMT_Q41) gguf_store_pairs(lo, out0); else gguf_store_bits(lo, 4, out0);

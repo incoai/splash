@@ -87,7 +87,8 @@ static_assert(sizeof(GgufEmbedParams) == 12, "GGUF embedding parameters are 12 b
 // (kernels/shared/embedding.metal, gguf_embed_<kQuantFormats name>).
 inline constexpr bool gguf_embedding_format(uint32_t format) {
   return format == GGUF_FMT_Q4K || format == GGUF_FMT_Q5K || format == GGUF_FMT_Q6K || format == GGUF_FMT_Q3K ||
-         format == GGUF_FMT_Q2K || format == GGUF_FMT_Q80 || format == GGUF_FMT_Q40 || format == GGUF_FMT_Q41;
+         format == GGUF_FMT_Q2K || format == GGUF_FMT_Q80 || format == GGUF_FMT_Q40 || format == GGUF_FMT_Q41 ||
+         format == GGUF_FMT_PQ20;
 }
 
 // fp32 projection of a GGUF float tensor (kernels/shared/gguf_float.metal):

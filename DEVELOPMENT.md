@@ -446,18 +446,21 @@ quantized types to `runtime/metal/abi/QuantFormat.h`). The native loader checks 
 and lists every unsupported tensor in one error:
 
 - linears and experts: Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, Q4_1,
-  IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL or
-  MXFP4;
-- token embeddings: Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, Q4_0 or Q4_1;
+  IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL,
+  MXFP4 or PQ2_0;
+- token embeddings: Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, Q4_1 or PQ2_0;
 - norms, the MoE router and shared-expert scalar gate, and the GDN
   convolution, decay and time-step bias: F32;
 - GDN alpha and beta: both Q8_0 or both F32.
 
 Of Unsloth's files in September 2026 that covers every file of Qwen3.8-27B
 and Qwen3.6-35B-A3B, from UD-IQ1_S up, but UD-Q8_K_XL and BF16, whose BF16
-tensors need kernels that do not exist yet. A format's image takes the bits
-per weight of its GGUF blocks, but for Q3_K's and Q6_K's padded meta units
-(1/16 bit more) and IQ3_S's chunk words (4.06 bits for its 3.44).
+tensors need kernels that do not exist yet. PQ2_0 is Prism ML's type 142,
+`block_pq2_0` of PrismML-Eng/llama.cpp, which upstream GGML does not define:
+2-bit codes q worth d (q - 1) with one half d per 128 weights. A format's
+image takes the bits per weight of its GGUF blocks, but for Q3_K's and Q6_K's
+padded meta units (1/16 bit more) and IQ3_S's chunk words (4.06 bits for its
+3.44).
 
 At load time the engine validates the GGUF metadata, including the rotary
 embedding and norm epsilon the kernels assume (`rope.freq_base`,

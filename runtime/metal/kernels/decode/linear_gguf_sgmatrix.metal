@@ -37,12 +37,14 @@ template <class F> struct Shape {
     // bf16 bits of the operand of code 0: 128, or 160 - zero when seeded
     Operand = 0x4300 + (Seeded ? kZeroPointOffset - 128 - F::Zero : 0),
     CG = Seeded || F::Group == 16 ? 2 : 1,                    // coefficient groups per 32 inputs
-    // Spans decoded per coefficient unit: every span of a meta unit of eight groups, or half of them where a
-    // span's coefficients take twice Q4_K's storage (Q2_K's (s, b) per 16 inputs)
+    // Spans decoded per coefficient unit: every span of eight groups (one meta unit of eight, or two of four), or
+    // half of them where a span's coefficients take twice Q4_K's storage (Q2_K's (s, b) per 16 inputs)
     UnitSpans = F::MetaGroups == 1 ? 1 : CG * (HasMin ? 2 : 1) <= 2 ? 4 : 2,
     J = 2 * UnitSpans * CG,                                   // coefficients per column and unit
   };
-  static_assert(F::MetaGroups == 8 || F::MetaGroups == 1, "a meta unit is one or eight groups");
+  // Each coefficient reads its own group's meta unit (coefficient_source), so a unit of four groups (PQ2_0's 128
+  // elements) splits a coefficient unit of four spans in two.
+  static_assert(F::MetaGroups == 8 || F::MetaGroups == 4 || F::MetaGroups == 1, "a meta unit is one, four or eight groups");
 };
 template <class F> using Coef = metal::conditional_t<Shape<F>::HasMin != 0, float2, float>;
 // The coefficients of a threadgroup's simdgroups for one unit; the run-time-format kernels hold every format's in
