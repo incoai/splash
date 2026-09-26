@@ -317,7 +317,7 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
       throw std::invalid_argument("a rotated gate/up pair takes one rotation");
     if (k % GGUF_ROTATION_BLOCK || p.rotation.signs.sizeBytes() < k)
       throw std::invalid_argument("a rotated projection takes whole rotation blocks and their signs");
-    graph.add("gguf_rotate", {b.input, p.rotation.signs, b.scratch.rotated}, GgufRotationParams{w.rows, k},
+    graph.add("gguf_rotate", {b.input, p.rotation.signs, b.scratch.rotated}, GgufRotationParams{k},
               {k / GGUF_ROTATION_BLOCK, w.rows, 1}, {GGUF_ROTATION_THREADS, 1, 1});
     LinearBuffers rotated = b;
     rotated.input = b.scratch.rotated;

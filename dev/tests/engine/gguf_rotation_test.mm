@@ -114,7 +114,7 @@ int main(int argc, char **argv) {
           }
         const MetalBuffer in = upload(backend, input), out = backend.allocateBuffer(input.size() * 2);
         CommandGraph graph;
-        graph.add("gguf_rotate", {in, signBuffer, out}, GgufRotationParams{rows, width}, {width / kBlock, rows, 1},
+        graph.add("gguf_rotate", {in, signBuffer, out}, GgufRotationParams{width}, {width / kBlock, rows, 1},
                   {GGUF_ROTATION_THREADS, 1, 1});
         static_cast<void>(backend.submitCommand(graph.dispatches()));
         failures += check("gguf_rotate H (D x)", static_cast<const uint16_t *>(out.contents()), fp32, fp64);

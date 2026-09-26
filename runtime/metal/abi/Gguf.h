@@ -99,10 +99,9 @@ inline constexpr bool gguf_embedding_format(uint32_t format) {
 #define GGUF_ROTATION_BLOCK 1024u
 #define GGUF_ROTATION_THREADS 256u
 struct GgufRotationParams {
-  uint32_t rows;
   uint32_t width; // a multiple of GGUF_ROTATION_BLOCK
 };
-static_assert(sizeof(GgufRotationParams) == 8, "GGUF rotation parameters are 8 bytes on both sides");
+static_assert(sizeof(GgufRotationParams) == 4, "GGUF rotation parameters are 4 bytes on both sides");
 
 // fp32 projection of a GGUF float tensor (kernels/shared/gguf_float.metal):
 // out[r][out_offset + n] = sum_k x[r][k] * W[n][k] for rows r < rows, W as
