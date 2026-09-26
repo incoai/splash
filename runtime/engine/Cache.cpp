@@ -7,8 +7,10 @@
 
 namespace splash::engine {
 
-Cache::Cache(KvPool &pool, CacheNamespace cacheNamespace, model::KvTier *kvTier)
-    : pool_(pool), tier_(kvTier), kv_(pool, cacheNamespace, recency_),
+Cache::Cache(KvPool &pool, CacheNamespace cacheNamespace, model::KvTier *kvTier,
+             std::shared_ptr<const model::DiskBudget> diskBudget)
+    : pool_(pool), tier_(kvTier), diskBudget_(std::move(diskBudget)),
+      kv_(pool, cacheNamespace, recency_),
       states_(kv_, recency_), makeRoom_([this] { return freeDiskSpace(); }) {}
 
 void Cache::beginRequest(uint64_t requestId) {
@@ -804,13 +806,14 @@ CacheSnapshot Cache::snapshot() const {
   KvTierSnapshot tier = kvTier_;
   tier.pendingPages = pendingPages_;
   tier.diskBlocks = kv_.snapshot().diskBlocks;
-  if (tier_) {
-    tier.capacityBytes = tier_->capacityBytes();
-    tier.usedBytes = tier_->usedBytes();
-    tier.readBytes = tier_->readBytes();
-    tier.writtenBytes = tier_->writtenBytes();
-    tier.diskBytes = uint64_t{tier.diskBlocks} * tier_->slotBytes();
+  if (diskBudget_) {
+    tier.capacityBytes = diskBudget_->capacityBytes();
+    tier.usedBytes = diskBudget_->usedBytes();
+    tier.readBytes = diskBudget_->readBytes();
+    tier.writtenBytes = diskBudget_->writtenBytes();
   }
+  if (tier_)
+    tier.diskBytes = uint64_t{tier.diskBlocks} * tier_->slotBytes();
   return {pool_.snapshot(),
           kv_.snapshot(),
           states_.snapshot(),

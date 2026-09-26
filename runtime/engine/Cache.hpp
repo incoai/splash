@@ -4,6 +4,7 @@
 #include "engine/KvPool.hpp"
 #include "engine/StateCache.hpp"
 #include "model/Model.hpp"
+#include "model/SlotFile.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -121,7 +122,10 @@ enum class KvRestoreStatus : uint8_t { None, Pending, Failed };
 // composite states. Physical recurrent-state cells remain model-owned.
 class Cache final {
 public:
-  Cache(KvPool &pool, CacheNamespace cacheNamespace, model::KvTier *kvTier = nullptr);
+  // The disk budget is the quota the states' file shares with the KV tier;
+  // the states' file can run on it without the tier.
+  Cache(KvPool &pool, CacheNamespace cacheNamespace, model::KvTier *kvTier = nullptr,
+        std::shared_ptr<const model::DiskBudget> diskBudget = nullptr);
   Cache(const Cache &) = delete;
   Cache &operator=(const Cache &) = delete;
 
@@ -310,6 +314,7 @@ private:
 
   KvPool &pool_;
   model::KvTier *tier_;
+  std::shared_ptr<const model::DiskBudget> diskBudget_;
   CacheRecency recency_;
   KvCache kv_;
   StateCache states_;

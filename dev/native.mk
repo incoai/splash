@@ -302,7 +302,7 @@ $(TEST_CACHE_TEST): $(CACHE_SOURCES) \
 		dev/tests/engine/cache_test.cpp | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
-$(TEST_KV_FIRST_CACHE_TEST): $(CACHE_SOURCES) \
+$(TEST_KV_FIRST_CACHE_TEST): $(CACHE_SOURCES) runtime/model/SlotFile.cpp \
 		dev/tests/engine/kv_first_cache_test.cpp | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 

@@ -1,6 +1,7 @@
 #include "TestKvPool.hpp"
 #include "TestKvTier.hpp"
 #include "engine/Cache.hpp"
+#include "model/SlotFile.hpp"
 
 #include <algorithm>
 #include <array>
@@ -1394,6 +1395,26 @@ void testDiskReplacementSpansStatesAndKv() {
           "disk replacement did not give up redundant copies before the only ones");
 }
 
+// When only the KV tier failed to start, the states' file still draws on the
+// disk quota, and the quota and its IO are reported all the same.
+void testQuotaWithoutTheKvTier() {
+  constexpr uint64_t size = model::SlotFile::kAlignmentBytes;
+  auto budget = std::make_shared<model::DiskBudget>(4 * size);
+  test::TestKvBacking backing{4, 100};
+  KvPool pool{backing};
+  engine::Cache cache(pool, cacheNamespace(), nullptr, budget);
+  model::SlotFile states(size, budget);
+  auto slot = states.acquire();
+  std::vector<std::byte> source(size, std::byte{1}), restored(size);
+  require(slot && states.write(slot, {source}, {})->wait() &&
+              states.read(slot, {restored}, {})->wait(),
+          "state file IO failed");
+  const auto tier = cache.snapshot().kvTier;
+  require(tier.capacityBytes == 4 * size && tier.usedBytes == size && tier.readBytes == size &&
+              tier.writtenBytes == size && tier.diskBlocks == 0 && tier.diskBytes == 0,
+          "the disk quota went unreported without the KV tier");
+}
+
 // Independent prefixes under random publications, uses and reclaims: the
 // RAM contents match a cache without the tier step for step, and every hit
 // without the tier is a hit with it. The disk only adds.
@@ -2491,6 +2512,7 @@ int main() {
     testDiskPublicationMakesRoom();
     testRollingCheckpointsUseTheTier();
     testDiskQuotaReplacesByRecency();
+    testQuotaWithoutTheKvTier();
     testInvalidationDuringOffload();
     testDemotionFreesTheBufferAtOnce();
     testTierOnlyAddsToTierOff();
