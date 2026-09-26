@@ -106,11 +106,12 @@ private:
 
 // Wakes the engine and, when the command carried KV copies, reports the
 // batch they rode on.
-metal::CommandCompletion commandNotify(KvPageTier *tier, uint64_t transfers,
+metal::CommandCompletion commandNotify(std::function<void()> transfers,
                                        std::function<void()> completion) {
-  return [tier, transfers, completion = std::move(completion)](uint64_t) {
+  return [transfers = std::move(transfers),
+          completion = std::move(completion)](uint64_t) {
     if (transfers)
-      tier->commandCompleted(transfers);
+      transfers();
     if (completion)
       completion();
   };
@@ -1575,10 +1576,10 @@ struct Runtime::Impl {
   // or demotion waiting for as long as the model stays busy.
   CommandTicket submitWithCopies(CommandGraph &graph,
                                  std::function<void()> completion) {
-    const uint64_t transfers = kvTier ? kvTier->encode(graph) : 0;
+    std::function<void()> transfers = kvTier ? kvTier->encode(graph) : nullptr;
     return backend.submitCommandAsync(
         graph.dispatches(),
-        commandNotify(kvTier, transfers, std::move(completion)));
+        commandNotify(std::move(transfers), std::move(completion)));
   }
 
   // A constrained DFlash cycle has one host dependency between three Metal

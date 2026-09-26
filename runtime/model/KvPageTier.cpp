@@ -158,8 +158,14 @@ std::unique_ptr<KvTransfer> KvPageTier::restore(std::shared_ptr<KvDiskSlot> slot
 
 bool KvPageTier::copiesQueued() const noexcept { return !queued_.empty(); }
 
-uint64_t KvPageTier::encode(metal::CommandGraph &graph) {
-  if (queued_.empty()) return 0;
+std::function<void()> KvPageTier::encode(metal::CommandGraph &graph) {
+  if (queued_.empty()) return {};
+  // Earlier batches' commands have finished even when poll() has not seen
+  // their report yet; this command must not run their copies again.
+  for (const Batch &batch : inFlight_) {
+    for (const auto &transfer : batch.copies)
+      setTable(transfer->stagingSlot, 0, ops::KvCopy::Direction::None);
+  }
   for (auto &transfer : queued_) {
     setTable(transfer->stagingSlot, transfer->page,
              transfer->toStaging ? ops::KvCopy::Direction::ToStaging
@@ -168,11 +174,9 @@ uint64_t KvPageTier::encode(metal::CommandGraph &graph) {
   ops::KvCopy::addPages(graph, pages_, staging_, table_, stagingSlots_, slotBytes_);
   inFlight_.push_back(Batch{++encodedBatches_, std::move(queued_)});
   queued_.clear();
-  return encodedBatches_;
-}
-
-void KvPageTier::commandCompleted(uint64_t batch) noexcept {
-  completedBatch_.store(batch, std::memory_order_release);
+  return [completed = completedBatch_, batch = encodedBatches_] {
+    completed->store(batch, std::memory_order_release);
+  };
 }
 
 void KvPageTier::finish(Transfer &transfer, bool success) noexcept {
@@ -187,7 +191,7 @@ void KvPageTier::finish(Transfer &transfer, bool success) noexcept {
 }
 
 void KvPageTier::poll() {
-  const uint64_t completed = completedBatch_.load(std::memory_order_acquire);
+  const uint64_t completed = completedBatch_->load(std::memory_order_acquire);
   while (!inFlight_.empty() && inFlight_.front().number <= completed) {
     Batch batch = std::move(inFlight_.front());
     inFlight_.pop_front();

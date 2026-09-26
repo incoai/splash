@@ -62,13 +62,15 @@ public:
   void poll() override;
 
   // Runtime side. encode() appends every queued copy to the command being
-  // built and returns its batch number, zero when nothing was added; the
-  // command's completion reports that number back, from any thread. The
-  // runtime calls it for each batch command and each copy-only command (see
-  // KvTier). Copies are keyed by staging slot, so a command only ever sees
-  // entries owned by transfers it carries.
-  [[nodiscard]] uint64_t encode(metal::CommandGraph &graph);
-  void commandCompleted(uint64_t batch) noexcept;
+  // built and returns the report the command's completion runs, from any
+  // thread, or nothing when no copy was added. The report shares the batch
+  // counter rather than pointing at the tier, which a late completion may
+  // outlive. The runtime calls it for each batch command and each copy-only
+  // command (see KvTier). Copies are keyed by staging slot, and encode()
+  // first clears the entries of batches poll() has not retired, whose
+  // command has finished since the backend runs one at a time, so a command
+  // only ever sees entries owned by transfers it carries.
+  [[nodiscard]] std::function<void()> encode(metal::CommandGraph &graph);
 
 private:
   struct Transfer;
@@ -100,7 +102,9 @@ private:
   std::deque<Batch> inFlight_;
   std::vector<std::shared_ptr<Transfer>> io_;
   uint64_t encodedBatches_ = 0;
-  std::atomic<uint64_t> completedBatch_{0};
+  // Shared with the reports encode() hands out.
+  std::shared_ptr<std::atomic<uint64_t>> completedBatch_ =
+      std::make_shared<std::atomic<uint64_t>>(0);
 };
 
 } // namespace splash::model

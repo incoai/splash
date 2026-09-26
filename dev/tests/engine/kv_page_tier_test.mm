@@ -3,9 +3,11 @@
 
 #include "engine/MemoryGovernor.hpp"
 #include "metal/CommandGraph.hpp"
+#include "metal/abi/KvCopy.h"
 
 #include <algorithm>
 #include <cstring>
+#include <functional>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -53,10 +55,10 @@ void runUntilReady(KvPageTier &tier, metal::MetalBackend &backend, KvTransfer &t
     if (transfer.ready()) return;
     if (tier.copiesQueued()) {
       metal::CommandGraph graph;
-      const uint64_t batch = tier.encode(graph);
-      require(batch != 0 && !graph.empty(), "queued copies were not encoded");
+      const auto report = tier.encode(graph);
+      require(report && !graph.empty(), "queued copies were not encoded");
       static_cast<void>(backend.submitCommand(graph.dispatches()));
-      tier.commandCompleted(batch);
+      report();
     } else {
       std::this_thread::yield();
     }
@@ -145,9 +147,9 @@ void roundTrip(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
   require(demoteA != nullptr, "demotion was refused with free staging");
   {
     metal::CommandGraph graph;
-    const uint64_t batch = tier.encode(graph);
+    const auto report = tier.encode(graph);
     static_cast<void>(backend.submitCommand(graph.dispatches()));
-    tier.commandCompleted(batch);
+    report();
     tier.poll();
     require(!demoteA->ready() || demoteA->finish(),
             "demotion failed after its copy ran");
@@ -218,7 +220,7 @@ void staging(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
               std::memcmp(readSlot(*file, empty).data(), bytes.data(), payload) == 0,
           "demoted slots do not hold the page");
   metal::CommandGraph graph;
-  require(tier.encode(graph) == 0 && graph.empty() && !tier.copiesQueued(),
+  require(!tier.encode(graph) && graph.empty() && !tier.copiesQueued(),
           "an idle tier encoded copies");
   std::cout << "staging tests passed\n";
 }
@@ -265,6 +267,51 @@ void shares(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
   std::cout << "ring share tests passed\n";
 }
 
+// A ticket can be ready before its completion has reported the copies it
+// carried, so the engine may encode the next command first: that command must
+// not run the earlier copies again, and the late report may outlive the tier.
+void lateReport(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
+                kv::Format format) {
+  const kv::Layout layout{2, 2, 256, format};
+  kv::PageStorage pages(backend, governor.allocationAdmission(), layout,
+                          std::max(16u, layout.backingExtentPages()));
+  const uint64_t slotBytes = KvPageTier::slotBytesFor(pages);
+  auto file = std::make_shared<SlotFile>(slotBytes, 2 * slotBytes);
+  std::function<void()> late;
+  {
+    KvPageTier tier(backend, pages, file, 4);
+    auto first = tier.demote(0, tier.acquireSlot(), {});
+    require(first != nullptr, "demotion was refused with free staging");
+    metal::CommandGraph graph;
+    late = tier.encode(graph);
+    require(late != nullptr, "queued demotion was not encoded");
+    static_cast<void>(backend.submitCommand(graph.dispatches()));
+
+    auto second = tier.demote(1, tier.acquireSlot(), {});
+    require(second != nullptr, "a second demotion did not fit half the ring");
+    metal::CommandGraph next;
+    const auto report = tier.encode(next);
+    require(report && !next.empty(), "queued demotion was not encoded");
+    const auto *table = static_cast<const SplashKvCopySlot *>(
+        next.dispatches().front().buffers.back().buffer.contents());
+    uint32_t live = 0;
+    for (uint32_t slot = 0; slot < 4; ++slot) {
+      if (table[slot].direction == SPLASH_KV_COPY_NONE) continue;
+      ++live;
+      require(table[slot].page == 1 && table[slot].direction == SPLASH_KV_COPY_TO_STAGING,
+              "a command carried another command's copy");
+    }
+    require(live == 1, "the second command did not carry exactly its own copy");
+    static_cast<void>(backend.submitCommand(next.dispatches()));
+    report();
+    runUntilReady(tier, backend, *first);
+    runUntilReady(tier, backend, *second);
+    require(first->finish() && second->finish(), "demotions did not succeed");
+  }
+  late();
+  std::cout << "late report tests passed\n";
+}
+
 // A tier goes away with its writes still on the way out: staging is their
 // source and dies with it, so the IO worker has to be done with it first.
 void teardown(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
@@ -284,10 +331,10 @@ void teardown(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
       require(demotions.back() != nullptr, "a demotion within the share was refused");
     }
     metal::CommandGraph graph;
-    const uint64_t batch = tier.encode(graph);
-    require(batch != 0, "queued demotions were not encoded");
+    const auto report = tier.encode(graph);
+    require(report != nullptr, "queued demotions were not encoded");
     static_cast<void>(backend.submitCommand(graph.dispatches()));
-    tier.commandCompleted(batch);
+    report();
     // One poll hands every copy to the worker, which is still writing when
     // the tier goes out of scope.
     tier.poll();
@@ -307,6 +354,7 @@ void run(const std::string &metallib) {
     allocationFailure(backend, governor, format);
     staging(backend, governor, format);
     shares(backend, governor, format);
+    lateReport(backend, governor, format);
     teardown(backend, governor, format);
   }
   std::cout << "kv page tier tests passed\n";
