@@ -63,9 +63,10 @@ public:
 
   // Runtime side. encode() appends every queued copy to the command being
   // built and returns its batch number, zero when nothing was added; the
-  // command's completion reports that number back, from any thread. Copies
-  // are keyed by staging slot, so a command only ever sees entries owned by
-  // transfers it carries.
+  // command's completion reports that number back, from any thread. The
+  // runtime calls it for each batch command and each copy-only command (see
+  // KvTier). Copies are keyed by staging slot, so a command only ever sees
+  // entries owned by transfers it carries.
   [[nodiscard]] uint64_t encode(metal::CommandGraph &graph);
   void commandCompleted(uint64_t batch) noexcept;
 

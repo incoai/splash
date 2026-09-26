@@ -323,7 +323,13 @@ public:
   [[nodiscard]] virtual bool finish() = 0;
 };
 
-// The disk tier for KV pages as the engine drives it.
+// The disk tier for KV pages as the engine drives it. A queued copy moves
+// only inside a Metal command, so every command the model submits for a
+// batch carries the copies queued so far, each command of a multi-command
+// ticket included, and a batch with no work of its own still submits one
+// while copies are queued. The engine adds a copy-only command
+// (Model::submitTransfers) only when no batch runs, so while the model is
+// busy its own commands keep the copies moving.
 class KvTier {
 public:
   virtual ~KvTier() = default;

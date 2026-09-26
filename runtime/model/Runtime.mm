@@ -1569,12 +1569,25 @@ struct Runtime::Impl {
     return results;
   }
 
+  // Every asynchronous command the runtime submits goes through here and
+  // carries the KV copies queued so far. The engine sends a copy-only command
+  // only when no batch runs, so a command without them would leave a restore
+  // or demotion waiting for as long as the model stays busy.
+  CommandTicket submitWithCopies(CommandGraph &graph,
+                                 std::function<void()> completion) {
+    const uint64_t transfers = kvTier ? kvTier->encode(graph) : 0;
+    return backend.submitCommandAsync(
+        graph.dispatches(),
+        commandNotify(kvTier, transfers, std::move(completion)));
+  }
+
   // A constrained DFlash cycle has one host dependency between three Metal
   // commands: draft proposals define the grammar simulation, while the target
   // forward is independent of the resulting mask.  This ticket keeps the
   // scheduler batch (and therefore its DecodeArena lanes) owned across that
   // dependency.  All state transitions run on the engine thread; completion
-  // handlers only wake it, so they capture the wake hook and never the ticket.
+  // handlers only report their KV copies and wake it, so they capture the
+  // wake hook and never the ticket.
   class ConstrainedDecodeTicket final : public ModelBatchTicket {
   public:
     ConstrainedDecodeTicket(Impl &impl, std::vector<DecodeLaneResult> lanes,
@@ -1582,7 +1595,7 @@ struct Runtime::Impl {
                             std::span<const ModelBatchItem> items,
                             const ops::LinearDispatchStats &stats,
                             uint32_t planWidth, CommandTiming priorTiming,
-                            const CommandGraph &draft,
+                            CommandGraph &draft,
                             std::function<void()> completion)
         : impl_(impl), lanes_(std::move(lanes)), results_(std::move(results)),
           items_(items.begin(), items.end()), stats_(stats),
@@ -1739,12 +1752,11 @@ struct Runtime::Impl {
       Done
     };
 
-    void submit(const CommandGraph &graph) {
-      command_ = impl_.backend.submitCommandAsync(
-          graph.dispatches(), [wake = wake_](uint64_t) {
-            if (*wake)
-              (*wake)();
-          });
+    void submit(CommandGraph &graph) {
+      command_ = impl_.submitWithCopies(graph, [wake = wake_] {
+        if (*wake)
+          (*wake)();
+      });
     }
 
     void addTiming(CommandTiming value) noexcept {
@@ -2032,10 +2044,7 @@ Runtime::prefillAsync(const BatchPlan &plan,
                            });
       });
   std::vector<ModelBatchItem> copiedItems(items.begin(), items.end());
-  const uint64_t transfers = impl_->kvTier ? impl_->kvTier->encode(graph) : 0;
-  CommandTicket command = impl_->backend.submitCommandAsync(
-      graph.dispatches(),
-      commandNotify(impl_->kvTier, transfers, std::move(completion)));
+  CommandTicket command = impl_->submitWithCopies(graph, std::move(completion));
   Impl *impl = impl_.get();
   auto finish = [impl, entries,
                  items = std::move(copiedItems)](CommandTiming timing) mutable {
@@ -2325,17 +2334,17 @@ Runtime::decodeAsync(const BatchPlan &plan,
                                 planWidth, timing);
   };
 
-  if (commandGraph.empty()) {
+  // A mask stage encodes no work; while copies are queued it still submits a
+  // command for them, and the plan finishes with that command.
+  if (commandGraph.empty() &&
+      !(impl_->kvTier && impl_->kvTier->copiesQueued())) {
     std::vector<ModelStepResult> ready = finish(CommandTiming{});
     return std::make_unique<ReadyModelTicket>(std::move(ready),
                                               priorTiming.wallSeconds * 1000.0);
   }
 
-  const uint64_t transfers =
-      impl_->kvTier ? impl_->kvTier->encode(commandGraph) : 0;
-  CommandTicket command = impl_->backend.submitCommandAsync(
-      commandGraph.dispatches(),
-      commandNotify(impl_->kvTier, transfers, std::move(completion)));
+  CommandTicket command =
+      impl_->submitWithCopies(commandGraph, std::move(completion));
   return std::make_unique<DeferredMetalTicket>(
       std::move(command), std::move(finish), priorTiming.wallSeconds * 1000.0);
 }
@@ -2347,10 +2356,7 @@ Runtime::submitTransfers(std::function<void()> completion) {
   if (!impl_->kvTier || !impl_->kvTier->copiesQueued())
     return nullptr;
   CommandGraph graph;
-  const uint64_t transfers = impl_->kvTier->encode(graph);
-  CommandTicket command = impl_->backend.submitCommandAsync(
-      graph.dispatches(),
-      commandNotify(impl_->kvTier, transfers, std::move(completion)));
+  CommandTicket command = impl_->submitWithCopies(graph, std::move(completion));
   return std::make_unique<DeferredMetalTicket>(
       std::move(command),
       [](CommandTiming) { return std::vector<ModelStepResult>{}; });

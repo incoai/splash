@@ -130,6 +130,7 @@ public:
 
 struct MaskOverlapState final {
   uint64_t requestId = 0;
+  bool finishes = true;
   bool emitted = false;
   bool provided = false;
   bool abandoned = false;
@@ -159,7 +160,8 @@ public:
   std::vector<ModelStepResult> wait() override {
     if (!ready())
       throw std::logic_error("mask-overlap ticket completed without input");
-    return {{state_->requestId, 0, {42}, true, DecodeStage::Regular, 7, 0}};
+    return {{state_->requestId, 0, {42}, state_->finishes,
+             DecodeStage::Regular, 7, 0}};
   }
   double wallMilliseconds() const noexcept override { return 1.0; }
 
@@ -325,11 +327,20 @@ public:
   std::unique_ptr<ModelBatchTicket>
   submit(const BatchPlan &plan, std::span<const ModelBatchItem> items,
          std::function<void()> completion) override {
+    // Like every production batch command, this one carries the tier's
+    // queued copies; the test finishes the transfers themselves.
+    if (tier && tier->copiesQueued()) {
+      tier->queued = false;
+      ++carryingCommands;
+    }
+    // Every constrained cycle after the initial mask request waits for its
+    // mask inside the ticket, as the production constrained ticket does.
     if (plan.kind == WorkKind::Decode &&
         plan.cohort == BatchCohort::Constrained &&
-        plan.decodeStage == DecodeStage::ApplyInitialMask) {
+        plan.decodeStage != DecodeStage::RequestInitialMask) {
       overlap = std::make_shared<MaskOverlapState>();
       overlap->requestId = items.front().requestId;
+      overlap->finishes = decodeFinishes;
       return std::make_unique<MaskOverlapTicket>(overlap);
     }
     if (plan.kind == WorkKind::Decode && holdDecodeUntil) {
@@ -397,6 +408,7 @@ public:
 
   test::TestKvTier *tier = nullptr;
   uint32_t transferCommands = 0;
+  uint32_t carryingCommands = 0;
 
   struct Request {
     uint32_t slot = 0;
@@ -4451,6 +4463,66 @@ void testRestoringLaneWaitsForResidentLanes() {
           "the restoring lane did not run on its prefix once pages returned");
 }
 
+// A tool-using lane is runnable on every tick, so the engine never reaches
+// its copy-only command while one decodes. A restore still completes beside
+// it, on the copies that lane's own commands carry.
+void testRestoreCompletesWhileAConstrainedLaneDecodes() {
+  constexpr auto reuse = CacheReclaimMode::ReuseBacking;
+  Backing backing(128);
+  KvPool pool(backing);
+  test::TestKvTier tier;
+  engine::Cache cache(pool, CacheNamespace{}, &tier);
+  Executor executor;
+  executor.tier = &tier;
+  executor.decodeFinishes = false;
+  Events events;
+  engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+  // A two-block prefix and its state move to disk.
+  std::vector<uint32_t> prompt(65, 17);
+  cache.beginRequest(999);
+  require(cache.ensureTokens(999, 64).granted(), "fixture KV failed");
+  demoteState(cache, cache.publishCommittedBlocks(999, prompt, 64));
+  cache.endRequest(999);
+  for (uint32_t written = 1; written <= 2; ++written) {
+    require(cache.reclaimOne(reuse).madeProgress && tier.demotions == written, "block was not written");
+    tier.complete();
+    require(cache.pollTransfers(), "block did not land");
+  }
+
+  // The frontend answers every mask request on the tick that made it, and a
+  // transfer lands once a command has carried its copy.
+  const std::array<uint32_t, 1> mask{1};
+  uint32_t answered = 0;
+  uint32_t carried = 0;
+  auto step = [&](double now) {
+    static_cast<void>(engine.tick(now));
+    for (; answered < events.maskRequests.size(); ++answered)
+      engine.provideMask(events.maskRequests[answered].first, mask);
+    if (executor.carryingCommands != carried) {
+      carried = executor.carryingCommands;
+      tier.complete();
+    }
+  };
+  EngineRequest decoding = constrainedRequest(1, 1e9);
+  decoding.maxNewTokens = 1000;
+  engine.submit(std::move(decoding));
+  double now = 1;
+  for (; now < 20; ++now) step(now);
+  require(events.emitted > 1 && events.completedCount == 0, "the constrained lane is not decoding");
+
+  executor.restoreControl->ready = true;
+  EngineRequest restoring = request(2, prompt);
+  restoring.deadlineMilliseconds = 1e9;
+  engine.submit(std::move(restoring));
+  for (; now < 100 && events.startIds.size() < 2; ++now) step(now);
+  require(events.startIds.size() == 2 && events.starts[1].first == EngineCacheStatus::PrefixHit &&
+              events.starts[1].second == 64 && executor.restored == 64,
+          "the restore waited for the constrained lane to stop decoding");
+  require(executor.transferCommands == 0 && events.completedCount == 0 &&
+              events.failedCount == 0 && cache.snapshot().kvTier.restores == 2,
+          "the restore did not ride the constrained lane's commands");
+}
+
 int main() {
   try {
     testConcurrentColdPrefixesComputeOnce();
@@ -4465,6 +4537,7 @@ int main() {
     testLateSharedPrefillExtendsTheProducerPlan();
     testSharedPrefillCapacityFailureDoesNotDeadlock();
     testRestoringLaneWaitsForResidentLanes();
+    testRestoreCompletesWhileAConstrainedLaneDecodes();
     testWaitWithProgressOutlivesTheResourceLimit();
     testDiskKvPrefixIsRestoredBeforeTheLaneRuns();
     testCancelledDiskPrefixStopsQueuedReads();
