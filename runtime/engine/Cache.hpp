@@ -107,8 +107,8 @@ struct PageTableView final {
 struct CacheReclaimResult final {
   bool madeProgress = false;
   uint64_t reclaimedBytes = 0;
-  // Nothing was reclaimed, but a transfer in flight holds what the next
-  // reclaim needs: the staging buffer of the one state write, or the ring.
+  // Nothing was reclaimed, but a transfer in flight (a KV demotion, a KV
+  // restore or the one state write) holds what the next reclaim needs.
   // Retry when it lands rather than treating the cache as empty.
   bool pending = false;
 };
@@ -281,8 +281,13 @@ private:
     // The ring, the quota or the state write's staging buffer is held by
     // transfers in flight.
     Pending,
-    // Nothing can be written: no tier, or its file failed. A demotion also
-    // reports it when making room took the states the leaf was kept for.
+    // reclaimKvLeaf: the leaf stays for now and scans move on to the next
+    // one, because a state on it is in use, a disk subtree depends on it
+    // and the tier has no room that a transfer in flight will free, or a
+    // disk subtree below it cannot drop yet (in use, in transfer, or a
+    // state write in flight). demoteKv: the leaf cannot be written, and may
+    // go without a copy, because the tier takes no writes, has no such
+    // room, or making room took the states the leaf was kept for.
     Impossible,
   };
 

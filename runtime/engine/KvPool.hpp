@@ -26,8 +26,8 @@ enum class KvPageAcquireFailure : uint8_t {
   None,
   LogicalCapacity,
   PhysicalCapacity,
-  // A transfer in flight (a KV copy, a restore or the one state write) holds
-  // what the request needs; retry when it lands.
+  // A transfer in flight (a KV demotion, a KV restore or the one state write)
+  // holds what the request needs; retry when it lands.
   Pending,
 };
 

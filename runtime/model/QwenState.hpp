@@ -204,12 +204,12 @@ public:
   // dropping a cached state makes its slot available for retry.
   [[nodiscard]] std::shared_ptr<const QwenCompositeState>
   snapshot(uint32_t slot);
-  // Writes the lane's committed state to the disk tier from its own cells,
-  // taking no cache slot; the ticket carries the disk copy. Null without a
-  // tier that accepts writes, or when the quota cannot admit another state.
   [[nodiscard]] bool canSnapshotToDisk() const noexcept {
     return file_ && file_->writable();
   }
+  // Writes the lane's committed state to the disk tier from its own cells,
+  // taking no cache slot; the ticket carries the disk copy. Null without a
+  // tier that accepts writes, or when the quota cannot admit another state.
   [[nodiscard]] std::unique_ptr<StateOffload>
   snapshotToDisk(uint32_t slot, std::function<void()> completion);
   void restore(uint32_t slot, const CompositeState &state,

@@ -1106,8 +1106,8 @@ Engine::KvAdmission Engine::admitKv(const std::function<TokenAdmission()> &attem
     // Pages on their way back end the shortage without the residents.
     if (!denial.pending)
       allocationFailed_ = true;
-    denial.retryable = denial.pending || budgetMayRecover(admission.allocationFailure,
-                                                          releaseGeneration, reclaimed);
+    denial.retryable = budgetMayRecover(admission.allocationFailure, releaseGeneration,
+                                        reclaimed);
   }
   return {admission, denial};
 }

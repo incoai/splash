@@ -150,6 +150,8 @@ private:
     bool replaying = false;
     // Captured once the final prompt chunk completes; emitted with Done.
     std::vector<float> scoreLogits;
+    // A restore that could not fit alone released its prefix pin:
+    // admissions ignore the cache until one succeeds.
     bool skipCache = false;
     // Admission that waits for its state's read, its KV pages' restores,
     // or both, before the lane runs.
@@ -213,8 +215,8 @@ private:
     // On its way back: pages whose copies are being written, or a reclaim
     // that waits for the transfer in flight. The lane waits; nobody yields.
     bool pending = false;
-    // Still moving: a release or a reclaim in progress, a budget that can
-    // recover, or the above. Waiting or yielding beats failing.
+    // Still moving: a release or a reclaim in progress, or a budget that
+    // can recover. Waiting or yielding beats failing.
     bool retryable = false;
   };
   struct KvAdmission {
