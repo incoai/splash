@@ -144,9 +144,10 @@ public:
   // without children.
   [[nodiscard]] std::optional<CacheEvictionCandidate>
   diskCandidate(bool duplicate) const noexcept;
-  // The disk-only blocks below a resident block, each after its children;
-  // empty when one of them is in transfer or in use.
-  [[nodiscard]] std::vector<uint64_t> diskSubtree(uint64_t blockId) const;
+  // The blocks below a block, each after its children; empty when one of
+  // them is in transfer or in use. Below a resident leaf they are disk-only;
+  // below a poisoned block some may be resident.
+  [[nodiscard]] std::vector<uint64_t> subtree(uint64_t blockId) const;
   // Only a block without children, users or transfer can be removed. The
   // caller handles any composite state attached to it first.
   void erase(uint64_t blockId);

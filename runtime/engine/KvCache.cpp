@@ -361,7 +361,7 @@ KvCache::diskCandidate(bool duplicate) const noexcept {
   return duplicate ? duplicates_.oldest() : diskLeaves_.oldest();
 }
 
-std::vector<uint64_t> KvCache::diskSubtree(uint64_t blockId) const {
+std::vector<uint64_t> KvCache::subtree(uint64_t blockId) const {
   std::unordered_map<uint64_t, std::vector<uint64_t>> children;
   for (const auto &[id, entry] : blocks_)
     if (entry.parent)
@@ -377,8 +377,7 @@ std::vector<uint64_t> KvCache::diskSubtree(uint64_t blockId) const {
       continue;
     }
     const Block &entry = block(id);
-    if (id != blockId &&
-        (entry.page != noPage || entry.transferring || entry.activeUsers))
+    if (id != blockId && (entry.transferring || entry.activeUsers))
       return {};
     pending.push_back({id, true});
     if (const auto found = children.find(id); found != children.end())

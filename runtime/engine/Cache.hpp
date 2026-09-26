@@ -284,6 +284,10 @@ private:
   // false, erasing nothing, while a block of it is in transfer or in use (a
   // lookup holding a state uses its block) or a state write is in flight.
   [[nodiscard]] bool dropDiskSubtree(uint64_t block);
+  // Nothing below a block whose read failed matches any more. Once none of
+  // it is in transfer or in use, it is erased with the states on it, and
+  // the poisoned block leaves with its last user.
+  void dropPoisoned();
   // A slot for a new KV copy, replacing older copies while the quota is full.
   [[nodiscard]] std::shared_ptr<model::KvDiskSlot> acquireDiskSlot();
   // Gives up one disk copy: the oldest redundant one, KV or state, else the
@@ -308,6 +312,8 @@ private:
   // Block IDs increase from parent to child. Refill staging in that order so
   // cancellation can discard an unread suffix without stranding its parents.
   std::map<uint64_t, Restore> restores_;
+  // Blocks whose read failed, until they have left.
+  std::vector<uint64_t> poisoned_;
   uint32_t pendingPages_ = 0;
   KvTierSnapshot kvTier_;
   CacheLookupSnapshot lookup_;

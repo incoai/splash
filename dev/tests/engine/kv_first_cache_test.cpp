@@ -2022,6 +2022,68 @@ void testTransferFailures() {
   }
 }
 
+// Nothing below a block whose read failed matches any more. A block restored
+// under it and a sibling branch still on disk leave with their states once
+// the request lets go, and the prefix above gives its pages up again, even
+// after the fault has closed the tier.
+void testFailedRestoreDropsTheBlocksBelow() {
+  constexpr auto reuse = CacheReclaimMode::ReuseBacking;
+  test::TestKvBacking backing{8, 100};
+  KvPool pool{backing};
+  test::TestKvTier tier;
+  engine::Cache cache{pool, cacheNamespace(), &tier};
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  // Two prompts share three blocks and part at the fourth, which holds a
+  // state in each.
+  std::vector<uint32_t> prompt(129);
+  for (uint32_t i = 0; i < prompt.size(); ++i)
+    prompt[i] = 1000 + i;
+  std::vector<uint32_t> sibling = prompt;
+  for (uint32_t i = 96; i < sibling.size(); ++i)
+    sibling[i] = 2000 + i;
+  for (uint64_t request : {1, 2}) {
+    cache.beginRequest(request);
+    require(cache.ensureTokens(request, 128).granted(), "prefix KV failed");
+    const uint64_t last =
+        cache.publishCommittedBlocks(request, request == 1 ? prompt : sibling, 128);
+    cache.endRequest(request);
+    cache.publishCompositeState(last, std::make_shared<TieredState>(control));
+    require(cache.reclaimOneState() && cache.pollTransfers(), "state was not demoted");
+  }
+  // Both fourth blocks go to disk, then the third block they share.
+  for (int i = 0; i < 3; ++i) {
+    require(cache.reclaimOne(reuse).madeProgress, "KV demotion did not start");
+    tier.complete();
+    require(cache.pollTransfers(), "KV demotion did not finish");
+  }
+  // The shared block's read fails and the fault closes the tier; the read
+  // queued behind it still lands.
+  tier.stagingSlots = 1;
+  auto lookup = cache.lookup(prompt);
+  cache.beginRequest(3);
+  require(lookup.state && cache.restoreRequest(3, lookup).granted() && tier.restores == 1,
+          "restore was denied");
+  tier.complete(false);
+  static_cast<void>(cache.pollTransfers());
+  tier.writableFile = false;
+  tier.complete();
+  require(cache.pollTransfers() && tier.restores == 2 &&
+              cache.kvRestoreStatus(3) == KvRestoreStatus::Failed,
+          "the failed read was not reported");
+  lookup = {};
+  cache.endRequest(3);
+  const auto stats = cache.snapshot();
+  require(stats.kvCache.blocks == 2 && stats.kvTier.diskBlocks == 0 &&
+              stats.stateCache.entries == 0 && tier.slots == 0 && control->slots == 0,
+          "the blocks below a failed read or their states outlived the request");
+  require(cache.lookup(prompt).kvBoundary == 64, "the surviving prefix did not match");
+  cache.beginRequest(4);
+  require(cache.ensureTokens(4, 256).granted(),
+          "the prefix above a failed read stayed pinned in RAM");
+  cache.endRequest(4);
+}
+
 // Pressure reclaim counts pages in flight toward its target instead of
 // writing the whole chain at once.
 void testReclaimCacheCountsPendingPages() {
@@ -2297,6 +2359,7 @@ int main() {
     testDiskReplacementOrder();
     testPendingPagesGateAllocation();
     testTransferFailures();
+    testFailedRestoreDropsTheBlocksBelow();
     testReclaimCacheCountsPendingPages();
     testDemotionCostsNoSecondState();
     testPromotionIdentityAndDenial();

@@ -48,6 +48,7 @@ void Cache::endRequest(uint64_t requestId) {
     }
   }
   requests_.erase(found);
+  dropPoisoned();
 }
 
 std::vector<uint64_t>
@@ -461,7 +462,7 @@ Cache::LeafReclaim Cache::reclaimKvLeaf(uint64_t block) {
 bool Cache::dropDiskSubtree(uint64_t block) {
   if (states_.writing())
     return false;
-  const std::vector<uint64_t> subtree = kv_.diskSubtree(block);
+  const std::vector<uint64_t> subtree = kv_.subtree(block);
   if (subtree.empty())
     return false;
   for (uint64_t below : subtree) {
@@ -469,6 +470,20 @@ bool Cache::dropDiskSubtree(uint64_t block) {
     kv_.erase(below);
   }
   return true;
+}
+
+void Cache::dropPoisoned() {
+  std::erase_if(poisoned_, [&](uint64_t block) {
+    if (!kv_.contains(block))
+      return true;
+    for (uint64_t below : kv_.subtree(block)) {
+      static_cast<void>(states_.evict(below));
+      // A poisoned block below may have left with its last child.
+      if (kv_.contains(below))
+        kv_.erase(below);
+    }
+    return !kv_.contains(block);
+  });
 }
 
 uint64_t Cache::reclaimEmptyExtents() {
@@ -717,9 +732,11 @@ bool Cache::pollTransfers() {
         waiter->second.restoreFailed = true;
     }
     if (!restored) {
-      // The block leaves with its last user; so does any state it held.
+      // The block leaves with its last user; so does any state it held, and
+      // what lies below it, which no lookup reaches any more.
       states_.invalidate(block);
       kv_.poison(block);
+      poisoned_.push_back(block);
     }
     entry = restores_.erase(entry);
     progressed = true;
@@ -747,6 +764,8 @@ bool Cache::pollTransfers() {
     }
     progressed = true;
   }
+  if (progressed)
+    dropPoisoned();
   return progressed;
 }
 
