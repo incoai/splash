@@ -1,7 +1,16 @@
 #!/bin/sh
 set -eu
 
-ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+# Linked onto PATH, $0 names the link: follow it to the checkout.
+script=$0
+while [ -L "$script" ]; do
+    target=$(readlink -- "$script")
+    case $target in
+        /*) script=$target ;;
+        *) script=$(dirname -- "$script")/$target ;;
+    esac
+done
+ROOT=$(CDPATH= cd -P -- "$(dirname -- "$script")" && pwd -P)
 
 for python in "$ROOT/.venv/bin/python" python3.13 python3 python3.12 python3.14; do
     if (test -x "$python" 2>/dev/null || command -v "$python" >/dev/null 2>&1) \

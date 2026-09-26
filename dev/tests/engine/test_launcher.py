@@ -714,6 +714,45 @@ class LauncherTests(unittest.TestCase):
                 ],
             )
 
+    def test_source_script_runs_its_checkout_launcher_through_links(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            checkout = root / "checkout"
+            (checkout / "install").mkdir(parents=True)
+            (checkout / "install/launcher.py").write_text(
+                "import sys\nprint(__file__, *sys.argv[1:])\n"
+            )
+            (checkout / ".venv/bin").mkdir(parents=True)
+            (checkout / ".venv/bin/python").symlink_to(sys.executable)
+            script = checkout / "splash"
+            script.write_bytes((launcher.ROOT / "splash").read_bytes())
+            script.chmod(0o755)
+            # A relative link into the checkout, reached through an absolute one.
+            (root / "bin").mkdir()
+            (root / "bin/splash").symlink_to("../checkout/splash")
+            (root / "path").mkdir()
+            (root / "path/splash").symlink_to(root / "bin/splash")
+            # The relative link through a linked directory: its .. is physical.
+            (root / "path/linked").symlink_to("../bin")
+            for command in (
+                script,
+                root / "bin/splash",
+                root / "path/splash",
+                root / "path/linked/splash",
+            ):
+                with self.subTest(command=command):
+                    result = subprocess.run(
+                        [command, "serve", "--help"],
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(
+                        result.stdout,
+                        f"{checkout / 'install/launcher.py'} serve --help\n",
+                    )
+
     def test_source_build_lock_covers_make_and_releases_on_failure(self):
         for fail in (False, True):
             with tempfile.TemporaryDirectory() as temporary, self.subTest(fail=fail):
