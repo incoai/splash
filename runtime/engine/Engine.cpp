@@ -1258,12 +1258,9 @@ void Engine::apply(const BatchPlan &plan,
           result.outputTokens.begin(), result.outputTokens.end(),
           [&](uint32_t token) { return token >= config_.vocabularySize; });
       if (outOfVocabulary != result.outputTokens.end()) {
-        // The model emitted a token id outside the vocabulary — e.g. the
-        // 0xffffffff sentinel the sampling kernels leave when a logit row is
-        // entirely non-finite. A numerical outcome for this request, not a
-        // broken invariant: fail this lane like a model-reported result
-        // failure so the request ends before cache publication or output
-        // and the rest of the batch survives.
+        // A token outside the vocabulary, such as the 0xffffffff the sampling
+        // kernels leave for a non-finite logit row, fails this lane like a
+        // model-reported result: before any output or cache publication.
         active.failure = Failure{
             "model_result_invalid", "model emitted out-of-vocabulary token " +
                                         std::to_string(*outOfVocabulary)};

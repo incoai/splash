@@ -3290,8 +3290,6 @@ void testPrefillCanCompleteTheRequest() {
   }
 }
 
-const uint32_t defaultCheckpointTokens = EngineConfig{}.prefillCheckpointTokens;
-
 void testOutOfVocabularyOutputFailsLaneOnly() {
   Backing backing(64);
   KvPool pool(backing);
@@ -3316,16 +3314,14 @@ void testOutOfVocabularyOutputFailsLaneOnly() {
           "out-of-vocabulary failure carried the wrong code");
   require(events.completedCount == 1,
           "poisoned lane took down the rest of the batch");
-  for (const auto &[id, tokens] : events.outputs) {
-    (void)id;
-    require(std::none_of(tokens.begin(), tokens.end(),
-                         [](uint32_t token) { return token >= 1000; }),
-            "out-of-vocabulary token reached the event sink");
-  }
+  require(events.outputs[1].empty() &&
+              events.outputs[2] == std::vector<uint32_t>{42},
+          "out-of-vocabulary token reached the event sink");
   require(events.usage.count(2) == 1,
           "clean peer request did not complete");
 }
 
+const uint32_t defaultCheckpointTokens = EngineConfig{}.prefillCheckpointTokens;
 void runUntilCheckpoint(engine::Engine &engine, uint64_t publications) {
   for (uint32_t step = 0; step < 128; ++step) {
     static_cast<void>(engine.tick(step + 1));
