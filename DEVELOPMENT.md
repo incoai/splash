@@ -744,8 +744,9 @@ for the other direction. Copies ride Metal commands, including a copy-only
 command when inference is idle.
 
 A state with no available RAM cache slot can be written directly from its lane.
-Rolling checkpoints use free disk quota only and retire when replaced or no
-longer needed. With the disk tier enabled, a checkpoint less than one full
+Rolling checkpoints replace the least recently used copies like any state, so
+a suspended request keeps its progress when the quota is full; they retire when
+replaced or no longer needed. With the disk tier enabled, a checkpoint less than one full
 prefill chunk (2048 tokens) before the final replay boundary is captured only
 if a RAM slot is available without reclamation. Otherwise its predecessor stays
 usable for cancellation recovery; the final reusable state still uses the disk

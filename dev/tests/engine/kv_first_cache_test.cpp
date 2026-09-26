@@ -892,8 +892,7 @@ void testTieredWriteReuseAndFailure() {
   }
 }
 
-// A full quota replaces the least recently used copy; disposable checkpoints
-// are never written.
+// A full quota replaces the least recently used copy, for a checkpoint too.
 void testDiskQuotaReplacesByRecency() {
   CacheFixture fixture;
   auto control = std::make_shared<TransferControl>();
@@ -912,14 +911,17 @@ void testDiskQuotaReplacesByRecency() {
               fixture.lookup(129).resumeBoundary() == 128 && !fixture.lookup(33).state,
           "the older disk copy was not replaced");
   fixture.cache.publishCompositeState(fixture.blocks[1], std::make_shared<TieredState>(control), true);
-  require(fixture.cache.reclaimOneState(true) && fixture.cache.snapshot().stateCache.offloads == 2,
-          "checkpoint was not immediately reclaimable or replaced another copy");
+  require(fixture.cache.reclaimOneState(true) && fixture.cache.pollTransfers() &&
+              fixture.cache.snapshot().stateCache.offloads == 3 && control->slots == 1 &&
+              fixture.cache.snapshot().stateCache.checkpointEntries == 1 &&
+              fixture.lookup(129).resumeBoundary() == 64,
+          "checkpoint did not replace the least recently used copy");
 }
 
-// A rolling checkpoint uses the tier like any state, into free quota only:
-// straight to disk when no cache slot holds it, written under RAM pressure
-// while the quota has room and dropped when it has none, retired from both
-// tiers with its successor; under KV pressure its leaf is demoted, not dropped.
+// A rolling checkpoint uses the tier like any state: straight to disk when no
+// cache slot holds it, written under RAM pressure, replacing the least recently
+// used copy when the quota is full, retired from both tiers with its successor;
+// under KV pressure its leaf is demoted, not dropped.
 void testRollingCheckpointsUseTheTier() {
   test::TestKvTier tier;
   CacheFixture fixture(&tier);
@@ -937,7 +939,7 @@ void testRollingCheckpointsUseTheTier() {
   require(point && fixture.cache.retireCheckpointState(point) && control->slots == 0 &&
               fixture.cache.snapshot().stateCache.entries == 0,
           "retirement left the disk copy behind");
-  fixture.cache.publishCompositeState(fixture.blocks[3],
+  fixture.cache.publishCompositeState(fixture.blocks[2],
                                       std::make_shared<TieredState>(control), true);
   require(fixture.cache.reclaimOneState(true) && fixture.cache.pollTransfers(),
           "RAM checkpoint was not reclaimed");
@@ -946,12 +948,14 @@ void testRollingCheckpointsUseTheTier() {
               stats.checkpointBytes == 0 && control->slots == 1,
           "RAM checkpoint was dropped although the quota had room");
   control->capacity = 1;
-  fixture.cache.publishCompositeState(fixture.blocks[2],
+  fixture.cache.publishCompositeState(fixture.blocks[3],
                                       std::make_shared<TieredState>(control), true);
-  require(fixture.cache.reclaimOneState(true) && control->slots == 1 &&
-              fixture.cache.snapshot().stateCache.offloads == 2 &&
-              fixture.cache.snapshot().stateCache.checkpointEntries == 1,
-          "a checkpoint replaced another copy");
+  require(fixture.cache.reclaimOneState(true) && fixture.cache.pollTransfers() &&
+              control->slots == 1 && fixture.cache.snapshot().stateCache.offloads == 3 &&
+              fixture.cache.snapshot().stateCache.checkpointEntries == 1 &&
+              fixture.cache.checkpointState(fixture.blocks[3]) &&
+              !fixture.cache.checkpointState(fixture.blocks[2]),
+          "a full quota kept the older checkpoint");
   require(fixture.cache.reclaimOne(CacheReclaimMode::ReuseBacking).madeProgress &&
               tier.demotions == 1 && fixture.cache.snapshot().kvCache.blocks == 4,
           "the checkpoint's leaf was dropped instead of demoted");
