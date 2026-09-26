@@ -1,5 +1,7 @@
+import contextlib
 import fcntl
 import hashlib
+import io
 import json
 import os
 import shlex
@@ -12,7 +14,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from dev.tools import package
+from dev.tools import package, publish_test
 from install import paths
 
 
@@ -615,6 +617,66 @@ class InstallerTests(unittest.TestCase):
             self.installed(),
             ["splash-1.0-arm64-macos26", "splash-3.0-arm64-macos26"],
         )
+
+    def test_printed_tester_instructions_install_from_the_published_repo(self):
+        self.publish("1.0")
+        (self.root / "dist").symlink_to(self.releases)
+        installer = self.root / "dev/tools/install.sh"
+        installer.parent.mkdir(parents=True)
+        shutil.copy(package.ROOT / "dev/tools/install.sh", installer)
+        hub = self.root / "hub"
+        hub.mkdir()
+
+        def upload(path_or_fileobj, path_in_repo, repo_id):
+            self.assertEqual(repo_id, "owner/splash-releases")
+            data = path_or_fileobj
+            if not isinstance(data, bytes):
+                data = Path(data).read_bytes()
+            (hub / path_in_repo).write_bytes(data)
+
+        printed = io.StringIO()
+        with (
+            mock.patch.object(publish_test, "ROOT", self.root),
+            mock.patch.object(publish_test, "HfApi") as api,
+            contextlib.redirect_stdout(printed),
+        ):
+            api.return_value.upload_file.side_effect = upload
+            publish_test.main(["--version", "1.0", "--repo", "owner/splash-releases"])
+        # This curl serves the uploaded files only to requests that carry the
+        # token, as the private repo does.
+        commands = self.root / "commands"
+        commands.mkdir()
+        curl = commands / "curl"
+        curl.write_text(
+            f"#!{sys.executable}\n"
+            "import shutil, sys\n"
+            "arguments = sys.argv[1:]\n"
+            "config = arguments[arguments.index('--config') + 1]\n"
+            "header = (sys.stdin if config == '-' else open(config)).read()\n"
+            "if 'Authorization: Bearer test-token' not in header: sys.exit(22)\n"
+            "prefix = 'https://huggingface.co/owner/splash-releases/resolve/main/'\n"
+            "if not arguments[-1].startswith(prefix): sys.exit(22)\n"
+            f"source = open({str(hub)!r} + '/' + arguments[-1][len(prefix):], 'rb')\n"
+            "target = sys.stdout.buffer\n"
+            "if '-o' in arguments:\n"
+            "    target = open(arguments[arguments.index('-o') + 1], 'wb')\n"
+            "shutil.copyfileobj(source, target)\n"
+        )
+        curl.chmod(0o755)
+        result = subprocess.run(
+            ["/bin/sh", "-c", printed.getvalue().split("run:\n", 1)[1]],
+            env={
+                "PATH": str(commands) + os.pathsep + os.environ["PATH"],
+                "HOME": str(self.root / "home"),
+                "SPLASH_TOKEN": "test-token",
+                "SPLASH_BIN_DIR": str(self.bin),
+            },
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.current(), "splash-1.0-arm64-macos26")
+        self.assertIn("app/current/install/launcher.py", self.command.read_text())
 
 
 if __name__ == "__main__":
