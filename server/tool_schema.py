@@ -83,7 +83,8 @@ def json_value(value):
 
 # JSON Schema keywords whose values are schemas: maps from names to schemas,
 # then single schemas or lists of schemas. ``dependencies`` holds a schema or
-# a list of property names per entry and is told apart by shape.
+# a list of property names per entry and is told apart by shape. Draft 3's
+# ``type`` and ``disallow`` lists may hold schemas beside type names.
 SCHEMA_MAP_KEYWORDS = {
     "properties",
     "patternProperties",
@@ -108,6 +109,7 @@ SUBSCHEMA_KEYWORDS = {
     "then",
     "else",
     "contentSchema",
+    "extends",
 }
 
 
@@ -127,6 +129,8 @@ def _schemas(schema):
             children = (child for child in item.values() if not isinstance(child, list))
         elif key in SUBSCHEMA_KEYWORDS:
             children = item if isinstance(item, list) else (item,)
+        elif key in ("type", "disallow") and isinstance(item, list):
+            children = (child for child in item if isinstance(child, dict))
         else:
             continue
         for child in children:

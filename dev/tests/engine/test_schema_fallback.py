@@ -421,6 +421,46 @@ class SchemaFallbackTests(unittest.TestCase):
             tool_schema.tool_grammar(self.policy({"$ref": "#/$defs/missing"}), False)
         self.assertEqual(caught.exception.status, 400)
 
+    def test_remote_references_in_draft3_schema_keywords_are_request_errors(self):
+        # Draft 3 nests schemas under extends and in type and disallow lists.
+        # A remote reference there was accepted, and every output then failed
+        # validation with an internal error after generation.
+        remote = {"$ref": "https://example.com/schema.json"}
+        for keywords in (
+            {"extends": remote},
+            {"extends": [remote]},
+            {"disallow": [remote]},
+            {"properties": {"value": {"type": ["string", remote]}}},
+        ):
+            schema = {
+                "$schema": "http://json-schema.org/draft-03/schema#",
+                "type": "object",
+                **keywords,
+            }
+            tools = [
+                {"type": "function", "function": {"name": "t", "parameters": schema}}
+            ]
+            response_format = {"type": "json_schema", "json_schema": {"schema": schema}}
+            for normalize in (
+                lambda: tool_schema.normalize_tools(tools, None, None),
+                lambda: tool_schema.normalize_response_format(response_format),
+            ):
+                with self.subTest(keywords=keywords):
+                    with self.assertRaises(api.APIError) as caught:
+                        normalize()
+                    self.assertEqual(caught.exception.status, 400)
+                    self.assertIn("remote", caught.exception.message)
+        schema = {
+            "$schema": "http://json-schema.org/draft-03/schema#",
+            "definitions": {"text": {"type": "string"}},
+            "properties": {"value": {"extends": {"$ref": "#/definitions/text"}}},
+        }
+        _, validator = tool_schema.normalize_response_format(
+            {"type": "json_schema", "json_schema": {"schema": schema}}
+        )
+        self.assertTrue(validator.is_valid({"value": "x"}))
+        self.assertFalse(validator.is_valid({"value": 1}))
+
     def test_schemas_validation_cannot_evaluate_are_request_errors(self):
         # Draft 4 leaves $ref unchecked and draft 3 accepts any type name;
         # validating an output against either failed with an internal error.
