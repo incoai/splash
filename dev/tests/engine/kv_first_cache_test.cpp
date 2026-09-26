@@ -1744,6 +1744,37 @@ void testUnusableTierDropsTheLeafInstead() {
   deep.cache.endRequest(2);
 }
 
+// With the KV file closed by a failed write, or no KV tier at all, while the
+// state file still takes writes, a leaf's KV cannot stay on disk. A state in
+// RAM on it leaves with it, as without a tier: writing it would replace a
+// usable disk copy to make room, and the next leaf would wait for a write
+// whose copy is thrown away.
+void testStateLeavesWithALeafTheTierCannotKeep() {
+  for (const bool absent : {false, true}) {
+    test::TestKvTier tier;
+    tier.writableFile = false;
+    CacheFixture fixture(absent ? nullptr : &tier);
+    auto control = std::make_shared<TransferControl>();
+    control->capacity = 1;
+    control->ready = true;
+    // The quota holds one state: the first block's, its KV resident.
+    fixture.cache.publishCompositeState(fixture.blocks[0], std::make_shared<TieredState>(control));
+    require(fixture.cache.reclaimOneState() && fixture.cache.pollTransfers() &&
+                control->slots == 1 && fixture.lookup(33).resumeBoundary() == 32,
+            "the first state did not reach the disk");
+    fixture.cache.publishCompositeState(fixture.blocks[2], std::make_shared<TieredState>(control));
+    fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control));
+    fixture.cache.beginRequest(2);
+    require(fixture.cache.ensureTokens(2, 64).granted(),
+            "admission waited for a state write the leaf could not keep");
+    const auto stats = fixture.cache.snapshot().stateCache;
+    require(stats.offloads == 1 && stats.entries == 1 && control->slots == 1 &&
+                fixture.lookup(33).resumeBoundary() == 32,
+            "a state was written with a leaf the tier cannot keep, or replaced a usable one");
+    fixture.cache.endRequest(2);
+  }
+}
+
 // The failure seen at 23G: a leaf with disk-only children whose demotion is
 // refused must stay, not be erased under its children.
 void testParentOfDiskChildrenSurvivesRefusal() {
@@ -2352,6 +2383,7 @@ int main() {
     testTailsDropAndParentsFollowToDisk();
     testRefusedDemotionKeepsTheLeafWhileTransfersLand();
     testUnusableTierDropsTheLeafInstead();
+    testStateLeavesWithALeafTheTierCannotKeep();
     testSecondStateWaitsForTheWrite();
     testRefusedRingStopsTheScan();
     testRestoresInFlightMakeAShortfallPending();

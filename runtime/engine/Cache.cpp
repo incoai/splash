@@ -429,10 +429,13 @@ std::optional<CacheEvictionCandidate> Cache::oldestKvLeaf(uint64_t after) const 
 }
 
 Cache::LeafReclaim Cache::reclaimKvLeaf(uint64_t block) {
-  // A state in RAM goes first: to disk when the tier takes it, away
-  // otherwise. A state already on disk costs nothing and stays; one whose
-  // write must wait keeps its leaf until then.
-  if (states_.resident(block)) {
+  // While the KV can stay on disk, through the block's copy or a write the
+  // tier still takes, a state in RAM goes first: to disk when the tier takes
+  // it, away otherwise. Else it leaves with the leaf below, as without a
+  // tier, rather than being written for nothing. A state already on disk
+  // costs nothing and stays; one whose write must wait keeps its leaf until
+  // then.
+  if (states_.resident(block) && (kv_.slot(block) || (tier_ && tier_->writable()))) {
     const StateEviction eviction =
         states_.reclaim(block, completionNotifier_, makeRoom_, true);
     if (!eviction.evicted)
