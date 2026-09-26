@@ -2,9 +2,11 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <string>
 
 namespace {
 using namespace splash;
@@ -595,6 +597,50 @@ void invalidLookupsAndContextEdges() {
   ++edge[0];
   rejects([&] { (void)plans.verifyAttention(1, 24, kvLayout, edge); });
 }
+
+void verifySplitCountOverride() {
+  require(parseVerifySplitCount("1") == VerifySplitCount::One,
+          "split override 1 rejected");
+  require(parseVerifySplitCount("8") == VerifySplitCount::Eight,
+          "split override 8 rejected");
+  require(parseVerifySplitCount("16") == VerifySplitCount::Sixteen,
+          "split override 16 rejected");
+  require(parseVerifySplitCount("32") == VerifySplitCount::ThirtyTwo,
+          "split override 32 rejected");
+  rejects([] { (void)parseVerifySplitCount(""); });
+  rejects([] { (void)parseVerifySplitCount("0"); });
+  rejects([] { (void)parseVerifySplitCount("64"); });
+  rejects([] { (void)parseVerifySplitCount("eight"); });
+  rejects([] { (void)parseVerifySplitCount("32 "); });
+  rejects([] { (void)parseVerifySplitCount(" 8"); });
+  // The env-gated default must not leak across tests: save, exercise, restore.
+  const char *saved = std::getenv("SPLASH_VERIFY_SPLITS");
+  const std::string restore = saved ? saved : "";
+  const bool had = saved != nullptr;
+  unsetenv("SPLASH_VERIFY_SPLITS");
+  require(defaultVerifyAttentionConfig() == VerifyAttentionConfig{},
+          "unset split override changed the default");
+  setenv("SPLASH_VERIFY_SPLITS", "", 1);
+  require(defaultVerifyAttentionConfig() == VerifyAttentionConfig{},
+          "empty split override changed the default");
+  setenv("SPLASH_VERIFY_SPLITS", "8", 1);
+  const auto overridden = defaultVerifyAttentionConfig();
+  require(overridden.splitCount == VerifySplitCount::Eight &&
+              overridden.scalePlacement == AttentionScalePlacement::Softmax,
+          "split override not honored");
+  setenv("SPLASH_VERIFY_SPLITS", "64", 1);
+  bool threw = false;
+  try {
+    (void)defaultVerifyAttentionConfig();
+  } catch (const std::invalid_argument &) {
+    threw = true;
+  }
+  if (had)
+    setenv("SPLASH_VERIFY_SPLITS", restore.c_str(), 1);
+  else
+    unsetenv("SPLASH_VERIFY_SPLITS");
+  require(threw, "invalid split override was accepted");
+}
 } // namespace
 
 int main() {
@@ -606,6 +652,7 @@ int main() {
     policyKeysAndBounds();
     atomicInvalidChoices();
     invalidLookupsAndContextEdges();
+    verifySplitCountOverride();
     std::cout << "PASS execution plans: typed policies, device MoE tiles, atomic "
                  "install, all candidates, B1-B4 and prefill workspace bounds "
                  "(CPU only)\n";

@@ -178,6 +178,18 @@ struct VerifyAttentionConfig final {
   bool operator==(const VerifyAttentionConfig &) const = default;
 };
 
+// Parses a SPLASH_VERIFY_SPLITS value ("1", "8", "16" or "32"); anything else
+// throws. Pure and unit-testable; the environment lookup lives in
+// defaultVerifyAttentionConfig below.
+[[nodiscard]] VerifySplitCount
+parseVerifySplitCount(std::string_view text);
+// The verify fallback when no installed choice matches a workload: the
+// shipped default, unless SPLASH_VERIFY_SPLITS overrides the split base for
+// tuning runs. Installed choices always win; an empty or unset variable keeps
+// the default, while an invalid value throws instead of silently benchmarking
+// the wrong configuration.
+[[nodiscard]] VerifyAttentionConfig defaultVerifyAttentionConfig();
+
 // Immutable factory-built plans are shared by allocation, measurement and
 // encoding. Each prefill uses one split dispatch followed by one reduction.
 // Callers cannot replace a dispatch or reduce its scratch bound.
