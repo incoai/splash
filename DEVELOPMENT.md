@@ -451,7 +451,8 @@ and lists every unsupported tensor in one error:
 - token embeddings: Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, Q4_1 or PQ2_0;
 - norms, the MoE router and shared-expert scalar gate, and the GDN
   convolution, decay and time-step bias: F32;
-- GDN alpha and beta: both Q8_0 or both F32.
+- GDN alpha and beta: both Q8_0, both F32 or both BF16, which preparation
+  widens to the F32 values it equals.
 
 Of Unsloth's files in September 2026 that covers every file of Qwen3.8-27B
 and Qwen3.6-35B-A3B, from UD-IQ1_S up, but UD-Q8_K_XL and BF16, whose BF16
@@ -461,6 +462,19 @@ tensors need kernels that do not exist yet. PQ2_0 is Prism ML's type 142,
 image takes the bits per weight of its GGUF blocks, but for Q3_K's and Q6_K's
 padded meta units (1/16 bit more) and IQ3_S's chunk words (4.06 bits for its
 3.44).
+
+Prism ML's GGUFs, such as `prism-ml/Ternary-Bonsai-2-27B-gguf:PQ2_0`, store
+every projection for rotated inputs: the `prism.hadamard.*` metadata names the
+tensors whose weights multiply H (D x), H the normalized Walsh-Hadamard
+transform of each block of 1024 inputs and D an explicit sign per input, and
+the token table, whose rows are stored as H (D e). The engine runs that one
+form, on dense targets whose rotation names every quantized projection and
+the head, a PQ2_0 token table, and GDN value heads in grouped order (the
+installer screens the parameters, `GgufFile` and the planner check the rest).
+A rotated projection rotates its input once into `LinearScratch::rotated`
+(`gguf_rotate`, in fp32 and rounded once to bf16) before its quantized
+segments, whose kernels are the format's, while float segments read the input
+as it is; the table gathers each row through the inverse (`gguf_embed_rotated_pq20`).
 
 At load time the engine validates the GGUF metadata, including the rotary
 embedding and norm epsilon the kernels assume (`rope.freq_base`,

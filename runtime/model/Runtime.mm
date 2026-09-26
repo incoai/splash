@@ -1032,7 +1032,8 @@ struct Runtime::Impl {
     QwenTargetPrefillBuffers buffers;
     // Prefill plans read plain bf16 rows, so there is no input table or sums.
     buffers.linearScratch = {.partials = p(PrefillTensor::LinearPartials),
-                             .counters = p(PrefillTensor::LinearCounters)};
+                             .counters = p(PrefillTensor::LinearCounters),
+                             .rotated = p(PrefillTensor::LinearRotated)};
     buffers.hidden = {p(PrefillTensor::Hidden0), p(PrefillTensor::Hidden1)};
     buffers.normalized = p(PrefillTensor::Normalized);
     buffers.captured = p(PrefillTensor::Captured);

@@ -1,7 +1,10 @@
 #include "model/GgufFile.hpp"
 
+#include "metal/abi/Gguf.h"
+
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <limits>
 
@@ -103,6 +106,10 @@ uint64_t scalarBytes(uint32_t type) {
 // The longest metadata array kept: the vision metadata read from it has one
 // entry per block or channel, and tokenizer arrays are far longer.
 constexpr uint64_t kMaximumKeptArray = 1024;
+// Prism ML's rotation keys (GgufRotation), whose arrays are kept whole: a
+// tensor name per rotated tensor and a sign per input of each width.
+constexpr std::string_view kRotationPrefix = "prism.hadamard.";
+constexpr uint64_t kMaximumRotationArray = uint64_t{1} << 20;
 
 double numericValue(Reader &reader, uint32_t type) {
   switch (type) {
@@ -198,9 +205,23 @@ GgufFile::GgufFile(WeightSource &source) : source_(source) {
     case kFloat64: floats_[key] = reader.scalar<double>(); break;
     case kArray: {
       // Small numeric arrays of any key are kept; strings and long arrays
-      // (vocabularies, merges, token types) are skipped without reading them.
+      // (vocabularies, merges, token types) are skipped without reading them,
+      // but for the rotation's.
       const uint32_t element = reader.scalar<uint32_t>();
       const uint64_t count = reader.scalar<uint64_t>();
+      if (key.starts_with(kRotationPrefix)) {
+        if (count > kMaximumRotationArray || element == kArray)
+          throw GgufError("implausible rotation metadata: " + key);
+        if (element == kString) {
+          auto &names = names_[key];
+          for (uint64_t j = 0; j < count; ++j) names.push_back(reader.string());
+        } else {
+          auto &values = arrays_[key];
+          values.reserve(count);
+          for (uint64_t j = 0; j < count; ++j) values.push_back(numericValue(reader, element));
+        }
+        break;
+      }
       if (count > kMaximumKeptArray || element == kString || element == kArray) {
         skipArray(reader, element, count, 0);
         break;
@@ -251,6 +272,74 @@ GgufFile::GgufFile(WeightSource &source) : source_(source) {
     if (tensor.offset > dataBytes || tensor.bytes > dataBytes - tensor.offset)
       throw GgufError("tensor data runs past the end of the file: " + tensor.name);
   }
+  rotation_ = readRotation();
+}
+
+std::optional<GgufRotation> GgufFile::readRotation() const {
+  // Every rotation key, which must be one this parser knows: another one
+  // describes a rotation it cannot run.
+  std::set<std::string, std::less<>> keys;
+  const auto collect = [&](const auto &values) {
+    for (const auto &entry : values)
+      if (std::string_view(entry.first).starts_with(kRotationPrefix)) keys.insert(entry.first);
+  };
+  collect(unsigned_);
+  collect(strings_);
+  collect(floats_);
+  collect(arrays_);
+  collect(names_);
+  if (keys.empty()) return std::nullopt;
+  static constexpr std::string_view kKnown[] = {"version",       "block_size",   "transform",
+                                                "axis",          "sign_mode",    "gdn_v_grouped",
+                                                "weight_names",  "inverse_weight_names", "sign_widths",
+                                                "sign_values"};
+  for (const std::string &key : keys)
+    if (std::find(std::begin(kKnown), std::end(kKnown), std::string_view(key).substr(kRotationPrefix.size())) ==
+        std::end(kKnown))
+      throw GgufError("unsupported rotation metadata: " + key);
+  const auto key = [](std::string_view name) { return std::string(kRotationPrefix) + std::string(name); };
+  if (unsignedValue(key("version")) != 1) throw GgufError("unsupported prism.hadamard.version");
+  if (unsignedValue(key("block_size")) != GGUF_ROTATION_BLOCK ||
+      stringValue(key("transform")) != "normalized-sylvester-walsh-hadamard" ||
+      stringValue(key("axis")) != "input-last-dimension" || stringValue(key("sign_mode")) != "explicit")
+    throw GgufError("unsupported rotation: the kernels run explicit signs and normalized Sylvester "
+                    "Walsh-Hadamard blocks of " + std::to_string(GGUF_ROTATION_BLOCK) + " inputs");
+  GgufRotation rotation;
+  rotation.valueHeadsGrouped = unsignedValue(key("gdn_v_grouped")).value_or(0) != 0;
+  const auto widths = numericArray(key("sign_widths")), values = numericArray(key("sign_values"));
+  if (!widths || !values || widths->empty()) throw GgufError("rotation signs are missing");
+  size_t at = 0;
+  for (const double width : *widths) {
+    if (!(width > 0) || width != std::floor(width) || width > std::numeric_limits<uint32_t>::max() ||
+        uint64_t(width) % GGUF_ROTATION_BLOCK || width > double(values->size() - at))
+      throw GgufError("invalid rotation sign width");
+    auto [signs, inserted] = rotation.signs.emplace(uint32_t(width), std::vector<int8_t>{});
+    if (!inserted) throw GgufError("duplicate rotation sign width");
+    signs->second.reserve(uint32_t(width));
+    for (uint32_t i = 0; i < uint32_t(width); ++i, ++at) {
+      const double sign = (*values)[at];
+      if (sign != 1 && sign != -1) throw GgufError("rotation signs are +1 or -1");
+      signs->second.push_back(int8_t(sign));
+    }
+  }
+  if (at != values->size()) throw GgufError("rotation signs do not match their widths");
+  const auto named = [&](std::string_view name, std::set<std::string, std::less<>> &into) {
+    const auto found = names_.find(key(name));
+    if (found == names_.end()) return;
+    for (const std::string &tensorName : found->second) {
+      const GgufTensor &tensor = require(tensorName);
+      if (tensor.dims.size() != 2 || tensor.columns() > std::numeric_limits<uint32_t>::max() ||
+          !rotation.signs.contains(uint32_t(tensor.columns())))
+        throw GgufError("no rotation signs of the width of " + tensorName);
+      if (!into.insert(tensorName).second) throw GgufError("rotation names a tensor twice: " + tensorName);
+    }
+  };
+  named("weight_names", rotation.weights);
+  named("inverse_weight_names", rotation.tables);
+  if (rotation.weights.empty()) throw GgufError("the rotation names no weights");
+  for (const std::string &name : rotation.tables)
+    if (rotation.weights.contains(name)) throw GgufError("rotation names a tensor twice: " + name);
+  return rotation;
 }
 
 std::optional<uint64_t> GgufFile::unsignedValue(std::string_view key) const {

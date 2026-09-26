@@ -596,7 +596,11 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
   requireBytes(b.scratch.partials, scratch.partials, "partials");
   requireBytes(b.scratch.counters, scratch.counters, "counters");
   if (p.layout() == WeightLayout::Block32) {
+    if (p.rotation) requireBytes(b.scratch.rotated, rotatedBytes(k, rows), "rotated input");
     addGguf(graph, b, p, selected, gate, stats);
+    // A rotated projection's plan prepares its table, if any, from the
+    // rotated rows, which no other plan reads.
+    if (p.rotation) return {};
     // Only quantized segments run the plan's tile: float segments alone
     // leave the scratch table as it was.
     const std::vector<QuantizedSegment> &segments = p.blocks().segments;

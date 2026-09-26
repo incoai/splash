@@ -445,7 +445,8 @@ EMBEDDING_TYPES = {
 # The tensors the native loader reads from a target, and the types it accepts
 # for each (runtime/model/GgufImage.cpp): quantized projections; F32 norms,
 # small GDN vectors and MoE routers, which llama.cpp keeps unquantized and
-# which run unrounded; GDN alpha and beta both Q8_0 or both F32.
+# which run unrounded; GDN alpha and beta both Q8_0, both F32 or both BF16,
+# which preparation widens to the F32 values it equals.
 F32 = {"F32"}
 MODEL_TENSORS = {
     "token_embd.weight": EMBEDDING_TYPES,
@@ -464,8 +465,8 @@ ATTENTION_TENSORS = {
 GDN_TENSORS = {
     "attn_qkv.weight": QUANTIZED_TYPES,
     "attn_gate.weight": QUANTIZED_TYPES,
-    "ssm_alpha.weight": {"Q8_0", "F32"},
-    "ssm_beta.weight": {"Q8_0", "F32"},
+    "ssm_alpha.weight": {"Q8_0", "F32", "BF16"},
+    "ssm_beta.weight": {"Q8_0", "F32", "BF16"},
     "ssm_conv1d.weight": F32,
     "ssm_a": F32,
     "ssm_dt.bias": F32,
@@ -504,10 +505,40 @@ def loaded_tensors(metadata):
     return tensors
 
 
+# Prism ML's input rotation of a dense target: the one form the native loader
+# runs (runtime/model/GgufFile.cpp, GgufFile::readRotation), which also checks
+# the tensors the rotation names and their signs.
+ROTATION_PREFIX = "prism.hadamard."
+ROTATION = {
+    "version": 1,
+    "block_size": 1024,
+    "transform": "normalized-sylvester-walsh-hadamard",
+    "axis": "input-last-dimension",
+    "sign_mode": "explicit",
+    "gdn_v_grouped": True,
+}
+
+
+def require_rotation(metadata):
+    """Reject a rotated target (Prism ML's GGUFs) whose rotation the native
+    loader does not run: a MoE target, or other rotation parameters."""
+    if not any(key.startswith(ROTATION_PREFIX) for key in metadata.values):
+        return
+    if text_architecture(metadata) != "qwen35" or any(
+        type(metadata.values.get(ROTATION_PREFIX + key)) is not type(value)
+        or metadata.values.get(ROTATION_PREFIX + key) != value
+        for key, value in ROTATION.items()
+    ):
+        raise ModelError(
+            "this GGUF's input rotation is not one Splash runs; choose another variant"
+        )
+
+
 def require_loadable(metadata):
     """Reject a target the native loader cannot read, from its header alone,
     so an unusable file is never downloaded: every tensor it reads must be
     present, with a type it accepts for that tensor."""
+    require_rotation(metadata)
     unsupported = collections.Counter()
     for name, types in loaded_tensors(metadata).items():
         kind = metadata.tensors.get(name)

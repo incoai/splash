@@ -68,16 +68,36 @@ std::span<uint8_t> narrowToBfloat16(std::span<uint8_t> bytes, const std::string 
   return bytes.first(2 * count);
 }
 
+// BF16 values widened in place to the F32 values they equal: bytes holds
+// the BF16 values in its first half.
+std::span<uint8_t> widenToFloat32(std::span<uint8_t> bytes) {
+  const uint64_t count = bytes.size() / 4;
+  for (uint64_t i = count; i-- > 0;) {
+    uint16_t value;
+    std::memcpy(&value, bytes.data() + 2 * i, 2);
+    const uint32_t widened = uint32_t{value} << 16;
+    std::memcpy(bytes.data() + 4 * i, &widened, 4);
+  }
+  return bytes;
+}
+
+// Destination bytes of source bytes: halved when narrowed, doubled when widened.
+uint64_t copiedBytes(const gguf::Copy &copy, uint64_t sourceBytes) {
+  return copy.bfloat16 ? sourceBytes / 2 : copy.float32 ? sourceBytes * 2 : sourceBytes;
+}
+
 uint64_t copyBytes(const gguf::Copy &copy) {
-  return copy.source.rows * copy.source.rowBytes / (copy.bfloat16 ? 2 : 1);
+  return copiedBytes(copy, copy.source.rows * copy.source.rowBytes);
 }
 
 void writeCopy(const WeightSource &source, int destination, const gguf::Copy &copy,
                std::span<uint8_t> staging, const PreparationCheck &admit) {
   const gguf::TensorRows &rows = copy.source;
   // Whole rows per read where they fit; a wider row in pieces of whole values.
-  const uint64_t span = std::min<uint64_t>(rows.rowBytes, staging.size() & ~uint64_t{3});
-  const uint64_t batch = span == rows.rowBytes ? staging.size() / rows.rowBytes : 1;
+  // A widened read takes half the staging, which holds its F32 values.
+  const uint64_t room = copy.float32 ? staging.size() / 2 : staging.size();
+  const uint64_t span = std::min<uint64_t>(rows.rowBytes, room & ~uint64_t{3});
+  const uint64_t batch = span == rows.rowBytes ? room / rows.rowBytes : 1;
   for (uint64_t first = 0; first < rows.rows; first += batch) {
     const uint64_t count = std::min(batch, rows.rows - first);
     for (uint64_t column = 0; column < rows.rowBytes; column += span) {
@@ -86,8 +106,8 @@ void writeCopy(const WeightSource &source, int destination, const gguf::Copy &co
       auto bytes = staging.first(count * width);
       readRows(source, rows, first, count, column, width, bytes.data());
       if (copy.bfloat16) bytes = narrowToBfloat16(bytes, rows.name);
-      writeWeightBytes(destination, copy.destination + (first * rows.rowBytes + column) / (copy.bfloat16 ? 2 : 1),
-                       bytes);
+      if (copy.float32) bytes = widenToFloat32(staging.first(2 * count * width));
+      writeWeightBytes(destination, copy.destination + copiedBytes(copy, first * rows.rowBytes + column), bytes);
     }
   }
 }
@@ -221,6 +241,7 @@ PreparedWeight ggufImageWeight(const WeightSource &source, const gguf::Image &im
   for (const gguf::Fill &fill : image.fills) identity.record("fill", fill.offset, weightDigest(fill.bytes));
   for (const gguf::Copy &copy : image.copies) {
     identity.record("copy", copy.destination, copy.bfloat16);
+    if (copy.float32) identity.record("widen", copy.destination);
     input(copy.source);
   }
   for (const gguf::Repack &repack : image.repacks) {
@@ -241,10 +262,13 @@ void writeGgufImage(metal::MetalBackend &backend, const WeightSource &source, in
   // quantization operation. One staging buffer serves every copy.
   uint64_t copyStaging = 0;
   for (const gguf::Copy &copy : image.copies) {
-    if (!copy.source.rows || !copy.source.rowBytes || (copy.bfloat16 && copy.source.rowBytes % 4))
+    if (!copy.source.rows || !copy.source.rowBytes || (copy.bfloat16 && copy.source.rowBytes % 4) ||
+        (copy.float32 && (copy.bfloat16 || copy.source.rowBytes % 4)))
       throw GgufError("invalid prepared weight copy");
     requireRange(copy.destination, copyBytes(copy), image.bytes);
-    copyStaging = std::max(copyStaging, std::min(copy.source.rows * copy.source.rowBytes, kWeightPreparationStagingBytes));
+    // A widened copy stages its F32 values.
+    const uint64_t staged = copy.float32 ? copyBytes(copy) : copy.source.rows * copy.source.rowBytes;
+    copyStaging = std::max(copyStaging, std::min(staged, kWeightPreparationStagingBytes));
   }
   {
     std::vector<uint8_t> staging(copyStaging);

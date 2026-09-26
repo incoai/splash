@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <set>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -51,6 +52,20 @@ struct GgufTensor {
   [[nodiscard]] uint64_t elements() const;
 };
 
+// Prism ML's input rotation (prism.hadamard.* keys, metal/abi/Gguf.h): the
+// tensors whose weights were stored for rotated inputs, the token tables
+// stored rotated and the signs of each input width, one explicit int8 sign
+// per input. The parser keeps only the one transform the kernels run and
+// checks that every named tensor has the signs of its width.
+struct GgufRotation {
+  // The GDN value dimension of the rotated inputs is in grouped head order
+  // (prism.hadamard.gdn_v_grouped), not llama.cpp's tiled one.
+  bool valueHeadsGrouped = false;
+  std::set<std::string, std::less<>> weights;
+  std::set<std::string, std::less<>> tables;
+  std::map<uint32_t, std::vector<int8_t>> signs;
+};
+
 class GgufFile final {
 public:
   // Parses the header of source and sets where its tensor data starts.
@@ -63,6 +78,8 @@ public:
   [[nodiscard]] std::optional<std::string> stringValue(std::string_view key) const;
   [[nodiscard]] std::optional<double> floatValue(std::string_view key) const;
   [[nodiscard]] std::optional<std::span<const double>> numericArray(std::string_view key) const;
+  // The rotation the metadata declares, if any.
+  [[nodiscard]] const std::optional<GgufRotation> &rotation() const noexcept { return rotation_; }
 
   [[nodiscard]] const std::vector<GgufTensor> &tensors() const noexcept { return tensors_; }
   [[nodiscard]] const GgufTensor *find(std::string_view name) const noexcept;
@@ -75,6 +92,11 @@ private:
   std::map<std::string, std::string, std::less<>> strings_;
   std::map<std::string, double, std::less<>> floats_;
   std::map<std::string, std::vector<double>, std::less<>> arrays_;
+  // The string arrays of the rotation keys, the only ones kept.
+  std::map<std::string, std::vector<std::string>, std::less<>> names_;
+  std::optional<GgufRotation> rotation_;
+
+  [[nodiscard]] std::optional<GgufRotation> readRotation() const;
   std::vector<GgufTensor> tensors_;
   std::map<std::string, size_t, std::less<>> index_;
 };
