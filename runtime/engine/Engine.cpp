@@ -1078,7 +1078,7 @@ Engine::KvAdmission Engine::admitKv(const std::function<TokenAdmission()> &attem
     const bool paused = growthPaused() ||
         admission.allocationFailure == metal::AllocationFailure::HostPressure;
     const CacheReclaimResult progress = paused
-        ? CacheReclaimResult{reuseIdleBackingWhilePaused(admission)}
+        ? reuseIdleBackingWhilePaused(admission)
         : reclaimForGrowth(CacheReclaimMode::ReuseBacking);
     if (!progress.madeProgress) {
       pendingReclaim = progress.pending;
@@ -1138,15 +1138,17 @@ bool Engine::reclaimIdleState() noexcept {
 // short of pages may take idle cached pages instead of being suspended and
 // replaying its whole prefix once the pause lifts. Cache is only evicted when
 // the resident idle pages can actually cover the shortfall; otherwise the
-// request yields as before and the cache survives for later hits.
-bool Engine::reuseIdleBackingWhilePaused(const TokenAdmission &admission) {
+// request yields as before and the cache survives for later hits. A reclaim
+// that must wait for the transfer in flight makes the request wait with it,
+// as it does without the pause.
+CacheReclaimResult Engine::reuseIdleBackingWhilePaused(const TokenAdmission &admission) {
   if (reclaimIdleState())
-    return true;
+    return {true, 0};
   const KvPoolSnapshot pool = cache_.snapshot().pool;
   // Cached prefixes can also have active owners; those pages cannot be reused.
   const uint32_t reusable = pool.pagesResident - pool.pagesActive;
   if (reusable < admission.additionalPages)
-    return false;
+    return {};
   const CacheReclaimResult reused =
       cache_.reclaimOne(CacheReclaimMode::ReuseBacking);
   if (reused.madeProgress) {
@@ -1157,7 +1159,7 @@ bool Engine::reuseIdleBackingWhilePaused(const TokenAdmission &admission) {
     }
     signalResourceProgress();
   }
-  return reused.madeProgress;
+  return reused;
 }
 
 void Engine::suspendForGrowth(Request &active, uint64_t workEnd,

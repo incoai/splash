@@ -204,7 +204,8 @@ private:
   [[nodiscard]] CacheReclaimResult reclaimForGrowth(
       CacheReclaimMode mode = CacheReclaimMode::ReleaseBacking);
   [[nodiscard]] bool reclaimIdleState() noexcept;
-  [[nodiscard]] bool reuseIdleBackingWhilePaused(const TokenAdmission &admission);
+  [[nodiscard]] CacheReclaimResult reuseIdleBackingWhilePaused(
+      const TokenAdmission &admission);
   [[nodiscard]] bool growthPaused() const;
   // Memory a lane could not get, and what the engine knows about its return.
   struct Denial {

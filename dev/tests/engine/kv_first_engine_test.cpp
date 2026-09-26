@@ -3867,49 +3867,54 @@ void testSkippedCheckpointKeepsPreviousRecoveryPoint() {
 // holds the staging buffer, so the cached state that would free memory waits
 // for it, and the lane waits with it instead of failing or yielding. Once
 // the write lands the cached state is written, its block gives up its pages,
-// and the lane runs.
+// and the lane runs. Under host pressure the lane reuses the same idle
+// cached pages, so it waits for them the same way.
 void testGrowthWaitsForTheStateWriteInFlight() {
-  Backing backing(16);
-  KvPool pool(backing);
-  engine::Cache cache(pool, CacheNamespace{});
-  Executor executor;
-  Events events;
-  engine::Engine engine({.maxContext = 102400}, cache, executor, events);
-  // A write in flight from a lane still running: its block is no leaf to evict.
-  auto writing = std::make_shared<OffloadControl>();
-  cache.beginRequest(999);
-  require(cache.ensureTokens(999, 64).granted(), "fixture KV failed");
-  const auto held = cache.publishCommittedBlocks(999, std::vector<uint32_t>(64, 12), 64);
-  require(cache.publishStateToDisk(held, [&](std::function<void()>) {
-            return std::make_unique<OffloadTicket>(writing);
-          }),
-          "fixture write did not start");
-  // A cached state in RAM whose eviction must wait for that write.
-  auto cached = std::make_shared<OffloadControl>();
-  cache.beginRequest(998);
-  require(cache.ensureTokens(998, 64).granted(), "fixture KV failed");
-  const auto idle = cache.publishCommittedBlocks(998, std::vector<uint32_t>(64, 13), 64);
-  cache.publishCompositeState(idle, std::make_shared<OffloadState>(cached));
-  cache.endRequest(998);
-  // Every free page needs backing the budget refuses.
-  backing.allocationFailure = metal::AllocationFailure::EngineBudget;
-  backing.growthBlocked = true;
-  engine.submit(request(1, std::vector<uint32_t>(33, 17)));
-  static_cast<void>(engine.tick(1));
-  static_cast<void>(engine.tick(2));
-  require(events.failedCount == 0 && executor.prefillRows == 0 && executor.suspensions == 0,
-          "the lane failed or yielded while the tier was busy");
-  writing->ready = true;
-  static_cast<void>(engine.tick(3));
-  require(cache.snapshot().stateCache.offloads == 2 && cache.snapshot().stateCache.bytes == 0 &&
-              cached->released,
-          "the cached state was not written once the staging buffer was free");
-  cached->ready = true;
-  for (uint32_t step = 4; step < 20 && !engine.idle(); ++step)
-    static_cast<void>(engine.tick(step));
-  require(events.completedCount == 1 && events.failedCount == 0 && executor.suspensions == 0 &&
-              executor.prefillRows == 33,
-          "the lane did not run on the pages the written state gave up");
+  for (bool paused : {false, true}) {
+    Backing backing(16);
+    KvPool pool(backing);
+    engine::Cache cache(pool, CacheNamespace{});
+    Executor executor;
+    Events events;
+    engine::Engine engine({.maxContext = 102400, .growthPaused = [paused] { return paused; }},
+                          cache, executor, events);
+    // A write in flight from a lane still running: its block is no leaf to evict.
+    auto writing = std::make_shared<OffloadControl>();
+    cache.beginRequest(999);
+    require(cache.ensureTokens(999, 64).granted(), "fixture KV failed");
+    const auto held = cache.publishCommittedBlocks(999, std::vector<uint32_t>(64, 12), 64);
+    require(cache.publishStateToDisk(held, [&](std::function<void()>) {
+              return std::make_unique<OffloadTicket>(writing);
+            }),
+            "fixture write did not start");
+    // A cached state in RAM whose eviction must wait for that write.
+    auto cached = std::make_shared<OffloadControl>();
+    cache.beginRequest(998);
+    require(cache.ensureTokens(998, 64).granted(), "fixture KV failed");
+    const auto idle = cache.publishCommittedBlocks(998, std::vector<uint32_t>(64, 13), 64);
+    cache.publishCompositeState(idle, std::make_shared<OffloadState>(cached));
+    cache.endRequest(998);
+    // Every free page needs backing the budget, or the host, refuses.
+    backing.allocationFailure = paused ? metal::AllocationFailure::HostPressure
+                                       : metal::AllocationFailure::EngineBudget;
+    backing.growthBlocked = true;
+    engine.submit(request(1, std::vector<uint32_t>(33, 17)));
+    static_cast<void>(engine.tick(1));
+    static_cast<void>(engine.tick(2));
+    require(events.failedCount == 0 && executor.prefillRows == 0 && executor.suspensions == 0,
+            "the lane failed or yielded while the tier was busy");
+    writing->ready = true;
+    static_cast<void>(engine.tick(3));
+    require(cache.snapshot().stateCache.offloads == 2 && cache.snapshot().stateCache.bytes == 0 &&
+                cached->released,
+            "the cached state was not written once the staging buffer was free");
+    cached->ready = true;
+    for (uint32_t step = 4; step < 20 && !engine.idle(); ++step)
+      static_cast<void>(engine.tick(step));
+    require(events.completedCount == 1 && events.failedCount == 0 && executor.suspensions == 0 &&
+                executor.prefillRows == 33,
+            "the lane did not run on the pages the written state gave up");
+  }
 }
 
 // A physical shortfall is covered in one pass: when the pool cannot map
