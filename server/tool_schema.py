@@ -660,7 +660,7 @@ def json_grammar(schema, thinking):
     ]
     if thinking:
         grammar.append(f"think: TEXT <[{THINK_END_TOKEN_ID}]>")
-        grammar.append("TEXT: /(.|\\n)*/")
+        grammar.append(r"TEXT: /(?s:.*)/ & ~/(?s:.*)<\/think>(?s:.*)/")
     grammar.append("WS: /[ \\n\\r\\t]*/")
     return "\n".join(grammar) + "\n"
 
