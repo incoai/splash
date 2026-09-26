@@ -561,6 +561,11 @@ bool Engine::admit(Request &active, double now) {
       return true;
     }
     active.exactTokens = std::move(active.request.prompt);
+    // Reserve full generation capacity so decode appends avoid the one
+    // realloc that geometric growth would trigger at the first step
+    // past the prompt length.
+    active.exactTokens.reserve(uint64_t{active.promptTokens} +
+                               active.request.maxNewTokens);
     scheduler_.resourcesReady(active.request.id, resumeBoundary);
     cache_.recordLookup(lookup);
     events_.started(active.request.id,
