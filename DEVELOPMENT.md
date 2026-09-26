@@ -698,9 +698,10 @@ its next eviction needs no write while that copy remains cached.
 
 Writes happen when RAM reclamation selects a victim. States copy through one
 host staging buffer, freeing their RAM immediately. KV leaves needed by a state
-or a disk child copy through a 128-page staging ring and are released after the
-write succeeds. Unneeded tails are dropped without writing. When staging is
-busy, admission waits for the transfer instead of evicting additional victims.
+on them or below them copy through a 128-page staging ring and are released
+after the write succeeds. Unneeded tails are dropped without writing, together
+with any disk copies below them. When staging is busy, admission waits for the
+transfer instead of evicting additional victims.
 Demotions may occupy half the ring and restores three quarters, leaving room
 for the other direction. Copies ride Metal commands, including a copy-only
 command when inference is idle.

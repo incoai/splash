@@ -1653,6 +1653,52 @@ void testTailsDropAndParentsFollowToDisk() {
           "disk chain did not match up to its state");
 }
 
+// Only a state restores a disk-only chain. Once a failed state write or a
+// full quota has taken the state a disk child was written for, the parent is
+// not written for that child: both go, and the page returns at once.
+void testDiskCopiesNoStateNeedsGoWithTheLeaf() {
+  constexpr auto reuse = CacheReclaimMode::ReuseBacking;
+  {
+    test::TestKvTier tier;
+    CacheFixture fixture(&tier);
+    auto control = std::make_shared<TransferControl>();
+    fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control));
+    require(fixture.cache.reclaimOne(reuse).reclaimedBytes == 100 &&
+                fixture.cache.reclaimOne(reuse).madeProgress && tier.demotions == 1,
+            "the leaf under a state being written was not written");
+    tier.complete();
+    control->success = false;
+    control->ready = true;
+    require(fixture.cache.pollTransfers() && fixture.cache.snapshot().stateCache.entries == 0 &&
+                fixture.cache.snapshot().kvTier.diskBlocks == 1,
+            "the failed state write left its state, or the leaf did not land");
+    fixture.cache.beginRequest(2);
+    require(fixture.cache.ensureTokens(2, 64).granted() && tier.demotions == 1 &&
+                tier.slots == 0 && fixture.cache.snapshot().kvTier.diskBlocks == 0,
+            "a leaf was written for a disk child no state needs");
+    fixture.cache.endRequest(2);
+  }
+  {
+    // The quota holds one page, so the parent's demotion replaces the
+    // oldest sole copy: the child, and the state on it.
+    test::TestKvTier tier;
+    tier.capacity = 1;
+    CacheFixture fixture(&tier);
+    auto control = std::make_shared<TransferControl>();
+    control->ready = true;
+    fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control));
+    require(fixture.cache.reclaimOne(reuse).reclaimedBytes == 100 && fixture.cache.pollTransfers() &&
+                fixture.cache.reclaimOne(reuse).madeProgress && tier.demotions == 1,
+            "leaf was not written");
+    tier.complete();
+    require(fixture.cache.pollTransfers() && tier.slots == 1, "leaf did not land");
+    require(fixture.cache.reclaimOne(reuse).madeProgress && tier.demotions == 1 &&
+                tier.slots == 0 && fixture.pool.freePageCount() == 2 &&
+                fixture.cache.snapshot().stateCache.entries == 0,
+            "a leaf was written after making room took the state it was written for");
+  }
+}
+
 // A demotion the ring cannot take right now keeps its leaf: the requester is
 // told to wait, the leaf is written when the ring has room. Only a tier that
 // can never write again lets the leaf go as without a tier.
@@ -2381,6 +2427,7 @@ int main() {
     testOrdinaryPublicationUpgradesDiskCheckpoint();
     testKvDemotionAndRestoreLifecycle();
     testTailsDropAndParentsFollowToDisk();
+    testDiskCopiesNoStateNeedsGoWithTheLeaf();
     testRefusedDemotionKeepsTheLeafWhileTransfersLand();
     testUnusableTierDropsTheLeafInstead();
     testStateLeavesWithALeafTheTierCannotKeep();

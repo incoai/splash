@@ -113,6 +113,12 @@ public:
   [[nodiscard]] uint32_t page(uint64_t blockId) const;
   [[nodiscard]] std::shared_ptr<model::KvDiskSlot> slot(uint64_t blockId) const;
   [[nodiscard]] bool hasDiskChildren(uint64_t blockId) const;
+  // StateCache counts each of its entries in and out: a state restores
+  // through the KV of every block above its own.
+  void countState(uint64_t blockId, bool added) noexcept;
+  // A state sits below the block. Without one, the disk-only blocks below
+  // it are never read again.
+  [[nodiscard]] bool stateBelow(uint64_t blockId) const;
   [[nodiscard]] uint32_t activeUsers(uint64_t blockId) const;
   // A reusable state was published at this block at some point; lookups that
   // find the block without one report a lost state.
@@ -165,6 +171,7 @@ private:
     std::shared_ptr<model::KvDiskSlot> slot;
     uint32_t children = 0;
     uint32_t residentChildren = 0;
+    uint32_t statesBelow = 0;
     uint32_t activeUsers = 0;
     uint32_t depth = 0;
     uint64_t lastUsed = 0;

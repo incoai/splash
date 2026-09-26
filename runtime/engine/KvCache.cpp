@@ -243,6 +243,21 @@ bool KvCache::hasDiskChildren(uint64_t blockId) const {
   return entry.children > entry.residentChildren;
 }
 
+void KvCache::countState(uint64_t blockId, bool added) noexcept {
+  const auto found = blocks_.find(blockId);
+  if (found == blocks_.end())
+    std::terminate();
+  for (uint64_t above = found->second.parent; above;) {
+    const auto parent = blocks_.find(above);
+    if (parent == blocks_.end())
+      std::terminate();
+    added ? ++parent->second.statesBelow : --parent->second.statesBelow;
+    above = parent->second.parent;
+  }
+}
+
+bool KvCache::stateBelow(uint64_t blockId) const { return block(blockId).statesBelow > 0; }
+
 uint32_t KvCache::activeUsers(uint64_t blockId) const {
   return block(blockId).activeUsers;
 }

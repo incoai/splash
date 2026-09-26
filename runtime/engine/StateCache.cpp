@@ -398,6 +398,7 @@ StateEviction StateCache::erase(uint64_t kvBlock, bool retirement) noexcept {
   }
   unlink(target);
   entries_.erase(found);
+  kv_.countState(kvBlock, false);
   if (retirement)
     ++checkpointRetirements_;
   else
@@ -464,7 +465,9 @@ StateCache::Entry &StateCache::entryFor(uint64_t kvBlock) {
   fresh.ramNode = RecencyOrder::allocate(kvBlock);
   fresh.diskNode = RecencyOrder::allocate(kvBlock);
   fresh.publication = publications_ + 1;
-  return entries_.emplace(kvBlock, std::move(fresh)).first->second;
+  Entry &placed = entries_.emplace(kvBlock, std::move(fresh)).first->second;
+  kv_.countState(kvBlock, true);
+  return placed;
 }
 
 std::unique_ptr<StateOffload> StateCache::startWrite(const StateWriter &write,

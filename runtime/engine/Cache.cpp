@@ -445,7 +445,9 @@ Cache::LeafReclaim Cache::reclaimKvLeaf(uint64_t block) {
     kv_.dropPage(block);
     return LeafReclaim::Started;
   }
-  const bool keep = states_.contains(block) || kv_.hasDiskChildren(block);
+  // Only a state restores a disk-only chain: the leaf is written for one on
+  // it or below it, and disk copies below that no state needs go with it.
+  const bool keep = states_.contains(block) || kv_.stateBelow(block);
   if (keep) {
     const LeafReclaim demotion = demoteKv(block);
     if (demotion != LeafReclaim::Impossible)
@@ -454,9 +456,11 @@ Cache::LeafReclaim Cache::reclaimKvLeaf(uint64_t block) {
     // still write it: dropping it would orphan every copy below it. Once a
     // failed write has closed the tier, the subtree goes with it, as without
     // a tier, rather than holding the leaf's RAM until the server restarts.
-    if (kv_.hasDiskChildren(block) && (tier_->writable() || !dropDiskSubtree(block)))
+    if (kv_.stateBelow(block) && tier_->writable())
       return LeafReclaim::Impossible;
   }
+  if (kv_.hasDiskChildren(block) && !dropDiskSubtree(block))
+    return LeafReclaim::Impossible;
   static_cast<void>(states_.evict(block));
   kv_.erase(block);
   return LeafReclaim::Started;
@@ -652,6 +656,10 @@ Cache::LeafReclaim Cache::demoteKv(uint64_t block) {
   std::shared_ptr<model::KvDiskSlot> slot = acquireDiskSlot();
   if (!slot)
     return transfersInFlight() ? LeafReclaim::Pending : LeafReclaim::Impossible;
+  // Making room may have taken the states the leaf was kept for; it then
+  // goes like any leaf nothing needs.
+  if (!states_.contains(block) && !kv_.stateBelow(block))
+    return LeafReclaim::Impossible;
   auto transfer = tier_->demote(kv_.page(block), slot, completionNotifier_);
   if (!transfer) {
     ++kvTier_.demotionsRefused;

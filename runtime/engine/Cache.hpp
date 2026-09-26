@@ -263,7 +263,8 @@ private:
     Started,
     // The ring or the quota is held by transfers in flight.
     Pending,
-    // Nothing can be written: no tier, or its file failed.
+    // Nothing can be written: no tier, or its file failed. A demotion also
+    // reports it when making room took the states the leaf was kept for.
     Impossible,
   };
 
@@ -274,10 +275,11 @@ private:
   // Oldest resident KV leaf after `after` whose state, if any, is not in RAM.
   [[nodiscard]] std::optional<CacheEvictionCandidate> oldestKvLeaf(uint64_t after) const;
   // Frees the RAM of one resident KV leaf: through its disk copy when it has
-  // one, by demotion when a state or disk children depend on it, by erasure
-  // otherwise. Pending when the tier cannot take it right now. A leaf that a
-  // disk subtree depends on is dropped only once a failed write has closed
-  // the tier, together with that subtree.
+  // one, by demotion when a state on it or below it depends on it, by
+  // erasure otherwise, with any disk copies below it. Pending when the tier
+  // cannot take it right now. A leaf that a disk subtree depends on is
+  // dropped only once a failed write has closed the tier, together with
+  // that subtree.
   [[nodiscard]] LeafReclaim reclaimKvLeaf(uint64_t block);
   [[nodiscard]] LeafReclaim demoteKv(uint64_t block);
   // Erases the disk-only subtree below a resident leaf and the states on it;
