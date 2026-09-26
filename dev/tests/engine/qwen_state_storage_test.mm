@@ -70,6 +70,22 @@ bool sameBytes(const metal::MetalBuffer &buffer, const std::vector<uint8_t> &ima
          std::memcmp(buffer.contents(), image.data(), image.size()) == 0;
 }
 
+// Every byte of one parity's state, in the order its disk copy holds them.
+std::vector<std::vector<uint8_t>> stateImage(const model::QwenSlotBuffers &buffers,
+                                             uint32_t parity) {
+  std::vector<std::vector<uint8_t>> image{bytesOf(buffers.gdn[parity].stateBase)};
+  for (const auto &layer : buffers.draft) {
+    image.push_back(bytesOf(layer.keys));
+    image.push_back(bytesOf(layer.values));
+  }
+  return image;
+}
+
+template <typename Ticket> bool finishWhenReady(Ticket &ticket) {
+  while (!ticket.ready()) std::this_thread::yield();
+  return ticket.finish();
+}
+
 void testLayoutFormulas() {
   require(kTargetState.convolutionLayerBytes() == 65'536,
           "GDN convolution layer formula is wrong");
@@ -166,18 +182,7 @@ void testDiskRestore(metal::MetalBackend &backend) {
     word(buffers.draft[layer].keys) = 100 + layer;
     word(buffers.draft[layer].values) = 200 + layer;
   }
-  std::vector<std::vector<uint8_t>> images{bytesOf(buffers.gdn[0].stateBase)};
-  for (const auto &layer : buffers.draft) {
-    images.push_back(bytesOf(layer.keys));
-    images.push_back(bytesOf(layer.values));
-  }
-  const auto restoredExactly = [&] {
-    bool same = sameBytes(buffers.gdn[0].stateBase, images[0]);
-    for (size_t layer = 0; layer < buffers.draft.size(); ++layer)
-      same = same && sameBytes(buffers.draft[layer].keys, images[1 + 2 * layer]) &&
-             sameBytes(buffers.draft[layer].values, images[2 + 2 * layer]);
-    return same;
-  };
+  const auto images = stateImage(buffers, 0);
   storage.updateLengths(0, {4096, 2048, 2048, 0});
   auto source = storage.snapshot(0);
   auto write = source->offload({});
@@ -189,8 +194,7 @@ void testDiskRestore(metal::MetalBackend &backend) {
   require(storage.idleCells() == 1 && storage.idleRings() == 1,
           "demotion did not return the source buffers at once");
   static_cast<void>(storage.releaseIdle(0, 0));
-  while (!write->ready()) std::this_thread::yield();
-  require(write->finish(), "disk write failed");
+  require(finishWhenReady(*write), "disk write failed");
   write.reset();
   const auto beforeRestore = storage.actualAllocatedBytes();
   word(buffers.gdn[0].stateBase) = 0;
@@ -198,11 +202,10 @@ void testDiskRestore(metal::MetalBackend &backend) {
   bool committed = false;
   auto read = storage.beginRestore(0, *disk, true, {}, [&] { committed = true; });
   require(read && !committed, "disk restore committed before IO was consumed");
-  while (!read->ready()) std::this_thread::yield();
-  require(read->finish() && committed, "disk restore failed");
+  require(finishWhenReady(*read) && committed, "disk restore failed");
   read.reset();
   require(storage.actualAllocatedBytes() == beforeRestore, "restore allocated a second state");
-  require(restoredExactly(), "disk restore did not reproduce every state byte");
+  require(stateImage(buffers, 0) == images, "disk restore did not reproduce every state byte");
   require(word(buffers.gdn[0].stateBase) == 0x12345678 &&
               storage.metadata(0).lengths.targetTokens == 4096,
           "disk state changed target values or metadata");
@@ -212,8 +215,7 @@ void testDiskRestore(metal::MetalBackend &backend) {
             "disk state changed draft values");
   }
   read = storage.beginRestore(0, *disk, false, {}, [] {});
-  while (!read->ready()) std::this_thread::yield();
-  require(read->finish() && storage.metadata(0).lengths.draftLength == 0 &&
+  require(finishWhenReady(*read) && storage.metadata(0).lengths.draftLength == 0 &&
               storage.metadata(0).lengths.draftBase == 4096,
           "skipped draft restore retained stale context");
   auto promoted = read->snapshot();
@@ -234,7 +236,8 @@ void testDiskRestore(metal::MetalBackend &backend) {
     require(word(buffers.draft[layer].keys) == 100 + layer &&
                 word(buffers.draft[layer].values) == 200 + layer,
             "promotion aliased mutable active buffers");
-  require(restoredExactly(), "promoted snapshot did not reproduce every state byte");
+  require(stateImage(buffers, 0) == images,
+          "promoted snapshot did not reproduce every state byte");
   read.reset();
   disk.reset();
   promoted.reset();
@@ -262,11 +265,7 @@ void testDirectDiskSnapshot(metal::MetalBackend &backend) {
     fill(buffers.draft[layer].values, 21 + 2 * layer);
   }
   const auto inactive = bytesOf(buffers.gdn[0].stateBase);
-  std::vector<std::vector<uint8_t>> images{bytesOf(buffers.gdn[1].stateBase)};
-  for (const auto &layer : buffers.draft) {
-    images.push_back(bytesOf(layer.keys));
-    images.push_back(bytesOf(layer.values));
-  }
+  const auto images = stateImage(buffers, 1);
   storage.updateLengths(0, {4096, 2048, 2048, 0});
   const uint64_t before = storage.actualAllocatedBytes();
   auto write = storage.snapshotToDisk(0, {});
@@ -282,8 +281,7 @@ void testDirectDiskSnapshot(metal::MetalBackend &backend) {
   word(buffers.gdn[1].stateBase) = 0;
   requireThrows<std::logic_error>([&] { static_cast<void>(storage.snapshotToDisk(0, {})); },
                                   "a second write joined the one in flight");
-  while (!write->ready()) std::this_thread::yield();
-  require(write->finish(), "direct disk write failed");
+  require(finishWhenReady(*write), "direct disk write failed");
   write.reset();
   require(storage.snapshotToDisk(0, {}) == nullptr, "a full quota admitted a second state");
 
@@ -295,22 +293,17 @@ void testDirectDiskSnapshot(metal::MetalBackend &backend) {
   storage.updateLengths(0, {});
   bool committed = false;
   auto read = storage.beginRestore(0, *disk, true, {}, [&] { committed = true; });
-  while (!read->ready()) std::this_thread::yield();
-  require(read->finish() && committed, "restore of the direct disk copy failed");
+  require(finishWhenReady(*read) && committed, "restore of the direct disk copy failed");
   read.reset();
-  bool same = sameBytes(buffers.gdn[1].stateBase, images[0]);
-  for (size_t layer = 0; layer < buffers.draft.size(); ++layer)
-    same = same && sameBytes(buffers.draft[layer].keys, images[1 + 2 * layer]) &&
-           sameBytes(buffers.draft[layer].values, images[2 + 2 * layer]);
-  require(same && word(buffers.gdn[1].stateBase) == 0x0badf00d &&
+  require(stateImage(buffers, 1) == images &&
+              word(buffers.gdn[1].stateBase) == 0x0badf00d &&
               storage.metadata(0).lengths.targetTokens == 4096,
           "the disk copy did not reproduce the lane's active state");
   require(sameBytes(buffers.gdn[0].stateBase, inactive), "the inactive parity was touched");
   disk.reset();
   auto again = storage.snapshotToDisk(0, {});
   require(again != nullptr, "the dropped disk copy did not free its quota");
-  while (!again->ready()) std::this_thread::yield();
-  require(again->finish(), "the second direct disk write failed");
+  require(finishWhenReady(*again), "the second direct disk write failed");
   again.reset();
   storage.releaseSlot(0, 321);
 }

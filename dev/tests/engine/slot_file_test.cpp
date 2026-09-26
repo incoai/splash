@@ -79,7 +79,6 @@ int main() {
     auto second = file.acquire();
     require(first && second && file.usedBytes() == size * 2 && !file.acquire(),
             "a partial slot of the quota was granted");
-    require(first && second && !file.acquire(), "disk quota exceeded");
     std::vector<std::byte> source(size, std::byte{0xa5}), restored(size);
     auto write = file.write(first, {std::span(source).first(128), std::span(source).subspan(128)}, {});
     require(write->wait(), "slot write failed");

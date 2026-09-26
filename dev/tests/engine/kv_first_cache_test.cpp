@@ -181,6 +181,17 @@ struct CacheFixture {
   }
 };
 
+// Demotes the oldest leaves one at a time, each copy landing before the next
+// starts.
+void demoteLeaves(engine::Cache &cache, test::TestKvTier &tier, uint32_t leaves) {
+  for (uint32_t i = 0; i < leaves; ++i) {
+    require(cache.reclaimOne(CacheReclaimMode::ReuseBacking).madeProgress,
+            "KV demotion did not start");
+    tier.complete();
+    require(cache.pollTransfers(), "KV demotion did not finish");
+  }
+}
+
 void testSchedulingProbeDoesNotChangeCachePolicy() {
   CacheFixture fixture;
   const auto cachedTokens = [&](std::span<const uint32_t> prompt) {
@@ -1517,12 +1528,7 @@ void testCancelledRestoreStopsQueuedReads() {
                                           std::make_shared<TieredState>(control));
       require(fixture.cache.reclaimOneState() && fixture.cache.pollTransfers(),
               "state demotion failed");
-      for (unsigned i = 0; i < 4; ++i) {
-        require(fixture.cache.reclaimOne(CacheReclaimMode::ReuseBacking).madeProgress,
-                "KV demotion did not start");
-        tier.complete();
-        require(fixture.cache.pollTransfers(), "KV demotion did not finish");
-      }
+      demoteLeaves(fixture.cache, tier, 4);
       auto lookup = fixture.lookup(129);
       fixture.cache.beginRequest(2);
       require(fixture.cache.restoreRequest(2, lookup).granted(), "restore was denied");
@@ -2162,7 +2168,6 @@ void testTransferFailures() {
 // the request lets go, and the prefix above gives its pages up again, even
 // after the fault has closed the tier.
 void testFailedRestoreDropsTheBlocksBelow() {
-  constexpr auto reuse = CacheReclaimMode::ReuseBacking;
   test::TestKvBacking backing{8, 100};
   KvPool pool{backing};
   test::TestKvTier tier;
@@ -2187,11 +2192,7 @@ void testFailedRestoreDropsTheBlocksBelow() {
     require(cache.reclaimOneState() && cache.pollTransfers(), "state was not demoted");
   }
   // Both fourth blocks go to disk, then the third block they share.
-  for (int i = 0; i < 3; ++i) {
-    require(cache.reclaimOne(reuse).madeProgress, "KV demotion did not start");
-    tier.complete();
-    require(cache.pollTransfers(), "KV demotion did not finish");
-  }
+  demoteLeaves(cache, tier, 3);
   // The shared block's read fails and the fault closes the tier; the read
   // queued behind it still lands.
   tier.stagingSlots = 1;
@@ -2297,11 +2298,7 @@ void testRestoreKeepsTheBlockItExtends() {
   fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control));
   require(fixture.cache.reclaimOne(reuse).madeProgress && fixture.cache.pollTransfers(),
           "state was not demoted");
-  for (int demoted = 0; demoted < 2; ++demoted) {
-    require(fixture.cache.reclaimOne(reuse).madeProgress, "leaf was not demoted");
-    tier.complete();
-    require(fixture.cache.pollTransfers(), "demotion did not land");
-  }
+  demoteLeaves(fixture.cache, tier, 2);
   require(fixture.pool.freePageCount() == 2, "the last two blocks did not go to disk");
   {
     auto lookup = fixture.lookup(129);
@@ -2388,11 +2385,7 @@ void testCancelledRestoreKeepsThePageUnderANewState() {
   cache.endRequest(1);
   cache.publishCompositeState(last, std::make_shared<TieredState>(control));
   require(cache.reclaimOneState() && cache.pollTransfers(), "state was not demoted");
-  for (int i = 0; i < 3; ++i) {
-    require(cache.reclaimOne(reuse).madeProgress, "KV demotion did not start");
-    tier.complete();
-    require(cache.pollTransfers(), "KV demotion did not finish");
-  }
+  demoteLeaves(cache, tier, 3);
   // The restore reads the second block; the last two wait for staging.
   tier.stagingSlots = 1;
   auto lookup = cache.lookup(prompt);
@@ -2440,12 +2433,7 @@ void testLargeSharedDiskRestore() {
   control->ready = true;
   cache.publishCompositeState(boundary, std::make_shared<TieredState>(control));
   require(cache.reclaimOneState() && cache.pollTransfers(), "large state demotion failed");
-  for (uint32_t i = 0; i < pages; ++i) {
-    require(cache.reclaimOne(CacheReclaimMode::ReuseBacking).madeProgress,
-            "large prefix KV demotion did not progress");
-    tier.complete();
-    require(cache.pollTransfers(), "large prefix KV demotion did not finish");
-  }
+  demoteLeaves(cache, tier, pages);
   require(pool.freePageCount() == pages && tier.demotions == pages,
           "large prefix was not fully on disk");
   prompt.push_back(18);
