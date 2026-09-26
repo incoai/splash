@@ -207,8 +207,11 @@
   }
 
   function storageSet(key, value) {
-    try { localStorage.setItem(key, value); }
-    catch { /* Chat still works if browser storage is full or disabled. */ }
+    try {
+      localStorage.setItem(key, value);
+      return true;
+    }
+    catch { /* Chat still works if browser storage is full or disabled. */ return false; }
   }
 
   function cleanUserContent(content) {
@@ -249,10 +252,35 @@
     } catch { return []; }
   }
 
+  function hasImages(conversation) {
+    return conversation.messages.some(message => Array.isArray(message.content) &&
+      message.content.some(part => part.type === 'image_url'));
+  }
+
+  function withoutImages(conversation) {
+    const messages = conversation.messages.map(message => Array.isArray(message.content) ? {
+      ...message,
+      content: message.content.map(part => part.type === 'image_url' ? {type: 'text', text: '[Image not saved]'} : part)
+    } : message);
+    return {...conversation, messages};
+  }
+
   function save() {
     conversations.sort((a, b) => b.updated - a.updated);
     conversations = conversations.slice(0, 20);
-    storageSet(storeKey, JSON.stringify(conversations));
+    // Browser storage holds a few MB per site, which one photo can fill. Rather
+    // than fail every later save, store the newest chats that fit, each with its
+    // images if they still fit and without them otherwise, so a photo too large
+    // to store does not cost older chats theirs. The open page keeps its images.
+    if (!storageSet(storeKey, JSON.stringify(conversations))) {
+      const stored = [];
+      for (const conversation of conversations) {
+        const candidates = hasImages(conversation) ? [conversation, withoutImages(conversation)] : [conversation];
+        const fitting = candidates.find(candidate => storageSet(storeKey, JSON.stringify([...stored, candidate])));
+        if (!fitting) break;
+        stored.push(fitting);
+      }
+    }
     renderRecents();
   }
 
