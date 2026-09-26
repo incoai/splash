@@ -129,7 +129,8 @@ void StateCache::publish(uint64_t kvBlock,
   if (entry.ram)
     throw std::logic_error("duplicate composite state key");
   // The RAM copy joins the disk copy, or replaces one a failed read
-  // condemned; readers of that copy keep their own handle to it.
+  // condemned (a failed write leaves none); readers of that copy keep
+  // their own handle to it.
   if (entry.invalid) {
     discardDisk(entry);
     entry.invalid = false;
@@ -182,7 +183,8 @@ bool StateCache::publishToDisk(uint64_t kvBlock, const StateWriter &write,
   const bool fresh = !entries_.contains(kvBlock);
   Entry &entry = entryFor(kvBlock);
   if (entry.invalid) {
-    // The copy a failed read condemned gives way to the new one.
+    // The copy a failed read condemned gives way to the new one (a failed
+    // write leaves none).
     discardDisk(entry);
     entry.invalid = false;
   }
@@ -356,17 +358,19 @@ bool StateCache::pollOffload() {
   PendingOffload done = std::move(*pending_);
   pending_.reset();
   const bool written = done.transfer->finish();
+  // A failure counts even when its entry left or changed meanwhile.
+  if (!written)
+    ++offloadFailures_;
   auto found = entries_.find(done.kvBlock);
   if (found == entries_.end())
     return true;
   Entry &target = found->second;
   if (target.disk == done.transfer->state()) {
-    if (!written) {
-      ++offloadFailures_;
+    if (!written)
       discardDisk(target);
-    }
     if (!target.ram && !target.disk) {
-      // Nothing is left of the state; a pinned reader releases it.
+      // Nothing is left of the state; a pinned reader releases it, and a
+      // publication meanwhile takes the entry over.
       target.invalid = true;
       reindex(done.kvBlock, target);
       static_cast<void>(evict(done.kvBlock));
@@ -503,6 +507,8 @@ void StateCache::unlink(Entry &target) noexcept {
 }
 
 void StateCache::discardDisk(Entry &target) noexcept {
+  if (!target.disk)
+    return;
   diskBytes_ -= target.disk->bytes();
   target.disk.reset();
 }

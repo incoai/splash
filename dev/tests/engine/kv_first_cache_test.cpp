@@ -1249,6 +1249,77 @@ void testDiskPublicationFailure() {
           "the lost state was not recognised");
 }
 
+// A write that fails while a lookup holds its disk copy leaves the block
+// nothing; a publication there meanwhile, in RAM or on disk, takes the
+// entry over and outlives the reader.
+void testFailedWriteUnderALookup() {
+  for (bool onDisk : {false, true}) {
+    CacheFixture fixture;
+    auto control = std::make_shared<TransferControl>();
+    const auto block = fixture.blocks[3];
+    publishReusable(fixture, block, std::make_shared<TieredState>(control));
+    require(fixture.cache.reclaimOneState(), "state was not demoted");
+    auto reader = fixture.lookup(129);
+    require(reader.state && !reader.state->state()->residentBytes(),
+            "the state in flight was not served from disk");
+    control->ready = true;
+    control->success = false;
+    require(fixture.cache.pollTransfers(), "the failing write did not run");
+    auto stats = fixture.cache.snapshot().stateCache;
+    require(stats.entries == 1 && stats.pinned == 1 && stats.diskBytes == 0 &&
+                stats.offloadFailures == 1 && !fixture.lookup(129).state,
+            "a failed write under a lookup left a copy behind");
+    if (onDisk) {
+      control->success = true;
+      const StateWriter write = [&](std::function<void()>) { return writeState(control); };
+      require(fixture.cache.publishStateToDisk(block, write) && fixture.cache.pollTransfers(),
+              "the disk publication at the emptied block failed");
+    } else {
+      fixture.cache.publishCompositeState(block, std::make_shared<TestState>(100));
+    }
+    // The reader's read fails as well; it leaves with its lease.
+    fixture.cache.discardState(block, reader.state->state().get());
+    reader = {};
+    stats = fixture.cache.snapshot().stateCache;
+    require(stats.entries == 1 && stats.pinned == 0 && stats.bytes == (onDisk ? 0 : 100) &&
+                stats.diskBytes == (onDisk ? 100 : 0) && control->slots == (onDisk ? 1 : 0) &&
+                fixture.lookup(129).state,
+            "the publication did not take over the emptied entry");
+  }
+}
+
+// Every failed write is counted, also one whose entry left before it
+// landed: a checkpoint retired meanwhile, or a state a failed read
+// condemned and a new publication replaced.
+void testFailedWriteIsCountedAfterItsEntryLeft() {
+  for (bool replaced : {false, true}) {
+    CacheFixture fixture;
+    auto control = std::make_shared<TransferControl>();
+    const auto block = fixture.blocks[3];
+    if (replaced) {
+      publishReusable(fixture, block, std::make_shared<TieredState>(control));
+      require(fixture.cache.reclaimOneState(), "state was not demoted");
+      {
+        auto reader = fixture.lookup(129);
+        fixture.cache.discardState(block, reader.state->state().get());
+      }
+      fixture.cache.publishCompositeState(block, std::make_shared<TestState>(100));
+    } else {
+      const StateWriter write = [&](std::function<void()>) { return writeState(control); };
+      require(fixture.cache.publishStateToDisk(block, write, true) &&
+                  fixture.cache.retireCheckpointState(fixture.cache.checkpointState(block)),
+              "the checkpoint in flight was not retired");
+    }
+    control->ready = true;
+    control->success = false;
+    require(fixture.cache.pollTransfers(), "the failing write did not run");
+    const auto stats = fixture.cache.snapshot().stateCache;
+    require(stats.offloads == 1 && stats.offloadFailures == 1 &&
+                stats.entries == (replaced ? 1 : 0) && control->slots == 0,
+            "a failed write went uncounted");
+  }
+}
+
 // A full quota gives up its oldest copy for a state written from a lane;
 // when the disk holds nothing to give, nothing is published.
 void testDiskPublicationMakesRoom() {
@@ -2177,6 +2248,8 @@ int main() {
     testDiskReplacementSpansStatesAndKv();
     testDiskPublicationLifecycle();
     testDiskPublicationFailure();
+    testFailedWriteUnderALookup();
+    testFailedWriteIsCountedAfterItsEntryLeft();
     testDiskPublicationMakesRoom();
     testRollingCheckpointsUseTheTier();
     testDiskQuotaReplacesByRecency();
