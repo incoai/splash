@@ -2750,6 +2750,65 @@ void testRecoveryAdmitsFailedKvTargetBeforeReplaying() {
   }
 }
 
+// A resumption whose disk state fails to load goes back to waiting with the
+// same KV target: its next admission, from the prefix that remains, still
+// needs the pages of the dispatch that suspended it before replay runs.
+void testFailedResumeRestoreKeepsTheKvTarget() {
+  Backing backing(64);
+  KvPool pool(backing);
+  engine::Cache cache(pool, CacheNamespace{});
+  Executor executor;
+  executor.deniedSnapshots = 1000;
+  executor.stateTier = std::make_shared<OffloadControl>();
+  executor.stateTier->ready = true;
+  Events events;
+  engine::Engine engine({}, cache, executor, events);
+  backing.allocationFailure = metal::AllocationFailure::HostPressure;
+  const std::vector<uint32_t> prompt(129, 290);
+  engine.submit(request(290, prompt));
+  // The first dispatch reaches the replay state at 128, which goes to disk.
+  require(engine.tick(1) && engine.tick(2) && executor.prefillRows == 128 &&
+              engine.snapshot().diskStatePublications == 1,
+          "fixture did not write the replay state to disk");
+  backing.growthBlocked = true;
+  require(engine.tick(3) && engine.snapshot().resourceSuspensions == 1,
+          "the last prompt token's page did not suspend the request");
+  backing.growthBlocked = false;
+  static_cast<void>(engine.tick(103));
+  require(executor.diskReads == 1 && executor.prefillRows == 128 &&
+              engine.snapshot().resourceResumptions == 0,
+          "resumption did not wait for its disk state");
+  // The read fails and the retry finds no free cell; reclaiming for one
+  // empties the cache and releases the KV backing. Afterwards one extent
+  // (128 tokens) can come back: room for replay to start, not for the
+  // dispatch that suspended the request.
+  executor.resumeDenied = true;
+  executor.restoreControl->ready = true;
+  executor.restoreControl->success = false;
+  static_cast<void>(engine.tick(104));
+  require(cache.snapshot().stateCache.entries == 0 && pool.snapshot().pagesResident == 0 &&
+              engine.snapshot().resourceResumptions == 0,
+          "fixture did not release the failed resumption's memory");
+  executor.resumeDenied = false;
+  backing.growthAllowed = [&] { return pool.snapshot().pagesResident == 0; };
+  for (double now : {204.0, 304.0, 404.0}) {
+    static_cast<void>(engine.tick(now));
+    require(!engine.commandInFlight() && executor.prefillRows == 128 &&
+                engine.snapshot().resourceResumptions == 0 &&
+                engine.snapshot().resourceSuspensions == 1 &&
+                cache.snapshot().activeRequests == 0,
+            "replay started without the KV of the dispatch that suspended it");
+  }
+  backing.growthAllowed = {};
+  for (double now = 504; now < 530 && !engine.idle(); ++now)
+    static_cast<void>(engine.tick(now));
+  require(engine.idle() && executor.prefillRows == 128 + 129 &&
+              engine.snapshot().resourceResumptions == 1 &&
+              events.outputs.at(290) == std::vector<uint32_t>{42} &&
+              events.failedCount == 0 && cache.snapshot().activeRequests == 0,
+          "request did not replay cleanly once its KV target fit");
+}
+
 void testAdmissionReopensAfterLastSuspendedRequestResumes() {
   Backing backing(32);
   KvPool pool(backing);
@@ -4779,6 +4838,7 @@ int main() {
     testRepeatedPreemptionRespectsBackoffAndCancellation();
     testAdmissionReopensAfterLastSuspendedRequestResumes();
     testRecoveryAdmitsFailedKvTargetBeforeReplaying();
+    testFailedResumeRestoreKeepsTheKvTarget();
     testStateAdmissionWaitsForKvRelease();
     testAdmissionsWaitForBackgroundRelease();
     testAllocationCausesRemainRetryableAndDistinct();

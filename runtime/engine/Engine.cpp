@@ -570,7 +570,6 @@ bool Engine::admit(Request &active, double now) {
       deferResourceRetry(active, now, StateFailure::MemoryPressure, kv.denial.pending);
       return false;
     }
-    active.resumeKvTargetTokens = 0;
     active.resourceWait = {};
     DraftContextPlan draft = configureDraftStatePlan(
         active, resumeBoundary, lookup.junctionBoundary());
@@ -621,6 +620,7 @@ void Engine::completeAdmission(Request &active, CacheLookup &lookup,
   model_.setDraftContextPlan(active.request.id, std::move(draft));
   if (resuming) {
     active.suspended = false;
+    active.resumeKvTargetTokens = 0;
     active.replaying = true;
     armNextStateBoundary(active);
     ++counters_.resourceResumptions;
