@@ -2168,6 +2168,63 @@ void testDemotionKeepsThePageUnderANewState() {
           "the prefix under the new state is not resident");
 }
 
+// A prefill through blocks another request is restoring keeps its own pages
+// and may publish a state in RAM on one of them. When the restorer is
+// cancelled before that block's read has started, the read goes on: a state
+// in RAM sits on resident KV. Its later write into a full quota gives up
+// other copies, never the block under it.
+void testCancelledRestoreKeepsThePageUnderANewState() {
+  constexpr auto reuse = CacheReclaimMode::ReuseBacking;
+  test::TestKvBacking backing{8, 100};
+  KvPool pool{backing};
+  test::TestKvTier tier;
+  engine::Cache cache{pool, cacheNamespace(), &tier};
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  std::vector<uint32_t> prompt(129);
+  for (uint32_t i = 0; i < prompt.size(); ++i)
+    prompt[i] = 1000 + i;
+  cache.beginRequest(1);
+  require(cache.ensureTokens(1, 128).granted(), "prefix KV failed");
+  const uint64_t last = cache.publishCommittedBlocks(1, prompt, 128);
+  const uint64_t third = cache.blockAt(1, 96);
+  cache.endRequest(1);
+  cache.publishCompositeState(last, std::make_shared<TieredState>(control));
+  require(cache.reclaimOneState() && cache.pollTransfers(), "state was not demoted");
+  for (int i = 0; i < 3; ++i) {
+    require(cache.reclaimOne(reuse).madeProgress, "KV demotion did not start");
+    tier.complete();
+    require(cache.pollTransfers(), "KV demotion did not finish");
+  }
+  // The restore reads the second block; the last two wait for staging.
+  tier.stagingSlots = 1;
+  auto lookup = cache.lookup(prompt);
+  cache.beginRequest(2);
+  require(cache.restoreRequest(2, lookup).granted() && tier.restores == 1,
+          "restore was denied");
+  cache.beginRequest(3);
+  require(cache.ensureTokens(3, 97).granted() &&
+              cache.publishCommittedBlocks(3, prompt, 96) == third,
+          "the prefill did not reach the block being restored");
+  cache.publishCompositeState(third, std::make_shared<TieredState>(control));
+  cache.endRequest(3);
+  lookup = {};
+  cache.endRequest(2);
+  for (int i = 0; i < 2; ++i) {
+    tier.complete();
+    static_cast<void>(cache.pollTransfers());
+  }
+  require(tier.restores == 2 && tier.inFlight() == 0 && cache.snapshot().kvCache.blocks == 3,
+          "the cancelled restore dropped the page under a state in RAM");
+  control->capacity = control->slots;
+  require(cache.reclaimOne(reuse).reclaimedBytes == 100 && cache.pollTransfers(),
+          "the state in RAM was not written");
+  lookup = cache.lookup(std::span<const uint32_t>(prompt).first(97));
+  require(lookup.kvBoundary == 96 && lookup.state && lookup.state->kvBlock() == third &&
+              !lookup.state->state()->residentBytes(),
+          "the written state lost its block");
+}
+
 void testLargeSharedDiskRestore() {
   constexpr uint32_t pages = 4096;
   constexpr uint32_t tokens = pages * KvCache::pageTokens;
@@ -2224,6 +2281,7 @@ int main() {
     testLargeSharedDiskRestore();
     testRestoreKeepsTheBlockItExtends();
     testDemotionKeepsThePageUnderANewState();
+    testCancelledRestoreKeepsThePageUnderANewState();
     testBusyRingPreservesDiskVictim();
     testCancelledRestoreStopsQueuedReads();
     testDiskCheckpointRamAccounting();

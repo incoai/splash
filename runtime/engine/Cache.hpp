@@ -287,7 +287,8 @@ private:
   // A slot for a new KV copy, replacing older copies while the quota is full.
   [[nodiscard]] std::shared_ptr<model::KvDiskSlot> acquireDiskSlot();
   // Gives up one disk copy: the oldest redundant one, KV or state, else the
-  // oldest that is the only copy. False when the disk holds nothing to give.
+  // oldest that is the only copy, never the KV of a state in RAM. False when
+  // the disk holds nothing to give.
   [[nodiscard]] bool freeDiskSpace();
   void startRestore(uint64_t block);
   // A KV copy, a KV write or the one state write is in flight, so memory or

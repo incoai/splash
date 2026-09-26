@@ -202,6 +202,7 @@ private:
   [[nodiscard]] Entry &entryFor(uint64_t kvBlock);
   // Starts a write, giving up quota through makeRoom while the tier refuses
   // one; null while the one write in flight holds the staging buffer.
+  // makeRoom leaves states in RAM alone: reclaim holds the entry it writes.
   [[nodiscard]] std::unique_ptr<StateOffload>
   startWrite(const StateWriter &write, const std::function<void()> &completion,
              const std::function<bool()> &makeRoom);

@@ -37,10 +37,13 @@ void Cache::endRequest(uint64_t requestId) {
       std::erase(restore.waiters, requestId);
     // Unsubmitted reads have no IO to drain. Return their pages leaf first;
     // shared restores and already submitted transfers retain their ownership.
+    // So does a block another request published a state in RAM on meanwhile:
+    // a state in RAM sits on resident KV, so its read goes on.
     for (auto block = active.cachedBlocks.rbegin(); block != active.cachedBlocks.rend(); ++block) {
       const auto restore = restores_.find(*block);
       if (restore != restores_.end() && !restore->second.transfer &&
-          restore->second.waiters.empty() && kv_.abandonRestore(*block))
+          restore->second.waiters.empty() && !states_.resident(*block) &&
+          kv_.abandonRestore(*block))
         restores_.erase(restore);
     }
   }
@@ -667,7 +670,12 @@ bool Cache::freeDiskSpace() {
       kv_.setSlot(kvDuplicate->id, nullptr);
     return true;
   }
-  const auto kvLeaf = kv_.diskCandidate(false);
+  // A state in RAM sits on resident KV. Should a disk-only leaf hold one all
+  // the same, the leaf stays: that state's own write may be what asks for
+  // the room, and its reclaim holds the entry.
+  auto kvLeaf = kv_.diskCandidate(false);
+  if (kvLeaf && states_.resident(kvLeaf->id))
+    kvLeaf.reset();
   const auto stateOnly = states_.diskCandidate(false);
   if (!kvLeaf && !stateOnly)
     return false;
