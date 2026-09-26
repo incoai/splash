@@ -468,9 +468,10 @@ every projection for rotated inputs: the `prism.hadamard.*` metadata names the
 tensors whose weights multiply H (D x), H the normalized Walsh-Hadamard
 transform of each block of 1024 inputs and D an explicit sign per input, and
 the token table, whose rows are stored as H (D e). The engine runs that one
-form, on dense targets whose rotation names every quantized projection and
-the head, a PQ2_0 token table, and GDN value heads in grouped order (the
-installer screens the parameters, `GgufFile` and the planner check the rest).
+form, on dense targets whose rotation names exactly the tensors the planner
+repacks (every quantized projection and the head, and alpha/beta when Q8_0),
+a PQ2_0 token table, and GDN value heads in grouped order (the installer
+screens the parameters, `GgufFile` and the planner check the rest).
 A rotated projection rotates its input once into `LinearScratch::rotated`
 (`gguf_rotate`, in fp32 and rounded once to bf16) before its quantized
 segments, whose kernels are the format's, while float segments read the input

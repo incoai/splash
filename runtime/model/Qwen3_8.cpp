@@ -8,7 +8,7 @@ namespace splash::model {
 namespace {
 
 // Attaches a Prism ML GGUF's input rotation, which gguf::planImages checked
-// names every projection of the target and its token table: every block
+// names every quantized tensor of the target and its token table: every block
 // projection multiplies H (D x) (ops::InputRotation), the token table gathers
 // D (H r), and the GDN writes its value heads grouped, the order of the
 // rotated output projection's inputs. One signs buffer per input width; the

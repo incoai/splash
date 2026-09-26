@@ -14,7 +14,7 @@ namespace splash::test::gguf {
 using Bytes = std::vector<uint8_t>;
 
 // Metadata value types.
-inline constexpr uint32_t kUint32 = 4, kFloat32 = 6, kString = 8, kArray = 9, kUint64 = 10;
+inline constexpr uint32_t kUint32 = 4, kInt32 = 5, kFloat32 = 6, kBool = 7, kString = 8, kArray = 9, kUint64 = 10;
 // The alignment of the tensor data and of each tensor in it when the file
 // has no general.alignment key.
 inline constexpr uint64_t kAlignment = 32;
@@ -48,9 +48,31 @@ inline Key float32Key(std::string name, float value) {
   return key;
 }
 
+inline Key boolKey(std::string name, bool value) {
+  Key key{std::move(name), kBool, {}};
+  append<uint8_t>(key.value, value);
+  return key;
+}
+
 inline Key stringKey(std::string name, std::string_view value) {
   Key key{std::move(name), kString, {}};
   appendString(key.value, value);
+  return key;
+}
+
+inline Key int32ArrayKey(std::string name, const std::vector<int32_t> &values) {
+  Key key{std::move(name), kArray, {}};
+  append(key.value, kInt32);
+  append<uint64_t>(key.value, values.size());
+  for (int32_t value : values) append(key.value, value);
+  return key;
+}
+
+inline Key stringArrayKey(std::string name, const std::vector<std::string> &values) {
+  Key key{std::move(name), kArray, {}};
+  append(key.value, kString);
+  append<uint64_t>(key.value, values.size());
+  for (const std::string &value : values) appendString(key.value, value);
   return key;
 }
 

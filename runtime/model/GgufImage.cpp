@@ -340,36 +340,31 @@ Image layerImage(const GgufFile &file, const TargetGeometry &g, std::vector<std:
   return b.finish();
 }
 
-} // namespace
-
 // A rotated GGUF (GgufRotation) must name exactly what the loader rotates:
-// every quantized projection of a dense target and the head, whose inputs the
-// kernels rotate, and the token table, which the rotated gather decodes from
+// every tensor the images of a dense target repack, whose segments read
+// H (D x) (ops::InputRotation) while float segments (F32 or BF16 alpha/beta)
+// read x as it is, and the token table, which the rotated gather decodes from
 // PQ2_0 rows, with the GDN value heads of the rotated inputs grouped.
-static void requireRotation(const GgufFile &file, const TargetGeometry &g) {
+void requireRotation(const GgufFile &file, const TargetGeometry &g, const std::vector<Image> &images) {
   const GgufRotation &rotation = *file.rotation();
   if (g.sparseMoe()) throw GgufError("rotated weights are supported for dense targets only");
   if (!rotation.valueHeadsGrouped)
     throw GgufError("rotated GDN inputs must keep their value heads grouped (prism.hadamard.gdn_v_grouped)");
-  std::set<std::string, std::less<>> expected{"output.weight"};
-  for (uint32_t layer = 0; layer < g.layers; ++layer) {
-    const std::string p = prefix(layer);
-    const auto names = g.isFullAttentionLayer(layer)
-                           ? std::vector<const char *>{"attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight"}
-                           : std::vector<const char *>{"attn_qkv.weight", "attn_gate.weight", "ssm_out.weight"};
-    for (const char *name : names) expected.insert(p + name);
-    for (const char *name : {"ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"}) expected.insert(p + name);
-  }
-  if (rotation.weights != expected)
-    throw GgufError("the rotation must name every quantized projection of the target and nothing else");
+  std::set<std::string, std::less<>> repacked;
+  for (const Image &image : images)
+    for (const Repack &repack : image.repacks)
+      for (const TensorRows &source : repack.sources) repacked.insert(source.name);
+  if (rotation.weights != repacked)
+    throw GgufError("the rotation must name every quantized tensor of the target and nothing else");
   if (rotation.tables != std::set<std::string, std::less<>>{"token_embd.weight"} ||
       file.require("token_embd.weight").type != ggml::kPQ2_0)
     throw GgufError("the rotation's one token table must be token_embd.weight in PQ2_0");
 }
 
+} // namespace
+
 std::vector<Image> planImages(const GgufFile &file, const TargetGeometry &geometry) {
   requireMetadata(file, geometry);
-  if (file.rotation()) requireRotation(file, geometry);
   std::vector<std::string> problems;
   std::vector<Image> images;
   for (uint32_t layer = 0; layer < geometry.layers; ++layer)
@@ -386,6 +381,7 @@ std::vector<Image> planImages(const GgufFile &file, const TargetGeometry &geomet
     for (const std::string &problem : problems) names += (names.empty() ? "" : ", ") + problem;
     throw GgufError("GGUF tensors this build cannot load: " + names);
   }
+  if (file.rotation()) requireRotation(file, geometry, images);
   return images;
 }
 

@@ -36,7 +36,7 @@ public:
   [[nodiscard]] WeightFile head();
   [[nodiscard]] WeightFile embedding();
   // The input rotation of a Prism ML GGUF, which planImages checked names
-  // every projection of the target and its token table.
+  // every quantized tensor of the target and its token table.
   [[nodiscard]] const std::optional<GgufRotation> &rotation() const noexcept { return rotation_; }
 
 private:
