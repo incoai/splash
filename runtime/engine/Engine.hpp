@@ -246,6 +246,9 @@ private:
   void deferResourceRetry(Request &request, double nowMilliseconds,
                           StateFailure reason = StateFailure::MemoryPressure,
                           bool pending = false) noexcept;
+  // The wait limit tick() enforces, or zero while it enforces none: a
+  // pending wait that has seen progress waits for its next attempt.
+  [[nodiscard]] double resourceDeadline(const Request &request) const noexcept;
   void signalResourceProgress() noexcept;
   void apply(const BatchPlan &plan, std::span<const ModelStepResult> results,
              double wallMilliseconds, bool representativePrefillTiming);

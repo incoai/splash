@@ -184,10 +184,8 @@ bool Engine::tick(double now) {
       active.resourceWait.deadlineMilliseconds = 0.0;
       continue;
     }
-    const ResourceWait &wait = active.resourceWait;
-    const bool stalled = !(wait.pending && wait.epoch != resourceEpoch_);
-    if (!active.finalized && wait.deadlineMilliseconds > 0.0 &&
-        now >= wait.deadlineMilliseconds && stalled) {
+    const double deadline = resourceDeadline(active);
+    if (!active.finalized && deadline > 0.0 && now >= deadline) {
       finishFailure(active, {"resource_timeout", "memory did not become available within the resource wait limit", true});
       progressed = true;
     }
@@ -289,9 +287,9 @@ std::optional<double> Engine::nextWakeupMilliseconds() const {
       continue;
     if (!result || active.request.deadlineMilliseconds < *result)
       result = active.request.deadlineMilliseconds;
-    if (!draining && active.resourceWait.deadlineMilliseconds > 0.0 &&
-        (!result || active.resourceWait.deadlineMilliseconds < *result))
-      result = active.resourceWait.deadlineMilliseconds;
+    const double deadline = resourceDeadline(active);
+    if (!draining && deadline > 0.0 && (!result || deadline < *result))
+      result = deadline;
     if (draining || pending_ || (recovering && !active.suspended) ||
         active.resourceWait.retryMilliseconds <= 0.0)
       continue;
@@ -717,6 +715,12 @@ void Engine::deferResourceRetry(Request &active, double now,
     wait.deadlineMilliseconds = now + config_.resourceWaitTimeoutMilliseconds;
   wait.epoch = resourceEpoch_;
   wait.retryMilliseconds = now + kResourceRetryBackoffMilliseconds;
+}
+
+double Engine::resourceDeadline(const Request &active) const noexcept {
+  const ResourceWait &wait = active.resourceWait;
+  return wait.pending && wait.epoch != resourceEpoch_ ? 0.0
+                                                      : wait.deadlineMilliseconds;
 }
 
 void Engine::signalResourceProgress() noexcept {

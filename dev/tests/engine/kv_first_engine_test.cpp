@@ -4417,6 +4417,92 @@ void testWaitWithProgressOutlivesTheResourceLimit() {
           "resource retries lost or repeated completed KV restores");
 }
 
+// Pages that land while a command runs keep a waiting lane past its limit
+// until its next attempt, after the command. Until then that limit is no
+// wake-up: tick() does not act on it, and the native loop would poll
+// without blocking for as long as the command runs.
+void testLimitOutlivedByProgressDoesNotWakeTheLoop() {
+  constexpr auto reuse = CacheReclaimMode::ReuseBacking;
+  Backing backing(14);
+  KvPool pool(backing);
+  test::TestKvTier tier;
+  tier.capacity = 64;
+  tier.stagingSlots = 8;
+  engine::Cache cache(pool, CacheNamespace{}, &tier);
+  Executor executor;
+  executor.tier = &tier;
+  executor.decodeFinishes = false;
+  Events events;
+  engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+  // An eight-block prefix and its state move to disk entirely.
+  std::vector<uint32_t> prompt(257, 17);
+  cache.beginRequest(999);
+  require(cache.ensureTokens(999, 256).granted(), "fixture KV failed");
+  demoteState(cache, cache.publishCommittedBlocks(999, prompt, 256));
+  cache.endRequest(999);
+  for (uint32_t written = 1; written <= 8; ++written) {
+    require(cache.reclaimOne(reuse).madeProgress && tier.demotions == written,
+            "prefix block was not written");
+    tier.complete();
+    require(cache.pollTransfers(), "prefix block did not land");
+  }
+  // Six cached blocks under disk states.
+  auto transfer = std::make_shared<OffloadControl>();
+  transfer->ready = true;
+  for (uint64_t id = 900; id < 906; ++id) {
+    std::vector<uint32_t> filler(32, static_cast<uint32_t>(id));
+    cache.beginRequest(id);
+    require(cache.ensureTokens(id, 32).granted(), "filler KV failed");
+    cache.publishCompositeState(cache.publishCommittedBlocks(id, filler, 32),
+                                std::make_shared<OffloadState>(transfer));
+    cache.endRequest(id);
+    require(cache.reclaimOneState() && cache.pollTransfers(), "filler state was not demoted");
+  }
+  EngineRequest running = request(1, std::vector<uint32_t>(33, 5));
+  running.deadlineMilliseconds = 1e9;
+  engine.submit(std::move(running));
+  double now = 1.0;
+  for (int step = 0; step < 4; ++step, now += 100.0)
+    static_cast<void>(engine.tick(now));
+
+  // The running lane's next decode command is held, and the lane restoring
+  // the prefix waits for pages the tier is still writing.
+  executor.restoreControl->ready = true;
+  auto hold = std::make_shared<bool>(false);
+  executor.holdDecodeUntil = hold;
+  EngineRequest waiting = request(2, prompt);
+  waiting.deadlineMilliseconds = 1e9;
+  engine.submit(std::move(waiting));
+  for (int step = 0; step < 3; ++step, now += 100.0)
+    static_cast<void>(engine.tick(now));
+  require(engine.commandInFlight() && engine.resourceWaitSnapshot(now).memory == 1 &&
+              tier.demotions == 10 && events.starts.size() == 1,
+          "the lane did not wait for pages behind the command");
+  // The pages land, and the command is still held when the limit passes.
+  tier.complete();
+  static_cast<void>(engine.tick(now));
+  now += 31000.0;
+  require(!engine.tick(now) && events.failedCount == 0 && engine.commandInFlight(),
+          "the lane failed although pages landed since its last attempt");
+  const auto wakeup = engine.nextWakeupMilliseconds();
+  require(wakeup.has_value() && *wakeup > now,
+          "a limit tick() does not act on woke the loop");
+
+  // The command's completion wakes the loop, and the lane's next attempt
+  // takes the pages.
+  *hold = true;
+  executor.decodeFinishes = true;
+  for (int step = 0; step < 40 && !engine.idle(); ++step, now += 1.0) {
+    static_cast<void>(engine.tick(now));
+    tier.complete();
+  }
+  require(engine.idle() && events.completedCount == 2 && events.failedCount == 0 &&
+              events.starts.size() == 2 &&
+              events.starts[1].first == EngineCacheStatus::PrefixHit &&
+              events.starts[1].second == 256 && executor.restored == 256,
+          "the lane did not run on its prefix after the command");
+}
+
 // A restoring lane whose pages are all held by a resident lane waits for
 // that lane instead of giving up its prefix or failing for capacity.
 void testRestoringLaneWaitsForResidentLanes() {
@@ -4544,6 +4630,7 @@ int main() {
     testRestoringLaneWaitsForResidentLanes();
     testRestoreCompletesWhileAConstrainedLaneDecodes();
     testWaitWithProgressOutlivesTheResourceLimit();
+    testLimitOutlivedByProgressDoesNotWakeTheLoop();
     testDiskKvPrefixIsRestoredBeforeTheLaneRuns();
     testCancelledDiskPrefixStopsQueuedReads();
     testPagesReturnFromDemotionWithoutSuspending();
