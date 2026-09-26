@@ -376,35 +376,33 @@ CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode,
       return {true, bytes};
   }
 
-  // Oldest first across both kinds, after the checkpoints, which are
-  // disposable. A state whose write must wait for the one in flight stays,
-  // as does a KV leaf the ring cannot take now; the other kind may still
-  // give, and the next pass takes what waited. A waiting checkpoint holds
-  // back neither kind.
+  const auto reclaimState = [&](uint64_t block) {
+    const StateEviction eviction =
+        states_.reclaim(block, completionNotifier_, makeRoom_, true);
+    if (!eviction.evicted && !eviction.pending)
+      throw std::logic_error("state eviction candidate became pinned");
+    return eviction;
+  };
+  // Disposable checkpoints go first; one whose write must wait for the one
+  // in flight stays and holds back nothing else.
+  if (const auto oldest = states_.evictionCandidate(keepResumePoint);
+      oldest && states_.checkpoint(oldest->id)) {
+    if (const StateEviction eviction = reclaimState(oldest->id); eviction.evicted)
+      return {true, eviction.reclaimedBytes};
+  }
+
+  // Then oldest first across both kinds. A state whose write must wait for
+  // the one in flight stays, as does a KV leaf the ring cannot take now; the
+  // other kind may still give, and the next pass takes what waited.
   std::optional<CacheEvictionCandidate> state =
-      states_.evictionCandidate(keepResumePoint);
-  bool checkpoint = state && states_.checkpoint(state->id);
-  bool stateOpen = state.has_value();
-  bool kvOpen = !checkpoint;
-  bool pending = false;
-  std::optional<CacheEvictionCandidate> kv = kvOpen ? oldestKvLeaf(0) : std::nullopt;
-  while (stateOpen || (kvOpen && kv)) {
-    if (stateOpen && (!kvOpen || !kv || state->lastUsed <= kv->lastUsed)) {
-      const StateEviction eviction =
-          states_.reclaim(state->id, completionNotifier_, makeRoom_, true);
-      if (eviction.evicted)
+      states_.evictionCandidate(keepResumePoint, false);
+  std::optional<CacheEvictionCandidate> kv = oldestKvLeaf(0);
+  bool kvOpen = true;
+  while (state || (kvOpen && kv)) {
+    if (state && (!kvOpen || !kv || state->lastUsed <= kv->lastUsed)) {
+      if (const StateEviction eviction = reclaimState(state->id); eviction.evicted)
         return {true, eviction.reclaimedBytes};
-      if (!eviction.pending)
-        throw std::logic_error("state eviction candidate became pinned");
-      stateOpen = false;
-      pending = pending || transfersInFlight();
-      if (checkpoint) {
-        checkpoint = false;
-        state = states_.evictionCandidate(keepResumePoint, false);
-        stateOpen = state.has_value();
-        kvOpen = true;
-        kv = oldestKvLeaf(0);
-      }
+      state.reset();
       continue;
     }
     switch (reclaimKvLeaf(kv->id)) {
@@ -412,15 +410,15 @@ CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode,
       return {true, mode == CacheReclaimMode::ReleaseBacking ? reclaimEmptyExtents() : 0};
     case LeafReclaim::Pending:
       kvOpen = false;
-      pending = pending || transfersInFlight();
       break;
     case LeafReclaim::Impossible:
       kv = oldestKvLeaf(kv->id);
       break;
     }
   }
-  // Nothing to reclaim now; whatever is in flight still comes back.
-  return {false, 0, pending || transfersInFlight()};
+  // Nothing to reclaim now. Transfers land only in pollTransfers(), so what
+  // was in flight during the pass still is, and comes back.
+  return {false, 0, transfersInFlight()};
 }
 
 bool Cache::reclaimOneState(bool checkpointsOnly) {
