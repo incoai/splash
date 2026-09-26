@@ -505,9 +505,10 @@ def loaded_tensors(metadata):
     return tensors
 
 
-# Prism ML's input rotation of a dense target: the one form the native loader
-# runs (runtime/model/GgufFile.cpp, GgufFile::readRotation), which also checks
-# the tensors the rotation names and their signs.
+# Prism ML's input rotation of a dense target: the parameters and keys
+# GgufFile::readRotation (runtime/model/GgufFile.cpp) accepts;
+# gguf::planImages (runtime/model/GgufImage.cpp, requireRotation) refuses MoE
+# targets and ungrouped GDN value heads and checks the names.
 ROTATION_PREFIX = "prism.hadamard."
 ROTATION = {
     "version": 1,
@@ -517,17 +518,28 @@ ROTATION = {
     "sign_mode": "explicit",
     "gdn_v_grouped": True,
 }
+ROTATION_ARRAYS = {"weight_names", "inverse_weight_names", "sign_widths", "sign_values"}
 
 
 def require_rotation(metadata):
     """Reject a rotated target (Prism ML's GGUFs) whose rotation the native
-    loader does not run: a MoE target, or other rotation parameters."""
-    if not any(key.startswith(ROTATION_PREFIX) for key in metadata.values):
+    loader does not run: a MoE target, other rotation parameters or a
+    rotation key it does not know."""
+    keys = {
+        key[len(ROTATION_PREFIX) :]
+        for key in metadata.values
+        if key.startswith(ROTATION_PREFIX)
+    }
+    if not keys:
         return
-    if text_architecture(metadata) != "qwen35" or any(
-        type(metadata.values.get(ROTATION_PREFIX + key)) is not type(value)
-        or metadata.values.get(ROTATION_PREFIX + key) != value
-        for key, value in ROTATION.items()
+    if (
+        text_architecture(metadata) != "qwen35"
+        or not keys <= ROTATION.keys() | ROTATION_ARRAYS
+        or any(
+            type(metadata.values.get(ROTATION_PREFIX + key)) is not type(value)
+            or metadata.values.get(ROTATION_PREFIX + key) != value
+            for key, value in ROTATION.items()
+        )
     ):
         raise ModelError(
             "this GGUF's input rotation is not one Splash runs; choose another variant"

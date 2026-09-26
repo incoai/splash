@@ -266,6 +266,8 @@ std::optional<GgufRotation> GgufFile::readRotation() const {
   collect(arrays_);
   collect(names_);
   if (keys.empty()) return std::nullopt;
+  // install/gguf.py ROTATION and ROTATION_ARRAYS screen the same keys and
+  // values before download.
   static constexpr std::string_view kKnown[] = {"version",       "block_size",   "transform",
                                                 "axis",          "sign_mode",    "gdn_v_grouped",
                                                 "weight_names",  "inverse_weight_names", "sign_widths",

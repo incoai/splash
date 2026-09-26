@@ -304,6 +304,10 @@ class GgufMetadataTests(unittest.TestCase):
             "prism.hadamard.axis": "input-last-dimension",
             "prism.hadamard.sign_mode": "explicit",
             "prism.hadamard.gdn_v_grouped": True,
+            "prism.hadamard.weight_names": ["output.weight"],
+            "prism.hadamard.inverse_weight_names": ["token_embd.weight"],
+            "prism.hadamard.sign_widths": [1024],
+            "prism.hadamard.sign_values": [1] * 1024,
         }
         tensors = {
             name: GGML["F32"] if kind == GGML["F32"] else GGML["PQ2_0"]
@@ -321,6 +325,7 @@ class GgufMetadataTests(unittest.TestCase):
             {"prism.hadamard.block_size": 512},
             {"prism.hadamard.sign_mode": "identity"},
             {"prism.hadamard.gdn_v_grouped": False},
+            {"prism.hadamard.seed": 7},
         ):
             with self.subTest(changes=changes):
                 path = write_gguf(
@@ -422,6 +427,25 @@ class GgufMetadataTests(unittest.TestCase):
         embedding = embedding.split("}", 1)[0]
         names = re.findall(r"GGUF_FMT_(\w+)", embedding)
         self.assertEqual({types[ids[name]] for name in names}, gguf.EMBEDDING_TYPES)
+
+    def test_rotation_screen_is_the_native_loaders(self):
+        # ROTATION and ROTATION_ARRAYS must be what GgufFile::readRotation
+        # (runtime/model/GgufFile.cpp) accepts: the keys it knows, its fixed
+        # parameters and GGUF_ROTATION_BLOCK (runtime/metal/abi/Gguf.h), and
+        # the grouped GDN value heads the planner requires.
+        runtime = Path(__file__).resolve().parents[2] / "runtime"
+        source = (runtime / "model/GgufFile.cpp").read_text()
+        known = source.split("kKnown[] = {", 1)[1].split("};", 1)[0]
+        self.assertEqual(
+            set(re.findall(r'"(\w+)"', known)),
+            gguf.ROTATION.keys() | gguf.ROTATION_ARRAYS,
+        )
+        fixed = dict(re.findall(r'stringValue\(key\("(\w+)"\)\) != "([^"]+)"', source))
+        fixed["version"] = int(re.search(r'key\("version"\)\) != (\d+)', source)[1])
+        header = (runtime / "metal/abi/Gguf.h").read_text()
+        block = re.search(r"#define GGUF_ROTATION_BLOCK (\d+)u", header)[1]
+        fixed["block_size"] = int(block)
+        self.assertEqual(fixed | {"gdn_v_grouped": True}, gguf.ROTATION)
 
     def test_every_derivation_names_an_unsupported_architecture(self):
         values = fixture()
