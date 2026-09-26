@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -164,6 +165,21 @@ PagedAttention::prefillCandidates() noexcept {
       PrefillAttentionConfig{PrefillSplitMultiplier::One, AttentionScalePlacement::Cooperative},
       PrefillAttentionConfig{PrefillSplitMultiplier::Two, AttentionScalePlacement::Cooperative}};
   return configurations;
+}
+
+VerifySplitCount parseVerifySplitCount(std::string_view text) {
+  if (text == "1") return VerifySplitCount::One;
+  if (text == "8") return VerifySplitCount::Eight;
+  if (text == "16") return VerifySplitCount::Sixteen;
+  if (text == "32") return VerifySplitCount::ThirtyTwo;
+  throw std::invalid_argument(
+      "invalid SPLASH_VERIFY_SPLITS value (want 1, 8, 16 or 32)");
+}
+
+VerifyAttentionConfig defaultVerifyAttentionConfig() {
+  const char *raw = std::getenv("SPLASH_VERIFY_SPLITS");
+  if (!raw || !*raw) return {};
+  return {parseVerifySplitCount(raw), AttentionScalePlacement::Softmax};
 }
 
 std::span<const VerifyAttentionConfig>
