@@ -44,6 +44,9 @@ struct DeviceCapabilities {
 
     // Returns a stable machine-readable reason, or nullopt when valid.
     [[nodiscard]] std::optional<std::string> validationError() const;
+    // The same verdict as one line for a person: what Splash needs against
+    // what this Mac has, ending with the reason above.
+    [[nodiscard]] std::optional<std::string> validationMessage() const;
 };
 
 } // namespace splash

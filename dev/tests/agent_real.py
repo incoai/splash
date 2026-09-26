@@ -424,7 +424,7 @@ class ClientRun:
             BASE_URL,
             self.model,
             self.context,
-            launcher.RUNTIME_DIR,
+            launcher.PROFILES_DIR,
             environment,
             input_modalities=self.input_modalities,
         )
@@ -471,7 +471,7 @@ class ClientRun:
         return argv, env
 
     def hermes_messages(self):
-        path = launcher.RUNTIME_DIR / "hermes/state.db"
+        path = launcher.PROFILES_DIR / "hermes/state.db"
         with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as db:
             db.row_factory = sqlite3.Row
             if self.session is None:
@@ -719,7 +719,7 @@ class ClientRun:
                 BASE_URL,
                 self.model,
                 self.context,
-                launcher.RUNTIME_DIR,
+                launcher.PROFILES_DIR,
                 input_modalities=self.input_modalities,
             )
             env["PWD"] = str(self.workspace)

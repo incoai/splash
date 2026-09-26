@@ -260,6 +260,11 @@ private:
   AllocationFailure failure_;
 };
 
+// The capabilities a backend reads, without loading kernels or allocating:
+// enough to refuse an unsupported Mac before a model is downloaded. Only a
+// backend also exercises placement-sparse mapping.
+[[nodiscard]] DeviceCapabilities probeDeviceCapabilities();
+
 // Permits exactly one submitted-but-not-applied command on its command queue.
 class MetalBackend final {
 public:

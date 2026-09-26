@@ -1,7 +1,10 @@
 #!/bin/sh
 # Splash private-test installer for Apple Silicon Macs.
 #
-#   curl -fsSL <install.sh URL> | SPLASH_TOKEN=hf_... sh
+#   export SPLASH_TOKEN=hf_...
+#   curl -qfsSL --config - <install.sh URL> <<EOF | SPLASH_REPO=owner/repo sh
+#   header = "Authorization: Bearer $SPLASH_TOKEN"
+#   EOF
 #
 # Downloads the pinned release archive from the private Hugging Face repo,
 # verifies its SHA-256, unpacks it under ~/Library/Application Support/Splash/app,

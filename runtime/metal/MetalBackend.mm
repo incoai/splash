@@ -86,6 +86,40 @@ std::string errorDescription(NSError *error) {
     return result.empty() ? "unknown Metal error" : result;
 }
 
+void readMacosVersion(DeviceCapabilities &capabilities) {
+    const NSOperatingSystemVersion os =
+        NSProcessInfo.processInfo.operatingSystemVersion;
+    const auto component = [](NSInteger value) {
+        return value > 0 ? static_cast<uint32_t>(value) : 0U;
+    };
+    capabilities.macosMajor = component(os.majorVersion);
+    capabilities.macosMinor = component(os.minorVersion);
+    capabilities.macosPatch = component(os.patchVersion);
+}
+
+// The backend and probeDeviceCapabilities() share one reading of the device,
+// so the probe judges a Mac by the values the engine validates.
+void readDeviceCapabilities(id<MTLDevice> device,
+                            DeviceCapabilities &capabilities) {
+    capabilities.deviceName = stringFromNSString(device.name);
+    capabilities.gpuCoreCount = gpuCoreCountForDevice(device.registryID);
+    for (uint32_t family = 10; family >= 7; --family) {
+        if ([device supportsFamily:static_cast<MTLGPUFamily>(1000 + family)]) {
+            capabilities.appleGpuFamily = family;
+            break;
+        }
+    }
+    capabilities.physicalMemoryBytes = NSProcessInfo.processInfo.physicalMemory;
+    capabilities.recommendedMaxWorkingSetBytes =
+        device.recommendedMaxWorkingSetSize;
+    capabilities.maxBufferLengthBytes = device.maxBufferLength;
+    capabilities.maxThreadgroupMemoryBytes = device.maxThreadgroupMemoryLength;
+    MTLSize maximumThreads = device.maxThreadsPerThreadgroup;
+    capabilities.maxThreadgroupWidth = maximumThreads.width;
+    capabilities.hasUnifiedMemory = device.hasUnifiedMemory;
+    capabilities.supportsPlacementSparse = queryPlacementSparseSupport(device);
+}
+
 NSUInteger checkedNSUInteger(uint64_t value, std::string_view field) {
     if (value > std::numeric_limits<NSUInteger>::max()) {
         throw MetalBackendError(std::string(field) + " exceeds NSUInteger");
@@ -731,14 +765,7 @@ MetalBackend::MetalBackend(std::string metallibPath, double commandTimeoutSecond
         }
         // Check the OS floor before loading Metal resources so an unsupported
         // system reports the version requirement first.
-        const NSOperatingSystemVersion os =
-            NSProcessInfo.processInfo.operatingSystemVersion;
-        const auto component = [](NSInteger value) {
-            return value > 0 ? static_cast<uint32_t>(value) : 0U;
-        };
-        impl_->capabilities.macosMajor = component(os.majorVersion);
-        impl_->capabilities.macosMinor = component(os.minorVersion);
-        impl_->capabilities.macosPatch = component(os.patchVersion);
+        readMacosVersion(impl_->capabilities);
         if (!impl_->capabilities.meetsMinimumMacos()) {
             throw MetalBackendError(
                 "Splash requires macOS " +
@@ -783,30 +810,12 @@ MetalBackend::MetalBackend(std::string metallibPath, double commandTimeoutSecond
         }
         impl_->sampleDeviceMemory();
 
-        DeviceCapabilities &capabilities = impl_->capabilities;
-        capabilities.deviceName = stringFromNSString(impl_->device.name);
-        capabilities.gpuCoreCount = gpuCoreCountForDevice(impl_->device.registryID);
-        for (uint32_t family = 10; family >= 7; --family) {
-            if ([impl_->device supportsFamily:
-                    static_cast<MTLGPUFamily>(1000 + family)]) {
-                capabilities.appleGpuFamily = family;
-                break;
-            }
-        }
-        capabilities.physicalMemoryBytes =
-            NSProcessInfo.processInfo.physicalMemory;
-        capabilities.recommendedMaxWorkingSetBytes =
-            impl_->device.recommendedMaxWorkingSetSize;
-        capabilities.maxBufferLengthBytes = impl_->device.maxBufferLength;
-        capabilities.maxThreadgroupMemoryBytes =
-            impl_->device.maxThreadgroupMemoryLength;
-        MTLSize maximumThreads = impl_->device.maxThreadsPerThreadgroup;
-        capabilities.maxThreadgroupWidth = maximumThreads.width;
-        capabilities.hasUnifiedMemory = impl_->device.hasUnifiedMemory;
+        readDeviceCapabilities(impl_->device, impl_->capabilities);
 
-        // Query sparse support and exercise the private-buffer/placement-heap ABI.
+        // Exercise the private-buffer/placement-heap ABI the device reports;
+        // a failure fails the backend.
         if (@available(macOS 26.4, *)) {
-            if (queryPlacementSparseSupport(impl_->device)) {
+            if (impl_->capabilities.supportsPlacementSparse) {
                 impl_->sparseQueue = [impl_->device newMTL4CommandQueue];
                 impl_->sparseEvent = [impl_->device newSharedEvent];
                 if (!impl_->sparseQueue || !impl_->sparseEvent) {
@@ -879,7 +888,6 @@ MetalBackend::MetalBackend(std::string metallibPath, double commandTimeoutSecond
                         " (last signaled event=" +
                         std::to_string(impl_->sparseEvent.signaledValue) + ')');
                 }
-                capabilities.supportsPlacementSparse = true;
                 impl_->nextSparseEventValue = 2;
             }
         }
@@ -905,6 +913,17 @@ MetalBackend &MetalBackend::operator=(MetalBackend &&other) noexcept {
 
 const DeviceCapabilities &MetalBackend::capabilities() const noexcept {
     return impl_->capabilities;
+}
+
+DeviceCapabilities probeDeviceCapabilities() {
+    @autoreleasepool {
+        DeviceCapabilities capabilities;
+        readMacosVersion(capabilities);
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) throw MetalBackendError("Metal device unavailable");
+        readDeviceCapabilities(device, capabilities);
+        return capabilities;
+    }
 }
 
 void MetalBackend::checkOperation() const {

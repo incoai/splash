@@ -678,7 +678,7 @@ class LauncherTests(unittest.TestCase):
                             "PI_CODING_AGENT_DIR": str(Path(temporary) / "pi"),
                         },
                     ),
-                    mock.patch.object(launcher, "RUNTIME_DIR", Path(temporary)),
+                    mock.patch.object(launcher, "PROFILES_DIR", Path(temporary)),
                     mock.patch.object(
                         launcher.clients, "find_executable", return_value="/bin/echo"
                     ),
@@ -697,7 +697,7 @@ class LauncherTests(unittest.TestCase):
                             command.call_args.args[3:5], (MODEL_ID, 102400)
                         )
                         self.assertEqual(
-                            command.call_args.args[5], launcher._runtime_dir(port)
+                            command.call_args.args[5], launcher._profiles_dir(port)
                         )
                     self.assertEqual(
                         execute.call_count, len(launcher.clients.INSTALL_URLS)
@@ -713,6 +713,45 @@ class LauncherTests(unittest.TestCase):
                     for path in ("/status", "/v1/models")
                 ],
             )
+
+    def test_source_script_runs_its_checkout_launcher_through_links(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            checkout = root / "checkout"
+            (checkout / "install").mkdir(parents=True)
+            (checkout / "install/launcher.py").write_text(
+                "import sys\nprint(__file__, *sys.argv[1:])\n"
+            )
+            (checkout / ".venv/bin").mkdir(parents=True)
+            (checkout / ".venv/bin/python").symlink_to(sys.executable)
+            script = checkout / "splash"
+            script.write_bytes((launcher.ROOT / "splash").read_bytes())
+            script.chmod(0o755)
+            # A relative link into the checkout, reached through an absolute one.
+            (root / "bin").mkdir()
+            (root / "bin/splash").symlink_to("../checkout/splash")
+            (root / "path").mkdir()
+            (root / "path/splash").symlink_to(root / "bin/splash")
+            # The relative link through a linked directory: its .. is physical.
+            (root / "path/linked").symlink_to("../bin")
+            for command in (
+                script,
+                root / "bin/splash",
+                root / "path/splash",
+                root / "path/linked/splash",
+            ):
+                with self.subTest(command=command):
+                    result = subprocess.run(
+                        [command, "serve", "--help"],
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(
+                        result.stdout,
+                        f"{checkout / 'install/launcher.py'} serve --help\n",
+                    )
 
     def test_source_build_lock_covers_make_and_releases_on_failure(self):
         for fail in (False, True):
@@ -747,7 +786,12 @@ class LauncherTests(unittest.TestCase):
                             launcher._ensure_installed(selection(runtime))
                     else:
                         launcher._ensure_installed(selection(runtime))
-                self.assertEqual(len(calls), 1 if fail else 3)
+                self.assertEqual(len(calls), 1 if fail else 4)
+                if not fail:
+                    # The device check runs on the built binary, unlocked.
+                    self.assertEqual(
+                        calls[2], [str(launcher.paths.BINARY), "device-check"]
+                    )
                 with (runtime / "build.lock").open("a+") as probe:
                     fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
@@ -902,11 +946,58 @@ class LauncherTests(unittest.TestCase):
             ) as run,
         ):
             launcher._ensure_installed(selection(launcher.paths.MODELS))
-        run.assert_called_once()
-        command = run.call_args.args[0]
+        check, command = (call.args[0] for call in run.call_args_list)
+        self.assertEqual(check, [str(launcher.paths.BINARY), "device-check"])
         self.assertEqual(command[0], str(launcher.paths.PYTHON))
         self.assertIn("prepare", command)
         self.assertNotIn("make", command)
+
+    def test_unsupported_mac_is_refused_before_any_download(self):
+        reason = (
+            "Splash needs Apple GPU family 9 or newer (M3 or later) on macOS 26.4 "
+            "or newer, with placement-sparse buffers; this Mac has Apple M2 Max "
+            "(Apple GPU family 8) on macOS 26.4.1, with placement-sparse buffers "
+            "(apple_gpu_family_9_required)"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary, python, prepared = root / "splash", root / "python", root / "ran"
+            python.write_text(f"#!/bin/sh\ntouch '{prepared}'\n")
+            python.chmod(0o755)
+            # The binary's own line is the error, without its error: prefix;
+            # a binary killed before main() is reported whole.
+            for check, refusal in (
+                (f"echo 'error: {reason}' >&2; exit 70", reason),
+                (
+                    "echo 'error: Metal device unavailable' >&2; exit 70",
+                    "Metal device unavailable",
+                ),
+                (
+                    "printf 'dyld: Symbol not found\\n  Expected in: Metal\\n' >&2; kill -ABRT $$",
+                    "the engine's device check failed: dyld: Symbol not found\n"
+                    "  Expected in: Metal",
+                ),
+                ("exit 0", None),
+            ):
+                with (
+                    self.subTest(check=check),
+                    mock.patch.object(launcher.paths, "PACKAGED", True),
+                    mock.patch.object(launcher.paths, "BINARY", binary),
+                    mock.patch.object(launcher.paths, "PYTHON", python),
+                ):
+                    binary.write_text(
+                        f'#!/bin/sh\ntest "$*" = device-check || exit 2\n{check}\n'
+                    )
+                    binary.chmod(0o755)
+                    prepared.unlink(missing_ok=True)
+                    if refusal is None:
+                        launcher._ensure_installed(selection(root))
+                    else:
+                        with self.assertRaises(launcher.LauncherError) as refused:
+                            launcher._ensure_installed(selection(root))
+                        self.assertEqual(str(refused.exception), refusal)
+                    # Preparation, which downloads, runs only on a supported Mac.
+                    self.assertEqual(prepared.exists(), refusal is None)
 
     def test_failed_download_never_executes_server(self):
         with (

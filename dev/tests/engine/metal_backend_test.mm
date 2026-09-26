@@ -644,6 +644,9 @@ void placementProbeFailures(const std::string &metallibPath) {
         MetalBackend backend(metallibPath);
         require(!backend.capabilities().supportsPlacementSparse,
                 "unsupported device was not preserved as a capability result");
+        require(splash::metal::probeDeviceCapabilities().validationError().value_or("") ==
+                    "placement_sparse_required",
+                "the device check accepted a device without placement-sparse buffers");
     }
     {
         MethodReplacement replacement(device, @selector(supportsPlacementSparse),
@@ -1101,6 +1104,12 @@ void run(const std::string &metallibPath) {
             "threadgroup thread capability is insufficient");
     require(capabilities.supportsPlacementSparse,
             "placement-sparse capability is missing");
+    const auto probed = splash::metal::probeDeviceCapabilities();
+    require(probed.deviceName == capabilities.deviceName &&
+                probed.appleGpuFamily == capabilities.appleGpuFamily &&
+                probed.macosVersion() == capabilities.macosVersion() &&
+                probed.supportsPlacementSparse && !probed.validationMessage(),
+            "the device check read the device differently from the backend");
     require(backend.healthy(), "new backend is unhealthy");
     require(backend.submissionCount() == 0, "new backend has submissions");
     require(backend.pipelineCount() == 0, "pipeline cache is not empty");

@@ -240,6 +240,66 @@ for (const writable of [true, false]) {
 })().catch(error => { console.error(error); process.exitCode = 1; });
 """)
 
+    def test_saves_chats_that_exceed_the_storage_quota(self):
+        # Browser storage throws once the site holds more than a few MB, which
+        # one photo's data URL can fill.
+        self.run_chat(r"""
+(async () => {
+  class Storage extends Map {
+    set(key, value) {
+      let used = value.length;
+      for (const [name, stored] of this) if (name !== key) used += stored.length;
+      if (used > 10000) throw Object.assign(new Error('Quota exceeded'), {name: 'QuotaExceededError'});
+      return super.set(key, value);
+    }
+  }
+  const storage = new Storage();
+  const chat = createChat(storage);
+  async function send(text, ...images) {
+    chat.elements['new-chat'].handlers.click();
+    setText(chat, text);
+    pasteImages(chat, ...images).forEach(reading => reading.onload());
+    await flush();
+    submit(chat);
+    succeed(chat.requests.at(-1));
+    await flush();
+    // The next chat must be newer, since saved chats are ordered by time.
+    const last = Date.now();
+    while (Date.now() === last) await new Promise(resolve => setTimeout(resolve, 1));
+  }
+  const saved = () => JSON.parse(storage.get('splash-chats'));
+  const notSaved = {type: 'text', text: '[Image not saved]'};
+  const screenshot = 'S'.repeat(2000);
+  await send('screenshot', screenshot);
+  await send('huge photo', 'H'.repeat(12000));
+  // A photo too large to store even alone does not cost older chats their images.
+  assert.deepEqual(saved().map(conversation => conversation.messages[0].content), [
+    [{type: 'text', text: 'huge photo'}, notSaved],
+    [{type: 'text', text: 'screenshot'}, imagePart(screenshot)],
+  ]);
+  const [photoA, photoB] = ['A', 'B'].map(letter => letter.repeat(6000));
+  await send('old photo', photoA);
+  await send('new photo', photoB);
+  // The two photos do not fit together, so the older chat loses its image.
+  assert.deepEqual(saved().map(conversation => conversation.messages[0].content), [
+    [{type: 'text', text: 'new photo'}, imagePart(photoB)],
+    [{type: 'text', text: 'old photo'}, notSaved],
+    [{type: 'text', text: 'huge photo'}, notSaved],
+    [{type: 'text', text: 'screenshot'}, imagePart(screenshot)],
+  ]);
+  // Chats that do not fit even without images leave out the oldest chats.
+  for (const name of ['one', 'two', 'three']) await send(`${name} ${'x'.repeat(3500)}`);
+  assert.deepEqual(saved().map(conversation => conversation.title.split(' ')[0]), ['three', 'two']);
+  // The open page keeps every chat with its images.
+  assert.equal(chat.elements.recents.children.length, 7);
+  chat.elements.recents.children[4].handlers.click();
+  setText(chat, 'again');
+  submit(chat);
+  assert.deepEqual(chat.requests.at(-1).body.messages[0].content,
+    [{type: 'text', text: 'old photo'}, imagePart(photoA)]);
+})().catch(error => { console.error(error); process.exitCode = 1; });
+""")
+
     def test_enter_preserves_composition_and_shift_but_sends_normal_input(self):
         self.run_chat(r"""
 for (const [name, overrides, shouldSend] of [

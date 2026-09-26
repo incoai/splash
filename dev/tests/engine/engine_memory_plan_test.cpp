@@ -172,6 +172,37 @@ void testDeviceValidationNamesTheMacosFloor() {
   require(!newer.validationError(), "a newer macOS major was refused");
 }
 
+void testDeviceValidationMessageNamesWhatTheMacHas() {
+  require(!device().validationMessage(),
+          "the reference device has a validation message");
+  const std::string needs =
+      "Splash needs Apple GPU family 9 or newer (M3 or later) on macOS 26.4 "
+      "or newer, with placement-sparse buffers; this Mac has ";
+  DeviceCapabilities m2 = device();
+  m2.deviceName = "Apple M2 Max";
+  m2.appleGpuFamily = 8;
+  m2.macosPatch = 1;
+  require(m2.validationMessage().value_or("") ==
+              needs + "Apple M2 Max (Apple GPU family 8) on macOS 26.4.1, "
+                      "with placement-sparse buffers "
+                      "(apple_gpu_family_9_required)",
+          "a family-8 GPU was not named against the family required");
+  DeviceCapabilities older = device();
+  older.macosMinor = 3;
+  older.supportsPlacementSparse = false;
+  require(older.validationMessage().value_or("") ==
+              needs + "test (Apple GPU family 9) on macOS 26.3.0, where "
+                      "placement-sparse support cannot be queried "
+                      "(macos_26_4_required)",
+          "an older macOS was not named against the macOS required");
+  DeviceCapabilities dense = device();
+  dense.supportsPlacementSparse = false;
+  require(dense.validationMessage().value_or("") ==
+              needs + "test (Apple GPU family 9) on macOS 26.4.0, without "
+                      "placement-sparse buffers (placement_sparse_required)",
+          "missing placement-sparse buffers were not named");
+}
+
 int main() {
   try {
     testUnifiedElasticBudget();
@@ -180,6 +211,7 @@ int main() {
     testHardBudgetBoundaries();
     testModelProvidedKvGeometry();
     testDeviceValidationNamesTheMacosFloor();
+    testDeviceValidationMessageNamesWhatTheMacHas();
     std::cout << "elastic memory plan tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

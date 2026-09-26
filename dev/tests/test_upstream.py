@@ -276,8 +276,13 @@ class UpstreamTest(unittest.TestCase):
                 chosen = selection(self.root, "user/custom", language_only=False)
                 with self.assertRaisesRegex(
                     models.ModelError, "must come from the target repository"
-                ):
+                ) as refused:
                     self.prepare(chosen)
+                # A text-only checkpoint lacks only the processor.
+                self.assertEqual(
+                    "use --language-only to serve text only" in str(refused.exception),
+                    missing == "preprocessor_config.json",
+                )
                 self.assertEqual(fake.downloads, [])
                 self.assertFalse(chosen.models_root.exists())
                 shutil.rmtree(fake.remote)

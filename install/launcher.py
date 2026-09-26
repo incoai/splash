@@ -25,6 +25,7 @@ except ImportError:  # Executed directly by the source or packaged entry point.
 
 ROOT = paths.ROOT
 RUNTIME_DIR = paths.RUNTIME
+PROFILES_DIR = paths.PROFILES
 PORT = 8000
 # A copy: the launcher runs before .venv exists; server/chat_templates imports Jinja2.
 REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
@@ -38,8 +39,8 @@ def _base_url(port):
     return f"http://127.0.0.1:{port}"
 
 
-def _runtime_dir(port):
-    return RUNTIME_DIR if port == PORT else RUNTIME_DIR / "ports" / str(port)
+def _profiles_dir(port):
+    return PROFILES_DIR if port == PORT else PROFILES_DIR / "ports" / str(port)
 
 
 def _request_json(path, timeout=2, *, port=PORT):
@@ -85,6 +86,20 @@ def _ensure_installed(selection):
                     command, cwd=ROOT, pass_fds=(lock.fileno(),)
                 ).returncode:
                     raise LauncherError("source build failed; see the output above")
+    # The engine refuses an unsupported Mac only once the model is prepared;
+    # its own check refuses it before tens of GB are downloaded.
+    check = subprocess.run(
+        [str(paths.BINARY), "device-check"], capture_output=True, text=True
+    )
+    if check.returncode:
+        # The binary's own refusal is its last line; one that dies before
+        # main() (dyld on an older macOS) leaves a report worth showing whole.
+        report = check.stderr.strip()
+        raise LauncherError(
+            report.splitlines()[-1].removeprefix("error: ")
+            if check.returncode > 0 and report
+            else f"the engine's device check failed: {report or f'status {check.returncode}'}"
+        )
     command = [
         str(paths.PYTHON),
         str(ROOT / "install/models.py"),
@@ -283,7 +298,7 @@ def coding_client(args):
         _base_url(args.port),
         model,
         context,
-        _runtime_dir(args.port),
+        _profiles_dir(args.port),
         input_modalities=models[0].get("input_modalities"),
         client_args=args.client_args,
         client_version=client_version,

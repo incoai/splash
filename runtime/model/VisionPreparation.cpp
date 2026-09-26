@@ -85,8 +85,8 @@ void writeSection(int destination, const Section &s, uint32_t pixels, Staging &s
         for (uint32_t c = 0; c < s.columns; ++c) {
           const uint32_t channel = c / (2 * pixels), frame = c / pixels % 2, pixel = c % pixels;
           output[uint64_t(r) * s.storedColumns + c] =
-              frames == 1 ? values[uint64_t(r) * columns + (frame * pixels + pixel) * 3 + channel]
-                          : values[(uint64_t(frame) * count + r) * columns + channel * pixels + pixel];
+              frames == 1 ? values[uint64_t(r) * columns + (uint64_t(frame) * pixels + pixel) * 3 + channel]
+                          : values[(uint64_t(frame) * count + r) * columns + uint64_t(channel) * pixels + pixel];
         }
     }
     writeWeightBytes(destination, s.offset + row * storedRowBytes,

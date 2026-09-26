@@ -504,6 +504,17 @@ def parse_tool_calls(text, request_id, policy=None):
     return ("" if calls and not content.strip() else content), calls
 
 
+def _validate(validator, value):
+    try:
+        validator.validate(value)
+    except AttributeError as error:
+        # referencing's draft 3 crawls the keys of an extends object as schemas
+        # whenever a reference lookup scans the document for identifiers.
+        raise SchemaEvaluationError(
+            "schema reference could not be evaluated"
+        ) from error
+
+
 def validate_tool_calls(calls, policy):
     if policy.required and not calls:
         raise APIError(
@@ -524,7 +535,7 @@ def validate_tool_calls(calls, policy):
         try:
             arguments = json_codec.loads(function["arguments"])
             _validate_tool_unicode(arguments)
-            validator.validate(arguments)
+            _validate(validator, arguments)
         except SchemaEvaluationError as error:
             raise APIError(500, str(error), "output_validation_failed") from error
         except ValidationError as error:
@@ -544,7 +555,7 @@ def validate_response_content(content, validator):
         return
     try:
         value = json_codec.loads(content)
-        validator.validate(value)
+        _validate(validator, value)
     except SchemaEvaluationError as error:
         raise APIError(500, str(error), "output_validation_failed") from error
     except (ValueError, ValidationError, Unresolvable, RecursionError) as error:

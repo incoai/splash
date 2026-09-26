@@ -182,6 +182,24 @@ class StructuredToolGrammarTest(unittest.TestCase):
                 )
                 self.assert_not_complete(text, thinking=True)
 
+    def test_thinking_cannot_spell_its_close_in_text(self):
+        # The reasoning splitter ends thinking at the first decoded
+        # "</think>", so an ordinary-token spelling must not stay in thinking.
+        close = self.tokenizer.token_to_id("</think>")
+        with mock.patch.object(tool_schema, "THINK_END_TOKEN_ID", close):
+            grammars = {
+                "json": tool_schema.json_grammar(SCHEMA, True),
+                "tools": tool_schema.tool_grammar(policy(), True, SCHEMA),
+            }
+        tokens = [*b"Reason. </think> More.", close, *ANSWER.encode()]
+        for name, grammar in grammars.items():
+            with self.subTest(grammar=name):
+                self.assertFalse(LLMatcher.validate_grammar(grammar, self.guidance))
+                matcher = LLMatcher(self.guidance, grammar)
+                self.assertEqual(
+                    matcher.validate_tokens(tokens), len(b"Reason. </think")
+                )
+
     def test_truncated_json_and_tool_prefixes_remain_nonterminal(self):
         for text in ('{"answer":', CALL.partition("</parameter>")[0]):
             with self.subTest(text=text):
