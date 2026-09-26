@@ -118,9 +118,9 @@ def prometheus_metrics(status):
             "draft_context",
             "target_prefill_rows",
         ),
-        "splash_draft_context_active_rows_total": (
+        "splash_draft_context_prompt_end_rows_total": (
             "draft_context",
-            "active_rows",
+            "prompt_end_rows",
         ),
         "splash_draft_context_materialization_rows_total": (
             "draft_context",

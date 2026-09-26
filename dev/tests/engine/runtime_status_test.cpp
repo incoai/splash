@@ -273,8 +273,8 @@ void testCleanRuntimeStatus() {
           json.find("\"checkpoint_publications\":3,"
                     "\"checkpoint_publication_failures\":1") !=
               std::string::npos &&
-          json.find("\"draft_context\":{\"target_prefill_rows\":10000,\"active_"
-                    "rows\":2048,\"materialization_rows\":31,\"avoided_rows\":"
+          json.find("\"draft_context\":{\"target_prefill_rows\":10000,\"prompt_"
+                    "end_rows\":2048,\"materialization_rows\":31,\"avoided_rows\":"
                     "7921,\"restore_skipped\":1,\"resets\":2}") !=
               std::string::npos &&
           json.find("\"constraint_masks\":{\"overlap_batches\":5,\"overlap_"

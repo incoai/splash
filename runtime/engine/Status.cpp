@@ -228,7 +228,7 @@ std::string runtimeStatusJson(
       << ",\"resource_replay_tokens\":" << core.resourceReplayTokens << "}"
       << ",\"draft_context\":{\"target_prefill_rows\":"
       << executorTelemetry.targetPrefillRows
-      << ",\"active_rows\":" << executorTelemetry.draftContextRowsActive
+      << ",\"prompt_end_rows\":" << executorTelemetry.draftContextRowsActive
       << ",\"materialization_rows\":"
       << executorTelemetry.draftContextRowsMaterialization
       << ",\"avoided_rows\":" << executorTelemetry.draftContextRowsAvoided
