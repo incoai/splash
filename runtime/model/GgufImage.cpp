@@ -31,7 +31,8 @@ static_assert(kQuantFormats[GGUF_FMT_Q4K].ggml_type == ggml::kQ4_K &&
                   kQuantFormats[GGUF_FMT_IQ1M].ggml_type == ggml::kIQ1_M &&
                   kQuantFormats[GGUF_FMT_Q40].ggml_type == ggml::kQ4_0 &&
                   kQuantFormats[GGUF_FMT_Q41].ggml_type == ggml::kQ4_1 &&
-                  kQuantFormats[GGUF_FMT_MXFP4].ggml_type == ggml::kMXFP4,
+                  kQuantFormats[GGUF_FMT_MXFP4].ggml_type == ggml::kMXFP4 &&
+                  kQuantFormats[GGUF_FMT_PQ20].ggml_type == ggml::kPQ2_0,
               "format table types are the GGUF type ids");
 static_assert(GGUF_TYPE_F32 == ggml::kF32, "float segments carry the GGUF type id");
 

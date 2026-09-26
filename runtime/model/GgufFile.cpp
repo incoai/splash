@@ -16,7 +16,7 @@ uint64_t checkedMultiply(uint64_t a, uint64_t b) {
 
 // (id, name, block elements, block bytes) of the ggml types this parser can
 // size, as ggml-common.h defines them; a tensor of another type is rejected.
-constexpr std::array<std::pair<uint32_t, GgmlTypeTraits>, 30> kTypes{{
+constexpr std::array<std::pair<uint32_t, GgmlTypeTraits>, 31> kTypes{{
     {0, {"F32", 1, 4}},         {1, {"F16", 1, 2}},         {2, {"Q4_0", 32, 18}},
     {3, {"Q4_1", 32, 20}},      {6, {"Q5_0", 32, 22}},      {7, {"Q5_1", 32, 24}},
     {8, {"Q8_0", 32, 34}},      {9, {"Q8_1", 32, 36}},      {10, {"Q2_K", 256, 84}},
@@ -27,6 +27,7 @@ constexpr std::array<std::pair<uint32_t, GgmlTypeTraits>, 30> kTypes{{
     {23, {"IQ4_XS", 256, 136}}, {24, {"I8", 1, 1}},         {25, {"I16", 1, 2}},
     {26, {"I32", 1, 4}},        {27, {"I64", 1, 8}},        {28, {"F64", 1, 8}},
     {29, {"IQ1_M", 256, 56}},   {30, {"BF16", 1, 2}},       {39, {"MXFP4", 32, 17}},
+    {142, {"PQ2_0", 128, 34}},
 }};
 
 enum ValueType : uint32_t {

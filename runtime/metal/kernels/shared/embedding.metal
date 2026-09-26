@@ -151,6 +151,16 @@ struct GgufEmbedQ41 {
   }
 };
 
+// block_pq2_0: half d | uchar qs[32], element l in bits 2 (l % 4) of qs[l / 4]; zero point 1.
+struct GgufEmbedPQ20 {
+  enum : uint { Weights = 128, Bytes = 34, D = 0, Codes = 2 };
+  __attribute__((always_inline)) static bfloat value(device const uchar *block, uint dim) {
+#pragma clang fp reassociate(off)
+    const uint l = dim % Weights;
+    const uchar q = (block[Codes + l / 4] >> (2 * (l % 4))) & 3;
+    return bfloat(float(int(q) - 1) * float(gguf_half(block, D)));
+  }
+};
 // Inlined, with each format's value, so every gather stays one function (the
 // compiler otherwise keeps Q6_K's as a call).
 template <class F>
@@ -179,4 +189,5 @@ GGUF_EMBEDDING_ENTRY(gguf_embed_q3k, GgufEmbedQ3K)
 GGUF_EMBEDDING_ENTRY(gguf_embed_q2k, GgufEmbedQ2K)
 GGUF_EMBEDDING_ENTRY(gguf_embed_q40, GgufEmbedQ40)
 GGUF_EMBEDDING_ENTRY(gguf_embed_q41, GgufEmbedQ41)
+GGUF_EMBEDDING_ENTRY(gguf_embed_pq20, GgufEmbedPQ20)
 #undef GGUF_EMBEDDING_ENTRY

@@ -47,7 +47,9 @@ template <class F> struct Shape {
                                                                                      : 2,
     J = 2 * UnitSpans * CG,                                   // coefficients per column and unit
   };
-  static_assert(F::MetaGroups == 8 || F::MetaGroups == 1, "a meta unit is one or eight groups");
+  // Each coefficient reads its own group's meta unit (coefficient_source), so a unit of four groups (PQ2_0's 128
+  // elements) splits a coefficient unit of four spans in two.
+  static_assert(F::MetaGroups == 8 || F::MetaGroups == 4 || F::MetaGroups == 1, "a meta unit is one, four or eight groups");
 };
 template <class F> using Coef = metal::conditional_t<Shape<F>::HasMin != 0, float2, float>;
 template <class F> constant constexpr uint kCoefs = GGUF_TILE_COLUMNS * Shape<F>::J;

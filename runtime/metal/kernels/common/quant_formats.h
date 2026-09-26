@@ -425,6 +425,18 @@ struct FmtMXFP4 {
   static uint indices(Chunk q) { return q; }
   static QuantCoef coef(Meta e, ushort) { return {float2(as_type<float>(e < 2 ? 0x00200000u << e : uint(e - 1) << 23)), float2(0.0f)}; }
 };
+// PQ2_0 (Prism ML's GGUFs, ggml type 142): plane0 2-bit codes as Q2_K's; meta the half d of the 128-element native
+// block, four groups. value = d * (q - 1).
+struct FmtPQ20 {
+  QUANT_FORMAT(GGUF_FMT_PQ20, QuantLinear, 1, 32, false);
+  struct Payload { uint2 a; }; typedef uint Chunk; typedef ushort Meta;
+  static Payload load(device uchar *p0, device uchar *) { return {*((device uint2 *)p0)}; }
+  static Meta loadMeta(device uchar *m) { return *((device ushort *)m); }
+  static Chunk chunk(Payload w, ushort c) { return quant_spread2(w.a[c >> 1] >> (16 * (c & 1))); }
+  static Chunk loadChunk(device uchar *p0, device uchar *, ushort c) { return quant_spread2(*((device ushort *)(p0 + 2 * c))); }
+  static uint4 codes(Chunk q) { return (uint4(q) >> uint4(0, 4, 8, 12)) & 0x00030003u; }
+  static QuantCoef coef(Meta mt, ushort) { return {float2(float(as_type<half>(mt))), float2(0.0f)}; }
+};
 
 #undef QUANT_FORMAT
 
@@ -432,7 +444,7 @@ struct FmtMXFP4 {
 #define QUANT_FORMATS(X)                                                                                            \
   X(FmtQ4K, q4k) X(FmtIQ4XS, iq4xs) X(FmtIQ4NL, iq4nl) X(FmtQ5K, q5k) X(FmtQ6K, q6k) X(FmtQ3K, q3k) X(FmtQ80, q80) \
   X(FmtIQ3S, iq3s) X(FmtQ2K, q2k) X(FmtIQ3XXS, iq3xxs) X(FmtIQ2XXS, iq2xxs) X(FmtIQ2XS, iq2xs) X(FmtIQ2S, iq2s)      \
-  X(FmtIQ1S, iq1s) X(FmtIQ1M, iq1m) X(FmtQ40, q40) X(FmtQ41, q41) X(FmtMXFP4, mxfp4)
+  X(FmtIQ1S, iq1s) X(FmtIQ1M, iq1m) X(FmtQ40, q40) X(FmtQ41, q41) X(FmtMXFP4, mxfp4) X(FmtPQ20, pq20)
 
 // Runs body(F()) with the format type of run-time format id `format` (GGUF_FMT_*), for kernels whose tiles pick
 // their tensor, and so its format, at run time. The branch is uniform in a threadgroup. The host passes known ids
@@ -457,6 +469,7 @@ inline void quant_format_switch(uint format, Body body) {
   case GGUF_FMT_Q40: body(FmtQ40()); break;
   case GGUF_FMT_Q41: body(FmtQ41()); break;
   case GGUF_FMT_MXFP4: body(FmtMXFP4()); break;
+  case GGUF_FMT_PQ20: body(FmtPQ20()); break;
   case GGUF_FMT_IQ3S:
   default: body(FmtIQ3S()); break;
   }
