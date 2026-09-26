@@ -1253,6 +1253,19 @@ void Engine::apply(const BatchPlan &plan,
       // cancellation or deadline failure of the same lane still stands.
       active.failure = Failure{"model_result_invalid", result.failure};
     }
+    if (!active.failure) {
+      const auto outOfVocabulary = std::find_if(
+          result.outputTokens.begin(), result.outputTokens.end(),
+          [&](uint32_t token) { return token >= config_.vocabularySize; });
+      if (outOfVocabulary != result.outputTokens.end()) {
+        // A token outside the vocabulary, such as the 0xffffffff the sampling
+        // kernels leave for a non-finite logit row, fails this lane like a
+        // model-reported result: before any output or cache publication.
+        active.failure = Failure{
+            "model_result_invalid", "model emitted out-of-vocabulary token " +
+                                        std::to_string(*outOfVocabulary)};
+      }
+    }
     if (active.failure) {
       // An in-flight Metal command cannot be revoked safely. Its provisional
       // writes remain invisible, but a cancelled, deadline-expired or

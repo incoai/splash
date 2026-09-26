@@ -322,7 +322,11 @@ public:
                           0,
                           0});
       } else {
-        ModelStepResult step{item.requestId, 0, {42}, decodeFinishes,
+        const std::vector<uint32_t> tokens =
+            item.requestId == poisonRequest && poisonToken
+                ? std::vector<uint32_t>{*poisonToken}
+                : std::vector<uint32_t>{42};
+        ModelStepResult step{item.requestId, 0, tokens, decodeFinishes,
                              DecodeStage::Regular, 0, 0};
         step.outputTokensWithoutKv = decodeTokensWithoutKv;
         result.push_back(std::move(step));
@@ -455,6 +459,10 @@ public:
   bool decodeFinishes = true;
   DecodeStage replayDecodeStage = DecodeStage::Regular;
   uint32_t decodeTokensWithoutKv = 0;
+  // When set, the decode step emits poisonToken (instead of 42) for
+  // poisonRequest, exercising the engine's output validation.
+  uint64_t poisonRequest = 0;
+  std::optional<uint32_t> poisonToken;
   // Set when prefill itself ends the request: the value is `finished` (stop).
   std::optional<bool> prefillAnchor;
   std::shared_ptr<bool> holdDecodeUntil;
@@ -3282,6 +3290,37 @@ void testPrefillCanCompleteTheRequest() {
   }
 }
 
+void testOutOfVocabularyOutputFailsLaneOnly() {
+  Backing backing(64);
+  KvPool pool(backing);
+  engine::Cache cache(pool, CacheNamespace{});
+  Executor model;
+  Events events;
+  EngineConfig config;
+  config.vocabularySize = 1000;
+  engine::Engine engine(config, cache, model, events);
+  // The sampling kernels leave 0xffffffff when a logit row is entirely
+  // non-finite; the engine must fail that lane before the sentinel reaches
+  // the token history while the peer request completes normally.
+  model.poisonRequest = 1;
+  model.poisonToken = 0xFFFFFFFFU;
+  engine.submit(request(1, {7, 7, 7}));
+  engine.submit(request(2, {7, 7, 7}));
+  runUntilIdle(engine);
+  require(events.failedCount == 1,
+          "out-of-vocabulary model output did not fail the lane");
+  require(events.failures.size() == 1 &&
+              events.failures[0] == "model_result_invalid",
+          "out-of-vocabulary failure carried the wrong code");
+  require(events.completedCount == 1,
+          "poisoned lane took down the rest of the batch");
+  require(events.outputs[1].empty() &&
+              events.outputs[2] == std::vector<uint32_t>{42},
+          "out-of-vocabulary token reached the event sink");
+  require(events.usage.count(2) == 1,
+          "clean peer request did not complete");
+}
+
 const uint32_t defaultCheckpointTokens = EngineConfig{}.prefillCheckpointTokens;
 void runUntilCheckpoint(engine::Engine &engine, uint64_t publications) {
   for (uint32_t step = 0; step < 128; ++step) {
@@ -4970,6 +5009,7 @@ int main() {
     testStalledSuspensionFailsWithCapacity();
     testTerminalAnchorWithoutKvIsNotCached();
     testPrefillCanCompleteTheRequest();
+    testOutOfVocabularyOutputFailsLaneOnly();
     std::cout << "KV-first engine tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {
