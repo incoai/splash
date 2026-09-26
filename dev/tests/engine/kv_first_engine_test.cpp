@@ -110,6 +110,8 @@ struct RestoreControl {
   bool ready = false;
   bool success = true;
   bool cancelled = false;
+  // No cache slot for the restored state's RAM copy.
+  bool promotionDenied = false;
 };
 
 class RestoreTicket final : public StateRestore {
@@ -124,6 +126,8 @@ public:
   }
   void cancel() noexcept override { control->cancelled = true; }
   std::shared_ptr<const CompositeState> snapshot() override {
+    if (control->promotionDenied)
+      return nullptr;
     return std::make_shared<State>();
   }
 };
@@ -3363,32 +3367,51 @@ void testRetryCancelledBeforeNextCheckpointKeepsItsSource() {
   }
 }
 
+// A restored endpoint becomes ordinary where it is, on disk too when no
+// cache slot takes its RAM copy, and its loss is then a lost state.
 void testRestoredCheckpointAtReplayEndBecomesOrdinary() {
-  for (uint32_t suffix : {1U, 31U}) {
-    Backing backing(1024);
-    KvPool pool(backing);
-    engine::Cache resources(pool, CacheNamespace{});
-    Executor executor(1);
-    Events events;
-    engine::Engine engine({}, resources, executor, events);
-    const std::vector<uint32_t> prompt(25001, 33);
-    engine.submit(request(520, prompt));
-    runUntilCheckpoint(engine, 1);
-    engine.cancel(520);
-    runUntilIdle(engine);
-    const uint32_t snapshots = executor.snapshots;
-    std::vector<uint32_t> shorter(
-        prompt.begin(), prompt.begin() + defaultCheckpointTokens + suffix);
-    engine.submit(request(521, shorter));
-    runUntilIdle(engine);
-    require(events.starts.back().second == defaultCheckpointTokens &&
-                executor.snapshots == snapshots &&
-                engine.snapshot().deduplicatedStatePublications == 1 &&
-                resources.snapshot().stateCache.entries == 1 &&
-                resources.snapshot().stateCache.checkpointEntries == 0 &&
-                resources.lookup(shorter).resumeBoundary() ==
-                    defaultCheckpointTokens,
-            "restored replay endpoint was copied or retired as temporary");
+  for (bool disk : {false, true}) {
+    for (uint32_t suffix : {1U, 31U}) {
+      Backing backing(1024);
+      KvPool pool(backing);
+      engine::Cache resources(pool, CacheNamespace{});
+      Executor executor(1);
+      if (disk) {
+        executor.deniedSnapshots = 1000;
+        executor.stateTier = std::make_shared<OffloadControl>();
+        executor.stateTier->ready = true;
+        executor.restoreControl->ready = true;
+        executor.restoreControl->promotionDenied = true;
+      }
+      Events events;
+      engine::Engine engine({}, resources, executor, events);
+      const std::vector<uint32_t> prompt(25001, 33);
+      engine.submit(request(520, prompt));
+      runUntilCheckpoint(engine, 1);
+      engine.cancel(520);
+      runUntilIdle(engine);
+      const uint32_t snapshots = executor.snapshots + executor.diskSnapshots;
+      std::vector<uint32_t> shorter(
+          prompt.begin(), prompt.begin() + defaultCheckpointTokens + suffix);
+      engine.submit(request(521, shorter));
+      runUntilIdle(engine);
+      const auto states = resources.snapshot().stateCache;
+      require(events.starts.back().second == defaultCheckpointTokens &&
+                  executor.snapshots + executor.diskSnapshots == snapshots &&
+                  engine.snapshot().deduplicatedStatePublications == 1 &&
+                  states.entries == 1 && states.checkpointEntries == 0 &&
+                  states.promotionsSkipped == (disk ? 1 : 0) &&
+                  resources.lookup(shorter).resumeBoundary() ==
+                      defaultCheckpointTokens,
+              "restored replay endpoint was copied or retired as temporary");
+      auto held = resources.lookup(shorter);
+      const uint64_t block = held.state->kvBlock();
+      const CompositeState *copy = held.state->state().get();
+      held = {};
+      resources.discardState(block, copy);
+      require(resources.lookup(shorter).lostState,
+              "the loss of a restored replay endpoint was not a lost state");
+    }
   }
 }
 
@@ -3788,6 +3811,41 @@ void testStateWithoutACacheSlotGoesToDisk() {
               counters.resources.stateCache.checkpointRetirements == 1 &&
               events.completedCount == 4 && events.failedCount == 0,
           "the checkpoint did not go to disk and come back out");
+}
+
+// A foreground arrival does not wait for a background producer of the same
+// prompt, so both lanes compute it. Without a cache slot the producer's
+// states go to disk, and the other lane's publications at the same blocks
+// find them there: they are deduplicated, not counted as writes.
+void testStateAlreadyOnDiskIsDeduplicated() {
+  Backing backing(512);
+  KvPool pool(backing);
+  engine::Cache cache(pool, CacheNamespace{});
+  Executor executor;
+  executor.deniedSnapshots = 1000;
+  executor.stateTier = std::make_shared<OffloadControl>();
+  executor.stateTier->ready = true;
+  Events events;
+  engine::Engine engine({}, cache, executor, events);
+  const std::vector<uint32_t> prompt(5001, 7);
+  auto producer = request(1, prompt);
+  producer.priority = RequestPriority::Background;
+  engine.submit(std::move(producer));
+  static_cast<void>(engine.tick(0));
+  auto duplicate = request(2, prompt);
+  duplicate.priority = RequestPriority::Foreground;
+  engine.submit(std::move(duplicate));
+  runUntilIdle(engine);
+  require(events.completedCount == 2 && events.failedCount == 0 &&
+              executor.prefillRows == 2 * prompt.size(),
+          "both lanes did not compute the prompt");
+  const auto counters = engine.snapshot();
+  require(executor.diskSnapshots == 2 && counters.diskStatePublications == 2 &&
+              counters.replayStatePublications == 1 &&
+              counters.junctionMaterializations == 1 &&
+              counters.deduplicatedStatePublications == 1 &&
+              counters.resources.stateCache.deduplicatedPublications == 1,
+          "a state already on disk was counted as written");
 }
 
 // With no cache slot, a long prefill's rolling checkpoint goes to disk and
@@ -4796,6 +4854,7 @@ int main() {
     testDeniedSnapshotRecyclesLruStateAndRetries();
     testPersistentSnapshotDenialRecyclesAtMostOneState();
     testStateWithoutACacheSlotGoesToDisk();
+    testStateAlreadyOnDiskIsDeduplicated();
     testCancelledPrefillRecoversFromItsDiskCheckpoint();
     testFailedFinalStateKeepsTheDiskCheckpoint();
     testNearFinalCheckpointAvoidsDiskWrite();

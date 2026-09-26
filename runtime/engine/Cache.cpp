@@ -229,6 +229,13 @@ bool Cache::reuseCompositeState(uint64_t kvBlock, bool checkpoint) {
   return reused;
 }
 
+bool Cache::reuseStoredState(uint64_t kvBlock, bool checkpoint) {
+  const bool reused = states_.touchIfStored(kvBlock, checkpoint);
+  if (reused && !checkpoint)
+    kv_.noteState(kvBlock);
+  return reused;
+}
+
 void Cache::publishCompositeState(uint64_t kvBlock,
                                   std::shared_ptr<const CompositeState> state,
                                   bool checkpoint) {

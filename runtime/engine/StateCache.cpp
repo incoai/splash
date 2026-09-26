@@ -80,8 +80,12 @@ void StateCache::recordLookup(bool hit, bool disk) noexcept {
 }
 
 bool StateCache::touchIfResident(uint64_t kvBlock, bool checkpoint) {
+  return resident(kvBlock) && touchIfStored(kvBlock, checkpoint);
+}
+
+bool StateCache::touchIfStored(uint64_t kvBlock, bool checkpoint) {
   auto found = entries_.find(kvBlock);
-  if (found == entries_.end() || found->second.invalid || !found->second.ram)
+  if (found == entries_.end() || found->second.invalid)
     return false;
   if (!kv_.contains(kvBlock)) {
     throw std::logic_error("composite state outlived its target KV block");

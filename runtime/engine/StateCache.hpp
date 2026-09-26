@@ -111,6 +111,8 @@ public:
   // ordinary state. False for a state that is absent or only on disk: the
   // caller publishes the copy it holds, which is promotion without a read.
   [[nodiscard]] bool touchIfResident(uint64_t kvBlock, bool checkpoint = false);
+  // The same for a copy in either tier.
+  [[nodiscard]] bool touchIfStored(uint64_t kvBlock, bool checkpoint = false);
 
   // Publishes a RAM copy; a disk copy of the block stays beside it.
   void publish(uint64_t kvBlock, std::shared_ptr<const CompositeState> state,

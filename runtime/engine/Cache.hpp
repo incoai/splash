@@ -169,6 +169,9 @@ public:
       uint32_t committedTokens, std::span<const ImageSpan> images = {});
   [[nodiscard]] uint64_t blockAt(uint64_t requestId, uint32_t boundary) const;
   [[nodiscard]] bool reuseCompositeState(uint64_t kvBlock, bool checkpoint = false);
+  // Reuses the state at this block in either tier, as reuseCompositeState()
+  // does a RAM copy.
+  [[nodiscard]] bool reuseStoredState(uint64_t kvBlock, bool checkpoint = false);
   void publishCompositeState(uint64_t kvBlock,
                              std::shared_ptr<const CompositeState> state,
                              bool checkpoint = false);

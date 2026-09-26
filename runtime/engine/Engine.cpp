@@ -607,13 +607,14 @@ void Engine::completeAdmission(Request &active, CacheLookup &lookup,
   active.latestCheckpoint = {};
   if (lookup.state) {
     active.latestCheckpoint = cache_.checkpointState(lookup.state->kvBlock());
-    // A restored endpoint already has the ordinary replay state we need.
-    // Other restored progress points retain their rolling lifetime.
+    // A restored endpoint already has the ordinary replay state we need, in
+    // whichever tier holds it: a promotion that found no cache slot leaves
+    // it on disk. Other restored progress points retain their rolling
+    // lifetime.
     if (active.latestCheckpoint &&
         resumeBoundary == replayStateBoundary(active.replayTokens)) {
-      static_cast<void>(
-          cache_.reuseCompositeState(active.latestCheckpoint.kvBlock));
-      ++counters_.deduplicatedStatePublications;
+      if (cache_.reuseStoredState(active.latestCheckpoint.kvBlock))
+        ++counters_.deduplicatedStatePublications;
       active.latestCheckpoint = {};
     }
   }
@@ -908,6 +909,10 @@ void Engine::publishReachedStateBoundaries(Request &active,
         }
         if (state) {
           cache_.publishCompositeState(block, std::move(state), checkpoint);
+          ++publications;
+        } else if (cache_.reuseStoredState(block, checkpoint)) {
+          // No cache slot takes a RAM copy of a state already on disk.
+          ++counters_.deduplicatedStatePublications;
         } else if (model_.canSnapshotToDisk() &&
                    cache_.publishStateToDisk(
                        block,
@@ -917,11 +922,11 @@ void Engine::publishReachedStateBoundaries(Request &active,
                        checkpoint)) {
           // No cache slot holds the state; the tier takes it from the lane.
           ++counters_.diskStatePublications;
+          ++publications;
         } else {
           ++failures;
           continue;
         }
-        ++publications;
       }
       if (active.latestCheckpoint.kvBlock != block)
         static_cast<void>(retireCheckpoint(active));
