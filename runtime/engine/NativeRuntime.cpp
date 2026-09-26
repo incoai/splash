@@ -418,6 +418,11 @@ bool NativeRuntime::handleMaskIssue(protocol::ProtocolIssue issue) {
 bool NativeRuntime::handleIssue(protocol::ProtocolIssue issue) {
   protocol::FailureClass classification = issue.failureClass;
   uint64_t requestId = issue.requestId;
+  if (classification == protocol::FailureClass::EngineUnhealthy) {
+    engineError(std::string(protocol::issueCodeName(issue.code)),
+                std::move(issue.message));
+    return false;
+  }
   if (classification == protocol::FailureClass::RequestError && !requestId) {
     classification = protocol::FailureClass::ProtocolFatal;
   }
@@ -428,9 +433,6 @@ bool NativeRuntime::handleIssue(protocol::ProtocolIssue issue) {
       std::move(issue.message)});
   if (protocol::connectionMustClose(classification)) {
     closeConnection_ = true;
-    if (classification == protocol::FailureClass::EngineUnhealthy) {
-      engineHealthy_ = false;
-    }
     return false;
   }
   return true;
@@ -443,6 +445,8 @@ void NativeRuntime::requestError(uint64_t requestId, std::string code,
 }
 
 void NativeRuntime::engineError(std::string code, std::string message) {
+  if (engineFailure_.empty())
+    engineFailure_ = code + ": " + message;
   send(protocol::ErrorEvent{protocol::FailureClass::EngineUnhealthy, 0, false,
                             std::move(code), std::move(message)});
   engineHealthy_ = false;
@@ -459,6 +463,8 @@ bool NativeRuntime::send(protocol::Message message) {
     // later frame that contradicts the missing one.
     engineHealthy_ = false;
     closeConnection_ = true;
+    if (engineFailure_.empty())
+      engineFailure_ = "protocol_encode_failed: " + serialized.issue->message;
     auto report = protocol::serializeMessage(
         protocol::ErrorEvent{protocol::FailureClass::EngineUnhealthy, 0, false,
                              "protocol_encode_failed",
@@ -472,14 +478,20 @@ bool NativeRuntime::send(protocol::Message message) {
     }
     return false;
   }
+  std::string failure;
   try {
     output_(*serialized.value);
+    return true;
+  } catch (const std::exception &error) {
+    failure = error.what();
   } catch (...) {
-    engineHealthy_ = false;
-    closeConnection_ = true;
-    return false;
+    failure = "unknown output exception";
   }
-  return true;
+  if (engineFailure_.empty())
+    engineFailure_ = "output_write_failed: " + failure;
+  engineHealthy_ = false;
+  closeConnection_ = true;
+  return false;
 }
 
 void NativeRuntime::batchCompleted(WorkKind kind, uint32_t width,

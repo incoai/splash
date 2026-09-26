@@ -8,6 +8,7 @@
 #include "QwenVision.hpp"
 #include "ops/PageStorage.hpp"
 #include "ops/ExecutionPlans.hpp"
+#include "model/SlotFile.hpp"
 
 #include <filesystem>
 #include <memory>
@@ -60,6 +61,8 @@ struct ModelPackage final {
 
 // Model execution resources; physical memory admission remains governed by
 // the engine through admitAllocation.
+class KvPageTier;
+
 struct RuntimeContext final {
   metal::MetalBackend &backend;
   metal::AllocationAdmission admitAllocation;
@@ -70,6 +73,7 @@ struct RuntimeContext final {
   uint32_t maximumImagePatches = ops::kMaximumImagePatches;
   uint64_t pipelineReserveBytes = 0;
   uint64_t runtimeOverheadReserveBytes = 0;
+  KvPageTier *kvTier = nullptr;
 };
 
 // Validates only the interface between independently defined target and draft
@@ -111,10 +115,13 @@ plannedRuntimeMemory(const DeviceCapabilities &device,
                      const ModelPackage &package,
                      const ops::ExecutionPlans &operators,
                      kv::Format format = kv::Format::Int8);
+// The file, when given, holds one state per slot and shares the cache's
+// disk budget.
 [[nodiscard]] std::unique_ptr<StateStorage>
 createStateStorage(metal::MetalBackend &backend,
                    metal::AllocationAdmission admitAllocation,
-                   const ModelPackage &package);
+                   const ModelPackage &package,
+                   std::shared_ptr<SlotFile> file = nullptr);
 [[nodiscard]] std::unique_ptr<RuntimeModel>
 createRuntime(RuntimeContext context);
 

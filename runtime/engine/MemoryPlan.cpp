@@ -96,7 +96,7 @@ uint64_t ModelMemoryProfile::fixedRuntimeBytes() const {
            footprint.targetWeightsBytes, footprint.draftWeightsBytes,
            footprint.visionWeightsBytes, footprint.sharedPrefillBytes,
            footprint.sharedDecodeBytes, footprint.pipelineReserveBytes,
-           footprint.runtimeOverheadReserveBytes}) {
+           footprint.runtimeOverheadReserveBytes, footprint.kvStagingBytes}) {
     if (!checkedAdd(result, value, result)) {
       throw std::overflow_error("fixed runtime cost overflow");
     }
@@ -135,7 +135,8 @@ std::string modelStatusJson(const ModelMemoryProfile &model) {
       << "\"shared_decode_bytes\":" << model.footprint.sharedDecodeBytes << ','
       << "\"pipeline_reserve_bytes\":" << model.footprint.pipelineReserveBytes
       << ',' << "\"runtime_overhead_reserve_bytes\":"
-      << model.footprint.runtimeOverheadReserveBytes << "}}";
+      << model.footprint.runtimeOverheadReserveBytes << ','
+      << "\"kv_staging_bytes\":" << model.footprint.kvStagingBytes << "}}";
   return out.str();
 }
 
@@ -156,7 +157,8 @@ std::string EngineMemoryBreakdown::toStatusJson() const {
       << "\"shared_decode_bytes\":" << sharedDecodeBytes << ','
       << "\"pipeline_reserve_bytes\":" << pipelineReserveBytes << ','
       << "\"runtime_overhead_reserve_bytes\":" << runtimeOverheadReserveBytes
-      << ',' << "\"fixed_runtime_bytes\":" << fixedRuntimeBytes << ','
+      << ',' << "\"kv_staging_bytes\":" << kvStagingBytes << ','
+      << "\"fixed_runtime_bytes\":" << fixedRuntimeBytes << ','
       << "\"dynamic_budget_bytes\":" << dynamicBudgetBytes << ','
       << "\"kv_page_tokens\":" << kvPageTokens << ','
       << "\"kv_page_bytes\":" << kvPageBytes << ','
@@ -196,6 +198,7 @@ std::string EngineMemoryBreakdown::describe() const {
       << "pipeline reserve: " << bytesAndMiB(pipelineReserveBytes) << '\n'
       << "allocator/runtime reserve: "
       << bytesAndMiB(runtimeOverheadReserveBytes) << '\n'
+      << "disk tier KV staging: " << bytesAndMiB(kvStagingBytes) << '\n'
       << "fixed runtime: " << bytesAndMiB(fixedRuntimeBytes) << '\n'
       << "elastic state/KV budget: " << bytesAndMiB(dynamicBudgetBytes) << '\n'
       << "KV page: " << kvPageTokens << " tokens, "
@@ -277,6 +280,7 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
   breakdown.pipelineReserveBytes = model.footprint.pipelineReserveBytes;
   breakdown.runtimeOverheadReserveBytes =
       model.footprint.runtimeOverheadReserveBytes;
+  breakdown.kvStagingBytes = model.footprint.kvStagingBytes;
   breakdown.kvPageTokens = kv::kPageTokens;
   breakdown.kvSparseMappingBatchPages =
       model.targetKvLayout.sparseMappingBatchPages();

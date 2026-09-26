@@ -32,6 +32,8 @@ struct ActualMemoryReport {
     uint64_t sharedPrefillBytes = 0;
     uint64_t sharedDecodeBytes = 0;
     uint64_t kvResidentBytes = 0;
+    // The disk tier's KV staging ring and copy table; zero without the tier.
+    uint64_t kvStagingBytes = 0;
 
     uint64_t backendAllocatedBytes = 0;
     uint64_t deviceCurrentAllocatedBytes = 0;

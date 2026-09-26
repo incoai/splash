@@ -1,14 +1,17 @@
+#include "AllocationFailure.hpp"
 #include "TestImmediateTicket.hpp"
 #include "engine/Cache.hpp"
 #include "engine/NativeRuntime.hpp"
 #include "metal/CommandWatchdog.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <optional>
 #include <stdexcept>
+#include <system_error>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -707,6 +710,76 @@ void testControlFailureUsesExecutionBoundary() {
   }
 }
 
+// Every path that stops the engine keeps its reason for the exit log, not
+// only the ones that report through engineError().
+void testEngineFailureNamesItsReason() {
+  {
+    Backing backing(8);
+    KvPool pool(backing);
+    engine::Cache resources(pool, CacheNamespace{});
+    Executor executor;
+    const std::system_error closed(EPIPE, std::generic_category(),
+                                   "write(native output)");
+    bool outputClosed = false;
+    engine::NativeRuntime loop(
+        {}, resources, executor,
+        [&](std::span<const uint8_t>) {
+          if (outputClosed)
+            throw closed;
+        },
+        [] { return std::string("{\"schema_version\":5,\"ready\":true}"); });
+    loop.announceReady();
+    outputClosed = true;
+    auto status = protocol::serializeMessage(
+        protocol::Message{protocol::StatusRequestFrame{77}});
+    require(status && !loop.receive(*status.value) && !loop.engineHealthy() &&
+                loop.connectionMustClose(),
+            "a failed output write did not stop the engine");
+    require(loop.engineFailure() ==
+                std::string("output_write_failed: ") + closed.what(),
+            "a failed output write left the engine failure unnamed");
+  }
+  {
+    Backing backing(8);
+    KvPool pool(backing);
+    engine::Cache resources(pool, CacheNamespace{});
+    Executor executor;
+    std::vector<uint8_t> output;
+    engine::NativeRuntime loop(
+        {}, resources, executor,
+        [&](std::span<const uint8_t> bytes) {
+          output.insert(output.end(), bytes.begin(), bytes.end());
+        },
+        [] { return std::string("{\"schema_version\":5,\"ready\":true}"); });
+    loop.announceReady();
+    auto frame = protocol::serializeMessage(protocol::Message{request(1)});
+    require(static_cast<bool>(frame), "request wire failed");
+    // A header and one payload byte: the parser's first allocation is the
+    // payload buffer, and it fails.
+    allocationFailureAfter = 0;
+    const bool received = loop.receive(std::span<const uint8_t>(
+        frame.value->data(), protocol::kFrameHeaderBytes + 1));
+    allocationFailureAfter = -1;
+    uint32_t errors = 0;
+    for (const auto &message : decodeMessages(output)) {
+      if (const auto *error = std::get_if<protocol::ErrorEvent>(&message)) {
+        require(error->failureClass ==
+                        protocol::FailureClass::EngineUnhealthy &&
+                    error->code == "allocation_failure",
+                "an inbound allocation failure lost its classification");
+        ++errors;
+      }
+    }
+    require(!received && errors == 1 && !loop.engineHealthy() &&
+                loop.connectionMustClose(),
+            "an inbound allocation failure did not stop the engine");
+    require(loop.engineFailure() ==
+                "allocation_failure: allocation failed while receiving frame "
+                "payload",
+            "an inbound allocation failure left the engine failure unnamed");
+  }
+}
+
 void testInvalidPromptTokensStayRequestScoped() {
   Backing backing(32);
   KvPool pool(backing);
@@ -879,6 +952,8 @@ void testStepTokensFitTheWire() {
       require(!streamed && !completion && encodeErrors == 1 &&
                   !loop.engineHealthy() && loop.connectionMustClose(),
               "an unencodable event was not reported as an engine error");
+      require(loop.engineFailure().starts_with("protocol_encode_failed: "),
+              "an unencodable event left the engine failure unnamed");
     }
   }
 }
@@ -1210,6 +1285,7 @@ int main() {
     testCommandWatchdogAndPendingHealthWake();
     testDuplicateLiveRequestClosesWithoutAmbiguousError();
     testControlFailureUsesExecutionBoundary();
+    testEngineFailureNamesItsReason();
     testInvalidPromptTokensStayRequestScoped();
     testReadyAnnouncesVisionWhenImagesAreAdmitted();
     testImageRequestWithoutVisionStaysRequestScoped();

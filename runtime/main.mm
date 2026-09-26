@@ -50,6 +50,7 @@ struct NativeArguments final {
   model::ModelDescriptor model;
   uint32_t maxContext = 0;
   uint64_t maxMemoryBytes = 0;
+  uint64_t maxCacheDiskBytes = 0;
   kv::Format kvFormat = kv::Format::Int8;
 };
 
@@ -120,7 +121,8 @@ private:
 void printUsage(std::string_view executable) {
   std::cerr << "usage: " << executable
             << " serve-native TARGET_DIRECTORY DRAFT_DIRECTORY"
-               " MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto [--kv-format int8|bf16]\n";
+               " MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto [MAX_CACHE_DISK_BYTES]"
+               " [--kv-format int8|bf16]\n";
 }
 
 template <typename T>
@@ -179,14 +181,21 @@ std::filesystem::path requireModelRoot(std::string_view targetArgument,
 }
 
 NativeArguments parseArguments(int argc, char **argv) {
-  if ((argc != 6 && argc != 8) || std::string_view(argv[1]) != "serve-native") {
+  if (argc < 6 || std::string_view(argv[1]) != "serve-native") {
     throw UsageError("expected the serve-native command");
   }
   NativeArguments result;
-  if (argc == 8) {
-    const std::string_view format(argv[7]);
-    if (std::string_view(argv[6]) != "--kv-format" ||
-        (format != "int8" && format != "bf16"))
+  int next = 6;
+  if (next < argc && std::string_view(argv[next]) != "--kv-format") {
+    const std::string_view quota(argv[next++]);
+    if (quota != "0" && !parsePositive(quota, result.maxCacheDiskBytes))
+      throw UsageError("MAX_CACHE_DISK_BYTES must be a nonnegative integer");
+  }
+  if (next < argc) {
+    if (argc - next != 2 || std::string_view(argv[next]) != "--kv-format")
+      throw UsageError("expected --kv-format int8 or bf16");
+    const std::string_view format(argv[next + 1]);
+    if (format != "int8" && format != "bf16")
       throw UsageError("--kv-format requires int8 or bf16");
     result.kvFormat = format == "int8" ? kv::Format::Int8 : kv::Format::BFloat16;
   }
@@ -235,6 +244,7 @@ bootstrapConfig(const NativeArguments &arguments) {
   config.resources.model = arguments.model;
   config.resources.buildId = SPLASH_BUILD_ID;
   config.resources.maximumMemoryBytes = arguments.maxMemoryBytes;
+  config.resources.maximumCacheDiskBytes = arguments.maxCacheDiskBytes;
   config.resources.kvFormat = arguments.kvFormat;
   config.nativeLoop.engine.maxContext = arguments.maxContext;
   config.nativeLoop.engineInstanceId = engineInstanceId();
@@ -391,7 +401,8 @@ int runNative(const NativeArguments &arguments) {
     std::cerr << "error: native transport stopped after a protocol failure\n";
     break;
   case engine::NativeProcessExit::EngineFailure:
-    std::cerr << "error: native transport stopped after an engine failure\n";
+    std::cerr << "error: native transport stopped after an engine failure ("
+              << bootstrap->nativeLoop().engineFailure() << ")\n";
     break;
   case engine::NativeProcessExit::IoFailure:
     std::cerr << "error: native transport stopped after an I/O failure\n";

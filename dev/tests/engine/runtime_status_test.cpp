@@ -75,6 +75,7 @@ void testCleanRuntimeStatus() {
   engine.deduplicatedStatePublications = 2;
   engine.recycledStatePublications = 1;
   engine.scheduler.waitingPrefix = 3;
+  engine.diskStatePublications = 4;
   engine.scheduler.prefillBatches = 4;
   engine.scheduler.prefillRows = 4096;
   engine.scheduler.decodeBatches = 4;
@@ -88,8 +89,11 @@ void testCleanRuntimeStatus() {
   engine.resources.stateCache.checkpointBytes = 64;
   engine.resources.stateCache.checkpointEvictions = 4;
   engine.resources.stateCache.checkpointRetirements = 3;
-  engine.resources.lookup = {3, 128, 64, 1};
+  engine.resources.lookup = {.lookups = 3, .kvHitTokens = 128, .stateHitTokens = 64, .lazyJunctions = 1};
   engine.resources.activeRequests = 1;
+  engine.resources.kvTier.restores = 3;
+  engine.resources.kvTier.readBytes = 12345;
+  engine.resources.kvTier.writtenBytes = 67890;
 
   WarmupReport warmup;
   warmup.maximumPrefill = WarmupStepStatus::Complete;
@@ -172,6 +176,15 @@ void testCleanRuntimeStatus() {
   const std::string json =
       runtimeStatusJson(memoryPlan, engine, metal, warmup, audit(memoryPlan),
                         metrics, executorTelemetry, identity, governor, true);
+  require(json.find("\"kv_disk_hit_tokens\":96") != std::string::npos &&
+              json.find("\"kv_restores\":3") != std::string::npos,
+          "disk token accounting must include transfers completed before admission retries");
+  require(json.find("\"read_bytes\":12345") != std::string::npos &&
+              json.find("\"written_bytes\":67890") != std::string::npos,
+          "disk byte accounting was not exposed");
+  require(json.find("\"kv_staging_bytes\":0,\"fixed_runtime_bytes\"") !=
+              std::string::npos,
+          "the memory plan status omitted the disk tier's KV staging");
   require(json.find("\"kv\":{\"target_model_sha256\"") != std::string::npos &&
               json.find("\"q8\":{\"target_model_sha256\"") != std::string::npos,
           "INT8 status lost its generic or legacy identity");
@@ -253,7 +266,8 @@ void testCleanRuntimeStatus() {
           json.find("\"resource_replay_tokens\":1234") != std::string::npos &&
           json.find("\"waiting_prefix\":3") != std::string::npos &&
           json.find("\"deduplicated_state_publications\":2,"
-                    "\"recycled_state_publications\":1,") !=
+                    "\"recycled_state_publications\":1,"
+                    "\"disk_state_publications\":4,") !=
               std::string::npos &&
           json.find("\"lazy_junctions\":1") != std::string::npos &&
           json.find("\"checkpoint_publications\":3,"

@@ -1,4 +1,5 @@
 #include "TestImmediateTicket.hpp"
+#include "TestKvTier.hpp"
 #include "engine/Engine.hpp"
 
 #include <algorithm>
@@ -66,8 +67,74 @@ public:
   uint64_t bytes() const noexcept override { return 64; }
 };
 
+class DiskState final : public CompositeState {
+public:
+  uint64_t bytes() const noexcept override { return 64; }
+  uint64_t residentBytes() const noexcept override { return 0; }
+};
+
+struct OffloadControl {
+  bool ready = false;
+  bool released = false;
+};
+
+// A state write in flight; its disk copy is a DiskState.
+class OffloadTicket final : public StateOffload {
+public:
+  explicit OffloadTicket(std::shared_ptr<OffloadControl> control)
+      : control_(std::move(control)) {}
+  bool ready() const noexcept override { return control_->ready; }
+  bool finish() override { return true; }
+  const std::shared_ptr<const CompositeState> &state() const noexcept override {
+    return disk_;
+  }
+private:
+  std::shared_ptr<OffloadControl> control_;
+  std::shared_ptr<const CompositeState> disk_ = std::make_shared<DiskState>();
+};
+
+class OffloadState final : public CompositeState {
+public:
+  explicit OffloadState(std::shared_ptr<OffloadControl> control) : control_(std::move(control)) {}
+  ~OffloadState() override { control_->released = true; }
+  uint64_t bytes() const noexcept override { return 64; }
+  bool canOffload() const noexcept override { return true; }
+  std::unique_ptr<StateOffload> offload(std::function<void()>) const override {
+    return std::make_unique<OffloadTicket>(control_);
+  }
+private:
+  std::shared_ptr<OffloadControl> control_;
+};
+
+struct RestoreControl {
+  bool ready = false;
+  bool success = true;
+  bool cancelled = false;
+  // No cache slot for the restored state's RAM copy.
+  bool promotionDenied = false;
+};
+
+class RestoreTicket final : public StateRestore {
+public:
+  std::shared_ptr<RestoreControl> control;
+  std::function<void()> commit;
+  bool ready() const noexcept override { return control->ready; }
+  bool finish() override {
+    if (!control->success || control->cancelled) return false;
+    commit();
+    return true;
+  }
+  void cancel() noexcept override { control->cancelled = true; }
+  std::shared_ptr<const CompositeState> snapshot() override {
+    if (control->promotionDenied)
+      return nullptr;
+    return std::make_shared<State>();
+  }
+};
+
 struct MaskOverlapState final {
   uint64_t requestId = 0;
+  bool finishes = true;
   bool emitted = false;
   bool provided = false;
   bool abandoned = false;
@@ -97,7 +164,8 @@ public:
   std::vector<ModelStepResult> wait() override {
     if (!ready())
       throw std::logic_error("mask-overlap ticket completed without input");
-    return {{state_->requestId, 0, {42}, true, DecodeStage::Regular, 7, 0}};
+    return {{state_->requestId, 0, {42}, state_->finishes,
+             DecodeStage::Regular, 7, 0}};
   }
   double wallMilliseconds() const noexcept override { return 1.0; }
 
@@ -192,6 +260,21 @@ public:
     restored += length;
     restoredDraft = restoreDraftState;
   }
+  std::unique_ptr<StateRestore> beginRestore(
+      uint64_t id, uint32_t length, std::shared_ptr<const CompositeState> state,
+      bool restoreDraft, std::function<void()>) override {
+    if (state->residentBytes()) {
+      restore(id, length, std::move(state), restoreDraft);
+      return {};
+    }
+    ++diskReads;
+    auto ticket = std::make_unique<RestoreTicket>();
+    ticket->control = restoreControl;
+    ticket->commit = [this, id, length, state, restoreDraft] {
+      restore(id, length, state, restoreDraft);
+    };
+    return ticket;
+  }
   void setDraftContextPlan(uint64_t id, DraftContextPlan plan) override {
     plans[id] = std::move(plan);
   }
@@ -248,11 +331,20 @@ public:
   std::unique_ptr<ModelBatchTicket>
   submit(const BatchPlan &plan, std::span<const ModelBatchItem> items,
          std::function<void()> completion) override {
+    // Like every production batch command, this one carries the tier's
+    // queued copies; the test finishes the transfers themselves.
+    if (tier && tier->copiesQueued()) {
+      tier->queued = false;
+      ++carryingCommands;
+    }
+    // Every constrained cycle after the initial mask request waits for its
+    // mask inside the ticket, as the production constrained ticket does.
     if (plan.kind == WorkKind::Decode &&
         plan.cohort == BatchCohort::Constrained &&
-        plan.decodeStage == DecodeStage::ApplyInitialMask) {
+        plan.decodeStage != DecodeStage::RequestInitialMask) {
       overlap = std::make_shared<MaskOverlapState>();
       overlap->requestId = items.front().requestId;
+      overlap->finishes = decodeFinishes;
       return std::make_unique<MaskOverlapTicket>(overlap);
     }
     if (plan.kind == WorkKind::Decode && holdDecodeUntil) {
@@ -285,6 +377,14 @@ public:
     ++snapshots;
     return std::make_shared<State>();
   }
+  // Without a cache slot the production model writes the lane's state to
+  // the disk tier; the fake has one when `stateTier` is set, with quota for
+  // every state.
+  bool canSnapshotToDisk() const noexcept override { return stateTier != nullptr; }
+  std::unique_ptr<StateOffload> snapshotToDisk(uint64_t, std::function<void()>) override {
+    ++diskSnapshots;
+    return std::make_unique<OffloadTicket>(stateTier);
+  }
   uint64_t reclaimIdleState() noexcept override {
     const uint64_t released = reclaimableIdleStateBytes;
     reclaimableIdleStateBytes = 0;
@@ -298,6 +398,20 @@ public:
       overlap->provided = true;
   }
   void end(uint64_t id) override { requests.erase(id); }
+  // A command that carries only the tier's queued copies; the test finishes
+  // the transfers themselves.
+  std::unique_ptr<ModelBatchTicket>
+  submitTransfers(std::function<void()> completion) override {
+    if (!tier || !tier->copiesQueued())
+      return nullptr;
+    tier->queued = false;
+    ++transferCommands;
+    return test::immediateTicket({}, completion);
+  }
+
+  test::TestKvTier *tier = nullptr;
+  uint32_t transferCommands = 0;
+  uint32_t carryingCommands = 0;
 
   struct Request {
     uint32_t slot = 0;
@@ -307,10 +421,14 @@ public:
   };
   std::unordered_map<uint64_t, Request> requests;
   std::unordered_map<uint64_t, DraftContextPlan> plans;
+  std::shared_ptr<RestoreControl> restoreControl = std::make_shared<RestoreControl>();
+  uint32_t diskReads = 0;
   uint32_t prefillRows = 0;
   uint32_t restored = 0;
   uint32_t snapshots = 0;
   uint32_t snapshotAttempts = 0;
+  uint32_t diskSnapshots = 0;
+  std::shared_ptr<OffloadControl> stateTier;
   uint32_t deniedSnapshots = 0;
   std::optional<uint32_t> denySnapshotAtBoundary;
   uint32_t beginAttempts = 0;
@@ -2635,6 +2753,65 @@ void testRecoveryAdmitsFailedKvTargetBeforeReplaying() {
   }
 }
 
+// A resumption whose disk state fails to load goes back to waiting with the
+// same KV target: its next admission, from the prefix that remains, still
+// needs the pages of the dispatch that suspended it before replay runs.
+void testFailedResumeRestoreKeepsTheKvTarget() {
+  Backing backing(64);
+  KvPool pool(backing);
+  engine::Cache cache(pool, CacheNamespace{});
+  Executor executor;
+  executor.deniedSnapshots = 1000;
+  executor.stateTier = std::make_shared<OffloadControl>();
+  executor.stateTier->ready = true;
+  Events events;
+  engine::Engine engine({}, cache, executor, events);
+  backing.allocationFailure = metal::AllocationFailure::HostPressure;
+  const std::vector<uint32_t> prompt(129, 290);
+  engine.submit(request(290, prompt));
+  // The first dispatch reaches the replay state at 128, which goes to disk.
+  require(engine.tick(1) && engine.tick(2) && executor.prefillRows == 128 &&
+              engine.snapshot().diskStatePublications == 1,
+          "fixture did not write the replay state to disk");
+  backing.growthBlocked = true;
+  require(engine.tick(3) && engine.snapshot().resourceSuspensions == 1,
+          "the last prompt token's page did not suspend the request");
+  backing.growthBlocked = false;
+  static_cast<void>(engine.tick(103));
+  require(executor.diskReads == 1 && executor.prefillRows == 128 &&
+              engine.snapshot().resourceResumptions == 0,
+          "resumption did not wait for its disk state");
+  // The read fails and the retry finds no free cell; reclaiming for one
+  // empties the cache and releases the KV backing. Afterwards one extent
+  // (128 tokens) can come back: room for replay to start, not for the
+  // dispatch that suspended the request.
+  executor.resumeDenied = true;
+  executor.restoreControl->ready = true;
+  executor.restoreControl->success = false;
+  static_cast<void>(engine.tick(104));
+  require(cache.snapshot().stateCache.entries == 0 && pool.snapshot().pagesResident == 0 &&
+              engine.snapshot().resourceResumptions == 0,
+          "fixture did not release the failed resumption's memory");
+  executor.resumeDenied = false;
+  backing.growthAllowed = [&] { return pool.snapshot().pagesResident == 0; };
+  for (double now : {204.0, 304.0, 404.0}) {
+    static_cast<void>(engine.tick(now));
+    require(!engine.commandInFlight() && executor.prefillRows == 128 &&
+                engine.snapshot().resourceResumptions == 0 &&
+                engine.snapshot().resourceSuspensions == 1 &&
+                cache.snapshot().activeRequests == 0,
+            "replay started without the KV of the dispatch that suspended it");
+  }
+  backing.growthAllowed = {};
+  for (double now = 504; now < 530 && !engine.idle(); ++now)
+    static_cast<void>(engine.tick(now));
+  require(engine.idle() && executor.prefillRows == 128 + 129 &&
+              engine.snapshot().resourceResumptions == 1 &&
+              events.outputs.at(290) == std::vector<uint32_t>{42} &&
+              events.failedCount == 0 && cache.snapshot().activeRequests == 0,
+          "request did not replay cleanly once its KV target fit");
+}
+
 void testAdmissionReopensAfterLastSuspendedRequestResumes() {
   Backing backing(32);
   KvPool pool(backing);
@@ -3046,7 +3223,6 @@ void testPrefillCanCompleteTheRequest() {
 }
 
 const uint32_t defaultCheckpointTokens = EngineConfig{}.prefillCheckpointTokens;
-
 void runUntilCheckpoint(engine::Engine &engine, uint64_t publications) {
   for (uint32_t step = 0; step < 128; ++step) {
     static_cast<void>(engine.tick(step + 1));
@@ -3100,7 +3276,7 @@ void testConcurrentProgressRetainsAtMostOnePointPerLane() {
     maximumEntries =
         std::max(maximumEntries, resources.snapshot().stateCache.entries);
   }
-  const uint32_t checkpoints = prompt.size() / defaultCheckpointTokens;
+  const uint32_t checkpoints = (prompt.size() / defaultCheckpointTokens);
   require(engine.idle() && events.completedCount == 2 &&
               engine.snapshot().checkpointPublications >= checkpoints &&
               engine.snapshot().checkpointPublications <= 2 * checkpoints &&
@@ -3190,32 +3366,51 @@ void testRetryCancelledBeforeNextCheckpointKeepsItsSource() {
   }
 }
 
+// A restored endpoint becomes ordinary where it is, on disk too when no
+// cache slot takes its RAM copy, and its loss is then a lost state.
 void testRestoredCheckpointAtReplayEndBecomesOrdinary() {
-  for (uint32_t suffix : {1U, 31U}) {
-    Backing backing(1024);
-    KvPool pool(backing);
-    engine::Cache resources(pool, CacheNamespace{});
-    Executor executor(1);
-    Events events;
-    engine::Engine engine({}, resources, executor, events);
-    const std::vector<uint32_t> prompt(25001, 33);
-    engine.submit(request(520, prompt));
-    runUntilCheckpoint(engine, 1);
-    engine.cancel(520);
-    runUntilIdle(engine);
-    const uint32_t snapshots = executor.snapshots;
-    std::vector<uint32_t> shorter(
-        prompt.begin(), prompt.begin() + defaultCheckpointTokens + suffix);
-    engine.submit(request(521, shorter));
-    runUntilIdle(engine);
-    require(events.starts.back().second == defaultCheckpointTokens &&
-                executor.snapshots == snapshots &&
-                engine.snapshot().deduplicatedStatePublications == 1 &&
-                resources.snapshot().stateCache.entries == 1 &&
-                resources.snapshot().stateCache.checkpointEntries == 0 &&
-                resources.lookup(shorter).resumeBoundary() ==
-                    defaultCheckpointTokens,
-            "restored replay endpoint was copied or retired as temporary");
+  for (bool disk : {false, true}) {
+    for (uint32_t suffix : {1U, 31U}) {
+      Backing backing(1024);
+      KvPool pool(backing);
+      engine::Cache resources(pool, CacheNamespace{});
+      Executor executor(1);
+      if (disk) {
+        executor.deniedSnapshots = 1000;
+        executor.stateTier = std::make_shared<OffloadControl>();
+        executor.stateTier->ready = true;
+        executor.restoreControl->ready = true;
+        executor.restoreControl->promotionDenied = true;
+      }
+      Events events;
+      engine::Engine engine({}, resources, executor, events);
+      const std::vector<uint32_t> prompt(25001, 33);
+      engine.submit(request(520, prompt));
+      runUntilCheckpoint(engine, 1);
+      engine.cancel(520);
+      runUntilIdle(engine);
+      const uint32_t snapshots = executor.snapshots + executor.diskSnapshots;
+      std::vector<uint32_t> shorter(
+          prompt.begin(), prompt.begin() + defaultCheckpointTokens + suffix);
+      engine.submit(request(521, shorter));
+      runUntilIdle(engine);
+      const auto states = resources.snapshot().stateCache;
+      require(events.starts.back().second == defaultCheckpointTokens &&
+                  executor.snapshots + executor.diskSnapshots == snapshots &&
+                  engine.snapshot().deduplicatedStatePublications == 1 &&
+                  states.entries == 1 && states.checkpointEntries == 0 &&
+                  states.promotionsSkipped == (disk ? 1 : 0) &&
+                  resources.lookup(shorter).resumeBoundary() ==
+                      defaultCheckpointTokens,
+              "restored replay endpoint was copied or retired as temporary");
+      auto held = resources.lookup(shorter);
+      const uint64_t block = held.state->kvBlock();
+      const CompositeState *copy = held.state->state().get();
+      held = {};
+      resources.discardState(block, copy);
+      require(resources.lookup(shorter).lostState,
+              "the loss of a restored replay endpoint was not a lost state");
+    }
   }
 }
 
@@ -3264,7 +3459,7 @@ void testPinnedCheckpointSkipsReplacementButNotOrdinaryState() {
   runUntilIdle(engine);
   require(engine.snapshot().checkpointPublications == 1 &&
               engine.snapshot().checkpointPublicationFailures ==
-                  prompt.size() / defaultCheckpointTokens - 1 &&
+                  (prompt.size() / defaultCheckpointTokens) - 1 &&
               executor.snapshotAttempts == 2 &&
               resources.snapshot().stateCache.entries == 2 &&
               resources.snapshot().stateCache.checkpointEntries == 1 &&
@@ -3412,7 +3607,7 @@ void testFinalStateRecyclesItsCheckpointBeforeUnrelatedHotState() {
   runUntilIdle(engine);
   const std::vector<uint32_t> prompt(18001, 28);
   engine.submit(request(461, prompt));
-  runUntilCheckpoint(engine, prompt.size() / defaultCheckpointTokens);
+  runUntilCheckpoint(engine, (prompt.size() / defaultCheckpointTokens));
   executor.snapshotObserver = [&] {
     require(resources.snapshot().stateCache.entries == 1 &&
                 resources.lookup(hot).resumeBoundary() == 64,
@@ -3439,8 +3634,7 @@ void testFinalJunctionRetiresEarlierProgressPoint() {
   resources.endRequest(470);
   engine.submit(request(471, prompt));
   runUntilIdle(engine);
-  require(engine.snapshot().checkpointPublications ==
-                  prompt.size() / defaultCheckpointTokens &&
+  require(engine.snapshot().checkpointPublications == (prompt.size() / defaultCheckpointTokens) &&
               engine.snapshot().junctionMaterializations == 1 &&
               resources.snapshot().stateCache.entries == 1 &&
               resources.lookup(prompt).resumeBoundary() == 20000,
@@ -3553,6 +3747,1055 @@ void testCheckpointIntervalValidationAndDisable() {
 
 } // namespace
 
+// With no cache slot and nothing to recycle, a lane writes its state straight
+// to disk and the next lane over the prefix restores it. While that write is
+// in flight another lane's boundary is refused. Long-prefill checkpoints
+// can use free disk quota until a later state replaces them.
+void testStateWithoutACacheSlotGoesToDisk() {
+  Backing backing(1024);
+  KvPool pool(backing);
+  engine::Cache cache(pool, CacheNamespace{});
+  Executor executor;
+  executor.deniedSnapshots = 1000;
+  executor.stateTier = std::make_shared<OffloadControl>();
+  Events events;
+  engine::Engine engine({}, cache, executor, events);
+  const std::vector<uint32_t> first(65, 1);
+  engine.submit(request(1, first));
+  runUntilIdle(engine);
+  auto counters = engine.snapshot();
+  auto states = cache.snapshot().stateCache;
+  require(executor.diskSnapshots == 1 && counters.replayStatePublications == 1 &&
+              counters.diskStatePublications == 1 &&
+              counters.replayStatePublicationFailures == 0 &&
+              counters.recycledStatePublications == 0 && states.entries == 1 &&
+              states.bytes == 0 && states.diskBytes == 64 && states.offloads == 1 &&
+              events.completedCount == 1,
+          "the state did not go straight to disk");
+  // The write is still in flight: the next boundary finds the staging
+  // buffer busy and is not retried.
+  engine.submit(request(2, std::vector<uint32_t>(65, 2)));
+  runUntilIdle(engine);
+  counters = engine.snapshot();
+  require(executor.diskSnapshots == 1 && counters.diskStatePublications == 1 &&
+              counters.replayStatePublicationFailures == 1 &&
+              events.completedCount == 2 && events.failedCount == 0,
+          "a second write started beside the one in flight");
+  executor.stateTier->ready = true;
+  static_cast<void>(engine.tick(1000));
+  states = cache.snapshot().stateCache;
+  require(states.entries == 1 && states.diskBytes == 64 && states.offloadFailures == 0,
+          "the write did not land");
+  // The prefix comes back from disk.
+  engine.submit(request(3, first));
+  static_cast<void>(engine.tick(1001));
+  require(executor.diskReads == 1 && executor.prefillRows == 130,
+          "the disk state was not read");
+  executor.restoreControl->ready = true;
+  runUntilIdle(engine);
+  require(executor.restored == 64 && executor.prefillRows == 131 &&
+              events.starts.back() ==
+                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 64} &&
+              events.failedCount == 0,
+          "the prefix was not restored from the disk state");
+  // A rolling checkpoint denied a cache slot goes to disk like any state,
+  // and the replay boundary of the same prompt retires it from there.
+  engine.submit(request(4, std::vector<uint32_t>(2 * defaultCheckpointTokens + 1, 4)));
+  runUntilIdle(engine);
+  counters = engine.snapshot();
+  require(counters.checkpointPublications == 1 &&
+              counters.checkpointPublicationFailures == 0 &&
+              counters.diskStatePublications == 3 && executor.diskSnapshots == 3 &&
+              counters.resources.stateCache.checkpointEntries == 0 &&
+              counters.resources.stateCache.checkpointRetirements == 1 &&
+              events.completedCount == 4 && events.failedCount == 0,
+          "the checkpoint did not go to disk and come back out");
+}
+
+// A foreground arrival does not wait for a background producer of the same
+// prompt, so both lanes compute it. Without a cache slot the producer's
+// states go to disk, and the other lane's publications at the same blocks
+// find them there: they are deduplicated, not counted as writes.
+void testStateAlreadyOnDiskIsDeduplicated() {
+  Backing backing(512);
+  KvPool pool(backing);
+  engine::Cache cache(pool, CacheNamespace{});
+  Executor executor;
+  executor.deniedSnapshots = 1000;
+  executor.stateTier = std::make_shared<OffloadControl>();
+  executor.stateTier->ready = true;
+  Events events;
+  engine::Engine engine({}, cache, executor, events);
+  const std::vector<uint32_t> prompt(5001, 7);
+  auto producer = request(1, prompt);
+  producer.priority = RequestPriority::Background;
+  engine.submit(std::move(producer));
+  static_cast<void>(engine.tick(0));
+  auto duplicate = request(2, prompt);
+  duplicate.priority = RequestPriority::Foreground;
+  engine.submit(std::move(duplicate));
+  runUntilIdle(engine);
+  require(events.completedCount == 2 && events.failedCount == 0 &&
+              executor.prefillRows == 2 * prompt.size(),
+          "both lanes did not compute the prompt");
+  const auto counters = engine.snapshot();
+  require(executor.diskSnapshots == 2 && counters.diskStatePublications == 2 &&
+              counters.replayStatePublications == 1 &&
+              counters.junctionMaterializations == 1 &&
+              counters.deduplicatedStatePublications == 1 &&
+              counters.resources.stateCache.deduplicatedPublications == 1,
+          "a state already on disk was counted as written");
+}
+
+// With no cache slot, a long prefill's rolling checkpoint goes to disk and
+// outlives the request that made it: a branch off the same prompt restores
+// it from disk instead of replaying from the start.
+void testCancelledPrefillRecoversFromItsDiskCheckpoint() {
+  Backing backing(512);
+  KvPool pool(backing);
+  engine::Cache cache(pool, CacheNamespace{});
+  Executor executor(1);
+  executor.deniedSnapshots = 1000;
+  executor.stateTier = std::make_shared<OffloadControl>();
+  executor.stateTier->ready = true;
+  Events events;
+  engine::Engine engine({}, cache, executor, events);
+  const std::vector<uint32_t> donor(2 * defaultCheckpointTokens + 1, 61);
+  engine.submit(request(600, donor));
+  for (uint32_t step = 0; step < 128; ++step) {
+    static_cast<void>(engine.tick(step + 1));
+    if (!engine.commandInFlight() && executor.requests.at(600).position == 6144)
+      break;
+  }
+  auto counters = engine.snapshot();
+  require(!engine.commandInFlight() && executor.requests.at(600).position == 6144 &&
+              counters.checkpointPublications == 1 && counters.diskStatePublications == 1 &&
+              counters.resources.stateCache.checkpointEntries == 1 &&
+              counters.resources.stateCache.bytes == 0,
+          "the checkpoint did not go to disk");
+  engine.cancel(600);
+  runUntilIdle(engine);
+  require(engine.snapshot().cancelled == 1 &&
+              cache.snapshot().stateCache.checkpointEntries == 1,
+          "cancellation removed the disk checkpoint");
+  std::vector<uint32_t> branch(donor.begin(), donor.begin() + 6145);
+  branch.back() = 62;
+  engine.submit(request(601, branch));
+  static_cast<void>(engine.tick(1000));
+  require(executor.diskReads == 1, "the disk checkpoint was not read");
+  executor.restoreControl->ready = true;
+  runUntilIdle(engine);
+  counters = engine.snapshot();
+  require(events.starts.back() ==
+                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 4096} &&
+              executor.restored == 4096 && executor.prefillRows == 6144 + 2049 &&
+              counters.completed == 1 && events.failedCount == 0 &&
+              counters.resources.stateCache.checkpointEntries == 0 &&
+              counters.resources.stateCache.checkpointRetirements == 1,
+          "the branch did not resume from the disk checkpoint");
+}
+
+// A disk checkpoint frees no cache slot for the final state, so it stays the
+// lane's recovery point until that state is published. When another lane's
+// write holds the staging buffer at the final boundary, the request keeps
+// its checkpoint, and the next turn resumes from it whether the request was
+// cancelled or completed.
+void testFailedFinalStateKeepsTheDiskCheckpoint() {
+  for (bool cancel : {true, false}) {
+    Backing backing(512);
+    KvPool pool(backing);
+    engine::Cache cache(pool, CacheNamespace{});
+    Executor executor;
+    executor.deniedSnapshots = 1000;
+    executor.stateTier = std::make_shared<OffloadControl>();
+    executor.stateTier->ready = true;
+    Events events;
+    engine::Engine engine({}, cache, executor, events);
+    const std::vector<uint32_t> prompt(2 * defaultCheckpointTokens + 1, 65);
+    EngineRequest decoding = request(610, prompt);
+    decoding.maxNewTokens = 64;
+    engine.submit(decoding);
+    for (uint32_t step = 0; step < 128; ++step) {
+      static_cast<void>(engine.tick(step + 1));
+      if (!engine.commandInFlight() && executor.requests.at(610).position == 6144)
+        break;
+    }
+    auto counters = engine.snapshot();
+    require(!engine.commandInFlight() && executor.requests.at(610).position == 6144 &&
+                counters.checkpointPublications == 1 && counters.diskStatePublications == 1 &&
+                counters.resources.stateCache.checkpointEntries == 1,
+            "the checkpoint did not go to disk");
+    executor.stateTier->ready = false;
+    engine.submit(request(611, std::vector<uint32_t>(65, 66)));
+    for (uint32_t step = 0; step < 128 && !engine.snapshot().replayStatePublicationFailures;
+         ++step)
+      static_cast<void>(engine.tick(1000 + step));
+    counters = engine.snapshot();
+    require(counters.replayStatePublications == 1 &&
+                counters.replayStatePublicationFailures == 1 &&
+                counters.diskStatePublications == 2 && executor.diskSnapshots == 2 &&
+                events.failedCount == 0,
+            "the final state was not refused beside the other lane's write");
+    require(counters.resources.stateCache.checkpointEntries == 1 &&
+                counters.resources.stateCache.checkpointRetirements == 0,
+            "the final boundary retired the checkpoint it could not replace");
+    if (cancel)
+      engine.cancel(610);
+    executor.stateTier->ready = true;
+    runUntilIdle(engine);
+    require(engine.snapshot().completed == (cancel ? 1U : 2U) &&
+                cache.snapshot().stateCache.checkpointEntries == 1,
+            "the request's end removed the checkpoint its final state did not replace");
+    engine.submit(request(612, prompt));
+    static_cast<void>(engine.tick(2000));
+    executor.restoreControl->ready = true;
+    runUntilIdle(engine);
+    counters = engine.snapshot();
+    require(events.starts.back() ==
+                    std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 4096} &&
+                executor.restored == 4096 && counters.cancelled == (cancel ? 1U : 0U) &&
+                counters.completed == (cancel ? 2U : 3U) && events.failedCount == 0 &&
+                counters.resources.stateCache.checkpointEntries == 0 &&
+                counters.resources.stateCache.checkpointRetirements == 1,
+            "the next turn did not resume from the disk checkpoint and replace it");
+  }
+}
+
+void testNearFinalCheckpointAvoidsDiskWrite() {
+  const uint32_t chunk = model::ExecutionLimits::prefillTokenBudget;
+  for (bool denyRam : {false, true}) {
+    for (uint32_t remaining : {32u, chunk - 32, chunk}) {
+      Backing backing(512);
+      KvPool pool(backing);
+      engine::Cache cache(pool, CacheNamespace{});
+      Executor executor;
+      executor.deniedSnapshots = denyRam ? 1000 : 0;
+      executor.stateTier = std::make_shared<OffloadControl>();
+      executor.stateTier->ready = true;
+      Events events;
+      engine::Engine engine({}, cache, executor, events);
+      const std::vector<uint32_t> prompt(defaultCheckpointTokens + remaining + 1, 71);
+      engine.submit(request(1, prompt));
+      runUntilIdle(engine);
+      const auto counters = engine.snapshot();
+      const uint64_t checkpoint = !denyRam || remaining >= chunk;
+      require(counters.checkpointPublications == checkpoint &&
+                  counters.checkpointPublicationFailures == 0 &&
+                  counters.replayStatePublications == 1 &&
+                  counters.replayStatePublicationFailures == 0 &&
+                  executor.diskSnapshots == (denyRam ? 1 + checkpoint : 0) &&
+                  counters.resources.stateCache.entries == 1 &&
+                  counters.resources.stateCache.checkpointEntries == 0 &&
+                  events.completedCount == 1 && events.failedCount == 0,
+              "near-final disk checkpoint policy changed RAM checkpoints or lost final state");
+      executor.restoreControl->ready = true;
+      engine.submit(request(2, prompt));
+      runUntilIdle(engine);
+      require(events.starts.back() ==
+                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit,
+                                                       uint32_t(prompt.size() - 1)} &&
+                  events.completedCount == 2 && events.failedCount == 0,
+              "skipping a disk checkpoint lost the final reusable prefix");
+    }
+  }
+}
+
+void testSkippedCheckpointKeepsPreviousRecoveryPoint() {
+  for (bool disk : {false, true}) {
+    Backing backing(512);
+    KvPool pool(backing);
+    engine::Cache cache(pool, CacheNamespace{});
+    Executor executor(1);
+    executor.deniedSnapshots = disk ? 1000 : 0;
+    executor.denySnapshotAtBoundary = 2 * defaultCheckpointTokens;
+    executor.stateTier = std::make_shared<OffloadControl>();
+    executor.stateTier->ready = true;
+    executor.restoreControl->ready = true;
+    Events events;
+    engine::Engine engine({}, cache, executor, events);
+    const std::vector<uint32_t> prompt(2 * defaultCheckpointTokens + 33, 73);
+    engine.submit(request(1, prompt));
+    for (uint32_t step = 0; step < 128; ++step) {
+      static_cast<void>(engine.tick(step + 1));
+      if (!engine.commandInFlight() &&
+          executor.requests.at(1).position == 2 * defaultCheckpointTokens)
+        break;
+    }
+    const auto before = engine.snapshot();
+    require(!engine.commandInFlight() &&
+                executor.requests.at(1).position == 2 * defaultCheckpointTokens &&
+                before.checkpointPublications == 1 &&
+                before.checkpointPublicationFailures == 0 &&
+                before.resources.stateCache.checkpointEntries == 1 &&
+                before.resources.stateCache.checkpointRetirements == 0 &&
+                executor.diskSnapshots == (disk ? 1 : 0),
+            "skipped near-final checkpoint retired or rewrote its predecessor");
+    engine.cancel(1);
+    runUntilIdle(engine);
+    engine.submit(request(2, prompt));
+    runUntilIdle(engine);
+    require(events.starts.back() ==
+                std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit,
+                                                     defaultCheckpointTokens} &&
+                engine.snapshot().cancelled == 1 && engine.snapshot().completed == 1 &&
+                events.failedCount == 0 &&
+                cache.snapshot().stateCache.checkpointEntries == 0,
+            "cancellation after a skipped checkpoint lost the earlier recovery point");
+  }
+}
+
+// A lane alone in the pool whose growth needs backing the budget refuses is
+// not out of capacity while the tier is busy: the one state write in flight
+// holds the staging buffer, so the cached state that would free memory waits
+// for it, and the lane waits with it instead of failing or yielding. Once
+// the write lands the cached state is written, its block gives up its pages,
+// and the lane runs. Under host pressure the lane reuses the same idle
+// cached pages, so it waits for them the same way.
+void testGrowthWaitsForTheStateWriteInFlight() {
+  for (bool paused : {false, true}) {
+    Backing backing(16);
+    KvPool pool(backing);
+    engine::Cache cache(pool, CacheNamespace{});
+    Executor executor;
+    Events events;
+    engine::Engine engine({.maxContext = 102400, .growthPaused = [paused] { return paused; }},
+                          cache, executor, events);
+    // A write in flight from a lane still running: its block is no leaf to evict.
+    auto writing = std::make_shared<OffloadControl>();
+    cache.beginRequest(999);
+    require(cache.ensureTokens(999, 64).granted(), "fixture KV failed");
+    const auto held = cache.publishCommittedBlocks(999, std::vector<uint32_t>(64, 12), 64);
+    require(cache.publishStateToDisk(held, [&](std::function<void()>) {
+              return std::make_unique<OffloadTicket>(writing);
+            }),
+            "fixture write did not start");
+    // A cached state in RAM whose eviction must wait for that write.
+    auto cached = std::make_shared<OffloadControl>();
+    cache.beginRequest(998);
+    require(cache.ensureTokens(998, 64).granted(), "fixture KV failed");
+    const auto idle = cache.publishCommittedBlocks(998, std::vector<uint32_t>(64, 13), 64);
+    cache.publishCompositeState(idle, std::make_shared<OffloadState>(cached));
+    cache.endRequest(998);
+    // Every free page needs backing the budget, or the host, refuses.
+    backing.allocationFailure = paused ? metal::AllocationFailure::HostPressure
+                                       : metal::AllocationFailure::EngineBudget;
+    backing.growthBlocked = true;
+    engine.submit(request(1, std::vector<uint32_t>(33, 17)));
+    static_cast<void>(engine.tick(1));
+    static_cast<void>(engine.tick(2));
+    require(events.failedCount == 0 && executor.prefillRows == 0 && executor.suspensions == 0,
+            "the lane failed or yielded while the tier was busy");
+    writing->ready = true;
+    static_cast<void>(engine.tick(3));
+    require(cache.snapshot().stateCache.offloads == 2 && cache.snapshot().stateCache.bytes == 0 &&
+                cached->released,
+            "the cached state was not written once the staging buffer was free");
+    cached->ready = true;
+    for (uint32_t step = 4; step < 20 && !engine.idle(); ++step)
+      static_cast<void>(engine.tick(step));
+    require(events.completedCount == 1 && events.failedCount == 0 && executor.suspensions == 0 &&
+                executor.prefillRows == 33,
+            "the lane did not run on the pages the written state gave up");
+  }
+}
+
+// A physical shortfall is covered in one pass: when the pool cannot map
+// backing for its free pages, the reclaim between attempts demotes as many
+// leaves as the shortfall needs, within the ring's share, and the lane waits
+// once for their pages instead of once per page.
+// A lane that cannot run must never leave the engine without a wakeup: the
+// transfer it waits for wakes it, and if that wake is missed the retry
+// deadline does once no command is in flight (a command's completion wakes
+// the loop itself). Here the pages come back but nothing reports their
+// arrival, so only the deadline can end the wait.
+void testWaitingLaneAlwaysNamesAWakeup() {
+  Backing backing(8);
+  KvPool pool(backing);
+  test::TestKvTier tier;
+  tier.stagingSlots = 8;
+  engine::Cache cache(pool, CacheNamespace{}, &tier);
+  Executor executor;
+  executor.tier = &tier;
+  Events events;
+  engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+  auto transfer = std::make_shared<OffloadControl>();
+  transfer->ready = true;
+  for (uint64_t id = 900; id < 906; ++id) {
+    std::vector<uint32_t> prompt(32, static_cast<uint32_t>(id));
+    cache.beginRequest(id);
+    require(cache.ensureTokens(id, 32).granted(), "fixture KV failed");
+    const auto block = cache.publishCommittedBlocks(id, prompt, 32);
+    cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
+    cache.endRequest(id);
+    require(cache.reclaimOneState() && cache.pollTransfers(), "state was not demoted");
+  }
+  engine.submit(request(1, std::vector<uint32_t>(97, 7)));
+  static_cast<void>(engine.tick(1));
+  require(tier.demotions == 1 && executor.prefillRows == 0 && executor.transferCommands == 1,
+          "the lane did not wait for a page");
+  // The copies ride a command of their own; its completion is the next wake.
+  static_cast<void>(engine.tick(2));
+  const auto wakeup = engine.nextWakeupMilliseconds();
+  require(wakeup.has_value() && *wakeup <= 1.0 + 100.0,
+          "a waiting lane left the engine without a bounded wakeup");
+  // The wait ends on its own once the pages are back.
+  for (uint32_t step = 3; step < 40 && !engine.idle(); ++step) {
+    tier.complete();
+    static_cast<void>(engine.tick(step));
+  }
+  require(engine.idle() && events.outputs.contains(1) && events.failedCount == 0,
+          "the lane never ran");
+}
+
+// Pending means a transfer is in flight. With the tier unwritable and
+// nothing moving, a lane that cannot get pages must be answered, not parked.
+void testNothingInFlightIsNotPending() {
+  Backing backing(8);
+  KvPool pool(backing);
+  test::TestKvTier tier;
+  tier.writableFile = false;
+  engine::Cache cache(pool, CacheNamespace{}, &tier);
+  Executor executor;
+  executor.tier = &tier;
+  Events events;
+  engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+  auto transfer = std::make_shared<OffloadControl>();
+  transfer->ready = true;
+  for (uint64_t id = 900; id < 908; ++id) {
+    std::vector<uint32_t> prompt(32, static_cast<uint32_t>(id));
+    cache.beginRequest(id);
+    if (!cache.ensureTokens(id, 32).granted()) {
+      cache.endRequest(id);
+      break;
+    }
+    static_cast<void>(cache.publishCommittedBlocks(id, prompt, 32));
+    cache.endRequest(id);
+  }
+  engine.submit(request(1, std::vector<uint32_t>(97, 7)));
+  runUntilIdle(engine);
+  require(engine.idle() && events.outputs.contains(1) && events.failedCount == 0 &&
+              tier.demotions == 0 && executor.prefillRows == 97,
+          "the lane did not run on leaves the unwritable tier had to drop");
+}
+
+void testPhysicalShortfallDemotesInBulk() {
+  Backing backing(16);
+  KvPool pool(backing);
+  test::TestKvTier tier;
+  tier.stagingSlots = 8;
+  tier.capacity = 8;
+  engine::Cache cache(pool, CacheNamespace{}, &tier);
+  Executor executor;
+  executor.tier = &tier;
+  Events events;
+  engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+  auto transfer = std::make_shared<OffloadControl>();
+  transfer->ready = true;
+  for (uint64_t id = 900; id < 906; ++id) {
+    std::vector<uint32_t> prompt(32, static_cast<uint32_t>(id));
+    cache.beginRequest(id);
+    require(cache.ensureTokens(id, 32).granted(), "fixture KV failed");
+    const auto block = cache.publishCommittedBlocks(id, prompt, 32);
+    cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
+    cache.endRequest(id);
+    require(cache.reclaimOneState() && cache.pollTransfers(), "state was not demoted");
+  }
+  // The cached blocks fill two extents but two of their pages: those two
+  // are free and backed, the other eight free pages are not, and the budget
+  // maps nothing more. The first command, 160 tokens, falls three pages
+  // short; the last token one more.
+  require(pool.freeResidentPageCount() == 2 && pool.freePageCount() == 10,
+          "fixture backing geometry changed");
+  backing.allocationFailure = metal::AllocationFailure::EngineBudget;
+  backing.growthBlocked = true;
+  engine.submit(request(1, std::vector<uint32_t>(161, 7)));
+  static_cast<void>(engine.tick(1));
+  require(tier.demotions == 3 && executor.prefillRows == 0 && executor.suspensions == 0 &&
+              events.failedCount == 0,
+          "a shortfall of three pages did not start three demotions in one pass");
+  static_cast<void>(engine.tick(2));
+  require(tier.demotions == 3, "waiting demoted more");
+  for (uint32_t step = 3; step < 40 && !engine.idle(); ++step) {
+    tier.complete();
+    static_cast<void>(engine.tick(step));
+  }
+  require(engine.idle() && events.outputs.contains(1) && executor.prefillRows == 161 &&
+              executor.suspensions == 0 && events.failedCount == 0 && tier.demotions == 4 &&
+              cache.snapshot().kvTier.diskBlocks == 4,
+          "the lane did not run on the pages the demotions gave back");
+}
+
+void testKvGrowthProceedsThroughDemotion() {
+  Backing backing(128);
+  KvPool pool(backing);
+  engine::Cache cache(pool, CacheNamespace{});
+  Executor executor;
+  Events events;
+  engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+  auto transfer = std::make_shared<OffloadControl>();
+  cache.beginRequest(999);
+  require(cache.ensureTokens(999, 32).granted(), "offload fixture KV failed");
+  const auto block = cache.publishCommittedBlocks(999, std::vector<uint32_t>(32, 12), 32);
+  cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
+  cache.endRequest(999);
+  {
+    auto lookup = cache.lookup(std::vector<uint32_t>(33, 12));
+    cache.recordLookup(lookup);
+  }
+  backing.allocationFailure = metal::AllocationFailure::EngineBudget;
+  backing.growthAllowed = [&] { return transfer->released; };
+  engine.submit(request(1, std::vector<uint32_t>(256, 17)));
+  runUntilIdle(engine);
+  // The demoted state's RAM served KV growth before its write finished.
+  require(transfer->released && !transfer->ready && executor.prefillRows == 256 &&
+              executor.suspensions == 0 && events.failedCount == 0,
+          "KV growth waited for the write or replayed the lane");
+  require(cache.snapshot().stateCache.diskBytes == 64, "demoted state lost its disk copy");
+  transfer->ready = true;
+  static_cast<void>(engine.tick(1000));
+  const auto stats = cache.snapshot().stateCache;
+  require(stats.offloads == 1 && stats.offloadFailures == 0 && stats.diskBytes == 64,
+          "completed write was not consumed");
+}
+
+// States reach the disk tier by demotion only: the fixture publishes a RAM
+// state and reclaims it while nothing else is in RAM.
+void demoteState(engine::Cache &cache, uint64_t block) {
+  auto transfer = std::make_shared<OffloadControl>();
+  transfer->ready = true;
+  cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
+  require(cache.reclaimOneState() && cache.pollTransfers() &&
+              cache.snapshot().stateCache.bytes == 0,
+          "fixture state did not move to disk");
+}
+
+void publishDiskState(engine::Cache &cache, const std::vector<uint32_t> &prompt) {
+  cache.beginRequest(999);
+  require(cache.ensureTokens(999, 64).granted(), "disk fixture KV allocation failed");
+  demoteState(cache, cache.publishCommittedBlocks(999, prompt, 64));
+  cache.endRequest(999);
+}
+
+void testAsyncRestoreLifecycle() {
+  for (int outcome = 0; outcome < 4; ++outcome) {
+    Backing backing(128);
+    KvPool pool(backing);
+    engine::Cache cache(pool, CacheNamespace{});
+    Executor executor;
+    Events events;
+    engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+    std::vector<uint32_t> prompt(65, 17);
+    publishDiskState(cache, prompt);
+    engine.submit(request(1, prompt));
+    static_cast<void>(engine.tick(1));
+    require(executor.diskReads == 1 && executor.prefillRows == 0 && events.starts.empty(),
+            "disk restore ran before IO completion");
+    require(cache.snapshot().stateCache.pinned == 1 && executor.requests.contains(1),
+            "restore did not retain admitted state and KV");
+    // A separate lane can run while this restore is pending.
+    engine.submit(request(2, std::vector<uint32_t>(3, 99)));
+    for (int tick = 2; tick < 8; ++tick) static_cast<void>(engine.tick(tick));
+    require(events.outputs.contains(2), "restore blocked independent model work");
+    if (outcome == 1) engine.cancel(1);
+    if (outcome == 2) static_cast<void>(engine.tick(10001));
+    if (outcome == 3) executor.restoreControl->success = false;
+    require(executor.requests.contains(1), "cancellation reused IO destination before drain");
+    executor.restoreControl->ready = true;
+    runUntilIdle(engine);
+    require(cache.snapshot().stateCache.pinned == 0 && cache.snapshot().activeRequests == 0 &&
+                executor.requests.empty(), "restore leaked active resources");
+    if (outcome == 0)
+      require(executor.restored == 64 && executor.prefillRows == 4, "disk hit recomputed prefix");
+    else if (outcome == 3)
+      require(executor.restored == 0 && executor.prefillRows == 68 && executor.diskReads == 1,
+              "failed read did not fall back once to cold prefill");
+    else
+      require(executor.restored == 0 && !events.outputs.contains(1),
+              "cancelled or expired restore emitted output");
+  }
+}
+
+void testDiskHitWithNoActiveMemory() {
+  Backing backing(128);
+  KvPool pool(backing);
+  engine::Cache cache(pool, CacheNamespace{});
+  Executor executor;
+  Events events;
+  engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+  std::vector<uint32_t> prompt(65, 17);
+  publishDiskState(cache, prompt);
+  executor.beginAllocationFailure = metal::AllocationFailure::EngineBudget;
+  executor.beginGrowthBlocked = [&] { return cache.snapshot().stateCache.entries != 0; };
+  engine.submit(request(1, prompt));
+  runUntilIdle(engine);
+  require(executor.diskReads == 0 && executor.prefillRows == 65 && events.failedCount == 0,
+          "disk hit bypassed admission or deadlocked on its own pin");
+}
+
+void testRepeatedDiskHitPromotesToMemory() {
+  Backing backing(128);
+  KvPool pool(backing);
+  engine::Cache cache(pool, CacheNamespace{});
+  Executor executor;
+  Events events;
+  engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+  std::vector<uint32_t> prompt(65, 17);
+  publishDiskState(cache, prompt);
+  executor.restoreControl->ready = true;
+  for (uint64_t id = 1; id <= 4; ++id) {
+    engine.submit(request(id, prompt));
+    runUntilIdle(engine);
+  }
+  require(executor.diskReads == 1 && cache.snapshot().stateCache.promotions == 1 &&
+              cache.snapshot().stateCache.diskHits == 1 && events.failedCount == 0,
+          "hot restored prefix continued to read from disk");
+}
+
+// A failed disk read falls back to the next cache match, not to a cold start:
+// the invalidated copy is gone from the lookup, the shallower state is not.
+void testFailedDiskRestoreKeepsShallowerState() {
+  Backing backing(128);
+  KvPool pool(backing);
+  engine::Cache cache(pool, CacheNamespace{});
+  Executor executor;
+  Events events;
+  engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+  std::vector<uint32_t> prompt(65, 17);
+  cache.beginRequest(999);
+  require(cache.ensureTokens(999, 64).granted(), "fixture KV failed");
+  static_cast<void>(cache.publishCommittedBlocks(999, prompt, 64));
+  demoteState(cache, cache.blockAt(999, 64));
+  cache.publishCompositeState(cache.blockAt(999, 32), std::make_shared<State>());
+  cache.endRequest(999);
+  executor.restoreControl->ready = true;
+  executor.restoreControl->success = false;
+  engine.submit(request(1, prompt));
+  runUntilIdle(engine);
+  require(executor.diskReads == 1 && events.failedCount == 0 && executor.restored == 32 &&
+              executor.prefillRows == 33,
+          "failed disk restore discarded the shallower RAM state");
+}
+
+// A prefix whose state and KV moved to disk comes back before the lane runs:
+// the request waits for the state read and the page restores, then starts
+// as a prefix hit on the restored pages.
+void testDiskKvPrefixIsRestoredBeforeTheLaneRuns() {
+  constexpr auto reuse = CacheReclaimMode::ReuseBacking;
+  Backing backing(128);
+  KvPool pool(backing);
+  test::TestKvTier tier;
+  engine::Cache cache(pool, CacheNamespace{}, &tier);
+  Executor executor;
+  executor.tier = &tier;
+  Events events;
+  engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+  std::vector<uint32_t> prompt(65, 17);
+  auto transfer = std::make_shared<OffloadControl>();
+  transfer->ready = true;
+  cache.beginRequest(999);
+  require(cache.ensureTokens(999, 64).granted(), "fixture KV failed");
+  const auto block = cache.publishCommittedBlocks(999, prompt, 64);
+  cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
+  cache.endRequest(999);
+  require(cache.reclaimOne(reuse).reclaimedBytes == 64 && cache.pollTransfers(),
+          "state was not demoted");
+  for (uint32_t written = 1; written <= 2; ++written) {
+    require(cache.reclaimOne(reuse).madeProgress && tier.demotions == written,
+            "KV block was not written");
+    tier.complete();
+    require(cache.pollTransfers(), "written block did not land");
+  }
+  require(cache.snapshot().kvCache.blocks == 0 && cache.snapshot().kvTier.diskBlocks == 2,
+          "prefix did not move to disk whole");
+
+  engine.submit(request(1, prompt));
+  static_cast<void>(engine.tick(1));
+  require(executor.diskReads == 1 && tier.restores == 2 && executor.prefillRows == 0 &&
+              events.starts.empty() && executor.transferCommands == 1,
+          "lane ran before its pages came back, or no command carried the copies");
+  // The state read lands first; the lane still waits for its pages.
+  executor.restoreControl->ready = true;
+  static_cast<void>(engine.tick(2));
+  static_cast<void>(engine.tick(3));
+  require(executor.prefillRows == 0 && events.starts.empty(),
+          "lane ran with pages still on the way");
+  tier.complete();
+  runUntilIdle(engine);
+  require(executor.restored == 64 && executor.prefillRows == 1 && events.starts.size() == 1 &&
+              events.starts[0].first == EngineCacheStatus::PrefixHit &&
+              events.starts[0].second == 64 && events.failedCount == 0,
+          "restored prefix was not used");
+  const auto stats = cache.snapshot();
+  require(stats.kvTier.restores == 2 &&
+              stats.kvCache.blocks == 2 && stats.kvTier.diskBlocks == 2,
+          "restore accounting is off");
+}
+
+void testCancelledDiskPrefixStopsQueuedReads() {
+  Backing backing(128);
+  KvPool pool(backing);
+  test::TestKvTier tier;
+  tier.stagingSlots = 1;
+  engine::Cache cache(pool, CacheNamespace{}, &tier);
+  Executor executor;
+  executor.tier = &tier;
+  Events events;
+  engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+  const std::vector<uint32_t> prompt(129, 17);
+  cache.beginRequest(999);
+  require(cache.ensureTokens(999, 128).granted(), "fixture KV failed");
+  const auto block = cache.publishCommittedBlocks(999, prompt, 128);
+  demoteState(cache, block);
+  cache.endRequest(999);
+  for (int page = 0; page < 4; ++page) {
+    require(cache.reclaimOne(CacheReclaimMode::ReuseBacking).madeProgress,
+            "fixture KV did not demote");
+    tier.complete();
+    static_cast<void>(cache.pollTransfers());
+  }
+  engine.submit(request(1, prompt));
+  static_cast<void>(engine.tick(1));
+  require(tier.restores == 1 && executor.diskReads == 1,
+          "restore did not start within staging capacity");
+  engine.cancel(1);
+  executor.restoreControl->ready = true;
+  static_cast<void>(engine.tick(2));
+  for (int tick = 3; tick < 16; ++tick) {
+    tier.complete();
+    static_cast<void>(engine.tick(tick));
+  }
+  const auto stats = cache.snapshot();
+  require(tier.restores == 1 && !tier.inFlight() && engine.idle() &&
+              stats.stateCache.pinned == 0 && stats.activeRequests == 0 &&
+              executor.requests.empty() && !events.outputs.contains(1),
+          "cancelled prefix read unused pages or retained active resources");
+  require(stats.kvTier.diskBlocks == 4 && stats.kvCache.blocks == 1,
+          "cancellation destroyed reusable disk pages");
+  executor.restoreControl = std::make_shared<RestoreControl>();
+  executor.restoreControl->ready = true;
+  engine.submit(request(2, prompt));
+  for (int tick = 16; tick < 64; ++tick) {
+    tier.complete();
+    static_cast<void>(engine.tick(tick));
+  }
+  require(tier.restores == 4 && executor.restored == 128 &&
+              events.outputs.contains(2) && events.failedCount == 0 &&
+              cache.snapshot().activeRequests == 0,
+          "retry did not reuse the cancelled request's disk prefix");
+}
+
+// A lane short of pages waits for the copies of demoted blocks to land and
+// runs on their pages: no lane yields, and no more is written than needed.
+void testPagesReturnFromDemotionWithoutSuspending() {
+  Backing backing(8);
+  KvPool pool(backing);
+  test::TestKvTier tier;
+  tier.stagingSlots = 8;
+  engine::Cache cache(pool, CacheNamespace{}, &tier);
+  Executor executor;
+  executor.tier = &tier;
+  Events events;
+  engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+  // Six cached blocks, each under a state on disk, hold six of eight pages.
+  auto transfer = std::make_shared<OffloadControl>();
+  transfer->ready = true;
+  for (uint64_t id = 900; id < 906; ++id) {
+    std::vector<uint32_t> prompt(32, static_cast<uint32_t>(id));
+    cache.beginRequest(id);
+    require(cache.ensureTokens(id, 32).granted(), "fixture KV failed");
+    const auto block = cache.publishCommittedBlocks(id, prompt, 32);
+    cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
+    cache.endRequest(id);
+    require(cache.reclaimOneState() && cache.pollTransfers(), "state was not demoted");
+  }
+  require(pool.freePageCount() == 2 && tier.demotions == 0, "fixture pages are off");
+
+  // The first prefill command ends at the replay boundary, 96 tokens: three
+  // pages against two free ones.
+  engine.submit(request(1, std::vector<uint32_t>(97, 7)));
+  static_cast<void>(engine.tick(1));
+  require(tier.demotions == 1 && executor.transferCommands == 1 && executor.suspensions == 0 &&
+              executor.prefillRows == 0 && events.failedCount == 0,
+          "the lane yielded or more than one block was written");
+  static_cast<void>(engine.tick(2));
+  static_cast<void>(engine.tick(3));
+  require(tier.demotions == 1 && executor.prefillRows == 0, "waiting demoted more");
+  // The lane lacks two pages in all: one for its first command, one for the
+  // last token. Exactly two blocks are written.
+  for (uint32_t step = 4; step < 40 && !engine.idle(); ++step) {
+    tier.complete();
+    static_cast<void>(engine.tick(step));
+  }
+  require(engine.idle(), "engine did not reach idle");
+  require(events.outputs.contains(1) && executor.prefillRows == 97 && executor.suspensions == 0 &&
+              events.failedCount == 0 && tier.demotions == 2,
+          "lane did not run on the returned pages, or more was written than it lacked");
+  const auto stats = cache.snapshot();
+  require(stats.kvTier.diskBlocks == 2 && stats.kvTier.pendingPages == 0 &&
+              stats.stateCache.diskBytes == 6 * 64,
+          "tier accounting after the wait is off");
+}
+
+// A lane whose pages keep landing is never failed for waiting: the resource
+// limit measures time without progress. With one staging slot every round
+// moves one page, so the restore takes many rounds and several times the
+// limit, and still completes as a prefix hit.
+void testWaitWithProgressOutlivesTheResourceLimit() {
+  constexpr auto reuse = CacheReclaimMode::ReuseBacking;
+  Backing backing(8);
+  KvPool pool(backing);
+  test::TestKvTier tier;
+  tier.stagingSlots = 8;
+  engine::Cache cache(pool, CacheNamespace{}, &tier);
+  Executor executor;
+  executor.tier = &tier;
+  Events events;
+  engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+  // A three-block prefix and its state move to disk entirely.
+  std::vector<uint32_t> prompt(97, 17);
+  cache.beginRequest(999);
+  require(cache.ensureTokens(999, 96).granted(), "fixture KV failed");
+  demoteState(cache, cache.publishCommittedBlocks(999, prompt, 96));
+  cache.endRequest(999);
+  for (uint32_t written = 1; written <= 3; ++written) {
+    require(cache.reclaimOne(reuse).madeProgress && tier.demotions == written,
+            "prefix block was not written");
+    tier.complete();
+    require(cache.pollTransfers(), "prefix block did not land");
+  }
+  // Six cached blocks under disk states hold six of the eight pages.
+  auto transfer = std::make_shared<OffloadControl>();
+  transfer->ready = true;
+  for (uint64_t id = 900; id < 906; ++id) {
+    std::vector<uint32_t> filler(32, static_cast<uint32_t>(id));
+    cache.beginRequest(id);
+    require(cache.ensureTokens(id, 32).granted(), "filler KV failed");
+    cache.publishCompositeState(cache.publishCommittedBlocks(id, filler, 32),
+                                std::make_shared<OffloadState>(transfer));
+    cache.endRequest(id);
+    require(cache.reclaimOneState() && cache.pollTransfers(), "filler state was not demoted");
+  }
+  require(pool.freePageCount() == 2, "fixture pages are off");
+
+  tier.stagingSlots = 1;
+  executor.restoreControl->ready = true;
+  EngineRequest waiting = request(1, prompt);
+  waiting.deadlineMilliseconds = 1e9;
+  engine.submit(std::move(waiting));
+  double now = 1.0;
+  for (int round = 0; round < 40 && !engine.idle(); ++round) {
+    static_cast<void>(engine.tick(now));
+    tier.complete();
+    now += 20000.0;
+  }
+  require(engine.idle(), "lane did not finish");
+  require(now > 90000.0, "the wait did not cross the resource limit");
+  require(events.failedCount == 0 && events.starts.size() == 1 &&
+              events.starts[0].first == EngineCacheStatus::PrefixHit &&
+              events.starts[0].second == 96 && executor.restored == 96 &&
+              executor.prefillRows == 1 && executor.suspensions == 0,
+          "a lane whose pages kept landing was failed or lost its prefix");
+  require(cache.snapshot().kvTier.restores == 3,
+          "resource retries lost or repeated completed KV restores");
+}
+
+// Pages that land while a command runs keep a waiting lane past its limit
+// until its next attempt, after the command. Until then that limit is no
+// wake-up: tick() does not act on it, and the native loop would poll
+// without blocking for as long as the command runs.
+void testLimitOutlivedByProgressDoesNotWakeTheLoop() {
+  constexpr auto reuse = CacheReclaimMode::ReuseBacking;
+  Backing backing(14);
+  KvPool pool(backing);
+  test::TestKvTier tier;
+  tier.capacity = 64;
+  tier.stagingSlots = 8;
+  engine::Cache cache(pool, CacheNamespace{}, &tier);
+  Executor executor;
+  executor.tier = &tier;
+  executor.decodeFinishes = false;
+  Events events;
+  engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+  // An eight-block prefix and its state move to disk entirely.
+  std::vector<uint32_t> prompt(257, 17);
+  cache.beginRequest(999);
+  require(cache.ensureTokens(999, 256).granted(), "fixture KV failed");
+  demoteState(cache, cache.publishCommittedBlocks(999, prompt, 256));
+  cache.endRequest(999);
+  for (uint32_t written = 1; written <= 8; ++written) {
+    require(cache.reclaimOne(reuse).madeProgress && tier.demotions == written,
+            "prefix block was not written");
+    tier.complete();
+    require(cache.pollTransfers(), "prefix block did not land");
+  }
+  // Six cached blocks under disk states.
+  auto transfer = std::make_shared<OffloadControl>();
+  transfer->ready = true;
+  for (uint64_t id = 900; id < 906; ++id) {
+    std::vector<uint32_t> filler(32, static_cast<uint32_t>(id));
+    cache.beginRequest(id);
+    require(cache.ensureTokens(id, 32).granted(), "filler KV failed");
+    cache.publishCompositeState(cache.publishCommittedBlocks(id, filler, 32),
+                                std::make_shared<OffloadState>(transfer));
+    cache.endRequest(id);
+    require(cache.reclaimOneState() && cache.pollTransfers(), "filler state was not demoted");
+  }
+  EngineRequest running = request(1, std::vector<uint32_t>(33, 5));
+  running.deadlineMilliseconds = 1e9;
+  engine.submit(std::move(running));
+  double now = 1.0;
+  for (int step = 0; step < 4; ++step, now += 100.0)
+    static_cast<void>(engine.tick(now));
+
+  // The running lane's next decode command is held, and the lane restoring
+  // the prefix waits for pages the tier is still writing.
+  executor.restoreControl->ready = true;
+  auto hold = std::make_shared<bool>(false);
+  executor.holdDecodeUntil = hold;
+  EngineRequest waiting = request(2, prompt);
+  waiting.deadlineMilliseconds = 1e9;
+  engine.submit(std::move(waiting));
+  for (int step = 0; step < 3; ++step, now += 100.0)
+    static_cast<void>(engine.tick(now));
+  require(engine.commandInFlight() && engine.resourceWaitSnapshot(now).memory == 1 &&
+              tier.demotions == 10 && events.starts.size() == 1,
+          "the lane did not wait for pages behind the command");
+  // The pages land, and the command is still held when the limit passes.
+  tier.complete();
+  static_cast<void>(engine.tick(now));
+  now += 31000.0;
+  require(!engine.tick(now) && events.failedCount == 0 && engine.commandInFlight(),
+          "the lane failed although pages landed since its last attempt");
+  const auto wakeup = engine.nextWakeupMilliseconds();
+  require(wakeup.has_value() && *wakeup > now,
+          "a limit tick() does not act on woke the loop");
+
+  // The command's completion wakes the loop, and the lane's next attempt
+  // takes the pages.
+  *hold = true;
+  executor.decodeFinishes = true;
+  for (int step = 0; step < 40 && !engine.idle(); ++step, now += 1.0) {
+    static_cast<void>(engine.tick(now));
+    tier.complete();
+  }
+  require(engine.idle() && events.completedCount == 2 && events.failedCount == 0 &&
+              events.starts.size() == 2 &&
+              events.starts[1].first == EngineCacheStatus::PrefixHit &&
+              events.starts[1].second == 256 && executor.restored == 256,
+          "the lane did not run on its prefix after the command");
+}
+
+// A restoring lane whose pages are all held by a resident lane waits for
+// that lane instead of giving up its prefix or failing for capacity.
+void testRestoringLaneWaitsForResidentLanes() {
+  constexpr auto reuse = CacheReclaimMode::ReuseBacking;
+  Backing backing(8);
+  KvPool pool(backing);
+  test::TestKvTier tier;
+  tier.stagingSlots = 8;
+  engine::Cache cache(pool, CacheNamespace{}, &tier);
+  Executor executor;
+  executor.tier = &tier;
+  Events events;
+  engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+  // A two-block prefix and its state move to disk.
+  std::vector<uint32_t> prompt(65, 17);
+  cache.beginRequest(999);
+  require(cache.ensureTokens(999, 64).granted(), "fixture KV failed");
+  demoteState(cache, cache.publishCommittedBlocks(999, prompt, 64));
+  cache.endRequest(999);
+  for (uint32_t written = 1; written <= 2; ++written) {
+    require(cache.reclaimOne(reuse).madeProgress && tier.demotions == written, "block was not written");
+    tier.complete();
+    require(cache.pollTransfers(), "block did not land");
+  }
+  // A long lane held in decode occupies the pool.
+  auto hold = std::make_shared<bool>(false);
+  executor.holdDecodeUntil = hold;
+  EngineRequest holder = request(2, std::vector<uint32_t>(200, 5));
+  holder.deadlineMilliseconds = 1e9;
+  engine.submit(std::move(holder));
+  for (int step = 1; step < 6; ++step) static_cast<void>(engine.tick(step));
+  require(pool.freePageCount() < 3 && engine.commandInFlight(), "the holder did not take the pool");
+
+  executor.restoreControl->ready = true;
+  EngineRequest waiting = request(1, prompt);
+  waiting.deadlineMilliseconds = 1e9;
+  engine.submit(std::move(waiting));
+  for (int step = 10; step < 16; ++step) static_cast<void>(engine.tick(step));
+  require(events.failedCount == 0 && executor.suspensions == 0 && events.starts.size() == 1,
+          "the restoring lane failed or yielded instead of waiting");
+  *hold = true;
+  for (int step = 20; step < 60 && !engine.idle(); ++step) {
+    static_cast<void>(engine.tick(step));
+    tier.complete();
+  }
+  require(engine.idle() && events.failedCount == 0 && executor.suspensions == 0 &&
+              events.starts.size() == 2 && events.starts[1].first == EngineCacheStatus::PrefixHit &&
+              events.starts[1].second == 64 && executor.restored == 64,
+          "the restoring lane did not run on its prefix once pages returned");
+}
+
+// A tool-using lane is runnable on every tick, so the engine never reaches
+// its copy-only command while one decodes. A restore still completes beside
+// it, on the copies that lane's own commands carry.
+void testRestoreCompletesWhileAConstrainedLaneDecodes() {
+  constexpr auto reuse = CacheReclaimMode::ReuseBacking;
+  Backing backing(128);
+  KvPool pool(backing);
+  test::TestKvTier tier;
+  engine::Cache cache(pool, CacheNamespace{}, &tier);
+  Executor executor;
+  executor.tier = &tier;
+  executor.decodeFinishes = false;
+  Events events;
+  engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+  // A two-block prefix and its state move to disk.
+  std::vector<uint32_t> prompt(65, 17);
+  cache.beginRequest(999);
+  require(cache.ensureTokens(999, 64).granted(), "fixture KV failed");
+  demoteState(cache, cache.publishCommittedBlocks(999, prompt, 64));
+  cache.endRequest(999);
+  for (uint32_t written = 1; written <= 2; ++written) {
+    require(cache.reclaimOne(reuse).madeProgress && tier.demotions == written, "block was not written");
+    tier.complete();
+    require(cache.pollTransfers(), "block did not land");
+  }
+
+  // The frontend answers every mask request on the tick that made it, and a
+  // transfer lands once a command has carried its copy.
+  const std::array<uint32_t, 1> mask{1};
+  uint32_t answered = 0;
+  uint32_t carried = 0;
+  auto step = [&](double now) {
+    static_cast<void>(engine.tick(now));
+    for (; answered < events.maskRequests.size(); ++answered)
+      engine.provideMask(events.maskRequests[answered].first, mask);
+    if (executor.carryingCommands != carried) {
+      carried = executor.carryingCommands;
+      tier.complete();
+    }
+  };
+  EngineRequest decoding = constrainedRequest(1, 1e9);
+  decoding.maxNewTokens = 1000;
+  engine.submit(std::move(decoding));
+  double now = 1;
+  for (; now < 20; ++now) step(now);
+  require(events.emitted > 1 && events.completedCount == 0, "the constrained lane is not decoding");
+
+  executor.restoreControl->ready = true;
+  EngineRequest restoring = request(2, prompt);
+  restoring.deadlineMilliseconds = 1e9;
+  engine.submit(std::move(restoring));
+  for (; now < 100 && events.startIds.size() < 2; ++now) step(now);
+  require(events.startIds.size() == 2 && events.starts[1].first == EngineCacheStatus::PrefixHit &&
+              events.starts[1].second == 64 && executor.restored == 64,
+          "the restore waited for the constrained lane to stop decoding");
+  require(executor.transferCommands == 0 && events.completedCount == 0 &&
+              events.failedCount == 0 && cache.snapshot().kvTier.restores == 2,
+          "the restore did not ride the constrained lane's commands");
+}
+
 int main() {
   try {
     testConcurrentColdPrefixesComputeOnce();
@@ -3566,6 +4809,22 @@ int main() {
     testSharedPrefillHonorsPriorityAndLateArrival();
     testLateSharedPrefillExtendsTheProducerPlan();
     testSharedPrefillCapacityFailureDoesNotDeadlock();
+    testRestoringLaneWaitsForResidentLanes();
+    testRestoreCompletesWhileAConstrainedLaneDecodes();
+    testWaitWithProgressOutlivesTheResourceLimit();
+    testLimitOutlivedByProgressDoesNotWakeTheLoop();
+    testDiskKvPrefixIsRestoredBeforeTheLaneRuns();
+    testCancelledDiskPrefixStopsQueuedReads();
+    testPagesReturnFromDemotionWithoutSuspending();
+    testFailedDiskRestoreKeepsShallowerState();
+    testRepeatedDiskHitPromotesToMemory();
+    testGrowthWaitsForTheStateWriteInFlight();
+    testPhysicalShortfallDemotesInBulk();
+    testWaitingLaneAlwaysNamesAWakeup();
+    testNothingInFlightIsNotPending();
+    testKvGrowthProceedsThroughDemotion();
+    testAsyncRestoreLifecycle();
+    testDiskHitWithNoActiveMemory();
     testCancelledColdPrefillResumesItsLatestCheckpoint();
     testConcurrentProgressRetainsAtMostOnePointPerLane();
     testSharedCheckpointSurvivesPeerRollingReplacement();
@@ -3593,6 +4852,12 @@ int main() {
     testDeniedSnapshotCostsOnlyThatAttempt();
     testDeniedSnapshotRecyclesLruStateAndRetries();
     testPersistentSnapshotDenialRecyclesAtMostOneState();
+    testStateWithoutACacheSlotGoesToDisk();
+    testStateAlreadyOnDiskIsDeduplicated();
+    testCancelledPrefillRecoversFromItsDiskCheckpoint();
+    testFailedFinalStateKeepsTheDiskCheckpoint();
+    testNearFinalCheckpointAvoidsDiskWrite();
+    testSkippedCheckpointKeepsPreviousRecoveryPoint();
     testLongSuffixSkipsDraftRestore();
     testCancellationInFlightAtBoundaryPublishesNoState();
     testActiveCellGrowthReclaimsCachedStateAndRetries();
@@ -3631,6 +4896,7 @@ int main() {
     testRepeatedPreemptionRespectsBackoffAndCancellation();
     testAdmissionReopensAfterLastSuspendedRequestResumes();
     testRecoveryAdmitsFailedKvTargetBeforeReplaying();
+    testFailedResumeRestoreKeepsTheKvTarget();
     testStateAdmissionWaitsForKvRelease();
     testAdmissionsWaitForBackgroundRelease();
     testAllocationCausesRemainRetryableAndDistinct();
