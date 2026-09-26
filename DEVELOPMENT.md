@@ -539,13 +539,16 @@ llama.cpp's and the decoding follows its Metal kernels: both keep llama.cpp's MI
 `THIRD_PARTY_NOTICES`, which the package ships.
 
 The tests' CPU reference (`dev/tests/engine/GgufFormatReference.hpp`) must reproduce the golden
-hashes of upstream GGML's dequantization (llama.cpp 7ab4ee7) in `gguf-reference`, and
-`gguf-planner` checks the planner's plans; both run in `make test-engine-cpu`.
+hashes of upstream GGML's dequantization (llama.cpp 7ab4ee7; for PQ2_0, which upstream lacks,
+PrismML-Eng/llama.cpp 01ae597) in `gguf-reference`, and `gguf-planner` checks the planner's
+plans; both run in `make test-engine-cpu`.
 `make test-engine-metal` runs `gguf-preparation`, which checks every format's planes, as the
 production executor and its `gguf_repack` kernel prepare them, bitwise against the reference,
 the prepared alpha/beta, norm, convolution and router bytes and the golden images; then
 `gguf-dequant`, the staged tile's dequantizer, built with the production Metal flags, against
-the half rounding of every reference weight; `gguf-projection`, every GGUF projection through
+the half rounding of every reference weight; `gguf-rotation`, `gguf_rotate` and the rotated
+PQ2_0 token gather bitwise against the fp32 butterflies and within one bf16 step of fp64;
+`gguf-projection`, every GGUF projection through
 `ops::Linear` with each tile forced, so both decode tiles run on every GPU, at one to four
 lanes, every K split and epilogue, fused segments, every gate/up format pair and the prefill
 tiles, each output inside the fp64 bound of `GgufFormatReference.hpp`; and `gguf-moe`: the float
