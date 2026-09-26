@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <csignal>
 #include <limits>
 #include <stdexcept>
 #include <system_error>
@@ -62,6 +63,14 @@ SlotFile::SlotFile(uint64_t slotBytes, std::shared_ptr<DiskBudget> budget,
     throw std::invalid_argument("slot size is not aligned for uncached IO");
   backing_->slotBytes = slotBytes;
   backing_->budget = std::move(budget);
+  // A write past the file-size limit (ulimit -f, a launchd FileSize) raises
+  // SIGXFSZ, whose default action kills the process. Ignored, the write fails
+  // with EFBIG and stops the file like any other storage error. The change is
+  // process-wide, which is safe because every other engine writer checks its
+  // errors; a handler someone installed is left alone.
+  struct sigaction fileSize {};
+  if (::sigaction(SIGXFSZ, nullptr, &fileSize) == 0 && fileSize.sa_handler == SIG_DFL)
+    std::signal(SIGXFSZ, SIG_IGN);
   std::string name = (directory / "splash-cache-XXXXXX").string();
   backing_->descriptor = ::mkstemp(name.data());
   if (backing_->descriptor < 0)

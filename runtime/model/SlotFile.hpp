@@ -56,7 +56,8 @@ private:
 // own the memory an operation moves and keep it alive until the operation is
 // ready. A slot is readable only after one complete write; a failed or
 // cancelled write leaves it unreadable, and after a failed write the file
-// accepts no further writes.
+// accepts no further writes. So that a file-size limit fails a write rather
+// than killing the process, a file ignores SIGXFSZ from its construction on.
 class SlotFile final {
   struct Backing;
 

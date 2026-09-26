@@ -30,6 +30,9 @@ static void testFailedWriteStopsWriting() {
     int result = 0;
     try {
       constexpr size_t size = SlotFile::kAlignmentBytes;
+      // The engine starts with the default disposition, which kills the
+      // process on a write past the limit, so the file has to change it.
+      signal(SIGXFSZ, SIG_DFL);
       SlotFile file(size, 2 * size);
       auto complete = file.acquire();
       auto partial = file.acquire();
@@ -40,7 +43,6 @@ static void testFailedWriteStopsWriting() {
       auto limited = original;
       // The second slot starts at size: allow half its payload before failure.
       limited.rlim_cur = size + size / 2;
-      signal(SIGXFSZ, SIG_IGN);
       require(setrlimit(RLIMIT_FSIZE, &limited) == 0, "file limit could not be set");
       std::fill(source.begin(), source.end(), std::byte{2});
       require(!file.write(partial, {source}, {})->wait(), "partial write reported success");
