@@ -249,6 +249,10 @@ StateCheckpoint Cache::checkpointState(uint64_t kvBlock) const noexcept {
   return states_.checkpoint(kvBlock);
 }
 
+bool Cache::stateResident(uint64_t kvBlock) const noexcept {
+  return states_.resident(kvBlock);
+}
+
 bool Cache::retireCheckpointState(StateCheckpoint checkpoint) noexcept {
   return states_.retireCheckpoint(checkpoint);
 }

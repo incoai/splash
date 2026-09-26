@@ -891,8 +891,11 @@ void Engine::publishReachedStateBoundaries(Request &active,
             continue;
         }
         // Recycle the previous recovery point before allocating its replacement.
-        // A restore lease can delay this optional publication.
-        if (!retireCheckpoint(active) && checkpoint) {
+        // A restore lease can delay this optional publication. A checkpoint
+        // only on disk frees no cache slot for an ordinary state, so it stays
+        // the recovery point until that state is published.
+        if ((checkpoint || cache_.stateResident(active.latestCheckpoint.kvBlock)) &&
+            !retireCheckpoint(active) && checkpoint) {
           ++failures;
           continue;
         }
@@ -1369,7 +1372,6 @@ void Engine::finish(Request &active, EngineFinishReason reason,
   if (reason == EngineFinishReason::Cancelled) {
     ++counters_.cancelled;
   } else {
-    static_cast<void>(retireCheckpoint(active));
     ++counters_.completed;
   }
   release(active);

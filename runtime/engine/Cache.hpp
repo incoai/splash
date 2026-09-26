@@ -179,6 +179,8 @@ public:
   [[nodiscard]] bool publishStateToDisk(uint64_t kvBlock, const StateWriter &write,
                                         bool checkpoint = false);
   [[nodiscard]] StateCheckpoint checkpointState(uint64_t kvBlock) const noexcept;
+  // The state at this block has a RAM copy.
+  [[nodiscard]] bool stateResident(uint64_t kvBlock) const noexcept;
   // False only while this exact disposable publication is pinned.
   bool retireCheckpointState(StateCheckpoint checkpoint) noexcept;
 

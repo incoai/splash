@@ -3779,6 +3779,72 @@ void testCancelledPrefillRecoversFromItsDiskCheckpoint() {
           "the branch did not resume from the disk checkpoint");
 }
 
+// A disk checkpoint frees no cache slot for the final state, so it stays the
+// lane's recovery point until that state is published. When another lane's
+// write holds the staging buffer at the final boundary, the request keeps
+// its checkpoint, and the next turn resumes from it whether the request was
+// cancelled or completed.
+void testFailedFinalStateKeepsTheDiskCheckpoint() {
+  for (bool cancel : {true, false}) {
+    Backing backing(512);
+    KvPool pool(backing);
+    engine::Cache cache(pool, CacheNamespace{});
+    Executor executor;
+    executor.deniedSnapshots = 1000;
+    executor.stateTier = std::make_shared<OffloadControl>();
+    executor.stateTier->ready = true;
+    Events events;
+    engine::Engine engine({}, cache, executor, events);
+    const std::vector<uint32_t> prompt(2 * defaultCheckpointTokens + 1, 65);
+    EngineRequest decoding = request(610, prompt);
+    decoding.maxNewTokens = 64;
+    engine.submit(decoding);
+    for (uint32_t step = 0; step < 128; ++step) {
+      static_cast<void>(engine.tick(step + 1));
+      if (!engine.commandInFlight() && executor.requests.at(610).position == 6144)
+        break;
+    }
+    auto counters = engine.snapshot();
+    require(!engine.commandInFlight() && executor.requests.at(610).position == 6144 &&
+                counters.checkpointPublications == 1 && counters.diskStatePublications == 1 &&
+                counters.resources.stateCache.checkpointEntries == 1,
+            "the checkpoint did not go to disk");
+    executor.stateTier->ready = false;
+    engine.submit(request(611, std::vector<uint32_t>(65, 66)));
+    for (uint32_t step = 0; step < 128 && !engine.snapshot().replayStatePublicationFailures;
+         ++step)
+      static_cast<void>(engine.tick(1000 + step));
+    counters = engine.snapshot();
+    require(counters.replayStatePublications == 1 &&
+                counters.replayStatePublicationFailures == 1 &&
+                counters.diskStatePublications == 2 && executor.diskSnapshots == 2 &&
+                events.failedCount == 0,
+            "the final state was not refused beside the other lane's write");
+    require(counters.resources.stateCache.checkpointEntries == 1 &&
+                counters.resources.stateCache.checkpointRetirements == 0,
+            "the final boundary retired the checkpoint it could not replace");
+    if (cancel)
+      engine.cancel(610);
+    executor.stateTier->ready = true;
+    runUntilIdle(engine);
+    require(engine.snapshot().completed == (cancel ? 1U : 2U) &&
+                cache.snapshot().stateCache.checkpointEntries == 1,
+            "the request's end removed the checkpoint its final state did not replace");
+    engine.submit(request(612, prompt));
+    static_cast<void>(engine.tick(2000));
+    executor.restoreControl->ready = true;
+    runUntilIdle(engine);
+    counters = engine.snapshot();
+    require(events.starts.back() ==
+                    std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 4096} &&
+                executor.restored == 4096 && counters.cancelled == (cancel ? 1U : 0U) &&
+                counters.completed == (cancel ? 2U : 3U) && events.failedCount == 0 &&
+                counters.resources.stateCache.checkpointEntries == 0 &&
+                counters.resources.stateCache.checkpointRetirements == 1,
+            "the next turn did not resume from the disk checkpoint and replace it");
+  }
+}
+
 void testNearFinalCheckpointAvoidsDiskWrite() {
   const uint32_t chunk = model::ExecutionLimits::prefillTokenBudget;
   for (bool denyRam : {false, true}) {
@@ -4672,6 +4738,7 @@ int main() {
     testPersistentSnapshotDenialRecyclesAtMostOneState();
     testStateWithoutACacheSlotGoesToDisk();
     testCancelledPrefillRecoversFromItsDiskCheckpoint();
+    testFailedFinalStateKeepsTheDiskCheckpoint();
     testNearFinalCheckpointAvoidsDiskWrite();
     testSkippedCheckpointKeepsPreviousRecoveryPoint();
     testLongSuffixSkipsDraftRestore();
