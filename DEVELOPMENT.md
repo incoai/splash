@@ -624,7 +624,10 @@ decode tiles at one to four lanes and every K split, and marks the device policy
 device's plans and the other GGUF tile. Decode rows route through a pool of 24 experts per lane by
 default; `GGUF_MOE_ARGS='31 q4k q5k 256'` routes them over all 256, as diffusely as uniform
 routing. Each decode line prints the live routed experts and tiles and the affine layer's streamed
-expert-slab GB/s, so a timing can be read against its route count.
+expert-slab GB/s, so a timing can be read against its route count. The affine decode candidates
+(the other 8-row simdgroup count, which the MoE tuner does not vary, and the 32-row tile) are then
+timed against the device plan in alternating rounds, and any output that differs bitwise from the
+device plan's is flagged.
 
 ## Legacy Splash packages
 
