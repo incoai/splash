@@ -154,6 +154,28 @@ no kernel change reaches a 35.6 ms cycle below 324 GB/s.
 Deliverable: one table row per device x harness x width; all later percentages
 derive from the matching row.
 
+### 3.4 Tools and first measurements
+
+Tooling for items 1, 4 and the Phase 1 simdgroup re-measure is proposed in
+#180 (decode route pool and live-tile readback in `gguf-moe-benchmark`), #181
+(affine decode candidates in alternating rounds, bitwise-checked) and #182
+(real-route live experts and tiles per MoE layer call in `decode-profile`).
+Item 3 already exists: `make benchmark-decode` prints each dense Q4 decode
+pipeline's streamed GB/s (`q4_decode_profile.mm`).
+
+First row, synthetic routes only (M4, 10-core Apple9, 120 GB/s part, 31
+rounds, affine layer ms; experts are routed experts per layer):
+
+| Decode | Pool 24: ms (experts) | Pool 256: ms (experts) | sg4 / sg8 / m32 at pool 256 |
+| --- | ---: | ---: | --- |
+| B1 | 0.670 (23) | 1.439 (56) | 1.449 / 1.614 / 4.723 |
+| B4 | 2.216 (78) | 4.016 (167) | 3.973 / 4.519 / 13.158 |
+
+Layer time roughly doubles with live experts at a flat ~63-74 GB/s, i.e. it
+tracks bytes, not occupancy; four simdgroups beat eight by 1.11-1.14x on this
+smaller Apple9 part; the 32-row decode tile is ~3.3x slower. Real-route N and
+Apple10 rows are still missing.
+
 ### 3.5 Decision rule
 
 - Expert passes within 1.15x of the measured floor on a device: no kernel phase
