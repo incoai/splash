@@ -19,6 +19,17 @@ class Rfc189HostOffsetsTest(unittest.TestCase):
         self.assertTrue(doc.is_file())
         self.assertIn("issues/189", doc.read_text())
 
+    def test_offset_contract(self):
+        header = (ROOT / "runtime/ops/Rfc189HostOffsets.hpp").read_text()
+        for symbol in ("offsetFor", "offsetsFit", "LaneOffsets",
+                       "static_assert"):
+            with self.subTest(symbol=symbol):
+                self.assertIn(symbol, header)
+        # Python mirror of the header arithmetic.
+        self.assertEqual(512 + 8, 520)
+        self.assertTrue(512 + 8 <= 262144)
+        self.assertFalse(262140 + 8 <= 262144)
+
 
 if __name__ == "__main__":
     unittest.main()

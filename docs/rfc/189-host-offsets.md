@@ -23,6 +23,14 @@ needs to move.
 
 - Bit-identical positions; dispatch-only change; ABBA neutral required.
 
+## Code change (landed)
+
+`runtime/ops/Rfc189HostOffsets.hpp` now carries the host arithmetic
+(`offsetFor`, `offsetsFit`, `LaneOffsets`) as `constexpr` with
+`static_assert` cases — no dispatch change yet, and deliberately no
+`.metal` change: positions are consumed by the untouched RoPE kernels,
+so there is no kernel to add. `clang++ -fsyntax-only` clean.
+
 ## Validation
 
 - `benchmark-decode-profile` per-pipeline ms; revert is a flag flip.
