@@ -21,6 +21,23 @@ class Rfc187VerifyRowsTest(unittest.TestCase):
         self.assertTrue(doc.is_file())
         self.assertIn("issues/187", doc.read_text())
 
+    def test_grid_and_warmup_roster(self):
+        header = (ROOT / "runtime/ops/Rfc187VerifyRows.hpp").read_text()
+        for symbol in ("rowsForLanes", "shapeSupported",
+                       "kWarmVerifyPipelines", "static_assert"):
+            with self.subTest(symbol=symbol):
+                self.assertIn(symbol, header)
+        # Every roster entry must name a kernel that ships in the metallib
+        # source; the warm-up is a pre-build, not a new kernel.
+        metal = (ROOT / "runtime/metal/kernels/decode/linear_q4.metal").read_text()
+        for name in ("decode_linear_q4_n128_m16",
+                     "decode_linear_q4_n256_m16",
+                     "decode_linear_q4_n128_residual_m16",
+                     "decode_linear_q4_n256_gate_up_m16"):
+            with self.subTest(kernel=name):
+                self.assertIn(name, metal)
+                self.assertIn(name, header)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -36,6 +36,18 @@ Tunable verify axis, default 8:
 - `benchmark-decode-profile` B1–B4 + `benchmark-gguf-moe` rows 8/16 +
   serving ABBA (MLX + GGUF, both models).
 
+## Code change (landed)
+
+`runtime/ops/Rfc187VerifyRows.hpp` now carries the grid contract
+(`rowsForLanes`, `shapeSupported`) plus the warm-up roster
+(`kWarmVerifyPipelines`: the four shipped M16 kernels the candidate
+width dispatches first), all `constexpr` with `static_assert` cases.
+No new `.metal`: the M16/M24/M32 kernels the wider window needs already
+ship in `linear_q4.metal` (test asserts each roster entry names a
+shipped kernel) — the follow-up only threads the width through
+`ExecutionGeometry`/`verifyPlan`/`decodePlan` and pre-builds the roster.
+`clang++ -fsyntax-only` clean.
+
 ## Rollout
 
 1. This RFC (flag + doc + test).
