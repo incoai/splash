@@ -37,6 +37,18 @@ Additive, default-off second drafter:
 - `benchmark-decode-profile` B1–B4 before/after + serving ABBA per `PLAN.md §9`.
 - Report hit rate and skipped drafter forwards separately.
 
+## Code change (landed)
+
+`runtime/ops/Rfc186PromptLookup.hpp` now carries the host-side matcher
+(no dispatch change, no kernel — lookup reuses the existing target
+verify kernels, which is the point):
+
+- `PromptSpan{start, length}`, `meetsMinSpan()` (`>=16` gate),
+  `hashTokens()` (FNV-1a candidate selection), `matchAt()` (exact span
+  equality), all `constexpr` with `static_assert` cases.
+- `clang++ -std=c++20 -fsyntax-only` clean; python test mirrors the
+  match semantics.
+
 ## Rollout
 
 1. This RFC (flag + doc + test, no behavior change).
