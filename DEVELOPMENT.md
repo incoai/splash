@@ -621,7 +621,10 @@ weights DRAM-cold. `make benchmark-gguf-projection GGUF_PROJECTION_ARGS='q4k 512
 projection (up to three fused formats and widths, then `K` and an optional epilogue) on both
 decode tiles at one to four lanes and every K split, and marks the device policy's pick;
 `make benchmark-gguf-moe` times one MoE layer at the 35B shape, GGUF against affine Q4, on the
-device's plans and the other GGUF tile.
+device's plans and the other GGUF tile. Decode rows route through a pool of 24 experts per lane by
+default; `GGUF_MOE_ARGS='31 q4k q5k 256'` routes them over all 256, as diffusely as uniform
+routing. Each decode line prints the live routed experts and tiles and the affine layer's streamed
+expert-slab GB/s, so a timing can be read against its route count.
 
 ## Legacy Splash packages
 
