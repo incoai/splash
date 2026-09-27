@@ -24,8 +24,11 @@ class Rfc191FewRowGemmTest(unittest.TestCase):
         src = ROOT / "runtime/metal/kernels/decode/linear_q4.metal"
         self.assertTrue(src.is_file())
         text = src.read_text()
-        for name in ("decode_linear_q4_n64", "decode_linear_q4_n64_m16",
-                     "decode_linear_q4_n64_m32"):
+        for name in (
+            "decode_linear_q4_n64",
+            "decode_linear_q4_n64_m16",
+            "decode_linear_q4_n64_m32",
+        ):
             with self.subTest(kernel=name):
                 self.assertIn(name, text)
         header = ROOT / "runtime/ops/Rfc191FewRowGemm.hpp"
