@@ -21,6 +21,16 @@ the strict-prefix SSM eagerly; bonsai fuses it into the next verify scan
    resolve in next verify; `finalSSM:nil + fullAcceptance` fast path.
 3. Scratch sized at startup via memory plan.
 
+## Code change (landed)
+
+`runtime/ops/Rfc190DeferredGdn.hpp` now carries the transition contract
+(`ReplayState`, `DeferredReplay{state, pendingTokens}`, `onVerify()`)
+as `constexpr` with `static_assert` cases. No new `.metal`: the resolve
+target is the existing `verify_gdn_fused*` family in
+`kernels/decode/gdn.metal`, which already fuses the scan — the follow-up
+only teaches `QwenGdnCell` / GDN plan to defer into it.
+`clang++ -fsyntax-only` clean.
+
 ## Contracts
 
 - Bit-identical recurrent state after resolve; `StateCache` / SSD-tier
