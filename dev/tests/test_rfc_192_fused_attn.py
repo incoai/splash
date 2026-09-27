@@ -21,17 +21,18 @@ class Rfc192FusedAttentionTest(unittest.TestCase):
 
     def test_fused_scale_and_warmup_roster(self):
         header = (ROOT / "runtime/ops/Rfc192FusedAttention.hpp").read_text()
-        for symbol in ("fusedScaleAvailable", "kWarmPrefillPipelines",
-                       "static_assert"):
+        for symbol in ("fusedScaleAvailable", "kWarmPrefillPipelines", "static_assert"):
             with self.subTest(symbol=symbol):
                 self.assertIn(symbol, header)
         metal = (ROOT / "runtime/metal/kernels/prefill/attention_q8.metal").read_text()
-        for name in ("prefill_attention_q8_split",
-                     "prefill_attention_q8_reduce",
-                     "prefill_attention_q8_split_kv2_g8",
-                     "prefill_attention_q8_reduce_kv2_g8",
-                     "prefill_attention_bf16_split",
-                     "prefill_attention_bf16_split_kv2_g8"):
+        for name in (
+            "prefill_attention_q8_split",
+            "prefill_attention_q8_reduce",
+            "prefill_attention_q8_split_kv2_g8",
+            "prefill_attention_q8_reduce_kv2_g8",
+            "prefill_attention_bf16_split",
+            "prefill_attention_bf16_split_kv2_g8",
+        ):
             with self.subTest(kernel=name):
                 self.assertIn(name, metal)
                 self.assertIn(name, header)
