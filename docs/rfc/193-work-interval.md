@@ -26,6 +26,14 @@ scheduling hint alone; Splash lists host-gap hiding as out-of-scope
 - Scheduling hint only; no numerics / protocol / memory-plan change;
   must not starve UI/audio.
 
+## Code change (landed)
+
+`runtime/engine/Rfc193WorkInterval.hpp` now carries the scope contract
+(`IntervalScope`, `WorkIntervalConfig{enabled, maxRenewsPerWindow}`,
+`renewAllowed()`) as `constexpr` with `static_assert` cases. Host-only
+by design — a scheduling hint takes no kernel. `clang++ -fsyntax-only`
+clean.
+
 ## Validation
 
 - `benchmark-decode-profile` verify-build ms + GPU idle ms B1–B4
