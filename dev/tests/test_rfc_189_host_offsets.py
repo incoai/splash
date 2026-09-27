@@ -21,8 +21,7 @@ class Rfc189HostOffsetsTest(unittest.TestCase):
 
     def test_offset_contract(self):
         header = (ROOT / "runtime/ops/Rfc189HostOffsets.hpp").read_text()
-        for symbol in ("offsetFor", "offsetsFit", "LaneOffsets",
-                       "static_assert"):
+        for symbol in ("offsetFor", "offsetsFit", "LaneOffsets", "static_assert"):
             with self.subTest(symbol=symbol):
                 self.assertIn(symbol, header)
         # Python mirror of the header arithmetic.
