@@ -27,6 +27,26 @@ row-reuse tuned for verify-8/16 widths. Related: #168, #169, #154.
 - Bit-exact per tile geometry (existing four-simdgroup rule); candidates
   additive; shipped default unchanged until gate passes.
 
+## Kernel change (landed)
+
+`runtime/metal/kernels/decode/linear_q4.metal` now instantiates N64
+narrow-column candidates from the existing `q4_mpp_tiles.h` template
+(no template changes):
+
+- `decode_linear_q4_n64` (+`_f32`): `q4_mpp_tile<64,false,false,256>`,
+  Sums=64 — M8 base over StorageN=256 slabs (4 column groups per slab).
+- `decode_linear_q4_n64_m16` (+`_f32`):
+  `q4_mpp_tile_batched<16,64,false,false,256>`, Sums=128.
+- `decode_linear_q4_n64_m32` (+`_f32`):
+  `q4_mpp_tile_batched<32,64,false,false,256>`, Sums=256.
+
+Same fp32 accumulation order and single bf16 rounding as N128/N256, so
+bit-identical per output element. Compiled into the metallib
+(`xcrun metal` clean) but undispatched: no host `Linear` wiring yet,
+shipped default unchanged. Pipeline names are pinned in
+`Rfc191FewRowGemm.hpp` (`kN64Plain/kN64M16/kN64M32`) for the tuner
+follow-up (`Linear::candidates()` + `make tune-kernels` per device).
+
 ## Validation
 
 - `benchmark-gguf-projection` / `benchmark-gguf-moe` rows 8/16/24/32 +
