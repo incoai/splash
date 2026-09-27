@@ -26,13 +26,18 @@ class Rfc186PromptLookupTest(unittest.TestCase):
             n = len(needle)
             if n == 0 or off + n > len(haystack):
                 return False
-            return haystack[off:off + n] == needle
+            return haystack[off : off + n] == needle
 
         self.assertTrue(match_at([0, 1, 2, 3, 4, 5], 1, [1, 2, 3, 4]))
         self.assertFalse(match_at([0, 1, 2, 3, 4, 5], 2, [1, 2, 3, 4]))
         header = (ROOT / "runtime/ops/Rfc186PromptLookup.hpp").read_text()
-        for symbol in ("PromptSpan", "meetsMinSpan", "hashTokens", "matchAt",
-                       "static_assert"):
+        for symbol in (
+            "PromptSpan",
+            "meetsMinSpan",
+            "hashTokens",
+            "matchAt",
+            "static_assert",
+        ):
             with self.subTest(symbol=symbol):
                 self.assertIn(symbol, header)
 
