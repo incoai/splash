@@ -19,6 +19,16 @@ class Rfc188InPlaceKvTest(unittest.TestCase):
         self.assertTrue(doc.is_file())
         self.assertIn("issues/188", doc.read_text())
 
+    def test_squeezed_addressing_contract(self):
+        header = (ROOT / "runtime/ops/Rfc188InPlaceKv.hpp").read_text()
+        self.assertIn("chunkBaseForLane", header)
+        self.assertIn("static_assert", header)
+        device = (ROOT / "runtime/metal/kernels/common/paged_store_row.h").read_text()
+        self.assertIn("splash_chunk_base_for_lane", device)
+        # Host/device mirrors must agree on the squeezed base.
+        self.assertIn("squeezed ? 0UL", device)
+        self.assertIn("squeezed ? 0UL", header)
+
 
 if __name__ == "__main__":
     unittest.main()

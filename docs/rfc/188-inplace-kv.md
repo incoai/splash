@@ -23,6 +23,16 @@ on 27B). Splash paged KV (`ops/PagedKv.hpp Page32`, `ops/KvCopy.*`,
    pre-size `maxSize+block` once.
 3. Keep `LayoutGuard` + prefix-tree + SSD-tier semantics.
 
+## Code change (landed)
+
+- Device: `splash_chunk_base_for_lane()` in
+  `kernels/common/paged_store_row.h` — squeezed (`B=1`) chunk-base
+  addressing for the verify store. Unused until dispatch passes
+  `squeezed=true`; `attention_q8_store.metal` recompiles clean.
+- Host: `chunkBaseForLane()` mirror in `Rfc188InPlaceKv.hpp` as
+  `constexpr` with `static_assert` cases; test asserts both sides spell
+  the squeezed base identically. `clang++ -fsyntax-only` clean.
+
 ## Contracts
 
 - Bit-identical KV bytes; no alloc while encoding; ABBA gate.
