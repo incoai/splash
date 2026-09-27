@@ -20,6 +20,18 @@ softmax dispatches on 512-row prompt blocks and L=16 verify windows.
    `PagedAttention::prefillCandidates()` / `verifyPlan` with identical
    accumulation order, plus verify-block pipeline retention.
 
+## Code change (landed)
+
+`runtime/ops/Rfc192FusedAttention.hpp` now carries `fusedScaleAvailable()`
+(the `(4,6)`/`(2,8)` combos whose fused scale-in-softmax split kernels
+already ship) plus the 6-entry prefill warm-up roster (split+reduce pairs
++ BF16 splits), `constexpr` with `static_assert` cases. Deliberately no
+new `.metal`: the bonsai scale-epilogue fusion already ships here as
+`ScaleInSoftmax`, and split+reduce fusion is deferred with reason (split
+grids over heads×tiles×splits vs reduce over heads×M×tiles — one grid
+cannot cover both unpadded). The follow-up pre-builds/retains the roster.
+`clang++ -fsyntax-only` clean.
+
 ## Contracts
 
 - Bit-identical outputs (one rounding boundary); tuner-gated, default off.
