@@ -21,10 +21,16 @@ class Rfc190DeferredGdnTest(unittest.TestCase):
 
     def test_replay_transition_contract(self):
         header = (ROOT / "runtime/ops/Rfc190DeferredGdn.hpp").read_text()
-        for symbol in ("ReplayState", "DeferredReplay", "onVerify",
-                       "verify_gdn_fused", "static_assert"):
+        for symbol in (
+            "ReplayState",
+            "DeferredReplay",
+            "onVerify",
+            "verify_gdn_fused",
+            "static_assert",
+        ):
             with self.subTest(symbol=symbol):
                 self.assertIn(symbol, header)
+
         # Python mirror of onVerify: full accept builds, partial defers.
         def on_verify(state, pending, accepted, proposed):
             if accepted >= proposed:
