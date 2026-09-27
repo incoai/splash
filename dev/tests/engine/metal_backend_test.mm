@@ -1055,6 +1055,41 @@ void sparsePacedRelease(MetalBackend &backend) {
               << " tile_bytes=" << kTile << '\n';
 }
 
+// A profiled replay calls the observer after each dispatch completes, so it
+// reads each dispatch's own writes; unprofiled or cleared, it is not called.
+void dispatchObserverSeesEachReplay(const std::string &metallibPath) {
+    MetalBackend backend(metallibPath);
+    MetalBuffer values = backend.allocateBuffer(sizeof(uint32_t), BufferStorage::Shared);
+    auto *value = static_cast<uint32_t *>(values.contents());
+    *value = 0;
+    const uint32_t count = 1, increment = 5;
+    const ComputeDispatch add{"test_add_u32", {{0, values}},
+        {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
+        {1, 1, 1}, {1, 1, 1}};
+    const std::vector<ComputeDispatch> command{add, add, add};
+    std::vector<uint32_t> seen;
+    backend.setDispatchObserver([&](const ComputeDispatch &dispatch) {
+        require(dispatch.pipelineName == "test_add_u32" && dispatch.bytes.size() == 2 &&
+                    *static_cast<const uint32_t *>(dispatch.bytes[1].data) == increment,
+                "the observer did not receive the replayed dispatch");
+        seen.push_back(*static_cast<const uint32_t *>(dispatch.buffers[0].buffer.contents()));
+    });
+    (void)backend.submitCommand(command);
+    require(seen.empty(), "the observer ran without dispatch profiling");
+    backend.setDispatchProfiling(true);
+    (void)backend.submitCommand(command);
+    require(seen == std::vector<uint32_t>{4 * increment, 5 * increment, 6 * increment},
+            "the observer did not see each dispatch's completed write in order");
+    require(backend.takeDispatchProfile().size() == command.size(),
+            "the observer changed the dispatch profile");
+    backend.setDispatchObserver({});
+    (void)backend.submitCommand(command);
+    backend.setDispatchProfiling(false);
+    require(seen.size() == command.size() && *value == 9 * increment,
+            "a cleared observer still ran");
+    std::cout << "PASS MetalBackend dispatch observer\n";
+}
+
 void run(const std::string &metallibPath) {
     placementProbeFailures(metallibPath);
     backendDeferredSubmission(metallibPath);
@@ -1446,6 +1481,7 @@ int main(int argc, const char *argv[]) {
             pendingCommandStillTimesOut(argv[1]);
             keptBuffersStayResident(argv[1]);
             residencyRacesTheHeartbeat(argv[1]);
+            dispatchObserverSeesEachReplay(argv[1]);
             run(argv[1]);
         } catch (const std::exception &error) {
             std::cerr << "FAIL: unexpected exception: " << error.what()

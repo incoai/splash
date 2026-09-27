@@ -483,6 +483,7 @@ struct MetalBackend::Impl {
 
     bool dispatchProfiling = false;
     std::vector<DispatchTiming> dispatchProfile;
+    DispatchObserver dispatchObserver;
     __strong id<MTLDevice> device = nil;
     __strong id<MTLCommandQueue> queue = nil;
     // Allocations hold it weakly: they may outlive the backend.
@@ -1333,6 +1334,10 @@ std::vector<DispatchTiming> MetalBackend::takeDispatchProfile() {
     return std::exchange(impl_->dispatchProfile, {});
 }
 
+void MetalBackend::setDispatchObserver(DispatchObserver observer) {
+    impl_->dispatchObserver = std::move(observer);
+}
+
 CommandTicket MetalBackend::submitCommandAsync(
     std::span<const ComputeDispatch> dispatches,
     CommandCompletion completion) {
@@ -1349,6 +1354,7 @@ CommandTicket MetalBackend::submitCommandAsync(
             CommandTiming timing = submitAsync(dispatch).wait();
             impl_->dispatchProfile.push_back(
                 {dispatch.pipelineName, timing.gpuSeconds});
+            if (impl_->dispatchObserver) impl_->dispatchObserver(dispatch);
             total.gpuSeconds += timing.gpuSeconds;
             total.wallSeconds += timing.wallSeconds;
         }
