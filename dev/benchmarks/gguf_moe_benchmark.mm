@@ -1,8 +1,9 @@
 // GPU time of one sparse MoE layer at the 35B shape (hidden 2048, 256 experts, top 8, intermediate 512) in GGUF
 // (by default the 35B UD-Q4_K_M's Q4_K gate/up and Q5_K down experts, a Q8_0 shared expert, F32 router) against the
 // affine Q4 layer, on the device's plans and the other GGUF tile: a 2048-row prefill chunk, decode B1-B4 and prefill
-// chunks of their rows, then every dispatch of the long chunk, B1 and B4 replayed as its own command. The numbers
-// behind the MoE plans of ops/MoE.cpp:
+// chunks of their rows, the affine decode candidates (the other simdgroup count, the 32-row tile) in alternating
+// rounds with a bitwise output check, then every dispatch of the long chunk, B1 and B4 replayed as its own command.
+// The numbers behind the MoE plans of ops/MoE.cpp:
 //   gguf-moe-benchmark <metallib> [rounds] [gate/up format] [down format] [decode pool]
 // Printed are medians of GPU ms per layer over `rounds` (31) commands. Every row routes to 8 experts of a pool of
 // `decode pool` (24, at most 256) per request lane (decode, short chunks) or of all 256 (the long chunk), identically
@@ -226,6 +227,47 @@ int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFor
            lanes, a, device == MoeGgufTile::Register ? "register" : "staged", g,
            other == MoeGgufTile::Register ? "register" : "staged", o, lanes * 8, ap, gp, routes.experts,
            routes.tiles, (routes.experts + 1) * kAffineExpertBytes / (a * 1e6));
+  }
+  // The affine decode candidates against the device plan: the other 8-row simdgroup count (the family rule of
+  // ops::moeDecodeSimdgroups, which the MoE tuner does not vary) and the 32-row tile. Rounds alternate between the
+  // plans so clock drift lands on all of them, and every candidate's output must match the device plan's bitwise.
+  printf("  affine decode candidates, alternating rounds:\n");
+  for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
+    b.input = bfloatBuffer(backend, input(lanes * 8, pool), "input");
+    const MoePlan shipped = plans.moeDecode(affineShape, lanes);
+    MoeConfig simdgroups = shipped.configuration(), rows32 = shipped.configuration();
+    simdgroups.m8Simdgroups = simdgroups.m8Simdgroups == splash::ops::MoeExpertSimdgroups::Four
+                                  ? splash::ops::MoeExpertSimdgroups::Eight
+                                  : splash::ops::MoeExpertSimdgroups::Four;
+    rows32.expertTile = splash::ops::MoeExpertTile::M32;
+    const std::vector<std::pair<std::string, MoePlan>> candidates{
+        {"device", shipped},
+        {simdgroups.m8Simdgroups == splash::ops::MoeExpertSimdgroups::Four ? "sg4" : "sg8",
+         MoE::decodePlan(affineShape, lanes, simdgroups)},
+        {"m32", MoE::decodePlan(affineShape, lanes, rows32)}};
+    std::vector<MoeBuffers> buffers(candidates.size(), b);
+    std::vector<CommandGraph> graphs(candidates.size());
+    std::vector<std::vector<double>> samples(candidates.size());
+    for (size_t c = 0; c < candidates.size(); ++c) {
+      buffers[c].output = zeros(backend, uint64_t{lanes} * 8 * H * 2, "candidate-output");
+      allocate(backend, buffers[c], candidates[c].second);
+      MoE::add(graphs[c], buffers[c], affine, candidates[c].second);
+    }
+    for (uint32_t i = 0; i < rounds + 1; ++i) {
+      for (size_t c = 0; c < candidates.size(); ++c) {
+        const double seconds = backend.submitCommand(graphs[c].dispatches()).gpuSeconds;
+        if (i) samples[c].push_back(seconds * 1e3);   // the first round warms the pipelines
+      }
+    }
+    printf("    B%u:", lanes);
+    for (size_t c = 0; c < candidates.size(); ++c) {
+      std::sort(samples[c].begin(), samples[c].end());
+      const bool same = !std::memcmp(buffers[c].output.contents(), buffers[0].output.contents(),
+                                     uint64_t{lanes} * 8 * H * 2);
+      printf(" %s %.3f%s", candidates[c].first.c_str(), samples[c][samples[c].size() / 2],
+             same ? "" : " (OUTPUT DIFFERS)");
+    }
+    printf("\n");
   }
   // Where the time goes: every dispatch replayed as its own command.
   for (const auto &[label, weights, plan] :
