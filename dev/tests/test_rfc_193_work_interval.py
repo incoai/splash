@@ -21,8 +21,12 @@ class Rfc193WorkIntervalTest(unittest.TestCase):
 
     def test_scope_contract(self):
         header = (ROOT / "runtime/engine/Rfc193WorkInterval.hpp").read_text()
-        for symbol in ("IntervalScope", "WorkIntervalConfig",
-                       "renewAllowed", "static_assert"):
+        for symbol in (
+            "IntervalScope",
+            "WorkIntervalConfig",
+            "renewAllowed",
+            "static_assert",
+        ):
             with self.subTest(symbol=symbol):
                 self.assertIn(symbol, header)
 
