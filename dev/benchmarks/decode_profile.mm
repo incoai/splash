@@ -8,8 +8,13 @@
 // The fused (unprofiled) GPU time of the same work is reported alongside, so
 // the gap between the sum of parts and the fused command shows how much a
 // cycle pays in dispatch boundaries rather than kernel work.
+// On a sparse-MoE target each replayed moe_group_routes dispatch is also read
+// back: the distinct routed experts and live expert tiles of every MoE layer
+// call on the model's real routes, beside what uniform routing would touch.
+// Those counts set how many expert weight bytes a layer streams.
 
 #include "engine/Types.hpp"
+#include "metal/abi/MoE.h"
 #include "model/Runtime.hpp"
 #include "ops/PageStorage.hpp"
 #include "metal/MetalBackend.hpp"
@@ -23,8 +28,10 @@
 #include <array>
 #include <charconv>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <map>
@@ -84,6 +91,85 @@ std::vector<uint32_t> pageRange(uint32_t first, uint32_t count) {
   for (uint32_t index = 0; index < count; ++index)
     result[index] = first + index;
   return result;
+}
+
+// The routes of one MoE layer call, read after its moe_group_routes
+// dispatch: rows, routed experts per row and in the router, tile rows, and
+// the distinct routed experts and live tiles (routed plus shared) it grouped.
+struct MoeRoutes final {
+  ::MoeGroupParams params{};
+  uint32_t experts = 0;
+  uint32_t tiles = 0;
+};
+
+const metal::MetalBuffer *boundBuffer(const metal::ComputeDispatch &dispatch,
+                                      uint32_t index) {
+  for (const metal::BufferBinding &binding : dispatch.buffers)
+    if (binding.index == index) return &binding.buffer;
+  return nullptr;
+}
+
+// Reads the shared-storage scratch of a moe_group_routes dispatch (bindings
+// of kernels/shared/moe.metal): selected expert ids at 0, the tile count at 2
+// and MoeGroupParams at 5. Other dispatches, or unreadable bindings, are
+// skipped.
+void recordRoutes(const metal::ComputeDispatch &dispatch,
+                  std::vector<MoeRoutes> &routes) {
+  if (dispatch.pipelineName != "moe_group_routes") return;
+  const metal::MetalBuffer *selected = boundBuffer(dispatch, 0);
+  const metal::MetalBuffer *tileCount = boundBuffer(dispatch, 2);
+  const auto params = std::find_if(
+      dispatch.bytes.begin(), dispatch.bytes.end(),
+      [](const metal::BytesBinding &binding) { return binding.index == 5; });
+  if (!selected || !tileCount || !selected->contents() || !tileCount->contents() ||
+      params == dispatch.bytes.end() || params->sizeBytes != sizeof(::MoeGroupParams))
+    return;
+  MoeRoutes entry;
+  std::memcpy(&entry.params, params->data, sizeof(entry.params));
+  const uint32_t perRow = entry.params.top_k + 1;
+  const auto *ids = static_cast<const uint32_t *>(selected->contents());
+  std::vector<bool> seen(entry.params.experts, false);
+  for (uint64_t route = 0; route < uint64_t{entry.params.rows} * perRow; ++route) {
+    if (route % perRow == entry.params.top_k || ids[route] >= seen.size() ||
+        seen[ids[route]])
+      continue;
+    seen[ids[route]] = true;
+    ++entry.experts;
+  }
+  entry.tiles = *static_cast<const uint32_t *>(tileCount->contents());
+  routes.push_back(entry);
+}
+
+// Summarises the layer calls of each row count separately (a prefill packs
+// chunks of different sizes). Uniform is the expected distinct count if each
+// row drew top_k distinct experts independently and uniformly.
+void printRoutes(std::vector<MoeRoutes> &routes) {
+  if (routes.empty()) return;
+  std::map<uint32_t, std::vector<MoeRoutes>> byRows;
+  for (const MoeRoutes &entry : routes) byRows[entry.params.rows].push_back(entry);
+  std::printf("MoE routes per layer call (routed experts / live tiles):\n");
+  for (auto &[rows, entries] : byRows) {
+    const auto quantile = [&](auto field, double q) {
+      std::vector<uint32_t> values;
+      for (const MoeRoutes &entry : entries) values.push_back(entry.*field);
+      std::sort(values.begin(), values.end());
+      return values[std::min<size_t>(values.size() - 1, size_t(q * values.size()))];
+    };
+    const ::MoeGroupParams &p = entries.front().params;
+    double routed = 0.0;
+    for (const MoeRoutes &entry : entries) routed += entry.experts;
+    const double uniform =
+        p.experts * (1.0 - std::pow(1.0 - double(p.top_k) / p.experts, rows));
+    std::printf("  %u rows, %zu calls: experts min %u median %u p90 %u max %u "
+                "(uniform %.1f of %u); tiles median %u max %u of %u-row tiles; "
+                "%.2f rows per live expert\n",
+                rows, entries.size(), quantile(&MoeRoutes::experts, 0.0),
+                quantile(&MoeRoutes::experts, 0.5), quantile(&MoeRoutes::experts, 0.9),
+                quantile(&MoeRoutes::experts, 1.0), uniform, p.experts,
+                quantile(&MoeRoutes::tiles, 0.5), quantile(&MoeRoutes::tiles, 1.0),
+                p.tile_rows, double(rows) * p.top_k * entries.size() / routed);
+  }
+  routes.clear();
 }
 
 // A chat-formatted request that asks for a long answer, so decode cycles keep
@@ -257,6 +343,11 @@ int main(int argc, char **argv) {
                         pageRange(index * pagesPerLane, pagesPerLane)};
       }
       const std::vector<uint32_t> prompt = chatPrompt(promptTokens);
+      // Filled only by profiled replays, so fused timings are unaffected.
+      std::vector<MoeRoutes> routes;
+      backend.setDispatchObserver([&](const metal::ComputeDispatch &dispatch) {
+        recordRoutes(dispatch, routes);
+      });
 
       // Warm prefill and B1 decode with real work before measuring.
       prefill(executor, lanes[0], prompt);
@@ -277,6 +368,7 @@ int main(int argc, char **argv) {
       accumulate(prefillTable, backend.takeDispatchProfile());
       print("prefill " + std::to_string(promptTokens) + " rows", prefillTable,
             1.0, prefillFused);
+      printRoutes(routes);
 
       auto profileWidth = [&](const char *title, std::span<Lane> active) {
         std::vector<CycleTiming> fused;
@@ -298,6 +390,7 @@ int main(int argc, char **argv) {
         Table table;
         accumulate(table, backend.takeDispatchProfile());
         print(title, table, cycles, median.gpuSeconds);
+        printRoutes(routes);
       };
       profileWidth("B1 decode cycle", std::span<Lane>(&lanes[0], 1));
       // Add one lane at a time so M16 and M24 paths are measured too.
@@ -309,6 +402,7 @@ int main(int argc, char **argv) {
 
       for (Lane &lane : lanes)
         executor.end(lane.id);
+      backend.setDispatchObserver({});
       return 0;
     } catch (const std::exception &error) {
       std::cerr << "decode-profile: " << error.what() << '\n';

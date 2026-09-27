@@ -718,6 +718,8 @@ benchmark-decode: all $(TEST_Q4_DECODE_PROFILE)
 
 # decode-profile replays the installed model's prefill and decode commands as
 # separate dispatches; DECODE_PROFILE_ARGS passes --prompt-tokens/--cycles.
+# On a sparse-MoE target it also prints each width's live experts and tiles
+# per MoE layer call, read back from the real routes.
 benchmark-decode-profile: preflight $(TARGET) $(TEST_DECODE_PROFILE) $(LIB)
 	$(TEST_DECODE_PROFILE) $(LIB) "$(MODEL_ROOT)" $(DECODE_PROFILE_ARGS)
 
