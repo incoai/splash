@@ -2,18 +2,16 @@
 
 Scope: MoE decode on Qwen3.6-35B-A3B (40 layers, H=2048, E=256, top-8, I=512,
 `runtime/model/Qwen3_6Moe.hpp:19-26`), with follow-ups for GGUF and prefill.
-Status: proposed. Nothing below is a new measurement; every figure is either
-quoted from the repository with its location or derived from its constants.
-This revises an earlier draft after nine independent reviews (see Appendix B).
+Status: proposed. Every figure below is either quoted from the repository
+with its location or derived from its constants.
 
 ## 0. Summary
 
-The MoE FFN is most of the 35B decode cycle, but the earlier draft's claim that
-the expert kernels run "18x above the bandwidth floor" does not survive the
-repo's own constants. With the stored slab size and the real per-layer route
-count, the expert passes are within roughly 1.2-1.3x of a streaming floor on
-the one device with per-layer numbers (Apple9), and the M5 cycle is close to
-what its expert stream alone would need at uniform routing.
+The MoE FFN is most of the 35B decode cycle. With the stored slab size
+(1,769,472 B per expert) and the real per-layer route count (9-65 live tiles),
+the expert passes are within roughly 1.2-1.3x of a streaming floor on the one
+device with per-layer numbers (Apple9), and the M5 cycle is close to what its
+expert stream alone would need at uniform routing.
 
 The deciding unknown is **N, the number of distinct live expert tiles per layer
 on real serving routes** (between 9 and 65 at one lane). Every target, the phase
@@ -140,7 +138,7 @@ no kernel change reaches a 35.6 ms cycle below 324 GB/s.
    candidate hooks, and defaults to 20 rounds. Add a 256-expert decode pool,
    a candidate-config argument, and a `tile_count` column, and run with
    >= 31 rounds.
-5. **Tuner prerequisites** (moved here from the earlier draft's Phase 4):
+5. **Tuner prerequisites**:
    variable-length candidate sets (`MoE::decodeCandidates`,
    `ExecutionPlans::moeCandidates` are two-slot today), an optional captured
    real-route fixture, and, only if split-K proceeds, the bounded qualification
@@ -216,7 +214,7 @@ split-K), acceptance unchanged.
 
 ## 5. Phase 2: dispatch boundaries (a measurement, not a phase)
 
-- **Deleted: fusing router scores and select.** A per-row kernel reads router
+- **Not pursued: fusing router scores and select.** A per-row kernel reads router
   weights 8x (about 180 MB/cycle) or serialises the router into one threadgroup,
   to save an 8 KB score round trip.
 - **Route grouping.** `moe_group_routes` is genuinely serial but small (about
@@ -233,7 +231,7 @@ split-K), acceptance unchanged.
 
 ## 6. Phase 3: GGUF decode
 
-- **Dropped: M32 in GGUF decode.** It is blocked at `MoE.cpp:255-257` and
+- **Not pursued: M32 in GGUF decode.** It is blocked at `MoE.cpp:255-257` and
   `ExecutionPlans.cpp:158`, and the measured crossover (`rows * top_k >
   experts`, `MoE.hpp:238-243`) keeps M8 at every legal decode width. At about
   one route per expert it reuses no weights and only adds scratch.
@@ -270,7 +268,7 @@ expert's slabs about twice at 2048 rows.
 2. Dequantisation-side candidates for the staged tile (the gate+up fusion of
    §6 at prefill shapes).
 3. Re-validate the 8/32 crossover after any kernel change.
-4. Dropped: the N512 tile, which spans two StorageN slabs and would be a
+4. Not pursued: the N512 tile, which spans two StorageN slabs and would be a
    template redesign, not a new instance.
 
 ## 9. Validation (every phase)
@@ -312,23 +310,3 @@ Out of scope: expert counts, routing semantics, quantisation formats, and the
 draft. Because the expert stream is most of the cycle, bigger wins need fewer
 bytes or more accepted tokens per cycle; both are outside this plan. An
 acceptance workstream is the recommended separate follow-up.
-
-## Appendix A: corrections to the earlier draft
-
-- Live experts per layer: "at most 9" -> 9 to 65, about 58 at uniform routing.
-- Bytes per expert: 0.86 MB -> 1.769 MB; the resulting "18x" -> about 1.2-1.3x.
-- 24.7 ms is M3 Max Apple9, not M5 Pro.
-- Split-K bit-exactness: false (§2.2).
-- `benchmark-gguf-moe` is at `DEVELOPMENT.md:622-624`, not `:566-567`.
-- Routing contract lines: `moe.metal:290-377`, not `:291-344`.
-- GGUF tuner exclusion: `ExecutionPlans.cpp:178-183`, not `:181-185`.
-- Kernel paths live under `runtime/metal/`.
-- Router MACs are 524,288 per row (4.2M is the whole 8-row tile).
-- "Down from 16 to 16-32" does not follow for either split factor.
-
-## Appendix B: review provenance
-
-Nine reviews (Bunny, Grok, HY4, Kimi, Longcat, Luna, Luna-Codex, Mimo, Qwen)
-agreed on the cost-model, split-K, referee and device-mixing findings. Where
-they disagreed (whether Apple10 is already at the bandwidth wall), this plan
-treats the question as open and decides it by Phase 0's measurement of N.
