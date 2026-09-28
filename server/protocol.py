@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from enum import IntEnum, IntFlag
 from typing import TypeAlias
 
-PROTOCOL_VERSION = 6
+PROTOCOL_VERSION = 7
 FRAME_HEADER_BYTES = 24
 STATUS_SCHEMA_VERSION = 5
 # Largest top-k the native sampler keeps as candidates.
@@ -29,7 +29,7 @@ _MAGIC = b"SPLH"
 _HEADER = struct.Struct("<4sHHHHQI")
 # Replay can update the integer deadlines without decoding sampling floats.
 _REQUEST_HEAD = struct.Struct("<QBBBQQ")
-_REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIffIQBI")
+_REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIffIQBBI")
 _IMAGE_SPAN = struct.Struct("<IIIIQQ")
 _CANCEL = struct.Struct("<Q")
 _MASK_RESPONSE = struct.Struct("<QQI")
@@ -50,7 +50,7 @@ assert (
     and sys.byteorder == "little"
 )
 assert _HEADER.size == FRAME_HEADER_BYTES
-assert _REQUEST.size == 64
+assert _REQUEST.size == 65
 assert _IMAGE_SPAN.size == 32
 assert _START.size == 21
 assert _DONE.size == 41
@@ -180,6 +180,8 @@ class SamplingParameters:
     temperature: float = 0.0
     top_p: float = 1.0
     top_k: int = 0
+    # Never select a stop token; generation ends at the output budget.
+    ignore_eos: bool = False
 
 
 @dataclass(slots=True, frozen=True)
@@ -682,6 +684,8 @@ def _request_issue(
     try:
         if not isinstance(request.return_progress, bool):
             raise ValueError("return_progress must be a boolean")
+        if not isinstance(request.sampling.ignore_eos, bool):
+            raise ValueError("ignore_eos must be a boolean")
         _enum_value(request.priority, RequestPriority, "request priority")
         cohort = _enum_value(request.cohort, Cohort, "cohort")
         constraint = _enum_value(request.constraint, ConstraintMode, "constraint mode")
@@ -1142,6 +1146,7 @@ def _encode_message(
                 message.sampling.top_k,
                 message.seed,
                 message.return_progress,
+                message.sampling.ignore_eos,
                 len(scores),
             )
             + _pack_words(prompt)
@@ -1424,6 +1429,7 @@ def _decode_request(payload: bytes, limits: ProtocolLimits) -> RequestFrame:
         top_k,
         seed,
         return_progress,
+        ignore_eos,
         score_count,
     ) = _REQUEST.unpack_from(payload)
     if return_progress > 1:
@@ -1431,6 +1437,13 @@ def _decode_request(payload: bytes, limits: ProtocolLimits) -> RequestFrame:
             FailureClass.REQUEST_ERROR,
             IssueCode.INVALID_ENUM_VALUE,
             "return_progress must be a boolean",
+            request_id,
+        )
+    if ignore_eos > 1:
+        _fail(
+            FailureClass.REQUEST_ERROR,
+            IssueCode.INVALID_ENUM_VALUE,
+            "ignore_eos must be a boolean",
             request_id,
         )
     if score_count > MAX_SCORE_TOKENS:
@@ -1489,7 +1502,7 @@ def _decode_request(payload: bytes, limits: ProtocolLimits) -> RequestFrame:
         remaining_deadline,
         max_output,
         prompt,
-        SamplingParameters(temperature, top_p, top_k),
+        SamplingParameters(temperature, top_p, top_k, bool(ignore_eos)),
         seed,
         _decode_enum(
             cohort,

@@ -56,11 +56,25 @@ DraftSelectorWorkspace Sampling::draftWorkspace(uint32_t positions) {
 }
 
 Sampling::Sampling(metal::MetalBackend &backend, uint32_t vocabulary,
-                   uint32_t rowsPerLane)
+                   uint32_t rowsPerLane, std::array<uint32_t, 2> stopTokens)
     : backend_(backend), vocabulary_(vocabulary), rowsPerLane_(rowsPerLane),
-      maskWords_((vocabulary + 31) / 32) {
+      maskWords_((vocabulary + 31) / 32), stopTokens_(stopTokens) {
   if (!vocabulary || rowsPerLane != SPLASH_TARGET_VERIFY_ROWS)
     throw std::invalid_argument("invalid sampling geometry");
+}
+
+void Sampling::addStopSuppression(metal::CommandGraph &graph,
+                                  metal::MetalBuffer logits, uint32_t rowOffset,
+                                  uint32_t rows, uint32_t laneMask) const {
+  if (stopTokens_[0] >= vocabulary_ || stopTokens_[1] >= vocabulary_)
+    throw std::logic_error("stop suppression needs the model's stop tokens");
+  const SuppressStopParams params{vocabulary_, rowOffset,      rows,
+                                  rowsPerLane_, laneMask,      stopTokens_[0],
+                                  stopTokens_[1]};
+  // Two threads per row: one per stop token.
+  const uint64_t threads = uint64_t{rows} * 2;
+  graph.add("decode_suppress_stop_tokens", {std::move(logits)}, params,
+            {(threads + 63) / 64, 1, 1}, {64, 1, 1});
 }
 
 void Sampling::addInitial(metal::CommandGraph &graph,
@@ -69,6 +83,9 @@ void Sampling::addInitial(metal::CommandGraph &graph,
                           uint32_t rowOffset) const {
   if (rowOffset >= rowsPerLane_)
     throw std::invalid_argument("invalid initial sampling row");
+  // One row of this lane's buffer: lane 0 of a one-row view.
+  if (policy.suppressStop)
+    addStopSuppression(graph, buffers.logits, rowOffset, 1, 1U);
   if (policy.samples() || policy.constrained) {
     const EffectivePolicy effective = effectivePolicy(policy);
     const TargetSamplingParams params{
@@ -127,6 +144,13 @@ void Sampling::addVerify(metal::CommandGraph &graph,
       [](const SamplingPolicy &policy) { return !policy.samples(); });
   const bool distributed = constrained || sampling;
   const uint32_t rows = lanes * rowsPerLane_;
+  uint32_t suppressMask = 0;
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    if (policies[lane].suppressStop)
+      suppressMask |= uint32_t{1} << lane;
+  }
+  if (suppressMask)
+    addStopSuppression(graph, buffers.logits, 0, rows, suppressMask);
 
   if (!distributed) {
     graph.add("decode_sample_argmax_sharded",

@@ -20,7 +20,7 @@ std::string_view frameTypeName(FrameType type);
 std::string_view failureClassName(FailureClass failureClass);
 
 constexpr std::array<uint8_t, 4> kMagic{'S', 'P', 'L', 'H'};
-constexpr uint64_t kRequestFixedBytes = 64;
+constexpr uint64_t kRequestFixedBytes = 65;
 constexpr uint64_t kImageSpanBytes = 32;
 constexpr uint64_t kCancelFixedBytes = 8;
 constexpr uint64_t kMaskResponseFixedBytes = 20;
@@ -694,6 +694,7 @@ ProtocolResult<Frame> encodeRequest(const RequestFrame &request,
   writer.u32(request.sampling.topK);
   writer.u64(request.seed);
   writer.u8(request.returnProgress);
+  writer.u8(request.sampling.ignoreEos);
   writer.u32(static_cast<uint32_t>(request.scoreTokens.size()));
   for (uint32_t token : request.promptTokens)
     writer.u32(token);
@@ -891,6 +892,7 @@ ProtocolResult<Message> decodeRequest(const Frame &frame,
   uint8_t cohort = 0;
   uint8_t constraint = 0;
   uint8_t returnProgress = 0;
+  uint8_t ignoreEos = 0;
   uint32_t promptCount = 0;
   uint32_t imageSpanCount = 0;
   uint32_t scoreCount = 0;
@@ -903,7 +905,8 @@ ProtocolResult<Message> decodeRequest(const Frame &frame,
       !reader.f32(request.sampling.temperature) ||
       !reader.f32(request.sampling.topP) ||
       !reader.u32(request.sampling.topK) || !reader.u64(request.seed) ||
-      !reader.u8(returnProgress) || !reader.u32(scoreCount)) {
+      !reader.u8(returnProgress) || !reader.u8(ignoreEos) ||
+      !reader.u32(scoreCount)) {
     return failure<Message>(makeIssue(FailureClass::ProtocolFatal,
                                       IssueCode::InvalidPayloadLength, 0,
                                       "request fixed payload is truncated"));
@@ -913,7 +916,13 @@ ProtocolResult<Message> decodeRequest(const Frame &frame,
         makeIssue(FailureClass::RequestError, IssueCode::InvalidEnumValue,
                   request.requestId, "returnProgress must be a boolean"));
   }
+  if (ignoreEos > 1) {
+    return failure<Message>(
+        makeIssue(FailureClass::RequestError, IssueCode::InvalidEnumValue,
+                  request.requestId, "ignoreEos must be a boolean"));
+  }
   request.returnProgress = returnProgress;
+  request.sampling.ignoreEos = ignoreEos;
   request.priority = static_cast<RequestPriority>(priority);
   request.cohort = static_cast<Cohort>(cohort);
   request.constraint = static_cast<ConstraintMode>(constraint);

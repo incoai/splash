@@ -36,6 +36,22 @@ struct TargetSamplingBatchParams {
 static_assert(sizeof(TargetSamplingBatchParams) == 68,
               "Batched target sampling parameters are 68 bytes on both sides");
 
+// Rows [row_offset, row_offset + rows) of a [rows][vocabulary] logit buffer,
+// rows_per_lane rows per lane. Lanes set in lane_mask ignore end-of-sequence:
+// both stop token logits become -inf before any target sampling reads them.
+struct SuppressStopParams {
+  uint32_t vocabulary;
+  uint32_t row_offset;
+  uint32_t rows;
+  uint32_t rows_per_lane;
+  uint32_t lane_mask;
+  uint32_t stop_token_0;
+  uint32_t stop_token_1;
+};
+
+static_assert(sizeof(SuppressStopParams) == 28,
+              "Stop suppression parameters are 28 bytes on both sides");
+
 struct SelectorBatchParams {
   uint32_t anchor[SPLASH_MAXIMUM_BATCH_WIDTH];
   float temperature[SPLASH_MAXIMUM_BATCH_WIDTH];

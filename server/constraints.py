@@ -28,9 +28,10 @@ class TokenConstraint:
     MAX_ROWS = 9
     EOS_TOKENS = (248044, 248046)
 
-    def __init__(self, matcher, executor):
+    def __init__(self, matcher, executor, *, ignore_eos=False):
         self.matcher = matcher
         self.executor = executor
+        self.ignore_eos = ignore_eos
         self.bitmask = allocate_token_bitmask(self.MAX_ROWS, self.VOCABULARY)
 
     def masks(self, simulation_tokens):
@@ -63,7 +64,20 @@ class TokenConstraint:
             self.bitmask[valid_rows:rows] = self.bitmask[valid_rows - 1]
         if not self.bitmask[:valid_rows].any(axis=1).all():
             raise NativeError("constraint_error", "output grammar has no valid token")
+        if self.ignore_eos:
+            self._clear_eos(rows)
         return self.bitmask[:rows].tobytes()
+
+    def _clear_eos(self, rows):
+        # ignore_eos: forbid EOS wherever the grammar allows another token. A
+        # row whose only valid tokens are EOS keeps them, so a finished grammar
+        # still ends the request instead of leaving nothing to sample.
+        view = self.bitmask[:rows]
+        original = view.copy()
+        for token in self.EOS_TOKENS:
+            view[:, token // 32] &= ~(1 << (token % 32))
+        only_eos = ~view.any(axis=1)
+        view[only_eos] = original[only_eos]
 
     def consume(self, token_ids):
         if any(not 0 <= token < self.VOCABULARY for token in token_ids):
@@ -160,9 +174,11 @@ class ConstraintFactory:
         self.hits = 0
         self.misses = 0
 
-    def create(self, grammar, *, timeout=None):
+    def create(self, grammar, *, timeout=None, ignore_eos=False):
         matcher = self._matcher(grammar, timeout)
-        return TokenConstraint(matcher.deep_copy(), self.executor)
+        return TokenConstraint(
+            matcher.deep_copy(), self.executor, ignore_eos=ignore_eos
+        )
 
     def _matcher(self, grammar, timeout):
         # Compilation uses the frontend's bounded preparation slots. Share

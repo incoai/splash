@@ -279,7 +279,7 @@ bool NativeRuntime::handleRequest(protocol::RequestFrame &request) {
     engineRequest.scoreTokens = std::move(request.scoreTokens);
     engineRequest.sampling = {request.sampling.temperature,
                               request.sampling.topP, request.sampling.topK,
-                              request.seed};
+                              request.seed, request.sampling.ignoreEos};
     engineRequest.constraint = mapConstraint(request.constraint);
     engineRequest.returnProgress = request.returnProgress;
     engineRequest.deadlineMilliseconds =

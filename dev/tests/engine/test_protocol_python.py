@@ -15,22 +15,22 @@ ROOT = Path(__file__).parents[3]
 
 
 REQUEST_GOLDEN = (
-    "53504c480600180001000000540000000000000000000000efcdab8967452301"
+    "53504c480700180001000000550000000000000000000000efcdab8967452301"
     "000201008098281765060040a5ae0200000000008000000500000000000000cd"
-    "cc4c3f3333733f200000001032547698badcfe00000000000000000001000000"
-    "2a00000000000080ffffffff"
+    "cc4c3f3333733f200000001032547698badcfe00000000000000000000010000"
+    "002a00000000000080ffffffff"
 )
 ERROR_GOLDEN = (
-    "53504c4806001800050100002700000000000000000000000200000000000000"
+    "53504c4807001800050100002700000000000000000000000200000000000000"
     "0000090000000c0000006770755f6661756c744d6574616c206661696c6564"
 )
 STATUS_GOLDEN = (
-    "53504c4806001800070100002d00000000000000000000002803000000000000"
+    "53504c4807001800070100002d00000000000000000000002803000000000000"
     "050000007b22736368656d615f76657273696f6e223a342c227265616479223a"
     "747275657d"
 )
 INITIAL_MASK_GOLDEN = (
-    "53504c4806001800030100001800000000000000000000005b00000000000000"
+    "53504c4807001800030100001800000000000000000000005b00000000000000"
     "06000000000000000400000000000000"
 )
 
@@ -407,10 +407,10 @@ class ProtocolPythonTests(unittest.TestCase):
         request = example_score_request()
         wire = p.serialize_message(request)
         self.assertEqual(
-            struct.unpack_from("<I", wire, 24 + 60)[0], len(request.score_tokens)
+            struct.unpack_from("<I", wire, 24 + 61)[0], len(request.score_tokens)
         )
         self.assertEqual(
-            struct.unpack_from("<3I", wire, 24 + 64 + 4 * 3),
+            struct.unpack_from("<3I", wire, 24 + 65 + 4 * 3),
             request.score_tokens,
         )
         self.assertEqual(
@@ -418,7 +418,7 @@ class ProtocolPythonTests(unittest.TestCase):
             request,
         )
         # A wrong score count desynchronizes the tail and must fail closed.
-        bad = mutate_u32(wire, 24 + 60, 2)
+        bad = mutate_u32(wire, 24 + 61, 2)
         self.assert_protocol_error(
             p.FailureClass.REQUEST_ERROR,
             p.IssueCode.INVALID_PAYLOAD_LENGTH,
@@ -493,7 +493,7 @@ class ProtocolPythonTests(unittest.TestCase):
     def test_malformed_score_frames_preserve_request_error_codes(self):
         request = example_score_request()
         payload = p.encode_message(request).payload
-        score_offset = 64 + 4 * len(request.prompt_tokens)
+        score_offset = 65 + 4 * len(request.prompt_tokens)
         for tokens, output_tokens in (
             ((101,), 0),
             ((101, 101), 0),
@@ -505,7 +505,7 @@ class ProtocolPythonTests(unittest.TestCase):
             ):
                 malformed = bytearray(payload[:score_offset])
                 struct.pack_into("<I", malformed, 27, output_tokens)
-                struct.pack_into("<I", malformed, 60, len(tokens))
+                struct.pack_into("<I", malformed, 61, len(tokens))
                 malformed.extend(struct.pack(f"<{len(tokens)}I", *tokens))
                 wire = p.serialize_frame(p.Frame(p.FrameType.REQUEST, bytes(malformed)))
                 issue = self.assert_protocol_error(
@@ -520,7 +520,7 @@ class ProtocolPythonTests(unittest.TestCase):
         wire = p.serialize_message(request)
         for count in (p.MAX_SCORE_TOKENS + 1, 1_000_000, 0xFFFFFFFF):
             with self.subTest(count=count):
-                bad = mutate_u32(wire, 24 + 60, count)
+                bad = mutate_u32(wire, 24 + 61, count)
                 issue = self.assert_protocol_error(
                     p.FailureClass.REQUEST_ERROR,
                     p.IssueCode.INVALID_COUNT,
@@ -637,18 +637,25 @@ class ProtocolPythonTests(unittest.TestCase):
         self.assertEqual(wire[:4], b"SPLH")
         self.assertEqual(
             struct.unpack_from("<HHHHQI", wire, 4),
-            (p.PROTOCOL_VERSION, 24, int(p.FrameType.REQUEST), 0, 84, 0),
+            (p.PROTOCOL_VERSION, 24, int(p.FrameType.REQUEST), 0, 85, 0),
         )
         self.assertEqual(struct.unpack_from("<Q", wire, 24)[0], request.request_id)
         self.assertEqual(struct.unpack_from("<I", wire, 24 + 31)[0], 5)
         self.assertEqual(struct.unpack_from("<I", wire, 24 + 35)[0], 0)
         self.assertEqual(
-            struct.unpack_from("<5I", wire, 24 + 64), request.prompt_tokens
+            struct.unpack_from("<5I", wire, 24 + 65), request.prompt_tokens
         )
+        self.assertEqual(wire[24 + 60], 0)
+        ignore_eos = replace(
+            request, sampling=replace(request.sampling, ignore_eos=True)
+        )
+        wire = p.serialize_message(ignore_eos)
+        self.assertEqual(wire[24 + 60], 1)
+        self.assertEqual(p.decode_frame(parse_all(wire)[0]), ignore_eos)
 
         image = example_image_request()
         wire = p.serialize_message(image)
-        span_offset = 24 + 64 + 4 * len(image.prompt_tokens)
+        span_offset = 24 + 65 + 4 * len(image.prompt_tokens)
         self.assertEqual(struct.unpack_from("<I", wire, 24 + 35)[0], 1)
         self.assertEqual(
             struct.unpack_from("<IIIIQQ", wire, span_offset),

@@ -118,6 +118,8 @@ class Job:
     response_previous_id: str | None = None
     response_history_items: list | None = None
     return_progress: bool = False
+    # Never select a stop token; generation ends at max_new_tokens.
+    ignore_eos: bool = False
     # Option token ids for score-only jobs; empty means ordinary generation.
     score_tokens: tuple = ()
     # Endpoint-specific metadata carried to the response builder.
@@ -490,7 +492,7 @@ class NativeBackend:
             deadline=self._deadline(job),
             priority=priority,
             sampling=wire.SamplingParameters(
-                float(job.temperature), float(job.top_p), job.top_k
+                float(job.temperature), float(job.top_p), job.top_k, job.ignore_eos
             ),
             seed=job.seed,
             cohort=cohort,

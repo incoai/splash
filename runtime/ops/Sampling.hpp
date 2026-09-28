@@ -4,6 +4,7 @@
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/MetalBackend.hpp"
 
+#include <array>
 #include <cstdint>
 #include <span>
 
@@ -18,6 +19,9 @@ struct SamplingPolicy final {
   float temperature = 1.0F;
   float topP = 1.0F;
   bool constrained = false;
+  // ignore_eos: the lane may not select a stop token, so it runs to its
+  // output budget.
+  bool suppressStop = false;
 
   [[nodiscard]] bool samples() const noexcept { return temperature > 0.0F; }
 };
@@ -85,9 +89,12 @@ struct AcceptanceBuffers final {
 // and greedy argmax pipeline ABIs; the model only supplies policy and buffers.
 class Sampling final {
 public:
-  // rowsPerLane is the kernels' SPLASH_TARGET_VERIFY_ROWS.
+  // rowsPerLane is the kernels' SPLASH_TARGET_VERIFY_ROWS. stopTokens are
+  // the ids a suppressStop policy may not select; a Sampling built without
+  // them rejects such a policy.
   Sampling(metal::MetalBackend &backend, uint32_t vocabulary,
-           uint32_t rowsPerLane);
+           uint32_t rowsPerLane,
+           std::array<uint32_t, 2> stopTokens = {kNoStopToken, kNoStopToken});
 
   // Exact scratch/output bytes for the fixed precompiled sampling ABI.
   // Counts may cover one lane or a packed batch; the operator owns sharding.
@@ -116,10 +123,17 @@ public:
                       uint32_t lanes) const;
 
 private:
+  static constexpr uint32_t kNoStopToken = UINT32_MAX;
+
+  void addStopSuppression(metal::CommandGraph &graph, metal::MetalBuffer logits,
+                          uint32_t rowOffset, uint32_t rows,
+                          uint32_t laneMask) const;
+
   metal::MetalBackend &backend_;
   uint32_t vocabulary_ = 0;
   uint32_t rowsPerLane_ = 0;
   uint32_t maskWords_ = 0;
+  std::array<uint32_t, 2> stopTokens_{};
 };
 
 } // namespace splash::ops

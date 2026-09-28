@@ -849,6 +849,9 @@ class Frontend:
             or not 1 <= top_k <= wire.MAX_TOP_K
         ):
             raise APIError(400, "invalid sampling parameters")
+        ignore_eos = body.get("ignore_eos", False)
+        if not isinstance(ignore_eos, bool):
+            raise APIError(400, "ignore_eos must be a boolean")
         stop = body.get("stop")
         if stop in (None, []):
             stop_sequences = ()
@@ -906,11 +909,13 @@ class Frontend:
                     constraint = self.constraint_factory.create(
                         tool_grammar(tool_policy, thinking, response_schema),
                         timeout=remaining_request_time(deadline),
+                        ignore_eos=ignore_eos,
                     )
                 elif response_schema is not None:
                     constraint = self.constraint_factory.create(
                         json_grammar(response_schema, thinking),
                         timeout=remaining_request_time(deadline),
+                        ignore_eos=ignore_eos,
                     )
         remaining_request_time(deadline)
         tools_signature = None
@@ -977,6 +982,7 @@ class Frontend:
             image_owner=prepared_images if prepared_images else None,
             public_id=secrets.token_hex(16),
             tools_signature=tools_signature,
+            ignore_eos=ignore_eos,
         )
         return job, thinking, bool(tools)
 

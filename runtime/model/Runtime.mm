@@ -288,7 +288,8 @@ struct Runtime::Impl {
         maximumImagePatches(value.maximumImagePatches),
         pipelineReserveBytes(value.pipelineReserveBytes),
         runtimeOverheadReserveBytes(value.runtimeOverheadReserveBytes),
-        sampling(value.backend, geometry.target.vocabularySize, kDecodeRows),
+        sampling(value.backend, geometry.target.vocabularySize, kDecodeRows,
+                 geometry.target.stopTokens),
         targetModel(std::visit(
                         [&](const auto &weights) {
                           return QwenTarget(weights, value.backend, operators,
@@ -730,7 +731,11 @@ struct Runtime::Impl {
     return {enabled ? entry.sampling.topK : 1,
             enabled ? entry.sampling.temperature : 0.0F,
             enabled ? entry.sampling.topP : 1.0F,
-            entry.constraint == ConstraintMode::TokenMask};
+            entry.constraint == ConstraintMode::TokenMask,
+            // A constrained lane forbids EOS in its grammar mask instead, which
+            // keeps EOS when the grammar allows nothing else.
+            entry.sampling.ignoreEos &&
+                entry.constraint != ConstraintMode::TokenMask};
   }
 
   template <class Get>

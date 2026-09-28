@@ -915,3 +915,18 @@ kernel void decode_accept_dflash(
                        next_anchor[batch], accepted_count[batch], lane_params);
   }
 }
+
+// One thread per (row, stop token). A lane in lane_mask cannot select either
+// stop token: every target sampling kernel reads the logits after this one.
+kernel void decode_suppress_stop_tokens(device float *logits [[buffer(0)]],
+                                        constant SuppressStopParams &params [[buffer(1)]],
+                                        uint index [[thread_position_in_grid]]) {
+  uint row = index / 2;
+  if (row >= params.rows)
+    return;
+  uint lane = row / params.rows_per_lane;
+  if (!(params.lane_mask & (1u << lane)))
+    return;
+  uint token = (index & 1u) ? params.stop_token_1 : params.stop_token_0;
+  logits[ulong(params.row_offset + row) * params.vocabulary + token] = -INFINITY;
+}

@@ -35,6 +35,8 @@ struct SamplingParameters final {
   float topP = 1.0F;
   uint32_t topK = 0;
   uint64_t seed = 0;
+  // Never select a stop token; generation ends at maxNewTokens.
+  bool ignoreEos = false;
 };
 
 // Immutable view of the fields a model needs to activate a sequence.  Engine

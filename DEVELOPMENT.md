@@ -703,6 +703,13 @@ recovery; they are not a time estimate. Chat uses empty-delta chunks, Responses
 uses `response.in_progress`, and Messages uses `ping`. Queueing and prompt
 preparation do not advance this counter. Non-streaming requests cannot enable it.
 
+Chat requests accept `"ignore_eos":true` (default false), as vLLM and llama.cpp do.
+The model then never selects an end-of-sequence token, so generation runs to
+`max_tokens` and finishes with `length`; set `max_tokens`, or the output budget is
+the remaining context. Benchmarks use it to generate a fixed number of tokens. With
+tools or structured output, the grammar mask drops end-of-sequence, except where it
+is the only valid token: a finished grammar still ends the request.
+
 `GET /status` returns instance identity and the effective context limit as JSON.
 Proxy consumers can use these fields; additional fields may be added:
 
