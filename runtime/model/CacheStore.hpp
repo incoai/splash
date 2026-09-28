@@ -43,7 +43,8 @@ public:
   void collectUnreferenced();
   void save(const Prefix &prefix);
   void erase(uint64_t id);
-  void touch(uint64_t id);
+  // Oldest first: one transaction persists a batch of actual accesses.
+  void touch(std::span<const uint64_t> ids);
 
 private:
   struct Impl;

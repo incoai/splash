@@ -376,6 +376,81 @@ void lruAndQuotas(const std::filesystem::path &path) {
   }
 }
 
+void metadataWritingStatus(const std::filesystem::path &path) {
+  Fixture f(path, 6 * unit);
+  f.publish(100);
+  f.settle();
+  f.publish(200);
+  f.settle();
+  require(!f.cache.snapshot().persistent.writing, "idle cache reports writing");
+  const auto before = f.budget->writtenBytes();
+  f.hit(100);
+  require(f.cache.snapshot().persistent.writing,
+          "pending recency update was reported as settled");
+  static_cast<void>(f.cache.pollTransfers());
+  require(f.cache.snapshot().persistent.writing,
+          "submitted recency update was reported as settled");
+  f.settle();
+  require(!f.cache.snapshot().persistent.writing,
+          "completed recency update still reports writing");
+  require(f.budget->writtenBytes() == before, "recency update copied payload");
+}
+
+void atomicAccessBatch(const std::filesystem::path &path) {
+  std::vector<uint64_t> ids;
+  {
+    Fixture f(path, 9 * unit);
+    for (uint32_t seed : {100u, 200u, 300u}) {
+      f.publish(seed);
+      f.settle();
+    }
+    for (const auto &prefix : f.store->load())
+      ids.push_back(prefix.id);
+    require(ids.size() == 3, "batch fixture did not persist three prefixes");
+    const std::array<uint64_t, 2> accessed{ids[1], ids[0]};
+    f.store->touch(accessed);
+    const auto ordered = f.store->load();
+    require(ordered[0].id == ids[2] && ordered[1].id == ids[1] &&
+                ordered[2].id == ids[0],
+            "access batch lost its order");
+  }
+  // Inject failure on the second UPDATE. An earlier UPDATE in the same
+  // access batch must not survive on its own, including across restart.
+  sqlite3 *db = nullptr;
+  require(sqlite3_open(path.c_str(), &db) == SQLITE_OK,
+          "batch fixture open failed");
+  const std::string trigger =
+      "CREATE TRIGGER fail_touch BEFORE UPDATE OF used ON prefixes WHEN "
+      "NEW.id=" +
+      std::to_string(ids[0]) +
+      " BEGIN SELECT RAISE(ABORT,'injected touch failure'); END";
+  const int created =
+      sqlite3_exec(db, trigger.c_str(), nullptr, nullptr, nullptr);
+  sqlite3_close(db);
+  require(created == SQLITE_OK, "batch failure fixture failed");
+  {
+    CacheStore store(path, "test-model");
+    // The trigger rejects any UPDATE to the newest prefix. Repeating its
+    // access must preserve order without issuing a database write.
+    store.touch({});
+    const std::array<uint64_t, 4> unchanged{0, ids[0], UINT64_MAX, ids[0]};
+    store.touch(unchanged);
+    bool failed = false;
+    try {
+      const std::array<uint64_t, 2> accessed{ids[2], ids[0]};
+      store.touch(accessed);
+    } catch (const std::runtime_error &) {
+      failed = true;
+    }
+    require(failed, "batch fixture did not fail the second update");
+  }
+  CacheStore reopened(path, "test-model");
+  const auto ordered = reopened.load();
+  require(ordered.size() == 3 && ordered[0].id == ids[2] &&
+              ordered[1].id == ids[1] && ordered[2].id == ids[0],
+          "failed metadata batch partially changed durable recency");
+}
+
 void sharedPrefixes(const std::filesystem::path &path) {
   {
     Fixture f(path, 5 * unit, 4 * unit);
@@ -784,6 +859,8 @@ int main(int argc, char **argv) {
     runtimeAndRestart(directory.path / "runtime.sqlite");
     lruAndQuotas(directory.path / "lru.sqlite");
     sharedPrefixes(directory.path / "shared.sqlite");
+    atomicAccessBatch(directory.path / "atomic-access.sqlite");
+    metadataWritingStatus(directory.path / "metadata-status.sqlite");
     badMetadata(directory.path / "metadata.sqlite");
     crashAndIntegrity(directory.path / "crash.sqlite");
     failedWrite(directory.path / "limited.sqlite");

@@ -409,11 +409,29 @@ void CacheStore::erase(uint64_t id) {
   impl_->collect();
   transaction.commit();
 }
-void CacheStore::touch(uint64_t id) {
+void CacheStore::touch(std::span<const uint64_t> ids) {
+  if (ids.empty())
+    return;
   std::lock_guard lock(impl_->mutex);
-  Statement update(impl_->db, "UPDATE prefixes SET used=? WHERE id=?");
-  update.integer(1, ++impl_->clock);
-  update.integer(2, id);
-  update.step();
+  Transaction transaction(impl_->db);
+  uint64_t newest = 0;
+  {
+    Statement latest(impl_->db,
+                     "SELECT id FROM prefixes ORDER BY used DESC LIMIT 1");
+    if (latest.step())
+      newest = latest.integer(0);
+  }
+  for (uint64_t id : ids) {
+    // Accessing the newest prefix cannot change the durable LRU order.
+    if (id == newest)
+      continue;
+    Statement update(impl_->db, "UPDATE prefixes SET used=? WHERE id=?");
+    update.integer(1, ++impl_->clock);
+    update.integer(2, id);
+    update.step();
+    if (sqlite3_changes(impl_->db))
+      newest = id;
+  }
+  transaction.commit();
 }
 } // namespace splash::model

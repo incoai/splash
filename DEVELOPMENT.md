@@ -991,7 +991,11 @@ compatibility. Reusing an explicit file after a model, build or KV-layout change
 fresh cache. Unsupported file formats
 and files already open by another server produce a startup error.
 
-Durable prefixes and temporary copies use the existing recency clock. Redundant
+Durable prefixes and temporary copies use the existing recency clock. Recency
+updates copy no payload and are persisted in access order in one transaction
+per metadata batch. Accessing the newest durable prefix leaves its ordering
+unchanged, so it requires no database UPDATE or journal write. The status
+`writing` flag includes pending and submitted recency updates. Redundant
 temporary copies go first: RAM still serves them, while dropping durable
 ownership would lose restart recovery. Durable prefixes then compete by recency
 with sole temporary copies, as complete units rather than individual slots. Durable

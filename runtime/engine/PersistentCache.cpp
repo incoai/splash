@@ -196,11 +196,12 @@ bool PersistentCache::flushTouches() {
   if (touched.empty())
     return finished;
   std::sort(touched.begin(), touched.end());
+  std::vector<uint64_t> ids;
+  ids.reserve(touched.size());
+  for (auto [_, id] : touched)
+    ids.push_back(id);
   touches_ = config_.stateFile->metadata(
-      [store = config_.store, touched] {
-        for (auto [_, id] : touched)
-          store->touch(id);
-      },
+      [store = config_.store, ids = std::move(ids)] { store->touch(ids); },
       completion_);
   return true;
 }
@@ -484,7 +485,9 @@ PersistentCacheSnapshot PersistentCache::snapshot() const {
           restored_,
           failures_,
           static_cast<uint32_t>(entries_.size()),
-          job_ != nullptr || !pending_.empty(),
+          job_ != nullptr || !pending_.empty() || touches_ != nullptr ||
+              std::any_of(entries_.begin(), entries_.end(),
+                          [](const auto &item) { return item.second.touched; }),
           admissionSkips_,
           writeThrottles_};
 }
