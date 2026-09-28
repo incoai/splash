@@ -419,9 +419,13 @@ def _parse_request_timeout(value):
     try:
         timeout = float(value)
     except ValueError:
-        raise argparse.ArgumentTypeError("use seconds, e.g. 3600") from None
+        raise argparse.ArgumentTypeError(
+            "use a number of seconds such as 3600"
+        ) from None
     if not math.isfinite(timeout) or timeout <= 0:
-        raise argparse.ArgumentTypeError("must be positive and finite")
+        raise argparse.ArgumentTypeError(
+            "use a positive number of seconds such as 3600"
+        )
     return timeout
 
 
