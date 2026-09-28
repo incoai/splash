@@ -103,7 +103,9 @@ loopback, so use a listener that includes loopback when launching agents locally
 | `--port` | `SPLASH_PORT` or `8000` | HTTP port. |
 | `--max-memory` | Auto | Ceiling on Metal allocations, e.g. `28G`; not combined process RSS. |
 | `--max-context` | Auto | Context limit, up to `256K`, e.g. `100K`. |
-| `--max-cache-disk` | `0` (off) | Session-local SSD cache, e.g. `16G`. See [disk cache](#disk-cache). |
+| `--max-cache-disk` | `0` (off) | SSD offload budget, e.g. `16G`. See [disk cache](#disk-cache). |
+| `--persistent-cache [SIZE]` | `0` (off) | Durable prefix budget; bare flag enables `5G`. Independent of offload. |
+| `--cache-file PATH` | automatic | Persistent SQLite file. Used only with `--persistent-cache`. |
 | `--kv-format` | `int8` | Target KV storage: `int8` or `bf16`. |
 | `--max-image-pixels` | `4194304` | Maximum resized pixels per image. |
 | `--request-timeout` | `1800` | Seconds a request may take from its arrival; a request's own `timeout` can only shorten it. |
@@ -739,7 +741,7 @@ finishes with `length` unless a `stop` string ends it first. Benchmarks use it
 to generate a fixed number of tokens. Tools and structured output generate
 under a grammar, which decides where the output ends, so combining them with
 `ignore_eos` returns 400. The engine receives it as bit 0 of the request
-frame's flags word (native wire version 7), which rejects undefined bits.
+frame's flags word (introduced in native wire version 7), which rejects undefined bits.
 
 Streaming requests accept `"return_progress":true` (default false). Before output,
 `prompt_progress` reports `{total, cache, processed, time_ms}`: prompt tokens,
@@ -835,6 +837,36 @@ work in flight, since that lane holds memory the request waits for until it
 finishes; lanes submitted after the request do not extend it. Readiness does
 not guarantee that a request-sized allocation fits.
 
+### Predicted shared prefixes
+
+In every storage mode, the frontend may hint at the first literal message-end
+special token in the actual prompt tokens. The engine rounds it to Page32,
+excludes image interiors and boundaries shorter than 512 tokens, and ignores
+boundaries already covered by the restore or final replay point. The existing
+draft/state plan captures this point during prefill; there is no second render,
+second prefill or independent restore path. This lets the first sequential
+session fork reuse a common system/tools or initial-message prefix.
+
+A hint is a prediction, not a recovery requirement. Its snapshot must fit via
+the normal pool/governor admission without evicting another cached state or
+writing directly from the lane to disk. If admission fails, inference proceeds
+and the ordinary final state still gets its existing reclamation/fallback path.
+A real waiting peer or observed KV junction upgrades the same boundary to an
+ordinary junction. Existing checkpoint/replay purposes take precedence over a
+hint at the same point. Captured hint states join the ordinary cache and use the
+same retention rules as other complete states; no protected partition is added.
+
+This changes RAM-only and offloading-only state planning: both may now capture
+one additional predicted prefix. It does not enable disk IO when both disk
+features are disabled. Persistence can save successfully captured states via
+its existing publication path, but does not decide which boundaries to plan.
+
+Request accesses and maintenance ownership are distinct. A background durable
+copy pins state/KV storage but neither acquiring nor releasing those pins
+refreshes recency. Real request use still updates recency while a maintenance
+pin is held. This prevents IO completion order from masquerading as access
+order; RAM and disk replacement retain their existing policies.
+
 ### Disk cache
 
 `--max-cache-disk` adds an optional SSD tier for cached request states (GDN cell
@@ -872,14 +904,14 @@ state, with the state read alongside. Cancellation drops unsubmitted, unshared
 reads; submitted transfers drain before their buffers can be reused. Restored
 states remain usable even when there is no room to promote them into RAM cache.
 
-Two unlinked temporary files share one quota for live slots. A full quota
+With persistence off, two unlinked temporary files share one quota for live slots. A full quota
 replaces the oldest redundant copy first, then the oldest sole copy, across
 both KV and states. A quota smaller than the working set can cause repeated
 reads and writes; it is not a write-rate limit. Each file retains its allocated
 high-water mark until shutdown, so filesystem space can exceed the live-slot
 quota. Closing the server releases both files.
 
-Transfers use `pread`/`pwrite` with `F_NOCACHE`. The KV staging ring, 128
+Temporary-file transfers use `pread`/`pwrite` with `F_NOCACHE`. The KV staging ring, 128
 pages that the GPU copies through, is Metal memory within `--max-memory`: about
 42 MiB for 35B and 130 MiB for 27B with INT8 KV, 80 MiB and 256 MiB with BF16 KV.
 The memory plan sets it aside whenever the flag is set, even if the tier then
@@ -894,7 +926,8 @@ prefix.
 
 `/status` reports the shared quota and KV transfers under `disk`. Its cumulative
 `read_bytes` and `written_bytes` count bytes transferred by file IO across KV
-and state files, including partial or cancelled transfers. They exclude
+and state files. Temporary-file counters include partial or cancelled transfers;
+the persistent backend counts completed slot operations. They exclude
 filesystem metadata and physical SSD write amplification. State transfers appear
 under `state` (`disk_bytes`, `offloads`, `disk_hits`, `disk_promotions`). Cache
 counters include:
@@ -903,6 +936,132 @@ counters include:
   transfers count once, including those completed before cancellation or a
   resource retry.
 - `lost_state_misses`: lookups that matched KV where a reusable state used to be.
+
+### Persistent prefixes
+
+`--persistent-cache 5G` retains complete, reusable prefixes across server
+restarts. The bare `--persistent-cache` flag also selects 5 GiB; `0` disables
+persistence without opening or deleting an existing cache file. It can be used
+alone, together with `--max-cache-disk`, or with both options disabled.
+
+When enabled, KV and composite states share one SQLite backing file. Temporary
+slots and durable slots use the same payload table, staging, transfer tickets,
+prefix graph and restore path. The default path is
+`~/Library/Caches/Splash/prefix/<model-layout-sha>-<kv-format>.sqlite`;
+`--cache-file` overrides it. SQLite uses an exclusive PERSIST rollback journal with FULL synchronization.
+The journal is limited to 1 MiB after commits; it may grow while a transaction
+is active. Do not copy the main file alone while the server
+is running. Only one server may open a cache file at a time.
+
+The two sizes add to the shared live-slot budget. The persistent size also caps
+the durable subset, counting a shared KV page once. Offload may use spare space
+in this pool; disabling offload prevents pressure-driven eviction writes, while existing
+durable copies remain available for reclaim and restore. Increasing a quota
+keeps existing entries. Decreasing the durable quota selects the newest complete
+prefixes that fit before loading their metadata. Quotas count payload bytes;
+SQLite metadata, its journal and reusable free pages can make the physical file
+larger. New stores enable incremental vacuum; startup returns unused database
+pages after quota trimming, so a smaller budget also releases the old physical
+high-water allocation. Legacy stores without SQLite's relocation map still
+reuse free pages. Files do not need to have exactly the configured size.
+
+Ordinary state publications, reuse and actual cache hits nominate already
+materialized prefix boundaries, including successfully captured predicted
+prefixes described above. An evicted durable entry can be readmitted when its
+RAM copy becomes hot again, without rewriting disk copies that still exist.
+Disposable suspension checkpoints are not durable candidates. One job at a time
+writes the composite state and missing KV pages, preserving their RAM copies.
+If no RAM snapshot slot fits, the existing direct snapshot path may still write
+a final replay state or observed junction to the persistent backend. Predicted
+prefixes do not force this fallback. With offload disabled,
+disposable suspension checkpoints cannot use that direct disk fallback.
+Up to 16 pending candidates hold IDs only, so a burst cannot pin an unbounded
+queue of model snapshots. Oversized candidates are skipped before evicting
+existing durable entries. Shared pages and complete disk copies are reused.
+
+The index becomes durable only after every KV page and the target recurrent,
+convolution and draft state at that boundary have been written. Atomic SQLite
+publication synchronizes the preceding payload writes. An interrupted job
+leaves unreferenced slots, which are discarded at startup; it never exposes a
+partly restorable prefix. Shutdown drains submitted metadata work and performs
+no whole-RAM export. Hardware CRC32C checks payload and metadata for accidental
+corruption; the store identity versions the checksum format. Exact
+tokens, image identity and the model/build/KV-layout namespace still determine
+compatibility. Reusing an explicit file after a model, build or KV-layout change starts a
+fresh cache. Unsupported file formats
+and files already open by another server produce a startup error.
+
+Durable prefixes and temporary copies use the existing recency clock. Redundant
+temporary copies go first: RAM still serves them, while dropping durable
+ownership would lose restart recovery. Durable prefixes then compete by recency
+with sole temporary copies, as complete units rather than individual slots. Durable
+admission requires at least 512 tokens: a tiny prompt still needs a full
+recurrent/draft snapshot, so persisting it wastes writes and can evict useful
+long prefixes. Short prefixes remain eligible for the RAM cache and temporary
+disk tier. Under durable-quota pressure, a new unproven tail is skipped before copying
+payload; a genuine cache hit or an already observed junction can admit it later.
+Space that is still free admits first-use sessions immediately. Eviction remains
+LRU; there is no separate protected partition or unbounded frequency history.
+This trades persistence of some one-use tails under pressure for retention of
+proven prefixes. A rapidly growing conversation can therefore restore an earlier
+turn rather than its newest unproven tail when the quota is full.
+
+Additional background copies are paced by a token bucket: one cache capacity of
+initial credit and 128 GiB/hour of payload credit thereafter, per process.
+Already stored copies and metadata touches consume no payload credit. A skipped
+candidate stays available in RAM and may be reconsidered on reuse; it does not
+queue a timer or stall inference. This is not a cap on all disk I/O: temporary
+offloading, direct low-memory snapshots, metadata/journal writes and startup
+maintenance follow their existing paths. Restart resets the background budget.
+
+Durable ownership is evicted as a complete prefix; its constituent slots cannot be
+evicted independently. Shared slots remain until their last owner leaves.
+Active requests retain their own references throughout eviction. Reopening a
+file builds disk-only graph nodes; it allocates no GPU cache pages until a
+request actually restores them. `/status.persistent_cache` reports capacity,
+used payload bytes, entries, saved/restored prefixes, failures, write activity,
+pressure admission skips and background write throttles.
+
+The payload store separates retirement from new allocation so rollback journaling
+does not copy freed large payloads before reusing their pages. Free payload pages
+are reused without zero-filling (`secure_delete=OFF`); eviction is not secure
+erasure. CRC32C and model/layout identity still validate every restored object.
+
+Run `make test-persistent-cache` for the CPU crash/restart, quota, integrity and
+sharing tests. The manual model gate exercises all four option combinations,
+SIGKILL recovery, a prefix beyond the draft window and identical greedy decode:
+
+```sh
+.venv/bin/python dev/tests/persistent_cache_real.py \
+  --package /path/to/installed/package --model incoai/Qwen3.8-27B-Splash \
+  --max-memory 24G --output build/persistent-cache-results.json
+```
+
+The stress gate compares independent sessions against persistence-disabled
+controls, drives a small quota through repeated concurrent reuse and eviction,
+shrinks and grows it across restarts, checks zero repeated payload writes when
+the working set fits, resumes a tool-result conversation, cancels streaming
+output, interrupts an outstanding publication with SIGKILL, and corrupts
+stored state and KV independently to verify fallback:
+
+```sh
+.venv/bin/python dev/tests/persistent_cache_stress.py \
+  --package /path/to/installed/package --model incoai/Qwen3.6-35B-A3B-Splash \
+  --max-memory 24G --rounds 12 --output build/persistent-cache-stress.json
+```
+
+Both gates support `--kv-format bf16`; the model gate also accepts `--records
+2000` for a longer prefix. The stress artifact preserves raw output
+differences: concurrent greedy kernels can differ from serial execution even
+with persistence disabled. For its Python-function fixtures only, the concurrent
+comparison ignores optional type annotations observed in persistence-disabled
+controls (whose RAM cache remains enabled);
+all other AST changes fail. Serial and restarted tool-conversation checks require
+exact output equality. CPU tests additionally exercise 960 quota-limited
+publications over 12 lifetimes, bounded bursts, physical shrink, hot RAM
+readmission and 16 SIGKILL interruptions during repeated publication, including
+checksums of every surviving payload. Run `make test-sanitizers` to exercise
+those same storage cases with ASan/UBSan and TSan.
 
 ### Judgment contracts
 
@@ -992,7 +1151,10 @@ entropy concentration, `1 - H(p) / log(K)`, not an estimate of correctness.
 Score answers are probability-weighted level indices. Measure accuracy and
 calibrate on representative held-out data before using decision thresholds.
 
-Native wire version 6 appends score-token IDs to requests and selected f32 logits
+Native wire version 8 retains the generation-prompt length and request flags
+from version 7 and appends a bounded `prefixBoundary` u32 (76-byte fixed request
+header).
+Score-token IDs are appended to requests and selected f32 logits
 to Done events; a version mismatch is fatal. Scoring requires 2–255 distinct,
 in-vocabulary tokens, no images or generation constraints, and a zero output budget.
 It may use the full context window because no generated token needs a reserved
@@ -1198,9 +1360,10 @@ when the tokenizer supports independent encoding there. This process-local
 cache retains at most four prefixes and 8 MiB of text/token storage; it falls
 back to full encoding for other tokenizer pipelines. `/status.tokenizer_cache`
 reports its usage. It does not alter prompt text, token IDs or the GPU KV cache.
-Server restarts require recomputation. The SSD tier (`--max-cache-disk`, see
-[disk cache](#disk-cache)) keeps evicted KV pages and states during a server
-session; its temporary files do not survive shutdown.
+With `--persistent-cache`, complete prefixes survive server restarts (see
+[persistent prefixes](#persistent-prefixes)). The independent SSD offload option
+`--max-cache-disk` alone keeps evicted KV pages and states for the current
+server session. Tokenization caching remains process-local.
 
 ## Package
 

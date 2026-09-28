@@ -58,6 +58,21 @@ MODEL_IDS = (
 
 
 class LauncherTests(unittest.TestCase):
+    def test_persistent_cache_options(self):
+        required = ["serve", "--model", "incoai/Qwen3.8-27B-Splash"]
+        args = launcher.parse_args(
+            [*required, "--persistent-cache", "--cache-file", "/tmp/prefix.sqlite"]
+        )
+        self.assertEqual(args.persistent_cache, 5 * 1024**3)
+        self.assertEqual(args.max_cache_disk, 0)
+        self.assertEqual(args.cache_file, "/tmp/prefix.sqlite")
+        both = launcher.parse_args(
+            [*required, "--persistent-cache", "2G", "--max-cache-disk", "1G"]
+        )
+        self.assertEqual(
+            (both.persistent_cache, both.max_cache_disk), (2 * 1024**3, 1024**3)
+        )
+
     def setUp(self):
         # No serve refreshes the catalog from the Hub into the checkout, and
         # the launcher's defaults ignore the caller's Splash settings.

@@ -31,6 +31,7 @@ public:
   struct DiskSlot final : KvDiskSlot {
     explicit DiskSlot(std::shared_ptr<SlotFile::Slot> held) : slot(std::move(held)) {}
     std::shared_ptr<SlotFile::Slot> slot;
+    std::shared_ptr<SlotFile::Slot> record() const override { return slot; }
   };
   static constexpr uint32_t kDefaultStagingSlots = 128;
 
@@ -50,6 +51,9 @@ public:
 
   // Metal bytes the staging ring and copy table actually hold.
   [[nodiscard]] uint64_t actualAllocatedBytes() const noexcept { return actualAllocatedBytes_; }
+  std::shared_ptr<KvDiskSlot> reopenSlot(std::shared_ptr<SlotFile::Slot> slot) override {
+    return std::make_shared<DiskSlot>(std::move(slot));
+  }
   [[nodiscard]] uint64_t slotBytes() const noexcept override;
   [[nodiscard]] bool writable() const noexcept override;
   [[nodiscard]] bool canDemote() const noexcept override;

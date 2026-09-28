@@ -35,6 +35,7 @@ void Engine::submit(EngineRequest value) {
   const bool scoring = !value.scoreTokens.empty();
   if (!value.id || value.prompt.empty() ||
       value.generationPromptTokens >= value.prompt.size() ||
+      value.prefixBoundary > value.prompt.size() ||
       (scoring ? value.maxNewTokens != 0 : !value.maxNewTokens) ||
       value.prompt.size() + value.maxNewTokens > config_.maxContext ||
       !std::isfinite(value.deadlineMilliseconds) ||
@@ -788,6 +789,16 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
                    Request::StateBoundary::Purpose::Checkpoint);
     }
   }
+  // Predict one reusable message boundary in every storage mode. Unlike an
+  // observed junction, this hint never justifies evicting a state or writing
+  // directly to disk to obtain a snapshot. Capture is opportunistic below.
+  const uint32_t boundary = active.request.prefixBoundary / KvCache::pageTokens * KvCache::pageTokens;
+  if (boundary >= 512 && boundary < latestReplayBoundary &&
+      std::none_of(active.request.images.begin(), active.request.images.end(),
+        [boundary](const ImageSpan &image) {
+          return boundary > image.offset && boundary < uint64_t{image.offset} + image.tokens;
+        }))
+    addCandidate(boundary, Request::StateBoundary::Purpose::Hint);
   addCandidate(junctionBoundary, Request::StateBoundary::Purpose::Junction);
   addCandidate(latestReplayBoundary, Request::StateBoundary::Purpose::Replay);
   std::sort(active.stateBoundaries.begin(), active.stateBoundaries.end(),
@@ -826,7 +837,7 @@ bool Engine::addSharedPrefillBoundaries(Request &active, uint32_t after) {
       active.stateBoundaries.insert(
           found, {shared, Request::StateBoundary::Purpose::Junction});
       changed = true;
-    } else if (found->purpose == Request::StateBoundary::Purpose::Checkpoint) {
+    } else if (found->purpose < Request::StateBoundary::Purpose::Junction) {
       found->purpose = Request::StateBoundary::Purpose::Junction;
     }
   }
@@ -886,9 +897,10 @@ void Engine::publishReachedStateBoundaries(Request &active,
              promptProcessed) {
     const Request::StateBoundary objective =
         active.stateBoundaries[active.stateBoundaryCursor++];
+    const bool hint = objective.purpose == Request::StateBoundary::Purpose::Hint;
     const bool checkpoint =
         objective.purpose == Request::StateBoundary::Purpose::Checkpoint;
-    const bool junction =
+    const bool junction = hint ||
         objective.purpose == Request::StateBoundary::Purpose::Junction;
     uint64_t &failures = checkpoint ? counters_.checkpointPublicationFailures
                          : junction ? counters_.junctionMaterializationFailures
@@ -909,12 +921,13 @@ void Engine::publishReachedStateBoundaries(Request &active,
         ++counters_.deduplicatedStatePublications;
       } else {
         std::shared_ptr<const CompositeState> state;
-        // A checkpoint close to the final reusable state is only worth
+        // A predicted prefix must fit without displacing known recovery
+        // points. Likewise a checkpoint close to the final state is only worth
         // capturing if it fits now. Otherwise keep the previous recovery
         // point instead of evicting it or writing a short-lived replacement.
-        if (checkpoint && model_.canSnapshotToDisk() &&
+        if (hint || (checkpoint && model_.canSnapshotToDisk() &&
             uint64_t{objective.tokens} + model::ExecutionLimits::prefillTokenBudget >
-                replayStateBoundary(active)) {
+                replayStateBoundary(active))) {
           state = model_.snapshot(active.request.id);
           if (!state)
             continue;

@@ -9,12 +9,12 @@ namespace splash::engine {
 
 CompositeStateLease::CompositeStateLease(
     StateCache &owner, uint64_t kvBlock, uint32_t boundary,
-    std::shared_ptr<const CompositeState> state) noexcept
-    : owner_(&owner), kvBlock_(kvBlock), boundary_(boundary),
+    std::shared_ptr<const CompositeState> state, CacheAccess access) noexcept
+    : access_(access), owner_(&owner), kvBlock_(kvBlock), boundary_(boundary),
       state_(std::move(state)) {}
 
 CompositeStateLease::CompositeStateLease(CompositeStateLease &&other) noexcept
-    : owner_(std::exchange(other.owner_, nullptr)),
+    : access_(other.access_), owner_(std::exchange(other.owner_, nullptr)),
       kvBlock_(std::exchange(other.kvBlock_, 0)),
       boundary_(std::exchange(other.boundary_, 0)),
       state_(std::move(other.state_)) {}
@@ -24,6 +24,7 @@ CompositeStateLease::operator=(CompositeStateLease &&other) noexcept {
   if (this == &other)
     return *this;
   reset();
+  access_ = other.access_;
   owner_ = std::exchange(other.owner_, nullptr);
   kvBlock_ = std::exchange(other.kvBlock_, 0);
   boundary_ = std::exchange(other.boundary_, 0);
@@ -35,7 +36,7 @@ CompositeStateLease::~CompositeStateLease() noexcept { reset(); }
 
 void CompositeStateLease::reset() noexcept {
   if (owner_)
-    owner_->release(kvBlock_);
+    owner_->release(kvBlock_, access_);
   owner_ = nullptr;
   kvBlock_ = 0;
   boundary_ = 0;
@@ -43,15 +44,15 @@ void CompositeStateLease::reset() noexcept {
 }
 
 std::optional<CompositeStateLease>
-StateCache::acquireDeepest(std::span<const uint64_t> kvChain) {
+StateCache::acquireDeepest(std::span<const uint64_t> kvChain, CacheAccess access) {
   for (auto block = kvChain.rbegin(); block != kvChain.rend(); ++block) {
-    if (auto lease = acquireBlock(*block))
+    if (auto lease = acquireBlock(*block, access))
       return lease;
   }
   return std::nullopt;
 }
 
-std::optional<CompositeStateLease> StateCache::acquireBlock(uint64_t kvBlock) {
+std::optional<CompositeStateLease> StateCache::acquireBlock(uint64_t kvBlock, CacheAccess access) {
   auto found = entries_.find(kvBlock);
   if (found == entries_.end() || found->second.invalid)
     return std::nullopt;
@@ -65,13 +66,13 @@ std::optional<CompositeStateLease> StateCache::acquireBlock(uint64_t kvBlock) {
   if (!entry.pins && pinnedEntries_ == std::numeric_limits<uint32_t>::max()) {
     throw std::overflow_error("composite state pinned entry count overflowed");
   }
-  kv_.retainActive(kvBlock);
+  kv_.retainActive(kvBlock, access);
   if (!entry.pins)
     ++pinnedEntries_;
   ++entry.pins;
   reindex(kvBlock, entry);
   const uint32_t boundary = kv_.chainLength(kvBlock) * KvCache::pageTokens;
-  return CompositeStateLease(*this, kvBlock, boundary, copy(entry));
+  return CompositeStateLease(*this, kvBlock, boundary, copy(entry), access);
 }
 
 void StateCache::recordLookup(bool hit, bool disk) noexcept {
@@ -93,8 +94,7 @@ bool StateCache::touchIfStored(uint64_t kvBlock, bool checkpoint) {
   Entry &entry = found->second;
   if (!checkpoint)
     makeOrdinary(kvBlock, entry);
-  if (!entry.pins)
-    entry.lastUsed = recency_.next();
+  entry.lastUsed = recency_.next();
   reindex(kvBlock, entry);
   ++deduplicatedPublications_;
   return true;
@@ -102,7 +102,7 @@ bool StateCache::touchIfStored(uint64_t kvBlock, bool checkpoint) {
 
 void StateCache::touch(uint64_t kvBlock) noexcept {
   auto found = entries_.find(kvBlock);
-  if (found == entries_.end() || found->second.pins)
+  if (found == entries_.end())
     return;
   found->second.lastUsed = recency_.next();
   reindex(kvBlock, found->second);
@@ -133,8 +133,7 @@ void StateCache::publish(uint64_t kvBlock,
   bytes_ += stateBytes;
   if (entry.checkpoint)
     checkpointBytes_ += stateBytes;
-  if (!entry.pins)
-    entry.lastUsed = recency_.next();
+  entry.lastUsed = recency_.next();
   reindex(kvBlock, entry);
   ++publications_;
 }
@@ -159,11 +158,43 @@ bool StateCache::publishToDisk(uint64_t kvBlock, const StateWriter &write,
     return false;
   Entry &entry = publicationEntry(kvBlock, checkpoint);
   beginWrite(kvBlock, entry, std::move(transfer));
-  if (!entry.pins)
-    entry.lastUsed = recency_.next();
+  entry.lastUsed = recency_.next();
   reindex(kvBlock, entry);
   ++publications_;
   return true;
+}
+
+bool StateCache::copyToDisk(uint64_t block, const std::function<void()> &completion,
+                            const std::function<bool()> &makeRoom) {
+  auto found = entries_.find(block);
+  if (found == entries_.end() || found->second.invalid) return false;
+  Entry &entry = found->second;
+  if (entry.disk) return true;
+  if (!entry.ram || !entry.ram->canOffload()) return false;
+  auto transfer = startWrite([state = entry.ram](std::function<void()> done) {
+    return state->offload(std::move(done));
+  }, completion, makeRoom);
+  if (!transfer) return false;
+  beginWrite(block, entry, std::move(transfer));
+  reindex(block, entry);
+  return true;
+}
+
+std::shared_ptr<const CompositeState> StateCache::diskCopy(uint64_t block) const {
+  auto found = entries_.find(block);
+  return found != entries_.end() && !found->second.invalid && !writing(block)
+      ? found->second.disk : nullptr;
+}
+
+void StateCache::importDisk(uint64_t block, std::shared_ptr<const CompositeState> state) {
+  if (!state || state->residentBytes() || !kv_.contains(block))
+    throw std::invalid_argument("invalid imported state");
+  if (contains(block)) return;
+  Entry &entry = publicationEntry(block, false);
+  entry.disk = std::move(state);
+  diskBytes_ += entry.disk->bytes();
+  entry.lastUsed = recency_.next();
+  reindex(block, entry);
 }
 
 StateCheckpoint StateCache::checkpoint(uint64_t kvBlock) const noexcept {
@@ -219,7 +250,10 @@ StateCache::evictionCandidate(bool keepResumePoint, bool checkpoints) const noex
 
 std::optional<CacheEvictionCandidate>
 StateCache::diskCandidate(bool duplicate) const noexcept {
-  return duplicate ? duplicates_.oldest() : diskOnly_.oldest();
+  const auto &order = duplicate ? duplicates_ : diskOnly_;
+  for (auto candidate = order.oldest(); candidate; candidate = order.next(*candidate))
+    if (!entries_.find(candidate->id)->second.disk->durable()) return candidate;
+  return std::nullopt;
 }
 
 StateEviction StateCache::reclaim(uint64_t kvBlock, std::function<void()> completion,
@@ -231,7 +265,7 @@ StateEviction StateCache::reclaim(uint64_t kvBlock, std::function<void()> comple
   Entry &entry = found->second;
   const uint64_t reclaimed = entry.ram->bytes();
   // One write at a time.
-  const bool writable = !entry.disk && entry.ram->canOffload();
+  const bool writable = offloadEnabled_ && !entry.disk && entry.ram->canOffload();
   if (writable && pending_ && waitForWrite)
     return {false, 0, true};
   if (writable) {
@@ -397,22 +431,22 @@ StateCacheSnapshot StateCache::snapshot() const noexcept {
   return result;
 }
 
-void StateCache::release(uint64_t kvBlock) noexcept {
+void StateCache::release(uint64_t kvBlock, CacheAccess access) noexcept {
   auto found = entries_.find(kvBlock);
   if (found == entries_.end() || !found->second.pins)
     std::terminate();
   Entry &target = found->second;
   --target.pins;
+  if (access == CacheAccess::Request) target.lastUsed = recency_.next();
   if (!target.pins) {
     if (!pinnedEntries_)
       std::terminate();
     --pinnedEntries_;
-    target.lastUsed = recency_.next();
     reindex(kvBlock, target);
     if (target.invalid)
       static_cast<void>(evict(kvBlock));
   }
-  kv_.releaseActive(kvBlock);
+  kv_.releaseActive(kvBlock, access);
 }
 
 StateCache::Entry &StateCache::entry(uint64_t kvBlock) {

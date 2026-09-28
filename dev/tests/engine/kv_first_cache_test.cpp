@@ -192,6 +192,60 @@ void demoteLeaves(engine::Cache &cache, test::TestKvTier &tier, uint32_t leaves)
   }
 }
 
+// Background ownership must not turn IO completion into a cache hit. Actual
+// requests still refresh state and KV recency while that ownership is held.
+void testMaintenanceLeasesPreserveRequestRecency() {
+  test::TestKvBacking backing(2, 100);
+  KvPool pool(backing);
+  CacheRecency recency;
+  KvCache kv(pool, cacheNamespace(), recency);
+  StateCache states(kv, recency);
+  auto pages = pool.acquirePages(2, false);
+  require(pages.granted(), "maintenance fixture has no pages");
+  const std::array<uint32_t, 32> firstTokens{};
+  std::array<uint32_t, 32> secondTokens{};
+  secondTokens.fill(1);
+  const uint64_t first = kv.insert(0, firstTokens, pages.pages[0]).id;
+  const uint64_t second = kv.insert(0, secondTokens, pages.pages[1]).id;
+  for (auto page : pages.pages) pool.releasePage(page, false);
+  states.publish(first, std::make_shared<TestState>(100));
+  states.publish(second, std::make_shared<TestState>(100));
+  {
+    auto copy = states.acquireDeepest(std::span(&first, 1), CacheAccess::Maintenance);
+    kv.retainActive(first, CacheAccess::Maintenance);
+    auto moved = std::move(copy);
+    moved.reset();
+    kv.releaseActive(first, CacheAccess::Maintenance);
+  }
+  require(states.evictionCandidate()->id == first && kv.evictionCandidate()->id == first,
+          "background copy completion refreshed cache recency");
+  {
+    auto copy = states.acquireDeepest(std::span(&first, 1), CacheAccess::Maintenance);
+    auto use = states.acquireDeepest(std::span(&first, 1));
+    states.touch(second);
+    kv.touch(second);
+    use.reset(); // real use completes while the background copy still holds it
+    copy.reset();
+  }
+  require(states.evictionCandidate()->id == second && kv.evictionCandidate()->id == second,
+          "a background pin hid actual request use");
+  {
+    auto copy = states.acquireDeepest(std::span(&first, 1), CacheAccess::Maintenance);
+    states.touch(first);
+    kv.touch(first);
+    states.touch(second);
+    kv.touch(second);
+  }
+  require(states.evictionCandidate()->id == first && kv.evictionCandidate()->id == first,
+          "late maintenance release overrode a newer request's recency");
+  {
+    auto copy = states.acquireDeepest(std::span(&first, 1), CacheAccess::Maintenance);
+    require(states.touchIfStored(first, false), "pinned publication was not reused");
+  }
+  require(states.evictionCandidate()->id == second,
+          "a background pin hid an actual duplicate publication");
+}
+
 void testSchedulingProbeDoesNotChangeCachePolicy() {
   CacheFixture fixture;
   const auto cachedTokens = [&](std::span<const uint32_t> prompt) {
@@ -2520,6 +2574,7 @@ int main() {
     testCheckpointPressurePreservesHotPrefix();
     testLogicalKvPressureStillReclaimsPages();
     testSchedulingProbeDoesNotChangeCachePolicy();
+    testMaintenanceLeasesPreserveRequestRecency();
     testValidAdmissionProbePreservesLookupAndAccounting();
     testProbeFallsBackWhenPromptChanges();
     testProbeRechecksFirstMissAndPromptLength();

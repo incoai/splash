@@ -20,7 +20,7 @@ std::string_view frameTypeName(FrameType type);
 std::string_view failureClassName(FailureClass failureClass);
 
 constexpr std::array<uint8_t, 4> kMagic{'S', 'P', 'L', 'H'};
-constexpr uint64_t kRequestFixedBytes = 72;
+constexpr uint64_t kRequestFixedBytes = 76;
 constexpr uint64_t kImageSpanBytes = 32;
 constexpr uint64_t kCancelFixedBytes = 8;
 constexpr uint64_t kMaskResponseFixedBytes = 20;
@@ -396,6 +396,9 @@ std::optional<ProtocolIssue> validateRequest(const RequestFrame &request,
     return invalid(IssueCode::LimitExceeded,
                    "image span count exceeds its limit");
   }
+  if (request.prefixBoundary > request.promptTokens.size())
+    return makeIssue(FailureClass::RequestError, IssueCode::LimitExceeded,
+                     request.requestId, "prefix boundary exceeds prompt length");
   uint64_t previousSpanEnd = 0;
   uint64_t pixelBytes = 0;
   for (const ImageSpanFrame &span : request.imageSpans) {
@@ -712,6 +715,7 @@ ProtocolResult<Frame> encodeRequest(const RequestFrame &request,
   writer.u32(static_cast<uint32_t>(request.scoreTokens.size()));
   writer.u32(request.generationPromptTokens);
   writer.u32(request.flags);
+  writer.u32(request.prefixBoundary);
   for (uint32_t token : request.promptTokens)
     writer.u32(token);
   for (const ImageSpanFrame &span : request.imageSpans) {
@@ -922,7 +926,8 @@ ProtocolResult<Message> decodeRequest(const Frame &frame,
       !reader.u32(request.sampling.topK) || !reader.u64(request.seed) ||
       !reader.u8(returnProgress) || !reader.u32(scoreCount) ||
       !reader.u32(request.generationPromptTokens) ||
-      !reader.u32(request.flags)) {
+      !reader.u32(request.flags) ||
+      !reader.u32(request.prefixBoundary)) {
     return failure<Message>(makeIssue(FailureClass::ProtocolFatal,
                                       IssueCode::InvalidPayloadLength, 0,
                                       "request fixed payload is truncated"));

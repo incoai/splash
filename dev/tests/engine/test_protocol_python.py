@@ -15,22 +15,22 @@ ROOT = Path(__file__).parents[3]
 
 
 REQUEST_GOLDEN = (
-    "53504c4807001800010000005c0000000000000000000000efcdab8967452301"
-    "000201008098281765060040a5ae0200000000008000000500000000000000cd"
-    "cc4c3f3333733f200000001032547698badcfe00000000000200000000000000"
-    "00000000010000002a00000000000080ffffffff"
+    "53504c480800180001000000600000000000000000000000efcdab896745"
+    "2301000201008098281765060040a5ae0200000000008000000500000000"
+    "000000cdcc4c3f3333733f200000001032547698badcfe00000000000200"
+    "0000000000000000000000000000010000002a00000000000080ffffffff"
 )
 ERROR_GOLDEN = (
-    "53504c4807001800050100002700000000000000000000000200000000000000"
+    "53504c4808001800050100002700000000000000000000000200000000000000"
     "0000090000000c0000006770755f6661756c744d6574616c206661696c6564"
 )
 STATUS_GOLDEN = (
-    "53504c4807001800070100002d00000000000000000000002803000000000000"
+    "53504c4808001800070100002d00000000000000000000002803000000000000"
     "050000007b22736368656d615f76657273696f6e223a342c227265616479223a"
     "747275657d"
 )
 INITIAL_MASK_GOLDEN = (
-    "53504c4807001800030100001800000000000000000000005b00000000000000"
+    "53504c4808001800030100001800000000000000000000005b00000000000000"
     "06000000000000000400000000000000"
 )
 
@@ -78,6 +78,9 @@ int main() {
         image.imagePixels[i] = static_cast<uint8_t>(i * 7 + 1);
     }
     show(image);
+    RequestFrame hinted = request;
+    hinted.prefixBoundary = 3;
+    show(hinted);
     RequestFrame score = request;
     score.promptTokens = {5, 6, 7};
     score.logicalMaxOutputTokens = 0;
@@ -179,6 +182,7 @@ def all_messages():
     return [
         example_request(),
         example_image_request(),
+        replace(example_request(), prefix_boundary=3),
         example_score_request(),
         example_ignore_eos_request(),
         p.CancelFrame(91),
@@ -308,6 +312,17 @@ class ProtocolPythonTests(unittest.TestCase):
         self.assertEqual(caught.exception.issue.code, code)
         return caught.exception.issue
 
+    def test_prefix_hint_is_bounded_and_round_trips(self):
+        request = replace(example_request(), prefix_boundary=3)
+        wire = p.serialize_message(request)
+        self.assertEqual(struct.unpack_from("<I", wire, 24 + 72)[0], 3)
+        self.assertEqual(p.decode_frame(parse_all(wire)[0]), request)
+        for boundary in (-1, True, len(request.prompt_tokens) + 1):
+            with self.assertRaises(p.ProtocolError):
+                p.serialize_message(replace(request, prefix_boundary=boundary))
+        with self.assertRaises(p.ProtocolError):
+            p.decode_frame(parse_all(mutate_u32(wire, 24 + 72, 100))[0])
+
     def test_fixed_golden_vectors(self):
         messages = (
             example_request(),
@@ -427,7 +442,7 @@ class ProtocolPythonTests(unittest.TestCase):
             struct.unpack_from("<I", wire, 24 + 60)[0], len(request.score_tokens)
         )
         self.assertEqual(
-            struct.unpack_from("<3I", wire, 24 + 72 + 4 * 3),
+            struct.unpack_from("<3I", wire, 24 + 76 + 4 * 3),
             request.score_tokens,
         )
         self.assertEqual(
@@ -510,7 +525,7 @@ class ProtocolPythonTests(unittest.TestCase):
     def test_malformed_score_frames_preserve_request_error_codes(self):
         request = example_score_request()
         payload = p.encode_message(request).payload
-        score_offset = 72 + 4 * len(request.prompt_tokens)
+        score_offset = 76 + 4 * len(request.prompt_tokens)
         for tokens, output_tokens in (
             ((101,), 0),
             ((101, 101), 0),
@@ -654,7 +669,7 @@ class ProtocolPythonTests(unittest.TestCase):
         self.assertEqual(wire[:4], b"SPLH")
         self.assertEqual(
             struct.unpack_from("<HHHHQI", wire, 4),
-            (p.PROTOCOL_VERSION, 24, int(p.FrameType.REQUEST), 0, 92, 0),
+            (p.PROTOCOL_VERSION, 24, int(p.FrameType.REQUEST), 0, 96, 0),
         )
         self.assertEqual(struct.unpack_from("<Q", wire, 24)[0], request.request_id)
         self.assertEqual(struct.unpack_from("<I", wire, 24 + 31)[0], 5)
@@ -664,12 +679,12 @@ class ProtocolPythonTests(unittest.TestCase):
             (request.generation_prompt_tokens, request.flags),
         )
         self.assertEqual(
-            struct.unpack_from("<5I", wire, 24 + 72), request.prompt_tokens
+            struct.unpack_from("<5I", wire, 24 + 76), request.prompt_tokens
         )
 
         image = example_image_request()
         wire = p.serialize_message(image)
-        span_offset = 24 + 72 + 4 * len(image.prompt_tokens)
+        span_offset = 24 + 76 + 4 * len(image.prompt_tokens)
         self.assertEqual(struct.unpack_from("<I", wire, 24 + 35)[0], 1)
         self.assertEqual(
             struct.unpack_from("<IIIIQQ", wire, span_offset),

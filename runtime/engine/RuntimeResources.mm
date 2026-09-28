@@ -7,6 +7,7 @@
 #include <CommonCrypto/CommonDigest.h>
 
 #include <array>
+#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <sstream>
@@ -310,7 +311,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
           config.model.stateLayout.activeCellBytes(),
           uint64_t{kvLayout.backingExtentPages()} *
               kvLayout.bytesPerModelPage(),
-          config.maximumCacheDiskBytes ? model::KvPageTier::stagingBytesFor(kvLayout)
+          (config.maximumCacheDiskBytes || config.persistentCacheBytes) ? model::KvPageTier::stagingBytesFor(kvLayout)
                                        : 0}) {
       if (!checkedAdd(requiredBytes, bytes, requiredBytes))
         requiredBytes = std::numeric_limits<uint64_t>::max();
@@ -360,7 +361,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
   // The disk tier's KV staging is Metal memory the governor charges beside
   // the weights, so the plan sets it aside before it sizes the KV pool.
   const uint64_t kvStagingBytes =
-      config.maximumCacheDiskBytes
+      (config.maximumCacheDiskBytes || config.persistentCacheBytes)
           ? model::KvPageTier::stagingBytesFor(package.targetKvLayout(config.kvFormat))
           : 0;
   auto prepareMemory = [&]() -> EngineMemoryPlan {
@@ -472,12 +473,31 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
     // disk KV cannot preserve a restorable prefix, so the tier stays off.
     std::shared_ptr<model::DiskBudget> diskBudget;
     std::shared_ptr<model::SlotFile> stateFile;
+    std::shared_ptr<model::SlotFile> kvFile;
+    std::shared_ptr<model::CacheStore> store;
+    uint64_t diskCapacity = 0;
+    if (!checkedAdd(config.maximumCacheDiskBytes, config.persistentCacheBytes, diskCapacity))
+      throw std::invalid_argument("combined cache disk quota overflowed");
+    if (config.persistentCacheBytes) {
+      auto path = config.cacheFile;
+      if (path.empty()) {
+        const char *home = std::getenv("HOME");
+        if (!home) throw std::invalid_argument("HOME is unset; specify --cache-file");
+        path = std::filesystem::path(home) / "Library/Caches/Splash/prefix" /
+            (cacheIdentity.modelLayoutSha256 + "-" +
+             std::string(kv::storageFormatName(config.kvFormat)) + ".sqlite");
+      }
+      store = std::make_shared<model::CacheStore>(path, cacheIdentity.namespaceSha256);
+      logKernelStartup("Persistent prefix cache: ", path.string(), ".");
+    }
     const uint64_t stateBytes = package.stateLayout().cachedBytes();
-    if (config.maximumCacheDiskBytes) {
-      diskBudget = std::make_shared<model::DiskBudget>(config.maximumCacheDiskBytes);
+    if (diskCapacity) {
+      diskBudget = std::make_shared<model::DiskBudget>(diskCapacity);
       try {
-        stateFile = std::make_shared<model::SlotFile>(stateBytes, diskBudget);
+        stateFile = std::make_shared<model::SlotFile>(stateBytes, diskBudget,
+            std::filesystem::temp_directory_path(), store);
       } catch (const std::exception &error) {
+        if (store) throw;
         diskBudget.reset();
         logKernelStartup("Cache disk tier disabled (", error.what(), ").");
       }
@@ -491,14 +511,16 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
     if (diskBudget) {
       try {
         const uint64_t slotBytes = model::KvPageTier::slotBytesFor(*kvPages);
-        kvTier = std::make_unique<model::KvPageTier>(
-            *backend, *kvPages, std::make_shared<model::SlotFile>(slotBytes, diskBudget));
-        logKernelStartup("Cache disk tier: ", config.maximumCacheDiskBytes / kMiB,
+        kvFile = std::make_shared<model::SlotFile>(slotBytes, diskBudget,
+            std::filesystem::temp_directory_path(), store);
+        kvTier = std::make_unique<model::KvPageTier>(*backend, *kvPages, kvFile);
+        logKernelStartup("Cache disk tier: ", diskCapacity / kMiB,
                          " MiB for KV pages of ", slotBytes / 1024, " KiB and states of ",
                          stateBytes / kMiB, " MiB; KV pages stage through ",
                          kvStagingBytes / kMiB, " MiB of Metal memory",
                          stateFile ? ", states through host memory." : ".");
       } catch (const std::exception &error) {
+        if (store) throw;
         logKernelStartup("Cache disk KV storage disabled; state storage remains enabled (",
                          error.what(), ").");
       }
@@ -506,6 +528,12 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
     auto kvPool = std::make_unique<KvPool>(*kvPages);
     auto cache = std::make_unique<engine::Cache>(*kvPool, cacheIdentity.cacheNamespace,
                                                  kvTier.get(), diskBudget);
+    if (store) {
+      cache->enablePersistence({config.persistentCacheBytes, store, kvFile, stateFile,
+                                stateStorage.get()}, config.maximumCacheDiskBytes != 0);
+      logKernelStartup("Restored ", cache->snapshot().persistent.restored,
+                       " persistent prefixes without allocating GPU cache pages.");
+    }
 
     if (kvPages->declaredBytes() != budget.kvVirtualBytes ||
         kvPages->actualAllocatedBytes() > budget.kvVirtualBytes) {

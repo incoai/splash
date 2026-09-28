@@ -14,7 +14,7 @@
 
 namespace splash::protocol {
 
-inline constexpr uint16_t kProtocolVersion = 7;
+inline constexpr uint16_t kProtocolVersion = 8;
 inline constexpr size_t kFrameHeaderBytes = 24;
 inline constexpr uint32_t kStatusSchemaVersion = 5;
 // Image pixels travel inside the request frame; a multi-image agent turn can
@@ -186,6 +186,8 @@ struct RequestFrame {
 
   uint32_t logicalMaxOutputTokens = 0;
   std::vector<uint32_t> promptTokens;
+  // Optional first-message boundary, in the exact rendered token stream.
+  uint32_t prefixBoundary = 0;
   // Sorted, non-overlapping image spans and their resized uint8 RGB pixels,
   // concatenated in span order (gridHeight*16 x gridWidth*16 x 3 each).
   // Both are empty for text-only requests.

@@ -5,6 +5,9 @@
 
 namespace splash::engine {
 
+// Maintenance holds storage alive without making its content more recent.
+enum class CacheAccess : uint8_t { Request, Maintenance };
+
 // Shared monotonic access order for KV blocks and composite states.
 class CacheRecency final {
 public:

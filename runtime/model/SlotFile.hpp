@@ -1,5 +1,7 @@
 #pragma once
 
+#include "model/CacheStore.hpp"
+
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
@@ -34,7 +36,8 @@ public:
     return true;
   }
   void release(uint64_t bytes) noexcept { used_.fetch_sub(bytes, std::memory_order_relaxed); }
-  // Cumulative bytes accepted by file IO, including partial/cancelled work.
+  // Payload bytes moved by the backend. Temporary IO includes partial work;
+  // the transactional backend counts completed slot operations.
   // This is application IO, not physical SSD traffic or filesystem overhead.
   [[nodiscard]] uint64_t readBytes() const noexcept {
     return read_.load(std::memory_order_relaxed);
@@ -51,7 +54,7 @@ private:
   std::atomic<uint64_t> written_{0};
 };
 
-// Scratch storage of fixed-size slots in an unlinked temporary file, served
+// Fixed-size slots in an unlinked temporary file or a shared CacheStore, served
 // by one IO worker in submission order and bounded by a disk budget. Callers
 // own the memory an operation moves and keep it alive until the operation is
 // ready. A slot is readable only after one complete write; a failed or
@@ -68,6 +71,12 @@ public:
   class Slot final {
   public:
     ~Slot();
+    [[nodiscard]] uint64_t recordId() const noexcept { return recordId_; }
+    // Engine-thread ownership by committed prefixes. Tier eviction must
+    // remove a whole prefix before freeing any of its shared payload slots.
+    void retainDurable() noexcept { ++durableOwners_; }
+    void releaseDurable() noexcept { --durableOwners_; }
+    [[nodiscard]] bool durable() const noexcept { return durableOwners_ != 0; }
     Slot(const Slot &) = delete;
     Slot &operator=(const Slot &) = delete;
 
@@ -76,6 +85,8 @@ public:
     Slot(std::shared_ptr<Backing> backing, uint32_t index);
     std::shared_ptr<Backing> backing_;
     uint32_t index_;
+    uint64_t recordId_ = 0;
+    uint32_t durableOwners_ = 0;
     // Owned by the worker: operations on one file run in submission order.
     bool written_ = false;
   };
@@ -105,7 +116,8 @@ public:
   // The budget holds at least one slot: a smaller quota is a configuration
   // error. Files sharing a budget compete for its bytes.
   SlotFile(uint64_t slotBytes, std::shared_ptr<DiskBudget> budget,
-           const std::filesystem::path &directory = std::filesystem::temp_directory_path());
+           const std::filesystem::path &directory = std::filesystem::temp_directory_path(),
+           std::shared_ptr<CacheStore> store = nullptr);
   // A file with a budget of its own.
   SlotFile(uint64_t slotBytes, uint64_t capacityBytes,
            const std::filesystem::path &directory = std::filesystem::temp_directory_path());
@@ -114,6 +126,11 @@ public:
   SlotFile &operator=(const SlotFile &) = delete;
   // Null when the budget is exhausted.
   [[nodiscard]] std::shared_ptr<Slot> acquire();
+  // Startup only: adopts an already committed record, charging it once.
+  [[nodiscard]] std::shared_ptr<Slot> reopen(uint64_t id);
+  // Metadata commits share the worker with state writes. No engine-thread IO.
+  [[nodiscard]] std::shared_ptr<Operation> metadata(
+      std::function<void()> work, std::function<void()> completion = {});
   [[nodiscard]] uint64_t slotBytes() const noexcept;
   // The shared budget's capacity and use.
   [[nodiscard]] uint64_t capacityBytes() const noexcept;

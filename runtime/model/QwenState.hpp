@@ -119,6 +119,8 @@ struct StateStaging final {
 class QwenCompositeState final : public CompositeState {
 public:
   ~QwenCompositeState() override;
+  [[nodiscard]] DiskStateRecord diskRecord() const override;
+  [[nodiscard]] bool durable() const noexcept override { return disk_ && disk_->durable(); }
   QwenCompositeState(const QwenCompositeState &) = delete;
   QwenCompositeState &operator=(const QwenCompositeState &) = delete;
 
@@ -172,6 +174,8 @@ public:
                    std::shared_ptr<SlotFile> file = nullptr);
 
   ~QwenStateStorage() override;
+  [[nodiscard]] std::shared_ptr<const CompositeState>
+  reopenState(DiskStateRecord record, uint64_t boundary) override;
   QwenStateStorage(const QwenStateStorage &) = delete;
   QwenStateStorage &operator=(const QwenStateStorage &) = delete;
 

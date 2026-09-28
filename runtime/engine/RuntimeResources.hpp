@@ -77,6 +77,8 @@ struct RuntimeResourcesConfig {
   uint64_t maximumMemoryBytes = 0;
   // Disk quota shared by cached KV pages and states; zero disables the tier.
   uint64_t maximumCacheDiskBytes = 0;
+  uint64_t persistentCacheBytes = 0;
+  std::filesystem::path cacheFile;
   // Patches per image the vision scratch covers. The engine admits images up
   // to it when the model loaded vision and none otherwise; the wire parser's
   // limit defaults to the same constant.

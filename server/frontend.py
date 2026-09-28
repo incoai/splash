@@ -1105,6 +1105,7 @@ class Frontend:
         return Job(
             request_id=next(self.ids),
             prompt_tokens=prompt_tokens,
+            prefix_boundary=self.prompt_tokenizer.prefix_boundary(prompt_tokens),
             max_new_tokens=max_new,
             seed=seed,
             temperature=options.temperature,

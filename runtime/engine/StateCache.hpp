@@ -44,8 +44,9 @@ public:
 private:
   friend class StateCache;
   CompositeStateLease(StateCache &owner, uint64_t kvBlock, uint32_t boundary,
-                      std::shared_ptr<const CompositeState> state) noexcept;
+                      std::shared_ptr<const CompositeState> state, CacheAccess access) noexcept;
 
+  CacheAccess access_ = CacheAccess::Request;
   StateCache *owner_ = nullptr;
   uint64_t kvBlock_ = 0;
   uint32_t boundary_ = 0;
@@ -102,8 +103,10 @@ public:
   StateCache &operator=(const StateCache &) = delete;
 
   [[nodiscard]] std::optional<CompositeStateLease>
-  acquireDeepest(std::span<const uint64_t> kvChain);
+  acquireDeepest(std::span<const uint64_t> kvChain,
+                 CacheAccess access = CacheAccess::Request);
   // Acquisition pins backing; accounting occurs only when admission succeeds.
+  // Maintenance leases preserve recency through moves and release.
   void recordLookup(bool hit, bool disk = false) noexcept;
 
   // Reuses a RAM copy without a restore pin or lookup accounting. A normal
@@ -113,6 +116,17 @@ public:
   [[nodiscard]] bool touchIfResident(uint64_t kvBlock, bool checkpoint = false);
   // The same for a copy in either tier.
   [[nodiscard]] bool touchIfStored(uint64_t kvBlock, bool checkpoint = false);
+
+  // Write-through uses the same staging and ticket as pressure offload,
+  // keeping the resident copy. A disk copy is exported only after completion.
+  [[nodiscard]] bool writing(uint64_t kvBlock) const noexcept {
+    return pending_ && pending_->kvBlock == kvBlock;
+  }
+  bool copyToDisk(uint64_t block, const std::function<void()> &completion,
+                  const std::function<bool()> &makeRoom);
+  std::shared_ptr<const CompositeState> diskCopy(uint64_t block) const;
+  void importDisk(uint64_t block, std::shared_ptr<const CompositeState> state);
+  void setOffloadEnabled(bool enabled) noexcept { offloadEnabled_ = enabled; }
 
   // Publishes a RAM copy; a disk copy of the block stays beside it.
   void publish(uint64_t kvBlock, std::shared_ptr<const CompositeState> state,
@@ -133,7 +147,7 @@ public:
   // false only when the matching checkpoint is pinned; absent, replaced and
   // upgraded publications already satisfy the postcondition.
   bool retireCheckpoint(StateCheckpoint checkpoint) noexcept;
-  // Refreshes recency. No-op when absent or pinned.
+  // Refreshes actual use even while a background copy holds the state.
   void touch(uint64_t kvBlock) noexcept;
 
   [[nodiscard]] bool contains(uint64_t kvBlock) const noexcept;
@@ -215,9 +229,9 @@ private:
   // one in flight.
   void beginWrite(uint64_t kvBlock, Entry &entry, std::unique_ptr<StateOffload> transfer);
   [[nodiscard]] StateEviction erase(uint64_t kvBlock, bool retirement) noexcept;
-  void release(uint64_t kvBlock) noexcept;
+  void release(uint64_t kvBlock, CacheAccess access) noexcept;
   [[nodiscard]] std::optional<CompositeStateLease>
-  acquireBlock(uint64_t kvBlock);
+  acquireBlock(uint64_t kvBlock, CacheAccess access);
   // Places the entry in the orders its copies call for.
   void reindex(uint64_t kvBlock, Entry &entry) noexcept;
   static void unlink(Entry &entry) noexcept;
@@ -225,10 +239,9 @@ private:
   // An ordinary publication or reuse: the block has held a reusable state,
   // and a checkpoint is upgraded.
   void makeOrdinary(uint64_t kvBlock, Entry &entry);
-  [[nodiscard]] bool writing(uint64_t kvBlock) const noexcept {
-    return pending_ && pending_->kvBlock == kvBlock;
-  }
 
+
+  bool offloadEnabled_ = true;
   KvCache &kv_;
   CacheRecency &recency_;
   std::unordered_map<uint64_t, Entry> entries_;

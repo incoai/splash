@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from enum import IntEnum, IntFlag
 from typing import TypeAlias
 
-PROTOCOL_VERSION = 7
+PROTOCOL_VERSION = 8
 FRAME_HEADER_BYTES = 24
 STATUS_SCHEMA_VERSION = 5
 # Largest top-k the native sampler keeps as candidates.
@@ -29,7 +29,7 @@ _MAGIC = b"SPLH"
 _HEADER = struct.Struct("<4sHHHHQI")
 # Replay can update the integer deadlines without decoding sampling floats.
 _REQUEST_HEAD = struct.Struct("<QBBBQQ")
-_REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIffIQBIII")
+_REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIffIQBIIII")
 _IMAGE_SPAN = struct.Struct("<IIIIQQ")
 _CANCEL = struct.Struct("<Q")
 _MASK_RESPONSE = struct.Struct("<QQI")
@@ -50,7 +50,7 @@ assert (
     and sys.byteorder == "little"
 )
 assert _HEADER.size == FRAME_HEADER_BYTES
-assert _REQUEST.size == 72
+assert _REQUEST.size == 76
 assert _IMAGE_SPAN.size == 32
 assert _START.size == 21
 assert _DONE.size == 41
@@ -235,6 +235,7 @@ class RequestFrame:
     # when unknown. It must leave at least one prompt token.
     generation_prompt_tokens: int = 0
     flags: RequestFlag = RequestFlag(0)
+    prefix_boundary: int = 0
 
 
 @dataclass(slots=True, frozen=True)
@@ -730,6 +731,8 @@ def _request_issue(
         output_tokens = _u32(request.logical_max_output_tokens, "logical max output")
         prompt = _words(request.prompt_tokens, "prompt tokens")
         scores = _words(request.score_tokens, "score tokens")
+        if _u32(request.prefix_boundary, "prefix boundary") > len(prompt):
+            raise ValueError("prefix boundary exceeds prompt length")
         if scores:
             if output_tokens:
                 return _issue(
@@ -1180,6 +1183,7 @@ def _encode_message(
                 len(scores),
                 message.generation_prompt_tokens,
                 message.flags,
+                message.prefix_boundary,
             )
             + _pack_words(prompt)
             + b"".join(
@@ -1464,6 +1468,7 @@ def _decode_request(payload: bytes, limits: ProtocolLimits) -> RequestFrame:
         score_count,
         generation_prompt_tokens,
         flags,
+        prefix_boundary,
     ) = _REQUEST.unpack_from(payload)
     if return_progress > 1:
         _fail(
@@ -1550,6 +1555,7 @@ def _decode_request(payload: bytes, limits: ProtocolLimits) -> RequestFrame:
         score_tokens,
         generation_prompt_tokens,
         RequestFlag(flags),
+        prefix_boundary,
     )
     _raise_issue(_request_issue(request, limits))
     return request

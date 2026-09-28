@@ -159,6 +159,25 @@ QwenCompositeState::QwenCompositeState(CompositeStateLayout layout,
     std::shared_ptr<SlotFile::Slot> disk)
     : layout_(layout), lengths_(lengths), file_(std::move(file)), disk_(std::move(disk)) {}
 
+DiskStateRecord QwenCompositeState::diskRecord() const {
+  return {disk_, {lengths_.targetTokens, lengths_.draftBase,
+                  lengths_.draftLength, lengths_.draftCommitCursor}};
+}
+
+std::shared_ptr<const CompositeState>
+QwenStateStorage::reopenState(DiskStateRecord record, uint64_t boundary) {
+  if (!file_ || !record.slot || record.metadata.size() != 4 ||
+      record.metadata[0] != boundary || record.metadata[1] > boundary ||
+      record.metadata[2] > boundary - record.metadata[1] || record.metadata[2] > UINT32_MAX ||
+      record.metadata[3] > UINT32_MAX)
+    throw std::invalid_argument("invalid persistent state metadata");
+  QwenLogicalLengths lengths{record.metadata[0], record.metadata[1],
+      static_cast<uint32_t>(record.metadata[2]), static_cast<uint32_t>(record.metadata[3])};
+  validateLengths(lengths, true);
+  return std::shared_ptr<const CompositeState>(
+      new QwenCompositeState(layout_, lengths, file_, std::move(record.slot)));
+}
+
 std::unique_ptr<StateOffload>
 QwenCompositeState::offload(std::function<void()> completion) const {
   if (!canOffload()) return {};

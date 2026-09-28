@@ -112,6 +112,9 @@ class RealServer:
             command.extend(("--max-memory", arguments.max_memory))
         if arguments.max_cache_disk is not None:
             command.extend(("--max-cache-disk", arguments.max_cache_disk))
+        if getattr(arguments, "persistent_cache", None):
+            command.extend(("--persistent-cache", arguments.persistent_cache))
+            command.extend(("--cache-file", str(arguments.cache_file)))
         command.extend(("--kv-format", arguments.kv_format))
         self.process = subprocess.Popen(
             command,

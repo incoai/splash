@@ -545,6 +545,111 @@ void runUntilIdle(engine::Engine &engine) {
   require(engine.idle(), "engine did not reach idle");
 }
 
+void testPrefixHintServesTheFirstSequentialBranch() {
+  Backing backing(128);
+  KvPool pool(backing);
+  engine::Cache cache(pool, CacheNamespace{});
+  Executor model;
+  Events events;
+  engine::Engine engine({}, cache, model, events);
+  auto first = request(99, std::vector<uint32_t>(1089, 7));
+  first.prefixBoundary = 512;
+  engine.submit(std::move(first));
+  runUntilIdle(engine);
+  require(model.snapshots == 2 && engine.snapshot().junctionMaterializations == 1,
+          "RAM-only mode did not capture its predicted common prefix");
+  auto second = request(100, std::vector<uint32_t>(1089, 7));
+  std::fill(second.prompt.begin() + 512, second.prompt.end(), 8);
+  second.prefixBoundary = 512;
+  engine.submit(std::move(second));
+  runUntilIdle(engine);
+  require(events.starts.back().second == 512 && model.prefillRows == 1089 + 577,
+          "first sequential branch recomputed the predicted prefix");
+  require(events.completedCount == 2 && !events.failedCount,
+          "hinted branch did not complete");
+}
+
+void testDeniedHintDoesNotEvictOrOffloadKnownStates() {
+  for (bool disk : {false, true}) {
+    Backing backing(128);
+    KvPool pool(backing);
+    engine::Cache cache(pool, CacheNamespace{});
+    Executor model;
+    if (disk) model.stateTier = std::make_shared<OffloadControl>();
+    Events events;
+    engine::Engine engine({}, cache, model, events);
+    engine.submit(request(1, std::vector<uint32_t>(65, 3)));
+    runUntilIdle(engine);
+    model.denySnapshotAtBoundary = 512;
+    auto next = request(2, std::vector<uint32_t>(1089, 7));
+    next.prefixBoundary = 512;
+    engine.submit(std::move(next));
+    runUntilIdle(engine);
+    require(cache.snapshot().stateCache.evictions == 0 && model.diskSnapshots == 0 &&
+                cache.snapshot().stateCache.entries == 2 && model.snapshots == 2,
+            "optional hint displaced a known state or forced a disk snapshot");
+    require(events.completedCount == 2 && !events.failedCount,
+            "a denied optional hint failed the request");
+  }
+}
+
+void testPrefixHintBoundsAndImageExclusion() {
+  for (uint32_t hint : {0u, 31u, 511u, 512u, 535u, 1088u, 1089u}) {
+    Backing backing(128);
+    KvPool pool(backing);
+    engine::Cache cache(pool, CacheNamespace{});
+    Executor model;
+    Events events;
+    engine::Engine engine({}, cache, model, events);
+    auto value = request(1, std::vector<uint32_t>(1089, 7));
+    value.prefixBoundary = hint;
+    engine.submit(std::move(value));
+    runUntilIdle(engine);
+    require(model.snapshots == (hint >= 512 && hint < 1088 ? 2u : 1u),
+            "short, absent or redundant hint changed the state plan");
+  }
+  for (uint32_t end : {512u, 544u}) {
+    Backing backing(128);
+    KvPool pool(backing);
+    engine::Cache cache(pool, CacheNamespace{});
+    Executor model;
+    Events events;
+    engine::Engine engine({.maxImagePatches = 512}, cache, model, events);
+    auto value = request(1, std::vector<uint32_t>(1089, 7));
+    value.prefixBoundary = 512;
+    value.images.push_back({.offset = 480, .tokens = end - 480,
+                            .gridHeight = 8, .gridWidth = (end - 480) / 2});
+    value.imagePixels.resize(value.images.front().pixelBytes());
+    engine.submit(std::move(value));
+    runUntilIdle(engine);
+    require(model.snapshots == (end == 512 ? 2u : 1u),
+            "hint captured an incomplete image or excluded its complete boundary");
+  }
+}
+
+void testObservedBranchUpgradesAnOptionalHint() {
+  Backing backing(128);
+  KvPool pool(backing);
+  engine::Cache cache(pool, CacheNamespace{});
+  Executor model;
+  model.denySnapshotAtBoundary = 512;
+  model.stateTier = std::make_shared<OffloadControl>();
+  model.stateTier->ready = true;
+  model.restoreControl->ready = true;
+  Events events;
+  engine::Engine engine({}, cache, model, events);
+  for (uint32_t id : {1u, 2u}) {
+    auto value = request(id, std::vector<uint32_t>(1089, 7));
+    std::fill(value.prompt.begin() + 512, value.prompt.end(), id + 10);
+    value.prefixBoundary = 512;
+    engine.submit(std::move(value));
+  }
+  runUntilIdle(engine);
+  require(model.diskSnapshots == 1 && model.prefillRows == 512 + 2 * 577 &&
+              events.completedCount == 2 && !events.failedCount,
+          "a known waiting branch was treated as an unproven hint");
+}
+
 void testConcurrentColdPrefixesComputeOnce() {
   Backing backing(64);
   KvPool pool(backing);
@@ -5162,6 +5267,10 @@ void testRestoreCompletesWhileAConstrainedLaneDecodes() {
 
 int main() {
   try {
+    testPrefixHintServesTheFirstSequentialBranch();
+    testDeniedHintDoesNotEvictOrOffloadKnownStates();
+    testPrefixHintBoundsAndImageExclusion();
+    testObservedBranchUpgradesAnOptionalHint();
     testConcurrentColdPrefixesComputeOnce();
     testSharedPrefillRebuildsTheMissingJunctionOnce();
     testSharedPrefillReleasesDifferentJunctionsIndependently();

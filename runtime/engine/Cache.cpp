@@ -13,6 +13,17 @@ Cache::Cache(KvPool &pool, CacheNamespace cacheNamespace, model::KvTier *kvTier,
       kv_(pool, cacheNamespace, recency_),
       states_(kv_, recency_), makeRoom_([this] { return freeDiskSpace(); }) {}
 
+Cache::~Cache() = default;
+
+void Cache::enablePersistence(PersistentCacheConfig config, bool offloadEnabled) {
+  if (!tier_ || persistent_ || !requests_.empty())
+    throw std::logic_error("persistence must be configured at cache startup");
+  persistent_ = std::make_unique<PersistentCache>(std::move(config), kv_, states_,
+      *tier_, recency_, makeRoom_, completionNotifier_);
+  offloadEnabled_ = offloadEnabled;
+  states_.setOffloadEnabled(offloadEnabled);
+}
+
 void Cache::beginRequest(uint64_t requestId) {
   if (!requestId)
     throw std::invalid_argument("invalid request id");
@@ -144,6 +155,10 @@ CacheLookup Cache::lookup(std::span<const uint32_t> prompt,
 }
 
 void Cache::recordLookup(const CacheLookup &result) {
+  // A hot RAM state may have lost durable ownership under disk pressure.
+  // A real hit makes it eligible again; an existing durable entry is touched
+  // without copying any payload. Probes never change admission or recency.
+  if (persistent_ && result.state) persistent_->publish(result.state->kvBlock(), true);
   ++lookup_.lookups;
   lookup_.kvHitTokens += result.kvBoundary;
   lookup_.stateHitTokens += result.resumeBoundary();
@@ -225,21 +240,29 @@ uint64_t Cache::blockAt(uint64_t requestId, uint32_t boundary) const {
 }
 
 bool Cache::reuseCompositeState(uint64_t kvBlock, bool checkpoint) {
-  return states_.touchIfResident(kvBlock, checkpoint);
+  const bool reused = states_.touchIfResident(kvBlock, checkpoint);
+  if (reused && persistent_ && !checkpoint) persistent_->publish(kvBlock, true);
+  return reused;
 }
 
 bool Cache::reuseStoredState(uint64_t kvBlock, bool checkpoint) {
-  return states_.touchIfStored(kvBlock, checkpoint);
+  const bool reused = states_.touchIfStored(kvBlock, checkpoint);
+  if (reused && persistent_ && !checkpoint) persistent_->publish(kvBlock, true);
+  return reused;
 }
 
 void Cache::publishCompositeState(uint64_t kvBlock,
                                   std::shared_ptr<const CompositeState> state,
                                   bool checkpoint) {
   states_.publish(kvBlock, std::move(state), checkpoint);
+  if (persistent_ && !checkpoint) persistent_->publish(kvBlock);
 }
 
 bool Cache::publishStateToDisk(uint64_t kvBlock, const StateWriter &write, bool checkpoint) {
-  return states_.publishToDisk(kvBlock, write, completionNotifier_, makeRoom_, checkpoint);
+  if (!offloadEnabled_ && checkpoint) return false;
+  const bool published = states_.publishToDisk(kvBlock, write, completionNotifier_, makeRoom_, checkpoint);
+  if (published && persistent_ && !checkpoint) persistent_->publish(kvBlock);
+  return published;
 }
 
 StateCheckpoint Cache::checkpointState(uint64_t kvBlock) const noexcept {
@@ -509,7 +532,8 @@ uint64_t Cache::reclaimEmptyExtents() {
 }
 
 bool Cache::transfersInFlight() const noexcept {
-  return !restores_.empty() || !demotions_.empty() || states_.writing();
+  return !restores_.empty() || !demotions_.empty() || states_.writing() ||
+         (persistent_ && persistent_->busy());
 }
 
 uint64_t Cache::pendingBytes() const noexcept {
@@ -697,7 +721,9 @@ bool Cache::freeDiskSpace() {
                         const std::optional<CacheEvictionCandidate> &right) {
     return left && (!right || left->lastUsed < right->lastUsed);
   };
-  // A redundant copy loses nothing: its data stays in RAM.
+  // A redundant temporary copy loses nothing: its data stays in RAM.
+  // Durable ownership also serves restart recovery, so dropping it has a
+  // cost even when a resident copy exists. Compare it with sole copies below.
   const auto kvDuplicate = kv_.diskCandidate(true);
   const auto stateDuplicate = states_.diskCandidate(true);
   if (kvDuplicate || stateDuplicate) {
@@ -714,6 +740,11 @@ bool Cache::freeDiskSpace() {
   if (kvLeaf && states_.resident(kvLeaf->id))
     kvLeaf.reset();
   const auto stateOnly = states_.diskCandidate(false);
+  // A durable prefix owns all its slots atomically. Every tier shares this
+  // clock, but a live index must never lose an individual constituent page.
+  const auto durable = persistent_ ? persistent_->evictionCandidate() : std::nullopt;
+  if (durable && older(durable, kvLeaf) && older(durable, stateOnly))
+    return persistent_->evictOldest();
   if (!kvLeaf && !stateOnly)
     return false;
   if (older(stateOnly, kvLeaf)) {
@@ -756,6 +787,7 @@ bool Cache::pollTransfers() {
     if (!restored) {
       // The block leaves with its last user; so does any state it held, and
       // what lies below it, which no lookup reaches any more.
+      if (persistent_) persistent_->invalidate(block);
       states_.invalidate(block);
       kv_.poison(block);
       poisoned_.push_back(block);
@@ -785,6 +817,7 @@ bool Cache::pollTransfers() {
     }
     progressed = true;
   }
+  if (persistent_) progressed = persistent_->poll() || progressed;
   if (progressed)
     dropPoisoned();
   return progressed;
@@ -807,7 +840,8 @@ CacheSnapshot Cache::snapshot() const {
           states_.snapshot(),
           tier,
           lookup_,
-          static_cast<uint32_t>(requests_.size())};
+          static_cast<uint32_t>(requests_.size()),
+          persistent_ ? persistent_->snapshot() : PersistentCacheSnapshot{}};
 }
 
 Cache::Request &Cache::request(uint64_t requestId) {

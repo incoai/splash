@@ -1,5 +1,7 @@
 #pragma once
 
+#include "model/SlotFile.hpp"
+
 #include "ops/Vision.hpp"
 #include "model/StateTransfer.hpp"
 
@@ -81,11 +83,18 @@ struct ImageSpan final {
   bool operator==(const ImageSpan &) const = default;
 };
 
+struct DiskStateRecord final {
+  std::shared_ptr<model::SlotFile::Slot> slot;
+  std::vector<uint64_t> metadata;
+};
+
 // Immutable target-recurrent plus draft-context state.  Concrete model
 // implementations own its buffers; the engine only pins and accounts it.
 class CompositeState {
 public:
   virtual ~CompositeState() = default;
+  [[nodiscard]] virtual DiskStateRecord diskRecord() const { return {}; }
+  [[nodiscard]] virtual bool durable() const noexcept { return false; }
   // Footprint retained by the cache. A cached state owns a private copy of
   // the lane's state; dropping the reference returns that slot to the model's
   // pool, and idle-state reclaim frees it.
@@ -310,6 +319,8 @@ struct StateAllocationTracker final {
 class StateStorage {
 public:
   virtual ~StateStorage() = default;
+  [[nodiscard]] virtual std::shared_ptr<const CompositeState>
+  reopenState(DiskStateRecord, uint64_t) { return {}; }
   [[nodiscard]] virtual uint64_t actualAllocatedBytes() const noexcept = 0;
   // Frees pooled idle buffers beyond the counts kept warm and returns the
   // bytes released. Active lanes and cached states are never touched.
@@ -322,6 +333,10 @@ public:
 class KvDiskSlot {
 public:
   virtual ~KvDiskSlot() = default;
+  [[nodiscard]] virtual std::shared_ptr<SlotFile::Slot> record() const { return {}; }
+  [[nodiscard]] bool durable() const noexcept {
+    const auto slot = record(); return slot && slot->durable();
+  }
 };
 
 // One KV page moving between its pool page and the disk tier. The copy rides
@@ -345,6 +360,8 @@ public:
 class KvTier {
 public:
   virtual ~KvTier() = default;
+  [[nodiscard]] virtual std::shared_ptr<KvDiskSlot>
+  reopenSlot(std::shared_ptr<SlotFile::Slot>) { return {}; }
   [[nodiscard]] virtual uint64_t slotBytes() const noexcept = 0;
   // False once a write has failed; existing copies stay readable.
   [[nodiscard]] virtual bool writable() const noexcept = 0;

@@ -48,6 +48,7 @@ struct EngineRequest final {
   std::vector<uint32_t> scoreTokens{};
   // RequestFlag bits.
   uint32_t flags = 0;
+  uint32_t prefixBoundary = 0;
 
   [[nodiscard]] ModelRequest modelView() const noexcept {
     return {id,           cohort,   prompt,     images,      imagePixels,

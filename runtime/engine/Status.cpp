@@ -201,6 +201,16 @@ std::string runtimeStatusJson(
       << ",\"kv_restore_failures\":" << resources.kvTier.restoreFailures
       << ",\"kv_pending_pages\":" << resources.kvTier.pendingPages
       << "}"
+      << ",\"persistent_cache\":{\"capacity_bytes\":" << resources.persistent.capacityBytes
+      << ",\"used_bytes\":" << resources.persistent.usedBytes
+      << ",\"entries\":" << resources.persistent.entries
+      << ",\"saved\":" << resources.persistent.saved
+      << ",\"restored\":" << resources.persistent.restored
+      << ",\"failures\":" << resources.persistent.failures
+      << ",\"admission_skips\":" << resources.persistent.admissionSkips
+      << ",\"write_throttles\":" << resources.persistent.writeThrottles
+      << ",\"writing\":" << (resources.persistent.writing ? "true" : "false")
+      << "}"
       << ",\"cache\":{\"lookups\":" << lookup.lookups
       << ",\"hits\":" << core.cacheHits
       << ",\"cold_misses\":" << core.coldMisses << ",\"hit_rate\":" << hitRate

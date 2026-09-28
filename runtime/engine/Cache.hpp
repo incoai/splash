@@ -1,6 +1,7 @@
 #pragma once
 
 #include "engine/KvCache.hpp"
+#include "engine/PersistentCache.hpp"
 #include "engine/KvPool.hpp"
 #include "engine/StateCache.hpp"
 #include "model/Model.hpp"
@@ -86,6 +87,7 @@ struct CacheSnapshot final {
   KvTierSnapshot kvTier;
   CacheLookupSnapshot lookup;
   uint32_t activeRequests = 0;
+  PersistentCacheSnapshot persistent;
 };
 
 struct TokenAdmission final {
@@ -129,6 +131,8 @@ public:
   // the states' file can run on it without the tier.
   Cache(KvPool &pool, CacheNamespace cacheNamespace, model::KvTier *kvTier = nullptr,
         std::shared_ptr<const model::DiskBudget> diskBudget = nullptr);
+  ~Cache();
+  void enablePersistence(PersistentCacheConfig config, bool offloadEnabled);
   Cache(const Cache &) = delete;
   Cache &operator=(const Cache &) = delete;
 
@@ -139,6 +143,7 @@ public:
   // restored block becomes usable, and restores waiting for staging start.
   [[nodiscard]] bool pollTransfers();
   void discardState(uint64_t block, const CompositeState *state) {
+    if (persistent_) persistent_->invalidate(block);
     states_.invalidate(block, state);
   }
   void beginRequest(uint64_t requestId);
@@ -312,7 +317,7 @@ private:
   [[nodiscard]] LeafReclaim reclaimKvLeaf(uint64_t block);
   [[nodiscard]] LeafReclaim demoteKv(uint64_t block);
   // A failed write closes the tier; existing copies stay readable.
-  [[nodiscard]] bool kvTierWritable() const noexcept { return tier_ && tier_->writable(); }
+  [[nodiscard]] bool kvTierWritable() const noexcept { return offloadEnabled_ && tier_ && tier_->writable(); }
   // Only a state restores a disk-only chain, through its own block and every
   // block above.
   [[nodiscard]] bool kvNeededByState(uint64_t block) const {
@@ -353,6 +358,9 @@ private:
   KvTierSnapshot kvTier_;
   CacheLookupSnapshot lookup_;
   std::function<void()> completionNotifier_;
+  bool offloadEnabled_ = true;
+  // Last member: releases its pins while both logical caches still exist.
+  std::unique_ptr<PersistentCache> persistent_;
 };
 
 } // namespace splash::engine

@@ -121,6 +121,15 @@ class PromptTokenizer:
                         self.bytes -= sys.getsizeof(old) + sys.getsizeof(previous)
         return tokens + self._encode(text[boundary:])
 
+    def prefix_boundary(self, tokens):
+        """Hint from actual tokens; no second render or BPE approximation."""
+        if self.marker_id is None:
+            return 0
+        try:
+            return tokens.index(self.marker_id) + 1
+        except ValueError:
+            return 0
+
     def stats(self):
         with self.lock:
             return {

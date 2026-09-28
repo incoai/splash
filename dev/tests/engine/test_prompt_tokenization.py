@@ -52,6 +52,19 @@ class PromptTokenizationTests(unittest.TestCase):
         self.assertEqual(actual, expected)
         return actual
 
+    def test_prefix_hint_uses_the_first_literal_token_boundary(self):
+        text = "<|im_start|>system\nRules 中文 " + "read carefully " * 100
+        first = self.assert_encoding(text + "<|im_end|>")
+        full = self.assert_encoding(
+            text + "<|im_end|>\n<|im_start|>user\nHello<|im_end|>"
+        )
+        self.assertEqual(self.cache.prefix_boundary(full), len(first))
+        self.assertEqual(
+            self.cache.prefix_boundary(self.assert_encoding("No message marker")), 0
+        )
+        self.cache.marker_id = None
+        self.assertEqual(self.cache.prefix_boundary(full), 0)
+
     def test_extensions_unicode_and_changed_history_match_full_encoding(self):
         randomizer = random.Random(4321)
         fragments = [

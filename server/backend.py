@@ -124,6 +124,7 @@ class Job:
     # when unknown.
     generation_prompt_tokens: int = 0
     flags: wire.RequestFlag = wire.RequestFlag(0)
+    prefix_boundary: int = 0
     # Endpoint-specific metadata carried to the response builder.
     meta: dict | None = None
     latency: RequestLatency | None = None
@@ -507,6 +508,7 @@ class NativeBackend:
             score_tokens=job.score_tokens,
             generation_prompt_tokens=job.generation_prompt_tokens,
             flags=job.flags,
+            prefix_boundary=job.prefix_boundary,
         )
 
     def submit(self, job):

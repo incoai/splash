@@ -131,7 +131,7 @@ private:
 
   struct Request final {
     struct StateBoundary final {
-      enum class Purpose : uint8_t { Checkpoint, Replay, Junction };
+      enum class Purpose : uint8_t { Hint, Checkpoint, Replay, Junction };
       uint32_t tokens = 0;
       Purpose purpose = Purpose::Replay;
     };
