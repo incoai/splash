@@ -6,6 +6,7 @@ import errno
 import fcntl
 import http.client
 import json
+import math
 import os
 import socket
 import subprocess
@@ -249,6 +250,8 @@ def serve(args):
             command.extend(["--max-cache-disk", str(args.max_cache_disk)])
         if args.max_image_pixels is not None:
             command.extend(["--max-image-pixels", str(args.max_image_pixels)])
+        if args.request_timeout is not None:
+            command.extend(["--request-timeout", str(args.request_timeout)])
         if args.no_webui:
             command.append("--no-webui")
         for host in args.allowed_host:
@@ -410,6 +413,18 @@ def _parse_served_model_name(value):
     return value
 
 
+def _parse_request_timeout(value):
+    # Mirror the server's own validation (--request-timeout must be positive
+    # and finite) so bad values fail before installation or model work.
+    try:
+        timeout = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("use seconds, e.g. 3600") from None
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise argparse.ArgumentTypeError("must be positive and finite")
+    return timeout
+
+
 def _parse_max_image_pixels(value):
     try:
         pixels = int(value)
@@ -547,6 +562,13 @@ def parse_args(argv=None):
         "--max-image-pixels",
         type=_parse_max_image_pixels,
         help="maximum resized pixels per image, 65536–4194304 (default: 4194304)",
+    )
+    server.add_argument(
+        "--request-timeout",
+        dest="request_timeout",
+        type=_parse_request_timeout,
+        help="seconds before a queued or in-flight request expires with 504 "
+        "(default: 1800)",
     )
     server.add_argument(
         "--api-key",

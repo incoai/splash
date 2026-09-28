@@ -54,6 +54,35 @@ class LauncherTests(unittest.TestCase):
         with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
             launcher.parse_args(base + ["--kv-format", "fp16"])
 
+    def test_request_timeout_reaches_the_server(self):
+        base = ["serve", "--model", MODEL_ID]
+        # Unset stays unset: the server's own default (1800) remains authoritative.
+        self.assertIsNone(launcher.parse_args(base).request_timeout)
+        self.assertEqual(
+            launcher.parse_args(base + ["--request-timeout", "3600"]).request_timeout,
+            3600.0,
+        )
+        # Mirror the server's validation: positive and finite only.
+        for value in ("0", "-1", "inf", "nan", "soon"):
+            with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
+                launcher.parse_args(base + ["--request-timeout", value])
+
+        def check_exec(binary, argv, environment):
+            self.assertEqual(argv[argv.index("--request-timeout") + 1], "3600.0")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with (
+                mock.patch.object(launcher, "RUNTIME_DIR", Path(temporary)),
+                mock.patch.object(launcher.socket, "socket"),
+                mock.patch.object(launcher, "_ensure_installed"),
+                mock.patch.object(
+                    launcher.os, "execve", side_effect=check_exec
+                ) as execute,
+                mock.patch("sys.stdout", io.StringIO()),
+            ):
+                launcher.main(base + ["--request-timeout", "3600"])
+            execute.assert_called_once()
+
     def test_serve_requires_exact_repository_id_before_build(self):
         for arguments in (
             ["serve"],
