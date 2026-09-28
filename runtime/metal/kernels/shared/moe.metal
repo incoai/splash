@@ -609,7 +609,8 @@ inline void moe_expert_tile(device bfloat *grouped_input,
                             uint simd_group) {
   if (group.y >= *tile_count)
     return;
-  const uint expert = tiles[group.y].expert;
+  const MoeTileDescriptor tile = tiles[group.y];
+  const uint expert = tile.expert;
   const MoeQ4Slab slab_0 =
       moe_q4_slab(packed_0, shared_0, expert, params.experts,
                   params.expert_stride_bytes_0, params.output_size,
@@ -630,11 +631,30 @@ inline void moe_expert_tile(device bfloat *grouped_input,
         params.output_size, params.input_size, input_sums, group.x * TileN,
         simd_lane, simd_group);
   } else {
-    q4_mpp_tile_batched<Rows, TileN, GateUp, false, 256, false, Simdgroups>(
-        input, slab_0.weights, slab_0.scales, slab_0.biases, tile_output,
-        slab_1.weights, slab_1.scales, slab_1.biases, tile_output,
-        params.output_size, params.input_size, input_sums, group.x * TileN,
-        simd_lane, simd_group);
+    // A 32-row tile shrinks to the descriptor's live rows, as the split
+    // prefill passes do: an expert's last tile is mostly partial, and the
+    // skipped padding is never consumed. The smaller instances read rows the
+    // tile's 32-row region holds, so their sums, orders and epilogues stay
+    // bit-identical to the full tile.
+    if (tile.rows <= 8) {
+      q4_mpp_tile_batched<8, TileN, GateUp, false, 256, false, Simdgroups>(
+          input, slab_0.weights, slab_0.scales, slab_0.biases, tile_output,
+          slab_1.weights, slab_1.scales, slab_1.biases, tile_output,
+          params.output_size, params.input_size, input_sums, group.x * TileN,
+          simd_lane, simd_group);
+    } else if (tile.rows <= 16) {
+      q4_mpp_tile_batched<16, TileN, GateUp, false, 256, false, Simdgroups>(
+          input, slab_0.weights, slab_0.scales, slab_0.biases, tile_output,
+          slab_1.weights, slab_1.scales, slab_1.biases, tile_output,
+          params.output_size, params.input_size, input_sums, group.x * TileN,
+          simd_lane, simd_group);
+    } else {
+      q4_mpp_tile_batched<Rows, TileN, GateUp, false, 256, false, Simdgroups>(
+          input, slab_0.weights, slab_0.scales, slab_0.biases, tile_output,
+          slab_1.weights, slab_1.scales, slab_1.biases, tile_output,
+          params.output_size, params.input_size, input_sums, group.x * TileN,
+          simd_lane, simd_group);
+    }
   }
 }
 
