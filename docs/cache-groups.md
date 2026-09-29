@@ -26,7 +26,22 @@ eligibility. All groups and target KV use the same recency clock. A block is
 eligible for eviction only without active restore pins. Disposable progress
 checkpoints remain lower priority than ordinary cached conversation states.
 Evicting a group block does not evict its sibling group at the same target
-endpoint. Logical removal of target KV removes every state dependent on it.
+endpoint. Explicit retirement of a rolling checkpoint removes only exact-state
+checkpoint groups: its window blocks may still serve newer boundaries. Those
+blocks remain independently evictable. Logical removal of target KV removes
+every state dependent on it.
+
+Request completion refreshes complete restore points and every window fragment
+they need. Shared fragments inherit the access of all dependent points, rather
+than becoming artificially older because they occur earlier in the token chain.
+Incomplete points do not refresh their remaining payloads. This applies with
+offloading disabled as well as with either disk tier enabled. No model IDs or
+payload-size thresholds participate in this policy. Snapshot admission retries
+while normal LRU reclamation makes progress, bounded by the model-reported new
+allocation bytes for that snapshot. Shared pages are excluded. One small group
+block need not free enough memory; a persistent allocation denial cannot drain
+unrelated conversations beyond that byte budget (rounded to the last victim). Opportunistic hints still cannot displace
+cached work, and disposable checkpoints only reclaim disposable entries.
 
 `CacheGroupCoordinator` searches only the matched target ancestry and returns the
 deepest boundary satisfying every declared group. A missing window fragment
@@ -67,7 +82,8 @@ options and four supported switch combinations are unchanged.
 
 `cache-groups` covers KV-only, window-only and multiple-group models, incomplete
 windows, branch isolation, independent eviction, complete-window protection and
-randomized boundary search against exhaustive coverage. `persistent-cache`
+randomized boundary search against exhaustive coverage, shared-window checkpoint
+retirement and dependency-aware recency with different group declaration orders. `persistent-cache`
 reopens those model declarations across store lifetimes and checks payload bytes.
 `qwen-state-storage` checks RAM/disk boundary merges, COW, cancellation and allocation
 failures. Real-model oracle and serving tests cover numerical/output equivalence,

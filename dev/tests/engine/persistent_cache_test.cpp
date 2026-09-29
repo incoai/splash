@@ -712,14 +712,16 @@ void temporaryDuplicateBeforeDurable(const std::filesystem::path &path) {
     f.publish(100);
     f.settle();
     const auto duplicate = f.publish(200, 64, true);
-    require(f.cache.reclaimOneState(), "temporary fixture did not offload");
+    require(f.cache.reclaimOneState().madeProgress,
+            "temporary fixture did not offload");
     f.settle();
     test::publishCheckpoint(f.cache,
         duplicate, std::make_shared<State>(f.stateFile, 64), true);
     require(f.cache.reuseCompositeState(duplicate),
             "temporary RAM copy was not reusable");
     f.publish(300, 64, true);
-    require(f.cache.reclaimOneState(), "new temporary state did not offload");
+    require(f.cache.reclaimOneState().madeProgress,
+            "new temporary state did not offload");
     f.settle();
     require(f.cache.snapshot().persistent.entries == 1,
             "redundant temporary copy displaced a committed durable prefix");

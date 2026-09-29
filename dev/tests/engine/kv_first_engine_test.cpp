@@ -67,7 +67,11 @@ private:
 
 class State final : public StatePayload {
 public:
-  uint64_t bytes() const noexcept override { return 64; }
+  explicit State(uint64_t size = 64) : size_(size) {}
+  uint64_t bytes() const noexcept override { return size_; }
+
+private:
+  uint64_t size_;
 };
 
 class DiskState final : public StatePayload {
@@ -391,7 +395,11 @@ public:
       return nullptr;
     }
     ++snapshots;
-    return test::checkpoint(requests.at(id).position, std::make_shared<State>());
+    return test::checkpoint(requests.at(id).position,
+                            std::make_shared<State>(snapshotBytes));
+  }
+  uint64_t snapshotAllocationBytes(uint64_t) const override {
+    return snapshotBytes;
   }
   // Without a cache slot the production model writes the lane's state to
   // the disk tier; the fake has one when `stateTier` is set, with quota for
@@ -442,6 +450,7 @@ public:
   uint32_t prefillRows = 0;
   uint32_t restored = 0;
   uint32_t snapshots = 0;
+  uint64_t snapshotBytes = 64;
   uint32_t snapshotAttempts = 0;
   uint32_t diskSnapshots = 0;
   std::shared_ptr<OffloadControl> stateTier;
@@ -746,7 +755,7 @@ void testSharedPrefillEvictedPublicationFallsBack() {
   engine.submit(request(2, std::vector<uint32_t>(193, 7)));
   static_cast<void>(engine.tick(0));
   static_cast<void>(engine.tick(1));
-  require(cache.reclaimOneState(),
+  require(cache.reclaimOneState().madeProgress,
           "published shared prefix was pinned against pressure reclamation");
   runUntilIdle(engine);
   require(events.completedCount == 2 && model.prefillRows == 386 &&
@@ -1383,6 +1392,42 @@ void testDeniedSnapshotCostsOnlyThatAttempt() {
               engine.snapshot().junctionMaterializations == 1 &&
               resources.snapshot().stateCache.entries == 1,
           "junction was not materialized once snapshots were possible");
+}
+
+// Admission is bounded by required backing bytes, not a fixed victim count.
+void testSnapshotAdmissionReclaimsUntilItFits() {
+  Backing backing(64);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(1);
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  executor.snapshotBytes = 32;
+  for (uint64_t id = 1; id <= 3; ++id) {
+    engine.submit(request(id, std::vector<uint32_t>(65, id)));
+    runUntilIdle(engine);
+  }
+  require(resources.snapshot().stateCache.bytes == 96,
+          "snapshot admission fixture did not retain three states");
+  // The snapshot needs 64 bytes in a 96-byte budget. Reclaiming one older
+  // block is insufficient; admission must keep making progress in LRU order.
+  executor.snapshotBytes = 64;
+  executor.snapshotObserver = [&] {
+    if (resources.snapshot().stateCache.bytes > 32)
+      executor.deniedSnapshots = 1;
+  };
+  engine.submit(request(4, std::vector<uint32_t>(65, 4)));
+  runUntilIdle(engine);
+  require(resources.snapshot().stateCache.bytes == 96 &&
+              resources.snapshot().stateCache.evictions == 2 &&
+              engine.snapshot().recycledStatePublications == 1 &&
+              engine.snapshot().replayStatePublicationFailures == 0,
+          "snapshot admission stopped before enough space was reclaimed");
+  require(!resources.lookup(std::vector<uint32_t>(65, 1)).state &&
+              !resources.lookup(std::vector<uint32_t>(65, 2)).state &&
+              resources.lookup(std::vector<uint32_t>(65, 3)).state &&
+              resources.lookup(std::vector<uint32_t>(65, 4)).state,
+          "snapshot admission did not preserve LRU order");
 }
 
 // A snapshot the model denies once at a replay boundary lands by recycling
@@ -4003,7 +4048,7 @@ void testPinnedCheckpointSkipsReplacementButNotOrdinaryState() {
               resources.lookup(prompt).resumeBoundary() == 17984,
           "pinned recovery point was overwritten or blocked ordinary publication");
   pinned = {};
-  require(resources.reclaimOneState() &&
+  require(resources.reclaimOneState().madeProgress &&
               resources.snapshot().stateCache.checkpointEntries == 0 &&
               resources.lookup(prompt).resumeBoundary() == 17984,
           "released recovery pin did not rejoin the lower-priority queue");
@@ -4664,7 +4709,8 @@ void testWaitingLaneAlwaysNamesAWakeup() {
     const auto block = cache.publishCommittedBlocks(id, prompt, 32);
     test::publishCheckpoint(cache, block, std::make_shared<OffloadState>(transfer));
     cache.endRequest(id);
-    require(cache.reclaimOneState() && cache.pollTransfers(), "state was not demoted");
+    require(cache.reclaimOneState().madeProgress && cache.pollTransfers(),
+            "state was not demoted");
   }
   engine.submit(request(1, std::vector<uint32_t>(97, 7)));
   static_cast<void>(engine.tick(1));
@@ -4735,7 +4781,8 @@ void testPhysicalShortfallDemotesInBulk() {
     const auto block = cache.publishCommittedBlocks(id, prompt, 32);
     test::publishCheckpoint(cache, block, std::make_shared<OffloadState>(transfer));
     cache.endRequest(id);
-    require(cache.reclaimOneState() && cache.pollTransfers(), "state was not demoted");
+    require(cache.reclaimOneState().madeProgress && cache.pollTransfers(),
+            "state was not demoted");
   }
   // The cached blocks fill two extents but two of their pages: those two
   // are free and backed, the other eight free pages are not, and the budget
@@ -4801,7 +4848,7 @@ void demoteState(engine::Cache &cache, uint64_t block) {
   auto transfer = std::make_shared<OffloadControl>();
   transfer->ready = true;
   test::publishCheckpoint(cache, block, std::make_shared<OffloadState>(transfer));
-  require(cache.reclaimOneState() && cache.pollTransfers() &&
+  require(cache.reclaimOneState().madeProgress && cache.pollTransfers() &&
               cache.snapshot().stateCache.bytes == 0,
           "fixture state did not move to disk");
 }
@@ -5043,7 +5090,8 @@ void testPagesReturnFromDemotionWithoutSuspending() {
     const auto block = cache.publishCommittedBlocks(id, prompt, 32);
     test::publishCheckpoint(cache, block, std::make_shared<OffloadState>(transfer));
     cache.endRequest(id);
-    require(cache.reclaimOneState() && cache.pollTransfers(), "state was not demoted");
+    require(cache.reclaimOneState().madeProgress && cache.pollTransfers(),
+            "state was not demoted");
   }
   require(pool.freePageCount() == 2 && tier.demotions == 0, "fixture pages are off");
 
@@ -5110,7 +5158,8 @@ void testWaitWithProgressOutlivesTheResourceLimit() {
     test::publishCheckpoint(cache, cache.publishCommittedBlocks(id, filler, 32),
                                 std::make_shared<OffloadState>(transfer));
     cache.endRequest(id);
-    require(cache.reclaimOneState() && cache.pollTransfers(), "filler state was not demoted");
+    require(cache.reclaimOneState().madeProgress && cache.pollTransfers(),
+            "filler state was not demoted");
   }
   require(pool.freePageCount() == 2, "fixture pages are off");
 
@@ -5175,7 +5224,8 @@ void testLimitOutlivedByProgressDoesNotWakeTheLoop() {
     test::publishCheckpoint(cache, cache.publishCommittedBlocks(id, filler, 32),
                                 std::make_shared<OffloadState>(transfer));
     cache.endRequest(id);
-    require(cache.reclaimOneState() && cache.pollTransfers(), "filler state was not demoted");
+    require(cache.reclaimOneState().madeProgress && cache.pollTransfers(),
+            "filler state was not demoted");
   }
   EngineRequest running = request(1, std::vector<uint32_t>(33, 5));
   running.deadlineMilliseconds = 1e9;
@@ -5395,6 +5445,7 @@ int main() {
     testLatestReplayDenialRecyclesOlderStateNotTheJunction();
     testCancellationAfterJunctionDiscardsLaterState();
     testDeniedSnapshotCostsOnlyThatAttempt();
+    testSnapshotAdmissionReclaimsUntilItFits();
     testDeniedSnapshotRecyclesLruStateAndRetries();
     testPersistentSnapshotDenialRecyclesAtMostOneState();
     testStateWithoutACacheSlotGoesToDisk();

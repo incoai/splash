@@ -16,7 +16,9 @@ void require(bool value, const char *message) {
     throw std::runtime_error(message);
 }
 struct Payload final : StatePayload {
-  uint64_t bytes() const noexcept override { return 100; }
+  explicit Payload(uint64_t size = 100) : size(size) {}
+  uint64_t size;
+  uint64_t bytes() const noexcept override { return size; }
 };
 struct Fixture {
   test::TestKvBacking backing{64, 100};
@@ -34,10 +36,12 @@ struct Fixture {
       blocks.push_back(cache.blockAt(1, end));
     cache.endRequest(1);
   }
-  void publish(uint32_t boundary, std::vector<CachedStateBlock> parts) {
+  void publish(uint32_t boundary, std::vector<CachedStateBlock> parts,
+               bool checkpoint = false) {
     cache.publishCompositeState(blocks.at(boundary / 32 - 1),
                                 std::make_shared<RestoreState>(
-                                    RestoreState{boundary, std::move(parts)}));
+                                    RestoreState{boundary, std::move(parts)}),
+                                checkpoint);
   }
   CacheLookup lookup(uint32_t length) {
     return cache.lookup(std::span(tokens).first(length));
@@ -83,6 +87,40 @@ void independentGroups() {
   require(f.cache.stateResident(f.blocks[2]),
           "draft invalidation also discarded checkpoint");
 }
+void retireCheckpointKeepsSharedWindow() {
+  Fixture f({{7}, {19, CacheGroupKind::SlidingWindow, 64}});
+  auto shared = part(19, 0, 64);
+  f.publish(64, {part(7, 64, 64), shared}, true);
+  auto old = f.cache.checkpointState(f.blocks[1]);
+  f.publish(96, {part(7, 96, 96), shared, part(19, 64, 96)}, true);
+  require(f.cache.retireCheckpointState(old), "checkpoint retirement failed");
+  require(f.lookup(97).resumeBoundary() == 96,
+          "retiring a checkpoint removed a newer checkpoint's window");
+}
+void requestTouchesRestoreDependencies() {
+  for (bool reverse : {false, true}) {
+    std::vector<CacheGroupSpec> groups{{7},
+                                       {19, CacheGroupKind::SlidingWindow, 64}};
+    if (reverse)
+      std::reverse(groups.begin(), groups.end());
+    Fixture f(groups);
+    CachedStateBlock shared{19, 0, 64, std::make_shared<Payload>(1)};
+    CachedStateBlock tail{19, 64, 96, std::make_shared<Payload>(1)};
+    f.publish(64, {part(7, 64, 64), shared});
+    f.publish(96, {part(7, 96, 96), shared, tail});
+    f.cache.beginRequest(2);
+    {
+      auto hit = f.lookup(97);
+      require(f.cache.restoreRequest(2, hit).granted(), "restore failed");
+    }
+    f.cache.endRequest(2);
+    require(f.cache.reclaimOneState().madeProgress &&
+                f.cache.reclaimOneState().madeProgress,
+            "group reclaim made no progress");
+    require(f.cache.snapshot().stateCache.bytes == 2,
+            "LRU removed a shared dependency before its older checkpoints");
+  }
+}
 void windowWithoutCheckpoint() {
   Fixture f({{42, CacheGroupKind::SlidingWindow, 64}});
   f.publish(96, {part(42, 0, 64), part(42, 64, 96)});
@@ -123,7 +161,7 @@ void protectWholeWindow() {
 void independentEviction() {
   Fixture f({{7}, {19, CacheGroupKind::SlidingWindow, 64}});
   f.publish(64, {part(7, 64, 64), part(19, 0, 64)});
-  require(f.cache.reclaimOneState(), "group LRU made no progress");
+  require(f.cache.reclaimOneState().madeProgress, "group LRU made no progress");
   require(f.cache.snapshot().stateCache.entries == 1 &&
               f.cache.stateResident(f.blocks[1]),
           "one group eviction discarded its sibling at the same endpoint");
@@ -182,6 +220,26 @@ void boundarySearchMatchesExhaustiveCoverage() {
     }
   }
 }
+void incompletePointDoesNotRefreshDependencies() {
+  CacheGroupCoordinator coordinator(
+      {{19, CacheGroupKind::SlidingWindow, 64}, {7}});
+  std::vector<CachedStateBlock> records{part(7, 96, 96), part(19, 64, 96)};
+  const auto find = [&](CacheGroupId group,
+                        uint32_t end) -> std::optional<CachedStateBlock> {
+    for (const auto &record : records)
+      if (record.group == group && record.end == end)
+        return record;
+    return {};
+  };
+  std::vector<CacheGroupId> visited;
+  const auto visit = [&](const auto &block) { visited.push_back(block.group); };
+  coordinator.visitComplete(96, find, visit);
+  require(visited.empty(), "incomplete restore refreshed orphan dependencies");
+  records.push_back(part(19, 0, 64));
+  coordinator.visitComplete(96, find, visit);
+  require(visited == std::vector<CacheGroupId>{7, 19, 19},
+          "restore visit did not order checkpoint before dependencies");
+}
 void sharedPhysicalSlices() {
   auto payload = std::make_shared<Payload>();
   RestoreState state{224, {{1, 32, 64, payload}, {1, 192, 224, payload}}};
@@ -208,9 +266,12 @@ int main() {
     declarations();
     noAuxiliaryState();
     independentGroups();
+    retireCheckpointKeepsSharedWindow();
+    requestTouchesRestoreDependencies();
     windowWithoutCheckpoint();
     severalGroupsAndHoles();
     sharedPhysicalSlices();
+    incompletePointDoesNotRefreshDependencies();
     boundarySearchMatchesExhaustiveCoverage();
     protectWholeWindow();
     independentEviction();

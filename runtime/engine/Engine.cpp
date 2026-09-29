@@ -945,7 +945,16 @@ void Engine::publishReachedStateBoundaries(Request &active,
         }
         if (!state)
           state = model_.snapshot(active.request.id);
-        if (!state && cache_.reclaimOneState(checkpoint)) {
+        // Recycle at most this snapshot's new backing, in normal LRU order.
+        // Blocks can be smaller or shared; count released bytes, not victims.
+        // A persistent denial must not drain unrelated cached conversations.
+        uint64_t remaining =
+            state ? 0 : model_.snapshotAllocationBytes(active.request.id);
+        while (!state && remaining) {
+          const auto reclaimed = cache_.reclaimOneState(checkpoint);
+          if (!reclaimed.madeProgress)
+            break;
+          remaining -= std::min(remaining, reclaimed.reclaimedBytes);
           state = model_.snapshot(active.request.id);
           if (state)
             ++counters_.recycledStatePublications;

@@ -42,10 +42,10 @@ void Cache::endRequest(uint64_t requestId) {
     pool_.releasePage(page, false);
   if (!active.cachedBlocks.empty())
     kv_.releaseActive(active.cachedBlocks.back());
-  // Refresh used states within their class. Ordinary states remain newer
-  // than the finished KV tail; checkpoints retain their lower priority.
-  for (uint64_t block : active.cachedBlocks)
-    states_.touch(block);
+  // Refresh complete restore points and their dependencies within their class.
+  // Ordinary states remain newer than the finished KV tail; disposable
+  // checkpoints retain their lower priority.
+  states_.touch(active.cachedBlocks);
   if (active.pendingRestores) {
     for (auto &[_, restore] : restores_)
       std::erase(restore.waiters, requestId);
@@ -442,11 +442,14 @@ CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode,
   return {false, 0, transfersInFlight()};
 }
 
-bool Cache::reclaimOneState(bool checkpointsOnly) {
+CacheReclaimResult Cache::reclaimOneState(bool checkpointsOnly) {
   const std::optional<CacheEvictionCandidate> state =
       states_.evictionCandidate();
-  return state && (!checkpointsOnly || states_.isCheckpoint(*state)) &&
-         states_.reclaim(state->id, completionNotifier_, makeRoom_, false, state->group).evicted;
+  if (!state || (checkpointsOnly && !states_.isCheckpoint(*state)))
+    return {};
+  const auto eviction = states_.reclaim(state->id, completionNotifier_,
+                                        makeRoom_, false, state->group);
+  return {eviction.evicted, eviction.reclaimedBytes, eviction.pending};
 }
 
 std::optional<CacheEvictionCandidate> Cache::oldestKvLeaf(uint64_t after) const {

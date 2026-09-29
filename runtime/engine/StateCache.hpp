@@ -64,7 +64,7 @@ public:
   void recordLookup(bool hit, bool disk) noexcept;
   [[nodiscard]] bool touchIfResident(uint64_t block, bool checkpoint = false);
   [[nodiscard]] bool touchIfStored(uint64_t block, bool checkpoint = false);
-  void touch(uint64_t block) noexcept;
+  void touch(std::span<const uint64_t> chain) noexcept;
   void publish(uint64_t block, std::shared_ptr<const RestoreState> state,
                bool checkpoint = false);
   void importDisk(uint64_t block, std::shared_ptr<const RestoreState> state);

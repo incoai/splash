@@ -44,14 +44,14 @@ StateCache::StateCache(KvCache &kv, CacheRecency &recency)
   configure({{0}});
 }
 void StateCache::configure(std::vector<CacheGroupSpec> specs) {
-  if (std::equal(specs.begin(), specs.end(), coordinator_.groups().begin(),
-                 coordinator_.groups().end()) &&
+  CacheGroupCoordinator coordinator(specs);
+  if (std::equal(coordinator.groups().begin(), coordinator.groups().end(),
+                 coordinator_.groups().begin(), coordinator_.groups().end()) &&
       groups_.size() == specs.size())
     return;
   for (const auto &[_, store] : groups_)
     if (store->snapshot().entries || store->writing())
       throw std::logic_error("cache groups cannot change after publication");
-  CacheGroupCoordinator coordinator(specs);
   std::map<CacheGroupId, std::unique_ptr<StateGroupCache>> groups;
   for (const auto &spec : specs) {
     auto store = std::make_unique<StateGroupCache>(kv_, recency_, spec.id);
@@ -118,7 +118,13 @@ StateCache::acquireDeepest(std::span<const uint64_t> chain,
 std::optional<RestoreLease> StateCache::acquireResumePoint() {
   std::optional<CacheEvictionCandidate> selected;
   bool selectedCheckpoint = false;
-  for (const auto &[_, store] : groups_) {
+  const bool hasCheckpoint = std::any_of(
+      coordinator_.groups().begin(), coordinator_.groups().end(),
+      [](const auto &spec) { return spec.kind == CacheGroupKind::Checkpoint; });
+  for (const auto &spec : coordinator_.groups()) {
+    if (hasCheckpoint && spec.kind != CacheGroupKind::Checkpoint)
+      continue;
+    const auto &store = groups_.at(spec.id);
     const auto block = store->resumePoint();
     if (!block)
       continue;
@@ -168,9 +174,26 @@ bool StateCache::resident(uint64_t block) const noexcept {
     return g.second->resident(block);
   });
 }
-void StateCache::touch(uint64_t block) noexcept {
-  for (auto &[_, store] : groups_)
-    store->touch(block);
+void StateCache::touch(std::span<const uint64_t> chain) noexcept {
+  const auto find = [&](CacheGroupId id,
+                        uint32_t end) -> std::optional<CachedStateBlock> {
+    if (!end || end % KvCache::pageTokens ||
+        end / KvCache::pageTokens > chain.size())
+      return {};
+    const auto block = chain[end / KvCache::pageTokens - 1];
+    return kv_.contains(block) ? group(id).peek(block) : std::nullopt;
+  };
+  const auto visit = [&](const CachedStateBlock &part) {
+    group(part.group).touch(chain[part.end / KvCache::pageTokens - 1]);
+  };
+  // Reuse follows complete restore points, not physical token order. A shared
+  // window page inherits every dependent point's access; incomplete points do
+  // not keep otherwise unusable payloads hot. Reference wrappers avoid heap
+  // allocation while finishing a request, including failure cleanup.
+  const CacheGroupCoordinator::Find lookup = std::cref(find);
+  const CacheGroupCoordinator::Visit refresh = std::cref(visit);
+  for (size_t i = 0; i < chain.size(); ++i)
+    coordinator_.visitComplete((i + 1) * KvCache::pageTokens, lookup, refresh);
 }
 bool StateCache::touchIfResident(uint64_t block, bool checkpoint) {
   const auto state = match(std::span(&block, 1));
@@ -324,11 +347,14 @@ bool StateCache::copyToDisk(uint64_t leaf,
 }
 StateCheckpoint StateCache::checkpoint(uint64_t block) const {
   StateCheckpoint result;
-  for (const auto &[id, store] : groups_)
-    if (auto point = store->checkpoint(block)) {
-      result.kvBlock = block;
-      result.groups.emplace_back(id, point);
-    }
+  // Rolling checkpoint retirement owns exact state only. Window blocks can
+  // serve newer checkpoints and retain their independent LRU lifetime.
+  for (const auto &spec : coordinator_.groups())
+    if (spec.kind == CacheGroupKind::Checkpoint)
+      if (auto point = group(spec.id).checkpoint(block)) {
+        result.kvBlock = block;
+        result.groups.emplace_back(spec.id, point);
+      }
   return result;
 }
 bool StateCache::retireCheckpoint(const StateCheckpoint &point) noexcept {

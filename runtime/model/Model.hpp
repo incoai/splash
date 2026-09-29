@@ -552,6 +552,13 @@ public:
   // retry.
   [[nodiscard]] virtual std::shared_ptr<const RestoreState>
   snapshot(uint64_t requestId) = 0;
+  // Maximum new physical backing for snapshot(), excluding pages it shares.
+  // Bounds optional LRU recycling after a denied snapshot; zero means that
+  // snapshot publication must not displace cache. Models with variable state
+  // sizes report the requirement for this request's current boundary.
+  [[nodiscard]] virtual uint64_t snapshotAllocationBytes(uint64_t) const {
+    return 0;
+  }
   // Whether the disk tier takes a state written from a lane: a tier exists
   // and its state file accepts writes. The quota is the write's own concern.
   [[nodiscard]] virtual bool canSnapshotToDisk() const noexcept { return false; }

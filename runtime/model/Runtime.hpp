@@ -47,6 +47,8 @@ public:
   decode(const BatchPlan &plan, std::span<const ModelBatchItem> items);
   [[nodiscard]] std::shared_ptr<const RestoreState>
   snapshot(uint64_t requestId) override;
+  [[nodiscard]] uint64_t
+  snapshotAllocationBytes(uint64_t requestId) const override;
   [[nodiscard]] bool canSnapshotToDisk() const noexcept override;
   [[nodiscard]] std::unique_ptr<SnapshotOffload>
   snapshotToDisk(uint64_t requestId, std::function<void()> completion) override;

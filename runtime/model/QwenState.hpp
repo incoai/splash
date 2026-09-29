@@ -159,6 +159,10 @@ public:
   // the lane retains its own cells. Returns nullptr on capacity pressure;
   // dropping a cached state makes its slot available for retry.
   [[nodiscard]] std::shared_ptr<const RestoreState> snapshot(uint32_t slot);
+  [[nodiscard]] uint64_t snapshotAllocationBytes() const noexcept {
+    // Draft pages are shared; only the recurrent checkpoint needs new backing.
+    return layout_.target.cellBytes();
+  }
   [[nodiscard]] bool canSnapshotToDisk() const noexcept {
     return file_ && file_->writable() && draftFile_->writable();
   }

@@ -237,7 +237,8 @@ public:
       bool keepResumePoint = false);
   // Recycles exactly one unpinned state, preferring checkpoints, for a
   // required state publication; the disk tier keeps it when it admits it.
-  [[nodiscard]] bool reclaimOneState(bool checkpointsOnly = false);
+  [[nodiscard]] CacheReclaimResult
+  reclaimOneState(bool checkpointsOnly = false);
   // Empty resident backing exists but the previous release is still in
   // flight; more reclaim work becomes possible without evicting anything.
   [[nodiscard]] bool releaseDeferred() const noexcept;

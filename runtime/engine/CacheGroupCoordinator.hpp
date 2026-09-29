@@ -15,6 +15,8 @@ public:
   using Find =
       std::function<std::optional<CachedStateBlock>(CacheGroupId, uint32_t)>;
 
+  using Visit = std::function<void(const CachedStateBlock &)>;
+
   explicit CacheGroupCoordinator(std::vector<CacheGroupSpec> groups);
   [[nodiscard]] std::span<const CacheGroupSpec> groups() const noexcept {
     return groups_;
@@ -22,10 +24,12 @@ public:
   [[nodiscard]] std::optional<RestoreState>
   match(uint32_t maximumBoundary, uint32_t alignment, const Find &find) const;
   [[nodiscard]] bool complete(uint32_t boundary, const Find &find) const;
+  // Visit only complete restore points, with checkpoints before dependencies.
+  void visitComplete(uint32_t boundary, const Find &find,
+                     const Visit &visit) const;
 
 private:
-  bool collect(uint32_t boundary, const Find &find,
-               std::vector<CachedStateBlock> *blocks) const;
+  bool collect(uint32_t boundary, const Find &find, const Visit &visit) const;
   std::vector<CacheGroupSpec> groups_;
 };
 

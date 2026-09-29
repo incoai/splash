@@ -2413,6 +2413,10 @@ std::shared_ptr<const RestoreState> Runtime::snapshot(uint64_t requestId) {
   return impl_->states.snapshot(committedStateSlot(requestId));
 }
 
+uint64_t Runtime::snapshotAllocationBytes(uint64_t) const {
+  return impl_->states.snapshotAllocationBytes();
+}
+
 bool Runtime::canSnapshotToDisk() const noexcept {
   return impl_->states.canSnapshotToDisk();
 }

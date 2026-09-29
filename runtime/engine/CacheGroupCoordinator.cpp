@@ -8,11 +8,15 @@ namespace splash::engine {
 CacheGroupCoordinator::CacheGroupCoordinator(std::vector<CacheGroupSpec> groups)
     : groups_(std::move(groups)) {
   validateCacheGroups(groups_);
+  // Exact-state groups reject incomplete boundaries cheaply; visiting their
+  // reusable dependencies afterward also preserves dependency-aware recency.
+  std::stable_partition(groups_.begin(), groups_.end(), [](const auto &group) {
+    return group.kind == CacheGroupKind::Checkpoint;
+  });
 }
 
-bool CacheGroupCoordinator::collect(
-    uint32_t boundary, const Find &find,
-    std::vector<CachedStateBlock> *blocks) const {
+bool CacheGroupCoordinator::collect(uint32_t boundary, const Find &find,
+                                    const Visit &visit) const {
   for (const auto &group : groups_) {
     if (group.kind == CacheGroupKind::Checkpoint) {
       const auto block = find(group.id, boundary);
@@ -20,8 +24,8 @@ bool CacheGroupCoordinator::collect(
           block->end != boundary) {
         return false;
       }
-      if (blocks)
-        blocks->push_back(*block);
+      if (visit)
+        visit(*block);
       continue;
     }
     const uint32_t begin = boundary - std::min(boundary, group.windowTokens);
@@ -32,8 +36,8 @@ bool CacheGroupCoordinator::collect(
           block->begin >= end) {
         return false;
       }
-      if (blocks)
-        blocks->push_back(*block);
+      if (visit)
+        visit(*block);
       end = block->begin;
     }
   }
@@ -42,7 +46,13 @@ bool CacheGroupCoordinator::collect(
 
 bool CacheGroupCoordinator::complete(uint32_t boundary,
                                      const Find &find) const {
-  return collect(boundary, find, nullptr);
+  return collect(boundary, find, {});
+}
+
+void CacheGroupCoordinator::visitComplete(uint32_t boundary, const Find &find,
+                                          const Visit &visit) const {
+  if (complete(boundary, find))
+    collect(boundary, find, visit);
 }
 
 std::optional<RestoreState>
@@ -58,7 +68,8 @@ CacheGroupCoordinator::match(uint32_t maximumBoundary, uint32_t alignment,
     if (!complete(boundary, find))
       continue;
     RestoreState result{boundary, {}};
-    collect(boundary, find, &result.blocks);
+    collect(boundary, find,
+            [&](const auto &block) { result.blocks.push_back(block); });
     return result;
   }
   return std::nullopt;
