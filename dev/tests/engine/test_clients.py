@@ -103,6 +103,16 @@ class ClientTests(unittest.TestCase):
                     self.assertEqual(
                         config["providers"]["splash"]["apiKey"], "$SPLASH_API_KEY"
                     )
+                elif name == "omp":
+                    self.assertEqual(env["SPLASH_API_KEY"], "test-server-key")
+                    models = self.home / ".omp/agent/models.yml"
+                    self.assertNotIn("test-server-key", models.read_text())
+                    self.assertEqual(
+                        yaml.safe_load(models.read_text())["providers"]["splash"][
+                            "apiKey"
+                        ],
+                        "SPLASH_API_KEY",
+                    )
                 else:
                     self.assertEqual(env["OPENAI_API_KEY"], "test-server-key")
                     profile = Path(env["HERMES_HOME"]) / "config.yaml"
@@ -990,7 +1000,7 @@ class ClientTests(unittest.TestCase):
             self.command("codex", client_args=["exec", "-c"])
 
     def test_other_clients_preserve_passthrough_arguments(self):
-        for name in ("claude", "opencode", "hermes", "pi"):
+        for name in ("claude", "opencode", "hermes", "pi", "omp"):
             with self.subTest(name=name):
                 args = ["--help", "--", "literal"]
                 argv, _ = self.command(name, client_args=args)

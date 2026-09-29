@@ -344,6 +344,9 @@ def coding_client(args):
         client_args=args.client_args,
         client_version=client_version,
     )
+    if args.config_only:
+        print(f"Configured omp: {model} · {context:,} context tokens", flush=True)
+        return 0
     print(f"Starting {args.command}: {model} · {context:,} context tokens", flush=True)
     if args.command == "claude":
         print(
@@ -480,9 +483,12 @@ def _parse_max_image_pixels(value):
 def parse_args(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     client_args = []
+    config_only = False
     if argv and argv[0] in clients.INSTALL_URLS:
         argv, client_args = argv[:1], argv[1:]
-        if client_args[:1] == ["--"]:
+        if argv[0] == "omp" and client_args[:1] == ["--config-only"]:
+            config_only, client_args = True, client_args[1:]
+        elif client_args[:1] == ["--"]:
             client_args = client_args[1:]
     elif "--" in argv:
         boundary = argv.index("--")
@@ -638,6 +644,7 @@ def parse_args(argv=None):
     if client_args and args.command == "serve":
         parser.error("arguments after -- are only supported for coding clients")
     args.client_args = client_args
+    args.config_only = config_only
     return args
 
 

@@ -20,6 +20,7 @@ INSTALL_URLS = {
     "codex": "https://developers.openai.com/codex/cli/",
     "hermes": "https://hermes-agent.nousresearch.com/docs/getting-started/installation/",
     "pi": "https://pi.dev/",
+    "omp": "https://github.com/can1357/oh-my-pi#install",
 }
 # The most tokens a client reserves for one response out of the window.
 MAX_RESPONSE_TOKENS = 32768
@@ -147,6 +148,8 @@ def command(
             argv = _hermes(path, server, environment, client_args, hermes_profile)
         case "pi":
             argv = _pi(path, server, environment, client_args)
+        case "omp":
+            argv = _omp(path, server, environment, client_args)
         case _:
             raise ClientError(f"Unknown coding client: {name}")
     return argv, environment
@@ -459,6 +462,128 @@ def _write_pi_provider(path, provider, server, environment):
     }
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     _replace_file(path, json.dumps(config, indent=2) + "\n")
+
+
+def _omp_agent_directory(environment, arguments):
+    profile = environment.get("OMP_PROFILE", environment.get("PI_PROFILE", ""))
+    inherited_profile = profile.strip()
+    if not inherited_profile or inherited_profile == "default":
+        inherited_profile = environment.get("PI_PROFILE", "").strip()
+    for index, argument in enumerate(arguments):
+        if argument == "--":
+            break
+        if argument == "--profile":
+            if index + 1 == len(arguments) or arguments[index + 1].startswith("--"):
+                raise ClientError("OMP --profile requires a profile name")
+            profile = arguments[index + 1]
+        elif argument.startswith("--profile="):
+            profile = argument.partition("=")[2]
+    profile = profile.strip()
+    # Node's path.join keeps this relative to home even with a leading slash.
+    config = (environment.get("PI_CONFIG_DIR") or ".omp").lstrip("/")
+    root = Path(os.path.normpath(str(Path.home() / config)))
+    if profile and profile != "default":
+        if (
+            not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", profile)
+            or profile.endswith(".")
+            or re.fullmatch(r"(?:con|prn|aux|nul|com[0-9]|lpt[0-9])(?:\..*)?", profile)
+        ):
+            raise ClientError("Invalid OMP profile name")
+        return root / "profiles" / profile / "agent"
+    agent = environment.get("PI_CODING_AGENT_DIR")
+    # A named OMP session exports its derived agent directory to children.
+    # Returning to the default profile must not keep writing into that profile.
+    if inherited_profile and agent == str(
+        root / "profiles" / inherited_profile / "agent"
+    ):
+        agent = None
+    return Path(agent).resolve() if agent else root / "agent"
+
+
+def _omp_models(directory, provider, server):
+    import yaml
+
+    models = next(
+        (
+            directory / name
+            for name in ("models.yml", "models.yaml")
+            if (directory / name).exists()
+        ),
+        directory / "models.yml",
+    ).resolve()
+    source = models if models.exists() else directory / "models.json"
+    invalid = f"Invalid OMP model configuration: {source}"
+    try:
+        text = source.read_text() if source.exists() else "{}"
+        if source.suffix == ".json":
+            text = json.dumps(json.loads(text))
+        config = yaml.safe_load(text)
+    except (ValueError, yaml.YAMLError) as error:
+        raise ClientError(invalid) from error
+    providers = config.get("providers", {}) if isinstance(config, dict) else None
+    if not isinstance(providers, dict):
+        raise ClientError(invalid)
+    # Preserve scalar spelling in unrelated YAML nodes: OMP uses YAML 1.2,
+    # whereas PyYAML's object loader turns e.g. yes/off into booleans.
+    tree = yaml.compose(text, Loader=yaml.SafeLoader)
+    existing = next(
+        (value for key, value in tree.value if key.value == "providers"),
+        yaml.MappingNode("tag:yaml.org,2002:map", []),
+    )
+    addition = yaml.compose(
+        yaml.safe_dump({server.name: provider}, sort_keys=False), Loader=yaml.SafeLoader
+    )
+    merged = yaml.MappingNode(
+        existing.tag,
+        [(key, value) for key, value in existing.value if key.value != server.name]
+        + addition.value,
+    )
+    updated = yaml.MappingNode(
+        tree.tag,
+        [(key, value) for key, value in tree.value if key.value != "providers"]
+        + [(yaml.ScalarNode("tag:yaml.org,2002:str", "providers"), merged)],
+    )
+    models.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _replace_file(models, yaml.serialize(updated, Dumper=yaml.SafeDumper))
+
+
+def _omp_provider(server, environment):
+    return {
+        "baseUrl": server.endpoint,
+        "api": "openai-completions",
+        "apiKey": "SPLASH_API_KEY" if environment.get("SPLASH_API_KEY") else "local",
+        "models": [
+            {
+                "id": server.model,
+                "reasoning": True,
+                "thinking": {
+                    "mode": "effort",
+                    "efforts": ["minimal", "low", "medium", "high", "xhigh", "max"],
+                    "requiresEffort": False,
+                },
+                # OMP's generic OpenAI dialect otherwise maps off to its
+                # lowest effort. Only the non-thinking request needs this
+                # explicit value; enabled efforts keep OMP's selected value.
+                "compat": {
+                    "thinkingFormat": "openai",
+                    "supportsReasoningEffort": True,
+                    "extraBody": {"reasoning_effort": "none"},
+                    "whenThinking": {"extraBody": {}},
+                },
+                "input": ["text", "image"]
+                if "image" in server.input_modalities
+                else ["text"],
+                "contextWindow": server.context,
+                "maxTokens": server.response_tokens,
+            }
+        ],
+    }
+
+
+def _omp(path, server, environment, arguments):
+    directory = _omp_agent_directory(environment, arguments)
+    _omp_models(directory, _omp_provider(server, environment), server)
+    return [path, "--provider", server.name, "--model", server.model, *arguments]
 
 
 def _replace_file(path, text):

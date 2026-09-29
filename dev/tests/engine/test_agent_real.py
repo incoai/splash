@@ -19,9 +19,9 @@ MODEL_IDS = (
 
 
 class AgentRunnerTests(unittest.TestCase):
-    def test_pi_counts_only_successful_bash_results(self):
-        for is_error in (False, True):
-            with self.subTest(is_error=is_error):
+    def test_pi_and_omp_count_only_successful_bash_results(self):
+        for name, is_error in ((n, e) for n in ("pi", "omp") for e in (False, True)):
+            with self.subTest(name=name, is_error=is_error):
                 parsed = [
                     {
                         "type": "tool_execution_start",
@@ -43,7 +43,7 @@ class AgentRunnerTests(unittest.TestCase):
                     },
                 ]
                 self.assertEqual(
-                    agent.executed_commands("pi", parsed),
+                    agent.executed_commands(name, parsed),
                     [] if is_error else [agent.TEST_COMMAND],
                 )
 
@@ -87,6 +87,40 @@ class AgentRunnerTests(unittest.TestCase):
                 (sessions / name).write_text(
                     json.dumps({"type": "message"}) + "\n" + json.dumps(entry) + "\n"
                 )
+            self.assertEqual(runner.compaction(), [entry])
+
+    def test_omp_uses_an_isolated_home_and_resumes_with_its_native_flag(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = agent.ClientRun(
+                "omp", "/bin/omp", Path(directory) / "run", "test-model", 102400, 10, []
+            )
+            with (
+                mock.patch.dict(
+                    os.environ, {"OMP_PROFILE": "work", "PI_PROFILE": "old"}
+                ),
+                mock.patch.object(
+                    agent.clients, "command", return_value=(["omp"], {})
+                ) as adapter,
+            ):
+                for session in (None, "selected-id"):
+                    runner.session = session
+                    runner.argv()
+                    environment = adapter.call_args.args[5]
+                    self.assertEqual(
+                        environment["PI_CODING_AGENT_DIR"], str(runner.omp_home)
+                    )
+                    self.assertNotIn("OMP_PROFILE", environment)
+                    self.assertNotIn("PI_PROFILE", environment)
+                    expected = ["--print", "--mode", "json"]
+                    if session:
+                        expected += ["--resume", session]
+                    self.assertEqual(adapter.call_args.kwargs["client_args"], expected)
+            self.assertNotEqual(runner.omp_home, runner.pi_home)
+            sessions = runner.omp_home / "sessions/--project--"
+            sessions.mkdir(parents=True)
+            entry = {"type": "compaction", "summary": "Earlier OMP work"}
+            (sessions / "time_selected-id.jsonl").write_text(json.dumps(entry) + "\n")
+            (sessions / "time_other-id.jsonl").write_text(json.dumps(entry) + "\n")
             self.assertEqual(runner.compaction(), [entry])
 
     def test_hermes_session_lookup_uses_canonical_workspace(self):
@@ -361,8 +395,8 @@ class AgentRunnerTests(unittest.TestCase):
                 if mode == "interrupt":
                     self.assertEqual(row["error"], "test interrupted")
 
-    def test_pi_phase_resumes_its_session_and_requires_a_finished_turn(self):
-        header = {"type": "session", "id": "pi-session"}
+    def test_pi_and_omp_phase_require_a_finished_turn(self):
+        header = {"type": "session", "id": "test-session"}
         answer = {
             "type": "message_end",
             "message": {
@@ -372,13 +406,13 @@ class AgentRunnerTests(unittest.TestCase):
             },
         }
         idle = {"submitted": 0, "completed": 0, "cancelled": 0, "failed": 0}
-        for finished in (True, False):
+        for name, finished in ((n, f) for n in ("pi", "omp") for f in (True, False)):
             with (
-                self.subTest(finished=finished),
+                self.subTest(name=name, finished=finished),
                 tempfile.TemporaryDirectory() as directory,
             ):
                 runner = agent.ClientRun.__new__(agent.ClientRun)
-                runner.name, runner.session = "pi", None
+                runner.name, runner.session = name, None
                 runner.folder = runner.workspace = Path(directory)
                 runner.timeout, runner.phases = 10, []
                 process = mock.Mock(returncode=0)
@@ -391,7 +425,7 @@ class AgentRunnerTests(unittest.TestCase):
                     return process
 
                 with (
-                    mock.patch.object(runner, "argv", return_value=(["pi"], {})),
+                    mock.patch.object(runner, "argv", return_value=([name], {})),
                     mock.patch.object(
                         agent,
                         "idle_status",
@@ -410,10 +444,10 @@ class AgentRunnerTests(unittest.TestCase):
                         runner.phase("test", "task")
                     else:
                         with self.assertRaisesRegex(
-                            agent.AgentFailure, "Pi did not finish"
+                            agent.AgentFailure, "did not finish"
                         ):
                             runner.phase("test", "task")
-                self.assertEqual(runner.session, "pi-session")
+                self.assertEqual(runner.session, "test-session")
 
     def test_hermes_runs_in_its_own_profile_of_the_developers_root(self):
         # A root of its own would be the bug the launcher avoids: Hermes would
@@ -712,6 +746,7 @@ class AgentRunnerTests(unittest.TestCase):
                     runner.workspace = Path("/test/project")
                     runner.codex_home = Path(directory) / "codex-home"
                     runner.pi_home = Path(directory) / "pi-agent"
+                    runner.omp_home = Path(directory) / "omp-agent"
                     runner.opencode_data = Path(directory) / "opencode-data"
                     runner.hermes_profile = "splash-test-0123abcd"
                     runner.session = session
@@ -724,23 +759,28 @@ class AgentRunnerTests(unittest.TestCase):
                         agent.clients, "command", side_effect=launch
                     ) as adapter:
                         argv, env = runner.argv()
-                    # Pi, Codex and OpenCode keep their state in the run, and
+                    # Pi, OMP, Codex and OpenCode keep their state in the run, and
                     # Hermes in the run's profile.
                     state = {
                         "pi": {"PI_CODING_AGENT_DIR": str(runner.pi_home)},
+                        "omp": {"PI_CODING_AGENT_DIR": str(runner.omp_home)},
                         "codex": {"CODEX_HOME": str(runner.codex_home)},
                         "opencode": {"XDG_DATA_HOME": str(runner.opencode_data)},
                     }.get(name, {})
                     self.assertEqual(env["PWD"], "/test/project")
                     if name == "codex":
                         self.assertTrue(runner.codex_home.is_dir())
+                    expected_environment = dict(agent.os.environ, **state)
+                    if name == "omp":
+                        expected_environment.pop("OMP_PROFILE", None)
+                        expected_environment.pop("PI_PROFILE", None)
                     adapter.assert_called_once_with(
                         name,
                         runner.path,
                         agent.BASE_URL,
                         "Actual-model",
                         102400,
-                        dict(agent.os.environ, **state),
+                        expected_environment,
                         input_modalities=["text"],
                         client_args=argv[1:],
                         client_version=runner.version,
@@ -766,10 +806,13 @@ class AgentRunnerTests(unittest.TestCase):
                             argv[argv.index("--allowedTools") + 1],
                             f"Bash({agent.TEST_COMMAND})",
                         )
-                    if name == "pi":
+                    if name in ("pi", "omp"):
                         expected = ["--print", "--mode", "json"]
                         if session:
-                            expected += ["--session", session]
+                            expected += [
+                                "--resume" if name == "omp" else "--session",
+                                session,
+                            ]
                         self.assertEqual(argv[1:], expected)
 
     def test_opencode_runs_as_splash_launches_it(self):

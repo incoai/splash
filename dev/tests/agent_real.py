@@ -132,7 +132,7 @@ def executed_commands(name, parsed, messages=(), turns=()):
         # From its session record: the turns the phase added.
         return [command for turn in turns for command in turn["commands"]]
     for event in parsed:
-        if name == "pi" and event.get("toolName") == "bash":
+        if name in ("pi", "omp") and event.get("toolName") == "bash":
             if event.get("type") == "tool_execution_start":
                 calls[event["toolCallId"]] = event.get("args", {}).get("command", "")
             if (
@@ -164,7 +164,7 @@ def executed_commands(name, parsed, messages=(), turns=()):
 
 
 def pi_completed(parsed):
-    """Pi's agent ended on a stopped assistant message with text."""
+    """Pi or OMP ended on a stopped assistant message with text."""
     messages = [
         event["message"]
         for event in parsed
@@ -485,6 +485,7 @@ class ClientRun:
         self.phases = []
         self.codex_home = (folder / "codex-home").resolve()
         self.pi_home = (folder / "pi-agent").resolve()
+        self.omp_home = (folder / "omp-agent").resolve()
         self.opencode_data = (folder / "opencode-data").resolve()
         # A profile of the developer's own Hermes root: Hermes takes any other
         # home for a root of its own, where it would install its tools and to
@@ -530,10 +531,13 @@ class ClientRun:
             if self.session:
                 arguments += ["resume", self.session]
             arguments += ["--json", "-"]
-        elif self.name == "pi":
+        elif self.name in ("pi", "omp"):
             arguments = ["--print", "--mode", "json"]
             if self.session:
-                arguments += ["--session", self.session]
+                arguments += [
+                    "--resume" if self.name == "omp" else "--session",
+                    self.session,
+                ]
         else:
             arguments = ["--oneshot", "--query-file", "-"]
             if self.session:
@@ -543,7 +547,7 @@ class ClientRun:
     def command(self, arguments):
         """The client's command, as `splash NAME -- ARGUMENTS` runs it, with
         the client's own state in this run's folder, leaving the developer's
-        untouched: Pi's agent directory (providers, sessions, settings and
+        untouched: Pi's or OMP's agent directory (providers, sessions, settings and
         extensions), Codex's home, and OpenCode's data directory, whose
         session database OpenCode 2 migrates to a schema OpenCode 1 cannot
         open. Hermes runs in this run's own profile."""
@@ -551,6 +555,12 @@ class ClientRun:
         match self.name:
             case "pi":
                 environment["PI_CODING_AGENT_DIR"] = str(self.pi_home)
+            case "omp":
+                environment["PI_CODING_AGENT_DIR"] = str(self.omp_home)
+                # Named OMP profiles override PI_CODING_AGENT_DIR. Keep this
+                # test's models and sessions out of the developer's profile.
+                environment.pop("OMP_PROFILE", None)
+                environment.pop("PI_PROFILE", None)
             case "codex":
                 self.codex_home.mkdir(exist_ok=True)
                 environment["CODEX_HOME"] = str(self.codex_home)
@@ -694,7 +704,7 @@ class ClientRun:
         text = log.read_text(errors="replace")
         parsed = events(text)
         for e in parsed:
-            if self.name == "pi" and e.get("type") == "session":
+            if self.name in ("pi", "omp") and e.get("type") == "session":
                 self.session = e.get("id", self.session)
             self.session = e.get(
                 "session_id", e.get("sessionID", e.get("thread_id", self.session))
@@ -784,10 +794,11 @@ class ClientRun:
             elif self.name == "codex":
                 if not any(e.get("type") == "turn.completed" for e in parsed):
                     raise AgentFailure("Codex did not complete its turn")
-            elif self.name == "pi":
+            elif self.name in ("pi", "omp"):
                 if not pi_completed(parsed):
+                    client = "OMP" if self.name == "omp" else "Pi"
                     raise AgentFailure(
-                        "Pi did not finish its user turn with assistant text"
+                        f"{client} did not finish its user turn with assistant text"
                     )
             else:
                 if any(e.get("type") == "error" for e in parsed):
@@ -819,8 +830,9 @@ class ClientRun:
                 for e in events(p.read_text())
                 if e.get("type") == "compacted"
             ]
-        if self.name == "pi":
-            found = (self.pi_home / "sessions").rglob(f"*_{self.session}.jsonl")
+        if self.name in ("pi", "omp"):
+            home = self.omp_home if self.name == "omp" else self.pi_home
+            found = (home / "sessions").rglob(f"*_{self.session}.jsonl")
             return [
                 entry
                 for path in found
