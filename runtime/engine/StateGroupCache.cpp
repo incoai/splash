@@ -219,10 +219,12 @@ bool StateGroupCache::importDisk(uint64_t block,
     auto &entry = entries_.at(block);
     // A disk image may cover more than the resident descriptor, but never
     // less. Keep an existing disk owner and any in-flight transfer intact.
-    if (entry.disk || begin > entry.begin ||
-        state->bytes() != entry.ram->bytes())
+    if (entry.disk || (entry.ram && (begin > entry.begin ||
+                                   state->bytes() != entry.ram->bytes())))
       return false;
     retainDisk(entry, *state);
+    if (!entry.ram)
+      entry.begin = begin;
     entry.disk = std::move(state);
     reindex(block, entry);
     return true;

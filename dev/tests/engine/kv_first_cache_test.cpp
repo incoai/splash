@@ -213,6 +213,16 @@ void testWiderDiskGroupPreservesEarlierBoundaries() {
     states.importDisk(second,std::make_shared<RestoreState>(RestoreState{64,{
         {19,begin,64,std::make_shared<TieredState>(control,true)}}}));
   };
+  struct RefusedPayload final : StatePayload {
+    uint64_t bytes() const noexcept override { return 100; }
+    std::vector<StateResource> resources() const override { throw std::bad_alloc(); }
+  };
+  bool refused = false;
+  try {
+    states.publish(second,std::make_shared<RestoreState>(RestoreState{64,{
+        {19,0,64,std::make_shared<RefusedPayload>()}}}));
+  } catch (const std::bad_alloc &) { refused = true; }
+  require(refused, "resident publication fault was not exercised");
   publish(32);
   require(!states.acquireDeepest(std::span(&second,1)),
           "narrow disk slice falsely restored an earlier window");
