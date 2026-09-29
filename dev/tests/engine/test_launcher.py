@@ -75,7 +75,9 @@ class LauncherTests(unittest.TestCase):
 
     def test_cache_file_requires_enabled_persistence(self):
         with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
-            launcher.parse_args(["serve", "--model", MODEL_ID, "--cache-file", "/tmp/cache"])
+            launcher.parse_args(
+                ["serve", "--model", MODEL_ID, "--cache-file", "/tmp/cache"]
+            )
 
     def setUp(self):
         # No serve refreshes the catalog from the Hub into the checkout, and

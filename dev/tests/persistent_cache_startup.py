@@ -59,23 +59,37 @@ def main():
                     server = RealServer(args, environment)
                     before = server.wait_ready(180)
                     validate_status(before)
-                    require(before["persistent_cache"]["capacity_bytes"] == 0,
-                            "broken persistence remained enabled")
-                    require(before["disk"]["capacity_bytes"] ==
-                            (256 * 1024**2 if temporary else 0),
-                            "fallback changed the requested temporary quota")
+                    require(
+                        before["persistent_cache"]["capacity_bytes"] == 0,
+                        "broken persistence remained enabled",
+                    )
+                    require(
+                        before["disk"]["capacity_bytes"]
+                        == (256 * 1024**2 if temporary else 0),
+                        "fallback changed the requested temporary quota",
+                    )
                     code, response = request(
-                        server.port, "POST", "/v1/chat/completions",
+                        server.port,
+                        "POST",
+                        "/v1/chat/completions",
                         chat_body(args.model, "Reply OK.", max_completion_tokens=8),
                         timeout=180,
                     )
                     require(code == 200, f"fallback request failed: {response}")
                     log = server.tail()
-                    require(str(args.cache_file) in log,
-                            "startup diagnostic omitted the cache path")
-                    results.append({"failure": failure, "temporary": temporary,
-                                    "before": before, "response": response,
-                                    "log": log})
+                    require(
+                        str(args.cache_file) in log,
+                        "startup diagnostic omitted the cache path",
+                    )
+                    results.append(
+                        {
+                            "failure": failure,
+                            "temporary": temporary,
+                            "before": before,
+                            "response": response,
+                            "log": log,
+                        }
+                    )
                     args.output.write_text(json.dumps(results, indent=2) + "\n")
                     print(f"passed {failure}, temporary={temporary}", flush=True)
                 finally:

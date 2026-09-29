@@ -153,7 +153,7 @@ std::optional<RestoreLease> StateCache::acquireResumePoint() {
   if (!selected)
     return std::nullopt;
   // One lease protects the entire common restore boundary, including every
-  // window fragment and its target ancestry, for this speculative shrink.
+  // window block and its target ancestry, for this speculative shrink.
   return acquireDeepest(std::span(&selected->id, 1), CacheAccess::Maintenance);
 }
 bool StateCache::isCheckpoint(
@@ -372,7 +372,7 @@ uint64_t StateCache::pruneWindowDependencies(uint64_t leaf) noexcept {
       continue;
     auto &store = group(spec.id);
     const uint32_t span = (spec.windowTokens - 1) / KvCache::pageTokens;
-    // A fragment ending at d can serve only descendant checkpoints whose
+    // A block ending at d can serve only descendant checkpoints whose
     // window starts before d. Other branches and overlapping windows remain
     // discoverable in the existing prefix tree; no second ownership graph.
     uint64_t block = leaf;
@@ -526,7 +526,7 @@ void StateCache::promote(uint64_t leaf, const RestoreState *source,
 bool StateCache::writing(uint64_t leaf) const noexcept {
   if (pending_ && pending_->leaf == leaf)
     return true;
-  // A manifest can depend on an ancestor fragment in any group.
+  // A manifest can depend on an ancestor block in any group.
   while (leaf) {
     for (const auto &[_, store] : groups_)
       if (store->writing(leaf))

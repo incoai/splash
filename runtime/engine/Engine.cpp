@@ -576,7 +576,7 @@ bool Engine::admit(Request &active, double now) {
       draft = configureDraftStatePlan(
           active, resumeBoundary, lookup.junctionBoundary());
       if (lookup.state) {
-        // Restoring shared window fragments may need private merge backing.
+        // Restoring disk pages may need private destination backing.
         // Treat that capacity refusal like any other execution allocation,
         // retaining the restore lease across reclaim and retry.
         kv = admitGrowth([&]() -> TokenAdmission {

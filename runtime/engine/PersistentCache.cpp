@@ -364,8 +364,7 @@ PersistentCache::admit(uint64_t block, const RestoreState &state, bool reused) {
   std::set<uint64_t> knownRecords;
   for (const auto &part : state.blocks) {
     const auto resources = part.payload->resources();
-    // A payload's identity is its backing, so two circular boundary slices
-    // sharing one page neither charge nor write that page twice.
+    // Payload wrappers may share backing; account each source write once.
     std::vector<const void *> identity;
     for (const auto &resource : resources)
       identity.push_back(resource.identity);
