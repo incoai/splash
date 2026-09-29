@@ -1,3 +1,4 @@
+#include "TestStateSnapshot.hpp"
 #include "TestImmediateTicket.hpp"
 #include "TestKvPool.hpp"
 #include "TestKvTier.hpp"
@@ -64,12 +65,12 @@ private:
   std::vector<bool> resident_;
 };
 
-class State final : public CompositeState {
+class State final : public StatePayload {
 public:
   uint64_t bytes() const noexcept override { return 64; }
 };
 
-class DiskState final : public CompositeState {
+class DiskState final : public StatePayload {
 public:
   uint64_t bytes() const noexcept override { return 64; }
   uint64_t residentBytes() const noexcept override { return 0; }
@@ -87,15 +88,15 @@ public:
       : control_(std::move(control)) {}
   bool ready() const noexcept override { return control_->ready; }
   bool finish() override { return true; }
-  const std::shared_ptr<const CompositeState> &state() const noexcept override {
+  const std::shared_ptr<const StatePayload> &state() const noexcept override {
     return disk_;
   }
 private:
   std::shared_ptr<OffloadControl> control_;
-  std::shared_ptr<const CompositeState> disk_ = std::make_shared<DiskState>();
+  std::shared_ptr<const StatePayload> disk_ = std::make_shared<DiskState>();
 };
 
-class OffloadState final : public CompositeState {
+class OffloadState final : public StatePayload {
 public:
   explicit OffloadState(std::shared_ptr<OffloadControl> control) : control_(std::move(control)) {}
   ~OffloadState() override { control_->released = true; }
@@ -118,6 +119,7 @@ struct RestoreControl {
 
 class RestoreTicket final : public StateRestore {
 public:
+  uint32_t boundary = 0;
   std::shared_ptr<RestoreControl> control;
   std::function<void()> commit;
   bool ready() const noexcept override { return control->ready; }
@@ -127,10 +129,10 @@ public:
     return true;
   }
   void cancel() noexcept override { control->cancelled = true; }
-  std::shared_ptr<const CompositeState> snapshot() override {
+  std::shared_ptr<const RestoreState> snapshot() override {
     if (control->promotionDenied)
       return nullptr;
-    return std::make_shared<State>();
+    return test::checkpoint(boundary, std::make_shared<State>());
   }
 };
 
@@ -259,7 +261,7 @@ public:
     return {{}, StateFailure::ConcurrencyLimit};
   }
   void restore(uint64_t id, uint32_t length,
-               std::shared_ptr<const CompositeState> state,
+               std::shared_ptr<const RestoreState> state,
                bool restoreDraftState) override {
     if (!state)
       throw std::runtime_error("empty restore state");
@@ -270,15 +272,16 @@ public:
     restoredDraft = restoreDraftState;
   }
   std::unique_ptr<StateRestore> beginRestore(
-      uint64_t id, uint32_t length, std::shared_ptr<const CompositeState> state,
+      uint64_t id, uint32_t length, std::shared_ptr<const RestoreState> state,
       bool restoreDraft, std::function<void()>) override {
-    if (state->residentBytes()) {
+    if (state->resident()) {
       restore(id, length, std::move(state), restoreDraft);
       return {};
     }
     ++diskReads;
     auto ticket = std::make_unique<RestoreTicket>();
     ticket->control = restoreControl;
+    ticket->boundary = length;
     ticket->commit = [this, id, length, state, restoreDraft] {
       restore(id, length, state, restoreDraft);
     };
@@ -375,7 +378,7 @@ public:
   // current page-aligned boundary and returns nullptr when no slot is free
   // and the governor denies a new one. The fake denies the next
   // `deniedSnapshots` calls, or every call made at `denySnapshotAtBoundary`.
-  std::shared_ptr<const CompositeState> snapshot(uint64_t id) override {
+  std::shared_ptr<const RestoreState> snapshot(uint64_t id) override {
     ++snapshotAttempts;
     if (snapshotObserver)
       snapshotObserver();
@@ -388,15 +391,15 @@ public:
       return nullptr;
     }
     ++snapshots;
-    return std::make_shared<State>();
+    return test::checkpoint(requests.at(id).position, std::make_shared<State>());
   }
   // Without a cache slot the production model writes the lane's state to
   // the disk tier; the fake has one when `stateTier` is set, with quota for
   // every state.
   bool canSnapshotToDisk() const noexcept override { return stateTier != nullptr; }
-  std::unique_ptr<StateOffload> snapshotToDisk(uint64_t, std::function<void()>) override {
+  std::unique_ptr<SnapshotOffload> snapshotToDisk(uint64_t id, std::function<void()>) override {
     ++diskSnapshots;
-    return std::make_unique<OffloadTicket>(stateTier);
+    return std::make_unique<test::SnapshotWrite>(requests.at(id).position, std::make_unique<OffloadTicket>(stateTier));
   }
   uint64_t reclaimIdleState() noexcept override {
     const uint64_t released = reclaimableIdleStateBytes;
@@ -1781,7 +1784,7 @@ void testPressureReclaimFollowsTheChain() {
   const uint64_t leaf = cache.publishCommittedBlocks(1, prompt, 128);
   auto transfer = std::make_shared<OffloadControl>();
   transfer->ready = true;
-  cache.publishCompositeState(leaf, std::make_shared<OffloadState>(transfer));
+  test::publishCheckpoint(cache, leaf, std::make_shared<OffloadState>(transfer));
   cache.endRequest(1);
 
   const auto reclaim = [&](uint64_t target) {
@@ -3939,9 +3942,9 @@ void testRestoredCheckpointAtReplayEndBecomesOrdinary() {
               "restored replay endpoint was copied or retired as temporary");
       auto held = resources.lookup(shorter);
       const uint64_t block = held.state->kvBlock();
-      const CompositeState *copy = held.state->state().get();
+      const auto copy = held.state->state();
       held = {};
-      resources.discardState(block, copy);
+      resources.discardState(block, copy.get());
       require(resources.lookup(shorter).lostState,
               "the loss of a restored replay endpoint was not a lost state");
     }
@@ -4600,7 +4603,7 @@ void testGrowthWaitsForTheStateWriteInFlight() {
     require(cache.ensureTokens(999, 64).granted(), "fixture KV failed");
     const auto held = cache.publishCommittedBlocks(999, std::vector<uint32_t>(64, 12), 64);
     require(cache.publishStateToDisk(held, [&](std::function<void()>) {
-              return std::make_unique<OffloadTicket>(writing);
+              return test::snapshotWrite(64, std::make_unique<OffloadTicket>(writing));
             }),
             "fixture write did not start");
     // A cached state in RAM whose eviction must wait for that write.
@@ -4608,7 +4611,7 @@ void testGrowthWaitsForTheStateWriteInFlight() {
     cache.beginRequest(998);
     require(cache.ensureTokens(998, 64).granted(), "fixture KV failed");
     const auto idle = cache.publishCommittedBlocks(998, std::vector<uint32_t>(64, 13), 64);
-    cache.publishCompositeState(idle, std::make_shared<OffloadState>(cached));
+    test::publishCheckpoint(cache, idle, std::make_shared<OffloadState>(cached));
     cache.endRequest(998);
     // Every free page needs backing the budget, or the host, refuses.
     backing.allocationFailure = paused ? metal::AllocationFailure::HostPressure
@@ -4659,7 +4662,7 @@ void testWaitingLaneAlwaysNamesAWakeup() {
     cache.beginRequest(id);
     require(cache.ensureTokens(id, 32).granted(), "fixture KV failed");
     const auto block = cache.publishCommittedBlocks(id, prompt, 32);
-    cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
+    test::publishCheckpoint(cache, block, std::make_shared<OffloadState>(transfer));
     cache.endRequest(id);
     require(cache.reclaimOneState() && cache.pollTransfers(), "state was not demoted");
   }
@@ -4730,7 +4733,7 @@ void testPhysicalShortfallDemotesInBulk() {
     cache.beginRequest(id);
     require(cache.ensureTokens(id, 32).granted(), "fixture KV failed");
     const auto block = cache.publishCommittedBlocks(id, prompt, 32);
-    cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
+    test::publishCheckpoint(cache, block, std::make_shared<OffloadState>(transfer));
     cache.endRequest(id);
     require(cache.reclaimOneState() && cache.pollTransfers(), "state was not demoted");
   }
@@ -4770,7 +4773,7 @@ void testKvGrowthProceedsThroughDemotion() {
   cache.beginRequest(999);
   require(cache.ensureTokens(999, 32).granted(), "offload fixture KV failed");
   const auto block = cache.publishCommittedBlocks(999, std::vector<uint32_t>(32, 12), 32);
-  cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
+  test::publishCheckpoint(cache, block, std::make_shared<OffloadState>(transfer));
   cache.endRequest(999);
   {
     auto lookup = cache.lookup(std::vector<uint32_t>(33, 12));
@@ -4797,7 +4800,7 @@ void testKvGrowthProceedsThroughDemotion() {
 void demoteState(engine::Cache &cache, uint64_t block) {
   auto transfer = std::make_shared<OffloadControl>();
   transfer->ready = true;
-  cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
+  test::publishCheckpoint(cache, block, std::make_shared<OffloadState>(transfer));
   require(cache.reclaimOneState() && cache.pollTransfers() &&
               cache.snapshot().stateCache.bytes == 0,
           "fixture state did not move to disk");
@@ -4899,7 +4902,7 @@ void testFailedDiskRestoreKeepsShallowerState() {
   require(cache.ensureTokens(999, 64).granted(), "fixture KV failed");
   static_cast<void>(cache.publishCommittedBlocks(999, prompt, 64));
   demoteState(cache, cache.blockAt(999, 64));
-  cache.publishCompositeState(cache.blockAt(999, 32), std::make_shared<State>());
+  test::publishCheckpoint(cache, cache.blockAt(999, 32), std::make_shared<State>());
   cache.endRequest(999);
   executor.restoreControl->ready = true;
   executor.restoreControl->success = false;
@@ -4929,7 +4932,7 @@ void testDiskKvPrefixIsRestoredBeforeTheLaneRuns() {
   cache.beginRequest(999);
   require(cache.ensureTokens(999, 64).granted(), "fixture KV failed");
   const auto block = cache.publishCommittedBlocks(999, prompt, 64);
-  cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
+  test::publishCheckpoint(cache, block, std::make_shared<OffloadState>(transfer));
   cache.endRequest(999);
   require(cache.reclaimOne(reuse).reclaimedBytes == 64 && cache.pollTransfers(),
           "state was not demoted");
@@ -5038,7 +5041,7 @@ void testPagesReturnFromDemotionWithoutSuspending() {
     cache.beginRequest(id);
     require(cache.ensureTokens(id, 32).granted(), "fixture KV failed");
     const auto block = cache.publishCommittedBlocks(id, prompt, 32);
-    cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
+    test::publishCheckpoint(cache, block, std::make_shared<OffloadState>(transfer));
     cache.endRequest(id);
     require(cache.reclaimOneState() && cache.pollTransfers(), "state was not demoted");
   }
@@ -5104,7 +5107,7 @@ void testWaitWithProgressOutlivesTheResourceLimit() {
     std::vector<uint32_t> filler(32, static_cast<uint32_t>(id));
     cache.beginRequest(id);
     require(cache.ensureTokens(id, 32).granted(), "filler KV failed");
-    cache.publishCompositeState(cache.publishCommittedBlocks(id, filler, 32),
+    test::publishCheckpoint(cache, cache.publishCommittedBlocks(id, filler, 32),
                                 std::make_shared<OffloadState>(transfer));
     cache.endRequest(id);
     require(cache.reclaimOneState() && cache.pollTransfers(), "filler state was not demoted");
@@ -5169,7 +5172,7 @@ void testLimitOutlivedByProgressDoesNotWakeTheLoop() {
     std::vector<uint32_t> filler(32, static_cast<uint32_t>(id));
     cache.beginRequest(id);
     require(cache.ensureTokens(id, 32).granted(), "filler KV failed");
-    cache.publishCompositeState(cache.publishCommittedBlocks(id, filler, 32),
+    test::publishCheckpoint(cache, cache.publishCommittedBlocks(id, filler, 32),
                                 std::make_shared<OffloadState>(transfer));
     cache.endRequest(id);
     require(cache.reclaimOneState() && cache.pollTransfers(), "filler state was not demoted");

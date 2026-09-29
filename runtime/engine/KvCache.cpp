@@ -258,6 +258,14 @@ uint32_t KvCache::chainLength(uint64_t blockId) const {
   return block(blockId).depth;
 }
 
+uint64_t KvCache::ancestor(uint64_t blockId, uint32_t depth) const {
+  if (!depth || depth > chainLength(blockId))
+    return 0;
+  while (block(blockId).depth > depth)
+    blockId = block(blockId).parent;
+  return blockId;
+}
+
 uint32_t KvCache::page(uint64_t blockId) const { return block(blockId).page; }
 
 std::shared_ptr<model::KvDiskSlot> KvCache::slot(uint64_t blockId) const {

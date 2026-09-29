@@ -203,7 +203,7 @@ CacheStore::CacheStore(const std::filesystem::path &path,
       "CREATE INDEX IF NOT EXISTS refs_slot ON refs(slot);");
   {
     Statement existing(db, "SELECT value=? FROM identity");
-    const std::string versioned = "splash-prefix-cache-v2-crc32c:" + identity;
+    const std::string versioned = "splash-prefix-cache-v3-groups-crc32c:" + identity;
     existing.blob(1, versioned.data(), versioned.size());
     if (existing.step()) {
       if (!existing.integer(0)) {

@@ -1,3 +1,4 @@
+#include "TestStateSnapshot.hpp"
 #include "engine/Cache.hpp"
 
 #include <cstdlib>
@@ -69,7 +70,7 @@ private:
   uint32_t maximumResidentPages_;
 };
 
-class State final : public CompositeState {
+class State final : public StatePayload {
 public:
   explicit State(uint64_t bytes) : bytes_(bytes) {}
   uint64_t bytes() const noexcept override { return bytes_; }
@@ -91,7 +92,7 @@ CacheNamespace cacheNamespace() {
 
 void publish(engine::Cache &resources, uint64_t block,
              uint64_t bytes) {
-  resources.publishCompositeState(block, std::make_shared<State>(bytes));
+  test::publishCheckpoint(resources, block, std::make_shared<State>(bytes));
 }
 
 std::vector<uint32_t> tokens(uint32_t count, uint32_t salt = 0) {

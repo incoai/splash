@@ -60,6 +60,52 @@ def comparable_message(message):
     return {**message, "content": ast.dump(tree)}
 
 
+def corrupt_component(cache_file, kind):
+    with closing(sqlite3.connect(cache_file)) as db:
+        blob = db.execute(
+            "SELECT metadata FROM prefixes ORDER BY used DESC LIMIT 1"
+        ).fetchone()[0]
+        words = struct.unpack(f"<{len(blob) // 8}Q", blob)
+        require(words[0] == 3, "unexpected persistent metadata version")
+        cursor = 3
+        group_slots = {0: [], 1: []}
+        for _ in range(words[2]):
+            group, begin, end, metadata_count, record_count = words[cursor : cursor + 5]
+            cursor += 5 + metadata_count
+            if group in group_slots:
+                group_slots[group].extend(words[cursor : cursor + 2 * record_count : 2])
+            cursor += 2 * record_count
+        group = 0 if kind == "recurrent" else 1
+        require(group_slots[group], "state component fixture is empty")
+        slot = words[cursor + 1] if kind == "target" else group_slots[group][0]
+        db.execute("UPDATE slots SET checksum=checksum+1 WHERE id=?", (slot,))
+        db.commit()
+
+
+def corrupt_group_range(cache_file):
+    # Keep the generic window coverage valid, but make one descriptor span
+    # two physical DFlash pages. The model must reject it at cache-open time.
+    with closing(sqlite3.connect(cache_file)) as db:
+        prefix, blob = db.execute(
+            "SELECT id, metadata FROM prefixes ORDER BY used DESC LIMIT 1"
+        ).fetchone()
+        words = list(struct.unpack(f"<{len(blob) // 8}Q", blob))
+        require(words[0] == 3, "unexpected persistent metadata version")
+        cursor = 3
+        for _ in range(words[2]):
+            group, begin, end, metadata_count, record_count = words[cursor : cursor + 5]
+            if group == 1 and begin >= 128 and end % 128 == 0:
+                words[cursor + 1] = begin - 128
+                db.execute(
+                    "UPDATE prefixes SET metadata=? WHERE id=?",
+                    (struct.pack(f"<{len(words)}Q", *words), prefix),
+                )
+                db.commit()
+                return
+            cursor += 5 + metadata_count + 2 * record_count
+        raise AssertionError("no complete draft page in range-corruption fixture")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--package", required=True, type=Path)
@@ -356,11 +402,7 @@ def main():
             server.close()
         # Damage the newest complete state while the database is closed. A
         # request must fall back to a healthy boundary, repair, and stay usable.
-        with closing(sqlite3.connect(args.cache_file)) as db:
-            db.execute(
-                "UPDATE slots SET checksum=checksum+1 WHERE id=(SELECT id FROM prefixes ORDER BY used DESC LIMIT 1)"
-            )
-            db.commit()
+        corrupt_component(args.cache_file, "recurrent")
         server = RealServer(args, {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"})
         try:
             server.wait_ready(180)
@@ -430,27 +472,7 @@ def main():
         finally:
             server.close()
 
-        # Component IDs come from the versioned manifest: record allocation
-        # order no longer distinguishes target KV from shared draft blocks.
-        def corrupt_component(kind):
-            with closing(sqlite3.connect(args.cache_file)) as db:
-                blob = db.execute(
-                    "SELECT metadata FROM prefixes ORDER BY used DESC LIMIT 1"
-                ).fetchone()[0]
-                words = struct.unpack(f"<{len(blob) // 8}Q", blob)
-                require(words[0] == 2, "unexpected persistent metadata version")
-                components_at = 3 + words[2]
-                require(words[components_at] > 0, "draft component fixture is empty")
-                kv_count_at = components_at + 1 + 2 * words[components_at]
-                slot = (
-                    words[components_at + 1]
-                    if kind == "draft"
-                    else words[kv_count_at + 1]
-                )
-                db.execute("UPDATE slots SET checksum=checksum+1 WHERE id=?", (slot,))
-                db.commit()
-
-        corrupt_component("draft")
+        corrupt_component(args.cache_file, "draft")
         server = RealServer(args, {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"})
         try:
             server.wait_ready(180)
@@ -472,7 +494,7 @@ def main():
             save()
         finally:
             server.close()
-        corrupt_component("target")
+        corrupt_component(args.cache_file, "target")
         server = RealServer(args, {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"})
         try:
             server.wait_ready(180)
@@ -494,6 +516,29 @@ def main():
                 > 0,
                 "corruption fixture did not exercise a failed KV restore",
             )
+            save()
+        finally:
+            server.close()
+        corrupt_group_range(args.cache_file)
+        server = RealServer(args, {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"})
+        try:
+            server.wait_ready(180)
+            _, startup = request(server.port, "GET", "/status")
+            require(
+                startup["persistent_cache"]["failures"] > 0,
+                "model-specific corrupt range was not rejected at cache open",
+            )
+            recovered = complete(server, continuation)
+            require(
+                recovered["response"]["choices"][0]["message"]
+                == expected["response"]["choices"][0]["message"],
+                "model-specific corrupt range changed completion",
+            )
+            report["range_corruption_recovery"] = {
+                "startup": startup,
+                "result": recovered,
+                "status": settle(server),
+            }
             save()
         finally:
             server.close()

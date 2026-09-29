@@ -531,7 +531,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
     auto cache = std::make_unique<engine::Cache>(*kvPool, cacheIdentity.cacheNamespace,
                                                  kvTier.get(), diskBudget);
     if (store) {
-      cache->enablePersistence({config.persistentCacheBytes, store, kvFile, stateFile,
+      cache->enablePersistence({config.persistentCacheBytes, store, kvFile,
                                 stateStorage.get()}, config.maximumCacheDiskBytes != 0);
       logKernelStartup("Restored ", cache->snapshot().persistent.restored,
                        " persistent prefixes without allocating GPU cache pages.");

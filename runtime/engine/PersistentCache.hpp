@@ -14,7 +14,6 @@ struct PersistentCacheConfig {
   uint64_t capacityBytes = 0;
   std::shared_ptr<model::CacheStore> store;
   std::shared_ptr<model::SlotFile> kvFile;
-  std::shared_ptr<model::SlotFile> stateFile;
   model::StateStorage *stateStorage = nullptr;
   uint32_t minimumTokens = 512;
   // Payload write pacing; the token bucket permits a bounded initial burst.
@@ -66,7 +65,7 @@ private:
     std::unique_ptr<model::KvTransfer> transfer;
   };
   struct Job {
-    CompositeStateLease state;
+    RestoreLease state;
     std::vector<uint64_t> blocks;
     std::vector<Copy> copies;
     std::shared_ptr<model::SlotFile::Operation> commit;
@@ -79,7 +78,7 @@ private:
   void finish();
   void remember(Entry entry);
   void forget(std::map<uint64_t, Entry>::iterator entry);
-  model::CacheStore::Prefix describe(Entry &entry, const DiskStateRecord &state,
+  model::CacheStore::Prefix describe(Entry &entry, const RestoreState &state,
                                      std::span<const uint64_t> blocks) const;
   uint64_t additionalBytes(const Entry &entry) const;
 

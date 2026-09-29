@@ -9,8 +9,8 @@
 
 #include <algorithm>
 #include <array>
-#include <cstdlib>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <span>
 #include <string_view>
@@ -42,8 +42,7 @@ public:
 private:
   QwenGdnCell(metal::MetalBackend &backend,
               std::shared_ptr<StateAllocationTracker> tracker,
-              GdnStateLayout layout,
-              std::string_view label);
+              GdnStateLayout layout, std::string_view label);
 
   std::shared_ptr<StateAllocationTracker> tracker_;
   GdnParityBuffers buffers_;
@@ -86,12 +85,6 @@ struct QwenSlotMetadata final {
 
 class QwenStateStorage;
 
-// A recurrent checkpoint and references to immutable draft context blocks.
-struct QwenCacheSlot final {
-  std::shared_ptr<QwenGdnCell> gdn;
-  DraftKvCache::Window draft;
-};
-
 // Reusable GDN cells: a lane takes two and a cached snapshot takes one.
 // Draft pages have their own reference-counted pool in DraftKvCache.
 struct QwenBufferPool final {
@@ -111,69 +104,8 @@ struct StateStaging final {
   bool busy = false;
 };
 
-// An immutable restore point owns a GDN copy and retains draft KV pages.
-// Execution copies shared draft pages before writing them; the last owner
-// returns each allocation to its pool.
-class QwenCompositeState final : public CompositeState {
-public:
-  ~QwenCompositeState() override;
-  [[nodiscard]] DiskStateRecord diskRecord() const override;
-  [[nodiscard]] bool durable() const noexcept override { return disk_ && disk_->durable(); }
-  QwenCompositeState(const QwenCompositeState &) = delete;
-  QwenCompositeState &operator=(const QwenCompositeState &) = delete;
-
-  [[nodiscard]] uint64_t bytes() const noexcept override {
-    return layout_.target.cellBytes() +
-           uint64_t{(lengths_.draftLength + DraftStateLayout::blockTokens - 1) /
-                    DraftStateLayout::blockTokens} *
-               layout_.draft.blockBytes();
-  }
-  [[nodiscard]] std::vector<StateResource> resources() const override;
-  [[nodiscard]] uint64_t offloadBytes() const noexcept override;
-  [[nodiscard]] uint64_t reclaimableBytes() const noexcept override;
-  [[nodiscard]] uint64_t residentBytes() const noexcept override {
-    return disk_ ? 0 : bytes();
-  }
-  [[nodiscard]] bool canOffload() const noexcept override {
-    return !disk_ && file_ && file_->writable() && draftFile_->writable();
-  }
-  [[nodiscard]] std::unique_ptr<StateOffload>
-  offload(std::function<void()> completion) const override;
-
-private:
-  QwenCompositeState(std::shared_ptr<QwenBufferPool> pool, QwenCacheSlot slot,
-                     CompositeStateLayout layout, QwenLogicalLengths lengths,
-                     std::shared_ptr<SlotFile> file,
-                     std::shared_ptr<SlotFile> draftFile,
-                     std::shared_ptr<StateStaging> staging);
-  QwenCompositeState(CompositeStateLayout layout, QwenLogicalLengths lengths,
-                     std::shared_ptr<SlotFile> file,
-                     std::shared_ptr<SlotFile::Slot> disk,
-                     std::shared_ptr<SlotFile> draftFile,
-                     std::vector<std::shared_ptr<SlotFile::Slot>> draftDisk);
-  // Copies the spans of one state into staging and starts the write that
-  // carries them to disk; the ticket's state() is the disk copy. Null when
-  // the tier cannot admit another state.
-  [[nodiscard]] static std::unique_ptr<StateOffload>
-  write(const std::shared_ptr<SlotFile> &file,
-        const std::shared_ptr<SlotFile> &draftFile,
-        const std::shared_ptr<StateStaging> &staging,
-        const GdnParityBuffers &gdn, const DraftKvCache::Window &blocks,
-        CompositeStateLayout layout, QwenLogicalLengths lengths,
-        std::function<void()> completion);
-
-  std::shared_ptr<QwenBufferPool> pool_;
-  QwenCacheSlot slot_;
-  CompositeStateLayout layout_;
-  QwenLogicalLengths lengths_;
-  std::shared_ptr<SlotFile> file_;
-  std::shared_ptr<StateStaging> staging_;
-  std::shared_ptr<SlotFile::Slot> disk_;
-  std::shared_ptr<SlotFile> draftFile_;
-  std::vector<std::shared_ptr<SlotFile::Slot>> draftDisk_;
-
-  friend class QwenStateStorage;
-};
+inline constexpr CacheGroupId kQwenRecurrentGroup = 0;
+inline constexpr CacheGroupId kDraftWindowGroup = 1;
 
 // Live cells retain stable backing; only idle buffers may be reclaimed.
 class QwenStateStorage final : public model::StateStorage {
@@ -184,10 +116,13 @@ public:
                    std::shared_ptr<SlotFile> file = nullptr);
 
   ~QwenStateStorage() override;
-  [[nodiscard]] std::shared_ptr<const CompositeState>
-  reopenState(DiskStateRecord record, uint64_t boundary) override;
-  [[nodiscard]] std::shared_ptr<SlotFile::Slot>
-  reopenStateComponent(CacheStore::Record record) override;
+  [[nodiscard]] std::vector<CacheGroupSpec> cacheGroups() const override {
+    return {{kQwenRecurrentGroup, CacheGroupKind::Checkpoint, 0},
+            {kDraftWindowGroup, CacheGroupKind::SlidingWindow,
+             layout_.draft.tokens}};
+  }
+  [[nodiscard]] std::shared_ptr<const StatePayload>
+  reopenState(const CachedStateBlock &block, StoredStateRecord record) override;
   QwenStateStorage(const QwenStateStorage &) = delete;
   QwenStateStorage &operator=(const QwenStateStorage &) = delete;
 
@@ -198,7 +133,8 @@ public:
   // It clears parity-zero GDN state and resets draft logical lengths; later
   // transitions overwrite the remaining data. Refusals retain their cause.
   // Release returns the lane's buffers to the pool.
-  [[nodiscard]] metal::AllocationResult tryActivateSlot(uint32_t slot, uint64_t requestId);
+  [[nodiscard]] metal::AllocationResult tryActivateSlot(uint32_t slot,
+                                                        uint64_t requestId);
   void releaseSlot(uint32_t slot, uint64_t requestId);
 
   // Returns pooled buffers beyond the kept counts to macOS. Active lanes and
@@ -222,22 +158,22 @@ public:
   // Copies committed state into a pooled or newly admitted cache slot while
   // the lane retains its own cells. Returns nullptr on capacity pressure;
   // dropping a cached state makes its slot available for retry.
-  [[nodiscard]] std::shared_ptr<const QwenCompositeState>
-  snapshot(uint32_t slot);
+  [[nodiscard]] std::shared_ptr<const RestoreState> snapshot(uint32_t slot);
   [[nodiscard]] bool canSnapshotToDisk() const noexcept {
     return file_ && file_->writable() && draftFile_->writable();
   }
   // Writes the lane's committed state to the disk tier from its own cells,
   // taking no cache slot; the ticket carries the disk copy. Null without a
   // tier that accepts writes, or when the quota cannot admit another state.
-  [[nodiscard]] std::unique_ptr<StateOffload>
+  [[nodiscard]] std::unique_ptr<SnapshotOffload>
   snapshotToDisk(uint32_t slot, std::function<void()> completion);
-  void restore(uint32_t slot, const CompositeState &state,
+  void restore(uint32_t slot, const RestoreState &state,
                bool restoreDraftState);
 
-  [[nodiscard]] std::unique_ptr<StateRestore> beginRestore(
-      uint32_t slot, const CompositeState &state, bool restoreDraftState,
-      std::function<void()> completion, std::function<void()> committed);
+  [[nodiscard]] std::unique_ptr<StateRestore>
+  beginRestore(uint32_t slot, const RestoreState &state, bool restoreDraftState,
+               std::function<void()> completion,
+               std::function<void()> committed);
 
   [[nodiscard]] uint64_t actualAllocatedBytes() const noexcept override {
     return allocations_->bytes.load(std::memory_order_relaxed);
@@ -259,16 +195,18 @@ private:
                        bool cacheSnapshot) const;
   static void requireAssigned(const Slot &slot);
   [[nodiscard]] metal::AllocationResult allocateSlot(uint32_t index);
-  [[nodiscard]] std::shared_ptr<QwenGdnCell> acquireCell(std::string_view label);
+  [[nodiscard]] std::shared_ptr<QwenGdnCell>
+  acquireCell(std::string_view label);
   [[nodiscard]] std::shared_ptr<QwenGdnCell>
   allocateGdnCell(std::string_view label,
-                    metal::AllocationFailure *failure = nullptr);
+                  metal::AllocationFailure *failure = nullptr);
   [[nodiscard]] std::shared_ptr<DFlashDraftRing>
   allocateDraftRing(std::string_view label,
                     metal::AllocationFailure *failure = nullptr);
-  void restoreLengths(uint32_t slot, QwenLogicalLengths lengths, bool restoreDraft);
-  [[nodiscard]] std::shared_ptr<const QwenCompositeState>
-  snapshot(uint32_t slot, QwenLogicalLengths lengths);
+  void restoreLengths(uint32_t slot, QwenLogicalLengths lengths,
+                      bool restoreDraft);
+  [[nodiscard]] std::shared_ptr<const RestoreState>
+  snapshot(uint32_t slot, QwenLogicalLengths lengths, bool copyGdn = true);
 
   metal::MetalBackend &backend_;
   metal::AllocationAdmission admitAllocation_;

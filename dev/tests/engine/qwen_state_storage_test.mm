@@ -209,9 +209,9 @@ void testPages(metal::MetalBackend &backend) {
   require(first && storage.actualAllocatedBytes() - before ==
                        layout.target.cellBytes(),
           "snapshot copied draft pages instead of sharing them");
-  require(first->reclaimableBytes() == layout.target.cellBytes(),
+  require(first->blocks.front().payload->reclaimableBytes() == layout.target.cellBytes(),
           "active draft pages counted as reclaimable");
-  auto write = first->offload({});
+  auto write = storage.snapshotToDisk(0, {});
   require(write && finishWhenReady(*write), "initial offload failed");
   auto disk = write->state();
   write.reset();
@@ -249,19 +249,25 @@ void testPages(metal::MetalBackend &backend) {
               storage.buffers(0).draft[0].keyPages[1]),
           "restoring a branch copied an unchanged page");
   const uint64_t written = file->writtenBytes();
-  write = next->offload({});
+  write = storage.snapshotToDisk(0, {});
   require(write && finishWhenReady(*write), "overlap offload failed");
   auto nextDisk = write->state();
   write.reset();
   require(file->writtenBytes() - written ==
               layout.target.cellBytes() + layout.draft.blockBytes(),
           "overlap offload rewrote unchanged pages");
-  auto a = disk->diskRecord(), b = nextDisk->diskRecord();
-  require(a.components.size() == 16 && b.components.size() == 16 &&
-              a.components[0] != b.components[0],
+  const auto diskPages = [](const RestoreState &state) {
+    std::array<std::shared_ptr<model::SlotFile::Slot>, 16> pages;
+    for (const auto &part : state.blocks)
+      if (part.group == model::kDraftWindowGroup)
+        pages[(part.begin / 128) % 16] = part.payload->diskRecord().slot;
+    return pages;
+  };
+  auto a = diskPages(*disk), b = diskPages(*nextDisk);
+  require(a[0] != b[0],
           "wrong disk page table");
   for (size_t i = 1; i < 16; ++i)
-    require(a.components[i] == b.components[i], "disk pages not shared");
+    require(a[i] == b[i], "disk pages not shared");
 
   // The branch has its own mutable tail; rejected/uncommitted positions are
   // not written by this fixture, just as the context commit kernel behaves.
@@ -281,8 +287,28 @@ void testPages(metal::MetalBackend &backend) {
               stateImage(storage.buffers(1)) == nextImage,
           "disk page table restore changed state bytes");
   auto promoted = restore->snapshot();
-  require(promoted && promoted->offloadBytes() == layout.target.cellBytes(),
+  require(promoted && std::all_of(promoted->blocks.begin(), promoted->blocks.end(), [](const auto &part) {
+                return part.group == model::kQwenRecurrentGroup || !part.payload->offloadBytes();
+              }),
           "promotion lost disk references");
+  restore.reset();
+  // A window assembled from independent cache entries can use the old
+  // page's suffix and a new page's prefix in the same circular slot.
+  auto fragmented = std::make_shared<RestoreState>(*next);
+  for (auto &part : fragmented->blocks)
+    if (part.group == model::kDraftWindowGroup && part.begin == 32)
+      part.payload = first->blocks[1].payload;
+  storage.restore(1, *fragmented, true);
+  require(stateImage(storage.buffers(1)) == nextImage,
+          "resident boundary fragments were not merged correctly");
+  auto fragmentedDisk = std::make_shared<RestoreState>(*nextDisk);
+  for (auto &part : fragmentedDisk->blocks)
+    if (part.group == model::kDraftWindowGroup && part.begin == 32)
+      part.payload = disk->blocks[1].payload;
+  restore = storage.beginRestore(1, *fragmentedDisk, true, {}, [] {});
+  require(restore && finishWhenReady(*restore) &&
+              stateImage(storage.buffers(1)) == nextImage,
+          "independent disk boundary fragments were not merged correctly");
   restore.reset();
   // Reuse cannot inherit the previous request's draft bytes or page identity.
   storage.releaseSlot(1, 2);
@@ -308,6 +334,7 @@ void testPages(metal::MetalBackend &backend) {
       "unaligned snapshot accepted");
   storage.releaseSlot(0, 1);
   storage.releaseSlot(1, 3);
+  fragmented.reset();
   first.reset();
   next.reset();
   promoted.reset();
@@ -459,7 +486,7 @@ void testOffloadAllocationFailure(metal::MetalBackend &backend) {
   std::vector<std::byte> bytes(layout.target.cellBytes());
   struct Result {
     bool failed;
-    std::unique_ptr<StateOffload> transfer;
+    std::unique_ptr<SnapshotOffload> transfer;
   };
   for (int failure = 0; failure < 1024; ++failure) {
     // Keep the worker behind a barrier so a submitted write cannot finish
@@ -475,7 +502,7 @@ void testOffloadAllocationFailure(metal::MetalBackend &backend) {
     auto attempt = std::async(std::launch::async, [&] {
       allocationFailureAfter = failure;
       try {
-        auto transfer = source->offload({});
+        auto transfer = storage.snapshotToDisk(0, {});
         allocationFailureAfter = -1;
         return Result{false, std::move(transfer)};
       } catch (const std::bad_alloc &) {

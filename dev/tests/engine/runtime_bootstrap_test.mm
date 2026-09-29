@@ -270,7 +270,7 @@ private:
   std::vector<bool> resident_;
 };
 
-class State final : public CompositeState {
+class State final : public StatePayload {
 public:
   uint64_t bytes() const noexcept override { return 64; }
 };
@@ -289,7 +289,7 @@ public:
   StateAdmission resume(const ModelRequest &) override {
     return {0, StateFailure::None};
   }
-  void restore(uint64_t, uint32_t, std::shared_ptr<const CompositeState>,
+  void restore(uint64_t, uint32_t, std::shared_ptr<const RestoreState>,
                      bool) override {}
   void setDraftContextPlan(uint64_t, DraftContextPlan) override {}
   std::vector<ModelStepResult> prefill(const BatchPlan &,
@@ -308,8 +308,8 @@ public:
                                      : decode(plan, items),
                                  completion);
   }
-  std::shared_ptr<const CompositeState> snapshot(uint64_t) override {
-    return std::make_shared<State>();
+  std::shared_ptr<const RestoreState> snapshot(uint64_t) override {
+    return {};
   }
   uint64_t reclaimIdleState() noexcept override { return 0; }
   void provideMask(uint64_t, std::span<const uint32_t>) override {}

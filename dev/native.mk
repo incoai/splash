@@ -36,6 +36,9 @@ CACHE_SOURCES := \
 	runtime/engine/KvPool.cpp \
 	runtime/engine/KvCache.cpp \
 	runtime/engine/StateCache.cpp \
+	runtime/engine/StateGroupCache.cpp \
+	runtime/engine/CacheGroupCoordinator.cpp \
+	runtime/model/CacheGroups.cpp \
 	runtime/engine/Cache.cpp
 BACKEND_CONTROL_SOURCES := \
 	runtime/engine/Scheduler.cpp \
@@ -47,6 +50,8 @@ NATIVE_RUNTIME_SOURCES := $(BACKEND_CONTROL_SOURCES) \
 	runtime/engine/NativeRuntime.cpp
 TEST_SLOT_FILE_ASAN := $(ENGINE_SANITIZER_BUILD)/slot-file-asan-ubsan
 TEST_SLOT_FILE_TSAN := $(ENGINE_SANITIZER_BUILD)/slot-file-tsan
+TEST_GROUPS_ASAN := $(ENGINE_SANITIZER_BUILD)/cache-groups-asan-ubsan
+TEST_GROUPS_TSAN := $(ENGINE_SANITIZER_BUILD)/cache-groups-tsan
 TEST_PERSISTENT_ASAN := $(ENGINE_SANITIZER_BUILD)/persistent-cache-asan-ubsan
 TEST_PERSISTENT_TSAN := $(ENGINE_SANITIZER_BUILD)/persistent-cache-tsan
 TEST_BACKEND_ASAN := $(ENGINE_SANITIZER_BUILD)/kv-first-engine-asan-ubsan
@@ -76,6 +81,7 @@ TEST_GGUF_DEQUANT_LIB := $(ENGINE_TEST_BUILD)/gguf-dequant.metallib
 # Every hash the weight tests compare against, and how to update them.
 WEIGHT_GOLDENS := dev/tests/fixtures/weight-goldens/goldens.json
 TEST_KV_PAGE_CACHE_TEST := $(ENGINE_TEST_BUILD)/kv-page-cache
+TEST_CACHE_GROUPS := $(ENGINE_TEST_BUILD)/cache-groups
 TEST_KV_FIRST_CACHE_TEST := $(ENGINE_TEST_BUILD)/kv-first-cache
 TEST_DRAFT_CONTEXT_PLAN_TEST := $(ENGINE_TEST_BUILD)/draft-context-plan
 TEST_RAGGED_SCHEDULER_TEST := $(ENGINE_TEST_BUILD)/ragged-scheduler
@@ -163,6 +169,7 @@ TEST_CPU_TARGETS := $(TEST_PERSISTENT_CACHE) $(TEST_SLOT_FILE) $(TEST_VISION_PRE
 	$(TEST_MEMORY_TEST) \
 	$(TEST_KV_PAGE_CACHE_TEST) \
 	$(TEST_KV_FIRST_CACHE_TEST) \
+	$(TEST_CACHE_GROUPS) \
 	$(TEST_DRAFT_CONTEXT_PLAN_TEST) \
 	$(TEST_RAGGED_SCHEDULER_TEST) \
 	$(TEST_CACHE_TEST) \
@@ -222,7 +229,7 @@ TEST_CONFIG_TARGETS := $(filter-out $(LIB),$(sort $(TEST_CPU_TARGETS) $(TEST_MET
 PRODUCTION_FLAG_TOOLS := $(TEST_Q4_PREFILL_PROFILE) $(TEST_Q4_DECODE_PROFILE) \
 	$(TEST_BACKEND_BENCHMARK) $(TUNE_KERNELS)
 PRODUCTION_CONFIG_TARGETS += $(PRODUCTION_FLAG_TOOLS)
-SANITIZER_CONFIG_TARGETS := $(TEST_PERSISTENT_ASAN) $(TEST_PERSISTENT_TSAN) $(TEST_SLOT_FILE_ASAN) $(TEST_SLOT_FILE_TSAN) \
+SANITIZER_CONFIG_TARGETS := $(TEST_GROUPS_ASAN) $(TEST_GROUPS_TSAN) $(TEST_PERSISTENT_ASAN) $(TEST_PERSISTENT_TSAN) $(TEST_SLOT_FILE_ASAN) $(TEST_SLOT_FILE_TSAN) \
 	$(TEST_BACKEND_ASAN) $(TEST_BACKEND_TSAN) \
 	$(TEST_FD_TRANSPORT_ASAN) $(TEST_FD_TRANSPORT_TSAN) \
 	$(TEST_OPERATOR_TUNING_ASAN) $(TEST_OPERATOR_TUNING_TSAN) \
@@ -315,6 +322,10 @@ $(TEST_PERSISTENT_CACHE): $(CACHE_SOURCES) dev/tests/engine/persistent_cache_tes
 
 $(TEST_CACHE_TEST): $(CACHE_SOURCES) \
 		dev/tests/engine/cache_test.cpp | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
+
+$(TEST_CACHE_GROUPS): $(CACHE_SOURCES) \
+		dev/tests/engine/cache_groups_test.cpp | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
 $(TEST_KV_FIRST_CACHE_TEST): $(CACHE_SOURCES) \
@@ -648,6 +659,7 @@ test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TUNE_KERNELS) \
 	$(TEST_MEMORY_TEST)
 	$(TEST_KV_PAGE_CACHE_TEST)
 	$(TEST_KV_FIRST_CACHE_TEST)
+	$(TEST_CACHE_GROUPS)
 	$(TEST_DRAFT_CONTEXT_PLAN_TEST)
 	$(TEST_RAGGED_SCHEDULER_TEST)
 	$(TEST_CACHE_TEST)
@@ -759,6 +771,7 @@ benchmark-backend: preflight $(TARGET) $(TEST_BACKEND_BENCHMARK) $(LIB)
 
 # CPU tests that also run under the sanitizers: each is built three times
 # from the same sources.
+$(TEST_GROUPS_ASAN) $(TEST_GROUPS_TSAN): $(CACHE_SOURCES) dev/tests/engine/cache_groups_test.cpp
 $(TEST_PERSISTENT_ASAN) $(TEST_PERSISTENT_TSAN): $(CACHE_SOURCES) dev/tests/engine/persistent_cache_test.cpp
 $(TEST_SLOT_FILE) $(TEST_SLOT_FILE_ASAN) $(TEST_SLOT_FILE_TSAN): \
 		runtime/model/SlotFile.cpp runtime/model/CacheStore.cpp dev/tests/engine/slot_file_test.cpp
@@ -791,6 +804,8 @@ ASAN_TEST_ENV := ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 \
 	UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1
 TSAN_TEST_ENV := TSAN_OPTIONS=halt_on_error=1
 test-sanitizers: $(SANITIZER_CONFIG_TARGETS)
+	$(ASAN_TEST_ENV) $(TEST_GROUPS_ASAN)
+	$(TSAN_TEST_ENV) $(TEST_GROUPS_TSAN)
 	$(ASAN_TEST_ENV) $(TEST_PERSISTENT_ASAN)
 	$(TSAN_TEST_ENV) $(TEST_PERSISTENT_TSAN)
 	$(ASAN_TEST_ENV) $(TEST_SLOT_FILE_ASAN)

@@ -247,6 +247,9 @@ ENGINE_CPP_SOURCES := \
 	runtime/engine/KvPool.cpp \
 	runtime/engine/KvCache.cpp \
 	runtime/engine/StateCache.cpp \
+	runtime/engine/StateGroupCache.cpp \
+	runtime/engine/CacheGroupCoordinator.cpp \
+	runtime/model/CacheGroups.cpp \
 	runtime/model/DraftContextPlan.cpp \
 	runtime/engine/Protocol.cpp \
 	runtime/engine/NativeRuntime.cpp \

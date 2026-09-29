@@ -10,7 +10,7 @@ namespace splash::model {
 inline constexpr uint32_t kGdnConvolutionTaps = 4;
 
 // Physical state geometry is supplied by the paired target and draft models.
-// The engine sees only opaque CompositeState handles and byte accounting.
+// The engine sees only opaque StatePayload handles and byte accounting.
 struct GdnStateLayout final {
   static constexpr uint32_t alignmentBytes = 16 * 1024;
   static constexpr uint32_t bfloat16Bytes = 2;

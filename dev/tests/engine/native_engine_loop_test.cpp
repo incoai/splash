@@ -1,3 +1,4 @@
+#include "TestStateSnapshot.hpp"
 #include "AllocationFailure.hpp"
 #include "TestImmediateTicket.hpp"
 #include "engine/Cache.hpp"
@@ -44,7 +45,7 @@ private:
   std::vector<bool> resident_;
 };
 
-class State final : public CompositeState {
+class State final : public StatePayload {
 public:
   uint64_t bytes() const noexcept override { return 64; }
 };
@@ -75,6 +76,7 @@ public:
   // Prefill chunks each request received, to prove a failure was isolated to
   // the last one rather than to a prefill that never chunked.
   std::unordered_map<uint64_t, uint32_t> prefillChunks;
+  std::unordered_map<uint64_t, uint32_t> positions_;
   uint32_t widestBatch = 0;
   void checkHealth() override {
     if (onHealthCheck)
@@ -103,7 +105,7 @@ public:
     return {{}, StateFailure::ConcurrencyLimit};
   }
   void restore(uint64_t, uint32_t length,
-                     std::shared_ptr<const CompositeState> state,
+                     std::shared_ptr<const RestoreState> state,
                      bool) override {
     if (!state)
       throw std::runtime_error("missing composite state");
@@ -115,6 +117,7 @@ public:
     std::vector<ModelStepResult> results;
     for (const auto &item : items) {
       ++prefillChunks[item.requestId];
+      positions_[item.requestId] = item.logicalPosition + item.tokenCount;
       auto found = requests_.find(item.requestId);
       const bool last =
           found != requests_.end() &&
@@ -175,8 +178,8 @@ public:
       return std::make_unique<HeldTicket>(std::move(result), ticketReady);
     return test::immediateTicket(std::move(result), completion);
   }
-  std::shared_ptr<const CompositeState> snapshot(uint64_t) override {
-    return std::make_shared<State>();
+  std::shared_ptr<const RestoreState> snapshot(uint64_t id) override {
+    return test::checkpoint(positions_.at(id), std::make_shared<State>());
   }
   uint64_t reclaimIdleState() noexcept override { return 0; }
   void provideMask(uint64_t, std::span<const uint32_t> words) override {
@@ -1124,6 +1127,7 @@ struct ScoreBesideChat final {
   uint32_t completions = 0;
   uint32_t tokens = 0;
   uint32_t scoreChunks = 0;
+  std::unordered_map<uint64_t, uint32_t> positions_;
   uint32_t widestBatch = 0;
   uint64_t failedRequest = 0;
   std::string failureCode;

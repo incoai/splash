@@ -1,3 +1,4 @@
+#include "TestStateSnapshot.hpp"
 #include "TestKvPool.hpp"
 #include "engine/Cache.hpp"
 
@@ -85,7 +86,7 @@ struct FileTier final : KvTier {
   bool copiesQueued() const noexcept override { return false; }
   void poll() override {}
 };
-struct State final : CompositeState {
+struct State final : StatePayload {
   std::shared_ptr<SlotFile> file;
   std::shared_ptr<SlotFile::Slot> slot;
   uint64_t boundary;
@@ -114,12 +115,12 @@ struct State final : CompositeState {
   offload(std::function<void()> done) const override {
     struct Ticket final : StateOffload {
       std::vector<std::byte> data;
-      std::shared_ptr<const CompositeState> snapshot;
+      std::shared_ptr<const StatePayload> snapshot;
       std::shared_ptr<SlotFile::Operation> operation;
       ~Ticket() override { operation->drain(); }
       bool ready() const noexcept override { return operation->ready(); }
       bool finish() override { return operation->wait(); }
-      const std::shared_ptr<const CompositeState> &
+      const std::shared_ptr<const StatePayload> &
       state() const noexcept override {
         return snapshot;
       }
@@ -138,21 +139,21 @@ struct State final : CompositeState {
 struct Storage final : StateStorage {
   std::shared_ptr<SlotFile> file;
   std::shared_ptr<SlotFile> componentFile;
+  std::vector<CacheGroupSpec> groups{{0}};
+  std::vector<CacheGroupSpec> cacheGroups() const override { return groups; }
   explicit Storage(std::shared_ptr<SlotFile> f)
       : file(std::move(f)), componentFile(file->sibling(unit)) {}
-  std::shared_ptr<SlotFile::Slot>
-  reopenStateComponent(CacheStore::Record record) override {
-    require(record.bytes == unit, "wrong component geometry");
-    return componentFile->reopen(record.id);
-  }
   uint64_t actualAllocatedBytes() const noexcept override { return 0; }
   uint64_t releaseIdle(uint32_t, uint32_t) noexcept override { return 0; }
-  std::shared_ptr<const CompositeState>
-  reopenState(DiskStateRecord record, uint64_t boundary) override {
-    require(record.metadata == std::vector<uint64_t>{boundary},
-            "state boundary changed");
-    return std::make_shared<State>(file, boundary, record.slot,
-                                   record.components);
+  std::shared_ptr<const StatePayload>
+  reopenState(const CachedStateBlock &, StoredStateRecord record) override {
+    require(record.metadata.size() == 1 && !record.records.empty(), "invalid test state manifest");
+    const auto boundary = record.metadata.front();
+    auto slot = file->reopen(record.records.front().id);
+    std::vector<std::shared_ptr<SlotFile::Slot>> components;
+    for (size_t i = 1; i < record.records.size(); ++i)
+      components.push_back(componentFile->reopen(record.records[i].id));
+    return std::make_shared<State>(file, boundary, std::move(slot), std::move(components));
   }
 };
 struct Fixture {
@@ -166,7 +167,8 @@ struct Fixture {
   Cache cache;
   Fixture(const std::filesystem::path &path, uint64_t durable,
           uint64_t temporary = 0, uint32_t minimumTokens = 0,
-          uint64_t writeRate = UINT64_MAX, uint64_t writeBurst = 0)
+          uint64_t writeRate = UINT64_MAX, uint64_t writeBurst = 0,
+          std::vector<CacheGroupSpec> groups = {{0}})
       : store(durable ? std::make_shared<CacheStore>(path, "test-model")
                       : nullptr),
         budget(std::make_shared<DiskBudget>(durable + temporary)),
@@ -175,10 +177,12 @@ struct Fixture {
         stateFile(std::make_shared<SlotFile>(unit, budget, path.parent_path(),
                                              store)),
         storage(stateFile), tier(kvFile), cache(pool, {}, &tier, budget) {
+    storage.groups = std::move(groups);
+    cache.configureGroups(storage.groups);
     // Small synthetic slots exercise storage mechanics independently of the
     // production admission floor. admissionFloor() exercises that policy.
     if (durable)
-      cache.enablePersistence({durable, store, kvFile, stateFile, &storage,
+      cache.enablePersistence({durable, store, kvFile, &storage,
                                minimumTokens, writeRate, writeBurst},
                               temporary != 0);
   }
@@ -198,11 +202,15 @@ struct Fixture {
     }
     static_cast<void>(cache.publishCommittedBlocks(seed, tokens, count));
     const uint64_t block = cache.blockAt(seed, count);
-    cache.publishCompositeState(block,
-                                std::make_shared<State>(stateFile, count,
-                                                        nullptr,
-                                                        std::move(components)),
-                                checkpoint);
+    auto state = std::make_shared<RestoreState>(RestoreState{count,{}});
+    for (const auto &group : storage.groups) {
+      if (group.kind == CacheGroupKind::Checkpoint)
+        state->blocks.push_back({group.id,count,count,std::make_shared<State>(stateFile,count,nullptr,components)});
+      else
+        for (uint32_t end = count, begin = count - std::min(count,group.windowTokens); end > begin; end -= 32)
+          state->blocks.push_back({group.id,end-32,end,std::make_shared<State>(stateFile,end)});
+    }
+    cache.publishCompositeState(block, std::move(state), checkpoint);
     cache.endRequest(seed);
     return block;
   }
@@ -230,6 +238,33 @@ struct Fixture {
   }
 };
 
+void genericGroups(const std::filesystem::path &directory) {
+  const std::vector<std::vector<CacheGroupSpec>> variants{
+    {}, {{19,CacheGroupKind::SlidingWindow,64}},
+    {{3},{9},{25,CacheGroupKind::SlidingWindow,64},{80,CacheGroupKind::SlidingWindow,32}}};
+  for (size_t i = 0; i < variants.size(); ++i) {
+    const auto path = directory / ("groups-" + std::to_string(i) + ".sqlite");
+    {
+      Fixture f(path, 16*unit, 0, 0, UINT64_MAX, 0, variants[i]);
+      f.publish(100); f.settle();
+      require(f.cache.snapshot().persistent.entries == 1, "generic groups were not persisted");
+    }
+    {
+      Fixture f(path, 16*unit, 0, 0, UINT64_MAX, 0, variants[i]);
+      auto hit = f.lookup(100);
+      require(hit.resumeBoundary() == 64 && f.cache.snapshot().persistent.restored == 1,
+              "generic groups failed restart without a distinguished recurrent record");
+      const auto &parts = hit.state->state()->blocks;
+      require(variants[i].empty() ? parts.empty() : !parts.empty(), "manifest lost model groups");
+      for (const auto &part : parts) {
+        std::vector<std::byte> bytes(unit);
+        require(f.stateFile->read(part.payload->diskRecord().slot, {bytes}, {})->wait() &&
+                bytes.front() == std::byte{0x5a}, "group payload failed verification after restart");
+      }
+    }
+  }
+}
+
 void sharedComponents(const std::filesystem::path &path) {
   {
     Fixture f(path, 7 * unit);
@@ -253,8 +288,8 @@ void sharedComponents(const std::filesystem::path &path) {
     auto first = f.lookup(100), second = f.lookup(200);
     require(first.resumeBoundary() == 64 && second.resumeBoundary() == 64,
             "component-backed prefixes lost their restore points");
-    auto a = first.state->state()->diskRecord(),
-         b = second.state->state()->diskRecord();
+    auto a = first.state->state()->blocks.front().payload->diskRecord(),
+         b = second.state->state()->blocks.front().payload->diskRecord();
     require(a.components.size() == 1 && a.components[0] == b.components[0],
             "reopened prefixes do not share component ownership");
   }
@@ -266,7 +301,7 @@ void sharedComponents(const std::filesystem::path &path) {
     auto hit = f.lookup(200);
     require(hit.resumeBoundary() == 64,
             "resize evicted the newest complete prefix");
-    auto record = hit.state->state()->diskRecord();
+    auto record = hit.state->state()->blocks.front().payload->diskRecord();
     std::vector<std::byte> payload(unit);
     require(f.storage.componentFile->read(record.components[0], {payload}, {})
                     ->wait() &&
@@ -391,9 +426,9 @@ void runtimeAndRestart(const std::filesystem::path &path) {
     require(second.cache.snapshot().kvCache.bytes == 0,
             "startup eagerly allocated GPU KV");
     auto hit = second.lookup(100);
-    require(hit.resumeBoundary() == 64 && !hit.state->state()->residentBytes(),
+    require(hit.resumeBoundary() == 64 && !hit.state->state()->resident(),
             "restart missed durable state");
-    auto record = hit.state->state()->diskRecord();
+    auto record = hit.state->state()->blocks.front().payload->diskRecord();
     std::vector<std::byte> state(unit);
     require(second.stateFile->read(record.slot, {state}, {})->wait(),
             "state payload failed to restore");
@@ -613,7 +648,7 @@ void crashAndIntegrity(const std::filesystem::path &path) {
   {
     Fixture f(path, 9 * unit);
     auto hit = f.lookup(500);
-    auto record = hit.state->state()->diskRecord();
+    auto record = hit.state->state()->blocks.front().payload->diskRecord();
     std::vector<std::byte> data(unit);
     require(!f.stateFile->read(record.slot, {data}, {})->wait(),
             "damaged payload silently restored");
@@ -679,7 +714,7 @@ void temporaryDuplicateBeforeDurable(const std::filesystem::path &path) {
     const auto duplicate = f.publish(200, 64, true);
     require(f.cache.reclaimOneState(), "temporary fixture did not offload");
     f.settle();
-    f.cache.publishCompositeState(
+    test::publishCheckpoint(f.cache,
         duplicate, std::make_shared<State>(f.stateFile, 64), true);
     require(f.cache.reuseCompositeState(duplicate),
             "temporary RAM copy was not reusable");
@@ -709,7 +744,7 @@ void readmitHotRam(const std::filesystem::path &path) {
             "fixture did not evict durable ownership");
     {
       auto hit = f.lookup(100);
-      require(hit.state && hit.state->state()->residentBytes(),
+      require(hit.state && hit.state->state()->resident(),
               "fixture lost hot RAM state");
       f.cache.recordLookup(hit);
     }
@@ -859,7 +894,10 @@ void interruptedPublications(const std::filesystem::path &path) {
     require(!prefixes.empty(), "interrupted write lost all committed prefixes");
     std::atomic<bool> cancelled{false};
     for (const auto &prefix : prefixes) {
-      require(f.lookup(static_cast<uint32_t>(prefix.metadata.at(9)))
+      size_t cursor = 3;
+      for (uint64_t group = 0; group < prefix.metadata.at(2); ++group)
+        cursor += 5 + prefix.metadata.at(cursor + 3) + 2 * prefix.metadata.at(cursor + 4);
+      require(f.lookup(static_cast<uint32_t>(prefix.metadata.at(cursor + 4)))
                       .resumeBoundary() == 64,
               "interrupted publication lost its graph");
       for (const auto &record : prefix.records) {
@@ -925,6 +963,7 @@ int main(int argc, char **argv) {
       _exit(0); // no destructors or exit export
     }
     Directory directory;
+    genericGroups(directory.path);
     admissionFloor(directory.path / "admission.sqlite");
     sharedComponents(directory.path / "components.sqlite");
     pressureAdmission(directory.path / "pressure.sqlite");

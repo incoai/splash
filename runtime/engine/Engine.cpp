@@ -16,6 +16,7 @@ constexpr double kHealthCheckIntervalMilliseconds = 1000.0;
 Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
                EngineEventSink &events)
     : config_(config), cache_(cache), model_(model), events_(events) {
+  cache_.configureGroups(model_.cacheGroups());
   if (!config_.maxContext || !config_.vocabularySize) {
     throw std::invalid_argument("context and vocabulary sizes must be positive");
   }
@@ -561,7 +562,7 @@ bool Engine::admit(Request &active, double now) {
       kv =
           admitGrowth([&] { return cache_.restoreRequest(requestId, lookup); });
     const bool restoring =
-        lookup.state && (!lookup.state->state()->residentBytes() ||
+        lookup.state && (!lookup.state->state()->resident() ||
                          cache_.kvRestoreStatus(requestId) == KvRestoreStatus::Pending);
     if (kv.allocation.granted() && (resuming || restoring)) {
       const uint64_t workEnd =
@@ -879,7 +880,7 @@ bool Engine::retireCheckpoint(Request &active) {
         const auto &peer = entry.second;
         return &peer != &active && !peer.finalized &&
                peer.latestCheckpoint.kvBlock == point.kvBlock &&
-               peer.latestCheckpoint.publication == point.publication;
+               peer.latestCheckpoint.groups == point.groups;
       })) {
     active.latestCheckpoint = {};
     return true;
@@ -921,7 +922,7 @@ void Engine::publishReachedStateBoundaries(Request &active,
       if (cache_.reuseCompositeState(block, checkpoint)) {
         ++counters_.deduplicatedStatePublications;
       } else {
-        std::shared_ptr<const CompositeState> state;
+        std::shared_ptr<const RestoreState> state;
         // A predicted prefix must fit without displacing known recovery
         // points. Likewise a checkpoint close to the final state is only worth
         // capturing if it fits now. Otherwise keep the previous recovery

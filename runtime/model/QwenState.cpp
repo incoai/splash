@@ -57,35 +57,161 @@ struct FileOperations final {
   }
 };
 
-class FileOffload final : public StateOffload {
+// Each payload belongs to one cache group block. Sharing a page never retains
+// a recurrent checkpoint, and a checkpoint never owns a draft window.
+class QwenStatePayload final : public StatePayload {
 public:
-  FileOffload(std::shared_ptr<FileOperations> operation,
-              std::shared_ptr<const CompositeState> state,
-              std::shared_ptr<StateStaging> staging)
-      : operation_(std::move(operation)), state_(std::move(state)),
-        staging_(std::move(staging)) {}
-  // The staging copy is the write's source until the worker has stopped.
-  ~FileOffload() override {
-    operation_.reset();
-    staging_->busy = false;
+  CacheGroupId group = 0;
+  uint64_t size = 0;
+  std::shared_ptr<QwenGdnCell> cell;
+  std::shared_ptr<QwenBufferPool> pool;
+  std::shared_ptr<DraftKvCache::Block> page;
+  std::shared_ptr<SlotFile> file;
+  std::shared_ptr<SlotFile::Slot> disk;
+  std::shared_ptr<StateStaging> staging;
+
+  ~QwenStatePayload() override {
+    if (cell && pool && pool->open)
+      pool->cells.push_back(std::move(cell));
   }
-  bool ready() const noexcept override { return operation_->ready(); }
-  bool finish() override { return operation_->finish(); }
-  const std::shared_ptr<const CompositeState> &state() const noexcept override {
+  uint64_t bytes() const noexcept override { return size; }
+  uint64_t residentBytes() const noexcept override { return disk ? 0 : size; }
+  uint64_t reclaimableBytes() const noexcept override {
+    return disk || (page && page.use_count() != 1) ? 0 : size;
+  }
+  uint64_t offloadBytes() const noexcept override {
+    return disk || (page && !page->disk.expired()) ? 0 : size;
+  }
+  bool durable() const noexcept override { return disk && disk->durable(); }
+  bool canOffload() const noexcept override {
+    return !disk && file && file->writable();
+  }
+  DiskStateRecord diskRecord() const override {
+    return {disk ? disk : page ? page->disk.lock() : nullptr, {}, {}};
+  }
+  std::vector<StateResource> resources() const override {
+    return {{disk   ? static_cast<const void *>(disk.get())
+             : page ? static_cast<const void *>(page.get())
+                    : cell.get(),
+             size}};
+  }
+  const MetalBuffer &buffer() const {
+    return page ? page->page->buffer : cell->buffers().stateBase;
+  }
+  std::unique_ptr<StateOffload>
+  offload(std::function<void()> completion) const override;
+};
+
+struct PayloadWrite final {
+  std::shared_ptr<StateStaging> staging;
+  std::shared_ptr<FileOperations> operations =
+      std::make_shared<FileOperations>();
+  std::vector<std::shared_ptr<const StatePayload>> payloads;
+  bool ownsStaging = false;
+  ~PayloadWrite() {
+    operations.reset();
+    if (ownsStaging)
+      staging->busy = false;
+  }
+};
+
+std::shared_ptr<PayloadWrite>
+writePayloads(std::span<const QwenStatePayload *const> sources,
+              const std::shared_ptr<StateStaging> &staging,
+              const std::function<void()> &completion) {
+  if (!staging)
+    return {};
+  if (staging->busy)
+    throw std::logic_error("state staging write is already in flight");
+  auto result = std::make_shared<PayloadWrite>();
+  result->staging = staging;
+  result->payloads.reserve(sources.size());
+  result->operations->items.reserve(sources.size());
+  std::vector<uint64_t> offsets;
+  offsets.reserve(sources.size());
+  uint64_t bytes = 0;
+  for (const auto *source : sources) {
+    if (!source->canOffload())
+      return {};
+    auto disk = source->page ? source->page->disk.lock() : nullptr;
+    const bool missing = !disk;
+    if (!disk)
+      disk = source->file->acquire();
+    if (!disk)
+      return {};
+    auto payload = std::make_shared<QwenStatePayload>();
+    payload->group = source->group;
+    payload->size = source->size;
+    payload->file = source->file;
+    payload->disk = std::move(disk);
+    result->payloads.push_back(std::move(payload));
+    offsets.push_back(missing ? bytes : UINT64_MAX);
+    if (missing) {
+      if (source->size > staging->size - bytes)
+        throw std::logic_error("state snapshot exceeds bounded staging");
+      std::memcpy(staging->bytes.get() + bytes, source->buffer().contents(),
+                  source->size);
+      bytes += source->size;
+    }
+  }
+  staging->busy = true;
+  result->ownsStaging = true;
+  for (size_t i = 0; i < sources.size(); ++i) {
+    const auto *source = sources[i];
+    const auto record = result->payloads[i]->diskRecord();
+    if (offsets[i] != UINT64_MAX)
+      result->operations->items.push_back(source->file->write(
+          record.slot, {{staging->bytes.get() + offsets[i], source->size}},
+          completion));
+  }
+  for (size_t i = 0; i < sources.size(); ++i)
+    if (sources[i]->page)
+      sources[i]->page->disk = result->payloads[i]->diskRecord().slot;
+  return result;
+}
+
+class PayloadOffload final : public StateOffload {
+public:
+  explicit PayloadOffload(std::shared_ptr<PayloadWrite> write)
+      : write_(std::move(write)) {}
+  bool ready() const noexcept override { return write_->operations->ready(); }
+  bool finish() override { return write_->operations->finish(); }
+  const std::shared_ptr<const StatePayload> &state() const noexcept override {
+    return write_->payloads.front();
+  }
+
+private:
+  std::shared_ptr<PayloadWrite> write_;
+};
+
+std::unique_ptr<StateOffload>
+QwenStatePayload::offload(std::function<void()> completion) const {
+  const QwenStatePayload *source = this;
+  auto write = writePayloads(std::span(&source, 1), staging, completion);
+  return write ? std::make_unique<PayloadOffload>(std::move(write)) : nullptr;
+}
+
+class FileSnapshotOffload final : public SnapshotOffload {
+public:
+  FileSnapshotOffload(std::shared_ptr<PayloadWrite> write,
+                      std::shared_ptr<const RestoreState> state)
+      : write_(std::move(write)), state_(std::move(state)) {}
+  bool ready() const noexcept override { return write_->operations->ready(); }
+  bool finish() override { return write_->operations->finish(); }
+  const std::shared_ptr<const RestoreState> &state() const noexcept override {
     return state_;
   }
 
 private:
-  std::shared_ptr<FileOperations> operation_;
-  std::shared_ptr<const CompositeState> state_;
-  std::shared_ptr<StateStaging> staging_;
+  std::shared_ptr<PayloadWrite> write_;
+  std::shared_ptr<const RestoreState> state_;
 };
 
 class FileRestore final : public StateRestore {
 public:
   FileRestore(std::shared_ptr<FileOperations> operation,
               std::function<void()> committed,
-              std::function<std::shared_ptr<const CompositeState>()> snapshot)
+              std::function<std::shared_ptr<const RestoreState>()> snapshot)
       : operation_(std::move(operation)), committed_(std::move(committed)),
         snapshot_(std::move(snapshot)) {}
   ~FileRestore() override { operation_.reset(); }
@@ -98,14 +224,14 @@ public:
     finished_ = true;
     return true;
   }
-  std::shared_ptr<const CompositeState> snapshot() override {
+  std::shared_ptr<const RestoreState> snapshot() override {
     return finished_ ? snapshot_() : nullptr;
   }
 
 private:
   std::shared_ptr<FileOperations> operation_;
   std::function<void()> committed_;
-  std::function<std::shared_ptr<const CompositeState>()> snapshot_;
+  std::function<std::shared_ptr<const RestoreState>()> snapshot_;
   bool finished_ = false;
 };
 
@@ -149,188 +275,6 @@ QwenGdnCell::QwenGdnCell(metal::MetalBackend &backend,
 
 QwenGdnCell::~QwenGdnCell() {
   tracker_->bytes.fetch_sub(actualAllocatedBytes_, std::memory_order_relaxed);
-}
-
-QwenCompositeState::QwenCompositeState(std::shared_ptr<QwenBufferPool> pool,
-                                       QwenCacheSlot slot,
-                                       CompositeStateLayout layout,
-                                       QwenLogicalLengths lengths,
-                                       std::shared_ptr<SlotFile> file,
-                                       std::shared_ptr<SlotFile> draftFile,
-                                       std::shared_ptr<StateStaging> staging)
-    : pool_(std::move(pool)), slot_(std::move(slot)), layout_(layout),
-      lengths_(lengths), file_(std::move(file)), staging_(std::move(staging)),
-      draftFile_(std::move(draftFile)) {
-  if (!pool_ || !slot_.gdn || slot_.draft.empty()) {
-    throw std::invalid_argument("composite state buffers are empty");
-  }
-}
-
-QwenCompositeState::QwenCompositeState(
-    CompositeStateLayout layout, QwenLogicalLengths lengths,
-    std::shared_ptr<SlotFile> file, std::shared_ptr<SlotFile::Slot> disk,
-    std::shared_ptr<SlotFile> draftFile,
-    std::vector<std::shared_ptr<SlotFile::Slot>> draftDisk)
-    : layout_(layout), lengths_(lengths), file_(std::move(file)),
-      disk_(std::move(disk)), draftFile_(std::move(draftFile)),
-      draftDisk_(std::move(draftDisk)) {}
-
-DiskStateRecord QwenCompositeState::diskRecord() const {
-  DiskStateRecord result{disk_,
-                         {lengths_.targetTokens, lengths_.draftBase,
-                          lengths_.draftLength, lengths_.draftCommitCursor},
-                         draftDisk_};
-  if (!disk_)
-    for (const auto &block : slot_.draft)
-      result.components.push_back(block->disk.lock());
-  return result;
-}
-
-uint64_t QwenCompositeState::reclaimableBytes() const noexcept {
-  if (disk_)
-    return 0;
-  uint64_t bytes = layout_.target.cellBytes();
-  for (const auto &block : slot_.draft)
-    if (block.use_count() == 1)
-      bytes += layout_.draft.blockBytes();
-  return bytes;
-}
-
-uint64_t QwenCompositeState::offloadBytes() const noexcept {
-  if (disk_)
-    return 0;
-  uint64_t bytes = layout_.target.cellBytes();
-  for (const auto &block : slot_.draft)
-    if (block->disk.expired())
-      bytes += layout_.draft.blockBytes();
-  return bytes;
-}
-
-std::vector<StateResource> QwenCompositeState::resources() const {
-  std::vector<StateResource> result;
-  if (disk_) {
-    result.push_back({disk_.get(), disk_->bytes()});
-    for (const auto &block : draftDisk_)
-      result.push_back({block.get(), block->bytes()});
-  } else {
-    result.push_back({slot_.gdn.get(), layout_.target.cellBytes()});
-    for (const auto &block : slot_.draft)
-      result.push_back({block.get(), layout_.draft.blockBytes()});
-  }
-  return result;
-}
-
-std::shared_ptr<SlotFile::Slot>
-QwenStateStorage::reopenStateComponent(CacheStore::Record record) {
-  if (!draftFile_ || record.bytes != layout_.draft.blockBytes())
-    throw std::invalid_argument("invalid persistent draft block size");
-  return draftFile_->reopen(record.id);
-}
-
-std::shared_ptr<const CompositeState>
-QwenStateStorage::reopenState(DiskStateRecord record, uint64_t boundary) {
-  if (!file_ || !record.slot || record.metadata.size() != 4 ||
-      record.metadata[0] != boundary || record.metadata[1] > boundary ||
-      record.metadata[2] > boundary - record.metadata[1] ||
-      record.metadata[2] > UINT32_MAX || record.metadata[3] > UINT32_MAX)
-    throw std::invalid_argument("invalid persistent state metadata");
-  QwenLogicalLengths lengths{record.metadata[0], record.metadata[1],
-                             static_cast<uint32_t>(record.metadata[2]),
-                             static_cast<uint32_t>(record.metadata[3])};
-  validateLengths(lengths, true);
-  if (record.slot->bytes() != layout_.target.cellBytes() ||
-      record.components.size() !=
-          (lengths.draftLength + DraftStateLayout::blockTokens - 1) /
-              DraftStateLayout::blockTokens)
-    throw std::invalid_argument("incomplete persistent draft window");
-  for (const auto &block : record.components)
-    if (!block || block->bytes() != layout_.draft.blockBytes())
-      throw std::invalid_argument("invalid persistent draft block");
-  return std::shared_ptr<const CompositeState>(
-      new QwenCompositeState(layout_, lengths, file_, std::move(record.slot),
-                             draftFile_, std::move(record.components)));
-}
-
-std::unique_ptr<StateOffload>
-QwenCompositeState::offload(std::function<void()> completion) const {
-  if (!canOffload())
-    return {};
-  return write(file_, draftFile_, staging_, slot_.gdn->buffers(), slot_.draft,
-               layout_, lengths_, std::move(completion));
-}
-
-std::unique_ptr<StateOffload> QwenCompositeState::write(
-    const std::shared_ptr<SlotFile> &file,
-    const std::shared_ptr<SlotFile> &draftFile,
-    const std::shared_ptr<StateStaging> &staging, const GdnParityBuffers &gdn,
-    const DraftKvCache::Window &blocks, CompositeStateLayout layout,
-    QwenLogicalLengths lengths, std::function<void()> completion) {
-  if (staging->busy)
-    throw std::logic_error("a composite state write is already in flight");
-  auto disk = file->acquire();
-  if (!disk)
-    return {};
-  const size_t count =
-      (lengths.draftLength + DraftStateLayout::blockTokens - 1) /
-      DraftStateLayout::blockTokens;
-  std::vector<std::shared_ptr<SlotFile::Slot>> draftDisk;
-  std::vector<bool> writeBlock;
-  draftDisk.reserve(count);
-  writeBlock.reserve(count);
-  // Reserve the whole transfer before submitting IO. Failure leaves no
-  // partially admitted state and returns every newly reserved slot.
-  for (size_t i = 0; i < count; ++i) {
-    auto slot = blocks[i]->disk.lock();
-    writeBlock.push_back(!slot);
-    if (!slot)
-      slot = draftFile->acquire();
-    if (!slot)
-      return {};
-    draftDisk.push_back(std::move(slot));
-  }
-  auto result =
-      std::shared_ptr<const QwenCompositeState>(new QwenCompositeState(
-          layout, lengths, file, disk, draftFile, draftDisk));
-  auto operations = std::make_shared<FileOperations>();
-  operations->items.reserve(count + 1);
-  std::memcpy(staging->bytes.get(), gdn.stateBase.contents(),
-              layout.target.cellBytes());
-  auto *draft = staging->bytes.get() + layout.target.cellBytes();
-  for (size_t i = 0; i < count; ++i) {
-    if (!writeBlock[i])
-      continue;
-    auto bytes = std::span(draft + i * layout.draft.blockBytes(),
-                           layout.draft.blockBytes());
-    std::memcpy(bytes.data(), blocks[i]->page->buffer.contents(), bytes.size());
-  }
-  staging->busy = true;
-  try {
-    operations->items.push_back(file->write(
-        disk, {{staging->bytes.get(), layout.target.cellBytes()}}, completion));
-    for (size_t i = 0; i < count; ++i) {
-      if (writeBlock[i])
-        operations->items.push_back(
-            draftFile->write(draftDisk[i],
-                             {{draft + i * layout.draft.blockBytes(),
-                               layout.draft.blockBytes()}},
-                             completion));
-    }
-    auto ticket =
-        std::make_unique<FileOffload>(operations, std::move(result), staging);
-    for (size_t i = 0; i < count; ++i)
-      blocks[i]->disk = draftDisk[i];
-    return ticket;
-  } catch (...) {
-    operations.reset();
-    staging->busy = false;
-    throw;
-  }
-}
-
-QwenCompositeState::~QwenCompositeState() {
-  if (!pool_ || !pool_->open)
-    return;
-  pool_->cells.push_back(std::move(slot_.gdn));
 }
 
 QwenStateStorage::QwenStateStorage(metal::MetalBackend &backend,
@@ -471,47 +415,114 @@ void QwenStateStorage::swapParity(uint32_t index) {
   current.metadata.activeParity ^= 1;
 }
 
-std::shared_ptr<const QwenCompositeState>
-QwenStateStorage::snapshot(uint32_t index) {
+std::shared_ptr<const StatePayload>
+QwenStateStorage::reopenState(const CachedStateBlock &block,
+                              StoredStateRecord record) {
+  const auto group = block.group;
+  if (group == kDraftWindowGroup &&
+      (block.begin >= block.end ||
+       block.begin / DraftStateLayout::blockTokens !=
+           (block.end - 1) / DraftStateLayout::blockTokens))
+    throw std::invalid_argument(
+        "persistent draft fragment crosses a physical page");
+  const auto file = group == kQwenRecurrentGroup ? file_
+                    : group == kDraftWindowGroup ? draftFile_
+                                                 : nullptr;
+  if (!file || record.records.size() != 1 ||
+      record.records.front().bytes != file->slotBytes() ||
+      !record.metadata.empty())
+    throw std::invalid_argument("invalid persistent cache group payload");
+  auto payload = std::make_shared<QwenStatePayload>();
+  payload->group = group;
+  payload->size = file->slotBytes();
+  payload->file = file;
+  payload->disk = file->reopen(record.records.front().id);
+  if (!payload->disk)
+    throw std::invalid_argument("cannot reopen cache group record");
+  return payload;
+}
+
+std::shared_ptr<const RestoreState> QwenStateStorage::snapshot(uint32_t index) {
   return snapshot(index, slot(index).metadata.lengths);
 }
 
-std::shared_ptr<const QwenCompositeState>
-QwenStateStorage::snapshot(uint32_t index, QwenLogicalLengths lengths) {
+std::shared_ptr<const RestoreState>
+QwenStateStorage::snapshot(uint32_t index, QwenLogicalLengths lengths,
+                           bool copyGdn) {
   Slot &source = slot(index);
   requireAssigned(source);
   validateLengths(lengths, true);
-  // Pooled buffers first; a denied admission puts a pooled cell back and
-  // drops a fresh one, leaving no trace.
-  QwenCacheSlot cacheSlot;
-  cacheSlot.gdn = acquireCell("qwen-state-cache-gdn");
-  if (!cacheSlot.gdn)
-    return nullptr;
-  const size_t count =
-      (lengths.draftLength + DraftStateLayout::blockTokens - 1) /
-      DraftStateLayout::blockTokens;
-  cacheSlot.draft.assign(source.draft->pages.begin(),
-                         source.draft->pages.begin() + count);
-  const uint32_t active = source.metadata.activeParity;
-  copyExact(cacheSlot.gdn->buffers().stateBase,
-            source.gdn[active]->buffers().stateBase, "cached GDN state");
-  return std::shared_ptr<const QwenCompositeState>(
-      new QwenCompositeState(pool_, std::move(cacheSlot), layout_, lengths,
-                             file_, draftFile_, staging_));
+  auto result = std::make_shared<RestoreState>();
+  result->boundary = lengths.targetTokens;
+  result->blocks.reserve(2 +
+                         layout_.draft.tokens / DraftStateLayout::blockTokens);
+  auto recurrent = std::make_shared<QwenStatePayload>();
+  recurrent->group = kQwenRecurrentGroup;
+  recurrent->size = layout_.target.cellBytes();
+  recurrent->file = file_;
+  recurrent->staging = staging_;
+  if (copyGdn) {
+    recurrent->cell = acquireCell("qwen-state-cache-gdn");
+    if (!recurrent->cell)
+      return {};
+    recurrent->pool = pool_;
+    copyExact(recurrent->cell->buffers().stateBase,
+              source.gdn[source.metadata.activeParity]->buffers().stateBase,
+              "cached recurrent state");
+  } else {
+    recurrent->cell = source.gdn[source.metadata.activeParity];
+  }
+  result->blocks.push_back({kQwenRecurrentGroup, result->boundary,
+                            result->boundary, std::move(recurrent)});
+  const uint32_t pageTokens = DraftStateLayout::blockTokens;
+  const uint32_t pages = layout_.draft.tokens / pageTokens;
+  std::vector<std::shared_ptr<const StatePayload>> payloads(pages);
+  for (uint32_t begin = lengths.draftBase; begin < result->boundary;) {
+    const uint32_t end = std::min<uint64_t>(
+        result->boundary, (uint64_t{begin} / pageTokens + 1) * pageTokens);
+    const uint32_t physical = (begin / pageTokens) % pages;
+    auto &payload = payloads[physical];
+    if (!payload) {
+      auto draft = std::make_shared<QwenStatePayload>();
+      draft->group = kDraftWindowGroup;
+      draft->size = layout_.draft.blockBytes();
+      draft->file = draftFile_;
+      draft->staging = staging_;
+      draft->page = source.draft->pages[physical];
+      payload = std::move(draft);
+    }
+    result->blocks.push_back({kDraftWindowGroup, begin, end, payload});
+    begin = end;
+  }
+  return result;
 }
 
-std::unique_ptr<StateOffload>
+std::unique_ptr<SnapshotOffload>
 QwenStateStorage::snapshotToDisk(uint32_t index,
                                  std::function<void()> completion) {
-  Slot &source = slot(index);
-  requireAssigned(source);
-  validateLengths(source.metadata.lengths, true);
   if (!canSnapshotToDisk())
     return {};
-  return QwenCompositeState::write(
-      file_, draftFile_, staging_,
-      source.buffers.gdn[source.metadata.activeParity], source.draft->pages,
-      layout_, source.metadata.lengths, std::move(completion));
+  auto source = snapshot(index, slot(index).metadata.lengths, false);
+  std::vector<const QwenStatePayload *> unique;
+  std::vector<size_t> indices;
+  unique.reserve(source->blocks.size());
+  indices.reserve(source->blocks.size());
+  for (const auto &block : source->blocks) {
+    const auto *payload =
+        static_cast<const QwenStatePayload *>(block.payload.get());
+    const auto found = std::find(unique.begin(), unique.end(), payload);
+    indices.push_back(found - unique.begin());
+    if (found == unique.end())
+      unique.push_back(payload);
+  }
+  auto write = writePayloads(unique, staging_, completion);
+  if (!write)
+    return {};
+  auto state = std::make_shared<RestoreState>(*source);
+  for (size_t i = 0; i < state->blocks.size(); ++i)
+    state->blocks[i].payload = write->payloads[indices[i]];
+  return std::make_unique<FileSnapshotOffload>(std::move(write),
+                                               std::move(state));
 }
 
 std::shared_ptr<QwenGdnCell>
@@ -523,103 +534,231 @@ QwenStateStorage::acquireCell(std::string_view label) {
   return cell;
 }
 
-void QwenStateStorage::restore(uint32_t index, const CompositeState &state,
-                               bool restoreDraftState) {
-  const auto *typed = dynamic_cast<const QwenCompositeState *>(&state);
-  if (!typed) {
-    throw std::invalid_argument("composite state is not Qwen state");
-  }
-  if (typed->layout_ != layout_) {
-    throw std::invalid_argument("composite state layout does not match model");
-  }
-  validateLengths(typed->lengths_, true);
-  Slot &destination = slot(index);
-  requireAssigned(destination);
-  if (!typed->slot_.gdn || typed->slot_.draft.empty()) {
-    throw std::invalid_argument("incompatible Qwen composite state");
-  }
+namespace {
+struct DraftFragment final {
+  uint32_t begin, end;
+  std::shared_ptr<DraftKvCache::Block> page;
+};
 
-  DraftKvCache::Window pages;
-  std::vector<DFlashDraftRingLayer> views;
-  if (restoreDraftState) {
-    pages = destination.draft->pages;
-    std::copy(typed->slot_.draft.begin(), typed->slot_.draft.end(),
-              pages.begin());
-    views = draftCache_.views(pages);
+void copyDraftSlice(const MetalBuffer &destination, const MetalBuffer &source,
+                    DraftStateLayout layout, uint32_t begin, uint32_t end) {
+  if (destination.contents() == source.contents())
+    return;
+  const uint32_t first = begin % layout.blockTokens;
+  const uint32_t count = end - begin;
+  if (!count || count > layout.blockTokens - first)
+    throw std::logic_error("draft fragment crosses a page");
+  auto *dst = static_cast<std::byte *>(destination.contents());
+  const auto *src = static_cast<const std::byte *>(source.contents());
+  const uint64_t tensor =
+      uint64_t{layout.kvHeads} * layout.blockTokens * layout.headDimension * 2;
+  for (uint32_t layer = 0; layer < layout.layers; ++layer) {
+    for (uint32_t head = 0; head < layout.kvHeads; ++head) {
+      const uint64_t offset =
+          layer * 2 * tensor + (uint64_t{head} * layout.blockTokens + first) *
+                                   layout.headDimension * 2;
+      std::memcpy(dst + offset, src + offset,
+                  uint64_t{count} * layout.headDimension * 2);
+    }
+    for (uint32_t row = 0; row < layout.kvHeads * layout.headDimension; ++row) {
+      const uint64_t offset = (layer * 2 + 1) * tensor +
+                              (uint64_t{row} * layout.blockTokens + first) * 2;
+      std::memcpy(dst + offset, src + offset, uint64_t{count} * 2);
+    }
   }
-  const uint32_t active = destination.metadata.activeParity;
-  copyExact(destination.gdn[active]->buffers().stateBase,
-            typed->slot_.gdn->buffers().stateBase, "restored GDN state");
-  if (restoreDraftState) {
-    destination.draft->pages = std::move(pages);
-    destination.buffers.draft = std::move(views);
-  }
-  restoreLengths(index, typed->lengths_, restoreDraftState);
+}
+} // namespace
+
+void QwenStateStorage::restore(uint32_t index, const RestoreState &state,
+                               bool restoreDraftState) {
+  if (!state.resident())
+    throw std::invalid_argument("synchronous restore needs resident state");
+  auto transfer = beginRestore(index, state, restoreDraftState, {}, [] {});
+  if (transfer && !transfer->finish())
+    throw std::runtime_error("resident state restore failed");
 }
 
 void QwenStateStorage::restoreLengths(uint32_t index,
                                       QwenLogicalLengths lengths,
                                       bool restoreDraftState) {
-  Slot &destination = slot(index);
   if (!restoreDraftState) {
     lengths.draftBase = lengths.targetTokens;
     lengths.draftLength = 0;
     lengths.draftCommitCursor = lengths.targetTokens % layout_.draft.tokens;
   }
-  destination.metadata.lengths = lengths;
+  slot(index).metadata.lengths = lengths;
 }
 
 std::unique_ptr<StateRestore> QwenStateStorage::beginRestore(
-    uint32_t index, const CompositeState &state, bool restoreDraftState,
+    uint32_t index, const RestoreState &state, bool restoreDraftState,
     std::function<void()> completion, std::function<void()> committed) {
-  const auto *typed = dynamic_cast<const QwenCompositeState *>(&state);
-  if (!typed || typed->layout_ != layout_)
-    throw std::invalid_argument("incompatible Qwen composite state");
-  if (!typed->disk_) {
-    restore(index, state, restoreDraftState);
-    committed();
-    return {};
-  }
-  validateLengths(typed->lengths_, true);
   Slot &destination = slot(index);
   requireAssigned(destination);
-  // Read only the components execution needs. A skipped draft window cannot
-  // be promoted as a complete RAM state; the durable copy remains reusable.
-  if (restoreDraftState) {
-    if (auto admitted = prepareDraftWrite(index, 0, layout_.draft.tokens);
-        !admitted)
-      throw metal::MetalAllocationError("cannot admit draft restore pages",
-                                        admitted.failure);
+  const uint32_t boundary = state.boundary;
+  const uint32_t begin = boundary - std::min(boundary, layout_.draft.tokens);
+  QwenLogicalLengths lengths{boundary, begin, boundary - begin,
+                             boundary % layout_.draft.tokens};
+  validateLengths(lengths, true);
+  std::shared_ptr<const QwenStatePayload> recurrent;
+  std::vector<CachedStateBlock> draft;
+  for (const auto &part : state.blocks) {
+    auto payload =
+        std::dynamic_pointer_cast<const QwenStatePayload>(part.payload);
+    if (!payload || payload->group != part.group)
+      throw std::invalid_argument("incompatible model cache group payload");
+    if (part.group == kQwenRecurrentGroup) {
+      if (recurrent || part.begin != boundary || part.end != boundary ||
+          payload->size != layout_.target.cellBytes())
+        throw std::invalid_argument("invalid recurrent checkpoint");
+      recurrent = std::move(payload);
+    } else if (part.group == kDraftWindowGroup) {
+      if (part.begin >= part.end || part.end > boundary ||
+          part.begin / DraftStateLayout::blockTokens !=
+              (part.end - 1) / DraftStateLayout::blockTokens ||
+          payload->size != layout_.draft.blockBytes())
+        throw std::invalid_argument("invalid draft cache fragment");
+      draft.push_back(part);
+    } else {
+      throw std::invalid_argument("unknown model cache group");
+    }
   }
+  if (!recurrent)
+    throw std::invalid_argument("missing recurrent checkpoint");
+  std::sort(draft.begin(), draft.end(),
+            [](const auto &a, const auto &b) { return a.begin < b.begin; });
+  uint32_t covered = begin;
+  for (const auto &part : draft) {
+    if (part.begin > covered || part.end <= covered)
+      throw std::invalid_argument("draft window has a hole or overlap");
+    covered = part.end;
+  }
+  if (covered != boundary)
+    throw std::invalid_argument("incomplete draft window");
+
+  const uint32_t pageTokens = DraftStateLayout::blockTokens;
+  const uint32_t pageCount = layout_.draft.tokens / pageTokens;
+  std::vector<std::vector<CachedStateBlock>> slices(pageCount);
+  if (restoreDraftState)
+    for (const auto &part : draft)
+      slices[(part.begin / pageTokens) % pageCount].push_back(part);
+  // Only disk destinations and boundary merges write execution backing. Full
+  // resident pages stay shared without a copy or a fresh allocation.
+  for (uint32_t page = 0; page < pageCount; ++page) {
+    const auto &parts = slices[page];
+    if (parts.empty())
+      continue;
+    const auto &first =
+        static_cast<const QwenStatePayload &>(*parts.front().payload);
+    const bool writes =
+        first.disk ||
+        std::any_of(parts.begin(), parts.end(), [&](const auto &part) {
+          const auto &payload =
+              static_cast<const QwenStatePayload &>(*part.payload);
+          return payload.disk || payload.page != first.page;
+        });
+    if (writes) {
+      const auto admission =
+          prepareDraftWrite(index, page * pageTokens, (page + 1) * pageTokens);
+      if (!admission)
+        throw metal::MetalAllocationError("cannot admit draft restore page",
+                                          admission.failure);
+    }
+  }
+  DraftKvCache::AllocationScope allocation(draftCache_);
   auto operations = std::make_shared<FileOperations>();
-  operations->items.reserve(typed->draftDisk_.size() + 1);
-  auto commit = [this, index, lengths = typed->lengths_, restoreDraftState,
-                 blocks = typed->draftDisk_, committed = std::move(committed)] {
-    if (restoreDraftState)
-      for (size_t i = 0; i < blocks.size(); ++i)
-        slot(index).draft->pages[i]->disk = blocks[i];
+  operations->items.reserve(1 + draft.size());
+  auto pages = destination.draft->pages;
+  std::vector<DraftFragment> fragments;
+  struct Read {
+    const QwenStatePayload *payload;
+    MetalBuffer buffer;
+  };
+  std::vector<Read> reads;
+  reads.reserve(1 + draft.size());
+  const MetalBuffer gdn =
+      destination.buffers.gdn[destination.metadata.activeParity].stateBase;
+  if (recurrent->disk)
+    reads.push_back({recurrent.get(), gdn});
+  for (uint32_t physical = 0; physical < pageCount; ++physical) {
+    std::vector<std::pair<const void *, std::shared_ptr<DraftKvCache::Block>>>
+        sources;
+    for (const auto &part : slices[physical]) {
+      const auto &payload =
+          static_cast<const QwenStatePayload &>(*part.payload);
+      const void *identity = payload.disk
+                                 ? static_cast<const void *>(payload.disk.get())
+                                 : payload.page.get();
+      const auto found =
+          std::find_if(sources.begin(), sources.end(), [&](const auto &source) {
+            return source.first == identity;
+          });
+      std::shared_ptr<DraftKvCache::Block> page;
+      if (found != sources.end()) {
+        page = found->second;
+      } else if (!payload.disk) {
+        page = payload.page;
+      } else {
+        if (sources.empty())
+          page = destination.draft->pages[physical];
+        else {
+          metal::AllocationFailure failure = metal::AllocationFailure::None;
+          page = draftCache_.acquire(&failure);
+          if (!page)
+            throw metal::MetalAllocationError("cannot admit boundary fragment",
+                                              failure);
+        }
+        reads.push_back({&payload, page->page->buffer});
+        page->disk = payload.disk;
+      }
+      if (found == sources.end())
+        sources.emplace_back(identity, page);
+      fragments.push_back(
+          {std::max(begin, part.begin), part.end, std::move(page)});
+    }
+    if (sources.size() == 1)
+      pages[physical] = sources.front().second;
+    // Different fragments sharing a circular slot merge into its private
+    // execution page, never into an immutable cached source.
+    if (sources.size() > 1)
+      pages[physical]->disk.reset();
+  }
+  auto views = draftCache_.views(pages);
+  auto commit = [this, index, lengths, restoreDraftState, recurrent, gdn,
+                 pages = std::move(pages), views = std::move(views),
+                 fragments = std::move(fragments),
+                 committed = std::move(committed)]() mutable {
+    if (!recurrent->disk)
+      copyExact(gdn, recurrent->buffer(), "restored recurrent checkpoint");
+    if (restoreDraftState) {
+      for (const auto &fragment : fragments) {
+        const auto physical =
+            (fragment.begin / DraftStateLayout::blockTokens) % pages.size();
+        copyDraftSlice(pages[physical]->page->buffer,
+                       fragment.page->page->buffer, layout_.draft,
+                       fragment.begin, fragment.end);
+      }
+      slot(index).draft->pages = std::move(pages);
+      slot(index).buffers.draft = std::move(views);
+    }
     restoreLengths(index, lengths, restoreDraftState);
     committed();
   };
-  auto snapshot = [this, index, lengths = typed->lengths_, restoreDraftState] {
+  auto snapshot = [this, index, lengths, restoreDraftState] {
     return restoreDraftState ? this->snapshot(index, lengths) : nullptr;
   };
   auto ticket = std::make_unique<FileRestore>(operations, std::move(commit),
                                               std::move(snapshot));
-  const auto &gdn =
-      destination.buffers.gdn[destination.metadata.activeParity].stateBase;
-  operations->items.push_back(typed->file_->read(
-      typed->disk_,
-      {{static_cast<std::byte *>(gdn.contents()), gdn.sizeBytes()}},
-      completion));
-  if (restoreDraftState)
-    for (size_t i = 0; i < typed->draftDisk_.size(); ++i) {
-      const auto &buffer = destination.draft->pages[i]->page->buffer;
-      operations->items.push_back(typed->draftFile_->read(
-          typed->draftDisk_[i],
-          {{static_cast<std::byte *>(buffer.contents()), buffer.sizeBytes()}},
-          completion));
-    }
+  for (const auto &read : reads)
+    operations->items.push_back(read.payload->file->read(
+        read.payload->disk,
+        {{static_cast<std::byte *>(read.buffer.contents()),
+          read.buffer.sizeBytes()}},
+        completion));
+  allocation.commit();
+  if (reads.empty()) {
+    static_cast<void>(ticket->finish());
+    return {};
+  }
   return ticket;
 }
 

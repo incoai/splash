@@ -198,7 +198,7 @@ void beginCold(model::Runtime &runtime, const EngineRequest &request,
 
 void restoreActivePrefix(model::Runtime &executor, uint64_t requestId,
                          uint32_t promptTokens, uint32_t boundary,
-                         const std::shared_ptr<const CompositeState> &state) {
+                         const std::shared_ptr<const RestoreState> &state) {
   executor.restore(requestId, boundary, state, true);
   executor.setDraftContextPlan(
       requestId, planDraftContext(boundary, promptTokens, boundary, {}));
@@ -1032,7 +1032,7 @@ int main(int argc, char **argv) {
 
     const uint64_t predictedPromptSnapshotBytes =
         model.stateLayout().cachedBytes();
-    std::shared_ptr<const CompositeState> promptSnapshot =
+    std::shared_ptr<const RestoreState> promptSnapshot =
         executor.snapshot(1);
     require(promptSnapshot != nullptr,
             "prompt snapshot allocation failed");
@@ -1195,7 +1195,7 @@ int main(int argc, char **argv) {
     prefillChunk(executor, 54, 0, 120, 120,
                  std::span<const uint32_t>(promptAligned).subspan(120, 8),
                  policyPages, BatchCohort::Sampling);
-    std::shared_ptr<const CompositeState> partitionedSamplingSnapshot =
+    std::shared_ptr<const RestoreState> partitionedSamplingSnapshot =
         executor.snapshot(54);
     require(partitionedSamplingSnapshot != nullptr,
             "partitioned sampling snapshot allocation failed");
@@ -1399,7 +1399,7 @@ int main(int argc, char **argv) {
     prefillChunk(executor, 30, 0, 120, 120,
                  std::span<const uint32_t>(samplingPrefix).subspan(120, 8),
                  samplingPages, BatchCohort::Sampling);
-    std::shared_ptr<const CompositeState> samplingPromptSnapshot =
+    std::shared_ptr<const RestoreState> samplingPromptSnapshot =
         executor.snapshot(30);
     require(samplingPromptSnapshot != nullptr,
             "sampling snapshot allocation failed");
@@ -1775,7 +1775,7 @@ int main(int argc, char **argv) {
     beginCold(executor, makeRequest(70, productionPrefix, 16), 0);
     const std::vector<uint32_t> productionPages{48, 49, 50, 51};
     prefillChunk(executor, 70, 0, 0, 0, productionPrefix, productionPages);
-    std::shared_ptr<const CompositeState> productionSnapshot =
+    std::shared_ptr<const RestoreState> productionSnapshot =
         executor.snapshot(70);
     require(productionSnapshot != nullptr,
             "production snapshot allocation failed");

@@ -7,58 +7,120 @@
 
 namespace splash::engine {
 namespace {
-constexpr uint64_t metadataVersion = 2;
+constexpr uint64_t metadataVersion = 3;
 constexpr size_t blockWords = KvCache::pageTokens + 3;
+struct DecodedState {
+  CachedStateBlock block;
+  std::vector<uint64_t> metadata;
+  std::vector<model::CacheStore::Record> records;
+};
 struct Decoded {
-  uint64_t stateId;
-  std::vector<uint64_t> state;
+  std::vector<DecodedState> states;
   std::span<const uint64_t> blocks;
-  std::vector<model::CacheStore::Record> components;
 };
 Decoded decode(const model::CacheStore::Prefix &prefix, uint64_t kvBytes,
-               uint64_t stateBytes) {
+               std::span<const CacheGroupSpec> groups) {
   const auto &data = prefix.metadata;
-  if (data.size() < 5 || data[0] != metadataVersion || data[1] != prefix.id ||
-      data[2] > 64 || data.size() < data[2] + 4)
-    throw std::runtime_error("invalid persistent prefix metadata");
-  const size_t componentsAt = 3 + data[2];
-  if (data.size() <= componentsAt + 1 || data[componentsAt] > 4096 ||
-      data[componentsAt] > (data.size() - componentsAt - 2) / 2)
-    throw std::runtime_error("invalid persistent state components");
-  const size_t countAt = componentsAt + 1 + 2 * data[componentsAt];
-  const uint64_t count = data[countAt];
-  if (!count || count > UINT32_MAX / KvCache::pageTokens ||
-      count != (data.size() - countAt - 1) / blockWords ||
-      (data.size() - countAt - 1) % blockWords)
-    throw std::runtime_error("invalid persistent prefix length");
-  std::map<uint64_t, uint64_t> records;
+  size_t cursor = 0;
+  const auto next = [&]() -> uint64_t {
+    if (cursor == data.size())
+      throw std::runtime_error("truncated persistent manifest");
+    return data[cursor++];
+  };
+  if (next() != metadataVersion || next() != prefix.id)
+    throw std::runtime_error("invalid persistent manifest version or identity");
+  const uint64_t stateCount = next();
+  if (stateCount > (data.size() - cursor) / 7)
+    throw std::runtime_error("invalid persistent group count");
+  std::map<uint64_t, uint64_t> records, used;
   for (auto record : prefix.records)
-    records.emplace(record.id, record.bytes);
-  if (records.size() != count + 1 + data[componentsAt] ||
-      records[data[1]] != stateBytes)
-    throw std::runtime_error("incomplete persistent state");
-  const auto blocks = std::span(data).subspan(countAt + 1);
-  std::set<uint64_t> distinct{data[1]};
-  std::vector<model::CacheStore::Record> components;
-  for (size_t at = componentsAt + 1; at < countAt; at += 2) {
-    if (!data[at] || !data[at + 1] || records[data[at]] != data[at + 1] ||
-        !distinct.insert(data[at]).second)
-      throw std::runtime_error("incomplete persistent state component");
-    components.push_back({data[at], data[at + 1]});
+    if (!record.id || !record.bytes ||
+        !records.emplace(record.id, record.bytes).second)
+      throw std::runtime_error("invalid persistent record directory");
+  Decoded result;
+  std::map<std::pair<CacheGroupId, uint32_t>, size_t> stateIndex;
+  std::map<uint64_t, CacheGroupId> recordGroups;
+  for (uint64_t i = 0; i < stateCount; ++i) {
+    const auto group = next(), begin = next(), end = next();
+    const auto metadataCount = next(), recordCount = next();
+    if (group > UINT32_MAX || begin > end || end > UINT32_MAX ||
+        begin % KvCache::pageTokens || end % KvCache::pageTokens ||
+        metadataCount > data.size() - cursor || !recordCount ||
+        recordCount > (data.size() - cursor - metadataCount) / 2)
+      throw std::runtime_error("invalid persistent group block");
+    DecodedState state{{static_cast<CacheGroupId>(group),
+                        static_cast<uint32_t>(begin),
+                        static_cast<uint32_t>(end),
+                        {}},
+                       {},
+                       {}};
+    if (!stateIndex
+             .emplace(std::pair{state.block.group, state.block.end},
+                      result.states.size())
+             .second)
+      throw std::runtime_error("duplicate persistent group endpoint");
+    state.metadata.assign(data.begin() + cursor,
+                          data.begin() + cursor + metadataCount);
+    cursor += metadataCount;
+    std::set<uint64_t> distinct;
+    for (uint64_t record = 0; record < recordCount; ++record) {
+      const auto id = next(), bytes = next();
+      const auto found = records.find(id);
+      if (found == records.end() || found->second != bytes ||
+          !distinct.insert(id).second)
+        throw std::runtime_error("incomplete persistent group payload");
+      const auto [owner, added] = recordGroups.emplace(id, state.block.group);
+      if (!added && owner->second != state.block.group)
+        throw std::runtime_error("persistent payload aliases different groups");
+      state.records.push_back({id, bytes});
+      used.emplace(id, bytes);
+    }
+    result.states.push_back(std::move(state));
   }
-  for (size_t offset = 0; offset < blocks.size(); offset += blockWords) {
-    const uint64_t id = blocks[offset];
-    if (!id || id == data[1] || records[id] != kvBytes ||
-        !distinct.insert(id).second)
-      throw std::runtime_error("incomplete persistent KV");
+  const uint64_t count = next();
+  if (!count || count > UINT32_MAX / KvCache::pageTokens ||
+      count != (data.size() - cursor) / blockWords ||
+      (data.size() - cursor) % blockWords)
+    throw std::runtime_error("invalid persistent prefix length");
+  result.blocks = std::span(data).subspan(cursor);
+  for (size_t offset = 0; offset < result.blocks.size(); offset += blockWords) {
+    const auto id = result.blocks[offset];
+    const auto found = records.find(id);
+    if (found == records.end() || found->second != kvBytes ||
+        !used.emplace(id, kvBytes).second)
+      throw std::runtime_error("incomplete persistent target KV");
     for (size_t token = 3; token < blockWords; ++token)
-      if (blocks[offset + token] > UINT32_MAX)
+      if (result.blocks[offset + token] > UINT32_MAX)
         throw std::runtime_error("invalid persistent token");
   }
-  return {data[1],
-          {data.begin() + 3, data.begin() + componentsAt},
-          blocks,
-          std::move(components)};
+  if (used != records || result.blocks[(count - 1) * blockWords] != prefix.id)
+    throw std::runtime_error("persistent manifest record directory mismatch");
+  const uint32_t boundary = count * KvCache::pageTokens;
+  CacheGroupCoordinator coordinator(
+      std::vector<CacheGroupSpec>(groups.begin(), groups.end()));
+  for (const auto &state : result.states) {
+    const auto spec =
+        std::find_if(groups.begin(), groups.end(),
+                     [&](const auto &g) { return g.id == state.block.group; });
+    if (spec == groups.end() || state.block.end > boundary ||
+        (spec->kind == CacheGroupKind::Checkpoint
+             ? state.block.begin != boundary || state.block.end != boundary
+             : state.block.begin >= state.block.end))
+      throw std::runtime_error(
+          "persistent group does not match model declaration");
+  }
+  if (!coordinator.complete(
+          boundary,
+          [&](CacheGroupId group,
+              uint32_t end) -> std::optional<CachedStateBlock> {
+            const auto found = stateIndex.find({group, end});
+            return found == stateIndex.end()
+                       ? std::nullopt
+                       : std::optional(result.states[found->second].block);
+          }))
+    throw std::runtime_error(
+        "persistent manifest has incomplete group coverage");
+  return result;
 }
 } // namespace
 
@@ -71,7 +133,7 @@ PersistentCache::PersistentCache(PersistentCacheConfig config, KvCache &kv,
       recency_(recency), makeRoom_(std::move(makeRoom)),
       completion_(completion) {
   if (!config_.capacityBytes || !config_.store || !config_.kvFile ||
-      !config_.stateFile || !config_.stateStorage)
+      !config_.stateStorage)
     throw std::invalid_argument("incomplete persistent cache configuration");
   if (!config_.writeBurstBytes)
     config_.writeBurstBytes = config_.capacityBytes;
@@ -89,7 +151,7 @@ PersistentCache::~PersistentCache() {
     if (touches_)
       static_cast<void>(touches_->wait());
     static_cast<void>(flushTouches());
-    static_cast<void>(config_.stateFile->metadata([] {})->wait());
+    static_cast<void>(config_.kvFile->metadata([] {})->wait());
   } catch (...) {
   }
 }
@@ -105,7 +167,7 @@ void PersistentCache::load() {
     bool valid = true;
     try {
       static_cast<void>(decode(*it, config_.kvFile->slotBytes(),
-                               config_.stateFile->slotBytes()));
+                               config_.stateStorage->cacheGroups()));
     } catch (const std::exception &) {
       valid = false;
       ++failures_;
@@ -132,30 +194,35 @@ void PersistentCache::load() {
   config_.store->collectUnreferenced();
   for (auto it = selected.rbegin(); it != selected.rend(); ++it) {
     const auto decoded = decode(*it, config_.kvFile->slotBytes(),
-                                config_.stateFile->slotBytes());
-    auto stateSlot = config_.stateFile->reopen(decoded.stateId);
-    const uint64_t boundary =
+                                config_.stateStorage->cacheGroups());
+    const uint32_t boundary =
         decoded.blocks.size() / blockWords * KvCache::pageTokens;
-    std::shared_ptr<const CompositeState> state;
+    auto state = std::make_shared<RestoreState>();
+    state->boundary = boundary;
+    Entry entry{it->id, 0, recency_.next(), {}};
+    std::set<uint64_t> retained;
     try {
-      DiskStateRecord record{stateSlot, decoded.state};
-      for (auto component : decoded.components) {
-        auto slot = config_.stateStorage->reopenStateComponent(component);
-        if (!slot)
-          throw std::invalid_argument("cannot reopen persistent component");
-        record.components.push_back(std::move(slot));
+      for (const auto &part : decoded.states) {
+        auto block = part.block;
+        block.payload = config_.stateStorage->reopenState(
+            block, {part.metadata, part.records});
+        if (!block.payload)
+          throw std::invalid_argument("model cannot reopen cache group");
+        auto record = block.payload->diskRecord();
+        record.components.push_back(record.slot);
+        for (const auto &slot : record.components) {
+          if (!slot)
+            throw std::invalid_argument("model reopened incomplete payload");
+          if (retained.insert(slot->recordId()).second)
+            entry.records.push_back(slot);
+        }
+        state->blocks.push_back(std::move(block));
       }
-      state = config_.stateStorage->reopenState(std::move(record), boundary);
     } catch (const std::invalid_argument &) {
       ++failures_;
       config_.store->erase(it->id);
       continue;
     }
-    if (!state)
-      throw std::runtime_error("model cannot reopen a persistent state");
-    Entry entry{it->id, 0, recency_.next(), {std::move(stateSlot)}};
-    for (auto &component : state->diskRecord().components)
-      entry.records.push_back(std::move(component));
     for (size_t offset = 0; offset < decoded.blocks.size();
          offset += blockWords) {
       auto slot = config_.kvFile->reopen(decoded.blocks[offset]);
@@ -224,7 +291,7 @@ bool PersistentCache::flushTouches() {
   ids.reserve(touched.size());
   for (auto [_, id] : touched)
     ids.push_back(id);
-  touches_ = config_.stateFile->metadata(
+  touches_ = config_.kvFile->metadata(
       [store = config_.store, ids = std::move(ids)] { store->touch(ids); },
       completion_);
   return true;
@@ -247,7 +314,7 @@ void PersistentCache::invalidate(uint64_t block) {
 }
 
 void PersistentCache::start(uint64_t block, bool reused) {
-  if (!kv_.contains(block) || !states_.contains(block))
+  if (!kv_.contains(block))
     return;
   auto chain = kv_.chain(block);
   // Recurrent/draft snapshots have a large fixed cost even for tiny prompts.
@@ -258,7 +325,7 @@ void PersistentCache::start(uint64_t block, bool reused) {
     return;
   auto lease =
       states_.acquireDeepest(std::span(&block, 1), CacheAccess::Maintenance);
-  if (!lease)
+  if (!lease || lease->kvBlock() != block)
     return;
   // Account unique existing components and only the payloads that need IO.
   const auto &state = lease->state();
@@ -268,13 +335,28 @@ void PersistentCache::start(uint64_t block, bool reused) {
       chain.blocks.size() > (config_.capacityBytes - stateBytes) / pageBytes)
     return;
   uint64_t extra = stateBytes;
-  uint64_t writes = states_.diskCopy(block) ? 0 : state->offloadBytes();
-  auto existing = state->diskRecord();
-  if (existing.slot)
-    existing.components.push_back(existing.slot);
-  for (const auto &record : existing.components)
-    if (record && references_.contains(record->recordId()))
-      extra -= record->bytes();
+  uint64_t writes = 0;
+  std::set<std::vector<const void *>, std::less<>> sources;
+  std::set<uint64_t> knownRecords;
+  for (const auto &part : state->blocks) {
+    const auto resources = part.payload->resources();
+    // A payload's identity is its backing, so two circular boundary slices
+    // sharing one page neither charge nor write that page twice.
+    std::vector<const void *> identity;
+    for (const auto &resource : resources)
+      identity.push_back(resource.identity);
+    if (identity.empty())
+      identity.push_back(part.payload.get());
+    if (sources.insert(std::move(identity)).second)
+      writes += part.payload->offloadBytes();
+    auto record = part.payload->diskRecord();
+    if (record.slot)
+      record.components.push_back(record.slot);
+    for (const auto &slot : record.components)
+      if (slot && knownRecords.insert(slot->recordId()).second &&
+          references_.contains(slot->recordId()))
+        extra -= slot->bytes();
+  }
   for (uint64_t id : chain.blocks) {
     const auto slot = kv_.slot(id);
     const auto record = slot ? slot->record() : nullptr;
@@ -329,7 +411,7 @@ bool PersistentCache::poll() {
       ++saved_;
     } else {
       const uint64_t id = job.entry->id;
-      static_cast<void>(config_.stateFile->metadata(
+      static_cast<void>(config_.kvFile->metadata(
           [store = config_.store, id] { store->erase(id); }));
       ++failures_;
     }
@@ -398,14 +480,9 @@ bool PersistentCache::poll() {
   for (uint64_t id : job.blocks)
     if (!kv_.slot(id) || kv_.transferring(id))
       return progress;
-  const auto record = state->diskRecord();
-  if (!record.slot) {
-    ++failures_;
-    finish();
-    return true;
-  }
-  Entry entry{record.slot->recordId(), block, recency_.next(), {record.slot}};
-  const auto prefix = describe(entry, record, job.blocks);
+  const auto anchor = kv_.slot(block)->record();
+  Entry entry{anchor->recordId(), block, recency_.next(), {}};
+  const auto prefix = describe(entry, *state, job.blocks);
   while (additionalBytes(entry) > config_.capacityBytes - used_)
     if (!evictOldest()) {
       ++failures_;
@@ -413,40 +490,52 @@ bool PersistentCache::poll() {
       return true;
     }
   job.entry = std::move(entry);
-  job.commit = config_.stateFile->metadata(
+  job.commit = config_.kvFile->metadata(
       [store = config_.store, prefix] { store->save(prefix); }, completion_);
   return true;
 }
 
 model::CacheStore::Prefix
-PersistentCache::describe(Entry &entry, const DiskStateRecord &state,
+PersistentCache::describe(Entry &entry, const RestoreState &state,
                           std::span<const uint64_t> blocks) const {
   model::CacheStore::Prefix prefix{
-      entry.id, {metadataVersion, entry.id, state.metadata.size()}, {}};
-  prefix.metadata.insert(prefix.metadata.end(), state.metadata.begin(),
-                         state.metadata.end());
-  prefix.metadata.push_back(state.components.size());
-  prefix.records.push_back({entry.id, state.slot->bytes()});
-  for (const auto &component : state.components) {
-    if (!component || !component->recordId())
-      throw std::logic_error("incomplete persistent state component");
+      entry.id, {metadataVersion, entry.id, state.blocks.size()}, {}};
+  std::set<uint64_t> retained;
+  const auto rememberRecord =
+      [&](const std::shared_ptr<model::SlotFile::Slot> &slot) {
+        if (!slot || !slot->recordId())
+          throw std::logic_error("incomplete persistent payload");
+        if (retained.insert(slot->recordId()).second) {
+          prefix.records.push_back({slot->recordId(), slot->bytes()});
+          entry.records.push_back(slot);
+        }
+      };
+  for (const auto &part : state.blocks) {
+    const auto record = part.payload->diskRecord();
     prefix.metadata.insert(prefix.metadata.end(),
-                           {component->recordId(), component->bytes()});
-    prefix.records.push_back({component->recordId(), component->bytes()});
-    entry.records.push_back(component);
+                           {part.group, part.begin, part.end,
+                            record.metadata.size(),
+                            1 + record.components.size()});
+    prefix.metadata.insert(prefix.metadata.end(), record.metadata.begin(),
+                           record.metadata.end());
+    rememberRecord(record.slot);
+    prefix.metadata.insert(prefix.metadata.end(),
+                           {record.slot->recordId(), record.slot->bytes()});
+    for (const auto &component : record.components) {
+      rememberRecord(component);
+      prefix.metadata.insert(prefix.metadata.end(),
+                             {component->recordId(), component->bytes()});
+    }
   }
   prefix.metadata.push_back(blocks.size());
   for (uint64_t block : blocks) {
     const auto slot = kv_.slot(block)->record();
-    if (!slot || !slot->recordId())
-      throw std::logic_error("nonpersistent KV slot in persistent cache");
+    rememberRecord(slot);
     const auto key = kv_.key(block);
     prefix.metadata.insert(prefix.metadata.end(),
                            {slot->recordId(), key.images.lo, key.images.hi});
-    prefix.metadata.insert(prefix.metadata.end(), key.tokens.begin(),
-                           key.tokens.end());
-    prefix.records.push_back({slot->recordId(), config_.kvFile->slotBytes()});
-    entry.records.push_back(slot);
+    const auto tokens = key.tokens;
+    prefix.metadata.insert(prefix.metadata.end(), tokens.begin(), tokens.end());
   }
   return prefix;
 }
@@ -473,7 +562,7 @@ void PersistentCache::remember(Entry entry) {
 }
 void PersistentCache::forget(std::map<uint64_t, Entry>::iterator entry) {
   const uint64_t id = entry->second.id;
-  static_cast<void>(config_.stateFile->metadata(
+  static_cast<void>(config_.kvFile->metadata(
       [store = config_.store, id] { store->erase(id); }));
   for (auto record : entry->second.records) {
     record->releaseDurable();

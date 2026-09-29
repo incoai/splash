@@ -11,6 +11,7 @@ class Runtime final : public RuntimeModel {
 public:
   explicit Runtime(RuntimeContext context);
   ~Runtime() override;
+  [[nodiscard]] std::vector<CacheGroupSpec> cacheGroups() const override;
   void checkHealth() override;
   [[nodiscard]] bool needsHealthCheck() const noexcept override;
 
@@ -26,11 +27,11 @@ public:
   [[nodiscard]] StateAdmission
   resume(const ModelRequest &request) override;
   void restore(uint64_t requestId, uint32_t restoredPrefixLength,
-                     std::shared_ptr<const CompositeState> restoredState,
+                     std::shared_ptr<const RestoreState> restoredState,
                      bool restoreDraftState) override;
   [[nodiscard]] std::unique_ptr<StateRestore> beginRestore(
       uint64_t requestId, uint32_t boundary,
-      std::shared_ptr<const CompositeState> state, bool restoreDraft,
+      std::shared_ptr<const RestoreState> state, bool restoreDraft,
       std::function<void()> completion) override;
   void setDraftContextPlan(uint64_t requestId, DraftContextPlan plan) override;
   [[nodiscard]] std::vector<ModelStepResult>
@@ -44,10 +45,10 @@ public:
   submitTransfers(std::function<void()> completion) override;
   [[nodiscard]] std::vector<ModelStepResult>
   decode(const BatchPlan &plan, std::span<const ModelBatchItem> items);
-  [[nodiscard]] std::shared_ptr<const CompositeState>
+  [[nodiscard]] std::shared_ptr<const RestoreState>
   snapshot(uint64_t requestId) override;
   [[nodiscard]] bool canSnapshotToDisk() const noexcept override;
-  [[nodiscard]] std::unique_ptr<StateOffload>
+  [[nodiscard]] std::unique_ptr<SnapshotOffload>
   snapshotToDisk(uint64_t requestId, std::function<void()> completion) override;
   [[nodiscard]] uint64_t reclaimIdleState() noexcept override;
   void provideMask(uint64_t requestId,

@@ -1787,6 +1787,8 @@ Runtime::Runtime(RuntimeContext context)
 
 Runtime::~Runtime() = default;
 
+std::vector<CacheGroupSpec> Runtime::cacheGroups() const { return impl_->states.cacheGroups(); }
+
 void Runtime::checkHealth() { impl_->backend.checkHealth(); }
 
 bool Runtime::needsHealthCheck() const noexcept {
@@ -1936,7 +1938,7 @@ metal::AllocationResult Runtime::beginAt(const ModelRequest &request, uint32_t s
 }
 
 void Runtime::restore(uint64_t requestId, uint32_t restoredPrefixLength,
-                      std::shared_ptr<const CompositeState> restoredState,
+                      std::shared_ptr<const RestoreState> restoredState,
                       bool restoreDraftState) {
   Impl::Request &entry = impl_->request(requestId);
   if (!entry.resident || !restoredState) {
@@ -1952,7 +1954,7 @@ void Runtime::restore(uint64_t requestId, uint32_t restoredPrefixLength,
 
 std::unique_ptr<StateRestore> Runtime::beginRestore(
     uint64_t requestId, uint32_t boundary,
-    std::shared_ptr<const CompositeState> state, bool restoreDraft,
+    std::shared_ptr<const RestoreState> state, bool restoreDraft,
     std::function<void()> completion) {
   Impl::Request &entry = impl_->request(requestId);
   if (!entry.resident || !state || boundary >= entry.promptTokens)
@@ -2407,7 +2409,7 @@ uint32_t Runtime::committedStateSlot(uint64_t requestId) {
   return entry.slot;
 }
 
-std::shared_ptr<const CompositeState> Runtime::snapshot(uint64_t requestId) {
+std::shared_ptr<const RestoreState> Runtime::snapshot(uint64_t requestId) {
   return impl_->states.snapshot(committedStateSlot(requestId));
 }
 
@@ -2415,7 +2417,7 @@ bool Runtime::canSnapshotToDisk() const noexcept {
   return impl_->states.canSnapshotToDisk();
 }
 
-std::unique_ptr<StateOffload>
+std::unique_ptr<SnapshotOffload>
 Runtime::snapshotToDisk(uint64_t requestId, std::function<void()> completion) {
   return impl_->states.snapshotToDisk(committedStateSlot(requestId), std::move(completion));
 }
@@ -2718,7 +2720,7 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
   request.id = id;
   request.prompt = warmupPrompt;
   request.maxNewTokens = 8;
-  std::shared_ptr<const CompositeState> cachedState;
+  std::shared_ptr<const RestoreState> cachedState;
   uint64_t estimatedPeakBytes = impl_->estimatedWarmupPeak();
   double wallSeconds = 0.0;
   beginColdRequest(request, 0);

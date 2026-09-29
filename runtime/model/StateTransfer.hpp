@@ -4,7 +4,8 @@
 
 namespace splash {
 
-class CompositeState;
+class StatePayload;
+struct RestoreState;
 
 // Completion is consumed on the engine thread; cancellation never makes
 // backing reusable until ready() is true. Destruction drains outstanding
@@ -18,7 +19,7 @@ public:
   // After successful finish, before executing against the restored buffers.
   // Copies the complete immutable payload, even if execution skips part of it.
   // A null result means that cache storage could not be admitted.
-  [[nodiscard]] virtual std::shared_ptr<const CompositeState> snapshot() = 0;
+  [[nodiscard]] virtual std::shared_ptr<const RestoreState> snapshot() = 0;
 };
 
 // A demotion in flight. The disk copy is usable from the start: a read
@@ -29,7 +30,18 @@ public:
   virtual ~StateOffload() = default;
   [[nodiscard]] virtual bool ready() const noexcept = 0;
   [[nodiscard]] virtual bool finish() = 0;
-  [[nodiscard]] virtual const std::shared_ptr<const CompositeState> &
+  [[nodiscard]] virtual const std::shared_ptr<const StatePayload> &
+  state() const noexcept = 0;
+};
+
+// A direct snapshot can write several independent group blocks in one bounded
+// staging transaction. Publication still waits for every component to finish.
+class SnapshotOffload {
+public:
+  virtual ~SnapshotOffload() = default;
+  [[nodiscard]] virtual bool ready() const noexcept = 0;
+  [[nodiscard]] virtual bool finish() = 0;
+  [[nodiscard]] virtual const std::shared_ptr<const RestoreState> &
   state() const noexcept = 0;
 };
 

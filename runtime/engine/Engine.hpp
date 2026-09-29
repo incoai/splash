@@ -68,8 +68,8 @@ struct EngineSnapshot final {
   uint64_t resourceReplayTokens = 0;
 };
 
-// KV blocks define prefix identity; composite recurrent state is attached
-// at sparse progress points, replay boundaries, and shared KV junctions.
+// KV blocks define prefix identity. Model-declared groups provide the
+// additional checkpoint or window coverage required at a restore boundary.
 class Engine final {
 public:
   Engine(EngineConfig config, Cache &cache, model::Model &model,

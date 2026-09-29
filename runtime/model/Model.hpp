@@ -1,6 +1,7 @@
 #pragma once
 
 #include "model/SlotFile.hpp"
+#include "model/CacheGroups.hpp"
 
 #include "ops/Vision.hpp"
 #include "model/StateTransfer.hpp"
@@ -89,16 +90,21 @@ struct DiskStateRecord final {
   std::vector<std::shared_ptr<model::SlotFile::Slot>> components{};
 };
 
+struct StoredStateRecord final {
+  std::vector<uint64_t> metadata;
+  std::vector<model::CacheStore::Record> records;
+};
+
 struct StateResource final {
   const void *identity;
   uint64_t bytes;
 };
 
-// Immutable target-recurrent plus draft-context state.  Concrete model
-// implementations own its buffers; the engine only pins and accounts it.
-class CompositeState {
+// An immutable payload for one model-defined cache group block. Concrete
+// implementations own its storage; the engine only pins and accounts it.
+class StatePayload {
 public:
-  virtual ~CompositeState() = default;
+  virtual ~StatePayload() = default;
   [[nodiscard]] virtual DiskStateRecord diskRecord() const { return {}; }
   [[nodiscard]] virtual bool durable() const noexcept { return false; }
   // Physical resources may be shared by several immutable snapshots.
@@ -334,12 +340,9 @@ struct StateAllocationTracker final {
 class StateStorage {
 public:
   virtual ~StateStorage() = default;
-  [[nodiscard]] virtual std::shared_ptr<const CompositeState>
-  reopenState(DiskStateRecord, uint64_t) { return {}; }
-  [[nodiscard]] virtual std::shared_ptr<model::SlotFile::Slot>
-  reopenStateComponent(model::CacheStore::Record) {
-    return {};
-  }
+  [[nodiscard]] virtual std::vector<CacheGroupSpec> cacheGroups() const { return {{0}}; }
+  [[nodiscard]] virtual std::shared_ptr<const StatePayload>
+  reopenState(const CachedStateBlock &, StoredStateRecord) { return {}; }
   [[nodiscard]] virtual uint64_t actualAllocatedBytes() const noexcept = 0;
   // Frees pooled idle buffers beyond the counts kept warm and returns the
   // bytes released. Active lanes and cached states are never touched.
@@ -506,6 +509,9 @@ struct WarmupStepResult final {
 class Model {
 public:
   virtual ~Model() = default;
+  [[nodiscard]] virtual std::vector<CacheGroupSpec> cacheGroups() const {
+    return {{0, CacheGroupKind::Checkpoint, 0}};
+  }
   virtual void checkHealth() {}
   [[nodiscard]] virtual bool needsHealthCheck() const noexcept { return false; }
   [[nodiscard]] virtual StateAdmission begin(const ModelRequest &request) = 0;
@@ -515,11 +521,11 @@ public:
   virtual void suspend(uint64_t requestId) = 0;
   [[nodiscard]] virtual StateAdmission resume(const ModelRequest &request) = 0;
   virtual void restore(uint64_t requestId, uint32_t restoredPrefixLength,
-                       std::shared_ptr<const CompositeState> state,
+                       std::shared_ptr<const RestoreState> state,
                        bool restoreDraftState) = 0;
   [[nodiscard]] virtual std::unique_ptr<StateRestore>
   beginRestore(uint64_t requestId, uint32_t boundary,
-               std::shared_ptr<const CompositeState> state, bool restoreDraft,
+               std::shared_ptr<const RestoreState> state, bool restoreDraft,
                std::function<void()>) {
     restore(requestId, boundary, std::move(state), restoreDraft);
     return {};
@@ -544,7 +550,7 @@ public:
   // boundary into a cache slot. Returns nullptr when no slot is free and the
   // governor denies a new one; the caller may release a cached state and
   // retry.
-  [[nodiscard]] virtual std::shared_ptr<const CompositeState>
+  [[nodiscard]] virtual std::shared_ptr<const RestoreState>
   snapshot(uint64_t requestId) = 0;
   // Whether the disk tier takes a state written from a lane: a tier exists
   // and its state file accepts writes. The quota is the write's own concern.
@@ -553,7 +559,7 @@ public:
   // boundary to the disk tier from the lane's own buffers, for a state no
   // cache slot can hold; the ticket carries its disk copy. Null when the
   // quota cannot admit another state: the caller may free quota and retry.
-  [[nodiscard]] virtual std::unique_ptr<StateOffload>
+  [[nodiscard]] virtual std::unique_ptr<SnapshotOffload>
   snapshotToDisk(uint64_t, std::function<void()>) { return {}; }
   // Releases one unit of idle model state (an unused buffer, then caches
   // that can be rebuilt) and returns its bytes; zero when nothing is idle.
