@@ -243,6 +243,26 @@ void PersistentCache::load() {
   }
 }
 
+void PersistentCache::observe(uint64_t block, uint64_t submission) {
+  if (uint64_t{kv_.chainLength(block)} * KvCache::pageTokens < config_.minimumTokens)
+    return;
+  const uint64_t fingerprint = kv_.key(block).indexHash;
+  auto found = demands_.find(fingerprint);
+  if (found == demands_.end()) {
+    if (demands_.size() == demandHistoryCapacity) {
+      auto oldest = demands_.find(demandOrder_.oldest()->id);
+      RecencyOrder::unlink(oldest->second.recency);
+      demands_.erase(oldest);
+    }
+    found = demands_.emplace(fingerprint,
+        Demand{submission, false, RecencyOrder::allocate(fingerprint)}).first;
+  } else {
+    found->second.repeated |= found->second.firstSubmission != submission;
+    RecencyOrder::unlink(found->second.recency);
+  }
+  demandOrder_.link(found->second.recency, ++demandClock_, fingerprint);
+}
+
 void PersistentCache::publish(uint64_t block, bool reused) {
   if (states_.checkpoint(block))
     return;
@@ -362,7 +382,11 @@ PersistentCache::admit(uint64_t block, const RestoreState &state, bool reused) {
     if (!slot)
       writes += pageBytes;
   }
-  // Under pressure, an unseen tail must prove useful through a real hit.
+  // Repeated demand need not have produced a cache hit: its earlier state
+  // may have been rejected or evicted before the next request arrived.
+  const auto demand = demands_.find(kv_.key(block).indexHash);
+  reused |= demand != demands_.end() && demand->second.repeated;
+  // Under pressure, one-use tails leave room for observed reusable prefixes.
   // Existing branch/junction states already represent an observed prefix.
   // Free space still admits first-use sessions for immediate crash recovery.
   if (!reused && !kv_.stateBelow(block) &&

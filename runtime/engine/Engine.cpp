@@ -941,6 +941,8 @@ void Engine::publishReachedStateBoundaries(Request &active,
     materialized = true;
     try {
       const uint64_t block = cache_.blockAt(active.request.id, objective.tokens);
+      // A predicted hint is not evidence that its exact state was requested.
+      if (!checkpoint && !hint) cache_.observeStateDemand(active.sequence, block);
       if (cache_.reuseCompositeState(block, checkpoint)) {
         ++counters_.deduplicatedStatePublications;
       } else {

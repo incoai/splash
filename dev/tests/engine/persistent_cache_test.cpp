@@ -339,6 +339,84 @@ void pressureAdmission(const std::filesystem::path &path) {
           "pressure admission did not retain the reused working set");
 }
 
+// Demand must survive complete KV eviction and count requests, not retries.
+// Exercise both publication paths with no resident state left to hit.
+void repeatedMissAdmission(const std::filesystem::path &directory) {
+  for (bool direct : {false, true}) {
+    const auto path = directory / (direct ? "demand-direct.sqlite" : "demand-ram.sqlite");
+    {
+      Fixture f(path, 3 * unit);
+      f.publish(100); f.settle();
+      auto offer = [&](uint64_t submission, bool retry) {
+        constexpr uint64_t requestId = 1; // deliberately reused client ID
+        f.cache.beginRequest(requestId);
+        require(f.cache.ensureTokens(requestId, 64).granted(), "demand allocation failed");
+        std::vector<uint32_t> tokens(64); std::iota(tokens.begin(), tokens.end(), 200);
+        const auto block = f.cache.publishCommittedBlocks(requestId, tokens, 64);
+        f.cache.observeStateDemand(submission, block);
+        if (retry) f.cache.observeStateDemand(submission, block);
+        auto source = test::checkpoint(64, std::make_shared<State>(f.stateFile, 64));
+        if (direct) {
+          const SnapshotWritePlan plan{source, [&](std::function<void()> done) {
+            return test::snapshotWrite(64, source->blocks.front().payload->offload(std::move(done)));
+          }};
+          require(f.cache.publishStateToDisk(block, plan) == !retry,
+                  "direct demand confused a retry with a second request");
+        } else {
+          f.cache.publishCompositeState(block, source);
+        }
+        f.cache.endRequest(requestId); f.settle();
+        return block;
+      };
+      const auto before = f.budget->writtenBytes();
+      const auto first = offer(0, true);
+      require(f.budget->writtenBytes() == before,
+              "same-request retry admitted a one-use prefix");
+      static_cast<void>(f.cache.reclaimCache(UINT64_MAX, true)); f.settle();
+      require(f.lookup(200).kvBoundary == 0, "demand fixture retained rejected KV");
+      // Resource suspension recreates Cache::Request, not logical demand.
+      offer(0, true);
+      require(f.budget->writtenBytes() == before,
+              "resource resumption counted as a second request");
+      static_cast<void>(f.cache.reclaimCache(UINT64_MAX, true)); f.settle();
+      // A new submission may use the same client ID after completion.
+      const auto second = offer(1, false);
+      require(first != second, "demand fixture reused a process-local block id");
+      require(f.budget->writtenBytes() > before, "repeated miss was never admitted");
+    }
+    Fixture reopened(path, 3 * unit);
+    require(reopened.lookup(200).resumeBoundary() == 64 && !reopened.lookup(100).state,
+            "repeated demand did not persist the new working set");
+  }
+}
+
+// A bounded demand history must forget old observations, and a one-use scan
+// must not acquire durable ownership simply by filling that metadata history.
+void boundedDemand(const std::filesystem::path &path) {
+  Fixture f(path, 3 * unit);
+  f.publish(100); f.settle();
+  const auto before = f.budget->writtenBytes();
+  auto observe = [&](uint64_t request, uint32_t seed) {
+    f.cache.beginRequest(request);
+    require(f.cache.ensureTokens(request, 64).granted(), "history allocation failed");
+    std::vector<uint32_t> tokens(64); std::iota(tokens.begin(), tokens.end(), seed);
+    const auto block = f.cache.publishCommittedBlocks(request, tokens, 64);
+    f.cache.observeStateDemand(request, block);
+    f.cache.publishCompositeState(block,
+        test::checkpoint(64, std::make_shared<State>(f.stateFile, 64)));
+    f.cache.endRequest(request); f.settle();
+    static_cast<void>(f.cache.reclaimCache(UINT64_MAX, true)); f.settle();
+  };
+  observe(1, 1000);
+  for (uint32_t i = 0; i < 4096; ++i) observe(i + 2, 2000 + i * 100);
+  observe(5000, 1000);
+  require(f.budget->writtenBytes() == before,
+          "unbounded history or one-use scan displaced durable payload");
+  observe(5001, 1000);
+  require(f.budget->writtenBytes() > before,
+          "recent repeated demand did not recover after metadata churn");
+}
+
 // Both sources obey the same admission before any durable victim is removed.
 // A declined durable capture may still occupy temporary space, but not steal
 // a durable slot to do so. Reopen the file to check retention, not only counters.
@@ -368,6 +446,13 @@ void directAdmission(const std::filesystem::path &directory) {
         f.cache.beginRequest(10000);
         require(f.cache.ensureTokens(10000, c.newTokens).granted(), "direct fixture allocation failed");
         const auto block = f.cache.publishCommittedBlocks(10000, tokens, c.newTokens);
+        // Repeated demand cannot bypass size, minimum length or write credit.
+        if (std::string_view(c.name) != "reuse") {
+          f.cache.beginRequest(9000);
+          f.cache.observeStateDemand(9000, block);
+          f.cache.endRequest(9000);
+          f.cache.observeStateDemand(10000, block);
+        }
         auto source = test::checkpoint(c.newTokens, std::make_shared<State>(f.stateFile, c.newTokens));
         unsigned writes = 0;
         const SnapshotWritePlan plan{source, [&](std::function<void()> done) {
@@ -1080,6 +1165,8 @@ int main(int argc, char **argv) {
     admissionFloor(directory.path / "admission.sqlite");
     sharedComponents(directory.path / "components.sqlite");
     pressureAdmission(directory.path / "pressure.sqlite");
+    repeatedMissAdmission(directory.path);
+    boundedDemand(directory.path / "demand-bounded.sqlite");
     writePacing(directory.path / "pacing.sqlite");
     directAdmission(directory.path);
     optionalRecyclingPreservesDurable(directory.path / "optional-recycle.sqlite");

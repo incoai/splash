@@ -247,6 +247,10 @@ bool Cache::reuseStoredState(uint64_t kvBlock, bool checkpoint) {
   return reused;
 }
 
+void Cache::observeStateDemand(uint64_t submission, uint64_t kvBlock) {
+  if (persistent_) persistent_->observe(kvBlock, submission);
+}
+
 void Cache::publishCompositeState(uint64_t kvBlock,
                                   std::shared_ptr<const RestoreState> state,
                                   bool checkpoint) {

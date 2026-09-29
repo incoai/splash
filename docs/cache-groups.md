@@ -93,6 +93,25 @@ returning a transfer ticket.
 
 `PersistentCache` applies the same size, reuse and write-credit admission to a
 RAM snapshot or a direct-write plan, before either path may evict durable data.
+Replay endpoints and observed junctions record demand before attempting a
+snapshot. A bounded history of 4096 prefix fingerprints remembers whether a
+boundary appeared in distinct request lifetimes, even if its payload and KV
+blocks were rejected or evicted. It holds neither backing nor pins, counts no
+retry twice, and forgets the least recently observed fingerprint when full.
+The scheduler supplies its existing submission sequence, which remains stable
+across resource suspension and distinct when a client request ID is reused.
+Predicted hints and disposable progress checkpoints do not populate this
+history: repeatedly predicting a useful state is not observed reuse. Fingerprints
+affect admission only; full-key matching and complete restore coverage remain
+mandatory. History is process-local and resets on restart; durable payloads
+and their persisted recency retain the existing restart behavior.
+
+Under quota pressure, repeated demand can admit a candidate without requiring
+a prior successful cache hit. Actual hits and existing branch points remain
+eligible. One-use tails still cannot displace durable prefixes, and repeated
+demand does not bypass size, minimum length, write credits or dependency pins.
+The demand history does not promote payload LRU positions.
+
 An accepted direct capture enters the same bounded publication job and is not
 admitted or charged a second time. A rejected candidate may use temporary space
 when offloading is enabled, but that fallback cannot evict a durable manifest. Ordinary snapshot RAM

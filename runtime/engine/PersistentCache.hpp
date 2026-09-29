@@ -44,6 +44,9 @@ public:
                   std::function<bool()> makeRoom,
                   const std::function<void()> &completion);
   ~PersistentCache();
+  // Observe one materialized ordinary boundary per request, before any
+  // snapshot attempt. This history owns no cache state or disk records.
+  void observe(uint64_t block, uint64_t submission);
   void publish(uint64_t block, bool reused = false);
   // Admit before the plan can allocate or evict; an accepted capture starts
   // the same publication job as a RAM snapshot, without a second admission.
@@ -103,6 +106,17 @@ private:
   };
   std::unordered_map<uint64_t, RecordReference> references_;
   uint64_t used_ = 0;
+  struct Demand {
+    uint64_t firstSubmission;
+    bool repeated = false;
+    RecencyOrder::Node recency;
+  };
+  // Bounded process-local evidence survives payload and KV block eviction.
+  // Fingerprints influence admission only; restore matching stays exact.
+  static constexpr size_t demandHistoryCapacity = 4096;
+  std::unordered_map<uint64_t, Demand> demands_;
+  RecencyOrder demandOrder_;
+  uint64_t demandClock_ = 0;
   struct Candidate {
     uint64_t block;
     bool reused;

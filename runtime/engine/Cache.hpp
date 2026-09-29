@@ -186,6 +186,8 @@ public:
   // Reuses the state at this block in either tier, as reuseCompositeState()
   // does a RAM copy.
   [[nodiscard]] bool reuseStoredState(uint64_t kvBlock, bool checkpoint = false);
+  // submission stays stable across resource suspension and client-ID reuse.
+  void observeStateDemand(uint64_t submission, uint64_t kvBlock);
   void publishCompositeState(uint64_t kvBlock,
                              std::shared_ptr<const RestoreState> state,
                              bool checkpoint = false);
