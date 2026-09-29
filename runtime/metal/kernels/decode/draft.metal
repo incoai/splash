@@ -142,7 +142,7 @@ kernel void draft_context_kv_commit(
                               : (batch == 1 ? values1
                                             : (batch == 2 ? values2 : values3));
   DraftContextParams lane_params{Rows, params.cache_stride,
-                                  params.start_position[batch]};
+                                  params.start_position[batch], params.paged, params.pages[batch]};
   threadgroup float reductions[8];
   threadgroup bfloat normalized[128];
   draft_context_kv_phase(
@@ -165,6 +165,7 @@ inline void draft_attention_split_phase(
     device bfloat *queries, device bfloat *keys, device bfloat *values,
     device bfloat *query_keys, device bfloat *query_values,
     device float *partial, uint cache_stride, uint cache_length, uint split,
+    bool paged, constant DraftKvAddresses &pages, uint head,
     uint splits, threadgroup float *score_storage,
     threadgroup float *row_max, threadgroup float *row_sum,
     threadgroup float *previous_scale, uint thread_index, uint lane,
@@ -216,8 +217,13 @@ inline void draft_attention_split_phase(
 
   for (uint tile = split; tile < live_tiles; tile += splits) {
     uint slot = (tile < wrapped ? tile : resume + tile - wrapped) * N;
-    auto kt =
-        tensor(keys + slot * D, dextents<int, 2>{D, N}, array<int, 2>{1, D});
+    device bfloat *tile_keys = paged
+        ? reinterpret_cast<device bfloat *>(pages.keys[slot / N]) + head * N * D
+        : keys + slot * D;
+    device bfloat *tile_values = paged
+        ? reinterpret_cast<device bfloat *>(pages.values[slot / N]) + head * N * D
+        : values + slot;
+    auto kt = tensor(tile_keys, dextents<int, 2>{D, N}, array<int, 2>{1, D});
     auto k0 = kt.slice<TileK, N>(0, 0);
     auto scores =
         qk.template get_destination_cooperative_tensor<decltype(q0),
@@ -281,8 +287,8 @@ inline void draft_attention_split_phase(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    auto vt = tensor(values + slot, dextents<int, 2>{N, D},
-                     array<int, 2>{1, int(cache_stride)});
+    auto vt = tensor(tile_values, dextents<int, 2>{N, D},
+                     array<int, 2>{1, int(paged ? N : cache_stride)});
     auto v0 = vt.slice<TileK, D>(0, 0);
     auto partial_output =
         pv.template get_destination_cooperative_tensor<decltype(p0),
@@ -574,13 +580,13 @@ kernel void draft_attention_bf16_split(
   threadgroup float workspace[AttentionM * AttentionN + 3 * AttentionM];
   draft_attention_split_phase(
       queries + batch * Rows * Attention + group.x * AttentionM * HeadDim,
-      keys + group.x * params.cache_stride * HeadDim,
-      values + group.x * params.cache_stride * HeadDim,
+      keys + (params.paged ? 0 : group.x * params.cache_stride * HeadDim),
+      values + (params.paged ? 0 : group.x * params.cache_stride * HeadDim),
       query_keys + batch * KVHeads * Rows * HeadDim + group.x * Rows * HeadDim,
       query_values + batch * KVHeads * HeadDim * Rows +
           group.x * Rows * HeadDim,
       partials, params.cache_stride, params.cache_length[batch], group.z,
-      params.splits, workspace, workspace + AttentionM * AttentionN,
+      params.paged, params.pages[batch], group.x, params.splits, workspace, workspace + AttentionM * AttentionN,
       workspace + AttentionM * AttentionN + AttentionM,
       workspace + AttentionM * AttentionN + 2 * AttentionM, thread_index,
       lane, simd_group);

@@ -86,6 +86,12 @@ struct ImageSpan final {
 struct DiskStateRecord final {
   std::shared_ptr<model::SlotFile::Slot> slot;
   std::vector<uint64_t> metadata;
+  std::vector<std::shared_ptr<model::SlotFile::Slot>> components{};
+};
+
+struct StateResource final {
+  const void *identity;
+  uint64_t bytes;
 };
 
 // Immutable target-recurrent plus draft-context state.  Concrete model
@@ -95,11 +101,20 @@ public:
   virtual ~CompositeState() = default;
   [[nodiscard]] virtual DiskStateRecord diskRecord() const { return {}; }
   [[nodiscard]] virtual bool durable() const noexcept { return false; }
-  // Footprint retained by the cache. A cached state owns a private copy of
-  // the lane's state; dropping the reference returns that slot to the model's
-  // pool, and idle-state reclaim frees it.
+  // Physical resources may be shared by several immutable snapshots.
+  [[nodiscard]] virtual std::vector<StateResource> resources() const {
+    return {{this, bytes()}};
+  }
+  // Logical footprint of this snapshot. resources() identifies shared backing
+  // for unique accounting; reclaimableBytes() excludes backing still in use.
   [[nodiscard]] virtual uint64_t bytes() const noexcept = 0;
   [[nodiscard]] virtual uint64_t residentBytes() const noexcept { return bytes(); }
+  [[nodiscard]] virtual uint64_t reclaimableBytes() const noexcept {
+    return residentBytes();
+  }
+  [[nodiscard]] virtual uint64_t offloadBytes() const noexcept {
+    return bytes();
+  }
   [[nodiscard]] virtual bool canOffload() const noexcept { return false; }
   // Starts writing this state to the disk tier and returns the ticket that
   // carries its disk copy; the source is free as soon as the call returns.
@@ -321,6 +336,10 @@ public:
   virtual ~StateStorage() = default;
   [[nodiscard]] virtual std::shared_ptr<const CompositeState>
   reopenState(DiskStateRecord, uint64_t) { return {}; }
+  [[nodiscard]] virtual std::shared_ptr<model::SlotFile::Slot>
+  reopenStateComponent(model::CacheStore::Record) {
+    return {};
+  }
   [[nodiscard]] virtual uint64_t actualAllocatedBytes() const noexcept = 0;
   // Frees pooled idle buffers beyond the counts kept warm and returns the
   // bytes released. Active lanes and cached states are never touched.
@@ -507,6 +526,12 @@ public:
   }
   virtual void setDraftContextPlan(uint64_t requestId,
                                    DraftContextPlan plan) = 0;
+  // Admit copy-on-write execution backing before a batch starts. A refusal
+  // follows the engine's normal cache reclaim and suspension path.
+  [[nodiscard]] virtual metal::AllocationResult prepareStep(uint64_t, uint64_t,
+                                                            uint64_t) {
+    return true;
+  }
   // Optional async wake hook; an immediately ready ticket need not call it.
   [[nodiscard]] virtual std::unique_ptr<ModelBatchTicket>
   submit(const BatchPlan &plan, std::span<const ModelBatchItem> items,

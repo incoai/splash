@@ -167,10 +167,16 @@ void requireCommittedStateIdentical(const model::QwenStateStorage &states,
   identical(left.gdn[budget.activeParity].recurrentBase,
             right.gdn[masked.activeParity].recurrentBase, "GDN recurrent");
   for (uint32_t layer = 0; layer < states.layout().draft.layers; ++layer) {
-    identical(left.draft[layer].keys, right.draft[layer].keys,
-              "draft keys layer=" + std::to_string(layer));
-    identical(left.draft[layer].values, right.draft[layer].values,
-              "draft values layer=" + std::to_string(layer));
+    for (uint32_t page = 0; page < states.layout().draft.tokens /
+                                       model::DraftStateLayout::blockTokens;
+         ++page) {
+      identical(left.draft[layer].keyPages[page],
+                right.draft[layer].keyPages[page],
+                "draft keys layer=" + std::to_string(layer));
+      identical(left.draft[layer].valuePages[page],
+                right.draft[layer].valuePages[page],
+                "draft values layer=" + std::to_string(layer));
+    }
   }
 }
 
@@ -360,18 +366,27 @@ StateSamples sampleCommittedState(const model::QwenStateStorage &states,
                             layout.headDimension;
   const uint64_t stride = std::max<uint64_t>(1, elements / 65536);
   for (uint32_t layer = 0; layer < buffers.draft.size(); ++layer) {
-    const auto *keys = bfloatContents(buffers.draft[layer].keys, "draft keys");
-    const auto *values = bfloatContents(buffers.draft[layer].values, "draft values");
     std::vector<float> keySamples, valueSamples;
     for (uint64_t index = 0; index < elements; index += stride) {
       const uint32_t dimension = index % layout.headDimension;
       const uint32_t position = (index / layout.headDimension) % lengths.draftLength;
       const uint32_t head = index / (uint64_t{layout.headDimension} * lengths.draftLength);
       const uint32_t ring = (lengths.draftBase + position) % layout.tokens;
+      const auto page = ring / model::DraftStateLayout::blockTokens;
+      const auto offset = ring % model::DraftStateLayout::blockTokens;
+      const auto *keys =
+          bfloatContents(buffers.draft[layer].keyPages[page], "draft keys");
+      const auto *values =
+          bfloatContents(buffers.draft[layer].valuePages[page], "draft values");
       keySamples.push_back(ops::tuning::bf16ToFloat(
-          keys[(uint64_t{head} * layout.tokens + ring) * layout.headDimension + dimension]));
+          keys[(uint64_t{head} * model::DraftStateLayout::blockTokens +
+                offset) *
+                   layout.headDimension +
+               dimension]));
       valueSamples.push_back(ops::tuning::bf16ToFloat(
-          values[(uint64_t{head} * layout.headDimension + dimension) * layout.tokens + ring]));
+          values[(uint64_t{head} * layout.headDimension + dimension) *
+                     model::DraftStateLayout::blockTokens +
+                 offset]));
     }
     result.emplace_back("draft_key_" + std::to_string(layer), std::move(keySamples));
     result.emplace_back("draft_value_" + std::to_string(layer), std::move(valueSamples));

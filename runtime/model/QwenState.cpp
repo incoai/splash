@@ -1,7 +1,7 @@
 #include "model/QwenState.hpp"
 
-#include <cstring>
 #include <algorithm>
+#include <cstring>
 #include <new>
 #include <stdexcept>
 #include <string>
@@ -33,56 +33,67 @@ void clear(const MetalBuffer &buffer, const char *name) {
   std::memset(writableContents(buffer, name), 0, buffer.sizeBytes());
 }
 
-std::vector<std::span<std::byte>> stateSpans(
-    const GdnParityBuffers &gdn, const std::vector<DFlashDraftRingLayer> &draft) {
-  std::vector<std::span<std::byte>> spans;
-  const auto append = [&](const MetalBuffer &buffer) {
-    spans.emplace_back(static_cast<std::byte *>(writableContents(buffer, "state IO")),
-                       buffer.sizeBytes());
-  };
-  append(gdn.stateBase);
-  for (const auto &layer : draft) {
-    append(layer.keys);
-    append(layer.values);
+// A grouped transfer drains every submitted operation, including exception
+// paths. Different payload geometries have workers sharing the same budget.
+struct FileOperations final {
+  std::vector<std::shared_ptr<SlotFile::Operation>> items;
+  ~FileOperations() {
+    for (auto &item : items)
+      item->drain();
   }
-  return spans;
-}
+  bool ready() const noexcept {
+    return std::all_of(items.begin(), items.end(),
+                       [](const auto &item) { return item->ready(); });
+  }
+  bool finish() {
+    bool success = true;
+    for (auto &item : items)
+      success = item->wait() && success;
+    return success;
+  }
+  void cancel() noexcept {
+    for (auto &item : items)
+      item->cancel();
+  }
+};
 
 class FileOffload final : public StateOffload {
 public:
-  FileOffload(std::shared_ptr<SlotFile::Operation> operation,
+  FileOffload(std::shared_ptr<FileOperations> operation,
               std::shared_ptr<const CompositeState> state,
               std::shared_ptr<StateStaging> staging)
       : operation_(std::move(operation)), state_(std::move(state)),
         staging_(std::move(staging)) {}
   // The staging copy is the write's source until the worker has stopped.
   ~FileOffload() override {
-    operation_->drain();
+    operation_.reset();
     staging_->busy = false;
   }
   bool ready() const noexcept override { return operation_->ready(); }
-  bool finish() override { return operation_->wait(); }
+  bool finish() override { return operation_->finish(); }
   const std::shared_ptr<const CompositeState> &state() const noexcept override {
     return state_;
   }
+
 private:
-  std::shared_ptr<SlotFile::Operation> operation_;
+  std::shared_ptr<FileOperations> operation_;
   std::shared_ptr<const CompositeState> state_;
   std::shared_ptr<StateStaging> staging_;
 };
 
 class FileRestore final : public StateRestore {
 public:
-  FileRestore(std::shared_ptr<SlotFile::Operation> operation,
+  FileRestore(std::shared_ptr<FileOperations> operation,
               std::function<void()> committed,
               std::function<std::shared_ptr<const CompositeState>()> snapshot)
       : operation_(std::move(operation)), committed_(std::move(committed)),
         snapshot_(std::move(snapshot)) {}
-  ~FileRestore() override { operation_->drain(); }
+  ~FileRestore() override { operation_.reset(); }
   bool ready() const noexcept override { return operation_->ready(); }
   void cancel() noexcept override { operation_->cancel(); }
   bool finish() override {
-    if (!operation_->wait()) return false;
+    if (!operation_->finish())
+      return false;
     committed_();
     finished_ = true;
     return true;
@@ -90,8 +101,9 @@ public:
   std::shared_ptr<const CompositeState> snapshot() override {
     return finished_ ? snapshot_() : nullptr;
   }
+
 private:
-  std::shared_ptr<SlotFile::Operation> operation_;
+  std::shared_ptr<FileOperations> operation_;
   std::function<void()> committed_;
   std::function<std::shared_ptr<const CompositeState>()> snapshot_;
   bool finished_ = false;
@@ -110,8 +122,8 @@ QwenGdnCell::QwenGdnCell(metal::MetalBackend &backend,
   const uint64_t before = backend.memoryStats().allocatedBytes;
   buffers_.stateBase = backend.allocateBuffer(
       layout.cellBytes(), metal::BufferStorage::Shared, label);
-  buffers_.convolutionBase = backend.view(
-      buffers_.stateBase, 0, layout.convolutionBytes());
+  buffers_.convolutionBase =
+      backend.view(buffers_.stateBase, 0, layout.convolutionBytes());
   buffers_.convolutionLayers.resize(layout.layers);
   for (uint32_t layer = 0; layer < layout.layers; ++layer) {
     buffers_.convolutionLayers[layer] =
@@ -119,14 +131,12 @@ QwenGdnCell::QwenGdnCell(metal::MetalBackend &backend,
                      uint64_t{layer} * layout.convolutionLayerBytes(),
                      layout.convolutionLayerBytes());
   }
-  buffers_.recurrentBase =
-      backend.view(buffers_.stateBase, layout.convolutionBytes(),
-                   layout.recurrentBytes());
+  buffers_.recurrentBase = backend.view(
+      buffers_.stateBase, layout.convolutionBytes(), layout.recurrentBytes());
   buffers_.recurrentLayers.resize(layout.layers);
   for (uint32_t layer = 0; layer < layout.layers; ++layer) {
     buffers_.recurrentLayers[layer] = backend.view(
-        buffers_.recurrentBase,
-        uint64_t{layer} * layout.recurrentLayerBytes(),
+        buffers_.recurrentBase, uint64_t{layer} * layout.recurrentLayerBytes(),
         layout.recurrentLayerBytes());
   }
   actualAllocatedBytes_ =
@@ -146,68 +156,172 @@ QwenCompositeState::QwenCompositeState(std::shared_ptr<QwenBufferPool> pool,
                                        CompositeStateLayout layout,
                                        QwenLogicalLengths lengths,
                                        std::shared_ptr<SlotFile> file,
+                                       std::shared_ptr<SlotFile> draftFile,
                                        std::shared_ptr<StateStaging> staging)
     : pool_(std::move(pool)), slot_(std::move(slot)), layout_(layout),
-      lengths_(lengths), file_(std::move(file)), staging_(std::move(staging)) {
-  if (!pool_ || !slot_.gdn || !slot_.draft) {
+      lengths_(lengths), file_(std::move(file)), staging_(std::move(staging)),
+      draftFile_(std::move(draftFile)) {
+  if (!pool_ || !slot_.gdn || slot_.draft.empty()) {
     throw std::invalid_argument("composite state buffers are empty");
   }
 }
 
-QwenCompositeState::QwenCompositeState(CompositeStateLayout layout,
-    QwenLogicalLengths lengths, std::shared_ptr<SlotFile> file,
-    std::shared_ptr<SlotFile::Slot> disk)
-    : layout_(layout), lengths_(lengths), file_(std::move(file)), disk_(std::move(disk)) {}
+QwenCompositeState::QwenCompositeState(
+    CompositeStateLayout layout, QwenLogicalLengths lengths,
+    std::shared_ptr<SlotFile> file, std::shared_ptr<SlotFile::Slot> disk,
+    std::shared_ptr<SlotFile> draftFile,
+    std::vector<std::shared_ptr<SlotFile::Slot>> draftDisk)
+    : layout_(layout), lengths_(lengths), file_(std::move(file)),
+      disk_(std::move(disk)), draftFile_(std::move(draftFile)),
+      draftDisk_(std::move(draftDisk)) {}
 
 DiskStateRecord QwenCompositeState::diskRecord() const {
-  return {disk_, {lengths_.targetTokens, lengths_.draftBase,
-                  lengths_.draftLength, lengths_.draftCommitCursor}};
+  DiskStateRecord result{disk_,
+                         {lengths_.targetTokens, lengths_.draftBase,
+                          lengths_.draftLength, lengths_.draftCommitCursor},
+                         draftDisk_};
+  if (!disk_)
+    for (const auto &block : slot_.draft)
+      result.components.push_back(block->disk.lock());
+  return result;
+}
+
+uint64_t QwenCompositeState::reclaimableBytes() const noexcept {
+  if (disk_)
+    return 0;
+  uint64_t bytes = layout_.target.cellBytes();
+  for (const auto &block : slot_.draft)
+    if (block.use_count() == 1)
+      bytes += layout_.draft.blockBytes();
+  return bytes;
+}
+
+uint64_t QwenCompositeState::offloadBytes() const noexcept {
+  if (disk_)
+    return 0;
+  uint64_t bytes = layout_.target.cellBytes();
+  for (const auto &block : slot_.draft)
+    if (block->disk.expired())
+      bytes += layout_.draft.blockBytes();
+  return bytes;
+}
+
+std::vector<StateResource> QwenCompositeState::resources() const {
+  std::vector<StateResource> result;
+  if (disk_) {
+    result.push_back({disk_.get(), disk_->bytes()});
+    for (const auto &block : draftDisk_)
+      result.push_back({block.get(), block->bytes()});
+  } else {
+    result.push_back({slot_.gdn.get(), layout_.target.cellBytes()});
+    for (const auto &block : slot_.draft)
+      result.push_back({block.get(), layout_.draft.blockBytes()});
+  }
+  return result;
+}
+
+std::shared_ptr<SlotFile::Slot>
+QwenStateStorage::reopenStateComponent(CacheStore::Record record) {
+  if (!draftFile_ || record.bytes != layout_.draft.blockBytes())
+    throw std::invalid_argument("invalid persistent draft block size");
+  return draftFile_->reopen(record.id);
 }
 
 std::shared_ptr<const CompositeState>
 QwenStateStorage::reopenState(DiskStateRecord record, uint64_t boundary) {
   if (!file_ || !record.slot || record.metadata.size() != 4 ||
       record.metadata[0] != boundary || record.metadata[1] > boundary ||
-      record.metadata[2] > boundary - record.metadata[1] || record.metadata[2] > UINT32_MAX ||
-      record.metadata[3] > UINT32_MAX)
+      record.metadata[2] > boundary - record.metadata[1] ||
+      record.metadata[2] > UINT32_MAX || record.metadata[3] > UINT32_MAX)
     throw std::invalid_argument("invalid persistent state metadata");
   QwenLogicalLengths lengths{record.metadata[0], record.metadata[1],
-      static_cast<uint32_t>(record.metadata[2]), static_cast<uint32_t>(record.metadata[3])};
+                             static_cast<uint32_t>(record.metadata[2]),
+                             static_cast<uint32_t>(record.metadata[3])};
   validateLengths(lengths, true);
+  if (record.slot->bytes() != layout_.target.cellBytes() ||
+      record.components.size() !=
+          (lengths.draftLength + DraftStateLayout::blockTokens - 1) /
+              DraftStateLayout::blockTokens)
+    throw std::invalid_argument("incomplete persistent draft window");
+  for (const auto &block : record.components)
+    if (!block || block->bytes() != layout_.draft.blockBytes())
+      throw std::invalid_argument("invalid persistent draft block");
   return std::shared_ptr<const CompositeState>(
-      new QwenCompositeState(layout_, lengths, file_, std::move(record.slot)));
+      new QwenCompositeState(layout_, lengths, file_, std::move(record.slot),
+                             draftFile_, std::move(record.components)));
 }
 
 std::unique_ptr<StateOffload>
 QwenCompositeState::offload(std::function<void()> completion) const {
-  if (!canOffload()) return {};
-  return write(file_, staging_, stateSpans(slot_.gdn->buffers(), slot_.draft->layers()),
+  if (!canOffload())
+    return {};
+  return write(file_, draftFile_, staging_, slot_.gdn->buffers(), slot_.draft,
                layout_, lengths_, std::move(completion));
 }
 
 std::unique_ptr<StateOffload> QwenCompositeState::write(
-    const std::shared_ptr<SlotFile> &file, const std::shared_ptr<StateStaging> &staging,
-    const std::vector<std::span<std::byte>> &spans, CompositeStateLayout layout,
+    const std::shared_ptr<SlotFile> &file,
+    const std::shared_ptr<SlotFile> &draftFile,
+    const std::shared_ptr<StateStaging> &staging, const GdnParityBuffers &gdn,
+    const DraftKvCache::Window &blocks, CompositeStateLayout layout,
     QwenLogicalLengths lengths, std::function<void()> completion) {
   if (staging->busy)
     throw std::logic_error("a composite state write is already in flight");
   auto disk = file->acquire();
-  if (!disk) return {};
-  auto result = std::shared_ptr<const QwenCompositeState>(
-      new QwenCompositeState(layout, lengths, file, disk));
-  std::byte *staged = staging->bytes.get();
-  for (auto span : spans)
-    staged = std::copy(span.begin(), span.end(), staged);
+  if (!disk)
+    return {};
+  const size_t count =
+      (lengths.draftLength + DraftStateLayout::blockTokens - 1) /
+      DraftStateLayout::blockTokens;
+  std::vector<std::shared_ptr<SlotFile::Slot>> draftDisk;
+  std::vector<bool> writeBlock;
+  draftDisk.reserve(count);
+  writeBlock.reserve(count);
+  // Reserve the whole transfer before submitting IO. Failure leaves no
+  // partially admitted state and returns every newly reserved slot.
+  for (size_t i = 0; i < count; ++i) {
+    auto slot = blocks[i]->disk.lock();
+    writeBlock.push_back(!slot);
+    if (!slot)
+      slot = draftFile->acquire();
+    if (!slot)
+      return {};
+    draftDisk.push_back(std::move(slot));
+  }
+  auto result =
+      std::shared_ptr<const QwenCompositeState>(new QwenCompositeState(
+          layout, lengths, file, disk, draftFile, draftDisk));
+  auto operations = std::make_shared<FileOperations>();
+  operations->items.reserve(count + 1);
+  std::memcpy(staging->bytes.get(), gdn.stateBase.contents(),
+              layout.target.cellBytes());
+  auto *draft = staging->bytes.get() + layout.target.cellBytes();
+  for (size_t i = 0; i < count; ++i) {
+    if (!writeBlock[i])
+      continue;
+    auto bytes = std::span(draft + i * layout.draft.blockBytes(),
+                           layout.draft.blockBytes());
+    std::memcpy(bytes.data(), blocks[i]->page->buffer.contents(), bytes.size());
+  }
   staging->busy = true;
-  std::shared_ptr<SlotFile::Operation> operation;
   try {
-    operation = file->write(
-        std::move(disk), {std::span<const std::byte>(staging->bytes.get(), staging->size)},
-        std::move(completion));
-    return std::make_unique<FileOffload>(operation, std::move(result), staging);
+    operations->items.push_back(file->write(
+        disk, {{staging->bytes.get(), layout.target.cellBytes()}}, completion));
+    for (size_t i = 0; i < count; ++i) {
+      if (writeBlock[i])
+        operations->items.push_back(
+            draftFile->write(draftDisk[i],
+                             {{draft + i * layout.draft.blockBytes(),
+                               layout.draft.blockBytes()}},
+                             completion));
+    }
+    auto ticket =
+        std::make_unique<FileOffload>(operations, std::move(result), staging);
+    for (size_t i = 0; i < count; ++i)
+      blocks[i]->disk = draftDisk[i];
+    return ticket;
   } catch (...) {
-    if (operation)
-      operation->drain();
+    operations.reset();
     staging->busy = false;
     throw;
   }
@@ -217,7 +331,6 @@ QwenCompositeState::~QwenCompositeState() {
   if (!pool_ || !pool_->open)
     return;
   pool_->cells.push_back(std::move(slot_.gdn));
-  pool_->rings.push_back(std::move(slot_.draft));
 }
 
 QwenStateStorage::QwenStateStorage(metal::MetalBackend &backend,
@@ -225,8 +338,8 @@ QwenStateStorage::QwenStateStorage(metal::MetalBackend &backend,
                                    CompositeStateLayout layout,
                                    std::shared_ptr<SlotFile> file)
     : backend_(backend), admitAllocation_(std::move(admitAllocation)),
-      layout_(layout),
-      allocations_(std::make_shared<StateAllocationTracker>()),
+      layout_(layout), allocations_(std::make_shared<StateAllocationTracker>()),
+      draftCache_(backend, admitAllocation_, allocations_, layout.draft),
       pool_(std::make_shared<QwenBufferPool>()) {
   if (!admitAllocation_)
     throw std::invalid_argument("Qwen state allocation admission is required");
@@ -234,13 +347,15 @@ QwenStateStorage::QwenStateStorage(metal::MetalBackend &backend,
       layout_.draft.tokens != ExecutionLimits::draftContextTokens) {
     throw std::invalid_argument("Qwen composite state layout is invalid");
   }
-  if (file && file->slotBytes() != layout_.cachedBytes())
+  if (file && file->slotBytes() != layout_.target.cellBytes())
     throw std::invalid_argument("state file slots do not hold one state");
   if (file) {
     file_ = std::move(file);
+    draftFile_ = file_->sibling(layout_.draft.blockBytes());
     staging_ = std::make_shared<StateStaging>();
     void *memory = nullptr;
-    if (::posix_memalign(&memory, SlotFile::kAlignmentBytes, layout_.cachedBytes()) != 0)
+    if (::posix_memalign(&memory, SlotFile::kAlignmentBytes,
+                         layout_.cachedBytes()) != 0)
       throw std::bad_alloc();
     staging_->bytes.reset(static_cast<std::byte *>(memory));
     staging_->size = layout_.cachedBytes();
@@ -252,7 +367,6 @@ QwenStateStorage::QwenStateStorage(metal::MetalBackend &backend,
 QwenStateStorage::~QwenStateStorage() {
   pool_->open = false;
   pool_->cells.clear();
-  pool_->rings.clear();
 }
 
 const QwenSlotBuffers &QwenStateStorage::buffers(uint32_t index) const {
@@ -263,7 +377,8 @@ const QwenSlotMetadata &QwenStateStorage::metadata(uint32_t index) const {
   return slot(index).metadata;
 }
 
-metal::AllocationResult QwenStateStorage::tryActivateSlot(uint32_t index, uint64_t requestId) {
+metal::AllocationResult QwenStateStorage::tryActivateSlot(uint32_t index,
+                                                          uint64_t requestId) {
   if (!requestId)
     throw std::invalid_argument("request id must be non-zero");
   Slot &current = slot(index);
@@ -295,9 +410,8 @@ void QwenStateStorage::releaseSlot(uint32_t index, uint64_t requestId) {
     if (current.gdn[parity])
       pool_->cells.push_back(std::move(current.gdn[parity]));
   }
-  if (current.draft)
-    pool_->rings.push_back(std::move(current.draft));
-  refreshViews(current);
+  current.draft.reset();
+  current.buffers = {};
   current.metadata = {};
 }
 
@@ -306,8 +420,18 @@ uint64_t QwenStateStorage::releaseIdle(uint32_t keepCells,
   const uint64_t before = backend_.memoryStats().allocatedBytes;
   while (pool_->cells.size() > keepCells)
     pool_->cells.pop_back();
-  while (pool_->rings.size() > keepRings)
-    pool_->rings.pop_back();
+  draftCache_.releaseIdle(
+      keepRings * (layout_.draft.tokens / DraftStateLayout::blockTokens));
+  const uint64_t after = backend_.memoryStats().allocatedBytes;
+  return before >= after ? before - after : 0;
+}
+
+uint64_t QwenStateStorage::reclaimIdle() noexcept {
+  const uint64_t before = backend_.memoryStats().allocatedBytes;
+  if (!pool_->cells.empty())
+    pool_->cells.pop_back();
+  else if (draftCache_.idlePages())
+    draftCache_.releaseIdle(draftCache_.idlePages() - 1);
   const uint64_t after = backend_.memoryStats().allocatedBytes;
   return before >= after ? before - after : 0;
 }
@@ -317,14 +441,20 @@ uint32_t QwenStateStorage::idleCells() const noexcept {
 }
 
 uint32_t QwenStateStorage::idleRings() const noexcept {
-  return static_cast<uint32_t>(pool_->rings.size());
+  return draftCache_.idlePages() /
+         (layout_.draft.tokens / DraftStateLayout::blockTokens);
 }
 
 uint64_t QwenStateStorage::activationBytes() const noexcept {
   const uint64_t cells = std::tuple_size_v<decltype(Slot::gdn)>;
-  const uint64_t missing = cells - std::min<uint64_t>(pool_->cells.size(), cells);
+  const uint64_t missing =
+      cells - std::min<uint64_t>(pool_->cells.size(), cells);
   return missing * layout_.target.cellBytes() +
-         (pool_->rings.empty() ? layout_.draft.ringBytes() : 0);
+         (layout_.draft.tokens / DraftStateLayout::blockTokens -
+          std::min<uint32_t>(draftCache_.idlePages(),
+                             layout_.draft.tokens /
+                                 DraftStateLayout::blockTokens)) *
+             layout_.draft.blockBytes();
 }
 
 void QwenStateStorage::updateLengths(uint32_t index,
@@ -354,39 +484,33 @@ QwenStateStorage::snapshot(uint32_t index, QwenLogicalLengths lengths) {
   // Pooled buffers first; a denied admission puts a pooled cell back and
   // drops a fresh one, leaving no trace.
   QwenCacheSlot cacheSlot;
-  const bool pooledCell = !pool_->cells.empty();
   cacheSlot.gdn = acquireCell("qwen-state-cache-gdn");
   if (!cacheSlot.gdn)
     return nullptr;
-  cacheSlot.draft = acquireRing("qwen-state-cache-draft");
-  if (!cacheSlot.draft) {
-    if (pooledCell)
-      pool_->cells.push_back(std::move(cacheSlot.gdn));
-    return nullptr;
-  }
+  const size_t count =
+      (lengths.draftLength + DraftStateLayout::blockTokens - 1) /
+      DraftStateLayout::blockTokens;
+  cacheSlot.draft.assign(source.draft->pages.begin(),
+                         source.draft->pages.begin() + count);
   const uint32_t active = source.metadata.activeParity;
   copyExact(cacheSlot.gdn->buffers().stateBase,
             source.gdn[active]->buffers().stateBase, "cached GDN state");
-  for (uint32_t layer = 0; layer < source.buffers.draft.size(); ++layer) {
-    copyExact(cacheSlot.draft->layers()[layer].keys,
-              source.buffers.draft[layer].keys, "cached draft keys");
-    copyExact(cacheSlot.draft->layers()[layer].values,
-              source.buffers.draft[layer].values, "cached draft values");
-  }
-  return std::shared_ptr<const QwenCompositeState>(new QwenCompositeState(
-      pool_, std::move(cacheSlot), layout_, lengths, file_, staging_));
+  return std::shared_ptr<const QwenCompositeState>(
+      new QwenCompositeState(pool_, std::move(cacheSlot), layout_, lengths,
+                             file_, draftFile_, staging_));
 }
 
 std::unique_ptr<StateOffload>
-QwenStateStorage::snapshotToDisk(uint32_t index, std::function<void()> completion) {
+QwenStateStorage::snapshotToDisk(uint32_t index,
+                                 std::function<void()> completion) {
   Slot &source = slot(index);
   requireAssigned(source);
   validateLengths(source.metadata.lengths, true);
   if (!canSnapshotToDisk())
     return {};
   return QwenCompositeState::write(
-      file_, staging_,
-      stateSpans(source.buffers.gdn[source.metadata.activeParity], source.buffers.draft),
+      file_, draftFile_, staging_,
+      source.buffers.gdn[source.metadata.activeParity], source.draft->pages,
       layout_, source.metadata.lengths, std::move(completion));
 }
 
@@ -397,15 +521,6 @@ QwenStateStorage::acquireCell(std::string_view label) {
   std::shared_ptr<QwenGdnCell> cell = std::move(pool_->cells.back());
   pool_->cells.pop_back();
   return cell;
-}
-
-std::shared_ptr<DFlashDraftRing>
-QwenStateStorage::acquireRing(std::string_view label) {
-  if (pool_->rings.empty())
-    return allocateDraftRing(label);
-  std::shared_ptr<DFlashDraftRing> ring = std::move(pool_->rings.back());
-  pool_->rings.pop_back();
-  return ring;
 }
 
 void QwenStateStorage::restore(uint32_t index, const CompositeState &state,
@@ -420,29 +535,31 @@ void QwenStateStorage::restore(uint32_t index, const CompositeState &state,
   validateLengths(typed->lengths_, true);
   Slot &destination = slot(index);
   requireAssigned(destination);
-  if (!typed->slot_.gdn || !typed->slot_.draft) {
+  if (!typed->slot_.gdn || typed->slot_.draft.empty()) {
     throw std::invalid_argument("incompatible Qwen composite state");
   }
 
+  DraftKvCache::Window pages;
+  std::vector<DFlashDraftRingLayer> views;
+  if (restoreDraftState) {
+    pages = destination.draft->pages;
+    std::copy(typed->slot_.draft.begin(), typed->slot_.draft.end(),
+              pages.begin());
+    views = draftCache_.views(pages);
+  }
   const uint32_t active = destination.metadata.activeParity;
   copyExact(destination.gdn[active]->buffers().stateBase,
             typed->slot_.gdn->buffers().stateBase, "restored GDN state");
   if (restoreDraftState) {
-    for (uint32_t layer = 0; layer < destination.buffers.draft.size();
-         ++layer) {
-      copyExact(destination.buffers.draft[layer].keys,
-                typed->slot_.draft->layers()[layer].keys,
-                "restored draft keys");
-      copyExact(destination.buffers.draft[layer].values,
-                typed->slot_.draft->layers()[layer].values,
-                "restored draft values");
-    }
+    destination.draft->pages = std::move(pages);
+    destination.buffers.draft = std::move(views);
   }
   restoreLengths(index, typed->lengths_, restoreDraftState);
 }
 
-void QwenStateStorage::restoreLengths(uint32_t index, QwenLogicalLengths lengths,
-                                     bool restoreDraftState) {
+void QwenStateStorage::restoreLengths(uint32_t index,
+                                      QwenLogicalLengths lengths,
+                                      bool restoreDraftState) {
   Slot &destination = slot(index);
   if (!restoreDraftState) {
     lengths.draftBase = lengths.targetTokens;
@@ -466,21 +583,44 @@ std::unique_ptr<StateRestore> QwenStateStorage::beginRestore(
   validateLengths(typed->lengths_, true);
   Slot &destination = slot(index);
   requireAssigned(destination);
-  auto spans = stateSpans(destination.buffers.gdn[destination.metadata.activeParity],
-                          destination.buffers.draft);
+  // Read only the components execution needs. A skipped draft window cannot
+  // be promoted as a complete RAM state; the durable copy remains reusable.
+  if (restoreDraftState) {
+    if (auto admitted = prepareDraftWrite(index, 0, layout_.draft.tokens);
+        !admitted)
+      throw metal::MetalAllocationError("cannot admit draft restore pages",
+                                        admitted.failure);
+  }
+  auto operations = std::make_shared<FileOperations>();
+  operations->items.reserve(typed->draftDisk_.size() + 1);
   auto commit = [this, index, lengths = typed->lengths_, restoreDraftState,
-                 committed = std::move(committed)] {
+                 blocks = typed->draftDisk_, committed = std::move(committed)] {
+    if (restoreDraftState)
+      for (size_t i = 0; i < blocks.size(); ++i)
+        slot(index).draft->pages[i]->disk = blocks[i];
     restoreLengths(index, lengths, restoreDraftState);
     committed();
   };
-  auto operation = typed->file_->read(typed->disk_, std::move(spans), std::move(completion));
-  try {
-    return std::make_unique<FileRestore>(operation, std::move(commit),
-        [this, index, lengths = typed->lengths_] { return snapshot(index, lengths); });
-  } catch (...) {
-    operation->drain();
-    throw;
-  }
+  auto snapshot = [this, index, lengths = typed->lengths_, restoreDraftState] {
+    return restoreDraftState ? this->snapshot(index, lengths) : nullptr;
+  };
+  auto ticket = std::make_unique<FileRestore>(operations, std::move(commit),
+                                              std::move(snapshot));
+  const auto &gdn =
+      destination.buffers.gdn[destination.metadata.activeParity].stateBase;
+  operations->items.push_back(typed->file_->read(
+      typed->disk_,
+      {{static_cast<std::byte *>(gdn.contents()), gdn.sizeBytes()}},
+      completion));
+  if (restoreDraftState)
+    for (size_t i = 0; i < typed->draftDisk_.size(); ++i) {
+      const auto &buffer = destination.draft->pages[i]->page->buffer;
+      operations->items.push_back(typed->draftFile_->read(
+          typed->draftDisk_[i],
+          {{static_cast<std::byte *>(buffer.contents()), buffer.sizeBytes()}},
+          completion));
+    }
+  return ticket;
 }
 
 uint64_t QwenStateStorage::actualSlotBytes(uint32_t index) const {
@@ -502,6 +642,7 @@ metal::AllocationResult QwenStateStorage::allocateSlot(uint32_t index) {
   }
   // Pooled buffers first, then the governor for what the pool lacks. A denied
   // admission leaves no trace: pooled buffers go back, fresh ones are dropped.
+  DraftKvCache::AllocationScope allocation(draftCache_);
   std::array<std::shared_ptr<QwenGdnCell>, 2> gdn;
   std::shared_ptr<DFlashDraftRing> draft;
   metal::AllocationFailure failure = metal::AllocationFailure::None;
@@ -510,47 +651,46 @@ metal::AllocationResult QwenStateStorage::allocateSlot(uint32_t index) {
     gdn[pooledCells++] = std::move(pool_->cells.back());
     pool_->cells.pop_back();
   }
-  const bool pooledRing = !pool_->rings.empty();
-  if (pooledRing) {
-    draft = std::move(pool_->rings.back());
-    pool_->rings.pop_back();
-  }
   const auto giveBack = [&] {
     for (uint32_t parity = pooledCells; parity > 0;)
       pool_->cells.push_back(std::move(gdn[--parity]));
-    if (pooledRing)
-      pool_->rings.push_back(std::move(draft));
   };
   for (uint32_t parity = pooledCells; parity < gdn.size(); ++parity) {
     gdn[parity] = allocateGdnCell("qwen-state-cell-" + std::to_string(index) +
-                                  "-gdn-" + std::to_string(parity), &failure);
+                                      "-gdn-" + std::to_string(parity),
+                                  &failure);
     if (!gdn[parity]) {
       giveBack();
       return failure;
     }
   }
-  if (!pooledRing) {
-    draft = allocateDraftRing("qwen-state-cell-" + std::to_string(index) +
-                              "-draft", &failure);
+  {
+    draft = allocateDraftRing(
+        "qwen-state-cell-" + std::to_string(index) + "-draft", &failure);
     if (!draft) {
       giveBack();
       return failure;
     }
   }
+  QwenSlotBuffers buffers;
+  for (uint32_t parity = 0; parity < gdn.size(); ++parity)
+    buffers.gdn[parity] = gdn[parity]->buffers();
+  buffers.draft = draftCache_.views(draft->pages);
   destination.gdn = std::move(gdn);
   destination.draft = std::move(draft);
-  refreshViews(destination);
+  destination.buffers = std::move(buffers);
+  allocation.commit();
   return true;
 }
 
 std::shared_ptr<QwenGdnCell>
 QwenStateStorage::allocateGdnCell(std::string_view label,
-                                     metal::AllocationFailure *failure) {
+                                  metal::AllocationFailure *failure) {
   std::shared_ptr<QwenGdnCell> result;
   const auto admission = admitAllocation_(layout_.target.cellBytes(), [&] {
-        result = std::shared_ptr<QwenGdnCell>(
-            new QwenGdnCell(backend_, allocations_, layout_.target, label));
-      });
+    result = std::shared_ptr<QwenGdnCell>(
+        new QwenGdnCell(backend_, allocations_, layout_.target, label));
+  });
   if (!admission) {
     if (failure)
       *failure = admission.failure;
@@ -563,32 +703,70 @@ QwenStateStorage::allocateGdnCell(std::string_view label,
 
 std::shared_ptr<DFlashDraftRing>
 QwenStateStorage::allocateDraftRing(std::string_view label,
-                                     metal::AllocationFailure *failure) {
-  std::shared_ptr<DFlashDraftRing> result;
-  const auto admission = admitAllocation_(layout_.draft.ringBytes(), [&] {
-        result = std::shared_ptr<DFlashDraftRing>(
-            new DFlashDraftRing(backend_, allocations_, layout_.draft,
-                                label));
-      });
-  if (!admission) {
-    if (failure)
-      *failure = admission.failure;
-    return {};
+                                    metal::AllocationFailure *failure) {
+  static_cast<void>(label);
+  auto result = std::make_shared<DFlashDraftRing>();
+  result->pages.reserve(layout_.draft.tokens / DraftStateLayout::blockTokens);
+  for (uint32_t position = 0; position < layout_.draft.tokens;
+       position += DraftStateLayout::blockTokens) {
+    auto block = draftCache_.acquire(failure);
+    if (!block)
+      return {};
+    std::memset(block->page->buffer.contents(), 0, layout_.draft.blockBytes());
+    result->pages.push_back(std::move(block));
   }
-  if (!result)
-    throw std::logic_error("state admission skipped draft allocation");
   return result;
 }
 
-void QwenStateStorage::refreshViews(Slot &current) {
-  for (uint32_t parity = 0; parity < current.gdn.size(); ++parity) {
-    current.buffers.gdn[parity] = current.gdn[parity]
-                                      ? current.gdn[parity]->buffers()
-                                      : GdnParityBuffers{};
+metal::AllocationResult QwenStateStorage::prepareDraftWrite(uint32_t index,
+                                                            uint64_t begin,
+                                                            uint64_t end) {
+  Slot &current = slot(index);
+  requireAssigned(current);
+  if (begin > end)
+    throw std::invalid_argument("reversed draft write range");
+  if (begin == end)
+    return true;
+  const uint64_t first = begin / DraftStateLayout::blockTokens;
+  const uint64_t last =
+      (end + DraftStateLayout::blockTokens - 1) / DraftStateLayout::blockTokens;
+  const uint64_t count =
+      std::min<uint64_t>(last - first, current.draft->pages.size());
+  DraftKvCache::AllocationScope allocation(draftCache_);
+  std::array<std::shared_ptr<DraftKvCache::Block>, SPLASH_DRAFT_PAGE_COUNT>
+      replacements{};
+  bool changed = false;
+  for (uint64_t offset = 0; offset < count; ++offset) {
+    const auto &page =
+        current.draft->pages[(first + offset) % current.draft->pages.size()];
+    if (page.use_count() <= 1)
+      continue;
+    metal::AllocationFailure failure = metal::AllocationFailure::None;
+    auto replacement = draftCache_.acquire(&failure);
+    if (!replacement)
+      return failure;
+    std::memcpy(replacement->page->buffer.contents(),
+                page->page->buffer.contents(), layout_.draft.blockBytes());
+    replacements[offset] = std::move(replacement);
+    changed = true;
   }
-  current.buffers.draft =
-      current.draft ? current.draft->layers()
-                    : std::vector<DFlashDraftRingLayer>{};
+  if (changed) {
+    auto pages = current.draft->pages;
+    for (uint64_t offset = 0; offset < count; ++offset)
+      if (replacements[offset])
+        pages[(first + offset) % pages.size()] =
+            std::move(replacements[offset]);
+    // Build every view before replacing either table. Even a host allocation
+    // failure leaves execution and snapshots pointing at the original pages.
+    auto views = draftCache_.views(pages);
+    current.draft->pages = std::move(pages);
+    current.buffers.draft = std::move(views);
+  }
+  for (uint64_t offset = 0; offset < count; ++offset)
+    current.draft->pages[(first + offset) % current.draft->pages.size()]
+        ->disk.reset();
+  allocation.commit();
+  return true;
 }
 
 QwenStateStorage::Slot &QwenStateStorage::slot(uint32_t index) {
@@ -612,10 +790,9 @@ void QwenStateStorage::validateLengths(const QwenLogicalLengths &lengths,
       lengths.draftEnd() > lengths.targetTokens) {
     throw std::invalid_argument("invalid draft ring metadata");
   }
-  if (cacheSnapshot &&
-      (!lengths.targetTokens ||
-       !lengths.hasCompleteDraftWindow(layout_.draft.tokens) ||
-       lengths.targetTokens % kv::kPageTokens)) {
+  if (cacheSnapshot && (!lengths.targetTokens ||
+                        !lengths.hasCompleteDraftWindow(layout_.draft.tokens) ||
+                        lengths.targetTokens % kv::kPageTokens)) {
     throw std::invalid_argument(
         "composite snapshot requires equal page-aligned committed lengths");
   }

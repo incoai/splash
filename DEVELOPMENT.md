@@ -867,10 +867,46 @@ refreshes recency. Real request use still updates recency while a maintenance
 pin is held. This prevents IO completion order from masquerading as access
 order; RAM and disk replacement retain their existing policies.
 
+### Draft KV pages
+
+Draft execution reads a circular page table for its 2048-token sliding window.
+Each BF16 page holds 128 tokens across all draft layers. The page size matches
+one attention tile, preserving the existing tensor loads and reduction order;
+there is no gather into a separate dense ring before attention. Verification
+scratch stays separate, and only accepted context enters the page table.
+
+A cached restore point copies GDN state and retains the draft pages it needs.
+RAM restore shares those pages directly. Before execution writes a shared page,
+the model requests a private copy through the same memory admission and reclaim
+path as target KV growth. Exclusive pages are overwritten in place. Cancellation
+or a refused allocation leaves existing snapshots unchanged. Page references
+and Metal views are replaced together only after preparation succeeds. Failed
+activation/COW batches return the page pool to its previous capacity, so their
+partial allocations cannot create false progress for admission retries. During
+host-pressure pauses, draft growth does not evict target KV for backing it cannot
+reuse. This applies in
+RAM-only, offload-only, persistent-only and combined modes; disabling offload
+still disables pressure-driven disk writes.
+
+GDN, target KV and draft KV keep storage appropriate to their geometry while
+sharing the engine memory budget. Draft pages are reference counted and return
+to a reusable pool after their last owner leaves. Pressure reclaims individual
+idle draft pages, including a partial window. State-cache accounting counts
+shared allocations once and excludes active ownership from reclaimable bytes.
+GDN and draft use separate disk records in the same persistent file. Overlapping
+snapshots reuse existing draft records; a changed page alone needs a new record.
+A GDN-only restore skips draft IO and is not promoted as a complete RAM snapshot.
+
+Complete restore points remain the cache's state eviction unit. Shared pages
+survive eviction while another snapshot or active request owns them; persistence
+publishes only complete prefixes. This does not make draft and GDN independently
+evictable like separate attention/state groups in vLLM. It avoids introducing
+partially recoverable states into Splash's current prefix lookup contract.
+
 ### Disk cache
 
 `--max-cache-disk` adds an optional SSD tier for cached request states (GDN cell
-plus draft ring) and KV pages. Default: `0` (off). RAM and disk copies share the
+plus referenced draft pages) and target KV pages. Default: `0` (off). RAM and disk copies share the
 same block tree and recency order. Restoring a prefix keeps its disk copy, so
 its next eviction needs no write while that copy remains cached.
 
@@ -904,12 +940,13 @@ state, with the state read alongside. Cancellation drops unsubmitted, unshared
 reads; submitted transfers drain before their buffers can be reused. Restored
 states remain usable even when there is no room to promote them into RAM cache.
 
-With persistence off, two unlinked temporary files share one quota for live slots. A full quota
+With persistence off, GDN, draft pages and target KV use three unlinked temporary
+files sharing one quota for live slots. A full quota
 replaces the oldest redundant copy first, then the oldest sole copy, across
 both KV and states. A quota smaller than the working set can cause repeated
 reads and writes; it is not a write-rate limit. Each file retains its allocated
 high-water mark until shutdown, so filesystem space can exceed the live-slot
-quota. Closing the server releases both files.
+quota. Closing the server releases all temporary files.
 
 Temporary-file transfers use `pread`/`pwrite` with `F_NOCACHE`. The KV staging ring, 128
 pages that the GPU copies through, is Metal memory within `--max-memory`: about
@@ -954,7 +991,7 @@ is active. Do not copy the main file alone while the server
 is running. Only one server may open a cache file at a time.
 
 The two sizes add to the shared live-slot budget. The persistent size also caps
-the durable subset, counting a shared KV page once. Offload may use spare space
+the durable subset, counting each shared target or draft KV page once. Offload may use spare space
 in this pool; disabling offload prevents pressure-driven eviction writes, while existing
 durable copies remain available for reclaim and restore. Increasing a quota
 keeps existing entries. Decreasing the durable quota selects the newest complete
@@ -999,8 +1036,8 @@ unchanged, so it requires no database UPDATE or journal write. The status
 temporary copies go first: RAM still serves them, while dropping durable
 ownership would lose restart recovery. Durable prefixes then compete by recency
 with sole temporary copies, as complete units rather than individual slots. Durable
-admission requires at least 512 tokens: a tiny prompt still needs a full
-recurrent/draft snapshot, so persisting it wastes writes and can evict useful
+admission requires at least 512 tokens: a tiny prompt still needs the full
+recurrent state, so persisting it wastes writes and can evict useful
 long prefixes. Short prefixes remain eligible for the RAM cache and temporary
 disk tier. Under durable-quota pressure, a new unproven tail is skipped before copying
 payload; a genuine cache hit or an already observed junction can admit it later.

@@ -3,6 +3,7 @@
 #include "engine/CacheRecency.hpp"
 #include "engine/KvCache.hpp"
 #include "engine/RecencyOrder.hpp"
+#include "engine/StateResources.hpp"
 #include "model/Model.hpp"
 
 #include <cstdint>
@@ -194,6 +195,7 @@ private:
   struct Entry {
     std::shared_ptr<const CompositeState> ram;
     std::shared_ptr<const CompositeState> disk;
+    std::vector<StateResource> ramResources, diskResources;
     uint32_t pins = 0;
     uint64_t lastUsed = 0;
     bool checkpoint = false;
@@ -236,6 +238,9 @@ private:
   void reindex(uint64_t kvBlock, Entry &entry) noexcept;
   static void unlink(Entry &entry) noexcept;
   void discardDisk(Entry &entry) noexcept;
+  void retainRam(Entry &entry, const CompositeState &state);
+  uint64_t releaseRam(Entry &entry) noexcept;
+  void retainDisk(Entry &entry, const CompositeState &state);
   // An ordinary publication or reuse: the block has held a reusable state,
   // and a checkpoint is upgraded.
   void makeOrdinary(uint64_t kvBlock, Entry &entry);
@@ -251,6 +256,7 @@ private:
   RecencyOrder diskOnly_;
   uint64_t promotions_ = 0;
   uint64_t promotionsSkipped_ = 0;
+  StateResources ramResources_, diskResources_, checkpointResources_;
   uint64_t bytes_ = 0;
   uint64_t diskBytes_ = 0;
   uint32_t pinnedEntries_ = 0;

@@ -30,3 +30,9 @@ kernel void sparse_fill_copy_u32(device uint *sparseValues [[buffer(0)]],
         readback[gid] = sparseValues[gid];
     }
 }
+
+// The source has no ordinary buffer binding: only its GPU address is passed.
+kernel void test_indirect_copy_u32(constant ulong &address [[buffer(0)]],
+                                   device uint *destination [[buffer(1)]]) {
+    destination[0] = reinterpret_cast<device const uint *>(address)[0];
+}

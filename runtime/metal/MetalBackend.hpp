@@ -79,6 +79,7 @@ public:
   [[nodiscard]] BufferStorage storage() const noexcept;
   // Returns nullptr for private buffers. The pointer covers this view only.
   [[nodiscard]] void *contents() const noexcept;
+  [[nodiscard]] uint64_t gpuAddress() const noexcept;
   // Allocation identity and exact view range, including Private storage.
   // This compares metadata only; it never maps or reads device contents.
   [[nodiscard]] bool sameView(const MetalBuffer &other) const noexcept;
@@ -149,6 +150,8 @@ struct ComputeDispatch {
   std::vector<BytesBinding> bytes;
   DispatchSize threadgroups;
   DispatchSize threadsPerThreadgroup;
+  // Backing accessed through GPU addresses in a page table.
+  std::vector<MetalBuffer> indirectBuffers{};
 };
 
 struct CommandTiming {

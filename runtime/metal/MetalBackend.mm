@@ -673,6 +673,12 @@ BufferStorage MetalBuffer::storage() const noexcept {
                                       : BufferStorage::Shared;
 }
 
+uint64_t MetalBuffer::gpuAddress() const noexcept {
+    return impl_ && impl_->allocation
+               ? impl_->allocation->buffer.gpuAddress + impl_->offsetBytes
+               : 0;
+}
+
 void *MetalBuffer::contents() const noexcept {
     if (!impl_ || !impl_->allocation ||
         impl_->allocation->storage != BufferStorage::Shared) {
@@ -1414,6 +1420,12 @@ CommandTicket MetalBackend::submitCommandAsync(
             }
             claim(binding.index);
         }
+        for (const auto &buffer : dispatch.indirectBuffers) {
+            if (!buffer.impl_ || !buffer.impl_->allocation ||
+                buffer.impl_->allocation->accounting.get() !=
+                    impl_->accounting.get())
+                throw MetalBackendError("invalid indirect dispatch buffer");
+        }
         for (const BytesBinding &binding : dispatch.bytes) {
             if (!binding.data || !binding.sizeBytes) {
                 throw MetalBackendError("compute byte binding is empty");
@@ -1448,6 +1460,14 @@ CommandTicket MetalBackend::submitCommandAsync(
             }
         }
     }
+    std::unordered_set<const MetalAllocation *> indirectAllocations;
+    for (const auto &dispatch : dispatches)
+        for (const auto &buffer : dispatch.indirectBuffers) {
+            const auto &allocation = buffer.impl_->allocation;
+            indirectAllocations.insert(allocation.get());
+            if (retained.insert(allocation.get()).second)
+                ticketState->retainedAllocations.push_back(allocation);
+        }
     ticketState->sequence = impl_->asyncState->beginSubmission(dispatches.size());
 
     auto failBeforeCommit = [&](std::string message) {
@@ -1477,6 +1497,11 @@ CommandTicket MetalBackend::submitCommandAsync(
             failBeforeCommit("unable to create Metal compute encoder");
         }
         try {
+            // A page can appear as K and V in every layer. Declare its use once
+            // for this encoder; the ticket owns it until command completion.
+            for (const auto *allocation : indirectAllocations)
+                [encoder useResource:allocation->buffer
+                               usage:MTLResourceUsageRead | MTLResourceUsageWrite];
             for (const PreparedDispatch &item : prepared) {
                 const ComputeDispatch &dispatch = *item.source;
                 [encoder setComputePipelineState:item.pipeline];

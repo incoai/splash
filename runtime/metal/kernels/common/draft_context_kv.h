@@ -19,10 +19,16 @@ inline void draft_context_kv_phase(
   uint slot = position % Window;
   device const bfloat *source =
       context_qkv + ulong(row) * PackedWidth + QWidth + head_index * HeadDim;
-  device bfloat *key =
-      keys + (ulong(head_index) * params.cache_stride + slot) * HeadDim;
-  device bfloat *value =
-      values + ulong(head_index) * HeadDim * params.cache_stride + slot;
+  uint stride = params.cache_stride;
+  if (params.paged) {
+    uint page = slot / SPLASH_DRAFT_PAGE_TOKENS;
+    keys = reinterpret_cast<device bfloat *>(params.pages.keys[page]);
+    values = reinterpret_cast<device bfloat *>(params.pages.values[page]);
+    slot %= SPLASH_DRAFT_PAGE_TOKENS;
+    stride = SPLASH_DRAFT_PAGE_TOKENS;
+  }
+  device bfloat *key = keys + (ulong(head_index) * stride + slot) * HeadDim;
+  device bfloat *value = values + ulong(head_index) * HeadDim * stride + slot;
 
   float element = thread_index < HeadDim ? float(source[thread_index]) : 0.0f;
   float square_sum = simd_sum(element * element);
@@ -39,8 +45,7 @@ inline void draft_context_kv_phase(
   if (thread_index < HeadDim) {
     normalized[thread_index] =
         bfloat(element * reductions[0] * float(k_norm[thread_index]));
-    value[ulong(thread_index) * params.cache_stride] =
-        source[KWidth + thread_index];
+    value[ulong(thread_index) * stride] = source[KWidth + thread_index];
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (thread_index < HeadDim / 2) {

@@ -89,13 +89,26 @@ struct State final : CompositeState {
   std::shared_ptr<SlotFile> file;
   std::shared_ptr<SlotFile::Slot> slot;
   uint64_t boundary;
+  std::vector<std::shared_ptr<SlotFile::Slot>> components;
   State(std::shared_ptr<SlotFile> f, uint64_t b,
-        std::shared_ptr<SlotFile::Slot> s = {})
-      : file(std::move(f)), slot(std::move(s)), boundary(b) {}
-  uint64_t bytes() const noexcept override { return unit; }
-  uint64_t residentBytes() const noexcept override { return slot ? 0 : unit; }
+        std::shared_ptr<SlotFile::Slot> s = {},
+        std::vector<std::shared_ptr<SlotFile::Slot>> c = {})
+      : file(std::move(f)), slot(std::move(s)), boundary(b),
+        components(std::move(c)) {}
+  uint64_t bytes() const noexcept override {
+    uint64_t result = unit;
+    for (const auto &component : components)
+      result += component->bytes();
+    return result;
+  }
+  uint64_t offloadBytes() const noexcept override { return slot ? 0 : unit; }
+  uint64_t residentBytes() const noexcept override {
+    return slot ? 0 : bytes();
+  }
   bool canOffload() const noexcept override { return file && !slot; }
-  DiskStateRecord diskRecord() const override { return {slot, {boundary}}; }
+  DiskStateRecord diskRecord() const override {
+    return {slot, {boundary}, components};
+  }
   bool durable() const noexcept override { return slot && slot->durable(); }
   std::unique_ptr<StateOffload>
   offload(std::function<void()> done) const override {
@@ -116,21 +129,30 @@ struct State final : CompositeState {
       return {};
     auto ticket = std::make_unique<Ticket>();
     ticket->data.resize(unit, std::byte{0x5a});
-    ticket->snapshot = std::make_shared<State>(file, boundary, held);
+    ticket->snapshot =
+        std::make_shared<State>(file, boundary, held, components);
     ticket->operation = file->write(held, {ticket->data}, std::move(done));
     return ticket;
   }
 };
 struct Storage final : StateStorage {
   std::shared_ptr<SlotFile> file;
-  explicit Storage(std::shared_ptr<SlotFile> f) : file(std::move(f)) {}
+  std::shared_ptr<SlotFile> componentFile;
+  explicit Storage(std::shared_ptr<SlotFile> f)
+      : file(std::move(f)), componentFile(file->sibling(unit)) {}
+  std::shared_ptr<SlotFile::Slot>
+  reopenStateComponent(CacheStore::Record record) override {
+    require(record.bytes == unit, "wrong component geometry");
+    return componentFile->reopen(record.id);
+  }
   uint64_t actualAllocatedBytes() const noexcept override { return 0; }
   uint64_t releaseIdle(uint32_t, uint32_t) noexcept override { return 0; }
   std::shared_ptr<const CompositeState>
   reopenState(DiskStateRecord record, uint64_t boundary) override {
     require(record.metadata == std::vector<uint64_t>{boundary},
             "state boundary changed");
-    return std::make_shared<State>(file, boundary, record.slot);
+    return std::make_shared<State>(file, boundary, record.slot,
+                                   record.components);
   }
 };
 struct Fixture {
@@ -160,8 +182,9 @@ struct Fixture {
                                minimumTokens, writeRate, writeBurst},
                               temporary != 0);
   }
-  uint64_t publish(uint32_t seed, uint32_t count = 64,
-                   bool checkpoint = false) {
+  uint64_t
+  publish(uint32_t seed, uint32_t count = 64, bool checkpoint = false,
+          std::vector<std::shared_ptr<SlotFile::Slot>> components = {}) {
     std::vector<uint32_t> tokens(count);
     std::iota(tokens.begin(), tokens.end(), seed);
     cache.beginRequest(seed);
@@ -175,8 +198,11 @@ struct Fixture {
     }
     static_cast<void>(cache.publishCommittedBlocks(seed, tokens, count));
     const uint64_t block = cache.blockAt(seed, count);
-    cache.publishCompositeState(
-        block, std::make_shared<State>(stateFile, count), checkpoint);
+    cache.publishCompositeState(block,
+                                std::make_shared<State>(stateFile, count,
+                                                        nullptr,
+                                                        std::move(components)),
+                                checkpoint);
     cache.endRequest(seed);
     return block;
   }
@@ -203,6 +229,52 @@ struct Fixture {
     require(stateFile->metadata([] {})->wait(), "metadata drain failed");
   }
 };
+
+void sharedComponents(const std::filesystem::path &path) {
+  {
+    Fixture f(path, 7 * unit);
+    auto block = f.storage.componentFile->acquire();
+    std::vector<std::byte> payload(unit, std::byte{0x71});
+    require(f.storage.componentFile->write(block, {payload}, {})->wait(),
+            "shared component write failed");
+    f.publish(100, 64, false, {block});
+    f.settle();
+    f.publish(200, 64, false, {block});
+    f.settle();
+    require(f.cache.snapshot().persistent.usedBytes == 7 * unit &&
+                f.cache.snapshot().persistent.entries == 2,
+            "persistent component charged once per prefix");
+  }
+  {
+    Fixture f(path, 7 * unit);
+    require(f.cache.snapshot().persistent.restored == 2 &&
+                f.budget->usedBytes() == 7 * unit,
+            "shared components did not reopen within the unique quota");
+    auto first = f.lookup(100), second = f.lookup(200);
+    require(first.resumeBoundary() == 64 && second.resumeBoundary() == 64,
+            "component-backed prefixes lost their restore points");
+    auto a = first.state->state()->diskRecord(),
+         b = second.state->state()->diskRecord();
+    require(a.components.size() == 1 && a.components[0] == b.components[0],
+            "reopened prefixes do not share component ownership");
+  }
+  {
+    Fixture f(path, 4 * unit);
+    require(f.cache.snapshot().persistent.restored == 1 &&
+                f.budget->usedBytes() == 4 * unit,
+            "quota resize did not retain a complete component-backed prefix");
+    auto hit = f.lookup(200);
+    require(hit.resumeBoundary() == 64,
+            "resize evicted the newest complete prefix");
+    auto record = hit.state->state()->diskRecord();
+    std::vector<std::byte> payload(unit);
+    require(f.storage.componentFile->read(record.components[0], {payload}, {})
+                    ->wait() &&
+                payload.front() == std::byte{0x71} &&
+                payload.back() == std::byte{0x71},
+            "evicting one prefix retired a shared component still in use");
+  }
+}
 
 void pressureAdmission(const std::filesystem::path &path) {
   {
@@ -787,7 +859,7 @@ void interruptedPublications(const std::filesystem::path &path) {
     require(!prefixes.empty(), "interrupted write lost all committed prefixes");
     std::atomic<bool> cancelled{false};
     for (const auto &prefix : prefixes) {
-      require(f.lookup(static_cast<uint32_t>(prefix.metadata.at(8)))
+      require(f.lookup(static_cast<uint32_t>(prefix.metadata.at(9)))
                       .resumeBoundary() == 64,
               "interrupted publication lost its graph");
       for (const auto &record : prefix.records) {
@@ -854,6 +926,7 @@ int main(int argc, char **argv) {
     }
     Directory directory;
     admissionFloor(directory.path / "admission.sqlite");
+    sharedComponents(directory.path / "components.sqlite");
     pressureAdmission(directory.path / "pressure.sqlite");
     writePacing(directory.path / "pacing.sqlite");
     runtimeAndRestart(directory.path / "runtime.sqlite");

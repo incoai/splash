@@ -1,5 +1,6 @@
 #pragma once
 
+#include "metal/abi/DraftAttention.h"
 #include <cstdint>
 
 namespace splash::model {
@@ -51,6 +52,7 @@ struct GdnStateLayout final {
 
 struct DraftStateLayout final {
   static constexpr uint32_t bfloat16Bytes = 2;
+  static constexpr uint32_t blockTokens = SPLASH_DRAFT_PAGE_TOKENS;
 
   uint32_t layers = 0;
   uint32_t kvHeads = 0;
@@ -67,6 +69,14 @@ struct DraftStateLayout final {
     return uint64_t{layers} * 2 * tensorBytes();
   }
 
+  [[nodiscard]] constexpr uint64_t blockBytes() const noexcept {
+    return GdnStateLayout::align(uint64_t{layers} * 2 * kvHeads * blockTokens *
+                                 headDimension * bfloat16Bytes);
+  }
+  [[nodiscard]] constexpr uint64_t cacheBytes() const noexcept {
+    return tokens / blockTokens * blockBytes();
+  }
+
   bool operator==(const DraftStateLayout &) const = default;
 };
 
@@ -78,10 +88,10 @@ struct CompositeStateLayout final {
     return target.valid() && draft.valid();
   }
   [[nodiscard]] constexpr uint64_t activeCellBytes() const noexcept {
-    return 2 * target.cellBytes() + draft.ringBytes();
+    return 2 * target.cellBytes() + draft.cacheBytes();
   }
   [[nodiscard]] constexpr uint64_t cachedBytes() const noexcept {
-    return target.cellBytes() + draft.ringBytes();
+    return target.cellBytes() + draft.cacheBytes();
   }
 
   bool operator==(const CompositeStateLayout &) const = default;

@@ -194,6 +194,44 @@ void demoteLeaves(engine::Cache &cache, test::TestKvTier &tier, uint32_t leaves)
 
 // Background ownership must not turn IO completion into a cache hit. Actual
 // requests still refresh state and KV recency while that ownership is held.
+void testSharedStateAccounting() {
+  struct SharedState final : CompositeState {
+    const void *shared;
+    explicit SharedState(const void *identity) : shared(identity) {}
+    uint64_t bytes() const noexcept override { return 150; }
+    std::vector<StateResource> resources() const override {
+      return {{this, 100}, {shared, 50}};
+    }
+  };
+  test::TestKvBacking backing(2, 100);
+  KvPool pool(backing);
+  CacheRecency recency;
+  KvCache kv(pool, cacheNamespace(), recency);
+  StateCache states(kv, recency);
+  auto pages = pool.acquirePages(2, false);
+  require(pages.granted(), "shared state fixture has no pages");
+  std::array<uint32_t, 32> tokens{};
+  const uint64_t first = kv.insert(0, tokens, pages.pages[0]).id;
+  tokens.fill(1);
+  const uint64_t second = kv.insert(0, tokens, pages.pages[1]).id;
+  for (auto page : pages.pages)
+    pool.releasePage(page, false);
+  int identity = 0;
+  states.publish(first, std::make_shared<SharedState>(&identity), true);
+  states.publish(second, std::make_shared<SharedState>(&identity), true);
+  require(states.snapshot().bytes == 250 &&
+              states.snapshot().checkpointBytes == 250,
+          "shared state backing was charged twice");
+  require(states.touchIfStored(first), "checkpoint upgrade failed");
+  require(states.snapshot().checkpointBytes == 150,
+          "checkpoint upgrade lost backing still used by another checkpoint");
+  require(states.evict(second).reclaimedBytes == 100 &&
+              states.snapshot().bytes == 150,
+          "eviction counted shared backing as reclaimed");
+  require(states.evict(first).reclaimedBytes == 150 && !states.snapshot().bytes,
+          "last owner did not release shared backing");
+}
+
 void testMaintenanceLeasesPreserveRequestRecency() {
   test::TestKvBacking backing(2, 100);
   KvPool pool(backing);
@@ -2574,6 +2612,7 @@ int main() {
     testCheckpointPressurePreservesHotPrefix();
     testLogicalKvPressureStillReclaimsPages();
     testSchedulingProbeDoesNotChangeCachePolicy();
+    testSharedStateAccounting();
     testMaintenanceLeasesPreserveRequestRecency();
     testValidAdmissionProbePreservesLookupAndAccounting();
     testProbeFallsBackWhenPromptChanges();

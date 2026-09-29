@@ -558,14 +558,15 @@ bool Engine::admit(Request &active, double now) {
     // that resumes, or one that waits for a restore.
     KvAdmission kv;
     if (lookup.state)
-      kv = admitKv([&] { return cache_.restoreRequest(requestId, lookup); });
+      kv =
+          admitGrowth([&] { return cache_.restoreRequest(requestId, lookup); });
     const bool restoring =
         lookup.state && (!lookup.state->state()->residentBytes() ||
                          cache_.kvRestoreStatus(requestId) == KvRestoreStatus::Pending);
     if (kv.allocation.granted() && (resuming || restoring)) {
       const uint64_t workEnd =
           resuming ? active.resumeKvTargetTokens : uint64_t{resumeBoundary} + 1;
-      kv = admitKv([&] { return cache_.ensureTokens(requestId, workEnd); });
+      kv = admitGrowth([&] { return cache_.ensureTokens(requestId, workEnd); });
     }
     if (!kv.allocation.granted()) {
       // The host continuation survives this failed admission. No recurrent
@@ -1013,10 +1014,22 @@ Engine::Prepared Engine::prepare(BatchPlan &plan,
         plan.kind == WorkKind::Prefill
             ? position + scheduled.tokenCount
             : position + model::ExecutionLimits::targetVerifyRows;
-    const KvAdmission kv =
-        admitKv([&] { return cache_.ensureTokens(active.request.id, workEnd); });
+    const KvAdmission kv = admitGrowth(
+        [&] { return cache_.ensureTokens(active.request.id, workEnd); });
     if (!kv.allocation.granted()) {
       denied.push_back(Denied{active.request.id, kv.allocation, workEnd, kv.denial});
+      continue;
+    }
+    const KvAdmission state = admitGrowth([&] {
+      const auto allocation =
+          model_.prepareStep(active.request.id, position, workEnd);
+      return allocation ? TokenAdmission{}
+                        : TokenAdmission{KvPageAcquireFailure::PhysicalCapacity,
+                                         0, 0, allocation.failure};
+    });
+    if (!state.allocation.granted()) {
+      denied.push_back(
+          Denied{active.request.id, state.allocation, workEnd, state.denial});
       continue;
     }
     admitted.push_back(scheduled);
@@ -1120,7 +1133,8 @@ Engine::Verdict Engine::judge(const Denial &denial, uint64_t requestId) const {
   return Verdict::Fail;
 }
 
-Engine::KvAdmission Engine::admitKv(const std::function<TokenAdmission()> &attempt) {
+Engine::KvAdmission
+Engine::admitGrowth(const std::function<TokenAdmission()> &attempt) {
   const uint64_t releaseGeneration = cache_.releaseGeneration();
   bool reclaimed = false;
   bool pendingReclaim = false;
@@ -1196,6 +1210,10 @@ bool Engine::reclaimIdleState() noexcept {
 CacheReclaimResult Engine::reuseIdleBackingWhilePaused(const TokenAdmission &admission) {
   if (reclaimIdleState())
     return {true, 0};
+  // A model-side allocation (for example draft COW) cannot reuse target
+  // KV backing. Under host pressure, leave its cached prefixes in place.
+  if (!admission.additionalPages)
+    return {};
   const KvPoolSnapshot pool = cache_.snapshot().pool;
   // Cached prefixes can also have active owners; those pages cannot be reused.
   const uint32_t reusable = pool.pagesResident - pool.pagesActive;
@@ -1464,7 +1482,7 @@ void Engine::finishCapacity(Request &active, const TokenAdmission &admission) {
       admission.allocationFailure != metal::AllocationFailure::Capacity) {
     finishFailure(active,
                   {"capacity_exhausted",
-                   std::string("could not allocate KV target: ") +
+                   std::string("could not allocate execution backing: ") +
                        metal::allocationFailureName(admission.allocationFailure) +
                        " (additional_pages=" +
                        std::to_string(admission.additionalPages) +

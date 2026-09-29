@@ -1,5 +1,6 @@
 #include "tuning/DraftAttentionTuning.hpp"
 
+#include "metal/abi/DraftAttention.h"
 #include "tuning/LinearNumerics.hpp"
 
 #include <algorithm>
@@ -103,14 +104,18 @@ public:
       buffers_[i] = backend.view(base_, offset, plan_.sizes[i]);
       offset += aligned(plan_.sizes[i]);
     }
+    const uint64_t pageBytes = plan_.ringBytes / SPLASH_DRAFT_PAGE_COUNT;
     for (uint32_t lane = 0; lane < plan_.workload.lanes; ++lane) {
-      keys_[lane] = backend.view(get(Tensor::RingKeys), lane * plan_.ringBytes, plan_.ringBytes);
-      values_[lane] = backend.view(get(Tensor::RingValues), lane * plan_.ringBytes, plan_.ringBytes);
+      for (uint32_t page = 0; page < SPLASH_DRAFT_PAGE_COUNT; ++page) {
+        const uint64_t offset = lane * plan_.ringBytes + page * pageBytes;
+        context_[lane].keyPages.push_back(
+            backend.view(get(Tensor::RingKeys), offset, pageBytes));
+        context_[lane].valuePages.push_back(
+            backend.view(get(Tensor::RingValues), offset, pageBytes));
+      }
     }
-    for (uint32_t lane = plan_.workload.lanes; lane < kLanes; ++lane) {
-      keys_[lane] = keys_[0];
-      values_[lane] = values_[0];
-    }
+    for (uint32_t lane = plan_.workload.lanes; lane < kLanes; ++lane)
+      context_[lane] = context_[0];
   }
 
   bool initialize(const MeasurementStop &stop) {
@@ -169,8 +174,10 @@ public:
          get(Tensor::KeyNorm), get(Tensor::RopeCos), get(Tensor::RopeSin),
          get(Tensor::QueryKeys), get(Tensor::QueryValues)}, plan);
     DraftAttention::addDecode(graph,
-        {get(Tensor::Grouped), keys_, values_, get(Tensor::QueryKeys),
-         get(Tensor::QueryValues)}, histories[history], kWindow, plan);
+                              {get(Tensor::Grouped), context_,
+                               get(Tensor::QueryKeys),
+                               get(Tensor::QueryValues)},
+                              histories[history], kWindow, plan);
     DraftAttention::addReorder(graph, get(Tensor::Grouped), get(Tensor::Packed), plan);
     convolution(Tensor::Input1, Tensor::Dynamic0, Tensor::Weights0, Tensor::Residual0,
                   Tensor::Convolution1, DraftConvolutionStage::Residual);
@@ -207,7 +214,7 @@ private:
   FixturePlan plan_;
   metal::MetalBuffer base_;
   std::array<metal::MetalBuffer, index(Tensor::Count)> buffers_{};
-  std::array<metal::MetalBuffer, kLanes> keys_{}, values_{};
+  std::array<DraftKvBuffers, kLanes> context_{};
   std::array<bool, required.size()> haveReference_{};
 };
 } // namespace

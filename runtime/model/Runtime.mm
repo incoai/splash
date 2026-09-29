@@ -1149,18 +1149,12 @@ struct Runtime::Impl {
 
   void bindDraftRings(
       std::span<Request *const> entries,
-      std::vector<std::array<MetalBuffer, kLaneCount>> &keys,
-      std::vector<std::array<MetalBuffer, kLaneCount>> &values) const {
-    keys.resize(geometry.draft.layers);
-    values.resize(geometry.draft.layers);
-    for (uint32_t layer = 0; layer < geometry.draft.layers; ++layer) {
-      for (uint32_t lane = 0; lane < kLaneCount; ++lane) {
-        const auto &ring =
+      std::vector<std::array<ops::DraftKvBuffers, kLaneCount>> &context) const {
+    context.resize(geometry.draft.layers);
+    for (uint32_t layer = 0; layer < geometry.draft.layers; ++layer)
+      for (uint32_t lane = 0; lane < kLaneCount; ++lane)
+        context[layer][lane] =
             states.buffers(laneEntry(entries, lane).slot).draft[layer];
-        keys[layer][lane] = ring.keys;
-        values[layer][lane] = ring.values;
-      }
-    }
   }
 
   void encodeDraftBatchGraph(CommandGraph &graph,
@@ -1205,7 +1199,7 @@ struct Runtime::Impl {
     buffers.ropeCos = d(DecodeTensor::DraftRopeCos);
     buffers.ropeSin = d(DecodeTensor::DraftRopeSin);
     buffers.gateScratch = decodeArena->gateScratch();
-    bindDraftRings(entries, buffers.persistentKeys, buffers.persistentValues);
+    bindDraftRings(entries, buffers.context);
     draftModel.addDecode(graph, std::move(buffers),
                          targetModel.vocabularyProjection(), cacheLengths,
                          lanes, stats);
@@ -1384,7 +1378,7 @@ struct Runtime::Impl {
     buffers.ropeCos = d(DecodeTensor::DraftRopeCos);
     buffers.ropeSin = d(DecodeTensor::DraftRopeSin);
     buffers.retainedCounts = d(DecodeTensor::RetainedCount);
-    bindDraftRings(entries, buffers.persistentKeys, buffers.persistentValues);
+    bindDraftRings(entries, buffers.context);
     draftModel.addContextCommit(graph, std::move(buffers), startPositions,
                                 lanes, stats);
   }
@@ -2020,6 +2014,25 @@ Runtime::prefill(const BatchPlan &plan, std::span<const ModelBatchItem> items) {
   return prefillAsync(plan, items, {})->wait();
 }
 
+metal::AllocationResult Runtime::prepareStep(uint64_t requestId, uint64_t begin,
+                                             uint64_t end) {
+  const auto &entry = impl_->request(requestId);
+  if (entry.promptComplete)
+    return impl_->states.prepareDraftWrite(entry.slot, begin, end);
+  if (!entry.draftContextPlan)
+    throw std::logic_error("prefill request has no draft context plan");
+  // Early prefill chunks can deliberately skip draft capture. Admit only the
+  // pages this dispatch will write, preserving shared pages and disk records.
+  const auto captures = draftCaptureSpansForDispatch(
+      *entry.draftContextPlan, static_cast<uint32_t>(begin),
+      static_cast<uint32_t>(end));
+  for (const auto &capture : captures)
+    if (auto admitted = impl_->states.prepareDraftWrite(
+            entry.slot, capture.absoluteBegin, capture.absoluteEnd); !admitted)
+      return admitted;
+  return true;
+}
+
 std::unique_ptr<ModelBatchTicket>
 Runtime::submit(const BatchPlan &plan, std::span<const ModelBatchItem> items,
                 std::function<void()> completion) {
@@ -2037,6 +2050,13 @@ Runtime::prefillAsync(const BatchPlan &plan,
                       std::span<const ModelBatchItem> items,
                       std::function<void()> completion) {
   validatePlan(plan, items, WorkKind::Prefill);
+  for (const auto &item : items) {
+    const auto admission = prepareStep(item.requestId, item.logicalPosition,
+                                       item.logicalPosition + item.tokenCount);
+    if (!admission)
+      throw metal::MetalAllocationError("draft writable page admission failed",
+                                        admission.failure);
+  }
   if (plan.decodeStage != DecodeStage::Regular) {
     throw std::invalid_argument("Qwen prefill cannot resume a mask plan");
   }
@@ -2176,6 +2196,14 @@ Runtime::decodeAsync(const BatchPlan &plan,
                      std::span<const ModelBatchItem> items,
                      std::function<void()> completion) {
   validatePlan(plan, items, WorkKind::Decode);
+  for (const auto &item : items) {
+    const auto admission =
+        prepareStep(item.requestId, item.logicalPosition,
+                    item.logicalPosition + ExecutionLimits::targetVerifyRows);
+    if (!admission)
+      throw metal::MetalAllocationError("draft writable page admission failed",
+                                        admission.failure);
+  }
   const bool constrained = plan.cohort == BatchCohort::Constrained;
   if (plan.decodeStage != DecodeStage::Regular && !constrained) {
     throw std::invalid_argument(
@@ -2395,12 +2423,8 @@ Runtime::snapshotToDisk(uint64_t requestId, std::function<void()> completion) {
 uint64_t Runtime::reclaimIdleState() noexcept {
   // One idle buffer per call, so a denied allocation frees only what it
   // needs; rebuildable caches go once the pool is empty.
-  const uint32_t cells = impl_->states.idleCells();
-  const uint32_t rings = impl_->states.idleRings();
-  if (cells)
-    return impl_->states.releaseIdle(cells - 1, rings);
-  if (rings)
-    return impl_->states.releaseIdle(0, rings - 1);
+  if (const uint64_t released = impl_->states.reclaimIdle())
+    return released;
   uint64_t released = 0;
   released += impl_->dropEmbeddingCache();
   if (impl_->vision && impl_->visionIdle()) {

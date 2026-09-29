@@ -7,6 +7,7 @@
 #include <cstring>
 #include <deque>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -45,6 +46,13 @@ public:
         push(std::move(pipeline), std::move(buffers), groups, threads);
     dispatch.bytes.push_back({static_cast<uint32_t>(dispatch.buffers.size()),
                               payloads_.back().data(), sizeof(Params)});
+  }
+
+  void addIndirectBuffers(std::span<const MetalBuffer> buffers) {
+    if (dispatches_.empty())
+      throw std::logic_error("indirect resources require a dispatch");
+    auto &retained = dispatches_.back().indirectBuffers;
+    retained.insert(retained.end(), buffers.begin(), buffers.end());
   }
 
   [[nodiscard]] bool empty() const noexcept { return dispatches_.empty(); }

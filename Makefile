@@ -275,6 +275,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/engine/PersistentCache.cpp \
 	runtime/model/SlotFile.cpp \
 	runtime/model/KvPageTier.cpp \
+	runtime/model/DraftKvCache.cpp \
 	runtime/model/QwenState.cpp
 ENGINE_MM_SOURCES := \
 	runtime/model/SafetensorsCheckpoint.mm \

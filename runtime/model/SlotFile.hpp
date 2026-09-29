@@ -72,6 +72,7 @@ public:
   public:
     ~Slot();
     [[nodiscard]] uint64_t recordId() const noexcept { return recordId_; }
+    [[nodiscard]] uint64_t bytes() const noexcept;
     // Engine-thread ownership by committed prefixes. Tier eviction must
     // remove a whole prefix before freeing any of its shared payload slots.
     void retainDurable() noexcept { ++durableOwners_; }
@@ -118,6 +119,8 @@ public:
   SlotFile(uint64_t slotBytes, std::shared_ptr<DiskBudget> budget,
            const std::filesystem::path &directory = std::filesystem::temp_directory_path(),
            std::shared_ptr<CacheStore> store = nullptr);
+  // Another payload geometry in the same quota and persistent store.
+  [[nodiscard]] std::shared_ptr<SlotFile> sibling(uint64_t slotBytes) const;
   // A file with a budget of its own.
   SlotFile(uint64_t slotBytes, uint64_t capacityBytes,
            const std::filesystem::path &directory = std::filesystem::temp_directory_path());

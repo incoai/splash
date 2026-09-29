@@ -248,7 +248,8 @@ private:
   [[nodiscard]] bool anotherResident(uint64_t requestId) const;
   // Runs one page admission, reclaiming cache between attempts while that
   // makes progress.
-  [[nodiscard]] KvAdmission admitKv(const std::function<TokenAdmission()> &attempt);
+  [[nodiscard]] KvAdmission
+  admitGrowth(const std::function<TokenAdmission()> &attempt);
   [[nodiscard]] bool budgetMayRecover(metal::AllocationFailure failure,
                                       uint64_t generation, bool reclaimed) const;
   void suspendForGrowth(Request &request, uint64_t workEnd,

@@ -14,6 +14,7 @@ import json
 import os
 import signal
 import sqlite3
+import struct
 import subprocess
 import tempfile
 import time
@@ -428,11 +429,50 @@ def main():
             save()
         finally:
             server.close()
-        with closing(sqlite3.connect(args.cache_file)) as db:
-            db.execute("""UPDATE slots SET checksum=checksum+1 WHERE id=(
-                SELECT slot FROM refs WHERE prefix=(SELECT id FROM prefixes ORDER BY used DESC LIMIT 1)
-                AND slot != prefix ORDER BY slot LIMIT 1)""")
-            db.commit()
+
+        # Component IDs come from the versioned manifest: record allocation
+        # order no longer distinguishes target KV from shared draft blocks.
+        def corrupt_component(kind):
+            with closing(sqlite3.connect(args.cache_file)) as db:
+                blob = db.execute(
+                    "SELECT metadata FROM prefixes ORDER BY used DESC LIMIT 1"
+                ).fetchone()[0]
+                words = struct.unpack(f"<{len(blob) // 8}Q", blob)
+                require(words[0] == 2, "unexpected persistent metadata version")
+                components_at = 3 + words[2]
+                require(words[components_at] > 0, "draft component fixture is empty")
+                kv_count_at = components_at + 1 + 2 * words[components_at]
+                slot = (
+                    words[components_at + 1]
+                    if kind == "draft"
+                    else words[kv_count_at + 1]
+                )
+                db.execute("UPDATE slots SET checksum=checksum+1 WHERE id=?", (slot,))
+                db.commit()
+
+        corrupt_component("draft")
+        server = RealServer(args, {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"})
+        try:
+            server.wait_ready(180)
+            recovered = complete(server, continuation)
+            require(
+                recovered["response"]["choices"][0]["message"]
+                == expected["response"]["choices"][0]["message"],
+                "corrupted shared draft block changed completion",
+            )
+            report["draft_corruption_recovery"] = {
+                "result": recovered,
+                "status": settle(server),
+            }
+            require(
+                report["draft_corruption_recovery"]["status"]["state"]["invalidations"]
+                > 0,
+                "corruption fixture did not exercise a failed draft restore",
+            )
+            save()
+        finally:
+            server.close()
+        corrupt_component("target")
         server = RealServer(args, {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"})
         try:
             server.wait_ready(180)
@@ -446,6 +486,7 @@ def main():
                 "result": recovered,
                 "status": settle(server),
             }
+            save()
             require(
                 report["kv_corruption_recovery"]["status"]["disk"][
                     "kv_restore_failures"

@@ -35,6 +35,8 @@ public:
   void setDraftContextPlan(uint64_t requestId, DraftContextPlan plan) override;
   [[nodiscard]] std::vector<ModelStepResult>
   prefill(const BatchPlan &plan, std::span<const ModelBatchItem> items);
+  [[nodiscard]] metal::AllocationResult
+  prepareStep(uint64_t requestId, uint64_t begin, uint64_t end) override;
   [[nodiscard]] std::unique_ptr<ModelBatchTicket>
   submit(const BatchPlan &plan, std::span<const ModelBatchItem> items,
               std::function<void()> completion) override;

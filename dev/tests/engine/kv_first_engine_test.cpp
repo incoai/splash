@@ -218,6 +218,12 @@ public:
     }
     return {{}, StateFailure::ConcurrencyLimit};
   }
+  metal::AllocationResult prepareStep(uint64_t id, uint64_t begin,
+                                      uint64_t end) override {
+    ++stepAttempts;
+    return stepAdmission ? stepAdmission(id, begin, end)
+                         : metal::AllocationResult{true};
+  }
   void suspend(uint64_t id) override {
     Request &entry = requests.at(id);
     if (!entry.resident)
@@ -438,6 +444,9 @@ public:
   std::shared_ptr<OffloadControl> stateTier;
   uint32_t deniedSnapshots = 0;
   std::optional<uint32_t> denySnapshotAtBoundary;
+  uint32_t stepAttempts = 0;
+  std::function<metal::AllocationResult(uint64_t, uint64_t, uint64_t)>
+      stepAdmission;
   uint32_t beginAttempts = 0;
   // The request of the latest begin(), for hooks that refuse only some.
   uint64_t lastBeginId = 0;
@@ -1562,6 +1571,58 @@ void testActiveCellGrowthReclaimsCachedStateAndRetries() {
               "active-cell growth did not reclaim cached state");
     }
   }
+}
+
+void testDraftWriteGrowthReclaimsCachedState() {
+  Backing backing(16);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(1);
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  engine.submit(request(20, std::vector<uint32_t>(65, 7)));
+  runUntilIdle(engine);
+  require(resources.snapshot().stateCache.entries == 1,
+          "draft COW fixture did not retain a state");
+  executor.stepAdmission = [&](uint64_t, uint64_t, uint64_t) {
+    return resources.snapshot().stateCache.entries
+               ? metal::AllocationResult{metal::AllocationFailure::EngineBudget}
+               : metal::AllocationResult{true};
+  };
+  const uint32_t attempts = executor.stepAttempts;
+  engine.submit(request(21, {8}));
+  runUntilIdle(engine);
+  require(executor.stepAttempts >= attempts + 2 && events.completedCount == 2 &&
+              events.failedCount == 0 &&
+              resources.snapshot().stateCache.entries == 0,
+          "draft COW admission did not reclaim cached state and retry");
+}
+
+void testDraftHostPressurePreservesTargetCache() {
+  Backing backing(16);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(1);
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  engine.submit(request(20, std::vector<uint32_t>(65, 7)));
+  runUntilIdle(engine);
+  const auto before = resources.snapshot();
+  require(before.stateCache.entries == 1, "paused COW fixture did not cache a state");
+  executor.stepAdmission = [](uint64_t, uint64_t, uint64_t) {
+    return metal::AllocationResult{metal::AllocationFailure::HostPressure};
+  };
+  engine.submit(request(21, {8}));
+  static_cast<void>(engine.tick(1));
+  const auto after = resources.snapshot();
+  require(after.stateCache.entries == before.stateCache.entries &&
+              after.stateCache.evictions == before.stateCache.evictions &&
+              !events.failedCount,
+          "paused draft allocation evicted target cache that cannot supply draft backing");
+  engine.cancel(21);
+  runUntilIdle(engine);
+  require(executor.requests.empty() && !resources.snapshot().activeRequests,
+          "paused COW cancellation leaked ownership");
 }
 
 void testKvGrowthReclaimsIdleStateBeforeCache() {
@@ -3082,7 +3143,7 @@ void testAdmissionsWaitForBackgroundRelease() {
 }
 
 void testAllocationCausesRemainRetryableAndDistinct() {
-  for (bool stateAllocation : {false, true}) {
+  for (uint32_t source : {0U, 1U, 2U}) {
     for (auto reason : {metal::AllocationFailure::HostPressure,
                         metal::AllocationFailure::EngineBudget,
                         metal::AllocationFailure::DriverRejected}) {
@@ -3092,9 +3153,13 @@ void testAllocationCausesRemainRetryableAndDistinct() {
       Executor executor(1);
       Events events;
       engine::Engine engine({}, cache, executor, events);
-      backing.growthBlocked = !stateAllocation;
+      backing.growthBlocked = source == 0;
       backing.allocationFailure = reason;
-      executor.beginGrowthBlocked = [stateAllocation] { return stateAllocation; };
+      executor.beginGrowthBlocked = [source] { return source == 1; };
+      if (source == 2)
+        executor.stepAdmission = [reason](uint64_t, uint64_t, uint64_t) {
+          return metal::AllocationResult{reason};
+        };
       executor.beginAllocationFailure = reason;
       engine.submit(request(285, {285}));
       static_cast<void>(engine.tick(1));
@@ -5338,6 +5403,8 @@ int main() {
     testLongSuffixSkipsDraftRestore();
     testCancellationInFlightAtBoundaryPublishesNoState();
     testActiveCellGrowthReclaimsCachedStateAndRetries();
+    testDraftWriteGrowthReclaimsCachedState();
+    testDraftHostPressurePreservesTargetCache();
     testKvGrowthReclaimsIdleStateBeforeCache();
     testKvGrowthDenialKeepsEveryLaneReplayState();
     testPressureReclaimRespectsStateLifetimes();

@@ -87,10 +87,17 @@ struct DraftPrepareBuffers final {
   metal::MetalBuffer queryValues;
 };
 
+// Serving supplies page views; dense buffers support the independent layout
+// oracle. K is [head, token, dimension], V is [head, dimension, token].
+struct DraftKvBuffers final {
+  metal::MetalBuffer keys, values;
+  std::vector<metal::MetalBuffer> keyPages{}, valuePages{};
+  [[nodiscard]] bool paged() const noexcept { return !keyPages.empty(); }
+};
+
 struct DraftDecodeAttentionBuffers final {
   metal::MetalBuffer groupedQueries;
-  std::span<const metal::MetalBuffer> persistentKeys;
-  std::span<const metal::MetalBuffer> persistentValues;
+  std::span<const DraftKvBuffers> context;
   metal::MetalBuffer queryKeys;
   metal::MetalBuffer queryValues;
 };
@@ -127,18 +134,16 @@ public:
                          metal::MetalBuffer grouped,
                          metal::MetalBuffer packed,
                          const DraftAttentionPlan &plan);
-  static void addContextPrefill(
-      metal::CommandGraph &graph, metal::MetalBuffer contextQkv,
-      metal::MetalBuffer keyNorm, metal::MetalBuffer ropeCos,
-      metal::MetalBuffer ropeSin, metal::MetalBuffer keys,
-      metal::MetalBuffer values, uint32_t tokens, uint32_t cacheStride,
-      uint32_t startPosition, DraftAttentionShape shape);
+  static void
+  addContextPrefill(metal::CommandGraph &graph, metal::MetalBuffer contextQkv,
+                    metal::MetalBuffer keyNorm, metal::MetalBuffer ropeCos,
+                    metal::MetalBuffer ropeSin, const DraftKvBuffers &context,
+                    uint32_t tokens, uint32_t cacheStride,
+                    uint32_t startPosition, DraftAttentionShape shape);
   static void addContextCommit(
       metal::CommandGraph &graph, metal::MetalBuffer contextQkv,
       metal::MetalBuffer keyNorm, metal::MetalBuffer ropeCos,
-      metal::MetalBuffer ropeSin,
-      std::span<const metal::MetalBuffer> persistentKeys,
-      std::span<const metal::MetalBuffer> persistentValues,
+      metal::MetalBuffer ropeSin, std::span<const DraftKvBuffers> context,
       metal::MetalBuffer retainedCounts,
       std::span<const uint32_t> startPositions, uint32_t cacheStride,
       DraftAttentionShape shape, uint32_t lanes);

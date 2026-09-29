@@ -490,7 +490,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
       store = std::make_shared<model::CacheStore>(path, cacheIdentity.namespaceSha256);
       logKernelStartup("Persistent prefix cache: ", path.string(), ".");
     }
-    const uint64_t stateBytes = package.stateLayout().cachedBytes();
+    const uint64_t stateBytes = package.stateLayout().target.cellBytes();
     if (diskCapacity) {
       diskBudget = std::make_shared<model::DiskBudget>(diskCapacity);
       try {
@@ -515,8 +515,10 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
             std::filesystem::temp_directory_path(), store);
         kvTier = std::make_unique<model::KvPageTier>(*backend, *kvPages, kvFile);
         logKernelStartup("Cache disk tier: ", diskCapacity / kMiB,
-                         " MiB for KV pages of ", slotBytes / 1024, " KiB and states of ",
-                         stateBytes / kMiB, " MiB; KV pages stage through ",
+                         " MiB for KV pages of ", slotBytes / 1024, " KiB, GDN cells of ",
+                         stateBytes / kMiB, " MiB and draft pages of ",
+                         package.stateLayout().draft.blockBytes() / 1024,
+                         " KiB; KV pages stage through ",
                          kvStagingBytes / kMiB, " MiB of Metal memory",
                          stateFile ? ", states through host memory." : ".");
       } catch (const std::exception &error) {

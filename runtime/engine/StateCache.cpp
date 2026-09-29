@@ -129,10 +129,8 @@ void StateCache::publish(uint64_t kvBlock,
     throw std::logic_error("duplicate composite state key");
 
   Entry &entry = publicationEntry(kvBlock, checkpoint);
+  retainRam(entry, *state);
   entry.ram = std::move(state);
-  bytes_ += stateBytes;
-  if (entry.checkpoint)
-    checkpointBytes_ += stateBytes;
   entry.lastUsed = recency_.next();
   reindex(kvBlock, entry);
   ++publications_;
@@ -191,8 +189,8 @@ void StateCache::importDisk(uint64_t block, std::shared_ptr<const CompositeState
     throw std::invalid_argument("invalid imported state");
   if (contains(block)) return;
   Entry &entry = publicationEntry(block, false);
+  retainDisk(entry, *state);
   entry.disk = std::move(state);
-  diskBytes_ += entry.disk->bytes();
   entry.lastUsed = recency_.next();
   reindex(block, entry);
 }
@@ -217,7 +215,7 @@ void StateCache::makeOrdinary(uint64_t kvBlock, Entry &entry) {
   if (!entry.checkpoint)
     return;
   --checkpointEntries_;
-  checkpointBytes_ -= entry.ram ? entry.ram->bytes() : 0;
+  checkpointBytes_ -= checkpointResources_.release(entry.ramResources);
   entry.checkpoint = false;
 }
 
@@ -263,7 +261,6 @@ StateEviction StateCache::reclaim(uint64_t kvBlock, std::function<void()> comple
   if (found == entries_.end() || found->second.pins || !found->second.ram)
     return {};
   Entry &entry = found->second;
-  const uint64_t reclaimed = entry.ram->bytes();
   // One write at a time.
   const bool writable = offloadEnabled_ && !entry.disk && entry.ram->canOffload();
   if (writable && pending_ && waitForWrite)
@@ -279,9 +276,8 @@ StateEviction StateCache::reclaim(uint64_t kvBlock, std::function<void()> comple
   if (!entry.disk)
     return erase(kvBlock, false);
   // A write reads its own copy, so the RAM copy is free at once.
-  bytes_ -= reclaimed;
-  if (entry.checkpoint)
-    checkpointBytes_ -= reclaimed;
+  const uint64_t reclaimable = entry.ram->reclaimableBytes();
+  const uint64_t reclaimed = std::min(reclaimable, releaseRam(entry));
   entry.ram.reset();
   reindex(kvBlock, entry);
   return {true, reclaimed};
@@ -343,10 +339,8 @@ void StateCache::promote(uint64_t kvBlock, const CompositeState *source,
   if (state->bytes() > std::numeric_limits<uint64_t>::max() - bytes_)
     throw std::overflow_error("promoted state byte count overflowed");
   Entry &target = entry(kvBlock);
+  retainRam(target, *state);
   target.ram = std::move(state);
-  bytes_ += target.ram->bytes();
-  if (target.checkpoint)
-    checkpointBytes_ += target.ram->bytes();
   reindex(kvBlock, target);
   ++promotions_;
 }
@@ -385,13 +379,11 @@ StateEviction StateCache::erase(uint64_t kvBlock, bool retirement) noexcept {
   if (found == entries_.end() || found->second.pins)
     return {};
   Entry &target = found->second;
-  const uint64_t reclaimed = target.ram ? target.ram->bytes() : 0;
-  bytes_ -= reclaimed;
-  if (target.disk)
-    diskBytes_ -= target.disk->bytes();
+  const uint64_t reclaimable = target.ram ? target.ram->reclaimableBytes() : 0;
+  const uint64_t reclaimed = std::min(reclaimable, releaseRam(target));
+  diskBytes_ -= diskResources_.release(target.diskResources);
   if (target.checkpoint) {
     --checkpointEntries_;
-    checkpointBytes_ -= reclaimed;
     if (!retirement)
       ++checkpointEvictions_;
   }
@@ -500,8 +492,8 @@ std::unique_ptr<StateOffload> StateCache::startWrite(const StateWriter &write,
 
 void StateCache::beginWrite(uint64_t kvBlock, Entry &target,
                             std::unique_ptr<StateOffload> transfer) {
+  retainDisk(target, *transfer->state());
   target.disk = transfer->state();
-  diskBytes_ += target.disk->bytes();
   pending_.emplace(PendingOffload{kvBlock, std::move(transfer)});
   ++offloads_;
 }
@@ -526,10 +518,40 @@ void StateCache::unlink(Entry &target) noexcept {
     RecencyOrder::unlink(target.diskNode);
 }
 
+void StateCache::retainRam(Entry &entry, const CompositeState &state) {
+  auto resources = state.resources();
+  const uint64_t added = ramResources_.retain(resources);
+  try {
+    if (entry.checkpoint)
+      checkpointBytes_ += checkpointResources_.retain(resources);
+  } catch (...) {
+    ramResources_.release(resources);
+    throw;
+  }
+  bytes_ += added;
+  entry.ramResources = std::move(resources);
+}
+
+uint64_t StateCache::releaseRam(Entry &entry) noexcept {
+  const uint64_t released = ramResources_.release(entry.ramResources);
+  bytes_ -= released;
+  if (entry.checkpoint)
+    checkpointBytes_ -= checkpointResources_.release(entry.ramResources);
+  entry.ramResources.clear();
+  return released;
+}
+
+void StateCache::retainDisk(Entry &entry, const CompositeState &state) {
+  auto resources = state.resources();
+  diskBytes_ += diskResources_.retain(resources);
+  entry.diskResources = std::move(resources);
+}
+
 void StateCache::discardDisk(Entry &target) noexcept {
   if (!target.disk)
     return;
-  diskBytes_ -= target.disk->bytes();
+  diskBytes_ -= diskResources_.release(target.diskResources);
+  target.diskResources.clear();
   target.disk.reset();
 }
 

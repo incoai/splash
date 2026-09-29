@@ -16,6 +16,7 @@ namespace splash::model {
 
 struct SlotFile::Backing {
   int descriptor = -1;
+  std::filesystem::path directory;
   std::shared_ptr<CacheStore> store;
   std::unordered_map<uint64_t, std::weak_ptr<Slot>> reopened;
   uint64_t slotBytes = 0;
@@ -29,6 +30,13 @@ struct SlotFile::Backing {
 
 SlotFile::Slot::Slot(std::shared_ptr<Backing> backing, uint32_t index)
     : backing_(std::move(backing)), index_(index) {}
+uint64_t SlotFile::Slot::bytes() const noexcept { return backing_->slotBytes; }
+
+std::shared_ptr<SlotFile> SlotFile::sibling(uint64_t bytes) const {
+  return std::make_shared<SlotFile>(bytes, backing_->budget,
+                                    backing_->directory, backing_->store);
+}
+
 SlotFile::Slot::~Slot() {
   if (!backing_) return;
   if (backing_->store) backing_->store->retire(recordId_);
@@ -66,6 +74,7 @@ SlotFile::SlotFile(uint64_t slotBytes, std::shared_ptr<DiskBudget> budget,
     throw std::invalid_argument("slot file quota holds no slot");
   if (slotBytes % kAlignmentBytes)
     throw std::invalid_argument("slot size is not aligned for uncached IO");
+  backing_->directory = directory;
   backing_->slotBytes = slotBytes;
   backing_->budget = std::move(budget);
   backing_->store = std::move(store);

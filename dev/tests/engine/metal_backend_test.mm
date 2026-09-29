@@ -228,6 +228,56 @@ void delayCompletionNotification(id command, SEL selector, MTLCommandBufferHandl
     });
 }
 
+void indirectBuffersStayResident(const std::string &metallibPath) {
+    MetalBackend backend(metallibPath), other(metallibPath);
+    auto output = backend.allocateBuffer(sizeof(uint32_t));
+    const auto outputBytes = backend.memoryStats().allocatedBytes;
+    auto source = backend.allocateBuffer(2 * sizeof(uint32_t));
+    auto view = backend.view(source, sizeof(uint32_t), sizeof(uint32_t));
+    *static_cast<uint32_t *>(view.contents()) = 73;
+    const uint64_t address = view.gpuAddress();
+    require(address == source.gpuAddress() + sizeof(uint32_t) &&
+                MetalBuffer{}.gpuAddress() == 0,
+            "GPU address does not preserve the buffer view offset");
+    ComputeDispatch dispatch;
+    dispatch.pipelineName = "test_indirect_copy_u32";
+    dispatch.buffers = {{1, output}};
+    dispatch.bytes = {{0, &address, sizeof(address)}};
+    dispatch.threadgroups = dispatch.threadsPerThreadgroup = {1, 1, 1};
+    dispatch.indirectBuffers = {MetalBuffer{}};
+    requireBackendError([&] { (void)backend.submit(dispatch); },
+                        "empty indirect buffer was accepted");
+    dispatch.indirectBuffers = {other.allocateBuffer(sizeof(uint32_t))};
+    requireBackendError([&] { (void)backend.submit(dispatch); },
+                        "foreign indirect buffer was accepted");
+    dispatch.indirectBuffers = {view};
+    const auto resident = backend.memoryStats().allocatedBytes;
+    id<MTLCommandQueue> queue =
+        [MTLCreateSystemDefaultDevice() newCommandQueue];
+    id<MTLCommandBuffer> command = [queue commandBuffer];
+    commandWatchdogGate = [MTLCreateSystemDefaultDevice() newSharedEvent];
+    {
+        MethodReplacement commit(
+            command, @selector(commit),
+            reinterpret_cast<IMP>(commitBehindWatchdogGate));
+        originalCommandCommit = commit.original;
+        auto ticket = backend.submitAsync(dispatch);
+        dispatch.indirectBuffers.clear();
+        source = {};
+        view = {};
+        require(!ticket.ready() &&
+                    backend.memoryStats().allocatedBytes == resident,
+                "pending indirect allocation was released early");
+        commandWatchdogGate.signaledValue = 1;
+        (void)ticket.wait();
+    }
+    require(*static_cast<uint32_t *>(output.contents()) == 73 &&
+                backend.memoryStats().allocatedBytes == outputBytes,
+            "indirect command failed or retained its input after completion");
+    commandWatchdogGate = nil;
+    std::cout << "PASS indirect resource lifetime and validation\n";
+}
+
 void terminalCommandRecovers(const std::string &metallibPath, bool failed,
                                    bool pendingNext = false) {
     MetalBackend backend(metallibPath, 0.1);
@@ -1439,6 +1489,7 @@ int main(int argc, const char *argv[]) {
             return 2;
         }
         try {
+            indirectBuffersStayResident(argv[1]);
             completionDoesNotWaitForMemoryTelemetry(argv[1]);
             terminalCommandRecovers(argv[1], false);
             terminalCommandRecovers(argv[1], false, true);

@@ -32,39 +32,6 @@ void requireLayout(const DFlashDraftLayout &layout) {
 
 } // namespace
 
-DFlashDraftRing::DFlashDraftRing(
-    metal::MetalBackend &backend, std::shared_ptr<StateAllocationTracker> tracker,
-    DraftStateLayout layout, std::string_view label)
-    : tracker_(std::move(tracker)), layers_(layout.layers) {
-  if (!tracker_)
-    throw std::invalid_argument("draft state allocation tracker is empty");
-  if (!layout.valid() ||
-      layout.tokens != ExecutionLimits::draftContextTokens) {
-    throw std::invalid_argument("draft state layout is invalid");
-  }
-  const uint64_t before = backend.memoryStats().allocatedBytes;
-  const metal::MetalBuffer base = backend.allocateBuffer(
-      layout.ringBytes(), metal::BufferStorage::Shared, label);
-  uint64_t cursor = 0;
-  for (DFlashDraftRingLayer &layer : layers_) {
-    layer.keys = backend.view(base, cursor, layout.tensorBytes());
-    cursor += layout.tensorBytes();
-    layer.values = backend.view(base, cursor, layout.tensorBytes());
-    cursor += layout.tensorBytes();
-  }
-  if (cursor != layout.ringBytes())
-    throw std::logic_error("draft ring accounting mismatch");
-  actualAllocatedBytes_ =
-      metal::allocationDelta(before, backend.memoryStats().allocatedBytes);
-  if (actualAllocatedBytes_ < layout.ringBytes())
-    throw std::logic_error("draft ring allocation is below declared bytes");
-  tracker_->bytes.fetch_add(actualAllocatedBytes_, std::memory_order_relaxed);
-}
-
-DFlashDraftRing::~DFlashDraftRing() {
-  tracker_->bytes.fetch_sub(actualAllocatedBytes_, std::memory_order_relaxed);
-}
-
 DFlashDraft::DFlashDraft(const DFlashDraftWeights &weights,
                          metal::MetalBackend &backend,
                          const ops::ExecutionPlans &operators)
@@ -127,12 +94,15 @@ void DFlashDraft::addContextPrefill(
                             sizeof(uint16_t)),
           weights_.layers[layer].keyNorm,
           backend_.view(buffers.ropeCos, ropeOffset,
-                        uint64_t{span.rows} * (layout.attentionHeadDimension / 2) * sizeof(float)),
+                        uint64_t{span.rows} *
+                            (layout.attentionHeadDimension / 2) *
+                            sizeof(float)),
           backend_.view(buffers.ropeSin, ropeOffset,
-                        uint64_t{span.rows} * (layout.attentionHeadDimension / 2) * sizeof(float)),
-          span.ring[layer].keys, span.ring[layer].values, span.rows,
-          layout.stateLayout().tokens, span.startPosition,
-          layout.attentionShape());
+                        uint64_t{span.rows} *
+                            (layout.attentionHeadDimension / 2) *
+                            sizeof(float)),
+          span.ring[layer], span.rows, layout.stateLayout().tokens,
+          span.startPosition, layout.attentionShape());
     }
   }
 }
@@ -144,8 +114,7 @@ void DFlashDraft::addDecode(
     ops::LinearDispatchStats &stats) const {
   if (!lanes || lanes > ExecutionLimits::maximumBatchWidth ||
       cacheLengths.size() != ExecutionLimits::maximumBatchWidth ||
-      buffers.persistentKeys.size() != weights_.layout.layers ||
-      buffers.persistentValues.size() != weights_.layout.layers) {
+      buffers.context.size() != weights_.layout.layers) {
     throw std::invalid_argument("invalid draft decode batch");
   }
   const DFlashDraftLayout &layout = weights_.layout;
@@ -179,12 +148,11 @@ void DFlashDraft::addDecode(
          weights.keyNorm, buffers.ropeCos, buffers.ropeSin, buffers.queryKeys,
          buffers.queryValues},
         attentionPlan);
-    ops::DraftAttention::addDecode(
-        graph,
-        {buffers.attention, buffers.persistentKeys[layer],
-         buffers.persistentValues[layer], buffers.queryKeys,
-         buffers.queryValues},
-        cacheLengths, layout.stateLayout().tokens, attentionPlan);
+    ops::DraftAttention::addDecode(graph,
+                                   {buffers.attention, buffers.context[layer],
+                                    buffers.queryKeys, buffers.queryValues},
+                                   cacheLengths, layout.stateLayout().tokens,
+                                   attentionPlan);
     ops::DraftAttention::addReorder(graph, buffers.attention,
                                     buffers.proposalQkv, attentionPlan);
     operators_.linear().addDecodeBatch(graph,
@@ -241,8 +209,7 @@ void DFlashDraft::addContextCommit(
     ops::LinearDispatchStats &stats) const {
   if (!lanes || lanes > ExecutionLimits::maximumBatchWidth ||
       startPositions.size() != ExecutionLimits::maximumBatchWidth ||
-      buffers.persistentKeys.size() != weights_.layout.layers ||
-      buffers.persistentValues.size() != weights_.layout.layers) {
+      buffers.context.size() != weights_.layout.layers) {
     throw std::invalid_argument("invalid draft context batch");
   }
   const DFlashDraftLayout &layout = weights_.layout;
@@ -261,8 +228,7 @@ void DFlashDraft::addContextCommit(
                        lanes, stats, buffers.linearScratch, hidden);
     ops::DraftAttention::addContextCommit(
         graph, buffers.qkv, weights_.layers[layer].keyNorm, buffers.ropeCos,
-        buffers.ropeSin, buffers.persistentKeys[layer],
-        buffers.persistentValues[layer], buffers.retainedCounts,
+        buffers.ropeSin, buffers.context[layer], buffers.retainedCounts,
         startPositions, layout.stateLayout().tokens, layout.attentionShape(),
         lanes);
   }
