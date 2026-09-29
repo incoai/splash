@@ -2171,6 +2171,8 @@ def parse_args(argv=None):
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--binary", default=str(ROOT / "build" / "splash"))
     args = parser.parse_args(argv)
+    if args.cache_file and not args.persistent_cache:
+        parser.error("--cache-file requires --persistent-cache with a nonzero size")
     if (
         args.default_reasoning_effort is not None
         and args.default_reasoning_effort not in REASONING_EFFORTS

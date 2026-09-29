@@ -716,6 +716,8 @@ class ServerTest(unittest.TestCase):
             ],
         )
         self.assertEqual(args.max_cache_disk, 0)
+        with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
+            api.parse_args([*required, "--cache-file", "/tmp/cache"])
         disabled = api.parse_args([*required, "--persistent-cache", "0"])
         self.assertNotIn("--persistent-cache-bytes", api._native_command(disabled))
 

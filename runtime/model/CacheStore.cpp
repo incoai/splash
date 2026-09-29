@@ -4,15 +4,19 @@
 #include <array>
 #include <fcntl.h>
 #include <sqlite3.h>
+#include <sys/file.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <climits>
 #include <csignal>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <stdexcept>
 #include <system_error>
+#include <unordered_map>
 
 namespace splash::model {
 namespace {
@@ -36,11 +40,11 @@ public:
     check(sqlite3_bind_int64(stmt_, index, static_cast<sqlite3_int64>(value)),
           db_);
   }
-  void blob(int index, const void *data, size_t size, bool borrowed = false) {
+  void blob(int index, const void *data, size_t size) {
     if (size > INT_MAX)
       throw std::runtime_error("prefix cache metadata too large");
     check(sqlite3_bind_blob(stmt_, index, data, static_cast<int>(size),
-                            borrowed ? SQLITE_STATIC : SQLITE_TRANSIENT),
+                            SQLITE_TRANSIENT),
           db_);
   }
   bool step() {
@@ -102,11 +106,48 @@ public:
 private:
   uint32_t value_ = UINT32_MAX;
 };
+constexpr uint64_t alignment = 16384;
+uint64_t aligned(uint64_t bytes) {
+  if (!bytes || bytes > uint64_t{INT64_MAX} - alignment)
+    throw std::invalid_argument("invalid cache payload size");
+  return (bytes + alignment - 1) / alignment * alignment;
+}
+void fileCheck(bool ok, const char *operation) {
+  if (!ok)
+    throw std::system_error(errno, std::generic_category(), operation);
+}
+bool transfer(int fd, uint64_t offset, std::byte *data, size_t bytes,
+              bool writing, const std::atomic<bool> &cancelled) {
+  while (bytes) {
+    if (cancelled.load())
+      return false;
+    const auto count = std::min<size_t>(bytes, 1 << 20);
+    const auto done = writing ? ::pwrite(fd, data, count, offset)
+                              : ::pread(fd, data, count, offset);
+    if (done < 0 && errno == EINTR)
+      continue;
+    if (done <= 0)
+      return false;
+    data += done;
+    offset += done;
+    bytes -= done;
+  }
+  return true;
+}
 } // namespace
 
 struct CacheStore::Impl {
   sqlite3 *db = nullptr;
   bool owned = false;
+  int payload = -1;
+  uint64_t highWater = alignment;
+  struct Extent {
+    uint64_t offset, bytes, checksum;
+  };
+  std::unordered_map<uint64_t, Extent> records;
+  // Free extents, coalesced by offset. Accessed under mutex; in-flight writes
+  // reserve their extent before dropping the metadata lock.
+  std::map<uint64_t, uint64_t> free;
   std::mutex mutex;
   std::mutex retiredMutex;
   std::vector<uint64_t> retired;
@@ -123,6 +164,80 @@ struct CacheStore::Impl {
                      nullptr, nullptr, nullptr);
       sqlite3_close(db);
     }
+    if (payload >= 0)
+      ::close(payload);
+  }
+  void release(uint64_t offset, uint64_t bytes) {
+    bytes = aligned(bytes);
+    auto next = free.lower_bound(offset);
+    if (next != free.begin()) {
+      auto prior = std::prev(next);
+      if (prior->first + prior->second == offset) {
+        offset = prior->first;
+        bytes += prior->second;
+        free.erase(prior);
+      }
+    }
+    if (next != free.end() && offset + bytes == next->first) {
+      bytes += next->second;
+      free.erase(next);
+    }
+    free.emplace(offset, bytes);
+  }
+  uint64_t reserve(uint64_t bytes) {
+    const uint64_t size = aligned(bytes);
+    auto best = free.end();
+    for (auto it = free.begin(); it != free.end(); ++it)
+      if (it->second >= size &&
+          (best == free.end() || it->second < best->second))
+        best = it;
+    if (best == free.end()) {
+      if (highWater > uint64_t{INT64_MAX} - size)
+        throw std::runtime_error("cache payload offset overflow");
+      const auto offset = highWater;
+      highWater += size;
+      return offset;
+    }
+    const auto [offset, available] = *best;
+    free.erase(best);
+    if (available > size)
+      free.emplace(offset + size, available - size);
+    return offset;
+  }
+  // Startup only: reconstruct holes from the committed index and truncate
+  // only the unused tail. Live payloads are never copied or relocated.
+  void rebuild() {
+    struct stat info{};
+    fileCheck(::fstat(payload, &info) == 0, "stat cache payload");
+    free.clear();
+    records.clear();
+    highWater = alignment;
+    Statement rows(
+        db, "SELECT id,offset,bytes,checksum FROM slots ORDER BY offset");
+    while (rows.step()) {
+      const auto offset = rows.integer(1), bytes = rows.integer(2);
+      const auto size = aligned(bytes);
+      if (offset < highWater || offset % alignment ||
+          offset > uint64_t{INT64_MAX} - size ||
+          offset + bytes > static_cast<uint64_t>(info.st_size))
+        throw std::runtime_error("invalid or truncated cache payload extent");
+      if (offset > highWater)
+        free.emplace(highWater, offset - highWater);
+      highWater = offset + size;
+      records.emplace(rows.integer(0), Extent{offset, bytes, rows.integer(3)});
+    }
+    if (static_cast<uint64_t>(info.st_size) != highWater)
+      fileCheck(::ftruncate(payload, highWater) == 0,
+                "trim cache payload tail");
+    // APFS can return interior holes without moving live data. Other
+    // filesystems may keep these reusable extents allocated; logical quotas are
+    // unchanged.
+    for (const auto &[offset, bytes] : free) {
+      fpunchhole_t hole{};
+      hole.fp_offset = offset;
+      hole.fp_length = bytes;
+      static_cast<void>(::fcntl(payload, F_PUNCHHOLE, &hole));
+    }
   }
   void collect() {
     std::vector<uint64_t> ids;
@@ -130,6 +245,10 @@ struct CacheStore::Impl {
       std::lock_guard lock(retiredMutex);
       ids.swap(retired);
     }
+    if (ids.empty())
+      return;
+    std::vector<uint64_t> released;
+    Transaction transaction(db);
     for (auto id : ids) {
       Statement referenced(db, "SELECT 1 FROM refs WHERE slot=? LIMIT 1");
       referenced.integer(1, id);
@@ -137,16 +256,24 @@ struct CacheStore::Impl {
         std::lock_guard lock(retiredMutex);
         retired.push_back(id);
       } else {
+        if (records.contains(id))
+          released.push_back(id);
         Statement remove(db, "DELETE FROM slots WHERE id=?");
         remove.integer(1, id);
         remove.step();
       }
     }
+    transaction.commit();
+    for (auto id : released) {
+      const auto extent = records.at(id);
+      release(extent.offset, extent.bytes);
+      records.erase(id);
+    }
   }
 };
 
 CacheStore::CacheStore(const std::filesystem::path &path,
-                       const std::string &identity)
+                       const std::string &identity) try
     : impl_(std::make_unique<Impl>()) {
   if (path.empty())
     throw std::invalid_argument("persistent cache path is empty");
@@ -177,30 +304,80 @@ CacheStore::CacheStore(const std::filesystem::path &path,
     Statement version(db, "PRAGMA user_version");
     version.step();
     if (tables.integer(0) &&
-        (application.integer(0) != 0x53504c48 || version.integer(0) != 1))
+        (application.integer(0) != 0x53504c48 || version.integer(0) != 2))
       throw std::runtime_error("file is not a supported Splash prefix cache");
   }
   sql(db, "PRAGMA locking_mode=EXCLUSIVE;");
-  // New stores keep SQLite's relocation map so reducing the quota can return
-  // unused pages to the filesystem at startup, without rebuilding live blobs.
-  // Slots are multiples of 16 KiB. A matching database page reduces pager
-  // overhead for large state blobs without the slack of 64 KiB pages.
-  sql(db, "PRAGMA page_size=16384; PRAGMA auto_vacuum=INCREMENTAL;");
-  sql(db, "PRAGMA application_id=0x53504c48; PRAGMA user_version=1;");
+  sql(db, "PRAGMA application_id=0x53504c48; PRAGMA user_version=2;");
   sql(db,
       "PRAGMA journal_mode=PERSIST; PRAGMA synchronous=FULL; PRAGMA "
       "cache_size=-2048;"
       "PRAGMA foreign_keys=ON; PRAGMA secure_delete=OFF; PRAGMA "
       "journal_size_limit=1048576;"
       "CREATE TABLE IF NOT EXISTS identity(value BLOB NOT NULL);"
-      "CREATE TABLE IF NOT EXISTS slots(id INTEGER PRIMARY KEY, data BLOB NOT "
-      "NULL, checksum INTEGER NOT NULL);"
+      "CREATE TABLE IF NOT EXISTS storage(value BLOB NOT NULL);"
+      "CREATE TABLE IF NOT EXISTS slots(id INTEGER PRIMARY KEY, offset INTEGER "
+      "NOT "
+      "NULL, bytes INTEGER NOT NULL, checksum INTEGER NOT NULL);"
       "CREATE TABLE IF NOT EXISTS prefixes(id INTEGER PRIMARY KEY, metadata "
       "BLOB NOT NULL, used INTEGER NOT NULL, checksum INTEGER NOT NULL);"
       "CREATE TABLE IF NOT EXISTS refs(prefix INTEGER REFERENCES prefixes(id) "
       "ON DELETE CASCADE,"
       "slot INTEGER REFERENCES slots(id), PRIMARY KEY(prefix,slot));"
       "CREATE INDEX IF NOT EXISTS refs_slot ON refs(slot);");
+  // The payload file is paired by a random identity, not just its name.
+  const auto payloadPath = std::filesystem::path(path.string() + ".data");
+  const bool exists = std::filesystem::exists(payloadPath);
+  Statement count(db, "SELECT COUNT(*) FROM slots");
+  count.step();
+  if (!exists && count.integer(0))
+    throw std::runtime_error("persistent payload file is missing");
+  impl_->payload = ::open(
+      payloadPath.c_str(),
+      O_RDWR | O_CLOEXEC | O_NOFOLLOW | (exists ? 0 : O_CREAT | O_EXCL), 0600);
+  fileCheck(impl_->payload >= 0, "open cache payload");
+  fileCheck(::flock(impl_->payload, LOCK_EX | LOCK_NB) == 0,
+            "lock cache payload");
+  fileCheck(::fcntl(impl_->payload, F_NOCACHE, 1) == 0,
+            "uncached cache payload");
+  std::array<uint64_t, 4> header{0x53504c4850415932ULL, 0, 0, 0};
+  const std::atomic<bool> running{false};
+  if (exists) {
+    fileCheck(transfer(impl_->payload, 0,
+                       reinterpret_cast<std::byte *>(header.data()),
+                       sizeof(header), false, running),
+              "read cache payload header");
+    if (header[0] != 0x53504c4850415932ULL)
+      throw std::runtime_error("unsupported cache payload file");
+  } else {
+    arc4random_buf(header.data() + 1, 3 * sizeof(uint64_t));
+    fileCheck(transfer(impl_->payload, 0,
+                       reinterpret_cast<std::byte *>(header.data()),
+                       sizeof(header), true, running),
+              "write cache payload header");
+    fileCheck(::fsync(impl_->payload) == 0, "sync cache payload header");
+    const auto parent = path.parent_path().empty() ? std::filesystem::path(".")
+                                                   : path.parent_path();
+    const int directory = ::open(parent.c_str(), O_RDONLY | O_CLOEXEC);
+    fileCheck(directory >= 0, "open cache directory");
+    const int synced = ::fsync(directory);
+    const int saved = errno;
+    ::close(directory);
+    errno = saved;
+    fileCheck(synced == 0, "sync cache directory");
+  }
+  {
+    Statement pairing(db, "SELECT value=? FROM storage");
+    pairing.blob(1, header.data(), sizeof(header));
+    if (pairing.step()) {
+      if (!pairing.integer(0))
+        throw std::runtime_error("cache payload identity mismatch");
+    } else {
+      Statement insert(db, "INSERT INTO storage VALUES(?)");
+      insert.blob(1, header.data(), sizeof(header));
+      insert.step();
+    }
+  }
   {
     Statement existing(db, "SELECT value=? FROM identity");
     const std::string versioned = "splash-prefix-cache-v3-groups-crc32c:" + identity;
@@ -231,6 +408,12 @@ CacheStore::CacheStore(const std::filesystem::path &path,
   Statement clock(db, "SELECT COALESCE(MAX(used),0) FROM prefixes");
   clock.step();
   impl_->clock = clock.integer(0);
+  impl_->rebuild();
+} catch (const std::bad_alloc &) {
+  throw;
+} catch (const std::exception &error) {
+  throw std::runtime_error("persistent cache " + path.string() + ": " +
+                           error.what());
 }
 CacheStore::~CacheStore() = default;
 uint64_t CacheStore::allocate() noexcept { return impl_->next.fetch_add(1); }
@@ -248,95 +431,78 @@ bool CacheStore::write(uint64_t id,
   uint64_t bytes = 0;
   Checksum checksum;
   for (auto span : source) {
-    if (cancelled.load())
+    if (cancelled.load() || span.size() > uint64_t{INT64_MAX} - bytes)
       return false;
     bytes += span.size();
     checksum.update(span.data(), span.size());
   }
-  const uint64_t hash = checksum.finish();
-  if (bytes > INT_MAX || cancelled.load())
+  if (!bytes)
     return false;
-  std::lock_guard lock(impl_->mutex);
-  auto *db = impl_->db;
-  // Retire before allocating: rollback journals need not copy free payload
-  // pages. Never delete and reuse their large blobs in the same transaction.
+  uint64_t offset;
   {
-    Transaction reclaim(db);
+    std::lock_guard lock(impl_->mutex);
     impl_->collect();
-    reclaim.commit();
+    offset = impl_->reserve(bytes);
   }
-  Transaction transaction(db);
-  // Production staging is contiguous. Bind it for the duration of step()
-  // without a second state-sized allocation or a zeroblob write pass.
-  if (source.size() == 1) {
-    Statement insert(db, "INSERT INTO slots VALUES(?,?,?)");
-    insert.integer(1, id);
-    insert.blob(2, source.front().data(), bytes, true);
-    insert.integer(3, hash);
-    insert.step();
-    if (cancelled.load())
-      return false;
-    transaction.commit();
-    return true;
-  }
-  Statement insert(db, "INSERT INTO slots VALUES(?,zeroblob(?),?)");
-  insert.integer(1, id);
-  insert.integer(2, bytes);
-  insert.integer(3, hash);
-  insert.step();
-  sqlite3_blob *raw = nullptr;
-  check(sqlite3_blob_open(db, "main", "slots", "data", id, 1, &raw), db);
-  std::unique_ptr<sqlite3_blob, decltype(&sqlite3_blob_close)> blob(
-      raw, sqlite3_blob_close);
-  int offset = 0;
-  for (auto span : source) {
-    while (!span.empty()) {
-      if (cancelled.load())
-        return false;
-      const int count =
-          static_cast<int>(std::min<size_t>(span.size(), 1 << 20));
-      check(sqlite3_blob_write(raw, span.data(), count, offset), db);
-      offset += count;
-      span = span.subspan(count);
+  bool written = true;
+  uint64_t cursor = offset;
+  try {
+    for (auto span : source) {
+      if (!transfer(impl_->payload, cursor,
+                    const_cast<std::byte *>(span.data()), span.size(), true,
+                    cancelled)) {
+        written = false;
+        break;
+      }
+      cursor += span.size();
     }
+    if (written && !cancelled.load()) {
+      std::lock_guard lock(impl_->mutex);
+      if (!impl_->records
+               .emplace(id, Impl::Extent{offset, bytes, checksum.finish()})
+               .second)
+        throw std::logic_error("cache payload is immutable");
+      return true;
+    }
+  } catch (...) {
+    std::lock_guard lock(impl_->mutex);
+    impl_->release(offset, bytes);
+    throw;
   }
-  blob.reset();
-  transaction.commit();
-  return true;
+  std::lock_guard lock(impl_->mutex);
+  impl_->release(offset, bytes);
+  return false;
 }
 
 bool CacheStore::read(uint64_t id,
                       const std::vector<std::span<std::byte>> &destination,
                       const std::atomic<bool> &cancelled) {
-  std::lock_guard lock(impl_->mutex);
-  auto *db = impl_->db;
-  Statement stored(db, "SELECT length(data),checksum FROM slots WHERE id=?");
-  stored.integer(1, id);
-  if (!stored.step())
-    return false;
-  uint64_t bytes = 0;
-  for (auto span : destination)
-    bytes += span.size();
-  if (bytes != stored.integer(0) || bytes > INT_MAX)
-    return false;
-  const uint64_t expected = stored.integer(1);
-  sqlite3_blob *raw = nullptr;
-  check(sqlite3_blob_open(db, "main", "slots", "data", id, 0, &raw), db);
-  std::unique_ptr<sqlite3_blob, decltype(&sqlite3_blob_close)> blob(
-      raw, sqlite3_blob_close);
-  int offset = 0;
-  Checksum checksum;
+  uint64_t offset, bytes, expected;
+  {
+    std::lock_guard lock(impl_->mutex);
+    const auto found = impl_->records.find(id);
+    if (found == impl_->records.end())
+      return false;
+    offset = found->second.offset;
+    bytes = found->second.bytes;
+    expected = found->second.checksum;
+  }
+  uint64_t requested = 0;
   for (auto span : destination) {
-    while (!span.empty()) {
-      if (cancelled.load())
-        return false;
-      const int count =
-          static_cast<int>(std::min<size_t>(span.size(), 1 << 20));
-      check(sqlite3_blob_read(raw, span.data(), count, offset), db);
-      checksum.update(span.data(), count);
-      offset += count;
-      span = span.subspan(count);
-    }
+    if (span.size() > uint64_t{INT64_MAX} - requested)
+      return false;
+    requested += span.size();
+  }
+  if (bytes != requested)
+    return false;
+  Checksum checksum;
+  // The caller's live slot owns this immutable extent until IO completes.
+  for (auto span : destination) {
+    if (!transfer(impl_->payload, offset, span.data(), span.size(), false,
+                  cancelled))
+      return false;
+    checksum.update(span.data(), span.size());
+    offset += span.size();
   }
   return checksum.finish() == expected;
 }
@@ -359,7 +525,7 @@ std::vector<CacheStore::Prefix> CacheStore::load() {
     } catch (const std::runtime_error &) {
       prefix.metadata.clear();
     }
-    Statement refs(impl_->db, "SELECT slot,length(data) FROM refs JOIN slots "
+    Statement refs(impl_->db, "SELECT slot,bytes FROM refs JOIN slots "
                               "ON slot=slots.id WHERE prefix=?");
     refs.integer(1, prefix.id);
     while (refs.step())
@@ -372,13 +538,15 @@ void CacheStore::collectUnreferenced() {
   std::lock_guard lock(impl_->mutex);
   sql(impl_->db, "DELETE FROM slots WHERE NOT EXISTS(SELECT 1 FROM refs WHERE "
                  "slot=slots.id)");
-  sql(impl_->db, "PRAGMA incremental_vacuum;");
+  impl_->rebuild();
 }
 
 void CacheStore::save(const Prefix &prefix) {
+  // Only durable publication synchronizes payloads. Temporary eviction pays
+  // for a raw write; a manifest cannot commit before all its payloads are safe.
+  fileCheck(::fsync(impl_->payload) == 0, "sync persistent cache payloads");
   std::lock_guard lock(impl_->mutex);
   auto *db = impl_->db;
-  // Payload and publication transactions both use FULL synchronization.
   {
     Transaction transaction(db);
     Statement put(db, "INSERT OR REPLACE INTO prefixes VALUES(?,?,?,?)");
@@ -392,6 +560,15 @@ void CacheStore::save(const Prefix &prefix) {
     put.integer(4, checksum.finish());
     put.step();
     for (auto record : prefix.records) {
+      const auto &extent = impl_->records.at(record.id);
+      if (extent.bytes != record.bytes)
+        throw std::invalid_argument("persistent record size mismatch");
+      Statement slot(db, "INSERT OR IGNORE INTO slots VALUES(?,?,?,?)");
+      slot.integer(1, record.id);
+      slot.integer(2, extent.offset);
+      slot.integer(3, extent.bytes);
+      slot.integer(4, extent.checksum);
+      slot.step();
       Statement ref(db, "INSERT OR IGNORE INTO refs VALUES(?,?)");
       ref.integer(1, prefix.id);
       ref.integer(2, record.id);
@@ -406,8 +583,8 @@ void CacheStore::erase(uint64_t id) {
   Statement remove(impl_->db, "DELETE FROM prefixes WHERE id=?");
   remove.integer(1, id);
   remove.step();
-  impl_->collect();
   transaction.commit();
+  impl_->collect();
 }
 void CacheStore::touch(std::span<const uint64_t> ids) {
   if (ids.empty())

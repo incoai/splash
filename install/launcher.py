@@ -640,6 +640,8 @@ def parse_args(argv=None):
     for name in clients.INSTALL_URLS:
         commands.add_parser(name, help=f"connect {name} to the running server")
     args = parser.parse_args(argv)
+    if args.command == "serve" and args.cache_file and not args.persistent_cache:
+        parser.error("--cache-file requires --persistent-cache with a nonzero size")
     if (
         args.command == "serve"
         and args.default_reasoning_effort is not None

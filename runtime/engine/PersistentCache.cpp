@@ -138,7 +138,14 @@ PersistentCache::PersistentCache(PersistentCacheConfig config, KvCache &kv,
   if (!config_.writeBurstBytes)
     config_.writeBurstBytes = config_.capacityBytes;
   writeCredit_ = static_cast<double>(config_.writeBurstBytes);
-  load();
+  try {
+    load();
+  } catch (...) {
+    for (auto &[_, entry] : entries_)
+      for (auto &record : entry.records)
+        record->releaseDurable();
+    throw;
+  }
 }
 PersistentCache::~PersistentCache() {
   finish();

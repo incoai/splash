@@ -4,11 +4,14 @@
 
 #include <chrono>
 #include <csignal>
+#include <fstream>
 #include <iostream>
+#include <mutex>
 #include <numeric>
 #include <sqlite3.h>
 #include <stdexcept>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
@@ -837,9 +840,9 @@ void crashAndIntegrity(const std::filesystem::path &path) {
   sqlite3 *db = nullptr;
   require(sqlite3_open(path.c_str(), &db) == SQLITE_OK,
           "cannot open corruption fixture");
-  require(sqlite3_exec(db, "UPDATE slots SET data=zeroblob(length(data))",
-                       nullptr, nullptr, nullptr) == SQLITE_OK,
-          "cannot corrupt payload");
+  require(sqlite3_exec(db, "UPDATE slots SET checksum=checksum+1", nullptr,
+                       nullptr, nullptr) == SQLITE_OK,
+          "cannot corrupt payload checksum");
   sqlite3_close(db);
   {
     Fixture f(path, 9 * unit);
@@ -963,12 +966,18 @@ void physicalShrink(const std::filesystem::path &path) {
       f.settle();
     }
   }
-  const auto before = std::filesystem::file_size(path);
+  const auto allocated = [&] {
+    struct stat info{};
+    require(::stat((path.string() + ".data").c_str(), &info) == 0,
+            "cannot stat payload allocation");
+    return uint64_t{512} * info.st_blocks;
+  };
+  const auto before = allocated();
   {
     Fixture f(path, 3 * unit);
     require(f.cache.snapshot().persistent.entries == 1,
             "shrink did not keep exactly one entry");
-    require(std::filesystem::file_size(path) < before / 2,
+    require(allocated() < before / 2,
             "quota shrink retained physical high-water allocation");
   }
 }
@@ -1062,6 +1071,118 @@ void checksumContract(const std::filesystem::path &path) {
           "payload checksum is not standard CRC32C");
   sqlite3_finalize(statement);
   sqlite3_close(db);
+}
+
+void rawPayloadsDoNotJournalTemporaryWrites(const std::filesystem::path &path) {
+  std::atomic<bool> cancelled{false};
+  const auto indexBytes = [&] {
+    std::ifstream input(path, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(input), {});
+  };
+  uint64_t survivor = 0;
+  uint64_t offset = 0;
+  std::vector<std::byte> data(unit, std::byte{0x5a});
+  {
+    CacheStore store(path, "raw-test");
+    const auto original = indexBytes();
+    for (unsigned i = 0; i < 32; ++i) {
+      auto id = store.allocate();
+      require(store.write(id, {data}, cancelled), "raw temporary write failed");
+      require(indexBytes() == original,
+              "temporary payload wrote the SQLite index");
+      store.retire(id);
+    }
+    require(std::filesystem::file_size(path.string() + ".data") <= 2 * unit,
+            "temporary churn did not reuse freed extents");
+    survivor = store.allocate();
+    require(store.write(survivor, {data}, cancelled), "survivor write failed");
+    store.save({1, {42}, {{survivor, data.size()}}});
+  }
+  const auto position = [&] {
+    sqlite3 *db = nullptr;
+    require(sqlite3_open(path.c_str(), &db) == SQLITE_OK,
+            "extent query open failed");
+    sqlite3_stmt *row = nullptr;
+    require(sqlite3_prepare_v2(db, "SELECT offset FROM slots", -1, &row,
+                               nullptr) == SQLITE_OK &&
+                sqlite3_step(row) == SQLITE_ROW,
+            "extent query failed");
+    auto value = sqlite3_column_int64(row, 0);
+    sqlite3_finalize(row);
+    sqlite3_close(db);
+    return static_cast<uint64_t>(value);
+  };
+  offset = position();
+  {
+    CacheStore store(path, "raw-test");
+    store.collectUnreferenced();
+    std::vector<std::byte> restored(unit);
+    require(store.read(survivor, {restored}, cancelled) && restored == data,
+            "restart changed raw payload");
+  }
+  require(position() == offset, "ordinary restart relocated a live payload");
+}
+
+void concurrentRawPayloads(const std::filesystem::path &path) {
+  std::exception_ptr failure;
+  std::mutex failures;
+  {
+    CacheStore store(path, "concurrent-test");
+    std::vector<std::thread> writers;
+    for (uint32_t worker = 0; worker < 4; ++worker)
+      writers.emplace_back([&, worker] {
+        try {
+          const std::atomic<bool> cancelled{false};
+          for (uint32_t n = 0; n < 12; ++n) {
+            const uint64_t id = store.allocate();
+            std::vector<std::byte> data((1 + n % 3) * unit,
+                                        std::byte{uint8_t(worker + n)});
+            require(store.write(id, {data}, cancelled),
+                    "concurrent write failed");
+            store.save({id, {worker, n}, {{id, data.size()}}});
+            std::vector<std::byte> restored(data.size());
+            require(store.read(id, {restored}, cancelled) && restored == data,
+                    "concurrent read returned another extent");
+          }
+        } catch (...) {
+          std::lock_guard lock(failures);
+          failure = std::current_exception();
+        }
+      });
+    for (auto &writer : writers)
+      writer.join();
+    if (failure)
+      std::rethrow_exception(failure);
+  }
+  CacheStore reopened(path, "concurrent-test");
+  const auto records = reopened.load();
+  require(records.size() == 48, "concurrent publication lost a manifest");
+  const std::atomic<bool> cancelled{false};
+  for (const auto &prefix : records) {
+    std::vector<std::byte> bytes(prefix.records.front().bytes);
+    require(reopened.read(prefix.records.front().id, {bytes}, cancelled),
+            "concurrent publication exposed an unsynchronized payload");
+  }
+}
+
+void mismatchedPayloadFile(const std::filesystem::path &directory) {
+  const auto first = directory / "pair-a.sqlite",
+             second = directory / "pair-b.sqlite";
+  {
+    CacheStore a(first, "same-model"), b(second, "same-model");
+  }
+  std::filesystem::copy_file(second.string() + ".data",
+                             first.string() + ".data",
+                             std::filesystem::copy_options::overwrite_existing);
+  bool rejected = false;
+  try {
+    CacheStore a(first, "same-model");
+  } catch (const std::runtime_error &error) {
+    rejected =
+        std::string(error.what()).find(first.string()) != std::string::npos;
+  }
+  require(rejected,
+          "mismatched payload was admitted or error omitted its path");
 }
 
 void interruptedPublications(const std::filesystem::path &path) {
@@ -1188,6 +1309,9 @@ int main(int argc, char **argv) {
     migrateWal(directory.path / "migration.sqlite");
     checksumContract(directory.path / "checksum.sqlite");
     interruptedPublications(directory.path / "interrupt.sqlite");
+    rawPayloadsDoNotJournalTemporaryWrites(directory.path / "raw.sqlite");
+    concurrentRawPayloads(directory.path / "concurrent.sqlite");
+    mismatchedPayloadFile(directory.path);
     std::cout << "Persistent cache tests passed\n";
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';

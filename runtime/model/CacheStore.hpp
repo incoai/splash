@@ -11,8 +11,9 @@
 
 namespace splash::model {
 
-// Shared backing for durable and temporary slots. SQLite owns allocation,
-// crash recovery and atomic publication; the engine owns admission and LRU.
+// Shared backing for durable and temporary slots. Uncached payload extents
+// accompany the SQLite index; manifests commit only after payload sync.
+// The engine owns admission and LRU.
 // Payload IO runs only on SlotFile workers. Opening/loading happens at startup.
 class CacheStore final {
 public:

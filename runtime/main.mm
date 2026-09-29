@@ -210,6 +210,8 @@ NativeArguments parseArguments(int argc, char **argv) {
       result.cacheFile = value;
     } else throw UsageError("unknown native option");
   }
+  if (!result.cacheFile.empty() && !result.persistentCacheBytes)
+    throw UsageError("--cache-file requires nonzero --persistent-cache-bytes");
   result.modelRoot = requireModelRoot(argv[2], argv[3]);
   result.model = model::inspectModelPackage(result.modelRoot);
   result.maxContext = parseMaxContext(argv[4], result.model.capabilities);

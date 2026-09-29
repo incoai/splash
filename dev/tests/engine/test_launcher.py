@@ -73,6 +73,10 @@ class LauncherTests(unittest.TestCase):
             (both.persistent_cache, both.max_cache_disk), (2 * 1024**3, 1024**3)
         )
 
+    def test_cache_file_requires_enabled_persistence(self):
+        with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
+            launcher.parse_args(["serve", "--model", MODEL_ID, "--cache-file", "/tmp/cache"])
+
     def setUp(self):
         # No serve refreshes the catalog from the Hub into the checkout, and
         # the launcher's defaults ignore the caller's Splash settings.
