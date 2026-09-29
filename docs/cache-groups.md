@@ -95,7 +95,9 @@ returning a transfer ticket.
 RAM snapshot or a direct-write plan, before either path may evict durable data.
 An accepted direct capture enters the same bounded publication job and is not
 admitted or charged a second time. A rejected candidate may use temporary space
-when offloading is enabled, but that fallback cannot evict a durable manifest.
+when offloading is enabled, but that fallback cannot evict a durable manifest. Ordinary snapshot RAM
+recycling applies the same restriction to any offload it starts, so it cannot
+bypass admission indirectly after a declined direct capture.
 Necessary progress checkpoints and pressure-driven offloads retain their normal
 reclaim semantics. Publisher pacing includes accepted direct capture's source
 writes and missing target pages. The default allowance is 256 GiB/hour with

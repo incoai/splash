@@ -417,6 +417,39 @@ void directAdmission(const std::filesystem::path &directory) {
           "admitted direct prefix did not survive restart");
 }
 
+// A denied direct capture falls back to bounded RAM recycling in Engine.
+// Recycling an ordinary snapshot must not evict durable data indirectly via
+// the old RAM state's offload, even when the durable state's RAM is pinned.
+void optionalRecyclingPreservesDurable(const std::filesystem::path &path) {
+  {
+    Fixture f(path, 17 * unit, unit, 512);
+    f.publish(100, 512); f.settle();
+    f.publish(10000, 64); f.settle();
+    auto pinned = f.lookup(100, 512);
+    auto held = f.stateFile->acquire();
+    require(pinned.state && held, "optional recycling fixture failed");
+    f.cache.beginRequest(20000);
+    require(f.cache.ensureTokens(20000, 64).granted(), "optional candidate allocation failed");
+    std::vector<uint32_t> tokens(64); std::iota(tokens.begin(), tokens.end(), 20000);
+    const auto block = f.cache.publishCommittedBlocks(20000, tokens, 64);
+    auto source = test::checkpoint(64, std::make_shared<State>(f.stateFile, 64));
+    const SnapshotWritePlan plan{source, [&](std::function<void()> done) {
+      return test::snapshotWrite(64, source->blocks.front().payload->offload(std::move(done)));
+    }};
+    require(!f.cache.publishStateToDisk(block, plan), "full temporary tier admitted the short candidate");
+    require(f.cache.reclaimOneState().madeProgress, "optional RAM recycling stalled");
+    f.cache.publishCompositeState(block, source);
+    f.cache.endRequest(20000); f.settle();
+    require(f.cache.snapshot().persistent.entries == 1 &&
+                !f.cache.snapshot().persistent.failures,
+            "optional RAM offload bypassed durable admission");
+  }
+  Fixture reopened(path, 17 * unit, unit, 512);
+  require(reopened.lookup(100, 512).resumeBoundary() == 512 &&
+              !reopened.lookup(20000, 64).state,
+          "optional recycling lost the durable prefix across restart");
+}
+
 void writePacing(const std::filesystem::path &path) {
   {
     Fixture f(path, 9 * unit, 0, 0, 0, 3 * unit);
@@ -1049,6 +1082,7 @@ int main(int argc, char **argv) {
     pressureAdmission(directory.path / "pressure.sqlite");
     writePacing(directory.path / "pacing.sqlite");
     directAdmission(directory.path);
+    optionalRecyclingPreservesDurable(directory.path / "optional-recycle.sqlite");
     runtimeAndRestart(directory.path / "runtime.sqlite");
     lruAndQuotas(directory.path / "lru.sqlite");
     sharedPrefixes(directory.path / "shared.sqlite");

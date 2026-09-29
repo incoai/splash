@@ -456,8 +456,12 @@ CacheReclaimResult Cache::reclaimOneState(bool checkpointsOnly) {
       states_.evictionCandidate();
   if (!state || (checkpointsOnly && !states_.isCheckpoint(*state)))
     return {};
-  const auto eviction = states_.reclaim(state->id, completionNotifier_,
-                                        makeRoom_, state->group);
+  // Ordinary snapshot recycling is optional, just like direct capture. Its
+  // offload must not bypass durable admission. Progress checkpoints retain
+  // the pressure path; demand-driven reclaim uses makeRoom_ independently.
+  const auto eviction = states_.reclaim(
+      state->id, completionNotifier_,
+      [this, checkpointsOnly] { return freeDiskSpace(checkpointsOnly); }, state->group);
   return {eviction.evicted, eviction.reclaimedBytes, eviction.pending};
 }
 
