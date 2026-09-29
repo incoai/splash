@@ -963,13 +963,15 @@ void testOptionalReclaimLeavesOrdinaryStateIntact() {
   fixture.publish(0, 150);
   test::publishCheckpoint(fixture.cache, fixture.blocks[2],
                                       std::make_shared<TestState>(200), true);
-  require(fixture.cache.reclaimOneState(true).madeProgress &&
-              fixture.cache.snapshot().stateCache.checkpointEntries == 0 &&
-              fixture.lookup(33).resumeBoundary() == 32,
-          "optional publication failed to recycle a disposable checkpoint");
-  require(!fixture.cache.reclaimOneState(true).madeProgress &&
-              fixture.cache.snapshot().stateCache.entries == 1,
-          "optional publication displaced ordinary cached state");
+  require(
+      fixture.cache.reclaimOneState({.checkpointsOnly = true}).madeProgress &&
+          fixture.cache.snapshot().stateCache.checkpointEntries == 0 &&
+          fixture.lookup(33).resumeBoundary() == 32,
+      "optional publication failed to recycle a disposable checkpoint");
+  require(
+      !fixture.cache.reclaimOneState({.checkpointsOnly = true}).madeProgress &&
+          fixture.cache.snapshot().stateCache.entries == 1,
+      "optional publication displaced ordinary cached state");
 }
 
 void testCheckpointPinsAndBoundaryUpgrade() {
@@ -1144,13 +1146,14 @@ void testDiskQuotaReplacesByRecency() {
               fixture.lookup(129).resumeBoundary() == 128 && !fixture.lookup(33).state,
           "the older disk copy was not replaced");
   test::publishCheckpoint(fixture.cache, fixture.blocks[1], std::make_shared<TieredState>(control), true);
-  require(fixture.cache.reclaimOneState(true).madeProgress &&
-              fixture.cache.pollTransfers() &&
-              fixture.cache.snapshot().stateCache.offloads == 3 &&
-              control->slots == 1 &&
-              fixture.cache.snapshot().stateCache.checkpointEntries == 1 &&
-              fixture.lookup(129).resumeBoundary() == 64,
-          "checkpoint did not replace the least recently used copy");
+  require(
+      fixture.cache.reclaimOneState({.checkpointsOnly = true}).madeProgress &&
+          fixture.cache.pollTransfers() &&
+          fixture.cache.snapshot().stateCache.offloads == 3 &&
+          control->slots == 1 &&
+          fixture.cache.snapshot().stateCache.checkpointEntries == 1 &&
+          fixture.lookup(129).resumeBoundary() == 64,
+      "checkpoint did not replace the least recently used copy");
 }
 
 // A rolling checkpoint uses the tier like any state: straight to disk when no
@@ -1176,9 +1179,10 @@ void testRollingCheckpointsUseTheTier() {
           "retirement left the disk copy behind");
   test::publishCheckpoint(fixture.cache, fixture.blocks[2],
                                       std::make_shared<TieredState>(control), true);
-  require(fixture.cache.reclaimOneState(true).madeProgress &&
-              fixture.cache.pollTransfers(),
-          "RAM checkpoint was not reclaimed");
+  require(
+      fixture.cache.reclaimOneState({.checkpointsOnly = true}).madeProgress &&
+          fixture.cache.pollTransfers(),
+      "RAM checkpoint was not reclaimed");
   stats = fixture.cache.snapshot().stateCache;
   require(stats.offloads == 2 && stats.bytes == 0 && stats.checkpointEntries == 1 &&
               stats.checkpointBytes == 0 && control->slots == 1,
@@ -1186,13 +1190,14 @@ void testRollingCheckpointsUseTheTier() {
   control->capacity = 1;
   test::publishCheckpoint(fixture.cache, fixture.blocks[3],
                                       std::make_shared<TieredState>(control), true);
-  require(fixture.cache.reclaimOneState(true).madeProgress &&
-              fixture.cache.pollTransfers() && control->slots == 1 &&
-              fixture.cache.snapshot().stateCache.offloads == 3 &&
-              fixture.cache.snapshot().stateCache.checkpointEntries == 1 &&
-              fixture.cache.checkpointState(fixture.blocks[3]) &&
-              !fixture.cache.checkpointState(fixture.blocks[2]),
-          "a full quota kept the older checkpoint");
+  require(
+      fixture.cache.reclaimOneState({.checkpointsOnly = true}).madeProgress &&
+          fixture.cache.pollTransfers() && control->slots == 1 &&
+          fixture.cache.snapshot().stateCache.offloads == 3 &&
+          fixture.cache.snapshot().stateCache.checkpointEntries == 1 &&
+          fixture.cache.checkpointState(fixture.blocks[3]) &&
+          !fixture.cache.checkpointState(fixture.blocks[2]),
+      "a full quota kept the older checkpoint");
   require(fixture.cache.reclaimOne(CacheReclaimMode::ReuseBacking).madeProgress &&
               tier.demotions == 1 && fixture.cache.snapshot().kvCache.blocks == 4,
           "the checkpoint's leaf was dropped instead of demoted");
@@ -1359,7 +1364,7 @@ void testLostStatesAreCounted() {
     require(hit.state && !hit.lostState, "a disk hit was counted as a lost state");
   }
   test::publishCheckpoint(fixture.cache, fixture.blocks[1], std::make_shared<TestState>(100), true);
-  require(fixture.cache.reclaimOneState(true).madeProgress,
+  require(fixture.cache.reclaimOneState({.checkpointsOnly = true}).madeProgress,
           "checkpoint was not dropped");
   {
     auto shallow = fixture.lookup(65);
@@ -1404,9 +1409,10 @@ void testDiskCheckpointRamAccounting() {
     test::publishCheckpoint(fixture.cache, fixture.blocks[3],
                                         std::make_shared<TieredState>(control), true);
     const auto point = fixture.cache.checkpointState(fixture.blocks[3]);
-    require(fixture.cache.reclaimOneState(true).madeProgress &&
-                fixture.cache.pollTransfers(),
-            "checkpoint demotion failed");
+    require(
+        fixture.cache.reclaimOneState({.checkpointsOnly = true}).madeProgress &&
+            fixture.cache.pollTransfers(),
+        "checkpoint demotion failed");
     if (republish) {
       test::publishCheckpoint(fixture.cache, fixture.blocks[3],
                                           std::make_shared<TestState>(100), true);

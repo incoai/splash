@@ -95,6 +95,7 @@ struct TokenAdmission final {
   uint32_t additionalPages = 0;
   uint32_t availablePages = 0;
   metal::AllocationFailure allocationFailure = metal::AllocationFailure::None;
+  std::optional<CacheGroupId> cacheGroup{};
 
   [[nodiscard]] bool granted() const noexcept {
     return failure == KvPageAcquireFailure::None;
@@ -125,6 +126,13 @@ enum class KvRestoreStatus : uint8_t { None, Pending, Failed };
 // A state in RAM always sits on a resident KV block: reclaimKvLeaf frees or
 // drops the state before the block's page, and endRequest, pollTransfers and
 // freeDiskSpace leave such a block its page.
+enum class StateReclaimPurpose { Snapshot, Execution };
+struct StateReclaim final {
+  std::optional<CacheGroupId> group{};
+  bool checkpointsOnly = false;
+  StateReclaimPurpose purpose = StateReclaimPurpose::Snapshot;
+};
+
 class Cache final {
 public:
   // The disk budget is the quota the states' file shares with the KV tier;
@@ -240,8 +248,7 @@ public:
   // Optional snapshot admission recycles one unpinned state in global LRU
   // order, preferring checkpoints. Busy writes return pending without
   // discarding an uncopied state.
-  [[nodiscard]] CacheReclaimResult
-  reclaimOneState(bool checkpointsOnly = false);
+  [[nodiscard]] CacheReclaimResult reclaimOneState(StateReclaim request = {});
   // Empty resident backing exists but the previous release is still in
   // flight; more reclaim work becomes possible without evicting anything.
   [[nodiscard]] bool releaseDeferred() const noexcept;

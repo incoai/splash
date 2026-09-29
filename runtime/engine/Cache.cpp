@@ -260,18 +260,17 @@ void Cache::publishCompositeState(uint64_t kvBlock,
 
 bool Cache::publishStateToDisk(uint64_t kvBlock, const SnapshotWritePlan &plan,
                                 bool checkpoint) {
-  if (!offloadEnabled_ && checkpoint) return false;
   if (reuseStoredState(kvBlock, checkpoint)) return true;
   if (!plan.source || !plan.write || states_.writing()) return false;
-  if (persistent_ && !checkpoint) {
-    if (persistent_->capture(kvBlock, plan)) return true;
-    if (!offloadEnabled_) return false;
-    // A rejected optional durable capture may still use the temporary tier,
-    // but cannot bypass admission by evicting a durable prefix for its slots.
-    return states_.publishToDisk(kvBlock, plan.write, completionNotifier_,
-                                 [this] { return freeDiskSpace(false); }, false);
-  }
-  return states_.publishToDisk(kvBlock, plan.write, completionNotifier_, makeRoom_, checkpoint);
+  if (persistent_ && !checkpoint && persistent_->capture(kvBlock, plan))
+    return true;
+  if (!offloadEnabled_)
+    return false;
+  // All optional captures may use temporary space. Only a candidate admitted
+  // by the durable publisher, or required execution, can displace a manifest.
+  return states_.publishToDisk(
+      kvBlock, plan.write, completionNotifier_,
+      [this] { return freeDiskSpace(false); }, checkpoint);
 }
 
 StateCheckpoint Cache::checkpointState(uint64_t kvBlock) const {
@@ -455,17 +454,18 @@ CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode,
   return {false, 0, transfersInFlight()};
 }
 
-CacheReclaimResult Cache::reclaimOneState(bool checkpointsOnly) {
-  const std::optional<CacheEvictionCandidate> state =
-      states_.evictionCandidate();
-  if (!state || (checkpointsOnly && !states_.isCheckpoint(*state)))
+CacheReclaimResult Cache::reclaimOneState(StateReclaim request) {
+  const auto state = states_.evictionCandidate(true, request.group);
+  if (!state || (request.checkpointsOnly && !states_.isCheckpoint(*state)))
     return {};
-  // Ordinary snapshot recycling is optional, just like direct capture. Its
-  // offload must not bypass durable admission. Progress checkpoints retain
-  // the pressure path; demand-driven reclaim uses makeRoom_ independently.
+  // Optional snapshots never evict durable prefixes merely to recycle RAM.
+  // Required execution allocations use the normal demand reclaim policy.
   const auto eviction = states_.reclaim(
       state->id, completionNotifier_,
-      [this, checkpointsOnly] { return freeDiskSpace(checkpointsOnly); }, state->group);
+      [this, request] {
+        return freeDiskSpace(request.purpose == StateReclaimPurpose::Execution);
+      },
+      state->group);
   return {eviction.evicted, eviction.reclaimedBytes, eviction.pending};
 }
 

@@ -31,6 +31,10 @@ RestoreLease &RestoreLease::operator=(RestoreLease &&other) noexcept {
 }
 RestoreLease::~RestoreLease() noexcept { reset(); }
 void RestoreLease::reset() noexcept {
+  // A request accesses checkpoint groups before their window dependencies.
+  // Release explicitly in that order; vector destruction order is not policy.
+  for (auto &lease : leases_)
+    lease.reset();
   leases_.clear();
   state_.reset();
   if (kv_)
@@ -56,6 +60,9 @@ void StateCache::configure(std::vector<CacheGroupSpec> specs) {
   for (const auto &spec : specs) {
     auto store = std::make_unique<StateGroupCache>(kv_, recency_, spec.id);
     store->setOffloadEnabled(offloadEnabled_);
+    if (spec.kind == CacheGroupKind::Checkpoint)
+      store->setRemovalHandler(
+          [this](uint64_t leaf) { return pruneWindowDependencies(leaf); });
     groups.emplace(spec.id, std::move(store));
   }
   groups_ = std::move(groups);
@@ -349,10 +356,48 @@ bool StateCache::copyToDisk(uint64_t leaf,
   }
   return true;
 }
+uint64_t StateCache::pruneWindowDependencies(uint64_t leaf) noexcept {
+  const auto hasCheckpoint = [&](uint64_t block) {
+    for (const auto &spec : coordinator_.groups())
+      if (spec.kind == CacheGroupKind::Checkpoint &&
+          !group(spec.id).contains(block))
+        return false;
+    return true;
+  };
+  const std::function<bool(uint64_t)> needed = std::cref(hasCheckpoint);
+  const uint32_t depth = kv_.chainLength(leaf);
+  uint64_t reclaimed = 0;
+  for (const auto &spec : coordinator_.groups()) {
+    if (spec.kind != CacheGroupKind::SlidingWindow)
+      continue;
+    auto &store = group(spec.id);
+    const uint32_t span = (spec.windowTokens - 1) / KvCache::pageTokens;
+    // A fragment ending at d can serve only descendant checkpoints whose
+    // window starts before d. Other branches and overlapping windows remain
+    // discoverable in the existing prefix tree; no second ownership graph.
+    uint64_t block = leaf;
+    for (uint32_t d = depth; d && depth - d <= span; --d) {
+      if (store.contains(block) &&
+          !kv_.anyDescendant(block, d + span, needed)) {
+        const auto eviction = store.evict(block);
+        reclaimed += eviction.reclaimedBytes;
+        // A failed restore can still pin the window while its checkpoint
+        // lease is released. Existing readers keep their payload; defer
+        // removal until the last lease leaves, as for other invalid states.
+        if (!eviction.evicted)
+          if (const auto unused = store.peek(block))
+            store.invalidate(block, unused->payload.get());
+      }
+      block = d > 1 ? kv_.ancestor(block, d - 1) : 0;
+    }
+  }
+  return reclaimed;
+}
+
 StateCheckpoint StateCache::checkpoint(uint64_t block) const {
   StateCheckpoint result;
-  // Rolling checkpoint retirement owns exact state only. Window blocks can
-  // serve newer checkpoints and retain their independent LRU lifetime.
+  // Removing the exact checkpoint also releases window blocks that no other
+  // checkpoint uses. Publication identity protects upgraded/replaced entries.
   for (const auto &spec : coordinator_.groups())
     if (spec.kind == CacheGroupKind::Checkpoint)
       if (auto point = group(spec.id).checkpoint(block)) {
@@ -367,11 +412,13 @@ bool StateCache::retireCheckpoint(const StateCheckpoint &point) noexcept {
     retired = group(id).retireCheckpoint(checkpoint) && retired;
   return retired;
 }
-std::optional<CacheEvictionCandidate>
-StateCache::evictionCandidate(bool checkpoints) const noexcept {
+std::optional<CacheEvictionCandidate> StateCache::evictionCandidate(
+    bool checkpoints, std::optional<CacheGroupId> selected) const noexcept {
   std::optional<CacheEvictionCandidate> result;
   bool resultCheckpoint = false;
-  for (const auto &[_, store] : groups_) {
+  for (const auto &[id, store] : groups_) {
+    if (selected && *selected != id)
+      continue;
     const auto candidate = store->evictionCandidate(checkpoints);
     if (!candidate)
       continue;

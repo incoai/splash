@@ -97,6 +97,164 @@ void retireCheckpointKeepsSharedWindow() {
   require(f.lookup(97).resumeBoundary() == 96,
           "retiring a checkpoint removed a newer checkpoint's window");
 }
+void retirementReleasesUnsharedWindow() {
+  Fixture f({{7}, {19, CacheGroupKind::SlidingWindow, 64}});
+  f.publish(64, {part(7, 64, 64), part(19, 0, 64)}, true);
+  auto old = f.cache.checkpointState(f.blocks[1]);
+  f.publish(192, {part(7, 192, 192), part(19, 128, 192)}, true);
+  require(f.cache.retireCheckpointState(old), "checkpoint retirement failed");
+  require(f.cache.snapshot().stateCache.entries == 2 &&
+              f.lookup(193).resumeBoundary() == 192,
+          "retired checkpoint left an unshared window");
+}
+void leaseReleasePreservesDependencyOrder() {
+  Fixture f({{7}, {19, CacheGroupKind::SlidingWindow, 64}});
+  f.publish(64, {{7, 64, 64, std::make_shared<Payload>(100)},
+                 {19, 0, 64, std::make_shared<Payload>(3)}});
+  {
+    auto hit = f.lookup(65);
+    require(bool(hit.state), "lease fixture missed");
+  }
+  require(
+      f.cache.reclaimOneState().madeProgress &&
+          f.cache.snapshot().stateCache.entries == 0,
+      "lease release left an unusable checkpoint after evicting its window");
+}
+
+void invalidatedLeaseReleasesUnneededWindow() {
+  Fixture f({{7}, {19, CacheGroupKind::SlidingWindow, 64}});
+  auto checkpoint = part(7, 64, 64);
+  f.publish(64, {checkpoint, part(19, 0, 64)});
+  {
+    auto hit = f.lookup(65);
+    auto failed = RestoreState{64, {checkpoint}};
+    f.cache.discardState(f.blocks[1], &failed);
+    require(hit.state->state()->blocks.size() == 2,
+            "invalidation destroyed the active restore payload");
+  }
+  require(f.cache.snapshot().stateCache.entries == 0,
+          "invalidated restore lease left an unneeded window");
+}
+
+void incompleteCheckpointGroupsDoNotRetainWindow() {
+  Fixture f({{7}, {8}, {19, CacheGroupKind::SlidingWindow, 64}});
+  auto checkpoint = part(7, 64, 64);
+  f.publish(64, {checkpoint, part(8, 64, 64), part(19, 0, 64)});
+  auto failed = RestoreState{64, {checkpoint}};
+  f.cache.discardState(f.blocks[1], &failed);
+  require(f.cache.snapshot().stateCache.entries == 1 &&
+              f.lookup(65).resumeBoundary() == 0,
+          "incomplete checkpoint groups retained an unusable window");
+}
+
+void diskQuotaReclaimCanRetireTheWriteSource() {
+  struct TieredPayload final : StatePayload {
+    explicit TieredPayload(bool disk) : disk(disk) {}
+    bool disk;
+    mutable uint32_t writes = 0;
+    uint64_t bytes() const noexcept override { return 100; }
+    uint64_t residentBytes() const noexcept override {
+      return disk ? 0 : bytes();
+    }
+    bool canOffload() const noexcept override { return !disk; }
+    std::unique_ptr<StateOffload>
+    offload(std::function<void()>) const override {
+      ++writes;
+      return {}; // Full disk quota: the caller must make room.
+    }
+  };
+  for (bool copy : {false, true}) {
+    test::TestKvBacking backing{4, 100};
+    KvPool pool(backing);
+    CacheRecency recency;
+    KvCache kv(pool, {}, recency);
+    StateCache states(kv, recency);
+    states.configure({{7}, {19, CacheGroupKind::SlidingWindow, 32}});
+    auto allocation = pool.acquirePages(1, false);
+    require(allocation.granted(), "quota reclaim fixture allocation failed");
+    std::array<uint32_t, 32> tokens{};
+    const auto leaf = kv.insert(0, tokens, allocation.pages[0]).id;
+    pool.releasePage(allocation.pages[0], false);
+    states.importDisk(
+        leaf, std::make_shared<RestoreState>(RestoreState{
+                  32, {{7, 32, 32, std::make_shared<TieredPayload>(true)}}}));
+    auto source = std::make_shared<TieredPayload>(false);
+    states.publish(leaf, std::make_shared<RestoreState>(
+                             RestoreState{32, {{19, 0, 32, source}}}));
+    uint32_t attempts = 0;
+    const auto makeRoom = [&] {
+      if (++attempts != 1)
+        return false;
+      states.evictDiskOnly(leaf, 7);
+      return true;
+    };
+    if (copy)
+      require(!states.copyToDisk(leaf, {}, makeRoom),
+              "copied a window with no remaining checkpoint");
+    else
+      require(states.reclaim(leaf, {}, makeRoom, 19).evicted,
+              "quota reclaim did not release the obsolete source");
+    require(states.snapshot().entries == 0 && !states.writing() &&
+                attempts == 1 && source->writes == 1,
+            "quota reclaim retained or rewrote an orphan window");
+  }
+}
+
+void longPrefillKeepsOnlyLiveWindows() {
+  test::TestKvBacking backing(4096, 1);
+  KvPool pool(backing);
+  Cache cache(pool, {});
+  cache.configureGroups({{7}, {19, CacheGroupKind::SlidingWindow, 2048}});
+  std::vector<uint32_t> tokens(131073);
+  std::iota(tokens.begin(), tokens.end(), 1);
+  cache.beginRequest(1);
+  require(cache.ensureTokens(1, 131072).granted(),
+          "long prefill fixture failed");
+  static_cast<void>(cache.publishCommittedBlocks(1, tokens, 131072));
+  StateCheckpoint previous;
+  for (uint32_t end = 4096; end <= 131072; end += 4096) {
+    require(cache.retireCheckpointState(previous),
+            "long prefill retirement failed");
+    auto state = std::make_shared<RestoreState>();
+    state->boundary = end;
+    state->blocks.push_back(part(7, end, end));
+    for (uint32_t page = end - 2048 + 128; page <= end; page += 128)
+      state->blocks.push_back(part(19, page - 128, page));
+    const auto leaf = cache.blockAt(1, end);
+    cache.publishCompositeState(leaf, std::move(state), true);
+    previous = cache.checkpointState(leaf);
+    require(cache.snapshot().stateCache.entries == 17,
+            "long prefill accumulated orphan windows");
+  }
+  require(cache.lookup(tokens).resumeBoundary() == 131072,
+          "long prefill lost latest recovery point");
+  cache.endRequest(1);
+}
+
+void retirementPreservesOtherBranch() {
+  Fixture f({{7}, {19, CacheGroupKind::SlidingWindow, 128}});
+  auto shared = part(19, 0, 64);
+  f.publish(96, {part(7, 96, 96), shared, part(19, 64, 96)}, true);
+  auto old = f.cache.checkpointState(f.blocks[2]);
+  auto branch = f.tokens;
+  branch[64] += 10000;
+  f.cache.beginRequest(2);
+  require(f.cache.ensureTokens(2, 96).granted(), "branch allocation failed");
+  static_cast<void>(f.cache.publishCommittedBlocks(2, branch, 96));
+  const auto leaf = f.cache.blockAt(2, 96);
+  f.cache.publishCompositeState(
+      leaf,
+      std::make_shared<RestoreState>(
+          RestoreState{96, {part(7, 96, 96), shared, part(19, 64, 96)}}),
+      true);
+  f.cache.endRequest(2);
+  require(f.cache.retireCheckpointState(old) &&
+              f.cache.lookup(std::span(branch).first(97)).resumeBoundary() ==
+                  96 &&
+              f.cache.snapshot().stateCache.entries == 3,
+          "retirement removed a sibling branch's shared window");
+}
+
 void requestTouchesRestoreDependencies() {
   for (bool reverse : {false, true}) {
     std::vector<CacheGroupSpec> groups{{7},
@@ -114,11 +272,13 @@ void requestTouchesRestoreDependencies() {
       require(f.cache.restoreRequest(2, hit).granted(), "restore failed");
     }
     f.cache.endRequest(2);
-    require(f.cache.reclaimOneState().madeProgress &&
-                f.cache.reclaimOneState().madeProgress,
+    require(f.cache.reclaimOneState().madeProgress,
             "group reclaim made no progress");
-    require(f.cache.snapshot().stateCache.bytes == 2,
-            "LRU removed a shared dependency before its older checkpoints");
+    require(f.lookup(97).resumeBoundary() == 96,
+            "LRU removed a shared dependency before its older checkpoint");
+    require(f.cache.reclaimOneState().madeProgress &&
+                f.cache.snapshot().stateCache.entries == 0,
+            "last checkpoint left orphan window dependencies");
   }
 }
 void windowWithoutCheckpoint() {
@@ -162,9 +322,8 @@ void independentEviction() {
   Fixture f({{7}, {19, CacheGroupKind::SlidingWindow, 64}});
   f.publish(64, {part(7, 64, 64), part(19, 0, 64)});
   require(f.cache.reclaimOneState().madeProgress, "group LRU made no progress");
-  require(f.cache.snapshot().stateCache.entries == 1 &&
-              f.cache.stateResident(f.blocks[1]),
-          "one group eviction discarded its sibling at the same endpoint");
+  require(f.cache.snapshot().stateCache.entries == 0,
+          "checkpoint eviction retained an unusable window");
   require(!f.lookup(65).state, "incomplete group set was treated as a hit");
 }
 void branchIsolation() {
@@ -267,6 +426,13 @@ int main() {
     noAuxiliaryState();
     independentGroups();
     retireCheckpointKeepsSharedWindow();
+    retirementReleasesUnsharedWindow();
+    longPrefillKeepsOnlyLiveWindows();
+    retirementPreservesOtherBranch();
+    leaseReleasePreservesDependencyOrder();
+    invalidatedLeaseReleasesUnneededWindow();
+    incompleteCheckpointGroupsDoNotRetainWindow();
+    diskQuotaReclaimCanRetireTheWriteSource();
     requestTouchesRestoreDependencies();
     windowWithoutCheckpoint();
     severalGroupsAndHoles();

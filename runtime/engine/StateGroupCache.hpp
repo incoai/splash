@@ -106,6 +106,11 @@ public:
   StateGroupCache(const StateGroupCache &) = delete;
   StateGroupCache &operator=(const StateGroupCache &) = delete;
 
+  // Called after the last copy leaves, while its target ancestry is retained.
+  void setRemovalHandler(std::function<uint64_t(uint64_t)> handler) {
+    removed_ = std::move(handler);
+  }
+
   // Pins one block selected by the coordinator; maintenance preserves recency.
   [[nodiscard]] std::optional<StateBlockLease>
   acquireBlock(uint64_t kvBlock, CacheAccess access);
@@ -216,9 +221,10 @@ private:
   [[nodiscard]] Entry &publicationEntry(uint64_t kvBlock, bool checkpoint);
   // Starts a write, giving up quota through makeRoom while the tier refuses
   // one; null while the one write in flight holds the staging buffer.
-  // makeRoom leaves states in RAM alone: reclaim holds the entry it writes.
+  // A maintenance lease protects the source across quota eviction callbacks.
+  // Dependency removal may invalidate it, in which case no write is started.
   [[nodiscard]] std::unique_ptr<StateOffload>
-  startWrite(const StateBlockWriter &write,
+  startWrite(uint64_t kvBlock, const StateBlockWriter &write,
              const std::function<void()> &completion,
              const std::function<bool()> &makeRoom);
   // The disk copy this write carries becomes the entry's; the write is the
@@ -238,6 +244,7 @@ private:
   // and a checkpoint is upgraded.
   void makeOrdinary(uint64_t kvBlock, Entry &entry);
 
+  std::function<uint64_t(uint64_t)> removed_;
   bool offloadEnabled_ = true;
   KvCache &kv_;
   CacheRecency &recency_;

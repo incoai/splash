@@ -506,6 +506,12 @@ struct WarmupStepResult final {
   std::vector<WarmupLaneResult> lanes;
 };
 
+// Cache backing that can satisfy a model allocation through reuse.
+struct CacheAllocation final {
+  uint64_t bytes = 0;
+  std::optional<CacheGroupId> group{};
+};
+
 class Model {
 public:
   virtual ~Model() = default;
@@ -541,6 +547,10 @@ public:
                                                             uint64_t) {
     return true;
   }
+  [[nodiscard]] virtual std::optional<CacheGroupId>
+  stepAllocationGroup(uint64_t) const {
+    return {};
+  }
   // Optional async wake hook; an immediately ready ticket need not call it.
   [[nodiscard]] virtual std::unique_ptr<ModelBatchTicket>
   submit(const BatchPlan &plan, std::span<const ModelBatchItem> items,
@@ -559,8 +569,8 @@ public:
   // Bounds optional LRU recycling after a denied snapshot; zero means that
   // snapshot publication must not displace cache. Models with variable state
   // sizes report the requirement for this request's current boundary.
-  [[nodiscard]] virtual uint64_t snapshotAllocationBytes(uint64_t) const {
-    return 0;
+  [[nodiscard]] virtual CacheAllocation snapshotAllocation(uint64_t) const {
+    return {};
   }
   // Whether the disk tier takes a state written from a lane: a tier exists
   // and its state file accepts writes. The quota is the write's own concern.

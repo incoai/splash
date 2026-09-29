@@ -409,6 +409,26 @@ KvCache::diskCandidate(bool duplicate) const noexcept {
   return std::nullopt;
 }
 
+bool KvCache::anyDescendant(
+    uint64_t root, uint32_t maximumDepth,
+    const std::function<bool(uint64_t)> &predicate) const {
+  uint64_t id = root;
+  for (;;) {
+    const auto &entry = block(id);
+    if (predicate(id))
+      return true;
+    if (entry.depth < maximumDepth && entry.firstChild && entry.statesBelow) {
+      id = entry.firstChild;
+      continue;
+    }
+    while (id != root && !block(id).nextSibling)
+      id = block(id).parent;
+    if (id == root)
+      return false;
+    id = block(id).nextSibling;
+  }
+}
+
 std::vector<uint64_t> KvCache::subtree(uint64_t blockId) const {
   std::vector<uint64_t> order;
   std::vector<std::pair<uint64_t, bool>> pending{{blockId, false}};

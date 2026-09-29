@@ -159,6 +159,10 @@ public:
   // resident leaf they are disk-only; below a poisoned block some may be
   // resident.
   [[nodiscard]] std::vector<uint64_t> subtree(uint64_t blockId) const;
+  // Bounded, allocation-free traversal of this prefix and its descendants.
+  [[nodiscard]] bool
+  anyDescendant(uint64_t blockId, uint32_t maximumDepth,
+                const std::function<bool(uint64_t)> &predicate) const;
   // Only a block without children, users or transfer can be removed. The
   // caller handles all state groups attached to it first.
   void erase(uint64_t blockId);

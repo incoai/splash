@@ -128,20 +128,21 @@ bool StateGroupCache::copyToDisk(uint64_t block,
   auto found = entries_.find(block);
   if (found == entries_.end() || found->second.invalid)
     return false;
-  Entry &entry = found->second;
-  if (entry.disk)
+  if (found->second.disk)
     return true;
-  if (!entry.ram || !entry.ram->canOffload())
+  if (!found->second.ram || !found->second.ram->canOffload())
     return false;
   auto transfer = startWrite(
-      [state = entry.ram](std::function<void()> done) {
+      block,
+      [state = found->second.ram](std::function<void()> done) {
         return state->offload(std::move(done));
       },
       completion, makeRoom);
   if (!transfer)
     return false;
-  beginWrite(block, entry, std::move(transfer));
-  reindex(block, entry);
+  auto &target = entry(block);
+  beginWrite(block, target, std::move(transfer));
+  reindex(block, target);
   return true;
 }
 
@@ -279,20 +280,27 @@ StateEviction StateGroupCache::reclaim(uint64_t kvBlock,
   auto found = entries_.find(kvBlock);
   if (found == entries_.end() || found->second.pins || !found->second.ram)
     return {};
-  Entry &entry = found->second;
   // One write at a time.
   const bool writable =
-      offloadEnabled_ && !entry.disk && entry.ram->canOffload();
+      offloadEnabled_ && !found->second.disk && found->second.ram->canOffload();
   if (writable && pending_)
     return {false, 0, true};
   if (writable) {
-    if (auto transfer = startWrite(
-            [state = entry.ram](std::function<void()> done) {
-              return state->offload(std::move(done));
-            },
-            completion, makeRoom))
-      beginWrite(kvBlock, entry, std::move(transfer));
+    auto transfer = startWrite(
+        kvBlock,
+        [state = found->second.ram](std::function<void()> done) {
+          return state->offload(std::move(done));
+        },
+        completion, makeRoom);
+    // Quota eviction can remove the last checkpoint using this window.
+    // The write preparation lease then releases the invalidated source.
+    found = entries_.find(kvBlock);
+    if (found == entries_.end())
+      return {true, 0};
+    if (transfer)
+      beginWrite(kvBlock, found->second, std::move(transfer));
   }
+  Entry &entry = found->second;
   if (!entry.disk)
     return erase(kvBlock, false);
   // A write reads its own copy, so the RAM copy is free at once.
@@ -422,12 +430,13 @@ StateEviction StateGroupCache::erase(uint64_t kvBlock,
   }
   unlink(target);
   entries_.erase(found);
+  const uint64_t dependencies = removed_ ? removed_(kvBlock) : 0;
   kv_.countState(kvBlock, false);
   if (retirement)
     ++checkpointRetirements_;
   else
     ++evictions_;
-  return {true, reclaimed};
+  return {true, reclaimed + dependencies};
 }
 
 StateCacheSnapshot StateGroupCache::snapshot() const noexcept {
@@ -511,14 +520,22 @@ StateGroupCache::Entry &StateGroupCache::publicationEntry(uint64_t kvBlock,
 }
 
 std::unique_ptr<StateOffload>
-StateGroupCache::startWrite(const StateBlockWriter &write,
+StateGroupCache::startWrite(uint64_t kvBlock, const StateBlockWriter &write,
                             const std::function<void()> &completion,
                             const std::function<bool()> &makeRoom) {
   if (pending_)
     return {};
+  auto source = acquireBlock(kvBlock, CacheAccess::Maintenance);
+  if (!source)
+    return {};
   std::unique_ptr<StateOffload> transfer = write(completion);
-  while (!transfer && makeRoom && makeRoom())
+  while (!transfer && contains(kvBlock) && makeRoom && makeRoom()) {
+    if (!contains(kvBlock))
+      return {};
     transfer = write(completion);
+  }
+  if (!contains(kvBlock))
+    return {};
   return transfer;
 }
 

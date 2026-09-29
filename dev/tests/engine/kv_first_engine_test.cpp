@@ -230,6 +230,9 @@ public:
     return stepAdmission ? stepAdmission(id, begin, end)
                          : metal::AllocationResult{true};
   }
+  std::optional<CacheGroupId> stepAllocationGroup(uint64_t) const override {
+    return stepGroup;
+  }
   void suspend(uint64_t id) override {
     Request &entry = requests.at(id);
     if (!entry.resident)
@@ -403,8 +406,8 @@ public:
     return test::checkpoint(requests.at(id).position,
                             std::make_shared<State>(snapshotBytes));
   }
-  uint64_t snapshotAllocationBytes(uint64_t) const override {
-    return snapshotBytes;
+  model::CacheAllocation snapshotAllocation(uint64_t) const override {
+    return {snapshotBytes, snapshotGroup};
   }
   // Without a cache slot the production model writes the lane's state to
   // the disk tier; the fake has one when `stateTier` is set, with quota for
@@ -460,6 +463,8 @@ public:
   uint32_t restored = 0;
   uint32_t snapshots = 0;
   uint64_t snapshotBytes = 64;
+  std::optional<CacheGroupId> snapshotGroup{};
+  std::optional<CacheGroupId> stepGroup{};
   uint32_t snapshotAttempts = 0;
   uint32_t diskSnapshots = 0;
   std::shared_ptr<OffloadControl> stateTier;
@@ -1262,7 +1267,8 @@ void testRestoreAllocationPressure() {
     runUntilIdle(engine);
     executor.deniedRestores = permanent ? 1000 : 1;
     engine.submit(request(3, std::vector<uint32_t>(97, 8)));
-    runUntilIdle(engine);
+    for (uint32_t step = 1; step <= 32 && !engine.idle(); ++step)
+      static_cast<void>(engine.tick(100 * step));
     require(events.failedCount == 0 && events.outputs.contains(3) && engine.idle(),
             "restore allocation refusal failed the request");
     require(permanent ? executor.restored == 0 : executor.restored == 96,
@@ -1759,6 +1765,58 @@ void testDraftHostPressurePreservesTargetCache() {
   runUntilIdle(engine);
   require(executor.requests.empty() && !resources.snapshot().activeRequests,
           "paused COW cancellation leaked ownership");
+}
+
+void testModelGrowthReleasesPhysicalBacking() {
+  Backing backing(32);
+  KvPool pool(backing);
+  Cache cache(pool, {});
+  Executor executor(1);
+  Events events;
+  Engine engine({}, cache, executor, events);
+  engine.submit(request(1, std::vector<uint32_t>(257, 7)));
+  runUntilIdle(engine);
+  const auto resident = cache.snapshot().pool.pagesResident;
+  require(resident >= 8, "physical growth fixture lacks reclaimable backing");
+  executor.stepAdmission = [&](uint64_t, uint64_t, uint64_t) {
+    return cache.snapshot().pool.pagesResident >= resident
+               ? metal::AllocationResult{metal::AllocationFailure::EngineBudget}
+               : metal::AllocationResult{true};
+  };
+  engine.submit(request(2, {8}));
+  runUntilIdle(engine);
+  require(
+      events.completedCount == 2 && !events.failedCount &&
+          !executor.suspensions &&
+          cache.snapshot().pool.pagesResident < resident,
+      "model allocation recycled page IDs without releasing physical backing");
+}
+
+void testModelGrowthReusesItsGroupUnderHostPressure() {
+  Backing backing(32);
+  KvPool pool(backing);
+  Cache cache(pool, {});
+  Executor executor(1);
+  Events events;
+  Engine engine({}, cache, executor, events);
+  engine.submit(request(1, std::vector<uint32_t>(257, 7)));
+  runUntilIdle(engine);
+  const auto before = cache.snapshot();
+  executor.stepGroup = 0;
+  executor.stepAdmission = [&](uint64_t, uint64_t, uint64_t) {
+    return cache.snapshot().stateCache.entries
+               ? metal::AllocationResult{metal::AllocationFailure::HostPressure}
+               : metal::AllocationResult{true};
+  };
+  engine.submit(request(2, {8}));
+  runUntilIdle(engine);
+  require(events.completedCount == 2 && !events.failedCount &&
+              !executor.suspensions &&
+              cache.snapshot().pool.pagesResident ==
+                  before.pool.pagesResident &&
+              cache.snapshot().pool.pagesPrefix == before.pool.pagesPrefix,
+          "host pressure failed to reuse the model group without draining "
+          "target KV");
 }
 
 void testKvGrowthReclaimsIdleStateBeforeCache() {
@@ -5551,6 +5609,8 @@ int main() {
     testActiveCellGrowthReclaimsCachedStateAndRetries();
     testDraftWriteGrowthReclaimsCachedState();
     testDraftHostPressurePreservesTargetCache();
+    testModelGrowthReleasesPhysicalBacking();
+    testModelGrowthReusesItsGroupUnderHostPressure();
     testKvGrowthReclaimsIdleStateBeforeCache();
     testKvGrowthDenialKeepsEveryLaneReplayState();
     testPressureReclaimRespectsStateLifetimes();

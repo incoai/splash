@@ -517,7 +517,7 @@ bool Engine::admit(Request &active, double now) {
       // A useful restore remains pinned throughout ordinary eviction. If
       // that pin is the last obstacle to admitting even one lane, prefer
       // cold recomputation over waiting forever for our own cache lease.
-      if (!growthPaused() && lookup.state) {
+      if (!growthPaused() && !denial.pending && lookup.state) {
         lookup = {};
         continue;
       }
@@ -603,7 +603,8 @@ bool Engine::admit(Request &active, double now) {
       active.stateCell.reset();
       executorStarted = resourcesStarted = false;
       const Verdict verdict = judge(kv.denial, requestId);
-      const bool restoreCannotFit = restoreCapacityDenied && !kv.denial.pending &&
+      const bool restoreCannotFit =
+          restoreCapacityDenied && !kv.denial.pending && !kv.denial.retryable &&
           !anotherResident(requestId) && !growthPaused() &&
           kv.denial.allocationFailure != metal::AllocationFailure::HostPressure;
       if (lookup.state && (verdict == Verdict::Fail || restoreCannotFit)) {
@@ -985,10 +986,11 @@ void Engine::publishReachedStateBoundaries(Request &active,
         // Recycle at most this snapshot's new backing, in normal LRU order.
         // Blocks can be smaller or shared; count released bytes, not victims.
         // A persistent denial must not drain unrelated cached conversations.
-        uint64_t remaining =
-            state || stored ? 0 : model_.snapshotAllocationBytes(active.request.id);
+        const auto allocation = model_.snapshotAllocation(active.request.id);
+        uint64_t remaining = state || stored ? 0 : allocation.bytes;
         while (!state && remaining) {
-          const auto reclaimed = cache_.reclaimOneState(checkpoint);
+          const auto reclaimed = cache_.reclaimOneState(
+              {.group = allocation.group, .checkpointsOnly = checkpoint});
           if (!reclaimed.madeProgress)
             break;
           remaining -= std::min(remaining, reclaimed.reclaimedBytes);
@@ -1058,8 +1060,10 @@ Engine::Prepared Engine::prepare(BatchPlan &plan,
       const auto allocation =
           model_.prepareStep(active.request.id, position, workEnd);
       return allocation ? TokenAdmission{}
-                        : TokenAdmission{KvPageAcquireFailure::PhysicalCapacity,
-                                         0, 0, allocation.failure};
+                        : TokenAdmission{
+                              KvPageAcquireFailure::PhysicalCapacity, 0, 0,
+                              allocation.failure,
+                              model_.stepAllocationGroup(active.request.id)};
     });
     if (!state.allocation.granted()) {
       denied.push_back(
@@ -1177,9 +1181,19 @@ Engine::admitGrowth(const std::function<TokenAdmission()> &attempt) {
          admission.failure == KvPageAcquireFailure::PhysicalCapacity) {
     const bool paused = growthPaused() ||
         admission.allocationFailure == metal::AllocationFailure::HostPressure;
-    const CacheReclaimResult progress = paused
-        ? reuseIdleBackingWhilePaused(admission)
-        : reclaimForGrowth(CacheReclaimMode::ReuseBacking);
+    CacheReclaimResult progress;
+    if (admission.cacheGroup)
+      progress =
+          cache_.reclaimOneState({.group = admission.cacheGroup,
+                                  .purpose = StateReclaimPurpose::Execution});
+    if (progress.madeProgress)
+      signalResourceProgress();
+    if (!progress.madeProgress && !progress.pending)
+      progress = paused
+                     ? reuseIdleBackingWhilePaused(admission)
+                     : reclaimForGrowth(admission.additionalPages
+                                            ? CacheReclaimMode::ReuseBacking
+                                            : CacheReclaimMode::ReleaseBacking);
     if (!progress.madeProgress) {
       pendingReclaim = progress.pending;
       break;
@@ -1244,8 +1258,8 @@ bool Engine::reclaimIdleState() noexcept {
 CacheReclaimResult Engine::reuseIdleBackingWhilePaused(const TokenAdmission &admission) {
   if (reclaimIdleState())
     return {true, 0};
-  // A model-side allocation (for example draft COW) cannot reuse target
-  // KV backing. Under host pressure, leave its cached prefixes in place.
+  // Model allocations already tried their reusable cache group above.
+  // Target backing is useful only for a target page shortfall.
   if (!admission.additionalPages)
     return {};
   const KvPoolSnapshot pool = cache_.snapshot().pool;

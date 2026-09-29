@@ -82,7 +82,8 @@ public:
   [[nodiscard]] bool
   retireCheckpoint(const StateCheckpoint &checkpoint) noexcept;
   [[nodiscard]] std::optional<CacheEvictionCandidate>
-  evictionCandidate(bool checkpoints = true) const noexcept;
+  evictionCandidate(bool checkpoints = true,
+                    std::optional<CacheGroupId> selected = {}) const noexcept;
   [[nodiscard]] std::optional<CacheEvictionCandidate>
   diskCandidate(bool duplicate) const noexcept;
   [[nodiscard]] StateEviction
@@ -105,6 +106,7 @@ public:
   [[nodiscard]] StateCacheSnapshot snapshot() const noexcept;
 
 private:
+  [[nodiscard]] uint64_t pruneWindowDependencies(uint64_t leaf) noexcept;
   void validate(uint64_t leaf, const RestoreState &state) const;
   [[nodiscard]] StateGroupCache &group(CacheGroupId id);
   [[nodiscard]] const StateGroupCache &group(CacheGroupId id) const;
