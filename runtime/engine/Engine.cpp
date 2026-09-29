@@ -975,10 +975,7 @@ void Engine::publishReachedStateBoundaries(Request &active,
           ++counters_.deduplicatedStatePublications;
         } else if (!state && model_.canSnapshotToDisk() &&
                    cache_.publishStateToDisk(
-                       block,
-                       [&](std::function<void()> completion) {
-                         return model_.snapshotToDisk(active.request.id, std::move(completion));
-                       }, checkpoint)) {
+                       block, model_.prepareSnapshotToDisk(active.request.id), checkpoint)) {
           stored = true;
           ++counters_.diskStatePublications;
           ++publications;

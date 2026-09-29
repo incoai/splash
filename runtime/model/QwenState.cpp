@@ -497,32 +497,33 @@ QwenStateStorage::snapshot(uint32_t index, QwenLogicalLengths lengths,
   return result;
 }
 
-std::unique_ptr<SnapshotOffload>
-QwenStateStorage::snapshotToDisk(uint32_t index,
-                                 std::function<void()> completion) {
+SnapshotWritePlan QwenStateStorage::prepareSnapshotToDisk(uint32_t index) {
   if (!canSnapshotToDisk())
     return {};
   auto source = snapshot(index, slot(index).metadata.lengths, false);
-  std::vector<const QwenStatePayload *> unique;
-  std::vector<size_t> indices;
-  unique.reserve(source->blocks.size());
-  indices.reserve(source->blocks.size());
-  for (const auto &block : source->blocks) {
-    const auto *payload =
-        static_cast<const QwenStatePayload *>(block.payload.get());
-    const auto found = std::find(unique.begin(), unique.end(), payload);
-    indices.push_back(found - unique.begin());
-    if (found == unique.end())
-      unique.push_back(payload);
-  }
-  auto write = writePayloads(unique, staging_, completion);
-  if (!write)
-    return {};
-  auto state = std::make_shared<RestoreState>(*source);
-  for (size_t i = 0; i < state->blocks.size(); ++i)
-    state->blocks[i].payload = write->payloads[indices[i]];
-  return std::make_unique<FileSnapshotOffload>(std::move(write),
-                                               std::move(state));
+  return {source, [source, staging = staging_](std::function<void()> completion)
+                      -> std::unique_ptr<SnapshotOffload> {
+    std::vector<const QwenStatePayload *> unique;
+    std::vector<size_t> indices;
+    unique.reserve(source->blocks.size());
+    indices.reserve(source->blocks.size());
+    for (const auto &block : source->blocks) {
+      const auto *payload =
+          static_cast<const QwenStatePayload *>(block.payload.get());
+      const auto found = std::find(unique.begin(), unique.end(), payload);
+      indices.push_back(found - unique.begin());
+      if (found == unique.end())
+        unique.push_back(payload);
+    }
+    auto write = writePayloads(unique, staging, completion);
+    if (!write)
+      return {};
+    auto state = std::make_shared<RestoreState>(*source);
+    for (size_t i = 0; i < state->blocks.size(); ++i)
+      state->blocks[i].payload = write->payloads[indices[i]];
+    return std::make_unique<FileSnapshotOffload>(std::move(write),
+                                                std::move(state));
+  }};
 }
 
 std::shared_ptr<QwenGdnCell>

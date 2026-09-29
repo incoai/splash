@@ -17,7 +17,7 @@ struct PersistentCacheConfig {
   model::StateStorage *stateStorage = nullptr;
   uint32_t minimumTokens = 512;
   // Payload write pacing; the token bucket permits a bounded initial burst.
-  uint64_t writeBytesPerSecond = (128ULL << 30) / 3600;
+  uint64_t writeBytesPerSecond = (256ULL << 30) / 3600;
   uint64_t writeBurstBytes = 0; // zero selects one full cache capacity
 };
 
@@ -34,8 +34,9 @@ struct PersistentCacheSnapshot {
 };
 
 // Admission/publication only. Matching, RAM residency and restores remain
-// in KvCache/StateCache. One bounded job copies existing immutable snapshots;
-// it never captures new model state or replays a prompt to manufacture one.
+// in KvCache/StateCache. RAM snapshots and synchronous direct-write plans use
+// one admission policy and one bounded publication job. The model owns capture;
+// the publisher never replays a prompt to manufacture cache state.
 class PersistentCache final {
 public:
   PersistentCache(PersistentCacheConfig config, KvCache &kv, StateCache &states,
@@ -44,6 +45,9 @@ public:
                   const std::function<void()> &completion);
   ~PersistentCache();
   void publish(uint64_t block, bool reused = false);
+  // Admit before the plan can allocate or evict; an accepted capture starts
+  // the same publication job as a RAM snapshot, without a second admission.
+  bool capture(uint64_t block, const SnapshotWritePlan &plan);
   void touch(uint64_t block);
   void invalidate(uint64_t block);
   bool poll();
@@ -75,6 +79,9 @@ private:
   void load();
   bool flushTouches();
   void start(uint64_t block, bool reused);
+  std::optional<uint64_t> admit(uint64_t block, const RestoreState &state,
+                                bool reused);
+  void begin(RestoreLease state);
   void finish();
   void remember(Entry entry);
   void forget(std::map<uint64_t, Entry>::iterator entry);

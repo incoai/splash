@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <memory>
 
 namespace splash {
@@ -43,6 +44,18 @@ public:
   [[nodiscard]] virtual bool finish() = 0;
   [[nodiscard]] virtual const std::shared_ptr<const RestoreState> &
   state() const noexcept = 0;
+};
+
+// Preparing a direct snapshot neither allocates disk records nor starts IO.
+// The source describes its exact backing for admission; it may borrow the
+// lane's committed buffers and must not outlive the next model execution.
+// write() stages all borrowed data before returning a ticket and may be
+// retried synchronously after freeing quota. Never queue the plan itself.
+struct SnapshotWritePlan final {
+  using Writer =
+      std::function<std::unique_ptr<SnapshotOffload>(std::function<void()>)>;
+  std::shared_ptr<const RestoreState> source;
+  Writer write;
 };
 
 } // namespace splash

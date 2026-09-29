@@ -211,7 +211,7 @@ void testPages(metal::MetalBackend &backend) {
           "snapshot copied draft pages instead of sharing them");
   require(first->blocks.front().payload->reclaimableBytes() == layout.target.cellBytes(),
           "active draft pages counted as reclaimable");
-  auto write = storage.snapshotToDisk(0, {});
+  auto write = storage.prepareSnapshotToDisk(0).write({});
   require(write && finishWhenReady(*write), "initial offload failed");
   auto disk = write->state();
   write.reset();
@@ -249,7 +249,7 @@ void testPages(metal::MetalBackend &backend) {
               storage.buffers(0).draft[0].keyPages[1]),
           "restoring a branch copied an unchanged page");
   const uint64_t written = file->writtenBytes();
-  write = storage.snapshotToDisk(0, {});
+  write = storage.prepareSnapshotToDisk(0).write({});
   require(write && finishWhenReady(*write), "overlap offload failed");
   auto nextDisk = write->state();
   write.reset();
@@ -369,17 +369,25 @@ void testDirectDiskAndCancellation(metal::MetalBackend &backend) {
   storage.updateLengths(0, {4096, 2048, 2048, 0});
   const auto original = stateImage(storage.buffers(0));
   const auto allocated = storage.actualAllocatedBytes();
-  auto write = storage.snapshotToDisk(0, {});
+  const auto used = file->usedBytes();
+  auto plan = storage.prepareSnapshotToDisk(0);
+  require(plan.source && plan.source->boundary == 4096 &&
+              plan.source->bytes() == layout.cachedBytes() &&
+              file->usedBytes() == used &&
+              storage.actualAllocatedBytes() == allocated,
+          "preparing direct snapshot allocated payload or misreported its cost");
+  auto write = plan.write({});
+  plan = {};
   require(write && storage.actualAllocatedBytes() == allocated,
           "direct write allocated GPU pages");
   auto disk = write->state();
   fill(storage, 0, 22);
   requireThrows<std::logic_error>(
-      [&] { static_cast<void>(storage.snapshotToDisk(0, {})); },
+      [&] { static_cast<void>(storage.prepareSnapshotToDisk(0).write({})); },
       "concurrent staging write admitted");
   require(finishWhenReady(*write), "direct write failed");
   write.reset();
-  require(!storage.snapshotToDisk(0, {}),
+  require(!storage.prepareSnapshotToDisk(0).write({}),
           "full quota admitted another checkpoint");
   bool committed = false;
   auto read =
@@ -514,7 +522,7 @@ void testOffloadAllocationFailure(metal::MetalBackend &backend) {
     auto attempt = std::async(std::launch::async, [&] {
       allocationFailureAfter = failure;
       try {
-        auto transfer = storage.snapshotToDisk(0, {});
+        auto transfer = storage.prepareSnapshotToDisk(0).write({});
         allocationFailureAfter = -1;
         return Result{false, std::move(transfer)};
       } catch (const std::bad_alloc &) {

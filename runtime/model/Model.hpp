@@ -565,12 +565,11 @@ public:
   // Whether the disk tier takes a state written from a lane: a tier exists
   // and its state file accepts writes. The quota is the write's own concern.
   [[nodiscard]] virtual bool canSnapshotToDisk() const noexcept { return false; }
-  // Writes the request's committed state at its current page-aligned
-  // boundary to the disk tier from the lane's own buffers, for a state no
-  // cache slot can hold; the ticket carries its disk copy. Null when the
-  // quota cannot admit another state: the caller may free quota and retry.
-  [[nodiscard]] virtual std::unique_ptr<SnapshotOffload>
-  snapshotToDisk(uint64_t, std::function<void()>) { return {}; }
+  // Describe a direct snapshot before admission can displace cached data.
+  // An empty plan means no writable tier; consume the plan synchronously
+  // before executing the lane again. No cache-sized RAM copy is required.
+  [[nodiscard]] virtual SnapshotWritePlan
+  prepareSnapshotToDisk(uint64_t) { return {}; }
   // Releases one unit of idle model state (an unused buffer, then caches
   // that can be rebuilt) and returns its bytes; zero when nothing is idle.
   // A denied allocation retries between calls, so it frees only what it

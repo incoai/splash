@@ -50,8 +50,8 @@ public:
   [[nodiscard]] uint64_t
   snapshotAllocationBytes(uint64_t requestId) const override;
   [[nodiscard]] bool canSnapshotToDisk() const noexcept override;
-  [[nodiscard]] std::unique_ptr<SnapshotOffload>
-  snapshotToDisk(uint64_t requestId, std::function<void()> completion) override;
+  [[nodiscard]] SnapshotWritePlan
+  prepareSnapshotToDisk(uint64_t requestId) override;
   [[nodiscard]] uint64_t reclaimIdleState() noexcept override;
   void provideMask(uint64_t requestId,
                    std::span<const uint32_t> words) override;

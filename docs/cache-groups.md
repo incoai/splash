@@ -31,22 +31,24 @@ checkpoint groups: its window blocks may still serve newer boundaries. Those
 blocks remain independently evictable. Logical removal of target KV removes
 every state dependent on it.
 
-Request completion refreshes complete restore points and every window fragment
-they need. Shared fragments inherit the access of all dependent points, rather
-than becoming artificially older because they occur earlier in the token chain.
-Incomplete points do not refresh their remaining payloads. This applies with
-offloading disabled as well as with either disk tier enabled. No model IDs or
-payload-size thresholds participate in this policy. Snapshot admission retains
-global LRU across groups and bounds live-cache displacement by model-reported
-new allocation bytes, excluding shared pages
-(rounded to the last victim). An occupied staging buffer leaves an uncopied old
-state in RAM instead of discarding it to attempt a new snapshot. When a
-new resident snapshot cannot fit, an existing disk copy is reused or the current
-boundary is captured directly to disk before recycling live cached states.
-This keeps the old restore points and avoids occupying staging just to free RAM
-for a second copy. If the disk path is unavailable, bounded RAM recycling remains
-the fallback.
-Opportunistic hints still cannot displace cached work, and disposable checkpoints
+A real restore refreshes the selected checkpoint and its window dependencies.
+Request completion also refreshes complete restore points along that request's
+path. This deliberately retains historical recovery points for prefix branching
+and revisits; it is not a claim that every checkpoint was read during execution.
+Shared fragments inherit the access of complete dependent points; incomplete
+points do not refresh orphaned payloads. This applies with offloading disabled as
+well as with either disk tier enabled. No model IDs or payload-size thresholds
+participate in this policy. The shared recency clock operates with these retention
+and reclaim priorities, not as an unconditional ordering of all allocations.
+
+Snapshot admission bounds live-cache displacement by model-reported new
+allocation bytes, excluding shared pages (rounded to the last victim). An
+occupied staging buffer leaves an uncopied old state in RAM instead of discarding
+it to attempt a new snapshot. When a new resident snapshot cannot fit, an
+existing disk copy is reused or the current boundary is considered for direct
+disk capture before recycling live cached states. If the disk path is unavailable
+or declines the candidate, bounded RAM recycling remains the fallback.
+Opportunistic hints cannot displace cached work, and disposable checkpoints
 only reclaim disposable entries.
 
 Group stores expose exact block acquisition and own residency, transfers and
@@ -82,6 +84,25 @@ next eviction. A narrower resident publication preserves an existing wider disk
 range, so older restore points and pinned manifests retain complete coverage.
 Model staging is bounded across groups.
 
+Direct capture has two synchronous phases. The model prepares a
+`SnapshotWritePlan` describing the source backing and a writer; preparation
+allocates no payload records and starts no IO. The source may borrow committed
+lane buffers, so the plan must be consumed before the lane executes again and
+must never enter a background queue. The writer stages borrowed bytes before
+returning a transfer ticket.
+
+`PersistentCache` applies the same size, reuse and write-credit admission to a
+RAM snapshot or a direct-write plan, before either path may evict durable data.
+An accepted direct capture enters the same bounded publication job and is not
+admitted or charged a second time. A rejected candidate may use temporary space
+when offloading is enabled, but that fallback cannot evict a durable manifest.
+Necessary progress checkpoints and pressure-driven offloads retain their normal
+reclaim semantics. Publisher pacing includes accepted direct capture's source
+writes and missing target pages. The default allowance is 256 GiB/hour with
+an initial burst of one cache capacity; it accommodates bursty agent reuse while
+bounding sustained optional payload writes. It is not a cap on temporary offload
+or all process/SSD writes.
+
 Persistent manifests describe the complete target prefix and each required
 group block: group ID, logical range, model metadata and opaque disk records.
 There is no distinguished mandatory recurrent record. The model reopens its
@@ -101,7 +122,9 @@ options and four supported switch combinations are unchanged.
 windows, branch isolation, independent eviction, complete-window protection and
 randomized boundary search against exhaustive coverage, shared-window checkpoint
 retirement and dependency-aware recency with different group declaration orders. `persistent-cache`
-reopens those model declarations across store lifetimes and checks payload bytes.
+reopens those model declarations across store lifetimes and checks payload bytes,
+as well as rejected direct candidates under reuse, size and write-credit pressure
+with temporary offloading disabled, available and full.
 `qwen-state-storage` checks RAM/disk boundary merges, COW, cancellation and allocation
 failures. Real-model oracle and serving tests cover numerical/output equivalence,
 restart, corruption, quota pressure, concurrent requests and agent traces.

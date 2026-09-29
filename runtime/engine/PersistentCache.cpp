@@ -313,32 +313,29 @@ void PersistentCache::invalidate(uint64_t block) {
   }
 }
 
-void PersistentCache::start(uint64_t block, bool reused) {
-  if (!kv_.contains(block))
-    return;
+std::optional<uint64_t>
+PersistentCache::admit(uint64_t block, const RestoreState &state, bool reused) {
+  if (!kv_.contains(block)) return std::nullopt;
   auto chain = kv_.chain(block);
+  if (state.boundary != chain.blocks.size() * KvCache::pageTokens)
+    throw std::invalid_argument("persistent candidate boundary mismatch");
   // Recurrent/draft snapshots have a large fixed cost even for tiny prompts.
   // Keep short prefixes in the existing RAM/temporary tiers; admitting them
   // here would spend writes and displace expensive, reusable continuations.
   if (chain.blocks.size() * uint64_t{KvCache::pageTokens} <
       config_.minimumTokens)
-    return;
-  auto lease =
-      states_.acquireDeepest(std::span(&block, 1), CacheAccess::Maintenance);
-  if (!lease || lease->kvBlock() != block)
-    return;
-  // Account unique existing components and only the payloads that need IO.
-  const auto &state = lease->state();
-  const uint64_t stateBytes = state->bytes();
+    return std::nullopt;
+  // Account shared records and missing writes identically for RAM and lane sources.
+  const uint64_t stateBytes = state.bytes();
   const uint64_t pageBytes = config_.kvFile->slotBytes();
   if (stateBytes > config_.capacityBytes ||
       chain.blocks.size() > (config_.capacityBytes - stateBytes) / pageBytes)
-    return;
+    return std::nullopt;
   uint64_t extra = stateBytes;
   uint64_t writes = 0;
   std::set<std::vector<const void *>, std::less<>> sources;
   std::set<uint64_t> knownRecords;
-  for (const auto &part : state->blocks) {
+  for (const auto &part : state.blocks) {
     const auto resources = part.payload->resources();
     // A payload's identity is its backing, so two circular boundary slices
     // sharing one page neither charge nor write that page twice.
@@ -371,7 +368,7 @@ void PersistentCache::start(uint64_t block, bool reused) {
   if (!reused && !kv_.stateBelow(block) &&
       extra > config_.capacityBytes - used_) {
     ++admissionSkips_;
-    return;
+    return std::nullopt;
   }
   const auto now = std::chrono::steady_clock::now();
   const double burst = static_cast<double>(config_.writeBurstBytes);
@@ -382,14 +379,43 @@ void PersistentCache::start(uint64_t block, bool reused) {
   writeRefill_ = now;
   if (writeCredit_ < writes) {
     ++writeThrottles_;
-    return;
+    return std::nullopt;
   }
   writeCredit_ -= writes;
+  return writes;
+}
+
+void PersistentCache::begin(RestoreLease state) {
+  auto blocks = kv_.chain(state.kvBlock()).blocks;
   auto job = std::make_unique<Job>(
-      Job{std::move(*lease), std::move(chain.blocks), {}, {}, {}, false});
+      Job{std::move(state), std::move(blocks), {}, {}, {}, false});
   for (uint64_t id : job->blocks)
     kv_.retainActive(id, CacheAccess::Maintenance);
   job_ = std::move(job);
+}
+
+void PersistentCache::start(uint64_t block, bool reused) {
+  if (!kv_.contains(block)) return;
+  auto lease = states_.acquireDeepest(std::span(&block, 1), CacheAccess::Maintenance);
+  if (!lease || lease->kvBlock() != block || !admit(block, *lease->state(), reused))
+    return;
+  begin(std::move(*lease));
+}
+
+bool PersistentCache::capture(uint64_t block, const SnapshotWritePlan &plan) {
+  if (job_ || states_.writing()) return false;
+  const auto credit = admit(block, *plan.source, false);
+  if (!credit) return false;
+  if (!states_.publishToDisk(block, plan.write, completion_, makeRoom_, false)) {
+    writeCredit_ += *credit;
+    return false;
+  }
+  auto lease = states_.acquireDeepest(std::span(&block, 1), CacheAccess::Maintenance);
+  if (!lease || lease->kvBlock() != block)
+    throw std::logic_error("direct snapshot did not publish a complete restore point");
+  begin(std::move(*lease));
+  std::erase_if(pending_, [block](const auto &candidate) { return candidate.block == block; });
+  return true;
 }
 
 bool PersistentCache::poll() {

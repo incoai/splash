@@ -1162,7 +1162,7 @@ void testRollingCheckpointsUseTheTier() {
   CacheFixture fixture(&tier);
   auto control = std::make_shared<TransferControl>();
   control->ready = true;
-  const StateWriter write = [&](std::function<void()>) { return test::snapshotWrite(64, writeState(control)); };
+  SnapshotWritePlan write{test::checkpoint(64, std::make_shared<TestState>(100)), [&](std::function<void()>) { return test::snapshotWrite(64, writeState(control)); }};
   require(fixture.cache.publishStateToDisk(fixture.blocks[1], write, true) &&
               fixture.cache.pollTransfers(),
           "checkpoint was refused the tier");
@@ -1431,7 +1431,7 @@ void testOrdinaryPublicationUpgradesDiskCheckpoint() {
     CacheFixture fixture;
     auto control = std::make_shared<TransferControl>();
     control->ready = true;
-    const StateWriter write = [&](std::function<void()>) { return test::snapshotWrite(128, writeState(control)); };
+    SnapshotWritePlan write{test::checkpoint(128, std::make_shared<TestState>(100)), [&](std::function<void()>) { return test::snapshotWrite(128, writeState(control)); }};
     require(fixture.cache.publishStateToDisk(fixture.blocks[3], write, true) &&
                 fixture.cache.pollTransfers(), "disk checkpoint publication failed");
     const auto point = fixture.cache.checkpointState(fixture.blocks[3]);
@@ -1463,7 +1463,7 @@ void testDiskPublicationLifecycle() {
   CacheFixture fixture(&tier);
   auto control = std::make_shared<TransferControl>();
   uint32_t writeBoundary = 128;
-  const StateWriter write = [&](std::function<void()>) { return test::snapshotWrite(writeBoundary, writeState(control)); };
+  SnapshotWritePlan write{test::checkpoint(writeBoundary, std::make_shared<TestState>(100)), [&](std::function<void()>) { return test::snapshotWrite(writeBoundary, writeState(control)); }};
   require(fixture.cache.publishStateToDisk(fixture.blocks[3], write),
           "disk publication was refused");
   auto stats = fixture.cache.snapshot().stateCache;
@@ -1490,6 +1490,7 @@ void testDiskPublicationLifecycle() {
   require(stats.entries == 1 && stats.diskBytes == 100 && stats.offloadFailures == 0,
           "completion changed tier occupancy");
   writeBoundary = 64;
+  write.source = test::checkpoint(64, std::make_shared<TestState>(100));
   require(fixture.cache.publishStateToDisk(fixture.blocks[1], write) && control->slots == 2,
           "the next publication did not follow the finished write");
   require(fixture.cache.reclaimOne(CacheReclaimMode::ReuseBacking).madeProgress &&
@@ -1504,7 +1505,7 @@ void testDiskPublicationFailure() {
   auto control = std::make_shared<TransferControl>();
   control->ready = true;
   control->success = false;
-  const StateWriter write = [&](std::function<void()>) { return test::snapshotWrite(128, writeState(control)); };
+  SnapshotWritePlan write{test::checkpoint(128, std::make_shared<TestState>(100)), [&](std::function<void()>) { return test::snapshotWrite(128, writeState(control)); }};
   require(fixture.cache.publishStateToDisk(fixture.blocks[3], write) &&
               fixture.cache.pollTransfers(),
           "the failing write did not run");
@@ -1540,7 +1541,7 @@ void testFailedWriteUnderALookup() {
             "a failed write under a lookup left a copy behind");
     if (onDisk) {
       control->success = true;
-      const StateWriter write = [&](std::function<void()>) { return test::snapshotWrite(128, writeState(control)); };
+      SnapshotWritePlan write{test::checkpoint(128, std::make_shared<TestState>(100)), [&](std::function<void()>) { return test::snapshotWrite(128, writeState(control)); }};
       require(fixture.cache.publishStateToDisk(block, write) && fixture.cache.pollTransfers(),
               "the disk publication at the emptied block failed");
     } else {
@@ -1575,7 +1576,7 @@ void testFailedWriteIsCountedAfterItsEntryLeft() {
       }
       test::publishCheckpoint(fixture.cache, block, std::make_shared<TestState>(100));
     } else {
-      const StateWriter write = [&](std::function<void()>) { return test::snapshotWrite(128, writeState(control)); };
+      SnapshotWritePlan write{test::checkpoint(128, std::make_shared<TestState>(100)), [&](std::function<void()>) { return test::snapshotWrite(128, writeState(control)); }};
       require(fixture.cache.publishStateToDisk(block, write, true) &&
                   fixture.cache.retireCheckpointState(fixture.cache.checkpointState(block)),
               "the checkpoint in flight was not retired");
@@ -1601,7 +1602,7 @@ void testDiskPublicationMakesRoom() {
   require(fixture.cache.reclaimOneState().madeProgress &&
               fixture.cache.pollTransfers() && control->slots == 1,
           "the older state did not fill the quota");
-  const StateWriter write = [&](std::function<void()>) { return test::snapshotWrite(128, writeState(control)); };
+  SnapshotWritePlan write{test::checkpoint(128, std::make_shared<TestState>(100)), [&](std::function<void()>) { return test::snapshotWrite(128, writeState(control)); }};
   require(fixture.cache.publishStateToDisk(fixture.blocks[3], write) &&
               fixture.cache.pollTransfers(),
           "the full quota refused the lane's state");

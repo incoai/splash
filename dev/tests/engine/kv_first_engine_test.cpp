@@ -410,9 +410,13 @@ public:
   // the disk tier; the fake has one when `stateTier` is set, with quota for
   // every state.
   bool canSnapshotToDisk() const noexcept override { return stateTier != nullptr; }
-  std::unique_ptr<SnapshotOffload> snapshotToDisk(uint64_t id, std::function<void()>) override {
-    ++diskSnapshots;
-    return std::make_unique<test::SnapshotWrite>(requests.at(id).position, std::make_unique<OffloadTicket>(stateTier));
+  SnapshotWritePlan prepareSnapshotToDisk(uint64_t id) override {
+    const auto boundary = requests.at(id).position;
+    return {test::checkpoint(boundary, std::make_shared<State>(snapshotBytes)),
+            [this, boundary](std::function<void()>) {
+              ++diskSnapshots;
+              return std::make_unique<test::SnapshotWrite>(boundary, std::make_unique<OffloadTicket>(stateTier));
+            }};
   }
   uint64_t reclaimIdleState() noexcept override {
     const uint64_t released = reclaimableIdleStateBytes;
@@ -4731,9 +4735,10 @@ void testGrowthWaitsForTheStateWriteInFlight() {
     cache.beginRequest(999);
     require(cache.ensureTokens(999, 64).granted(), "fixture KV failed");
     const auto held = cache.publishCommittedBlocks(999, std::vector<uint32_t>(64, 12), 64);
-    require(cache.publishStateToDisk(held, [&](std::function<void()>) {
+    require(cache.publishStateToDisk(held, {test::checkpoint(64, std::make_shared<State>(100)),
+            [&](std::function<void()>) {
               return test::snapshotWrite(64, std::make_unique<OffloadTicket>(writing));
-            }),
+            }}),
             "fixture write did not start");
     // A cached state in RAM whose eviction must wait for that write.
     auto cached = std::make_shared<OffloadControl>();

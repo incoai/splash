@@ -190,9 +190,9 @@ public:
                              std::shared_ptr<const RestoreState> state,
                              bool checkpoint = false);
   // Publishes the state of the lane at this block straight to disk, for a
-  // state no cache slot can hold: `write` starts the write from the lane.
+  // state no cache slot can hold. The plan permits admission before IO.
   // False when the tier cannot take the state now; nothing is published then.
-  [[nodiscard]] bool publishStateToDisk(uint64_t kvBlock, const StateWriter &write,
+  [[nodiscard]] bool publishStateToDisk(uint64_t kvBlock, const SnapshotWritePlan &plan,
                                         bool checkpoint = false);
   [[nodiscard]] StateCheckpoint checkpointState(uint64_t kvBlock) const;
   // The state at this block has a RAM copy.
@@ -340,7 +340,7 @@ private:
   // Gives up one disk copy: the oldest redundant one, KV or state, else the
   // oldest that is the only copy, never the KV of a state in RAM. False when
   // the disk holds nothing to give.
-  [[nodiscard]] bool freeDiskSpace();
+  [[nodiscard]] bool freeDiskSpace(bool allowDurable = true);
   void startRestore(uint64_t block);
   [[nodiscard]] uint64_t pendingBytes() const noexcept;
   [[nodiscard]] uint64_t reclaimEmptyExtents();

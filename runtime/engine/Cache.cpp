@@ -254,11 +254,20 @@ void Cache::publishCompositeState(uint64_t kvBlock,
   if (persistent_ && !checkpoint) persistent_->publish(kvBlock);
 }
 
-bool Cache::publishStateToDisk(uint64_t kvBlock, const StateWriter &write, bool checkpoint) {
+bool Cache::publishStateToDisk(uint64_t kvBlock, const SnapshotWritePlan &plan,
+                                bool checkpoint) {
   if (!offloadEnabled_ && checkpoint) return false;
-  const bool published = states_.publishToDisk(kvBlock, write, completionNotifier_, makeRoom_, checkpoint);
-  if (published && persistent_ && !checkpoint) persistent_->publish(kvBlock);
-  return published;
+  if (reuseStoredState(kvBlock, checkpoint)) return true;
+  if (!plan.source || !plan.write || states_.writing()) return false;
+  if (persistent_ && !checkpoint) {
+    if (persistent_->capture(kvBlock, plan)) return true;
+    if (!offloadEnabled_) return false;
+    // A rejected optional durable capture may still use the temporary tier,
+    // but cannot bypass admission by evicting a durable prefix for its slots.
+    return states_.publishToDisk(kvBlock, plan.write, completionNotifier_,
+                                 [this] { return freeDiskSpace(false); }, false);
+  }
+  return states_.publishToDisk(kvBlock, plan.write, completionNotifier_, makeRoom_, checkpoint);
 }
 
 StateCheckpoint Cache::checkpointState(uint64_t kvBlock) const {
@@ -718,7 +727,7 @@ std::shared_ptr<model::KvDiskSlot> Cache::acquireDiskSlot() {
   }
 }
 
-bool Cache::freeDiskSpace() {
+bool Cache::freeDiskSpace(bool allowDurable) {
   const auto older = [](const std::optional<CacheEvictionCandidate> &left,
                         const std::optional<CacheEvictionCandidate> &right) {
     return left && (!right || left->lastUsed < right->lastUsed);
@@ -744,7 +753,7 @@ bool Cache::freeDiskSpace() {
   const auto stateOnly = states_.diskCandidate(false);
   // A durable prefix owns all its slots atomically. Every tier shares this
   // clock, but a live index must never lose an individual constituent page.
-  const auto durable = persistent_ ? persistent_->evictionCandidate() : std::nullopt;
+  const auto durable = allowDurable && persistent_ ? persistent_->evictionCandidate() : std::nullopt;
   if (durable && older(durable, kvLeaf) && older(durable, stateOnly))
     return persistent_->evictOldest();
   if (!kvLeaf && !stateOnly)

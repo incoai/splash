@@ -339,6 +339,84 @@ void pressureAdmission(const std::filesystem::path &path) {
           "pressure admission did not retain the reused working set");
 }
 
+// Both sources obey the same admission before any durable victim is removed.
+// A declined durable capture may still occupy temporary space, but not steal
+// a durable slot to do so. Reopen the file to check retention, not only counters.
+void directAdmission(const std::filesystem::path &directory) {
+  struct Case { const char *name; uint32_t oldTokens, newTokens, minimum;
+                uint64_t capacity, burst; };
+  for (const auto c : {Case{"reuse", 512, 512, 512, 17, 0},
+                       Case{"short", 512, 64, 512, 17, 0},
+                       Case{"size", 64, 96, 0, 3, 0},
+                       Case{"pacing", 64, 64, 0, 6, 3}}) {
+    for (uint64_t temporary : {0U, 1U, 2U}) {
+      // 2 denotes an enabled but externally occupied temporary slot.
+      const bool occupied = temporary == 2;
+      const uint64_t temporaryBytes = temporary ? unit : 0;
+      const auto path = directory / (std::string(c.name) + std::to_string(temporary) + ".sqlite");
+      {
+        Fixture f(path, c.capacity * unit, temporaryBytes, c.minimum, 0, c.burst * unit);
+        f.publish(100, c.oldTokens);
+        f.settle();
+        std::vector<std::shared_ptr<SlotFile::Slot>> held;
+        if (occupied)
+          while (auto slot = f.stateFile->acquire()) held.push_back(std::move(slot));
+        require(!occupied || !held.empty(), "temporary pressure fixture allocation failed");
+        const auto before = f.budget->writtenBytes();
+        std::vector<uint32_t> tokens(c.newTokens);
+        std::iota(tokens.begin(), tokens.end(), 10000);
+        f.cache.beginRequest(10000);
+        require(f.cache.ensureTokens(10000, c.newTokens).granted(), "direct fixture allocation failed");
+        const auto block = f.cache.publishCommittedBlocks(10000, tokens, c.newTokens);
+        auto source = test::checkpoint(c.newTokens, std::make_shared<State>(f.stateFile, c.newTokens));
+        unsigned writes = 0;
+        const SnapshotWritePlan plan{source, [&](std::function<void()> done) {
+          ++writes;
+          return test::snapshotWrite(c.newTokens, source->blocks.front().payload->offload(std::move(done)));
+        }};
+        const bool saved = f.cache.publishStateToDisk(block, plan);
+        require(saved == (temporary != 0 && !occupied), "rejected capture ignored temporary mode");
+        f.cache.endRequest(10000);
+        f.settle();
+        require(f.cache.snapshot().persistent.entries == 1 &&
+                    !f.cache.snapshot().persistent.failures,
+                "rejected direct candidate displaced durable ownership");
+        if (!temporary)
+          require(!writes && f.budget->writtenBytes() == before,
+                  "rejected direct candidate started IO");
+      }
+      Fixture reopened(path, c.capacity * unit, temporaryBytes, c.minimum);
+      require(reopened.lookup(100, c.oldTokens).resumeBoundary() == c.oldTokens &&
+                  !reopened.lookup(10000, c.newTokens).state,
+              "rejected direct candidate changed restart recovery");
+    }
+  }
+  const auto path = directory / "direct-admitted.sqlite";
+  {
+    // Exactly enough credit for two prefixes: the direct path must reserve
+    // its complete cost once, including target pages, without re-admitting.
+    Fixture f(path, 6 * unit, 0, 0, 0, 6 * unit);
+    f.publish(100); f.settle();
+    f.cache.beginRequest(200);
+    require(f.cache.ensureTokens(200, 64).granted(), "direct allocation failed");
+    std::vector<uint32_t> tokens(64); std::iota(tokens.begin(), tokens.end(), 200);
+    const auto block = f.cache.publishCommittedBlocks(200, tokens, 64);
+    auto source = test::checkpoint(64, std::make_shared<State>(f.stateFile, 64));
+    const SnapshotWritePlan plan{source, [&](std::function<void()> done) {
+      return test::snapshotWrite(64, source->blocks.front().payload->offload(std::move(done)));
+    }};
+    require(f.cache.publishStateToDisk(block, plan), "eligible direct capture rejected");
+    f.cache.endRequest(200); f.settle();
+    require(f.cache.snapshot().persistent.entries == 2 &&
+                !f.cache.snapshot().persistent.writeThrottles &&
+                f.budget->writtenBytes() == 6 * unit,
+            "direct publication was charged twice or lost after admission");
+  }
+  Fixture reopened(path, 6 * unit);
+  require(reopened.lookup(100).state && reopened.lookup(200).state,
+          "admitted direct prefix did not survive restart");
+}
+
 void writePacing(const std::filesystem::path &path) {
   {
     Fixture f(path, 9 * unit, 0, 0, 0, 3 * unit);
@@ -970,6 +1048,7 @@ int main(int argc, char **argv) {
     sharedComponents(directory.path / "components.sqlite");
     pressureAdmission(directory.path / "pressure.sqlite");
     writePacing(directory.path / "pacing.sqlite");
+    directAdmission(directory.path);
     runtimeAndRestart(directory.path / "runtime.sqlite");
     lruAndQuotas(directory.path / "lru.sqlite");
     sharedPrefixes(directory.path / "shared.sqlite");

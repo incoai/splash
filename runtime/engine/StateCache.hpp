@@ -7,8 +7,7 @@
 
 namespace splash::engine {
 
-using StateWriter =
-    std::function<std::unique_ptr<SnapshotOffload>(std::function<void()>)>;
+using StateWriter = SnapshotWritePlan::Writer;
 
 struct StateCheckpoint final {
   uint64_t kvBlock = 0;

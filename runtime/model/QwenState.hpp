@@ -166,11 +166,9 @@ public:
   [[nodiscard]] bool canSnapshotToDisk() const noexcept {
     return file_ && file_->writable() && draftFile_->writable();
   }
-  // Writes the lane's committed state to the disk tier from its own cells,
-  // taking no cache slot; the ticket carries the disk copy. Null without a
-  // tier that accepts writes, or when the quota cannot admit another state.
-  [[nodiscard]] std::unique_ptr<SnapshotOffload>
-  snapshotToDisk(uint32_t slot, std::function<void()> completion);
+  // Borrows committed backing for synchronous admission and disk capture.
+  // Preparing the plan takes no cache slot and performs no IO.
+  [[nodiscard]] SnapshotWritePlan prepareSnapshotToDisk(uint32_t slot);
   void restore(uint32_t slot, const RestoreState &state,
                bool restoreDraftState);
 

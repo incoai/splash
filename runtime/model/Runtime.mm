@@ -2421,9 +2421,8 @@ bool Runtime::canSnapshotToDisk() const noexcept {
   return impl_->states.canSnapshotToDisk();
 }
 
-std::unique_ptr<SnapshotOffload>
-Runtime::snapshotToDisk(uint64_t requestId, std::function<void()> completion) {
-  return impl_->states.snapshotToDisk(committedStateSlot(requestId), std::move(completion));
+SnapshotWritePlan Runtime::prepareSnapshotToDisk(uint64_t requestId) {
+  return impl_->states.prepareSnapshotToDisk(committedStateSlot(requestId));
 }
 
 uint64_t Runtime::reclaimIdleState() noexcept {
