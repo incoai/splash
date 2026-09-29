@@ -182,6 +182,43 @@ void testSlotLifecycle(metal::MetalBackend &backend) {
   require(!storage.actualAllocatedBytes(), "lifecycle leaked backing");
 }
 
+void testCowCanDropOnlyTheSharedPage(metal::MetalBackend &backend) {
+  MemoryGovernor governor(
+      backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
+  bool paused = false;
+  auto admission = [&](uint64_t bytes, const std::function<void()> &allocate) {
+    return paused
+               ? metal::AllocationResult{metal::AllocationFailure::HostPressure}
+               : governor.allocationAdmission()(bytes, allocate);
+  };
+  model::QwenStateStorage storage(backend, admission, layout);
+  require(static_cast<bool>(storage.tryActivateSlot(0, 1)),
+          "COW fixture activation failed");
+  fill(storage, 0, 1);
+  storage.updateLengths(0, {2048, 0, 2048, 0});
+  auto snapshot = storage.snapshot(0);
+  auto retained = std::make_shared<RestoreState>(*snapshot);
+  snapshot.reset();
+  const auto before = storage.actualAllocatedBytes();
+  paused = true;
+  require(!storage.prepareDraftWrite(0, 2048, 2080),
+          "shared page ignored pressure");
+  const auto page = std::find_if(
+      retained->blocks.begin(), retained->blocks.end(), [](const auto &part) {
+        return part.group == model::kDraftWindowGroup &&
+               part.end == model::DraftStateLayout::blockTokens;
+      });
+  require(page != retained->blocks.end(),
+          "COW fixture has no first draft page");
+  retained->blocks.erase(page);
+  require(storage.prepareDraftWrite(0, 2048, 2080) &&
+              storage.actualAllocatedBytes() == before &&
+              retained->blocks.front().group == model::kQwenRecurrentGroup,
+          "dropping a shared draft page did not permit an in-place write");
+  retained.reset();
+  storage.releaseSlot(0, 1);
+}
+
 void testPages(metal::MetalBackend &backend) {
   MemoryGovernor governor(
       backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
@@ -233,7 +270,7 @@ void testPages(metal::MetalBackend &backend) {
                 32 * layout.draft.headDimension * 2);
     for (uint32_t channel = 0; channel < layout.draft.headDimension; ++channel)
       std::memset(static_cast<std::byte *>(layer.valuePages[0].contents()) +
-                      channel * 128 * 2,
+                      channel * model::DraftStateLayout::blockTokens * 2,
                   99, 32 * 2);
   }
   storage.updateLengths(0, {2080, 32, 2048, 32});
@@ -257,16 +294,18 @@ void testPages(metal::MetalBackend &backend) {
               layout.target.cellBytes() + layout.draft.blockBytes(),
           "overlap offload rewrote unchanged pages");
   const auto diskPages = [](const RestoreState &state) {
-    std::array<std::shared_ptr<model::SlotFile::Slot>, 16> pages;
+    std::array<std::shared_ptr<model::SlotFile::Slot>, SPLASH_DRAFT_PAGE_COUNT>
+        pages;
     for (const auto &part : state.blocks)
       if (part.group == model::kDraftWindowGroup)
-        pages[(part.begin / 128) % 16] = part.payload->diskRecord().slot;
+        pages[(part.begin / model::DraftStateLayout::blockTokens) %
+              SPLASH_DRAFT_PAGE_COUNT] = part.payload->diskRecord().slot;
     return pages;
   };
   auto a = diskPages(*disk), b = diskPages(*nextDisk);
   require(a[0] != b[0],
           "wrong disk page table");
-  for (size_t i = 1; i < 16; ++i)
+  for (size_t i = 1; i < SPLASH_DRAFT_PAGE_COUNT; ++i)
     require(a[i] == b[i], "disk pages not shared");
 
   // The branch has its own mutable tail; rejected/uncommitted positions are
@@ -292,35 +331,29 @@ void testPages(metal::MetalBackend &backend) {
               }),
           "promotion lost disk references");
   restore.reset();
-  // A window assembled from independent cache entries can use the old
-  // page's suffix and a new page's prefix in the same circular slot.
-  auto fragmented = std::make_shared<RestoreState>(*next);
-  for (auto &part : fragmented->blocks)
-    if (part.group == model::kDraftWindowGroup && part.begin == 32)
-      part.payload = first->blocks[1].payload;
-  storage.restore(1, *fragmented, true);
-  require(stateImage(storage.buffers(1)) == nextImage,
-          "resident boundary fragments were not merged correctly");
-  auto fragmentedDisk = std::make_shared<RestoreState>(*nextDisk);
-  for (auto &part : fragmentedDisk->blocks)
-    if (part.group == model::kDraftWindowGroup && part.begin == 32)
-      part.payload = disk->blocks[1].payload;
+  auto invalid = std::make_shared<RestoreState>(*next);
+  invalid->blocks[1].begin += 1;
+  requireThrows<std::invalid_argument>(
+      [&] { storage.restore(1, *invalid, true); },
+      "partial draft page accepted");
+  invalid.reset();
   const auto beforeDeniedRestore = stateImage(storage.buffers(1));
   const auto beforeDeniedReads = file->readBytes();
   allow = false;
   requireThrows<metal::MetalAllocationError>(
-      [&] { static_cast<void>(storage.beginRestore(1, *fragmentedDisk, true,
-                                                   {}, [] {})); },
-      "fragmented restore bypassed allocation admission");
+      [&] {
+        static_cast<void>(storage.beginRestore(1, *nextDisk, true, {}, [] {}));
+      },
+      "disk restore bypassed allocation admission");
   require(file->readBytes() == beforeDeniedReads &&
               stateImage(storage.buffers(1)) == beforeDeniedRestore &&
               backend.healthy(),
           "denied restore started IO, committed state, or poisoned Metal");
   allow = true;
-  restore = storage.beginRestore(1, *fragmentedDisk, true, {}, [] {});
+  restore = storage.beginRestore(1, *nextDisk, true, {}, [] {});
   require(restore && finishWhenReady(*restore) &&
               stateImage(storage.buffers(1)) == nextImage,
-          "independent disk boundary fragments were not merged correctly");
+          "aligned disk pages did not restore correctly");
   restore.reset();
   // Reuse cannot inherit the previous request's draft bytes or page identity.
   storage.releaseSlot(1, 2);
@@ -346,7 +379,6 @@ void testPages(metal::MetalBackend &backend) {
       "unaligned snapshot accepted");
   storage.releaseSlot(0, 1);
   storage.releaseSlot(1, 3);
-  fragmented.reset();
   first.reset();
   next.reset();
   promoted.reset();
@@ -471,7 +503,8 @@ void testCowAllocationFailure(metal::MetalBackend &backend) {
     // Write only already-prepared pages: another COW call must not accidentally
     // repair a stale table and hide a failed preparation's aliasing bug.
     for (const auto &layer : storage.buffers(1).draft)
-      for (uint32_t page = 0; page < 2; ++page) {
+      for (uint32_t page = 0; page < 256 / model::DraftStateLayout::blockTokens;
+           ++page) {
         std::memset(layer.keyPages[page].contents(), 91,
                     layer.keyPages[page].sizeBytes());
         std::memset(layer.valuePages[page].contents(), 92,
@@ -563,6 +596,7 @@ int main(int argc, const char **argv) {
       testLayoutFormulas();
       testSlotLifecycle(backend);
       testPages(backend);
+      testCowCanDropOnlyTheSharedPage(backend);
       testDirectDiskAndCancellation(backend);
       testActivationRollback(backend);
       testCowAllocationFailure(backend);

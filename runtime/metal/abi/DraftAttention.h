@@ -25,14 +25,14 @@ struct DraftQkvBatchParams {
 static_assert(sizeof(DraftQkvBatchParams) == 8,
               "Draft QKV parameters are 8 bytes on both sides");
 
-// One page matches the attention core's N tile, allowing direct tensor
-// loads with no cross-page gather or change to the reduction order.
-#define SPLASH_DRAFT_PAGE_TOKENS 128
+// Draft and target cache pages share token boundaries. Compute tiles are
+// independent of storage geometry. Each address points to one layer's
+// contiguous K/V pair, with the key tensor followed by the value tensor.
+#define SPLASH_DRAFT_PAGE_TOKENS SPLASH_TARGET_KV_BLOCK_TOKENS
 #define SPLASH_DRAFT_PAGE_COUNT                                                \
   (SPLASH_DRAFT_SLIDING_WINDOW / SPLASH_DRAFT_PAGE_TOKENS)
 struct DraftKvAddresses {
   uint64_t keys[SPLASH_DRAFT_PAGE_COUNT];
-  uint64_t values[SPLASH_DRAFT_PAGE_COUNT];
 };
 
 struct DraftAttentionBatchParams {
@@ -44,8 +44,8 @@ struct DraftAttentionBatchParams {
   DraftKvAddresses pages[SPLASH_MAXIMUM_BATCH_WIDTH];
 };
 
-static_assert(sizeof(DraftAttentionBatchParams) == 1056,
-              "Draft attention parameters are 1056 bytes on both sides");
+static_assert(sizeof(DraftAttentionBatchParams) == 2080,
+              "Draft attention parameters are 2080 bytes on both sides");
 
 struct DraftContextParams {
   uint32_t tokens;
@@ -55,8 +55,8 @@ struct DraftContextParams {
   DraftKvAddresses pages;
 };
 
-static_assert(sizeof(DraftContextParams) == 272,
-              "Draft context prefill parameters are 272 bytes on both sides");
+static_assert(sizeof(DraftContextParams) == 528,
+              "Draft context prefill parameters are 528 bytes on both sides");
 
 struct DraftContextBatchParams {
   uint32_t cache_stride;
@@ -67,8 +67,8 @@ struct DraftContextBatchParams {
   DraftKvAddresses pages[SPLASH_MAXIMUM_BATCH_WIDTH];
 };
 
-static_assert(sizeof(DraftContextBatchParams) == 1056,
-              "Draft context commit parameters are 1056 bytes on both sides");
+static_assert(sizeof(DraftContextBatchParams) == 2080,
+              "Draft context commit parameters are 2080 bytes on both sides");
 
 struct CaptureParams {
   uint32_t rows;

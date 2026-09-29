@@ -71,7 +71,9 @@ void describeContext(const DraftKvBuffers &context, DraftAttentionShape shape,
     requireBuffer(context.valuePages[i],
                   ringBytes(shape) / SPLASH_DRAFT_PAGE_COUNT);
     addresses.keys[i] = context.keyPages[i].gpuAddress();
-    addresses.values[i] = context.valuePages[i].gpuAddress();
+    if (context.valuePages[i].gpuAddress() !=
+        addresses.keys[i] + ringBytes(shape) / SPLASH_DRAFT_PAGE_COUNT)
+      throw std::invalid_argument("draft page K/V views must be adjacent");
   }
 }
 void bindContext(std::vector<metal::MetalBuffer> &bindings,

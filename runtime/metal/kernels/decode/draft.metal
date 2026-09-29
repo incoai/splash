@@ -141,14 +141,13 @@ kernel void draft_context_kv_commit(
                               ? values0
                               : (batch == 1 ? values1
                                             : (batch == 2 ? values2 : values3));
-  DraftContextParams lane_params{Rows, params.cache_stride,
-                                  params.start_position[batch], params.paged, params.pages[batch]};
   threadgroup float reductions[8];
   threadgroup bfloat normalized[128];
   draft_context_kv_phase(
       context_qkv + ulong(batch) * Rows * PackedWidth, k_norm,
       rope_cos + ulong(batch) * RopeLaneStride,
-      rope_sin + ulong(batch) * RopeLaneStride, keys, values, lane_params,
+      rope_sin + ulong(batch) * RopeLaneStride, keys, values,
+      params.cache_stride, params.start_position[batch], params.paged, params.pages[batch],
       min(retained[batch], Rows), task, thread_index, lane, simd_group,
       reductions, normalized);
 }
@@ -170,7 +169,7 @@ inline void draft_attention_split_phase(
     threadgroup float *row_max, threadgroup float *row_sum,
     threadgroup float *previous_scale, uint thread_index, uint lane,
     uint simd_group) {
-  constexpr ushort M = 32, N = 128, D = 128, TileK = 64;
+  constexpr ushort M = 32, N = 32, D = 128, TileK = 32;
   constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS, Window = SPLASH_DRAFT_SLIDING_WINDOW;
   uint common_start =
       cache_length >= Window - 1 ? cache_length - (Window - 1) : 0;
@@ -221,7 +220,7 @@ inline void draft_attention_split_phase(
         ? reinterpret_cast<device bfloat *>(pages.keys[slot / N]) + head * N * D
         : keys + slot * D;
     device bfloat *tile_values = paged
-        ? reinterpret_cast<device bfloat *>(pages.values[slot / N]) + head * N * D
+        ? reinterpret_cast<device bfloat *>(pages.keys[slot / N]) + (8 + head) * N * D
         : values + slot;
     auto kt = tensor(tile_keys, dextents<int, 2>{D, N}, array<int, 2>{1, D});
     auto k0 = kt.slice<TileK, N>(0, 0);
@@ -250,9 +249,9 @@ inline void draft_attention_split_phase(
       uint row_start =
           query_position >= Window - 1 ? query_position - (Window - 1) : 0;
       uint hidden_prefix = row_start - common_start;
-      float local_scores[4];
+      float local_scores[N / 32];
       float tile_max = -INFINITY;
-      for (ushort i = 0; i < 4; ++i) {
+      for (ushort i = 0; i < N / 32; ++i) {
         uint column = lane + i * 32;
         uint key = slot + column;
         uint logical_key = key >= physical_start
@@ -270,7 +269,7 @@ inline void draft_attention_split_phase(
       bool empty = next_max == -INFINITY;
       float scale = empty ? 1.0f : fast::exp(row_max[matrix_row] - next_max);
       float tile_sum = 0.0f;
-      for (ushort i = 0; i < 4; ++i) {
+      for (ushort i = 0; i < N / 32; ++i) {
         local_scores[i] = empty ? 0.0f : fast::exp(local_scores[i] - next_max);
         tile_sum += local_scores[i];
       }
@@ -280,7 +279,7 @@ inline void draft_attention_split_phase(
         row_sum[matrix_row] = row_sum[matrix_row] * scale + tile_sum;
         row_max[matrix_row] = next_max;
       }
-      for (ushort i = 0; i < 4; ++i) {
+      for (ushort i = 0; i < N / 32; ++i) {
         uint column = lane + i * 32;
         score_storage[matrix_row * N + column] = local_scores[i];
       }
@@ -559,10 +558,20 @@ kernel void draft_attention_bf16_split(
     uint thread_index [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  constexpr uint AttentionM = 32, AttentionN = 128, KVHeads = 8;
+  constexpr uint AttentionM = 32, AttentionN = 32, KVHeads = 8;
   constexpr ulong Rows = SPLASH_DRAFT_QUERY_ROWS;
   constexpr ulong Attention = 4096;
   constexpr ulong HeadDim = 128;
+  // The current-row value product pads its eight rows to the MPP minimum
+  // of 16. Scores, probabilities and padded BF16 values share this scratch.
+  constexpr ulong CurrentValueTile = 16;
+  constexpr ulong CurrentScratchFloats =
+      AttentionM * (CurrentValueTile + Rows) +
+      HeadDim * CurrentValueTile * sizeof(bfloat) / sizeof(float);
+  constexpr ulong WindowScratchFloats = AttentionM * AttentionN;
+  constexpr ulong ScoreFloats = WindowScratchFloats > CurrentScratchFloats
+                                    ? WindowScratchFloats
+                                    : CurrentScratchFloats;
   constexpr ulong PartialFloats = AttentionM * HeadDim + 2 * AttentionM;
   uint batch = group.y;
   if (batch >= params.lanes)
@@ -577,7 +586,7 @@ kernel void draft_attention_bf16_split(
       reinterpret_cast<device float *>(queries +
                                        params.lanes * Rows * Attention) +
       ((batch * KVHeads + group.x) * params.splits + group.z) * PartialFloats;
-  threadgroup float workspace[AttentionM * AttentionN + 3 * AttentionM];
+  threadgroup float workspace[ScoreFloats + 3 * AttentionM];
   draft_attention_split_phase(
       queries + batch * Rows * Attention + group.x * AttentionM * HeadDim,
       keys + (params.paged ? 0 : group.x * params.cache_stride * HeadDim),
@@ -586,9 +595,9 @@ kernel void draft_attention_bf16_split(
       query_values + batch * KVHeads * HeadDim * Rows +
           group.x * Rows * HeadDim,
       partials, params.cache_stride, params.cache_length[batch], group.z,
-      params.paged, params.pages[batch], group.x, params.splits, workspace, workspace + AttentionM * AttentionN,
-      workspace + AttentionM * AttentionN + AttentionM,
-      workspace + AttentionM * AttentionN + 2 * AttentionM, thread_index,
+      params.paged, params.pages[batch], group.x, params.splits, workspace,
+      workspace + ScoreFloats, workspace + ScoreFloats + AttentionM,
+      workspace + ScoreFloats + 2 * AttentionM, thread_index,
       lane, simd_group);
 }
 

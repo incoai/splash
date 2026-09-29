@@ -1,5 +1,6 @@
+#include "metal/abi/DraftAttention.h"
 // Draft sliding-window attention against a direct CPU reference. The kernel
-// streams the 2048-slot ring in ring-aligned 128-token tiles over a fixed
+// streams the 2048-slot ring in ring-aligned page tiles over a fixed
 // number of splits and combines their partials in split order; these cases
 // cover an unaligned wrap, a wrap that starts exactly one slot before the ring
 // end, the short prefix before any wrap, aligned wraps, windows that fill
@@ -159,15 +160,15 @@ std::array<splash::ops::DraftKvBuffers, kLanes>
 pagedContext(MetalBackend &backend, std::span<const MetalBuffer> keys,
              std::span<const MetalBuffer> values) {
   std::array<splash::ops::DraftKvBuffers, kLanes> result;
-  constexpr uint32_t pageTokens = 128;
+  constexpr uint32_t pageTokens = SPLASH_DRAFT_PAGE_TOKENS;
   constexpr uint64_t elements = uint64_t{kKvHeads} * pageTokens * kHeadDim;
   for (size_t lane = 0; lane < kLanes; ++lane)
     for (uint32_t page = 0; page < kWindow / pageTokens; ++page) {
-      auto key = backend.allocateBuffer((elements + pageTokens * kHeadDim) * 2,
-                                        BufferStorage::Shared,
-                                        "paged draft oracle keys");
-      auto value = backend.allocateBuffer(
-          key.sizeBytes(), BufferStorage::Shared, "paged draft oracle values");
+      auto allocation =
+          backend.allocateBuffer((2 * elements + pageTokens * kHeadDim) * 2,
+                                 BufferStorage::Shared, "paged draft oracle");
+      auto key = backend.view(allocation, 0, elements * 2);
+      auto value = backend.view(allocation, elements * 2, elements * 2);
       auto *k = static_cast<uint16_t *>(key.contents());
       auto *v = static_cast<uint16_t *>(value.contents());
       for (uint32_t head = 0; head < kKvHeads; ++head)
@@ -180,7 +181,6 @@ pagedContext(MetalBackend &backend, std::span<const MetalBuffer> keys,
                     static_cast<uint16_t *>(values[lane].contents()) +
                         channel * kWindow + page * pageTokens,
                     pageTokens * 2);
-      std::fill_n(k + elements, pageTokens * kHeadDim, uint16_t{0x7fc0});
       std::fill_n(v + elements, pageTokens * kHeadDim, uint16_t{0x7fc0});
       result[lane].keyPages.push_back(backend.view(key, 0, elements * 2));
       result[lane].valuePages.push_back(backend.view(value, 0, elements * 2));
@@ -664,6 +664,13 @@ void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
     return backend.view(buffer, 0, buffer.sizeBytes() - 2);
   };
   CommandGraph invalid;
+  auto separated = pagedPrefill[0];
+  separated.valuePages[0] = separated.valuePages[1];
+  rejects([&] {
+    DraftAttention::addContextPrefill(invalid, qkv, keyNorm, ropeCos, ropeSin,
+                                      separated, kTokens, kWindow, kStart,
+                                      shape);
+  });
   const auto prefillWith = [&](const MetalBuffer &q, const MetalBuffer &sines,
                                const MetalBuffer &k, uint32_t stride) {
     DraftAttention::addContextPrefill(invalid, q, keyNorm, ropeCos, sines,
@@ -708,6 +715,9 @@ int main(int argc, char **argv) {
         surroundingPhases(backend, shape, lanes);
       contextWriters(backend, shape);
       runCase(backend, 1, shape, {0, 0, 0, 0});
+      runCase(backend, 1, shape, {512, 0, 0, 0});
+      runCase(backend, 1, shape, {2048, 0, 0, 0});
+      runCase(backend, 1, shape, {8191, 0, 0, 0});
       runCase(backend, 2, shape, {2048, 2047, 0, 0});
       runCase(backend, 3, shape, {2100, 4094, 6143, 0});
       runCase(backend, 4, shape, {262137, 4094, 500, 6143});

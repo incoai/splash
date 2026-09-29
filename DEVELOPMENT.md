@@ -105,7 +105,7 @@ loopback, so use a listener that includes loopback when launching agents locally
 | `--max-context` | Auto | Context limit, up to `256K`, e.g. `100K`. |
 | `--max-cache-disk` | `0` (off) | SSD offload budget, e.g. `16G`. See [disk cache](#disk-cache). |
 | `--persistent-cache [SIZE]` | `0` (off) | Durable prefix budget; bare flag enables `5G`. Independent of offload. |
-| `--cache-file PATH` | automatic | Persistent SQLite file. Used only with `--persistent-cache`. |
+| `--cache-file PATH` | automatic | Persistent index path; payloads use the adjacent `.data` file. Requires `--persistent-cache`. |
 | `--kv-format` | `int8` | Target KV storage: `int8` or `bf16`. |
 | `--max-image-pixels` | `4194304` | Maximum resized pixels per image. |
 | `--request-timeout` | `1800` | Seconds a request may take from its arrival; a request's own `timeout` can only shorten it. |
@@ -870,9 +870,9 @@ order; RAM and disk replacement retain their existing policies.
 ### Draft KV pages
 
 Draft execution reads a circular page table for its 2048-token sliding window.
-Each BF16 page holds 128 tokens across all draft layers. The page size matches
-one attention tile, preserving the existing tensor loads and reduction order;
-there is no gather into a separate dense ring before attention. Verification
+Each BF16 page holds 32 tokens across all draft layers, matching target KV
+page boundaries. Attention reads the page table directly; its compute tiling
+is independent of the cache page size. Verification
 scratch stays separate, and only accepted context enters the page table.
 
 A cached restore point copies GDN state and retains the draft pages it needs.
@@ -883,9 +883,12 @@ or a refused allocation leaves existing snapshots unchanged. Page references
 and Metal views are replaced together only after preparation succeeds. Failed
 activation/COW batches return the page pool to its previous capacity, so their
 partial allocations cannot create false progress for admission retries. During
-host-pressure pauses, draft growth does not evict target KV for backing it cannot
-reuse. This applies in
-RAM-only, offload-only, persistent-only and combined modes; disabling offload
+host-pressure pauses, draft growth first releases cache references in its own
+group, permitting exclusive writes or reuse of idle draft pages without growing
+memory. It does not evict target KV for backing it cannot reuse. Outside host
+pressure, a model allocation may release physical target backing when its own
+group cannot supply space. This applies in RAM-only, offload-only,
+persistent-only and combined modes; disabling offload
 still disables pressure-driven disk writes.
 
 GDN, target KV and draft KV keep storage appropriate to their geometry while
@@ -893,15 +896,16 @@ sharing the engine memory budget. Draft pages are reference counted and return
 to a reusable pool after their last owner leaves. Pressure reclaims individual
 idle draft pages, including a partial window. State-cache accounting counts
 shared allocations once and excludes active ownership from reclaimable bytes.
-GDN and draft use separate disk records in the same persistent file. Overlapping
+GDN and draft use separate records in the persistent payload file. Overlapping
 snapshots reuse existing draft records; a changed page alone needs a new record.
-A GDN-only restore skips draft IO and is not promoted as a complete RAM snapshot.
 
-Complete restore points remain the cache's state eviction unit. Shared pages
-survive eviction while another snapshot or active request owns them; persistence
-publishes only complete prefixes. This does not make draft and GDN independently
-evictable like separate attention/state groups in vLLM. It avoids introducing
-partially recoverable states into Splash's current prefix lookup contract.
+RAM eviction operates on individual group blocks. Removing a checkpoint also
+removes window pages no remaining complete checkpoint can use, including when a live
+lease defers their release. Shared pages survive while another checkpoint or
+active request needs them. Lookup and durable publication require complete
+coverage across all declared groups; neither treats a partial combination as a
+cache hit. See [cache groups](docs/cache-groups.md) for ownership and extension
+contracts.
 
 ### Disk cache
 
@@ -929,9 +933,11 @@ for the other direction. Copies ride Metal commands, including a copy-only
 command when inference is idle.
 
 A state with no available RAM cache slot can be written directly from its lane.
-Rolling checkpoints replace the least recently used copies like any state, so
-a suspended request keeps its progress when the quota is full; they retire when
-replaced or no longer needed. With the disk tier enabled, a checkpoint less than one full
+Disposable rolling checkpoints reclaim other disposable checkpoints in RAM;
+their optional disk captures use temporary quota without displacing durable
+manifests. Required execution-memory reclaim may evict durable ownership. Old
+checkpoints retire when replaced or no longer needed. With the disk tier enabled,
+a checkpoint less than one full
 prefill chunk (2048 tokens) before the final replay boundary is captured only
 if a RAM slot is available without reclamation. Otherwise its predecessor stays
 usable for cancellation recovery; the final reusable state still uses the disk
@@ -955,7 +961,7 @@ The memory plan sets it aside whenever the flag is set, even if the tier then
 fails to start, so the KV pool and the advertised context shrink by it.
 The state staging buffer, one state (109 MiB for 35B, 187 MiB for 27B), is host
 memory outside `--max-memory`.
-A quota too small for one state leaves the tier disabled.
+A quota too small for a complete restore point cannot preserve that prefix on disk.
 A failed write disables further writes to that file. Failed KV writes retain
 RAM pages; failed state writes invalidate the disk copy. A failed read
 invalidates its cached data, allowing lookup to fall back to the surviving
@@ -981,26 +987,39 @@ restarts. The bare `--persistent-cache` flag also selects 5 GiB; `0` disables
 persistence without opening or deleting an existing cache file. It can be used
 alone, together with `--max-cache-disk`, or with both options disabled.
 
-When enabled, KV and composite states share one SQLite backing file. Temporary
-slots and durable slots use the same payload table, staging, transfer tickets,
-prefix graph and restore path. The default path is
-`~/Library/Caches/Splash/prefix/<model-layout-sha>-<kv-format>.sqlite`;
-`--cache-file` overrides it. SQLite uses an exclusive PERSIST rollback journal with FULL synchronization.
-The journal is limited to 1 MiB after commits; it may grow while a transaction
-is active. Do not copy the main file alone while the server
-is running. Only one server may open a cache file at a time.
+When enabled, target pages and model cache groups share an uncached payload
+file and a small SQLite index. Temporary records stay in memory; only durable
+manifests and their payload extents enter SQLite. Transfers, staging, prefix
+matching and restore use the same representation for both tiers. The default
+index path is `~/Library/Caches/Splash/prefix/<model-layout-sha>-<kv-format>-v2.sqlite`;
+`--cache-file` overrides it. Payloads live at `<index-path>.data`. Both files
+are private to the user (created with mode 0600), paired by a random identity,
+and locked for one server. SQLite's PERSIST rollback journal contains metadata
+only; payloads are synchronized before each durable manifest commits.
 
-The two sizes add to the shared live-slot budget. The persistent size also caps
-the durable subset, counting each shared target or draft KV page once. Offload may use spare space
-in this pool; disabling offload prevents pressure-driven eviction writes, while existing
-durable copies remain available for reclaim and restore. Increasing a quota
-keeps existing entries. Decreasing the durable quota selects the newest complete
-prefixes that fit before loading their metadata. Quotas count payload bytes;
-SQLite metadata, its journal and reusable free pages can make the physical file
-larger. New stores enable incremental vacuum; startup returns unused database
-pages after quota trimming, so a smaller budget also releases the old physical
-high-water allocation. Legacy stores without SQLite's relocation map still
-reuse free pages. Files do not need to have exactly the configured size.
+Opening or loading an unavailable, incompatible, locked or damaged cache logs
+the path and reason, then continues with RAM and the configured temporary
+offload budget. It does not delete or overwrite the rejected cache. A second
+server can therefore serve without persistence while the first owns the file.
+
+The two quotas add to the shared live-payload budget. The persistent quota also
+caps the durable subset, counting shared target and draft pages once. Offload
+may use spare space; disabling it prevents pressure-driven eviction writes,
+while durable copies remain available for restore. Increasing the quota keeps
+existing entries. Decreasing it selects the newest complete prefixes that fit.
+Startup reuses interior holes and truncates the unused payload tail. On APFS,
+hole punching also returns interior free extents to the filesystem without
+moving live payloads. Other filesystems may retain those extents for reuse.
+There is no startup vacuum or payload compaction. Logical file length can exceed
+the quota; quotas count live payloads, not metadata or filesystem allocation.
+
+Caches contain token IDs and model state derived from prompts. They are not an
+encrypted archive. Automatic deletion of other model/version caches is avoided
+because another server may own them. To remove a cache, stop its server and
+remove its index, `.data` companion and any `-journal`, `-wal`, `-shm` companions.
+Do not copy or remove the set while a server is using it. The earlier draft's
+SQLite-blob format is not reopened by v2; an explicitly selected old file is
+left untouched and persistence is disabled with a warning.
 
 Ordinary state publications, reuse and actual cache hits nominate already
 materialized prefix boundaries, including successfully captured predicted
@@ -1025,8 +1044,8 @@ no whole-RAM export. Hardware CRC32C checks payload and metadata for accidental
 corruption; the store identity versions the checksum format. Exact
 tokens, image identity and the model/build/KV-layout namespace still determine
 compatibility. Reusing an explicit file after a model, build or KV-layout change starts a
-fresh cache. Unsupported file formats
-and files already open by another server produce a startup error.
+fresh cache. Unsupported formats and files already open by another server disable
+persistence with a path-specific warning; serving continues.
 
 Durable prefixes and temporary copies use the existing recency clock. Recency
 updates copy no payload and are persisted in access order in one transaction
@@ -1048,12 +1067,13 @@ proven prefixes. A rapidly growing conversation can therefore restore an earlier
 turn rather than its newest unproven tail when the quota is full.
 
 Additional background copies are paced by a token bucket: one cache capacity of
-initial credit and 128 GiB/hour of payload credit thereafter, per process.
+initial credit and 256 GiB/hour of payload credit thereafter, per process.
 Already stored copies and metadata touches consume no payload credit. A skipped
 candidate stays available in RAM and may be reconsidered on reuse; it does not
 queue a timer or stall inference. This is not a cap on all disk I/O: temporary
-offloading, direct low-memory snapshots, metadata/journal writes and startup
-maintenance follow their existing paths. Restart resets the background budget.
+offloading, temporary-only direct snapshots, metadata/journal writes and startup
+maintenance are outside this allowance. Accepted direct durable captures consume
+the same credit as background copies. Restart resets the background budget.
 
 Durable ownership is evicted as a complete prefix; its constituent slots cannot be
 evicted independently. Shared slots remain until their last owner leaves.
@@ -1063,10 +1083,9 @@ request actually restores them. `/status.persistent_cache` reports capacity,
 used payload bytes, entries, saved/restored prefixes, failures, write activity,
 pressure admission skips and background write throttles.
 
-The payload store separates retirement from new allocation so rollback journaling
-does not copy freed large payloads before reusing their pages. Free payload pages
-are reused without zero-filling (`secure_delete=OFF`); eviction is not secure
-erasure. CRC32C and model/layout identity still validate every restored object.
+The payload store reuses freed extents after their last live and durable owners
+leave. SQLite journals metadata only. Reusing or punching an extent is not secure
+erasure; CRC32C and model/layout identity validate every restored object.
 
 Run `make test-persistent-cache` for the CPU crash/restart, quota, integrity and
 sharing tests. The manual model gate exercises all four option combinations,
@@ -1091,7 +1110,12 @@ stored state and KV independently to verify fallback:
   --max-memory 24G --rounds 12 --output build/persistent-cache-stress.json
 ```
 
-Both gates support `--kv-format bf16`; the model gate also accepts `--records
+`dev/tests/persistent_cache_startup.py` additionally opens corrupt, locked and
+mismatched cache pairs, with temporary offloading both disabled and enabled. It
+requires successful serving, a path-specific diagnostic, disabled persistence
+and preservation of the requested temporary quota.
+
+The model and stress gates support `--kv-format bf16`; the model gate also accepts `--records
 2000` for a longer prefix. The stress artifact preserves raw output
 differences: concurrent greedy kernels can differ from serial execution even
 with persistence disabled. For its Python-function fixtures only, the concurrent

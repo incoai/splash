@@ -8,6 +8,7 @@
 #include <utility>
 
 namespace splash::model {
+static_assert(DraftStateLayout::blockTokens == kv::kPageTokens);
 namespace {
 
 using metal::MetalBuffer;
@@ -421,10 +422,10 @@ QwenStateStorage::reopenState(const CachedStateBlock &block,
   const auto group = block.group;
   if (group == kDraftWindowGroup &&
       (block.begin >= block.end ||
-       block.begin / DraftStateLayout::blockTokens !=
-           (block.end - 1) / DraftStateLayout::blockTokens))
+       block.begin % DraftStateLayout::blockTokens ||
+       block.end - block.begin != DraftStateLayout::blockTokens))
     throw std::invalid_argument(
-        "persistent draft fragment crosses a physical page");
+        "persistent draft record is not one aligned page");
   const auto file = group == kQwenRecurrentGroup ? file_
                     : group == kDraftWindowGroup ? draftFile_
                                                  : nullptr;
@@ -476,23 +477,16 @@ QwenStateStorage::snapshot(uint32_t index, QwenLogicalLengths lengths,
                             result->boundary, std::move(recurrent)});
   const uint32_t pageTokens = DraftStateLayout::blockTokens;
   const uint32_t pages = layout_.draft.tokens / pageTokens;
-  std::vector<std::shared_ptr<const StatePayload>> payloads(pages);
-  for (uint32_t begin = lengths.draftBase; begin < result->boundary;) {
-    const uint32_t end = std::min<uint64_t>(
-        result->boundary, (uint64_t{begin} / pageTokens + 1) * pageTokens);
-    const uint32_t physical = (begin / pageTokens) % pages;
-    auto &payload = payloads[physical];
-    if (!payload) {
-      auto draft = std::make_shared<QwenStatePayload>();
-      draft->group = kDraftWindowGroup;
-      draft->size = layout_.draft.blockBytes();
-      draft->file = draftFile_;
-      draft->staging = staging_;
-      draft->page = source.draft->pages[physical];
-      payload = std::move(draft);
-    }
-    result->blocks.push_back({kDraftWindowGroup, begin, end, payload});
-    begin = end;
+  for (uint32_t begin = lengths.draftBase; begin < result->boundary;
+       begin += pageTokens) {
+    auto draft = std::make_shared<QwenStatePayload>();
+    draft->group = kDraftWindowGroup;
+    draft->size = layout_.draft.blockBytes();
+    draft->file = draftFile_;
+    draft->staging = staging_;
+    draft->page = source.draft->pages[(begin / pageTokens) % pages];
+    result->blocks.push_back(
+        {kDraftWindowGroup, begin, begin + pageTokens, std::move(draft)});
   }
   return result;
 }
@@ -501,29 +495,23 @@ SnapshotWritePlan QwenStateStorage::prepareSnapshotToDisk(uint32_t index) {
   if (!canSnapshotToDisk())
     return {};
   auto source = snapshot(index, slot(index).metadata.lengths, false);
-  return {source, [source, staging = staging_](std::function<void()> completion)
-                      -> std::unique_ptr<SnapshotOffload> {
-    std::vector<const QwenStatePayload *> unique;
-    std::vector<size_t> indices;
-    unique.reserve(source->blocks.size());
-    indices.reserve(source->blocks.size());
-    for (const auto &block : source->blocks) {
-      const auto *payload =
-          static_cast<const QwenStatePayload *>(block.payload.get());
-      const auto found = std::find(unique.begin(), unique.end(), payload);
-      indices.push_back(found - unique.begin());
-      if (found == unique.end())
-        unique.push_back(payload);
-    }
-    auto write = writePayloads(unique, staging, completion);
-    if (!write)
-      return {};
-    auto state = std::make_shared<RestoreState>(*source);
-    for (size_t i = 0; i < state->blocks.size(); ++i)
-      state->blocks[i].payload = write->payloads[indices[i]];
-    return std::make_unique<FileSnapshotOffload>(std::move(write),
-                                                std::move(state));
-  }};
+  return {source,
+          [source, staging = staging_](std::function<void()> completion)
+              -> std::unique_ptr<SnapshotOffload> {
+            std::vector<const QwenStatePayload *> payloads;
+            payloads.reserve(source->blocks.size());
+            for (const auto &block : source->blocks)
+              payloads.push_back(
+                  static_cast<const QwenStatePayload *>(block.payload.get()));
+            auto write = writePayloads(payloads, staging, completion);
+            if (!write)
+              return {};
+            auto state = std::make_shared<RestoreState>(*source);
+            for (size_t i = 0; i < state->blocks.size(); ++i)
+              state->blocks[i].payload = write->payloads[i];
+            return std::make_unique<FileSnapshotOffload>(std::move(write),
+                                                         std::move(state));
+          }};
 }
 
 std::shared_ptr<QwenGdnCell>
@@ -534,41 +522,6 @@ QwenStateStorage::acquireCell(std::string_view label) {
   pool_->cells.pop_back();
   return cell;
 }
-
-namespace {
-struct DraftFragment final {
-  uint32_t begin, end;
-  std::shared_ptr<DraftKvCache::Block> page;
-};
-
-void copyDraftSlice(const MetalBuffer &destination, const MetalBuffer &source,
-                    DraftStateLayout layout, uint32_t begin, uint32_t end) {
-  if (destination.contents() == source.contents())
-    return;
-  const uint32_t first = begin % layout.blockTokens;
-  const uint32_t count = end - begin;
-  if (!count || count > layout.blockTokens - first)
-    throw std::logic_error("draft fragment crosses a page");
-  auto *dst = static_cast<std::byte *>(destination.contents());
-  const auto *src = static_cast<const std::byte *>(source.contents());
-  const uint64_t tensor =
-      uint64_t{layout.kvHeads} * layout.blockTokens * layout.headDimension * 2;
-  for (uint32_t layer = 0; layer < layout.layers; ++layer) {
-    for (uint32_t head = 0; head < layout.kvHeads; ++head) {
-      const uint64_t offset =
-          layer * 2 * tensor + (uint64_t{head} * layout.blockTokens + first) *
-                                   layout.headDimension * 2;
-      std::memcpy(dst + offset, src + offset,
-                  uint64_t{count} * layout.headDimension * 2);
-    }
-    for (uint32_t row = 0; row < layout.kvHeads * layout.headDimension; ++row) {
-      const uint64_t offset = (layer * 2 + 1) * tensor +
-                              (uint64_t{row} * layout.blockTokens + first) * 2;
-      std::memcpy(dst + offset, src + offset, uint64_t{count} * 2);
-    }
-  }
-}
-} // namespace
 
 void QwenStateStorage::restore(uint32_t index, const RestoreState &state,
                                bool restoreDraftState) {
@@ -613,11 +566,11 @@ std::unique_ptr<StateRestore> QwenStateStorage::beginRestore(
         throw std::invalid_argument("invalid recurrent checkpoint");
       recurrent = std::move(payload);
     } else if (part.group == kDraftWindowGroup) {
-      if (part.begin >= part.end || part.end > boundary ||
-          part.begin / DraftStateLayout::blockTokens !=
-              (part.end - 1) / DraftStateLayout::blockTokens ||
+      if (part.begin >= part.end ||
+          part.begin % DraftStateLayout::blockTokens || part.end > boundary ||
+          part.end - part.begin != DraftStateLayout::blockTokens ||
           payload->size != layout_.draft.blockBytes())
-        throw std::invalid_argument("invalid draft cache fragment");
+        throw std::invalid_argument("invalid draft cache page");
       draft.push_back(part);
     } else {
       throw std::invalid_argument("unknown model cache group");
@@ -629,47 +582,16 @@ std::unique_ptr<StateRestore> QwenStateStorage::beginRestore(
             [](const auto &a, const auto &b) { return a.begin < b.begin; });
   uint32_t covered = begin;
   for (const auto &part : draft) {
-    if (part.begin > covered || part.end <= covered)
+    if (part.begin != covered)
       throw std::invalid_argument("draft window has a hole or overlap");
     covered = part.end;
   }
   if (covered != boundary)
     throw std::invalid_argument("incomplete draft window");
 
-  const uint32_t pageTokens = DraftStateLayout::blockTokens;
-  const uint32_t pageCount = layout_.draft.tokens / pageTokens;
-  std::vector<std::vector<CachedStateBlock>> slices(pageCount);
-  if (restoreDraftState)
-    for (const auto &part : draft)
-      slices[(part.begin / pageTokens) % pageCount].push_back(part);
-  // Only disk destinations and boundary merges write execution backing. Full
-  // resident pages stay shared without a copy or a fresh allocation.
-  for (uint32_t page = 0; page < pageCount; ++page) {
-    const auto &parts = slices[page];
-    if (parts.empty())
-      continue;
-    const auto &first =
-        static_cast<const QwenStatePayload &>(*parts.front().payload);
-    const bool writes =
-        first.disk ||
-        std::any_of(parts.begin(), parts.end(), [&](const auto &part) {
-          const auto &payload =
-              static_cast<const QwenStatePayload &>(*part.payload);
-          return payload.disk || payload.page != first.page;
-        });
-    if (writes) {
-      const auto admission =
-          prepareDraftWrite(index, page * pageTokens, (page + 1) * pageTokens);
-      if (!admission)
-        throw metal::MetalAllocationError("cannot admit draft restore page",
-                                          admission.failure);
-    }
-  }
   DraftKvCache::AllocationScope allocation(draftCache_);
   auto operations = std::make_shared<FileOperations>();
   operations->items.reserve(1 + draft.size());
-  auto pages = destination.draft->pages;
-  std::vector<DraftFragment> fragments;
   struct Read {
     const QwenStatePayload *payload;
     MetalBuffer buffer;
@@ -680,63 +602,47 @@ std::unique_ptr<StateRestore> QwenStateStorage::beginRestore(
       destination.buffers.gdn[destination.metadata.activeParity].stateBase;
   if (recurrent->disk)
     reads.push_back({recurrent.get(), gdn});
-  for (uint32_t physical = 0; physical < pageCount; ++physical) {
-    std::vector<std::pair<const void *, std::shared_ptr<DraftKvCache::Block>>>
-        sources;
-    for (const auto &part : slices[physical]) {
+  // A disk restore overwrites complete pages. Reuse exclusive destinations;
+  // allocate private pages for shared destinations, without copying old bytes.
+  // Prepare all pages and views before starting IO or replacing the live table.
+  std::array<bool, SPLASH_DRAFT_PAGE_COUNT> exclusive{};
+  for (size_t i = 0; i < destination.draft->pages.size(); ++i)
+    exclusive[i] = destination.draft->pages[i].use_count() == 1;
+  auto pages = destination.draft->pages;
+  if (restoreDraftState)
+    for (const auto &part : draft) {
       const auto &payload =
           static_cast<const QwenStatePayload &>(*part.payload);
-      const void *identity = payload.disk
-                                 ? static_cast<const void *>(payload.disk.get())
-                                 : payload.page.get();
-      const auto found =
-          std::find_if(sources.begin(), sources.end(), [&](const auto &source) {
-            return source.first == identity;
-          });
-      std::shared_ptr<DraftKvCache::Block> page;
-      if (found != sources.end()) {
-        page = found->second;
-      } else if (!payload.disk) {
-        page = payload.page;
-      } else {
-        if (sources.empty())
-          page = destination.draft->pages[physical];
-        else {
-          metal::AllocationFailure failure = metal::AllocationFailure::None;
-          page = draftCache_.acquire(&failure);
-          if (!page)
-            throw metal::MetalAllocationError("cannot admit boundary fragment",
-                                              failure);
-        }
-        reads.push_back({&payload, page->page->buffer});
-        page->disk = payload.disk;
+      const auto physical =
+          (part.begin / DraftStateLayout::blockTokens) % pages.size();
+      if (!payload.disk) {
+        pages[physical] = payload.page;
+        continue;
       }
-      if (found == sources.end())
-        sources.emplace_back(identity, page);
-      fragments.push_back(
-          {std::max(begin, part.begin), part.end, std::move(page)});
+      if (!exclusive[physical]) {
+        metal::AllocationFailure failure = metal::AllocationFailure::None;
+        auto page = draftCache_.acquire(&failure);
+        if (!page)
+          throw metal::MetalAllocationError("cannot admit draft restore page",
+                                            failure);
+        pages[physical] = std::move(page);
+      }
+      reads.push_back({&payload, pages[physical]->page->buffer});
     }
-    if (sources.size() == 1)
-      pages[physical] = sources.front().second;
-    // Different fragments sharing a circular slot merge into its private
-    // execution page, never into an immutable cached source.
-    if (sources.size() > 1)
-      pages[physical]->disk.reset();
-  }
   auto views = draftCache_.views(pages);
   auto commit = [this, index, lengths, restoreDraftState, recurrent, gdn,
                  pages = std::move(pages), views = std::move(views),
-                 fragments = std::move(fragments),
+                 draft = std::move(draft),
                  committed = std::move(committed)]() mutable {
     if (!recurrent->disk)
       copyExact(gdn, recurrent->buffer(), "restored recurrent checkpoint");
     if (restoreDraftState) {
-      for (const auto &fragment : fragments) {
-        const auto physical =
-            (fragment.begin / DraftStateLayout::blockTokens) % pages.size();
-        copyDraftSlice(pages[physical]->page->buffer,
-                       fragment.page->page->buffer, layout_.draft,
-                       fragment.begin, fragment.end);
+      for (const auto &part : draft) {
+        const auto &payload =
+            static_cast<const QwenStatePayload &>(*part.payload);
+        if (payload.disk)
+          pages[(part.begin / DraftStateLayout::blockTokens) % pages.size()]
+              ->disk = payload.disk;
       }
       slot(index).draft->pages = std::move(pages);
       slot(index).buffers.draft = std::move(views);
@@ -852,6 +758,8 @@ QwenStateStorage::allocateDraftRing(std::string_view label,
     auto block = draftCache_.acquire(failure);
     if (!block)
       return {};
+    // Attention loads whole value tiles before masking their probabilities.
+    // Unwritten lanes must be finite: zero probability times NaN is still NaN.
     std::memset(block->page->buffer.contents(), 0, layout_.draft.blockBytes());
     result->pages.push_back(std::move(block));
   }

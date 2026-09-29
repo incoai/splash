@@ -25,17 +25,19 @@ Each `StateGroupCache` controls its own block residency, transfers and eviction
 eligibility. All groups and target KV use the same recency clock. A block is
 eligible for eviction only without active restore pins. Disposable progress
 checkpoints remain lower priority than ordinary cached conversation states.
-Evicting a group block does not evict its sibling group at the same target
-endpoint. Explicit retirement of a rolling checkpoint removes only exact-state
-checkpoint groups: its window blocks may still serve newer boundaries. Those
-blocks remain independently evictable. Logical removal of target KV removes
+Evicting a group block preserves unrelated groups. Removing an exact-state
+checkpoint frees window blocks that no compatible descendant can use with all
+required checkpoint groups present. The prefix tree supplies that liveness
+check; no second ownership index is needed. Window-only models retain their
+independent block lifetime. Shared windows remain independently evictable and are retained across rolling
+checkpoint replacement and branch changes. Logical removal of target KV removes
 every state dependent on it.
 
 A real restore refreshes the selected checkpoint and its window dependencies.
 Request completion also refreshes complete restore points along that request's
 path. This deliberately retains historical recovery points for prefix branching
 and revisits; it is not a claim that every checkpoint was read during execution.
-Shared fragments inherit the access of complete dependent points; incomplete
+Shared blocks inherit the access of complete dependent points; incomplete
 points do not refresh orphaned payloads. This applies with offloading disabled as
 well as with either disk tier enabled. No model IDs or payload-size thresholds
 participate in this policy. The shared recency clock operates with these retention
@@ -51,29 +53,36 @@ or declines the candidate, bounded RAM recycling remains the fallback.
 Opportunistic hints cannot displace cached work, and disposable checkpoints
 only reclaim disposable entries.
 
+The model identifies which group can supply reusable execution backing.
+Required execution first reclaims that group, including under host pressure.
+When an allocation instead needs physical budget, target KV reclaim releases
+backing rather than just returning page IDs to its pool.
+
 Group stores expose exact block acquisition and own residency, transfers and
 recency. They do not search for restore boundaries, publish whole snapshots or
 count request hits; those responsibilities belong to the coordinating cache.
 
 `CacheGroupCoordinator` searches only the matched target ancestry and returns the
-deepest boundary satisfying every declared group. A missing window fragment
+deepest boundary satisfying every declared group. A missing window block
 reduces the candidate boundary; an incomplete combination is never a cache hit.
 `RestoreLease` pins every selected group block and the target endpoint before
-execution-memory admission. Maintenance leases preserve access recency. During
+execution-memory admission. Request leases release checkpoints before window
+dependencies so recency does not depend on container destruction order.
+Maintenance leases preserve recency. During
 speculative memory shrink, the cache protects one complete resident restore
 bundle; demand-driven admission can reclaim it.
 
-DFlash's circular execution table uses BF16 pages. A non-page-aligned window can
-have two logical fragments in the same circular slot. Those fragments may come
-from different snapshots. Qwen shares unchanged resident pages, reads disk pages
-into private destinations, and merges only differing boundary fragments. COW
-protects cached pages from subsequent execution writes. A failed or cancelled
+DFlash's circular execution table uses 32-token BF16 pages, matching target KV
+boundaries. Each cached draft record covers one aligned page. RAM restore shares
+complete pages; disk restore overwrites exclusive destinations or allocates
+private pages for shared destinations. COW protects cached pages from subsequent execution writes. A failed or cancelled
 restore cannot publish a promoted cache copy. Restore scratch allocations use the
-same execution admission path as KV growth: the complete restore remains pinned
+execution admission path: the complete restore remains pinned
 while reclaim retries. Transfers start only after restore allocations succeed.
 If no further reclaim, pending transfer or other resident request can make the
 restore fit, admission retries cold rather than failing the engine or repeatedly
-attempting the same oversized restore. Host pressure and pending IO retain their ordinary wait rules.
+attempting the same oversized restore. Host pressure and pending IO retain
+their ordinary wait rules.
 
 ## Disk storage and persistence
 
@@ -83,6 +92,12 @@ restored resident payload keeps its disk record, avoiding another write on the
 next eviction. A narrower resident publication preserves an existing wider disk
 range, so older restore points and pinned manifests retain complete coverage.
 Model staging is bounded across groups.
+
+Payloads use uncached positional IO. SQLite indexes committed durable extents;
+temporary writes neither journal payloads nor commit per-slot metadata. Payload
+synchronization precedes manifest commit. On restart, the store reconstructs
+free extents, truncates the unused tail and punches free holes on APFS, without
+relocating live payloads.
 
 Direct capture has two synchronous phases. The model prepares a
 `SnapshotWritePlan` describing the source backing and a writer; preparation
@@ -114,12 +129,12 @@ The demand history does not promote payload LRU positions.
 
 An accepted direct capture enters the same bounded publication job and is not
 admitted or charged a second time. A rejected candidate may use temporary space
-when offloading is enabled, but that fallback cannot evict a durable manifest. Ordinary snapshot RAM
-recycling applies the same restriction to any offload it starts, so it cannot
+when offloading is enabled, but that fallback cannot evict a durable manifest.
+Ordinary snapshot RAM recycling applies the same restriction to any offload it starts, so it cannot
 bypass admission indirectly after a declined direct capture.
-Necessary progress checkpoints and pressure-driven offloads retain their normal
-reclaim semantics. Publisher pacing includes accepted direct capture's source
-writes and missing target pages. The default allowance is 256 GiB/hour with
+Optional checkpoints use the same durable-preserving rule. Required execution
+allocations and pressure-driven offloads may reclaim durable quota. Publisher
+pacing includes accepted direct capture's source writes and missing target pages. The default allowance is 256 GiB/hour with
 an initial burst of one cache capacity; it accommodates bursty agent reuse while
 bounding sustained optional payload writes. It is not a cap on temporary offload
 or all process/SSD writes.
@@ -132,20 +147,21 @@ The manifest is committed only after all payloads finish writing. Runtime RAM
 eviction remains per group block; durable quota eviction removes a complete
 manifest, with shared records released at their final owner.
 
-The format namespace is `splash-prefix-cache-v3-groups-crc32c`. Files written with
-the earlier composite manifest are safely reset and warm again; there is no
-in-place conversion of those development cache records. The file path, capacity
-options and four supported switch combinations are unchanged.
+Manifest compatibility uses `splash-prefix-cache-v3-groups-crc32c`; storage v2
+pairs the SQLite index with an uncached `.data` file. The earlier SQLite-blob
+storage is not reopened or converted. Explicit incompatible files are left in
+place and serving falls back to RAM and configured temporary offload. The four
+switch combinations remain independent.
 
 ## Validation
 
 `cache-groups` covers KV-only, window-only and multiple-group models, incomplete
 windows, branch isolation, independent eviction, complete-window protection and
 randomized boundary search against exhaustive coverage, shared-window checkpoint
-retirement and dependency-aware recency with different group declaration orders. `persistent-cache`
-reopens those model declarations across store lifetimes and checks payload bytes,
+retirement, quota callbacks that retire the write source, and dependency-aware
+recency with different group declaration orders. `persistent-cache` reopens those model declarations across store lifetimes and checks payload bytes,
 as well as rejected direct candidates under reuse, size and write-credit pressure
 with temporary offloading disabled, available and full.
-`qwen-state-storage` checks RAM/disk boundary merges, COW, cancellation and allocation
+`qwen-state-storage` checks aligned RAM/disk restoration, COW, cancellation and allocation
 failures. Real-model oracle and serving tests cover numerical/output equivalence,
 restart, corruption, quota pressure, concurrent requests and agent traces.

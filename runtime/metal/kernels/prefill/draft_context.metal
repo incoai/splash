@@ -32,6 +32,7 @@ prefill_draft_context_kv(device const bfloat *context_qkv [[buffer(0)]],
   threadgroup float reductions[8];
   threadgroup bfloat normalized[128];
   draft_context_kv_phase(context_qkv, k_norm, rope_cos, rope_sin, keys, values,
-                         params, params.tokens, task, thread_index, lane,
+                         params.cache_stride, params.start_position, params.paged,
+                         params.pages, params.tokens, task, thread_index, lane,
                          simd_group, reductions, normalized);
 }

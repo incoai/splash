@@ -5,25 +5,26 @@
 inline void draft_context_kv_phase(
     device const bfloat *context_qkv, device const bfloat *k_norm,
     device const float *rope_cos, device const float *rope_sin,
-    device bfloat *keys, device bfloat *values,
-    DraftContextParams params, uint active_tokens, uint task,
-    uint thread_index, uint lane, uint simd_group,
-    threadgroup float *reductions, threadgroup bfloat *normalized) {
+    device bfloat *keys, device bfloat *values, uint cache_stride,
+    uint start_position, bool paged, constant DraftKvAddresses &pages,
+    uint active_tokens, uint task, uint thread_index, uint lane,
+    uint simd_group, threadgroup float *reductions,
+    threadgroup bfloat *normalized) {
   constexpr uint KVHeads = 8, HeadDim = 128, Window = SPLASH_DRAFT_SLIDING_WINDOW;
   constexpr uint QWidth = 4096, KWidth = 1024, PackedWidth = 6144;
   uint row = task / KVHeads;
   if (row >= active_tokens)
     return;
   uint head_index = task % KVHeads;
-  uint position = params.start_position + row;
+  uint position = start_position + row;
   uint slot = position % Window;
   device const bfloat *source =
       context_qkv + ulong(row) * PackedWidth + QWidth + head_index * HeadDim;
-  uint stride = params.cache_stride;
-  if (params.paged) {
+  uint stride = cache_stride;
+  if (paged) {
     uint page = slot / SPLASH_DRAFT_PAGE_TOKENS;
-    keys = reinterpret_cast<device bfloat *>(params.pages.keys[page]);
-    values = reinterpret_cast<device bfloat *>(params.pages.values[page]);
+    keys = reinterpret_cast<device bfloat *>(pages.keys[page]);
+    values = keys + KVHeads * SPLASH_DRAFT_PAGE_TOKENS * HeadDim;
     slot %= SPLASH_DRAFT_PAGE_TOKENS;
     stride = SPLASH_DRAFT_PAGE_TOKENS;
   }
