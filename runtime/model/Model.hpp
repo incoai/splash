@@ -523,6 +523,9 @@ public:
   virtual void restore(uint64_t requestId, uint32_t restoredPrefixLength,
                        std::shared_ptr<const RestoreState> state,
                        bool restoreDraftState) = 0;
+  // Allocation refusal may throw MetalAllocationError before starting IO or
+  // committing restored state. The engine can reclaim and retry with the same
+  // pinned payload, or release the lane and fall back to cold execution.
   [[nodiscard]] virtual std::unique_ptr<StateRestore>
   beginRestore(uint64_t requestId, uint32_t boundary,
                std::shared_ptr<const RestoreState> state, bool restoreDraft,

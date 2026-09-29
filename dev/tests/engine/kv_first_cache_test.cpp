@@ -280,12 +280,22 @@ void testGroupsShareOneOffloadStagingSlot() {
           "first group did not start its offload");
   require(!fixture.cache.reclaimOne().madeProgress && control->slots == 1,
           "background reclaim wrote another group into occupied staging");
-  require(fixture.cache.reclaimOneState().madeProgress && control->slots == 1,
-          "demanded reclaim started a second group's staging write");
+  const auto waiting = fixture.cache.reclaimOneState();
+  require(!waiting.madeProgress && waiting.pending && control->slots == 1 &&
+              fixture.cache.snapshot().stateCache.entries == 2 &&
+              fixture.cache.snapshot().stateCache.bytes == 100,
+          "optional snapshot reclaim discarded an uncopied group while busy");
   control->ready = true;
   require(fixture.cache.pollTransfers() &&
               fixture.cache.snapshot().stateCache.offloads == 1,
           "shared staging transfer did not finish independently");
+  require(fixture.cache.reclaimOneState().madeProgress &&
+              control->slots == 2 && fixture.cache.pollTransfers(),
+          "waiting group did not offload after staging became available");
+  const auto hit = fixture.cache.lookup(fixture.prompt);
+  require(hit.resumeBoundary() == 128 &&
+              fixture.cache.snapshot().stateCache.evictions == 0,
+          "serialized group offloads lost the complete restore point");
 }
 
 void testSharedStateAccounting() {
@@ -1205,12 +1215,14 @@ void testDemotionFreesTheBufferAtOnce() {
   auto snapshot = fixture.cache.snapshot().stateCache;
   require(snapshot.entries == 2 && snapshot.bytes == 100 && snapshot.diskBytes == 100,
           "demotion took a second state or kept the victim's RAM");
-  // One write in flight: a second victim inside the window is dropped.
-  require(fixture.cache.reclaimOneState().madeProgress,
-          "second recycle failed");
+  // Optional publication waits for staging instead of destroying a second
+  // useful state just because the first write has not finished.
+  const auto waiting = fixture.cache.reclaimOneState();
+  require(!waiting.madeProgress && waiting.pending,
+          "optional recycle did not wait for the first write");
   snapshot = fixture.cache.snapshot().stateCache;
-  require(snapshot.entries == 1 && snapshot.bytes == 0 && snapshot.offloads == 1,
-          "second victim was written while a write was in flight");
+  require(snapshot.entries == 2 && snapshot.bytes == 100 && snapshot.offloads == 1,
+          "second victim was lost while a write was in flight");
   control->ready = true;
   require(fixture.cache.pollTransfers() && fixture.lookup(33).resumeBoundary() == 32,
           "cold state was not preserved on disk");

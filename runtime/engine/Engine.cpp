@@ -569,20 +569,50 @@ bool Engine::admit(Request &active, double now) {
           resuming ? active.resumeKvTargetTokens : uint64_t{resumeBoundary} + 1;
       kv = admitGrowth([&] { return cache_.ensureTokens(requestId, workEnd); });
     }
+    DraftContextPlan draft;
+    std::unique_ptr<StateRestore> transfer;
+    bool restoreCapacityDenied = false;
+    if (kv.allocation.granted()) {
+      draft = configureDraftStatePlan(
+          active, resumeBoundary, lookup.junctionBoundary());
+      if (lookup.state) {
+        // Restoring shared window fragments may need private merge backing.
+        // Treat that capacity refusal like any other execution allocation,
+        // retaining the restore lease across reclaim and retry.
+        kv = admitGrowth([&]() -> TokenAdmission {
+          try {
+            transfer = model_.beginRestore(
+                requestId, resumeBoundary, lookup.state->state(),
+                !draft.draftStateRestoreSkipped, completionNotifier_);
+            return {};
+          } catch (const metal::MetalAllocationError &error) {
+            return {KvPageAcquireFailure::PhysicalCapacity, 0, 0,
+                    error.failure()};
+          }
+        });
+        restoreCapacityDenied = !kv.allocation.granted();
+      }
+    }
     if (!kv.allocation.granted()) {
       // The host continuation survives this failed admission. No recurrent
       // state restore or replay has run, and all temporary leases are freed.
+      discardPendingStateBoundaries(active);
       if (resuming) model_.suspend(requestId);
       else model_.end(requestId);
       cache_.endRequest(requestId);
       active.stateCell.reset();
       executorStarted = resourcesStarted = false;
       const Verdict verdict = judge(kv.denial, requestId);
-      if (verdict == Verdict::Fail && restoring) {
+      const bool restoreCannotFit = restoreCapacityDenied && !kv.denial.pending &&
+          !anotherResident(requestId) && !growthPaused() &&
+          kv.denial.allocationFailure != metal::AllocationFailure::HostPressure;
+      if (lookup.state && (verdict == Verdict::Fail || restoreCannotFit)) {
         // Release the prefix pin before retrying without its memory footprint.
         active.skipCache = true;
         scheduler_.waitForResources(requestId);
-        deferResourceRetry(active, now, kv.denial);
+        // This is a different admission attempt, with no restore footprint.
+        // It need not wait for memory that the failed restore could not free.
+        active.resourceWait = {};
         return false;
       }
       if (verdict == Verdict::Fail) {
@@ -594,14 +624,6 @@ bool Engine::admit(Request &active, double now) {
       return false;
     }
     active.resourceWait = {};
-    DraftContextPlan draft = configureDraftStatePlan(
-        active, resumeBoundary, lookup.junctionBoundary());
-    std::unique_ptr<StateRestore> transfer;
-    if (lookup.state) {
-      transfer = model_.beginRestore(requestId, resumeBoundary, lookup.state->state(),
-                                     !draft.draftStateRestoreSkipped,
-                                     completionNotifier_);
-    }
     if (transfer || cache_.kvRestoreStatus(requestId) == KvRestoreStatus::Pending) {
       active.restore.emplace(Request::Restore{
           std::move(lookup), std::move(draft), std::move(transfer)});

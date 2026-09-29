@@ -235,8 +235,9 @@ public:
   [[nodiscard]] CacheReclaimResult reclaimOne(
       CacheReclaimMode mode = CacheReclaimMode::ReleaseBacking,
       bool keepResumePoint = false);
-  // Recycles exactly one unpinned state, preferring checkpoints, for a
-  // required state publication; the disk tier keeps it when it admits it.
+  // Optional snapshot admission recycles one unpinned state in global LRU
+  // order, preferring checkpoints. Busy writes return pending without
+  // discarding an uncopied state.
   [[nodiscard]] CacheReclaimResult
   reclaimOneState(bool checkpointsOnly = false);
   // Empty resident backing exists but the previous release is still in

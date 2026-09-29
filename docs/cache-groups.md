@@ -36,12 +36,13 @@ they need. Shared fragments inherit the access of all dependent points, rather
 than becoming artificially older because they occur earlier in the token chain.
 Incomplete points do not refresh their remaining payloads. This applies with
 offloading disabled as well as with either disk tier enabled. No model IDs or
-payload-size thresholds participate in this policy. Snapshot admission retries
-while normal LRU reclamation makes progress, bounded by the model-reported new
-allocation bytes for that snapshot. Shared pages are excluded. One small group
-block need not free enough memory; a persistent allocation denial cannot drain
-unrelated conversations beyond that byte budget (rounded to the last victim). Opportunistic hints still cannot displace
-cached work, and disposable checkpoints only reclaim disposable entries.
+payload-size thresholds participate in this policy. Snapshot admission retains global LRU across groups and bounds live-cache
+displacement by model-reported new allocation bytes, excluding shared pages
+(rounded to the last victim). An occupied staging buffer leaves an uncopied old
+state in RAM instead of discarding it to attempt a new snapshot.
+Opportunistic hints still cannot displace cached work, and disposable checkpoints
+only reclaim disposable entries.
+
 
 `CacheGroupCoordinator` searches only the matched target ancestry and returns the
 deepest boundary satisfying every declared group. A missing window fragment
@@ -56,7 +57,13 @@ have two logical fragments in the same circular slot. Those fragments may come
 from different snapshots. Qwen shares unchanged resident pages, reads disk pages
 into private destinations, and merges only differing boundary fragments. COW
 protects cached pages from subsequent execution writes. A failed or cancelled
-restore cannot publish a promoted cache copy.
+restore cannot publish a promoted cache copy. Restore scratch allocations use the
+same execution admission path as KV growth: the complete restore remains pinned
+while reclaim retries. Transfers start only after restore allocations succeed.
+If no further reclaim, pending transfer or other resident request can make the
+restore fit, admission
+retries cold rather than failing the engine or repeatedly attempting the same
+oversized restore. Host pressure and pending IO retain their ordinary wait rules.
 
 ## Disk storage and persistence
 

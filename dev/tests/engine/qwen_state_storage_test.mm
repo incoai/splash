@@ -305,6 +305,18 @@ void testPages(metal::MetalBackend &backend) {
   for (auto &part : fragmentedDisk->blocks)
     if (part.group == model::kDraftWindowGroup && part.begin == 32)
       part.payload = disk->blocks[1].payload;
+  const auto beforeDeniedRestore = stateImage(storage.buffers(1));
+  const auto beforeDeniedReads = file->readBytes();
+  allow = false;
+  requireThrows<metal::MetalAllocationError>(
+      [&] { static_cast<void>(storage.beginRestore(1, *fragmentedDisk, true,
+                                                   {}, [] {})); },
+      "fragmented restore bypassed allocation admission");
+  require(file->readBytes() == beforeDeniedReads &&
+              stateImage(storage.buffers(1)) == beforeDeniedRestore &&
+              backend.healthy(),
+          "denied restore started IO, committed state, or poisoned Metal");
+  allow = true;
   restore = storage.beginRestore(1, *fragmentedDisk, true, {}, [] {});
   require(restore && finishWhenReady(*restore) &&
               stateImage(storage.buffers(1)) == nextImage,

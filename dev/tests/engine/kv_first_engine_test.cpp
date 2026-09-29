@@ -278,6 +278,11 @@ public:
   std::unique_ptr<StateRestore> beginRestore(
       uint64_t id, uint32_t length, std::shared_ptr<const RestoreState> state,
       bool restoreDraft, std::function<void()>) override {
+    if (deniedRestores) {
+      --deniedRestores;
+      throw metal::MetalAllocationError("injected restore capacity refusal",
+                                        restoreAllocationFailure);
+    }
     if (state->resident()) {
       restore(id, length, std::move(state), restoreDraft);
       return {};
@@ -455,6 +460,9 @@ public:
   uint32_t diskSnapshots = 0;
   std::shared_ptr<OffloadControl> stateTier;
   uint32_t deniedSnapshots = 0;
+  uint32_t deniedRestores = 0;
+  metal::AllocationFailure restoreAllocationFailure =
+      metal::AllocationFailure::EngineBudget;
   std::optional<uint32_t> denySnapshotAtBoundary;
   uint32_t stepAttempts = 0;
   std::function<metal::AllocationResult(uint64_t, uint64_t, uint64_t)>
@@ -1231,6 +1239,56 @@ void testOneRequestPublishesJunctionAndLatestReplayState() {
               snapshot.replayStatePublications == 2 &&
               snapshot.resources.stateCache.entries == 2,
           "one request did not retain both sparse composite states");
+}
+
+// Restore scratch belongs to execution admission. A temporary shortage retries
+// without dropping the matched prefix; a permanently impossible restore falls
+// back to prefill instead of turning normal capacity pressure into engine death.
+void testRestoreAllocationPressure() {
+  for (const bool permanent : {false, true}) {
+    Backing backing(64);
+    KvPool pool(backing);
+    engine::Cache cache(pool, CacheNamespace{});
+    Executor executor(1);
+    Events events;
+    engine::Engine engine({}, cache, executor, events);
+    engine.submit(request(1, std::vector<uint32_t>(97, 7)));
+    runUntilIdle(engine);
+    engine.submit(request(2, std::vector<uint32_t>(97, 8)));
+    runUntilIdle(engine);
+    executor.deniedRestores = permanent ? 1000 : 1;
+    engine.submit(request(3, std::vector<uint32_t>(97, 8)));
+    runUntilIdle(engine);
+    require(events.failedCount == 0 && events.outputs.contains(3) && engine.idle(),
+            "restore allocation refusal failed the request");
+    require(permanent ? executor.restored == 0 : executor.restored == 96,
+            "restore pressure failed to retry or fall back to cold prefill");
+    executor.deniedRestores = 0;
+    engine.submit(request(4, std::vector<uint32_t>(97, 8)));
+    runUntilIdle(engine);
+    require(events.failedCount == 0 && events.outputs.contains(4),
+            "restore refusal leaked a lane or poisoned subsequent requests");
+  }
+}
+
+void testRestoreWaitsForHostPressure() {
+  Backing backing(64);
+  KvPool pool(backing);
+  engine::Cache cache(pool, CacheNamespace{});
+  Executor executor(1);
+  Events events;
+  engine::Engine engine({}, cache, executor, events);
+  engine.submit(request(1, std::vector<uint32_t>(97, 7)));
+  runUntilIdle(engine);
+  const auto before = cache.snapshot().stateCache.evictions;
+  executor.deniedRestores = 1;
+  executor.restoreAllocationFailure = metal::AllocationFailure::HostPressure;
+  engine.submit(request(2, std::vector<uint32_t>(97, 7)));
+  for (uint32_t step = 1; step <= 32 && !engine.idle(); ++step)
+    static_cast<void>(engine.tick(100 * step));
+  require(engine.idle() && !events.failedCount && executor.restored == 96 &&
+              cache.snapshot().stateCache.evictions == before,
+          "host pressure discarded the pinned prefix instead of waiting");
 }
 
 // A denied snapshot at the latest replay boundary recycles the least recently
@@ -5442,6 +5500,8 @@ int main() {
     testSharedJunctionEndsBeforeTheGenerationPrompt();
     testImageSpansKeyPrefixIdentity();
     testOneRequestPublishesJunctionAndLatestReplayState();
+    testRestoreAllocationPressure();
+    testRestoreWaitsForHostPressure();
     testLatestReplayDenialRecyclesOlderStateNotTheJunction();
     testCancellationAfterJunctionDiscardsLaterState();
     testDeniedSnapshotCostsOnlyThatAttempt();

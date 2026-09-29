@@ -448,7 +448,7 @@ CacheReclaimResult Cache::reclaimOneState(bool checkpointsOnly) {
   if (!state || (checkpointsOnly && !states_.isCheckpoint(*state)))
     return {};
   const auto eviction = states_.reclaim(state->id, completionNotifier_,
-                                        makeRoom_, false, state->group);
+                                        makeRoom_, true, state->group);
   return {eviction.evicted, eviction.reclaimedBytes, eviction.pending};
 }
 
