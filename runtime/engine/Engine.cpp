@@ -967,11 +967,27 @@ void Engine::publishReachedStateBoundaries(Request &active,
         }
         if (!state)
           state = model_.snapshot(active.request.id);
+        // If a resident copy cannot fit, preserve the new boundary directly
+        // on disk before writing an old cached block merely to recycle RAM.
+        bool stored = false;
+        if (!state && cache_.reuseStoredState(block, checkpoint)) {
+          stored = true;
+          ++counters_.deduplicatedStatePublications;
+        } else if (!state && model_.canSnapshotToDisk() &&
+                   cache_.publishStateToDisk(
+                       block,
+                       [&](std::function<void()> completion) {
+                         return model_.snapshotToDisk(active.request.id, std::move(completion));
+                       }, checkpoint)) {
+          stored = true;
+          ++counters_.diskStatePublications;
+          ++publications;
+        }
         // Recycle at most this snapshot's new backing, in normal LRU order.
         // Blocks can be smaller or shared; count released bytes, not victims.
         // A persistent denial must not drain unrelated cached conversations.
         uint64_t remaining =
-            state ? 0 : model_.snapshotAllocationBytes(active.request.id);
+            state || stored ? 0 : model_.snapshotAllocationBytes(active.request.id);
         while (!state && remaining) {
           const auto reclaimed = cache_.reclaimOneState(checkpoint);
           if (!reclaimed.madeProgress)
@@ -984,20 +1000,7 @@ void Engine::publishReachedStateBoundaries(Request &active,
         if (state) {
           cache_.publishCompositeState(block, std::move(state), checkpoint);
           ++publications;
-        } else if (cache_.reuseStoredState(block, checkpoint)) {
-          // No cache slot takes a RAM copy of a state already on disk.
-          ++counters_.deduplicatedStatePublications;
-        } else if (model_.canSnapshotToDisk() &&
-                   cache_.publishStateToDisk(
-                       block,
-                       [&](std::function<void()> completion) {
-                         return model_.snapshotToDisk(active.request.id, std::move(completion));
-                       },
-                       checkpoint)) {
-          // No cache slot holds the state; the tier takes it from the lane.
-          ++counters_.diskStatePublications;
-          ++publications;
-        } else {
+        } else if (!stored) {
           ++failures;
           continue;
         }

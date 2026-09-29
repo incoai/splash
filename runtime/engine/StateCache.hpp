@@ -88,7 +88,7 @@ public:
   diskCandidate(bool duplicate) const noexcept;
   [[nodiscard]] StateEviction
   reclaim(uint64_t block, std::function<void()> completion,
-          const std::function<bool()> &makeRoom = {}, bool waitForWrite = false,
+          const std::function<bool()> &makeRoom = {},
           std::optional<CacheGroupId> selected = {});
   [[nodiscard]] StateEviction evict(uint64_t block) noexcept;
   void dropDisk(uint64_t block, std::optional<CacheGroupId> selected = {});

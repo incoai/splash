@@ -107,7 +107,7 @@ StateCache::acquireDeepest(std::span<const uint64_t> chain,
   leases.reserve(state->blocks.size());
   for (auto &block : state->blocks) {
     const uint64_t id = endpoint(leaf, block.end);
-    auto lease = group(block.group).acquireDeepest(std::span(&id, 1), access);
+    auto lease = group(block.group).acquireBlock(id, access);
     if (!lease || lease->kvBlock() != id)
       throw std::logic_error("cache group changed during restore acquisition");
     block.payload = lease->state();
@@ -249,7 +249,11 @@ void StateCache::publish(uint64_t leaf,
     auto &store = group(part.group);
     const uint64_t block = endpoint(leaf, part.end);
     const auto existing = store.peek(block);
-    if (existing && existing->begin <= part.begin && store.resident(block)) {
+    // One descriptor serves both tiers. A narrower RAM slice cannot replace
+    // a wider disk range: earlier restore points (including pinned manifests)
+    // still depend on that coverage. Equal ranges may acquire a RAM copy.
+    if (existing && existing->begin <= part.begin &&
+        (store.resident(block) || existing->begin < part.begin)) {
       static_cast<void>(store.touchIfStored(block, checkpoint));
       continue;
     }
@@ -406,7 +410,6 @@ StateCache::diskCandidate(bool duplicate) const noexcept {
 StateEviction StateCache::reclaim(uint64_t block,
                                   std::function<void()> completion,
                                   const std::function<bool()> &makeRoom,
-                                  bool waitForWrite,
                                   std::optional<CacheGroupId> selected) {
   const auto id = selected ? selected : oldestGroup(block);
   if (!id)
@@ -416,14 +419,9 @@ StateEviction StateCache::reclaim(uint64_t block,
   if (offloadEnabled_ && writing() && payload &&
       payload->payload->canOffload() && !group(*id).diskCopy(block) &&
       !group(*id).writing(block)) {
-    if (waitForWrite)
-      return {false, 0, true};
-    // Demand-driven reclaim may discard an uncopied block, but must not
-    // start a second write against another group's occupied staging buffer.
-    return group(*id).evict(block);
+    return {false, 0, true};
   }
-  return group(*id).reclaim(block, std::move(completion), makeRoom,
-                            waitForWrite);
+  return group(*id).reclaim(block, std::move(completion), makeRoom);
 }
 StateEviction StateCache::evict(uint64_t block) noexcept {
   StateEviction result;

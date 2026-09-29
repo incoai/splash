@@ -399,7 +399,7 @@ CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode,
 
   const auto reclaimState = [&](CacheEvictionCandidate candidate) {
     const StateEviction eviction =
-        states_.reclaim(candidate.id, completionNotifier_, makeRoom_, true, candidate.group);
+        states_.reclaim(candidate.id, completionNotifier_, makeRoom_, candidate.group);
     if (!eviction.evicted && !eviction.pending)
       throw std::logic_error("state eviction candidate became pinned");
     return eviction;
@@ -448,7 +448,7 @@ CacheReclaimResult Cache::reclaimOneState(bool checkpointsOnly) {
   if (!state || (checkpointsOnly && !states_.isCheckpoint(*state)))
     return {};
   const auto eviction = states_.reclaim(state->id, completionNotifier_,
-                                        makeRoom_, true, state->group);
+                                        makeRoom_, state->group);
   return {eviction.evicted, eviction.reclaimedBytes, eviction.pending};
 }
 
@@ -470,7 +470,7 @@ Cache::LeafReclaim Cache::reclaimKvLeaf(uint64_t block) {
   // then.
   if (states_.resident(block) && (kv_.slot(block) || kvTierWritable())) {
     const StateEviction eviction =
-        states_.reclaim(block, completionNotifier_, makeRoom_, true);
+        states_.reclaim(block, completionNotifier_, makeRoom_);
     if (!eviction.evicted)
       return eviction.pending ? LeafReclaim::Pending : LeafReclaim::Impossible;
     if (states_.resident(block)) return LeafReclaim::Started;
@@ -671,7 +671,7 @@ void Cache::promoteState(const CacheLookup &lookup, StateRestore &transfer) {
       // copy makes room for it unless its write has to wait.
       const auto victim = states_.evictionCandidate();
       if (victim &&
-          states_.reclaim(victim->id, completionNotifier_, makeRoom_, true, victim->group).evicted)
+          states_.reclaim(victim->id, completionNotifier_, makeRoom_, victim->group).evicted)
         state = transfer.snapshot();
     }
     if (state) states_.promote(block, source, std::move(state));

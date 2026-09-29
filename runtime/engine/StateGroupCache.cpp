@@ -44,16 +44,6 @@ void StateBlockLease::reset() noexcept {
 }
 
 std::optional<StateBlockLease>
-StateGroupCache::acquireDeepest(std::span<const uint64_t> kvChain,
-                                CacheAccess access) {
-  for (auto block = kvChain.rbegin(); block != kvChain.rend(); ++block) {
-    if (auto lease = acquireBlock(*block, access))
-      return lease;
-  }
-  return std::nullopt;
-}
-
-std::optional<StateBlockLease>
 StateGroupCache::acquireBlock(uint64_t kvBlock, CacheAccess access) {
   auto found = entries_.find(kvBlock);
   if (found == entries_.end() || found->second.invalid)
@@ -75,16 +65,6 @@ StateGroupCache::acquireBlock(uint64_t kvBlock, CacheAccess access) {
   reindex(kvBlock, entry);
   const uint32_t boundary = kv_.chainLength(kvBlock) * KvCache::pageTokens;
   return StateBlockLease(*this, kvBlock, boundary, copy(entry), access);
-}
-
-void StateGroupCache::recordLookup(bool hit, bool disk) noexcept {
-  hit ? ++hits_ : ++misses_;
-  if (disk)
-    ++diskHits_;
-}
-
-bool StateGroupCache::touchIfResident(uint64_t kvBlock, bool checkpoint) {
-  return resident(kvBlock) && touchIfStored(kvBlock, checkpoint);
 }
 
 bool StateGroupCache::touchIfStored(uint64_t kvBlock, bool checkpoint) {
@@ -140,35 +120,6 @@ void StateGroupCache::publish(uint64_t kvBlock,
   entry.lastUsed = recency_.next();
   reindex(kvBlock, entry);
   ++publications_;
-}
-
-bool StateGroupCache::publishToDisk(uint64_t kvBlock,
-                                    const StateBlockWriter &write,
-                                    const std::function<void()> &completion,
-                                    const std::function<bool()> &makeRoom,
-                                    bool checkpoint) {
-  if (!kv_.contains(kvBlock)) {
-    throw std::invalid_argument("group state KV block is unknown");
-  }
-  if (publications_ == std::numeric_limits<uint64_t>::max())
-    throw std::overflow_error("group state publication count overflowed");
-  if (resident(kvBlock))
-    throw std::logic_error("duplicate group state key");
-  // The state is on disk already; a second copy would add nothing.
-  if (touchIfStored(kvBlock, checkpoint))
-    return true;
-  // A checkpoint replaces older copies like any state: it is the only
-  // progress a suspended request keeps once the quota is full.
-  std::unique_ptr<StateOffload> transfer =
-      startWrite(write, completion, makeRoom);
-  if (!transfer)
-    return false;
-  Entry &entry = publicationEntry(kvBlock, checkpoint);
-  beginWrite(kvBlock, entry, std::move(transfer));
-  entry.lastUsed = recency_.next();
-  reindex(kvBlock, entry);
-  ++publications_;
-  return true;
 }
 
 bool StateGroupCache::copyToDisk(uint64_t block,
@@ -324,8 +275,7 @@ StateGroupCache::diskCandidate(bool duplicate) const noexcept {
 
 StateEviction StateGroupCache::reclaim(uint64_t kvBlock,
                                        std::function<void()> completion,
-                                       const std::function<bool()> &makeRoom,
-                                       bool waitForWrite) {
+                                       const std::function<bool()> &makeRoom) {
   auto found = entries_.find(kvBlock);
   if (found == entries_.end() || found->second.pins || !found->second.ram)
     return {};
@@ -333,7 +283,7 @@ StateEviction StateGroupCache::reclaim(uint64_t kvBlock,
   // One write at a time.
   const bool writable =
       offloadEnabled_ && !entry.disk && entry.ram->canOffload();
-  if (writable && pending_ && waitForWrite)
+  if (writable && pending_)
     return {false, 0, true};
   if (writable) {
     if (auto transfer = startWrite(
@@ -490,11 +440,7 @@ StateCacheSnapshot StateGroupCache::snapshot() const noexcept {
   result.offloads = offloads_;
   result.offloadFailures = offloadFailures_;
   result.invalidations = invalidations_;
-  result.diskHits = diskHits_;
   result.promotions = promotions_;
-  result.promotionsSkipped = promotionsSkipped_;
-  result.hits = hits_;
-  result.misses = misses_;
   result.publications = publications_;
   result.deduplicatedPublications = deduplicatedPublications_;
   result.evictions = evictions_;

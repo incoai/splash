@@ -231,6 +231,42 @@ void testWiderDiskGroupPreservesEarlierBoundaries() {
           "wider disk slice did not replace the narrow imported range");
 }
 
+// A later window may use a narrower slice of an earlier physical block.
+// Publishing that slice in RAM must not shrink its existing disk coverage.
+void testNarrowResidentPublicationPreservesDiskCoverage() {
+  for (const bool pin : {false, true}) {
+    test::TestKvBacking backing{4,100};
+    KvPool pool{backing};
+    CacheRecency recency;
+    KvCache kv(pool,cacheNamespace(),recency);
+    StateCache states(kv,recency);
+    states.configure({{19,CacheGroupKind::SlidingWindow,64}});
+    auto pages = pool.acquirePages(3,false);
+    require(pages.granted(), "coverage fixture allocation failed");
+    std::array<uint32_t,32> tokens{};
+    std::vector<uint64_t> blocks;
+    for (auto page : pages.pages) {
+      blocks.push_back(kv.insert(blocks.empty() ? 0 : blocks.back(),tokens,page).id);
+      pool.releasePage(page,false);
+    }
+    auto control = std::make_shared<TransferControl>();
+    states.importDisk(blocks[1],std::make_shared<RestoreState>(RestoreState{64,{
+        {19,0,64,std::make_shared<TieredState>(control,true)}}}));
+    auto lease = pin ? states.acquireDeepest(std::span(&blocks[1],1),
+                                           CacheAccess::Maintenance)
+                     : std::optional<RestoreLease>{};
+    states.publish(blocks[2],std::make_shared<RestoreState>(RestoreState{96,{
+        {19,32,64,std::make_shared<TieredState>(control)},
+        {19,64,96,std::make_shared<TieredState>(control)}}}));
+    require(states.matchedBoundary(std::span(&blocks[1],1)) == 64 &&
+                states.diskCopy(blocks[1]) &&
+                states.matchedBoundary(std::span(&blocks[2],1)) == 96,
+            "narrow RAM publication destroyed a complete disk restore point");
+    require(states.copyToDisk(blocks[1],{},{}),
+            "an existing persistent lease lost complete disk coverage");
+  }
+}
+
 void testResidentProtectionSkipsMixedTierHoles() {
   test::TestKvBacking backing{4,100};
   KvPool pool{backing};
@@ -254,7 +290,7 @@ void testResidentProtectionSkipsMixedTierHoles() {
       part(7,32,32),part(19,0,32)}}));
   states.publish(blocks[2],std::make_shared<RestoreState>(RestoreState{96,{
       part(7,96,96),part(19,32,64),part(19,64,96)}}));
-  require(states.reclaim(blocks[1],{}, {},false,19).evicted,
+  require(states.reclaim(blocks[1],{}, {},19).evicted,
           "middle window fragment was not offloaded");
   control->ready = true;
   require(states.pollOffload(), "middle fragment write did not finish");
@@ -353,7 +389,7 @@ void testMaintenanceLeasesPreserveRequestRecency() {
   states.publish(first, std::make_shared<TestState>(100));
   states.publish(second, std::make_shared<TestState>(100));
   {
-    auto copy = states.acquireDeepest(std::span(&first, 1), CacheAccess::Maintenance);
+    auto copy = states.acquireBlock(first, CacheAccess::Maintenance);
     kv.retainActive(first, CacheAccess::Maintenance);
     auto moved = std::move(copy);
     moved.reset();
@@ -362,8 +398,8 @@ void testMaintenanceLeasesPreserveRequestRecency() {
   require(states.evictionCandidate()->id == first && kv.evictionCandidate()->id == first,
           "background copy completion refreshed cache recency");
   {
-    auto copy = states.acquireDeepest(std::span(&first, 1), CacheAccess::Maintenance);
-    auto use = states.acquireDeepest(std::span(&first, 1));
+    auto copy = states.acquireBlock(first, CacheAccess::Maintenance);
+    auto use = states.acquireBlock(first, CacheAccess::Request);
     states.touch(second);
     kv.touch(second);
     use.reset(); // real use completes while the background copy still holds it
@@ -372,7 +408,7 @@ void testMaintenanceLeasesPreserveRequestRecency() {
   require(states.evictionCandidate()->id == second && kv.evictionCandidate()->id == second,
           "a background pin hid actual request use");
   {
-    auto copy = states.acquireDeepest(std::span(&first, 1), CacheAccess::Maintenance);
+    auto copy = states.acquireBlock(first, CacheAccess::Maintenance);
     states.touch(first);
     kv.touch(first);
     states.touch(second);
@@ -381,7 +417,7 @@ void testMaintenanceLeasesPreserveRequestRecency() {
   require(states.evictionCandidate()->id == first && kv.evictionCandidate()->id == first,
           "late maintenance release overrode a newer request's recency");
   {
-    auto copy = states.acquireDeepest(std::span(&first, 1), CacheAccess::Maintenance);
+    auto copy = states.acquireBlock(first, CacheAccess::Maintenance);
     require(states.touchIfStored(first, false), "pinned publication was not reused");
   }
   require(states.evictionCandidate()->id == second,
@@ -2754,6 +2790,7 @@ int main() {
     testLogicalKvPressureStillReclaimsPages();
     testSchedulingProbeDoesNotChangeCachePolicy();
     testWiderDiskGroupPreservesEarlierBoundaries();
+    testNarrowResidentPublicationPreservesDiskCoverage();
     testResidentProtectionSkipsMixedTierHoles();
     testGroupsShareOneOffloadStagingSlot();
     testSharedStateAccounting();

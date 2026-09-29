@@ -1488,6 +1488,32 @@ void testSnapshotAdmissionReclaimsUntilItFits() {
           "snapshot admission did not preserve LRU order");
 }
 
+// A full resident budget does not require displacing a useful RAM prefix
+// when the current committed boundary can be captured directly to disk.
+void testDiskSnapshotPreservesResidentPrefixes() {
+  Backing backing(64);
+  KvPool pool(backing);
+  engine::Cache cache(pool, CacheNamespace{});
+  Executor executor(1);
+  Events events;
+  engine::Engine engine({}, cache, executor, events);
+  engine.submit(request(1, std::vector<uint32_t>(65, 1)));
+  runUntilIdle(engine);
+  executor.stateTier = std::make_shared<OffloadControl>();
+  executor.stateTier->ready = true;
+  executor.deniedSnapshots = 100;
+  engine.submit(request(2, std::vector<uint32_t>(65, 2)));
+  runUntilIdle(engine);
+  const auto older = cache.lookup(std::vector<uint32_t>(65, 1));
+  const auto newer = cache.lookup(std::vector<uint32_t>(65, 2));
+  require(older.state && older.state->state()->resident() && newer.state &&
+              !newer.state->state()->resident() && executor.diskSnapshots == 1 &&
+              cache.snapshot().stateCache.evictions == 0 &&
+              engine.snapshot().replayStatePublicationFailures == 0 &&
+              events.completedCount == 2 && !events.failedCount,
+          "direct disk capture displaced a resident prefix unnecessarily");
+}
+
 // A snapshot the model denies once at a replay boundary lands by recycling
 // the least recently used cached state: one eviction, the same number of
 // entries, and the recycled slot now holds the new lane's state.
@@ -5506,6 +5532,7 @@ int main() {
     testCancellationAfterJunctionDiscardsLaterState();
     testDeniedSnapshotCostsOnlyThatAttempt();
     testSnapshotAdmissionReclaimsUntilItFits();
+    testDiskSnapshotPreservesResidentPrefixes();
     testDeniedSnapshotRecyclesLruStateAndRetries();
     testPersistentSnapshotDenialRecyclesAtMostOneState();
     testStateWithoutACacheSlotGoesToDisk();

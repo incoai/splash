@@ -106,19 +106,10 @@ public:
   StateGroupCache(const StateGroupCache &) = delete;
   StateGroupCache &operator=(const StateGroupCache &) = delete;
 
+  // Pins one block selected by the coordinator; maintenance preserves recency.
   [[nodiscard]] std::optional<StateBlockLease>
-  acquireDeepest(std::span<const uint64_t> kvChain,
-                 CacheAccess access = CacheAccess::Request);
-  // Acquisition pins backing; accounting occurs only when admission succeeds.
-  // Maintenance leases preserve recency through moves and release.
-  void recordLookup(bool hit, bool disk = false) noexcept;
-
-  // Reuses a RAM copy without a restore pin or lookup accounting. A normal
-  // boundary upgrades a checkpoint; a checkpoint cannot downgrade an
-  // ordinary state. False for a state that is absent or only on disk: the
-  // caller publishes the copy it holds, which is promotion without a read.
-  [[nodiscard]] bool touchIfResident(uint64_t kvBlock, bool checkpoint = false);
-  // The same for a copy in either tier.
+  acquireBlock(uint64_t kvBlock, CacheAccess access);
+  // Reuse upgrades checkpoints but never downgrades ordinary state.
   [[nodiscard]] bool touchIfStored(uint64_t kvBlock, bool checkpoint = false);
 
   // Write-through uses the same staging and ticket as pressure offload,
@@ -142,17 +133,6 @@ public:
   // Publishes a RAM copy; a disk copy of the block stays beside it.
   void publish(uint64_t kvBlock, std::shared_ptr<const StatePayload> state,
                bool checkpoint = false, uint32_t begin = UINT32_MAX);
-  // Publishes a state that has no RAM copy by writing it from its lane: the
-  // entry is the disk copy the ticket carries, with the write in flight. A
-  // block whose state is on disk already is published as it is. False when
-  // the one write in flight holds the staging buffer, or when the quota
-  // cannot admit the state after makeRoom gave up what it could; nothing is
-  // published then.
-  [[nodiscard]] bool publishToDisk(uint64_t kvBlock,
-                                   const StateBlockWriter &write,
-                                   const std::function<void()> &completion,
-                                   const std::function<bool()> &makeRoom,
-                                   bool checkpoint = false);
   // Publication identity protects replacement states from stale handles.
   [[nodiscard]] GroupCheckpoint checkpoint(uint64_t kvBlock) const noexcept;
   // Ensures this publication is no longer a disposable checkpoint. Returns
@@ -172,13 +152,11 @@ public:
   evictionCandidate(bool checkpoints = true) const noexcept;
   // Frees an unpinned RAM copy: for nothing when a disk copy exists, by
   // writing one when the tier takes it (makeRoom frees quota on its behalf),
-  // by dropping the state otherwise. The RAM is free when the call returns.
-  // With waitForWrite, a state that could be written once the write in
-  // flight has finished is kept and reported pending instead of dropped.
+  // by dropping the state otherwise. A successful reclaim frees the RAM copy.
+  // A state waiting for occupied staging stays cached and reports pending.
   [[nodiscard]] StateEviction
   reclaim(uint64_t kvBlock, std::function<void()> completion,
-          const std::function<bool()> &makeRoom = {},
-          bool waitForWrite = false);
+          const std::function<bool()> &makeRoom = {});
   // Removes an unpinned state from both tiers.
   [[nodiscard]] StateEviction evict(uint64_t kvBlock) noexcept;
   // Disk replacement: the oldest unpinned disk copy that is redundant (a RAM
@@ -196,7 +174,6 @@ public:
                                 const StatePayload *source) const noexcept;
   void promote(uint64_t kvBlock, const StatePayload *source,
                std::shared_ptr<const StatePayload> state);
-  void promotionSkipped() noexcept { ++promotionsSkipped_; }
   // The one state write is in flight; its RAM or quota returns when it lands.
   [[nodiscard]] bool writing() const noexcept { return pending_.has_value(); }
   [[nodiscard]] bool pollOffload();
@@ -250,8 +227,6 @@ private:
                   std::unique_ptr<StateOffload> transfer);
   [[nodiscard]] StateEviction erase(uint64_t kvBlock, bool retirement) noexcept;
   void release(uint64_t kvBlock, CacheAccess access) noexcept;
-  [[nodiscard]] std::optional<StateBlockLease> acquireBlock(uint64_t kvBlock,
-                                                            CacheAccess access);
   // Places the entry in the orders its copies call for.
   void reindex(uint64_t kvBlock, Entry &entry) noexcept;
   static void unlink(Entry &entry) noexcept;
@@ -273,14 +248,10 @@ private:
   RecencyOrder duplicates_;
   RecencyOrder diskOnly_;
   uint64_t promotions_ = 0;
-  uint64_t promotionsSkipped_ = 0;
   StateResources ramResources_, diskResources_, checkpointResources_;
   uint64_t bytes_ = 0;
   uint64_t diskBytes_ = 0;
   uint32_t pinnedEntries_ = 0;
-  uint64_t diskHits_ = 0;
-  uint64_t hits_ = 0;
-  uint64_t misses_ = 0;
   uint64_t publications_ = 0;
   uint64_t publicationSequence_ = 0;
   uint64_t deduplicatedPublications_ = 0;
