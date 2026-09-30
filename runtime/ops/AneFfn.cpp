@@ -1,6 +1,7 @@
 #include "ops/AneFfn.hpp"
 
 #include "metal/abi/AneFfn.h"
+#include "metal/abi/QuantFormat.h"
 
 #include <algorithm>
 #include <bit>
@@ -48,9 +49,67 @@ std::vector<uint32_t> segments(uint32_t channels) {
 
 uint64_t pages(uint64_t bytes) { return (bytes + 16383) / 16384 * 16384; }
 
-// The GPU share of down: its first `channels` inputs of each 256-row tile.
-uint64_t downShareBytes(uint32_t hidden, uint32_t channels) {
-  return pages(uint64_t{hidden} * channels / 2 + uint64_t{hidden} * (channels / kQuantGroup) * 4);
+// A projection the split takes: affine Q4, or one quantized GGUF image tensor.
+bool splittable(const Projection &projection) {
+  if (projection.layout() == WeightLayout::Affine64) return true;
+  const std::vector<QuantizedSegment> &segments = projection.blocks().segments;
+  return segments.size() == 1 && !segments.front().isFloat() && !projection.rotation;
+}
+
+// A weight plane of a projection: per 256-row tile, `units` units of its inputs
+// for each row, of `bytes` bytes each; `prefix` of them hold its first inputs.
+struct Plane {
+  metal::MetalBuffer buffer;
+  uint64_t units, prefix, bytes;
+};
+// The planes of a projection, with the units of its first `inputs` inputs:
+// the affine weights, scales and biases (units of 64 inputs), or a GGUF
+// image's plane0, plane1 and meta (groups of 32, meta units of meta_groups).
+std::vector<Plane> planes(const Projection &projection, uint32_t inputs) {
+  if (projection.layout() == WeightLayout::Affine64) {
+    const AffineWeights &weights = projection.affine();
+    const uint64_t units = projection.inputSize / kQuantGroup, prefix = inputs / kQuantGroup;
+    return {{weights.weights, units, prefix, 32}, {weights.scales, units, prefix, 2}, {weights.biases, units, prefix, 2}};
+  }
+  const QuantizedSegment &segment = projection.blocks().segments.front();
+  const QuantFormat &format = segment.format();
+  const uint64_t groups = projection.inputSize / 32, prefix = inputs / 32;
+  std::vector<Plane> result{{segment.plane0, groups, prefix, format.plane0_bytes}};
+  if (format.plane1_bytes) result.push_back({segment.plane1, groups, prefix, format.plane1_bytes});
+  result.push_back({segment.meta, groups / format.meta_groups, prefix / format.meta_groups, format.meta_bytes});
+  return result;
+}
+// A projection of `outputs` x `inputs` in the layout and format of `like`,
+// over `views` of its planes in planes() order.
+Projection projection(const Projection &like, uint32_t outputs, uint32_t inputs, std::vector<metal::MetalBuffer> views) {
+  if (like.layout() == WeightLayout::Affine64) return Projection(outputs, inputs, AffineWeights{views[0], views[1], views[2]});
+  const QuantizedSegment &segment = like.blocks().segments.front();
+  const bool second = segment.format().plane1_bytes != 0;
+  return Projection(outputs, inputs,
+                    BlockWeights{{QuantizedSegment::planes(segment.formatId, outputs, inputs, views[0],
+                                                           second ? views[1] : metal::MetalBuffer{}, views.back())}});
+}
+// A projection's weight planes as ane_ffn_weights and ane_ffn_row_scale bind
+// them, and their kernel variant: the affine Q4 planes (groups of 64 inputs),
+// or a GGUF image tensor's (the _gguf kernels, groups of 32 in its format).
+struct WeightSource {
+  metal::MetalBuffer a, b, c;
+  uint32_t groups = 0, format = 0;
+  std::string kernel;
+};
+WeightSource weightSource(const Projection &projection) {
+  if (projection.layout() == WeightLayout::Affine64) {
+    const AffineWeights &weights = projection.affine();
+    return {weights.weights, weights.scales, weights.biases, projection.inputSize / kQuantGroup, 0, ""};
+  }
+  const QuantizedSegment &segment = projection.blocks().segments.front();
+  return {segment.plane0, segment.plane1Slot(), segment.meta, projection.inputSize / 32, segment.formatId, "_gguf"};
+}
+// The bytes of a projection's first `inputs` inputs out of each of its tiles.
+uint64_t leadingInputBytes(const Projection &projection, uint32_t inputs) {
+  uint64_t bytes = 0;
+  for (const Plane &plane : planes(projection, inputs)) bytes += uint64_t{projection.outputSize} * plane.prefix * plane.bytes;
+  return pages(bytes);
 }
 
 // The Hadamard signs D of the rotations R = D H / sqrt(n) of inputs, weights
@@ -198,16 +257,18 @@ std::string ffnProgram(uint32_t hidden, uint32_t channels, const std::vector<uin
 
 } // namespace
 
-uint64_t AneFfn::plannedBytes(uint32_t layers, uint32_t hidden, uint32_t intermediate, double share) {
+uint64_t AneFfn::plannedBytes(std::span<const SwiGluProjections> layers, double share) {
+  const uint32_t hidden = layers.front().gate->inputSize, intermediate = layers.front().gate->outputSize;
   const uint32_t gpu = gpuChannels(intermediate, share), ane = intermediate - gpu;
-  uint64_t bytes = pages(kIntermediateBlock * sizeof(float)) + pages(uint64_t{layers} * (2 * ane + hidden) * 2) +
-                   pages(uint64_t{kRows} * hidden * 2) + uint64_t{layers} * downShareBytes(hidden, gpu) +
+  uint64_t bytes = pages(kIntermediateBlock * sizeof(float)) + pages(uint64_t{layers.size()} * (2 * ane + hidden) * 2) +
+                   pages(uint64_t{kRows} * hidden * 2) +
                    (hidden / kSegment) * ane::Surface::bytes(kSegment, kRows, Element::Int8) +
                    ane::Surface::bytes(1, kRows, Element::Float16) +
                    ane::Surface::bytes(hidden, kRows, Element::Float16);
   uint64_t set = 2 * ane::Surface::bytes(ane, 1, Element::Float16) + ane::Surface::bytes(hidden, 1, Element::Float16) +
                  2 * (hidden / kSegment) * ane::Surface::bytes(ane, kSegment, Element::Int8);
   for (uint32_t width : segments(ane)) set += ane::Surface::bytes(hidden, width, Element::Int8);
+  for (const SwiGluProjections &layer : layers) bytes += leadingInputBytes(*layer.down, gpu);
   return bytes + 2 * set;
 }
 
@@ -224,8 +285,8 @@ AneFfn::AneFfn(metal::MetalBackend &backend, const Linear &linear, std::span<con
     throw std::invalid_argument("ANE FFN split needs a hidden size of 2560-channel segments");
   for (const SwiGluProjections &layer : layers) {
     for (const Projection *projection : {layer.gate, layer.up, layer.down})
-      if (projection->layout() != WeightLayout::Affine64)
-        throw std::invalid_argument("ANE FFN split needs affine Q4 projections");
+      if (!splittable(*projection))
+        throw std::invalid_argument("ANE FFN split needs affine Q4 projections or quantized GGUF tensors");
     if (layer.gate->outputSize != intermediate_ || layer.gate->inputSize != hidden_ ||
         layer.up->outputSize != intermediate_ || layer.up->inputSize != hidden_ ||
         layer.down->outputSize != hidden_ || layer.down->inputSize != intermediate_)
@@ -248,39 +309,32 @@ AneFfn::AneFfn(metal::MetalBackend &backend, const Linear &linear, std::span<con
   rotated_ = allocate(uint64_t{kRows} * hidden_ * 2, "ane ffn rotated input");
 
   // The GPU's share: gate and up rows lead each projection's 256-row tiles;
-  // down's leading inputs are repacked out of each of its tiles.
-  const uint32_t groups = intermediate_ / kQuantGroup, shareGroups = gpuChannels_ / kQuantGroup;
-  const uint64_t tileWeights = uint64_t{shareGroups} * 256 * 32, tileScales = uint64_t{shareGroups} * 256 * 2;
-  for (const SwiGluProjections &source : layers) {
-    const auto prefix = [&](const Projection &projection) {
-      const AffineWeights &weights = projection.affine();
-      const uint64_t scaleBytes = uint64_t{gpuChannels_} * (hidden_ / kQuantGroup) * 2;
-      return Projection(gpuChannels_, hidden_,
-                        AffineWeights{backend_.view(weights.weights, 0, uint64_t{gpuChannels_} * hidden_ / 2),
-                                      backend_.view(weights.scales, 0, scaleBytes),
-                                      backend_.view(weights.biases, 0, scaleBytes)});
-    };
-    const AffineWeights &down = source.down->affine();
-    const auto *weights = static_cast<const uint8_t *>(down.weights.contents());
-    const auto *scales = static_cast<const uint8_t *>(down.scales.contents());
-    const auto *biases = static_cast<const uint8_t *>(down.biases.contents());
-    if (!weights || !scales || !biases) throw std::invalid_argument("ANE FFN split needs CPU-visible weights");
-    const uint32_t tiles = hidden_ / 256;
-    const metal::MetalBuffer packed = allocate(downShareBytes(hidden_, gpuChannels_), "ane ffn gpu down");
-    AffineWeights share{backend_.view(packed, 0, tiles * tileWeights),
-                        backend_.view(packed, tiles * tileWeights, tiles * tileScales),
-                        backend_.view(packed, tiles * (tileWeights + tileScales), tiles * tileScales)};
-    for (uint32_t tile = 0; tile < tiles; ++tile) {
-      std::memcpy(static_cast<uint8_t *>(share.weights.contents()) + tile * tileWeights,
-                  weights + uint64_t{tile} * groups * 256 * 32, tileWeights);
-      std::memcpy(static_cast<uint8_t *>(share.scales.contents()) + tile * tileScales,
-                  scales + uint64_t{tile} * groups * 256 * 2, tileScales);
-      std::memcpy(static_cast<uint8_t *>(share.biases.contents()) + tile * tileScales,
-                  biases + uint64_t{tile} * groups * 256 * 2, tileScales);
+  // down's leading inputs are copied out of each of its tiles.
+  const auto leadingRows = [&](const Projection &source) {
+    std::vector<metal::MetalBuffer> views;
+    for (const Plane &plane : planes(source, hidden_))
+      views.push_back(backend_.view(plane.buffer, 0, uint64_t{gpuChannels_} * plane.units * plane.bytes));
+    return projection(source, gpuChannels_, hidden_, std::move(views));
+  };
+  const auto leadingInputs = [&](const Projection &source) {
+    const metal::MetalBuffer packed = allocate(leadingInputBytes(source, gpuChannels_), "ane ffn gpu down");
+    const uint32_t tiles = source.outputSize / 256;
+    std::vector<metal::MetalBuffer> views;
+    uint64_t offset = 0;
+    for (const Plane &plane : planes(source, gpuChannels_)) {
+      const auto *from = static_cast<const uint8_t *>(plane.buffer.contents());
+      if (!from) throw std::invalid_argument("ANE FFN split needs CPU-visible weights");
+      const uint64_t tileBytes = plane.units * 256 * plane.bytes, prefixBytes = plane.prefix * 256 * plane.bytes;
+      views.push_back(backend_.view(packed, offset, tiles * prefixBytes));
+      for (uint32_t tile = 0; tile < tiles; ++tile)
+        std::memcpy(static_cast<uint8_t *>(views.back().contents()) + tile * prefixBytes, from + tile * tileBytes,
+                    prefixBytes);
+      offset += tiles * prefixBytes;
     }
-    layers_.push_back({source, prefix(*source.gate), prefix(*source.up),
-                       Projection(hidden_, gpuChannels_, std::move(share))});
-  }
+    return projection(source, source.outputSize, gpuChannels_, std::move(views));
+  };
+  for (const SwiGluProjections &source : layers)
+    layers_.push_back({source, leadingRows(*source.gate), leadingRows(*source.up), leadingInputs(*source.down)});
 
   for (uint32_t k = 0; k < hidden_ / kSegment; ++k) inputs_.push_back(surface(kSegment, kRows, Element::Int8));
   tokenScale_ = surface(1, kRows, Element::Float16);
@@ -319,16 +373,16 @@ AneFfn::AneFfn(metal::MetalBackend &backend, const Linear &linear, std::span<con
   metal::CommandGraph graph;
   for (uint32_t layer = 0; layer < layers_.size(); ++layer) {
     const SwiGluProjections &source = layers_[layer].source;
-    const auto add = [&](const Projection &projection, uint32_t part, AneFfnWeightParams params, uint32_t rows,
-                         uint32_t block) {
-      const AffineWeights &weights = projection.affine();
-      graph.add("ane_ffn_row_scale_" + std::to_string(block),
-                {weights.weights, weights.scales, weights.biases, rowScales(layer, part), signs_}, params,
-                {rows / 8, 1, 1});
+    const auto add = [&](const Projection &projection, uint32_t part, uint32_t row, uint32_t input, uint32_t width,
+                         uint32_t rows, uint32_t block) {
+      const WeightSource weights = weightSource(projection);
+      graph.add("ane_ffn_row_scale" + weights.kernel + "_" + std::to_string(block),
+                {weights.a, weights.b, weights.c, rowScales(layer, part), signs_},
+                AneFfnWeightParams{weights.groups, row, input, width, 0, 0, weights.format}, {rows / 8, 1, 1});
     };
-    add(*source.gate, 0, {hidden_ / kQuantGroup, gpuChannels_, 0, hidden_, 0, 0}, aneChannels_, kBlock);
-    add(*source.up, 1, {hidden_ / kQuantGroup, gpuChannels_, 0, hidden_, 0, 0}, aneChannels_, kBlock);
-    add(*source.down, 2, {groups, 0, gpuChannels_, aneChannels_, 0, 0}, hidden_, kIntermediateBlock);
+    add(*source.gate, 0, gpuChannels_, 0, hidden_, aneChannels_, kBlock);
+    add(*source.up, 1, gpuChannels_, 0, hidden_, aneChannels_, kBlock);
+    add(*source.down, 2, 0, gpuChannels_, aneChannels_, hidden_, kIntermediateBlock);
   }
   static_cast<void>(backend_.submitCommand(graph.dispatches()));
 }
@@ -345,23 +399,25 @@ void AneFfn::addWeights(metal::CommandGraph &graph, uint32_t layer, uint32_t set
   const SwiGluProjections &source = layers_.at(layer).source;
   const Weights &target = sets_[set];
   const auto add = [&](const Projection &projection, const metal::MetalBuffer &scales, const ane::Surface &output,
-                       const ane::Surface &scale, AneFfnWeightParams params, uint32_t rows, uint32_t block) {
-    const AffineWeights &weights = projection.affine();
-    params.stride = output.strideBytes;
-    params.scale_stride = scale.strideBytes / 2;
-    graph.add("ane_ffn_weights_" + std::to_string(block),
-              {weights.weights, weights.scales, weights.biases, scales, output.buffer, scale.buffer, signs_}, params,
-              {rows / 8, params.width / block, 1});
+                       const ane::Surface &scale, uint32_t row, uint32_t input, uint32_t width, uint32_t rows,
+                       uint32_t block) {
+    const WeightSource weights = weightSource(projection);
+    graph.add("ane_ffn_weights" + weights.kernel + "_" + std::to_string(block),
+              {weights.a, weights.b, weights.c, scales, output.buffer, scale.buffer, signs_},
+              AneFfnWeightParams{weights.groups, row, input, width, output.strideBytes, scale.strideBytes / 2,
+                                 weights.format},
+              {rows / 8, width / block, 1});
   };
   for (uint32_t k = 0; k < target.gate.size(); ++k) {
-    const AneFfnWeightParams params{hidden_ / kQuantGroup, gpuChannels_, k * kSegment, kSegment, 0, 0};
-    add(*source.gate, rowScales(layer, 0), target.gate[k], target.gateScale, params, aneChannels_, kBlock);
-    add(*source.up, rowScales(layer, 1), target.up[k], target.upScale, params, aneChannels_, kBlock);
+    add(*source.gate, rowScales(layer, 0), target.gate[k], target.gateScale, gpuChannels_, k * kSegment, kSegment,
+        aneChannels_, kBlock);
+    add(*source.up, rowScales(layer, 1), target.up[k], target.upScale, gpuChannels_, k * kSegment, kSegment,
+        aneChannels_, kBlock);
   }
   uint32_t begin = gpuChannels_;
   for (size_t i = 0; i < downSegments_.size(); ++i) {
-    add(*source.down, rowScales(layer, 2), target.down[i], target.downScale,
-        {intermediate_ / kQuantGroup, 0, begin, downSegments_[i], 0, 0}, hidden_, kIntermediateBlock);
+    add(*source.down, rowScales(layer, 2), target.down[i], target.downScale, 0, begin, downSegments_[i], hidden_,
+        kIntermediateBlock);
     begin += downSegments_[i];
   }
 }

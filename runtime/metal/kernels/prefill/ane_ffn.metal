@@ -1,11 +1,12 @@
 #include "metal/abi/KernelABI.h"
+#include "metal/kernels/common/quant_formats.h"
 
 // The GPU side of a dense FFN split with the ANE (ops/AneFfn.cpp). The ANE
 // multiplies int8 weights and activations after a block-diagonal Hadamard
 // rotation R = diag(sign) H / sqrt(n) of blocks of n = K * 128 values:
 // (x R)(W R)^T = x W^T, and the rotation spreads outliers before the
-// per-token and per-row int8 scales. Weights are rotated here from the affine
-// Q4 planes of each chunk's layer.
+// per-token and per-row int8 scales. Weights are rotated here from each
+// chunk's layer: affine Q4 planes, or a GGUF image tensor in any format.
 
 constant constexpr uint kAneFfnBlock = 128;
 
@@ -107,26 +108,74 @@ kernel void ane_ffn_pack(device const half *rotated [[buffer(0)]],
         char(clamp(rint(float(staged[position.x][j])), -127.0f, 127.0f));
 }
 
+// The four values of `row` at inputs [input, input + 4) of a GGUF image
+// tensor of format F with `groups` groups of 32 inputs per row: pairs 2h and
+// 2h + 1 of chunk c of their group, h = input bit 4 and c = input bits 2, 3
+// (metal/abi/QuantFormat.h), as kernels/common/gguf_staged.h decodes them.
+template <class F>
+inline void ane_ffn_gguf_values(thread float (&value)[4], device uchar *plane0, device uchar *plane1,
+                                device uchar *meta, uint groups, uint row, uint input) {
+  const uint group = input >> 5, h = (input >> 4) & 1;
+  const ushort c = (input >> 2) & 3;
+  const ulong unit = quant_tile_index(row, group, groups);
+  const typename F::Payload w = F::load(plane0 + unit * F::P0, plane1 + unit * F::P1);
+  const typename F::Meta header =
+      F::loadMeta(meta + quant_tile_index(row, group / F::MetaGroups, groups / F::MetaGroups) * F::MetaBytes);
+  const typename F::Chunk q = F::chunk(w, c);
+  QuantCoef k;
+  if constexpr (F::ScaleInChunk) k = F::coef(header, F::chunk(w, 0));
+  else k = F::coef(header, ushort(group % F::MetaGroups));
+  const float s = h ? k.s.y : k.s.x, m = h ? k.m.y : k.m.x;
+  float4 v;
+  if constexpr (F::Kind == QuantLinear) {
+    const uint4 pairs = F::codes(q);
+    const uint a = h ? pairs.z : pairs.x, b = h ? pairs.w : pairs.y;
+    const float4 code = float4(a & 0xFFFFu, a >> 16, b & 0xFFFFu, b >> 16) - float(F::Zero);
+    v = F::Zero ? code * s : fma(code, float4(s), float4(m));
+  } else if constexpr (F::Kind == QuantCodebook) {
+    const uchar4 bytes = as_type<uchar4>(F::indices(q));
+    const uint a = h ? bytes.z : bytes.x, b = h ? bytes.w : bytes.y;
+    v = float4(F::value(a & 15), F::value(a >> 4), F::value(b & 15), F::value(b >> 4)) * s;
+  } else if constexpr (F::Kind == QuantInt8) {
+    const uint2 codes = F::values(q);
+    v = float4(as_type<char4>(h ? codes.y : codes.x)) * s;
+  } else {
+    const uint2 grid = F::grid(q);
+    const uint signs = F::signs(q) >> (4 * h);
+    v = float4(as_type<uchar4>(h ? grid.y : grid.x)) * s;
+    v = select(v, -v, bool4(signs & 1, signs & 2, signs & 4, signs & 8));
+  }
+  for (uint e = 0; e < 4; ++e) value[e] = v[e];
+}
+
+// A projection's weight planes a, b, c: the affine Q4 weights, scales and
+// biases (groups = inputs / 64), or a GGUF image tensor's plane0, plane1 and
+// meta in format F (groups = inputs / 32).
+struct AneFfnAffine {
+  static void values(thread float (&value)[4], device uchar *a, device uchar *b, device uchar *c, uint groups, uint row,
+                     uint input) {
+    ane_ffn_q4_values(value, a, (device const bfloat *)b, (device const bfloat *)c, groups, row, input);
+  }
+};
+template <class F>
+struct AneFfnGguf {
+  static void values(thread float (&value)[4], device uchar *a, device uchar *b, device uchar *c, uint groups, uint row,
+                     uint input) {
+    ane_ffn_gguf_values<F>(value, a, b, c, groups, row, input);
+  }
+};
+
 // One simdgroup per weight row, eight rows x one rotation block of K * 128
 // inputs per threadgroup: the int8 rows under their shared scale, which the
 // first block also copies into the ANE's scale surface.
-template <uint K>
-kernel void ane_ffn_weights(device const uchar *weights [[buffer(0)]],
-                            device const bfloat *scales [[buffer(1)]],
-                            device const bfloat *biases [[buffer(2)]],
-                            device const half *row_scale [[buffer(3)]],
-                            device char *output [[buffer(4)]],
-                            device half *scale [[buffer(5)]],
-                            device const float *sign [[buffer(6)]],
-                            constant AneFfnWeightParams &params [[buffer(7)]],
-                            uint2 tile [[threadgroup_position_in_grid]],
-                            uint simd_group [[simdgroup_index_in_threadgroup]],
-                            uint lane [[thread_index_in_simdgroup]]) {
+template <uint K, class Source>
+inline void ane_ffn_weight_rows(device uchar *a, device uchar *b, device uchar *c, device const half *row_scale,
+                                device char *output, device half *scale, device const float *sign,
+                                constant AneFfnWeightParams &params, uint2 tile, uint simd_group, uint lane) {
   const uint row = tile.x * 8 + simd_group, block = tile.y * K * kAneFfnBlock;
   float value[K][4];
   for (uint k = 0; k < K; ++k)
-    ane_ffn_q4_values(value[k], weights, scales, biases, params.groups, params.row + row,
-                      params.input + block + k * kAneFfnBlock + lane * 4);
+    Source::values(value[k], a, b, c, params.groups, params.row + row, params.input + block + k * kAneFfnBlock + lane * 4);
   ane_ffn_rotate_block<K>(value, lane, sign);
   const float inverse = 128.0f / float(row_scale[row]);
   for (uint k = 0; k < K; ++k)
@@ -138,23 +187,16 @@ kernel void ane_ffn_weights(device const uchar *weights [[buffer(0)]],
 // Each row's largest weight over inputs [input, input + width) rotated in
 // blocks of K * 128, as the shared scale times 128 of ane_ffn_weights and the
 // ANE.
-template <uint K>
-kernel void ane_ffn_row_scale(device const uchar *weights [[buffer(0)]],
-                              device const bfloat *scales [[buffer(1)]],
-                              device const bfloat *biases [[buffer(2)]],
-                              device half *row_scale [[buffer(3)]],
-                              device const float *sign [[buffer(4)]],
-                              constant AneFfnWeightParams &params [[buffer(5)]],
-                              uint tile [[threadgroup_position_in_grid]],
-                              uint simd_group [[simdgroup_index_in_threadgroup]],
-                              uint lane [[thread_index_in_simdgroup]]) {
+template <uint K, class Source>
+inline void ane_ffn_row_scales(device uchar *a, device uchar *b, device uchar *c, device half *row_scale,
+                               device const float *sign, constant AneFfnWeightParams &params, uint tile,
+                               uint simd_group, uint lane) {
   const uint row = tile * 8 + simd_group;
   float peak = 0.0f;
   for (uint block = 0; block < params.width; block += K * kAneFfnBlock) {
     float value[K][4];
     for (uint k = 0; k < K; ++k)
-      ane_ffn_q4_values(value[k], weights, scales, biases, params.groups, params.row + row,
-                        params.input + block + k * kAneFfnBlock + lane * 4);
+      Source::values(value[k], a, b, c, params.groups, params.row + row, params.input + block + k * kAneFfnBlock + lane * 4);
     ane_ffn_rotate_block<K>(value, lane, sign);
     for (uint k = 0; k < K; ++k)
       for (uint e = 0; e < 4; ++e) peak = max(peak, fabs(value[k][e]));
@@ -163,15 +205,55 @@ kernel void ane_ffn_row_scale(device const uchar *weights [[buffer(0)]],
   if (lane == 0) row_scale[row] = half(max(peak, 1e-8f) / 127.0f * 128.0f);
 }
 
-using AneFfnWeightsKernel = void(device const uchar *, device const bfloat *, device const bfloat *,
-                                 device const half *, device char *, device half *, device const float *,
-                                 constant AneFfnWeightParams &, uint2, uint, uint);
-using AneFfnRowScaleKernel = void(device const uchar *, device const bfloat *, device const bfloat *, device half *,
-                                  device const float *, constant AneFfnWeightParams &, uint, uint, uint);
+template <uint K>
+kernel void ane_ffn_weights(device uchar *a [[buffer(0)]], device uchar *b [[buffer(1)]], device uchar *c [[buffer(2)]],
+    device const half *row_scale [[buffer(3)]], device char *output [[buffer(4)]], device half *scale [[buffer(5)]],
+    device const float *sign [[buffer(6)]], constant AneFfnWeightParams &params [[buffer(7)]],
+    uint2 tile [[threadgroup_position_in_grid]], uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  ane_ffn_weight_rows<K, AneFfnAffine>(a, b, c, row_scale, output, scale, sign, params, tile, simd_group, lane);
+}
+// The GGUF variants run the body of the dispatch's format.
+template <uint K>
+kernel void ane_ffn_weights_gguf(device uchar *a [[buffer(0)]], device uchar *b [[buffer(1)]], device uchar *c [[buffer(2)]],
+    device const half *row_scale [[buffer(3)]], device char *output [[buffer(4)]], device half *scale [[buffer(5)]],
+    device const float *sign [[buffer(6)]], constant AneFfnWeightParams &params [[buffer(7)]],
+    uint2 tile [[threadgroup_position_in_grid]], uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  quant_format_switch(params.format, [&](auto format) {
+    ane_ffn_weight_rows<K, AneFfnGguf<decltype(format)>>(a, b, c, row_scale, output, scale, sign, params, tile,
+                                                         simd_group, lane);
+  });
+}
+template <uint K>
+kernel void ane_ffn_row_scale(device uchar *a [[buffer(0)]], device uchar *b [[buffer(1)]], device uchar *c [[buffer(2)]],
+    device half *row_scale [[buffer(3)]], device const float *sign [[buffer(4)]],
+    constant AneFfnWeightParams &params [[buffer(5)]], uint tile [[threadgroup_position_in_grid]],
+    uint simd_group [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+  ane_ffn_row_scales<K, AneFfnAffine>(a, b, c, row_scale, sign, params, tile, simd_group, lane);
+}
+template <uint K>
+kernel void ane_ffn_row_scale_gguf(device uchar *a [[buffer(0)]], device uchar *b [[buffer(1)]], device uchar *c [[buffer(2)]],
+    device half *row_scale [[buffer(3)]], device const float *sign [[buffer(4)]],
+    constant AneFfnWeightParams &params [[buffer(5)]], uint tile [[threadgroup_position_in_grid]],
+    uint simd_group [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+  quant_format_switch(params.format, [&](auto format) {
+    ane_ffn_row_scales<K, AneFfnGguf<decltype(format)>>(a, b, c, row_scale, sign, params, tile, simd_group, lane);
+  });
+}
+
+using AneFfnWeightsKernel = void(device uchar *, device uchar *, device uchar *, device const half *, device char *,
+                                 device half *, device const float *, constant AneFfnWeightParams &, uint2, uint, uint);
+using AneFfnRowScaleKernel = void(device uchar *, device uchar *, device uchar *, device half *, device const float *,
+                                  constant AneFfnWeightParams &, uint, uint, uint);
 template [[host_name("ane_ffn_weights_128")]] kernel AneFfnWeightsKernel ane_ffn_weights<1>;
 template [[host_name("ane_ffn_weights_512")]] kernel AneFfnWeightsKernel ane_ffn_weights<4>;
+template [[host_name("ane_ffn_weights_gguf_128")]] kernel AneFfnWeightsKernel ane_ffn_weights_gguf<1>;
+template [[host_name("ane_ffn_weights_gguf_512")]] kernel AneFfnWeightsKernel ane_ffn_weights_gguf<4>;
 template [[host_name("ane_ffn_row_scale_128")]] kernel AneFfnRowScaleKernel ane_ffn_row_scale<1>;
 template [[host_name("ane_ffn_row_scale_512")]] kernel AneFfnRowScaleKernel ane_ffn_row_scale<4>;
+template [[host_name("ane_ffn_row_scale_gguf_128")]] kernel AneFfnRowScaleKernel ane_ffn_row_scale_gguf<1>;
+template [[host_name("ane_ffn_row_scale_gguf_512")]] kernel AneFfnRowScaleKernel ane_ffn_row_scale_gguf<4>;
 
 // 32 x 32 tiles of rows x channels, 32 x 8 threads.
 kernel void ane_ffn_join(device bfloat *output [[buffer(0)]],

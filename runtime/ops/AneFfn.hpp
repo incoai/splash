@@ -14,7 +14,8 @@
 
 namespace splash::ops {
 
-// One layer's affine SwiGLU projections: down(silu(gate x) * up x).
+// One layer's SwiGLU projections, affine Q4 or quantized GGUF tensors:
+// down(silu(gate x) * up x).
 struct SwiGluProjections final {
   const Projection *gate = nullptr;
   const Projection *up = nullptr;
@@ -42,9 +43,8 @@ public:
   AneFfn(const AneFfn &) = delete;
   AneFfn &operator=(const AneFfn &) = delete;
 
-  // The Metal memory of a split of `layers` layers of `hidden` x
-  // `intermediate` projections at `share`.
-  [[nodiscard]] static uint64_t plannedBytes(uint32_t layers, uint32_t hidden, uint32_t intermediate, double share);
+  // The Metal memory of the split of `layers` at `share`.
+  [[nodiscard]] static uint64_t plannedBytes(std::span<const SwiGluProjections> layers, double share);
   [[nodiscard]] uint64_t allocatedBytes() const noexcept { return allocatedBytes_; }
 
   // Starts encoding a command, discarding the jobs of one never submitted.

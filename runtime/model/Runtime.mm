@@ -2825,10 +2825,7 @@ ModelMemoryPlan plannedRuntimeMemory(const DeviceCapabilities &device,
   const RuntimeGeometry geometry = RuntimeGeometry::from(package, format);
   uint64_t prefillBytes = plannedPrefillBytes(geometry, operators);
   if (aneFfnShare > 0.0) {
-    const std::vector<ops::SwiGluProjections> layers = aneFfnLayers(package);
-    prefillBytes += ops::AneFfn::plannedBytes(
-        static_cast<uint32_t>(layers.size()), layers.front().gate->inputSize,
-        layers.front().gate->outputSize, aneFfnShare);
+    prefillBytes += ops::AneFfn::plannedBytes(aneFfnLayers(package), aneFfnShare);
   }
   return {package.stateLayout().activeCellBytes(), prefillBytes,
           plannedDecodeBytes(geometry, operators), kPipelineReserveBytes,
