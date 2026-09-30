@@ -186,7 +186,6 @@ void KvCache::retainActive(uint64_t blockId) {
     throw std::overflow_error("KV cache active user count overflowed");
   }
   ++entry.activeUsers;
-  entry.lastUsed = recency_.next();
   reindex(entry);
 }
 
@@ -196,10 +195,6 @@ void KvCache::releaseActive(uint64_t blockId) noexcept {
     std::terminate();
   Block &entry = found->second;
   --entry.activeUsers;
-  // A released leaf is the newest; a parent keeps the recency its children
-  // pass on.
-  if (!entry.activeUsers && !entry.children)
-    entry.lastUsed = recency_.next();
   reindex(entry);
   erasePoisonedLeaf(blockId);
 }
@@ -234,6 +229,14 @@ bool KvCache::contains(uint64_t blockId) const noexcept {
 
 uint32_t KvCache::chainLength(uint64_t blockId) const {
   return block(blockId).depth;
+}
+
+uint64_t KvCache::ancestor(uint64_t blockId, uint32_t depth) const {
+  if (!depth || depth > chainLength(blockId))
+    return 0;
+  while (block(blockId).depth > depth)
+    blockId = block(blockId).parent;
+  return blockId;
 }
 
 uint32_t KvCache::page(uint64_t blockId) const { return block(blockId).page; }
@@ -374,6 +377,26 @@ KvCache::evictionCandidate(uint64_t after) const {
 std::optional<CacheEvictionCandidate>
 KvCache::diskCandidate(bool duplicate) const noexcept {
   return duplicate ? duplicates_.oldest() : diskLeaves_.oldest();
+}
+
+bool KvCache::anyDescendant(
+    uint64_t root, uint32_t maximumDepth,
+    const std::function<bool(uint64_t)> &predicate) const {
+  uint64_t id = root;
+  for (;;) {
+    const auto &entry = block(id);
+    if (predicate(id))
+      return true;
+    if (entry.depth < maximumDepth && entry.firstChild && entry.statesBelow) {
+      id = entry.firstChild;
+      continue;
+    }
+    while (id != root && !block(id).nextSibling)
+      id = block(id).parent;
+    if (id == root)
+      return false;
+    id = block(id).nextSibling;
+  }
 }
 
 std::vector<uint64_t> KvCache::subtree(uint64_t blockId) const {

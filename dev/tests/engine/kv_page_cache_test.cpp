@@ -1,11 +1,11 @@
-#include "engine/KvCache.hpp"
 #include "TestKvPool.hpp"
+#include "engine/KvCache.hpp"
 
-#include <array>
 #include <algorithm>
+#include <array>
 #include <iostream>
-#include <stdexcept>
 #include <random>
+#include <stdexcept>
 #include <vector>
 
 using namespace splash;
@@ -138,6 +138,9 @@ void testExactChainedBlocksAndPhysicalOwnership() {
               !cache.evictionCandidate(other.id),
           "active page block remained evictable");
   cache.releaseActive(left.id);
+  require(cache.evictionCandidate()->id == left.id,
+          "lease release changed recency");
+  cache.touch(left.id);
   require(cache.evictionCandidate().value().id == right.id &&
               cache.evictionCandidate(right.id).value().id == other.id &&
               cache.evictionCandidate(other.id).value().id == left.id &&
@@ -280,11 +283,9 @@ void testCandidateOrderThroughChurn() {
       if (!entry.activeUsers) {
         cache.retainActive(id);
         ++entry.activeUsers;
-        entry.lastUsed = ++clock;
       } else {
         cache.releaseActive(id);
         --entry.activeUsers;
-        if (!entry.children) entry.lastUsed = ++clock;
       }
       break;
     case 2:

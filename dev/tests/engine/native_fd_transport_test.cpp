@@ -44,8 +44,8 @@ public:
   StateAdmission resume(const ModelRequest &) override {
     return {0, StateFailure::None};
   }
-  void restore(uint64_t, uint32_t, std::shared_ptr<const CompositeState>,
-                     bool) override {}
+  void restore(uint64_t, uint32_t, std::shared_ptr<const RestoreState>,
+               bool) override {}
   void setDraftContextPlan(uint64_t, DraftContextPlan) override {}
   std::vector<ModelStepResult> prefill(const BatchPlan &,
                                           std::span<const ModelBatchItem>) {
@@ -63,9 +63,7 @@ public:
                                      : decode(plan, items),
                                  completion);
   }
-  std::shared_ptr<const CompositeState> snapshot(uint64_t) override {
-    return {};
-  }
+  std::shared_ptr<const RestoreState> snapshot(uint64_t) override { return {}; }
   uint64_t reclaimIdleState() noexcept override { return 0; }
   void provideMask(uint64_t, std::span<const uint32_t>) override {}
   void end(uint64_t) override {}

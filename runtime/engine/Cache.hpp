@@ -19,7 +19,7 @@ namespace splash::engine {
 
 struct CacheLookup final {
   uint32_t kvBoundary = 0;
-  std::optional<CompositeStateLease> state;
+  std::optional<RestoreLease> state;
   // A matched block deeper than the state once held a reusable state that
   // is gone from both tiers.
   bool lostState = false;
@@ -93,6 +93,7 @@ struct TokenAdmission final {
   uint32_t additionalPages = 0;
   uint32_t availablePages = 0;
   metal::AllocationFailure allocationFailure = metal::AllocationFailure::None;
+  std::optional<CacheGroupId> cacheGroup{};
 
   [[nodiscard]] bool granted() const noexcept {
     return failure == KvPageAcquireFailure::None;
@@ -119,7 +120,7 @@ enum class CacheReclaimMode { ReuseBacking, ReleaseBacking };
 enum class KvRestoreStatus : uint8_t { None, Pending, Failed };
 
 // Owns active KV page leases, the content-addressed KV graph and cached
-// composite states. Physical recurrent-state cells remain model-owned.
+// state groups. Physical state backing remains model-owned.
 // A state in RAM always sits on a resident KV block: reclaimKvLeaf frees or
 // drops the state before the block's page, and endRequest, pollTransfers and
 // freeDiskSpace leave such a block its page.
@@ -129,6 +130,13 @@ public:
   // the states' file can run on it without the tier.
   Cache(KvPool &pool, CacheNamespace cacheNamespace, model::KvTier *kvTier = nullptr,
         std::shared_ptr<const model::DiskBudget> diskBudget = nullptr);
+  ~Cache();
+  [[nodiscard]] uint32_t prefixLength(uint64_t block) const {
+    return kv_.chainLength(block) * KvCache::pageTokens;
+  }
+  void configureGroups(std::vector<CacheGroupSpec> groups) {
+    states_.configure(std::move(groups));
+  }
   Cache(const Cache &) = delete;
   Cache &operator=(const Cache &) = delete;
 
@@ -138,7 +146,7 @@ public:
   // Consumes finished transfers: a written state or KV page frees its RAM, a
   // restored block becomes usable, and restores waiting for staging start.
   [[nodiscard]] bool pollTransfers();
-  void discardState(uint64_t block, const CompositeState *state) {
+  void discardState(uint64_t block, const RestoreState *state) {
     states_.invalidate(block, state);
   }
   void beginRequest(uint64_t requestId);
@@ -175,19 +183,21 @@ public:
       uint64_t requestId, std::span<const uint32_t> exactTokens,
       uint32_t committedTokens, std::span<const ImageSpan> images = {});
   [[nodiscard]] uint64_t blockAt(uint64_t requestId, uint32_t boundary) const;
-  [[nodiscard]] bool reuseCompositeState(uint64_t kvBlock, bool checkpoint = false);
-  // Reuses the state at this block in either tier, as reuseCompositeState()
+  [[nodiscard]] bool reuseRestoreState(uint64_t kvBlock,
+                                       bool checkpoint = false);
+  // Reuses the state at this block in either tier, as reuseRestoreState()
   // does a RAM copy.
   [[nodiscard]] bool reuseStoredState(uint64_t kvBlock, bool checkpoint = false);
-  void publishCompositeState(uint64_t kvBlock,
-                             std::shared_ptr<const CompositeState> state,
-                             bool checkpoint = false);
+  void publishRestoreState(uint64_t kvBlock,
+                           std::shared_ptr<const RestoreState> state,
+                           bool checkpoint = false);
   // Publishes the state of the lane at this block straight to disk, for a
-  // state no cache slot can hold: `write` starts the write from the lane.
+  // state no cache slot can hold. The plan permits admission before IO.
   // False when the tier cannot take the state now; nothing is published then.
-  [[nodiscard]] bool publishStateToDisk(uint64_t kvBlock, const StateWriter &write,
+  [[nodiscard]] bool publishStateToDisk(uint64_t kvBlock,
+                                        const SnapshotWritePlan &plan,
                                         bool checkpoint = false);
-  [[nodiscard]] StateCheckpoint checkpointState(uint64_t kvBlock) const noexcept;
+  [[nodiscard]] StateCheckpoint checkpointState(uint64_t kvBlock) const;
   // The state at this block has a RAM copy.
   [[nodiscard]] bool stateResident(uint64_t kvBlock) const noexcept;
   // False only while this exact disposable publication is pinned.
@@ -228,9 +238,11 @@ public:
   [[nodiscard]] CacheReclaimResult reclaimOne(
       CacheReclaimMode mode = CacheReclaimMode::ReleaseBacking,
       bool keepResumePoint = false);
-  // Recycles exactly one unpinned state, preferring checkpoints, for a
-  // required state publication; the disk tier keeps it when it admits it.
-  [[nodiscard]] bool reclaimOneState(bool checkpointsOnly = false);
+  // Optional snapshot admission recycles one unpinned state in global LRU
+  // order, preferring checkpoints. Busy writes return pending without
+  // discarding an uncopied state.
+  [[nodiscard]] CacheReclaimResult
+  reclaimOneState(std::optional<CacheGroupId> group = {});
   // Empty resident backing exists but the previous release is still in
   // flight; more reclaim work becomes possible without evicting anything.
   [[nodiscard]] bool releaseDeferred() const noexcept;

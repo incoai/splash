@@ -9,9 +9,9 @@
 #include "ops/Normalization.hpp"
 #include "ops/Sampling.hpp"
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
-#include <array>
 #include <functional>
 #include <memory>
 #include <span>
@@ -22,36 +22,7 @@
 
 namespace splash::model {
 
-struct DFlashDraftRingLayer final {
-  // K is [head][ring_position][dimension].
-  metal::MetalBuffer keys;
-  // V is [head][dimension][ring_position].
-  metal::MetalBuffer values;
-};
-
-// Draft-owned persistent context, paired with target state in composite caches.
-class DFlashDraftRing final {
-public:
-  DFlashDraftRing(metal::MetalBackend &backend,
-                  std::shared_ptr<StateAllocationTracker> tracker,
-                  DraftStateLayout layout,
-                  std::string_view label);
-  ~DFlashDraftRing();
-  DFlashDraftRing(const DFlashDraftRing &) = delete;
-  DFlashDraftRing &operator=(const DFlashDraftRing &) = delete;
-
-  [[nodiscard]] const std::vector<DFlashDraftRingLayer> &layers() const noexcept {
-    return layers_;
-  }
-  [[nodiscard]] uint64_t actualAllocatedBytes() const noexcept {
-    return actualAllocatedBytes_;
-  }
-
-private:
-  std::shared_ptr<StateAllocationTracker> tracker_;
-  std::vector<DFlashDraftRingLayer> layers_;
-  uint64_t actualAllocatedBytes_ = 0;
-};
+using DraftKvPageViews = ops::DraftKvBuffers;
 
 struct DFlashDraftLayout final {
   uint32_t layers = 5;
@@ -99,10 +70,9 @@ struct DFlashDecodeBuffers final {
   metal::MetalBuffer ropeCos;
   metal::MetalBuffer ropeSin;
   metal::MetalBuffer gateScratch;
-  std::vector<std::array<metal::MetalBuffer,
-                         ExecutionLimits::maximumBatchWidth>> persistentKeys;
-  std::vector<std::array<metal::MetalBuffer,
-                         ExecutionLimits::maximumBatchWidth>> persistentValues;
+  std::vector<
+      std::array<ops::DraftKvBuffers, ExecutionLimits::maximumBatchWidth>>
+      context;
 };
 
 struct DFlashContextBuffers final {
@@ -114,17 +84,16 @@ struct DFlashContextBuffers final {
   metal::MetalBuffer ropeCos;
   metal::MetalBuffer ropeSin;
   metal::MetalBuffer retainedCounts;
-  std::vector<std::array<metal::MetalBuffer,
-                         ExecutionLimits::maximumBatchWidth>> persistentKeys;
-  std::vector<std::array<metal::MetalBuffer,
-                         ExecutionLimits::maximumBatchWidth>> persistentValues;
+  std::vector<
+      std::array<ops::DraftKvBuffers, ExecutionLimits::maximumBatchWidth>>
+      context;
 };
 
 struct DFlashPrefillSpan final {
   uint32_t compactRow = 0;
   uint32_t rows = 0;
   uint32_t startPosition = 0;
-  std::span<const DFlashDraftRingLayer> ring;
+  std::span<const DraftKvPageViews> pages;
 };
 
 struct DFlashPrefillBuffers final {

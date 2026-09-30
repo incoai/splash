@@ -16,6 +16,7 @@ constexpr double kHealthCheckIntervalMilliseconds = 1000.0;
 Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
                EngineEventSink &events)
     : config_(config), cache_(cache), model_(model), events_(events) {
+  cache_.configureGroups(model_.cacheGroups());
   if (!config_.maxContext || !config_.vocabularySize) {
     throw std::invalid_argument("context and vocabulary sizes must be positive");
   }
@@ -26,8 +27,8 @@ Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
       (config_.prefillCheckpointTokens <
            model::ExecutionLimits::draftContextTokens ||
        config_.prefillCheckpointTokens % KvCache::pageTokens)) {
-    throw std::invalid_argument(
-        "prefill checkpoint interval must span a draft window and whole KV pages");
+    throw std::invalid_argument("prefill checkpoint interval must span a draft "
+                                "window and whole KV pages");
   }
 }
 
@@ -515,7 +516,7 @@ bool Engine::admit(Request &active, double now) {
       // A useful restore remains pinned throughout ordinary eviction. If
       // that pin is the last obstacle to admitting even one lane, prefer
       // cold recomputation over waiting forever for our own cache lease.
-      if (!growthPaused() && lookup.state) {
+      if (!growthPaused() && !denial.pending && lookup.state) {
         lookup = {};
         continue;
       }
@@ -557,29 +558,63 @@ bool Engine::admit(Request &active, double now) {
     // that resumes, or one that waits for a restore.
     KvAdmission kv;
     if (lookup.state)
-      kv = admitKv([&] { return cache_.restoreRequest(requestId, lookup); });
+      kv =
+          admitGrowth([&] { return cache_.restoreRequest(requestId, lookup); });
     const bool restoring =
-        lookup.state && (!lookup.state->state()->residentBytes() ||
-                         cache_.kvRestoreStatus(requestId) == KvRestoreStatus::Pending);
+        lookup.state &&
+        (!lookup.state->state()->resident() ||
+         cache_.kvRestoreStatus(requestId) == KvRestoreStatus::Pending);
     if (kv.allocation.granted() && (resuming || restoring)) {
       const uint64_t workEnd =
           resuming ? active.resumeKvTargetTokens : uint64_t{resumeBoundary} + 1;
-      kv = admitKv([&] { return cache_.ensureTokens(requestId, workEnd); });
+      kv = admitGrowth([&] { return cache_.ensureTokens(requestId, workEnd); });
+    }
+    DraftContextPlan draft;
+    std::unique_ptr<StateRestore> transfer;
+    bool restoreCapacityDenied = false;
+    if (kv.allocation.granted()) {
+      draft = configureDraftStatePlan(
+          active, resumeBoundary, lookup.junctionBoundary(),
+          lookup.state ? lookup.state->state().get() : nullptr);
+      if (lookup.state) {
+        // Restoring disk pages may need private destination backing.
+        // Treat that capacity refusal like any other execution allocation,
+        // retaining the restore lease across reclaim and retry.
+        kv = admitGrowth([&]() -> TokenAdmission {
+          try {
+            transfer = model_.beginRestore(requestId, resumeBoundary,
+                                           lookup.state->state(), draft,
+                                           completionNotifier_);
+            return {};
+          } catch (const metal::MetalAllocationError &error) {
+            return {KvPageAcquireFailure::PhysicalCapacity, 0, 0,
+                    error.failure(), model_.stepAllocationGroup(requestId)};
+          }
+        });
+        restoreCapacityDenied = !kv.allocation.granted();
+      }
     }
     if (!kv.allocation.granted()) {
       // The host continuation survives this failed admission. No recurrent
       // state restore or replay has run, and all temporary leases are freed.
+      discardPendingStateBoundaries(active);
       if (resuming) model_.suspend(requestId);
       else model_.end(requestId);
       cache_.endRequest(requestId);
       active.stateCell.reset();
       executorStarted = resourcesStarted = false;
       const Verdict verdict = judge(kv.denial, requestId);
-      if (verdict == Verdict::Fail && restoring) {
+      const bool restoreCannotFit =
+          restoreCapacityDenied && !kv.denial.pending && !kv.denial.retryable &&
+          !anotherResident(requestId) && !growthPaused() &&
+          kv.denial.allocationFailure != metal::AllocationFailure::HostPressure;
+      if (lookup.state && (verdict == Verdict::Fail || restoreCannotFit)) {
         // Release the prefix pin before retrying without its memory footprint.
         active.skipCache = true;
         scheduler_.waitForResources(requestId);
-        deferResourceRetry(active, now, kv.denial);
+        // This is a different admission attempt, with no restore footprint.
+        // It need not wait for memory that the failed restore could not free.
+        active.resourceWait = {};
         return false;
       }
       if (verdict == Verdict::Fail) {
@@ -591,14 +626,6 @@ bool Engine::admit(Request &active, double now) {
       return false;
     }
     active.resourceWait = {};
-    DraftContextPlan draft = configureDraftStatePlan(
-        active, resumeBoundary, lookup.junctionBoundary());
-    std::unique_ptr<StateRestore> transfer;
-    if (lookup.state) {
-      transfer = model_.beginRestore(requestId, resumeBoundary, lookup.state->state(),
-                                     !draft.draftStateRestoreSkipped,
-                                     completionNotifier_);
-    }
     if (transfer || cache_.kvRestoreStatus(requestId) == KvRestoreStatus::Pending) {
       active.restore.emplace(Request::Restore{
           std::move(lookup), std::move(draft), std::move(transfer)});
@@ -757,9 +784,10 @@ void Engine::signalResourceProgress() noexcept {
 
 DraftContextPlan Engine::configureDraftStatePlan(Request &active,
                                                  uint32_t stateBoundary,
-                                                 uint32_t junctionBoundary) {
+                                                 uint32_t junctionBoundary,
+                                                 const RestoreState *restored) {
   if (!active.stateBoundaries.empty() || active.stateBoundaryCursor != 0) {
-    throw std::logic_error("request already has a composite-state plan");
+    throw std::logic_error("request already has a draft context plan");
   }
 
   // The replay state is the last one planned: a lazy junction past it would
@@ -799,7 +827,13 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
   static_cast<void>(addSharedPrefillBoundaries(active, stateBoundary));
 
   try {
-    return pendingDraftStatePlan(active, stateBoundary);
+    auto plan = pendingDraftStatePlan(active, stateBoundary, restored);
+    std::erase_if(active.stateBoundaries, [&](const auto &candidate) {
+      return std::none_of(
+          plan.boundaries.begin(), plan.boundaries.end(),
+          [&](const auto &kept) { return kept.boundary == candidate.tokens; });
+    });
+    return plan;
   } catch (...) {
     discardPendingStateBoundaries(active);
     throw;
@@ -826,23 +860,22 @@ bool Engine::addSharedPrefillBoundaries(Request &active, uint32_t after) {
       active.stateBoundaries.insert(
           found, {shared, Request::StateBoundary::Purpose::Junction});
       changed = true;
-    } else if (found->purpose == Request::StateBoundary::Purpose::Checkpoint) {
+    } else if (found->purpose < Request::StateBoundary::Purpose::Junction) {
       found->purpose = Request::StateBoundary::Purpose::Junction;
     }
   }
   return changed;
 }
 
-DraftContextPlan Engine::pendingDraftStatePlan(const Request &active,
-                                               uint32_t stateBoundary) const {
+DraftContextPlan
+Engine::pendingDraftStatePlan(const Request &active, uint32_t stateBoundary,
+                              const RestoreState *restored) const {
   std::vector<uint32_t> boundaries;
   boundaries.reserve(active.stateBoundaries.size() - active.stateBoundaryCursor);
   for (size_t i = active.stateBoundaryCursor; i < active.stateBoundaries.size(); ++i)
     boundaries.push_back(active.stateBoundaries[i].tokens);
-  return planDraftContext(
-      stateBoundary, active.replayTokens,
-      stateBoundary ? std::optional<uint32_t>(stateBoundary) : std::nullopt,
-      boundaries);
+  return model_.planDraftPrefill(stateBoundary, active.replayTokens, boundaries,
+                                 restored);
 }
 
 void Engine::armNextStateBoundary(Request &active) {
@@ -861,13 +894,14 @@ void Engine::discardPendingStateBoundaries(Request &active) noexcept {
 
 bool Engine::retireCheckpoint(Request &active) {
   // Shared progress points remain disposable under memory pressure, but a
-  // lane's normal rolling replacement must not retire its peer's recovery point.
+  // lane's normal rolling replacement must not retire its peer's recovery
+  // point.
   const auto point = active.latestCheckpoint;
   if (point && std::any_of(requests_.begin(), requests_.end(), [&](const auto &entry) {
         const auto &peer = entry.second;
         return &peer != &active && !peer.finalized &&
                peer.latestCheckpoint.kvBlock == point.kvBlock &&
-               peer.latestCheckpoint.publication == point.publication;
+               peer.latestCheckpoint.groups == point.groups;
       })) {
     active.latestCheckpoint = {};
     return true;
@@ -905,53 +939,40 @@ void Engine::publishReachedStateBoundaries(Request &active,
     materialized = true;
     try {
       const uint64_t block = cache_.blockAt(active.request.id, objective.tokens);
-      if (cache_.reuseCompositeState(block, checkpoint)) {
+      if (cache_.reuseRestoreState(block, checkpoint)) {
         ++counters_.deduplicatedStatePublications;
       } else {
-        std::shared_ptr<const CompositeState> state;
-        // A checkpoint close to the final reusable state is only worth
-        // capturing if it fits now. Otherwise keep the previous recovery
-        // point instead of evicting it or writing a short-lived replacement.
-        if (checkpoint && model_.canSnapshotToDisk() &&
-            uint64_t{objective.tokens} + model::ExecutionLimits::prefillTokenBudget >
-                replayStateBoundary(active)) {
-          state = model_.snapshot(active.request.id);
-          if (!state)
-            continue;
-        }
-        // Recycle the previous recovery point before allocating its replacement.
-        // A restore lease can delay this optional publication. A checkpoint
-        // only on disk frees no cache slot for an ordinary state, so it stays
-        // the recovery point until that state is published.
-        if ((checkpoint || cache_.stateResident(active.latestCheckpoint.kvBlock)) &&
-            !retireCheckpoint(active) && checkpoint) {
-          ++failures;
-          continue;
-        }
-        if (!state)
-          state = model_.snapshot(active.request.id);
-        if (!state && cache_.reclaimOneState(checkpoint)) {
+        auto state = model_.snapshot(active.request.id);
+        // Optional snapshots recycle only backing usable by the failed group.
+        // A shared page can disappear from the index without freeing backing;
+        // that does not justify evicting the next conversation.
+        while (!state) {
+          const auto allocation = model_.snapshotAllocation(active.request.id);
+          if (!allocation.group)
+            break;
+          const auto reclaimed = cache_.reclaimOneState(allocation.group);
+          if (!reclaimed.madeProgress || !reclaimed.reclaimedBytes)
+            break;
           state = model_.snapshot(active.request.id);
           if (state)
             ++counters_.recycledStatePublications;
         }
-        if (state) {
-          cache_.publishCompositeState(block, std::move(state), checkpoint);
-          ++publications;
-        } else if (cache_.reuseStoredState(block, checkpoint)) {
-          // No cache slot takes a RAM copy of a state already on disk.
+        bool stored = false;
+        if (!state && cache_.reuseStoredState(block, checkpoint)) {
+          stored = true;
           ++counters_.deduplicatedStatePublications;
-        } else if (model_.canSnapshotToDisk() &&
+        } else if (!state && model_.canSnapshotToDisk() &&
                    cache_.publishStateToDisk(
-                       block,
-                       [&](std::function<void()> completion) {
-                         return model_.snapshotToDisk(active.request.id, std::move(completion));
-                       },
+                       block, model_.prepareSnapshotToDisk(active.request.id),
                        checkpoint)) {
-          // No cache slot holds the state; the tier takes it from the lane.
+          stored = true;
           ++counters_.diskStatePublications;
           ++publications;
-        } else {
+        }
+        if (state) {
+          cache_.publishRestoreState(block, std::move(state), checkpoint);
+          ++publications;
+        } else if (!stored) {
           ++failures;
           continue;
         }
@@ -1000,10 +1021,24 @@ Engine::Prepared Engine::prepare(BatchPlan &plan,
         plan.kind == WorkKind::Prefill
             ? position + scheduled.tokenCount
             : position + model::ExecutionLimits::targetVerifyRows;
-    const KvAdmission kv =
-        admitKv([&] { return cache_.ensureTokens(active.request.id, workEnd); });
+    const KvAdmission kv = admitGrowth(
+        [&] { return cache_.ensureTokens(active.request.id, workEnd); });
     if (!kv.allocation.granted()) {
       denied.push_back(Denied{active.request.id, kv.allocation, workEnd, kv.denial});
+      continue;
+    }
+    const KvAdmission state = admitGrowth([&] {
+      const auto allocation =
+          model_.prepareStep(active.request.id, position, workEnd);
+      return allocation ? TokenAdmission{}
+                        : TokenAdmission{
+                              KvPageAcquireFailure::PhysicalCapacity, 0, 0,
+                              allocation.failure,
+                              model_.stepAllocationGroup(active.request.id)};
+    });
+    if (!state.allocation.granted()) {
+      denied.push_back(
+          Denied{active.request.id, state.allocation, workEnd, state.denial});
       continue;
     }
     admitted.push_back(scheduled);
@@ -1107,7 +1142,8 @@ Engine::Verdict Engine::judge(const Denial &denial, uint64_t requestId) const {
   return Verdict::Fail;
 }
 
-Engine::KvAdmission Engine::admitKv(const std::function<TokenAdmission()> &attempt) {
+Engine::KvAdmission
+Engine::admitGrowth(const std::function<TokenAdmission()> &attempt) {
   const uint64_t releaseGeneration = cache_.releaseGeneration();
   bool reclaimed = false;
   bool pendingReclaim = false;
@@ -1116,9 +1152,26 @@ Engine::KvAdmission Engine::admitKv(const std::function<TokenAdmission()> &attem
          admission.failure == KvPageAcquireFailure::PhysicalCapacity) {
     const bool paused = growthPaused() ||
         admission.allocationFailure == metal::AllocationFailure::HostPressure;
-    const CacheReclaimResult progress = paused
-        ? reuseIdleBackingWhilePaused(admission)
-        : reclaimForGrowth(CacheReclaimMode::ReuseBacking);
+    CacheReclaimResult progress;
+    if (admission.cacheGroup)
+      progress = cache_.reclaimOneState(admission.cacheGroup);
+    if (progress.madeProgress)
+      signalResourceProgress();
+    if (!progress.madeProgress && !progress.pending) {
+      if (admission.cacheGroup) {
+        // A model-group allocation needs memory, not reusable target pages.
+        // This also releases backing when host pressure has paused growth.
+        progress = reclaimIdleState()
+                       ? CacheReclaimResult{true, 0}
+                       : cache_.reclaimOne(CacheReclaimMode::ReleaseBacking);
+      } else {
+        progress =
+            paused ? reuseIdleBackingWhilePaused(admission)
+                   : reclaimForGrowth(admission.additionalPages
+                                          ? CacheReclaimMode::ReuseBacking
+                                          : CacheReclaimMode::ReleaseBacking);
+      }
+    }
     if (!progress.madeProgress) {
       pendingReclaim = progress.pending;
       break;
@@ -1183,6 +1236,10 @@ bool Engine::reclaimIdleState() noexcept {
 CacheReclaimResult Engine::reuseIdleBackingWhilePaused(const TokenAdmission &admission) {
   if (reclaimIdleState())
     return {true, 0};
+  // Model allocations already tried their reusable cache group above.
+  // Target backing is useful only for a target page shortfall.
+  if (!admission.additionalPages)
+    return {};
   const KvPoolSnapshot pool = cache_.snapshot().pool;
   // Cached prefixes can also have active owners; those pages cannot be reused.
   const uint32_t reusable = pool.pagesResident - pool.pagesActive;
@@ -1449,15 +1506,15 @@ void Engine::finishFailure(Request &active, Failure failure) {
 void Engine::finishCapacity(Request &active, const TokenAdmission &admission) {
   if (admission.allocationFailure != metal::AllocationFailure::None &&
       admission.allocationFailure != metal::AllocationFailure::Capacity) {
-    finishFailure(active,
-                  {"capacity_exhausted",
-                   std::string("could not allocate KV target: ") +
-                       metal::allocationFailureName(admission.allocationFailure) +
-                       " (additional_pages=" +
-                       std::to_string(admission.additionalPages) +
-                       ", logical_pages_free=" +
-                       std::to_string(admission.availablePages) + ")",
-                   true});
+    finishFailure(
+        active,
+        {"capacity_exhausted",
+         std::string("could not allocate execution backing: ") +
+             metal::allocationFailureName(admission.allocationFailure) +
+             " (additional_pages=" + std::to_string(admission.additionalPages) +
+             ", logical_pages_free=" +
+             std::to_string(admission.availablePages) + ")",
+         true});
     return;
   }
   if (active.finalized)

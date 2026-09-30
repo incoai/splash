@@ -1,8 +1,8 @@
 #include "engine/MemoryGovernor.hpp"
 #include "engine/MemoryPlan.hpp"
 #include "engine/Types.hpp"
-#include "model/Runtime.hpp"
 #include "model/QwenState.hpp"
+#include "model/Runtime.hpp"
 #include "ops/PageStorage.hpp"
 #include "ops/Vision.hpp"
 #include "tuning/LinearNumerics.hpp"
@@ -167,10 +167,16 @@ void requireCommittedStateIdentical(const model::QwenStateStorage &states,
   identical(left.gdn[budget.activeParity].recurrentBase,
             right.gdn[masked.activeParity].recurrentBase, "GDN recurrent");
   for (uint32_t layer = 0; layer < states.layout().draft.layers; ++layer) {
-    identical(left.draft[layer].keys, right.draft[layer].keys,
-              "draft keys layer=" + std::to_string(layer));
-    identical(left.draft[layer].values, right.draft[layer].values,
-              "draft values layer=" + std::to_string(layer));
+    for (uint32_t page = 0; page < states.layout().draft.tokens /
+                                       model::DraftStateLayout::blockTokens;
+         ++page) {
+      identical(left.draft[layer].keyPages[page],
+                right.draft[layer].keyPages[page],
+                "draft keys layer=" + std::to_string(layer));
+      identical(left.draft[layer].valuePages[page],
+                right.draft[layer].valuePages[page],
+                "draft values layer=" + std::to_string(layer));
+    }
   }
 }
 
@@ -192,7 +198,7 @@ void beginCold(model::Runtime &runtime, const EngineRequest &request,
 
 void restoreActivePrefix(model::Runtime &executor, uint64_t requestId,
                          uint32_t promptTokens, uint32_t boundary,
-                         const std::shared_ptr<const CompositeState> &state) {
+                         const std::shared_ptr<const RestoreState> &state) {
   executor.restore(requestId, boundary, state, true);
   executor.setDraftContextPlan(
       requestId, planDraftContext(boundary, promptTokens, boundary, {}));
@@ -360,18 +366,27 @@ StateSamples sampleCommittedState(const model::QwenStateStorage &states,
                             layout.headDimension;
   const uint64_t stride = std::max<uint64_t>(1, elements / 65536);
   for (uint32_t layer = 0; layer < buffers.draft.size(); ++layer) {
-    const auto *keys = bfloatContents(buffers.draft[layer].keys, "draft keys");
-    const auto *values = bfloatContents(buffers.draft[layer].values, "draft values");
     std::vector<float> keySamples, valueSamples;
     for (uint64_t index = 0; index < elements; index += stride) {
       const uint32_t dimension = index % layout.headDimension;
       const uint32_t position = (index / layout.headDimension) % lengths.draftLength;
       const uint32_t head = index / (uint64_t{layout.headDimension} * lengths.draftLength);
-      const uint32_t ring = (lengths.draftBase + position) % layout.tokens;
+      const uint32_t slot = (lengths.draftBase + position) % layout.tokens;
+      const auto page = slot / model::DraftStateLayout::blockTokens;
+      const auto offset = slot % model::DraftStateLayout::blockTokens;
+      const auto *keys =
+          bfloatContents(buffers.draft[layer].keyPages[page], "draft keys");
+      const auto *values =
+          bfloatContents(buffers.draft[layer].valuePages[page], "draft values");
       keySamples.push_back(ops::tuning::bf16ToFloat(
-          keys[(uint64_t{head} * layout.tokens + ring) * layout.headDimension + dimension]));
+          keys[(uint64_t{head} * model::DraftStateLayout::blockTokens +
+                offset) *
+                   layout.headDimension +
+               dimension]));
       valueSamples.push_back(ops::tuning::bf16ToFloat(
-          values[(uint64_t{head} * layout.headDimension + dimension) * layout.tokens + ring]));
+          values[(uint64_t{head} * layout.headDimension + dimension) *
+                     model::DraftStateLayout::blockTokens +
+                 offset]));
     }
     result.emplace_back("draft_key_" + std::to_string(layer), std::move(keySamples));
     result.emplace_back("draft_value_" + std::to_string(layer), std::move(valueSamples));
@@ -492,7 +507,7 @@ void requireAtomicImageAdmission(model::Runtime &executor,
                 "shared vision setup failed");
       const uint64_t before = backend.memoryStats().allocatedBytes;
       // The check of the whole attempt, fresh vision, image pixels/embeddings,
-      // two GDN cells, draft ring. With an existing encoder, the check and
+      // two GDN cells, draft window. With an existing encoder, the check and
       // the last four allocations remain.
       for (int boundary = 0; boundary < (sharedVision ? 5 : 6); ++boundary) {
         for (bool throwing : {false, true}) {
@@ -813,7 +828,9 @@ int main(int argc, char **argv) {
   try {
     bool imagesOnly = false, warmupEosOnly = false;
     kv::Format format = kv::Format::Int8;
-    if (argc < 3) fail("usage: model-runtime-oracle METALLIB MODEL_ROOT [--kv-format int8|bf16]");
+    if (argc < 3)
+      fail("usage: model-runtime-oracle METALLIB MODEL_ROOT [--kv-format "
+           "int8|bf16]");
     for (int i = 3; i < argc; ++i) {
       const std::string_view option(argv[i]);
       if (option == "--images-only") imagesOnly = true;
@@ -987,8 +1004,10 @@ int main(int argc, char **argv) {
       std::cout << "image scenarios: skipped, the model serves text only\n";
     }
     if (imagesOnly) {
-      std::cout << "PASS model-runtime-oracle scope=images-only model=" << model.name()
-                << " (admission rollback, chunk reclaim, cache-only budget, mixed/repeated images)\n";
+      std::cout << "PASS model-runtime-oracle scope=images-only model="
+                << model.name()
+                << " (admission rollback, chunk reclaim, cache-only budget, "
+                   "mixed/repeated images)\n";
       return 0;
     }
 
@@ -1017,8 +1036,7 @@ int main(int argc, char **argv) {
 
     const uint64_t predictedPromptSnapshotBytes =
         model.stateLayout().cachedBytes();
-    std::shared_ptr<const CompositeState> promptSnapshot =
-        executor.snapshot(1);
+    std::shared_ptr<const RestoreState> promptSnapshot = executor.snapshot(1);
     require(promptSnapshot != nullptr,
             "prompt snapshot allocation failed");
     require(promptSnapshot->bytes() <= predictedPromptSnapshotBytes,
@@ -1160,7 +1178,7 @@ int main(int argc, char **argv) {
     executor.end(50);
     executor.end(51);
 
-    // A reusable composite state contains no final hidden. A fresh
+    // A reusable restore state contains no final hidden. A fresh
     // consumer must replay at least one complete input token; that replay
     // regenerates target hidden, performs the matching draft injection, and
     // selects the consumer's policy-specific anchor.
@@ -1180,7 +1198,7 @@ int main(int argc, char **argv) {
     prefillChunk(executor, 54, 0, 120, 120,
                  std::span<const uint32_t>(promptAligned).subspan(120, 8),
                  policyPages, BatchCohort::Sampling);
-    std::shared_ptr<const CompositeState> partitionedSamplingSnapshot =
+    std::shared_ptr<const RestoreState> partitionedSamplingSnapshot =
         executor.snapshot(54);
     require(partitionedSamplingSnapshot != nullptr,
             "partitioned sampling snapshot allocation failed");
@@ -1249,10 +1267,11 @@ int main(int argc, char **argv) {
     // Every decode executes an anchor plus seven proposal rows. Compare each
     // budgeted commit with a constrained cycle that retains the same prefix,
     // rejecting the next proposal unless all eight rows are retained. The
-    // constrained request has a larger budget, so both acceptance paths agree on
-    // the exact GDN state and draft ring. Kernel tests cover the recurrence's
-    // FP64 accuracy; this check does not mix prefill and decode summation
-    // orders, whose tiny differences can amplify through the full model.
+    // constrained request has a larger budget, so both acceptance paths agree
+    // on the exact GDN state and draft window. Kernel tests cover the
+    // recurrence's FP64 accuracy; this check does not mix prefill and decode
+    // summation orders, whose tiny differences can amplify through the full
+    // model.
     for (uint32_t outputLimit = 2; outputLimit <= 8; ++outputLimit) {
       uint64_t id = 10 + outputLimit;
       EngineRequest variant = makeRequest(id, prompt129, outputLimit);
@@ -1279,7 +1298,7 @@ int main(int argc, char **argv) {
 
       const uint64_t replayId = 100 + outputLimit;
       std::vector<uint32_t> replayPages = pageTable;
-      // Composite snapshots exclude KV: share sealed history and give the
+      // State snapshots exclude KV: share sealed history and give the
       // comparison its own writable page for the speculative suffix.
       replayPages[4] = 80;
       EngineRequest replayRequest = makeRequest(
@@ -1329,7 +1348,7 @@ int main(int argc, char **argv) {
       executor.end(id);
     }
 
-    // A Page32 composite state followed by one replayed token must equal a cold
+    // A Page32 restore state followed by one replayed token must equal a cold
     // run with the same 128+1 command partition.
     EngineRequest extended = makeRequest(20, prompt129, 2);
     beginCold(executor, extended, 0);
@@ -1384,7 +1403,7 @@ int main(int argc, char **argv) {
     prefillChunk(executor, 30, 0, 120, 120,
                  std::span<const uint32_t>(samplingPrefix).subspan(120, 8),
                  samplingPages, BatchCohort::Sampling);
-    std::shared_ptr<const CompositeState> samplingPromptSnapshot =
+    std::shared_ptr<const RestoreState> samplingPromptSnapshot =
         executor.snapshot(30);
     require(samplingPromptSnapshot != nullptr,
             "sampling snapshot allocation failed");
@@ -1760,7 +1779,7 @@ int main(int argc, char **argv) {
     beginCold(executor, makeRequest(70, productionPrefix, 16), 0);
     const std::vector<uint32_t> productionPages{48, 49, 50, 51};
     prefillChunk(executor, 70, 0, 0, 0, productionPrefix, productionPages);
-    std::shared_ptr<const CompositeState> productionSnapshot =
+    std::shared_ptr<const RestoreState> productionSnapshot =
         executor.snapshot(70);
     require(productionSnapshot != nullptr,
             "production snapshot allocation failed");
@@ -1975,8 +1994,10 @@ int main(int argc, char **argv) {
             cycleResults[lane].acceptedDraftTokens);
         productionB4Lengths[lane] += cycleResults[lane].outputTokens.size() -
                                      cycleResults[lane].outputTokensWithoutKv;
-        require(states.metadata(lane).lengths.targetTokens == productionB4Lengths[lane],
-                "production B4 committed length differs from its output accounting");
+        require(states.metadata(lane).lengths.targetTokens ==
+                    productionB4Lengths[lane],
+                "production B4 committed length differs from its output "
+                "accounting");
       }
       // Budget exhaustion is the engine's decision; the oracle mirrors it.
       productionFinished =
@@ -2068,7 +2089,8 @@ int main(int argc, char **argv) {
                                      cycleResults[lane].outputTokensWithoutKv;
         require(states.metadata(productionB2Slots[lane]).lengths.targetTokens ==
                     productionB2Lengths[lane],
-                "production B2 committed length differs from its output accounting");
+                "production B2 committed length differs from its output "
+                "accounting");
       }
       productionB2Finished =
           cycleResults[0].finished || productionB2Tokens[0].size() >= 16;
@@ -2299,7 +2321,8 @@ int main(int argc, char **argv) {
       if (cohort == BatchCohort::Sampling) {
         const auto repeated = runPreemption(cohort, 2);
         require(resumed.transcript == repeated.transcript,
-                "fixed-seed recomputation is not deterministic for the same schedule");
+                "fixed-seed recomputation is not deterministic for the same "
+                "schedule");
       }
       // Generated history is rebuilt through ragged prefill, whose numerical
       // path differs from decode. Already-emitted tokens and the pending
@@ -2326,15 +2349,19 @@ int main(int argc, char **argv) {
     for (uint32_t rows : {32U, 128U, 512U}) {
       const auto smallerWarmup = executor.warmupPrefill(rows);
       require(smallerWarmup.completed && smallerWarmup.estimatedPeakBytes > 0 &&
-                  smallerWarmup.wallSeconds >= executor.telemetry().lastPrefillWallSeconds &&
-                  smallerWarmup.wallSeconds > 0 && smallerWarmup.lanes.size() == 1 &&
+                  smallerWarmup.wallSeconds >=
+                      executor.telemetry().lastPrefillWallSeconds &&
+                  smallerWarmup.wallSeconds > 0 &&
+                  smallerWarmup.lanes.size() == 1 &&
                   smallerWarmup.lanes[0].step.consumedPromptTokens == rows &&
                   smallerWarmup.lanes[0].committedTokens == rows,
-              "parameterized warmup changed actual rows or omitted its measured result");
+              "parameterized warmup changed actual rows or omitted its "
+              "measured result");
       if (rows == 32) {
         const auto repeatedWarmup = executor.warmupPrefill(rows);
         require(repeatedWarmup.lanes == smallerWarmup.lanes,
-                "adjacent baseline prefill warmups changed their deterministic result");
+                "adjacent baseline prefill warmups changed their deterministic "
+                "result");
       }
     }
     model::WarmupStepResult prefillWarmup =
@@ -2342,13 +2369,15 @@ int main(int argc, char **argv) {
     require(prefillWarmup.completed && prefillWarmup.estimatedPeakBytes > 0 &&
                 prefillWarmup.wallSeconds > 0.0,
             "real prefill warmup did not report timing");
-    require(prefillWarmup.wallSeconds >= executor.telemetry().lastPrefillWallSeconds &&
+    require(prefillWarmup.wallSeconds >=
+                    executor.telemetry().lastPrefillWallSeconds &&
                 prefillWarmup.lanes.size() == 1 &&
                 prefillWarmup.lanes[0].step.consumedPromptTokens ==
                     model::ExecutionLimits::prefillTokenBudget &&
                 prefillWarmup.lanes[0].committedTokens ==
                     model::ExecutionLimits::prefillTokenBudget,
-            "prefill warmup omitted production wall time or its deterministic result");
+            "prefill warmup omitted production wall time or its deterministic "
+            "result");
     model::WarmupStepResult batch1 = executor.warmupDecodeBatch(1);
     model::WarmupStepResult batch2 = executor.warmupDecodeBatch(2);
     model::WarmupStepResult batch3 = executor.warmupDecodeBatch(3);

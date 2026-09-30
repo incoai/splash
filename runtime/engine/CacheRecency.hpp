@@ -2,10 +2,11 @@
 
 #include <cstdint>
 #include <limits>
+#include <optional>
 
 namespace splash::engine {
 
-// Shared monotonic access order for KV blocks and composite states.
+// Shared monotonic access order for KV blocks and group states.
 class CacheRecency final {
 public:
   [[nodiscard]] uint64_t next() noexcept {
@@ -21,6 +22,7 @@ private:
 struct CacheEvictionCandidate final {
   uint64_t id = 0;
   uint64_t lastUsed = 0;
+  std::optional<uint32_t> group{};
 };
 
 } // namespace splash::engine

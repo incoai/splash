@@ -1,7 +1,9 @@
 #pragma once
 
-#include "ops/Vision.hpp"
+#include "model/CacheGroups.hpp"
+
 #include "model/StateTransfer.hpp"
+#include "ops/Vision.hpp"
 
 #include <array>
 #include <atomic>
@@ -81,22 +83,35 @@ struct ImageSpan final {
   bool operator==(const ImageSpan &) const = default;
 };
 
-// Immutable target-recurrent plus draft-context state.  Concrete model
-// implementations own its buffers; the engine only pins and accounts it.
-class CompositeState {
+struct StateResource final {
+  const void *identity;
+  uint64_t bytes;
+};
+
+// An immutable payload for one model-defined cache group block. Concrete
+// implementations own its storage; the engine only pins and accounts it.
+class StatePayload {
 public:
-  virtual ~CompositeState() = default;
-  // Footprint retained by the cache. A cached state owns a private copy of
-  // the lane's state; dropping the reference returns that slot to the model's
-  // pool, and idle-state reclaim frees it.
+  virtual ~StatePayload() = default;
+  // Physical resources may be shared by several immutable snapshots.
+  [[nodiscard]] virtual std::vector<StateResource> resources() const {
+    return {{this, bytes()}};
+  }
+  // Logical footprint of this snapshot. resources() identifies shared backing
+  // for unique accounting; reclaimableBytes() excludes backing still in use.
   [[nodiscard]] virtual uint64_t bytes() const noexcept = 0;
   [[nodiscard]] virtual uint64_t residentBytes() const noexcept { return bytes(); }
+  [[nodiscard]] virtual uint64_t reclaimableBytes() const noexcept {
+    return residentBytes();
+  }
   [[nodiscard]] virtual bool canOffload() const noexcept { return false; }
   // Starts writing this state to the disk tier and returns the ticket that
   // carries its disk copy; the source is free as soon as the call returns.
   // A null ticket means that the disk quota cannot admit another state.
-  [[nodiscard]] virtual std::unique_ptr<StateOffload>
-  offload(std::function<void()>) const { return {}; }
+  [[nodiscard]] virtual std::unique_ptr<StateWrite<StatePayload>>
+  offload(std::function<void()>) const {
+    return {};
+  }
 };
 
 enum class DraftBoundaryPurpose : uint8_t { Active, Materialization };
@@ -117,6 +132,7 @@ struct DraftContextPlan final {
   uint32_t replayBegin = 0;
   uint32_t replayEnd = 0;
   std::optional<uint32_t> restoredDraftBoundary;
+  uint32_t oldWindowBegin = 0;
   std::vector<DraftCaptureSpan> captureSpans;
   std::vector<DraftBoundaryPlan> boundaries;
 
@@ -164,7 +180,8 @@ struct DispatchDraftCapturePlan final {
 [[nodiscard]] DraftContextPlan
 planDraftContext(uint32_t replayBegin, uint32_t replayEnd,
                  std::optional<uint32_t> restoredDraftBoundary,
-                 std::span<const uint32_t> materializationBoundaries);
+                 std::span<const uint32_t> materializationBoundaries,
+                 uint32_t availableBegin = 0);
 
 [[nodiscard]] DispatchDraftCapturePlan
 draftCaptureSpansForDispatch(const DraftContextPlan &plan,
@@ -310,11 +327,14 @@ struct StateAllocationTracker final {
 class StateStorage {
 public:
   virtual ~StateStorage() = default;
+  [[nodiscard]] virtual std::vector<CacheGroupSpec> cacheGroups() const {
+    return {{0}};
+  }
   [[nodiscard]] virtual uint64_t actualAllocatedBytes() const noexcept = 0;
   // Frees pooled idle buffers beyond the counts kept warm and returns the
   // bytes released. Active lanes and cached states are never touched.
   [[nodiscard]] virtual uint64_t releaseIdle(uint32_t keepCells,
-                                             uint32_t keepRings) noexcept = 0;
+                                             uint32_t keepPages) noexcept = 0;
 };
 
 // One slot of the disk tier holding a KV page; releasing the last handle
@@ -467,9 +487,17 @@ struct WarmupStepResult final {
   std::vector<WarmupLaneResult> lanes;
 };
 
+// Cache backing that can satisfy a model allocation through reuse.
+struct CacheAllocation final {
+  std::optional<CacheGroupId> group{};
+};
+
 class Model {
 public:
   virtual ~Model() = default;
+  [[nodiscard]] virtual std::vector<CacheGroupSpec> cacheGroups() const {
+    return {{0, CacheGroupKind::Checkpoint, 0}};
+  }
   virtual void checkHealth() {}
   [[nodiscard]] virtual bool needsHealthCheck() const noexcept { return false; }
   [[nodiscard]] virtual StateAdmission begin(const ModelRequest &request) = 0;
@@ -479,17 +507,39 @@ public:
   virtual void suspend(uint64_t requestId) = 0;
   [[nodiscard]] virtual StateAdmission resume(const ModelRequest &request) = 0;
   virtual void restore(uint64_t requestId, uint32_t restoredPrefixLength,
-                       std::shared_ptr<const CompositeState> state,
+                       std::shared_ptr<const RestoreState> state,
                        bool restoreDraftState) = 0;
+  // Allocation refusal may throw MetalAllocationError before starting IO or
+  // committing restored state. The engine can reclaim and retry with the same
+  // pinned payload, or release the lane and fall back to cold execution.
   [[nodiscard]] virtual std::unique_ptr<StateRestore>
   beginRestore(uint64_t requestId, uint32_t boundary,
-               std::shared_ptr<const CompositeState> state, bool restoreDraft,
-               std::function<void()>) {
-    restore(requestId, boundary, std::move(state), restoreDraft);
+               std::shared_ptr<const RestoreState> state,
+               const DraftContextPlan &plan, std::function<void()>) {
+    restore(requestId, boundary, std::move(state),
+            !plan.draftStateRestoreSkipped);
     return {};
+  }
+  [[nodiscard]] virtual DraftContextPlan
+  planDraftPrefill(uint32_t begin, uint32_t end,
+                   std::span<const uint32_t> boundaries,
+                   const RestoreState * = nullptr) const {
+    return planDraftContext(
+        begin, end, begin ? std::optional<uint32_t>(begin) : std::nullopt,
+        boundaries);
   }
   virtual void setDraftContextPlan(uint64_t requestId,
                                    DraftContextPlan plan) = 0;
+  // Admit copy-on-write execution backing before a batch starts. A refusal
+  // follows the engine's normal cache reclaim and suspension path.
+  [[nodiscard]] virtual metal::AllocationResult prepareStep(uint64_t, uint64_t,
+                                                            uint64_t) {
+    return true;
+  }
+  [[nodiscard]] virtual std::optional<CacheGroupId>
+  stepAllocationGroup(uint64_t) const {
+    return {};
+  }
   // Optional async wake hook; an immediately ready ticket need not call it.
   [[nodiscard]] virtual std::unique_ptr<ModelBatchTicket>
   submit(const BatchPlan &plan, std::span<const ModelBatchItem> items,
@@ -502,17 +552,21 @@ public:
   // boundary into a cache slot. Returns nullptr when no slot is free and the
   // governor denies a new one; the caller may release a cached state and
   // retry.
-  [[nodiscard]] virtual std::shared_ptr<const CompositeState>
+  [[nodiscard]] virtual std::shared_ptr<const RestoreState>
   snapshot(uint64_t requestId) = 0;
+  // The pool whose allocation failed during the last snapshot attempt.
+  [[nodiscard]] virtual CacheAllocation snapshotAllocation(uint64_t) const {
+    return {};
+  }
   // Whether the disk tier takes a state written from a lane: a tier exists
   // and its state file accepts writes. The quota is the write's own concern.
   [[nodiscard]] virtual bool canSnapshotToDisk() const noexcept { return false; }
-  // Writes the request's committed state at its current page-aligned
-  // boundary to the disk tier from the lane's own buffers, for a state no
-  // cache slot can hold; the ticket carries its disk copy. Null when the
-  // quota cannot admit another state: the caller may free quota and retry.
-  [[nodiscard]] virtual std::unique_ptr<StateOffload>
-  snapshotToDisk(uint64_t, std::function<void()>) { return {}; }
+  // Describe a direct snapshot before admission can displace cached data.
+  // An empty plan means no writable tier; consume the plan synchronously
+  // before executing the lane again. No cache-sized RAM copy is required.
+  [[nodiscard]] virtual SnapshotWritePlan prepareSnapshotToDisk(uint64_t) {
+    return {};
+  }
   // Releases one unit of idle model state (an unused buffer, then caches
   // that can be rebuilt) and returns its bytes; zero when nothing is idle.
   // A denied allocation retries between calls, so it frees only what it
@@ -528,7 +582,8 @@ class RuntimeModel : public Model {
 public:
   ~RuntimeModel() override = default;
 
-  // Actual rows, not padded dispatch rows; valid range is 1..prefillTokenBudget.
+  // Actual rows, not padded dispatch rows; valid range
+  // is 1..prefillTokenBudget.
   virtual WarmupStepResult warmupPrefill(uint32_t rows) = 0;
   virtual WarmupStepResult warmupDecodeBatch(uint32_t width) = 0;
   virtual WarmupStepResult warmupDraftVerifyCommit() = 0;

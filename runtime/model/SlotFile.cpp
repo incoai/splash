@@ -44,13 +44,17 @@ bool SlotFile::Operation::wait() {
   return success_;
 }
 
+std::shared_ptr<SlotFile> SlotFile::sibling(uint64_t slotBytes) const {
+  return std::make_shared<SlotFile>(slotBytes, backing_->budget, directory_);
+}
+
 SlotFile::SlotFile(uint64_t slotBytes, uint64_t capacityBytes,
                    const std::filesystem::path &directory)
     : SlotFile(slotBytes, std::make_shared<DiskBudget>(capacityBytes), directory) {}
 
 SlotFile::SlotFile(uint64_t slotBytes, std::shared_ptr<DiskBudget> budget,
                    const std::filesystem::path &directory)
-    : backing_(std::make_shared<Backing>()) {
+    : backing_(std::make_shared<Backing>()), directory_(directory) {
   if (!budget)
     throw std::invalid_argument("slot file needs a disk budget");
   const uint64_t capacityBytes = budget->capacityBytes();

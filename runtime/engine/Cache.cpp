@@ -13,6 +13,8 @@ Cache::Cache(KvPool &pool, CacheNamespace cacheNamespace, model::KvTier *kvTier,
       kv_(pool, cacheNamespace, recency_),
       states_(kv_, recency_), makeRoom_([this] { return freeDiskSpace(); }) {}
 
+Cache::~Cache() = default;
+
 void Cache::beginRequest(uint64_t requestId) {
   if (!requestId)
     throw std::invalid_argument("invalid request id");
@@ -28,12 +30,14 @@ void Cache::endRequest(uint64_t requestId) {
   Request &active = found->second;
   for (uint32_t page : active.pages)
     pool_.releasePage(page, false);
-  if (!active.cachedBlocks.empty())
+  if (!active.cachedBlocks.empty()) {
+    kv_.touch(active.cachedBlocks.back());
     kv_.releaseActive(active.cachedBlocks.back());
-  // Refresh used states within their class. Ordinary states remain newer
-  // than the finished KV tail; checkpoints retain their lower priority.
-  for (uint64_t block : active.cachedBlocks)
-    states_.touch(block);
+  }
+  // Record request use once, after leases stop affecting recency.
+  // Ordinary states remain newer than the finished KV tail; disposable
+  // checkpoints retain their lower priority.
+  states_.touch(active.cachedBlocks);
   if (active.pendingRestores) {
     for (auto &[_, restore] : restores_)
       std::erase(restore.waiters, requestId);
@@ -92,12 +96,7 @@ CacheProbe Cache::probe(std::span<const uint32_t> prompt,
   if (checkedBlocks)
     result.checkedTokens_.assign(
         prompt.begin(), prompt.begin() + checkedBlocks * KvCache::pageTokens);
-  for (size_t i = result.blocks_.size(); i > 0; --i) {
-    if (states_.contains(result.blocks_[i - 1])) {
-      result.cachedTokens_ = static_cast<uint32_t>(i * KvCache::pageTokens);
-      break;
-    }
-  }
+  result.cachedTokens_ = states_.matchedBoundary(result.blocks_, prompt.size());
   return result;
 }
 
@@ -128,9 +127,8 @@ CacheLookup Cache::lookup(std::span<const uint32_t> prompt,
     blocks = fallback;
   }
   if (!blocks.empty()) {
-    kv_.touch(blocks.back());
     result.kvBoundary = static_cast<uint32_t>(blocks.size() * KvCache::pageTokens);
-    result.state = states_.acquireDeepest(blocks);
+    result.state = states_.acquireDeepest(blocks, prompt.size());
   }
   const uint64_t stateBlock = result.state ? result.state->kvBlock() : 0;
   for (auto block = blocks.rbegin(); block != blocks.rend(); ++block) {
@@ -148,7 +146,7 @@ void Cache::recordLookup(const CacheLookup &result) {
   lookup_.kvHitTokens += result.kvBoundary;
   lookup_.stateHitTokens += result.resumeBoundary();
   states_.recordLookup(result.state.has_value(),
-                       result.state && !result.state->state()->residentBytes());
+                       result.state && !result.state->state()->resident());
   if (result.junctionBoundary())
     ++lookup_.lazyJunctions;
   if (result.lostState)
@@ -224,7 +222,7 @@ uint64_t Cache::blockAt(uint64_t requestId, uint32_t boundary) const {
   return active.cachedBlocks[index];
 }
 
-bool Cache::reuseCompositeState(uint64_t kvBlock, bool checkpoint) {
+bool Cache::reuseRestoreState(uint64_t kvBlock, bool checkpoint) {
   return states_.touchIfResident(kvBlock, checkpoint);
 }
 
@@ -232,17 +230,23 @@ bool Cache::reuseStoredState(uint64_t kvBlock, bool checkpoint) {
   return states_.touchIfStored(kvBlock, checkpoint);
 }
 
-void Cache::publishCompositeState(uint64_t kvBlock,
-                                  std::shared_ptr<const CompositeState> state,
-                                  bool checkpoint) {
+void Cache::publishRestoreState(uint64_t kvBlock,
+                                std::shared_ptr<const RestoreState> state,
+                                bool checkpoint) {
   states_.publish(kvBlock, std::move(state), checkpoint);
 }
 
-bool Cache::publishStateToDisk(uint64_t kvBlock, const StateWriter &write, bool checkpoint) {
-  return states_.publishToDisk(kvBlock, write, completionNotifier_, makeRoom_, checkpoint);
+bool Cache::publishStateToDisk(uint64_t kvBlock, const SnapshotWritePlan &plan,
+                               bool checkpoint) {
+  if (reuseStoredState(kvBlock, checkpoint))
+    return true;
+  if (!plan.source || !plan.write || states_.writing())
+    return false;
+  return states_.publishToDisk(kvBlock, plan.write, completionNotifier_,
+                               makeRoom_, checkpoint);
 }
 
-StateCheckpoint Cache::checkpointState(uint64_t kvBlock) const noexcept {
+StateCheckpoint Cache::checkpointState(uint64_t kvBlock) const {
   return states_.checkpoint(kvBlock);
 }
 
@@ -355,11 +359,12 @@ uint64_t Cache::reclaimCache(uint64_t targetBytes, bool evictAll,
   // whose copies are being written count the same way.
   if (releaseDeferred())
     return 0;
+  auto resume = keepResumePoint ? states_.acquireResumePoint() : std::nullopt;
   uint64_t released = reclaimEmptyExtents();
   auto needsMore = [&] { return !reclaimMet(released, targetBytes, evictAll); };
   while (needsMore() && !releaseDeferred()) {
     const CacheReclaimResult result =
-        reclaimOne(CacheReclaimMode::ReleaseBacking, keepResumePoint);
+        reclaimOne(CacheReclaimMode::ReleaseBacking);
     if (!result.madeProgress)
       break;
     released += result.reclaimedBytes;
@@ -369,6 +374,7 @@ uint64_t Cache::reclaimCache(uint64_t targetBytes, bool evictAll,
 
 CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode,
                                      bool keepResumePoint) {
+  auto resume = keepResumePoint ? states_.acquireResumePoint() : std::nullopt;
   if (mode == CacheReclaimMode::ReleaseBacking) {
     if (releaseDeferred())
       return {};
@@ -376,18 +382,18 @@ CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode,
       return {true, bytes};
   }
 
-  const auto reclaimState = [&](uint64_t block) {
-    const StateEviction eviction =
-        states_.reclaim(block, completionNotifier_, makeRoom_, true);
+  const auto reclaimState = [&](CacheEvictionCandidate candidate) {
+    const StateEviction eviction = states_.reclaim(
+        candidate.id, completionNotifier_, makeRoom_, candidate.group);
     if (!eviction.evicted && !eviction.pending)
       throw std::logic_error("state eviction candidate became pinned");
     return eviction;
   };
   // Disposable checkpoints go first; one whose write must wait for the one
   // in flight stays and holds back nothing else.
-  if (const auto oldest = states_.evictionCandidate(keepResumePoint);
-      oldest && states_.checkpoint(oldest->id)) {
-    if (const StateEviction eviction = reclaimState(oldest->id); eviction.evicted)
+  if (const auto oldest = states_.evictionCandidate();
+      oldest && states_.isCheckpoint(*oldest)) {
+    if (const StateEviction eviction = reclaimState(*oldest); eviction.evicted)
       return {true, eviction.reclaimedBytes};
   }
 
@@ -395,12 +401,12 @@ CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode,
   // the one in flight stays, as does a KV leaf the ring cannot take now; the
   // other kind may still give, and the next pass takes what waited.
   std::optional<CacheEvictionCandidate> state =
-      states_.evictionCandidate(keepResumePoint, false);
+      states_.evictionCandidate(false);
   std::optional<CacheEvictionCandidate> kv = oldestKvLeaf(0);
   bool kvOpen = true;
   while (state || (kvOpen && kv)) {
     if (state && (!kvOpen || !kv || state->lastUsed <= kv->lastUsed)) {
-      if (const StateEviction eviction = reclaimState(state->id); eviction.evicted)
+      if (const StateEviction eviction = reclaimState(*state); eviction.evicted)
         return {true, eviction.reclaimedBytes};
       state.reset();
       continue;
@@ -421,11 +427,14 @@ CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode,
   return {false, 0, transfersInFlight()};
 }
 
-bool Cache::reclaimOneState(bool checkpointsOnly) {
-  const std::optional<CacheEvictionCandidate> state =
-      states_.evictionCandidate();
-  return state && (!checkpointsOnly || states_.checkpoint(state->id)) &&
-         states_.reclaim(state->id, completionNotifier_, makeRoom_).evicted;
+CacheReclaimResult Cache::reclaimOneState(std::optional<CacheGroupId> group) {
+  const auto state =
+      group ? states_.groupCandidate(*group) : states_.evictionCandidate();
+  if (!state)
+    return {};
+  const auto eviction =
+      states_.reclaim(state->id, completionNotifier_, makeRoom_, state->group);
+  return {eviction.evicted, eviction.reclaimedBytes, eviction.pending};
 }
 
 std::optional<CacheEvictionCandidate> Cache::oldestKvLeaf(uint64_t after) const {
@@ -446,9 +455,11 @@ Cache::LeafReclaim Cache::reclaimKvLeaf(uint64_t block) {
   // then.
   if (states_.resident(block) && (kv_.slot(block) || kvTierWritable())) {
     const StateEviction eviction =
-        states_.reclaim(block, completionNotifier_, makeRoom_, true);
+        states_.reclaim(block, completionNotifier_, makeRoom_);
     if (!eviction.evicted)
       return eviction.pending ? LeafReclaim::Pending : LeafReclaim::Impossible;
+    if (states_.resident(block))
+      return LeafReclaim::Started;
   }
   if (kv_.slot(block)) {
     kv_.dropPage(block);
@@ -636,18 +647,11 @@ void Cache::promoteState(const CacheLookup &lookup, StateRestore &transfer) {
   const auto block = lookup.state->kvBlock();
   const auto *source = lookup.state->state().get();
   if (!states_.promotable(block, source)) return;
-  // Promotion is optional and uses the ordinary snapshot admission/reclaimer.
+  // Promotion is optional. A partial restore has no complete snapshot; neither
+  // it nor a denied copy justifies reclaiming an unspecified model group.
   // The admitted request can run even when no cache buffer is available.
   try {
     auto state = transfer.snapshot();
-    if (!state) {
-      // The restored state is the most recently used one; the oldest RAM
-      // copy makes room for it unless its write has to wait.
-      const auto victim = states_.evictionCandidate();
-      if (victim &&
-          states_.reclaim(victim->id, completionNotifier_, makeRoom_, true).evicted)
-        state = transfer.snapshot();
-    }
     if (state) states_.promote(block, source, std::move(state));
     else states_.promotionSkipped();
   } catch (const std::exception &) {
@@ -697,12 +701,12 @@ bool Cache::freeDiskSpace() {
                         const std::optional<CacheEvictionCandidate> &right) {
     return left && (!right || left->lastUsed < right->lastUsed);
   };
-  // A redundant copy loses nothing: its data stays in RAM.
+  // A redundant temporary copy loses nothing: its data stays in RAM.
   const auto kvDuplicate = kv_.diskCandidate(true);
   const auto stateDuplicate = states_.diskCandidate(true);
   if (kvDuplicate || stateDuplicate) {
     if (older(stateDuplicate, kvDuplicate))
-      states_.dropDisk(stateDuplicate->id);
+      states_.dropDisk(stateDuplicate->id, stateDuplicate->group);
     else
       kv_.setSlot(kvDuplicate->id, nullptr);
     return true;
@@ -717,7 +721,7 @@ bool Cache::freeDiskSpace() {
   if (!kvLeaf && !stateOnly)
     return false;
   if (older(stateOnly, kvLeaf)) {
-    static_cast<void>(states_.evict(stateOnly->id));
+    states_.evictDiskOnly(stateOnly->id, stateOnly->group);
     return true;
   }
   static_cast<void>(states_.evict(kvLeaf->id));

@@ -498,7 +498,7 @@ void evictAllCache(engine::Cache &resources) {
   }
 }
 
-void evictAllCompositeState(engine::Cache &resources) {
+void evictAllRestoreState(engine::Cache &resources) {
   const auto deadline = std::chrono::steady_clock::now() + kDrainDeadline;
   while (resources.snapshot().stateCache.entries) {
     awaitDeferredRelease(resources, deadline);
@@ -525,7 +525,7 @@ runDecodeThroughput(engine::Engine &engine, Driver &driver,
     progress->begin("decode_throughput", "decode", sample, tokens.size(), width);
 
   // The lanes share one prompt. The first request to reach a Page32 boundary
-  // publishes the composite state there and splits its prefill around it, so
+  // publishes the restore state there and splits its prefill around it, so
   // it would start decoding one command after the deduplicated lanes. Warm
   // the prefix with a one-token request; every lane then resumes from the
   // published prefix in a single packed prefill and decodes in lockstep.
@@ -1194,7 +1194,7 @@ int main(int argc, char **argv) {
       Measurement lazySeed =
           runRequest(engine, driver, *executor, events, progress.get(),
                      requestId++, "lazy_seed", 0, lazyPrompt);
-      evictAllCompositeState(resources->cache());
+      evictAllRestoreState(resources->cache());
       Measurement lazyMaterialize =
           runRequest(engine, driver, *executor, events, progress.get(),
                      requestId++, "lazy_materialize", 0, lazyPrompt);

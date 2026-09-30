@@ -24,7 +24,7 @@ struct DraftAttentionShape final {
 
 // These configurations vary the surrounding convolution, QKV preparation and
 // reorder phases. The compiled attention core stays M32/N128/D128 with eight
-// query rows, 256 threads, a fixed number of ring splits per KV head and the
+// query rows, 256 threads, a fixed number of window splits per KV head and the
 // semantic 2048 window.
 struct DraftAttentionConfiguration final {
   // Zero uses the full element/task grid. Nonzero selects a persistent group
@@ -87,10 +87,15 @@ struct DraftPrepareBuffers final {
   metal::MetalBuffer queryValues;
 };
 
+// One layer of fixed-size pages: K is [head, token, dimension],
+// V is [head, dimension, token], adjacent within each page.
+struct DraftKvBuffers final {
+  std::vector<metal::MetalBuffer> keyPages{}, valuePages{};
+};
+
 struct DraftDecodeAttentionBuffers final {
   metal::MetalBuffer groupedQueries;
-  std::span<const metal::MetalBuffer> persistentKeys;
-  std::span<const metal::MetalBuffer> persistentValues;
+  std::span<const DraftKvBuffers> context;
   metal::MetalBuffer queryKeys;
   metal::MetalBuffer queryValues;
 };
@@ -127,18 +132,16 @@ public:
                          metal::MetalBuffer grouped,
                          metal::MetalBuffer packed,
                          const DraftAttentionPlan &plan);
-  static void addContextPrefill(
-      metal::CommandGraph &graph, metal::MetalBuffer contextQkv,
-      metal::MetalBuffer keyNorm, metal::MetalBuffer ropeCos,
-      metal::MetalBuffer ropeSin, metal::MetalBuffer keys,
-      metal::MetalBuffer values, uint32_t tokens, uint32_t cacheStride,
-      uint32_t startPosition, DraftAttentionShape shape);
+  static void
+  addContextPrefill(metal::CommandGraph &graph, metal::MetalBuffer contextQkv,
+                    metal::MetalBuffer keyNorm, metal::MetalBuffer ropeCos,
+                    metal::MetalBuffer ropeSin, const DraftKvBuffers &context,
+                    uint32_t tokens, uint32_t cacheStride,
+                    uint32_t startPosition, DraftAttentionShape shape);
   static void addContextCommit(
       metal::CommandGraph &graph, metal::MetalBuffer contextQkv,
       metal::MetalBuffer keyNorm, metal::MetalBuffer ropeCos,
-      metal::MetalBuffer ropeSin,
-      std::span<const metal::MetalBuffer> persistentKeys,
-      std::span<const metal::MetalBuffer> persistentValues,
+      metal::MetalBuffer ropeSin, std::span<const DraftKvBuffers> context,
       metal::MetalBuffer retainedCounts,
       std::span<const uint32_t> startPositions, uint32_t cacheStride,
       DraftAttentionShape shape, uint32_t lanes);

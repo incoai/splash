@@ -247,6 +247,10 @@ ENGINE_CPP_SOURCES := \
 	runtime/engine/KvPool.cpp \
 	runtime/engine/KvCache.cpp \
 	runtime/engine/StateCache.cpp \
+	runtime/engine/StateGroupCache.cpp \
+	runtime/engine/CacheGroupCoordinator.cpp \
+	runtime/model/CacheGroups.cpp \
+	runtime/model/WindowPlan.cpp \
 	runtime/model/DraftContextPlan.cpp \
 	runtime/engine/Protocol.cpp \
 	runtime/engine/NativeRuntime.cpp \
@@ -273,6 +277,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/ModelFactory.cpp \
 	runtime/model/SlotFile.cpp \
 	runtime/model/KvPageTier.cpp \
+	runtime/model/DraftKvCache.cpp \
 	runtime/model/QwenState.cpp
 ENGINE_MM_SOURCES := \
 	runtime/model/SafetensorsCheckpoint.mm \

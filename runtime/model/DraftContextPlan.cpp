@@ -1,4 +1,5 @@
 #include "model/Model.hpp"
+#include "model/WindowPlan.hpp"
 
 #include <algorithm>
 #include <stdexcept>
@@ -7,7 +8,8 @@ namespace splash {
 DraftContextPlan
 planDraftContext(uint32_t replayBegin, uint32_t replayEnd,
                  std::optional<uint32_t> restoredDraftBoundary,
-                 std::span<const uint32_t> materializationBoundaries) {
+                 std::span<const uint32_t> materializationBoundaries,
+                 uint32_t availableBegin) {
   if (replayEnd < replayBegin) {
     throw std::invalid_argument("draft replay range is reversed");
   }
@@ -16,90 +18,40 @@ planDraftContext(uint32_t replayBegin, uint32_t replayEnd,
         "restored draft state must coincide with the replay boundary");
   }
   if (!restoredDraftBoundary && replayBegin != 0) {
-    throw std::invalid_argument(
-        "nonzero replay requires a restored composite state");
+    throw std::invalid_argument("nonzero replay requires a restored state");
   }
 
-  uint32_t previousMaterialization = 0;
-  bool havePreviousMaterialization = false;
-  for (uint32_t boundary : materializationBoundaries) {
-    if (boundary <= replayBegin || boundary > replayEnd) {
-      throw std::invalid_argument(
-          "draft materialization boundary is outside replay range");
-    }
-    if (havePreviousMaterialization && boundary <= previousMaterialization) {
-      throw std::invalid_argument(
-          "draft materialization boundaries are not sorted and unique");
-    }
-    previousMaterialization = boundary;
-    havePreviousMaterialization = true;
-  }
-
+  const auto window = planWindow(replayBegin, replayEnd,
+                                 model::ExecutionLimits::draftContextTokens,
+                                 availableBegin, materializationBoundaries);
+  if (!window.usable)
+    throw std::invalid_argument("restored window cannot reach prompt end");
   DraftContextPlan result;
   result.replayBegin = replayBegin;
   result.replayEnd = replayEnd;
   result.restoredDraftBoundary = restoredDraftBoundary;
+  result.oldWindowBegin = window.loadBegin;
   result.targetPrefillRows = replayEnd - replayBegin;
-
-  constexpr uint32_t window = model::ExecutionLimits::draftContextTokens;
-  uint32_t stateBoundary = restoredDraftBoundary.value_or(0);
-  bool haveState = restoredDraftBoundary.has_value();
-
-  const auto addBoundary = [&](uint32_t boundary,
-                               DraftBoundaryPurpose purpose) {
-    const uint32_t distance = boundary - stateBoundary;
-    const bool useRestored = haveState && distance == 0;
-    uint32_t captureBegin = boundary;
-
-    if (!useRestored) {
-      const bool continueState = haveState && distance < window;
-      captureBegin =
-          continueState ? stateBoundary : boundary - std::min(boundary, window);
-      const uint32_t rows = boundary - captureBegin;
-
-      if (rows != 0 && !result.captureSpans.empty() && continueState &&
-          result.captureSpans.back().end ==
-              captureBegin) {
-        result.captureSpans.back().end = boundary;
-      } else if (rows != 0) {
-        result.captureSpans.push_back({captureBegin, boundary, !continueState});
-        if (!continueState)
-          ++result.draftStateResets;
-      }
-
-      if (purpose == DraftBoundaryPurpose::Active) {
-        result.draftContextRowsActive += rows;
-      } else {
-        result.draftContextRowsMaterialization += rows;
-      }
-    }
-
-    result.boundaries.push_back({boundary, purpose, captureBegin});
-    stateBoundary = boundary;
-    haveState = true;
-  };
-
-  // A cache state at prompt end is the active state itself; do not describe or
-  // build the same physical state twice.
-  for (uint32_t boundary : materializationBoundaries) {
-    if (boundary < replayEnd)
-      addBoundary(boundary, DraftBoundaryPurpose::Materialization);
+  result.draftStateRestoreSkipped =
+      replayBegin && window.loadBegin == replayBegin;
+  for (const auto &capture : window.captures) {
+    result.captureSpans.push_back({capture.begin, capture.end, capture.reset});
+    result.draftStateResets += capture.reset;
   }
-  addBoundary(replayEnd, DraftBoundaryPurpose::Active);
-
-  const uint64_t contextRows = result.draftContextRows();
-  result.draftContextRowsAvoided = result.targetPrefillRows > contextRows
-                                       ? result.targetPrefillRows - contextRows
-                                       : 0;
-  const uint32_t firstBoundary =
-      !materializationBoundaries.empty() &&
-              materializationBoundaries.front() < replayEnd
-          ? materializationBoundaries.front()
-          : replayEnd;
-  if (restoredDraftBoundary &&
-      firstBoundary - *restoredDraftBoundary >= window) {
-    result.draftStateRestoreSkipped = 1;
+  for (const auto &boundary : window.boundaries) {
+    const bool active = boundary.tokens == replayEnd;
+    result.boundaries.push_back({boundary.tokens,
+                                 active ? DraftBoundaryPurpose::Active
+                                        : DraftBoundaryPurpose::Materialization,
+                                 boundary.captureBegin});
+    (active ? result.draftContextRowsActive
+            : result.draftContextRowsMaterialization) +=
+        boundary.tokens - boundary.captureBegin;
   }
+  result.draftContextRowsAvoided =
+      result.targetPrefillRows > result.draftContextRows()
+          ? result.targetPrefillRows - result.draftContextRows()
+          : 0;
   return result;
 }
 

@@ -39,12 +39,12 @@ uint64_t expectedBytes(DraftAttentionShape shape, uint32_t lanes) {
   const uint64_t grouped = rowsBytes + uint64_t{lanes} * shape.kvHeads * 4 * 16640;
   const uint64_t query = rows * shape.kvHeads * shape.headDimension * 2;
   const uint64_t rope = rows * shape.headDimension / 2 * 4;
-  const uint64_t ring = uint64_t{lanes} * shape.kvHeads * 2048 * shape.headDimension * 2;
+  const uint64_t window = uint64_t{lanes} * shape.kvHeads * 2048 * shape.headDimension * 2;
   const uint64_t reference = 2 * (4 * convolution + qkv + 2 * rowsBytes + 2 * query);
   return 8 * align(convolution) + 2 * align(dynamic) + 2 * align(weights) +
          2 * align(qkv) + align(grouped) + align(rowsBytes) + 2 * align(query) +
          2 * align(uint64_t{shape.headDimension} * 2) + 2 * align(rope) +
-         2 * align(ring) + align(reference);
+         2 * align(window) + align(reference);
 }
 
 void cpuTests() {
@@ -54,7 +54,7 @@ void cpuTests() {
       require(bytes == expectedBytes(shape, lanes) && bytes % 16384 == 0,
               "draft fixture admission differs from exact tensor/reference bound");
       require(bytes < 64ULL * 1024 * 1024,
-              "draft tuning fixture unexpectedly duplicated its ring histories");
+              "draft tuning fixture unexpectedly duplicated its window histories");
     }
     rejects([&] { (void)draftAttentionTuningFixtureBytes({shape, 0}); });
     rejects([&] { (void)draftAttentionTuningFixtureBytes({shape, 5}); });

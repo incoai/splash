@@ -3,8 +3,8 @@
 #include "engine/StartupLog.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 
-#import <Foundation/Foundation.h>
 #include <CommonCrypto/CommonDigest.h>
+#import <Foundation/Foundation.h>
 
 #include <array>
 #include <limits>
@@ -472,7 +472,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
     // disk KV cannot preserve a restorable prefix, so the tier stays off.
     std::shared_ptr<model::DiskBudget> diskBudget;
     std::shared_ptr<model::SlotFile> stateFile;
-    const uint64_t stateBytes = package.stateLayout().cachedBytes();
+    const uint64_t stateBytes = package.stateLayout().target.cellBytes();
     if (config.maximumCacheDiskBytes) {
       diskBudget = std::make_shared<model::DiskBudget>(config.maximumCacheDiskBytes);
       try {

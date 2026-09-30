@@ -1,11 +1,11 @@
 #pragma once
 
-#include "ops/Vision.hpp"
 #include "engine/Cache.hpp"
 #include "engine/MemoryGovernor.hpp"
 #include "engine/Scheduler.hpp"
 #include "engine/Types.hpp"
 #include "ops/PagedKv.hpp"
+#include "ops/Vision.hpp"
 
 #include <cstdint>
 #include <functional>
@@ -68,8 +68,8 @@ struct EngineSnapshot final {
   uint64_t resourceReplayTokens = 0;
 };
 
-// KV blocks define prefix identity; composite recurrent state is attached
-// at sparse progress points, replay boundaries, and shared KV junctions.
+// KV blocks define prefix identity. Model-declared groups provide the
+// additional checkpoint or window coverage required at a restore boundary.
 class Engine final {
 public:
   Engine(EngineConfig config, Cache &cache, model::Model &model,
@@ -206,10 +206,12 @@ private:
   [[nodiscard]] bool pollRestores(double nowMilliseconds);
   [[nodiscard]] DraftContextPlan
   configureDraftStatePlan(Request &request, uint32_t stateBoundary,
-                          uint32_t junctionBoundary);
+                          uint32_t junctionBoundary,
+                          const RestoreState *restored = nullptr);
   [[nodiscard]] bool addSharedPrefillBoundaries(Request &request, uint32_t after);
   [[nodiscard]] DraftContextPlan
-  pendingDraftStatePlan(const Request &request, uint32_t stateBoundary) const;
+  pendingDraftStatePlan(const Request &request, uint32_t stateBoundary,
+                        const RestoreState *restored = nullptr) const;
   void armNextStateBoundary(Request &request);
   void discardPendingStateBoundaries(Request &request) noexcept;
   [[nodiscard]] bool retireCheckpoint(Request &request);
@@ -248,7 +250,8 @@ private:
   [[nodiscard]] bool anotherResident(uint64_t requestId) const;
   // Runs one page admission, reclaiming cache between attempts while that
   // makes progress.
-  [[nodiscard]] KvAdmission admitKv(const std::function<TokenAdmission()> &attempt);
+  [[nodiscard]] KvAdmission
+  admitGrowth(const std::function<TokenAdmission()> &attempt);
   [[nodiscard]] bool budgetMayRecover(metal::AllocationFailure failure,
                                       uint64_t generation, bool reclaimed) const;
   void suspendForGrowth(Request &request, uint64_t workEnd,

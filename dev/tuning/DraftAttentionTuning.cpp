@@ -1,5 +1,6 @@
 #include "tuning/DraftAttentionTuning.hpp"
 
+#include "metal/abi/DraftAttention.h"
 #include "tuning/LinearNumerics.hpp"
 
 #include <algorithm>
@@ -21,10 +22,31 @@ constexpr std::array<std::array<uint32_t, kLanes>, 2> histories{{
     {0, 31, 128, 511}, {2100, 4094, 6143, 8193}}};
 
 enum class Tensor : size_t {
-  Input0, Input1, Dynamic0, Dynamic1, Weights0, Weights1, Residual0,
-  Residual1, Convolution0, Convolution1, Convolution2, Convolution3,
-  Qkv, QkvOriginal, Grouped, QueryKeys, QueryValues, Packed, QueryNorm,
-  KeyNorm, RopeCos, RopeSin, RingKeys, RingValues, Reference, Count
+  Input0,
+  Input1,
+  Dynamic0,
+  Dynamic1,
+  Weights0,
+  Weights1,
+  Residual0,
+  Residual1,
+  Convolution0,
+  Convolution1,
+  Convolution2,
+  Convolution3,
+  Qkv,
+  QkvOriginal,
+  Grouped,
+  QueryKeys,
+  QueryValues,
+  Packed,
+  QueryNorm,
+  KeyNorm,
+  RopeCos,
+  RopeSin,
+  ContextPages,
+  Reference,
+  Count
 };
 constexpr size_t index(Tensor tensor) { return static_cast<size_t>(tensor); }
 constexpr std::array outputs{
@@ -42,7 +64,7 @@ struct FixturePlan final {
   DraftAttentionWorkload workload;
   std::array<uint64_t, index(Tensor::Count)> sizes{};
   uint64_t queryRowBytes = 0;
-  uint64_t ringBytes = 0;
+  uint64_t windowBytes = 0;
   uint64_t referenceBytes = 0;
   uint64_t bytes = 0;
 
@@ -75,8 +97,9 @@ struct FixturePlan final {
         uint64_t{w.shape.headDimension} * 2;
     sizes[index(Tensor::RopeCos)] = sizes[index(Tensor::RopeSin)] =
         rows * (w.shape.headDimension / 2) * sizeof(float);
-    ringBytes = uint64_t{w.shape.kvHeads} * kWindow * w.shape.headDimension * 2;
-    sizes[index(Tensor::RingKeys)] = sizes[index(Tensor::RingValues)] = ringBytes * w.lanes;
+    windowBytes =
+        uint64_t{w.shape.kvHeads} * kWindow * w.shape.headDimension * 2;
+    sizes[index(Tensor::ContextPages)] = 2 * windowBytes * w.lanes;
     for (auto tensor : outputs) referenceBytes += qualifiedBytes(tensor);
     sizes[index(Tensor::Reference)] = referenceBytes * required.size();
     for (uint64_t size : sizes) {
@@ -103,22 +126,27 @@ public:
       buffers_[i] = backend.view(base_, offset, plan_.sizes[i]);
       offset += aligned(plan_.sizes[i]);
     }
+    const uint64_t pageBytes = plan_.windowBytes / SPLASH_DRAFT_PAGE_COUNT;
     for (uint32_t lane = 0; lane < plan_.workload.lanes; ++lane) {
-      keys_[lane] = backend.view(get(Tensor::RingKeys), lane * plan_.ringBytes, plan_.ringBytes);
-      values_[lane] = backend.view(get(Tensor::RingValues), lane * plan_.ringBytes, plan_.ringBytes);
+      for (uint32_t page = 0; page < SPLASH_DRAFT_PAGE_COUNT; ++page) {
+        const uint64_t offset =
+            2 * (lane * plan_.windowBytes + page * pageBytes);
+        context_[lane].keyPages.push_back(
+            backend.view(get(Tensor::ContextPages), offset, pageBytes));
+        context_[lane].valuePages.push_back(backend.view(
+            get(Tensor::ContextPages), offset + pageBytes, pageBytes));
+      }
     }
-    for (uint32_t lane = plan_.workload.lanes; lane < kLanes; ++lane) {
-      keys_[lane] = keys_[0];
-      values_[lane] = values_[0];
-    }
+    for (uint32_t lane = plan_.workload.lanes; lane < kLanes; ++lane)
+      context_[lane] = context_[0];
   }
 
   bool initialize(const MeasurementStop &stop) {
     std::memset(base_.contents(), 0, plan_.bytes);
-    for (Tensor tensor : {Tensor::Input0, Tensor::Input1, Tensor::Dynamic0,
-                           Tensor::Dynamic1, Tensor::Weights0, Tensor::Weights1,
-                           Tensor::Residual0, Tensor::Residual1, Tensor::QkvOriginal,
-                           Tensor::RingKeys, Tensor::RingValues}) {
+    for (Tensor tensor :
+         {Tensor::Input0, Tensor::Input1, Tensor::Dynamic0, Tensor::Dynamic1,
+          Tensor::Weights0, Tensor::Weights1, Tensor::Residual0,
+          Tensor::Residual1, Tensor::QkvOriginal, Tensor::ContextPages}) {
       const auto buffer = get(tensor);
       auto *data = static_cast<uint16_t *>(buffer.contents());
       const uint64_t elements = buffer.sizeBytes() / 2;
@@ -169,8 +197,10 @@ public:
          get(Tensor::KeyNorm), get(Tensor::RopeCos), get(Tensor::RopeSin),
          get(Tensor::QueryKeys), get(Tensor::QueryValues)}, plan);
     DraftAttention::addDecode(graph,
-        {get(Tensor::Grouped), keys_, values_, get(Tensor::QueryKeys),
-         get(Tensor::QueryValues)}, histories[history], kWindow, plan);
+                              {get(Tensor::Grouped), context_,
+                               get(Tensor::QueryKeys),
+                               get(Tensor::QueryValues)},
+                              histories[history], kWindow, plan);
     DraftAttention::addReorder(graph, get(Tensor::Grouped), get(Tensor::Packed), plan);
     convolution(Tensor::Input1, Tensor::Dynamic0, Tensor::Weights0, Tensor::Residual0,
                   Tensor::Convolution1, DraftConvolutionStage::Residual);
@@ -207,7 +237,7 @@ private:
   FixturePlan plan_;
   metal::MetalBuffer base_;
   std::array<metal::MetalBuffer, index(Tensor::Count)> buffers_{};
-  std::array<metal::MetalBuffer, kLanes> keys_{}, values_{};
+  std::array<DraftKvBuffers, kLanes> context_{};
   std::array<bool, required.size()> haveReference_{};
 };
 } // namespace

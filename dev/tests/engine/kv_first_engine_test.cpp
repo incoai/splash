@@ -1,6 +1,7 @@
 #include "TestImmediateTicket.hpp"
 #include "TestKvPool.hpp"
 #include "TestKvTier.hpp"
+#include "TestStateSnapshot.hpp"
 #include "engine/Engine.hpp"
 
 #include <algorithm>
@@ -64,12 +65,16 @@ private:
   std::vector<bool> resident_;
 };
 
-class State final : public CompositeState {
+class State final : public StatePayload {
 public:
-  uint64_t bytes() const noexcept override { return 64; }
+  explicit State(uint64_t size = 64) : size_(size) {}
+  uint64_t bytes() const noexcept override { return size_; }
+
+private:
+  uint64_t size_;
 };
 
-class DiskState final : public CompositeState {
+class DiskState final : public StatePayload {
 public:
   uint64_t bytes() const noexcept override { return 64; }
   uint64_t residentBytes() const noexcept override { return 0; }
@@ -81,29 +86,32 @@ struct OffloadControl {
 };
 
 // A state write in flight; its disk copy is a DiskState.
-class OffloadTicket final : public StateOffload {
+class OffloadTicket final : public StateWrite<StatePayload> {
 public:
   explicit OffloadTicket(std::shared_ptr<OffloadControl> control)
       : control_(std::move(control)) {}
   bool ready() const noexcept override { return control_->ready; }
   bool finish() override { return true; }
-  const std::shared_ptr<const CompositeState> &state() const noexcept override {
+  const std::shared_ptr<const StatePayload> &state() const noexcept override {
     return disk_;
   }
+
 private:
   std::shared_ptr<OffloadControl> control_;
-  std::shared_ptr<const CompositeState> disk_ = std::make_shared<DiskState>();
+  std::shared_ptr<const StatePayload> disk_ = std::make_shared<DiskState>();
 };
 
-class OffloadState final : public CompositeState {
+class OffloadState final : public StatePayload {
 public:
   explicit OffloadState(std::shared_ptr<OffloadControl> control) : control_(std::move(control)) {}
   ~OffloadState() override { control_->released = true; }
   uint64_t bytes() const noexcept override { return 64; }
   bool canOffload() const noexcept override { return true; }
-  std::unique_ptr<StateOffload> offload(std::function<void()>) const override {
+  std::unique_ptr<StateWrite<StatePayload>>
+  offload(std::function<void()>) const override {
     return std::make_unique<OffloadTicket>(control_);
   }
+
 private:
   std::shared_ptr<OffloadControl> control_;
 };
@@ -118,6 +126,7 @@ struct RestoreControl {
 
 class RestoreTicket final : public StateRestore {
 public:
+  uint32_t boundary = 0;
   std::shared_ptr<RestoreControl> control;
   std::function<void()> commit;
   bool ready() const noexcept override { return control->ready; }
@@ -127,10 +136,10 @@ public:
     return true;
   }
   void cancel() noexcept override { control->cancelled = true; }
-  std::shared_ptr<const CompositeState> snapshot() override {
+  std::shared_ptr<const RestoreState> snapshot() override {
     if (control->promotionDenied)
       return nullptr;
-    return std::make_shared<State>();
+    return test::checkpoint(boundary, std::make_shared<State>());
   }
 };
 
@@ -192,6 +201,8 @@ private:
 
 class Executor final : public model::Model {
 public:
+  std::vector<CacheGroupSpec> groups{{0}};
+  std::vector<CacheGroupSpec> cacheGroups() const override { return groups; }
   explicit Executor(
       uint32_t maximumCells = model::ExecutionLimits::maximumBatchWidth)
       : maximumCells(maximumCells) {}
@@ -217,6 +228,15 @@ public:
       }
     }
     return {{}, StateFailure::ConcurrencyLimit};
+  }
+  metal::AllocationResult prepareStep(uint64_t id, uint64_t begin,
+                                      uint64_t end) override {
+    ++stepAttempts;
+    return stepAdmission ? stepAdmission(id, begin, end)
+                         : metal::AllocationResult{true};
+  }
+  std::optional<CacheGroupId> stepAllocationGroup(uint64_t) const override {
+    return stepGroup;
   }
   void suspend(uint64_t id) override {
     Request &entry = requests.at(id);
@@ -253,7 +273,7 @@ public:
     return {{}, StateFailure::ConcurrencyLimit};
   }
   void restore(uint64_t id, uint32_t length,
-               std::shared_ptr<const CompositeState> state,
+               std::shared_ptr<const RestoreState> state,
                bool restoreDraftState) override {
     if (!state)
       throw std::runtime_error("empty restore state");
@@ -263,16 +283,24 @@ public:
     restored += length;
     restoredDraft = restoreDraftState;
   }
-  std::unique_ptr<StateRestore> beginRestore(
-      uint64_t id, uint32_t length, std::shared_ptr<const CompositeState> state,
-      bool restoreDraft, std::function<void()>) override {
-    if (state->residentBytes()) {
+  std::unique_ptr<StateRestore>
+  beginRestore(uint64_t id, uint32_t length,
+               std::shared_ptr<const RestoreState> state,
+               const DraftContextPlan &plan, std::function<void()>) override {
+    const bool restoreDraft = !plan.draftStateRestoreSkipped;
+    if (deniedRestores) {
+      --deniedRestores;
+      throw metal::MetalAllocationError("injected restore capacity refusal",
+                                        restoreAllocationFailure);
+    }
+    if (state->resident()) {
       restore(id, length, std::move(state), restoreDraft);
       return {};
     }
     ++diskReads;
     auto ticket = std::make_unique<RestoreTicket>();
     ticket->control = restoreControl;
+    ticket->boundary = length;
     ticket->commit = [this, id, length, state, restoreDraft] {
       restore(id, length, state, restoreDraft);
     };
@@ -369,7 +397,7 @@ public:
   // current page-aligned boundary and returns nullptr when no slot is free
   // and the governor denies a new one. The fake denies the next
   // `deniedSnapshots` calls, or every call made at `denySnapshotAtBoundary`.
-  std::shared_ptr<const CompositeState> snapshot(uint64_t id) override {
+  std::shared_ptr<const RestoreState> snapshot(uint64_t id) override {
     ++snapshotAttempts;
     if (snapshotObserver)
       snapshotObserver();
@@ -382,15 +410,24 @@ public:
       return nullptr;
     }
     ++snapshots;
-    return std::make_shared<State>();
+    return test::checkpoint(requests.at(id).position,
+                            std::make_shared<State>(snapshotBytes));
+  }
+  model::CacheAllocation snapshotAllocation(uint64_t) const override {
+    return {snapshotGroup};
   }
   // Without a cache slot the production model writes the lane's state to
   // the disk tier; the fake has one when `stateTier` is set, with quota for
   // every state.
   bool canSnapshotToDisk() const noexcept override { return stateTier != nullptr; }
-  std::unique_ptr<StateOffload> snapshotToDisk(uint64_t, std::function<void()>) override {
-    ++diskSnapshots;
-    return std::make_unique<OffloadTicket>(stateTier);
+  SnapshotWritePlan prepareSnapshotToDisk(uint64_t id) override {
+    const auto boundary = requests.at(id).position;
+    return {test::checkpoint(boundary, std::make_shared<State>(snapshotBytes)),
+            [this, boundary](std::function<void()>) {
+              ++diskSnapshots;
+              return std::make_unique<test::SnapshotWrite>(
+                  boundary, std::make_unique<OffloadTicket>(stateTier));
+            }};
   }
   uint64_t reclaimIdleState() noexcept override {
     const uint64_t released = reclaimableIdleStateBytes;
@@ -433,11 +470,20 @@ public:
   uint32_t prefillRows = 0;
   uint32_t restored = 0;
   uint32_t snapshots = 0;
+  uint64_t snapshotBytes = 64;
+  std::optional<CacheGroupId> snapshotGroup{0};
+  std::optional<CacheGroupId> stepGroup{};
   uint32_t snapshotAttempts = 0;
   uint32_t diskSnapshots = 0;
   std::shared_ptr<OffloadControl> stateTier;
   uint32_t deniedSnapshots = 0;
+  uint32_t deniedRestores = 0;
+  metal::AllocationFailure restoreAllocationFailure =
+      metal::AllocationFailure::EngineBudget;
   std::optional<uint32_t> denySnapshotAtBoundary;
+  uint32_t stepAttempts = 0;
+  std::function<metal::AllocationResult(uint64_t, uint64_t, uint64_t)>
+      stepAdmission;
   uint32_t beginAttempts = 0;
   // The request of the latest begin(), for hooks that refuse only some.
   uint64_t lastBeginId = 0;
@@ -629,7 +675,7 @@ void testSharedPrefillEvictedPublicationFallsBack() {
   engine.submit(request(2, std::vector<uint32_t>(193, 7)));
   static_cast<void>(engine.tick(0));
   static_cast<void>(engine.tick(1));
-  require(cache.reclaimOneState(),
+  require(cache.reclaimOneState().madeProgress,
           "published shared prefix was pinned against pressure reclamation");
   runUntilIdle(engine);
   require(events.completedCount == 2 && model.prefillRows == 386 &&
@@ -1104,7 +1150,60 @@ void testOneRequestPublishesJunctionAndLatestReplayState() {
   require(executor.snapshots == 3 && snapshot.junctionMaterializations == 1 &&
               snapshot.replayStatePublications == 2 &&
               snapshot.resources.stateCache.entries == 2,
-          "one request did not retain both sparse composite states");
+          "one request did not retain both sparse restore states");
+}
+
+// Restore scratch belongs to execution admission. A temporary shortage retries
+// without dropping the matched prefix; a permanently impossible restore falls
+// back to prefill instead of turning normal capacity pressure into engine
+// death.
+void testRestoreAllocationPressure() {
+  for (const bool permanent : {false, true}) {
+    Backing backing(64);
+    KvPool pool(backing);
+    engine::Cache cache(pool, CacheNamespace{});
+    Executor executor(1);
+    Events events;
+    engine::Engine engine({}, cache, executor, events);
+    engine.submit(request(1, std::vector<uint32_t>(97, 7)));
+    runUntilIdle(engine);
+    engine.submit(request(2, std::vector<uint32_t>(97, 8)));
+    runUntilIdle(engine);
+    executor.deniedRestores = permanent ? 1000 : 1;
+    engine.submit(request(3, std::vector<uint32_t>(97, 8)));
+    for (uint32_t step = 1; step <= 32 && !engine.idle(); ++step)
+      static_cast<void>(engine.tick(100 * step));
+    require(events.failedCount == 0 && events.outputs.contains(3) &&
+                engine.idle(),
+            "restore allocation refusal failed the request");
+    require(permanent ? executor.restored == 0 : executor.restored == 96,
+            "restore pressure failed to retry or fall back to cold prefill");
+    executor.deniedRestores = 0;
+    engine.submit(request(4, std::vector<uint32_t>(97, 8)));
+    runUntilIdle(engine);
+    require(events.failedCount == 0 && events.outputs.contains(4),
+            "restore refusal leaked a lane or poisoned subsequent requests");
+  }
+}
+
+void testRestoreWaitsForHostPressure() {
+  Backing backing(64);
+  KvPool pool(backing);
+  engine::Cache cache(pool, CacheNamespace{});
+  Executor executor(1);
+  Events events;
+  engine::Engine engine({}, cache, executor, events);
+  engine.submit(request(1, std::vector<uint32_t>(97, 7)));
+  runUntilIdle(engine);
+  const auto before = cache.snapshot().stateCache.evictions;
+  executor.deniedRestores = 1;
+  executor.restoreAllocationFailure = metal::AllocationFailure::HostPressure;
+  engine.submit(request(2, std::vector<uint32_t>(97, 7)));
+  for (uint32_t step = 1; step <= 32 && !engine.idle(); ++step)
+    static_cast<void>(engine.tick(100 * step));
+  require(engine.idle() && !events.failedCount && executor.restored == 96 &&
+              cache.snapshot().stateCache.evictions == before,
+          "host pressure discarded the pinned prefix instead of waiting");
 }
 
 // A denied snapshot at the latest replay boundary recycles the least recently
@@ -1125,7 +1224,7 @@ void testLatestReplayDenialRecyclesOlderStateNotTheJunction() {
   runUntilIdle(engine);
   while (resources.snapshot().stateCache.entries != 0) {
     require(resources.reclaimCache(1, false) != 0,
-            "test could not remove the old composite state");
+            "test could not remove the old restore state");
   }
   engine.submit(request(70, std::vector<uint32_t>(65, 7000)));
   runUntilIdle(engine);
@@ -1190,7 +1289,7 @@ void testCancellationAfterJunctionDiscardsLaterState() {
   runUntilIdle(engine);
   while (resources.snapshot().stateCache.entries != 0) {
     require(resources.reclaimCache(1, false) != 0,
-            "test could not remove the old composite state");
+            "test could not remove the old restore state");
   }
 
   prompt.resize(161, 999);
@@ -1268,6 +1367,67 @@ void testDeniedSnapshotCostsOnlyThatAttempt() {
           "junction was not materialized once snapshots were possible");
 }
 
+// Admission is bounded by required backing bytes, not a fixed victim count.
+void testSnapshotAdmissionReclaimsUntilItFits() {
+  Backing backing(64);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(1);
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  executor.snapshotBytes = 32;
+  for (uint64_t id = 1; id <= 3; ++id) {
+    engine.submit(request(id, std::vector<uint32_t>(65, id)));
+    runUntilIdle(engine);
+  }
+  require(resources.snapshot().stateCache.bytes == 96,
+          "snapshot admission fixture did not retain three states");
+  // The snapshot needs 64 bytes in a 96-byte budget. Reclaiming one older
+  // block is insufficient; admission must keep making progress in LRU order.
+  executor.snapshotBytes = 64;
+  executor.snapshotObserver = [&] {
+    if (resources.snapshot().stateCache.bytes > 32)
+      executor.deniedSnapshots = 1;
+  };
+  engine.submit(request(4, std::vector<uint32_t>(65, 4)));
+  runUntilIdle(engine);
+  require(resources.snapshot().stateCache.bytes == 96 &&
+              resources.snapshot().stateCache.evictions == 2 &&
+              engine.snapshot().recycledStatePublications == 1 &&
+              engine.snapshot().replayStatePublicationFailures == 0,
+          "snapshot admission stopped before enough space was reclaimed");
+  require(!resources.lookup(std::vector<uint32_t>(65, 1)).state &&
+              !resources.lookup(std::vector<uint32_t>(65, 2)).state &&
+              resources.lookup(std::vector<uint32_t>(65, 3)).state &&
+              resources.lookup(std::vector<uint32_t>(65, 4)).state,
+          "snapshot admission did not preserve LRU order");
+}
+
+// Direct disk capture follows failed attempts to reuse RAM group backing.
+void testDiskSnapshotFollowsRamReclaim() {
+  Backing backing(64);
+  KvPool pool(backing);
+  engine::Cache cache(pool, CacheNamespace{});
+  Executor executor(1);
+  Events events;
+  engine::Engine engine({}, cache, executor, events);
+  engine.submit(request(1, std::vector<uint32_t>(65, 1)));
+  runUntilIdle(engine);
+  executor.stateTier = std::make_shared<OffloadControl>();
+  executor.stateTier->ready = true;
+  executor.deniedSnapshots = 100;
+  engine.submit(request(2, std::vector<uint32_t>(65, 2)));
+  runUntilIdle(engine);
+  const auto older = cache.lookup(std::vector<uint32_t>(65, 1));
+  const auto newer = cache.lookup(std::vector<uint32_t>(65, 2));
+  require(!older.state && newer.state && !newer.state->state()->resident() &&
+              executor.diskSnapshots == 1 &&
+              cache.snapshot().stateCache.evictions == 1 &&
+              engine.snapshot().replayStatePublicationFailures == 0 &&
+              events.completedCount == 2 && !events.failedCount,
+          "disk capture did not follow the RAM reclaim attempt");
+}
+
 // A snapshot the model denies once at a replay boundary lands by recycling
 // the least recently used cached state: one eviction, the same number of
 // entries, and the recycled slot now holds the new lane's state.
@@ -1319,10 +1479,9 @@ void testDeniedSnapshotRecyclesLruStateAndRetries() {
           "recycled state was not the least recently used one");
 }
 
-// When the retry after recycling is denied as well, the boundary fails and
-// the engine has paid exactly one cached state for it. Persistent denial
-// never drains the rest of the cache.
-void testPersistentSnapshotDenialRecyclesAtMostOneState() {
+// Each successful return of group backing permits one retry. Once that group
+// has no candidates, publication stops and the request continues.
+void testSnapshotDenialStopsWhenGroupIsExhausted() {
   Backing backing(64);
   KvPool pool(backing);
   engine::Cache resources(pool, CacheNamespace{});
@@ -1340,15 +1499,58 @@ void testPersistentSnapshotDenialRecyclesAtMostOneState() {
   engine.submit(request(4, std::vector<uint32_t>(65, 4)));
   runUntilIdle(engine);
   const auto after = engine.snapshot();
-  require(executor.snapshotAttempts == 5 && executor.snapshots == 3 &&
-              executor.deniedSnapshots == 98 &&
+  require(executor.snapshotAttempts == 7 && executor.snapshots == 3 &&
+              executor.deniedSnapshots == 96 &&
               after.replayStatePublicationFailures == 1 &&
               after.recycledStatePublications == 0 &&
               events.completedCount == 4 && events.failedCount == 0,
-          "persistently denied snapshot was retried more than once");
-  require(after.resources.stateCache.evictions == 1 &&
-              after.resources.stateCache.entries == 2,
-          "persistent snapshot denial recycled more than one cached state");
+          "snapshot retries did not track reusable group backing");
+  require(after.resources.stateCache.evictions == 3 &&
+              after.resources.stateCache.entries == 0,
+          "snapshot denial did not stop at group exhaustion");
+}
+
+void testSnapshotReclaimsOnlyReusableBackingFromFailedGroup() {
+  for (bool sharedBacking : {false, true}) {
+    Backing backing(64);
+    KvPool pool(backing);
+    Cache cache(pool, {});
+    Executor executor(1);
+    executor.groups = {{0}, {7}};
+    Events events;
+    Engine engine({}, cache, executor, events);
+    std::shared_ptr<const StatePayload> retained;
+    for (uint32_t id : {1, 2, 3}) {
+      std::vector<uint32_t> tokens(64, id);
+      cache.beginRequest(id);
+      require(cache.ensureTokens(id, 64).granted(),
+              "group fixture allocation failed");
+      static_cast<void>(cache.publishCommittedBlocks(id, tokens, 64));
+      auto payload = std::make_shared<State>();
+      if (sharedBacking && id == 2)
+        retained = payload;
+      cache.publishRestoreState(
+          cache.blockAt(id, 64),
+          std::make_shared<RestoreState>(RestoreState{
+              64, {{id == 1 ? 7u : 0u, 64, 64, std::move(payload)}}}),
+          id == 3);
+      cache.endRequest(id);
+    }
+    executor.deniedSnapshots = 100;
+    engine.submit(request(4, std::vector<uint32_t>(65, 4)));
+    runUntilIdle(engine);
+    const auto result = engine.snapshot();
+    require(executor.snapshotAttempts == (sharedBacking ? 1u : 3u) &&
+                result.resources.stateCache.evictions ==
+                    (sharedBacking ? 1u : 2u) &&
+                result.resources.stateCache.entries ==
+                    (sharedBacking ? 2u : 1u) &&
+                result.replayStatePublicationFailures == 1 &&
+                events.completedCount == 1 && !events.failedCount,
+            "snapshot drained unrelated or non-reusable group backing");
+    require(cache.reclaimOneState(7).madeProgress,
+            "snapshot reclaimed an older entry from a different group");
+  }
 }
 
 void testLongSuffixSkipsDraftRestore() {
@@ -1371,7 +1573,7 @@ void testLongSuffixSkipsDraftRestore() {
   runUntilIdle(engine);
   require(!executor.restoredDraft &&
               executor.plans.at(11).draftStateRestoreSkipped,
-          "long suffix copied a draft ring that its final window overwrites");
+          "long suffix copied a draft window that its final window overwrites");
 }
 
 // A lane cancelled while the command that ends at its armed boundary is in
@@ -1428,7 +1630,7 @@ void testActiveCellGrowthReclaimsCachedStateAndRetries() {
     runUntilIdle(engine);
     const auto cached = resources.snapshot();
     require(cached.stateCache.entries == 1,
-            "state-reclaim setup did not publish a composite state");
+            "state-reclaim setup did not publish a restore state");
 
     if (hostPressure) {
       backing.growthBlocked = true;
@@ -1457,6 +1659,120 @@ void testActiveCellGrowthReclaimsCachedStateAndRetries() {
               "active-cell growth did not reclaim cached state");
     }
   }
+}
+
+void testDraftWriteGrowthReclaimsCachedState() {
+  Backing backing(16);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(1);
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  engine.submit(request(20, std::vector<uint32_t>(65, 7)));
+  runUntilIdle(engine);
+  require(resources.snapshot().stateCache.entries == 1,
+          "draft COW fixture did not retain a state");
+  executor.stepAdmission = [&](uint64_t, uint64_t, uint64_t) {
+    return resources.snapshot().stateCache.entries
+               ? metal::AllocationResult{metal::AllocationFailure::EngineBudget}
+               : metal::AllocationResult{true};
+  };
+  const uint32_t attempts = executor.stepAttempts;
+  engine.submit(request(21, {8}));
+  runUntilIdle(engine);
+  require(executor.stepAttempts >= attempts + 2 && events.completedCount == 2 &&
+              events.failedCount == 0 &&
+              resources.snapshot().stateCache.entries == 0,
+          "draft COW admission did not reclaim cached state and retry");
+}
+
+void testUntaggedHostPressureWaitsForController() {
+  Backing backing(16);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(1);
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  engine.submit(request(20, std::vector<uint32_t>(65, 7)));
+  runUntilIdle(engine);
+  const auto before = resources.snapshot();
+  require(before.stateCache.entries == 1,
+          "paused COW fixture did not cache a state");
+  executor.stepAdmission = [](uint64_t, uint64_t, uint64_t) {
+    return metal::AllocationResult{metal::AllocationFailure::HostPressure};
+  };
+  engine.submit(request(21, {8}));
+  static_cast<void>(engine.tick(1));
+  const auto after = resources.snapshot();
+  require(after.stateCache.entries == before.stateCache.entries &&
+              after.stateCache.evictions == before.stateCache.evictions &&
+              !events.failedCount,
+          "paused draft allocation evicted target cache that cannot supply "
+          "draft backing");
+  engine.cancel(21);
+  runUntilIdle(engine);
+  require(executor.requests.empty() && !resources.snapshot().activeRequests,
+          "paused COW cancellation leaked ownership");
+}
+
+void testModelGrowthReleasesPhysicalBacking() {
+  using Failure = metal::AllocationFailure;
+  for (const auto &[group, failure] :
+       std::vector<std::pair<std::optional<CacheGroupId>, Failure>>{
+           {std::nullopt, Failure::EngineBudget},
+           {0, Failure::EngineBudget},
+           {0, Failure::HostPressure}}) {
+    Backing backing(32);
+    KvPool pool(backing);
+    Cache cache(pool, {});
+    Executor executor(1);
+    Events events;
+    Engine engine({}, cache, executor, events);
+    engine.submit(request(1, std::vector<uint32_t>(257, 7)));
+    runUntilIdle(engine);
+    const auto resident = cache.snapshot().pool.pagesResident;
+    require(resident >= 8, "physical growth fixture lacks reclaimable backing");
+    executor.stepGroup = group;
+    executor.stepAdmission = [&](uint64_t, uint64_t, uint64_t) {
+      return cache.snapshot().pool.pagesResident >= resident
+                 ? metal::AllocationResult{failure}
+                 : metal::AllocationResult{true};
+    };
+    engine.submit(request(2, {8}));
+    runUntilIdle(engine);
+    require(events.completedCount == 2 && !events.failedCount &&
+                !executor.suspensions &&
+                cache.snapshot().pool.pagesResident < resident,
+            "model allocation recycled page IDs without releasing physical "
+            "backing");
+  }
+}
+
+void testModelGrowthReusesItsGroupUnderHostPressure() {
+  Backing backing(32);
+  KvPool pool(backing);
+  Cache cache(pool, {});
+  Executor executor(1);
+  Events events;
+  Engine engine({}, cache, executor, events);
+  engine.submit(request(1, std::vector<uint32_t>(257, 7)));
+  runUntilIdle(engine);
+  const auto before = cache.snapshot();
+  executor.stepGroup = 0;
+  executor.stepAdmission = [&](uint64_t, uint64_t, uint64_t) {
+    return cache.snapshot().stateCache.entries
+               ? metal::AllocationResult{metal::AllocationFailure::HostPressure}
+               : metal::AllocationResult{true};
+  };
+  engine.submit(request(2, {8}));
+  runUntilIdle(engine);
+  require(events.completedCount == 2 && !events.failedCount &&
+              !executor.suspensions &&
+              cache.snapshot().pool.pagesResident ==
+                  before.pool.pagesResident &&
+              cache.snapshot().pool.pagesPrefix == before.pool.pagesPrefix,
+          "host pressure failed to reuse the model group without draining "
+          "target KV");
 }
 
 void testKvGrowthReclaimsIdleStateBeforeCache() {
@@ -1496,7 +1812,7 @@ void testKvGrowthReclaimsIdleStateBeforeCache() {
                 after.stateCache.entries == cached.stateCache.entries + 1 &&
                 engine.snapshot().replayStatePublications == 2 &&
                 engine.snapshot().recycledStatePublications == 0,
-            "KV growth evicted useful composite state before idle state memory");
+            "KV growth evicted useful restore state before idle state memory");
   }
 }
 
@@ -1546,7 +1862,7 @@ void testPressureReclaimRespectsStateLifetimes() {
   runUntilIdle(engine);
   const auto cached = resources.snapshot();
   require(cached.stateCache.entries == 1 && cached.kvCache.blocks == 2,
-          "pressure setup did not retain KV and composite state");
+          "pressure setup did not retain KV and restore state");
 
   // A shrink that nothing is waiting for stops at the resume point. Freeing
   // its cell gains the host a little; the next request pays a full replay.
@@ -1615,7 +1931,8 @@ void testPressureReclaimFollowsTheChain() {
   const uint64_t leaf = cache.publishCommittedBlocks(1, prompt, 128);
   auto transfer = std::make_shared<OffloadControl>();
   transfer->ready = true;
-  cache.publishCompositeState(leaf, std::make_shared<OffloadState>(transfer));
+  test::publishCheckpoint(cache, leaf,
+                          std::make_shared<OffloadState>(transfer));
   cache.endRequest(1);
 
   const auto reclaim = [&](uint64_t target) {
@@ -1867,7 +2184,8 @@ void testAdmissionWaitsOutEarlierLanes() {
     while (now < 500)
       static_cast<void>(engine.tick(now += 50));
     require(!events.completedCount && events.failedCount == 0,
-            "a request waiting for a resident lane's memory timed out while it ran");
+            "a request waiting for a resident lane's memory timed out while it "
+            "ran");
     executor.decodeFinishes = true;
     while (!events.completedCount && now < 1000)
       static_cast<void>(engine.tick(now += 10));
@@ -2672,7 +2990,7 @@ void testLongDecodePreemptionPlansTheCurrentReplayBoundary() {
   std::vector<uint32_t> history = prompt;
   history.insert(history.end(), emitted.begin(), emitted.end());
   require(resources.snapshot().stateCache.entries == 0,
-          "snapshot denial left a composite state to restore");
+          "snapshot denial left a restore state to restore");
 
   // Retain a KV junction one draft window past the original prompt boundary.
   // The old prompt boundary, this junction, and the generated history's end
@@ -2723,7 +3041,7 @@ void testLongDecodePreemptionPlansTheCurrentReplayBoundary() {
           "long replay leaked active resources");
 }
 
-void testPreemptedDecodeRestoresItsResidentCompositeState() {
+void testPreemptedDecodeRestoresItsResidentState() {
   Backing backing(6);
   KvPool pool(backing);
   engine::Cache resources(pool, CacheNamespace{});
@@ -2886,9 +3204,11 @@ void testStateAdmissionWaitsForKvRelease() {
         static_cast<void>(engine.tick(51));
       } else {
         static_cast<void>(engine.tick(502));
-        require(events.failures == std::vector<std::string>{"resource_timeout"} &&
+        require(events.failures ==
+                        std::vector<std::string>{"resource_timeout"} &&
                     events.failureDetails.back().first ==
-                        "memory did not become available within the resource wait limit",
+                        "memory did not become available within the resource "
+                        "wait limit",
                 "pending release bypassed resource wait deadline, or a budget "
                 "wait blamed macOS");
       }
@@ -2977,7 +3297,7 @@ void testAdmissionsWaitForBackgroundRelease() {
 }
 
 void testAllocationCausesRemainRetryableAndDistinct() {
-  for (bool stateAllocation : {false, true}) {
+  for (uint32_t source : {0U, 1U, 2U}) {
     for (auto reason : {metal::AllocationFailure::HostPressure,
                         metal::AllocationFailure::EngineBudget,
                         metal::AllocationFailure::DriverRejected}) {
@@ -2987,9 +3307,13 @@ void testAllocationCausesRemainRetryableAndDistinct() {
       Executor executor(1);
       Events events;
       engine::Engine engine({}, cache, executor, events);
-      backing.growthBlocked = !stateAllocation;
+      backing.growthBlocked = source == 0;
       backing.allocationFailure = reason;
-      executor.beginGrowthBlocked = [stateAllocation] { return stateAllocation; };
+      executor.beginGrowthBlocked = [source] { return source == 1; };
+      if (source == 2)
+        executor.stepAdmission = [reason](uint64_t, uint64_t, uint64_t) {
+          return metal::AllocationResult{reason};
+        };
       executor.beginAllocationFailure = reason;
       engine.submit(request(285, {285}));
       static_cast<void>(engine.tick(1));
@@ -3051,9 +3375,12 @@ void testRecoveryAdmitsFailedKvTargetBeforeReplaying() {
     backing.growthBlocked = true;
     require(engine.tick(3) && engine.snapshot().resourceSuspensions == 1,
             "request-sized host denial was treated as permanent capacity");
-    require(resources.snapshot().stateCache.entries == cached.stateCache.entries &&
-                resources.snapshot().stateCache.evictions == cached.stateCache.evictions,
-            "active prefix pages were mistaken for idle backing and lost their state");
+    require(resources.snapshot().stateCache.entries ==
+                    cached.stateCache.entries &&
+                resources.snapshot().stateCache.evictions ==
+                    cached.stateCache.evictions,
+            "active prefix pages were mistaken for idle backing and lost their "
+            "state");
     const uint64_t rows = executor.prefillRows;
     const uint64_t replay = engine.snapshot().resourceReplayTokens;
     for (double now : {103.0, 203.0, 303.0}) {
@@ -3246,9 +3573,9 @@ void testRecoveryDrainEndsWithItsCause() {
     PressurePersists,
     HardLimit
   };
-  for (Cause cause : {Cause::PressureClears, Cause::KvStillShort,
-                      Cause::StateStillShort, Cause::PressurePersists,
-                      Cause::HardLimit}) {
+  for (Cause cause :
+       {Cause::PressureClears, Cause::KvStillShort, Cause::StateStillShort,
+        Cause::PressurePersists, Cause::HardLimit}) {
     Backing backing(64);
     KvPool pool(backing);
     engine::Cache resources(pool, CacheNamespace{});
@@ -3648,7 +3975,8 @@ void testConcurrentProgressRetainsAtMostOnePointPerLane() {
               executor.prefillRows == prompt.size() * 2 - 24992 &&
               maximumEntries <= 2 &&
               resources.snapshot().stateCache.entries == 1,
-          "concurrent prompts accumulated progress states beyond their active lanes");
+          "concurrent prompts accumulated progress states beyond their active "
+          "lanes");
 }
 
 void testSharedCheckpointSurvivesPeerRollingReplacement() {
@@ -3769,9 +4097,9 @@ void testRestoredCheckpointAtReplayEndBecomesOrdinary() {
               "restored replay endpoint was copied or retired as temporary");
       auto held = resources.lookup(shorter);
       const uint64_t block = held.state->kvBlock();
-      const CompositeState *copy = held.state->state().get();
+      const auto copy = held.state->state();
       held = {};
-      resources.discardState(block, copy);
+      resources.discardState(block, copy.get());
       require(resources.lookup(shorter).lostState,
               "the loss of a restored replay endpoint was not a lost state");
     }
@@ -3807,7 +4135,7 @@ void testRetryRetiresCheckpointAtDeeperJunction() {
           "retry did not retain its normal junction and replay states");
 }
 
-void testPinnedCheckpointSkipsReplacementButNotOrdinaryState() {
+void testPinnedCheckpointSurvivesLaterPublications() {
   Backing backing(1024);
   KvPool pool(backing);
   engine::Cache resources(pool, CacheNamespace{});
@@ -3821,16 +4149,18 @@ void testPinnedCheckpointSkipsReplacementButNotOrdinaryState() {
   require(pinned.resumeBoundary() == defaultCheckpointTokens,
           "fixture did not pin its checkpoint");
   runUntilIdle(engine);
-  require(engine.snapshot().checkpointPublications == 1 &&
-              engine.snapshot().checkpointPublicationFailures ==
-                  (prompt.size() / defaultCheckpointTokens) - 1 &&
-              executor.snapshotAttempts == 2 &&
-              resources.snapshot().stateCache.entries == 2 &&
-              resources.snapshot().stateCache.checkpointEntries == 1 &&
-              resources.lookup(prompt).resumeBoundary() == 17984,
-          "pinned recovery point was overwritten or blocked ordinary publication");
+  require(
+      engine.snapshot().checkpointPublications ==
+              prompt.size() / defaultCheckpointTokens &&
+          engine.snapshot().checkpointPublicationFailures == 0 &&
+          executor.snapshotAttempts ==
+              prompt.size() / defaultCheckpointTokens + 1 &&
+          resources.snapshot().stateCache.entries == 2 &&
+          resources.snapshot().stateCache.checkpointEntries == 1 &&
+          resources.lookup(prompt).resumeBoundary() == 17984,
+      "pinned recovery point was overwritten or blocked ordinary publication");
   pinned = {};
-  require(resources.reclaimOneState() &&
+  require(resources.reclaimOneState().madeProgress &&
               resources.snapshot().stateCache.checkpointEntries == 0 &&
               resources.lookup(prompt).resumeBoundary() == 17984,
           "released recovery pin did not rejoin the lower-priority queue");
@@ -3873,7 +4203,7 @@ void testRollingHandleCannotRetirePromotedState() {
   runUntilCheckpoint(engine, 1);
   {
     auto existing = resources.lookup(prompt);
-    require(resources.reuseCompositeState(existing.state->kvBlock()),
+    require(resources.reuseRestoreState(existing.state->kvBlock()),
             "shared ordinary boundary could not reuse its checkpoint");
   }
   runUntilIdle(engine);
@@ -3886,7 +4216,7 @@ void testRollingHandleCannotRetirePromotedState() {
           "old rolling handle deleted a state promoted by another request");
 }
 
-void testCheckpointDenialPreservesUnrelatedHotState() {
+void testCheckpointDenialRecyclesAvailableGroupBacking() {
   Backing backing(1024);
   KvPool pool(backing);
   engine::Cache resources(pool, CacheNamespace{});
@@ -3902,9 +4232,9 @@ void testCheckpointDenialPreservesUnrelatedHotState() {
        !engine.snapshot().checkpointPublicationFailures; ++step)
     static_cast<void>(engine.tick(step + 1));
   require(engine.snapshot().checkpointPublicationFailures == 1 &&
-              resources.snapshot().stateCache.evictions == 0 &&
-              resources.lookup(hot).resumeBoundary() == 64,
-          "optional progress allocation displaced an unrelated hot prefix");
+              resources.snapshot().stateCache.evictions == 1 &&
+              resources.lookup(hot).resumeBoundary() == 0,
+          "checkpoint denial did not retry reusable backing before skipping");
   engine.cancel(421);
   runUntilIdle(engine);
 }
@@ -3918,16 +4248,21 @@ void testCheckpointRecyclesItsBufferBeforeReplacement() {
   engine::Engine engine({}, resources, executor, events);
   engine.submit(request(430, std::vector<uint32_t>(25001, 23)));
   runUntilCheckpoint(engine, 1);
+  uint32_t attempts = 0;
   executor.snapshotObserver = [&] {
-    require(resources.snapshot().stateCache.entries == 0,
-            "checkpoint replacement allocated before retiring its old state");
+    const bool first = ++attempts == 1;
+    require(resources.snapshot().stateCache.entries == (first ? 1u : 0u),
+            "checkpoint retry did not follow RAM attempt then group reclaim");
+    if (first)
+      executor.deniedSnapshots = 1;
   };
   runUntilCheckpoint(engine, 2);
-  require(resources.snapshot().stateCache.entries == 1 &&
-              resources.snapshot().stateCache.evictions == 0 &&
-              resources.snapshot().stateCache.checkpointRetirements == 1 &&
-              engine.snapshot().checkpointPublicationFailures == 0,
-          "progress could not replace its old state within the allocation budget");
+  require(
+      resources.snapshot().stateCache.entries == 1 &&
+          resources.snapshot().stateCache.evictions == 1 &&
+          resources.snapshot().stateCache.checkpointRetirements == 0 &&
+          engine.snapshot().checkpointPublicationFailures == 0,
+      "progress could not replace its old state within the allocation budget");
   engine.cancel(430);
   runUntilIdle(engine);
 }
@@ -3959,7 +4294,7 @@ void testCancelAtCheckpointDoesNotPublishDrainingCommand() {
           "cancellation published a checkpoint from the draining command");
 }
 
-void testFinalStateRecyclesItsCheckpointBeforeUnrelatedHotState() {
+void testFinalStateRecyclesByGroupRecency() {
   Backing backing(1024);
   KvPool pool(backing);
   engine::Cache resources(pool, CacheNamespace{});
@@ -3972,10 +4307,23 @@ void testFinalStateRecyclesItsCheckpointBeforeUnrelatedHotState() {
   const std::vector<uint32_t> prompt(18001, 28);
   engine.submit(request(461, prompt));
   runUntilCheckpoint(engine, (prompt.size() / defaultCheckpointTokens));
+  {
+    auto hit = resources.lookup(hot);
+    resources.beginRequest(462);
+    require(resources.restoreRequest(462, hit).granted(),
+            "hot prefix restore failed");
+    hit.state.reset();
+    resources.endRequest(462);
+  }
+  uint32_t attempts = 0;
   executor.snapshotObserver = [&] {
-    require(resources.snapshot().stateCache.entries == 1 &&
+    const bool first = ++attempts == 1;
+    require(resources.snapshot().stateCache.entries == (first ? 2u : 1u) &&
                 resources.lookup(hot).resumeBoundary() == 64,
-            "final state did not recycle its checkpoint before allocating");
+            "final snapshot retry displaced the ordinary state before its "
+            "checkpoint");
+    if (first)
+      executor.deniedSnapshots = 1;
   };
   runUntilIdle(engine);
   require(resources.snapshot().stateCache.entries == 2 &&
@@ -4203,7 +4551,7 @@ void testStateAlreadyOnDiskIsDeduplicated() {
               executor.prefillRows == 2 * prompt.size(),
           "both lanes did not compute the prompt");
   const auto counters = engine.snapshot();
-  require(executor.diskSnapshots == 2 && counters.diskStatePublications == 2 &&
+  require(executor.diskSnapshots == 4 && counters.diskStatePublications == 4 &&
               counters.replayStatePublications == 1 &&
               counters.junctionMaterializations == 1 &&
               counters.deduplicatedStatePublications == 1 &&
@@ -4309,7 +4657,8 @@ void testFailedFinalStateKeepsTheDiskCheckpoint() {
     runUntilIdle(engine);
     require(engine.snapshot().completed == (cancel ? 1U : 2U) &&
                 cache.snapshot().stateCache.checkpointEntries == 1,
-            "the request's end removed the checkpoint its final state did not replace");
+            "the request's end removed the checkpoint its final state did not "
+            "replace");
     engine.submit(request(612, prompt));
     static_cast<void>(engine.tick(2000));
     executor.restoreControl->ready = true;
@@ -4325,7 +4674,7 @@ void testFailedFinalStateKeepsTheDiskCheckpoint() {
   }
 }
 
-void testNearFinalCheckpointAvoidsDiskWrite() {
+void testCheckpointsUseTheSameAdmissionAtEveryBoundary() {
   const uint32_t chunk = model::ExecutionLimits::prefillTokenBudget;
   for (bool denyRam : {false, true}) {
     for (uint32_t remaining : {32u, chunk - 32, chunk}) {
@@ -4342,7 +4691,7 @@ void testNearFinalCheckpointAvoidsDiskWrite() {
       engine.submit(request(1, prompt));
       runUntilIdle(engine);
       const auto counters = engine.snapshot();
-      const uint64_t checkpoint = !denyRam || remaining >= chunk;
+      const uint64_t checkpoint = 1;
       require(counters.checkpointPublications == checkpoint &&
                   counters.checkpointPublicationFailures == 0 &&
                   counters.replayStatePublications == 1 &&
@@ -4351,20 +4700,21 @@ void testNearFinalCheckpointAvoidsDiskWrite() {
                   counters.resources.stateCache.entries == 1 &&
                   counters.resources.stateCache.checkpointEntries == 0 &&
                   events.completedCount == 1 && events.failedCount == 0,
-              "near-final disk checkpoint policy changed RAM checkpoints or lost final state");
+              "checkpoint admission depends on distance from the final state");
       executor.restoreControl->ready = true;
       engine.submit(request(2, prompt));
       runUntilIdle(engine);
       require(events.starts.back() ==
-                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit,
-                                                       uint32_t(prompt.size() - 1)} &&
+                      std::pair<EngineCacheStatus, uint32_t>{
+                          EngineCacheStatus::PrefixHit,
+                          uint32_t(prompt.size() - 1)} &&
                   events.completedCount == 2 && events.failedCount == 0,
-              "skipping a disk checkpoint lost the final reusable prefix");
+              "checkpoint retirement lost the final reusable prefix");
     }
   }
 }
 
-void testSkippedCheckpointKeepsPreviousRecoveryPoint() {
+void testDiskFallbackReplacesCheckpointAfterRamDenial() {
   for (bool disk : {false, true}) {
     Backing backing(512);
     KvPool pool(backing);
@@ -4387,24 +4737,27 @@ void testSkippedCheckpointKeepsPreviousRecoveryPoint() {
     }
     const auto before = engine.snapshot();
     require(!engine.commandInFlight() &&
-                executor.requests.at(1).position == 2 * defaultCheckpointTokens &&
-                before.checkpointPublications == 1 &&
+                executor.requests.at(1).position ==
+                    2 * defaultCheckpointTokens &&
+                before.checkpointPublications == 2 &&
                 before.checkpointPublicationFailures == 0 &&
                 before.resources.stateCache.checkpointEntries == 1 &&
-                before.resources.stateCache.checkpointRetirements == 0 &&
-                executor.diskSnapshots == (disk ? 1 : 0),
-            "skipped near-final checkpoint retired or rewrote its predecessor");
+                before.resources.stateCache.checkpointRetirements ==
+                    (disk ? 1u : 0u) &&
+                executor.diskSnapshots == (disk ? 2 : 1),
+            "disk fallback did not replace the checkpoint after RAM refusal");
     engine.cancel(1);
     runUntilIdle(engine);
     engine.submit(request(2, prompt));
     runUntilIdle(engine);
     require(events.starts.back() ==
-                std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit,
-                                                     defaultCheckpointTokens} &&
-                engine.snapshot().cancelled == 1 && engine.snapshot().completed == 1 &&
-                events.failedCount == 0 &&
+                    std::pair<EngineCacheStatus, uint32_t>{
+                        EngineCacheStatus::PrefixHit,
+                        2 * defaultCheckpointTokens} &&
+                engine.snapshot().cancelled == 1 &&
+                engine.snapshot().completed == 1 && events.failedCount == 0 &&
                 cache.snapshot().stateCache.checkpointEntries == 0,
-            "cancellation after a skipped checkpoint lost the earlier recovery point");
+            "cancellation lost the replacement disk recovery point");
   }
 }
 
@@ -4424,21 +4777,26 @@ void testGrowthWaitsForTheStateWriteInFlight() {
     Events events;
     engine::Engine engine({.maxContext = 102400, .growthPaused = [paused] { return paused; }},
                           cache, executor, events);
-    // A write in flight from a lane still running: its block is no leaf to evict.
+    // A write in flight from a lane still running: its block is no leaf to
+    // evict.
     auto writing = std::make_shared<OffloadControl>();
     cache.beginRequest(999);
     require(cache.ensureTokens(999, 64).granted(), "fixture KV failed");
     const auto held = cache.publishCommittedBlocks(999, std::vector<uint32_t>(64, 12), 64);
-    require(cache.publishStateToDisk(held, [&](std::function<void()>) {
-              return std::make_unique<OffloadTicket>(writing);
-            }),
+    require(cache.publishStateToDisk(
+                held, {test::checkpoint(64, std::make_shared<State>(100)),
+                       [&](std::function<void()>) {
+                         return test::snapshotWrite(
+                             64, std::make_unique<OffloadTicket>(writing));
+                       }}),
             "fixture write did not start");
     // A cached state in RAM whose eviction must wait for that write.
     auto cached = std::make_shared<OffloadControl>();
     cache.beginRequest(998);
     require(cache.ensureTokens(998, 64).granted(), "fixture KV failed");
     const auto idle = cache.publishCommittedBlocks(998, std::vector<uint32_t>(64, 13), 64);
-    cache.publishCompositeState(idle, std::make_shared<OffloadState>(cached));
+    test::publishCheckpoint(cache, idle,
+                            std::make_shared<OffloadState>(cached));
     cache.endRequest(998);
     // Every free page needs backing the budget, or the host, refuses.
     backing.allocationFailure = paused ? metal::AllocationFailure::HostPressure
@@ -4489,9 +4847,11 @@ void testWaitingLaneAlwaysNamesAWakeup() {
     cache.beginRequest(id);
     require(cache.ensureTokens(id, 32).granted(), "fixture KV failed");
     const auto block = cache.publishCommittedBlocks(id, prompt, 32);
-    cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
+    test::publishCheckpoint(cache, block,
+                            std::make_shared<OffloadState>(transfer));
     cache.endRequest(id);
-    require(cache.reclaimOneState() && cache.pollTransfers(), "state was not demoted");
+    require(cache.reclaimOneState().madeProgress && cache.pollTransfers(),
+            "state was not demoted");
   }
   engine.submit(request(1, std::vector<uint32_t>(97, 7)));
   static_cast<void>(engine.tick(1));
@@ -4560,9 +4920,11 @@ void testPhysicalShortfallDemotesInBulk() {
     cache.beginRequest(id);
     require(cache.ensureTokens(id, 32).granted(), "fixture KV failed");
     const auto block = cache.publishCommittedBlocks(id, prompt, 32);
-    cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
+    test::publishCheckpoint(cache, block,
+                            std::make_shared<OffloadState>(transfer));
     cache.endRequest(id);
-    require(cache.reclaimOneState() && cache.pollTransfers(), "state was not demoted");
+    require(cache.reclaimOneState().madeProgress && cache.pollTransfers(),
+            "state was not demoted");
   }
   // The cached blocks fill two extents but two of their pages: those two
   // are free and backed, the other eight free pages are not, and the budget
@@ -4600,7 +4962,8 @@ void testKvGrowthProceedsThroughDemotion() {
   cache.beginRequest(999);
   require(cache.ensureTokens(999, 32).granted(), "offload fixture KV failed");
   const auto block = cache.publishCommittedBlocks(999, std::vector<uint32_t>(32, 12), 32);
-  cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
+  test::publishCheckpoint(cache, block,
+                          std::make_shared<OffloadState>(transfer));
   cache.endRequest(999);
   {
     auto lookup = cache.lookup(std::vector<uint32_t>(33, 12));
@@ -4627,8 +4990,9 @@ void testKvGrowthProceedsThroughDemotion() {
 void demoteState(engine::Cache &cache, uint64_t block) {
   auto transfer = std::make_shared<OffloadControl>();
   transfer->ready = true;
-  cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
-  require(cache.reclaimOneState() && cache.pollTransfers() &&
+  test::publishCheckpoint(cache, block,
+                          std::make_shared<OffloadState>(transfer));
+  require(cache.reclaimOneState().madeProgress && cache.pollTransfers() &&
               cache.snapshot().stateCache.bytes == 0,
           "fixture state did not move to disk");
 }
@@ -4729,7 +5093,8 @@ void testFailedDiskRestoreKeepsShallowerState() {
   require(cache.ensureTokens(999, 64).granted(), "fixture KV failed");
   static_cast<void>(cache.publishCommittedBlocks(999, prompt, 64));
   demoteState(cache, cache.blockAt(999, 64));
-  cache.publishCompositeState(cache.blockAt(999, 32), std::make_shared<State>());
+  test::publishCheckpoint(cache, cache.blockAt(999, 32),
+                          std::make_shared<State>());
   cache.endRequest(999);
   executor.restoreControl->ready = true;
   executor.restoreControl->success = false;
@@ -4759,7 +5124,8 @@ void testDiskKvPrefixIsRestoredBeforeTheLaneRuns() {
   cache.beginRequest(999);
   require(cache.ensureTokens(999, 64).granted(), "fixture KV failed");
   const auto block = cache.publishCommittedBlocks(999, prompt, 64);
-  cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
+  test::publishCheckpoint(cache, block,
+                          std::make_shared<OffloadState>(transfer));
   cache.endRequest(999);
   require(cache.reclaimOne(reuse).reclaimedBytes == 64 && cache.pollTransfers(),
           "state was not demoted");
@@ -4868,9 +5234,11 @@ void testPagesReturnFromDemotionWithoutSuspending() {
     cache.beginRequest(id);
     require(cache.ensureTokens(id, 32).granted(), "fixture KV failed");
     const auto block = cache.publishCommittedBlocks(id, prompt, 32);
-    cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
+    test::publishCheckpoint(cache, block,
+                            std::make_shared<OffloadState>(transfer));
     cache.endRequest(id);
-    require(cache.reclaimOneState() && cache.pollTransfers(), "state was not demoted");
+    require(cache.reclaimOneState().madeProgress && cache.pollTransfers(),
+            "state was not demoted");
   }
   require(pool.freePageCount() == 2 && tier.demotions == 0, "fixture pages are off");
 
@@ -4891,9 +5259,11 @@ void testPagesReturnFromDemotionWithoutSuspending() {
     static_cast<void>(engine.tick(step));
   }
   require(engine.idle(), "engine did not reach idle");
-  require(events.outputs.contains(1) && executor.prefillRows == 97 && executor.suspensions == 0 &&
-              events.failedCount == 0 && tier.demotions == 2,
-          "lane did not run on the returned pages, or more was written than it lacked");
+  require(events.outputs.contains(1) && executor.prefillRows == 97 &&
+              executor.suspensions == 0 && events.failedCount == 0 &&
+              tier.demotions == 2,
+          "lane did not run on the returned pages, or more was written than it "
+          "lacked");
   const auto stats = cache.snapshot();
   require(stats.kvTier.diskBlocks == 2 && stats.kvTier.pendingPages == 0 &&
               stats.stateCache.diskBytes == 6 * 64,
@@ -4934,10 +5304,11 @@ void testWaitWithProgressOutlivesTheResourceLimit() {
     std::vector<uint32_t> filler(32, static_cast<uint32_t>(id));
     cache.beginRequest(id);
     require(cache.ensureTokens(id, 32).granted(), "filler KV failed");
-    cache.publishCompositeState(cache.publishCommittedBlocks(id, filler, 32),
-                                std::make_shared<OffloadState>(transfer));
+    test::publishCheckpoint(cache, cache.publishCommittedBlocks(id, filler, 32),
+                            std::make_shared<OffloadState>(transfer));
     cache.endRequest(id);
-    require(cache.reclaimOneState() && cache.pollTransfers(), "filler state was not demoted");
+    require(cache.reclaimOneState().madeProgress && cache.pollTransfers(),
+            "filler state was not demoted");
   }
   require(pool.freePageCount() == 2, "fixture pages are off");
 
@@ -4999,10 +5370,11 @@ void testLimitOutlivedByProgressDoesNotWakeTheLoop() {
     std::vector<uint32_t> filler(32, static_cast<uint32_t>(id));
     cache.beginRequest(id);
     require(cache.ensureTokens(id, 32).granted(), "filler KV failed");
-    cache.publishCompositeState(cache.publishCommittedBlocks(id, filler, 32),
-                                std::make_shared<OffloadState>(transfer));
+    test::publishCheckpoint(cache, cache.publishCommittedBlocks(id, filler, 32),
+                            std::make_shared<OffloadState>(transfer));
     cache.endRequest(id);
-    require(cache.reclaimOneState() && cache.pollTransfers(), "filler state was not demoted");
+    require(cache.reclaimOneState().madeProgress && cache.pollTransfers(),
+            "filler state was not demoted");
   }
   EngineRequest running = request(1, std::vector<uint32_t>(33, 5));
   running.deadlineMilliseconds = 1e9;
@@ -5196,13 +5568,13 @@ int main() {
     testRetryCancelledBeforeNextCheckpointKeepsItsSource();
     testRestoredCheckpointAtReplayEndBecomesOrdinary();
     testRetryRetiresCheckpointAtDeeperJunction();
-    testPinnedCheckpointSkipsReplacementButNotOrdinaryState();
+    testPinnedCheckpointSurvivesLaterPublications();
     testFailedReplacementContinuesWithoutRecoveryPoint();
     testRollingHandleCannotRetirePromotedState();
-    testCheckpointDenialPreservesUnrelatedHotState();
+    testCheckpointDenialRecyclesAvailableGroupBacking();
     testCheckpointRecyclesItsBufferBeforeReplacement();
     testCancelAtCheckpointDoesNotPublishDrainingCommand();
-    testFinalStateRecyclesItsCheckpointBeforeUnrelatedHotState();
+    testFinalStateRecyclesByGroupRecency();
     testFinalJunctionRetiresEarlierProgressPoint();
     testShortSuffixContinuesCheckpointDraftState();
     testDefaultCheckpointRestoresLatestCommittedPrefix();
@@ -5215,20 +5587,29 @@ int main() {
     testSharedJunctionEndsBeforeTheGenerationPrompt();
     testImageSpansKeyPrefixIdentity();
     testOneRequestPublishesJunctionAndLatestReplayState();
+    testRestoreAllocationPressure();
+    testRestoreWaitsForHostPressure();
     testLatestReplayDenialRecyclesOlderStateNotTheJunction();
     testCancellationAfterJunctionDiscardsLaterState();
     testDeniedSnapshotCostsOnlyThatAttempt();
+    testSnapshotAdmissionReclaimsUntilItFits();
+    testDiskSnapshotFollowsRamReclaim();
     testDeniedSnapshotRecyclesLruStateAndRetries();
-    testPersistentSnapshotDenialRecyclesAtMostOneState();
+    testSnapshotDenialStopsWhenGroupIsExhausted();
     testStateWithoutACacheSlotGoesToDisk();
     testStateAlreadyOnDiskIsDeduplicated();
     testCancelledPrefillRecoversFromItsDiskCheckpoint();
     testFailedFinalStateKeepsTheDiskCheckpoint();
-    testNearFinalCheckpointAvoidsDiskWrite();
-    testSkippedCheckpointKeepsPreviousRecoveryPoint();
+    testCheckpointsUseTheSameAdmissionAtEveryBoundary();
+    testDiskFallbackReplacesCheckpointAfterRamDenial();
+    testSnapshotReclaimsOnlyReusableBackingFromFailedGroup();
     testLongSuffixSkipsDraftRestore();
     testCancellationInFlightAtBoundaryPublishesNoState();
     testActiveCellGrowthReclaimsCachedStateAndRetries();
+    testDraftWriteGrowthReclaimsCachedState();
+    testUntaggedHostPressureWaitsForController();
+    testModelGrowthReleasesPhysicalBacking();
+    testModelGrowthReusesItsGroupUnderHostPressure();
     testKvGrowthReclaimsIdleStateBeforeCache();
     testKvGrowthDenialKeepsEveryLaneReplayState();
     testPressureReclaimRespectsStateLifetimes();
@@ -5263,7 +5644,7 @@ int main() {
     testAdmissionRetryWakesOnlyWhenTickCanRetry();
     testDecodePreemptionReplaysCommittedHistoryWithoutRepeatingOutput();
     testLongDecodePreemptionPlansTheCurrentReplayBoundary();
-    testPreemptedDecodeRestoresItsResidentCompositeState();
+    testPreemptedDecodeRestoresItsResidentState();
     testPreemptedDecodeReplayBoundaryIgnoresTheGenerationPrompt();
     testRepeatedPreemptionRespectsBackoffAndCancellation();
     testAdmissionReopensAfterLastSuspendedRequestResumes();

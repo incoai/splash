@@ -32,8 +32,9 @@ struct ModelDescriptor final {
   ops::VisionLayout vision;
   ModelCapabilities capabilities;
   kv::Layout targetKvLayout;
-  CompositeStateLayout stateLayout;
-  // Container selection belongs to loading; runtime dispatch follows each weight.
+  ModelStateLayout stateLayout;
+  // Container selection belongs to loading; runtime dispatch follows each
+  // weight.
   TargetSource targetSource = TargetSource::Packed;
   DraftSource draftSource = DraftSource::Packed;
   VisionSource visionSource = VisionSource::Packed;

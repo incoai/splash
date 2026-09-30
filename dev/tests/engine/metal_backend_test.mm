@@ -1,5 +1,5 @@
-#include "../../../runtime/metal/MetalBackend.hpp"
 #include "../../../runtime/metal/DeviceQueries.hpp"
+#include "../../../runtime/metal/MetalBackend.hpp"
 #include "../../../runtime/ops/PagedKv.hpp"
 
 #import <Foundation/Foundation.h>
@@ -31,11 +31,11 @@
 namespace {
 
 using splash::metal::AllocationFailure;
-using splash::metal::MetalAllocationError;
 using splash::metal::BufferBinding;
 using splash::metal::BufferStorage;
 using splash::metal::BytesBinding;
 using splash::metal::ComputeDispatch;
+using splash::metal::MetalAllocationError;
 using splash::metal::MetalBackend;
 using splash::metal::MetalBackendError;
 using splash::metal::MetalBuffer;
@@ -168,7 +168,8 @@ void completionDoesNotWaitForMemoryTelemetry(const std::string &metallibPath) {
             "completion handler did not drain after telemetry was released");
     require(completed, "test GPU command did not complete");
     require(ready && healthy && completionMemoryQueries == 0,
-            "completed GPU work depends on memory telemetry and can trip the watchdog");
+            "completed GPU work depends on memory telemetry and can trip the "
+            "watchdog");
     require(memoryQueries > queriesBeforeConsumption,
             "consuming a completed command did not refresh admission telemetry");
     const unsigned queriesAfterConsumption = memoryQueries;
@@ -226,6 +227,53 @@ void delayCompletionNotification(id command, SEL selector, MTLCommandBufferHandl
         handler(completed);
         delayedCompletionReturned.set_value();
     });
+}
+
+void indirectBuffersStayResident(const std::string &metallibPath) {
+  MetalBackend backend(metallibPath), other(metallibPath);
+  auto output = backend.allocateBuffer(sizeof(uint32_t));
+  const auto outputBytes = backend.memoryStats().allocatedBytes;
+  auto source = backend.allocateBuffer(2 * sizeof(uint32_t));
+  auto view = backend.view(source, sizeof(uint32_t), sizeof(uint32_t));
+  *static_cast<uint32_t *>(view.contents()) = 73;
+  const uint64_t address = view.gpuAddress();
+  require(address == source.gpuAddress() + sizeof(uint32_t) &&
+              MetalBuffer{}.gpuAddress() == 0,
+          "GPU address does not preserve the buffer view offset");
+  ComputeDispatch dispatch;
+  dispatch.pipelineName = "test_indirect_copy_u32";
+  dispatch.buffers = {{1, output}};
+  dispatch.bytes = {{0, &address, sizeof(address)}};
+  dispatch.threadgroups = dispatch.threadsPerThreadgroup = {1, 1, 1};
+  dispatch.indirectBuffers = {MetalBuffer{}};
+  requireBackendError([&] { (void)backend.submit(dispatch); },
+                      "empty indirect buffer was accepted");
+  dispatch.indirectBuffers = {other.allocateBuffer(sizeof(uint32_t))};
+  requireBackendError([&] { (void)backend.submit(dispatch); },
+                      "foreign indirect buffer was accepted");
+  dispatch.indirectBuffers = {view};
+  const auto resident = backend.memoryStats().allocatedBytes;
+  id<MTLCommandQueue> queue = [MTLCreateSystemDefaultDevice() newCommandQueue];
+  id<MTLCommandBuffer> command = [queue commandBuffer];
+  commandWatchdogGate = [MTLCreateSystemDefaultDevice() newSharedEvent];
+  {
+    MethodReplacement commit(command, @selector(commit),
+                             reinterpret_cast<IMP>(commitBehindWatchdogGate));
+    originalCommandCommit = commit.original;
+    auto ticket = backend.submitAsync(dispatch);
+    dispatch.indirectBuffers.clear();
+    source = {};
+    view = {};
+    require(!ticket.ready() && backend.memoryStats().allocatedBytes == resident,
+            "pending indirect allocation was released early");
+    commandWatchdogGate.signaledValue = 1;
+    (void)ticket.wait();
+  }
+  require(*static_cast<uint32_t *>(output.contents()) == 73 &&
+              backend.memoryStats().allocatedBytes == outputBytes,
+          "indirect command failed or retained its input after completion");
+  commandWatchdogGate = nil;
+  std::cout << "PASS indirect resource lifetime and validation\n";
 }
 
 void terminalCommandRecovers(const std::string &metallibPath, bool failed,
@@ -404,7 +452,8 @@ void keptBuffersStayResident(const std::string &metallibPath) {
     const std::chrono::duration<double> lapsedAfter = std::chrono::steady_clock::now() - start;
     require(backend.lapsedResidentBytes() == 2 * each &&
                 lapsedAfter.count() >= kKeepAliveSeconds,
-            "kept buffers did not lapse once the keep-alive passed without a command");
+            "kept buffers did not lapse once the keep-alive passed without a "
+            "command");
     dropped = {};
     require(backend.lapsedResidentBytes() == each,
             "a buffer whose last view is gone is still kept");
@@ -1439,14 +1488,15 @@ int main(int argc, const char *argv[]) {
             return 2;
         }
         try {
-            completionDoesNotWaitForMemoryTelemetry(argv[1]);
-            terminalCommandRecovers(argv[1], false);
-            terminalCommandRecovers(argv[1], false, true);
-            terminalCommandRecovers(argv[1], true);
-            pendingCommandStillTimesOut(argv[1]);
-            keptBuffersStayResident(argv[1]);
-            residencyRacesTheHeartbeat(argv[1]);
-            run(argv[1]);
+          indirectBuffersStayResident(argv[1]);
+          completionDoesNotWaitForMemoryTelemetry(argv[1]);
+          terminalCommandRecovers(argv[1], false);
+          terminalCommandRecovers(argv[1], false, true);
+          terminalCommandRecovers(argv[1], true);
+          pendingCommandStillTimesOut(argv[1]);
+          keptBuffersStayResident(argv[1]);
+          residencyRacesTheHeartbeat(argv[1]);
+          run(argv[1]);
         } catch (const std::exception &error) {
             std::cerr << "FAIL: unexpected exception: " << error.what()
                       << '\n';

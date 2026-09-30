@@ -1,3 +1,4 @@
+#include "TestStateSnapshot.hpp"
 #include "engine/Cache.hpp"
 
 #include <cstdlib>
@@ -69,7 +70,7 @@ private:
   uint32_t maximumResidentPages_;
 };
 
-class State final : public CompositeState {
+class State final : public StatePayload {
 public:
   explicit State(uint64_t bytes) : bytes_(bytes) {}
   uint64_t bytes() const noexcept override { return bytes_; }
@@ -91,7 +92,7 @@ CacheNamespace cacheNamespace() {
 
 void publish(engine::Cache &resources, uint64_t block,
              uint64_t bytes) {
-  resources.publishCompositeState(block, std::make_shared<State>(bytes));
+  test::publishCheckpoint(resources, block, std::make_shared<State>(bytes));
 }
 
 std::vector<uint32_t> tokens(uint32_t count, uint32_t salt = 0) {
@@ -143,13 +144,13 @@ void testKvDeeperThanStateAndDependencyEviction() {
           "dense KV did not expose the lazy state junction");
   lookup.state.reset();
   require(resources.reclaimCache(1, false) >= 100,
-          "unreferenced composite state was not reclaimed first");
+          "unreferenced restore state was not reclaimed first");
   require(resources.snapshot().kvCache.blocks == 2,
           "LRU reclaim did not remove the older fragmented KV leaf first");
   require(resources.reclaimCache(1, false) != 0,
           "KV backing was not reclaimed after cached state");
   require(resources.snapshot().stateCache.entries == 0,
-          "composite state outlived its KV dependency");
+          "restore state outlived its KV dependency");
 }
 
 void testActiveTipProtectsTheContentChain() {
@@ -221,7 +222,7 @@ void testFragmentedColdKvPrecedesNewerState() {
 }
 
 // A request short of logical pages evicts the least recently used KV leaf
-// together with its composite state. A leaf whose state a lookup holds is
+// together with its restore state. A leaf whose state a lookup holds is
 // not a candidate, so the next leaf goes instead.
 void testLogicalPressureEvictsALeafWithItsState() {
   for (bool leased : {false, true}) {
@@ -314,7 +315,8 @@ void testReclaimDefersBehindInFlightRelease() {
               backing.unmappedExtents == 1 && resources.releaseDeferred() &&
               resources.snapshot().kvCache.blocks == 1 &&
               resources.snapshot().pool.reclaimableExtents == 1,
-          "reclaim queued a second unmap or evicted cache behind an in-flight release");
+          "reclaim queued a second unmap or evicted cache behind an in-flight "
+          "release");
   require(resources.reclaimCache(1ULL << 30, false) == 0 &&
               !resources.reclaimOne().madeProgress &&
               backing.unmappedExtents == 1 &&

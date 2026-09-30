@@ -673,6 +673,12 @@ BufferStorage MetalBuffer::storage() const noexcept {
                                       : BufferStorage::Shared;
 }
 
+uint64_t MetalBuffer::gpuAddress() const noexcept {
+  return impl_ && impl_->allocation
+             ? impl_->allocation->buffer.gpuAddress + impl_->offsetBytes
+             : 0;
+}
+
 void *MetalBuffer::contents() const noexcept {
     if (!impl_ || !impl_->allocation ||
         impl_->allocation->storage != BufferStorage::Shared) {
@@ -847,8 +853,9 @@ MetalBackend::MetalBackend(std::string metallibPath, double commandTimeoutSecond
                 MTLSharedEventListener *listener =
                     [MTLSharedEventListener sharedListener];
                 if (!listener) {
-                    throw MetalAllocationError(
-                        "placement-sparse probe could not allocate its completion listener");
+                  throw MetalAllocationError(
+                      "placement-sparse probe could not "
+                      "allocate its completion listener");
                 }
                 MTL4UpdateSparseBufferMappingOperation operation{};
                 operation.mode = MTLSparseTextureMappingModeMap;
@@ -883,11 +890,13 @@ MetalBackend::MetalBackend(std::string metallibPath, double commandTimeoutSecond
                         }];
                 }
                 if (!mapped || !unmapped) {
-                    throw MetalBackendError(
-                        std::string("placement-sparse probe timed out after 5000 ms waiting for ") +
-                        (!mapped ? "mapping" : "unmapping") +
-                        " (last signaled event=" +
-                        std::to_string(impl_->sparseEvent.signaledValue) + ')');
+                  throw MetalBackendError(
+                      std::string(
+                          "placement-sparse probe timed out after 5000 ms "
+                          "waiting for ") +
+                      (!mapped ? "mapping" : "unmapping") +
+                      " (last signaled event=" +
+                      std::to_string(impl_->sparseEvent.signaledValue) + ')');
                 }
                 impl_->nextSparseEventValue = 2;
             }
@@ -1256,14 +1265,15 @@ MetalBuffer MetalBackend::wrapSharedMemory(
 
     id<MTLBuffer> buffer = [impl_->device
         newBufferWithBytesNoCopy:address
-        length:checkedNSUInteger(bytes, "shared memory size")
-        options:MTLResourceStorageModeShared
-        deallocator:^(void *, NSUInteger) {
-            // Metal may retain the buffer beyond our last C++ view/ticket,
-            // including while a completed command's handler is returning.
-            // Keep its backing owner until Metal actually releases it.
-            (void)lifetime;
-        }];
+                          length:checkedNSUInteger(bytes, "shared memory size")
+                         options:MTLResourceStorageModeShared
+                     deallocator:^(void *, NSUInteger) {
+                       // Metal may retain the buffer beyond our last C++
+                       // view/ticket, including while a completed command's
+                       // handler is returning. Keep its backing owner until
+                       // Metal actually releases it.
+                       (void)lifetime;
+                     }];
     if (!buffer) {
         throw MetalBackendError("zero-copy Metal buffer creation failed");
     }
@@ -1414,12 +1424,18 @@ CommandTicket MetalBackend::submitCommandAsync(
             }
             claim(binding.index);
         }
+        for (const auto &buffer : dispatch.indirectBuffers) {
+          if (!buffer.impl_ || !buffer.impl_->allocation ||
+              buffer.impl_->allocation->accounting.get() !=
+                  impl_->accounting.get())
+            throw MetalBackendError("invalid indirect dispatch buffer");
+        }
         for (const BytesBinding &binding : dispatch.bytes) {
-            if (!binding.data || !binding.sizeBytes) {
-                throw MetalBackendError("compute byte binding is empty");
-            }
-            checkedNSUInteger(binding.sizeBytes, "byte binding size");
-            claim(binding.index);
+          if (!binding.data || !binding.sizeBytes) {
+            throw MetalBackendError("compute byte binding is empty");
+          }
+          checkedNSUInteger(binding.sizeBytes, "byte binding size");
+          claim(binding.index);
         }
         prepared.push_back(item);
     }
@@ -1448,7 +1464,16 @@ CommandTicket MetalBackend::submitCommandAsync(
             }
         }
     }
-    ticketState->sequence = impl_->asyncState->beginSubmission(dispatches.size());
+    std::unordered_set<const MetalAllocation *> indirectAllocations;
+    for (const auto &dispatch : dispatches)
+      for (const auto &buffer : dispatch.indirectBuffers) {
+        const auto &allocation = buffer.impl_->allocation;
+        indirectAllocations.insert(allocation.get());
+        if (retained.insert(allocation.get()).second)
+          ticketState->retainedAllocations.push_back(allocation);
+      }
+    ticketState->sequence =
+        impl_->asyncState->beginSubmission(dispatches.size());
 
     auto failBeforeCommit = [&](std::string message) {
         impl_->markUnhealthy(message);
@@ -1477,25 +1502,30 @@ CommandTicket MetalBackend::submitCommandAsync(
             failBeforeCommit("unable to create Metal compute encoder");
         }
         try {
-            for (const PreparedDispatch &item : prepared) {
-                const ComputeDispatch &dispatch = *item.source;
-                [encoder setComputePipelineState:item.pipeline];
-                for (const BufferBinding &binding : dispatch.buffers) {
-                    const MetalBuffer::Impl &buffer = *binding.buffer.impl_;
-                    [encoder setBuffer:buffer.allocation->buffer
-                                offset:checkedNSUInteger(buffer.offsetBytes,
-                                                         "buffer offset")
-                               atIndex:binding.index];
-                }
-                for (const BytesBinding &binding : dispatch.bytes) {
-                    [encoder setBytes:binding.data
-                               length:checkedNSUInteger(binding.sizeBytes,
-                                                        "byte binding size")
-                              atIndex:binding.index];
-                }
-                [encoder dispatchThreadgroups:item.groups
-                         threadsPerThreadgroup:item.threads];
+          // A page can appear as K and V in every layer. Declare its use once
+          // for this encoder; the ticket owns it until command completion.
+          for (const auto *allocation : indirectAllocations)
+            [encoder useResource:allocation->buffer
+                           usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+          for (const PreparedDispatch &item : prepared) {
+            const ComputeDispatch &dispatch = *item.source;
+            [encoder setComputePipelineState:item.pipeline];
+            for (const BufferBinding &binding : dispatch.buffers) {
+              const MetalBuffer::Impl &buffer = *binding.buffer.impl_;
+              [encoder setBuffer:buffer.allocation->buffer
+                          offset:checkedNSUInteger(buffer.offsetBytes,
+                                                   "buffer offset")
+                         atIndex:binding.index];
             }
+            for (const BytesBinding &binding : dispatch.bytes) {
+              [encoder setBytes:binding.data
+                         length:checkedNSUInteger(binding.sizeBytes,
+                                                  "byte binding size")
+                        atIndex:binding.index];
+            }
+            [encoder dispatchThreadgroups:item.groups
+                    threadsPerThreadgroup:item.threads];
+          }
             [encoder endEncoding];
         } catch (...) {
             impl_->asyncState->releaseSubmission(ticketState->sequence);

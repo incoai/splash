@@ -1,6 +1,7 @@
-#include "model/Model.hpp"
 #include "benchmarks/PrefillWork.hpp"
 #include "engine/Engine.hpp"
+#include "model/Model.hpp"
+#include "model/WindowPlan.hpp"
 
 #include <algorithm>
 #include <array>
@@ -32,6 +33,42 @@ cachedPlan(uint32_t replayBegin, uint32_t replayEnd,
   return planDraftContext(
       replayBegin, replayEnd, restored,
       {materializationBoundaries.begin(), materializationBoundaries.size()});
+}
+
+void testDemandAwareWindowCoverage() {
+  const std::array<uint32_t, 2> optional{5120, 6144};
+  const auto absent = planWindow(4096, 8192, 2048, 4096, optional);
+  require(absent.usable && absent.loadBegin == 4096 &&
+              absent.boundaries.size() == 2 &&
+              absent.boundaries.front().tokens == 6144,
+          "missing old pages rejected a long suffix or retained an impossible "
+          "checkpoint");
+  const auto present = planWindow(4096, 8192, 2048, 3072, optional);
+  require(present.usable && present.loadBegin == 3072 &&
+              present.boundaries.size() == 3,
+          "available old suffix did not preserve the early checkpoint");
+  require(planWindow(4096, 5120, 2048, 3072).usable &&
+              !planWindow(4096, 5120, 2048, 3104).usable,
+          "short suffix coverage ignored a needed old page");
+  // Independent row coverage oracle across aligned availability and arbitrary
+  // P.
+  for (uint32_t b : {0u, 32u, 2048u, 4096u})
+    for (uint32_t a = b - std::min(b, 2048u); a <= b; a += 32)
+      for (uint32_t suffix = 0; suffix <= 2304; suffix += 127) {
+        const uint32_t p = b + suffix;
+        const auto plan = planWindow(b, p, 2048, a);
+        const bool expected = suffix >= 2048 || a <= p - std::min(p, 2048u);
+        require(plan.usable == expected,
+                "window match disagrees with row coverage");
+        if (!plan.usable)
+          continue;
+        for (uint32_t row = p - std::min(p, 2048u); row < p; ++row) {
+          bool covered = row >= plan.loadBegin && row < plan.loadEnd;
+          for (const auto &capture : plan.captures)
+            covered |= row >= capture.begin && row < capture.end;
+          require(covered, "planned boundary reads an unavailable row");
+        }
+      }
 }
 
 void testColdLengths() {
@@ -272,7 +309,7 @@ void testInvalidInputs() {
   } catch (const std::invalid_argument &) {
     threw = true;
   }
-  require(threw, "KV-only replay without composite state was accepted");
+  require(threw, "KV-only replay without restore state was accepted");
 
   threw = false;
   try {
@@ -296,6 +333,7 @@ void testInvalidInputs() {
 
 int main() {
   try {
+    testDemandAwareWindowCoverage();
     testColdLengths();
     testPartialHit();
     testFinalFullBlockBound();

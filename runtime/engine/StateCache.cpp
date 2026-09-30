@@ -1,77 +1,165 @@
 #include "engine/StateCache.hpp"
 
 #include <algorithm>
-#include <limits>
+#include <set>
 #include <stdexcept>
 #include <utility>
 
 namespace splash::engine {
 
-CompositeStateLease::CompositeStateLease(
-    StateCache &owner, uint64_t kvBlock, uint32_t boundary,
-    std::shared_ptr<const CompositeState> state) noexcept
-    : owner_(&owner), kvBlock_(kvBlock), boundary_(boundary),
-      state_(std::move(state)) {}
-
-CompositeStateLease::CompositeStateLease(CompositeStateLease &&other) noexcept
-    : owner_(std::exchange(other.owner_, nullptr)),
-      kvBlock_(std::exchange(other.kvBlock_, 0)),
-      boundary_(std::exchange(other.boundary_, 0)),
-      state_(std::move(other.state_)) {}
-
-CompositeStateLease &
-CompositeStateLease::operator=(CompositeStateLease &&other) noexcept {
-  if (this == &other)
-    return *this;
-  reset();
-  owner_ = std::exchange(other.owner_, nullptr);
-  kvBlock_ = std::exchange(other.kvBlock_, 0);
-  boundary_ = std::exchange(other.boundary_, 0);
-  state_ = std::move(other.state_);
+RestoreLease::RestoreLease(KvCache &kv, uint64_t block,
+                           std::shared_ptr<const RestoreState> state,
+                           std::vector<StateBlockLease> leases)
+    : kv_(&kv), block_(block), state_(std::move(state)),
+      leases_(std::move(leases)) {
+  kv_->retainActive(block_);
+}
+RestoreLease::RestoreLease(RestoreLease &&other) noexcept
+    : kv_(std::exchange(other.kv_, nullptr)), block_(other.block_),
+      state_(std::move(other.state_)), leases_(std::move(other.leases_)) {}
+RestoreLease &RestoreLease::operator=(RestoreLease &&other) noexcept {
+  if (this != &other) {
+    reset();
+    kv_ = std::exchange(other.kv_, nullptr);
+    block_ = other.block_;
+    state_ = std::move(other.state_);
+    leases_ = std::move(other.leases_);
+  }
   return *this;
 }
+RestoreLease::~RestoreLease() noexcept { reset(); }
 
-CompositeStateLease::~CompositeStateLease() noexcept { reset(); }
-
-void CompositeStateLease::reset() noexcept {
-  if (owner_)
-    owner_->release(kvBlock_);
-  owner_ = nullptr;
-  kvBlock_ = 0;
-  boundary_ = 0;
+void RestoreLease::reset() noexcept {
+  // Release all pins before dropping the retained target ancestry.
+  for (auto &lease : leases_)
+    lease.reset();
+  leases_.clear();
   state_.reset();
+  if (kv_)
+    kv_->releaseActive(block_);
+  kv_ = nullptr;
+  block_ = 0;
 }
 
-std::optional<CompositeStateLease>
-StateCache::acquireDeepest(std::span<const uint64_t> kvChain) {
-  for (auto block = kvChain.rbegin(); block != kvChain.rend(); ++block) {
-    if (auto lease = acquireBlock(*block))
-      return lease;
+StateCache::StateCache(KvCache &kv, CacheRecency &recency)
+    : kv_(kv), recency_(recency), coordinator_({{0}}) {
+  configure({{0}});
+}
+void StateCache::configure(std::vector<CacheGroupSpec> specs) {
+  CacheGroupCoordinator coordinator(specs);
+  if (std::equal(coordinator.groups().begin(), coordinator.groups().end(),
+                 coordinator_.groups().begin(), coordinator_.groups().end()) &&
+      groups_.size() == specs.size())
+    return;
+  for (const auto &[_, store] : groups_)
+    if (store->snapshot().entries || store->writing())
+      throw std::logic_error("cache groups cannot change after publication");
+  std::map<CacheGroupId, std::unique_ptr<StateGroupCache>> groups;
+  for (const auto &spec : specs) {
+    auto store = std::make_unique<StateGroupCache>(kv_, recency_, spec);
+    if (spec.kind == CacheGroupKind::Checkpoint)
+      store->setRemovalHandler(
+          [this](uint64_t leaf) { pruneWindowDependencies(leaf); });
+    groups.emplace(spec.id, std::move(store));
   }
-  return std::nullopt;
+  groups_ = std::move(groups);
+  coordinator_ = std::move(coordinator);
+}
+StateGroupCache &StateCache::group(CacheGroupId id) { return *groups_.at(id); }
+const StateGroupCache &StateCache::group(CacheGroupId id) const {
+  return *groups_.at(id);
+}
+uint64_t StateCache::endpoint(uint64_t leaf, uint32_t boundary) const {
+  if (boundary % KvCache::pageTokens)
+    throw std::invalid_argument(
+        "state block is not aligned to target prefix identity");
+  return kv_.ancestor(leaf, boundary / KvCache::pageTokens);
 }
 
-std::optional<CompositeStateLease> StateCache::acquireBlock(uint64_t kvBlock) {
-  auto found = entries_.find(kvBlock);
-  if (found == entries_.end() || found->second.invalid)
+std::optional<RestoreState> StateCache::match(std::span<const uint64_t> chain,
+                                              bool residentOnly,
+                                              uint32_t prompt) const {
+  if (chain.empty())
     return std::nullopt;
-  Entry &entry = found->second;
-  if (!kv_.contains(kvBlock)) {
-    throw std::logic_error("composite state outlived its target KV block");
+  // Some callers provide just a candidate endpoint; matching always checks its
+  // actual ancestry, never unrelated blocks with equal token positions.
+  const auto full = kv_.chain(chain.back());
+  return coordinator_.match(
+      full.blocks.size() * KvCache::pageTokens, KvCache::pageTokens,
+      [&](CacheGroupId id, uint32_t end) {
+        if (!end || end % KvCache::pageTokens ||
+            end / KvCache::pageTokens > full.blocks.size())
+          return std::optional<CachedStateBlock>{};
+        auto part = group(id).peek(full.blocks[end / KvCache::pageTokens - 1]);
+        if (residentOnly && part &&
+            part->payload->residentBytes() != part->payload->bytes())
+          return std::optional<CachedStateBlock>{};
+        return part;
+      },
+      prompt);
+}
+uint32_t StateCache::matchedBoundary(std::span<const uint64_t> chain,
+                                     uint32_t prompt) const {
+  const auto state = match(chain, false, prompt);
+  return state ? state->boundary : 0;
+}
+std::optional<RestoreLease>
+StateCache::acquireDeepest(std::span<const uint64_t> chain, uint32_t prompt) {
+  auto matched = match(chain, false, prompt);
+  if (!matched)
+    return std::nullopt;
+  const uint64_t leaf = endpoint(chain.back(), matched->boundary);
+  auto state = std::make_shared<RestoreState>(std::move(*matched));
+  std::vector<StateBlockLease> leases;
+  leases.reserve(state->blocks.size());
+  for (auto &block : state->blocks) {
+    const uint64_t id = endpoint(leaf, block.end);
+    auto lease = group(block.group).acquireBlock(id);
+    if (!lease || lease->kvBlock() != id)
+      throw std::logic_error("cache group changed during restore acquisition");
+    block.payload = lease->state();
+    leases.push_back(std::move(*lease));
   }
-  if (entry.pins == std::numeric_limits<uint32_t>::max()) {
-    throw std::overflow_error("composite state pin count overflowed");
+  return RestoreLease(kv_, leaf, std::move(state), std::move(leases));
+}
+std::optional<RestoreLease> StateCache::acquireResumePoint() {
+  std::optional<CacheEvictionCandidate> selected;
+  bool selectedCheckpoint = false;
+  const bool hasCheckpoint = std::any_of(
+      coordinator_.groups().begin(), coordinator_.groups().end(),
+      [](const auto &spec) { return spec.kind == CacheGroupKind::Checkpoint; });
+  for (const auto &spec : coordinator_.groups()) {
+    if (hasCheckpoint && spec.kind != CacheGroupKind::Checkpoint)
+      continue;
+    const auto &store = groups_.at(spec.id);
+    const auto block = store->resumePoint();
+    if (!block)
+      continue;
+    const auto state = match(std::span(&block, 1), true);
+    if (!state || !state->resident())
+      continue;
+    const auto leaf = endpoint(block, state->boundary);
+    const auto candidate = store->candidate(leaf);
+    if (!candidate)
+      continue;
+    const bool checkpoint = bool(store->checkpoint(leaf));
+    if (!selected || (selectedCheckpoint && !checkpoint) ||
+        (selectedCheckpoint == checkpoint &&
+         candidate->lastUsed > selected->lastUsed)) {
+      selected = candidate;
+      selectedCheckpoint = checkpoint;
+    }
   }
-  if (!entry.pins && pinnedEntries_ == std::numeric_limits<uint32_t>::max()) {
-    throw std::overflow_error("composite state pinned entry count overflowed");
-  }
-  kv_.retainActive(kvBlock);
-  if (!entry.pins)
-    ++pinnedEntries_;
-  ++entry.pins;
-  reindex(kvBlock, entry);
-  const uint32_t boundary = kv_.chainLength(kvBlock) * KvCache::pageTokens;
-  return CompositeStateLease(*this, kvBlock, boundary, copy(entry));
+  if (!selected)
+    return std::nullopt;
+  // One lease protects the entire common restore boundary, including every
+  // window block and its target ancestry, for this speculative shrink.
+  return acquireDeepest(std::span(&selected->id, 1));
+}
+bool StateCache::isCheckpoint(
+    const CacheEvictionCandidate &candidate) const noexcept {
+  return candidate.group &&
+         bool(group(*candidate.group).checkpoint(candidate.id));
 }
 
 void StateCache::recordLookup(bool hit, bool disk) noexcept {
@@ -79,424 +167,363 @@ void StateCache::recordLookup(bool hit, bool disk) noexcept {
   if (disk) ++diskHits_;
 }
 
-bool StateCache::touchIfResident(uint64_t kvBlock, bool checkpoint) {
-  return resident(kvBlock) && touchIfStored(kvBlock, checkpoint);
+bool StateCache::contains(uint64_t block) const noexcept {
+  return std::any_of(groups_.begin(), groups_.end(), [block](const auto &g) {
+    return g.second->contains(block);
+  });
+}
+bool StateCache::resident(uint64_t block) const noexcept {
+  return std::any_of(groups_.begin(), groups_.end(), [block](const auto &g) {
+    return g.second->resident(block);
+  });
+}
+void StateCache::touch(std::span<const uint64_t> chain) noexcept {
+  // The request used this target prefix. Touch its resident cache records once,
+  // checkpoint groups before window dependencies. A partial window can still
+  // serve a later request, so recency does not depend on full-window coverage.
+  for (const auto &spec : coordinator_.groups())
+    for (uint64_t block : chain)
+      group(spec.id).touch(block);
+}
+bool StateCache::touchIfResident(uint64_t block, bool checkpoint) {
+  const auto state = match(std::span(&block, 1));
+  if (!state ||
+      state->boundary != kv_.chainLength(block) * KvCache::pageTokens ||
+      !state->resident())
+    return false;
+  return touchIfStored(block, checkpoint);
 }
 
-bool StateCache::touchIfStored(uint64_t kvBlock, bool checkpoint) {
-  auto found = entries_.find(kvBlock);
-  if (found == entries_.end() || found->second.invalid)
+bool StateCache::touchIfStored(uint64_t block, bool checkpoint) {
+  const auto state = match(std::span(&block, 1));
+  if (!state || state->boundary != kv_.chainLength(block) * KvCache::pageTokens)
     return false;
-  if (!kv_.contains(kvBlock)) {
-    throw std::logic_error("composite state outlived its target KV block");
-  }
-  Entry &entry = found->second;
-  if (!checkpoint)
-    makeOrdinary(kvBlock, entry);
-  if (!entry.pins)
-    entry.lastUsed = recency_.next();
-  reindex(kvBlock, entry);
-  ++deduplicatedPublications_;
+  for (const auto &part : state->blocks)
+    static_cast<void>(
+        group(part.group).touchIfStored(endpoint(block, part.end), checkpoint));
   return true;
 }
 
-void StateCache::touch(uint64_t kvBlock) noexcept {
-  auto found = entries_.find(kvBlock);
-  if (found == entries_.end() || found->second.pins)
-    return;
-  found->second.lastUsed = recency_.next();
-  reindex(kvBlock, found->second);
+void StateCache::validate(uint64_t leaf, const RestoreState &state) const {
+  if (!kv_.contains(leaf) ||
+      state.boundary != kv_.chainLength(leaf) * KvCache::pageTokens)
+    throw std::invalid_argument("restore boundary has no target prefix");
+  std::set<std::pair<CacheGroupId, uint32_t>> endpoints;
+  for (const auto &part : state.blocks) {
+    const auto specs = coordinator_.groups();
+    const auto spec =
+        std::find_if(specs.begin(), specs.end(),
+                     [&](const auto &g) { return g.id == part.group; });
+    if (spec == specs.end() || !part.payload || !part.payload->bytes() ||
+        !part.end || part.end > state.boundary || part.begin > part.end ||
+        part.begin % KvCache::pageTokens || part.end % KvCache::pageTokens ||
+        (spec->kind == CacheGroupKind::Checkpoint
+             ? part.begin != part.end
+             : part.end - part.begin != KvCache::pageTokens) ||
+        !endpoints.emplace(part.group, part.end).second)
+      throw std::invalid_argument("invalid cache group block");
+  }
 }
 
-void StateCache::publish(uint64_t kvBlock,
-                         std::shared_ptr<const CompositeState> state,
+void StateCache::publish(uint64_t leaf,
+                         std::shared_ptr<const RestoreState> state,
                          bool checkpoint) {
-  if (!state || !state->bytes()) {
-    throw std::invalid_argument("composite state payload is empty");
-  }
-  if (state->residentBytes() != state->bytes())
-    throw std::invalid_argument("published state must be in RAM");
-  if (!kv_.contains(kvBlock)) {
-    throw std::invalid_argument("composite state KV block is unknown");
-  }
-  if (publications_ == std::numeric_limits<uint64_t>::max())
-    throw std::overflow_error("composite state publication count overflowed");
-  const uint64_t stateBytes = state->bytes();
-  if (bytes_ > std::numeric_limits<uint64_t>::max() - stateBytes) {
-    throw std::overflow_error("composite state byte count overflowed");
-  }
-  if (resident(kvBlock))
-    throw std::logic_error("duplicate composite state key");
-
-  Entry &entry = publicationEntry(kvBlock, checkpoint);
-  entry.ram = std::move(state);
-  bytes_ += stateBytes;
-  if (entry.checkpoint)
-    checkpointBytes_ += stateBytes;
-  if (!entry.pins)
-    entry.lastUsed = recency_.next();
-  reindex(kvBlock, entry);
-  ++publications_;
-}
-
-bool StateCache::publishToDisk(uint64_t kvBlock, const StateWriter &write,
-                               const std::function<void()> &completion,
-                               const std::function<bool()> &makeRoom, bool checkpoint) {
-  if (!kv_.contains(kvBlock)) {
-    throw std::invalid_argument("composite state KV block is unknown");
-  }
-  if (publications_ == std::numeric_limits<uint64_t>::max())
-    throw std::overflow_error("composite state publication count overflowed");
-  if (resident(kvBlock))
-    throw std::logic_error("duplicate composite state key");
-  // The state is on disk already; a second copy would add nothing.
-  if (touchIfStored(kvBlock, checkpoint))
-    return true;
-  // A checkpoint replaces older copies like any state: it is the only
-  // progress a suspended request keeps once the quota is full.
-  std::unique_ptr<StateOffload> transfer = startWrite(write, completion, makeRoom);
-  if (!transfer)
-    return false;
-  Entry &entry = publicationEntry(kvBlock, checkpoint);
-  beginWrite(kvBlock, entry, std::move(transfer));
-  if (!entry.pins)
-    entry.lastUsed = recency_.next();
-  reindex(kvBlock, entry);
-  ++publications_;
-  return true;
-}
-
-StateCheckpoint StateCache::checkpoint(uint64_t kvBlock) const noexcept {
-  const auto found = entries_.find(kvBlock);
-  if (found == entries_.end() || !found->second.checkpoint)
-    return {};
-  return {kvBlock, found->second.publication};
-}
-
-bool StateCache::retireCheckpoint(StateCheckpoint checkpoint) noexcept {
-  const auto found = entries_.find(checkpoint.kvBlock);
-  if (found == entries_.end() || !found->second.checkpoint ||
-      found->second.publication != checkpoint.publication)
-    return true;
-  return erase(checkpoint.kvBlock, true).evicted;
-}
-
-void StateCache::makeOrdinary(uint64_t kvBlock, Entry &entry) {
-  kv_.noteState(kvBlock);
-  if (!entry.checkpoint)
-    return;
-  --checkpointEntries_;
-  checkpointBytes_ -= entry.ram ? entry.ram->bytes() : 0;
-  entry.checkpoint = false;
-}
-
-bool StateCache::contains(uint64_t kvBlock) const noexcept {
-  const auto found = entries_.find(kvBlock);
-  return found != entries_.end() && !found->second.invalid;
-}
-
-uint64_t StateCache::resumePoint() const noexcept {
-  // Checkpoints can survive cancellation but remain disposable. Prefer an
-  // ordinary state for speculative protection, regardless of recency.
-  return ordinary_.newestId() ? ordinary_.newestId()
-                                  : checkpoints_.newestId();
-}
-
-bool StateCache::resident(uint64_t kvBlock) const noexcept {
-  const auto found = entries_.find(kvBlock);
-  return found != entries_.end() && found->second.ram != nullptr;
-}
-
-std::optional<CacheEvictionCandidate>
-StateCache::evictionCandidate(bool keepResumePoint, bool checkpoints) const noexcept {
-  const uint64_t kept = keepResumePoint ? resumePoint() : 0;
-  for (const auto candidate :
-       {checkpoints ? checkpoints_.oldest() : std::nullopt, ordinary_.oldest()})
-    if (candidate && candidate->id != kept)
-      return candidate;
-  return std::nullopt;
-}
-
-std::optional<CacheEvictionCandidate>
-StateCache::diskCandidate(bool duplicate) const noexcept {
-  return duplicate ? duplicates_.oldest() : diskOnly_.oldest();
-}
-
-StateEviction StateCache::reclaim(uint64_t kvBlock, std::function<void()> completion,
-                                  const std::function<bool()> &makeRoom,
-                                  bool waitForWrite) {
-  auto found = entries_.find(kvBlock);
-  if (found == entries_.end() || found->second.pins || !found->second.ram)
-    return {};
-  Entry &entry = found->second;
-  const uint64_t reclaimed = entry.ram->bytes();
-  // One write at a time.
-  const bool writable = !entry.disk && entry.ram->canOffload();
-  if (writable && pending_ && waitForWrite)
-    return {false, 0, true};
-  if (writable) {
-    if (auto transfer = startWrite(
-            [state = entry.ram](std::function<void()> done) {
-              return state->offload(std::move(done));
-            },
-            completion, makeRoom))
-      beginWrite(kvBlock, entry, std::move(transfer));
-  }
-  if (!entry.disk)
-    return erase(kvBlock, false);
-  // A write reads its own copy, so the RAM copy is free at once.
-  bytes_ -= reclaimed;
-  if (entry.checkpoint)
-    checkpointBytes_ -= reclaimed;
-  entry.ram.reset();
-  reindex(kvBlock, entry);
-  return {true, reclaimed};
-}
-
-StateEviction StateCache::evict(uint64_t kvBlock) noexcept {
-  return erase(kvBlock, false);
-}
-
-void StateCache::dropDisk(uint64_t kvBlock) {
-  Entry &target = entry(kvBlock);
-  if (!target.ram || !target.disk)
-    throw std::logic_error("only a redundant disk copy is dropped");
-  if (writing(kvBlock))
-    throw std::logic_error("a disk copy being written cannot be dropped");
-  discardDisk(target);
-  reindex(kvBlock, target);
-}
-
-void StateCache::invalidate(uint64_t kvBlock, const CompositeState *state) noexcept {
-  auto found = entries_.find(kvBlock);
-  if (found == entries_.end() || found->second.invalid)
-    return;
-  Entry &target = found->second;
-  if (target.ram && target.disk.get() == state) {
-    // The RAM copy stands; only the copy that failed to read leaves.
-    discardDisk(target);
-    ++invalidations_;
-    reindex(kvBlock, target);
-    return;
-  }
-  if (copy(target).get() != state)
-    return;
-  target.invalid = true;
-  ++invalidations_;
-  reindex(kvBlock, target);
-  static_cast<void>(evict(kvBlock));
-}
-
-void StateCache::invalidate(uint64_t kvBlock) noexcept {
-  const auto found = entries_.find(kvBlock);
-  if (found != entries_.end())
-    invalidate(kvBlock, copy(found->second).get());
-}
-
-bool StateCache::promotable(uint64_t kvBlock, const CompositeState *source) const noexcept {
-  const auto found = entries_.find(kvBlock);
-  return found != entries_.end() && !found->second.invalid && !found->second.ram &&
-         found->second.disk.get() == source;
-}
-
-void StateCache::promote(uint64_t kvBlock, const CompositeState *source,
-                         std::shared_ptr<const CompositeState> state) {
-  if (!promotable(kvBlock, source))
-    return;
-  if (!state || state->bytes() != source->bytes() ||
-      state->residentBytes() != state->bytes())
-    throw std::invalid_argument("invalid promoted state");
-  if (state->bytes() > std::numeric_limits<uint64_t>::max() - bytes_)
-    throw std::overflow_error("promoted state byte count overflowed");
-  Entry &target = entry(kvBlock);
-  target.ram = std::move(state);
-  bytes_ += target.ram->bytes();
-  if (target.checkpoint)
-    checkpointBytes_ += target.ram->bytes();
-  reindex(kvBlock, target);
-  ++promotions_;
-}
-
-bool StateCache::pollOffload() {
-  if (!pending_ || !pending_->transfer->ready())
-    return false;
-  PendingOffload done = std::move(*pending_);
-  pending_.reset();
-  const bool written = done.transfer->finish();
-  // A failure counts even when its entry left or changed meanwhile.
-  if (!written)
-    ++offloadFailures_;
-  auto found = entries_.find(done.kvBlock);
-  if (found == entries_.end())
-    return true;
-  Entry &target = found->second;
-  if (target.disk == done.transfer->state()) {
-    if (!written)
-      discardDisk(target);
-    if (!target.ram && !target.disk) {
-      // Nothing is left of the state; a pinned reader releases it, and a
-      // publication meanwhile takes the entry over.
-      target.invalid = true;
-      reindex(done.kvBlock, target);
-      static_cast<void>(evict(done.kvBlock));
-      return true;
+  if (!state || !kv_.contains(leaf) ||
+      state->boundary != kv_.chainLength(leaf) * KvCache::pageTokens ||
+      !state->resident())
+    throw std::invalid_argument("invalid resident restore state");
+  validate(leaf, *state);
+  if (const auto existing = match(std::span(&leaf, 1));
+      !groups_.empty() && existing && existing->boundary == state->boundary &&
+      existing->resident())
+    throw std::logic_error("duplicate resident restore state");
+  for (const auto &part : state->blocks) {
+    if (!part.payload || part.begin > part.end || part.end > state->boundary)
+      throw std::invalid_argument("invalid cache group block");
+    auto &store = group(part.group);
+    const uint64_t block = endpoint(leaf, part.end);
+    if (store.resident(block)) {
+      static_cast<void>(store.touchIfStored(block, checkpoint));
+      continue;
     }
+    store.publish(block, part.payload, checkpoint);
   }
-  reindex(done.kvBlock, target);
-  return true;
 }
 
-StateEviction StateCache::erase(uint64_t kvBlock, bool retirement) noexcept {
-  auto found = entries_.find(kvBlock);
-  if (found == entries_.end() || found->second.pins)
-    return {};
-  Entry &target = found->second;
-  const uint64_t reclaimed = target.ram ? target.ram->bytes() : 0;
-  bytes_ -= reclaimed;
-  if (target.disk)
-    diskBytes_ -= target.disk->bytes();
-  if (target.checkpoint) {
-    --checkpointEntries_;
-    checkpointBytes_ -= reclaimed;
-    if (!retirement)
-      ++checkpointEvictions_;
-  }
-  unlink(target);
-  entries_.erase(found);
-  kv_.countState(kvBlock, false);
-  if (retirement)
-    ++checkpointRetirements_;
-  else
-    ++evictions_;
-  return {true, reclaimed};
-}
-
-StateCacheSnapshot StateCache::snapshot() const noexcept {
-  StateCacheSnapshot result;
-  result.entries = static_cast<uint32_t>(std::min<uint64_t>(
-      entries_.size(), std::numeric_limits<uint32_t>::max()));
-  result.pinned = pinnedEntries_;
-  result.bytes = bytes_;
-  result.diskBytes = diskBytes_;
-  result.offloads = offloads_;
-  result.offloadFailures = offloadFailures_;
-  result.invalidations = invalidations_;
-  result.diskHits = diskHits_;
-  result.promotions = promotions_;
-  result.promotionsSkipped = promotionsSkipped_;
-  result.hits = hits_;
-  result.misses = misses_;
-  result.publications = publications_;
-  result.deduplicatedPublications = deduplicatedPublications_;
-  result.evictions = evictions_;
-  result.checkpointEntries = static_cast<uint32_t>(std::min<uint64_t>(
-      checkpointEntries_, std::numeric_limits<uint32_t>::max()));
-  result.checkpointBytes = checkpointBytes_;
-  result.checkpointRetirements = checkpointRetirements_;
-  result.checkpointEvictions = checkpointEvictions_;
-  return result;
-}
-
-void StateCache::release(uint64_t kvBlock) noexcept {
-  auto found = entries_.find(kvBlock);
-  if (found == entries_.end() || !found->second.pins)
-    std::terminate();
-  Entry &target = found->second;
-  --target.pins;
-  if (!target.pins) {
-    if (!pinnedEntries_)
-      std::terminate();
-    --pinnedEntries_;
-    target.lastUsed = recency_.next();
-    reindex(kvBlock, target);
-    if (target.invalid)
-      static_cast<void>(evict(kvBlock));
-  }
-  kv_.releaseActive(kvBlock);
-}
-
-StateCache::Entry &StateCache::entry(uint64_t kvBlock) {
-  auto found = entries_.find(kvBlock);
-  if (found == entries_.end())
-    throw std::out_of_range("unknown composite state");
-  return found->second;
-}
-
-StateCache::Entry &StateCache::entryFor(uint64_t kvBlock) {
-  auto found = entries_.find(kvBlock);
-  if (found != entries_.end())
-    return found->second;
-  Entry fresh;
-  fresh.ramNode = RecencyOrder::allocate(kvBlock);
-  fresh.diskNode = RecencyOrder::allocate(kvBlock);
-  fresh.publication = publications_ + 1;
-  Entry &placed = entries_.emplace(kvBlock, std::move(fresh)).first->second;
-  kv_.countState(kvBlock, true);
-  return placed;
-}
-
-StateCache::Entry &StateCache::publicationEntry(uint64_t kvBlock, bool checkpoint) {
-  const bool fresh = !entries_.contains(kvBlock);
-  Entry &entry = entryFor(kvBlock);
-  // An entry a failed read condemned gives its copy up (one a failed write
-  // condemned has none); readers of that copy keep their own handle to it.
-  if (entry.invalid) {
-    discardDisk(entry);
-    entry.invalid = false;
-  }
-  if (fresh && checkpoint) {
-    entry.checkpoint = true;
-    ++checkpointEntries_;
-  }
-  if (!checkpoint)
-    makeOrdinary(kvBlock, entry);
-  return entry;
-}
-
-std::unique_ptr<StateOffload> StateCache::startWrite(const StateWriter &write,
-                                                     const std::function<void()> &completion,
-                                                     const std::function<bool()> &makeRoom) {
-  if (pending_)
-    return {};
-  std::unique_ptr<StateOffload> transfer = write(completion);
+bool StateCache::publishToDisk(uint64_t leaf,
+                               const StateWriter<RestoreState> &write,
+                               const std::function<void()> &completion,
+                               const std::function<bool()> &makeRoom,
+                               bool checkpoint) {
+  if (touchIfStored(leaf, checkpoint))
+    return true;
+  if (writing())
+    return false;
+  auto transfer = write(completion);
   while (!transfer && makeRoom && makeRoom())
     transfer = write(completion);
-  return transfer;
+  if (!transfer)
+    return false;
+  const auto state = transfer->state();
+  if (!state)
+    throw std::invalid_argument("empty disk snapshot");
+  validate(leaf, *state);
+  PendingSnapshot pending{leaf, std::move(transfer), {}};
+  pending.blocks.reserve(state->blocks.size());
+  try {
+    for (const auto &part : state->blocks) {
+      auto &store = group(part.group);
+      const auto block = endpoint(leaf, part.end);
+      if (store.importDisk(block, part.payload, checkpoint)) {
+        pending.blocks.push_back({part.group, block, part.payload});
+        store.setExternalWrite(block, part.payload.get(), true);
+      }
+    }
+    pending_ = std::move(pending);
+    ++directOffloads_;
+    ++directPublications_;
+  } catch (...) {
+    for (const auto &[id, block, payload] : pending.blocks) {
+      group(id).setExternalWrite(block, payload.get(), false);
+      group(id).invalidate(block, payload.get());
+    }
+    throw;
+  }
+  return true;
 }
 
-void StateCache::beginWrite(uint64_t kvBlock, Entry &target,
-                            std::unique_ptr<StateOffload> transfer) {
-  target.disk = transfer->state();
-  diskBytes_ += target.disk->bytes();
-  pending_.emplace(PendingOffload{kvBlock, std::move(transfer)});
-  ++offloads_;
+void StateCache::pruneWindowDependencies(uint64_t leaf) noexcept {
+  const auto hasCheckpoint = [&](uint64_t block) {
+    for (const auto &spec : coordinator_.groups())
+      if (spec.kind == CacheGroupKind::Checkpoint &&
+          !group(spec.id).contains(block))
+        return false;
+    return true;
+  };
+  const std::function<bool(uint64_t)> needed = std::cref(hasCheckpoint);
+  const uint32_t depth = kv_.chainLength(leaf);
+  for (const auto &spec : coordinator_.groups()) {
+    if (spec.kind != CacheGroupKind::SlidingWindow)
+      continue;
+    auto &store = group(spec.id);
+    const uint32_t span = (spec.windowTokens - 1) / KvCache::pageTokens;
+    // A block ending at d can serve only descendant checkpoints whose
+    // window starts before d. Other branches and overlapping windows remain
+    // discoverable in the existing prefix tree; no second ownership graph.
+    uint64_t block = leaf;
+    for (uint32_t d = depth; d && depth - d <= span; --d) {
+      if (store.contains(block) &&
+          !kv_.anyDescendant(block, d + span, needed)) {
+        const auto eviction = store.evict(block);
+        // A failed restore can still pin the window while its checkpoint
+        // lease is released. Existing readers keep their payload; defer
+        // removal until the last lease leaves, as for other invalid states.
+        if (!eviction.evicted)
+          if (const auto unused = store.peek(block))
+            store.invalidate(block, unused->payload.get());
+      }
+      block = d > 1 ? kv_.ancestor(block, d - 1) : 0;
+    }
+  }
 }
 
-// RAM copies wait for eviction in one order per class; disk copies wait for
-// replacement as redundant copies or as the only copy. A pinned or invalid
-// entry, or a copy being written, is in no order.
-void StateCache::reindex(uint64_t kvBlock, Entry &target) noexcept {
-  unlink(target);
-  if (target.pins || target.invalid)
+StateCheckpoint StateCache::checkpoint(uint64_t block) const {
+  StateCheckpoint result;
+  // Removing the exact checkpoint also releases window blocks that no other
+  // checkpoint uses. Publication identity protects upgraded/replaced entries.
+  for (const auto &spec : coordinator_.groups())
+    if (spec.kind == CacheGroupKind::Checkpoint)
+      if (auto point = group(spec.id).checkpoint(block)) {
+        result.kvBlock = block;
+        result.groups.emplace_back(spec.id, point);
+      }
+  return result;
+}
+bool StateCache::retireCheckpoint(const StateCheckpoint &point) noexcept {
+  bool retired = true;
+  for (const auto &[id, checkpoint] : point.groups)
+    retired = group(id).retireCheckpoint(checkpoint) && retired;
+  return retired;
+}
+std::optional<CacheEvictionCandidate>
+StateCache::evictionCandidate(bool checkpoints) const noexcept {
+  std::optional<CacheEvictionCandidate> result;
+  bool resultCheckpoint = false;
+  for (const auto &[id, store] : groups_) {
+    const auto candidate = store->evictionCandidate(checkpoints);
+    if (!candidate)
+      continue;
+    const bool checkpoint = bool(store->checkpoint(candidate->id));
+    if (!result || (checkpoint && !resultCheckpoint) ||
+        (checkpoint == resultCheckpoint &&
+         candidate->lastUsed < result->lastUsed)) {
+      result = candidate;
+      resultCheckpoint = checkpoint;
+    }
+  }
+  return result;
+}
+std::optional<CacheEvictionCandidate>
+StateCache::groupCandidate(CacheGroupId id) const {
+  return group(id).oldestResident();
+}
+std::optional<CacheGroupId>
+StateCache::oldestGroup(uint64_t block, bool disk,
+                        bool duplicate) const noexcept {
+  std::optional<CacheEvictionCandidate> oldest;
+  std::optional<CacheGroupId> result;
+  for (const auto &[id, store] : groups_)
+    if (const auto candidate = store->candidate(block, disk, duplicate);
+        candidate && (!oldest || candidate->lastUsed < oldest->lastUsed)) {
+      oldest = candidate;
+      result = id;
+    }
+  return result;
+}
+std::optional<CacheEvictionCandidate>
+StateCache::diskCandidate(bool duplicate) const noexcept {
+  std::optional<CacheEvictionCandidate> result;
+  for (const auto &[_, store] : groups_)
+    if (const auto candidate = store->diskCandidate(duplicate);
+        candidate && (!result || candidate->lastUsed < result->lastUsed))
+      result = candidate;
+  return result;
+}
+StateEviction StateCache::reclaim(uint64_t block,
+                                  std::function<void()> completion,
+                                  const std::function<bool()> &makeRoom,
+                                  std::optional<CacheGroupId> selected) {
+  const auto id = selected ? selected : oldestGroup(block);
+  if (!id)
+    return {};
+  // Shared model staging is bounded across groups, not separately per group.
+  {
+    const auto payload = group(*id).peek(block);
+    if (writing() && payload && payload->payload->canOffload() &&
+        !group(*id).diskCopy(block) && !group(*id).writing(block)) {
+      return {false, 0, true};
+    }
+  }
+  return group(*id).reclaim(block, std::move(completion), makeRoom);
+}
+StateEviction StateCache::evict(uint64_t block) noexcept {
+  StateEviction result;
+  for (auto &[_, store] : groups_) {
+    const auto removed = store->evict(block);
+    result.evicted |= removed.evicted;
+    result.reclaimedBytes += removed.reclaimedBytes;
+  }
+  return result;
+}
+void StateCache::dropDisk(uint64_t block,
+                          std::optional<CacheGroupId> selected) {
+  if (const auto id = selected ? selected : oldestGroup(block, true, true))
+    group(*id).dropDisk(block);
+}
+void StateCache::evictDiskOnly(uint64_t block,
+                               std::optional<CacheGroupId> selected) {
+  if (const auto id = selected ? selected : oldestGroup(block, true, false))
+    static_cast<void>(group(*id).evict(block));
+}
+void StateCache::invalidate(uint64_t leaf, const RestoreState *state) noexcept {
+  if (!state)
     return;
-  if (target.ram)
-    (target.checkpoint ? checkpoints_ : ordinary_).link(target.ramNode, target.lastUsed, kvBlock);
-  if (target.disk && !writing(kvBlock))
-    (target.ram ? duplicates_ : diskOnly_).link(target.diskNode, target.lastUsed, kvBlock);
+  for (const auto &part : state->blocks)
+    group(part.group).invalidate(endpoint(leaf, part.end), part.payload.get());
 }
-
-void StateCache::unlink(Entry &target) noexcept {
-  if (target.ramNode.linked())
-    RecencyOrder::unlink(target.ramNode);
-  if (target.diskNode.linked())
-    RecencyOrder::unlink(target.diskNode);
+void StateCache::invalidate(uint64_t block) noexcept {
+  for (auto &[_, store] : groups_)
+    store->invalidate(block);
 }
-
-void StateCache::discardDisk(Entry &target) noexcept {
-  if (!target.disk)
-    return;
-  diskBytes_ -= target.disk->bytes();
-  target.disk.reset();
+bool StateCache::promotable(uint64_t leaf,
+                            const RestoreState *state) const noexcept {
+  return state && std::any_of(state->blocks.begin(), state->blocks.end(),
+                              [&](const auto &part) {
+                                return group(part.group)
+                                    .promotable(endpoint(leaf, part.end),
+                                                part.payload.get());
+                              });
+}
+void StateCache::promote(uint64_t leaf, const RestoreState *source,
+                         std::shared_ptr<const RestoreState> state) {
+  if (!source || !state || source->boundary != state->boundary)
+    throw std::invalid_argument("incompatible restore promotion");
+  for (const auto &part : state->blocks) {
+    const auto old = std::find_if(
+        source->blocks.begin(), source->blocks.end(), [&](const auto &value) {
+          return value.group == part.group && value.begin == part.begin &&
+                 value.end == part.end;
+        });
+    if (old != source->blocks.end())
+      group(part.group)
+          .promote(endpoint(leaf, part.end), old->payload.get(), part.payload);
+  }
+}
+bool StateCache::writing(uint64_t leaf) const noexcept {
+  if (pending_ && pending_->leaf == leaf)
+    return true;
+  // A restore point can depend on an ancestor block in any group.
+  while (leaf) {
+    for (const auto &[_, store] : groups_)
+      if (store->writing(leaf))
+        return true;
+    const auto depth = kv_.chainLength(leaf);
+    leaf = depth > 1 ? kv_.ancestor(leaf, depth - 1) : 0;
+  }
+  return false;
+}
+bool StateCache::writing() const noexcept {
+  return pending_ ||
+         std::any_of(groups_.begin(), groups_.end(),
+                     [](const auto &g) { return g.second->writing(); });
+}
+bool StateCache::pollOffload() {
+  bool progress = false;
+  if (pending_ && pending_->transfer->ready()) {
+    auto done = std::move(*pending_);
+    pending_.reset();
+    const bool success = done.transfer->finish();
+    if (!success)
+      ++directFailures_;
+    for (const auto &[id, block, payload] : done.blocks) {
+      group(id).setExternalWrite(block, payload.get(), false);
+      if (!success)
+        group(id).invalidate(block, payload.get());
+    }
+    progress = true;
+  }
+  for (auto &[_, store] : groups_)
+    progress = store->pollOffload() || progress;
+  return progress;
+}
+StateCacheSnapshot StateCache::snapshot() const noexcept {
+  StateCacheSnapshot result;
+  for (const auto &[_, store] : groups_) {
+    const auto s = store->snapshot();
+    result.entries += s.entries;
+    result.pinned += s.pinned;
+    result.bytes += s.bytes;
+    result.diskBytes += s.diskBytes;
+    result.offloads += s.offloads;
+    result.offloadFailures += s.offloadFailures;
+    result.invalidations += s.invalidations;
+    result.promotions += s.promotions;
+    result.publications += s.publications;
+    result.deduplicatedPublications += s.deduplicatedPublications;
+    result.evictions += s.evictions;
+    result.checkpointEntries += s.checkpointEntries;
+    result.checkpointBytes += s.checkpointBytes;
+    result.checkpointRetirements += s.checkpointRetirements;
+    result.checkpointEvictions += s.checkpointEvictions;
+  }
+  result.offloads += directOffloads_;
+  result.offloadFailures += directFailures_;
+  result.publications += directPublications_;
+  result.hits = hits_;
+  result.misses = misses_;
+  result.diskHits = diskHits_;
+  result.promotionsSkipped = promotionsSkipped_;
+  return result;
 }
 
 } // namespace splash::engine

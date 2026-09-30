@@ -52,8 +52,8 @@ struct KvBlockKeyView final {
 // Content-addressed target-KV blocks across two tiers. Matching walks the
 // chained full-page hashes from the root. A block holds a pool page, a disk
 // slot, or both; resident blocks form a subtree at the root, so a matched
-// chain is a resident prefix followed by disk-only blocks. Composite
-// recurrent states are a separate sparse layer. This class owns exactly one
+// chain is a resident prefix followed by disk-only blocks. Model-defined
+// state groups are indexed separately. This class owns exactly one
 // prefix reference for every resident block.
 class KvCache final {
 public:
@@ -99,6 +99,7 @@ public:
                                     uint32_t physicalPage,
                                     ImageIdentity images = {});
 
+  // Pins protect backing without refreshing the access order.
   void retainActive(uint64_t blockId);
   void releaseActive(uint64_t blockId) noexcept;
   void touch(uint64_t blockId) noexcept;
@@ -106,6 +107,7 @@ public:
   [[nodiscard]] Chain chain(uint64_t blockId) const;
   [[nodiscard]] bool contains(uint64_t blockId) const noexcept;
   [[nodiscard]] uint32_t chainLength(uint64_t blockId) const;
+  [[nodiscard]] uint64_t ancestor(uint64_t blockId, uint32_t depth) const;
   [[nodiscard]] uint64_t generation() const noexcept { return generation_; }
 
   // Tiers. A block in transfer is moving between them and is neither
@@ -154,8 +156,12 @@ public:
   // resident leaf they are disk-only; below a poisoned block some may be
   // resident.
   [[nodiscard]] std::vector<uint64_t> subtree(uint64_t blockId) const;
+  // Bounded, allocation-free traversal of this prefix and its descendants.
+  [[nodiscard]] bool
+  anyDescendant(uint64_t blockId, uint32_t maximumDepth,
+                const std::function<bool(uint64_t)> &predicate) const;
   // Only a block without children, users or transfer can be removed. The
-  // caller handles any composite state attached to it first.
+  // caller handles all state groups attached to it first.
   void erase(uint64_t blockId);
 
   [[nodiscard]] Snapshot snapshot() const noexcept;

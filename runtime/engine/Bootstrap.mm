@@ -373,7 +373,9 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
         ActualMemoryReport report = resourcesPointer->actualMemoryReport(
             modelPointer->actualRuntimeMemory(), estimatedPeakBytes);
         // Keep one lane's worth of warm buffers for the first request.
-        static_cast<void>(resourcesPointer->stateStorage().releaseIdle(2, 1));
+        static_cast<void>(resourcesPointer->stateStorage().releaseIdle(
+            2,
+            model::ExecutionLimits::draftContextTokens / KvCache::pageTokens));
         resourcesPointer->cache().releaseUnusedKvBacking();
         resourcesPointer->memoryGovernor().markServingFootprint();
         return report;

@@ -148,8 +148,7 @@ void validatePlan(const BatchPlan &plan, std::span<const ModelBatchItem> items,
 QwenStateStorage &requireQwenStateStorage(StateStorage &storage) {
   auto *qwen = dynamic_cast<QwenStateStorage *>(&storage);
   if (!qwen) {
-    throw std::invalid_argument(
-        "Qwen runtime requires Qwen composite state storage");
+    throw std::invalid_argument("Qwen runtime requires Qwen state storage");
   }
   return *qwen;
 }
@@ -205,7 +204,7 @@ struct Runtime::Impl {
     uint32_t flags = 0;
     std::optional<uint32_t> pendingToken;
     // Transient active-request hidden used only while a constrained request
-    // waits for its first token mask. Composite cache state never stores it;
+    // waits for its first token mask. Cached restore state never stores it;
     // every cache hit replays one input token and regenerates this value.
     std::vector<uint16_t> finalTargetHidden;
     std::array<float, kSamplingUniformCount> cycleUniforms{};
@@ -475,7 +474,7 @@ struct Runtime::Impl {
                          : 0;
     // At the budget the engine retries a denied admission after each reclaim
     // step. Checking the whole attempt first, with the GDN cells and draft
-    // ring the lane needs beyond the idle pool, keeps a denial from building
+    // pages the lane needs beyond the idle pool, keeps a denial from building
     // and dropping the encoder arena and image buffers every time.
     if (bytes) {
       if (auto admission = admitAllocation(
@@ -941,7 +940,7 @@ struct Runtime::Impl {
         span.compactRow = sequence.captureBegin + capture.compactDestinationRow;
         span.rows = capture.absoluteEnd - capture.absoluteBegin;
         span.startPosition = capture.absoluteBegin;
-        span.ring = slot.draft;
+        span.pages = slot.draft;
       }
     }
     draftModel.addContextPrefill(
@@ -1147,20 +1146,14 @@ struct Runtime::Impl {
     return *entry;
   }
 
-  void bindDraftRings(
+  void bindDraftPages(
       std::span<Request *const> entries,
-      std::vector<std::array<MetalBuffer, kLaneCount>> &keys,
-      std::vector<std::array<MetalBuffer, kLaneCount>> &values) const {
-    keys.resize(geometry.draft.layers);
-    values.resize(geometry.draft.layers);
-    for (uint32_t layer = 0; layer < geometry.draft.layers; ++layer) {
-      for (uint32_t lane = 0; lane < kLaneCount; ++lane) {
-        const auto &ring =
+      std::vector<std::array<ops::DraftKvBuffers, kLaneCount>> &context) const {
+    context.resize(geometry.draft.layers);
+    for (uint32_t layer = 0; layer < geometry.draft.layers; ++layer)
+      for (uint32_t lane = 0; lane < kLaneCount; ++lane)
+        context[layer][lane] =
             states.buffers(laneEntry(entries, lane).slot).draft[layer];
-        keys[layer][lane] = ring.keys;
-        values[layer][lane] = ring.values;
-      }
-    }
   }
 
   void encodeDraftBatchGraph(CommandGraph &graph,
@@ -1205,7 +1198,7 @@ struct Runtime::Impl {
     buffers.ropeCos = d(DecodeTensor::DraftRopeCos);
     buffers.ropeSin = d(DecodeTensor::DraftRopeSin);
     buffers.gateScratch = decodeArena->gateScratch();
-    bindDraftRings(entries, buffers.persistentKeys, buffers.persistentValues);
+    bindDraftPages(entries, buffers.context);
     draftModel.addDecode(graph, std::move(buffers),
                          targetModel.vocabularyProjection(), cacheLengths,
                          lanes, stats);
@@ -1384,7 +1377,7 @@ struct Runtime::Impl {
     buffers.ropeCos = d(DecodeTensor::DraftRopeCos);
     buffers.ropeSin = d(DecodeTensor::DraftRopeSin);
     buffers.retainedCounts = d(DecodeTensor::RetainedCount);
-    bindDraftRings(entries, buffers.persistentKeys, buffers.persistentValues);
+    bindDraftPages(entries, buffers.context);
     draftModel.addContextCommit(graph, std::move(buffers), startPositions,
                                 lanes, stats);
   }
@@ -1793,6 +1786,10 @@ Runtime::Runtime(RuntimeContext context)
 
 Runtime::~Runtime() = default;
 
+std::vector<CacheGroupSpec> Runtime::cacheGroups() const {
+  return impl_->states.cacheGroups();
+}
+
 void Runtime::checkHealth() { impl_->backend.checkHealth(); }
 
 bool Runtime::needsHealthCheck() const noexcept {
@@ -1942,7 +1939,7 @@ metal::AllocationResult Runtime::beginAt(const ModelRequest &request, uint32_t s
 }
 
 void Runtime::restore(uint64_t requestId, uint32_t restoredPrefixLength,
-                      std::shared_ptr<const CompositeState> restoredState,
+                      std::shared_ptr<const RestoreState> restoredState,
                       bool restoreDraftState) {
   Impl::Request &entry = impl_->request(requestId);
   if (!entry.resident || !restoredState) {
@@ -1956,15 +1953,18 @@ void Runtime::restore(uint64_t requestId, uint32_t restoredPrefixLength,
   finishRestore(requestId, restoredPrefixLength, restoreDraftState);
 }
 
-std::unique_ptr<StateRestore> Runtime::beginRestore(
-    uint64_t requestId, uint32_t boundary,
-    std::shared_ptr<const CompositeState> state, bool restoreDraft,
-    std::function<void()> completion) {
+std::unique_ptr<StateRestore>
+Runtime::beginRestore(uint64_t requestId, uint32_t boundary,
+                      std::shared_ptr<const RestoreState> state,
+                      const DraftContextPlan &plan,
+                      std::function<void()> completion) {
   Impl::Request &entry = impl_->request(requestId);
   if (!entry.resident || !state || boundary >= entry.promptTokens)
     throw std::invalid_argument("invalid state restore");
-  return impl_->states.beginRestore(entry.slot, *state, restoreDraft,
-      std::move(completion), [this, requestId, boundary, restoreDraft] {
+  const bool restoreDraft = !plan.draftStateRestoreSkipped;
+  return impl_->states.beginRestore(
+      entry.slot, *state, plan, std::move(completion),
+      [this, requestId, boundary, restoreDraft] {
         finishRestore(requestId, boundary, restoreDraft);
       });
 }
@@ -1978,7 +1978,7 @@ void Runtime::finishRestore(uint64_t requestId, uint32_t restoredPrefixLength,
       impl_->states.metadata(entry.slot).lengths;
   if (lengths.targetTokens != restoredPrefixLength ||
       (restoreDraftState &&
-       !lengths.hasCompleteDraftWindow(kDraftCacheStride)) ||
+       (lengths.draftEnd() != restoredPrefixLength || !lengths.draftLength)) ||
       (!restoreDraftState && lengths.draftLength != 0)) {
     throw std::invalid_argument("prefix logical length does not match state");
   }
@@ -1997,6 +1997,15 @@ void Runtime::finishRestore(uint64_t requestId, uint32_t restoredPrefixLength,
   entry.draftContextValid = restoreDraftState;
   entry.draftContextThrough = restoreDraftState ? restoredPrefixLength : 0;
   entry.draftContextPlan.reset();
+}
+
+DraftContextPlan Runtime::planDraftPrefill(uint32_t begin, uint32_t end,
+                                           std::span<const uint32_t> boundaries,
+                                           const RestoreState *state) const {
+  return planDraftContext(
+      begin, end, begin ? std::optional<uint32_t>(begin) : std::nullopt,
+      boundaries,
+      state ? state->windowBegin(kDraftWindowGroup, kDraftCacheStride) : 0);
 }
 
 void Runtime::setDraftContextPlan(uint64_t requestId, DraftContextPlan plan) {
@@ -2020,6 +2029,26 @@ Runtime::prefill(const BatchPlan &plan, std::span<const ModelBatchItem> items) {
   return prefillAsync(plan, items, {})->wait();
 }
 
+metal::AllocationResult Runtime::prepareStep(uint64_t requestId, uint64_t begin,
+                                             uint64_t end) {
+  const auto &entry = impl_->request(requestId);
+  if (entry.promptComplete)
+    return impl_->states.prepareDraftWrite(entry.slot, begin, end);
+  if (!entry.draftContextPlan)
+    throw std::logic_error("prefill request has no draft context plan");
+  // Early prefill chunks can deliberately skip draft capture. Admit only the
+  // pages this dispatch will write, preserving shared pages and disk records.
+  const auto captures = draftCaptureSpansForDispatch(
+      *entry.draftContextPlan, static_cast<uint32_t>(begin),
+      static_cast<uint32_t>(end));
+  for (const auto &capture : captures)
+    if (auto admitted = impl_->states.prepareDraftWrite(
+            entry.slot, capture.absoluteBegin, capture.absoluteEnd);
+        !admitted)
+      return admitted;
+  return true;
+}
+
 std::unique_ptr<ModelBatchTicket>
 Runtime::submit(const BatchPlan &plan, std::span<const ModelBatchItem> items,
                 std::function<void()> completion) {
@@ -2037,6 +2066,13 @@ Runtime::prefillAsync(const BatchPlan &plan,
                       std::span<const ModelBatchItem> items,
                       std::function<void()> completion) {
   validatePlan(plan, items, WorkKind::Prefill);
+  for (const auto &item : items) {
+    const auto admission = prepareStep(item.requestId, item.logicalPosition,
+                                       item.logicalPosition + item.tokenCount);
+    if (!admission)
+      throw metal::MetalAllocationError("draft writable page admission failed",
+                                        admission.failure);
+  }
   if (plan.decodeStage != DecodeStage::Regular) {
     throw std::invalid_argument("Qwen prefill cannot resume a mask plan");
   }
@@ -2176,6 +2212,14 @@ Runtime::decodeAsync(const BatchPlan &plan,
                      std::span<const ModelBatchItem> items,
                      std::function<void()> completion) {
   validatePlan(plan, items, WorkKind::Decode);
+  for (const auto &item : items) {
+    const auto admission =
+        prepareStep(item.requestId, item.logicalPosition,
+                    item.logicalPosition + ExecutionLimits::targetVerifyRows);
+    if (!admission)
+      throw metal::MetalAllocationError("draft writable page admission failed",
+                                        admission.failure);
+  }
   const bool constrained = plan.cohort == BatchCohort::Constrained;
   if (plan.decodeStage != DecodeStage::Regular && !constrained) {
     throw std::invalid_argument(
@@ -2379,28 +2423,30 @@ uint32_t Runtime::committedStateSlot(uint64_t requestId) {
   return entry.slot;
 }
 
-std::shared_ptr<const CompositeState> Runtime::snapshot(uint64_t requestId) {
+std::shared_ptr<const RestoreState> Runtime::snapshot(uint64_t requestId) {
   return impl_->states.snapshot(committedStateSlot(requestId));
+}
+
+CacheAllocation Runtime::snapshotAllocation(uint64_t) const {
+  return {kQwenRecurrentGroup};
+}
+std::optional<CacheGroupId> Runtime::stepAllocationGroup(uint64_t) const {
+  return kDraftWindowGroup;
 }
 
 bool Runtime::canSnapshotToDisk() const noexcept {
   return impl_->states.canSnapshotToDisk();
 }
 
-std::unique_ptr<StateOffload>
-Runtime::snapshotToDisk(uint64_t requestId, std::function<void()> completion) {
-  return impl_->states.snapshotToDisk(committedStateSlot(requestId), std::move(completion));
+SnapshotWritePlan Runtime::prepareSnapshotToDisk(uint64_t requestId) {
+  return impl_->states.prepareSnapshotToDisk(committedStateSlot(requestId));
 }
 
 uint64_t Runtime::reclaimIdleState() noexcept {
   // One idle buffer per call, so a denied allocation frees only what it
   // needs; rebuildable caches go once the pool is empty.
-  const uint32_t cells = impl_->states.idleCells();
-  const uint32_t rings = impl_->states.idleRings();
-  if (cells)
-    return impl_->states.releaseIdle(cells - 1, rings);
-  if (rings)
-    return impl_->states.releaseIdle(0, rings - 1);
+  if (const uint64_t released = impl_->states.reclaimIdle())
+    return released;
   uint64_t released = 0;
   released += impl_->dropEmbeddingCache();
   if (impl_->vision && impl_->visionIdle()) {
@@ -2694,7 +2740,7 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
   request.id = id;
   request.prompt = warmupPrompt;
   request.maxNewTokens = 8;
-  std::shared_ptr<const CompositeState> cachedState;
+  std::shared_ptr<const RestoreState> cachedState;
   uint64_t estimatedPeakBytes = impl_->estimatedWarmupPeak();
   double wallSeconds = 0.0;
   beginColdRequest(request, 0);

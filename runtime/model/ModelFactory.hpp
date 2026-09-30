@@ -1,14 +1,14 @@
 #pragma once
 
-#include "ops/Vision.hpp"
 #include "DFlashDraft.hpp"
 #include "ModelDescriptor.hpp"
 #include "Qwen3_6Moe.hpp"
 #include "Qwen3_8.hpp"
 #include "QwenVision.hpp"
-#include "ops/PageStorage.hpp"
-#include "ops/ExecutionPlans.hpp"
 #include "model/SlotFile.hpp"
+#include "ops/ExecutionPlans.hpp"
+#include "ops/PageStorage.hpp"
+#include "ops/Vision.hpp"
 
 #include <filesystem>
 #include <memory>
@@ -35,7 +35,7 @@ struct ModelPackage final {
     layout.format = format;
     return layout;
   }
-  [[nodiscard]] CompositeStateLayout stateLayout() const noexcept {
+  [[nodiscard]] ModelStateLayout stateLayout() const noexcept {
     return descriptor.stateLayout;
   }
   [[nodiscard]] uint32_t maximumContextTokens() const noexcept {

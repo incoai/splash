@@ -112,6 +112,8 @@ public:
   ~SlotFile();
   SlotFile(const SlotFile &) = delete;
   SlotFile &operator=(const SlotFile &) = delete;
+  // Another payload geometry in this temporary tier, sharing its quota.
+  [[nodiscard]] std::shared_ptr<SlotFile> sibling(uint64_t slotBytes) const;
   // Null when the budget is exhausted.
   [[nodiscard]] std::shared_ptr<Slot> acquire();
   [[nodiscard]] uint64_t slotBytes() const noexcept;
@@ -145,6 +147,7 @@ private:
       std::function<void()> completion);
   void run();
   std::shared_ptr<Backing> backing_;
+  std::filesystem::path directory_;
   mutable std::mutex mutex_;
   std::condition_variable wake_;
   std::deque<Work> work_;

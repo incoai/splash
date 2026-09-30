@@ -116,7 +116,7 @@ struct EngineMemoryBreakdown {
   uint64_t kvStagingBytes = 0;
   uint64_t fixedRuntimeBytes = 0;
 
-  // All active state cells, cached composite states, and physical KV
+  // All active state cells, cached restore states, and physical KV
   // extents grow from this one governor-controlled byte budget. None is
   // preallocated merely because the address space exists.
   uint64_t dynamicBudgetBytes = 0;
