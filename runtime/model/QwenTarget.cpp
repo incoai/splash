@@ -3,6 +3,7 @@
 #include "model/Qwen3_6Moe.hpp"
 #include "model/Qwen3_8.hpp"
 #include "model/WeightStore.hpp"
+#include "ops/AneFfn.hpp"
 #include "ops/DraftAttention.hpp"
 #include "ops/Embedding.hpp"
 #include "ops/Normalization.hpp"
@@ -187,8 +188,8 @@ void requireLayerPartition(const QwenTargetGeometry &geometry, uint32_t gdnLayer
 
 } // namespace
 
-// The state a prefill command's layers share: its inputs and the next GDN
-// and attention layer of the step.
+// The state a prefill command's layers share: its inputs and the next GDN,
+// attention and dense FFN layer of the step.
 struct QwenTarget::PrefillStep {
   metal::CommandGraph &graph;
   const QwenTargetPrefillBuffers &buffers;
@@ -196,8 +197,10 @@ struct QwenTarget::PrefillStep {
   uint32_t rows;
   std::span<const kv::LayerStorage> kvLayers;
   std::optional<ops::MoePlan> moe{};
+  ops::AneFfn *aneFfn = nullptr;
   uint32_t gdnLayer = 0;
   uint32_t attentionLayer = 0;
+  uint32_t ffnLayer = 0;
 };
 
 struct QwenTarget::VerifyStep {
@@ -218,7 +221,7 @@ struct QwenTarget::VerifyStep {
 metal::MetalBuffer QwenTarget::addPrefill(
     metal::CommandGraph &graph, QwenTargetPrefillBuffers buffers,
     std::span<const QwenTargetPrefillSequence> sequences, uint32_t rows,
-    std::span<const kv::LayerStorage> kvLayers) const {
+    std::span<const kv::LayerStorage> kvLayers, ops::AneFfn *aneFfn) const {
   if (sequences.empty() ||
       sequences.size() > ExecutionLimits::maximumBatchWidth || !rows ||
       rows > ExecutionLimits::prefillTokenBudget ||
@@ -235,6 +238,7 @@ metal::MetalBuffer QwenTarget::addPrefill(
   }
   PrefillStep step{graph, buffers, sequences, rows, kvLayers};
   if (geometry_.ffnKind == QwenFfnKind::SparseMoe) step.moe = operators_.moePrefill(geometry_.moeShape(), rows);
+  if (rows >= ops::AneFfn::kMinimumRows) step.aneFfn = aneFfn;
   std::visit([&](const auto *weights) {
     for (uint32_t index = 0; index < geometry_.layers; ++index) {
       const auto &layer = weights->layers[index];
@@ -353,7 +357,13 @@ void QwenTarget::addPrefillFfn(PrefillStep &step, const Qwen3_8LayerWeights &lay
                                metal::MetalBuffer output) const {
   const QwenTargetPrefillBuffers &b = step.buffers;
   const ops::Linear &linear = operators_.linear();
+  const uint32_t index = step.ffnLayer++;
   addPrefillNorm(step, residual, layer.postAttentionNorm, layer.gateProjection.layout());
+  if (step.aneFfn) {
+    step.aneFfn->add(step.graph, index, b.normalized, b.projectionSums, b.denseGateScratch, b.denseIntermediate,
+                     b.downProjectionSums, residual, output, step.rows, b.linearScratch);
+    return;
+  }
   linear.addPrefill(step.graph, b.normalized, layer.gateProjection, b.denseGateScratch, b.projectionSums,
                     step.rows, b.linearScratch);
   linear.addPrefillUpWithGate(step.graph, b.normalized, layer.upProjection, b.denseGateScratch,

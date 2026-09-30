@@ -20,6 +20,10 @@
 #include <variant>
 #include <vector>
 
+namespace splash::ops {
+class AneFfn;
+} // namespace splash::ops
+
 namespace splash::model {
 
 struct Qwen3_8Layout;
@@ -295,11 +299,13 @@ public:
   // stale activations and write results no active row reads.
   [[nodiscard]] uint32_t decodeStorageLanes(uint32_t lanes) const;
 
-  // Returns the hidden buffer that holds the last layer's output rows.
+  // Returns the hidden buffer that holds the last layer's output rows. The
+  // dense FFN of a chunk of at least AneFfn::kMinimumRows rows runs split
+  // with the Neural Engine on `aneFfn`, when given.
   [[nodiscard]] metal::MetalBuffer addPrefill(
       metal::CommandGraph &graph, QwenTargetPrefillBuffers buffers,
       std::span<const QwenTargetPrefillSequence> sequences, uint32_t rows,
-      std::span<const kv::LayerStorage> kvLayers) const;
+      std::span<const kv::LayerStorage> kvLayers, ops::AneFfn *aneFfn = nullptr) const;
   void addVerify(
       metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
       std::span<const kv::LayerStorage> kvLayers,

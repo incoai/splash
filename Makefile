@@ -193,7 +193,8 @@ $(LIB): $(PRODUCTION_AIRS)
 
 ENGINE_BUILD := $(BUILD)/engine
 ENGINE_LIBRARY := $(ENGINE_BUILD)/libsplash.a
-ENGINE_LINKFLAGS := -framework Foundation -framework Metal -framework IOKit
+ENGINE_LINKFLAGS := -framework Foundation -framework Metal -framework IOKit \
+	-framework IOSurface
 ENGINE_DEPFLAGS := -MMD -MP
 # Configuration belongs to each successful output, not to a shared timestamp:
 # macOS make can treat a new stamp and an old binary in the same second as equal.
@@ -226,6 +227,7 @@ BUILD_ID_CONSTANT_ARGS = \
 ENGINE_MAIN_OBJECT := $(ENGINE_BUILD)/main.o
 ENGINE_METAL_RUNTIME_OBJECT := $(ENGINE_BUILD)/metal/MetalBackend.o
 ENGINE_CPP_SOURCES := \
+	runtime/ops/AneFfn.cpp \
 	runtime/ops/DraftAttention.cpp \
 	runtime/ops/Embedding.cpp \
 	runtime/ops/ExecutionPlans.cpp \
@@ -275,6 +277,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/KvPageTier.cpp \
 	runtime/model/QwenState.cpp
 ENGINE_MM_SOURCES := \
+	runtime/ane/Program.mm \
 	runtime/model/SafetensorsCheckpoint.mm \
 	runtime/model/ModelDescriptor.mm \
 	runtime/model/Runtime.mm \

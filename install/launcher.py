@@ -272,6 +272,8 @@ def serve(args):
         ]
         if args.kv_format != "int8":
             command.extend(("--kv-format", args.kv_format))
+        if args.ane_ffn_share:
+            command.extend(("--ane-ffn-share", repr(args.ane_ffn_share)))
         for name in args.served_model_name:
             command.append(f"--served-model-name={name}")
         if args.default_reasoning_effort is not None:
@@ -566,6 +568,13 @@ def parse_args(argv=None):
         choices=("int8", "bf16"),
         default="int8",
         help="target KV cache storage (default: int8); bf16 uses more memory",
+    )
+    server.add_argument(
+        "--ane-ffn-share",
+        type=float,
+        default=0.0,
+        help="fraction of a dense target's prefill FFN channels run on the Neural Engine "
+        "(default: 0, GPU only)",
     )
     server.add_argument(
         "--max-memory",

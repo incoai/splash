@@ -251,6 +251,10 @@ struct MetalBuffer::Impl {
     uint64_t lengthBytes = 0;
 };
 
+struct SharedEvent::Impl {
+    __strong id<MTLSharedEvent> event = nil;
+};
+
 struct SparseHeap::Impl {
     __strong id<MTLHeap> heap = nil;
     std::shared_ptr<AllocationAccounting> accounting;
@@ -325,13 +329,15 @@ struct BackendAsyncState {
         return activeSequence;
     }
 
-    bool commitSubmission(uint64_t sequence, id<MTLCommandBuffer> command,
+    bool commitSubmission(uint64_t sequence, const std::vector<id<MTLCommandBuffer>> &leading,
+                          id<MTLCommandBuffer> command,
                           std::function<void(id<MTLCommandBuffer>)> completion) {
         std::lock_guard lock(gateMutex);
         if (stopping.stop_requested()) return false;
         activeCommand = command;
         activeCompletion = std::move(completion);
         commandWatchdog.start(sequence, steadySeconds());
+        for (id<MTLCommandBuffer> earlier : leading) [earlier commit];
         [command commit];
         return true;
     }
@@ -397,6 +403,8 @@ struct CommandTicket::State {
     CommandTiming timing;
     std::chrono::steady_clock::time_point wallStart;
     uint64_t sparseEventValue = 0;
+    // Command buffers committed before the last one, split at event signals.
+    std::vector<id<MTLCommandBuffer>> leadingCommands;
     std::string error;
     bool completed = false;
     bool released = false;
@@ -404,8 +412,9 @@ struct CommandTicket::State {
     void finishCommand(id<MTLCommandBuffer> command) {
         auto wallEnd = std::chrono::steady_clock::now();
         CommandTiming timing;
-        timing.gpuSeconds =
-            command.GPUEndTime - command.GPUStartTime;
+        const double gpuStart = leadingCommands.empty()
+            ? command.GPUStartTime : leadingCommands.front().GPUStartTime;
+        timing.gpuSeconds = command.GPUEndTime - gpuStart;
         if (!std::isfinite(timing.gpuSeconds) || timing.gpuSeconds < 0.0) {
             timing.gpuSeconds = 0.0;
         }
@@ -413,12 +422,19 @@ struct CommandTicket::State {
             std::chrono::duration<double>(wallEnd - wallStart).count();
 
         std::string error;
-        if (command.status != MTLCommandBufferStatusCompleted) {
+        id<MTLCommandBuffer> failed = command.status != MTLCommandBufferStatusCompleted ? command : nil;
+        for (id<MTLCommandBuffer> earlier : leadingCommands) {
+            if (earlier.status != MTLCommandBufferStatusCompleted) {
+                failed = earlier;
+                break;
+            }
+        }
+        if (failed) {
             std::ostringstream message;
             message << "Metal command " << sequence
                     << " failed (sparse event " << sparseEventValue << ')';
-            if (command.error) {
-                message << ": " << errorDescription(command.error);
+            if (failed.error) {
+                message << ": " << errorDescription(failed.error);
             }
             error = message.str();
         }
@@ -641,6 +657,20 @@ struct MetalBackend::Impl {
         return result;
     }
 };
+
+SharedEvent::SharedEvent() = default;
+SharedEvent::~SharedEvent() = default;
+SharedEvent::SharedEvent(const SharedEvent &) = default;
+SharedEvent &SharedEvent::operator=(const SharedEvent &) = default;
+SharedEvent::SharedEvent(SharedEvent &&) noexcept = default;
+SharedEvent &SharedEvent::operator=(SharedEvent &&) noexcept = default;
+SharedEvent::SharedEvent(std::shared_ptr<Impl> impl) : impl_(std::move(impl)) {}
+
+SharedEvent::operator bool() const noexcept { return impl_ && impl_->event; }
+
+void *SharedEvent::nativeHandle() const noexcept {
+    return impl_ ? (__bridge void *)impl_->event : nullptr;
+}
 
 MetalBuffer::MetalBuffer() = default;
 MetalBuffer::~MetalBuffer() = default;
@@ -1297,6 +1327,16 @@ MetalBuffer MetalBackend::view(const MetalBuffer &base,
     return MetalBuffer(std::move(result));
 }
 
+SharedEvent MetalBackend::newSharedEvent() {
+    checkOperation();
+    auto result = std::make_shared<SharedEvent::Impl>();
+    result->event = [impl_->device newSharedEvent];
+    if (!result->event) {
+        throw MetalBackendError("unable to create Metal shared event");
+    }
+    return SharedEvent(std::move(result));
+}
+
 void MetalBackend::keepResident(const MetalBuffer &buffer) {
     MetalAllocation &allocation = impl_->allocationOf(buffer);
     if (!allocation.residency.expired()) {
@@ -1341,7 +1381,12 @@ CommandTicket MetalBackend::submitCommandAsync(
     if (dispatches.empty()) {
         throw MetalBackendError("Metal command must contain a dispatch");
     }
+    const bool events = std::any_of(dispatches.begin(), dispatches.end(),
+        [](const ComputeDispatch &dispatch) { return dispatch.event.has_value(); });
     if (impl_->dispatchProfiling && dispatches.size() > 1) {
+        if (events) {
+            throw MetalBackendError("dispatch profiling cannot replay event steps");
+        }
         // Replay serially, one command per dispatch, then hand back an
         // already-completed ticket carrying the summed timing so callers
         // observe the usual asynchronous contract.
@@ -1373,6 +1418,13 @@ CommandTicket MetalBackend::submitCommandAsync(
     for (const ComputeDispatch &dispatch : dispatches) {
         PreparedDispatch item;
         item.source = &dispatch;
+        if (dispatch.event) {
+            if (!dispatch.event->event || !dispatch.event->value) {
+                throw MetalBackendError("event step requires an event and a value");
+            }
+            prepared.push_back(item);
+            continue;
+        }
         item.groups = metalSize(dispatch.threadgroups, "threadgroups");
         item.threads = metalSize(
             dispatch.threadsPerThreadgroup, "threadsPerThreadgroup");
@@ -1428,6 +1480,7 @@ CommandTicket MetalBackend::submitCommandAsync(
     impl_->ensureHealthy();
     static_cast<void>(impl_->reapSparseUnmapsLocked());
     for (PreparedDispatch &item : prepared) {
+        if (item.source->event) continue;
         item.pipeline = impl_->pipeline(item.source->pipelineName);
         if (item.threadCount >
             item.pipeline.maxTotalThreadsPerThreadgroup) {
@@ -1471,14 +1524,38 @@ CommandTicket MetalBackend::submitCommandAsync(
     // Encoders can remain autoreleased after their command has completed.
     // The serving loop is long-lived, so bound their temporary ownership to
     // encoding; the command retains everything needed for GPU execution.
+    // An event signal ends a command buffer; the rest continue in the next.
+    std::vector<id<MTLCommandBuffer>> leading;
     @autoreleasepool {
-        id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
-        if (!encoder) {
-            failBeforeCommit("unable to create Metal compute encoder");
-        }
+        id<MTLComputeCommandEncoder> encoder = nil;
         try {
             for (const PreparedDispatch &item : prepared) {
                 const ComputeDispatch &dispatch = *item.source;
+                if (dispatch.event) {
+                    if (encoder) {
+                        [encoder endEncoding];
+                        encoder = nil;
+                    }
+                    id<MTLSharedEvent> event =
+                        (__bridge id<MTLSharedEvent>)dispatch.event->event.nativeHandle();
+                    if (!dispatch.event->signal) {
+                        [command encodeWaitForEvent:event value:dispatch.event->value];
+                        continue;
+                    }
+                    [command encodeSignalEvent:event value:dispatch.event->value];
+                    leading.push_back(command);
+                    command = [impl_->queue commandBuffer];
+                    if (!command) {
+                        failBeforeCommit("unable to create Metal command buffer");
+                    }
+                    continue;
+                }
+                if (!encoder) {
+                    encoder = [command computeCommandEncoder];
+                    if (!encoder) {
+                        failBeforeCommit("unable to create Metal compute encoder");
+                    }
+                }
                 [encoder setComputePipelineState:item.pipeline];
                 for (const BufferBinding &binding : dispatch.buffers) {
                     const MetalBuffer::Impl &buffer = *binding.buffer.impl_;
@@ -1496,7 +1573,7 @@ CommandTicket MetalBackend::submitCommandAsync(
                 [encoder dispatchThreadgroups:item.groups
                          threadsPerThreadgroup:item.threads];
             }
-            [encoder endEncoding];
+            if (encoder) [encoder endEncoding];
         } catch (...) {
             impl_->asyncState->releaseSubmission(ticketState->sequence);
             throw;
@@ -1506,6 +1583,7 @@ CommandTicket MetalBackend::submitCommandAsync(
     // Driver callbacks only complete the ticket. Device-wide memory telemetry
     // is sampled on the host before submission and when consuming the result.
     std::shared_ptr<BackendAsyncState> observer = impl_->asyncState;
+    ticketState->leadingCommands = leading;
     [command addCompletedHandler:^(id<MTLCommandBuffer> completedCommand) {
         ticketState->finishCommand(completedCommand);
     }];
@@ -1521,7 +1599,7 @@ CommandTicket MetalBackend::submitCommandAsync(
     }
     const NSUInteger timeout = impl_->sparseTimeoutMilliseconds;
     afterMetalEvent(event, sparseEventValue, timeout,
-        [command, event, observer, ticketState, sparseEventValue,
+        [command, leading, event, observer, ticketState, sparseEventValue,
          pendingMap, mapWaitStart, wallStart, timeout](bool signaled) {
             if (pendingMap) {
                 const double waited = steadySeconds() - mapWaitStart;
@@ -1546,7 +1624,7 @@ CommandTicket MetalBackend::submitCommandAsync(
                 ticketState->finish(timing, message.str());
                 return;
             }
-            if (!observer->commitSubmission(ticketState->sequence, command,
+            if (!observer->commitSubmission(ticketState->sequence, leading, command,
                     [weakTicket = std::weak_ptr(ticketState)](id<MTLCommandBuffer> completed) {
                         if (auto ticket = weakTicket.lock()) ticket->finishCommand(completed);
                     })) {

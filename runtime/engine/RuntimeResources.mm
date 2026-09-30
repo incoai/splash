@@ -216,7 +216,7 @@ RuntimeResources::RuntimeResources(
     std::unique_ptr<model::StateStorage> stateStorage,
     std::unique_ptr<model::KvPageTier> kvTier,
     std::unique_ptr<KvPool> kvPool, std::unique_ptr<engine::Cache> cache,
-    uint32_t maximumImagePatches, std::optional<uint64_t> hostAvailableAtStart)
+    uint32_t maximumImagePatches, double aneFfnShare, std::optional<uint64_t> hostAvailableAtStart)
     : backend_(std::move(backend)), model_(std::move(model)),
       operators_(std::move(operators)),
       memoryPlan_(std::move(memoryPlan)),
@@ -226,7 +226,7 @@ RuntimeResources::RuntimeResources(
       stateStorage_(std::move(stateStorage)), kvTier_(std::move(kvTier)),
       kvPool_(std::move(kvPool)),
       cache_(std::move(cache)), maximumImagePatches_(maximumImagePatches),
-      hostAvailableAtStart_(hostAvailableAtStart) {}
+      aneFfnShare_(aneFfnShare), hostAvailableAtStart_(hostAvailableAtStart) {}
 
 std::unique_ptr<RuntimeResources>
 RuntimeResources::create(const RuntimeResourcesConfig &config) {
@@ -365,7 +365,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
           : 0;
   auto prepareMemory = [&]() -> EngineMemoryPlan {
     try {
-      modelMemoryPlan = model::plannedRuntimeMemory(device, package, operators, config.kvFormat);
+      modelMemoryPlan =
+          model::plannedRuntimeMemory(device, package, operators, config.kvFormat, config.aneFfnShare);
       if (auto error = modelMemoryPlan.validationError()) {
         throw std::invalid_argument(*error);
       }
@@ -533,7 +534,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
         std::move(modelMemoryPlan), std::move(cacheIdentity),
         std::move(memoryGovernor), std::move(kvPages), std::move(stateStorage),
         std::move(kvTier), std::move(kvPool), std::move(cache),
-        config.maximumImagePatches, hostAvailableAtStart));
+        config.maximumImagePatches, config.aneFfnShare, hostAvailableAtStart));
     return result;
   } catch (const metal::MetalAllocationError &error) {
     throw RuntimeResourcesError(RuntimeResourceStage::StorageAllocation,
@@ -560,6 +561,7 @@ model::RuntimeContext RuntimeResources::modelContext() noexcept {
       budget.pipelineReserveBytes,
       budget.runtimeOverheadReserveBytes,
       kvTier_.get(),
+      aneFfnShare_,
   };
 }
 

@@ -81,6 +81,9 @@ struct RuntimeResourcesConfig {
   // to it when the model loaded vision and none otherwise; the wire parser's
   // limit defaults to the same constant.
   uint32_t maximumImagePatches = ops::kMaximumImagePatches;
+  // The fraction of a dense target's prefill FFN channels run on the Neural
+  // Engine (ops/AneFfn.hpp); zero keeps the FFN on the GPU.
+  double aneFfnShare = 0.0;
   // The process's existing pressure observer runs before resource assembly;
   // it only publishes a level. Bootstrap checks it at Metal operation
   // boundaries; after Ready the transport control handler keeps it current.
@@ -205,7 +208,7 @@ private:
                    std::unique_ptr<model::KvPageTier> kvTier,
                    std::unique_ptr<KvPool> kvPool,
                    std::unique_ptr<engine::Cache> cache,
-                   uint32_t maximumImagePatches,
+                   uint32_t maximumImagePatches, double aneFfnShare,
                    std::optional<uint64_t> hostAvailableAtStart);
 
   std::unique_ptr<metal::MetalBackend> backend_;
@@ -221,6 +224,7 @@ private:
   std::unique_ptr<KvPool> kvPool_;
   std::unique_ptr<engine::Cache> cache_;
   uint32_t maximumImagePatches_ = 0;
+  double aneFfnShare_ = 0.0;
   std::optional<uint64_t> hostAvailableAtStart_;
 };
 

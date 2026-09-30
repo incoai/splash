@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -92,6 +93,30 @@ private:
   friend class MetalBackend;
 };
 
+// A shared event another agent, such as the Neural Engine, waits on or
+// signals. Copies name the same event. nativeHandle() is its
+// id<MTLSharedEvent> for Objective-C++ callers.
+class SharedEvent final {
+public:
+  SharedEvent();
+  ~SharedEvent();
+  SharedEvent(const SharedEvent &);
+  SharedEvent &operator=(const SharedEvent &);
+  SharedEvent(SharedEvent &&) noexcept;
+  SharedEvent &operator=(SharedEvent &&) noexcept;
+
+  [[nodiscard]] explicit operator bool() const noexcept;
+  [[nodiscard]] void *nativeHandle() const noexcept;
+
+private:
+  struct Impl;
+  explicit SharedEvent(std::shared_ptr<Impl> impl);
+
+  std::shared_ptr<Impl> impl_;
+
+  friend class MetalBackend;
+};
+
 // Move-only ownership of one private placement heap. Destroying an empty heap
 // is the operation that actually returns sparse KV backing to the OS; merely
 // unmapping tiles is not sufficient on Apple Silicon.
@@ -143,12 +168,25 @@ struct BytesBinding {
   uint64_t sizeBytes = 0;
 };
 
+// A dispatch-free step that orders a command against another agent: signal
+// raises the event to value once all earlier work has completed; otherwise
+// later work waits until the event reaches value. The work before a signal is
+// committed as its own Metal command buffer, so the signal is never held back
+// behind the dispatches that follow it.
+struct EventStep {
+  SharedEvent event;
+  uint64_t value = 0;
+  bool signal = false;
+};
+
 struct ComputeDispatch {
   std::string pipelineName;
   std::vector<BufferBinding> buffers;
   std::vector<BytesBinding> bytes;
   DispatchSize threadgroups;
   DispatchSize threadsPerThreadgroup;
+  // Set for an event step, which has no pipeline or bindings.
+  std::optional<EventStep> event{};
 };
 
 struct CommandTiming {
@@ -334,6 +372,7 @@ public:
                                              std::string_view label = {});
   [[nodiscard]] MetalBuffer view(const MetalBuffer &base, uint64_t offsetBytes,
                                  uint64_t lengthBytes) const;
+  [[nodiscard]] SharedEvent newSharedEvent();
 
   // Metal wires a buffer only while a command uses it and a few seconds
   // after, so memory pressure can drop idle weights and the next request
