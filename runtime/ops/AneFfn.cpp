@@ -2,6 +2,7 @@
 
 #include "metal/abi/AneFfn.h"
 
+#include <algorithm>
 #include <bit>
 #include <chrono>
 #include <cmath>
@@ -16,19 +17,27 @@ namespace {
 
 using Element = ane::Surface::Element;
 
-// The rotation block (kernels/prefill/ane_ffn.metal) and the channels of an
-// ANE input segment of gate and up, and of a segment of down's inputs.
+// The rotation blocks (kernels/prefill/ane_ffn.metal) of the inputs, which
+// gate and up multiply, and of the ANE's intermediate rows, which down
+// multiplies: a larger block spreads the intermediate rows' outliers further
+// before their per-token scale. Then the channels of an ANE input segment of
+// gate and up, and of a segment of down's inputs.
 constexpr uint32_t kBlock = 128;
+constexpr uint32_t kIntermediateBlock = 512;
 constexpr uint32_t kSegment = 2560;
 constexpr uint32_t kQuantGroup = 64;
 constexpr auto kCompletionTimeout = std::chrono::seconds(10);
 
+// Whole blocks of the intermediate rotation for the ANE, whole 256-row tiles
+// of the Q4 planes for the GPU.
 uint32_t gpuChannels(uint32_t intermediate, double share) {
+  constexpr uint32_t unit = std::max(256u, kIntermediateBlock);
   if (!(share > 0.0 && share < 1.0)) throw std::invalid_argument("ANE FFN share must lie in (0, 1)");
-  const auto tiles = static_cast<uint32_t>(std::lround((1.0 - share) * intermediate / 256.0));
-  if (!tiles || tiles >= intermediate / 256)
+  if (intermediate % unit) throw std::invalid_argument("ANE FFN split needs whole rotation blocks of channels");
+  const auto units = static_cast<uint32_t>(std::lround((1.0 - share) * intermediate / unit));
+  if (!units || units >= intermediate / unit)
     throw std::invalid_argument("ANE FFN share leaves the GPU or the ANE no channels");
-  return tiles * 256;
+  return units * unit;
 }
 
 std::vector<uint32_t> segments(uint32_t channels) {
@@ -44,20 +53,21 @@ uint64_t downShareBytes(uint32_t hidden, uint32_t channels) {
   return pages(uint64_t{hidden} * channels / 2 + uint64_t{hidden} * (channels / kQuantGroup) * 4);
 }
 
-// The Hadamard signs D of the rotation R = H D / sqrt(128) of inputs, weights
-// and the ANE's intermediate rows alike.
-std::array<float, kBlock> rotationSigns() {
+// The Hadamard signs D of the rotations R = D H / sqrt(n) of inputs, weights
+// and the ANE's intermediate rows alike: a block of n values takes the first n.
+std::array<float, kIntermediateBlock> rotationSigns() {
   std::mt19937 generator(20260930);
-  std::array<float, kBlock> signs{};
+  std::array<float, kIntermediateBlock> signs{};
   for (float &sign : signs) sign = (generator() & 1) ? -1.0f : 1.0f;
   return signs;
 }
 
 // A Core ML weight blob holding one fp16 tensor: the rotation of each of the
-// ANE's intermediate channels as the [channels, 128, 1, 1] weight of a
-// grouped 1x1 convolution. Its metadata record is at offset 64.
-std::vector<uint8_t> rotationBlob(uint32_t channels, const std::array<float, kBlock> &signs) {
-  const uint64_t count = uint64_t{channels} * kBlock;
+// ANE's intermediate channels as the [channels, kIntermediateBlock, 1, 1]
+// weight of a grouped 1x1 convolution. Its metadata record is at offset 64.
+std::vector<uint8_t> rotationBlob(uint32_t channels, const std::array<float, kIntermediateBlock> &signs) {
+  constexpr uint32_t block = kIntermediateBlock;
+  const uint64_t count = uint64_t{channels} * block;
   std::vector<uint8_t> blob(128 + count * sizeof(_Float16));
   const auto put = [&](size_t offset, auto value) { std::memcpy(blob.data() + offset, &value, sizeof value); };
   put(0, uint32_t{1});          // blobs
@@ -67,12 +77,12 @@ std::vector<uint8_t> rotationBlob(uint32_t channels, const std::array<float, kBl
   put(72, count * sizeof(_Float16));
   put(80, uint64_t{128});
   auto *values = reinterpret_cast<_Float16 *>(blob.data() + 128);
-  const float norm = 1.0f / std::sqrt(float(kBlock));
+  const float norm = 1.0f / std::sqrt(float(block));
   for (uint32_t channel = 0; channel < channels; ++channel)
-    for (uint32_t input = 0; input < kBlock; ++input) {
-      const uint32_t output = channel % kBlock;
+    for (uint32_t input = 0; input < block; ++input) {
+      const uint32_t output = channel % block;
       const float hadamard = (std::popcount(output & input) & 1) ? -1.0f : 1.0f;
-      values[uint64_t{channel} * kBlock + input] = _Float16(signs[output] * hadamard * norm);
+      values[uint64_t{channel} * block + input] = _Float16(signs[output] * hadamard * norm);
     }
   return blob;
 }
@@ -149,10 +159,11 @@ std::string ffnProgram(uint32_t hidden, uint32_t channels, const std::vector<uin
   f16("h", channels, rows, "mul(x = silu, y = us)");
   line("tensor<fp16, [1, " + c + ", 1, " + r + "]> h4 = reshape(x = h, shape = tensor<int32, [4]>([1, " + c + ", 1, " +
        r + "]))");
-  line("tensor<fp16, [" + c + ", 128, 1, 1]> rotation = const()[name = string(\"rotation\"), val = tensor<fp16, [" + c +
-       ", 128, 1, 1]>(BLOBFILE(path = string(\"@model_path/weights.bin\"), offset = uint64(64)))]");
+  const std::string block = std::to_string(kIntermediateBlock);
+  line("tensor<fp16, [" + c + ", " + block + ", 1, 1]> rotation = const()[name = string(\"rotation\"), val = tensor<fp16, [" +
+       c + ", " + block + ", 1, 1]>(BLOBFILE(path = string(\"@model_path/weights.bin\"), offset = uint64(64)))]");
   line("tensor<fp16, [1, " + c + ", 1, " + r +
-       "]> hr4 = conv(dilations = tensor<int32, [2]>([1, 1]), groups = int32(" + std::to_string(channels / kBlock) +
+       "]> hr4 = conv(dilations = tensor<int32, [2]>([1, 1]), groups = int32(" + std::to_string(channels / kIntermediateBlock) +
        "), pad = tensor<int32, [4]>([0, 0, 0, 0]), pad_type = string(\"valid\"), strides = tensor<int32, [2]>([1, "
        "1]), weight = rotation, x = h4)");
   f16("hr", channels, rows, "reshape(x = hr4, shape = tensor<int32, [4]>(" + shape(channels, rows) + "))");
@@ -189,7 +200,7 @@ std::string ffnProgram(uint32_t hidden, uint32_t channels, const std::vector<uin
 
 uint64_t AneFfn::plannedBytes(uint32_t layers, uint32_t hidden, uint32_t intermediate, double share) {
   const uint32_t gpu = gpuChannels(intermediate, share), ane = intermediate - gpu;
-  uint64_t bytes = pages(kBlock * sizeof(float)) + pages(uint64_t{layers} * (2 * ane + hidden) * 2) +
+  uint64_t bytes = pages(kIntermediateBlock * sizeof(float)) + pages(uint64_t{layers} * (2 * ane + hidden) * 2) +
                    pages(uint64_t{kRows} * hidden * 2) + uint64_t{layers} * downShareBytes(hidden, gpu) +
                    (hidden / kSegment) * ane::Surface::bytes(kSegment, kRows, Element::Int8) +
                    ane::Surface::bytes(1, kRows, Element::Float16) +
@@ -230,7 +241,7 @@ AneFfn::AneFfn(metal::MetalBackend &backend, const Linear &linear, std::span<con
     return ane::Surface::create(backend_, rows, width, element);
   };
 
-  const std::array<float, kBlock> signs = rotationSigns();
+  const std::array<float, kIntermediateBlock> signs = rotationSigns();
   signs_ = allocate(sizeof signs, "ane ffn signs");
   std::memcpy(signs_.contents(), signs.data(), sizeof signs);
   rowScales_ = allocate(uint64_t{layers.size()} * (2 * aneChannels_ + hidden_) * 2, "ane ffn row scales");
@@ -308,14 +319,16 @@ AneFfn::AneFfn(metal::MetalBackend &backend, const Linear &linear, std::span<con
   metal::CommandGraph graph;
   for (uint32_t layer = 0; layer < layers_.size(); ++layer) {
     const SwiGluProjections &source = layers_[layer].source;
-    const auto add = [&](const Projection &projection, uint32_t part, AneFfnWeightParams params, uint32_t rows) {
+    const auto add = [&](const Projection &projection, uint32_t part, AneFfnWeightParams params, uint32_t rows,
+                         uint32_t block) {
       const AffineWeights &weights = projection.affine();
-      graph.add("ane_ffn_row_scale", {weights.weights, weights.scales, weights.biases, rowScales(layer, part), signs_},
-                params, {rows / 8, 1, 1});
+      graph.add("ane_ffn_row_scale_" + std::to_string(block),
+                {weights.weights, weights.scales, weights.biases, rowScales(layer, part), signs_}, params,
+                {rows / 8, 1, 1});
     };
-    add(*source.gate, 0, {hidden_ / kQuantGroup, gpuChannels_, 0, hidden_, 0, 0}, aneChannels_);
-    add(*source.up, 1, {hidden_ / kQuantGroup, gpuChannels_, 0, hidden_, 0, 0}, aneChannels_);
-    add(*source.down, 2, {groups, 0, gpuChannels_, aneChannels_, 0, 0}, hidden_);
+    add(*source.gate, 0, {hidden_ / kQuantGroup, gpuChannels_, 0, hidden_, 0, 0}, aneChannels_, kBlock);
+    add(*source.up, 1, {hidden_ / kQuantGroup, gpuChannels_, 0, hidden_, 0, 0}, aneChannels_, kBlock);
+    add(*source.down, 2, {groups, 0, gpuChannels_, aneChannels_, 0, 0}, hidden_, kIntermediateBlock);
   }
   static_cast<void>(backend_.submitCommand(graph.dispatches()));
 }
@@ -332,23 +345,23 @@ void AneFfn::addWeights(metal::CommandGraph &graph, uint32_t layer, uint32_t set
   const SwiGluProjections &source = layers_.at(layer).source;
   const Weights &target = sets_[set];
   const auto add = [&](const Projection &projection, const metal::MetalBuffer &scales, const ane::Surface &output,
-                       const ane::Surface &scale, AneFfnWeightParams params, uint32_t rows) {
+                       const ane::Surface &scale, AneFfnWeightParams params, uint32_t rows, uint32_t block) {
     const AffineWeights &weights = projection.affine();
     params.stride = output.strideBytes;
     params.scale_stride = scale.strideBytes / 2;
-    graph.add("ane_ffn_weights",
+    graph.add("ane_ffn_weights_" + std::to_string(block),
               {weights.weights, weights.scales, weights.biases, scales, output.buffer, scale.buffer, signs_}, params,
-              {rows / 8, params.width / kBlock, 1});
+              {rows / 8, params.width / block, 1});
   };
   for (uint32_t k = 0; k < target.gate.size(); ++k) {
     const AneFfnWeightParams params{hidden_ / kQuantGroup, gpuChannels_, k * kSegment, kSegment, 0, 0};
-    add(*source.gate, rowScales(layer, 0), target.gate[k], target.gateScale, params, aneChannels_);
-    add(*source.up, rowScales(layer, 1), target.up[k], target.upScale, params, aneChannels_);
+    add(*source.gate, rowScales(layer, 0), target.gate[k], target.gateScale, params, aneChannels_, kBlock);
+    add(*source.up, rowScales(layer, 1), target.up[k], target.upScale, params, aneChannels_, kBlock);
   }
   uint32_t begin = gpuChannels_;
   for (size_t i = 0; i < downSegments_.size(); ++i) {
     add(*source.down, rowScales(layer, 2), target.down[i], target.downScale,
-        {intermediate_ / kQuantGroup, 0, begin, downSegments_[i], 0, 0}, hidden_);
+        {intermediate_ / kQuantGroup, 0, begin, downSegments_[i], 0, 0}, hidden_, kIntermediateBlock);
     begin += downSegments_[i];
   }
 }
