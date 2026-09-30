@@ -145,6 +145,9 @@ constexpr uint64_t kPlacementSparsePageBytes = MetalBackend::kPlacementSparsePag
 constexpr MTLSparsePageSize kPlacementSparsePageSize = MTLSparsePageSize64;
 // Entries of a kernel's buffer argument table on every Apple GPU family.
 constexpr uint32_t kBufferArgumentEntries = 31;
+// The queue's outstanding command buffers; a command takes one per event
+// signal and one more.
+constexpr NSUInteger kMaximumCommandBuffers = 512;
 
 MTLSparsePageSize metalSparsePageSize(uint64_t bytes) {
     if (bytes != kPlacementSparsePageBytes) {
@@ -810,7 +813,11 @@ MetalBackend::MetalBackend(std::string metallibPath, double commandTimeoutSecond
             throw MetalBackendError("Metal device unavailable");
         }
         impl_->asyncState->device = impl_->device;
-        impl_->queue = [impl_->device newCommandQueue];
+        // A command splits into one Metal command buffer per event signal
+        // (EventStep), all created before any commits: the default limit of
+        // 64 outstanding would block a 64-layer prefill with an ANE step each.
+        impl_->queue = [impl_->device
+            newCommandQueueWithMaxCommandBufferCount:kMaximumCommandBuffers];
         if (!impl_->queue) {
             throw MetalBackendError("unable to create Metal command queue");
         }
@@ -1383,6 +1390,11 @@ CommandTicket MetalBackend::submitCommandAsync(
     }
     const bool events = std::any_of(dispatches.begin(), dispatches.end(),
         [](const ComputeDispatch &dispatch) { return dispatch.event.has_value(); });
+    const auto signals = std::count_if(dispatches.begin(), dispatches.end(),
+        [](const ComputeDispatch &dispatch) { return dispatch.event && dispatch.event->signal; });
+    if (static_cast<NSUInteger>(signals) >= kMaximumCommandBuffers) {
+        throw MetalBackendError("Metal command signals more events than its queue holds command buffers");
+    }
     if (impl_->dispatchProfiling && dispatches.size() > 1) {
         if (events) {
             throw MetalBackendError("dispatch profiling cannot replay event steps");
