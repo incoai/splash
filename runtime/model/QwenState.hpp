@@ -125,6 +125,9 @@ public:
   QwenStateStorage(const QwenStateStorage &) = delete;
   QwenStateStorage &operator=(const QwenStateStorage &) = delete;
 
+  [[nodiscard]] std::shared_ptr<const StatePayload>
+  reopenState(const CachedStateBlock &block, StoredStateRecord record,
+              DiskReservation &reservation) override;
   [[nodiscard]] const QwenSlotBuffers &buffers(uint32_t slot) const;
   [[nodiscard]] const QwenSlotMetadata &metadata(uint32_t slot) const;
 
@@ -163,6 +166,8 @@ public:
   // Borrows committed backing for synchronous admission and disk capture.
   // Preparing the plan takes no cache slot and performs no IO.
   [[nodiscard]] SnapshotWritePlan prepareSnapshotToDisk(uint32_t slot);
+  [[nodiscard]] SnapshotWritePlan
+  prepareWrite(std::shared_ptr<const RestoreState> source) override;
   void restore(uint32_t slot, const RestoreState &state,
                bool restoreDraftState);
 

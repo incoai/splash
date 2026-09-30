@@ -54,7 +54,8 @@ public:
   uint64_t residentBytes() const noexcept override { return disk_ ? 0 : bytes(); }
   bool canOffload() const noexcept override { return !disk_; }
   std::unique_ptr<StateWrite<StatePayload>>
-  offload(std::function<void()>) const override {
+  offload(std::function<void()>,
+          model::DiskReservation * = nullptr) const override {
     return writeState(control_);
   }
 
@@ -1205,7 +1206,7 @@ void testRollingCheckpointsUseTheTier() {
   control->ready = true;
   SnapshotWritePlan write{
       test::checkpoint(64, std::make_shared<TestState>(100)),
-      [&](std::function<void()>) {
+      [&](std::function<void()>, model::DiskReservation *) {
         return test::snapshotWrite(64, writeState(control));
       }};
   require(fixture.cache.publishStateToDisk(fixture.blocks[1], write, true) &&
@@ -1490,7 +1491,7 @@ void testOrdinaryPublicationUpgradesDiskCheckpoint() {
     control->ready = true;
     SnapshotWritePlan write{
         test::checkpoint(128, std::make_shared<TestState>(100)),
-        [&](std::function<void()>) {
+        [&](std::function<void()>, model::DiskReservation *) {
           return test::snapshotWrite(128, writeState(control));
         }};
     require(fixture.cache.publishStateToDisk(fixture.blocks[3], write, true) &&
@@ -1526,7 +1527,7 @@ void testDiskPublicationLifecycle() {
   uint32_t writeBoundary = 128;
   SnapshotWritePlan write{
       test::checkpoint(writeBoundary, std::make_shared<TestState>(100)),
-      [&](std::function<void()>) {
+      [&](std::function<void()>, model::DiskReservation *) {
         return test::snapshotWrite(writeBoundary, writeState(control));
       }};
   require(fixture.cache.publishStateToDisk(fixture.blocks[3], write),
@@ -1572,7 +1573,7 @@ void testDiskPublicationFailure() {
   control->success = false;
   SnapshotWritePlan write{
       test::checkpoint(128, std::make_shared<TestState>(100)),
-      [&](std::function<void()>) {
+      [&](std::function<void()>, model::DiskReservation *) {
         return test::snapshotWrite(128, writeState(control));
       }};
   require(fixture.cache.publishStateToDisk(fixture.blocks[3], write) &&
@@ -1612,7 +1613,7 @@ void testFailedWriteUnderALookup() {
       control->success = true;
       SnapshotWritePlan write{
           test::checkpoint(128, std::make_shared<TestState>(100)),
-          [&](std::function<void()>) {
+          [&](std::function<void()>, model::DiskReservation *) {
             return test::snapshotWrite(128, writeState(control));
           }};
       require(fixture.cache.publishStateToDisk(block, write) && fixture.cache.pollTransfers(),
@@ -1653,7 +1654,7 @@ void testFailedWriteIsCountedAfterItsEntryLeft() {
     } else {
       SnapshotWritePlan write{
           test::checkpoint(128, std::make_shared<TestState>(100)),
-          [&](std::function<void()>) {
+          [&](std::function<void()>, model::DiskReservation *) {
             return test::snapshotWrite(128, writeState(control));
           }};
       require(fixture.cache.publishStateToDisk(block, write, true) &&
@@ -1683,7 +1684,7 @@ void testDiskPublicationMakesRoom() {
           "the older state did not fill the quota");
   SnapshotWritePlan write{
       test::checkpoint(128, std::make_shared<TestState>(100)),
-      [&](std::function<void()>) {
+      [&](std::function<void()>, model::DiskReservation *) {
         return test::snapshotWrite(128, writeState(control));
       }};
   require(fixture.cache.publishStateToDisk(fixture.blocks[3], write) &&

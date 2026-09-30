@@ -7,6 +7,7 @@
 #import <Foundation/Foundation.h>
 
 #include <array>
+#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <sstream>
@@ -310,8 +311,9 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
           config.model.stateLayout.activeCellBytes(),
           uint64_t{kvLayout.backingExtentPages()} *
               kvLayout.bytesPerModelPage(),
-          config.maximumCacheDiskBytes ? model::KvPageTier::stagingBytesFor(kvLayout)
-                                       : 0}) {
+          (config.maximumCacheDiskBytes || config.persistentCacheBytes)
+              ? model::KvPageTier::stagingBytesFor(kvLayout)
+              : 0}) {
       if (!checkedAdd(requiredBytes, bytes, requiredBytes))
         requiredBytes = std::numeric_limits<uint64_t>::max();
     }
@@ -360,8 +362,9 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
   // The disk tier's KV staging is Metal memory the governor charges beside
   // the weights, so the plan sets it aside before it sizes the KV pool.
   const uint64_t kvStagingBytes =
-      config.maximumCacheDiskBytes
-          ? model::KvPageTier::stagingBytesFor(package.targetKvLayout(config.kvFormat))
+      (config.maximumCacheDiskBytes || config.persistentCacheBytes)
+          ? model::KvPageTier::stagingBytesFor(
+                package.targetKvLayout(config.kvFormat))
           : 0;
   auto prepareMemory = [&]() -> EngineMemoryPlan {
     try {
@@ -468,51 +471,99 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
     auto kvPages = std::make_unique<kv::PageStorage>(
         *backend, memoryGovernor->allocationAdmission(), package.targetKvLayout(config.kvFormat),
         budget.kvVirtualPages);
-    // One disk quota serves KV pages and states. Without room for a state,
-    // disk KV cannot preserve a restorable prefix, so the tier stays off.
-    std::shared_ptr<model::DiskBudget> diskBudget;
-    std::shared_ptr<model::SlotFile> stateFile;
-    const uint64_t stateBytes = package.stateLayout().target.cellBytes();
-    if (config.maximumCacheDiskBytes) {
-      diskBudget = std::make_shared<model::DiskBudget>(config.maximumCacheDiskBytes);
-      try {
-        stateFile = std::make_shared<model::SlotFile>(stateBytes, diskBudget);
-      } catch (const std::exception &error) {
-        diskBudget.reset();
-        logKernelStartup("Cache disk tier disabled (", error.what(), ").");
+    // Persistence is optional. Rebuild only cache storage after an open/load
+    // failure, retaining the user's independent temporary-offload setting.
+    struct CacheStorage {
+      std::unique_ptr<model::StateStorage> states;
+      std::unique_ptr<model::KvPageTier> tier;
+      std::unique_ptr<KvPool> pool;
+      std::unique_ptr<engine::Cache> cache;
+    };
+    const auto assembleCache = [&](std::shared_ptr<model::CacheStore> store) {
+      CacheStorage storage;
+      const uint64_t capacity = config.maximumCacheDiskBytes;
+      std::shared_ptr<model::DiskBudget> diskBudget;
+      std::shared_ptr<model::SlotFile> stateFile, kvFile;
+      if (capacity || store) {
+        diskBudget = std::make_shared<model::DiskBudget>(capacity);
+        try {
+          stateFile = std::make_shared<model::SlotFile>(
+              package.stateLayout().target.cellBytes(), diskBudget,
+              std::filesystem::temp_directory_path(), store);
+          kvFile = std::make_shared<model::SlotFile>(
+              model::KvPageTier::slotBytesFor(*kvPages), diskBudget,
+              std::filesystem::temp_directory_path(), store);
+          storage.tier =
+              std::make_unique<model::KvPageTier>(*backend, *kvPages, kvFile);
+        } catch (const std::bad_alloc &) {
+          throw;
+        } catch (const std::exception &error) {
+          if (store)
+            throw;
+          diskBudget.reset();
+          stateFile.reset();
+          kvFile.reset();
+          logKernelStartup("Cache disk tier disabled (", error.what(), ").");
+        }
       }
-    }
-    std::unique_ptr<model::StateStorage> stateStorage = model::createStateStorage(
-        *backend, memoryGovernor->allocationAdmission(), package, stateFile);
-    if (!stateStorage) {
-      throw std::runtime_error("model factory returned no state storage");
-    }
-    std::unique_ptr<model::KvPageTier> kvTier;
-    if (diskBudget) {
-      try {
-        const uint64_t slotBytes = model::KvPageTier::slotBytesFor(*kvPages);
-        kvTier = std::make_unique<model::KvPageTier>(
-            *backend, *kvPages, std::make_shared<model::SlotFile>(slotBytes, diskBudget));
-        logKernelStartup("Cache disk tier: ", config.maximumCacheDiskBytes / kMiB,
-                         " MiB for KV pages of ", slotBytes / 1024, " KiB and states of ",
-                         stateBytes / kMiB, " MiB; KV pages stage through ",
-                         kvStagingBytes / kMiB, " MiB of Metal memory",
-                         stateFile ? ", states through host memory." : ".");
-      } catch (const std::exception &error) {
-        logKernelStartup("Cache disk KV storage disabled; state storage remains enabled (",
-                         error.what(), ").");
+      storage.states = model::createStateStorage(
+          *backend, memoryGovernor->allocationAdmission(), package, stateFile);
+      if (!storage.states)
+        throw std::runtime_error("model factory returned no state storage");
+      storage.pool = std::make_unique<KvPool>(*kvPages);
+      storage.cache = std::make_unique<engine::Cache>(
+          *storage.pool, cacheIdentity.cacheNamespace, storage.tier.get(),
+          diskBudget);
+      if (store) {
+        storage.cache->enablePersistence(
+            {std::make_shared<model::DiskBudget>(config.persistentCacheBytes),
+             store, kvFile, storage.states.get()});
+        logKernelStartup(
+            "Restored ", storage.cache->snapshot().persistent.restored,
+            " persistent prefixes without allocating GPU cache pages.");
       }
+      if (diskBudget)
+        logKernelStartup(
+            "Cache disk tier: ", capacity / kMiB,
+            " MiB temporary quota for target pages and model cache groups.");
+      return storage;
+    };
+    CacheStorage storage;
+    if (config.persistentCacheBytes) {
+      auto path = config.cacheFile;
+      if (path.empty()) {
+        const char *home = std::getenv("HOME");
+        if (!home)
+          throw std::invalid_argument("HOME is unset; specify --cache-file");
+        path = std::filesystem::path(home) / "Library/Caches/Splash/prefix" /
+               (cacheIdentity.modelLayoutSha256 + "-" +
+                std::string(kv::storageFormatName(config.kvFormat)) +
+                "-v2.sqlite");
+      }
+      try {
+        auto store = std::make_shared<model::CacheStore>(
+            path, cacheIdentity.namespaceSha256);
+        storage = assembleCache(std::move(store));
+        logKernelStartup("Persistent prefix cache: ", path.string(), ".");
+      } catch (const std::bad_alloc &) {
+        throw;
+      } catch (const std::exception &error) {
+        logKernelStartup(
+            "Persistent prefix cache disabled for ", path.string(), " (",
+            error.what(),
+            "); continuing with RAM and configured temporary offload.");
+        storage = assembleCache({});
+      }
+    } else {
+      storage = assembleCache({});
     }
-    auto kvPool = std::make_unique<KvPool>(*kvPages);
-    auto cache = std::make_unique<engine::Cache>(*kvPool, cacheIdentity.cacheNamespace,
-                                                 kvTier.get(), diskBudget);
 
     if (kvPages->declaredBytes() != budget.kvVirtualBytes ||
         kvPages->actualAllocatedBytes() > budget.kvVirtualBytes) {
       throw std::runtime_error(
           "actual KV page storage exceeds its planned category");
     }
-    if (stateStorage->actualAllocatedBytes() != 0) {
+    if (storage.states->actualAllocatedBytes() != 0) {
       throw std::runtime_error("state cells were allocated eagerly");
     }
     metal::MetalMemoryStats memory = backend->memoryStats();
@@ -529,10 +580,10 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
 
     auto result = std::unique_ptr<RuntimeResources>(new RuntimeResources(
         std::move(backend), std::move(package), std::move(operators),
-        std::move(memoryPlan),
-        std::move(modelMemoryPlan), std::move(cacheIdentity),
-        std::move(memoryGovernor), std::move(kvPages), std::move(stateStorage),
-        std::move(kvTier), std::move(kvPool), std::move(cache),
+        std::move(memoryPlan), std::move(modelMemoryPlan),
+        std::move(cacheIdentity), std::move(memoryGovernor), std::move(kvPages),
+        std::move(storage.states), std::move(storage.tier),
+        std::move(storage.pool), std::move(storage.cache),
         config.maximumImagePatches, hostAvailableAtStart));
     return result;
   } catch (const metal::MetalAllocationError &error) {

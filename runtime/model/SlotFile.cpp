@@ -9,12 +9,44 @@
 #include <limits>
 #include <stdexcept>
 #include <system_error>
+#include <unordered_map>
 #include <utility>
 
 namespace splash::model {
 
+std::optional<DiskReservation>
+DiskReservation::acquire(std::shared_ptr<DiskBudget> budget, uint64_t bytes) {
+  if (!budget || !budget->reserve(bytes))
+    return std::nullopt;
+  return DiskReservation(std::move(budget), bytes);
+}
+DiskReservation::DiskReservation(DiskReservation &&other) noexcept
+    : budget_(std::move(other.budget_)),
+      bytes_(std::exchange(other.bytes_, 0)) {}
+DiskReservation &DiskReservation::operator=(DiskReservation &&other) noexcept {
+  if (this != &other) {
+    if (budget_)
+      budget_->release(bytes_);
+    budget_ = std::move(other.budget_);
+    bytes_ = std::exchange(other.bytes_, 0);
+  }
+  return *this;
+}
+DiskReservation::~DiskReservation() {
+  if (budget_)
+    budget_->release(bytes_);
+}
+void DiskReservation::consume(uint64_t bytes) {
+  if (bytes > bytes_)
+    throw std::logic_error("slot exceeds disk reservation");
+  bytes_ -= bytes;
+}
+
 struct SlotFile::Backing {
   int descriptor = -1;
+  std::filesystem::path directory;
+  std::shared_ptr<CacheStore> store;
+  std::unordered_map<uint64_t, std::weak_ptr<Slot>> reopened;
   uint64_t slotBytes = 0;
   std::shared_ptr<DiskBudget> budget;
   uint32_t allocated = 0;
@@ -26,13 +58,47 @@ struct SlotFile::Backing {
 
 SlotFile::Slot::Slot(std::shared_ptr<Backing> backing, uint32_t index)
     : backing_(std::move(backing)), index_(index) {}
+uint64_t SlotFile::Slot::bytes() const noexcept { return backing_->slotBytes; }
+
+bool SlotFile::Slot::durable() const noexcept {
+  return budget_ != backing_->budget;
+}
+void SlotFile::Slot::transfer(DiskReservation &reservation) {
+  if (!backing_->store || !reusable_ ||
+      reservation.budget() == backing_->budget)
+    throw std::logic_error("invalid durable slot transfer");
+  if (budget_ == reservation.budget())
+    return;
+  reservation.consume(bytes());
+  budget_->release(bytes());
+  budget_ = reservation.budget();
+}
+bool SlotFile::Slot::returnTemporary() {
+  if (!reusable_)
+    return false;
+  if (!durable())
+    return true;
+  if (!backing_->budget->reserve(bytes()))
+    return false;
+  budget_->release(bytes());
+  budget_ = backing_->budget;
+  return true;
+}
+
+std::shared_ptr<SlotFile> SlotFile::sibling(uint64_t bytes) const {
+  return std::make_shared<SlotFile>(bytes, backing_->budget,
+                                    backing_->directory, backing_->store);
+}
+
 SlotFile::Slot::~Slot() {
   if (!backing_) return;
-  {
+  if (backing_->store)
+    backing_->store->retire(recordId_);
+  else {
     std::lock_guard lock(backing_->mutex);
     backing_->free.push_back(index_);
   }
-  backing_->budget->release(backing_->slotBytes);
+  budget_->release(backing_->slotBytes);
 }
 
 bool SlotFile::Operation::ready() const noexcept {
@@ -44,29 +110,32 @@ bool SlotFile::Operation::wait() {
   return success_;
 }
 
-std::shared_ptr<SlotFile> SlotFile::sibling(uint64_t slotBytes) const {
-  return std::make_shared<SlotFile>(slotBytes, backing_->budget, directory_);
-}
-
 SlotFile::SlotFile(uint64_t slotBytes, uint64_t capacityBytes,
                    const std::filesystem::path &directory)
     : SlotFile(slotBytes, std::make_shared<DiskBudget>(capacityBytes), directory) {}
 
 SlotFile::SlotFile(uint64_t slotBytes, std::shared_ptr<DiskBudget> budget,
-                   const std::filesystem::path &directory)
-    : backing_(std::make_shared<Backing>()), directory_(directory) {
+                   const std::filesystem::path &directory,
+                   std::shared_ptr<CacheStore> store)
+    : backing_(std::make_shared<Backing>()) {
   if (!budget)
     throw std::invalid_argument("slot file needs a disk budget");
   const uint64_t capacityBytes = budget->capacityBytes();
   if (!slotBytes || capacityBytes > uint64_t{std::numeric_limits<off_t>::max()} ||
       capacityBytes / slotBytes > std::numeric_limits<uint32_t>::max())
     throw std::invalid_argument("invalid slot file capacity");
-  if (capacityBytes < slotBytes)
+  if (!store && capacityBytes < slotBytes)
     throw std::invalid_argument("slot file quota holds no slot");
   if (slotBytes % kAlignmentBytes)
     throw std::invalid_argument("slot size is not aligned for uncached IO");
+  backing_->directory = directory;
   backing_->slotBytes = slotBytes;
   backing_->budget = std::move(budget);
+  backing_->store = std::move(store);
+  if (backing_->store) {
+    worker_ = std::thread([this] { run(); });
+    return;
+  }
   // A write past the file-size limit (ulimit -f, a launchd FileSize) raises
   // SIGXFSZ, whose default action kills the process. Ignored, the write fails
   // with EFBIG and stops the file like any other storage error. The change is
@@ -102,23 +171,68 @@ SlotFile::~SlotFile() {
 }
 
 std::shared_ptr<SlotFile::Slot> SlotFile::acquire() {
+  auto reservation =
+      DiskReservation::acquire(backing_->budget, backing_->slotBytes);
+  return reservation ? allocate(*reservation) : nullptr;
+}
+std::shared_ptr<SlotFile::Slot>
+SlotFile::acquire(DiskReservation &reservation) {
+  if (!backing_->store)
+    throw std::logic_error("durable slots require a cache store");
+  return allocate(reservation);
+}
+std::shared_ptr<SlotFile::Slot>
+SlotFile::allocate(DiskReservation &reservation) {
   auto slot = std::shared_ptr<Slot>(new Slot({}, 0));
   std::lock_guard lock(backing_->mutex);
-  // Prepare the free list before reserving bytes so allocation failure cannot
-  // strand quota, and returning a slot never needs to allocate.
-  if (backing_->free.empty() && backing_->free.capacity() == backing_->allocated)
+  // Prepare the free list before transferring the charge, so returning a
+  // scratch slot never allocates and allocation failure cannot strand quota.
+  if (!backing_->store && backing_->free.empty() &&
+      backing_->free.capacity() == backing_->allocated)
     backing_->free.reserve(std::max<size_t>(1, 2 * backing_->free.capacity()));
-  if (!backing_->budget->reserve(backing_->slotBytes)) return {};
-  uint32_t index;
-  if (!backing_->free.empty()) {
-    index = backing_->free.back();
+  reservation.consume(backing_->slotBytes);
+  slot->backing_ = backing_;
+  slot->budget_ = reservation.budget();
+  if (backing_->store) {
+    slot->recordId_ = backing_->store->allocate();
+  } else if (!backing_->free.empty()) {
+    slot->index_ = backing_->free.back();
     backing_->free.pop_back();
   } else {
-    index = backing_->allocated++;
+    slot->index_ = backing_->allocated++;
   }
-  slot->backing_ = backing_;
-  slot->index_ = index;
   return slot;
+}
+
+std::shared_ptr<SlotFile::Slot> SlotFile::reopen(uint64_t id,
+                                                 DiskReservation &reservation) {
+  if (!backing_->store || !id)
+    throw std::invalid_argument("invalid durable slot");
+  if (auto found = backing_->reopened.find(id);
+      found != backing_->reopened.end())
+    if (auto slot = found->second.lock())
+      return slot;
+  auto slot = std::shared_ptr<Slot>(new Slot({}, 0));
+  reservation.consume(backing_->slotBytes);
+  slot->backing_ = backing_;
+  slot->budget_ = reservation.budget();
+  slot->recordId_ = id;
+  slot->written_ = true;
+  backing_->reopened[id] = slot;
+  return slot;
+}
+
+std::shared_ptr<SlotFile::Operation>
+SlotFile::metadata(std::function<void()> work,
+                   std::function<void()> completion) {
+  return submit(
+      [work = std::move(work)](const std::atomic<bool> &cancelled) {
+        if (cancelled.load())
+          return false;
+        work();
+        return true;
+      },
+      std::move(completion));
 }
 
 uint64_t SlotFile::slotBytes() const noexcept { return backing_->slotBytes; }
@@ -233,23 +347,44 @@ std::shared_ptr<SlotFile::Operation> SlotFile::write(
     throw std::invalid_argument("slot write does not match this file's slots");
   if (!writable())
     throw std::logic_error("slot file no longer takes writes");
-  return submit([slot, source = std::move(source)](const std::atomic<bool> &cancelled) {
-    Backing &backing = *slot->backing_;
-    slot->written_ = false;
-    if (transfer(source, slotOffset(slot->index_, backing.slotBytes), cancelled,
-                 [&backing](const std::byte *data, size_t bytes, off_t offset) {
-                   const auto count = ::pwrite(backing.descriptor, data, bytes, offset);
-                   if (count > 0)
-                     backing.budget->written_.fetch_add(count, std::memory_order_relaxed);
-                   return count;
-                 })) {
-      slot->written_ = true;
-      return true;
-    }
-    if (!cancelled.load(std::memory_order_relaxed))
-      backing.failed.store(true, std::memory_order_relaxed);
-    return false;
-  }, std::move(completion));
+  return submit(
+      [slot, budget = slot->budget_,
+       source = std::move(source)](const std::atomic<bool> &cancelled) {
+        Backing &backing = *slot->backing_;
+        slot->written_ = false;
+        if (backing.store) {
+          try {
+            slot->written_ =
+                backing.store->write(slot->recordId_, source, cancelled);
+          } catch (...) {
+            backing.failed.store(true);
+            throw;
+          }
+          if (slot->written_)
+            budget->written_.fetch_add(backing.slotBytes);
+          else if (!cancelled.load())
+            backing.failed.store(true);
+          return slot->written_;
+        }
+        if (transfer(source, slotOffset(slot->index_, backing.slotBytes),
+                     cancelled,
+                     [&backing, &budget](const std::byte *data, size_t bytes,
+                                         off_t offset) {
+                       const auto count =
+                           ::pwrite(backing.descriptor, data, bytes, offset);
+                       if (count > 0)
+                         budget->written_.fetch_add(count,
+                                                    std::memory_order_relaxed);
+                       return count;
+                     })) {
+          slot->written_ = true;
+          return true;
+        }
+        if (!cancelled.load(std::memory_order_relaxed))
+          backing.failed.store(true, std::memory_order_relaxed);
+        return false;
+      },
+      std::move(completion));
 }
 
 std::shared_ptr<SlotFile::Operation> SlotFile::read(
@@ -257,17 +392,31 @@ std::shared_ptr<SlotFile::Operation> SlotFile::read(
     std::function<void()> completion) {
   if (!slot || slot->backing_ != backing_ || totalBytes(destination) != backing_->slotBytes)
     throw std::invalid_argument("slot read does not match this file's slots");
-  return submit([slot, destination = std::move(destination)](const std::atomic<bool> &cancelled) {
-    if (!slot->written_) return false;
-    Backing &backing = *slot->backing_;
-    return transfer(destination, slotOffset(slot->index_, slot->backing_->slotBytes), cancelled,
-                    [&backing](std::byte *data, size_t bytes, off_t offset) {
-                      const auto count = ::pread(backing.descriptor, data, bytes, offset);
-                      if (count > 0)
-                        backing.budget->read_.fetch_add(count, std::memory_order_relaxed);
-                      return count;
-                    });
-  }, std::move(completion));
+  return submit(
+      [slot, budget = slot->budget_, destination = std::move(destination)](
+          const std::atomic<bool> &cancelled) {
+        if (!slot->written_)
+          return false;
+        Backing &backing = *slot->backing_;
+        if (backing.store) {
+          const bool result =
+              backing.store->read(slot->recordId_, destination, cancelled);
+          if (result)
+            budget->read_.fetch_add(backing.slotBytes);
+          return result;
+        }
+        return transfer(
+            destination, slotOffset(slot->index_, slot->backing_->slotBytes),
+            cancelled,
+            [&backing, &budget](std::byte *data, size_t bytes, off_t offset) {
+              const auto count =
+                  ::pread(backing.descriptor, data, bytes, offset);
+              if (count > 0)
+                budget->read_.fetch_add(count, std::memory_order_relaxed);
+              return count;
+            });
+      },
+      std::move(completion));
 }
 
 } // namespace splash::model

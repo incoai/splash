@@ -193,7 +193,7 @@ $(LIB): $(PRODUCTION_AIRS)
 
 ENGINE_BUILD := $(BUILD)/engine
 ENGINE_LIBRARY := $(ENGINE_BUILD)/libsplash.a
-ENGINE_LINKFLAGS := -framework Foundation -framework Metal -framework IOKit
+ENGINE_LINKFLAGS := -lsqlite3 -framework Foundation -framework Metal -framework IOKit
 ENGINE_DEPFLAGS := -MMD -MP
 # Configuration belongs to each successful output, not to a shared timestamp:
 # macOS make can treat a new stamp and an old binary in the same second as equal.
@@ -275,6 +275,8 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/QwenTargetLoader.cpp \
 	runtime/model/DFlashDraft.cpp \
 	runtime/model/ModelFactory.cpp \
+	runtime/engine/PersistentCache.cpp \
+	runtime/model/CacheStore.cpp \
 	runtime/model/SlotFile.cpp \
 	runtime/model/KvPageTier.cpp \
 	runtime/model/DraftKvCache.cpp \

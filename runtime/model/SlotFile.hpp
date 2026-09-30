@@ -1,5 +1,7 @@
 #pragma once
 
+#include "model/CacheStore.hpp"
+
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
@@ -9,8 +11,10 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace splash::model {
@@ -34,7 +38,8 @@ public:
     return true;
   }
   void release(uint64_t bytes) noexcept { used_.fetch_sub(bytes, std::memory_order_relaxed); }
-  // Cumulative bytes accepted by file IO, including partial/cancelled work.
+  // Payload bytes moved by the backend. Scratch IO includes partial work;
+  // the transactional backend counts completed slot operations.
   // This is application IO, not physical SSD traffic or filesystem overhead.
   [[nodiscard]] uint64_t readBytes() const noexcept {
     return read_.load(std::memory_order_relaxed);
@@ -51,7 +56,33 @@ private:
   std::atomic<uint64_t> written_{0};
 };
 
-// Scratch storage of fixed-size slots in an unlinked temporary file, served
+// A manifest reserves its complete additional footprint before any write.
+// Consuming a reservation moves its charge to a slot; destruction returns only
+// unused bytes. Slot charges live until the last IO/read handle is released.
+class DiskReservation final {
+public:
+  static std::optional<DiskReservation>
+  acquire(std::shared_ptr<DiskBudget> budget, uint64_t bytes);
+  DiskReservation(DiskReservation &&other) noexcept;
+  DiskReservation &operator=(DiskReservation &&other) noexcept;
+  ~DiskReservation();
+  DiskReservation(const DiskReservation &) = delete;
+  DiskReservation &operator=(const DiskReservation &) = delete;
+  [[nodiscard]] uint64_t remainingBytes() const noexcept { return bytes_; }
+  [[nodiscard]] const std::shared_ptr<DiskBudget> &budget() const noexcept {
+    return budget_;
+  }
+  // Called only after a slot is ready to take ownership of these bytes.
+  void consume(uint64_t bytes);
+
+private:
+  DiskReservation(std::shared_ptr<DiskBudget> budget, uint64_t bytes)
+      : budget_(std::move(budget)), bytes_(bytes) {}
+  std::shared_ptr<DiskBudget> budget_;
+  uint64_t bytes_ = 0;
+};
+
+// Fixed-size slots in an unlinked temporary file or a shared CacheStore, served
 // by one IO worker in submission order and bounded by a disk budget. Callers
 // own the memory an operation moves and keep it alive until the operation is
 // ready. A slot is readable only after one complete write; a failed or
@@ -68,6 +99,15 @@ public:
   class Slot final {
   public:
     ~Slot();
+    [[nodiscard]] uint64_t recordId() const noexcept { return recordId_; }
+    [[nodiscard]] uint64_t bytes() const noexcept;
+    // Ownership changes run on the engine thread. IO captures its accounting
+    // budget at submission and never reads this mutable ownership.
+    [[nodiscard]] bool durable() const noexcept;
+    void transfer(DiskReservation &reservation);
+    [[nodiscard]] bool returnTemporary();
+    [[nodiscard]] bool reusable() const noexcept { return reusable_; }
+    void retire() noexcept { reusable_ = false; }
     Slot(const Slot &) = delete;
     Slot &operator=(const Slot &) = delete;
 
@@ -76,6 +116,9 @@ public:
     Slot(std::shared_ptr<Backing> backing, uint32_t index);
     std::shared_ptr<Backing> backing_;
     uint32_t index_;
+    uint64_t recordId_ = 0;
+    std::shared_ptr<DiskBudget> budget_;
+    bool reusable_ = true;
     // Owned by the worker: operations on one file run in submission order.
     bool written_ = false;
   };
@@ -102,20 +145,29 @@ public:
     std::condition_variable wake_;
   };
 
-  // The budget holds at least one slot: a smaller quota is a configuration
-  // error. Files sharing a budget compete for its bytes.
+  // The default quota belongs only to temporary offload. A zero quota is
+  // allowed with a CacheStore: durable writes use an explicit reservation.
   SlotFile(uint64_t slotBytes, std::shared_ptr<DiskBudget> budget,
-           const std::filesystem::path &directory = std::filesystem::temp_directory_path());
+           const std::filesystem::path &directory =
+               std::filesystem::temp_directory_path(),
+           std::shared_ptr<CacheStore> store = nullptr);
+  // Another payload geometry in the same quota and persistent store.
+  [[nodiscard]] std::shared_ptr<SlotFile> sibling(uint64_t slotBytes) const;
   // A file with a budget of its own.
   SlotFile(uint64_t slotBytes, uint64_t capacityBytes,
            const std::filesystem::path &directory = std::filesystem::temp_directory_path());
   ~SlotFile();
   SlotFile(const SlotFile &) = delete;
   SlotFile &operator=(const SlotFile &) = delete;
-  // Another payload geometry in this temporary tier, sharing its quota.
-  [[nodiscard]] std::shared_ptr<SlotFile> sibling(uint64_t slotBytes) const;
   // Null when the budget is exhausted.
   [[nodiscard]] std::shared_ptr<Slot> acquire();
+  [[nodiscard]] std::shared_ptr<Slot> acquire(DiskReservation &reservation);
+  // Startup only: adopts an already committed record, charging it once.
+  [[nodiscard]] std::shared_ptr<Slot> reopen(uint64_t id,
+                                             DiskReservation &reservation);
+  // Metadata commits share the worker with state writes. No engine-thread IO.
+  [[nodiscard]] std::shared_ptr<Operation>
+  metadata(std::function<void()> work, std::function<void()> completion = {});
   [[nodiscard]] uint64_t slotBytes() const noexcept;
   // The shared budget's capacity and use.
   [[nodiscard]] uint64_t capacityBytes() const noexcept;
@@ -137,6 +189,7 @@ public:
       std::function<void()> completion);
 
 private:
+  std::shared_ptr<Slot> allocate(DiskReservation &reservation);
   struct Work {
     std::shared_ptr<Operation> operation;
     std::function<bool(const std::atomic<bool> &)> run;
@@ -147,7 +200,6 @@ private:
       std::function<void()> completion);
   void run();
   std::shared_ptr<Backing> backing_;
-  std::filesystem::path directory_;
   mutable std::mutex mutex_;
   std::condition_variable wake_;
   std::deque<Work> work_;

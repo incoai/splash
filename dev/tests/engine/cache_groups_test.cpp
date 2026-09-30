@@ -180,7 +180,8 @@ void diskQuotaReclaimCanRetireTheWriteSource() {
     }
     bool canOffload() const noexcept override { return !disk; }
     std::unique_ptr<StateWrite<StatePayload>>
-    offload(std::function<void()>) const override {
+    offload(std::function<void()>,
+            model::DiskReservation * = nullptr) const override {
       ++writes;
       return {}; // Full disk quota: the caller must make room.
     }

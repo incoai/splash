@@ -108,7 +108,8 @@ public:
   uint64_t bytes() const noexcept override { return 64; }
   bool canOffload() const noexcept override { return true; }
   std::unique_ptr<StateWrite<StatePayload>>
-  offload(std::function<void()>) const override {
+  offload(std::function<void()>,
+          model::DiskReservation * = nullptr) const override {
     return std::make_unique<OffloadTicket>(control_);
   }
 
@@ -423,7 +424,7 @@ public:
   SnapshotWritePlan prepareSnapshotToDisk(uint64_t id) override {
     const auto boundary = requests.at(id).position;
     return {test::checkpoint(boundary, std::make_shared<State>(snapshotBytes)),
-            [this, boundary](std::function<void()>) {
+            [this, boundary](std::function<void()>, model::DiskReservation *) {
               ++diskSnapshots;
               return std::make_unique<test::SnapshotWrite>(
                   boundary, std::make_unique<OffloadTicket>(stateTier));
@@ -4785,7 +4786,7 @@ void testGrowthWaitsForTheStateWriteInFlight() {
     const auto held = cache.publishCommittedBlocks(999, std::vector<uint32_t>(64, 12), 64);
     require(cache.publishStateToDisk(
                 held, {test::checkpoint(64, std::make_shared<State>(100)),
-                       [&](std::function<void()>) {
+                       [&](std::function<void()>, model::DiskReservation *) {
                          return test::snapshotWrite(
                              64, std::make_unique<OffloadTicket>(writing));
                        }}),

@@ -162,8 +162,10 @@ std::string runtimeStatusJson(
       << ",\"unmap_last_ms\":" << metalMemory.lastSparseUnmapSeconds * 1000.0
       << ",\"unmap_max_ms\":" << metalMemory.maxSparseUnmapSeconds * 1000.0
       << ",\"map_wait_event\":" << metalMemory.sparseMapWaitEvent
-      << ",\"pending_map_wait_ms\":" << metalMemory.pendingSparseMapWaitSeconds * 1000.0
-      << ",\"map_wait_last_ms\":" << metalMemory.lastSparseMapWaitSeconds * 1000.0
+      << ",\"pending_map_wait_ms\":"
+      << metalMemory.pendingSparseMapWaitSeconds * 1000.0
+      << ",\"map_wait_last_ms\":"
+      << metalMemory.lastSparseMapWaitSeconds * 1000.0
       << ",\"map_wait_max_ms\":" << metalMemory.maxSparseMapWaitSeconds * 1000.0
       << "}"
       << ",\"state\":{\"entries\":" << state.entries
@@ -186,8 +188,7 @@ std::string runtimeStatusJson(
       << ",\"disk_bytes\":" << state.diskBytes
       << ",\"offloads\":" << state.offloads
       << ",\"offload_failures\":" << state.offloadFailures
-      << ",\"invalidations\":" << state.invalidations
-      << "}"
+      << ",\"invalidations\":" << state.invalidations << "}"
       << ",\"disk\":{\"capacity_bytes\":" << resources.kvTier.capacityBytes
       << ",\"used_bytes\":" << resources.kvTier.usedBytes
       << ",\"read_bytes\":" << resources.kvTier.readBytes
@@ -199,21 +200,31 @@ std::string runtimeStatusJson(
       << ",\"kv_demotions_refused\":" << resources.kvTier.demotionsRefused
       << ",\"kv_restores\":" << resources.kvTier.restores
       << ",\"kv_restore_failures\":" << resources.kvTier.restoreFailures
-      << ",\"kv_pending_pages\":" << resources.kvTier.pendingPages
+      << ",\"kv_pending_pages\":" << resources.kvTier.pendingPages << "}"
+      << ",\"persistent_cache\":{\"capacity_bytes\":"
+      << resources.persistent.capacityBytes
+      << ",\"used_bytes\":" << resources.persistent.usedBytes
+      << ",\"read_bytes\":" << resources.persistent.readBytes
+      << ",\"written_bytes\":" << resources.persistent.writtenBytes
+      << ",\"entries\":" << resources.persistent.entries
+      << ",\"saved\":" << resources.persistent.saved
+      << ",\"restored\":" << resources.persistent.restored
+      << ",\"failures\":" << resources.persistent.failures
+      << ",\"writing\":" << (resources.persistent.writing ? "true" : "false")
       << "}"
       << ",\"cache\":{\"lookups\":" << lookup.lookups
       << ",\"hits\":" << core.cacheHits
       << ",\"cold_misses\":" << core.coldMisses << ",\"hit_rate\":" << hitRate
       << ",\"kv_hit_tokens\":" << lookup.kvHitTokens
-      << ",\"kv_disk_hit_tokens\":" << resources.kvTier.restores * kv::kPageTokens
+      << ",\"kv_disk_hit_tokens\":"
+      << resources.kvTier.restores * kv::kPageTokens
       << ",\"state_hit_tokens\":" << lookup.stateHitTokens
       << ",\"lost_state_misses\":" << lookup.lostStateMisses
       << ",\"reused_tokens\":" << core.reusedTokens
       << ",\"replay_state_publications\":" << core.replayStatePublications
       << ",\"deduplicated_state_publications\":"
       << core.deduplicatedStatePublications
-      << ",\"recycled_state_publications\":"
-      << core.recycledStatePublications
+      << ",\"recycled_state_publications\":" << core.recycledStatePublications
       << ",\"disk_state_publications\":" << core.diskStatePublications
       << ",\"replay_state_publication_failures\":"
       << core.replayStatePublicationFailures
@@ -234,20 +245,25 @@ std::string runtimeStatusJson(
       << executorTelemetry.draftContextRowsMaterialization
       << ",\"avoided_rows\":" << executorTelemetry.draftContextRowsAvoided
       << ",\"restore_skipped\":" << executorTelemetry.draftStateRestoreSkipped
-      << ",\"resets\":" << executorTelemetry.draftStateResets << "}"
+      << ",\"resets\":" << executorTelemetry.draftStateResets
+      << "}"
       // Model-lifetime timings include warmup; request metrics do not.
       << ",\"model_timing\":{\"scope\":\"model_lifetime\""
       << ",\"prefill\":{\"last_gpu_ms\":"
       << executorTelemetry.lastPrefillGpuSeconds * 1000.0
-      << ",\"last_wall_ms\":" << executorTelemetry.lastPrefillWallSeconds * 1000.0
-      << ",\"total_gpu_ms\":" << executorTelemetry.totalPrefillGpuSeconds * 1000.0
-      << ",\"total_wall_ms\":" << executorTelemetry.totalPrefillWallSeconds * 1000.0
+      << ",\"last_wall_ms\":"
+      << executorTelemetry.lastPrefillWallSeconds * 1000.0
+      << ",\"total_gpu_ms\":"
+      << executorTelemetry.totalPrefillGpuSeconds * 1000.0
+      << ",\"total_wall_ms\":"
+      << executorTelemetry.totalPrefillWallSeconds * 1000.0
       << "},\"decode\":{\"last_gpu_ms\":"
-      << executorTelemetry.lastDecodeGpuSeconds * 1000.0
-      << ",\"last_wall_ms\":" << executorTelemetry.lastDecodeWallSeconds * 1000.0
-      << ",\"total_gpu_ms\":" << executorTelemetry.totalDecodeGpuSeconds * 1000.0
-      << ",\"total_wall_ms\":" << executorTelemetry.totalDecodeWallSeconds * 1000.0
-      << "}}"
+      << executorTelemetry.lastDecodeGpuSeconds * 1000.0 << ",\"last_wall_ms\":"
+      << executorTelemetry.lastDecodeWallSeconds * 1000.0
+      << ",\"total_gpu_ms\":"
+      << executorTelemetry.totalDecodeGpuSeconds * 1000.0
+      << ",\"total_wall_ms\":"
+      << executorTelemetry.totalDecodeWallSeconds * 1000.0 << "}}"
       << ",\"constraint_masks\":{\"overlap_batches\":"
       << executorTelemetry.constrainedMaskOverlapBatches
       << ",\"overlap_requests\":"

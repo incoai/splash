@@ -2146,6 +2146,20 @@ def parse_args(argv=None):
         type=_parse_max_cache_disk,
         default=0,
     )
+    parser.add_argument(
+        "--persistent-cache",
+        type=_parse_max_cache_disk,
+        nargs="?",
+        const=5 * 1024**3,
+        default=0,
+        metavar="SIZE",
+        help="retain reusable prefixes across restarts (default size when enabled: 5G)",
+    )
+    parser.add_argument(
+        "--cache-file",
+        default=None,
+        help="persistent cache file (default: a model-specific file in Library/Caches/Splash)",
+    )
     parser.add_argument("--max-image-pixels", type=int, default=image_input.MAX_PIXELS)
     parser.add_argument("--max-new-tokens", type=int, default=32768)
     parser.add_argument("--request-timeout", type=float, default=1800)
@@ -2157,6 +2171,8 @@ def parse_args(argv=None):
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--binary", default=str(ROOT / "build" / "splash"))
     args = parser.parse_args(argv)
+    if args.cache_file and not args.persistent_cache:
+        parser.error("--cache-file requires --persistent-cache with a nonzero size")
     if (
         args.default_reasoning_effort is not None
         and args.default_reasoning_effort not in REASONING_EFFORTS
@@ -2196,6 +2212,12 @@ def _native_command(args):
     ]
     if args.max_cache_disk:
         command.append(str(args.max_cache_disk))
+    if getattr(args, "persistent_cache", 0):
+        command.extend(("--persistent-cache-bytes", str(args.persistent_cache)))
+        if args.cache_file:
+            command.extend(
+                ("--cache-file", str(Path(args.cache_file).expanduser().resolve()))
+            )
     if args.kv_format != "int8":
         command.extend(("--kv-format", args.kv_format))
     return command

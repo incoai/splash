@@ -2,6 +2,7 @@
 
 #include "engine/KvCache.hpp"
 #include "engine/KvPool.hpp"
+#include "engine/PersistentCache.hpp"
 #include "engine/StateCache.hpp"
 #include "model/Model.hpp"
 #include "model/SlotFile.hpp"
@@ -80,6 +81,7 @@ struct KvTierSnapshot final {
 };
 
 struct CacheSnapshot final {
+  PersistentCacheSnapshot persistent;
   KvPoolSnapshot pool;
   KvCache::Snapshot kvCache;
   StateCacheSnapshot stateCache;
@@ -131,6 +133,7 @@ public:
   Cache(KvPool &pool, CacheNamespace cacheNamespace, model::KvTier *kvTier = nullptr,
         std::shared_ptr<const model::DiskBudget> diskBudget = nullptr);
   ~Cache();
+  void enablePersistence(PersistentCacheConfig config);
   [[nodiscard]] uint32_t prefixLength(uint64_t block) const {
     return kv_.chainLength(block) * KvCache::pageTokens;
   }
@@ -147,6 +150,8 @@ public:
   // restored block becomes usable, and restores waiting for staging start.
   [[nodiscard]] bool pollTransfers();
   void discardState(uint64_t block, const RestoreState *state) {
+    if (persistent_)
+      persistent_->invalidate(block);
     states_.invalidate(block, state);
   }
   void beginRequest(uint64_t requestId);
@@ -271,6 +276,9 @@ private:
     std::unique_ptr<model::KvTransfer> transfer;
   };
   struct Restore final {
+    // Pin the source while waiting for staging, including after its manifest
+    // is invalidated. The transfer takes over only when a read actually starts.
+    std::shared_ptr<model::KvDiskSlot> slot;
     // Null until the tier has staging for it.
     std::unique_ptr<model::KvTransfer> transfer;
     std::vector<uint64_t> waiters;
@@ -324,7 +332,10 @@ private:
   [[nodiscard]] LeafReclaim reclaimKvLeaf(uint64_t block);
   [[nodiscard]] LeafReclaim demoteKv(uint64_t block);
   // A failed write closes the tier; existing copies stay readable.
-  [[nodiscard]] bool kvTierWritable() const noexcept { return tier_ && tier_->writable(); }
+  [[nodiscard]] bool kvTierWritable() const noexcept {
+    return tier_ && tier_->writable() &&
+           (!diskBudget_ || diskBudget_->capacityBytes() >= tier_->slotBytes());
+  }
   // Only a state restores a disk-only chain, through its own block and every
   // block above.
   [[nodiscard]] bool kvNeededByState(uint64_t block) const {
@@ -365,6 +376,8 @@ private:
   KvTierSnapshot kvTier_;
   CacheLookupSnapshot lookup_;
   std::function<void()> completionNotifier_;
+  // Last member: releases its pins while both logical caches still exist.
+  std::unique_ptr<PersistentCache> persistent_;
 };
 
 } // namespace splash::engine

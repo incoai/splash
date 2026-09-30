@@ -1,6 +1,7 @@
 #include "engine/MemoryGovernor.hpp"
 #include "model/QwenState.hpp"
 #include "tests/engine/AllocationFailure.hpp"
+#include "tests/engine/TestFiles.hpp"
 
 #include <chrono>
 #include <cstring>
@@ -266,7 +267,7 @@ void testPages(metal::MetalBackend &backend) {
   require(first->blocks.front().payload->reclaimableBytes() ==
               layout.target.cellBytes(),
           "active draft pages counted as reclaimable");
-  auto write = storage.prepareSnapshotToDisk(0).write({});
+  auto write = storage.prepareSnapshotToDisk(0).write({}, nullptr);
   require(write && finishWhenReady(*write), "initial offload failed");
   auto disk = write->state();
   write.reset();
@@ -304,7 +305,7 @@ void testPages(metal::MetalBackend &backend) {
               storage.buffers(0).draft[0].keyPages[1]),
           "restoring a branch copied an unchanged page");
   const uint64_t written = file->writtenBytes();
-  write = storage.prepareSnapshotToDisk(0).write({});
+  write = storage.prepareSnapshotToDisk(0).write({}, nullptr);
   require(write && finishWhenReady(*write), "overlap offload failed");
   auto nextDisk = write->state();
   write.reset();
@@ -416,6 +417,37 @@ void testPages(metal::MetalBackend &backend) {
           "released pages remained allocated");
 }
 
+void testDurableOnlyDoesNotAdvertiseTemporaryOffload(
+    metal::MetalBackend &backend) {
+  test::TemporaryDirectory directory("splash-state-durable-only");
+  auto store =
+      std::make_shared<model::CacheStore>(directory.path() / "cache", "test");
+  auto temporary = std::make_shared<model::DiskBudget>(0);
+  auto durable = std::make_shared<model::DiskBudget>(layout.cachedBytes());
+  auto file = std::make_shared<model::SlotFile>(
+      layout.target.cellBytes(), temporary, directory.path(), store);
+  MemoryGovernor governor(
+      backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
+  model::QwenStateStorage storage(backend, governor.allocationAdmission(),
+                                  layout, file);
+  require(bool(storage.tryActivateSlot(0, 1)), "source activation failed");
+  fill(storage, 0, 17);
+  storage.updateLengths(0, {2048, 0, 2048, 0});
+  auto snapshot = storage.snapshot(0);
+  require(snapshot &&
+              std::none_of(
+                  snapshot->blocks.begin(), snapshot->blocks.end(),
+                  [](const auto &part) { return part.payload->canOffload(); }),
+          "zero temporary quota advertised an offload path to RAM reclamation");
+  auto reservation =
+      model::DiskReservation::acquire(durable, snapshot->bytes());
+  require(bool(reservation), "durable reservation failed");
+  auto write = storage.prepareWrite(snapshot).write({}, &*reservation);
+  require(write && finishWhenReady(*write) && !temporary->usedBytes() &&
+              durable->writtenBytes() == snapshot->bytes(),
+          "disabling temporary offload also disabled durable publication");
+}
+
 void testDemandAwareDiskRestore(metal::MetalBackend &backend) {
   MemoryGovernor governor(
       backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
@@ -426,7 +458,7 @@ void testDemandAwareDiskRestore(metal::MetalBackend &backend) {
   require(bool(storage.tryActivateSlot(0, 1)), "source activation failed");
   fill(storage, 0, 17);
   storage.updateLengths(0, {4096, 2048, 2048, 0});
-  auto write = storage.prepareSnapshotToDisk(0).write({});
+  auto write = storage.prepareSnapshotToDisk(0).write({}, nullptr);
   require(write && finishWhenReady(*write),
           "partial-restore fixture write failed");
   auto disk = write->state();
@@ -497,18 +529,20 @@ void testDirectDiskAndCancellation(metal::MetalBackend &backend) {
           file->usedBytes() == used &&
           storage.actualAllocatedBytes() == allocated,
       "preparing direct snapshot allocated payload or misreported its cost");
-  auto write = plan.write({});
+  auto write = plan.write({}, nullptr);
   plan = {};
   require(write && storage.actualAllocatedBytes() == allocated,
           "direct write allocated GPU pages");
   auto disk = write->state();
   fill(storage, 0, 22);
   requireThrows<std::logic_error>(
-      [&] { static_cast<void>(storage.prepareSnapshotToDisk(0).write({})); },
+      [&] {
+        static_cast<void>(storage.prepareSnapshotToDisk(0).write({}, nullptr));
+      },
       "concurrent staging write admitted");
   require(finishWhenReady(*write), "direct write failed");
   write.reset();
-  require(!storage.prepareSnapshotToDisk(0).write({}),
+  require(!storage.prepareSnapshotToDisk(0).write({}, nullptr),
           "full quota admitted another checkpoint");
   bool committed = false;
   auto read = storage.beginRestore(0, *disk, restorePlan(*disk, true), {},
@@ -642,7 +676,7 @@ void testOffloadAllocationFailure(metal::MetalBackend &backend) {
     auto attempt = std::async(std::launch::async, [&] {
       allocationFailureAfter = failure;
       try {
-        auto transfer = storage.prepareSnapshotToDisk(0).write({});
+        auto transfer = storage.prepareSnapshotToDisk(0).write({}, nullptr);
         allocationFailureAfter = -1;
         return Result{false, std::move(transfer)};
       } catch (const std::bad_alloc &) {
@@ -684,6 +718,7 @@ int main(int argc, const char **argv) {
       testPages(backend);
       testCowCanDropOnlyTheSharedPage(backend);
       testDemandAwareDiskRestore(backend);
+      testDurableOnlyDoesNotAdvertiseTemporaryOffload(backend);
       testDirectDiskAndCancellation(backend);
       testActivationRollback(backend);
       testCowAllocationFailure(backend);

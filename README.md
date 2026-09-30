@@ -91,6 +91,7 @@ window. To set your own limits or cache options, add these to `splash serve`:
 | `--language-only` | Skip vision; serve text only. |
 | `--kv-format bf16` | Use BF16 KV cache. Default: 8-bit (INT8). |
 | `--max-cache-disk 16G` | Offload target KV and model state to SSD as needed. Off by default. |
+| `--persistent-cache 5G` | Reuse prefixes across server restarts. Off by default. |
 
 On a Mac you also use for other work, `--max-memory` leaves room for other
 applications.

@@ -80,8 +80,18 @@ public:
   uint64_t reclaimableBytes() const noexcept override {
     return disk || (page && page.use_count() != 1) ? 0 : size;
   }
+  bool durable() const noexcept override { return disk && disk->durable(); }
+  DiskStateRecord diskRecord() const override {
+    if (disk)
+      return {disk, {}, {}};
+    auto record = page ? page->disk.lock() : nullptr;
+    if (record && !record->reusable())
+      record.reset();
+    return {std::move(record), {}, {}};
+  }
   bool canOffload() const noexcept override {
-    return !disk && file && file->writable();
+    return !disk && file && file->writable() &&
+           file->capacityBytes() >= file->slotBytes();
   }
   std::vector<StateResource> resources() const override {
     return {{disk   ? static_cast<const void *>(disk.get())
@@ -93,7 +103,8 @@ public:
     return page ? page->page->buffer : cell->buffers().stateBase;
   }
   std::unique_ptr<StateWrite<StatePayload>>
-  offload(std::function<void()> completion) const override;
+  offload(std::function<void()> completion,
+          DiskReservation *reservation) const override;
 };
 
 struct PayloadWrite final {
@@ -112,7 +123,8 @@ struct PayloadWrite final {
 std::shared_ptr<PayloadWrite>
 writePayloads(std::span<const QwenStatePayload *const> sources,
               const std::shared_ptr<StateStaging> &staging,
-              const std::function<void()> &completion) {
+              const std::function<void()> &completion,
+              DiskReservation *reservation) {
   if (!staging)
     return {};
   if (staging->busy)
@@ -125,12 +137,13 @@ writePayloads(std::span<const QwenStatePayload *const> sources,
   offsets.reserve(sources.size());
   uint64_t bytes = 0;
   for (const auto *source : sources) {
-    if (!source->canOffload())
+    auto disk = source->diskRecord().slot;
+    if (!disk && (!source->file || !source->file->writable()))
       return {};
-    auto disk = source->page ? source->page->disk.lock() : nullptr;
     const bool missing = !disk;
     if (!disk)
-      disk = source->file->acquire();
+      disk = reservation ? source->file->acquire(*reservation)
+                         : source->file->acquire();
     if (!disk)
       return {};
     auto payload = std::make_shared<QwenStatePayload>();
@@ -183,10 +196,14 @@ private:
 };
 
 std::unique_ptr<StateWrite<StatePayload>>
-QwenStatePayload::offload(std::function<void()> completion) const {
+QwenStatePayload::offload(std::function<void()> completion,
+                          DiskReservation *reservation) const {
   const QwenStatePayload *source = this;
-  auto write = writePayloads(std::span(&source, 1), staging, completion);
-  return write ? std::make_unique<FileWrite<StatePayload>>(write, write->payloads.front()) : nullptr;
+  auto write =
+      writePayloads(std::span(&source, 1), staging, completion, reservation);
+  return write ? std::make_unique<FileWrite<StatePayload>>(
+                     write, write->payloads.front())
+               : nullptr;
 }
 
 class FileRestore final : public StateRestore {
@@ -394,6 +411,34 @@ void QwenStateStorage::swapParity(uint32_t index) {
   current.metadata.activeParity ^= 1;
 }
 
+std::shared_ptr<const StatePayload>
+QwenStateStorage::reopenState(const CachedStateBlock &block,
+                              StoredStateRecord record,
+                              DiskReservation &reservation) {
+  const auto group = block.group;
+  if (group == kDraftWindowGroup &&
+      (block.begin >= block.end ||
+       block.begin % DraftStateLayout::blockTokens ||
+       block.end - block.begin != DraftStateLayout::blockTokens))
+    throw std::invalid_argument(
+        "persistent draft record is not one aligned page");
+  const auto file = group == kQwenRecurrentGroup ? file_
+                    : group == kDraftWindowGroup ? draftFile_
+                                                 : nullptr;
+  if (!file || record.records.size() != 1 ||
+      record.records.front().bytes != file->slotBytes() ||
+      !record.metadata.empty())
+    throw std::invalid_argument("invalid persistent cache group payload");
+  auto payload = std::make_shared<QwenStatePayload>();
+  payload->group = group;
+  payload->size = file->slotBytes();
+  payload->file = file;
+  payload->disk = file->reopen(record.records.front().id, reservation);
+  if (!payload->disk)
+    throw std::invalid_argument("cannot reopen cache group record");
+  return payload;
+}
+
 std::shared_ptr<const RestoreState> QwenStateStorage::snapshot(uint32_t index) {
   return snapshot(index, slot(index).metadata.lengths);
 }
@@ -445,16 +490,21 @@ QwenStateStorage::snapshot(uint32_t index, QwenLogicalLengths lengths,
 SnapshotWritePlan QwenStateStorage::prepareSnapshotToDisk(uint32_t index) {
   if (!canSnapshotToDisk())
     return {};
-  auto source = snapshot(index, slot(index).metadata.lengths, false);
+  return prepareWrite(snapshot(index, slot(index).metadata.lengths, false));
+}
+SnapshotWritePlan
+QwenStateStorage::prepareWrite(std::shared_ptr<const RestoreState> source) {
   return {source,
-          [source, staging = staging_](std::function<void()> completion)
+          [source, staging = staging_](std::function<void()> completion,
+                                       DiskReservation *reservation)
               -> std::unique_ptr<StateWrite<RestoreState>> {
             std::vector<const QwenStatePayload *> payloads;
             payloads.reserve(source->blocks.size());
             for (const auto &block : source->blocks)
               payloads.push_back(
                   static_cast<const QwenStatePayload *>(block.payload.get()));
-            auto write = writePayloads(payloads, staging, completion);
+            auto write =
+                writePayloads(payloads, staging, completion, reservation);
             if (!write)
               return {};
             auto state = std::make_shared<RestoreState>(*source);

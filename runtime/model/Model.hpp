@@ -1,5 +1,7 @@
 #pragma once
 
+#include "model/SlotFile.hpp"
+
 #include "model/CacheGroups.hpp"
 
 #include "model/StateTransfer.hpp"
@@ -83,6 +85,17 @@ struct ImageSpan final {
   bool operator==(const ImageSpan &) const = default;
 };
 
+struct DiskStateRecord final {
+  std::shared_ptr<model::SlotFile::Slot> slot;
+  std::vector<uint64_t> metadata;
+  std::vector<std::shared_ptr<model::SlotFile::Slot>> components{};
+};
+
+struct StoredStateRecord final {
+  std::vector<uint64_t> metadata;
+  std::vector<model::CacheStore::Record> records;
+};
+
 struct StateResource final {
   const void *identity;
   uint64_t bytes;
@@ -93,6 +106,8 @@ struct StateResource final {
 class StatePayload {
 public:
   virtual ~StatePayload() = default;
+  [[nodiscard]] virtual DiskStateRecord diskRecord() const { return {}; }
+  [[nodiscard]] virtual bool durable() const noexcept { return false; }
   // Physical resources may be shared by several immutable snapshots.
   [[nodiscard]] virtual std::vector<StateResource> resources() const {
     return {{this, bytes()}};
@@ -104,12 +119,13 @@ public:
   [[nodiscard]] virtual uint64_t reclaimableBytes() const noexcept {
     return residentBytes();
   }
+  // Whether normal RAM reclamation can create a temporary disk copy.
   [[nodiscard]] virtual bool canOffload() const noexcept { return false; }
   // Starts writing this state to the disk tier and returns the ticket that
   // carries its disk copy; the source is free as soon as the call returns.
   // A null ticket means that the disk quota cannot admit another state.
   [[nodiscard]] virtual std::unique_ptr<StateWrite<StatePayload>>
-  offload(std::function<void()>) const {
+  offload(std::function<void()>, model::DiskReservation * = nullptr) const {
     return {};
   }
 };
@@ -327,6 +343,14 @@ struct StateAllocationTracker final {
 class StateStorage {
 public:
   virtual ~StateStorage() = default;
+  [[nodiscard]] virtual SnapshotWritePlan
+  prepareWrite(std::shared_ptr<const RestoreState>) {
+    return {};
+  }
+  [[nodiscard]] virtual std::shared_ptr<const StatePayload>
+  reopenState(const CachedStateBlock &, StoredStateRecord, DiskReservation &) {
+    return {};
+  }
   [[nodiscard]] virtual std::vector<CacheGroupSpec> cacheGroups() const {
     return {{0}};
   }
@@ -342,6 +366,10 @@ public:
 class KvDiskSlot {
 public:
   virtual ~KvDiskSlot() = default;
+  [[nodiscard]] virtual std::shared_ptr<SlotFile::Slot> record() const {
+    return {};
+  }
+  [[nodiscard]] virtual bool durable() const noexcept { return false; }
 };
 
 // One KV page moving between its pool page and the disk tier. The copy rides
@@ -372,6 +400,11 @@ public:
   [[nodiscard]] virtual bool canDemote() const noexcept = 0;
   // Null when the disk quota is full.
   [[nodiscard]] virtual std::shared_ptr<KvDiskSlot> acquireSlot() = 0;
+  [[nodiscard]] virtual std::shared_ptr<KvDiskSlot>
+  reopenSlot(std::shared_ptr<SlotFile::Slot>) {
+    return {};
+  }
+
   // Null when no demotion staging is available; the caller waits while
   // transfers are in flight.
   [[nodiscard]] virtual std::unique_ptr<KvTransfer>

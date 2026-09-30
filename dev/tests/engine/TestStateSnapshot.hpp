@@ -17,12 +17,12 @@ private:
 };
 inline void publishDiskState(engine::StateCache &cache, uint64_t block,
                              std::shared_ptr<const RestoreState> state) {
-  if (!cache.publishToDisk(block,
-                           [state](std::function<void()>) {
-                             return std::make_unique<CompletedStateWrite>(
-                                 state);
-                           },
-                           {}, {}) ||
+  if (!cache.publishToDisk(
+          block,
+          [state](std::function<void()>, model::DiskReservation *) {
+            return std::make_unique<CompletedStateWrite>(state);
+          },
+          {}, {}) ||
       !cache.pollOffload())
     throw std::logic_error("test disk publication failed");
 }

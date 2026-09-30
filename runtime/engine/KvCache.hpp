@@ -100,6 +100,12 @@ public:
                                     ImageIdentity images = {});
 
   // Pins protect backing without refreshing the access order.
+  [[nodiscard]] uint64_t importDisk(uint64_t parent,
+                                    std::span<const uint32_t> tokens,
+                                    ImageIdentity images,
+                                    std::shared_ptr<model::KvDiskSlot> slot);
+  [[nodiscard]] KvBlockKeyView key(uint64_t block) const;
+
   void retainActive(uint64_t blockId);
   void releaseActive(uint64_t blockId) noexcept;
   void touch(uint64_t blockId) noexcept;
@@ -167,6 +173,10 @@ public:
   [[nodiscard]] Snapshot snapshot() const noexcept;
 
 private:
+  InsertResult insertBacking(uint64_t parentBlock,
+                             std::span<const uint32_t> tokens,
+                             uint32_t physicalPage, ImageIdentity images,
+                             std::shared_ptr<model::KvDiskSlot> disk);
   struct Block {
     uint64_t id = 0;
     uint64_t parent = 0;

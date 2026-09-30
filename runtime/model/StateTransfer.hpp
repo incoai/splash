@@ -5,6 +5,10 @@
 
 namespace splash {
 
+namespace model {
+class DiskReservation;
+}
+
 class StatePayload;
 struct RestoreState;
 
@@ -35,8 +39,8 @@ public:
 };
 
 template <typename Payload>
-using StateWriter =
-    std::function<std::unique_ptr<StateWrite<Payload>>(std::function<void()>)>;
+using StateWriter = std::function<std::unique_ptr<StateWrite<Payload>>(
+    std::function<void()>, model::DiskReservation *)>;
 
 // Preparing a direct snapshot neither allocates disk records nor starts IO.
 // The source describes its exact backing for admission; it may borrow the

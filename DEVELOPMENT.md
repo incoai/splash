@@ -153,7 +153,8 @@ BF16 avoids target KV quantization, uses approximately twice the target KV
 memory, and can be slower at long contexts. Model weights are unchanged.
 Restart to switch formats. Omit `--kv-format` or use `--kv-format int8` for the
 default. The [SSD cache](#disk-cache) supports both formats, preserving their
-stored bytes without further quantization; it does not survive a restart.
+stored bytes without further quantization. Enable `--persistent-cache` to retain
+prefixes across restarts.
 
 ## API model aliases
 
@@ -869,6 +870,53 @@ transfers, but exclude filesystem metadata and physical write amplification.
 `kv_disk_hit_tokens` counts tokens restored by completed target KV transfers;
 shared transfers count once. `lost_state_misses` counts lookups matching target
 KV where a reusable state used to exist.
+
+#### Persistent prefixes
+
+`--persistent-cache [SIZE]` enables persistence independently of temporary
+offload. Omit both flags for RAM only; enable either one or both. The default
+persistent size when the flag has no value is `5G`; omission or `0` disables it.
+`--cache-file PATH` chooses its location and requires persistence to be enabled.
+The default location is model-specific under `~/Library/Caches/Splash`.
+
+The store is created if absent and reopened if present. A smaller quota keeps
+the most recently used complete manifests that fit; a larger quota provides
+room for later publications. Quotas limit live payload bytes; the sparse file
+can remain larger after shrinking. Startup trims its unused tail and returns
+interior holes to APFS without moving live payloads. An
+incompatible build, model or KV layout invalidates old contents. An unavailable or
+locked store produces a startup diagnostic and falls back to RAM with the
+requested temporary quota.
+
+Temporary and persistent slots share the storage implementation and, when both
+are enabled, the same store, but have separate quotas. Each slot belongs to
+exactly one quota. Temporary slots are discarded on restart. Persistent slots
+belong to committed prefix manifests and are evicted by manifest LRU. A manifest
+includes the target prefix and all model groups needed for its restore point;
+shared immutable records are stored once.
+
+Admission uses **write-through**: every ordinary completed boundary of at least
+512 tokens is eligible. This includes replay and materialized shared branch
+boundaries; rolling checkpoints remain disposable. A bounded queue keeps
+publication asynchronous. Manifests larger than the persistent quota are skipped
+before eviction or IO. There is no system-prompt detection, demand history or write-rate
+bucket. Saving on first use lets a working set grow into the disk cache even
+when it cannot stay in RAM long enough for a second hit.
+
+Publication runs during serving, including while entries remain in RAM. Before
+any write, it reserves the full additional persistent footprint, evicting older
+manifests if necessary. Existing temporary copies transfer ownership without
+being rewritten. They return to the temporary quota on cancellation or removal
+of their last persistent reference only if their original cache entry survives
+and temporary space is available. Otherwise the disk copy is removed; any RAM
+copy remains. In-flight readers retain their slot charge until they finish.
+
+Payloads are synchronized before the manifest transaction commits. Restart
+loads only committed manifests; shutdown is not needed to save them. The store
+uses a SQLite index with a sibling `.data` payload file and SQLite journal.
+Treat these as one cache location. Payload IO bypasses the filesystem cache.
+`/status.persistent_cache` reports its own quota, payload IO, saves, restores,
+failures and pending publication. These counters exclude metadata writes.
 
 ### Judgment contracts
 

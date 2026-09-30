@@ -259,11 +259,19 @@ bool StateCache::publishToDisk(uint64_t leaf,
     return true;
   if (writing())
     return false;
-  auto transfer = write(completion);
+  auto transfer = write(completion, nullptr);
   while (!transfer && makeRoom && makeRoom())
-    transfer = write(completion);
+    transfer = write(completion, nullptr);
   if (!transfer)
     return false;
+  publishDiskWrite(leaf, std::move(transfer), checkpoint);
+  return true;
+}
+void StateCache::publishDiskWrite(
+    uint64_t leaf, std::unique_ptr<StateWrite<RestoreState>> transfer,
+    bool checkpoint) {
+  if (writing() || !transfer)
+    throw std::logic_error("state write is unavailable");
   const auto state = transfer->state();
   if (!state)
     throw std::invalid_argument("empty disk snapshot");
@@ -289,7 +297,38 @@ bool StateCache::publishToDisk(uint64_t leaf,
     }
     throw;
   }
-  return true;
+}
+
+void StateCache::importDisk(uint64_t leaf,
+                            std::shared_ptr<const RestoreState> state) {
+  if (!state)
+    throw std::invalid_argument("empty persistent state");
+  validate(leaf, *state);
+  for (const auto &part : state->blocks)
+    group(part.group).importDisk(endpoint(leaf, part.end), part.payload);
+}
+std::shared_ptr<const StatePayload> StateCache::diskCopy(CacheGroupId id,
+                                                         uint64_t block) const {
+  return group(id).diskCopy(block);
+}
+void StateCache::invalidateDisk(CacheGroupId id, uint64_t block,
+                                const model::SlotFile::Slot *record) noexcept {
+  const auto copy = group(id).diskCopy(block);
+  if (!copy)
+    return;
+  const auto disk = copy->diskRecord();
+  if (disk.slot.get() == record ||
+      std::any_of(disk.components.begin(), disk.components.end(),
+                  [record](const auto &slot) { return slot.get() == record; }))
+    group(id).invalidate(block, copy.get());
+}
+std::shared_ptr<const RestoreState>
+StateCache::diskSource(uint64_t leaf, const RestoreState &state) const {
+  auto result = std::make_shared<RestoreState>(state);
+  for (auto &part : result->blocks)
+    if (auto copy = diskCopy(part.group, endpoint(leaf, part.end)))
+      part.payload = std::move(copy);
+  return result;
 }
 
 void StateCache::pruneWindowDependencies(uint64_t leaf) noexcept {
@@ -477,19 +516,24 @@ bool StateCache::writing() const noexcept {
          std::any_of(groups_.begin(), groups_.end(),
                      [](const auto &g) { return g.second->writing(); });
 }
+void StateCache::finishDiskWrite() {
+  if (!pending_)
+    return;
+  auto done = std::move(*pending_);
+  pending_.reset();
+  const bool success = done.transfer->finish();
+  if (!success)
+    ++directFailures_;
+  for (const auto &[id, block, payload] : done.blocks) {
+    group(id).setExternalWrite(block, payload.get(), false);
+    if (!success)
+      group(id).invalidate(block, payload.get());
+  }
+}
 bool StateCache::pollOffload() {
   bool progress = false;
   if (pending_ && pending_->transfer->ready()) {
-    auto done = std::move(*pending_);
-    pending_.reset();
-    const bool success = done.transfer->finish();
-    if (!success)
-      ++directFailures_;
-    for (const auto &[id, block, payload] : done.blocks) {
-      group(id).setExternalWrite(block, payload.get(), false);
-      if (!success)
-        group(id).invalidate(block, payload.get());
-    }
+    finishDiskWrite();
     progress = true;
   }
   for (auto &[_, store] : groups_)

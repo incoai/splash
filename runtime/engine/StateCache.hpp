@@ -70,6 +70,18 @@ public:
                                    const std::function<void()> &completion,
                                    const std::function<bool()> &makeRoom,
                                    bool checkpoint = false);
+  // Both temporary capture and durable publication hand the same staged
+  // model write to the cache; it owns completion and partial-failure cleanup.
+  void publishDiskWrite(uint64_t leaf,
+                        std::unique_ptr<StateWrite<RestoreState>> transfer,
+                        bool checkpoint = false);
+  void importDisk(uint64_t leaf, std::shared_ptr<const RestoreState> state);
+  [[nodiscard]] std::shared_ptr<const StatePayload>
+  diskCopy(CacheGroupId group, uint64_t block) const;
+  void invalidateDisk(CacheGroupId group, uint64_t block,
+                      const model::SlotFile::Slot *record) noexcept;
+  [[nodiscard]] std::shared_ptr<const RestoreState>
+  diskSource(uint64_t leaf, const RestoreState &state) const;
   [[nodiscard]] bool contains(uint64_t block) const noexcept;
   [[nodiscard]] bool resident(uint64_t block) const noexcept;
   [[nodiscard]] StateCheckpoint checkpoint(uint64_t block) const;
@@ -98,6 +110,9 @@ public:
   [[nodiscard]] bool writing(uint64_t block) const noexcept;
   [[nodiscard]] bool writing() const noexcept;
   [[nodiscard]] bool pollOffload();
+  // Waits for the staged snapshot before cancellation/shutdown releases its
+  // slots.
+  void finishDiskWrite();
   [[nodiscard]] StateCacheSnapshot snapshot() const noexcept;
 
 private:

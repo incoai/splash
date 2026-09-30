@@ -14,6 +14,7 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 try:
     from . import assembly, catalog, clients, paths
@@ -282,6 +283,12 @@ def serve(args):
             command.extend(["--max-request-size", str(args.max_request_size)])
         if args.max_cache_disk:
             command.extend(["--max-cache-disk", str(args.max_cache_disk)])
+        if args.persistent_cache:
+            command.extend(["--persistent-cache", str(args.persistent_cache)])
+            if args.cache_file:
+                command.extend(
+                    ["--cache-file", str(Path(args.cache_file).expanduser().resolve())]
+                )
         if args.max_image_pixels is not None:
             command.extend(["--max-image-pixels", str(args.max_image_pixels)])
         if args.request_timeout is not None:
@@ -580,6 +587,20 @@ def parse_args(argv=None):
         help="SSD quota for cached KV pages and states, e.g. 5G (default: 0, disabled)",
     )
     server.add_argument(
+        "--persistent-cache",
+        type=_parse_max_cache_disk,
+        nargs="?",
+        const=5 * 1024**3,
+        default=0,
+        metavar="SIZE",
+        help="retain reusable prefixes across restarts (default size when enabled: 5G)",
+    )
+    server.add_argument(
+        "--cache-file",
+        default=None,
+        help="persistent cache file (default: a model-specific file in Library/Caches/Splash)",
+    )
+    server.add_argument(
         "--max-context",
         type=_parse_max_context,
         help="context token limit, up to 256K (K = 1024; default: auto within the memory budget)",
@@ -619,6 +640,8 @@ def parse_args(argv=None):
     for name in clients.INSTALL_URLS:
         commands.add_parser(name, help=f"connect {name} to the running server")
     args = parser.parse_args(argv)
+    if args.command == "serve" and args.cache_file and not args.persistent_cache:
+        parser.error("--cache-file requires --persistent-cache with a nonzero size")
     if (
         args.command == "serve"
         and args.default_reasoning_effort is not None

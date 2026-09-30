@@ -30,6 +30,8 @@ TUNING_SOURCES := \
 # Control-plane tests compile the runtime sources they check: their sanitizer
 # builds cannot use the unsanitized engine library, and none links a framework.
 CACHE_SOURCES := \
+	runtime/engine/PersistentCache.cpp \
+	runtime/model/CacheStore.cpp \
 	runtime/model/SlotFile.cpp \
 	runtime/engine/KvPool.cpp \
 	runtime/engine/KvCache.cpp \
@@ -47,6 +49,10 @@ BACKEND_CONTROL_SOURCES := \
 NATIVE_RUNTIME_SOURCES := $(BACKEND_CONTROL_SOURCES) \
 	runtime/engine/Protocol.cpp \
 	runtime/engine/NativeRuntime.cpp
+TEST_PERSISTENT_ASAN := $(ENGINE_SANITIZER_BUILD)/persistent-cache-asan-ubsan
+TEST_PERSISTENT_TSAN := $(ENGINE_SANITIZER_BUILD)/persistent-cache-tsan
+TEST_OWNERSHIP_ASAN := $(ENGINE_SANITIZER_BUILD)/disk-ownership-asan-ubsan
+TEST_OWNERSHIP_TSAN := $(ENGINE_SANITIZER_BUILD)/disk-ownership-tsan
 TEST_SLOT_FILE_ASAN := $(ENGINE_SANITIZER_BUILD)/slot-file-asan-ubsan
 TEST_SLOT_FILE_TSAN := $(ENGINE_SANITIZER_BUILD)/slot-file-tsan
 TEST_CACHE_ASAN := $(ENGINE_SANITIZER_BUILD)/kv-first-cache-asan-ubsan
@@ -153,7 +159,9 @@ TEST_PRODUCTION_LIB := $(ENGINE_TEST_BUILD)/production-and-test.metallib
 
 TEST_SLOT_FILE := $(ENGINE_TEST_BUILD)/slot-file
 
-TEST_CPU_TARGETS := $(TEST_SLOT_FILE) $(TEST_VISION_PREPARATION) $(TEST_AFFINE_CHECKPOINT) $(TEST_PREPARED_WEIGHTS) $(TEST_OPERATOR_WORKSPACE) \
+TEST_PERSISTENT_CACHE := $(ENGINE_TEST_BUILD)/persistent-cache
+TEST_DISK_OWNERSHIP := $(ENGINE_TEST_BUILD)/disk-ownership
+TEST_CPU_TARGETS := $(TEST_PERSISTENT_CACHE) $(TEST_DISK_OWNERSHIP) $(TEST_SLOT_FILE) $(TEST_VISION_PREPARATION) $(TEST_AFFINE_CHECKPOINT) $(TEST_PREPARED_WEIGHTS) $(TEST_OPERATOR_WORKSPACE) \
 	$(TEST_GGUF_FILE) \
 	$(TEST_GGUF_REFERENCE) $(TEST_GGUF_PLANNER) \
 	$(TEST_DEVICE_QUERIES) \
@@ -227,7 +235,7 @@ TEST_CONFIG_TARGETS := $(filter-out $(LIB),$(sort $(TEST_CPU_TARGETS) $(TEST_MET
 PRODUCTION_FLAG_TOOLS := $(TEST_Q4_PREFILL_PROFILE) $(TEST_Q4_DECODE_PROFILE) \
 	$(TEST_BACKEND_BENCHMARK) $(TUNE_KERNELS)
 PRODUCTION_CONFIG_TARGETS += $(PRODUCTION_FLAG_TOOLS)
-SANITIZER_CONFIG_TARGETS := $(TEST_CACHE_ASAN) $(TEST_CACHE_TSAN) $(TEST_GROUPS_ASAN) $(TEST_GROUPS_TSAN) $(TEST_SLOT_FILE_ASAN) $(TEST_SLOT_FILE_TSAN) \
+SANITIZER_CONFIG_TARGETS := $(TEST_PERSISTENT_ASAN) $(TEST_PERSISTENT_TSAN) $(TEST_OWNERSHIP_ASAN) $(TEST_OWNERSHIP_TSAN) $(TEST_CACHE_ASAN) $(TEST_CACHE_TSAN) $(TEST_GROUPS_ASAN) $(TEST_GROUPS_TSAN) $(TEST_SLOT_FILE_ASAN) $(TEST_SLOT_FILE_TSAN) \
 	$(TEST_BACKEND_ASAN) $(TEST_BACKEND_TSAN) \
 	$(TEST_FD_TRANSPORT_ASAN) $(TEST_FD_TRANSPORT_TSAN) \
 	$(TEST_OPERATOR_TUNING_ASAN) $(TEST_OPERATOR_TUNING_TSAN) \
@@ -237,7 +245,8 @@ SANITIZER_CONFIG_TARGETS := $(TEST_CACHE_ASAN) $(TEST_CACHE_TSAN) $(TEST_GROUPS_
 # prerequisites and the force dependency are not compiler input files.
 ENGINE_TEST_HEADERS := $(filter %.h %.hpp,$(PRODUCTION_ENGINE_INPUTS)) \
 	$(wildcard dev/tuning/*.hpp dev/tests/engine/*.hpp)
-TEST_INPUTS = $(filter-out %.h %.hpp,$(BUILD_INPUTS))
+TEST_INPUTS = $(filter-out %.h %.hpp,$(BUILD_INPUTS)) \
+	$(if $(filter runtime/model/CacheStore.cpp,$^),-lsqlite3)
 $(filter-out %.air %.metallib,$(TEST_CONFIG_TARGETS)) $(PRODUCTION_FLAG_TOOLS) \
 	$(SANITIZER_CONFIG_TARGETS): $(ENGINE_TEST_HEADERS)
 
@@ -629,6 +638,8 @@ test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TUNE_KERNELS) \
 		$(TEST_GGUF_PROJECTION_BENCHMARK) $(TEST_GGUF_MOE_BENCHMARK) \
 		$(TEST_AFFINE_SOURCE_ORACLE)
 	$(TEST_SLOT_FILE)
+	$(TEST_PERSISTENT_CACHE)
+	$(TEST_DISK_OWNERSHIP)
 	$(BUILD_ID_PYTHON) dev/tests/engine/run_vision_preparation.py $(TEST_VISION_PREPARATION) $(WEIGHT_GOLDENS)
 	$(TEST_AFFINE_CHECKPOINT)
 	$(TEST_PREPARED_WEIGHTS)
@@ -762,8 +773,12 @@ benchmark-backend: preflight $(TARGET) $(TEST_BACKEND_BENCHMARK) $(LIB)
 # from the same sources.
 $(TEST_CACHE_ASAN) $(TEST_CACHE_TSAN): $(CACHE_SOURCES) dev/tests/engine/kv_first_cache_test.cpp
 $(TEST_GROUPS_ASAN) $(TEST_GROUPS_TSAN): $(CACHE_SOURCES) dev/tests/engine/cache_groups_test.cpp
+$(TEST_PERSISTENT_CACHE) $(TEST_PERSISTENT_ASAN) $(TEST_PERSISTENT_TSAN): \
+		$(CACHE_SOURCES) dev/tests/engine/persistent_cache_test.cpp
+$(TEST_DISK_OWNERSHIP) $(TEST_OWNERSHIP_ASAN) $(TEST_OWNERSHIP_TSAN): \
+		runtime/model/SlotFile.cpp runtime/model/CacheStore.cpp dev/tests/engine/disk_ownership_test.cpp
 $(TEST_SLOT_FILE) $(TEST_SLOT_FILE_ASAN) $(TEST_SLOT_FILE_TSAN): \
-		runtime/model/SlotFile.cpp dev/tests/engine/slot_file_test.cpp
+		runtime/model/SlotFile.cpp runtime/model/CacheStore.cpp dev/tests/engine/slot_file_test.cpp
 $(TEST_KV_FIRST_ENGINE_TEST) $(TEST_BACKEND_ASAN) $(TEST_BACKEND_TSAN): \
 		$(BACKEND_CONTROL_SOURCES) \
 		dev/tests/engine/kv_first_engine_test.cpp
@@ -778,7 +793,7 @@ $(TEST_OPERATOR_MEASUREMENT) $(TEST_OPERATOR_MEASUREMENT_ASAN) $(TEST_OPERATOR_M
 		dev/tuning/Tuning.cpp dev/tuning/Measurement.cpp \
 		dev/tests/engine/operator_measurement_test.cpp
 
-$(TEST_SLOT_FILE) $(TEST_KV_FIRST_ENGINE_TEST) $(TEST_FD_TRANSPORT_TEST) \
+$(TEST_PERSISTENT_CACHE) $(TEST_DISK_OWNERSHIP) $(TEST_SLOT_FILE) $(TEST_KV_FIRST_ENGINE_TEST) $(TEST_FD_TRANSPORT_TEST) \
 		$(TEST_OPERATOR_TUNING) $(TEST_OPERATOR_MEASUREMENT): | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
@@ -793,6 +808,10 @@ ASAN_TEST_ENV := ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 \
 	UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1
 TSAN_TEST_ENV := TSAN_OPTIONS=halt_on_error=1
 test-sanitizers: $(SANITIZER_CONFIG_TARGETS)
+	$(ASAN_TEST_ENV) $(TEST_PERSISTENT_ASAN)
+	$(TSAN_TEST_ENV) $(TEST_PERSISTENT_TSAN)
+	$(ASAN_TEST_ENV) $(TEST_OWNERSHIP_ASAN)
+	$(TSAN_TEST_ENV) $(TEST_OWNERSHIP_TSAN)
 	$(ASAN_TEST_ENV) $(TEST_CACHE_ASAN)
 	$(TSAN_TEST_ENV) $(TEST_CACHE_TSAN)
 	$(ASAN_TEST_ENV) $(TEST_GROUPS_ASAN)

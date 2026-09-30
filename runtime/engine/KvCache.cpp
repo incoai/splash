@@ -95,20 +95,44 @@ KvCache::find(uint64_t parentBlock, std::span<const uint32_t> tokens,
   return std::nullopt;
 }
 
-KvCache::InsertResult KvCache::insert(uint64_t parentBlock,
+KvCache::InsertResult KvCache::insert(uint64_t parent,
                                       std::span<const uint32_t> tokens,
-                                      uint32_t physicalPage,
-                                      ImageIdentity images) {
+                                      uint32_t page, ImageIdentity images) {
+  return insertBacking(parent, tokens, page, images, nullptr);
+}
+
+uint64_t KvCache::importDisk(uint64_t parent, std::span<const uint32_t> tokens,
+                             ImageIdentity images,
+                             std::shared_ptr<model::KvDiskSlot> slot) {
+  if (!slot)
+    throw std::invalid_argument("imported KV slot is empty");
+  return insertBacking(parent, tokens, noPage, images, std::move(slot)).id;
+}
+
+KvBlockKeyView KvCache::key(uint64_t id) const {
+  const Block &entry = block(id);
+  return {entry.parent, entry.indexHash, entry.tokens, entry.images};
+}
+
+KvCache::InsertResult
+KvCache::insertBacking(uint64_t parentBlock, std::span<const uint32_t> tokens,
+                       uint32_t physicalPage, ImageIdentity images,
+                       std::shared_ptr<model::KvDiskSlot> disk) {
   if (tokens.size() != pageTokens) {
     throw std::invalid_argument("KV cache block must contain one full page");
   }
-  if (physicalPage >= pool_.pageCount()) {
+  if (physicalPage >= pool_.pageCount() && !disk) {
     throw std::out_of_range("KV cache physical page is out of range");
   }
   if (auto existing = find(parentBlock, tokens, images)) {
     InsertResult result;
     result.id = existing->id;
     result.physicalPage = existing->physicalPage;
+    if (physicalPage == noPage) {
+      if (!slot(existing->id))
+        setSlot(existing->id, std::move(disk));
+      return result;
+    }
     if (existing->physicalPage == noPage) {
       adoptPage(existing->id, physicalPage);
       result.physicalPage = physicalPage;
@@ -121,7 +145,8 @@ KvCache::InsertResult KvCache::insert(uint64_t parentBlock,
   if (parentBlock && !blocks_.contains(parentBlock)) {
     throw std::invalid_argument("KV cache parent block is unknown");
   }
-  if (parentBlock && block(parentBlock).page == noPage) {
+  if (physicalPage != noPage && parentBlock &&
+      block(parentBlock).page == noPage) {
     throw std::logic_error("KV cache parent block has no page");
   }
   if (parentBlock &&
@@ -139,11 +164,13 @@ KvCache::InsertResult KvCache::insert(uint64_t parentBlock,
   std::copy(tokens.begin(), tokens.end(), entry.tokens.begin());
   entry.images = images;
   entry.page = physicalPage;
+  entry.slot = std::move(disk);
   entry.depth = parentBlock ? block(parentBlock).depth + 1 : 1;
   entry.ramNode = RecencyOrder::allocate(entry.id);
   entry.diskNode = RecencyOrder::allocate(entry.id);
 
-  pool_.retainPage(physicalPage, true);
+  if (physicalPage != noPage)
+    pool_.retainPage(physicalPage, true);
   bool blockInserted = false;
   try {
     auto [position, unique] = blocks_.emplace(entry.id, std::move(entry));
@@ -154,16 +181,21 @@ KvCache::InsertResult KvCache::insert(uint64_t parentBlock,
   } catch (...) {
     if (blockInserted)
       blocks_.erase(nextBlockId_);
-    pool_.releasePage(physicalPage, true);
+    if (physicalPage != noPage)
+      pool_.releasePage(physicalPage, true);
     throw;
   }
   const uint64_t id = nextBlockId_++;
-  ++residentBlocks_;
+  if (physicalPage != noPage)
+    ++residentBlocks_;
+  if (block(id).slot)
+    ++diskBlocks_;
   Block &placed = block(id);
   if (parentBlock) {
     Block &parent = block(parentBlock);
     ++parent.children;
-    ++parent.residentChildren;
+    if (physicalPage != noPage)
+      ++parent.residentChildren;
     if (parent.firstChild)
       block(parent.firstChild).previousSibling = id;
     placed.nextSibling = parent.firstChild;
@@ -376,7 +408,12 @@ KvCache::evictionCandidate(uint64_t after) const {
 
 std::optional<CacheEvictionCandidate>
 KvCache::diskCandidate(bool duplicate) const noexcept {
-  return duplicate ? duplicates_.oldest() : diskLeaves_.oldest();
+  const auto &order = duplicate ? duplicates_ : diskLeaves_;
+  for (auto candidate = order.oldest(); candidate;
+       candidate = order.next(*candidate))
+    if (!block(candidate->id).slot->durable())
+      return candidate;
+  return std::nullopt;
 }
 
 bool KvCache::anyDescendant(

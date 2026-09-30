@@ -30,6 +30,8 @@ class KvPageTier final : public KvTier {
 public:
   struct DiskSlot final : KvDiskSlot {
     explicit DiskSlot(std::shared_ptr<SlotFile::Slot> held) : slot(std::move(held)) {}
+    std::shared_ptr<SlotFile::Slot> record() const override { return slot; }
+    bool durable() const noexcept override { return slot && slot->durable(); }
     std::shared_ptr<SlotFile::Slot> slot;
   };
   static constexpr uint32_t kDefaultStagingSlots = 128;
@@ -54,6 +56,10 @@ public:
   [[nodiscard]] bool writable() const noexcept override;
   [[nodiscard]] bool canDemote() const noexcept override;
   [[nodiscard]] std::shared_ptr<KvDiskSlot> acquireSlot() override;
+  [[nodiscard]] std::shared_ptr<KvDiskSlot>
+  reopenSlot(std::shared_ptr<SlotFile::Slot> slot) override {
+    return std::make_shared<DiskSlot>(std::move(slot));
+  }
   [[nodiscard]] std::unique_ptr<KvTransfer>
   demote(uint32_t page, std::shared_ptr<KvDiskSlot> slot,
          std::function<void()> completion) override;

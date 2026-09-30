@@ -14,6 +14,23 @@ Cache::Cache(KvPool &pool, CacheNamespace cacheNamespace, model::KvTier *kvTier,
       states_(kv_, recency_), makeRoom_([this] { return freeDiskSpace(); }) {}
 
 Cache::~Cache() = default;
+void Cache::enablePersistence(PersistentCacheConfig config) {
+  if (!tier_ || persistent_ || !requests_.empty() || kv_.snapshot().blocks)
+    throw std::logic_error("persistence must be configured at cache startup");
+  configureGroups(config.stateStorage->cacheGroups());
+  persistent_ = std::make_unique<PersistentCache>(
+      std::move(config), kv_, states_, *tier_, recency_,
+      [this](uint64_t block) {
+        if (kv_.page(block) != KvCache::noPage)
+          kv_.setSlot(block, nullptr);
+        else {
+          states_.invalidate(block);
+          kv_.poison(block);
+          poisoned_.push_back(block);
+        }
+      },
+      completionNotifier_);
+}
 
 void Cache::beginRequest(uint64_t requestId) {
   if (!requestId)
@@ -38,6 +55,9 @@ void Cache::endRequest(uint64_t requestId) {
   // Ordinary states remain newer than the finished KV tail; disposable
   // checkpoints retain their lower priority.
   states_.touch(active.cachedBlocks);
+  if (persistent_)
+    for (auto block : active.cachedBlocks)
+      persistent_->touch(block);
   if (active.pendingRestores) {
     for (auto &[_, restore] : restores_)
       std::erase(restore.waiters, requestId);
@@ -142,6 +162,8 @@ CacheLookup Cache::lookup(std::span<const uint32_t> prompt,
 }
 
 void Cache::recordLookup(const CacheLookup &result) {
+  if (persistent_ && result.state)
+    persistent_->publish(result.state->kvBlock());
   ++lookup_.lookups;
   lookup_.kvHitTokens += result.kvBoundary;
   lookup_.stateHitTokens += result.resumeBoundary();
@@ -223,17 +245,25 @@ uint64_t Cache::blockAt(uint64_t requestId, uint32_t boundary) const {
 }
 
 bool Cache::reuseRestoreState(uint64_t kvBlock, bool checkpoint) {
-  return states_.touchIfResident(kvBlock, checkpoint);
+  const bool reused = states_.touchIfResident(kvBlock, checkpoint);
+  if (reused && persistent_ && !checkpoint)
+    persistent_->publish(kvBlock);
+  return reused;
 }
 
 bool Cache::reuseStoredState(uint64_t kvBlock, bool checkpoint) {
-  return states_.touchIfStored(kvBlock, checkpoint);
+  const bool reused = states_.touchIfStored(kvBlock, checkpoint);
+  if (reused && persistent_ && !checkpoint)
+    persistent_->publish(kvBlock);
+  return reused;
 }
 
 void Cache::publishRestoreState(uint64_t kvBlock,
                                 std::shared_ptr<const RestoreState> state,
                                 bool checkpoint) {
   states_.publish(kvBlock, std::move(state), checkpoint);
+  if (persistent_ && !checkpoint)
+    persistent_->publish(kvBlock);
 }
 
 bool Cache::publishStateToDisk(uint64_t kvBlock, const SnapshotWritePlan &plan,
@@ -242,6 +272,8 @@ bool Cache::publishStateToDisk(uint64_t kvBlock, const SnapshotWritePlan &plan,
     return true;
   if (!plan.source || !plan.write || states_.writing())
     return false;
+  if (persistent_ && !checkpoint && persistent_->capture(kvBlock, *plan.source))
+    return true;
   return states_.publishToDisk(kvBlock, plan.write, completionNotifier_,
                                makeRoom_, checkpoint);
 }
@@ -520,7 +552,8 @@ uint64_t Cache::reclaimEmptyExtents() {
 }
 
 bool Cache::transfersInFlight() const noexcept {
-  return !restores_.empty() || !demotions_.empty() || states_.writing();
+  return !restores_.empty() || !demotions_.empty() || states_.writing() ||
+         (persistent_ && persistent_->busy());
 }
 
 uint64_t Cache::pendingBytes() const noexcept {
@@ -638,8 +671,9 @@ KvRestoreStatus Cache::kvRestoreStatus(uint64_t requestId) const {
 void Cache::startRestore(uint64_t block) {
   kv_.setTransferring(block, true);
   Restore &restore = restores_[block];
+  restore.slot = kv_.slot(block);
   restore.transfer =
-      tier_->restore(kv_.slot(block), kv_.page(block), completionNotifier_);
+      tier_->restore(restore.slot, kv_.page(block), completionNotifier_);
 }
 
 void Cache::promoteState(const CacheLookup &lookup, StateRestore &transfer) {
@@ -731,6 +765,8 @@ bool Cache::freeDiskSpace() {
 
 bool Cache::pollTransfers() {
   bool progressed = states_.pollOffload();
+  if (persistent_)
+    progressed = persistent_->poll() || progressed;
   if (!tier_)
     return progressed;
   tier_->poll();
@@ -738,7 +774,7 @@ bool Cache::pollTransfers() {
     auto &[block, restore] = *entry;
     if (!restore.transfer)
       restore.transfer =
-          tier_->restore(kv_.slot(block), kv_.page(block), completionNotifier_);
+          tier_->restore(restore.slot, kv_.page(block), completionNotifier_);
     if (!restore.transfer || !restore.transfer->ready()) {
       ++entry;
       continue;
@@ -760,9 +796,13 @@ bool Cache::pollTransfers() {
     if (!restored) {
       // The block leaves with its last user; so does any state it held, and
       // what lies below it, which no lookup reaches any more.
-      states_.invalidate(block);
-      kv_.poison(block);
-      poisoned_.push_back(block);
+      if (persistent_)
+        persistent_->invalidate(block);
+      if (kv_.contains(block)) {
+        states_.invalidate(block);
+        kv_.poison(block);
+        poisoned_.push_back(block);
+      }
     }
     entry = restores_.erase(entry);
     progressed = true;
@@ -806,7 +846,8 @@ CacheSnapshot Cache::snapshot() const {
   }
   if (tier_)
     tier.diskBytes = uint64_t{tier.diskBlocks} * tier_->slotBytes();
-  return {pool_.snapshot(),
+  return {persistent_ ? persistent_->snapshot() : PersistentCacheSnapshot{},
+          pool_.snapshot(),
           kv_.snapshot(),
           states_.snapshot(),
           tier,

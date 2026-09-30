@@ -687,6 +687,40 @@ class Harness:
 
 
 class ServerTest(unittest.TestCase):
+    def test_persistent_cache_native_options(self):
+        required = [
+            "target",
+            "draft",
+            "--tokenizer",
+            "tokenizer",
+            "--model",
+            "incoai/Qwen3.8-27B-Splash",
+        ]
+        args = api.parse_args(
+            [
+                *required,
+                "--persistent-cache",
+                "2G",
+                "--cache-file",
+                "/tmp/prefix.sqlite",
+            ]
+        )
+        command = api._native_command(args)
+        self.assertEqual(
+            command[-4:],
+            [
+                "--persistent-cache-bytes",
+                str(2 * 1024**3),
+                "--cache-file",
+                str(Path("/tmp/prefix.sqlite").resolve()),
+            ],
+        )
+        self.assertEqual(args.max_cache_disk, 0)
+        with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
+            api.parse_args([*required, "--cache-file", "/tmp/cache"])
+        disabled = api.parse_args([*required, "--persistent-cache", "0"])
+        self.assertNotIn("--persistent-cache-bytes", api._native_command(disabled))
+
     def setUp(self):
         self.harnesses = []
 

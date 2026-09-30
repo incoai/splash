@@ -171,7 +171,8 @@ StateGroupCache::candidate(uint64_t block, bool disk,
   const auto &entry = found->second;
   if (entry.invalid || entry.pins)
     return std::nullopt;
-  if (disk ? (!entry.disk || writing(block) || bool(entry.ram) != duplicate)
+  if (disk ? (!entry.disk || entry.disk->durable() || writing(block) ||
+              bool(entry.ram) != duplicate)
            : !entry.ram)
     return std::nullopt;
   return CacheEvictionCandidate{block, entry.lastUsed, spec_.id};
@@ -256,7 +257,9 @@ StateGroupCache::diskCandidate(bool duplicate) const noexcept {
   const auto &order = duplicate ? duplicates_ : diskOnly_;
   for (auto candidate = order.oldest(); candidate;
        candidate = order.next(*candidate))
-    return CacheEvictionCandidate{candidate->id, candidate->lastUsed, spec_.id};
+    if (!entries_.at(candidate->id).disk->durable())
+      return CacheEvictionCandidate{candidate->id, candidate->lastUsed,
+                                    spec_.id};
   return std::nullopt;
 }
 
@@ -273,7 +276,8 @@ StateEviction StateGroupCache::reclaim(uint64_t kvBlock,
   if (writable) {
     auto transfer = startWrite(
         kvBlock,
-        [state = found->second.ram](std::function<void()> done) {
+        [state = found->second.ram](std::function<void()> done,
+                                    model::DiskReservation *) {
           return state->offload(std::move(done));
         },
         completion, makeRoom);
@@ -517,11 +521,12 @@ StateGroupCache::startWrite(uint64_t kvBlock,
   auto source = acquireBlock(kvBlock);
   if (!source)
     return {};
-  std::unique_ptr<StateWrite<StatePayload>> transfer = write(completion);
+  std::unique_ptr<StateWrite<StatePayload>> transfer =
+      write(completion, nullptr);
   while (!transfer && contains(kvBlock) && makeRoom && makeRoom()) {
     if (!contains(kvBlock))
       return {};
-    transfer = write(completion);
+    transfer = write(completion, nullptr);
   }
   if (!contains(kvBlock))
     return {};

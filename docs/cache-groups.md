@@ -87,4 +87,7 @@ block or a complete restore boundary. Transfer destruction drains outstanding
 IO. Disk copies can remain beside RAM copies and be reused during later pressure;
 shared immutable draft pages are not written again while their disk copy exists.
 
-This change does not introduce persistent storage or change the server protocol.
+The same group index also supports [persistent prefixes](../DEVELOPMENT.md#persistent-prefixes).
+Persistence owns manifest admission and durable slot references; matching,
+restoration, group eviction and temporary offload remain cache responsibilities.
+The server protocol remains version 7.
