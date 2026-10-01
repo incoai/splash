@@ -173,11 +173,11 @@ inline constexpr auto kMoeWorkspaceFields = [] {
 // changing it never changes the physical rows in a command. Affine plans
 // consume Q4 expert slabs in StorageN=256 order: M8 plans and decode plans
 // run the fused gate/up tile; the M32 prefill plan runs the experts as three
-// N256 passes (gate, up with the silu gate, down) whose tiles shrink to the
-// descriptor's live rows, bit-identical to the fused tile. GGUF plans run
-// three passes of M8 tiles, or of M32 tiles to prefill (moeGgufPrefillTile).
-// M32 is the device-independent tile of prefill plans; ExecutionPlans applies
-// the device policy of GGUF plans.
+// N256 passes (gate, up with the silu gate, down), bit-identical to the fused
+// tile. Both forms run a 32-row tile as the 8-, 16- or 32-row matmul that
+// holds its live rows. GGUF plans run three passes of M8 tiles, or of M32
+// tiles to prefill (moeGgufPrefillTile). M32 is the device-independent tile
+// of prefill plans; ExecutionPlans applies the device policy of GGUF plans.
 enum class MoeExpertTile : uint8_t { M8 = 8, M32 = 32 };
 
 // Simdgroups per 8-row expert tile: a device policy the execution plans set,

@@ -631,30 +631,22 @@ inline void moe_expert_tile(device bfloat *grouped_input,
         params.output_size, params.input_size, input_sums, group.x * TileN,
         simd_lane, simd_group);
   } else {
-    // A 32-row tile shrinks to the descriptor's live rows, as the split
-    // prefill passes do: an expert's last tile is mostly partial, and the
-    // skipped padding is never consumed. The smaller instances read rows the
-    // tile's 32-row region holds, so their sums, orders and epilogues stay
-    // bit-identical to the full tile.
-    if (tile.rows <= 8) {
-      q4_mpp_tile_batched<8, TileN, GateUp, false, 256, false, Simdgroups>(
+    // A 32-row tile runs the 8-, 16- or 32-row matmul that holds its live
+    // rows, as the split prefill passes do: an expert's last tile is mostly
+    // partial, and its padding rows are never consumed. Every instance keeps
+    // the full tile's quant-group order, input sums and epilogue, so the live
+    // rows are bit-identical to it.
+    const auto run = [&](auto rows) {
+      constexpr ushort R = decltype(rows)::value;
+      q4_mpp_tile_batched<R, TileN, GateUp, false, 256, false, Simdgroups>(
           input, slab_0.weights, slab_0.scales, slab_0.biases, tile_output,
           slab_1.weights, slab_1.scales, slab_1.biases, tile_output,
           params.output_size, params.input_size, input_sums, group.x * TileN,
           simd_lane, simd_group);
-    } else if (tile.rows <= 16) {
-      q4_mpp_tile_batched<16, TileN, GateUp, false, 256, false, Simdgroups>(
-          input, slab_0.weights, slab_0.scales, slab_0.biases, tile_output,
-          slab_1.weights, slab_1.scales, slab_1.biases, tile_output,
-          params.output_size, params.input_size, input_sums, group.x * TileN,
-          simd_lane, simd_group);
-    } else {
-      q4_mpp_tile_batched<Rows, TileN, GateUp, false, 256, false, Simdgroups>(
-          input, slab_0.weights, slab_0.scales, slab_0.biases, tile_output,
-          slab_1.weights, slab_1.scales, slab_1.biases, tile_output,
-          params.output_size, params.input_size, input_sums, group.x * TileN,
-          simd_lane, simd_group);
-    }
+    };
+    if (tile.rows <= 8) run(integral_constant<ushort, 8>{});
+    else if (tile.rows <= 16) run(integral_constant<ushort, 16>{});
+    else run(integral_constant<ushort, Rows>{});
   }
 }
 
