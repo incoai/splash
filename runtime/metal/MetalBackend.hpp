@@ -372,6 +372,14 @@ public:
   // per-dispatch timings with takeDispatchProfile().
   void setDispatchProfiling(bool enabled) noexcept;
   [[nodiscard]] std::vector<DispatchTiming> takeDispatchProfile();
+  // While profiling, called after each replayed dispatch completes, before
+  // the next one runs, so a benchmark can read the Shared buffers that
+  // dispatch wrote (for example an operator's routing scratch, which later
+  // dispatches and layers overwrite). The dispatch's bytes bindings are
+  // still valid during the call. An empty observer clears it; production
+  // serving never sets one.
+  using DispatchObserver = std::function<void(const ComputeDispatch &)>;
+  void setDispatchObserver(DispatchObserver observer);
 
   [[nodiscard]] MetalMemoryStats memoryStats() const noexcept;
   // Explicit safe-point refresh for memory admission/reclamation code. A
