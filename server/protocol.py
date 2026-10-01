@@ -29,7 +29,7 @@ _MAGIC = b"SPLH"
 _HEADER = struct.Struct("<4sHHHHQI")
 # Replay can update the integer deadlines without decoding sampling floats.
 _REQUEST_HEAD = struct.Struct("<QBBBQQ")
-_REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIffIQBIII")
+_REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIffIQBIIII")
 _IMAGE_SPAN = struct.Struct("<IIIIQQ")
 _CANCEL = struct.Struct("<Q")
 _MASK_RESPONSE = struct.Struct("<QQI")
@@ -50,7 +50,7 @@ assert (
     and sys.byteorder == "little"
 )
 assert _HEADER.size == FRAME_HEADER_BYTES
-assert _REQUEST.size == 72
+assert _REQUEST.size == 76
 assert _IMAGE_SPAN.size == 32
 assert _START.size == 21
 assert _DONE.size == 41
@@ -235,6 +235,10 @@ class RequestFrame:
     # when unknown. It must leave at least one prompt token.
     generation_prompt_tokens: int = 0
     flags: RequestFlag = RequestFlag(0)
+    # Leading prompt tokens that later requests are expected to share, such
+    # as the chat template's system prompt and tools; zero when unknown. It
+    # must not exceed the prompt.
+    shared_prefix_tokens: int = 0
 
 
 @dataclass(slots=True, frozen=True)
@@ -756,6 +760,9 @@ def _request_issue(
         generation = _u32(request.generation_prompt_tokens, "generation prompt tokens")
         if generation >= len(prompt):
             raise ValueError("generation prompt must leave a prompt token")
+        shared = _u32(request.shared_prefix_tokens, "shared prefix tokens")
+        if shared > len(prompt):
+            raise ValueError("shared prefix must lie within the prompt")
         if scores and (request.image_spans or request.image_pixels):
             raise ValueError("score requests are text-only")
         if scores and (
@@ -1180,6 +1187,7 @@ def _encode_message(
                 len(scores),
                 message.generation_prompt_tokens,
                 message.flags,
+                message.shared_prefix_tokens,
             )
             + _pack_words(prompt)
             + b"".join(
@@ -1464,6 +1472,7 @@ def _decode_request(payload: bytes, limits: ProtocolLimits) -> RequestFrame:
         score_count,
         generation_prompt_tokens,
         flags,
+        shared_prefix_tokens,
     ) = _REQUEST.unpack_from(payload)
     if return_progress > 1:
         _fail(
@@ -1550,6 +1559,7 @@ def _decode_request(payload: bytes, limits: ProtocolLimits) -> RequestFrame:
         score_tokens,
         generation_prompt_tokens,
         RequestFlag(flags),
+        shared_prefix_tokens,
     )
     _raise_issue(_request_issue(request, limits))
     return request

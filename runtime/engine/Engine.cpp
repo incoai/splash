@@ -38,6 +38,7 @@ void Engine::submit(EngineRequest value) {
   const bool scoring = !value.scoreTokens.empty();
   if (!value.id || value.prompt.empty() ||
       value.generationPromptTokens >= value.prompt.size() ||
+      value.sharedPrefixTokens > value.prompt.size() ||
       (scoring ? value.maxNewTokens != 0 : !value.maxNewTokens) ||
       value.prompt.size() + value.maxNewTokens > config_.maxContext ||
       !std::isfinite(value.deadlineMilliseconds) ||
@@ -792,6 +793,11 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
     }
   }
   addCandidate(junctionBoundary, Request::StateBoundary::Purpose::Junction);
+  // A prefix other requests will share is a junction they have not reached
+  // yet: keeping its state now spares the first of them recomputing it.
+  addCandidate(active.request.sharedPrefixTokens / KvCache::pageTokens *
+                   KvCache::pageTokens,
+               Request::StateBoundary::Purpose::Junction);
   addCandidate(latestReplayBoundary, Request::StateBoundary::Purpose::Replay);
   std::sort(active.stateBoundaries.begin(), active.stateBoundaries.end(),
             [](const Request::StateBoundary &left,

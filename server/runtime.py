@@ -188,6 +188,9 @@ class GenerationRequest:
     # when unknown.
     generation_prompt_tokens: int = 0
     flags: wire.RequestFlag = wire.RequestFlag(0)
+    # Leading prompt tokens that later requests are expected to share; zero
+    # when unknown.
+    shared_prefix_tokens: int = 0
 
 
 @dataclass(slots=True, frozen=True)
@@ -627,6 +630,7 @@ class MultiplexedRuntime:
                 score_tokens=request.score_tokens,
                 generation_prompt_tokens=request.generation_prompt_tokens,
                 flags=request.flags,
+                shared_prefix_tokens=request.shared_prefix_tokens,
             )
             try:
                 encoded = wire.serialize_message(protocol_request)

@@ -273,6 +273,7 @@ bool NativeRuntime::handleRequest(protocol::RequestFrame &request) {
     engineRequest.cohort = mapCohort(request.cohort);
     engineRequest.prompt = std::move(request.promptTokens);
     engineRequest.generationPromptTokens = request.generationPromptTokens;
+    engineRequest.sharedPrefixTokens = request.sharedPrefixTokens;
     engineRequest.images.reserve(request.imageSpans.size());
     for (const protocol::ImageSpanFrame &span : request.imageSpans) {
       engineRequest.images.push_back({span.offset, span.tokens, span.gridHeight,

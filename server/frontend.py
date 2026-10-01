@@ -9,6 +9,7 @@ import time
 from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from functools import lru_cache
 from itertools import count
 from pathlib import Path
 
@@ -97,6 +98,11 @@ RESPONSE_STORE_BUDGET_BYTES = 64 * 1024 * 1024
 # Text completions' output budget when max_tokens is omitted: OpenAI's
 # default for the endpoint, which vLLM and SGLang also use.
 COMPLETION_DEFAULT_MAX_TOKENS = 16
+
+
+# What follows the leading system prompt and tools in the probe that finds
+# their shared prefix: a first turn no request's own is likely to begin with.
+SHARED_PREFIX_PROBE = {"role": "user", "content": "\u2063"}
 
 
 # A stable marker lets repeated image requests reuse the compiled template.
@@ -224,6 +230,9 @@ class RenderedPrompt:
     thinking: bool
     # Images precede the generation prompt; expanding them keeps this count.
     generation_prompt_tokens: int
+    # Leading tokens other requests with the same system prompt and tools
+    # share; zero unless requested, or when an image lies within them.
+    shared_prefix_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -308,6 +317,10 @@ class Frontend:
         self.preparation_waiting = 0
         self.response_store = ResponseStore()
         self.thinking_codec = thinking_codec
+        # Agents repeat a few system prompts and tool sets.
+        self._shared_prefix_probe = lru_cache(maxsize=8)(
+            self._render_shared_prefix_probe
+        )
 
     def accepts_model(self, model):
         return isinstance(model, str) and model in self.model_names
@@ -881,8 +894,39 @@ class Frontend:
         with self.latencies.measure("template"):
             return render_chat_template(self.tokenizer, messages, template)
 
+    def _render_shared_prefix_probe(self, key):
+        """The tokens of a request's leading system message and template
+        options followed by the probe turn instead of its own; empty where
+        the template cannot render it."""
+        head, template = json.loads(key)
+        try:
+            text = self._apply_chat_template([*head, SHARED_PREFIX_PROBE], template)
+        except Exception:
+            return ()
+        return tuple(self._tokenize(text, add_special_tokens=False)["input_ids"])
+
+    def _shared_prefix_probe_tokens(self, messages, template):
+        """The tokens of the prompt's leading system message, tools and
+        template options followed by a probe turn; empty without a system
+        message or tools."""
+        head = messages[:1] if messages and messages[0]["role"] == "system" else []
+        if head and not isinstance(head[0]["content"], str):
+            return ()
+        if not head and "tools" not in template:
+            return ()
+        # Key order is kept: templates render tools in the request's order.
+        return self._shared_prefix_probe(
+            json.dumps([head, template], ensure_ascii=False)
+        )
+
     def _render_prompt(
-        self, prompt, deadline, *, check_context=True, add_generation_prompt=True
+        self,
+        prompt,
+        deadline,
+        *,
+        check_context=True,
+        add_generation_prompt=True,
+        shared_prefix=False,
     ):
         chat_template = self.chat_templates.select(prompt.tools)
         if not chat_template.accepts(prompt.messages):
@@ -899,6 +943,12 @@ class Frontend:
             ),
             **prompt.template_kwargs,
         }
+        # Rendered first, so the request's own rendering stays the latest.
+        shared_prefix_probe = (
+            self._shared_prefix_probe_tokens(prompt.messages, template)
+            if shared_prefix
+            else None
+        )
         with self.latencies.measure("images"):
             images = self._prepare_images(prompt.messages, check_context=check_context)
         remaining_request_time(deadline)
@@ -947,8 +997,27 @@ class Frontend:
             raise APIError(
                 400, "chat template does not support the requested thinking mode"
             )
+        # The leading tokens that depend only on the system message, tools
+        # and template options, which an agent repeats across requests: the
+        # prompt's common prefix with the probe. The engine keeps a reusable
+        # state there, so the next such request resumes after the head
+        # whatever follows it. No template structure is assumed.
+        shared_prefix_tokens = 0
+        for ours, probed in zip(tokens, shared_prefix_probe or ()):
+            if ours != probed:
+                break
+            shared_prefix_tokens += 1
+        # Expanding an image before it would move it.
+        if positions and positions[0] < shared_prefix_tokens:
+            shared_prefix_tokens = 0
         return RenderedPrompt(
-            rendered, tokens, images, positions, thinking, generation_prompt_tokens
+            rendered,
+            tokens,
+            images,
+            positions,
+            thinking,
+            generation_prompt_tokens,
+            shared_prefix_tokens,
         )
 
     def _prepare(
@@ -1010,7 +1079,7 @@ class Frontend:
             raise APIError(
                 400, "ignore_eos cannot be combined with tools or structured output"
             )
-        rendered = self._render_prompt(prompt, deadline)
+        rendered = self._render_prompt(prompt, deadline, shared_prefix=True)
         prompt_tokens, prepared_images = rendered.tokens, rendered.images
         image_positions, thinking = rendered.image_positions, rendered.thinking
         constraint = None
@@ -1071,6 +1140,7 @@ class Frontend:
             image_owner=prepared_images if prepared_images else None,
             tools_signature=tools_signature,
             generation_prompt_tokens=rendered.generation_prompt_tokens,
+            shared_prefix_tokens=rendered.shared_prefix_tokens,
             output_clamped_to_context=requested is not None and max_new < requested,
         )
         return job, thinking, bool(tools)

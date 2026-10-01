@@ -599,6 +599,77 @@ class ChatTemplateFrontendTests(unittest.TestCase):
             app.tokenizer(history, add_special_tokens=False)["input_ids"],
         )
 
+    def test_requests_carry_the_prefix_their_system_prompt_and_tools_share(self):
+        """The leading tokens that depend only on the system prompt, the
+        tools and the template options, so the engine keeps a state there
+        for the next request with the same head and another question."""
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "description": "Find a fact.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                    },
+                },
+            }
+        ]
+        system = {"role": "system", "content": "Read the document and answer."}
+
+        def common(left, right):
+            shared = 0
+            for ours, theirs in zip(left, right):
+                if ours != theirs:
+                    break
+                shared += 1
+            return shared
+
+        for name in ("qwen36_gguf", "qwen38_gguf"):
+            app = fixtures.make_frontend(
+                chat_tokenizer(source(name), "<|im_start|>", "<|im_end|>"),
+                None,
+                "test-model",
+                4096,
+                10,
+                2,
+                vision=False,
+            )
+
+            def prepare(messages, **extra):
+                job, _thinking, _tools = app.prepare(
+                    {"model": "test-model", "messages": messages, **extra}
+                )
+                return job
+
+            for head, extra in (
+                ([system], {}),
+                ([system], {"tools": tools}),
+                ([], {"tools": tools}),
+            ):
+                with self.subTest(name=name, head=bool(head), tools=bool(extra)):
+                    alpha = prepare(
+                        [*head, {"role": "user", "content": "Alpha?"}], **extra
+                    )
+                    beta = prepare(
+                        [
+                            *head,
+                            {"role": "user", "content": "Beta?"},
+                            {"role": "assistant", "content": "Gamma."},
+                            {"role": "user", "content": "Delta?"},
+                        ],
+                        **extra,
+                    )
+                    shared = common(alpha.prompt_tokens, beta.prompt_tokens)
+                    self.assertGreater(shared, 0)
+                    self.assertEqual(alpha.shared_prefix_tokens, shared)
+                    self.assertEqual(beta.shared_prefix_tokens, shared)
+            # Without a system prompt or tools nothing is shared by design.
+            self.assertEqual(
+                prepare([{"role": "user", "content": "Alpha?"}]).shared_prefix_tokens, 0
+            )
+
     def test_generation_prompts_need_no_turn_marker(self):
         """Whatever a chat format's markers, the generation prompt is what its
         template appends. A template that appends nothing, or renders the

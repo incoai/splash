@@ -35,6 +35,10 @@ struct EngineRequest final {
   // reusable state is kept before them. Zero when unknown; it must leave at
   // least one prompt token.
   uint32_t generationPromptTokens = 0;
+  // Leading prompt tokens that later requests are expected to share whatever
+  // follows them (a chat template's system prompt and tools), so a reusable
+  // state is kept at the last whole page within them. Zero when unknown.
+  uint32_t sharedPrefixTokens = 0;
   std::vector<ImageSpan> images;
   std::vector<uint8_t> imagePixels;
   uint32_t maxNewTokens = 0;
