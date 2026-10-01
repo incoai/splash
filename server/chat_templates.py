@@ -24,22 +24,47 @@ marker. The outcome is one of:
   message fails with a 400 instead of losing it.
 
 The probe also records the generation prompt, the text a template appends
-for ``add_generation_prompt``, under each reasoning effort. A request's
-prompt must end with it, and it says whether generation starts in a think
-block. The next turn may render it differently, so the engine keeps a turn's
-reusable state before it. No chat format's markers are assumed.
+for ``add_generation_prompt``, under each reasoning effort, and under other
+template variables a request sets when it first sets them. A request's prompt
+must end with it, and it says whether generation starts in a think block. The
+next turn may render it differently, so the engine keeps a turn's reusable
+state before it. No chat format's markers are assumed.
 
 Requests and the probe share the reasoning efforts, template options and
 alias retry defined here, so the probe renders exactly as requests do.
 Tokenizer files and the tokenizer object are never modified.
 """
 
+import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
+from functools import lru_cache
 
 from jinja2 import Environment, TemplateError, TemplateSyntaxError, nodes
 from jinja2.ext import Extension
 from jinja2.lexer import Token
+
+# Template arguments request preparation sets itself, and apply_chat_template's
+# own controls: a request's template kwargs cannot set them.
+RESERVED_TEMPLATE_KWARGS = frozenset(
+    {
+        "add_generation_prompt",
+        "chat_template",
+        "continue_final_message",
+        "conversation",
+        "documents",
+        "messages",
+        "return_dict",
+        "tokenize",
+        "tools",
+    }
+)
+# Template options that cannot shape the generation prompt: those (the probe
+# renders without tools) and preserve_thinking, which only changes history.
+_HISTORY_OPTIONS = RESERVED_TEMPLATE_KWARGS | {"preserve_thinking"}
+# Combinations of other template variables whose generation prompts are kept.
+_PROBED_OPTIONS = 64
 
 # What Splash does with a later system message.
 NATIVE = "native"
@@ -103,8 +128,11 @@ class ChatTemplate:
     # RENDERS, REJECTS, DROPS or MISPLACES.
     original: str
     # The generation prompt's text and tokens by the options that shape it
-    # (_generation_key); absent where it is empty or the probes disagree.
+    # (_generation_key), for each reasoning effort; absent where it is empty
+    # or the probes disagree.
     generation_prompts: dict
+    # The same for other options, probed on first use.
+    probe: Callable
 
     def accepts(self, messages):
         """Whether requests with these normalized messages are served: a
@@ -116,7 +144,9 @@ class ChatTemplate:
     def generation_prompt(self, options):
         """The text and tokens add_generation_prompt appends under these
         request options; empty where the probe found none."""
-        return self.generation_prompts.get(_generation_key(options), ("", ()))
+        key = _generation_key(options)
+        found = self.generation_prompts.get(key)
+        return found if found is not None else self.probe(key)
 
 
 class ChatTemplates:
@@ -217,8 +247,18 @@ def _prepare(render, encode, source):
         patched = _patch(render, source, original)
         if patched is not None and _verified(render, source, patched):
             source, later_system = patched, PATCHED
+
+    @lru_cache(maxsize=_PROBED_OPTIONS)
+    def probe(key):
+        options = {**json.loads(key), "add_generation_prompt": True}
+        return _generation_prompt(render, encode, source, options) or ("", ())
+
     return ChatTemplate(
-        source, later_system, original, _generation_prompts(render, encode, source)
+        source,
+        later_system,
+        original,
+        _generation_prompts(render, encode, source),
+        probe,
     )
 
 
@@ -301,13 +341,18 @@ _FOLLOWED = ([_ASK], [_SYSTEM, _ASK, _THOUGHT, _NEXT], [_SYSTEM, _ASK, _CALL, _R
 
 def _generation_key(options):
     """The template options that can shape the generation prompt."""
-    return options.get("enable_thinking"), options.get("reasoning_effort")
+    return json.dumps(
+        {
+            name: value
+            for name, value in options.items()
+            if name not in _HISTORY_OPTIONS
+        },
+        sort_keys=True,
+    )
 
 
 def _generation_prompts(render, encode, source):
-    """What add_generation_prompt appends, with its tokens, for each reasoning
-    effort a request can pass: kept where every probe conversation renders
-    as a prefix of its prompt and gains the same non-empty text."""
+    """The generation prompt for each reasoning effort a request can pass."""
     prompts = {}
     for effort in (None, *REASONING_EFFORTS):
         options = template_options(
@@ -316,23 +361,31 @@ def _generation_prompts(render, encode, source):
             tools=None,
             add_generation_prompt=True,
         )
-        texts = set()
-        for messages in _FOLLOWED:
-            prompt = _outcome(render, source, messages, options)
-            history = _outcome(
-                render, source, messages, {**options, "add_generation_prompt": False}
-            )
-            if not (
-                isinstance(prompt, str)
-                and isinstance(history, str)
-                and prompt.startswith(history)
-            ):
-                break
-            texts.add(prompt[len(history) :])
-        else:
-            if len(texts) == 1 and (text := texts.pop()):
-                prompts[_generation_key(options)] = (text, tuple(encode(text)))
+        if found := _generation_prompt(render, encode, source, options):
+            prompts[_generation_key(options)] = found
     return prompts
+
+
+def _generation_prompt(render, encode, source, options):
+    """What add_generation_prompt appends under these options, with its
+    tokens: kept where every probe conversation renders as a prefix of its
+    prompt and gains the same non-empty text."""
+    texts = set()
+    for messages in _FOLLOWED:
+        prompt = _outcome(render, source, messages, options)
+        history = _outcome(
+            render, source, messages, {**options, "add_generation_prompt": False}
+        )
+        if not (
+            isinstance(prompt, str)
+            and isinstance(history, str)
+            and prompt.startswith(history)
+        ):
+            return None
+        texts.add(prompt[len(history) :])
+    if len(texts) == 1 and (text := texts.pop()):
+        return text, tuple(encode(text))
+    return None
 
 
 def _outcome(render, source, messages, options):

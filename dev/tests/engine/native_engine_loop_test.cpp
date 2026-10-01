@@ -178,7 +178,7 @@ public:
   std::shared_ptr<const CompositeState> snapshot(uint64_t) override {
     return std::make_shared<State>();
   }
-  uint64_t reclaimIdleState() noexcept override { return 0; }
+  uint64_t reclaimIdleState(bool) noexcept override { return 0; }
   void provideMask(uint64_t, std::span<const uint32_t> words) override {
     // As in the model, a mask row must permit some token.
     if (std::none_of(words.begin(), words.end(),

@@ -166,6 +166,9 @@ private:
 // Live cells retain stable backing; only idle buffers may be reclaimed.
 class QwenStateStorage final : public model::StateStorage {
 public:
+  // The GDN cells a lane holds, with one draft ring.
+  static constexpr uint32_t kLaneCells = 2;
+
   QwenStateStorage(metal::MetalBackend &backend,
                    metal::AllocationAdmission admitAllocation,
                    CompositeStateLayout layout,
@@ -229,7 +232,7 @@ private:
   struct Slot final {
     QwenSlotBuffers buffers;
     QwenSlotMetadata metadata;
-    std::array<std::shared_ptr<QwenGdnCell>, 2> gdn;
+    std::array<std::shared_ptr<QwenGdnCell>, kLaneCells> gdn;
     std::shared_ptr<DFlashDraftRing> draft;
   };
 

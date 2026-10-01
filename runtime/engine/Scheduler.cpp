@@ -52,6 +52,7 @@ void Scheduler::suspendForResources(uint64_t id) {
   }
   request.suspendedForResources = true;
   request.phase = Phase::WaitingResources;
+  dropStaleDecodeDebt();
 }
 
 void Scheduler::resumeFromResources(uint64_t id, uint32_t processed,
@@ -113,6 +114,7 @@ void Scheduler::cancel(uint64_t id) {
   Request &request = get(id);
   if (!terminal(request.phase))
     request.phase = Phase::Cancelled;
+  dropStaleDecodeDebt();
 }
 
 void Scheduler::fail(uint64_t id) {
@@ -120,6 +122,7 @@ void Scheduler::fail(uint64_t id) {
   if (terminal(request.phase))
     return;
   request.phase = Phase::Failed;
+  dropStaleDecodeDebt();
 }
 
 void Scheduler::remove(uint64_t id) {
@@ -161,6 +164,8 @@ bool Scheduler::expireDeadlines(double now) {
       changed = true;
     }
   }
+  if (changed)
+    dropStaleDecodeDebt();
   return changed;
 }
 
@@ -235,8 +240,11 @@ std::optional<BatchPlan> Scheduler::next() const {
   }
 
   // Prefill and fixed-eight decode use different Metal graphs and cannot be
-  // packed into one command. Honor request priority first, then alternate at
-  // command boundaries so equal-priority work cannot starve.
+  // packed into one command. Honor request priority first. Then decode runs
+  // while prefill owes it time, and otherwise the kinds alternate at command
+  // boundaries so equal-priority work cannot starve.
+  if (decodeDebtMilliseconds_ > 0.0)
+    return decode;
   return lastCommittedKind_ == WorkKind::Decode ? std::move(prefill)
                                                  : std::move(decode);
 }
@@ -475,7 +483,39 @@ void Scheduler::complete(const BatchPlan &plan,
       rows += item.tokenCount;
     observePrefill(rows, wallMilliseconds);
   }
+  // While requests of the same or a higher priority decode, lanes this
+  // prefill finished included, it owes decode a share of its time; decode
+  // commands work the debt off with their own.
+  if (std::isfinite(wallMilliseconds) && wallMilliseconds > 0.0) {
+    if (plan.kind == WorkKind::Decode) {
+      decodeDebtMilliseconds_ =
+          std::max(0.0, decodeDebtMilliseconds_ - wallMilliseconds);
+    } else if (decodeShare_ > 0.0) {
+      const RequestPriority priority =
+          get(plan.items.front().requestId).spec.priority;
+      const bool contended = std::any_of(
+          requests_.begin(), requests_.end(), [&](const auto &entry) {
+            const Request &peer = entry.second;
+            return (peer.phase == Phase::Decode ||
+                    peer.phase == Phase::WaitingMask) &&
+                   peer.spec.priority <= priority;
+          });
+      if (contended)
+        decodeDebtMilliseconds_ += decodeShare_ * wallMilliseconds;
+    }
+  }
+  dropStaleDecodeDebt();
   active_.reset();
+}
+
+void Scheduler::dropStaleDecodeDebt() noexcept {
+  const bool decoding = std::any_of(
+      requests_.begin(), requests_.end(), [](const auto &entry) {
+        return entry.second.phase == Phase::Decode ||
+               entry.second.phase == Phase::WaitingMask;
+      });
+  if (!decoding)
+    decodeDebtMilliseconds_ = 0.0;
 }
 
 void Scheduler::observePrefill(uint32_t rows, double wallMilliseconds) {

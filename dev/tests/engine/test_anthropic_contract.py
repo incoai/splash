@@ -161,6 +161,17 @@ class AnthropicAdapterTest(unittest.TestCase):
         self.assertEqual(translated["response_format"]["json_schema"]["schema"], SCHEMA)
         self.assertEqual(translated["tools"][0]["function"]["name"], "lookup")
 
+    def test_a_strict_tool_stays_strict(self):
+        body = request_body(
+            tools=[
+                {"name": "lookup", "input_schema": {"type": "object"}, "strict": True}
+            ],
+        )
+        translated = anthropic_to_chat_prompt(
+            body, thinking_resolver=no_signed_thinking
+        )
+        self.assertIs(translated["tools"][0]["function"]["strict"], True)
+
     def test_format_shape_validation_is_independent_of_thinking(self):
         invalid = [
             {"output_config": value} for value in (None, [], "json_schema", False)

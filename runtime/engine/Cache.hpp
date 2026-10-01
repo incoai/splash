@@ -213,8 +213,10 @@ public:
   // and costs the next request a replay of its whole prompt, because a
   // hybrid model cannot resume from cached KV without the recurrent state.
   // Empty backing, older publications and state-free KV are still reclaimed.
+  // keepRunway leaves one empty extent resident, for the next request.
   [[nodiscard]] uint64_t reclaimCache(uint64_t targetBytes, bool evictAll,
-                                      bool keepResumePoint = false);
+                                      bool keepResumePoint = false,
+                                      bool keepRunway = false);
   // reclaimCache's stop rule: releasedBytes and the pages whose copies are
   // being written meet targetBytes. A pass with evictAll has no target.
   [[nodiscard]] bool reclaimMet(uint64_t releasedBytes, uint64_t targetBytes,
@@ -227,7 +229,7 @@ public:
   // page reusable without immediately emptying its extent.
   [[nodiscard]] CacheReclaimResult reclaimOne(
       CacheReclaimMode mode = CacheReclaimMode::ReleaseBacking,
-      bool keepResumePoint = false);
+      bool keepResumePoint = false, bool keepRunway = false);
   // Recycles exactly one unpinned state, preferring checkpoints, for a
   // required state publication; the disk tier keeps it when it admits it.
   [[nodiscard]] bool reclaimOneState(bool checkpointsOnly = false);
@@ -334,7 +336,7 @@ private:
   [[nodiscard]] bool freeDiskSpace();
   void startRestore(uint64_t block);
   [[nodiscard]] uint64_t pendingBytes() const noexcept;
-  [[nodiscard]] uint64_t reclaimEmptyExtents();
+  [[nodiscard]] uint64_t reclaimEmptyExtents(bool keepRunway);
 
   KvPool &pool_;
   model::KvTier *tier_;

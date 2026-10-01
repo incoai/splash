@@ -54,7 +54,9 @@ def remaining_request_time(deadline):
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise APIError(504, "request timed out", "request_timeout")
-    return remaining
+    # Callers wait this long, and waits reject a timeout above TIMEOUT_MAX;
+    # a request without a deadline has infinite time left.
+    return min(remaining, threading.TIMEOUT_MAX)
 
 
 @dataclass(frozen=True)
@@ -124,6 +126,9 @@ class Job:
     # when unknown.
     generation_prompt_tokens: int = 0
     flags: wire.RequestFlag = wire.RequestFlag(0)
+    # The request asked for more output than the context leaves, and
+    # max_new_tokens was lowered to what it leaves.
+    output_clamped_to_context: bool = False
     # Endpoint-specific metadata carried to the response builder.
     meta: dict | None = None
     latency: RequestLatency | None = None
@@ -213,7 +218,10 @@ class CallbackStreamer:
         handled = "".join(self.emitted) + self.pending_text
         if not decoded.startswith(handled):
             raise RuntimeError("incremental tokenizer output diverged")
-        self._emit(decoded[len(handled) :])
+        # Bytes of a multi-byte character the output ends inside decode to
+        # U+FFFD; DecodeStream held them back for the rest. Drop the trailing
+        # U+FFFD, as vLLM's detokenizer does; one that text follows stays.
+        self._emit(decoded[len(handled) :].rstrip("\ufffd"))
         if self.stop_sequence is None:
             self._send(self.pending_text)
             self.pending_text = ""
@@ -443,7 +451,10 @@ class NativeBackend:
 
     @staticmethod
     def _deadline(job):
-        remaining = remaining_request_time(job.deadline)
+        remaining_request_time(job.deadline)
+        # Uncapped, unlike a wait's timeout: a request without a deadline
+        # gets the wire's maximum.
+        remaining = job.deadline - time.monotonic()
         wall_micros = time.time_ns() // 1000
         maximum_remaining = MAX_PROTOCOL_U64 - wall_micros
         if remaining >= maximum_remaining / 1_000_000:
@@ -726,6 +737,16 @@ class NativeBackend:
                 queued = latency.get("queue_to_start_ms")
                 if queued is not None:
                     job.latency.metrics.observe("native_queue", queued / 1000.0)
+        except engine_runtime.EngineUnhealthy:
+            # An admitted request ends with EngineUnhealthy only when the
+            # engine running it fails, and the backend restarts that engine.
+            # The console names the failure; a client can only retry.
+            error = APIError(
+                503,
+                "the inference engine stopped unexpectedly and is restarting; "
+                "retry the request",
+                "runtime_unavailable",
+            )
         except Exception as unexpected:
             error = self._api_error(unexpected)
         finally:

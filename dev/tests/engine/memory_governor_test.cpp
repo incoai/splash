@@ -246,7 +246,7 @@ void testHostRefusalStartsReclaim() {
   require(refused.pressure == MemoryPressure::Warning &&
               !refused.hostGrowthAllowed && directive.reclaimEmptyKvExtents &&
               !directive.evictAllUnpinnedPrefixes &&
-              !directive.keepResumePoint &&
+              !directive.keepResumePoint && directive.keepServingFootprint &&
               directive.targetBytes == kGiB - 200 * kMiB,
           "a request-sized host refusal did not start the paced reclaim");
   // The reclaim reaches the recovery margin, and the request fits.
@@ -279,6 +279,8 @@ void testPolicyContinuesHeldBackTarget() {
   require(pass(2000.0, none) == 100 && pass(2100.0, none) == 0,
           "a measurement did not replace the held-back target");
   pressure.pressure = MemoryPressure::Critical;
+  require(!policy.update(pressure, 2150.0, true).keepServingFootprint,
+          "critical pressure kept the serving footprint");
   static_cast<void>(pass(2200.0, {0, ReclaimOutcome::Pending}));
   pressure.pressure = MemoryPressure::Warning;
   require(pass(2300.0, none) == 0, "evicting everything was continued after critical pressure");

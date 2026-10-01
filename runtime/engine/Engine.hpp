@@ -26,6 +26,11 @@ struct EngineConfig final {
   // Patches per image the model's vision scratch covers; zero rejects images.
   uint32_t maxImagePatches = ops::kMaximumImagePatches;
   double resourceWaitTimeoutMilliseconds = 30000.0;
+  // Decode time owed for each unit of time a prefill runs while requests of
+  // equal or higher priority decode. At 0.5 a stream keeps about a third of
+  // its solo rate through a long prefill, which meanwhile takes 1.5x as long;
+  // zero alternates one command of each kind.
+  double decodeShare = 0.5;
   // Host growth admission, supplied by the runtime governor. Queried only on
   // failed allocation and, after a suspension the pause caused, while
   // resident lanes drain; never on the ordinary decode path.

@@ -5,6 +5,7 @@ import gc
 import http.client
 import io
 import json
+import math
 import socket
 import threading
 import time
@@ -299,7 +300,7 @@ class HttpBodyBudgetTests(unittest.TestCase):
             self.wait_bytes(harness, 0)
         with mock.patch.object(harness.backend, "submit", return_value=False):
             self.assertEqual(
-                harness.request("POST", "/v1/chat/completions", body)[0], 429
+                harness.request("POST", "/v1/chat/completions", body)[0], 503
             )
         self.wait_bytes(harness, 0)
 
@@ -454,6 +455,7 @@ class HttpBodyBudgetTests(unittest.TestCase):
             (1024, 1800, 30 + 1 / 512),
             (128 * 1024**2, 1800, 286),
             (256 * 1024**2, 1800, 542),
+            (256 * 1024**2, math.inf, 542),
             (128 * 1024**2, 5, 5),
         ):
             with self.subTest(length=length, request_seconds=request_seconds):

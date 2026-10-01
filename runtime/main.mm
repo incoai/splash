@@ -16,6 +16,7 @@
 #include <charconv>
 #include <csignal>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <limits.h>
@@ -52,6 +53,7 @@ struct NativeArguments final {
   uint64_t maxMemoryBytes = 0;
   uint64_t maxCacheDiskBytes = 0;
   kv::Format kvFormat = kv::Format::Int8;
+  double decodeShare = engine::EngineConfig{}.decodeShare;
 };
 
 // One observer spans bootstrap and serving. The dispatch queue only records
@@ -123,7 +125,7 @@ void printUsage(std::string_view executable) {
       "usage: " + std::string(executable) +
       " serve-native TARGET_DIRECTORY DRAFT_DIRECTORY"
       " MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto [MAX_CACHE_DISK_BYTES]"
-      " [--kv-format int8|bf16]");
+      " [--kv-format int8|bf16] [--decode-share SHARE]");
 }
 
 template <typename T>
@@ -152,6 +154,16 @@ uint32_t parseMaxContext(std::string_view value,
     throw UsageError("MAX_CONTEXT must be auto or an integer in [1, " +
                      std::to_string(capabilities.maximumContextTokens) + "]");
   }
+  return result;
+}
+
+double parseDecodeShare(std::string_view value) {
+  double result = 0.0;
+  const char *end = value.data() + value.size();
+  auto parsed = std::from_chars(value.data(), end, result);
+  if (parsed.ec != std::errc{} || parsed.ptr != end || !std::isfinite(result) ||
+      result < 0.0)
+    throw UsageError("--decode-share requires a nonnegative number");
   return result;
 }
 
@@ -187,18 +199,24 @@ NativeArguments parseArguments(int argc, char **argv) {
   }
   NativeArguments result;
   int next = 6;
-  if (next < argc && std::string_view(argv[next]) != "--kv-format") {
+  if (next < argc && !std::string_view(argv[next]).starts_with("--")) {
     const std::string_view quota(argv[next++]);
     if (quota != "0" && !parsePositive(quota, result.maxCacheDiskBytes))
       throw UsageError("MAX_CACHE_DISK_BYTES must be a nonnegative integer");
   }
-  if (next < argc) {
-    if (argc - next != 2 || std::string_view(argv[next]) != "--kv-format")
-      throw UsageError("expected --kv-format int8 or bf16");
-    const std::string_view format(argv[next + 1]);
-    if (format != "int8" && format != "bf16")
-      throw UsageError("--kv-format requires int8 or bf16");
-    result.kvFormat = format == "int8" ? kv::Format::Int8 : kv::Format::BFloat16;
+  // Options follow as --name value pairs; a missing value fails its check.
+  for (; next < argc; next += 2) {
+    const std::string_view option(argv[next]);
+    const std::string_view value(next + 1 < argc ? argv[next + 1] : "");
+    if (option == "--kv-format") {
+      if (value != "int8" && value != "bf16")
+        throw UsageError("--kv-format requires int8 or bf16");
+      result.kvFormat = value == "int8" ? kv::Format::Int8 : kv::Format::BFloat16;
+    } else if (option == "--decode-share") {
+      result.decodeShare = parseDecodeShare(value);
+    } else {
+      throw UsageError("unexpected argument " + std::string(option));
+    }
   }
   result.modelRoot = requireModelRoot(argv[2], argv[3]);
   result.model = model::inspectModelPackage(result.modelRoot);
@@ -248,6 +266,7 @@ bootstrapConfig(const NativeArguments &arguments) {
   config.resources.maximumCacheDiskBytes = arguments.maxCacheDiskBytes;
   config.resources.kvFormat = arguments.kvFormat;
   config.nativeLoop.engine.maxContext = arguments.maxContext;
+  config.nativeLoop.engine.decodeShare = arguments.decodeShare;
   config.nativeLoop.engineInstanceId = engineInstanceId();
   config.nativeLoop.maskWordsPerToken = maskWordsPerToken;
   config.protocolLimits.maxTokenBatch =

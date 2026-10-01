@@ -343,10 +343,13 @@ MemoryReclaimDirective MemoryPressurePolicy::update(
     return {};
   }
   if (snapshot.pressure == MemoryPressure::Critical) {
-    return {true, true, std::numeric_limits<uint64_t>::max()};
+    return {.reclaimEmptyKvExtents = true,
+            .evictAllUnpinnedPrefixes = true,
+            .targetBytes = std::numeric_limits<uint64_t>::max()};
   }
   if (nowMilliseconds < nextReclaimMilliseconds_)
-    return continued_.value_or(MemoryReclaimDirective{true, false, 0});
+    return continued_.value_or(MemoryReclaimDirective{
+        .reclaimEmptyKvExtents = true, .keepServingFootprint = true});
   // The host samples every 500 ms. Allow counters to settle between batches,
   // but keep responding if another application continues consuming memory.
   nextReclaimMilliseconds_ = nowMilliseconds + 1000.0;
@@ -356,7 +359,7 @@ MemoryReclaimDirective MemoryPressurePolicy::update(
   // cache must be discarded. Empty backing can still be returned.
   if (!snapshot.hostMeasurementValid &&
       snapshot.systemPressure == MemoryPressure::Normal)
-    return {true, false, 0};
+    return {.reclaimEmptyKvExtents = true, .keepServingFootprint = true};
 
   uint64_t desired = snapshot.hostHeadroomBytes < kHostRecoveryMarginBytes
       ? kHostRecoveryMarginBytes - snapshot.hostHeadroomBytes
@@ -364,8 +367,10 @@ MemoryReclaimDirective MemoryPressurePolicy::update(
   // Recovering the last stretch to the watermark is worth far less than the
   // resume point it would otherwise discard, so a pass with nothing waiting
   // keeps that publication and takes the rest. A waiting request outranks it.
-  return {true, false, std::min(desired, kHostWarningMarginBytes),
-          !requestWaiting};
+  return {.reclaimEmptyKvExtents = true,
+          .targetBytes = std::min(desired, kHostWarningMarginBytes),
+          .keepResumePoint = !requestWaiting,
+          .keepServingFootprint = true};
 }
 
 void MemoryPressurePolicy::reclaimed(const MemoryReclaimDirective &directive,

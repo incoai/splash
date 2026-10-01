@@ -84,7 +84,7 @@ class LauncherTests(unittest.TestCase):
 
     def test_request_timeout_reaches_the_server(self):
         base = ["serve", "--model", MODEL_ID]
-        # Unset stays unset: the server's own default (1800) remains authoritative.
+        # Unset stays unset: the server's own default (none) remains authoritative.
         self.assertIsNone(launcher.parse_args(base).request_timeout)
         self.assertEqual(
             launcher.parse_args(base + ["--request-timeout", "3600"]).request_timeout,
@@ -110,6 +110,17 @@ class LauncherTests(unittest.TestCase):
             ):
                 launcher.main(base + ["--request-timeout", "3600"])
             execute.assert_called_once()
+
+    def test_queue_size_is_optional_and_positive(self):
+        base = ["serve", "--model", MODEL_ID]
+        # Unset stays unset: the server's own default (32) remains authoritative.
+        self.assertIsNone(launcher.parse_args(base).queue_size)
+        self.assertEqual(
+            launcher.parse_args(base + ["--queue-size", "64"]).queue_size, 64
+        )
+        for value in ("0", "-1", "1.5", "many"):
+            with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
+                launcher.parse_args(base + ["--queue-size", value])
 
     def test_serve_requires_exact_repository_id_before_build(self):
         for arguments in (
@@ -178,6 +189,23 @@ class LauncherTests(unittest.TestCase):
             ):
                 launcher.parse_args([*required, "--max-cache-disk", invalid])
             self.assertIn("use 0 to disable, or a size such as 5G", error.getvalue())
+
+    def test_decode_share(self):
+        required = ["serve", "--model", MODEL_ID]
+        # Unset stays unset: the engine's own default remains authoritative.
+        self.assertIsNone(launcher.parse_args(required).decode_share)
+        for value, share in (("0", 0.0), ("0.25", 0.25), ("2", 2.0)):
+            self.assertEqual(
+                launcher.parse_args([*required, "--decode-share", value]).decode_share,
+                share,
+            )
+        for invalid in ("-0.5", "inf", "nan", "half"):
+            with (
+                self.subTest(invalid=invalid),
+                mock.patch("sys.stderr", io.StringIO()),
+                self.assertRaises(SystemExit),
+            ):
+                launcher.parse_args([*required, "--decode-share", invalid])
 
     def test_image_budget_fails_before_installation(self):
         for value in ("-1", "0", "65535", "4194305", "invalid"):
@@ -306,6 +334,8 @@ class LauncherTests(unittest.TestCase):
                 self.assertEqual(
                     argv[argv.index("--max-cache-disk") + 1], str(5 * 1024**3)
                 )
+                self.assertEqual(argv[argv.index("--queue-size") + 1], "64")
+                self.assertEqual(argv[argv.index("--decode-share") + 1], "0.25")
                 self.assertEqual(
                     argv[-4:],
                     ["--allowed-host", "splash.local", "--allowed-host", "proxy.local"],
@@ -353,6 +383,10 @@ class LauncherTests(unittest.TestCase):
                         "28G",
                         "--max-cache-disk",
                         "5G",
+                        "--decode-share",
+                        "0.25",
+                        "--queue-size",
+                        "64",
                         "--allowed-host",
                         "splash.local",
                         "--allowed-host",

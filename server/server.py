@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import math
 import os
 import queue
 import re
@@ -120,6 +121,8 @@ HTTP_UPLOAD_BYTES_PER_SECOND = 512 * 1024
 # Native events wake a waiting request at once; this only bounds how late a
 # client disconnect is noticed.
 CLIENT_DISCONNECT_POLL = 0.1
+# How long a connection refused unread may take its client to close.
+REFUSED_LINGER_SECONDS = 2.0
 SSE_KEEPALIVE_SECONDS = 2.0
 NATIVE_START_TIMEOUT = 600.0
 ROOT = Path(__file__).parents[1]
@@ -177,6 +180,14 @@ def _normalize_path(raw_path):
     if trailing and normalized != "/":
         normalized += "/"
     return normalized
+
+
+def _queue_full():
+    """The answer when the native pending limit refuses a submission. That
+    limit is --queue-size, the HTTP request gate's capacity, so only a race
+    with the gate reaches it, as when a cancelled request still holds its
+    native slot: an overload like the gate's own, retried the same way."""
+    return APIError(503, "request queue is full", "frontend_overloaded")
 
 
 class FrontendHandler(BaseHTTPRequestHandler):
@@ -273,6 +284,20 @@ class FrontendHandler(BaseHTTPRequestHandler):
             )
             return False
         return True
+
+    def send_error(self, code, message=None, explain=None):
+        # The stdlib's send_error, which answers requests it cannot parse or
+        # route and parse_request's 505, writes an HTML page. After a request
+        # line it cannot parse, or HTTP/0.9's, request_version is HTTP/0.9,
+        # and it writes that page with no status line or headers. Answer as
+        # any other error, over HTTP/1.1.
+        self.request_version = self.protocol_version
+        path = getattr(self, "path", "").partition("?")[0]
+        self._safe_error(
+            APIError(code, message or self.responses[code][0]),
+            path.startswith("/v1/messages"),
+            log=False,
+        )
 
     @property
     def app(self):
@@ -608,7 +633,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 if self._client_disconnected():
                     raise ConnectionResetError("client disconnected before submission")
                 if not self.app.backend.submit(job):
-                    raise APIError(429, "request queue is full", "rate_limit_exceeded")
+                    raise _queue_full()
                 submitted = True
                 self._judgment_complete(job, row)
                 return
@@ -632,6 +657,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                         body, thinking_resolver=self.app.thinking_codec.decode
                     ),
                     deadline=deadline,
+                    output_field="max_tokens",
                     clamp_output_budget=True,
                 )
                 stream_options = None
@@ -669,7 +695,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             if self._client_disconnected():
                 raise ConnectionResetError("client disconnected before submission")
             if not self.app.backend.submit(job):
-                raise APIError(429, "request queue is full", "rate_limit_exceeded")
+                raise _queue_full()
             submitted = True
             if anthropic and stream:
                 self._anthropic_stream(job, thinking, has_tools)
@@ -769,7 +795,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 # queue bound and lets later questions reuse the state prefix.
                 active_job = job
                 if not self.app.backend.submit(job):
-                    raise APIError(429, "request queue is full", "rate_limit_exceeded")
+                    raise _queue_full()
                 result = None
                 while result is None:
                     kind, value = self._next_event(job)
@@ -1159,7 +1185,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 "message_delta",
                 {
                     "delta": {
-                        "stop_reason": anthropic_stop(result, tool_calls),
+                        "stop_reason": anthropic_stop(
+                            result, tool_calls, job.output_clamped_to_context
+                        ),
                         "stop_sequence": result.stop_sequence,
                     },
                     "usage": {"output_tokens": result.completion_tokens},
@@ -1780,17 +1808,115 @@ def _refuse_connection(connection):
         pass
 
 
+def _has_input(connection):
+    """Whether `connection` holds input its thread has yet to read, such as
+    a request that arrived before its thread ran."""
+    # A poll object holds no descriptor.
+    poller = select.poll()
+    poller.register(connection, select.POLLIN)
+    return bool(poller.poll(0))
+
+
+class LingeringCloser:
+    """Closes connections answered without reading their requests.
+
+    Closing a connection with request bytes unread resets it, and the reset
+    can destroy the answer before the client reads it. Each connection given
+    here is half-closed instead; one thread reads and drops what its client
+    still sends, and closes it once the client has closed or `linger`
+    seconds after its answer. At most `capacity` wait at once; any beyond
+    them are closed at once.
+    """
+
+    # How soon the thread first reads a connection that arrives while it
+    # waits on others.
+    TICK = 0.05
+
+    def __init__(self, capacity, linger):
+        self.capacity = capacity
+        self.linger = linger
+        self.changed = threading.Condition()
+        self.arrivals = []
+        self.held = 0
+        self.stopped = False
+        self.thread = threading.Thread(
+            target=self._run, name="lingering close", daemon=True
+        )
+        self.thread.start()
+
+    def close(self, connection):
+        try:
+            connection.shutdown(socket.SHUT_WR)
+            connection.setblocking(False)
+        except OSError:
+            connection.close()
+            return
+        with self.changed:
+            if self.stopped or self.held >= self.capacity:
+                connection.close()
+                return
+            self.held += 1
+            self.arrivals.append((connection, time.monotonic() + self.linger))
+            self.changed.notify()
+
+    def stop(self):
+        """Close every waiting connection and end the thread."""
+        with self.changed:
+            self.stopped = True
+            self.changed.notify()
+        self.thread.join()
+
+    def _run(self):
+        # A poll object holds no descriptor.
+        poller = select.poll()
+        waiting = {}
+        while True:
+            with self.changed:
+                while not (waiting or self.arrivals or self.stopped):
+                    self.changed.wait()
+                arrivals, self.arrivals = self.arrivals, []
+                stopped = self.stopped
+            for connection, deadline in arrivals:
+                poller.register(connection, select.POLLIN)
+                waiting[connection.fileno()] = connection, deadline
+            if not stopped:
+                for descriptor, _ in poller.poll(self.TICK * 1000):
+                    connection, _ = waiting[descriptor]
+                    try:
+                        if connection.recv(65536):
+                            continue
+                    except BlockingIOError:
+                        continue
+                    except OSError:
+                        pass
+                    waiting[descriptor] = connection, 0.0
+            now = time.monotonic()
+            done = [
+                descriptor
+                for descriptor, (_, deadline) in waiting.items()
+                if stopped or deadline <= now
+            ]
+            for descriptor in done:
+                poller.unregister(descriptor)
+                waiting.pop(descriptor)[0].close()
+            with self.changed:
+                self.held -= len(done)
+            if stopped:
+                return
+
+
 class ConnectionSlots:
     """The connections the server gives a thread, at most `capacity`.
 
-    One that waits on its client, for its request or to drain an upload
-    refused unread, gives its slot to a new connection when no slot is
-    free, the longest waiting first, so stalled connections, however many
-    and from however many addresses, cannot keep others out; only
-    connections with a request in progress can fill every slot. One that
-    gives way still awaiting its request gets the 503 of a connection
-    refused at the accept: in a burst, its request may only be waiting for
-    its thread. One draining a refused upload already has its response.
+    One that waits for its request with nothing yet to read, or drains an
+    upload refused unread, gives its slot to a new connection when no slot
+    is free, the longest waiting first, so stalled connections, however
+    many and from however many addresses, cannot keep others out. One whose
+    request has arrived keeps its slot, although its thread may not have
+    run yet: when every slot has a request, arrived or in progress, the new
+    connection is refused. One that gives way still awaiting its request
+    gets the 503 of a connection refused at the accept, as its request may
+    be on its way. One draining a refused upload already has its response.
     """
 
     # What a connection with a slot is doing.
@@ -1809,14 +1935,15 @@ class ConnectionSlots:
 
     def admit(self, connection):
         """Give `connection` a slot, awaiting its request; False when every
-        slot has a request in progress."""
+        slot has a request, arrived or in progress."""
         with self.lock:
             if len(self.holders) >= self.capacity:
                 waiting = next(
                     (
                         held
                         for held, state in self.holders.items()
-                        if state != self.SERVING
+                        if state == self.DRAINING
+                        or (state == self.AWAITING_REQUEST and not _has_input(held))
                     ),
                     None,
                 )
@@ -1927,10 +2054,17 @@ class RequestBodyReservation:
 class FrontendServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    # Connections the kernel holds until the accept loop takes them. A burst
+    # beyond this queue is reset by the kernel, unseen by the server, so ask
+    # for as many as uvicorn does; the kernel caps it (128 on macOS).
+    # Queued connections take no thread or descriptor.
+    request_queue_size = 2048
     # Keep control/catalog capacity separate from generation capacity.
     # Neither gate allocates workers in advance.
-    request_queue_size = 64
     control_connection_capacity = 64
+    # Connections refused at the accept that wait at once, on one thread,
+    # for their clients to close.
+    refused_connection_capacity = 64
 
     def __init__(
         self,
@@ -1971,6 +2105,9 @@ class FrontendServer(ThreadingHTTPServer):
         self.connections = ConnectionSlots(
             request_capacity + self.control_connection_capacity
         )
+        self.refused = LingeringCloser(
+            self.refused_connection_capacity, REFUSED_LINGER_SECONDS
+        )
         super().__init__(address, FrontendHandler, bind_and_activate)
         self.app = app
 
@@ -1998,7 +2135,7 @@ class FrontendServer(ThreadingHTTPServer):
             # Do not create a thread or block the accept loop to reject an
             # excess socket.
             _refuse_connection(request)
-            self.shutdown_request(request)
+            self.refused.close(request)
             return
         super().process_request(request, client_address)
 
@@ -2008,6 +2145,7 @@ class FrontendServer(ThreadingHTTPServer):
 
     def server_close(self):
         super().server_close()
+        self.refused.stop()
         self.connections.idle.wait(min(2.0, self.io_timeout))
 
     def handle_error(self, request, client_address):
@@ -2146,9 +2284,15 @@ def parse_args(argv=None):
         type=_parse_max_cache_disk,
         default=0,
     )
+    parser.add_argument(
+        "--decode-share",
+        type=float,
+        default=None,
+        help="decode time owed per unit of prefill time while other requests "
+        "decode (default: 0.5; 0 alternates one command each)",
+    )
     parser.add_argument("--max-image-pixels", type=int, default=image_input.MAX_PIXELS)
-    parser.add_argument("--max-new-tokens", type=int, default=32768)
-    parser.add_argument("--request-timeout", type=float, default=1800)
+    parser.add_argument("--request-timeout", type=float, default=None)
     parser.add_argument("--queue-size", type=int, default=32)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--allowed-host", action="append", default=[])
@@ -2169,15 +2313,21 @@ def parse_args(argv=None):
             validate_api_key(args.api_key)
         except ValueError as error:
             parser.error(str(error))
-    if args.max_new_tokens <= 0:
-        parser.error("--max-new-tokens must be positive")
     if not image_input.MIN_PIXELS <= args.max_image_pixels <= image_input.MAX_PIXELS:
         parser.error(
             "--max-image-pixels must be in "
             f"[{image_input.MIN_PIXELS}, {image_input.MAX_PIXELS}]"
         )
-    if not is_finite_number(args.request_timeout) or args.request_timeout <= 0:
+    if args.request_timeout is None:
+        # No deadline unless given, as in vLLM and SGLang; a request still
+        # ends when its client disconnects.
+        args.request_timeout = math.inf
+    elif not is_finite_number(args.request_timeout) or args.request_timeout <= 0:
         parser.error("--request-timeout must be positive and finite")
+    if args.decode_share is not None and (
+        not is_finite_number(args.decode_share) or args.decode_share < 0
+    ):
+        parser.error("--decode-share must be nonnegative and finite")
     if args.queue_size <= 0:
         parser.error("--queue-size must be positive")
     if not 0 <= args.port <= 65535:
@@ -2198,6 +2348,8 @@ def _native_command(args):
         command.append(str(args.max_cache_disk))
     if args.kv_format != "int8":
         command.extend(("--kv-format", args.kv_format))
+    if args.decode_share is not None:
+        command.extend(("--decode-share", str(args.decode_share)))
     return command
 
 
@@ -2273,7 +2425,6 @@ def main():
             backend,
             args.model,
             effective_context,
-            args.max_new_tokens,
             args.request_timeout,
             readiness.max_concurrent_requests,
             constraint_factory=constraint_factory,

@@ -8,7 +8,7 @@ import threading
 import time
 from collections import OrderedDict
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import count
 from pathlib import Path
 
@@ -27,6 +27,7 @@ if __package__:
     from .chat_templates import (
         LATER_SYSTEM_UNSUPPORTED,
         REASONING_EFFORTS,
+        RESERVED_TEMPLATE_KWARGS,
         render_chat_template,
         template_options,
     )
@@ -37,7 +38,10 @@ if __package__:
     from .tokenization import PromptTokenizer
     from .tool_schema import (
         THINK_END,
+        THINK_END_TOKEN_ID,
+        TOOL_CALL_OPEN,
         ToolPolicy,
+        function_opening,
         json_grammar,
         normalize_response_format,
         normalize_tools,
@@ -59,6 +63,7 @@ else:
     from chat_templates import (
         LATER_SYSTEM_UNSUPPORTED,
         REASONING_EFFORTS,
+        RESERVED_TEMPLATE_KWARGS,
         render_chat_template,
         template_options,
     )
@@ -69,7 +74,10 @@ else:
     from tokenization import PromptTokenizer
     from tool_schema import (
         THINK_END,
+        THINK_END_TOKEN_ID,
+        TOOL_CALL_OPEN,
         ToolPolicy,
+        function_opening,
         json_grammar,
         normalize_response_format,
         normalize_tools,
@@ -203,6 +211,8 @@ class Prompt:
     response_schema: dict | bool | None = None
     response_validator: object = None
     preserve_thinking: bool | None = None
+    # Template variables from the request, which outrank Splash's own.
+    template_kwargs: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -247,7 +257,6 @@ class Frontend:
         backend,
         model,
         max_context,
-        default_max_new,
         request_timeout,
         preparation_capacity,
         *,
@@ -287,7 +296,6 @@ class Frontend:
             raise ValueError("invalid default_reasoning_effort")
         self.default_reasoning_effort = default_reasoning_effort
         self.max_context = max_context
-        self.default_max_new = default_max_new
         self.request_timeout = request_timeout
         self.constraint_factory = constraint_factory
         self.max_image_pixels = max_image_pixels
@@ -467,17 +475,33 @@ class Frontend:
         timeout = body.get("timeout")
         if timeout is None:
             timeout = self.request_timeout
-        if not is_finite_number(timeout) or timeout <= 0:
+        elif not is_finite_number(timeout) or timeout <= 0:
             raise APIError(400, "timeout must be positive")
         return started_at + min(timeout, self.request_timeout)
 
     def prepare(
-        self, body, tool_namespaces=None, *, deadline=None, clamp_output_budget=False
+        self,
+        body,
+        tool_namespaces=None,
+        *,
+        deadline=None,
+        output_field=None,
+        clamp_output_budget=False,
     ):
+        """A Chat request, or another API's request converted to Chat.
+        Output limit errors name output_field, that API's own field; with
+        clamp_output_budget, a limit larger than what the context leaves is
+        lowered to it instead of refused."""
         if deadline is None:
             deadline = self.request_deadline(body)
         with self._preparation(deadline):
-            return self._prepare(body, tool_namespaces, deadline, clamp_output_budget)
+            return self._prepare(
+                body,
+                tool_namespaces,
+                deadline,
+                output_field=output_field,
+                clamp_output_budget=clamp_output_budget,
+            )
 
     def prepare_completion(self, body, *, deadline=None):
         """A text completion: the prompt generates as given, with no chat
@@ -494,6 +518,7 @@ class Frontend:
                 "best_of",
                 "presence_penalty",
                 "frequency_penalty",
+                "repetition_penalty",
                 "max_tokens",
                 "suffix",
                 "echo",
@@ -816,6 +841,13 @@ class Frontend:
         preserve_thinking = body.get("preserve_thinking")
         if preserve_thinking is not None and not isinstance(preserve_thinking, bool):
             raise APIError(400, "preserve_thinking must be a boolean")
+        template_kwargs = body.get("chat_template_kwargs")
+        if template_kwargs is None:
+            template_kwargs = {}
+        elif not isinstance(template_kwargs, dict):
+            raise APIError(400, "chat_template_kwargs must be an object")
+        elif reserved := sorted(RESERVED_TEMPLATE_KWARGS & template_kwargs.keys()):
+            raise APIError(400, f"chat_template_kwargs cannot set {reserved[0]}")
         messages = template_messages(
             normalize_messages(
                 body.get("messages"), vision=self.vision, deadline=deadline
@@ -838,6 +870,7 @@ class Frontend:
             response_schema,
             response_validator,
             preserve_thinking,
+            template_kwargs,
         )
 
     def _tokenize(self, text, **options):
@@ -864,6 +897,7 @@ class Frontend:
                 tools=prompt.tools,
                 add_generation_prompt=add_generation_prompt,
             ),
+            **prompt.template_kwargs,
         }
         with self.latencies.measure("images"):
             images = self._prepare_images(prompt.messages, check_context=check_context)
@@ -904,10 +938,11 @@ class Frontend:
             thinking, generation_prompt_tokens = _generation_prompt(
                 chat_template.generation_prompt(template), rendered, tokens
             )
+        requested = template.get("enable_thinking")
         if (
             add_generation_prompt
-            and prompt.reasoning_effort is not None
-            and thinking != (prompt.reasoning_effort != "none")
+            and requested is not None
+            and thinking != bool(requested)
         ):
             raise APIError(
                 400, "chat template does not support the requested thinking mode"
@@ -916,7 +951,15 @@ class Frontend:
             rendered, tokens, images, positions, thinking, generation_prompt_tokens
         )
 
-    def _prepare(self, body, tool_namespaces, deadline, clamp_output_budget=False):
+    def _prepare(
+        self,
+        body,
+        tool_namespaces,
+        deadline,
+        *,
+        output_field=None,
+        clamp_output_budget=False,
+    ):
         nullable = {
             "temperature",
             "top_p",
@@ -925,6 +968,7 @@ class Frontend:
             "n",
             "presence_penalty",
             "frequency_penalty",
+            "repetition_penalty",
             "max_tokens",
             "max_completion_tokens",
             "stream",
@@ -977,6 +1021,7 @@ class Frontend:
                     constraint = self.constraint_factory.create(
                         tool_grammar(tool_policy, thinking, response_schema),
                         timeout=remaining_request_time(deadline),
+                        prefixes=lambda: self._call_openings(tool_policy, thinking),
                     )
                 elif response_schema is not None:
                     constraint = self.constraint_factory.create(
@@ -996,11 +1041,16 @@ class Frontend:
                 prompt_tokens, prepared_images, image_positions
             )
         remaining_request_time(deadline)
+        requested = body.get("max_completion_tokens", body.get("max_tokens"))
+        if output_field is None:
+            # Chat takes either field; errors name the one the client sent.
+            output_field = (
+                "max_completion_tokens"
+                if "max_completion_tokens" in body
+                else "max_tokens"
+            )
         max_new = self._output_budget(
-            body.get("max_completion_tokens", body.get("max_tokens")),
-            prompt_tokens,
-            "max_completion_tokens",
-            clamp_output_budget,
+            requested, prompt_tokens, output_field, clamp_output_budget
         )
         job = self._generation_job(
             body,
@@ -1021,8 +1071,25 @@ class Frontend:
             image_owner=prepared_images if prepared_images else None,
             tools_signature=tools_signature,
             generation_prompt_tokens=rendered.generation_prompt_tokens,
+            output_clamped_to_context=requested is not None and max_new < requested,
         )
         return job, thinking, bool(tools)
+
+    def _call_openings(self, policy, thinking):
+        """The tokens that begin each callable tool's call. Its parameter
+        names are all possible next, so a tool with more of them than the
+        parser admits fails there."""
+        reasoning = [THINK_END_TOKEN_ID] if thinking else []
+        return [
+            (
+                reasoning
+                + self._tokenize(
+                    TOOL_CALL_OPEN + function_opening(name), add_special_tokens=False
+                )["input_ids"],
+                f"tool {name} has too many parameters to constrain",
+            )
+            for name in policy.schemas
+        ]
 
     def _generation_options(self, body):
         temperature = body.get("temperature", 1.0)
@@ -1053,13 +1120,16 @@ class Frontend:
             stop_sequences = tuple(stop)
         else:
             raise APIError(400, "stop must be a string or up to four strings")
+        # Each with the value that leaves the logits unchanged.
         penalties = (
-            body.get("presence_penalty", 0),
-            body.get("frequency_penalty", 0),
-            body.get("min_p", 0),
+            (body.get("presence_penalty", 0), 0),
+            (body.get("frequency_penalty", 0), 0),
+            (body.get("repetition_penalty", 1), 1),
+            (body.get("min_p", 0), 0),
         )
         if any(
-            not is_finite_number(value) or value != 0 for value in penalties
+            not is_finite_number(value) or value != neutral
+            for value, neutral in penalties
         ) or body.get("logit_bias") not in (None, {}):
             raise APIError(
                 400, "the requested logits or output transformation is not supported"
@@ -1070,21 +1140,21 @@ class Frontend:
         return GenerationOptions(temperature, top_p, top_k, stop_sequences, ignore_eos)
 
     def _output_budget(self, requested, prompt_tokens, field, clamp=False):
-        """The output token budget, requested under the API's field name or
-        the server default, within the context window the prompt leaves."""
+        """The output token budget requested under the API's field name,
+        within the context window the prompt leaves. A request that names
+        none may use all of that window, as in vLLM and SGLang."""
         if len(prompt_tokens) >= self.max_context:
             raise ContextLengthError(len(prompt_tokens), self.max_context - 1)
         remaining = self.max_context - len(prompt_tokens)
-        max_new = (
-            min(self.default_max_new, remaining) if requested is None else requested
-        )
+        max_new = remaining if requested is None else requested
         if not isinstance(max_new, int) or isinstance(max_new, bool) or max_new <= 0:
             raise APIError(400, f"{field} must be a positive integer")
         if max_new > remaining:
             if not clamp:
                 raise APIError(
                     400,
-                    f"prompt and {field} exceed the context window",
+                    f"prompt and {field} exceed the context window: "
+                    f"{len(prompt_tokens)} + {max_new} > {self.max_context} tokens",
                     "context_length_exceeded",
                 )
             # This API treats the output budget as a ceiling. Generate up to
@@ -1152,7 +1222,9 @@ class Frontend:
                 previous_items = json_codec.loads(previous.history_json)
             chat = responses_to_chat_body(body, previous_items)
             namespaces = chat.pop("_tool_namespaces")
-            job, thinking, has_tools = self._prepare(chat, namespaces, deadline)
+            job, thinking, has_tools = self._prepare(
+                chat, namespaces, deadline, output_field="max_output_tokens"
+            )
             job.response_store = store
             job.response_previous_id = previous_id
             if store:

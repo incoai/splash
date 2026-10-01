@@ -2392,15 +2392,17 @@ Runtime::snapshotToDisk(uint64_t requestId, std::function<void()> completion) {
   return impl_->states.snapshotToDisk(committedStateSlot(requestId), std::move(completion));
 }
 
-uint64_t Runtime::reclaimIdleState() noexcept {
+uint64_t Runtime::reclaimIdleState(bool keepLane) noexcept {
   // One idle buffer per call, so a denied allocation frees only what it
-  // needs; rebuildable caches go once the pool is empty.
+  // needs; rebuildable caches go once the pool has nothing more to give.
+  const uint32_t keptCells = keepLane ? QwenStateStorage::kLaneCells : 0;
+  const uint32_t keptRings = keepLane ? 1 : 0;
   const uint32_t cells = impl_->states.idleCells();
   const uint32_t rings = impl_->states.idleRings();
-  if (cells)
+  if (cells > keptCells)
     return impl_->states.releaseIdle(cells - 1, rings);
-  if (rings)
-    return impl_->states.releaseIdle(0, rings - 1);
+  if (rings > keptRings)
+    return impl_->states.releaseIdle(cells, rings - 1);
   uint64_t released = 0;
   released += impl_->dropEmbeddingCache();
   if (impl_->vision && impl_->visionIdle()) {

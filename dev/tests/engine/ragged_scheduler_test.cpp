@@ -484,6 +484,60 @@ void testPrefillAndDecodeAlternateWithoutStarvation() {
           "prefill did not yield the next command back to decode");
 }
 
+// Lane 1 decodes beside lane 2's long prompt: one decode command, then one
+// 500 ms prefill command.
+void runContendedPrefill(engine::Scheduler &scheduler) {
+  scheduler.submit(request(1, 1));
+  scheduler.submit(request(2, 20'000));
+  scheduler.resourcesReady(1, 1);
+  scheduler.resourcesReady(2, 0);
+  completeDecode(scheduler, false, 50.0);
+  const BatchPlan prefill = *scheduler.next();
+  require(prefill.kind == WorkKind::Prefill && prefill.items[0].requestId == 2,
+          "the long prompt did not follow the first decode command");
+  completePrefill(scheduler, prefill, 500.0);
+}
+
+void testDecodeRepaysItsShareOfContendedPrefill() {
+  for (const double share : {0.0, 0.5}) {
+    engine::Scheduler scheduler(share);
+    runContendedPrefill(scheduler);
+    // At 0.5 the prefill owes 250 ms, five 50 ms decode commands; with no
+    // share the kinds alternate one command each.
+    for (uint32_t step = 0; step < (share > 0.0 ? 5u : 1u); ++step)
+      completeDecode(scheduler, false, 50.0);
+    require(scheduler.next()->kind == WorkKind::Prefill,
+            "decode did not return the next command once its share was repaid");
+  }
+}
+
+void testDecodeDebtLeavesWithTheLastDecoder() {
+  for (const bool finished : {true, false}) {
+    engine::Scheduler scheduler(0.5);
+    runContendedPrefill(scheduler);
+    // Lane 1 leaves still owed 200 ms: its decode command finishes it, or it
+    // is cancelled between commands.
+    completeDecode(scheduler, finished, 50.0);
+    if (!finished)
+      scheduler.cancel(1);
+    scheduler.submit(request(3, 1));
+    scheduler.resourcesReady(3, 1);
+    require(scheduler.next()->kind == WorkKind::Prefill,
+            "a later decoder inherited debt owed to one that left");
+  }
+}
+
+void testHigherPriorityPrefillPrecedesDecodeDebt() {
+  engine::Scheduler scheduler(0.5);
+  runContendedPrefill(scheduler);
+  scheduler.submit(request(3, 20'000, BatchCohort::Greedy,
+                           RequestPriority::Foreground));
+  scheduler.resourcesReady(3, 0);
+  const BatchPlan plan = *scheduler.next();
+  require(plan.kind == WorkKind::Prefill && plan.items[0].requestId == 3,
+          "decode debt overrode a higher-priority prefill");
+}
+
 void testMeasuredBudgetOnlyLimitsContendedWork() {
   engine::Scheduler scheduler;
   scheduler.submit(request(1, 20'000));
@@ -945,6 +999,9 @@ int main() {
     testDecodeMixTelemetryIgnoresRejectedCommits();
     testConstrainedDecodeRemainsSeparate();
     testPrefillAndDecodeAlternateWithoutStarvation();
+    testDecodeRepaysItsShareOfContendedPrefill();
+    testDecodeDebtLeavesWithTheLastDecoder();
+    testHigherPriorityPrefillPrecedesDecodeDebt();
     testMeasuredBudgetOnlyLimitsContendedWork();
     testAuxiliaryWorkDoesNotTrainTextPrefillTiming();
     testMeasuredBudgetUsesActualRowsAndRecovers();

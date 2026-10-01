@@ -306,11 +306,14 @@ void allCandidates() {
                       selected.pipeline() == candidate.pipeline() &&
                       selected.threadsPerThreadgroup() == candidate.threadsPerThreadgroup(),
                   "linear candidate configuration/pipeline/scope not selected together");
+          // A four-SIMDgroup choice keeps the shipped plan's rows and sums and
+          // needs no more gate scratch: the one-lane Split32 gate/up tile
+          // needs none where the shipped plan runs Split128's gate pass.
           if (candidate.configuration().simdgroups == LinearSimdgroups::Four) {
             const auto original = shipped.linear().plan(w);
             require(selected.storageRows() == original.storageRows() &&
                         selected.sumsBytes() == original.sumsBytes() &&
-                        selected.gateScratchBytes() == original.gateScratchBytes() &&
+                        selected.gateScratchBytes() <= original.gateScratchBytes() &&
                         selected.downSumsBytes() == original.downSumsBytes() &&
                         plans.gateUpWorkspace(affineGateUp(matrix)) == shipped.gateUpWorkspace(affineGateUp(matrix)),
                     "four-SIMDgroup choice changed an external workspace requirement");

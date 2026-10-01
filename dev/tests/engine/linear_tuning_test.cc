@@ -461,9 +461,11 @@ int main(int argc, char **argv) {
                     deterministicQ4Projection(backend, {10240, 256}, 131)};
     for (uint32_t rows : {8U, 16U, 24U, 32U})
       gpuSweep(backend, gate, rows, LinearPhase::Decode, LinearEpilogue::GateUp);
-    // K % 1024 == 0 lists the split-K tiles beside the sequential ones (and
-    // selects one as the baseline on a GPU with two or more cores), so every
-    // qualification crosses the bitwise class and runs the derived bound.
+    // K % 1024 == 0 lists the split-K tiles beside the sequential ones, and on
+    // a GPU with two or more cores the baseline splits K too (Apple9's
+    // simdgroup tile, Apple10's Split128), so every qualification runs the
+    // derived bound, including a one-lane split tile's against a Split128
+    // baseline with as many partial sums.
     std::array split{deterministicQ4Projection(backend, {512, 1024}, 29),
                      deterministicQ4Projection(backend, {512, 1024}, 131)};
     bool mixedClasses = false;

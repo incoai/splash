@@ -118,6 +118,7 @@ std::string_view name(LinearTile tile) {
     ENUMERATOR_NAME(LinearTile::Paired128);
     ENUMERATOR_NAME(LinearTile::Split32);
     ENUMERATOR_NAME(LinearTile::Split64);
+    ENUMERATOR_NAME(LinearTile::Split128);
     ENUMERATOR_NAME(LinearTile::Paired256);
     ENUMERATOR_NAME(LinearTile::Simdgroup);
     ENUMERATOR_NAME(LinearTile::GgufStaged);

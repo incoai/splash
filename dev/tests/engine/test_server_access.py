@@ -183,6 +183,8 @@ class ServerAccessTests(unittest.TestCase):
             {"Authorization": "Bearer test-server-key"},
             {"Authorization": "bearer test-server-key"},
             {"x-api-key": "test-server-key"},
+            # Anthropic's SDK with both an API key and an auth token.
+            {"Authorization": "Bearer test-server-key", "x-api-key": "test-server-key"},
         ):
             self.assertEqual(
                 harness.request("GET", "/v1/models", headers=headers)[0], 200
@@ -190,11 +192,26 @@ class ServerAccessTests(unittest.TestCase):
         for headers in (
             {"Authorization": "Bearer incorrect"},
             {"Authorization": "Basic test-server-key"},
-            {"Authorization": "Bearer test-server-key", "x-api-key": "test-server-key"},
+            {"Authorization": "Bearer incorrect", "x-api-key": "test-server-key"},
+            {"Authorization": "Bearer test-server-key", "x-api-key": "incorrect"},
+            {"Authorization": "Basic test-server-key", "x-api-key": "test-server-key"},
         ):
             self.assertEqual(
                 harness.request("GET", "/v1/models", headers=headers)[0], 401
             )
+        for name, value in (
+            ("Authorization", "Bearer test-server-key"),
+            ("x-api-key", "test-server-key"),
+        ):
+            connection = http.client.HTTPConnection(*harness.server.server_address)
+            self.addCleanup(connection.close)
+            connection.putrequest("GET", "/v1/models")
+            connection.putheader(name, value)
+            connection.putheader(name, value)
+            connection.endheaders()
+            response = connection.getresponse()
+            response.read()
+            self.assertEqual(response.status, 401)
 
     def test_public_probes_and_optional_webui(self):
         harness = self.harness(api_key="test-server-key", webui=False)

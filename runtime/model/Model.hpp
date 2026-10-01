@@ -516,8 +516,8 @@ public:
   // Releases one unit of idle model state (an unused buffer, then caches
   // that can be rebuilt) and returns its bytes; zero when nothing is idle.
   // A denied allocation retries between calls, so it frees only what it
-  // needs.
-  [[nodiscard]] virtual uint64_t reclaimIdleState() noexcept = 0;
+  // needs. keepLane keeps the pooled buffers one lane starts from.
+  [[nodiscard]] virtual uint64_t reclaimIdleState(bool keepLane) noexcept = 0;
   virtual void provideMask(uint64_t requestId,
                            std::span<const uint32_t> words) = 0;
   virtual void end(uint64_t requestId) = 0;

@@ -348,18 +348,18 @@ Cache::Eviction Cache::evictOneKvBlock() {
 // resident KV leaves alike.
 
 uint64_t Cache::reclaimCache(uint64_t targetBytes, bool evictAll,
-                             bool keepResumePoint) {
+                             bool keepResumePoint, bool keepRunway) {
   // Empty backing that is waiting behind an in-flight release will satisfy
   // part of the target by itself; evicting more cache now would only
   // discard reusable prefixes without returning memory any sooner. Pages
   // whose copies are being written count the same way.
   if (releaseDeferred())
     return 0;
-  uint64_t released = reclaimEmptyExtents();
+  uint64_t released = reclaimEmptyExtents(keepRunway);
   auto needsMore = [&] { return !reclaimMet(released, targetBytes, evictAll); };
   while (needsMore() && !releaseDeferred()) {
-    const CacheReclaimResult result =
-        reclaimOne(CacheReclaimMode::ReleaseBacking, keepResumePoint);
+    const CacheReclaimResult result = reclaimOne(
+        CacheReclaimMode::ReleaseBacking, keepResumePoint, keepRunway);
     if (!result.madeProgress)
       break;
     released += result.reclaimedBytes;
@@ -368,11 +368,11 @@ uint64_t Cache::reclaimCache(uint64_t targetBytes, bool evictAll,
 }
 
 CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode,
-                                     bool keepResumePoint) {
+                                     bool keepResumePoint, bool keepRunway) {
   if (mode == CacheReclaimMode::ReleaseBacking) {
     if (releaseDeferred())
       return {};
-    if (const uint64_t bytes = reclaimEmptyExtents())
+    if (const uint64_t bytes = reclaimEmptyExtents(keepRunway))
       return {true, bytes};
   }
 
@@ -407,7 +407,9 @@ CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode,
     }
     switch (reclaimKvLeaf(kv->id)) {
     case LeafReclaim::Started:
-      return {true, mode == CacheReclaimMode::ReleaseBacking ? reclaimEmptyExtents() : 0};
+      return {true, mode == CacheReclaimMode::ReleaseBacking
+                        ? reclaimEmptyExtents(keepRunway)
+                        : 0};
     case LeafReclaim::Pending:
       kvOpen = false;
       break;
@@ -501,9 +503,9 @@ void Cache::dropPoisoned() {
   });
 }
 
-uint64_t Cache::reclaimEmptyExtents() {
+uint64_t Cache::reclaimEmptyExtents(bool keepRunway) {
   const uint64_t before = pool_.residentBackingBytes();
-  static_cast<void>(pool_.reclaimEmptyExtents(false));
+  static_cast<void>(pool_.reclaimEmptyExtents(keepRunway));
   const uint64_t after = pool_.residentBackingBytes();
   return before >= after ? before - after : 0;
 }

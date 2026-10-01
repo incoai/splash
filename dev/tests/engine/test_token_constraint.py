@@ -87,6 +87,8 @@ class TokenConstraintTest(unittest.TestCase):
             ):
                 self.constraint().consume(tokens)
             self.assertEqual(caught.exception.code, "constraint_error")
+            # The parser's state dump, generated text included, stays out.
+            self.assertNotIn("\n", caught.exception.message)
 
 
 if __name__ == "__main__":

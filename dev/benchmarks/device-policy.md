@@ -9,14 +9,43 @@ production allocations, startup benchmarks or per-model/per-SKU tables.
 
 `runtime/ops/Linear.cpp` owns Q4 selection. Apple9 decode uses bfloat
 simdgroup matrices with 1/2/4/8 K partitions
-([apple9-simdgroup.md](apple9-simdgroup.md)). Apple10 uses MPP tiles, with
-shape and core count selecting grids and the narrow M24 variant.
-Apple10 split-K tiles are offline candidates only. Their former one-lane
-defaults have been withdrawn after reproducible speculative-acceptance
-reductions on some M5 prompts. Those projections use the existing sequential
-tiles again; paired N256, M24, and Apple9 simdgroup selection are unchanged.
-The obsolete Apple9 one-lane MPP branches have been removed; those kernels
-remain useful as qualification references and offline candidates.
+([apple9-simdgroup.md](apple9-simdgroup.md)). Apple10 and later use MPP
+tiles, with shape and core count selecting grids. A projection with at most
+two N128 tiles per core splits K instead: `LinearTile::Split128` runs the N128
+tile over the largest power of two, up to eight, of K partitions whose grid
+still fits four 256-thread threadgroups per core, each partition at least one
+256-input block. The rule depends on the grid per core only, so every batch
+width takes the same plan and a request's sums do not depend on the requests
+it is batched with. Every other projection keeps the sequential tiles, paired
+N256 and M24 included, bit for bit. The obsolete Apple9 one-lane MPP branches
+have been removed; those kernels remain useful as qualification references
+and offline candidates.
+
+The split rule follows the policy bench's DRAM-cold kernel times (eight
+alternating runs) on the two Apple10/11 GPUs we have, a 20-core M5 Pro and a
+12-core M6. Core counts emulated by width misjudge split tiles by -26% to
++20% against a 40-core M5 Max, so a rule takes a gain only where a native
+machine measures one.
+
+- The one-lane Split32/Split64 tiles, withdrawn as defaults after
+  speculative-acceptance reductions on some M5 prompts, remain offline
+  candidates: no rule of the grid per core selects them on both machines. On
+  the M5 Pro they beat today's plan on the 35B's mixer and draft outputs by
+  4%, about their run-to-run spread, and on its draft gate/up by 9%; the same
+  shapes run 15-17% slower in them on the M6. The M6's one-lane wins with them
+  (4-8% on the 27B's 5120-wide projections) are smaller than those of the
+  unpaired N128 or N256 tile on the same shapes (17-18%), and on the M5 Pro
+  the unpaired N128 tile likewise beats both the paired plan and Split64 on
+  the 35B's attention input: that headroom belongs to the sequential tiles'
+  pairing rule, not to a split.
+
+On the 27B and 35B projections neither machine runs a split plan slower than
+its fastest sequential tile. The exceptions are off those shapes: on the
+bench's fitting grid the M6 runs 3072 x 2048 and 3072 x 4096 in two splits
+4-7% slower at one and two lanes, and with 20 cores emulated on the M6 the
+27B draft output (5120 x 4096) and mixer output at one lane take 1.044x and
+1.010x the paired N128 time (spread 1.9%), about 0.06 ms of a 58 ms one-lane
+Q4 step there.
 
 Core count comes from the Metal device's IORegistry property. Missing metadata
 uses one 32-core estimate across families, an intermediate value in the
@@ -24,8 +53,9 @@ uses one 32-core estimate across families, an intermediate value in the
 or a performance guarantee for unidentified GPUs. A nonzero reported count
 always overrides it. Family 11 (the M6) runs the family 10 policy; its policy
 tests check extrapolation only, and actual validation here covers families 9
-and 10. Core count alone cannot describe memory bandwidth, cache capacity,
-power state or compiler behavior.
+and 10, with the Apple10 split rule also timed on a 12-core M6. Core count
+alone cannot describe memory bandwidth, cache capacity, power state or
+compiler behavior.
 
 MoE routing scales its row threshold with core count. The expert tile's
 four-SIMD-group Apple9 decode default remains a family rule, measured on the
@@ -36,8 +66,10 @@ claiming that rule is optimal. Prefill and Apple10 retain eight SIMD groups.
 
 Q4 candidates always start with the shipped baseline. Persistent grids now
 include two, three and four threadgroups per reported core plus the full grid,
-instead of fixed counts 36/60/80. Apple9 additionally exposes every valid
-simdgroup split in 1/2/4/8. The maximum candidate count is 20, derived beside
+instead of fixed counts 36/60/80. One lane lists the Split32/Split64 tiles
+when K % 1024 == 0. Apple9 additionally exposes every valid simdgroup split in
+1/2/4/8, and Apple10 every Split128 split of two to eight its blocks allow at
+every lane count. The maximum candidate count is 20, derived beside
 `Linear::kMaximumCandidates`; deduplication handles small grids. Prefill
 candidates are unchanged. New candidates do not automatically change serving.
 

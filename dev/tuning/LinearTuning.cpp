@@ -16,8 +16,8 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 // ReferenceGate/ReferenceUp hold the exact gate and up projections a split-K
-// gate/up plan is held to; they exist only when the candidates mix split-K
-// and sequential tiles for a gate/up workload.
+// gate/up plan is held to; they exist only when a gate/up workload has a
+// candidate that is not bitwise comparable with its baseline.
 enum Field : size_t {
   Input, Output, Sums, Residual, GateScratch, DownSums,
   ReferenceOutput, ReferenceDownSums, ReferenceGate, ReferenceUp,
@@ -28,6 +28,17 @@ struct Layout final {
   std::array<Region, FieldCount> fields{};
   uint64_t bytes = 0;
 };
+
+// Sequential plans store bitwise-identical outputs for a workload
+// (LinearPlan::partialSums). Any other pair may round differently even with
+// as many partial sums on both sides (Split128's four K splits and the
+// one-lane Split32 tile's four partitions), so it is held to the derived bound.
+bool sequential(const LinearPlan &plan) {
+  return plan.partialSums() == 1 && !plan.usesSimdgroup();
+}
+bool bitwiseComparable(const LinearPlan &baseline, const LinearPlan &candidate) {
+  return sequential(baseline) && sequential(candidate);
+}
 
 uint64_t align(uint64_t value, uint64_t alignment) {
   if (value > std::numeric_limits<uint64_t>::max() - (alignment - 1))
@@ -59,10 +70,9 @@ Layout layout(const DeviceCapabilities &device,
         std::max(result.fields[DownSums].bytes, plan.downSumsBytes());
   }
   result.fields[ReferenceDownSums].bytes = result.fields[DownSums].bytes;
-  bool mixed = false;
-  for (const auto &plan : plans)
-    mixed |= plan.partialSums() != plans.front().partialSums() ||
-        plan.usesSimdgroup() || plans.front().usesSimdgroup();
+  const bool mixed = std::any_of(plans.begin() + 1, plans.end(), [&](const LinearPlan &plan) {
+    return !bitwiseComparable(plans.front(), plan);
+  });
   if (mixed && workload.epilogue == LinearEpilogue::GateUp)
     result.fields[ReferenceGate].bytes = result.fields[ReferenceUp].bytes =
         result.fields[Output].bytes;
@@ -103,14 +113,17 @@ void poisonFloat(metal::MetalBuffer buffer) {
   auto *values = static_cast<float *>(buffer.contents());
   std::fill_n(values, buffer.sizeBytes() / 4, std::numeric_limits<float>::quiet_NaN());
 }
-// A split-K plan and a sequential plan are not bitwise comparable, so every
-// output element is held to the derived bound instead (LinearNumerics.hpp),
-// with the sequential plan's output as the reference whichever side it is.
+// Two plans that are not bitwise comparable hold every output element to the
+// derived bound instead (LinearNumerics.hpp), with the sequential plan's
+// output as the reference whichever side it is. Two split plans each
+// reassociate the sum: `associations` counts the sides whose fp32 slack the
+// bound covers.
 void requireWithinSplitTolerance(LinearWorkload workload, const metal::MetalBuffer &exact,
                                  const metal::MetalBuffer &split,
                                  const metal::MetalBuffer &residual,
                                  const metal::MetalBuffer &gate,
-                                 const metal::MetalBuffer &up, float operandSlack = 0) {
+                                 const metal::MetalBuffer &up, uint32_t associations,
+                                 float operandSlack) {
   const auto values = [](const metal::MetalBuffer &buffer) {
     return buffer ? static_cast<const uint16_t *>(buffer.contents()) : nullptr;
   };
@@ -123,7 +136,7 @@ void requireWithinSplitTolerance(LinearWorkload workload, const metal::MetalBuff
   float maxAbs = 0;
   for (uint64_t i = 0; i < elements; ++i)
     maxAbs = std::max(maxAbs, std::fabs(bf16ToFloat(exactValues[i])));
-  const float slack = reassociationSlack(workload.matrix.inputSize, maxAbs) + operandSlack;
+  const float slack = float(associations) * reassociationSlack(workload.matrix.inputSize, maxAbs) + operandSlack;
   for (uint64_t i = 0; i < elements; ++i) {
     SplitReference reference{bf16ToFloat(exactValues[i])};
     if (residualValues) reference.residual = bf16ToFloat(residualValues[i]);
@@ -281,19 +294,19 @@ LinearTuningResult tuneLinear(metal::MetalBackend &backend,
     auto qualify = [&](size_t candidate, bool baseline) {
       requireFinite(buffers.output, false);
       requireFinite(buffers.downSums, true);
-      const bool mixed = plans[candidate].partialSums() != plans[0].partialSums() ||
-          plans[candidate].usesSimdgroup() || plans[0].usesSimdgroup();
+      const bool bitwise = bitwiseComparable(plans[0], plans[candidate]);
       for (const auto pair : {std::pair{Output, ReferenceOutput},
                               std::pair{DownSums, ReferenceDownSums}}) {
         const auto &actual = fields[pair.first];
         const auto &reference = fields[pair.second];
         if (!actual) continue;
         if (baseline) std::memcpy(reference.contents(), actual.contents(), actual.sizeBytes());
-        else if (mixed && pair.first == Output) {
-          const bool baselineExact = plans[0].partialSums() == 1 && !plans[0].usesSimdgroup();
+        else if (!bitwise && pair.first == Output) {
+          const bool baselineExact = sequential(plans[0]);
           requireWithinSplitTolerance(workload, baselineExact ? reference : actual,
                                       baselineExact ? actual : reference, buffers.residual,
-                                      fields[ReferenceGate], fields[ReferenceUp], operandSlack);
+                                      fields[ReferenceGate], fields[ReferenceUp],
+                                      baselineExact || sequential(plans[candidate]) ? 1 : 2, operandSlack);
         } else if (std::memcmp(reference.contents(), actual.contents(), actual.sizeBytes()))
           throw std::runtime_error("Linear tuning candidate output differs from baseline");
       }

@@ -539,7 +539,7 @@ class ClientRun:
                     self.session,
                 ]
         else:
-            arguments = ["--oneshot", "--query-file", "-"]
+            arguments = ["chat", "--oneshot", "--query-file", "-"]
             if self.session:
                 arguments += ["--resume", self.session]
         return self.command(arguments)

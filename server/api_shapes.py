@@ -935,6 +935,8 @@ def anthropic_to_chat_prompt(body, *, thinking_resolver):
             }
             if isinstance(tool.get("description"), str):
                 function["description"] = tool["description"]
+            if "strict" in tool:
+                function["strict"] = tool["strict"]
             chat["tools"].append({"type": "function", "function": function})
     choice = body.get("tool_choice")
     if choice is not None:
@@ -1165,10 +1167,14 @@ def responses_output(
     return output
 
 
-def anthropic_stop(result, tool_calls):
+def anthropic_stop(result, tool_calls, output_clamped_to_context):
     if tool_calls and result.reason != "length":
         return "tool_use"
     if result.reason == "length":
+        # Anthropic's reason when the context window, not max_tokens, ends
+        # the response.
+        if output_clamped_to_context:
+            return "model_context_window_exceeded"
         return "max_tokens"
     if result.stop_sequence is not None:
         return "stop_sequence"
@@ -1221,7 +1227,9 @@ def anthropic_response(
         "role": "assistant",
         "model": model,
         "content": blocks,
-        "stop_reason": anthropic_stop(result, tool_calls),
+        "stop_reason": anthropic_stop(
+            result, tool_calls, job.output_clamped_to_context
+        ),
         "stop_sequence": result.stop_sequence,
         "usage": anthropic_usage(
             result.prompt_tokens, result.completion_tokens, result.cache

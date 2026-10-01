@@ -20,14 +20,21 @@ def authenticate(headers, key):
         return
     authorization = headers.get_all("Authorization", [])
     api_keys = headers.get_all("x-api-key", [])
-    supplied = None
-    if len(authorization) == 1 and not api_keys:
-        scheme, separator, value = authorization[0].partition(" ")
-        if separator and scheme.lower() == "bearer":
-            supplied = value
-    elif len(api_keys) == 1 and not authorization:
-        supplied = api_keys[0]
-    if supplied is None or not hmac.compare_digest(supplied.encode(), key.encode()):
+    # Anthropic's SDK sends both headers when it has an API key and an auth
+    # token: every credential given must be the key, each header only once.
+    supplied = list(api_keys)
+    for header in authorization:
+        scheme, separator, value = header.partition(" ")
+        supplied.append(value if separator and scheme.lower() == "bearer" else None)
+    if (
+        not supplied
+        or len(authorization) > 1
+        or len(api_keys) > 1
+        or not all(
+            value is not None and hmac.compare_digest(value.encode(), key.encode())
+            for value in supplied
+        )
+    ):
         raise APIError(401, "invalid or missing API key", "authentication_error")
 
 

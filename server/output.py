@@ -103,7 +103,8 @@ class StreamingToolCallProjector:
 
     Emit function names before their arguments finish. Validate each closed
     call before its closing JSON brace, then validate the complete response
-    at request completion.
+    at request completion. Text outside calls streams as it arrives, after a
+    call as before one.
     """
 
     _FUNCTION_PREFIX = FUNCTION_OPEN
@@ -127,7 +128,11 @@ class StreamingToolCallProjector:
         self.arguments = {}
         self.argument_fragments = []
         self.content_fragments = []
-        self.streamed_content_fragments = []
+        # How many content fragments the stream has published (the rest are
+        # whitespace it holds), and whether the text since the start of the
+        # output or the last call has shown a visible character yet.
+        self.streamed_count = 0
+        self.text_visible = False
         self.closed_calls = []
 
     @staticmethod
@@ -143,19 +148,24 @@ class StreamingToolCallProjector:
         self._malformed()
 
     def _emit_content(self, value, events):
-        if value:
-            self.content_fragments.append(value)
-            # Publish text after a tool call only after full completion; a
-            # max-token boundary can leave it in an unfinished tool suffix.
-            if not self.closed_calls:
-                if not self.streamed_content_fragments:
-                    # Hold template whitespace until there is visible text.
-                    # A tool-only turn must not create an empty text item.
-                    if not value.strip():
-                        return
-                    value = "".join(self.content_fragments)
-                self.streamed_content_fragments.append(value)
-                events.append(("content", value))
+        if not value:
+            return
+        self.content_fragments.append(value)
+        # The chat template sets calls apart from text with whitespace. Hold
+        # whitespace that starts the output or follows a call until visible
+        # text arrives. Before the first text or after the last, it only
+        # frames the calls and is dropped; between two texts it separates
+        # them and streams with the later one.
+        if not self.text_visible:
+            if not value.strip():
+                return
+            self.text_visible = True
+        unsent = self.content_fragments[self.streamed_count :]
+        self.streamed_count = len(self.content_fragments)
+        events.append(("content", "".join(unsent)))
+
+    def _streamed_content(self):
+        return "".join(self.content_fragments[: self.streamed_count])
 
     def _begin_call(self, events):
         name_end = self.pending.find(">\n")
@@ -169,6 +179,9 @@ class StreamingToolCallProjector:
                 "invalid_model_output",
             )
         self.pending = self.pending[name_end + 2 :]
+        if not self.streamed_count:
+            # Whitespace before the first text only framed the calls.
+            self.content_fragments.clear()
         self.function_name = name
         self.call_id = f"call_{self.request_id}_{self.call_index}"
         self.arguments = {}
@@ -265,6 +278,7 @@ class StreamingToolCallProjector:
         self.function_name = None
         self.arguments = {}
         self.argument_fragments = []
+        self.text_visible = False
         self.state = "content"
 
     def put(self, text):
@@ -353,15 +367,13 @@ class StreamingToolCallProjector:
         return events
 
     def interrupted_result(self):
-        content = "".join(self.streamed_content_fragments)
-        if not self.closed_calls and self.call_id is None:
-            content = "".join(self.content_fragments)
-        if (
-            not self.closed_calls
-            and self.state in ("content", "output", "json")
-            and not TOOL_CALL_OPEN.startswith(self.pending)
-        ):
-            content += self.pending
+        """The content and calls of output cut at the token limit.
+
+        Closed calls are complete, and an open call keeps the arguments it
+        has. With a call, the content is the text the stream published, which
+        leaves out whitespace that no visible text has followed since the
+        start or the last call. Without one, the text is kept exactly, apart
+        from a trailing partial call marker or unfinished call header."""
         calls = list(self.closed_calls)
         if self.call_id is not None:
             calls.append(
@@ -374,7 +386,13 @@ class StreamingToolCallProjector:
                     },
                 }
             )
-        return ("" if calls and not content.strip() else content), calls
+        if calls:
+            return self._streamed_content(), calls
+        content = "".join(self.content_fragments)
+        in_text = self.state in ("content", "output", "json")
+        if in_text and not TOOL_CALL_OPEN.startswith(self.pending):
+            content += self.pending
+        return content, calls
 
     def finish(self, canonical_content, canonical_calls, incomplete):
         content = []
@@ -383,13 +401,14 @@ class StreamingToolCallProjector:
                 incomplete and TOOL_CALL_OPEN.startswith(self.pending)
             ):
                 self.content_fragments.append(self.pending)
+            elif self.closed_calls:
+                # Whitespace held after the last text only framed the calls.
+                del self.content_fragments[self.streamed_count :]
             self.pending = ""
         elif not incomplete:
             self._malformed()
         parsed_content = "".join(self.content_fragments)
-        if canonical_calls and not parsed_content.strip():
-            parsed_content = ""
-        emitted = "".join(self.streamed_content_fragments)
+        emitted = self._streamed_content()
         if (
             not incomplete and parsed_content != canonical_content
         ) or not canonical_content.startswith(emitted):
@@ -400,7 +419,6 @@ class StreamingToolCallProjector:
             )
         remaining = canonical_content[len(emitted) :]
         if remaining:
-            self.streamed_content_fragments.append(remaining)
             content.append(remaining)
         if self.closed_calls != canonical_calls:
             if not incomplete:
@@ -500,8 +518,13 @@ def parse_tool_calls(text, request_id, policy=None):
             }
         )
     content.append(text[cursor:])
-    content = "".join(content)
-    return ("" if calls and not content.strip() else content), calls
+    if calls:
+        # Whitespace alone before the first text or after the last is the
+        # chat template's framing around calls; between two texts it
+        # separates them.
+        visible = [index for index, part in enumerate(content) if part.strip()]
+        content = content[visible[0] : visible[-1] + 1] if visible else []
+    return "".join(content), calls
 
 
 def _validate(validator, value):

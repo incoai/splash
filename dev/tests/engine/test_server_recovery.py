@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from dev.tests.engine.test_native_backend import FakeTokenizer as NativeTokenizer
+from dev.tests.engine.test_native_backend import make_job
 from dev.tests.engine.test_runtime import READY_FEATURES, FakeFactory
 from dev.tests.test_server import FakeRuntime, Harness, Plan, main_args
 from install import launcher
@@ -343,6 +344,34 @@ class ServerRecoveryTests(unittest.TestCase):
         )
         self.assertTrue(transport["recovering"])
         self.assertIn("executable is missing", transport["error"])
+
+    def test_engine_failure_under_a_request_asks_its_client_to_retry(self):
+        factory = FakeFactory()
+        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        backend = backend_api.NativeBackend(runtime, NativeTokenizer())
+        self.addCleanup(backend.close)
+        job = make_job()
+        with mock.patch.object(backend_api, "print_status") as console:
+            self.assertTrue(backend.submit(job))
+            factory.processes[0].stdin.wait_for(wire.RequestFrame)
+            factory.processes[0].close_stdout()
+            kind, error = job.events.get(timeout=1)
+            self.wait_until(lambda: console.called)
+        self.assertEqual(kind, "error")
+        self.assertEqual(
+            (error.status, error.code, error.message),
+            (
+                503,
+                "runtime_unavailable",
+                "the inference engine stopped unexpectedly and is restarting; "
+                "retry the request",
+            ),
+        )
+        # The engine's own reason stays on the console.
+        self.assertEqual(
+            console.call_args_list[0].args[0],
+            "Engine failed · native protocol reached EOF",
+        )
 
     def test_recovery_refusals_carry_the_last_engine_failure(self):
         runtime = RecoveringRuntime([engine_runtime.EngineUnhealthy("GPU is gone")])

@@ -84,11 +84,12 @@ struct GgufEmbedParams {
 };
 static_assert(sizeof(GgufEmbedParams) == 12, "GGUF embedding parameters are 12 bytes on both sides");
 // The formats whose native token rows the embedding kernels gather
-// (kernels/shared/embedding.metal, gguf_embed_<kQuantFormats name>).
+// (kernels/shared/embedding.metal, gguf_embed_<kQuantFormats name>): every
+// format llama-quantize gives a token table by default, and Prism's PQ2_0.
 inline constexpr bool gguf_embedding_format(uint32_t format) {
   return format == GGUF_FMT_Q4K || format == GGUF_FMT_Q5K || format == GGUF_FMT_Q6K || format == GGUF_FMT_Q3K ||
          format == GGUF_FMT_Q2K || format == GGUF_FMT_Q80 || format == GGUF_FMT_Q40 || format == GGUF_FMT_Q41 ||
-         format == GGUF_FMT_PQ20;
+         format == GGUF_FMT_IQ4XS || format == GGUF_FMT_IQ4NL || format == GGUF_FMT_IQ3S || format == GGUF_FMT_PQ20;
 }
 
 // Prism ML's input rotation (kernels/shared/gguf_rotation.metal): weights

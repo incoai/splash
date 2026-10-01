@@ -310,7 +310,7 @@ class SchemaFallbackTests(unittest.TestCase):
         guidance = self.guidance
 
         class CompilingFactory(FakeConstraintFactory):
-            def create(self, grammar, *, timeout=None):
+            def create(self, grammar, *, timeout=None, prefixes=None):
                 error = LLMatcher.validate_grammar(grammar, guidance)
                 if error:
                     raise AssertionError(error)

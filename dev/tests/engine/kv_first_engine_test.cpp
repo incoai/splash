@@ -392,7 +392,8 @@ public:
     ++diskSnapshots;
     return std::make_unique<OffloadTicket>(stateTier);
   }
-  uint64_t reclaimIdleState() noexcept override {
+  uint64_t reclaimIdleState(bool keepLane) noexcept override {
+    keptLane = keepLane;
     const uint64_t released = reclaimableIdleStateBytes;
     reclaimableIdleStateBytes = 0;
     reclaimedIdleStateBytes += released;
@@ -457,6 +458,7 @@ public:
   metal::AllocationFailure beginAllocationFailure = metal::AllocationFailure::None;
   uint64_t reclaimableIdleStateBytes = 0;
   uint64_t reclaimedIdleStateBytes = 0;
+  bool keptLane = false;
   bool *physicalGrowthBlocked = nullptr;
   bool unblockGrowthOnSuspend = true;
   bool decodeFinishes = true;
@@ -1593,6 +1595,42 @@ void testPressureReclaimRespectsStateLifetimes() {
       engine.reclaimMemory({.reclaimEmptyKvExtents = true, .targetBytes = 64});
   require(!empty.releasedBytes && empty.outcome == ReclaimOutcome::Exhausted,
           "an empty cache did not report reclaim exhausted");
+}
+
+// Pressure short of critical takes cached state and KV but leaves what a
+// request starts from, since growth is paused: a lane's pooled buffers and
+// one empty extent. Critical pressure takes those too.
+void testWarningReclaimKeepsTheServingFootprint() {
+  Backing backing(8);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(1);
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+
+  engine.submit(request(28, std::vector<uint32_t>(65, 28)));
+  runUntilIdle(engine);
+  constexpr uint64_t extentBytes = 4 * 4096;
+  require(resources.snapshot().pool.residentBackingBytes == extentBytes,
+          "footprint setup did not keep one resident extent of cached KV");
+
+  static_cast<void>(engine.reclaimMemory(
+      {.reclaimEmptyKvExtents = true,
+       .targetBytes = std::numeric_limits<uint64_t>::max(),
+       .keepServingFootprint = true}));
+  const auto warning = resources.snapshot();
+  require(executor.keptLane && warning.stateCache.entries == 0 &&
+              warning.kvCache.blocks == 0 &&
+              warning.pool.residentBackingBytes == extentBytes,
+          "warning pressure did not keep only the serving footprint");
+
+  static_cast<void>(engine.reclaimMemory(
+      {.reclaimEmptyKvExtents = true,
+       .evictAllUnpinnedPrefixes = true,
+       .targetBytes = std::numeric_limits<uint64_t>::max()}));
+  require(!executor.keptLane &&
+              resources.snapshot().pool.residentBackingBytes == 0,
+          "critical pressure kept the serving footprint");
 }
 
 // A KV chain gives up one leaf at a time, each after its copy is written. A
@@ -4109,6 +4147,25 @@ void testCheckpointIntervalValidationAndDisable() {
           "disabling checkpoints changed existing replay-state behavior");
 }
 
+void testDecodeShareValidation() {
+  Backing backing(1024);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(1);
+  Events events;
+  for (double invalid : {-0.5, std::numeric_limits<double>::infinity(),
+                         std::numeric_limits<double>::quiet_NaN()}) {
+    bool rejected = false;
+    try {
+      engine::Engine engine({.decodeShare = invalid}, resources, executor,
+                            events);
+    } catch (const std::invalid_argument &) {
+      rejected = true;
+    }
+    require(rejected, "invalid decode share was accepted");
+  }
+}
+
 } // namespace
 
 // With no cache slot and nothing to recycle, a lane writes its state straight
@@ -5207,6 +5264,7 @@ int main() {
     testShortSuffixContinuesCheckpointDraftState();
     testDefaultCheckpointRestoresLatestCommittedPrefix();
     testCheckpointIntervalValidationAndDisable();
+    testDecodeShareValidation();
     testColdPublishesReplayStateAndLazyJunctionCanRebuildIt();
     testConcurrentDuplicateStateSkipsSnapshotCapture();
     testReplayStateEndsBeforeTheGenerationPrompt();
@@ -5232,6 +5290,7 @@ int main() {
     testKvGrowthReclaimsIdleStateBeforeCache();
     testKvGrowthDenialKeepsEveryLaneReplayState();
     testPressureReclaimRespectsStateLifetimes();
+    testWarningReclaimKeepsTheServingFootprint();
     testPressureReclaimFollowsTheChain();
     testFullStateCellsSkipAdmissionAttempts();
     testConcurrencyLimitDoesNotEvictCache();

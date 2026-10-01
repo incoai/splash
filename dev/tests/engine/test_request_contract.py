@@ -1,8 +1,11 @@
 import array
 import errno
+import http.client
+import json
 import select
 import socket
 import struct
+import sys
 import unittest
 from unittest import mock
 
@@ -123,6 +126,36 @@ class RequestContractTests(unittest.TestCase):
             self.assertFalse(handler.parse_request())
         handler.send_error.assert_called_once_with(505, "HTTP version not supported")
         self.assertTrue(handler.close_connection)
+
+    def test_unparsable_requests_get_an_http_1_1_json_error(self):
+        harness = Harness(FakeRuntime())
+        self.addCleanup(harness.close)
+        # Each request is all the server reads: bytes it left unread would
+        # reset the connection under its response.
+        for data, status, anthropic in (
+            (b"GARBAGE\r\n", 400, False),
+            (b"GET / FOO/1.1\r\n", 400, False),
+            # HTTP/0.9's request line, which has no version. Python before
+            # 3.13 reads headers after it all the same.
+            (b"GET /\r\n" + b"\r\n" * (sys.version_info < (3, 13)), 505, False),
+            # One byte over the stdlib's request and header line limits.
+            (b"x" * 65537, 414, False),
+            (b"POST /v1/messages HTTP/1.1\r\n" + b"x" * 65537, 431, True),
+        ):
+            with self.subTest(data=data[:24]):
+                client = socket.create_connection(
+                    harness.server.server_address, timeout=2
+                )
+                self.addCleanup(client.close)
+                client.sendall(data)
+                response = http.client.HTTPResponse(client)
+                response.begin()
+                self.assertEqual((response.version, response.status), (11, status))
+                self.assertEqual(response.getheader("Connection"), "close")
+                self.assertEqual(response.getheader("Content-Type"), "application/json")
+                payload = json.loads(response.read())
+                self.assertEqual(payload.get("type"), "error" if anthropic else None)
+                self.assertTrue(payload["error"]["message"])
 
     def test_missing_native_executable_has_upgrade_guidance(self):
         with self.assertRaisesRegex(

@@ -227,7 +227,13 @@ class TextCompletionTests(unittest.TestCase):
 
     def test_default_values_of_unsupported_fields_are_accepted(self):
         harness, runtime = self.harness()
-        defaults = {"suffix": None, "echo": False, "logprobs": None, "best_of": 1}
+        defaults = {
+            "suffix": None,
+            "echo": False,
+            "logprobs": None,
+            "best_of": 1,
+            "repetition_penalty": 1,
+        }
         for fields in (defaults, {key: None for key in defaults}, {"n": 1}):
             with self.subTest(fields=fields):
                 status, response = self.complete(harness, **fields)
@@ -235,14 +241,14 @@ class TextCompletionTests(unittest.TestCase):
         self.assertEqual(len(runtime.requests), 3)
 
     def test_omitted_max_tokens_is_openais_default_within_the_context(self):
-        # 16 tokens, not the server's chat budget; a prompt that leaves less
-        # context generates up to the rest instead of failing.
-        harness, runtime = self.harness(max_context=64, default_max_new=8)
+        # 16 tokens, not all the context leaves as in chat; a prompt that
+        # leaves less context generates up to the rest instead of failing.
+        harness, runtime = self.harness(max_context=64)
         for fields in ({}, {"max_tokens": None}):
             status, response = self.complete(harness, **fields)
             self.assertEqual(status, 200, response)
             self.assertEqual(runtime.requests[-1].logical_max_output_tokens, 16)
-        harness, runtime = self.harness(max_context=16, default_max_new=8)
+        harness, runtime = self.harness(max_context=16)
         status, response = self.complete(harness)
         self.assertEqual(status, 200, response)
         request = runtime.requests[0]
@@ -251,7 +257,7 @@ class TextCompletionTests(unittest.TestCase):
         )
 
     def test_sampling_budget_seed_and_priority_are_validated_as_in_chat(self):
-        harness, runtime = self.harness(max_context=16, default_max_new=8)
+        harness, runtime = self.harness(max_context=16)
         status, response = self.complete(
             harness,
             temperature=0.7,
@@ -271,6 +277,7 @@ class TextCompletionTests(unittest.TestCase):
             ({"temperature": -1}, "invalid sampling parameters"),
             ({"top_k": 33}, "invalid sampling parameters"),
             ({"presence_penalty": 1}, "output transformation is not supported"),
+            ({"repetition_penalty": 1.1}, "output transformation is not supported"),
             ({"logit_bias": {"1": 2}}, "output transformation is not supported"),
             ({"seed": 2**64}, "seed must be an unsigned 64-bit integer"),
             ({"priority": "urgent"}, "priority must be"),

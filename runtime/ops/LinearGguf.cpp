@@ -383,7 +383,7 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
     return;
   }
   // Dispatch order is tile order: segments with the most bytes per tile
-  // first, so their threadgroups do not form the tail (alpha/beta are Q8_0).
+  // first, so their threadgroups do not form the tail.
   std::vector<const QuantizedSegment *> order;
   for (const QuantizedSegment &s : segments) order.push_back(&s);
   const auto bitsPerWeight = [](const QuantizedSegment &s) {

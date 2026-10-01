@@ -99,6 +99,11 @@ struct MemoryReclaimDirective {
   // Keep the newest state publication, the point a follow-up request resumes
   // from. Only a shrink that nothing is waiting for can afford to.
   bool keepResumePoint = false;
+  // Keep what a request starts from without growing: one lane's pooled state
+  // buffers and one resident KV extent. Growth is paused under pressure, so
+  // without them no request could start until the pressure lifted; only
+  // critical pressure takes them.
+  bool keepServingFootprint = false;
 };
 
 // What a reclaim pass made of its directive's target.

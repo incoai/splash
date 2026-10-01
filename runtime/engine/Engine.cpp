@@ -15,13 +15,16 @@ constexpr double kHealthCheckIntervalMilliseconds = 1000.0;
 
 Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
                EngineEventSink &events)
-    : config_(config), cache_(cache), model_(model), events_(events) {
+    : config_(config), cache_(cache), model_(model), events_(events),
+      scheduler_(config_.decodeShare) {
   if (!config_.maxContext || !config_.vocabularySize) {
     throw std::invalid_argument("context and vocabulary sizes must be positive");
   }
   if (!std::isfinite(config_.resourceWaitTimeoutMilliseconds) ||
       config_.resourceWaitTimeoutMilliseconds <= 0.0)
     throw std::invalid_argument("resource wait timeout must be positive and finite");
+  if (!std::isfinite(config_.decodeShare) || config_.decodeShare < 0.0)
+    throw std::invalid_argument("decode share must be nonnegative and finite");
   if (config_.prefillCheckpointTokens &&
       (config_.prefillCheckpointTokens <
            model::ExecutionLimits::draftContextTokens ||
@@ -1166,7 +1169,7 @@ CacheReclaimResult Engine::reclaimForGrowth(CacheReclaimMode mode) {
 }
 
 bool Engine::reclaimIdleState() noexcept {
-  if (!model_.reclaimIdleState())
+  if (!model_.reclaimIdleState(false))
     return false;
   signalResourceProgress();
   return true;
@@ -1194,7 +1197,7 @@ CacheReclaimResult Engine::reuseIdleBackingWhilePaused(const TokenAdmission &adm
     // An evicted state parks its buffers in the model's pool; under pressure
     // that memory goes back to the host now rather than waiting for the
     // next background pass.
-    while (model_.reclaimIdleState()) {
+    while (model_.reclaimIdleState(false)) {
     }
     signalResourceProgress();
   }
@@ -1231,18 +1234,20 @@ MemoryReclaimResult Engine::reclaimMemory(const MemoryReclaimDirective &directiv
   if (!directive.reclaimEmptyKvExtents)
     return {};
 
+  const bool keep = directive.keepServingFootprint;
   uint64_t released = 0;
-  while (const uint64_t idle = model_.reclaimIdleState())
+  while (const uint64_t idle = model_.reclaimIdleState(keep))
     released += idle;
   const uint64_t remaining =
       released >= directive.targetBytes ? 0 : directive.targetBytes - released;
   // Even a zero-byte directive may release completely empty KV extents.
-  const uint64_t fromCache = cache_.reclaimCache(
-      remaining, directive.evictAllUnpinnedPrefixes, directive.keepResumePoint);
+  const uint64_t fromCache =
+      cache_.reclaimCache(remaining, directive.evictAllUnpinnedPrefixes,
+                          directive.keepResumePoint, keep);
   released += fromCache;
   // Evicted states park their buffers in the model's pool; a pressure pass
   // returns that memory to the host now rather than keeping it warm.
-  while (model_.reclaimIdleState()) {
+  while (model_.reclaimIdleState(keep)) {
   }
   if (released)
     signalResourceProgress();

@@ -82,8 +82,10 @@ class TokenConstraint:
             else self.matcher.consume_tokens(token_ids)
         )
         if not valid:
+            # The lines after the first dump the parser state, output included.
+            error = self.matcher.get_error()
             raise NativeError(
-                "constraint_error", self.matcher.get_error() or "invalid token"
+                "constraint_error", error.splitlines()[0] if error else "invalid token"
             )
 
 
@@ -160,11 +162,16 @@ class ConstraintFactory:
         self.hits = 0
         self.misses = 0
 
-    def create(self, grammar, *, timeout=None):
-        matcher = self._matcher(grammar, timeout)
+    def create(self, grammar, *, timeout=None, prefixes=None):
+        """`prefixes`, called when the grammar is compiled, returns pairs of
+        tokens the output must be able to begin with and the error for a
+        grammar that cannot. A grammar can compile and still exceed the
+        parser's limits where generation reaches a construct, after the whole
+        prompt has been processed."""
+        matcher = self._matcher(grammar, timeout, prefixes)
         return TokenConstraint(matcher.deep_copy(), self.executor)
 
-    def _matcher(self, grammar, timeout):
+    def _matcher(self, grammar, timeout, prefixes):
         # Compilation uses the frontend's bounded preparation slots. Share
         # identical misses without blocking unrelated immutable templates.
         with self.lock:
@@ -193,6 +200,9 @@ class ConstraintFactory:
             matcher = LLMatcher(self.tokenizer, grammar, log_level=0)
             if matcher.is_error():
                 raise _grammar_error(matcher.get_error())
+            for tokens, message in prefixes() if prefixes else ():
+                if not matcher.deep_copy().consume_tokens(tokens):
+                    raise APIError(400, message)
             size = len(grammar.encode())
             # Oversized grammars remain usable without displacing the cache.
             # This bounds source bytes; LLGuidance bounds compiler complexity.

@@ -22,8 +22,15 @@ INSTALL_URLS = {
     "pi": "https://pi.dev/",
     "omp": "https://github.com/can1357/oh-my-pi#install",
 }
-# The most tokens a client reserves for one response out of the window.
-MAX_RESPONSE_TOKENS = 32768
+# The output one response may use in the OpenCode, Pi and Hermes
+# configurations the launchers write. Qwen recommends 32,768 for most Qwen3.6
+# queries and evaluated Qwen3.8-27B under Claude Code with it in a 256K
+# window; the 131,072 that model's card names is for the answer alone, beside
+# a separate reasoning limit, in a 1M window. OpenCode sends at most 32,000
+# of it unless OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX raises that; Pi, given
+# none, asks for 16,384. OpenCode and Hermes get a quarter of a window
+# smaller than four times this instead (_Server.response_tokens).
+CLIENT_RESPONSE_TOKENS = 32768
 OPENCODE_AGENTS = ("build", "plan", "general", "explore", "title", "compaction")
 OPENCODE_EFFORTS = ("none", "low", "medium", "high", "xhigh")
 OPENCODE_CONFIG_ERROR = "OPENCODE_CONFIG_CONTENT must be a JSON object"
@@ -49,7 +56,11 @@ class _Server:
 
     @property
     def response_tokens(self):
-        return min(MAX_RESPONSE_TOKENS, max(1, self.context // 4))
+        """The output allowance of a client that reserves it out of the
+        input it compacts at, OpenCode and Hermes: CLIENT_RESPONSE_TOKENS,
+        or a quarter of the window when that is less, so a small window
+        keeps room for the conversation."""
+        return min(CLIENT_RESPONSE_TOKENS, max(1, self.context // 4))
 
     @property
     def name(self):
@@ -334,7 +345,9 @@ def _hermes(path, server, environment, arguments, profile):
         OPENAI_BASE_URL=server.endpoint,
         OPENAI_API_KEY=server.api_key,
     )
-    return [path, "chat", "--provider", "custom", "--model", server.model, *arguments]
+    # Hermes takes --provider and --model before any subcommand and runs chat
+    # without one, so the user's arguments follow as Hermes itself takes them.
+    return [path, "--provider", "custom", "--model", server.model, *arguments]
 
 
 def hermes_profile_home(environment, name):
@@ -401,8 +414,10 @@ def _write_hermes_profile(home, server, created=False):
         api_mode="chat_completions",
         supports_vision="image" in server.input_modalities,
         context_length=server.context,
-        # Leave the input room expected by Hermes's 75% small-context
-        # compaction threshold; do not inherit a cloud model's output cap.
+        # Hermes before 2026.9.7 asks for this output limit on every request
+        # and compacts at 75% of the window less it; left unset, it asks a
+        # custom endpoint for 65,536, which its compaction does not reserve.
+        # Later versions ignore it and leave the limit to the server.
         max_tokens=server.response_tokens,
     )
     _replace_file(path, yaml.safe_dump(profile, sort_keys=False))
@@ -449,7 +464,9 @@ def _write_pi_provider(path, provider, server, environment):
         "thinkingLevelMap": {"off": "none"},
         "input": ["text", "image"] if vision else ["text"],
         "contextWindow": server.context,
-        "maxTokens": server.response_tokens,
+        # Pi lowers this on each request to what its context leaves, and
+        # compacts at a fixed distance from the window whatever it is.
+        "maxTokens": CLIENT_RESPONSE_TOKENS,
     }
     config["providers"] = {
         **providers,

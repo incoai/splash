@@ -33,6 +33,12 @@ PARAMETER_CLOSE = "\n</parameter>\n"
 THINK_END_TOKEN_ID = 248069  # the chat template's think-close token
 
 
+def function_opening(name):
+    """What follows TOOL_CALL_OPEN in a call of tool `name`, up to its
+    arguments."""
+    return f"{FUNCTION_OPEN}{name}>\n"
+
+
 LOCAL_REGISTRY = Registry()
 
 # Framing projects each tool's fields through schema composition and copies
@@ -195,6 +201,17 @@ MAX_GRAMMAR_BOUND = 64
 # output schema on every turn, so the answers for this many patterns are kept.
 PATTERN_CHECK_CACHE_SIZE = 1024
 
+# The whitespace a model chooses between the tokens of constrained output, in
+# JSON and around tool calls, is bounded: a model that prefers whitespace to
+# every token the grammar allows next would otherwise write it until
+# max_tokens, as Qwen models do, most of all under speculative decoding (vLLM
+# #38696, #50989). llama.cpp and Outlines bound it more tightly; 64 characters
+# still take pretty printing 15 levels deep at four spaces. Whitespace inside
+# strings is content and unbounded.
+MAX_WHITESPACE = 64
+WHITESPACE = rf"[ \t\n\r]{{0,{MAX_WHITESPACE}}}"
+WHITESPACE_RULE = f"WS: /{WHITESPACE}/"
+
 
 @lru_cache(maxsize=PATTERN_CHECK_CACHE_SIZE)
 def _grammar_takes_pattern(pattern):
@@ -221,8 +238,82 @@ def _grammar_compatible_schema(schema):
             bound = node.get(key)
             if isinstance(bound, (int, float)) and bound > MAX_GRAMMAR_BOUND:
                 del node[key]
+    if output is True:
+        # Any value, with the whitespace between its tokens bounded.
+        output = {}
     if isinstance(output, dict):
-        output["x-guidance"] = {"lenient": True}
+        output["x-guidance"] = {"lenient": True, "whitespace_pattern": WHITESPACE}
+    return output
+
+
+# Keywords that apply further schemas to the instance a schema describes.
+IN_PLACE_APPLICATORS = {
+    "allOf",
+    "not",
+    "if",
+    "then",
+    "else",
+    "dependentSchemas",
+    "dependencies",
+    "extends",
+    "$dynamicRef",
+    "$recursiveRef",
+}
+SCHEMA_IDENTIFIERS = {
+    "$schema",
+    "$id",
+    "$anchor",
+    "$dynamicAnchor",
+    "$defs",
+    "definitions",
+}
+# Keywords by which an object says which properties it takes beyond those it
+# declares.
+MORE_PROPERTIES = {"additionalProperties", "unevaluatedProperties", "patternProperties"}
+
+
+def _extended(node):
+    """Whether other schemas apply to the instance `node` describes, so that
+    `node` may declare only some of its properties."""
+    keys = set(node) - SCHEMA_ANNOTATIONS - SCHEMA_IDENTIFIERS
+    if keys & IN_PLACE_APPLICATORS or ("$ref" in keys and keys != {"$ref"}):
+        return True
+    unions = keys & {"anyOf", "oneOf"}
+    return bool(unions and keys - unions - {"type"})
+
+
+def _strict_schema(schema):
+    """The schema a strict tool's arguments are generated to, as vLLM and
+    SGLang generate them with XGrammar's strict mode: an object that does not
+    say which properties it takes beyond those it declares takes none, and
+    an array that does not say which items it takes beyond its leading ones
+    takes none. Validation keeps the declared schema.
+
+    A schema that other schemas of the same instance extend, as an allOf
+    does, may declare only some of its properties, and closing it would
+    refuse the others; a schema composed that way is left as declared."""
+    if any(_extended(node) for node in _schemas(schema) if isinstance(node, dict)):
+        return schema
+    output = copy.deepcopy(schema)
+    for node in _schemas(output):
+        if not isinstance(node, dict):
+            continue
+        keys = set(node)
+        # A union or a reference describes its instance by its alternatives
+        # or its target, which are closed in their own places.
+        if keys & {"anyOf", "oneOf", "$ref"}:
+            continue
+        kind = node.get("type")
+        kinds = kind if isinstance(kind, list) else [kind]
+        if "object" in kinds or (kind is None and "properties" in keys):
+            if not keys & MORE_PROPERTIES:
+                node["additionalProperties"] = False
+        if "array" in kinds or (kind is None and "prefixItems" in keys):
+            if isinstance(node.get("items"), list):
+                if not keys & {"additionalItems", "unevaluatedItems"}:
+                    node["additionalItems"] = False
+            elif not keys & {"items", "unevaluatedItems"}:
+                node["items"] = False
     return output
 
 
@@ -681,7 +772,7 @@ def json_grammar(schema, thinking):
     if thinking:
         grammar.append(f"think: TEXT <[{THINK_END_TOKEN_ID}]>")
         grammar.append(r"TEXT: /(?s:.*)/ & ~/(?s:.*)<\/think>(?s:.*)/")
-    grammar.append("WS: /[ \\n\\r\\t]*/")
+    grammar.append(WHITESPACE_RULE)
     return "\n".join(grammar) + "\n"
 
 
@@ -739,11 +830,14 @@ def normalize_tools(tools, tool_choice, parallel, namespaces=None):
             schema = {}
         if not isinstance(schema, (dict, bool)):
             raise APIError(400, f"invalid tool schema for {name}")
+        strict = function.get("strict")
+        if strict is not None and not isinstance(strict, bool):
+            raise APIError(400, f"strict must be a boolean for tool {name}")
         if ref := _remote_ref(schema):
             raise APIError(400, f"remote tool schema reference is not allowed: {ref}")
         try:
             validators[name] = build_validator(schema, _schemas, LOCAL_REGISTRY)
-            schemas[name] = schema
+            schemas[name] = _strict_schema(schema) if strict else schema
         except SchemaError as error:
             raise APIError(
                 400, f"invalid tool schema for {name}: {error.message}"
@@ -765,9 +859,11 @@ def normalize_tools(tools, tool_choice, parallel, namespaces=None):
             or name not in validators
         ):
             raise APIError(400, "invalid named tool_choice")
-        # The prompt keeps every tool; the grammar and validators force the call.
+        # The prompt keeps every tool; the grammar and validators force the
+        # call, exactly one, as a forced function is defined.
         validators = {name: validators[name]}
         schemas = {name: schemas[name]}
+        parallel = False
     elif choice not in ("auto", "required"):
         raise APIError(400, "invalid tool_choice")
     policy = ToolPolicy(
@@ -792,47 +888,49 @@ def tool_grammar(policy, thinking, response_schema=None):
         # An older declared dialect leaves newer keywords unchecked, so framing
         # can meet any JSON value where it reads part of a schema.
         raise APIError(400, "unsupported tool parameter schema") from error
+    # Text of the model's own may come before a call only where the answer
+    # may be text. A required call, like a JSON answer, stands apart from the
+    # reasoning and from other calls by whitespace alone.
+    separator = "WS" if policy.required or response_schema is not None else "TEXT"
     side_grammars = []
     tag_rules = []
     for index, (name, grammar) in enumerate(zip(policy.argument_schemas, arguments)):
         grammar_name = f"arguments_{index}"
         side_grammars.append({"name": grammar_name, "lark_grammar": grammar})
         tag_rules.append(
-            f"tool_{index}: {'WS' if response_schema is not None else 'TEXT'} {TOOL_CALL_OPEN} "
-            f"{json.dumps(FUNCTION_OPEN + name + '>' + chr(10))} "
+            f"tool_{index}: {separator} {TOOL_CALL_OPEN} "
+            f"{json.dumps(function_opening(name))} "
             f"@{grammar_name} {json.dumps(FUNCTION_CLOSE.removesuffix(TOOL_CALL_CLOSE))} "
             f"{TOOL_CALL_CLOSE}"
         )
     tool_choice = (
         "(" + " | ".join(f"tool_{index}" for index in range(len(tag_rules))) + ")"
     )
+    calls = tool_choice + ("+" if policy.parallel else "") + " WS"
     thinking_prefix = "think " if thinking else ""
     if not tag_rules:
         # tool_choice "none": neither the text nor a JSON answer starts a call.
         body = "tail" if response_schema is None else "answer"
         start = f"start: {thinking_prefix}{body}"
     elif response_schema is not None:
-        calls = tool_choice + ("+" if policy.parallel else "") + " WS"
         body = calls if policy.required else f"({calls} | answer)"
         start = f"start: {thinking_prefix}{body}"
     elif policy.required:
-        body = tool_choice + ("+" if policy.parallel else "")
-        start = f"start: {thinking_prefix}{body}"
+        start = f"start: {thinking_prefix}{calls}"
     else:
         body = tool_choice + ("*" if policy.parallel else "?")
         start = f"start: {thinking_prefix}{body} tail"
     main = ["%llguidance {}", start]
     if response_schema is not None:
-        main.extend(
-            [
-                "answer: WS %json "
-                + json.dumps(
-                    _grammar_compatible_schema(response_schema), separators=(",", ":")
-                )
-                + " WS",
-                r"WS: /[ \n\r\t]*/",
-            ]
+        main.append(
+            "answer: WS %json "
+            + json.dumps(
+                _grammar_compatible_schema(response_schema), separators=(",", ":")
+            )
+            + " WS"
         )
+    if separator == "WS":
+        main.append(WHITESPACE_RULE)
     if thinking:
         main.append(f"think: TEXT <[{THINK_END_TOKEN_ID}]>")
     main.extend(

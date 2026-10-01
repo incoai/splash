@@ -62,6 +62,11 @@ struct SchedulerSnapshot final {
 // M8/M16/M24/M32 shapes.
 class Scheduler final {
 public:
+  // Decode time owed for each unit of time a prefill runs while requests of
+  // equal or higher priority decode; zero alternates one command of each kind.
+  explicit Scheduler(double decodeShare = 0.0) noexcept
+      : decodeShare_(decodeShare) {}
+
   void submit(RequestSpec request);
   void observePrefill(uint32_t rows, double wallMilliseconds);
   void deferAdmission(uint64_t requestId);
@@ -130,12 +135,19 @@ private:
   [[nodiscard]] uint32_t
   prefillBudget(const PrefillRequestView &leader,
                 std::span<const PrefillRequestView> ready) const;
+  // Debt is owed only to requests that decode or wait for a mask: once the
+  // last one leaves, a later decoder starts without it.
+  void dropStaleDecodeDebt() noexcept;
 
   std::unordered_map<uint64_t, Request> requests_;
   std::optional<BatchPlan> active_;
   uint64_t order_ = 0;
   uint64_t decodeDispatchOrder_ = 0;
   double prefillMillisecondsPerToken_ = 0.0;
+  double decodeShare_;
+  // Decode time that contended prefill still owes: equal-priority decode
+  // runs until its commands' wall time has worked it off.
+  double decodeDebtMilliseconds_ = 0.0;
   std::optional<WorkKind> lastCommittedKind_;
   SchedulerSnapshot counters_;
 };

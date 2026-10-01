@@ -66,7 +66,7 @@ public:
   std::shared_ptr<const CompositeState> snapshot(uint64_t) override {
     return {};
   }
-  uint64_t reclaimIdleState() noexcept override { return 0; }
+  uint64_t reclaimIdleState(bool) noexcept override { return 0; }
   void provideMask(uint64_t, std::span<const uint32_t>) override {}
   void end(uint64_t) override {}
 };

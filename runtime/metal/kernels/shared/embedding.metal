@@ -1,5 +1,6 @@
 #include "metal/abi/Gguf.h"
 #include "metal/abi/KernelABI.h"
+#include "metal/abi/QuantTables.h"
 
 template <uint Hidden>
 inline void q4_embedding_impl(device const uint *tokens,
@@ -148,6 +149,44 @@ struct GgufEmbedPQ20 {
     return bfloat(float(int(q) - 1) * float(gguf_half(block, D)));
   }
 };
+// block_iq4_nl: block_q4_0's layout, whose codes index the IQ4_NL values.
+struct GgufEmbedIQ4NL {
+  enum : uint { Weights = 32, Bytes = 18, D = 0, Codes = 2 };
+  __attribute__((always_inline)) static bfloat value(device const uchar *block, uint dim) {
+#pragma clang fp reassociate(off)
+    const uint l = dim % Weights;
+    const uchar q = (block[Codes + l % 16] >> (4 * (l / 16))) & 15;
+    return bfloat(float(gguf_half(block, D)) * float(kIQ4NLValues[q]));
+  }
+};
+// block_iq4_xs: half d | ushort scales_h | uchar scales_l[4] | uchar qs[128], eight 32-weight groups of IQ4_NL codes
+// with a 6-bit scale (offset 32): group j's element l in nibble l / 16 of qs[16 j + l % 16].
+struct GgufEmbedIQ4XS {
+  enum : uint { Weights = 256, Bytes = 136, D = 0, High = 2, Low = 4, Codes = 8 };
+  __attribute__((always_inline)) static bfloat value(device const uchar *block, uint dim) {
+#pragma clang fp reassociate(off)
+    const uint j = (dim % Weights) / 32, l = dim % 32;
+    const uint high = block[High] | (block[High + 1] << 8);
+    const int ls = int((block[Low + j / 2] >> (4 * (j % 2))) & 15) | int(((high >> (2 * j)) & 3) << 4);
+    const uchar q = (block[Codes + 16 * j + l % 16] >> (4 * (l / 16))) & 15;
+    return bfloat(float(gguf_half(block, D)) * float(ls - 32) * float(kIQ4NLValues[q]));
+  }
+};
+// block_iq3_s: half d | uchar qs[64] | uchar qh[8] | uchar signs[32] | uchar scales[4], eight 32-weight groups with
+// a 4-bit scale s worth 1 + 2 s: group j's element l is IQ3_S grid entry qs[8 j + l / 4] (ninth index bit l / 4 of
+// qh[j]) at byte l % 4, negated by bit l % 8 of signs[4 j + l / 8].
+struct GgufEmbedIQ3S {
+  enum : uint { Weights = 256, Bytes = 110, D = 0, Codes = 2, High = 66, Signs = 74, Scales = 106 };
+  __attribute__((always_inline)) static bfloat value(device const uchar *block, uint dim) {
+#pragma clang fp reassociate(off)
+    const uint j = (dim % Weights) / 32, l = dim % 32;
+    const uint index = block[Codes + 8 * j + l / 4] | (((block[High + j] >> (l / 4)) & 1) << 8);
+    const uint magnitude = (kIQ3SGrid[index] >> (8 * (l % 4))) & 0xFF;
+    const uint s = (block[Scales + j / 2] >> (4 * (j % 2))) & 15;
+    const float sign = (block[Signs + 4 * j + l / 8] >> (l % 8)) & 1 ? -1.0f : 1.0f;
+    return bfloat(float(gguf_half(block, D)) * float(1 + 2 * s) * float(magnitude) * sign);
+  }
+};
 // Inlined, with each format's value, so every gather stays one function (the
 // compiler otherwise keeps Q6_K's as a call).
 template <class F>
@@ -177,4 +216,7 @@ GGUF_EMBEDDING_ENTRY(gguf_embed_q2k, GgufEmbedQ2K)
 GGUF_EMBEDDING_ENTRY(gguf_embed_q40, GgufEmbedQ40)
 GGUF_EMBEDDING_ENTRY(gguf_embed_q41, GgufEmbedQ41)
 GGUF_EMBEDDING_ENTRY(gguf_embed_pq20, GgufEmbedPQ20)
+GGUF_EMBEDDING_ENTRY(gguf_embed_iq4nl, GgufEmbedIQ4NL)
+GGUF_EMBEDDING_ENTRY(gguf_embed_iq4xs, GgufEmbedIQ4XS)
+GGUF_EMBEDDING_ENTRY(gguf_embed_iq3s, GgufEmbedIQ3S)
 #undef GGUF_EMBEDDING_ENTRY

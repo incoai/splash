@@ -470,7 +470,7 @@ void requireAtomicImageAdmission(model::Runtime &executor,
                     : executor.begin(image.modelView())).granted(),
             "image could not retry after an execution lane became free");
     executor.end(image.id);
-    while (executor.reclaimIdleState()) {
+    while (executor.reclaimIdleState(false)) {
     }
     require(backend.memoryStats().allocatedBytes == originalBytes,
             "full-lane image test leaked resources");
@@ -514,13 +514,13 @@ void requireAtomicImageAdmission(model::Runtime &executor,
           require(threw == throwing, "image admission exception was lost");
           require(backend.memoryStats().allocatedBytes == before,
                   "failed image admission retained or removed shared buffers");
-          require(executor.reclaimIdleState() == 0,
+          require(executor.reclaimIdleState(false) == 0,
                   "failed image admission created false reclamation progress");
         }
       }
       if (sharedVision) {
         executor.end(keeper.id);
-        while (executor.reclaimIdleState()) {
+        while (executor.reclaimIdleState(false)) {
         }
       }
     }
@@ -529,7 +529,7 @@ void requireAtomicImageAdmission(model::Runtime &executor,
                     : executor.begin(image.modelView())).granted(),
             "image request could not retry after allocation failure");
     executor.end(image.id);
-    while (executor.reclaimIdleState()) {
+    while (executor.reclaimIdleState(false)) {
         }
     require(backend.memoryStats().allocatedBytes == originalBytes,
             "image admission test leaked resources");
@@ -548,7 +548,7 @@ void requireImageRowsAfterReclaim(model::Runtime &executor,
                                   model::QwenStateStorage &states,
                                   const model::ModelPackage &model,
                                   AllocationFault &fault) {
-  while (executor.reclaimIdleState()) {
+  while (executor.reclaimIdleState(false)) {
   }
   const uint64_t originalBytes = backend.memoryStats().allocatedBytes;
   const uint64_t encodesBefore = executor.telemetry().imageEncodes;
@@ -573,7 +573,7 @@ void requireImageRowsAfterReclaim(model::Runtime &executor,
                BatchCohort::Greedy, false);
   // Nothing else is idle, so the pass releases exactly the encoder arena.
   uint64_t reclaimed = 0;
-  while (const uint64_t bytes = executor.reclaimIdleState())
+  while (const uint64_t bytes = executor.reclaimIdleState(false))
     reclaimed += bytes;
   const uint64_t encoderBytes = ops::Vision::scratchBytes(
       model.vision.tensors.layout, ops::kMaximumImagePatches);
@@ -647,13 +647,13 @@ void requireImageRowsAfterReclaim(model::Runtime &executor,
   // frees nothing, so the reclaimer must not credit those bytes.
   const uint64_t heldBytes = backend.memoryStats().allocatedBytes;
   uint64_t released = 0;
-  while (const uint64_t bytes = executor.reclaimIdleState())
+  while (const uint64_t bytes = executor.reclaimIdleState(false))
     released += bytes;
   require(released == heldBytes - backend.memoryStats().allocatedBytes,
           "reclaim credited cached rows a live request still holds");
   executor.end(request.id);
 
-  while (executor.reclaimIdleState()) {
+  while (executor.reclaimIdleState(false)) {
   }
   require(backend.memoryStats().allocatedBytes == originalBytes,
           "image requests leaked resources");
@@ -664,7 +664,7 @@ void requireRepeatedImagePlacements(model::Runtime &executor,
                                      metal::MetalBackend &backend,
                                      model::QwenStateStorage &states,
                                      AllocationFault &fault) {
-  while (executor.reclaimIdleState()) {
+  while (executor.reclaimIdleState(false)) {
   }
   const uint64_t originalBytes = backend.memoryStats().allocatedBytes;
   std::vector<uint32_t> prompt(128);
@@ -680,7 +680,7 @@ void requireRepeatedImagePlacements(model::Runtime &executor,
   const uint64_t singleImageBytes =
       backend.memoryStats().allocatedBytes - originalBytes;
   executor.end(request.id);
-  while (executor.reclaimIdleState()) {
+  while (executor.reclaimIdleState(false)) {
   }
   require(backend.memoryStats().allocatedBytes == originalBytes,
           "single image allocation fixture retained memory");
@@ -719,7 +719,7 @@ void requireRepeatedImagePlacements(model::Runtime &executor,
           "repeated image placements encoded more than once");
   const auto expected = sampleCommittedState(states, slot);
   executor.end(request.id);
-  while (executor.reclaimIdleState()) {
+  while (executor.reclaimIdleState(false)) {
   }
 
   // The first placement is covered by the prefix, but its later duplicates
@@ -737,7 +737,7 @@ void requireRepeatedImagePlacements(model::Runtime &executor,
                           true);
   executor.end(request.id);
   checkpoint.reset();
-  while (executor.reclaimIdleState()) {
+  while (executor.reclaimIdleState(false)) {
   }
   require(backend.memoryStats().allocatedBytes == originalBytes,
           "repeated image placements retained resources");

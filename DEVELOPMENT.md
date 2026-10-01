@@ -35,7 +35,8 @@ whose message names the last failure.
 Use `--max-context 100K` or `--max-memory 28G` to set optional limits. Memory
 limits cap Metal allocations, not combined process RSS. Agents must already be
 installed; `./splash claude|opencode|codex|hermes|pi|omp` connects to the running server.
-Arguments pass through, for example `./splash codex resume --last`.
+Arguments pass through, for example `./splash codex resume --last` or
+`./splash hermes chat -q "Hello"`.
 
 Set `SPLASH_API_KEY` in the server and agent shells to require authentication;
 `serve --api-key KEY` overrides the server's environment value. API requests
@@ -56,7 +57,7 @@ every connection slot is taken, the first with that 503, so stalled clients
 cannot lock others out. Image and model context limits apply independently.
 Stored Responses history is charged before decoding. Uploads allow 30 seconds
 of inactivity; total upload time is limited to 30 seconds plus the body size
-at 512 KiB/s (286 seconds for 128 MiB), capped by the overall request deadline.
+at 512 KiB/s (286 seconds for 128 MiB), capped by `--request-timeout` when set.
 Timed-out uploads return 408 and release their input reservation. An upload
 refused before it is read, such as one over the shared budget, is still
 received on these terms, so a client that sends its whole body before reading
@@ -105,8 +106,10 @@ loopback, so use a listener that includes loopback when launching agents locally
 | `--max-context` | Auto | Context limit, up to `256K`, e.g. `100K`. |
 | `--max-cache-disk` | `0` (off) | Session-local SSD cache, e.g. `16G`. See [disk cache](#disk-cache). |
 | `--kv-format` | `int8` | Target KV storage: `int8` or `bf16`. |
+| `--decode-share` | `0.5` | Decode time owed per unit of prefill time while other requests generate. Higher keeps their output faster during a long prompt and slows that prompt; `0` alternates one command each. |
 | `--max-image-pixels` | `4194304` | Maximum resized pixels per image. |
-| `--request-timeout` | `1800` | Seconds a request may take from its arrival; a request's own `timeout` can only shorten it. |
+| `--request-timeout` | None | Seconds a request may take from its arrival; a request's own `timeout` can only shorten it. |
+| `--queue-size` | `32` | Requests admitted at once, running or waiting; more get 503 with `Retry-After`. |
 | `--allowed-host` | No extra names | Additional HTTP Host name, e.g. `mymac.local`; repeatable. |
 | `--api-key` | `SPLASH_API_KEY` or none | Require a bearer token or `x-api-key`. |
 | `--no-webui` | Off | Disable the chat page. |
@@ -123,6 +126,12 @@ cannot fit, startup prints a memory budget breakdown and stops.
 a server on another port), preserving other providers, settings and sessions.
 The browser chat and agent launchers connect to the running server; a model
 need not appear in a client's catalog to serve it by its full repository ID.
+`splash opencode`, `pi` and `hermes` configure an output limit per response
+of 32K tokens (`CLIENT_RESPONSE_TOKENS` in `install/clients.py`); OpenCode and
+Hermes, which reserve it out of the context they compact at, get a quarter of
+a context under 128K instead. Hermes 2026.9.7 and later ignore it and, like
+Codex, leave the limit to the server; Claude Code keeps its own, which
+`CLAUDE_CODE_MAX_OUTPUT_TOKENS` raises.
 
 `splash omp` connects [Oh My Pi](https://github.com/can1357/oh-my-pi) to the
 running server. It adds the same per-port provider to OMP's `models.yml`
@@ -197,6 +206,11 @@ splash serve --model mlx-community/Qwen3.8-27B-4bit --default-reasoning-effort n
 
 `/apply-template` uses the same default. Anthropic `thinking` keeps its protocol
 semantics (off when omitted); judgment endpoints always disable thinking.
+
+A Chat request's `chat_template_kwargs`, as vLLM and SGLang accept them, are
+passed to the template as variables and outrank the effort, so
+`{"enable_thinking": false}` turns reasoning off. They cannot set what Splash
+passes itself, such as `tools` or `add_generation_prompt`.
 
 ## Upstream model loading
 
@@ -525,6 +539,17 @@ and represent different operator contracts. Arena sizing collects each
 projection's actual layout (a GGUF target's block projections beside its
 affine draft's) and reserves the vocabulary head only for decode.
 
+Affine Q4 decode (`runtime/ops/Linear.cpp`) runs MPP tiles on Apple10 and later
+(the M6 reports family 11 and runs the same rules) and bf16 simdgroup matrix
+tiles on Apple9. On Apple10 a projection with at most two N128 tiles per core
+runs that tile over two, four or eight K partitions (`LinearTile::Split128`,
+`kernels/decode/linear_q4_grid_split.metal`), the most whose split grid still
+fits four 256-thread threadgroups per core; the last partition of each tile
+adds the fp32 partials in split order, so the sums do not depend on
+scheduling. The split count depends on the grid per core, never on the batch
+width, so a request's sums are the same alone and batched. Every other
+projection keeps the sequential tiles (`dev/benchmarks/device-policy.md`).
+
 ### GGUF targets
 
 `--model unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M` selects the repository's
@@ -540,15 +565,20 @@ and lists every unsupported tensor in one error:
 - linears and experts: Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, Q4_1,
   IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL,
   MXFP4 or PQ2_0;
-- token embeddings: Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, Q4_1 or PQ2_0;
+- token embeddings: Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, Q4_1, IQ3_S,
+  IQ4_NL or IQ4_XS, every type llama-quantize gives a token table by default
+  in a file whose linears load, and Prism's PQ2_0;
 - norms, the MoE router and shared-expert scalar gate, and the GDN
   convolution, decay and time-step bias: F32;
-- GDN alpha and beta: both Q8_0, both F32 or both BF16, which preparation
-  widens to the F32 values it equals.
+- GDN alpha and beta: both of one type, any of the linears' formats (one
+  segment of the GDN input projection), F32 or BF16, which preparation widens
+  to the F32 values it equals.
 
-Of Unsloth's files in September 2026 that covers every file of Qwen3.8-27B
-and Qwen3.6-35B-A3B, from UD-IQ1_S up, but UD-Q8_K_XL and BF16, whose BF16
-tensors need kernels that do not exist yet. PQ2_0 is Prism ML's type 142,
+Of Unsloth's files in September 2026 that covers every file of Qwen3.8-27B and
+Qwen3.6-35B-A3B, from UD-IQ1_S up, but UD-Q8_K_XL and BF16, whose BF16 tensors
+need kernels that do not exist yet. llama-quantize's default type selection
+stores alpha and beta in the file type's format (Q4_K in a Q4_K_M), as in
+lmstudio-community's files, so those load too. PQ2_0 is Prism ML's type 142,
 `block_pq2_0` of PrismML-Eng/llama.cpp, which upstream GGML does not define:
 2-bit codes q worth d (q - 1) with one half d per 128 weights. A format's
 image takes the bits per weight of its GGUF blocks, but for Q3_K's and Q6_K's
@@ -561,9 +591,9 @@ tensors whose weights multiply H (D x), H the normalized Walsh-Hadamard
 transform of each block of 1024 inputs and D an explicit sign per input, and
 the token table, whose rows are stored as H (D e). The engine runs that one
 form, on dense targets whose rotation names exactly the tensors the planner
-repacks (every quantized projection and the head, and alpha/beta when Q8_0),
-a PQ2_0 token table, and GDN value heads in grouped order (the installer
-screens the parameters, `GgufFile` and the planner check the rest).
+repacks (every quantized projection and the head, and alpha/beta when
+quantized), a PQ2_0 token table, and GDN value heads in grouped order (the
+installer screens the parameters, `GgufFile` and the planner check the rest).
 A rotated projection rotates its input once into `LinearScratch::rotated`
 (`gguf_rotate`, in fp32 and rounded once to bf16) before its quantized
 segments, whose kernels are the format's, while float segments read the input
@@ -743,6 +773,19 @@ SGLang, or to what the context leaves when that is less. `temperature`,
 `stream_options.include_usage` work as in Chat. Batched prompts, `suffix`,
 `echo`, `logprobs`, `best_of` and `n` other than 1 are rejected.
 
+Chat's `max_completion_tokens` or `max_tokens` and Responses'
+`max_output_tokens` bound a response's output. Omitted, the output may use
+all the context the prompt leaves, as in vLLM and SGLang: the context limit,
+and `--request-timeout` when set, are the only server bounds on a request that
+names no limit. A value larger than what the context leaves returns 400
+`context_length_exceeded` with the prompt's tokens, the value and the window,
+as in vLLM and SGLang; that error and an invalid value's name the field the
+request sent. Messages requires `max_tokens`; a larger value than the context
+leaves generates up to the context limit, since Claude Code asks for the same
+limit on every turn and does not compact for it. A response the context limit
+ends then has the `stop_reason` `model_context_window_exceeded`, as in
+Anthropic's API, not `max_tokens`.
+
 Chat and text completions accept `"ignore_eos":true` (default false), as vLLM
 and llama.cpp do: the model never selects its own stop tokens, and a draft
 proposal of one is rejected, so generation runs to its output budget and
@@ -837,7 +880,9 @@ requests, or with other prefixes cached, it can differ.
 
 Long prefill uses disposable rolling checkpoints every 4096 tokens. Contended
 prefill adapts toward a 500 ms slice, keeping 2048-token chunks for long unopposed
-work. These policies do not extend client deadlines. Memory recovery waits are
+work. While requests of the same or a higher priority decode, each slice owes
+them decode time, `--decode-share` times its own, before the next slice runs.
+These policies do not extend client deadlines. Memory recovery waits are
 bounded: after a suspension, new work waits for resident requests only while
 memory is still short, and at most for the 30 s resource wait; suspended
 requests then resume first, each within its own resource wait. A resource

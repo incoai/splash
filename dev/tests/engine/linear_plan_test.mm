@@ -94,8 +94,18 @@ uint32_t expectedGroups(uint32_t tiles, uint32_t cores, GroupRule rule) {
   return rule.wave * cores;
 }
 
-// Apple10 one-lane MPP rules: paired N256 from eight tiles per core.
-// Split-K is available for offline experiments but never selected by default.
+// Apple10's K splits of the Split128 tile, the same at every lane count: the
+// largest power of two up to eight whose grid of 128-column threadgroups fits
+// four per core, every partition keeping one 256-input block.
+uint32_t expectedApple10Splits(uint32_t cores, LinearMatrix matrix) {
+  uint32_t selected = 1;
+  for (const uint32_t split : {2U, 4U, 8U})
+    if (uint64_t{matrix.outputSize / 128} * split <= 4ULL * cores && matrix.inputSize / 256 >= split)
+      selected = split;
+  return selected;
+}
+
+// Apple10 one-lane MPP rule: paired N256 from eight tiles per core.
 std::optional<LinearConfig> expectedOneLane(uint32_t cores,
                                             LinearMatrix matrix, LinearEpilogue epilogue) {
   const uint32_t n = matrix.outputSize;
@@ -121,6 +131,9 @@ LinearConfig expectedDecode(uint32_t family, uint32_t cores, LinearMatrix matrix
     }
     return {LinearTile::Simdgroup, grid, LinearSimdgroups::Four, selected};
   }
+  if (family >= 10)
+    if (const uint32_t splits = expectedApple10Splits(cores, matrix); splits > 1)
+      return {LinearTile::Split128, matrix.outputSize / 128, LinearSimdgroups::Eight, splits};
   constexpr GroupRule n128{4, 4, 12}, m16{5, 4, 12}, n256{3, 3, 8}, gateUp{3, 3, 8},
       fourSimdgroups{8, 8, 24};
   const uint32_t tiles128 = matrix.outputSize / 128;
@@ -137,8 +150,6 @@ LinearConfig expectedDecode(uint32_t family, uint32_t cores, LinearMatrix matrix
     return {LinearTile::N256, std::min(tiles256, uint32_t(std::lround(2.25 * cores)))};
   }
   if (lanes == 1) return {LinearTile::Paired128, groups(tiles128, n128)};
-  if (family >= 10 && lanes == 3 && tiles128 <= cores && matrix.inputSize >= 4096)
-    return {LinearTile::N128, tiles128, LinearSimdgroups::Eight};
   if (lanes == 3 && (family >= 10 ||
       (family == 9 && epilogue == LinearEpilogue::None)))
     return {LinearTile::N128, groups(tiles128, fourSimdgroups), LinearSimdgroups::Four};
@@ -158,10 +169,17 @@ LinearConfig expectedPrefill(uint32_t family, uint32_t cores, LinearWorkload w) 
                                                                            : LinearTile::N128, 0};
 }
 
+// The rows suffix of a batched decode kernel.
+std::string rowsSuffix(uint32_t lanes) { return lanes > 1 ? "_m" + std::to_string(lanes * 8) : ""; }
+
 std::string expectedPipeline(LinearConfig expected, uint32_t lanes, LinearEpilogue epilogue) {
   if (expected.tile == LinearTile::Simdgroup)
     return epilogue == LinearEpilogue::GateUp ? "decode_linear_q4_sg_gate_up" :
         epilogue == LinearEpilogue::Residual ? "decode_linear_q4_sg_residual" : "decode_linear_q4_sg";
+  // Gate/up runs the plain split kernel as its gate pass.
+  if (expected.tile == LinearTile::Split128)
+    return std::string("decode_linear_q4_n128_split") +
+        (epilogue == LinearEpilogue::Residual ? "_residual" : "") + rowsSuffix(lanes);
   if (expected.tile == LinearTile::Paired256) return "decode_linear_q4_n256_paired_sg4";
   if (epilogue == LinearEpilogue::GateUp)
     return lanes == 1 ? "decode_linear_q4_n256_gate_up" : lanes == 2 ? "decode_linear_q4_n256_gate_up_m16"
@@ -174,10 +192,13 @@ std::string expectedPipeline(LinearConfig expected, uint32_t lanes, LinearEpilog
   return name;
 }
 
-// The N256 gate/up tile runs three and four lanes as the gate projection and
-// then the up projection with the SiLU product.
+// Split128 at every lane count and the N256 gate/up tile at three and four
+// lanes run gate/up as the gate projection and then the up projection with the
+// SiLU product.
 std::string expectedSecondPipeline(LinearConfig expected, uint32_t lanes, LinearEpilogue epilogue) {
-  if (epilogue != LinearEpilogue::GateUp || lanes < 3 || expected.tile == LinearTile::Simdgroup) return {};
+  if (epilogue != LinearEpilogue::GateUp || expected.tile == LinearTile::Simdgroup) return {};
+  if (expected.tile == LinearTile::Split128) return "decode_linear_q4_n128_split_up_silu" + rowsSuffix(lanes);
+  if (lanes < 3) return {};
   return "decode_linear_q4_n256_up_silu_m" + std::to_string(lanes * 8);
 }
 
@@ -192,12 +213,16 @@ std::string expectedPrefillPipeline(LinearConfig expected, LinearEpilogue epilog
 // The simdgroup tile reads the Table64 activation table its producer writes
 // (tableBytes and tableSumsBytes) and, split over K, reduces two fp32 fragment
 // streams per partition, row and column with one completion counter per lane
-// and column tile; one partition binds one-element placeholders. Every other
-// affine tile reads the plain rows and binds no scratch.
+// and column tile; one partition binds one-element placeholders. Split128
+// reduces one fp32 partial per partition, row and column with one counter per
+// column tile, which covers every lane. Every other affine tile reads the
+// plain rows and binds no scratch.
 constexpr uint64_t kFragmentStreams = 2;
 LinearScratchSize expectedScratch(LinearConfig expected, LinearWorkload w, uint32_t tileColumns) {
-  if (expected.tile != LinearTile::Simdgroup) return {};
   const auto [n, k] = w.matrix;
+  if (expected.tile == LinearTile::Split128)
+    return {0, 0, uint64_t{expected.splits} * w.rows * n * sizeof(float), uint64_t{n / tileColumns} * sizeof(uint32_t)};
+  if (expected.tile != LinearTile::Simdgroup) return {};
   const uint64_t lanes = w.rows / 8;
   const bool split = expected.splits > 1;
   return {tableBytes(k, w.rows), tableSumsBytes(LinearInput::Table64, k, w.rows),
@@ -226,7 +251,7 @@ void checkAffineDecode(const Linear &linear, uint32_t family, uint32_t reportedC
   const bool simdgroup = expected.tile == LinearTile::Simdgroup;
   const uint32_t columns = simdgroup ? (w.epilogue == LinearEpilogue::GateUp ? 32U : 64U)
       : expected.tile == LinearTile::N256 || expected.tile == LinearTile::Paired256 ? 256U : 128U;
-  rule(plan.tileColumns() == columns && plan.partialSums() == (simdgroup ? expected.splits : 1U),
+  rule(plan.tileColumns() == columns && plan.partialSums() == expected.splits,
        "affine decode tile geometry differs from its configuration");
   rule(plan.input() == (simdgroup ? LinearInput::Table64 : LinearInput::Plain),
        "affine decode input layout differs from its tile");
@@ -280,23 +305,6 @@ constexpr std::array kProductionShapes{
     ProductionShape{{6144, 4352}, LinearEpilogue::GateUp},
     ProductionShape{{2048, 768}, LinearEpilogue::None}};
 
-void narrowM24BoundaryPlans() {
-  for (uint32_t cores : {16U, 20U}) {
-    const Linear linear = gpu(10, cores);
-    for (auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual}) {
-      // Explicit values on both sides of the tile and K boundaries.
-      for (auto [matrix, threads] : std::array<std::pair<LinearMatrix, uint32_t>, 4>{{
-               {{cores * 128, 4096}, 256}, {{cores * 128 + 256, 4096}, 128},
-               {{cores * 128, 3840}, 128}, {{256, 16384}, 256}}}) {
-        const auto plan = linear.plan({matrix, 24, LinearPhase::Decode, epilogue});
-        require(plan.threadsPerThreadgroup() == threads &&
-                    plan.configuration().groups == matrix.outputSize / 128,
-                "narrow M24 occupancy boundary changed");
-      }
-    }
-  }
-}
-
 void baselinePlans() {
   for (const uint32_t family : {9U, 10U, 11U}) {
     for (const uint32_t reportedCores : {0U, 8U, 10U, 16U, 18U, 20U, 31U, 32U, 33U, 40U, 80U}) {
@@ -340,23 +348,32 @@ void baselinePlans() {
               configured(9, 16, {{16640, 5120}, 16}) == LinearConfig{LinearTile::Simdgroup, 260, LinearSimdgroups::Four, 1} &&
               configured(9, 20, {{16640, 5120}, 32}) == LinearConfig{LinearTile::N256, 65},
           "Apple9 decode grids changed without a measurement");
-  // Former split-K defaults return to sequential tiles. Apple9 simdgroup and
-  // wide paired N256 anchors remain unchanged.
+  // Apple10 splits K where the Split128 grid fits four threadgroups per core
+  // and keeps the sequential tiles elsewhere; Apple9 simdgroup and wide
+  // paired N256 anchors are unchanged.
   const LinearWorkload mixer27{{5120, 6144}, 8, LinearPhase::Decode, LinearEpilogue::Residual};
   const LinearWorkload mixer35{{2048, 4096}, 8, LinearPhase::Decode, LinearEpilogue::Residual};
   const LinearWorkload draftGateUp{{6144, 2048}, 8, LinearPhase::Decode, LinearEpilogue::GateUp};
-  require(configured(10, 20, mixer27) == LinearConfig{LinearTile::Paired128, 40} &&
+  const auto split = [](uint32_t n, uint32_t splits) {
+    return LinearConfig{LinearTile::Split128, n / 128, LinearSimdgroups::Eight, splits};
+  };
+  require(configured(10, 20, mixer27) == split(5120, 2) &&
               configured(10, 16, mixer27) == LinearConfig{LinearTile::Paired128, 40} &&
-              configured(10, 20, mixer35) == LinearConfig{LinearTile::Paired128, 16} &&
-              configured(10, 16, mixer35) == LinearConfig{LinearTile::Paired128, 16} &&
-              configured(10, 10, mixer35) == LinearConfig{LinearTile::Paired128, 16} &&
+              configured(10, 40, mixer27) == split(5120, 4) &&
+              configured(10, 20, mixer35) == split(2048, 4) &&
+              configured(10, 16, mixer35) == split(2048, 4) &&
+              configured(10, 10, mixer35) == split(2048, 2) &&
+              configured(10, 40, mixer35) == split(2048, 8) &&
               configured(10, 10, {{5120, 17408}, 8}) == LinearConfig{LinearTile::Paired128, 40} &&
-              configured(10, 20, {{1280, 5120}, 8}) == LinearConfig{LinearTile::Paired128, 10} &&
-              configured(10, 16, {{256, 5120}, 8}) == LinearConfig{LinearTile::Paired128, 2} &&
+              configured(10, 20, {{1280, 5120}, 8}) == split(1280, 8) &&
+              configured(10, 16, {{1280, 5120}, 8}) == split(1280, 4) &&
+              configured(10, 16, {{256, 5120}, 8}) == split(256, 8) &&
               configured(10, 20, {{6144, 5120}, 8}) == LinearConfig{LinearTile::Paired128, 48} &&
+              configured(10, 40, {{6144, 5120}, 8}) == split(6144, 2) &&
               configured(10, 20, draftGateUp) == LinearConfig{LinearTile::N256, 24} &&
-              configured(10, 16, draftGateUp) == LinearConfig{LinearTile::N256, 24},
-          "Apple10 sequential defaults were not restored");
+              configured(10, 16, draftGateUp) == LinearConfig{LinearTile::N256, 24} &&
+              configured(10, 40, draftGateUp) == split(6144, 2),
+          "Apple10 K split anchors changed");
   require(configured(9, 40, mixer27) == LinearConfig{LinearTile::Simdgroup, 80, LinearSimdgroups::Four, 8} &&
               configured(9, 40, {{16640, 5120}, 8}) == LinearConfig{LinearTile::Simdgroup, 260, LinearSimdgroups::Four, 4} &&
               configured(9, 40, {{5120, 17408}, 8}) == LinearConfig{LinearTile::Simdgroup, 80, LinearSimdgroups::Four, 8} &&
@@ -378,14 +395,15 @@ void baselinePlans() {
                   LinearConfig{LinearTile::Paired256, 80, LinearSimdgroups::Four} &&
               configured(10, 20, {{40704, 5120}, 8}) == LinearConfig{LinearTile::Paired128, 318},
           "one-lane paired N256 anchors changed");
-  // K % 1024 != 0 is legal for matrix tiles; Apple10 keeps its shipped rules.
-  require(configured(10, 20, {{5120, 4352}, 8}) == LinearConfig{LinearTile::Paired128, 40} &&
+  // K % 1024 != 0 is legal for matrix tiles, and Split128 partitions differ by
+  // at most one 256-input block (17 into 8 and 9, 3 into 1 and 2).
+  require(configured(10, 20, {{5120, 4352}, 8}) == split(5120, 2) &&
               configured(9, 40, {{5120, 4352}, 8, LinearPhase::Decode, LinearEpilogue::Residual}) ==
                   LinearConfig{LinearTile::Simdgroup, 80, LinearSimdgroups::Four, 4} &&
               configured(9, 40, {{6144, 4352}, 8, LinearPhase::Decode, LinearEpilogue::GateUp}) ==
                   LinearConfig{LinearTile::Simdgroup, 192, LinearSimdgroups::Four, 4} &&
-              configured(10, 20, {{2048, 768}, 8}) == LinearConfig{LinearTile::Paired128, 16} &&
-              configured(10, 20, {{2048, 4096}, 16}) == LinearConfig{LinearTile::N128, 16} &&
+              configured(10, 20, {{2048, 768}, 8}) == split(2048, 2) &&
+              configured(10, 20, {{2048, 4096}, 16}) == split(2048, 4) &&
               configured(9, 40, {{5120, 6144}, 24, LinearPhase::Decode, LinearEpilogue::Residual}) ==
                   LinearConfig{LinearTile::Simdgroup, 80, LinearSimdgroups::Four, 8} &&
               configured(10, 20, {{6144, 2048}, 32, LinearPhase::Decode, LinearEpilogue::GateUp}) ==
@@ -460,12 +478,13 @@ void planContracts(uint32_t family, uint32_t cores, size_t &widestCandidates) {
         widestCandidates = std::max(widestCandidates, candidates.size());
         require(candidates.front().configuration() == linear.plan(workload).configuration(),
                 "Linear baseline is not first candidate");
-        uint32_t fourScopeCandidates = 0, splitCandidates = 0, simdgroupCandidates = 0;
+        uint32_t fourScopeCandidates = 0, splitCandidates = 0, split128Candidates = 0, simdgroupCandidates = 0;
         for (size_t index = 0; index < candidates.size(); ++index) {
           const auto &plan = candidates[index];
           const bool four = plan.configuration().simdgroups == LinearSimdgroups::Four;
           const auto tile = plan.configuration().tile;
           const bool split = tile == LinearTile::Split32 || tile == LinearTile::Split64;
+          const bool split128 = tile == LinearTile::Split128;
           if (split) {
             ++splitCandidates;
             require(lanes == 1 && matrix.inputSize % 1024 == 0 && plan.partialSums() == 4 &&
@@ -473,6 +492,13 @@ void planContracts(uint32_t family, uint32_t cores, size_t &widestCandidates) {
                         (epilogue != LinearEpilogue::GateUp || tile == LinearTile::Split32) &&
                         plan.secondPipeline().empty(),
                     "split-K candidate escaped its one-lane full-grid contract");
+          } else if (split128) {
+            ++split128Candidates;
+            const uint32_t splits = plan.configuration().splits;
+            require(splits >= 2 && matrix.inputSize / 256 >= splits && plan.partialSums() == splits &&
+                        plan.configuration().groups == matrix.outputSize / 128 &&
+                        plan.secondPipeline().empty() == (epilogue != LinearEpilogue::GateUp),
+                    "Split128 candidate escaped its full-grid contract");
           } else if (plan.usesSimdgroup()) {
             ++simdgroupCandidates;
             require(family == 9 && four &&
@@ -499,8 +525,9 @@ void planContracts(uint32_t family, uint32_t cores, size_t &widestCandidates) {
                   "Linear plan scope/thread count disagree");
           require(plan.storageRows() == lanes * 8 && !plan.sumsBytes() && !plan.downSumsBytes(),
                   "decode storage/sums contract changed");
-          require(plan.gateScratchBytes() == (epilogue == LinearEpilogue::GateUp && lanes >= 3 && !plan.usesSimdgroup()
-                      ? uint64_t{lanes} * 8 * matrix.outputSize * 2 : 0),
+          require(plan.gateScratchBytes() ==
+                      (epilogue == LinearEpilogue::GateUp && (split128 || (lanes >= 3 && !plan.usesSimdgroup()))
+                           ? uint64_t{lanes} * 8 * matrix.outputSize * 2 : 0),
                   "decode gate scratch disagrees with decomposition");
           for (size_t prior = 0; prior < index; ++prior)
             require(candidates[prior].configuration() != plan.configuration(),
@@ -522,6 +549,12 @@ void planContracts(uint32_t family, uint32_t cores, size_t &widestCandidates) {
         require(splitCandidates == (lanes == 1 && matrix.inputSize % 1024 == 0
                                         ? (epilogue == LinearEpilogue::GateUp ? 1U : 2U) : 0U),
                 "Linear candidate set omitted or added split-K plans");
+        // Apple10 lists Split128 at every lane count and each K split its
+        // blocks allow.
+        uint32_t legalSplit128 = 0;
+        if (family >= 10)
+          for (uint32_t split : {2U, 4U, 8U}) legalSplit128 += matrix.inputSize / 256 >= split;
+        require(split128Candidates == legalSplit128, "Linear candidate set omitted or added Split128 plans");
       }
     }
     for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
@@ -578,8 +611,10 @@ void planContracts(uint32_t family, uint32_t cores, size_t &widestCandidates) {
   rejects([&] { (void)Linear::plan({{512, 256}, 8, LinearPhase::Decode, LinearEpilogue::GateUp}, {LinearTile::N128, 1}); });
   rejects([&] { (void)Linear::plan({{512, 256}, 8, LinearPhase::Prefill, LinearEpilogue::UpWithGate}, {LinearTile::N128, 0}); });
   // Split tiles: one lane, K % 1024 == 0, the full grid and the kernel's own
-  // simdgroup count; Split64 has no gate/up form. Paired256: one lane, plain
-  // epilogue, four simdgroups. Neither exists in prefill.
+  // simdgroup count; Split64 has no gate/up form. Split128: the full grid,
+  // eight simdgroups and two to eight K partitions of at least one 256-input
+  // block, at every lane count and epilogue. Paired256: one lane, plain
+  // epilogue, four simdgroups. None exists in prefill.
   const LinearWorkload splitWorkload{{512, 1024}, 8, LinearPhase::Decode, LinearEpilogue::None};
   const LinearWorkload splitResidual{{512, 1024}, 8, LinearPhase::Decode, LinearEpilogue::Residual};
   const LinearWorkload splitGateUp{{512, 1024}, 8, LinearPhase::Decode, LinearEpilogue::GateUp};
@@ -603,7 +638,27 @@ void planContracts(uint32_t family, uint32_t cores, size_t &widestCandidates) {
       {LinearTile::Simdgroup, 8, LinearSimdgroups::Eight, 4}); });
   const LinearConfig split32{LinearTile::Split32, 16, LinearSimdgroups::Four};
   const LinearConfig split64{LinearTile::Split64, 8, LinearSimdgroups::Eight};
+  const LinearConfig split128{LinearTile::Split128, 4, LinearSimdgroups::Eight, 4};
   const LinearConfig paired256{LinearTile::Paired256, 2, LinearSimdgroups::Four};
+  for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
+    const std::string rows = rowsSuffix(lanes);
+    const LinearWorkload plain{{512, 1024}, lanes * 8, LinearPhase::Decode, LinearEpilogue::None};
+    const auto plan = Linear::plan(plain, split128);
+    require(plan.pipeline() == "decode_linear_q4_n128_split" + rows && plan.threadsPerThreadgroup() == 256 &&
+                plan.tileColumns() == 128 && plan.partialSums() == 4 && plan.secondPipeline().empty() &&
+                plan.storageRows() == lanes * 8 && plan.input() == LinearInput::Plain &&
+                sameScratch(plan.scratchSize(), expectedScratch(split128, plain, 128)),
+            "Split128 plan geometry, pipeline or scratch is wrong");
+    require(Linear::plan({plain.matrix, lanes * 8, LinearPhase::Decode, LinearEpilogue::Residual}, split128)
+                    .pipeline() == "decode_linear_q4_n128_split_residual" + rows,
+            "Split128 residual pipeline is wrong");
+    const auto gateUpPlan = Linear::plan({plain.matrix, lanes * 8, LinearPhase::Decode, LinearEpilogue::GateUp},
+                                         split128);
+    require(gateUpPlan.pipeline() == "decode_linear_q4_n128_split" + rows &&
+                gateUpPlan.secondPipeline() == "decode_linear_q4_n128_split_up_silu" + rows &&
+                gateUpPlan.gateScratchBytes() == uint64_t{lanes} * 8 * 512 * 2,
+            "Split128 gate/up runs a gate pass into the gate scratch and an up pass");
+  }
   {
     const auto plan = Linear::plan(splitWorkload, split64);
     require(plan.pipeline() == "decode_linear_q4_n64_split4" && plan.threadsPerThreadgroup() == 256 &&
@@ -629,6 +684,12 @@ void planContracts(uint32_t family, uint32_t cores, size_t &widestCandidates) {
   }
   rejects([&] { (void)Linear::plan(splitWorkload, {LinearTile::Split32, 16, LinearSimdgroups::Eight}); });
   rejects([&] { (void)Linear::plan(splitWorkload, {LinearTile::Split64, 8, LinearSimdgroups::Four}); });
+  // Split128 takes eight simdgroups, the full grid and 2, 4 or 8 partitions
+  // of at least one block: 1024 inputs hold four.
+  rejects([&] { (void)Linear::plan(splitWorkload, {LinearTile::Split128, 4, LinearSimdgroups::Four, 4}); });
+  rejects([&] { (void)Linear::plan(splitWorkload, {LinearTile::Split128, 2, LinearSimdgroups::Eight, 4}); });
+  for (const uint32_t splits : {0U, 1U, 3U, 8U, 16U})
+    rejects([&] { (void)Linear::plan(splitWorkload, {LinearTile::Split128, 4, LinearSimdgroups::Eight, splits}); });
   rejects([&] { (void)Linear::plan(splitWorkload, {LinearTile::Paired256, 2, LinearSimdgroups::Eight}); });
   rejects([&] { (void)Linear::plan(splitWorkload, {LinearTile::Split32, 8, LinearSimdgroups::Four}); });
   rejects([&] { (void)Linear::plan(splitWorkload, {LinearTile::Split64, 4, LinearSimdgroups::Eight}); });
@@ -644,6 +705,8 @@ void planContracts(uint32_t family, uint32_t cores, size_t &widestCandidates) {
   for (const auto tile : {LinearTile::Split32, LinearTile::Split64, LinearTile::Paired256})
     rejects([&] { (void)Linear::plan({{512, 1024}, 32, LinearPhase::Prefill},
         {tile, 0, tile == LinearTile::Split64 ? LinearSimdgroups::Eight : LinearSimdgroups::Four}); });
+  rejects([&] { (void)Linear::plan({{512, 1024}, 32, LinearPhase::Prefill},
+                                   {LinearTile::Split128, 0, LinearSimdgroups::Eight, 4}); });
   const LinearWorkload fourWorkload{{512, 256}, 24, LinearPhase::Decode, LinearEpilogue::None};
   const LinearConfig fourConfig{LinearTile::N128, 1, LinearSimdgroups::Four};
   for (uint32_t scope : {0U, 1U, 2U, 3U, 16U, 255U})
@@ -1125,6 +1188,55 @@ void ggufCoreLaws() {
     }
 }
 
+// The Apple10 affine split rule as per-core laws, checked at every core count
+// (zero is the fallback), families 10 and 11 and a grid of widths, inputs and
+// epilogues, as ggufCoreLaws checks the GGUF rule:
+// - a request's sums do not depend on the requests it is batched with: whether
+//   a projection splits, and its whole plan when it does, is the same at every
+//   batch width;
+// - a split count is a power of two up to eight whose partitions each keep one
+//   256-input block;
+// - it depends on the grid per core only: doubling the width and the core count
+//   keeps it, more cores never lower it and a wider grid never raises it.
+// The decode arena's bound over every lane count is checked on the production
+// geometries (model_execution_plan_test.cpp).
+void apple10AffineCoreLaws() {
+  constexpr std::array<uint32_t, 14> widths{256, 512, 768, 1024, 1280, 2048, 2560, 4096,
+                                            5120, 6144, 9216, 12544, 17408, 248320};
+  constexpr std::array<uint32_t, 10> inputs{256, 512, 768, 1024, 2048, 4096, 5120, 6144, 17408, 25600};
+  for (const uint32_t family : {10U, 11U})
+    for (uint32_t cores = 0; cores <= 128; ++cores) {
+      const Linear linear = gpu(family, cores), more = gpu(family, cores + 1), twice = gpu(family, 2 * cores);
+      for (const uint32_t n : widths)
+        for (const uint32_t k : inputs)
+          for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp}) {
+            const auto plan = [&](const Linear &l, uint32_t width, uint32_t rows) {
+              return l.plan({{width, k}, rows, LinearPhase::Decode, epilogue});
+            };
+            const LinearPlan one = plan(linear, n, 8);
+            const LinearConfig c = one.configuration();
+            const bool split = c.tile == LinearTile::Split128;
+            for (const uint32_t rows : {16U, 24U, 32U}) {
+              const LinearConfig wider = plan(linear, n, rows).configuration();
+              require((wider.tile == LinearTile::Split128) == split && (!split || wider == c),
+                      "Apple10 split plan depends on the batch width");
+            }
+            const uint32_t s = c.splits;
+            require(split == (s > 1) && s <= 8 && (s & (s - 1)) == 0 &&
+                        (!split || (c.groups == n / 128 && c.simdgroups == LinearSimdgroups::Eight)),
+                    "Apple10 split plan tile or split count");
+            require(k / 256 >= s, "Apple10 split partition below one 256-input block");
+            if (cores) {
+              require(plan(twice, 2 * n, 8).configuration().splits == s,
+                      "Apple10 split count depends on more than the grid per core");
+              require(plan(more, n, 8).configuration().splits >= s, "Apple10 split count falls with more cores");
+              require(plan(linear, 2 * n, 8).configuration().splits <= s,
+                      "Apple10 split count rises with the width");
+            }
+          }
+    }
+}
+
 // Exercise continuous core counts, not just measured SKU anchors. These
 // contracts check legal grids, bounded candidates and override workspace;
 // they do not claim performance on simulated hardware.
@@ -1351,16 +1463,20 @@ void bufferContracts(metal::MetalBackend &backend, Linear &linear,
     rejects([&] { add(graph, shortBuffers, p, gateUp ? &gate : nullptr); });
     require(graph.empty(), "invalid Linear buffers partially encoded a graph");
   }
-  if (plan.usesSimdgroup()) {
-    for (auto member : {&LinearScratch::input, &LinearScratch::sums,
-                        &LinearScratch::partials, &LinearScratch::counters}) {
-      auto shortBuffers = buffers;
-      shortBuffers.scratch.*member = backend.view(buffers.scratch.*member, 0,
-                                                  (buffers.scratch.*member).sizeBytes()-1);
-      metal::CommandGraph graph;
-      rejects([&] { add(graph, shortBuffers, p, gateUp ? &gate : nullptr); });
-      require(graph.empty(), "invalid simdgroup workspace partially encoded a graph");
-    }
+  // Every scratch field the plan uses (the simdgroup tile's table, sums,
+  // partials and counters; the Split128 partials and counters).
+  const LinearScratchSize scratch = plan.scratchSize();
+  for (const auto [member, bytes] : {std::pair{&LinearScratch::input, scratch.input},
+                                     std::pair{&LinearScratch::sums, scratch.sums},
+                                     std::pair{&LinearScratch::partials, scratch.partials},
+                                     std::pair{&LinearScratch::counters, scratch.counters}}) {
+    if (!bytes) continue;
+    auto shortBuffers = buffers;
+    shortBuffers.scratch.*member = backend.view(buffers.scratch.*member, 0,
+                                                (buffers.scratch.*member).sizeBytes() - 1);
+    metal::CommandGraph graph;
+    rejects([&] { add(graph, shortBuffers, p, gateUp ? &gate : nullptr); });
+    require(graph.empty(), "invalid split workspace partially encoded a graph");
   }
   for (auto member : {&AffineWeights::weights, &AffineWeights::scales, &AffineWeights::biases}) {
     AffineWeights planes = p.affine();
@@ -1719,7 +1835,7 @@ int main(int argc, char **argv) {
     ggufPlans();
     ggufCoreLaws();
     const std::set<std::string_view> plainKernels = floatOutputPlans();
-    narrowM24BoundaryPlans();
+    apple10AffineCoreLaws();
     scalingContracts();
     // Apple9 at the assumed core count reaches the expanded split set;
     // Apple10 exercises the MPP-only candidate bound.

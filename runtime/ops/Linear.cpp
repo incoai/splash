@@ -20,26 +20,30 @@ constexpr uint32_t kAffinePrefillTileRows = 32;
 constexpr uint32_t kQuantGroup = 64;
 static_assert(SPLASH_TARGET_VERIFY_ROWS == 8,
               "simdgroup Q4 tiles require eight verify rows per lane");
-// Split tiles hold four K partitions, each a whole number of the kernels'
-// four-quant-group (256-input) input-sum blocks.
+// The kernels sum their input per block of four quant groups (256 inputs).
+// Split128 partitions K in whole blocks; the one-lane split tiles hold four
+// partitions of whole blocks.
+constexpr uint32_t kInputSumBlock = 4 * kQuantGroup;
 constexpr uint32_t kSplitPartitions = 4;
-constexpr uint32_t kSplitInputBlock = kSplitPartitions * 4 * kQuantGroup;
+constexpr uint32_t kSplitInputBlock = kSplitPartitions * kInputSumBlock;
 static_assert(sizeof(LinearMatrix) == 8);
 
-bool splitTile(LinearTile tile) noexcept {
+bool oneLaneSplit(LinearTile tile) noexcept {
   return tile == LinearTile::Split32 || tile == LinearTile::Split64;
 }
 bool oneLaneTile(LinearTile tile) noexcept {
-  return tile == LinearTile::Paired128 || tile == LinearTile::Paired256 || splitTile(tile);
+  return tile == LinearTile::Paired128 || tile == LinearTile::Paired256 || oneLaneSplit(tile);
 }
-// Simdgroups fixed by the kernel instance: split tiles run four partitions of
-// one (N32) or two (N64) simdgroups; the paired N256 tile runs four.
+// Simdgroups fixed by the kernel instance: the one-lane split tiles run four
+// partitions of one (N32) or two (N64) simdgroups, the paired N256 tile runs
+// four and Split128 the N128 tile's eight.
 std::optional<LinearSimdgroups> fixedSimdgroups(LinearTile tile) noexcept {
   switch (tile) {
   case LinearTile::Split32:
   case LinearTile::Simdgroup:
   case LinearTile::Paired256: return LinearSimdgroups::Four;
-  case LinearTile::Split64: return LinearSimdgroups::Eight;
+  case LinearTile::Split64:
+  case LinearTile::Split128: return LinearSimdgroups::Eight;
   case LinearTile::N128:
   case LinearTile::N256:
   case LinearTile::Paired128:
@@ -137,7 +141,8 @@ uint32_t LinearPlan::tileColumns() const noexcept {
   case LinearTile::N256:
   case LinearTile::Paired256: return 256;
   case LinearTile::N128:
-  case LinearTile::Paired128: return 128;
+  case LinearTile::Paired128:
+  case LinearTile::Split128: return 128;
   }
   return 0;
 }
@@ -145,10 +150,7 @@ uint32_t LinearPlan::threadsPerThreadgroup() const noexcept {
   return static_cast<uint32_t>(config_.simdgroups) * 32;
 }
 uint32_t LinearPlan::partialSums() const noexcept {
-  if (usesSimdgroup() || config_.tile == LinearTile::GgufStaged ||
-      config_.tile == LinearTile::GgufRegister)
-    return config_.splits;
-  return splitTile(config_.tile) ? kSplitPartitions : 1;
+  return oneLaneSplit(config_.tile) ? kSplitPartitions : config_.splits;
 }
 bool LinearPlan::usesSimdgroup() const noexcept { return config_.tile == LinearTile::Simdgroup; }
 LinearInput LinearPlan::input() const noexcept {
@@ -157,8 +159,13 @@ LinearInput LinearPlan::input() const noexcept {
 }
 LinearScratchSize LinearPlan::scratchSize() const noexcept {
   if (workload_.weightLayout == WeightLayout::Block32) return blockScratchSize();
-  if (!usesSimdgroup()) return {};
   const auto [n, k] = workload_.matrix;
+  // Split128: [split][row][column] fp32 partials over every row of the step
+  // and one counter per column tile.
+  if (config_.tile == LinearTile::Split128)
+    return {0, 0, uint64_t{config_.splits} * workload_.rows * n * sizeof(float),
+            uint64_t{n / tileColumns()} * sizeof(uint32_t)};
+  if (!usesSimdgroup()) return {};
   const uint64_t rows = workload_.rows;
   const uint64_t lanes = rows / SPLASH_TARGET_VERIFY_ROWS;
   // Each row tile owns two fp32 fragment streams per K partition and one
@@ -198,10 +205,11 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destin
     requireBlockConfiguration();
     return;
   }
-  if (config.tile != LinearTile::Simdgroup && config.splits != 1)
-    throw std::invalid_argument("K splits require the simdgroup Q4 tile");
-  if (config.tile != LinearTile::N128 && config.tile != LinearTile::N256 &&
-      config.tile != LinearTile::Simdgroup && !oneLaneTile(config.tile))
+  const bool splitsK = config.tile == LinearTile::Simdgroup || config.tile == LinearTile::Split128;
+  if (!splitsK && config.splits != 1)
+    throw std::invalid_argument("K splits require the simdgroup or Split128 Q4 tile");
+  if (config.tile != LinearTile::N128 && config.tile != LinearTile::N256 && !splitsK &&
+      !oneLaneTile(config.tile))
     throw std::invalid_argument("invalid Q4 linear tile");
   if ((config.simdgroups != LinearSimdgroups::Four &&
        config.simdgroups != LinearSimdgroups::Eight) ||
@@ -215,7 +223,7 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destin
   const bool residual = w.epilogue == LinearEpilogue::Residual;
   const bool four = config.simdgroups == LinearSimdgroups::Four;
   if (w.phase == LinearPhase::Prefill) {
-    if (config.groups || oneLaneTile(config.tile) || usesSimdgroup())
+    if (config.groups || oneLaneTile(config.tile) || splitsK)
       throw std::invalid_argument("invalid Q4 prefill configuration");
     if (four) {
       pipeline_ = w.epilogue == LinearEpilogue::UpWithGate
@@ -248,7 +256,7 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destin
         residual ? "decode_linear_q4_sg_residual" : "decode_linear_q4_sg";
     return;
   }
-  if (splitTile(config.tile)) {
+  if (oneLaneSplit(config.tile)) {
     // Each partition takes a quarter of K in whole 256-input blocks, and the
     // split kernels are dispatched one threadgroup per tile.
     if (w.matrix.inputSize % kSplitInputBlock ||
@@ -265,6 +273,26 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destin
     } else {
       pipeline_ = n32 ? "decode_linear_q4_n32_split4" : "decode_linear_q4_n64_split4";
     }
+    return;
+  }
+  if (config.tile == LinearTile::Split128) {
+    // Every partition holds at least one of the kernel's 256-input blocks.
+    if (config.groups != w.matrix.outputSize / tileColumns() || !config.validSplits() ||
+        config.splits < 2 || w.matrix.inputSize / kInputSumBlock < config.splits)
+      throw std::invalid_argument(
+          "Split128 requires the full column grid and 2, 4 or 8 K partitions of 256-input blocks");
+    constexpr std::array plainNames{"decode_linear_q4_n128_split", "decode_linear_q4_n128_split_m16",
+        "decode_linear_q4_n128_split_m24", "decode_linear_q4_n128_split_m32"};
+    constexpr std::array residualNames{"decode_linear_q4_n128_split_residual",
+        "decode_linear_q4_n128_split_residual_m16", "decode_linear_q4_n128_split_residual_m24",
+        "decode_linear_q4_n128_split_residual_m32"};
+    constexpr std::array upSiluNames{"decode_linear_q4_n128_split_up_silu",
+        "decode_linear_q4_n128_split_up_silu_m16", "decode_linear_q4_n128_split_up_silu_m24",
+        "decode_linear_q4_n128_split_up_silu_m32"};
+    // Gate/up at every lane count: a plain gate pass into the gate scratch,
+    // then the up pass whose epilogue applies the SiLU gate.
+    pipeline_ = residual ? residualNames[lane] : plainNames[lane];
+    if (w.epilogue == LinearEpilogue::GateUp) secondPipeline_ = upSiluNames[lane];
     return;
   }
   if (config.tile == LinearTile::Paired256) {
@@ -378,10 +406,40 @@ constexpr double kApple9WidePrefillGroupsPerCore = 8.0;
 // This is a fallback, not a calibrated optimum. Reported counts always win.
 constexpr uint32_t kAssumedGpuCores = 32;
 
+// Apple10 and later decode split K across the threadgroups of the Split128
+// tile (256 threads) by one rule at every batch width: the largest power of
+// two up to LinearConfig::kMaximumSplits whose split grid still fits four
+// threadgroups per core (1024 threads, twice the 512-thread occupancy knee),
+// with at least one 256-input block per partition. A grid of more than two
+// tiles per core keeps one split, the sequential tiles. Measured DRAM-cold on
+// a 20-core M5 Pro over the 27B and 35B MLX 4-bit decode projections and their
+// drafts at one to four lanes, with 10 to 80 cores emulated by width, and on a
+// 12-core M6 (Apple11): grids that only reach the knee leave time (the 20
+// tiles of 2560 x 4096 take 0.48-0.60 of the sequential time with four
+// splits, 0.60-0.71 with two), and a grid past four per core loses to its
+// second wave (6144 x 5120 in two splits is 9% slower at one lane). The rule is
+// never slower than the sequential tiles on the M5 Pro or on the M6's own 12
+// cores (20 cores emulated on the M6 ran 5120 x 4096 4% slower at one lane).
+constexpr uint32_t kSplitGroupsPerCore = 4;
+
+uint32_t apple10Splits(LinearMatrix matrix, uint32_t cores) noexcept {
+  const uint64_t grid = matrix.outputSize / 128;
+  uint32_t splits = 1;
+  while (splits < LinearConfig::kMaximumSplits && grid * 2 * splits <= uint64_t{kSplitGroupsPerCore} * cores &&
+         2 * splits <= matrix.inputSize / kInputSumBlock)
+    splits *= 2;
+  return splits;
+}
+
 // Apple10 wide plain projections reduce input re-reads with paired N256
-// tiles at one resident wave, measured on 16/20-core GPUs. Split-K remains
-// an offline candidate: its reassociation reduced speculative acceptance
-// on some measured prompts. Apple9's simdgroup policy is independent.
+// tiles at one resident wave, measured on 16/20-core GPUs. The one-lane split
+// tiles remain offline candidates: no rule of the grid per core selects them
+// on both machines measured. On a 20-core M5 Pro they beat today's plan on the
+// 35B's mixer and draft outputs by 4% (about their run spread) and on its
+// draft gate/up by 9%, and the same shapes run 15-17% slower in them on a
+// 12-core M6. The M6's own one-lane wins with them (4-8% on the 27B's
+// 5120-wide projections) are smaller than the unpaired N128 or N256 tile's on
+// the same shapes (17-18%). Apple9's simdgroup policy is independent.
 constexpr uint32_t kPaired256TilesPerCore = 8;
 constexpr uint32_t kPaired256WaveGroupsPerCore = 4;
 
@@ -448,8 +506,12 @@ LinearConfig Linear::baseline(LinearWorkload w, std::span<const Projection *cons
       splits *= 2;
     return {LinearTile::Simdgroup, grid, LinearSimdgroups::Four, splits};
   }
-  if (appleGpuFamily_ >= 10 && lanes == 1)
-    if (const auto config = apple10OneLaneConfig(w, gpuCores_)) return *config;
+  if (appleGpuFamily_ >= 10) {
+    if (const uint32_t splits = apple10Splits(w.matrix, gpuCores_); splits > 1)
+      return {LinearTile::Split128, tiles128, LinearSimdgroups::Eight, splits};
+    if (lanes == 1)
+      if (const auto config = apple10OneLaneConfig(w, gpuCores_)) return *config;
+  }
   // Apple9 keeps its one-tile grids (see kApple9GateUpGroupsPerCore).
   const auto groups = [&](uint32_t tiles, DecodeGroupPolicy policy) {
     return appleGpuFamily_ >= 10 ? decodeGroups(tiles, gpuCores_, policy)
@@ -465,14 +527,9 @@ LinearConfig Linear::baseline(LinearWorkload w, std::span<const Projection *cons
   }
   // Pipelined N128 hides the latency of a single lane's weight stream.
   if (lanes == 1) return {LinearTile::Paired128, groups(tiles128, kN128Groups)};
-  // With at most one N128 tile per core, longer M24 dot products benefit
-  // from eight groups. Short K and wider grids retain the four-group path.
-  if (appleGpuFamily_ >= 10 && lanes == 3 && tiles128 <= gpuCores_ &&
-      w.matrix.inputSize >= 4096)
-    return {LinearTile::N128, tiles128, LinearSimdgroups::Eight};
   // M24 plain projections benefit from four SIMD groups on Apple9 too.
   // Apple9 residual projections retain eight groups with compact prefix
-  // traversal; Apple10 uses four groups outside the narrow-grid case above.
+  // traversal; Apple10 uses four for every M24 projection it does not split.
   if (lanes == 3 && (appleGpuFamily_ >= 10 ||
       (appleGpuFamily_ == 9 && w.epilogue == LinearEpilogue::None)))
     return {LinearTile::N128, groups(tiles128, kFourSimdgroupGroups),
@@ -547,6 +604,12 @@ std::vector<LinearPlan> Linear::candidates(LinearWorkload w) const {
       if ((w.matrix.inputSize / kQuantGroup) % splits == 0)
         append({LinearTile::Simdgroup, n / columns, LinearSimdgroups::Four, splits});
   }
+  // Apple10 lists Split128 at every K split its 256-input blocks allow, at
+  // every lane count.
+  if (w.phase == LinearPhase::Decode && appleGpuFamily_ >= 10)
+    for (uint32_t splits = 2;
+         splits <= LinearConfig::kMaximumSplits && splits <= w.matrix.inputSize / kInputSumBlock; splits *= 2)
+      append({LinearTile::Split128, w.matrix.outputSize / 128, LinearSimdgroups::Eight, splits});
   // One-lane tiles: the split forms at their full grid and the paired N256
   // tile at one resident wave and at its full grid.
   if (w.phase == LinearPhase::Decode && w.rows == SPLASH_TARGET_VERIFY_ROWS) {
@@ -638,9 +701,14 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
           {selected.storageRows() / kAffinePrefillTileRows, n / selected.tileColumns(), 1},
           {selected.threadsPerThreadgroup(), 1, 1});
     else {
-      const uint32_t groups = selected.configuration().groups;
-      graph.add(kernelInstance(name, selected.destination()), bindings, Q4Params{n, k, groups}, {groups, 1, 1},
-          {selected.threadsPerThreadgroup(), 1, 1});
+      // Split128 binds its partials and counters after the sequential
+      // kernel's buffers; every other decode tile runs one K split.
+      const LinearConfig config = selected.configuration();
+      std::vector<metal::MetalBuffer> buffers(bindings);
+      if (config.tile == LinearTile::Split128)
+        buffers.insert(buffers.end(), {b.scratch.partials, b.scratch.counters});
+      graph.add(kernelInstance(name, selected.destination()), std::move(buffers), Q4Params{n, k, config.groups},
+                {config.groups, config.splits, 1}, {selected.threadsPerThreadgroup(), 1, 1});
     }
   };
   const bool prefill = w.phase == LinearPhase::Prefill;
