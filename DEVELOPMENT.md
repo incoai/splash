@@ -34,7 +34,7 @@ whose message names the last failure.
 
 Use `--max-context 100K` or `--max-memory 28G` to set optional limits. Memory
 limits cap Metal allocations, not combined process RSS. Agents must already be
-installed; `./splash claude|opencode|codex|hermes|pi` connects to the running server.
+installed; `./splash claude|opencode|codex|hermes|pi|omp` connects to the running server.
 Arguments pass through, for example `./splash codex resume --last` or
 `./splash hermes chat -q "Hello"`.
 
@@ -132,6 +132,17 @@ Hermes, which reserve it out of the context they compact at, get a quarter of
 a context under 128K instead. Hermes 2026.9.7 and later ignore it and, like
 Codex, leave the limit to the server; Claude Code keeps its own, which
 `CLAUDE_CODE_MAX_OUTPUT_TOKENS` raises.
+
+`splash omp` connects [Oh My Pi](https://github.com/can1357/oh-my-pi) to the
+running server. It adds the same per-port provider to OMP's `models.yml`
+(or an existing `models.yaml`) in `~/.omp/agent`, respecting
+`PI_CODING_AGENT_DIR`, `PI_CONFIG_DIR`, and the selected OMP profile.
+Existing providers are preserved; a legacy `models.json` is copied into
+the YAML configuration without changing the original. The API key stays in
+`SPLASH_API_KEY`, referenced by name in the provider configuration.
+Use `splash omp --config-only` to configure without launching. OMP arguments
+such as `--profile work`, `--resume SESSION` and `--config extra.yml` pass
+through; `--config` remains OMP's own settings overlay option.
 
 `splash hermes` runs Hermes in the `splash` profile (`splash-<port>`) of the
 user's Hermes root, `~/.hermes` or the root `HERMES_HOME` belongs to, and
@@ -1077,8 +1088,8 @@ and `REVISION`, `DRAFT_MODEL` and `LANGUAGE_ONLY=1` as its `--revision`,
 | `verify-models` | the installer's restarts without the Hub, `verify --full`, and the prepared-weight record (`dev/tools/installer_restarts.py`, [Release check](#release-check)) |
 | `test-real` | vision parity with the family's fixture in `dev/tests/fixtures/vision-parity/` when the installation serves vision, and the native model runtime oracle |
 | `test-http-real` | the HTTP frontend on an isolated server (`dev/tests/smoke_real.py`) |
-| `test-agent-real` | the five official clients through `splash serve` (`dev/tests/agent_real.py`), in `AGENT_SCENARIO` `complete` (the default) or `smoke` |
-| `test-release-real` | the HTTP smoke and all five clients on one `splash serve` |
+| `test-agent-real` | the six official clients through `splash serve` (`dev/tests/agent_real.py`), in `AGENT_SCENARIO` `complete` (the default) or `smoke` |
+| `test-release-real` | the HTTP smoke and all six clients on one `splash serve` |
 | `test-performance-real` | the native decode and partial-prefix benchmark, or with `BASELINE` its ABBA comparison with that build (`dev/benchmarks/backend_regression.py`) |
 | `release-check` | one model on this Mac ([Release check](#release-check)) |
 
@@ -1179,7 +1190,7 @@ two Macs. The unpinned `verify-models`, run after the pinned ones while the
 default branch still names the pinned commit, resolves the branch online, and
 its unreachable-Hub restart must fall back with the Hub's reason. The agent
 clients depend on neither the model's format nor the GPU: run the smoke
-scenario once per Mac, with the five clients split between the Macs, and
+scenario once per Mac, with the six clients split between the Macs, and
 `AGENT_SCENARIO=complete` for one model when the client integration changed.
 Expect about 1.5 hours on an M5 Pro and 2.5 hours on an M3 Max, most of it in
 the three 27B comparisons. A laptop can cap its GPU power during a long

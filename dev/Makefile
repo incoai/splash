@@ -25,7 +25,7 @@ publish-test:
 		--repo "$(TEST_RELEASE_REPO)"
 
 ENGINE_PYTHON_TEST_PATTERN ?= test_*.py
-# Comma-separated subset of claude,opencode,codex,hermes,pi for the real client
+# Comma-separated subset of claude,opencode,codex,hermes,pi,omp for the real client
 # gates on a machine that lacks one of them; empty runs all five.
 AGENT_CLIENTS ?=
 AGENT_CLIENT_ARGS = $(if $(AGENT_CLIENTS),--clients $(AGENT_CLIENTS),)
