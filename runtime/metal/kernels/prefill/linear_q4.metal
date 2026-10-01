@@ -37,6 +37,7 @@ inline void q4_mpp_prefill_tile(device bfloat *input, device uchar *weights,
                                 device bfloat *scales, device bfloat *biases,
                                 device bfloat *output, device bfloat *auxiliary,
                                 uint output_size, uint input_size,
+                                uint plane_input_size,
                                 device const float *precomputed_sums,
                                 uint output_origin, uint simd_lane,
                                 uint simd_group,
@@ -50,13 +51,17 @@ inline void q4_mpp_prefill_tile(device bfloat *input, device uchar *weights,
       matmul2d_descriptor(TileM, TileN, 64, false, true, false);
   matmul2d<descriptor, execution_simdgroups<Simdgroups>> operation;
   auto a0 = a.slice<64, TileM>(0, 0);
+  // A tile's groups lie in order: the first quant_groups of a view of the
+  // leading inputs of wider rows (plane_groups) are those it reads. Zero
+  // means input_size (metal/abi/Linear.h).
   uint quant_groups = input_size / 64;
+  uint plane_groups = (plane_input_size ? plane_input_size : input_size) / 64;
   constexpr ushort WeightTileN = 256; // weights are stored in 256-column tiles
   uint tile = output_origin / WeightTileN;
   uint tile_column = output_origin % WeightTileN;
   device uchar *tile_weights =
       weights +
-      (ulong(tile) * quant_groups * WeightTileN + tile_column) * 64 / 2;
+      (ulong(tile) * plane_groups * WeightTileN + tile_column) * 64 / 2;
   tensor<device uint4b_format, dextents<int, 2>, tensor_inline> first_b(
       tile_weights, dextents<int, 2>{64, TileN}, array<int, 2>{1, 64});
   auto b0 = first_b.slice<64, TileN>(0, 0);
@@ -99,7 +104,7 @@ inline void q4_mpp_prefill_tile(device bfloat *input, device uchar *weights,
       auto index = accumulated.get_multidimensional_index(i);
       uint row = index[1];
       ulong parameter =
-          (ulong(tile) * quant_groups + quant_group) * WeightTileN +
+          (ulong(tile) * plane_groups + quant_group) * WeightTileN +
           tile_column + index[0];
       float sum = StagedSums
           ? input_sums[(quant_group % PrefillSumBatch) * TileM + row]
@@ -153,7 +158,7 @@ kernel void prefill_linear_q4_n128(
   output += ulong(row_tile) * TileM * params.output_size;
   q4_mpp_prefill_tile<TileM, TileN, 8, false, false>(
       input, weights, scales, biases, output, output, params.output_size,
-      params.input_size, sums, output_tile * TileN, simd_lane, simd_group,
+      params.input_size, params.plane_input_size, sums, output_tile * TileN, simd_lane, simd_group,
       input_sums);
 }
 
@@ -174,7 +179,7 @@ kernel void prefill_linear_q4_n256(
   output += ulong(row_tile) * TileM * params.output_size;
   q4_mpp_prefill_tile<TileM, TileN, 8, false, false>(
       input, weights, scales, biases, output, output, params.output_size,
-      params.input_size, sums, output_tile * TileN, simd_lane, simd_group,
+      params.input_size, params.plane_input_size, sums, output_tile * TileN, simd_lane, simd_group,
       input_sums);
 }
 
@@ -196,7 +201,7 @@ kernel void prefill_linear_q4_n128_residual(
   sums += ulong(row_tile) * TileM * (params.input_size / 64);
   q4_mpp_prefill_tile<TileM, TileN, 8, true, false>(
       input + input_offset, weights, scales, biases, output + output_offset,
-      residual + output_offset, params.output_size, params.input_size, sums,
+      residual + output_offset, params.output_size, params.input_size, params.plane_input_size, sums,
       output_tile * TileN, simd_lane, simd_group, input_sums);
 }
 
@@ -218,7 +223,7 @@ kernel void prefill_linear_q4_n256_residual(
   sums += ulong(row_tile) * TileM * (params.input_size / 64);
   q4_mpp_prefill_tile<TileM, TileN, 8, true, false>(
       input + input_offset, weights, scales, biases, output + output_offset,
-      residual + output_offset, params.output_size, params.input_size, sums,
+      residual + output_offset, params.output_size, params.input_size, params.plane_input_size, sums,
       output_tile * TileN, simd_lane, simd_group, input_sums);
 }
 
@@ -263,7 +268,7 @@ kernel void prefill_linear_q4_n256_up_silu_sums(
   output_sums += ulong(row_tile) * TileM * (params.output_size / 64);
   q4_mpp_prefill_tile<TileM, TileN, 8, false, true>(
       input + input_offset, weights, scales, biases, output + output_offset,
-      gate + output_offset, params.output_size, params.input_size, sums,
+      gate + output_offset, params.output_size, params.input_size, params.plane_input_size, sums,
       output_tile * TileN, simd_lane, simd_group, input_sums);
   q4_prefill_write_output_sums<TileM, TileN, 8>(
       output + output_offset, output_sums, params.output_size,
@@ -286,7 +291,7 @@ kernel void prefill_linear_q4_n128_sg4(
   output += ulong(row_tile) * TileM * params.output_size;
   q4_mpp_prefill_tile<TileM, TileN, 4, false, false>(
       input, weights, scales, biases, output, output, params.output_size,
-      params.input_size, sums, output_tile * TileN, simd_lane, simd_group);
+      params.input_size, params.plane_input_size, sums, output_tile * TileN, simd_lane, simd_group);
 }
 
 kernel void prefill_linear_q4_n128_residual_sg4(
@@ -306,7 +311,7 @@ kernel void prefill_linear_q4_n128_residual_sg4(
   sums += ulong(row_tile) * TileM * (params.input_size / 64);
   q4_mpp_prefill_tile<TileM, TileN, 4, true, false>(
       input + input_offset, weights, scales, biases, output + output_offset,
-      residual + output_offset, params.output_size, params.input_size, sums,
+      residual + output_offset, params.output_size, params.input_size, params.plane_input_size, sums,
       output_tile * TileN, simd_lane, simd_group);
 }
 
@@ -329,7 +334,7 @@ kernel void prefill_linear_q4_n128_up_silu_sums_sg4(
   output_sums += ulong(row_tile) * TileM * (params.output_size / 64);
   q4_mpp_prefill_tile<TileM, TileN, 4, false, true>(
       input + input_offset, weights, scales, biases, output + output_offset,
-      gate + output_offset, params.output_size, params.input_size, sums,
+      gate + output_offset, params.output_size, params.input_size, params.plane_input_size, sums,
       output_tile * TileN, simd_lane, simd_group);
   q4_prefill_write_output_sums<TileM, TileN, 4>(
       output + output_offset, output_sums, params.output_size,

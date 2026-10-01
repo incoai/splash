@@ -159,6 +159,12 @@ public:
 
   uint32_t outputSize = 0;
   uint32_t inputSize = 0;
+  // The inputs each row of the weight planes holds when the projection reads
+  // only their first inputSize, a view of the leading inputs of another's;
+  // zero for inputSize. Only quantized prefill tiles of more than 32 rows
+  // take such a view (Linear::add).
+  uint32_t planeInputs = 0;
+  [[nodiscard]] uint32_t planeInputSize() const noexcept { return planeInputs ? planeInputs : inputSize; }
   // fp32 only for plain decode plans (Linear::plan), which keep the tile of
   // the bf16 plan.
   FloatOutput destination = FloatOutput::BFloat16;

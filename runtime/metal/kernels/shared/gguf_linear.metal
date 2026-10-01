@@ -35,7 +35,7 @@ template <class F, ushort RowsPerSG, ushort Simdgroups, ushort TileN, ushort KS,
 inline void gguf_prefill_tile(device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta, device bfloat *output,
                     uint output_size, uint input_size, uint output_origin, uint rows, threadgroup half *stage,
                     threadgroup half2 *tl, uint simd_lane, uint simd_group, uint out_stride = 0, uint out_offset = 0,
-                    device bfloat *aux = nullptr) {
+                    device bfloat *aux = nullptr, uint plane_input_size = 0) {
   // 0 = output_size (Gguf.h). The host always passes the stride, but dropping the fallback changes these kernels'
   // code, a change to measure on its own.
   if (out_stride == 0) out_stride = output_size;
@@ -46,10 +46,13 @@ inline void gguf_prefill_tile(device bfloat *input, device uchar *w0, device uch
   auto a = tensor(input + ulong(simd_group) * RowsPerSG * input_size, dextents<int, 2>{int(input_size), RowsPerSG}, array<int, 2>{1, int(input_size)});
   constexpr auto descriptor = matmul2d_descriptor(RowsPerSG, TileN, KS, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<descriptor, execution_simdgroups<1>> operation;
-  const uint groups = input_size / 32, steps = groups / GPS, units = groups / F::MetaGroups;
+  // A tile's groups lie in order: the first `groups` of a view of the leading inputs of wider rows (plane_groups)
+  // are those it reads.
+  const uint groups = input_size / 32, steps = groups / GPS;
+  const uint plane_groups = (plane_input_size ? plane_input_size : input_size) / 32, units = plane_groups / F::MetaGroups;
   const uint plane_tile = output_origin / QUANT_TILE_ROWS, plane_row = output_origin % QUANT_TILE_ROWS;
-  device uchar *tw0 = w0 + (ulong(plane_tile) * groups * QUANT_TILE_ROWS + plane_row) * F::P0;
-  device uchar *tw1 = w1 + (ulong(plane_tile) * groups * QUANT_TILE_ROWS + plane_row) * F::P1;
+  device uchar *tw0 = w0 + (ulong(plane_tile) * plane_groups * QUANT_TILE_ROWS + plane_row) * F::P0;
+  device uchar *tw1 = w1 + (ulong(plane_tile) * plane_groups * QUANT_TILE_ROWS + plane_row) * F::P1;
   device uchar *tmeta = meta + (ulong(plane_tile) * units * QUANT_TILE_ROWS + plane_row) * F::MetaBytes;
   auto a0 = a.template slice<KS, RowsPerSG>(0, 0);
   tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt0(stage, dextents<int, 2>{KS, TileN}, array<int, 2>{1, KS});
@@ -231,7 +234,8 @@ GGUF_DECODE_FUSED(8) GGUF_DECODE_FUSED(16) GGUF_DECODE_FUSED(32)
     gguf_prefill_tile<F, GGUF_PREFILL_SIMDGROUP_ROWS, GGUF_PREFILL_SIMDGROUPS, GGUF_TILE_COLUMNS, GGUF_PREFILL_STEP>(input + ulong(first) * p.input_size, w0, w1, meta,                        \
                                          output + ulong(first) * (p.out_stride ? p.out_stride : p.output_size),   \
                                          p.output_size, p.input_size, group.y * GGUF_TILE_COLUMNS, rows, stage, tl, \
-                                         simd_lane, simd_group, p.out_stride, p.out_offset);                      \
+                                         simd_lane, simd_group, p.out_stride, p.out_offset, nullptr,              \
+                                         p.plane_input_size);                                                     \
   }
 #define GGUF_PREFILL_EPILOGUE(F, f, ep, Ep)                                                                        \
   kernel void gguf_prefill_##f##_##ep(GGUF_PREFILL_BUFFERS, device bfloat *aux [[buffer(5)]],                    \
@@ -242,7 +246,8 @@ GGUF_DECODE_FUSED(8) GGUF_DECODE_FUSED(16) GGUF_DECODE_FUSED(32)
     gguf_prefill_tile<F, GGUF_PREFILL_SIMDGROUP_ROWS, GGUF_PREFILL_SIMDGROUPS, GGUF_TILE_COLUMNS, GGUF_PREFILL_STEP, Ep>(input + ulong(first) * p.input_size, w0, w1, meta,                    \
                                              output + ulong(first) * rs, p.output_size, p.input_size,              \
                                              group.y * GGUF_TILE_COLUMNS, rows, stage, tl, simd_lane, simd_group,  \
-                                             p.out_stride, p.out_offset, aux + ulong(first) * rs);                 \
+                                             p.out_stride, p.out_offset, aux + ulong(first) * rs,                  \
+                                             p.plane_input_size);                                                  \
   }
 #define GGUF_PREFILL_FORMAT(F, f) \
   GGUF_PREFILL(F, f) GGUF_PREFILL_EPILOGUE(F, f, r, EpResidual) GGUF_PREFILL_EPILOGUE(F, f, g, EpUpWithGate)

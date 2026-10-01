@@ -613,6 +613,8 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
   }
   requireAffineProjection(p, w.matrix);
   if (gate) requireAffineProjection(*gate, w.matrix);
+  if (p.planeInputSize() != p.inputSize && (w.phase != LinearPhase::Prefill || selected.usesSimdgroup()))
+    throw std::invalid_argument("a view of leading inputs runs only the prefill tiles");
   const AffineWeights &weights = p.affine();
   if (selected.usesSimdgroup()) {
     if (b.prepared.layout != LinearInput::Table64 || !b.prepared.source.sameView(b.input))
@@ -634,7 +636,7 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
       std::initializer_list<metal::MetalBuffer> bindings) {
     if (w.phase == LinearPhase::Prefill)
       graph.add(std::string(name), bindings,
-          Q4PrefillParams{w.matrix.outputSize, w.matrix.inputSize},
+          Q4PrefillParams{w.matrix.outputSize, w.matrix.inputSize, p.planeInputSize()},
           {selected.storageRows() / kAffinePrefillTileRows, n / selected.tileColumns(), 1},
           {selected.threadsPerThreadgroup(), 1, 1});
     else {
@@ -680,7 +682,7 @@ void Linear::addPrefillSums(metal::CommandGraph &graph, metal::MetalBuffer input
   requireBytes(input, storageRows * consumer.inputSize * 2, "input");
   requireBytes(sums, storageRows * (consumer.inputSize / kQuantGroup) * 4, "sums");
   graph.add("prefill_linear_q4_sums32", {input, sums},
-            Q4PrefillParams{consumer.outputSize, consumer.inputSize}, {tiles, 1, 1});
+            Q4PrefillParams{consumer.outputSize, consumer.inputSize, consumer.inputSize}, {tiles, 1, 1});
 }
 void Linear::addPrefill(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &p,
                         metal::MetalBuffer output, metal::MetalBuffer sums, uint32_t rows,

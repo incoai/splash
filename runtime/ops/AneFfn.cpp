@@ -73,26 +73,26 @@ bool splittable(const Projection &projection) {
 }
 
 // A weight plane of a projection: per 256-row tile, `units` units of its inputs
-// for each row, of `bytes` bytes each; `prefix` of them hold its first inputs.
+// for each row, of `bytes` bytes each.
 struct Plane {
   metal::MetalBuffer buffer;
-  uint64_t units, prefix, bytes;
+  uint64_t units, bytes;
 };
-// The planes of a projection, with the units of its first `inputs` inputs:
-// the affine weights, scales and biases (units of 64 inputs), or a GGUF
-// image's plane0, plane1 and meta (groups of 32, meta units of meta_groups).
-std::vector<Plane> planes(const Projection &projection, uint32_t inputs) {
+// The planes of a projection: the affine weights, scales and biases (units of
+// 64 inputs), or a GGUF image's plane0, plane1 and meta (groups of 32, meta
+// units of meta_groups).
+std::vector<Plane> planes(const Projection &projection) {
   if (projection.layout() == WeightLayout::Affine64) {
     const AffineWeights &weights = projection.affine();
-    const uint64_t units = projection.inputSize / kQuantGroup, prefix = inputs / kQuantGroup;
-    return {{weights.weights, units, prefix, 32}, {weights.scales, units, prefix, 2}, {weights.biases, units, prefix, 2}};
+    const uint64_t units = projection.inputSize / kQuantGroup;
+    return {{weights.weights, units, 32}, {weights.scales, units, 2}, {weights.biases, units, 2}};
   }
   const QuantizedSegment &segment = projection.blocks().segments.front();
   const QuantFormat &format = segment.format();
-  const uint64_t groups = projection.inputSize / 32, prefix = inputs / 32;
-  std::vector<Plane> result{{segment.plane0, groups, prefix, format.plane0_bytes}};
-  if (format.plane1_bytes) result.push_back({segment.plane1, groups, prefix, format.plane1_bytes});
-  result.push_back({segment.meta, groups / format.meta_groups, prefix / format.meta_groups, format.meta_bytes});
+  const uint64_t groups = projection.inputSize / 32;
+  std::vector<Plane> result{{segment.plane0, groups, format.plane0_bytes}};
+  if (format.plane1_bytes) result.push_back({segment.plane1, groups, format.plane1_bytes});
+  result.push_back({segment.meta, groups / format.meta_groups, format.meta_bytes});
   return result;
 }
 // A projection of `outputs` x `inputs` in the layout and format of `like`,
@@ -121,13 +121,6 @@ WeightSource weightSource(const Projection &projection) {
   const QuantizedSegment &segment = projection.blocks().segments.front();
   return {segment.plane0, segment.plane1Slot(), segment.meta, projection.inputSize / 32, segment.formatId, "_gguf"};
 }
-// The bytes of a projection's first `inputs` inputs out of each of its tiles.
-uint64_t leadingInputBytes(const Projection &projection, uint32_t inputs) {
-  uint64_t bytes = 0;
-  for (const Plane &plane : planes(projection, inputs)) bytes += uint64_t{projection.outputSize} * plane.prefix * plane.bytes;
-  return pages(bytes);
-}
-
 // The Hadamard signs D of the rotations R = D H / sqrt(n) of inputs, weights
 // and the ANE's intermediate rows alike: a block of n values takes the first n.
 std::array<float, kIntermediateBlock> rotationSigns() {
@@ -297,7 +290,6 @@ uint64_t AneFfn::plannedBytes(std::span<const SwiGluProjections> layers, double 
   uint64_t set = 2 * ane::Surface::bytes(ane, 1, Element::Float16) + ane::Surface::bytes(hidden, 1, Element::Float16) +
                  2 * (hidden / kSegment) * ane::Surface::bytes(ane, kSegment, Element::Int8);
   for (uint32_t width : segments(ane)) set += ane::Surface::bytes(hidden, width, Element::Int8);
-  for (const SwiGluProjections &layer : layers) bytes += leadingInputBytes(*layer.down, gpu);
   return bytes + 2 * set;
 }
 
@@ -337,30 +329,20 @@ AneFfn::AneFfn(metal::MetalBackend &backend, const Linear &linear, std::span<con
   rowScales_ = allocate(uint64_t{layers.size()} * (2 * aneChannels_ + hidden_) * 2, "ane ffn row scales");
   rotated_ = allocate(uint64_t{kRows} * hidden_ * 2, "ane ffn rotated input");
 
-  // The GPU's share: gate and up rows lead each projection's 256-row tiles;
-  // down's leading inputs are copied out of each of its tiles.
+  // The GPU's share: gate and up rows lead each projection's 256-row tiles,
+  // and down's leading inputs each tile's groups.
   const auto leadingRows = [&](const Projection &source) {
     std::vector<metal::MetalBuffer> views;
-    for (const Plane &plane : planes(source, hidden_))
+    for (const Plane &plane : planes(source))
       views.push_back(backend_.view(plane.buffer, 0, uint64_t{gpuChannels_} * plane.units * plane.bytes));
     return projection(source, gpuChannels_, hidden_, std::move(views));
   };
   const auto leadingInputs = [&](const Projection &source) {
-    const metal::MetalBuffer packed = allocate(leadingInputBytes(source, gpuChannels_), "ane ffn gpu down");
-    const uint32_t tiles = source.outputSize / 256;
     std::vector<metal::MetalBuffer> views;
-    uint64_t offset = 0;
-    for (const Plane &plane : planes(source, gpuChannels_)) {
-      const auto *from = static_cast<const uint8_t *>(plane.buffer.contents());
-      if (!from) throw std::invalid_argument("ANE FFN split needs CPU-visible weights");
-      const uint64_t tileBytes = plane.units * 256 * plane.bytes, prefixBytes = plane.prefix * 256 * plane.bytes;
-      views.push_back(backend_.view(packed, offset, tiles * prefixBytes));
-      for (uint32_t tile = 0; tile < tiles; ++tile)
-        std::memcpy(static_cast<uint8_t *>(views.back().contents()) + tile * prefixBytes, from + tile * tileBytes,
-                    prefixBytes);
-      offset += tiles * prefixBytes;
-    }
-    return projection(source, source.outputSize, gpuChannels_, std::move(views));
+    for (const Plane &plane : planes(source)) views.push_back(plane.buffer);
+    Projection result = projection(source, source.outputSize, gpuChannels_, std::move(views));
+    result.planeInputs = source.inputSize;
+    return result;
   };
   for (const SwiGluProjections &source : layers)
     layers_.push_back({source, leadingRows(*source.gate), leadingRows(*source.up), leadingInputs(*source.down)});
