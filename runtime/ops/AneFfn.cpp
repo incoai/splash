@@ -158,14 +158,13 @@ std::string buffer(const char *type, uint64_t rows, uint64_t width, uint64_t str
          plane + ", " + std::to_string(stride) + ", 1], interleave_factors=[1, 1, 1, 1]>";
 }
 
-// The ANE's share of the FFN as MIL. Inputs: x<k>, the rotated input rows
+// The ANE's share of the FFN over `rows` rows as MIL. Inputs: x<k>, the rotated input rows
 // channel-major in int8 segments, tx their per-token scales; w<g|u><k>, the
 // rotated int8 gate and up rows of segment k, s<g|u> their per-row scales;
 // wd<i> down's rotated int8 inputs of segment i, sd its per-row scales. Every
 // int8 value is dequantized by 2^-7 against fp16 overflow, which the scales
 // carry back. The intermediate rows are rotated and quantized per token here.
-std::string ffnProgram(uint32_t hidden, uint32_t channels, const std::vector<uint32_t> &down) {
-  const uint64_t rows = AneFfn::kRows;
+std::string ffnProgram(uint32_t hidden, uint32_t channels, const std::vector<uint32_t> &down, uint64_t rows) {
   const uint32_t inputs = hidden / kSegment;
   std::string parameters, body;
   const auto line = [&](const std::string &text) { body += "        " + text + ";\n"; };
@@ -261,10 +260,10 @@ uint64_t AneFfn::plannedBytes(std::span<const SwiGluProjections> layers, double 
   const uint32_t hidden = layers.front().gate->inputSize, intermediate = layers.front().gate->outputSize;
   const uint32_t gpu = gpuChannels(intermediate, share), ane = intermediate - gpu;
   uint64_t bytes = pages(kIntermediateBlock * sizeof(float)) + pages(uint64_t{layers.size()} * (2 * ane + hidden) * 2) +
-                   pages(uint64_t{kRows} * hidden * 2) +
-                   (hidden / kSegment) * ane::Surface::bytes(kSegment, kRows, Element::Int8) +
-                   ane::Surface::bytes(1, kRows, Element::Float16) +
-                   ane::Surface::bytes(hidden, kRows, Element::Float16);
+                   pages(uint64_t{kRows} * hidden * 2);
+  for (uint32_t rows : kProgramRows)
+    bytes += (hidden / kSegment) * ane::Surface::bytes(kSegment, rows, Element::Int8) +
+             ane::Surface::bytes(1, rows, Element::Float16) + ane::Surface::bytes(hidden, rows, Element::Float16);
   uint64_t set = 2 * ane::Surface::bytes(ane, 1, Element::Float16) + ane::Surface::bytes(hidden, 1, Element::Float16) +
                  2 * (hidden / kSegment) * ane::Surface::bytes(ane, kSegment, Element::Int8);
   for (uint32_t width : segments(ane)) set += ane::Surface::bytes(hidden, width, Element::Int8);
@@ -336,9 +335,6 @@ AneFfn::AneFfn(metal::MetalBackend &backend, const Linear &linear, std::span<con
   for (const SwiGluProjections &source : layers)
     layers_.push_back({source, leadingRows(*source.gate), leadingRows(*source.up), leadingInputs(*source.down)});
 
-  for (uint32_t k = 0; k < hidden_ / kSegment; ++k) inputs_.push_back(surface(kSegment, kRows, Element::Int8));
-  tokenScale_ = surface(1, kRows, Element::Float16);
-  partial_ = surface(hidden_, kRows, Element::Float16);
   for (Weights &set : sets_) {
     for (uint32_t k = 0; k < hidden_ / kSegment; ++k) {
       set.gate.push_back(surface(aneChannels_, kSegment, Element::Int8));
@@ -351,20 +347,29 @@ AneFfn::AneFfn(metal::MetalBackend &backend, const Linear &linear, std::span<con
   }
 
   const std::vector<uint8_t> blob = rotationBlob(aneChannels_, signs);
-  program_ = std::make_unique<ane::Program>(ffnProgram(hidden_, aneChannels_, downSegments_), blob);
-  for (uint32_t index = 0; index < 2; ++index) {
-    const Weights &set = sets_[index];
-    for (const std::string &name : program_->inputs()) {
-      const auto segment = [&](size_t prefix) { return std::stoul(name.substr(prefix)); };
-      if (name == "tx") bindings_[index].push_back(tokenScale_);
-      else if (name == "sg") bindings_[index].push_back(set.gateScale);
-      else if (name == "su") bindings_[index].push_back(set.upScale);
-      else if (name == "sd") bindings_[index].push_back(set.downScale);
-      else if (name.starts_with("wg")) bindings_[index].push_back(set.gate.at(segment(2)));
-      else if (name.starts_with("wu")) bindings_[index].push_back(set.up.at(segment(2)));
-      else if (name.starts_with("wd")) bindings_[index].push_back(set.down.at(segment(2)));
-      else if (name.starts_with("x")) bindings_[index].push_back(inputs_.at(segment(1)));
-      else throw std::logic_error("unknown ANE FFN program input " + name);
+  for (uint32_t rows : kProgramRows) {
+    Evaluation &evaluation = evaluations_.emplace_back();
+    evaluation.rows = rows;
+    for (uint32_t k = 0; k < hidden_ / kSegment; ++k)
+      evaluation.inputs.push_back(surface(kSegment, rows, Element::Int8));
+    evaluation.tokenScale = surface(1, rows, Element::Float16);
+    evaluation.partial = surface(hidden_, rows, Element::Float16);
+    evaluation.program = std::make_unique<ane::Program>(ffnProgram(hidden_, aneChannels_, downSegments_, rows), blob);
+    for (uint32_t index = 0; index < 2; ++index) {
+      const Weights &set = sets_[index];
+      std::vector<ane::Surface> &bindings = evaluation.bindings[index];
+      for (const std::string &name : evaluation.program->inputs()) {
+        const auto segment = [&](size_t prefix) { return std::stoul(name.substr(prefix)); };
+        if (name == "tx") bindings.push_back(evaluation.tokenScale);
+        else if (name == "sg") bindings.push_back(set.gateScale);
+        else if (name == "su") bindings.push_back(set.upScale);
+        else if (name == "sd") bindings.push_back(set.downScale);
+        else if (name.starts_with("wg")) bindings.push_back(set.gate.at(segment(2)));
+        else if (name.starts_with("wu")) bindings.push_back(set.up.at(segment(2)));
+        else if (name.starts_with("wd")) bindings.push_back(set.down.at(segment(2)));
+        else if (name.starts_with("x")) bindings.push_back(evaluation.inputs.at(segment(1)));
+        else throw std::logic_error("unknown ANE FFN program input " + name);
+      }
     }
   }
   event_ = backend_.newSharedEvent();
@@ -428,13 +433,18 @@ void AneFfn::add(metal::CommandGraph &graph, uint32_t layer, metal::MetalBuffer 
   if (!rows || rows > kRows) throw std::invalid_argument("ANE FFN chunk exceeds its rows");
   const Layer &current = layers_.at(layer);
   const uint32_t set = layer & 1, tiles = (rows + 31) / 32;
+  const auto index = static_cast<uint32_t>(
+      std::ranges::find_if(evaluations_, [&](const Evaluation &evaluation) { return evaluation.rows >= rows; }) -
+      evaluations_.begin());
+  const Evaluation &evaluation = evaluations_[index];
   // Each command stages layer 0's weights, then each layer the next one's.
   if (!layer) addWeights(graph, 0, 0);
-  graph.add("ane_ffn_rotate", {normalized, signs_, rotated_, tokenScale_.buffer}, AneFfnRotateParams{hidden_},
-            {rows, 1, 1}, {256, 1, 1});
-  for (uint32_t k = 0; k < inputs_.size(); ++k)
-    graph.add("ane_ffn_pack", {rotated_, inputs_[k].buffer},
-              AneFfnPackParams{hidden_, k * kSegment, inputs_[k].strideBytes}, {tiles, kSegment / 32, 1}, {32, 8, 1});
+  graph.add("ane_ffn_rotate", {normalized, signs_, rotated_, evaluation.tokenScale.buffer},
+            AneFfnRotateParams{hidden_}, {rows, 1, 1}, {256, 1, 1});
+  for (uint32_t k = 0; k < evaluation.inputs.size(); ++k)
+    graph.add("ane_ffn_pack", {rotated_, evaluation.inputs[k].buffer},
+              AneFfnPackParams{hidden_, k * kSegment, evaluation.inputs[k].strideBytes}, {tiles, kSegment / 32, 1},
+              {32, 8, 1});
   const uint64_t wait = ++value_;
   graph.signal(event_, wait);
   linear_.addPrefill(graph, normalized, current.gate, gateScratch, sums, rows, scratch);
@@ -444,22 +454,23 @@ void AneFfn::add(metal::CommandGraph &graph, uint32_t layer, metal::MetalBuffer 
   if (layer + 1 < layers_.size()) addWeights(graph, layer + 1, set ^ 1);
   const uint64_t signal = ++value_;
   graph.wait(event_, signal);
-  graph.add("ane_ffn_join", {output, partial_.buffer}, AneFfnJoinParams{hidden_, partial_.strideBytes / 2, rows},
-            {tiles, hidden_ / 32, 1}, {32, 8, 1});
-  jobs_.push_back({set, wait, signal});
+  graph.add("ane_ffn_join", {output, evaluation.partial.buffer},
+            AneFfnJoinParams{hidden_, evaluation.partial.strideBytes / 2, rows}, {tiles, hidden_ / 32, 1}, {32, 8, 1});
+  jobs_.push_back({index, set, wait, signal});
 }
 
 void AneFfn::submit() {
   std::vector<Job> jobs = std::exchange(jobs_, {});
   for (const Job &job : jobs) {
     try {
-      program_->enqueue(bindings_[job.set], partial_, event_, job.wait, job.signal,
-                        [evaluations = evaluations_](bool success) {
-                          std::lock_guard lock(evaluations->mutex);
-                          ++evaluations->completed;
-                          evaluations->failed |= !success;
-                          evaluations->changed.notify_all();
-                        });
+      const Evaluation &evaluation = evaluations_[job.evaluation];
+      evaluation.program->enqueue(evaluation.bindings[job.set], evaluation.partial, event_, job.wait, job.signal,
+                                  [completions = completions_](bool success) {
+                                    std::lock_guard lock(completions->mutex);
+                                    ++completions->completed;
+                                    completions->failed |= !success;
+                                    completions->changed.notify_all();
+                                  });
     } catch (...) {
       static_cast<void>(wait(true));
       throw;
@@ -471,18 +482,18 @@ void AneFfn::submit() {
 
 void AneFfn::finish() {
   if (!wait(false)) throw std::runtime_error("ANE FFN evaluations did not complete");
-  std::lock_guard lock(evaluations_->mutex);
-  if (std::exchange(evaluations_->failed, false)) throw std::runtime_error("ANE FFN evaluation failed");
+  std::lock_guard lock(completions_->mutex);
+  if (std::exchange(completions_->failed, false)) throw std::runtime_error("ANE FFN evaluation failed");
 }
 
 bool AneFfn::wait(bool release) {
-  std::unique_lock lock(evaluations_->mutex);
+  std::unique_lock lock(completions_->mutex);
   const uint64_t first = queuedCount_ - queued_.size();
   for (size_t index = 0; index < queued_.size(); ++index) {
     const uint64_t sequence = first + index + 1;
     if (release) ane::Program::release(event_, queued_[index].wait);
-    if (!evaluations_->changed.wait_for(lock, kCompletionTimeout,
-                                        [&] { return evaluations_->completed >= sequence; }))
+    if (!completions_->changed.wait_for(lock, kCompletionTimeout,
+                                        [&] { return completions_->completed >= sequence; }))
       return false;
   }
   queued_.clear();

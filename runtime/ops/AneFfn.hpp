@@ -24,17 +24,20 @@ struct SwiGluProjections final {
 
 // The dense FFN of a prefill chunk split by intermediate channel between the
 // GPU and the Neural Engine. The GPU runs the leading channels with the affine
-// Q4 prefill kernels; the ANE runs the rest as one W8A8 program over 2048
-// rows, with int8 weights the GPU requantizes from the Q4 planes one layer
-// ahead into double-buffered surfaces. The GPU adds the ANE's partial down
+// Q4 prefill kernels; the ANE runs the rest as one W8A8 program over the
+// chunk's rows, with int8 weights the GPU requantizes from the Q4 planes one
+// layer ahead into double-buffered surfaces. The GPU adds the ANE's partial down
 // projection to its own. A shared event orders each layer's ANE evaluation
 // between the GPU's input packing and that join, within the one command.
 class AneFfn final {
 public:
-  // The rows of every ANE evaluation, and the fewest a chunk needs for the
-  // split to beat the GPU alone; smaller chunks keep the whole FFN on the GPU.
-  static constexpr uint32_t kRows = 2048;
-  static constexpr uint32_t kMinimumRows = 512;
+  // The rows of the ANE programs, ascending: a chunk runs on the smallest
+  // that holds it, since an evaluation costs the ANE its program's rows. The
+  // fewest rows a chunk needs for the split to beat the GPU alone are the
+  // first program's; smaller chunks keep the whole FFN on the GPU.
+  static constexpr std::array<uint32_t, 4> kProgramRows{512, 1024, 1536, 2048};
+  static constexpr uint32_t kRows = kProgramRows.back();
+  static constexpr uint32_t kMinimumRows = kProgramRows.front();
 
   // `share` is the fraction of intermediate channels the ANE takes.
   AneFfn(metal::MetalBackend &backend, const Linear &linear, std::span<const SwiGluProjections> layers,
@@ -78,12 +81,21 @@ private:
     // leading inputs repacked.
     Projection gate, up, down;
   };
+  // An ANE program of `rows` rows and the surfaces it reads and writes,
+  // bound for each weight set.
+  struct Evaluation final {
+    uint32_t rows = 0;
+    std::vector<ane::Surface> inputs;
+    ane::Surface tokenScale, partial;
+    std::unique_ptr<ane::Program> program;
+    std::array<std::vector<ane::Surface>, 2> bindings;
+  };
   struct Job final {
-    uint32_t set;
+    uint32_t evaluation, set;
     uint64_t wait, signal;
   };
   // Evaluations complete in the order they are queued.
-  struct Evaluations final {
+  struct Completions final {
     std::mutex mutex;
     std::condition_variable changed;
     uint64_t completed = 0;
@@ -102,18 +114,16 @@ private:
   std::vector<uint32_t> downSegments_;
   std::vector<Layer> layers_;
   metal::MetalBuffer signs_, rowScales_, rotated_;
-  std::vector<ane::Surface> inputs_;
-  ane::Surface tokenScale_, partial_;
   std::array<Weights, 2> sets_;
-  std::unique_ptr<ane::Program> program_;
-  std::array<std::vector<ane::Surface>, 2> bindings_;
+  // By rows, as kProgramRows.
+  std::vector<Evaluation> evaluations_;
   metal::SharedEvent event_;
   uint64_t value_ = 0;
   // Encoded but not queued, and queued (the queued-th evaluation is the
   // last of queued_).
   std::vector<Job> jobs_, queued_;
   uint64_t queuedCount_ = 0;
-  std::shared_ptr<Evaluations> evaluations_ = std::make_shared<Evaluations>();
+  std::shared_ptr<Completions> completions_ = std::make_shared<Completions>();
   uint64_t allocatedBytes_ = 0;
 };
 
