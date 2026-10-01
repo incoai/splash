@@ -2087,6 +2087,19 @@ def _parse_request_size(value):
     return size
 
 
+def _parse_ane_split(value):
+    normalized = value.strip().lower()
+    if normalized == "auto":
+        return normalized
+    try:
+        share = float(normalized)
+    except ValueError:
+        share = None
+    if share is None or not 0 <= share < 1:
+        raise argparse.ArgumentTypeError("use auto or a fraction in [0, 1)")
+    return share
+
+
 def _parse_model_id(value):
     repo_id, separator, variant = value.partition(":")
     if repo_id.count("/") != 1:
@@ -2134,11 +2147,11 @@ def parse_args(argv=None):
         help="target KV cache storage (default: int8); bf16 uses more memory",
     )
     parser.add_argument(
-        "--ane-ffn-share",
-        type=float,
+        "--ane-split",
+        type=_parse_ane_split,
         default=0.0,
-        help="fraction of a dense target's prefill FFN channels run on the Neural Engine "
-        "(default: 0, GPU only)",
+        help="fraction of a dense target's prefill FFN channels run on the Neural Engine, "
+        "or auto for this Mac's measured best (default: 0, GPU only)",
     )
     parser.add_argument(
         "--max-request-size",
@@ -2189,8 +2202,6 @@ def parse_args(argv=None):
         parser.error("--queue-size must be positive")
     if not 0 <= args.port <= 65535:
         parser.error("--port must be in [0, 65535]")
-    if not 0 <= args.ane_ffn_share < 1:
-        parser.error("--ane-ffn-share must be in [0, 1)")
     return args
 
 
@@ -2207,8 +2218,8 @@ def _native_command(args):
         command.append(str(args.max_cache_disk))
     if args.kv_format != "int8":
         command.extend(("--kv-format", args.kv_format))
-    if args.ane_ffn_share:
-        command.extend(("--ane-ffn-share", repr(args.ane_ffn_share)))
+    if args.ane_split:
+        command.extend(("--ane-split", str(args.ane_split)))
     return command
 
 

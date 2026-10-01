@@ -363,10 +363,11 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
       config.maximumCacheDiskBytes
           ? model::KvPageTier::stagingBytesFor(package.targetKvLayout(config.kvFormat))
           : 0;
+  const double aneFfnShare = model::aneFfnShare(package, config.aneSplit, device);
   auto prepareMemory = [&]() -> EngineMemoryPlan {
     try {
       modelMemoryPlan =
-          model::plannedRuntimeMemory(device, package, operators, config.kvFormat, config.aneFfnShare);
+          model::plannedRuntimeMemory(device, package, operators, config.kvFormat, aneFfnShare);
       if (auto error = modelMemoryPlan.validationError()) {
         throw std::invalid_argument(*error);
       }
@@ -534,7 +535,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
         std::move(modelMemoryPlan), std::move(cacheIdentity),
         std::move(memoryGovernor), std::move(kvPages), std::move(stateStorage),
         std::move(kvTier), std::move(kvPool), std::move(cache),
-        config.maximumImagePatches, config.aneFfnShare, hostAvailableAtStart));
+        config.maximumImagePatches, aneFfnShare, hostAvailableAtStart));
     return result;
   } catch (const metal::MetalAllocationError &error) {
     throw RuntimeResourcesError(RuntimeResourceStage::StorageAllocation,

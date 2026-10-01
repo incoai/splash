@@ -81,9 +81,9 @@ struct RuntimeResourcesConfig {
   // to it when the model loaded vision and none otherwise; the wire parser's
   // limit defaults to the same constant.
   uint32_t maximumImagePatches = ops::kMaximumImagePatches;
-  // The fraction of a dense target's prefill FFN channels run on the Neural
-  // Engine (ops/AneFfn.hpp); zero keeps the FFN on the GPU.
-  double aneFfnShare = 0.0;
+  // How a dense target's prefill FFN splits with the Neural Engine
+  // (model::aneFfnShare).
+  ops::AneSplit aneSplit;
   // The process's existing pressure observer runs before resource assembly;
   // it only publishes a level. Bootstrap checks it at Metal operation
   // boundaries; after Ready the transport control handler keeps it current.

@@ -2814,6 +2814,14 @@ ModelTelemetry Runtime::telemetry() const noexcept {
   return result;
 }
 
+double aneFfnShare(const ModelPackage &package, const ops::AneSplit &split,
+                   const DeviceCapabilities &device) {
+  if (split.mode == ops::AneSplit::Mode::Automatic &&
+      !std::holds_alternative<Qwen3_8Weights>(package.target))
+    return 0.0;
+  return ops::AneFfn::share(split, device);
+}
+
 ModelMemoryPlan plannedRuntimeMemory(const DeviceCapabilities &device,
                                      const ModelPackage &package,
                                      const ops::ExecutionPlans &operators,

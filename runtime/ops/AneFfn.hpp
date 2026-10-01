@@ -2,6 +2,8 @@
 
 #include "ane/Program.hpp"
 #include "metal/CommandGraph.hpp"
+#include "metal/DeviceCapabilities.hpp"
+#include "ops/AneSplit.hpp"
 #include "ops/Linear.hpp"
 
 #include <array>
@@ -45,6 +47,12 @@ public:
   ~AneFfn();
   AneFfn(const AneFfn &) = delete;
   AneFfn &operator=(const AneFfn &) = delete;
+
+  // The share `split` runs at on `device`: none when off; for Automatic, the
+  // share measured fastest on the device, or kUntunedShare on one not
+  // measured.
+  static constexpr double kUntunedShare = 0.5;
+  [[nodiscard]] static double share(const AneSplit &split, const DeviceCapabilities &device) noexcept;
 
   // The Metal memory of the split of `layers` at `share`.
   [[nodiscard]] static uint64_t plannedBytes(std::span<const SwiGluProjections> layers, double share);

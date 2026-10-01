@@ -29,6 +29,22 @@ constexpr uint32_t kSegment = 2560;
 constexpr uint32_t kQuantGroup = 64;
 constexpr auto kCompletionTimeout = std::chrono::seconds(10);
 
+// The share of Qwen3.8-27B's prefill FFN fastest in 2048-row chunks on each
+// device measured, by name and GPU cores: the M4's in the kernel harness (the
+// model does not fit its 16 GB), the M5 Pro's with UD-Q4_K_M and the M6's
+// with UD-IQ2_S end to end. The M6's GPU and Neural Engine slow each other
+// down for memory bandwidth, so its GPU keeps little.
+struct TunedShare final {
+  const char *device;
+  uint32_t gpuCores;
+  double share;
+};
+constexpr TunedShare kTunedShares[] = {
+    {"Apple M4", 10, 0.85},
+    {"Apple M5 Pro", 16, 0.5},
+    {"Apple M6", 12, 0.9},
+};
+
 // Whole blocks of the intermediate rotation for the ANE, whole 256-row tiles
 // of the Q4 planes for the GPU.
 uint32_t gpuChannels(uint32_t intermediate, double share) {
@@ -255,6 +271,20 @@ std::string ffnProgram(uint32_t hidden, uint32_t channels, const std::vector<uin
 }
 
 } // namespace
+
+double AneFfn::share(const AneSplit &split, const DeviceCapabilities &device) noexcept {
+  switch (split.mode) {
+  case AneSplit::Mode::Off:
+    return 0.0;
+  case AneSplit::Mode::Fixed:
+    return split.share;
+  case AneSplit::Mode::Automatic:
+    break;
+  }
+  for (const TunedShare &tuned : kTunedShares)
+    if (device.deviceName == tuned.device && device.gpuCoreCount == tuned.gpuCores) return tuned.share;
+  return kUntunedShare;
+}
 
 uint64_t AneFfn::plannedBytes(std::span<const SwiGluProjections> layers, double share) {
   const uint32_t hidden = layers.front().gate->inputSize, intermediate = layers.front().gate->outputSize;
