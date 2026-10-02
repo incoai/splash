@@ -1,5 +1,5 @@
 """The model families Splash serves: each architecture's signature and the
-DFlash2 draft trained for it.
+DFlash2 draft trained for it, if one exists.
 
 A target is identified by its own configuration, never by its repository's
 name: an MLX config.json states it, and gguf.model_config derives the same
@@ -57,7 +57,9 @@ class ModelFamily:
     # states them and as gguf.model_config derives them from a GGUF header,
     # including every one the native source model inspection requires.
     signature: tuple[tuple[str, object], ...]
-    draft: Draft
+    # None for a family no DFlash2 draft was trained for: it decodes without
+    # one, and --draft-model is refused for it.
+    draft: Draft | None
 
 
 FAMILIES = (
@@ -120,6 +122,24 @@ FAMILIES = (
                 ("dflash_config.target_layer_ids", (1, 6, 11, 16, 22, 27, 32, 37)),
             ),
         ),
+    ),
+    ModelFamily(
+        "Qwen3.8-Flash-Next",
+        (
+            ("model_type", "qwen4_exp_text"),
+            ("max_position_embeddings", 262144),
+            ("hidden_size", 2560),
+            ("num_hidden_layers", 48),
+            ("vocab_size", 248320),
+            ("num_attention_heads", 24),
+            ("num_key_value_heads", 2),
+            ("head_dim", 256),
+            ("num_experts", 512),
+            ("num_experts_per_tok", 10),
+            ("hc_count", 4),
+            ("hc_lowrank", 320),
+        ),
+        None,
     ),
 )
 

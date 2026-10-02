@@ -369,7 +369,7 @@ void checkDenseTarget(MetalBackend &backend, const std::filesystem::path &direct
                                      {"output.weight", kQ6_K},
                                      {"token_embd.weight", kIQ4_XS}}),
             geometry);
-  model::GgufTargetLoader files(backend, model::findTargetGguf(target), geometry);
+  model::GgufTargetLoader files(backend, model::findTargetGgufs(target), geometry);
   const model::Qwen3_8Weights weights = model::loadQwen3_8Weights(backend, layout, files);
   check(weights.layers.size() == layout.layers, "GGUF target: every layer");
   check(weights.finalNorm.float32, "GGUF target: F32 final norm");
@@ -469,7 +469,8 @@ void checkRepack(MetalBackend &backend, const std::filesystem::path &directory, 
     const uint64_t before = backend.memoryStats().allocatedBytes;
     model::WeightSource source(inputPath);
     source.setDataOffset(kSourceOffset);
-    model::writeGgufImage(backend, source, output, plan, [] {});
+    const model::WeightSource *sources[] = {&source};
+    model::writeGgufImage(backend, sources, output, plan, [] {});
     check(backend.memoryStats().allocatedBytes == before, "repack releases its staging buffers");
     check(backend.memoryStats().peakAllocatedBytes <= model::kWeightPreparationStagingBytes,
           "repack staging stays within the preparation staging bound");

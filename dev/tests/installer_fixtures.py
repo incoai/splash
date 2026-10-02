@@ -181,7 +181,8 @@ def fake_hub(test, cache, *, target=DENSE, commit="a" * 40):
     fake = FakeHub(test, cache)
     fake.publish(MODEL, commit, lambda p: mlx_target(p, target))
     for family in families.FAMILIES:
-        fake.publish(family.draft.repo, DRAFT_COMMIT, lambda p: draft_dir(p, family))
+        if family.draft:
+            fake.publish(family.draft.repo, DRAFT_COMMIT, lambda p: draft_dir(p, family))
     return fake
 
 

@@ -36,13 +36,28 @@ struct TargetGeometry {
   uint32_t experts = 0;
   uint32_t expertsPerToken = 0;
   uint32_t expertIntermediateSize = 0;
+  // Qwen3.8-Flash-Next (qwen4exp) when hyperConnections is set: the streams,
+  // the mixes' rank, the QSA indexer and the PLE layer (pleLayer = layers
+  // for none) with its heads of pleHeadDimension values and convolution taps.
+  uint32_t hyperConnections = 0;
+  uint32_t hyperRank = 0;
+  uint32_t indexerHeads = 0;
+  uint32_t indexerHeadDimension = 0;
+  uint32_t indexerTokens = 0;
+  uint32_t indexerBlockTokens = 0;
+  uint32_t pleLayer = 0;
+  uint32_t pleNgram = 0;
+  uint32_t pleHeadsPerNgram = 0;
+  uint32_t pleHeadDimension = 0;
+  uint32_t pleConvolutionTaps = 0;
+  [[nodiscard]] bool qwen4() const noexcept { return hyperConnections != 0; }
   [[nodiscard]] bool isFullAttentionLayer(uint32_t layer) const noexcept {
     return (layer + 1) % fullAttentionPeriod == 0;
   }
   [[nodiscard]] bool sparseMoe() const noexcept { return experts != 0; }
   // The general.architecture of a GGUF of this target.
   [[nodiscard]] const char *architecture() const noexcept {
-    return sparseMoe() ? "qwen35moe" : "qwen35";
+    return qwen4() ? "qwen4exp" : sparseMoe() ? "qwen35moe" : "qwen35";
   }
 };
 
@@ -65,6 +80,7 @@ struct TensorRows {
   uint64_t rows = 0;
   uint64_t rowBytes = 0;
   RowOrder order{};
+  uint32_t file = 0;   // the file of a split GGUF it is in
 };
 
 // Header and descriptor bytes.
@@ -80,6 +96,9 @@ struct Copy {
   TensorRows source;
   bool bfloat16 = false;
   bool float32 = false;
+  // Q8_0 rows as the F32 values they equal (d * q, exact in F32): small
+  // tensors a float kernel reads, as the MTP head's injection weights.
+  bool dequantizeQ80 = false;
 };
 // Quantized rows repacked into the planes of their format; the rows of the
 // sources in order, then zero rows up to `rows`.
@@ -100,10 +119,29 @@ struct Image {
   std::vector<Repack> repacks;
 };
 
-// The layers' images, then the head's and the embedding's. Checks the
+// The layers' images, then the head's and the embedding's, and for qwen4exp
+// with a PLE layer the n-gram table's (ple.bin). Checks the
 // architecture, the geometry the metadata declares, its rotary embedding and
 // norms included, and each tensor's shape; throws GgufError naming every
 // missing tensor and every tensor of a type this build cannot load.
 [[nodiscard]] std::vector<Image> planImages(const GgufFile &file, const TargetGeometry &geometry);
+
+// A qwen4exp MTP head's image (mtp.bin): its one full-attention block
+// (blk.<layers>, the block's tensors as a target layer's), then the
+// nextn tensors: eh_proj, enorm, hnorm and the head's mix. The geometry is
+// the target's; the MTP file has no PLE.
+[[nodiscard]] Image planMtpImage(const GgufFile &file, const TargetGeometry &geometry);
+
+// The hash of a qwen4exp target's PLE n-gram embedding (llama.cpp
+// qwen4exp.cpp llm_graph_input_qwen4exp_ple): per n-gram position the
+// multiplier, per head its table rows' offset and count, and the table's rows.
+struct PleHash {
+  std::vector<uint64_t> multipliers;
+  std::vector<uint32_t> headOffsets;
+  std::vector<uint32_t> headVocabularies;
+  uint64_t tableRows = 0;
+  uint32_t eosToken = 0;
+};
+[[nodiscard]] PleHash readPleHash(const GgufFile &file, const TargetGeometry &geometry);
 
 } // namespace splash::model::gguf

@@ -18,18 +18,19 @@
     "q40": "3df6851dce84712c67778856cdb16f368c8d57d16031f63c7b3cf9210bb7815f",
     "q41": "4e00c1bb0f333029a59b745167f5be402e44d051a859504173b1ae1ce00f0d31",
     "mxfp4": "3665d78f8b738d4e139b21f44bb7a085b52835cb36e1906ea34e15267ca73537",
-    "pq20": "c41444ea0f8afc3c9d3e4392b371b6f1d8e8ea3fc23c1a8b17f9a8ce11dda763"
+    "pq20": "c41444ea0f8afc3c9d3e4392b371b6f1d8e8ea3fc23c1a8b17f9a8ce11dda763",
+    "q51": "d7e5f8d29ae70dc48cc6548c13864a72a6829c1e34cc54b053b2e1d30e944790"
   },
   "gguf_images": {
     "dense": {
-      "target/layer-0.bin": "3cb6434604cdcae0d93b72844939421eff05f98cff74196392c2153a5c0b4ab3",
-      "target/layer-1.bin": "f7e1f9a7dec53a1a2396898a302d39e7877ee13bcb493f7240b7c9479df91bfe",
-      "target/head.bin": "568caf2ce1c20591bbb6da095f1e94b47f868addf0ca3865fede7bafe7486e36",
+      "target/layer-0.bin": "c03f94f50978577a794cb120ae56594317e4c276400e79da7814ac76ee5feace",
+      "target/layer-1.bin": "e67034a0f0faf58c95b4387293ec9718b29b57545ee213b8a24392479c3d72f4",
+      "target/head.bin": "208fff3c19817727793b769680ceed0a35f549ed78d37abc866dd18c2276ef9f",
       "target/embedding.bin": "6d17df18962f4941a0ce6538aa0092dba1073c78848a62f577a666b81a89e159"
     },
     "moe": {
-      "target/layer-0.bin": "70d9d2727f5a8883507b6f7c3680913f6f8c3c131fbb90b01bffa05e831b637e",
-      "target/head.bin": "3f61a8a408a40624b12f9564472930c655a84cdf5e1782191990f678fe80305c",
+      "target/layer-0.bin": "6575ec6e4d2c72f2a3b406d490a95d6e4fec0d79b8b2e9110d4948c442f1f449",
+      "target/head.bin": "cee4659abb8e830f64dc34ad7ecff5b7627ff3bdc81a299d3dd91ff90a7ebaa1",
       "target/embedding.bin": "86a749f41cab45849eb9a2753025779ef1c58e74842b65290534eff4e29403e9"
     }
   },

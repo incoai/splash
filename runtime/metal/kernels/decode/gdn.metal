@@ -230,7 +230,7 @@ inline void gdn_decode_gate(threadgroup GdnDecodeShared<HeadDim> &shared,
                             device const bfloat *packed,
                             device const W *norm_weight,
                             device bfloat *recurrent, device bfloat *hidden,
-                            uint packed_width, bool tiled, uint value_head,
+                            uint packed_width, bool tiled, bool sigmoid_gate, uint value_head,
                             uint lane, uint token) {
 #pragma clang fp reassociate(off)
   constexpr uint Groups = HeadDim / 32;
@@ -257,7 +257,8 @@ inline void gdn_decode_gate(threadgroup GdnDecodeShared<HeadDim> &shared,
     recurrent[(row + value_head) * HeadDim + dim] = bfloat(value[g]);
     const bfloat normalized = bfloat((value[g] * inverse) * float(weight[g]));
     const float z = float(gate[g]);
-    const bfloat gated = bfloat((float(normalized) * z) /
+    // Qwen3.5 gates by silu(z), Qwen3.8-Flash-Next by sigmoid(z).
+    const bfloat gated = bfloat((float(normalized) * (sigmoid_gate ? 1.0f : z)) /
                                 (1.0f + fast::exp2(-1.44269504089f * z)));
     hidden[hidden_base + dim] = gated;
     shared.rows[token * HeadDim + dim] = gated;
@@ -449,10 +450,10 @@ inline void gdn_decode_batch_phase(
   gdn_decode_scan<HeadDim, RowsInFlight>(state_in, state_out, shared, group.x,
                                          lane, simd_group);
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  const bool tiled = params.tiled_heads != 0;
+  const bool tiled = (params.tiled_heads & 1) != 0;
   gdn_decode_gate<KeyHeads, ValueHeads, HeadDim, ConvDim>(
       shared, packed, gdn_norm_weight, lane_recurrent, lane_hidden,
-      params.packed_width, tiled, group.x, lane, simd_group);
+      params.packed_width, tiled, (params.tiled_heads & 2) != 0, group.x, lane, simd_group);
   if (table) {
     // Each group owns this head for all eight rows; each simdgroup writes
     // the table of the row it just gated.

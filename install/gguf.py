@@ -284,7 +284,13 @@ def tokenizer_files(metadata):
 
 # The GGUF text architectures Splash serves, and the model type of each one's
 # text configuration.
-TEXT_MODEL_TYPES = {"qwen35": "qwen3_5_text", "qwen35moe": "qwen3_5_moe_text"}
+TEXT_MODEL_TYPES = {
+    "qwen35": "qwen3_5_text",
+    "qwen35moe": "qwen3_5_moe_text",
+    "qwen4exp": "qwen4_exp_text",
+}
+# The architectures whose feed-forward is a sparse MoE block.
+MOE_ARCHITECTURES = {"qwen35moe", "qwen4exp"}
 
 
 def text_architecture(metadata):
@@ -309,10 +315,15 @@ def model_config(metadata, vision=None):
         model_type=TEXT_MODEL_TYPES[arch],
         vocab_size=len(metadata.require("tokenizer.ggml.tokens", list)),
     )
-    if arch == "qwen35moe":
+    if arch in MOE_ARCHITECTURES:
         text.update(
             num_experts=metadata.positive(arch + ".expert_count"),
             num_experts_per_tok=metadata.positive(arch + ".expert_used_count"),
+        )
+    if arch == "qwen4exp":
+        text.update(
+            hc_count=metadata.positive(arch + ".hyper_connection.count"),
+            hc_lowrank=metadata.positive(arch + ".hyper_connection.low_rank"),
         )
     config = {
         "model_type": TEXT_MODEL_TYPES[arch].removesuffix("_text"),
@@ -417,6 +428,7 @@ QUANTIZED_TYPES = {
     "Q8_0",
     "Q4_0",
     "Q4_1",
+    "Q5_1",
     "IQ1_S",
     "IQ1_M",
     "IQ2_XXS",
@@ -493,19 +505,106 @@ MOE_TENSORS = {
 }
 
 
+# Qwen3.8-Flash-Next (qwen4exp): hyper-connections replace every norm, so a
+# layer has none of its own and the model no output norm; its full-attention
+# layers carry the QSA indexer, whose BF16 projections preparation widens to
+# the F32 values they equal; the PLE layers carry the n-gram embedding's
+# projections, norms and convolution.
+QWEN4_MODEL_TENSORS = {
+    "token_embd.weight": EMBEDDING_TYPES,
+    "output.weight": QUANTIZED_TYPES,
+    "output_hc_norm.weight": F32,
+    "output_hc_down.weight": QUANTIZED_TYPES,
+    "output_hc_up.weight": QUANTIZED_TYPES,
+}
+QWEN4_PLE_MODEL_TENSORS = {"per_layer_token_embd.weight": EMBEDDING_TYPES}
+QWEN4_LAYER_TENSORS = {
+    f"hc_{part}_{name}.weight": types
+    for part in ("attn", "ffn")
+    for name, types in (
+        ("norm", F32),
+        ("down", QUANTIZED_TYPES),
+        ("up", QUANTIZED_TYPES),
+        ("inject", F32),
+    )
+}
+QWEN4_INDEXER_TENSORS = {
+    "indexer.q_proj.weight": QUANTIZED_TYPES | {"F32", "BF16"},
+    "indexer.k_proj.weight": QUANTIZED_TYPES | {"F32", "BF16"},
+    "indexer.q_norm.weight": F32,
+    "indexer.k_norm.weight": F32,
+}
+QWEN4_PLE_TENSORS = {
+    "ple_key.weight": QUANTIZED_TYPES,
+    "ple_value.weight": QUANTIZED_TYPES,
+    "ple_norm_key.weight": F32,
+    "ple_norm_query.weight": F32,
+    "ple_norm_conv.weight": F32,
+    "ple_conv1d.weight": F32,
+}
+
+
+def ple_layers(metadata, arch):
+    """The layers a qwen4exp target's PLE n-gram embedding feeds, 0-based."""
+    layers = metadata.values.get(arch + ".ple.layers", [])
+    if type(layers) is not list or any(type(layer) is not int for layer in layers):
+        raise ModelError("invalid GGUF PLE layers")
+    return set(layers)
+
+
 def loaded_tensors(metadata):
     """Each tensor the native loader reads from the target that metadata
     describes, with the types it accepts. MTP layers are not loaded; every
     full_attention_interval-th layer is full attention, the others GDN."""
     arch = text_architecture(metadata)
     period = metadata.positive(arch + ".full_attention_interval")
-    ffn = MOE_TENSORS if arch == "qwen35moe" else DENSE_TENSORS
+    if arch == "qwen4exp":
+        ple = ple_layers(metadata, arch)
+        tensors = dict(QWEN4_MODEL_TENSORS)
+        if ple:
+            tensors |= QWEN4_PLE_MODEL_TENSORS
+        for layer in range(loaded_layers(metadata, arch)):
+            attention = (layer + 1) % period == 0
+            mixer = ATTENTION_TENSORS | QWEN4_INDEXER_TENSORS if attention else GDN_TENSORS
+            parts = QWEN4_LAYER_TENSORS | mixer | MOE_TENSORS
+            if layer in ple:
+                parts |= QWEN4_PLE_TENSORS
+            for name, types in parts.items():
+                tensors[f"blk.{layer}.{name}"] = types
+        return tensors
+    ffn = MOE_TENSORS if arch in MOE_ARCHITECTURES else DENSE_TENSORS
     tensors = dict(MODEL_TENSORS)
     for layer in range(loaded_layers(metadata, arch)):
         mixer = ATTENTION_TENSORS if (layer + 1) % period == 0 else GDN_TENSORS
         for name, types in (LAYER_TENSORS | mixer | ffn).items():
             tensors[f"blk.{layer}.{name}"] = types
     return tensors
+
+
+def merged_split(headers):
+    """One target's metadata from the headers of its split files (llama.cpp's
+    gguf-split), in split order: the first file's keys, whose split.* keys
+    must describe these files, and every file's tensors."""
+    first = headers[0]
+    count = first.values.get("split.count", 1)
+    if type(count) is not int or count != len(headers):
+        raise ModelError("the GGUF's split files do not match its split.count")
+    tensors = {}
+    for number, header in enumerate(headers):
+        if len(headers) > 1 and (
+            header.values.get("split.no") != number
+            or header.values.get("split.count") != count
+        ):
+            raise ModelError(f"GGUF split file {number + 1} is out of order")
+        for name, kind in header.tensors.items():
+            if name in tensors:
+                raise ModelError("duplicate GGUF tensor across split files: " + name)
+            tensors[name] = kind
+    total = first.values.get("split.tensors.count", len(tensors))
+    if total != len(tensors):
+        raise ModelError("the GGUF's split files hold another number of tensors")
+    first.tensors = tensors
+    return first
 
 
 # Prism ML's input rotation of a dense target: the parameters and keys

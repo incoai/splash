@@ -12,6 +12,12 @@
 namespace splash::ops {
 namespace {
 
+// The output head order and gate of GDNGatePrefillParams::tiled_heads.
+uint32_t headFlags(GdnShape shape, GdnHeadOrder order) noexcept {
+  return (order == GdnHeadOrder::Tiled ? 1u : 0u) | (shape.sigmoidGate ? GDN_SIGMOID_GATE : 0u);
+}
+
+
 static_assert(offsetof(GDNDecodeBatchParams, conv_layer_bytes) == 16);
 static_assert(offsetof(GDNBatchCommitParams, conv_layer_bytes) == 32);
 
@@ -20,9 +26,15 @@ enum class KernelLayout : uint8_t { Value48, Value32 };
 [[nodiscard]] KernelLayout kernelShape(const GdnShape &shape) {
   if (!shape.valid())
     throw std::invalid_argument("invalid GDN shape");
-  if (shape == GdnShape{16, 48, 128, 10240, 16640})
+  // The packed row width and the output gate are run-time parameters
+  // (Qwen3.8-Flash-Next packs its GDN rows to 16512 columns).
+  const auto heads = [&](uint32_t keys, uint32_t values, uint32_t dimension, uint32_t convolution) {
+    return shape.keyHeads == keys && shape.valueHeads == values && shape.headDimension == dimension &&
+           shape.convolutionDimension == convolution;
+  };
+  if (heads(16, 48, 128, 10240))
     return KernelLayout::Value48;
-  if (shape == GdnShape{16, 32, 128, 8192, 12544})
+  if (heads(16, 32, 128, 8192))
     return KernelLayout::Value32;
   throw std::invalid_argument("unsupported compiled GDN shape");
 }
@@ -64,8 +76,7 @@ void GDN::addPrefill(metal::CommandGraph &graph, GdnPrefillBuffers buffers,
   graph.add(gate,
             {buffers.recurrentRows, buffers.packed, buffers.mixerNorm.buffer,
              buffers.hidden},
-            GDNGatePrefillParams{tokens, shape.packedWidth,
-                                 order == GdnHeadOrder::Tiled},
+            GDNGatePrefillParams{tokens, shape.packedWidth, headFlags(shape, order)},
             {uint64_t{tokens} * shape.valueHeads, 1, 1}, {128, 1, 1});
 }
 
@@ -92,7 +103,7 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
                    buffers.generation});
   if (prepare)
     bindings.insert(bindings.end(), {buffers.linearScratch.input, buffers.linearScratch.sums});
-  const GDNDecodeBatchParams params{order == GdnHeadOrder::Tiled,
+  const GDNDecodeBatchParams params{headFlags(shape, order),
                                     shape.packedWidth,
                                     lanes,
                                     layer,

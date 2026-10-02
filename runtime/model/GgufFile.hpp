@@ -69,6 +69,7 @@ struct GgufTensor {
   std::vector<uint64_t> dims; // dims[0] is the fastest (row length)
   uint64_t offset = 0;        // in the file's tensor data
   uint64_t bytes = 0;
+  uint32_t file = 0;          // which file of a split GGUF holds it
   [[nodiscard]] uint64_t columns() const noexcept { return dims.empty() ? 0 : dims[0]; }
   [[nodiscard]] uint64_t rows() const;
   [[nodiscard]] uint64_t elements() const;
@@ -92,8 +93,14 @@ class GgufFile final {
 public:
   // Parses the header of source and sets where its tensor data starts.
   explicit GgufFile(WeightSource &source);
+  // The files of a split GGUF (llama.cpp's gguf-split), in split order: the
+  // first one's metadata, whose split.* keys must describe these files, and
+  // every file's tensors, each tagged with its file.
+  explicit GgufFile(std::span<WeightSource *const> sources);
 
-  [[nodiscard]] const WeightSource &source() const noexcept { return source_; }
+  [[nodiscard]] const WeightSource &source() const noexcept { return *sources_.front(); }
+  [[nodiscard]] const WeightSource &source(uint32_t file) const { return *sources_.at(file); }
+  [[nodiscard]] uint32_t files() const noexcept { return static_cast<uint32_t>(sources_.size()); }
   [[nodiscard]] const std::string &architecture() const noexcept { return architecture_; }
 
   [[nodiscard]] std::optional<uint64_t> unsignedValue(std::string_view key) const;
@@ -108,7 +115,8 @@ public:
   [[nodiscard]] const GgufTensor &require(std::string_view name) const;
 
 private:
-  const WeightSource &source_;
+  void parse(WeightSource &source, uint32_t file);
+  std::vector<WeightSource *> sources_;
   std::string architecture_;
   std::map<std::string, uint64_t, std::less<>> unsigned_;
   std::map<std::string, std::string, std::less<>> strings_;

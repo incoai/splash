@@ -182,6 +182,14 @@ std::filesystem::path requireModelRoot(std::string_view targetArgument,
                                        std::string_view draftArgument) {
   std::filesystem::path target =
       canonicalDirectory(targetArgument, "TARGET_DIRECTORY");
+  // A family without a DFlash2 draft has no draft/ directory; it is still
+  // named, beside target/, so the model root is unambiguous.
+  std::error_code missing;
+  const std::filesystem::path named(draftArgument);
+  if (!std::filesystem::exists(named, missing) && !missing &&
+      named.filename() == "draft" &&
+      std::filesystem::weakly_canonical(named).parent_path() == target.parent_path())
+    return target.parent_path();
   std::filesystem::path draft =
       canonicalDirectory(draftArgument, "DRAFT_DIRECTORY");
   if (target.filename() != "target" || draft.filename() != "draft" ||

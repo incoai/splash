@@ -63,6 +63,10 @@ struct LayerStorage final {
   metal::MetalBuffer valueData;
   metal::MetalBuffer valueScales;
   Format format = Format::Int8;
+  // Layout::indexDimension: the QSA indexer's raw keys (bf16 [page][token]
+  // [dimension]) and its blocks' pooled keys (fp32 [page][block][dimension]).
+  metal::MetalBuffer indexKeys;
+  metal::MetalBuffer indexPooled;
 };
 
 // Shared cache format and execution limits; model dimensions live in Layout.
@@ -117,6 +121,11 @@ struct Layout final {
   uint32_t kvHeads = 0;
   uint32_t headDimension = 0;
   Format format = Format::Int8;
+  // Qwen3.8-Flash-Next's QSA: each page also holds its tokens' indexer keys
+  // of this many values and the pooled keys of its blocks of
+  // kIndexBlockTokens tokens (LayerStorage::indexKeys, indexPooled).
+  uint32_t indexDimension = 0;
+  static constexpr uint32_t kIndexBlockTokens = 4;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
     return attentionLayers && kvHeads && headDimension && validFormat(format);
@@ -137,8 +146,15 @@ struct Layout final {
   [[nodiscard]] constexpr uint64_t scaleBytesPerLayerPage() const noexcept {
     return scalesPerTensorLayerPage() * sizeof(float);
   }
+  [[nodiscard]] constexpr uint64_t indexKeyBytesPerLayerPage() const noexcept {
+    return uint64_t{kPageTokens} * indexDimension * 2;
+  }
+  [[nodiscard]] constexpr uint64_t indexPooledBytesPerLayerPage() const noexcept {
+    return uint64_t{kPageTokens} / kIndexBlockTokens * indexDimension * sizeof(float);
+  }
   [[nodiscard]] constexpr uint64_t bytesPerLayerPage() const noexcept {
-    return 2 * (dataBytesPerLayerPage() + scaleBytesPerLayerPage());
+    return 2 * (dataBytesPerLayerPage() + scaleBytesPerLayerPage()) + indexKeyBytesPerLayerPage() +
+           indexPooledBytesPerLayerPage();
   }
   [[nodiscard]] constexpr uint64_t bytesPerModelPage() const noexcept {
     return uint64_t{attentionLayers} * bytesPerLayerPage();
@@ -149,12 +165,14 @@ struct Layout final {
   // pages and 2 heads require 256. BF16 needs only 1 or 2 pages. This is physical
   // allocation geometry; prefix matching remains Page32 in both cases.
   [[nodiscard]] constexpr uint32_t sparseMappingBatchPages() const noexcept {
-    if (format == Format::BFloat16)
-      return static_cast<uint32_t>(
-          detail::pagesForAlignedMapping(dataBytesPerLayerPage()));
-    return static_cast<uint32_t>(detail::lcm(
-        detail::pagesForAlignedMapping(dataBytesPerLayerPage()),
-        detail::pagesForAlignedMapping(scaleBytesPerLayerPage())));
+    uint64_t pages = format == Format::BFloat16
+                         ? detail::pagesForAlignedMapping(dataBytesPerLayerPage())
+                         : detail::lcm(detail::pagesForAlignedMapping(dataBytesPerLayerPage()),
+                                       detail::pagesForAlignedMapping(scaleBytesPerLayerPage()));
+    if (indexDimension)
+      pages = detail::lcm(pages, detail::lcm(detail::pagesForAlignedMapping(indexKeyBytesPerLayerPage()),
+                                             detail::pagesForAlignedMapping(indexPooledBytesPerLayerPage())));
+    return static_cast<uint32_t>(pages);
   }
 
   [[nodiscard]] constexpr uint64_t sparseMappingBatchBytes() const noexcept {

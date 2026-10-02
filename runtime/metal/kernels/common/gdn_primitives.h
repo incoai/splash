@@ -90,7 +90,7 @@ gdn_gate_phase(device const bfloat *recurrent, device const bfloat *packed,
                device const W *norm_weight, device bfloat *hidden,
                uint tasks, uint groups, uint packed_width, bool tiled,
                threadgroup float *scratch, uint group, uint thread_index,
-               uint lane, uint simd_group) {
+               uint lane, uint simd_group, bool sigmoid_gate = false) {
   constexpr uint ZOffset = ConvDim;
   for (uint task = group; task < tasks; task += groups) {
     uint token = task / ValueHeads;
@@ -118,8 +118,9 @@ gdn_gate_phase(device const bfloat *recurrent, device const bfloat *packed,
           bfloat(value * scratch[0] * float(norm_weight[thread_index]));
       float gate = float(packed[token * packed_width + ZOffset +
                                 head * HeadDim + thread_index]);
-      float silu = gate / (1.0f + fast::exp2(-1.44269504089f * gate));
-      hidden[hidden_base + thread_index] = bfloat(float(normalized) * silu);
+      // Qwen3.5 gates by silu(z), Qwen3.8-Flash-Next by sigmoid(z).
+      float sigmoid = 1.0f / (1.0f + fast::exp2(-1.44269504089f * gate));
+      hidden[hidden_base + thread_index] = bfloat(float(normalized) * (sigmoid_gate ? sigmoid : gate * sigmoid));
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }

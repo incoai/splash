@@ -75,6 +75,9 @@ int main(int argc, char **argv) {
       const std::filesystem::path package(argv[3]);
       const auto descriptor = model::inspectModelPackage(package);
       std::visit([&](const auto &layout) {
+        if constexpr (std::is_same_v<std::remove_cvref_t<decltype(layout)>, model::Qwen4ExpLayout>) {
+          throw std::runtime_error("Qwen3.8-Flash-Next has no affine source");
+        } else {
         model::AffineTargetLoader loader(backend, argv[2], layout);
         const uint32_t begin = argc == 5 && !loadOnly ? std::stoul(argv[4]) : 0;
         const uint32_t end = argc == 5 && !loadOnly ? begin + 1 : layout.layers;
@@ -89,6 +92,7 @@ int main(int argc, char **argv) {
         if (argc != 5 || loadOnly) {
           compare(loader.head(), package / "target", loadOnly);
           compare(loader.embedding(), package / "target", loadOnly);
+        }
         }
       }, descriptor.target);
       std::cout << "affine source oracle PASS seconds="

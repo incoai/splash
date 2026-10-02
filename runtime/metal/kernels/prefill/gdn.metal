@@ -310,8 +310,8 @@ GDN_PREPARE_PREFILL_ENTRY(prefill_gdn_prepare_vh32, 16, 32, 128, 8192)
     gdn_gate_phase<KeyHeads, ValueHeads, HeadDim, ConvDim, 4>(                \
         recurrent, packed, norm_weight, hidden, params.tokens * ValueHeads,   \
         params.tokens * ValueHeads, params.packed_width,                      \
-        params.tiled_heads != 0, reductions, task, thread_index, lane,        \
-        simd_group);                                                          \
+        (params.tiled_heads & 1) != 0, reductions, task, thread_index, lane,  \
+        simd_group, (params.tiled_heads & 2) != 0);                           \
   }
 
 GDN_GATE_PREFILL_ENTRY(prefill_gdn_gate, 16, 48, 128, 10240, bfloat)

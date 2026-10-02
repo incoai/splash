@@ -62,6 +62,14 @@ PageStorage::PageStorage(metal::MetalBackend &backend,
                 checkedMultiply(pageCount, layout_.scaleBytesPerLayerPage()),
                 kSparseMappingAlignmentBytes, prefix + "value-scales");
         }
+        if (layout_.indexDimension) {
+            storage.indexKeys = backend_.allocatePlacementSparseBuffer(
+                checkedMultiply(pageCount, layout_.indexKeyBytesPerLayerPage()),
+                kSparseMappingAlignmentBytes, prefix + "index-keys");
+            storage.indexPooled = backend_.allocatePlacementSparseBuffer(
+                checkedMultiply(pageCount, layout_.indexPooledBytesPerLayerPage()),
+                kSparseMappingAlignmentBytes, prefix + "index-pooled");
+        }
     }
     if (declaredBytes() != bytes.total) {
         throw std::logic_error("KV storage accounting mismatch");
@@ -138,7 +146,7 @@ bool PageStorage::isResident(uint32_t page) const {
 std::vector<metal::SparseMapping> PageStorage::mappingsFor(
     const Extent &extent) const {
     std::vector<metal::SparseMapping> mappings;
-    mappings.reserve(uint64_t{layout_.attentionLayers} * 4);
+    mappings.reserve(uint64_t{layout_.attentionLayers} * 6);
     uint64_t heapOffset = 0;
     auto append = [&](const metal::MetalBuffer &buffer,
                       uint64_t bytesPerPage) {
@@ -154,6 +162,10 @@ std::vector<metal::SparseMapping> PageStorage::mappingsFor(
         append(storage.keyScales, layout_.scaleBytesPerLayerPage());
         append(storage.valueData, layout_.dataBytesPerLayerPage());
         append(storage.valueScales, layout_.scaleBytesPerLayerPage());
+        if (layout_.indexDimension) {
+            append(storage.indexKeys, layout_.indexKeyBytesPerLayerPage());
+            append(storage.indexPooled, layout_.indexPooledBytesPerLayerPage());
+        }
     }
     uint64_t expected = checkedMultiply(
         extent.pageCount, layout_.bytesPerModelPage());

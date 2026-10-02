@@ -148,7 +148,7 @@ public:
       offset += aligned(plan_.sizes[i]);
     }
     layer_ = {get(Tensor::Keys), get(Tensor::KeyScales), get(Tensor::Values),
-               get(Tensor::ValueScales), plan_.shape.format};
+               get(Tensor::ValueScales), plan_.shape.format, {}, {}};
     for (uint32_t lane = 0; lane < plan_.lanes; ++lane) {
       tables_[lane] = get(static_cast<Tensor>(tensorIndex(Tensor::Table0) + lane));
       stores_[lane] = {plan_.histories[lane], plan_.rows, plan_.stride,

@@ -145,7 +145,7 @@ canonicalRuntimeCacheNamespace(const RuntimeCacheIdentity &identity) {
 
 void requireLoadedModel(const model::ModelPackage &package) {
   if (!package.targetActualAllocatedBytes() ||
-      !package.draft.actualAllocatedBytes ||
+      (package.hasDraft() && !package.draft.actualAllocatedBytes) ||
       (package.descriptor.hasVision() && !package.vision.actualAllocatedBytes) ||
       package.manifestFingerprintSha256.empty() ||
       package.targetManifestFingerprint().empty()) {
