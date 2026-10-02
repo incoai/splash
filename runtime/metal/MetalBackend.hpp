@@ -77,6 +77,9 @@ public:
 
   [[nodiscard]] explicit operator bool() const noexcept;
   [[nodiscard]] uint64_t sizeBytes() const noexcept;
+  // The base allocation's MTLResource.allocatedSize, as memoryStats() counts
+  // it; views of one allocation all report it.
+  [[nodiscard]] uint64_t allocatedBytes() const noexcept;
   [[nodiscard]] BufferStorage storage() const noexcept;
   // Returns nullptr for private buffers. The pointer covers this view only.
   [[nodiscard]] void *contents() const noexcept;

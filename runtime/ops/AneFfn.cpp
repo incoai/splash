@@ -314,13 +314,17 @@ AneFfn::AneFfn(metal::MetalBackend &backend, const Linear &linear, std::span<con
       throw std::invalid_argument("ANE FFN split layers differ in shape");
   }
 
+  // The bytes the backend counts, which the memory audit compares with the
+  // runtime's categories: a small buffer can take less than its pages.
   const auto allocate = [&](uint64_t bytes, const char *label) {
-    allocatedBytes_ += pages(bytes);
-    return backend_.allocateBuffer(bytes, metal::BufferStorage::Shared, label);
+    metal::MetalBuffer buffer = backend_.allocateBuffer(bytes, metal::BufferStorage::Shared, label);
+    allocatedBytes_ += buffer.allocatedBytes();
+    return buffer;
   };
   const auto surface = [&](uint32_t rows, uint32_t width, Element element) {
-    allocatedBytes_ += ane::Surface::bytes(rows, width, element);
-    return ane::Surface::create(backend_, rows, width, element);
+    ane::Surface result = ane::Surface::create(backend_, rows, width, element);
+    allocatedBytes_ += result.buffer.allocatedBytes();
+    return result;
   };
 
   const std::array<float, kIntermediateBlock> signs = rotationSigns();
