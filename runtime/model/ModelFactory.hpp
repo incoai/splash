@@ -6,7 +6,7 @@
 #include "Qwen3_6Moe.hpp"
 #include "Qwen3_8.hpp"
 #include "QwenVision.hpp"
-#include "ops/AneSplit.hpp"
+#include "ops/AneFfn.hpp"
 #include "ops/PageStorage.hpp"
 #include "ops/ExecutionPlans.hpp"
 #include "model/SlotFile.hpp"
@@ -75,7 +75,8 @@ struct RuntimeContext final {
   uint64_t pipelineReserveBytes = 0;
   uint64_t runtimeOverheadReserveBytes = 0;
   KvPageTier *kvTier = nullptr;
-  // aneFfnShare() of RuntimeResourcesConfig::aneSplit.
+  // The share of the prefill FFN's Neural Engine split (calibrateAneFfn), or
+  // 0 for none.
   double aneFfnShare = 0.0;
 };
 
@@ -113,10 +114,12 @@ loadModelPackage(metal::MetalBackend &backend,
 inline constexpr uint64_t kPipelineReserveBytes = 256ULL << 20;
 inline constexpr uint64_t kRuntimeOverheadReserveBytes = 512ULL << 20;
 
-// The prefill FFN share `split` gives the package's target on `device`
-// (ops::AneFfn::share): an automatic split takes only a dense target.
-[[nodiscard]] double aneFfnShare(const ModelPackage &package, const ops::AneSplit &split,
-                                 const DeviceCapabilities &device);
+// The Neural Engine split of the package's prefill FFN calibrated on this
+// device (ops::AneFfn::calibrate) on a prefill arena of its own; a target
+// other than a dense one, or one whose FFN the split does not take, gets
+// none.
+[[nodiscard]] ops::AneFfn::Calibration calibrateAneFfn(metal::MetalBackend &backend, const ModelPackage &package,
+                                                       const ops::ExecutionPlans &operators, kv::Format format);
 [[nodiscard]] ModelMemoryPlan
 plannedRuntimeMemory(const DeviceCapabilities &device,
                      const ModelPackage &package,

@@ -2,8 +2,6 @@
 
 #include "ane/Program.hpp"
 #include "metal/CommandGraph.hpp"
-#include "metal/DeviceCapabilities.hpp"
-#include "ops/AneSplit.hpp"
 #include "ops/Linear.hpp"
 
 #include <array>
@@ -48,11 +46,31 @@ public:
   AneFfn(const AneFfn &) = delete;
   AneFfn &operator=(const AneFfn &) = delete;
 
-  // The share `split` runs at on `device`: none when off; for Automatic, the
-  // share measured fastest on the device, or kUntunedShare on one not
-  // measured.
-  static constexpr double kUntunedShare = 0.5;
-  [[nodiscard]] static double share(const AneSplit &split, const DeviceCapabilities &device) noexcept;
+  // A prefill arena's buffers of a full chunk's dense FFN, as add() takes
+  // them, with the residual and output of alternate layers in `hidden`.
+  struct ChunkBuffers final {
+    metal::MetalBuffer normalized, sums, gateScratch, intermediate, downSums;
+    std::array<metal::MetalBuffer, 2> hidden;
+    LinearScratch scratch;
+  };
+  struct Calibration final {
+    // The fraction of intermediate channels the ANE takes, or 0 when the GPU
+    // alone is about as fast.
+    double share = 0.0;
+    // A full chunk's FFN layer on the GPU alone and split at `share`.
+    double gpuMilliseconds = 0.0, splitMilliseconds = 0.0;
+  };
+  // Whether the split takes `layers`: affine Q4 or quantized GGUF
+  // projections of one shape, whose hidden size is whole input segments and
+  // intermediate size whole rotation blocks.
+  [[nodiscard]] static bool supports(std::span<const SwiGluProjections> layers);
+  // The share at which full chunks of `layers` run fastest on this device,
+  // from the GPU's part, the ANE's part and both together timed on the
+  // leading layers at two shares (AneFfn.cpp), or none for layers the split
+  // does not take. It overwrites `buffers`.
+  [[nodiscard]] static Calibration calibrate(metal::MetalBackend &backend, const Linear &linear,
+                                             std::span<const SwiGluProjections> layers,
+                                             const ChunkBuffers &buffers);
 
   // The Metal memory of the split of `layers` at `share`.
   [[nodiscard]] static uint64_t plannedBytes(std::span<const SwiGluProjections> layers, double share);
@@ -77,6 +95,18 @@ public:
   void finish();
 
 private:
+  // The parts of a split layer encode() adds: the GPU's channels and the
+  // staging of the next layer's int8 weights, the ANE's channels with their
+  // packing and join, or both, ordered by the shared event.
+  enum class Parts : uint8_t { Gpu = 1, Ane = 2, Both = 3 };
+
+  AneFfn(metal::MetalBackend &backend, const Linear &linear, std::span<const SwiGluProjections> layers,
+         double share, std::span<const uint32_t> programRows);
+  void encode(metal::CommandGraph &graph, uint32_t layer, metal::MetalBuffer normalized, metal::MetalBuffer sums,
+              metal::MetalBuffer gateScratch, metal::MetalBuffer intermediate, metal::MetalBuffer downSums,
+              metal::MetalBuffer residual, metal::MetalBuffer output, uint32_t rows, LinearScratch scratch,
+              Parts parts);
+
   struct Weights final {
     // The ANE's rows of gate and up in two input segments, down in segments
     // of its inputs, and the shared per-row scale of each.
@@ -123,7 +153,7 @@ private:
   std::vector<Layer> layers_;
   metal::MetalBuffer signs_, rowScales_, rotated_;
   std::array<Weights, 2> sets_;
-  // By rows, as kProgramRows.
+  // By rows, ascending.
   std::vector<Evaluation> evaluations_;
   metal::SharedEvent event_;
   uint64_t value_ = 0;

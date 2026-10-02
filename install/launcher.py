@@ -272,8 +272,6 @@ def serve(args):
         ]
         if args.kv_format != "int8":
             command.extend(("--kv-format", args.kv_format))
-        if args.ane_split:
-            command.extend(("--ane-split", str(args.ane_split)))
         for name in args.served_model_name:
             command.append(f"--served-model-name={name}")
         if args.default_reasoning_effort is not None:
@@ -414,19 +412,6 @@ def _parse_request_size(value):
     if size is None:
         raise argparse.ArgumentTypeError("use a positive byte count such as 128M")
     return size
-
-
-def _parse_ane_split(value):
-    normalized = value.strip().lower()
-    if normalized == "auto":
-        return normalized
-    try:
-        share = float(normalized)
-    except ValueError:
-        share = None
-    if share is None or not 0 <= share < 1:
-        raise argparse.ArgumentTypeError("use auto or a fraction in [0, 1)")
-    return share
 
 
 def _parse_max_context(value):
@@ -581,13 +566,6 @@ def parse_args(argv=None):
         choices=("int8", "bf16"),
         default="int8",
         help="target KV cache storage (default: int8); bf16 uses more memory",
-    )
-    server.add_argument(
-        "--ane-split",
-        type=_parse_ane_split,
-        default=0.0,
-        help="fraction of a dense target's prefill FFN channels run on the Neural Engine, "
-        "or auto for this Mac's measured best (default: 0, GPU only)",
     )
     server.add_argument(
         "--max-memory",

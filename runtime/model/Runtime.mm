@@ -2814,12 +2814,21 @@ ModelTelemetry Runtime::telemetry() const noexcept {
   return result;
 }
 
-double aneFfnShare(const ModelPackage &package, const ops::AneSplit &split,
-                   const DeviceCapabilities &device) {
-  if (split.mode == ops::AneSplit::Mode::Automatic &&
-      !std::holds_alternative<Qwen3_8Weights>(package.target))
-    return 0.0;
-  return ops::AneFfn::share(split, device);
+ops::AneFfn::Calibration calibrateAneFfn(MetalBackend &backend, const ModelPackage &package,
+                                         const ops::ExecutionPlans &operators, kv::Format format) {
+  if (!std::holds_alternative<Qwen3_8Weights>(package.target)) return {};
+  const std::vector<ops::SwiGluProjections> layers = aneFfnLayers(package);
+  if (!ops::AneFfn::supports(layers)) return {};
+  const PrefillArena arena(backend, RuntimeGeometry::from(package, format), operators);
+  const auto p = [&](PrefillTensor tensor) { return arena.get(tensor); };
+  return ops::AneFfn::calibrate(
+      backend, operators.linear(), layers,
+      {p(PrefillTensor::Normalized), p(PrefillTensor::ProjectionSums), p(PrefillTensor::GateIntermediate),
+       p(PrefillTensor::Intermediate), p(PrefillTensor::DownProjectionSums),
+       {p(PrefillTensor::Hidden0), p(PrefillTensor::Hidden1)},
+       {.partials = p(PrefillTensor::LinearPartials),
+        .counters = p(PrefillTensor::LinearCounters),
+        .rotated = p(PrefillTensor::LinearRotated)}});
 }
 
 ModelMemoryPlan plannedRuntimeMemory(const DeviceCapabilities &device,

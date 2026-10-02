@@ -559,7 +559,6 @@ def main_args(**overrides):
             "port": 0,
             "binary": "splash",
             "kv_format": "int8",
-            "ane_split": 0.0,
             **overrides,
         }
     )
@@ -3438,22 +3437,6 @@ class ServerTest(unittest.TestCase):
         )
         with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
             api.parse_args([*required, "--kv-format", "fp16"])
-        self.assertNotIn("--ane-split", api._native_command(args))
-        for value, passed in (("auto", "auto"), ("AUTO", "auto"), ("0.9", "0.9")):
-            with self.subTest(ane_split=value):
-                split_args = api.parse_args([*required, "--ane-split", value])
-                self.assertEqual(api._native_command(split_args)[-2:], ["--ane-split", passed])
-        self.assertNotIn(
-            "--ane-split", api._native_command(api.parse_args([*required, "--ane-split", "0"]))
-        )
-        for invalid in ("1", "-0.1", "half"):
-            with (
-                self.subTest(invalid=invalid),
-                mock.patch("sys.stderr", io.StringIO()) as error,
-                self.assertRaises(SystemExit),
-            ):
-                api.parse_args([*required, "--ane-split", invalid])
-            self.assertIn("use auto or a fraction in [0, 1)", error.getvalue())
         self.assertEqual(
             api.parse_args([*required, "--max-context", "262144"]).max_context, 262144
         )
