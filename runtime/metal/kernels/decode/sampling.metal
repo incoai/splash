@@ -607,17 +607,82 @@ kernel void draft_select_edges(
   }
 }
 
+// The path of one greedy lane with the highest expected accepted length
+// under the selector's own conditionals q_p(c | s) = softmax_c(unary + edge):
+// V_p(s) = max_c q_p(c | s) * (1 + V_{p+1}(c)), V_7 = 0, evaluated backwards
+// over the edge tables, then walked forwards from the anchor. Position 0 has
+// only the anchor as predecessor (draft_select_edges writes only its row 0).
+// Ties keep the lowest candidate, as the greedy walk does.
+inline void draft_select_lookahead(device const uint *candidates,
+                                   device const float *unary,
+                                   device const float *tables,
+                                   device uint *tokens) {
+  constexpr uint Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
+  constexpr uint Candidates = 16;
+  uchar choice[Positions][Candidates];
+  float value[Candidates];
+  for (uint i = 0; i < Candidates; ++i)
+    value[i] = 0.0f;
+  for (uint step = 0; step < Positions; ++step) {
+    const uint position = Positions - 1 - step;
+    const uint predecessors = position > 0 ? Candidates : 1;
+    float next[Candidates];
+    for (uint s = 0; s < Candidates; ++s)
+      next[s] = 0.0f;
+    for (uint s = 0; s < predecessors; ++s) {
+      device const float *edges =
+          tables + (position * Candidates + s) * Candidates;
+      float weights[Candidates];
+      float maximum = unary[position * Candidates] + edges[0];
+      for (uint i = 0; i < Candidates; ++i) {
+        weights[i] = unary[position * Candidates + i] + edges[i];
+        maximum = max(maximum, weights[i]);
+      }
+      if (maximum == -INFINITY) {
+        choice[position][s] = 0;
+        continue;
+      }
+      float sum = 0.0f;
+      for (uint i = 0; i < Candidates; ++i) {
+        weights[i] = exp(weights[i] - maximum);
+        sum += weights[i];
+      }
+      uint best = 0;
+      float best_value = -1.0f;
+      for (uint i = 0; i < Candidates; ++i) {
+        const float candidate_value = weights[i] / sum * (1.0f + value[i]);
+        if (candidate_value > best_value) {
+          best_value = candidate_value;
+          best = i;
+        }
+      }
+      choice[position][s] = uchar(best);
+      next[s] = best_value;
+    }
+    for (uint s = 0; s < Candidates; ++s)
+      value[s] = next[s];
+  }
+  uint predecessor_index = 0;
+  for (uint position = 0; position < Positions; ++position) {
+    const uint selected = choice[position][predecessor_index];
+    tokens[position] = candidates[position * Candidates + selected];
+    predecessor_index = selected;
+  }
+}
+
 // One thread per lane walks the seven positions: the score of a candidate is
 // its unary score plus the edge from the previously chosen candidate, read
 // from the table draft_select_edges left in the partial-values scratch.
-kernel void draft_select_dflash(
-    device const uint *candidates [[buffer(0)]],
-    device const float *unary [[buffer(1)]],
-    device const float *partial_values [[buffer(2)]],
-    device const float *uniforms [[buffer(3)]],
-    device uint *tokens [[buffer(4)]], device float *q_probs [[buffer(5)]],
-    constant SelectorBatchParams &params [[buffer(6)]],
-    uint batch [[thread_position_in_grid]]) {
+// Lookahead replaces the greedy walk of greedy lanes only: sampling lanes
+// always draw ancestrally, since acceptance divides by the drawn q.
+template <bool Lookahead>
+inline void draft_select_path(device const uint *candidates,
+                              device const float *unary,
+                              device const float *partial_values,
+                              device const float *uniforms,
+                              device uint *tokens, device float *q_probs,
+                              constant SelectorBatchParams &params,
+                              uint batch) {
   if (batch >= params.lanes)
     return;
   constexpr ulong Rows = SPLASH_DRAFT_QUERY_ROWS;
@@ -634,6 +699,10 @@ kernel void draft_select_dflash(
   q_probs += batch * Positions * Candidates;
 
   const bool sampling = (params.sampling_mask & (1u << batch)) != 0;
+  if (Lookahead && !sampling) {
+    draft_select_lookahead(candidates, unary, tables, tokens);
+    return;
+  }
   uint predecessor_index = 0;
   for (uint position = 0; position < Positions; ++position) {
     device const float *edges =
@@ -673,6 +742,30 @@ kernel void draft_select_dflash(
     predecessor_index = selected;
     tokens[position] = candidates[position * Candidates + selected];
   }
+}
+
+kernel void draft_select_dflash(
+    device const uint *candidates [[buffer(0)]],
+    device const float *unary [[buffer(1)]],
+    device const float *partial_values [[buffer(2)]],
+    device const float *uniforms [[buffer(3)]],
+    device uint *tokens [[buffer(4)]], device float *q_probs [[buffer(5)]],
+    constant SelectorBatchParams &params [[buffer(6)]],
+    uint batch [[thread_position_in_grid]]) {
+  draft_select_path<false>(candidates, unary, partial_values, uniforms, tokens,
+                           q_probs, params, batch);
+}
+
+kernel void draft_select_dflash_lookahead(
+    device const uint *candidates [[buffer(0)]],
+    device const float *unary [[buffer(1)]],
+    device const float *partial_values [[buffer(2)]],
+    device const float *uniforms [[buffer(3)]],
+    device uint *tokens [[buffer(4)]], device float *q_probs [[buffer(5)]],
+    constant SelectorBatchParams &params [[buffer(6)]],
+    uint batch [[thread_position_in_grid]]) {
+  draft_select_path<true>(candidates, unary, partial_values, uniforms, tokens,
+                          q_probs, params, batch);
 }
 
 inline float sparse_lookup(device const uint *ids,

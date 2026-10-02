@@ -84,6 +84,14 @@ struct AcceptanceBuffers final {
   metal::MetalBuffer acceptedCounts;
 };
 
+// How a greedy lane picks its proposals from the selector's candidates and
+// edge tables. Greedy takes the best-scoring candidate position by position.
+// Lookahead takes the path with the highest expected accepted length under
+// the selector's own conditional probabilities. Both use the same buffers and
+// workspace, and sampling lanes draw ancestrally under either. Verification
+// is unchanged, so the emitted tokens are the same; only acceptance differs.
+enum class DraftSelection : uint8_t { Greedy, Lookahead };
+
 // Target token policy. This operator owns top-k/top-p, constrained selection,
 // stop-token exclusion and greedy argmax pipeline ABIs; the model only
 // supplies policy, buffers and its stop tokens.
@@ -121,11 +129,20 @@ public:
                       metal::MetalBuffer verifyInputTokens,
                       uint32_t lanes) const;
 
+  // Applies to graphs encoded after the call. Greedy is the shipped default.
+  void setDraftSelection(DraftSelection selection) noexcept {
+    draftSelection_ = selection;
+  }
+  [[nodiscard]] DraftSelection draftSelection() const noexcept {
+    return draftSelection_;
+  }
+
 private:
   metal::MetalBackend &backend_;
   uint32_t vocabulary_ = 0;
   uint32_t rowsPerLane_ = 0;
   uint32_t maskWords_ = 0;
+  DraftSelection draftSelection_ = DraftSelection::Greedy;
 };
 
 } // namespace splash::ops

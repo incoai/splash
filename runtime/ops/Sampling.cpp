@@ -211,7 +211,9 @@ void Sampling::addDraftSelector(
              buffers.predecessorCodebook, buffers.successorCodebook},
             params, {uint64_t{lanes} * proposalTokens, 1, 1},
             {kEdgeThreads, 1, 1});
-  graph.add("draft_select_dflash",
+  graph.add(draftSelection_ == DraftSelection::Lookahead
+                ? "draft_select_dflash_lookahead"
+                : "draft_select_dflash",
             {buffers.candidates, buffers.unary, buffers.partialValues,
              buffers.uniforms, buffers.proposedTokens,
              buffers.proposalProbabilities},

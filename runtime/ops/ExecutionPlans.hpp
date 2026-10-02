@@ -4,6 +4,7 @@
 #include "ops/Linear.hpp"
 #include "ops/MoE.hpp"
 #include "ops/PagedAttention.hpp"
+#include "ops/Sampling.hpp"
 
 #include <array>
 #include <compare>
@@ -71,10 +72,12 @@ struct OperatorChoices final {
   std::vector<VerifyAttentionChoice> verifyAttention;
   std::vector<DraftAttentionChoice> draftAttention;
   std::vector<MoeChoice> moe;
+  DraftSelection draftSelection = DraftSelection::Greedy;
 
   [[nodiscard]] bool empty() const noexcept {
     return linear.empty() && prefillAttention.empty() && verifyAttention.empty() &&
-           draftAttention.empty() && moe.empty();
+           draftAttention.empty() && moe.empty() &&
+           draftSelection == DraftSelection::Greedy;
   }
 };
 
@@ -86,6 +89,9 @@ class ExecutionPlans final {
 public:
   explicit ExecutionPlans(const DeviceCapabilities &device);
   [[nodiscard]] const Linear &linear() const noexcept { return linear_; }
+  [[nodiscard]] DraftSelection draftSelection() const noexcept {
+    return choices_.draftSelection;
+  }
   // Validate every table before replacing any installed choice. Missing keys
   // always use the operator's shipped baseline; an empty install resets all.
   void install(const OperatorChoices &choices);

@@ -116,6 +116,7 @@ TEST_DFLASH_BATCH_CONTROL_TEST := $(ENGINE_TEST_BUILD)/dflash-batch-control
 TEST_DRAFT_ATTENTION_TEST := $(ENGINE_TEST_BUILD)/draft-attention
 TEST_GDN_DECODE_TEST := $(ENGINE_TEST_BUILD)/gdn-decode
 TEST_DRAFT_SELECTOR_TEST := $(ENGINE_TEST_BUILD)/draft-selector
+TEST_DRAFT_SELECTOR_REFERENCE := $(ENGINE_TEST_BUILD)/draft-selector-reference
 TEST_Q4_PREFILL_PROFILE := $(ENGINE_TEST_BUILD)/q4-prefill-profile
 TEST_Q4_DECODE_PROFILE := $(ENGINE_TEST_BUILD)/q4-decode-profile
 TEST_BACKEND_BENCHMARK := $(ENGINE_TEST_BUILD)/backend-benchmark
@@ -144,6 +145,7 @@ TEST_PRODUCTION_LIB := $(ENGINE_TEST_BUILD)/production-and-test.metallib
 TEST_SLOT_FILE := $(ENGINE_TEST_BUILD)/slot-file
 
 TEST_CPU_TARGETS := $(TEST_SLOT_FILE) $(TEST_VISION_PREPARATION) $(TEST_AFFINE_CHECKPOINT) $(TEST_PREPARED_WEIGHTS) $(TEST_OPERATOR_WORKSPACE) \
+	$(TEST_DRAFT_SELECTOR_REFERENCE) \
 	$(TEST_GGUF_FILE) \
 	$(TEST_GGUF_REFERENCE) $(TEST_GGUF_PLANNER) \
 	$(TEST_DEVICE_QUERIES) \
@@ -429,6 +431,10 @@ $(TEST_OPERATOR_WORKSPACE): dev/tests/engine/operator_workspace_test.cc \
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $< $(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
 
+$(TEST_DRAFT_SELECTOR_REFERENCE): dev/tests/engine/draft_selector_reference_test.cpp \
+		dev/tests/engine/draft_selector_reference.hpp | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $< -o $@
+
 $(TEST_EXECUTION_PLANS): dev/tests/engine/execution_plans_test.cc \
 		$(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $< $(ENGINE_LIBRARY) \
@@ -614,6 +620,7 @@ test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TUNE_KERNELS) \
 		$(TEST_GGUF_PROJECTION_BENCHMARK) $(TEST_GGUF_MOE_BENCHMARK) \
 		$(TEST_AFFINE_SOURCE_ORACLE)
 	$(TEST_SLOT_FILE)
+	$(TEST_DRAFT_SELECTOR_REFERENCE)
 	$(BUILD_ID_PYTHON) dev/tests/engine/run_vision_preparation.py $(TEST_VISION_PREPARATION) $(WEIGHT_GOLDENS)
 	$(TEST_AFFINE_CHECKPOINT)
 	$(TEST_PREPARED_WEIGHTS)
@@ -705,7 +712,7 @@ test-real: preflight $(TARGET) $(TEST_MODEL_RUNTIME_ORACLE) \
 			$(METAL_TEST_ENV) $(TEST_VISION_ENCODER_TEST) $(LIB) "$(MODEL_ROOT)" \
 				dev/tests/fixtures/vision-parity/$$family; \
 		else echo "vision parity: skipped, the installation serves text only"; fi
-	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)"
+	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" $(MODEL_RUNTIME_ORACLE_ARGS)
 
 .PHONY: benchmark-prefill benchmark-decode benchmark-backend \
 	benchmark-decode-profile benchmark-attention-sweep \
@@ -717,7 +724,8 @@ benchmark-decode: all $(TEST_Q4_DECODE_PROFILE)
 	$(TEST_Q4_DECODE_PROFILE) $(LIB)
 
 # decode-profile replays the installed model's prefill and decode commands as
-# separate dispatches; DECODE_PROFILE_ARGS passes --prompt-tokens/--cycles.
+# separate dispatches; DECODE_PROFILE_ARGS passes --prompt-tokens/--cycles/
+# --kv-format/--draft-selection.
 benchmark-decode-profile: preflight $(TARGET) $(TEST_DECODE_PROFILE) $(LIB)
 	$(TEST_DECODE_PROFILE) $(LIB) "$(MODEL_ROOT)" $(DECODE_PROFILE_ARGS)
 

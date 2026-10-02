@@ -70,6 +70,8 @@ void covers(const Workspace &stride, const Workspace &needed, uint32_t lanes,
 void baselinePlans() {
   for (uint32_t family : {9U, 10U, 11U}) {
     const ExecutionPlans plans(device(family));
+    require(plans.draftSelection() == DraftSelection::Greedy,
+            "draft selection baseline changed");
     const Linear baseline(device(family));
     for (auto matrix : matrices) {
       uint64_t gateBound = 0;
@@ -561,6 +563,26 @@ void atomicInvalidChoices() {
   invalid([](auto &c) { c.moe.push_back(c.moe[0]); });
 }
 
+void draftSelectionChoices() {
+  for (uint32_t family : {9U, 10U, 11U}) {
+    ExecutionPlans plans(device(family));
+    OperatorChoices choices;
+    require(choices.empty(), "baseline operator choices are not empty");
+    choices.draftSelection = DraftSelection::Lookahead;
+    require(!choices.empty(), "look-ahead choice was ignored by empty()");
+    plans.install(choices);
+    require(plans.draftSelection() == DraftSelection::Lookahead,
+            "look-ahead choice was not installed");
+    choices.draftSelection = DraftSelection(255);
+    rejects([&] { plans.install(choices); });
+    require(plans.draftSelection() == DraftSelection::Lookahead,
+            "invalid install changed draft selection");
+    plans.install({});
+    require(plans.draftSelection() == DraftSelection::Greedy,
+            "empty install did not restore greedy selection");
+  }
+}
+
 void invalidLookupsAndContextEdges() {
   ExecutionPlans plans(device());
   const auto kvLayout = layout(attentionShapes[0]);
@@ -608,6 +630,7 @@ int main() {
     allCandidates();
     policyKeysAndBounds();
     atomicInvalidChoices();
+    draftSelectionChoices();
     invalidLookupsAndContextEdges();
     std::cout << "PASS execution plans: typed policies, device MoE tiles, atomic "
                  "install, all candidates, B1-B4 and prefill workspace bounds "

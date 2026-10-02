@@ -79,6 +79,9 @@ ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device)
 
 void ExecutionPlans::install(const OperatorChoices &choices) {
   OperatorChoices pending = choices;
+  if (pending.draftSelection != DraftSelection::Greedy &&
+      pending.draftSelection != DraftSelection::Lookahead)
+    throw std::invalid_argument("invalid draft selection choice");
   Linear nextLinear = baselineLinear_;
   nextLinear.setChoices(pending.linear);
   for (const auto &choice : pending.prefillAttention) {

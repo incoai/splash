@@ -82,7 +82,9 @@ void DFlashDraft::addSelection(
     metal::CommandGraph &graph, DFlashSelectionBuffers buffers,
     std::span<const uint32_t> anchors,
     std::span<const ops::SamplingPolicy> policies, uint32_t proposalTokens) const {
-  selector_.addDraftSelector(
+  auto selector = selector_;
+  selector.setDraftSelection(operators_.draftSelection());
+  selector.addDraftSelector(
       graph,
       {std::move(buffers.logits), std::move(buffers.partialIds),
        std::move(buffers.partialValues), std::move(buffers.candidates),

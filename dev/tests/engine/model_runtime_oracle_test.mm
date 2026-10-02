@@ -813,7 +813,8 @@ int main(int argc, char **argv) {
   try {
     bool imagesOnly = false, warmupEosOnly = false;
     kv::Format format = kv::Format::Int8;
-    if (argc < 3) fail("usage: model-runtime-oracle METALLIB MODEL_ROOT [--kv-format int8|bf16]");
+    ops::DraftSelection selection = ops::DraftSelection::Greedy;
+    if (argc < 3) fail("usage: model-runtime-oracle METALLIB MODEL_ROOT [--kv-format int8|bf16] [--draft-selection greedy|lookahead]");
     for (int i = 3; i < argc; ++i) {
       const std::string_view option(argv[i]);
       if (option == "--images-only") imagesOnly = true;
@@ -822,6 +823,12 @@ int main(int argc, char **argv) {
         const std::string_view value(argv[++i]);
         if (value != "int8" && value != "bf16") fail("invalid KV format");
         format = value == "int8" ? kv::Format::Int8 : kv::Format::BFloat16;
+      } else if (option == "--draft-selection" && i + 1 < argc) {
+        const std::string_view value(argv[++i]);
+        if (value != "greedy" && value != "lookahead")
+          fail("invalid draft selection");
+        selection = value == "greedy" ? ops::DraftSelection::Greedy
+                                      : ops::DraftSelection::Lookahead;
       } else fail("unknown model-runtime-oracle option");
     }
     metal::MetalBackend backend(argv[1]);
@@ -849,6 +856,9 @@ int main(int argc, char **argv) {
     model::ModelPackage model =
         model::loadModelPackage(backend, modelRoot, descriptor);
     ops::ExecutionPlans operators(backend.capabilities());
+    ops::OperatorChoices choices;
+    choices.draftSelection = selection;
+    operators.install(choices);
     model::ModelMemoryPlan executorPlan =
         model::plannedRuntimeMemory(backend.capabilities(), model, operators, format);
     ModelMemoryFootprint footprint{

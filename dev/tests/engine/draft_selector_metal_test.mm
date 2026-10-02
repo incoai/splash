@@ -5,10 +5,15 @@
 // vocabularies cover the production size, an odd size that misaligns the
 // 16-byte vectors and leaves shards with only a few tokens, and one wider
 // than a single register chunk per thread. The logits are fp32, and their
-// order is decided below the bf16 spacing.
+// order is decided below the bf16 spacing. Look-ahead selection must reach
+// the optimum of a double-precision dynamic program over the same tables,
+// leave sampling lanes untouched, and differ from the greedy walk exactly
+// where a crafted table makes the greedy choice a dead end.
 #include "metal/MetalBackend.hpp"
+#include "metal/abi/Sampling.h"
 #include "ops/Sampling.hpp"
 #include "tuning/LinearNumerics.hpp"
+#include "tests/engine/draft_selector_reference.hpp"
 
 #import <Foundation/Foundation.h>
 
@@ -17,9 +22,12 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <iostream>
 #include <numeric>
+#include <span>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -598,6 +606,276 @@ void excludedStopTokens(MetalBackend &backend, uint32_t vocabulary) {
   }
 }
 
+using splash::test::draft_selector::conditional;
+using splash::test::draft_selector::expectedLength;
+using splash::test::draft_selector::referenceLookahead;
+using Score = splash::test::draft_selector::Score<double>;
+
+// Direct randomized fp32 tables isolate the DP from the top-k and edge
+// kernels. Poison the unused position-0 rows; they must never affect a path.
+// Exact ties and sparse/all-excluded rows keep the lowest candidate index.
+void lookaheadTables(MetalBackend &backend, uint32_t lanes) {
+  const uint32_t positions = lanes * kPositions;
+  const auto workspace = Sampling::draftWorkspace(positions);
+  MetalBuffer candidates = allocate(backend, workspace.candidatesBytes);
+  MetalBuffer unary = allocate(backend, workspace.unaryBytes);
+  MetalBuffer partials = allocate(backend, workspace.partialValuesBytes);
+  MetalBuffer uniforms = allocate(backend, lanes * 2 * kRows * sizeof(float));
+  MetalBuffer tokens = allocate(backend, positions * sizeof(uint32_t));
+  MetalBuffer probabilities = allocate(backend, workspace.proposalProbabilitiesBytes);
+  auto *ids = static_cast<uint32_t *>(candidates.contents());
+  auto *scores = static_cast<float *>(unary.contents());
+  float *allTables = static_cast<float *>(partials.contents()) +
+                    positions * SPLASH_DRAFT_SAMPLING_SHARDS * kCandidates;
+  for (uint32_t trial = 0; trial < 32; ++trial) {
+    Random random(0xabc + trial * kLanes + lanes);
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+      const uint32_t first = lane * kPositions;
+      float *tables = allTables + first * kCandidates * kCandidates;
+      for (uint32_t p = 0; p < kPositions; ++p) {
+        for (uint32_t c = 0; c < kCandidates; ++c) {
+          ids[(first + p) * kCandidates + c] =
+              1000 + (first + p) * kCandidates + c;
+          scores[(first + p) * kCandidates + c] =
+              trial == 0 ? 0.0F : trial == 1 && c > 2 ? -INFINITY
+                                                        : random.unit() * 3.0F;
+        }
+        for (uint32_t s = 0; s < kCandidates; ++s)
+          for (uint32_t c = 0; c < kCandidates; ++c)
+            tables[(p * kCandidates + s) * kCandidates + c] =
+                p == 0 && s > 0 ? NAN
+                : trial == 0 ? 0.0F
+                : trial == 2 && p == kPositions - 1 ? -INFINITY
+                                                  : random.unit() * 3.0F;
+      }
+    }
+    SelectorBatchParams params{};
+    params.lanes = lanes;
+    params.vocabulary = 1 << 20;
+    std::memset(probabilities.contents(), 0xA5, probabilities.sizeBytes());
+    CommandGraph graph;
+    graph.add("draft_select_dflash_lookahead",
+              {candidates, unary, partials, uniforms, tokens, probabilities},
+              params, {lanes, 1, 1}, {1, 1, 1});
+    static_cast<void>(backend.submitCommand(graph.dispatches()));
+    const auto *proposed = static_cast<const uint32_t *>(tokens.contents());
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+      const uint32_t first = lane * kPositions;
+      const float *tables = allTables + first * kCandidates * kCandidates;
+      const splash::test::draft_selector::Score<float> score =
+          [&](uint32_t p, uint32_t s, uint32_t c) {
+            require(p != 0 || s == 0, "reference read an unused anchor row");
+            return scores[(first + p) * kCandidates + c] +
+                   tables[(p * kCandidates + s) * kCandidates + c];
+          };
+      const auto [best, path] = referenceLookahead(score, kPositions, kCandidates);
+      static_cast<void>(best);
+      for (uint32_t p = 0; p < kPositions; ++p)
+        require(proposed[first + p] == ids[(first + p) * kCandidates + path[p]],
+                "look-ahead tokens differ from the fp32 reference DP");
+      if (trial == 0)
+        require(std::all_of(path.begin(), path.end(), [](uint32_t c) { return c == 0; }),
+                "look-ahead tie did not keep the lowest candidate");
+    }
+    const auto *bytes = static_cast<const unsigned char *>(probabilities.contents());
+    require(std::all_of(bytes, bytes + probabilities.sizeBytes(),
+                        [](unsigned char byte) { return byte == 0xA5; }),
+            "look-ahead greedy lanes wrote sampling probabilities");
+  }
+}
+
+// One thread per lane: the selection kernel alone over a crafted table where
+// the best first candidate leads nowhere and the second starts a chain the
+// selector is sure of. Greedy follows the first; look-ahead takes the chain.
+void lookaheadCraftedTable(MetalBackend &backend) {
+  constexpr uint32_t shards = SPLASH_DRAFT_SAMPLING_SHARDS;
+  const auto workspace = Sampling::draftWorkspace(kPositions);
+  MetalBuffer candidates = allocate(backend, workspace.candidatesBytes);
+  MetalBuffer unary = allocate(backend, workspace.unaryBytes);
+  MetalBuffer partials = allocate(backend, workspace.partialValuesBytes);
+  MetalBuffer uniforms = allocate(backend, 2 * kRows * sizeof(float));
+  MetalBuffer tokens = allocate(backend, kPositions * sizeof(uint32_t));
+  MetalBuffer probabilities = allocate(backend, workspace.proposalProbabilitiesBytes);
+  auto *ids = static_cast<uint32_t *>(candidates.contents());
+  auto *scores = static_cast<float *>(unary.contents());
+  float *tables = static_cast<float *>(partials.contents()) +
+                  kPositions * shards * kCandidates;
+  for (uint32_t position = 0; position < kPositions; ++position) {
+    for (uint32_t c = 0; c < kCandidates; ++c) {
+      ids[position * kCandidates + c] = 1000 + position * kCandidates + c;
+      scores[position * kCandidates + c] = 0.0F;
+    }
+    // From predecessor 1, candidate 1 is all but certain; every other
+    // predecessor spreads uniformly.
+    if (position > 0)
+      tables[(position * kCandidates + 1) * kCandidates + 1] = 10.0F;
+  }
+  scores[0] = 1.0F;
+  scores[1] = 0.5F;
+  for (uint32_t c = 2; c < kCandidates; ++c)
+    scores[c] = -10.0F;
+
+  SelectorBatchParams params{};
+  params.lanes = 1;
+  params.vocabulary = 1 << 20;
+  for (const bool lookahead : {false, true}) {
+    std::memset(tokens.contents(), 0xFF, tokens.sizeBytes());
+    CommandGraph graph;
+    graph.add(lookahead ? "draft_select_dflash_lookahead" : "draft_select_dflash",
+              {candidates, unary, partials, uniforms, tokens, probabilities},
+              params, {1, 1, 1}, {1, 1, 1});
+    static_cast<void>(backend.submitCommand(graph.dispatches()));
+    const auto *proposed = static_cast<const uint32_t *>(tokens.contents());
+    for (uint32_t position = 0; position < kPositions; ++position)
+      require(proposed[position] ==
+                  1000 + position * kCandidates + (lookahead ? 1 : 0),
+              lookahead ? "look-ahead selection missed the confident chain"
+                        : "greedy selection changed on the crafted table");
+  }
+}
+
+// The production pipeline in look-ahead mode. Greedy lanes must reach the
+// reference optimum over the tables the edge kernel actually wrote; sampling
+// lanes must match greedy mode bit for bit, tokens and probabilities.
+// Returns how many greedy lanes look-ahead moved off the greedy path.
+uint32_t lookaheadPipeline(MetalBackend &backend, uint32_t vocabulary,
+                           uint32_t lanes, uint32_t samplingMask) {
+  uint32_t changed = 0;
+  Random random(0x10c4 + vocabulary + lanes * 16 + samplingMask);
+  const uint32_t rows = lanes * kRows;
+  const uint32_t positions = lanes * kPositions;
+  const auto workspace = Sampling::draftWorkspace(positions);
+  Sampling sampling(backend, vocabulary, kRows);
+  require(sampling.draftSelection() == DraftSelection::Greedy,
+          "draft selection does not default to greedy");
+
+  MetalBuffer logits = allocate(backend, uint64_t{rows} * vocabulary * sizeof(float));
+  auto *logitRows = static_cast<float *>(logits.contents());
+  const std::array patterns{Pattern::Peaked, Pattern::Uniform, Pattern::Ties,
+                            Pattern::Sparse};
+  for (uint32_t row = 0; row < rows; ++row)
+    fillRow(logitRows + uint64_t{row} * vocabulary, vocabulary,
+            patterns[(row / kRows + row % kRows) % patterns.size()], random);
+  DraftSelectorBuffers buffers{
+      logits,
+      allocate(backend, workspace.partialIdsBytes),
+      allocate(backend, workspace.partialValuesBytes),
+      allocate(backend, workspace.candidatesBytes),
+      allocate(backend, workspace.unaryBytes),
+      // Larger codebook values than runCase: edges that move the choice.
+      randomBfloat(backend, uint64_t{rows} * kRank, random, 0.5F),
+      randomBfloat(backend, uint64_t{vocabulary} * kRank, random, 0.5F),
+      randomBfloat(backend, uint64_t{vocabulary} * kRank, random, 0.5F),
+      allocate(backend, uint64_t{lanes} * 2 * kRows * sizeof(float)),
+      allocate(backend, uint64_t{positions} * sizeof(uint32_t)),
+      allocate(backend, workspace.proposalProbabilitiesBytes)};
+  auto *uniforms = static_cast<float *>(buffers.uniforms.contents());
+  for (uint32_t index = 0; index < lanes * 2 * kRows; ++index)
+    uniforms[index] = (random.unit() + 1.0F) * 0.5F;
+  std::vector<uint32_t> anchors(lanes);
+  std::vector<SamplingPolicy> policies(lanes);
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    anchors[lane] = random.next() % vocabulary;
+    policies[lane] =
+        SamplingPolicy{16, (samplingMask >> lane & 1U) ? 0.8F : 0.0F, 1.0F, false};
+  }
+
+  auto run = [&](DraftSelection selection) {
+    sampling.setDraftSelection(selection);
+    std::memset(buffers.proposedTokens.contents(), 0xFF,
+                buffers.proposedTokens.sizeBytes());
+    std::memset(buffers.proposalProbabilities.contents(), 0xFF,
+                buffers.proposalProbabilities.sizeBytes());
+    CommandGraph graph;
+    sampling.addDraftSelector(graph, buffers, anchors, policies, kPositions);
+    require(graph.dispatches().size() == 3,
+            "draft selector dispatch count changed");
+    require(graph.dispatches()[2].pipelineName ==
+                (selection == DraftSelection::Lookahead
+                     ? "draft_select_dflash_lookahead"
+                     : "draft_select_dflash"),
+            "draft selection chose the wrong pipeline");
+    static_cast<void>(backend.submitCommand(graph.dispatches()));
+    const auto *tokens =
+        static_cast<const uint32_t *>(buffers.proposedTokens.contents());
+    const auto *probabilities =
+        static_cast<const float *>(buffers.proposalProbabilities.contents());
+    return std::pair{
+        std::vector<uint32_t>(tokens, tokens + positions),
+        std::vector<float>(probabilities,
+                           probabilities + uint64_t{positions} * kCandidates)};
+  };
+  const auto greedy = run(DraftSelection::Greedy);
+  const auto lookahead = run(DraftSelection::Lookahead);
+  const auto restored = run(DraftSelection::Greedy);
+  require(restored.first == greedy.first &&
+              std::memcmp(restored.second.data(), greedy.second.data(),
+                          greedy.second.size() * sizeof(float)) == 0,
+          "restoring greedy mode changed tokens or probabilities");
+
+  constexpr uint32_t shards = SPLASH_DRAFT_SAMPLING_SHARDS;
+  const auto *candidates =
+      static_cast<const uint32_t *>(buffers.candidates.contents());
+  const auto *unary = static_cast<const float *>(buffers.unary.contents());
+  const float *allTables =
+      static_cast<const float *>(buffers.partialValues.contents()) +
+      uint64_t{lanes} * kPositions * shards * kCandidates;
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    const uint64_t first = uint64_t{lane} * kPositions;
+    if (policies[lane].samples()) {
+      require(std::equal(greedy.first.begin() + first,
+                         greedy.first.begin() + first + kPositions,
+                         lookahead.first.begin() + first),
+              "look-ahead mode changed a sampling lane's draw");
+      require(std::memcmp(greedy.second.data() + first * kCandidates,
+                          lookahead.second.data() + first * kCandidates,
+                          kPositions * kCandidates * sizeof(float)) == 0,
+              "look-ahead mode changed a sampling lane's probabilities");
+      continue;
+    }
+    // The kernel adds fp32 unary and edge scores; evaluate the same sums.
+    const float *tables = allTables + uint64_t{lane} * kPositions * kCandidates * kCandidates;
+    const Score score = [&](uint32_t p, uint32_t s, uint32_t c) {
+      return double(unary[(first + p) * kCandidates + c] +
+                    tables[(p * kCandidates + s) * kCandidates + c]);
+    };
+    std::vector<uint32_t> path(kPositions);
+    for (uint32_t position = 0; position < kPositions; ++position) {
+      const uint32_t token = lookahead.first[first + position];
+      uint32_t selected = kCandidates;
+      for (uint32_t c = 0; c < kCandidates && selected == kCandidates; ++c)
+        if (candidates[(first + position) * kCandidates + c] == token)
+          selected = c;
+      require(selected < kCandidates,
+              "look-ahead proposed a token outside its candidates");
+      path[position] = selected;
+    }
+    const auto [best, reference] = referenceLookahead(score, kPositions, kCandidates);
+    const double actual = expectedLength(score, path, kCandidates);
+    // fp32 softmax and products differ from double only near exact ties.
+    require(actual >= best - 1e-4 * (1.0 + best),
+            "look-ahead path is worse than the reference optimum");
+    // Greedy lanes in greedy mode keep the greedy walk.
+    std::vector<uint32_t> greedyPath(kPositions);
+    uint32_t predecessor = 0;
+    for (uint32_t position = 0; position < kPositions; ++position) {
+      uint32_t selected = 0;
+      for (uint32_t c = 1; c < kCandidates; ++c)
+        if (score(position, predecessor, c) > score(position, predecessor, selected))
+          selected = c;
+      greedyPath[position] = selected;
+      predecessor = selected;
+      require(greedy.first[first + position] ==
+                  candidates[(first + position) * kCandidates + selected],
+              "greedy mode no longer walks greedily");
+    }
+    require(actual >= expectedLength(score, greedyPath, kCandidates) - 1e-4,
+            "look-ahead path is worse than the greedy walk");
+    changed += path != greedyPath ? 1U : 0U;
+  }
+  return changed;
+}
+
 void invalidRequests(MetalBackend &backend) {
   Sampling sampling(backend, 1024, kRows);
   const auto workspace = Sampling::draftWorkspace(kPositions);
@@ -652,6 +930,17 @@ int main(int argc, char **argv) {
         runCase(backend, {vocabulary, lanes, true});
       }
     }
+    lookaheadCraftedTable(backend);
+    for (uint32_t lanes = 1; lanes <= kLanes; ++lanes)
+      lookaheadTables(backend, lanes);
+    uint32_t changed = 0;
+    for (const uint32_t vocabulary : {248320U, 1003U})
+      for (uint32_t lanes = 1; lanes <= kLanes; ++lanes)
+        for (uint32_t mask = 0; mask < (1U << lanes); ++mask)
+          changed += lookaheadPipeline(backend, vocabulary, lanes, mask);
+    // The random tables are not built to favour look-ahead; it must still
+    // leave the greedy path somewhere, or the pipeline cases test nothing.
+    require(changed > 0, "look-ahead never left the greedy path");
     std::cout << "draft_selector_metal_test: PASS\n";
     return 0;
   } catch (const std::exception &error) {

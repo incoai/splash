@@ -1,6 +1,7 @@
 // Per-kernel GPU time attribution for the production executor.
 //
 //   decode-profile METALLIB MODEL_ROOT [--prompt-tokens N] [--cycles K] [--kv-format int8|bf16]
+//                  [--draft-selection greedy|lookahead]
 //
 // Drives the real model runtime with Metal dispatch profiling enabled, so
 // every dispatch of a packed prefill command and B1 through B4 DFlash cycles
@@ -153,6 +154,7 @@ struct CycleTiming final {
   double gpuSeconds = 0.0;
   double wallSeconds = 0.0;
   uint64_t commands = 0;
+  uint64_t acceptedDraftTokens = 0;
 };
 
 CycleTiming decodeCycle(metal::MetalBackend &backend,
@@ -171,16 +173,18 @@ CycleTiming decodeCycle(metal::MetalBackend &backend,
   auto results = executor.decode(plan, items);
   if (results.size() != lanes.size())
     throw std::runtime_error("decode width changed");
+  uint64_t accepted = 0;
   for (size_t index = 0; index < lanes.size(); ++index) {
     if (results[index].finished)
       throw std::runtime_error("the answer ended before profiling finished");
     lanes[index].position += results[index].outputTokens.size() -
                              results[index].outputTokensWithoutKv;
+    accepted += results[index].acceptedDraftTokens;
   }
   const auto finished = std::chrono::steady_clock::now();
   return {executor.telemetry().lastDecodeGpuSeconds,
           std::chrono::duration<double>(finished - started).count(),
-          backend.submissionCount() - submissionsBefore};
+          backend.submissionCount() - submissionsBefore, accepted};
 }
 
 } // namespace
@@ -190,12 +194,14 @@ int main(int argc, char **argv) {
     try {
       if (argc < 3) {
         std::cerr << "usage: decode-profile METALLIB MODEL_ROOT "
-                     "[--prompt-tokens N] [--cycles K] [--kv-format int8|bf16]\n";
+                     "[--prompt-tokens N] [--cycles K] [--kv-format int8|bf16] "
+                     "[--draft-selection greedy|lookahead]\n";
         return 2;
       }
       uint32_t promptTokens = 512;
       uint32_t cycles = 4;
       kv::Format format = kv::Format::Int8;
+      ops::DraftSelection selection = ops::DraftSelection::Greedy;
       for (int index = 3; index < argc; index += 2) {
         const std::string_view option(argv[index]);
         if (index + 1 >= argc)
@@ -209,6 +215,13 @@ int main(int argc, char **argv) {
           if (value != "int8" && value != "bf16")
             throw std::invalid_argument("--kv-format takes int8 or bf16");
           format = value == "int8" ? kv::Format::Int8 : kv::Format::BFloat16;
+        } else if (option == "--draft-selection") {
+          const std::string_view value(argv[index + 1]);
+          if (value != "greedy" && value != "lookahead")
+            throw std::invalid_argument(
+                "--draft-selection takes greedy or lookahead");
+          selection = value == "greedy" ? ops::DraftSelection::Greedy
+                                        : ops::DraftSelection::Lookahead;
         } else
           throw std::invalid_argument("unknown option");
       }
@@ -217,6 +230,9 @@ int main(int argc, char **argv) {
       model::ModelPackage model = model::loadModelPackage(
           backend, std::filesystem::path(argv[2]));
       ops::ExecutionPlans operators(backend.capabilities());
+      ops::OperatorChoices choices;
+      choices.draftSelection = selection;
+      operators.install(choices);
       model::ModelMemoryPlan executorPlan =
           model::plannedRuntimeMemory(backend.capabilities(), model, operators, format);
 
@@ -247,9 +263,12 @@ int main(int argc, char **argv) {
           executorPlan.runtimeOverheadReserveBytes};
       model::Runtime executor(context);
 
-      std::printf("device %s, %u prompt tokens, %u cycles per width\n",
+      std::printf("device %s, %u prompt tokens, %u cycles per width, %s draft "
+                  "selection\n",
                   backend.capabilities().deviceName.c_str(), promptTokens,
-                  cycles);
+                  cycles,
+                  selection == ops::DraftSelection::Greedy ? "greedy"
+                                                           : "lookahead");
 
       std::array<Lane, 4> lanes;
       for (uint32_t index = 0; index < lanes.size(); ++index) {
@@ -282,15 +301,20 @@ int main(int argc, char **argv) {
         std::vector<CycleTiming> fused;
         for (uint32_t cycle = 0; cycle < cycles; ++cycle)
           fused.push_back(decodeCycle(backend, executor, active));
+        uint64_t accepted = 0;
+        for (const CycleTiming &timing : fused)
+          accepted += timing.acceptedDraftTokens;
         std::sort(fused.begin(), fused.end(),
                   [](const CycleTiming &left, const CycleTiming &right) {
                     return left.gpuSeconds < right.gpuSeconds;
                   });
         const CycleTiming median = fused[fused.size() / 2];
         std::printf("\n%s: median fused gpu %.2f ms, wall %.2f ms, %llu "
-                    "command(s) per cycle\n",
+                    "command(s) per cycle, %.2f accepted draft tokens per "
+                    "lane-cycle\n",
                     title, median.gpuSeconds * 1e3, median.wallSeconds * 1e3,
-                    static_cast<unsigned long long>(median.commands));
+                    static_cast<unsigned long long>(median.commands),
+                    double(accepted) / double(fused.size() * active.size()));
         backend.setDispatchProfiling(true);
         for (uint32_t cycle = 0; cycle < cycles; ++cycle)
           static_cast<void>(decodeCycle(backend, executor, active));
