@@ -34,7 +34,10 @@ struct Surface final {
 class Program final {
 public:
   // `weights` is the blob file the program's constants name as
-  // "@model_path/weights.bin".
+  // "@model_path/weights.bin". The service keeps the compiled program under
+  // a key of the source's hash, whose files stay in a directory of the
+  // user's temporary directory, so later processes load it without
+  // compiling it again.
   Program(std::string_view mil, std::span<const uint8_t> weights);
   ~Program();
   Program(const Program &) = delete;

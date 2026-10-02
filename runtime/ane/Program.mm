@@ -7,8 +7,10 @@
 #include <dlfcn.h>
 #include <sys/qos.h>
 
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <unistd.h>
 #include <stdexcept>
 
 // The private AppleNeuralEngine interface this file uses.
@@ -19,6 +21,8 @@
 @protocol SplashAneClient
 + (id)sharedConnection;
 - (BOOL)compileModel:(id)model options:(NSDictionary *)options qos:(unsigned)qos error:(NSError **)error;
+- (BOOL)compiledModelExistsFor:(id)model;
+- (void)purgeCompiledModel:(id)model;
 - (BOOL)loadModel:(id)model options:(NSDictionary *)options qos:(unsigned)qos error:(NSError **)error;
 - (BOOL)unloadModel:(id)model options:(NSDictionary *)options qos:(unsigned)qos error:(NSError **)error;
 - (BOOL)evaluateWithModel:(id)model options:(NSDictionary *)options request:(id)request qos:(unsigned)qos
@@ -92,43 +96,70 @@ Surface Surface::create(metal::MetalBackend &backend, uint32_t rows, uint32_t wi
 }
 
 struct Program::Impl {
-  std::filesystem::path directory;
   __strong id model = nil;
   std::vector<std::string> inputs;
   bool loaded = false;
 
   ~Impl() {
     if (loaded) [client() unloadModel:model options:@{} qos:kQos error:nil];
-    std::error_code ignored;
-    if (!directory.empty()) std::filesystem::remove_all(directory, ignored);
   }
 };
 
 Program::Program(std::string_view mil, std::span<const uint8_t> weights) : impl_(std::make_unique<Impl>()) {
   @autoreleasepool {
-    std::string pattern = (std::filesystem::temp_directory_path() / "splash-ane-XXXXXX").string();
-    if (!mkdtemp(pattern.data())) throw std::runtime_error("unable to create the ANE program directory");
-    impl_->directory = pattern;
+    // FNV-1a of the source names its directory and the service's key.
+    uint64_t hash = 14695981039346656037ULL;
+    const auto mix = [&](std::span<const uint8_t> bytes) {
+      for (const uint8_t byte : bytes) hash = (hash ^ byte) * 1099511628211ULL;
+    };
+    mix({reinterpret_cast<const uint8_t *>(mil.data()), mil.size()});
+    mix(weights);
+    char key[17];
+    std::snprintf(key, sizeof key, "%016llx", static_cast<unsigned long long>(hash));
+    const std::filesystem::path directory = std::filesystem::temp_directory_path() / "splash-ane-programs" / key;
+    std::filesystem::create_directories(directory);
+    // Each file is renamed into place whole, as another process may load the
+    // same program at the same time.
     const auto write = [&](const char *name, const void *data, size_t bytes) {
-      std::ofstream file(impl_->directory / name, std::ios::binary);
-      file.write(static_cast<const char *>(data), static_cast<std::streamsize>(bytes));
-      if (!file) throw std::runtime_error(std::string("unable to write the ANE program's ") + name);
+      const std::filesystem::path target = directory / name;
+      std::error_code missing;
+      if (std::filesystem::file_size(target, missing) == bytes) return;
+      const std::filesystem::path partial =
+          directory / (std::string(name) + "." + std::to_string(getpid()) + ".partial");
+      {
+        std::ofstream file(partial, std::ios::binary);
+        file.write(static_cast<const char *>(data), static_cast<std::streamsize>(bytes));
+        if (!file) throw std::runtime_error(std::string("unable to write the ANE program's ") + name);
+      }
+      std::filesystem::rename(partial, target);
     };
     write("model.mil", mil.data(), mil.size());
     write("weights.bin", weights.data(), weights.size());
 
-    NSString *path = @(impl_->directory.c_str());
-    impl_->model = [(Class<SplashAneModel>)requireClass("_ANEModel") modelAtURL:[NSURL fileURLWithPath:path
-                                                                                           isDirectory:YES]
-                                                                            key:path];
+    impl_->model = [(Class<SplashAneModel>)requireClass("_ANEModel")
+        modelAtURL:[NSURL fileURLWithPath:@(directory.c_str()) isDirectory:YES]
+               key:@(key)];
     if (!impl_->model) fail("model creation", nil);
+    const auto compile = [&] {
+      NSError *error = nil;
+      if (![client() compileModel:impl_->model
+                          options:@{@"kANEFModelType" : @"kANEFModelMIL", @"kANEFNetPlistFilenameKey" : @"model.mil"}
+                              qos:kQos
+                            error:&error])
+        fail("compilation", error);
+    };
+    const bool compiled = [client() compiledModelExistsFor:impl_->model];
+    if (!compiled) compile();
     NSError *error = nil;
-    if (![client() compileModel:impl_->model
-                        options:@{@"kANEFModelType" : @"kANEFModelMIL", @"kANEFNetPlistFilenameKey" : @"model.mil"}
-                            qos:kQos
-                          error:&error])
-      fail("compilation", error);
-    if (![client() loadModel:impl_->model options:@{} qos:kQos error:&error]) fail("load", error);
+    if (![client() loadModel:impl_->model options:@{} qos:kQos error:&error]) {
+      // A compilation the service kept from another compiler, say, compiles
+      // again once.
+      if (!compiled) fail("load", error);
+      [client() purgeCompiledModel:impl_->model];
+      compile();
+      error = nil;
+      if (![client() loadModel:impl_->model options:@{} qos:kQos error:&error]) fail("load", error);
+    }
     impl_->loaded = true;
     NSArray *symbols =
         [impl_->model modelAttributes][@"ANEFModelDescription"][@"kANEFModelInputSymbolsArrayKey"];
