@@ -71,12 +71,12 @@ Qwen3.8-Flash-Next has no DFlash2 draft: it drafts with the MTP head Unsloth
 publishes beside the GGUF (`MTP/mtp-*-shared-Q8_0.gguf`), which the first run
 downloads with the model. MTP decoding is lossless and about twice as fast as
 decoding without it. `SPLASH_MTP=0` turns it off and `SPLASH_MTP_DRAFTS=1`–`7`
-sets the proposals per step (default 3). It serves text only
-(`--language-only`) and needs about 117 GB of Metal memory in `UD-Q4_K_XL`; its
-SSD cache (`--max-cache-disk`) keeps GDN states but not KV pages.
+sets the proposals per step (default 3). Vision runs from the repository's
+`mmproj-BF16.gguf`. `UD-Q4_K_XL` needs about 118 GB of Metal memory; its SSD cache
+(`--max-cache-disk`) keeps GDN states but not KV pages.
 
 ```bash
-splash serve --model unsloth/Qwen3.8-Flash-Next-GGUF:UD-Q4_K_XL --language-only
+splash serve --model unsloth/Qwen3.8-Flash-Next-GGUF:UD-Q4_K_XL
 ```
 
 Unsloth GGUF variants span **1–8 bits**, including mixed-precision UD formats;
