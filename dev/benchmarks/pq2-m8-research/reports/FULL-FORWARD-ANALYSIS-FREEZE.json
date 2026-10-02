@@ -1,0 +1,27 @@
+{
+  "frozen_utc": "2026-09-30T22:10:12.073757+00:00",
+  "protocol": "new fixedcontext fulltarget M8 normalCB; NOT original32/256cadences",
+  "expected_samples_per_route": 32,
+  "blocks": 8,
+  "PQ2_primary": "r_i=mean(H_i)/mean(S_i);median_r=median8ratios;gain=1-median_r;speedup=1/median_r;all32samples retained",
+  "PQ2_drift": "eachroute later/earlier within eachblock, chronologicaltwo samples; outer/inner gap3/1 andcarryover differ, diagnostic cannotexclude bias",
+  "PQ2_drift_gates": {
+    "abs_route_median_minus1_max": 0.01,
+    "every_pair_abs_minus1_strictmax": 0.03
+  },
+  "response": {
+    "positive_gain_min": 0.03,
+    "wins_min": 7,
+    "qualified_regression_min": 0.03,
+    "slower_blocks_min": 7,
+    "validAA_required": true
+  },
+  "RTN_stability": "8 blockmeans;laterhalfmean/earlierhalfmeanper4same-routeblock diagnostic,medianwithin1%everyblock<3%;no independent crossmodelpair",
+  "RTN_over_optimizedPQ2": "median8RTNblockmeans/median8PQ2Hblockmeans;observedcombinationrange[minRTNmean/maxHmean,maxRTNmean/minHmean];NOT CI,NOT paired/purebitwidthcausal",
+  "incomplete": "noaggregate;retainraw",
+  "noise": "allrawdescriptive only,no promotion;no retry/subsets",
+  "timing": "gpu_seconds only;wallseparate,prefill/draft excluded;qualification durationsnot included",
+  "thermal": "recordall;nonzero marks environmentlimited,notcull",
+  "legacy_R259_original_oracle_failures_retained": true,
+  "UD_full_NOT_READY": true
+}

@@ -1,0 +1,26 @@
+--- /Users/zaiyang/bonsai-pq2-research/splash-110/runtime/metal/kernels/shared/gguf_linear.metal[prefix through alias]
++++ /Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/candidate.metal
+@@ -146,7 +146,7 @@
+ }
+ // The staged decode kernels: grid (column tiles, K partitions), two simdgroups.
+ template <class F, ushort Rows, GgufEpilogue Ep, class Out>
+-kernel void gguf_decode(device bfloat *input [[buffer(0)]], device uchar *w0 [[buffer(1)]], device uchar *w1 [[buffer(2)]],
++kernel void v024_decode(device bfloat *input [[buffer(0)]], device uchar *w0 [[buffer(1)]], device uchar *w1 [[buffer(2)]],
+                         device uchar *meta [[buffer(3)]], device Out *output [[buffer(4)]],
+                         device coherent(device) float *partials [[buffer(5)]], device atomic_uint *counters [[buffer(6)]],
+                         device bfloat *aux [[buffer(7)]], constant GgufDecodeParams &p [[buffer(8)]],
+@@ -156,10 +156,13 @@
+   quant_pair_table<F>(tl, simd_group * 32 + simd_lane, GGUF_STAGED_THREADS);
+   threadgroup half stage[kStagedStages];
+   threadgroup uint arrival;
+-  gguf_decode_tile<F, Rows, Ep>(input, w0, w1, meta, output, partials, counters, aux, p, group, simd_lane, simd_group,
++  const uint q = group.x + 80 * group.y;
++  const uint2 logicalGroup = uint2(q >> 1, q & 1);
++  gguf_decode_tile<F, Rows, Ep>(input, w0, w1, meta, output, partials, counters, aux, p, logicalGroup, simd_lane, simd_group,
+                                 stage, tl, &arrival);
+ }
+ template <class Out>
+ using GgufDecodeKernel = void(device bfloat *, device uchar *, device uchar *, device uchar *, device Out *,
+                               device coherent(device) float *, device atomic_uint *, device bfloat *,
+                               constant GgufDecodeParams &, uint2, uint, uint);
++template [[host_name("v024_pq2_m8_r_interleaved")]] kernel GgufDecodeKernel<bfloat> v024_decode<FmtPQ20, 8, EpResidual, bfloat>;

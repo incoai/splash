@@ -1,0 +1,45 @@
+{
+  "records": [
+    {
+      "path": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/ACTUAL-DEPENDENCIES.json",
+      "bytes": 110986,
+      "sha256": "3bde7fdf881a31dee05d0cbbde2c15055ca1274b8c10f690fd66fb4bdf9cf306",
+      "contents_not_embedded": true
+    },
+    {
+      "path": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/ACTUAL-COMPILE-DEPENDENCIES.json",
+      "bytes": 75772,
+      "sha256": "11391aab81be6cc53c3f8c02b12da42e008982ea44fdb9d1dcab7748cae7b473",
+      "contents_not_embedded": true
+    },
+    {
+      "path": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/ACTUAL-AIR-INPUTS.json",
+      "bytes": 21386,
+      "sha256": "d9458a46eefa47abf53baae6206211155c4f7eb4dd396c449817adc86357d16d",
+      "contents_not_embedded": true
+    },
+    {
+      "path": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/input-pins.json",
+      "bytes": 137,
+      "sha256": "62d7a6a763189d011dfe4c69930f467b63568fe734fc1dbcfc88aafcfc74f72d",
+      "contents_not_embedded": true
+    },
+    {
+      "path": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v025-forward-down-controller-prep/MODEL-CACHE-STAT-INPUTS.json",
+      "bytes": 102826,
+      "sha256": "6d9c84ae4c6ccdcdfc33d3a0bd975bd743ef6625a312dfabde47255d40b1fde1",
+      "stat_only_payload_manifest": true
+    },
+    {
+      "path": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v004-target-forward-qualification-prep/qualify/qualification-stock.json",
+      "bytes": 103690,
+      "sha256": "bea17b4f022777803e2f6f7c84885791f2a1f416de1361da1a7fd84212097359",
+      "original_raw_files_external": true
+    }
+  ],
+  "model_weights_and_prepared_cache_external": true,
+  "SDK_archive_and_AIR_external": true,
+  "raw_arrays_external": true,
+  "trace_binaries_not_included": true,
+  "old_absolute_paths_and_deadlines_preserved": true
+}
