@@ -205,6 +205,10 @@ struct RequestFrame {
   uint32_t generationPromptTokens = 0;
   // RequestFlag bits.
   uint32_t flags = 0;
+  // Leading prompt tokens that later requests are expected to share, such as
+  // the chat template's system prompt and tools; zero when unknown. It must
+  // not exceed the prompt.
+  uint32_t sharedPrefixTokens = 0;
 
   bool operator==(const RequestFrame &) const = default;
 };

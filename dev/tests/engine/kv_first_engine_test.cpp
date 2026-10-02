@@ -11,6 +11,7 @@
 #include <numeric>
 #include <optional>
 #include <stdexcept>
+#include <tuple>
 
 using namespace splash;
 using namespace splash::engine;
@@ -1015,6 +1016,64 @@ void testSharedJunctionEndsBeforeTheGenerationPrompt() {
   require(events.starts.size() == 3 && events.starts[1] == hit &&
               events.starts[2] == hit,
           "the shared junction was not the waiter's reusable state");
+}
+
+// A request keeps a state at the last whole page of the prefix it declares
+// shared, so the first request with another suffix already resumes there
+// instead of recomputing the prefix to plan a junction for the next one.
+void testSharedPrefixStateServesTheFirstReuse() {
+  const auto reuse = [](uint32_t sharedPrefixTokens) {
+    Backing backing(64);
+    KvPool pool(backing);
+    engine::Cache resources(pool, CacheNamespace{});
+    Executor executor;
+    Events events;
+    engine::Engine engine({}, resources, executor, events);
+    std::vector<uint32_t> prompt(161);
+    std::iota(prompt.begin(), prompt.end(), 1);
+    EngineRequest first = request(1, prompt);
+    first.sharedPrefixTokens = sharedPrefixTokens;
+    engine.submit(std::move(first));
+    runUntilIdle(engine);
+    prompt.resize(70);
+    prompt.resize(161, 500);
+    EngineRequest second = request(2, prompt);
+    second.sharedPrefixTokens = sharedPrefixTokens;
+    engine.submit(std::move(second));
+    runUntilIdle(engine);
+    return std::tuple{executor.plans.at(1), events.starts.at(1),
+                      engine.snapshot()};
+  };
+  const auto [plan, start, snapshot] = reuse(70);
+  require(plan.boundaries.size() == 3 && plan.boundaries[0].boundary == 64 &&
+              plan.boundaries[1].boundary == 160 &&
+              plan.boundaries[2].boundary == 161,
+          "no state was planned at the shared prefix");
+  require(start == std::pair<EngineCacheStatus, uint32_t>{
+                       EngineCacheStatus::PrefixHit, 64},
+          "the first reuse did not resume after the shared prefix");
+  require(snapshot.junctionMaterializations == 1 &&
+              snapshot.deduplicatedStatePublications == 0,
+          "the shared prefix state was not published once");
+  require(std::get<1>(reuse(0)) ==
+              std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::Miss, 0},
+          "a prompt without a shared prefix resumed from one");
+
+  Backing backing(32);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  EngineRequest beyond = request(3, std::vector<uint32_t>(33, 5));
+  beyond.sharedPrefixTokens = 34;
+  bool rejected = false;
+  try {
+    engine.submit(std::move(beyond));
+  } catch (const std::invalid_argument &) {
+    rejected = true;
+  }
+  require(rejected, "a shared prefix beyond the prompt was admitted");
 }
 
 void testImageSpansKeyPrefixIdentity() {
@@ -5271,6 +5330,7 @@ int main() {
     testFollowUpResumesBeforeTheGenerationPrompt();
     testRetryPublishesNoStateInsideTheGenerationPrompt();
     testSharedJunctionEndsBeforeTheGenerationPrompt();
+    testSharedPrefixStateServesTheFirstReuse();
     testImageSpansKeyPrefixIdentity();
     testOneRequestPublishesJunctionAndLatestReplayState();
     testLatestReplayDenialRecyclesOlderStateNotTheJunction();

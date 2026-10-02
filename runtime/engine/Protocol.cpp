@@ -20,7 +20,7 @@ std::string_view frameTypeName(FrameType type);
 std::string_view failureClassName(FailureClass failureClass);
 
 constexpr std::array<uint8_t, 4> kMagic{'S', 'P', 'L', 'H'};
-constexpr uint64_t kRequestFixedBytes = 72;
+constexpr uint64_t kRequestFixedBytes = 76;
 constexpr uint64_t kImageSpanBytes = 32;
 constexpr uint64_t kCancelFixedBytes = 8;
 constexpr uint64_t kMaskResponseFixedBytes = 20;
@@ -427,6 +427,10 @@ std::optional<ProtocolIssue> validateRequest(const RequestFrame &request,
     return invalid(IssueCode::InvalidCount,
                    "generation prompt must leave a prompt token");
   }
+  if (request.sharedPrefixTokens > request.promptTokens.size()) {
+    return invalid(IssueCode::InvalidCount,
+                   "shared prefix must lie within the prompt");
+  }
   if (scoring) {
     if (!request.imageSpans.empty()) {
       return invalid(IssueCode::InvalidCount,
@@ -712,6 +716,7 @@ ProtocolResult<Frame> encodeRequest(const RequestFrame &request,
   writer.u32(static_cast<uint32_t>(request.scoreTokens.size()));
   writer.u32(request.generationPromptTokens);
   writer.u32(request.flags);
+  writer.u32(request.sharedPrefixTokens);
   for (uint32_t token : request.promptTokens)
     writer.u32(token);
   for (const ImageSpanFrame &span : request.imageSpans) {
@@ -922,7 +927,8 @@ ProtocolResult<Message> decodeRequest(const Frame &frame,
       !reader.u32(request.sampling.topK) || !reader.u64(request.seed) ||
       !reader.u8(returnProgress) || !reader.u32(scoreCount) ||
       !reader.u32(request.generationPromptTokens) ||
-      !reader.u32(request.flags)) {
+      !reader.u32(request.flags) ||
+      !reader.u32(request.sharedPrefixTokens)) {
     return failure<Message>(makeIssue(FailureClass::ProtocolFatal,
                                       IssueCode::InvalidPayloadLength, 0,
                                       "request fixed payload is truncated"));

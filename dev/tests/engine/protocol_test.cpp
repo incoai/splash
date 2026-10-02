@@ -126,6 +126,7 @@ RequestFrame exampleRequest() {
   request.cohort = Cohort::Constrained;
   request.constraint = ConstraintMode::TokenMask;
   request.generationPromptTokens = 2;
+  request.sharedPrefixTokens = 3;
   return request;
 }
 
@@ -167,13 +168,13 @@ void testRequestWireAndRoundTrip() {
   const auto &wire = *serialized.value;
 
   CHECK(test, wire.size() ==
-                  kFrameHeaderBytes + 72 + request.promptTokens.size() * 4);
+                  kFrameHeaderBytes + 76 + request.promptTokens.size() * 4);
   CHECK(test, std::string(wire.begin(), wire.begin() + 4) == "SPLH");
   CHECK(test, loadU16(wire, 4) == kProtocolVersion);
   CHECK(test, loadU16(wire, 6) == kFrameHeaderBytes);
   CHECK(test, loadU16(wire, 8) == static_cast<uint16_t>(FrameType::Request));
   CHECK(test, loadU16(wire, 10) == 0);
-  CHECK(test, loadU64(wire, 12) == 72 + request.promptTokens.size() * 4);
+  CHECK(test, loadU64(wire, 12) == 76 + request.promptTokens.size() * 4);
   CHECK(test, loadU32(wire, 20) == 0);
   CHECK(test, loadU64(wire, kFrameHeaderBytes) == request.requestId);
   CHECK(test,
@@ -183,8 +184,10 @@ void testRequestWireAndRoundTrip() {
   CHECK(test, loadU32(wire, kFrameHeaderBytes + 64) ==
                   request.generationPromptTokens);
   CHECK(test, loadU32(wire, kFrameHeaderBytes + 68) == request.flags);
-  CHECK(test, loadU32(wire, kFrameHeaderBytes + 72) == 0);
-  CHECK(test, loadU32(wire, kFrameHeaderBytes + 72 + 16) == 0xffffffffU);
+  CHECK(test, loadU32(wire, kFrameHeaderBytes + 72) ==
+                  request.sharedPrefixTokens);
+  CHECK(test, loadU32(wire, kFrameHeaderBytes + 76) == 0);
+  CHECK(test, loadU32(wire, kFrameHeaderBytes + 76 + 16) == 0xffffffffU);
   RequestFrame decoded = roundTrip(request);
   CHECK(test, decoded == request);
 
@@ -194,7 +197,7 @@ void testRequestWireAndRoundTrip() {
   if (!imageWire)
     return;
   const size_t spanOffset =
-      kFrameHeaderBytes + 72 + withImage.promptTokens.size() * 4;
+      kFrameHeaderBytes + 76 + withImage.promptTokens.size() * 4;
   CHECK(test, imageWire.value->size() ==
                   spanOffset + 32 + withImage.imagePixels.size());
   CHECK(test, loadU32(*imageWire.value, kFrameHeaderBytes + 35) == 1);
@@ -216,7 +219,7 @@ void testScoreRequestAndDoneLogits() {
     return;
   const auto &wire = *serialized.value;
   const size_t scoreOffset =
-      kFrameHeaderBytes + 72 + request.promptTokens.size() * 4;
+      kFrameHeaderBytes + 76 + request.promptTokens.size() * 4;
   CHECK(test, wire.size() == scoreOffset + request.scoreTokens.size() * 4);
   CHECK(test, loadU32(wire, kFrameHeaderBytes + 27) == 0);
   CHECK(test, loadU32(wire, kFrameHeaderBytes + 60) ==
@@ -747,6 +750,9 @@ void testPromptAndImageSpanRejections() {
   RequestFrame wholePrompt = exampleRequest();
   wholePrompt.generationPromptTokens = wholePrompt.promptTokens.size();
   expectIssue(wholePrompt, IssueCode::InvalidCount);
+  RequestFrame beyondPrompt = exampleRequest();
+  beyondPrompt.sharedPrefixTokens = beyondPrompt.promptTokens.size() + 1;
+  expectIssue(beyondPrompt, IssueCode::InvalidCount);
 
   const RequestFrame image = exampleImageRequest();
   auto withSpan = [&](auto change) {
@@ -789,16 +795,20 @@ void testPromptAndImageSpanRejections() {
     return;
   // Only the fixed fields and the prompt tokens: drop the tokens.
   auto emptyWire = *serialized.value;
-  emptyWire.resize(kFrameHeaderBytes + 72);
+  emptyWire.resize(kFrameHeaderBytes + 76);
   storeU32(emptyWire, kFrameHeaderBytes + 31, 0);
-  storeU64(emptyWire, 12, 72);
+  storeU64(emptyWire, 12, 76);
   expectDecodeIssue(emptyWire, IssueCode::LimitExceeded);
   auto wholePromptWire = *serialized.value;
   storeU32(wholePromptWire, kFrameHeaderBytes + 64,
            wholePrompt.generationPromptTokens);
   expectDecodeIssue(wholePromptWire, IssueCode::InvalidCount);
+  auto beyondPromptWire = *serialized.value;
+  storeU32(beyondPromptWire, kFrameHeaderBytes + 72,
+           beyondPrompt.sharedPrefixTokens);
+  expectDecodeIssue(beyondPromptWire, IssueCode::InvalidCount);
   const size_t spanOffset =
-      kFrameHeaderBytes + 72 + image.promptTokens.size() * 4;
+      kFrameHeaderBytes + 76 + image.promptTokens.size() * 4;
   auto tokensWire = *imageWire.value;
   storeU32(tokensWire, spanOffset + 4, 2);
   expectDecodeIssue(tokensWire, IssueCode::InvalidCount);

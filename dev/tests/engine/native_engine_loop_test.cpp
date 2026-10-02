@@ -461,6 +461,44 @@ void testGenerationPromptBoundsTheReplayState() {
           "the replay state did not end before the generation prompt");
 }
 
+// The request's shared prefix reaches the engine: the next request with
+// another suffix resumes from the state kept within it.
+void testSharedPrefixKeepsAState() {
+  Backing backing(32);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  std::vector<uint8_t> output;
+  double monotonic = 100.0;
+  engine::NativeLoopConfig config;
+  config.engine.maxContext = 1024;
+  engine::NativeRuntime loop(
+      config, resources, executor,
+      [&](std::span<const uint8_t> bytes) {
+        output.insert(output.end(), bytes.begin(), bytes.end());
+      },
+      [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
+      {[] { return uint64_t{1'000'000}; }, [&] { return monotonic += 0.25; }});
+  loop.announceReady();
+  for (uint64_t id : {1, 2}) {
+    auto input = request(id);
+    input.sharedPrefixTokens = 40;
+    if (id == 2)
+      std::fill(input.promptTokens.begin() + 40, input.promptTokens.end(), 500);
+    auto encoded = protocol::serializeMessage(protocol::Message{input});
+    require(encoded && loop.receive(*encoded.value),
+            "shared prefix request wire failed");
+    runUntilIdle(loop);
+  }
+  std::vector<uint32_t> matched;
+  for (const auto &message : decodeMessages(output)) {
+    if (const auto *start = std::get_if<protocol::StartEvent>(&message))
+      matched.push_back(start->matchedPromptTokens);
+  }
+  require(matched == std::vector<uint32_t>{0, 32},
+          "the next request did not resume within the shared prefix");
+}
+
 // A request's flags reach the model with the rest of its request.
 void testRequestFlagsReachTheModel() {
   Backing backing(32);
@@ -1345,6 +1383,7 @@ int main() {
   try {
     testWireLifecycleAndCacheHit();
     testGenerationPromptBoundsTheReplayState();
+    testSharedPrefixKeepsAState();
     testRequestFlagsReachTheModel();
     testPromptProgress();
     testCapacityFailureHasOneTerminalFrame();
