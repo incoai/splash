@@ -55,6 +55,23 @@ std::string MemoryStatusReporter::update(const ResourceWaitSnapshot &wait,
   return out.str();
 }
 
+namespace {
+const char *phaseName(engine::Phase phase) noexcept {
+  switch (phase) {
+  case engine::Phase::Queued: return "queued";
+  case engine::Phase::WaitingResources: return "waiting_resources";
+  case engine::Phase::WaitingPrefix: return "waiting_prefix";
+  case engine::Phase::Prefill: return "prefill";
+  case engine::Phase::Decode: return "decode";
+  case engine::Phase::WaitingMask: return "waiting_mask";
+  case engine::Phase::Completed: return "completed";
+  case engine::Phase::Cancelled: return "cancelled";
+  case engine::Phase::Failed: return "failed";
+  }
+  return "unknown";
+}
+} // namespace
+
 std::string runtimeStatusJson(
     const EngineMemoryPlan &plan, const engine::EngineSnapshot &core,
     const metal::MetalMemoryStats &metalMemory, const WarmupReport &warmup,
@@ -279,7 +296,18 @@ std::string runtimeStatusJson(
       << ",\"b3\":" << scheduler.decodeBatchesByWidth[2]
       << ",\"b4\":" << scheduler.decodeBatchesByWidth[3] << "}"
       << ",\"decode_mixed_greedy_sampling_batches\":"
-      << scheduler.decodeMixedGreedySamplingBatches << "}"
+      << scheduler.decodeMixedGreedySamplingBatches << "}";
+  // Each live request's progress: encoded prompt tokens and generated tokens.
+  out << ",\"active_requests\":[";
+  for (size_t index = 0; index < core.activeRequests.size(); ++index) {
+    const engine::ActiveRequestSnapshot &request = core.activeRequests[index];
+    out << (index ? "," : "") << "{\"id\":" << request.id << ",\"phase\":\"" << phaseName(request.phase)
+        << "\",\"prompt_tokens\":" << request.promptTokens
+        << ",\"prompt_processed\":" << request.promptProcessed
+        << ",\"generated_tokens\":" << request.generatedTokens
+        << ",\"max_new_tokens\":" << request.maxNewTokens << ",\"age_ms\":" << request.ageMilliseconds << "}";
+  }
+  out << "]"
       << ",\"requests\":{\"submitted\":" << core.submitted
       << ",\"completed\":" << core.completed
       << ",\"cancelled\":" << core.cancelled << ",\"failed\":" << core.failed
