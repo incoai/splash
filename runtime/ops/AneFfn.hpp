@@ -95,10 +95,11 @@ public:
   void finish();
 
 private:
-  // The parts of a split layer encode() adds: the GPU's channels and the
-  // staging of the next layer's int8 weights, the ANE's channels with their
-  // packing and join, or both, ordered by the shared event.
-  enum class Parts : uint8_t { Gpu = 1, Ane = 2, Both = 3 };
+  // What encode() adds of a split layer: the GPU's work alone (its channels,
+  // the staging of the next layer's int8 weights, and the packing and join
+  // of the ANE's channels), or with the ANE's evaluation, which the shared
+  // event orders between the packing and the join.
+  enum class Parts : uint8_t { Gpu, Both };
 
   AneFfn(metal::MetalBackend &backend, const Linear &linear, std::span<const SwiGluProjections> layers,
          double share, std::span<const uint32_t> programRows);

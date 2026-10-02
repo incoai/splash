@@ -439,40 +439,33 @@ void AneFfn::encode(metal::CommandGraph &graph, uint32_t layer, metal::MetalBuff
   if (!rows || rows > kRows) throw std::invalid_argument("ANE FFN chunk exceeds its rows");
   const Layer &current = layers_.at(layer);
   const uint32_t set = layer & 1, tiles = (rows + 31) / 32;
-  const bool gpu = parts != Parts::Ane, ane = parts != Parts::Gpu;
+  const bool ane = parts == Parts::Both;
   const auto found =
       std::ranges::find_if(evaluations_, [&](const Evaluation &evaluation) { return evaluation.rows >= rows; });
   if (found == evaluations_.end()) throw std::invalid_argument("ANE FFN has no program of the chunk's rows");
   const auto index = static_cast<uint32_t>(found - evaluations_.begin());
   const Evaluation &evaluation = *found;
   // Each command stages layer 0's weights, then each layer the next one's.
-  if (gpu && !layer) addWeights(graph, 0, 0);
-  uint64_t wait = 0;
-  if (ane) {
-    graph.add("ane_ffn_rotate", {normalized, signs_, rotated_, evaluation.tokenScale.buffer},
-              AneFfnRotateParams{hidden_}, {rows, 1, 1}, {256, 1, 1});
-    for (uint32_t k = 0; k < evaluation.inputs.size(); ++k)
-      graph.add("ane_ffn_pack", {rotated_, evaluation.inputs[k].buffer},
-                AneFfnPackParams{hidden_, k * kSegment, evaluation.inputs[k].strideBytes}, {tiles, kSegment / 32, 1},
-                {32, 8, 1});
-    wait = ++value_;
-    graph.signal(event_, wait);
-  }
-  if (gpu) {
-    linear_.addPrefill(graph, normalized, current.gate, gateScratch, sums, rows, scratch);
-    linear_.addPrefillUpWithGate(graph, normalized, current.up, gateScratch, intermediate, sums, downSums, rows,
-                                 scratch);
-    linear_.addPrefillResidual(graph, intermediate, current.down, residual, output, downSums, rows, scratch);
-    if (layer + 1 < layers_.size()) addWeights(graph, layer + 1, set ^ 1);
-  }
-  if (ane) {
-    const uint64_t signal = ++value_;
-    graph.wait(event_, signal);
-    graph.add("ane_ffn_join", {output, evaluation.partial.buffer},
-              AneFfnJoinParams{hidden_, evaluation.partial.strideBytes / 2, rows}, {tiles, hidden_ / 32, 1},
+  if (!layer) addWeights(graph, 0, 0);
+  graph.add("ane_ffn_rotate", {normalized, signs_, rotated_, evaluation.tokenScale.buffer},
+            AneFfnRotateParams{hidden_}, {rows, 1, 1}, {256, 1, 1});
+  for (uint32_t k = 0; k < evaluation.inputs.size(); ++k)
+    graph.add("ane_ffn_pack", {rotated_, evaluation.inputs[k].buffer},
+              AneFfnPackParams{hidden_, k * kSegment, evaluation.inputs[k].strideBytes}, {tiles, kSegment / 32, 1},
               {32, 8, 1});
-    jobs_.push_back({index, set, wait, signal});
-  }
+  const uint64_t wait = ane ? ++value_ : 0;
+  if (ane) graph.signal(event_, wait);
+  linear_.addPrefill(graph, normalized, current.gate, gateScratch, sums, rows, scratch);
+  linear_.addPrefillUpWithGate(graph, normalized, current.up, gateScratch, intermediate, sums, downSums, rows,
+                               scratch);
+  linear_.addPrefillResidual(graph, intermediate, current.down, residual, output, downSums, rows, scratch);
+  if (layer + 1 < layers_.size()) addWeights(graph, layer + 1, set ^ 1);
+  const uint64_t signal = ane ? ++value_ : 0;
+  if (ane) graph.wait(event_, signal);
+  graph.add("ane_ffn_join", {output, evaluation.partial.buffer},
+            AneFfnJoinParams{hidden_, evaluation.partial.strideBytes / 2, rows}, {tiles, hidden_ / 32, 1},
+            {32, 8, 1});
+  if (ane) jobs_.push_back({index, set, wait, signal});
 }
 
 void AneFfn::submit() {
@@ -518,12 +511,16 @@ bool AneFfn::wait(bool release) {
 
 // Calibration. At share s, a layer of a full chunk takes
 //   T(s) = max(G(s), A(s), uG G(s) + uA A(s)):
-// G(s) is the GPU's part alone (its channels and the staging of the ANE's
-// int8 weights) and A(s) the ANE's (the packing, the evaluation and the
-// join), each close to linear in s. The third term is the memory bandwidth
-// both parts share when they run together, uG and uA each one's fraction of
-// it alone. Timing each part alone at two shares gives G and A, and both
-// together at those shares gives uG and uA where the bandwidth binds there.
+// G(s) is the GPU's part alone (its channels, the staging of the ANE's int8
+// weights, and the packing and join of the ANE's channels) and A(s) the
+// ANE's evaluation, each close to linear in s. The third term is the memory
+// bandwidth both parts share when they run together, uG and uA each one's
+// fraction of it alone. Timing each part alone at two shares gives G and A,
+// and both together at those shares gives uG and uA where the bandwidth
+// binds there. Neither part waits on the other while timed: a command buffer
+// that hands off to the ANE after little GPU work can start the next one
+// late, by tens of milliseconds at random on the M5 Max with Qwen3.8-27B
+// resident, which would time Metal's scheduling instead.
 // On Qwen3.8-27B's FFN this predicts the fastest share measured on the M4
 // (0.83, no contention), the M5 Pro (0.52) and the M6, where contention moves
 // it from where G meets A (0.68) to 0.92. Near a flat optimum the split takes
@@ -565,30 +562,38 @@ AneFfn::Calibration AneFfn::calibrate(metal::MetalBackend &backend, const Linear
   std::vector<Point> points;
   for (const double share : kShares) {
     AneFfn split(backend, linear, sampled, share, std::array{kRows});
-    const auto milliseconds = [&](Parts parts, uint32_t count) {
+    // The GPU's part of `count` layers in one command buffer, and the ANE's
+    // evaluations back to back, their waits met at once.
+    const auto milliseconds = [&](bool gpu, bool ane, uint32_t count) {
       double best = std::numeric_limits<double>::infinity();
       for (int run = 0; run < 2; ++run) {
         metal::CommandGraph graph;
         split.begin();
-        for (uint32_t layer = 0; layer < count; ++layer)
-          split.encode(graph, layer, buffers.normalized, buffers.sums, buffers.gateScratch, buffers.intermediate,
-                       buffers.downSums, buffers.hidden[layer & 1], buffers.hidden[(layer & 1) ^ 1], kRows,
-                       buffers.scratch, parts);
+        if (gpu)
+          for (uint32_t layer = 0; layer < count; ++layer)
+            split.encode(graph, layer, buffers.normalized, buffers.sums, buffers.gateScratch, buffers.intermediate,
+                         buffers.downSums, buffers.hidden[layer & 1], buffers.hidden[(layer & 1) ^ 1], kRows,
+                         buffers.scratch, Parts::Gpu);
+        if (ane) {
+          const uint64_t met = ++split.value_;
+          ane::Program::release(split.event_, met);
+          for (uint32_t layer = 0; layer < count; ++layer) split.jobs_.push_back({0, layer & 1, met, met});
+        }
         const auto start = std::chrono::steady_clock::now();
         split.submit();
-        static_cast<void>(backend.submitCommand(graph.dispatches()));
+        if (gpu) static_cast<void>(backend.submitCommand(graph.dispatches()));
         split.finish();
         best = std::min(best,
                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
       }
       return best;
     };
-    const auto perLayer = [&](Parts parts) {
-      return (milliseconds(parts, kLayers) - milliseconds(parts, 1)) / (kLayers - 1);
+    const auto perLayer = [&](bool gpu, bool ane) {
+      return (milliseconds(gpu, ane, kLayers) - milliseconds(gpu, ane, 1)) / (kLayers - 1);
     };
     // The first command compiles and wires what the others run.
-    static_cast<void>(milliseconds(Parts::Both, kLayers));
-    points.push_back({share, perLayer(Parts::Gpu), perLayer(Parts::Ane), perLayer(Parts::Both)});
+    static_cast<void>(milliseconds(true, true, kLayers));
+    points.push_back({share, perLayer(true, false), perLayer(false, true), perLayer(true, true)});
   }
 
   struct Line final {
