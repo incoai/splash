@@ -1003,13 +1003,10 @@ class Frontend:
             raise APIError(
                 400, "stop cannot be combined with tools or structured output"
             )
-        # Tools and structured output generate under a grammar, which decides
-        # where the output ends.
+        # Tools and structured output generate under a grammar. With
+        # ignore_eos the grammar's masks forbid EOS wherever another token is
+        # valid, so a grammar that has finished still ends the request.
         constrained = bool(tools) or response_schema is not None
-        if options.ignore_eos and constrained:
-            raise APIError(
-                400, "ignore_eos cannot be combined with tools or structured output"
-            )
         rendered = self._render_prompt(prompt, deadline)
         prompt_tokens, prepared_images = rendered.tokens, rendered.images
         image_positions, thinking = rendered.image_positions, rendered.thinking
@@ -1022,11 +1019,13 @@ class Frontend:
                         tool_grammar(tool_policy, thinking, response_schema),
                         timeout=remaining_request_time(deadline),
                         prefixes=lambda: self._call_openings(tool_policy, thinking),
+                        ignore_eos=options.ignore_eos,
                     )
                 elif response_schema is not None:
                     constraint = self.constraint_factory.create(
                         json_grammar(response_schema, thinking),
                         timeout=remaining_request_time(deadline),
+                        ignore_eos=options.ignore_eos,
                     )
         remaining_request_time(deadline)
         tools_signature = None
@@ -1183,9 +1182,11 @@ class Frontend:
             deadline=deadline,
             priority=priority,
             stop_sequences=options.stop_sequences,
+            # A constrained request ignores EOS in its grammar's masks, which
+            # keep EOS when nothing else is valid; the engine flag would not.
             flags=(
                 wire.RequestFlag.IGNORE_END_OF_SEQUENCE
-                if options.ignore_eos
+                if options.ignore_eos and fields.get("constraint") is None
                 else wire.RequestFlag(0)
             ),
             public_id=secrets.token_hex(16),

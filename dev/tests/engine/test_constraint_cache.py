@@ -23,7 +23,9 @@ class ConstraintCacheTests(unittest.TestCase):
             def deep_copy(self):
                 return self.grammar
 
-        constraint = mock.Mock(side_effect=lambda matcher, executor: matcher)
+        constraint = mock.Mock(
+            side_effect=lambda matcher, executor, ignore_eos=False: matcher
+        )
         constraint.VOCABULARY = constraints.TokenConstraint.VOCABULARY
         constraint.EOS_TOKENS = constraints.TokenConstraint.EOS_TOKENS
         for target, replacement in (

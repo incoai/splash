@@ -515,9 +515,11 @@ class FakeRuntime:
 class FakeConstraintFactory:
     def __init__(self):
         self.grammars = []
+        self.ignore_eos = []
 
-    def create(self, grammar, *, timeout=None, prefixes=None):
+    def create(self, grammar, *, timeout=None, prefixes=None, ignore_eos=False):
         self.grammars.append(grammar)
+        self.ignore_eos.append(ignore_eos)
         return SimpleNamespace(consume=lambda _tokens: None)
 
     def stats(self):
@@ -527,7 +529,7 @@ class FakeConstraintFactory:
 class PassThroughConstraintFactory:
     """Leaves generation unconstrained, for tests that do not check grammars."""
 
-    def create(self, grammar, *, timeout=None, prefixes=None):
+    def create(self, grammar, *, timeout=None, prefixes=None, ignore_eos=False):
         return None
 
     def stats(self):
@@ -748,7 +750,10 @@ class ServerTest(unittest.TestCase):
             mock.patch("server.constraints.LLExecutor", return_value="executor"),
             mock.patch(
                 "server.constraints.TokenConstraint",
-                side_effect=lambda matcher, executor: (matcher, executor),
+                side_effect=lambda matcher, executor, ignore_eos=False: (
+                    matcher,
+                    executor,
+                ),
             ),
         ):
             factory = generation_constraints.ConstraintFactory(object(), cache_size=2)
@@ -798,7 +803,7 @@ class ServerTest(unittest.TestCase):
             mock.patch("server.constraints.LLExecutor", return_value=object()),
             mock.patch(
                 "server.constraints.TokenConstraint",
-                side_effect=lambda matcher, _: matcher,
+                side_effect=lambda matcher, _, ignore_eos=False: matcher,
             ),
         ):
             factory = generation_constraints.ConstraintFactory(object())
@@ -839,7 +844,7 @@ class ServerTest(unittest.TestCase):
             mock.patch("server.constraints.LLExecutor", return_value=object()),
             mock.patch(
                 "server.constraints.TokenConstraint",
-                side_effect=lambda matcher, _: matcher,
+                side_effect=lambda matcher, _, ignore_eos=False: matcher,
             ),
         ):
             factory = generation_constraints.ConstraintFactory(object())

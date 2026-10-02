@@ -49,30 +49,38 @@ class IgnoreEosTests(unittest.TestCase):
                     )
         self.assertEqual(runtime.requests, [])
 
-    def test_grammar_constrained_generation_rejects_it(self):
-        # The grammar decides where tool calls and structured output end.
+    def test_grammar_constrained_generation_ignores_eos_in_its_masks(self):
+        # The grammar's masks forbid EOS, so the engine flag, which would also
+        # forbid it where the grammar allows nothing else, stays clear.
         factory = FakeConstraintFactory()
-        harness, runtime = self.harness(Plan([[4]]), constraint_factory=factory)
         tools = [{"type": "function", "function": {"name": "weather"}}]
         schema = {"type": "json_schema", "json_schema": {"schema": {}}}
-        for fields in (
+        cases = (
             {"tools": tools},
             {"tools": tools, "tool_choice": "none"},
             {"tools": tools, "tool_choice": "required"},
             {"response_format": schema},
             {"response_format": {"type": "json_object"}},
-        ):
+        )
+        harness, runtime = self.harness(
+            *(Plan([[4]], reason="length") for _ in cases),
+            constraint_factory=factory,
+        )
+        for fields in cases:
             with self.subTest(fields=fields):
                 status, _, payload = harness.request(
-                    "POST", CHAT[0], {**CHAT[1], **fields, "ignore_eos": True}
+                    "POST",
+                    CHAT[0],
+                    {**CHAT[1], **fields, "max_tokens": 1, "ignore_eos": True},
                 )
-                self.assertEqual(status, 400)
-                self.assertEqual(
-                    json.loads(payload)["error"]["message"],
-                    "ignore_eos cannot be combined with tools or structured output",
-                )
-        self.assertEqual((runtime.requests, factory.grammars), ([], []))
-        # Unconstrained text ignores end-of-sequence as asked.
+                self.assertEqual(status, 200, payload)
+        self.assertEqual(factory.ignore_eos, [True] * len(cases))
+        self.assertEqual(
+            [(request.flags, request.constraint) for request in runtime.requests],
+            [(0, wire.ConstraintMode.TOKEN_MASK)] * len(cases),
+        )
+        # Unconstrained text ignores end-of-sequence in the engine.
+        harness, runtime = self.harness(Plan([[4]], reason="length"))
         status, _, payload = harness.request(
             "POST",
             CHAT[0],
