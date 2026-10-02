@@ -17,7 +17,7 @@
 
 namespace splash::model {
 
-using TargetWeights = std::variant<Qwen3_8Weights, Qwen3_6MoeWeights>;
+using TargetWeights = std::variant<Qwen3_8Weights, Qwen3_6MoeWeights, Qwen4ExpWeights>;
 
 struct ModelPackage final {
   ModelDescriptor descriptor;
@@ -29,6 +29,8 @@ struct ModelPackage final {
   [[nodiscard]] const std::string &name() const noexcept {
     return descriptor.name;
   }
+  // Whether a DFlash2 draft runs (ModelDescriptor::hasDraft).
+  [[nodiscard]] bool hasDraft() const noexcept { return descriptor.hasDraft(); }
   [[nodiscard]] kv::Layout targetKvLayout(
       kv::Format format = kv::Format::Int8) const noexcept {
     auto layout = descriptor.targetKvLayout;

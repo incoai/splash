@@ -1,4 +1,5 @@
 #include "metal/kernels/common/paged_attention_tile.h"
+#include "metal/abi/Qwen4.h"
 
 // Verify tiles process one lane's eight rows per KV head and history split.
 // Verify and prefill share the device-operand page loop in paged_attention_tile.h.
@@ -108,6 +109,42 @@ Q8_VERIFY_SPLIT(verify_attention_q8_split_cooperative_scale,
 Q8_VERIFY_SPLIT(verify_attention_q8_split_kv2_g8, 2, 8, true)
 Q8_VERIFY_SPLIT(
     verify_attention_q8_split_cooperative_scale_kv2_g8, 2, 8, false)
+// Qwen3.8-Flash-Next's GQA-12 tiles also read the QSA bitmaps: a lane's
+// eight rows from bitmap row 8 lane.
+#define Q8_VERIFY_SPLIT_MASKED(Name, Heads, Group, ScaleInSoftmax)             \
+  kernel void Name(                                                            \
+      device bfloat *queries [[buffer(0)]],                                    \
+      device int8_t *cache_keys [[buffer(1)]],                                 \
+      device const float *key_scales_buffer [[buffer(2)]],                     \
+      device int8_t *cache_values [[buffer(3)]],                               \
+      device const float *value_scales_buffer [[buffer(4)]],                   \
+      device float *partials [[buffer(5)]],                                    \
+      device float *statistics [[buffer(6)]],                                  \
+      device const uint *page_table0 [[buffer(7)]],                            \
+      device const uint *page_table1 [[buffer(8)]],                            \
+      device const uint *page_table2 [[buffer(9)]],                            \
+      device const uint *page_table3 [[buffer(10)]],                           \
+      constant SplashQ8VerifyAttentionParams *params [[buffer(11)]],           \
+      device const uint *block_mask [[buffer(12)]],                            \
+      constant Qwen4QsaMaskParams &mask [[buffer(13)]],                        \
+      uint3 group [[threadgroup_position_in_grid]],                            \
+      uint thread_index [[thread_index_in_threadgroup]]) {                     \
+    Q8_VERIFY_SCRATCH(Group)                                                   \
+    Q8_VERIFY_TILE_AT(Heads, Group)                                            \
+    splash_paged_attention_tile<Heads, Group,                                  \
+                                      SPLASH_TARGET_VERIFY_ROWS,               \
+                                      ScaleInSoftmax>(                         \
+        tile.queries, cache_keys, key_scales_buffer, cache_values, value_scales_buffer,\
+        tile.page_table, tile.kv_head, tile.committed_tokens, tile.active_rows,\
+        tile.splits, tile.split, partials, statistics, tile.slot, scores,      \
+        probabilities, row_max, row_sum, previous_scale, &rescale,             \
+        thread_index,                                                          \
+        mask.mask_words ? block_mask + ulong(mask.row0 + group.z * SPLASH_TARGET_VERIFY_ROWS) * mask.mask_words \
+                        : nullptr, mask.mask_words);                           \
+  }
+Q8_VERIFY_SPLIT_MASKED(verify_attention_q8_split_kv2_g12, 2, 12, true)
+Q8_VERIFY_SPLIT_MASKED(
+    verify_attention_q8_split_cooperative_scale_kv2_g12, 2, 12, false)
 #define BF16_VERIFY_SPLIT_SIGNATURE(Name)                                      \
   kernel void Name(                                                            \
       device bfloat *queries [[buffer(0)]],                                    \
@@ -139,6 +176,37 @@ Q8_VERIFY_SPLIT(
 
 BF16_VERIFY_SPLIT(verify_attention_bf16_split, 4, 6)
 BF16_VERIFY_SPLIT(verify_attention_bf16_split_kv2_g8, 2, 8)
+#define BF16_VERIFY_SPLIT_MASKED(Name, Heads, Group)                           \
+  kernel void Name(                                                            \
+      device bfloat *queries [[buffer(0)]],                                    \
+      device bfloat *cache_keys [[buffer(1)]],                                 \
+      device bfloat *cache_values [[buffer(2)]],                               \
+      device float *partials [[buffer(3)]],                                    \
+      device float *statistics [[buffer(4)]],                                  \
+      device const uint *page_table0 [[buffer(5)]],                            \
+      device const uint *page_table1 [[buffer(6)]],                            \
+      device const uint *page_table2 [[buffer(7)]],                            \
+      device const uint *page_table3 [[buffer(8)]],                            \
+      constant SplashQ8VerifyAttentionParams *params [[buffer(9)]],            \
+      device const uint *block_mask [[buffer(10)]],                            \
+      constant Qwen4QsaMaskParams &mask [[buffer(11)]],                        \
+      uint3 group [[threadgroup_position_in_grid]],                            \
+      uint thread_index [[thread_index_in_threadgroup]]) {                     \
+    Q8_VERIFY_SCRATCH(Group)                                                   \
+    Q8_VERIFY_TILE_AT(Heads, Group)                                            \
+    splash_paged_attention_tile<Heads, Group,                                  \
+                                      SPLASH_TARGET_VERIFY_ROWS,               \
+                                      true>(                                   \
+        tile.queries, cache_keys, nullptr, cache_values, nullptr,              \
+        tile.page_table, tile.kv_head, tile.committed_tokens, tile.active_rows,\
+        tile.splits, tile.split, partials, statistics, tile.slot, scores,      \
+        probabilities, row_max, row_sum, previous_scale, &rescale,             \
+        thread_index,                                                          \
+        mask.mask_words ? block_mask + ulong(mask.row0 + group.z * SPLASH_TARGET_VERIFY_ROWS) * mask.mask_words \
+                        : nullptr, mask.mask_words);                           \
+  }
+BF16_VERIFY_SPLIT_MASKED(verify_attention_bf16_split_kv2_g12, 2, 12)
+#undef BF16_VERIFY_SPLIT_MASKED
 #undef BF16_VERIFY_SPLIT
 #undef BF16_VERIFY_SPLIT_SIGNATURE
 #undef Q8_VERIFY_SPLIT
@@ -195,5 +263,18 @@ kernel void verify_attention_q8_reduce_kv2_g8(
   threadgroup float weights[SplashVerifyMaximumSplits];
   threadgroup float group_values[8];
   splash_q8_verify_attention_reduce_phase<2, 8>(
+      partials, statistics, output, params, group, thread_index, weights, group_values);
+}
+
+kernel void verify_attention_q8_reduce_kv2_g12(
+    device const float *partials [[buffer(0)]],
+    device const float *statistics [[buffer(1)]],
+    device bfloat *output [[buffer(2)]],
+    constant SplashQ8VerifyAttentionParams *params [[buffer(3)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+  threadgroup float weights[SplashVerifyMaximumSplits];
+  threadgroup float group_values[8];
+  splash_q8_verify_attention_reduce_phase<2, 12>(
       partials, statistics, output, params, group, thread_index, weights, group_values);
 }

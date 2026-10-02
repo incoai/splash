@@ -2,6 +2,8 @@
 #include "WeightPreparationIdentity.hpp"
 #include "model/GgufPreparation.hpp"
 
+#include <bit>
+
 #include "metal/abi/GgufRepack.h"
 #include "model/Bfloat16.hpp"
 #include "model/GgufImageLayout.hpp"
@@ -40,7 +42,7 @@ void requireRange(uint64_t offset, uint64_t bytes, uint64_t available) {
 
 // Image rows [first, first + count) of `rows`, bytes [column, column + span)
 // of each, back to back. Consecutive source rows are read together.
-void readRows(const WeightSource &source, const gguf::TensorRows &rows, uint64_t first,
+void readRows(GgufSources sources, const gguf::TensorRows &rows, uint64_t first,
               uint64_t count, uint64_t column, uint64_t span, uint8_t *to) {
   if (first > rows.rows || count > rows.rows - first || column > rows.rowBytes || span > rows.rowBytes - column)
     throw GgufError("prepared weight rows are out of bounds");
@@ -49,7 +51,8 @@ void readRows(const WeightSource &source, const gguf::TensorRows &rows, uint64_t
     uint64_t run = 1;
     if (span == rows.rowBytes)
       while (row + run < count && sourceRow(rows, first + row + run) == start + run) ++run;
-    source.readData(rows.offset + start * rows.rowBytes + column, {to + row * span, run * span});
+    if (rows.file >= sources.size()) throw GgufError("prepared weight rows name a missing GGUF file");
+    sources[rows.file]->readData(rows.offset + start * rows.rowBytes + column, {to + row * span, run * span});
     row += run;
   }
 }
@@ -81,8 +84,26 @@ std::span<uint8_t> widenToFloat32(std::span<uint8_t> bytes) {
   return bytes;
 }
 
+// Q8_0 blocks (half d, 32 int8 q) dequantized in place to F32 d * q: bytes
+// holds whole blocks at its start and room for their values.
+constexpr uint64_t kQ80BlockBytes = 34, kQ80FloatBytes = 32 * sizeof(float);
+std::span<uint8_t> dequantizeQ80(std::span<uint8_t> bytes, uint64_t blocks) {
+  std::vector<uint8_t> source(bytes.begin(), bytes.begin() + blocks * kQ80BlockBytes);
+  for (uint64_t b = 0; b < blocks; ++b) {
+    uint16_t half;
+    std::memcpy(&half, source.data() + b * kQ80BlockBytes, 2);
+    const float d = static_cast<float>(std::bit_cast<_Float16>(half));
+    for (uint32_t i = 0; i < 32; ++i) {
+      const float value = d * float(static_cast<int8_t>(source[b * kQ80BlockBytes + 2 + i]));
+      std::memcpy(bytes.data() + b * kQ80FloatBytes + 4 * i, &value, 4);
+    }
+  }
+  return bytes.first(blocks * kQ80FloatBytes);
+}
+
 // Destination bytes of source bytes: halved when narrowed, doubled when widened.
 uint64_t copiedBytes(const gguf::Copy &copy, uint64_t sourceBytes) {
+  if (copy.dequantizeQ80) return sourceBytes / kQ80BlockBytes * kQ80FloatBytes;
   return copy.bfloat16 ? sourceBytes / 2 : copy.float32 ? sourceBytes * 2 : sourceBytes;
 }
 
@@ -90,9 +111,22 @@ uint64_t copyBytes(const gguf::Copy &copy) {
   return copiedBytes(copy, copy.source.rows * copy.source.rowBytes);
 }
 
-void writeCopy(const WeightSource &source, int destination, const gguf::Copy &copy,
+void writeCopy(GgufSources source, int destination, const gguf::Copy &copy,
                std::span<uint8_t> staging, const PreparationCheck &admit) {
   const gguf::TensorRows &rows = copy.source;
+  if (copy.dequantizeQ80) {
+    // Whole rows of whole blocks, expanded in the staging.
+    const uint64_t expanded = copiedBytes(copy, rows.rowBytes);
+    if (rows.rowBytes % kQ80BlockBytes || expanded > staging.size())
+      throw GgufError("Q8_0 rows exceed the dequantization staging: " + rows.name);
+    for (uint64_t row = 0; row < rows.rows; ++row) {
+      admit();
+      readRows(source, rows, row, 1, 0, rows.rowBytes, staging.data());
+      writeWeightBytes(destination, copy.destination + row * expanded,
+                       dequantizeQ80(staging.first(expanded), rows.rowBytes / kQ80BlockBytes));
+    }
+    return;
+  }
   // Whole rows per read where they fit; a wider row in pieces of whole values.
   // A widened read takes half the staging, which holds its F32 values.
   const uint64_t room = copy.float32 ? staging.size() / 2 : staging.size();
@@ -156,7 +190,7 @@ RepackChunk repackChunk(const gguf::Repack &repack) {
 // shape, sources of its row width and planes inside the image.
 void requireRepack(const gguf::Repack &repack, uint64_t imageBytes) {
   if (repack.format >= GGUF_FMT_COUNT || !repack.rows || repack.rows % QUANT_TILE_ROWS || !repack.columns ||
-      repack.columns % kGgufBlockColumns)
+      repack.columns % ggufColumnUnit(kQuantFormats[repack.format]))
     throw GgufError("invalid prepared weight repack");
   const QuantFormat &format = kQuantFormats[repack.format];
   const uint64_t rowBytes = ggufRowBytes(format, repack.columns);
@@ -172,7 +206,7 @@ void requireRepack(const gguf::Repack &repack, uint64_t imageBytes) {
   for (size_t plane = 0; plane < sizes.size(); ++plane) requireRange(offsets[plane], sizes[plane], imageBytes);
 }
 
-void writeRepack(metal::MetalBackend &backend, const WeightSource &source, int destination,
+void writeRepack(metal::MetalBackend &backend, GgufSources source, int destination,
                  const gguf::Repack &repack, const RepackChunk &chunk, metal::MetalBuffer &input,
                  metal::MetalBuffer &output, const PreparationCheck &admit) {
   const QuantFormat &format = kQuantFormats[repack.format];
@@ -227,14 +261,15 @@ void writeRepack(metal::MetalBackend &backend, const WeightSource &source, int d
 
 } // namespace
 
-PreparedWeight ggufImageWeight(const WeightSource &source, const gguf::Image &image) {
+PreparedWeight ggufImageWeight(GgufSources sources, const gguf::Image &image) {
   // The envelope version covers identity serialization. Conversion code and
   // its storage ABI are fingerprinted at build time, independently of tuning.
   WeightIdentity identity("splash-gguf-preparation-v2 " SPLASH_GGUF_PREPARATION_ID);
   identity.record("image", image.layer, image.type, image.bytes);
   const auto input = [&](const gguf::TensorRows &rows) {
     const uint64_t shape[] = {rows.rows, rows.rowBytes};
-    identity.input(source, rows.offset, rows.rows * rows.rowBytes, ggmlTypeName(rows.type), shape);
+    if (rows.file >= sources.size()) throw GgufError("prepared weight rows name a missing GGUF file");
+    identity.input(*sources[rows.file], rows.offset, rows.rows * rows.rowBytes, ggmlTypeName(rows.type), shape);
     identity.record("order", rows.order.from, rows.order.headRows, rows.order.keyHeads,
                     rows.order.valueHeadsPerKey);
   };
@@ -248,10 +283,10 @@ PreparedWeight ggufImageWeight(const WeightSource &source, const gguf::Image &im
     identity.record("repack", repack.format, repack.rows, repack.columns, repack.plane0, repack.plane1, repack.meta);
     for (const gguf::TensorRows &rows : repack.sources) input(rows);
   }
-  return identity.weight(image.bytes, "target/" + image.name, source.path().string());
+  return identity.weight(image.bytes, "target/" + image.name, sources.front()->path().string());
 }
 
-void writeGgufImage(metal::MetalBackend &backend, const WeightSource &source, int destination,
+void writeGgufImage(metal::MetalBackend &backend, GgufSources source, int destination,
                     const gguf::Image &image, const PreparationCheck &admit) {
   admit();
   for (const gguf::Fill &fill : image.fills) {
@@ -267,7 +302,9 @@ void writeGgufImage(metal::MetalBackend &backend, const WeightSource &source, in
       throw GgufError("invalid prepared weight copy");
     requireRange(copy.destination, copyBytes(copy), image.bytes);
     // A widened copy stages its F32 values.
-    const uint64_t staged = copy.float32 ? copyBytes(copy) : copy.source.rows * copy.source.rowBytes;
+    const uint64_t staged = copy.dequantizeQ80 ? copiedBytes(copy, copy.source.rowBytes)
+                            : copy.float32    ? copyBytes(copy)
+                                              : copy.source.rows * copy.source.rowBytes;
     copyStaging = std::max(copyStaging, std::min(staged, kWeightPreparationStagingBytes));
   }
   {

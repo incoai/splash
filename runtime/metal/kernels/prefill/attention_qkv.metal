@@ -28,6 +28,8 @@ PREFILL_ATTENTION_QKV(prefill_attention_qkv, 24, 4, bfloat)
 PREFILL_ATTENTION_QKV(prefill_attention_qkv_kv2_g8, 16, 2, bfloat)
 PREFILL_ATTENTION_QKV(prefill_attention_qkv_f32, 24, 4, float)
 PREFILL_ATTENTION_QKV(prefill_attention_qkv_kv2_g8_f32, 16, 2, float)
+PREFILL_ATTENTION_QKV(prefill_attention_qkv_kv2_g12, 24, 2, bfloat)
+PREFILL_ATTENTION_QKV(prefill_attention_qkv_kv2_g12_f32, 24, 2, float)
 #undef PREFILL_ATTENTION_QKV
 
 template <uint QHeads, uint KHeads>
@@ -78,5 +80,16 @@ kernel void prefill_attention_gate_kv2_g8(
     uint index [[thread_position_in_grid]],
     uint grid_size [[threads_per_grid]]) {
   full_attention_gate_prefill_phase<16, 2>(
+      packed_qkv, attention, hidden, params, index, grid_size);
+}
+
+kernel void prefill_attention_gate_kv2_g12(
+    device const bfloat *packed_qkv [[buffer(0)]],
+    device const bfloat *attention [[buffer(1)]],
+    device bfloat *hidden [[buffer(2)]],
+    constant FullPrefillParams &params [[buffer(3)]],
+    uint index [[thread_position_in_grid]],
+    uint grid_size [[threads_per_grid]]) {
+  full_attention_gate_prefill_phase<24, 2>(
       packed_qkv, attention, hidden, params, index, grid_size);
 }

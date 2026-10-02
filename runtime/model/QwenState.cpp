@@ -129,6 +129,9 @@ QwenGdnCell::QwenGdnCell(metal::MetalBackend &backend,
         uint64_t{layer} * layout.recurrentLayerBytes(),
         layout.recurrentLayerBytes());
   }
+  if (layout.auxiliaryBytes)
+    buffers_.auxiliary = backend.view(buffers_.stateBase, layout.convolutionBytes() + layout.recurrentBytes(),
+                                      layout.auxiliaryBytes);
   actualAllocatedBytes_ =
       metal::allocationDelta(before, backend.memoryStats().allocatedBytes);
   if (actualAllocatedBytes_ < layout.cellBytes()) {
@@ -259,6 +262,10 @@ metal::AllocationResult QwenStateStorage::tryActivateSlot(uint32_t index, uint64
   // by the zero logical lengths below.
   clear(current.buffers.gdn[0].convolutionBase, "slot convolution state");
   clear(current.buffers.gdn[0].recurrentBase, "slot recurrent state");
+  // The auxiliary state (Qwen3.8-Flash-Next's PLE history and MTP streams)
+  // starts at zero as the recurrent state does.
+  if (current.buffers.gdn[0].auxiliary)
+    clear(current.buffers.gdn[0].auxiliary, "slot auxiliary state");
   current.metadata = {true, requestId, 0, {}};
   return true;
 }

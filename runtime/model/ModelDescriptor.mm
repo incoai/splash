@@ -6,6 +6,7 @@
 #include <array>
 #include <stdexcept>
 #include <string>
+#include <cstdlib>
 #include <string_view>
 #include <utility>
 
@@ -171,6 +172,18 @@ ModelDescriptor qwen36Descriptor(std::string name) {
                              vision);
 }
 
+ModelDescriptor qwen4Descriptor(std::string name, bool mtp) {
+  Qwen4ExpLayout target;
+  target.mtpLayers = mtp ? 1 : 0;
+  ops::VisionLayout vision;
+  vision.outputHiddenSize = target.hiddenSize;
+  ModelDescriptor result = makeModelDescriptor(
+      std::move(name), target,
+      nullDraftLayout(target.hiddenSize, target.vocabularySize, target.capturedHiddenSize()), vision);
+  result.draftSource = DraftSource::None;
+  return result;
+}
+
 void validateTokenizer(const std::filesystem::path &root,
                        const ModelDescriptor &descriptor,
                        std::string_view expectedTextModelType) {
@@ -321,6 +334,11 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
   ModelDescriptor result;
   if (type == "qwen3_5_moe_text") result = qwen36Descriptor(name);
   else if (type == "qwen3_5_text") result = qwen38Descriptor(name);
+  else if (type == "qwen4_exp_text") {
+    // The MTP head drafts when mtp/ holds it, unless SPLASH_MTP=0.
+    const char *mtp = std::getenv("SPLASH_MTP");
+    result = qwen4Descriptor(name, std::filesystem::exists(root / "mtp") && !(mtp && std::string_view(mtp) == "0"));
+  }
   else throw std::invalid_argument("unsupported model architecture: " + type);
   std::visit([&](const auto &layout) {
     requireNumbers(text, {{"hidden_size", layout.hiddenSize}, {"num_hidden_layers", layout.layers},
@@ -333,6 +351,11 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
   else if (target == "gguf") result.targetSource = TargetSource::Gguf;
   else throw std::invalid_argument("unsupported target source format: " + target);
 
+  if (!result.hasDraft()) {
+    if (std::filesystem::exists(root / "draft"))
+      throw std::invalid_argument("this model decodes without a DFlash2 draft, but its root holds one");
+    if (target != "gguf") throw std::invalid_argument("Qwen3.8-Flash-Next loads from a GGUF only");
+  } else {
   NSDictionary *draft = readObject(root / "draft" / "config.json", "draft config");
   NSArray *architectures = requireArray(draft, @"architectures", "draft architectures");
   if (architectures.count != 1 || ![architectures[0] isEqual:@"DFlash2DraftModel"])
@@ -366,6 +389,7 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
     }
   }, result.target);
   result.draftSource = DraftSource::Checkpoint;
+  }
 
   const auto vision = requireString(record, @"vision_format", "vision format");
   if (vision == "none") result.visionSource = VisionSource::None;
@@ -442,6 +466,17 @@ bool ModelDescriptor::valid() const noexcept {
                layout.gdnStateLayout() == stateLayout.target;
       },
       target);
+}
+
+DFlashDraftLayout nullDraftLayout(uint32_t hiddenSize, uint32_t vocabularySize, uint32_t capturedHiddenSize) {
+  DFlashDraftLayout layout;
+  layout.layers = 1;
+  layout.hiddenSize = hiddenSize;
+  layout.vocabularySize = vocabularySize;
+  layout.kvHeads = 1;
+  layout.attentionHeadDimension = 8;
+  layout.targetHiddenSize = capturedHiddenSize;
+  return layout;
 }
 
 ModelDescriptor inspectModelPackage(const std::filesystem::path &root) {

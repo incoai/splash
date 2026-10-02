@@ -22,13 +22,13 @@
 // being elements e0 and e0 + 1 with e0 = 16 (p >> 1) + 4c + 2 (p & 1).
 // Element e is at slot quant_slot(e) = 8c + 2p + (e & 1). The planes pack the
 // slots as follows.
-//   4-bit linear codes (Q4_K, Q4_0, Q4_1, the low bits of Q5_K and Q6_K):
+//   4-bit linear codes (Q4_K, Q4_0, Q4_1, the low bits of Q5_K, Q5_1 and Q6_K):
 //     word c holds slots 8c..8c+7, pair p's e0 at bits 4p and e1 at bits
 //     16 + 4p.
 //   Every other field is a little-endian bit string of the 32 slots: IQ4 and
 //     MXFP4 indices (4 bits, so byte p of word c is pair p), Q8_0 values (8),
-//     Q6_K high, Q3_K low, Q2_K and PQ2_0 bits (2), Q5_K fifth and Q3_K hmask
-//     bits (1).
+//     Q6_K high, Q3_K low, Q2_K and PQ2_0 bits (2), Q5_K and Q5_1 fifth and
+//     Q3_K hmask bits (1).
 //   IQ3_S word c: bits 0..7 and 8..15 the low grid index bits of elements
 //     4c..4c+3 and 16+4c..16+4c+3, 16..23 the sign bits of slots 8c..8c+7,
 //     24 and 25 the two ninth index bits, 26..29 the group's scale.
@@ -65,7 +65,8 @@
 #define GGUF_FMT_Q41 16u
 #define GGUF_FMT_MXFP4 17u
 #define GGUF_FMT_PQ20 18u
-#define GGUF_FMT_COUNT 19u
+#define GGUF_FMT_Q51 19u
+#define GGUF_FMT_COUNT 20u
 
 struct QuantFormat {
   uint32_t ggml_type;      // GGUF tensor type
@@ -98,6 +99,7 @@ QUANT_CONSTANT QuantFormat kQuantFormats[GGUF_FMT_COUNT] = {
     {3, 32, 20, 16, 0, 4, 1, "q41"},      // meta: d, m
     {39, 32, 17, 16, 0, 1, 1, "mxfp4"},   // meta: e
     {142, 128, 34, 8, 0, 2, 4, "pq20"},   // Prism's block_pq2_0, one d per 128 elements; meta: d
+    {7, 32, 24, 16, 4, 4, 1, "q51"},      // plane1: fifth bits; meta: d, m
 };
 
 // The format that stores a GGUF tensor type; GGUF_FMT_COUNT when none does.
@@ -110,7 +112,18 @@ inline constexpr uint32_t gguf_format_of(uint32_t ggml_type) {
 // The chunk order slot of element e (0..31) of a group.
 inline constexpr uint32_t quant_slot(uint32_t e) { return 8 * ((e >> 2) & 3) + 4 * (e >> 4) + (e & 3); }
 
-#define QUANT_TILE_ROWS 256u
+// A plane tile holds one GGUF_TILE_COLUMNS column tile of every kernel, so
+// any projection or expert of a multiple of 64 rows starts on a tile.
+#define QUANT_TILE_ROWS 64u
+
+// The columns a [N, K] tensor of format f is a multiple of: one 64-input span
+// of the activation tables for formats of one group per meta unit, else a
+// whole 256-input superblock. The register decode tiles (linear_gguf_sgmatrix)
+// decode the coefficients of four spans together for formats of several
+// groups per meta unit, so PQ2_0's 128-input blocks take 256 columns too.
+inline constexpr uint32_t quant_column_unit(uint32_t block_elements) {
+  return block_elements > 64 ? 256 : 64;
+}
 
 // Index of (row, block) in a [rows / T][blocks][T] plane (blocks = G) or meta
 // plane (blocks = meta units per row).

@@ -4,6 +4,7 @@
 #include "model/GgufTarget.hpp"
 #include "model/QwenTargetLoader.hpp"
 
+#include <deque>
 #include <functional>
 #include <limits>
 #include <optional>
@@ -32,13 +33,18 @@ void requireCompatibleModelPackage(const ModelPackage &package) {
 namespace {
 
 TargetWeights readTarget(metal::MetalBackend &backend, const Qwen3_8Layout &layout,
-                         const QwenTargetFiles<Qwen3_8Layout> &files) {
+                         const QwenTargetFiles<Qwen3_8Layout> &files, GgufMtpLoader *) {
   return loadQwen3_8Weights(backend, layout, files);
 }
 
 TargetWeights readTarget(metal::MetalBackend &backend, const Qwen3_6MoeLayout &layout,
-                         const QwenTargetFiles<Qwen3_6MoeLayout> &files) {
+                         const QwenTargetFiles<Qwen3_6MoeLayout> &files, GgufMtpLoader *) {
   return loadQwen3_6MoeWeights(backend, layout, files);
+}
+
+TargetWeights readTarget(metal::MetalBackend &backend, const Qwen4ExpLayout &layout,
+                         const QwenTargetFiles<Qwen4ExpLayout> &files, GgufMtpLoader *mtp) {
+  return loadQwen4ExpWeights(backend, layout, files, mtp);
 }
 
 ModelPackage loadPackage(metal::MetalBackend &backend,
@@ -60,6 +66,13 @@ ModelPackage loadPackage(metal::MetalBackend &backend,
     draft.emplace(backend, root / "draft", result.descriptor.draft, admitConversion);
     prepared.insert(prepared.end(), draft->weights().begin(), draft->weights().end());
   }
+  // Qwen3.8-Flash-Next's MTP head, from mtp/ beside target/.
+  std::unique_ptr<GgufMtpLoader> mtp;
+  if (const auto *qwen4 = std::get_if<Qwen4ExpLayout>(&result.descriptor.target); qwen4 && qwen4->mtpLayers) {
+    const auto files = findTargetGgufs(root / "mtp");
+    if (files.size() != 1) throw std::invalid_argument("mtp/ must hold one GGUF");
+    mtp = std::make_unique<GgufMtpLoader>(backend, files.front(), ggufTargetGeometry(*qwen4), admitConversion);
+  }
   result.target = std::visit(
       [&](const auto &layout) -> TargetWeights {
         using Layout = std::remove_cvref_t<decltype(layout)>;
@@ -70,21 +83,27 @@ ModelPackage loadPackage(metal::MetalBackend &backend,
         const auto read = [&](const QwenTargetFiles<Layout> &files,
                               std::span<const PreparedWeight> target, const auto &prepareTarget) {
           prepared.insert(prepared.end(), target.begin(), target.end());
+          if (mtp) prepared.insert(prepared.end(), mtp->weights().begin(), mtp->weights().end());
           if (!prepared.empty()) PreparedWeights().requireSpace(prepared, check);
           if (vision) static_cast<void>(vision->prepare());
           if (draft) draft->prepare();
           prepareTarget();
-          return readTarget(backend, layout, files);
+          if (mtp) mtp->prepare();
+          return readTarget(backend, layout, files, mtp.get());
         };
         switch (result.descriptor.targetSource) {
         case TargetSource::Packed:
           return read(PackedTargetFiles<Layout>{backend, directory, layout}, {}, [] {});
         case TargetSource::Mlx: {
-          AffineTargetLoader loader(backend, directory, layout, admitConversion);
-          return read(loader, loader.weights(), [&] { loader.prepare(); });
+          if constexpr (std::is_same_v<Layout, Qwen4ExpLayout>) {
+            throw std::invalid_argument("Qwen3.8-Flash-Next loads from a GGUF only");
+          } else {
+            AffineTargetLoader loader(backend, directory, layout, admitConversion);
+            return read(loader, loader.weights(), [&] { loader.prepare(); });
+          }
         }
         case TargetSource::Gguf: {
-          GgufTargetLoader loader(backend, findTargetGguf(directory), ggufTargetGeometry(layout),
+          GgufTargetLoader loader(backend, findTargetGgufs(directory), ggufTargetGeometry(layout),
                                   admitConversion);
           return read(loader, loader.weights(), [&] { loader.prepare(); });
         }
@@ -92,11 +111,14 @@ ModelPackage loadPackage(metal::MetalBackend &backend,
         throw std::invalid_argument("unknown target source");
       },
       result.descriptor.target);
-  result.draft = loadDFlashDraftWeights(
-      backend,
-      draft ? DraftFiles(std::ref(*draft))
-            : DraftFiles(PackedDraftFiles{backend, root / "draft", result.descriptor.draft}),
-      result.descriptor.draft);
+  if (result.descriptor.hasDraft())
+    result.draft = loadDFlashDraftWeights(
+        backend,
+        draft ? DraftFiles(std::ref(*draft))
+              : DraftFiles(PackedDraftFiles{backend, root / "draft", result.descriptor.draft}),
+        result.descriptor.draft);
+  else
+    result.draft.layout = result.descriptor.draft;
   result.vision = loadVisionWeights(backend, root, result.descriptor, vision.get());
 
   std::vector<WeightFileRecord> records(result.targetFiles().begin(),
@@ -144,14 +166,22 @@ QwenVisionWeights loadVisionWeights(metal::MetalBackend &backend, const std::fil
 uint64_t preparedModelWeightBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor) {
   uint64_t bytes = 0;
   if (descriptor.targetSource == TargetSource::Gguf) {
-    WeightSource source(findTargetGguf(root / "target"));
-    const GgufFile file(source);
+    std::deque<WeightSource> sources;
+    std::vector<WeightSource *> files;
+    for (const std::filesystem::path &path : findTargetGgufs(root / "target"))
+      files.push_back(&sources.emplace_back(path));
+    const GgufFile file(files);
     for (const gguf::Image &image :
          std::visit([&](const auto &layout) { return gguf::planImages(file, ggufTargetGeometry(layout)); },
                     descriptor.target))
       bytes += image.bytes;
   } else if (descriptor.targetSource == TargetSource::Mlx) {
-    bytes = std::visit([](const auto &layout) { return preparedAffineBytes(layout); }, descriptor.target);
+    bytes = std::visit([](const auto &layout) -> uint64_t {
+      if constexpr (std::is_same_v<std::remove_cvref_t<decltype(layout)>, Qwen4ExpLayout>)
+        throw std::invalid_argument("Qwen3.8-Flash-Next loads from a GGUF only");
+      else
+        return preparedAffineBytes(layout);
+    }, descriptor.target);
   }
   if (descriptor.draftSource == DraftSource::Checkpoint) bytes += preparedDraftBytes(descriptor.draft);
   if (descriptor.visionSource == VisionSource::Mlx || descriptor.visionSource == VisionSource::Gguf)

@@ -286,7 +286,7 @@ Case makeCase(metal::MetalBackend &backend, uint32_t queryHeads,
   const uint64_t dataBytes = physicalPages * layout.dataBytesPerLayerPage();
   const uint64_t scaleBytes = physicalPages * layout.scaleBytesPerLayerPage();
   data.layer = {allocate(backend, dataBytes), allocate(backend, scaleBytes),
-                allocate(backend, dataBytes), allocate(backend, scaleBytes), layout.format};
+                allocate(backend, dataBytes), allocate(backend, scaleBytes), layout.format, {}, {}};
   data.keys = allocate(backend, uint64_t{lanes} * layout.kvHeads * data.stride * 256 * 2);
   data.values = allocate(backend, data.keys.sizeBytes());
   data.queries = allocate(backend, uint64_t{lanes} * queryHeads * data.stride * 256 * 2);

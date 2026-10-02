@@ -56,7 +56,10 @@ std::optional<LinearSimdgroups> fixedSimdgroups(LinearTile tile) noexcept {
 void validate(LinearWorkload w) {
   if (w.weightLayout != WeightLayout::Affine64 && w.weightLayout != WeightLayout::Block32)
     throw std::invalid_argument("invalid linear weight layout");
-  if (!w.matrix.outputSize || w.matrix.outputSize % 256 ||
+  // Affine tiles span 256 columns; GGUF ones 64 (GGUF_TILE_COLUMNS), whose
+  // K is a multiple of a 64-input span (or of its format's superblock).
+  const uint32_t unit = w.weightLayout == WeightLayout::Block32 ? 64 : 256;
+  if (!w.matrix.outputSize || w.matrix.outputSize % unit ||
       !w.matrix.inputSize || w.matrix.inputSize % kQuantGroup)
     throw std::invalid_argument("invalid linear matrix");
   if (w.phase == LinearPhase::Prefill) {
@@ -64,7 +67,7 @@ void validate(LinearWorkload w) {
         w.epilogue == LinearEpilogue::GateUp)
       throw std::invalid_argument("invalid linear prefill workload");
   } else if (w.phase == LinearPhase::Decode) {
-    if (w.matrix.inputSize % 256 || !w.rows || w.rows % SPLASH_TARGET_VERIFY_ROWS ||
+    if (w.matrix.inputSize % unit || !w.rows || w.rows % SPLASH_TARGET_VERIFY_ROWS ||
         w.rows > SPLASH_TARGET_VERIFY_ROWS * SPLASH_MAXIMUM_BATCH_WIDTH ||
         w.epilogue == LinearEpilogue::UpWithGate)
       throw std::invalid_argument("invalid linear decode workload");
@@ -650,6 +653,10 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
   if ((w.epilogue == LinearEpilogue::GateUp) != (gate != nullptr))
     throw std::invalid_argument("a gate/up plan takes a gate projection and no other plan does");
   const uint64_t rows = selected.storageRows();
+  if (b.input && b.input.sizeBytes() < rows * k * 2)
+    throw std::invalid_argument("projection " + std::to_string(n) + "x" + std::to_string(k) + " of " +
+                                std::to_string(rows) + " rows: input buffer holds " +
+                                std::to_string(b.input.sizeBytes()) + " bytes");
   requireBytes(b.input, rows * k * 2, "input");
   requireBytes(b.output, rows * n * elementBytes(selected.destination()), "output");
   if (w.epilogue == LinearEpilogue::Residual) requireBytes(b.residual, rows * n * 2, "residual");

@@ -33,6 +33,11 @@ inline constexpr uint32_t kPackedAttentionRows =
     kPrefillRows + kLaneCount * (kTileRows - 1);
 inline constexpr uint32_t kDraftCacheStride = ExecutionLimits::draftContextTokens;
 inline constexpr uint64_t kArenaAlignment = 16 * 1024;
+// Qwen3.8-Flash-Next's QSA: the rows a prefill scores at once, and the
+// words of a row's block bitmap for a context of `tokens` tokens (one bit
+// per block of four, the tail block included).
+inline constexpr uint32_t kQsaPrefillScoreRows = 256;
+[[nodiscard]] constexpr uint32_t qsaMaskWords(uint32_t tokens) noexcept { return (tokens / 4 + 2 + 31) / 32; }
 inline constexpr uint32_t kMaximumPageTableEntries =
     (kv::kMaximumPhysicalTokens + kv::kPageTokens - 1) / kv::kPageTokens;
 
@@ -40,6 +45,9 @@ struct RuntimeGeometry final {
   QwenTargetGeometry target;
   DFlashDraftLayout draft;
   DraftStateLayout draftState;
+  // Whether a DFlash2 draft runs; without one, `draft` is a placeholder whose
+  // operator workspaces are never planned.
+  bool hasDraft = true;
 
   [[nodiscard]] static RuntimeGeometry from(
       const ModelPackage &package, kv::Format format = kv::Format::Int8) {
@@ -50,6 +58,7 @@ struct RuntimeGeometry final {
     result.target.kvLayout = package.targetKvLayout(format);
     result.draft = package.draft.layout;
     result.draftState = result.draft.stateLayout();
+    result.hasDraft = package.hasDraft();
     if (!result.target.valid() || !result.draftState.valid() ||
         result.target.hiddenSize != result.draft.hiddenSize ||
         result.target.vocabularySize != result.draft.vocabularySize ||
@@ -135,6 +144,29 @@ enum class PrefillTensor : uint32_t {
   DraftRopeSin,
   ChunkKeys,
   ChunkValues,
+  // Qwen3.8-Flash-Next's (QwenHyperBuffers); empty for other families.
+  HyperStreams,
+  HyperNormalized,
+  HyperLow,
+  HyperGate,
+  HyperWeights,
+  HyperBranch,
+  HyperZeros,
+  PleIndices,
+  PleRows,
+  PleValue,
+  PleGated,
+  PleConvolution,
+  IndexerQuery,
+  IndexerKey,
+  QsaQueries,
+  QsaScores,
+  QsaMask,
+  QsaBlocks,
+  MtpStreams,
+  MtpInput,
+  MtpTokens,
+  PlePrior,
   // One tensor per ops::kMoeScratchFields entry, in its order (moeScratchTensor).
   MoeScratch,
   MoeScratchLast = MoeScratch + ops::kMoeScratchFields.size() - 1,
@@ -197,6 +229,9 @@ public:
     // Split projections return their counters to zero; they start there.
     if (const metal::MetalBuffer counters = get(PrefillTensor::LinearCounters))
       std::memset(counters.contents(), 0, counters.sizeBytes());
+    // The rows the MoE adds a hyper-connected block's output to.
+    if (const metal::MetalBuffer zeros = get(PrefillTensor::HyperZeros))
+      std::memset(zeros.contents(), 0, zeros.sizeBytes());
   }
 
   [[nodiscard]] metal::MetalBuffer get(PrefillTensor tensor) const {
@@ -208,6 +243,30 @@ public:
       scratch.*ops::kMoeScratchFields[field].buffer =
           get(moeScratchTensor<PrefillTensor>(field));
     return scratch;
+  }
+  [[nodiscard]] QwenHyperBuffers hyper() const {
+    QwenHyperBuffers h;
+    h.streams = get(PrefillTensor::HyperStreams);
+    h.normalized = get(PrefillTensor::HyperNormalized);
+    h.low = get(PrefillTensor::HyperLow);
+    h.gate = get(PrefillTensor::HyperGate);
+    h.weights = get(PrefillTensor::HyperWeights);
+    h.branch = get(PrefillTensor::HyperBranch);
+    h.zeros = get(PrefillTensor::HyperZeros);
+    h.pleIndices = get(PrefillTensor::PleIndices);
+    h.pleRows = get(PrefillTensor::PleRows);
+    h.pleValue = get(PrefillTensor::PleValue);
+    h.pleGated = get(PrefillTensor::PleGated);
+    h.pleConvolution = get(PrefillTensor::PleConvolution);
+    h.indexerQuery = get(PrefillTensor::IndexerQuery);
+    h.indexerKey = get(PrefillTensor::IndexerKey);
+    h.qsaQueries = get(PrefillTensor::QsaQueries);
+    h.qsaScores = get(PrefillTensor::QsaScores);
+    h.qsaMask = get(PrefillTensor::QsaMask);
+    h.mtpStreams = get(PrefillTensor::MtpStreams);
+    h.mtpInput = get(PrefillTensor::MtpInput);
+    h.mtpTokens = get(PrefillTensor::MtpTokens);
+    return h;
   }
   [[nodiscard]] uint64_t bytes() const noexcept { return bytes_; }
 
@@ -287,6 +346,29 @@ enum class DecodeTensor : uint32_t {
   VerifyBetaBase,
   ChunkKeysBase,
   ChunkValuesBase,
+  // Qwen3.8-Flash-Next's (QwenHyperBuffers); empty for other families.
+  HyperStreams,
+  HyperNormalized,
+  HyperLow,
+  HyperGate,
+  HyperWeights,
+  HyperBranch,
+  HyperZeros,
+  PleIndices,
+  PleRows,
+  PleValue,
+  PleGated,
+  PleConvolution,
+  IndexerQuery,
+  IndexerKey,
+  QsaQueries,
+  QsaScores,
+  QsaMask,
+  QsaBlocks,
+  MtpStreams,
+  MtpInput,
+  MtpTokens,
+  PlePrior,
   // One tensor per ops::kMoeScratchFields entry, in its order (moeScratchTensor).
   MoeScratch,
   MoeScratchLast = MoeScratch + ops::kMoeScratchFields.size() - 1,
@@ -348,6 +430,8 @@ public:
     }
     if (cursor != baseBytes)
       throw std::logic_error("decode arena mismatch");
+    if (const metal::MetalBuffer zeros = packed(DecodeTensor::HyperZeros, kLaneCount))
+      std::memset(zeros.contents(), 0, zeros.sizeBytes());
 
     const uint64_t denseScratchBytes = gateScratchBytes(geometry_, operators);
     if (denseScratchBytes) {
@@ -408,6 +492,30 @@ public:
     return scratch;
   }
 
+  [[nodiscard]] QwenHyperBuffers hyper(uint32_t lanes) const {
+    QwenHyperBuffers h;
+    h.streams = packed(DecodeTensor::HyperStreams, lanes);
+    h.normalized = packed(DecodeTensor::HyperNormalized, lanes);
+    h.low = packed(DecodeTensor::HyperLow, lanes);
+    h.gate = packed(DecodeTensor::HyperGate, lanes);
+    h.weights = packed(DecodeTensor::HyperWeights, lanes);
+    h.branch = packed(DecodeTensor::HyperBranch, lanes);
+    h.zeros = packed(DecodeTensor::HyperZeros, lanes);
+    h.pleIndices = packed(DecodeTensor::PleIndices, lanes);
+    h.pleRows = packed(DecodeTensor::PleRows, lanes);
+    h.pleValue = packed(DecodeTensor::PleValue, lanes);
+    h.pleGated = packed(DecodeTensor::PleGated, lanes);
+    h.pleConvolution = packed(DecodeTensor::PleConvolution, lanes);
+    h.indexerQuery = packed(DecodeTensor::IndexerQuery, lanes);
+    h.indexerKey = packed(DecodeTensor::IndexerKey, lanes);
+    h.qsaQueries = packed(DecodeTensor::QsaQueries, lanes);
+    h.qsaScores = packed(DecodeTensor::QsaScores, lanes);
+    h.qsaMask = packed(DecodeTensor::QsaMask, lanes);
+    h.mtpStreams = packed(DecodeTensor::MtpStreams, lanes);
+    h.mtpInput = packed(DecodeTensor::MtpInput, lanes);
+    h.mtpTokens = packed(DecodeTensor::MtpTokens, lanes);
+    return h;
+  }
   [[nodiscard]] ops::LinearScratch linearScratch() const { return linearScratch_; }
   static ops::LinearScratchSize linearScratchSize(const RuntimeGeometry &geometry,
                                                  const ops::ExecutionPlans &operators);

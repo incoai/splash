@@ -4,6 +4,7 @@
 #include "Model.hpp"
 #include "Qwen3_6Moe.hpp"
 #include "Qwen3_8.hpp"
+#include "Qwen4Exp.hpp"
 #include "ops/Vision.hpp"
 
 #include <cstdint>
@@ -13,14 +14,15 @@
 
 namespace splash::model {
 
-using TargetLayout = std::variant<Qwen3_8Layout, Qwen3_6MoeLayout>;
+using TargetLayout = std::variant<Qwen3_8Layout, Qwen3_6MoeLayout, Qwen4ExpLayout>;
 
 // Where a model's weights come from: files already in the packed layout, or
 // an MLX or GGUF checkpoint, and the draft's DFlash2 checkpoint, prepared
-// into cached files when it loads. The vision tower is None for a model
+// into cached files when it loads, or None for a family no DFlash2 draft was
+// trained for (nullDraftLayout). The vision tower is None for a model
 // installed with --language-only.
 enum class TargetSource : uint8_t { Packed, Mlx, Gguf };
-enum class DraftSource : uint8_t { Packed, Checkpoint };
+enum class DraftSource : uint8_t { Packed, Checkpoint, None };
 enum class VisionSource : uint8_t { Packed, Mlx, Gguf, None };
 
 // Package metadata validated before weight buffers are loaded. The engine
@@ -43,6 +45,9 @@ struct ModelDescriptor final {
   [[nodiscard]] bool hasVision() const noexcept {
     return visionSource != VisionSource::None;
   }
+  [[nodiscard]] bool hasDraft() const noexcept {
+    return draftSource != DraftSource::None;
+  }
   [[nodiscard]] bool valid() const noexcept;
 };
 
@@ -54,5 +59,12 @@ struct ModelDescriptor final {
                                                   ops::VisionLayout vision);
 [[nodiscard]] ModelDescriptor
 inspectModelPackage(const std::filesystem::path &root);
+
+// The draft layout of a target that decodes without a DFlash2 draft: no draft
+// model runs, but the engine's composite state keeps its one-layer,
+// eight-wide ring, so the state and cache bookkeeping stay those of a draft
+// (a few tens of KiB per state).
+[[nodiscard]] DFlashDraftLayout nullDraftLayout(uint32_t hiddenSize, uint32_t vocabularySize,
+                                                uint32_t capturedHiddenSize);
 
 } // namespace splash::model

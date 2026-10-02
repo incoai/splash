@@ -287,7 +287,9 @@ ops::NormWeights readNorm(WeightFile &file, uint32_t width, bool float32,
 }
 
 namespace {
-GgufTensorDescriptor readGgufDescriptor(WeightFile &file, std::string_view label) {
+// A table's native rows (`tiled` false) need not fill whole tiles: the
+// gather reads any row of whole blocks.
+GgufTensorDescriptor readGgufDescriptor(WeightFile &file, std::string_view label, bool tiled = true) {
     metal::MetalBuffer section = file.section(sizeof(GgufTensorDescriptor), std::string(label) + "-desc");
     const uint8_t *bytes = static_cast<const uint8_t *>(section.contents());
     if (!bytes) throw WeightStoreError("GGUF descriptor is not host visible");
@@ -295,7 +297,7 @@ GgufTensorDescriptor readGgufDescriptor(WeightFile &file, std::string_view label
     std::memcpy(&d, bytes, sizeof d);
     // Float tensors are rows as stored; quantized ones fill whole tiles.
     if (!d.outputSize || !d.inputSize ||
-        (d.type != GGUF_TYPE_F32 && (d.outputSize % QUANT_TILE_ROWS || d.inputSize % kGgufBlockColumns)))
+        (tiled && d.type != GGUF_TYPE_F32 && (d.outputSize % QUANT_TILE_ROWS || d.inputSize % quant_column_unit(32))))
         throw WeightStoreError("GGUF tensor shape is not tile aligned: " + std::string(label));
     return d;
 }
@@ -337,7 +339,7 @@ ops::Projection readBlockProjection(WeightFile &file, uint32_t outputSize, uint3
 
 ops::EmbeddingWeights readBlockEmbedding(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
                                          std::string_view label) {
-    const GgufTensorDescriptor d = readGgufDescriptor(file, label);
+    const GgufTensorDescriptor d = readGgufDescriptor(file, label, false);
     if (d.outputSize != outputSize || d.inputSize != inputSize)
         throw WeightStoreError("GGUF embedding does not match the layout: " + std::string(label));
     const uint32_t format = gguf_format_of(d.type);

@@ -72,6 +72,9 @@ KvPageTier::KvPageTier(metal::MetalBackend &backend, kv::PageStorage &pages,
       slotBytes_(slotBytesFor(pages)), stagingSlots_(stagingSlots) {
   if (!file_ || file_->slotBytes() != slotBytes_)
     throw std::invalid_argument("KV slot file does not match the page size");
+  // The copies move the K/V planes only, not QSA index keys.
+  if (pages.layout().indexDimension)
+    throw std::invalid_argument("the SSD tier does not keep QSA index keys");
   if (!stagingSlots_)
     throw std::invalid_argument("KV staging needs at least one slot");
   demotionSlots_ = std::max<uint32_t>(1, stagingSlots_ / 2);

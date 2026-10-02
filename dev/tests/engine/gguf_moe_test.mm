@@ -77,10 +77,18 @@ using namespace gguf_reference;
 
 // K = 1024 on the hidden side (16 spans, four 256-input coefficient units)
 // and 512 on the intermediate side, as the 35B's experts.
-constexpr uint32_t kHidden = 1024;
-constexpr uint32_t kIntermediate = 512;
-constexpr uint32_t kExperts = 16;
-constexpr uint32_t kTopK = 4;
+// gguf-moe-e512 builds the test at Qwen3.8-Flash-Next's routing: 512
+// experts, top 10, a 640-wide intermediate.
+#ifndef GGUF_MOE_HIDDEN
+#define GGUF_MOE_HIDDEN 1024
+#define GGUF_MOE_INTERMEDIATE 512
+#define GGUF_MOE_EXPERTS 16
+#define GGUF_MOE_TOP_K 4
+#endif
+constexpr uint32_t kHidden = GGUF_MOE_HIDDEN;
+constexpr uint32_t kIntermediate = GGUF_MOE_INTERMEDIATE;
+constexpr uint32_t kExperts = GGUF_MOE_EXPERTS;
+constexpr uint32_t kTopK = GGUF_MOE_TOP_K;
 constexpr uint32_t kRoutes = kTopK + 1;
 constexpr uint32_t kMaximumRows = 263;
 
@@ -390,14 +398,26 @@ struct Model {
   std::array<Fmt, 6> formats{};
 };
 
+// The first format from f whose column unit divides rows of K values: a GGUF
+// stores no 256-value blocks in rows of 640 (Qwen3.8-Flash-Next's expert
+// down projections take 32-value blocks), and preparation takes PQ2_0's
+// 128-value blocks only in rows of whole superblocks.
+Fmt fitting(int f, uint32_t K) {
+  for (int i = 0; i < FMT_COUNT; ++i) {
+    const Fmt g = Fmt((f + i) % FMT_COUNT);
+    if (K % quant_column_unit(kQuantFormats[g].block_elements) == 0) return g;
+  }
+  throw std::logic_error("no format fits the row");
+}
+
 // Gate, up and down in formats f, f + 1, f + 2 and the shared expert's in
-// f + 3, f + 4, f + 5.
+// f + 3, f + 4, f + 5, each the next that fits its rows.
 Model makeModel(MetalBackend &backend, int f) {
   Model m;
-  for (int i = 0; i < 6; ++i) m.formats[i] = Fmt((f + i) % FMT_COUNT);
+  const uint32_t n[3] = {kIntermediate, kIntermediate, kHidden}, k[3] = {kHidden, kHidden, kIntermediate};
+  for (int i = 0; i < 6; ++i) m.formats[i] = fitting(f + i, k[i % 3]);
   m.router = floating(backend, kExperts, kHidden, 0.05f);
   m.sharedGate = floating(backend, 1, kHidden, 0.05f);
-  const uint32_t n[3] = {kIntermediate, kIntermediate, kHidden}, k[3] = {kHidden, kHidden, kIntermediate};
   for (int p = 0; p < 3; ++p) {
     m.routed[p] = quantized(backend, m.formats[p], kExperts * n[p], k[p]);
     m.shared[p] = quantized(backend, m.formats[3 + p], n[p], k[p]);

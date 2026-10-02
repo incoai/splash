@@ -55,6 +55,8 @@ VERIFY_ATTENTION_QKV(verify_attention_qkv, 24, 4, bfloat)
 VERIFY_ATTENTION_QKV(verify_attention_qkv_kv2_g8, 16, 2, bfloat)
 VERIFY_ATTENTION_QKV(verify_attention_qkv_f32, 24, 4, float)
 VERIFY_ATTENTION_QKV(verify_attention_qkv_kv2_g8_f32, 16, 2, float)
+VERIFY_ATTENTION_QKV(verify_attention_qkv_kv2_g12, 24, 2, bfloat)
+VERIFY_ATTENTION_QKV(verify_attention_qkv_kv2_g12_f32, 24, 2, float)
 #undef VERIFY_ATTENTION_QKV
 
 template <uint QHeads, uint KHeads>
@@ -108,6 +110,17 @@ kernel void verify_attention_gate(
       packed_qkv, attention, hidden, params, index, grid_size);
 }
 
+kernel void verify_attention_gate_kv2_g12(
+    device const bfloat *packed_qkv [[buffer(0)]],
+    device const bfloat *attention [[buffer(1)]],
+    device bfloat *hidden [[buffer(2)]],
+    constant FullDecodeBatchParams &params [[buffer(3)]],
+    uint index [[thread_position_in_grid]],
+    uint grid_size [[threads_per_grid]]) {
+  full_attention_gate_decode_phase<24, 2>(
+      packed_qkv, attention, hidden, params, index, grid_size);
+}
+
 kernel void verify_attention_gate_kv2_g8(
     device const bfloat *packed_qkv [[buffer(0)]],
     device const bfloat *attention [[buffer(1)]],
@@ -141,4 +154,6 @@ ATTENTION_GATE_TABLE(verify_attention_gate_table64, 24, 4, q4sg::Table64)
 ATTENTION_GATE_TABLE(verify_attention_gate_table64_kv2_g8, 16, 2, q4sg::Table64)
 ATTENTION_GATE_TABLE(verify_attention_gate_table16, 24, 4, gguf_sg::Table16)
 ATTENTION_GATE_TABLE(verify_attention_gate_table16_kv2_g8, 16, 2, gguf_sg::Table16)
+ATTENTION_GATE_TABLE(verify_attention_gate_table64_kv2_g12, 24, 2, q4sg::Table64)
+ATTENTION_GATE_TABLE(verify_attention_gate_table16_kv2_g12, 24, 2, gguf_sg::Table16)
 #undef ATTENTION_GATE_TABLE
