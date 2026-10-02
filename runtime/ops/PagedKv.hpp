@@ -119,6 +119,13 @@ struct Layout final {
   uint32_t kvHeads = 0;
   uint32_t headDimension = 0;
   Format format = Format::Int8;
+  // Qwen3.8-Flash-Next's QSA: each page also holds, per layer, its tokens'
+  // indexer keys of this many values (bf16 [token][dimension]) and the
+  // pooled keys of its blocks of kIndexBlockTokens tokens (fp32 [block]
+  // [dimension]), in index regions after every layer's K/V region
+  // (PageStorage::indexPlacement).
+  uint32_t indexDimension = 0;
+  static constexpr uint32_t kIndexBlockTokens = 4;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
     return attentionLayers && kvHeads && headDimension && validFormat(format);
@@ -139,11 +146,21 @@ struct Layout final {
   [[nodiscard]] constexpr uint64_t scaleBytesPerLayerPage() const noexcept {
     return scalesPerTensorLayerPage() * sizeof(float);
   }
+  [[nodiscard]] constexpr uint64_t indexKeyBytesPerLayerPage() const noexcept {
+    return uint64_t{kPageTokens} * indexDimension * 2;
+  }
+  [[nodiscard]] constexpr uint64_t indexPooledBytesPerLayerPage() const noexcept {
+    return uint64_t{kPageTokens} / kIndexBlockTokens * indexDimension * sizeof(float);
+  }
+  // The K/V bytes of one layer's page; the index bytes are apart.
   [[nodiscard]] constexpr uint64_t bytesPerLayerPage() const noexcept {
     return 2 * (dataBytesPerLayerPage() + scaleBytesPerLayerPage());
   }
+  [[nodiscard]] constexpr uint64_t indexBytesPerLayerPage() const noexcept {
+    return indexKeyBytesPerLayerPage() + indexPooledBytesPerLayerPage();
+  }
   [[nodiscard]] constexpr uint64_t bytesPerModelPage() const noexcept {
-    return uint64_t{attentionLayers} * bytesPerLayerPage();
+    return uint64_t{attentionLayers} * (bytesPerLayerPage() + indexBytesPerLayerPage());
   }
 
   // An extent holds a whole number of these pages, so that every tensor
@@ -152,12 +169,14 @@ struct Layout final {
   // needs only 1 or 2 pages. This is allocation geometry only; prefix
   // matching remains Page32 in both cases.
   [[nodiscard]] constexpr uint32_t extentAlignmentPages() const noexcept {
-    if (format == Format::BFloat16)
-      return static_cast<uint32_t>(
-          detail::pagesForAlignedRegion(dataBytesPerLayerPage()));
-    return static_cast<uint32_t>(detail::lcm(
-        detail::pagesForAlignedRegion(dataBytesPerLayerPage()),
-        detail::pagesForAlignedRegion(scaleBytesPerLayerPage())));
+    uint64_t pages = format == Format::BFloat16
+                         ? detail::pagesForAlignedRegion(dataBytesPerLayerPage())
+                         : detail::lcm(detail::pagesForAlignedRegion(dataBytesPerLayerPage()),
+                                       detail::pagesForAlignedRegion(scaleBytesPerLayerPage()));
+    if (indexDimension)
+      pages = detail::lcm(pages, detail::lcm(detail::pagesForAlignedRegion(indexKeyBytesPerLayerPage()),
+                                             detail::pagesForAlignedRegion(indexPooledBytesPerLayerPage())));
+    return static_cast<uint32_t>(pages);
   }
 
   // Extents hold whole alignment units, between half and one and a half

@@ -24,6 +24,9 @@ struct GdnStateLayout final {
   uint32_t recurrentGroups = 0;
   uint32_t recurrentRows = 0;
   uint32_t recurrentColumns = 0;
+  // State a family keeps beside its GDN layers' (Qwen3.8-Flash-Next's PLE
+  // convolution history), after them in the cell.
+  uint64_t auxiliaryBytes = 0;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
     return layers && convolutionHistory && convolutionChannels &&
@@ -44,7 +47,7 @@ struct GdnStateLayout final {
     return uint64_t{layers} * recurrentLayerBytes();
   }
   [[nodiscard]] constexpr uint64_t cellBytes() const noexcept {
-    return convolutionBytes() + recurrentBytes();
+    return convolutionBytes() + recurrentBytes() + alignUp(auxiliaryBytes);
   }
 
   bool operator==(const GdnStateLayout &) const = default;

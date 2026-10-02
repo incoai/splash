@@ -241,6 +241,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/LinearGguf.cpp \
 	runtime/ops/MoE.cpp \
 	runtime/ops/Normalization.cpp \
+	runtime/ops/Qwen4.cpp \
 	runtime/ops/PagedAttention.cpp \
 	runtime/ops/PageStorage.cpp \
 	runtime/ops/RoPE.cpp \
@@ -280,6 +281,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/GgufPreparation.cpp \
 	runtime/model/Qwen3_6Moe.cpp \
 	runtime/model/Qwen3_8.cpp \
+	runtime/model/Qwen4Exp.cpp \
 	runtime/model/QwenVision.cpp \
 	runtime/model/VisionPreparation.cpp \
 	runtime/model/VisionLoader.cpp \

@@ -82,7 +82,7 @@ inline void
 gdn_gate_phase(device const bfloat *recurrent, device const bfloat *packed,
                device const W *norm_weight, device bfloat *hidden, uint task,
                bool tiled, threadgroup float *scratch, uint thread_index,
-               uint lane, uint simd_group) {
+               uint lane, uint simd_group, bool sigmoid_gate = false) {
   constexpr uint Simdgroups = 4, ZOffset = ConvDim;
   static_assert(HeadDim == Simdgroups * 32, "one thread per dimension");
   uint token = task / ValueHeads;
@@ -99,6 +99,7 @@ gdn_gate_phase(device const bfloat *recurrent, device const bfloat *packed,
       bfloat(value * inverse * float(norm_weight[thread_index]));
   float gate = float(packed[token * PackedWidth + ZOffset + head * HeadDim +
                             thread_index]);
-  float silu = splash_silu(gate);
-  hidden[hidden_base + thread_index] = bfloat(float(normalized) * silu);
+  // Qwen3.5 gates by silu(z), Qwen3.8-Flash-Next by sigmoid(z).
+  float gated = sigmoid_gate ? splash_sigmoid(gate) : splash_silu(gate);
+  hidden[hidden_base + thread_index] = bfloat(float(normalized) * gated);
 }

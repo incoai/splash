@@ -19,25 +19,26 @@
     "q41": "4e00c1bb0f333029a59b745167f5be402e44d051a859504173b1ae1ce00f0d31",
     "mxfp4": "3665d78f8b738d4e139b21f44bb7a085b52835cb36e1906ea34e15267ca73537",
     "pq20": "c41444ea0f8afc3c9d3e4392b371b6f1d8e8ea3fc23c1a8b17f9a8ce11dda763",
-    "ggml-nvfp4": "957ccd043df3c08f72196aa488af08e87578ed3203e277a41fc8f6bae26cc86f"
+    "q51": "d7e5f8d29ae70dc48cc6548c13864a72a6829c1e34cc54b053b2e1d30e944790",
+    "ggml-nvfp4": "13d72463e33c2e103dc4dccc446a478c86ae3049555a5e831c4e418ed9aab6c4"
   },
   "gguf_images": {
     "dense": {
-      "target/layer-0.bin": "3cb6434604cdcae0d93b72844939421eff05f98cff74196392c2153a5c0b4ab3",
-      "target/layer-1.bin": "f7e1f9a7dec53a1a2396898a302d39e7877ee13bcb493f7240b7c9479df91bfe",
-      "target/head.bin": "568caf2ce1c20591bbb6da095f1e94b47f868addf0ca3865fede7bafe7486e36",
+      "target/layer-0.bin": "c03f94f50978577a794cb120ae56594317e4c276400e79da7814ac76ee5feace",
+      "target/layer-1.bin": "e67034a0f0faf58c95b4387293ec9718b29b57545ee213b8a24392479c3d72f4",
+      "target/head.bin": "208fff3c19817727793b769680ceed0a35f549ed78d37abc866dd18c2276ef9f",
       "target/embedding.bin": "6d17df18962f4941a0ce6538aa0092dba1073c78848a62f577a666b81a89e159"
     },
     "moe": {
-      "target/layer-0.bin": "70d9d2727f5a8883507b6f7c3680913f6f8c3c131fbb90b01bffa05e831b637e",
-      "target/head.bin": "3f61a8a408a40624b12f9564472930c655a84cdf5e1782191990f678fe80305c",
+      "target/layer-0.bin": "6575ec6e4d2c72f2a3b406d490a95d6e4fec0d79b8b2e9110d4948c442f1f449",
+      "target/head.bin": "cee4659abb8e830f64dc34ad7ecff5b7627ff3bdc81a299d3dd91ff90a7ebaa1",
       "target/embedding.bin": "86a749f41cab45849eb9a2753025779ef1c58e74842b65290534eff4e29403e9"
     }
   },
   "draft_images": {
-    "draft/layer-0.bin": "9f700c359015aa3ff675724ac96e27d387bd315fab822d330687d6efca08a4c9",
-    "draft/layer-1.bin": "2f5f7b1507c362cb8e8b4ec7eb2b66459ada7c01e18b4140abc7420deafbf921",
-    "draft/model.bin": "50532cd62688df5ca2fe846956ec11fa291eb49ecb1690a47a55b34e79a6fcd3"
+    "draft/layer-0.bin": "8637be24bbcd5a226af083bc03c2f1079e689438bf136e43fb0f91d46b9cb1fd",
+    "draft/layer-1.bin": "251c109c5eb6171450d65f640f7bb64a8a2302dcd505eaba446101528341896f",
+    "draft/model.bin": "f7668ca67754d696e89ee19793e726a5abf8db7b8e9d2ee68f9f03bb504da729"
   },
   "vision_image": "f1a165335c42384479f73d83e69146cfa46d4964d66ed13c663b158fed08cdd5"
 }

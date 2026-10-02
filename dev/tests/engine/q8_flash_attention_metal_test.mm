@@ -39,7 +39,7 @@ struct Shape {
   uint32_t fusedRows() const { return kRows * queryHeadsPerKvHead; }
   Layout layout() const { return {1, kvHeads, kHeadDimension}; }
 };
-constexpr std::array<Shape, 2> kShapes{{{4, 6, ""}, {2, 8, "_kv2_g8"}}};
+constexpr std::array<Shape, 3> kShapes{{{4, 6, ""}, {2, 8, "_kv2_g8"}, {2, 12, "_kv2_g12"}}};
 
 using splash::test::require;
 
@@ -415,6 +415,10 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
   // The kernel reaches the extents only through the page entries.
   for (id<MTLBuffer> extent : data.extents)
     [encoder useResource:extent usage:MTLResourceUsageRead];
+  // A GQA-12 split also binds QSA bitmaps; none here (every row causal).
+  const uint32_t noMask[2] = {0, 0};
+  [encoder setBuffer:partials offset:0 atIndex:8];
+  [encoder setBytes:noMask length:sizeof(noMask) atIndex:9];
   [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads, splits, width)
           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   [encoder setComputePipelineState:reduce];

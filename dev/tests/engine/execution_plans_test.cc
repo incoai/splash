@@ -271,8 +271,8 @@ void invalidLookupsAndContextEdges() {
             "a MoE decode of no lanes or past a batch was accepted");
   rejects([&] { (void)plans.moePrefillWorkspace(routedShape, 0); }, "invalid MoE prefill rows",
           "a MoE prefill workspace of no rows was accepted");
-  rejects([&] { (void)plans.gateUpWorkspace({256, 64}); }, "invalid linear decode workload",
-          "a gate/up workspace of a partial 256-input block was accepted");
+  rejects([&] { (void)plans.gateUpWorkspace({256, 32}); }, "invalid linear matrix",
+          "a gate/up workspace of a partial 64-input span was accepted");
   rejects([&] { (void)plans.draftAttentionWorkspacePerLane({}); },
           "unsupported compiled draft attention shape", "a draft workspace of an empty shape was accepted");
   std::array<uint32_t, 1> edge{kv::kMaximumPhysicalTokens - 8};

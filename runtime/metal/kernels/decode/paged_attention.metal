@@ -1,5 +1,6 @@
 #include "metal/kernels/common/lane_bindings.h"
 #include "metal/kernels/common/paged_attention_tile.h"
+#include "metal/abi/Qwen4.h"
 
 // Verify tiles process one lane's eight rows per KV head and history split.
 // Verify and prefill share the device-operand page loop in paged_attention_tile.h.
@@ -100,6 +101,39 @@ PAGED_VERIFY_SPLIT(verify_attention_q8_split_kv2_g8, 2, 8, int8_t)
 // BF16 shares the page loop and reduction, without quantization scales.
 PAGED_VERIFY_SPLIT(verify_attention_bf16_split, 4, 6, bfloat)
 PAGED_VERIFY_SPLIT(verify_attention_bf16_split_kv2_g8, 2, 8, bfloat)
+// Qwen3.8-Flash-Next's GQA-12 tiles also read the QSA bitmaps: a lane's
+// eight rows from bitmap row 8 lane.
+#define PAGED_VERIFY_SPLIT_MASKED(Name, Heads, Group, CacheElement)            \
+  kernel void Name(                                                            \
+      device bfloat *queries [[buffer(0)]],                                    \
+      device float *partials [[buffer(1)]],                                    \
+      device float *statistics [[buffer(2)]],                                  \
+      device const SplashKvPage *page_table0 [[buffer(3)]],                    \
+      device const SplashKvPage *page_table1 [[buffer(4)]],                    \
+      device const SplashKvPage *page_table2 [[buffer(5)]],                    \
+      device const SplashKvPage *page_table3 [[buffer(6)]],                    \
+      constant SplashVerifyAttentionParams *params [[buffer(7)]],              \
+      device const uint *block_mask [[buffer(8)]],                             \
+      constant Qwen4QsaMaskParams &mask [[buffer(9)]],                         \
+      uint3 group [[threadgroup_position_in_grid]],                            \
+      uint thread_index [[thread_index_in_threadgroup]]) {                     \
+    PAGED_VERIFY_SCRATCH(Group)                                                \
+    PAGED_VERIFY_TILE_AT(Heads, Group)                                         \
+    splash_paged_attention_tile<Heads, Group, SPLASH_TARGET_VERIFY_ROWS,       \
+                                CacheElement>(                                 \
+        tile.queries, tile.page_table, params[group.z].kv, tile.kv_head,       \
+        tile.committed_tokens, SPLASH_TARGET_VERIFY_ROWS, tile.splits,         \
+        tile.split, partials, statistics, tile.slot, scores, probabilities,    \
+        row_max, row_sum, previous_scale, &rescale, thread_index,              \
+        mask.mask_words ? block_mask + ulong(mask.row0 + group.z *             \
+                                             SPLASH_TARGET_VERIFY_ROWS) *      \
+                                           mask.mask_words                     \
+                        : nullptr,                                             \
+        mask.mask_words);                                                      \
+  }
+PAGED_VERIFY_SPLIT_MASKED(verify_attention_q8_split_kv2_g12, 2, 12, int8_t)
+PAGED_VERIFY_SPLIT_MASKED(verify_attention_bf16_split_kv2_g12, 2, 12, bfloat)
+#undef PAGED_VERIFY_SPLIT_MASKED
 #undef PAGED_VERIFY_SPLIT
 #undef PAGED_VERIFY_TILE_AT
 #undef PAGED_VERIFY_SCRATCH
@@ -148,4 +182,5 @@ inline void splash_verify_attention_reduce_phase(
   }
 PAGED_VERIFY_REDUCE(verify_attention_reduce, 4, 6)
 PAGED_VERIFY_REDUCE(verify_attention_reduce_kv2_g8, 2, 8)
+PAGED_VERIFY_REDUCE(verify_attention_reduce_kv2_g12, 2, 12)
 #undef PAGED_VERIFY_REDUCE

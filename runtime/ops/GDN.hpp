@@ -16,6 +16,8 @@ struct GdnShape final {
   uint32_t headDimension = 0;
   uint32_t convolutionDimension = 0;
   uint32_t packedWidth = 0;
+  // Gates the normalized output by sigmoid(z) (Qwen3.8-Flash-Next), not silu(z).
+  bool sigmoidGate = false;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
     return keyHeads && valueHeads && valueHeads % keyHeads == 0 &&

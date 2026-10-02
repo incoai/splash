@@ -76,11 +76,13 @@ std::filesystem::path requireModelRoot(std::string_view argument) {
       std::filesystem::canonical(std::filesystem::path(argument), error);
   if (error || !std::filesystem::is_directory(root, error))
     throw UsageError("MODEL_DIRECTORY must name an existing directory");
-  for (const char *role : {"target", "draft"}) {
-    if (!std::filesystem::is_directory(root / role, error))
-      throw UsageError(
-          "MODEL_DIRECTORY must hold the model's target/ and draft/ directories");
-  }
+  // A family without a DFlash2 draft (Qwen3.8-Flash-Next) has no draft/
+  // directory; the model's descriptor says whether it needs one.
+  if (!std::filesystem::is_directory(root / "target", error) ||
+      (std::filesystem::exists(root / "draft", error) &&
+       !std::filesystem::is_directory(root / "draft", error)))
+    throw UsageError(
+        "MODEL_DIRECTORY must hold the model's target/ and draft/ directories");
   return root;
 }
 

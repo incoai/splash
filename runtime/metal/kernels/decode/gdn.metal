@@ -216,7 +216,7 @@ template <uint KeyHeads, uint ValueHeads, uint HeadDim, uint ConvDim,
 inline void gdn_decode_gate(threadgroup GdnDecodeShared<HeadDim> &shared,
                             device const bfloat *packed,
                             device const W *norm_weight, device bfloat *hidden,
-                            bool tiled, uint value_head, uint lane,
+                            bool tiled, bool sigmoid_gate, uint value_head, uint lane,
                             uint token) {
 #pragma clang fp reassociate(off)
   constexpr uint Groups = HeadDim / 32;
@@ -242,7 +242,8 @@ inline void gdn_decode_gate(threadgroup GdnDecodeShared<HeadDim> &shared,
     const uint dim = 32 * g + lane;
     const bfloat normalized = bfloat((value[g] * inverse) * float(weight[g]));
     const float z = float(gate[g]);
-    const bfloat gated = bfloat((float(normalized) * z) /
+    // Qwen3.5 gates by silu(z), Qwen3.8-Flash-Next by sigmoid(z).
+    const bfloat gated = bfloat((float(normalized) * (sigmoid_gate ? 1.0f : z)) /
                                 (1.0f + fast::exp2(-1.44269504089f * z)));
     hidden[hidden_base + dim] = gated;
     shared.rows[token * HeadDim + dim] = gated;
@@ -381,6 +382,8 @@ inline void gdn_commit_prefix_batch_phase(
 
 GDN_COMMIT_ENTRY(verify_gdn_commit, 16, 48, 128, 10240, 16640)
 GDN_COMMIT_ENTRY(verify_gdn_commit_vh32, 16, 32, 128, 8192, 12544)
+// Qwen3.8-Flash-Next packs the 48-head rows to 16512 columns.
+GDN_COMMIT_ENTRY(verify_gdn_commit_p16512, 16, 48, 128, 10240, 16512)
 #undef GDN_COMMIT_ENTRY
 
 // Grid {value heads, lanes}.
@@ -427,10 +430,10 @@ inline void gdn_decode_batch_phase(
   gdn_decode_scan<HeadDim, RowsInFlight>(state_in, state_out, shared, group.x,
                                          lane, simd_group);
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  const bool tiled = params.tiled_heads != 0;
+  const bool tiled = (params.tiled_heads & 1) != 0;
   gdn_decode_gate<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth>(
-      shared, packed, gdn_norm_weight, lane_hidden, tiled, group.x, lane,
-      simd_group);
+      shared, packed, gdn_norm_weight, lane_hidden, tiled,
+      (params.tiled_heads & GDN_SIGMOID_GATE) != 0, group.x, lane, simd_group);
   if (table) {
     // Each group owns this head for all eight rows; each simdgroup writes
     // the table of the row it just gated.
@@ -492,6 +495,11 @@ GDN_DECODE_ENTRY(verify_gdn_fused_f32, 16, 48, 128, 10240, 16640, float)
 GDN_DECODE_ENTRY(verify_gdn_fused_vh32_f32, 16, 32, 128, 8192, 12544, float)
 GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table16_f32, 16, 48, 128, 10240, 16640, gguf_sg::Table16, float)
 GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table16_vh32_f32, 16, 32, 128, 8192, 12544, gguf_sg::Table16, float)
+// Qwen3.8-Flash-Next (16512-column rows).
+GDN_DECODE_ENTRY(verify_gdn_fused_p16512, 16, 48, 128, 10240, 16512, bfloat)
+GDN_DECODE_ENTRY(verify_gdn_fused_p16512_f32, 16, 48, 128, 10240, 16512, float)
+GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table16_p16512, 16, 48, 128, 10240, 16512, gguf_sg::Table16, bfloat)
+GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table16_p16512_f32, 16, 48, 128, 10240, 16512, gguf_sg::Table16, float)
 #undef GDN_DECODE_ENTRY
 #undef GDN_DECODE_TABLE_ENTRY
 #undef GDN_DECODE_BODY

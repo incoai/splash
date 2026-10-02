@@ -27,7 +27,7 @@ enum Fmt { Q4K = GGUF_FMT_Q4K, IQ4XS = GGUF_FMT_IQ4XS, IQ4NL = GGUF_FMT_IQ4NL, Q
            Q3K = GGUF_FMT_Q3K, Q80 = GGUF_FMT_Q80, IQ3S = GGUF_FMT_IQ3S, Q2K = GGUF_FMT_Q2K, IQ3XXS = GGUF_FMT_IQ3XXS,
            IQ2XXS = GGUF_FMT_IQ2XXS, IQ2XS = GGUF_FMT_IQ2XS, IQ2S = GGUF_FMT_IQ2S, IQ1S = GGUF_FMT_IQ1S,
            IQ1M = GGUF_FMT_IQ1M, Q40 = GGUF_FMT_Q40, Q41 = GGUF_FMT_Q41, MXFP4 = GGUF_FMT_MXFP4,
-           PQ20 = GGUF_FMT_PQ20, NVFP4 = GGUF_FMT_NVFP4, FP8 = GGUF_FMT_FP8, FMT_COUNT = GGUF_FMT_COUNT };
+           PQ20 = GGUF_FMT_PQ20, Q51 = GGUF_FMT_Q51, NVFP4 = GGUF_FMT_NVFP4, FP8 = GGUF_FMT_FP8, FMT_COUNT = GGUF_FMT_COUNT };
 inline const char *fmtName(uint32_t f) { return kQuantFormats[f].name; }
 // The format of kQuantFormats name `name`, FMT_COUNT for none.
 inline Fmt fmtNamed(const std::string &name) {
@@ -140,7 +140,7 @@ inline std::vector<float> blockNvfp4Values(const std::vector<uint8_t> &rows) {
   return values;
 }
 
-// N native rows of random bytes whose half scales (d, and dmin or m for Q4_K, Q5_K, Q2_K and Q4_1) are scale(), and
+// N native rows of random bytes whose half scales (d, and dmin or m for Q4_K, Q5_K, Q2_K, Q4_1 and Q5_1) are scale(), and
 // MXFP4's exponents the power of two at or below it.
 template <class Scale>
 std::vector<uint8_t> makeNative(Fmt f, uint32_t N, uint32_t K, std::mt19937 &rng, Scale scale) {
@@ -160,7 +160,7 @@ std::vector<uint8_t> makeNative(Fmt f, uint32_t N, uint32_t K, std::mt19937 &rng
     } else {
       memcpy(blk + off, &d, 2);
     }
-    if (f == Q4K || f == Q5K || f == Q2K || f == Q41) { const uint16_t m = scale(); memcpy(blk + off + 2, &m, 2); }
+    if (f == Q4K || f == Q5K || f == Q2K || f == Q41 || f == Q51) { const uint16_t m = scale(); memcpy(blk + off + 2, &m, 2); }
   }
   return v;
 }
@@ -245,7 +245,7 @@ inline std::uniform_real_distribution<float> scaleRange(Fmt f) {
     return std::uniform_real_distribution<float>(top / 4, top);
   }
   switch (f) {
-    case Q4K: case Q5K: case Q3K: case IQ4NL: case Q80: case Q2K: case Q40: case Q41: case MXFP4:
+    case Q4K: case Q5K: case Q3K: case IQ4NL: case Q80: case Q2K: case Q40: case Q41: case MXFP4: case Q51:
       return std::uniform_real_distribution<float>(0.0005f, 0.004f);
     case IQ4XS: return std::uniform_real_distribution<float>(0.00002f, 0.00015f);
     case Q6K: return std::uniform_real_distribution<float>(0.00002f, 0.0001f);
@@ -473,6 +473,17 @@ inline void groupPack(Fmt f, const uint8_t *row, uint32_t g, float vals[32], uin
       if (f == MXFP4) packBits(lo, 4, p0); else packPairs(lo, p0);
       return;
     }
+    case Q51: {   // block_q5_1 {d, m, qh[4], qs[16]}
+      const uint8_t *qs = blk + 8;
+      uint16_t d16, m16; uint32_t qh; memcpy(&d16, blk, 2); memcpy(&m16, blk + 2, 2); memcpy(&qh, blk + 4, 4);
+      for (int k = 0; k < 32; ++k) {
+        const uint8_t l4 = k < 16 ? (qs[k] & 15) : (qs[k - 16] >> 4), h1 = (qh >> k) & 1;
+        lo[quant_slot(k)] = l4;
+        hi[quant_slot(k)] = h1;
+        vals[k] = (l4 + 16 * h1) * h2f(d16) + h2f(m16);
+      }
+      packPairs(lo, p0); packBits(hi, 1, p1); return;
+    }
     // The IQ3_XXS, IQ2 and IQ1 planes are the group's native bytes (metal/abi/QuantFormat.h).
     case IQ3XXS: {
       const uint8_t *qs = blk + 2 + 8 * j;
@@ -551,7 +562,7 @@ inline void metaPack(Fmt f, const uint8_t *row, uint32_t unit, uint8_t *dst) {
   switch (f) {
     // The block's leading fields.
     case Q4K: case Q5K: case IQ4XS: case IQ4NL: case Q80: case IQ3S: case IQ3XXS: case IQ2XXS: case IQ2XS: case IQ2S:
-    case IQ1S: case Q40: case Q41: case MXFP4: case PQ20:
+    case IQ1S: case Q40: case Q41: case MXFP4: case PQ20: case Q51:
       memcpy(dst, blk, fi.meta_bytes); return;
     case Q6K: memcpy(dst, blk + kQ6KScales, 16); memcpy(dst + 16, blk + kQ6KD, 2); dst[18] = dst[19] = 0; return;
     case NVFP4: case FP8: memcpy(dst, blk, fi.meta_bytes); return;   // the scales and g, or g
@@ -614,7 +625,7 @@ inline bool ggmlDequantize(void *ggml, Fmt f, const std::vector<uint8_t> &native
     "dequantize_row_q6_K", "dequantize_row_q3_K", "dequantize_row_q8_0", "dequantize_row_iq3_s",
     "dequantize_row_q2_K", "dequantize_row_iq3_xxs", "dequantize_row_iq2_xxs", "dequantize_row_iq2_xs",
     "dequantize_row_iq2_s", "dequantize_row_iq1_s", "dequantize_row_iq1_m", "dequantize_row_q4_0",
-    "dequantize_row_q4_1", "dequantize_row_mxfp4", "dequantize_row_pq2_0"};
+    "dequantize_row_q4_1", "dequantize_row_mxfp4", "dequantize_row_pq2_0", "dequantize_row_q5_1"};
   static_assert(std::size(symbols) == GGUF_FMT_AF2G32, "a GGML dequantize_row_* symbol per GGUF format");
   if (quant_loader_format(f)) { error = std::string("GGML has no ") + fmtName(f); return false; }
   return ggmlDequantizeRows(ggml, symbols[f], native,

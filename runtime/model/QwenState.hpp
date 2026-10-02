@@ -21,6 +21,8 @@ struct GdnParityBuffers final {
   metal::MetalBuffer stateBase;
   std::vector<metal::MetalBuffer> convolutionLayers;
   std::vector<metal::MetalBuffer> recurrentLayers;
+  // GdnStateLayout::auxiliaryBytes after the GDN layers' state; empty when 0.
+  metal::MetalBuffer auxiliary;
 };
 
 class QwenGdnCell final {
