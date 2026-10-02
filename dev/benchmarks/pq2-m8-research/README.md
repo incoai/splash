@@ -63,7 +63,10 @@ cases in a temporary directory, and recomputes every V027 aggregate from all
 32 archived samples. It does not initialize Metal or load a model. Validation
 is not a new GPU correctness or performance qualification.
 
-The actual analyzer and its original KAT are in `source/v025`; all V006,
+The original analyzer and KAT are byte-exact `.py.txt` snapshots in
+`source/v025`; the validator restores their original filenames only in its
+temporary directory. They are historical source, not shipping Python modules.
+All V006,
 V007 and V027 timing samples and independent reviews are in `evidence`.
 Historical `PENDING_ROOT_REVIEW` fields in analyzer output remain unchanged;
 subsequent accepted root reviews supply the final status.

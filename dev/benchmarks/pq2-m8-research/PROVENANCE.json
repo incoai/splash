@@ -67,14 +67,14 @@
       "copy_byte_exact": true
     },
     {
-      "path": "source/v025/forward_analysis.py",
+      "path": "source/v025/forward_analysis.py.txt",
       "bytes": 4734,
       "sha256": "367173bdef6f0aa1a54b4faa6033274869f34019d3d889e06927d46135527175",
       "source": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v025-forward-down-controller-prep/forward_analysis.py",
       "copy_byte_exact": true
     },
     {
-      "path": "source/v025/kat1.py",
+      "path": "source/v025/kat1.py.txt",
       "bytes": 3660,
       "sha256": "c9cf5d78143f457b6ffa11dce61ab5d04ee3bf74751cb2025b071ef89c14b824",
       "source": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v025-forward-down-controller-prep/kat1.py",
