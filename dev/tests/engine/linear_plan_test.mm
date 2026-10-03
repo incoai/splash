@@ -947,6 +947,43 @@ void ggufPlans() {
           "GGUF single-tensor decode plan");
   for (const SplitAnchor &anchor : kStagedSplitAnchors)
     requireAnchorSplits(anchorPlan(10, anchor), anchor, "GGUF staged split policy");
+  // Apple11 splits reductions of at least 16384 inputs in its low-bit formats
+  // in four and the heavy K-quants while fewer than five threadgroups per core,
+  // at every width and in prefill chunks of up to 32 rows; other formats and
+  // shorter reductions keep the fitted tier. The arenas, sized from shapes
+  // alone, hold these plans.
+  for (const auto &[cores, format, n, k, splits] :
+       std::initializer_list<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>>{
+           {12, GGUF_FMT_PQ20, 5120, 17408, 4}, {12, GGUF_FMT_IQ2XXS, 5120, 17408, 4},
+           {12, GGUF_FMT_IQ3XXS, 5120, 17408, 4}, {12, GGUF_FMT_Q3K, 5120, 17408, 4},
+           {10, GGUF_FMT_PQ20, 5120, 17408, 4}, {40, GGUF_FMT_PQ20, 5120, 17408, 4},
+           {12, GGUF_FMT_Q4K, 5120, 17408, 1}, {12, GGUF_FMT_IQ3S, 5120, 17408, 1},
+           {12, GGUF_FMT_Q6K, 5120, 17408, 1}, {16, GGUF_FMT_IQ3S, 5120, 17408, 2},
+           {12, GGUF_FMT_Q5K, 2048, 4096, 2}, {12, GGUF_FMT_Q6K, 2048, 4096, 2},
+           {16, GGUF_FMT_Q6K, 2048, 4096, 4}, {12, GGUF_FMT_IQ4XS, 2048, 4096, 4},
+           {12, GGUF_FMT_Q5K, 512, 2048, 4}, {12, GGUF_FMT_Q4K, 5120, 6144, 1},
+           {20, GGUF_FMT_Q4K, 5120, 6144, 2},
+           {12, GGUF_FMT_PQ20, 5120, 8192, 1}, {12, GGUF_FMT_PQ20, 5120, 12288, 1},
+           {12, GGUF_FMT_PQ20, 5120, 16384, 4}, {12, GGUF_FMT_PQ20, 5120, 6144, 1},
+           {12, GGUF_FMT_PQ20, 17408, 5120, 1}, {12, GGUF_FMT_PQ20, 2048, 4096, 4},
+           {12, GGUF_FMT_PQ20, 248320, 5120, 1}}) {
+    const Linear m6 = gpu(11, cores);
+    for (const uint32_t rows : {8U, 32U}) {
+      const LinearPlan decode = m6.plan({{n, k}, rows, LinearPhase::Decode, LinearEpilogue::Residual},
+                                        blockProjection(n, k, 1, format));
+      const LinearPlan chunk = m6.plan({{n, k}, rows, LinearPhase::Prefill, LinearEpilogue::Residual},
+                                       blockProjection(n, k, 1, format));
+      require(decode.configuration().splits == splits && chunk.configuration().splits == splits,
+              "Apple11 GGUF split classes");
+      const LinearScratchSize decodeBound = m6.decodeScratchSize(decode.workload()),
+                              prefillBound = m6.prefillScratchSize({n, k, WeightLayout::Block32});
+      require(decodeBound.partials >= decode.scratchSize().partials &&
+                  decodeBound.counters >= decode.scratchSize().counters &&
+                  prefillBound.partials >= chunk.scratchSize().partials &&
+                  prefillBound.counters >= chunk.scratchSize().counters,
+              "Apple11 GGUF arena bound below a plan");
+    }
+  }
   const LinearPlan gateUpPlan = linear.plan({{512, 2048}, 16, LinearPhase::Decode, LinearEpilogue::GateUp},
                                             blockProjection(512, 2048, 1));
   require(gateUpPlan.partialSums() == 4 && gateUpPlan.gateScratchBytes() == gateBytes(gateUpPlan) &&
@@ -1125,16 +1162,21 @@ void ggufCoreLaws() {
   constexpr std::array<uint32_t, 16> widths{256, 512, 768, 1024, 1536, 2048, 3072, 4096, 5120,
                                             6144, 8192, 12288, 16384, 24576, 65536, 248320};
   constexpr std::array<uint32_t, 11> inputs{256, 512, 1024, 2048, 3072, 4096, 5120, 6144, 8192, 12288, 17408};
-  for (const uint32_t family : {9U, 10U, 11U})
+  // Family 11 once per split class: heavy (Q4_K), long-reduction (PQ2_0), fitted (IQ3_S).
+  for (const auto &[family, format] :
+       {std::pair{9U, uint32_t(GGUF_FMT_Q4K)}, std::pair{10U, uint32_t(GGUF_FMT_Q4K)},
+        std::pair{11U, uint32_t(GGUF_FMT_Q4K)}, std::pair{11U, uint32_t(GGUF_FMT_PQ20)},
+        std::pair{11U, uint32_t(GGUF_FMT_IQ3S)}})
     for (uint32_t cores = 0; cores <= 128; ++cores) {
       const Linear linear = gpu(family, cores), more = gpu(family, cores + 1), twice = gpu(family, 2 * cores);
       for (const uint32_t n : widths)
         for (const uint32_t k : inputs)
           for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp})
             for (uint32_t segments = 1; segments <= (epilogue == LinearEpilogue::None ? 3U : 1U); ++segments) {
-              const Projection p = blockProjection(n, k, segments);
+              const Projection p = blockProjection(n, k, segments, format);
               const auto plan = [&](const Linear &l, uint32_t width, uint32_t rows) {
-                return l.plan({{width, k}, rows, LinearPhase::Decode, epilogue}, blockProjection(width, k, segments));
+                return l.plan({{width, k}, rows, LinearPhase::Decode, epilogue},
+                              blockProjection(width, k, segments, format));
               };
               const LinearPlan one = plan(linear, n, 8);
               const LinearConfig c = one.configuration();

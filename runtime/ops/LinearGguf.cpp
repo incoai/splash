@@ -42,12 +42,14 @@ std::string prefillKernel(const char *format, char epilogue) {
 struct SplitTier {
   uint32_t threadgroups;
   uint32_t inputs;
+  uint32_t minimumInputs = 0;  // the tier asks only for reductions of at least this many inputs
 };
 uint32_t decodeSplits(uint32_t n, uint32_t k, uint32_t cores, std::span<const SplitTier> tiers) {
   const uint64_t grid = n / GGUF_TILE_COLUMNS;
   uint32_t splits = 1;
   const auto asks = [&](const SplitTier &t) {
-    return grid * splits < uint64_t{t.threadgroups} * cores && k / (2 * splits) >= t.inputs;
+    return grid * splits < uint64_t{t.threadgroups} * cores && k / (2 * splits) >= t.inputs &&
+           k >= t.minimumInputs;
   };
   while (splits < LinearConfig::kMaximumSplits && std::any_of(tiers.begin(), tiers.end(), asks)) splits *= 2;
   return splits;
@@ -77,15 +79,81 @@ constexpr SplitTier kRegisterTiers[] = {{4, 256}, {32, 1024}};
 // per core with 1024 inputs and unsplit fused and gate/up kernels: 6.4%).
 constexpr SplitTier kStagedTiers[] = {{6, 512}};
 
+// Apple11 (M6) adds a tier for long reductions in the low-bit formats of
+// apple11LongFormat: 24 threadgroups per core, 4096 inputs per partition,
+// reductions of at least 16384 inputs. On a 12-core M6 it takes the 27B down
+// projection (5120 x 17408, unsplit 6.7 threadgroups per core) to four
+// partitions. Measured there with the projection's input written by a producer
+// kernel just before it: four partitions take 3-10% less time than one at one
+// lane in those formats and between 3% less and 1% more at four lanes; two
+// partitions take 3-13% more than one. In Q4_K and Q6_K four take 4-13% more
+// and in IQ3_S 2% more at one lane, so those formats keep the fitted tier.
+// Whole model on the same M6 (backend_regression against main, GPU time per
+// decode step at one to four lanes): Bonsai 2 27B PQ2_0 -1.4%, -0.7%, +0.3%,
+// +0.7%; Qwen3.8-27B UD-IQ3_XXS -1.1%, -1.1%, -0.1%, -0.1%.
+constexpr SplitTier kApple11LongTiers[] = {{6, 512}, {24, 4096, 16384}};
+
+// Apple11 splits the heavier K-quants (apple11HeavyFormat) while fewer than
+// five threadgroups per core, not six. On the 12-core M6 the 35B output
+// projections (2048 x 4096) in Q5_K and Q6_K take 10-18% less time in two
+// partitions (5.3 threadgroups per core) than in the fitted tier's four (10.7)
+// at one to four lanes, with the input written just before; the 27B output and
+// down projections in Q4_K and Q6_K (6.7 per core unsplit) are fastest unsplit.
+// Whole model on the same M6 (backend_regression against main, GPU time per
+// decode step at one to four lanes): Qwen3.6-35B-A3B UD-Q2_K_XL -0.8%, -0.9%,
+// -0.6%, -1.0%.
+constexpr SplitTier kApple11HeavyTiers[] = {{5, 512}};
+
+// Apple11's split classes: the fitted tier, the long-reduction tier of the
+// low-bit formats, or the heavy K-quants' tier.
+enum class Apple11Splits { Fitted, Long, Heavy };
+
 // The staged tile's tiers on a family. Apple9 cores take as many of its
 // threadgroups as of the register tile's, and its tiers: on a 40-core M3 Max
 // over the 27B and 35B dense shapes at one to four lanes they come within
 // 0-9% of each shape's fastest split (20% at one lane on 2048 x 512, a
 // 0.012 ms projection), where the fitted tier above is 13-27% slower on
 // 17408 x 5120 and 12288 x 5120 and 50% on 2048 x 512.
-std::span<const SplitTier> stagedTiers(uint32_t appleGpuFamily) noexcept {
+std::span<const SplitTier> stagedTiers(uint32_t appleGpuFamily,
+                                       Apple11Splits splits = Apple11Splits::Fitted) noexcept {
   if (appleGpuFamily == 9) return kRegisterTiers;
+  if (appleGpuFamily == 11 && splits == Apple11Splits::Long) return kApple11LongTiers;
+  if (appleGpuFamily == 11 && splits == Apple11Splits::Heavy) return kApple11HeavyTiers;
   return kStagedTiers;
+}
+
+// The heavier K-quants of Apple11's heavy tier (see kApple11HeavyTiers).
+bool apple11HeavyFormat(uint32_t format) noexcept {
+  return format == GGUF_FMT_Q4K || format == GGUF_FMT_Q5K || format == GGUF_FMT_Q6K;
+}
+
+// The formats of Apple11's long-reduction tier (see kApple11LongTiers).
+bool apple11LongFormat(uint32_t format) noexcept {
+  switch (format) {
+  case GGUF_FMT_PQ20: case GGUF_FMT_IQ1S: case GGUF_FMT_IQ1M: case GGUF_FMT_IQ2XXS: case GGUF_FMT_IQ2XS:
+  case GGUF_FMT_IQ2S: case GGUF_FMT_IQ3XXS: case GGUF_FMT_Q2K: case GGUF_FMT_Q3K: return true;
+  default: return false;
+  }
+}
+
+// A plan's Apple11 split class: Long when every quantized segment is in a
+// format of apple11LongFormat, Heavy when every one is in a format of
+// apple11HeavyFormat, else the fitted tier.
+Apple11Splits apple11Splits(std::span<const Projection *const> projections) {
+  bool quantized = false, low = true, heavy = true;
+  for (const Projection *p : projections) {
+    if (!p) continue;
+    for (const QuantizedSegment &s : p->blocks().segments) {
+      if (s.isFloat()) continue;
+      quantized = true;
+      low = low && apple11LongFormat(s.formatId);
+      heavy = heavy && apple11HeavyFormat(s.formatId);
+    }
+  }
+  return !quantized ? Apple11Splits::Fitted
+       : low        ? Apple11Splits::Long
+       : heavy      ? Apple11Splits::Heavy
+                    : Apple11Splits::Fitted;
 }
 
 // The decode tile configurations over an n x k matrix on `cores` cores.
@@ -93,9 +161,10 @@ LinearConfig registerDecode(uint32_t n, uint32_t k, uint32_t cores) {
   return {LinearTile::GgufRegister, n / GGUF_TILE_COLUMNS, LinearSimdgroups::Four,
           decodeSplits(n, k, cores, kRegisterTiers)};
 }
-LinearConfig stagedDecode(uint32_t n, uint32_t k, uint32_t cores, uint32_t appleGpuFamily) {
+LinearConfig stagedDecode(uint32_t n, uint32_t k, uint32_t cores, uint32_t appleGpuFamily,
+                          Apple11Splits splits = Apple11Splits::Fitted) {
   return {LinearTile::GgufStaged, n / GGUF_TILE_COLUMNS, LinearSimdgroups::Two,
-          decodeSplits(n, k, cores, stagedTiers(appleGpuFamily))};
+          decodeSplits(n, k, cores, stagedTiers(appleGpuFamily, splits))};
 }
 
 // Whether Apple9 decodes a plan's projections (a gate/up plan's two) on the
@@ -250,9 +319,17 @@ LinearScratchSize LinearPlan::blockScratchSize() const noexcept {
 LinearScratchSize Linear::prefillScratchSize(ProjectionShape shape) const {
   LinearScratchSize bound;
   for (uint32_t rows = 1; rows <= kMaximumDecodeTileRows; ++rows)
-    for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate})
-      bound.include(
-          plan({{shape.outputSize, shape.inputSize}, rows, LinearPhase::Prefill, epilogue, shape.layout}).scratchSize());
+    for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate}) {
+      const LinearWorkload w{{shape.outputSize, shape.inputSize}, rows, LinearPhase::Prefill, epilogue, shape.layout};
+      bound.include(plan(w).scratchSize());
+      // Apple11's long-reduction tier depends on the formats, which a shape
+      // does not name: bound its chunks too.
+      if (appleGpuFamily_ == 11 && shape.layout == WeightLayout::Block32)
+        bound.include(LinearPlan(w, {LinearTile::GgufStaged, 0, LinearSimdgroups::Two,
+                                     decodeSplits(shape.outputSize, shape.inputSize, gpuCores_,
+                                                  stagedTiers(appleGpuFamily_, Apple11Splits::Long))})
+                          .scratchSize());
+    }
   return bound;
 }
 
@@ -267,21 +344,24 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
   // that is 1.8-2.9x faster on a 16-core M5 Pro (its neural accelerator pads
   // 8 rows to 16) and 1.1-2.8x on a 40-core M3 Max; the 27B down and output
   // projections split in two gain 24-37% more on the 16-core M5 Pro.
+  const Apple11Splits splits = appleGpuFamily_ == 11 ? apple11Splits(projections) : Apple11Splits::Fitted;
   if (w.phase == LinearPhase::Prefill)
     return w.rows <= kMaximumDecodeTileRows
         ? LinearConfig{LinearTile::GgufStaged, 0, LinearSimdgroups::Two,
-                       decodeSplits(n, k, gpuCores_, stagedTiers(appleGpuFamily_))}
+                       decodeSplits(n, k, gpuCores_, stagedTiers(appleGpuFamily_, splits))}
         : LinearConfig{LinearTile::GgufStaged, 0, LinearSimdgroups::Four};
   // Apple9 runs matrix operations on the FP32 pipe, so the exact register
   // kernel beats staging but for the projections apple9Stages names.
   if (appleGpuFamily_ == 9 && !apple9Stages(w, projections)) return registerDecode(n, k, gpuCores_);
-  return stagedDecode(n, k, gpuCores_, appleGpuFamily_);
+  return stagedDecode(n, k, gpuCores_, appleGpuFamily_, splits);
 }
 
 LinearScratchSize Linear::ggufDecodeScratchSize(LinearWorkload w) const {
   const auto [n, k] = w.matrix;
   LinearScratchSize size = LinearPlan(w, baseline(w)).scratchSize();
   if (appleGpuFamily_ == 9) size.include(LinearPlan(w, stagedDecode(n, k, gpuCores_, appleGpuFamily_)).scratchSize());
+  if (appleGpuFamily_ == 11)
+    size.include(LinearPlan(w, stagedDecode(n, k, gpuCores_, appleGpuFamily_, Apple11Splits::Long)).scratchSize());
   return size;
 }
 
