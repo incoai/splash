@@ -38,6 +38,16 @@ inline ulong splash_current_value_index(uint stride, uint head, uint token,
   return (ulong(head) * SplashQ8HeadDimension + dimension) * stride + token;
 }
 
+// Squeezed verify-store base (RFC 188, undispatched): with squeezed=true
+// every lane addresses the B=1 verify slice at lane 0's chunk base, so the
+// fused Q/K prework can write K/V in place instead of materializing a
+// per-lane concat copy first. Host mirror: chunkBaseForLane in
+// Rfc188InPlaceKv.hpp — keep the two in sync.
+inline ulong splash_chunk_base_for_lane(ulong lane_tensor_stride, uint batch,
+                                        bool squeezed) {
+  return (squeezed ? 0UL : ulong(batch)) * lane_tensor_stride;
+}
+
 // One lane per dimension stores a current row in its final page slot.
 // INT8 derives a per-row scale; BF16 copies the original bits. Slots are
 // addressed inside the head's slab of the page: the page index functions at
