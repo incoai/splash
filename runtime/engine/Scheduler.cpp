@@ -360,36 +360,73 @@ uint32_t Scheduler::prefillBudget(
   return maximum;
 }
 
-std::optional<BatchPlan> Scheduler::nextDecode(std::span<const uint64_t> excluded) const {
-  std::vector<const Request *> ready;
-  for (const auto &[id, request] : requests_) {
-    if (request.phase == Phase::Decode && !listed(excluded, id))
-      ready.push_back(&request);
-  }
-  if (ready.empty())
-    return std::nullopt;
-  std::sort(ready.begin(), ready.end(), [](const Request *a, const Request *b) {
+std::optional<BatchPlan>
+Scheduler::nextDecode(std::span<const uint64_t> excluded) const {
+  const auto before = [](const Request *a, const Request *b) {
     if (a->spec.priority != b->spec.priority)
       return a->spec.priority < b->spec.priority;
     if (a->lastDecodeDispatch != b->lastDecodeDispatch)
       return a->lastDecodeDispatch < b->lastDecodeDispatch;
     return a->order < b->order;
-  });
-  const DecodeStage decodeStage = ready.front()->decodeStage;
-  const RequestPriority selectedPriority = ready.front()->spec.priority;
+  };
+
+  constexpr uint32_t maximumWidth = model::ExecutionLimits::maximumBatchWidth;
+  std::array<const Request *, maximumWidth> selected{};
+  uint32_t readyCount = 0;
+  bool overflow = false;
+  const Request *leader = nullptr;
+  for (const auto &[id, request] : requests_) {
+    if (request.phase != Phase::Decode || listed(excluded, id))
+      continue;
+    if (!leader || before(&request, leader))
+      leader = &request;
+    if (readyCount < maximumWidth)
+      selected[readyCount++] = &request;
+    else
+      overflow = true;
+  }
+  if (!leader)
+    return std::nullopt;
+
+  const DecodeStage decodeStage = leader->decodeStage;
+  const RequestPriority selectedPriority = leader->spec.priority;
   BatchPlan plan;
   plan.kind = WorkKind::Decode;
-  plan.constrained = ready.front()->spec.constrained;
+  plan.constrained = leader->spec.constrained;
   plan.decodeStage = decodeStage;
-  for (const Request *request : ready) {
-    if (request->spec.priority != selectedPriority ||
-        request->spec.constrained != plan.constrained ||
-        request->decodeStage != decodeStage)
-      continue;
-    plan.items.push_back({request->spec.id, 0, 0});
-    if (plan.width() == model::ExecutionLimits::maximumBatchWidth)
-      break;
+  uint32_t selectedCount = 0;
+  const auto select = [&](const Request *candidate) {
+    if (candidate->spec.priority != selectedPriority ||
+        candidate->spec.constrained != plan.constrained ||
+        candidate->decodeStage != decodeStage)
+      return;
+
+    uint32_t position = 0;
+    while (position < selectedCount &&
+           !before(candidate, selected[position]))
+      ++position;
+    if (position >= maximumWidth)
+      return;
+    if (selectedCount < maximumWidth)
+      ++selectedCount;
+    for (uint32_t index = selectedCount - 1; index > position; --index)
+      selected[index] = selected[index - 1];
+    selected[position] = candidate;
+  };
+
+  if (!overflow) {
+    // The first scan retained every ready lane. Sort and filter that prefix
+    // in place: insertion only writes at or before the lane being read.
+    for (uint32_t index = 0; index < readyCount; ++index)
+      select(selected[index]);
+  } else {
+    for (const auto &[id, request] : requests_)
+      if (request.phase == Phase::Decode && !listed(excluded, id))
+        select(&request);
   }
+
+  for (uint32_t index = 0; index < selectedCount; ++index)
+    plan.items.push_back({selected[index]->spec.id, 0, 0});
   return plan;
 }
 

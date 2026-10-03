@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <random>
 #include <stdexcept>
 
 using namespace splash;
@@ -928,6 +929,91 @@ void testDecodeLanesRotate() {
           "decode did not prioritize lanes omitted by the previous batch");
 }
 
+// Compare repeated dispatches with the previous full-sort policy across
+// queue depths, submission orders, priority tiers, constraints and exclusions.
+void testDecodeSelectionMatchesFullSort() {
+  struct Lane {
+    uint64_t id;
+    RequestPriority priority;
+    bool constrained;
+    uint64_t order;
+    uint64_t lastDispatch = 0;
+    bool ready;
+  };
+  std::mt19937 random(106);
+  for (uint32_t count : {0, 1, 4, 5, 16, 65}) {
+    for (uint32_t trial = 0; trial < 16; ++trial) {
+      Scheduler scheduler(0.0);
+      std::vector<uint64_t> ids;
+      for (uint64_t id = 1; id <= count; ++id)
+        ids.push_back(id);
+      std::shuffle(ids.begin(), ids.end(), random);
+      std::vector<Lane> lanes;
+      for (uint64_t id : ids) {
+        const auto priority = static_cast<RequestPriority>(random() % 3);
+        const bool constrained = random() % 2;
+        const bool ready = random() % 5 != 0;
+        lanes.push_back({id, priority, constrained, lanes.size(), 0, ready});
+        scheduler.submit(request(id, 1, constrained, priority));
+        if (ready)
+          scheduler.resourcesReady(id, 1);
+      }
+      uint64_t dispatch = 0;
+      for (uint32_t step = 0; step < 64; ++step) {
+        std::shuffle(ids.begin(), ids.end(), random);
+        const std::span<const uint64_t> excluded(
+            ids.data(), std::min<size_t>(random() % 5, ids.size()));
+        std::vector<Lane *> sorted;
+        for (Lane &lane : lanes)
+          if (lane.ready && std::find(excluded.begin(), excluded.end(), lane.id) ==
+                                excluded.end())
+            sorted.push_back(&lane);
+        std::sort(sorted.begin(), sorted.end(), [](const Lane *a, const Lane *b) {
+          if (a->priority != b->priority)
+            return a->priority < b->priority;
+          if (a->lastDispatch != b->lastDispatch)
+            return a->lastDispatch < b->lastDispatch;
+          return a->order < b->order;
+        });
+        const auto plan = scheduler.next(excluded);
+        require(plan.has_value() == !sorted.empty(),
+                "bounded selection changed decode readiness");
+        if (!plan)
+          continue;
+        const Lane &leader = *sorted.front();
+        std::vector<Lane *> expected;
+        for (Lane *lane : sorted) {
+          if (lane->priority == leader.priority &&
+              lane->constrained == leader.constrained)
+            expected.push_back(lane);
+          if (expected.size() == model::ExecutionLimits::maximumBatchWidth)
+            break;
+        }
+        require(plan->kind == WorkKind::Decode &&
+                    plan->constrained == leader.constrained &&
+                    plan->decodeStage == DecodeStage::Regular &&
+                    plan->width() == expected.size(),
+                "bounded selection changed the full-sort batch shape");
+        std::vector<StepResult> results;
+        ++dispatch;
+        for (size_t index = 0; index < expected.size(); ++index) {
+          Lane &lane = *expected[index];
+          require(plan->items[index].requestId == lane.id &&
+                      plan->items[index].tokenCount == 0 &&
+                      plan->items[index].promptOffset == 0,
+                  "bounded selection changed full-sort dispatch order");
+          lane.lastDispatch = dispatch;
+          const bool finished = random() % 7 == 0;
+          lane.ready = !finished;
+          results.push_back({lane.id, 0, finished, DecodeStage::Regular});
+        }
+        scheduler.commit(*plan, excluded);
+        scheduler.complete(*plan, results, 0.0, true);
+      }
+    }
+  }
+}
+
 void testMaskStagesNeverMix() {
   engine::Scheduler scheduler(0.0);
   scheduler.submit(request(1, 1, true));
@@ -981,24 +1067,29 @@ void testMaskStagesNeverMix() {
 // arrived are selected in one plan.
 void testInitialSelectionsBatch() {
   engine::Scheduler scheduler(0.0);
-  for (uint64_t id : {1, 2}) {
+  for (uint64_t id = 1; id <= 6; ++id) {
     scheduler.submit(request(id, 1, true));
     scheduler.resourcesReady(id, 0);
   }
-  const BatchPlan prompts = *scheduler.next({});
-  scheduler.commit(prompts, {});
-  const std::array promptResults{
-      StepResult{1, 1, false, DecodeStage::ApplyInitialMask},
-      StepResult{2, 1, false, DecodeStage::ApplyInitialMask},
-  };
-  scheduler.complete(prompts, promptResults, 0.0, true);
-  scheduler.maskReady(1);
-  scheduler.maskReady(2);
-  const BatchPlan selection = *scheduler.next({});
-  require(selection.kind == WorkKind::Decode && selection.width() == 2 &&
+  for (uint32_t batch = 0; batch < 2; ++batch) {
+    const BatchPlan prompts = *scheduler.next({});
+    scheduler.commit(prompts, {});
+    std::vector<StepResult> results;
+    for (const BatchItem &item : prompts.items)
+      results.push_back({item.requestId, 1, false, DecodeStage::ApplyInitialMask});
+    scheduler.complete(prompts, results, 0.0, true);
+  }
+  for (uint64_t id = 1; id <= 6; ++id)
+    scheduler.maskReady(id);
+  const std::array<uint64_t, 1> excluded{1};
+  const BatchPlan selection = *scheduler.next(excluded);
+  require(selection.kind == WorkKind::Decode && selection.width() == 4 &&
               selection.decodeStage == DecodeStage::ApplyInitialMask &&
               selection.constrained,
-          "first-token selections of one priority did not share a plan");
+          "first-token selections of one priority did not share a full plan");
+  for (size_t index = 0; index < selection.items.size(); ++index)
+    require(selection.items[index].requestId == index + 2,
+            "first-token selection changed arrival order or included an excluded lane");
 }
 
 void testWaitingMaskExpiresAtRequestDeadline() {
@@ -1153,6 +1244,7 @@ int main() {
     testPrefillCommandContainsOnePriorityTier();
     testDecodeCommandContainsOnePriorityTier();
     testDecodeLanesRotate();
+    testDecodeSelectionMatchesFullSort();
     testMaskStagesNeverMix();
     testInitialSelectionsBatch();
     testWaitingMaskExpiresAtRequestDeadline();
