@@ -267,6 +267,7 @@ class MoePlan final {
 public:
   [[nodiscard]] MoeShape shape() const noexcept { return shape_; }
   [[nodiscard]] uint32_t rows() const noexcept { return rows_; }
+  [[nodiscard]] MoePhase phase() const noexcept { return phase_; }
   [[nodiscard]] MoeConfig configuration() const noexcept { return config_; }
   [[nodiscard]] uint32_t tileRows() const noexcept {
     return static_cast<uint32_t>(config_.expertTile);
@@ -284,6 +285,7 @@ private:
   MoeShape shape_;
   uint32_t rows_;
   MoeConfig config_;
+  MoePhase phase_;
   bool splitExperts_;
   uint32_t maximumTiles_;
   MoeWorkspace workspace_;
@@ -294,6 +296,8 @@ struct MoeBuffers final {
   metal::MetalBuffer residual;
   metal::MetalBuffer output;
   MoeScratch scratch;
+  // Optional GPU-produced VerifyLiveRows per decode lane; prefill omits it.
+  metal::MetalBuffer liveRows{};
 };
 
 // Routes and executes grouped experts from immutable weight views.

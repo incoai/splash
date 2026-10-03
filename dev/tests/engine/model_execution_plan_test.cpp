@@ -4,6 +4,7 @@
 #include "model/RuntimeArenas.hpp"
 
 #include "metal/abi/QuantFormat.h"
+#include "metal/abi/LiveRows.h"
 
 #include <algorithm>
 #include <array>
@@ -135,6 +136,10 @@ void checkMixedLayouts() {
 void checkLaneScratch(const model::ModelPackage &package) {
   const auto geometry = model::RuntimeGeometry::from(package, kv::Format::Int8);
   const auto &d = geometry.draft;
+  const ops::ExecutionPlans defaultPlans(DeviceCapabilities{});
+  const auto sizes = model::decodeTensorBytes(geometry, defaultPlans);
+  require(sizes[static_cast<uint32_t>(model::DecodeTensor::LiveRows)] == sizeof(VerifyLiveRows),
+          "decode memory plan omitted live-row metadata");
   std::vector<ops::LinearMatrix> matrices{
       {d.dynamicSize, d.hiddenSize}, {d.qkvSize, d.hiddenSize}, {d.contextKvSize(), d.hiddenSize},
       {d.hiddenSize, d.attentionSize},

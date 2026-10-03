@@ -12,6 +12,7 @@
 #include "../../../runtime/ops/ExecutionPlans.hpp"
 #include "../../../runtime/ops/MoE.hpp"
 #include "metal/abi/MoE.h"
+#include "metal/abi/LiveRows.h"
 
 #import <Foundation/Foundation.h>
 
@@ -903,6 +904,61 @@ void run(const std::string &metallibPath) {
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
       const std::string label = "decode B" + std::to_string(lanes);
       const auto baseline = execute(shipped.moeDecode(fixture.shape, lanes), label);
+      // Removing routes must not change a live row's arithmetic, even when
+      // its tile neighbours and shared-expert slot change. Exercise every
+      // prefix and different prefixes in neighbouring lanes, on both tiles.
+      for (const ExecutionPlans *policy : {&shipped, &narrow}) {
+        const auto livePlan = policy->moeDecode(fixture.shape, lanes);
+        for (uint32_t cutoff = 1; cutoff <= 9; ++cutoff) {
+          fixture.buffers.liveRows = shared(backend, lanes * sizeof(VerifyLiveRows), "live rows");
+          auto *budgets = static_cast<VerifyLiveRows *>(fixture.buffers.liveRows.contents());
+          uint32_t liveCount = 0;
+          for (uint32_t lane = 0; lane < lanes; ++lane) {
+            budgets[lane].count = cutoff == 9 ? 8 : (cutoff + lane - 1) % 8 + 1;
+            liveCount += budgets[lane].count;
+          }
+          allocateScratch(backend, fixture, livePlan);
+          std::memset(fixture.buffers.scratch.routeRows.contents(), 0xa5,
+                      fixture.buffers.scratch.routeRows.sizeBytes());
+          CommandGraph liveGraph;
+          MoE::add(liveGraph, fixture.buffers, fixture.weights, livePlan);
+          require(liveGraph.dispatches()[2].pipelineName == "moe_group_routes_live_rows",
+                  "live-row plan did not filter routes");
+          static_cast<void>(backend.submitCommand(liveGraph.dispatches()));
+          const auto *actual = static_cast<const __bf16 *>(fixture.buffers.output.contents());
+          const auto *residual = static_cast<const __bf16 *>(fixture.buffers.residual.contents());
+          const auto *descriptors = static_cast<const MoeTileDescriptor *>(fixture.buffers.scratch.tileDescriptors.contents());
+          const uint32_t tiles = *static_cast<const uint32_t *>(fixture.buffers.scratch.tileCount.contents());
+          uint32_t groupedCount = 0, sharedCount = 0;
+          for (uint32_t tile = 0; tile < tiles; ++tile) {
+            groupedCount += descriptors[tile].rows;
+            if (descriptors[tile].expert == kExperts) sharedCount += descriptors[tile].rows;
+          }
+          require(groupedCount == liveCount * kRoutesPerRow && sharedCount == liveCount,
+                  "inactive rows still scheduled routed or shared experts");
+          const auto *routeRows = static_cast<const uint32_t *>(fixture.buffers.scratch.routeRows.contents());
+          const auto *groupedRoutes = static_cast<const uint32_t *>(fixture.buffers.scratch.groupedRoutes.contents());
+          for (uint32_t row = 0; row < lanes * 8; ++row) {
+            const bool live = row % 8 < budgets[row / 8].count;
+            for (uint32_t slot = 0; slot < kRoutesPerRow; ++slot) {
+              const uint32_t route = row * kRoutesPerRow + slot;
+              if (live)
+                require(routeRows[route] < tiles * 8 && groupedRoutes[routeRows[route]] == route,
+                        "live route mapping does not round-trip");
+              else
+                require(routeRows[route] == 0xffffffffu, "inactive route is not invalidated");
+            }
+            for (uint32_t col = 0; col < kHidden; ++col) {
+              const uint32_t index = row * kHidden + col;
+              const float expected = live ? baseline[index] : float(residual[index]);
+              require(float(actual[index]) == expected,
+                      "live MoE output differs bitwise from full verification");
+            }
+          }
+          fixture.buffers.liveRows = {};
+          ++cases;
+        }
+      }
       // The Apple9 four-simdgroup tiles (gate/up N128, down N256, 128
       // threads) must reproduce the shipped N128 x 8 tile bit for bit: each
       // output element sums its quant groups in the same order, so no

@@ -444,6 +444,8 @@ struct ModelTelemetry final {
   uint64_t stateHeldImageBytes = 0;
   uint64_t imageRowsBytes = 0;
   uint32_t lastDecodeWidth = 0;
+  // Rows allowed to run experts in the last decode; full rows by default.
+  uint32_t lastDecodeLiveRows = 0;
   uint64_t constrainedMaskOverlapBatches = 0;
   uint64_t constrainedMaskOverlapRequests = 0;
   double lastConstrainedTargetForwardGpuSeconds = 0.0;

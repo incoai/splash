@@ -12,6 +12,10 @@ public:
   explicit Runtime(RuntimeContext context);
   ~Runtime() override;
   void checkHealth() override;
+  // Opt-in experimental greedy MoE verification. Zero retains the original
+  // graph; sampled, constrained and dense requests retain full verification.
+  // Configure before submitting work; no ticket may be in flight.
+  void setLiveVerifyThreshold(float threshold);
   [[nodiscard]] uint32_t statesToActivate() const noexcept override;
 
   Runtime(const Runtime &) = delete;
