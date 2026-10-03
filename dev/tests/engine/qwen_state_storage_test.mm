@@ -451,6 +451,42 @@ void testPersistentStateComesBack(metal::MetalBackend &backend) {
   std::filesystem::remove_all(directory, ignored);
 }
 
+// A persistent tier's copy of a state that stays in RAM is written from the
+// RAM copy's own buffers: no staging, and the RAM copy keeps them. The disk
+// copy restores every byte.
+void testPersistKeepsTheRamCopy(metal::MetalBackend &backend) {
+  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
+                          queryHostAvailableMemory, 0);
+  model::QwenStateStorage storage(
+      backend, governor.allocationAdmission(), kStateLayout,
+      std::make_shared<model::SlotFile>(kStateSlotBytes,
+                                        std::make_shared<model::DiskBudget>(kStateSlotBytes)));
+  require(static_cast<bool>(storage.tryActivateLane(0, 7)), "lane activation failed");
+  fill(storage.current(0).stateBase, 60);
+  for (size_t layer = 0; layer < storage.draft(0).size(); ++layer) {
+    fill(storage.draft(0)[layer].keys, 61 + 2 * layer);
+    fill(storage.draft(0)[layer].values, 62 + 2 * layer);
+  }
+  const auto images = stateImage(storage, 0);
+  storage.updateLengths(0, {4096, 2048, 2048});
+  const auto source = storage.snapshot(0);
+  const uint64_t allocated = storage.actualAllocatedBytes();
+  auto write = source->persist({});
+  require(write && !write->state()->residentBytes() &&
+              source->residentBytes() == kStateLayout.cachedBytes() &&
+              storage.actualAllocatedBytes() == allocated,
+          "a persisted state staged its write or gave up its RAM copy");
+  require(!source->persist({}), "a second copy was admitted past the quota");
+  require(finishWhenReady(*write), "the persisted state's write failed");
+  fill(storage.current(0).stateBase, 99);
+  auto read = storage.beginRestore(0, *write->state(), true, {}, [] {});
+  require(read && finishWhenReady(*read) && stateImage(storage, 0) == images &&
+              storage.metadata(0).lengths == model::QwenLogicalLengths{4096, 2048, 2048},
+          "the persisted copy did not restore every byte and its lengths");
+  read.reset();
+  storage.releaseLane(0, 7);
+}
+
 void run(const std::string &metallib) {
   using model::QwenCompositeState;
   using model::QwenLogicalLengths;
@@ -463,6 +499,7 @@ void run(const std::string &metallib) {
   testDirectDiskSnapshot(backend);
   testStateSmallerThanSlot(backend);
   testPersistentStateComesBack(backend);
+  testPersistKeepsTheRamCopy(backend);
   MemoryGovernor governor(
       backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
       queryHostAvailableMemory, 0);

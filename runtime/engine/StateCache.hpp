@@ -105,6 +105,22 @@ struct StateEviction final {
   bool pending = false;
 };
 
+// What one step of making a restore point durable for the next process did
+// (Cache::persist, StateCache::persist).
+enum class PersistStatus : uint8_t {
+  // Every copy it needs is complete on disk.
+  Durable,
+  // Writes it needs are in flight; it is durable once they land.
+  Started,
+  // The tier takes no more of these writes for now; a later step may.
+  Busy,
+  // Nothing to keep: the point is gone, or its conversation went on from it.
+  Unneeded,
+  // The tier cannot keep it: its quota holds nothing to give up, or its
+  // writes failed.
+  Refused,
+};
+
 // Starts the write of a state from the lane that holds it and returns the
 // ticket carrying its disk copy, null when the quota cannot admit one; the
 // argument is the write's completion hook.
@@ -185,8 +201,17 @@ public:
   [[nodiscard]] std::vector<uint64_t> usedStates() const;
 
   [[nodiscard]] bool contains(uint64_t kvBlock) const noexcept;
+  // An ordinary state, in either tier.
+  [[nodiscard]] bool ordinary(uint64_t kvBlock) const noexcept;
+  // The size of the state at this block; zero without one.
+  [[nodiscard]] uint64_t bytes(uint64_t kvBlock) const noexcept;
   // A RAM copy exists.
   [[nodiscard]] bool stateResident(uint64_t kvBlock) const noexcept;
+  // In a persistent tier, writes a disk copy of a RAM copy from the RAM
+  // copy's own buffers, which stay: the next process takes the disk copy
+  // back. Until the write lands the RAM copy is no eviction candidate, and
+  // the write is the one in flight. Durable once a disk copy has landed.
+  [[nodiscard]] PersistStatus persist(uint64_t kvBlock);
   // The RAM copies a reclaim may free: the unpinned ones, and those in use
   // only withInUse.
   [[nodiscard]] uint32_t evictableStates(bool withInUse) const noexcept {
@@ -213,7 +238,8 @@ public:
   // else throws std::logic_error): for nothing when a disk copy exists, by
   // writing one when the tier takes it (makeRoom frees quota on its behalf),
   // otherwise as `unwritten` says. Its buffers return to the model's pool,
-  // which reclaimIdleState gives back to the host.
+  // which reclaimIdleState gives back to the host. A RAM copy a write in
+  // flight reads (persist) stays until it lands: pending.
   [[nodiscard]] StateEviction reclaim(uint64_t kvBlock, Unwritten unwritten);
   // Removes an unpinned state from both tiers.
   void evict(uint64_t kvBlock) noexcept;
@@ -261,6 +287,9 @@ private:
   };
   struct PendingOffload {
     uint64_t kvBlock;
+    // A RAM copy the write reads in place (persist), held until the write
+    // has drained, which the transfer, going first, does.
+    std::shared_ptr<const CompositeState> source;
     std::unique_ptr<StateOffload> transfer;
   };
 
@@ -285,8 +314,9 @@ private:
   [[nodiscard]] std::unique_ptr<StateOffload> startWrite(uint64_t kvBlock,
                                                          const StateWriter &write);
   // The disk copy this write carries becomes the entry's; the write is the
-  // one in flight.
-  void beginWrite(uint64_t kvBlock, Entry &entry, std::unique_ptr<StateOffload> transfer);
+  // one in flight, reading `source` in place when given.
+  void beginWrite(uint64_t kvBlock, Entry &entry, std::unique_ptr<StateOffload> transfer,
+                  std::shared_ptr<const CompositeState> source);
   // In a persistent tier, labels the entry's disk copy with its block,
   // class and recency.
   void labelDisk(uint64_t kvBlock, const Entry &entry) const;
@@ -303,6 +333,10 @@ private:
   void makeOrdinary(uint64_t kvBlock, Entry &entry);
   [[nodiscard]] bool writing(uint64_t kvBlock) const noexcept {
     return pending_ && pending_->kvBlock == kvBlock;
+  }
+  // The write in flight reads this block's RAM copy (persist).
+  [[nodiscard]] bool persisting(uint64_t kvBlock) const noexcept {
+    return writing(kvBlock) && pending_->source;
   }
 
   KvCache &kv_;

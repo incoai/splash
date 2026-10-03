@@ -205,7 +205,7 @@ bool StateCache::publishStateToDisk(uint64_t kvBlock, const StateWriter &write,
   if (!transfer)
     return false;
   Entry &entry = publicationEntry(kvBlock, checkpoint);
-  beginWrite(kvBlock, entry, std::move(transfer));
+  beginWrite(kvBlock, entry, std::move(transfer), nullptr);
   if (!entry.pins)
     entry.lastUsed = recency_.next();
   labelDisk(kvBlock, entry);
@@ -262,9 +262,46 @@ uint64_t StateCache::resumePoint() const noexcept {
   return newest ? newest->id : 0;
 }
 
+bool StateCache::ordinary(uint64_t kvBlock) const noexcept {
+  const auto found = entries_.find(kvBlock);
+  return found != entries_.end() && !found->second.invalid && !found->second.checkpoint;
+}
+
+uint64_t StateCache::bytes(uint64_t kvBlock) const noexcept {
+  const auto found = entries_.find(kvBlock);
+  if (found == entries_.end())
+    return 0;
+  const auto &state = copy(found->second);
+  return state ? state->bytes() : 0;
+}
+
 bool StateCache::stateResident(uint64_t kvBlock) const noexcept {
   const auto found = entries_.find(kvBlock);
   return found != entries_.end() && found->second.ram != nullptr;
+}
+
+PersistStatus StateCache::persist(uint64_t kvBlock) {
+  const auto found = entries_.find(kvBlock);
+  if (found == entries_.end() || found->second.invalid)
+    return PersistStatus::Unneeded;
+  Entry &entry = found->second;
+  if (entry.disk)
+    return writing(kvBlock) ? PersistStatus::Started : PersistStatus::Durable;
+  if (pending_)
+    return PersistStatus::Busy;
+  if (!entry.ram->canOffload())
+    return PersistStatus::Refused;
+  std::shared_ptr<const CompositeState> source = entry.ram;
+  std::unique_ptr<StateOffload> transfer =
+      startWrite(kvBlock, [&source](std::function<void()> done) {
+        return source->persist(std::move(done));
+      });
+  if (!transfer)
+    return PersistStatus::Refused;
+  beginWrite(kvBlock, entry, std::move(transfer), std::move(source));
+  labelDisk(kvBlock, entry);
+  reindex(kvBlock, entry);
+  return PersistStatus::Started;
 }
 
 std::optional<CacheEvictionCandidate>
@@ -303,6 +340,9 @@ StateEviction StateCache::reclaim(uint64_t kvBlock, Unwritten unwritten) {
   if (found == entries_.end() || found->second.pins || !found->second.ram)
     throw std::logic_error("state eviction candidate became pinned");
   Entry &entry = found->second;
+  // A write in flight reads this RAM copy: it frees nothing until it lands.
+  if (persisting(kvBlock))
+    return {false, true};
   const uint64_t reclaimed = entry.ram->bytes();
   // One write at a time.
   const bool writable = !entry.disk && entry.ram->canOffload();
@@ -312,7 +352,7 @@ StateEviction StateCache::reclaim(uint64_t kvBlock, Unwritten unwritten) {
     if (auto transfer = startWrite(kvBlock, [state = entry.ram](std::function<void()> done) {
           return state->offload(std::move(done));
         })) {
-      beginWrite(kvBlock, entry, std::move(transfer));
+      beginWrite(kvBlock, entry, std::move(transfer), nullptr);
       labelDisk(kvBlock, entry);
     }
   }
@@ -562,10 +602,11 @@ std::unique_ptr<StateOffload> StateCache::startWrite(uint64_t kvBlock, const Sta
 }
 
 void StateCache::beginWrite(uint64_t kvBlock, Entry &target,
-                            std::unique_ptr<StateOffload> transfer) {
+                            std::unique_ptr<StateOffload> transfer,
+                            std::shared_ptr<const CompositeState> source) {
   target.disk = transfer->state();
   diskBytes_ += target.disk->bytes();
-  pending_.emplace(PendingOffload{kvBlock, std::move(transfer)});
+  pending_.emplace(PendingOffload{kvBlock, std::move(source), std::move(transfer)});
   ++offloads_;
 }
 
@@ -580,14 +621,15 @@ void StateCache::labelDisk(uint64_t kvBlock, const Entry &target) const {
 // RAM copies wait for eviction in one order per class: checkpoints,
 // ordinary states, states in use. Disk copies wait for replacement as
 // redundant copies or as the only copy, of a state in use or not. A pinned
-// or invalid entry, or a copy being written, is in no order.
+// or invalid entry, a copy being written, or a RAM copy a write reads, is in
+// no order.
 void StateCache::reindex(uint64_t kvBlock, Entry &target) noexcept {
   RecencyOrder::unlink(target.ramNode);
   RecencyOrder::unlink(target.diskNode);
   if (target.pins || target.invalid)
     return;
   const bool used = inUse(kvBlock);
-  if (target.ram)
+  if (target.ram && !persisting(kvBlock))
     (used ? inUse_ : target.checkpoint ? checkpoints_ : ordinary_)
         .link(target.ramNode, target.lastUsed, kvBlock);
   if (target.disk && !writing(kvBlock))

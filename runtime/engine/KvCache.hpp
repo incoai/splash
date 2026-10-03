@@ -89,6 +89,9 @@ public:
   [[nodiscard]] uint64_t lastUsed(uint64_t blockId) const;
   // No request uses the block and no transfer moves it: it can lose a copy.
   [[nodiscard]] bool idle(uint64_t blockId) const;
+  [[nodiscard]] bool transferring(uint64_t blockId) const;
+  // The blocks right below this one.
+  [[nodiscard]] std::vector<uint64_t> children(uint64_t blockId) const;
 
   void retainActive(uint64_t blockId);
   void releaseActive(uint64_t blockId) noexcept;

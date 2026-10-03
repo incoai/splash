@@ -698,9 +698,11 @@ CacheReclaimResult Cache::releaseExtent(bool keepRunway) {
 bool Cache::compactExtent() {
   const auto start = std::chrono::steady_clock::now();
   std::vector<uint32_t> inTransfer;
-  inTransfer.reserve(demotions_.size() + restores_.size());
+  inTransfer.reserve(demotions_.size() + copies_.size() + restores_.size());
   for (const Demotion &demotion : demotions_)
     inTransfer.push_back(kv_.page(demotion.block));
+  for (const Demotion &copy : copies_)
+    inTransfer.push_back(kv_.page(copy.block));
   for (const auto &[block, _] : restores_)
     inTransfer.push_back(kv_.page(block));
   const KvPageMoves moves = pool_.compactExtent(inTransfer);
@@ -730,7 +732,7 @@ bool Cache::compactExtent() {
 }
 
 bool Cache::transfersInFlight() const noexcept {
-  return !restores_.empty() || !demotions_.empty() || states_.writing();
+  return !restores_.empty() || !demotions_.empty() || !copies_.empty() || states_.writing();
 }
 
 uint64_t Cache::pendingBytes() const noexcept {
@@ -996,9 +998,97 @@ bool Cache::pollTransfers() {
     }
     progressed = true;
   }
+  // A page persist() wrote stays: the copy is for the next process.
+  for (auto copy = copies_.begin(); copy != copies_.end();) {
+    if (!copy->transfer->ready()) {
+      ++copy;
+      continue;
+    }
+    const uint64_t block = copy->block;
+    const bool written = copy->transfer->finish();
+    copy = copies_.erase(copy);
+    kv_.setTransferring(block, false);
+    if (written) {
+      ++kvTier_.copies;
+    } else {
+      ++kvTier_.copyFailures;
+      kv_.setSlot(block, nullptr);
+    }
+    progressed = true;
+  }
   if (progressed)
     dropPoisoned();
   return progressed;
+}
+
+PersistStatus Cache::persist(uint64_t block) {
+  if (!persistent_)
+    throw std::logic_error("only a persistent tier keeps restore points");
+  if (!kv_.contains(block) || !states_.ordinary(block) || superseded(block))
+    return PersistStatus::Unneeded;
+  if (!kvTierWritable())
+    return PersistStatus::Refused;
+  const KvCache::Chain chain = kv_.chain(block);
+  // A point larger than the whole quota is never kept: making room for it
+  // would give up every other copy first.
+  if (diskBudget_ && uint64_t{chain.blocks.size()} * tier_->slotBytes() + states_.bytes(block) >
+                         diskBudget_->capacityBytes())
+    return PersistStatus::Refused;
+  bool inFlight = false;
+  for (size_t index = 0; index < chain.blocks.size(); ++index) {
+    const uint64_t id = chain.blocks[index];
+    if (kv_.slot(id)) {
+      inFlight = inFlight || kv_.transferring(id);
+      continue;
+    }
+    // Only a resident block lacks a disk copy.
+    if (!restores_.empty() || copies_.size() >= kCopies || !tier_->canDemote())
+      return inFlight ? PersistStatus::Started : PersistStatus::Busy;
+    std::shared_ptr<KvDiskSlot> slot = acquireDiskSlot(false);
+    // Making room gives up the oldest point, which may be this one: it does
+    // not fit then. Otherwise its chain stays whole, as a state needs it.
+    if (!slot || !states_.ordinary(block))
+      return PersistStatus::Refused;
+    auto transfer = tier_->demote(chain.pages[index], slot, completionNotifier_);
+    if (!transfer)
+      return inFlight ? PersistStatus::Started : PersistStatus::Busy;
+    labelKv(id, slot);
+    kv_.setSlot(id, std::move(slot));
+    kv_.setTransferring(id, true);
+    copies_.push_back({id, std::move(transfer)});
+    inFlight = true;
+  }
+  const PersistStatus state = states_.persist(block);
+  if (state == PersistStatus::Durable || state == PersistStatus::Busy)
+    return inFlight ? PersistStatus::Started : state;
+  return state;
+}
+
+bool Cache::superseded(uint64_t block) const {
+  if (!kv_.stateBelow(block))
+    return false;
+  uint32_t branches = 0;
+  for (const uint64_t child : kv_.children(block)) {
+    if (holdsOrdinaryState(child) && ++branches > 1)
+      return false;
+  }
+  return branches == 1;
+}
+
+bool Cache::holdsOrdinaryState(uint64_t block) const {
+  std::vector<uint64_t> pending{block};
+  while (!pending.empty()) {
+    const uint64_t id = pending.back();
+    pending.pop_back();
+    if (states_.ordinary(id))
+      return true;
+    // Only where a state lies below is there anything to find.
+    if (kv_.stateBelow(id)) {
+      const std::vector<uint64_t> children = kv_.children(id);
+      pending.insert(pending.end(), children.begin(), children.end());
+    }
+  }
+  return false;
 }
 
 CacheSnapshot Cache::snapshot() const {

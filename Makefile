@@ -247,6 +247,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/engine/MemoryPlan.cpp \
 	runtime/engine/Scheduler.cpp \
 	runtime/engine/Cache.cpp \
+	runtime/engine/WriteBehind.cpp \
 	runtime/engine/Engine.cpp \
 	runtime/engine/MemoryGovernor.cpp \
 	runtime/engine/MemoryControl.cpp \

@@ -69,7 +69,8 @@ Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
       checkpointTokens_(testConfig().prefillCheckpointTokens.value_or(kPrefillCheckpointTokens)),
       resourceWaitTimeoutMilliseconds_(
           testConfig().resourceWaitTimeoutMilliseconds.value_or(kResourceWaitTimeoutMilliseconds)),
-      cache_(cache), model_(model), events_(events), scheduler_(config_.decodeShare) {
+      cache_(cache), writeBehind_(cache), model_(model), events_(events),
+      scheduler_(config_.decodeShare) {
   if (!config_.maxContext || !config_.vocabularySize) {
     throw std::invalid_argument("context and vocabulary sizes must be positive");
   }
@@ -173,6 +174,7 @@ bool Engine::tick(double now) {
     progressed = true;
   }
   progressed = pollRestores(now) || progressed;
+  progressed = writeBehind_.run(now) || progressed;
   // The earliest submitted and the earliest admitted of the lanes with work
   // in flight.
   uint64_t earliestWorking = std::numeric_limits<uint64_t>::max();
@@ -357,6 +359,9 @@ std::optional<double> Engine::nextWakeupMilliseconds() const {
     if (!result || wakeup < *result)
       result = wakeup;
   }
+  if (const std::optional<double> persist = writeBehind_.nextWakeup();
+      persist && (!result || *persist < *result))
+    result = persist;
   return result;
 }
 
@@ -365,6 +370,7 @@ EngineSnapshot Engine::snapshot() const {
   result.maximumContextTokens = config_.maxContext;
   result.scheduler = scheduler_.snapshot();
   result.resources = cache_.snapshot();
+  result.writeBehind = writeBehind_.snapshot();
   return result;
 }
 
@@ -1018,7 +1024,7 @@ bool Engine::retireCheckpoint(Request &active) {
 }
 
 void Engine::publishReachedStateBoundaries(Request &active,
-                                           uint32_t promptProcessed) {
+                                           uint32_t promptProcessed, double now) {
   bool materialized = false;
   while (active.stateBoundaryCursor < active.stateBoundaries.size() &&
          active.stateBoundaries[active.stateBoundaryCursor].tokens <=
@@ -1112,6 +1118,8 @@ void Engine::publishReachedStateBoundaries(Request &active,
     static_cast<void>(retireCheckpoint(active));
     active.latestCheckpoint = checkpoint ? cache_.checkpointState(block)
                                          : StateCheckpoint{};
+    if (!checkpoint)
+      writeBehind_.published(block, objective.tokens, now);
   }
   // Late siblings can extend the remaining plan only where both target and
   // draft states are complete, never at an arbitrary in-flight chunk boundary.
@@ -1588,7 +1596,7 @@ void Engine::apply(const BatchPlan &plan,
         active.replaying = false;
       cache_.publishCommittedBlocks(active.request.id, active.exactTokens,
                                     promptProcessed, active.request.images);
-      publishReachedStateBoundaries(active, promptProcessed);
+      publishReachedStateBoundaries(active, promptProcessed, now);
       // Recovery may replay an already reported prefix, including generated
       // history.
       const uint32_t processed = std::min(promptProcessed, active.promptTokens);

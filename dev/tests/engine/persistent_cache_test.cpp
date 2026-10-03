@@ -1,10 +1,12 @@
 #include "Checked.hpp"
+#include "ScopedTestConfig.hpp"
 #include "TestCache.hpp"
 #include "TestChecks.hpp"
 #include "TestKvPool.hpp"
 #include "TestKvTier.hpp"
 #include "engine/Cache.hpp"
 #include "engine/DiskLabels.hpp"
+#include "engine/WriteBehind.hpp"
 #include "model/SlotFile.hpp"
 
 #include <unistd.h>
@@ -30,11 +32,12 @@ using splash::test::require;
 
 // Where a persistent tier keeps state copies in these tests: each copy on
 // disk keeps the label its write gave it while it lives, as a slot file's
-// record does.
+// record does. Writes land when the shelf is ready.
 class ShelvedState;
 struct Shelf final {
   std::set<const ShelvedState *> disk;
   uint32_t capacity = 8;
+  bool ready = true;
 };
 
 class ShelvedState final : public CompositeState {
@@ -53,17 +56,22 @@ public:
   std::unique_ptr<StateOffload> offload(std::function<void()>) const override {
     if (shelf_->disk.size() >= shelf_->capacity)
       return {};
-    return std::make_unique<Written>(std::make_shared<ShelvedState>(shelf_, true));
+    return std::make_unique<Written>(shelf_, std::make_shared<ShelvedState>(shelf_, true));
+  }
+  std::unique_ptr<StateOffload> persist(std::function<void()> done) const override {
+    return offload(std::move(done));
   }
   void label(std::vector<std::byte> label) const override { label_ = std::move(label); }
   [[nodiscard]] const std::vector<std::byte> &labelled() const noexcept { return label_; }
 
 private:
   struct Written final : StateOffload {
-    explicit Written(std::shared_ptr<const CompositeState> copy) : disk(std::move(copy)) {}
-    bool ready() const noexcept override { return true; }
+    Written(std::shared_ptr<Shelf> owner, std::shared_ptr<const CompositeState> copy)
+        : shelf(std::move(owner)), disk(std::move(copy)) {}
+    bool ready() const noexcept override { return shelf->ready; }
     bool finish() override { return true; }
     const std::shared_ptr<const CompositeState> &state() const noexcept override { return disk; }
+    std::shared_ptr<Shelf> shelf;
     std::shared_ptr<const CompositeState> disk;
   };
 
@@ -119,8 +127,8 @@ struct Process final {
     return blocks;
   }
 
-  void publish(uint64_t block) {
-    cache.publishCompositeState(block, std::make_shared<ShelvedState>(shelf, false), false);
+  void publish(uint64_t block, bool checkpoint = false) {
+    cache.publishCompositeState(block, std::make_shared<ShelvedState>(shelf, false), checkpoint);
   }
 
   // Everything leaves RAM: each state is written as it goes, and each KV
@@ -309,6 +317,70 @@ void testOldestPointGoes() {
           "a copy no state needs stayed while a point was given up");
 }
 
+// Making room for a point can give up its own state, when it is the oldest
+// copy: the point is refused then, and the chain it no longer holds is not
+// touched.
+void testPointGivenUpForItselfIsRefused() {
+  Process process(true);
+  process.tier.capacity = 2;
+  const std::vector<uint64_t> blocks = process.cachePrompt(1, promptOf(1000, 4));
+  process.publish(blocks[3]);
+  // The state is written, and the two leaves under it are demoted: the
+  // chain is two resident pages without copies over two disk-only blocks.
+  while (process.tier.slots < 2) {
+    require(process.cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse)
+                .madeProgress,
+            "the point did not leave RAM");
+    process.tier.complete();
+    static_cast<void>(process.cache.pollTransfers());
+  }
+  require(!process.cache.stateResident(blocks[3]) && process.shelf->disk.size() == 1,
+          "the point's state was not written");
+  require(process.cache.persist(blocks[3]) == PersistStatus::Refused &&
+              !process.shelf->disk.size(),
+          "a point given up for itself was not refused");
+}
+
+// A point larger than the whole quota is refused before anything else gives
+// way to it.
+void testPointLargerThanTheQuotaIsRefused() {
+  // Two pages and a state fit; four pages and a state do not.
+  Process process(true, std::make_shared<model::DiskBudget>(450));
+  const uint64_t small = process.cachePrompt(1, promptOf(1000, 2))[1];
+  process.publish(small);
+  require(process.cache.persist(small) == PersistStatus::Started, "the small point was not kept");
+  process.tier.complete();
+  static_cast<void>(process.cache.pollTransfers());
+  require(process.cache.persist(small) == PersistStatus::Durable, "the small point is not durable");
+  const uint64_t large = process.cachePrompt(2, promptOf(2000, 4))[3];
+  process.publish(large);
+  require(process.cache.persist(large) == PersistStatus::Refused && process.tier.slots == 2 &&
+              process.shelf->disk.size() == 1 &&
+              process.cache.persist(small) == PersistStatus::Durable,
+          "a point larger than the quota displaced another");
+}
+
+// While a write reads a state's RAM copy, no reclaim frees that copy, a
+// page scan's included: it frees nothing until the write lands.
+void testPersistingStateStaysInRam() {
+  Process process(true);
+  const uint64_t block = process.cachePrompt(1, promptOf(1000, 2))[1];
+  process.publish(block);
+  process.shelf->ready = false;
+  require(process.cache.persist(block) == PersistStatus::Started, "the point was not written");
+  process.tier.complete();
+  static_cast<void>(process.cache.pollTransfers());
+  static_cast<void>(process.cache.reclaimOne(CacheReclaimMode::ReusePages, ReclaimClass::InUse));
+  require(process.cache.stateResident(block), "a page scan freed a state its write still read");
+  process.shelf->ready = true;
+  static_cast<void>(process.cache.pollTransfers());
+  require(process.cache.persist(block) == PersistStatus::Durable &&
+              process.cache.reclaimOne(CacheReclaimMode::ReusePages, ReclaimClass::InUse)
+                  .madeProgress &&
+              !process.cache.stateResident(block),
+          "the state's RAM copy did not go once its write landed");
+}
+
 // States of a slot file kept for the next process: each holds a slot of it.
 class SlotState final : public CompositeState {
 public:
@@ -371,6 +443,174 @@ void testAdoptionTrimsToTheQuota() {
   std::filesystem::remove_all(directory, ignored);
 }
 
+// A point made durable stays in RAM: the pages of its chain are copied and
+// its state is written from its own buffers, and once every write has
+// landed it is durable. The next process takes it back whole.
+void testDurablePointsStayInRam() {
+  const std::vector<uint32_t> prompt = promptOf(1000, 4);
+  Process process(true);
+  const std::vector<uint64_t> blocks = process.cachePrompt(1, prompt);
+  process.publish(blocks[3]);
+  process.shelf->ready = false;
+  require(process.cache.persist(blocks[3]) == PersistStatus::Started &&
+              process.tier.demotions == 4 && process.shelf->disk.size() == 1,
+          "the point's chain and state were not written");
+  process.tier.complete();
+  require(process.cache.pollTransfers() &&
+              process.cache.persist(blocks[3]) == PersistStatus::Started,
+          "the point was durable before its state landed");
+  process.shelf->ready = true;
+  require(process.cache.pollTransfers() &&
+              process.cache.persist(blocks[3]) == PersistStatus::Durable &&
+              process.tier.demotions == 4,
+          "the point did not become durable once its writes landed");
+  const CacheSnapshot snapshot = process.cache.snapshot();
+  require(snapshot.pool.pagesPrefix == 4 && snapshot.kvTier.copies == 4 &&
+              process.cache.stateResident(blocks[3]),
+          "the durable point left RAM");
+  Process next(true);
+  const CacheAdoption adoption = next.adopt(process.kvLabels(), process.stateLabels());
+  require(adoption.blocks == 4 && adoption.states == 1,
+          "the next process did not take the durable point back whole");
+}
+
+// A point its conversation went on from is not kept, nor one that is gone or
+// only a checkpoint. A point two conversations went on from is kept, and so
+// is one only a checkpoint follows.
+void testOnlyTheNewestPointsAreKept() {
+  const std::vector<uint32_t> prompt = promptOf(1000, 4);
+  Process process(true);
+  const std::vector<uint64_t> blocks = process.cachePrompt(1, prompt);
+  process.publish(blocks[1]);
+  process.publish(blocks[2], true);
+  process.publish(blocks[3]);
+  require(process.cache.persist(blocks[1]) == PersistStatus::Unneeded &&
+              process.cache.persist(blocks[2]) == PersistStatus::Unneeded &&
+              process.cache.persist(blocks[3] + 100) == PersistStatus::Unneeded &&
+              !process.tier.demotions,
+          "a superseded point, a checkpoint or a gone point was written");
+  std::vector<uint32_t> branch(prompt.begin(), prompt.begin() + 2 * KvCache::pageTokens);
+  const std::vector<uint32_t> own = promptOf(5000, 2);
+  branch.insert(branch.end(), own.begin(), own.end());
+  process.publish(process.cachePrompt(2, branch)[3]);
+  require(process.cache.persist(blocks[1]) == PersistStatus::Started,
+          "a point two conversations went on from was not kept");
+
+  Process followed(true);
+  const std::vector<uint64_t> chain = followed.cachePrompt(1, prompt);
+  followed.publish(chain[1]);
+  followed.publish(chain[3], true);
+  require(followed.cache.persist(chain[1]) == PersistStatus::Started,
+          "a point only a checkpoint follows was not kept");
+}
+
+// Nothing is written while a restore waits: the tier serves the request
+// first.
+void testRestoresGoFirst() {
+  const std::vector<uint32_t> earlier = promptOf(1000, 2);
+  Process process(true);
+  process.publish(process.cachePrompt(1, earlier)[1]);
+  process.writeEverything();
+  std::vector<uint32_t> continued = earlier;
+  continued.push_back(7);
+  CacheLookup lookup = process.cache.lookup(continued, {});
+  process.cache.beginRequest(2);
+  require(lookup.state && process.cache.restoreRequest(2, lookup).granted() &&
+              process.tier.restores == 2,
+          "the earlier point was not restored");
+  const std::vector<uint64_t> blocks = process.cachePrompt(3, promptOf(5000, 2));
+  process.publish(blocks[1]);
+  const uint32_t demotions = process.tier.demotions;
+  require(process.cache.persist(blocks[1]) == PersistStatus::Busy &&
+              process.tier.demotions == demotions,
+          "a point was written while a restore waited");
+  process.tier.complete();
+  require(process.cache.pollTransfers() &&
+              process.cache.persist(blocks[1]) == PersistStatus::Started,
+          "the point was not written once the restore landed");
+  lookup = {};
+  process.cache.endRequest(2);
+}
+
+// A point is written once it has waited the delay, unless its conversation
+// went on from it meanwhile; a short point never is. At a clean stop every
+// waiting point is written, the newest first.
+void testPointsWaitTheirTurn() {
+  constexpr double kDelay = WriteBehind::kDelayMilliseconds;
+  Process process(true);
+  WriteBehind writes(process.cache);
+  const std::vector<uint64_t> first = process.cachePrompt(1, promptOf(1000, 2));
+  process.publish(first[1]);
+  writes.published(first[1], WriteBehind::kMinimumTokens, 0.0);
+  const std::vector<uint64_t> second = process.cachePrompt(2, promptOf(2000, 1));
+  process.publish(second[0]);
+  writes.published(second[0], WriteBehind::kMinimumTokens - 1, 0.0);
+  require(writes.snapshot().waiting == 1 && !writes.run(kDelay - 1) && !process.tier.demotions &&
+              writes.nextWakeup() == kDelay,
+          "a point was written before its delay, or a short one was queued");
+  require(!writes.run(kDelay) && process.tier.demotions == 2 && !writes.nextWakeup(),
+          "a due point was not written, or its writes did not hold the queue");
+  process.tier.complete();
+  require(process.cache.pollTransfers() && writes.run(kDelay + 1) &&
+              writes.snapshot().durable == 1 && !writes.snapshot().waiting,
+          "the point did not become durable once its writes landed");
+
+  // The conversation goes on before its point falls due.
+  std::vector<uint32_t> longer = promptOf(3000, 2);
+  const std::vector<uint64_t> turn = process.cachePrompt(3, longer);
+  process.publish(turn[1]);
+  writes.published(turn[1], WriteBehind::kMinimumTokens, 2 * kDelay);
+  const std::vector<uint32_t> more = promptOf(4000, 1);
+  longer.insert(longer.end(), more.begin(), more.end());
+  const uint64_t next = process.cachePrompt(4, longer)[2];
+  process.publish(next);
+  writes.published(next, WriteBehind::kMinimumTokens, 2 * kDelay + 1);
+  require(writes.run(3 * kDelay) && writes.snapshot().unneeded == 1 &&
+              writes.snapshot().waiting == 1 && process.tier.demotions == 2,
+          "a point its conversation went on from was written");
+
+  // A clean stop takes the newest point first, before it is due.
+  const std::vector<uint64_t> newest = process.cachePrompt(5, promptOf(6000, 1));
+  process.publish(newest[0]);
+  writes.published(newest[0], WriteBehind::kMinimumTokens, 3 * kDelay);
+  process.shelf->ready = false;
+  require(!writes.flush() && process.tier.demotions == 3,
+          "the clean stop did not start with the newest point");
+  process.tier.complete();
+  process.shelf->ready = true;
+  require(process.cache.pollTransfers() && !writes.flush(),
+          "the clean stop did not go on to the next point");
+  process.tier.complete();
+  require(process.cache.pollTransfers() && writes.flush() && writes.snapshot().durable == 3 &&
+              !writes.snapshot().waiting,
+          "the clean stop did not leave every point durable");
+}
+
+// While the tier has written its hourly bytes in the last hour, a due point
+// waits, and the limit is looked at again a minute later.
+void testWritesKeepToTheHourlyLimit() {
+  constexpr double kMinute = 60'000.0, kHour = 3'600'000.0;
+  const test::ScopedTestConfig config({.writeBehindHourlyBytes = kHostPageBytes});
+  auto budget = std::make_shared<model::DiskBudget>(4 * kHostPageBytes);
+  Process process(true, budget);
+  WriteBehind writes(process.cache);
+  const std::vector<uint64_t> blocks = process.cachePrompt(1, promptOf(1000, 2));
+  process.publish(blocks[1]);
+  writes.published(blocks[1], WriteBehind::kMinimumTokens, 0.0);
+  require(!writes.run(0.0), "a point was written before its delay");
+  // Eviction writes the hour's bytes.
+  model::SlotFile file(kHostPageBytes, budget);
+  const std::vector<std::byte> payload(kHostPageBytes, std::byte{1});
+  require(file.write(file.acquire(), {payload}, {})->wait(), "the eviction write failed");
+  require(!writes.run(WriteBehind::kDelayMilliseconds) && !process.tier.demotions &&
+              writes.nextWakeup() == kMinute,
+          "a due point was written past the hourly limit");
+  require(!writes.run(kMinute) && !writes.run(kHour) && !process.tier.demotions,
+          "a due point was written while the hour's writes reached the limit");
+  require(!writes.run(kHour + kMinute) && process.tier.demotions == 2,
+          "a due point waited once the writes were an hour old");
+}
+
 } // namespace
 
 int main() {
@@ -380,6 +620,14 @@ int main() {
     testBrokenChainsStayBehind();
     testOldestPointGoes();
     testAdoptionTrimsToTheQuota();
+    testPointGivenUpForItselfIsRefused();
+    testPointLargerThanTheQuotaIsRefused();
+    testPersistingStateStaysInRam();
+    testDurablePointsStayInRam();
+    testOnlyTheNewestPointsAreKept();
+    testRestoresGoFirst();
+    testPointsWaitTheirTurn();
+    testWritesKeepToTheHourlyLimit();
     std::cout << "Persistent cache tests passed\n";
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';

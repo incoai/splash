@@ -122,6 +122,8 @@ public:
   }
   [[nodiscard]] std::unique_ptr<StateOffload>
   offload(std::function<void()> completion) const override;
+  [[nodiscard]] std::unique_ptr<StateOffload>
+  persist(std::function<void()> completion) const override;
   void label(std::vector<std::byte> label) const override;
 
 private:

@@ -5,6 +5,7 @@
 #include "engine/MemoryGovernor.hpp"
 #include "engine/Scheduler.hpp"
 #include "engine/Types.hpp"
+#include "engine/WriteBehind.hpp"
 #include "ops/PagedKv.hpp"
 
 #include <cstdint>
@@ -115,6 +116,8 @@ struct EngineSnapshot final {
   uint64_t resourceResumptions = 0;
   // All prefill rows after preemption, including an unfinished prompt suffix.
   uint64_t resourceReplayTokens = 0;
+  // A persistent tier's newest restore points (WriteBehind).
+  WriteBehindSnapshot writeBehind;
 };
 
 // KV blocks define prefix identity; composite recurrent state is attached
@@ -326,7 +329,7 @@ private:
   void discardPendingStateBoundaries(Request &request) noexcept;
   [[nodiscard]] bool retireCheckpoint(Request &request);
   void publishReachedStateBoundaries(Request &request,
-                                     uint32_t promptProcessed);
+                                     uint32_t promptProcessed, double nowMilliseconds);
   [[nodiscard]] Prepared prepare(BatchPlan &plan,
                                  std::vector<ModelBatchItem> &items,
                                  double nowMilliseconds);
@@ -465,6 +468,7 @@ private:
   uint32_t checkpointTokens_;
   double resourceWaitTimeoutMilliseconds_;
   Cache &cache_;
+  WriteBehind writeBehind_;
   model::Model &model_;
   EngineEventSink &events_;
   Scheduler scheduler_;

@@ -215,6 +215,15 @@ bool KvCache::idle(uint64_t blockId) const {
   return !entry.activeUsers && !entry.transferring;
 }
 
+bool KvCache::transferring(uint64_t blockId) const { return block(blockId).transferring; }
+
+std::vector<uint64_t> KvCache::children(uint64_t blockId) const {
+  std::vector<uint64_t> result;
+  for (uint64_t child = block(blockId).firstChild; child; child = block(child).nextSibling)
+    result.push_back(child);
+  return result;
+}
+
 void KvCache::retainActive(uint64_t blockId) {
   Block &entry = block(blockId);
   if (entry.activeUsers == std::numeric_limits<uint32_t>::max()) {
