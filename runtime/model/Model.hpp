@@ -189,6 +189,10 @@ public:
   // A null ticket means that the disk quota cannot admit another state.
   [[nodiscard]] virtual std::unique_ptr<StateOffload>
   offload(std::function<void()>) const { return {}; }
+  // On a disk copy in a persistent tier, keeps the label with its slot once
+  // the write started before has landed (SlotFile::label). Nothing
+  // otherwise.
+  virtual void label(std::vector<std::byte>) const {}
 };
 
 enum class DraftBoundaryPurpose : uint8_t { Active, Materialization };

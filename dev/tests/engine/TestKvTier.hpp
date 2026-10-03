@@ -2,9 +2,11 @@
 
 #include "engine/KvTier.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <set>
 #include <vector>
 
 namespace splash::test {
@@ -20,8 +22,15 @@ public:
     bool finished = false;
   };
 
+  TestKvTier() = default;
+  explicit TestKvTier(bool persistent) : persistentTier(persistent) {}
+
   uint64_t slotBytes() const noexcept override { return 100; }
   bool writable() const noexcept override { return writableFile; }
+  bool persistent() const noexcept override { return persistentTier; }
+  void label(const std::shared_ptr<engine::KvDiskSlot> &slot, std::vector<std::byte> label) override {
+    static_cast<Slot &>(*slot).label = std::move(label);
+  }
   bool canDemote() const noexcept override { return writableFile && inFlight() < transferLimit; }
   bool canRestore() const noexcept override { return inFlight() < transferLimit; }
   std::shared_ptr<engine::KvDiskSlot> acquireSlot() override {
@@ -53,6 +62,15 @@ public:
     }
   }
   [[nodiscard]] uint32_t inFlight() const noexcept { return inFlight_; }
+  // The labels of the slots a persistent tier holds, as the next process
+  // finds them, and a slot that process takes back.
+  [[nodiscard]] std::vector<std::vector<std::byte>> labels() const {
+    std::vector<std::vector<std::byte>> result;
+    for (const Slot *slot : live_)
+      if (!slot->label.empty()) result.push_back(slot->label);
+    return result;
+  }
+  [[nodiscard]] std::shared_ptr<engine::KvDiskSlot> adopt() { return std::make_shared<Slot>(*this); }
 
   uint32_t slots = 0;
   uint32_t capacity = 4;
@@ -63,13 +81,21 @@ public:
   uint32_t restoreCalls = 0;
   std::vector<uint32_t> restoredPages;
   bool writableFile = true;
+  bool persistentTier = false;
   std::vector<std::shared_ptr<Transfer>> transfers;
 
 private:
   struct Slot final : engine::KvDiskSlot {
-    explicit Slot(TestKvTier &owner) : tier(owner) { ++tier.slots; }
-    ~Slot() override { --tier.slots; }
+    explicit Slot(TestKvTier &owner) : tier(owner) {
+      ++tier.slots;
+      tier.live_.insert(this);
+    }
+    ~Slot() override {
+      --tier.slots;
+      tier.live_.erase(this);
+    }
     TestKvTier &tier;
+    std::vector<std::byte> label;
   };
   class Ticket final : public engine::KvTransfer {
   public:
@@ -97,6 +123,7 @@ private:
   }
 
   uint32_t inFlight_ = 0;
+  std::set<const Slot *> live_;
 };
 
 } // namespace splash::test

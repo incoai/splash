@@ -70,6 +70,25 @@ public:
                                   std::span<const uint32_t> tokens,
                                   uint32_t physicalPage,
                                   ImageIdentity images);
+  // Takes back a disk-only block an earlier process left in a persistent
+  // tier, under its id, key and recency; a parent comes back before its
+  // children. New ids continue after it. False, taking nothing, when
+  // another block holds the key.
+  [[nodiscard]] bool adoptDiskBlock(uint64_t blockId, uint64_t parentBlock,
+                                    std::span<const uint32_t> tokens, ImageIdentity images,
+                                    std::shared_ptr<KvDiskSlot> slot, uint64_t lastUsed);
+  // New ids continue after this one, which an earlier process recorded.
+  void continueIdsAfter(uint64_t blockId) noexcept;
+  // A block's key and recency, which a persistent tier records with its copy.
+  struct Key final {
+    uint64_t parent = 0;
+    std::span<const uint32_t> tokens;
+    ImageIdentity images;
+  };
+  [[nodiscard]] Key key(uint64_t blockId) const;
+  [[nodiscard]] uint64_t lastUsed(uint64_t blockId) const;
+  // No request uses the block and no transfer moves it: it can lose a copy.
+  [[nodiscard]] bool idle(uint64_t blockId) const;
 
   void retainActive(uint64_t blockId);
   void releaseActive(uint64_t blockId) noexcept;
@@ -88,8 +107,8 @@ public:
   [[nodiscard]] std::shared_ptr<KvDiskSlot> slot(uint64_t blockId) const;
   [[nodiscard]] bool hasDiskChildren(uint64_t blockId) const;
   // StateCache counts each of its entries in and out, and each entry while
-  // an unfinished request uses it: a state restores through the KV of every
-  // block above its own.
+  // an unfinished request uses it: a state restores through the KV of its
+  // own block and every block above.
   void countState(uint64_t blockId, bool added, bool inUse) noexcept;
   void countStateInUse(uint64_t blockId, bool added) noexcept;
   // A state sits below the block. Without one, the disk-only blocks below
@@ -134,6 +153,11 @@ public:
   // without children. Pass the previous candidate to continue the scan.
   [[nodiscard]] std::optional<CacheEvictionCandidate>
   diskCandidate(bool duplicate, uint64_t after = 0) const;
+  // Oldest unused holder of a disk copy that no state needs: none sits at
+  // its block or below. A disk-only one is a leaf.
+  [[nodiscard]] std::optional<CacheEvictionCandidate> unneededCopy() const noexcept {
+    return unneeded_.oldest();
+  }
   // The blocks below a block, each after its children, visiting only that
   // subtree; empty when one of them is in transfer or active. Below a
   // resident leaf they are disk-only; below a poisoned block some may be
@@ -163,6 +187,7 @@ private:
     std::shared_ptr<KvDiskSlot> slot;
     uint32_t children = 0;
     uint32_t residentChildren = 0;
+    uint32_t statesHere = 0;
     uint32_t statesBelow = 0;
     uint32_t statesInUseBelow = 0;
     uint32_t activeUsers = 0;
@@ -173,6 +198,7 @@ private:
     bool hadState = false;
     RecencyOrder::Node ramNode;
     RecencyOrder::Node diskNode;
+    RecencyOrder::Node unneededNode;
   };
 
   [[nodiscard]] Block &block(uint64_t blockId);
@@ -205,6 +231,7 @@ private:
   RecencyOrder ramLeaves_;
   RecencyOrder duplicates_;
   RecencyOrder diskLeaves_;
+  RecencyOrder unneeded_;
   uint32_t diskBlocks_ = 0;
 };
 

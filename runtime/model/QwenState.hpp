@@ -122,6 +122,7 @@ public:
   }
   [[nodiscard]] std::unique_ptr<StateOffload>
   offload(std::function<void()> completion) const override;
+  void label(std::vector<std::byte> label) const override;
 
 private:
   QwenCompositeState(std::shared_ptr<QwenBufferPool> pool,
@@ -228,6 +229,11 @@ public:
   [[nodiscard]] std::unique_ptr<StateRestore> beginRestore(
       uint32_t lane, const CompositeState &state, bool restoreDraftState,
       std::function<void()> completion, std::function<void()> committed);
+  // Takes back the disk copy of a state at `tokens` that an earlier process
+  // recorded in a persistent tier's file. A cached state holds a complete
+  // draft window, so its lengths follow from its boundary.
+  [[nodiscard]] std::shared_ptr<const CompositeState> adopt(const SlotRecord &record,
+                                                            uint32_t tokens);
 
   [[nodiscard]] uint64_t actualAllocatedBytes() const noexcept {
     return allocations_->bytes.load(std::memory_order_relaxed);

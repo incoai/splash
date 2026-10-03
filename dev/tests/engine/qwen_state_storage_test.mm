@@ -4,8 +4,12 @@
 #include "model/QwenState.hpp"
 #include "tests/engine/TestChecks.hpp"
 
+#include <unistd.h>
+
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <future>
 #include <chrono>
@@ -375,6 +379,78 @@ void testStateSmallerThanSlot(metal::MetalBackend &backend) {
   }
 }
 
+// A persistent tier keeps a written state's slot and label for the next
+// process, whose storage takes the state back from its boundary alone: it
+// restores every byte, with the lengths of a cached state's complete draft
+// window, and a state whose slot changed after its record fails its
+// restore.
+void testPersistentStateComesBack(metal::MetalBackend &backend) {
+  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
+                          queryHostAvailableMemory, 0);
+  std::string name = (std::filesystem::temp_directory_path() / "splash-states-XXXXXX").string();
+  require(::mkdtemp(name.data()) != nullptr, "temporary directory could not be made");
+  const std::filesystem::path directory = name;
+  const model::SlotFile::Persistence persistence{directory / "state.slots",
+                                                 directory / "state.records", {}, 8};
+  const auto budget = std::make_shared<model::DiskBudget>(2 * kStateSlotBytes);
+  std::vector<std::vector<uint8_t>> images;
+  {
+    auto file = std::make_shared<model::SlotFile>(kStateSlotBytes, budget, persistence);
+    file->finishAdoption();
+    model::QwenStateStorage storage(backend, governor.allocationAdmission(), kStateLayout, file);
+    require(static_cast<bool>(storage.tryActivateLane(0, 5)), "lane activation failed");
+    std::vector<std::shared_ptr<const CompositeState>> kept;
+    for (uint64_t seed : {40, 50}) {
+      fill(storage.current(0).stateBase, seed);
+      for (size_t layer = 0; layer < storage.draft(0).size(); ++layer) {
+        fill(storage.draft(0)[layer].keys, seed + 1 + 2 * layer);
+        fill(storage.draft(0)[layer].values, seed + 2 + 2 * layer);
+      }
+      if (images.empty())
+        images = stateImage(storage, 0);
+      storage.updateLengths(0, {4096, 2048, 2048});
+      auto write = storage.snapshotToDisk(0, {});
+      require(write != nullptr, "a state write was refused");
+      kept.push_back(write->state());
+      kept.back()->label(std::vector<std::byte>(8, std::byte{static_cast<uint8_t>(seed)}));
+      require(finishWhenReady(*write), "a state write failed");
+    }
+    require(file->synchronize({})->wait(), "the state file did not synchronize");
+    file->seal();
+    storage.releaseLane(0, 5);
+  }
+  {
+    // The second state's slot changes after its record was written.
+    std::fstream slots(directory / "state.slots", std::ios::in | std::ios::out | std::ios::binary);
+    slots.seekp(static_cast<std::streamoff>(kStateSlotBytes + 100));
+    slots.put('\x7f');
+  }
+  auto file = std::make_shared<model::SlotFile>(kStateSlotBytes, budget, persistence);
+  model::QwenStateStorage storage(backend, governor.allocationAdmission(), kStateLayout, file);
+  const std::vector<model::SlotRecord> records = file->records();
+  require(records.size() == 2 && records[0].label == std::vector<std::byte>(8, std::byte{40}),
+          "the next process did not find both labelled states");
+  requireThrows<std::invalid_argument>([&] { static_cast<void>(storage.adopt(records[0], 4100)); },
+                                       "a state was taken back at a boundary off a page");
+  auto intact = storage.adopt(records[0], 4096);
+  auto changed = storage.adopt(records[1], 4096);
+  file->finishAdoption();
+  require(intact && !intact->residentBytes() && intact->bytes() == kStateLayout.cachedBytes(),
+          "a state taken back is not a disk copy of the layout");
+  require(static_cast<bool>(storage.tryActivateLane(0, 6)), "lane activation failed");
+  fill(storage.current(0).stateBase, 99);
+  auto read = storage.beginRestore(0, *intact, true, {}, [] {});
+  require(read && finishWhenReady(*read) && stateImage(storage, 0) == images &&
+              storage.metadata(0).lengths == model::QwenLogicalLengths{4096, 2048, 2048},
+          "a state taken back did not restore every byte and its lengths");
+  read = storage.beginRestore(0, *changed, true, {}, [] {});
+  require(read && !finishWhenReady(*read), "a state whose slot changed was restored");
+  read.reset();
+  storage.releaseLane(0, 6);
+  std::error_code ignored;
+  std::filesystem::remove_all(directory, ignored);
+}
+
 void run(const std::string &metallib) {
   using model::QwenCompositeState;
   using model::QwenLogicalLengths;
@@ -386,6 +462,7 @@ void run(const std::string &metallib) {
   testDiskRestore(backend);
   testDirectDiskSnapshot(backend);
   testStateSmallerThanSlot(backend);
+  testPersistentStateComesBack(backend);
   MemoryGovernor governor(
       backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
       queryHostAvailableMemory, 0);

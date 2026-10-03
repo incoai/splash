@@ -129,9 +129,10 @@ public:
   // holds the staging buffer.
   enum class Unwritten : uint8_t { Drop, Wait, Keep };
 
-  // makeRoom gives up disk copies for a state's write the quota refuses.
-  StateCache(KvCache &kv, CacheRecency &recency, DiskRoom makeRoom)
-      : kv_(kv), recency_(recency), makeRoom_(std::move(makeRoom)) {}
+  // makeRoom gives up disk copies for a state's write the quota refuses. In
+  // a persistent tier every write labels its disk copy (CompositeState::label).
+  StateCache(KvCache &kv, CacheRecency &recency, DiskRoom makeRoom, bool persistent)
+      : kv_(kv), recency_(recency), makeRoom_(std::move(makeRoom)), persistent_(persistent) {}
   StateCache(const StateCache &) = delete;
   StateCache &operator=(const StateCache &) = delete;
 
@@ -229,6 +230,10 @@ public:
   void discardState(uint64_t kvBlock, const CompositeState *state) noexcept;
   // Whatever the block holds leaves once unpinned.
   void invalidate(uint64_t kvBlock) noexcept;
+  // Takes back the disk copy of a state an earlier process left at this
+  // block in a persistent tier, with the recency and class it had.
+  void adoptDisk(uint64_t kvBlock, std::shared_ptr<const CompositeState> state, uint64_t lastUsed,
+                 bool checkpoint);
   // A restored disk copy without a RAM copy takes one.
   [[nodiscard]] bool promotable(uint64_t kvBlock, const CompositeState *source) const noexcept;
   void promote(uint64_t kvBlock, const CompositeState *source,
@@ -282,6 +287,9 @@ private:
   // The disk copy this write carries becomes the entry's; the write is the
   // one in flight.
   void beginWrite(uint64_t kvBlock, Entry &entry, std::unique_ptr<StateOffload> transfer);
+  // In a persistent tier, labels the entry's disk copy with its block,
+  // class and recency.
+  void labelDisk(uint64_t kvBlock, const Entry &entry) const;
   [[nodiscard]] StateEviction erase(uint64_t kvBlock, bool retirement) noexcept;
   void release(uint64_t kvBlock) noexcept;
   void unuse(uint64_t kvBlock) noexcept;
@@ -300,6 +308,7 @@ private:
   KvCache &kv_;
   CacheRecency &recency_;
   DiskRoom makeRoom_;
+  bool persistent_;
   std::function<void()> completion_;
   std::unordered_map<uint64_t, Entry> entries_;
   RecencyOrder ordinary_;

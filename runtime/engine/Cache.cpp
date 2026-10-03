@@ -1,9 +1,12 @@
 #include "engine/Cache.hpp"
 
+#include "engine/DiskLabels.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <limits>
 #include <stdexcept>
+#include <unordered_set>
 #include <utility>
 
 namespace splash::engine {
@@ -17,13 +20,123 @@ std::span<const ImageSpan> spansFrom(std::span<const ImageSpan> images, uint64_t
   return {std::partition_point(images.begin(), images.end(), ended), images.end()};
 }
 
+// The left candidate exists and was used before the right one, if any.
+bool older(const std::optional<CacheEvictionCandidate> &left,
+           const std::optional<CacheEvictionCandidate> &right) noexcept {
+  return left && (!right || left->lastUsed < right->lastUsed);
+}
+
 } // namespace
 
 Cache::Cache(KvPool &pool, KvTier *kvTier,
              std::shared_ptr<const model::DiskBudget> diskBudget)
-    : pool_(pool), tier_(kvTier), diskBudget_(std::move(diskBudget)),
-      kv_(pool, recency_),
-      states_(kv_, recency_, [this](bool inUse) { return freeDiskSpace(inUse); }) {}
+    : pool_(pool), tier_(kvTier), persistent_(kvTier && kvTier->persistent()),
+      diskBudget_(std::move(diskBudget)), kv_(pool, recency_),
+      states_(kv_, recency_, [this](bool inUse) { return freeDiskSpace(inUse); }, persistent_) {}
+
+CacheAdoption Cache::adopt(std::vector<PersistedKv> blocks, std::vector<PersistedState> states) {
+  if (!persistent_)
+    throw std::logic_error("a cache takes back copies only from a persistent tier");
+  if (!requests_.empty() || kv_.diskBlocks() || states_.snapshot().entries)
+    throw std::logic_error("a cache takes back copies only before anything else is in it");
+  CacheAdoption result;
+  // Every block's label by id. A parent's id is lower than its children's,
+  // so a chain resolves in id order and a cycle cannot form.
+  struct Recorded final {
+    KvBlockLabel label;
+    size_t index = 0;
+    // Tokens up to and including the block; zero while its chain is broken.
+    uint32_t tokens = 0;
+    bool needed = false;
+  };
+  std::map<uint64_t, Recorded> recorded;
+  // New ids continue after every id a record names, taken back or not: a
+  // record whose clearing a crash lost must never name a block of this
+  // process.
+  uint64_t highestId = 0;
+  for (size_t index = 0; index < blocks.size(); ++index) {
+    const auto label = decodeLabel<KvBlockLabel>(blocks[index].label);
+    if (label)
+      highestId = std::max(highestId, label->id);
+    if (!label || !label->id || label->parent >= label->id ||
+        !recorded.emplace(label->id, Recorded{*label, index}).second)
+      ++result.dropped;
+  }
+  for (auto &[id, block] : recorded) {
+    if (!block.label.parent) {
+      block.tokens = KvCache::pageTokens;
+    } else if (auto parent = recorded.find(block.label.parent);
+               parent != recorded.end() && parent->second.tokens) {
+      block.tokens = parent->second.tokens + KvCache::pageTokens;
+    }
+  }
+  // A state comes back with its whole chain; a block only for a state.
+  std::vector<std::pair<StateLabel, size_t>> kept;
+  for (size_t index = 0; index < states.size(); ++index) {
+    const auto label = decodeLabel<StateLabel>(states[index].label);
+    if (label)
+      highestId = std::max(highestId, label->block);
+    const auto block = label ? recorded.find(label->block) : recorded.end();
+    if (block == recorded.end() || !block->second.tokens ||
+        block->second.tokens != label->tokens) {
+      ++result.dropped;
+      continue;
+    }
+    kept.emplace_back(*label, index);
+    for (auto above = block; above != recorded.end() && !above->second.needed;
+         above = recorded.find(above->second.label.parent))
+      above->second.needed = true;
+  }
+  // A record its file refuses, or whose key another block took, stays
+  // behind like a damaged one, and so does everything below it.
+  uint64_t lastUsed = 0;
+  std::unordered_set<uint64_t> adopted;
+  for (auto &[id, block] : recorded) {
+    std::shared_ptr<KvDiskSlot> slot;
+    if (block.needed && (!block.label.parent || adopted.contains(block.label.parent))) {
+      try {
+        slot = blocks[block.index].adopt();
+      } catch (const std::invalid_argument &) {
+      }
+    }
+    if (!slot || !kv_.adoptDiskBlock(id, block.label.parent, block.label.tokens,
+                                     {block.label.imagesLo, block.label.imagesHi},
+                                     std::move(slot), block.label.lastUsed)) {
+      ++result.dropped;
+      continue;
+    }
+    adopted.insert(id);
+    lastUsed = std::max(lastUsed, block.label.lastUsed);
+  }
+  // A block holds one state; a second record for it is a stale one.
+  std::unordered_set<uint64_t> stated;
+  for (const auto &[label, index] : kept) {
+    std::shared_ptr<const CompositeState> state;
+    if (adopted.contains(label.block) && stated.insert(label.block).second) {
+      try {
+        state = states[index].adopt(label.tokens);
+      } catch (const std::invalid_argument &) {
+      }
+    }
+    if (!state) {
+      ++result.dropped;
+      continue;
+    }
+    states_.adoptDisk(label.block, std::move(state), label.lastUsed, label.checkpoint != 0);
+    lastUsed = std::max(lastUsed, label.lastUsed);
+  }
+  recency_.continueAfter(lastUsed);
+  kv_.continueIdsAfter(highestId);
+  // A lower quota than the earlier process had takes the oldest copies.
+  while (diskBudget_ && diskBudget_->usedBytes() > diskBudget_->capacityBytes() &&
+         freeDiskSpace(true))
+    ++result.dropped;
+  const StateCacheSnapshot held = states_.snapshot();
+  result.states = held.entries;
+  result.blocks = kv_.diskBlocks();
+  result.bytes = held.diskBytes + uint64_t{result.blocks} * tier_->slotBytes();
+  return result;
+}
 
 void Cache::beginRequest(uint64_t requestId) {
   if (!requestId)
@@ -729,10 +842,20 @@ Cache::LeafReclaim Cache::demoteKv(uint64_t block) {
     ++kvTier_.demotionsRefused;
     return transfersInFlight() ? LeafReclaim::Pending : LeafReclaim::Impossible;
   }
+  labelKv(block, slot);
   kv_.setSlot(block, std::move(slot));
   kv_.setTransferring(block, true);
   demotions_.push_back({block, std::move(transfer)});
   return LeafReclaim::Started;
+}
+
+void Cache::labelKv(uint64_t block, const std::shared_ptr<KvDiskSlot> &slot) {
+  if (!persistent_)
+    return;
+  const KvCache::Key key = kv_.key(block);
+  KvBlockLabel label{block, key.parent, kv_.lastUsed(block), key.images.lo, key.images.hi, {}};
+  std::copy(key.tokens.begin(), key.tokens.end(), label.tokens.begin());
+  tier_->label(slot, encodeLabel(label));
 }
 
 std::shared_ptr<KvDiskSlot> Cache::acquireDiskSlot(bool inUse) {
@@ -745,10 +868,8 @@ std::shared_ptr<KvDiskSlot> Cache::acquireDiskSlot(bool inUse) {
 }
 
 bool Cache::freeDiskSpace(bool inUse) {
-  const auto older = [](const std::optional<CacheEvictionCandidate> &left,
-                        const std::optional<CacheEvictionCandidate> &right) {
-    return left && (!right || left->lastUsed < right->lastUsed);
-  };
+  if (persistent_)
+    return dropUnneededCopy() || dropOldestPoint(inUse);
   // A redundant copy loses nothing: its data stays in RAM.
   const auto kvDuplicate = kv_.diskCandidate(true);
   const auto stateDuplicate = states_.diskCandidate(true);
@@ -779,6 +900,32 @@ bool Cache::freeDiskSpace(bool inUse) {
   }
   states_.evict(kvLeaf->id);
   kv_.erase(kvLeaf->id);
+  return true;
+}
+
+bool Cache::dropOldestPoint(bool inUse) {
+  const auto redundant = states_.diskCandidate(true);
+  const auto only = states_.diskCandidate(false);
+  std::optional<CacheEvictionCandidate> victim = older(only, redundant) ? only : redundant;
+  if (!victim && inUse)
+    victim = states_.inUseDiskCandidate();
+  if (!victim)
+    return false;
+  if (states_.stateResident(victim->id))
+    states_.dropDisk(victim->id);
+  else
+    states_.evict(victim->id);
+  return true;
+}
+
+bool Cache::dropUnneededCopy() {
+  const auto unneeded = kv_.unneededCopy();
+  if (!unneeded)
+    return false;
+  if (kv_.page(unneeded->id) != KvCache::noPage)
+    kv_.setSlot(unneeded->id, nullptr);
+  else
+    kv_.erase(unneeded->id);
   return true;
 }
 

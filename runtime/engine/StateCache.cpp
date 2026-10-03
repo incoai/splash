@@ -1,5 +1,7 @@
 #include "engine/StateCache.hpp"
 
+#include "engine/DiskLabels.hpp"
+
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
@@ -206,6 +208,7 @@ bool StateCache::publishStateToDisk(uint64_t kvBlock, const StateWriter &write,
   beginWrite(kvBlock, entry, std::move(transfer));
   if (!entry.pins)
     entry.lastUsed = recency_.next();
+  labelDisk(kvBlock, entry);
   reindex(kvBlock, entry);
   ++publications_;
   return true;
@@ -308,8 +311,10 @@ StateEviction StateCache::reclaim(uint64_t kvBlock, Unwritten unwritten) {
   if (writable) {
     if (auto transfer = startWrite(kvBlock, [state = entry.ram](std::function<void()> done) {
           return state->offload(std::move(done));
-        }))
+        })) {
       beginWrite(kvBlock, entry, std::move(transfer));
+      labelDisk(kvBlock, entry);
+    }
   }
   if (!entry.disk)
     return unwritten == Unwritten::Keep ? StateEviction{} : erase(kvBlock, false);
@@ -360,6 +365,25 @@ void StateCache::invalidate(uint64_t kvBlock) noexcept {
   const auto found = entries_.find(kvBlock);
   if (found != entries_.end())
     discardState(kvBlock, copy(found->second).get());
+}
+
+void StateCache::adoptDisk(uint64_t kvBlock, std::shared_ptr<const CompositeState> state,
+                           uint64_t lastUsed, bool checkpoint) {
+  if (!state || !state->bytes() || state->residentBytes())
+    throw std::invalid_argument("an adopted composite state is a disk copy");
+  if (!kv_.contains(kvBlock) || entries_.contains(kvBlock))
+    throw std::invalid_argument("adopted composite state has no block of its own");
+  Entry &entry = entryFor(kvBlock);
+  if (checkpoint) {
+    entry.checkpoint = true;
+    ++checkpointEntries_;
+  } else {
+    kv_.noteState(kvBlock);
+  }
+  entry.disk = std::move(state);
+  diskBytes_ += entry.disk->bytes();
+  entry.lastUsed = lastUsed;
+  reindex(kvBlock, entry);
 }
 
 bool StateCache::promotable(uint64_t kvBlock, const CompositeState *source) const noexcept {
@@ -543,6 +567,14 @@ void StateCache::beginWrite(uint64_t kvBlock, Entry &target,
   diskBytes_ += target.disk->bytes();
   pending_.emplace(PendingOffload{kvBlock, std::move(transfer)});
   ++offloads_;
+}
+
+void StateCache::labelDisk(uint64_t kvBlock, const Entry &target) const {
+  if (!persistent_)
+    return;
+  target.disk->label(encodeLabel(StateLabel{
+      kvBlock, target.lastUsed, kv_.chainLength(kvBlock) * KvCache::pageTokens,
+      target.checkpoint ? 1u : 0u}));
 }
 
 // RAM copies wait for eviction in one order per class: checkpoints,

@@ -1,8 +1,10 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <vector>
 
 namespace splash::engine {
 
@@ -35,6 +37,11 @@ public:
   [[nodiscard]] virtual uint64_t slotBytes() const noexcept = 0;
   // False once a write has failed; existing copies stay readable.
   [[nodiscard]] virtual bool writable() const noexcept = 0;
+  // The tier's copies outlive the process (model::SlotFile::Persistence).
+  [[nodiscard]] virtual bool persistent() const noexcept = 0;
+  // In a persistent tier, keeps the label with the slot once the demotion
+  // started before it has landed (model::SlotFile::label).
+  virtual void label(const std::shared_ptr<KvDiskSlot> &slot, std::vector<std::byte> label) = 0;
   // Engine-thread admission probe, before replacing any disk copies.
   [[nodiscard]] virtual bool canDemote() const noexcept = 0;
   // Engine-thread admission probe, before building a restore's arguments.
