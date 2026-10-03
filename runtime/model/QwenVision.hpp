@@ -5,11 +5,12 @@
 
 #include <cstdint>
 #include <filesystem>
-#include <string>
 #include <string_view>
 #include <vector>
 
 namespace splash::model {
+
+class VisionLoader;
 
 // The current Qwen targets share one vision-tower architecture. Its language
 // projection width belongs to VisionLayout, so the loader is independent of a
@@ -18,14 +19,15 @@ struct QwenVisionWeights final {
   ops::VisionWeights tensors;
   std::vector<WeightFileRecord> files;
   uint64_t actualAllocatedBytes = 0;
-  std::string manifestFingerprintSha256;
 };
 
-inline constexpr std::string_view kVisionMagic = "MDFV0001";
-
+// The packed vision/model.bin of directory.
 [[nodiscard]] QwenVisionWeights
 loadQwenVisionWeights(metal::MetalBackend &backend,
                       const std::filesystem::path &directory,
-                      ops::VisionLayout layout = {});
+                      ops::VisionLayout layout);
+// The same layout, prepared from an upstream source.
+[[nodiscard]] QwenVisionWeights
+loadQwenVisionWeights(metal::MetalBackend &backend, const VisionLoader &source);
 
 } // namespace splash::model

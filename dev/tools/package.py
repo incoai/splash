@@ -4,6 +4,7 @@
 import argparse
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -24,10 +25,22 @@ INSTALL_FILES = (
     "clients.py",
     "paths.py",
     "models.py",
+    "hub.py",
+    "families.py",
+    "assembly.py",
+    "legacy.py",
+    "upstream.py",
+    "gguf.py",
     "catalog.py",
     "requirements.txt",
 )
-COMPLETION_FILES = ("models", "_splash", "splash.bash", "official-models.txt")
+COMPLETION_FILES = (
+    "models",
+    "_splash",
+    "splash.bash",
+    "official-models.txt",
+    "suggested-models.txt",
+)
 SERVER_FILES = (
     "__init__.py",
     "server.py",
@@ -35,6 +48,7 @@ SERVER_FILES = (
     "constraints.py",
     "output.py",
     "frontend.py",
+    "chat_templates.py",
     "judgments.py",
     "diagnostics.py",
     "api_shapes.py",
@@ -50,11 +64,16 @@ SERVER_FILES = (
     "documents.py",
     "document_worker.py",
     "http_security.py",
+    "origins.py",
+    "serve_options.py",
     "thinking.py",
     "schema_validation.py",
     "crash_trace.py",
     "chat.html",
+    "favicon.svg",
 )
+# Splash's license and the notices of the third-party code it ships.
+LICENSE_FILES = ("LICENSE", "THIRD_PARTY_NOTICES")
 
 
 def digest(path):
@@ -73,7 +92,7 @@ def stage_runtime(destination, version):
         source = ROOT / ("build" if folder == "engine" else folder)
         for name in names:
             shutil.copy2(source / name, destination / folder / name)
-    for name in ("LICENSE",):
+    for name in LICENSE_FILES:
         shutil.copy2(ROOT / name, destination / name)
     (destination / "release.json").write_text(
         json.dumps(
@@ -131,7 +150,7 @@ class Splash < Formula
   def caveats
     <<~CAVEAT
       Serve a model:
-        splash serve --model incoai/Qwen3.8-27B-Splash
+        splash serve --model mlx-community/Qwen3.8-27B-4bit
     CAVEAT
   end
 
@@ -203,6 +222,15 @@ def main(argv=None):
             ],
             cwd=stage,
             check=True,
+        )
+        # The server's entry point as the launcher starts it, which the
+        # import above does not run. Not isolated: -I would ignore PYTHONPATH.
+        subprocess.run(
+            [str(python), "-P", "-m", "server.server", "--help"],
+            cwd=stage,
+            env={**os.environ, "PYTHONPATH": str(stage)},
+            check=True,
+            stdout=subprocess.DEVNULL,
         )
         subprocess.run(
             [str(python), "-B", str(stage / "install/launcher.py"), "--help"],

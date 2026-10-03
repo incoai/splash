@@ -1,6 +1,7 @@
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/KernelABI.h"
 #include "metal/kernels/common/gdn_primitives.h"
+#include "metal/kernels/common/rms_inverse.h"
 
 constant constexpr uint GdnScanBlock = 16;
 
@@ -188,14 +189,15 @@ GDN_SCAN_PREFILL_ENTRY(prefill_gdn_scan_vh32, 16, 32, 128)
 // Prepares one token of one key head: causal convolution, SiLU, q/k RMS
 // normalization, value-head gates and (from the first token) convolution carry.
 // Round q/k to bf16 before applying the 1/128 and 1/sqrt(128) scales.
-template <uint KeyHeads, uint ValueHeads, uint HeadDim, uint ConvDim>
+template <uint KeyHeads, uint ValueHeads, uint HeadDim, uint ConvDim,
+          uint PackedWidth>
 inline void gdn_prepare_prefill_phase(
     device const bfloat *packed, device const bfloat *conv_weights,
     device const bfloat *conv_state_in, device bfloat *conv_state_out,
     device bfloat *q, device bfloat *k, device bfloat *v,
     device const float *a_scale, device const bfloat *dt_bias,
     device float *decay, device bfloat *beta,
-    constant GDNPreparePrefillParams &params, threadgroup float *reductions,
+    constant GDNPrefillParams &params, threadgroup float *reductions,
     uint task, uint thread_index, uint lane, uint simd_group) {
   constexpr uint KeyWidth = KeyHeads * HeadDim;
   constexpr uint ValueWidth = ValueHeads * HeadDim;
@@ -211,11 +213,11 @@ inline void gdn_prepare_prefill_phase(
       2 * KeyWidth + key_head * HeadsPerKey * HeadDim + thread_index;
 
   const float query =
-      float(gdn_conv_silu(packed, conv_state_in, conv_weights,
-                          params.packed_width, ConvDim, token, query_channel));
+      float(gdn_conv_silu(packed, conv_state_in, conv_weights, PackedWidth,
+                          ConvDim, token, query_channel));
   const float key =
-      float(gdn_conv_silu(packed, conv_state_in, conv_weights,
-                          params.packed_width, ConvDim, token, key_channel));
+      float(gdn_conv_silu(packed, conv_state_in, conv_weights, PackedWidth,
+                          ConvDim, token, key_channel));
   const float query_sum = simd_sum(query * query);
   const float key_sum = simd_sum(key * key);
   if (lane == 0) {
@@ -227,11 +229,11 @@ inline void gdn_prepare_prefill_phase(
     reductions[0] =
         rsqrt((reductions[0] + reductions[1] + reductions[2] + reductions[3]) /
                   HeadDim +
-              1e-6f);
+              kRmsEpsilon);
     reductions[4] =
         rsqrt((reductions[4] + reductions[5] + reductions[6] + reductions[7]) /
                   HeadDim +
-              1e-6f);
+              kRmsEpsilon);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const ulong key_row = ulong(token) * KeyWidth;
@@ -242,14 +244,16 @@ inline void gdn_prepare_prefill_phase(
   for (uint head = 0; head < HeadsPerKey; ++head) {
     const uint channel = value_channel + head * HeadDim;
     v[ulong(token) * ValueWidth + channel - 2 * KeyWidth] =
-        gdn_conv_silu(packed, conv_state_in, conv_weights, params.packed_width,
+        gdn_conv_silu(packed, conv_state_in, conv_weights, PackedWidth,
                       ConvDim, token, channel);
   }
   if (thread_index < HeadsPerKey) {
     const uint head = key_head * HeadsPerKey + thread_index;
     const uint gate = token * ValueHeads + head;
-    gdn_write_gates(packed + token * params.packed_width, dt_bias, a_scale,
-                    BOffset, AOffset, head, beta[gate], decay[gate]);
+    const GdnGates gates = gdn_gates(packed + token * PackedWidth, dt_bias,
+                                     a_scale, BOffset, AOffset, head);
+    beta[gate] = gates.beta;
+    decay[gate] = gates.decay;
   }
   if (token == 0) {
     for (uint row = 0; row < 3; ++row) {
@@ -258,7 +262,7 @@ inline void gdn_prepare_prefill_phase(
                              : head == 1 ? key_channel
                                          : value_channel + (head - 2) * HeadDim;
         conv_state_out[row * ConvDim + channel] =
-            gdn_conv_carry(packed, conv_state_in, params.packed_width, ConvDim,
+            gdn_conv_carry(packed, conv_state_in, PackedWidth, ConvDim,
                            params.tokens, row, channel);
       }
     }
@@ -266,7 +270,7 @@ inline void gdn_prepare_prefill_phase(
 }
 
 #define GDN_PREPARE_PREFILL_ENTRY(Name, KeyHeads, ValueHeads, HeadDim,        \
-                                  ConvDim)                                    \
+                                  ConvDim, PackedWidth)                       \
   kernel void Name(                                                           \
       device const bfloat *packed [[buffer(0)]],                              \
       device const bfloat *conv_weights [[buffer(1)]],                        \
@@ -277,40 +281,45 @@ inline void gdn_prepare_prefill_phase(
       device const float *a_scale [[buffer(7)]],                              \
       device const bfloat *dt_bias [[buffer(8)]],                             \
       device float *decay [[buffer(9)]], device bfloat *beta [[buffer(10)]],  \
-      constant GDNPreparePrefillParams &params [[buffer(11)]],                \
+      constant GDNPrefillParams &params [[buffer(11)]],                       \
       uint task [[threadgroup_position_in_grid]],                             \
       uint thread_index [[thread_index_in_threadgroup]],                      \
       uint lane [[thread_index_in_simdgroup]],                                \
       uint simd_group [[simdgroup_index_in_threadgroup]]) {                   \
     threadgroup float reductions[8];                                          \
-    gdn_prepare_prefill_phase<KeyHeads, ValueHeads, HeadDim, ConvDim>(        \
+    gdn_prepare_prefill_phase<KeyHeads, ValueHeads, HeadDim, ConvDim,         \
+                              PackedWidth>(                                   \
         packed, conv_weights, conv_state_in, conv_state_out, q, k, v, a_scale,\
         dt_bias, decay, beta, params, reductions, task, thread_index, lane,   \
         simd_group);                                                          \
   }
 
-GDN_PREPARE_PREFILL_ENTRY(prefill_gdn_prepare, 16, 48, 128, 10240)
-GDN_PREPARE_PREFILL_ENTRY(prefill_gdn_prepare_vh32, 16, 32, 128, 8192)
+GDN_PREPARE_PREFILL_ENTRY(prefill_gdn_prepare, 16, 48, 128, 10240, 16640)
+GDN_PREPARE_PREFILL_ENTRY(prefill_gdn_prepare_vh32, 16, 32, 128, 8192, 12544)
 #undef GDN_PREPARE_PREFILL_ENTRY
 
-#define GDN_GATE_PREFILL_ENTRY(Name, ValueHeads, HeadDim, ConvDim)             \
+// W: the norm weights' stored type (float: a GGUF's F32 norms, _f32).
+#define GDN_GATE_PREFILL_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim,  \
+                               PackedWidth, W)                                \
   kernel void Name(                                                           \
       device const bfloat *recurrent [[buffer(0)]],                           \
       device const bfloat *packed [[buffer(1)]],                              \
-      device const bfloat *norm_weight [[buffer(2)]],                         \
+      device const W *norm_weight [[buffer(2)]],                              \
       device bfloat *hidden [[buffer(3)]],                                    \
-      constant GDNPreparePrefillParams &params [[buffer(4)]],                 \
+      constant GDNGatePrefillParams &params [[buffer(4)]],                    \
       uint task [[threadgroup_position_in_grid]],                             \
       uint thread_index [[thread_index_in_threadgroup]],                      \
       uint lane [[thread_index_in_simdgroup]],                                \
       uint simd_group [[simdgroup_index_in_threadgroup]]) {                   \
     threadgroup float reductions[4];                                          \
-    gdn_gate_phase<ValueHeads, HeadDim, ConvDim, 4>(                          \
-        recurrent, packed, norm_weight, hidden, params.tokens * ValueHeads,   \
-        params.tokens * ValueHeads, params.packed_width, reductions, task,     \
-        thread_index, lane, simd_group);                                      \
+    gdn_gate_phase<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth>(      \
+        recurrent, packed, norm_weight, hidden, task,                         \
+        params.tiled_heads != 0, reductions, thread_index, lane, simd_group); \
   }
 
-GDN_GATE_PREFILL_ENTRY(prefill_gdn_gate, 48, 128, 10240)
-GDN_GATE_PREFILL_ENTRY(prefill_gdn_gate_vh32, 32, 128, 8192)
+GDN_GATE_PREFILL_ENTRY(prefill_gdn_gate, 16, 48, 128, 10240, 16640, bfloat)
+GDN_GATE_PREFILL_ENTRY(prefill_gdn_gate_vh32, 16, 32, 128, 8192, 12544, bfloat)
+GDN_GATE_PREFILL_ENTRY(prefill_gdn_gate_f32, 16, 48, 128, 10240, 16640, float)
+GDN_GATE_PREFILL_ENTRY(prefill_gdn_gate_vh32_f32, 16, 32, 128, 8192, 12544,
+                       float)
 #undef GDN_GATE_PREFILL_ENTRY

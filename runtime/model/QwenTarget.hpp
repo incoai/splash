@@ -1,126 +1,71 @@
 #pragma once
 
 #include "Model.hpp"
+#include "QwenHybridLayout.hpp"
 #include "StateLayout.hpp"
 #include "WeightStore.hpp"
 #include "ops/GDN.hpp"
 #include "ops/ExecutionPlans.hpp"
 #include "ops/Linear.hpp"
 #include "ops/MoE.hpp"
+#include "ops/Normalization.hpp"
 #include "ops/PagedAttention.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
-#include <filesystem>
+#include <optional>
 #include <span>
 #include <string>
-#include <string_view>
 #include <variant>
+#include <vector>
 
 namespace splash::model {
 
-struct Qwen3_8Weights;
-struct Qwen3_6MoeWeights;
-
-enum class QwenFfnKind : uint8_t { Dense, SparseMoe };
+struct Qwen3_8Layout;
+struct Qwen3_8LayerWeights;
+struct Qwen3_6MoeLayout;
+struct Qwen3_6MoeLayerWeights;
 
 // Both supported targets bind the same mixer tensors per hybrid layer; only
 // the FFN differs between them.
 struct QwenGdnWeights final {
-  ops::Q4Projection inputProjection;
+  ops::Projection inputProjection;
   metal::MetalBuffer convolutionWeights;
   metal::MetalBuffer decay;
   metal::MetalBuffer timeBias;
-  metal::MetalBuffer mixerNorm;
-  ops::Q4Projection outputProjection;
+  ops::NormWeights mixerNorm;
+  ops::Projection outputProjection;
+  // The value-head order of outputProjection's input columns, in which the
+  // GDN writes its output.
+  ops::GdnHeadOrder outputHeadOrder = ops::GdnHeadOrder::Grouped;
 };
 
 struct QwenAttentionWeights final {
-  ops::Q4Projection inputProjection;
-  metal::MetalBuffer queryNorm;
-  metal::MetalBuffer keyNorm;
-  ops::Q4Projection outputProjection;
+  ops::Projection inputProjection;
+  ops::NormWeights queryNorm;
+  ops::NormWeights keyNorm;
+  ops::Projection outputProjection;
 };
 
 using QwenMixerWeights = std::variant<QwenGdnWeights, QwenAttentionWeights>;
 
-// Sizes of the mixer sections in a packed layer file.
-struct QwenMixerGeometry final {
-  uint32_t hiddenSize = 0;
-  uint32_t packedGdnWidth = 0;
-  uint32_t packedAttentionWidth = 0;
-  uint32_t convolutionDimension = 0;
-  uint32_t gdnValueHeads = 0;
-  uint32_t gdnHeadDimension = 0;
-  uint32_t attentionWidth = 0;
-  uint32_t attentionHeadDimension = 0;
+// A Qwen target's weights outside its layers and the record of every file
+// its weights were read from.
+struct QwenTargetWeightsBase {
+  ops::NormWeights finalNorm;
+  ops::Projection logitsProjection;
+  ops::EmbeddingWeights tokenEmbedding;
+  std::vector<WeightFileRecord> files;
+  uint64_t actualAllocatedBytes = 0;
+  std::string manifestFingerprintSha256;
 };
 
-// Reads the mixer sections that follow a layer's input norm, in file order.
-[[nodiscard]] QwenMixerWeights readQwenMixer(WeightFile &file,
-                                             metal::MetalBackend &backend,
-                                             const QwenMixerGeometry &geometry,
-                                             bool fullAttention);
-
-inline constexpr std::string_view kEmbeddingMagic = "MDFE0001";
-
-// Reads a packed target directory: one file per hybrid layer (input norm,
-// mixer, post-attention norm, then the architecture's FFN through readFfn),
-// head.bin and embedding.bin. Weights is the architecture's weight struct.
-template <class Weights, class Layout, class ReadFfn>
-[[nodiscard]] Weights
-loadQwenTargetWeights(metal::MetalBackend &backend,
-                      const std::filesystem::path &directory,
-                      const Layout &layout, std::string_view headMagic,
-                      ReadFfn readFfn) {
-  const uint64_t allocationBaseline = backend.memoryStats().allocatedBytes;
-  Weights result;
-  result.layout = layout;
-  result.layers.reserve(layout.layers);
-
-  const uint64_t hiddenBytes = checkedWeightMultiply(
-      layout.hiddenSize, kBFloat16Bytes, "Qwen norm bytes");
-  for (uint32_t layerIndex = 0; layerIndex < layout.layers; ++layerIndex) {
-    const bool fullAttention = layout.isFullAttentionLayer(layerIndex);
-    const std::string filename =
-        "layer-" + std::to_string(layerIndex) + ".bin";
-    WeightFile file(backend, directory / filename, "target/" + filename,
-                    Layout::layerMagic, layerIndex, fullAttention ? 1U : 0U);
-    auto &layer = result.layers.emplace_back();
-    layer.inputNorm = file.section(hiddenBytes, "input-norm");
-    layer.mixer =
-        readQwenMixer(file, backend, layout.mixerGeometry(), fullAttention);
-    layer.postAttentionNorm =
-        file.section(hiddenBytes, "post-attention-norm");
-    readFfn(file, layer);
-    file.finish();
-    result.files.push_back(file.record());
-  }
-
-  {
-    WeightFile file(backend, directory / "head.bin", "target/head.bin",
-                    headMagic, layout.layers, 2);
-    result.finalNorm = file.section(hiddenBytes, "final-norm");
-    result.logitsProjection = readQ4Projection(
-        file, backend, layout.vocabularySize, layout.hiddenSize, "logits");
-    file.finish();
-    result.files.push_back(file.record());
-  }
-  {
-    WeightFile file(backend, directory / "embedding.bin",
-                    "target/embedding.bin", kEmbeddingMagic,
-                    layout.vocabularySize, layout.hiddenSize);
-    result.tokenEmbedding = readQ4ProjectionComponents(
-        file, layout.vocabularySize, layout.hiddenSize, "embedding");
-    file.finish();
-    result.files.push_back(file.record());
-  }
-
-  result.manifestFingerprintSha256 = weightManifestFingerprint(result.files);
-  result.actualAllocatedBytes = metal::allocationDelta(
-      allocationBaseline, backend.memoryStats().allocatedBytes);
-  return result;
-}
+// The weights of a target of Layout, whose layers the family keeps in Layer.
+template <class Layout, class Layer> struct QwenTargetWeights final : QwenTargetWeightsBase {
+  Layout layout;
+  std::vector<Layer> layers;
+};
 
 // Runtime-visible tensor geometry shared by the supported Qwen hybrid
 // targets. It describes semantics only; operators remain responsible for
@@ -128,12 +73,11 @@ loadQwenTargetWeights(metal::MetalBackend &backend,
 struct QwenTargetGeometry final {
   static constexpr uint32_t maximumCaptureLayers = 8;
 
-  uint32_t maximumContextTokens = 0;
   uint32_t layers = 0;
   uint32_t hiddenSize = 0;
   uint32_t vocabularySize = 0;
   uint32_t packedGdnWidth = 0;
-  uint32_t packedAttentionWidth = 0;
+  uint32_t packedFullWidth = 0;
   uint32_t convolutionDimension = 0;
   uint32_t gdnKeyHeads = 0;
   uint32_t gdnValueHeads = 0;
@@ -145,14 +89,24 @@ struct QwenTargetGeometry final {
   uint32_t rotaryPairs = 0;
   float rotaryTheta = 0.0F;
   uint32_t denseIntermediateSize = 0;
-  ops::MoeShape moe{};
+  uint32_t experts = 0;
+  uint32_t expertsPerToken = 0;
+  uint32_t expertIntermediateSize = 0;
   QwenFfnKind ffnKind = QwenFfnKind::Dense;
+  // The weight layout every sparse MoE block of the target shares, and in a
+  // GGUF the format of most of its routed expert weights.
+  ops::WeightLayout moeLayout = ops::WeightLayout::Affine64;
+  uint32_t moeExpertFormat = GGUF_FMT_COUNT;
   uint32_t maskToken = 0;
   std::array<uint32_t, 2> stopTokens{};
   std::array<uint32_t, maximumCaptureLayers> captureLayerValues{};
   uint32_t captureLayerCount = 0;
   kv::Layout kvLayout{};
   GdnStateLayout stateLayout{};
+  // Distinct operator requirements, collected from the loaded weights.
+  std::vector<ops::ProjectionShape> prefillProjections;
+  std::vector<ops::ProjectionShape> decodeProjections;
+  std::vector<ops::ProjectionShape> gateUpProjections;
 
   [[nodiscard]] constexpr uint32_t gdnKeyWidth() const noexcept {
     return gdnKeyHeads * gdnHeadDimension;
@@ -160,33 +114,45 @@ struct QwenTargetGeometry final {
   [[nodiscard]] constexpr uint32_t capturedHiddenSize() const noexcept {
     return hiddenSize * captureLayerCount;
   }
+  [[nodiscard]] constexpr ops::MoeShape moeShape() const noexcept {
+    return {hiddenSize, experts, expertsPerToken, expertIntermediateSize, moeLayout, moeExpertFormat};
+  }
   [[nodiscard]] constexpr uint32_t ffnScratchWidth() const noexcept {
     return ffnKind == QwenFfnKind::Dense ? denseIntermediateSize
-                                         : moe.expertIntermediateSize;
+                                         : expertIntermediateSize;
   }
   [[nodiscard]] constexpr std::span<const uint32_t>
   captureLayers() const noexcept {
     return {captureLayerValues.data(), captureLayerCount};
   }
+  // The capture slot of `layer`, whose output the draft reads.
+  [[nodiscard]] constexpr std::optional<uint32_t> captureSlot(uint32_t layer) const noexcept {
+    const auto layers = captureLayers();
+    const auto found = std::find(layers.begin(), layers.end(), layer);
+    if (found == layers.end()) return std::nullopt;
+    return static_cast<uint32_t>(found - layers.begin());
+  }
   [[nodiscard]] constexpr ops::GdnShape gdnShape() const noexcept {
     return {gdnKeyHeads, gdnValueHeads, gdnHeadDimension,
             convolutionDimension, packedGdnWidth};
   }
-  [[nodiscard]] constexpr bool valid() const noexcept {
-    return maximumContextTokens && layers && hiddenSize && vocabularySize &&
-           packedGdnWidth && packedAttentionWidth && convolutionDimension &&
-           gdnKeyHeads && gdnValueHeads && gdnHeadDimension &&
-           attentionWidth && attentionQueryHeads && attentionKvHeads &&
-           attentionHeadDimension && rotaryPairs && rotaryTheta > 0.0F &&
-           captureLayerCount && captureLayerCount <= maximumCaptureLayers &&
-           kvLayout.valid() && stateLayout.valid() &&
+  // The layout itself was checked by requireQwenLayout when the target
+  // loaded. The projection lists hold every projection the weights dispatch,
+  // which each have sizes.
+  [[nodiscard]] bool valid() const noexcept {
+    const auto sized = [](const std::vector<ops::ProjectionShape> &shapes) {
+      return !shapes.empty() && std::all_of(shapes.begin(), shapes.end(), [](const auto &shape) {
+        return shape.outputSize && shape.inputSize;
+      });
+    };
+    return captureLayerCount && captureLayerCount <= maximumCaptureLayers &&
            stateLayout.layers + kvLayout.attentionLayers == layers &&
-           gdnKeyWidth() * 2 + attentionWidth <= packedGdnWidth &&
-           attentionWidth == attentionQueryHeads * attentionHeadDimension &&
+           gdnShape().valid() &&
            kvLayout.kvHeads == attentionKvHeads &&
            kvLayout.headDimension == attentionHeadDimension &&
-           ((ffnKind == QwenFfnKind::Dense && denseIntermediateSize) ||
-            (ffnKind == QwenFfnKind::SparseMoe && moe.valid()));
+           sized(prefillProjections) && sized(decodeProjections) &&
+           ((ffnKind == QwenFfnKind::Dense && denseIntermediateSize && sized(gateUpProjections)) ||
+            (ffnKind == QwenFfnKind::SparseMoe && moeShape().valid()));
   }
 };
 
@@ -202,7 +168,7 @@ struct QwenTargetPrefillSequence final {
   uint32_t attentionStride = 0;
   uint64_t queryOffset = 0;
   uint64_t kvOffset = 0;
-  kv::Q8ChunkedPrefillParams q8;
+  kv::ChunkedPrefillParams chunk;
   metal::MetalBuffer pageTable;
   std::span<const metal::MetalBuffer> convolutionIn;
   std::span<const metal::MetalBuffer> convolutionOut;
@@ -213,6 +179,8 @@ struct QwenTargetPrefillSequence final {
 };
 
 struct QwenTargetPrefillBuffers final {
+  // Split projections of chunks of up to 32 rows (LinearGguf.cpp).
+  ops::LinearScratch linearScratch{};
   std::array<metal::MetalBuffer, 2> hidden;
   metal::MetalBuffer normalized;
   metal::MetalBuffer captured;
@@ -240,22 +208,13 @@ struct QwenTargetPrefillBuffers final {
   metal::MetalBuffer ropeSin;
   metal::MetalBuffer chunkKeys;
   metal::MetalBuffer chunkValues;
-  metal::MetalBuffer selectedExperts;
-  metal::MetalBuffer routingWeights;
-  metal::MetalBuffer tileDescriptors;
-  metal::MetalBuffer tileCount;
-  metal::MetalBuffer groupedRoutes;
-  metal::MetalBuffer routeRows;
-  metal::MetalBuffer groupedInput;
-  metal::MetalBuffer expertIntermediate;
-  metal::MetalBuffer expertOutput;
+  ops::MoeScratch moe;
 };
 
 struct QwenTargetVerifyBuffers final {
   ops::LinearScratch linearScratch{};
   std::array<metal::MetalBuffer, 2> hidden;
   metal::MetalBuffer normalized;
-  metal::MetalBuffer recurrent;
   metal::MetalBuffer gdnHidden;
   metal::MetalBuffer gdnOutput;
   metal::MetalBuffer denseIntermediate;
@@ -268,8 +227,6 @@ struct QwenTargetVerifyBuffers final {
   metal::MetalBuffer attentionOutput;
   metal::MetalBuffer ropeCos;
   metal::MetalBuffer ropeSin;
-  metal::MetalBuffer arrived;
-  metal::MetalBuffer generation;
   metal::MetalBuffer capturedTargetHidden;
   metal::MetalBuffer finalHidden;
   metal::MetalBuffer logits;
@@ -286,15 +243,7 @@ struct QwenTargetVerifyBuffers final {
       nextGdnStates;
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth>
       pageTables;
-  metal::MetalBuffer selectedExperts;
-  metal::MetalBuffer routingWeights;
-  metal::MetalBuffer tileDescriptors;
-  metal::MetalBuffer tileCount;
-  metal::MetalBuffer groupedRoutes;
-  metal::MetalBuffer routeRows;
-  metal::MetalBuffer groupedInput;
-  metal::MetalBuffer expertIntermediate;
-  metal::MetalBuffer expertOutput;
+  ops::MoeScratch moe;
 };
 
 struct QwenTargetCommitBuffers final {
@@ -309,41 +258,47 @@ struct QwenTargetCommitBuffers final {
   metal::MetalBuffer retainedCounts;
 };
 
+template <class Layout, class Layer>
 [[nodiscard]] QwenTargetGeometry
-qwenTargetGeometry(const Qwen3_8Weights &weights);
-[[nodiscard]] QwenTargetGeometry
-qwenTargetGeometry(const Qwen3_6MoeWeights &weights);
+qwenTargetGeometry(const QwenTargetWeights<Layout, Layer> &weights);
 
 // Builds the shared Qwen GDN/attention layer graph with the target's dense
 // or sparse-MoE FFN. Architecture-specific loaders supply the package tensors.
 class QwenTarget final {
 public:
-  QwenTarget(const Qwen3_8Weights &weights, metal::MetalBackend &backend,
-             const ops::ExecutionPlans &operators,
-             kv::Format format = kv::Format::Int8);
-  QwenTarget(const Qwen3_6MoeWeights &weights, metal::MetalBackend &backend,
-             const ops::ExecutionPlans &operators,
-             kv::Format format = kv::Format::Int8);
+  template <class Layout, class Layer>
+  QwenTarget(const QwenTargetWeights<Layout, Layer> &weights, const QwenTargetGeometry &geometry,
+             metal::MetalBackend &backend, const ops::ExecutionPlans &operators);
 
-  [[nodiscard]] const QwenTargetGeometry &geometry() const noexcept {
-    return geometry_;
-  }
-  [[nodiscard]] const ops::Q4Projection &
+  [[nodiscard]] const ops::Projection &
   vocabularyProjection() const noexcept;
+  // Lanes of storage the tensors of a decode step of `lanes` lanes bind: a
+  // linear tile may hold more rows than the step (LinearPlan::storageRows;
+  // a three-lane GGUF step on the staged tile runs its 32-row tile over four
+  // lanes). Every op still processes the step's lanes; padding rows read
+  // stale activations and write results no active row reads.
+  [[nodiscard]] uint32_t decodeStorageLanes(uint32_t lanes) const;
 
-  void addPrefill(
+  // Returns the hidden buffer that holds the last layer's output rows.
+  [[nodiscard]] metal::MetalBuffer addPrefill(
       metal::CommandGraph &graph, QwenTargetPrefillBuffers buffers,
       std::span<const QwenTargetPrefillSequence> sequences, uint32_t rows,
-      std::span<const kv::LayerStorage> kvLayers) const;
+      std::span<const SplashKvLayer> kvLayers) const;
   void addVerify(
       metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
-      std::span<const kv::LayerStorage> kvLayers,
-      std::span<const kv::Q8ChunkedPrefillParams> q8,
-      std::span<const kv::Q8VerifyAttentionParams> verify, uint32_t lanes,
-      ops::Q4DispatchStats &stats) const;
-  void addHead(metal::CommandGraph &graph, metal::MetalBuffer hidden,
-               metal::MetalBuffer finalHidden, metal::MetalBuffer logits,
-               uint32_t normalizedRows, ops::LinearScratch scratch = {}) const;
+      std::span<const SplashKvLayer> kvLayers,
+      std::span<const kv::ChunkedPrefillParams> chunks,
+      uint32_t lanes) const;
+  // The final norm and LM head over `lanes` lanes of targetVerifyRows rows,
+  // as verify ends: one sweep of the vocabulary projection for every lane.
+  void addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden,
+                    metal::MetalBuffer finalHidden, metal::MetalBuffer logits,
+                    uint32_t lanes, ops::LinearScratch scratch) const;
+  // The verify input tokens addEmbedding then gathers: each lane's anchor,
+  // row 0 of its draft input, and the draft's proposals.
+  void addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer draftInput,
+                      metal::MetalBuffer proposals,
+                      metal::MetalBuffer verifyInput, uint32_t lanes) const;
   void addEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens,
                     metal::MetalBuffer hidden, uint32_t rows) const;
   void addStateCommit(metal::CommandGraph &graph,
@@ -351,24 +306,36 @@ public:
 
 private:
   using WeightView =
-      std::variant<const Qwen3_8Weights *, const Qwen3_6MoeWeights *>;
+      std::variant<const QwenTargetWeights<Qwen3_8Layout, Qwen3_8LayerWeights> *,
+                   const QwenTargetWeights<Qwen3_6MoeLayout, Qwen3_6MoeLayerWeights> *>;
+  struct PrefillStep;
+  struct VerifyStep;
 
-  template <class Weights>
-  void addPrefillImpl(
-      const Weights &weights, metal::CommandGraph &graph,
-      QwenTargetPrefillBuffers buffers,
-      std::span<const QwenTargetPrefillSequence> sequences, uint32_t rows,
-      std::span<const kv::LayerStorage> kvLayers) const;
-  template <class Weights>
-  void addVerifyImpl(
-      const Weights &weights, metal::CommandGraph &graph,
-      QwenTargetVerifyBuffers buffers,
-      std::span<const kv::LayerStorage> kvLayers,
-      std::span<const kv::Q8ChunkedPrefillParams> q8,
-      std::span<const kv::Q8VerifyAttentionParams> verify, uint32_t lanes,
-      ops::Q4DispatchStats &stats) const;
+  // A layer's parts in dispatch order: the mixer normalizes its input and
+  // returns the residual rows the FFN normalizes and adds to into `output`.
+  void addPrefillNorm(PrefillStep &step, metal::MetalBuffer input, const ops::NormWeights &norm,
+                      ops::WeightLayout consumer) const;
+  void addPrefillOutput(PrefillStep &step, metal::MetalBuffer hidden, const ops::Projection &projection,
+                        metal::MetalBuffer input, metal::MetalBuffer output) const;
+  metal::MetalBuffer addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer, const ops::NormWeights &norm,
+                                     metal::MetalBuffer input) const;
+  metal::MetalBuffer addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &mixer,
+                                     const ops::NormWeights &norm, metal::MetalBuffer input) const;
+  void addPrefillFfn(PrefillStep &step, const Qwen3_8LayerWeights &layer, metal::MetalBuffer residual,
+                     metal::MetalBuffer output) const;
+  void addPrefillFfn(PrefillStep &step, const Qwen3_6MoeLayerWeights &layer, metal::MetalBuffer residual,
+                     metal::MetalBuffer output) const;
+  metal::MetalBuffer addVerifyMixer(VerifyStep &step, const QwenGdnWeights &mixer, const ops::NormWeights &norm,
+                                    metal::MetalBuffer input) const;
+  metal::MetalBuffer addVerifyMixer(VerifyStep &step, const QwenAttentionWeights &mixer,
+                                    const ops::NormWeights &norm, metal::MetalBuffer input) const;
+  void addVerifyFfn(VerifyStep &step, const Qwen3_8LayerWeights &layer, metal::MetalBuffer residual,
+                    metal::MetalBuffer output) const;
+  void addVerifyFfn(VerifyStep &step, const Qwen3_6MoeLayerWeights &layer, metal::MetalBuffer residual,
+                    metal::MetalBuffer output) const;
 
   WeightView weights_;
+  const QwenTargetWeightsBase &weightsBase_;
   QwenTargetGeometry geometry_;
   metal::MetalBackend &backend_;
   const ops::ExecutionPlans &operators_;

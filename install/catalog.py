@@ -25,12 +25,14 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-if __package__:
-    from . import paths
-    from .models import ModelError, validate_repo_id
-else:  # Executed directly, e.g. `python install/catalog.py --refresh`.
-    import paths
-    from models import ModelError, validate_repo_id
+if __name__ == "__main__" and not __package__:
+    # Run as a script by spawn_refresh: import siblings as the install
+    # package.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    __package__ = "install"
+
+from . import paths
+from .models import ModelError, validate_repo_id
 
 # The collection is the source of truth for which packages are official.
 COLLECTION = "incoai/splash-6aac69afeba907af0511ec14"
@@ -158,6 +160,12 @@ def refresh(timeout: float = TIMEOUT_SECONDS, destination: Path | None = None) -
     return True
 
 
+def _offline() -> bool:
+    """HF_HUB_OFFLINE, as huggingface_hub reads it: the Hub must not be asked."""
+    value = os.environ.get("HF_HUB_OFFLINE") or os.environ.get("TRANSFORMERS_OFFLINE")
+    return (value or "").upper() in {"1", "ON", "YES", "TRUE"}
+
+
 def spawn_refresh() -> None:
     """Refresh the cache in a detached child, if it looks stale.
 
@@ -165,7 +173,7 @@ def spawn_refresh() -> None:
     be a thread. It is deliberately fire-and-forget: the caller never learns
     the outcome, and a failure is indistinguishable from not having run.
     """
-    if not is_stale():
+    if not is_stale() or _offline():
         return
     try:
         subprocess.Popen(

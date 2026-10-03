@@ -8,35 +8,31 @@ import threading
 import time
 from collections import OrderedDict
 from contextlib import closing
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 
-if __package__:
-    from .errors import APIError
-    from .protocol import ProtocolLimits
-else:
-    from errors import APIError
-    from protocol import ProtocolLimits
+from .errors import APIError
+from .protocol import MAX_IMAGE_SPANS
 
 MAX_REQUEST_DOCUMENT_BYTES = 64 * 1024 * 1024
 MAX_PDF_BYTES = MAX_REQUEST_DOCUMENT_BYTES
 # Every rendered page becomes one image in the native request.
-MAX_PAGES = ProtocolLimits().max_image_spans
+MAX_PAGES = MAX_IMAGE_SPANS
 MAX_PAGE_PIXELS = 1024 * 1024
 MAX_TEXT_CHARACTERS = 1_000_000
 MAX_RENDERED_BYTES = 32 * 1024 * 1024
 CACHE_BYTES = 64 * 1024 * 1024
 CACHE_ENTRIES = 16
+PDF_DATA_URL_PREFIX = "data:application/pdf;base64,"
 
 
 @dataclass(slots=True)
 class DocumentBudget:
-    deadline: float | None = None
+    # The request's deadline; math.inf when it has none.
+    deadline: float
     remaining_bytes: int = MAX_REQUEST_DOCUMENT_BYTES
     remaining_pages: int = MAX_PAGES
 
     def remaining_time(self):
-        if self.deadline is None:
-            return -1
         remaining = self.deadline - time.monotonic()
         if remaining <= 0:
             raise APIError(504, "request timed out", "request_timeout")
@@ -73,13 +69,7 @@ class RenderLimits:
     page_pixels: int
     text_characters: int
     rendered_bytes: int
-    request_bytes: int = MAX_REQUEST_DOCUMENT_BYTES
-
-
-def _render_limits():
-    return RenderLimits(
-        MAX_PAGES, MAX_PAGE_PIXELS, MAX_TEXT_CHARACTERS, MAX_RENDERED_BYTES
-    )
+    request_bytes: int
 
 
 # Serialize cache misses so only one bounded PDF worker is active at a time.
@@ -89,16 +79,14 @@ _cache_bytes = 0
 
 
 def _render(payload, budget):
-    if __package__:
-        from .document_worker import render
-    else:
-        from document_worker import render
+    from .document_worker import render
 
-    limits = _render_limits()
-    limits = replace(
-        limits,
-        pages=min(limits.pages, budget.remaining_pages),
-        request_bytes=budget.remaining_bytes,
+    limits = RenderLimits(
+        min(MAX_PAGES, budget.remaining_pages),
+        MAX_PAGE_PIXELS,
+        MAX_TEXT_CHARACTERS,
+        MAX_RENDERED_BYTES,
+        budget.remaining_bytes,
     )
     values = render(payload, asdict(limits), budget.remaining_time())
     pages = tuple(Page(**value) for value in values)
@@ -106,10 +94,9 @@ def _render(payload, budget):
     return pages
 
 
-def render_pages(payload, budget, limits=None):
+def render_pages(payload, budget, limits):
     import pypdfium2 as pdfium
 
-    limits = limits or _render_limits()
     try:
         budget.remaining_time()
         with pdfium.PdfDocument(payload) as document:
@@ -118,7 +105,6 @@ def render_pages(payload, budget, limits=None):
                 raise APIError(
                     400, f"PDF documents must contain 1–{limits.pages} pages"
                 )
-            budget.charge_pages(len(document))
             pages = []
             total_characters = total_bytes = 0
             for index in range(len(document)):
@@ -213,10 +199,12 @@ def _pages(encoded, budget):
         _pdf_lock.release()
 
 
-def document_content(block, *, budget=None):
-    """Translate an inline PDF into canonical text/image parts, preserving pages."""
-    if budget is None:
-        budget = DocumentBudget()
+def document_parts(block):
+    """An Anthropic PDF document block as canonical text and file parts.
+
+    Only the block is checked here. Request preparation renders the file with
+    the request's shared document budget, like every other PDF, or rejects it
+    when the model serves without vision."""
     source = block.get("source")
     if (
         not isinstance(source, dict)
@@ -224,7 +212,6 @@ def document_content(block, *, budget=None):
         or source.get("media_type") != "application/pdf"
     ):
         raise APIError(400, "documents require a base64 application/pdf source")
-    encoded = source.get("data")
     citations = block.get("citations")
     if citations is not None and (
         not isinstance(citations, dict) or citations.get("enabled", False) is not False
@@ -236,20 +223,18 @@ def document_content(block, *, budget=None):
         if value is not None:
             if not isinstance(value, str):
                 raise APIError(400, f"document {field} must be a string")
-            budget.charge((len(value) + 1) * 4)
             parts.append({"type": "text", "text": value + "\n"})
-    parts.extend(pdf_content(encoded, budget=budget))
+    encoded = source.get("data")
+    if not isinstance(encoded, str):
+        raise APIError(400, "PDF data must be a base64 string")
+    parts.append({"type": "file", "file": {"file_data": PDF_DATA_URL_PREFIX + encoded}})
     return parts
 
 
-def pdf_content(encoded, *, budget=None):
+def pdf_content(encoded, *, budget):
     """Render an inline PDF through the shared bounded document pipeline."""
-    if not isinstance(encoded, str):
-        raise APIError(400, "PDF data must be a base64 string")
     if len(encoded) > 4 * ((MAX_PDF_BYTES + 2) // 3):
         raise APIError(400, "PDF document exceeds the size limit")
-    if budget is None:
-        budget = DocumentBudget()
     parts = []
     for page in _pages(encoded, budget):
         parts.append({"type": "text", "text": page.text})
@@ -258,7 +243,7 @@ def pdf_content(encoded, *, budget=None):
 
 
 def file_content(file, *, budget):
-    """Translate OpenAI inline PDFs into canonical text/image parts."""
+    """Render a file part's inline PDF as canonical text/image parts."""
     if not isinstance(file, dict):
         raise APIError(400, "file must be an object")
     if file.get("file_id") is not None or file.get("file_url") is not None:
@@ -272,8 +257,7 @@ def file_content(file, *, budget):
     if not isinstance(data, str):
         raise APIError(400, "file_data must contain a base64 PDF")
     if data.startswith("data:"):
-        prefix = "data:application/pdf;base64,"
-        if not data.startswith(prefix):
+        if not data.startswith(PDF_DATA_URL_PREFIX):
             raise APIError(400, "only application/pdf file data is supported")
-        data = data[len(prefix) :]
+        data = data[len(PDF_DATA_URL_PREFIX) :]
     return pdf_content(data, budget=budget)

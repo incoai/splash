@@ -29,7 +29,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from install import models as artifacts  # noqa: E402
+from install import legacy  # noqa: E402
 
 MAGIC = b"MDFV0001"
 PATCH = 16
@@ -96,11 +96,11 @@ def load_pack(root: Path) -> tuple[VisionLayout, dict]:
     offset = 16
     for name, shape in sections(layout):
         count = math.prod(shape)
-        offset = -(-offset // artifacts.ALIGNMENT) * artifacts.ALIGNMENT
+        offset = -(-offset // legacy.ALIGNMENT) * legacy.ALIGNMENT
         words = np.asarray(data[offset : offset + count * 2]).view(np.uint16)
         weights[name] = bf16_to_f32(words).reshape(shape)
         offset += count * 2
-    if -(-offset // artifacts.ALIGNMENT) * artifacts.ALIGNMENT != data.size:
+    if -(-offset // legacy.ALIGNMENT) * legacy.ALIGNMENT != data.size:
         raise ValueError(f"unexpected vision pack size: {path}")
     return layout, weights
 

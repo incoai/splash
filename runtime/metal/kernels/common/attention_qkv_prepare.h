@@ -1,13 +1,16 @@
 #pragma once
 
 #include "metal/abi/KernelABI.h"
+#include "metal/kernels/common/rms_inverse.h"
 
-template <uint QHeads, uint KHeads>
+// q_norm and k_norm are read in their stored type W: bfloat in the packed
+// formats, float for a GGUF's F32 norms.
+template <uint QHeads, uint KHeads, class W>
 inline void full_qkv_storage_phase(
-    device const bfloat *qkv, device const bfloat *q_norm,
-    device const bfloat *k_norm, device const float *rope_cos,
+    device const bfloat *qkv, device const W *q_norm,
+    device const W *k_norm, device const float *rope_cos,
     device const float *rope_sin, device bfloat *queries,
-    device bfloat *key_cache, device bfloat *value_cache,
+    device bfloat *chunk_keys, device bfloat *chunk_values,
     FullPrefillParams params, threadgroup float *reductions,
     threadgroup bfloat *normalized, uint task, uint thread_index, uint lane,
     uint simd_group) {
@@ -25,39 +28,31 @@ inline void full_qkv_storage_phase(
   device const bfloat *source =
       query ? qkv + ulong(row) * PackedStride + head_index * QStride
             : qkv + ulong(row) * PackedStride + QWidth + head_index * HeadDim;
-  device const bfloat *weight = query ? q_norm : k_norm;
+  device const W *weight = query ? q_norm : k_norm;
   uint kv_head = head_index / (QHeads / KHeads);
   uint local_head = head_index % (QHeads / KHeads);
   device bfloat *destination =
-      queries + ((ulong(kv_head) * params.row_stride + row) *
+      queries + ((ulong(kv_head) * params.stride + row) *
                      (QHeads / KHeads) +
                  local_head) *
                     HeadDim;
   if (!query) {
     ulong key_offset =
-        (ulong(head_index) * params.cache_stride + position) * HeadDim;
-    destination = key_cache + key_offset;
+        (ulong(head_index) * params.stride + position) * HeadDim;
+    destination = chunk_keys + key_offset;
   }
 
   float element = float(source[thread_index]);
-  float square_sum = simd_sum(element * element);
-  if (lane == 0)
-    reductions[simd_group] = square_sum;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (thread_index == 0) {
-    float total = 0.0f;
-    for (uint i = 0; i < 8; ++i)
-      total += reductions[i];
-    reductions[0] = rsqrt(total / HeadDim + 1e-6f);
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float inverse = rms_inverse_of_sums(element * element, HeadDim,
+                                            reductions, thread_index, lane,
+                                            simd_group);
   normalized[thread_index] =
-      bfloat(element * reductions[0] * float(weight[thread_index]));
+      bfloat(element * inverse * float(weight[thread_index]));
   if (!query) {
     ulong value_offset =
-        (ulong(head_index) * HeadDim + thread_index) * params.cache_stride +
+        (ulong(head_index) * HeadDim + thread_index) * params.stride +
         position;
-    value_cache[value_offset] = source[KWidth + thread_index];
+    chunk_values[value_offset] = source[KWidth + thread_index];
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (thread_index < 32) {

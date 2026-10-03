@@ -7,65 +7,46 @@
 namespace splash::model {
 namespace {
 
-template <class Projection>
-bool sameProjection(const Projection &left, const Projection &right) noexcept {
+using ops::tuning::LinearTuningInput;
+using ops::tuning::LinearTuningWeights;
+using ops::tuning::kMaximumLinearTuningRepresentatives;
+
+bool sameProjection(const ops::Projection &left, const ops::Projection &right) {
+  const auto &l = left.affine(), &r = right.affine();
   return left.inputSize == right.inputSize && left.outputSize == right.outputSize &&
-         left.weights.sameView(right.weights) &&
-         left.scales.sameView(right.scales) && left.biases.sameView(right.biases);
+         l.weights.sameView(r.weights) && l.scales.sameView(r.scales) && l.biases.sameView(r.biases);
 }
 
-bool sameWeights(const ops::tuning::LinearTuningWeights &left,
-                  const ops::tuning::LinearTuningWeights &right) noexcept {
+bool sameWeights(const LinearTuningWeights &left, const LinearTuningWeights &right) {
   return sameProjection(left.projection, right.projection) &&
          left.gate.has_value() == right.gate.has_value() &&
          (!left.gate || sameProjection(*left.gate, *right.gate));
 }
 
-bool sameExpert(const ops::ExpertQ4Projection &left,
-                 const ops::ExpertQ4Projection &right) noexcept {
-  return left.inputSize == right.inputSize && left.outputSize == right.outputSize &&
-         left.experts == right.experts &&
-         left.expertStrideBytes == right.expertStrideBytes &&
-         left.packed.sameView(right.packed);
-}
-
-bool sameWeights(const ops::MoeWeights &left, const ops::MoeWeights &right) noexcept {
-  if (!sameProjection(left.router, right.router) ||
-      !sameProjection(left.sharedExpertGate, right.sharedExpertGate))
-    return false;
-  for (auto field : {&ops::MoeWeights::expertGate, &ops::MoeWeights::expertUp,
-                     &ops::MoeWeights::expertDown, &ops::MoeWeights::sharedGate,
-                     &ops::MoeWeights::sharedUp, &ops::MoeWeights::sharedDown})
-    if (!sameExpert(left.*field, right.*field))
-      return false;
-  return true;
-}
-
-template <class Workload, class Input, class Weights>
-void appendDistinct(std::map<Workload, Input> &table, const Workload &workload,
-                     const Weights &weights) {
-  auto &input = table.try_emplace(workload, Input{workload, {}}).first->second;
+void appendDistinct(std::map<ops::LinearWorkload, LinearTuningInput> &table,
+                    const ops::LinearWorkload &workload, const LinearTuningWeights &weights) {
+  auto &input = table.try_emplace(workload, LinearTuningInput{workload, {}}).first->second;
   if (std::none_of(input.weights.begin(), input.weights.end(),
                    [&](const auto &existing) { return sameWeights(existing, weights); }))
     input.weights.push_back(weights);
 }
 
-template <size_t Maximum, class Weights>
-void retainRepresentatives(std::vector<Weights> &weights) {
-  static_assert(Maximum > 1);
-  if (weights.size() <= Maximum) return;
+void retainRepresentatives(std::vector<LinearTuningWeights> &weights) {
+  constexpr size_t maximum = kMaximumLinearTuningRepresentatives;
+  static_assert(maximum > 1);
+  if (weights.size() <= maximum) return;
   // Distinct bundles arrive in layer order. Include both ends and evenly
   // spaced interior layers; tied views never consume a sampling position.
-  std::vector<Weights> selected;
-  selected.reserve(Maximum);
-  for (size_t index = 0; index < Maximum; ++index)
-    selected.push_back(std::move(weights[index * (weights.size() - 1) / (Maximum - 1)]));
+  std::vector<LinearTuningWeights> selected;
+  selected.reserve(maximum);
+  for (size_t index = 0; index < maximum; ++index)
+    selected.push_back(std::move(weights[index * (weights.size() - 1) / (maximum - 1)]));
   weights = std::move(selected);
 }
 
 } // namespace
 
-TuningWorkloads collectTuningWorkloads(
+std::vector<LinearTuningInput> collectTuningWorkloads(
     const ModelPackage &package, std::span<const uint32_t> prefillRows,
     std::span<const uint32_t> decodeWidths) {
   using ops::LinearEpilogue;
@@ -77,36 +58,33 @@ TuningWorkloads collectTuningWorkloads(
     if (!width || width > ExecutionLimits::maximumBatchWidth)
       throw std::invalid_argument("invalid operator decode probe width");
 
-  std::map<ops::LinearWorkload, ops::tuning::LinearTuningInput> linear;
-  std::map<ops::MoeWorkload, ops::tuning::MoeTuningInput> moe;
-  auto projection = [&](const ops::Q4Projection &weight, LinearPhase phase,
+  std::map<ops::LinearWorkload, LinearTuningInput> linear;
+  auto projection = [&](const ops::Projection &weight, LinearPhase phase,
                          LinearEpilogue epilogue,
-                         const ops::Q4Projection *gate = nullptr) {
+                         const ops::Projection *gate = nullptr) {
     if (!weight.inputSize || !weight.outputSize)
       throw std::invalid_argument("operator probe projection has no geometry");
+    // Block projections are not tuned: they run the device policy's tiles.
+    if (weight.layout() != ops::WeightLayout::Affine64 ||
+        (gate && gate->layout() != ops::WeightLayout::Affine64)) return;
     const auto sizes = phase == LinearPhase::Prefill ? prefillRows : decodeWidths;
     for (uint32_t size : sizes) {
       const uint32_t rows = phase == LinearPhase::Prefill
           ? size : size * ExecutionLimits::targetVerifyRows;
       ops::LinearWorkload workload{{weight.outputSize, weight.inputSize},
                                     rows, phase, epilogue};
-      const ops::tuning::LinearTuningWeights representative{
+      const LinearTuningWeights representative{
           weight, gate ? std::optional{*gate} : std::nullopt};
       appendDistinct(linear, workload, representative);
     }
   };
-  auto bothPhases = [&](const ops::Q4Projection &weight,
+  auto bothPhases = [&](const ops::Projection &weight,
                          LinearEpilogue epilogue = LinearEpilogue::None) {
     projection(weight, LinearPhase::Prefill, epilogue);
     projection(weight, LinearPhase::Decode, epilogue);
   };
 
-  TuningWorkloads result;
   std::visit([&](const auto &target) {
-    const auto geometry = qwenTargetGeometry(target);
-    result.targetAttention = {geometry.attentionQueryHeads,
-                              geometry.attentionKvHeads,
-                              geometry.attentionHeadDimension};
     if (target.layers.empty())
       throw std::invalid_argument("operator probes require target layers");
     for (const auto &layer : target.layers) {
@@ -114,7 +92,7 @@ TuningWorkloads collectTuningWorkloads(
         bothPhases(mixer.inputProjection);
         bothPhases(mixer.outputProjection, LinearEpilogue::Residual);
       }, layer.mixer);
-      if constexpr (requires { layer.gateProjection; }) {
+      if constexpr (decltype(target.layout)::ffnKind == QwenFfnKind::Dense) {
         projection(layer.gateProjection, LinearPhase::Prefill,
                      LinearEpilogue::None);
         projection(layer.upProjection, LinearPhase::Prefill,
@@ -122,16 +100,6 @@ TuningWorkloads collectTuningWorkloads(
         projection(layer.upProjection, LinearPhase::Decode,
                      LinearEpilogue::GateUp, &layer.gateProjection);
         bothPhases(layer.downProjection, LinearEpilogue::Residual);
-      } else {
-        for (uint32_t rows : prefillRows) {
-          ops::MoeWorkload workload{geometry.moe, rows, ops::MoePhase::Prefill};
-          appendDistinct(moe, workload, layer.ffn);
-        }
-        for (uint32_t width : decodeWidths) {
-          ops::MoeWorkload workload{geometry.moe,
-              width * ExecutionLimits::targetVerifyRows, ops::MoePhase::Decode};
-          appendDistinct(moe, workload, layer.ffn);
-        }
       }
     }
     projection(target.logitsProjection, LinearPhase::Decode,
@@ -141,7 +109,6 @@ TuningWorkloads collectTuningWorkloads(
   const auto &draft = package.draft;
   if (draft.layers.empty())
     throw std::invalid_argument("operator probes require draft layers");
-  result.draftAttention = draft.layout.attentionShape();
   bothPhases(draft.contextProjection);
   for (const auto &layer : draft.layers) {
     bothPhases(layer.qkvProjection);
@@ -154,15 +121,11 @@ TuningWorkloads collectTuningWorkloads(
   projection(draft.selectorProjection, LinearPhase::Decode,
                LinearEpilogue::None);
 
-  result.linear.reserve(linear.size());
+  std::vector<LinearTuningInput> result;
+  result.reserve(linear.size());
   for (auto &[key, input] : linear) {
-    retainRepresentatives<ops::tuning::kMaximumLinearTuningRepresentatives>(input.weights);
-    result.linear.push_back(std::move(input));
-  }
-  result.moe.reserve(moe.size());
-  for (auto &[key, input] : moe) {
-    retainRepresentatives<ops::tuning::kMaximumMoeTuningRepresentatives>(input.weights);
-    result.moe.push_back(std::move(input));
+    retainRepresentatives(input.weights);
+    result.push_back(std::move(input));
   }
   return result;
 }

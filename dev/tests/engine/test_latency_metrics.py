@@ -8,28 +8,26 @@ from server.metrics import prometheus_metrics
 
 
 class LatencyTests(unittest.TestCase):
-    def test_mixed_decode_metric_preserves_zero_and_missing_status(self):
-        name = "splash_scheduler_decode_mixed_greedy_sampling_batches_total"
+    def test_scheduler_metric_preserves_zero_and_missing_status(self):
+        name = "splash_scheduler_decode_batches_total"
         self.assertIn(
             name + " 0",
-            prometheus_metrics(
-                {"scheduler": {"decode_mixed_greedy_sampling_batches": 0}}
-            ).splitlines(),
+            prometheus_metrics({"scheduler": {"decode_batches": 0}}).splitlines(),
         )
         self.assertNotIn(name, prometheus_metrics({"scheduler": {}}))
 
     def test_buckets_boundaries_and_invalid_samples(self):
         metrics = LatencyMetrics()
         for duration in (0, 0.001, 0.002, 1801, -1, math.inf, math.nan):
-            metrics.observe("ttft", duration)
-        sample = metrics.snapshot()["ttft"]
+            metrics.observe("http_ttft", duration)
+        sample = metrics.snapshot()["http_ttft"]
         self.assertEqual(sample["count"], 4)
         self.assertEqual(list(sample["buckets"].values())[:2], [2, 3])
         self.assertEqual(sample["buckets"]["+Inf"], 4)
         text = prometheus_metrics({"latency": metrics.snapshot()})
-        self.assertIn('splash_ttft_seconds_bucket{le="0.001"} 2', text)
-        self.assertIn('splash_ttft_seconds_bucket{le="+Inf"} 4', text)
-        self.assertIn("splash_ttft_seconds_count 4", text)
+        self.assertIn('splash_http_ttft_seconds_bucket{le="0.001"} 2', text)
+        self.assertIn('splash_http_ttft_seconds_bucket{le="+Inf"} 4', text)
+        self.assertIn("splash_http_ttft_seconds_count 4", text)
         self.assertEqual(len(sample["buckets"]), len(BUCKETS) + 1)
 
     def test_timer_records_failures_and_native_batches_are_not_individual_tokens(self):
@@ -46,8 +44,8 @@ class LatencyTests(unittest.TestCase):
             request.tokens()
         snapshot = metrics.snapshot()
         self.assertEqual(snapshot["template"]["sum"], 1)
-        self.assertEqual(snapshot["ttft"]["sum"], 6)
-        self.assertEqual(snapshot["ttft"]["count"], 1)
+        self.assertEqual(snapshot["http_ttft"]["sum"], 6)
+        self.assertEqual(snapshot["http_ttft"]["count"], 1)
         self.assertEqual(snapshot["output_interval"]["sum"], 1.5)
         self.assertEqual(snapshot["output_interval"]["count"], 2)
 

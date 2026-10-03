@@ -1,12 +1,15 @@
 #pragma once
 
+#include "engine/MemoryControl.hpp"
 #include "engine/NativeRuntime.hpp"
 #include "engine/RuntimeResources.hpp"
 #include "engine/Status.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -18,7 +21,6 @@ enum class RuntimeBootstrapStage {
     ModelCreation,
     MaximumPrefill,
     DecodeWarmup,
-    DraftVerifyCommit,
     CompositeStateRestore,
     MemoryAudit,
     AnnounceReady,
@@ -28,8 +30,8 @@ enum class RuntimeBootstrapStage {
 [[nodiscard]] std::string_view runtimeBootstrapStageName(
     RuntimeBootstrapStage stage);
 
+// A report of a successful bootstrap is at stage Ready.
 struct RuntimeBootstrapReport {
-    bool ready = false;
     RuntimeBootstrapStage stage = RuntimeBootstrapStage::ResourceAssembly;
     RuntimeResourceFailure resourceFailure = RuntimeResourceFailure::Other;
     std::string message;
@@ -56,14 +58,52 @@ private:
     RuntimeBootstrapReport report_;
 };
 
-struct RuntimeBootstrapConfig {
-    RuntimeResourcesConfig resources;
-    NativeLoopConfig nativeLoop;
-    protocol::ProtocolLimits protocolLimits;
+// Startup retries a temporary host or driver allocation failure for a
+// bounded time. The window opens at the first such failure, not at process
+// start, since a cold start can prepare weights for minutes before one; a
+// failure at a later stage than the last one follows progress and opens a
+// new window.
+class StartupRetryWindow final {
+public:
+    using Clock = std::chrono::steady_clock;
+
+    explicit StartupRetryWindow(Clock::duration length) noexcept
+        : length_(length) {}
+
+    // Until when startup may retry after this failure; nothing when the
+    // failure is not temporary or its window has closed.
+    [[nodiscard]] std::optional<Clock::time_point>
+    retryUntil(const RuntimeBootstrapReport &failure, Clock::time_point now);
+
+private:
+    Clock::duration length_;
+    std::optional<Clock::time_point> deadline_;
+    RuntimeBootstrapStage stage_ = RuntimeBootstrapStage::ResourceAssembly;
 };
 
-using ActualMemoryReporter =
-    std::function<ActualMemoryReport(uint64_t estimatedWarmupPeakBytes)>;
+// Whether memory may not hold a request of contextTokens: the plan within
+// what the host had available at startup, beyond its reserve and the warning
+// margin, holds less. The estimate is conservative, since macOS compresses
+// other applications further once the engine loads.
+[[nodiscard]] bool memoryMayNotHold(const EngineMemoryPlan &plan,
+                                    uint64_t hostAvailableBytes,
+                                    uint32_t contextTokens);
+
+// The wire limits of a model served with maxContext tokens: prompts and
+// outputs up to the context, the engine's step and draft query rows, and a
+// mask row per draft query and the anchor.
+[[nodiscard]] protocol::ProtocolLimits
+protocolLimitsFor(const model::ModelCapabilities &capabilities,
+                  uint32_t maxContext) noexcept;
+
+struct RuntimeBootstrapConfig {
+    RuntimeResourcesConfig resources;
+    // A zero engine maxContext is what the memory plan holds, as serve's
+    // default; a larger one than that fails the bootstrap.
+    NativeLoopConfig nativeLoop{.engine = {.maxContext = 0}};
+};
+
+using ActualMemoryReporter = std::function<ActualMemoryReport()>;
 
 // Complete owner returned only after the real loop has emitted its binary
 // ReadyEvent. No partially warmed instance escapes start().
@@ -96,6 +136,16 @@ public:
         return report_;
     }
 
+    // The memory control pass the transport runs at a command-free point
+    // (MemoryControl::run).
+    [[nodiscard]] bool controlPass(MemoryPressure pressure) {
+        return memoryControl_.run(pressure);
+    }
+    // The status document, with the metrics and the loop timing the
+    // transport keeps.
+    [[nodiscard]] std::string statusJson(const RuntimeMetricsSnapshot &metrics,
+                                         const NativeLoopTiming &loop);
+
 private:
     RuntimeBootstrap(std::unique_ptr<RuntimeResources> resources,
                      std::unique_ptr<model::RuntimeModel> modelRuntime,
@@ -106,6 +156,7 @@ private:
     std::unique_ptr<RuntimeResources> resources_;
     std::unique_ptr<model::RuntimeModel> model_;
     std::unique_ptr<NativeRuntime> nativeLoop_;
+    MemoryControl memoryControl_;
     RuntimeBootstrapReport report_;
 };
 

@@ -13,7 +13,10 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[3]
 COMPLETIONS = REPO / "install/completions"
 OFFICIAL = ("official/Model-A", "official/Model-B")
+SUGGESTED = ("suggested/Model-4bit",)
 LOCAL = ("community/custom-splash", "community/linked-splash")
+GGUF = ("unsloth/Model-GGUF:Q8_0", "unsloth/Model-GGUF:UD-Q4_K_M")
+UPSTREAM = (*GGUF, "mlx-community/Model-4bit")
 
 
 def bash_paths():
@@ -75,6 +78,7 @@ class CompletionTests(unittest.TestCase):
         directory = root / "install/completions"
         shutil.copytree(COMPLETIONS, directory)
         (directory / "official-models.txt").write_text("\n".join(OFFICIAL) + "\n")
+        (directory / "suggested-models.txt").write_text("\n".join(SUGGESTED) + "\n")
         if release:
             (root / "release.json").write_text("{}")
             models = self.home / "Library/Application Support/Splash/models"
@@ -95,10 +99,28 @@ class CompletionTests(unittest.TestCase):
         (models / "community/directory-manifest/manifest.json").mkdir(
             parents=True, exist_ok=True
         )
+        # Upstream installations link assemblies that record model.json.
+        for model in UPSTREAM:
+            assembly = self.root / (name + " assembly " + model.replace("/", " "))
+            assembly.mkdir()
+            (assembly / "model.json").write_text("{}")
+            (models / model).parent.mkdir(parents=True, exist_ok=True)
+            (models / model).unlink(missing_ok=True)
+            (models / model).symlink_to(assembly, target_is_directory=True)
+        # A selection root (.selections/<sha256>) records model.json too, but
+        # it is a hidden installation, not a model id.
+        selection = self.root / (name + " selection assembly")
+        selection.mkdir()
+        (selection / "model.json").write_text("{}")
+        (models / ".selections").mkdir(exist_ok=True)
+        (models / ".selections/0123").unlink(missing_ok=True)
+        (models / ".selections/0123").symlink_to(selection, target_is_directory=True)
         for invalid in (
             "bad owner/model",
             "community/bad--name",
             "community/bad..name",
+            "community/model:bad variant",
+            "community/model:a:b",
         ):
             path = models / invalid
             path.mkdir(parents=True, exist_ok=True)
@@ -117,9 +139,7 @@ class CompletionTests(unittest.TestCase):
         self.assertEqual(result.stderr, "")
         return result.stdout.splitlines()
 
-    def bash_complete(
-        self, shell, script, words, *, upgrade=None, equal_wordbreak=True
-    ):
+    def bash_complete(self, shell, script, words, *, upgrade=None, unbroken=""):
         setup = ""
         if upgrade:
             link, new, old = upgrade
@@ -128,8 +148,8 @@ class CompletionTests(unittest.TestCase):
                 f"/bin/ln -s {shlex.quote(str(new))} {shlex.quote(str(link))}\n"
                 f"/bin/rm -rf {shlex.quote(str(old))}\n"
             )
-        if not equal_wordbreak:
-            setup += "COMP_WORDBREAKS=${COMP_WORDBREAKS//=/}\n"
+        if unbroken:
+            setup += f"COMP_WORDBREAKS=${{COMP_WORDBREAKS//[{unbroken}]/}}\n"
         program = (
             'source "$1"\nshift\n' + setup + "registration=$(complete -p splash)\n"
             "function=${registration##* -F }\nfunction=${function%% *}\n"
@@ -163,8 +183,10 @@ class CompletionTests(unittest.TestCase):
             with self.subTest(release=release):
                 _, directory = self.layout(str(release), release=release)
                 self.assertEqual(
-                    self.run_helper(directory), sorted((*OFFICIAL, *LOCAL))
+                    self.run_helper(directory),
+                    sorted((*OFFICIAL, *SUGGESTED, *LOCAL, *UPSTREAM)),
                 )
+                self.assertEqual(self.run_helper(directory, "unsloth/"), list(GGUF))
                 self.assertEqual(self.run_helper(directory, "community/l"), [LOCAL[1]])
                 self.assertEqual(self.run_helper(directory, "community/*"), [])
                 self.assertEqual(self.run_helper(directory, "["), [])
@@ -185,28 +207,79 @@ class CompletionTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     self.run_helper(directory),
-                    sorted((*OFFICIAL, *LOCAL, "official/New")),
+                    sorted((*OFFICIAL, *SUGGESTED, *LOCAL, *UPSTREAM, "official/New")),
                 )
                 self.assertEqual(
                     self.run_helper(directory, "official/N"), ["official/New"]
                 )
                 cache.write_text("invalid\n")
                 self.assertEqual(
-                    self.run_helper(directory), sorted((*OFFICIAL, *LOCAL))
+                    self.run_helper(directory),
+                    sorted((*OFFICIAL, *SUGGESTED, *LOCAL, *UPSTREAM)),
                 )
 
     def test_actual_bash_completion(self):
         _, directory = self.layout()
         cases = (
-            (["splash", ""], ["serve", "claude", "codex", "opencode", "hermes"]),
+            (
+                ["splash", ""],
+                ["serve", "claude", "codex", "opencode", "hermes", "pi"],
+            ),
             (["splash", "co"], ["codex"]),
-            (["splash", "serve", "--model", ""], sorted((*OFFICIAL, *LOCAL))),
+            (
+                ["splash", "serve", "--model", ""],
+                sorted((*OFFICIAL, *SUGGESTED, *LOCAL, *UPSTREAM)),
+            ),
             (["splash", "serve", "--model", "community/l"], [LOCAL[1]]),
             (["splash", "serve", "--model=community/l"], [LOCAL[1]]),
             (["splash", "serve", "--model", "=", "community/l"], [LOCAL[1]]),
-            (["splash", "serve", "--model", "="], sorted((*OFFICIAL, *LOCAL))),
+            (
+                ["splash", "serve", "--model", "="],
+                sorted((*OFFICIAL, *SUGGESTED, *LOCAL, *UPSTREAM)),
+            ),
             (["splash", "serve", "--", "--model", ""], []),
             (["splash", "serve", "--max-context", ""], []),
+            # Bash 3.2 keeps owner/repo:VARIANT in one word, and readline
+            # replaces only the text after its ':'.
+            (["splash", "serve", "--model", "unsloth/Model-GGUF:UD"], ["UD-Q4_K_M"]),
+            (["splash", "serve", "--model=unsloth/Model-GGUF:UD"], ["UD-Q4_K_M"]),
+            # Bash 4 and later also split the word at the ':'.
+            (
+                ["splash", "serve", "--model", "unsloth/Model-GGUF", ":", "UD"],
+                ["UD-Q4_K_M"],
+            ),
+            (
+                ["splash", "serve", "--model", "unsloth/Model-GGUF", ":"],
+                ["Q8_0", "UD-Q4_K_M"],
+            ),
+            (
+                ["splash", "serve", "--model", "=", "unsloth/Model-GGUF", ":", "UD"],
+                ["UD-Q4_K_M"],
+            ),
+            (
+                ["splash", "serve", "--max-context", "unsloth/Model-GGUF", ":", "UD"],
+                [],
+            ),
+            (["splash", "serve", "unsloth/Model-GGUF", ":"], []),
+        )
+        # Words as they are split once these characters leave COMP_WORDBREAKS.
+        unbroken_cases = (
+            (["splash", "serve", "--model=community/l"], "=", [f"--model={LOCAL[1]}"]),
+            (
+                ["splash", "serve", "--model=unsloth/Model-GGUF", ":", "UD"],
+                "=",
+                ["UD-Q4_K_M"],
+            ),
+            (
+                ["splash", "serve", "--model", "unsloth/Model-GGUF:UD"],
+                ":",
+                ["unsloth/Model-GGUF:UD-Q4_K_M"],
+            ),
+            (
+                ["splash", "serve", "--model=unsloth/Model-GGUF:UD"],
+                "=:",
+                ["--model=unsloth/Model-GGUF:UD-Q4_K_M"],
+            ),
         )
         for shell in bash_paths():
             for words, expected in cases:
@@ -215,17 +288,15 @@ class CompletionTests(unittest.TestCase):
                         self.bash_complete(shell, directory / "splash.bash", words),
                         expected,
                     )
-            with self.subTest(shell=shell, equal_wordbreak=False):
-                self.assertEqual(
-                    self.bash_complete(
-                        shell,
-                        directory / "splash.bash",
-                        ["splash", "serve", "--model=community/l"],
-                        equal_wordbreak=False,
-                    ),
-                    [f"--model={LOCAL[1]}"],
-                )
-            for agent in ("claude", "codex", "opencode", "hermes"):
+            for words, unbroken, expected in unbroken_cases:
+                with self.subTest(shell=shell, words=words, unbroken=unbroken):
+                    self.assertEqual(
+                        self.bash_complete(
+                            shell, directory / "splash.bash", words, unbroken=unbroken
+                        ),
+                        expected,
+                    )
+            for agent in ("claude", "codex", "opencode", "hermes", "pi"):
                 with self.subTest(shell=shell, agent=agent):
                     self.assertEqual(
                         self.bash_complete(
@@ -262,11 +333,14 @@ class CompletionTests(unittest.TestCase):
         shell="/bin/zsh",
         upgrade=None,
         autoload=False,
-        equal_wordbreak=True,
+        unbroken="",
     ):
         zsh = shell == "/bin/zsh"
         capture = self.root / "shell captured result"
         capture.unlink(missing_ok=True)
+        # The capture is read as soon as it exists, so each writer renames
+        # its complete result into place.
+        publish = '> "$CAPTURE.part" && mv "$CAPTURE.part" "$CAPTURE"'
         environment = {
             **self.env,
             "COMPLETION_SCRIPT": str(script),
@@ -289,7 +363,9 @@ class CompletionTests(unittest.TestCase):
                     else 'autoload -Uz compinit; compinit -D -u; source "$COMPLETION_SCRIPT"; '
                 )
                 setup += (
-                    'function capture_buffer() { print -r -- "$BUFFER" > "$CAPTURE"; }; '
+                    'function capture_buffer() { print -r -- "$BUFFER" '
+                    + publish
+                    + "; }; "
                     "zle -N capture_buffer; bindkey '^X' capture_buffer; "
                     "print -r -- COMPLETION_READY\n"
                 )
@@ -297,16 +373,24 @@ class CompletionTests(unittest.TestCase):
             else:
                 # Enter runs this test-only argv recorder, never the real launcher.
                 recorder = self.root / "splash"
-                recorder.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$CAPTURE"\n')
+                recorder.write_text('#!/bin/sh\nprintf "%s\\n" "$@" ' + publish + "\n")
                 recorder.chmod(0o755)
-                setup = 'source "$COMPLETION_SCRIPT"; splash() { printf "%s\\n" "$@" > "$CAPTURE"; }; '
-                if not equal_wordbreak:
-                    setup += "COMP_WORDBREAKS=${COMP_WORDBREAKS//=/}; "
+                setup = (
+                    'source "$COMPLETION_SCRIPT"; '
+                    'splash() { printf "%s\\n" "$@" ' + publish + "; }; "
+                )
+                if unbroken:
+                    setup += f"COMP_WORDBREAKS=${{COMP_WORDBREAKS//[{unbroken}]/}}; "
                 setup += 'printf "COMPLETION_READY\\n"\n'
                 keys = b"\t\n"
-            os.write(master, setup.encode())
+            # Typing waits for the prompt: keys that arrive before the line
+            # editor takes the terminal go through its line discipline instead.
+            os.write(master, b"PS1='[splash-test] '; " + setup.encode())
             deadline = time.monotonic() + 15
-            while b"COMPLETION_READY\r\n" not in output:
+            ready = b"COMPLETION_READY\r\n"
+            while ready not in output or (
+                b"[splash-test] " not in output[output.index(ready) :]
+            ):
                 self.assertLess(
                     time.monotonic(), deadline, output.decode(errors="replace")
                 )
@@ -348,9 +432,15 @@ class CompletionTests(unittest.TestCase):
         _, directory = self.layout()
         for line, expected in (
             ("splash se", "splash serve "),
+            ("splash p", "splash pi "),
             ("splash serve --model community/l", f"splash serve --model {LOCAL[1]} "),
             ("splash serve --model=community/l", f"splash serve --model={LOCAL[1]} "),
+            (
+                "splash serve --model unsloth/Model-GGUF:UD",
+                f"splash serve --model {GGUF[1]} ",
+            ),
             ("splash claude --model community/l", "splash claude --model community/l"),
+            ("splash pi --model community/l", "splash pi --model community/l"),
         ):
             with self.subTest(line=line):
                 self.assertEqual(self.shell_tab(directory / "_splash", line), expected)
@@ -358,30 +448,35 @@ class CompletionTests(unittest.TestCase):
     def test_actual_bash_tab_wordbreaks(self):
         _, directory = self.layout()
         for shell in bash_paths():
-            for equal_wordbreak in (True, False):
+            for unbroken in ("", "=", ":"):
                 for command, option in (
                     ("splash", "--model="),
                     ("splash", "--model "),
                     ("./splash", "--model="),
                 ):
-                    with self.subTest(
-                        shell=shell,
-                        equal_wordbreak=equal_wordbreak,
-                        command=command,
-                        option=option,
+                    for typed, model in (
+                        ("community/l", LOCAL[1]),
+                        ("unsloth/Model-GGUF:UD", GGUF[1]),
                     ):
-                        actual = self.shell_tab(
-                            directory / "splash.bash",
-                            f"{command} serve {option}community/l",
+                        with self.subTest(
                             shell=shell,
-                            equal_wordbreak=equal_wordbreak,
-                        )
-                        expected = (
-                            ["serve", "--model=" + LOCAL[1]]
-                            if option.endswith("=")
-                            else ["serve", "--model", LOCAL[1]]
-                        )
-                        self.assertEqual(actual.splitlines(), expected)
+                            unbroken=unbroken,
+                            command=command,
+                            option=option,
+                            typed=typed,
+                        ):
+                            actual = self.shell_tab(
+                                directory / "splash.bash",
+                                f"{command} serve {option}{typed}",
+                                shell=shell,
+                                unbroken=unbroken,
+                            )
+                            expected = (
+                                ["serve", "--model=" + model]
+                                if option.endswith("=")
+                                else ["serve", "--model", model]
+                            )
+                            self.assertEqual(actual.splitlines(), expected)
 
     @unittest.skipUnless(os.access("/bin/zsh", os.X_OK), "Zsh is not installed")
     def test_zsh_loaded_completion_survives_release_upgrade(self):

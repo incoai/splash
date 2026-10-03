@@ -11,6 +11,11 @@ on:
         required: false
         type: boolean
         default: false
+      expect_output_change:
+        description: Allow outputs that differ from the baseline's, with acceptance within 0.02 (EXPECT_OUTPUT_CHANGE=1)
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: runtime-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
@@ -58,14 +63,11 @@ jobs:
           test "$actual" = "${{ matrix.python-version }}"
 
   release-hardware:
-    name: Release gate (${{ matrix.runner_label }}, ${{ matrix.model }})
+    name: Release gate (${{ matrix.runner_label }})
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.release_gate == true }}
     strategy:
       fail-fast: false
       matrix:
-        model:
-          - incoai/Qwen3.8-27B-Splash
-          - incoai/Qwen3.6-35B-A3B-Splash
         runner_label:
           - splash-m3-max-48
           - splash-m4-pro-48
@@ -76,39 +78,56 @@ jobs:
           - splash-m5-max-64plus
     runs-on: [self-hosted, macOS, ARM64, "${{ matrix.runner_label }}"]
     env:
-      MODEL: ${{ matrix.model }}
+      PYTHON_CANDIDATES: python3
+      EXPECT_OUTPUT_CHANGE: ${{ inputs.expect_output_change && '1' || '' }}
     # Older Apple GPUs can spend substantially longer in the real context and
-    # quality gates. The matrix must fail on an engine/test result, not an
+    # quality gates. The job must fail on an engine/test result, not an
     # arbitrary job timer.
     timeout-minutes: 360
+    # The Metal suite once, then each model of DEVELOPMENT.md's Release check
+    # (MLX and GGUF, dense and MoE, each at one commit, and a legacy package)
+    # against the runner's retained baseline build, RUNNER_BASELINE, which
+    # release-check requires and which must load every model: the previous
+    # release's build, or while that loads no upstream model (1.0.x, for 1.1)
+    # a build of the last commit before the change under test. Every model
+    # runs even when an earlier step failed.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          # Self-hosted release machines keep the manifest-pinned packed
-          # models in the ignored install/models/ directory. A clean checkout runs
-          # git clean -ffdx and destroys that multi-gigabyte prepared input;
-          # release-check still rejects tracked/untracked source changes and
-          # verify-models performs a full content hash before inference.
-          clean: false
-      - name: Prepare the selected model
-        run: make install PYTHON_CANDIDATES=python3
-      - name: Run the complete Splash runtime release gate
-        run: |
-          make release-check PYTHON_CANDIDATES=python3
-      - name: Record the physical GPU prefill and decode kernel sweeps
-        if: success()
-        run: |
-          mkdir -p build/release
-          make benchmark-prefill | tee build/release/q4-prefill-profile.txt
-          make benchmark-decode | tee build/release/q4-decode-profile.txt
+      - name: Run the shader-validated Metal suite
+        run: make check-native-metal
+      - name: mlx-community/Qwen3.8-27B-4bit
+        if: ${{ !cancelled() }}
+        run: >-
+          make install release-check BASELINE="$RUNNER_BASELINE"
+          MODEL=mlx-community/Qwen3.8-27B-4bit
+          REVISION=3e6447f082e89cc7f0bc6e5441afd38dfce760ff
+      - name: unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M, text only
+        if: ${{ !cancelled() }}
+        run: >-
+          make install release-check BASELINE="$RUNNER_BASELINE"
+          MODEL=unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M LANGUAGE_ONLY=1
+          REVISION=4ca720788d1e01f1bff70c033e0d0028fd02e502
+      - name: mlx-community/Qwen3.6-35B-A3B-4bit
+        if: ${{ !cancelled() }}
+        run: >-
+          make install release-check BASELINE="$RUNNER_BASELINE"
+          MODEL=mlx-community/Qwen3.6-35B-A3B-4bit
+          REVISION=38740b847e4cb78f352aba30aa41c76e08e6eb46
+      - name: unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M
+        if: ${{ !cancelled() }}
+        run: >-
+          make install release-check BASELINE="$RUNNER_BASELINE"
+          MODEL=unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M
+          REVISION=a483e9e6cbd595906af30beda3187c2663a1118c
+      - name: incoai/Qwen3.8-27B-Splash
+        if: ${{ !cancelled() }}
+        run: >-
+          make install release-check BASELINE="$RUNNER_BASELINE"
+          MODEL=incoai/Qwen3.8-27B-Splash
       - name: Preserve release reports
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: runtime-release-${{ runner.name }}-${{ strategy.job-index }}-${{ github.sha }}
-          path: |
-            build/release/agent-real.json
-            build/release/backend-benchmark.json
-            build/release/q4-prefill-profile.txt
-            build/release/q4-decode-profile.txt
+          path: build/release/**/*.json
           if-no-files-found: ignore

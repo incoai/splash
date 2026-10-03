@@ -4,8 +4,20 @@ import unittest
 
 from dev.tests import test_server
 from dev.tests.engine.test_documents import document_block
-from dev.tests.test_server import FakeConstraintFactory, FakeRuntime, Harness, Plan
-from server.api_shapes import anthropic_to_chat_body, anthropic_to_chat_prompt
+from dev.tests.test_server import (
+    FOREVER,
+    FakeConstraintFactory,
+    FakeRuntime,
+    Harness,
+    Plan,
+    no_signed_thinking,
+)
+from server import documents
+from server.api_shapes import (
+    anthropic_to_chat_body,
+    anthropic_to_chat_prompt,
+    normalize_messages,
+)
 from server.errors import APIError
 
 SCHEMA = {
@@ -65,7 +77,10 @@ class AnthropicAdapterTest(unittest.TestCase):
             ]
         )
         original = copy.deepcopy(body)
-        messages = anthropic_to_chat_prompt(body)["messages"]
+        translated = anthropic_to_chat_prompt(
+            body, thinking_resolver=no_signed_thinking
+        )
+        messages = translated["messages"]
         self.assertEqual(messages[1]["content"], "Checking.")
         self.assertNotIn("reasoning_content", messages[1])
         self.assertEqual(
@@ -96,7 +111,8 @@ class AnthropicAdapterTest(unittest.TestCase):
                                 ],
                             }
                         ]
-                    )
+                    ),
+                    thinking_resolver=no_signed_thinking,
                 )
             self.assertEqual(caught.exception.status, 400)
 
@@ -110,7 +126,9 @@ class AnthropicAdapterTest(unittest.TestCase):
             with self.subTest(fields=fields):
                 self.assertNotIn(
                     "preserve_thinking",
-                    anthropic_to_chat_prompt(request_body(**fields)),
+                    anthropic_to_chat_prompt(
+                        request_body(**fields), thinking_resolver=no_signed_thinking
+                    ),
                 )
 
     def test_format_aliases_preserve_schema_and_input(self):
@@ -121,7 +139,9 @@ class AnthropicAdapterTest(unittest.TestCase):
             with self.subTest(fields=fields):
                 body = request_body(**fields)
                 original = copy.deepcopy(body)
-                translated = anthropic_to_chat_body(body)
+                translated, _ = anthropic_to_chat_body(
+                    body, thinking_resolver=no_signed_thinking
+                )
                 self.assertEqual(body, original)
                 self.assertEqual(
                     translated["response_format"],
@@ -135,10 +155,23 @@ class AnthropicAdapterTest(unittest.TestCase):
             output_config={"effort": "xhigh", "format": FORMAT},
             tools=[{"name": "lookup", "input_schema": {"type": "object"}}],
         )
-        translated = anthropic_to_chat_prompt(body)
+        translated = anthropic_to_chat_prompt(
+            body, thinking_resolver=no_signed_thinking
+        )
         self.assertEqual(translated["reasoning_effort"], "xhigh")
         self.assertEqual(translated["response_format"]["json_schema"]["schema"], SCHEMA)
         self.assertEqual(translated["tools"][0]["function"]["name"], "lookup")
+
+    def test_a_strict_tool_stays_strict(self):
+        body = request_body(
+            tools=[
+                {"name": "lookup", "input_schema": {"type": "object"}, "strict": True}
+            ],
+        )
+        translated = anthropic_to_chat_prompt(
+            body, thinking_resolver=no_signed_thinking
+        )
+        self.assertIs(translated["tools"][0]["function"]["strict"], True)
 
     def test_format_shape_validation_is_independent_of_thinking(self):
         invalid = [
@@ -165,7 +198,8 @@ class AnthropicAdapterTest(unittest.TestCase):
                 with self.subTest(fields=fields, thinking=thinking):
                     with self.assertRaises(APIError):
                         anthropic_to_chat_prompt(
-                            request_body(thinking=thinking, **fields)
+                            request_body(thinking=thinking, **fields),
+                            thinking_resolver=no_signed_thinking,
                         )
 
 
@@ -174,6 +208,29 @@ class AnthropicHTTPContractTest(unittest.TestCase):
         harness = Harness(runtime or FakeRuntime(), **kwargs)
         self.addCleanup(harness.close)
         return harness
+
+    def test_trailing_assistant_prefill_is_refused(self):
+        runtime = FakeRuntime()
+        harness = self.harness(runtime)
+        body = request_body(
+            messages=[
+                {"role": "user", "content": "Answer in JSON."},
+                {"role": "assistant", "content": "{"},
+            ]
+        )
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                status, _, payload = harness.request(
+                    "POST", "/v1/messages", {**body, "stream": stream}
+                )
+                self.assertEqual(status, 400, payload)
+                error = json.loads(payload)["error"]
+                self.assertEqual(error["type"], "invalid_request_error")
+                self.assertIn("prefill", error["message"])
+        self.assertEqual(runtime.requests, [])
+        status, _, payload = harness.request("POST", "/v1/messages/count_tokens", body)
+        self.assertEqual(status, 200, payload)
+        self.assertGreater(json.loads(payload)["input_tokens"], 0)
 
     def test_redacted_history_count_and_generation_use_same_visible_prompt(self):
         tokenizer = test_server.FakeTokenizer()
@@ -215,9 +272,13 @@ class AnthropicHTTPContractTest(unittest.TestCase):
 
     def test_keep_all_forwards_history_and_agrees_with_generation_count(self):
         class InputTokenizer(test_server.FakeTokenizer):
-            def apply_chat_template(self, messages, **kwargs):
-                prefix = super().apply_chat_template(messages, **kwargs)
-                return json.dumps([messages, kwargs], sort_keys=True) + prefix
+            def apply_chat_template(
+                self, messages, add_generation_prompt=False, **kwargs
+            ):
+                prompt = super().apply_chat_template(
+                    messages, add_generation_prompt=add_generation_prompt, **kwargs
+                )
+                return json.dumps([messages, kwargs], sort_keys=True) + prompt
 
             def __call__(self, text, **_kwargs):
                 return {"input_ids": list(text.encode())}
@@ -367,8 +428,25 @@ class AnthropicHTTPContractTest(unittest.TestCase):
         ):
             with self.subTest(tool_result=len(messages) > 1):
                 body = request_body(messages=messages)
-                translated = anthropic_to_chat_body(body)
-                parts = translated["messages"][-1]["content"]
+                translated, _ = anthropic_to_chat_body(
+                    body, thinking_resolver=no_signed_thinking
+                )
+                # Conversion leaves the PDF to request preparation.
+                self.assertEqual(
+                    translated["messages"][-1]["content"],
+                    [
+                        {
+                            "type": "file",
+                            "file": {
+                                "file_data": documents.PDF_DATA_URL_PREFIX
+                                + document["source"]["data"]
+                            },
+                        }
+                    ],
+                )
+                parts = normalize_messages(
+                    translated["messages"], vision=True, deadline=FOREVER
+                )[-1]["content"]
                 self.assertIn("ALPHA 42", parts[0]["text"])
                 self.assertEqual(parts[1]["type"], "image_url")
                 status, _, payload = harness.request(
@@ -376,7 +454,7 @@ class AnthropicHTTPContractTest(unittest.TestCase):
                 )
                 self.assertEqual(status, 200, payload)
                 counted = json.loads(payload)["input_tokens"]
-                job, *_ = harness.app.prepare(translated)
+                job = harness.app.prepare(translated, deadline=FOREVER)
                 self.assertEqual(len(job.prompt_tokens), counted)
                 self.assertGreater(counted, 2)
                 self.assertEqual(len(job.image_spans), 1)
