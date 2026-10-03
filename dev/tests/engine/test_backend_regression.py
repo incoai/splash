@@ -249,9 +249,19 @@ class BackendRegressionTests(unittest.TestCase):
         with self.assertRaisesRegex(regression.RegressionError, "lacks"):
             regression.round_record("baseline", [benchmark_document(("decode",))])
 
-    def fake_checkout(self, root: Path, name: str, identity: str, list_support: bool):
+    def fake_checkout(
+        self,
+        root: Path,
+        name: str,
+        identity: str,
+        list_support: bool,
+        share=None,
+        honours_share=True,
+    ):
         """A checkout whose backend-benchmark prints canned output and logs
-        its invocations."""
+        its invocations. With a share it has the Neural Engine split: it
+        reports that share as calibrated, or runs the one --ane-ffn-share
+        gives unless honours_share is false, and logs what it was given."""
         checkout = root / name
         (checkout / "build/engine-tests").mkdir(parents=True)
         (checkout / "build/engine").mkdir()
@@ -261,6 +271,17 @@ class BackendRegressionTests(unittest.TestCase):
             "[--scenario NAME[,NAME...]]"
             if list_support
             else "[--scenario decode|partial]"
+        ) + (" [--ane-ffn-share SHARE]" if share is not None else "")
+        given = (
+            "given = sys.argv[sys.argv.index('--ane-ffn-share') + 1] "
+            "if '--ane-ffn-share' in sys.argv else None\n"
+            f"with open({str(root / 'shares.jsonl')!r}, 'a') as log:\n"
+            f"    log.write(json.dumps([{name!r}, given]) + '\\n')\n"
+            "document['ane_ffn_share'] = "
+            + ("float(given) if given else " if honours_share else "")
+            + f"{share!r}\n"
+            if share is not None
+            else ""
         )
         script = checkout / regression.BENCHMARK
         script.write_text(
@@ -275,7 +296,8 @@ class BackendRegressionTests(unittest.TestCase):
             f"document = json.loads({json.dumps(json.dumps(benchmark_document(build=name, layout=identity)))})\n"
             "if 'decode' not in scenarios: document['decode_throughput']['samples'] = []\n"
             "if 'partial' not in scenarios: document['measurements'] = []\n"
-            "print(json.dumps(document))\n"
+            + given
+            + "print(json.dumps(document))\n"
         )
         script.chmod(0o755)
         return checkout
@@ -376,6 +398,58 @@ class BackendRegressionTests(unittest.TestCase):
                 )
                 # A legacy package prepares nothing, which is no failure.
                 self.assertEqual(document["prepared"].get("entries", []), [])
+
+    def test_later_rounds_run_the_first_reported_ane_ffn_share(self):
+        calibrated = 1 - 24 / 34
+        # A baseline without the split leaves the candidate's first round to
+        # calibrate; one with it calibrates first and the candidate runs its
+        # share.
+        for baseline_share, expected in (
+            (None, [["candidate", None], ["candidate", repr(0.32)]]),
+            (
+                calibrated,
+                [
+                    ["baseline", None],
+                    ["candidate", repr(calibrated)],
+                    ["candidate", repr(calibrated)],
+                    ["baseline", repr(calibrated)],
+                ],
+            ),
+        ):
+            with (
+                self.subTest(baseline_share=baseline_share),
+                TemporaryDirectory() as directory,
+            ):
+                root = Path(directory).resolve()
+                self.fake_checkout(root, "baseline", "same", True, baseline_share)
+                self.fake_checkout(root, "candidate", "same", True, 0.32)
+                self.assertEqual(self.run_main(root), 0)
+                shares = [
+                    json.loads(line)
+                    for line in (root / "shares.jsonl").read_text().splitlines()
+                ]
+                self.assertEqual(shares, expected)
+                document = json.loads(
+                    (root / "release/backend-regression.json").read_text()
+                )
+                self.assertEqual(
+                    document["ane_ffn_share"],
+                    0.32 if baseline_share is None else calibrated,
+                )
+
+    def test_a_round_that_runs_another_ane_ffn_share_fails(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            self.fake_checkout(root, "baseline", "same", True, 0.3)
+            self.fake_checkout(
+                root, "candidate", "same", True, 0.0, honours_share=False
+            )
+            with self.assertRaisesRegex(
+                regression.RegressionError,
+                r"round-2-candidate-decode-partial: ran the Neural Engine split "
+                r"at share 0.0, not the first round's 0.3",
+            ):
+                self.run_main(root)
 
     def test_package_slug_names_results_by_selection(self):
         models = Path("/install/models")

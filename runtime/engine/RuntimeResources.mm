@@ -396,12 +396,16 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
       memoryGovernor->setPressure(config.memoryPressure());
     logStartup("Kernel policy for GPU family ", device.appleGpuFamily,
                " with ", device.gpuCoreCount, " cores.");
-    // The split runs at the share calibrated here when it beats the GPU
-    // alone and the plan still fits with it under the governor's ceiling.
+    // The split runs at the share calibrated here, or the one the config
+    // gives, when the plan still fits with it under the governor's ceiling;
+    // a calibrated share also has to beat the GPU alone.
     try {
       const auto started = std::chrono::steady_clock::now();
-      const ops::AneFfn::Calibration calibration =
-          model::calibrateAneFfn(*backend, package, operators, config.kvFormat);
+      ops::AneFfn::Calibration calibration;
+      if (config.aneFfnShare)
+        calibration.share = *config.aneFfnShare;
+      else
+        calibration = model::calibrateAneFfn(*backend, package, operators, config.kvFormat);
       const auto fixed = [](double value, int digits) {
         std::ostringstream text;
         text << std::fixed << std::setprecision(digits) << value;
@@ -424,9 +428,12 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
               split.hardBudgetBytes != unsplit.hardBudgetBytes)
             throw std::logic_error("the split changed the memory governor ceiling");
           memoryPlan = std::move(splitMemoryPlan);
-          logStartup("Neural Engine FFN split at share ", fixed(calibration.share, 2), ": ",
-                     fixed(calibration.splitMilliseconds, 1), layer, " against ",
-                     fixed(calibration.gpuMilliseconds, 1), " ms on the GPU alone", calibrated, ".");
+          if (config.aneFfnShare)
+            logStartup("Neural Engine FFN split at the given share ", fixed(calibration.share, 3), ".");
+          else
+            logStartup("Neural Engine FFN split at share ", fixed(calibration.share, 2), ": ",
+                       fixed(calibration.splitMilliseconds, 1), layer, " against ",
+                       fixed(calibration.gpuMilliseconds, 1), " ms on the GPU alone", calibrated, ".");
         } catch (const std::exception &error) {
           aneFfnShare = 0.0;
           memoryPlan = unsplitMemoryPlan;
@@ -434,6 +441,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
           logStartup("Neural Engine FFN split at share ", fixed(calibration.share, 2),
                      " does not fit (", error.what(), "); the GPU runs the FFN alone.");
         }
+      } else if (config.aneFfnShare) {
+        logStartup("The GPU runs the prefill FFN alone, as given.");
       } else if (calibration.gpuMilliseconds > 0.0) {
         logStartup("The GPU runs the prefill FFN alone, ", fixed(calibration.gpuMilliseconds, 1), layer,
                    ": no Neural Engine split beats it", calibrated, ".");

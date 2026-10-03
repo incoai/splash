@@ -777,6 +777,8 @@ variants, so a `:VARIANT` suffix is rejected, and `--revision`,
 - `runtime/engine/`: scheduling, memory admission and reusable request state.
 - `runtime/model/`: target/draft execution and vision.
 - `runtime/ops/` and `runtime/metal/`: operators and Metal kernels.
+- `runtime/ane/`: the Neural Engine client, on the private AppleNeuralEngine
+  framework.
 - `install/`: launcher, client configuration and model installation.
 - `dev/`: maintained tests, benchmarks and build/release tools.
 
@@ -1094,6 +1096,35 @@ alone, after every cached prefix was evicted, fails with 400
 `capacity_exhausted`, naming `--max-memory` and `--max-context`; retrying it
 fails the same way.
 
+### Neural Engine prefill
+
+Prefill chunks of 512 rows or more of a dense target split each layer's FFN by
+intermediate channel (`runtime/ops/AneFfn.cpp`). The GPU runs the leading
+channels on its prefill kernels, its down projection reading a view of the
+leading inputs of down's rows (`Projection::planeInputs`). The Neural Engine
+runs the rest as one W8A8 program, Hadamard-rotated int8 activations and
+per-row int8 weights, in programs of 512, 1024, 1536 and 2048 rows
+(`runtime/ane/Program.mm`). The GPU requantizes the ANE's weights from the Q4
+or GGUF planes one layer ahead into double-buffered IOSurfaces and adds the
+ANE's partial down projection to its own. Shared events order each evaluation
+between the GPU's packing and that join inside the one prefill command
+(`metal::EventStep`); each signal ends a Metal command buffer, so the queue
+holds 512. MoE targets, the mixers and decode stay on the GPU.
+
+Startup picks the share on the loaded model once the governor exists
+(`AneFfn::calibrate`): it times five FFN layers spread over the model's depth
+at shares 0.4 and 0.8, fits `T(s) = max(G(s), A(s), uG·G(s) + uA·A(s))`, and
+takes the least share within 1% of the best. The GPU runs the FFN alone if no
+share gains 5%, the ANE is unavailable, or the memory plan with the split's
+buffers, at the sizes Metal allocates, no longer fits under the governor's
+ceiling; startup logs which (`Neural Engine FFN split at share ...`). The
+first start compiles the ANE programs, about 5-15 s; the ANE service keeps
+each under a hash of its source, which stays in `$TMPDIR/splash-ane-programs`,
+so later starts load them until macOS clears that directory. The split's
+logits differ from the GPU's alone (KL about 1e-4 to 7e-4 on Qwen3.8-27B), and
+the share, being measured, can differ between starts; `backend-benchmark
+--ane-ffn-share` runs a given share instead.
+
 ### Disk cache
 
 `--max-cache-disk` adds an optional SSD tier for cached request states (GDN cell
@@ -1409,8 +1440,10 @@ family, so it runs once on each Mac. Per model, `release-check`:
 - runs the HTTP smoke, which for a text-only installation checks the 400s
   instead of images (`test-http-real`);
 - compares this build with `BASELINE`, which must have another build
-  identity, in ABBA order (`test-performance-real`): output tokens and
-  acceptance must be identical (`EXPECT_OUTPUT_CHANGE=1` allows changed
+  identity, in ABBA order (`test-performance-real`), every round after the
+  first to report a [Neural Engine share](#neural-engine-prefill) running that
+  share when its build takes one: output tokens and acceptance must be
+  identical (`EXPECT_OUTPUT_CHANGE=1` allows changed
   outputs with acceptance within 0.02), and so must the prepared bytes,
   which a baseline of another preparation identity prepares into a cache of
   its own; decode and prefill GPU time may regress by at most the larger of
