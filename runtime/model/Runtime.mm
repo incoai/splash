@@ -4,6 +4,7 @@
 #include "model/RuntimeArenas.hpp"
 
 #include "metal/CommandGraph.hpp"
+#include "metal/abi/LiveRows.h"
 #include "ops/Linear.hpp"
 #include "ops/PagedAttention.hpp"
 #include "ops/PagedKv.hpp"
@@ -19,6 +20,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <list>
 #include <numeric>
@@ -221,6 +223,7 @@ struct Runtime::Impl {
     uint32_t accepted = 0;
     uint32_t currentAnchor = 0;
     uint32_t maximumRetained = 0;
+    bool liveVerify = false;
     // Why the lane's selection is unusable (invalidSelection), found before
     // any lane commits.
     std::string failure;
@@ -278,6 +281,7 @@ struct Runtime::Impl {
   ops::Sampling sampling;
   QwenTarget targetModel;
   DFlashDraft draftModel;
+  float liveVerifyThreshold = 0.0F;
   explicit Impl(RuntimeContext value)
       : backend(value.backend),
         package(value.package),
@@ -1330,6 +1334,17 @@ struct Runtime::Impl {
     }
   }
 
+  bool useLiveVerifyRows(std::span<Request *const> entries) const noexcept {
+    return liveVerifyThreshold > 0.0F &&
+           geometry.target.ffnKind == QwenFfnKind::SparseMoe &&
+           std::any_of(entries.begin(), entries.end(), [](const Request *entry) {
+             return entry->sampling.temperature <= 0.0F;
+           }) &&
+           std::none_of(entries.begin(), entries.end(), [](const Request *entry) {
+             return entry->constraint != ConstraintMode::None;
+           });
+  }
+
   void encodeDraftBatchGraph(CommandGraph &graph,
                              std::span<Request *const> entries,
                              std::span<const uint64_t> logicalPositions) {
@@ -1382,14 +1397,18 @@ struct Runtime::Impl {
       anchors[lane] = *entry.pendingToken;
       policies[lane] = samplingPolicy(entry);
     }
-    draftModel.addSelection(
-        graph,
-        {d(DecodeTensor::Logits), d(DecodeTensor::TopPartialIds),
+    const ops::DraftSelectorBuffers selection{
+         d(DecodeTensor::Logits), d(DecodeTensor::TopPartialIds),
          d(DecodeTensor::TopPartialValues), d(DecodeTensor::Candidates),
          d(DecodeTensor::Unary), d(DecodeTensor::SelectorHidden),
          d(DecodeTensor::SamplingUniforms), d(DecodeTensor::ProposedTokens),
-         d(DecodeTensor::ProposalProbs)},
-        std::span(anchors).first(lanes), std::span(policies).first(lanes));
+         d(DecodeTensor::ProposalProbs)};
+    draftModel.addSelection(graph, selection, std::span(anchors).first(lanes),
+                             std::span(policies).first(lanes));
+    if (useLiveVerifyRows(entries))
+      ops::DraftSelector(geometry.target.vocabularySize).addLiveRows(
+          graph, selection, d(DecodeTensor::LiveRows),
+          std::span(policies).first(lanes), liveVerifyThreshold);
   }
 
   void encodeTargetVerifyBatchForward(CommandGraph &graph,
@@ -1442,6 +1461,7 @@ struct Runtime::Impl {
     buffers.chunkKeys = chunkKeys;
     buffers.chunkValues = chunkValues;
     buffers.moe = decodeArena->moeScratch(storage);
+    if (useLiveVerifyRows(entries)) buffers.liveRows = d(DecodeTensor::LiveRows);
     for (uint32_t lane = 0; lane < lanes; ++lane)
       chunks[lane] = ops::PagedAttention::verifyParams(
           items[lane].logicalPosition,
@@ -1546,7 +1566,8 @@ struct Runtime::Impl {
          decodeArena->packed(DecodeTensor::SamplingUniforms, width),
          decodeArena->packed(DecodeTensor::OutputTokens, width),
          decodeArena->packed(DecodeTensor::RetainedCount, width),
-         decodeArena->packed(DecodeTensor::AcceptedCount, width)},
+         decodeArena->packed(DecodeTensor::AcceptedCount, width),
+         useLiveVerifyRows(lanes) ? decodeArena->packed(DecodeTensor::LiveRows, width) : MetalBuffer{}},
         maximumRetained, std::span(policies).first(width),
         geometry.target.stopTokens[0], geometry.target.stopTokens[1]);
   }
@@ -1680,6 +1701,15 @@ struct Runtime::Impl {
     }
 
     counters.lastDecodeWidth = static_cast<uint32_t>(items.size());
+    counters.lastDecodeLiveRows = counters.lastDecodeWidth * kDecodeRows;
+    if (lanes.front().liveVerify) {
+      const auto *budgets = contents<VerifyLiveRows>(
+          decodeArena->packed(DecodeTensor::LiveRows, counters.lastDecodeWidth),
+          "live verify rows");
+      counters.lastDecodeLiveRows = 0;
+      for (uint32_t lane = 0; lane < counters.lastDecodeWidth; ++lane)
+        counters.lastDecodeLiveRows += budgets[lane].count;
+    }
     counters.lastDecodeGpuSeconds = timing.gpuSeconds;
     counters.totalDecodeGpuSeconds += timing.gpuSeconds;
     counters.lastDecodeWallSeconds = timing.wallSeconds;
@@ -1875,6 +1905,12 @@ Runtime::Runtime(RuntimeContext context)
 Runtime::~Runtime() = default;
 
 void Runtime::checkHealth() { impl_->backend.checkHealth(); }
+
+void Runtime::setLiveVerifyThreshold(float threshold) {
+  if (!std::isfinite(threshold) || threshold < 0.0F || threshold > 1.0F)
+    throw std::invalid_argument("live verify threshold must be in [0, 1]");
+  impl_->liveVerifyThreshold = threshold;
+}
 
 void Runtime::beginColdRequest(const ModelRequest &request,
                                uint32_t stateLane) {
@@ -2249,6 +2285,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
   }
 
   const std::span<Impl::Request *const> entries(requests.data(), width);
+  for (auto &lane : lanes) lane.liveVerify = impl_->useLiveVerifyRows(entries);
   const uint32_t ropeRows = width * kDecodeRows;
   CommandGraph commandGraph;
   impl_->addRopeTables(
@@ -2661,7 +2698,16 @@ ModelMemoryPlan plannedRuntimeMemory(const DeviceCapabilities &device,
 }
 
 std::unique_ptr<RuntimeModel> createRuntime(RuntimeContext context) {
-  return std::make_unique<Runtime>(std::move(context));
+  float threshold = 0.0F;
+  if (const char *value = std::getenv("SPLASH_LIVE_VERIFY_THRESHOLD")) {
+    char *end = nullptr;
+    threshold = std::strtof(value, &end);
+    if (end == value || *end || !std::isfinite(threshold) || threshold < 0.0F || threshold > 1.0F)
+      throw std::invalid_argument("SPLASH_LIVE_VERIFY_THRESHOLD must be a number in [0, 1]");
+  }
+  auto runtime = std::make_unique<Runtime>(std::move(context));
+  runtime->setLiveVerifyThreshold(threshold);
+  return runtime;
 }
 
 } // namespace splash::model

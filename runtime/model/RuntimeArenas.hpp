@@ -253,6 +253,7 @@ enum class DecodeTensor : uint32_t {
   TopPartialIds,
   TopPartialValues,
   ProposalProbs,
+  LiveRows,
   ProposedTokens,
   PageTable,
   // Indexed by state lane, like PageTable: a penalized request's penalty

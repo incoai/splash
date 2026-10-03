@@ -1,4 +1,5 @@
 #include "ops/MoE.hpp"
+#include "metal/abi/LiveRows.h"
 
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Gguf.h"
@@ -244,7 +245,7 @@ void addGgufExperts(metal::CommandGraph &graph, const MoeScratch &scratch,
 // plan, affine decode plans the fused gate/up tile.
 MoePlan::MoePlan(MoeShape shape, uint32_t rows, MoeConfig config,
                  MoePhase phase)
-    : shape_(shape), rows_(rows), config_(config),
+    : shape_(shape), rows_(rows), config_(config), phase_(phase),
       splitExperts_(shape.weightLayout == WeightLayout::Block32 || phase == MoePhase::Prefill) {
   // Affine plans have 32-row prefill and 8-row decode kernels, GGUF plans
   // 8-row kernels in both phases and 32-row prefill kernels.
@@ -273,6 +274,10 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
       buffers.residual.sizeBytes() < rowBytes ||
       buffers.output.sizeBytes() < rowBytes)
     throw std::invalid_argument("MoE row buffers are smaller than execution shape");
+  const bool live = bool(buffers.liveRows);
+  if (live && (plan.phase() != MoePhase::Decode ||
+               buffers.liveRows.sizeBytes() < uint64_t{rows / SPLASH_TARGET_VERIFY_ROWS} * sizeof(VerifyLiveRows)))
+    throw std::invalid_argument("invalid MoE live-row buffer or phase");
   const MoeScratch &scratch = buffers.scratch;
   for (const MoeScratchField &field : kMoeScratchFields)
     if ((scratch.*field.buffer).sizeBytes() < required.*field.bytes)
@@ -306,11 +311,13 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
                scratch.routingWeights},
               routeParams, {rows, 1, 1});
   }
-  graph.add("moe_group_routes",
-            {scratch.selectedExperts, scratch.tileDescriptors,
-             scratch.tileCount, scratch.groupedRoutes, scratch.routeRows},
-            MoeGroupParams{rows, shape.expertsPerToken, tileRows,
-                           shape.experts},
+  std::vector<metal::MetalBuffer> grouping{
+      scratch.selectedExperts, scratch.tileDescriptors, scratch.tileCount,
+      scratch.groupedRoutes, scratch.routeRows};
+  if (live) grouping.push_back(buffers.liveRows);
+  graph.add(live ? "moe_group_routes_live_rows" : "moe_group_routes",
+            std::move(grouping),
+            MoeGroupParams{rows, shape.expertsPerToken, tileRows, shape.experts},
             {1, 1, 1});
   const MoeGatherParams gather{tileRows, shape.hiddenSize, shape.routesPerToken()};
   if (plan.configuration().ggufTile == MoeGgufTile::Register)
@@ -327,9 +334,12 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
     addGgufExperts(graph, scratch, weights.blocks(), plan);
   else
     addAffineExperts(graph, scratch, weights.affine(), plan);
-  graph.add("moe_combine",
-            {scratch.expertOutput, scratch.routeRows, scratch.routingWeights,
-             buffers.residual, buffers.output},
+  std::vector<metal::MetalBuffer> combine{
+      scratch.expertOutput, scratch.routeRows, scratch.routingWeights,
+      buffers.residual, buffers.output};
+  if (live) combine.push_back(buffers.liveRows);
+  graph.add(live ? "moe_combine_live_rows" : "moe_combine",
+            std::move(combine),
             MoeCombineParams{rows, shape.hiddenSize, shape.routesPerToken()},
             {rows, shape.hiddenSize / 256, 1});
 }

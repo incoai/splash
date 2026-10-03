@@ -1,6 +1,7 @@
 #include "ops/Sampling.hpp"
 
 #include "metal/abi/Sampling.h"
+#include "metal/abi/LiveRows.h"
 
 #include <algorithm>
 #include <limits>
@@ -239,12 +240,17 @@ void Sampling::addAcceptance(
     if (policies[lane].samples())
       params.sampling_mask |= uint32_t{1} << lane;
   }
-  graph.add("decode_accept_dflash",
-            {buffers.proposedTokens, buffers.candidates,
-             buffers.proposalProbabilities, buffers.targetVocabularyRows,
-             buffers.uniforms, buffers.outputTokens, buffers.retainedCounts,
-             buffers.acceptedCounts},
-            params, {lanes, 1, 1}, {1, 1, 1});
+  std::vector<metal::MetalBuffer> acceptance{
+      buffers.proposedTokens, buffers.candidates, buffers.proposalProbabilities,
+      buffers.targetVocabularyRows, buffers.uniforms, buffers.outputTokens,
+      buffers.retainedCounts, buffers.acceptedCounts};
+  if (buffers.liveRows) {
+    if (buffers.liveRows.sizeBytes() < uint64_t{lanes} * sizeof(VerifyLiveRows))
+      throw std::invalid_argument("acceptance live-row buffer is too small");
+    acceptance.push_back(buffers.liveRows);
+  }
+  graph.add(buffers.liveRows ? "decode_accept_dflash_live_rows" : "decode_accept_dflash",
+            std::move(acceptance), params, {lanes, 1, 1}, {1, 1, 1});
 }
 
 } // namespace splash::ops

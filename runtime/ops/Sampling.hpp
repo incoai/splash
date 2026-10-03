@@ -103,6 +103,7 @@ struct AcceptanceBuffers final {
   metal::MetalBuffer outputTokens;
   metal::MetalBuffer retainedCounts;
   metal::MetalBuffer acceptedCounts;
+  metal::MetalBuffer liveRows{};
 };
 
 // Target token policy (penalties, min-p/top-k/top-p, constrained selection,

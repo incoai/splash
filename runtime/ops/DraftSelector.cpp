@@ -1,8 +1,11 @@
 #include "ops/DraftSelector.hpp"
 
 #include "metal/abi/Sampling.h"
+#include "metal/abi/LiveRows.h"
 
+#include <cmath>
 #include <stdexcept>
+#include <utility>
 
 namespace splash::ops {
 namespace {
@@ -30,6 +33,37 @@ DraftSelectorWorkspace DraftSelector::workspace(uint32_t positions) {
           candidates * (kShards + SPLASH_DRAFT_CANDIDATES) * sizeof(float),
           candidates * sizeof(uint32_t), candidates * sizeof(float),
           candidates * sizeof(float)};
+}
+
+uint64_t DraftSelector::liveRowsBytes(uint32_t lanes) {
+  if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
+    throw std::invalid_argument("invalid live-row batch width");
+  return uint64_t{lanes} * sizeof(VerifyLiveRows);
+}
+
+void DraftSelector::addLiveRows(
+    metal::CommandGraph &graph, const DraftSelectorBuffers &buffers,
+    metal::MetalBuffer liveRows, std::span<const SamplingPolicy> policies,
+    float threshold) const {
+  if (policies.empty() || policies.size() > SPLASH_MAXIMUM_BATCH_WIDTH ||
+      !std::isfinite(threshold) || threshold < 0.0F || threshold > 1.0F)
+    throw std::invalid_argument("invalid live-row threshold or batch");
+  const uint32_t lanes = static_cast<uint32_t>(policies.size());
+  const auto required = workspace(lanes * kPositions);
+  if (liveRows.sizeBytes() < liveRowsBytes(lanes) ||
+      buffers.candidates.sizeBytes() < required.candidatesBytes ||
+      buffers.unary.sizeBytes() < required.unaryBytes ||
+      buffers.partialValues.sizeBytes() < required.partialValuesBytes ||
+      buffers.proposedTokens.sizeBytes() < uint64_t{lanes} * kPositions * sizeof(uint32_t))
+    throw std::invalid_argument("live-row buffers are smaller than the batch");
+  DraftLiveRowsParams params{lanes, 0, threshold};
+  for (uint32_t lane = 0; lane < lanes; ++lane)
+    if (policies[lane].samples() || policies[lane].constrained)
+      params.sampling_mask |= uint32_t{1} << lane;
+  graph.add("draft_verify_live_rows",
+            {buffers.candidates, buffers.unary, buffers.partialValues,
+             buffers.proposedTokens, std::move(liveRows)},
+            params, {lanes, 1, 1}, {1, 1, 1});
 }
 
 void DraftSelector::add(metal::CommandGraph &graph,

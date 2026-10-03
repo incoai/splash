@@ -244,6 +244,7 @@ struct QwenTargetVerifyBuffers final {
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth>
       pageTables;
   ops::MoeScratch moe;
+  metal::MetalBuffer liveRows{};
 };
 
 struct QwenTargetCommitBuffers final {
