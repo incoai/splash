@@ -1,0 +1,184 @@
+{
+  "utc": "2026-10-01T19:52:51.623676+00:00",
+  "host": {
+    "path": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/verify_host",
+    "resolved": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/verify_host",
+    "bytes": 1759880,
+    "dev": 16777231,
+    "ino": 46958987,
+    "mtime_ns": "1790883954445570418",
+    "ctime_ns": "1790883954445570418",
+    "sha256": "5dc80cca94321ac0605474735d63027e492d7d50959addc06a34a7ea5491e15c"
+  },
+  "library": {
+    "path": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/fixtures/combined.metallib",
+    "resolved": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/fixtures/combined.metallib",
+    "bytes": 16520200,
+    "dev": 16777231,
+    "ino": 46958856,
+    "mtime_ns": "1790883866484756498",
+    "ctime_ns": "1790883866484756498",
+    "sha256": "e2fb0463c65c3b47c886411ac8df2b65e1651c0911553e8ad4806e36a26ddec4"
+  },
+  "candidate_source": {
+    "path": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/candidate2.metal",
+    "resolved": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/candidate2.metal",
+    "bytes": 12325,
+    "dev": 16777231,
+    "ino": 46958805,
+    "mtime_ns": "1790883841110636121",
+    "ctime_ns": "1790883841110636121",
+    "sha256": "d06822dd1a311e009feb3f73ae9af452e17ebdb5ff3c0733287317b2d9df2bfc"
+  },
+  "candidate_AIR": {
+    "path": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/candidate2.air",
+    "resolved": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/candidate2.air",
+    "bytes": 25824,
+    "dev": 16777231,
+    "ino": 46958833,
+    "mtime_ns": "1790883842352243566",
+    "ctime_ns": "1790883842352498274",
+    "sha256": "b42987746bc4b772ad16ad97826ba699ef8090272be7721bc77b588f00a56deb"
+  },
+  "objects": [
+    {
+      "path": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/runtime.o",
+      "resolved": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/runtime.o",
+      "bytes": 336152,
+      "dev": 16777231,
+      "ino": 46958897,
+      "mtime_ns": "1790883890959785658",
+      "ctime_ns": "1790883890960346115",
+      "sha256": "7c7cebd8797831c4376c75aa9f99dbea241030ba4ddfbaf6a536a1c6d7965c48"
+    },
+    {
+      "path": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/linear.o",
+      "resolved": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/linear.o",
+      "bytes": 80968,
+      "dev": 16777231,
+      "ino": 46958935,
+      "mtime_ns": "1790883922631048802",
+      "ctime_ns": "1790883922631443843",
+      "sha256": "035da64b3a133d0cb016b530b9c79e109d09e7e6d35e00dc94446af7bfc40de7"
+    },
+    {
+      "path": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/host.o",
+      "resolved": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/host.o",
+      "bytes": 133904,
+      "dev": 16777231,
+      "ino": 46958953,
+      "mtime_ns": "1790883934067777822",
+      "ctime_ns": "1790883934068281112",
+      "sha256": "809b37a95218cdd5424c02a104e2c06ebb62793b42b35a3db652e8ad70b07055"
+    }
+  ],
+  "source": [
+    {
+      "path": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/source/runtime/model/Runtime.hpp",
+      "resolved": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/source/runtime/model/Runtime.hpp",
+      "bytes": 4168,
+      "dev": 16777231,
+      "ino": 46958301,
+      "mtime_ns": "1790883541234403129",
+      "ctime_ns": "1790883541234403129",
+      "sha256": "b59f29300b837ae64743864ee093cbfad465e26579bdf3260717ad71112ecbda"
+    },
+    {
+      "path": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/source/runtime/model/Runtime.mm",
+      "resolved": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/source/runtime/model/Runtime.mm",
+      "bytes": 128655,
+      "dev": 16777231,
+      "ino": 46958303,
+      "mtime_ns": "1790883541234615045",
+      "ctime_ns": "1790883541234615045",
+      "sha256": "35b76f453e6c3ebb0d301eefab15cf4a3ae949da46b217a755df91f2859af700"
+    },
+    {
+      "path": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/source/runtime/ops/LinearGguf.cpp",
+      "resolved": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/source/runtime/ops/LinearGguf.cpp",
+      "bytes": 29597,
+      "dev": 16777231,
+      "ino": 46958305,
+      "mtime_ns": "1790883541235976500",
+      "ctime_ns": "1790883541235976500",
+      "sha256": "1923c465d045f910d5016adb52d5c054df1c76829797b09418429d845e46e281"
+    },
+    {
+      "path": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/verify_host.mm",
+      "resolved": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/verify_host.mm",
+      "bytes": 15980,
+      "dev": 16777231,
+      "ino": 46958307,
+      "mtime_ns": "1790883541236335666",
+      "ctime_ns": "1790883541236335666",
+      "sha256": "57c1154a74f581ea5103aecb6fa04717cd1acd84e9b6ff80a657b00a06d14d09"
+    },
+    {
+      "path": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/source/runtime/model/PrivateLegacyRtnDescriptor.hpp",
+      "resolved": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/source/runtime/model/PrivateLegacyRtnDescriptor.hpp",
+      "bytes": 5794,
+      "dev": 16777231,
+      "ino": 46958309,
+      "mtime_ns": "1790883541236759664",
+      "ctime_ns": "1790883541236759664",
+      "sha256": "dd26dad90a76a4faf72cbed58926ae99fe5f9766e91e1f33dbc5f314463f1cb6"
+    },
+    {
+      "path": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/source/runtime/model/PrivateLegacyRtnPins.hpp",
+      "resolved": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/source/runtime/model/PrivateLegacyRtnPins.hpp",
+      "bytes": 98058,
+      "dev": 16777231,
+      "ino": 46958310,
+      "mtime_ns": "1790883541237018414",
+      "ctime_ns": "1790883541237018414",
+      "sha256": "248460f2690716de899be5a052c7fe1cec336f020a4f82793b9ad0b6bb81a21d"
+    },
+    {
+      "path": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/source/runtime/model/V024ExpectedGraph.hpp",
+      "resolved": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/source/runtime/model/V024ExpectedGraph.hpp",
+      "bytes": 105275,
+      "dev": 16777231,
+      "ino": 46958299,
+      "mtime_ns": "1790883541234038630",
+      "ctime_ns": "1790883541234038630",
+      "sha256": "3c78f6e238663afde9e3f941fa161b3d52bcfce8f32b7197dd45a6c982e7caa7"
+    }
+  ],
+  "input_manifest": {
+    "path": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/input-pins.json",
+    "resolved": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/input-pins.json",
+    "bytes": 137,
+    "dev": 16777231,
+    "ino": 46959195,
+    "mtime_ns": "1790884371623632228",
+    "ctime_ns": "1790884371623632228",
+    "sha256": "62d7a6a763189d011dfe4c69930f467b63568fe734fc1dbcfc88aafcfc74f72d"
+  },
+  "selected_archive": {
+    "path": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-r158-release-launcher/source/build/engine/libsplash.a",
+    "inherited_sha256": "da14ded8fcc662d12733b8c8ac9f032ec263cf0eef0ef24470d2ec81e7c43d6a",
+    "fresh_payload_hash": false
+  },
+  "link_map": {
+    "path": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/link-map.txt",
+    "resolved": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/link-map.txt",
+    "bytes": 735817,
+    "dev": 16777231,
+    "ino": 46958986,
+    "mtime_ns": "1790883954444068547",
+    "ctime_ns": "1790883954444068547",
+    "sha256": "682fbc5b6f34aecd006a22ef44b0e9c78b0275b7013c60935eecf41c87ad0652"
+  },
+  "Metal_compile_attempts": 2,
+  "Metal_successful_compiles": 1,
+  "Metal_links": 1,
+  "disassemblies": 1,
+  "Runtime_compiles": 1,
+  "Linear_compiles": 1,
+  "host_compiles": 1,
+  "host_links": 1,
+  "worker_inspector_status": "FAILED_NESTED_RESULT_DESTRUCTOR_PROVIDER",
+  "root_link_review": "PENDING",
+  "host_executed": false,
+  "GPU": false
+}
