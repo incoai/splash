@@ -86,6 +86,16 @@ Q4_DECODE_AFFINE(decode_linear_q4_n256_m16,
 Q4_DECODE_AFFINE(decode_linear_q4_n256_m24,
                  (q4_mpp_tile_batched<24, 256, false, false>), 192, 256)
 Q4_DECODE_AFFINE(decode_linear_q4_n256, (q4_mpp_tile<256, false, false>), 64, 256)
+// N64 narrow-column candidates (RFC 191): same q4_mpp_tile template at
+// TileN=64 over StorageN=256 slabs, so one slab fans out to four column
+// threadgroups instead of two (N128) or one (N256). Same fp32 accumulation
+// order and single bf16 rounding as the wider tiles, hence bit-identical
+// per output element; undispatched until the tuner wires them.
+Q4_DECODE_AFFINE(decode_linear_q4_n64, (q4_mpp_tile<64, false, false, 256>), 64, 64)
+Q4_DECODE_AFFINE(decode_linear_q4_n64_m16,
+                 (q4_mpp_tile_batched<16, 64, false, false, 256>), 128, 64)
+Q4_DECODE_AFFINE(decode_linear_q4_n64_m32,
+                 (q4_mpp_tile_batched<32, 64, false, false, 256>), 256, 64)
 Q4_DECODE_AFFINE(decode_linear_q4_n128_paired,
                  (q4_mpp_tile<128, false, false, 256, true>), 64, 128)
 // 128 threads: four 8 x 256 tiles per core reach the occupancy knee for very
