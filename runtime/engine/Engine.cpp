@@ -162,6 +162,11 @@ void Engine::setCompletionNotifier(std::function<void()> notifier) {
   cache_.setCompletionNotifier(completionNotifier_);
 }
 
+bool Engine::flushRestorePoints() {
+  static_cast<void>(cache_.pollTransfers());
+  return writeBehind_.flush();
+}
+
 bool Engine::tick(double now) {
   model_.checkHealth();
   nextHealthCheckMilliseconds_ = now + kHealthCheckIntervalMilliseconds;
