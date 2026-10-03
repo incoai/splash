@@ -132,7 +132,8 @@ VerifyAttentionPlan ExecutionPlans::verifyAttention(
   const auto workload = verifyKey(lanes, queryHeads, layout, historyTokens);
   return PagedAttention::verifyPlan(
       lanes, queryHeads, layout, historyTokens,
-      chosenConfiguration(choices_.verifyAttention, workload, VerifyAttentionConfig{}));
+      chosenConfiguration(choices_.verifyAttention, workload,
+                          defaultVerifyAttentionConfig()));
 }
 
 DraftAttentionPlan ExecutionPlans::draftAttention(DraftAttentionShape shape,
