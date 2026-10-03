@@ -4,6 +4,7 @@ import threading
 from collections import OrderedDict
 from concurrent.futures import Future, wait
 
+import numpy as np
 from llguidance import LLExecutor, LLMatcher, LLTokenizer
 from llguidance.hf import from_tokenizer as guidance_tokenizer
 from llguidance.numpy import (
@@ -28,9 +29,10 @@ class TokenConstraint:
     MAX_ROWS = 9
     EOS_TOKENS = (248044, 248046)
 
-    def __init__(self, matcher, executor):
+    def __init__(self, matcher, executor, *, ignore_eos=False):
         self.matcher = matcher
         self.executor = executor
+        self.ignore_eos = ignore_eos
         self.bitmask = allocate_token_bitmask(self.MAX_ROWS, self.VOCABULARY)
 
     def masks(self, simulation_tokens):
@@ -63,7 +65,20 @@ class TokenConstraint:
             self.bitmask[valid_rows:rows] = self.bitmask[valid_rows - 1]
         if not self.bitmask[:valid_rows].any(axis=1).all():
             raise NativeError("constraint_error", "output grammar has no valid token")
+        if self.ignore_eos:
+            self._forbid_eos(rows)
         return self.bitmask[:rows].tobytes()
+
+    def _forbid_eos(self, rows):
+        # ignore_eos: forbid EOS in every row that allows another token. A row
+        # that allows only EOS keeps it, so a grammar that has finished still
+        # ends the request instead of leaving nothing to sample.
+        words = self.bitmask[:rows].view(np.uint32)
+        allowed = words.copy()
+        for token in self.EOS_TOKENS:
+            words[:, token // 32] &= np.uint32(~(1 << token % 32) & 0xFFFFFFFF)
+        finished = ~words.any(axis=1)
+        words[finished] = allowed[finished]
 
     def consume(self, token_ids):
         if any(not 0 <= token < self.VOCABULARY for token in token_ids):
@@ -162,14 +177,17 @@ class ConstraintFactory:
         self.hits = 0
         self.misses = 0
 
-    def create(self, grammar, *, timeout=None, prefixes=None):
+    def create(self, grammar, *, timeout=None, prefixes=None, ignore_eos=False):
         """`prefixes`, called when the grammar is compiled, returns pairs of
         tokens the output must be able to begin with and the error for a
         grammar that cannot. A grammar can compile and still exceed the
         parser's limits where generation reaches a construct, after the whole
-        prompt has been processed."""
+        prompt has been processed. `ignore_eos` forbids EOS wherever the
+        grammar allows another token."""
         matcher = self._matcher(grammar, timeout, prefixes)
-        return TokenConstraint(matcher.deep_copy(), self.executor)
+        return TokenConstraint(
+            matcher.deep_copy(), self.executor, ignore_eos=ignore_eos
+        )
 
     def _matcher(self, grammar, timeout, prefixes):
         # Compilation uses the frontend's bounded preparation slots. Share

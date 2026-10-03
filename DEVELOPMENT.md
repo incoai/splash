@@ -826,9 +826,12 @@ and llama.cpp do: the model never selects its own stop tokens, and a draft
 proposal of one is rejected, so generation runs to its output budget and
 finishes with `length` unless a `stop` string ends it first. Benchmarks use it
 to generate a fixed number of tokens. Tools and structured output generate
-under a grammar, which decides where the output ends, so combining them with
-`ignore_eos` returns 400. The engine receives it as bit 0 of the request
-frame's flags word (native wire version 7), which rejects undefined bits.
+under a grammar: with `ignore_eos` its token masks forbid the stop tokens
+wherever the grammar allows another token, and keep them where they are the
+only valid tokens, so a grammar that has finished still ends the request. The
+engine receives an unconstrained request's flag as bit 0 of the request
+frame's flags word (native wire version 7), which rejects undefined bits and
+the flag on a constrained request.
 
 Streaming requests accept `"return_progress":true` (default false). Before output,
 `prompt_progress` reports `{total, cache, processed, time_ms}`: prompt tokens,

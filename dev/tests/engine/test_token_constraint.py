@@ -25,6 +25,7 @@ class TokenConstraintTest(unittest.TestCase):
             EOS_TOKENS = (tokenizer.token_to_id("<eos>"),)
 
         cls.Constraint = Constraint
+        cls.guidance = guidance
         cls.width = (Constraint.VOCABULARY + 31) // 32
         cls.matcher = LLMatcher(
             guidance, '%llguidance {}\nstart: "ab" | "ac"\n', log_level=0
@@ -89,6 +90,21 @@ class TokenConstraintTest(unittest.TestCase):
             self.assertEqual(caught.exception.code, "constraint_error")
             # The parser's state dump, generated text included, stays out.
             self.assertNotIn("\n", caught.exception.message)
+
+    def test_ignore_eos_keeps_eos_only_where_nothing_else_is_valid(self):
+        a, b, eos = self.a, self.b, self.eos
+        # After "a" the grammar may end or continue with "b".
+        matcher = LLMatcher(
+            self.guidance, '%llguidance {}\nstart: "a" | "ab"\n', log_level=0
+        )
+        plain = self.Constraint(matcher.deep_copy(), self.executor)
+        ignoring = self.Constraint(matcher.deep_copy(), self.executor, ignore_eos=True)
+        self.assertEqual(self.rows(plain.masks((a, b))), [[a], [b, eos], [eos]])
+        self.assertEqual(self.rows(ignoring.masks((a, b))), [[a], [b], [eos]])
+        ignoring.consume([a])
+        self.assertEqual(self.rows(ignoring.masks(())), [[b]])
+        ignoring.consume([b])
+        self.assertEqual(self.rows(ignoring.masks(())), [[eos]])
 
 
 if __name__ == "__main__":
