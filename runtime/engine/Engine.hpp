@@ -7,6 +7,7 @@
 #include "engine/Types.hpp"
 #include "ops/PagedKv.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <limits>
@@ -51,8 +52,22 @@ struct ResourceWaitSnapshot final {
   bool draining = false;
 };
 
+// One live request's progress, for /status active_requests: its phase, how
+// many prompt tokens are encoded (cached ones included) and generated.
+struct ActiveRequestSnapshot final {
+  uint64_t id = 0;
+  Phase phase = Phase::Queued;
+  uint32_t promptTokens = 0;
+  uint32_t promptProcessed = 0;
+  uint32_t generatedTokens = 0;
+  uint32_t maxNewTokens = 0;
+  double ageMilliseconds = 0.0;
+};
+
 struct EngineSnapshot final {
   SchedulerSnapshot scheduler;
+  // Requests not yet finalized, in submission order.
+  std::vector<ActiveRequestSnapshot> activeRequests;
   CacheSnapshot resources;
   uint32_t maximumContextTokens = 0;
   uint64_t submitted = 0;
@@ -149,6 +164,8 @@ private:
     // Its place in submission order. Earlier requests' lanes hold memory it
     // may wait for, so their work restarts its resource wait's limit.
     uint64_t sequence = 0;
+    std::chrono::steady_clock::time_point submittedAt = std::chrono::steady_clock::now();
+    uint32_t generatedTokens = 0;
     std::optional<uint32_t> stateCell;
     bool suspended = false;
     uint32_t promptTokens = 0;
