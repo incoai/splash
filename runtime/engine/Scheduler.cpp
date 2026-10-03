@@ -307,6 +307,9 @@ Scheduler::planPrefill(std::vector<PrefillRequestView> ready) const {
 
   BatchPlan plan;
   plan.kind = WorkKind::Prefill;
+  plan.items.reserve(std::min(
+      ready.size(),
+      static_cast<size_t>(model::ExecutionLimits::maximumBatchWidth)));
   uint32_t budget = prefillBudget(ready.front(), ready);
   for (const PrefillRequestView &view : ready) {
     if (!budget || view.request->spec.priority != selectedPriority ||
@@ -381,6 +384,9 @@ std::optional<BatchPlan> Scheduler::nextDecode(std::span<const uint64_t> exclude
   plan.kind = WorkKind::Decode;
   plan.constrained = ready.front()->spec.constrained;
   plan.decodeStage = decodeStage;
+  plan.items.reserve(std::min(
+      ready.size(),
+      static_cast<size_t>(model::ExecutionLimits::maximumBatchWidth)));
   for (const Request *request : ready) {
     if (request->spec.priority != selectedPriority ||
         request->spec.constrained != plan.constrained ||
