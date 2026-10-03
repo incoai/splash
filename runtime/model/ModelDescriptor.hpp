@@ -16,8 +16,8 @@ namespace splash::model {
 using TargetLayout = std::variant<Qwen3_8Layout, Qwen3_6MoeLayout>;
 
 // Where a model's weights come from: files already in the packed layout, or
-// an MLX or GGUF checkpoint prepared into cached files when it loads. The
-// vision tower is None for a model installed with --language-only.
+// an MLX or GGUF checkpoint prepared into images when it loads. The vision
+// tower is None for a model installed with --language-only.
 enum class TargetSource : uint8_t { Packed, Mlx, Gguf };
 enum class VisionSource : uint8_t { Packed, Mlx, Gguf, None };
 
@@ -34,6 +34,11 @@ struct ModelDescriptor final {
   // Container selection belongs to loading; runtime dispatch follows each weight.
   TargetSource targetSource = TargetSource::Packed;
   VisionSource visionSource = VisionSource::Packed;
+  // The SHA-256 of the record that names the digest of every source file,
+  // an assembly's model.json or a package's manifest.json, which the
+  // installer verifies at every start (inspectModelPackage): what every
+  // image is written from (WeightFileRecord).
+  std::string sourceIdentity;
 
   // A source model's draft is a DFlash2 checkpoint; a packed package carries
   // its draft packed.

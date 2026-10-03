@@ -1,7 +1,5 @@
 #pragma once
 
-// Editing this file re-prepares every GGUF model.
-
 // Weight preparation's repack of native GGUF rows into the MDGG0001 planes
 // (kernels/shared/gguf_repack.metal), shared by the host executor
 // (model/GgufPreparation.cpp) and the kernel. The host stages a chunk of

@@ -11,7 +11,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import statistics
 import sys
 import threading
@@ -20,8 +19,7 @@ import uuid
 from collections import defaultdict
 from pathlib import Path
 
-from dev.benchmarks import abba
-from dev.benchmarks import prepared as prepared_weights
+from dev.benchmarks import abba, weights
 from dev.tests import smoke_real as smoke
 
 
@@ -376,18 +374,18 @@ def parse_args(argv=None):
         for path in (binary, binary.parent / "splash.metallib"):
             if not path.is_file():
                 parser.error(f"missing retained executable/library: {path}")
+    if not weights.loads_in_memory(args.binary.resolve().parent):
+        parser.error(f"the candidate build has no {weights.WEIGHT_DIGESTS}")
     args.kind = smoke.model_artifacts.installation_kind(args.package)
     if args.kind is None:
         parser.error(f"missing installed model: {args.package}")
     return args
 
 
-def check_identity(status: dict, version: str, rounds: list[dict], shared: bool):
-    """Every round serves the same model and KV format. A build's rounds
-    load the same executable and prepared files; builds of one preparation
-    identity load the same prepared files too, while builds of different
-    identities prepare under different keys, so their bytes are compared
-    after the rounds instead (prepared.compare)."""
+def check_identity(status: dict, version: str, rounds: list[dict]):
+    """Every round serves the same model and KV format, and a build's rounds
+    load the same executable and model layout. The builds' weights are
+    compared by their bytes after the rounds (weights.compare_builds)."""
     identity = status["identity"]
     for previous in rounds:
         expected = previous["identity"]
@@ -395,18 +393,16 @@ def check_identity(status: dict, version: str, rounds: list[dict], shared: bool)
             smoke.kv_identity(identity) == smoke.kv_identity(expected),
             "KV identity changed",
         )
-        same_layout = (
-            identity["cache"]["loaded_model_layout_sha256"]
-            == expected["cache"]["loaded_model_layout_sha256"]
-        )
         if previous["version"] == version:
             smoke.require(
                 identity["cache"]["build_id"] == expected["cache"]["build_id"],
                 "executable source changed between rounds",
             )
-            smoke.require(same_layout, f"the {version} loaded another model layout")
-        elif shared:
-            smoke.require(same_layout, "loaded target/draft changed")
+            smoke.require(
+                identity["cache"]["loaded_model_layout_sha256"]
+                == expected["cache"]["loaded_model_layout_sha256"],
+                f"the {version} loaded another model layout",
+            )
 
 
 def main(argv=None):
@@ -423,16 +419,10 @@ def main(argv=None):
         tokenizer, [128, *args.contexts], args.samples * max(1, args.burst), nonce
     )
     binaries = {"baseline": args.baseline_binary, "candidate": args.binary}
-    shared = prepared_weights.preparation_identity(
-        args.baseline_binary.resolve().parent
-    ) == prepared_weights.preparation_identity(args.binary.resolve().parent)
+    builds = {version: binary.resolve().parent for version, binary in binaries.items()}
     environments = {"baseline": None, "candidate": None}
-    if not shared:
-        # Builds of different preparation identities must not share a cache;
-        # the candidate keeps its own, which its other steps use.
-        environments["baseline"] = prepared_weights.baseline_environment(
-            args.output.parent
-        )
+    if not weights.loads_in_memory(builds["baseline"]):
+        environments["baseline"] = weights.baseline_environment(args.output.parent)
     document = {
         "schema_version": 1,
         "timing": "HTTP/native wall; not GPU time",
@@ -450,7 +440,7 @@ def main(argv=None):
             try:
                 status = server.wait_ready(args.startup_timeout)
                 smoke.validate_status(status, args.kv_format)
-                check_identity(status, version, document["rounds"], shared)
+                check_identity(status, version, document["rounds"])
                 document["rounds"].append(
                     {
                         "version": version,
@@ -523,23 +513,17 @@ def main(argv=None):
         document["comparison"] = (summarize_bursts if args.burst else summarize)(
             document["samples"]
         )
-        document["prepared"] = (
-            {"shared_identity": True, "pass": True}
-            if shared
-            else {
-                "shared_identity": False,
-                **prepared_weights.compare(
-                    prepared_weights.cache_root(environments["baseline"]),
-                    prepared_weights.cache_root(os.environ),
-                    # The model root RealServer gives both builds.
-                    package=args.package.resolve(),
-                    required=args.kind == smoke.model_artifacts.ASSEMBLY,
-                ),
-            }
+        document["weights"] = weights.compare_builds(
+            builds["baseline"],
+            builds["candidate"],
+            # The model root RealServer gives both builds.
+            args.package.resolve(),
+            environments["baseline"],
+            args.kind == smoke.model_artifacts.ASSEMBLY,
         )
         smoke.require(
-            document["prepared"]["pass"],
-            f"prepared bytes differ: {document['prepared'].get('failures')}",
+            document["weights"]["pass"],
+            f"weight bytes differ: {document['weights']['failures']}",
         )
         document["correctness_pass"] = True
         document["performance_pass"] = all(

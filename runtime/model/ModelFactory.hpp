@@ -23,6 +23,8 @@ using TargetWeights = std::variant<Qwen3_8Weights, Qwen3_6MoeWeights>;
 
 struct ModelPackage final {
   ModelDescriptor descriptor;
+  // The memory of every image the weights below are views of.
+  std::shared_ptr<WeightImages> images;
   TargetWeights target;
   DFlashDraftWeights draft;
   QwenVisionWeights vision;
@@ -74,18 +76,17 @@ struct RuntimeContext final {
 // architectures. Each architecture validates its own tensor and state layout.
 void requireCompatibleModelPackage(const ModelPackage &package);
 
-[[nodiscard]] uint64_t preparedModelWeightBytes(const std::filesystem::path &root,
-                                                 const ModelDescriptor &descriptor);
+// The bytes of every image the model's weights load into.
+[[nodiscard]] uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor);
 
-// The vision role's upstream source, planned for preparation; null for a
-// packed vision file or a model without vision.
+// The vision role's upstream source, planned; null for a packed vision file
+// or a model without vision.
 [[nodiscard]] std::unique_ptr<VisionLoader>
-planVisionLoader(metal::MetalBackend &backend, const std::filesystem::path &root,
-                 const ModelDescriptor &descriptor, PreparationCheck admitConversion);
-// The vision role: prepared by `loader` when there is one, else the packed
+planVisionLoader(const std::filesystem::path &root, const ModelDescriptor &descriptor);
+// The vision role: written by `loader` when there is one, else the packed
 // file; empty weights for a model without vision.
 [[nodiscard]] QwenVisionWeights
-loadVisionWeights(metal::MetalBackend &backend, const std::filesystem::path &root,
+loadVisionWeights(metal::MetalBackend &backend, WeightImages &images, const std::filesystem::path &root,
                   const ModelDescriptor &descriptor, const VisionLoader *loader);
 
 // Production loading is selected by the validated package descriptor. There
@@ -93,7 +94,7 @@ loadVisionWeights(metal::MetalBackend &backend, const std::filesystem::path &roo
 [[nodiscard]] ModelPackage
 loadModelPackage(metal::MetalBackend &backend,
                  const std::filesystem::path &root,
-                 const ModelDescriptor &descriptor, PreparationCheck admitConversion);
+                 const ModelDescriptor &descriptor);
 
 [[nodiscard]] ModelMemoryPlan
 plannedRuntimeMemory(const DeviceCapabilities &device,

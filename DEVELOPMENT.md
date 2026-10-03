@@ -19,10 +19,10 @@ make -j4
 repository such as `mlx-community/Qwen3.8-27B-4bit`, or a GGUF repository and
 variant, `OWNER/REPO:VARIANT`, such as `unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M`.
 Splash identifies the model from its own metadata and pairs the DFlash2 draft
-trained for it. The first serve sets up Python dependencies, downloads the
-model and its draft, and prepares the weights once
-([Weight preparation](#weight-preparation)); each start follows the model's
-revision ([Revisions](#revisions)). Legacy Splash packages remain loadable
+trained for it. The first serve sets up Python dependencies and downloads the
+model and its draft; each start loads the weights into memory
+([Weight preparation](#weight-preparation)) and follows the model's revision
+([Revisions](#revisions)). Legacy Splash packages remain loadable
 ([Legacy Splash packages](#legacy-splash-packages)). Public repositories need
 no login; private or gated ones need `HF_TOKEN` or `hf auth login`. Ctrl+C
 stops serving, and a second Ctrl+C stops the engine at once; stop before
@@ -318,13 +318,13 @@ never rewrites upstream files.
 
 ### Model storage
 
-Allow space for the target and BF16 draft downloads plus prepared copies of
-their weights: up to about 40 GB in total for the Qwen3.8-27B 4-bit examples
-and 48 GB for Qwen3.6-35B-A3B. Other variants have different sizes. Downloads
-use the Hugging Face cache; prepared weights use `~/Library/Caches/Splash/weights`
-(`SPLASH_WEIGHT_CACHE` relocates them). Later starts reuse prepared weights,
-and `brew upgrade splash` preserves models and agent sessions.
-See [weight preparation](#weight-preparation) for cache validation and cleanup.
+Allow space for the target and BF16 draft downloads: up to about 21 GB for the
+Qwen3.8-27B 4-bit examples and 24 GB for Qwen3.6-35B-A3B. Other variants have
+different sizes. Downloads use the Hugging Face cache, and `brew upgrade splash`
+preserves models and agent sessions. Splash keeps no other copy of the weights
+on disk. Earlier releases kept prepared copies in
+`~/Library/Caches/Splash/weights` (or the directory `SPLASH_WEIGHT_CACHE`
+named), which nothing reads now and which can be deleted.
 
 ### Model cache
 
@@ -337,8 +337,7 @@ HF_HUB_CACHE=/Volumes/Models/huggingface splash serve --model mlx-community/Qwen
 `HF_HUB_CACHE` selects the Hugging Face download cache. Alternatively, set
 `HF_HOME` to relocate the Hugging Face home directory, including its default
 `hub` cache. Model links and agent sessions stay in Splash's data directory;
-existing downloads are not moved. Prepared weights have their own cache,
-which this does not move ([Weight preparation](#weight-preparation)).
+existing downloads are not moved.
 
 ### Drafts
 
@@ -353,11 +352,11 @@ family's draft signature (`Draft.signature`), every field and value native
 loading requires, so a draft of another architecture never replaces one that
 loads. Native loading validates the configuration against the target and
 prepares the draft like a target ([Weight preparation](#weight-preparation)):
-`DraftCheckpointLoader` (`DraftCheckpoint.cpp`) plans the packed draft files
-of a Splash package, `layer-<N>.bin` and `model.bin`, and `AffinePreparation`
-quantizes each projection to 4 bits in groups of 64 as MLX's affine
-quantization rounds it and copies every other tensor as stored. For both
-families the prepared files are byte for byte the Q4 drafts of the Splash
+`DraftCheckpointLoader` (`DraftCheckpoint.cpp`) plans the images of a Splash
+package's packed draft files, `layer-<N>.bin` and `model.bin`, and
+`AffinePreparation` quantizes each projection to 4 bits in groups of 64 as
+MLX's affine quantization rounds it and copies every other tensor as stored.
+For both families the images are byte for byte the Q4 drafts of the Splash
 packages.
 
 ### Tokenizer and chat templates
@@ -446,116 +445,81 @@ launchers configure OpenCode, Hermes and Pi without attachments.
 
 ### Weight preparation
 
-Source adapters write a model's target, draft and vision tensors into prepared
-files: an MLX target, the DFlash2 draft and any vision tower into the packed
-layouts of Splash packages, which run the same kernels, and a GGUF target into
-the `MDGG0001` layout of the GGUF kernels. Each adapter is a loader, which
-validates the source's metadata and plans its files, and a writer:
-`AffineTargetLoader` (`AffineTarget.cpp`) and `AffinePreparation` for an MLX
-target, `DraftCheckpointLoader` (`DraftCheckpoint.cpp`) and `AffinePreparation`
-for the draft, `GgufTargetLoader` (`GgufTarget.cpp`, planned by `GgufImage.cpp`)
-and `GgufPreparation` for a GGUF target, `VisionLoader` and `VisionPreparation`
-for an MLX or GGUF vision tower. They open their files through `PreparedFiles`,
-the `PreparedWeights` cache with the load's guards; the target and draft loaders
-keep their planned images in `PreparedImages` (`PreparedFiles.hpp`), whose
-sizes `preparedModelWeightBytes` sums. `AffinePreparation` reorders
-an MLX target's codes, scales and biases into 256-row tiles without
-requantization, quantizes the draft's BF16 projections into the same tiles
-([Drafts](#drafts)) and computes GDN decay as `float(-exp(double(A_log)))`,
-which may differ by one float ULP in this small vector from packages produced
-with MLX's float exponential. `GgufPreparation` repacks GGUF blocks ([GGUF
-targets](#gguf-targets)).
+Every start writes a model's target, draft and vision tensors into weight
+images in memory, in the layouts the kernels read: an MLX target, the DFlash2
+draft and any vision tower in the packed layouts of Splash packages, which run
+the same kernels, and a GGUF target in the `MDGG0001` layout of the GGUF
+kernels. Each source adapter is a loader, which validates the source's metadata
+and plans its images, and a writer: `AffineTargetLoader` (`AffineTarget.cpp`)
+and `AffinePreparation` for an MLX target, `DraftCheckpointLoader`
+(`DraftCheckpoint.cpp`) and `AffinePreparation` for the draft,
+`GgufTargetLoader` (`GgufTarget.cpp`, planned by `GgufImage.cpp`) and
+`GgufPreparation` for a GGUF target, `VisionLoader` and `VisionPreparation` for
+an MLX or GGUF vision tower. A package's packed files are read as they are
+(`packedImage`). `AffinePreparation` reorders an MLX target's codes, scales and
+biases into 256-row tiles without requantization, quantizes the draft's BF16
+projections into the same tiles ([Drafts](#drafts)) and computes GDN decay as
+`float(-exp(double(A_log)))`, which may differ by one float ULP in this small
+vector from packages produced with MLX's float exponential. `GgufPreparation`
+repacks GGUF blocks ([GGUF targets](#gguf-targets)).
 
 Preparation never rounds a target or vision weight, and rounds the draft's
 projections only as the packages' drafts are rounded. A tensor it converts to
 BF16 (vision tensors stored as F32 or F16, a GGUF's convolution taps and
 time-step bias) must be exactly representable in BF16; otherwise preparation
-fails, naming the tensor and, for a vision tensor, its file.
+fails, naming the tensor and, for a vision tensor, its file. The hashes of the
+images prepared from the test fixtures, in
+`dev/tests/fixtures/weight-goldens/goldens.json`, fail the tests on any change
+of prepared bytes; the README beside it gives the procedure for an intended
+change.
 
-The cache is `~/Library/Caches/Splash/weights`, or the directory
-`SPLASH_WEIGHT_CACHE` names; nothing else selects it. It holds an additional
-copy of the weights about the model's size, its prepared target, draft and
-vision tensors. Preparing needs that much free disk space plus a 2 GiB reserve:
-before anything is written, the factory (`ModelFactory.cpp`) constructs the
-vision tower's loader (`planVisionLoader`, which the vision encoder test
-shares), the draft's and the target's, and checks once for the space their
-missing files add beyond the entries they supersede (below), plus the largest
-file written while the entry it replaces remains, plus the reserve. After a
-preparation-identity change, preparing thus needs little more than its largest
-file. Uninstalling a model does not delete possibly shared prepared weights.
-With Splash stopped, entry directories can be deleted; deleting the whole cache
-causes preparation at the next load.
+`WeightImages` (`WeightImages.hpp`) holds a model's images, each in a Metal
+buffer of its own that the weights are views of. Before any image is written,
+the factory (`ModelFactory.cpp`) constructs the vision tower's loader
+(`planVisionLoader`, which the vision encoder test shares), the draft's and the
+target's, so every source's metadata is checked first. A writer writes every
+byte of its image, zeroing alignment and padding, as a new buffer's contents
+are undefined. Writers read their sources uncached (`F_NOCACHE`), so the page
+cache keeps no second copy of the model, on a thread per core (`parallelFor`);
+a thread stages at most 4 MiB of a source at a time, and a GGUF image the rows
+of one repack, at most 32 MiB (`kGgufRepackStagingBytes`), for the
+`gguf_repack` kernel, which writes the planes into the image. Once an image is
+written, its writer checks that no source file it read was written since it was
+opened (`WeightSource::checkUnchanged`), so a source changed in place fails the
+load instead of mixing two versions. A start logs `Weights loaded in N s.`;
+loading reads the sources at about the speed of the disk that holds them
+([upstream loading](dev/benchmarks/upstream-loading.md#loading-time)).
 
-A prepared file's key hashes its adapter's preparation identity, its plan, and
-the bytes, type and shape of every source tensor it reads, located and hashed
-within its file's tensor data. An edit to a source's metadata only (a GGUF chat
-template, a safetensors header), `config.json` or files the component does not
-read keeps every key. The preparation identity is a build-generated fingerprint
-of only the code that writes the bytes, the files listed per adapter in
-`INPUTS` of `dev/tools/weight_preparation_identity.py`; inference, parser,
-planner and reader changes keep it. The hashes of the images prepared from the
-test fixtures, in `dev/tests/fixtures/weight-goldens/goldens.json`, fail the
-tests on any change of prepared bytes. The README beside it gives the
-procedure for an intended change: the key the new bytes need, and the order in
-which the independent layout oracles and the hashes are updated.
+Each image's record (`WeightFileRecord`) names what it was written from: the
+SHA-256 of the record of every source file's digest, an assembly's `model.json`
+or a package's `manifest.json`, which the installer verifies at every start
+(`ModelDescriptor::sourceIdentity`). The weight manifest fingerprints `/status`
+reports (`loaded_model_layout_sha256`, `target_model_sha256`) cover it, so
+models of one layout from different sources never share a fingerprint.
 
-Each entry records in `source` its component (such as `target/layer-0.bin`),
-the digest of the source data it was written from and the source path.
-Publishing an entry removes the complete entries it supersedes: the same
-component from the same source data under another key, which an earlier
-preparation identity wrote. Entries of other sources or revisions, which
-installations may share, stay. Removal happens under the converter lock, so no
-entry being written is touched, and a running process keeps the files it has
-mapped until it unmaps them. Two builds of different preparation identities
-sharing one cache supersede each other's entries at every start; give a
-development build its own `SPLASH_WEIGHT_CACHE`.
-
-One writer per cache serializes conversion; complete cache hits never wait for
-this lock. Each output's disk space is preallocated before writing.
-Interruption, disk-full errors and memory-pressure rejection cannot publish
-partial files; concurrent external disk activity can still exhaust the volume.
-Every converter-lock acquisition removes abandoned writes, and so does a warm
-start that finds the lock free; a warm start that cannot lock or clean the cache
-(read-only, or without `flock`) leaves them and still loads. Replacing an
-invalid entry also drops its digest proof. Retrying reuses previously completed
-files, which are read-only. Cold preparation reports each artifact's progress.
-
-Cold source hashing and output validation stream bounded buffers. Unchanged
-files reuse a digest proof tied to inode, size, birth time, mtime and ctime, so
-a remounted volume keeps its proofs; a write or replacement invalidates it.
-This is not a full disk scrub on every startup. Preparation uses uncached
-destination I/O. Every adapter sizes its conversion steps to one staging bound,
-input and output together, of 32 MiB (`kWeightPreparationStagingBytes`),
-whatever the tensor, layer or expert count, inside a 64 MiB admission reserve
-that also covers source metadata.
-Complete rows and multiple row tiles are processed together where possible,
-avoiding per-row I/O and small GPU waits. Startup runs two checks
-(`RuntimeResources.mm`), both stopped by cancellation. `admitWeightPreparation`,
-which the loaders receive as `admitConversion`, admits the conversion workspace
-on a cache miss, before anything is allocated and again before each chunk: it
-requires normal memory pressure and host headroom for the startup reserve plus
-the 64 MiB workspace. Cache hits, bounded source verification and every other
-Metal operation of startup pass `admitMetalOperation` instead, which critical
-pressure or too little headroom for the startup reserve still fails.
-
-`WeightFile` maps completed files, prepared or packed, read-only into one
-no-copy Metal buffer, so no model-sized anonymous allocation holds the weights.
-It maps a prepared file only if a digest proof covers the very file it opened
-and matches the digest its entry records (`requireVerifiedFile`), so a file
-replaced or changed after `prepare` checked it is refused.
-Runtime admission counts prepared weights, draft and vision exactly once
-(`preparedModelWeightBytes`, which `tune-kernels` and the runtime oracle use
-too). Before loading, startup refuses a model whose prepared weights, with the
-pipeline and runtime reserves, one lane's state, the KV runway and any disk tier
-state staging, exceed the hard budget, so a model that can never fit is not
-prepared. File backing does not make Metal-resident pages reclaimable.
-Every buffer the backend allocates or wraps belongs to one residency set
-attached to its command queue (`MetalBackend::allocateBuffer`): weights, KV
-extents, state cells and draft rings, and scratch alike stay wired between
-requests until 10 minutes pass without a command, and the next command wires
-them again. Memory returns to macOS when the engine releases it, never because
-macOS compressed or dropped an idle buffer. macOS page cache, driver
-allocations and other applications still affect memory pressure and swap.
+Runtime admission counts the images exactly once (`modelWeightBytes`, which
+`tune-kernels` and the runtime oracle use too). Before loading, startup refuses
+a model whose images, with the pipeline and runtime reserves, one lane's state,
+the KV runway and any disk tier state staging, exceed the hard budget, so a
+model that can never fit is not loaded.
+Every buffer the backend allocates belongs to one residency set attached to its
+command queue (`MetalBackend::allocateBuffer`): weights, KV extents, state cells
+and draft rings, and scratch alike stay wired between requests until 10 minutes
+pass without a command, and the next command wires them again. When 10 minutes
+pass without a request, the memory control between commands also releases the
+images' memory (`WeightImages::release`): their buffers are freed, the weights'
+views stay the same handles, and a command that binds released memory fails
+(`MetalBackend::releaseMemory`). The next request waits while the same writers
+write the images again (`WeightImages::restore`), an image per tick so that the
+loop keeps answering status and cancellations; this takes about as long as the
+load at startup and logs `Weights restored in N s`. A restore is not admitted
+again: the memory plan counted the images at startup, and nothing else
+allocates while the engine holds no request. A restore that fails (an
+allocation the driver refuses, a read error, a source written in place) stops
+the engine, which the server starts again. Memory returns to macOS when the
+engine releases it, never because macOS compressed or dropped an idle buffer.
+macOS page cache, driver allocations and other applications still affect
+memory pressure and swap.
 
 KV pages live in extents: ordinary shared Metal buffers of one size per pool,
 between half and one and a half times 128 MiB, in which every tensor region of
@@ -590,12 +554,12 @@ requests on the moved pages. The counts and the longest allocation include the
 runway allocated at startup, before serving begins; how long a whole pass holds
 the loop shows in `loop.max_tick_ms`.
 
-`loadQwenTarget` (`QwenTargetLoader.hpp`) reads a target's files
-(`QwenTargetFiles`: packed files, or the files `AffineTargetLoader` or
-`GgufTargetLoader` prepared) through the format that stores them.
-`AffineTargetFormat`, for packed and MLX-prepared files, reads every
+`loadQwenTarget` (`QwenTargetLoader.hpp`) reads a target's images
+(`QwenTargetFiles`: a package's packed files, or the images
+`AffineTargetLoader` or `GgufTargetLoader` plans) through the format that
+stores them. `AffineTargetFormat`, for packed and MLX images, reads every
 projection, a fused one too, as one affine Q4 tensor and the norms as bf16.
-`BlockTargetFormat`, for prepared GGUF images, reads each GGUF tensor as one
+`BlockTargetFormat`, for GGUF images, reads each GGUF tensor as one
 block-quantized `QuantizedSegment` (a fused projection's tensors in output
 column order), the norms as F32, and keeps the GDN output projection's input
 in llama.cpp's tiled value-head order. Both Qwen families share one layout
@@ -675,9 +639,9 @@ embedding and norm epsilon the kernels assume (`rope.freq_base`,
 `rope.dimension_count`, `attention.layer_norm_rms_epsilon`, and no
 `rope.scaling.type` but `none`), and plans the `MDGG0001` layout.
 `GgufPreparation` stages rows in image order on the CPU within the
-staging bound, splitting rows wider than it into column chunks, runs the
-`gguf_repack` kernel, and writes its planes into a prepared file. Embeddings
-and F32 sections use bounded direct copies.
+staging bound, splitting rows wider than it into column chunks, and runs the
+`gguf_repack` kernel, which writes their planes into the image. Embeddings and
+F32 sections are copied in bounded steps.
 
 Every tensor keeps its stored format: the F32 norm multipliers, GDN decay, the
 MoE router and shared-expert scalar gate, and GDN alpha/beta when a file
@@ -1320,7 +1284,7 @@ and `REVISION`, `DRAFT_MODEL` and `LANGUAGE_ONLY=1` as its `--revision`,
 
 | Target | Runs |
 | --- | --- |
-| `verify-models` | the installer's restarts without the Hub, `verify --full`, and the prepared-weight record (`dev/tools/installer_restarts.py`, [Release check](#release-check)) |
+| `verify-models` | the installer's restarts without the Hub, `verify --full`, and the record of the weight images (`dev/tools/installer_restarts.py`, `weight-digests`, [Release check](#release-check)) |
 | `test-real` | vision parity with the family's fixture in `dev/tests/fixtures/vision-parity/` when the installation serves vision, and the native model runtime oracle |
 | `test-http-real` | the HTTP frontend on an isolated server (`dev/tests/smoke_real.py`) |
 | `test-agent-real` | the five official clients through `splash serve` (`dev/tests/agent_real.py`), in `AGENT_SCENARIO` `complete` (the default) or `smoke` |
@@ -1350,22 +1314,22 @@ the same way. The models they are run with, one per family and source format:
 
 The source formats load differently: an MLX target is prepared into the packed
 layout, a GGUF target into its own layout for the GGUF projection and MoE
-kernels, and a package's packed files are mapped as they are.
+kernels, and a package's packed files are read as they are.
 
 On a 24 GB Mac, `test-agent-real` stops a client's workflow at macOS's warning
 memory pressure, which the smaller GGUF variants such a Mac uses can reach under
 an agent's load; `SPLASH_TEST_PRESSURE_STOP=4` stops only at critical pressure,
 to observe how the engine sheds its cache. The runtime oracle in `test-real` has
-no production memory guard: the prepared weights, and then what the runtime
+no production memory guard: the weights, and then what the runtime
 allocates as it runs, must fit in what macOS has available above its reserve,
 so it stops, naming what it needs, while other programs hold that memory. With
 only desktop applications open, a 24 GB Mac runs it for those variants.
 
-`make test-engine-cpu` builds the affine source oracle so it cannot break
-unnoticed, but no target runs it because it needs real models: after
-`make all build/engine-tests/affine-source-oracle`, pass it
+`make test-engine-cpu` builds the affine source oracle and `weight-digests` so
+they cannot break unnoticed. No target runs the oracle, as it needs real
+models: after `make all build/engine-tests/affine-source-oracle`, pass it
 `build/splash.metallib`, an installed MLX model's `target` directory and the
-matching installed package to compare every prepared byte.
+matching installed package to compare every byte of their images.
 
 Compare performance on the same idle Mac with the same model and workload.
 `make tune-kernels MODEL=...` measures each projection key of the installed
@@ -1382,8 +1346,9 @@ and experiment notes out of the source tree and commits.
 
 A release is checked once per source identity, and then on each Apple GPU
 family (an Apple9 M3 and an Apple10 M5) against a retained baseline build,
-`BASELINE`: a checkout whose `build/` holds `splash`, `splash.metallib` and
-`engine-tests/backend-benchmark`. `release-check` fails without it. The
+`BASELINE`: a checkout whose `build/` holds `splash`, `splash.metallib`,
+`engine-tests/backend-benchmark` and, for a build that loads the weights into
+memory, `engine-tests/weight-digests`. `release-check` fails without it. The
 baseline must load the model: it is the previous release's build when that
 loads the model. Splash 1.0.x loads only Splash packages, so for 1.1, the
 first release that loads upstream models, an upstream model's baseline is a
@@ -1413,22 +1378,23 @@ family, so it runs once on each Mac. Per model, `release-check`:
   (`HF_ENDPOINT=http://127.0.0.1:9`) and with an empty `HF_HUB_CACHE`: each
   restart must start the same assembly within 10 seconds, name the Hub's
   reason on one line when it asked the Hub ([Revisions](#revisions)), and
-  download nothing. It then hashes the sources and records in
-  `prepared.json` the component and SHA-256 of every prepared-weight entry
-  the installation loads (`verify-models`; a legacy package is only hashed);
+  download nothing; a legacy package is not restarted. It then hashes the
+  sources and records in `weights.json` the component, size and SHA-256 of
+  every weight image the installation loads (`verify-models`);
 - runs the HTTP smoke, which for a text-only installation checks the 400s
   instead of images (`test-http-real`);
 - compares this build with `BASELINE`, which must have another build
   identity, in ABBA order (`test-performance-real`): output tokens and
   acceptance must be identical (`EXPECT_OUTPUT_CHANGE=1` allows changed
-  outputs with acceptance within 0.02), and so must the prepared bytes,
-  which a baseline of another preparation identity prepares into a cache of
-  its own; decode and prefill GPU time may regress by at most the larger of
-  2% and twice the run's own ABBA spread, and a spread above 5% fails as
-  inconclusive.
+  outputs with acceptance within 0.02), and so must the bytes of the weight
+  images both load (`dev/benchmarks/weights.py`; a baseline of a release that
+  kept prepared copies writes them into a cache of its own, and a package's
+  files are not compared with it); decode and prefill GPU time may regress by
+  at most the larger of 2% and twice the run's own ABBA spread, and a spread
+  above 5% fails as inconclusive.
 
 Results go to `build/release/<owner>--<repo>[--VARIANT]/`. Preparation does not
-depend on the GPU, so each model's `prepared.json` must be identical on the
+depend on the GPU, so each model's `weights.json` must be identical on the
 two Macs. The unpinned `verify-models`, run after the pinned ones while the
 default branch still names the pinned commit, resolves the branch online, and
 its unreachable-Hub restart must fall back with the Hub's reason. The agent
@@ -1472,8 +1438,10 @@ prefixes and the checks fail, naming what each lookup found.
 
 For a same-machine HTTP regression check, retain a `splash` binary **and its
 adjacent `splash.metallib`** built from a checkout with the same native wire
-version and status schema as this one (the server refuses any other), then run
-from the candidate checkout:
+version and status schema as this one (the server refuses any other), with
+`engine-tests/weight-digests` beside them when that build loads the weights
+into memory, then run from the candidate checkout, after
+`make build/engine-tests/weight-digests`:
 
 ```sh
 .venv/bin/python -m dev.benchmarks.http_regression \
@@ -1485,7 +1453,7 @@ from the candidate checkout:
 It takes any installed model and, for an upstream one, holds its assembly for
 the whole run, so every round serves the same model. It starts isolated servers
 in ABBA order, compares matched cold, exact-prefix and decode requests by the
-release check's speed rule and prepared bytes (decode by
+release check's speed rule and weight bytes (decode by
 `metrics.decode_cycle_ms` per output token, so host work between commands
 counts; against a baseline that does not report it, both versions by
 `metrics.decode_wall_ms` per output token, as each comparison's `metric`

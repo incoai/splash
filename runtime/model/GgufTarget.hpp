@@ -1,16 +1,17 @@
 #pragma once
 
-// Source adapter for a Qwen GGUF. Preparation writes immutable cached files;
-// serving uses the same read-only WeightFile mappings as packaged weights.
+// Source adapter for a Qwen GGUF: its images are written into memory and
+// read like packaged weights.
 
 #include <filesystem>
+#include <memory>
 #include <optional>
-#include <span>
+#include <vector>
 
 #include "model/GgufFile.hpp"
 #include "model/GgufImage.hpp"
-#include "model/PreparedFiles.hpp"
 #include "model/QwenHybridLayout.hpp"
+#include "model/WeightImages.hpp"
 
 namespace splash::model {
 
@@ -20,16 +21,10 @@ namespace splash::model {
 class GgufTargetLoader final {
 public:
   // Plans every image from the GGUF's metadata once.
-  GgufTargetLoader(metal::MetalBackend &backend, const std::filesystem::path &path,
-                   const gguf::TargetGeometry &geometry, PreparationCheck admitConversion);
+  GgufTargetLoader(metal::MetalBackend &backend, WeightImages &images, const std::filesystem::path &path,
+                   const gguf::TargetGeometry &geometry);
   GgufTargetLoader(const GgufTargetLoader &) = delete;
   GgufTargetLoader &operator=(const GgufTargetLoader &) = delete;
-
-  // Every image's cache identity and size, layers first, for the model's
-  // disk check before the first image is written.
-  [[nodiscard]] std::span<const PreparedWeight> weights() const noexcept { return images_.weights(); }
-  // Writes every missing image and maps none.
-  void prepare();
 
   [[nodiscard]] WeightFile layer(uint32_t index);
   [[nodiscard]] WeightFile head();
@@ -39,10 +34,18 @@ public:
   [[nodiscard]] const std::optional<GgufRotation> &rotation() const noexcept { return rotation_; }
 
 private:
+  // The GGUF and its images, which their writers share.
+  struct Planned {
+    explicit Planned(const std::filesystem::path &path) : source(path) {}
+    WeightSource source;
+    std::vector<gguf::Image> images; // layers, head, embedding
+  };
+  [[nodiscard]] WeightFile open(size_t index);
+
   metal::MetalBackend &backend_;
-  WeightSource source_;
+  WeightImages &images_;
+  std::shared_ptr<Planned> planned_;
   std::optional<GgufRotation> rotation_;
-  PreparedImages<gguf::Image> images_; // layers, head, embedding
 };
 
 // The GGUF geometry of a Qwen layout with its family's dense or sparse MoE

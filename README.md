@@ -23,10 +23,9 @@ brew install incoai/tap/splash
 splash serve --model unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M
 ```
 
-The first run downloads the model and its matching draft, prepares the
-weights, and starts serving on `127.0.0.1:8000`. Later starts reuse them.
-Leave room on disk for both the downloads and prepared weights
-([storage requirements](DEVELOPMENT.md#model-storage)).
+The first run downloads the model and its matching draft and starts serving
+on `127.0.0.1:8000`. Later starts reuse the downloads; leave room on disk for
+them ([storage requirements](DEVELOPMENT.md#model-storage)).
 
 Once it prints `Ready`, leave this terminal open. Open <http://127.0.0.1:8000>
 in your browser, or run an installed coding agent from another terminal:
@@ -148,9 +147,9 @@ Splash uses BF16 KV in this comparison.
 ## Design
 
 Each supported model pairs a trained DFlash2 draft with Metal kernels for its
-shapes. The runtime, scheduler, cache, and API are shared. Weights are prepared
-once and mapped from disk; kernels ship precompiled, with no Xcode or local
-tuning required.
+shapes. The runtime, scheduler, cache, and API are shared. Weights are
+converted to the kernels' layouts as they load, with no copy on disk; kernels
+ship precompiled, with no Xcode or local tuning required.
 [How Splash works](https://inco.ai/blog/splash/)
 
 ## More

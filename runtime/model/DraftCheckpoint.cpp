@@ -80,34 +80,19 @@ std::vector<Image> draftCheckpointImages(const DFlashDraftLayout &layout) {
   return result;
 }
 
-struct DraftCheckpointLoader::Impl {
-  metal::MetalBackend &backend;
-  SafetensorsCheckpoint source;
-  PreparedImages<Image> images; // layers, then model.bin
-  Impl(metal::MetalBackend &backend, const std::filesystem::path &directory, const DFlashDraftLayout &layout,
-       PreparationCheck admitConversion)
-      : backend(backend), source(directory, [&backend] { backend.checkOperation(); }),
-        images(PreparedFiles([&backend] { backend.checkOperation(); }, std::move(admitConversion),
-                             [this] { source.checkUnchanged(); }),
-               [](const Image &image) { return affine::affineImageWriter(image); }) {
-    for (Image &image : draftCheckpointImages(layout)) {
-      backend.checkOperation();
-      affine::bind(image, source);
-      PreparedWeight weight = affine::affineImageWeight(image, "draft", directory.string());
-      images.add(std::move(image), std::move(weight));
-    }
-  }
-};
-DraftCheckpointLoader::DraftCheckpointLoader(metal::MetalBackend &backend, const std::filesystem::path &directory,
-                                             const DFlashDraftLayout &layout, PreparationCheck admitConversion)
-    : impl_(std::make_unique<Impl>(backend, directory, layout, std::move(admitConversion))) {}
-DraftCheckpointLoader::~DraftCheckpointLoader() = default;
-std::span<const PreparedWeight> DraftCheckpointLoader::weights() const noexcept { return impl_->images.weights(); }
-void DraftCheckpointLoader::prepare() { impl_->images.prepare(); }
-WeightFile DraftCheckpointLoader::layer(uint32_t index) {
-  if (index >= impl_->images.size() - 1) throw WeightStoreError("draft layer is out of range");
-  return impl_->images.open(impl_->backend, index);
+DraftCheckpointLoader::DraftCheckpointLoader(WeightImages &images, const std::filesystem::path &directory,
+                                             const DFlashDraftLayout &layout)
+    : images_(images), planned_(std::make_shared<affine::PlannedCheckpoint>(directory)) {
+  planned_->images = draftCheckpointImages(layout);
+  for (Image &image : planned_->images) affine::bind(image, planned_->source);
 }
-WeightFile DraftCheckpointLoader::model() { return impl_->images.open(impl_->backend, impl_->images.size() - 1); }
+DraftCheckpointLoader::~DraftCheckpointLoader() = default;
+WeightFile DraftCheckpointLoader::layer(uint32_t index) {
+  if (index >= planned_->images.size() - 1) throw WeightStoreError("draft layer is out of range");
+  return images_.load(affine::imagePlan(planned_, index, "draft"));
+}
+WeightFile DraftCheckpointLoader::model() {
+  return images_.load(affine::imagePlan(planned_, planned_->images.size() - 1, "draft"));
+}
 
 } // namespace splash::model

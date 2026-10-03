@@ -3,12 +3,14 @@
 #include "engine/Engine.hpp"
 #include "engine/StartupLog.hpp"
 #include "metal/abi/ExecutionGeometry.h"
-#include "model/PreparedWeights.hpp"
+#include "model/WeightStore.hpp"
 #include "TestConfig.hpp"
 
 #import <Foundation/Foundation.h>
 
 #include <array>
+#include <chrono>
+#include <iomanip>
 #include <limits>
 #include <optional>
 #include <sstream>
@@ -59,9 +61,8 @@ uint8_t hexNibble(char value) {
 uint64_t mebibytes(uint64_t bytes) noexcept { return bytes / kMiB; }
 
 // The startup admission rule. Deliberately independent of the model size:
-// weights are mapped, not copied, so the package never has to fit in
-// reclaimable memory at once. Residency is what must fit, and it is checked
-// here again at every Metal operation as loading and warmup build it up.
+// it is checked here again at every Metal operation, each image's
+// allocation included, as loading and warmup build the residency up.
 void requireStartupHeadroom(
     const MemoryGovernor::HostAvailableMemoryProvider &hostAvailableMemory,
     uint64_t reserveBytes, MemoryPressure pressure) {
@@ -210,8 +211,6 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
 
   const uint64_t hostReserveBytes =
       EngineMemoryPolicy::hostAvailableReserveBytes(device.physicalMemoryBytes);
-  const uint64_t preparationReserveBytes =
-      hostReserveBytes + model::kWeightPreparationWorkspaceBytes;
   // Reclaimable host memory, sampled at every Metal operation during startup
   // and by the governor afterwards.
   MemoryGovernor::HostAvailableMemoryProvider hostAvailableMemory =
@@ -232,17 +231,6 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
     throwIfCancelled();
     requireStartupHeadroom(hostAvailableMemory, hostReserveBytes,
                            currentPressure());
-  };
-  const auto admitWeightPreparation = [throwIfCancelled, currentPressure,
-                                       hostAvailableMemory,
-                                       preparationReserveBytes] {
-    throwIfCancelled();
-    const MemoryPressure level = currentPressure();
-    if (level != MemoryPressure::Normal)
-      throw metal::MetalAllocationError(
-          "weight preparation requires normal memory pressure",
-          metal::AllocationFailure::HostPressure);
-    requireStartupHeadroom(hostAvailableMemory, preparationReserveBytes, level);
   };
   backend->setOperationGuard(admitMetalOperation);
   // A synchronous command wait gives up when the process shuts down, also
@@ -272,15 +260,15 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
   try {
     const uint64_t hardBudgetBytes = EngineMemoryPolicy::hardBudgetBytes(
         device.recommendedMaxWorkingSetBytes, config.maximumMemoryBytes);
-    // Reject a model that cannot fit before preparing or registering its
-    // weights. Beside them the plan needs at least the runtime reserves, one
-    // lane's state, the KV runway and any disk tier state staging; the full
-    // plan below adds the arenas.
+    // Reject a model that cannot fit before loading its weights. Beside
+    // them the plan needs at least the runtime reserves, one lane's state,
+    // the KV runway and any disk tier state staging; the full plan below adds
+    // the arenas.
     kv::Layout kvLayout = config.model.targetKvLayout;
     kvLayout.format = config.kvFormat;
     uint64_t fixedBytes = 0;
     for (const uint64_t bytes :
-         {model::preparedModelWeightBytes(config.modelRoot, config.model),
+         {model::modelWeightBytes(config.modelRoot, config.model),
           model::kPipelineReserveBytes, model::kRuntimeOverheadReserveBytes,
           stateStagingBytes}) {
       if (!checkedAdd(fixedBytes, bytes, fixedBytes))
@@ -316,9 +304,13 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
 
   model::ModelPackage package;
   try {
-    package = model::loadModelPackage(*backend, config.modelRoot, config.model,
-                                      admitWeightPreparation);
+    const auto started = std::chrono::steady_clock::now();
+    package = model::loadModelPackage(*backend, config.modelRoot, config.model);
     requireLoadedModel(package);
+    const std::chrono::duration<double> loading =
+        std::chrono::steady_clock::now() - started;
+    logStartup("Weights loaded in ", std::fixed, std::setprecision(2),
+               loading.count(), " s.");
   } catch (const metal::MetalAllocationError &error) {
     throw RuntimeResourcesError(RuntimeResourceStage::ModelLoading,
                                 error.what(), deviceStatusJson(device), {},

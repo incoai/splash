@@ -62,7 +62,7 @@ ENGINE_OBJCXXFLAGS := $(ENGINE_CXXFLAGS) -fobjc-arc
 LIB := $(BUILD)/splash.metallib
 .PHONY: all clean force-build-identity install _install \
 	install-environment _install-environment \
-	platform-check model-selection preflight serve verify-models
+	platform-check model-selection preflight serve
 
 all: $(TARGET)
 
@@ -167,13 +167,6 @@ preflight: model-selection
 	@$(PYTHON) -m pip check >/dev/null
 	@TRANSFORMERS_VERBOSITY=error $(PYTHON) -c 'import server.server'
 
-# The installer's restarts without the Hub, a full source hash and the
-# prepared weights a load of the installation wrote (DEVELOPMENT.md, Release
-# check).
-verify-models: preflight
-	@$(PYTHON) dev/tools/installer_restarts.py $(MODEL_ARGS) \
-		--output "$(MODEL_RESULTS)/prepared.json"
-
 serve: preflight $(TARGET)
 	./splash serve $(MODEL_ARGS)
 
@@ -267,7 +260,8 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/AffineTarget.cpp \
 	runtime/model/AffinePreparation.cpp \
 	runtime/model/DraftCheckpoint.cpp \
-	runtime/model/PreparedWeights.cpp \
+	runtime/model/WeightSource.cpp \
+	runtime/model/WeightImages.cpp \
 	runtime/model/GgufPreparation.cpp \
 	runtime/model/Qwen3_6Moe.cpp \
 	runtime/model/Qwen3_8.cpp \
@@ -313,23 +307,6 @@ $(BUILD_ID_STAMP): force-build-identity | $(ENGINE_BUILD)
 
 $(BUILD_ID_HEADER): $(BUILD_ID_STAMP)
 	@:
-
-# Cache identities follow only the code that writes prepared bytes
-# (dev/tools/weight_preparation_identity.py). Make compares the header's
-# content with the identities when it starts, read-only, and rewrites it
-# only when they differ: an edited input, a new one or a tree copied with old
-# timestamps regenerates it, and an unchanged tree leaves every object that
-# uses it current. The preparation adapters under runtime/model include it:
-# their objects depend on it through their depfiles, and on a clean build it
-# is generated before any model object compiles.
-WEIGHT_PREPARATION_HEADER := $(ENGINE_BUILD)/WeightPreparationIdentity.hpp
-WEIGHT_PREPARATION_STALE := $(shell $(BUILD_ID_PYTHON) dev/tools/weight_preparation_identity.py \
-	--root . --header $(WEIGHT_PREPARATION_HEADER) --stale)
-
-$(WEIGHT_PREPARATION_HEADER): $(if $(WEIGHT_PREPARATION_STALE),force-build-identity) | $(ENGINE_BUILD)
-	@$(BUILD_ID_PYTHON) dev/tools/weight_preparation_identity.py --root . --header $@
-
-$(filter $(ENGINE_BUILD)/model/%.o,$(ENGINE_OBJECTS)): | $(WEIGHT_PREPARATION_HEADER)
 
 $(ENGINE_BUILD)/%.o: runtime/%.cpp
 	@mkdir -p $(dir $@)

@@ -2,8 +2,7 @@
 
 // Decode-only value tables of the GGUF formats (metal/abi/QuantFormat.h),
 // shared by the GEMM kernels, the token gathers and the host reference decoder
-// of the tests. No prepared byte depends on them, so they stay out of the
-// preparation identity.
+// of the tests. No prepared byte depends on them.
 #ifdef __METAL_VERSION__
 #include <metal_stdlib>
 #define QUANT_CONSTANT constant constexpr

@@ -13,7 +13,8 @@
 #include "model/GgufFile.hpp"
 #include "model/GgufImage.hpp"
 #include "model/GgufImageLayout.hpp"
-#include "model/PreparedWeights.hpp"
+#include "model/WeightSource.hpp"
+#include "model/WeightStore.hpp"
 #include "model/StateLayout.hpp"
 
 #include <algorithm>

@@ -1438,16 +1438,15 @@ int main(int argc, char **argv) {
     // Production's weight byte count with a different bound. Production checks
     // it only against the Metal hard budget, then guards host headroom at every
     // Metal operation while loading. This oracle has no such guard, so the
-    // prepared weights must fit in reclaimable memory above the macOS reserve
-    // before anything is mapped; it can refuse a package production starts.
-    const uint64_t weightBytes =
-        model::preparedModelWeightBytes(modelRoot, descriptor);
+    // weights must fit in reclaimable memory above the macOS reserve before
+    // any is loaded; it can refuse a package production starts.
+    const uint64_t weightBytes = model::modelWeightBytes(modelRoot, descriptor);
     if (*hostAvailableBytes <= hostReserveBytes ||
         weightBytes > *hostAvailableBytes - hostReserveBytes)
-      stopForHostMemory("the prepared weights need " + mebibytes(weightBytes),
+      stopForHostMemory("the weights need " + mebibytes(weightBytes),
                         *hostAvailableBytes, hostReserveBytes);
     model::ModelPackage model =
-        model::loadModelPackage(backend, modelRoot, descriptor, {});
+        model::loadModelPackage(backend, modelRoot, descriptor);
     ops::ExecutionPlans operators(backend.capabilities());
     model::ModelMemoryPlan executorPlan =
         model::plannedRuntimeMemory(backend.capabilities(), model, operators, format);

@@ -5,6 +5,7 @@
 #include "model/QwenHybridLayout.hpp"
 #include "model/QwenTarget.hpp"
 #include "model/QwenTargetFiles.hpp"
+#include "model/WeightImages.hpp"
 #include "model/WeightStore.hpp"
 #include "ops/GDN.hpp"
 #include "ops/Linear.hpp"
@@ -80,30 +81,30 @@ template <class Format>
                                              const QwenMixerGeometry &geometry,
                                              bool fullAttention);
 
-// Opens the packed files of a target directory: one per hybrid layer, head.bin
-// and embedding.bin.
+// Loads the packed files of a target directory: one per hybrid layer,
+// head.bin and embedding.bin.
 template <class Layout> struct PackedTargetFiles final {
-  metal::MetalBackend &backend;
+  WeightImages &images;
   std::filesystem::path directory;
   const Layout &layout;
   [[nodiscard]] WeightFile layer(uint32_t index) const {
     const std::string filename = "layer-" + std::to_string(index) + ".bin";
-    return WeightFile(backend, directory / filename, "target/" + filename, Layout::layerMagic, index,
-                      layout.isFullAttentionLayer(index) ? 1U : 0U);
+    return images.load(packedImage(directory / filename, "target/" + filename, Layout::layerMagic, index,
+                                   layout.isFullAttentionLayer(index) ? 1U : 0U));
   }
   [[nodiscard]] WeightFile head() const {
-    return WeightFile(backend, directory / "head.bin", "target/head.bin", Layout::headMagic, layout.layers, 2);
+    return images.load(packedImage(directory / "head.bin", "target/head.bin", Layout::headMagic, layout.layers, 2));
   }
   [[nodiscard]] WeightFile embedding() const {
-    return WeightFile(backend, directory / "embedding.bin", "target/embedding.bin", kEmbeddingMagic,
-                      layout.vocabularySize, layout.hiddenSize);
+    return images.load(packedImage(directory / "embedding.bin", "target/embedding.bin", kEmbeddingMagic,
+                                   layout.vocabularySize, layout.hiddenSize));
   }
 };
 
-// Reads a target through immutable WeightFiles, packaged or prepared locally,
-// in their format: per layer the input norm, mixer, post-attention norm and
-// the architecture's FFN through readFfn, then the head and the token
-// embedding. Weights is the architecture's weight struct.
+// Reads a target through the files of its images, packaged or written from
+// an upstream source, in their format: per layer the input norm, mixer,
+// post-attention norm and the architecture's FFN through readFfn, then the
+// head and the token embedding. Weights is the architecture's weight struct.
 template <class Weights, class Layout, class Files, class Format, class ReadFfn>
 [[nodiscard]] Weights
 readQwenTargetWeights(metal::MetalBackend &backend, const Layout &layout, Files &&files,

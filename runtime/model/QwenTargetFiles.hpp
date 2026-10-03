@@ -13,7 +13,7 @@ class AffineTargetLoader;
 class GgufTargetLoader;
 
 // The files a target is read from: packed files (splash-packed-q4 formats),
-// or the cached files a loader prepares from an MLX or GGUF source.
+// or the images a loader writes from an MLX or GGUF source.
 template <class Layout>
 using QwenTargetFiles = std::variant<PackedTargetFiles<Layout>, std::reference_wrapper<AffineTargetLoader>,
                                      std::reference_wrapper<GgufTargetLoader>>;

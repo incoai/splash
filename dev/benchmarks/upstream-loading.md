@@ -21,7 +21,7 @@ below with `make all build/engine-tests/<tool>`.
 
 Drafts are prepared from each family's DFlash2 repository (`families.FAMILIES`);
 the ones measured here were `incoai/Qwen3.8-27B-DFlash2` at `015e7956` and
-`incoai/Qwen3.6-35B-A3B-DFlash2` at `51ef7b69`. The prepared files are
+`incoai/Qwen3.6-35B-A3B-DFlash2` at `51ef7b69`. The draft images are
 byte-identical to the drafts of the released Qwen3.8-27B and Qwen3.6-35B-A3B
 packages.
 
@@ -52,18 +52,17 @@ F32 values has non-zero low 16 bits (0 of 4,833,008 for 27B, 0 of 4,829,936 for
 35B), so they convert to BF16 exactly.
 
 The affine comparison is `affine-source-oracle` (DEVELOPMENT.md, Validate),
-which prints `packed_exact=true` and the decay's `decay_max_ulp` per file; give
-it a scratch `SPLASH_WEIGHT_CACHE`. The GGUF repack check is `gguf-preparation`
-in `make test-engine-metal`.
+which prints `packed_exact=true` and the decay's `decay_max_ulp` per file. The
+GGUF repack check is `gguf-preparation` in `make test-engine-metal`.
 
 ```sh
-SPLASH_WEIGHT_CACHE=$(mktemp -d) build/engine-tests/affine-source-oracle build/splash.metallib \
+build/engine-tests/affine-source-oracle build/splash.metallib \
   install/models/mlx-community/Qwen3.6-35B-A3B-4bit/target install/models/incoai/Qwen3.6-35B-A3B-Splash
 ```
 
-A prepared vision file is the `weights` file of the cache entry whose `source`
-names `component vision/model.bin` (`grep -l '^component vision/model.bin'
-~/Library/Caches/Splash/weights/*/source`).
+`weight-digests` prints the size and SHA-256 of every image a model loads,
+`vision/model.bin` among them:
+`build/engine-tests/weight-digests build/splash.metallib MODEL_ROOT`.
 
 The vision fixture embedding is unchanged, with Metal shader validation:
 `7946f077435ef45d0a596461a9d9a234ff458c805c007bb3ea1af7296bd230f9` for 35B on
@@ -98,26 +97,31 @@ That comparison script is not in the repository. The committed checks are
 chat-template probe tests over the embedded templates in
 `dev/tests/fixtures/chat_templates/`.
 
-## Preparation cost
+## Loading time
 
-35B UD-Q4_K_M GGUF: 42 artifacts, 22,143,172,608 bytes, prepared by the
-batched executor of `2ca5691`; later preparation changes did not repeat this
-timing.
+Every start writes the weight images from their sources, and the first request
+after an idle release writes them again (DEVELOPMENT.md, Weight preparation): a
+start logs `Weights loaded in N s.`, a restore `Weights restored in N s`.
+Measured in October 2026 on an M5 Max (40 GPU cores, 64 GB), otherwise idle,
+from its internal SSD: the time that log reports, for one load in a process of
+its own, and the process's peak footprint (`/usr/bin/time -l`).
 
-| Device | Cold preparation | Reuse of prepared files |
-| --- | ---: | ---: |
-| M3 Max | 29.74 s | 0.641 s |
-| M5 Pro 16 cores | 24.30–25.87 s | 0.533–0.539 s |
+| Model | Images | Sources not cached | Sources cached | Peak footprint |
+| --- | ---: | ---: | ---: | ---: |
+| 35B UD-Q2_K_XL GGUF | 11.89 GiB | 2.09 s | 0.71–0.74 s | 12.11 GiB |
+| 35B MLX 4-bit | 19.49 GiB | 2.18 s | 1.63–1.67 s | 19.64 GiB |
+| 27B MLX 4-bit | 16.16 GiB | 2.73 s | 1.44–1.45 s | 16.37 GiB |
 
-Cold means an empty preparation cache and no source hash proof. The times cover
-backend creation, source verification, planning, conversion, output hashing and
-publication, not tokenizer, server startup or warmup. Peak process RSS is about
-65–68 MB; staging is bounded to 32 MiB inside a 64 MiB admission reserve and does
-not grow with tensor, layer or expert count. No run increased the system swap
-counters. Reopening the prepared affine 35B files takes 0.064 s on the M5 Pro 20
-(`affine-source-oracle ... --load-only`, which prints `seconds=`). The GGUF
-timing harness is not in the repository; a cold start logs each artifact's
-`Prepared <component> in N s`.
+"Not cached" reads fresh copies of the sources, which no read has left in the
+page cache, as a start long after the download does; the writers' own reads
+bypass the cache. The peak footprint includes the Metal backend's own 0.1 GiB:
+beside the images, loading stages 4 MiB per thread and one GGUF repack's rows.
+Restores after an idle release took 1.3–2.1 s for these models, and every
+image's bytes after each restore equaled the first load's.
+
+The cache this replaced prepared the 35B UD-Q4_K_M GGUF, on `2ca5691`, in
+29.74 s on the M3 Max and 24.30–25.87 s on the M5 Pro 16 when cold, and then
+reopened the prepared files in 0.641 s and 0.533–0.539 s.
 
 ## Decode throughput
 

@@ -2,6 +2,7 @@
 
 #include "Model.hpp"
 #include "StateLayout.hpp"
+#include "WeightImages.hpp"
 #include "WeightStore.hpp"
 #include "ops/DraftAttention.hpp"
 #include "ops/DraftSelector.hpp"
@@ -170,7 +171,7 @@ inline constexpr std::string_view kDFlashLayerMagic = "MDFD0004";
 
 // A Splash package's draft files: layer-<N>.bin and model.bin.
 struct PackedDraftFiles final {
-  metal::MetalBackend &backend;
+  WeightImages &images;
   std::filesystem::path directory;
   const DFlashDraftLayout &layout;
   [[nodiscard]] WeightFile layer(uint32_t index) const;
@@ -179,8 +180,8 @@ struct PackedDraftFiles final {
 
 class DraftCheckpointLoader;
 
-// The files a draft is read from: a package's packed files, or the cached
-// files DraftCheckpointLoader prepares from a DFlash2 checkpoint.
+// The files a draft is read from: a package's packed files, or the images
+// DraftCheckpointLoader writes from a DFlash2 checkpoint.
 using DraftFiles = std::variant<PackedDraftFiles, std::reference_wrapper<DraftCheckpointLoader>>;
 
 [[nodiscard]] DFlashDraftWeights

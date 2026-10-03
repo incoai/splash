@@ -133,18 +133,15 @@ struct SafetensorsCheckpoint::Impl {
   }
 };
 
-SafetensorsCheckpoint::SafetensorsCheckpoint(const std::filesystem::path &directory, const PreparationCheck &check)
+SafetensorsCheckpoint::SafetensorsCheckpoint(const std::filesystem::path &directory)
     : impl_(std::make_unique<Impl>()) {
   @autoreleasepool {
-    if (check) check();
     impl_->readConfiguration(directory / "config.json");
     uint64_t metadataBytes = 0;
     for (const auto &path : shardPaths(directory)) {
       @autoreleasepool {
-        if (check) check();
-        auto file = std::make_unique<WeightSource>(path, check);
+        auto file = std::make_unique<WeightSource>(path);
         indexShard(*file, impl_->tensors, metadataBytes);
-        file->checkUnchanged();
         impl_->files.push_back(std::move(file));
       }
     }

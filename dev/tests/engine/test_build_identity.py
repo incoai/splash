@@ -78,7 +78,6 @@ class BuildIdentityTests(unittest.TestCase):
         self.assertIn("runtime/metal/abi/KernelABI.h", inputs)
         self.assertIn("runtime/metal/kernels/common/paged_attention_tile.h", inputs)
         self.assertIn("dev/tools/build_identity.py", inputs)
-        self.assertIn("dev/tools/weight_preparation_identity.py", inputs)
         self.assertFalse(any(path.startswith("dev/tests/") for path in inputs))
         self.assertFalse(any(path.startswith("dev/benchmarks/") for path in inputs))
         self.assertFalse(any(path.startswith("install/models/") for path in inputs))
@@ -93,9 +92,6 @@ class BuildIdentityTests(unittest.TestCase):
             tool = root / "dev/tools/build_identity.py"
             tool.parent.mkdir(parents=True)
             tool.write_text("fixture tool")
-            (tool.parent / "weight_preparation_identity.py").write_text(
-                "fixture preparation tool"
-            )
             first = build_identity.build_id(root)
             geometry.write_text("#define SPLASH_DFLASH_QUERY_ROWS 7\n")
             self.assertNotEqual(first, build_identity.build_id(root))
@@ -106,9 +102,6 @@ class BuildIdentityTests(unittest.TestCase):
             tool = root / "dev/tools/build_identity.py"
             tool.parent.mkdir(parents=True)
             shutil.copy2(build_identity.ROOT / "dev/tools/build_identity.py", tool)
-            (tool.parent / "weight_preparation_identity.py").write_text(
-                "fixture preparation tool"
-            )
             shader = root / "runtime/metal/kernels/shared/alternate.metal"
             shader.parent.mkdir(parents=True)
             header = root / "generated/BuildIdentity.hpp"

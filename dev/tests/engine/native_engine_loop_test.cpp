@@ -234,13 +234,17 @@ struct PoolShape {
   uint32_t runwayPages = pages;
 };
 
+// How long the loop keeps weights without a request (NativeLoopConfig).
+constexpr double kWeightKeepAliveSeconds = 2.0;
+
 // A native loop over the fake model, collecting the bytes it writes. Its
 // clocks come from the test seam: the unix clock stands still and the steady
 // clock reads `monotonic`, advanced by `clockStep` on every read.
 struct LoopFixture {
   explicit LoopFixture(NativeLoopConfig config = {}, PoolShape shape = {},
                        protocol::ProtocolLimits limits = {})
-      : seam({.unixMicros = [] { return uint64_t{1'000'000}; },
+      : seam({.residencyKeepAliveSeconds = kWeightKeepAliveSeconds,
+              .unixMicros = [] { return uint64_t{1'000'000}; },
               .monotonicMilliseconds = [this] { return monotonic += clockStep; }}),
         storage(shape.pages, 4096, shape.extentPages),
         pool(storage, shape.runwayPages), cache(pool, nullptr, nullptr),
@@ -1381,6 +1385,118 @@ void testControlPassReclaimsUnderHostPressure() {
           "critical pressure did not empty the cache and release every extent");
 }
 
+// Weights of three images that count what the loop does with them.
+class Weights final : public model::WeightMemory {
+public:
+  static constexpr uint32_t kImages = 3;
+  [[nodiscard]] bool released() const noexcept override {
+    return restored_ < kImages;
+  }
+  void release() override {
+    require(!released(), "weights were released twice");
+    restored_ = 0;
+  }
+  bool restore() override {
+    if (failRestore)
+      throw std::runtime_error("weights restore test");
+    require(released(), "held weights were restored");
+    ++restores;
+    return ++restored_ == kImages;
+  }
+  bool failRestore = false;
+  // The images written back.
+  uint32_t restores = 0;
+
+private:
+  uint32_t restored_ = kImages;
+};
+
+bool answeredStatus(const LoopFixture &fixture, uint64_t correlationId) {
+  const auto events = fixture.events();
+  return std::any_of(events.begin(), events.end(), [&](const auto &message) {
+    const auto *event = std::get_if<protocol::StatusJsonEvent>(&message);
+    return event && event->correlationId == correlationId;
+  });
+}
+
+// The control pass between commands releases the weights once the engine has
+// held no request for the keep-alive, counted from the end of the last one
+// however long it ran, never while one is there. A request waits while they
+// are written back, an image per tick, so the loop answers frames between
+// them, and the images all come back even when it is cancelled. A restore
+// that fails stops the engine.
+void testIdleWeightsAreReleasedAndRestored() {
+  constexpr double keepAlive = 1000.0 * kWeightKeepAliveSeconds;
+  Weights weights;
+  engine::NativeLoopConfig config;
+  config.engine.maxContext = 1024;
+  config.weights = &weights;
+  LoopFixture fixture(config);
+  engine::NativeRuntime &loop = fixture.loop;
+  fixture.executor.onBegin = [&] {
+    require(!weights.released(), "the model began a request on released weights");
+  };
+  test::metalStatistics() = {};
+  metal::MetalBackend backend("unused");
+  MemoryGovernor governor(backend, 40ULL << 30, 2ULL << 30,
+                          [] { return std::optional<uint64_t>{64ULL << 30}; }, 0);
+  MemoryControl control(governor, backend, loop);
+  const auto idlePass = [&](double elapsed) {
+    fixture.monotonic += elapsed;
+    static_cast<void>(control.run(MemoryPressure::Normal));
+    return weights.released();
+  };
+  loop.announceReady();
+  require(!idlePass(keepAlive - 1), "weights were released before the keep-alive passed");
+  require(idlePass(1), "idle weights were kept past the keep-alive");
+
+  require(loop.receive(protocol::peer::serialize(request(1))) && weights.restores == 0,
+          "weights were written back before a tick");
+  require(loop.tick() && weights.restores == 1 && weights.released(),
+          "a tick did not write back one image");
+  require(loop.receive(protocol::peer::serialize(protocol::StatusRequestFrame{77})) &&
+              answeredStatus(fixture, 77),
+          "the loop did not answer status while it restored the weights");
+  while (weights.released())
+    require(loop.tick(), "a tick did not write back an image");
+  require(weights.restores == Weights::kImages, "an image was written back twice");
+  require(!idlePass(2 * keepAlive), "weights were released under a request");
+  runUntilIdle(loop);
+
+  require(loop.receive(protocol::peer::serialize(request(2))), "a second request failed");
+  // It runs past the keep-alive, without a control pass between commands.
+  fixture.clockStep = keepAlive;
+  runUntilIdle(loop);
+  fixture.clockStep = 0;
+  require(!idlePass(0), "weights were released as soon as a long request ended");
+  require(idlePass(keepAlive), "weights were kept past the keep-alive after a request");
+
+  require(loop.receive(protocol::peer::serialize(request(3))) && loop.tick() &&
+              loop.receive(protocol::peer::serialize(protocol::CancelFrame{3})),
+          "a request cancelled while the weights came back failed");
+  while (weights.released())
+    require(loop.tick(), "a cancelled request stopped its weights coming back");
+  require(weights.restores == 2 * Weights::kImages, "an image was written back twice");
+  // The transport ticks again after a tick that progressed: the engine then
+  // lets the cancelled request go.
+  static_cast<void>(loop.tick());
+
+  require(idlePass(keepAlive), "weights were kept past the keep-alive after a cancel");
+  weights.failRestore = true;
+  require(loop.receive(protocol::peer::serialize(request(4))) && !loop.tick(),
+          "a failed restore kept the engine running");
+  const auto events = fixture.events();
+  require(std::any_of(events.begin(), events.end(),
+                      [](const auto &message) {
+                        const auto *error = std::get_if<protocol::ErrorEvent>(&message);
+                        return error &&
+                               error->failureClass == protocol::FailureClass::EngineUnhealthy &&
+                               error->message.find("weights restore test") != std::string::npos;
+                      }) &&
+              !loop.engineHealthy() && loop.connectionMustClose(),
+          "a failed restore did not stop the engine");
+}
+
 // The reporter logs a change in what requests wait for, never a retry or the
 // depth of a queue.
 void testMemoryStatusReporterLogsTransitionsOnly() {
@@ -1435,6 +1551,7 @@ int main() {
     testInvalidScoreFailsOneRequestAndKeepsTheBatch();
     testConstrainedMaskExchange();
     testControlPassReclaimsUnderHostPressure();
+    testIdleWeightsAreReleasedAndRestored();
     testMemoryStatusReporterLogsTransitionsOnly();
     std::cout << "native KV-first loop tests passed\n";
     return EXIT_SUCCESS;

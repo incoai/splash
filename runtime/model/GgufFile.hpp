@@ -4,7 +4,7 @@
 // strings and small numeric arrays, the tensor table and where the tensor
 // data starts. Tensor data is never read here.
 
-#include "model/PreparedWeights.hpp"
+#include "model/WeightSource.hpp"
 
 #include <array>
 #include <cstdint>

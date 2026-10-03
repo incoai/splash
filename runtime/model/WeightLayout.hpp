@@ -1,9 +1,7 @@
 #pragma once
 
 // Layout constants of the weight files: preparation writes them, the weight
-// store reads them. Preparation code takes them from this header, so the
-// preparation identity does not follow the reader's API.
-// Editing this file re-prepares every affine and vision model.
+// store reads them.
 
 #include <array>
 #include <cstdint>

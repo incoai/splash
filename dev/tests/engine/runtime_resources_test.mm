@@ -201,7 +201,7 @@ void testImagePatchCapIsBounded(const char *metallibPath) {
 
 // A 34.5 GiB model under a 35 GiB budget: the weights alone fit, but not
 // with what the runtime needs beside them. Startup refuses it before any
-// weight is prepared or registered.
+// weight is loaded.
 void testModelBeyondBudgetIsRefusedBeforeLoading(const char *metallibPath) {
   TemporaryModelRoot root(23 * kGiB / 2);
   RuntimeResourcesConfig config = budgetConfig(metallibPath, root);

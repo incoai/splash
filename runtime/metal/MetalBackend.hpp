@@ -72,7 +72,8 @@ public:
   [[nodiscard]] explicit operator bool() const noexcept;
   [[nodiscard]] uint64_t sizeBytes() const noexcept;
   [[nodiscard]] BufferStorage storage() const noexcept;
-  // Returns nullptr for private buffers. The pointer covers this view only.
+  // Returns nullptr for private buffers and released memory
+  // (MetalBackend::releaseMemory). The pointer covers this view only.
   [[nodiscard]] void *contents() const noexcept;
   // GPU address of the view's first byte, for kernels that reach a buffer
   // through an address another buffer holds.
@@ -199,8 +200,10 @@ private:
 [[nodiscard]] DeviceCapabilities probeDeviceCapabilities();
 
 // How long a command may run before the backend gives up on it, and how long
-// every buffer stays wired after the last command (see allocateBuffer). Tests
-// substitute shorter ones through TestConfig.
+// every buffer stays wired after the last command (see allocateBuffer), as the
+// engine keeps a model's weights after the last request
+// (NativeRuntime::releaseIdleWeights). Tests substitute shorter ones through
+// TestConfig.
 inline constexpr double kCommandTimeoutSeconds = 120.0;
 inline constexpr double kResidencyKeepAliveSeconds = 600.0;
 static_assert(kCommandTimeoutSeconds > 0.0 && kResidencyKeepAliveSeconds > 0.0);
@@ -232,11 +235,11 @@ public:
 
   [[nodiscard]] const DeviceCapabilities &capabilities() const noexcept;
 
-  // Every buffer the backend allocates or wraps belongs to one residency set,
-  // attached to the command queue, until its last view is gone. Metal by
-  // itself wires a buffer only while a command uses it and a few seconds
-  // after, so memory pressure could compress idle state or drop idle weights
-  // and the next request would wait to get them back. A member is wired from
+  // Every buffer the backend allocates belongs to one residency set, attached
+  // to the command queue, until its memory is released or its last view is
+  // gone. Metal by itself wires a buffer only while a command uses it and a
+  // few seconds after, so memory pressure could compress idle state and the
+  // next request would wait to get it back. A member is wired from
   // its allocation on until the keep-alive passes without a command, and
   // again from the next command: memory goes back to macOS when the engine
   // releases it, not when macOS chooses. Kernels may also reach a Shared
@@ -247,14 +250,17 @@ public:
   allocateBuffer(uint64_t bytes, BufferStorage storage,
                  std::string_view label);
 
-  // Wraps page-aligned shared memory without copying it. The lifetime token
-  // is retained by Metal's deallocator, including any internal buffer owners
-  // that outlive our C++ views and completed tickets.
-  [[nodiscard]] MetalBuffer wrapSharedMemory(void *address, uint64_t bytes,
-                                             std::shared_ptr<void> lifetime,
-                                             std::string_view label);
   [[nodiscard]] MetalBuffer view(const MetalBuffer &base, uint64_t offsetBytes,
                                  uint64_t lengthBytes) const;
+
+  // Frees the memory of a buffer from allocateBuffer while no command is in
+  // flight: it leaves the residency set and the accounting. Its views stay
+  // valid handles of no memory: a command that binds one fails, and their
+  // contents are null and GPU addresses 0, until restoreMemory allocates the
+  // buffer's memory again, at another GPU address, its contents undefined
+  // until written.
+  void releaseMemory(const MetalBuffer &buffer);
+  void restoreMemory(const MetalBuffer &buffer);
 
   // Encodes exactly one compute dispatch, commits it, waits for completion,
   // and reports both GPU and end-to-end wall time.

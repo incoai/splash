@@ -9,10 +9,8 @@
 //   meta   [N / T][G / meta_groups][T][meta_bytes]
 // A meta unit is one native block and holds its scale fields.
 //
-// Its contents are hashed into SPLASH_GGUF_PREPARATION_ID
-// (dev/tools/weight_preparation_identity.py): it holds what defines prepared
-// bytes, plus each format's kernel name token, which the host reads.
-// Editing this file re-prepares every GGUF model.
+// It holds what defines the image's bytes, plus each format's kernel name
+// token, which the host reads.
 // dev/tests/test_gguf_metadata.py reads the GGUF type of each kQuantFormats
 // row with a regex on the row's leading number. The decode-only value tables
 // are in metal/abi/QuantTables.h.

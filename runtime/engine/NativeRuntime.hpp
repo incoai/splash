@@ -3,6 +3,7 @@
 #include "engine/Engine.hpp"
 #include "engine/Protocol.hpp"
 #include "engine/Status.hpp"
+#include "model/WeightMemory.hpp"
 
 #include <cstdint>
 #include <exception>
@@ -18,6 +19,11 @@ namespace splash::engine {
 struct NativeLoopConfig {
   engine::EngineConfig engine;
   RuntimeMetrics *metrics = nullptr;
+  // The model's weights: released once the engine has held no request for
+  // the residency keep-alive (metal::kResidencyKeepAliveSeconds), and written
+  // back, an image per tick, before the engine runs the next request. Null
+  // where they stay, as in tests of other behavior.
+  model::WeightMemory *weights = nullptr;
 };
 
 // Translates native protocol messages and events at the Engine boundary.
@@ -42,10 +48,14 @@ public:
   bool receive(std::span<const uint8_t> bytes);
   bool finishInput();
 
-  // Executes at most one explicit GPU BatchPlan.
+  // Executes at most one explicit GPU BatchPlan, or writes back one image of
+  // released weights.
   bool tick();
   // Command-free control work uses the same failure boundary as execution.
   bool runControl(const std::function<bool()> &control);
+  // Releases the weights once the engine has held no request for the
+  // residency keep-alive. Runs between commands, in the control pass.
+  void releaseIdleWeights();
   void setCompletionNotifier(std::function<void()> notifier) {
     core_.setCompletionNotifier(std::move(notifier));
   }
@@ -101,6 +111,7 @@ private:
 
   bool handle(protocol::ClientMessage &message);
   bool handleRequest(protocol::RequestFrame &request);
+  void restoreWeights();
   bool handleCancel(const protocol::CancelFrame &cancel);
   bool handleMask(const protocol::MaskResponseFrame &mask);
   bool handleStatus(const protocol::StatusRequestFrame &status);
@@ -148,6 +159,13 @@ private:
   std::unordered_map<uint64_t, RequestTelemetry> telemetry_;
   std::unordered_map<uint64_t, PendingMask> pendingMasks_;
   uint64_t nextMaskRequestId_ = 1;
+  // metal::kResidencyKeepAliveSeconds, or the test seam's (TestConfig), and
+  // when the engine last held a request: when one ended, or when weights were
+  // restored for one.
+  double weightKeepAliveMilliseconds_;
+  double lastRequestMilliseconds_;
+  // When the weights began to be written back for a request, until they are.
+  std::optional<double> restoreStarted_;
   bool ready_ = false;
   bool closeConnection_ = false;
   bool engineHealthy_ = true;

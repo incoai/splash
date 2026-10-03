@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 
 #include "model/AffineTarget.hpp"
+#include "model/WeightImages.hpp"
 #include "model/ModelDescriptor.hpp"
 
 #include <fcntl.h>
@@ -60,7 +61,7 @@ void compare(model::WeightFile file, const std::filesystem::path &target, bool l
       }
     }
     file.finish();
-    std::cout << record.relativePath << " bytes=" << record.declaredBytes << (loadOnly ? " opened=true" : " packed_exact=true") << " decay_max_ulp=" << maximumDecayUlp << std::endl;
+    std::cout << record.relativePath << " bytes=" << record.declaredBytes << (loadOnly ? " loaded=true" : " packed_exact=true") << " decay_max_ulp=" << maximumDecayUlp << std::endl;
   } catch (...) { close(fd); throw; }
   close(fd);
 }
@@ -75,21 +76,27 @@ int main(int argc, char **argv) {
       const std::filesystem::path package(argv[3]);
       const auto descriptor = model::inspectModelPackage(package);
       std::visit([&](const auto &layout) {
-        model::AffineTargetLoader loader(backend, argv[2], layout, {});
+        // Each image is written into memory of its own, so one is held at a
+        // time.
+        const auto check = [&](const auto &load, uint64_t decayOffset = 0, uint32_t decayHeads = 0) {
+          model::WeightImages images(backend);
+          model::AffineTargetLoader loader(images, argv[2], layout);
+          compare(load(loader), package / "target", loadOnly, decayOffset, decayHeads);
+        };
         const uint32_t begin = argc == 5 && !loadOnly ? std::stoul(argv[4]) : 0;
         const uint32_t end = argc == 5 && !loadOnly ? begin + 1 : layout.layers;
-        const std::vector<model::affine::Image> images = model::affineTargetImages(layout);
+        const std::vector<model::affine::Image> planned = model::affineTargetImages(layout);
         for (uint32_t layer = begin; layer < end; ++layer) {
-          const auto &sections = images.at(layer).sections;
+          const auto &sections = planned.at(layer).sections;
           const auto decay = std::ranges::find(sections, model::affine::SectionKind::Decay,
                                                &model::affine::Section::kind);
           const bool gdn = decay != sections.end();
-          compare(loader.layer(layer), package / "target", loadOnly, gdn ? decay->offset : 0,
-                  gdn ? uint32_t(decay->bytes / sizeof(float)) : 0);
+          check([&](auto &loader) { return loader.layer(layer); }, gdn ? decay->offset : 0,
+                gdn ? uint32_t(decay->bytes / sizeof(float)) : 0);
         }
         if (argc != 5 || loadOnly) {
-          compare(loader.head(), package / "target", loadOnly);
-          compare(loader.embedding(), package / "target", loadOnly);
+          check([](auto &loader) { return loader.head(); });
+          check([](auto &loader) { return loader.embedding(); });
         }
       }, descriptor.target);
       std::cout << "affine source oracle PASS seconds="

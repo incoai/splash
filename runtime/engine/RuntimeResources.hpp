@@ -158,6 +158,7 @@ public:
   }
 
   [[nodiscard]] model::RuntimeContext modelContext() noexcept;
+  [[nodiscard]] model::WeightImages &weightImages() noexcept { return *model_.images; }
   [[nodiscard]] ActualMemoryReport
   actualMemoryReport(const model::ModelMemoryActual &modelMemory) const;
 

@@ -1,10 +1,14 @@
 #include "engine/NativeRuntime.hpp"
+#include "StderrLine.hpp"
 #include "TestConfig.hpp"
+#include "metal/MetalBackend.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <iomanip>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
@@ -19,7 +23,11 @@ NativeRuntime::NativeRuntime(NativeLoopConfig config, engine::Cache &cache,
     : config_(std::move(config)), output_(std::move(output)),
       statusProvider_(std::move(statusProvider)), clocks_(clocks()),
       limits_(limits), parser_(limits_),
-      core_(config_.engine, cache, model, *this) {
+      core_(config_.engine, cache, model, *this),
+      weightKeepAliveMilliseconds_(
+          1000.0 * testConfig().residencyKeepAliveSeconds.value_or(
+                       metal::kResidencyKeepAliveSeconds)),
+      lastRequestMilliseconds_(clocks_.monotonicMilliseconds()) {
   if (!output_ || !statusProvider_) {
     throw std::invalid_argument("invalid native engine loop config");
   }
@@ -80,6 +88,12 @@ bool NativeRuntime::tick() {
   if (closeConnection_ || !engineHealthy_)
     return false;
   try {
+    // The engine runs no request until its weights are back, written an
+    // image per tick so that frames are answered between them.
+    if (restoreStarted_) {
+      restoreWeights();
+      return true;
+    }
     return core_.tick(clocks_.monotonicMilliseconds());
   } catch (...) {
     executionFailed(std::current_exception());
@@ -96,6 +110,29 @@ bool NativeRuntime::runControl(const std::function<bool()> &control) {
     executionFailed(std::current_exception());
   }
   return false;
+}
+
+void NativeRuntime::releaseIdleWeights() {
+  if (!config_.weights || config_.weights->released() || !core_.idle() ||
+      clocks_.monotonicMilliseconds() - lastRequestMilliseconds_ <
+          weightKeepAliveMilliseconds_)
+    return;
+  config_.weights->release();
+  std::ostringstream message;
+  message << "Weights released after " << weightKeepAliveMilliseconds_ / 1000.0
+          << " s without a request; the next request restores them";
+  writeStderrLine(message.str());
+}
+
+void NativeRuntime::restoreWeights() {
+  if (!config_.weights->restore())
+    return;
+  lastRequestMilliseconds_ = clocks_.monotonicMilliseconds();
+  std::ostringstream message;
+  message << "Weights restored in " << std::fixed << std::setprecision(2)
+          << (lastRequestMilliseconds_ - *restoreStarted_) / 1000.0 << " s";
+  restoreStarted_.reset();
+  writeStderrLine(message.str());
 }
 
 void NativeRuntime::executionFailed(std::exception_ptr failure) {
@@ -200,6 +237,10 @@ bool NativeRuntime::handleRequest(protocol::RequestFrame &request) {
   }
   telemetry_.emplace(request.requestId,
                      RequestTelemetry{.arrivedMilliseconds = nowMonotonic});
+  // Released weights are written back before the engine runs the request
+  // (tick()); a failure to restore them stops the engine.
+  if (config_.weights && config_.weights->released() && !restoreStarted_)
+    restoreStarted_ = nowMonotonic;
   return true;
 }
 
@@ -416,6 +457,7 @@ void NativeRuntime::completed(uint64_t requestId, EngineFinishReason reason,
       std::vector<float>(optionLogits.begin(), optionLogits.end())});
   pendingMasks_.erase(requestId);
   telemetry_.erase(requestId);
+  lastRequestMilliseconds_ = now;
 }
 
 void NativeRuntime::failed(uint64_t requestId, LaneOutcome outcome,
@@ -427,6 +469,7 @@ void NativeRuntime::failed(uint64_t requestId, LaneOutcome outcome,
                wire.retryable);
   pendingMasks_.erase(requestId);
   telemetry_.erase(requestId);
+  lastRequestMilliseconds_ = clocks_.monotonicMilliseconds();
 }
 
 NativeRuntime::Clocks NativeRuntime::clocks() {

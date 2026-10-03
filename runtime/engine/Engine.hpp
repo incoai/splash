@@ -150,6 +150,10 @@ public:
   [[nodiscard]] bool commandInFlight() const noexcept {
     return pending_.has_value();
   }
+  // No request is waiting, running or draining.
+  [[nodiscard]] bool idle() const noexcept {
+    return requests_.empty() && !pending_;
+  }
   [[nodiscard]] std::optional<double> nextWakeupMilliseconds() const;
   [[nodiscard]] EngineSnapshot snapshot() const;
   [[nodiscard]] ResourceWaitSnapshot resourceWaitSnapshot(double nowMilliseconds) const;

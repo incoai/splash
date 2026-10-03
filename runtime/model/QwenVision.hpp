@@ -1,5 +1,6 @@
 #pragma once
 
+#include "WeightImages.hpp"
 #include "WeightStore.hpp"
 #include "ops/Vision.hpp"
 
@@ -23,11 +24,11 @@ struct QwenVisionWeights final {
 
 // The packed vision/model.bin of directory.
 [[nodiscard]] QwenVisionWeights
-loadQwenVisionWeights(metal::MetalBackend &backend,
+loadQwenVisionWeights(metal::MetalBackend &backend, WeightImages &images,
                       const std::filesystem::path &directory,
                       ops::VisionLayout layout);
-// The same layout, prepared from an upstream source.
+// The same layout, written from an upstream source.
 [[nodiscard]] QwenVisionWeights
-loadQwenVisionWeights(metal::MetalBackend &backend, const VisionLoader &source);
+loadQwenVisionWeights(metal::MetalBackend &backend, WeightImages &images, const VisionLoader &source);
 
 } // namespace splash::model
