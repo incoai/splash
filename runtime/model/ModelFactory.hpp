@@ -7,6 +7,7 @@
 #include "Qwen3_8.hpp"
 #include "QwenVision.hpp"
 #include "VisionLoader.hpp"
+#include "ops/AneFfn.hpp"
 #include "ops/PageStorage.hpp"
 #include "ops/ExecutionPlans.hpp"
 
@@ -68,6 +69,9 @@ struct RuntimeContext final {
   kv::PageStorage &kvPages;
   QwenStateStorage &stateStorage;
   const ops::ExecutionPlans &operators;
+  // The share of the prefill FFN's Neural Engine split (calibrateAneFfn), or
+  // 0 for none.
+  double aneFfnShare = 0.0;
 };
 
 // Validates only the interface between independently defined target and draft
@@ -95,11 +99,17 @@ loadModelPackage(metal::MetalBackend &backend,
                  const std::filesystem::path &root,
                  const ModelDescriptor &descriptor, PreparationCheck admitConversion);
 
+// The Neural Engine split of the package's prefill FFN calibrated on this
+// device (ops::AneFfn::calibrate) on a prefill arena of its own; a target
+// other than a dense one, or one whose FFN the split does not take, gets
+// none.
+[[nodiscard]] ops::AneFfn::Calibration calibrateAneFfn(metal::MetalBackend &backend, const ModelPackage &package,
+                                                       const ops::ExecutionPlans &operators, kv::Format format);
 [[nodiscard]] ModelMemoryPlan
 plannedRuntimeMemory(const DeviceCapabilities &device,
                      const ModelPackage &package,
                      const ops::ExecutionPlans &operators,
-                     kv::Format format);
+                     kv::Format format, double aneFfnShare = 0.0);
 [[nodiscard]] std::unique_ptr<RuntimeModel>
 createRuntime(RuntimeContext context);
 

@@ -280,6 +280,10 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
   requireSegments(p, w.matrix);
   if (gate) requireSegments(*gate, w.matrix);
   const std::vector<QuantizedSegment> &segments = p.blocks().segments;
+  if (p.planeInputSize() != p.inputSize &&
+      (p.rotation || plan.configuration().tile != LinearTile::GgufPrefill ||
+       std::any_of(segments.begin(), segments.end(), [](const QuantizedSegment &s) { return s.isFloat(); })))
+    throw std::invalid_argument("a view of leading inputs runs only the quantized prefill tiles");
   // The fused kernels have no fp32 instance.
   if (plan.destination() == FloatOutput::Float32 && segments.size() > 1)
     throw std::invalid_argument("an fp32 destination takes a single-tensor block projection");
@@ -391,7 +395,7 @@ void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
     std::vector<metal::MetalBuffer> bindings{b.input, s.plane0, s.plane1Slot(), s.meta, b.output};
     if (w.epilogue != LinearEpilogue::None) bindings.push_back(epilogueInput(b, w.epilogue));
     graph.add(prefillKernel(s.name(), epilogue), std::move(bindings),
-              GgufPrefillParams{k, w.rows, n, s.columnOffset},
+              GgufPrefillParams{k, w.rows, n, s.columnOffset, p.planeInputSize()},
               {plan.storageRows() / GGUF_PREFILL_ROWS, s.outputSize / GGUF_TILE_COLUMNS, 1},
               {GGUF_PREFILL_THREADS, 1, 1});
   }

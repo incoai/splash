@@ -50,13 +50,16 @@ template <class Acc, class Fn> inline void gguf_elements(thread Acc &acc, Fn fn)
 template <class F, ushort Rows, ushort Cols, ushort KS, ushort Threads, class Acc>
 inline void gguf_staged_steps(device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta, uint input_size,
                               uint output_origin, threadgroup half *stage, threadgroup half2 *tl, uint thread_index,
-                              uint step_begin, uint step_end, bool matmuls, thread Acc &acc) {
+                              uint step_begin, uint step_end, bool matmuls, thread Acc &acc,
+                              uint plane_input_size = 0) {
   // Prefetch: the steps whose weights are loaded ahead of the one being staged.
   constexpr ushort Prefetch = 1, GPS = KS / 32, Items = Cols * GPS, IPT = (Items + Threads - 1) / Threads;
   auto a = tensor(input, dextents<int, 2>{int(input_size), Rows}, array<int, 2>{1, int(input_size)});
   constexpr auto descriptor = matmul2d_descriptor(Rows, Cols, KS, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<descriptor, execution_simdgroups<1>> operation;
-  const uint groups = input_size / 32, units = groups / F::MetaGroups;
+  // A tile's groups lie in order: the first input_size / 32 of a view of the leading inputs of wider rows
+  // (plane_input_size, 0 = input_size) are those it reads.
+  const uint groups = (plane_input_size ? plane_input_size : input_size) / 32, units = groups / F::MetaGroups;
   const uint plane_tile = output_origin / QUANT_TILE_ROWS, plane_row = output_origin % QUANT_TILE_ROWS;
   device uchar *tw0 = w0 + (ulong(plane_tile) * groups * QUANT_TILE_ROWS + plane_row) * F::P0;
   device uchar *tw1 = w1 + (ulong(plane_tile) * groups * QUANT_TILE_ROWS + plane_row) * F::P1;

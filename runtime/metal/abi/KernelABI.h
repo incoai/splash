@@ -3,6 +3,7 @@
 // Shader prelude. The ABI headers below also compile as host C++; their
 // shared parameter layouts use fixed-width scalars and explicit padding.
 
+#include "metal/abi/AneFfn.h"
 #include "metal/abi/DraftAttention.h"
 #include "metal/abi/Embedding.h"
 #include "metal/abi/ExecutionGeometry.h"

@@ -47,6 +47,11 @@ public:
                               payloads_.back().data(), sizeof(Params)});
   }
 
+  // Event steps (EventStep): signal after all earlier work, or hold later
+  // work until the event reaches value.
+  void signal(SharedEvent event, uint64_t value) { step(std::move(event), value, true); }
+  void wait(SharedEvent event, uint64_t value) { step(std::move(event), value, false); }
+
   [[nodiscard]] bool empty() const noexcept { return dispatches_.empty(); }
   [[nodiscard]] std::span<const ComputeDispatch> dispatches() const noexcept {
     return dispatches_;
@@ -65,6 +70,12 @@ private:
     }
     dispatches_.push_back(std::move(dispatch));
     return dispatches_.back();
+  }
+
+  void step(SharedEvent event, uint64_t value, bool signal) {
+    ComputeDispatch dispatch;
+    dispatch.event = EventStep{std::move(event), value, signal};
+    dispatches_.push_back(std::move(dispatch));
   }
 
   std::deque<std::vector<std::byte>> payloads_;

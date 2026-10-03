@@ -591,6 +591,47 @@ void prefill(MetalBackend &backend, const Linear &linear) {
           "chunks and chunks of 8-32 rows (S 1 and 4) within fp64, equal to the 128-row tiles");
 }
 
+// ---------------------------------------------------------------- leading inputs
+// A view of the leading inputs of a projection's rows (Projection::planeInputs), as the ANE FFN split runs down's GPU
+// share, equals bit for bit a projection of those inputs repacked on their own, in every format and epilogue.
+void leadingInputs(MetalBackend &backend, const Linear &linear) {
+  constexpr uint32_t N = 512, K = 1024, kLeading = 512, kChunk = 168;
+  for (int fi = 0; fi < FMT_COUNT; ++fi) {
+    const Fmt f = Fmt(fi);
+    const Tensor whole = tensor(backend, f, N, K);
+    std::vector<uint8_t> leading;
+    for (uint32_t row = 0; row < N; ++row) {
+      const auto begin = whole.native.begin() + uint64_t{row} * rowBytes(f, K);
+      leading.insert(leading.end(), begin, begin + rowBytes(f, kLeading));
+    }
+    const Packed planes = repack(f, leading, N, kLeading, nullptr);
+    const Projection compact(
+        N, kLeading,
+        BlockWeights{{QuantizedSegment::planes(f, N, kLeading, upload(backend, planes.w0),
+                                               kQuantFormats[f].plane1_bytes ? upload(backend, planes.w1)
+                                                                             : MetalBuffer{},
+                                               upload(backend, planes.meta))}});
+    Projection view(N, kLeading,
+                    BlockWeights{{QuantizedSegment::planes(f, N, kLeading, whole.segment.plane0, whole.segment.plane1,
+                                                           whole.segment.meta)}});
+    view.planeInputs = K;
+    for (const LinearEpilogue e : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate}) {
+      const LinearWorkload w{{N, kLeading}, kChunk, LinearPhase::Prefill, e, WeightLayout::Block32};
+      const LinearPlan plan = Linear::plan(w, {.tile = LinearTile::GgufPrefill}, FloatOutput::BFloat16);
+      const uint32_t storage = plan.storageRows();
+      const std::vector<uint16_t> x = storageRows(activations(Inputs::Dense, storage, kLeading), kLeading, kChunk,
+                                                  storage);
+      const std::vector<uint16_t> aux = storageRows(activations(Inputs::Dense, storage, N), N, storage, storage);
+      const std::string label = std::string(fmtName(fi)) + " " + epilogueName(e) + " leading inputs";
+      const Outcome expected = run(backend, linear, plan, compact, nullptr, x, aux, kPoisonNaN, N, label);
+      const Outcome got = run(backend, linear, plan, view, nullptr, x, aux, kPoisonNaN, N, label);
+      if (got.output != expected.output) fail(label + ": differs from the repacked leading inputs");
+    }
+  }
+  section("leading inputs: " + std::to_string(FMT_COUNT) + " formats plain/residual/up-with-gate, a view of 512 of "
+          "1024 inputs equal to them repacked");
+}
+
 // ---------------------------------------------------------------- split visibility
 // Two projections of a decode step run back to back and share one split scratch, as every GGUF projection of a step
 // does, at each pair of K splits the tile's policy (Apple9: register, Apple10: staged) picks for 8-80 cores. The
@@ -749,6 +790,7 @@ int main(int argc, char **argv) {
         gateUpPairs(backend, linear, tile);
       }
       prefill(backend, linear);
+      leadingInputs(backend, linear);
       // The 27B out_proj then down, and gdn_in then gate/up: K 6144, 17408 and 5120.
       const SplitOperand out = splitOperand(backend, Q4K, {5120, 6144}, LinearEpilogue::Residual);
       const SplitOperand down = splitOperand(backend, Q6K, {5120, 17408}, LinearEpilogue::Residual);

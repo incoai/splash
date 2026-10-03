@@ -586,6 +586,8 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
   }
   requireAffineProjection(p, w.matrix);
   if (gate) requireAffineProjection(*gate, w.matrix);
+  if (p.planeInputSize() != p.inputSize && (w.phase != LinearPhase::Prefill || selected.usesSimdgroup()))
+    throw std::invalid_argument("a view of leading inputs runs only the prefill tiles");
   const AffineWeights &weights = p.affine();
   if (selected.usesSimdgroup()) {
     if (b.prepared.layout != LinearInput::Table64 || !b.prepared.source.sameView(b.input))
@@ -605,7 +607,7 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
   const auto dispatch = [&](std::string_view name,
       std::initializer_list<metal::MetalBuffer> bindings) {
     if (w.phase == LinearPhase::Prefill)
-      graph.add(std::string(name), bindings, Q4Params{n, k},
+      graph.add(std::string(name), bindings, Q4PrefillParams{n, k, p.planeInputSize()},
           {selected.storageRows() / kAffinePrefillTileRows, n / selected.tileColumns(), 1},
           {selected.threadsPerThreadgroup(), 1, 1});
     else {

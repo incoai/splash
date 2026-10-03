@@ -7,9 +7,9 @@
 #include <stdint.h>
 #endif
 
-// A Q4 projection's matrix, for prefill and the decode tiles whose grid
-// covers it (a K-split tile reads its split count from the grid). Separate
-// from ops::LinearMatrix so host-only fields cannot change the ABI.
+// A Q4 projection's matrix, for the decode tiles whose grid covers it (a
+// K-split tile reads its split count from the grid). Separate from
+// ops::LinearMatrix so host-only fields cannot change the ABI.
 struct Q4Params {
   uint32_t output_size;
   uint32_t input_size;
@@ -17,6 +17,18 @@ struct Q4Params {
 
 static_assert(sizeof(Q4Params) == 8,
               "Q4 projection parameters are 8 bytes on both sides");
+
+// A Q4 projection's matrix for prefill. plane_input_size: the inputs each
+// weight row holds, of which the projection reads the first input_size
+// (0 = input_size).
+struct Q4PrefillParams {
+  uint32_t output_size;
+  uint32_t input_size;
+  uint32_t plane_input_size;
+};
+
+static_assert(sizeof(Q4PrefillParams) == 12,
+              "Q4 prefill projection parameters are 12 bytes on both sides");
 
 // The persistent decode tiles' matrix and their grid's `groups`
 // threadgroups, which stride over the column tiles. The stride is a

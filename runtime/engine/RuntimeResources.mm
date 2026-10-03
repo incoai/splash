@@ -9,6 +9,8 @@
 #import <Foundation/Foundation.h>
 
 #include <array>
+#include <chrono>
+#include <iomanip>
 #include <limits>
 #include <optional>
 #include <sstream>
@@ -166,7 +168,7 @@ RuntimeResources::RuntimeResources(
     std::unique_ptr<model::QwenStateStorage> stateStorage,
     std::unique_ptr<KvPageTier> kvTier,
     std::unique_ptr<KvPool> kvPool, std::unique_ptr<engine::Cache> cache,
-    std::optional<uint64_t> hostAvailableAtStart)
+    double aneFfnShare, std::optional<uint64_t> hostAvailableAtStart)
     : backend_(std::move(backend)), model_(std::move(model)),
       operators_(std::move(operators)),
       memoryPlan_(std::move(memoryPlan)),
@@ -174,7 +176,8 @@ RuntimeResources::RuntimeResources(
       memoryGovernor_(std::move(memoryGovernor)), kvPages_(std::move(kvPages)),
       stateStorage_(std::move(stateStorage)), kvTier_(std::move(kvTier)),
       kvPool_(std::move(kvPool)),
-      cache_(std::move(cache)), hostAvailableAtStart_(hostAvailableAtStart) {}
+      cache_(std::move(cache)), aneFfnShare_(aneFfnShare),
+      hostAvailableAtStart_(hostAvailableAtStart) {}
 
 std::unique_ptr<RuntimeResources>
 RuntimeResources::create(const RuntimeResourcesConfig &config) {
@@ -332,34 +335,41 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
   // engine lends it to model execution without inspecting its plans.
   ops::ExecutionPlans operators(device);
   model::ModelMemoryPlan modelMemoryPlan;
-  try {
-    modelMemoryPlan = model::plannedRuntimeMemory(device, package, operators, config.kvFormat);
-  } catch (const std::exception &error) {
-    throw RuntimeResourcesError(
-        RuntimeResourceStage::MemoryPlanning,
-        std::string("model allocated-size plan is invalid: ") + error.what(),
-        deviceStatusJson(device));
-  }
+  // The share of a dense target's prefill FFN split with the Neural Engine,
+  // calibrated once the serving baseline is planned; none until then.
+  double aneFfnShare = 0.0;
+  auto prepareMemory = [&]() -> EngineMemoryPlan {
+    try {
+      modelMemoryPlan =
+          model::plannedRuntimeMemory(device, package, operators, config.kvFormat, aneFfnShare);
+    } catch (const std::exception &error) {
+      throw RuntimeResourcesError(
+          RuntimeResourceStage::MemoryPlanning,
+          std::string("model allocated-size plan is invalid: ") + error.what(),
+          deviceStatusJson(device));
+    }
 
-  ModelMemoryFootprint footprint{
-      package.targetActualAllocatedBytes(),
-      package.draft.actualAllocatedBytes,
-      package.vision.actualAllocatedBytes,
-      modelMemoryPlan,
-      stateStagingBytes,
+    ModelMemoryFootprint footprint{
+        package.targetActualAllocatedBytes(),
+        package.draft.actualAllocatedBytes,
+        package.vision.actualAllocatedBytes,
+        modelMemoryPlan,
+        stateStagingBytes,
+    };
+
+    ModelMemoryProfile modelProfile{
+        package.name(), package.maximumContextTokens(),
+        package.targetKvLayout(config.kvFormat), footprint};
+    EngineMemoryPlanResult planResult =
+        evaluateEngineMemoryPlan(device, modelProfile, config.maximumMemoryBytes);
+    if (!planResult.plan) {
+      throw RuntimeResourcesError(
+          RuntimeResourceStage::MemoryPlanning, planResult.status.message,
+          planResult.status.toStatusJson(), planResult.status.describe());
+    }
+    return std::move(*planResult.plan);
   };
-
-  ModelMemoryProfile modelProfile{
-      package.name(), package.maximumContextTokens(),
-      package.targetKvLayout(config.kvFormat), footprint};
-  EngineMemoryPlanResult planResult =
-      evaluateEngineMemoryPlan(device, modelProfile, config.maximumMemoryBytes);
-  if (!planResult.plan) {
-    throw RuntimeResourcesError(
-        RuntimeResourceStage::MemoryPlanning, planResult.status.message,
-        planResult.status.toStatusJson(), planResult.status.describe());
-  }
-  EngineMemoryPlan memoryPlan = std::move(*planResult.plan);
+  EngineMemoryPlan memoryPlan = prepareMemory();
 
   RuntimeCacheIdentity cacheIdentity;
   try {
@@ -386,6 +396,61 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
       memoryGovernor->setPressure(config.memoryPressure());
     logStartup("Kernel policy for GPU family ", device.appleGpuFamily,
                " with ", device.gpuCoreCount, " cores.");
+    // The split runs at the share calibrated here, or the one the config
+    // gives, when the plan still fits with it under the governor's ceiling;
+    // a calibrated share also has to beat the GPU alone.
+    try {
+      const auto started = std::chrono::steady_clock::now();
+      ops::AneFfn::Calibration calibration;
+      if (config.aneFfnShare)
+        calibration.share = *config.aneFfnShare;
+      else
+        calibration = model::calibrateAneFfn(*backend, package, operators, config.kvFormat);
+      const auto fixed = [](double value, int digits) {
+        std::ostringstream text;
+        text << std::fixed << std::setprecision(digits) << value;
+        return text.str();
+      };
+      const std::string layer = " ms per " + std::to_string(ops::AneFfn::kRows) + "-row FFN layer";
+      const std::string calibrated =
+          " (calibrated in " +
+          fixed(std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count(), 1) + " s)";
+      if (calibration.share > 0.0) {
+        const EngineMemoryPlan unsplitMemoryPlan = memoryPlan;
+        const model::ModelMemoryPlan unsplitModelMemoryPlan = modelMemoryPlan;
+        aneFfnShare = calibration.share;
+        try {
+          EngineMemoryPlan splitMemoryPlan = prepareMemory();
+          const EngineMemoryBreakdown &split = splitMemoryPlan.breakdown();
+          const EngineMemoryBreakdown &unsplit = unsplitMemoryPlan.breakdown();
+          if (split.pipelineReserveBytes + split.runtimeOverheadReserveBytes !=
+                  unsplit.pipelineReserveBytes + unsplit.runtimeOverheadReserveBytes ||
+              split.hardBudgetBytes != unsplit.hardBudgetBytes)
+            throw std::logic_error("the split changed the memory governor ceiling");
+          memoryPlan = std::move(splitMemoryPlan);
+          if (config.aneFfnShare)
+            logStartup("Neural Engine FFN split at the given share ", fixed(calibration.share, 3), ".");
+          else
+            logStartup("Neural Engine FFN split at share ", fixed(calibration.share, 2), ": ",
+                       fixed(calibration.splitMilliseconds, 1), layer, " against ",
+                       fixed(calibration.gpuMilliseconds, 1), " ms on the GPU alone", calibrated, ".");
+        } catch (const std::exception &error) {
+          aneFfnShare = 0.0;
+          memoryPlan = unsplitMemoryPlan;
+          modelMemoryPlan = unsplitModelMemoryPlan;
+          logStartup("Neural Engine FFN split at share ", fixed(calibration.share, 2),
+                     " does not fit (", error.what(), "); the GPU runs the FFN alone.");
+        }
+      } else if (config.aneFfnShare) {
+        logStartup("The GPU runs the prefill FFN alone, as given.");
+      } else if (calibration.gpuMilliseconds > 0.0) {
+        logStartup("The GPU runs the prefill FFN alone, ", fixed(calibration.gpuMilliseconds, 1), layer,
+                   ": no Neural Engine split beats it", calibrated, ".");
+      }
+    } catch (const std::exception &error) {
+      logStartup("Neural Engine FFN split unavailable (", error.what(),
+                 "); the GPU runs the FFN alone.");
+    }
 
     // Page ids for every extent the hard budget could hold: the governor,
     // never the id range, limits the pool.
@@ -436,7 +501,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
         std::move(memoryPlan), std::move(cacheIdentity),
         std::move(memoryGovernor), std::move(kvPages), std::move(stateStorage),
         std::move(kvTier), std::move(kvPool), std::move(cache),
-        hostAvailableAtStart));
+        aneFfnShare, hostAvailableAtStart));
     return result;
   } catch (const metal::MetalAllocationError &error) {
     throw RuntimeResourcesError(RuntimeResourceStage::StorageAllocation,
@@ -457,6 +522,7 @@ model::RuntimeContext RuntimeResources::modelContext() noexcept {
       *kvPages_,
       *stateStorage_,
       operators_,
+      aneFfnShare_,
   };
 }
 

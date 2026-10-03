@@ -4,6 +4,7 @@
 #include "model/RuntimeArenas.hpp"
 
 #include "metal/CommandGraph.hpp"
+#include "ops/AneFfn.hpp"
 #include "ops/Linear.hpp"
 #include "ops/PagedAttention.hpp"
 #include "ops/PagedKv.hpp"
@@ -133,6 +134,17 @@ StateAdmission admitIdleLane(const QwenStateStorage &states,
       return activate(lane);
   }
   return {{}, StateFailure::ConcurrencyLimit};
+}
+
+std::vector<ops::SwiGluProjections> aneFfnLayers(const ModelPackage &package) {
+  const auto *dense = std::get_if<Qwen3_8Weights>(&package.target);
+  if (!dense)
+    throw std::invalid_argument("the ANE FFN split needs a dense target");
+  std::vector<ops::SwiGluProjections> layers;
+  for (const Qwen3_8LayerWeights &layer : dense->layers)
+    layers.push_back({&layer.gateProjection, &layer.upProjection,
+                      &layer.downProjection});
+  return layers;
 }
 
 } // namespace
@@ -278,6 +290,7 @@ struct Runtime::Impl {
   ops::Sampling sampling;
   QwenTarget targetModel;
   DFlashDraft draftModel;
+  std::unique_ptr<ops::AneFfn> aneFfn;
   explicit Impl(RuntimeContext value)
       : backend(value.backend),
         package(value.package),
@@ -300,6 +313,9 @@ struct Runtime::Impl {
     }
     prefillArena = std::make_unique<PrefillArena>(backend, geometry, operators);
     decodeArena = std::make_unique<DecodeArena>(backend, geometry, operators);
+    if (value.aneFfnShare > 0.0)
+      aneFfn = std::make_unique<ops::AneFfn>(
+          backend, operators.linear(), aneFfnLayers(package), value.aneFfnShare);
     penaltyTable = decodeArena->packed(DecodeTensor::PenaltyState, kLaneCount);
     preparePolicyPipelines();
   }
@@ -1230,7 +1246,7 @@ struct Runtime::Impl {
     const MetalBuffer finalHidden = targetModel.addPrefill(
         graph, std::move(buffers),
         std::span(modelSequences).first(batch.sequences.size()), batch.rows,
-        kvPages.layers());
+        kvPages.layers(), aneFfn.get());
     addPackedDraftContext(graph, batch);
 
     // A lane that finishes its prompt copies the prompt's last row to row 0
@@ -2060,6 +2076,8 @@ Runtime::prefillAsync(const BatchPlan &plan,
 
   std::array<Impl::Request *, kLaneCount> entries{};
   CommandGraph graph;
+  if (impl_->aneFfn)
+    impl_->aneFfn->begin();
   const auto captures = impl_->encodePackedPrefillGraph(graph, items, entries);
   const bool encodesImages = std::any_of(
       entries.begin(), entries.begin() + items.size(), [](const auto *entry) {
@@ -2069,11 +2087,15 @@ Runtime::prefillAsync(const BatchPlan &plan,
                            });
       });
   std::vector<ModelBatchItem> copiedItems(items.begin(), items.end());
+  if (impl_->aneFfn)
+    impl_->aneFfn->submit();
   CommandTicket command = impl_->backend.submitCommandAsync(
       graph.dispatches(), std::move(completion));
   Impl *impl = impl_.get();
   auto finish = [impl, entries, captures,
                  items = std::move(copiedItems)](CommandTiming timing) mutable {
+    if (impl->aneFfn)
+      impl->aneFfn->finish();
     for (uint32_t lane = 0; lane < items.size(); ++lane) {
       const uint64_t chunkEnd = items[lane].logicalPosition + items[lane].tokenCount;
       for (Impl::ImageState &image : entries[lane]->images) {
@@ -2627,7 +2649,9 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
 }
 
 ModelMemoryActual Runtime::actualRuntimeMemory() const {
-  return {impl_->states.actualAllocatedBytes(), impl_->prefillArena->bytes(),
+  return {impl_->states.actualAllocatedBytes(),
+          impl_->prefillArena->bytes() +
+              (impl_->aneFfn ? impl_->aneFfn->allocatedBytes() : 0),
           impl_->decodeArena->bytes(), impl_->states.stagingBytes()};
 }
 
@@ -2646,17 +2670,37 @@ ModelTelemetry Runtime::telemetry() const noexcept {
   return result;
 }
 
+ops::AneFfn::Calibration calibrateAneFfn(MetalBackend &backend, const ModelPackage &package,
+                                         const ops::ExecutionPlans &operators, kv::Format format) {
+  if (!std::holds_alternative<Qwen3_8Weights>(package.target)) return {};
+  const std::vector<ops::SwiGluProjections> layers = aneFfnLayers(package);
+  if (!ops::AneFfn::supports(layers)) return {};
+  const PrefillArena arena(backend, RuntimeGeometry::from(package, format), operators);
+  const auto p = [&](PrefillTensor tensor) { return arena.get(tensor); };
+  return ops::AneFfn::calibrate(
+      backend, operators.linear(), layers,
+      {p(PrefillTensor::Normalized), p(PrefillTensor::ProjectionSums), p(PrefillTensor::GateIntermediate),
+       p(PrefillTensor::Intermediate), p(PrefillTensor::DownProjectionSums),
+       {p(PrefillTensor::Hidden0), p(PrefillTensor::Hidden1)},
+       {.partials = p(PrefillTensor::LinearPartials),
+        .counters = p(PrefillTensor::LinearCounters),
+        .rotated = p(PrefillTensor::LinearRotated)}});
+}
+
 ModelMemoryPlan plannedRuntimeMemory(const DeviceCapabilities &device,
                                      const ModelPackage &package,
                                      const ops::ExecutionPlans &operators,
-                                     kv::Format format) {
+                                     kv::Format format, double aneFfnShare) {
   requireCompatibleModelPackage(package);
   if (device.appleGpuFamily < DeviceCapabilities::kMinimumAppleGpuFamily) {
     throw std::invalid_argument("model runtime requires Apple tensor BF16");
   }
   const RuntimeGeometry geometry = RuntimeGeometry::from(package, format);
-  return {package.stateLayout().laneBytes(),
-          plannedPrefillBytes(geometry, operators),
+  uint64_t prefillBytes = plannedPrefillBytes(geometry, operators);
+  if (aneFfnShare > 0.0) {
+    prefillBytes += ops::AneFfn::plannedBytes(aneFfnLayers(package), aneFfnShare);
+  }
+  return {package.stateLayout().laneBytes(), prefillBytes,
           plannedDecodeBytes(geometry, operators)};
 }
 

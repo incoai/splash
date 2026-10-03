@@ -70,6 +70,10 @@ struct RuntimeResourcesConfig {
   // to it when the model loaded vision and none otherwise. The wire parser
   // keeps the protocol ceiling.
   uint32_t maximumImagePatches = ops::kMaximumImagePatches;
+  // The share of the prefill FFN's Neural Engine split to run instead of
+  // calibrating one (0 runs the GPU alone), so that benchmark rounds repeat
+  // one another; the memory plan must still fit it.
+  std::optional<double> aneFfnShare;
   // The process's existing pressure observer runs before resource assembly;
   // it only publishes a level. Bootstrap checks it at Metal operation
   // boundaries; after Ready the transport control handler keeps it current.
@@ -156,6 +160,8 @@ public:
   [[nodiscard]] std::optional<uint64_t> hostAvailableAtStart() const noexcept {
     return hostAvailableAtStart_;
   }
+  // The share the prefill FFN's Neural Engine split runs at; 0 for none.
+  [[nodiscard]] double aneFfnShare() const noexcept { return aneFfnShare_; }
 
   [[nodiscard]] model::RuntimeContext modelContext() noexcept;
   [[nodiscard]] ActualMemoryReport
@@ -173,6 +179,7 @@ private:
                    std::unique_ptr<KvPageTier> kvTier,
                    std::unique_ptr<KvPool> kvPool,
                    std::unique_ptr<engine::Cache> cache,
+                   double aneFfnShare,
                    std::optional<uint64_t> hostAvailableAtStart);
 
   std::unique_ptr<metal::MetalBackend> backend_;
@@ -186,6 +193,7 @@ private:
   std::unique_ptr<KvPageTier> kvTier_;
   std::unique_ptr<KvPool> kvPool_;
   std::unique_ptr<engine::Cache> cache_;
+  double aneFfnShare_ = 0.0;
   std::optional<uint64_t> hostAvailableAtStart_;
 };
 
