@@ -6,7 +6,6 @@
 #include "Qwen3_8.hpp"
 #include "ops/Vision.hpp"
 
-#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <string>
@@ -15,6 +14,12 @@
 namespace splash::model {
 
 using TargetLayout = std::variant<Qwen3_8Layout, Qwen3_6MoeLayout>;
+
+// Where a model's weights come from: files already in the packed layout, or
+// an MLX or GGUF checkpoint prepared into cached files when it loads. The
+// vision tower is None for a model installed with --language-only.
+enum class TargetSource : uint8_t { Packed, Mlx, Gguf };
+enum class VisionSource : uint8_t { Packed, Mlx, Gguf, None };
 
 // Package metadata validated before weight buffers are loaded. The engine
 // consumes capabilities; model loading consumes the concrete layouts.
@@ -26,10 +31,21 @@ struct ModelDescriptor final {
   ModelCapabilities capabilities;
   kv::Layout targetKvLayout;
   CompositeStateLayout stateLayout;
-  // Exact bytes parsed during package inspection, including artifact digests.
-  // Synthetic descriptors retain zero; this is separate from layout identity.
-  std::array<uint8_t, 32> packageManifestSha256{};
+  // Container selection belongs to loading; runtime dispatch follows each weight.
+  TargetSource targetSource = TargetSource::Packed;
+  VisionSource visionSource = VisionSource::Packed;
 
+  // A source model's draft is a DFlash2 checkpoint; a packed package carries
+  // its draft packed.
+  [[nodiscard]] bool draftFromCheckpoint() const noexcept {
+    return targetSource != TargetSource::Packed;
+  }
+
+  // A model installed with --language-only has no vision tower: it loads no
+  // vision weights and serves no image requests.
+  [[nodiscard]] bool hasVision() const noexcept {
+    return visionSource != VisionSource::None;
+  }
   [[nodiscard]] bool valid() const noexcept;
 };
 

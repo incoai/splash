@@ -3,6 +3,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Splash</title>
+<link rel="icon" href="/favicon.ico" type="image/svg+xml">
 <style>
   * { box-sizing: border-box }
   :root {
@@ -39,7 +40,7 @@
 
   aside { position: fixed; inset: 0 auto 0 0; z-index: 20; overflow-y: auto; width: var(--sidebar); padding: 12px 8px; background: var(--side); border-right: 1px solid var(--border) }
   .brand { display: flex; align-items: center; gap: 9px; height: 38px; padding: 0 10px; font-size: 17px; font-weight: 650; letter-spacing: -.02em }
-  .brand svg { width: 19px; height: 19px }
+  .brand img { width: 19px; height: 19px }
   #new-chat { display: flex; align-items: center; gap: 10px; width: 100%; margin-top: 9px; padding: 9px 10px; border-radius: 9px; text-align: left }
   #new-chat:hover { background: var(--hover) }
   #new-chat svg { width: 18px; height: 18px }
@@ -80,6 +81,7 @@
   textarea { display: block; width: 100%; max-height: 180px; padding: 6px 0; resize: none; border: 0; outline: 0; background: transparent }
   textarea::placeholder { color: var(--muted) }
   .toolbar { display: flex; flex: none; align-items: center; gap: 5px }
+  #attach[hidden] { display: none }
   #attach { display: grid; width: 34px; height: 34px; place-items: center; border-radius: 50%; color: var(--muted) }
   #attach:hover { color: var(--text); background: var(--hover) }
   .effort { position: relative; display: flex; align-items: center; gap: 5px; padding: 5px 21px 5px 8px; border-radius: 10px; color: var(--muted); font-size: 13px; line-height: 24px }
@@ -114,7 +116,7 @@
 
 <aside id="sidebar">
   <div class="brand">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.5 2 5 13h6l-.5 9L19 11h-6z"/></svg>
+    <img src="/favicon.ico" alt="">
     Splash
   </div>
   <button id="new-chat" type="button">
@@ -146,6 +148,7 @@
   <div class="toolbar">
     <label class="effort"><span>Thinking</span>
       <select id="effort" aria-label="Thinking effort">
+        <option value="">Default</option>
         <option value="xhigh">XHigh</option>
         <option value="medium">Medium</option>
         <option value="low">Low</option>
@@ -176,9 +179,27 @@
   let messages = [];
   let attachments = [];
   let controller;
+  // Until /v1/models says otherwise; a text-only model takes no images.
+  let imagesAccepted = true;
 
   const savedEffort = storageGet(effortKey);
-  effort.value = allowedEfforts.has(savedEffort) ? savedEffort : 'xhigh';
+  effort.value = allowedEfforts.has(savedEffort) ? savedEffort : '';
+
+  function authorization() {
+    return apiKey.value ? {Authorization: `Bearer ${apiKey.value}`} : {};
+  }
+
+  async function loadModalities() {
+    try {
+      const response = await fetch('/v1/models', {headers: authorization()});
+      if (!response.ok) return;
+      const modalities = (await response.json()).data?.[0]?.input_modalities;
+      if (!Array.isArray(modalities)) return;
+      imagesAccepted = modalities.includes('image');
+      attach.hidden = !imagesAccepted;
+      if (!imagesAccepted) clearAttachments();
+    } catch { /* The server still rejects input the model cannot take. */ }
+  }
 
   function storageGet(key) {
     try {
@@ -188,8 +209,11 @@
   }
 
   function storageSet(key, value) {
-    try { localStorage.setItem(key, value); }
-    catch { /* Chat still works if browser storage is full or disabled. */ }
+    try {
+      localStorage.setItem(key, value);
+      return true;
+    }
+    catch { /* Chat still works if browser storage is full or disabled. */ return false; }
   }
 
   function cleanUserContent(content) {
@@ -230,16 +254,48 @@
     } catch { return []; }
   }
 
+  function hasImages(conversation) {
+    return conversation.messages.some(message => Array.isArray(message.content) &&
+      message.content.some(part => part.type === 'image_url'));
+  }
+
+  function withoutImages(conversation) {
+    const messages = conversation.messages.map(message => Array.isArray(message.content) ? {
+      ...message,
+      content: message.content.map(part => part.type === 'image_url' ? {type: 'text', text: '[Image not saved]'} : part)
+    } : message);
+    return {...conversation, messages};
+  }
+
   function save() {
     conversations.sort((a, b) => b.updated - a.updated);
     conversations = conversations.slice(0, 20);
-    storageSet(storeKey, JSON.stringify(conversations));
+    // Browser storage holds a few MB per site, which one photo can fill. Rather
+    // than fail every later save, store the newest chats that fit, each with its
+    // images if they still fit and without them otherwise, so a photo too large
+    // to store does not cost older chats theirs. The open page keeps its images.
+    if (!storageSet(storeKey, JSON.stringify(conversations))) {
+      const stored = [];
+      for (const conversation of conversations) {
+        const candidates = hasImages(conversation) ? [conversation, withoutImages(conversation)] : [conversation];
+        const fitting = candidates.find(candidate => storageSet(storeKey, JSON.stringify([...stored, candidate])));
+        if (!fitting) break;
+        stored.push(fitting);
+      }
+    }
     renderRecents();
   }
 
   function titleFor(text) {
     const title = text.replace(/\s+/g, ' ').trim();
     return title.length > 34 ? `${title.slice(0, 34)}…` : title;
+  }
+
+  // crypto.randomUUID exists only in secure contexts, which excludes a LAN
+  // address over plain HTTP; getRandomValues works everywhere.
+  function chatId() {
+    return Array.from(crypto.getRandomValues(new Uint8Array(16)),
+      byte => byte.toString(16).padStart(2, '0')).join('');
   }
 
   function userParts(content) {
@@ -361,7 +417,7 @@
   function persist(firstPrompt) {
     let conversation = conversations.find(item => item.id === activeId);
     if (!conversation) {
-      conversation = {id: crypto.randomUUID(), title: titleFor(firstPrompt), messages, updated: Date.now()};
+      conversation = {id: chatId(), title: titleFor(firstPrompt), messages, updated: Date.now()};
       conversations.push(conversation);
       activeId = conversation.id;
     }
@@ -472,8 +528,9 @@
       stats.hidden = false;
     }
     const delta = chunk.choices?.[0]?.delta;
-    if (!delta) return false;
-    if (delta.reasoning_content || delta.content) box.querySelector('.waiting').hidden = true;
+    // A chunk without text has nothing to show or scroll to.
+    if (!delta?.reasoning_content && !delta?.content) return false;
+    box.querySelector('.waiting').hidden = true;
     if (delta.reasoning_content) {
       assistant.reasoning_content += delta.reasoning_content;
       const details = box.querySelector('details');
@@ -511,8 +568,8 @@
     try {
       const response = await fetch('/v1/chat/completions', {
         method: 'POST',
-        headers: {'Content-Type': 'application/json', ...(apiKey.value ? {Authorization: `Bearer ${apiKey.value}`} : {})},
-        body: JSON.stringify({messages: requestMessages(), stream: true, stream_options: {include_usage: true}, reasoning_effort: effort.value}),
+        headers: {'Content-Type': 'application/json', ...authorization()},
+        body: JSON.stringify({messages: requestMessages(), stream: true, stream_options: {include_usage: true}, ...(effort.value ? {reasoning_effort: effort.value} : {})}),
         signal: controller.signal
       });
       if (!response.ok) throw new Error((await response.json()).error?.message || response.statusText);
@@ -561,10 +618,12 @@
   });
   attach.addEventListener('click', () => imageInput.click());
   imageInput.addEventListener('change', () => {
-    addImages(imageInput.files).catch(console.error);
+    if (imagesAccepted) addImages(imageInput.files).catch(console.error);
     imageInput.value = '';
   });
   input.addEventListener('paste', event => {
+    // Without image input the browser pastes as usual.
+    if (!imagesAccepted) return;
     const images = Array.from(event.clipboardData?.items || [])
       .filter(item => item.type.startsWith('image/'))
       .map(item => item.getAsFile())
@@ -579,6 +638,7 @@
     if (event.isComposing || event.keyCode === 229) return;
     if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); complete(); }
   });
+  apiKey.addEventListener('change', loadModalities);
   $('#new-chat').addEventListener('click', newChat);
   $('#mobile-new').addEventListener('click', newChat);
   $('#menu').addEventListener('click', () => document.body.classList.add('menu-open'));
@@ -586,5 +646,6 @@
   renderChat();
   renderRecents();
   updateComposer();
+  loadModalities();
 </script>
 </html>

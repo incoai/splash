@@ -1,5 +1,7 @@
+import contextlib
 import fcntl
 import hashlib
+import io
 import json
 import os
 import shlex
@@ -12,7 +14,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from dev.tools import package
+from dev.tools import package, publish_test
 from install import paths
 
 
@@ -29,7 +31,7 @@ class PackageTests(unittest.TestCase):
                 (root / folder).mkdir(parents=True)
                 for name in names:
                     (root / folder / name).write_text("fixture")
-            for name in ("LICENSE",):
+            for name in package.LICENSE_FILES:
                 (root / name).write_text("fixture")
             (root / "install/completions/official-models.txt").write_text(
                 "company/Published\n"
@@ -61,7 +63,7 @@ class PackageTests(unittest.TestCase):
                     mock.patch("sys.stdout"),
                 ):
                     package.main(["--version", version, "--macos-min", "26.4"])
-                self.assertEqual(run.call_count, 3)
+                self.assertEqual(run.call_count, 4)
                 with tarfile.open(
                     root / f"dist/splash-{version}-arm64-macos26.tar.gz"
                 ) as archive:
@@ -89,7 +91,7 @@ class PackageTests(unittest.TestCase):
                 (root / folder).mkdir(parents=True)
                 for name in names:
                     (root / folder / name).write_text("fixture")
-            for name in ("LICENSE",):
+            for name in package.LICENSE_FILES:
                 (root / name).write_text("license")
             completions = root / "install/completions"
             completions.mkdir()
@@ -97,7 +99,9 @@ class PackageTests(unittest.TestCase):
                 "models",
                 "_splash",
                 "splash.bash",
+                "splash.fish",
                 "official-models.txt",
+                "suggested-models.txt",
             }
             for name in completion_names:
                 (completions / name).write_text(f"fixture {name}\n")
@@ -111,7 +115,14 @@ class PackageTests(unittest.TestCase):
                 package.stage_runtime(stage, "test")
             self.assertEqual(
                 {p.name for p in stage.iterdir()},
-                {"install", "server", "engine", "LICENSE", "release.json"},
+                {
+                    "install",
+                    "server",
+                    "engine",
+                    "LICENSE",
+                    "THIRD_PARTY_NOTICES",
+                    "release.json",
+                },
             )
             self.assertEqual(
                 {p.name for p in (stage / "install").iterdir()},
@@ -135,6 +146,11 @@ class PackageTests(unittest.TestCase):
             self.assertNotIn(
                 "catalog_sha256", json.loads((stage / "release.json").read_text())
             )
+
+    def test_every_installer_module_ships(self):
+        # The packaged launcher and installer import these by module name.
+        modules = {path.name for path in (package.ROOT / "install").glob("*.py")}
+        self.assertLessEqual(modules, set(package.INSTALL_FILES))
 
     def test_packaged_paths_keep_user_data_outside_versioned_prefix(self):
         source = Path(paths.__file__).read_text()
@@ -242,6 +258,7 @@ puts SplashMacOSRequirement.check
             completion_entries = (
                 ("share/zsh/site-functions/_splash", "_splash"),
                 ("etc/bash_completion.d/splash", "splash.bash"),
+                ("share/fish/vendor_completions.d/splash.fish", "splash.fish"),
             )
             old_assets = previous / "libexec/install/completions"
             old_assets.mkdir(parents=True)
@@ -260,7 +277,12 @@ puts SplashMacOSRequirement.check
             source = root / "source"
             assets = source / "install/completions"
             assets.mkdir(parents=True)
-            for name in ("_splash", "splash.bash", "official-models.txt"):
+            for name in (
+                "_splash",
+                "splash.bash",
+                "splash.fish",
+                "official-models.txt",
+            ):
                 (assets / name).write_text(f"fixture {name}\n")
             (assets / "models").write_text("#!/bin/sh\nprintf '%s\\n' new/model\n")
             (assets / "models").chmod(0o755)
@@ -303,7 +325,7 @@ class Formula
   [:desc, :homepage, :url, :version, :sha256, :license, :depends_on, :test].each do |name|
     define_singleton_method(name) { |*args, &block| }
   end
-  attr_reader :libexec, :opt_libexec, :bin, :zsh_completion, :bash_completion
+  attr_reader :libexec, :opt_libexec, :bin, :zsh_completion, :bash_completion, :fish_completion
   def initialize(prefix, opt)
     @libexec = prefix/"libexec"
     @opt_libexec = opt/"libexec"
@@ -311,6 +333,7 @@ class Formula
     @bin.mkpath
     @zsh_completion = prefix/"share/zsh/site-functions"
     @bash_completion = prefix/"etc/bash_completion.d"
+    @fish_completion = prefix/"share/fish/vendor_completions.d"
   end
   def chmod(mode, path); File.chmod(mode, path); end
   def odie(message); raise message; end
@@ -362,7 +385,12 @@ class InstallerTests(unittest.TestCase):
         self.app = self.root / "home/Library/Application Support/Splash/app"
         self.command = self.bin / "splash"
 
-    def publish(self, version, help_status=0, completions=True):
+    def publish(
+        self,
+        version,
+        help_status=0,
+        completions=("splash.bash", "_splash", "splash.fish"),
+    ):
         name = f"splash-{version}-arm64-macos26"
         staging = self.root / "staging"
         release = staging / name
@@ -380,7 +408,7 @@ class InstallerTests(unittest.TestCase):
         if completions:
             assets = release / "install/completions"
             assets.mkdir()
-            for asset in ("splash.bash", "_splash"):
+            for asset in completions:
                 (assets / asset).write_text(
                     f"SPLASH_COMPLETION_TEST_VERSION='{version}'\n"
                 )
@@ -456,6 +484,10 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(self.completion_version(), "1.0")
         self.assertIn(
             'source "$HOME/Library/Application Support/Splash/app/current/install/completions/splash.bash"',
+            first.stdout,
+        )
+        self.assertIn(
+            'source "$HOME/Library/Application Support/Splash/app/current/install/completions/splash.fish"',
             first.stdout,
         )
         self.assertIn("Zsh needs compinit initialized", first.stdout)
@@ -538,11 +570,19 @@ class InstallerTests(unittest.TestCase):
     def test_older_release_without_completions_does_not_print_a_broken_source_command(
         self,
     ):
-        self.publish("1.0", completions=False)
+        self.publish("1.0", completions=())
         result = self.install()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("source ", result.stdout)
         self.assertEqual(self.current(), "splash-1.0-arm64-macos26")
+
+    def test_release_without_fish_completion_still_offers_bash_and_zsh(self):
+        self.publish("1.0", completions=("splash.bash", "_splash"))
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("completions/splash.bash", result.stdout)
+        self.assertIn("completions/_splash", result.stdout)
+        self.assertNotIn("splash.fish", result.stdout)
 
     def test_failed_same_version_check_preserves_absolute_and_relative_current(self):
         self.publish("1.0")
@@ -602,6 +642,66 @@ class InstallerTests(unittest.TestCase):
             self.installed(),
             ["splash-1.0-arm64-macos26", "splash-3.0-arm64-macos26"],
         )
+
+    def test_printed_tester_instructions_install_from_the_published_repo(self):
+        self.publish("1.0")
+        (self.root / "dist").symlink_to(self.releases)
+        installer = self.root / "dev/tools/install.sh"
+        installer.parent.mkdir(parents=True)
+        shutil.copy(package.ROOT / "dev/tools/install.sh", installer)
+        hub = self.root / "hub"
+        hub.mkdir()
+
+        def upload(path_or_fileobj, path_in_repo, repo_id):
+            self.assertEqual(repo_id, "owner/splash-releases")
+            data = path_or_fileobj
+            if not isinstance(data, bytes):
+                data = Path(data).read_bytes()
+            (hub / path_in_repo).write_bytes(data)
+
+        printed = io.StringIO()
+        with (
+            mock.patch.object(publish_test, "ROOT", self.root),
+            mock.patch.object(publish_test, "HfApi") as api,
+            contextlib.redirect_stdout(printed),
+        ):
+            api.return_value.upload_file.side_effect = upload
+            publish_test.main(["--version", "1.0", "--repo", "owner/splash-releases"])
+        # This curl serves the uploaded files only to requests that carry the
+        # token, as the private repo does.
+        commands = self.root / "commands"
+        commands.mkdir()
+        curl = commands / "curl"
+        curl.write_text(
+            f"#!{sys.executable}\n"
+            "import shutil, sys\n"
+            "arguments = sys.argv[1:]\n"
+            "config = arguments[arguments.index('--config') + 1]\n"
+            "header = (sys.stdin if config == '-' else open(config)).read()\n"
+            "if 'Authorization: Bearer test-token' not in header: sys.exit(22)\n"
+            "prefix = 'https://huggingface.co/owner/splash-releases/resolve/main/'\n"
+            "if not arguments[-1].startswith(prefix): sys.exit(22)\n"
+            f"source = open({str(hub)!r} + '/' + arguments[-1][len(prefix):], 'rb')\n"
+            "target = sys.stdout.buffer\n"
+            "if '-o' in arguments:\n"
+            "    target = open(arguments[arguments.index('-o') + 1], 'wb')\n"
+            "shutil.copyfileobj(source, target)\n"
+        )
+        curl.chmod(0o755)
+        result = subprocess.run(
+            ["/bin/sh", "-c", printed.getvalue().split("run:\n", 1)[1]],
+            env={
+                "PATH": str(commands) + os.pathsep + os.environ["PATH"],
+                "HOME": str(self.root / "home"),
+                "SPLASH_TOKEN": "test-token",
+                "SPLASH_BIN_DIR": str(self.bin),
+            },
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.current(), "splash-1.0-arm64-macos26")
+        self.assertIn("app/current/install/launcher.py", self.command.read_text())
 
 
 if __name__ == "__main__":

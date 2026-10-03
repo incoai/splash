@@ -3,7 +3,6 @@
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 
-#include <array>
 #include <cstdint>
 #include <span>
 
@@ -21,17 +20,6 @@ struct DraftAttentionShape final {
   bool operator==(const DraftAttentionShape &) const = default;
 };
 
-// These configurations vary the surrounding convolution, QKV preparation and
-// reorder phases. The compiled attention core stays M32/N128/D128 with eight
-// query rows, 256 threads, a fixed number of ring splits per KV head and the
-// semantic 2048 window.
-struct DraftAttentionConfiguration final {
-  // Zero uses the full element/task grid. Nonzero selects a persistent group
-  // count for the surrounding phases.
-  uint32_t groups = 0;
-  bool operator==(const DraftAttentionConfiguration &) const = default;
-};
-
 struct DraftAttentionWorkspace final {
   uint64_t convolutionBytes = 0;
   uint64_t qkvBytes = 0;
@@ -40,27 +28,22 @@ struct DraftAttentionWorkspace final {
   uint64_t queryValuesBytes = 0;
 };
 
-// Constructed only by DraftAttention::plan so configuration, physical rows
-// and workspace cannot disagree. The grouped-queries tensor also carries the
+// Constructed only by DraftAttention::plan so the shape, physical rows and
+// workspace cannot disagree. The grouped-queries tensor also carries the
 // split partials of the attention core behind the query rows, so the core
 // needs no device scratch beyond these tensors.
 class DraftAttentionPlan final {
 public:
   [[nodiscard]] DraftAttentionShape shape() const noexcept { return shape_; }
   [[nodiscard]] uint32_t lanes() const noexcept { return lanes_; }
-  [[nodiscard]] DraftAttentionConfiguration configuration() const noexcept {
-    return configuration_;
-  }
   [[nodiscard]] DraftAttentionWorkspace workspace() const noexcept;
 
 private:
-  DraftAttentionPlan(DraftAttentionShape shape, uint32_t lanes,
-                     DraftAttentionConfiguration configuration)
-      : shape_(shape), lanes_(lanes), configuration_(configuration) {}
+  DraftAttentionPlan(DraftAttentionShape shape, uint32_t lanes)
+      : shape_(shape), lanes_(lanes) {}
 
   DraftAttentionShape shape_;
   uint32_t lanes_;
-  DraftAttentionConfiguration configuration_;
 
   friend class DraftAttention;
 };
@@ -96,21 +79,9 @@ struct DraftDecodeAttentionBuffers final {
 
 class DraftAttention final {
 public:
-  [[nodiscard]] static std::span<const DraftAttentionConfiguration>
-  candidates(DraftAttentionShape shape);
-  [[nodiscard]] static DraftAttentionPlan
-  plan(DraftAttentionShape shape, uint32_t lanes,
-       DraftAttentionConfiguration configuration = {});
+  [[nodiscard]] static DraftAttentionPlan plan(DraftAttentionShape shape,
+                                               uint32_t lanes);
 
-  static void captureTargetHidden(
-      metal::CommandGraph &graph, metal::MetalBuffer source,
-      metal::MetalBuffer captured, uint32_t rows, uint32_t captureSlot,
-      uint32_t sourceStart, uint32_t destinationStart, uint32_t hiddenWidth,
-      uint32_t targetWidth);
-  static void gatherLastRows(metal::CommandGraph &graph,
-                             metal::MetalBuffer source,
-                             metal::MetalBuffer destination, uint32_t rows,
-                             uint32_t width);
   static void addConvolution(metal::CommandGraph &graph,
                              DraftConvolutionBuffers buffers,
                              const DraftAttentionPlan &plan,
@@ -118,29 +89,31 @@ public:
   static void addPrepare(metal::CommandGraph &graph,
                          DraftPrepareBuffers buffers,
                          const DraftAttentionPlan &plan);
-  static void addDecode(
-      metal::CommandGraph &graph, DraftDecodeAttentionBuffers buffers,
-      std::span<const uint32_t> cacheLengths, uint32_t cacheStride,
-      const DraftAttentionPlan &plan);
+  static void addDecode(metal::CommandGraph &graph,
+                        DraftDecodeAttentionBuffers buffers,
+                        std::span<const uint32_t> cacheLengths,
+                        const DraftAttentionPlan &plan);
   static void addReorder(metal::CommandGraph &graph,
                          metal::MetalBuffer grouped,
                          metal::MetalBuffer packed,
                          const DraftAttentionPlan &plan);
+  // The context writers. A row of contextKv holds its keys, then its values
+  // (kvHeads * headDimension each); its normalized, rotated keys and its
+  // values go to its position's slot of the ring.
   static void addContextPrefill(
-      metal::CommandGraph &graph, metal::MetalBuffer contextQkv,
+      metal::CommandGraph &graph, metal::MetalBuffer contextKv,
       metal::MetalBuffer keyNorm, metal::MetalBuffer ropeCos,
       metal::MetalBuffer ropeSin, metal::MetalBuffer keys,
-      metal::MetalBuffer values, uint32_t tokens, uint32_t cacheStride,
-      uint32_t startPosition, DraftAttentionShape shape);
+      metal::MetalBuffer values, uint32_t tokens, uint32_t startPosition,
+      DraftAttentionShape shape);
   static void addContextCommit(
-      metal::CommandGraph &graph, metal::MetalBuffer contextQkv,
+      metal::CommandGraph &graph, metal::MetalBuffer contextKv,
       metal::MetalBuffer keyNorm, metal::MetalBuffer ropeCos,
       metal::MetalBuffer ropeSin,
       std::span<const metal::MetalBuffer> persistentKeys,
       std::span<const metal::MetalBuffer> persistentValues,
       metal::MetalBuffer retainedCounts,
-      std::span<const uint32_t> startPositions, uint32_t cacheStride,
-      DraftAttentionShape shape, uint32_t lanes);
+      std::span<const uint32_t> startPositions, DraftAttentionShape shape);
 };
 
 } // namespace splash::ops

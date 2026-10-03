@@ -1,5 +1,6 @@
 import base64
 import io
+import math
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -85,6 +86,29 @@ def document_block(payload=None, **fields):
     }
 
 
+def full_render_limits():
+    """The worker's limits for a request whose budget is untouched."""
+    return documents.RenderLimits(
+        documents.MAX_PAGES,
+        documents.MAX_PAGE_PIXELS,
+        documents.MAX_TEXT_CHARACTERS,
+        documents.MAX_RENDERED_BYTES,
+        documents.MAX_REQUEST_DOCUMENT_BYTES,
+    )
+
+
+def render_pdf(payload=None, budget=None):
+    """A PDF's page text and image parts, rendered as request preparation
+    renders a file part."""
+    encoded = base64.b64encode(pdf_bytes() if payload is None else payload).decode()
+    return documents.file_content(
+        {"file_data": encoded},
+        budget=documents.DocumentBudget(deadline=math.inf)
+        if budget is None
+        else budget,
+    )
+
+
 class DocumentTests(unittest.TestCase):
     def test_owner_password_does_not_prevent_opening_but_user_password_does(self):
         fixtures = Path(__file__).parents[1] / "fixtures" / "documents"
@@ -92,30 +116,37 @@ class DocumentTests(unittest.TestCase):
         locked = (fixtures / "open-password.pdf").read_bytes()
         # Both fixtures contain the same page, encrypted with AES-128. The
         # first has an empty opening password; the second requires one.
-        parts = documents.document_content(document_block(owner))
-        self.assertIn("ALPHA 42", parts[0]["text"])
+        self.assertIn("ALPHA 42", render_pdf(owner)[0]["text"])
         with self.assertRaisesRegex(APIError, "opening password"):
-            documents.document_content(document_block(locked))
+            render_pdf(locked)
 
     def setUp(self):
         with documents._pdf_lock:
             documents._cache.clear()
             documents._cache_bytes = 0
 
-    def test_pdf_keeps_page_text_images_and_document_context(self):
-        parts = documents.document_content(
-            document_block(pdf_bytes(pages=2), title="Report", context="Local fixture")
-        )
+    def test_document_block_puts_title_and_context_before_its_pdf(self):
+        block = document_block(title="Report", context="Local fixture")
         self.assertEqual(
-            parts[:2],
+            documents.document_parts(block),
             [
                 {"type": "text", "text": "Report\n"},
                 {"type": "text", "text": "Local fixture\n"},
+                {
+                    "type": "file",
+                    "file": {
+                        "file_data": documents.PDF_DATA_URL_PREFIX
+                        + block["source"]["data"]
+                    },
+                },
             ],
         )
-        self.assertIn("ALPHA 42 page 1", parts[2]["text"])
-        self.assertIn("ALPHA 42 page 2", parts[4]["text"])
-        for part in (parts[3], parts[5]):
+
+    def test_pdf_keeps_page_text_and_images(self):
+        parts = render_pdf(pdf_bytes(pages=2))
+        self.assertIn("ALPHA 42 page 1", parts[0]["text"])
+        self.assertIn("ALPHA 42 page 2", parts[2]["text"])
+        for part in (parts[1], parts[3]):
             payload = images.decode_data_url(part["image_url"]["url"])
             with Image.open(io.BytesIO(payload)) as page:
                 self.assertLessEqual(
@@ -149,47 +180,61 @@ class DocumentTests(unittest.TestCase):
 
         with mock.patch.object(pdfium.PdfPage, "render", render):
             documents.render_pages(
-                pdf_bytes(width=14400, height=14400), documents.DocumentBudget()
+                pdf_bytes(width=14400, height=14400),
+                documents.DocumentBudget(deadline=math.inf),
+                full_render_limits(),
             )
         self.assertEqual(len(sizes), 1)
 
-    def test_input_types_invalid_pdf_and_encryption_are_rejected(self):
+    def test_invalid_document_blocks_are_rejected(self):
+        numeric_data = document_block()
+        numeric_data["source"]["data"] = 4
         invalid = [
             ({"type": "document"}, "base64 application/pdf"),
-            (document_block(b"not a PDF"), "could not be decoded"),
-            (document_block(b""), "could not be decoded"),
-            (document_block(pdf_bytes(encrypted=True)), "opening password"),
             (document_block(title=123), "title must be a string"),
             (
                 document_block(citations={"enabled": True}),
                 "citations are not supported",
             ),
+            (numeric_data, "PDF data must be a base64 string"),
         ]
         for block, message in invalid:
             with (
                 self.subTest(message=message),
                 self.assertRaisesRegex(APIError, message),
             ):
-                documents.document_content(block)
-        for encoded in ("***", "é", 4):
-            block = document_block()
-            block["source"]["data"] = encoded
+                documents.document_parts(block)
+
+    def test_invalid_pdf_and_encryption_are_rejected(self):
+        for payload, message in (
+            (b"not a PDF", "could not be decoded"),
+            (b"", "could not be decoded"),
+            (pdf_bytes(encrypted=True), "opening password"),
+        ):
+            with (
+                self.subTest(message=message),
+                self.assertRaisesRegex(APIError, message),
+            ):
+                render_pdf(payload)
+        for encoded in ("***", "é"):
             with (
                 self.subTest(encoded=encoded),
-                self.assertRaisesRegex(APIError, "base64"),
+                self.assertRaisesRegex(APIError, "PDF data is not valid base64"),
             ):
-                documents.document_content(block)
+                documents.file_content(
+                    {"file_data": encoded},
+                    budget=documents.DocumentBudget(deadline=math.inf),
+                )
 
     def test_document_bounds_fail_before_processing_more_content(self):
         import pypdfium2 as pdfium
 
-        block = document_block()
         with (
             mock.patch.object(documents, "MAX_PDF_BYTES", 3),
             mock.patch.object(documents, "_render") as render,
         ):
             with self.assertRaisesRegex(APIError, "size limit"):
-                documents.document_content(block)
+                render_pdf()
             render.assert_not_called()
         for payload, message in (
             (pdf_bytes(pages=0), "could not be decoded"),
@@ -197,24 +242,23 @@ class DocumentTests(unittest.TestCase):
         ):
             with mock.patch.object(pdfium.PdfPage, "render") as render:
                 with self.assertRaisesRegex(APIError, message):
-                    documents.document_content(document_block(payload))
+                    render_pdf(payload)
                 render.assert_not_called()
         with (
             mock.patch.object(documents, "MAX_TEXT_CHARACTERS", 3),
             mock.patch.object(pdfium.PdfPage, "render") as render,
         ):
             with self.assertRaisesRegex(APIError, "text exceeds"):
-                documents.document_content(block)
+                render_pdf()
             render.assert_not_called()
         with mock.patch.object(documents, "MAX_RENDERED_BYTES", 1):
             with self.assertRaisesRegex(APIError, "rendered PDF exceeds"):
-                documents.document_content(block)
+                render_pdf()
 
     def test_cache_reuses_rendered_pages_and_returns_independent_parts(self):
-        block = document_block()
         with mock.patch.object(documents, "_render", wraps=documents._render) as render:
             with ThreadPoolExecutor(max_workers=4) as executor:
-                results = list(executor.map(documents.document_content, [block] * 8))
+                results = list(executor.map(render_pdf, [pdf_bytes()] * 8))
         self.assertEqual(render.call_count, 1)
         self.assertIs(results[0][0]["text"], results[1][0]["text"])
         self.assertIs(
@@ -224,86 +268,85 @@ class DocumentTests(unittest.TestCase):
         results[0][1]["image_url"]["url"] = "changed"
         self.assertIn("ALPHA 42", results[1][0]["text"])
         self.assertTrue(results[1][1]["image_url"]["url"].startswith("data:image/png"))
-        self.assertIn("ALPHA 42", documents.document_content(block)[0]["text"])
+        self.assertIn("ALPHA 42", render_pdf()[0]["text"])
 
     def test_small_pdf_uses_native_page_limit_instead_of_twenty_pages(self):
-        from server.protocol import ProtocolLimits
+        from server.protocol import MAX_IMAGE_SPANS
 
-        self.assertEqual(documents.MAX_PAGES, ProtocolLimits().max_image_spans)
+        self.assertEqual(documents.MAX_PAGES, MAX_IMAGE_SPANS)
         for pages in (21, documents.MAX_PAGES):
             with self.subTest(pages=pages):
-                parts = documents.document_content(
-                    document_block(pdf_bytes(pages=pages, width=64, height=64))
-                )
+                parts = render_pdf(pdf_bytes(pages=pages, width=64, height=64))
                 self.assertEqual(len(parts), pages * 2)
                 self.assertIn(f"PDF page {pages}:", parts[-2]["text"])
 
     def test_source_larger_than_ten_mib_within_conversion_budget(self):
         payload = pdf_bytes(padding_bytes=11 * 1024 * 1024)
-        budget = documents.DocumentBudget()
-        parts = documents.document_content(document_block(payload), budget=budget)
+        budget = documents.DocumentBudget(deadline=math.inf)
+        parts = render_pdf(payload, budget)
         self.assertIn("ALPHA 42", parts[0]["text"])
         self.assertLess(
             budget.remaining_bytes, documents.MAX_REQUEST_DOCUMENT_BYTES - len(payload)
         )
 
     def test_pdf_pages_and_source_bytes_share_request_budget_on_cache_hits(self):
-        block = document_block(pdf_bytes(pages=2))
-        documents.document_content(block)
+        payload = pdf_bytes(pages=2)
+        render_pdf(payload)
         with mock.patch.object(documents, "_render") as render:
-            budget = documents.DocumentBudget(remaining_pages=3)
-            documents.document_content(block, budget=budget)
+            budget = documents.DocumentBudget(deadline=math.inf, remaining_pages=3)
+            render_pdf(payload, budget)
             self.assertEqual(budget.remaining_pages, 1)
             with self.assertRaisesRegex(APIError, "request page limit"):
-                documents.document_content(block, budget=budget)
+                render_pdf(payload, budget)
             with self.assertRaisesRegex(APIError, "request size limit"):
-                documents.document_content(
-                    block, budget=documents.DocumentBudget(remaining_bytes=1)
+                render_pdf(
+                    payload,
+                    documents.DocumentBudget(deadline=math.inf, remaining_bytes=1),
                 )
             render.assert_not_called()
 
     def test_cold_pdf_obeys_remaining_page_budget(self):
         with self.assertRaisesRegex(APIError, "pages"):
-            documents.document_content(
-                document_block(pdf_bytes(pages=3)),
-                budget=documents.DocumentBudget(remaining_pages=2),
+            render_pdf(
+                pdf_bytes(pages=3),
+                documents.DocumentBudget(deadline=math.inf, remaining_pages=2),
             )
         self.assertFalse(documents._cache)
 
     def test_request_budget_counts_repeated_pdfs_with_and_without_cache(self):
-        block = document_block()
-        documents.document_content(block)
+        render_pdf()
         size = sum(page.size for pages in documents._cache.values() for page in pages)
-        source_size = len(base64.b64decode(block["source"]["data"]))
+        source_size = len(pdf_bytes())
         for keep_cache in (False, True):
             self.setUp()
             budget = documents.DocumentBudget(
-                remaining_bytes=2 * (size + source_size) - 1
+                deadline=math.inf, remaining_bytes=2 * (size + source_size) - 1
             )
             with mock.patch.object(
                 documents, "_render", wraps=documents._render
             ) as render:
-                documents.document_content(block, budget=budget)
+                render_pdf(budget=budget)
                 if not keep_cache:
                     self.setUp()
                 with self.assertRaisesRegex(APIError, "size limit"):
-                    documents.document_content(block, budget=budget)
+                    render_pdf(budget=budget)
             self.assertEqual(render.call_count, 1 if keep_cache else 2)
             self.assertEqual(budget.remaining_bytes, size - 1)
 
     def test_shared_budget_error_matches_on_cold_and_cached_pdf(self):
         payload = pdf_bytes()
-        block = document_block(payload)
         for cached in (False, True):
             for remaining in (len(payload), len(payload) + 1):
                 with self.subTest(cached=cached, remaining=remaining):
                     self.setUp()
                     if cached:
-                        documents.document_content(block)
+                        render_pdf(payload)
                     with self.assertRaises(APIError) as raised:
-                        documents.document_content(
-                            block,
-                            budget=documents.DocumentBudget(remaining_bytes=remaining),
+                        render_pdf(
+                            payload,
+                            documents.DocumentBudget(
+                                deadline=math.inf, remaining_bytes=remaining
+                            ),
                         )
                     self.assertEqual(raised.exception.status, 400)
                     self.assertEqual(
@@ -311,20 +354,16 @@ class DocumentTests(unittest.TestCase):
                         "PDF sources and rendered pages exceed the shared request size limit",
                     )
                     self.assertEqual(bool(documents._cache), cached)
-                    self.assertIn(
-                        "ALPHA 42", documents.document_content(block)[0]["text"]
-                    )
+                    self.assertIn("ALPHA 42", render_pdf(payload)[0]["text"])
 
     def test_waiting_for_renderer_expires_without_decoding_more_pdf_bytes(self):
-        block = document_block()
         with (
             documents._pdf_lock,
             mock.patch.object(documents.base64, "b64decode") as decode,
         ):
             with self.assertRaises(APIError) as raised:
-                documents.document_content(
-                    block,
-                    budget=documents.DocumentBudget(deadline=time.monotonic() + 0.01),
+                render_pdf(
+                    budget=documents.DocumentBudget(deadline=time.monotonic() + 0.01)
                 )
             self.assertEqual(raised.exception.status, 504)
             self.assertEqual(raised.exception.code, "request_timeout")
@@ -346,16 +385,14 @@ class DocumentTests(unittest.TestCase):
 
         with mock.patch.object(pdfium.PdfPage, "render", render):
             with self.assertRaises(APIError) as raised:
-                documents.render_pages(pdf_bytes(pages=2), budget)
+                documents.render_pages(pdf_bytes(pages=2), budget, full_render_limits())
         self.assertEqual(raised.exception.code, "request_timeout")
         self.assertEqual(len(handles), 3)
         self.assertTrue(all(handle.raw is None for handle in handles))
         self.assertFalse(documents._cache)
         self.assertEqual(documents._cache_bytes, 0)
         self.assertFalse(documents._pdf_lock.locked())
-        self.assertIn(
-            "ALPHA 42", documents.document_content(document_block())[0]["text"]
-        )
+        self.assertIn("ALPHA 42", render_pdf()[0]["text"])
 
     def test_cache_evicts_by_bytes_and_entry_count(self):
         page = documents.Page("text", "image")
@@ -367,7 +404,7 @@ class DocumentTests(unittest.TestCase):
                 mock.patch.object(documents, "CACHE_ENTRIES", entries),
             ):
                 for payload in (b"first", b"second", b"first"):
-                    documents.document_content(document_block(payload))
+                    render_pdf(payload)
                 self.assertEqual(render.call_count, 3)
                 self.assertEqual(len(documents._cache), 1)
                 self.assertLessEqual(documents._cache_bytes, budget)

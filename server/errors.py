@@ -25,11 +25,8 @@ class APIError(Exception):
         )
 
 
-class NativeError(Exception):
-    def __init__(self, code, message):
-        super().__init__(message)
-        self.code = code
-        self.message = message
+class ConstraintError(Exception):
+    """The output grammar rejected a token or has no valid next token."""
 
 
 class ContextLengthError(APIError):

@@ -14,11 +14,12 @@ def log_unexpected(error):
 
 
 def print_status(message, *, error=False):
-    print(
-        f"{time.strftime('%H:%M:%S')} {message}",
-        file=sys.stderr if error else sys.stdout,
-        flush=True,
-    )
+    # One write per line, newline included, so that lines written at once by
+    # request threads, or by the native runtime on the shared stderr, stay
+    # whole in a terminal or in one log file.
+    stream = sys.stderr if error else sys.stdout
+    stream.write(f"{time.strftime('%H:%M:%S')} {message}\n")
+    stream.flush()
 
 
 def print_request(record):

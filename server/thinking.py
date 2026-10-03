@@ -7,10 +7,7 @@ from pathlib import Path
 
 from cryptography.fernet import Fernet, InvalidToken
 
-if __package__:
-    from .errors import APIError
-else:
-    from errors import APIError
+from .errors import APIError
 
 
 class ThinkingKeyError(RuntimeError):

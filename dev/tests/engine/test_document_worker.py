@@ -1,10 +1,15 @@
+import math
 import subprocess
 import sys
 import unittest
 from dataclasses import asdict
 from unittest import mock
 
-from dev.tests.engine.test_documents import document_block, pdf_bytes
+from dev.tests.engine.test_documents import (
+    full_render_limits,
+    pdf_bytes,
+    render_pdf,
+)
 from server import document_worker, documents
 from server.errors import APIError
 
@@ -34,19 +39,31 @@ class DocumentWorkerTests(unittest.TestCase):
         self.assertFalse(document_worker._workers)
         self.assertFalse(documents._cache)
         self.assertFalse(documents._pdf_lock.locked())
-        self.assertIn(
-            "ALPHA 42", documents.document_content(document_block())[0]["text"]
-        )
+        self.assertIn("ALPHA 42", render_pdf()[0]["text"])
 
     def test_deadline_stops_worker_and_next_document_succeeds(self):
         children = []
         with self.sleeping_worker(children):
             with self.assertRaises(APIError) as caught:
-                document_worker.render(
-                    pdf_bytes(), asdict(documents._render_limits()), 0.1
-                )
+                document_worker.render(pdf_bytes(), asdict(full_render_limits()), 0.1)
         self.assertEqual(caught.exception.status, 504)
         self.assertEqual(caught.exception.code, "request_timeout")
+        self.assert_released(children)
+
+    def test_worker_time_limit_without_a_deadline_is_a_request_error(self):
+        children = []
+        with (
+            self.sleeping_worker(children),
+            mock.patch.object(document_worker, "MAX_SECONDS", 0.1),
+        ):
+            with self.assertRaises(APIError) as caught:
+                document_worker.render(
+                    pdf_bytes(), asdict(full_render_limits()), math.inf
+                )
+        self.assertEqual(caught.exception.status, 400)
+        self.assertEqual(
+            caught.exception.message, "PDF processing exceeded the time limit"
+        )
         self.assert_released(children)
 
     def test_memory_budget_stops_worker_without_caching_partial_output(self):
@@ -60,7 +77,7 @@ class DocumentWorkerTests(unittest.TestCase):
             ),
         ):
             with self.assertRaisesRegex(APIError, "memory limit"):
-                documents.document_content(document_block())
+                render_pdf()
         self.assert_released(children)
 
     def test_failed_measurement_stops_worker(self):
@@ -70,7 +87,7 @@ class DocumentWorkerTests(unittest.TestCase):
             mock.patch.object(document_worker, "_memory_bytes", side_effect=OSError),
         ):
             with self.assertRaises(APIError) as caught:
-                documents.document_content(document_block())
+                render_pdf()
         self.assertEqual(caught.exception.status, 503)
         self.assertEqual(caught.exception.code, "document_unavailable")
         self.assert_released(children)
@@ -80,7 +97,7 @@ class DocumentWorkerTests(unittest.TestCase):
             document_worker.subprocess, "Popen", side_effect=OSError
         ):
             with self.assertRaises(APIError) as caught:
-                documents.document_content(document_block())
+                render_pdf()
         self.assertEqual(caught.exception.status, 503)
         self.assertEqual(caught.exception.code, "document_unavailable")
         self.assertFalse(document_worker._workers)

@@ -7,12 +7,11 @@ import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
 from cryptography.fernet import Fernet
 
-from dev.tests.test_server import FakeRuntime, Harness, Plan
+from dev.tests.test_server import FakeRuntime, Harness, Plan, main_args
 from server import server as api
 from server.thinking import ThinkingCodec, ThinkingKeyError, load_thinking_key
 
@@ -144,17 +143,8 @@ class ThinkingKeyTests(unittest.TestCase):
 
     def test_main_reports_key_error_before_model_loading(self):
         server = mock.Mock()
-        args = SimpleNamespace(
-            host="127.0.0.1",
-            port=0,
-            queue_size=1,
-            allowed_host=[],
-            api_key=None,
-            no_webui=False,
-            max_request_size=api.DEFAULT_MAX_REQUEST_BYTES,
-        )
         with (
-            mock.patch.object(api, "parse_args", return_value=args),
+            mock.patch.object(api, "parse_args", return_value=main_args()),
             mock.patch.object(api.signal, "signal"),
             mock.patch.object(api, "FrontendServer", return_value=server),
             mock.patch.object(
