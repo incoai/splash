@@ -101,6 +101,21 @@ private:
   std::shared_ptr<uint64_t> pool_;
 };
 
+// A lane's snapshot whose copy a persistent tier writes while it stays in
+// RAM (persist); the copy is a DiskState.
+class KeptState final : public CompositeState {
+public:
+  explicit KeptState(std::shared_ptr<OffloadControl> control) : control_(std::move(control)) {}
+  uint64_t bytes() const noexcept override { return 64; }
+  bool canOffload() const noexcept override { return true; }
+  std::unique_ptr<StateOffload> persist(std::function<void()>) const override {
+    return std::make_unique<OffloadTicket>(control_);
+  }
+
+private:
+  std::shared_ptr<OffloadControl> control_;
+};
+
 struct RestoreControl {
   bool ready = false;
   bool success = true;
@@ -396,6 +411,8 @@ public:
     if (snapshotRoom && !snapshotRoom())
       return nullptr;
     ++snapshots;
+    if (keptTier)
+      return std::make_shared<KeptState>(keptTier);
     if (stateHeldRows)
       return std::make_shared<RowsHoldingState>(cacheUnits, stateHeldRows);
     return std::make_shared<State>(evictedStateBytes);
@@ -494,6 +511,8 @@ public:
   uint32_t snapshotAttempts = 0;
   uint32_t diskSnapshots = 0;
   std::shared_ptr<OffloadControl> stateTier;
+  // With it, snapshots are KeptStates whose copies land when it says so.
+  std::shared_ptr<OffloadControl> keptTier;
   // What a snapshot allocates; State::bytes() unless a test needs a state
   // larger than an extent.
   uint64_t stateBytes = 64;
@@ -7100,6 +7119,77 @@ void testWaitingPlanDoesNotIdleRunnableLanes() {
   }
 }
 
+// In a persistent tier a request's replay point is written behind it: once
+// it has waited its delay, the pages of its chain are copied as earlier
+// copies land, a few at a time, then its state, and all of it stays in RAM.
+// A clean stop writes a point that has not waited yet at once. A temporary
+// tier writes nothing behind.
+void testReplayPointsAreWrittenBehind() {
+  struct Fixture final {
+    explicit Fixture(bool persistent)
+        : tier(persistent), cache(pool, &tier, nullptr),
+          engine({.maxContext = 102400}, cache, executor, events) {
+      tier.transferLimit = 64;
+      tier.capacity = 128;
+      executor.keptTier = std::make_shared<OffloadControl>();
+      executor.keptTier->ready = true;
+      guardReleases(storage, engine);
+      engine.submit(request(1, std::vector<uint32_t>(2060, 7)));
+      tickUntil(engine, now, [this] { return idle(engine); }, "the request did not finish");
+    }
+    // The chain's 64 pages and the state, written while they stay in RAM.
+    [[nodiscard]] bool durableInRam() const {
+      const CacheSnapshot resources = cache.snapshot();
+      return engine.snapshot().writeBehind.durable == 1 && tier.demotions == 64 &&
+             resources.kvTier.copies == 64 && resources.pool.pagesPrefix == 64 &&
+             resources.stateCache.bytes == 64 && resources.stateCache.diskBytes == 64;
+    }
+    test::TestKvStorage storage{72, 4096, 4};
+    KvPool pool{storage, 0};
+    test::TestKvTier tier;
+    engine::Cache cache;
+    Executor executor;
+    Events events;
+    engine::Engine engine;
+    double now = 1;
+  };
+  {
+    Fixture fixture(true);
+    const std::optional<double> due = fixture.engine.nextWakeupMilliseconds();
+    require(fixture.engine.snapshot().writeBehind.waiting == 1 && !fixture.tier.demotions &&
+                due && *due > fixture.now &&
+                *due <= fixture.now + WriteBehind::kDelayMilliseconds,
+            "the replay point did not wait for its delay");
+    static_cast<void>(fixture.engine.tick(*due - 1));
+    require(!fixture.tier.demotions, "the replay point was written before its delay");
+    double now = *due;
+    static_cast<void>(fixture.engine.tick(now));
+    require(fixture.tier.demotions == 16, "the replay point's copies did not start a few at a time");
+    for (uint32_t step = 0; step < 16 && !fixture.durableInRam(); ++step) {
+      fixture.tier.complete();
+      static_cast<void>(fixture.engine.tick(++now));
+    }
+    require(fixture.durableInRam(), "the replay point did not become durable in RAM");
+  }
+  {
+    Fixture fixture(true);
+    require(!fixture.engine.flushRestorePoints() && fixture.tier.demotions == 16,
+            "a clean stop did not write the point that had not waited");
+    bool flushed = false;
+    for (uint32_t step = 0; step < 16 && !flushed; ++step) {
+      fixture.tier.complete();
+      flushed = fixture.engine.flushRestorePoints();
+    }
+    require(flushed && fixture.durableInRam(), "a clean stop did not leave the point durable");
+  }
+  {
+    Fixture fixture(false);
+    require(!fixture.engine.snapshot().writeBehind.waiting && fixture.engine.flushRestorePoints() &&
+                !fixture.tier.demotions,
+            "a temporary tier wrote a replay point behind");
+  }
+}
+
 // Pending means a transfer is in flight. With the tier unwritable and
 // nothing moving, a lane that cannot get pages must be answered, not parked.
 void testNothingInFlightIsNotPending() {
@@ -8899,6 +8989,7 @@ int main() {
     testGrowthWaitsForTheStateWriteInFlight();
     testPageShortfallDemotesInBulk();
     testWaitingLaneAlwaysNamesAWakeup();
+    testReplayPointsAreWrittenBehind();
     testWaitingPlanDoesNotIdleRunnableLanes();
     testNothingInFlightIsNotPending();
     testKvGrowthProceedsThroughDemotion();

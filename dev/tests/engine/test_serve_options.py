@@ -68,6 +68,26 @@ OPTIONS = {
         {"0": 0, "5G": 5 * 1024**3},
         ("auto", "-1", "0G", "5X", "nan"),
     ),
+    "--persistent-cache": (
+        [(["--persistent-cache", "--max-cache-disk=5G"], True)],
+        [["--persistent-cache"], ["--persistent-cache", "--max-cache-disk=0"]],
+    ),
+    "--cache-dir": (
+        [
+            (
+                ["--cache-dir=/srv/cache", "--persistent-cache", "--max-cache-disk=5G"],
+                Path("/srv/cache"),
+            ),
+            (
+                ["--cache-dir=~/cache", "--persistent-cache", "--max-cache-disk=5G"],
+                Path.home() / "cache",
+            ),
+        ],
+        [
+            ["--cache-dir=/srv/cache"],
+            ["--cache-dir=", "--persistent-cache", "--max-cache-disk=5G"],
+        ],
+    ),
     "--max-context": values(
         "--max-context",
         {"auto": None, "100K": 102400, "256k": 262144, "262144": 262144, "1": 1},

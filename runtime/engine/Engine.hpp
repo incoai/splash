@@ -5,6 +5,7 @@
 #include "engine/MemoryGovernor.hpp"
 #include "engine/Scheduler.hpp"
 #include "engine/Types.hpp"
+#include "engine/WriteBehind.hpp"
 #include "ops/PagedKv.hpp"
 
 #include <cstdint>
@@ -115,6 +116,8 @@ struct EngineSnapshot final {
   uint64_t resourceResumptions = 0;
   // All prefill rows after preemption, including an unfinished prompt suffix.
   uint64_t resourceReplayTokens = 0;
+  // A persistent tier's newest restore points (WriteBehind).
+  WriteBehindSnapshot writeBehind;
 };
 
 // KV blocks define prefix identity; composite recurrent state is attached
@@ -124,11 +127,11 @@ struct EngineSnapshot final {
 // (Types.hpp): its own result, which the engine reports and survives. submit()
 // reports an invalid request with std::invalid_argument, which the caller
 // answers with that request's error. Any other exception out of submit(), and
-// every exception out of tick(), cancel(), failRequest(), provideMask() and
-// reclaimMemory(), is engine-fatal: NativeRuntime reports EngineUnhealthy and
-// the process exits. Code below them therefore does not roll back on an
-// exception; the only cleanup on that path is RAII teardown itself needs
-// (state IO drains, FileRestore, Serving).
+// every exception out of tick(), cancel(), failRequest(), provideMask(),
+// reclaimMemory() and flushRestorePoints(), is engine-fatal: NativeRuntime
+// reports EngineUnhealthy and the process exits. Code below them therefore
+// does not roll back on an exception; the only cleanup on that path is RAII
+// teardown itself needs (state IO drains, FileRestore, Serving).
 class Engine final {
 public:
   Engine(EngineConfig config, Cache &cache, model::Model &model,
@@ -175,6 +178,11 @@ public:
   // takes what they freed. The result says whether the directive's target is
   // met, waits for transfers in flight, or finds nothing left to reclaim.
   [[nodiscard]] MemoryReclaimResult reclaimMemory(const MemoryReclaimDirective &directive);
+  // At a clean stop, once tick() has stopped: makes every restore point
+  // still waiting for its delay durable, the newest first, as the writes it
+  // starts land (WriteBehind::flush). True once none is left. The requests
+  // and the command in flight stay as they are, for teardown.
+  [[nodiscard]] bool flushRestorePoints();
 
 private:
   struct LaneEnd final {
@@ -326,7 +334,7 @@ private:
   void discardPendingStateBoundaries(Request &request) noexcept;
   [[nodiscard]] bool retireCheckpoint(Request &request);
   void publishReachedStateBoundaries(Request &request,
-                                     uint32_t promptProcessed);
+                                     uint32_t promptProcessed, double nowMilliseconds);
   [[nodiscard]] Prepared prepare(BatchPlan &plan,
                                  std::vector<ModelBatchItem> &items,
                                  double nowMilliseconds);
@@ -465,6 +473,7 @@ private:
   uint32_t checkpointTokens_;
   double resourceWaitTimeoutMilliseconds_;
   Cache &cache_;
+  WriteBehind writeBehind_;
   model::Model &model_;
   EngineEventSink &events_;
   Scheduler scheduler_;

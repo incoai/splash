@@ -3,6 +3,7 @@
 #include "engine/NativeRuntime.hpp"
 #include "engine/Protocol.hpp"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -48,6 +49,11 @@ public:
   [[nodiscard]] std::function<void()> controlNotifier();
   void setControlHandler(ControlHandler handler);
   [[nodiscard]] NativeProcessExit run(NativeRuntime &loop);
+  // After run() returned CleanEof: makes the newest restore points durable
+  // (NativeRuntime::flushRestorePoints) as the writes it starts land, which
+  // wake it, without reading input, until none is left or budget has
+  // passed. True once none is left.
+  [[nodiscard]] bool runFlush(NativeRuntime &loop, std::chrono::milliseconds budget);
   // Async-signal-safe. Asks run() to return CleanEof at its next iteration.
   // It does not wait for in-flight GPU work; the process owner bounds teardown.
   // An output write the signal interrupts fails instead of resuming.
@@ -60,7 +66,8 @@ public:
   // (server/runtime.py `_probe_liveness`).
   [[nodiscard]] double maxTickMilliseconds() const noexcept;
   // Why run() ended with IoFailure, or with EngineFailure when the input
-  // reader ran out of memory; empty when the loop chose the exit.
+  // reader ran out of memory, or why runFlush() could not wait; empty when
+  // the loop chose the exit.
   [[nodiscard]] const std::string &failure() const noexcept;
 
 private:

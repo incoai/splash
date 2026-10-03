@@ -51,6 +51,9 @@ struct NativeArguments final {
   uint32_t maxContext = 0;
   uint64_t maxMemoryBytes = 0;
   uint64_t maxCacheDiskBytes = 0;
+  // --cache-dir: where the cache tier keeps its files for the next process;
+  // empty for temporary ones.
+  std::filesystem::path persistentCacheRoot;
   kv::Format kvFormat = kv::Format::Int8;
   double decodeShare = engine::EngineConfig{}.decodeShare;
   uint32_t maxImagePatches = ops::kMaximumImagePatches;
@@ -126,7 +129,7 @@ void printUsage(std::string_view executable) {
       " serve-native MODEL_DIRECTORY"
       " MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto [MAX_CACHE_DISK_BYTES]"
       " [--kv-format int8|bf16] [--decode-share SHARE]"
-      " [--max-image-patches PATCHES]");
+      " [--max-image-patches PATCHES] [--cache-dir DIRECTORY]");
 }
 
 template <typename T>
@@ -214,10 +217,16 @@ NativeArguments parseArguments(int argc, char **argv) {
       result.decodeShare = parseDecodeShare(value);
     } else if (option == "--max-image-patches") {
       result.maxImagePatches = parseMaxImagePatches(value);
+    } else if (option == "--cache-dir") {
+      if (value.empty())
+        throw UsageError("--cache-dir requires a directory");
+      result.persistentCacheRoot = std::filesystem::absolute(std::filesystem::path(value));
     } else {
       throw UsageError("unexpected argument " + std::string(option));
     }
   }
+  if (!result.persistentCacheRoot.empty() && !result.maxCacheDiskBytes)
+    throw UsageError("--cache-dir requires a MAX_CACHE_DISK_BYTES quota");
   result.modelRoot = requireModelRoot(argv[2]);
   result.model = model::inspectModelPackage(result.modelRoot);
   result.maxContext = parseMaxContext(argv[3], result.model.capabilities);
@@ -253,6 +262,7 @@ bootstrapConfig(const NativeArguments &arguments) {
   config.resources.buildId = SPLASH_BUILD_ID;
   config.resources.maximumMemoryBytes = arguments.maxMemoryBytes;
   config.resources.maximumCacheDiskBytes = arguments.maxCacheDiskBytes;
+  config.resources.persistentCacheRoot = arguments.persistentCacheRoot;
   config.resources.kvFormat = arguments.kvFormat;
   config.resources.maximumImagePatches = arguments.maxImagePatches;
   config.nativeLoop.engine.maxContext = arguments.maxContext;
@@ -301,6 +311,31 @@ public:
     gShutdownTransport.store(nullptr, std::memory_order_release);
   }
 };
+
+// The time a clean stop gives the newest restore points of a persistent
+// cache to reach the disk before it closes the cache. The server waits
+// longer for the engine to exit (server/runtime.py `_shutdown_grace_seconds`).
+constexpr std::chrono::seconds kFlushBudget{6};
+
+// A clean stop of a persistent cache: the newest restore points reach the
+// disk, then the cache closes. An engine that fails meanwhile writes nothing
+// more, and its cache counts as ending uncleanly.
+void closePersistentCache(engine::FdTransport &transport,
+                          engine::RuntimeBootstrap &bootstrap) {
+  engine::NativeRuntime &loop = bootstrap.nativeLoop();
+  const bool flushed = transport.runFlush(loop, kFlushBudget);
+  if (!loop.engineHealthy()) {
+    writeStderrLine("error: the engine failed while it saved its newest restore points (" +
+                    loop.engineFailure() + ")");
+    return;
+  }
+  if (!flushed)
+    writeStderrLine("Persistent cache: stopping before every newest restore point reached the "
+                    "disk.");
+  if (!bootstrap.resources().closePersistentCache())
+    writeStderrLine("error: the persistent cache did not reach the disk; the next start takes it "
+                    "back on probation.");
+}
 
 int runNative(const NativeArguments &arguments) {
   engine::FdTransport transport(STDIN_FILENO, STDOUT_FILENO);
@@ -359,6 +394,8 @@ int runNative(const NativeArguments &arguments) {
   const auto exit = transport.run(bootstrap->nativeLoop());
   switch (exit) {
   case engine::NativeProcessExit::CleanEof:
+    if (bootstrap->resources().cache().persistent())
+      closePersistentCache(transport, *bootstrap);
     break;
   case engine::NativeProcessExit::ProtocolFailure:
     writeStderrLine(

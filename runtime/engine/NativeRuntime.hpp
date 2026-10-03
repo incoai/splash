@@ -22,8 +22,8 @@ struct NativeLoopConfig {
 
 // Translates native protocol messages and events at the Engine boundary.
 //
-// The engine's failure boundary. Every received frame, tick() and
-// runControl() run inside it: an exception is reported once as an
+// The engine's failure boundary. Every received frame, tick(), runControl()
+// and flushRestorePoints() run inside it: an exception is reported once as an
 // EngineUnhealthy ErrorEvent (metal_execution_failed for MetalBackendError,
 // else engine_execution_failed), the connection closes and the process exits.
 // Request-scoped problems never arrive as exceptions here except
@@ -46,6 +46,9 @@ public:
   bool tick();
   // Command-free control work uses the same failure boundary as execution.
   bool runControl(const std::function<bool()> &control);
+  // At a clean stop (Engine::flushRestorePoints). False until no restore
+  // point is left, and once the engine has failed.
+  bool flushRestorePoints();
   void setCompletionNotifier(std::function<void()> notifier) {
     core_.setCompletionNotifier(std::move(notifier));
   }

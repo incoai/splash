@@ -98,6 +98,17 @@ bool NativeRuntime::runControl(const std::function<bool()> &control) {
   return false;
 }
 
+bool NativeRuntime::flushRestorePoints() {
+  if (!engineHealthy_)
+    return false;
+  try {
+    return core_.flushRestorePoints();
+  } catch (...) {
+    executionFailed(std::current_exception());
+  }
+  return false;
+}
+
 void NativeRuntime::executionFailed(std::exception_ptr failure) {
   try {
     std::rethrow_exception(failure);
