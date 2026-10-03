@@ -16,7 +16,7 @@ It reuses cached prefixes and batches concurrent requests automatically.
 
 Apple M3 or newer, macOS 26.4 or later, and [Homebrew](https://brew.sh).
 The 4-bit examples need at least 36 GB of unified memory (48 GB recommended);
-24 GB Macs can use [smaller GGUF variants](#models).
+24 GB Macs can use [smaller GGUF variants](#small-quantization-variants-for-24-gb-macs).
 
 ```bash
 brew install incoai/tap/splash
@@ -24,9 +24,7 @@ splash serve --model unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M
 ```
 
 The first run downloads the model and its matching draft, prepares the
-weights, and starts serving on `127.0.0.1:8000`. Later starts reuse them.
-Leave room on disk for both the downloads and prepared weights
-([storage requirements](DEVELOPMENT.md#model-storage)).
+weights, and starts serving on `127.0.0.1:8000`.
 
 Once it prints `Ready`, leave this terminal open. Open <http://127.0.0.1:8000>
 in your browser, or run an installed coding agent from another terminal:
@@ -37,6 +35,13 @@ splash opencode    # or: splash claude / splash codex / splash hermes / splash p
 
 Press Ctrl+C in the server terminal to stop Splash.
 For LM Studio Bionic, follow its [Splash setup guide](https://lmstudio.ai/blog/splash-engine).
+
+> [!NOTE]
+> Splash keeps two copies of each model: the download stays unmodified in the
+> Hugging Face cache, and the prepared weights go to
+> `~/Library/Caches/Splash/weights`. A model therefore needs about twice its
+> download size in free disk, about 40 GB for the example above
+> ([model storage](DEVELOPMENT.md#model-storage)).
 
 ## Use the API
 
@@ -58,26 +63,43 @@ Reasoning follows the model default; `"reasoning_effort": "none"` turns it off.
 
 ## Models
 
-Splash supports these model families, with a matching DFlash2 draft selected
-automatically:
+Splash supports these models, with a matching DFlash2 draft selected automatically:
 
 | Model | GGUF example | MLX 4-bit |
 | --- | --- | --- |
 | Qwen3.8-27B | `unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M` | `mlx-community/Qwen3.8-27B-4bit` |
 | Qwen3.6-35B-A3B | `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M` | `mlx-community/Qwen3.6-35B-A3B-4bit` |
 
+Vision and the tokenizer come from the target model's source. [Model loading and compatibility](DEVELOPMENT.md#upstream-model-loading) · [Supported formats](DEVELOPMENT.md#gguf-targets)
+
+### Unsloth GGUF with high quality
+
+UD quantization formats that Splash supports: [27B variants](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/tree/main) · [35B variants](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/tree/main)
+
 Unsloth GGUF variants span **1–8 bits**, including mixed-precision UD formats;
 `UD-Q8_K_XL` and BF16 targets are not supported.
+
+Splash runs Unsloth UD GGUFs at llama.cpp's quality. On the same UD-Q4_K_M files, Splash and llama.cpp pick the same next token more often than llama.cpp's own CPU and Metal backends do:
+
+| Next-token agreement ↑ | 27B | 35B-A3B |
+| --- | ---: | ---: |
+| llama.cpp: CPU vs. GPU | 97.8% | 96.5–96.9% |
+| llama.cpp: single-token vs. batched | 99.65–99.75% | 97.95% |
+| **Splash vs. llama.cpp** | **99.30–99.45%** | **97.83–98.14%** |
+
+Perplexity stays within 0.4% (27B) and 0.9% (35B-A3B) of llama.cpp's. Splash uses BF16 KV in this comparison.
+
+### Small quantization variants for 24 GB Macs
+
+See [Smaller GGUFs on 24 GB Macs](docs/performance.md#smaller-ggufs-on-24-gb-macs)
+for the Unsloth variants we measured. Coding agents need about 100K tokens of
+context: serve `unsloth/Qwen3.8-27B-GGUF:UD-IQ3_XXS` with `--language-only` for them.
+
 [Prism ML Ternary Bonsai 2](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf)
 is also supported in PQ2_0 (7.2 GB), including vision. Pass `OWNER/REPO:VARIANT`
-to `--model`, as in the quick start. Smaller variants run on
-[24 GB Macs](docs/performance.md#smaller-ggufs-on-24-gb-macs).
-[27B variants](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/tree/main) ·
-[35B variants](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/tree/main)
-
-Vision and the tokenizer come from the target model's source.
-[Model loading and compatibility](DEVELOPMENT.md#upstream-model-loading) ·
-[Supported formats](DEVELOPMENT.md#gguf-targets)
+to `--model`, as in the quick start. On a 24 GB M6 (12-core GPU), text only, it
+decodes code at 54.8 tok/s with a 212,985-token context, and at 72.7 tok/s on an
+M5 Pro (20-core GPU). [Bonsai measurements](https://github.com/incoai/splash/pull/166)
 
 ## Settings
 
@@ -104,9 +126,11 @@ access, authentication, browser apps on other origins, and other options, see
 
 ## Performance
 
-Measured on an M5 Pro (16-core GPU, 48 GB), using the Splash
-packages and selected SPEED-Bench coding prompts over HTTP. Ratios compare
-with the next-fastest engine measured in that benchmark.
+### RTN 4-bit
+
+Measured on an M5 Pro (16-core GPU, 48 GB) with selected SPEED-Bench coding
+prompts over HTTP, serving the Splash packages (the same weights as the
+MLX 4-bit models). Ratios compare with the next-fastest engine measured.
 
 | Metric | Qwen3.6-35B-A3B | Qwen3.8-27B |
 | --- | ---: | ---: |
@@ -119,11 +143,11 @@ with the next-fastest engine measured in that benchmark.
 [Measurement details](docs/performance.md#splash-10-launch-benchmarks) ·
 [Run benchmarks locally](DEVELOPMENT.md#local-benchmarks)
 
-### GGUF against llama.cpp
+### Unsloth UD-Q4_K_M
 
-Same Unsloth UD-Q4_K_M weights on Metal. Decode speed in tok/s:
+Against llama.cpp on the same GGUF files, both on Metal. Decode speed in tok/s:
 
-| Model | Engine | M5 Pro | M3 Max |
+| Model | Engine | M5 Pro (20-core GPU) | M3 Max (40-core GPU) |
 | --- | --- | ---: | ---: |
 | 27B | llama.cpp | 16 | 17 |
 | | llama.cpp with MTP | 27 | 20 |
@@ -132,17 +156,7 @@ Same Unsloth UD-Q4_K_M weights on Metal. Decode speed in tok/s:
 | | **Splash** | **175** | **209** |
 
 That is **2.5–3.2×** as fast on the 35B and **4.5–5.3×** on the 27B
-(**2.7–4.6×** against MTP).
-
-**Closely matches llama.cpp's predictions.**
-
-| Next-token agreement ↑ | 27B | 35B-A3B |
-| --- | ---: | ---: |
-| llama.cpp: CPU vs. GPU | 97.8% | 96.5–96.9% |
-| llama.cpp: single-token vs. batched | 99.65–99.75% | 97.95% |
-| **Splash vs. llama.cpp** | **99.30–99.45%** | **97.83–98.14%** |
-
-Splash uses BF16 KV in this comparison.
+(**2.7–4.6×** against MTP).\
 [Benchmark details](docs/performance.md#gguf-against-llamacpp)
 
 ## Design
