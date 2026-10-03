@@ -5,6 +5,7 @@
 // tensors it reads. AffineTarget.cpp plans an MLX target with it,
 // DraftCheckpoint.cpp a DFlash2 draft.
 
+#include "Checked.hpp"
 #include "model/AffinePreparation.hpp"
 #include "model/SafetensorsCheckpoint.hpp"
 #include "model/WeightLayout.hpp"
@@ -34,7 +35,8 @@ inline void copy(Image &image, const std::string &name, std::vector<uint64_t> sh
                  const std::string &dtype = "BF16") {
   Section section;
   section.bytes = dtype == "U32" ? 4 : kBFloat16Bytes;
-  for (uint64_t dimension : shape) section.bytes = checkedWeightMultiply(section.bytes, dimension, "affine tensor");
+  for (uint64_t dimension : shape)
+    section.bytes = checkedMultiply<WeightStoreError>(section.bytes, dimension, "affine tensor");
   section.input = {name, {dtype}, std::move(shape)};
   append(image, std::move(section));
 }

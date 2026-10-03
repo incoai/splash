@@ -22,7 +22,7 @@ from dev.tests.fixture_files import (  # noqa: E402
 )
 
 
-def fixture(root, moe=False):
+def fixture(root, moe=False, rope_type_key="rope_type", rope_type="default"):
     tensors = {}
     quantization = {"bits": 4, "group_size": 64}
 
@@ -176,7 +176,7 @@ def fixture(root, moe=False):
         "rope_parameters": {
             "rope_theta": 10000000,
             "partial_rotary_factor": 0.25,
-            "rope_type": "default",
+            rope_type_key: rope_type,
         },
     }
     if moe:
@@ -381,6 +381,24 @@ def main():
         root.mkdir()
         fixture(root)
         command = prepare(args.binary, args.metallib, root, "dense", goldens["dense"])
+        # Fine-tunes may name the rope type by its older `type` key.
+        legacy = Path(directory) / "legacy"
+        legacy.mkdir()
+        fixture(legacy, rope_type_key="type")
+        prepare(args.binary, args.metallib, legacy, "dense", goldens["dense"])
+        # Read from either key, a rope type other than the default is refused.
+        refused = Path(directory) / "legacy-yarn"
+        refused.mkdir()
+        fixture(refused, rope_type_key="type", rope_type="yarn")
+        result = subprocess.run(
+            [*command[:2], str(refused), "dense"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode != 0 and "rope_parameters.type" in result.stderr, (
+            result.stderr
+        )
         # Raw checkpoints need a different normalization convention. Refuse
         # their unsanitized convolution layout before publishing any weights.
         source = root / "model.safetensors"

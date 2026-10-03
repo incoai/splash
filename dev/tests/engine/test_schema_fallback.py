@@ -36,6 +36,12 @@ class SchemaFallbackTests(unittest.TestCase):
         )[1]
 
     @staticmethod
+    def framed_value(schema):
+        """The `value` parameter's schema as a request frames it."""
+        budget = [tool_schema.MAX_FRAMED_SCHEMA_BYTES]
+        return tool_schema.tool_argument_schema(schema, budget)["properties"]["value"]
+
+    @staticmethod
     def call(value):
         return (
             "<tool_call>\n<function=test>\n<parameter=value>\n"
@@ -105,9 +111,7 @@ class SchemaFallbackTests(unittest.TestCase):
                 "required": ["value"],
             }
             with self.subTest(kind=kind):
-                self.assertIsNone(
-                    raw_string_schema(schema["properties"]["value"], schema)
-                )
+                self.assertIsNone(raw_string_schema(self.framed_value(schema)))
                 self.verify(schema, '"red"', ['"blue"', "red", "7"], "red")
 
     def test_local_reference_and_sibling_constraints_are_both_retained(self):
@@ -117,7 +121,7 @@ class SchemaFallbackTests(unittest.TestCase):
             "properties": {"value": {"$ref": "#/$defs/Choice", "const": "1"}},
             "required": ["value"],
         }
-        self.assertIsNone(raw_string_schema(schema["properties"]["value"], schema))
+        self.assertIsNone(raw_string_schema(self.framed_value(schema)))
         self.verify(schema, '"1"', ['"2"', "1", "7"], "1")
         plain = {
             "type": "object",
@@ -125,6 +129,53 @@ class SchemaFallbackTests(unittest.TestCase):
             "required": ["value"],
         }
         self.verify(plain, "1", ['"1"', "2"], "1")
+
+    def test_compilable_patterns_constrain_generation(self):
+        order = {"type": "string", "pattern": "^ORD-[0-9]{4}$"}
+        nested = {"type": "object", "properties": {"id": order}, "required": ["id"]}
+        self.verify(
+            {"type": "object", "properties": {"value": nested}, "required": ["value"]},
+            '{"id":"ORD-1234"}',
+            ['{"id":"ORD-2024-8892"}', '{"id":"ord-1234"}'],
+            {"id": "ORD-1234"},
+        )
+        # An unanchored pattern keeps its search semantics; look-around cannot
+        # compile and stays with validation of the complete output.
+        schema = {
+            "type": "object",
+            "properties": {
+                "order": order,
+                "code": {"type": "string", "pattern": "[A-Z]{3}"},
+                "path": {"type": "string", "pattern": r"^(?!\.\.)[a-z/.]+$"},
+            },
+            "required": ["order", "code", "path"],
+            "additionalProperties": False,
+        }
+        grammar = tool_schema.json_grammar(schema, False)
+        self.assertFalse(LLMatcher.validate_grammar(grammar, self.guidance))
+        for order_id, code, valid in (
+            ("ORD-1234", "xABCx", True),
+            ("ORD-2024-8892-GOLD", "ABC", False),
+            ("ORD-1234", "abc", False),
+        ):
+            with self.subTest(order=order_id, code=code):
+                text = json.dumps({"order": order_id, "code": code, "path": "../x"})
+                tokens = self.tokenizer.encode(text).ids
+                matcher = LLMatcher(self.guidance, grammar)
+                accepted = matcher.validate_tokens(tokens) == len(tokens)
+                if accepted:
+                    self.assertTrue(matcher.consume_tokens(tokens))
+                    accepted = matcher.is_accepting()
+                self.assertEqual(accepted, valid)
+        _, validator = tool_schema.normalize_response_format(
+            {"type": "json_schema", "json_schema": {"schema": schema}}
+        )
+        with self.assertRaises(api.APIError) as caught:
+            model_output.validate_response_content(
+                json.dumps({"order": "ORD-1234", "code": "ABC", "path": "../x"}),
+                validator,
+            )
+        self.assertEqual(caught.exception.code, "invalid_model_output")
 
     def test_reference_with_array_constraint_keeps_json_type(self):
         schema = {
@@ -263,7 +314,7 @@ class SchemaFallbackTests(unittest.TestCase):
         guidance = self.guidance
 
         class CompilingFactory(FakeConstraintFactory):
-            def create(self, grammar, *, timeout=None):
+            def create(self, grammar, *, timeout=None, prefixes=None):
                 error = LLMatcher.validate_grammar(grammar, guidance)
                 if error:
                     raise AssertionError(error)
@@ -420,6 +471,46 @@ class SchemaFallbackTests(unittest.TestCase):
         with self.assertRaises(api.APIError) as caught:
             tool_schema.tool_grammar(self.policy({"$ref": "#/$defs/missing"}), False)
         self.assertEqual(caught.exception.status, 400)
+
+    def test_remote_references_in_draft3_schema_keywords_are_request_errors(self):
+        # Draft 3 nests schemas under extends and in type and disallow lists.
+        # A remote reference there was accepted, and every output then failed
+        # validation with an internal error after generation.
+        remote = {"$ref": "https://example.com/schema.json"}
+        for keywords in (
+            {"extends": remote},
+            {"extends": [remote]},
+            {"disallow": [remote]},
+            {"properties": {"value": {"type": ["string", remote]}}},
+        ):
+            schema = {
+                "$schema": "http://json-schema.org/draft-03/schema#",
+                "type": "object",
+                **keywords,
+            }
+            tools = [
+                {"type": "function", "function": {"name": "t", "parameters": schema}}
+            ]
+            response_format = {"type": "json_schema", "json_schema": {"schema": schema}}
+            for normalize in (
+                lambda: tool_schema.normalize_tools(tools, None, None),
+                lambda: tool_schema.normalize_response_format(response_format),
+            ):
+                with self.subTest(keywords=keywords):
+                    with self.assertRaises(api.APIError) as caught:
+                        normalize()
+                    self.assertEqual(caught.exception.status, 400)
+                    self.assertIn("remote", caught.exception.message)
+        schema = {
+            "$schema": "http://json-schema.org/draft-03/schema#",
+            "definitions": {"text": {"type": "string"}},
+            "properties": {"value": {"extends": {"$ref": "#/definitions/text"}}},
+        }
+        _, validator = tool_schema.normalize_response_format(
+            {"type": "json_schema", "json_schema": {"schema": schema}}
+        )
+        self.assertTrue(validator.is_valid({"value": "x"}))
+        self.assertFalse(validator.is_valid({"value": 1}))
 
     def test_schemas_validation_cannot_evaluate_are_request_errors(self):
         # Draft 4 leaves $ref unchecked and draft 3 accepts any type name;

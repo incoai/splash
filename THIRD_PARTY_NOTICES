@@ -3,11 +3,13 @@ The SemIf code in server/judgments.py carries its MIT notice in that file.
 
 llama.cpp (https://github.com/ggml-org/llama.cpp)
 
-The IQ4_NL values and the IQ3_S grid in runtime/metal/abi/QuantTables.h are
-ggml's kvalues_iq4nl and iq3s_grid (ggml/src/ggml-common.h), and the GGUF
-decoding in runtime/metal/kernels/common/quant_formats.h and the GGUF kernels
-built on it follow ggml's Metal dequantize.h and mul_mm.metal. They are
-compiled into splash.metallib. The tests' CPU reference,
+The IQ4_NL and MXFP4 values and the IQ1, IQ2 and IQ3 grids in
+runtime/metal/abi/QuantTables.h are ggml's kvalues_iq4nl, kvalues_mxfp4,
+iq1s_grid_gpu, iq2xxs_grid, iq2xs_grid, iq2s_grid, iq3xxs_grid and iq3s_grid
+(ggml/src/ggml-common.h), and the GGUF decoding in
+runtime/metal/kernels/common/quant_formats.h and the GGUF kernels built on it
+follow ggml's Metal dequantize.h and mul_mm.metal. They are compiled into
+splash.metallib. The tests' CPU reference,
 dev/tests/engine/GgufFormatReference.hpp, decodes the same blocks as ggml's
 dequantize_row_* (ggml/src/ggml-quants.c).
 

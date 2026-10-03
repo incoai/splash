@@ -1,6 +1,7 @@
+#include "../../../runtime/metal/BackendInstrumentation.hpp"
 #include "../../../runtime/metal/MetalBackend.hpp"
-#include "../../../runtime/metal/DeviceQueries.hpp"
-#include "../../../runtime/ops/PagedKv.hpp"
+#include "ScopedTestConfig.hpp"
+#include "TestBuffers.hpp"
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -9,7 +10,6 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -21,9 +21,7 @@
 #include <filesystem>
 #include <future>
 #include <iostream>
-#include <limits>
 #include <mutex>
-#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -31,6 +29,7 @@
 namespace {
 
 using splash::metal::AllocationFailure;
+using splash::metal::BackendInstrumentation;
 using splash::metal::MetalAllocationError;
 using splash::metal::BufferBinding;
 using splash::metal::BufferStorage;
@@ -38,8 +37,9 @@ using splash::metal::BytesBinding;
 using splash::metal::ComputeDispatch;
 using splash::metal::MetalBackend;
 using splash::metal::MetalBackendError;
+using splash::test::ScopedTestConfig;
+using splash::test::sharedBuffer;
 using splash::metal::MetalBuffer;
-using splash::metal::SparseMapping;
 
 [[noreturn]] void fail(const std::string &message) {
     std::cerr << "FAIL: " << message << '\n';
@@ -48,20 +48,6 @@ using splash::metal::SparseMapping;
 
 void require(bool condition, const std::string &message) {
     if (!condition) fail(message);
-}
-
-void awaitSparseRelease(MetalBackend &backend, uint64_t residentBytes,
-                        std::optional<uint64_t> virtualBytes = std::nullopt) {
-    // The driver event and its resource-retention callback complete separately.
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (true) {
-        const auto stats = backend.memoryStats();
-        if (stats.sparseResidentBytes == residentBytes &&
-            (!virtualBytes || stats.sparseVirtualBytes == *virtualBytes)) return;
-        require(std::chrono::steady_clock::now() < deadline,
-                "completed sparse mapping did not release retained resources");
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
 }
 
 struct TemporaryMetallib final {
@@ -91,7 +77,7 @@ class MethodReplacement final {
 public:
     MethodReplacement(id object, SEL selector, IMP replacement) {
         method_ = class_getInstanceMethod(object_getClass(object), selector);
-        require(method_ != nullptr, "probe fault method is missing");
+        require(method_ != nullptr, "replacement method is missing");
         original = method_setImplementation(method_, replacement);
     }
     ~MethodReplacement() { method_setImplementation(method_, original); }
@@ -130,8 +116,9 @@ NSUInteger delayedCompletionMemoryQuery(id device, SEL selector) {
 }
 
 void completionDoesNotWaitForMemoryTelemetry(const std::string &metallibPath) {
-    MetalBackend backend(metallibPath, 0.1);
-    auto buffer = backend.allocateBuffer(sizeof(uint32_t));
+    const ScopedTestConfig seam({.commandTimeoutSeconds = 0.1});
+    MetalBackend backend(metallibPath);
+    auto buffer = sharedBuffer(backend, sizeof(uint32_t));
     *static_cast<uint32_t *>(buffer.contents()) = 0;
     const uint32_t count = 1, increment = 7;
     ComputeDispatch dispatch;
@@ -140,6 +127,8 @@ void completionDoesNotWaitForMemoryTelemetry(const std::string &metallibPath) {
     dispatch.bytes = {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}};
     dispatch.threadgroups = {1, 1, 1};
     dispatch.threadsPerThreadgroup = {1, 1, 1};
+    // Creates the pipeline, whose creation samples memory, before counting.
+    (void)backend.submit(dispatch);
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     id<MTLCommandQueue> queue = [device newCommandQueue];
     id<MTLCommandBuffer> command = [queue commandBuffer];
@@ -154,6 +143,7 @@ void completionDoesNotWaitForMemoryTelemetry(const std::string &metallibPath) {
                              reinterpret_cast<IMP>(delayedCompletionMemoryQuery));
     originalAllocatedSize = memory.original;
     auto ticket = backend.submitAsync(dispatch);
+    const bool sampledOnSubmission = memoryQueries != 0;
     const bool completed = gpuDone.wait_for(std::chrono::seconds(5)) ==
                            std::future_status::ready;
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -167,6 +157,8 @@ void completionDoesNotWaitForMemoryTelemetry(const std::string &metallibPath) {
     require(callbackDone.wait_for(std::chrono::seconds(5)) == std::future_status::ready,
             "completion handler did not drain after telemetry was released");
     require(completed, "test GPU command did not complete");
+    require(!sampledOnSubmission,
+            "submission sampled device memory while the GPU idled");
     require(ready && healthy && completionMemoryQueries == 0,
             "completed GPU work depends on memory telemetry and can trip the watchdog");
     require(memoryQueries > queriesBeforeConsumption,
@@ -175,7 +167,7 @@ void completionDoesNotWaitForMemoryTelemetry(const std::string &metallibPath) {
     (void)ticket.wait();
     require(memoryQueries == queriesAfterConsumption,
             "an already-released ticket queried device memory again");
-    require(*static_cast<uint32_t *>(buffer.contents()) == increment,
+    require(*static_cast<uint32_t *>(buffer.contents()) == 2 * increment,
             "completion telemetry test produced the wrong result");
     std::cout << "PASS GPU completion independent of memory telemetry\n";
 }
@@ -230,8 +222,9 @@ void delayCompletionNotification(id command, SEL selector, MTLCommandBufferHandl
 
 void terminalCommandRecovers(const std::string &metallibPath, bool failed,
                                    bool pendingNext = false) {
-    MetalBackend backend(metallibPath, 0.1);
-    auto buffer = backend.allocateBuffer(sizeof(uint32_t));
+    const ScopedTestConfig seam({.commandTimeoutSeconds = 0.1});
+    MetalBackend backend(metallibPath);
+    auto buffer = sharedBuffer(backend, sizeof(uint32_t));
     *static_cast<uint32_t *>(buffer.contents()) = 0;
     const uint32_t count = 1, increment = 7;
     ComputeDispatch dispatch;
@@ -260,7 +253,7 @@ void terminalCommandRecovers(const std::string &metallibPath, bool failed,
         MethodReplacement completion(command, @selector(addCompletedHandler:),
                                      reinterpret_cast<IMP>(delayCompletionNotification));
         originalCompletedHandler = completion.original;
-        auto ticket = backend.submitAsync(dispatch, [&](uint64_t) { ++notifications; });
+        auto ticket = backend.submitCommandAsync({&dispatch, 1}, [&] { ++notifications; });
         require(gpuDone.wait_for(std::chrono::seconds(5)) == std::future_status::ready,
                 "GPU did not reach the delayed completion handler");
         require(!ticket.ready(), "test did not delay the completion notification");
@@ -286,7 +279,7 @@ void terminalCommandRecovers(const std::string &metallibPath, bool failed,
                 "terminal ticket retained allocations until the callback returned");
         splash::metal::CommandTicket next;
         if (!failed) {
-            buffer = backend.allocateBuffer(sizeof(uint32_t));
+            buffer = sharedBuffer(backend, sizeof(uint32_t));
             *static_cast<uint32_t *>(buffer.contents()) = 0;
             dispatch.buffers = {{0, buffer}};
             if (pendingNext) {
@@ -313,7 +306,7 @@ void terminalCommandRecovers(const std::string &metallibPath, bool failed,
             commandWatchdogGate.signaledValue = 1;
             (void)next.wait();
             commandWatchdogGate = nil;
-        } else if (next) {
+        } else if (!failed) {
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
             while (!next.ready() && std::chrono::steady_clock::now() < deadline)
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -340,8 +333,9 @@ void terminalCommandRecovers(const std::string &metallibPath, bool failed,
 }
 
 void pendingCommandStillTimesOut(const std::string &metallibPath) {
-    MetalBackend backend(metallibPath, 0.1);
-    auto buffer = backend.allocateBuffer(sizeof(uint32_t));
+    const ScopedTestConfig seam({.commandTimeoutSeconds = 0.1});
+    MetalBackend backend(metallibPath);
+    auto buffer = sharedBuffer(backend, sizeof(uint32_t));
     *static_cast<uint32_t *>(buffer.contents()) = 0;
     const uint32_t count = 1, increment = 7;
     ComputeDispatch dispatch;
@@ -382,59 +376,538 @@ void pendingCommandStillTimesOut(const std::string &metallibPath) {
     std::cout << "PASS pending GPU command watchdog and resource lifetime\n";
 }
 
-// Kept buffers stay held until the keep-alive passes without a command, the
-// next command holds them again at once, and a buffer's last view takes it
-// out of the set.
-void keptBuffersStayResident(const std::string &metallibPath) {
+// Polls until the backend holds no allocations.
+bool awaitAllocationsReleased(const MetalBackend &backend) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (backend.memoryStats().allocatedBytes != 0 &&
+           std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    return backend.memoryStats().allocatedBytes == 0;
+}
+
+// A synchronous submission throws once the watchdog gives up on its command,
+// which keeps its allocations until the GPU ends it.
+void synchronousWaitObeysTheWatchdog(const std::string &metallibPath) {
+    const ScopedTestConfig seam({.commandTimeoutSeconds = 0.1});
+    MetalBackend backend(metallibPath);
+    auto buffer = sharedBuffer(backend, sizeof(uint32_t));
+    const uint32_t count = 1, increment = 7;
+    ComputeDispatch dispatch{"test_add_u32", {{0, buffer}},
+        {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
+        {1, 1, 1}, {1, 1, 1}};
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    id<MTLCommandBuffer> command = [[device newCommandQueue] commandBuffer];
+    commandWatchdogGate = [device newSharedEvent];
+    std::future<std::string> submitted;
+    {
+        MethodReplacement commit(command, @selector(commit),
+                                 reinterpret_cast<IMP>(commitBehindWatchdogGate));
+        originalCommandCommit = commit.original;
+        submitted = std::async(std::launch::async, [&]() -> std::string {
+            try {
+                (void)backend.submitCommand({&dispatch, 1});
+            } catch (const MetalBackendError &error) {
+                return error.what();
+            }
+            return "the command completed";
+        });
+        require(submitted.wait_for(std::chrono::seconds(5)) == std::future_status::ready,
+                "a synchronous wait outlasted the command watchdog");
+    }
+    const std::string failure = submitted.get();
+    require(failure.find("completion timed out") != std::string::npos && !backend.healthy(),
+            "a synchronous wait did not fail with the command timeout: " + failure);
+    dispatch.buffers.clear();
+    buffer = {};
+    require(backend.memoryStats().allocatedBytes != 0,
+            "an abandoned wait released the allocations of a pending command");
+    commandWatchdogGate.signaledValue = 1;
+    const bool released = awaitAllocationsReleased(backend);
+    commandWatchdogGate = nil;
+    require(released, "an abandoned command kept its allocations after the GPU ended it");
+    std::cout << "PASS synchronous wait obeys the command watchdog\n";
+}
+
+// Destroying a ticket whose command the watchdog gave up on returns while the
+// command is still pending, and the command completes once the GPU ends it.
+void abandonedTicketReturnsAfterTheWatchdog(const std::string &metallibPath) {
+    const ScopedTestConfig seam({.commandTimeoutSeconds = 0.1});
+    MetalBackend backend(metallibPath);
+    auto buffer = sharedBuffer(backend, sizeof(uint32_t));
+    const uint32_t count = 1, increment = 7;
+    ComputeDispatch dispatch{"test_add_u32", {{0, buffer}},
+        {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
+        {1, 1, 1}, {1, 1, 1}};
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    id<MTLCommandBuffer> command = [[device newCommandQueue] commandBuffer];
+    commandWatchdogGate = [device newSharedEvent];
+    std::atomic<bool> completed{false};
+    splash::metal::CommandTicket ticket;
+    {
+        MethodReplacement commit(command, @selector(commit),
+                                 reinterpret_cast<IMP>(commitBehindWatchdogGate));
+        originalCommandCommit = commit.original;
+        ticket = backend.submitCommandAsync({&dispatch, 1}, [&] { completed = true; });
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    requireBackendError([&] { backend.checkHealth(); },
+                        "the watchdog did not give up on a pending command");
+    auto destroyed = std::async(std::launch::async, [&ticket] {
+        splash::metal::CommandTicket dropped = std::move(ticket);
+    });
+    require(destroyed.wait_for(std::chrono::seconds(3)) == std::future_status::ready,
+            "destroying an abandoned ticket waited for its command");
+    dispatch.buffers.clear();
+    buffer = {};
+    require(!completed && backend.memoryStats().allocatedBytes != 0,
+            "an abandoned ticket let go of a pending command's allocations");
+    commandWatchdogGate.signaledValue = 1;
+    const bool released = awaitAllocationsReleased(backend);
+    commandWatchdogGate = nil;
+    require(completed && released,
+            "an abandoned command did not complete once the GPU ended it");
+    std::cout << "PASS abandoned ticket returns after the command watchdog\n";
+}
+
+// A stopped backend refuses the next submission before encoding it, and
+// stopping is not a failure: the backend stays healthy with nothing in flight.
+void stopRefusesSubmission(const std::string &metallibPath) {
+    MetalBackend backend(metallibPath);
+    auto buffer = sharedBuffer(backend, sizeof(uint32_t));
+    const uint32_t count = 1, increment = 7;
+    const ComputeDispatch dispatch{"test_add_u32", {{0, buffer}},
+        {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
+        {1, 1, 1}, {1, 1, 1}};
+    backend.stop();
+    std::string error;
+    try {
+        (void)backend.submitAsync(dispatch);
+    } catch (const MetalBackendError &failure) {
+        error = failure.what();
+    }
+    require(error.find("stopping") != std::string::npos,
+            "a stopped backend accepted a submission: " + error);
+    require(backend.healthy() && !backend.commandInFlight(),
+            "refusing a submission while stopping marked the backend unhealthy "
+            "or left a command in flight");
+    std::cout << "PASS stopped backend refuses submission\n";
+}
+
+// A shutdown gives up a synchronous wait as the watchdog does: the wait
+// throws and the backend is unhealthy, and the command keeps its allocations
+// until the GPU ends it.
+void shutdownInterruptsACommandWait(const std::string &metallibPath) {
+    MetalBackend backend(metallibPath);
+    std::atomic<bool> stop{false};
+    backend.setWaitInterrupt([&] { return stop.load(); });
+    auto buffer = sharedBuffer(backend, sizeof(uint32_t));
+    const uint32_t count = 1, increment = 7;
+    ComputeDispatch dispatch{"test_add_u32", {{0, buffer}},
+        {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
+        {1, 1, 1}, {1, 1, 1}};
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    id<MTLCommandBuffer> command = [[device newCommandQueue] commandBuffer];
+    commandWatchdogGate = [device newSharedEvent];
+    std::future<std::string> submitted;
+    {
+        MethodReplacement commit(command, @selector(commit),
+                                 reinterpret_cast<IMP>(commitBehindWatchdogGate));
+        originalCommandCommit = commit.original;
+        submitted = std::async(std::launch::async, [&]() -> std::string {
+            try {
+                (void)backend.submitCommand({&dispatch, 1});
+            } catch (const MetalBackendError &error) {
+                return error.what();
+            }
+            return "the command completed";
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        stop = true;
+        require(submitted.wait_for(std::chrono::seconds(3)) == std::future_status::ready,
+                "a shutdown did not end a synchronous wait");
+    }
+    const std::string failure = submitted.get();
+    require(failure.find("shutdown") != std::string::npos && !backend.healthy(),
+            "a shutdown did not fail the synchronous wait: " + failure);
+    dispatch.buffers.clear();
+    buffer = {};
+    require(backend.memoryStats().allocatedBytes != 0,
+            "an interrupted wait released the allocations of a pending command");
+    commandWatchdogGate.signaledValue = 1;
+    const bool released = awaitAllocationsReleased(backend);
+    commandWatchdogGate = nil;
+    require(released, "an interrupted command kept its allocations after the GPU ended it");
+    std::cout << "PASS shutdown interrupts a command wait\n";
+}
+
+// Destroying a ticket during a shutdown still waits for its command: only
+// wait() gives a command up for a shutdown, and only the watchdog judges the
+// backend's health meanwhile.
+void shutdownLeavesTicketTeardownToTheCommand(const std::string &metallibPath) {
+    MetalBackend backend(metallibPath);
+    backend.setWaitInterrupt([] { return true; });
+    auto buffer = sharedBuffer(backend, sizeof(uint32_t));
+    const uint32_t count = 1, increment = 7;
+    ComputeDispatch dispatch{"test_add_u32", {{0, buffer}},
+        {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
+        {1, 1, 1}, {1, 1, 1}};
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    id<MTLCommandBuffer> command = [[device newCommandQueue] commandBuffer];
+    commandWatchdogGate = [device newSharedEvent];
+    splash::metal::CommandTicket ticket;
+    {
+        MethodReplacement commit(command, @selector(commit),
+                                 reinterpret_cast<IMP>(commitBehindWatchdogGate));
+        originalCommandCommit = commit.original;
+        ticket = backend.submitAsync(dispatch);
+    }
+    auto destroyed = std::async(std::launch::async, [&ticket] {
+        splash::metal::CommandTicket dropped = std::move(ticket);
+    });
+    // Longer than a wait slice, after which a wait for wait() would give up.
+    const bool waited = destroyed.wait_for(std::chrono::milliseconds(1500)) ==
+                        std::future_status::timeout;
+    backend.checkHealth();
+    commandWatchdogGate.signaledValue = 1;
+    const bool returned = destroyed.wait_for(std::chrono::seconds(5)) ==
+                          std::future_status::ready;
+    commandWatchdogGate = nil;
+    require(waited && returned && backend.healthy(),
+            "a shutdown gave up a command its ticket's teardown waits for");
+    std::cout << "PASS shutdown leaves ticket teardown to the command\n";
+}
+
+// A command that completes while its wait asks about a shutdown stays a
+// success: the wait gives up only a command still unfinished, so the backend
+// stays healthy.
+void shutdownSparesACommandThatCompletes(const std::string &metallibPath) {
+    MetalBackend backend(metallibPath);
+    auto buffer = sharedBuffer(backend, sizeof(uint32_t));
+    const uint32_t count = 1, increment = 7;
+    ComputeDispatch dispatch{"test_add_u32", {{0, buffer}},
+        {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
+        {1, 1, 1}, {1, 1, 1}};
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    id<MTLCommandBuffer> command = [[device newCommandQueue] commandBuffer];
+    commandWatchdogGate = [device newSharedEvent];
+    std::atomic<bool> completed{false};
+    // The command completes after the wait's slice ended, before the wait
+    // decides.
+    backend.setWaitInterrupt([&] {
+        commandWatchdogGate.signaledValue = 1;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!completed && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        return true;
+    });
+    splash::metal::CommandTicket ticket;
+    {
+        MethodReplacement commit(command, @selector(commit),
+                                 reinterpret_cast<IMP>(commitBehindWatchdogGate));
+        originalCommandCommit = commit.original;
+        ticket = backend.submitCommandAsync({&dispatch, 1}, [&] { completed = true; });
+    }
+    std::string failure;
+    try {
+        (void)ticket.wait();
+    } catch (const MetalBackendError &error) {
+        failure = error.what();
+    }
+    commandWatchdogGate = nil;
+    require(completed && failure.empty() && backend.healthy(),
+            "a shutdown gave up a command that completed: " + failure);
+    std::cout << "PASS shutdown spares a command that completes\n";
+}
+
+// Profiling times every dispatch of every command, a command of one dispatch
+// included, and hands back a completed ticket with their summed time.
+void dispatchProfilingCoversEveryCommand(const std::string &metallibPath) {
+    MetalBackend backend(metallibPath);
+    auto buffer = sharedBuffer(backend, sizeof(uint32_t));
+    auto *value = static_cast<uint32_t *>(buffer.contents());
+    *value = 0;
+    const uint32_t count = 1, increment = 1;
+    const ComputeDispatch dispatch{"test_add_u32", {{0, buffer}},
+        {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
+        {1, 1, 1}, {1, 1, 1}};
+    BackendInstrumentation::setDispatchProfiling(backend, true);
+    for (const size_t dispatches : {1, 2}) {
+        const std::vector<ComputeDispatch> command(dispatches, dispatch);
+        bool notified = false;
+        auto ticket =
+            backend.submitCommandAsync(command, [&] { notified = true; });
+        require(notified && ticket.ready(),
+                "a profiled command was not complete on return");
+        const auto timing = ticket.wait();
+        const auto profile = BackendInstrumentation::takeDispatchProfile(backend);
+        double total = 0.0;
+        for (const auto &entry : profile) {
+            require(entry.pipelineName == dispatch.pipelineName,
+                    "a profiled dispatch lost its pipeline name");
+            total += entry.gpuSeconds;
+        }
+        require(profile.size() == dispatches && timing.gpuSeconds == total,
+                "profiling skipped a dispatch or misreported the command");
+    }
+    BackendInstrumentation::setDispatchProfiling(backend, false);
+    require(*value == 3, "profiling did not run each dispatch exactly once");
+    std::cout << "PASS dispatch profiling covers every command\n";
+}
+
+// Preparing a dispatch compiles its pipeline without submitting anything, so
+// its submission compiles nothing, and rejects what submission would.
+void preparedPipelinesCompileAhead(const std::string &metallibPath) {
+    MetalBackend backend(metallibPath);
+    auto buffer = sharedBuffer(backend, sizeof(uint32_t));
+    auto *value = static_cast<uint32_t *>(buffer.contents());
+    *value = 0;
+    const uint32_t count = 1, increment = 1;
+    const ComputeDispatch dispatch{"test_add_u32", {{0, buffer}},
+        {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
+        {1, 1, 1}, {1, 1, 1}};
+    backend.preparePipelines({&dispatch, 1});
+    require(BackendInstrumentation::cachedPipelines(backend) == 1 &&
+                BackendInstrumentation::submittedCommands(backend) == 0 &&
+                *value == 0,
+            "preparing a dispatch did more than compile its pipeline");
+    (void)backend.submit(dispatch);
+    require(BackendInstrumentation::cachedPipelines(backend) == 1 && *value == 1,
+            "submitting a prepared dispatch compiled its pipeline again");
+    ComputeDispatch oversized = dispatch;
+    oversized.threadsPerThreadgroup = {4096, 1, 1};
+    requireBackendError([&] { backend.preparePipelines({&oversized, 1}); },
+                        "a dispatch past its pipeline's thread limit was prepared");
+    ComputeDispatch missing = dispatch;
+    missing.pipelineName = "does_not_exist";
+    requireBackendError([&] { backend.preparePipelines({&missing, 1}); },
+                        "a dispatch of a missing function was prepared");
+    require(backend.healthy() &&
+                BackendInstrumentation::submittedCommands(backend) == 1,
+            "a rejected preparation poisoned the backend or submitted work");
+    std::cout << "PASS prepared pipelines compile ahead\n";
+}
+
+std::atomic<unsigned> blitEncoders{0};
+std::atomic<unsigned> computeEncoders{0};
+IMP originalBlitEncoder = nullptr;
+IMP originalComputeEncoder = nullptr;
+id countBlitEncoder(id command, SEL selector) {
+    ++blitEncoders;
+    return reinterpret_cast<id (*)(id, SEL)>(originalBlitEncoder)(command, selector);
+}
+id countComputeEncoder(id command, SEL selector) {
+    ++computeEncoders;
+    return reinterpret_cast<id (*)(id, SEL)>(originalComputeEncoder)(command, selector);
+}
+
+// Counts what residency sets ask of Metal while it lives, passing every call
+// on: requests and ends of residency, and removals of a member. All sets
+// share the class of the one it creates. Arm it before the backend it
+// observes, so that no call races the swap.
+class ResidencyCalls final {
+public:
+    ResidencyCalls() {
+        originalRequest = request_.original;
+        originalEnd = end_.original;
+        originalRemoval = removal_.original;
+        requests = ends = removals = 0;
+    }
+
+    static inline std::atomic<unsigned> requests{0};
+    static inline std::atomic<unsigned> ends{0};
+    static inline std::atomic<unsigned> removals{0};
+
+private:
+    static inline IMP originalRequest = nullptr;
+    static inline IMP originalEnd = nullptr;
+    static inline IMP originalRemoval = nullptr;
+
+    static void countRequest(id set, SEL selector) {
+        ++requests;
+        reinterpret_cast<void (*)(id, SEL)>(originalRequest)(set, selector);
+    }
+    static void countEnd(id set, SEL selector) {
+        ++ends;
+        reinterpret_cast<void (*)(id, SEL)>(originalEnd)(set, selector);
+    }
+    static void countRemoval(id set, SEL selector, id allocation) {
+        ++removals;
+        reinterpret_cast<void (*)(id, SEL, id)>(originalRemoval)(set, selector, allocation);
+    }
+
+    id<MTLResidencySet> set_ = [MTLCreateSystemDefaultDevice()
+        newResidencySetWithDescriptor:[MTLResidencySetDescriptor new] error:nil];
+    MethodReplacement request_{set_, @selector(requestResidency),
+                               reinterpret_cast<IMP>(countRequest)};
+    MethodReplacement end_{set_, @selector(endResidency), reinterpret_cast<IMP>(countEnd)};
+    MethodReplacement removal_{set_, @selector(removeAllocation:),
+                               reinterpret_cast<IMP>(countRemoval)};
+};
+
+// Polls until `done` holds or `limit` passes, and returns whether it held.
+template <typename Predicate>
+bool waitFor(Predicate done, std::chrono::milliseconds limit) {
+    const auto deadline = std::chrono::steady_clock::now() + limit;
+    while (!done() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    return done();
+}
+
+// A lapsed keep-alive ends residency with one dispatch of a kernel built with
+// the library, never a blit whose driver program compiles at that moment, and
+// destroying a backend that holds its set submits no GPU work at all.
+void residencyEndsWithoutBlits(const std::string &metallibPath) {
+    constexpr double kKeepAliveSeconds = 0.2;
+    id<MTLCommandBuffer> command =
+        [[MTLCreateSystemDefaultDevice() newCommandQueue] commandBuffer];
+    commits = 0;
+    blitEncoders = 0;
+    computeEncoders = 0;
+    MethodReplacement committing(command, @selector(commit),
+                                 reinterpret_cast<IMP>(countCommit));
+    originalCountedCommit = committing.original;
+    MethodReplacement blits(command, @selector(blitCommandEncoder),
+                            reinterpret_cast<IMP>(countBlitEncoder));
+    originalBlitEncoder = blits.original;
+    MethodReplacement computes(command, @selector(computeCommandEncoder),
+                               reinterpret_cast<IMP>(countComputeEncoder));
+    originalComputeEncoder = computes.original;
+    ResidencyCalls calls;
+    unsigned lapseCommits = 0, lapseComputes = 0;
+    {
+        const ScopedTestConfig seam({.residencyKeepAliveSeconds = kKeepAliveSeconds});
+        MetalBackend backend(metallibPath);
+        const uint64_t page = static_cast<uint64_t>(getpagesize());
+        MetalBuffer lapsing = sharedBuffer(backend, page);
+        (void)waitFor([] { return commits != 0; }, std::chrono::seconds(5));
+        lapseCommits = commits.exchange(0);
+        lapseComputes = computeEncoders.exchange(0);
+        // Allocating another buffer holds the set again for the teardown.
+        const unsigned requested = calls.requests;
+        MetalBuffer held = sharedBuffer(backend, page);
+        require(waitFor([&] { return calls.requests > requested; }, std::chrono::seconds(1)),
+                "an allocation did not hold the set");
+    }
+    require(lapseCommits == 1 && lapseComputes == 1,
+            "a lapsed keep-alive did not end residency with one compute dispatch");
+    require(commits == 0 && computeEncoders == 0 && calls.ends == 2,
+            "backend teardown submitted GPU work or did not end residency");
+    require(blitEncoders == 0, "residency encoded a blit");
+    std::cout << "PASS residency ends without blits\n";
+}
+
+// A buffer's memory returns once its last view is gone, and a set the
+// backend still holds lets its buffers go with the backend, though the
+// serving thread's autorelease pool, like this one, never drains.
+void residencyReturnsRemovedBuffers(const std::string &metallibPath) {
+    constexpr uint64_t kBytes = 64ull << 20;
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    {
+        MetalBackend backend(metallibPath);
+        const uint64_t before = device.currentAllocatedSize;
+        MetalBuffer buffer = sharedBuffer(backend, kBytes);
+        buffer = {};
+        require(device.currentAllocatedSize <= before + (1ull << 20),
+                "a buffer taken out of the residency set kept its memory");
+    }
+    const uint64_t before = device.currentAllocatedSize;
+    {
+        MetalBuffer buffer;
+        {
+            MetalBackend backend(metallibPath);
+            buffer = sharedBuffer(backend, kBytes);
+        }
+    }
+    require(device.currentAllocatedSize <= before + (32ull << 20),
+            "a destroyed backend's residency set kept its buffers");
+    std::cout << "PASS residency returns removed buffers\n";
+}
+
+// Every buffer is held from its allocation until the keep-alive passes
+// without a command, the next command holds it again at once, and its last
+// view takes it out of the set: allocated and wrapped buffers alike.
+void buffersStayResident(const std::string &metallibPath) {
     constexpr double kKeepAliveSeconds = 1.0;
-    MetalBackend backend(metallibPath, 120.0, 30000, kKeepAliveSeconds);
+    ResidencyCalls calls;
+    const ScopedTestConfig seam({.residencyKeepAliveSeconds = kKeepAliveSeconds});
+    MetalBackend backend(metallibPath);
     const uint64_t page = static_cast<uint64_t>(getpagesize());
-    MetalBuffer dropped = backend.allocateBuffer(page);
-    MetalBuffer used = backend.allocateBuffer(page);
-    const uint64_t each = backend.memoryStats().allocatedBytes / 2;
+    void *address = mmap(nullptr, page, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANON, -1, 0);
+    require(address != MAP_FAILED, "unable to map memory to wrap");
+    std::shared_ptr<void> mapping(address, [page](void *memory) { munmap(memory, page); });
     const auto start = std::chrono::steady_clock::now();
-    backend.keepResident(backend.view(dropped, 0, 64));
-    backend.keepResident(used);
-    require(backend.lapsedResidentBytes() == 0, "kept buffers were not held at once");
-    requireBackendError([&] { backend.keepResident(dropped); },
-                        "the base of a kept view was kept again");
-    while (!backend.lapsedResidentBytes() &&
-           std::chrono::steady_clock::now() - start < std::chrono::seconds(5))
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    MetalBuffer dropped = backend.view(backend.wrapSharedMemory(address, page, mapping, {}), 0, 64);
+    MetalBuffer used = sharedBuffer(backend, page);
+    const uint64_t each = backend.memoryStats().allocatedBytes / 2;
+    require(waitFor([&] { return calls.requests != 0; }, std::chrono::seconds(1)),
+            "buffers were not held at once");
+    (void)waitFor([&] { return calls.ends != 0; }, std::chrono::seconds(5));
     const std::chrono::duration<double> lapsedAfter = std::chrono::steady_clock::now() - start;
-    require(backend.lapsedResidentBytes() == 2 * each &&
-                lapsedAfter.count() >= kKeepAliveSeconds,
-            "kept buffers did not lapse once the keep-alive passed without a command");
+    require(calls.ends == 1 && lapsedAfter.count() >= kKeepAliveSeconds,
+            "buffers did not lapse once the keep-alive passed without a command");
     dropped = {};
-    require(backend.lapsedResidentBytes() == each,
-            "a buffer whose last view is gone is still kept");
+    require(calls.removals == 1 && backend.memoryStats().allocatedBytes == each,
+            "a buffer whose last view is gone is still a member");
     const uint32_t count = 1, increment = 7;
     *static_cast<uint32_t *>(used.contents()) = 0;
     ComputeDispatch dispatch{"test_add_u32", {{0, used}},
         {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
         {1, 1, 1}, {1, 1, 1}};
+    const unsigned requested = calls.requests;
     auto ticket = backend.submitAsync(dispatch);
-    require(backend.lapsedResidentBytes() == 0,
-            "a command did not hold the kept buffers again");
+    require(waitFor([&] { return calls.requests > requested; }, std::chrono::seconds(1)),
+            "a command did not hold the buffers again");
     (void)ticket.wait();
     require(*static_cast<uint32_t *>(used.contents()) == increment,
-            "a command on a kept buffer produced the wrong result");
-    std::cout << "PASS kept buffers stay resident keep_alive_seconds=" << kKeepAliveSeconds
+            "a command on a resident buffer produced the wrong result");
+    std::cout << "PASS buffers stay resident keep_alive_seconds=" << kKeepAliveSeconds
               << " lapsed_after_seconds=" << lapsedAfter.count() << '\n';
 }
 
-// Keeping, lapsing and holding again race the heartbeat while another thread
-// drops kept buffers, as command completion can, and the backend is then
-// destroyed with its heartbeat live and a kept buffer outliving it. Nothing
-// may block, and every command must see its buffer.
+// Allocating into a held set wires the buffer at the set's commit: the
+// serving thread asks Metal for no residency of its own, and only the
+// heartbeat requests the set while allocations follow one another.
+void allocationDoesNotRequestResidency(const std::string &metallibPath) {
+    constexpr uint32_t kAllocations = 20;
+    constexpr double kBeatSeconds = 0.5;
+    ResidencyCalls calls;
+    MetalBackend backend(metallibPath);
+    const uint64_t page = static_cast<uint64_t>(getpagesize());
+    MetalBuffer used = sharedBuffer(backend, page);
+    const uint32_t count = 1, increment = 7;
+    const ComputeDispatch dispatch{"test_add_u32", {{0, used}},
+        {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
+        {1, 1, 1}, {1, 1, 1}};
+    (void)backend.submitAsync(dispatch).wait();
+    require(waitFor([&] { return calls.requests != 0; }, std::chrono::seconds(1)),
+            "the set was not held before the allocations");
+    const unsigned held = calls.requests;
+    const auto start = std::chrono::steady_clock::now();
+    std::vector<MetalBuffer> buffers;
+    for (uint32_t index = 0; index < kAllocations; ++index)
+        buffers.push_back(sharedBuffer(backend, page));
+    const std::chrono::duration<double> elapsed = std::chrono::steady_clock::now() - start;
+    const unsigned requests = calls.requests - held;
+    require(requests <= 1 + elapsed.count() / kBeatSeconds,
+            "allocations requested residency: " + std::to_string(requests) +
+                " requests in " + std::to_string(elapsed.count()) + " s");
+    std::cout << "PASS allocation does not request residency allocations=" << kAllocations
+              << " requests=" << requests << '\n';
+}
+
+// Allocating, lapsing and holding again race the heartbeat while another
+// thread drops buffers, as command completion can, and the backend is then
+// destroyed with its heartbeat live and a buffer outliving it. Nothing may
+// block, and every command must see its buffer.
 void residencyRacesTheHeartbeat(const std::string &metallibPath) {
     constexpr double kKeepAliveSeconds = 0.05;
     constexpr int kRounds = 24;
-    auto backend = std::make_unique<MetalBackend>(metallibPath, 120.0, 30000,
-                                                  kKeepAliveSeconds);
+    ResidencyCalls calls;
+    const ScopedTestConfig seam({.residencyKeepAliveSeconds = kKeepAliveSeconds});
+    auto backend = std::make_unique<MetalBackend>(metallibPath);
     const uint64_t page = static_cast<uint64_t>(getpagesize());
-    MetalBuffer used = backend->allocateBuffer(page);
-    backend->keepResident(used);
+    MetalBuffer used = sharedBuffer(*backend, page);
     *static_cast<uint32_t *>(used.contents()) = 0;
     std::mutex mutex;
     std::condition_variable ready;
@@ -457,21 +930,17 @@ void residencyRacesTheHeartbeat(const std::string &metallibPath) {
         {1, 1, 1}, {1, 1, 1}};
     int lapses = 0;
     for (int round = 0; round < kRounds; ++round) {
-        MetalBuffer kept = backend->allocateBuffer(page);
-        backend->keepResident(kept);
+        MetalBuffer member = sharedBuffer(*backend, page);
         {
             std::lock_guard lock(mutex);
-            handed.push_back(std::move(kept));
+            handed.push_back(std::move(member));
         }
         ready.notify_one();
         // Every third round lets the heartbeat end residency, so that its
         // command holds the set again.
         if (round % 3 == 2) {
-            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-            while (!backend->lapsedResidentBytes() &&
-                   std::chrono::steady_clock::now() < deadline)
-                std::this_thread::sleep_for(std::chrono::milliseconds(5));
-            lapses += backend->lapsedResidentBytes() != 0;
+            const unsigned ended = calls.ends;
+            lapses += waitFor([&] { return calls.ends > ended; }, std::chrono::seconds(2));
         }
         (void)backend->submitAsync(dispatch).wait();
     }
@@ -491,207 +960,126 @@ void residencyRacesTheHeartbeat(const std::string &metallibPath) {
               << " lapses=" << lapses << '\n';
 }
 
-id<MTLSharedEvent> submissionGate = nil;
-id<MTLSharedEvent> delayedMappingEvent = nil;
-IMP originalSparseSignal = nullptr;
-void delayMappingSignal(id queue, SEL selector, id<MTLSharedEvent> event, uint64_t value) {
-    if (value == 3) {
-        delayedMappingEvent = event;
-        // Complete the real mapping on a separate event. The test publishes
-        // its dependency only after verifying that backing is ready.
-        event = submissionGate;
-        value = 1;
-    }
-    reinterpret_cast<void (*)(id, SEL, id<MTLSharedEvent>, uint64_t)>(
-        originalSparseSignal)(queue, selector, event, value);
-}
+// Kernels reach shared buffers only through GPU addresses in a table, as
+// they reach KV extents. The residency set makes the buffers resident for
+// every command, also once its keep-alive has lapsed; one dispatch reads
+// what the previous one wrote through them; the CPU reads what kernels wrote
+// and kernels read what the CPU wrote between commands; and buffers released
+// and allocated again between commands work at once.
+void buffersReachedThroughTables(const std::string &metallibPath) {
+    constexpr double kKeepAliveSeconds = 0.2;
+    constexpr uint32_t kBuffers = 6, kWords = 16384, kRounds = 60;
+    constexpr uint64_t kBytes = uint64_t{kWords} * sizeof(uint32_t);
+    ResidencyCalls calls;
+    const ScopedTestConfig seam({.residencyKeepAliveSeconds = kKeepAliveSeconds});
+    MetalBackend backend(metallibPath);
+    MetalBuffer table = sharedBuffer(backend, kBuffers * sizeof(uint64_t));
+    MetalBuffer mismatches = sharedBuffer(backend, sizeof(uint32_t));
+    const uint64_t before = backend.memoryStats().allocatedBytes;
+    std::vector<MetalBuffer> buffers(kBuffers);
+    for (MetalBuffer &buffer : buffers) buffer = sharedBuffer(backend, kBytes);
+    require(buffers[0].storage() == BufferStorage::Shared && buffers[0].contents() &&
+                buffers[0].sizeBytes() == kBytes &&
+                backend.memoryStats().allocatedBytes == before + kBuffers * kBytes,
+            "buffers were not allocated or counted at their size");
+    require(buffers[0].gpuAddress() &&
+                backend.view(buffers[0], 4096, 4096).gpuAddress() ==
+                    buffers[0].gpuAddress() + 4096,
+            "a view's GPU address does not start at its offset");
 
-void backendDeferredSubmission(const std::string &metallibPath) {
-    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
-    id<MTL4CommandQueue> queue = [device newMTL4CommandQueue];
-    // A command buffer of the class the backend commits.
-    id<MTLCommandBuffer> command = [[device newCommandQueue] commandBuffer];
-    constexpr uint64_t tile = MetalBackend::kPlacementSparsePageBytes;
-    // Exercise the real submission/ticket path, not just the event helper.
-    for (const std::string mode : {"resume", "stop", "timeout", "teardown-unmap"}) {
-        // "timeout" gives up on the mapping after 500 ms instead of 30 s.
-        auto backend = std::make_unique<MetalBackend>(
-            metallibPath, 120.0, mode == "timeout" ? 500 : 30000);
-        auto sparse = backend->allocatePlacementSparseBuffer(tile, tile, "gated-map");
-        auto heap = backend->allocatePlacementHeap(tile, tile, "gated-heap");
-        SparseMapping mapping{sparse, 0, tile, 0};
-        auto readback = backend->allocateBuffer(4 * sizeof(uint32_t));
-        std::fill_n(static_cast<uint32_t *>(readback.contents()), 4, 0);
-        const uint32_t count = 4, seed = 73;
-        ComputeDispatch dispatch;
-        dispatch.pipelineName = "sparse_fill_copy_u32";
-        dispatch.buffers = {{0, sparse}, {1, readback}};
-        dispatch.bytes = {{2, &count, sizeof(count)}, {3, &seed, sizeof(seed)}};
-        dispatch.threadgroups = {1, 1, 1};
-        dispatch.threadsPerThreadgroup = {4, 1, 1};
-        submissionGate = [device newSharedEvent];
-        {
-            MethodReplacement replacement(queue, @selector(signalEvent:value:),
-                reinterpret_cast<IMP>(delayMappingSignal));
-            originalSparseSignal = replacement.original;
-            backend->mapSparse(heap, {&mapping, 1});
+    auto *entries = static_cast<uint64_t *>(table.contents());
+    for (uint32_t index = 0; index < kBuffers; ++index)
+        entries[index] = buffers[index].gpuAddress();
+    const uint32_t words = kWords;
+    uint32_t seed = 0;
+    const std::array<ComputeDispatch, 2> command{
+        ComputeDispatch{"addressed_write_u32", {{0, table}},
+            {{1, &words, sizeof(words)}, {2, &seed, sizeof(seed)}},
+            {kWords / 256, kBuffers, 1}, {256, 1, 1}},
+        ComputeDispatch{"addressed_check_u32", {{0, table}, {3, mismatches}},
+            {{1, &words, sizeof(words)}, {2, &seed, sizeof(seed)}},
+            {kWords / 256, kBuffers, 1}, {256, 1, 1}}};
+    const std::array<ComputeDispatch, 1> check{command[1]};
+    const auto expected = [&](uint32_t index, uint32_t word) {
+        return seed ^ (index * 131071u + word);
+    };
+    uint32_t regrown = 0;
+    bool lapsedRound = false;
+    for (uint32_t round = 0; round < kRounds; ++round) {
+        if (round % 5 == 4) {
+            const uint32_t index = round % kBuffers;
+            buffers[index] = {};
+            require(backend.memoryStats().allocatedBytes ==
+                        before + (kBuffers - 1) * kBytes,
+                    "a released buffer is still counted");
+            buffers[index] = sharedBuffer(backend, kBytes);
+            entries[index] = buffers[index].gpuAddress();
+            ++regrown;
         }
-        require(delayedMappingEvent && delayedMappingEvent.signaledValue < 3,
-                "mapping test gate was not installed");
-        if (mode == "teardown-unmap") {
-            backend->unmapSparse({&mapping, 1}, std::move(heap));
-            // The unmap (event 4) waits on the sparse queue for the withheld
-            // mapping event: teardown must return before it completes.
-            backend.reset();
-            require(delayedMappingEvent.signaledValue < 4,
-                    "backend teardown waited for the mapping queue");
-            require([submissionGate waitUntilSignaledValue:1 timeoutMS:5000],
-                    "test mapping did not complete");
-            delayedMappingEvent.signaledValue = 3;
-            require([delayedMappingEvent waitUntilSignaledValue:4 timeoutMS:5000],
-                    "unmap ownership did not survive backend teardown");
-            continue;
+        if (round == kRounds / 2) {
+            const unsigned ended = calls.ends;
+            require(waitFor([&] { return calls.ends > ended; }, std::chrono::seconds(5)),
+                    "the buffers did not lapse with the residency set");
+            lapsedRound = true;
         }
-        std::atomic<unsigned> callbacks{0};
-        std::promise<void> completion;
-        auto notified = completion.get_future();
-        commits = 0;
-        MethodReplacement counting(command, @selector(commit),
-                                   reinterpret_cast<IMP>(countCommit));
-        originalCountedCommit = counting.original;
-        auto ticket = backend->submitAsync(dispatch, [&](uint64_t) {
-            if (++callbacks == 1) completion.set_value();
-        });
-        auto requireNotifiedOnce = [&] {
-            require(notified.wait_for(std::chrono::seconds(5)) == std::future_status::ready &&
-                        callbacks == 1, "deferred ticket did not notify exactly once");
-        };
-        require(!ticket.ready() && backend->memoryStats().sparseMapWaitEvent == 3,
-                "backend did not defer submission behind mapping");
-        requireBackendError([&] { (void)backend->submitAsync(dispatch); },
-                            "deferred command did not hold the submission gate");
-        if (mode == "resume") {
-            // The command waits on the host and reaches the GPU only once its
-            // mapping completes, so no GPU queue timeout can run out on it.
-            require(!ticket.ready() && callbacks == 0 && commits == 0,
-                    "backend committed a command before its mapping");
-            require([submissionGate waitUntilSignaledValue:1 timeoutMS:5000],
-                    "test mapping did not complete");
-            delayedMappingEvent.signaledValue = 3;
-            (void)ticket.wait();
-            requireNotifiedOnce();
-            require(backend->healthy() && commits == 1,
-                    "resumed ticket poisoned the backend");
-            auto *words = static_cast<uint32_t *>(readback.contents());
-            for (uint32_t i = 0; i < count; ++i)
-                require(words[i] == seed + i, "deferred command produced wrong output");
-            backend->unmapSparse({&mapping, 1}, std::move(heap));
-            backend->drainSparseUnmaps();
-            awaitSparseRelease(*backend, 0);
-        } else {
-            if (mode == "stop") backend->stop();
-            requireNotifiedOnce();
-            require(ticket.ready(), "stopped/timed-out mapping did not finish its ticket");
-            try {
-                (void)ticket.wait();
-                fail("stopped/timed-out mapping completed successfully");
-            } catch (const MetalBackendError &error) {
-                const std::string message = error.what();
-                require(message.find(mode == "stop" ? "stopped before" : "wait exceeded") !=
-                            std::string::npos, "deferred failure lost its cause: " + message);
+        seed = 0x9e3779b9u * (round + 1);
+        *static_cast<uint32_t *>(mismatches.contents()) = 0;
+        // Every third round the CPU writes what the check expects, and the
+        // command only checks it.
+        const bool hostWrites = round % 3 == 2;
+        if (hostWrites) {
+            for (uint32_t index = 0; index < kBuffers; ++index) {
+                auto *contents = static_cast<uint32_t *>(buffers[index].contents());
+                for (uint32_t word = 0; word < kWords; ++word)
+                    contents[word] = expected(index, word);
             }
-            require(!backend->healthy(), "failed ticket did not poison the backend");
-            requireBackendError([&] { (void)backend->submitAsync(dispatch); },
-                                "stopped backend accepted new work");
-            backend.reset();
-            require([submissionGate waitUntilSignaledValue:1 timeoutMS:5000],
-                    "test mapping did not complete");
-            delayedMappingEvent.signaledValue = 3;
-            require([delayedMappingEvent waitUntilSignaledValue:3 timeoutMS:5000],
-                    "map ownership did not survive backend teardown");
-            require(commits == 0 && static_cast<uint32_t *>(readback.contents())[0] == 0,
-                    "cancelled deferred command ran on the GPU");
         }
-        std::cout << "PASS backend deferred submission " << mode << '\n';
+        auto ticket = hostWrites ? backend.submitCommandAsync(check)
+                                 : backend.submitCommandAsync(command);
+        require(backend.commandInFlight(), "a submitted command is not in flight");
+        (void)ticket.wait();
+        require(!backend.commandInFlight(), "a consumed command is still in flight");
+        require(*static_cast<uint32_t *>(mismatches.contents()) == 0,
+                "round " + std::to_string(round) +
+                    " read wrong data through the addresses of its buffers");
+        for (uint32_t index = 0; index < kBuffers; ++index) {
+            const auto *contents = static_cast<const uint32_t *>(buffers[index].contents());
+            for (uint32_t word = 0; word < kWords; ++word) {
+                if (contents[word] != expected(index, word))
+                    fail("round " + std::to_string(round) +
+                         ": the CPU read other data than the kernels wrote");
+            }
+        }
     }
-    submissionGate = nil;
-    delayedMappingEvent = nil;
+    buffers.clear();
+    require(backend.memoryStats().allocatedBytes == before &&
+                calls.removals == kBuffers + regrown,
+            "released buffers stayed counted or in the residency set");
+    std::cout << "PASS buffers reached through tables rounds=" << kRounds
+              << " regrown=" << regrown << " lapsed_round=" << lapsedRound << '\n';
 }
 
-BOOL noPlacementSupport(id, SEL) { return NO; }
-BOOL failPlacementQuery(id, SEL) {
-    id<SplashPlacementSparseDevice> backing = (id<SplashPlacementSparseDevice>)[NSObject new];
-    return backing.supportsPlacementSparse;
-}
-id<MTLHeap> refuseProbeHeap(id, SEL, MTLHeapDescriptor *) { return nil; }
-uint64_t failedProbeWaitValue = 0;
-IMP originalProbeWait = nullptr;
-BOOL failProbeWait(id event, SEL selector, uint64_t value, uint64_t timeout) {
-    if (value == failedProbeWaitValue)
-        return NO;
-    return reinterpret_cast<BOOL (*)(id, SEL, uint64_t, uint64_t)>(
-        originalProbeWait)(event, selector, value, timeout);
-}
-
-void placementProbeFailures(const std::string &metallibPath) {
-    // Faults apply only to this serial test process and are restored per case.
-    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
-    id<MTLSharedEvent> event = [device newSharedEvent];
-    require(device && event, "probe fault fixtures are unavailable");
-    {
-        MethodReplacement replacement(device, @selector(supportsPlacementSparse),
-                                      reinterpret_cast<IMP>(noPlacementSupport));
-        MetalBackend backend(metallibPath);
-        require(!backend.capabilities().supportsPlacementSparse,
-                "unsupported device was not preserved as a capability result");
+// Bindings of consecutive entries reach Metal as one run, each buffer at its
+// own offset, in whatever order the dispatch lists them.
+void bindingRunsKeepOffsets(MetalBackend &backend) {
+    constexpr uint32_t kWords = 8, count = 4;
+    MetalBuffer source = sharedBuffer(backend, kWords * sizeof(uint32_t));
+    MetalBuffer destination = sharedBuffer(backend, kWords * sizeof(uint32_t));
+    auto *in = static_cast<uint32_t *>(source.contents());
+    auto *out = static_cast<uint32_t *>(destination.contents());
+    for (uint32_t word = 0; word < kWords; ++word) {
+        in[word] = 100 + word;
+        out[word] = 0;
     }
-    {
-        MethodReplacement replacement(device, @selector(supportsPlacementSparse),
-                                      reinterpret_cast<IMP>(failPlacementQuery));
-        try {
-            MetalBackend backend(metallibPath);
-            fail("probe query failure was reported as unsupported");
-        } catch (const MetalBackendError &error) {
-            const std::string message = error.what();
-            require(message.find("supportsPlacementSparse query failed") !=
-                        std::string::npos &&
-                    message.find("unrecognized selector") != std::string::npos,
-                    "probe query failure lost its cause");
-        }
+    const ComputeDispatch dispatch{"test_copy_u32",
+        {{1, backend.view(destination, 4 * sizeof(uint32_t), 4 * sizeof(uint32_t))},
+         {0, backend.view(source, 2 * sizeof(uint32_t), 4 * sizeof(uint32_t))}},
+        {{2, &count, sizeof(count)}}, {1, 1, 1}, {count, 1, 1}};
+    (void)backend.submit(dispatch);
+    for (uint32_t word = 0; word < kWords; ++word) {
+        require(out[word] == (word < 4 ? 0 : 98 + word),
+                "a run of bindings lost a buffer's entry or offset");
     }
-    {
-        MethodReplacement replacement(device, @selector(newHeapWithDescriptor:),
-                                      reinterpret_cast<IMP>(refuseProbeHeap));
-        try {
-            MetalBackend backend(metallibPath);
-            fail("probe allocation failure was reported as unsupported");
-        } catch (const MetalAllocationError &error) {
-            require(error.failure() == splash::metal::AllocationFailure::DriverRejected &&
-                        std::string(error.what()).find("probe could not allocate") !=
-                            std::string::npos,
-                    "probe allocation failure lost its cause");
-        }
-    }
-    for (uint64_t failedValue : {1ULL, 2ULL}) {
-        failedProbeWaitValue = failedValue;
-        MethodReplacement replacement(event,
-            @selector(waitUntilSignaledValue:timeoutMS:),
-            reinterpret_cast<IMP>(failProbeWait));
-        originalProbeWait = replacement.original;
-        try {
-            MetalBackend backend(metallibPath);
-            fail("probe timeout was reported as unsupported");
-        } catch (const splash::metal::MetalAllocationError &) {
-            fail("probe timeout was misclassified as an allocation failure");
-        } catch (const MetalBackendError &error) {
-            const std::string message = error.what();
-            require(message.find("timed out after 5000 ms") != std::string::npos &&
-                        message.find(failedValue == 1 ? "for mapping" : "for unmapping") !=
-                            std::string::npos,
-                    "probe timeout lost its phase or deadline");
-        }
-    }
-    std::cout << "placement_probe_failures=PASS\n";
 }
 
 void sharedMemoryCompletionLifetime(MetalBackend &backend) {
@@ -711,13 +1099,13 @@ void sharedMemoryCompletionLifetime(MetalBackend &backend) {
         munmap(memory, bytes);
         gate->ownerReleased.store(true);
     });
-    auto buffer = backend.wrapSharedMemory(address, bytes, owner);
+    auto buffer = backend.wrapSharedMemory(address, bytes, owner, {});
     owner.reset();
     const uint32_t count = 1, increment = 1;
     ComputeDispatch dispatch{"test_add_u32", {{0, buffer}},
         {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
         {1, 1, 1}, {1, 1, 1}};
-    auto ticket = backend.submitAsync(dispatch, [gate](uint64_t) {
+    auto ticket = backend.submitCommandAsync({&dispatch, 1}, [gate] {
         std::unique_lock lock(gate->mutex);
         gate->entered = true;
         gate->condition.notify_all();
@@ -752,309 +1140,7 @@ void sharedMemoryCompletionLifetime(MetalBackend &backend) {
             "external memory leaked after Metal released its buffer");
 }
 
-void sparseExtentChurn(MetalBackend &backend) {
-    // Match the production per-layer data/scale mapping sizes. Rotate three
-    // virtual extents, retaining one as a witness while its replacement is
-    // mapped and used: at most two 130-MiB heaps plus one extent of readback.
-    constexpr splash::kv::Layout layout{16, 4, 256};
-    constexpr uint32_t kSegments = layout.attentionLayers * 4;
-    constexpr uint32_t kExtentCount = 3;
-    constexpr uint32_t kRepetitions = 256;
-    constexpr uint32_t kRollbackPeriod = 4;
-    constexpr uint32_t kGuardWords = 64;
-    constexpr uint32_t kSampleWords = 64;
-    constexpr uint32_t kCanary = 0xd15ca11u;
-    constexpr uint64_t kGuardBytes = kGuardWords * sizeof(uint32_t);
-    constexpr uint64_t kExtentBytes =
-        layout.backingExtentPages() * layout.bytesPerModelPage();
-    constexpr uint64_t kWitnessBytes =
-        kSegments * 2 * kSampleWords * sizeof(uint32_t);
-    const auto before = backend.memoryStats();
-    const uint64_t submissionsBefore = backend.submissionCount();
-    {
-        std::array<MetalBuffer, kSegments> buffers;
-        std::array<uint64_t, kSegments> segmentBytes{};
-        std::array<uint64_t, kSegments> offsets{};
-        std::array<uint32_t, kSegments> counts{};
-        uint64_t offset = 0;
-        for (uint32_t segment = 0; segment < kSegments; ++segment) {
-            segmentBytes[segment] = layout.backingExtentPages() *
-                (segment % 2 ? layout.scaleBytesPerLayerPage()
-                             : layout.dataBytesPerLayerPage());
-            offsets[segment] = offset;
-            counts[segment] = segmentBytes[segment] / sizeof(uint32_t);
-            offset += segmentBytes[segment];
-            buffers[segment] = backend.allocatePlacementSparseBuffer(
-                kExtentCount * segmentBytes[segment],
-                splash::kv::kSparseMappingAlignmentBytes,
-                "sparse-churn-layer-buffer-" + std::to_string(segment));
-        }
-        require(offset == kExtentBytes, "sparse churn geometry disagrees");
-        require(backend.memoryStats().sparseVirtualBytes ==
-                    before.sparseVirtualBytes + kExtentCount * kExtentBytes,
-                "sparse churn virtual accounting disagrees");
-        std::array<std::vector<SparseMapping>, kExtentCount> mappings;
-        for (uint32_t extent = 0; extent < kExtentCount; ++extent) {
-            for (uint32_t segment = 0; segment < kSegments; ++segment) {
-                mappings[extent].push_back({buffers[segment],
-                    extent * segmentBytes[segment], segmentBytes[segment],
-                    offsets[segment]});
-            }
-        }
-        MetalBuffer readback = backend.allocateBuffer(
-            kExtentBytes + kWitnessBytes + 3 * kGuardBytes,
-            BufferStorage::Shared, "sparse-churn-readback");
-        auto *words = static_cast<uint32_t *>(readback.contents());
-        const uint64_t middleGuard = kGuardWords + kExtentBytes / sizeof(uint32_t);
-        const uint64_t witnessStart = middleGuard + kGuardWords;
-        const uint64_t finalGuard = witnessStart + kWitnessBytes / sizeof(uint32_t);
-        std::array<std::optional<splash::metal::SparseHeap>, kExtentCount> heaps;
-        int32_t witness = -1;
-        std::array<uint32_t, kSegments> seeds{};
-        std::array<uint32_t, kSegments> witnessSeeds{};
-        for (uint32_t repetition = 0; repetition < kRepetitions; ++repetition) {
-            const uint32_t extent = repetition % kExtentCount;
-            try {
-                auto mapExtent = [&] {
-                    require(!heaps[extent], "sparse churn reused a resident extent");
-                    heaps[extent].emplace(backend.allocatePlacementHeap(
-                        kExtentBytes, splash::kv::kSparseMappingAlignmentBytes,
-                        "sparse-churn-extent-" + std::to_string(extent)));
-                    require(heaps[extent]->sizeBytes() == kExtentBytes,
-                            "sparse churn heap size changed");
-                    backend.mapSparse(*heaps[extent], mappings[extent]);
-                    require(backend.memoryStats().sparseResidentBytes ==
-                                before.sparseResidentBytes +
-                                    (witness < 0 ? 1 : 2) * kExtentBytes,
-                            "sparse churn resident accounting disagrees");
-                };
-                mapExtent();
-                if (repetition % kRollbackPeriod == 0) {
-                    // Allocation rollback may unmap while the asynchronous
-                    // map is pending, without an intervening compute ticket.
-                    backend.unmapSparse(mappings[extent], std::move(*heaps[extent]));
-                    heaps[extent].reset();
-                    backend.drainSparseUnmaps();
-                    awaitSparseRelease(backend, before.sparseResidentBytes +
-                        (witness < 0 ? 0 : 1) * kExtentBytes);
-                    require(backend.memoryStats().sparseResidentBytes ==
-                                before.sparseResidentBytes +
-                                    (witness < 0 ? 0 : 1) * kExtentBytes,
-                            "rolled-back churn heap remains resident");
-                    require(backend.submissionCount() ==
-                                submissionsBefore + 2 * repetition,
-                            "sparse rollback submitted a compute command");
-                    mapExtent();
-                }
-                for (uint64_t guard : {uint64_t{0}, middleGuard, finalGuard})
-                    std::fill_n(words + guard, kGuardWords, kCanary);
-
-                std::vector<ComputeDispatch> fill;
-                std::vector<ComputeDispatch> copy;
-                auto append = [&](std::vector<ComputeDispatch> &dispatches,
-                                  const char *pipeline, const MetalBuffer &source,
-                                  uint64_t destinationOffset, const uint32_t &count,
-                                  const uint32_t *seed = nullptr) {
-                    ComputeDispatch dispatch;
-                    dispatch.pipelineName = pipeline;
-                    dispatch.buffers = {{0, source}, {1, backend.view(readback,
-                        destinationOffset, uint64_t{count} * sizeof(uint32_t))}};
-                    dispatch.bytes = {{2, &count, sizeof(count)}};
-                    if (seed) dispatch.bytes.push_back({3, seed, sizeof(*seed)});
-                    dispatch.threadgroups = {(uint64_t{count} + 255) / 256, 1, 1};
-                    dispatch.threadsPerThreadgroup = {256, 1, 1};
-                    dispatches.push_back(std::move(dispatch));
-                };
-                for (uint32_t segment = 0; segment < kSegments; ++segment) {
-                    seeds[segment] = (repetition + 1) * 1048576u + segment * 8192u;
-                    const auto source = backend.view(buffers[segment],
-                        extent * segmentBytes[segment], segmentBytes[segment]);
-                    append(fill, "sparse_fill_copy_u32", source,
-                        kGuardBytes + offsets[segment], counts[segment], &seeds[segment]);
-                    // A separate command reads the sparse resource, rather
-                    // than relying on the fill kernel's own write-through copy.
-                    append(copy, "test_copy_u32", source,
-                        kGuardBytes + offsets[segment], counts[segment]);
-                    if (witness < 0) continue;
-                    for (uint32_t end = 0; end < 2; ++end) {
-                        const uint64_t sampleOffset = end
-                            ? segmentBytes[segment] - kSampleWords * sizeof(uint32_t) : 0;
-                        append(copy, "test_copy_u32", backend.view(buffers[segment],
-                            static_cast<uint64_t>(witness) * segmentBytes[segment] + sampleOffset,
-                            kSampleWords * sizeof(uint32_t)),
-                            witnessStart * sizeof(uint32_t) +
-                                (segment * 2 + end) * kSampleWords * sizeof(uint32_t),
-                            kSampleWords);
-                    }
-                }
-                auto fillTicket = backend.submitCommandAsync(fill);
-                if (!repetition) {
-                    requireBackendError([&] {
-                        backend.unmapSparse(mappings[extent], std::move(*heaps[extent]));
-                    }, "sparse unmap accepted an undrained compute ticket");
-                    require(heaps[extent] && *heaps[extent],
-                            "rejected unmap consumed the caller's heap");
-                }
-                (void)fillTicket.wait();
-                std::fill_n(words + kGuardWords, kExtentBytes / sizeof(uint32_t),
-                            std::numeric_limits<uint32_t>::max());
-                std::fill_n(words + witnessStart, kWitnessBytes / sizeof(uint32_t),
-                            std::numeric_limits<uint32_t>::max());
-                auto copyTicket = backend.submitCommandAsync(copy);
-                (void)copyTicket.wait();
-                for (uint32_t segment = 0; segment < kSegments; ++segment) {
-                    const uint64_t begin = kGuardWords + offsets[segment] / sizeof(uint32_t);
-                    for (uint32_t index = 0; index < counts[segment]; ++index) {
-                        if (words[begin + index] != seeds[segment] + index)
-                            throw std::runtime_error("sparse full-extent readback mismatch at segment " +
-                                std::to_string(segment) + " word " + std::to_string(index));
-                    }
-                    if (witness < 0) continue;
-                    for (uint32_t end = 0; end < 2; ++end) {
-                        const uint32_t sampleOffset = end ? counts[segment] - kSampleWords : 0;
-                        const uint64_t sample = witnessStart + (segment * 2 + end) * kSampleWords;
-                        for (uint32_t index = 0; index < kSampleWords; ++index) {
-                            if (words[sample + index] != witnessSeeds[segment] + sampleOffset + index)
-                                throw std::runtime_error("resident witness changed at segment " +
-                                    std::to_string(segment));
-                        }
-                    }
-                }
-                for (uint64_t guard : {uint64_t{0}, middleGuard, finalGuard}) {
-                    for (uint32_t index = 0; index < kGuardWords; ++index)
-                        require(words[guard + index] == kCanary, "sparse churn readback canary changed");
-                }
-                // Both real GPU tickets are drained before any mapping or
-                // heap is released, matching the engine's cancellation drain.
-                if (witness >= 0) {
-                    backend.unmapSparse(mappings[witness], std::move(*heaps[witness]));
-                    heaps[witness].reset();
-                    // The heap stays resident until the queue reports the
-                    // unmap complete; the next repetition's map is ordered
-                    // behind it on the same queue.
-                    backend.drainSparseUnmaps();
-                }
-                witness = extent;
-                witnessSeeds = seeds;
-                awaitSparseRelease(backend, before.sparseResidentBytes + kExtentBytes);
-                require(backend.memoryStats().sparseResidentBytes ==
-                            before.sparseResidentBytes + kExtentBytes,
-                        "released churn heap remains resident");
-            } catch (const std::exception &error) {
-                throw std::runtime_error("sparse churn repetition " +
-                    std::to_string(repetition) + " extent " +
-                    std::to_string(extent) + ": " + error.what());
-            }
-        }
-        backend.unmapSparse(mappings[witness], std::move(*heaps[witness]));
-        heaps[witness].reset();
-        backend.drainSparseUnmaps();
-        awaitSparseRelease(backend, before.sparseResidentBytes);
-        require(backend.memoryStats().sparseResidentBytes == before.sparseResidentBytes,
-                "final churn heap remains resident");
-    }
-    awaitSparseRelease(backend, before.sparseResidentBytes, before.sparseVirtualBytes);
-    const auto after = backend.memoryStats();
-    require(after.allocatedBytes == before.allocatedBytes &&
-                after.sparseVirtualBytes == before.sparseVirtualBytes &&
-                after.sparseResidentBytes == before.sparseResidentBytes,
-            "sparse churn leaked buffer or heap accounting");
-    require(backend.submissionCount() == submissionsBefore + 2 * kRepetitions,
-            "sparse churn command count changed");
-    require(backend.healthy(), "sparse churn poisoned the backend");
-    std::cout << "PASS sparse extent churn repetitions=" << kRepetitions
-              << " pending_map_rollbacks=" << (kRepetitions + kRollbackPeriod - 1) / kRollbackPeriod
-              << " layers=" << layout.attentionLayers
-              << " mappings_per_extent=" << kSegments
-              << " extent_bytes=" << kExtentBytes << '\n';
-}
-
-// Releases are paced: a second unmap waits for the first, heaps stay resident
-// until completion, and a remap of the same range orders behind the unmap.
-void sparsePacedRelease(MetalBackend &backend) {
-    constexpr uint64_t kTile = splash::kv::kSparseMappingAlignmentBytes;
-    constexpr uint32_t kExtents = 3;
-    constexpr uint32_t kTilesPerExtent = 4;
-    constexpr uint64_t kExtentBytes = kTilesPerExtent * kTile;
-    const auto before = backend.memoryStats();
-    MetalBuffer buffer = backend.allocatePlacementSparseBuffer(
-        kExtents * kExtentBytes, kTile, "sparse-paced");
-    std::array<std::optional<splash::metal::SparseHeap>, kExtents> heaps;
-    std::array<SparseMapping, kExtents> mappings;
-    auto mapExtent = [&](uint32_t extent) {
-        heaps[extent].emplace(backend.allocatePlacementHeap(
-            kExtentBytes, kTile, "sparse-paced-heap"));
-        mappings[extent] = {buffer, extent * kExtentBytes, kExtentBytes, 0};
-        backend.mapSparse(*heaps[extent], {&mappings[extent], 1});
-    };
-    for (uint32_t extent = 0; extent < kExtents; ++extent) mapExtent(extent);
-    MetalBuffer readback = backend.allocateBuffer(
-        kExtentBytes, BufferStorage::Shared, "sparse-paced-readback");
-    const uint32_t count = kExtentBytes / sizeof(uint32_t);
-    auto fillAndCheck = [&](uint32_t extent, uint32_t seed) {
-        ComputeDispatch fill;
-        fill.pipelineName = "sparse_fill_copy_u32";
-        fill.buffers = {{0, backend.view(buffer, extent * kExtentBytes, kExtentBytes)},
-                        {1, readback}};
-        fill.bytes = {{2, &count, sizeof(count)}, {3, &seed, sizeof(seed)}};
-        fill.threadgroups = {(uint64_t{count} + 255) / 256, 1, 1};
-        fill.threadsPerThreadgroup = {256, 1, 1};
-        (void)backend.submit(fill);
-        auto *words = static_cast<uint32_t *>(readback.contents());
-        for (uint32_t index = 0; index < count; ++index)
-            require(words[index] == seed + index, "paced-release extent readback mismatch");
-    };
-    for (uint32_t extent = 0; extent < kExtents; ++extent) fillAndCheck(extent, 17 + extent);
-    require(backend.memoryStats().sparseResidentBytes ==
-                before.sparseResidentBytes + kExtents * kExtentBytes,
-            "paced-release setup accounting disagrees");
-
-    // Two back-to-back releases: the second waits for the first internally.
-    backend.unmapSparse({&mappings[2], 1}, std::move(*heaps[2]));
-    heaps[2].reset();
-    backend.unmapSparse({&mappings[1], 1}, std::move(*heaps[1]));
-    heaps[1].reset();
-    require(backend.memoryStats().pendingSparseUnmaps <= 1,
-            "two sparse unmaps were outstanding at once");
-    backend.drainSparseUnmaps();
-    awaitSparseRelease(backend, before.sparseResidentBytes + kExtentBytes);
-    auto stats = backend.memoryStats();
-    require(stats.sparseResidentBytes == before.sparseResidentBytes + kExtentBytes &&
-                stats.pendingSparseUnmaps == 0 &&
-                stats.completedSparseUnmaps >= before.completedSparseUnmaps + 2,
-            "paced releases did not free both heaps after draining");
-
-    // Remap a released range while its unmap may still be in flight: the
-    // queue orders the new map behind the unmap, and the data is fresh.
-    mapExtent(1);
-    fillAndCheck(1, 4001);
-    fillAndCheck(0, 4000);
-    backend.unmapSparse({&mappings[1], 1}, std::move(*heaps[1]));
-    heaps[1].reset();
-    mapExtent(1);
-    fillAndCheck(1, 5001);
-    for (uint32_t extent = 0; extent < 2; ++extent) {
-        backend.unmapSparse({&mappings[extent], 1}, std::move(*heaps[extent]));
-        heaps[extent].reset();
-    }
-    backend.drainSparseUnmaps();
-    awaitSparseRelease(backend, before.sparseResidentBytes);
-    require(backend.memoryStats().sparseResidentBytes == before.sparseResidentBytes,
-            "paced-release cleanup leaked a heap");
-    readback = {};
-    for (SparseMapping &mapping : mappings) mapping.buffer = {};
-    buffer = {};
-    awaitSparseRelease(backend, before.sparseResidentBytes, before.sparseVirtualBytes);
-    require(backend.memoryStats().sparseVirtualBytes == before.sparseVirtualBytes &&
-                backend.healthy(),
-            "paced-release cleanup leaked address space or poisoned the backend");
-    std::cout << "PASS sparse paced release extents=" << kExtents
-              << " tile_bytes=" << kTile << '\n';
-}
-
 void run(const std::string &metallibPath) {
-    placementProbeFailures(metallibPath);
-    backendDeferredSubmission(metallibPath);
     NSData *libraryData = [NSData dataWithContentsOfFile:
         [NSString stringWithUTF8String:metallibPath.c_str()]];
     TemporaryMetallib temporary;
@@ -1068,7 +1154,7 @@ void run(const std::string &metallibPath) {
     };
     backend.setOperationGuard(denyOperation);
     try {
-        (void)backend.allocateBuffer(16384, BufferStorage::Shared);
+        (void)sharedBuffer(backend, 16384);
         fail("operation guard admitted an allocation");
     } catch (const MetalAllocationError &error) {
         require(error.failure() == AllocationFailure::HostPressure,
@@ -1099,11 +1185,17 @@ void run(const std::string &metallibPath) {
             "threadgroup memory capability is insufficient");
     require(capabilities.maxThreadgroupWidth >= 256,
             "threadgroup thread capability is insufficient");
-    require(capabilities.supportsPlacementSparse,
-            "placement-sparse capability is missing");
+    const auto probed = splash::metal::probeDeviceCapabilities();
+    require(probed.deviceName == capabilities.deviceName &&
+                probed.appleGpuFamily == capabilities.appleGpuFamily &&
+                probed.macosVersion() == capabilities.macosVersion() &&
+                !probed.validationMessage(),
+            "the device check read the device differently from the backend");
     require(backend.healthy(), "new backend is unhealthy");
-    require(backend.submissionCount() == 0, "new backend has submissions");
-    require(backend.pipelineCount() == 0, "pipeline cache is not empty");
+    require(BackendInstrumentation::submittedCommands(backend) == 0,
+            "new backend has submissions");
+    require(BackendInstrumentation::cachedPipelines(backend) == 0,
+            "pipeline cache is not empty");
 
     constexpr uint32_t kElementCount = 64;
     constexpr uint32_t kViewElementCount = kElementCount / 2;
@@ -1123,8 +1215,6 @@ void run(const std::string &metallibPath) {
             "actual live allocation bytes were not tracked");
     require(stats.peakAllocatedBytes == actualAllocationBytes,
             "peak allocation bytes were not tracked");
-    require(stats.peakResidentBytes == actualAllocationBytes,
-            "dense-only physical peak was not tracked");
     require(stats.deviceCurrentAllocatedBytes >= actualAllocationBytes,
             "device allocation counter is smaller than backend allocations");
     require(stats.devicePeakAllocatedBytes >=
@@ -1166,7 +1256,8 @@ void run(const std::string &metallibPath) {
             fail("operation guard admitted a GPU submission");
         } catch (const MetalAllocationError &error) {
             require(error.failure() == AllocationFailure::HostPressure &&
-                        backend.healthy() && backend.submissionCount() == 0,
+                        backend.healthy() &&
+                        BackendInstrumentation::submittedCommands(backend) == 0,
                     "guarded submission lost its cause or altered the backend");
         }
         backend.setOperationGuard({});
@@ -1176,14 +1267,10 @@ void run(const std::string &metallibPath) {
             if (!runIndex) {
                 timing = backend.submit(dispatch);
             } else {
-                std::promise<uint64_t> completedSequence;
-                auto notified = completedSequence.get_future();
-                auto ticket = backend.submitAsync(
-                    dispatch, [&](uint64_t sequence) {
-                        completedSequence.set_value(sequence);
-                    });
-                require(ticket && ticket.sequence() > 0,
-                        "async submission returned an empty ticket");
+                std::promise<void> completion;
+                auto notified = completion.get_future();
+                auto ticket = backend.submitCommandAsync(
+                    {&dispatch, 1}, [&] { completion.set_value(); });
                 requireBackendError(
                     [&] { (void)backend.submit(dispatch); },
                     "a second in-flight command was accepted");
@@ -1194,8 +1281,7 @@ void run(const std::string &metallibPath) {
                 // wait() may return first; only the callback's own signal
                 // shows the notification was delivered.
                 require(notified.wait_for(std::chrono::seconds(5)) ==
-                                std::future_status::ready &&
-                            notified.get() == ticket.sequence(),
+                            std::future_status::ready,
                         "async completion notification was not delivered");
             }
             require(std::isfinite(timing.gpuSeconds) &&
@@ -1208,9 +1294,9 @@ void run(const std::string &metallibPath) {
         }
     }
 
-    require(backend.submissionCount() == 2,
+    require(BackendInstrumentation::submittedCommands(backend) == 2,
             "successful submissions were not counted");
-    require(backend.pipelineCount() == 1,
+    require(BackendInstrumentation::cachedPipelines(backend) == 1,
             "pipeline cache did not reuse the pipeline");
     for (uint32_t i = 0; i < kViewElementCount; ++i) {
         require(values[i] == i, "dispatch wrote before the buffer view");
@@ -1233,7 +1319,7 @@ void run(const std::string &metallibPath) {
         std::vector<ComputeDispatch> command{first, first};
         (void)backend.submitCommand(command);
     }
-    require(backend.submissionCount() == 3,
+    require(BackendInstrumentation::submittedCommands(backend) == 3,
             "explicit operation list did not use one command buffer");
     for (uint32_t i = kViewElementCount; i < kElementCount; ++i) {
         require(values[i] == i + 4 * kIncrement,
@@ -1267,9 +1353,9 @@ void run(const std::string &metallibPath) {
             "a descriptor error incorrectly poisoned the backend");
     require(backend.unhealthyReason().empty(),
             "healthy backend has an unhealthy reason");
-    require(backend.submissionCount() == 3,
+    require(BackendInstrumentation::submittedCommands(backend) == 3,
             "failed pre-commit dispatch was counted as submitted");
-    require(backend.pipelineCount() == 1,
+    require(BackendInstrumentation::cachedPipelines(backend) == 1,
             "failed pipeline lookup polluted the cache");
 
     base = MetalBuffer{};
@@ -1296,117 +1382,8 @@ void run(const std::string &metallibPath) {
     require(backend.memoryStats().allocatedBytes == 0,
             "private allocation release was not tracked");
 
-    constexpr uint64_t kSparseTileBytes =
-        splash::kv::kSparseMappingAlignmentBytes;
-    static_assert(kSparseTileBytes == 64 * 1024,
-                  "KV mapping alignment must match the 64 KiB sparse tile");
-    requireBackendError(
-        [&] { (void)backend.allocatePlacementSparseBuffer(16 * 1024, 16 * 1024,
-                                                          "sparse-16k"); },
-        "a 16 KiB sparse tile was accepted");
-    MetalBuffer sparse = backend.allocatePlacementSparseBuffer(
-        kSparseTileBytes, kSparseTileBytes, "sparse-test");
-    require(sparse && sparse.contents() == nullptr,
-            "placement-sparse allocation is not private");
-    stats = backend.memoryStats();
-    require(stats.sparseVirtualBytes == kSparseTileBytes,
-            "sparse virtual bytes were not tracked");
-    require(stats.sparseTileBytes == kSparseTileBytes &&
-                stats.pendingSparseUnmaps == 0 &&
-                stats.completedSparseUnmaps == 0,
-            "sparse tile and unmap telemetry were not reported");
-    require(stats.sparseResidentBytes == 0,
-            "sparse virtual allocation committed physical memory");
-
-    auto heap = backend.allocatePlacementHeap(
-        kSparseTileBytes, kSparseTileBytes, "sparse-test-heap");
-    require(heap && heap.sizeBytes() >= kSparseTileBytes,
-            "placement heap allocation failed");
-    stats = backend.memoryStats();
-    require(stats.sparseResidentBytes == heap.sizeBytes(),
-            "sparse resident bytes were not tracked");
-    require(stats.peakSparseResidentBytes == heap.sizeBytes(),
-            "sparse resident peak was not tracked");
-    require(stats.peakResidentBytes ==
-                std::max(stats.peakAllocatedBytes, heap.sizeBytes()),
-            "disjoint dense/sparse peaks were added together");
-
-    SparseMapping sparseMapping{sparse, 0, kSparseTileBytes, 0};
-    backend.mapSparse(heap, {&sparseMapping, 1});
-    MetalBuffer readback = backend.allocateBuffer(
-        sizeof(uint32_t) * kElementCount, BufferStorage::Shared,
-        "sparse-readback");
-    stats = backend.memoryStats();
-    require(stats.peakResidentBytes ==
-                stats.allocatedBytes + stats.sparseResidentBytes,
-            "simultaneous dense/sparse physical peak was not tracked");
-    constexpr uint32_t kSparseValue = 91;
-    ComputeDispatch sparseDispatch;
-    sparseDispatch.pipelineName = "sparse_fill_copy_u32";
-    sparseDispatch.buffers = {{0, sparse}, {1, readback}};
-    sparseDispatch.bytes = {
-        {2, &kElementCount, sizeof(kElementCount)},
-        {3, &kSparseValue, sizeof(kSparseValue)}};
-    sparseDispatch.threadgroups = {1, 1, 1};
-    sparseDispatch.threadsPerThreadgroup = {kElementCount, 1, 1};
-    (void)backend.submit(sparseDispatch);
-    auto *readbackValues = static_cast<uint32_t *>(readback.contents());
-    for (uint32_t index = 0; index < kElementCount; ++index) {
-        require(readbackValues[index] == kSparseValue + index,
-                "sparse mapping was not visible to the compute queue");
-    }
-
-    // Tiles are counted from the start of the buffer, so a view with an
-    // offset can be neither mapped nor unmapped: its tile 0 is not the
-    // buffer's.
-    MetalBuffer wide = backend.allocatePlacementSparseBuffer(
-        2 * kSparseTileBytes, kSparseTileBytes, "sparse-view-test");
-    SparseMapping viewMapping{
-        backend.view(wide, kSparseTileBytes, kSparseTileBytes), 0,
-        kSparseTileBytes, 0};
-    requireBackendError(
-        [&] { backend.mapSparse(heap, {&viewMapping, 1}); },
-        "a sparse view with an offset was mapped");
-    requireBackendError(
-        [&] { backend.unmapSparse({&viewMapping, 1}, std::move(heap)); },
-        "a sparse view with an offset was unmapped");
-    require(heap && backend.healthy(),
-            "a rejected view mapping took the heap or poisoned the backend");
-    viewMapping.buffer = {};
-    wide = {};
-
-    // Unmapping is asynchronous: the backend owns the heap until the sparse
-    // queue reports completion, and the caller's handle is left empty.
-    requireBackendError(
-        [&] { backend.unmapSparse({&sparseMapping, 1}, splash::metal::SparseHeap{}); },
-        "unmap without the mapped heap was accepted");
-    require(heap && backend.memoryStats().sparseResidentBytes == heap.sizeBytes(),
-            "rejected unmap changed heap ownership or accounting");
-    backend.unmapSparse({&sparseMapping, 1}, std::move(heap));
-    require(!heap, "asynchronous unmap left the caller a heap handle");
-    require(backend.memoryStats().pendingSparseUnmaps <= 1,
-            "more than one sparse unmap was outstanding");
-    backend.drainSparseUnmaps();
-    awaitSparseRelease(backend, 0);
-    require(!backend.sparseUnmapPending(), "drained unmap remains pending");
-    stats = backend.memoryStats();
-    require(stats.sparseResidentBytes == 0 && stats.pendingSparseUnmaps == 0 &&
-                stats.completedSparseUnmaps == 1 &&
-                stats.pendingSparseUnmapSeconds == 0.0 &&
-                std::isfinite(stats.lastSparseUnmapSeconds) &&
-                stats.lastSparseUnmapSeconds >= 0.0 &&
-                stats.maxSparseUnmapSeconds >= stats.lastSparseUnmapSeconds,
-            "completed unmap did not release its heap or record its timing");
-    sparseDispatch = {};
-    sparseMapping.buffer = {};
-    sparse = {};
-    awaitSparseRelease(backend, 0, 0);
-    require(backend.memoryStats().sparseVirtualBytes == 0,
-            "released sparse address space remains tracked");
-
+    bindingRunsKeepOffsets(backend);
     sharedMemoryCompletionLifetime(backend);
-    sparsePacedRelease(backend);
-    sparseExtentChurn(backend);
     require(capabilities.gpuCoreCount >= 1 && capabilities.gpuCoreCount <= 4096,
             "GPU core count was not read from the IORegistry");
     require(capabilities.meetsMinimumMacos(),
@@ -1435,8 +1412,20 @@ int main(int argc, const char *argv[]) {
             terminalCommandRecovers(argv[1], false, true);
             terminalCommandRecovers(argv[1], true);
             pendingCommandStillTimesOut(argv[1]);
-            keptBuffersStayResident(argv[1]);
+            synchronousWaitObeysTheWatchdog(argv[1]);
+            abandonedTicketReturnsAfterTheWatchdog(argv[1]);
+            stopRefusesSubmission(argv[1]);
+            shutdownInterruptsACommandWait(argv[1]);
+            shutdownLeavesTicketTeardownToTheCommand(argv[1]);
+            shutdownSparesACommandThatCompletes(argv[1]);
+            dispatchProfilingCoversEveryCommand(argv[1]);
+            preparedPipelinesCompileAhead(argv[1]);
+            buffersStayResident(argv[1]);
+            allocationDoesNotRequestResidency(argv[1]);
             residencyRacesTheHeartbeat(argv[1]);
+            residencyEndsWithoutBlits(argv[1]);
+            residencyReturnsRemovedBuffers(argv[1]);
+            buffersReachedThroughTables(argv[1]);
             run(argv[1]);
         } catch (const std::exception &error) {
             std::cerr << "FAIL: unexpected exception: " << error.what()

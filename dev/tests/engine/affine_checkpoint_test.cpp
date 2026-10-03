@@ -35,7 +35,7 @@ int main() {
     setenv("SPLASH_WEIGHT_CACHE", (root / "cache").c_str(), 1);
     splash::test::writeFile(root / "config.json", R"({"quantization":{"bits":4,"group_size":64,"router":{"bits":8}},"text_config":{"layers":2,"model_type":"fixture","layer_types":["linear_attention","full_attention"]}})");
     shard(root / "model.safetensors", valid);
-    SafetensorsCheckpoint source(root);
+    SafetensorsCheckpoint source(root, {});
     source.requireQuantization("projection", 4);
     source.requireQuantization("router", 8);
     source.requireConfigNumber("layers", 2);
@@ -63,14 +63,15 @@ int main() {
     const auto first = identity(source);
     shard(root / "model.safetensors", valid);
     rejects([&] { source.checkUnchanged(); }, "source weights changed", "changed source accepted");
-    require(identity(SafetensorsCheckpoint(root)) == first, "same content changed identity");
+    require(identity(SafetensorsCheckpoint(root, {})) == first, "same content changed identity");
     shard(root / "model.safetensors", R"({"__metadata__":{"format":"mlx"},"a":{"dtype":"U32","shape":[2,2],"data_offsets":[0,16]}})");
-    require(identity(SafetensorsCheckpoint(root)) == first, "a header-only edit changed the tensor identity");
+    require(identity(SafetensorsCheckpoint(root, {})) == first, "a header-only edit changed the tensor identity");
     shard(root / "model.safetensors", valid, 16, 9);
-    require(identity(SafetensorsCheckpoint(root)) != first, "changed tensor data kept its identity");
+    require(identity(SafetensorsCheckpoint(root, {})) != first, "changed tensor data kept its identity");
     shard(root / "model.safetensors", valid);
     shard(root / "extra.safetensors", valid);
-    rejects([&] { SafetensorsCheckpoint invalid(root); }, "duplicate source tensor: a", "duplicate tensor accepted");
+    rejects([&] { SafetensorsCheckpoint invalid(root, {}); }, "duplicate source tensor: a",
+            "duplicate tensor accepted");
     std::filesystem::remove(root / "extra.safetensors");
     for (const auto &[header, error] : std::initializer_list<std::pair<std::string_view, std::string_view>>{
              {R"({"a":{"dtype":"U32","shape":[2,2],"data_offsets":[0,15]}})", "safetensors data range is invalid"},
@@ -85,11 +86,11 @@ int main() {
               "overlapping source tensors"},
              {R"({"a":{"dtype":"FP4","shape":[4],"data_offsets":[0,16]}})", "unsupported safetensors dtype: FP4"}}) {
       shard(root / "model.safetensors", header);
-      rejects([&] { SafetensorsCheckpoint invalid(root); }, error,
+      rejects([&] { SafetensorsCheckpoint invalid(root, {}); }, error,
               "malformed tensor accepted: " + std::string(header));
     }
     shard(root / "model.safetensors", valid, 8);
-    rejects([&] { SafetensorsCheckpoint invalid(root); }, "safetensors data range is invalid",
+    rejects([&] { SafetensorsCheckpoint invalid(root, {}); }, "safetensors data range is invalid",
             "truncated tensor accepted");
     std::cout << "affine checkpoint: bounded reads, metadata, quantization, identity and malformed sources PASS\n";
   } catch (const std::exception &error) {

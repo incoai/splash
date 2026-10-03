@@ -63,5 +63,9 @@ struct Image {
 // Writes an image into its preallocated, zeroed destination within the
 // preparation staging bound; admit runs before each chunk.
 void writeAffineImage(int destination, const Image &image, const PreparationCheck &admit);
+// writeAffineImage for image, which outlives the writer.
+[[nodiscard]] inline WeightWriter affineImageWriter(const Image &image) {
+  return [&image](int destination, const PreparationCheck &admit) { writeAffineImage(destination, image, admit); };
+}
 
 } // namespace splash::model::affine

@@ -133,15 +133,11 @@ ifneq ($(BASELINE),)
 	$(PYTHON) -m dev.benchmarks.backend_regression --baseline "$(BASELINE)" \
 		--package "$(MODEL_ROOT)" --output-dir "$(MODEL_RESULTS)"
 else
-	@set +e; \
-		$(TEST_BACKEND_BENCHMARK) $(LIB) "$(MODEL_ROOT)" \
-			--scenario decode,partial --samples 3 \
-			--progress "$(MODEL_RESULTS)/backend-benchmark-progress.jsonl" \
-			> "$(MODEL_RESULTS)/backend-benchmark.json"; \
-		status=$$?; \
-		$(PYTHON) -m json.tool "$(MODEL_RESULTS)/backend-benchmark.json" >/dev/null \
-			|| exit 1; \
-		test $$status -eq 0 || exit $$status
+	@$(TEST_BACKEND_BENCHMARK) $(LIB) "$(MODEL_ROOT)" \
+		--scenario decode,partial --samples 3 \
+		--progress "$(MODEL_RESULTS)/backend-benchmark-progress.jsonl" \
+		> "$(MODEL_RESULTS)/backend-benchmark.json" \
+		&& $(PYTHON) -m json.tool "$(MODEL_RESULTS)/backend-benchmark.json" >/dev/null
 	@echo "native backend characterization: PASS ($(MODEL_RESULTS)/backend-benchmark.json)"
 endif
 

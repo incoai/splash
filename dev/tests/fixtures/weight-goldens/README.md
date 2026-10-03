@@ -2,7 +2,8 @@
 
 - `gguf_dequantization`: upstream GGML's fp32 dequantization of the reference
   fixture of each GGUF format (`gguf-reference`). They pin the CPU reference
-  (`dev/tests/engine/GgufFormatReference.hpp`) to llama.cpp 7ab4ee7, so no
+  (`dev/tests/engine/GgufFormatReference.hpp`) to llama.cpp 7ab4ee7, and
+  PQ2_0, which upstream GGML lacks, to PrismML-Eng/llama.cpp 01ae597, so no
   Splash change touches them.
 - `gguf_images`: every image `gguf-preparation` prepares from its dense and
   MoE GGUF fixtures.
@@ -47,6 +48,7 @@ means to change them:
    why.
 
 The dequantization hashes change only with the fixture itself. Regenerate
-them with a libggml-base built from llama.cpp 7ab4ee7:
+them with a libggml-base built from llama.cpp 7ab4ee7 (PrismML-Eng/llama.cpp
+01ae597 for PQ2_0; its other formats decode as upstream's):
 `SPLASH_GGML_ORACLE=<libggml-base.dylib> build/engine-tests/gguf-reference dev/tests/fixtures/weight-goldens/goldens.json`
 compares the reference with GGML and prints GGML's hash of each format.

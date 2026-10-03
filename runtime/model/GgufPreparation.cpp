@@ -68,16 +68,41 @@ std::span<uint8_t> narrowToBfloat16(std::span<uint8_t> bytes, const std::string 
   return bytes.first(2 * count);
 }
 
+// BF16 values widened in place to the F32 values they equal: bytes holds
+// the BF16 values in its first half.
+std::span<uint8_t> widenToFloat32(std::span<uint8_t> bytes) {
+  const uint64_t count = bytes.size() / 4;
+  for (uint64_t i = count; i-- > 0;) {
+    uint16_t value;
+    std::memcpy(&value, bytes.data() + 2 * i, 2);
+    const uint32_t widened = uint32_t{value} << 16;
+    std::memcpy(bytes.data() + 4 * i, &widened, 4);
+  }
+  return bytes;
+}
+
+// Destination bytes of source bytes: halved when narrowed, doubled when widened.
+uint64_t copiedBytes(const gguf::Copy &copy, uint64_t sourceBytes) {
+  switch (copy.conversion) {
+  case gguf::Conversion::NarrowToBfloat16: return sourceBytes / 2;
+  case gguf::Conversion::WidenToFloat32: return sourceBytes * 2;
+  case gguf::Conversion::None: break;
+  }
+  return sourceBytes;
+}
+
 uint64_t copyBytes(const gguf::Copy &copy) {
-  return copy.source.rows * copy.source.rowBytes / (copy.bfloat16 ? 2 : 1);
+  return copiedBytes(copy, copy.source.rows * copy.source.rowBytes);
 }
 
 void writeCopy(const WeightSource &source, int destination, const gguf::Copy &copy,
                std::span<uint8_t> staging, const PreparationCheck &admit) {
   const gguf::TensorRows &rows = copy.source;
   // Whole rows per read where they fit; a wider row in pieces of whole values.
-  const uint64_t span = std::min<uint64_t>(rows.rowBytes, staging.size() & ~uint64_t{3});
-  const uint64_t batch = span == rows.rowBytes ? staging.size() / rows.rowBytes : 1;
+  // A widened read takes half the staging, which holds its F32 values.
+  const uint64_t room = copy.conversion == gguf::Conversion::WidenToFloat32 ? staging.size() / 2 : staging.size();
+  const uint64_t span = std::min<uint64_t>(rows.rowBytes, room & ~uint64_t{3});
+  const uint64_t batch = span == rows.rowBytes ? room / rows.rowBytes : 1;
   for (uint64_t first = 0; first < rows.rows; first += batch) {
     const uint64_t count = std::min(batch, rows.rows - first);
     for (uint64_t column = 0; column < rows.rowBytes; column += span) {
@@ -85,9 +110,12 @@ void writeCopy(const WeightSource &source, int destination, const gguf::Copy &co
       const uint64_t width = std::min(span, rows.rowBytes - column);
       auto bytes = staging.first(count * width);
       readRows(source, rows, first, count, column, width, bytes.data());
-      if (copy.bfloat16) bytes = narrowToBfloat16(bytes, rows.name);
-      writeWeightBytes(destination, copy.destination + (first * rows.rowBytes + column) / (copy.bfloat16 ? 2 : 1),
-                       bytes);
+      switch (copy.conversion) {
+      case gguf::Conversion::NarrowToBfloat16: bytes = narrowToBfloat16(bytes, rows.name); break;
+      case gguf::Conversion::WidenToFloat32: bytes = widenToFloat32(staging.first(2 * count * width)); break;
+      case gguf::Conversion::None: break;
+      }
+      writeWeightBytes(destination, copy.destination + copiedBytes(copy, first * rows.rowBytes + column), bytes);
     }
   }
 }
@@ -210,7 +238,7 @@ void writeRepack(metal::MetalBackend &backend, const WeightSource &source, int d
 PreparedWeight ggufImageWeight(const WeightSource &source, const gguf::Image &image) {
   // The envelope version covers identity serialization. Conversion code and
   // its storage ABI are fingerprinted at build time, independently of tuning.
-  WeightIdentity identity("splash-gguf-preparation-v2 " SPLASH_GGUF_PREPARATION_ID);
+  WeightIdentity identity("splash-gguf-preparation-v3 " SPLASH_GGUF_PREPARATION_ID);
   identity.record("image", image.layer, image.type, image.bytes);
   const auto input = [&](const gguf::TensorRows &rows) {
     const uint64_t shape[] = {rows.rows, rows.rowBytes};
@@ -220,7 +248,7 @@ PreparedWeight ggufImageWeight(const WeightSource &source, const gguf::Image &im
   };
   for (const gguf::Fill &fill : image.fills) identity.record("fill", fill.offset, weightDigest(fill.bytes));
   for (const gguf::Copy &copy : image.copies) {
-    identity.record("copy", copy.destination, copy.bfloat16);
+    identity.record("copy", copy.destination, static_cast<uint32_t>(copy.conversion));
     input(copy.source);
   }
   for (const gguf::Repack &repack : image.repacks) {
@@ -232,7 +260,6 @@ PreparedWeight ggufImageWeight(const WeightSource &source, const gguf::Image &im
 
 void writeGgufImage(metal::MetalBackend &backend, const WeightSource &source, int destination,
                     const gguf::Image &image, const PreparationCheck &admit) {
-  admit();
   for (const gguf::Fill &fill : image.fills) {
     requireRange(fill.offset, fill.bytes.size(), image.bytes);
     writeWeightBytes(destination, fill.offset, fill.bytes);
@@ -241,10 +268,14 @@ void writeGgufImage(metal::MetalBackend &backend, const WeightSource &source, in
   // quantization operation. One staging buffer serves every copy.
   uint64_t copyStaging = 0;
   for (const gguf::Copy &copy : image.copies) {
-    if (!copy.source.rows || !copy.source.rowBytes || (copy.bfloat16 && copy.source.rowBytes % 4))
+    if (!copy.source.rows || !copy.source.rowBytes ||
+        (copy.conversion != gguf::Conversion::None && copy.source.rowBytes % 4))
       throw GgufError("invalid prepared weight copy");
     requireRange(copy.destination, copyBytes(copy), image.bytes);
-    copyStaging = std::max(copyStaging, std::min(copy.source.rows * copy.source.rowBytes, kWeightPreparationStagingBytes));
+    // A widened copy stages its F32 values.
+    const uint64_t staged =
+        copy.conversion == gguf::Conversion::WidenToFloat32 ? copyBytes(copy) : copy.source.rows * copy.source.rowBytes;
+    copyStaging = std::max(copyStaging, std::min(staged, kWeightPreparationStagingBytes));
   }
   {
     std::vector<uint8_t> staging(copyStaging);
@@ -266,7 +297,6 @@ void writeGgufImage(metal::MetalBackend &backend, const WeightSource &source, in
     for (size_t i = 0; i < image.repacks.size(); ++i)
       writeRepack(backend, source, destination, image.repacks[i], chunks[i], input, output, admit);
   }
-  admit();
 }
 
 } // namespace splash::model

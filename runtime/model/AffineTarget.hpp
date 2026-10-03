@@ -5,6 +5,7 @@
 
 #include <memory>
 #include <span>
+#include <vector>
 
 namespace splash::model {
 
@@ -18,13 +19,15 @@ struct Qwen3_6MoeLayout;
 class AffineTargetLoader final {
 public:
   AffineTargetLoader(metal::MetalBackend &backend, const std::filesystem::path &directory,
-                     const Qwen3_8Layout &layout, PreparationCheck admitConversion = {});
+                     const Qwen3_8Layout &layout, PreparationCheck admitConversion);
   AffineTargetLoader(metal::MetalBackend &backend, const std::filesystem::path &directory,
-                     const Qwen3_6MoeLayout &layout, PreparationCheck admitConversion = {});
+                     const Qwen3_6MoeLayout &layout, PreparationCheck admitConversion);
   ~AffineTargetLoader();
   // Every image's cache identity and size, layers first, for the model's
   // disk check before the first image is written.
   [[nodiscard]] std::span<const PreparedWeight> weights() const noexcept;
+  // Writes every missing image and maps none.
+  void prepare();
   [[nodiscard]] WeightFile layer(uint32_t index);
   [[nodiscard]] WeightFile head();
   [[nodiscard]] WeightFile embedding();
@@ -33,10 +36,9 @@ private:
   std::unique_ptr<Impl> impl_;
 };
 
-[[nodiscard]] uint64_t preparedAffineBytes(const Qwen3_8Layout &layout);
-[[nodiscard]] uint64_t preparedAffineBytes(const Qwen3_6MoeLayout &layout);
-// The planned image of target layer `layer`: its sections at their offsets.
-[[nodiscard]] affine::Image affineLayerImage(const Qwen3_8Layout &layout, uint32_t layer);
-[[nodiscard]] affine::Image affineLayerImage(const Qwen3_6MoeLayout &layout, uint32_t layer);
+// Every planned image of a layout, its sections at their offsets: the layers,
+// the head, the embedding.
+[[nodiscard]] std::vector<affine::Image> affineTargetImages(const Qwen3_8Layout &layout);
+[[nodiscard]] std::vector<affine::Image> affineTargetImages(const Qwen3_6MoeLayout &layout);
 
 } // namespace splash::model

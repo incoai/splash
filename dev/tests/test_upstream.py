@@ -114,6 +114,11 @@ class UpstreamTest(unittest.TestCase):
             "Qwen3.8-27B-XL-Q4_K_M.gguf",
         ):
             upstream.select_gguf(files | {"Qwen3.8-27B-XL-Q4_K_M.gguf"}, "Q4_K_M")
+        # A projector is never a target, however its publisher names it.
+        self.assertEqual(
+            upstream.select_gguf({"Model-PQ2_0.gguf", "Model-mmproj-BF16.gguf"}, None),
+            ("Model-PQ2_0.gguf", False),
+        )
         # A repository of one GGUF has no shared name to strip, and needs no
         # variant.
         for variant in ("UD-Q4_K_M", "Q4_K_M", None):
@@ -276,8 +281,13 @@ class UpstreamTest(unittest.TestCase):
                 chosen = selection(self.root, "user/custom", language_only=False)
                 with self.assertRaisesRegex(
                     models.ModelError, "must come from the target repository"
-                ):
+                ) as refused:
                     self.prepare(chosen)
+                # A text-only checkpoint lacks only the processor.
+                self.assertEqual(
+                    "use --language-only to serve text only" in str(refused.exception),
+                    missing == "preprocessor_config.json",
+                )
                 self.assertEqual(fake.downloads, [])
                 self.assertFalse(chosen.models_root.exists())
                 shutil.rmtree(fake.remote)

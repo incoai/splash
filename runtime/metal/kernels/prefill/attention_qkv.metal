@@ -1,4 +1,5 @@
 #include "metal/abi/KernelABI.h"
+#include "metal/kernels/common/activation.h"
 #include "metal/kernels/common/attention_qkv_prepare.h"
 
 // W: the q/k norm weights' stored type (float: a GGUF's F32 norms, _f32).
@@ -10,8 +11,8 @@
       device const float *rope_cos [[buffer(3)]],                             \
       device const float *rope_sin [[buffer(4)]],                             \
       device bfloat *queries [[buffer(5)]],                                   \
-      device bfloat *key_cache [[buffer(6)]],                                 \
-      device bfloat *value_cache [[buffer(7)]],                               \
+      device bfloat *chunk_keys [[buffer(6)]],                                \
+      device bfloat *chunk_values [[buffer(7)]],                              \
       constant FullPrefillParams &params [[buffer(8)]],                       \
       uint task [[threadgroup_position_in_grid]],                             \
       uint thread_index [[thread_index_in_threadgroup]],                      \
@@ -20,8 +21,8 @@
     threadgroup float reductions[8];                                          \
     threadgroup bfloat normalized[256];                                       \
     full_qkv_storage_phase<QHeads, KHeads>(                                   \
-        qkv, q_norm, k_norm, rope_cos, rope_sin, queries, key_cache,          \
-        value_cache, params, reductions, normalized, task, thread_index,      \
+        qkv, q_norm, k_norm, rope_cos, rope_sin, queries, chunk_keys,         \
+        chunk_values, params, reductions, normalized, task, thread_index,     \
         lane, simd_group);                                                    \
   }
 PREFILL_ATTENTION_QKV(prefill_attention_qkv, 24, 4, bfloat)
@@ -46,16 +47,16 @@ inline void full_attention_gate_prefill_phase(
     uint dim = remainder % HeadDim;
     float gate = float(packed_qkv[ulong(row) * PackedStride +
                                   query_head * QStride + HeadDim + dim]);
-    float sigmoid = 1.0f / (1.0f + fast::exp2(-1.44269504089f * gate));
+    float gate_scale = splash_sigmoid(gate);
     uint kv_head = query_head / HeadsPerKV;
     uint local_head = query_head % HeadsPerKV;
     hidden[element] = bfloat(
-        float(attention[((ulong(kv_head) * params.row_stride + row) *
+        float(attention[((ulong(kv_head) * params.stride + row) *
                              HeadsPerKV +
                          local_head) *
                             HeadDim +
                         dim]) *
-        sigmoid);
+        gate_scale);
   }
 }
 

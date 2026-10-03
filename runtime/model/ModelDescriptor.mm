@@ -4,6 +4,7 @@
 #import <Foundation/Foundation.h>
 
 #include <array>
+#include <cmath>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -18,8 +19,7 @@ struct GeometryField final {
 };
 
 constexpr auto kExecutionGeometry = std::to_array<GeometryField>(
-    {{"allocation_extent_target_bytes", kv::kAllocationExtentTargetBytes},
-     {"draft_proposal_tokens", ExecutionLimits::draftProposalTokens},
+    {{"draft_proposal_tokens", ExecutionLimits::draftProposalTokens},
      {"draft_query_rows", ExecutionLimits::draftQueryRows},
      {"draft_sliding_window", ExecutionLimits::draftContextTokens},
      {"maximum_batch_width", ExecutionLimits::maximumBatchWidth},
@@ -94,14 +94,21 @@ uint64_t requireUnsigned(NSDictionary *object, NSString *key,
                                 " must be an unsigned integer");
   }
   NSNumber *number = static_cast<NSNumber *>(value);
-  if (CFNumberIsFloatType((__bridge CFNumberRef)number) ||
-      number.longLongValue <= 0 ||
-      static_cast<uint64_t>(number.longLongValue) !=
-          number.unsignedLongLongValue) {
-    throw std::invalid_argument(std::string(label) +
-                                " must be a positive unsigned integer");
+  if (CFNumberIsFloatType((__bridge CFNumberRef)number)) {
+    // A config saved from Python writes a float that holds a whole number,
+    // rope_theta=1e7 as 10000000.0, and the installer compares it equal to
+    // that integer. A double holds every integer exactly up to 2^53 - 1.
+    const double real = number.doubleValue;
+    if (std::isfinite(real) && real >= 1 && real <= 9007199254740991.0 &&
+        std::floor(real) == real)
+      return static_cast<uint64_t>(real);
+  } else if (number.longLongValue > 0 &&
+             static_cast<uint64_t>(number.longLongValue) ==
+                 number.unsignedLongLongValue) {
+    return number.unsignedLongLongValue;
   }
-  return number.unsignedLongLongValue;
+  throw std::invalid_argument(std::string(label) +
+                              " must be a positive unsigned integer");
 }
 
 void requireEqual(uint64_t actual, uint64_t expected,
@@ -365,7 +372,6 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
         throw std::invalid_argument("draft target capture layers do not match this model");
     }
   }, result.target);
-  result.draftSource = DraftSource::Checkpoint;
 
   const auto vision = requireString(record, @"vision_format", "vision format");
   if (vision == "none") result.visionSource = VisionSource::None;
@@ -399,16 +405,8 @@ ModelDescriptor makeModelDescriptor(std::string name, TargetLayout target,
   result.vision = vision;
   std::visit(
       [&](const auto &layout) {
-        result.capabilities = {
-            layout.vocabularySize,
-            layout.maximumContextTokens,
-            ExecutionLimits::maximumBatchWidth,
-            ExecutionLimits::prefillTokenBudget,
-            ExecutionLimits::draftQueryRows,
-            ExecutionLimits::draftProposalTokens,
-            ExecutionLimits::targetVerifyRows,
-            ExecutionLimits::draftContextTokens,
-        };
+        result.capabilities = {layout.vocabularySize,
+                               layout.maximumContextTokens};
         result.targetKvLayout = layout.kvLayout();
         result.stateLayout = {layout.gdnStateLayout(), draft.stateLayout()};
       },
@@ -417,15 +415,8 @@ ModelDescriptor makeModelDescriptor(std::string name, TargetLayout target,
 }
 
 bool ModelDescriptor::valid() const noexcept {
-  if ((targetSource != TargetSource::Packed && targetSource != TargetSource::Mlx && targetSource != TargetSource::Gguf) ||
-      name.empty() || !capabilities.vocabularySize ||
+  if (name.empty() || !capabilities.vocabularySize ||
       !capabilities.maximumContextTokens ||
-      capabilities.maximumBatchWidth != ExecutionLimits::maximumBatchWidth ||
-      capabilities.prefillTokenBudget != ExecutionLimits::prefillTokenBudget ||
-      capabilities.draftQueryRows != ExecutionLimits::draftQueryRows ||
-      capabilities.draftProposalTokens != ExecutionLimits::draftProposalTokens ||
-      capabilities.targetVerifyRows != ExecutionLimits::targetVerifyRows ||
-      capabilities.draftContextTokens != ExecutionLimits::draftContextTokens ||
       !targetKvLayout.valid() || !stateLayout.valid() ||
       stateLayout.draft != draft.stateLayout() ||
       vision.outputHiddenSize != draft.hiddenSize) {

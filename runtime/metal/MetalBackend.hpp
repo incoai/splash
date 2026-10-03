@@ -2,7 +2,6 @@
 
 #include "metal/DeviceCapabilities.hpp"
 
-#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -17,18 +16,16 @@ namespace splash::metal {
 
 enum class AllocationFailure : uint8_t {
   None,
-  Capacity, // Unclassified capacity refusal from an alternate backing.
   EngineBudget,
   HostPressure,
   DriverRejected,
 };
 
 struct AllocationResult final {
-  AllocationFailure failure;
-  AllocationResult(bool granted)
-      : failure(granted ? AllocationFailure::None
-                        : AllocationFailure::Capacity) {}
-  AllocationResult(AllocationFailure reason) : failure(reason) {}
+  AllocationFailure failure = AllocationFailure::None;
+  // Granted.
+  AllocationResult() noexcept = default;
+  AllocationResult(AllocationFailure reason) noexcept : failure(reason) {}
   [[nodiscard]] explicit operator bool() const noexcept {
     return failure == AllocationFailure::None;
   }
@@ -38,7 +35,6 @@ struct AllocationResult final {
     AllocationFailure failure) noexcept {
   switch (failure) {
   case AllocationFailure::None: return "none";
-  case AllocationFailure::Capacity: return "allocation capacity unavailable";
   case AllocationFailure::EngineBudget: return "engine memory budget exceeded";
   case AllocationFailure::HostPressure: return "host memory reserve protected";
   case AllocationFailure::DriverRejected:
@@ -47,10 +43,10 @@ struct AllocationResult final {
   return "unknown allocation failure";
 }
 
-// Physical allocators use this callback to obtain engine-governed headroom
+// Allocators use this callback to obtain engine-governed headroom
 // without depending on the engine policy type. The operation runs while the
-// caller's reservation is held and returns false without side effects when
-// admission is denied.
+// caller's reservation is held; the callback returns the refusal's cause,
+// with no side effects, when admission is denied.
 using AllocationAdmission =
     std::function<AllocationResult(uint64_t, const std::function<void()> &)>;
 
@@ -61,7 +57,6 @@ enum class BufferStorage {
 
 class MetalBackend;
 class CommandTicket;
-class SparseHeap;
 
 // A cheap, copyable reference to a backend-owned Metal allocation. Views keep
 // the base allocation alive and do not increase the tracked allocation count.
@@ -79,6 +74,9 @@ public:
   [[nodiscard]] BufferStorage storage() const noexcept;
   // Returns nullptr for private buffers. The pointer covers this view only.
   [[nodiscard]] void *contents() const noexcept;
+  // GPU address of the view's first byte, for kernels that reach a buffer
+  // through an address another buffer holds.
+  [[nodiscard]] uint64_t gpuAddress() const noexcept;
   // Allocation identity and exact view range, including Private storage.
   // This compares metadata only; it never maps or reads device contents.
   [[nodiscard]] bool sameView(const MetalBuffer &other) const noexcept;
@@ -90,39 +88,6 @@ private:
   std::shared_ptr<Impl> impl_;
 
   friend class MetalBackend;
-};
-
-// Move-only ownership of one private placement heap. Destroying an empty heap
-// is the operation that actually returns sparse KV backing to the OS; merely
-// unmapping tiles is not sufficient on Apple Silicon.
-class SparseHeap final {
-public:
-  SparseHeap();
-  ~SparseHeap();
-  SparseHeap(const SparseHeap &) = delete;
-  SparseHeap &operator=(const SparseHeap &) = delete;
-  SparseHeap(SparseHeap &&) noexcept;
-  SparseHeap &operator=(SparseHeap &&) noexcept;
-
-  [[nodiscard]] explicit operator bool() const noexcept;
-  [[nodiscard]] uint64_t sizeBytes() const noexcept;
-private:
-  struct Impl;
-  explicit SparseHeap(std::shared_ptr<Impl> impl);
-
-  std::shared_ptr<Impl> impl_;
-
-  friend class MetalBackend;
-};
-
-// Tiles [bufferOffsetBytes, bufferOffsetBytes + sizeBytes) of a
-// placement-sparse buffer, never a view with an offset, backed from
-// heapOffsetBytes of a placement heap.
-struct SparseMapping {
-  MetalBuffer buffer;
-  uint64_t bufferOffsetBytes = 0;
-  uint64_t sizeBytes = 0;
-  uint64_t heapOffsetBytes = 0;
 };
 
 struct DispatchSize {
@@ -156,18 +121,14 @@ struct CommandTiming {
   double wallSeconds = 0.0;
 };
 
-// GPU time of one dispatch replayed as its own command while profiling.
-struct DispatchTiming {
-  std::string pipelineName;
-  double gpuSeconds = 0.0;
-};
-
-// Move-only ownership of one submitted Metal command, including any resource
-// dependency wait before GPU commitment. Completion is signalled
+// Move-only ownership of one submitted Metal command. Completion is signalled
 // without blocking the submitting thread; wait() is normally called only
 // after the host event loop receives the completion notification.
 // Destroying or replacing an unfinished ticket waits for GPU completion and
-// retains its allocations throughout that wait.
+// retains its allocations throughout that wait. Each of these waits runs the
+// command watchdog every second: once the watchdog gives up on the command,
+// wait() throws MetalBackendError and destruction or replacement returns,
+// leaving the allocations to the command's completion handler.
 class CommandTicket final {
 public:
   CommandTicket();
@@ -177,8 +138,6 @@ public:
   CommandTicket(CommandTicket &&) noexcept;
   CommandTicket &operator=(CommandTicket &&) noexcept;
 
-  [[nodiscard]] explicit operator bool() const noexcept;
-  [[nodiscard]] uint64_t sequence() const noexcept;
   [[nodiscard]] bool ready() const noexcept;
   [[nodiscard]] CommandTiming wait();
 
@@ -191,7 +150,7 @@ private:
   friend class MetalBackend;
 };
 
-using CommandCompletion = std::function<void(uint64_t sequence)>;
+using CommandCompletion = std::function<void()>;
 
 // Bytes one allocation added between two memoryStats() readings.
 [[nodiscard]] inline uint64_t allocationDelta(uint64_t before, uint64_t after) {
@@ -211,35 +170,9 @@ struct MetalMemoryStats {
   // with an in-flight GPU command.
   uint64_t deviceCurrentAllocatedBytes = 0;
   // Highest sampled device.currentAllocatedSize. Sampled after allocations
-  // and pipeline creation, before submission, and on host-side retirement.
+  // and pipeline creation, on host-side retirement and whenever admission
+  // refreshes the stats.
   uint64_t devicePeakAllocatedBytes = 0;
-
-  // Placement-sparse buffers reserve virtual GPU address space without
-  // committing it. Resident bytes count live placement heaps, which are the
-  // reclaimable physical unit.
-  uint64_t sparseVirtualBytes = 0;
-  uint64_t sparseResidentBytes = 0;
-  uint64_t peakSparseResidentBytes = 0;
-
-  // Peak of the simultaneous dense + sparse physical allocations. The two
-  // component peaks above can occur at different times and must not be added.
-  uint64_t peakResidentBytes = 0;
-
-  // Placement-sparse unmapping is asynchronous. The heap of an unmapped
-  // extent stays retained, and counted resident, until the sparse queue
-  // reports that unmap complete; at most one unmap is outstanding. Durations
-  // are observed at the next backend safe point, not measured by the kernel.
-  uint64_t sparseTileBytes = 0;
-  uint64_t pendingSparseUnmaps = 0;
-  uint64_t completedSparseUnmaps = 0;
-  double lastSparseUnmapSeconds = 0.0;
-  double maxSparseUnmapSeconds = 0.0;
-  double pendingSparseUnmapSeconds = 0.0;
-  // Host-side dependency wait before committing a compute command.
-  uint64_t sparseMapWaitEvent = 0;
-  double pendingSparseMapWaitSeconds = 0.0;
-  double lastSparseMapWaitSeconds = 0.0;
-  double maxSparseMapWaitSeconds = 0.0;
 };
 
 class MetalBackendError : public std::runtime_error {
@@ -248,7 +181,8 @@ public:
 };
 
 // A normal capacity failure. Callers may evict cache or return a retryable
-// admission error; the Metal backend remains healthy.
+// admission error; the Metal backend remains healthy. MemoryGovernor's
+// allocationAdmission is the one place it becomes a value (AllocationResult).
 class MetalAllocationError final : public MetalBackendError {
 public:
   explicit MetalAllocationError(
@@ -260,86 +194,67 @@ private:
   AllocationFailure failure_;
 };
 
+// The capabilities a backend reads, without loading kernels or allocating:
+// enough to refuse an unsupported Mac before a model is downloaded.
+[[nodiscard]] DeviceCapabilities probeDeviceCapabilities();
+
+// How long a command may run before the backend gives up on it, and how long
+// every buffer stays wired after the last command (see allocateBuffer). Tests
+// substitute shorter ones through TestConfig.
+inline constexpr double kCommandTimeoutSeconds = 120.0;
+inline constexpr double kResidencyKeepAliveSeconds = 600.0;
+static_assert(kCommandTimeoutSeconds > 0.0 && kResidencyKeepAliveSeconds > 0.0);
+
 // Permits exactly one submitted-but-not-applied command on its command queue.
+// One thread submits, allocates and looks up pipelines; checkHealth(),
+// healthy(), unhealthyReason(), memoryStats() and commandInFlight() may be
+// called from any thread.
 class MetalBackend final {
 public:
-  // A sparse map a command waits for, or an unmap, still pending after
-  // sparseTimeoutMilliseconds fails the command or the backend. Buffers kept
-  // resident stay wired until residencyKeepAliveSeconds pass without a
-  // command.
-  explicit MetalBackend(std::string metallibPath,
-                        double commandTimeoutSeconds = 120.0,
-                        uint32_t sparseTimeoutMilliseconds = 30000,
-                        double residencyKeepAliveSeconds = 600.0);
+  explicit MetalBackend(std::string metallibPath);
   ~MetalBackend();
   // Invoked before allocations and submissions; may throw to stop bootstrap.
   void setOperationGuard(std::function<void()> guard);
+  // Asked between the slices of a ticket's wait(); true gives up the wait as
+  // the watchdog does and marks the backend unhealthy: the process is
+  // shutting down. Destroying or replacing a ticket still waits for its
+  // command.
+  void setWaitInterrupt(std::function<bool()> shuttingDown);
   void checkOperation() const;
-  // Stop new submissions and cancel dependency waits before teardown.
-  // Commands already committed to the GPU retain their normal lifetime.
+  // Stop new submissions before teardown. Commands already committed to the
+  // GPU retain their normal lifetime.
   void stop() noexcept;
 
   MetalBackend(const MetalBackend &) = delete;
   MetalBackend &operator=(const MetalBackend &) = delete;
-  MetalBackend(MetalBackend &&) noexcept;
-  MetalBackend &operator=(MetalBackend &&) noexcept;
+  MetalBackend(MetalBackend &&) = delete;
+  MetalBackend &operator=(MetalBackend &&) = delete;
 
   [[nodiscard]] const DeviceCapabilities &capabilities() const noexcept;
 
+  // Every buffer the backend allocates or wraps belongs to one residency set,
+  // attached to the command queue, until its last view is gone. Metal by
+  // itself wires a buffer only while a command uses it and a few seconds
+  // after, so memory pressure could compress idle state or drop idle weights
+  // and the next request would wait to get them back. A member is wired from
+  // its allocation on until the keep-alive passes without a command, and
+  // again from the next command: memory goes back to macOS when the engine
+  // releases it, not when macOS chooses. Kernels may also reach a Shared
+  // buffer only through its GPU address held in another buffer, as they
+  // reach KV extents: residency makes it resident for every command, so no
+  // command names it.
   [[nodiscard]] MetalBuffer
-  allocateBuffer(uint64_t bytes, BufferStorage storage = BufferStorage::Shared,
-                 std::string_view label = {});
-
-  // Private sparse buffers use the shared 64 KiB tile ABI. Per-layer scale
-  // ranges must stay tile-aligned; fewer dirty tiles reduce unmap cost.
-  [[nodiscard]] MetalBuffer
-  allocatePlacementSparseBuffer(uint64_t virtualBytes, uint64_t sparsePageBytes,
-                                std::string_view label = {});
-  [[nodiscard]] SparseHeap allocatePlacementHeap(uint64_t physicalBytes,
-                                                 uint64_t sparsePageBytes,
-                                                 std::string_view label = {});
-
-  // Mapping is ordered before the next compute command by an internal
-  // Metal event. Unmapping is only legal with no submitted command. It is
-  // asynchronous: the backend takes ownership of the mapped heap and keeps it
-  // resident until the sparse queue reports the unmap complete, which is
-  // observed at later safe points. Only one unmap may be outstanding; a
-  // second call first waits for the previous unmap. Unmapping GPU-written
-  // tiles is kernel work that can stall the whole GPU stack when issued in
-  // bursts, so callers pace releases with sparseUnmapPending().
-  void mapSparse(const SparseHeap &heap,
-                 std::span<const SparseMapping> mappings);
-  void unmapSparse(std::span<const SparseMapping> mappings, SparseHeap &&heap);
-  // Reports whether an unmap is still outstanding, reaping a completed one
-  // (releasing its heap) when no command is being encoded.
-  // Never blocks. Marks the backend unhealthy once the outstanding unmap has
-  // been pending longer than the drain's bounded wait.
-  [[nodiscard]] bool sparseUnmapPending() noexcept;
-  // Placement-sparse page (tile) size shared with the KV page layout.
-  static constexpr uint64_t kPlacementSparsePageBytes = 64 * 1024;
-  // Blocks until the outstanding unmap, if any, has completed. A bounded
-  // timeout marks the backend unhealthy; use only at startup and shutdown.
-  void drainSparseUnmaps();
+  allocateBuffer(uint64_t bytes, BufferStorage storage,
+                 std::string_view label);
 
   // Wraps page-aligned shared memory without copying it. The lifetime token
   // is retained by Metal's deallocator, including any internal buffer owners
   // that outlive our C++ views and completed tickets.
   [[nodiscard]] MetalBuffer wrapSharedMemory(void *address, uint64_t bytes,
                                              std::shared_ptr<void> lifetime,
-                                             std::string_view label = {});
+                                             std::string_view label);
   [[nodiscard]] MetalBuffer view(const MetalBuffer &base, uint64_t offsetBytes,
                                  uint64_t lengthBytes) const;
-
-  // Metal wires a buffer only while a command uses it and a few seconds
-  // after, so memory pressure can drop idle weights and the next request
-  // reads them from disk again. A kept buffer (the base allocation of a view)
-  // is wired from here on until the keep-alive passes without a command, and
-  // again from the next command, until the allocation's last view is gone.
-  // Keeping a buffer twice throws.
-  void keepResident(const MetalBuffer &buffer);
-  // The kept bytes whose residency the keep-alive has ended, until the next
-  // command holds them again; Metal unwires them shortly after the end.
-  [[nodiscard]] uint64_t lapsedResidentBytes() const noexcept;
 
   // Encodes exactly one compute dispatch, commits it, waits for completion,
   // and reports both GPU and end-to-end wall time.
@@ -353,39 +268,37 @@ public:
   // notifies host control flow; command results and errors are consumed from
   // the returned ticket. A second command is rejected until wait() consumes
   // the first ticket, preserving the one-in-flight runtime invariant.
-  [[nodiscard]] CommandTicket
-  submitAsync(const ComputeDispatch &dispatch,
-              CommandCompletion completion = {});
+  [[nodiscard]] CommandTicket submitAsync(const ComputeDispatch &dispatch);
   [[nodiscard]] CommandTicket
   submitCommandAsync(std::span<const ComputeDispatch> dispatches,
                      CommandCompletion completion = {});
 
-  // Development profiling replays a multi-dispatch command synchronously,
-  // one dispatch per command buffer. Even submitCommandAsync() then blocks,
-  // invokes completion inline and returns an already-completed ticket.
-  // Production serving leaves this disabled. Benchmarks read and clear the
-  // per-dispatch timings with takeDispatchProfile().
-  void setDispatchProfiling(bool enabled) noexcept;
-  [[nodiscard]] std::vector<DispatchTiming> takeDispatchProfile();
+  // Startup: compiles now the pipelines a later submission of these
+  // dispatches would compile. Validates them as submission does and throws
+  // as it would, but encodes and commits nothing.
+  void preparePipelines(std::span<const ComputeDispatch> dispatches);
 
   [[nodiscard]] MetalMemoryStats memoryStats() const noexcept;
   // Explicit safe-point refresh for memory admission/reclamation code. A
   // control-plane status query must use memoryStats() so it can never wait
   // behind an active Metal command.
   [[nodiscard]] MetalMemoryStats refreshMemoryStats() const noexcept;
-  [[nodiscard]] uint64_t submissionCount() const noexcept;
-  [[nodiscard]] size_t pipelineCount() const noexcept;
+  // True from a submission until its ticket has been consumed: while memory
+  // the command reaches through addresses must stay allocated.
+  [[nodiscard]] bool commandInFlight() const noexcept;
   [[nodiscard]] bool healthy() const noexcept;
-  // Serving-loop check of actual GPU commands and pending unmaps. Terminal
-  // results may invoke completion here if the driver callback is delayed.
+  // Serving-loop check of the command in flight. Terminal results may invoke
+  // completion here if the driver callback is delayed.
   // Timeout marks the backend unhealthy without releasing in-flight resources.
+  // A synchronous ticket wait runs the same command watchdog.
   void checkHealth();
-  [[nodiscard]] bool needsHealthCheck() const noexcept;
   [[nodiscard]] std::string unhealthyReason() const;
 
 private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
+
+  friend class BackendInstrumentation;
 };
 
 } // namespace splash::metal

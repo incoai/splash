@@ -1,9 +1,11 @@
 #pragma once
 
+#include "model/AffinePreparation.hpp"
 #include "model/PreparedFiles.hpp"
 
 #include <memory>
 #include <span>
+#include <vector>
 
 namespace splash::model {
 
@@ -17,11 +19,13 @@ struct DFlashDraftLayout;
 class DraftCheckpointLoader final {
 public:
   DraftCheckpointLoader(metal::MetalBackend &backend, const std::filesystem::path &directory,
-                        const DFlashDraftLayout &layout, PreparationCheck admitConversion = {});
+                        const DFlashDraftLayout &layout, PreparationCheck admitConversion);
   ~DraftCheckpointLoader();
   // Every file's cache identity and size, layers first, for the model's disk
   // check before the first file is written.
   [[nodiscard]] std::span<const PreparedWeight> weights() const noexcept;
+  // Writes every missing file and maps none.
+  void prepare();
   [[nodiscard]] WeightFile layer(uint32_t index);
   [[nodiscard]] WeightFile model();
 
@@ -30,6 +34,8 @@ private:
   std::unique_ptr<Impl> impl_;
 };
 
-[[nodiscard]] uint64_t preparedDraftBytes(const DFlashDraftLayout &layout);
+// Every planned file of a layout, its sections at their offsets: the layers,
+// then model.bin.
+[[nodiscard]] std::vector<affine::Image> draftCheckpointImages(const DFlashDraftLayout &layout);
 
 } // namespace splash::model

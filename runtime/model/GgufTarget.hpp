@@ -4,8 +4,8 @@
 // serving uses the same read-only WeightFile mappings as packaged weights.
 
 #include <filesystem>
+#include <optional>
 #include <span>
-#include <vector>
 
 #include "model/GgufFile.hpp"
 #include "model/GgufImage.hpp"
@@ -21,26 +21,28 @@ class GgufTargetLoader final {
 public:
   // Plans every image from the GGUF's metadata once.
   GgufTargetLoader(metal::MetalBackend &backend, const std::filesystem::path &path,
-                   const gguf::TargetGeometry &geometry, PreparationCheck admitConversion = {});
+                   const gguf::TargetGeometry &geometry, PreparationCheck admitConversion);
   GgufTargetLoader(const GgufTargetLoader &) = delete;
   GgufTargetLoader &operator=(const GgufTargetLoader &) = delete;
 
   // Every image's cache identity and size, layers first, for the model's
   // disk check before the first image is written.
-  [[nodiscard]] std::span<const PreparedWeight> weights() const noexcept { return weights_; }
+  [[nodiscard]] std::span<const PreparedWeight> weights() const noexcept { return images_.weights(); }
+  // Writes every missing image and maps none.
+  void prepare();
 
   [[nodiscard]] WeightFile layer(uint32_t index);
   [[nodiscard]] WeightFile head();
   [[nodiscard]] WeightFile embedding();
+  // The input rotation of a Prism ML GGUF, which planImages checked names
+  // every quantized tensor of the target and its token table.
+  [[nodiscard]] const std::optional<GgufRotation> &rotation() const noexcept { return rotation_; }
 
 private:
-  [[nodiscard]] WeightFile open(size_t index);
-
   metal::MetalBackend &backend_;
   WeightSource source_;
-  std::vector<gguf::Image> images_; // layers, head, embedding
-  std::vector<PreparedWeight> weights_;
-  PreparedFiles files_;
+  std::optional<GgufRotation> rotation_;
+  PreparedImages<gguf::Image> images_; // layers, head, embedding
 };
 
 // The GGUF geometry of a Qwen layout with its family's dense or sparse MoE

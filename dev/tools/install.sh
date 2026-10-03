@@ -1,7 +1,10 @@
 #!/bin/sh
 # Splash private-test installer for Apple Silicon Macs.
 #
-#   curl -fsSL <install.sh URL> | SPLASH_TOKEN=hf_... sh
+#   export SPLASH_TOKEN=hf_...
+#   curl -qfsSL --config - <install.sh URL> <<EOF | SPLASH_REPO=owner/repo sh
+#   header = "Authorization: Bearer $SPLASH_TOKEN"
+#   EOF
 #
 # Downloads the pinned release archive from the private Hugging Face repo,
 # verifies its SHA-256, unpacks it under ~/Library/Application Support/Splash/app,
@@ -154,5 +157,8 @@ if [ -f "$APP/current/install/completions/splash.bash" ] && [ -f "$APP/current/i
     echo "  Optional shell completion (Zsh needs compinit initialized):"
     echo '    Bash: source "$HOME/Library/Application Support/Splash/app/current/install/completions/splash.bash"'
     echo '    Zsh:  source "$HOME/Library/Application Support/Splash/app/current/install/completions/_splash"'
+    if [ -f "$APP/current/install/completions/splash.fish" ]; then
+        echo '    Fish: source "$HOME/Library/Application Support/Splash/app/current/install/completions/splash.fish"'
+    fi
 fi
 echo "  Upgrade: run this installer again.  Uninstall: rm -rf \"$APP\" \"$wrapper\""

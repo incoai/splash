@@ -7,6 +7,7 @@ from llguidance import LLMatcher
 
 from dev.tests.engine import test_structured_tools as structured
 from dev.tests.test_server import no_signed_thinking
+from dev.tests.tool_output import project, streamed_arguments
 from server import api_shapes, output, tool_schema
 from server.errors import APIError
 
@@ -36,7 +37,7 @@ class ToolSchemaCompositionTests(unittest.TestCase):
         for name in names:
             value = arguments[name]
             value_schema = shape["properties"].get(name, shape["additionalProperties"])
-            raw = tool_schema.raw_string_schema(value_schema, value_schema)
+            raw = tool_schema.raw_string_schema(value_schema)
             encoded = value if isinstance(value, str) and raw else json.dumps(value)
             xml += f"<parameter={name}>\n{encoded}\n</parameter>\n"
         xml += "</function>\n</tool_call>"
@@ -45,20 +46,10 @@ class ToolSchemaCompositionTests(unittest.TestCase):
         self.assertEqual(matcher.validate_tokens(tokens), len(tokens), xml)
         self.assertTrue(matcher.consume_tokens(tokens))
         self.assertTrue(matcher.is_accepting())
-        content, calls = output.parse_tool_calls(xml, 1, policy)
+        _, calls, events = project(xml, policy, size=1)
         self.assertEqual(json.loads(calls[0]["function"]["arguments"]), arguments)
+        self.assertEqual(streamed_arguments(events), calls[0]["function"]["arguments"])
         output.validate_tool_calls(calls, policy)
-        projector = output.StreamingToolCallProjector(policy, 1)
-        events = []
-        for char in xml:
-            events.extend(projector.put(char))
-        events.extend(projector.finish(content, calls, False))
-        streamed = "".join(
-            value.get("function", {}).get("arguments", "")
-            for kind, value in events
-            if kind == "tool"
-        )
-        self.assertEqual(json.loads(streamed), arguments)
         self.assertEqual(schema, original)
         calls[0]["function"]["arguments"] = json.dumps(invalid)
         with self.assertRaises(APIError):
@@ -113,13 +104,11 @@ class ToolSchemaCompositionTests(unittest.TestCase):
         }
         function = {"name": "test", "parameters": schema}
         chat = {"tools": [{"type": "function", "function": function}]}
-        responses = api_shapes.responses_to_chat_body(
-            {
-                "input": "Create a note",
-                "tools": [{"type": "function", **function}],
-            }
+        responses, _ = api_shapes.responses_to_chat_body(
+            {"tools": [{"type": "function", **function}]},
+            [{"role": "user", "content": "Create a note"}],
         )
-        messages = api_shapes.anthropic_to_chat_body(
+        messages, _ = api_shapes.anthropic_to_chat_body(
             {
                 "model": "test",
                 "max_tokens": 128,
@@ -155,7 +144,7 @@ class ToolSchemaCompositionTests(unittest.TestCase):
                 with self.assertRaisesRegex(
                     APIError, "cyclic tool parameter alternatives"
                 ) as error:
-                    tool_schema.raw_string_schema(schema, schema)
+                    tool_schema.raw_string_schema(schema)
                 self.assertEqual(error.exception.status, 400)
                 parameters = {
                     "$defs": schema["$defs"],
@@ -178,13 +167,15 @@ class ToolSchemaCompositionTests(unittest.TestCase):
 
     def test_shared_string_alternatives_are_not_cycles(self):
         schema = {
-            "$defs": {"text": {"type": "string"}},
-            "anyOf": [{"$ref": "#/$defs/text"}, {"$ref": "#/$defs/text"}],
+            "$defs": {
+                "text": {"type": "string"},
+                "choice": {
+                    "anyOf": [{"$ref": "#/$defs/text"}, {"$ref": "#/$defs/text"}]
+                },
+            },
+            "$ref": "#/$defs/choice",
         }
-        self.assertEqual(
-            tool_schema.raw_string_schema({"anyOf": schema["anyOf"]}, schema),
-            ("raw", None),
-        )
+        self.assertEqual(tool_schema.raw_string_schema(schema), ("raw", None))
 
     def test_shared_references_are_projected_once(self):
         # Two references per level to the next definition used to double the

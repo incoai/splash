@@ -1,4 +1,6 @@
+import base64
 import concurrent.futures
+import copy
 import gc
 import json
 import time
@@ -7,6 +9,7 @@ import weakref
 from unittest import mock
 
 from dev.tests import test_server as fixtures
+from dev.tests.engine.test_documents import pdf_bytes
 from server import frontend
 
 
@@ -74,16 +77,66 @@ class ResponseLifecycleTests(unittest.TestCase):
         harness.app.response_store.put(
             {"id": "resp_previous"}, [{"role": "user", "content": "old history"}]
         )
-        job, *_ = harness.app.prepare_responses(
+        job = harness.app.prepare_responses(
             {
                 "input": "continue",
                 "previous_response_id": "resp_previous",
                 "store": False,
-            }
+            },
+            deadline=fixtures.FOREVER,
         )
         self.assertIn("old history", str(harness.tokenizer.templates))
         self.assertIsNone(job.response_history_items)
         self.assertFalse(job.response_store)
+
+    def test_stored_history_is_independent_of_the_request_body(self):
+        harness = self.harness()
+        question = {"type": "message", "role": "user", "content": "question"}
+        answer = {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "answer"}],
+        }
+        body = {"input": [dict(question)]}
+        job = harness.app.prepare_responses(body, deadline=fixtures.FOREVER)
+        output = [copy.deepcopy(answer)]
+        harness.app.persist_response(job, {"id": "resp_stored"}, output)
+        # The record was encoded when it was stored.
+        body["input"][0]["content"] = "changed"
+        output[0]["content"][0]["text"] = "changed"
+        record = harness.app.response_store.get("resp_stored")
+        self.assertEqual(json.loads(record.history_json), [question, answer])
+
+    def test_stored_history_is_the_input_as_posted(self):
+        # Preparation renders the PDF and decodes the image of the items the
+        # record stores, and leaves them as they were posted.
+        harness = self.harness(
+            tokenizer=fixtures.ServerTest.ImagePadTokenizer(), max_context=65536
+        )
+        pdf = base64.b64encode(pdf_bytes()).decode()
+        posted = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Compare these."},
+                    {
+                        "type": "input_file",
+                        "filename": "receipt.pdf",
+                        "file_data": "data:application/pdf;base64," + pdf,
+                    },
+                    {
+                        "type": "input_image",
+                        "image_url": fixtures.ServerTest._png_data_url(),
+                    },
+                ],
+            }
+        ]
+        status, _, payload = harness.request(
+            "POST", "/v1/responses", {"input": posted, "max_output_tokens": 16}
+        )
+        self.assertEqual(status, 200, payload)
+        record = harness.app.response_store.get(json.loads(payload)["id"])
+        self.assertEqual(json.loads(record.history_json)[: len(posted)], posted)
 
     def test_completion_before_submit_returns_releases_job_without_gc(self):
         harness = self.harness()

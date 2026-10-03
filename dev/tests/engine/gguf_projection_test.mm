@@ -12,10 +12,13 @@
 // - split visibility: two projections that share the split scratch, at every pair of K splits either tile's policy
 //   picks for 8-80 cores, independent of poisoned partials.
 // Every run leaves the padding columns past its segments, the guard bands past its buffers and its counters as they
-// were.
+// were. The token gather (ops::Embedding) of every embedding format's native rows is checked here too.
 #include "GgufFormatReference.hpp"
+#include "TestBuffers.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
+#include "metal/abi/Gguf.h"
+#include "ops/Embedding.hpp"
 #include "ops/Linear.hpp"
 #include "tuning/LinearNumerics.hpp"
 
@@ -26,6 +29,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <random>
@@ -99,7 +103,7 @@ struct Tensor {
 };
 
 MetalBuffer upload(MetalBackend &backend, const std::vector<uint8_t> &bytes) {
-  MetalBuffer buffer = backend.allocateBuffer(bytes.size());
+  MetalBuffer buffer = test::sharedBuffer(backend, bytes.size());
   std::memcpy(buffer.contents(), bytes.data(), bytes.size());
   return buffer;
 }
@@ -179,6 +183,12 @@ struct Interval {
   double lo, hi;
 };
 float bf16(double v) { return bf16ToFloat(floatToBf16(float(v))); }
+// Nine significant digits, which tell apart the values near zero that %f prints alike.
+std::string digits(double v) {
+  char text[32];
+  std::snprintf(text, sizeof text, "%.9g", v);
+  return text;
+}
 bool inside(uint16_t got, Interval i) {
   const float value = bf16ToFloat(got);
   return std::isfinite(value) && value >= bf16(i.lo) && value <= bf16(i.hi);
@@ -202,7 +212,7 @@ double siluError(double gate) {
 double silu(double g) { return g / (1 + std::exp(-g)); }
 // fl(bf16(up) * silu_gate(gate)): the corners of bf16(up)'s interval times silu's. The fast-math division is only
 // bounded for divisors up to 2^126, which 1 + exp2(t) exceeds from t = 126, and the kernels' fp32 flushes values below
-// its normal range to zero: there either factor may be zero.
+// its normal range to zero: there either factor, and a product below that range, may be zero.
 Interval withGate(Interval up, float gate) {
   constexpr double kSmallestNormal = 0x1p-126, kLargestDivisorExponent = 126;
   const double s = silu(gate), e = siluError(gate) * std::fabs(s);
@@ -213,7 +223,7 @@ Interval withGate(Interval up, float gate) {
       lo = std::min(lo, u * g);
       hi = std::max(hi, u * g);
     }
-  if (std::max(std::fabs(lo), std::fabs(hi)) < kSmallestNormal) return {std::min(lo, 0.0), std::max(hi, 0.0)};
+  if (std::min(std::fabs(lo), std::fabs(hi)) < kSmallestNormal) return {std::min(lo, 0.0), std::max(hi, 0.0)};
   return {lo, hi};
 }
 
@@ -224,7 +234,7 @@ struct Guarded {
   uint64_t bytes = 0;
   Guarded(MetalBackend &backend, uint64_t size, uint8_t fill) : bytes(size) {
     if (!size) return;
-    backing = backend.allocateBuffer(size + kGuardBytes);
+    backing = test::sharedBuffer(backend, size + kGuardBytes);
     std::memset(backing.contents(), fill, size);
     std::memset(static_cast<uint8_t *>(backing.contents()) + size, kGuardByte, kGuardBytes);
     view = backend.view(backing, 0, size);
@@ -326,8 +336,8 @@ void checkValues(const Outcome &out, const std::vector<Dot> &dots, const std::ve
   const auto check = [&](const char *what, uint64_t i, uint16_t got, Interval want) {
     if (inside(got, want) || outside++) return;
     first = std::string(what) + " of row " + std::to_string(i / columns) + " column " + std::to_string(i % columns) +
-            " is " + std::to_string(bf16ToFloat(got)) + ", not in [" + std::to_string(bf16(want.lo)) + ", " +
-            std::to_string(bf16(want.hi)) + "]";
+            " is " + digits(bf16ToFloat(got)) + ", not in [" + digits(bf16(want.lo)) + ", " + digits(bf16(want.hi)) +
+            "]";
   };
   for (uint32_t r = 0; r < rows; ++r)
     for (uint32_t c = 0; c < covered; ++c) {
@@ -381,12 +391,9 @@ bool sameRows(const std::vector<uint16_t> &a, uint64_t aRow, const std::vector<u
   return std::equal(a.begin() + aRow * columns, a.begin() + (aRow + rows) * columns, b.begin() + bRow * columns);
 }
 
-// The configuration of `tile` for a decode workload (its full column grid) or a prefill chunk.
+// The configuration of `tile` for a decode workload, or of the staged tile for a prefill chunk of up to 32 rows.
 LinearConfig config(LinearTile tile, const LinearWorkload &w, uint32_t splits) {
-  if (w.phase == LinearPhase::Prefill) return {LinearTile::GgufStaged, 0, LinearSimdgroups::Two, splits};
-  const uint32_t groups = w.matrix.outputSize / 64;
-  return tile == LinearTile::GgufRegister ? LinearConfig{tile, groups, LinearSimdgroups::Four, splits}
-                                           : LinearConfig{tile, groups, LinearSimdgroups::Two, splits};
+  return {.tile = w.phase == LinearPhase::Prefill ? LinearTile::GgufStaged : tile, .splits = splits};
 }
 LinearWorkload decode(LinearMatrix matrix, uint32_t lanes, LinearEpilogue epilogue) {
   return {matrix, lanes * kLaneRows, LinearPhase::Decode, epilogue, WeightLayout::Block32};
@@ -419,14 +426,14 @@ void decodeTile(MetalBackend &backend, const Linear &linear, LinearTile tile) {
             const std::vector<float> aux(residual.begin() + uint64_t{lane} * kLaneRows * columns,
                                          residual.begin() + uint64_t{lane + 1} * kLaneRows * columns);
             const LinearWorkload one = decode({columns, K}, 1, epilogue);
-            const LinearPlan plan = Linear::plan(one, config(tile, one, splits));
+            const LinearPlan plan = Linear::plan(one, config(tile, one, splits), FloatOutput::BFloat16);
             lanesAlone.push_back(run(backend, linear, plan, up, gated, storageRows(rows, K, kLaneRows, kLaneRows),
                                      storageRows(aux, columns, kLaneRows, kLaneRows), kPoisonNaN, N,
                                      what + " lane " + std::to_string(lane) + " alone"));
           }
           for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes) {
             const LinearWorkload wl = decode({columns, K}, lanes, epilogue);
-            const LinearPlan plan = Linear::plan(wl, config(tile, wl, splits));
+            const LinearPlan plan = Linear::plan(wl, config(tile, wl, splits), FloatOutput::BFloat16);
             const uint32_t storage = plan.storageRows(), rows = wl.rows;
             const std::string label = what + " L=" + std::to_string(lanes);
             const std::vector<uint16_t> aux = storageRows(residual, columns, rows, storage);
@@ -443,7 +450,7 @@ void decodeTile(MetalBackend &backend, const Linear &linear, LinearTile tile) {
         }
     }
   }
-  section(std::string(tileName(tile)) + " decode: 8 formats, 1-4 lanes, S 1-8, plain/residual/gate-up, dense and "
+  section(std::string(tileName(tile)) + " decode: " + std::to_string(FMT_COUNT) + " formats, 1-4 lanes, S 1-8, plain/residual/gate-up, dense and "
           "sparse inputs within fp64, lanes equal to one-lane projections, fp32 plain outputs rounding to bf16's");
 }
 
@@ -463,7 +470,7 @@ void fusedDecode(MetalBackend &backend, const Linear &linear, LinearTile tile) {
     for (const uint32_t splits : kSplits)
       for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes) {
         const LinearWorkload wl = decode({columns, K}, lanes, LinearEpilogue::None);
-        const LinearPlan plan = Linear::plan(wl, config(tile, wl, splits));
+        const LinearPlan plan = Linear::plan(wl, config(tile, wl, splits), FloatOutput::BFloat16);
         const uint32_t storage = plan.storageRows(), rows = wl.rows;
         const std::string label = formats + " S=" + std::to_string(splits) + " L=" + std::to_string(lanes);
         const Outcome out = run(backend, linear, plan, fused, nullptr, storageRows(x, K, rows, storage), {},
@@ -473,8 +480,9 @@ void fusedDecode(MetalBackend &backend, const Linear &linear, LinearTile tile) {
         for (const Tensor *part : parts) {
           const Projection alone = projection({part}, part->N);
           const LinearWorkload one = decode({part->N, K}, lanes, LinearEpilogue::None);
-          const Outcome single = run(backend, linear, Linear::plan(one, config(tile, one, splits)), alone, nullptr,
-                                     storageRows(x, K, rows, storage), {}, kPoisonNaN, part->N, label + " alone");
+          const Outcome single =
+              run(backend, linear, Linear::plan(one, config(tile, one, splits), FloatOutput::BFloat16), alone, nullptr,
+                  storageRows(x, K, rows, storage), {}, kPoisonNaN, part->N, label + " alone");
           for (uint32_t r = 0; r < rows; ++r)
             if (!std::equal(single.output.begin() + uint64_t{r} * part->N, single.output.begin() + (r + 1) * part->N,
                             out.output.begin() + uint64_t{r} * columns + offset)) {
@@ -485,7 +493,7 @@ void fusedDecode(MetalBackend &backend, const Linear &linear, LinearTile tile) {
         }
       }
   }
-  section(std::string(tileName(tile)) + " fused: three segments in 8 format triples, 1-4 lanes, S 1-8 within fp64 "
+  section(std::string(tileName(tile)) + " fused: three segments in " + std::to_string(FMT_COUNT) + " format triples, 1-4 lanes, S 1-8 within fp64 "
           "and equal to each segment's projection");
 }
 
@@ -499,7 +507,7 @@ void gateUpPairs(MetalBackend &backend, const Linear &linear, LinearTile tile) {
     const Tensor g = tensor(backend, gf, N, K), u = tensor(backend, uf, N, K);
     const Projection gate = projection({&g}, columns), up = projection({&u}, columns);
     const LinearWorkload wl = decode({columns, K}, lanes, LinearEpilogue::GateUp);
-    const LinearPlan plan = Linear::plan(wl, config(tile, wl, kSplitsByLanes[lanes - 1]));
+    const LinearPlan plan = Linear::plan(wl, config(tile, wl, kSplitsByLanes[lanes - 1]), FloatOutput::BFloat16);
     const std::vector<float> x = activations(Inputs::Dense, wl.rows, K);
     const std::string label = std::string(fmtName(gf)) + " gate " + fmtName(uf) + " up N=" + std::to_string(N) +
                               " L=" + std::to_string(lanes);
@@ -513,47 +521,58 @@ void gateUpPairs(MetalBackend &backend, const Linear &linear, LinearTile tile) {
       for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes) pair(Fmt(gf), Fmt(uf), 256, lanes);
   const std::array<std::array<Fmt, 2>, kMaximumLanes> wide{{{IQ4XS, Q4K}, {Q5K, Q5K}, {Q4K, IQ4XS}, {Q3K, Q6K}}};
   for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes) pair(wide[lanes - 1][0], wide[lanes - 1][1], 1024, lanes);
-  section(std::string(tileName(tile)) + " gate/up: 64 gate and up format pairs at N 256 and 4 at N 1024, 1-4 lanes, "
+  section(std::string(tileName(tile)) + " gate/up: " + std::to_string(FMT_COUNT * FMT_COUNT) + " gate and up format pairs at N 256 and 4 at N 1024, 1-4 lanes, "
           "within fp64");
 }
 
 // ---------------------------------------------------------------- prefill
-// A 168-row chunk on the 128-row tiles: the second tile holds 40 rows, so its last two 32-row simdgroups skip their
-// matmuls and leave the rows from 192 unwritten. Chunks of up to 32 rows run the decode tiles, whose rows equal the
-// 128-row tiles' bitwise without K splits and lie within fp64 with them. Every format ([1024, 1024]) at each
-// epilogue, and a fused projection at its segments' column offsets.
+// 168- and 136-row chunks on the 128-row tiles: the second tile holds 40 or 8 rows, so its last two or three 32-row
+// simdgroups skip their matmuls, though not the barriers of the stage they share, and leave the rows from 192 or 160
+// unwritten. Chunks of up to 32 rows run the decode tiles, whose rows equal the 128-row tiles' bitwise without K
+// splits and lie within fp64 with them. Every format ([1024, 1024]) at each epilogue, and a fused projection at its
+// segments' column offsets.
 void prefill(MetalBackend &backend, const Linear &linear) {
-  constexpr uint32_t K = 1024, kChunk = 168, kSimdgroupRows = 32, kSplitChunk = 4;
+  constexpr uint32_t K = 1024, kChunks[] = {168, 136}, kSimdgroupRows = 32, kSplitChunk = 4;
+  constexpr LinearConfig kTiles{.tile = LinearTile::GgufPrefill};
   const auto chunks = [&](const Projection &p, const std::vector<const Tensor *> &parts, LinearEpilogue epilogue,
                           const std::string &what) {
     const uint32_t covered = segmentColumns(parts), columns = p.outputSize;
-    const LinearWorkload tiles{{columns, K}, kChunk, LinearPhase::Prefill, epilogue, WeightLayout::Block32};
-    const LinearPlan tilePlan = Linear::plan(tiles, {LinearTile::GgufStaged, 0, LinearSimdgroups::Four, 1});
-    const uint32_t storage = tilePlan.storageRows();
+    const auto workload = [&](uint32_t rows) {
+      return LinearWorkload{{columns, K}, rows, LinearPhase::Prefill, epilogue, WeightLayout::Block32};
+    };
+    // Both chunks take two tiles.
+    const uint32_t storage = Linear::plan(workload(kChunks[0]), kTiles, FloatOutput::BFloat16).storageRows();
     const std::vector<float> x = activations(Inputs::Dense, storage, K);
     // The residual, or the gate of the up-with-gate epilogue.
     const std::vector<float> auxiliary = epilogue == LinearEpilogue::Residual
         ? residuals(storage, columns) : activations(Inputs::Dense, storage, columns);
     const std::vector<uint16_t> aux = storageRows(auxiliary, columns, storage, storage);
-    const std::vector<Dot> dots = products(parts, columns, x, kChunk);
+    const std::vector<Dot> dots = products(parts, columns, x, kChunks[0]);
     const std::string label = what + " " + epilogueName(epilogue);
-    const Outcome whole = run(backend, linear, tilePlan, p, nullptr, storageRows(x, K, kChunk, storage), aux,
-                              kPoisonNaN, covered, label + " 168 rows");
-    checkValues(whole, dots, {}, aux, tiles, kChunk, covered, true, label + " 168 rows");
-    const uint32_t written = (kChunk + kSimdgroupRows - 1) / kSimdgroupRows * kSimdgroupRows;
-    if (!std::all_of(whole.output.begin() + uint64_t{written} * columns, whole.output.end(),
-                     [](uint16_t v) { return v == kUnwritten; }))
-      fail(label + ": simdgroups past the 168-row chunk write their rows");
+    std::vector<uint16_t> tileOutput;  // the first chunk's output on the 128-row tiles
+    for (const uint32_t chunk : kChunks) {
+      const LinearWorkload w = workload(chunk);
+      const std::string name = label + " " + std::to_string(chunk) + " rows";
+      const Outcome whole = run(backend, linear, Linear::plan(w, kTiles, FloatOutput::BFloat16), p, nullptr,
+                                storageRows(x, K, chunk, storage), aux, kPoisonNaN, covered, name);
+      checkValues(whole, dots, {}, aux, w, chunk, covered, true, name);
+      const uint32_t written = (chunk + kSimdgroupRows - 1) / kSimdgroupRows * kSimdgroupRows;
+      if (!std::all_of(whole.output.begin() + uint64_t{written} * columns, whole.output.end(),
+                       [](uint16_t v) { return v == kUnwritten; }))
+        fail(name + ": simdgroups past the chunk write their rows");
+      if (tileOutput.empty()) tileOutput = whole.output;
+    }
     for (const uint32_t rows : {8u, 16u, 24u, 32u})
       for (const uint32_t splits : {1u, kSplitChunk}) {
         const LinearWorkload chunk{{columns, K}, rows, LinearPhase::Prefill, epilogue, WeightLayout::Block32};
-        const LinearPlan plan = Linear::plan(chunk, config(LinearTile::GgufStaged, chunk, splits));
+        const LinearPlan plan =
+            Linear::plan(chunk, config(LinearTile::GgufStaged, chunk, splits), FloatOutput::BFloat16);
         const std::string name = label + " chunk of " + std::to_string(rows) + " rows S=" + std::to_string(splits);
         const std::vector<uint16_t> chunkAux(aux.begin(), aux.begin() + uint64_t{plan.storageRows()} * columns);
         const Outcome out = run(backend, linear, plan, p, nullptr, storageRows(x, K, rows, plan.storageRows()),
                                 chunkAux, kPoisonNaN, covered, name);
         checkValues(out, dots, {}, chunkAux, chunk, rows, covered, true, name);
-        if (splits == 1 && !sameRows(out.output, 0, whole.output, 0, rows, columns))
+        if (splits == 1 && !sameRows(out.output, 0, tileOutput, 0, rows, columns))
           fail(name + ": differs from the 128-row tiles");
       }
   };
@@ -568,8 +587,8 @@ void prefill(MetalBackend &backend, const Linear &linear) {
     chunks(projection(parts, segmentColumns(parts) + kPadding), parts, LinearEpilogue::None,
            std::string(fmtName(fi)) + "|" + fmtName(b.format) + "|" + fmtName(c.format));
   }
-  section("prefill: 8 formats plain/residual/up-with-gate and fused segments, 128-row tiles over a 168-row chunk and "
-          "chunks of 8-32 rows (S 1 and 4) within fp64, equal to the 128-row tiles");
+  section("prefill: " + std::to_string(FMT_COUNT) + " formats plain/residual/up-with-gate and fused segments, 128-row tiles over 168- and 136-row "
+          "chunks and chunks of 8-32 rows (S 1 and 4) within fp64, equal to the 128-row tiles");
 }
 
 // ---------------------------------------------------------------- split visibility
@@ -624,14 +643,14 @@ void splitVisibility(MetalBackend &backend, const Linear &linear, LinearTile til
   for (const auto &splits : splitPairs) pairs += " " + std::to_string(splits[0]) + "/" + std::to_string(splits[1]);
   std::cout << "  " << shape << ": splits" << pairs << '\n';
   const auto plan = [&](uint32_t i, uint32_t splits) {
-    return Linear::plan(workloads[i], config(tile, workloads[i], splits));
+    return Linear::plan(workloads[i], config(tile, workloads[i], splits), FloatOutput::BFloat16);
   };
   LinearScratchSize size = plan(0, 1).scratchSize();
   size.include(plan(1, 1).scratchSize());
   for (const auto &splits : splitPairs)
     for (uint32_t i = 0; i < 2; ++i) size.include(plan(i, splits[i]).scratchSize());
   const Scratch scratch(backend, size);
-  MetalBuffer poison = backend.allocateBuffer(size.partials);
+  MetalBuffer poison = test::sharedBuffer(backend, size.partials);
   std::vector<Operands> operands;
   std::vector<std::vector<uint16_t>> auxiliary;
   for (uint32_t i = 0; i < 2; ++i) {
@@ -684,6 +703,37 @@ void splitVisibility(MetalBackend &backend, const Linear &linear, LinearTile til
 
 } // namespace
 
+// ---------------------------------------------------------------- token gather
+// ops::Embedding over the native rows of every embedding format (kernels/shared/embedding.metal): each gathered value
+// is the bf16 rounding of GGML's fp32 value, for tokens in any order, repeated, and the vocabulary's first and last.
+void tokenGather(MetalBackend &backend) {
+  constexpr uint32_t kVocabulary = 64, kHidden = 1024;
+  const std::vector<uint32_t> tokens{kVocabulary - 1, 0, 17, 17, 42, 3, kVocabulary - 1, 29, 8};
+  int formats = 0;
+  for (int fi = 0; fi < FMT_COUNT; ++fi) {
+    if (!gguf_embedding_format(fi)) continue;
+    ++formats;
+    const Fmt f = Fmt(fi);
+    const std::vector<uint8_t> native = makeNative(f, kVocabulary, kHidden, rng);
+    const EmbeddingWeights table(kVocabulary, kHidden, NativeRows(upload(backend, native), f));
+    const Guarded ids(backend, tokens.size() * sizeof(uint32_t), 0), output(backend, tokens.size() * kHidden * 2, 0xFF);
+    std::memcpy(ids.view.contents(), tokens.data(), ids.bytes);
+    CommandGraph graph;
+    Embedding::add(graph, ids.view, table, output.view, uint32_t(tokens.size()));
+    static_cast<void>(backend.submitCommand(graph.dispatches()));
+    if (!output.intact()) fail(std::string(fmtName(f)) + " gather writes past its output");
+    const std::vector<uint16_t> got = output.halves();
+    std::vector<float> values(kHidden);
+    size_t differ = 0;
+    for (size_t r = 0; r < tokens.size(); ++r) {
+      rowValues(f, native.data() + size_t(tokens[r]) * rowBytes(f, kHidden), kHidden, values.data());
+      for (uint32_t k = 0; k < kHidden; ++k) differ += got[r * kHidden + k] != floatToBf16(values[k]);
+    }
+    if (differ) fail(std::string(fmtName(f)) + " gather: " + std::to_string(differ) + " values differ from bf16(GGML)");
+  }
+  section("token gather: " + std::to_string(formats) + " embedding formats, each value bf16 of GGML's fp32 value");
+}
+
 int main(int argc, char **argv) {
   @autoreleasepool {
     if (argc != 2) {
@@ -711,6 +761,7 @@ int main(int argc, char **argv) {
         }
       section("split visibility: both tiles, 1 and 4 lanes, every split pair the policy picks for 8-80 cores, "
               "independent of poisoned partials and within fp64");
+      tokenGather(backend);
     } catch (const std::exception &e) {
       std::cerr << "gguf-projection: FAIL: " << e.what() << '\n';
       return 1;

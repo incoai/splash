@@ -12,8 +12,12 @@ namespace splash::model {
 
 // Writes a planned image into its preallocated, zeroed destination file: the
 // header and descriptors, the copied rows and the planes the GPU repacks.
-// Staging stays within kWeightPreparationStagingBytes whatever the tensor,
-// layer or expert count; admit runs before each chunk.
+// Each chunk's staging, input and output together, stays within
+// kWeightPreparationStagingBytes whatever the tensor, layer or expert count.
+// The repacks reuse one input and one output buffer, sized by the largest
+// input and the largest output; only when those come from chunks of
+// different formats can the pair exceed that bound, though never twice it.
+// admit runs before each chunk.
 void writeGgufImage(metal::MetalBackend &backend, const WeightSource &source, int destination,
                     const gguf::Image &image, const PreparationCheck &admit);
 

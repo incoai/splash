@@ -10,12 +10,15 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import sys
 from pathlib import Path
 
-if __package__:
-    from .build_identity import update_if_changed
-else:
-    from build_identity import update_if_changed
+if __name__ == "__main__" and not __package__:
+    # Run as a script (make): import siblings as the dev.tools package.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    __package__ = "dev.tools"
+
+from .build_identity import update_if_changed
 
 DOMAIN = b"splash-weight-preparation-identity-v1\0"
 # Each adapter's byte-defining code. Every project header these files

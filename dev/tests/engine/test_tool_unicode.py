@@ -1,6 +1,7 @@
 import json
 import unittest
 
+from dev.tests.tool_output import project, streamed_arguments
 from server import output, tool_schema
 from server.errors import APIError
 
@@ -40,7 +41,7 @@ class ToolUnicodeTests(unittest.TestCase):
                 with self.subTest(codepoint=codepoint, kind=type(value).__name__):
                     text = tool_xml(json.dumps(value))
                     with self.assertRaisesRegex(APIError, "invalid Unicode") as error:
-                        output.parse_tool_calls(text, "test", tool_policy)
+                        project(text, tool_policy)
                     self.assertEqual(error.exception.status, 500)
                     self.assertEqual(error.exception.code, "invalid_model_output")
 
@@ -82,30 +83,22 @@ class ToolUnicodeTests(unittest.TestCase):
         for schema, raw, expected in cases:
             tool_policy = policy(schema)
             text = tool_xml(raw)
-            content, calls = output.parse_tool_calls(text, "test", tool_policy)
-            canonical = calls[0]["function"]["arguments"]
-            self.assertEqual(json.loads(canonical), {"value": expected})
-            output.validate_tool_calls(calls, tool_policy)
+            canonical = json.dumps(
+                {"value": expected}, ensure_ascii=False, separators=(",", ":")
+            )
             for split in range(len(text) + 1):
                 with self.subTest(raw=raw, split=split):
                     projector = output.StreamingToolCallProjector(tool_policy, "test")
                     events = projector.put(text[:split]) + projector.put(text[split:])
-                    projector.finish(content, calls, False)
-                    emitted = "".join(
-                        value.get("function", {}).get("arguments", "")
-                        for kind, value in events
-                        if kind == "tool"
-                    )
-                    self.assertEqual(emitted, canonical)
+                    _, calls, _ = projector.finish(False)
+                    self.assertEqual(calls[0]["function"]["arguments"], canonical)
+                    self.assertEqual(streamed_arguments(events), canonical)
 
     def test_invalid_parameter_names_and_final_validation(self):
         tool_policy = policy({})
         text = tool_xml('"ok"', "bad\ud800")
         with self.assertRaisesRegex(APIError, "invalid Unicode"):
-            output.parse_tool_calls(text, "test", tool_policy)
-        projector = output.StreamingToolCallProjector(tool_policy, "test")
-        with self.assertRaisesRegex(APIError, "invalid Unicode"):
-            projector.put(text)
+            project(text, tool_policy)
         calls = [{"function": {"name": "echo", "arguments": r'{"value":"\ud800"}'}}]
         with self.assertRaisesRegex(APIError, "invalid Unicode"):
             output.validate_tool_calls(calls, tool_policy)

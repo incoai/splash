@@ -22,23 +22,21 @@ reject() {
 # Reaching an unknown trailing option proves that preceding values parsed.
 sentinel='unknown option or missing value: --sentinel'
 reject "$sentinel" --sentinel
-reject "$sentinel" --confirm --sentinel
-for option in --pairs --confirm; do
-    for value in 12 13 32 63 64; do
-        reject "$sentinel" "$option" "$value" --sentinel
-    done
-    for value in 0 11 65 12.5 1e100 18446744073709551616 12x 0x10 nan inf +12 '' ' 12' '12 '; do
-        reject "$option requires an integer between 12 and 64" "$option" "$value"
-    done
-    reject 'unknown option or missing value:' "$option" -1
+reject "$sentinel" --candidates --sentinel
+for value in 12 13 32 63 64; do
+    reject "$sentinel" --pairs "$value" --sentinel
 done
+for value in 0 11 65 12.5 1e100 18446744073709551616 12x 0x10 nan inf +12 '' ' 12' '12 '; do
+    reject "--pairs requires an integer between 12 and 64" --pairs "$value"
+done
+reject 'unknown option or missing value:' --pairs -1
 reject 'unknown option or missing value: --pairs' --pairs
 reject 'unknown option or missing value: --pairs' --pairs --candidates
 reject 'unknown option or missing value: --seconds' --seconds
-reject 'unknown option or missing value: --seconds' --seconds --confirm
+reject 'unknown option or missing value: --seconds' --seconds --candidates
 for value in 0 1x nan inf ''; do
     reject '--seconds requires a positive number' --seconds "$value"
 done
-reject "$sentinel" --seconds 0.25 --pairs 64 --confirm --candidates --sentinel
-reject "$sentinel" --seconds 1e2 --confirm 12 --pairs 12 --sentinel
+reject "$sentinel" --seconds 0.25 --pairs 64 --candidates --sentinel
+reject "$sentinel" --seconds 1e2 --pairs 12 --sentinel
 echo 'tune-kernels CLI validation: PASS'

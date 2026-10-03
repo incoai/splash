@@ -41,11 +41,13 @@ TargetWeights readTarget(metal::MetalBackend &backend, const Qwen3_6MoeLayout &l
   return loadQwen3_6MoeWeights(backend, layout, files);
 }
 
-ModelPackage loadPackage(metal::MetalBackend &backend,
-                         const std::filesystem::path &root,
-                         ModelDescriptor descriptor, PreparationCheck admitConversion = {}) {
+} // namespace
+
+ModelPackage loadModelPackage(metal::MetalBackend &backend,
+                              const std::filesystem::path &root,
+                              const ModelDescriptor &descriptor, PreparationCheck admitConversion) {
   ModelPackage result;
-  result.descriptor = std::move(descriptor);
+  result.descriptor = descriptor;
   if (!result.descriptor.valid())
     throw std::invalid_argument("model descriptor is invalid");
   const PreparationCheck check = [&backend] { backend.checkOperation(); };
@@ -56,7 +58,7 @@ ModelPackage loadPackage(metal::MetalBackend &backend,
   std::vector<PreparedWeight> prepared;
   if (vision) prepared.push_back(vision->weight());
   std::optional<DraftCheckpointLoader> draft;
-  if (result.descriptor.draftSource == DraftSource::Checkpoint) {
+  if (result.descriptor.draftFromCheckpoint()) {
     draft.emplace(backend, root / "draft", result.descriptor.draft, admitConversion);
     prepared.insert(prepared.end(), draft->weights().begin(), draft->weights().end());
   }
@@ -64,23 +66,29 @@ ModelPackage loadPackage(metal::MetalBackend &backend,
       [&](const auto &layout) -> TargetWeights {
         using Layout = std::remove_cvref_t<decltype(layout)>;
         const std::filesystem::path directory = root / "target";
+        // Every missing file is written before the first is mapped: conversion
+        // needs normal memory pressure, which the residency of the files
+        // mapped before it would take away on a Mac with little memory.
         const auto read = [&](const QwenTargetFiles<Layout> &files,
-                              std::span<const PreparedWeight> target) {
+                              std::span<const PreparedWeight> target, const auto &prepareTarget) {
           prepared.insert(prepared.end(), target.begin(), target.end());
           if (!prepared.empty()) PreparedWeights().requireSpace(prepared, check);
+          if (vision) static_cast<void>(vision->prepare());
+          if (draft) draft->prepare();
+          prepareTarget();
           return readTarget(backend, layout, files);
         };
         switch (result.descriptor.targetSource) {
         case TargetSource::Packed:
-          return read(PackedTargetFiles<Layout>{backend, directory, layout}, {});
+          return read(PackedTargetFiles<Layout>{backend, directory, layout}, {}, [] {});
         case TargetSource::Mlx: {
           AffineTargetLoader loader(backend, directory, layout, admitConversion);
-          return read(loader, loader.weights());
+          return read(loader, loader.weights(), [&] { loader.prepare(); });
         }
         case TargetSource::Gguf: {
           GgufTargetLoader loader(backend, findTargetGguf(directory), ggufTargetGeometry(layout),
                                   admitConversion);
-          return read(loader, loader.weights());
+          return read(loader, loader.weights(), [&] { loader.prepare(); });
         }
         }
         throw std::invalid_argument("unknown target source");
@@ -102,19 +110,6 @@ ModelPackage loadPackage(metal::MetalBackend &backend,
   result.manifestFingerprintSha256 = weightManifestFingerprint(records);
   requireCompatibleModelPackage(result);
   return result;
-}
-
-} // namespace
-
-ModelPackage loadModelPackage(metal::MetalBackend &backend,
-                              const std::filesystem::path &root) {
-  return loadPackage(backend, root, inspectModelPackage(root));
-}
-
-ModelPackage loadModelPackage(metal::MetalBackend &backend,
-                              const std::filesystem::path &root,
-                              const ModelDescriptor &descriptor, PreparationCheck admitConversion) {
-  return loadPackage(backend, root, descriptor, std::move(admitConversion));
 }
 
 std::unique_ptr<VisionLoader> planVisionLoader(metal::MetalBackend &backend, const std::filesystem::path &root,
@@ -140,19 +135,23 @@ uint64_t preparedModelWeightBytes(const std::filesystem::path &root, const Model
   if (descriptor.targetSource == TargetSource::Gguf) {
     WeightSource source(findTargetGguf(root / "target"));
     const GgufFile file(source);
-    for (const gguf::Image &image :
-         std::visit([&](const auto &layout) { return gguf::planImages(file, ggufTargetGeometry(layout)); },
-                    descriptor.target))
-      bytes += image.bytes;
+    bytes = std::visit(
+        [&](const auto &layout) {
+          return PreparedImages<gguf::Image>::bytes(gguf::planImages(file, ggufTargetGeometry(layout)));
+        },
+        descriptor.target);
   } else if (descriptor.targetSource == TargetSource::Mlx) {
-    bytes = std::visit([](const auto &layout) { return preparedAffineBytes(layout); }, descriptor.target);
+    bytes = std::visit(
+        [](const auto &layout) { return PreparedImages<affine::Image>::bytes(affineTargetImages(layout)); },
+        descriptor.target);
   }
-  if (descriptor.draftSource == DraftSource::Checkpoint) bytes += preparedDraftBytes(descriptor.draft);
+  if (descriptor.draftFromCheckpoint())
+    bytes += PreparedImages<affine::Image>::bytes(draftCheckpointImages(descriptor.draft));
   if (descriptor.visionSource == VisionSource::Mlx || descriptor.visionSource == VisionSource::Gguf)
     bytes += preparedVisionBytes(descriptor.vision);
   for (std::string_view directory : {"target", "draft", "vision"}) {
     if (directory == "vision" && descriptor.visionSource != VisionSource::Packed) continue;
-    if (directory == "draft" && descriptor.draftSource != DraftSource::Packed) continue;
+    if (directory == "draft" && descriptor.draftFromCheckpoint()) continue;
     if (directory == "target" && descriptor.targetSource != TargetSource::Packed) continue;
     for (const auto &entry : std::filesystem::recursive_directory_iterator(root / directory)) {
       if (!entry.is_regular_file()) continue;

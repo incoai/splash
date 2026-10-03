@@ -25,6 +25,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace gguf_fixtures {
@@ -33,6 +34,17 @@ namespace model = splash::model;
 namespace test_gguf = splash::test::gguf;
 using gguf_reference::Fmt;
 using test_gguf::Tensor;
+
+// The id of the ggml type named `name` in model::kGgmlTypes; an unknown name
+// does not compile.
+consteval uint32_t ggmlType(std::string_view name) {
+  for (const auto &[id, traits] : model::kGgmlTypes)
+    if (traits.name == name) return id;
+  throw std::invalid_argument("unknown ggml type");
+}
+inline constexpr uint32_t kQ8_0 = ggmlType("Q8_0"), kQ3_K = ggmlType("Q3_K"), kQ4_K = ggmlType("Q4_K"),
+                          kQ5_K = ggmlType("Q5_K"), kQ6_K = ggmlType("Q6_K"), kIQ4_NL = ggmlType("IQ4_NL"),
+                          kIQ3_S = ggmlType("IQ3_S"), kIQ4_XS = ggmlType("IQ4_XS");
 
 inline int failures = 0;
 
@@ -206,12 +218,13 @@ inline void randomize(std::vector<Tensor> &tensors, uint32_t seed) {
 }
 
 // The targets the golden images were recorded from, seeds included. dense: a
-// GDN layer and a full-attention layer, all eight formats, Q8_0 alpha/beta
-// and permuted value-head rows, seeds 901-928. moe: one qwen35moe layer with
-// F32 alpha/beta, router and shared-expert scalar gate and 3-D expert tensors, its
-// seeds after dense's and output_norm first in its file.
+// GDN layer and a full-attention layer in eight formats (Q4_K, Q5_K, Q6_K,
+// Q3_K, Q8_0, IQ4_XS, IQ4_NL and IQ3_S; gguf-preparation's repack check covers
+// every format), Q8_0 alpha/beta and permuted value-head rows, seeds 901-928.
+// moe: one qwen35moe layer with F32 alpha/beta, router and shared-expert
+// scalar gate and 3-D expert tensors, its seeds after dense's and output_norm
+// first in its file.
 inline SmallTarget smallTarget(bool moe) {
-  using namespace model::ggml;
   SmallTarget target;
   model::gguf::TargetGeometry &g = target.geometry;
   g.hiddenSize = 512;

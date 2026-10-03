@@ -1,4 +1,5 @@
 #include "model/AffineTarget.hpp"
+#include "Checked.hpp"
 #include "model/AffinePlan.hpp"
 #include "model/Qwen3_8.hpp"
 #include "model/Qwen3_6Moe.hpp"
@@ -27,8 +28,8 @@ void projection(Image &image, std::initializer_list<std::pair<std::string, uint3
   section.columns = columns;
   section.bits = bits;
   section.experts = experts;
-  section.bytes = checkedWeightMultiply(uint64_t(rows) * columns * bits / 8 +
-                                        uint64_t(rows) * columns / 16, experts, "affine projection");
+  section.bytes = checkedMultiply<WeightStoreError>(
+      uint64_t(rows) * columns * bits / 8 + uint64_t(rows) * columns / 16, experts, "affine projection");
   uint64_t sourceRows = 0;
   for (const auto &[name, count] : parts) {
     image.quantized.emplace_back(name, bits);
@@ -61,7 +62,9 @@ void validateConfiguration(const SafetensorsCheckpoint &source, const Layout &la
       {"rope_parameters.partial_rotary_factor", double(layout.rotaryPairs * 2) / layout.attentionHeadDimension}};
   for (const auto &[key, value] : fields) source.requireConfigNumber(key, value);
   source.requireConfigString("hidden_act", "silu");
-  source.requireConfigString("rope_parameters.rope_type", "default");
+  // Transformers also reads the rope type from the older `type` key, which
+  // fine-tunes such as Ornith 1.5 still write.
+  source.requireConfigString("rope_parameters.rope_type", "default", "rope_parameters.type");
   source.requireLayerTypes(layout.layers, layout.fullAttentionPeriod);
   if constexpr (Layout::ffnKind == QwenFfnKind::SparseMoe) {
     source.requireConfigString("model_type", "qwen3_5_moe_text");
@@ -150,7 +153,6 @@ Image embeddingImage(const Layout &layout) {
   return result;
 }
 
-// Every image of a layout: the layers, the head, the embedding.
 template<class Layout>
 std::vector<Image> images(const Layout &layout) {
   std::vector<Image> result;
@@ -160,40 +162,29 @@ std::vector<Image> images(const Layout &layout) {
   return result;
 }
 
-template<class Layout>
-uint64_t preparedBytes(const Layout &layout) {
-  uint64_t bytes = 0;
-  for (const Image &image : images(layout)) bytes += image.bytes;
-  return bytes;
-}
-
 } // namespace
+
+std::vector<Image> affineTargetImages(const Qwen3_8Layout &layout) { return images(layout); }
+std::vector<Image> affineTargetImages(const Qwen3_6MoeLayout &layout) { return images(layout); }
 
 struct AffineTargetLoader::Impl {
   metal::MetalBackend &backend;
   SafetensorsCheckpoint source;
-  std::vector<Image> images; // layers, head, embedding
-  std::vector<PreparedWeight> weights;
-  PreparedFiles files;
+  PreparedImages<Image> images; // layers, head, embedding
   template<class Layout>
   Impl(metal::MetalBackend &backend, const std::filesystem::path &directory, const Layout &layout,
        PreparationCheck admitConversion)
       : backend(backend), source(directory, [&backend] { backend.checkOperation(); }),
-        files([&backend] { backend.checkOperation(); }, std::move(admitConversion),
-              [this] { source.checkUnchanged(); }) {
+        images(PreparedFiles([&backend] { backend.checkOperation(); }, std::move(admitConversion),
+                             [this] { source.checkUnchanged(); }),
+               [](const Image &image) { return affine::affineImageWriter(image); }) {
     validateConfiguration(source, layout);
-    images = model::images(layout);
-    for (Image &image : images) {
+    for (Image &image : affineTargetImages(layout)) {
       backend.checkOperation();
       affine::bind(image, source);
-      weights.push_back(affine::affineImageWeight(image, "target", directory.string()));
+      PreparedWeight weight = affine::affineImageWeight(image, "target", directory.string());
+      images.add(std::move(image), std::move(weight));
     }
-  }
-  WeightFile open(size_t index) {
-    const Image &image = images[index];
-    return files.open(backend, weights[index],
-        [&](int destination, const PreparationCheck &admit) { affine::writeAffineImage(destination, image, admit); },
-        image.magic, image.layer, image.type);
   }
 };
 AffineTargetLoader::AffineTargetLoader(metal::MetalBackend &backend, const std::filesystem::path &directory,
@@ -203,17 +194,13 @@ AffineTargetLoader::AffineTargetLoader(metal::MetalBackend &backend, const std::
                                        const Qwen3_6MoeLayout &layout, PreparationCheck admitConversion)
     : impl_(std::make_unique<Impl>(backend, directory, layout, std::move(admitConversion))) {}
 AffineTargetLoader::~AffineTargetLoader() = default;
-std::span<const PreparedWeight> AffineTargetLoader::weights() const noexcept { return impl_->weights; }
+std::span<const PreparedWeight> AffineTargetLoader::weights() const noexcept { return impl_->images.weights(); }
+void AffineTargetLoader::prepare() { impl_->images.prepare(); }
 WeightFile AffineTargetLoader::layer(uint32_t index) {
   if (index >= impl_->images.size() - 2) throw WeightStoreError("target layer is out of range");
-  return impl_->open(index);
+  return impl_->images.open(impl_->backend, index);
 }
-WeightFile AffineTargetLoader::head() { return impl_->open(impl_->images.size() - 2); }
-WeightFile AffineTargetLoader::embedding() { return impl_->open(impl_->images.size() - 1); }
-
-uint64_t preparedAffineBytes(const Qwen3_8Layout &layout) { return preparedBytes(layout); }
-uint64_t preparedAffineBytes(const Qwen3_6MoeLayout &layout) { return preparedBytes(layout); }
-Image affineLayerImage(const Qwen3_8Layout &layout, uint32_t layer) { return layerImage(layout, layer); }
-Image affineLayerImage(const Qwen3_6MoeLayout &layout, uint32_t layer) { return layerImage(layout, layer); }
+WeightFile AffineTargetLoader::head() { return impl_->images.open(impl_->backend, impl_->images.size() - 2); }
+WeightFile AffineTargetLoader::embedding() { return impl_->images.open(impl_->backend, impl_->images.size() - 1); }
 
 } // namespace splash::model

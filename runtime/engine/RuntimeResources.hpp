@@ -4,12 +4,13 @@
 #include "engine/MemoryPlan.hpp"
 #include "engine/Cache.hpp"
 #include "engine/MemoryGovernor.hpp"
+#include "engine/KvPageTier.hpp"
 #include "ops/PageStorage.hpp"
 #include "model/ModelFactory.hpp"
+#include "model/QwenState.hpp"
 #include "engine/MemoryAudit.hpp"
 #include "ops/ExecutionPlans.hpp"
 
-#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -20,6 +21,8 @@
 #include <string_view>
 
 namespace splash::engine {
+
+struct EngineConfig;
 
 enum class RuntimeResourceStage {
   Configuration,
@@ -33,28 +36,15 @@ enum class RuntimeResourceStage {
 [[nodiscard]] std::string_view
 runtimeResourceStageName(RuntimeResourceStage stage);
 
-[[nodiscard]] inline std::string
-digestHex(const std::array<uint8_t, 32> &digest) {
-  constexpr char hex[] = "0123456789abcdef";
-  std::string result;
-  result.reserve(digest.size() * 2);
-  for (uint8_t byte : digest) {
-    result.push_back(hex[byte >> 4]);
-    result.push_back(hex[byte & 0x0f]);
-  }
-  return result;
-}
-
+// What /status reports of the loaded model, the build and the KV pages.
+// Both digests are SHA-256 in lowercase hex.
 struct RuntimeCacheIdentity {
+  // The combined manifest of every model the runtime loaded.
   std::string modelLayoutSha256;
   std::string buildId;
-  // One process-wide content namespace. KV blocks never copy model/build
-  // strings or physical layout metadata.
-  CacheNamespace cacheNamespace;
-  // Stable binary layout guard for physical KV pages.
-  kv::LayoutGuard kvLayout;
-  // SHA-256 of the versioned model/build/KV compatibility tuple.
-  std::string namespaceSha256;
+  kv::Layout kvLayout;
+  // The target model's manifest.
+  std::string targetModelSha256;
 };
 
 [[nodiscard]] RuntimeCacheIdentity
@@ -74,23 +64,17 @@ struct RuntimeResourcesConfig {
   model::ModelDescriptor model;
   std::string buildId;
   uint64_t maximumMemoryBytes = 0;
-  // Patches per image the vision scratch covers. The engine admits images up
-  // to it when the model loaded vision and none otherwise; the wire parser's
-  // limit defaults to the same constant.
+  // Disk quota shared by cached KV pages and states; zero disables the tier.
+  uint64_t maximumCacheDiskBytes = 0;
+  // Patches per image, from --max-image-patches: the engine admits images up
+  // to it when the model loaded vision and none otherwise. The wire parser
+  // keeps the protocol ceiling.
   uint32_t maximumImagePatches = ops::kMaximumImagePatches;
   // The process's existing pressure observer runs before resource assembly;
   // it only publishes a level. Bootstrap checks it at Metal operation
   // boundaries; after Ready the transport control handler keeps it current.
   std::function<MemoryPressure()> memoryPressure;
   std::function<bool()> cancelled;
-  // Reclaimable host memory, sampled at every Metal operation during startup
-  // and by the governor afterwards. Empty means the live vm_statistics64
-  // estimate; tests substitute a fixed value.
-  MemoryGovernor::HostAvailableMemoryProvider hostAvailableMemory;
-  // Kernel choices to install over the operator policy. Used by the offline
-  // measurement tool and tests; production leaves it empty. Arenas are sized
-  // for the operator defaults plus these choices.
-  std::optional<ops::OperatorChoices> operatorChoices;
 };
 
 enum class RuntimeResourceFailure {
@@ -140,9 +124,12 @@ private:
   std::string budgetDescription_;
 };
 
-// Owns every process-wide native resource exactly once. Destruction order is
-// Cache -> logical KV pool -> state -> KV backing -> governor ->
-// model package -> Metal backend.
+// Owns every process-wide native resource exactly once. Members go in
+// reverse declaration order: Cache -> KV pool -> KV disk tier -> state
+// storage -> KV page storage -> governor -> model package -> Metal backend.
+// The KV disk tier must go before the KV page storage: its IO worker reads
+// and writes pages in place in the extents, and its destructor waits for
+// every transfer in flight.
 class RuntimeResources final {
 public:
   [[nodiscard]] static std::unique_ptr<RuntimeResources>
@@ -155,15 +142,8 @@ public:
   [[nodiscard]] const EngineMemoryPlan &memoryPlan() const noexcept {
     return memoryPlan_;
   }
-  [[nodiscard]] const model::ModelMemoryPlan &
-  modelMemoryPlan() const noexcept {
-    return modelMemoryPlan_;
-  }
   [[nodiscard]] MemoryGovernor &memoryGovernor() noexcept {
     return *memoryGovernor_;
-  }
-  [[nodiscard]] model::StateStorage &stateStorage() noexcept {
-    return *stateStorage_;
   }
   [[nodiscard]] engine::Cache &cache() noexcept {
     return *cache_;
@@ -171,45 +151,47 @@ public:
   [[nodiscard]] const RuntimeCacheIdentity &cacheIdentity() const noexcept {
     return cacheIdentity_;
   }
+  // What other applications left, measured before the engine took any;
+  // empty when the host could not be measured.
+  [[nodiscard]] std::optional<uint64_t> hostAvailableAtStart() const noexcept {
+    return hostAvailableAtStart_;
+  }
 
   [[nodiscard]] model::RuntimeContext modelContext() noexcept;
   [[nodiscard]] ActualMemoryReport
-  actualMemoryReport(const model::ModelMemoryActual &modelMemory,
-                     uint64_t estimatedWarmupPeakBytes) const;
-  // Offline tuning tool only, before any request: swaps between the operator
-  // defaults and the choices this instance was created with. Arenas were
-  // sized for exactly those two configurations, so nothing else may be
-  // installed after creation.
-  void installOperatorChoices(const ops::OperatorChoices &choices) {
-    operators_.install(choices);
-  }
+  actualMemoryReport(const model::ModelMemoryActual &modelMemory) const;
 
 private:
 
   RuntimeResources(std::unique_ptr<metal::MetalBackend> backend,
                    model::ModelPackage model, ops::ExecutionPlans operators,
                    EngineMemoryPlan memoryPlan,
-                   model::ModelMemoryPlan modelMemoryPlan,
                    RuntimeCacheIdentity cacheIdentity,
                    std::unique_ptr<MemoryGovernor> memoryGovernor,
                    std::unique_ptr<kv::PageStorage> kvPages,
-                   std::unique_ptr<model::StateStorage> stateStorage,
+                   std::unique_ptr<model::QwenStateStorage> stateStorage,
+                   std::unique_ptr<KvPageTier> kvTier,
                    std::unique_ptr<KvPool> kvPool,
                    std::unique_ptr<engine::Cache> cache,
-                   uint32_t maximumImagePatches);
+                   std::optional<uint64_t> hostAvailableAtStart);
 
   std::unique_ptr<metal::MetalBackend> backend_;
   model::ModelPackage model_;
   ops::ExecutionPlans operators_;
   EngineMemoryPlan memoryPlan_;
-  model::ModelMemoryPlan modelMemoryPlan_;
   RuntimeCacheIdentity cacheIdentity_;
   std::unique_ptr<MemoryGovernor> memoryGovernor_;
   std::unique_ptr<kv::PageStorage> kvPages_;
-  std::unique_ptr<model::StateStorage> stateStorage_;
+  std::unique_ptr<model::QwenStateStorage> stateStorage_;
+  std::unique_ptr<KvPageTier> kvTier_;
   std::unique_ptr<KvPool> kvPool_;
   std::unique_ptr<engine::Cache> cache_;
-  uint32_t maximumImagePatches_ = 0;
+  std::optional<uint64_t> hostAvailableAtStart_;
 };
+
+// Connects an engine to the governor that admits its memory: the engine asks
+// it whether the host pauses growth, and marks the allocations a request in
+// service makes. Every engine that runs against a governor connects through it.
+void connectToGovernor(EngineConfig &config, MemoryGovernor &governor);
 
 } // namespace splash::engine

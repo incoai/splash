@@ -46,6 +46,42 @@ class OutputValidationTests(unittest.TestCase):
             self.assertEqual(caught.exception.status, 500)
             self.assertEqual(caught.exception.code, "invalid_model_output")
 
+    def test_reference_lookup_crashes_are_evaluation_failures(self):
+        # referencing's draft 3 crawls an extends object's keys as schemas once a
+        # lookup scans the document, here for the nested id; the AttributeError
+        # escaped validation as an internal server error.
+        schema = {
+            "$schema": "http://json-schema.org/draft-03/schema#",
+            "type": "object",
+            "extends": {"type": "object"},
+            "definitions": {"q": {"type": "string"}},
+            "properties": {
+                "a": {
+                    "id": "https://other.invalid/x.json",
+                    "type": "object",
+                    "properties": {"b": {"$ref": "#/definitions/q"}},
+                }
+            },
+        }
+        _, validator = tool_schema.normalize_response_format(
+            {"type": "json_schema", "json_schema": {"schema": schema}}
+        )
+        _, policy = tool_schema.normalize_tools(
+            [{"type": "function", "function": {"name": "echo", "parameters": schema}}],
+            "auto",
+            True,
+        )
+        for validate in (
+            lambda value: model_output.validate_response_content(value, validator),
+            lambda value: model_output.validate_tool_calls(
+                [{"function": {"name": "echo", "arguments": value}}], policy
+            ),
+        ):
+            with self.assertRaises(api.APIError) as caught:
+                validate('{"a": {"b": "y"}}')
+            self.assertEqual(caught.exception.status, 500)
+            self.assertEqual(caught.exception.code, "output_validation_failed")
+
     def test_invalid_request_schemas_remain_client_errors(self):
         schema = {"type": 7}
         for normalize in (
