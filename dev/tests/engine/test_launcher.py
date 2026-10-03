@@ -1,8 +1,10 @@
+import contextlib
 import fcntl
 import io
 import json
 import os
 import select
+import signal
 import socket
 import subprocess
 import sys
@@ -14,8 +16,41 @@ from pathlib import Path
 from unittest import mock
 
 from install import launcher
+from server import server as api
 
 MODEL_ID = "community/custom-splash"
+
+
+def with_stop_held(command, number):
+    """The command, started with a stop signal already sent and held, as the
+    launcher holds one sent while it starts a program."""
+    return [
+        sys.executable,
+        "-c",
+        "import os, signal, sys; "
+        f"signal.pthread_sigmask(signal.SIG_BLOCK, ({int(number)},)); "
+        f"os.kill(os.getpid(), {int(number)}); "
+        "os.execv(sys.argv[1], sys.argv[1:])",
+        *command,
+    ]
+
+
+def keep_stop_signals(test):
+    """Give the process its stop-signal handlers and mask back after `test`:
+    serve takes the signals, and blocks them for the exec a test stubs."""
+    for number in launcher.STOP_SIGNALS:
+        test.addCleanup(signal.signal, number, signal.getsignal(number))
+    test.addCleanup(
+        signal.pthread_sigmask,
+        signal.SIG_SETMASK,
+        signal.pthread_sigmask(signal.SIG_BLOCK, ()),
+    )
+
+
+def selection(models_root, **options):
+    return launcher.model_artifacts.Selection.of(models_root, MODEL_ID, **options)
+
+
 MODEL_IDS = (
     "incoai/Qwen3.8-27B-Splash",
     "incoai/Qwen3.6-35B-A3B-Splash",
@@ -23,15 +58,26 @@ MODEL_IDS = (
 )
 
 
+def server_arguments(argv):
+    """The server's own arguments in the launcher's command for it."""
+    return argv[argv.index("server.server") + 1 :]
+
+
 class LauncherTests(unittest.TestCase):
-    def test_kv_format_is_an_explicit_load_option(self):
-        base = ["serve", "--model", MODEL_ID]
-        self.assertEqual(launcher.parse_args(base).kv_format, "int8")
-        self.assertEqual(
-            launcher.parse_args(base + ["--kv-format", "bf16"]).kv_format, "bf16"
+    def setUp(self):
+        # No serve refreshes the catalog from the Hub into the checkout, and
+        # the launcher's defaults ignore the caller's Splash settings.
+        self.refresh = self.enterContext(
+            mock.patch.object(launcher.catalog, "spawn_refresh")
         )
-        with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
-            launcher.parse_args(base + ["--kv-format", "fp16"])
+        self.enterContext(mock.patch.dict(os.environ))
+        for name in (
+            "SPLASH_PORT",
+            "SPLASH_API_KEY",
+            "SPLASH_DEFAULT_REASONING_EFFORT",
+        ):
+            os.environ.pop(name, None)
+        keep_stop_signals(self)
 
     def test_serve_requires_exact_repository_id_before_build(self):
         for arguments in (
@@ -85,40 +131,6 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(args.max_memory, 28 * 1024**3)
         self.assertEqual(args.max_context, 102400)
 
-    def test_image_budget_fails_before_installation(self):
-        for value in ("-1", "0", "65535", "4194305", "invalid"):
-            with (
-                self.subTest(value=value),
-                mock.patch.object(launcher, "_ensure_installed") as install,
-                mock.patch("sys.stderr", io.StringIO()),
-                self.assertRaises(SystemExit) as failed,
-            ):
-                launcher.main(
-                    ["serve", "--model", MODEL_ID, "--max-image-pixels", value]
-                )
-            self.assertEqual(failed.exception.code, 2)
-            install.assert_not_called()
-        for value in (65_536, 4_194_304):
-            args = launcher.parse_args(
-                ["serve", "--model", MODEL_ID, "--max-image-pixels", str(value)]
-            )
-            self.assertEqual(args.max_image_pixels, value)
-
-    def test_size_validation(self):
-        for value in ("1G", "1GB", "1GiB", "1073741824"):
-            self.assertEqual(launcher._parse_max_memory(value), 1024**3)
-        for flag, values in (
-            ("--max-context", ("0", "-1", "257K", "bad")),
-            ("--max-memory", ("0", "-1G", "bad", str(2**64))),
-            ("--max-request-size", ("auto", "0", "-1G", "bad", str(2**64))),
-        ):
-            for value in values:
-                with self.subTest(value=value), mock.patch("sys.stderr", io.StringIO()):
-                    with self.assertRaises(SystemExit):
-                        launcher.parse_args(
-                            ["serve", "--model", MODEL_ID, f"{flag}={value}"]
-                        )
-
     def test_host_controls_probe_and_server_independently_of_allowed_host(self):
         for host in (None, "0.0.0.0", "192.0.2.10", "localhost"):
             with (
@@ -127,7 +139,6 @@ class LauncherTests(unittest.TestCase):
                 mock.patch.object(launcher, "RUNTIME_DIR", Path(temporary)),
                 mock.patch.object(launcher.socket, "socket") as factory,
                 mock.patch.object(launcher, "_ensure_installed"),
-                mock.patch.object(launcher.catalog, "spawn_refresh"),
                 mock.patch.object(launcher.os, "execve") as execute,
             ):
                 arguments = [
@@ -146,11 +157,9 @@ class LauncherTests(unittest.TestCase):
                 factory.return_value.__enter__.return_value.bind.assert_called_once_with(
                     (expected, 9123)
                 )
-                argv = execute.call_args.args[1]
-                self.assertEqual(argv[argv.index("--host") + 1], expected)
-                self.assertEqual(
-                    argv[argv.index("--allowed-host") + 1], "proxy.example"
-                )
+                served = api.parse_args(server_arguments(execute.call_args.args[1]))
+                self.assertEqual(served.host, expected)
+                self.assertEqual(served.allowed_host, ["proxy.example"])
 
     def test_invalid_bind_address_fails_before_model_work(self):
         with (
@@ -192,32 +201,33 @@ class LauncherTests(unittest.TestCase):
                 "port": launcher.PORT,
             }
 
-            def check_install(model):
+            def check_install(chosen):
                 self.assertEqual(json.loads(lock_path.read_text()), owner)
 
             def check_exec(binary, argv, environment):
-                refresh.assert_called_once_with()
+                self.refresh.assert_called_once_with()
                 self.assertEqual(binary, str(launcher.paths.PYTHON))
-                self.assertEqual(argv[argv.index("--max-context") + 1], "102400")
+                # test_serve_options.py checks every shared option; these
+                # are the launcher's own and the shared options it was given.
+                with mock.patch.dict(os.environ, environment):
+                    served = api.parse_args(server_arguments(argv))
                 self.assertEqual(
-                    argv[argv.index("--max-memory") + 1], str(28 * 1024**3)
+                    (served.binary, served.model, served.port),
+                    (str(launcher.paths.BINARY), MODEL_ID, launcher.PORT),
                 )
                 self.assertEqual(
-                    argv[argv.index("--binary") + 1], str(launcher.paths.BINARY)
-                )
-                self.assertEqual(argv[argv.index("--model") + 1], MODEL_ID)
-                self.assertEqual(argv[argv.index("--kv-format") + 1], "bf16")
-                self.assertEqual(
-                    argv[argv.index("--max-request-size") + 1], str(256 * 1024**2)
+                    (served.max_context, served.max_memory, served.kv_format),
+                    (102400, 28 * 1024**3, "bf16"),
                 )
                 self.assertEqual(
-                    argv[-4:],
-                    ["--allowed-host", "splash.local", "--allowed-host", "proxy.local"],
+                    served.allowed_origin, [("tauri", "localhost", None), "*"]
                 )
+                self.assertTrue(served.no_webui)
                 self.assertNotIn("start_new_session", environment)
-                self.assertIn("--no-webui", argv)
-                self.assertNotIn("test-server-key", argv)
-                self.assertEqual(environment["SPLASH_API_KEY"], "test-server-key")
+                self.assertFalse(
+                    any("test-server-key" in argument for argument in argv)
+                )
+                self.assertEqual(served.api_key, "test-server-key")
                 self.assertEqual(json.loads(lock_path.read_text()), owner)
                 self.assertEqual(lock_path.stat().st_ino, original_inode)
                 with (runtime / "serve.lock").open("a+") as upgrade:
@@ -231,7 +241,6 @@ class LauncherTests(unittest.TestCase):
             with (
                 mock.patch.object(launcher, "RUNTIME_DIR", runtime),
                 mock.patch.object(launcher.socket, "socket"),
-                mock.patch.object(launcher.catalog, "spawn_refresh") as refresh,
                 mock.patch.object(
                     launcher, "_ensure_installed", side_effect=check_install
                 ) as install,
@@ -250,19 +259,17 @@ class LauncherTests(unittest.TestCase):
                         "--api-key",
                         "test-server-key",
                         "--no-webui",
-                        "--max-request-size",
-                        "256M",
                         "--max-context",
                         "100K",
                         "--max-memory",
                         "28G",
-                        "--allowed-host",
-                        "splash.local",
-                        "--allowed-host",
-                        "proxy.local",
+                        "--allowed-origin",
+                        "tauri://localhost",
+                        "--allowed-origin",
+                        "*",
                     ]
                 )
-            install.assert_called_once_with(MODEL_ID)
+            install.assert_called_once_with(selection(launcher.paths.MODELS))
             execute.assert_called_once()
             self.assertEqual(
                 {p.name for p in runtime.iterdir()}, {"serve.lock", "serve-8000.lock"}
@@ -431,6 +438,43 @@ class LauncherTests(unittest.TestCase):
                     install.assert_not_called()
                     execute.assert_not_called()
 
+    def test_real_port_probe_rejects_a_listener_on_another_address_of_the_port(self):
+        # SO_REUSEADDR lets 127.0.0.1 bind beside another process's wildcard
+        # listener, IPv4 or dual-stack (python -m http.server), and take its
+        # loopback clients; and 0.0.0.0 bind beside a loopback listener,
+        # which keeps the clients the launcher connects to 127.0.0.1.
+        for listen, host in (
+            ("0.0.0.0", "127.0.0.1"),
+            ("::", "127.0.0.1"),
+            ("127.0.0.1", "0.0.0.0"),
+        ):
+            family = socket.AF_INET6 if ":" in listen else socket.AF_INET
+            with (
+                self.subTest(listen=listen, host=host),
+                tempfile.TemporaryDirectory() as temporary,
+                socket.socket(family) as listener,
+            ):
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                if family == socket.AF_INET6:
+                    listener.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+                listener.bind((listen, 0))
+                port = listener.getsockname()[1]
+                listener.listen()
+                with (
+                    mock.patch.object(launcher, "RUNTIME_DIR", Path(temporary)),
+                    mock.patch.object(launcher, "_ensure_installed") as install,
+                    mock.patch.object(launcher.os, "execve") as execute,
+                    mock.patch("sys.stderr", io.StringIO()) as error,
+                ):
+                    result = launcher.main(
+                        ["serve", "--model", MODEL_ID, "--host", host]
+                        + ["--port", str(port)]
+                    )
+                self.assertEqual(result, 1)
+                self.assertIn(f"cannot bind {host}:{port}: ", error.getvalue())
+                install.assert_not_called()
+                execute.assert_not_called()
+
     def test_port_selection_validates_environment_and_explicit_override(self):
         with mock.patch.dict(os.environ, {"SPLASH_PORT": "8123"}):
             self.assertEqual(
@@ -506,7 +550,6 @@ class LauncherTests(unittest.TestCase):
             with (
                 mock.patch.object(launcher, "RUNTIME_DIR", runtime),
                 mock.patch.object(launcher, "_ensure_installed") as install,
-                mock.patch.object(launcher.catalog, "spawn_refresh"),
                 mock.patch.object(launcher.os, "execve", side_effect=execute),
                 mock.patch("sys.stderr", io.StringIO()) as error,
             ):
@@ -524,6 +567,7 @@ class LauncherTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / "server").mkdir()
+            (root / "server/__init__.py").write_text("")
             (root / "server/server.py").write_text(
                 "import sys\nprint('ready', flush=True)\nsys.stdin.read()\n"
             )
@@ -533,8 +577,8 @@ class LauncherTests(unittest.TestCase):
                 "launcher.ROOT = Path(sys.argv[1])\n"
                 "launcher.RUNTIME_DIR = launcher.ROOT / 'runtime'\n"
                 "launcher.paths.PYTHON = Path(sys.executable)\n"
-                "launcher._ensure_installed = lambda model: None\n"
-                "launcher.model_artifacts.installed_root = lambda *args: launcher.ROOT\n"
+                "launcher._ensure_installed = lambda selection: None\n"
+                "launcher.model_artifacts.selection_link = lambda *a, **k: launcher.ROOT\n"
                 "launcher.catalog.spawn_refresh = lambda: None\n"
                 "launcher.main(['serve', '--model', 'test/model', '--port', sys.argv[2]])\n"
             )
@@ -584,11 +628,16 @@ class LauncherTests(unittest.TestCase):
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
                 requests.append((self.path, self.headers.get("Authorization")))
-                payload = (
-                    {"maximum_context_tokens": 102400}
-                    if self.path == "/status"
-                    else {"data": [{"id": MODEL_ID, "owned_by": "splash"}]}
-                )
+                payload = {
+                    "data": [
+                        {
+                            "id": MODEL_ID,
+                            "owned_by": "splash",
+                            "context_length": 102400,
+                            "input_modalities": ["text", "image", "pdf"],
+                        }
+                    ]
+                }
                 body = json.dumps(payload).encode()
                 self.send_response(200)
                 self.send_header("Content-Length", str(len(body)))
@@ -609,9 +658,14 @@ class LauncherTests(unittest.TestCase):
                 with (
                     mock.patch.dict(
                         os.environ,
-                        {"SPLASH_PORT": str(port), "SPLASH_API_KEY": "test-key"},
+                        {
+                            "SPLASH_PORT": str(port),
+                            "SPLASH_API_KEY": "test-key",
+                            "PI_CODING_AGENT_DIR": str(Path(temporary) / "pi"),
+                            # Hermes's root.
+                            "HOME": temporary,
+                        },
                     ),
-                    mock.patch.object(launcher, "RUNTIME_DIR", Path(temporary)),
                     mock.patch.object(
                         launcher.clients, "find_executable", return_value="/bin/echo"
                     ),
@@ -621,6 +675,7 @@ class LauncherTests(unittest.TestCase):
                     mock.patch.object(launcher.os, "execvpe") as execute,
                     mock.patch("sys.stdout", io.StringIO()),
                 ):
+                    os.environ.pop("HERMES_HOME", None)
                     for name in launcher.clients.INSTALL_URLS:
                         launcher.main([name])
                         self.assertEqual(
@@ -629,21 +684,108 @@ class LauncherTests(unittest.TestCase):
                         self.assertEqual(
                             command.call_args.args[3:5], (MODEL_ID, 102400)
                         )
-                        self.assertEqual(
-                            command.call_args.args[5], launcher._runtime_dir(port)
-                        )
-                    self.assertEqual(execute.call_count, 4)
+                    self.assertEqual(
+                        execute.call_count, len(launcher.clients.INSTALL_URLS)
+                    )
             finally:
                 server.shutdown()
                 worker.join(timeout=5)
             self.assertEqual(
                 requests,
-                [
-                    (path, "Bearer test-key")
-                    for _ in range(4)
-                    for path in ("/status", "/v1/models")
-                ],
+                [("/v1/models", "Bearer test-key")]
+                * len(launcher.clients.INSTALL_URLS),
             )
+
+    def test_client_setup_works_while_status_is_unavailable(self):
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/status":
+                    self.send_response(503)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                body = json.dumps(
+                    {
+                        "data": [
+                            {
+                                "id": MODEL_ID,
+                                "owned_by": "splash",
+                                "context_length": 4096,
+                                "input_modalities": ["text"],
+                            }
+                        ]
+                    }
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+            worker = threading.Thread(target=server.serve_forever)
+            worker.start()
+            try:
+                with (
+                    mock.patch.dict(
+                        os.environ, {"SPLASH_PORT": str(server.server_port)}
+                    ),
+                    mock.patch.object(
+                        launcher.clients, "find_executable", return_value="/bin/echo"
+                    ),
+                    mock.patch.object(
+                        launcher.clients, "command", return_value=(["codex"], {})
+                    ) as command,
+                    mock.patch.object(launcher.os, "execvpe") as execute,
+                    mock.patch("sys.stdout", io.StringIO()),
+                ):
+                    self.assertIsNone(launcher.main(["codex"]))
+            finally:
+                server.shutdown()
+                worker.join(timeout=5)
+        self.assertEqual(command.call_args.args[3:5], (MODEL_ID, 4096))
+        execute.assert_called_once()
+
+    def test_source_script_runs_its_checkout_launcher_through_links(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            checkout = root / "checkout"
+            (checkout / "install").mkdir(parents=True)
+            (checkout / "install/launcher.py").write_text(
+                "import sys\nprint(__file__, *sys.argv[1:])\n"
+            )
+            (checkout / ".venv/bin").mkdir(parents=True)
+            (checkout / ".venv/bin/python").symlink_to(sys.executable)
+            script = checkout / "splash"
+            script.write_bytes((launcher.ROOT / "splash").read_bytes())
+            script.chmod(0o755)
+            # A relative link into the checkout, reached through an absolute one.
+            (root / "bin").mkdir()
+            (root / "bin/splash").symlink_to("../checkout/splash")
+            (root / "path").mkdir()
+            (root / "path/splash").symlink_to(root / "bin/splash")
+            # The relative link through a linked directory: its .. is physical.
+            (root / "path/linked").symlink_to("../bin")
+            for command in (
+                script,
+                root / "bin/splash",
+                root / "path/splash",
+                root / "path/linked/splash",
+            ):
+                with self.subTest(command=command):
+                    result = subprocess.run(
+                        [command, "serve", "--help"],
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(
+                        result.stdout,
+                        f"{checkout / 'install/launcher.py'} serve --help\n",
+                    )
 
     def test_source_build_lock_covers_make_and_releases_on_failure(self):
         for fail in (False, True):
@@ -670,17 +812,319 @@ class LauncherTests(unittest.TestCase):
                     mock.patch.object(launcher.paths, "PACKAGED", False),
                     mock.patch.object(launcher, "RUNTIME_DIR", runtime),
                     mock.patch.object(launcher.subprocess, "run", side_effect=run),
+                    mock.patch.object(
+                        launcher,
+                        "_run_held",
+                        side_effect=lambda command, **options: run(command).returncode,
+                    ),
                 ):
                     if fail:
                         with self.assertRaisesRegex(
                             launcher.LauncherError, "source build failed"
                         ):
-                            launcher._ensure_installed(MODEL_ID)
+                            launcher._ensure_installed(selection(runtime))
                     else:
-                        launcher._ensure_installed(MODEL_ID)
-                self.assertEqual(len(calls), 1 if fail else 3)
+                        launcher._ensure_installed(selection(runtime))
+                self.assertEqual(len(calls), 1 if fail else 4)
+                if not fail:
+                    # The device check runs on the built binary, unlocked.
+                    self.assertEqual(
+                        calls[2], [str(launcher.paths.BINARY), "device-check"]
+                    )
                 with (runtime / "build.lock").open("a+") as probe:
                     fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_source_selection_reaches_installation_and_served_root(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = Path(temporary)
+            draft = runtime / "local-draft"
+            draft.mkdir()
+            options = {
+                "revision": "v2",
+                "language_only": True,
+                "draft_model": str(draft.resolve()),
+            }
+            with (
+                mock.patch.object(launcher, "RUNTIME_DIR", runtime),
+                mock.patch.object(launcher.socket, "socket"),
+                mock.patch.object(launcher, "_ensure_installed") as install,
+                mock.patch.object(
+                    launcher.model_artifacts,
+                    "selection_link",
+                    return_value=runtime / "selected",
+                ) as root,
+                mock.patch.object(launcher.os, "execve") as execute,
+            ):
+                launcher.main(
+                    [
+                        "serve",
+                        "--model",
+                        MODEL_ID,
+                        "--revision",
+                        "v2",
+                        "--draft-model",
+                        str(draft),
+                        "--language-only",
+                    ]
+                )
+            (chosen,) = install.call_args.args
+            self.assertEqual(
+                (chosen.model, chosen.link),
+                (MODEL_ID, runtime / "selected"),
+            )
+            root.assert_called_once_with(chosen.models_root, MODEL_ID, **options)
+            argv = execute.call_args.args[1]
+            self.assertEqual(server_arguments(argv)[0], str(runtime / "selected"))
+
+            with (
+                mock.patch.object(
+                    launcher.subprocess,
+                    "run",
+                    return_value=subprocess.CompletedProcess([], 0),
+                ),
+                mock.patch.object(launcher, "_run_held", return_value=0) as run,
+                mock.patch.object(launcher.paths, "PACKAGED", True),
+            ):
+                launcher._ensure_installed(chosen)
+            command = run.call_args.args[0]
+            self.assertEqual(run.call_args.kwargs["cwd"], launcher.ROOT)
+            parsed = launcher.model_artifacts.parse_args(command[2:])
+            self.assertEqual(
+                (
+                    parsed.command,
+                    parsed.model,
+                    parsed.revision,
+                    parsed.language_only,
+                    parsed.draft_model,
+                ),
+                ("prepare", MODEL_ID, "v2", True, options["draft_model"]),
+            )
+
+    def test_offline_serve_forbids_the_hub_to_installer_refresh_and_server(self):
+        for offline in (False, True):
+            with (
+                self.subTest(offline=offline),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                runtime = Path(temporary)
+                os.environ.pop("HF_HUB_OFFLINE", None)
+                seen = {}
+
+                def install(selection):
+                    seen["installer"] = os.environ.get("HF_HUB_OFFLINE")
+
+                self.refresh.side_effect = lambda: seen.setdefault(
+                    "refresh", os.environ.get("HF_HUB_OFFLINE")
+                )
+                with (
+                    mock.patch.object(launcher, "RUNTIME_DIR", runtime),
+                    mock.patch.object(launcher.socket, "socket"),
+                    mock.patch.object(
+                        launcher, "_ensure_installed", side_effect=install
+                    ),
+                    mock.patch.object(
+                        launcher.model_artifacts,
+                        "selection_link",
+                        return_value=runtime / "selected",
+                    ),
+                    mock.patch.object(launcher.os, "execve") as execute,
+                ):
+                    launcher.main(
+                        [
+                            "serve",
+                            "--model",
+                            MODEL_ID,
+                            *(["--offline"] if offline else []),
+                        ]
+                    )
+                argv, environment = execute.call_args.args[1:]
+                expected = "1" if offline else None
+                self.assertEqual(seen, {"installer": expected, "refresh": expected})
+                self.assertEqual(environment.get("HF_HUB_OFFLINE"), expected)
+                # The server has no such option: the environment carries it.
+                self.assertNotIn("--offline", argv)
+
+    def test_server_holds_the_assembly_it_serves(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = Path(temporary)
+            assembly = runtime / "models/.resolved/assembly"
+            assembly.mkdir(parents=True)
+            (assembly / "model.json").write_text("{}")
+            selection = runtime / "models/owner/model"
+            selection.parent.mkdir()
+            selection.symlink_to(assembly)
+            held = []
+
+            def execute(program, argv, environment):
+                # Installations remove no assembly a server holds.
+                with (assembly / "model.json").open("rb") as record:
+                    try:
+                        fcntl.flock(record, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        held.append(server_arguments(argv)[0])
+
+            with (
+                mock.patch.object(launcher, "RUNTIME_DIR", runtime),
+                mock.patch.object(launcher.paths, "MODELS", runtime / "models"),
+                mock.patch.object(launcher.socket, "socket"),
+                mock.patch.object(launcher, "_ensure_installed"),
+                mock.patch.object(
+                    launcher.model_artifacts, "selection_link", return_value=selection
+                ),
+                mock.patch.object(launcher.os, "execve", side_effect=execute),
+            ):
+                launcher.main(["serve", "--model", MODEL_ID])
+            self.assertEqual(held, [str(assembly.resolve())])
+
+    def test_serve_takes_the_stop_signals_and_holds_them_across_the_exec(self):
+        # A non-interactive shell starts background jobs with SIGINT ignored.
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        held = {}
+
+        def execute(*_):
+            held["handlers"] = {
+                number: signal.getsignal(number) for number in launcher.STOP_SIGNALS
+            }
+            held["mask"] = signal.pthread_sigmask(signal.SIG_BLOCK, ())
+
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.object(launcher, "RUNTIME_DIR", Path(temporary)),
+            mock.patch.object(launcher.socket, "socket"),
+            mock.patch.object(launcher, "_ensure_installed"),
+            mock.patch.object(launcher.os, "execve", side_effect=execute),
+        ):
+            launcher.main(["serve", "--model", MODEL_ID])
+        self.assertEqual(
+            held["handlers"], dict.fromkeys(launcher.STOP_SIGNALS, launcher._interrupt)
+        )
+        self.assertLessEqual(set(launcher.STOP_SIGNALS), held["mask"])
+
+    def test_a_stop_ends_serve_with_the_status_of_its_signal(self):
+        for number, status in ((signal.SIGINT, 130), (signal.SIGTERM, 143)):
+            with (
+                self.subTest(signal=number.name),
+                tempfile.TemporaryDirectory() as temporary,
+                mock.patch.object(launcher, "RUNTIME_DIR", Path(temporary)),
+                mock.patch.object(launcher.socket, "socket"),
+                mock.patch.object(
+                    launcher,
+                    "_ensure_installed",
+                    side_effect=lambda _: signal.raise_signal(number),
+                ),
+            ):
+                self.assertEqual(launcher.main(["serve", "--model", MODEL_ID]), status)
+
+    def test_a_held_program_starts_with_the_stop_signals_blocked(self):
+        check = (
+            "import signal, sys; "
+            "sys.exit(not {signal.SIGINT, signal.SIGTERM} "
+            "<= signal.pthread_sigmask(signal.SIG_BLOCK, ()))"
+        )
+        self.assertEqual(launcher._run_held([sys.executable, "-c", check]), 0)
+        self.assertFalse(
+            set(launcher.STOP_SIGNALS) & signal.pthread_sigmask(signal.SIG_BLOCK, ())
+        )
+
+    def test_a_stop_the_launcher_takes_ends_the_held_program(self):
+        signal.signal(signal.SIGINT, launcher._interrupt)
+        main = threading.main_thread().ident
+        popen = subprocess.Popen
+        for moment in ("spawn", "run"):
+            with self.subTest(moment=moment):
+                programs = []
+
+                def spawn(*args, **options):
+                    programs.append(popen(*args, **options))
+                    if moment == "spawn":
+                        # Held: it arrives once the program exists.
+                        signal.pthread_kill(main, signal.SIGINT)
+                    else:
+                        threading.Timer(
+                            0.2, signal.pthread_kill, (main, signal.SIGINT)
+                        ).start()
+                    return programs[-1]
+
+                with (
+                    mock.patch.object(launcher.subprocess, "Popen", side_effect=spawn),
+                    self.assertRaises(KeyboardInterrupt),
+                ):
+                    launcher._run_held(
+                        [sys.executable, "-c", "import time; time.sleep(60)"]
+                    )
+                self.assertEqual(programs[0].wait(timeout=5), -signal.SIGKILL)
+
+    def test_programs_take_a_stop_held_from_their_start(self):
+        home = self.enterContext(tempfile.TemporaryDirectory())
+        # Unstopped, each would go on to fail at its first step.
+        server = ["-m", "server.server", "model", "--tokenizer", "tokenizer"]
+        server += ["--model", MODEL_ID, "--port", "0"]
+        installer = ["install/models.py", "--models", home, "--model", MODEL_ID]
+        installer.append("prepare")
+        environment = {
+            **os.environ,
+            "HOME": home,
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_VERBOSITY": "error",
+        }
+        for program, number, status in (
+            (server, signal.SIGINT, 0),
+            (server, signal.SIGTERM, 0),
+            (installer, signal.SIGINT, 130),
+        ):
+            with self.subTest(program=program[:2], signal=number.name):
+                result = subprocess.run(
+                    with_stop_held([sys.executable, *program], number),
+                    cwd=launcher.ROOT,
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                self.assertEqual(
+                    (result.returncode, result.stdout, result.stderr), (status, "", "")
+                )
+
+    def test_relative_draft_directory_is_resolved_for_the_installer(self):
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            contextlib.chdir(temporary),
+        ):
+            base = Path(temporary).resolve()
+            (base / "drafts/local").mkdir(parents=True)
+            for value in ("drafts/local", "./drafts/local", "drafts/../drafts/local"):
+                with self.subTest(value=value):
+                    args = launcher.parse_args(
+                        ["serve", "--model", MODEL_ID, "--draft-model", value]
+                    )
+                    self.assertEqual(args.draft_model, str(base / "drafts/local"))
+                    # The installer, run directly, records the same directory.
+                    args = launcher.model_artifacts.parse_args(
+                        ["--model", MODEL_ID, "--draft-model", value, "prepare"]
+                    )
+                    self.assertEqual(args.draft_model, str(base / "drafts/local"))
+            repository = "incoai/Qwen3.8-27B-DFlash2"
+            args = launcher.parse_args(
+                ["serve", "--model", MODEL_ID, "--draft-model", repository]
+            )
+            self.assertEqual(args.draft_model, repository)
+            for value in ("./missing", "missing", "", "drafts/local/../../missing/"):
+                with (
+                    self.subTest(value=value),
+                    mock.patch.object(launcher, "_ensure_installed") as install,
+                    mock.patch("sys.stderr", io.StringIO()) as error,
+                    self.assertRaises(SystemExit) as failed,
+                ):
+                    launcher.main(
+                        ["serve", "--model", MODEL_ID, "--draft-model", value]
+                    )
+                self.assertEqual(failed.exception.code, 2)
+                self.assertIn(
+                    "argument --draft-model: must be a local DFlash2 draft "
+                    "directory or a Hugging Face repository ID",
+                    error.getvalue(),
+                )
+                install.assert_not_called()
 
     def test_packaged_serve_never_invokes_make_or_system_python(self):
         with (
@@ -690,13 +1134,61 @@ class LauncherTests(unittest.TestCase):
                 "run",
                 return_value=subprocess.CompletedProcess([], 0),
             ) as run,
+            mock.patch.object(launcher, "_run_held", return_value=0) as run_held,
         ):
-            launcher._ensure_installed(MODEL_ID)
-        run.assert_called_once()
-        command = run.call_args.args[0]
+            launcher._ensure_installed(selection(launcher.paths.MODELS))
+        (check,) = (call.args[0] for call in run.call_args_list)
+        command = run_held.call_args.args[0]
+        self.assertEqual(check, [str(launcher.paths.BINARY), "device-check"])
         self.assertEqual(command[0], str(launcher.paths.PYTHON))
         self.assertIn("prepare", command)
         self.assertNotIn("make", command)
+
+    def test_unsupported_mac_is_refused_before_any_download(self):
+        reason = (
+            "Splash needs Apple GPU family 9 or newer (M3 or later) on macOS 26.4 "
+            "or newer; this Mac has Apple M2 Max (Apple GPU family 8) on macOS "
+            "26.4.1 (apple_gpu_family_9_required)"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary, python, prepared = root / "splash", root / "python", root / "ran"
+            python.write_text(f"#!/bin/sh\ntouch '{prepared}'\n")
+            python.chmod(0o755)
+            # The binary's own line is the error, without its error: prefix;
+            # a binary killed before main() is reported whole.
+            for check, refusal in (
+                (f"echo 'error: {reason}' >&2; exit 70", reason),
+                (
+                    "echo 'error: Metal device unavailable' >&2; exit 70",
+                    "Metal device unavailable",
+                ),
+                (
+                    "printf 'dyld: Symbol not found\\n  Expected in: Metal\\n' >&2; kill -ABRT $$",
+                    "the engine's device check failed: dyld: Symbol not found\n"
+                    "  Expected in: Metal",
+                ),
+                ("exit 0", None),
+            ):
+                with (
+                    self.subTest(check=check),
+                    mock.patch.object(launcher.paths, "PACKAGED", True),
+                    mock.patch.object(launcher.paths, "BINARY", binary),
+                    mock.patch.object(launcher.paths, "PYTHON", python),
+                ):
+                    binary.write_text(
+                        f'#!/bin/sh\ntest "$*" = device-check || exit 2\n{check}\n'
+                    )
+                    binary.chmod(0o755)
+                    prepared.unlink(missing_ok=True)
+                    if refusal is None:
+                        launcher._ensure_installed(selection(root))
+                    else:
+                        with self.assertRaises(launcher.LauncherError) as refused:
+                            launcher._ensure_installed(selection(root))
+                        self.assertEqual(str(refused.exception), refusal)
+                    # Preparation, which downloads, runs only on a supported Mac.
+                    self.assertEqual(prepared.exists(), refusal is None)
 
     def test_failed_download_never_executes_server(self):
         with (

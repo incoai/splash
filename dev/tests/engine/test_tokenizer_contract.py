@@ -60,13 +60,15 @@ class TokenizerContractTests(unittest.TestCase):
 
     def test_startup_rejects_tokenizer_before_starting_the_native_worker(self):
         args = server.parse_args(
-            ["target", "draft", "--tokenizer", "tokenizer", "--model", "owner/model"]
+            ["model", "--tokenizer", "tokenizer", "--model", "owner/model"]
         )
         tokenizer = self.tokenizer()
         tokenizer.get_vocab()["</think>"] = 0
         http = mock.Mock()
         with (
             mock.patch.object(server, "parse_args", return_value=args),
+            mock.patch.object(server.signal, "signal"),
+            mock.patch.object(server, "load_thinking_key", return_value=None),
             mock.patch.object(
                 server.AutoTokenizer, "from_pretrained", return_value=tokenizer
             ),

@@ -3,12 +3,20 @@
 // delta-rule recurrence over the fp32 state, the gated RMSNorm of the
 // recurrent rows and the convolution carry, for both compiled geometries,
 // every lane count, a two-layer state cell (so the layer offsets are
-// exercised) and every retained count of the commit. The recurrence and the
-// gate are checked from the kernel's own q/k/v and gates after those were
-// checked against the reference, so their tolerances stay at fp32 accuracy.
+// exercised) and every retained count of the commit. The recurrent state is
+// checked at fp32 accuracy from the kernel's own k/v and gates, after those
+// were checked against the reference; the hidden rows from the recurrent rows
+// read from that state with the reference q and rounded to bf16.
+#include "TestBuffers.hpp"
+#include "TestChecks.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/ExecutionGeometry.h"
+#include "model/StateLayout.hpp"
 #include "ops/GDN.hpp"
+#include "tuning/LinearNumerics.hpp"
+
+#include "LinearInputReference.hpp"
+#include "NormReference.hpp"
 
 #import <Foundation/Foundation.h>
 
@@ -28,18 +36,18 @@ using splash::metal::CommandGraph;
 using splash::metal::MetalBackend;
 using splash::metal::MetalBuffer;
 using namespace splash::ops;
+using namespace splash::test;
+using splash::ops::tuning::bf16ToFloat;
+using splash::ops::tuning::floatToBf16;
 
 constexpr uint32_t kRows = SPLASH_TARGET_VERIFY_ROWS;
 constexpr uint32_t kMaxLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
 constexpr uint32_t kHeadDim = 128;
 constexpr uint32_t kLayers = 2;
+// The scales of the normalized q and k rows.
+constexpr double kQueryScale = 0.0078125, kKeyScale = 0.08838834765;
 constexpr std::array kShapes{GdnShape{16, 48, 128, 10240, 16640},
                              GdnShape{16, 32, 128, 8192, 12544}};
-
-void require(bool condition, const std::string &message) {
-  if (!condition)
-    throw std::runtime_error(message);
-}
 
 template <class Function> void rejects(Function function) {
   try {
@@ -50,22 +58,8 @@ template <class Function> void rejects(Function function) {
   throw std::runtime_error("invalid GDN request was accepted");
 }
 
-uint16_t toBfloat(float value) {
-  uint32_t bits;
-  std::memcpy(&bits, &value, sizeof(bits));
-  bits += 0x7FFFU + ((bits >> 16) & 1U);
-  return static_cast<uint16_t>(bits >> 16);
-}
-
-float fromBfloat(uint16_t value) {
-  const uint32_t bits = uint32_t{value} << 16;
-  float result;
-  std::memcpy(&result, &bits, sizeof(result));
-  return result;
-}
-
 double roundBfloat(double value) {
-  return fromBfloat(toBfloat(static_cast<float>(value)));
+  return bf16ToFloat(floatToBf16(static_cast<float>(value)));
 }
 
 // One bf16 unit in the last place at the reference's magnitude.
@@ -76,7 +70,7 @@ double bfloatUlp(double reference) {
 }
 
 bool closeBfloat(uint16_t got, double reference, double ulps, double floor) {
-  return std::fabs(double(fromBfloat(got)) - reference) <=
+  return std::fabs(double(bf16ToFloat(got)) - reference) <=
          ulps * bfloatUlp(reference) + floor;
 }
 
@@ -97,24 +91,23 @@ private:
   uint64_t state_;
 };
 
-uint64_t align16k(uint64_t bytes) { return (bytes + 16383) & ~uint64_t{16383}; }
-
 double sigmoid(double value) { return 1.0 / (1.0 + std::exp(-value)); }
 
 // The production state cell layout: every layer's conv rows, then every
 // layer's recurrent state, both padded to 16 KiB.
 struct Cell final {
+  splash::model::GdnStateLayout layout;
   uint64_t convLayerBytes = 0;
   uint64_t recurrentLayerBytes = 0;
   uint64_t convBytes = 0;
   uint64_t bytes = 0;
 
   explicit Cell(const GdnShape &shape)
-      : convLayerBytes(align16k(uint64_t{3} * shape.convolutionDimension * 2)),
-        recurrentLayerBytes(align16k(uint64_t{shape.valueHeads} * kHeadDim *
-                                     kHeadDim * 4)),
-        convBytes(kLayers * convLayerBytes),
-        bytes(convBytes + kLayers * recurrentLayerBytes) {}
+      : layout{kLayers, splash::model::kGdnConvolutionTaps - 1, shape.convolutionDimension,
+               shape.valueHeads, shape.headDimension, shape.headDimension},
+        convLayerBytes(layout.convolutionLayerBytes()),
+        recurrentLayerBytes(layout.recurrentLayerBytes()),
+        convBytes(layout.convolutionBytes()), bytes(layout.cellBytes()) {}
 
   GdnStateStrides strides() const {
     return {convLayerBytes, recurrentLayerBytes, convBytes};
@@ -128,17 +121,20 @@ struct Cell final {
   }
 };
 
+// The mixer norm is bf16, or F32 as a GGUF stores it.
 struct Fixture final {
   const GdnShape &shape;
   Cell cell;
   uint32_t lanes;
   MetalBuffer packed, convWeights, mixed, decayWeights, timeBias, decay, beta,
-      recurrent, mixerNorm, hidden, arrived, generation, retained;
+      hidden, retained;
+  NormWeights mixerNorm;
   std::array<MetalBuffer, kMaxLanes> current, next;
   std::vector<MetalBuffer> packedLayer, mixedLayer, decayLayer, betaLayer;
   uint64_t packedStride, mixedStride, gateStride;
 
-  Fixture(MetalBackend &backend, const GdnShape &geometry, uint32_t laneCount)
+  Fixture(MetalBackend &backend, const GdnShape &geometry, uint32_t laneCount,
+          bool float32 = false)
       : shape(geometry), cell(geometry), lanes(laneCount),
         packedStride(uint64_t{kRows} * shape.packedWidth),
         mixedStride(uint64_t{kRows} * shape.convolutionDimension),
@@ -150,7 +146,7 @@ struct Fixture final {
     auto fill = [&](MetalBuffer &buffer, float scale) {
       auto *values = static_cast<uint16_t *>(buffer.contents());
       for (uint64_t index = 0; index < buffer.sizeBytes() / 2; ++index)
-        values[index] = toBfloat(random.unit() * scale);
+        values[index] = floatToBf16(random.unit() * scale);
     };
     packed = alloc(kLayers * kMaxLanes * packedStride * 2, "gdn packed");
     fill(packed, 1.0F);
@@ -166,14 +162,10 @@ struct Fixture final {
     fill(timeBias, 0.5F);
     decay = alloc(kLayers * kMaxLanes * gateStride * 4, "gdn decay");
     beta = alloc(kLayers * kMaxLanes * gateStride * 2, "gdn beta");
-    const uint64_t rowBytes =
-        uint64_t{kMaxLanes} * kRows * shape.valueHeads * kHeadDim * 2;
-    recurrent = alloc(rowBytes, "gdn recurrent rows");
-    hidden = alloc(rowBytes, "gdn hidden");
-    mixerNorm = alloc(uint64_t{kHeadDim} * 2, "gdn mixer norm");
-    fill(mixerNorm, 1.0F);
-    arrived = alloc(kMaxLanes * 4, "gdn arrived");
-    generation = alloc(kMaxLanes * 4, "gdn generation");
+    hidden = alloc(uint64_t{kMaxLanes} * kRows * shape.valueHeads * kHeadDim * 2,
+                   "gdn hidden");
+    mixerNorm = makeNormWeights(backend, kHeadDim, float32,
+                                [&](uint32_t) { return random.unit(); });
     retained = alloc(kMaxLanes * 4, "gdn retained");
     for (uint32_t lane = 0; lane < kMaxLanes; ++lane) {
       current[lane] = alloc(cell.bytes, "gdn current");
@@ -181,7 +173,7 @@ struct Fixture final {
       auto *bytes = static_cast<uint8_t *>(current[lane].contents());
       auto *conv = reinterpret_cast<uint16_t *>(bytes);
       for (uint64_t index = 0; index < cell.convBytes / 2; ++index)
-        conv[index] = toBfloat(random.unit());
+        conv[index] = floatToBf16(random.unit());
       auto *state = reinterpret_cast<float *>(bytes + cell.convBytes);
       for (uint64_t index = 0; index < (cell.bytes - cell.convBytes) / 4;
            ++index)
@@ -207,7 +199,7 @@ struct Fixture final {
     for (uint32_t lane = 0; lane < kMaxLanes; ++lane)
       std::memset(next[lane].contents(), 0, cell.bytes);
     for (MetalBuffer *buffer :
-         {&mixed, &decay, &beta, &recurrent, &hidden, &arrived, &generation})
+         {&mixed, &decay, &beta, &hidden})
       std::memset(buffer->contents(), 0, buffer->sizeBytes());
   }
 
@@ -215,8 +207,7 @@ struct Fixture final {
     return {packedLayer[layer], convWeights,     current,
             next,               mixedLayer[layer], decayWeights,
             timeBias,           decayLayer[layer], betaLayer[layer],
-            recurrent,          mixerNorm,       hidden,
-            arrived,            generation};
+            mixerNorm,          hidden};
   }
   GdnCommitBuffers commitBuffers() const {
     return {packed, mixed, decay, beta, current, next, retained};
@@ -246,9 +237,9 @@ struct Fixture final {
            (uint64_t{layer} * kMaxLanes + lane) * gateStride +
            uint64_t{token} * shape.valueHeads;
   }
-  const uint16_t *rowsOf(const MetalBuffer &buffer, uint32_t lane,
-                         uint32_t token, uint32_t head) const {
-    return static_cast<const uint16_t *>(buffer.contents()) +
+  const uint16_t *hiddenRow(uint32_t lane, uint32_t token,
+                            uint32_t head) const {
+    return static_cast<const uint16_t *>(hidden.contents()) +
            ((uint64_t{lane} * kRows + token) * shape.valueHeads + head) *
                kHeadDim;
   }
@@ -273,7 +264,7 @@ double convolutionSilu(const Fixture &fixture, uint32_t layer, uint32_t lane,
         position < 3
             ? carried[position * fixture.shape.convolutionDimension + channel]
             : fixture.packedRow(layer, lane, position - 3)[channel];
-    value += double(fromBfloat(input)) * fromBfloat(weights[tap]);
+    value += double(bf16ToFloat(input)) * bf16ToFloat(weights[tap]);
   }
   value = roundBfloat(value);
   return roundBfloat(value * sigmoid(value));
@@ -290,36 +281,44 @@ uint16_t convolutionCarry(const Fixture &fixture, uint32_t layer,
              : fixture.packedRow(layer, lane, source - 3)[channel];
 }
 
+// The q or k row of one key head at one token, from the head's first
+// channel: the convolution RMS-normalised over the head, rounded, then scaled
+// (the kernel rounds again).
+std::vector<double> normalizedHead(const Fixture &fixture, uint32_t layer,
+                                   uint32_t lane, uint32_t token,
+                                   uint32_t first, double scale) {
+  std::vector<double> conv(kHeadDim);
+  double squares = 0.0;
+  for (uint32_t dim = 0; dim < kHeadDim; ++dim) {
+    conv[dim] = convolutionSilu(fixture, layer, lane, token, first + dim);
+    squares += conv[dim] * conv[dim];
+  }
+  const double inverse = 1.0 / std::sqrt(squares / kHeadDim + 1e-6);
+  for (double &value : conv)
+    value = roundBfloat(value * inverse) * scale;
+  return conv;
+}
+
+// The k and v rows the commit reads; the kernel writes no q rows.
 void checkConvolution(const Fixture &fixture, uint32_t layer, uint32_t lane,
                       const std::string &where) {
   const GdnShape &shape = fixture.shape;
   const uint32_t keyWidth = shape.keyHeads * kHeadDim;
   for (uint32_t token = 0; token < kRows; ++token) {
     const uint16_t *mixedRow = fixture.mixedRow(layer, lane, token);
-    std::vector<double> conv(shape.convolutionDimension);
-    for (uint32_t channel = 0; channel < shape.convolutionDimension; ++channel)
-      conv[channel] = convolutionSilu(fixture, layer, lane, token, channel);
-    // q and k: RMS-normalised per key head, rounded, then scaled and
-    // rounded again.
-    for (uint32_t part = 0; part < 2; ++part) {
-      const double scale = part == 0 ? 0.0078125 : 0.08838834765;
-      for (uint32_t head = 0; head < shape.keyHeads; ++head) {
-        const uint32_t base = part * keyWidth + head * kHeadDim;
-        double squares = 0.0;
-        for (uint32_t dim = 0; dim < kHeadDim; ++dim)
-          squares += conv[base + dim] * conv[base + dim];
-        const double inverse = 1.0 / std::sqrt(squares / kHeadDim + 1e-6);
-        for (uint32_t dim = 0; dim < kHeadDim; ++dim) {
-          const double normalized = roundBfloat(conv[base + dim] * inverse);
-          require(closeBfloat(mixedRow[base + dim], normalized * scale, 3.0,
-                              1e-6),
-                  where + ": mixed q/k row mismatch");
-        }
-      }
+    for (uint32_t head = 0; head < shape.keyHeads; ++head) {
+      const uint32_t first = keyWidth + head * kHeadDim;
+      const std::vector<double> key =
+          normalizedHead(fixture, layer, lane, token, first, kKeyScale);
+      for (uint32_t dim = 0; dim < kHeadDim; ++dim)
+        require(closeBfloat(mixedRow[first + dim], key[dim], 3.0, 1e-6),
+                where + ": mixed k row mismatch");
     }
     for (uint32_t channel = 2 * keyWidth; channel < shape.convolutionDimension;
          ++channel)
-      require(closeBfloat(mixedRow[channel], conv[channel], 3.0, 1e-6),
+      require(closeBfloat(mixedRow[channel],
+                          convolutionSilu(fixture, layer, lane, token, channel),
+                          3.0, 1e-6),
               where + ": mixed v row mismatch");
   }
 }
@@ -339,20 +338,20 @@ void checkGates(const Fixture &fixture, uint32_t layer, uint32_t lane,
     const float *decay = fixture.decayRow(layer, lane, token);
     const uint16_t *beta = fixture.betaRow(layer, lane, token);
     for (uint32_t head = 0; head < shape.valueHeads; ++head) {
-      const double b = fromBfloat(packed[bOffset + head]);
+      const double b = bf16ToFloat(packed[bOffset + head]);
       require(closeBfloat(beta[head], sigmoid(b), 2.0, 1e-6),
               where + ": beta mismatch");
-      const double x = roundBfloat(double(fromBfloat(packed[aOffset + head])) +
-                                   fromBfloat(timeBias[head]));
+      const double x = roundBfloat(double(bf16ToFloat(packed[aOffset + head])) +
+                                   bf16ToFloat(timeBias[head]));
       const double softplus =
           std::max(x, 0.0) + std::log1p(std::exp(-std::fabs(x)));
       // The kernel rounds softplus to bf16 with fast transcendentals, so a
       // value near a rounding boundary may land one bf16 step away.
       bool matched = false;
-      const uint16_t rounded = toBfloat(static_cast<float>(softplus));
+      const uint16_t rounded = floatToBf16(static_cast<float>(softplus));
       for (int step = -1; step <= 1 && !matched; ++step) {
         const double candidate =
-            fromBfloat(static_cast<uint16_t>(rounded + step));
+            bf16ToFloat(static_cast<uint16_t>(rounded + step));
         matched = closeFloat(decay[head],
                              std::exp(double(decayWeights[head]) * candidate),
                              1e-4);
@@ -363,8 +362,9 @@ void checkGates(const Fixture &fixture, uint32_t layer, uint32_t lane,
 }
 
 // The delta rule over `tokens` rows of one value head from the lane's
-// incoming state, driven by the kernel's own q/k/v rows and gates. Returns
-// the final state; the recurrent output rows go to `rows` when requested.
+// incoming state, driven by the kernel's own k/v rows and gates. Returns the
+// final state; the recurrent output rows, read with the reference q, go to
+// `rows` when requested.
 std::vector<double> recurrence(const Fixture &fixture, uint32_t layer,
                                uint32_t lane, uint32_t head, uint32_t tokens,
                                std::vector<double> *rows) {
@@ -379,26 +379,30 @@ std::vector<double> recurrence(const Fixture &fixture, uint32_t layer,
     rows->assign(uint64_t{tokens} * kHeadDim, 0.0);
   for (uint32_t token = 0; token < tokens; ++token) {
     const uint16_t *mixed = fixture.mixedRow(layer, lane, token);
-    const uint16_t *query = mixed + keyHead * kHeadDim;
+    const std::vector<double> query =
+        rows ? normalizedHead(fixture, layer, lane, token, keyHead * kHeadDim,
+                              kQueryScale)
+             : std::vector<double>{};
     const uint16_t *key = mixed + keyWidth + keyHead * kHeadDim;
     const uint16_t *value = mixed + 2 * keyWidth + head * kHeadDim;
     const double decay = fixture.decayRow(layer, lane, token)[head];
-    const double beta = fromBfloat(fixture.betaRow(layer, lane, token)[head]);
+    const double beta = bf16ToFloat(fixture.betaRow(layer, lane, token)[head]);
     for (uint32_t valueDim = 0; valueDim < kHeadDim; ++valueDim) {
       double *row = state.data() + uint64_t{valueDim} * kHeadDim;
       double memory = 0.0;
       for (uint32_t keyDim = 0; keyDim < kHeadDim; ++keyDim) {
         row[keyDim] *= decay;
-        memory += row[keyDim] * fromBfloat(key[keyDim]);
+        memory += row[keyDim] * bf16ToFloat(key[keyDim]);
       }
-      const double delta = (fromBfloat(value[valueDim]) - memory) * beta;
+      const double delta = (bf16ToFloat(value[valueDim]) - memory) * beta;
+      for (uint32_t keyDim = 0; keyDim < kHeadDim; ++keyDim)
+        row[keyDim] += bf16ToFloat(key[keyDim]) * delta;
+      if (!rows)
+        continue;
       double output = 0.0;
-      for (uint32_t keyDim = 0; keyDim < kHeadDim; ++keyDim) {
-        row[keyDim] += fromBfloat(key[keyDim]) * delta;
-        output += row[keyDim] * fromBfloat(query[keyDim]);
-      }
-      if (rows)
-        (*rows)[uint64_t{token} * kHeadDim + valueDim] = output;
+      for (uint32_t keyDim = 0; keyDim < kHeadDim; ++keyDim)
+        output += row[keyDim] * query[keyDim];
+      (*rows)[uint64_t{token} * kHeadDim + valueDim] = output;
     }
   }
   return state;
@@ -435,54 +439,47 @@ void checkDecode(const Fixture &fixture, uint32_t layer, uint32_t lane) {
   checkConvolution(fixture, layer, lane, where);
   checkGates(fixture, layer, lane, where);
   checkCarry(fixture, layer, lane, kRows, where);
-  // Every layer writes the recurrent rows and the hidden rows into the same
-  // scratch, as the model graph does, so those hold the last layer's values.
+  // Every layer writes the hidden rows into the same scratch, as the model
+  // graph does, so those hold the last layer's values: the gated RMSNorm of
+  // the recurrent rows, here the reference's rounded to bf16 as the kernel
+  // rounds its own. Where a row cancels, the kernel's fp32 row can round to
+  // the neighbouring bf16 value, which moves its normalized value by up to a
+  // bf16 step on top of the two units of the output's own rounding, hence
+  // three units. Almost every output is the reference's own double rounding;
+  // norm weights rounded to bf16 would move a large fraction of them.
   const bool lastLayer = layer + 1 == kLayers;
+  const uint32_t zOffset = shape.convolutionDimension;
+  uint64_t inexact = 0;
   std::vector<double> rows;
   for (uint32_t head = 0; head < shape.valueHeads; ++head) {
-    const std::vector<double> state =
-        recurrence(fixture, layer, lane, head, kRows, &rows);
+    const std::vector<double> state = recurrence(
+        fixture, layer, lane, head, kRows, lastLayer ? &rows : nullptr);
     checkState(fixture, layer, lane, head, state, where);
     if (!lastLayer)
       continue;
     for (uint32_t token = 0; token < kRows; ++token) {
-      const uint16_t *recurrent =
-          fixture.rowsOf(fixture.recurrent, lane, token, head);
+      const uint16_t *packed = fixture.packedRow(layer, lane, token);
+      std::array<uint16_t, kHeadDim> recurrent;
       for (uint32_t dim = 0; dim < kHeadDim; ++dim)
-        require(closeBfloat(recurrent[dim], rows[token * kHeadDim + dim], 2.0,
-                            1e-6),
-                where + ": recurrent row mismatch");
+        recurrent[dim] =
+            floatToBf16(static_cast<float>(rows[token * kHeadDim + dim]));
+      const uint16_t *hidden = fixture.hiddenRow(lane, token, head);
+      const std::vector<double> exact =
+          rmsNorm(recurrent.data(), fixture.mixerNorm, kHeadDim);
+      for (uint32_t dim = 0; dim < kHeadDim; ++dim) {
+        const double normalized = roundBfloat(exact[dim]);
+        const double gate = bf16ToFloat(packed[zOffset + head * kHeadDim + dim]);
+        const double reference = normalized * gate * sigmoid(gate);
+        require(closeBfloat(hidden[dim], reference, 3.0, 1e-6),
+                where + ": hidden mismatch");
+        inexact += bf16ToFloat(hidden[dim]) != roundBfloat(reference);
+      }
     }
   }
   if (!lastLayer)
     return;
-  // The gated RMSNorm, from the kernel's own recurrent rows.
-  const auto *norm =
-      static_cast<const uint16_t *>(fixture.mixerNorm.contents());
-  const uint32_t zOffset = shape.convolutionDimension;
-  for (uint32_t token = 0; token < kRows; ++token) {
-    const uint16_t *packed = fixture.packedRow(layer, lane, token);
-    for (uint32_t head = 0; head < shape.valueHeads; ++head) {
-      const uint16_t *recurrent =
-          fixture.rowsOf(fixture.recurrent, lane, token, head);
-      const uint16_t *hidden =
-          fixture.rowsOf(fixture.hidden, lane, token, head);
-      double squares = 0.0;
-      for (uint32_t dim = 0; dim < kHeadDim; ++dim) {
-        const double row = fromBfloat(recurrent[dim]);
-        squares += row * row;
-      }
-      const double inverse = 1.0 / std::sqrt(squares / kHeadDim + 1e-6);
-      for (uint32_t dim = 0; dim < kHeadDim; ++dim) {
-        const double normalized = roundBfloat(
-            fromBfloat(recurrent[dim]) * inverse * fromBfloat(norm[dim]));
-        const double gate = fromBfloat(packed[zOffset + head * kHeadDim + dim]);
-        require(closeBfloat(hidden[dim], normalized * gate * sigmoid(gate), 2.0,
-                            1e-6),
-                where + ": hidden mismatch");
-      }
-    }
-  }
+  require(inexact <= uint64_t{kRows} * shape.valueHeads * kHeadDim / 100,
+          where + ": hidden differs from the reference in more than 1% of values");
 }
 
 void requireUntouched(const Fixture &fixture, uint32_t lane,
@@ -492,29 +489,29 @@ void requireUntouched(const Fixture &fixture, uint32_t lane,
     require(bytes[index] == 0, where + ": idle lane cell was written");
 }
 
-void runDecode(MetalBackend &backend, const GdnShape &shape, uint32_t lanes) {
-  Fixture fixture(backend, shape, lanes);
+void runDecode(MetalBackend &backend, const GdnShape &shape, uint32_t lanes,
+               bool float32) {
+  Fixture fixture(backend, shape, lanes, float32);
   CommandGraph graph;
+  const std::string where =
+      "lanes " + std::to_string(lanes) + (float32 ? " f32 norm" : "");
   for (uint32_t layer = 0; layer < kLayers; ++layer)
-    GDN::addDecode(graph, fixture.decodeBuffers(layer), shape, lanes, layer,
-                   fixture.cell.strides());
+    require(GDN::addDecode(graph, fixture.decodeBuffers(layer), shape, lanes,
+                           layer, fixture.cell.strides(), GdnHeadOrder::Grouped, LinearInput::Plain)
+                    .layout == LinearInput::Plain,
+            where + ": plain GDN claimed a table");
   static_cast<void>(backend.submitCommand(graph.dispatches()));
-  const std::string where = "lanes " + std::to_string(lanes);
   for (uint32_t lane = 0; lane < kMaxLanes; ++lane) {
-    const auto *generation =
-        static_cast<const uint32_t *>(fixture.generation.contents());
-    const auto *arrived =
-        static_cast<const uint32_t *>(fixture.arrived.contents());
-    require(arrived[lane] == 0, where + ": completion counter not reset");
     if (lane >= lanes) {
-      require(generation[lane] == 0, where + ": idle lane completed");
       requireUntouched(fixture, lane, where);
       continue;
     }
-    require(generation[lane] == kLayers, where + ": layer completion count");
     for (uint32_t layer = 0; layer < kLayers; ++layer)
       checkDecode(fixture, layer, lane);
   }
+  // The commit reads no norm weights; the bf16 pass covers it.
+  if (float32)
+    return;
 
   // The commit replays the retained rows from the incoming cell over the
   // decoded q/k/v and gates; eight retained rows leave the decoded cell.
@@ -566,33 +563,130 @@ void runDecode(MetalBackend &backend, const GdnShape &shape, uint32_t lanes) {
   }
 }
 
-void fusedPreparation(MetalBackend &backend, const GdnShape &shape, uint32_t lanes) {
-  Fixture fixture(backend, shape, lanes);
-  const uint32_t width = shape.valueHeads * shape.headDimension;
-  auto table = backend.allocateBuffer(width * 16 * lanes);
-  auto sums = backend.allocateBuffer(width / 2 * lanes);
-  auto referenceTable = backend.allocateBuffer(width * 16 * lanes);
-  auto referenceSums = backend.allocateBuffer(width / 2 * lanes);
+// The out-projection table a fused decode writes into its scratch and the one
+// the projection's own preparation writes from the decoded hidden rows.
+struct PreparedTables final {
+  LinearInput layout;
+  uint32_t width, lanes;
+  uint64_t tableSize, sumsSize;
+  MetalBuffer table, sums, referenceTable, referenceSums;
+
+  PreparedTables(MetalBackend &backend, LinearInput tableLayout, uint32_t hiddenWidth,
+                 uint32_t laneCount)
+      : layout(tableLayout), width(hiddenWidth), lanes(laneCount),
+        tableSize(tableBytes(width, lanes * kRows)),
+        sumsSize(tableSumsBytes(layout, width, lanes * kRows)),
+        table(sharedBuffer(backend, tableSize)), sums(sharedBuffer(backend, sumsSize)),
+        referenceTable(sharedBuffer(backend, tableSize)),
+        referenceSums(sharedBuffer(backend, sumsSize)) {}
+
+  LinearScratch scratch() const { return {table, sums, {}, {}}; }
+  void addReference(CommandGraph &graph, const MetalBuffer &hidden) const {
+    addReferencePreparation(graph, layout, hidden, referenceTable, referenceSums, width, lanes);
+  }
+  // The decode reported the table it wrote, and wrote the reference's bytes.
+  void requireWritten(const PreparedInput &reported, const MetalBuffer &hidden,
+                      const std::string &what) const {
+    require(reported.layout == layout && reported.source.sameView(hidden),
+            what + " did not report the table it wrote");
+    require(!std::memcmp(table.contents(), referenceTable.contents(), tableSize),
+            what + " table mismatch");
+    require(!std::memcmp(sums.contents(), referenceSums.contents(), sumsSize),
+            what + " sums mismatch");
+  }
+};
+
+std::string caseName(const char *test, const GdnShape &shape, uint32_t lanes, LinearInput layout) {
+  return std::string(test) + " vh" + std::to_string(shape.valueHeads) + " lanes " +
+         std::to_string(lanes) +
+         (layout == LinearInput::Plain     ? " plain"
+          : layout == LinearInput::Table64 ? " Table64"
+                                           : " Table16");
+}
+
+void fusedPreparation(MetalBackend &backend, const GdnShape &shape, uint32_t lanes, LinearInput layout,
+                      bool float32) {
+  const std::string what = caseName("fused GDN", shape, lanes, layout);
+  Fixture fixture(backend, shape, lanes, float32);
+  const PreparedTables tables(backend, layout, shape.valueHeads * shape.headDimension, lanes);
   CommandGraph reference;
-  GDN::addDecode(reference, fixture.decodeBuffers(0), shape, lanes, 0, fixture.cell.strides());
-  reference.add("decode_linear_q4_prepare", {fixture.hidden, referenceTable, referenceSums},
-                width, {width / 32, lanes, 1}, {128, 1, 1});
+  // Without scratch the table cannot be written: GDN refuses it before it
+  // encodes anything.
+  rejects([&] {
+    GDN::addDecode(reference, fixture.decodeBuffers(0), shape, lanes, 0, fixture.cell.strides(),
+                   GdnHeadOrder::Grouped, layout);
+  });
+  require(GDN::addDecode(reference, fixture.decodeBuffers(0), shape, lanes, 0, fixture.cell.strides(),
+                         GdnHeadOrder::Grouped, LinearInput::Plain)
+                  .layout == LinearInput::Plain,
+          what + " plain kernel claimed a table");
+  tables.addReference(reference, fixture.hidden);
   (void)backend.submitCommand(reference.dispatches());
-  std::vector<uint8_t> expected(width * 16 * lanes);
+  // The active lanes' bf16 hidden rows.
+  std::vector<uint8_t> expected(uint64_t{lanes} * kRows * tables.width * 2);
   std::memcpy(expected.data(), fixture.hidden.contents(), expected.size());
   fixture.clear();
   auto buffers = fixture.decodeBuffers(0);
-  buffers.linearScratch = {table, sums, {}, {}};
+  buffers.linearScratch = tables.scratch();
+  // A plain consumer gets no table from the scratch it shares.
+  CommandGraph unprepared;
+  require(GDN::addDecode(unprepared, buffers, shape, lanes, 0, fixture.cell.strides(),
+                         GdnHeadOrder::Grouped, LinearInput::Plain).layout == LinearInput::Plain,
+          what + " claimed a table for a plain consumer");
   CommandGraph fused;
-  GDN::addDecode(fused, buffers, shape, lanes, 0, fixture.cell.strides());
+  const PreparedInput prepared =
+      GDN::addDecode(fused, buffers, shape, lanes, 0, fixture.cell.strides(), GdnHeadOrder::Grouped, layout);
   (void)backend.submitCommand(fused.dispatches());
   require(!std::memcmp(expected.data(), fixture.hidden.contents(), expected.size()),
-          "fused GDN changed output");
-  require(!std::memcmp(table.contents(), referenceTable.contents(), width * 16 * lanes),
-          "fused GDN table mismatch");
-  require(!std::memcmp(sums.contents(), referenceSums.contents(), width / 2 * lanes),
-          "fused GDN sums mismatch");
+          what + " changed output");
+  tables.requireWritten(prepared, fixture.hidden, what);
   for (uint32_t lane=0;lane<lanes;++lane) checkDecode(fixture, 0, lane);
+}
+
+// The tiled head order only moves each value head's output block: the tiled
+// output, and the table prepared from it in the same dispatch, are the
+// grouped output with head h at (h % heads per key) * key heads + h / heads
+// per key, byte for byte.
+void tiledHeadOrder(MetalBackend &backend, const GdnShape &shape, uint32_t lanes, LinearInput layout,
+                    bool float32) {
+  Fixture fixture(backend, shape, lanes, float32);
+  const uint32_t width = shape.valueHeads * shape.headDimension;
+  const uint32_t headsPerKey = shape.valueHeads / shape.keyHeads;
+  const uint64_t headBytes = uint64_t{shape.headDimension} * 2;
+  const std::string what = caseName("tiled GDN", shape, lanes, layout);
+  CommandGraph grouped;
+  require(GDN::addDecode(grouped, fixture.decodeBuffers(0), shape, lanes, 0, fixture.cell.strides(),
+                         GdnHeadOrder::Grouped, LinearInput::Plain)
+                  .layout == LinearInput::Plain,
+          what + " grouped reference claimed a table");
+  (void)backend.submitCommand(grouped.dispatches());
+  const auto *hidden = static_cast<const uint8_t *>(fixture.hidden.contents());
+  std::vector<uint8_t> expected(fixture.hidden.sizeBytes());
+  for (uint64_t row = 0; row < uint64_t{kMaxLanes} * kRows; ++row)
+    for (uint32_t head = 0; head < shape.valueHeads; ++head) {
+      const uint32_t tiled = (head % headsPerKey) * shape.keyHeads + head / headsPerKey;
+      std::memcpy(expected.data() + (row * shape.valueHeads + tiled) * headBytes,
+                  hidden + (row * shape.valueHeads + head) * headBytes, headBytes);
+    }
+  fixture.clear();
+  CommandGraph tiled;
+  if (layout == LinearInput::Plain) {
+    require(GDN::addDecode(tiled, fixture.decodeBuffers(0), shape, lanes, 0, fixture.cell.strides(),
+                           GdnHeadOrder::Tiled, LinearInput::Plain).layout == LinearInput::Plain,
+            what + " claimed a table");
+    (void)backend.submitCommand(tiled.dispatches());
+  } else {
+    const PreparedTables tables(backend, layout, width, lanes);
+    auto buffers = fixture.decodeBuffers(0);
+    buffers.linearScratch = tables.scratch();
+    const PreparedInput prepared =
+        GDN::addDecode(tiled, buffers, shape, lanes, 0, fixture.cell.strides(), GdnHeadOrder::Tiled, layout);
+    tables.addReference(tiled, fixture.hidden);
+    (void)backend.submitCommand(tiled.dispatches());
+    tables.requireWritten(prepared, fixture.hidden, what);
+  }
+  require(!std::memcmp(expected.data(), hidden, expected.size()),
+          what + " output is not the grouped output in tiled head order");
 }
 
 void rejectsInvalid(MetalBackend &backend) {
@@ -601,16 +695,16 @@ void rejectsInvalid(MetalBackend &backend) {
   CommandGraph graph;
   rejects([&] {
     GDN::addDecode(graph, fixture.decodeBuffers(0), shape, 0, 0,
-                   fixture.cell.strides());
+                   fixture.cell.strides(), GdnHeadOrder::Grouped, LinearInput::Plain);
   });
   rejects([&] {
     GDN::addDecode(graph, fixture.decodeBuffers(0), shape, kMaxLanes + 1, 0,
-                   fixture.cell.strides());
+                   fixture.cell.strides(), GdnHeadOrder::Grouped, LinearInput::Plain);
   });
   rejects([&] {
     GDN::addDecode(graph, fixture.decodeBuffers(0),
                    GdnShape{16, 40, 128, 9216, 14400}, 1, 0,
-                   fixture.cell.strides());
+                   fixture.cell.strides(), GdnHeadOrder::Grouped, LinearInput::Plain);
   });
   rejects([&] {
     GDN::addCommit(graph, fixture.commitBuffers(), shape, 0, 1,
@@ -618,9 +712,26 @@ void rejectsInvalid(MetalBackend &backend) {
   });
   rejects([&] {
     auto buffers = fixture.decodeBuffers(0);
-    buffers.linearScratch.input = backend.allocateBuffer(16);
-    buffers.linearScratch.sums = backend.allocateBuffer(4);
-    GDN::addDecode(graph, buffers, shape, 1, 0, fixture.cell.strides());
+    buffers.linearScratch.input = sharedBuffer(backend, 16);
+    buffers.linearScratch.sums = sharedBuffer(backend, 4);
+    GDN::addDecode(graph, buffers, shape, 1, 0, fixture.cell.strides(), GdnHeadOrder::Grouped,
+                   splash::ops::LinearInput::Table64);
+  });
+  rejects([&] {
+    // Sums sized for the affine table are below the GGUF table's.
+    const uint32_t width = shape.valueHeads * shape.headDimension;
+    auto buffers = fixture.decodeBuffers(0);
+    buffers.linearScratch.input = sharedBuffer(backend, tableBytes(width, kRows));
+    buffers.linearScratch.sums = sharedBuffer(backend, tableSumsBytes(LinearInput::Table64, width, kRows));
+    GDN::addDecode(graph, buffers, shape, 1, 0, fixture.cell.strides(), GdnHeadOrder::Grouped,
+                   LinearInput::Table16);
+  });
+  rejects([&] {
+    // F32 weights need twice the bytes of bf16 ones.
+    auto buffers = fixture.decodeBuffers(0);
+    buffers.mixerNorm.float32 = true;
+    GDN::addDecode(graph, buffers, shape, 1, 0, fixture.cell.strides(), GdnHeadOrder::Grouped,
+                   LinearInput::Plain);
   });
   require(graph.empty(), "invalid GDN request partially encoded a graph");
 }
@@ -633,11 +744,21 @@ int main(int argc, char **argv) {
       throw std::invalid_argument("usage: gdn-decode METALLIB");
     MetalBackend backend(argv[1]);
     rejectsInvalid(backend);
-    for (const GdnShape &shape : kShapes)
-      for (uint32_t lanes=1;lanes<=kMaxLanes;++lanes) fusedPreparation(backend, shape, lanes);
+    // Table64 feeds the affine models, whose norms are bf16; Table16 a GGUF's, whose norms are F32.
+    for (LinearInput layout : {LinearInput::Table64, LinearInput::Table16})
+      for (const GdnShape &shape : kShapes)
+        for (uint32_t lanes = 1; lanes <= kMaxLanes; ++lanes) {
+          fusedPreparation(backend, shape, lanes, layout, layout == LinearInput::Table16);
+          tiledHeadOrder(backend, shape, lanes, layout, layout == LinearInput::Table16);
+        }
+    // A GGUF's out-projection on the staged tile reads the tiled rows plain.
     for (const GdnShape &shape : kShapes)
       for (uint32_t lanes = 1; lanes <= kMaxLanes; ++lanes)
-        runDecode(backend, shape, lanes);
+        tiledHeadOrder(backend, shape, lanes, LinearInput::Plain, true);
+    for (bool float32 : {false, true})
+      for (const GdnShape &shape : kShapes)
+        for (uint32_t lanes = 1; lanes <= kMaxLanes; ++lanes)
+          runDecode(backend, shape, lanes, float32);
     std::cout << "gdn_decode_metal_test: PASS\n";
     return 0;
   } catch (const std::exception &error) {

@@ -66,11 +66,11 @@ inline float reassociationSlack(uint32_t inputSize, float maxAbsReference) noexc
 // affine FMAs per group and up to eight split additions. Maxima over columns
 // keep this qualification pass linear in packed metadata, not matrix FLOPs.
 inline float simdgroupSlack(LinearWorkload w, const metal::MetalBuffer &input,
-                           const Q4Projection &projection) {
+                           const Projection &projection) {
   const uint32_t groups = w.matrix.inputSize / 64;
   std::vector<double> scale(groups), bias(groups);
-  const auto *sc = static_cast<const uint16_t *>(projection.scales.contents());
-  const auto *bi = static_cast<const uint16_t *>(projection.biases.contents());
+  const auto *sc = static_cast<const uint16_t *>(projection.affine().scales.contents());
+  const auto *bi = static_cast<const uint16_t *>(projection.affine().biases.contents());
   for (uint32_t n = 0; n < w.matrix.outputSize; ++n)
     for (uint32_t g = 0; g < groups; ++g) {
       const uint64_t i = (uint64_t(n / 256) * groups + g) * 256 + n % 256;

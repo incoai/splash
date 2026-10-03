@@ -90,12 +90,12 @@ void runShape(MetalBackend &backend, const ProjectionShape &shape,
     gatePtr[index] = __bf16(inputValues(random));
   }
 
-  const Q4PrefillParams params{shape.outputSize, shape.inputSize};
+  const Q4Params params{shape.outputSize, shape.inputSize};
   {
     ComputeDispatch sum;
     sum.pipelineName = "prefill_linear_q4_sums32";
     sum.buffers = {{0, input}, {1, sums}};
-    sum.bytes = {{2, &params, sizeof(params)}};
+    sum.bytes = {{2, &shape.inputSize, sizeof(shape.inputSize)}};
     sum.threadgroups = {rowTiles, 1, 1};
     sum.threadsPerThreadgroup = {256, 1, 1};
     (void)backend.submit(sum);
@@ -269,12 +269,12 @@ void runDecodeCrossCheck(MetalBackend &backend, std::mt19937 &random) {
   for (uint64_t index = 0; index < outputElements; ++index)
     residualPtr[index] = __bf16(inputValues(random));
 
-  const Q4PrefillParams prefillParams{shape.outputSize, shape.inputSize};
+  const Q4Params prefillParams{shape.outputSize, shape.inputSize};
   {
     ComputeDispatch sum;
     sum.pipelineName = "prefill_linear_q4_sums32";
     sum.buffers = {{0, input}, {1, sums}};
-    sum.bytes = {{2, &prefillParams, sizeof(prefillParams)}};
+    sum.bytes = {{2, &shape.inputSize, sizeof(shape.inputSize)}};
     sum.threadgroups = {1, 1, 1};
     sum.threadsPerThreadgroup = {256, 1, 1};
     (void)backend.submit(sum);
@@ -300,7 +300,7 @@ void runDecodeCrossCheck(MetalBackend &backend, std::mt19937 &random) {
   };
   const auto runDecodePlain = [&](const char *pipeline, uint32_t groups,
                                   MetalBuffer output) {
-    const Q4Params decodeParams{shape.outputSize, shape.inputSize, groups};
+    const Q4PersistentParams decodeParams{shape.outputSize, shape.inputSize, groups};
     ComputeDispatch decode;
     decode.pipelineName = pipeline;
     decode.buffers = {{0, input}, {1, weights}, {2, scales}, {3, biases},
@@ -359,14 +359,14 @@ void runDecodeCrossCheck(MetalBackend &backend, std::mt19937 &random) {
     (void)backend.submit(up);
 
     MetalBuffer decodeOut = freshOutput("q4-cross-up-decode");
-    const Q4Params decodeParams{shape.outputSize, shape.inputSize,
-                                shape.outputSize / 256};
+    const Q4PersistentParams decodeParams{shape.outputSize, shape.inputSize,
+                                          shape.outputSize / 256};
     ComputeDispatch upDecode;
     upDecode.pipelineName = "decode_linear_q4_n256_up_silu_m32";
     upDecode.buffers = {{0, input}, {1, weights}, {2, scales}, {3, biases},
                         {4, gateScratchB}, {5, decodeOut}};
     upDecode.bytes = {{6, &decodeParams, sizeof(decodeParams)}};
-    upDecode.threadgroups = {decodeParams.persistent_groups, 1, 1};
+    upDecode.threadgroups = {decodeParams.groups, 1, 1};
     upDecode.threadsPerThreadgroup = {256, 1, 1};
     (void)backend.submit(upDecode);
 
@@ -392,14 +392,14 @@ void runDecodeCrossCheck(MetalBackend &backend, std::mt19937 &random) {
     (void)backend.submit(prefill);
 
     MetalBuffer decodeOut = freshOutput("q4-cross-decode-residual");
-    const Q4Params decodeParams{shape.outputSize, shape.inputSize,
-                                shape.outputSize / 128};
+    const Q4PersistentParams decodeParams{shape.outputSize, shape.inputSize,
+                                          shape.outputSize / 128};
     ComputeDispatch decode;
     decode.pipelineName = "decode_linear_q4_n128_residual_m32";
     decode.buffers = {{0, input}, {1, weights}, {2, scales}, {3, biases},
                       {4, residual}, {5, decodeOut}};
     decode.bytes = {{6, &decodeParams, sizeof(decodeParams)}};
-    decode.threadgroups = {decodeParams.persistent_groups, 1, 1};
+    decode.threadgroups = {decodeParams.groups, 1, 1};
     decode.threadsPerThreadgroup = {256, 1, 1};
     (void)backend.submit(decode);
 

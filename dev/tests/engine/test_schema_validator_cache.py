@@ -1,15 +1,12 @@
-import gc
 import threading
 import unittest
-import weakref
 from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
 
 from jsonschema import SchemaError
-from referencing import Registry
 
 from server import schema_validation as validation
-from server import tool_schema
+from server.errors import APIError
 
 
 class ValidatorCacheTests(unittest.TestCase):
@@ -24,9 +21,7 @@ class ValidatorCacheTests(unittest.TestCase):
             validation._validator_cache_bytes = 0
 
     def build(self, schema):
-        return validation.build_validator(
-            schema, tool_schema._schemas, tool_schema.LOCAL_REGISTRY
-        )
+        return validation.build_validator(schema)
 
     def test_eviction_obeys_both_count_and_source_byte_limits(self):
         for count, budget in ((2, 10000), (256, 180)):
@@ -43,7 +38,7 @@ class ValidatorCacheTests(unittest.TestCase):
                     self.assertLessEqual(validation._validator_cache_bytes, budget)
                     self.assertEqual(
                         validation._validator_cache_bytes,
-                        sum(len(key[2]) for key in cache),
+                        sum(len(key) for key in cache),
                     )
 
     def test_cache_hit_refreshes_lru(self):
@@ -75,6 +70,59 @@ class ValidatorCacheTests(unittest.TestCase):
         self.assertFalse(validation._validator_cache)
         self.assertEqual(validation._validator_cache_bytes, 0)
 
+    def test_unevaluated_properties_cannot_reach_unbounded_patterns(self):
+        # jsonschema matches these patterns with the standard-library engine,
+        # which has no time limit, however the keywords are connected.
+        patterns = {"patternProperties": {"^(a+)+$": {"type": "integer"}}}
+        closed = {"unevaluatedProperties": False}
+        draft = {"$schema": "https://json-schema.org/draft/2019-09/schema"}
+        for schema in (
+            {**patterns, **closed},
+            {"allOf": [patterns], **closed},
+            {"$ref": "#/x-stash", "x-stash": patterns, **closed},
+            {**draft, **patterns, **closed},
+        ):
+            with self.subTest(schema=schema), self.assertRaises(APIError) as caught:
+                self.build(schema)
+            self.assertEqual(caught.exception.status, 400)
+        self.assertFalse(validation._validator_cache)
+        self.assertFalse(self.build(patterns).is_valid({"aa": "1"}))
+        validator = self.build({"properties": {"a": {}}, **closed})
+        self.assertTrue(validator.is_valid({"a": 1}))
+        self.assertFalse(validator.is_valid({"b": 1}))
+
+    def test_references_keep_patterns_bounded(self):
+        # A reference into an unknown keyword reaches a $schema the build
+        # leaves, and jsonschema would validate there with that dialect's
+        # class, which matches patterns with the unbounded standard engine.
+        for container, dialect in (
+            ("$defs", "https://json-schema.org/draft/2020-12/schema"),
+            ("x-stash", "https://json-schema.org/draft/2020-12/schema"),
+            ("x-stash", "http://json-schema.org/draft-07/schema#"),
+        ):
+            target = {"$schema": dialect, "type": "string", "pattern": "^a+$"}
+            validator = self.build(
+                {"$ref": f"#/{container}/s", container: {"s": target}}
+            )
+            with (
+                self.subTest(container=container, dialect=dialect),
+                mock.patch.object(validation.regex, "search", side_effect=TimeoutError),
+                self.assertRaises(validation.SchemaEvaluationError),
+            ):
+                validator.is_valid("aa")
+
+    def test_references_keep_their_dialect(self):
+        # The draft-07 target's items list is a schema per position, which
+        # the document's 2020-12 dialect would refuse.
+        target = {
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "items": [{"type": "string"}],
+            "additionalItems": False,
+        }
+        validator = self.build({"$ref": "#/x-stash/s", "x-stash": {"s": target}})
+        self.assertTrue(validator.is_valid(["a"]))
+        self.assertFalse(validator.is_valid(["a", 1]))
+
     def test_caller_mutation_does_not_change_cached_validator(self):
         schema = {"properties": {"x": {"type": "integer"}}}
         first = self.build(schema)
@@ -84,24 +132,6 @@ class ValidatorCacheTests(unittest.TestCase):
         self.assertFalse(first.is_valid({"x": "1"}))
         self.assertFalse(second.is_valid({"x": 1}))
         self.assertTrue(second.is_valid({"x": "1"}))
-
-    def test_identity_contexts_stay_alive_until_eviction(self):
-        def nodes(schema):
-            return [schema]
-
-        ref = weakref.ref(nodes)
-        registry = Registry()
-        schema = {"type": "integer"}
-        first = validation.build_validator(schema, nodes, registry)
-        self.assertIsNot(
-            first, validation.build_validator(schema, lambda s: [s], registry)
-        )
-        del nodes
-        gc.collect()
-        self.assertIsNotNone(ref())
-        self.clear()
-        gc.collect()
-        self.assertIsNone(ref())
 
     def test_concurrent_misses_account_for_one_entry(self):
         barrier = threading.Barrier(4)
@@ -120,5 +150,5 @@ class ValidatorCacheTests(unittest.TestCase):
         self.assertEqual(len(validation._validator_cache), 1)
         self.assertEqual(
             validation._validator_cache_bytes,
-            sum(len(key[2]) for key in validation._validator_cache),
+            sum(len(key) for key in validation._validator_cache),
         )

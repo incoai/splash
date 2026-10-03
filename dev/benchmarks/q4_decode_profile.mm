@@ -144,7 +144,7 @@ void sweep(MetalBackend &backend, const Shape &shape, const Pipeline &pipeline,
   dispatch.threadsPerThreadgroup = {256, 1, 1};
 
   for (uint32_t groups : groupCandidates(tiles, shape.referenceGroups)) {
-    Q4Params params{shape.outputSize, shape.inputSize, groups};
+    Q4PersistentParams params{shape.outputSize, shape.inputSize, groups};
     dispatch.bytes = {{parameterIndex, &params, sizeof(params)}};
     dispatch.threadgroups = {groups, 1, 1};
     for (uint32_t warmup = 0; warmup < 2; ++warmup)

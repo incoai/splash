@@ -6,11 +6,11 @@ from pathlib import Path
 from unittest import mock
 
 from dev.tests import test_server as fixtures
+from dev.tests.engine.test_launcher import keep_stop_signals, server_arguments
 from install import launcher
-from server import frontend
 from server import server as api
 
-SERVER_ARGS = ["target", "draft", "--tokenizer", "tokenizer", "--model", "owner/repo"]
+SERVER_ARGS = ["model", "--tokenizer", "tokenizer", "--model", "owner/repo"]
 EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 
 
@@ -132,10 +132,12 @@ class DefaultReasoningTests(unittest.TestCase):
                 fixtures.ServerTest.reasoning_template(default=default)
             )
             harness = self.harness(tokenizer=tokenizer)
-            job, _, _ = harness.app.prepare(fixtures.ServerTest.body())
+            job = harness.app.prepare(
+                fixtures.ServerTest.body(), deadline=fixtures.FOREVER
+            )
             self.assertEqual(job.thinking, default)
-            job, _, _ = harness.app.prepare_responses(
-                fixtures.ServerTest.responses_body()
+            job = harness.app.prepare_responses(
+                fixtures.ServerTest.responses_body(), deadline=fixtures.FOREVER
             )
             self.assertEqual(job.thinking, default)
 
@@ -145,7 +147,9 @@ class DefaultReasoningTests(unittest.TestCase):
             harness = self.harness(
                 effort, tokenizer=fixtures.ServerTest.CharTokenizer(), max_context=8192
             )
-            job, _ = harness.app.prepare_judgment(fixtures.ServerTest.judgment_body())
+            job, _ = harness.app.prepare_judgment(
+                fixtures.ServerTest.judgment_body(), deadline=fixtures.FOREVER
+            )
             self.assertFalse(job.thinking)
             jobs.append((job.prompt_tokens, job.score_tokens))
             systemone = harness.app.prepare_systemone(
@@ -153,7 +157,8 @@ class DefaultReasoningTests(unittest.TestCase):
                     "model": "test-model",
                     "state": {},
                     "questions": {"q": {"type": "noul"}},
-                }
+                },
+                deadline=fixtures.FOREVER,
             )
             self.assertFalse(systemone[0][2].thinking)
         self.assertEqual(jobs, [jobs[0]] * 3)
@@ -183,7 +188,7 @@ class DefaultReasoningTests(unittest.TestCase):
                     )
 
     def test_cli_over_environment_and_launcher_forwarding(self):
-        self.assertEqual(frontend.REASONING_EFFORTS, launcher.REASONING_EFFORTS)
+        keep_stop_signals(self)
         for env, explicit, expected in (
             (None, None, None),
             ("none", None, "none"),
@@ -209,8 +214,14 @@ class DefaultReasoningTests(unittest.TestCase):
                     launcher.main(["serve", "--model", "owner/repo", *options])
                     argv = execute.call_args.args[1]
                     self.assertEqual(
-                        api.parse_args(argv[3:]).default_reasoning_effort, expected
+                        api.parse_args(server_arguments(argv)).default_reasoning_effort,
+                        expected,
                     )
+                    # The server reads the environment's default itself.
                     self.assertEqual(
-                        "--default-reasoning-effort" in argv, expected is not None
+                        any(
+                            argument.startswith("--default-reasoning-effort")
+                            for argument in argv
+                        ),
+                        explicit is not None,
                     )

@@ -1,8 +1,12 @@
 # Apple9 Q4 decode with simdgroup matrices
 
-The default Apple9 one-lane decode plan uses eight-row bfloat matrix operands.
-Apple10, wider decode batches and prefill retain their existing policies.
-The packed Q4 weights and the `Q4Params` ABI are unchanged.
+Apple9 Q4 decode uses eight-row bfloat matrix operands, one independent tile
+per request lane at one to four lanes. Plain projections at three or four lanes
+whose grid holds at least two N256 tiles per core keep the broad-column path
+(`widePlain` in `runtime/ops/Linear.cpp`). Apple10 and prefill retain their
+policies. The packed Q4 weights and the `Q4Params` ABI are unchanged. The
+measurements below are of the one-lane version; `3a20983` extended it to two
+through four lanes with identical output hashes and acceptance counts.
 
 Each SIMD group computes two 8-column fragments, or one fragment each for
 gate and up. Nibbles become exact bfloat values `128 + q`; fp32 accumulation
@@ -86,7 +90,9 @@ candidate cycles 55–67 ms. Preserve this limitation when quoting the results.
 An earlier shorter ABBA run measured approximately 77.1 → 55.8 ms. The real-model
 oracle independently measured a 57.1 ms one-lane cycle. These measurements do
 not establish sustained AC/high-power performance or a same-condition ranking
-against another serving engine.
+against another serving engine. The serving ABBA harness is not in the
+repository; `make benchmark-decode-profile MODEL=... DECODE_PROFILE_ARGS='--cycles 7'`
+reports one build's cycle time at each batch width.
 
 The M5 Pro 16-core control used the same integration/candidate comparison
 with 192 tokens, two scenarios and one repetition per phase. Decode throughput

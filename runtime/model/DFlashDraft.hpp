@@ -4,18 +4,19 @@
 #include "StateLayout.hpp"
 #include "WeightStore.hpp"
 #include "ops/DraftAttention.hpp"
+#include "ops/DraftSelector.hpp"
 #include "ops/ExecutionPlans.hpp"
 #include "ops/Linear.hpp"
 #include "ops/Normalization.hpp"
-#include "ops/Sampling.hpp"
 
 #include <cstdint>
 #include <filesystem>
 #include <array>
+#include <functional>
 #include <memory>
 #include <span>
-#include <string>
 #include <string_view>
+#include <variant>
 #include <vector>
 
 namespace splash::model {
@@ -41,9 +42,6 @@ public:
   [[nodiscard]] const std::vector<DFlashDraftRingLayer> &layers() const noexcept {
     return layers_;
   }
-  [[nodiscard]] uint64_t actualAllocatedBytes() const noexcept {
-    return actualAllocatedBytes_;
-  }
 
 private:
   std::shared_ptr<StateAllocationTracker> tracker_;
@@ -66,13 +64,17 @@ struct DFlashDraftLayout final {
   uint32_t kvHeads = 8;
 
   [[nodiscard]] constexpr DraftStateLayout stateLayout() const noexcept {
-    return {layers, kvHeads, ExecutionLimits::draftContextTokens,
-            attentionHeadDimension};
+    return {layers, kvHeads, attentionHeadDimension};
   }
   [[nodiscard]] constexpr ops::DraftAttentionShape attentionShape() const noexcept {
     return {hiddenSize, dynamicSize, qkvSize, attentionSize,
             attentionSize / attentionHeadDimension, kvHeads,
             attentionHeadDimension};
+  }
+  // The key and value columns of the fused QKV projection, all the context
+  // writers read.
+  [[nodiscard]] constexpr uint32_t contextKvSize() const noexcept {
+    return qkvSize - attentionSize;
   }
 
   bool operator==(const DFlashDraftLayout &) const = default;
@@ -108,7 +110,7 @@ struct DFlashContextBuffers final {
   metal::MetalBuffer capturedTargetHidden;
   metal::MetalBuffer projected;
   metal::MetalBuffer hidden;
-  metal::MetalBuffer qkv;
+  metal::MetalBuffer contextKv;
   metal::MetalBuffer ropeCos;
   metal::MetalBuffer ropeSin;
   metal::MetalBuffer retainedCounts;
@@ -130,62 +132,64 @@ struct DFlashPrefillBuffers final {
   metal::MetalBuffer projectionSums;
   metal::MetalBuffer projected;
   metal::MetalBuffer hidden;
-  metal::MetalBuffer qkv;
+  metal::MetalBuffer contextKv;
   metal::MetalBuffer ropeCos;
   metal::MetalBuffer ropeSin;
 };
 
-struct DFlashSelectionBuffers final {
-  metal::MetalBuffer logits;
-  metal::MetalBuffer partialIds;
-  metal::MetalBuffer partialValues;
-  metal::MetalBuffer candidates;
-  metal::MetalBuffer unary;
-  metal::MetalBuffer selectorHidden;
-  metal::MetalBuffer uniforms;
-  metal::MetalBuffer proposedTokens;
-  metal::MetalBuffer proposalProbabilities;
-};
-
 struct DFlashDraftLayerWeights final {
-  metal::MetalBuffer inputNorm;
+  ops::NormWeights inputNorm;
   metal::MetalBuffer attentionConvolution;
-  ops::Q4Projection attentionDynamic;
-  ops::Q4Projection qkvProjection;
+  ops::Projection attentionDynamic;
+  ops::Projection qkvProjection;
   metal::MetalBuffer queryNorm;
   metal::MetalBuffer keyNorm;
-  ops::Q4Projection outputProjection;
-  metal::MetalBuffer postAttentionNorm;
+  ops::Projection outputProjection;
+  ops::NormWeights postAttentionNorm;
   metal::MetalBuffer mlpConvolution;
-  ops::Q4Projection mlpDynamic;
-  ops::Q4Projection gateProjection;
-  ops::Q4Projection upProjection;
-  ops::Q4Projection downProjection;
+  ops::Projection mlpDynamic;
+  ops::Projection gateProjection;
+  ops::Projection upProjection;
+  ops::Projection downProjection;
 };
 
 struct DFlashDraftWeights final {
   DFlashDraftLayout layout;
   std::vector<DFlashDraftLayerWeights> layers;
-  ops::Q4Projection contextProjection;
-  metal::MetalBuffer hiddenNorm;
-  metal::MetalBuffer finalNorm;
-  ops::Q4Projection selectorProjection;
+  ops::Projection contextProjection;
+  ops::NormWeights hiddenNorm;
+  ops::NormWeights finalNorm;
+  ops::Projection selectorProjection;
   metal::MetalBuffer predecessorCodebook;
   metal::MetalBuffer successorCodebook;
   std::vector<WeightFileRecord> files;
   uint64_t actualAllocatedBytes = 0;
-  std::string manifestFingerprintSha256;
 };
 
 inline constexpr std::string_view kDFlashLayerMagic = "MDFD0004";
 
-[[nodiscard]] DFlashDraftWeights
-loadDFlashDraftWeights(metal::MetalBackend &backend,
-                       const std::filesystem::path &directory,
-                       DFlashDraftLayout layout = {});
+// A Splash package's draft files: layer-<N>.bin and model.bin.
+struct PackedDraftFiles final {
+  metal::MetalBackend &backend;
+  std::filesystem::path directory;
+  const DFlashDraftLayout &layout;
+  [[nodiscard]] WeightFile layer(uint32_t index) const;
+  [[nodiscard]] WeightFile model() const;
+};
 
-// Builds the draft layer graph from packed buffers and persistent context.
-// Sampling and acceptance policy remain outside the model.
+class DraftCheckpointLoader;
+
+// The files a draft is read from: a package's packed files, or the cached
+// files DraftCheckpointLoader prepares from a DFlash2 checkpoint.
+using DraftFiles = std::variant<PackedDraftFiles, std::reference_wrapper<DraftCheckpointLoader>>;
+
+[[nodiscard]] DFlashDraftWeights
+loadDFlashDraftWeights(metal::MetalBackend &backend, const DraftFiles &files,
+                       DFlashDraftLayout layout);
+
+// Builds the draft layer graph and its proposal selection
+// (ops::DraftSelector) from packed buffers and persistent context; the
+// target's sampling and acceptance policy remain outside the model.
 class DFlashDraft final {
 public:
   DFlashDraft(const DFlashDraftWeights &weights, metal::MetalBackend &backend,
@@ -196,25 +200,24 @@ public:
                          std::span<const DFlashPrefillSpan> spans) const;
 
   void addDecode(metal::CommandGraph &graph, DFlashDecodeBuffers buffers,
-                 const ops::Q4Projection &vocabularyProjection,
-                 std::span<const uint32_t> cacheLengths, uint32_t lanes,
-                 ops::Q4DispatchStats &stats) const;
+                 const ops::Projection &vocabularyProjection,
+                 std::span<const uint32_t> cacheLengths) const;
   void addSelection(metal::CommandGraph &graph,
-                    DFlashSelectionBuffers buffers,
+                    const ops::DraftSelectorBuffers &buffers,
                     std::span<const uint32_t> anchors,
-                    std::span<const ops::SamplingPolicy> policies,
-                    uint32_t proposalTokens) const;
+                    std::span<const ops::SamplingPolicy> policies) const;
   void addContextCommit(metal::CommandGraph &graph,
                         DFlashContextBuffers buffers,
-                        std::span<const uint32_t> startPositions,
-                        uint32_t lanes,
-                        ops::Q4DispatchStats &stats) const;
+                        std::span<const uint32_t> startPositions) const;
 
 private:
   const DFlashDraftWeights &weights_;
   metal::MetalBackend &backend_;
   const ops::ExecutionPlans &operators_;
-  ops::Sampling selector_;
+  ops::DraftSelector selector_;
+  // Each layer's key and value rows of its QKV projection, views of its
+  // planes, which the context writers project with.
+  std::vector<ops::Projection> contextKvProjections_;
 };
 
 } // namespace splash::model

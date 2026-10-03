@@ -1,3 +1,5 @@
+#include "ScopedTestConfig.hpp"
+#include "TestChecks.hpp"
 #include "engine/Status.hpp"
 
 #include <cmath>
@@ -10,15 +12,13 @@ namespace {
 using namespace splash;
 using namespace splash::engine;
 
-void require(bool condition, const char *message) {
-  if (!condition)
-    throw std::runtime_error(message);
-}
+using splash::test::require;
 
 bool close(double left, double right) { return std::abs(left - right) < 1e-9; }
 
 void testLatencyWindowAndThroughput() {
-  RuntimeMetrics metrics(3);
+  const test::ScopedTestConfig seam({.metricsLatencyWindow = 3});
+  RuntimeMetrics metrics;
   for (uint64_t id = 1; id <= 4; ++id) {
     double submitted = double(id) * 100.0;
     const double first = submitted + double(id) * 10.0;
@@ -26,8 +26,8 @@ void testLatencyWindowAndThroughput() {
     metrics.tokens(submitted, first, 2, first + 8.0);
   }
 
-  metrics.batchCompleted(WorkKind::Prefill, 1, 1000, 0, 0, 0, 100.0);
-  metrics.batchCompleted(WorkKind::Decode, 4, 0, 8, 28, 4, 40.0);
+  metrics.batchCompleted(WorkKind::Prefill, 1, 1000, 0, 0, 0, 100.0, 110.0);
+  metrics.batchCompleted(WorkKind::Decode, 4, 0, 8, 28, 4, 40.0, 45.0);
   metrics.capacityFailed();
   metrics.metalFailed();
 
@@ -47,6 +47,8 @@ void testLatencyWindowAndThroughput() {
               snapshot.decodeOutputTokens == 8 &&
               close(snapshot.decodeWallMilliseconds, 40.0),
           "batch throughput metrics are incorrect");
+  require(close(snapshot.decodeCycleMilliseconds, 45.0),
+          "the decode cycle did not count decode commands alone");
   require(snapshot.draftedTokens == 28 && snapshot.acceptedDraftTokens == 4 &&
               close(snapshot.draftAcceptanceRate, 1.0 / 7.0) &&
               snapshot.capacityFailures == 1 && snapshot.metalFailures == 1,
@@ -65,17 +67,8 @@ void testLatencyWindowAndThroughput() {
 }
 
 void testValidation() {
-  bool threw = false;
-  try {
-    RuntimeMetrics invalid(0);
-    static_cast<void>(invalid);
-  } catch (const std::invalid_argument &) {
-    threw = true;
-  }
-  require(threw, "zero metrics window was accepted");
-
   RuntimeMetrics metrics;
-  threw = false;
+  bool threw = false;
   try {
     metrics.tokens(10.0, 20.0, 1, 19.0);
   } catch (const std::invalid_argument &) {

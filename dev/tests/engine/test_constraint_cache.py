@@ -32,10 +32,13 @@ class ConstraintCacheTests(unittest.TestCase):
             ("LLExecutor", lambda: None),
             ("TokenConstraint", constraint),
         ):
-            patch = mock.patch.object(constraints, target, replacement)
-            patch.start()
-            self.addCleanup(patch.stop)
-        return constraints.ConstraintFactory(object(), cache_source_bytes=budget)
+            self.enterContext(mock.patch.object(constraints, target, replacement))
+        self.enterContext(
+            mock.patch.object(
+                constraints.ConstraintFactory, "CACHE_SOURCE_BYTES", budget
+            )
+        )
+        return constraints.ConstraintFactory(object())
 
     def test_byte_budget_evicts_lru_and_counts_utf8(self):
         factory = self.factory()
@@ -65,12 +68,7 @@ class ConstraintCacheTests(unittest.TestCase):
         self.assertEqual(
             factory.source_bytes, sum(len(key.encode()) for key in factory.cache)
         )
-        self.assertLessEqual(len(factory.cache), factory.cache_size)
-
-    def test_invalid_budget_is_rejected(self):
-        for value in (0, -1, True, 1.5):
-            with self.subTest(value=value), self.assertRaises(ValueError):
-                self.factory(value)
+        self.assertLessEqual(len(factory.cache), factory.CACHE_SIZE)
 
     def test_cold_compile_does_not_block_hits_stats_or_other_compilation(self):
         entered, release = threading.Event(), threading.Event()
@@ -161,6 +159,35 @@ class ConstraintCacheTests(unittest.TestCase):
             self.assertEqual(first.result(2), "shared")
         self.assertEqual(factory.create("shared"), "shared")
         self.assertEqual(factory.stats()["misses"], 1)
+
+    def test_compiler_errors_are_reported_without_internals(self):
+        from dev.tests.engine.test_structured_tools import StructuredToolGrammarTest
+        from server import tool_schema
+
+        StructuredToolGrammarTest.setUpClass()
+        with mock.patch.object(
+            constraints,
+            "guidance_tokenizer",
+            return_value=StructuredToolGrammarTest.guidance,
+        ):
+            factory = constraints.ConstraintFactory(object())
+        unsatisfiable = {"type": "array", "minItems": 5, "maxItems": 2}
+        # More grammar symbols than the compiler can index make it panic.
+        array = {"type": "array", "maxItems": tool_schema.MAX_GRAMMAR_BOUND}
+        oversized = {"properties": {f"p{i}": array for i in range(1000)}}
+        for schema, reason in (
+            (unsatisfiable, "minItems (5) is greater than maxItems (2)"),
+            (oversized, "tool or output schema is too large to compile"),
+        ):
+            with (
+                self.subTest(reason=reason),
+                self.assertRaises(constraints.APIError) as caught,
+            ):
+                factory.create(tool_schema.json_grammar(schema, False))
+            self.assertEqual(caught.exception.status, 400)
+            self.assertIn(reason, caught.exception.message)
+            self.assertNotIn("\n", caught.exception.message)
+            self.assertNotIn("%llguidance", caught.exception.message)
 
     def test_real_matchers_compile_and_copy_independently_under_concurrency(self):
         from dev.tests.engine.test_structured_tools import StructuredToolGrammarTest
