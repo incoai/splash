@@ -101,6 +101,13 @@ access, authentication, and other options, see
 [KV precision](DEVELOPMENT.md#kv-cache-precision) ·
 [SSD cache](DEVELOPMENT.md#disk-cache)
 
+## Multiple models
+
+`splash serve-multi` serves several models from one port: it stops the
+engine, loads the model a request names, and serves the request — or returns
+a 503 that standard SDKs retry while the model loads.
+[serve-multi](docs/serve-multi.md)
+
 ## Performance
 
 Measured on an M5 Pro (16-core GPU, 48 GB), using the Splash

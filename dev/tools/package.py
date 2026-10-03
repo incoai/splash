@@ -21,6 +21,7 @@ PYTHON_SHA256 = "149038dd0c194c25d4616d7e42a35f67f2edee96412788f74115819b6a4c854
 INSTALL_FILES = (
     "__init__.py",
     "launcher.py",
+    "serve_multi.py",
     "clients.py",
     "paths.py",
     "models.py",
