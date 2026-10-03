@@ -253,6 +253,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/engine/KvPool.cpp \
 	runtime/engine/KvCache.cpp \
 	runtime/engine/KvPageTier.cpp \
+	runtime/engine/CacheDirectory.cpp \
 	runtime/engine/StateCache.cpp \
 	runtime/model/DraftContextPlan.cpp \
 	runtime/engine/Protocol.cpp \
