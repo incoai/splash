@@ -212,6 +212,9 @@ public:
   // back. Until the write lands the RAM copy is no eviction candidate, and
   // the write is the one in flight. Durable once a disk copy has landed.
   [[nodiscard]] PersistStatus persist(uint64_t kvBlock);
+  // In a persistent tier, labels every disk copy again, with its state's
+  // block, class and current recency.
+  void relabel() const;
   // The RAM copies a reclaim may free: the unpinned ones, and those in use
   // only withInUse.
   [[nodiscard]] uint32_t evictableStates(bool withInUse) const noexcept {

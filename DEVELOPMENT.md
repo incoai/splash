@@ -127,6 +127,8 @@ loopback, so use a listener that includes loopback when launching agents locally
 | `--max-memory` | Auto | Ceiling on Metal allocations, e.g. `28G`; not combined process RSS. |
 | `--max-context` | Auto | Context limit, up to `256K`, e.g. `100K`. |
 | `--max-cache-disk` | `0` (off) | Session-local SSD cache, e.g. `16G`. See [disk cache](#disk-cache). |
+| `--persistent-cache` | Off | Keep the SSD cache for the next server of the same model; needs `--max-cache-disk`. See [persistent cache](#persistent-cache). |
+| `--cache-dir` | `~/Library/Caches/Splash/prefix-cache` | Where `--persistent-cache` keeps its files. |
 | `--kv-format` | `int8` | Target KV storage: `int8` or `bf16`. |
 | `--decode-share` | `0.5` | Decode time owed per unit of prefill time while other requests generate. Higher keeps their output faster during a long prompt and slows that prompt; `0` alternates one command each. |
 | `--max-image-pixels` | `4194304` | Maximum resized pixels per image. An image's vision scratch grows with its patches (pixels / 256), to about 600 MiB at the default. |
@@ -1183,6 +1185,61 @@ counters include:
   commands. A waiting request's match is kept across passes and extended only
   past what the cache changed.
 
+### Persistent cache
+
+`--persistent-cache` keeps the SSD tier for the next server of the same model,
+so a restart, an upgrade or a crash does not cost conversations their prefixes.
+It needs `--max-cache-disk`, whose quota then holds both the copies that extend
+RAM and those kept for the next server. Without it the tier is the session-local
+one above, unchanged.
+
+The tier keeps its KV pages and states in two slot files, each with a file of
+records, in `~/Library/Caches/Splash/prefix-cache/<namespace>/` (`--cache-dir`
+names another root), owned by the user with mode 0700. The namespace is a digest
+of the models' weight manifests, the KV and state layouts and the cache format,
+so caches of several models stay side by side and none is taken back by another
+model or after a format change; the build is not part of it. A lock gives the
+directory to one engine: another server of the same model waits up to 20 s for
+it and then serves with temporary files. A namespace nobody opened or wrote for
+14 days is removed when another one opens.
+
+A slot's record holds its copy's label (a KV block's id, parent, tokens, image
+identity and recency; a state's block, boundary, class and recency) with the
+size and CRC-32C of its payload, written once the payload has landed. The first
+read of a slot taken back checks the payload against the record; a mismatch is a
+read failure, which falls back to the surviving prefix like any other.
+
+In this mode the tier also writes each conversation's newest restore point while
+it stays in RAM. A replay point or junction published or reused at least 2048
+tokens deep is written 10 s later, unless its conversation has gone on from it
+by then: an ordinary state on its only branch below supersedes it, so the steps
+of a tool loop cost no write. The pages of its chain without a disk copy are
+copied straight from their extents, 16 at a time and none while a restore waits,
+and its state is written from its own RAM buffers; the point stays in RAM, and
+its state is no eviction candidate until the write lands. Points are written one
+at a time, in publication order. While the tier has written 128 GiB in the last
+hour, eviction writes included, these writes wait; eviction never does.
+`/status` reports them under `disk.write_behind` (`waiting`, `durable`,
+`unneeded`, `refused`) and the page copies as `disk.kv_copies`.
+
+A full quota gives up whole restore points: the copy of the state used longest
+ago, redundant or not, and every copy up its chain that no remaining state
+needs, so no chain is kept that no state restores. Only when no state copy can
+go does the session-local rule apply. Copies in use keep their protection.
+
+At startup the engine takes back each recorded state whose chain is whole, with
+its blocks, under their old ids and recency, and frees every other slot; a quota
+smaller than last time gives up the oldest points until the rest fits.
+`disk.taken_back` in `/status` reports what came back. A clean stop (SIGTERM,
+SIGINT, SIGHUP or the end of the engine's input) writes every point still waiting for
+its delay, the newest first, for up to 6 s, records each state's current
+recency, flushes both files to the drive (`F_FULLFSYNC`) and marks the cache
+closed. After a crash the next start takes back what reached the disk: every
+newest point older than its delay that the quota kept. A start after an unclean
+end serves on probation for its first minute; one that fails within it leaves
+the next start an empty cache, so a cached point that breaks the engine cannot
+break every start after it. A failed engine writes nothing more.
+
 ### Judgment contracts
 
 `POST /v1/systemone` accepts the [TypeSafe System One](https://docs.typesafe.ai/)
@@ -1504,9 +1561,10 @@ when the tokenizer supports independent encoding there. This process-local
 cache retains at most four prefixes and 8 MiB of text/token storage; it falls
 back to full encoding for other tokenizer pipelines. `/status.tokenizer_cache`
 reports its usage. It does not alter prompt text, token IDs or the GPU KV cache.
-Server restarts require recomputation. The SSD tier (`--max-cache-disk`, see
-[disk cache](#disk-cache)) keeps evicted KV pages and states during a server
-session; its temporary files do not survive shutdown.
+Server restarts require recomputation unless `--persistent-cache` keeps the SSD
+tier for the next server (see [persistent cache](#persistent-cache)). Alone,
+`--max-cache-disk` (see [disk cache](#disk-cache)) keeps evicted KV pages and
+states during a server session; its temporary files do not survive shutdown.
 
 ## Package
 

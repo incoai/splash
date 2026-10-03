@@ -304,6 +304,12 @@ PersistStatus StateCache::persist(uint64_t kvBlock) {
   return PersistStatus::Started;
 }
 
+void StateCache::relabel() const {
+  for (const auto &[kvBlock, entry] : entries_)
+    if (entry.disk && !entry.invalid)
+      labelDisk(kvBlock, entry);
+}
+
 std::optional<CacheEvictionCandidate>
 StateCache::oldestOf(const RecencyOrder &order, bool keepResumePoint) const noexcept {
   const std::optional<CacheEvictionCandidate> oldest = order.oldest();

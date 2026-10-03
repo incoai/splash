@@ -376,6 +376,7 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
   // The per-operation guard RuntimeResources installed is only for startup:
   // once Ready, the engine meets memory pressure between its ticks.
   resources->backend().setOperationGuard({});
+  resources->beginServing();
   return std::unique_ptr<RuntimeBootstrap>(
       new RuntimeBootstrap(std::move(resources), std::move(modelRuntime),
                            std::move(nativeLoop), std::move(report)));

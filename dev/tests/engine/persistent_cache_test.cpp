@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <functional>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <set>
 #include <stdexcept>
@@ -381,6 +382,34 @@ void testPersistingStateStaysInRam() {
           "the state's RAM copy did not go once its write landed");
 }
 
+// At a clean stop each state copy's label takes its state's current recency:
+// a point used after its write is the newest for the next process. Until
+// then the labels keep the recency of their writes.
+void testCleanStopRecordsRecency() {
+  Process process(true);
+  const std::vector<uint32_t> firstPrompt = promptOf(1000, 2);
+  const uint64_t first = process.cachePrompt(1, firstPrompt)[1];
+  process.publish(first);
+  const uint64_t second = process.cachePrompt(2, promptOf(2000, 2))[1];
+  process.publish(second);
+  process.writeEverything();
+  const auto labelled = [&] {
+    std::map<uint64_t, uint64_t> recency;
+    for (const auto &bytes : process.stateLabels()) {
+      const auto label = decodeLabel<StateLabel>(bytes);
+      recency[label->block] = label->lastUsed;
+    }
+    return recency;
+  };
+  require(labelled()[first] < labelled()[second], "the labels did not follow the writes");
+  std::vector<uint32_t> again = firstPrompt;
+  again.push_back(7);
+  require(process.cache.lookup(again, {}).state.has_value(), "the first point was not found");
+  require(labelled()[first] < labelled()[second], "a use relabelled a copy before the stop");
+  process.cache.relabelStates();
+  require(labelled()[first] > labelled()[second], "the clean stop did not record the newest use");
+}
+
 // States of a slot file kept for the next process: each holds a slot of it.
 class SlotState final : public CompositeState {
 public:
@@ -620,6 +649,7 @@ int main() {
     testBrokenChainsStayBehind();
     testOldestPointGoes();
     testAdoptionTrimsToTheQuota();
+    testCleanStopRecordsRecency();
     testPointGivenUpForItselfIsRefused();
     testPointLargerThanTheQuotaIsRefused();
     testPersistingStateStaysInRam();

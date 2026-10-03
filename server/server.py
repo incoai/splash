@@ -1904,6 +1904,10 @@ def _native_command(args):
     ]
     if args.max_cache_disk:
         command.append(str(args.max_cache_disk))
+    if args.persistent_cache:
+        command.extend(
+            ("--cache-dir", str(args.cache_dir or serve_options.DEFAULT_CACHE_DIR))
+        )
     if args.kv_format != "int8":
         command.extend(("--kv-format", args.kv_format))
     if args.decode_share is not None:

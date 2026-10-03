@@ -88,6 +88,17 @@ struct KvTierSnapshot final {
   uint64_t diskBytes = 0;
 };
 
+// What a start took back from a persistent tier: the states and KV blocks
+// the cache holds afterwards, and their bytes.
+struct CacheAdoption final {
+  uint32_t states = 0;
+  uint32_t blocks = 0;
+  uint64_t bytes = 0;
+  // Records left behind, damaged, incomplete or of no state, and copies
+  // given up for the quota.
+  uint32_t dropped = 0;
+};
+
 struct CacheSnapshot final {
   KvPoolSnapshot pool;
   StateCacheSnapshot stateCache;
@@ -97,6 +108,9 @@ struct CacheSnapshot final {
   // The longest emptying of one extent by moving its pages, re-pointing the
   // cached blocks and requests on them included.
   double extentCompactMaxMilliseconds = 0.0;
+  // A persistent tier, and what the start took back from it.
+  bool persistent = false;
+  CacheAdoption adoption;
 };
 
 enum class TokenAdmissionFailure : uint8_t {
@@ -190,17 +204,6 @@ struct PersistedState final {
   std::function<std::shared_ptr<const CompositeState>(uint32_t tokens)> adopt;
 };
 
-// What a start took back from a persistent tier: the states and KV blocks
-// the cache holds afterwards, and their bytes.
-struct CacheAdoption final {
-  uint32_t states = 0;
-  uint32_t blocks = 0;
-  uint64_t bytes = 0;
-  // Records left behind, damaged, incomplete or of no state, and copies
-  // given up for the quota.
-  uint32_t dropped = 0;
-};
-
 // Owns active KV page leases, the content-addressed KV graph and cached
 // composite states. Physical recurrent-state cells remain model-owned.
 // A state in RAM always sits on a resident KV block: reclaim takes such a
@@ -236,6 +239,11 @@ public:
   // branch below supersedes it: its conversation went on from there. One
   // larger than the quota, or given up to make room for itself, is refused.
   [[nodiscard]] PersistStatus persist(uint64_t block);
+  // At a clean stop: the label of each state copy a persistent tier keeps
+  // takes its state's current recency and class, which the next process
+  // keeps and orders them by. KV copies keep the labels of their writes: a
+  // chain goes with the states that need it (dropOldestPoint).
+  void relabelStates() const;
   // Bytes the disk tier has written in all.
   [[nodiscard]] uint64_t diskWrittenBytes() const noexcept {
     return diskBudget_ ? diskBudget_->writtenBytes() : 0;
@@ -598,6 +606,7 @@ private:
   KvPool &pool_;
   KvTier *tier_;
   bool persistent_;
+  CacheAdoption adoption_;
   std::shared_ptr<const model::DiskBudget> diskBudget_;
   CacheRecency recency_;
   KvCache kv_;

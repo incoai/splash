@@ -135,6 +135,7 @@ CacheAdoption Cache::adopt(std::vector<PersistedKv> blocks, std::vector<Persiste
   result.states = held.entries;
   result.blocks = kv_.diskBlocks();
   result.bytes = held.diskBytes + uint64_t{result.blocks} * tier_->slotBytes();
+  adoption_ = result;
   return result;
 }
 
@@ -1064,6 +1065,8 @@ PersistStatus Cache::persist(uint64_t block) {
   return state;
 }
 
+void Cache::relabelStates() const { states_.relabel(); }
+
 bool Cache::superseded(uint64_t block) const {
   if (!kv_.stateBelow(block))
     return false;
@@ -1109,7 +1112,9 @@ CacheSnapshot Cache::snapshot() const {
           tier,
           lookup_,
           static_cast<uint32_t>(requests_.size()),
-          extentCompactMaxMilliseconds_};
+          extentCompactMaxMilliseconds_,
+          persistent_,
+          adoption_};
 }
 
 Cache::Request &Cache::request(uint64_t requestId) {

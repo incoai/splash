@@ -1,5 +1,6 @@
 #include "engine/RuntimeResources.hpp"
 #include "Checked.hpp"
+#include "engine/DiskLabels.hpp"
 #include "engine/Engine.hpp"
 #include "engine/StartupLog.hpp"
 #include "metal/abi/ExecutionGeometry.h"
@@ -9,6 +10,7 @@
 #import <Foundation/Foundation.h>
 
 #include <array>
+#include <chrono>
 #include <limits>
 #include <optional>
 #include <sstream>
@@ -82,6 +84,57 @@ void requireStartupHeadroom(
   }
 }
 
+// The format of a persistent cache's files and of what its copies hold. A
+// change to either, such as a fix to a kernel that writes KV or state, bumps
+// it, so that no start takes back copies of the old one.
+constexpr uint32_t kPersistentCacheFormat = 1;
+// How long a start waits for the cache directory another process holds: one
+// that is closing has finished its flush, or been stopped by the server, by
+// then (server/runtime.py `_shutdown_grace_seconds`).
+constexpr std::chrono::seconds kCacheLockWait{20};
+// Another model's cache nobody opened for this long is removed.
+constexpr std::chrono::hours kStaleCache{24 * 14};
+// How long a start that follows an unclean end serves on probation: the
+// server counts a failure within that time toward a crash loop
+// (server/backend.py `CRASH_LOOP_WINDOW_SECONDS`).
+constexpr std::chrono::seconds kProbation{60};
+
+// A persistent tier's directory under root and its files, empty when another
+// process holds the directory or it cannot be used: the tier then keeps
+// temporary files, as without one.
+PersistentCacheFiles openPersistentCache(const std::filesystem::path &root,
+                                         const std::string &cacheNamespace,
+                                         uint64_t kvSlotBytes, uint64_t stateSlotBytes,
+                                         const std::shared_ptr<model::DiskBudget> &budget,
+                                         const std::function<bool()> &cancelled) {
+  try {
+    PersistentCacheFiles files;
+    files.directory = CacheDirectory::open(root, cacheNamespace, kCacheLockWait,
+                                           kStaleCache, cancelled);
+    if (!files.directory) {
+      if (!cancelled || !cancelled())
+        logStartup("Persistent cache ", (root / cacheNamespace).string(),
+                   " is in use by another process; this one keeps a temporary cache.");
+      return {};
+    }
+    const std::vector<std::byte> tag(reinterpret_cast<const std::byte *>(cacheNamespace.data()),
+                                     reinterpret_cast<const std::byte *>(cacheNamespace.data()) +
+                                         cacheNamespace.size());
+    files.kv = std::make_shared<model::SlotFile>(
+        kvSlotBytes, budget,
+        model::SlotFile::Persistence{files.directory->kvSlots(), files.directory->kvRecords(),
+                                     tag, sizeof(KvBlockLabel)});
+    files.states = std::make_shared<model::SlotFile>(
+        stateSlotBytes, budget,
+        model::SlotFile::Persistence{files.directory->stateSlots(),
+                                     files.directory->stateRecords(), tag, sizeof(StateLabel)});
+    return files;
+  } catch (const std::exception &error) {
+    logStartup("Persistent cache disabled (", error.what(), "); this process keeps a temporary cache.");
+    return {};
+  }
+}
+
 std::array<uint8_t, 32> parseSha256(std::string_view value) {
   if (value.size() != 64) {
     throw std::invalid_argument(
@@ -147,6 +200,25 @@ makeRuntimeCacheIdentity(std::string_view combinedManifestSha256,
   return result;
 }
 
+std::string persistentCacheNamespace(const RuntimeCacheIdentity &identity,
+                                     const model::CompositeStateLayout &states) {
+  const kv::Layout &kv = identity.kvLayout;
+  const model::GdnStateLayout &gdn = states.target;
+  const model::DraftStateLayout &draft = states.draft;
+  std::ostringstream canonical;
+  canonical << "splash-persistent-cache-v" << kPersistentCacheFormat << '\n'
+            << identity.modelLayoutSha256 << '\n'
+            << "kv " << kv::kPageTokens << ' ' << kv.attentionLayers << ' ' << kv.kvHeads << ' '
+            << kv.headDimension << ' ' << kv::formatName(kv.format) << '\n'
+            << "gdn " << gdn.layers << ' ' << gdn.convolutionHistory << ' '
+            << gdn.convolutionChannels << ' ' << gdn.recurrentGroups << ' ' << gdn.recurrentRows
+            << ' ' << gdn.recurrentColumns << '\n'
+            << "draft " << draft.layers << ' ' << draft.kvHeads << ' ' << draft.headDimension << ' '
+            << SPLASH_DRAFT_SLIDING_WINDOW << '\n';
+  // 128 bits name it.
+  return model::weightDigest(canonical.str()).substr(0, 32);
+}
+
 RuntimeResourcesError::RuntimeResourcesError(RuntimeResourceStage stage,
                                              std::string message,
                                              std::string statusJson,
@@ -158,6 +230,7 @@ RuntimeResourcesError::RuntimeResourcesError(RuntimeResourceStage stage,
       budgetDescription_(std::move(budgetDescription)) {}
 
 RuntimeResources::RuntimeResources(
+    PersistentCacheFiles persistentCache,
     std::unique_ptr<metal::MetalBackend> backend, model::ModelPackage model,
     ops::ExecutionPlans operators, EngineMemoryPlan memoryPlan,
     RuntimeCacheIdentity cacheIdentity,
@@ -167,7 +240,8 @@ RuntimeResources::RuntimeResources(
     std::unique_ptr<KvPageTier> kvTier,
     std::unique_ptr<KvPool> kvPool, std::unique_ptr<engine::Cache> cache,
     std::optional<uint64_t> hostAvailableAtStart)
-    : backend_(std::move(backend)), model_(std::move(model)),
+    : persistentCache_(std::move(persistentCache)),
+      backend_(std::move(backend)), model_(std::move(model)),
       operators_(std::move(operators)),
       memoryPlan_(std::move(memoryPlan)),
       cacheIdentity_(std::move(cacheIdentity)),
@@ -396,6 +470,19 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
         *backend, memoryGovernor->allocationAdmission(), package.targetKvLayout(config.kvFormat),
         static_cast<uint32_t>(poolExtents * budget.kvExtentPages), budget.kvExtentPages);
     auto kvPool = std::make_unique<KvPool>(*kvPages, model::ExecutionLimits::warmupKvPages);
+    // A persistent tier keeps its files in a cache directory of its own.
+    // When another process holds it or it cannot be used, the tier keeps
+    // temporary files, as without one.
+    PersistentCacheFiles persistentCache;
+    if (stateFile && !config.persistentCacheRoot.empty()) {
+      persistentCache = openPersistentCache(
+          config.persistentCacheRoot,
+          persistentCacheNamespace(cacheIdentity, package.stateLayout()),
+          model::SlotFile::slotBytesFor(kvPages->bytesPerPage()), stateFile->slotBytes(),
+          diskBudget, config.cancelled);
+      if (persistentCache.directory)
+        stateFile = persistentCache.states;
+    }
     auto stateStorage = std::make_unique<model::QwenStateStorage>(
         *backend, memoryGovernor->allocationAdmission(), package.stateLayout(),
         stateFile);
@@ -404,12 +491,19 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
       try {
         const uint64_t slotBytes = model::SlotFile::slotBytesFor(kvPages->bytesPerPage());
         kvTier = std::make_unique<KvPageTier>(
-            *kvPages, std::make_shared<model::SlotFile>(slotBytes, diskBudget));
-        logStartup("Cache disk tier: ", config.maximumCacheDiskBytes / kMiB,
-                   " MiB for KV pages of ", slotBytes / 1024, " KiB and states of ",
-                   stateBytes / kMiB, " MiB; a state's write stages through ",
-                   stateStagingBytes / kMiB, " MiB of the memory plan.");
+            *kvPages, persistentCache.kv
+                          ? persistentCache.kv
+                          : std::make_shared<model::SlotFile>(slotBytes, diskBudget));
+        logStartup(persistentCache.directory ? "Persistent cache tier: " : "Cache disk tier: ",
+                   config.maximumCacheDiskBytes / kMiB, " MiB for KV pages of ",
+                   slotBytes / 1024, " KiB and states of ", stateBytes / kMiB,
+                   " MiB; a state's write stages through ", stateStagingBytes / kMiB,
+                   " MiB of the memory plan.");
       } catch (const std::exception &error) {
+        // The persistent files are open by now; without the tier nothing
+        // would keep or replace their copies.
+        if (persistentCache.directory)
+          throw;
         logStartup("Cache disk KV storage disabled; state storage remains enabled (",
                    error.what(), ").");
       }
@@ -432,11 +526,12 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
     }
 
     auto result = std::unique_ptr<RuntimeResources>(new RuntimeResources(
-        std::move(backend), std::move(package), std::move(operators),
-        std::move(memoryPlan), std::move(cacheIdentity),
+        std::move(persistentCache), std::move(backend), std::move(package),
+        std::move(operators), std::move(memoryPlan), std::move(cacheIdentity),
         std::move(memoryGovernor), std::move(kvPages), std::move(stateStorage),
         std::move(kvTier), std::move(kvPool), std::move(cache),
         hostAvailableAtStart));
+    result->adoptPersistentCache();
     return result;
   } catch (const metal::MetalAllocationError &error) {
     throw RuntimeResourcesError(RuntimeResourceStage::StorageAllocation,
@@ -448,6 +543,96 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
                                 error.what(), memoryPlan.toStatusJson(),
                                 memoryPlan.breakdown().describe());
   }
+}
+
+RuntimeResources::~RuntimeResources() {
+  stopProbation();
+  if (persistentCache_.directory) {
+    persistentCache_.kv->seal();
+    persistentCache_.states->seal();
+  }
+}
+
+void RuntimeResources::adoptPersistentCache() {
+  if (!persistentCache_.directory)
+    return;
+  CacheDirectory &directory = *persistentCache_.directory;
+  if (!directory.coldReason().empty())
+    logStartup("Persistent cache emptied: ", directory.coldReason(), ".");
+  std::vector<PersistedKv> blocks;
+  for (const model::SlotRecord &record : persistentCache_.kv->records())
+    blocks.push_back({record.label, [this, record] { return kvTier_->adopt(record); }});
+  std::vector<PersistedState> states;
+  for (const model::SlotRecord &record : persistentCache_.states->records())
+    states.push_back({record.label, [this, record](uint32_t tokens) {
+                        return stateStorage_->adopt(record, tokens);
+                      }});
+  const CacheAdoption adoption = cache_->adopt(std::move(blocks), std::move(states));
+  persistentCache_.kv->finishAdoption();
+  persistentCache_.states->finishAdoption();
+  logStartup("Persistent cache ", directory.path().string(), ": took back ", adoption.states,
+             " restore points over ", adoption.blocks, " KV blocks (", adoption.bytes / kMiB,
+             " MiB); left ", adoption.dropped, " copies behind.",
+             directory.uncleanExit()
+                 ? " The last process did not stop cleanly: this one serves on probation for "
+                   "its first minute."
+                 : "");
+}
+
+void RuntimeResources::beginServing() {
+  CacheDirectory *directory = persistentCache_.directory.get();
+  if (!directory)
+    return;
+  const bool probation = directory->uncleanExit();
+  try {
+    directory->beginServing(probation);
+  } catch (const std::exception &error) {
+    logStartup("Persistent cache cannot mark this process serving (", error.what(),
+               "); the next start will not know how it ended.");
+    return;
+  }
+  if (!probation)
+    return;
+  probation_ = std::thread([this, directory] {
+    std::unique_lock lock(probationMutex_);
+    if (probationWake_.wait_for(lock, kProbation, [this] { return probationStopped_; }))
+      return;
+    try {
+      directory->endProbation();
+    } catch (const std::exception &error) {
+      logStartup("Persistent cache probation did not end (", error.what(), ").");
+    }
+  });
+}
+
+void RuntimeResources::stopProbation() noexcept {
+  {
+    std::lock_guard lock(probationMutex_);
+    probationStopped_ = true;
+  }
+  probationWake_.notify_all();
+  if (probation_.joinable())
+    probation_.join();
+}
+
+bool RuntimeResources::closePersistentCache() {
+  if (!persistentCache_.directory)
+    return true;
+  stopProbation();
+  cache_->relabelStates();
+  // Each file runs its operations in order: the writes and labels submitted
+  // before land first.
+  const auto kv = persistentCache_.kv->synchronize({});
+  const auto states = persistentCache_.states->synchronize({});
+  const bool kvSynchronized = kv->wait();
+  if (!states->wait() || !kvSynchronized)
+    return false;
+  try {
+    persistentCache_.directory->close();
+  } catch (const std::exception &) {
+    return false;
+  }
+  return true;
 }
 
 model::RuntimeContext RuntimeResources::modelContext() noexcept {
