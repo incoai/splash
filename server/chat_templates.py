@@ -45,6 +45,8 @@ from jinja2 import Environment, TemplateError, TemplateSyntaxError, nodes
 from jinja2.ext import Extension
 from jinja2.lexer import Token
 
+from .serve_options import REASONING_EFFORTS
+
 # Template arguments request preparation sets itself, and apply_chat_template's
 # own controls: a request's template kwargs cannot set them.
 RESERVED_TEMPLATE_KWARGS = frozenset(
@@ -85,8 +87,7 @@ class ChatTemplateError(ValueError):
     """The tokenizer has no chat template Splash can serve."""
 
 
-REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
-# What a template that rejects one of these efforts renders instead.
+# What a template that rejects one of the REASONING_EFFORTS renders instead.
 REASONING_EFFORT_ALIASES = {"high": "xhigh", "max": "xhigh", "minimal": "low"}
 
 

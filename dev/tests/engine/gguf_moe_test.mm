@@ -56,6 +56,7 @@ using splash::ops::MoE;
 using splash::ops::MoeBuffers;
 using splash::ops::MoeConfig;
 using splash::ops::MoeScratchField;
+using splash::ops::kAssumedGpuCores;
 using splash::ops::kMoeScratchFields;
 using splash::ops::MoeExpertSimdgroups;
 using splash::ops::MoeExpertTile;
@@ -63,6 +64,7 @@ using splash::ops::MoeGgufTile;
 using splash::ops::MoePlan;
 using splash::ops::MoeShape;
 using splash::ops::MoeWeights;
+using splash::ops::moeRouteWideRows;
 using splash::ops::LinearEpilogue;
 using splash::ops::LinearMatrix;
 using splash::ops::LinearPhase;
@@ -323,8 +325,8 @@ int floatSegments(MetalBackend &backend, uint32_t floatColumns) {
       const LinearScratch scratch = scratchFor(plan);
       check(lanes * 8, plan.storageRows(), "decode B" + std::to_string(lanes),
             [&](CommandGraph &graph, MetalBuffer input, const Projection &p, MetalBuffer output) {
-              splash::ops::LinearDispatchStats stats;
-              static_cast<void>(linear.addDecodeBatch(graph, input, p, output, lanes, stats, scratch));
+              static_cast<void>(linear.add(graph, {.input = input, .output = output, .scratch = scratch}, p,
+                                           linear.decodePlan(p, lanes)));
             });
     }
     for (const uint32_t rows : {1u, 24u, 33u, 263u}) {
@@ -357,19 +359,21 @@ int floatOnlyChain(MetalBackend &backend) {
   int failures = 0;
   for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
     const uint64_t rows = lanes * 8, bytes = rows * N * 2;
-    const LinearScratchSize size = linear.decodePlan(blocks, lanes).scratchSize();
+    const LinearPlan plan = linear.decodePlan(blocks, lanes);
+    const LinearScratchSize size = plan.scratchSize();
     const LinearScratch scratch{zeros(backend, size.input, "chain-table"), zeros(backend, size.sums, "chain-sums"),
                                 zeros(backend, size.partials, "chain-partials"),
                                 zeros(backend, size.counters, "chain-counters")};
     const MetalBuffer input = bfloatBuffer(backend, activations(rows * K), "chain-input");
     const MetalBuffer scores = zeros(backend, bytes, "chain-scores"), chained = zeros(backend, bytes, "chain-output"),
                       alone = zeros(backend, bytes, "chain-reference");
-    splash::ops::LinearDispatchStats stats;
     CommandGraph graph, reference;
-    const PreparedInput prepared = linear.addDecodeBatch(graph, input, floats, scores, lanes, stats, scratch);
-    static_cast<void>(linear.addDecodeBatch(graph, input, blocks, chained, lanes, stats, scratch, prepared));
+    const PreparedInput prepared =
+        linear.add(graph, {.input = input, .output = scores, .scratch = scratch}, floats, linear.decodePlan(floats, lanes));
+    static_cast<void>(
+        linear.add(graph, {.input = input, .output = chained, .scratch = scratch, .prepared = prepared}, blocks, plan));
     static_cast<void>(backend.submitCommand(graph.dispatches()));
-    static_cast<void>(linear.addDecodeBatch(reference, input, blocks, alone, lanes, stats, scratch));
+    static_cast<void>(linear.add(reference, {.input = input, .output = alone, .scratch = scratch}, blocks, plan));
     static_cast<void>(backend.submitCommand(reference.dispatches()));
     if (std::memcmp(chained.contents(), alone.contents(), bytes)) {
       printf("  float-only projection B%u: a register plan chained after it read another table FAIL\n", lanes);
@@ -588,7 +592,8 @@ int moe(MetalBackend &backend) {
       std::vector<uint16_t> widest;
       for (uint32_t lanes = 4; lanes >= 1; --lanes) {
         const MoePlan plan = MoE::decodePlan(
-            shape, lanes, MoeConfig{MoeExpertTile::M8, splash::ops::kMoeRouteWideRows, MoeExpertSimdgroups::Eight, tile});
+            shape, lanes,
+            MoeConfig{MoeExpertTile::M8, moeRouteWideRows(kAssumedGpuCores), MoeExpertSimdgroups::Eight, tile});
         const std::string label = formats + (tile == MoeGgufTile::Register ? " register" : " staged") + " decode B" +
                                   std::to_string(lanes);
         const std::vector<uint16_t> rows = runPlan(backend, m, b, plan, tile == MoeGgufTile::Staged, products, stats, label);
@@ -603,7 +608,8 @@ int moe(MetalBackend &backend) {
       // Prefill chunks on the same 8-row tiles (ExecutionPlans::moePrefill).
       for (const uint32_t chunk : {kMaximumRows, 27u, 9u}) {
         const MoePlan plan = MoE::prefillPlan(
-            shape, chunk, MoeConfig{MoeExpertTile::M8, splash::ops::kMoeRouteWideRows, MoeExpertSimdgroups::Eight, tile});
+            shape, chunk,
+            MoeConfig{MoeExpertTile::M8, moeRouteWideRows(kAssumedGpuCores), MoeExpertSimdgroups::Eight, tile});
         const std::string label = formats + (tile == MoeGgufTile::Register ? " register" : " staged") + " prefill rows=" +
                                   std::to_string(chunk);
         const std::vector<uint16_t> rows = runPlan(backend, m, b, plan, tile == MoeGgufTile::Staged, products, stats, label);
@@ -618,10 +624,10 @@ int moe(MetalBackend &backend) {
              100.0 * stats.gateUpFlips / (stats.outputs / 2), 100.0 * stats.downFlips / stats.outputs,
              stats.gateUpWorst, stats.downWorst, failures > before ? "FAIL" : "ok");
     }
-    // The 32-row tiles, whose 16- and 32-row matmuls both run at 263 rows,
-    // with the router on each float tile: a row's result is the same in every
-    // chunk on one tile (either tile's scores of a row depend on that row
-    // alone).
+    // The 32-row tiles, whose live-row matmuls (moe_live_rows) differ by
+    // chunk, with the router on each float tile: a row's result is the same
+    // in every chunk on one tile (either tile's scores of a row depend on that
+    // row alone).
     for (const FloatTile router : {FloatTile::Simdgroup, FloatTile::NeuralAccelerator}) {
       const int before = failures;
       Stats stats;

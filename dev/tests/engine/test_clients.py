@@ -1018,7 +1018,6 @@ class ClientLifecycleTests(unittest.TestCase):
                 "owned_by": "splash",
                 "input_modalities": ["text", "image", "pdf"],
             }
-        status = {"ready": True, "maximum_context_tokens": context}
         # Pi's models.json and the Hermes root are in the home directory.
         with (
             tempfile.TemporaryDirectory() as home,
@@ -1029,9 +1028,10 @@ class ClientLifecycleTests(unittest.TestCase):
             mock.patch.object(
                 clients, "find_executable", return_value=f"/bin/{client}"
             ),
-            mock.patch.object(launcher, "_running_status", return_value=status),
             mock.patch.object(
-                launcher, "_request_json", return_value={"data": [model]}
+                launcher,
+                "_request_json",
+                return_value={"data": [{"context_length": context, **model}]},
             ),
             mock.patch.object(launcher.os, "execvpe") as execute,
             mock.patch("sys.stdout", io.StringIO()),
@@ -1078,22 +1078,22 @@ class ClientLifecycleTests(unittest.TestCase):
         for arguments in (["--help"], ["serve", "--help"]):
             with (
                 self.subTest(arguments=arguments),
-                mock.patch.object(launcher, "_running_status") as status,
+                mock.patch.object(launcher, "_request_json") as request,
                 mock.patch("sys.stdout", io.StringIO()),
                 self.assertRaises(SystemExit) as result,
             ):
                 launcher.main(arguments)
             self.assertEqual(result.exception.code, 0)
-            status.assert_not_called()
+            request.assert_not_called()
 
     def test_missing_client_is_checked_before_connection(self):
         with (
             mock.patch.object(clients.shutil, "which", return_value=None),
-            mock.patch.object(launcher, "_running_status") as status,
+            mock.patch.object(launcher, "_request_json") as request,
             mock.patch("sys.stderr", io.StringIO()) as error,
         ):
             self.assertEqual(launcher.main(["claude"]), 1)
-        status.assert_not_called()
+        request.assert_not_called()
         self.assertIn("claude is not installed", error.getvalue())
 
     def test_ready_server_is_source_of_model_and_context(self):
@@ -1166,7 +1166,7 @@ class ClientLifecycleTests(unittest.TestCase):
         with (
             mock.patch.object(clients, "find_executable", return_value="/bin/opencode"),
             mock.patch.object(clients, "probe_major_version") as probe,
-            mock.patch.object(launcher, "_running_status", return_value=None),
+            mock.patch.object(launcher, "_request_json", return_value=None),
             mock.patch.object(launcher.os, "execvpe") as execute,
             mock.patch("sys.stderr", io.StringIO()),
         ):
@@ -1208,7 +1208,7 @@ class ClientLifecycleTests(unittest.TestCase):
                 mock.patch.object(
                     clients, "find_executable", return_value="/bin/claude"
                 ),
-                mock.patch.object(launcher, "_running_status", return_value=None),
+                mock.patch.object(launcher, "_request_json", return_value=None),
                 mock.patch.object(launcher, "_ensure_installed") as install,
                 mock.patch.object(launcher.os, "execvpe") as execute,
                 mock.patch("sys.stderr", io.StringIO()) as error,
@@ -1220,19 +1220,17 @@ class ClientLifecycleTests(unittest.TestCase):
 
     def test_unidentified_server_never_launches_client(self):
         for catalog in (
-            None,
             {},
             {"data": None},
             {"data": []},
-            {"data": [{"id": "other", "owned_by": "other"}]},
+            {"data": [{"id": "other", "owned_by": "other", "context_length": 1}]},
+            {"data": [{"id": MODEL, "owned_by": "splash"}]},
+            {"data": [{"id": MODEL, "owned_by": "splash", "context_length": 0}]},
         ):
             with (
                 self.subTest(catalog=catalog),
                 mock.patch.object(
                     clients, "find_executable", return_value="/bin/codex"
-                ),
-                mock.patch.object(
-                    launcher, "_running_status", return_value={"ready": True}
                 ),
                 mock.patch.object(launcher, "_request_json", return_value=catalog),
                 mock.patch.object(launcher.os, "execvpe") as execute,
@@ -1391,8 +1389,8 @@ class InstalledCodexTests(unittest.TestCase):
             # context its prompt leaves.
             for request in runtime.requests:
                 self.assertEqual(
-                    request.logical_max_output_tokens,
-                    131072 - len(request.prompt_tokens),
+                    request.frame.logical_max_output_tokens,
+                    131072 - len(request.frame.prompt_tokens),
                 )
             rows = [
                 json.loads(line) for line in stdout.splitlines() if line.startswith("{")

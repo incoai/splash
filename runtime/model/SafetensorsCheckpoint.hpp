@@ -14,7 +14,7 @@ namespace splash::model {
 class SafetensorsCheckpoint final {
 public:
   explicit SafetensorsCheckpoint(const std::filesystem::path &directory,
-                        const PreparationCheck &check = {});
+                        const PreparationCheck &check);
   ~SafetensorsCheckpoint();
   [[nodiscard]] const SourceTensor *find(std::string_view name) const noexcept;
   [[nodiscard]] const SourceTensor &require(std::string_view name) const;

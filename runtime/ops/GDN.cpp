@@ -12,8 +12,7 @@
 namespace splash::ops {
 namespace {
 
-static_assert(offsetof(GDNDecodeBatchParams, conv_layer_bytes) == 16);
-static_assert(offsetof(GDNBatchCommitParams, conv_layer_bytes) == 32);
+static_assert(offsetof(GDNDecodeBatchParams, conv_layer_bytes) == 8);
 
 enum class KernelLayout : uint8_t { Value48, Value32 };
 
@@ -42,21 +41,21 @@ void GDN::addPrefill(metal::CommandGraph &graph, GdnPrefillBuffers buffers,
   const KernelLayout kernel = kernelShape(shape);
   const std::string gate = normKernel(kernelName(kernel, "prefill_gdn_gate", "prefill_gdn_gate_vh32"),
                                       buffers.mixerNorm, shape.headDimension);
-  const GDNPreparePrefillParams prepare{tokens, shape.packedWidth};
+  const GDNPrefillParams params{tokens};
   graph.add(kernelName(kernel, "prefill_gdn_prepare",
                        "prefill_gdn_prepare_vh32"),
             {buffers.packed, buffers.convolutionWeights,
              buffers.convolutionIn, buffers.convolutionOut, buffers.queries,
              buffers.keys, buffers.values, buffers.decayWeights,
              buffers.timeBias, buffers.decay, buffers.beta},
-            prepare, {uint64_t{tokens} * shape.keyHeads, 1, 1},
+            params, {uint64_t{tokens} * shape.keyHeads, 1, 1},
             {shape.headDimension, 1, 1});
   graph.add(kernelName(kernel, "prefill_gdn_scan",
                        "prefill_gdn_scan_vh32"),
             {buffers.queries, buffers.keys, buffers.values, buffers.decay,
              buffers.beta, buffers.recurrentIn, buffers.recurrentOut,
              buffers.recurrentRows},
-            GDNPrefillParams{tokens},
+            params,
             {uint64_t{shape.valueHeads} * shape.headDimension /
                  SPLASH_GDN_SCAN_STATE_ROWS,
              1, 1},
@@ -64,8 +63,7 @@ void GDN::addPrefill(metal::CommandGraph &graph, GdnPrefillBuffers buffers,
   graph.add(gate,
             {buffers.recurrentRows, buffers.packed, buffers.mixerNorm.buffer,
              buffers.hidden},
-            GDNGatePrefillParams{tokens, shape.packedWidth,
-                                 order == GdnHeadOrder::Tiled},
+            GDNGatePrefillParams{order == GdnHeadOrder::Tiled},
             {uint64_t{tokens} * shape.valueHeads, 1, 1}, {128, 1, 1});
 }
 
@@ -77,31 +75,24 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
   const KernelLayout kernel = kernelShape(shape);
   std::vector<metal::MetalBuffer> bindings{buffers.packed,
                                            buffers.convolutionWeights};
-  const bool prepare = input != LinearInput::Plain && buffers.linearScratch.input;
-  const uint32_t outputWidth = shape.valueHeads * shape.headDimension;
-  const uint32_t rows = lanes * SPLASH_TARGET_VERIFY_ROWS;
-  if (prepare && (buffers.linearScratch.input.sizeBytes() < tableBytes(outputWidth, rows) ||
-                  buffers.linearScratch.sums.sizeBytes() < tableSumsBytes(input, outputWidth, rows)))
-    throw std::invalid_argument("Q4 GDN preparation scratch is below requirement");
-  bindings.reserve(prepare ? 22 : 20);
+  const bool prepare = input != LinearInput::Plain;
+  if (prepare)
+    requireTableScratch(buffers.linearScratch, input, shape.valueHeads * shape.headDimension,
+                        lanes * SPLASH_TARGET_VERIFY_ROWS);
+  bindings.reserve(prepare ? 19 : 17);
   appendLaneBindings(bindings, buffers.currentStates, buffers.nextStates);
   bindings.insert(bindings.end(),
                   {buffers.mixed, buffers.decayWeights, buffers.timeBias,
-                   buffers.decay, buffers.beta, buffers.recurrent,
-                   buffers.mixerNorm.buffer, buffers.hidden, buffers.arrived,
-                   buffers.generation});
+                   buffers.decay, buffers.beta, buffers.mixerNorm.buffer,
+                   buffers.hidden});
   if (prepare)
     bindings.insert(bindings.end(), {buffers.linearScratch.input, buffers.linearScratch.sums});
   const GDNDecodeBatchParams params{order == GdnHeadOrder::Tiled,
-                                    shape.packedWidth,
-                                    lanes,
                                     layer,
                                     state.convolutionLayerBytes,
                                     state.recurrentLayerBytes,
                                     state.convolutionStateBytes};
-  const std::string name = !prepare ? kernelName(kernel, "verify_gdn_fused", "verify_gdn_fused_vh32")
-      : input == LinearInput::Table16 ? kernelName(kernel, "verify_gdn_fused_table16", "verify_gdn_fused_table16_vh32")
-                                      : kernelName(kernel, "verify_gdn_fused_table64", "verify_gdn_fused_table64_vh32");
+  const std::string name = std::string("verify_gdn_fused") + tableSuffix(input) + kernelName(kernel, "", "_vh32");
   graph.add(normKernel(name, buffers.mixerNorm, shape.headDimension), std::move(bindings), params,
             {shape.valueHeads, lanes, 1});
   if (!prepare) return {};
@@ -120,16 +111,7 @@ void GDN::addCommit(metal::CommandGraph &graph, GdnCommitBuffers buffers,
   bindings.reserve(13);
   appendLaneBindings(bindings, buffers.currentStates, buffers.nextStates);
   bindings.push_back(buffers.retainedCounts);
-  constexpr uint32_t rows = SPLASH_TARGET_VERIFY_ROWS;
-  const GDNBatchCommitParams params{shape.valueHeads,
-                                    shape.packedWidth,
-                                    lanes,
-                                    rows * shape.packedWidth,
-                                    rows * shape.convolutionDimension,
-                                    rows * shape.valueHeads,
-                                    rows * shape.valueHeads,
-                                    0,
-                                    state.convolutionLayerBytes,
+  const GDNBatchCommitParams params{state.convolutionLayerBytes,
                                     state.recurrentLayerBytes,
                                     state.convolutionStateBytes};
   graph.add(kernelName(kernel, "verify_gdn_commit",

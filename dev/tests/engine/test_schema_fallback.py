@@ -36,6 +36,12 @@ class SchemaFallbackTests(unittest.TestCase):
         )[1]
 
     @staticmethod
+    def framed_value(schema):
+        """The `value` parameter's schema as a request frames it."""
+        budget = [tool_schema.MAX_FRAMED_SCHEMA_BYTES]
+        return tool_schema.tool_argument_schema(schema, budget)["properties"]["value"]
+
+    @staticmethod
     def call(value):
         return (
             "<tool_call>\n<function=test>\n<parameter=value>\n"
@@ -105,9 +111,7 @@ class SchemaFallbackTests(unittest.TestCase):
                 "required": ["value"],
             }
             with self.subTest(kind=kind):
-                self.assertIsNone(
-                    raw_string_schema(schema["properties"]["value"], schema)
-                )
+                self.assertIsNone(raw_string_schema(self.framed_value(schema)))
                 self.verify(schema, '"red"', ['"blue"', "red", "7"], "red")
 
     def test_local_reference_and_sibling_constraints_are_both_retained(self):
@@ -117,7 +121,7 @@ class SchemaFallbackTests(unittest.TestCase):
             "properties": {"value": {"$ref": "#/$defs/Choice", "const": "1"}},
             "required": ["value"],
         }
-        self.assertIsNone(raw_string_schema(schema["properties"]["value"], schema))
+        self.assertIsNone(raw_string_schema(self.framed_value(schema)))
         self.verify(schema, '"1"', ['"2"', "1", "7"], "1")
         plain = {
             "type": "object",

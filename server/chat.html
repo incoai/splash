@@ -148,6 +148,7 @@
   <div class="toolbar">
     <label class="effort"><span>Thinking</span>
       <select id="effort" aria-label="Thinking effort">
+        <option value="">Default</option>
         <option value="xhigh">XHigh</option>
         <option value="medium">Medium</option>
         <option value="low">Low</option>
@@ -182,7 +183,7 @@
   let imagesAccepted = true;
 
   const savedEffort = storageGet(effortKey);
-  effort.value = allowedEfforts.has(savedEffort) ? savedEffort : 'xhigh';
+  effort.value = allowedEfforts.has(savedEffort) ? savedEffort : '';
 
   function authorization() {
     return apiKey.value ? {Authorization: `Bearer ${apiKey.value}`} : {};
@@ -568,7 +569,7 @@
       const response = await fetch('/v1/chat/completions', {
         method: 'POST',
         headers: {'Content-Type': 'application/json', ...authorization()},
-        body: JSON.stringify({messages: requestMessages(), stream: true, stream_options: {include_usage: true}, reasoning_effort: effort.value}),
+        body: JSON.stringify({messages: requestMessages(), stream: true, stream_options: {include_usage: true}, ...(effort.value ? {reasoning_effort: effort.value} : {})}),
         signal: controller.signal
       });
       if (!response.ok) throw new Error((await response.json()).error?.message || response.statusText);

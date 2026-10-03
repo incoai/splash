@@ -17,12 +17,8 @@ import contextlib
 import struct
 from pathlib import Path
 
-if __package__:
-    from . import models
-    from .models import ModelError
-else:
-    import models
-    from models import ModelError
+from . import models
+from .models import ModelError
 
 # The files derived_files derives from a target GGUF, by assembly path.
 DERIVED_FILES = (

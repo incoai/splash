@@ -28,7 +28,6 @@ static_assert([] {
     if (format.meta_groups * 32 != format.block_elements) return false;
   return true;
 }(), "a meta unit is one native block");
-static_assert(GGUF_TYPE_F32 == ggml::kF32, "float segments carry the GGUF type id");
 
 bool quantizedType(uint32_t type) { return gguf_format_of(type) != GGUF_FMT_COUNT; }
 bool floatType(uint32_t type) { return type == ggml::kF32; }
@@ -48,9 +47,10 @@ public:
           std::string name, uint32_t layer, uint32_t type)
       : file_(file), geometry_(geometry), problems_(problems) {
     image_.name = std::move(name);
+    image_.magic = kGgufImageMagic;
     image_.layer = layer;
     image_.type = type;
-    const auto header = weightFileHeader(kGgufImageMagic, layer, type);
+    const auto header = weightFileHeader(image_.magic, layer, type);
     image_.fills.push_back({0, {header.begin(), header.end()}});
     cursor_ = header.size();
   }
@@ -92,8 +92,8 @@ public:
       descriptor(ggml::kF32, 2ull * heads, hidden, {}, {bytes, 0, 0}, betaName);
       uint64_t destination = section(bytes);
       for (const GgufTensor *t : {beta, alpha}) {
-        image_.copies.push_back(
-            {destination, tensorRows(*t, heads, t->bytes / heads, grouped(0, 1)), false, widening == 2});
+        image_.copies.push_back({destination, tensorRows(*t, heads, t->bytes / heads, grouped(0, 1)),
+                                 widening == 2 ? Conversion::WidenToFloat32 : Conversion::None});
         destination += t->bytes * widening;
       }
       return;
@@ -112,15 +112,16 @@ public:
   void convolution(const std::string &name, uint64_t keyRows) {
     const uint32_t channels = geometry_.convolutionDimension;
     if (const GgufTensor *tensor = floatVector(name, uint64_t{channels} * kGdnConvolutionTaps))
-      copy(tensorRows(*tensor, channels, tensor->bytes / channels, grouped(keyRows, geometry_.gdnHeadDimension)), true);
+      copy(tensorRows(*tensor, channels, tensor->bytes / channels, grouped(keyRows, geometry_.gdnHeadDimension)),
+           Conversion::NarrowToBfloat16);
   }
 
   // A per value head F32 vector in grouped head order: as stored, or as the
   // exact bf16 values the kernels read.
-  void headVector(const std::string &name, bool bfloat16) {
+  void headVector(const std::string &name, Conversion conversion) {
     const uint32_t heads = geometry_.gdnValueHeads;
     if (const GgufTensor *tensor = floatVector(name, heads))
-      copy(tensorRows(*tensor, heads, tensor->bytes / heads, grouped(0, 1)), bfloat16);
+      copy(tensorRows(*tensor, heads, tensor->bytes / heads, grouped(0, 1)), conversion);
   }
 
   // Native token rows, gathered by the embedding kernel.
@@ -184,10 +185,10 @@ private:
     return {tensor.name, tensor.type, tensor.offset, count, rowBytes, order};
   }
 
-  // Rows written as stored, or converted to bf16, into their own section.
-  void copy(TensorRows source, bool bfloat16 = false) {
-    const uint64_t bytes = source.rows * source.rowBytes / (bfloat16 ? 2 : 1);
-    image_.copies.push_back({section(bytes), std::move(source), bfloat16});
+  // Rows written as stored, or narrowed to bf16, into their own section.
+  void copy(TensorRows source, Conversion conversion = Conversion::None) {
+    const uint64_t bytes = source.rows * source.rowBytes / (conversion == Conversion::NarrowToBfloat16 ? 2 : 1);
+    image_.copies.push_back({section(bytes), std::move(source), conversion});
   }
 
   // A tensor's rows as stored, after their descriptor.
@@ -318,8 +319,8 @@ Image layerImage(const GgufFile &file, const TargetGeometry &g, std::vector<std:
     b.quantized(p + "attn_gate.weight", valueRows, g.hiddenSize, b.grouped(0, g.gdnHeadDimension));
     b.alphaBeta(p + "ssm_beta.weight", p + "ssm_alpha.weight");
     b.convolution(p + "ssm_conv1d.weight", keyRows);
-    b.headVector(p + "ssm_a", false);
-    b.headVector(p + "ssm_dt.bias", true);
+    b.headVector(p + "ssm_a", Conversion::None);
+    b.headVector(p + "ssm_dt.bias", Conversion::NarrowToBfloat16);
     b.floatNorm(p + "ssm_norm.weight", g.gdnHeadDimension);
     b.quantized(p + "ssm_out.weight", g.hiddenSize, valueRows);
   }

@@ -30,6 +30,7 @@ sys.path.insert(0, str(ROOT))
 from dev.tests import smoke_real  # noqa: E402
 from dev.tools import build_identity  # noqa: E402
 from install import clients, launcher  # noqa: E402
+from server import serve_options  # noqa: E402
 
 CLIENTS = tuple(clients.INSTALL_URLS)
 # The server this harness starts or finds, on the default port.
@@ -77,8 +78,11 @@ def current_build_id():
     return identity
 
 
-def validate_server_configuration(initial, model, expected_model, context, identity):
-    if model != expected_model or initial["maximum_context_tokens"] != context:
+def validate_server_configuration(initial, model, context, identity):
+    if (
+        initial["instance"]["model"] != model
+        or initial["maximum_context_tokens"] != context
+    ):
         raise AgentFailure(
             "running server model/context differs from the test configuration"
         )
@@ -293,7 +297,7 @@ def status(*, wait_for_fresh=True, tolerate_critical=False):
 
 def idle_status():
     # Up to 60 s: a phase boundary may fall inside the engine's critical
-    # window, which clears once shed memory is released at the paced rate.
+    # window, which clears once macOS has registered the memory it shed.
     for _ in range(240):
         value = status(tolerate_critical=True)
         if not value.get("ready"):
@@ -310,13 +314,30 @@ def idle_status():
                     "waiting_mask",
                 )
             )
-            and value["state"]["active_cells"] == 0
+            and value["state"]["active_lanes"] == 0
             and value["state"]["pinned"] == 0
+            and value["state"]["in_use"] == 0
             and value["kv"]["pages_active"] == 0
         ):
             return value
         time.sleep(0.25)
     raise AgentFailure("server did not return to idle")
+
+
+def prefix_reuse(before, after):
+    """What a phase's requests reused of the cache, from the idle status
+    before and after it."""
+
+    def delta(section, key):
+        return after[section][key] - before[section][key]
+
+    return {
+        "reused_tokens": delta("cache", "reused_tokens"),
+        "prefill_input_tokens": delta("metrics", "prefill_input_tokens"),
+        "lost_state_misses": delta("cache", "lost_state_misses"),
+        "in_use_evictions": delta("state", "in_use_evictions"),
+        "completed": delta("requests", "completed"),
+    }
 
 
 def pressure_stop_level():
@@ -596,7 +617,7 @@ class ClientRun:
                 )
             ]
 
-    def phase(self, label, prompt, cancel=False):
+    def phase(self, label, prompt, cancel=False, may_compact=False):
         before = idle_status()
         previous_message = 0
         if self.name == "hermes" and self.session:
@@ -647,7 +668,7 @@ class ClientRun:
                             "growth_allowed": governor.get("growth_allowed"),
                             "prefill_rows": scheduler.get("prefill_rows"),
                             "decode_batches": scheduler.get("decode_batches"),
-                            "kv_blocks": current.get("kv", {}).get("blocks"),
+                            "kv_pages_cache": current.get("kv", {}).get("pages_cache"),
                             "state_entries": current.get("state", {}).get("entries"),
                         }
                     if sample["engine_critical"]:
@@ -734,6 +755,8 @@ class ClientRun:
             "log": str(log),
             "executed_commands": executed_commands(self.name, parsed, messages, turns),
         }
+        if after is not None:
+            row["reuse"] = prefix_reuse(before, after)
         self.phases.append(row)
         atomic_json(self.folder / f"{label}.json", row)
         atomic_json(self.folder / "session.json", {"session": self.session})
@@ -750,6 +773,16 @@ class ClientRun:
             raise AgentFailure("client did not expose a real session id")
         if after["requests"]["failed"] != before["requests"]["failed"]:
             raise AgentFailure("native request failed")
+        reuse = row["reuse"]
+        # Running work takes the replay points unfinished requests hold after
+        # everything else; at a tight --max-memory that is legitimate, so it
+        # is recorded, not gated.
+        if reuse["in_use_evictions"]:
+            print(
+                f"{self.name}/{label}: warning: {reuse['in_use_evictions']} replay "
+                "points of unfinished requests were evicted",
+                flush=True,
+            )
         if cancel:
             if (
                 not interrupted
@@ -798,10 +831,26 @@ class ClientRun:
                     raise AgentFailure(
                         "OpenCode did not finish its user turn with assistant text"
                     )
+            # A phase that may compact is judged once its caller knows
+            # whether it did.
+            if not may_compact:
+                self.require_reuse()
         print(
             f"{self.name}/{label}: completed ({row['wall_seconds']:.1f}s)", flush=True
         )
         return parsed
+
+    def require_reuse(self):
+        """Fails the last phase when two or more of its requests completed and
+        none reused a cached prompt token. Every request after a phase's
+        first resends the conversation, so a working replay point always
+        reuses some of it."""
+        reuse = self.phases[-1]["reuse"]
+        if reuse["completed"] >= 2 and not reuse["reused_tokens"]:
+            raise AgentFailure(
+                "phase reused no cached prompt tokens across "
+                f"{reuse['completed']} requests"
+            )
 
     def compaction(self):
         if self.name == "hermes":
@@ -912,8 +961,17 @@ class ClientRun:
         for wave in range(first_wave, first_wave + 20):
             if compact:
                 break
-            self.phase(f"reference-{wave:02}", reference.replace("BATCH_ID", str(wave)))
+            self.phase(
+                f"reference-{wave:02}",
+                reference.replace("BATCH_ID", str(wave)),
+                may_compact=True,
+            )
             compact = self.compaction()
+            # The wave that compacts resends no conversation: its summary
+            # request and the request after it share only the system prompt
+            # and tools.
+            if not compact:
+                self.require_reuse()
         if not compact:
             raise AgentFailure("no genuine automatic compaction observed")
         self.phase(
@@ -1079,21 +1137,22 @@ def main(argv=None):
                     start_new_session=True,
                 )
             deadline = time.monotonic() + 900
-            while launcher._running_status() is None:
+            while launcher._request_json("/status", timeout=10) is None:
                 if process.poll() is not None or time.monotonic() >= deadline:
                     raise AgentFailure(
                         f"serve did not become ready; see {directory / 'server.log'}"
                     )
                 time.sleep(0.5)
         initial = idle_status()
+        # Clients get the first entry, the name responses report, as with
+        # splash <client>; /status names the loaded model.
         served = launcher._request_json("/v1/models")["data"][0]
         model = served["id"]
         context = initial["maximum_context_tokens"]
         validate_server_configuration(
             initial,
-            model,
             args.model,
-            launcher._parse_max_context(args.max_context),
+            serve_options.parse_max_context(args.max_context),
             identity,
         )
         document.update(model=model, context=context, identity=initial["identity"])

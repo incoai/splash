@@ -66,7 +66,7 @@ std::vector<uint8_t> cachedImage(const model::WeightFile &weights) {
 // the embedding's.
 std::vector<std::vector<uint8_t>> preparedImages(MetalBackend &backend, const std::filesystem::path &path,
                                                  const model::gguf::TargetGeometry &geometry) {
-  model::GgufTargetLoader loader(backend, path, geometry);
+  model::GgufTargetLoader loader(backend, path, geometry, {});
   std::vector<std::vector<uint8_t>> images;
   for (uint32_t layer = 0; layer < geometry.layers; ++layer) images.push_back(cachedImage(loader.layer(layer)));
   images.push_back(cachedImage(loader.head()));
@@ -85,7 +85,7 @@ std::vector<model::gguf::Image> planned(const std::filesystem::path &path,
 // `name`, and every golden of `name` prepared.
 void checkGoldenImages(MetalBackend &backend, const std::filesystem::path &path,
                        const model::gguf::TargetGeometry &geometry, const std::string &name, const Goldens &hashes) {
-  model::GgufTargetLoader loader(backend, path, geometry);
+  model::GgufTargetLoader loader(backend, path, geometry, {});
   uint64_t compared = 0;
   const auto compare = [&](const model::WeightFile &weights) {
     const auto &record = weights.record();
@@ -128,17 +128,20 @@ void checkDense(MetalBackend &backend, const std::filesystem::path &directory, c
         check(slice(prepared[index], copy.destination, values.size()) == values,
               "prepared norm is the GGUF's F32 values as stored: " + copy.source.name);
       }
-  const auto prepares = [&](const char *name, bool bfloat16) {
+  const auto prepares = [&](const char *name, model::gguf::Conversion conversion) {
     const model::gguf::Copy *copy = copyOf(images[0], name);
-    if (!copy) return false;
+    if (!copy || copy->conversion != conversion) return false;
     const auto &values = target.data(name);
     const auto ordered = orderedRows(values, values.size() / copy->source.rows, copy->source.order);
-    const auto expected = bfloat16 ? bfloat16Halves(ordered) : ordered;
+    const auto expected =
+        conversion == model::gguf::Conversion::NarrowToBfloat16 ? bfloat16Halves(ordered) : ordered;
     return slice(prepared[0], copy->destination, expected.size()) == expected;
   };
-  check(prepares("blk.0.ssm_conv1d.weight", true), "prepared convolution: exact bf16 in grouped head order");
-  check(prepares("blk.0.ssm_a", false), "prepared decay: F32 in grouped head order");
-  check(prepares("blk.0.ssm_dt.bias", true), "prepared time bias: exact bf16 in grouped head order");
+  check(prepares("blk.0.ssm_conv1d.weight", model::gguf::Conversion::NarrowToBfloat16),
+        "prepared convolution: exact bf16 in grouped head order");
+  check(prepares("blk.0.ssm_a", model::gguf::Conversion::None), "prepared decay: F32 in grouped head order");
+  check(prepares("blk.0.ssm_dt.bias", model::gguf::Conversion::NarrowToBfloat16),
+        "prepared time bias: exact bf16 in grouped head order");
 
   for (const std::string name : {"blk.0.ssm_conv1d.weight", "blk.0.ssm_dt.bias"}) {
     std::vector<Tensor> inexact = target.tensors;
@@ -239,7 +242,7 @@ void checkMoe(MetalBackend &backend, const std::filesystem::path &directory, con
       if (!allowPreparation) throw std::runtime_error("conversion forbidden on warm load");
     });
     auto weights = loader.layer(0);
-    const auto bytes = weights.section(weights.record().declaredBytes - model::kWeightFileAlignment);
+    const auto bytes = weights.section(weights.record().declaredBytes - model::kWeightFileAlignment, {});
     const auto *begin = static_cast<const uint8_t *>(bytes.contents());
     std::vector<uint8_t> image(model::kWeightFileAlignment, 0);
     image.insert(image.end(), begin, begin + bytes.sizeBytes());
@@ -299,10 +302,11 @@ void checkWidenedAlphaBeta(MetalBackend &backend, const std::filesystem::path &d
   const std::vector<model::gguf::Image> images = planned(path, g);
   const auto *beta = copyOf(images[0], "blk.0.ssm_beta.weight"), *alpha = copyOf(images[0], "blk.0.ssm_alpha.weight");
   if (!beta || !alpha) throw std::runtime_error("the plan has no alpha/beta tensor");
-  check(beta->float32 && alpha->float32 && !beta->bfloat16 && !alpha->bfloat16 &&
+  check(beta->conversion == model::gguf::Conversion::WidenToFloat32 &&
+            alpha->conversion == model::gguf::Conversion::WidenToFloat32 &&
             alpha->destination == beta->destination + 2 * target.data(beta->source.name).size(),
         "planner widens BF16 alpha/beta into one F32 tensor");
-  model::GgufTargetLoader loader(backend, path, g);
+  model::GgufTargetLoader loader(backend, path, g, {});
   const std::vector<uint8_t> image = cachedImage(loader.layer(0));
   const uint64_t rowBytes = uint64_t{g.hiddenSize} * sizeof(float);
   std::vector<uint8_t> gates = orderedRows(floats[beta->source.name], rowBytes, beta->source.order);
@@ -331,7 +335,6 @@ bool blockProjection(const ops::Projection &p, uint32_t n, uint32_t k, std::vect
 // per tensor in the layout's padded width, the norms F32 and the GDN output in
 // the GGUF's tiled head order; the head and token table as the GGUF stores them.
 void checkDenseTarget(MetalBackend &backend, const std::filesystem::path &directory) {
-  using namespace model::ggml;
   model::Qwen3_8Layout layout;
   layout.layers = 4;
   layout.hiddenSize = 256;
@@ -369,7 +372,7 @@ void checkDenseTarget(MetalBackend &backend, const std::filesystem::path &direct
                                      {"output.weight", kQ6_K},
                                      {"token_embd.weight", kIQ4_XS}}),
             geometry);
-  model::GgufTargetLoader files(backend, model::findTargetGguf(target), geometry);
+  model::GgufTargetLoader files(backend, model::findTargetGguf(target), geometry, {});
   const model::Qwen3_8Weights weights = model::loadQwen3_8Weights(backend, layout, files);
   check(weights.layers.size() == layout.layers, "GGUF target: every layer");
   check(weights.finalNorm.float32, "GGUF target: F32 final norm");

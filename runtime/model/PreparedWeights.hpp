@@ -39,8 +39,20 @@ struct PreparedWeight {
 
 void readWeightBytes(int descriptor, uint64_t offset, std::span<uint8_t> bytes);
 void writeWeightBytes(int descriptor, uint64_t offset, std::span<const uint8_t> bytes);
+// The lowercase hex SHA-256 of bytes or text.
 [[nodiscard]] std::string weightDigest(std::span<const uint8_t> bytes);
 [[nodiscard]] std::string weightDigest(std::string_view text);
+// A SHA-256 digest in lowercase hex.
+[[nodiscard]] inline std::string digestHex(std::span<const uint8_t, 32> digest) {
+  constexpr char digits[] = "0123456789abcdef";
+  std::string result;
+  result.reserve(2 * digest.size());
+  for (uint8_t byte : digest) {
+    result += digits[byte >> 4];
+    result += digits[byte & 15];
+  }
+  return result;
+}
 
 // A source file, opened once; checkUnchanged throws when it was modified or
 // replaced since. Its parser reads the metadata through descriptor() and
@@ -163,16 +175,18 @@ public:
   // files add beyond the entries they supersede, which publishing them
   // evicts, and its largest file, written while the entries it replaces
   // remain. Completed layers remain reusable after an interruption; they are
-  // not partial files.
+  // not partial files, which this removes under the converter lock first. A
+  // complete model takes the lock only when it is free, never waiting for it,
+  // and a cache it cannot lock or clean does not fail it.
   void requireSpace(std::span<const PreparedWeight> weights,
-                    const PreparationCheck &check = {}) const;
+                    const PreparationCheck &check) const;
   // The complete file of weight: reused, or written now under the converter
   // lock and published atomically; writer failures never publish partial
   // data. The sources are checked unchanged before, after writing and before
   // the path is returned, so no file of a modified source is published or
   // used.
   [[nodiscard]] std::filesystem::path prepare(const PreparedWeight &weight, const WeightWriter &write,
-                                              const PreparationGuards &guards = {}) const;
+                                              const PreparationGuards &guards) const;
 
 private:
   std::filesystem::path root_;

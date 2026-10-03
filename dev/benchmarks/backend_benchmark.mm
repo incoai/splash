@@ -17,7 +17,6 @@
 #include <functional>
 #include <iomanip>
 #include <iostream>
-#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -38,16 +37,6 @@ using splash::benchmark::expectedDraftContextRows;
 namespace {
 
 using Clock = std::chrono::steady_clock;
-
-std::string_view cacheStatusName(EngineCacheStatus status) noexcept {
-  switch (status) {
-  case EngineCacheStatus::Miss:
-    return "miss";
-  case EngineCacheStatus::PrefixHit:
-    return "prefix_hit";
-  }
-  std::terminate();
-}
 
 double milliseconds(Clock::time_point value) {
   return std::chrono::duration<double, std::milli>(value.time_since_epoch())
@@ -77,16 +66,16 @@ public:
   void batchCompleted(WorkKind kind, uint32_t width, uint32_t inputTokens,
                       uint32_t outputTokens,
                       uint32_t draftedTokens, uint32_t acceptedDraftTokens,
-                      double) override {
+                      double, double) override {
     lastBatch_ = {kind, width, inputTokens, outputTokens, draftedTokens,
                   acceptedDraftTokens};
     ++batchSequence_;
   }
 
-  void started(uint64_t requestId, EngineCacheStatus cacheStatus,
-               uint32_t matchedTokens, uint32_t) override {
+  void started(uint64_t requestId, uint32_t matchedTokens,
+               uint32_t) override {
     Observation &value = observations_[requestId];
-    value.cacheStatus = cacheStatusName(cacheStatus);
+    value.cacheStatus = matchedTokens ? "prefix_hit" : "miss";
     value.matchedTokens = matchedTokens;
   }
 
@@ -107,14 +96,10 @@ public:
     observations_[requestId].completed = true;
   }
 
-  void failed(uint64_t requestId, std::string code, std::string message,
-              bool) override {
-    observations_[requestId].failure = std::move(code) + ":" + message;
-  }
-
-  void capacityExhausted(uint64_t requestId, uint32_t, uint32_t,
-                         uint64_t) override {
-    observations_[requestId].failure = "capacity_exhausted";
+  void failed(uint64_t requestId, LaneOutcome outcome,
+              std::string message) override {
+    observations_[requestId].failure =
+        std::string(laneOutcomeWire(outcome).code) + ":" + message;
   }
 
   [[nodiscard]] const Observation &get(uint64_t requestId) const {
@@ -326,7 +311,7 @@ public:
           {}) {
     const auto deadline = Clock::now() + std::chrono::hours(2);
     uint64_t observedBatchSequence = events_.batchSequence();
-    while (!engine_.idle()) {
+    while (!drained()) {
       if (engine_.tick(milliseconds(Clock::now()))) {
         const uint64_t sequence = events_.batchSequence();
         if (sequence != observedBatchSequence) {
@@ -362,6 +347,15 @@ private:
     std::condition_variable condition;
     bool notified = false;
   };
+
+  // Every submitted request has ended and no command is in flight.
+  [[nodiscard]] bool drained() const {
+    const engine::EngineSnapshot counts = engine_.snapshot();
+    return counts.submitted ==
+               counts.completed + counts.cancelled + counts.failed &&
+           !engine_.commandInFlight();
+  }
+
   engine::Engine &engine_;
   Events &events_;
   std::shared_ptr<WakeState> wake_ = std::make_shared<WakeState>();
@@ -467,48 +461,20 @@ Measurement runRequest(engine::Engine &engine, Driver &driver,
   return result;
 }
 
-// Physical KV release is paced by the backing: while an earlier extent
-// release is still in flight, Cache::reclaimCache evicts nothing and its
-// caller retries once releaseDeferred() clears. The benchmark drains follow
-// that contract, bounded well above the backing's own release timeout.
-constexpr std::chrono::seconds kDrainDeadline{120};
-
-void awaitDeferredRelease(engine::Cache &resources,
-                          std::chrono::steady_clock::time_point deadline) {
-  while (resources.releaseDeferred()) {
-    if (std::chrono::steady_clock::now() >= deadline) {
-      throw std::logic_error("native benchmark backing release did not complete");
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-  }
-}
-
+// One reclaim pass evicts every unpinned entry and releases the extents it
+// empties.
 void evictAllCache(engine::Cache &resources) {
-  const auto deadline = std::chrono::steady_clock::now() + kDrainDeadline;
-  for (;;) {
-    awaitDeferredRelease(resources, deadline);
-    static_cast<void>(
-        resources.reclaimCache(std::numeric_limits<uint64_t>::max(), true));
-    const engine::CacheSnapshot snapshot = resources.snapshot();
-    if (!snapshot.stateCache.entries && !snapshot.kvCache.blocks) return;
-    // Evicting KV empties extents whose release is paced; wait and continue.
-    // Entries that remain with no release in flight are a real failure.
-    if (!resources.releaseDeferred())
-      throw std::logic_error("native benchmark cache did not drain");
-  }
+  static_cast<void>(resources.evictAll());
+  const engine::CacheSnapshot snapshot = resources.snapshot();
+  if (snapshot.stateCache.entries || snapshot.pool.pagesPrefix)
+    throw std::logic_error("native benchmark cache did not drain");
 }
 
+// Evicts every cached state, one at a time, and leaves the KV graph intact.
 void evictAllCompositeState(engine::Cache &resources) {
-  const auto deadline = std::chrono::steady_clock::now() + kDrainDeadline;
   while (resources.snapshot().stateCache.entries) {
-    awaitDeferredRelease(resources, deadline);
-    const engine::CacheSnapshot before = resources.snapshot();
-    static_cast<void>(resources.reclaimCache(1, false));
-    const engine::CacheSnapshot after = resources.snapshot();
-    if (after.stateCache.entries >= before.stateCache.entries &&
-        after.pool.residentBackingBytes >= before.pool.residentBackingBytes) {
+    if (!resources.reclaimStateForLane(engine::ReclaimClass::InUse).madeProgress)
       throw std::logic_error("native benchmark state cache made no progress");
-    }
   }
 }
 
@@ -828,12 +794,6 @@ int main(int argc, char **argv) {
     config.buildId = SPLASH_BUILD_ID;
     const std::string modelRoot = config.modelRoot.string();
     const auto &capabilities = config.model.capabilities;
-    const uint32_t maskWordsPerToken = (capabilities.vocabularySize + 31) / 32;
-    bootstrapConfig.nativeLoop.maskWordsPerToken = maskWordsPerToken;
-    bootstrapConfig.protocolLimits.maxTokenBatch = model::ExecutionLimits::maximumStepTokens;
-    bootstrapConfig.protocolLimits.maxSimulationTokens = capabilities.draftQueryRows;
-    bootstrapConfig.protocolLimits.maxMaskWords =
-        maskWordsPerToken * (capabilities.draftQueryRows + 1);
     // Complete production warmup and memory audit before measuring. Retry
     // host-capacity refusals while memory from the previous engine settles.
     std::unique_ptr<engine::RuntimeBootstrap> bootstrap;
@@ -860,8 +820,8 @@ int main(int argc, char **argv) {
         std::this_thread::sleep_for(std::chrono::seconds(2));
       }
     }
-    if (!bootstrap->report().ready || !bootstrap->nativeLoop().ready() ||
-        !bootstrap->nativeLoop().engineHealthy() || !bootstrap->nativeLoop().idle() ||
+    if (!bootstrap->nativeLoop().ready() ||
+        !bootstrap->nativeLoop().engineHealthy() ||
         bootstrap->nativeLoop().commandInFlight())
       throw std::runtime_error("benchmark production bootstrap did not finish idle and ready");
     // Non-owning borrows. This scope never feeds or ticks the bootstrap loop;
@@ -873,9 +833,7 @@ int main(int argc, char **argv) {
     const std::string identity =
         "{\"model_root\":" + json::quote(modelRoot) +
         ",\"loaded_model_layout_sha256\":" +
-        json::quote(cacheIdentity.modelLayoutSha256) +
-        ",\"runtime_cache_namespace\":" +
-        json::quote(cacheIdentity.namespaceSha256) + ",\"device\":" +
+        json::quote(cacheIdentity.modelLayoutSha256) + ",\"device\":" +
         json::quote(resources->backend().capabilities().deviceName) + "}";
     if (progress)
       progress->identity(identity);
@@ -923,8 +881,6 @@ int main(int argc, char **argv) {
         }
       }
     }
-    if (!prefillWarmup.completed)
-      throw std::runtime_error("maximum prefill warmup failed");
     if (median(decodeSamples[2]) >
         median(decodeSamples[0]) + median(decodeSamples[1])) {
       performanceFailures.push_back(
@@ -935,9 +891,7 @@ int main(int argc, char **argv) {
     engine::EngineConfig engineConfig;
     engineConfig.maxContext = resources->memoryPlan().maximumContextTokens();
     engineConfig.vocabularySize = capabilities.vocabularySize;
-    engineConfig.growthPaused = [resources] {
-      return !resources->memoryGovernor().snapshot().hostGrowthAllowed;
-    };
+    engine::connectToGovernor(engineConfig, resources->memoryGovernor());
     engine::Engine engine(engineConfig, resources->cache(),
                                   *executor, events);
     Driver driver(engine, events);
@@ -1113,7 +1067,7 @@ int main(int argc, char **argv) {
         continuationResult.coldOutputMatch =
             continuationResult.outputTokens == continuationCold.outputTokens;
         if (coldResult.draftContextRows != expectedDraftContextRows(
-                length, engineConfig.prefillCheckpointTokens)) {
+                length, engine::kPrefillCheckpointTokens)) {
           throw std::runtime_error(
               "cold prefill performed unnecessary draft-context work");
         }
@@ -1159,7 +1113,7 @@ int main(int argc, char **argv) {
             ((partialBase.size() - 1) / kv::kPageTokens) *
             kv::kPageTokens;
         const uint64_t expectedPartialRows = expectedDraftContextRows(
-            partialPrompt.size(), engineConfig.prefillCheckpointTokens,
+            partialPrompt.size(), engine::kPrefillCheckpointTokens,
             partialBoundary);
         if (partialSeed.cacheStatus != "miss" ||
             partialHit.cacheStatus != "prefix_hit" ||
@@ -1185,35 +1139,72 @@ int main(int argc, char **argv) {
       }
     }
 
-    // State eviction deliberately leaves the Page32 graph intact. The next
-    // request must replay target work and lazily materialize the proven KV
-    // junction; only the following request may restore it directly.
+    // A request lazily materializes a KV junction where its match ends past
+    // its state at a branch point: another branch goes on below and holds a
+    // state there, and the junction lies a draft window or more past the
+    // state the request resumes from. Two prompts share a 7K prefix and then
+    // diverge. State eviction deliberately leaves the Page32 graph intact.
     if (selected.context) {
       evictAllCache(resources->cache());
-      std::vector<uint32_t> lazyPrompt = prompt(10000, 0x4c415a594b56ULL);
+      const std::vector<uint32_t> lazyShared = prompt(7168, 0x4c415a594b56ULL);
+      const auto lazyBranch = [&](uint64_t salt) {
+        std::vector<uint32_t> branch = lazyShared;
+        const std::vector<uint32_t> tail = prompt(2048, salt);
+        branch.insert(branch.end(), tail.begin(), tail.end());
+        return branch;
+      };
+      const std::vector<uint32_t> lazyPrompt = lazyBranch(0x4c415a5941ULL);
       Measurement lazySeed =
           runRequest(engine, driver, *executor, events, progress.get(),
                      requestId++, "lazy_seed", 0, lazyPrompt);
       evictAllCompositeState(resources->cache());
+      // The repeat's match ends where its own chain does, so it plans no
+      // junction: it replays the prompt and rebuilds its replay point, which
+      // the next repeat restores.
+      Measurement lazyChainEnd =
+          runRequest(engine, driver, *executor, events, progress.get(),
+                     requestId++, "lazy_chain_end", 0, lazyPrompt);
+      Measurement lazyRepeat =
+          runRequest(engine, driver, *executor, events, progress.get(),
+                     requestId++, "lazy_repeat", 0, lazyPrompt);
+      const uint32_t lazyReplayBoundary =
+          ((lazyPrompt.size() - 1) / kv::kPageTokens) * kv::kPageTokens;
+      if (lazySeed.cacheStatus != "miss" ||
+          lazyChainEnd.cacheStatus != "miss" ||
+          lazyChainEnd.junctionMaterializations != 0 ||
+          lazyRepeat.matchedTokens != lazyReplayBoundary ||
+          lazyRepeat.junctionMaterializations != 0) {
+        throw std::runtime_error(
+            "chain-end KV junction oracle failed: junctions=" +
+            std::to_string(lazyChainEnd.junctionMaterializations) + "," +
+            std::to_string(lazyRepeat.junctionMaterializations) + " " +
+            lookups({lazySeed, lazyChainEnd, lazyRepeat}, lazyReplayBoundary));
+      }
+      // The other branch's match ends at the shared prefix, above the first
+      // branch's replay point: it materializes the junction there, and a
+      // third branch off the prefix restores from it.
       Measurement lazyMaterialize =
           runRequest(engine, driver, *executor, events, progress.get(),
-                     requestId++, "lazy_materialize", 0, lazyPrompt);
+                     requestId++, "lazy_materialize", 0,
+                     lazyBranch(0x4c415a5942ULL));
       Measurement lazyReuse =
           runRequest(engine, driver, *executor, events, progress.get(),
-                     requestId++, "lazy_reuse", 0, lazyPrompt);
-      const uint32_t lazyBoundary =
-          ((lazyPrompt.size() - 1) / kv::kPageTokens) *
-          kv::kPageTokens;
-      if (lazySeed.cacheStatus != "miss" ||
-          lazyMaterialize.cacheStatus != "miss" ||
-          lazyMaterialize.matchedTokens != 0 ||
-          lazyMaterialize.junctionMaterializations != 1 ||
-          lazyReuse.matchedTokens != lazyBoundary) {
-        throw std::runtime_error("lazy KV junction oracle failed");
+                     requestId++, "lazy_reuse", 0, lazyBranch(0x4c415a5943ULL));
+      const auto lazyBranchPoint = static_cast<uint32_t>(lazyShared.size());
+      if (lazyMaterialize.junctionMaterializations != 1 ||
+          lazyReuse.matchedTokens != lazyBranchPoint ||
+          lazyReuse.junctionMaterializations != 0) {
+        throw std::runtime_error(
+            "branch KV junction oracle failed: junctions=" +
+            std::to_string(lazyMaterialize.junctionMaterializations) + "," +
+            std::to_string(lazyReuse.junctionMaterializations) + " " +
+            lookups({lazyMaterialize, lazyReuse}, lazyBranchPoint));
       }
-      lazyMaterialize.coldOutputMatch = lazySeed.outputTokens == lazyMaterialize.outputTokens;
-      lazyReuse.coldOutputMatch = lazySeed.outputTokens == lazyReuse.outputTokens;
+      lazyChainEnd.coldOutputMatch = lazySeed.outputTokens == lazyChainEnd.outputTokens;
+      lazyRepeat.coldOutputMatch = lazySeed.outputTokens == lazyRepeat.outputTokens;
       measurements.push_back(std::move(lazySeed));
+      measurements.push_back(std::move(lazyChainEnd));
+      measurements.push_back(std::move(lazyRepeat));
       measurements.push_back(std::move(lazyMaterialize));
       measurements.push_back(std::move(lazyReuse));
     }
@@ -1311,7 +1302,7 @@ int main(int argc, char **argv) {
     std::cout << "],\"final\":{\"cache_hits\":" << snapshot.cacheHits
               << ",\"cold_misses\":" << snapshot.coldMisses
               << ",\"reused_tokens\":" << snapshot.reusedTokens
-              << ",\"kv_blocks\":" << snapshot.resources.kvCache.blocks
+              << ",\"kv_pages_cache\":" << snapshot.resources.pool.pagesPrefix
               << ",\"state_entries\":" << snapshot.resources.stateCache.entries
               << "}}\n";
     if (progress)

@@ -6,7 +6,7 @@ from unittest import mock
 
 from dev.tests import test_server
 from dev.tests.engine.test_documents import pdf_bytes, render_pdf
-from dev.tests.test_server import FakeRuntime, Harness, Plan
+from dev.tests.test_server import FOREVER, FakeRuntime, Harness, Plan
 from server import api_shapes, documents
 from server.errors import APIError
 
@@ -19,7 +19,7 @@ class PdfProtocolTests(unittest.TestCase):
             "file_data": "data:application/pdf;base64," + self.encoded,
         }
 
-    def chat(self, file=None, **kwargs):
+    def chat(self, file=None, deadline=FOREVER):
         return api_shapes.normalize_messages(
             [
                 {
@@ -29,31 +29,30 @@ class PdfProtocolTests(unittest.TestCase):
                     ],
                 }
             ],
-            **kwargs,
             vision=True,
+            deadline=deadline,
         )
 
     def test_protocols_share_rendered_pages_and_preserve_order(self):
         expected = render_pdf(pdf_bytes(pages=2))
         chat = self.chat()[0]["content"]
         self.assertEqual(chat, expected)
-        response = api_shapes.responses_to_chat_body(
-            {
-                "input": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "input_text", "text": "before"},
-                            {"type": "input_file", **self.file},
-                            {"type": "input_text", "text": "after"},
-                        ],
-                    }
-                ],
-            }
+        response, _ = api_shapes.responses_to_chat_body(
+            {},
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "before"},
+                        {"type": "input_file", **self.file},
+                        {"type": "input_text", "text": "after"},
+                    ],
+                }
+            ],
         )
-        actual = api_shapes.normalize_messages(response["messages"], vision=True)[0][
-            "content"
-        ]
+        actual = api_shapes.normalize_messages(
+            response["messages"], vision=True, deadline=FOREVER
+        )[0]["content"]
         self.assertEqual(
             actual,
             [
@@ -106,7 +105,7 @@ class PdfProtocolTests(unittest.TestCase):
                         status, _, payload = harness.request("POST", path, body)
                         self.assertEqual(status, 200, payload)
                         self.assertEqual(len(runtime.requests), 1)
-                        self.assertEqual(len(runtime.requests[0].image_spans), 2)
+                        self.assertEqual(len(runtime.requests[0].frame.image_spans), 2)
                         if stream:
                             self.assertIn(b"data:", payload)
                         else:
@@ -145,7 +144,7 @@ class PdfProtocolTests(unittest.TestCase):
             },
         )
         self.assertEqual(status, 200, payload)
-        self.assertEqual([len(r.image_spans) for r in runtime.requests], [2, 2])
+        self.assertEqual([len(r.frame.image_spans) for r in runtime.requests], [2, 2])
 
     def test_unsupported_file_rejected_before_stream_or_runtime(self):
         runtime = FakeRuntime()
@@ -203,31 +202,32 @@ class PdfProtocolTests(unittest.TestCase):
         with mock.patch.object(
             documents, "_render", side_effect=AssertionError("early render")
         ):
-            response = api_shapes.responses_to_chat_body(
-                {
-                    "input": [
-                        {
-                            "role": "user",
-                            "content": [{"type": "input_file", **self.file}],
-                        }
-                    ]
-                }
+            response, _ = api_shapes.responses_to_chat_body(
+                {},
+                [
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_file", **self.file}],
+                    }
+                ],
             )
         self.assertEqual(
             response["messages"][0]["content"], [{"type": "file", "file": self.file}]
         )
 
     def test_user_and_tool_files_share_one_request_budget(self):
-        budget = documents.DocumentBudget()
+        budget = documents.DocumentBudget(deadline=FOREVER)
         documents.file_content(self.file, budget=budget)
         one_file = documents.MAX_REQUEST_DOCUMENT_BYTES - budget.remaining_bytes
 
         def normalize(messages, remaining_bytes):
-            request_budget = documents.DocumentBudget(remaining_bytes=remaining_bytes)
+            request_budget = documents.DocumentBudget(
+                deadline=FOREVER, remaining_bytes=remaining_bytes
+            )
             with mock.patch.object(
                 api_shapes, "DocumentBudget", return_value=request_budget
             ):
-                api_shapes.normalize_messages(messages, vision=True)
+                api_shapes.normalize_messages(messages, vision=True, deadline=FOREVER)
 
         for dialect in ("chat", "responses"):
             with self.subTest(dialect=dialect):
@@ -244,20 +244,20 @@ class PdfProtocolTests(unittest.TestCase):
                         },
                     ]
                 else:
-                    body = {
-                        "input": [
-                            {
-                                "role": "user",
-                                "content": [{"type": "input_file", **self.file}],
-                            },
-                            {
-                                "type": "function_call_output",
-                                "call_id": "read",
-                                "output": [{"type": "input_file", **self.file}],
-                            },
-                        ]
-                    }
-                    messages = api_shapes.responses_to_chat_body(body)["messages"]
+                    items = [
+                        {
+                            "role": "user",
+                            "content": [{"type": "input_file", **self.file}],
+                        },
+                        {
+                            "type": "function_call_output",
+                            "call_id": "read",
+                            "output": [{"type": "input_file", **self.file}],
+                        },
+                    ]
+                    messages = api_shapes.responses_to_chat_body({}, items)[0][
+                        "messages"
+                    ]
                 normalize(messages, 2 * one_file)
                 with self.assertRaisesRegex(APIError, "request size limit"):
                     normalize(messages, 2 * one_file - 1)
@@ -290,6 +290,7 @@ class PdfProtocolTests(unittest.TestCase):
                     api_shapes.normalize_messages(
                         [{"role": "user", "content": [{"type": "file", "file": file}]}],
                         vision=True,
+                        deadline=FOREVER,
                     )
 
     def test_input_bound_checked_before_decode(self):

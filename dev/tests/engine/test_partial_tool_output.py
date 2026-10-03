@@ -6,16 +6,23 @@ import unittest
 from jsonschema import Draft202012Validator
 
 from dev.tests.test_server import (
+    FOREVER,
     FakeRuntime,
     FakeTokenizer,
     Harness,
     Plan,
     _byte_backend,
 )
+from dev.tests.tool_output import project, streamed_arguments, streamed_text
 from server import api_shapes
 from server import output as model_output
 from server import server as api
-from server.tool_schema import TOOL_CALL_OPEN, ToolPolicy, normalize_tools
+from server.tool_schema import (
+    PARAMETER_CLOSE,
+    TOOL_CALL_OPEN,
+    ToolPolicy,
+    normalize_tools,
+)
 
 SCHEMA = {
     "type": "object",
@@ -40,18 +47,27 @@ def weather_call(city):
     )
 
 
+PARIS, ROME = weather_call("Paris"), weather_call("Rome")
+
+
 def weather_policy():
     return ToolPolicy(
         {"weather": Draft202012Validator(SCHEMA)}, {"weather": SCHEMA}, False, True
     )
 
 
-def character_harness(text, reason="stop"):
-    """A server whose model writes `text`, one character per token."""
+def character_tokenizer(text):
+    """A tokenizer with one token per character of `text`, and the token of
+    each character."""
     tokenizer = FakeTokenizer()
     tokenizer.fragments = dict(enumerate(dict.fromkeys(text), 1))
-    token_ids = {value: key for key, value in tokenizer.fragments.items()}
     tokenizer.backend_tokenizer = _byte_backend(tokenizer.fragments)
+    return tokenizer, {value: key for key, value in tokenizer.fragments.items()}
+
+
+def character_harness(text, reason="stop"):
+    """A server whose model writes `text`, one character per token."""
+    tokenizer, token_ids = character_tokenizer(text)
     return Harness(
         FakeRuntime(Plan([[token_ids[char]] for char in text], reason=reason)),
         tokenizer=tokenizer,
@@ -177,27 +193,6 @@ def messages_output(payload, stream):
         elif event["type"] == "message_delta":
             stop = event["delta"]["stop_reason"]
     return items, stop
-
-
-def project(text, size, incomplete):
-    """Stream `text` in chunks of `size` characters and finish as a request
-    does. Returns the events, with the final flush as content events, and
-    the content and calls of the response."""
-    projector = model_output.StreamingToolCallProjector(weather_policy(), "cut")
-    projected = []
-    for offset in range(0, len(text), size):
-        projected += projector.put(text[offset : offset + size])
-    if incomplete:
-        content, calls = projector.interrupted_result()
-    else:
-        content, calls = model_output.parse_tool_calls(text, "cut", projector.policy)
-    for value in projector.finish(content, calls, incomplete):
-        projected.append(("content", value))
-    return projected, content, calls
-
-
-def streamed_text(projected):
-    return "".join(value for kind, value in projected if kind == "content")
 
 
 def text_runs(projected):
@@ -378,23 +373,89 @@ class PartialToolOutputTests(unittest.TestCase):
                         finally:
                             harness.close()
 
+    def test_newlines_after_think_end_do_not_start_the_answer_in_any_protocol(self):
+        # Models write "\n</think>\n\n" before the answer, as their chat
+        # template lays out a turn. Whether each output thinks, and its text:
+        outputs = (
+            (True, "why\n</think>\n\nHi\n\nyou"),
+            (True, "why\n</think>\n \n\tHi"),
+            (True, "why\n</think>\n\n"),
+            (True, "why\n</think>"),
+            (False, "\n\nHi"),
+        )
+        protocols = {
+            "/v1/chat/completions": chat_output,
+            "/v1/responses": responses_output,
+            "/v1/messages": messages_output,
+        }
+        tokenizer, token_ids = character_tokenizer("".join(t for _, t in outputs))
+        for path, parse in protocols.items():
+            for stream in (False, True):
+                for tools in (False, True):
+                    with self.subTest(path=path, stream=stream, tools=tools):
+                        harness = Harness(
+                            FakeRuntime(
+                                *(
+                                    Plan([[token_ids[char]] for char in text])
+                                    for _, text in outputs
+                                )
+                            ),
+                            tokenizer=tokenizer,
+                            max_context=8192,
+                        )
+                        answers = []
+                        try:
+                            for thinking, _ in outputs:
+                                request = weather_request(path, stream, thinking)
+                                if not tools:
+                                    del request["tools"]
+                                status, _, payload = harness.request(
+                                    "POST", path, request
+                                )
+                                self.assertEqual(status, 200, payload)
+                                answers.append(parse(payload, stream)[0])
+                        finally:
+                            harness.close()
+                        self.assertEqual(
+                            answers[0], [("reasoning", "why\n"), ("text", "Hi\n\nyou")]
+                        )
+                        # Only newlines are dropped.
+                        self.assertEqual(
+                            answers[1], [("reasoning", "why\n"), ("text", " \n\tHi")]
+                        )
+                        # Newlines alone after </think> are no answer.
+                        self.assertEqual(answers[2], answers[3])
+                        # Without thinking, leading newlines are the model's own.
+                        self.assertEqual(answers[4], [("text", "\n\nHi")])
+
+    def test_reasoning_splitter_starts_the_answer_however_the_text_is_cut(self):
+        text = "why\n</think>\n\nHi\n\nyou"
+        for size in range(1, len(text) + 1):
+            with self.subTest(size=size):
+                splitter = model_output.ReasoningSplitter(True)
+                parts = [
+                    part
+                    for offset in range(0, len(text), size)
+                    for part in splitter.put(text[offset : offset + size])
+                ]
+                parts += splitter.finish()
+                self.assertTrue(all(value for _, value in parts), parts)
+                self.assertEqual(
+                    [
+                        "".join(value for kind, value in parts if kind == field)
+                        for field in ("reasoning_content", "content")
+                    ],
+                    ["why\n", "Hi\n\nyou"],
+                )
+
     def test_projector_preserves_whitespace_without_a_tool(self):
         for text in (" \n\t", " \nhello \t\n"):
             for incomplete in (False, True):
-                projector = model_output.StreamingToolCallProjector(None, "whitespace")
-                emitted = []
-                for character in text:
-                    emitted.extend(
-                        value
-                        for kind, value in projector.put(character)
-                        if kind == "content"
-                    )
-                canonical, calls = (
-                    projector.interrupted_result() if incomplete else (text, [])
+                content, calls, projected = project(
+                    text, None, incomplete=incomplete, size=1
                 )
-                emitted.extend(projector.finish(canonical, calls, incomplete))
-                self.assertEqual(canonical, text)
-                self.assertEqual("".join(emitted), text)
+                self.assertEqual((content, calls), (text, []))
+                self.assertEqual(streamed_text(projected), text)
 
     def test_every_json_prefix_can_be_returned_in_tool_history(self):
         objects = [
@@ -428,6 +489,7 @@ class PartialToolOutputTests(unittest.TestCase):
                                 {"role": "user", "content": "Continue"},
                             ],
                             vision=True,
+                            deadline=FOREVER,
                         )
                         actual = normalized[0]["tool_calls"][0]["function"]
                         self.assertEqual(actual["arguments"], arguments)
@@ -557,16 +619,37 @@ class PartialToolOutputTests(unittest.TestCase):
         )
         expected = None
         for size in (1, 3, 17, len(text)):
-            projector = model_output.StreamingToolCallProjector(policy, "owned")
-            for offset in range(0, len(text), size):
-                projector.put(text[offset : offset + size])
-            result = projector.interrupted_result()
+            result = project(text, policy, "owned", incomplete=True, size=size)[:2]
             if expected is None:
                 expected = result
             self.assertEqual(result, expected)
         self.assertEqual(
             [call["function"]["arguments"] for call in expected[1]],
             ['{"city":"Paris"}', '{"city":"Par'],
+        )
+
+    def test_typed_parameter_value_keeps_pending_bounded(self):
+        # A JSON value held whole until its close would be rescanned and
+        # copied by every put, quadratic in its length.
+        schema = {"type": "object", "properties": {"items": {"type": "array"}}}
+        policy = ToolPolicy(
+            {"store": Draft202012Validator(schema)}, {"store": schema}, False, True
+        )
+        items = ["x" * 100] * 2048
+        text = (
+            "<tool_call>\n<function=store>\n<parameter=items>\n"
+            + json.dumps(items)
+            + "\n</parameter>\n</function>\n</tool_call>"
+        )
+        projector = model_output.StreamingToolCallProjector(policy, "typed")
+        projected = []
+        for offset in range(0, len(text), 4):
+            projected += projector.put(text[offset : offset + 4])
+            if projector.state == "parameter_value":
+                self.assertLess(len(projector.pending), len(PARAMETER_CLOSE))
+        self.assertEqual(
+            streamed_arguments(projected),
+            json.dumps({"items": items}, separators=(",", ":")),
         )
 
     def test_closed_calls_still_require_schema_validation_at_length(self):
@@ -600,6 +683,58 @@ class TextAfterToolCallTests(unittest.TestCase):
         " \nalpha \t" + weather_call("Paris") + "\n beta \t\n",
         "answer <" + weather_call("Paris") + "<b> & </tool_ok>",
     ]
+    # Outputs with their content and their runs of text and calls. The
+    # template's whitespace around calls, before the first text or after the
+    # last, is neither streamed nor reported, at a normal finish or a cut.
+    # Between two texts it is their separator and streams with the later
+    # one, and text keeps its own whitespace.
+    WHITESPACE = [
+        (
+            "Text. " + PARIS + "\nMore text.\n" + ROME + "\n",
+            "Text. \nMore text.\n",
+            [
+                ("text", "Text. "),
+                ("call", "weather"),
+                ("text", "\nMore text.\n"),
+                ("call", "weather"),
+            ],
+        ),
+        (
+            "I'll check both.\n\n" + PARIS + "\n" + ROME + "\n",
+            "I'll check both.\n\n",
+            [
+                ("text", "I'll check both.\n\n"),
+                ("call", "weather"),
+                ("call", "weather"),
+            ],
+        ),
+        (
+            " \n" + PARIS + "\n" + ROME + "\nDone.",
+            "\nDone.",
+            [("call", "weather"), ("call", "weather"), ("text", "\nDone.")],
+        ),
+        (
+            "Checking both." + PARIS + "\n" + ROME + "Done.",
+            "Checking both.\nDone.",
+            [
+                ("text", "Checking both."),
+                ("call", "weather"),
+                ("call", "weather"),
+                ("text", "\nDone."),
+            ],
+        ),
+        (
+            "Hi" + PARIS + "\n" + ROME + "\nBye",
+            "Hi\n\nBye",
+            [
+                ("text", "Hi"),
+                ("call", "weather"),
+                ("call", "weather"),
+                ("text", "\n\nBye"),
+            ],
+        ),
+        (PARIS + "\n" + ROME + "\n", "", [("call", "weather")] * 2),
+    ]
 
     def test_text_after_a_call_streams_and_survives_a_cut(self):
         # The reproduction in #231.
@@ -621,22 +756,22 @@ class TextAfterToolCallTests(unittest.TestCase):
             [kind for kind, _ in first], ["content", "tool", "tool", "tool"]
         )
         self.assertEqual(second, [("content", "POST-CALL TEXT THAT SHOULD BE VISIBLE")])
-        content, calls = projector.interrupted_result()
+        content, calls, unsent = projector.finish(True)
         self.assertEqual(
             content, "First message. POST-CALL TEXT THAT SHOULD BE VISIBLE"
         )
         self.assertEqual(len(calls), 1)
-        self.assertEqual(projector.finish(content, calls, True), [])
+        self.assertEqual(unsent, "")
 
     def test_a_cut_reports_the_text_it_streamed_without_markup(self):
         for text in self.OUTPUTS:
             for end in range(len(text) + 1):
                 cut = text[:end]
                 results = set()
-                # One put of the whole cut is how a response that does not
-                # stream projects it.
-                for size in (1, 3, 17, max(end, 1)):
-                    projected, content, calls = project(cut, size, True)
+                for size in (1, 3, 17, None):
+                    content, calls, projected = project(
+                        cut, weather_policy(), incomplete=True, size=size
+                    )
                     with self.subTest(cut=cut, size=size):
                         self.assertEqual(streamed_text(projected), content)
                         self.assertNotIn("<tool_call", content)
@@ -650,80 +785,78 @@ class TextAfterToolCallTests(unittest.TestCase):
                     self.assertEqual(len(results), 1, results)
 
     def test_a_completed_output_streams_its_content(self):
-        for text in self.OUTPUTS:
-            content, _ = model_output.parse_tool_calls(text, "cut", weather_policy())
-            for size in (1, 3, 17, len(text)):
+        for text, content in zip(
+            self.OUTPUTS,
+            [
+                "First message. POST-CALL TEXT THAT SHOULD BE VISIBLE",
+                "Text. \nMore text.\n\nEnd.",
+                "I'll check both.\n\n",
+                "",
+                " \nalpha \t\n beta \t\n",
+                "answer <<b> & </tool_ok>",
+            ],
+            strict=True,
+        ):
+            for size in (1, 3, 17, None):
                 with self.subTest(text=text, size=size):
-                    projected = project(text, size, False)[0]
+                    reported, _, projected = project(text, weather_policy(), size=size)
+                    self.assertEqual(reported, content)
                     self.assertEqual(streamed_text(projected), content)
 
     def test_whitespace_alone_is_text_only_between_texts(self):
-        # The template's whitespace around calls, before the first text or
-        # after the last, is neither streamed nor reported, at a normal
-        # finish or a cut. Between two texts it is their separator and
-        # streams with the later one, and text keeps its own whitespace.
-        paris, rome = weather_call("Paris"), weather_call("Rome")
-        for text, content, runs in (
-            (
-                "Text. " + paris + "\nMore text.\n" + rome + "\n",
-                "Text. \nMore text.\n",
-                [
-                    ("text", "Text. "),
-                    ("call", "weather"),
-                    ("text", "\nMore text.\n"),
-                    ("call", "weather"),
-                ],
-            ),
-            (
-                "I'll check both.\n\n" + paris + "\n" + rome + "\n",
-                "I'll check both.\n\n",
-                [
-                    ("text", "I'll check both.\n\n"),
-                    ("call", "weather"),
-                    ("call", "weather"),
-                ],
-            ),
-            (
-                " \n" + paris + "\n" + rome + "\nDone.",
-                "\nDone.",
-                [("call", "weather"), ("call", "weather"), ("text", "\nDone.")],
-            ),
-            (
-                "Checking both." + paris + "\n" + rome + "Done.",
-                "Checking both.\nDone.",
-                [
-                    ("text", "Checking both."),
-                    ("call", "weather"),
-                    ("call", "weather"),
-                    ("text", "\nDone."),
-                ],
-            ),
-            (
-                "Hi" + paris + "\n" + rome + "\nBye",
-                "Hi\n\nBye",
-                [
-                    ("text", "Hi"),
-                    ("call", "weather"),
-                    ("call", "weather"),
-                    ("text", "\n\nBye"),
-                ],
-            ),
-            (paris + "\n" + rome + "\n", "", [("call", "weather")] * 2),
-        ):
+        for text, content, runs in self.WHITESPACE:
             for incomplete in (False, True):
-                for size in (1, 3, len(text)):
+                for size in (1, 3, None):
                     with self.subTest(text=text, incomplete=incomplete, size=size):
-                        projected, reported, _ = project(text, size, incomplete)
+                        reported, _, projected = project(
+                            text, weather_policy(), incomplete=incomplete, size=size
+                        )
                         self.assertEqual(text_runs(projected), runs)
                         self.assertEqual(reported, content)
+
+    def test_non_streaming_tool_output_uses_the_streaming_projector(self):
+        def joined(items):
+            text = "".join(value for kind, value in items if kind == "text")
+            return text, [value for kind, value in items if kind == "call"]
+
+        for text, _, _ in self.WHITESPACE:
+            outputs = []
+            for stream in (False, True):
+                with self.subTest(text=text, stream=stream):
+                    status, payload = respond(
+                        "/v1/chat/completions", text, stream, False
+                    )
+                    self.assertEqual(status, 200, payload)
+                    outputs.append(joined(chat_output(payload, stream)[0]))
+            with self.subTest(text=text):
+                self.assertEqual(outputs[0], outputs[1])
+        # The model writes a call without its required argument, then text
+        # after a pause. The projector checks the call as it is read, so the
+        # request fails and cancels the model while it is still writing.
+        parts = "<tool_call>\n<function=weather>\n</function>\n</tool_call>", "Done."
+        tokenizer, token_ids = character_tokenizer("".join(parts))
+        plan = Plan([[token_ids[char] for char in part] for part in parts], delay=1)
+        harness = Harness(FakeRuntime(plan), tokenizer=tokenizer, max_context=8192)
+        try:
+            status, _, payload = harness.request(
+                "POST",
+                "/v1/chat/completions",
+                weather_request("/v1/chat/completions", False, False),
+            )
+            self.assertTrue(plan.cancelled.is_set())
+        finally:
+            harness.close()
+        self.assertEqual(status, 500, payload)
+        self.assertEqual(json.loads(payload)["error"]["code"], "invalid_model_output")
 
     def test_whitespace_around_parallel_calls_in_every_protocol(self):
         # After a preface and parallel calls, the newlines between and after
         # the calls are not text. With text after the calls as well, the
-        # newline between them separates the two texts.
+        # newline between them separates the two texts. Only a complete chat
+        # message joins its text ahead of its calls.
         paris, rome = weather_call("Paris"), weather_call("Rome")
         calls = [("call", '{"city":"Paris"}'), ("call", '{"city":"Rome"}')]
-        for text, complete, streamed in (
+        for text, joined, ordered in (
             (
                 "I'll check both.\n\n" + paris + "\n" + rome + "\n",
                 [("text", "I'll check both.\n\n")] + calls,
@@ -745,7 +878,8 @@ class TextAfterToolCallTests(unittest.TestCase):
                         status, payload = respond(path, text, stream, False)
                         self.assertEqual(status, 200, payload)
                         items, _ = output(payload, stream)
-                        self.assertEqual(items, streamed if stream else complete)
+                        chat = path == "/v1/chat/completions" and not stream
+                        self.assertEqual(items, joined if chat else ordered)
 
     def check_cut_after_text_following_a_call(self, path, output, complete, finish):
         # The model writes text, a call and more text, and the token limit
@@ -792,21 +926,80 @@ class TextAfterToolCallTests(unittest.TestCase):
             "/v1/responses",
             responses_output,
             [
-                ("text", "First message. \nPost-call text.\n"),
+                ("text", "First message. "),
                 ("call", '{"city":"Paris"}'),
+                ("text", "\nPost-call text.\n"),
                 ("call", '{"city":"Ro'),
             ],
             "incomplete",
         )
 
     def test_messages_keep_text_after_a_call_at_max_tokens(self):
-        # A message leaves out the unfinished call's partial input.
+        # A complete message leaves out the unfinished call's partial input.
         self.check_cut_after_text_following_a_call(
             "/v1/messages",
             messages_output,
             [
-                ("text", "First message. \nPost-call text.\n"),
+                ("text", "First message. "),
                 ("call", '{"city":"Paris"}'),
+                ("text", "\nPost-call text.\n"),
             ],
             "max_tokens",
         )
+
+    def test_responses_stored_object_is_the_same_streamed_or_not(self):
+        # Items closed before the cut are complete in both modes; only the
+        # call the token limit cut is incomplete.
+        text = (
+            "First message. "
+            + PARIS
+            + "\nPost-call text.\n"
+            + "<tool_call>\n<function=weather>\n<parameter=city>\nRo"
+        )
+        stored = []
+        for stream in (False, True):
+            harness = character_harness(text, "length")
+            try:
+                status, _, payload = harness.request(
+                    "POST",
+                    "/v1/responses",
+                    weather_request("/v1/responses", stream, False),
+                )
+                self.assertEqual(status, 200, payload)
+                response = (
+                    events(payload)[-1]["response"] if stream else json.loads(payload)
+                )
+                status, _, payload = harness.request(
+                    "GET", "/v1/responses/" + response["id"]
+                )
+                self.assertEqual(status, 200, payload)
+            finally:
+                harness.close()
+            public_id = response["id"].removeprefix("resp_")
+            stored.append(
+                json.loads(payload.decode().replace(public_id, "id"))["output"]
+            )
+        self.assertEqual(stored[0], stored[1])
+        self.assertEqual(
+            [(item["type"], item["status"]) for item in stored[0]],
+            [
+                ("message", "completed"),
+                ("function_call", "completed"),
+                ("message", "completed"),
+                ("function_call", "incomplete"),
+            ],
+        )
+
+    def test_thinking_only_output_ends_with_an_empty_text_block_in_both_modes(self):
+        for path, output in (
+            ("/v1/responses", responses_output),
+            ("/v1/messages", messages_output),
+        ):
+            for stream in (False, True):
+                with self.subTest(path=path, stream=stream):
+                    status, payload = respond(path, "Reasoning.</think>", stream, True)
+                    self.assertEqual(status, 200, payload)
+                    self.assertEqual(
+                        output(payload, stream)[0],
+                        [("reasoning", "Reasoning."), ("text", "")],
+                    )

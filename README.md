@@ -89,13 +89,14 @@ window. To set your own limits or cache options, add these to `splash serve`:
 | `--max-memory 28G` | Cap Metal memory use. |
 | `--max-context 100K` | Set the context limit. |
 | `--language-only` | Skip vision; serve text only. |
+| `--offline` | Start the installed model without contacting Hugging Face. |
 | `--kv-format bf16` | Use BF16 KV cache. Default: 8-bit (INT8). |
 | `--max-cache-disk 16G` | Offload KV cache and GDN states to SSD as needed. Off by default. |
 
 On a Mac you also use for other work, `--max-memory` leaves room for other
 applications.
 The server listens on localhost without authentication by default. For LAN
-access, authentication, and other options, see
+access, authentication, browser apps on other origins, and other options, see
 [server configuration](DEVELOPMENT.md#server-configuration) or
 `splash serve --help`.
 [KV precision](DEVELOPMENT.md#kv-cache-precision) ·

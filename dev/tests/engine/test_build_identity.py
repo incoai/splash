@@ -334,20 +334,23 @@ class CompileConfigurationTests(unittest.TestCase):
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(build_identity.ROOT / relative, destination)
             kernel_root = Path("runtime/metal/kernels")
-            q8_sources = [
+            paged_sources = [
                 kernel_root / phase / name
                 for phase in ("prefill", "decode")
-                for name in ("attention_q8.metal", "attention_q8_store.metal")
+                for name in ("paged_attention.metal", "paged_attention_store.metal")
             ]
+            # Every test library a MetalBackend loads links the kernel that
+            # ends residency; q8-attention.metallib is loaded by raw MTLDevice
+            # tests.
+            residency_source = kernel_root / "shared/residency.metal"
             removed_source = kernel_root / "shared/removed.metal"
             removed_header = kernel_root / "common/removed.h"
             for relative in (
-                *q8_sources,
+                *paged_sources,
+                residency_source,
                 removed_source,
                 removed_header,
-                Path("runtime/metal/abi/ExecutionGeometry.h"),
                 Path("runtime/engine/Status.cpp"),
-                Path("dev/tests/engine/q8_page_format_oracle.metal"),
                 Path("dev/tests/engine/metal_backend_test.metal"),
             ):
                 path = root / relative
@@ -371,7 +374,7 @@ class CompileConfigurationTests(unittest.TestCase):
                     / "metal"
                     / source.relative_to(kernel_root).with_suffix(".air")
                 )
-                for source in (*q8_sources, removed_source)
+                for source in (*paged_sources, residency_source, removed_source)
             }
             test_airs = {
                 str(
@@ -379,8 +382,9 @@ class CompileConfigurationTests(unittest.TestCase):
                     / "engine-tests/kernels"
                     / source.relative_to(kernel_root).with_suffix(".air")
                 )
-                for source in q8_sources
+                for source in paged_sources
             }
+            residency_air = str(build / "engine-tests/kernels/shared/residency.air")
 
             def rebuild(*selected):
                 before = log.read_text().splitlines() if log.exists() else []
@@ -410,12 +414,13 @@ class CompileConfigurationTests(unittest.TestCase):
             # library current, even with identical output timestamps.
             self.assertEqual(self.query(*options, library), 1)
             self.assertEqual(rebuild(library), production_airs | {library})
-            self.assertEqual(rebuild(native, unrelated), set())
+            self.assertEqual(rebuild(native, unrelated), {residency_air})
 
             (root / removed_header).write_text("// fixture\n")
             self.assertEqual(rebuild(library), production_airs | {library})
             self.assertEqual(self.query(*options, attention), 1)
             self.assertEqual(rebuild(attention), test_airs | {attention})
+            self.assertEqual(rebuild(native, unrelated), {residency_air})
             self.assertEqual(self.query(*options, *targets), 0)
             self.assertEqual(rebuild(*targets), set())
 

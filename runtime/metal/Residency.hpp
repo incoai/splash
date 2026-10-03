@@ -8,28 +8,35 @@
 #include <chrono>
 #include <cstdint>
 #include <mutex>
+#include <string_view>
 
 namespace splash::metal {
 
-// Holds the buffers of one residency set wired between the commands of a
-// command queue. Metal wires them while a command runs and lets them go a few
-// seconds later, and one request holds them only about two seconds, so a
-// heartbeat requests residency every 500 ms. After keepAlive without a command
+// Holds every buffer of a backend in one residency set, wired between the
+// commands of its command queue. Metal wires them while a command runs and
+// lets them go a few seconds later, and one request holds them only about two
+// seconds, so a heartbeat requests residency every 500 ms. After keepAlive without a command
 // it ends residency, which Metal applies at its next GPU operation on any
-// queue: a one-byte blit on a queue of its own, as the runtime keeps exactly
-// one command in flight on the command queue. The set is used only on the
-// heartbeat's serial queue.
+// queue: one dispatch of the kick kernel, whose pipeline the backend builds
+// with its library, on a queue of its own, as the runtime keeps exactly one
+// command in flight on the command queue. Destruction ends residency without
+// GPU work: a backend being torn down must not start any. The set is used
+// only on the heartbeat's serial queue.
 class Residency final {
 public:
+  // A one-thread kernel that writes one word of its buffer 0
+  // (kernels/shared/residency.metal).
+  static constexpr std::string_view kKickPipeline = "residency_kick";
+
   Residency(id<MTLDevice> device, id<MTLCommandQueue> commands,
-            double keepAliveSeconds)
-      : commands_(commands), keepAlive_(keepAliveSeconds) {
+            id<MTLComputePipelineState> kick, double keepAliveSeconds)
+      : commands_(commands), kick_(kick), keepAlive_(keepAliveSeconds) {
     set_ = [device newResidencySetWithDescriptor:[MTLResidencySetDescriptor new]
                                            error:nil];
-    releaseQueue_ = [device newCommandQueue];
-    releaseTarget_ = [device newBufferWithLength:1
-                                         options:MTLResourceStorageModePrivate];
-    if (!set_ || !releaseQueue_ || !releaseTarget_)
+    kickQueue_ = [device newCommandQueue];
+    kickTarget_ = [device newBufferWithLength:sizeof(uint32_t)
+                                      options:MTLResourceStorageModePrivate];
+    if (!set_ || !kickQueue_ || !kickTarget_)
       throw MetalBackendError("unable to create the Metal residency set");
     [commands_ addResidencySet:set_];
     queue_ = dispatch_queue_create(
@@ -44,29 +51,26 @@ public:
   ~Residency() {
     dispatch_source_cancel(heartbeat_);
     // Runs after any beat or request already queued: they use this object.
+    // Metal applies the end at the process's next GPU operation, or frees
+    // the set at exit.
     dispatch_sync(queue_, ^{
-      @autoreleasepool {
-        [commands_ removeResidencySet:set_];
-        std::lock_guard lock(mutex_);
-        if (held_) release();
-      }
+      [commands_ removeResidencySet:set_];
+      std::lock_guard lock(mutex_);
+      if (held_) [set_ endResidency];
     });
   }
 
   Residency(const Residency &) = delete;
   Residency &operator=(const Residency &) = delete;
 
-  // Wires the buffer before returning and restarts the keep-alive.
+  // Adds the buffer to the set and restarts the keep-alive: a held set wires
+  // it at the commit, and a lapsed one is requested again off the caller's
+  // thread (use()).
   void add(id<MTLBuffer> buffer) {
     dispatch_sync(queue_, ^{
       [set_ addAllocation:buffer];
       [set_ commit];
-      [set_ requestResidency];
     });
-    {
-      std::lock_guard lock(mutex_);
-      bytes_ += buffer.allocatedSize;
-    }
     use();
   }
 
@@ -75,8 +79,6 @@ public:
       [set_ removeAllocation:buffer];
       [set_ commit];
     });
-    std::lock_guard lock(mutex_);
-    bytes_ -= buffer.allocatedSize;
   }
 
   // Marks a command. A lapsed set is requested again at once, off the
@@ -85,7 +87,7 @@ public:
     {
       std::lock_guard lock(mutex_);
       lastUse_ = std::chrono::steady_clock::now();
-      if (held_ || !bytes_) return;
+      if (held_) return;
       held_ = true;
     }
     dispatch_async(queue_, ^{
@@ -93,12 +95,6 @@ public:
       dispatch_source_set_timer(heartbeat_, dispatch_time(DISPATCH_TIME_NOW, kBeat),
                                 kBeat, kBeat / 10);
     });
-  }
-
-  // The bytes of the set while it is not held.
-  [[nodiscard]] uint64_t lapsedBytes() const {
-    std::lock_guard lock(mutex_);
-    return held_ ? 0 : bytes_;
   }
 
 private:
@@ -116,29 +112,32 @@ private:
       return;
     }
     dispatch_source_set_timer(heartbeat_, DISPATCH_TIME_FOREVER, 0, 0);
-    release();
+    [set_ endResidency];
+    kickResidencyEnd();
   }
 
-  void release() {
-    [set_ endResidency];
-    id<MTLCommandBuffer> command = [releaseQueue_ commandBuffer];
-    id<MTLBlitCommandEncoder> blit = [command blitCommandEncoder];
-    [blit fillBuffer:releaseTarget_ range:NSMakeRange(0, 1) value:0];
-    [blit endEncoding];
+  void kickResidencyEnd() {
+    id<MTLCommandBuffer> command = [kickQueue_ commandBuffer];
+    id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+    [encoder setComputePipelineState:kick_];
+    [encoder setBuffer:kickTarget_ offset:0 atIndex:0];
+    [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+    [encoder endEncoding];
     [command commit];
   }
 
   __strong id<MTLCommandQueue> commands_ = nil;
+  __strong id<MTLComputePipelineState> kick_ = nil;
   __strong id<MTLResidencySet> set_ = nil;
-  __strong id<MTLCommandQueue> releaseQueue_ = nil;
-  __strong id<MTLBuffer> releaseTarget_ = nil;
+  __strong id<MTLCommandQueue> kickQueue_ = nil;
+  __strong id<MTLBuffer> kickTarget_ = nil;
   __strong dispatch_queue_t queue_ = nil;
   __strong dispatch_source_t heartbeat_ = nil;
   const std::chrono::duration<double> keepAlive_;
-  mutable std::mutex mutex_;
+  std::mutex mutex_;
   std::chrono::steady_clock::time_point lastUse_;
   bool held_ = false;
-  uint64_t bytes_ = 0;
 };
 
 } // namespace splash::metal

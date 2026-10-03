@@ -128,6 +128,12 @@ measured the following medians of phase medians:
 | 3 | 45.005 | 44.890 | +0.26% |
 | 4 | 50.105 | 49.840 | +0.53% |
 
+Host work between decode commands (graph build, submission, completion,
+scheduling) does not show in GPU timings or in `metrics.decode_wall_ms`, which
+starts at submission. Judge changes to it by `metrics.decode_cycle_ms` of
+`/status`, which the HTTP ABBA decode verdict uses, or by decode-profile's
+wall minus fused GPU time.
+
 The M5 20-core machine has kernel/policy validation and microbenchmarks here;
 this table does not imply an end-to-end serving run on that machine. No new
 comparison against MLX Serve or Ollama was performed.

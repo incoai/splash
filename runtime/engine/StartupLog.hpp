@@ -10,7 +10,7 @@
 namespace splash::engine {
 
 template <typename... Parts>
-void logKernelStartup(const Parts &...parts) noexcept {
+void logStartup(const Parts &...parts) noexcept {
   try {
     std::ostringstream text;
     (text << ... << parts);

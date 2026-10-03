@@ -10,12 +10,36 @@ from pathlib import Path
 from unittest import mock
 
 from dev.tests import agent_real as agent
+from server import serve_options
 
 MODEL_IDS = (
     "incoai/Qwen3.8-27B-Splash",
     "incoai/Qwen3.6-35B-A3B-Splash",
     "community/custom-splash",
 )
+
+
+def idle(
+    submitted=0,
+    completed=0,
+    cancelled=0,
+    failed=0,
+    reused=0,
+    prefill=0,
+    in_use_evictions=0,
+):
+    """An idle status with these request, cache, state and metric counters."""
+    return {
+        "requests": {
+            "submitted": submitted,
+            "completed": completed,
+            "cancelled": cancelled,
+            "failed": failed,
+        },
+        "cache": {"reused_tokens": reused, "lost_state_misses": 0},
+        "state": {"in_use_evictions": in_use_evictions},
+        "metrics": {"prefill_input_tokens": prefill},
+    }
 
 
 class AgentRunnerTests(unittest.TestCase):
@@ -137,14 +161,15 @@ class AgentRunnerTests(unittest.TestCase):
     def test_server_configuration_rejects_wrong_model_context_or_build(self):
         identity = "src-" + "a" * 64
         context = 102400
-        initial = {
-            "maximum_context_tokens": context,
-            "identity": {"cache": {"build_id": identity}},
-        }
         for selected in MODEL_IDS:
             with self.subTest(model=selected):
+                initial = {
+                    "instance": {"model": selected},
+                    "maximum_context_tokens": context,
+                    "identity": {"cache": {"build_id": identity}},
+                }
                 agent.validate_server_configuration(
-                    initial, selected, selected, context, identity
+                    initial, selected, context, identity
                 )
                 other = next(value for value in MODEL_IDS if value != selected)
                 for model, expected_context, expected_identity in (
@@ -154,16 +179,14 @@ class AgentRunnerTests(unittest.TestCase):
                 ):
                     with self.assertRaises(agent.AgentFailure):
                         agent.validate_server_configuration(
-                            initial,
-                            model,
-                            selected,
-                            expected_context,
-                            expected_identity,
+                            initial, model, expected_context, expected_identity
                         )
                 with self.assertRaisesRegex(agent.AgentFailure, "native build"):
                     agent.validate_server_configuration(
-                        {"maximum_context_tokens": context},
-                        selected,
+                        {
+                            "instance": {"model": selected},
+                            "maximum_context_tokens": context,
+                        },
                         selected,
                         context,
                         identity,
@@ -196,9 +219,13 @@ class AgentRunnerTests(unittest.TestCase):
         model = "incoai/Qwen3.8-27B-Splash"
         identity = "src-" + "a" * 64
         initial = {
-            "maximum_context_tokens": agent.launcher._parse_max_context("100K"),
+            "instance": {"model": model},
+            "maximum_context_tokens": serve_options.parse_max_context("100K"),
             "identity": {"cache": {"build_id": "src-" + "b" * 64}},
         }
+        # An announced alias leads /v1/models while the loaded model matches,
+        # so only the build is rejected.
+        served = {"data": [{"id": "local"}, {"id": model}]}
         with tempfile.TemporaryDirectory() as directory:
             with (
                 mock.patch.object(
@@ -213,7 +240,7 @@ class AgentRunnerTests(unittest.TestCase):
                 mock.patch.object(
                     agent.launcher,
                     "_request_json",
-                    side_effect=[initial, {"data": [{"id": model}]}],
+                    side_effect=[initial, served],
                 ),
                 mock.patch.object(agent, "idle_status", return_value=initial),
                 mock.patch.object(agent.subprocess, "Popen") as start,
@@ -298,22 +325,8 @@ class AgentRunnerTests(unittest.TestCase):
                 process.poll.return_value = (
                     None if mode in ("monitor_error", "interrupt") else 0
                 )
-                before = {
-                    "requests": {
-                        "submitted": 0,
-                        "completed": 0,
-                        "cancelled": 0,
-                        "failed": 0,
-                    }
-                }
-                after = {
-                    "requests": {
-                        "submitted": 2,
-                        "completed": 1,
-                        "cancelled": 1,
-                        "failed": 0,
-                    }
-                }
+                before = idle()
+                after = idle(submitted=2, completed=1, cancelled=1)
 
                 # OpenCode's record of the turn: stopped, unless incomplete.
                 record = {
@@ -371,7 +384,6 @@ class AgentRunnerTests(unittest.TestCase):
                 "content": [{"type": "text", "text": "Done"}],
             },
         }
-        idle = {"submitted": 0, "completed": 0, "cancelled": 0, "failed": 0}
         for finished in (True, False):
             with (
                 self.subTest(finished=finished),
@@ -395,10 +407,7 @@ class AgentRunnerTests(unittest.TestCase):
                     mock.patch.object(
                         agent,
                         "idle_status",
-                        side_effect=[
-                            {"requests": idle},
-                            {"requests": {**idle, "submitted": 1, "completed": 1}},
-                        ],
+                        side_effect=[idle(), idle(submitted=1, completed=1)],
                     ),
                     mock.patch.object(agent.subprocess, "Popen", side_effect=launch),
                     mock.patch.object(agent, "stop_process"),
@@ -414,6 +423,108 @@ class AgentRunnerTests(unittest.TestCase):
                         ):
                             runner.phase("test", "task")
                 self.assertEqual(runner.session, "pi-session")
+
+    def test_phase_requires_prefix_reuse_across_requests(self):
+        # Requests after a phase's first resend the conversation: with no
+        # prompt token reused, its replay points stopped working. Evicting a
+        # replay point an unfinished request holds is recorded, not gated.
+        for completed, reused, evictions, error in (
+            (3, 0, 0, "phase reused no cached prompt tokens across 3 requests"),
+            (3, 64, 0, None),
+            (1, 0, 0, None),
+            (3, 64, 2, None),
+        ):
+            with (
+                self.subTest(completed=completed, reused=reused, evictions=evictions),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                runner = agent.ClientRun.__new__(agent.ClientRun)
+                runner.name, runner.session = "codex", None
+                runner.folder = runner.workspace = Path(directory)
+                runner.timeout, runner.phases = 10, []
+                process = mock.Mock(returncode=0)
+                process.poll.return_value = 0
+
+                def launch(*args, **kwargs):
+                    for event in (
+                        {"type": "thread.started", "thread_id": "thread"},
+                        {"type": "turn.completed"},
+                    ):
+                        kwargs["stdout"].write(json.dumps(event) + "\n")
+                    return process
+
+                after = idle(
+                    submitted=completed,
+                    completed=completed,
+                    reused=reused,
+                    prefill=500,
+                    in_use_evictions=evictions,
+                )
+                output = io.StringIO()
+                with (
+                    mock.patch.object(runner, "argv", return_value=(["codex"], {})),
+                    mock.patch.object(
+                        agent, "idle_status", side_effect=[idle(prefill=100), after]
+                    ),
+                    mock.patch.object(agent.subprocess, "Popen", side_effect=launch),
+                    mock.patch.object(agent, "stop_process"),
+                    mock.patch.object(
+                        agent, "memory_sample", return_value={"pressure": 1}
+                    ),
+                    contextlib.redirect_stdout(output),
+                ):
+                    if error is None:
+                        runner.phase("test", "task")
+                    else:
+                        with self.assertRaisesRegex(agent.AgentFailure, error):
+                            runner.phase("test", "task")
+                self.assertEqual(
+                    runner.phases[0]["reuse"],
+                    {
+                        "reused_tokens": reused,
+                        "prefill_input_tokens": 400,
+                        "lost_state_misses": 0,
+                        "in_use_evictions": evictions,
+                        "completed": completed,
+                    },
+                )
+                self.assertEqual(
+                    "codex/test: warning: 2 replay points" in output.getvalue(),
+                    bool(evictions),
+                )
+
+    def test_only_the_wave_that_compacts_may_reuse_no_cached_prompt(self):
+        # Its summary request and the request after it share only the system
+        # prompt and tools; any other reference wave resends the conversation.
+        for compactions, error in (
+            ([[], []], "phase reused no cached prompt tokens across 2 requests"),
+            ([[], [{"auto": True}]], None),
+        ):
+            with (
+                self.subTest(compacts=bool(compactions[-1])),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                runner = agent.ClientRun.__new__(agent.ClientRun)
+                runner.folder, runner.phases = Path(directory), []
+
+                def phase(label, prompt, cancel=False, may_compact=False):
+                    runner.phases.append(
+                        {"phase": label, "reuse": {"completed": 2, "reused_tokens": 0}}
+                    )
+
+                with (
+                    mock.patch.object(runner, "compaction", side_effect=compactions),
+                    mock.patch.object(runner, "phase", side_effect=phase) as waves,
+                    mock.patch.object(
+                        runner, "check_artifact", return_value={"oracle": "pass"}
+                    ),
+                ):
+                    if error is None:
+                        runner.finish("BATCH_ID", [])
+                    else:
+                        with self.assertRaisesRegex(agent.AgentFailure, error):
+                            runner.finish("BATCH_ID", [])
+                self.assertEqual(waves.call_args_list[0].kwargs, {"may_compact": True})
 
     def test_hermes_runs_in_its_own_profile_of_the_developers_root(self):
         # A root of its own would be the bug the launcher avoids: Hermes would
@@ -457,7 +568,6 @@ class AgentRunnerTests(unittest.TestCase):
     def test_hermes_phase_without_a_session_record_reports_the_exit(self):
         # Hermes creates state.db with its first session; its absence is not
         # a sqlite error.
-        idle = {"submitted": 0, "completed": 0, "cancelled": 0, "failed": 0}
         for code in (1, 0):
             with (
                 self.subTest(exit_code=code),
@@ -473,9 +583,7 @@ class AgentRunnerTests(unittest.TestCase):
                 with (
                     mock.patch.object(runner, "argv", return_value=(["hermes"], {})),
                     mock.patch.object(
-                        agent,
-                        "idle_status",
-                        side_effect=[{"requests": idle}, {"requests": idle}],
+                        agent, "idle_status", side_effect=[idle(), idle()]
                     ),
                     mock.patch.object(agent.subprocess, "Popen", return_value=process),
                     mock.patch.object(agent, "stop_process"),
@@ -932,7 +1040,6 @@ class AgentRunnerTests(unittest.TestCase):
             "status": "completed",
         }
         earlier = turn(answer("Done"))
-        idle = {"submitted": 0, "completed": 0, "cancelled": 0, "failed": 0}
         for history, error in (
             ({"messages": [*earlier, *turn(compaction, answer("Again"))]}, None),
             # The prompt never reached OpenCode: the session's last turn is
@@ -962,10 +1069,7 @@ class AgentRunnerTests(unittest.TestCase):
                     mock.patch.object(
                         agent,
                         "idle_status",
-                        side_effect=[
-                            {"requests": idle},
-                            {"requests": {**idle, "submitted": 1, "completed": 1}},
-                        ],
+                        side_effect=[idle(), idle(submitted=1, completed=1)],
                     ),
                     mock.patch.object(agent.subprocess, "Popen", return_value=process),
                     mock.patch.object(agent, "stop_process"),
@@ -1168,7 +1272,8 @@ class AgentRunnerTests(unittest.TestCase):
         model = "incoai/Qwen3.8-27B-Splash"
         identity = "src-" + "a" * 64
         initial = {
-            "maximum_context_tokens": agent.launcher._parse_max_context("100K"),
+            "instance": {"model": model},
+            "maximum_context_tokens": serve_options.parse_max_context("100K"),
             "identity": {"cache": {"build_id": identity}},
         }
         served = {"data": [{"id": model, "input_modalities": ["text"]}]}

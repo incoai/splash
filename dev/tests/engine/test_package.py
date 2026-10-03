@@ -63,7 +63,7 @@ class PackageTests(unittest.TestCase):
                     mock.patch("sys.stdout"),
                 ):
                     package.main(["--version", version, "--macos-min", "26.4"])
-                self.assertEqual(run.call_count, 3)
+                self.assertEqual(run.call_count, 4)
                 with tarfile.open(
                     root / f"dist/splash-{version}-arm64-macos26.tar.gz"
                 ) as archive:
@@ -99,6 +99,7 @@ class PackageTests(unittest.TestCase):
                 "models",
                 "_splash",
                 "splash.bash",
+                "splash.fish",
                 "official-models.txt",
                 "suggested-models.txt",
             }
@@ -257,6 +258,7 @@ puts SplashMacOSRequirement.check
             completion_entries = (
                 ("share/zsh/site-functions/_splash", "_splash"),
                 ("etc/bash_completion.d/splash", "splash.bash"),
+                ("share/fish/vendor_completions.d/splash.fish", "splash.fish"),
             )
             old_assets = previous / "libexec/install/completions"
             old_assets.mkdir(parents=True)
@@ -275,7 +277,12 @@ puts SplashMacOSRequirement.check
             source = root / "source"
             assets = source / "install/completions"
             assets.mkdir(parents=True)
-            for name in ("_splash", "splash.bash", "official-models.txt"):
+            for name in (
+                "_splash",
+                "splash.bash",
+                "splash.fish",
+                "official-models.txt",
+            ):
                 (assets / name).write_text(f"fixture {name}\n")
             (assets / "models").write_text("#!/bin/sh\nprintf '%s\\n' new/model\n")
             (assets / "models").chmod(0o755)
@@ -318,7 +325,7 @@ class Formula
   [:desc, :homepage, :url, :version, :sha256, :license, :depends_on, :test].each do |name|
     define_singleton_method(name) { |*args, &block| }
   end
-  attr_reader :libexec, :opt_libexec, :bin, :zsh_completion, :bash_completion
+  attr_reader :libexec, :opt_libexec, :bin, :zsh_completion, :bash_completion, :fish_completion
   def initialize(prefix, opt)
     @libexec = prefix/"libexec"
     @opt_libexec = opt/"libexec"
@@ -326,6 +333,7 @@ class Formula
     @bin.mkpath
     @zsh_completion = prefix/"share/zsh/site-functions"
     @bash_completion = prefix/"etc/bash_completion.d"
+    @fish_completion = prefix/"share/fish/vendor_completions.d"
   end
   def chmod(mode, path); File.chmod(mode, path); end
   def odie(message); raise message; end
@@ -377,7 +385,12 @@ class InstallerTests(unittest.TestCase):
         self.app = self.root / "home/Library/Application Support/Splash/app"
         self.command = self.bin / "splash"
 
-    def publish(self, version, help_status=0, completions=True):
+    def publish(
+        self,
+        version,
+        help_status=0,
+        completions=("splash.bash", "_splash", "splash.fish"),
+    ):
         name = f"splash-{version}-arm64-macos26"
         staging = self.root / "staging"
         release = staging / name
@@ -395,7 +408,7 @@ class InstallerTests(unittest.TestCase):
         if completions:
             assets = release / "install/completions"
             assets.mkdir()
-            for asset in ("splash.bash", "_splash"):
+            for asset in completions:
                 (assets / asset).write_text(
                     f"SPLASH_COMPLETION_TEST_VERSION='{version}'\n"
                 )
@@ -471,6 +484,10 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(self.completion_version(), "1.0")
         self.assertIn(
             'source "$HOME/Library/Application Support/Splash/app/current/install/completions/splash.bash"',
+            first.stdout,
+        )
+        self.assertIn(
+            'source "$HOME/Library/Application Support/Splash/app/current/install/completions/splash.fish"',
             first.stdout,
         )
         self.assertIn("Zsh needs compinit initialized", first.stdout)
@@ -553,11 +570,19 @@ class InstallerTests(unittest.TestCase):
     def test_older_release_without_completions_does_not_print_a_broken_source_command(
         self,
     ):
-        self.publish("1.0", completions=False)
+        self.publish("1.0", completions=())
         result = self.install()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("source ", result.stdout)
         self.assertEqual(self.current(), "splash-1.0-arm64-macos26")
+
+    def test_release_without_fish_completion_still_offers_bash_and_zsh(self):
+        self.publish("1.0", completions=("splash.bash", "_splash"))
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("completions/splash.bash", result.stdout)
+        self.assertIn("completions/_splash", result.stdout)
+        self.assertNotIn("splash.fish", result.stdout)
 
     def test_failed_same_version_check_preserves_absolute_and_relative_current(self):
         self.publish("1.0")

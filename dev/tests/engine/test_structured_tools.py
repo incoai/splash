@@ -7,6 +7,7 @@ from llguidance import LLMatcher, LLTokenizer
 from tokenizers import Regex, Tokenizer, decoders, models, pre_tokenizers
 
 from dev.tests.test_server import _byte_alphabet
+from dev.tests.tool_output import argument_grammar, put, streamed_text
 from server import output as model_output
 from server import server as api
 from server import tool_schema
@@ -346,8 +347,8 @@ class StructuredToolGrammarTest(unittest.TestCase):
         array = json.loads(json.dumps(scalar))
         array["properties"]["query"]["type"] = ["string"]
         self.assertEqual(
-            tool_schema._tool_arguments_grammar(scalar),
-            tool_schema._tool_arguments_grammar(array),
+            argument_grammar(scalar),
+            argument_grammar(array),
         )
 
     def test_json_strings_can_contain_tool_delimiter_bytes(self):
@@ -401,43 +402,47 @@ class StructuredToolProjectionTest(unittest.TestCase):
             response_validator=validator,
         )
 
-    def finalize(self, text, job, incomplete=False):
-        return api.FrontendHandler._finalize_content(None, text, job, True, incomplete)
+    def finalize(self, text, job, incomplete=False, size=None):
+        """Project `text` as a request does, whole or in chunks of `size`
+        characters, and finalize it. Returns the content, the calls and the
+        text the stream sends, the finish's unsent text included."""
+        projector = model_output.StreamingToolCallProjector(
+            job.tool_policy, job.public_id, True
+        )
+        events = put(projector, text, size)
+        content, calls, unsent = api.FrontendHandler._finalize_content(
+            None, "", job, incomplete, projector
+        )
+        return content, calls, streamed_text(events) + unsent
 
     def test_json_tool_spellings_stream_as_text_at_every_split(self):
         text = json.dumps({"answer": 42, "marker": CALL})
         job = self.job()
-        content, calls = self.finalize(text, job)
-        self.assertEqual((content, calls), (text, []))
+        self.assertEqual(self.finalize(text, job), (text, [], text))
         for split in range(len(text) + 1):
             with self.subTest(split=split):
                 projector = model_output.StreamingToolCallProjector(
                     job.tool_policy, job.public_id, True
                 )
                 events = projector.put(text[:split]) + projector.put(text[split:])
-                tail = projector.finish(content, calls, False)
+                content, calls, unsent = projector.finish(False)
+                self.assertEqual((content, calls), (text, []))
                 self.assertTrue(all(kind == "content" for kind, _ in events))
-                self.assertEqual(
-                    "".join(value for _, value in events) + "".join(tail), text
-                )
+                self.assertEqual(streamed_text(events) + unsent, text)
 
     def test_partial_json_is_preserved_and_partial_tool_is_not_completed(self):
         job = self.job()
         partial_json = '{"answer":42,"marker":"<tool_call>'
-        self.assertEqual(self.finalize(partial_json, job, True), (partial_json, []))
-        self.assertEqual(self.finalize(" \n" + CALL[:20], job, True), (" \n", []))
-        for text in (partial_json, " \n" + CALL[:20], " "):
-            with self.subTest(text=text):
-                canonical, calls = self.finalize(text, job, True)
-                projector = model_output.StreamingToolCallProjector(
-                    job.tool_policy, job.public_id, True
-                )
-                events = []
-                for char in text:
-                    events.extend(projector.put(char))
-                tail = projector.finish(canonical, calls, True)
-                content = "".join(value for kind, value in events if kind == "content")
-                self.assertEqual(content + "".join(tail), canonical)
+        for text, content in (
+            (partial_json, partial_json),
+            (" \n" + CALL[:20], " \n"),
+            (" ", " "),
+        ):
+            for size in (1, None):
+                with self.subTest(text=text, size=size):
+                    self.assertEqual(
+                        self.finalize(text, job, True, size), (content, [], content)
+                    )
 
     def test_a_cut_after_a_call_reports_and_streams_no_text(self):
         # Beside an output schema only whitespace surrounds calls.
@@ -445,19 +450,11 @@ class StructuredToolProjectionTest(unittest.TestCase):
         text = " \n" + CALL + "\n" + OTHER_CALL + "\n"
         for end in range(len(" \n" + CALL), len(text) + 1):
             cut = text[:end]
-            with self.subTest(cut=cut):
-                content, calls = self.finalize(cut, job, True)
-                self.assertEqual(content, "")
-                self.assertEqual(calls[0]["function"]["name"], "lookup")
-                projector = model_output.StreamingToolCallProjector(
-                    job.tool_policy, job.public_id, True
-                )
-                events = []
-                for char in cut:
-                    events.extend(projector.put(char))
-                tail = projector.finish(content, calls, True)
-                self.assertFalse([value for kind, value in events if kind == "content"])
-                self.assertEqual(tail, [])
+            for size in (1, None):
+                with self.subTest(cut=cut, size=size):
+                    content, calls, streamed = self.finalize(cut, job, True, size)
+                    self.assertEqual((content, streamed), ("", ""))
+                    self.assertEqual(calls[0]["function"]["name"], "lookup")
 
     def test_finalization_enforces_required_parallel_and_output_schema(self):
         for text, job in (
@@ -469,7 +466,7 @@ class StructuredToolProjectionTest(unittest.TestCase):
             with self.subTest(text=text):
                 with self.assertRaises(api.APIError):
                     self.finalize(text, job)
-        content, calls = self.finalize(CALL + "\n" + OTHER_CALL, self.job())
+        content, calls, _ = self.finalize(CALL + "\n" + OTHER_CALL, self.job())
         self.assertFalse(content.strip())
         self.assertEqual(
             [call["function"]["name"] for call in calls], ["lookup", "finish"]
