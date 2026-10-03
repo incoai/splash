@@ -170,18 +170,26 @@ std::string buffer(const char *type, uint64_t rows, uint64_t width, uint64_t str
          plane + ", " + std::to_string(stride) + ", 1], interleave_factors=[1, 1, 1, 1]>";
 }
 
+// A surface row's elements of `width` int8 or fp16 values (ane::Surface).
+uint64_t rowStride(uint64_t width, bool int8) { return (width * (int8 ? 1 : 2) + 63) / 64 * 64 / (int8 ? 1 : 2); }
+
 // The ANE's share of the FFN over `rows` rows as MIL. Inputs: x<k>, the rotated input rows
 // channel-major in int8 segments, tx their per-token scales; w<g|u><k>, the
 // rotated int8 gate and up rows of segment k, s<g|u> their per-row scales;
 // wd<i> down's rotated int8 inputs of segment i, sd its per-row scales. Every
 // int8 value is dequantized by 2^-7 against fp16 overflow, which the scales
 // carry back. The intermediate rows are rotated and quantized per token here.
-std::string ffnProgram(uint32_t hidden, uint32_t channels, const std::vector<uint32_t> &down, uint64_t rows) {
+// The surfaces of x, tx and the output y hold `capacity` rows each, of which
+// the program reads and writes the leading `rows`.
+std::string ffnProgram(uint32_t hidden, uint32_t channels, const std::vector<uint32_t> &down, uint64_t rows,
+                       uint64_t capacity) {
   const uint32_t inputs = hidden / kSegment;
   std::string parameters, body;
   const auto line = [&](const std::string &text) { body += "        " + text + ";\n"; };
-  const auto input = [&](const char *type, const std::string &name, uint64_t height, uint64_t width) {
-    const uint64_t stride = (width * (type[0] == 'i' ? 1 : 2) + 63) / 64 * 64 / (type[0] == 'i' ? 1 : 2);
+  // An input of `height` x `width` in surface rows of `allocated` elements.
+  const auto input = [&](const char *type, const std::string &name, uint64_t height, uint64_t width,
+                         uint64_t allocated) {
+    const uint64_t stride = rowStride(allocated, type[0] == 'i');
     parameters += (parameters.empty() ? "" : ", ") + buffer(type, height, width, stride) + " " + name;
     line(tensor(type, height, width) + " " + name + "_t = tensor_buffer_to_tensor<ios17>(input = " + name + ")");
   };
@@ -208,16 +216,16 @@ std::string ffnProgram(uint32_t hidden, uint32_t channels, const std::vector<uin
 
   for (uint32_t k = 0; k < inputs; ++k) {
     const std::string x = "x" + std::to_string(k);
-    input("int8", x, kSegment, rows);
+    input("int8", x, kSegment, rows, capacity);
     f16(x + "_d", kSegment, rows, "dequantize(input = " + x + "_t, scale = fp16(0x1p-7))");
   }
-  input("fp16", "tx", 1, rows);
+  input("fp16", "tx", 1, rows, capacity);
   for (const char *projection : {"g", "u"}) {
     const std::string p = projection;
-    input("fp16", "s" + p, channels, 1);
+    input("fp16", "s" + p, channels, 1, 1);
     for (uint32_t k = 0; k < inputs; ++k) {
       const std::string w = "w" + p + std::to_string(k);
-      input("int8", w, channels, kSegment);
+      input("int8", w, channels, kSegment, kSegment);
       matmul(p + "m" + std::to_string(k), w, "x" + std::to_string(k) + "_d", channels, kSegment);
     }
     f16(p + "s", channels, rows, "mul(x = " + sum(p + "m", inputs, channels) + ", y = s" + p + "_t)");
@@ -251,18 +259,19 @@ std::string ffnProgram(uint32_t hidden, uint32_t channels, const std::vector<uin
     f16(slice, down[i], rows,
         "slice_by_size(x = hd, begin = tensor<int32, [4]>([0, 0, " + std::to_string(begin) +
             ", 0]), size = tensor<int32, [4]>(" + shape(down[i], rows) + "))");
-    input("int8", "wd" + index, hidden, down[i]);
+    input("int8", "wd" + index, hidden, down[i], down[i]);
     matmul("dm" + index, "wd" + index, slice, hidden, down[i]);
     begin += down[i];
   }
-  input("fp16", "sd", hidden, 1);
+  input("fp16", "sd", hidden, 1, 1);
   f16("ds", hidden, rows, "mul(x = " + sum("dm", down.size(), hidden) + ", y = sd_t)");
   f16("ys", 1, rows, "mul(x = hscale, y = tx_t)");
   f16("yt", hidden, rows, "mul(x = ds, y = ys)");
-  const std::string plane = std::to_string(uint64_t{hidden} * rows);
-  line(buffer("fp16", hidden, rows, rows) +
+  const uint64_t stride = rowStride(capacity, false);
+  const std::string plane = std::to_string(uint64_t{hidden} * stride), pitch = std::to_string(stride);
+  line(buffer("fp16", hidden, rows, stride) +
        " y = tensor_to_tensor_buffer<ios17>(input = yt, interleave_factors = tensor<uint8, [4]>([1, 1, 1, 1]), "
-       "strides = tensor<int64, [4]>([" + plane + ", " + plane + ", " + r + ", 1]))");
+       "strides = tensor<int64, [4]>([" + plane + ", " + plane + ", " + pitch + ", 1]))");
   return "program(1.3)\n{\n    func main_ane<ios18>(" + parameters + ") {\n" + body + "    } -> (y);\n}\n";
 }
 
@@ -271,11 +280,11 @@ std::string ffnProgram(uint32_t hidden, uint32_t channels, const std::vector<uin
 uint64_t AneFfn::plannedBytes(std::span<const SwiGluProjections> layers, double share) {
   const uint32_t hidden = layers.front().gate->inputSize, intermediate = layers.front().gate->outputSize;
   const uint32_t gpu = gpuChannels(intermediate, share), ane = intermediate - gpu;
-  uint64_t bytes = pages(kIntermediateBlock * sizeof(float)) + pages(uint64_t{layers.size()} * (2 * ane + hidden) * 2) +
-                   pages(uint64_t{kRows} * hidden * 2);
-  for (uint32_t rows : kProgramRows)
-    bytes += (hidden / kSegment) * ane::Surface::bytes(kSegment, rows, Element::Int8) +
-             ane::Surface::bytes(1, rows, Element::Float16) + ane::Surface::bytes(hidden, rows, Element::Float16);
+  const uint64_t bytes = pages(kIntermediateBlock * sizeof(float)) +
+                         pages(uint64_t{layers.size()} * (2 * ane + hidden) * 2) + pages(uint64_t{kRows} * hidden * 2) +
+                         (hidden / kSegment) * ane::Surface::bytes(kSegment, kRows, Element::Int8) +
+                         ane::Surface::bytes(1, kRows, Element::Float16) +
+                         ane::Surface::bytes(hidden, kRows, Element::Float16);
   uint64_t set = 2 * ane::Surface::bytes(ane, 1, Element::Float16) + ane::Surface::bytes(hidden, 1, Element::Float16) +
                  2 * (hidden / kSegment) * ane::Surface::bytes(ane, kSegment, Element::Int8);
   for (uint32_t width : segments(ane)) set += ane::Surface::bytes(hidden, width, Element::Int8);
@@ -344,28 +353,29 @@ AneFfn::AneFfn(metal::MetalBackend &backend, const Linear &linear, std::span<con
     set.downScale = surface(hidden_, 1, Element::Float16);
   }
 
+  const uint32_t capacity = programRows.back();
+  for (uint32_t k = 0; k < hidden_ / kSegment; ++k) inputs_.push_back(surface(kSegment, capacity, Element::Int8));
+  tokenScale_ = surface(1, capacity, Element::Float16);
+  partial_ = surface(hidden_, capacity, Element::Float16);
   const std::vector<uint8_t> blob = rotationBlob(aneChannels_, signs);
   for (uint32_t rows : programRows) {
     Evaluation &evaluation = evaluations_.emplace_back();
     evaluation.rows = rows;
-    for (uint32_t k = 0; k < hidden_ / kSegment; ++k)
-      evaluation.inputs.push_back(surface(kSegment, rows, Element::Int8));
-    evaluation.tokenScale = surface(1, rows, Element::Float16);
-    evaluation.partial = surface(hidden_, rows, Element::Float16);
-    evaluation.program = std::make_unique<ane::Program>(ffnProgram(hidden_, aneChannels_, downSegments_, rows), blob);
+    evaluation.program =
+        std::make_unique<ane::Program>(ffnProgram(hidden_, aneChannels_, downSegments_, rows, capacity), blob);
     for (uint32_t index = 0; index < 2; ++index) {
       const Weights &set = sets_[index];
       std::vector<ane::Surface> &bindings = evaluation.bindings[index];
       for (const std::string &name : evaluation.program->inputs()) {
         const auto segment = [&](size_t prefix) { return std::stoul(name.substr(prefix)); };
-        if (name == "tx") bindings.push_back(evaluation.tokenScale);
+        if (name == "tx") bindings.push_back(tokenScale_);
         else if (name == "sg") bindings.push_back(set.gateScale);
         else if (name == "su") bindings.push_back(set.upScale);
         else if (name == "sd") bindings.push_back(set.downScale);
         else if (name.starts_with("wg")) bindings.push_back(set.gate.at(segment(2)));
         else if (name.starts_with("wu")) bindings.push_back(set.up.at(segment(2)));
         else if (name.starts_with("wd")) bindings.push_back(set.down.at(segment(2)));
-        else if (name.starts_with("x")) bindings.push_back(evaluation.inputs.at(segment(1)));
+        else if (name.starts_with("x")) bindings.push_back(inputs_.at(segment(1)));
         else throw std::logic_error("unknown ANE FFN program input " + name);
       }
     }
@@ -444,15 +454,13 @@ void AneFfn::encode(metal::CommandGraph &graph, uint32_t layer, metal::MetalBuff
       std::ranges::find_if(evaluations_, [&](const Evaluation &evaluation) { return evaluation.rows >= rows; });
   if (found == evaluations_.end()) throw std::invalid_argument("ANE FFN has no program of the chunk's rows");
   const auto index = static_cast<uint32_t>(found - evaluations_.begin());
-  const Evaluation &evaluation = *found;
   // Each command stages layer 0's weights, then each layer the next one's.
   if (!layer) addWeights(graph, 0, 0);
-  graph.add("ane_ffn_rotate", {normalized, signs_, rotated_, evaluation.tokenScale.buffer},
-            AneFfnRotateParams{hidden_}, {rows, 1, 1}, {256, 1, 1});
-  for (uint32_t k = 0; k < evaluation.inputs.size(); ++k)
-    graph.add("ane_ffn_pack", {rotated_, evaluation.inputs[k].buffer},
-              AneFfnPackParams{hidden_, k * kSegment, evaluation.inputs[k].strideBytes}, {tiles, kSegment / 32, 1},
-              {32, 8, 1});
+  graph.add("ane_ffn_rotate", {normalized, signs_, rotated_, tokenScale_.buffer}, AneFfnRotateParams{hidden_},
+            {rows, 1, 1}, {256, 1, 1});
+  for (uint32_t k = 0; k < inputs_.size(); ++k)
+    graph.add("ane_ffn_pack", {rotated_, inputs_[k].buffer}, AneFfnPackParams{hidden_, k * kSegment, inputs_[k].strideBytes},
+              {tiles, kSegment / 32, 1}, {32, 8, 1});
   const uint64_t wait = ane ? ++value_ : 0;
   if (ane) graph.signal(event_, wait);
   linear_.addPrefill(graph, normalized, current.gate, gateScratch, sums, rows, scratch);
@@ -462,9 +470,8 @@ void AneFfn::encode(metal::CommandGraph &graph, uint32_t layer, metal::MetalBuff
   if (layer + 1 < layers_.size()) addWeights(graph, layer + 1, set ^ 1);
   const uint64_t signal = ane ? ++value_ : 0;
   if (ane) graph.wait(event_, signal);
-  graph.add("ane_ffn_join", {output, evaluation.partial.buffer},
-            AneFfnJoinParams{hidden_, evaluation.partial.strideBytes / 2, rows}, {tiles, hidden_ / 32, 1},
-            {32, 8, 1});
+  graph.add("ane_ffn_join", {output, partial_.buffer}, AneFfnJoinParams{hidden_, partial_.strideBytes / 2, rows},
+            {tiles, hidden_ / 32, 1}, {32, 8, 1});
   if (ane) jobs_.push_back({index, set, wait, signal});
 }
 
@@ -473,7 +480,7 @@ void AneFfn::submit() {
   for (const Job &job : jobs) {
     try {
       const Evaluation &evaluation = evaluations_[job.evaluation];
-      evaluation.program->enqueue(evaluation.bindings[job.set], evaluation.partial, event_, job.wait, job.signal,
+      evaluation.program->enqueue(evaluation.bindings[job.set], partial_, event_, job.wait, job.signal,
                                   [completions = completions_](bool success) {
                                     std::lock_guard lock(completions->mutex);
                                     ++completions->completed;

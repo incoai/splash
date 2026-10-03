@@ -31,11 +31,16 @@ struct SwiGluProjections final {
 // between the GPU's input packing and that join, within the one command.
 class AneFfn final {
 public:
-  // The rows of the ANE programs, ascending: a chunk runs on the smallest
-  // that holds it, since an evaluation costs the ANE its program's rows. The
-  // fewest rows a chunk needs for the split to beat the GPU alone are the
-  // first program's; smaller chunks keep the whole FFN on the GPU.
-  static constexpr std::array<uint32_t, 4> kProgramRows{512, 1024, 1536, 2048};
+  // The rows of the ANE programs, every 128 from 512, ascending: a chunk runs
+  // on the smallest that holds it, since an evaluation costs the ANE its
+  // program's rows. The fewest rows a chunk needs for the split to beat the
+  // GPU alone are the first program's; smaller chunks keep the whole FFN on
+  // the GPU.
+  static constexpr std::array<uint32_t, 13> kProgramRows = [] {
+    std::array<uint32_t, 13> rows{};
+    for (uint32_t index = 0; index < rows.size(); ++index) rows[index] = 512 + 128 * index;
+    return rows;
+  }();
   static constexpr uint32_t kRows = kProgramRows.back();
   static constexpr uint32_t kMinimumRows = kProgramRows.front();
 
@@ -120,12 +125,10 @@ private:
     // leading inputs repacked.
     Projection gate, up, down;
   };
-  // An ANE program of `rows` rows and the surfaces it reads and writes,
-  // bound for each weight set.
+  // An ANE program of `rows` rows and the surfaces it reads, bound for each
+  // weight set.
   struct Evaluation final {
     uint32_t rows = 0;
-    std::vector<ane::Surface> inputs;
-    ane::Surface tokenScale, partial;
     std::unique_ptr<ane::Program> program;
     std::array<std::vector<ane::Surface>, 2> bindings;
   };
@@ -154,6 +157,12 @@ private:
   std::vector<Layer> layers_;
   metal::MetalBuffer signs_, rowScales_, rotated_;
   std::array<Weights, 2> sets_;
+  // The chunk's rotated input rows in int8 segments, their per-token scales
+  // and the ANE's partial down projection, which every program reads and
+  // writes: allocated for the most rows, whose row stride each program
+  // declares, so a program's rows lead each row of them.
+  std::vector<ane::Surface> inputs_;
+  ane::Surface tokenScale_, partial_;
   // By rows, ascending.
   std::vector<Evaluation> evaluations_;
   metal::SharedEvent event_;

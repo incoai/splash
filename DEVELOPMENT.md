@@ -1103,13 +1103,15 @@ intermediate channel (`runtime/ops/AneFfn.cpp`). The GPU runs the leading
 channels on its prefill kernels, its down projection reading a view of the
 leading inputs of down's rows (`Projection::planeInputs`). The Neural Engine
 runs the rest as one W8A8 program, Hadamard-rotated int8 activations and
-per-row int8 weights, in programs of 512, 1024, 1536 and 2048 rows
-(`runtime/ane/Program.mm`). The GPU requantizes the ANE's weights from the Q4
-or GGUF planes one layer ahead into double-buffered IOSurfaces and adds the
-ANE's partial down projection to its own. Shared events order each evaluation
-between the GPU's packing and that join inside the one prefill command
-(`metal::EventStep`); each signal ends a Metal command buffer, so the queue
-holds 512. MoE targets, the mixers and decode stay on the GPU.
+per-row int8 weights (`runtime/ane/Program.mm`): a chunk takes the smallest
+program that holds it, one every 128 rows from 512 to 2048, all reading and
+writing one set of surfaces sized for 2048 rows. The GPU requantizes the
+ANE's weights from the Q4 or GGUF planes one layer ahead into double-buffered
+IOSurfaces and adds the ANE's partial down projection to its own. Shared
+events order each evaluation between the GPU's packing and that join inside
+the one prefill command (`metal::EventStep`); each signal ends a Metal command
+buffer, so the queue holds 512. MoE targets, the mixers and decode stay on the
+GPU.
 
 Startup picks the share on the loaded model once the governor exists
 (`AneFfn::calibrate`): it times five FFN layers spread over the model's depth
