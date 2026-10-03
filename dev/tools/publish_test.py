@@ -50,7 +50,8 @@ def main(argv=None):
         "testers set SPLASH_TOKEN to the supplied read token, then run:\n"
         "export SPLASH_TOKEN\n"
         "curl -qfsSL --config - "
-        f"https://huggingface.co/{args.repo}/resolve/main/install.sh <<EOF | sh\n"
+        f"https://huggingface.co/{args.repo}/resolve/main/install.sh <<EOF"
+        f" | SPLASH_REPO={args.repo} sh\n"
         'header = "Authorization: Bearer $SPLASH_TOKEN"\n'
         "EOF"
     )

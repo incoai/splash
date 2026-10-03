@@ -27,8 +27,10 @@ enum class Phase : uint8_t {
 struct RequestSpec final {
   uint64_t id = 0;
   RequestPriority priority = RequestPriority::Normal;
-  BatchCohort cohort = BatchCohort::Greedy;
-  uint32_t promptTokens = 0;
+  bool constrained = false;
+  // Tokens to prefill: the prompt, and after resumeFromResources the
+  // replayed history.
+  uint32_t prefillTokens = 0;
   double deadlineMilliseconds = 0.0;
 };
 
@@ -50,9 +52,6 @@ struct SchedulerSnapshot final {
   uint64_t decodeBatches = 0;
   std::array<uint64_t, model::ExecutionLimits::maximumBatchWidth>
       decodeBatchesByWidth{};
-  // Committed decode batches containing both Greedy and Sampling requests.
-  // Counts scheduler dispatches, not completed GPU commands or sampled tokens.
-  uint64_t decodeMixedGreedySamplingBatches = 0;
 };
 
 // One single-owner policy for the specialized backend. Prefill packs the
@@ -62,6 +61,10 @@ struct SchedulerSnapshot final {
 // M8/M16/M24/M32 shapes.
 class Scheduler final {
 public:
+  // Decode time owed for each unit of time a prefill runs while requests of
+  // equal or higher priority decode; zero alternates one command of each kind.
+  explicit Scheduler(double decodeShare) noexcept : decodeShare_(decodeShare) {}
+
   void submit(RequestSpec request);
   void observePrefill(uint32_t rows, double wallMilliseconds);
   void deferAdmission(uint64_t requestId);
@@ -77,22 +80,38 @@ public:
   void remove(uint64_t requestId);
 
   // A sparse-state materialization point can stop one sequence without
-  // padding or shortening any peer in the same packed command.
+  // padding or shortening any peer in the same packed command. The boundary
+  // must lie past the request's progress; complete() consumes a boundary its
+  // command reached.
   void setPrefillBoundary(uint64_t requestId,
                           std::optional<uint32_t> absoluteTokens);
 
   [[nodiscard]] bool expireDeadlines(double nowMilliseconds);
   [[nodiscard]] std::vector<uint64_t> admissionOrder() const;
-  // Preview the dispatch row budget before allocating new resident cells.
+  // Preview the dispatch row budget before allocating new lanes.
   [[nodiscard]] std::vector<uint64_t>
   prefillAdmissionOrder(std::span<const PrefillAdmission> candidates) const;
-  [[nodiscard]] std::optional<BatchPlan> next() const;
-  void commit(const BatchPlan &plan);
+  // The highest priority among requests that prefill or decode. A waiting
+  // request of a lower priority cannot be in prefillAdmissionOrder's result
+  // while it lasts: the plan takes one tier, the highest among resident
+  // prefill lanes and candidates, and is dropped when a higher tier decodes.
+  [[nodiscard]] std::optional<RequestPriority> highestRunnablePriority() const noexcept;
+  // The next command, planned without the excluded lanes: those that wait
+  // for memory on its way back and cannot run before it lands.
+  [[nodiscard]] std::optional<BatchPlan> next(std::span<const uint64_t> excluded) const;
+  // The excluded lanes are those the plan was made without: blocked, not
+  // passed over, so they lose nothing to it.
+  void commit(const BatchPlan &plan, std::span<const uint64_t> excluded);
   void complete(const BatchPlan &plan, std::span<const StepResult> results,
-                double wallMilliseconds = 0.0,
-                bool representativePrefillTiming = true);
+                double wallMilliseconds, bool representativePrefillTiming);
 
   [[nodiscard]] Phase phase(uint64_t requestId) const;
+  // Suspended by suspendForResources and not resumed since; a terminal
+  // phase keeps it until remove(), so the engine can end the request's
+  // continuation.
+  [[nodiscard]] bool suspended(uint64_t requestId) const;
+  // The request's place in submission order.
+  [[nodiscard]] uint64_t submissionOrder(uint64_t requestId) const;
   [[nodiscard]] uint32_t promptProcessed(uint64_t requestId) const;
   [[nodiscard]] SchedulerSnapshot snapshot() const noexcept;
 
@@ -104,7 +123,7 @@ private:
     std::optional<uint32_t> prefillBoundary;
     // Set by suspendForResources: the request comes back through
     // resumeFromResources, never through resourcesReady.
-    bool suspendedForResources = false;
+    bool suspended = false;
     DecodeStage decodeStage = DecodeStage::Regular;
     uint64_t order = 0;
     uint64_t lastDecodeDispatch = 0;
@@ -113,24 +132,44 @@ private:
     uint32_t overtaken = 0;
   };
 
+  struct PrefillRequestView final {
+    const Request *request = nullptr;
+    uint32_t promptProcessed = 0;
+  };
+
   [[nodiscard]] Request &get(uint64_t requestId);
   [[nodiscard]] const Request &get(uint64_t requestId) const;
   [[nodiscard]] static bool terminal(Phase phase) noexcept;
   [[nodiscard]] static bool byPriorityThenOrder(const Request *a,
                                                 const Request *b) noexcept;
-  [[nodiscard]] std::optional<BatchPlan> nextPrefill() const;
-  [[nodiscard]] std::optional<BatchPlan> nextDecode() const;
   [[nodiscard]] std::optional<BatchPlan>
-  planPrefill(std::vector<const Request *> ready) const;
+  nextPrefill(std::span<const uint64_t> excluded) const;
+  [[nodiscard]] std::optional<BatchPlan>
+  nextDecode(std::span<const uint64_t> excluded) const;
+  [[nodiscard]] std::optional<BatchPlan>
+  planPrefill(std::vector<PrefillRequestView> ready) const;
+  // The rows the lane can take in one command: up to its prompt's end or its
+  // next state boundary.
+  [[nodiscard]] static uint32_t dispatchRemaining(const PrefillRequestView &view) noexcept;
   [[nodiscard]] uint32_t
-  prefillBudget(const Request &leader,
-                std::span<const Request *const> ready) const;
+  prefillBudget(const PrefillRequestView &leader,
+                std::span<const PrefillRequestView> ready) const;
+  // Debt is owed only to requests that decode or wait for a mask: once the
+  // last one leaves, a later decoder starts without it.
+  void dropStaleDecodeDebt() noexcept;
 
   std::unordered_map<uint64_t, Request> requests_;
   std::optional<BatchPlan> active_;
+  // The lanes the active command was planned without.
+  std::vector<uint64_t> excluded_;
   uint64_t order_ = 0;
   uint64_t decodeDispatchOrder_ = 0;
   double prefillMillisecondsPerToken_ = 0.0;
+  double decodeShare_;
+  // Decode time that prefill still owes the lanes that decoded beside it
+  // (not those waiting for a mask): equal-priority decode runs until its
+  // commands' wall time has worked it off.
+  double decodeDebtMilliseconds_ = 0.0;
   std::optional<WorkKind> lastCommittedKind_;
   SchedulerSnapshot counters_;
 };

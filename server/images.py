@@ -19,14 +19,13 @@ MERGE = 2
 FACTOR = PATCH * MERGE
 # Qwen3-VL's shortest_edge floor; the serving cap below is far below the model's.
 MIN_PIXELS = 65_536
-# Serving default: the engine's vision scratch covers 16,384 patches.
+# Serving default and largest cap: 16,384 patches, the protocol's per-image ceiling.
 MAX_PIXELS = 4_194_304
 # Bound codec work before full-resolution decode, independently of the model's
 # resized input budget. Ordinary screenshots and up to 32 MP photos fit here.
 MAX_SOURCE_PIXELS = 32 * 1024 * 1024
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
 IMAGE_FORMATS = ("JPEG", "PNG", "WEBP", "GIF")
-DEFAULT_CACHE_BYTES = 256 * 1024 * 1024
 
 
 class ImageError(ValueError):
@@ -68,6 +67,12 @@ def decode_data_url(url) -> bytes:
     return raw
 
 
+def max_patches(max_pixels: int) -> int:
+    """The most patches an image resized within max_pixels can have: its
+    sides are whole merge units, so its patch count is a multiple of 4."""
+    return max_pixels // (PATCH * PATCH) // 4 * 4
+
+
 def smart_resize(height: int, width: int, max_pixels: int) -> tuple[int, int]:
     """Upstream Qwen2VL smart-resize: patch/merge-aligned sides inside the
     pixel budget with the aspect ratio preserved as closely as possible."""
@@ -99,14 +104,30 @@ def smart_resize(height: int, width: int, max_pixels: int) -> tuple[int, int]:
 
 def prepare(payload: bytes, max_pixels: int = MAX_PIXELS) -> PreparedImage:
     """Decode, convert to RGB, resize into the grid, and digest the pixels."""
-    from PIL import Image
+    from PIL import Image, ImageOps
 
     try:
         with Image.open(io.BytesIO(payload), formats=IMAGE_FORMATS) as decoded:
             if decoded.height * decoded.width > MAX_SOURCE_PIXELS:
                 raise ImageError("source image exceeds the pixel limit")
+            stored = decoded.size
             height, width = smart_resize(decoded.height, decoded.width, max_pixels)
-            image = decoded.convert("RGB")
+            try:
+                # Cameras store the sensor's orientation and an EXIF tag that
+                # turns it upright for display; show the model the upright one.
+                ImageOps.exif_transpose(decoded, in_place=True)
+            except Exception:
+                pass  # A malformed tag leaves the stored orientation.
+            if decoded.size != stored:
+                height, width = width, height
+            if decoded.has_transparency_data:
+                # Composite onto white as Qwen's preprocessing does: transparent
+                # pixels usually store black, which hides dark content.
+                rgba = decoded.convert("RGBA")
+                image = Image.new("RGB", rgba.size, (255, 255, 255))
+                image.paste(rgba, mask=rgba)
+            else:
+                image = decoded.convert("RGB")
             if (image.height, image.width) != (height, width):
                 image = image.resize((width, height), Image.Resampling.BICUBIC)
             pixels = image.tobytes()
@@ -136,7 +157,7 @@ class PreparedImages(list):
     def append(self, image):
         size = len(image.pixels)
         with self._cache._lock:
-            if size > self._cache.request_budget_bytes - self._cache._request_bytes:
+            if size > self._cache.REQUEST_BUDGET_BYTES - self._cache._request_bytes:
                 raise ImageCapacityError("in-flight image memory budget is full")
             self._cache._request_bytes += size
             self._bytes += size
@@ -150,15 +171,11 @@ class PreparedImages(list):
 class ImageCache:
     """Byte-budgeted LRU of prepared images keyed by the raw image bytes."""
 
-    def __init__(
-        self,
-        budget_bytes: int = DEFAULT_CACHE_BYTES,
-        request_budget_bytes: int = DEFAULT_CACHE_BYTES,
-    ):
-        if budget_bytes < 0 or request_budget_bytes <= 0:
-            raise ValueError("invalid image memory budget")
-        self.budget_bytes = budget_bytes
-        self.request_budget_bytes = request_budget_bytes
+    # Cached prepared images, and the images of requests in flight.
+    BUDGET_BYTES = 256 * 1024 * 1024
+    REQUEST_BUDGET_BYTES = 256 * 1024 * 1024
+
+    def __init__(self):
         # GC may finalize a cancelled batch during a cache insertion on this
         # same thread; returning its byte charge must not deadlock the cache.
         self._lock = threading.RLock()
@@ -177,13 +194,13 @@ class ImageCache:
                 self._entries.move_to_end(key)
                 return cached
         prepared = prepare(payload, max_pixels)
-        if len(prepared.pixels) > self.budget_bytes:
+        if len(prepared.pixels) > self.BUDGET_BYTES:
             return prepared
         with self._lock:
             if key not in self._entries:
                 self._entries[key] = prepared
                 self._bytes += len(prepared.pixels)
-                while self._bytes > self.budget_bytes:
+                while self._bytes > self.BUDGET_BYTES:
                     _, evicted = self._entries.popitem(last=False)
                     self._bytes -= len(evicted.pixels)
         return prepared
@@ -193,7 +210,7 @@ class ImageCache:
             return {
                 "entries": len(self._entries),
                 "bytes": self._bytes,
-                "budget_bytes": self.budget_bytes,
+                "budget_bytes": self.BUDGET_BYTES,
                 "request_bytes": self._request_bytes,
-                "request_budget_bytes": self.request_budget_bytes,
+                "request_budget_bytes": self.REQUEST_BUDGET_BYTES,
             }

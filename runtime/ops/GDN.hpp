@@ -2,6 +2,7 @@
 
 #include "metal/CommandGraph.hpp"
 #include "ops/Linear.hpp"
+#include "ops/Normalization.hpp"
 
 #include <cstdint>
 #include <span>
@@ -29,6 +30,11 @@ struct GdnShape final {
   bool operator==(const GdnShape &) const = default;
 };
 
+// The value-head order of the GDN output, the out_proj input columns. Grouped
+// keeps a key head's value heads adjacent; Tiled is llama.cpp's GGUF order,
+// value head h at (h % heads per key) * key heads + h / heads per key.
+enum class GdnHeadOrder : uint8_t { Grouped, Tiled };
+
 struct GdnStateStrides final {
   uint64_t convolutionLayerBytes = 0;
   uint64_t recurrentLayerBytes = 0;
@@ -55,7 +61,7 @@ struct GdnPrefillBuffers final {
   metal::MetalBuffer recurrentIn;
   metal::MetalBuffer recurrentOut;
   metal::MetalBuffer recurrentRows;
-  metal::MetalBuffer mixerNorm;
+  NormWeights mixerNorm;
   metal::MetalBuffer hidden;
 };
 
@@ -69,11 +75,8 @@ struct GdnDecodeBuffers final {
   metal::MetalBuffer timeBias;
   metal::MetalBuffer decay;
   metal::MetalBuffer beta;
-  metal::MetalBuffer recurrent;
-  metal::MetalBuffer mixerNorm;
+  NormWeights mixerNorm;
   metal::MetalBuffer hidden;
-  metal::MetalBuffer arrived;
-  metal::MetalBuffer generation;
   LinearScratch linearScratch{};
 };
 
@@ -90,10 +93,16 @@ struct GdnCommitBuffers final {
 class GDN final {
 public:
   static void addPrefill(metal::CommandGraph &graph, GdnPrefillBuffers buffers,
-                         GdnShape shape, uint32_t tokens);
-  static void addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffers,
-                        GdnShape shape, uint32_t lanes, uint32_t layer,
-                        GdnStateStrides state);
+                         GdnShape shape, uint32_t tokens,
+                         GdnHeadOrder order);
+  // Also writes the out-projection's `input` table into
+  // buffers.linearScratch when it is not Plain, and throws when the scratch
+  // cannot hold it.
+  static PreparedInput addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffers,
+                                 GdnShape shape, uint32_t lanes, uint32_t layer,
+                                 GdnStateStrides state,
+                                 GdnHeadOrder order,
+                                 LinearInput input);
   static void addCommit(metal::CommandGraph &graph, GdnCommitBuffers buffers,
                         GdnShape shape, uint32_t layers, uint32_t lanes,
                         GdnStateStrides state);

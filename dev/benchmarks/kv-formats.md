@@ -8,18 +8,19 @@ choice, not a general speed improvement.
 ## Implementation boundaries
 
 - One `kv::Layout` supplies allocation, admission, cache identity, and attention
-  planning. Format is part of execution-policy keys and the prefix-cache
-  namespace, so policies and cached blocks cannot cross formats.
-- `PageStorage` owns both formats. BF16 has no scale allocations or bindings.
-  Sparse mapping still respects 64 KiB alignment; physical backing extents
-  target about 128 MiB. Logical prefix blocks remain 32 tokens.
+  planning. Format is part of execution-policy keys, so policies cannot cross
+  formats, and of the cache identity `/status` reports. One process serves one
+  format and keeps KV only in its own extents and unlinked slot files, so
+  cached blocks cannot cross formats either.
+- `PageStorage` owns both formats. BF16 extents have no scale regions. Every
+  region of an extent starts 64 KiB aligned, and extents target about 128 MiB.
+  Logical prefix blocks remain 32 tokens.
 - The shared Metal page loop specializes on the stored element type. BF16 stores
   preserve source bits and attention omits quantization scales at compile time.
   INT8 entry points, argument order, arithmetic, and dispatch policies remain.
-  Both formats share the FP32 split reduction. Historical Q8 ABI names are kept
-  where the underlying geometry and argument structure have not changed.
-- Status reports the selected format and its actual byte geometry. Existing
-  INT8 `identity.q8` and `q8_page_bytes` fields remain available.
+  Both formats share the FP32 split reduction. Format-generic code is named for
+  paged KV; only the INT8 entry points, quantization and scales say q8.
+- Status reports the selected format and its actual byte geometry.
 
 ## Validation on 2026-09-21
 
@@ -46,7 +47,7 @@ power condition.
   width, order main/INT8/BF16/BF16/INT8/main: default INT8 cycle-time changes
   ranged from -0.08% to +0.81% on M3 and -0.71% to +0.07% on M5.
 - Native long-context runs completed through 256K for 35B in both formats on
-  both devices. Follow-up integration with PR92 completed the 27B 256K matrix
+  both devices. With PR #92 integrated, the 27B 256K matrix completed
   as well: both formats on both devices, 262,016 input tokens plus 128 output
   tokens, followed by exact-prefix replay. Each replay reused 261,984 tokens
   and matched its cold run's 128-token output exactly. Active KV pages and
@@ -54,10 +55,11 @@ power condition.
   matched the retained main run on the same input token-for-token.
 
 The benchmark tools accept `--kv-format int8|bf16`. `attention-sweep` accepts
-`--compare-metallib BASELINE` and checks exact output equality;
+`--compare-metallib BASELINE` and checks exact output equality (the baseline
+must be built from a tree with `residency_kick`, which every backend loads);
 `paged-attention-plan METALLIB --long` runs the long independent references.
 
-## Combined serving validation with PR92
+## Combined serving validation with PR #92
 
 The integrated build passed all four real HTTP and runtime-oracle combinations
 (27B/35B, INT8/BF16) on M5 Pro 20. HTTP coverage includes tools, structured
@@ -71,7 +73,7 @@ The combined Python suite ran 766 tests: 764 passed and two opt-in external CLI
 routing tests were skipped. Production/CPU/sanitizers and Python 3.12–3.14 CI
 passed, as did the full Metal gate with shader validation on M5 Pro 20.
 
-The real HTTP smoke and ABBA tools now accept `--kv-format int8|bf16` and check
+The real HTTP smoke and ABBA tools accept `--kv-format int8|bf16` and check
 the running format and its quantization/scale identity. M5 Pro 20 HTTP ABBA
 against main passed transcript/usage equality and the unchanged 2% regression
 limit for both models (three samples per build, 2K/8K cold and cached requests,

@@ -7,10 +7,10 @@ optimizations are exhausted, or a ranking against other serving engines.
 ## Production changes
 
 GDN and the attention gate emit the Q4 operand layout and row sums alongside
-their ordinary rounded bfloat output for one-lane decode when the shared Q4
-scratch exists. The following mixer projection consumes that prepared input.
-Both paths reproduce separate preparation bit for bit, and reuse the existing
-arena allocation. Wider batches keep their existing producer path. The FFN
+their ordinary rounded bfloat output when the following mixer projection reads
+a prepared table (Apple9; one lane when measured here, one to four lanes since
+`3a20983`). Both paths reproduce separate preparation bit for bit, and reuse
+the existing arena allocation. The FFN
 producer is intentionally unchanged; its experimental fusion did not justify
 another live operand buffer and a second row-sum format.
 
@@ -25,7 +25,8 @@ Apple10 M24 plain and residual projections use the existing eight-SIMD-group
 N128 kernel when there is at most one output tile per GPU core and K >= 4096.
 Other M24 workloads keep four SIMD groups. The conservative boundary excludes
 short dot products and grids that can benefit more from occupancy. This adds
-no kernel, scratch buffer or weight format. Apple9 policy is unchanged.
+no kernel, scratch buffer or weight format. Apple9 policy is unchanged. (Those
+narrow grids now split K at every batch width, [device-policy.md](device-policy.md).)
 
 `attention-sweep` can compare two libraries with alternating order, GPU warmup
 and medians, and can select verify or prefill. Its figures describe one layer's
@@ -50,8 +51,7 @@ cover all tested counts through 128 on all three devices.
 The M24 tests cover both sides of the N and K dispatch boundaries and execute
 all supported candidate kernels against numerical references.
 
-Raw evidence is kept outside the source tree in the handoff evidence directory
-`remaining/`. Experimental kernels are not part of the production build.
+Experimental kernels are not part of the production build.
 
 ## Measurements (2026-09-21)
 
@@ -65,6 +65,12 @@ previous battery measurements.
 The attention sweep alternates libraries, warms the GPU, and takes medians of
 31 samples at 2K/8K/32K/nearly 128K history, both model head geometries and
 one/three/four lanes (24 cases per machine). Speedups are baseline/candidate.
+
+```sh
+build/engine-tests/attention-sweep build/splash.metallib --phases verify \
+  --compare-metallib BASELINE/splash.metallib --lanes 1,3,4 --repeat 31 \
+  --histories LENGTHS
+```
 
 | Device | Merge kernel speedup range | Whole attention graph range | Graph median |
 | --- | ---: | ---: | ---: |
@@ -107,11 +113,13 @@ for 100 ms of GPU time, alternates 31 paired samples and batches 16 dispatches
 per sample. The measured 35B draft context projection improves 1.064x on M5
 20 and 1.077x on M5 16; draft down improves 1.047x and 1.064x. Small K and wider
 grids can regress, hence the conservative dispatch boundary. A desktop timing
-outlier for draft out was rechecked twice (1.045x each); the raw outlier is
-retained in the evidence rather than discarded silently.
+outlier for draft out was rechecked twice (1.045x each); it is reported here
+rather than discarded silently.
 
 A real 35B decode-profile ABBA on M5 16, with 2048 prompt tokens and nine
-cycles per width/phase, measured the following medians of phase medians:
+cycles per width/phase (`make benchmark-decode-profile MODEL=...
+DECODE_PROFILE_ARGS='--prompt-tokens 2048 --cycles 9'` per build and phase),
+measured the following medians of phase medians:
 
 | Batch width | Baseline cycle ms | Candidate cycle ms | Change |
 | --- | ---: | ---: | ---: |
@@ -119,6 +127,12 @@ cycles per width/phase, measured the following medians of phase medians:
 | 2 | 35.300 | 35.130 | +0.48% |
 | 3 | 45.005 | 44.890 | +0.26% |
 | 4 | 50.105 | 49.840 | +0.53% |
+
+Host work between decode commands (graph build, submission, completion,
+scheduling) does not show in GPU timings or in `metrics.decode_wall_ms`, which
+starts at submission. Judge changes to it by `metrics.decode_cycle_ms` of
+`/status`, which the HTTP ABBA decode verdict uses, or by decode-profile's
+wall minus fused GPU time.
 
 The M5 20-core machine has kernel/policy validation and microbenchmarks here;
 this table does not imply an end-to-end serving run on that machine. No new

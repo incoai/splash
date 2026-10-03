@@ -60,12 +60,12 @@ void profileShape(MetalBackend &backend, uint32_t rows, uint32_t inputSize,
   std::memset(weights.contents(), 0x5a, weights.sizeBytes());
   std::memset(scales.contents(), 0x3c, scales.sizeBytes());
   std::memset(biases.contents(), 0x3c, biases.sizeBytes());
-  Q4PrefillParams params{outputSize, inputSize};
+  Q4Params params{outputSize, inputSize};
 
   ComputeDispatch sum;
   sum.pipelineName = sumPipeline;
   sum.buffers = {{0, input}, {1, sums}};
-  sum.bytes = {{2, &params, sizeof(params)}};
+  sum.bytes = {{2, &inputSize, sizeof(inputSize)}};
   sum.threadgroups = {(rows + tileRows - 1) / tileRows, 1, 1};
   sum.threadsPerThreadgroup = {256, 1, 1};
 
@@ -137,12 +137,12 @@ void profileUpSilu(MetalBackend &backend, uint32_t rows, uint32_t inputSize,
   std::memset(scales.contents(), 0x3c, scales.sizeBytes());
   std::memset(biases.contents(), 0x3c, biases.sizeBytes());
   std::memset(gate.contents(), 0x3c, gate.sizeBytes());
-  Q4PrefillParams params{outputSize, inputSize};
+  Q4Params params{outputSize, inputSize};
 
   ComputeDispatch sum;
   sum.pipelineName = "prefill_linear_q4_sums32";
   sum.buffers = {{0, input}, {1, sums}};
-  sum.bytes = {{2, &params, sizeof(params)}};
+  sum.bytes = {{2, &inputSize, sizeof(inputSize)}};
   sum.threadgroups = {(rows + 31) / 32, 1, 1};
   sum.threadsPerThreadgroup = {256, 1, 1};
 
@@ -184,7 +184,6 @@ void profileRmsSums(MetalBackend &backend, uint32_t rows, uint32_t width,
   MetalBuffer sums = shared(
       backend, uint64_t{allocatedRows} * (width / kQuantGroup) * sizeof(float),
       label + " sums");
-  Q4PrefillParams params{width, width};
   ComputeDispatch rms{"norm_rms",
                       {{0, input}, {1, weight}, {2, output}},
                       {{3, &width, sizeof(width)}},
@@ -192,7 +191,7 @@ void profileRmsSums(MetalBackend &backend, uint32_t rows, uint32_t width,
                       {256, 1, 1}};
   ComputeDispatch sum{sumPipeline,
                       {{0, output}, {1, sums}},
-                      {{2, &params, sizeof(params)}},
+                      {{2, &width, sizeof(width)}},
                       {(rows + tileRows - 1) / tileRows, 1, 1},
                       {256, 1, 1}};
   ComputeDispatch fused{fusedPipeline,

@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import io
 import json
 import signal
@@ -14,8 +15,18 @@ from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
+from dev.tests.engine import native_peer
 from server import crash_trace
 from server import protocol as wire
+
+
+def ready_frame():
+    """The frame the server reads for a Ready event."""
+    return (
+        wire.FrameParser()
+        .consume(native_peer.serialize_event(wire.ReadyEvent(4, 131_072, False)))
+        .frame
+    )
 
 
 class CrashTraceTest(unittest.TestCase):
@@ -121,18 +132,7 @@ class CrashTraceTest(unittest.TestCase):
                 ring.start_generation(3, 1234)
                 outgoing = wire.serialize_message(wire.StatusRequestFrame(9))
                 ring.record_bytes(3, "client_to_engine", outgoing)
-                ring.record_frame(
-                    3,
-                    "engine_to_client",
-                    wire.encode_message(
-                        wire.ReadyEvent(
-                            44,
-                            4,
-                            131_072,
-                            int(wire.ReadyFeature.MULTIPLEXING),
-                        )
-                    ),
-                )
+                ring.record_frame(3, "engine_to_client", ready_frame())
                 path = ring.dump(
                     3,
                     RuntimeError("engine failed"),
@@ -164,6 +164,51 @@ class CrashTraceTest(unittest.TestCase):
                 )
                 self.assertEqual(len(list(directory.glob("*.json"))), 1)
 
+    def test_oversized_frame_leaves_a_marker_that_replay_refuses(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            with (
+                mock.patch.object(crash_trace, "DEFAULT_TRACE_DIRECTORY", directory),
+                mock.patch.object(crash_trace, "MAX_TRACE_BYTES", 64),
+            ):
+                ring = crash_trace.CrashTraceRing(
+                    ("splash", "serve-native"), enabled=True
+                )
+                ring.start_generation(1, 50)
+                small = wire.serialize_message(wire.StatusRequestFrame(1))
+                large = wire.serialize_message(
+                    wire.MaskResponseFrame(2, 3, bytes(4 * 64))
+                )
+                ring.record_bytes(1, "client_to_engine", small)
+                ring.record_bytes(1, "client_to_engine", large)
+                path = ring.dump(
+                    1, RuntimeError("failed"), process_returncode=1, last_status=None
+                )
+            document = json.loads(path.read_text())
+            self.assertEqual(document["omitted_frames"], 1)
+            kept, marker = document["frames"]
+            self.assertEqual(base64.b64decode(kept["frame_base64"]), small)
+            self.assertNotIn("frame_base64", marker)
+            self.assertEqual(marker["omitted_bytes"], len(large))
+            self.assertEqual(marker["sha256"], hashlib.sha256(large).hexdigest())
+            self.assertEqual(
+                base64.b64decode(marker["header_base64"]),
+                large[: wire.FRAME_HEADER_BYTES],
+            )
+            with (
+                mock.patch.object(crash_trace.subprocess, "Popen") as spawn,
+                self.assertRaisesRegex(ValueError, "cannot be replayed"),
+            ):
+                crash_trace.replay(path)
+            spawn.assert_not_called()
+
+    def test_disabled_ring_does_not_reencode_received_frames(self):
+        ring = crash_trace.CrashTraceRing(("splash", "serve-native"))
+        frame = ready_frame()
+        with mock.patch.object(crash_trace.wire, "serialize_frame") as serialize:
+            ring.record_frame(1, "engine_to_client", frame)
+        serialize.assert_not_called()
+
     def test_fake_process_factory_has_no_machine_global_trace(self):
         ring = crash_trace.CrashTraceRing(None)
         self.assertFalse(ring.active)
@@ -184,9 +229,9 @@ class CrashTraceTest(unittest.TestCase):
 
     def test_replay_waits_for_ready_and_replays_recorded_input(self):
         ready_program = (
-            "import sys; from server import protocol as w; "
-            "sys.stdout.buffer.write(w.serialize_message(w.ReadyEvent(1,4,"
-            "131072,int(w.ReadyFeature.MULTIPLEXING)))); "
+            "import sys; from dev.tests.engine import native_peer as n; "
+            "from server import protocol as w; "
+            "sys.stdout.buffer.write(n.serialize_event(w.ReadyEvent(4,131072,False))); "
             "sys.stdout.buffer.flush(); sys.stdin.buffer.read()"
         )
         with tempfile.TemporaryDirectory() as temporary:
@@ -234,10 +279,11 @@ class CrashTraceTest(unittest.TestCase):
 
     def test_replay_kills_an_engine_after_a_write_failure(self):
         program = (
-            "import os, signal, sys, time; from server import protocol as w; "
+            "import os, signal, sys, time; "
+            "from dev.tests.engine import native_peer as n; "
+            "from server import protocol as w; "
             "signal.signal(signal.SIGTERM, signal.SIG_IGN); os.close(0); "
-            "sys.stdout.buffer.write(w.serialize_message(w.ReadyEvent(1,4,"
-            "131072,int(w.ReadyFeature.MULTIPLEXING)))); "
+            "sys.stdout.buffer.write(n.serialize_event(w.ReadyEvent(4,131072,False))); "
             "sys.stdout.buffer.flush(); time.sleep(60)"
         )
         with self._replay_peer(program) as (path, engines):
@@ -248,25 +294,24 @@ class CrashTraceTest(unittest.TestCase):
             self.assertTrue(engine.stdin.closed and engine.stdout.closed)
 
     def test_replay_interrupts_a_blocked_write(self):
-        request = wire.RequestFrame(
+        request = native_peer.request_frame(
             request_id=7,
             priority=wire.RequestPriority.FOREGROUND,
-            absolute_deadline_unix_micros=1,
             remaining_deadline_micros=45_000_000,
             logical_max_output_tokens=16,
             prompt_tokens=(1,) * 262_144,
-            sampling=wire.SamplingParameters(),
             seed=99,
-            cohort=wire.Cohort.GREEDY,
-            constraint=wire.ConstraintMode.NONE,
         )
         for outcome in ("timeout", "protocol_error", "eof"):
             with self.subTest(outcome=outcome):
                 program = (
-                    "import os, signal, sys, time; from server import protocol as w; "
+                    "import os, signal, sys, time; "
+                    "from dev.tests.engine import native_peer as n; "
+                    "from server import protocol as w; "
                     "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-                    "sys.stdout.buffer.write(w.serialize_message(w.ReadyEvent(1,4,"
-                    "1048576,15))); sys.stdout.buffer.flush(); "
+                    "sys.stdout.buffer.write("
+                    "n.serialize_event(w.ReadyEvent(4,1048576,False))); "
+                    "sys.stdout.buffer.flush(); "
                     "sys.stdin.buffer.read(1); "
                     + {
                         "timeout": "",
@@ -308,8 +353,9 @@ class CrashTraceTest(unittest.TestCase):
     def test_replay_eof_interrupts_the_recorded_input_delay(self):
         frame = wire.serialize_message(wire.StatusRequestFrame(7))
         program = (
-            "import sys; from server import protocol as w; "
-            "sys.stdout.buffer.write(w.serialize_message(w.ReadyEvent(1,4,131072,15))); "
+            "import sys; from dev.tests.engine import native_peer as n; "
+            "from server import protocol as w; "
+            "sys.stdout.buffer.write(n.serialize_event(w.ReadyEvent(4,131072,False))); "
             "sys.stdout.buffer.flush(); "
             f"sys.stdin.buffer.read({len(frame)}); raise SystemExit(23)"
         )
@@ -329,9 +375,12 @@ class CrashTraceTest(unittest.TestCase):
         for returncode in (0, 23):
             with self.subTest(returncode=returncode):
                 program = (
-                    "import os, sys, time; from server import protocol as w; "
-                    "sys.stdout.buffer.write(w.serialize_message(w.ReadyEvent(1,4,"
-                    "131072,15))); sys.stdout.buffer.flush(); "
+                    "import os, sys, time; "
+                    "from dev.tests.engine import native_peer as n; "
+                    "from server import protocol as w; "
+                    "sys.stdout.buffer.write("
+                    "n.serialize_event(w.ReadyEvent(4,131072,False))); "
+                    "sys.stdout.buffer.flush(); "
                     "sys.stdin.buffer.read(); os.close(1); "
                     f"time.sleep(0.05); raise SystemExit({returncode})"
                 )
@@ -344,9 +393,10 @@ class CrashTraceTest(unittest.TestCase):
     def test_replay_reader_error_interrupts_schedule_and_process_wait(self):
         frame = wire.serialize_message(wire.StatusRequestFrame(7))
         program = (
-            "import signal, sys, time; from server import protocol as w; "
+            "import signal, sys, time; from dev.tests.engine import native_peer as n; "
+            "from server import protocol as w; "
             "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-            "sys.stdout.buffer.write(w.serialize_message(w.ReadyEvent(1,4,131072,15))); "
+            "sys.stdout.buffer.write(n.serialize_event(w.ReadyEvent(4,131072,False))); "
             "sys.stdout.buffer.flush(); "
             f"sys.stdin.buffer.read({len(frame)}); "
             "sys.stdout.buffer.write(b'NOPE' + bytes(20)); "
@@ -380,10 +430,10 @@ class CrashTraceTest(unittest.TestCase):
 
     def test_replay_reaps_an_engine_that_never_finishes(self):
         program = (
-            "import signal, sys, time; from server import protocol as w; "
+            "import signal, sys, time; from dev.tests.engine import native_peer as n; "
+            "from server import protocol as w; "
             "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-            "sys.stdout.buffer.write(w.serialize_message(w.ReadyEvent(1,4,"
-            "131072,int(w.ReadyFeature.MULTIPLEXING)))); "
+            "sys.stdout.buffer.write(n.serialize_event(w.ReadyEvent(4,131072,False))); "
             "sys.stdout.buffer.flush(); sys.stdin.buffer.read(); time.sleep(60)"
         )
         with self._replay_peer(program) as (path, engines):
@@ -413,23 +463,21 @@ class CrashTraceTest(unittest.TestCase):
 
     def test_replay_restamps_request_deadlines_from_replay_time(self):
         capture_program = (
-            "import sys; from server import protocol as w; "
-            "sys.stdout.buffer.write(w.serialize_message(w.ReadyEvent(1,4,"
-            "131072,int(w.ReadyFeature.MULTIPLEXING)))); "
+            "import sys; from dev.tests.engine import native_peer as n; "
+            "from server import protocol as w; "
+            "sys.stdout.buffer.write(n.serialize_event(w.ReadyEvent(4,131072,False))); "
             "sys.stdout.buffer.flush(); "
             "open(sys.argv[1], 'wb').write(sys.stdin.buffer.read())"
         )
-        request = wire.RequestFrame(
+        request = native_peer.request_frame(
             request_id=7,
             priority=wire.RequestPriority.FOREGROUND,
-            absolute_deadline_unix_micros=1,
             remaining_deadline_micros=45_000_000,
             logical_max_output_tokens=16,
             # Exceed pipe capacity to exercise successful partial writes too.
             prompt_tokens=(1, 2, 3) * 100_000,
             sampling=wire.SamplingParameters(0.5, 0.25, 8),
             seed=99,
-            cohort=wire.Cohort.CONSTRAINED,
             constraint=wire.ConstraintMode.TOKEN_MASK,
         )
         with tempfile.TemporaryDirectory() as temporary:
@@ -454,15 +502,9 @@ class CrashTraceTest(unittest.TestCase):
             self.assertEqual(crash_trace.replay(path), 0)
             finished = time.time_ns() // 1000
             replayed = captured.read_bytes()
-        parser = wire.FrameParser()
-        messages = []
-        while replayed:
-            step = parser.consume(replayed)
-            self.assertIsNone(step.issue)
-            replayed = replayed[step.consumed_bytes :]
-            if step.frame:
-                messages.append(wire.decode_frame(step.frame))
-        replayed_request, status_request = messages
+        (replayed_request, _), (status_request, _) = (
+            native_peer.ClientFrameReader().feed(replayed)
+        )
         self.assertEqual(status_request, wire.StatusRequestFrame(7))
         budget = request.remaining_deadline_micros
         self.assertGreaterEqual(

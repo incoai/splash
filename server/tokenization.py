@@ -10,10 +10,10 @@ from collections import OrderedDict
 class PromptTokenizer:
     MARKER = "<|im_end|>"
     MIN_PREFIX_CHARS = 4096
+    BUDGET_BYTES = 8 * 1024 * 1024
+    CAPACITY = 4
 
-    def __init__(self, tokenizer, *, budget_bytes=8 * 1024 * 1024, capacity=4):
-        if budget_bytes <= 0 or capacity <= 0:
-            raise ValueError("tokenizer cache limits must be positive")
+    def __init__(self, tokenizer):
         self.tokenizer = tokenizer
         self.enabled = self._supports_boundaries(tokenizer)
         self.marker_id = (
@@ -21,8 +21,6 @@ class PromptTokenizer:
             if self.enabled
             else None
         )
-        self.budget_bytes = budget_bytes
-        self.capacity = capacity
         self.entries = OrderedDict()
         self.bytes = self.hits = self.reused_tokens = 0
         self.lock = threading.Lock()
@@ -103,7 +101,7 @@ class PromptTokenizer:
                 return self._encode(text)
             packed = array("I", tokens).tobytes()
             size = sys.getsizeof(prefix) + sys.getsizeof(packed)
-            if size <= self.budget_bytes:
+            if size <= self.BUDGET_BYTES:
                 with self.lock:
                     # An extension replaces its earlier prefix; unrelated
                     # concurrent conversations retain their own LRU entries.
@@ -114,8 +112,8 @@ class PromptTokenizer:
                     self.entries[prefix] = packed
                     self.bytes += size
                     while (
-                        self.bytes > self.budget_bytes
-                        or len(self.entries) > self.capacity
+                        self.bytes > self.BUDGET_BYTES
+                        or len(self.entries) > self.CAPACITY
                     ):
                         old, previous = self.entries.popitem(last=False)
                         self.bytes -= sys.getsizeof(old) + sys.getsizeof(previous)
@@ -127,8 +125,8 @@ class PromptTokenizer:
                 "enabled": self.enabled,
                 "entries": len(self.entries),
                 "bytes": self.bytes,
-                "budget_bytes": self.budget_bytes,
-                "capacity": self.capacity,
+                "budget_bytes": self.BUDGET_BYTES,
+                "capacity": self.CAPACITY,
                 "hits": self.hits,
                 "reused_tokens": self.reused_tokens,
             }

@@ -2,6 +2,9 @@ build/
 .venv
 .venv.install.lock
 install/models/
+# Hermes homes of older checkouts, with their sessions and keys.
+install/agents/
+install/profiles/
 .DS_Store
 __pycache__/
 .ruff_cache/

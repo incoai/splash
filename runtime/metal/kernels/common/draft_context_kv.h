@@ -1,46 +1,39 @@
 #pragma once
 
 #include "metal/abi/KernelABI.h"
+#include "metal/kernels/common/rms_inverse.h"
 
+// One KV head of one context row: a row of context_kv holds the row's keys,
+// then its values (KWidth each). The keys are normalized and rotated into
+// the ring slot of the row's position; the values are copied there.
 inline void draft_context_kv_phase(
-    device const bfloat *context_qkv, device const bfloat *k_norm,
+    device const bfloat *context_kv, device const bfloat *k_norm,
     device const float *rope_cos, device const float *rope_sin,
-    device bfloat *keys, device bfloat *values,
-    DraftContextParams params, uint active_tokens, uint task,
+    device bfloat *keys, device bfloat *values, uint start_position,
+    uint active_tokens, uint task,
     uint thread_index, uint lane, uint simd_group,
     threadgroup float *reductions, threadgroup bfloat *normalized) {
   constexpr uint KVHeads = 8, HeadDim = 128, Window = SPLASH_DRAFT_SLIDING_WINDOW;
-  constexpr uint QWidth = 4096, KWidth = 1024, PackedWidth = 6144;
+  constexpr uint KWidth = KVHeads * HeadDim, RowWidth = 2 * KWidth;
   uint row = task / KVHeads;
   if (row >= active_tokens)
     return;
   uint head_index = task % KVHeads;
-  uint position = params.start_position + row;
+  uint position = start_position + row;
   uint slot = position % Window;
   device const bfloat *source =
-      context_qkv + ulong(row) * PackedWidth + QWidth + head_index * HeadDim;
-  device bfloat *key =
-      keys + (ulong(head_index) * params.cache_stride + slot) * HeadDim;
-  device bfloat *value =
-      values + ulong(head_index) * HeadDim * params.cache_stride + slot;
+      context_kv + ulong(row) * RowWidth + head_index * HeadDim;
+  device bfloat *key = keys + (ulong(head_index) * Window + slot) * HeadDim;
+  device bfloat *value = values + ulong(head_index) * HeadDim * Window + slot;
 
   float element = thread_index < HeadDim ? float(source[thread_index]) : 0.0f;
-  float square_sum = simd_sum(element * element);
-  if (lane == 0)
-    reductions[simd_group] = square_sum;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (thread_index == 0) {
-    float total = 0.0f;
-    for (uint i = 0; i < 8; ++i)
-      total += reductions[i];
-    reductions[0] = rsqrt(total / HeadDim + 1e-6f);
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float inverse = rms_inverse_of_sums(element * element, HeadDim,
+                                            reductions, thread_index, lane,
+                                            simd_group);
   if (thread_index < HeadDim) {
     normalized[thread_index] =
-        bfloat(element * reductions[0] * float(k_norm[thread_index]));
-    value[ulong(thread_index) * params.cache_stride] =
-        source[KWidth + thread_index];
+        bfloat(element * inverse * float(k_norm[thread_index]));
+    value[ulong(thread_index) * Window] = source[KWidth + thread_index];
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (thread_index < HeadDim / 2) {

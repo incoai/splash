@@ -1,0 +1,36 @@
+Splash contains the third-party material below, which keeps its own license.
+The SemIf code in server/judgments.py carries its MIT notice in that file.
+
+llama.cpp (https://github.com/ggml-org/llama.cpp)
+
+The IQ4_NL and MXFP4 values and the IQ1, IQ2 and IQ3 grids in
+runtime/metal/abi/QuantTables.h are ggml's kvalues_iq4nl, kvalues_mxfp4,
+iq1s_grid_gpu, iq2xxs_grid, iq2xs_grid, iq2s_grid, iq3xxs_grid and iq3s_grid
+(ggml/src/ggml-common.h), and the GGUF decoding in
+runtime/metal/kernels/common/quant_formats.h and the GGUF kernels built on it
+follow ggml's Metal dequantize.h and mul_mm.metal. They are compiled into
+splash.metallib. The tests' CPU reference,
+dev/tests/engine/GgufFormatReference.hpp, decodes the same blocks as ggml's
+dequantize_row_* (ggml/src/ggml-quants.c).
+
+MIT License
+
+Copyright (c) 2023-2026 The ggml authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
