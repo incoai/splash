@@ -1328,6 +1328,15 @@ and `REVISION`, `DRAFT_MODEL` and `LANGUAGE_ONLY=1` as its `--revision`,
 | `test-performance-real` | the native decode and partial-prefix benchmark, or with `BASELINE` its ABBA comparison with that build (`dev/benchmarks/backend_regression.py`) |
 | `release-check` | one model on this Mac ([Release check](#release-check)) |
 
+The runtime oracle accepts `--draft-selection greedy|lookahead`; pass it through
+`make test-real MODEL=... MODEL_RUNTIME_ORACLE_ARGS='--draft-selection lookahead'`
+to exercise the lossless decode checks with look-ahead proposals. The decode
+profiler accepts the same option through `DECODE_PROFILE_ARGS` and reports
+accepted draft tokens per lane-cycle. Both default to `greedy`. The immutable
+`ExecutionPlans` constructor accepts the draft selection mode; serving keeps
+its default of `Greedy` on every device family until replay and serving
+measurements justify promotion.
+
 `test-agent-real` runs Hermes in a profile of its own in the developer's Hermes
 root, `splash-test-<id>`, which moves into the run's folder under
 `build/release` when Hermes finishes.

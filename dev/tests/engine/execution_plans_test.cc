@@ -65,6 +65,8 @@ void covers(const Workspace &stride, const Workspace &needed, uint32_t lanes,
 void baselinePlans() {
   for (uint32_t family : {9U, 10U, 11U}) {
     const ExecutionPlans plans(device(family));
+    require(plans.draftSelection() == DraftSelection::Greedy,
+            "draft selection baseline changed");
     const Linear baseline(device(family));
     for (auto matrix : matrices) {
       uint64_t gateBound = 0;
@@ -294,6 +296,18 @@ void workspaceBounds() {
           "draft workspace ABI changed");
 }
 
+void draftSelectionChoices() {
+  for (uint32_t family : {9U, 10U, 11U}) {
+    const ExecutionPlans plans(device(family), DraftSelection::Lookahead);
+    require(plans.draftSelection() == DraftSelection::Lookahead,
+            "look-ahead choice was not selected");
+    rejects([&] { ExecutionPlans(device(family), DraftSelection(255)); });
+    const ExecutionPlans greedy(device(family), DraftSelection::Greedy);
+    require(greedy.draftSelection() == DraftSelection::Greedy,
+            "explicit greedy selection changed");
+  }
+}
+
 void invalidLookupsAndContextEdges() {
   const ExecutionPlans plans(device());
   const auto kvLayout = attentionShapes[0].layout;
@@ -326,6 +340,7 @@ int main() {
     ggufMoePlans();
     unknownCoreCount();
     workspaceBounds();
+    draftSelectionChoices();
     invalidLookupsAndContextEdges();
     std::cout << "PASS execution plans: device policies, device MoE tiles, B1-B4 "
                  "and prefill workspace bounds (CPU only)\n";

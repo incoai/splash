@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ops/DraftAttention.hpp"
+#include "ops/DraftSelector.hpp"
 #include "ops/Linear.hpp"
 #include "ops/MoE.hpp"
 #include "ops/PagedAttention.hpp"
@@ -13,7 +14,11 @@ namespace splash::ops {
 // object and production models borrow it; it never changes after creation.
 class ExecutionPlans final {
 public:
-  explicit ExecutionPlans(const DeviceCapabilities &device);
+  explicit ExecutionPlans(const DeviceCapabilities &device,
+                          DraftSelection selection = DraftSelection::Greedy);
+  [[nodiscard]] DraftSelection draftSelection() const noexcept {
+    return draftSelection_;
+  }
   [[nodiscard]] const Linear &linear() const noexcept { return linear_; }
 
   [[nodiscard]] PrefillAttentionPlan prefillAttention(
@@ -46,6 +51,7 @@ private:
   [[nodiscard]] MoeConfig moeConfig(MoeShape shape, uint32_t rows, MoePhase phase) const;
 
   Linear linear_;
+  DraftSelection draftSelection_ = DraftSelection::Greedy;
   uint32_t moeRouteWideRows_;
   MoeExpertSimdgroups moeDecodeSimdgroups_ = MoeExpertSimdgroups::Eight;
   uint32_t appleGpuFamily_ = 0;

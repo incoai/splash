@@ -23,10 +23,13 @@ void include(Workspace &bound, const Workspace &required,
 
 } // namespace
 
-ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device)
-    : linear_(device), moeRouteWideRows_(moeRouteWideRows(plannedGpuCores(device))),
+ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device, DraftSelection selection)
+    : linear_(device), draftSelection_(selection), moeRouteWideRows_(moeRouteWideRows(plannedGpuCores(device))),
       moeDecodeSimdgroups_(moeDecodeSimdgroups(device.appleGpuFamily)),
-      appleGpuFamily_(device.appleGpuFamily) {}
+      appleGpuFamily_(device.appleGpuFamily) {
+  if (selection != DraftSelection::Greedy && selection != DraftSelection::Lookahead)
+    throw std::invalid_argument("invalid draft selection choice");
+}
 
 PrefillAttentionPlan ExecutionPlans::prefillAttention(
     uint32_t rows, uint32_t queryHeads, kv::Layout layout) const {

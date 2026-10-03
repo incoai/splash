@@ -9,6 +9,11 @@
 
 namespace splash::ops {
 
+// Greedy walks the highest-scoring candidate at each position. Lookahead
+// maximizes expected accepted draft length under the selector probabilities.
+// Sampling lanes draw ancestrally in either mode; verification is unchanged.
+enum class DraftSelection : uint8_t { Greedy, Lookahead };
+
 struct DraftSelectorWorkspace final {
   uint64_t partialIdsBytes = 0;
   uint64_t partialValuesBytes = 0;
@@ -41,11 +46,16 @@ struct DraftCodebooks final {
 // metal/kernels/decode/sampling.metal): each lane keeps the
 // SPLASH_DRAFT_CANDIDATES most likely draft tokens of every proposal
 // position, scores each candidate with its edge from the previous position's
-// choice, and walks the SPLASH_DRAFT_PROPOSAL_TOKENS positions greedily or,
-// for a sampling lane, drawing at its temperature.
+// choice, and walks the SPLASH_DRAFT_PROPOSAL_TOKENS positions greedily or
+// with lookahead. A sampling lane draws at its temperature in either mode.
 class DraftSelector final {
 public:
-  explicit DraftSelector(uint32_t vocabulary);
+  explicit DraftSelector(uint32_t vocabulary,
+                         DraftSelection selection = DraftSelection::Greedy);
+
+  [[nodiscard]] DraftSelection draftSelection() const noexcept {
+    return selection_;
+  }
 
   // Exact scratch/output bytes for that many proposal positions.
   [[nodiscard]] static DraftSelectorWorkspace workspace(uint32_t positions);
@@ -56,6 +66,7 @@ public:
 
 private:
   uint32_t vocabulary_ = 0;
+  DraftSelection selection_ = DraftSelection::Greedy;
 };
 
 } // namespace splash::ops

@@ -16,9 +16,12 @@ constexpr uint32_t kEdgeThreads = 256;
 
 } // namespace
 
-DraftSelector::DraftSelector(uint32_t vocabulary) : vocabulary_(vocabulary) {
+DraftSelector::DraftSelector(uint32_t vocabulary, DraftSelection selection)
+    : vocabulary_(vocabulary), selection_(selection) {
   if (!vocabulary)
     throw std::invalid_argument("invalid draft selector vocabulary");
+  if (selection != DraftSelection::Greedy && selection != DraftSelection::Lookahead)
+    throw std::invalid_argument("invalid draft selection choice");
 }
 
 DraftSelectorWorkspace DraftSelector::workspace(uint32_t positions) {
@@ -59,7 +62,9 @@ void DraftSelector::add(metal::CommandGraph &graph,
              codebooks.successor},
             params, {uint64_t{lanes} * kPositions, 1, 1},
             {kEdgeThreads, 1, 1});
-  graph.add("draft_select_dflash",
+  graph.add(selection_ == DraftSelection::Lookahead
+                ? "draft_select_dflash_lookahead"
+                : "draft_select_dflash",
             {buffers.candidates, buffers.unary, buffers.partialValues,
              buffers.uniforms, buffers.proposedTokens,
              buffers.proposalProbabilities},
