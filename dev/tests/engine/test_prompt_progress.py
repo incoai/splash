@@ -1,6 +1,5 @@
 import json
 import unittest
-from dataclasses import replace
 
 from dev.tests.engine.test_runtime import request
 from dev.tests.test_server import FakeRuntime, Harness, Plan
@@ -12,9 +11,9 @@ class ProgressRuntime(FakeRuntime):
     def submit(self, request, *, on_event, on_complete):
         def emit(call, event):
             on_event(call, event)
-            if request.return_progress and isinstance(event, wire.StartEvent):
+            if request.frame.return_progress and isinstance(event, wire.StartEvent):
                 counts = sorted(
-                    {event.matched_prompt_tokens, len(request.prompt_tokens)}
+                    {event.matched_prompt_tokens, len(request.frame.prompt_tokens)}
                 )
                 for index, count in enumerate(counts):
                     on_event(
@@ -37,6 +36,7 @@ class PromptProgressTests(unittest.TestCase):
     def test_all_streams_are_opt_in_and_preserve_completion(self):
         paths = (
             "/v1/chat/completions",
+            "/v1/completions",
             "/v1/responses",
             "/v1/messages?beta=true",
         )
@@ -58,6 +58,8 @@ class PromptProgressTests(unittest.TestCase):
                                 body["input"] = "Hi"
                                 body.pop("max_tokens")
                                 body["max_output_tokens"] = 8
+                            elif path == "/v1/completions":
+                                body["prompt"] = "Hi"
                             else:
                                 body["messages"] = [{"role": "user", "content": "Hi"}]
                             status, _, payload = harness.request("POST", path, body)
@@ -69,7 +71,7 @@ class PromptProgressTests(unittest.TestCase):
                                 if "prompt_progress" in event
                             ]
                             self.assertEqual(
-                                runtime.requests[0].return_progress, enabled
+                                runtime.requests[0].frame.return_progress, enabled
                             )
                             self.assertIn(b"plain answer", payload)
                             if not enabled:
@@ -99,6 +101,13 @@ class PromptProgressTests(unittest.TestCase):
                                 self.assertTrue(
                                     all(
                                         event["choices"][0]["delta"] == {}
+                                        for event in progress_events
+                                    )
+                                )
+                            elif path == "/v1/completions":
+                                self.assertTrue(
+                                    all(
+                                        event["choices"][0]["text"] == ""
                                         for event in progress_events
                                     )
                                 )
@@ -151,7 +160,12 @@ class PromptProgressTests(unittest.TestCase):
         runtime = ProgressRuntime()
         harness = Harness(runtime)
         self.addCleanup(harness.close)
-        for path in ("/v1/chat/completions", "/v1/responses", "/v1/messages"):
+        for path in (
+            "/v1/chat/completions",
+            "/v1/completions",
+            "/v1/responses",
+            "/v1/messages",
+        ):
             for extra in (
                 {"return_progress": True},
                 {"return_progress": True, "stream": False},
@@ -161,6 +175,7 @@ class PromptProgressTests(unittest.TestCase):
                 with self.subTest(path=path, extra=extra):
                     body = {
                         "messages": [{"role": "user", "content": "Hi"}],
+                        "prompt": "Hi",
                         "input": "Hi",
                         "max_tokens": 8,
                         **extra,
@@ -172,11 +187,9 @@ class PromptProgressTests(unittest.TestCase):
     def test_runtime_rejects_unsolicited_or_regressing_progress(self):
         def call(enabled=True):
             result = RuntimeCall(
-                None, 1, 1, replace(request(10), return_progress=enabled), None, None
+                None, 1, 1, request(10, return_progress=enabled), None, None
             )
-            result._record_start(
-                wire.StartEvent(1, wire.CacheDisposition.PREFIX_HIT, 0, 1, 8192)
-            )
+            result._record_start(wire.StartEvent(1, 0, 1))
             return result
 
         self.assertIsNotNone(

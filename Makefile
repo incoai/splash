@@ -11,12 +11,26 @@ PYTHON = $(VENV)/bin/python
 VENV_STAMP = $(VENV)/.requirements-installed
 INSTALL_LOCK = $(VENV).install.lock
 REQUIREMENTS := install/requirements.txt
-PYTHON_CANDIDATES := python3.13 python3 python3.12 python3.14
+PYTHON_CANDIDATES ?= python3.13 python3 python3.12 python3.14
 BUILD_ID_PYTHON ?= python3
 SPLASH_MAKEFILE := $(abspath $(firstword $(MAKEFILE_LIST)))
-MODEL_INSTALL = $(PYTHON) install/models.py
 MODEL ?=
-MODEL_ROOT := install/models/$(MODEL)
+# MODEL with the installer's source options selects one installation
+# (DEVELOPMENT.md, Upstream model loading); every model target passes them.
+# LANGUAGE_ONLY=1 selects the text-only installation; 0 or empty, the one
+# with vision.
+REVISION ?=
+DRAFT_MODEL ?=
+LANGUAGE_ONLY ?=
+MODEL_ARGS = --model "$(MODEL)" $(if $(REVISION),--revision "$(REVISION)") \
+	$(if $(DRAFT_MODEL),--draft-model "$(DRAFT_MODEL)") \
+	$(if $(filter 1,$(LANGUAGE_ONLY)),--language-only)
+MODEL_INSTALL = $(PYTHON) install/models.py $(MODEL_ARGS)
+# The installation's selection link, as the installer names it.
+MODEL_ROOT = $(if $(MODEL),$(shell $(MODEL_INSTALL) link))
+# Where the release targets record the model's results. No ':' in the name:
+# CI's artifact upload refuses paths holding one.
+MODEL_RESULTS = build/release/$(subst :,--,$(subst /,--,$(MODEL)))
 
 BUILD := build
 TARGET := $(BUILD)/splash
@@ -35,14 +49,14 @@ PRODUCTION_AIRS := $(addprefix $(METAL_BUILD)/, \
 	$(addsuffix .air,$(PRODUCTION_KERNEL_NAMES)))
 KERNEL_HEADERS := $(sort $(wildcard runtime/metal/abi/*.h \
 	runtime/metal/kernels/common/*.h))
-# Placement-sparse support became queryable in macOS 26.4
-# (MTLDevice.supportsPlacementSparse). The engine refuses older systems at
-# startup; every binary and metallib records the same floor.
+# macOS 26.4 is the tested floor: the engine refuses older systems at
+# startup, and every binary and metallib records it. The MPP kernels need
+# macOS 26.2 or newer, and MPP chooses its code path by this target.
 MACOS_MIN_VERSION := 26.4
 MACOS_TARGET_FLAG := -mmacosx-version-min=$(MACOS_MIN_VERSION)
 PROD_METALFLAGS := -std=metal4.0 -O3 -Wall -Wextra -Werror -Iruntime \
 	$(MACOS_TARGET_FLAG)
-ENGINE_CXXFLAGS := -std=c++20 -O3 -Wall -Wextra -Werror -Iruntime \
+ENGINE_CXXFLAGS := -std=c++20 -O3 -Wall -Wextra -Werror -Iruntime -I$(BUILD)/engine \
 	$(MACOS_TARGET_FLAG)
 ENGINE_OBJCXXFLAGS := $(ENGINE_CXXFLAGS) -fobjc-arc
 LIB := $(BUILD)/splash.metallib
@@ -57,13 +71,17 @@ install: model-selection platform-check
 		-f "$(SPLASH_MAKEFILE)" _install
 
 _install: model-selection _install-environment
-	$(MODEL_INSTALL) --model "$(MODEL)" prepare
+	$(MODEL_INSTALL) prepare
 
 model-selection:
 	@test -n "$(MODEL)" || { \
-		echo "error: set MODEL to a supported full Hugging Face repository ID" >&2; \
+		echo "error: set MODEL to a model ID as splash serve --model takes it (OWNER/REPO[:VARIANT])" >&2; \
 		exit 1; \
 	}
+	@case "$(LANGUAGE_ONLY)" in ""|0|1) ;; *) \
+		echo "error: LANGUAGE_ONLY is 1 (text only) or 0" >&2; \
+		exit 1;; \
+	esac
 
 platform-check:
 	@test "$(SYSTEM_NAME)" = Darwin && test "$(SYSTEM_ARCH)" = arm64 || { \
@@ -85,6 +103,11 @@ install-environment:
 	@/usr/bin/lockf -k "$(INSTALL_LOCK)" $(MAKE) --no-print-directory \
 		-f "$(SPLASH_MAKEFILE)" _install-environment
 
+# The environment is created from the interpreter under the candidate's
+# installation prefix (sys.base_prefix). A symlinked launcher, such as uv's,
+# names a directory without the standard library, and a resolved path names a
+# versioned Homebrew keg that brew upgrade deletes; Homebrew's prefix is its
+# stable opt path.
 _install-environment:
 	@set -eu; \
 	if test -f "$(VENV)/pyvenv.cfg" && test -x "$(PYTHON)" \
@@ -96,7 +119,7 @@ _install-environment:
 		bootstrap=; \
 		for candidate in $(PYTHON_CANDIDATES); do \
 			command -v "$$candidate" >/dev/null 2>&1 || continue; \
-			base=$$("$$candidate" -c 'import sys; print(getattr(sys, "_base_executable", sys.executable))') \
+			base=$$("$$candidate" -c 'import os, sys; path = os.path.join(sys.base_prefix, "bin", "python%d.%d" % sys.version_info[:2]); print(path if os.path.exists(path) else getattr(sys, "_base_executable", sys.executable))') \
 				|| continue; \
 			"$$base" -c 'import sys; raise SystemExit(not ((3, 12) <= sys.version_info[:2] < (3, 15)))' \
 				>/dev/null 2>&1 || continue; \
@@ -140,15 +163,19 @@ preflight: model-selection
 		echo "error: Splash is not installed; run 'make install MODEL=$(MODEL)' first" >&2; \
 		exit 1; \
 	}
-	@$(MODEL_INSTALL) --model "$(MODEL)" verify
+	@$(MODEL_INSTALL) verify
 	@$(PYTHON) -m pip check >/dev/null
 	@TRANSFORMERS_VERBOSITY=error $(PYTHON) -c 'import server.server'
 
+# The installer's restarts without the Hub, a full source hash and the
+# prepared weights a load of the installation wrote (DEVELOPMENT.md, Release
+# check).
 verify-models: preflight
-	@$(MODEL_INSTALL) --model "$(MODEL)" verify --full
+	@$(PYTHON) dev/tools/installer_restarts.py $(MODEL_ARGS) \
+		--output "$(MODEL_RESULTS)/prepared.json"
 
 serve: preflight $(TARGET)
-	./splash serve --model "$(MODEL)"
+	./splash serve $(MODEL_ARGS)
 
 $(BUILD):
 	mkdir -p $(BUILD)
@@ -198,16 +225,23 @@ BUILD_ID_CONSTANT_ARGS = \
 	--constant 'production_metalflags=$(PROD_METALFLAGS)'
 ENGINE_MAIN_OBJECT := $(ENGINE_BUILD)/main.o
 ENGINE_METAL_RUNTIME_OBJECT := $(ENGINE_BUILD)/metal/MetalBackend.o
+# MetalBackend with the test seam metal/BackendInstrumentation.hpp declares.
+# Only tests and benchmarks link it, ahead of the engine library, whose own
+# MetalBackend object the linker then never pulls.
+ENGINE_INSTRUMENTED_METAL_OBJECT := $(ENGINE_BUILD)/metal/MetalBackendInstrumented.o
 ENGINE_CPP_SOURCES := \
 	runtime/ops/DraftAttention.cpp \
+	runtime/ops/DraftSelector.cpp \
 	runtime/ops/Embedding.cpp \
 	runtime/ops/ExecutionPlans.cpp \
 	runtime/ops/GDN.cpp \
 	runtime/ops/Linear.cpp \
+	runtime/ops/LinearGguf.cpp \
 	runtime/ops/MoE.cpp \
 	runtime/ops/Normalization.cpp \
 	runtime/ops/PagedAttention.cpp \
 	runtime/ops/RoPE.cpp \
+	runtime/ops/RowCopy.cpp \
 	runtime/ops/Sampling.cpp \
 	runtime/metal/DeviceCapabilities.cpp \
 	runtime/engine/MemoryPlan.cpp \
@@ -215,8 +249,10 @@ ENGINE_CPP_SOURCES := \
 	runtime/engine/Cache.cpp \
 	runtime/engine/Engine.cpp \
 	runtime/engine/MemoryGovernor.cpp \
+	runtime/engine/MemoryControl.cpp \
 	runtime/engine/KvPool.cpp \
 	runtime/engine/KvCache.cpp \
+	runtime/engine/KvPageTier.cpp \
 	runtime/engine/StateCache.cpp \
 	runtime/model/DraftContextPlan.cpp \
 	runtime/engine/Protocol.cpp \
@@ -225,14 +261,27 @@ ENGINE_CPP_SOURCES := \
 	runtime/engine/MemoryAudit.cpp \
 	runtime/engine/Status.cpp \
 	runtime/model/WeightStore.cpp \
+	runtime/model/GgufFile.cpp \
+	runtime/model/GgufImage.cpp \
+	runtime/model/GgufTarget.cpp \
+	runtime/model/AffineTarget.cpp \
+	runtime/model/AffinePreparation.cpp \
+	runtime/model/DraftCheckpoint.cpp \
+	runtime/model/PreparedWeights.cpp \
+	runtime/model/GgufPreparation.cpp \
 	runtime/model/Qwen3_6Moe.cpp \
 	runtime/model/Qwen3_8.cpp \
 	runtime/model/QwenVision.cpp \
+	runtime/model/VisionPreparation.cpp \
+	runtime/model/VisionLoader.cpp \
 	runtime/model/QwenTarget.cpp \
+	runtime/model/QwenTargetLoader.cpp \
 	runtime/model/DFlashDraft.cpp \
 	runtime/model/ModelFactory.cpp \
+	runtime/model/SlotFile.cpp \
 	runtime/model/QwenState.cpp
 ENGINE_MM_SOURCES := \
+	runtime/model/SafetensorsCheckpoint.mm \
 	runtime/model/ModelDescriptor.mm \
 	runtime/model/Runtime.mm \
 	runtime/model/RuntimeArenas.mm \
@@ -245,8 +294,10 @@ ENGINE_OBJECTS := \
 	$(patsubst runtime/%.mm,$(ENGINE_BUILD)/%.o,$(ENGINE_MM_SOURCES)) \
 	$(ENGINE_METAL_RUNTIME_OBJECT)
 PRODUCTION_CONFIG_TARGETS := $(ENGINE_OBJECTS) $(ENGINE_MAIN_OBJECT) \
-	$(ENGINE_LIBRARY) $(PRODUCTION_AIRS) $(LIB) $(TARGET)
-ENGINE_DEPFILES := $(ENGINE_OBJECTS:.o=.d) $(ENGINE_MAIN_OBJECT:.o=.d)
+	$(ENGINE_INSTRUMENTED_METAL_OBJECT) $(ENGINE_LIBRARY) $(PRODUCTION_AIRS) \
+	$(LIB) $(TARGET)
+ENGINE_DEPFILES := $(ENGINE_OBJECTS:.o=.d) $(ENGINE_MAIN_OBJECT:.o=.d) \
+	$(ENGINE_INSTRUMENTED_METAL_OBJECT:.o=.d)
 
 -include $(ENGINE_DEPFILES)
 
@@ -263,6 +314,23 @@ $(BUILD_ID_STAMP): force-build-identity | $(ENGINE_BUILD)
 $(BUILD_ID_HEADER): $(BUILD_ID_STAMP)
 	@:
 
+# Cache identities follow only the code that writes prepared bytes
+# (dev/tools/weight_preparation_identity.py). Make compares the header's
+# content with the identities when it starts, read-only, and rewrites it
+# only when they differ: an edited input, a new one or a tree copied with old
+# timestamps regenerates it, and an unchanged tree leaves every object that
+# uses it current. The preparation adapters under runtime/model include it:
+# their objects depend on it through their depfiles, and on a clean build it
+# is generated before any model object compiles.
+WEIGHT_PREPARATION_HEADER := $(ENGINE_BUILD)/WeightPreparationIdentity.hpp
+WEIGHT_PREPARATION_STALE := $(shell $(BUILD_ID_PYTHON) dev/tools/weight_preparation_identity.py \
+	--root . --header $(WEIGHT_PREPARATION_HEADER) --stale)
+
+$(WEIGHT_PREPARATION_HEADER): $(if $(WEIGHT_PREPARATION_STALE),force-build-identity) | $(ENGINE_BUILD)
+	@$(BUILD_ID_PYTHON) dev/tools/weight_preparation_identity.py --root . --header $@
+
+$(filter $(ENGINE_BUILD)/model/%.o,$(ENGINE_OBJECTS)): | $(WEIGHT_PREPARATION_HEADER)
+
 $(ENGINE_BUILD)/%.o: runtime/%.cpp
 	@mkdir -p $(dir $@)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_CXXFLAGS) $(ENGINE_DEPFLAGS) -c $< -o $@
@@ -274,6 +342,11 @@ $(ENGINE_BUILD)/%.o: runtime/%.mm
 $(ENGINE_METAL_RUNTIME_OBJECT): runtime/metal/MetalBackend.mm
 	@mkdir -p $(dir $@)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_OBJCXXFLAGS) $(ENGINE_DEPFLAGS) -c $< -o $@
+
+$(ENGINE_INSTRUMENTED_METAL_OBJECT): runtime/metal/MetalBackend.mm
+	@mkdir -p $(dir $@)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_OBJCXXFLAGS) $(ENGINE_DEPFLAGS) \
+		-DSPLASH_BACKEND_INSTRUMENTATION=1 -c $< -o $@
 
 $(ENGINE_MAIN_OBJECT): runtime/main.mm $(BUILD_ID_HEADER)
 	@mkdir -p $(dir $@)
@@ -311,8 +384,8 @@ KERNEL_SOURCE_NAMES_DIGEST := $(shell printf '%s\0' $(sort $(PRODUCTION_KERNEL_S
 PRODUCTION_AIR_CONFIG := $(CONFIG_DIGEST)-$(KERNEL_HEADER_NAMES_DIGEST)
 PRODUCTION_LIB_CONFIG := $(PRODUCTION_AIR_CONFIG)-$(KERNEL_SOURCE_NAMES_DIGEST)
 TEST_KERNEL_CONFIG := $(TEST_CONFIG_DIGEST)-$(KERNEL_HEADER_NAMES_DIGEST)
-TEST_KERNEL_CONFIG_TARGETS := $(TEST_Q8_KERNEL_AIRS) \
-	$(TEST_Q8_ATTENTION_LIB)
+TEST_KERNEL_CONFIG_TARGETS := $(TEST_Q8_KERNEL_AIRS) $(TEST_RESIDENCY_AIR) \
+	$(TEST_Q8_ATTENTION_LIB) $(TEST_GGUF_DEQUANT_AIR) $(TEST_GGUF_DEQUANT_LIB)
 PRODUCTION_CONFIG_TARGETS := $(filter-out $(PRODUCTION_AIRS) $(LIB),$(PRODUCTION_CONFIG_TARGETS))
 TEST_CONFIG_TARGETS := $(filter-out $(TEST_KERNEL_CONFIG_TARGETS),$(TEST_CONFIG_TARGETS))
 

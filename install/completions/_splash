@@ -7,7 +7,7 @@ _splash() {
     local word helper
     local -a models
     if (( CURRENT == 2 )); then
-        compadd -- serve claude codex opencode hermes
+        compadd -- serve claude codex opencode hermes pi
         return
     fi
     [[ $words[2] == serve ]] || return 0

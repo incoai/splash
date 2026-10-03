@@ -26,6 +26,12 @@ class ModelCatalogTests(unittest.TestCase):
         patch = mock.patch.object(catalog.urllib.request, "urlopen")
         self.urlopen = patch.start()
         self.addCleanup(patch.stop)
+        # Every test starts online, whatever the caller's environment says.
+        patch = mock.patch.dict(catalog.os.environ)
+        patch.start()
+        self.addCleanup(patch.stop)
+        for name in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
+            catalog.os.environ.pop(name, None)
 
     def response(self, payload):
         self.urlopen.return_value.__enter__.return_value = io.BytesIO(
@@ -113,6 +119,22 @@ class ModelCatalogTests(unittest.TestCase):
             self.output.unlink()
             process.side_effect = OSError("cannot spawn")
             catalog.spawn_refresh()
+
+    def test_offline_environment_skips_background_refresh(self):
+        # The cache is missing, so only the environment can skip the refresh.
+        # HF_HUB_OFFLINE, when set, decides alone, as huggingface_hub reads it.
+        for environment, spawns in (
+            ({"HF_HUB_OFFLINE": "1"}, False),
+            ({"TRANSFORMERS_OFFLINE": "yes"}, False),
+            ({"HF_HUB_OFFLINE": "0", "TRANSFORMERS_OFFLINE": "1"}, True),
+        ):
+            with (
+                self.subTest(environment=environment),
+                mock.patch.dict(catalog.os.environ, environment),
+                mock.patch.object(catalog.subprocess, "Popen") as process,
+            ):
+                catalog.spawn_refresh()
+                self.assertEqual(process.called, spawns)
 
 
 if __name__ == "__main__":

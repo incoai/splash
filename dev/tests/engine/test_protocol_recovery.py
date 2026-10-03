@@ -4,9 +4,9 @@ import unittest
 from itertools import product
 from unittest import mock
 
-from dev.tests.test_server import FakeRuntime, Harness, Plan
+from dev.tests.test_server import FOREVER, FakeRuntime, Harness, Plan
+from dev.tests.tool_output import argument_grammar, project
 from server import errors as api_errors
-from server import output as model_output
 from server import server as api
 from server import tool_schema
 from server.api_shapes import (
@@ -122,6 +122,18 @@ class ProtocolRecoveryTests(unittest.TestCase):
                 self.assertEqual(status, 200, payload)
                 self.assertIn(b"because ", payload)
 
+    def test_chat_body_cannot_set_thinking_display(self):
+        # Only Messages hides reasoning, through its thinking.display.
+        harness = self.harness(FakeRuntime(Plan([[1], [2], [3]])))
+        body = request_body(thinking_display="omitted")
+        status, _, payload = harness.request("POST", "/v1/chat/completions", body)
+        self.assertEqual(status, 200, payload)
+        message = json.loads(payload)["choices"][0]["message"]
+        self.assertEqual(message["reasoning_content"], "because ")
+        self.assertEqual(
+            harness.app.prepare(body, deadline=FOREVER).thinking_display, "summarized"
+        )
+
     def test_omitted_tool_roundtrip_and_summarized_compatibility(self):
         codec = ThinkingCodec()
         signature = codec.encode("inspect before acting")
@@ -160,11 +172,12 @@ class ProtocolRecoveryTests(unittest.TestCase):
             )
             self.assertEqual(chat["messages"][2]["tool_call_id"], "t1")
 
-    def test_visible_foreign_thinking_can_continue_but_hidden_content_needs_its_key(
-        self,
-    ):
-        foreign_signature = ThinkingCodec().encode("foreign reasoning")
-        for visible in ("visible reasoning", ""):
+    def test_foreign_thinking_keeps_visible_history_and_drops_hidden_content(self):
+        # Other providers' signatures, and ours under another key, are opaque.
+        for signature, visible in product(
+            ("malformed-client-token", ThinkingCodec().encode("private reasoning")),
+            ("visible reasoning", ""),
+        ):
             harness = self.harness(FakeRuntime(Plan([[4]])))
             body = request_body(
                 messages=[
@@ -175,7 +188,7 @@ class ProtocolRecoveryTests(unittest.TestCase):
                             {
                                 "type": "thinking",
                                 "thinking": visible,
-                                "signature": foreign_signature,
+                                "signature": signature,
                             },
                             {"type": "text", "text": "hello"},
                         ],
@@ -184,16 +197,16 @@ class ProtocolRecoveryTests(unittest.TestCase):
                 ]
             )
             for path in ("/v1/messages/count_tokens", "/v1/messages"):
-                with self.subTest(visible=bool(visible), path=path):
+                with self.subTest(
+                    signature=signature[:16], visible=bool(visible), path=path
+                ):
                     status, _, payload = harness.request("POST", path, body)
-                    self.assertEqual(status, 200 if visible else 400, payload)
-                    if not visible:
-                        self.assertIn(b"invalid signature in thinking block", payload)
-            if visible:
-                converted = anthropic_to_chat_prompt(
-                    body, thinking_resolver=harness.app.thinking_codec.decode
-                )
-                self.assertEqual(converted["messages"][1]["reasoning_content"], visible)
+                    self.assertEqual(status, 200, payload)
+                    history = harness.tokenizer.templates[-1][0]
+                    self.assertEqual(history[1]["content"], "hello")
+                    self.assertEqual(
+                        history[1].get("reasoning_content"), visible or None
+                    )
 
     def test_hidden_thinking_survives_display_changes_and_tool_roundtrips(self):
         harness = self.harness(
@@ -258,14 +271,9 @@ class ProtocolRecoveryTests(unittest.TestCase):
             sum(message["role"] == "tool" for message in rendered_history), 3
         )
 
-    def test_hidden_history_rejects_invalid_or_other_instance_signatures_before_submit(
-        self,
-    ):
+    def test_hidden_history_rejects_malformed_signatures_before_submit(self):
         harness = self.harness(FakeRuntime())
-        for signature in (
-            "malformed-client-token",
-            ThinkingCodec().encode("private reasoning"),
-        ):
+        for signature in (7, None, ["token"]):
             for path in ("/v1/messages", "/v1/messages/count_tokens"):
                 body = request_body(
                     messages=[
@@ -287,8 +295,6 @@ class ProtocolRecoveryTests(unittest.TestCase):
                 self.assertEqual(status, 400, payload)
                 error = json.loads(payload)["error"]
                 self.assertEqual(error["type"], "invalid_request_error")
-                self.assertNotIn("private reasoning", error["message"])
-                self.assertNotIn(signature, error["message"])
         self.assertFalse(harness.backend.runtime.requests)
 
     def test_thinking_signature_authentication_and_size_limits(self):
@@ -339,7 +345,7 @@ class ProtocolRecoveryTests(unittest.TestCase):
             {"role": "tool", "tool_call_id": "interrupted", "content": "interrupted"},
         ]
         original = copy.deepcopy(source)
-        normalized = normalize_messages(source)
+        normalized = normalize_messages(source, vision=True, deadline=FOREVER)
         projected = template_messages(normalized)
         self.assertEqual(source, original)
         self.assertEqual(
@@ -431,7 +437,7 @@ class ProtocolRecoveryTests(unittest.TestCase):
                 "properties": {"value": union},
                 "required": ["value"],
             }
-            grammar = tool_schema._tool_arguments_grammar(schema)
+            grammar = argument_grammar(schema)
             generated, _ = json.JSONDecoder().raw_decode(grammar.split("%json ", 1)[1])
             generated.pop("x-guidance", None)
             self.assertEqual(generated, union)
@@ -451,15 +457,18 @@ class ProtocolRecoveryTests(unittest.TestCase):
                     + json.dumps(value)
                     + "\n</parameter>\n</function>\n</tool_call>"
                 )
-                _, calls = model_output.parse_tool_calls(text, 1, policy)
+                if value is invalid:
+                    # Typed as written, the value fails validation.
+                    with self.assertRaisesRegex(
+                        api.APIError,
+                        rf"^invalid arguments for echo at \$\.value: {value!r} ",
+                    ):
+                        project(text, policy)
+                    continue
+                _, calls, _ = project(text, policy)
                 self.assertEqual(
                     json.loads(calls[0]["function"]["arguments"]), {"value": value}
                 )
-                if value is invalid:
-                    with self.assertRaises(api.APIError):
-                        model_output.validate_tool_calls(calls, policy)
-                else:
-                    model_output.validate_tool_calls(calls, policy)
 
     def test_anthropic_overflow_has_actual_counts_for_text_and_image_precheck(self):
         harness = self.harness(FakeRuntime(), max_context=2)

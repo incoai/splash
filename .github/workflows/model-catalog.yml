@@ -15,6 +15,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
+  actions: write
   contents: write
   pull-requests: write
 
@@ -66,6 +67,10 @@ jobs:
           git add "$CATALOG"
           git commit -m "Refresh official model catalog from the Splash collection"
           git push --force-with-lease="refs/heads/$BRANCH:$REMOTE_TIP" origin "$BRANCH"
+          # A push or pull request made with GITHUB_TOKEN starts no workflow, a
+          # dispatch does: CI runs on the pushed commit, the pull request's
+          # head, where its checks land. The hardware release gate stays off.
+          gh workflow run ci.yml --ref "$BRANCH" -f release_gate=false
 
           if gh pr view "$BRANCH" --json state --jq '.state' 2>/dev/null | grep -q OPEN; then
             echo "Existing pull request updated."

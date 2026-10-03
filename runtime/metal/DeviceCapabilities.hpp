@@ -9,7 +9,8 @@ namespace splash {
 // Device features and memory limits used by runtime planning.
 struct DeviceCapabilities {
     std::string deviceName = "unknown";
-    // Placement-sparse support is queryable from macOS 26.4.
+    // The tested floor (MACOS_MIN_VERSION in the Makefile); the MPP kernels
+    // need macOS 26.2 or newer.
     static constexpr uint32_t kMinimumMacosMajor = 26;
     static constexpr uint32_t kMinimumMacosMinor = 4;
     uint32_t macosMajor = 0;
@@ -18,8 +19,9 @@ struct DeviceCapabilities {
     // Highest supported MTLGPUFamilyAppleN.
     static constexpr uint32_t kMinimumAppleGpuFamily = 9;
     uint32_t appleGpuFamily = 0;
-    // IORegistry gpu-core-count; zero means unavailable. Kernel policy then
-    // uses its fallback for unknown core counts; keep the missing value here.
+    // IORegistry gpu-core-count; zero means unavailable. ops::plannedGpuCores
+    // substitutes ops::kAssumedGpuCores for kernel policy. Keep the missing
+    // value here (status reports it).
     uint32_t gpuCoreCount = 0;
     uint64_t physicalMemoryBytes = 0;
     uint64_t recommendedMaxWorkingSetBytes = 0;
@@ -30,9 +32,6 @@ struct DeviceCapabilities {
     // the total thread count for every dispatch.
     uint64_t maxThreadgroupWidth = 0;
     bool hasUnifiedMemory = false;
-    // Exposes the full logical KV address space while committing physical
-    // memory only for pages in use.
-    bool supportsPlacementSparse = false;
 
     [[nodiscard]] bool meetsMinimumMacos() const noexcept {
         return macosMajor > kMinimumMacosMajor ||
@@ -44,6 +43,9 @@ struct DeviceCapabilities {
 
     // Returns a stable machine-readable reason, or nullopt when valid.
     [[nodiscard]] std::optional<std::string> validationError() const;
+    // The same verdict as one line for a person: what Splash needs against
+    // what this Mac has, ending with the reason above.
+    [[nodiscard]] std::optional<std::string> validationMessage() const;
 };
 
 } // namespace splash

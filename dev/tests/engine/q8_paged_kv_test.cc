@@ -1,7 +1,6 @@
 #include "Q8PageFormatReference.hpp"
 
 #include <algorithm>
-#include <array>
 #include <cassert>
 #include <cmath>
 #include <cstdint>
@@ -19,35 +18,60 @@ void testByteAccounting() {
   constexpr Layout bf16{16, 4, 256, Format::BFloat16};
   static_assert(bf16.valid());
   static_assert(bf16.bytesPerModelPage() == 2'097'152);
-  static_assert(bf16.sparseMappingBatchPages() == 1);
-  static_assert(bf16.backingExtentPages() == 64);
-  static_assert(bf16.storageByteCounts(4096).total == 8ULL * 1024 * 1024 * 1024);
+  static_assert(bf16.extentAlignmentPages() == 1);
+  static_assert(bf16.minimumExtentPages() == 32 && bf16.maximumExtentPages() == 96);
+  static_assert(4096 * bf16.bytesPerModelPage() == 8ULL * 1024 * 1024 * 1024);
   static_assert(bf16.scaleBytesPerLayerPage() == 0);
   constexpr Layout compact{10, 2, 256, Format::BFloat16};
   static_assert(compact.bytesPerModelPage() == 655'360);
-  static_assert(compact.sparseMappingBatchPages() == 2);
-  static_assert(compact.backingExtentPages() == 206);
+  static_assert(compact.extentAlignmentPages() == 2);
+  static_assert(compact.minimumExtentPages() == 104 && compact.maximumExtentPages() == 306);
+  // A pool's extents hold whole alignment units, so that every tensor region
+  // of an extent starts 64 KiB-aligned: the 512-byte-per-page scale regions
+  // need 128 pages for four KV heads and 256 for two, BF16 one or two. The
+  // size is chosen per pool between half and one and a half times the
+  // 128 MiB target, leaving the fewest of its pages over, the one nearest the
+  // target on a tie.
+  static_assert(kExtentRegionAlignmentBytes == 64 * 1024);
+  static_assert(kOracleLayout.extentAlignmentPages() == 128);
+  static_assert(kOracleLayout.minimumExtentPages() == 128 &&
+                kOracleLayout.maximumExtentPages() == 128);
+  static_assert(kOracleLayout.extentPagesFor(127) == 0 && kOracleLayout.extentPagesFor(128) == 128 &&
+                kOracleLayout.extentPagesFor(1000) == 128);
+  constexpr Layout compactInt8{10, 2, 256};
+  static_assert(compactInt8.bytesPerModelPage() == 332'800);
+  static_assert(compactInt8.extentAlignmentPages() == 256);
+  static_assert(compactInt8.minimumExtentPages() == 256 && compactInt8.maximumExtentPages() == 512);
+  static_assert(compactInt8.extentPagesFor(255) == 0 && compactInt8.extentPagesFor(511) == 256);
+  // Both sizes leave nothing over: 512 pages (162.5 MiB) is nearer the target
+  // than 256 (81.25 MiB). With 256 pages over, only 256 leaves nothing.
+  static_assert(compactInt8.extentPagesFor(10'240) == 512);
+  static_assert(compactInt8.extentPagesFor(10'496) == 256);
+  // 448 pages divide by 32, 56 and 64 (128 MiB, the target); 97 leaves one
+  // page over 32, 48 and 96 extents, of which 48 (96 MiB) is nearest.
+  static_assert(bf16.extentPagesFor(31) == 0 && bf16.extentPagesFor(448) == 64 &&
+                bf16.extentPagesFor(97) == 48);
   static_assert(!Layout{16, 4, 256, static_cast<Format>(0)}.valid());
   static_assert(kBytesPerModelPage == 1'064'960);
-  StorageByteCounts one = storageByteCounts(1);
-  assert(one.keyData == 512 * 1024);
-  assert(one.keyScales == 8 * 1024);
-  assert(one.valueData == 512 * 1024);
-  assert(one.valueScales == 8 * 1024);
-  assert(one.total == 1'064'960);
-  StorageByteCounts production = storageByteCounts(4608);
-  assert(production.total == 4'907'335'680ULL); // 147456 tokens.
+  // One page's keys (or values) and their scales across the layers.
+  static_assert(kOracleLayout.attentionLayers * kKeyDataBytesPerLayerPage == 512 * 1024);
+  static_assert(kOracleLayout.attentionLayers * kKeyScaleBytesPerLayerPage == 8 * 1024);
+  static_assert(kBytesPerModelPage == 2 * (512 + 8) * 1024);
+  static_assert(4608 * kBytesPerModelPage == 4'907'335'680ULL); // 147456 tokens.
 }
 
 void testLayouts() {
-  assert(keyDataIndex(0, 0, 1) == keyDataIndex(0, 0, 0) + 1);
-  assert(keyDataIndex(0, 1, 0) == keyDataIndex(0, 0, 0) + kHeadDimension);
-  assert(valueDataIndex(0, 1, 0) == valueDataIndex(0, 0, 0) + 1);
-  assert(valueDataIndex(0, 0, 1) == valueDataIndex(0, 0, 0) + kPageTokens);
-  assert(keyDataIndex(kKvHeads - 1, kPageTokens - 1, kHeadDimension - 1) ==
-         kElementsPerLayerPage - 1);
-  assert(valueDataIndex(kKvHeads - 1, kPageTokens - 1, kHeadDimension - 1) ==
-         kElementsPerLayerPage - 1);
+  assert(splash_kv_key_element(0, 0, 1) == splash_kv_key_element(0, 0, 0) + 1);
+  assert(splash_kv_key_element(0, 1, 0) ==
+         splash_kv_key_element(0, 0, 0) + kHeadDimension);
+  assert(splash_kv_value_element(0, 1, 0) ==
+         splash_kv_value_element(0, 0, 0) + 1);
+  assert(splash_kv_value_element(0, 0, 1) ==
+         splash_kv_value_element(0, 0, 0) + kPageTokens);
+  assert(splash_kv_key_element(kKvHeads - 1, kPageTokens - 1,
+                               kHeadDimension - 1) == kElementsPerLayerPage - 1);
+  assert(splash_kv_value_element(kKvHeads - 1, kPageTokens - 1,
+                                 kHeadDimension - 1) == kElementsPerLayerPage - 1);
 }
 
 void testBFloat16() {
@@ -63,30 +87,6 @@ void testBFloat16() {
       floatToBFloat16(std::numeric_limits<float>::infinity()))));
   assert(std::isnan(bfloat16ToFloat(
       floatToBFloat16(std::numeric_limits<float>::quiet_NaN()))));
-}
-
-void testLayoutGuard() {
-  std::array<uint8_t, 32> digest{};
-  for (uint32_t i = 0; i < digest.size(); ++i)
-    digest[i] = uint8_t(i);
-  LayoutGuard first = makeLayoutGuard(kOracleLayout, digest);
-  LayoutGuard second = makeLayoutGuard(kOracleLayout, digest);
-  auto bf16 = kOracleLayout;
-  bf16.format = Format::BFloat16;
-  const auto bf16Guard = makeLayoutGuard(bf16, digest);
-  assert(bf16Guard.quantization != first.quantization);
-  assert(bf16Guard.scaleType == uint32_t(ScaleType::None));
-  assert(bf16Guard.elementsPerScale == 0);
-  assert(bf16Guard.quantizedMinimum == 0 && bf16Guard.quantizedMaximum == 0);
-  assert(bf16Guard.modelArtifactSha256 == first.modelArtifactSha256);
-  assert(matchesLayout(first, kOracleLayout));
-  assert(first.modelArtifactSha256 == second.modelArtifactSha256);
-  second.elementsPerScale = 32;
-  assert(!isValidLayoutGuard(second));
-  second = first;
-  ++second.modelArtifactSha256[0];
-  assert(isValidLayoutGuard(second));
-  assert(first.modelArtifactSha256 != second.modelArtifactSha256);
 }
 
 void testQuantization(uint32_t validTokens) {
@@ -115,8 +115,8 @@ void testQuantization(uint32_t validTokens) {
     for (uint32_t head = 0; head < kKvHeads; ++head) {
       for (uint32_t dimension = 0; dimension < kHeadDimension; ++dimension) {
         uint64_t logical = logicalIndex(token, head, dimension);
-        float keyScale = page->keyScales[keyScaleIndex(head, token)];
-        float valueScale = page->valueScales[valueScaleIndex(head, token)];
+        float keyScale = page->keyScales[splash_kv_scale_element(head, token)];
+        float valueScale = page->valueScales[splash_kv_scale_element(head, token)];
         assert(std::abs(decodedKeys[logical] - keys[logical]) <=
                keyScale * 0.51f + 1.0e-7f);
         assert(std::abs(decodedValues[logical] - values[logical]) <=
@@ -160,7 +160,6 @@ int main() {
   testByteAccounting();
   testLayouts();
   testBFloat16();
-  testLayoutGuard();
   testQuantization(kPageTokens);
   testQuantization(17);
   testZeroAndInvalidInputs();

@@ -1,4 +1,6 @@
 #include "model/QwenVision.hpp"
+#include "Checked.hpp"
+#include "model/VisionLoader.hpp"
 
 #include <string>
 #include <utility>
@@ -6,63 +8,46 @@
 namespace splash::model {
 namespace {
 
-void validateLayout(const ops::VisionLayout &layout) {
-  if (!layout.depth || !layout.hiddenSize || !layout.patchDimension ||
-      !layout.intermediateSize || !layout.paddedIntermediateSize ||
-      !layout.mergedHiddenSize || !layout.outputHiddenSize || !layout.heads ||
-      !layout.headDimension || !layout.positionGridSide || !layout.patchSize ||
-      !layout.spatialMerge ||
-      layout.heads * layout.headDimension != layout.hiddenSize ||
-      layout.paddedIntermediateSize < layout.intermediateSize ||
-      layout.mergedHiddenSize !=
-          layout.hiddenSize * layout.spatialMerge * layout.spatialMerge ||
-      layout.patchDimension != 3 * 2 * layout.patchSize * layout.patchSize) {
-    throw WeightStoreError("Qwen vision layout is inconsistent");
-  }
-}
-
 ops::VisionAffine readAffine(WeightFile &file, uint32_t outputSize,
                              uint32_t inputSize, std::string_view label) {
   return {
-      file.section(checkedWeightMultiply(
-                       checkedWeightMultiply(outputSize, inputSize,
-                                             "vision weight elements"),
+      file.section(checkedMultiply<WeightStoreError>(
+                       checkedMultiply<WeightStoreError>(
+                           outputSize, inputSize, "vision weight elements"),
                        kBFloat16Bytes, "vision weight bytes"),
                    label),
-      file.section(checkedWeightMultiply(outputSize, kBFloat16Bytes,
-                                         "vision bias bytes"),
+      file.section(checkedMultiply<WeightStoreError>(
+                       outputSize, kBFloat16Bytes, "vision bias bytes"),
                    label),
   };
 }
 
 ops::VisionNorm readNorm(WeightFile &file, uint32_t width,
                          std::string_view label) {
-  const uint64_t bytes =
-      checkedWeightMultiply(width, kBFloat16Bytes, "vision norm bytes");
+  const uint64_t bytes = checkedMultiply<WeightStoreError>(
+      width, kBFloat16Bytes, "vision norm bytes");
   return {file.section(bytes, label), file.section(bytes, label)};
 }
 
-} // namespace
-
-QwenVisionWeights loadQwenVisionWeights(metal::MetalBackend &backend,
-                                        const std::filesystem::path &directory,
-                                        ops::VisionLayout layout) {
-  validateLayout(layout);
+QwenVisionWeights readVision(metal::MetalBackend &backend,
+                             const std::filesystem::path &path,
+                             std::string contentIdentity,
+                             const ops::VisionLayout &layout) {
   const uint64_t allocationBaseline = backend.memoryStats().allocatedBytes;
   QwenVisionWeights result;
   result.tensors.layout = layout;
   result.tensors.blocks.reserve(layout.depth);
 
-  WeightFile file(backend, directory / "model.bin", "vision/model.bin",
-                  kVisionMagic, layout.depth, 0);
+  WeightFile file(backend, path, "vision/model.bin", kVisionMagic, layout.depth,
+                  0, std::move(contentIdentity));
   result.tensors.patchEmbedding =
       readAffine(file, layout.hiddenSize, layout.patchDimension, "patch-embed");
   result.tensors.positionTable = file.section(
-      checkedWeightMultiply(
-          checkedWeightMultiply(
-              checkedWeightMultiply(layout.positionGridSide,
-                                    layout.positionGridSide,
-                                    "vision position count"),
+      checkedMultiply<WeightStoreError>(
+          checkedMultiply<WeightStoreError>(
+              checkedMultiply<WeightStoreError>(layout.positionGridSide,
+                                                layout.positionGridSide,
+                                                "vision position count"),
               layout.hiddenSize, "vision position elements"),
           kBFloat16Bytes, "vision position bytes"),
       "position-table");
@@ -87,10 +72,23 @@ QwenVisionWeights loadQwenVisionWeights(metal::MetalBackend &backend,
   file.finish();
   result.files.push_back(file.record());
 
-  result.manifestFingerprintSha256 = weightManifestFingerprint(result.files);
   result.actualAllocatedBytes = metal::allocationDelta(
       allocationBaseline, backend.memoryStats().allocatedBytes);
   return result;
+}
+
+} // namespace
+
+QwenVisionWeights loadQwenVisionWeights(metal::MetalBackend &backend,
+                                        const std::filesystem::path &directory,
+                                        ops::VisionLayout layout) {
+  requireVisionLayout(layout);
+  return readVision(backend, directory / "model.bin", {}, layout);
+}
+
+// The loader checked its layout when it was built.
+QwenVisionWeights loadQwenVisionWeights(metal::MetalBackend &backend, const VisionLoader &source) {
+  return readVision(backend, source.prepare(), source.weight().key, source.layout());
 }
 
 } // namespace splash::model

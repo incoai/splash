@@ -186,8 +186,8 @@ def slot_labels(tokenizer):
     return labels
 
 
-def encode_prompt(tokenizer, messages, labels, *, admit=None, checkpoint=None):
-    """Render messages and verify single-token answer slots.
+def encode_prompt(tokenizer, chat_template, messages, labels, *, admit, checkpoint):
+    """Render messages with chat_template and verify single-token answer slots.
 
     Mirrors SemIf semif_phase1.direct.encode_prompt: each slot label must be
     one exact round-trip token, and appending the label to the rendered
@@ -197,10 +197,11 @@ def encode_prompt(tokenizer, messages, labels, *, admit=None, checkpoint=None):
     prompt with many options costs far more than the prompt itself. `admit`
     receives the prepared prompt token count before that pass begins and
     `checkpoint` runs once per slot inside it; either may raise to abandon
-    preparation. Omitting both reproduces the upstream behavior exactly.
+    preparation.
     """
     prompt = tokenizer.apply_chat_template(
         messages,
+        chat_template=chat_template,
         tokenize=False,
         add_generation_prompt=True,
         enable_thinking=False,
@@ -218,11 +219,9 @@ def encode_prompt(tokenizer, messages, labels, *, admit=None, checkpoint=None):
         slots.append(encoded[0])
     if len(slots) != len(set(slots)):
         raise ScoringUnsupported("answer-slot tokens collide")
-    if admit is not None:
-        admit(len(ids))
+    admit(len(ids))
     for label, token in zip(labels, slots):
-        if checkpoint is not None:
-            checkpoint()
+        checkpoint()
         if tokenizer.encode(prompt + label, add_special_tokens=False) != ids + [token]:
             raise ScoringUnsupported(
                 f"answer boundary changes tokenization for slot {label!r}"
@@ -230,7 +229,7 @@ def encode_prompt(tokenizer, messages, labels, *, admit=None, checkpoint=None):
     return ids, slots, prompt
 
 
-def judgment_response(model, row, meta, result):
+def judgment_response(model, row, job, result):
     logits = list(result.option_logits)
     return {
         "id": row["id"],
@@ -238,8 +237,8 @@ def judgment_response(model, row, meta, result):
         "probabilities": softmax(logits),
         "option_logits": logits,
         "input_tokens": result.prompt_tokens,
-        "answer_token_ids": list(meta["answer_token_ids"]),
-        "prompt_sha256": meta["prompt_sha256"],
+        "answer_token_ids": list(job.score_tokens),
+        "prompt_sha256": job.prompt_sha256,
         "prompt_version": PROMPT_VERSION,
         "model": {"id": model},
         "readout": READOUT,

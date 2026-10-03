@@ -7,16 +7,11 @@
 
 namespace splash::ops::tuning {
 
-// IDs refer to operator-owned typed configurations and measured workloads.
-// This helper never interprets a kernel configuration or encodes GPU work.
+// IDs refer to operator-owned typed configurations. This helper never
+// interprets a kernel configuration or encodes GPU work.
 struct CandidateId final {
   uint32_t value = 0;
   bool operator==(const CandidateId &) const = default;
-};
-
-struct WorkloadId final {
-  uint32_t value = 0;
-  bool operator==(const WorkloadId &) const = default;
 };
 
 inline constexpr CandidateId kBaseline{};
@@ -49,7 +44,7 @@ struct Policy final {
   size_t minimumPairs = kMinPairedSamples;
   double maximumRelativeTimingSpread = 0.10;
   double maximumPairedGainSpread = 0.05;
-  double minimumMeanImprovement = 0.03;
+  double minimumImprovement = 0.03;
 };
 
 enum class TimingVerdict : uint8_t {
@@ -101,17 +96,10 @@ struct TimingAssessment final {
 [[nodiscard]] TimingAssessment evaluate(std::span<const PairedTiming> samples,
                                         const Policy &policy = {}) noexcept;
 
-struct WorkloadMeasurements final {
-  WorkloadId id;
-  std::span<const PairedTiming> samples;
-  // Caller-proven structural identity, not an inference from neutral/noisy
-  // timings. Identity requires no samples and contributes exactly zero gain.
-  bool equivalentToBaseline = false;
-};
-
+// One candidate's paired samples of the measured workload.
 struct CandidateMeasurements final {
   CandidateId id;
-  std::span<const WorkloadMeasurements> workloads;
+  std::span<const PairedTiming> samples;
 };
 
 enum class SelectionVerdict : uint8_t { Baseline, Selected, InvalidInput };
@@ -119,23 +107,17 @@ enum class SelectionVerdict : uint8_t { Baseline, Selected, InvalidInput };
 struct Selection final {
   SelectionVerdict verdict = SelectionVerdict::Baseline;
   CandidateId candidate = kBaseline;
-  double conservativeMeanGain = 0;
-  double worstWorkloadGain = 0;
+  double conservativeGain = 0;
 };
 
-// Every required ID must appear exactly once in each candidate, with no extra
-// IDs. Missing/duplicate workloads disqualify that candidate. Duplicate
-// candidate IDs, baseline IDs, duplicate required IDs or invalid policy make
-// the whole input invalid. All such outcomes retain the shipped baseline.
-// Every workload must qualify or explicitly be structurally identical with
-// empty samples; identity still counts in the equally weighted mean and worst
-// gain. Their conservative mean must meet minimumMeanImprovement, so an
-// all-identical candidate cannot win. Ties prefer the greater worst-workload
-// gain, then the smaller candidate ID, independently of input order.
-// The winner still requires caller-owned production graph confirmation.
+// Duplicate candidate IDs, the baseline's ID or an invalid policy make the
+// whole input invalid, which retains the shipped baseline. Only a candidate
+// whose samples are Improved can win: its conservative gain meets
+// minimumImprovement. The greatest conservative gain wins; ties prefer the
+// smaller candidate ID, independently of input order.
+// A winner still needs a whole-model A/B before any policy change.
 [[nodiscard]] Selection
 selectCandidate(std::span<const CandidateMeasurements> candidates,
-                std::span<const WorkloadId> requiredWorkloads,
                 const Policy &policy = {}) noexcept;
 
 } // namespace splash::ops::tuning

@@ -26,15 +26,13 @@ bool validMeasurementOptions(const MeasurementOptions &options) noexcept {
          evaluate({}, options.policy).verdict != TimingVerdict::InvalidPolicy;
 }
 
-MeasurementResult measureWorkload(CandidateId candidate, WorkloadId workload,
-                                  const MeasurementRun &run,
+MeasurementResult measureWorkload(CandidateId candidate, const MeasurementRun &run,
                                   const MeasurementOptions &options,
                                   const MeasurementStop &shouldStop) {
   using Clock = std::chrono::steady_clock;
   const auto start = Clock::now();
   MeasurementResult result;
   result.candidate = candidate;
-  result.workload = workload;
   auto elapsed = [&] {
     return std::chrono::duration<double>(Clock::now() - start).count();
   };

@@ -104,6 +104,48 @@ class PrepareTest(unittest.TestCase):
                 images.prepare(wide)
             convert.assert_not_called()
 
+    def test_exif_orientation_is_applied_before_resizing(self):
+        from PIL import Image
+
+        def prepared(image, exif=None):
+            buffer = io.BytesIO()
+            image.save(buffer, format="PNG", **({"exif": exif} if exif else {}))
+            image = images.prepare(buffer.getvalue(), images.MAX_PIXELS)
+            return image.grid_height, image.grid_width, image.digest_lo
+
+        stored = Image.new("RGB", (80, 40), (30, 30, 200))
+        stored.paste((200, 30, 30), (0, 0, 80, 1))
+        # Orientation 6 displays the stored image turned a quarter clockwise.
+        tag = Image.Exif()
+        tag[0x0112] = 6
+        upright = stored.transpose(Image.Transpose.ROTATE_270)
+        self.assertEqual(prepared(stored, tag), prepared(upright))
+        # A malformed tag leaves the image as stored instead of failing it.
+        malformed = b"Exif\x00\x00not a tiff header"
+        self.assertEqual(prepared(stored, malformed), prepared(stored))
+
+    def test_transparent_pixels_are_composited_onto_white(self):
+        from PIL import Image
+
+        # Opaque black on the top half, transparent pixels storing black below.
+        rgba = Image.new("RGBA", (256, 256), (0, 0, 0, 0))
+        rgba.paste((0, 0, 0, 255), (0, 0, 256, 128))
+        palette = Image.new("P", (256, 256), 0)
+        palette.putpalette([0, 0, 0, 0, 0, 0])
+        palette.paste(1, (0, 0, 256, 128))
+        expected = bytes(256 * 128 * 3) + b"\xff" * (256 * 128 * 3)
+        for image, encoding, params in (
+            (rgba, "PNG", {}),
+            (rgba.convert("LA"), "PNG", {}),
+            (palette, "PNG", {"transparency": 0}),
+            (palette, "GIF", {"transparency": 0}),
+        ):
+            with self.subTest(mode=image.mode, encoding=encoding):
+                buffer = io.BytesIO()
+                image.save(buffer, format=encoding, **params)
+                prepared = images.prepare(buffer.getvalue(), images.MAX_PIXELS)
+                self.assertEqual(prepared.pixels, expected)
+
     def test_small_image_preparation_obeys_cap_after_upscale(self):
         prepared = images.prepare(png_bytes(1, 100), images.MIN_PIXELS)
         self.assertLessEqual(len(prepared.pixels), 3 * images.MIN_PIXELS)
@@ -127,7 +169,11 @@ class DataUrlTest(unittest.TestCase):
 
 class ImageCacheTest(unittest.TestCase):
     def test_request_budget_counts_repeated_images_and_all_live_batches(self):
-        cache = images.ImageCache(budget_bytes=0, request_budget_bytes=12)
+        self.enterContext(mock.patch.object(images.ImageCache, "BUDGET_BYTES", 0))
+        self.enterContext(
+            mock.patch.object(images.ImageCache, "REQUEST_BUDGET_BYTES", 12)
+        )
+        cache = images.ImageCache()
         image = images.PreparedImage(2, 2, b"abcd", 0, 0)
         first, second = cache.request_batch(), cache.request_batch()
         first.append(image)
@@ -147,7 +193,10 @@ class ImageCacheTest(unittest.TestCase):
         self.assertEqual(cache.stats()["request_bytes"], 0)
 
     def test_request_budget_is_returned_after_exception_and_cyclic_owner(self):
-        cache = images.ImageCache(request_budget_bytes=4)
+        self.enterContext(
+            mock.patch.object(images.ImageCache, "REQUEST_BUDGET_BYTES", 4)
+        )
+        cache = images.ImageCache()
 
         def prepare_then_fail():
             batch = cache.request_batch()
@@ -162,7 +211,10 @@ class ImageCacheTest(unittest.TestCase):
         self.assertEqual(cache.stats()["request_bytes"], 0)
 
     def test_concurrent_request_batches_do_not_oversell_image_budget(self):
-        cache = images.ImageCache(request_budget_bytes=12)
+        self.enterContext(
+            mock.patch.object(images.ImageCache, "REQUEST_BUDGET_BYTES", 12)
+        )
+        cache = images.ImageCache()
         batches = [cache.request_batch() for _ in range(16)]
 
         def append(batch):
@@ -179,14 +231,17 @@ class ImageCacheTest(unittest.TestCase):
         self.assertEqual(cache.stats()["request_bytes"], 0)
 
     def test_cache_reuses_prepared_images_and_evicts_by_bytes(self):
-        cache = images.ImageCache(budget_bytes=2 * 256 * 256 * 3)
+        self.enterContext(
+            mock.patch.object(images.ImageCache, "BUDGET_BYTES", 2 * 256 * 256 * 3)
+        )
+        cache = images.ImageCache()
         first = cache.prepare(png_bytes(64, 64), images.MAX_PIXELS)
         self.assertIs(cache.prepare(png_bytes(64, 64), images.MAX_PIXELS), first)
         self.assertEqual(cache.stats()["entries"], 1)
         cache.prepare(png_bytes(64, 64, (0, 200, 0)), images.MAX_PIXELS)
         cache.prepare(png_bytes(64, 64, (0, 0, 200)), images.MAX_PIXELS)
         self.assertEqual(cache.stats()["entries"], 2)
-        self.assertLessEqual(cache.stats()["bytes"], cache.budget_bytes)
+        self.assertLessEqual(cache.stats()["bytes"], cache.BUDGET_BYTES)
         # A different serving cap is a different preparation.
         cache.prepare(png_bytes(64, 64), 65_536)
         self.assertEqual(cache.stats()["entries"], 2)

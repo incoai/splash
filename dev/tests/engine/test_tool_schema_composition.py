@@ -1,10 +1,13 @@
 import copy
 import json
 import unittest
+from unittest import mock
 
 from llguidance import LLMatcher
 
 from dev.tests.engine import test_structured_tools as structured
+from dev.tests.test_server import no_signed_thinking
+from dev.tests.tool_output import project, streamed_arguments
 from server import api_shapes, output, tool_schema
 from server.errors import APIError
 
@@ -34,7 +37,7 @@ class ToolSchemaCompositionTests(unittest.TestCase):
         for name in names:
             value = arguments[name]
             value_schema = shape["properties"].get(name, shape["additionalProperties"])
-            raw = tool_schema.raw_string_schema(value_schema, value_schema)
+            raw = tool_schema.raw_string_schema(value_schema)
             encoded = value if isinstance(value, str) and raw else json.dumps(value)
             xml += f"<parameter={name}>\n{encoded}\n</parameter>\n"
         xml += "</function>\n</tool_call>"
@@ -43,20 +46,10 @@ class ToolSchemaCompositionTests(unittest.TestCase):
         self.assertEqual(matcher.validate_tokens(tokens), len(tokens), xml)
         self.assertTrue(matcher.consume_tokens(tokens))
         self.assertTrue(matcher.is_accepting())
-        content, calls = output.parse_tool_calls(xml, 1, policy)
+        _, calls, events = project(xml, policy, size=1)
         self.assertEqual(json.loads(calls[0]["function"]["arguments"]), arguments)
+        self.assertEqual(streamed_arguments(events), calls[0]["function"]["arguments"])
         output.validate_tool_calls(calls, policy)
-        projector = output.StreamingToolCallProjector(policy, 1)
-        events = []
-        for char in xml:
-            events.extend(projector.put(char))
-        events.extend(projector.finish(content, calls, False))
-        streamed = "".join(
-            value.get("function", {}).get("arguments", "")
-            for kind, value in events
-            if kind == "tool"
-        )
-        self.assertEqual(json.loads(streamed), arguments)
         self.assertEqual(schema, original)
         calls[0]["function"]["arguments"] = json.dumps(invalid)
         with self.assertRaises(APIError):
@@ -111,19 +104,18 @@ class ToolSchemaCompositionTests(unittest.TestCase):
         }
         function = {"name": "test", "parameters": schema}
         chat = {"tools": [{"type": "function", "function": function}]}
-        responses = api_shapes.responses_to_chat_body(
-            {
-                "input": "Create a note",
-                "tools": [{"type": "function", **function}],
-            }
+        responses, _ = api_shapes.responses_to_chat_body(
+            {"tools": [{"type": "function", **function}]},
+            [{"role": "user", "content": "Create a note"}],
         )
-        messages = api_shapes.anthropic_to_chat_body(
+        messages, _ = api_shapes.anthropic_to_chat_body(
             {
                 "model": "test",
                 "max_tokens": 128,
                 "messages": [{"role": "user", "content": "Create a note"}],
                 "tools": [{"name": "test", "input_schema": schema}],
-            }
+            },
+            thinking_resolver=no_signed_thinking,
         )
         for body in (chat, responses, messages):
             with self.subTest(body=body):
@@ -152,7 +144,7 @@ class ToolSchemaCompositionTests(unittest.TestCase):
                 with self.assertRaisesRegex(
                     APIError, "cyclic tool parameter alternatives"
                 ) as error:
-                    tool_schema.raw_string_schema(schema, schema)
+                    tool_schema.raw_string_schema(schema)
                 self.assertEqual(error.exception.status, 400)
                 parameters = {
                     "$defs": schema["$defs"],
@@ -175,13 +167,98 @@ class ToolSchemaCompositionTests(unittest.TestCase):
 
     def test_shared_string_alternatives_are_not_cycles(self):
         schema = {
-            "$defs": {"text": {"type": "string"}},
-            "anyOf": [{"$ref": "#/$defs/text"}, {"$ref": "#/$defs/text"}],
+            "$defs": {
+                "text": {"type": "string"},
+                "choice": {
+                    "anyOf": [{"$ref": "#/$defs/text"}, {"$ref": "#/$defs/text"}]
+                },
+            },
+            "$ref": "#/$defs/choice",
         }
-        self.assertEqual(
-            tool_schema.raw_string_schema({"anyOf": schema["anyOf"]}, schema),
-            ("raw", None),
-        )
+        self.assertEqual(tool_schema.raw_string_schema(schema), ("raw", None))
+
+    def test_shared_references_are_projected_once(self):
+        # Two references per level to the next definition used to double the
+        # work at every level; a 1.6 KB schema took hours.
+        depth = 14
+        definitions = {
+            f"d{i}": {
+                "anyOf": [{"$ref": f"#/$defs/d{i + 1}"}, {"$ref": f"#/$defs/d{i + 1}"}]
+            }
+            for i in range(depth)
+        }
+        definitions[f"d{depth}"] = {
+            "type": "object",
+            "properties": {"x": {"type": "string"}},
+            "required": ["x"],
+        }
+        field = {"$ref": "#/$defs/d0"}
+        lookup = tool_schema._lookup_tool_reference
+        for schema, arguments, invalid in (
+            ({"$defs": definitions, **field}, {"x": "a"}, {"x": 1}),
+            (
+                {"$defs": definitions, "properties": {"value": field}},
+                {"value": {"x": "a"}},
+                {"value": {"x": 1}},
+            ),
+        ):
+            tool = {"type": "function", "function": {"name": "t", "parameters": schema}}
+            policy = tool_schema.normalize_tools([tool], "required", False)[1]
+            with (
+                self.subTest(schema=sorted(schema)),
+                mock.patch.object(
+                    tool_schema, "_lookup_tool_reference", side_effect=lookup
+                ) as counted,
+            ):
+                tool_schema.tool_grammar(policy, False)
+            # A few lookups per reference, rather than one per path.
+            self.assertLess(counted.call_count, 4 * (depth + 1))
+            self.check_arguments(schema, arguments, invalid)
+
+    def test_framing_is_bounded_across_the_tools_of_a_request(self):
+        # Composition and root copies can make the framed schemas quadratic or
+        # exponential in the tool schemas; one budget covers all tools.
+        def policy(*schemas):
+            tools = [
+                {"type": "function", "function": {"name": f"t{i}", "parameters": s}}
+                for i, s in enumerate(schemas)
+            ]
+            return tool_schema.normalize_tools(tools, "auto", True)[1]
+
+        wide = {
+            "anyOf": [
+                {
+                    "properties": {f"b{i}_{j}": {"type": "integer"} for j in range(5)},
+                    "additionalProperties": {"type": "string", "description": str(i)},
+                }
+                for i in range(30)
+            ]
+        }
+        copies = {
+            "$defs": {"x": {"type": "integer"}},
+            "properties": {f"p{i}": {"$ref": "#/$defs/x"} for i in range(200)},
+        }
+        nested = {"$defs": {"d16": {"properties": {"x": {"type": "integer"}}}}}
+        for i in range(16):
+            ref = {"$ref": f"#/$defs/d{i + 1}"}
+            narrower = {"allOf": [ref, {"properties": {"x": {"minimum": i}}}]}
+            nested["$defs"][f"d{i}"] = {"anyOf": [ref, narrower]}
+        nested["$ref"] = "#/$defs/d0"
+        half = {"properties": {"x": {"description": "d" * 12_000}}}
+        with mock.patch.object(tool_schema, "MAX_FRAMED_SCHEMA_BYTES", 20_000):
+            tool_schema.tool_grammar(policy(half), False)
+            for name, schemas in (
+                ("wide union", [wide]),
+                ("root copies", [copies]),
+                ("nested alternatives", [nested]),
+                ("two tools", [half, half]),
+            ):
+                with (
+                    self.subTest(name),
+                    self.assertRaisesRegex(APIError, "too complex") as caught,
+                ):
+                    tool_schema.tool_grammar(policy(*schemas), False)
+                self.assertEqual(caught.exception.status, 400)
 
     def test_recursive_objects_keep_json_framing_and_validation(self):
         self.check_arguments(
@@ -398,6 +475,33 @@ class ToolSchemaCompositionTests(unittest.TestCase):
         self.assertLess(
             LLMatcher(self.guidance, grammar).validate_tokens(tokens), len(tokens)
         )
+
+    def test_extra_names_may_start_like_unused_declared_names(self):
+        schema = {
+            "properties": {"url": {"type": "string"}, "ab": {"type": "integer"}},
+            "additionalProperties": {"type": "integer"},
+        }
+        for extra in ("user-agent", "urls", "u", "a", "abc"):
+            with self.subTest(extra=extra):
+                self.check_arguments(schema, {extra: 1}, {extra: "1"})
+
+        def rejected(policy, xml):
+            matcher = LLMatcher(self.guidance, tool_schema.tool_grammar(policy, False))
+            tokens = self.tokenizer.encode(xml).ids
+            return matcher.validate_tokens(tokens) < len(tokens)
+
+        # Declared names still appear once, and forbidden ones not at all.
+        policy, xml = self.check_arguments(
+            schema, {"url": "x", "ab": 1, "user-agent": 2}, {"url": 1}
+        )
+        repeated = "<parameter=url>\nx\n</parameter>\n</function>"
+        self.assertTrue(rejected(policy, xml.replace("</function>", repeated)))
+        policy, xml = self.check_arguments(
+            {"properties": {"secret": False}, "additionalProperties": {}},
+            {"secrets": 1},
+            {"secret": 1},
+        )
+        self.assertTrue(rejected(policy, xml.replace("secrets", "secret")))
 
 
 if __name__ == "__main__":
