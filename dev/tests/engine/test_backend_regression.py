@@ -212,7 +212,7 @@ class BackendRegressionTests(unittest.TestCase):
         def fails(document):
             document["performance_pass"] = False
             document["performance_failures"] = [
-                "B3 aggregate decode throughput did not exceed B2"
+                "B3 aggregate decode throughput fell below B2"
             ]
 
         summary = regression.summarize(rounds({2: fails}), False)

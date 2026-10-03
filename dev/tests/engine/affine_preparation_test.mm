@@ -72,7 +72,7 @@ void prepare(metal::MetalBackend &backend, const std::filesystem::path &root, co
       if (prepared.size() != record.declaredBytes) throw std::runtime_error("wrong image size");
       if (prepared != fileBytes(root / "expected" / std::filesystem::path(record.relativePath).filename()))
         throw std::runtime_error("affine fixture differs: " + record.relativePath);
-      static_cast<void>(weights.section(record.declaredBytes - model::kWeightFileAlignment));
+      static_cast<void>(weights.section(record.declaredBytes - model::kWeightFileAlignment, {}));
       weights.finish();
       if (pass == 0) std::cout << "prepared " << record.relativePath << ' ' << model::weightDigest(prepared) << '\n';
     };
@@ -125,7 +125,7 @@ int main(int argc, char **argv) {
           check(loader.model());
         });
         // The draft reads the prepared files as it reads a package's.
-        model::DraftCheckpointLoader files(backend, root, layout);
+        model::DraftCheckpointLoader files(backend, root, layout, {});
         const model::DFlashDraftWeights draft = model::loadDFlashDraftWeights(backend, std::ref(files), layout);
         const auto affine = [](const ops::Projection &p, uint32_t n, uint32_t k) {
           return p.layout() == ops::WeightLayout::Affine64 && p.outputSize == n && p.inputSize == k;
@@ -162,7 +162,7 @@ int main(int argc, char **argv) {
       });
       // The target loader reads the prepared files as affine Q4 projections of
       // the layout's sizes with bf16 norms, the head into fp32 logits.
-      model::AffineTargetLoader files(backend, root, layout);
+      model::AffineTargetLoader files(backend, root, layout, {});
       const model::Qwen3_8Weights weights = model::loadQwen3_8Weights(backend, layout, files);
       const auto affine = [](const ops::Projection &p, uint32_t n, uint32_t k) {
         return p.layout() == ops::WeightLayout::Affine64 && p.outputSize == n && p.inputSize == k;

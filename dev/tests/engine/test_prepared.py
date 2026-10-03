@@ -17,9 +17,8 @@ class PreparedBytesTests(unittest.TestCase):
         inputs="i" * 64,
         source=PACKAGE / "target",
     ):
-        """An entry with provenance when it names its component; with only
-        a source path, as earlier versions wrote, when source is given
-        without one; with no source file when source is None."""
+        """An entry with provenance when it names its component; with no
+        source file otherwise."""
         directory = cache / key
         directory.mkdir(parents=True)
         (directory / "weights").write_text("")
@@ -29,14 +28,12 @@ class PreparedBytesTests(unittest.TestCase):
                 f"{prepared.PROVENANCE}\ncomponent {component}\n"
                 f"inputs {inputs}\nsource {source}\n"
             )
-        elif source:
-            (directory / "source").write_text(f"{source}\nvision.bin\n")
 
     def compare(self, baseline, candidate, required=True):
         return prepared.compare(baseline, candidate, package=PACKAGE, required=required)
 
     def test_candidate_must_hold_every_baseline_entry_of_the_package(self):
-        a, b, c, d, e = ("a" * 64, "b" * 64, "c" * 64, "d" * 64, "e" * 64)
+        a, b, d, e = ("a" * 64, "b" * 64, "d" * 64, "e" * 64)
         with TemporaryDirectory() as directory:
             root = Path(directory)
             baseline, candidate = root / "baseline", root / "candidate"
@@ -46,7 +43,7 @@ class PreparedBytesTests(unittest.TestCase):
                 baseline, "9" * 64, e, "target/layer-0.bin", "r" * 64, f"{PACKAGE}-old"
             )
             (baseline / ("4" * 64)).mkdir()  # an incomplete entry
-            (baseline / "verified").mkdir()
+            (baseline / "verified-v3").mkdir()
             self.assertEqual(len(prepared.entries(baseline)), 2)
             self.assertEqual(prepared.entries(root / "missing"), [])
             result = self.compare(baseline, candidate)
@@ -58,24 +55,15 @@ class PreparedBytesTests(unittest.TestCase):
             self.entry(
                 baseline, "2" * 64, b, "vision/model.bin", source=PACKAGE / "vision"
             )
-            # An entry of an earlier version names only its source.
-            self.entry(baseline, "3" * 64, c, source=PACKAGE / "vision")
-            records = {
-                record["key"][0]: record for record in prepared.entries(baseline)
-            }
-            self.assertEqual(records["3"]["source"], str(PACKAGE / "vision"))
-            self.assertNotIn("component", records["3"])
             self.assertFalse(self.compare(baseline, candidate)["pass"])
-            # Other keys, same bytes: equal. The earlier entry's bytes may be
-            # held by any entry.
+            # Other keys, same bytes: equal.
             self.entry(candidate, "5" * 64, a, "target/layer-0.bin")
             self.entry(candidate, "6" * 64, b, "vision/model.bin")
-            self.entry(candidate, "7" * 64, c, "target/layer-9.bin", "k" * 64)
             result = self.compare(baseline, candidate)
             self.assertTrue(result["pass"], result["failures"])
             self.assertEqual(
                 [(row["key"][0], row["candidate_sha256"]) for row in result["entries"]],
-                [("1", a), ("2", b), ("3", None)],
+                [("1", a), ("2", b)],
             )
 
         with TemporaryDirectory() as directory:
@@ -83,21 +71,22 @@ class PreparedBytesTests(unittest.TestCase):
             baseline, candidate = root / "baseline", root / "candidate"
             self.entry(baseline, "1" * 64, a, "target/layer-0.bin")
             self.entry(baseline, "2" * 64, b, "vision/model.bin")
-            self.entry(baseline, "3" * 64, c, source=PACKAGE / "vision")
-            # Changed bytes of a component from the same source data, and
-            # an earlier entry's bytes that no candidate entry holds.
+            # Changed bytes of a component from the same source data.
             self.entry(candidate, "5" * 64, a, "target/layer-0.bin")
             self.entry(candidate, "6" * 64, d, "vision/model.bin")
             failures = self.compare(baseline, candidate)["failures"]
-            self.assertEqual(len(failures), 2, failures)
+            self.assertEqual(len(failures), 1, failures)
             self.assertIn("vision/model.bin: the candidate prepared", failures[0])
-            self.assertIn("lacks the baseline's prepared bytes", failures[1])
-            # An entry without a source record cannot be told apart: compared.
-            self.entry(candidate, "7" * 64, c)
-            self.entry(baseline, "8" * 64, e, source=None)
+            # An entry without a source record cannot be told apart: compared
+            # by its bytes, which no candidate entry holds.
+            self.entry(baseline, "8" * 64, e)
             failures = self.compare(baseline, candidate)["failures"]
             self.assertEqual(len(failures), 2, failures)
             self.assertIn("8" * 64, failures[1])
+            self.assertIn("lacks the baseline's prepared bytes", failures[1])
+            # Any entry may hold them.
+            self.entry(candidate, "7" * 64, e, "target/layer-9.bin", "k" * 64)
+            self.assertEqual(len(self.compare(baseline, candidate)["failures"]), 1)
 
     def test_a_baseline_of_another_identity_gets_its_own_cache(self):
         with TemporaryDirectory() as directory:

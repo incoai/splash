@@ -7,7 +7,6 @@
 
 #include <algorithm>
 #include <array>
-#include <compare>
 #include <cstdint>
 
 namespace splash::ops {
@@ -36,7 +35,7 @@ struct MoeShape final {
   [[nodiscard]] constexpr uint32_t routesPerToken() const noexcept {
     return expertsPerToken + 1;
   }
-  auto operator<=>(const MoeShape &) const = default;
+  bool operator==(const MoeShape &) const = default;
 };
 
 // A GGUF expert projection: every routed expert in one segment of experts *
@@ -77,17 +76,17 @@ struct AffineMoeWeights final {
 using MoeWeights = LayoutWeights<AffineMoeWeights, BlockMoeWeights>;
 
 // Router score tiles: 8 x 32 for short chunks, 32 x 128 for longer chunks.
-// The measured Apple10 crossover is about 26 rows per GPU core, with a
-// 20-core fallback when the core count is unknown. Both tiles preserve scores.
+// The measured Apple10 crossover is about 26 rows per GPU core; an unknown
+// core count plans for ops::kAssumedGpuCores (Linear.hpp). Both tiles
+// preserve scores.
 struct MoeRouteTile final {
   uint32_t rows;
   uint32_t experts;
 };
-inline constexpr uint32_t kMoeRouteWideRows = 512;
 inline constexpr uint32_t kMoeRouteRowsPerCore = 26;
 
-[[nodiscard]] constexpr uint32_t moeRouteWideRows(uint32_t gpuCores) noexcept {
-  return gpuCores ? gpuCores * kMoeRouteRowsPerCore : kMoeRouteWideRows;
+[[nodiscard]] constexpr uint32_t moeRouteWideRows(uint32_t plannedCores) noexcept {
+  return plannedCores * kMoeRouteRowsPerCore;
 }
 
 [[nodiscard]] constexpr MoeRouteTile
@@ -171,17 +170,15 @@ inline constexpr auto kMoeWorkspaceFields = [] {
 
 // The tile applies to grouping, gather and both expert projections together;
 // changing it never changes the physical rows in a command. Affine plans
-// consume Q4 expert slabs in StorageN=256 order: M8 plans and decode plans
-// run the fused gate/up tile; the M32 prefill plan runs the experts as three
+// consume Q4 expert slabs in StorageN=256 order: decode plans run the fused
+// gate/up tile on M8 tiles, prefill plans the experts on M32 tiles as three
 // N256 passes (gate, up with the silu gate, down) whose tiles shrink to the
-// descriptor's live rows, bit-identical to the fused tile. GGUF plans run
-// three passes of M8 tiles, or of M32 tiles to prefill (moeGgufPrefillTile).
-// M32 is the device-independent tile of prefill plans; ExecutionPlans applies
-// the device policy of GGUF plans.
+// descriptor's live rows. GGUF plans run three passes of M8 tiles, or of M32
+// tiles to prefill (moeGgufPrefillTile).
 enum class MoeExpertTile : uint8_t { M8 = 8, M32 = 32 };
 
-// Simdgroups per 8-row expert tile: a device policy the execution plans set,
-// not a tuned choice. Eight is the shipped N128 tile for both projections.
+// Simdgroups per affine 8-row expert tile, a device policy the execution
+// plans set. Eight is the shipped N128 tile for both projections.
 // Four halves the threadgroup to 128 threads and runs gate/up at N128 and
 // down at N256, for Apple9 decode plans: family 9 has no per-core matrix
 // unit, and a decode expert grid leaves it latency-bound at low occupancy.
@@ -189,12 +186,11 @@ enum class MoeExpertTile : uint8_t { M8 = 8, M32 = 32 };
 // top_k=8, I=512), ms per layer at rows 8/16/24/32: gate/up
 // 0.332/0.551/0.728/0.859 -> 0.314/0.503/0.618/0.699 (1.06x-1.23x), down
 // 0.157/0.274/0.363/0.419 -> 0.137/0.226/0.297/0.335 (1.15x-1.25x). Apple10
-// variants had mixed results across shapes, so family 10
-// keeps eight. Smaller Apple9 core counts still need performance validation;
-// this family gate does not establish their optimum.
-// The 32-row tiles always run eight simdgroups. Either choice
-// writes bit-identical outputs and needs the same workspace; only the down
-// pass's column grid changes.
+// variants had mixed results across shapes, so family 10 keeps eight.
+// Smaller Apple9 core counts still need performance validation; this family
+// gate does not establish their optimum. Either choice writes bit-identical
+// outputs and needs the same workspace; only the down pass's column grid
+// changes.
 enum class MoeExpertSimdgroups : uint8_t { Eight = 8, Four = 4 };
 
 // Families below 9 are rejected at startup; 10 and later keep the shipped
@@ -230,11 +226,12 @@ enum class MoeGgufTile : uint8_t { Staged, Register };
 // The rows of a GGUF prefill plan's tiles on the device's `tile`: 8 on the
 // register tile. Staged: 8-row tiles while the chunk's routes average at most
 // one row per expert (rows * topK <= experts), 32-row tiles beyond, which
-// stream an expert's weights once for up to 32 of its rows (its tiles run 16-
-// or 32-row matmuls by their live rows). On the 35B's real prefill routes
-// (wikitext, 16-core M5 Pro, the three expert passes of a layer, ms) 8- vs
-// 32-row tiles: 32 rows 0.72 / 0.71, 64 rows 1.03 / 0.97, 128 rows 1.59 / 1.29,
-// 256 rows 2.60 / 1.71.
+// stream an expert's weights once for up to 32 of its rows (its tiles run 8-,
+// 16- or 32-row matmuls by their live rows, moe_live_rows). On the 35B's
+// real prefill routes (wikitext, 16-core M5 Pro, the three expert passes of a
+// layer, ms, with 16-row matmuls for up to 16 live rows) 8- vs 32-row tiles:
+// 32 rows 0.72 / 0.71, 64 rows 1.03 / 0.97, 128 rows 1.59 / 1.29, 256 rows
+// 2.60 / 1.71.
 [[nodiscard]] constexpr MoeExpertTile moeGgufPrefillTile(MoeShape shape, uint32_t rows,
                                                          MoeGgufTile tile) noexcept {
   return tile == MoeGgufTile::Register ||
@@ -245,13 +242,17 @@ enum class MoeGgufTile : uint8_t { Staged, Register };
 
 enum class MoePhase : uint8_t { Prefill, Decode };
 
+// The device's policy for a MoE plan, which the execution plans derive.
 struct MoeConfig final {
+  // M32 for affine prefill plans, M8 for decode plans; a GGUF prefill plan
+  // takes moeGgufPrefillTile's.
   MoeExpertTile expertTile = MoeExpertTile::M32;
   // Rows from which the router uses the 32-row scores tile; the execution
   // plans derive it from the GPU core count.
-  uint32_t routeWideRows = kMoeRouteWideRows;
-  // Simdgroups of the 8-row expert tiles; the execution plans derive it from
-  // the GPU family for decode plans and keep eight for prefill plans.
+  uint32_t routeWideRows = moeRouteWideRows(kAssumedGpuCores);
+  // Simdgroups of the affine 8-row expert tiles, which decode plans run; the
+  // execution plans derive it from the GPU family for decode plans and keep
+  // eight for prefill plans.
   MoeExpertSimdgroups m8Simdgroups = MoeExpertSimdgroups::Eight;
   // GGUF plans only; the execution plans derive it from the GPU family.
   MoeGgufTile ggufTile = MoeGgufTile::Staged;
@@ -299,14 +300,6 @@ struct MoeBuffers final {
 struct MoE final {
   [[nodiscard]] static MoePlan prefillPlan(MoeShape shape, uint32_t rows, MoeConfig config);
   [[nodiscard]] static MoePlan decodePlan(MoeShape shape, uint32_t lanes, MoeConfig config);
-  // The precompiled configurations an affine shape is tuned over, shipped
-  // baseline first; ExecutionPlans gives each one the device's fields.
-  [[nodiscard]] static constexpr std::array<MoeConfig, 2> prefillCandidates() noexcept {
-    return {{{MoeExpertTile::M32}, {MoeExpertTile::M8}}};
-  }
-  [[nodiscard]] static constexpr std::array<MoeConfig, 2> decodeCandidates() noexcept {
-    return {{{MoeExpertTile::M8}, {MoeExpertTile::M32}}};
-  }
   static void add(metal::CommandGraph &graph, const MoeBuffers &buffers,
                   const MoeWeights &weights, const MoePlan &plan);
 };

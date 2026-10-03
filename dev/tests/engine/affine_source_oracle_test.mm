@@ -26,7 +26,7 @@ void compare(model::WeightFile file, const std::filesystem::path &target, bool l
     model::readWeightBytes(fd, 0, header);
     if (memcmp(header.data(), record.magic.data(), 8) || memcmp(header.data() + 8, &record.layer, 4) ||
         memcmp(header.data() + 12, &record.type, 4)) throw std::runtime_error("prepared header differs");
-    const auto data = file.section(record.declaredBytes - model::kWeightFileAlignment);
+    const auto data = file.section(record.declaredBytes - model::kWeightFileAlignment, {});
     const auto *prepared = static_cast<const uint8_t *>(data.contents());
     std::vector<uint8_t> bytes(1024 * 1024);
     uint32_t maximumDecayUlp = 0;
@@ -75,11 +75,12 @@ int main(int argc, char **argv) {
       const std::filesystem::path package(argv[3]);
       const auto descriptor = model::inspectModelPackage(package);
       std::visit([&](const auto &layout) {
-        model::AffineTargetLoader loader(backend, argv[2], layout);
+        model::AffineTargetLoader loader(backend, argv[2], layout, {});
         const uint32_t begin = argc == 5 && !loadOnly ? std::stoul(argv[4]) : 0;
         const uint32_t end = argc == 5 && !loadOnly ? begin + 1 : layout.layers;
+        const std::vector<model::affine::Image> images = model::affineTargetImages(layout);
         for (uint32_t layer = begin; layer < end; ++layer) {
-          const auto sections = model::affineLayerImage(layout, layer).sections;
+          const auto &sections = images.at(layer).sections;
           const auto decay = std::ranges::find(sections, model::affine::SectionKind::Decay,
                                                &model::affine::Section::kind);
           const bool gdn = decay != sections.end();

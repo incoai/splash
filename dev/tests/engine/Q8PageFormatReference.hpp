@@ -1,5 +1,6 @@
 #pragma once
 
+#include "metal/abi/KvExtent.h"
 #include "ops/PagedKv.hpp"
 
 #include <algorithm>
@@ -10,6 +11,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace splash::kv {
 
@@ -36,11 +38,6 @@ inline constexpr uint64_t kBytesPerLayerPage =
 inline constexpr uint64_t kBytesPerModelPage =
     kOracleLayout.bytesPerModelPage();
 
-[[nodiscard]] constexpr StorageByteCounts
-storageByteCounts(uint64_t pages) noexcept {
-  return kOracleLayout.storageByteCounts(pages);
-}
-
 struct Q8LayerPage final {
   std::array<int8_t, kElementsPerLayerPage> keys{};
   std::array<float, kScalesPerTensorLayerPage> keyScales{};
@@ -64,24 +61,6 @@ static_assert(std::is_standard_layout_v<Q8KVMetalPageParams>);
 constexpr uint64_t logicalIndex(uint32_t token, uint32_t head,
                                 uint32_t dimension) {
   return (uint64_t{token} * kKvHeads + head) * kHeadDimension + dimension;
-}
-
-constexpr uint64_t keyDataIndex(uint32_t head, uint32_t token,
-                                uint32_t dimension) {
-  return (uint64_t{head} * kPageTokens + token) * kHeadDimension + dimension;
-}
-
-constexpr uint64_t keyScaleIndex(uint32_t head, uint32_t token) {
-  return uint64_t{head} * kPageTokens + token;
-}
-
-constexpr uint64_t valueDataIndex(uint32_t head, uint32_t token,
-                                  uint32_t dimension) {
-  return (uint64_t{head} * kHeadDimension + dimension) * kPageTokens + token;
-}
-
-constexpr uint64_t valueScaleIndex(uint32_t head, uint32_t token) {
-  return uint64_t{head} * kPageTokens + token;
 }
 
 inline BFloat16Bits floatToBFloat16(float value) {
@@ -149,15 +128,15 @@ inline void checkElement(uint32_t head, uint32_t token, uint32_t dimension) {
 inline float dequantizeKey(const Q8LayerPage &source, uint32_t head,
                            uint32_t token, uint32_t dimension) {
   reference_detail::checkElement(head, token, dimension);
-  return float(source.keys[keyDataIndex(head, token, dimension)]) *
-         source.keyScales[keyScaleIndex(head, token)];
+  return float(source.keys[splash_kv_key_element(head, token, dimension)]) *
+         source.keyScales[splash_kv_scale_element(head, token)];
 }
 
 inline float dequantizeValue(const Q8LayerPage &source, uint32_t head,
                              uint32_t token, uint32_t dimension) {
   reference_detail::checkElement(head, token, dimension);
-  return float(source.values[valueDataIndex(head, token, dimension)]) *
-         source.valueScales[valueScaleIndex(head, token)];
+  return float(source.values[splash_kv_value_element(head, token, dimension)]) *
+         source.valueScales[splash_kv_scale_element(head, token)];
 }
 
 inline void quantizeLayerPage(std::span<const float> logicalKeys,
@@ -180,15 +159,15 @@ inline void quantizeLayerPage(std::span<const float> logicalKeys,
             valueMaximum,
             std::abs(logicalValues[logicalIndex(token, head, dimension)]));
       }
-      destination.keyScales[keyScaleIndex(head, token)] =
+      destination.keyScales[splash_kv_scale_element(head, token)] =
           reference_detail::storedScale(keyMaximum);
-      destination.valueScales[valueScaleIndex(head, token)] =
+      destination.valueScales[splash_kv_scale_element(head, token)] =
           reference_detail::storedScale(valueMaximum);
       for (uint32_t dimension = 0; dimension < kHeadDimension; ++dimension) {
-        destination.keys[keyDataIndex(head, token, dimension)] =
+        destination.keys[splash_kv_key_element(head, token, dimension)] =
             reference_detail::quantize(
                 logicalKeys[logicalIndex(token, head, dimension)], keyMaximum);
-        destination.values[valueDataIndex(head, token, dimension)] =
+        destination.values[splash_kv_value_element(head, token, dimension)] =
             reference_detail::quantize(
                 logicalValues[logicalIndex(token, head, dimension)],
                 valueMaximum);
@@ -217,32 +196,6 @@ inline void dequantizeLayerPage(const Q8LayerPage &source,
       }
     }
   }
-}
-
-// Test-only guard checks: production compares guards through the runtime
-// cache identity, so these helpers live with the tests that assert on them.
-[[nodiscard]] inline bool isValidLayoutGuard(const LayoutGuard &guard) {
-  const Layout layout{guard.attentionLayers, guard.kvHeads,
-                        guard.headDimension};
-  return layout.valid() &&
-         guard.quantization == uint32_t(Quantization::SymmetricInt8) &&
-         guard.scaleType == uint32_t(ScaleType::Float32) &&
-         guard.keyLayout == uint32_t(KeyLayout::TokenMajor) &&
-         guard.valueLayout == uint32_t(ValueLayout::DimensionMajor) &&
-         guard.pageTokens == kPageTokens &&
-         guard.elementsPerScale == layout.elementsPerScale() &&
-         guard.quantizedMinimum == kQuantizedMinimum &&
-         guard.quantizedMaximum == kQuantizedMaximum &&
-         guard.bytesPerLayerPage == layout.bytesPerLayerPage() &&
-         guard.bytesPerModelPage == layout.bytesPerModelPage();
-}
-
-[[nodiscard]] inline bool matchesLayout(const LayoutGuard &guard,
-                                          Layout layout) {
-  return isValidLayoutGuard(guard) &&
-         guard.attentionLayers == layout.attentionLayers &&
-         guard.kvHeads == layout.kvHeads &&
-         guard.headDimension == layout.headDimension;
 }
 
 } // namespace splash::kv

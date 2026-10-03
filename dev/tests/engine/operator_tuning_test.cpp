@@ -1,3 +1,4 @@
+#include "TestChecks.hpp"
 #include "tuning/Tuning.hpp"
 
 #include <algorithm>
@@ -12,10 +13,7 @@ namespace {
 
 using namespace splash::ops::tuning;
 
-void require(bool condition, const char *message) {
-  if (!condition)
-    throw std::runtime_error(message);
-}
+using splash::test::require;
 
 std::vector<PairedTiming> timings(double gain, size_t count = 12) {
   std::vector<PairedTiming> result;
@@ -45,7 +43,7 @@ void validSamples() {
   require(evaluate(timings(0.125, 13)).qualified(),
           "odd sample count was rejected");
   Policy exactThreshold;
-  exactThreshold.minimumMeanImprovement = 0.125;
+  exactThreshold.minimumImprovement = 0.125;
   require(evaluate(samples, exactThreshold).verdict == TimingVerdict::Improved,
           "gain equal to the improvement margin was rejected");
   exactThreshold.minimumPairs = 24;
@@ -112,9 +110,9 @@ void invalidSamplesAndPolicies() {
       std::numeric_limits<double>::quiet_NaN();
   policies[5].maximumPairedGainSpread = -1;
   policies[6].maximumPairedGainSpread = std::numeric_limits<double>::infinity();
-  policies[7].minimumMeanImprovement = 0;
-  policies[8].minimumMeanImprovement = 1;
-  policies[9].minimumMeanImprovement = std::numeric_limits<double>::quiet_NaN();
+  policies[7].minimumImprovement = 0;
+  policies[8].minimumImprovement = 1;
+  policies[9].minimumImprovement = std::numeric_limits<double>::quiet_NaN();
   for (const auto &policy : policies)
     require(evaluate(samples, policy).verdict == TimingVerdict::InvalidPolicy,
             "invalid policy was accepted");
@@ -163,160 +161,62 @@ void matchedNoise() {
 }
 
 void selection() {
-  const std::array required{WorkloadId{10}, WorkloadId{20}};
   const auto fast = timings(0.125);
   const auto medium = timings(0.0625);
-  const auto neutral = timings(0);
   const auto small = timings(0.01);
   const auto slow = timings(-0.01);
   const auto shortRun = timings(0.125, 11);
-  const std::array mixed{WorkloadMeasurements{{10}, fast},
-                         WorkloadMeasurements{{20}, neutral}};
-  const std::array balanced{WorkloadMeasurements{{20}, medium},
-                            WorkloadMeasurements{{10}, medium}};
-  const std::array regressing{WorkloadMeasurements{{10}, fast},
-                              WorkloadMeasurements{{20}, slow}};
-  const std::array unhelpful{WorkloadMeasurements{{10}, small},
-                             WorkloadMeasurements{{20}, neutral}};
-  const std::array incomplete{WorkloadMeasurements{{10}, fast},
-                              WorkloadMeasurements{{20}, shortRun}};
-  std::array candidates{CandidateMeasurements{{1}, mixed},
-                         CandidateMeasurements{{3}, balanced},
-                         CandidateMeasurements{{2}, balanced},
-                         CandidateMeasurements{{4}, regressing},
-                         CandidateMeasurements{{5}, unhelpful},
-                         CandidateMeasurements{{6}, incomplete}};
-  auto chosen = selectCandidate(candidates, required);
+  std::array candidates{CandidateMeasurements{{1}, medium},
+                        CandidateMeasurements{{3}, fast},
+                        CandidateMeasurements{{2}, fast},
+                        CandidateMeasurements{{4}, slow},
+                        CandidateMeasurements{{5}, small},
+                        CandidateMeasurements{{6}, shortRun}};
+  auto chosen = selectCandidate(candidates);
   require(chosen.verdict == SelectionVerdict::Selected &&
               chosen.candidate == CandidateId{2} &&
-              chosen.conservativeMeanGain == 0.0625 &&
-              chosen.worstWorkloadGain == 0.0625,
-          "selection did not rank aggregate gain, worst gain and ID");
+              chosen.conservativeGain == 0.125,
+          "selection did not rank conservative gain, then ID");
   std::reverse(candidates.begin(), candidates.end());
-  require(selectCandidate(candidates, required).candidate == chosen.candidate,
+  require(selectCandidate(candidates).candidate == chosen.candidate,
           "selection changed with candidate order");
-  require(selectCandidate(std::span(candidates).last(1), required).candidate ==
+  require(selectCandidate(std::span(candidates).last(1)).candidate ==
               CandidateId{1},
-          "neutral required workload prevented a meaningful aggregate gain");
-  require(selectCandidate(std::span(candidates).first(3), required).candidate ==
+          "a smaller meaningful gain did not replace baseline");
+  require(selectCandidate(std::span(candidates).first(3)).candidate ==
               kBaseline,
           "regression, small gain or missing samples replaced baseline");
-  require(selectCandidate({}, required).candidate == kBaseline,
+  require(selectCandidate({}).candidate == kBaseline,
           "empty candidate list did not retain baseline");
   auto pressured = fast;
   pressured.back().underPressure = true;
   auto noisy = fast;
   for (size_t i = 0; i < noisy.size(); i += 2)
     noisy[i].candidateSeconds = 1.125;
-  const std::array pressureWorkloads{WorkloadMeasurements{{10}, fast},
-                                    WorkloadMeasurements{{20}, pressured}};
-  const std::array noisyWorkloads{WorkloadMeasurements{{10}, fast},
-                                 WorkloadMeasurements{{20}, noisy}};
-  const std::array neutralWorkloads{WorkloadMeasurements{{10}, neutral},
-                                   WorkloadMeasurements{{20}, neutral}};
-  const std::array unsafe{CandidateMeasurements{{1}, pressureWorkloads},
-                         CandidateMeasurements{{2}, noisyWorkloads},
-                         CandidateMeasurements{{3}, neutralWorkloads}};
-  require(selectCandidate(unsafe, required).candidate == kBaseline,
-          "pressure, noisy or entirely neutral workloads replaced baseline");
+  const auto neutral = timings(0);
+  const std::array unsafe{CandidateMeasurements{{1}, pressured},
+                          CandidateMeasurements{{2}, noisy},
+                          CandidateMeasurements{{3}, neutral}};
+  require(selectCandidate(unsafe).candidate == kBaseline,
+          "pressured, noisy or neutral samples replaced baseline");
+  Policy margin;
+  margin.minimumImprovement = 0.07;
+  require(selectCandidate(std::span(candidates).last(1), margin).candidate ==
+              kBaseline,
+          "a gain below the improvement margin replaced baseline");
 
-  const std::array missing{WorkloadMeasurements{{10}, fast}};
-  const std::array duplicate{WorkloadMeasurements{{10}, fast},
-                             WorkloadMeasurements{{10}, fast}};
-  const std::array unknown{WorkloadMeasurements{{10}, fast},
-                           WorkloadMeasurements{{30}, fast}};
-  const std::array extra{WorkloadMeasurements{{10}, fast},
-                         WorkloadMeasurements{{20}, fast},
-                         WorkloadMeasurements{{30}, fast}};
-  const std::array malformed{CandidateMeasurements{{1}, missing},
-                            CandidateMeasurements{{2}, duplicate},
-                            CandidateMeasurements{{3}, unknown},
-                            CandidateMeasurements{{4}, extra}};
-  require(selectCandidate(malformed, required).candidate == kBaseline,
-          "missing, duplicate or extra workload IDs were accepted");
-  const std::array ambiguous{CandidateMeasurements{{1}, mixed},
-                             CandidateMeasurements{{1}, balanced}};
-  const std::array baselineId{CandidateMeasurements{kBaseline, balanced}};
-  const std::array duplicateRequired{WorkloadId{10}, WorkloadId{10}};
-  require(selectCandidate(ambiguous, required).verdict ==
-              SelectionVerdict::InvalidInput &&
-              selectCandidate(baselineId, required).verdict ==
-                  SelectionVerdict::InvalidInput &&
-              selectCandidate(candidates, duplicateRequired).verdict ==
-                  SelectionVerdict::InvalidInput &&
-              selectCandidate(candidates, {}).verdict ==
+  const std::array ambiguous{CandidateMeasurements{{1}, fast},
+                             CandidateMeasurements{{1}, medium}};
+  const std::array baselineId{CandidateMeasurements{kBaseline, fast}};
+  require(selectCandidate(ambiguous).verdict == SelectionVerdict::InvalidInput &&
+              selectCandidate(baselineId).verdict ==
                   SelectionVerdict::InvalidInput,
           "ambiguous selection IDs were accepted");
   Policy invalidPolicy;
   invalidPolicy.minimumPairs = 1;
-  require(selectCandidate(candidates, required, invalidPolicy).verdict ==
+  require(selectCandidate(candidates, invalidPolicy).verdict ==
               SelectionVerdict::InvalidInput,
           "selection ignored an invalid policy");
-}
-
-void structuralEquivalence() {
-  const std::array required{WorkloadId{10}, WorkloadId{20}};
-  const auto fast = timings(0.125);
-  const std::array mixed{WorkloadMeasurements{{20}, {}, true},
-                         WorkloadMeasurements{{10}, fast}};
-  const std::array candidate{CandidateMeasurements{{1}, mixed}};
-  const auto selected = selectCandidate(candidate, required);
-  require(selected.verdict == SelectionVerdict::Selected &&
-              selected.candidate == CandidateId{1} &&
-              selected.conservativeMeanGain == 0.0625 &&
-              selected.worstWorkloadGain == 0 && mixed[0].samples.empty() &&
-              mixed[1].samples.data() == fast.data() &&
-              mixed[1].samples.size() == fast.size(),
-          "structural identity did not contribute exact zero without samples");
-  Policy margin;
-  margin.minimumMeanImprovement = 0.07;
-  require(selectCandidate(candidate, required, margin).candidate == kBaseline,
-          "structurally identical workload was omitted from the mean denominator");
-  const std::array reorderedRequired{WorkloadId{20}, WorkloadId{10}};
-  require(selectCandidate(candidate, reorderedRequired).candidate == CandidateId{1},
-          "structural identity changed required-ID matching order");
-
-  const std::array allEquivalent{WorkloadMeasurements{{10}, {}, true},
-                                WorkloadMeasurements{{20}, {}, true}};
-  const std::array allEquivalentCandidate{CandidateMeasurements{{1}, allEquivalent}};
-  require(selectCandidate(allEquivalentCandidate, required).candidate == kBaseline,
-          "an all-identical candidate displaced baseline");
-  const std::array absentSamples{WorkloadMeasurements{{10}, fast},
-                                WorkloadMeasurements{{20}, {}}};
-  const std::array absentCandidate{CandidateMeasurements{{1}, absentSamples}};
-  require(!absentSamples[1].equivalentToBaseline &&
-              selectCandidate(absentCandidate, required).candidate == kBaseline,
-          "missing samples implicitly asserted structural identity");
-  const std::array contradictory{WorkloadMeasurements{{10}, fast},
-                                WorkloadMeasurements{{20}, fast, true}};
-  const std::array contradictoryCandidate{CandidateMeasurements{{2}, contradictory}};
-  require(selectCandidate(contradictoryCandidate, required).candidate == kBaseline,
-          "structural identity with timing samples was accepted");
-  const std::array independent{CandidateMeasurements{{2}, contradictory},
-                               CandidateMeasurements{{1}, mixed}};
-  require(selectCandidate(independent, required).candidate == CandidateId{1},
-          "contradictory identity invalidated an independent qualified candidate");
-
-  const std::array missing{WorkloadMeasurements{{20}, {}, true}};
-  const std::array duplicate{WorkloadMeasurements{{10}, fast},
-                            WorkloadMeasurements{{10}, {}, true}};
-  const std::array unknown{WorkloadMeasurements{{10}, fast},
-                          WorkloadMeasurements{{30}, {}, true}};
-  const std::array extra{WorkloadMeasurements{{10}, fast},
-                        WorkloadMeasurements{{20}, {}, true},
-                        WorkloadMeasurements{{30}, {}, true}};
-  for (const auto workloads : {std::span<const WorkloadMeasurements>(missing),
-                               std::span<const WorkloadMeasurements>(duplicate),
-                               std::span<const WorkloadMeasurements>(unknown),
-                               std::span<const WorkloadMeasurements>(extra)}) {
-    const std::array malformed{CandidateMeasurements{{1}, workloads}};
-    require(selectCandidate(malformed, required).candidate == kBaseline,
-            "structural identity bypassed exact required workload IDs");
-  }
-  const std::array duplicateRequired{WorkloadId{10}, WorkloadId{10}};
-  require(selectCandidate(candidate, duplicateRequired).verdict ==
-              SelectionVerdict::InvalidInput,
-          "structural identity bypassed duplicate required-ID validation");
 }
 
 } // namespace
@@ -327,7 +227,6 @@ int main() {
     invalidSamplesAndPolicies();
     matchedNoise();
     selection();
-    structuralEquivalence();
     std::cout << "operator tuning: PASS\n";
   } catch (const std::exception &error) {
     std::cerr << "operator tuning: FAIL: " << error.what() << '\n';

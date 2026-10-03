@@ -1,5 +1,6 @@
 #include "model/GgufFile.hpp"
 
+#include "Checked.hpp"
 #include "metal/abi/Gguf.h"
 
 #include <algorithm>
@@ -9,12 +10,6 @@
 
 namespace splash::model {
 namespace {
-
-uint64_t checkedMultiply(uint64_t a, uint64_t b) {
-  if (b && a > std::numeric_limits<uint64_t>::max() / b)
-    throw GgufError("GGUF size overflows uint64");
-  return a * b;
-}
 
 enum ValueType : uint32_t {
   kUint8 = 0, kInt8 = 1, kUint16 = 2, kInt16 = 3, kUint32 = 4, kInt32 = 5,
@@ -119,7 +114,7 @@ void skipArray(Reader &reader, uint32_t element, uint64_t count, unsigned depth)
   if (element == kString || element == kArray) {
     for (uint64_t i = 0; i < count; ++i) skipValue(reader, element, depth + 1);
   } else {
-    reader.skip(checkedMultiply(count, scalarBytes(element)));
+    reader.skip(checkedMultiply<GgufError>(count, scalarBytes(element), "GGUF size"));
   }
 }
 
@@ -144,13 +139,13 @@ std::string ggmlTypeName(uint32_t type) {
 
 uint64_t GgufTensor::rows() const {
   uint64_t rows = 1;
-  for (size_t i = 1; i < dims.size(); ++i) rows = checkedMultiply(rows, dims[i]);
+  for (size_t i = 1; i < dims.size(); ++i) rows = checkedMultiply<GgufError>(rows, dims[i], "GGUF size");
   return rows;
 }
 
 uint64_t GgufTensor::elements() const {
   uint64_t elements = 1;
-  for (uint64_t dim : dims) elements = checkedMultiply(elements, dim);
+  for (uint64_t dim : dims) elements = checkedMultiply<GgufError>(elements, dim, "GGUF size");
   return elements;
 }
 
@@ -233,8 +228,9 @@ GgufFile::GgufFile(WeightSource &source) : source_(source) {
     if (!traits) throw GgufError("unknown ggml type " + std::to_string(tensor.type) + " for " + tensor.name);
     if (tensor.columns() % traits->blockElements)
       throw GgufError("tensor row is not block aligned: " + tensor.name);
-    tensor.bytes = checkedMultiply(checkedMultiply(tensor.rows(), tensor.columns() / traits->blockElements),
-                                   traits->blockBytes);
+    tensor.bytes = checkedMultiply<GgufError>(
+        checkedMultiply<GgufError>(tensor.rows(), tensor.columns() / traits->blockElements, "GGUF size"),
+        traits->blockBytes, "GGUF size");
     if (!index_.emplace(tensor.name, tensors_.size()).second)
       throw GgufError("duplicate GGUF tensor: " + tensor.name);
     tensors_.push_back(std::move(tensor));

@@ -1,5 +1,8 @@
 #pragma once
 
+#include "Checked.hpp"
+#include "metal/abi/ExecutionGeometry.h"
+
 #include <cstdint>
 
 namespace splash::model {
@@ -11,7 +14,6 @@ inline constexpr uint32_t kGdnConvolutionTaps = 4;
 // Physical state geometry is supplied by the paired target and draft models.
 // The engine sees only opaque CompositeState handles and byte accounting.
 struct GdnStateLayout final {
-  static constexpr uint32_t alignmentBytes = 16 * 1024;
   static constexpr uint32_t bfloat16Bytes = 2;
 
   uint32_t layers = 0;
@@ -25,19 +27,16 @@ struct GdnStateLayout final {
     return layers && convolutionHistory && convolutionChannels &&
            recurrentGroups && recurrentRows && recurrentColumns;
   }
-  [[nodiscard]] static constexpr uint64_t align(uint64_t bytes) noexcept {
-    return (bytes + alignmentBytes - 1) & ~uint64_t(alignmentBytes - 1);
-  }
   [[nodiscard]] constexpr uint64_t convolutionLayerBytes() const noexcept {
-    return align(uint64_t{convolutionHistory} * convolutionChannels *
-                 bfloat16Bytes);
+    return alignUp(uint64_t{convolutionHistory} * convolutionChannels *
+                   bfloat16Bytes);
   }
   [[nodiscard]] constexpr uint64_t convolutionBytes() const noexcept {
     return uint64_t{layers} * convolutionLayerBytes();
   }
   [[nodiscard]] constexpr uint64_t recurrentLayerBytes() const noexcept {
-    return align(uint64_t{recurrentGroups} * recurrentRows *
-                 recurrentColumns * sizeof(float));
+    return alignUp(uint64_t{recurrentGroups} * recurrentRows *
+                   recurrentColumns * sizeof(float));
   }
   [[nodiscard]] constexpr uint64_t recurrentBytes() const noexcept {
     return uint64_t{layers} * recurrentLayerBytes();
@@ -49,19 +48,21 @@ struct GdnStateLayout final {
   bool operator==(const GdnStateLayout &) const = default;
 };
 
+// One ring of SPLASH_DRAFT_SLIDING_WINDOW slots per KV head for the keys and
+// one for the values of every draft layer.
 struct DraftStateLayout final {
   static constexpr uint32_t bfloat16Bytes = 2;
 
   uint32_t layers = 0;
   uint32_t kvHeads = 0;
-  uint32_t tokens = 0;
   uint32_t headDimension = 0;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
-    return layers && kvHeads && tokens && headDimension;
+    return layers && kvHeads && headDimension;
   }
   [[nodiscard]] constexpr uint64_t tensorBytes() const noexcept {
-    return uint64_t{kvHeads} * tokens * headDimension * bfloat16Bytes;
+    return uint64_t{kvHeads} * SPLASH_DRAFT_SLIDING_WINDOW * headDimension *
+           bfloat16Bytes;
   }
   [[nodiscard]] constexpr uint64_t ringBytes() const noexcept {
     return uint64_t{layers} * 2 * tensorBytes();
@@ -71,14 +72,17 @@ struct DraftStateLayout final {
 };
 
 struct CompositeStateLayout final {
+  // The GDN cells a lane holds, with one draft ring.
+  static constexpr uint32_t kLaneGdnCells = 2;
+
   GdnStateLayout target;
   DraftStateLayout draft;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
     return target.valid() && draft.valid();
   }
-  [[nodiscard]] constexpr uint64_t activeCellBytes() const noexcept {
-    return 2 * target.cellBytes() + draft.ringBytes();
+  [[nodiscard]] constexpr uint64_t laneBytes() const noexcept {
+    return kLaneGdnCells * target.cellBytes() + draft.ringBytes();
   }
   [[nodiscard]] constexpr uint64_t cachedBytes() const noexcept {
     return target.cellBytes() + draft.ringBytes();

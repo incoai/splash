@@ -1,10 +1,15 @@
+import math
 import subprocess
 import sys
 import unittest
 from dataclasses import asdict
 from unittest import mock
 
-from dev.tests.engine.test_documents import pdf_bytes, render_pdf
+from dev.tests.engine.test_documents import (
+    full_render_limits,
+    pdf_bytes,
+    render_pdf,
+)
 from server import document_worker, documents
 from server.errors import APIError
 
@@ -40,11 +45,25 @@ class DocumentWorkerTests(unittest.TestCase):
         children = []
         with self.sleeping_worker(children):
             with self.assertRaises(APIError) as caught:
-                document_worker.render(
-                    pdf_bytes(), asdict(documents._render_limits()), 0.1
-                )
+                document_worker.render(pdf_bytes(), asdict(full_render_limits()), 0.1)
         self.assertEqual(caught.exception.status, 504)
         self.assertEqual(caught.exception.code, "request_timeout")
+        self.assert_released(children)
+
+    def test_worker_time_limit_without_a_deadline_is_a_request_error(self):
+        children = []
+        with (
+            self.sleeping_worker(children),
+            mock.patch.object(document_worker, "MAX_SECONDS", 0.1),
+        ):
+            with self.assertRaises(APIError) as caught:
+                document_worker.render(
+                    pdf_bytes(), asdict(full_render_limits()), math.inf
+                )
+        self.assertEqual(caught.exception.status, 400)
+        self.assertEqual(
+            caught.exception.message, "PDF processing exceeded the time limit"
+        )
         self.assert_released(children)
 
     def test_memory_budget_stops_worker_without_caching_partial_output(self):

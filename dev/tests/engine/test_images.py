@@ -169,7 +169,11 @@ class DataUrlTest(unittest.TestCase):
 
 class ImageCacheTest(unittest.TestCase):
     def test_request_budget_counts_repeated_images_and_all_live_batches(self):
-        cache = images.ImageCache(budget_bytes=0, request_budget_bytes=12)
+        self.enterContext(mock.patch.object(images.ImageCache, "BUDGET_BYTES", 0))
+        self.enterContext(
+            mock.patch.object(images.ImageCache, "REQUEST_BUDGET_BYTES", 12)
+        )
+        cache = images.ImageCache()
         image = images.PreparedImage(2, 2, b"abcd", 0, 0)
         first, second = cache.request_batch(), cache.request_batch()
         first.append(image)
@@ -189,7 +193,10 @@ class ImageCacheTest(unittest.TestCase):
         self.assertEqual(cache.stats()["request_bytes"], 0)
 
     def test_request_budget_is_returned_after_exception_and_cyclic_owner(self):
-        cache = images.ImageCache(request_budget_bytes=4)
+        self.enterContext(
+            mock.patch.object(images.ImageCache, "REQUEST_BUDGET_BYTES", 4)
+        )
+        cache = images.ImageCache()
 
         def prepare_then_fail():
             batch = cache.request_batch()
@@ -204,7 +211,10 @@ class ImageCacheTest(unittest.TestCase):
         self.assertEqual(cache.stats()["request_bytes"], 0)
 
     def test_concurrent_request_batches_do_not_oversell_image_budget(self):
-        cache = images.ImageCache(request_budget_bytes=12)
+        self.enterContext(
+            mock.patch.object(images.ImageCache, "REQUEST_BUDGET_BYTES", 12)
+        )
+        cache = images.ImageCache()
         batches = [cache.request_batch() for _ in range(16)]
 
         def append(batch):
@@ -221,14 +231,17 @@ class ImageCacheTest(unittest.TestCase):
         self.assertEqual(cache.stats()["request_bytes"], 0)
 
     def test_cache_reuses_prepared_images_and_evicts_by_bytes(self):
-        cache = images.ImageCache(budget_bytes=2 * 256 * 256 * 3)
+        self.enterContext(
+            mock.patch.object(images.ImageCache, "BUDGET_BYTES", 2 * 256 * 256 * 3)
+        )
+        cache = images.ImageCache()
         first = cache.prepare(png_bytes(64, 64), images.MAX_PIXELS)
         self.assertIs(cache.prepare(png_bytes(64, 64), images.MAX_PIXELS), first)
         self.assertEqual(cache.stats()["entries"], 1)
         cache.prepare(png_bytes(64, 64, (0, 200, 0)), images.MAX_PIXELS)
         cache.prepare(png_bytes(64, 64, (0, 0, 200)), images.MAX_PIXELS)
         self.assertEqual(cache.stats()["entries"], 2)
-        self.assertLessEqual(cache.stats()["bytes"], cache.budget_bytes)
+        self.assertLessEqual(cache.stats()["bytes"], cache.BUDGET_BYTES)
         # A different serving cap is a different preparation.
         cache.prepare(png_bytes(64, 64), 65_536)
         self.assertEqual(cache.stats()["entries"], 2)

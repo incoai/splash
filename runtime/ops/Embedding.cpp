@@ -1,6 +1,7 @@
 #include "ops/Embedding.hpp"
 
 #include "metal/abi/Embedding.h"
+#include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Gguf.h"
 
 #include <stdexcept>
@@ -48,6 +49,21 @@ void Embedding::add(metal::CommandGraph &graph, metal::MetalBuffer tokens,
   graph.add("embedding_q4_h" + std::to_string(table.inputSize),
             {std::move(tokens), affine.weights, affine.scales, affine.biases, std::move(output)},
             params, {hiddenGroups, 1, 1});
+}
+
+void Embedding::addVerifyInput(metal::CommandGraph &graph,
+                               metal::MetalBuffer draftInputTokens,
+                               metal::MetalBuffer proposedTokens,
+                               metal::MetalBuffer verifyInputTokens,
+                               uint32_t vocabulary, uint32_t lanes) {
+  if (!vocabulary || !lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
+    throw std::invalid_argument("invalid verify input batch");
+  const VerifyInputBatchParams params{vocabulary};
+  graph.add("verify_input_tokens",
+            {std::move(draftInputTokens), std::move(proposedTokens),
+             std::move(verifyInputTokens)},
+            params, {uint64_t{lanes} * SPLASH_TARGET_VERIFY_ROWS, 1, 1},
+            {1, 1, 1});
 }
 
 } // namespace splash::ops

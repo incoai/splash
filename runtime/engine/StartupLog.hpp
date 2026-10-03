@@ -1,7 +1,8 @@
 #pragma once
 
+#include "StderrLine.hpp"
+
 #include <ctime>
-#include <iostream>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -9,7 +10,7 @@
 namespace splash::engine {
 
 template <typename... Parts>
-void logKernelStartup(const Parts &...parts) noexcept {
+void logStartup(const Parts &...parts) noexcept {
   try {
     std::ostringstream text;
     (text << ... << parts);
@@ -26,7 +27,7 @@ void logKernelStartup(const Parts &...parts) noexcept {
     for (unsigned char character : std::string_view(message).substr(0, 768))
       line << (character < 32 || character == 127 ? ' ' : char(character));
     if (message.size() > 768) line << "...";
-    std::cerr << line.str() << '\n';
+    writeStderrLine(line.str());
   } catch (...) {
     // Optional diagnostics must not affect startup or serving.
   }

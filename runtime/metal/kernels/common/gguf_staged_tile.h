@@ -8,9 +8,9 @@
 using namespace metal;
 using namespace mpp::tensor_ops;
 
-// The staged decode tile of kernels/shared/gguf_linear.metal and kernels/shared/moe_gguf.metal: each simdgroup
-// dequantizes its own columns' weights into a half stage and runs matmul2d on it alone. Includers set `#pragma clang
-// fp reassociate(off)` first.
+// The staged tiles of kernels/shared/gguf_linear.metal and kernels/shared/moe_gguf.metal: dequantize the weights into
+// a half stage and run matmul2d on it, in the decode tile each simdgroup its own columns alone, in the prefill tile
+// every thread for the columns all simdgroups share. Includers set `#pragma clang fp reassociate(off)` first.
 
 // The two stages of a simdgroup, and of the threadgroup's GGUF_TILE_COLUMNS / GGUF_STAGED_COLUMNS simdgroups.
 constant constexpr uint kStagedSimdgroupStage = 2 * GGUF_STAGED_COLUMNS * GGUF_STAGED_STEP;
@@ -42,13 +42,17 @@ template <class Acc, class Fn> inline void gguf_elements(thread Acc &acc, Fn fn)
   }
 }
 
-// The decode tile loop without the store: dequantize one KS-input step of the Cols columns into the stage, then run
-// the tile's matmul2d on it, over steps [step_begin, step_end) of K.
-template <class F, ushort Rows, ushort Cols, ushort KS, class Acc>
-inline void staged_accumulate(device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta, uint input_size, uint output_origin,
-                     threadgroup half *stage, threadgroup half2 *tl, uint simd_lane, uint step_begin, uint step_end, thread Acc &acc) {
+// The staged tile loop without the store, over steps [step_begin, step_end) of K: the Threads threads (thread_index
+// among them) dequantize one KS-input step of the Cols columns into the stage, meet at a barrier (a simdgroup's when
+// one simdgroup stages alone, the threadgroup's otherwise), and, when `matmuls`, run the Rows-row matmul2d of `input`
+// on the stage. Threads that run no matmuls still stage and meet every barrier: in MSL a barrier inside a conditional
+// must be reached by every thread of the threadgroup.
+template <class F, ushort Rows, ushort Cols, ushort KS, ushort Threads, class Acc>
+inline void gguf_staged_steps(device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta, uint input_size,
+                              uint output_origin, threadgroup half *stage, threadgroup half2 *tl, uint thread_index,
+                              uint step_begin, uint step_end, bool matmuls, thread Acc &acc) {
   // Prefetch: the steps whose weights are loaded ahead of the one being staged.
-  constexpr ushort Prefetch = 1, GPS = KS / 32, Items = Cols * GPS, IPT = (Items + 31) / 32;
+  constexpr ushort Prefetch = 1, GPS = KS / 32, Items = Cols * GPS, IPT = (Items + Threads - 1) / Threads;
   auto a = tensor(input, dextents<int, 2>{int(input_size), Rows}, array<int, 2>{1, int(input_size)});
   constexpr auto descriptor = matmul2d_descriptor(Rows, Cols, KS, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<descriptor, execution_simdgroups<1>> operation;
@@ -64,7 +68,7 @@ inline void staged_accumulate(device bfloat *input, device uchar *w0, device uch
   const uint unit0 = (step_begin * GPS) / F::MetaGroups;
 #pragma unroll
   for (ushort it = 0; it < IPT; ++it) {
-    const uint item = simd_lane + it * 32; const bool live = item < Items;
+    const uint item = thread_index + it * Threads; const bool live = item < Items;
     const uint col = live ? item % Cols : 0, gi = live ? item / Cols : 0;
 #pragma unroll
     for (ushort pf = 0; pf < Prefetch; ++pf) {
@@ -77,23 +81,34 @@ inline void staged_accumulate(device bfloat *input, device uchar *w0, device uch
     threadgroup half *buf = stage + (step & 1) * (KS * Cols);
 #pragma unroll
     for (ushort it = 0; it < IPT; ++it) {
-      const uint item = simd_lane + it * 32; if (item >= Items) break;
+      const uint item = thread_index + it * Threads; if (item >= Items) break;
       const uint col = item % Cols, gi = item / Cols, g = step * GPS + gi, unit = g / F::MetaGroups; const ushort j = g % F::MetaGroups;
       if (unit != hdr_unit[it]) { hdr[it] = F::loadMeta(tmeta + (ulong(unit) * QUANT_TILE_ROWS + col) * F::MetaBytes); hdr_unit[it] = unit; }
       dequant32<F>(packed[0][it], hdr[it], j, tl, buf + col * KS + gi * 32);
     }
-    simdgroup_barrier(mem_flags::mem_threadgroup);
+    if constexpr (Threads == 32) simdgroup_barrier(mem_flags::mem_threadgroup);
+    else threadgroup_barrier(mem_flags::mem_threadgroup);
     if (step + Prefetch < step_end) {
 #pragma unroll
       for (ushort it = 0; it < IPT; ++it) {
-        const uint item = simd_lane + it * 32; if (item >= Items) break;
+        const uint item = thread_index + it * Threads; if (item >= Items) break;
         const uint col = item % Cols, gi = item / Cols; const ulong g = ulong(step + Prefetch) * GPS + gi;
         packed[Prefetch - 1][it] = F::load(tw0 + (g * QUANT_TILE_ROWS + col) * F::P0, tw1 + (g * QUANT_TILE_ROWS + col) * F::P1);
       }
     }
-    auto a_slice = a.template slice<KS, Rows>(step * KS, 0);
-    if (step & 1) operation.run(a_slice, b1, acc); else operation.run(a_slice, b0, acc);
+    if (matmuls) {
+      auto a_slice = a.template slice<KS, Rows>(step * KS, 0);
+      if (step & 1) operation.run(a_slice, b1, acc); else operation.run(a_slice, b0, acc);
+    }
   }
+}
+
+// The decode tile loop of one simdgroup without the store: its Cols columns over steps [step_begin, step_end) of K.
+template <class F, ushort Rows, ushort Cols, ushort KS, class Acc>
+inline void staged_accumulate(device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta, uint input_size, uint output_origin,
+                     threadgroup half *stage, threadgroup half2 *tl, uint simd_lane, uint step_begin, uint step_end, thread Acc &acc) {
+  gguf_staged_steps<F, Rows, Cols, KS, 32>(input, w0, w1, meta, input_size, output_origin, stage, tl, simd_lane, step_begin,
+                                           step_end, true, acc);
   simdgroup_barrier(mem_flags::mem_threadgroup);   // the stage may be reused by a following accumulate
 }
 

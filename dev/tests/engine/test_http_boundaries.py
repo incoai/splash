@@ -8,9 +8,22 @@ from unittest import mock
 
 from PIL import Image
 
-from dev.tests.test_server import FakeRuntime, Harness
-from server import crash_trace, http_security, images
+from dev.tests.test_server import FOREVER, FakeRuntime, Harness
+from server import crash_trace, http_security, images, origins
 from server.errors import APIError
+
+INVALID_ORIGINS = (
+    "",
+    "null",
+    "localhost:3000",
+    "http://",
+    "http://localhost:3000/",
+    "http://localhost/app",
+    "http://localhost?debug",
+    "http://user@localhost",
+    "http://localhost:99999",
+    "http://local host",
+)
 
 
 class HttpBoundaryTests(unittest.TestCase):
@@ -37,7 +50,13 @@ class HttpBoundaryTests(unittest.TestCase):
 
     def test_authority_and_origin_validation(self):
         allowed = {"localhost", "127.0.0.1", "::1", "serving.example"}
-        cross_origin = "cross-origin requests are not allowed"
+
+        def elsewhere(origin):
+            return (
+                f"Origin {origin} is not allowed; restart the server with "
+                f"--allowed-origin {origin} to accept it"
+            )
+
         cases = (
             ("localhost:8000", "http://localhost:8000", None),
             ("[::1]:8000", "http://[::1]:8000", None),
@@ -50,9 +69,19 @@ class HttpBoundaryTests(unittest.TestCase):
                 "with --allowed-host unconfigured.example to accept it",
             ),
             ("user@localhost:8000", None, "invalid Host header"),
-            ("localhost:8000", "http://localhost:9000", cross_origin),
-            ("localhost:8000", "http://other.example:8000", cross_origin),
+            (
+                "localhost:8000",
+                "http://localhost:9000",
+                elsewhere("http://localhost:9000"),
+            ),
+            (
+                "localhost:8000",
+                "http://other.example:8000",
+                elsewhere("http://other.example:8000"),
+            ),
+            ("localhost:8000", "tauri://localhost", elsewhere("tauri://localhost")),
             ("localhost:8000", "null", "invalid Origin header"),
+            ("localhost:8000", "tauri://*", "invalid Origin header"),
             ("localhost:8000", "http://user@localhost:8000", "invalid Origin header"),
             ("localhost:8000", "http://localhost:8000/path", "invalid Origin header"),
             ("localhost:8000", "http://localhost:99999", "invalid Origin header"),
@@ -64,22 +93,100 @@ class HttpBoundaryTests(unittest.TestCase):
                 if origin is not None:
                     headers["Origin"] = origin
                 if rejection is None:
-                    http_security.validate_headers(headers, allowed)
+                    self.assertIsNone(
+                        http_security.validate_headers(headers, allowed, frozenset())
+                    )
                     continue
                 with self.assertRaises(APIError) as caught:
-                    http_security.validate_headers(headers, allowed)
+                    http_security.validate_headers(headers, allowed, frozenset())
                 error = caught.exception
                 self.assertEqual(
                     (error.status, error.code, error.message),
                     (403, "forbidden", rejection),
                 )
+                # Only a well-formed origin that is not admitted is refused
+                # by name, for the server to print.
+                refused = rejection == elsewhere(origin)
+                self.assertIs(isinstance(error, http_security.OriginRefused), refused)
+                if refused:
+                    self.assertEqual(error.origin, origin)
         for name in ("Host", "Origin"):
             headers = Message()
             headers["Host"] = "localhost"
             headers["Origin"] = "http://localhost"
             headers[name] = headers[name]
             with self.assertRaises(APIError):
-                http_security.validate_headers(headers, allowed)
+                http_security.validate_headers(headers, allowed, frozenset())
+
+    def test_only_the_origins_named_are_admitted_from_elsewhere(self):
+        def answer(origin, allowed):
+            headers = Message()
+            headers["Host"] = "localhost:8000"
+            headers["Origin"] = origin
+            return http_security.validate_headers(headers, {"localhost"}, allowed)
+
+        named = frozenset(
+            map(
+                origins.parse_allowed_origin,
+                ("tauri://localhost", "HTTP://Localhost:3000", "https://chat.example"),
+            )
+        )
+        for origin in (
+            "tauri://localhost",
+            "http://localhost:3000",
+            "https://chat.example",
+            "https://chat.example:443",
+        ):
+            with self.subTest(origin=origin):
+                self.assertEqual(answer(origin, named), origin)
+        for origin in (
+            "tauri://other",
+            "app://localhost",
+            "http://localhost:3001",
+            "http://chat.example",
+            "https://chat.example:8443",
+        ):
+            with self.subTest(origin=origin), self.assertRaises(APIError) as caught:
+                answer(origin, named)
+            self.assertIn(f"--allowed-origin {origin} ", caught.exception.message)
+        # The server's own pages owe their browser nothing, named or not.
+        self.assertIsNone(answer("http://localhost:8000", named))
+        # Every origin: whatever a browser sends, a sandboxed page's null too.
+        every = frozenset({origins.ANY_ORIGIN})
+        for origin in ("https://anywhere.example", "null", "http://localhost:8000"):
+            with self.subTest(origin=origin):
+                self.assertEqual(answer(origin, every), "*")
+
+    def test_allowed_origin_grammar(self):
+        # An origin as a browser sends it, whatever the letter case and
+        # with its scheme's default port; '*' stands for every origin.
+        for value, parsed in (
+            ("*", origins.ANY_ORIGIN),
+            ("HTTP://Localhost:3000", ("http", "localhost", 3000)),
+            ("tauri://localhost", ("tauri", "localhost", None)),
+            ("https://chat.example", ("https", "chat.example", 443)),
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(origins.parse_allowed_origin(value), parsed)
+        for value in INVALID_ORIGINS:
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, "expected a scheme and a host"),
+            ):
+                origins.parse_allowed_origin(value)
+        # Origins match exactly: a pattern, which would match nothing, is refused.
+        for value in (
+            "tauri://*",
+            "app://*",
+            "http://*.example.com",
+            "http://localhost:*",
+            "*://localhost",
+        ):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, r"only a bare '\*'"),
+            ):
+                origins.parse_allowed_origin(value)
 
     def test_http_rejection_precedes_routing_and_local_access_still_works(self):
         harness = Harness(FakeRuntime())
@@ -106,8 +213,8 @@ class HttpBoundaryTests(unittest.TestCase):
             "server.server.secrets.token_hex",
             side_effect=("first-random-id", "second-random-id"),
         ):
-            first, _, _ = harness.app.prepare(body)
-            second, _, _ = harness.app.prepare(body)
+            first = harness.app.prepare(body, deadline=FOREVER)
+            second = harness.app.prepare(body, deadline=FOREVER)
         self.assertEqual(
             (first.public_id, second.public_id), ("first-random-id", "second-random-id")
         )

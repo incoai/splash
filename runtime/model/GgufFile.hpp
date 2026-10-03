@@ -25,11 +25,10 @@ public:
   using std::runtime_error::runtime_error;
 };
 
-// ggml type ids as stored in GGUF tensor infos.
+// The ggml type ids production names, as stored in GGUF tensor infos; the
+// rest are looked up in kGgmlTypes.
 namespace ggml {
-inline constexpr uint32_t kF32 = 0, kF16 = 1, kQ8_0 = 8, kQ3_K = 11, kQ4_K = 12,
-                          kQ5_K = 13, kQ6_K = 14, kIQ4_NL = 20, kIQ3_S = 21,
-                          kIQ4_XS = 23, kBF16 = 30, kPQ2_0 = 142;
+inline constexpr uint32_t kF32 = 0, kBF16 = 30, kPQ2_0 = 142;
 }
 
 struct GgmlTypeTraits {

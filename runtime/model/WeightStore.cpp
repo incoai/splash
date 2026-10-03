@@ -1,17 +1,15 @@
 #include "WeightStore.hpp"
 
+#include "Checked.hpp"
 #include "metal/abi/Gguf.h"
+#include "model/GgufFile.hpp"
 #include "model/GgufImageLayout.hpp"
 #include "model/PreparedWeights.hpp"
 
-#include <CommonCrypto/CommonDigest.h>
-
 #include <algorithm>
-#include <array>
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
-#include <limits>
 #include <sstream>
 #include <system_error>
 #include <tuple>
@@ -23,37 +21,23 @@
 
 namespace splash::model {
 
-uint64_t checkedWeightMultiply(uint64_t left, uint64_t right,
-                         std::string_view description) {
-    if (left && right > std::numeric_limits<uint64_t>::max() / left) {
-        throw WeightStoreError(std::string(description) + " overflows");
-    }
-    return left * right;
-}
+static_assert(kWeightFileAlignment == kHostPageBytes, "weight files are mapped at host page boundaries");
 
 namespace {
-
-[[nodiscard]] uint64_t checkedWeightAdd(uint64_t left, uint64_t right,
-                                        std::string_view description) {
-    if (left > std::numeric_limits<uint64_t>::max() - right) {
-        throw WeightStoreError(std::string(description) + " overflows");
-    }
-    return left + right;
-}
 
 [[nodiscard]] uint64_t q4Elements(uint32_t outputSize, uint32_t inputSize) {
     if (!outputSize || !inputSize || inputSize % kQ4GroupElements) {
         throw WeightStoreError(
             "Q4 projection dimensions must be positive and input-aligned");
     }
-    return checkedWeightMultiply(outputSize, inputSize, "Q4 element count");
+    return checkedMultiply<WeightStoreError>(outputSize, inputSize, "Q4 element count");
 }
 
 } // namespace
 
 uint64_t q4PackedBytes(uint32_t outputSize, uint32_t inputSize) {
     uint64_t elements = q4Elements(outputSize, inputSize);
-    return checkedWeightMultiply(elements / 16, 9, "Q4 packed byte count");
+    return checkedMultiply<WeightStoreError>(elements / 16, 9, "Q4 packed byte count");
 }
 
 void validateQ4Layout(uint32_t outputSize, uint32_t inputSize) {
@@ -70,7 +54,8 @@ namespace {
 constexpr uint64_t kHeaderBytes = std::tuple_size_v<decltype(weightFileHeader({}, 0, 0))>;
 
 uint64_t alignPacked(uint64_t value) {
-    static_cast<void>(checkedWeightAdd(value, kWeightFileAlignment - 1, "packed file alignment"));
+    static_cast<void>(
+        checkedAdd<WeightStoreError>(value, kWeightFileAlignment - 1, "packed file alignment"));
     return alignWeightOffset(value);
 }
 
@@ -79,6 +64,8 @@ std::string systemError(std::string_view operation,
     return std::string(operation) + " " + path.string() + ": " +
         std::error_code(error, std::generic_category()).message();
 }
+
+static_assert(sizeof(size_t) == sizeof(uint64_t), "weight files are mapped whole");
 
 class MappedRegion final {
 public:
@@ -110,11 +97,6 @@ public:
             }
         }
         uint64_t bytes = static_cast<uint64_t>(status.st_size);
-        if (bytes > std::numeric_limits<size_t>::max()) {
-            close(descriptor);
-            throw WeightStoreError("packed file is too large to map: " +
-                                   path.string());
-        }
 
         // Metal can materialize MAP_PRIVATE file mappings as anonymous dirty
         // pages on GPU use. Preserve file backing; pages held resident by Metal
@@ -157,19 +139,14 @@ struct WeightFile::Impl {
     metal::MetalBackend *backend = nullptr;
     std::shared_ptr<MappedRegion> mapping;
     metal::MetalBuffer base;
-    uint64_t bytes = 0;
     WeightFileRecord record;
     uint64_t offset = kHeaderBytes;
-    bool finished = false;
 };
 
 namespace {
 void checkWeightHeader(const uint8_t *header, uint64_t bytes, std::string_view expectedMagic,
                        uint32_t expectedLayer, uint32_t expectedType,
                        const std::string &what) {
-    if (expectedMagic.size() != 8) {
-        throw WeightStoreError("packed file magic must contain eight bytes");
-    }
     const auto expected = weightFileHeader(expectedMagic, expectedLayer, expectedType);
     if (bytes < expected.size() || bytes % kWeightFileAlignment) {
         throw WeightStoreError("packed file size is not 16 KiB-aligned: " + what);
@@ -189,20 +166,16 @@ WeightFile::WeightFile(metal::MetalBackend &backend,
     : impl_(std::make_unique<Impl>()) {
     impl_->backend = &backend;
     impl_->mapping = MappedRegion::openReadOnly(path, !contentIdentity.empty());
-    impl_->bytes = impl_->mapping->bytes();
     checkWeightHeader(static_cast<const uint8_t *>(impl_->mapping->address()),
-                      impl_->bytes, expectedMagic, expectedLayer, expectedType,
+                      impl_->mapping->bytes(), expectedMagic, expectedLayer, expectedType,
                       path.string());
     impl_->record = {
         std::move(relativePath), std::string(expectedMagic), expectedLayer, expectedType,
-        impl_->bytes, std::move(contentIdentity),
+        impl_->mapping->bytes(), std::move(contentIdentity),
     };
     impl_->base = backend.wrapSharedMemory(
-        impl_->mapping->address(), impl_->bytes, impl_->mapping,
+        impl_->mapping->address(), impl_->mapping->bytes(), impl_->mapping,
         impl_->record.relativePath);
-    // The weights outlive this loader: the base stays resident until its last
-    // view is gone.
-    backend.keepResident(impl_->base);
 }
 
 WeightFile::WeightFile(WeightFile &&) noexcept = default;
@@ -212,13 +185,10 @@ WeightFile::~WeightFile() = default;
 
 metal::MetalBuffer WeightFile::section(uint64_t bytes,
                                        std::string_view label) {
-    if (impl_->finished) {
-        throw WeightStoreError("cannot add a section after packed file finish");
-    }
     if (!bytes) throw WeightStoreError("packed section must not be empty");
     uint64_t start = alignPacked(impl_->offset);
-    uint64_t end = checkedWeightAdd(start, bytes, "packed section end");
-    if (start % kWeightFileAlignment || end > impl_->bytes) {
+    uint64_t end = checkedAdd<WeightStoreError>(start, bytes, "packed section end");
+    if (start % kWeightFileAlignment || end > impl_->mapping->bytes()) {
         throw WeightStoreError(
             "packed file is truncated at section " + std::string(label));
     }
@@ -229,7 +199,7 @@ metal::MetalBuffer WeightFile::section(uint64_t bytes,
 std::vector<metal::MetalBuffer> WeightFile::split(std::initializer_list<uint64_t> parts,
                                                   std::string_view label) {
     uint64_t bytes = 0;
-    for (uint64_t part : parts) bytes = checkedWeightAdd(bytes, part, "packed section size");
+    for (uint64_t part : parts) bytes = checkedAdd<WeightStoreError>(bytes, part, "packed section size");
     const metal::MetalBuffer whole = section(bytes, label);
     std::vector<metal::MetalBuffer> views;
     uint64_t offset = 0;
@@ -241,14 +211,12 @@ std::vector<metal::MetalBuffer> WeightFile::split(std::initializer_list<uint64_t
 }
 
 void WeightFile::finish() {
-    if (impl_->finished) return;
     uint64_t consumed = alignPacked(impl_->offset);
-    if (consumed != impl_->bytes) {
+    if (consumed != impl_->mapping->bytes()) {
         throw WeightStoreError(
             "packed file has unconsumed or missing bytes: " +
             impl_->record.relativePath);
     }
-    impl_->finished = true;
 }
 
 const WeightFileRecord &WeightFile::record() const noexcept {
@@ -295,7 +263,7 @@ GgufTensorDescriptor readGgufDescriptor(WeightFile &file, std::string_view label
     std::memcpy(&d, bytes, sizeof d);
     // Float tensors are rows as stored; quantized ones fill whole tiles.
     if (!d.outputSize || !d.inputSize ||
-        (d.type != GGUF_TYPE_F32 && (d.outputSize % QUANT_TILE_ROWS || d.inputSize % kGgufBlockColumns)))
+        (d.type != ggml::kF32 && (d.outputSize % QUANT_TILE_ROWS || d.inputSize % kGgufBlockColumns)))
         throw WeightStoreError("GGUF tensor shape is not tile aligned: " + std::string(label));
     return d;
 }
@@ -303,7 +271,7 @@ GgufTensorDescriptor readGgufDescriptor(WeightFile &file, std::string_view label
 
 ops::QuantizedSegment readQuantizedSegment(WeightFile &file, std::string_view label) {
     const GgufTensorDescriptor d = readGgufDescriptor(file, label);
-    if (d.type == GGUF_TYPE_F32) {
+    if (d.type == ggml::kF32) {
         if (d.p0 || d.p1 || d.metaBytes || d.metaGroups || d.plane1Bytes || d.metaTotalBytes ||
             d.plane0Bytes != uint64_t{d.outputSize} * d.inputSize * sizeof(float))
             throw WeightStoreError("GGUF float section sizes are inconsistent: " + std::string(label));
@@ -365,8 +333,8 @@ readAffineExpertProjection(WeightFile &file, uint32_t experts,
     validateQ4Layout(outputSize, inputSize);
     const uint64_t stride = q4PackedBytes(outputSize, inputSize);
     return {
-        file.section(checkedWeightMultiply(experts, stride,
-                                           "expert Q4 slab bytes"),
+        file.section(checkedMultiply<WeightStoreError>(experts, stride,
+                                                       "expert Q4 slab bytes"),
                      label),
         experts,
         outputSize,
@@ -392,23 +360,7 @@ std::string weightManifestFingerprint(
         if (!record.contentIdentity.empty()) canonical << '\t' << record.contentIdentity;
         canonical << '\n';
     }
-    std::string value = canonical.str();
-    if (value.size() > std::numeric_limits<CC_LONG>::max()) {
-        throw WeightStoreError("manifest is too large to fingerprint");
-    }
-    std::array<unsigned char, CC_SHA256_DIGEST_LENGTH> digest{};
-    if (!CC_SHA256(value.data(), static_cast<CC_LONG>(value.size()),
-                   digest.data())) {
-        throw WeightStoreError("unable to calculate manifest SHA-256");
-    }
-    constexpr char hex[] = "0123456789abcdef";
-    std::string result;
-    result.reserve(digest.size() * 2);
-    for (unsigned char byte : digest) {
-        result.push_back(hex[byte >> 4]);
-        result.push_back(hex[byte & 0x0f]);
-    }
-    return result;
+    return weightDigest(canonical.str());
 }
 
 } // namespace splash::model

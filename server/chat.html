@@ -3,6 +3,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Splash</title>
+<link rel="icon" href="/favicon.ico" type="image/svg+xml">
 <style>
   * { box-sizing: border-box }
   :root {
@@ -39,7 +40,7 @@
 
   aside { position: fixed; inset: 0 auto 0 0; z-index: 20; overflow-y: auto; width: var(--sidebar); padding: 12px 8px; background: var(--side); border-right: 1px solid var(--border) }
   .brand { display: flex; align-items: center; gap: 9px; height: 38px; padding: 0 10px; font-size: 17px; font-weight: 650; letter-spacing: -.02em }
-  .brand svg { width: 19px; height: 19px }
+  .brand img { width: 19px; height: 19px }
   #new-chat { display: flex; align-items: center; gap: 10px; width: 100%; margin-top: 9px; padding: 9px 10px; border-radius: 9px; text-align: left }
   #new-chat:hover { background: var(--hover) }
   #new-chat svg { width: 18px; height: 18px }
@@ -115,7 +116,7 @@
 
 <aside id="sidebar">
   <div class="brand">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.5 2 5 13h6l-.5 9L19 11h-6z"/></svg>
+    <img src="/favicon.ico" alt="">
     Splash
   </div>
   <button id="new-chat" type="button">
@@ -147,6 +148,7 @@
   <div class="toolbar">
     <label class="effort"><span>Thinking</span>
       <select id="effort" aria-label="Thinking effort">
+        <option value="">Default</option>
         <option value="xhigh">XHigh</option>
         <option value="medium">Medium</option>
         <option value="low">Low</option>
@@ -181,7 +183,7 @@
   let imagesAccepted = true;
 
   const savedEffort = storageGet(effortKey);
-  effort.value = allowedEfforts.has(savedEffort) ? savedEffort : 'xhigh';
+  effort.value = allowedEfforts.has(savedEffort) ? savedEffort : '';
 
   function authorization() {
     return apiKey.value ? {Authorization: `Bearer ${apiKey.value}`} : {};
@@ -526,8 +528,9 @@
       stats.hidden = false;
     }
     const delta = chunk.choices?.[0]?.delta;
-    if (!delta) return false;
-    if (delta.reasoning_content || delta.content) box.querySelector('.waiting').hidden = true;
+    // A chunk without text has nothing to show or scroll to.
+    if (!delta?.reasoning_content && !delta?.content) return false;
+    box.querySelector('.waiting').hidden = true;
     if (delta.reasoning_content) {
       assistant.reasoning_content += delta.reasoning_content;
       const details = box.querySelector('details');
@@ -566,7 +569,7 @@
       const response = await fetch('/v1/chat/completions', {
         method: 'POST',
         headers: {'Content-Type': 'application/json', ...authorization()},
-        body: JSON.stringify({messages: requestMessages(), stream: true, stream_options: {include_usage: true}, reasoning_effort: effort.value}),
+        body: JSON.stringify({messages: requestMessages(), stream: true, stream_options: {include_usage: true}, ...(effort.value ? {reasoning_effort: effort.value} : {})}),
         signal: controller.signal
       });
       if (!response.ok) throw new Error((await response.json()).error?.message || response.statusText);

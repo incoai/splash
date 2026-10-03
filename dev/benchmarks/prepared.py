@@ -52,8 +52,7 @@ def cache_root(environment) -> Path:
 def entries(root: Path) -> list[dict]:
     """The complete entries of the cache at root: key and sha256 of the
     prepared bytes, plus component, inputs and source when the entry
-    records its provenance; an entry of an earlier version records only
-    its source."""
+    records its provenance."""
     records = []
     try:
         directories = sorted(Path(root).iterdir())
@@ -78,9 +77,6 @@ def entries(root: Path) -> list[dict]:
                 name, _, value = line.partition(" ")
                 if name == field:
                     record[field] = value
-        elif len(lines) == 2:
-            # Earlier versions recorded the source path and the file name.
-            record["source"] = lines[0]
         records.append(record)
     return records
 

@@ -12,6 +12,9 @@ import hashlib
 import json
 import os
 import random
+import re
+import secrets
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -27,11 +30,18 @@ sys.path.insert(0, str(ROOT))
 from dev.tests import smoke_real  # noqa: E402
 from dev.tools import build_identity  # noqa: E402
 from install import clients, launcher  # noqa: E402
+from server import serve_options  # noqa: E402
 
 CLIENTS = tuple(clients.INSTALL_URLS)
 # The server this harness starts or finds, on the default port.
 BASE_URL = launcher._base_url(launcher.PORT)
-TEST_COMMAND = "python3 -m unittest -v"
+# The project's tests: the prompts give their command with python3, and the
+# harness reruns them with its own Python.
+TEST_ARGUMENTS = ("-m", "unittest", "-v")
+TEST_COMMAND = " ".join(("python3", *TEST_ARGUMENTS))
+# A successful command running the unittest module: the prompt names python3,
+# but an agent may run the tests with its own interpreter or its full path.
+RAN_TESTS = re.compile(r"\bpython[\d.]*\s+-m\s+unittest\b")
 
 
 class AgentFailure(RuntimeError):
@@ -68,8 +78,11 @@ def current_build_id():
     return identity
 
 
-def validate_server_configuration(initial, model, expected_model, context, identity):
-    if model != expected_model or initial["maximum_context_tokens"] != context:
+def validate_server_configuration(initial, model, context, identity):
+    if (
+        initial["instance"]["model"] != model
+        or initial["maximum_context_tokens"] != context
+    ):
         raise AgentFailure(
             "running server model/context differs from the test configuration"
         )
@@ -97,7 +110,7 @@ def events(text):
     return result
 
 
-def executed_commands(name, parsed, messages=()):
+def executed_commands(name, parsed, messages=(), turns=()):
     commands = []
     calls = {}
     if name == "hermes":
@@ -119,6 +132,9 @@ def executed_commands(name, parsed, messages=()):
                 ):
                     commands.append(calls[message["tool_call_id"]])
         return commands
+    if name == "opencode":
+        # From its session record: the turns the phase added.
+        return [command for turn in turns for command in turn["commands"]]
     for event in parsed:
         if name == "pi" and event.get("toolName") == "bash":
             if event.get("type") == "tool_execution_start":
@@ -133,15 +149,6 @@ def executed_commands(name, parsed, messages=()):
             item = event.get("item", {})
             if item.get("type") == "command_execution" and item.get("exit_code") == 0:
                 commands.append(item.get("command", ""))
-        if name == "opencode" and event.get("type") == "tool_use":
-            part = event.get("part", {})
-            state = part.get("state", {})
-            if (
-                part.get("tool") == "bash"
-                and state.get("status") == "completed"
-                and state.get("metadata", {}).get("exit", 0) == 0
-            ):
-                commands.append(state.get("input", {}).get("command", ""))
         if name == "claude":
             # System events such as permission_denied carry a string message.
             message = event.get("message")
@@ -176,6 +183,65 @@ def pi_completed(parsed):
         )
         and any(event.get("type") == "agent_end" for event in parsed)
     )
+
+
+def opencode_session(history, version):
+    """OpenCode's session export, the same record for both major versions:
+    the turns, each the assistant steps that answer a user message, as how
+    the last step finished, their text and the shell commands that
+    succeeded; and the automatic compactions, as the messages holding them."""
+    turns, compactions = [], []
+    for message in history["messages"]:
+        if version >= 2:
+            # 2.x keeps a message's role as its type and an assistant's parts
+            # in content, names its bash tool shell, and records a compaction
+            # as an entry of its own; an idle entry ends each turn.
+            role, finish = message["type"], message.get("finish")
+            parts = message.get("content") or []
+            shells = [
+                p for p in parts if p.get("type") == "tool" and p.get("name") == "shell"
+            ]
+            if (
+                role == "compaction"
+                and message.get("reason") == "auto"
+                and message.get("status") == "completed"
+            ):
+                compactions.append({"message_id": message["id"]})
+        else:
+            # 1.x keeps a message's role and finish in its info, and marks the
+            # user message that asks for a compaction with an automatic
+            # compaction part.
+            info, parts = message["info"], message.get("parts") or []
+            role, finish = info["role"], info.get("finish")
+            shells = [
+                p for p in parts if p.get("type") == "tool" and p.get("tool") == "bash"
+            ]
+            if any(p.get("type") == "compaction" and p.get("auto") for p in parts):
+                compactions.append({"message_id": info["id"]})
+        if role == "user":
+            turns.append({"finish": None, "text": "", "commands": []})
+        elif role == "assistant" and turns:
+            turn = turns[-1]
+            turn["finish"] = finish
+            turn["text"] += "".join(
+                p.get("text") or "" for p in parts if p.get("type") == "text"
+            )
+            for part in shells:
+                state = part.get("state") or {}
+                if (
+                    state.get("status") == "completed"
+                    and (state.get("metadata") or {}).get("exit", 0) == 0
+                ):
+                    turn["commands"].append(
+                        (state.get("input") or {}).get("command", "")
+                    )
+    return {"turns": turns, "compactions": compactions}
+
+
+def opencode_completed(turns):
+    """OpenCode answered a phase, given the turns it added: there is one, and
+    the last ended on a stopped assistant step and has text."""
+    return bool(turns and turns[-1]["finish"] == "stop" and turns[-1]["text"].strip())
 
 
 # The engine's own critical verdict drops every evictable cache entry and
@@ -231,7 +297,7 @@ def status(*, wait_for_fresh=True, tolerate_critical=False):
 
 def idle_status():
     # Up to 60 s: a phase boundary may fall inside the engine's critical
-    # window, which clears once shed memory is released at the paced rate.
+    # window, which clears once macOS has registered the memory it shed.
     for _ in range(240):
         value = status(tolerate_critical=True)
         if not value.get("ready"):
@@ -248,13 +314,30 @@ def idle_status():
                     "waiting_mask",
                 )
             )
-            and value["state"]["active_cells"] == 0
+            and value["state"]["active_lanes"] == 0
             and value["state"]["pinned"] == 0
+            and value["state"]["in_use"] == 0
             and value["kv"]["pages_active"] == 0
         ):
             return value
         time.sleep(0.25)
     raise AgentFailure("server did not return to idle")
+
+
+def prefix_reuse(before, after):
+    """What a phase's requests reused of the cache, from the idle status
+    before and after it."""
+
+    def delta(section, key):
+        return after[section][key] - before[section][key]
+
+    return {
+        "reused_tokens": delta("cache", "reused_tokens"),
+        "prefill_input_tokens": delta("metrics", "prefill_input_tokens"),
+        "lost_state_misses": delta("cache", "lost_state_misses"),
+        "in_use_evictions": delta("state", "in_use_evictions"),
+        "completed": delta("requests", "completed"),
+    }
 
 
 def pressure_stop_level():
@@ -375,8 +458,11 @@ print('independent oracle passed')
         )
     if not (workspace / "test_ledger.py").is_file():
         raise AgentFailure("client did not create the requested unit tests")
+    # Rerun the client's tests as its test command does, with the harness's
+    # Python like the oracle above: the python3 first on PATH can be a shim
+    # that refuses to run, as Xcode's does until its license is accepted.
     result = subprocess.run(
-        TEST_COMMAND.split(),
+        [sys.executable, *TEST_ARGUMENTS],
         cwd=workspace,
         capture_output=True,
         text=True,
@@ -397,45 +483,48 @@ print('independent oracle passed')
 
 
 class ClientRun:
-    def __init__(self, name, path, folder, model, context, timeout, input_modalities):
+    def __init__(
+        self,
+        name,
+        path,
+        folder,
+        model,
+        context,
+        timeout,
+        input_modalities,
+        version=None,
+    ):
         self.name, self.path, self.folder = name, path, folder
         self.model, self.context, self.timeout = model, context, timeout
         # What the served model accepts, as /v1/models reports it.
         self.input_modalities = input_modalities
+        # The client's major version, on which only OpenCode's launch depends,
+        # as for splash.
+        self.version = version
         self.workspace = (folder / "project").resolve()
         self.session = None
         self.phases = []
         self.codex_home = (folder / "codex-home").resolve()
         self.pi_home = (folder / "pi-agent").resolve()
+        self.opencode_data = (folder / "opencode-data").resolve()
+        # A profile of the developer's own Hermes root: Hermes takes any other
+        # home for a root of its own, where it would install its tools and to
+        # which it would point the developer's hermes command. finish_hermes
+        # moves it into this folder.
+        self.hermes_profile = f"splash-test-{secrets.token_hex(4)}"
+        self.hermes_home = clients.hermes_profile_home(os.environ, self.hermes_profile)
+        self.hermes_profiles_existed = self.hermes_home.parent.is_dir()
+        # OpenCode's record of the session, as the last phase exported it.
+        self.opencode = {"turns": [], "compactions": []}
         folder.mkdir(parents=True)
         fixture(self.workspace)
 
     def argv(self):
-        # Pi keeps its providers, sessions, settings and extensions in one
-        # agent directory; a private one leaves the developer's untouched.
-        environment = (
-            dict(os.environ, PI_CODING_AGENT_DIR=str(self.pi_home))
-            if self.name == "pi"
-            else None
-        )
-        argv, env = clients.command(
-            self.name,
-            self.path,
-            BASE_URL,
-            self.model,
-            self.context,
-            launcher.PROFILES_DIR,
-            environment,
-            input_modalities=self.input_modalities,
-        )
-        # subprocess(cwd=...) does not update inherited PWD. Keep both views
-        # consistent, just as a user shell entering the project would.
-        env["PWD"] = str(self.workspace)
         if self.name == "claude":
             # Normal edit authorization and one explicit project test command;
             # --allowedTools grants permission, unlike --tools it does not filter
             # the registered tool inventory. Production still defaults to default.
-            argv += [
+            arguments = [
                 "--print",
                 "--output-format",
                 "stream-json",
@@ -446,32 +535,70 @@ class ClientRun:
                 f"Bash({TEST_COMMAND})",
             ]
             if self.session:
-                argv += ["--resume", self.session]
+                arguments += ["--resume", self.session]
         elif self.name == "opencode":
-            argv += ["run", "--format", "json"]
+            arguments = ["run", "--format", "json"]
             if self.session:
-                argv += ["--session", self.session]
+                arguments += ["--session", self.session]
         elif self.name == "codex":
-            self.codex_home.mkdir(exist_ok=True)
-            env["CODEX_HOME"] = str(self.codex_home)
-            argv += ["exec", "--sandbox", "workspace-write"]
             # Test overrides leave the shipped launcher profile unchanged.
-            argv += os.environ.get("SPLASH_TEST_CODEX_ARGS", "").split()
+            arguments = [
+                "exec",
+                "--sandbox",
+                "workspace-write",
+                *os.environ.get("SPLASH_TEST_CODEX_ARGS", "").split(),
+            ]
             if self.session:
-                argv += ["resume", self.session]
-            argv += ["--json", "-"]
+                arguments += ["resume", self.session]
+            arguments += ["--json", "-"]
         elif self.name == "pi":
-            argv += ["--print", "--mode", "json"]
+            arguments = ["--print", "--mode", "json"]
             if self.session:
-                argv += ["--session", self.session]
+                arguments += ["--session", self.session]
         else:
-            argv += ["--oneshot", "--query-file", "-"]
+            arguments = ["chat", "--oneshot", "--query-file", "-"]
             if self.session:
-                argv += ["--resume", self.session]
+                arguments += ["--resume", self.session]
+        return self.command(arguments)
+
+    def command(self, arguments):
+        """The client's command, as `splash NAME -- ARGUMENTS` runs it, with
+        the client's own state in this run's folder, leaving the developer's
+        untouched: Pi's agent directory (providers, sessions, settings and
+        extensions), Codex's home, and OpenCode's data directory, whose
+        session database OpenCode 2 migrates to a schema OpenCode 1 cannot
+        open. Hermes runs in this run's own profile."""
+        environment = dict(os.environ)
+        match self.name:
+            case "pi":
+                environment["PI_CODING_AGENT_DIR"] = str(self.pi_home)
+            case "codex":
+                self.codex_home.mkdir(exist_ok=True)
+                environment["CODEX_HOME"] = str(self.codex_home)
+            case "opencode":
+                environment["XDG_DATA_HOME"] = str(self.opencode_data)
+        argv, env = clients.command(
+            self.name,
+            self.path,
+            BASE_URL,
+            self.model,
+            self.context,
+            environment,
+            input_modalities=self.input_modalities,
+            client_args=arguments,
+            client_version=self.version,
+            hermes_profile=self.hermes_profile,
+        )
+        # subprocess(cwd=...) does not update inherited PWD. Keep both views
+        # consistent, just as a user shell entering the project would.
+        env["PWD"] = str(self.workspace)
         return argv, env
 
     def hermes_messages(self):
-        path = launcher.PROFILES_DIR / "hermes/state.db"
+        path = self.hermes_home / "state.db"
+        # Hermes creates it with its first session; the phase reports its absence.
+        if not path.exists():
+            return []
         with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as db:
             db.row_factory = sqlite3.Row
             if self.session is None:
@@ -490,7 +617,7 @@ class ClientRun:
                 )
             ]
 
-    def phase(self, label, prompt, cancel=False):
+    def phase(self, label, prompt, cancel=False, may_compact=False):
         before = idle_status()
         previous_message = 0
         if self.name == "hermes" and self.session:
@@ -541,7 +668,7 @@ class ClientRun:
                             "growth_allowed": governor.get("growth_allowed"),
                             "prefill_rows": scheduler.get("prefill_rows"),
                             "decode_batches": scheduler.get("decode_batches"),
-                            "kv_blocks": current.get("kv", {}).get("blocks"),
+                            "kv_pages_cache": current.get("kv", {}).get("pages_cache"),
                             "state_entries": current.get("state", {}).get("entries"),
                         }
                     if sample["engine_critical"]:
@@ -558,7 +685,8 @@ class ClientRun:
                         critical_since = None
                     if sample["pressure"] >= pressure_stop_level():
                         reason = (
-                            f"OS memory pressure level {sample['pressure']}; "
+                            f"OS memory pressure level {sample['pressure']} reached "
+                            f"SPLASH_TEST_PRESSURE_STOP={pressure_stop_level()}; "
                             "stopped for desktop safety"
                         )
                         break
@@ -597,6 +725,15 @@ class ClientRun:
             if self.name == "hermes"
             else []
         )
+        # The turns this phase added to OpenCode's record of the session.
+        turns = []
+        if self.name == "opencode" and self.session:
+            previous = self.opencode
+            try:
+                self.opencode = opencode_session(self.opencode_history(), self.version)
+            except Exception as error:
+                reason = reason or f"session export failed: {error}"
+            turns = self.opencode["turns"][len(previous["turns"]) :]
         try:
             after = idle_status()
         except Exception as error:
@@ -616,8 +753,10 @@ class ClientRun:
             "after": after,
             "memory_samples": samples,
             "log": str(log),
-            "executed_commands": executed_commands(self.name, parsed, messages),
+            "executed_commands": executed_commands(self.name, parsed, messages, turns),
         }
+        if after is not None:
+            row["reuse"] = prefix_reuse(before, after)
         self.phases.append(row)
         atomic_json(self.folder / f"{label}.json", row)
         atomic_json(self.folder / "session.json", {"session": self.session})
@@ -625,10 +764,25 @@ class ClientRun:
             raise KeyboardInterrupt
         if reason:
             raise AgentFailure(reason)
+        if not self.session and self.name == "hermes":
+            raise AgentFailure(
+                f"Hermes exited {process.returncode} without a session record in "
+                f"{self.hermes_home / 'state.db'}; see {log}"
+            )
         if not self.session:
             raise AgentFailure("client did not expose a real session id")
         if after["requests"]["failed"] != before["requests"]["failed"]:
             raise AgentFailure("native request failed")
+        reuse = row["reuse"]
+        # Running work takes the replay points unfinished requests hold after
+        # everything else; at a tight --max-memory that is legitimate, so it
+        # is recorded, not gated.
+        if reuse["in_use_evictions"]:
+            print(
+                f"{self.name}/{label}: warning: {reuse['in_use_evictions']} replay "
+                "points of unfinished requests were evicted",
+                flush=True,
+            )
         if cancel:
             if (
                 not interrupted
@@ -671,22 +825,32 @@ class ClientRun:
             else:
                 if any(e.get("type") == "error" for e in parsed):
                     raise AgentFailure("OpenCode reported a request error")
-                if not any(
-                    e.get("type") == "step_finish"
-                    and e.get("part", {}).get("reason") == "stop"
-                    for e in parsed
-                ):
-                    raise AgentFailure("OpenCode did not finish its user turn")
-                if not any(
-                    e.get("type") == "text"
-                    and e.get("part", {}).get("text", "").strip()
-                    for e in parsed
-                ):
-                    raise AgentFailure("OpenCode produced no assistant text")
+                # Its session records how the turn ended; OpenCode 2 prints no
+                # final step_finish to say so.
+                if not opencode_completed(turns):
+                    raise AgentFailure(
+                        "OpenCode did not finish its user turn with assistant text"
+                    )
+            # A phase that may compact is judged once its caller knows
+            # whether it did.
+            if not may_compact:
+                self.require_reuse()
         print(
             f"{self.name}/{label}: completed ({row['wall_seconds']:.1f}s)", flush=True
         )
         return parsed
+
+    def require_reuse(self):
+        """Fails the last phase when two or more of its requests completed and
+        none reused a cached prompt token. Every request after a phase's
+        first resends the conversation, so a working replay point always
+        reuses some of it."""
+        reuse = self.phases[-1]["reuse"]
+        if reuse["completed"] >= 2 and not reuse["reused_tokens"]:
+            raise AgentFailure(
+                "phase reused no cached prompt tokens across "
+                f"{reuse['completed']} requests"
+            )
 
     def compaction(self):
         if self.name == "hermes":
@@ -713,39 +877,7 @@ class ClientRun:
                 if entry.get("type") == "compaction"
             ]
         if self.name == "opencode":
-            argv, env = clients.command(
-                self.name,
-                self.path,
-                BASE_URL,
-                self.model,
-                self.context,
-                launcher.PROFILES_DIR,
-                input_modalities=self.input_modalities,
-            )
-            env["PWD"] = str(self.workspace)
-            # A regular file avoids losing buffered pipe output when the CLI
-            # exits immediately after printing a large session export.
-            with tempfile.TemporaryFile(mode="w+") as output:
-                result = subprocess.run(
-                    argv + ["export", self.session],
-                    env=env,
-                    cwd=self.workspace,
-                    stdout=output,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    timeout=20,
-                )
-                if result.returncode:
-                    raise AgentFailure("OpenCode session export failed")
-                output.seek(0)
-                history = json.load(output)
-            atomic_json(self.folder / "history.json", history)
-            return [
-                part
-                for message in history["messages"]
-                for part in message["parts"]
-                if part.get("type") == "compaction" and part.get("auto")
-            ]
+            return self.opencode["compactions"]
         return [
             e
             for p in self.folder.glob("*.log")
@@ -755,9 +887,46 @@ class ClientRun:
             and e.get("compact_metadata", {}).get("trigger") == "auto"
         ]
 
+    def opencode_history(self):
+        """OpenCode's own record of the session, which OpenCode 2 exports
+        with its session command."""
+        export = ["session", "export"] if self.version >= 2 else ["export"]
+        argv, env = self.command([*export, self.session])
+        # A regular file avoids losing buffered pipe output when the CLI
+        # exits immediately after printing a large session export.
+        with tempfile.TemporaryFile(mode="w+") as output:
+            result = subprocess.run(
+                argv,
+                env=env,
+                cwd=self.workspace,
+                stdout=output,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=20,
+            )
+            if result.returncode:
+                raise AgentFailure(
+                    f"exit status {result.returncode}: {result.stderr[-2000:]}"
+                )
+            output.seek(0)
+            history = json.load(output)
+        atomic_json(self.folder / "history.json", history)
+        return history
+
+    def finish_hermes(self):
+        """Move this run's Hermes profile, with its native history, into the
+        run's folder, leaving the developer's Hermes root as it was."""
+        if self.hermes_home.exists():
+            shutil.move(self.hermes_home, self.folder / "hermes-profile")
+        if not self.hermes_profiles_existed:
+            try:
+                self.hermes_home.parent.rmdir()
+            except OSError:
+                pass
+
     def check_artifact(self, stage):
         if not any(
-            "python3 -m unittest" in command
+            RAN_TESTS.search(command)
             for command in self.phases[-1]["executed_commands"]
         ):
             raise AgentFailure(
@@ -792,8 +961,17 @@ class ClientRun:
         for wave in range(first_wave, first_wave + 20):
             if compact:
                 break
-            self.phase(f"reference-{wave:02}", reference.replace("BATCH_ID", str(wave)))
+            self.phase(
+                f"reference-{wave:02}",
+                reference.replace("BATCH_ID", str(wave)),
+                may_compact=True,
+            )
             compact = self.compaction()
+            # The wave that compacts resends no conversation: its summary
+            # request and the request after it share only the system prompt
+            # and tools.
+            if not compact:
+                self.require_reuse()
         if not compact:
             raise AgentFailure("no genuine automatic compaction observed")
         self.phase(
@@ -909,6 +1087,16 @@ def main(argv=None):
             "path": path,
             "version": (result.stdout or result.stderr).strip(),
         }
+        # OpenCode's launch depends on its major version, read as splash reads
+        # it. The launcher starts a version it cannot read as OpenCode 1,
+        # which would run OpenCode 2 through its background service.
+        if name == "opencode":
+            major = clients.major_version(result.stdout)
+            if major is None:
+                raise AgentFailure(
+                    f"cannot determine opencode's major version: {result.stdout!r}"
+                )
+            versions[name]["major_version"] = major
     args.output.parent.mkdir(parents=True, exist_ok=True)
     if args.preflight_only:
         atomic_json(
@@ -949,21 +1137,22 @@ def main(argv=None):
                     start_new_session=True,
                 )
             deadline = time.monotonic() + 900
-            while launcher._running_status() is None:
+            while launcher._request_json("/status", timeout=10) is None:
                 if process.poll() is not None or time.monotonic() >= deadline:
                     raise AgentFailure(
                         f"serve did not become ready; see {directory / 'server.log'}"
                     )
                 time.sleep(0.5)
         initial = idle_status()
+        # Clients get the first entry, the name responses report, as with
+        # splash <client>; /status names the loaded model.
         served = launcher._request_json("/v1/models")["data"][0]
         model = served["id"]
         context = initial["maximum_context_tokens"]
         validate_server_configuration(
             initial,
-            model,
             args.model,
-            launcher._parse_max_context(args.max_context),
+            serve_options.parse_max_context(args.max_context),
             identity,
         )
         document.update(model=model, context=context, identity=initial["identity"])
@@ -990,6 +1179,7 @@ def main(argv=None):
                 context,
                 args.client_timeout,
                 served["input_modalities"],
+                version=versions[name].get("major_version"),
             )
             entry = {**versions[name], "result": "running", "phases": runner.phases}
             document["clients"][name] = entry
@@ -998,10 +1188,15 @@ def main(argv=None):
             except Exception as error:
                 entry.update(result="fail", error=str(error))
                 print(f"{name}: FAIL: {error}", flush=True)
+            finally:
+                runner.finish_hermes()
             atomic_json(args.output, document)
             remaining = selected[selected.index(name) + 1 :]
             if remaining and memory_sample()["pressure"] >= pressure_stop_level():
-                raise AgentFailure("stopping remaining clients for OS memory pressure")
+                raise AgentFailure(
+                    "stopping remaining clients: OS memory pressure reached "
+                    f"SPLASH_TEST_PRESSURE_STOP={pressure_stop_level()}"
+                )
         document["final_status"] = idle_status()
         document["result"] = (
             "pass"
