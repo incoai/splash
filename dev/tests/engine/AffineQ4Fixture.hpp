@@ -1,11 +1,12 @@
 #pragma once
 
 // Affine Q4 test weights in the layout the kernels read: per output and
-// 64-input group one parameter, in StorageN=256 order, with 32 bytes of
-// packed nibbles and a bf16 scale and bias. A packed slab of
+// 64-input group one parameter, in the packed 256-column storage order, with
+// 32 bytes of packed nibbles and a bf16 scale and bias. A packed slab of
 // model::q4PackedBytes holds the nibbles, then the scales, then the biases
 // (model::readAffineProjection). Shared by the Linear and MoE tests.
 
+#include "TestBuffers.hpp"
 #include "metal/MetalBackend.hpp"
 #include "model/WeightStore.hpp"
 #include "ops/Linear.hpp"
@@ -37,8 +38,8 @@ inline ops::Projection deterministicQ4Projection(metal::MetalBackend &backend, o
                                                  uint32_t seed) {
   const uint64_t parameters = uint64_t{matrix.outputSize} * (matrix.inputSize / 64);
   ops::Projection p(matrix.outputSize, matrix.inputSize,
-                    ops::AffineWeights{backend.allocateBuffer(parameters * 32), backend.allocateBuffer(parameters * 2),
-                                       backend.allocateBuffer(parameters * 2)});
+                    ops::AffineWeights{sharedBuffer(backend, parameters * 32), sharedBuffer(backend, parameters * 2),
+                                       sharedBuffer(backend, parameters * 2)});
   const AffineQ4Planes planes{static_cast<uint8_t *>(p.affine().weights.contents()),
                               static_cast<uint16_t *>(p.affine().scales.contents()),
                               static_cast<uint16_t *>(p.affine().biases.contents())};

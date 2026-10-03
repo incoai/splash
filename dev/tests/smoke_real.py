@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import concurrent.futures
 import http.client
 import io
 import json
@@ -92,9 +93,9 @@ class RealServer:
         )
         command = [
             sys.executable,
-            str(ROOT / "server/server.py"),
-            str(package / "target"),
-            str(package / "draft"),
+            "-m",
+            "server.server",
+            str(package),
             "--host",
             "127.0.0.1",
             "--port",
@@ -112,6 +113,8 @@ class RealServer:
             command.extend(("--max-memory", arguments.max_memory))
         if arguments.max_cache_disk is not None:
             command.extend(("--max-cache-disk", arguments.max_cache_disk))
+        if arguments.max_image_pixels is not None:
+            command.extend(("--max-image-pixels", str(arguments.max_image_pixels)))
         command.extend(("--kv-format", arguments.kv_format))
         self.process = subprocess.Popen(
             command,
@@ -153,8 +156,7 @@ class RealServer:
 
 
 def kv_identity(identity: dict) -> dict:
-    # Older INT8 builds expose only q8 and have no explicit format field.
-    return {"format": "int8", **identity.get("kv", identity.get("q8", {}))}
+    return identity.get("kv", {})
 
 
 def validate_status(status: dict, kv_format: str | None = None) -> None:
@@ -170,7 +172,7 @@ def validate_status(status: dict, kv_format: str | None = None) -> None:
     )
     identity = status.get("identity", {})
     kv = kv_identity(identity)
-    actual = kv["format"]
+    actual = kv.get("format")
     require(actual in ("int8", "bf16"), "unknown KV format")
     if kv_format is not None:
         require(actual == kv_format, "runtime KV format differs from requested format")
@@ -211,13 +213,14 @@ def image_data_url(kind: str) -> str:
 
 
 def image_chat_body(model: str, prompt: str, url: str, **extra) -> dict:
+    """A user message that shows the image and then asks the prompt."""
     body = chat_body(model, prompt, **extra)
     body["messages"] = [
         {
             "role": "user",
             "content": [
-                {"type": "text", "text": prompt},
                 {"type": "image_url", "image_url": {"url": url}},
+                {"type": "text", "text": prompt},
             ],
         }
     ]
@@ -231,7 +234,13 @@ def answer_text(chat: dict) -> str:
 
 
 def run_images(port: int, model: str, nonce: str) -> None:
-    question = f"What color is this image? Answer with one word. Request {nonce}."
+    # More than a block of tokens follows the image, so the replay point a
+    # repeat restores lies past it.
+    question = (
+        "What color is the image above? Answer with exactly one lowercase English "
+        "word naming the color, with no punctuation, explanation or other words. "
+        f"Request {nonce}."
+    )
     code, red = request(
         port,
         "POST",
@@ -249,9 +258,11 @@ def run_images(port: int, model: str, nonce: str) -> None:
         flush=True,
     )
 
-    # The same image and prompt reuse the image-aware prefix without running
-    # the vision tower again; a different image behind identical placeholder
-    # tokens must not reuse KV.
+    # The same image and prompt reuse the image-aware prefix, which covers the
+    # image: its rows are neither encoded nor looked up. Behind another system
+    # prompt the same image comes from the embedding cache without the vision
+    # tower. A different image behind identical placeholder tokens must not
+    # reuse KV.
     code, before = request(port, "GET", "/status")
     require(code == 200 and "images" in before, "status lacks image telemetry")
     code, repeat = request(
@@ -273,8 +284,27 @@ def run_images(port: int, model: str, nonce: str) -> None:
     require(
         code == 200
         and after["images"]["encodes"] == before["images"]["encodes"]
-        and after["images"]["embedding_reuses"] > before["images"]["embedding_reuses"],
-        f"repeated image re-ran the vision tower: {before['images']} -> {after['images']}",
+        and after["images"]["embedding_reuses"] == before["images"]["embedding_reuses"],
+        f"a prefix covering the image used its rows: {before['images']} -> "
+        f"{after['images']}",
+    )
+    body = image_chat_body(model, question, image_data_url("red"))
+    body["messages"].insert(
+        0, {"role": "system", "content": "You describe images for a test."}
+    )
+    code, other = request(port, "POST", "/v1/chat/completions", body)
+    require(
+        code == 200 and "red" in answer_text(other),
+        f"the image behind another system prompt failed: {other!r}",
+    )
+    code, reused = request(port, "GET", "/status")
+    require(
+        code == 200
+        and reused["images"]["encodes"] == after["images"]["encodes"]
+        and reused["images"]["embedding_reuses"]
+        == after["images"]["embedding_reuses"] + 1,
+        f"a cached image re-ran the vision tower or was not reused: "
+        f"{after['images']} -> {reused['images']}",
     )
     code, blue = request(
         port,
@@ -626,6 +656,22 @@ def run_text_only(port: int, model: str, nonce: str) -> None:
     print("text-only media refusal: PASS", flush=True)
 
 
+# A tool whose only valid call is {"value": "ok"}.
+PROBE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "record_probe",
+        "description": "Record the fixed smoke-test value.",
+        "parameters": {
+            "type": "object",
+            "properties": {"value": {"type": "string", "const": "ok"}},
+            "required": ["value"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
 def run(port: int, model: str) -> None:
     nonce = uuid.uuid4().hex
     modalities = input_modalities(port, model)
@@ -672,19 +718,6 @@ def run(port: int, model: str) -> None:
     )
     print("chat streaming: PASS", flush=True)
 
-    tool = {
-        "type": "function",
-        "function": {
-            "name": "record_probe",
-            "description": "Record the fixed smoke-test value.",
-            "parameters": {
-                "type": "object",
-                "properties": {"value": {"type": "string", "const": "ok"}},
-                "required": ["value"],
-                "additionalProperties": False,
-            },
-        },
-    }
     code, tool_response = request(
         port,
         "POST",
@@ -692,7 +725,7 @@ def run(port: int, model: str) -> None:
         chat_body(
             model,
             f"Call record_probe for request {nonce}.",
-            tools=[tool],
+            tools=[PROBE_TOOL],
             tool_choice={"type": "function", "function": {"name": "record_probe"}},
             max_completion_tokens=96,
         ),
@@ -786,6 +819,7 @@ def run(port: int, model: str) -> None:
         )
     print("anthropic messages: PASS", flush=True)
 
+    run_sampling(port, model)
     vision = "image" in modalities
     if vision:
         run_images(port, model, nonce)
@@ -793,6 +827,124 @@ def run(port: int, model: str) -> None:
         run_text_only(port, model, nonce)
     run_protocol_extensions(port, model, vision)
     run_judgments(port, model, nonce)
+
+
+def run_sampling(port: int, model: str) -> None:
+    """The sampling penalties, top_k and min_p on the real model: a penalized
+    greedy request repeats itself exactly once its prompt is cached (the first
+    run chunks the prompt differently), a sampled request whose min_p of 1
+    leaves each row its most likely token answers what a greedy one does, and
+    penalized greedy, sampled and constrained requests finish side by side with
+    an unpenalized one and with sampled ones whose top_k keeps every token or
+    which min_p cuts."""
+    prompt = "Name the days of the week, three times over, separated by commas."
+    penalized = chat_body(
+        model,
+        prompt,
+        presence_penalty=1.5,
+        frequency_penalty=0.5,
+        repetition_penalty=1.05,
+        max_completion_tokens=48,
+    )
+    answers = []
+    for _ in range(3):
+        code, chat = request(port, "POST", "/v1/chat/completions", penalized)
+        require(code == 200, f"penalized greedy Chat failed: {chat!r}")
+        answers.append(answer_text(chat))
+    require(answers[1] == answers[2], "a penalized greedy request did not repeat")
+
+    code, greedy = request(
+        port,
+        "POST",
+        "/v1/chat/completions",
+        chat_body(model, prompt, max_completion_tokens=48),
+    )
+    require(code == 200, f"greedy Chat failed: {greedy!r}")
+    code, heaviest = request(
+        port,
+        "POST",
+        "/v1/chat/completions",
+        chat_body(
+            model,
+            prompt,
+            temperature=1.0,
+            top_k=-1,
+            top_p=1.0,
+            min_p=1.0,
+            seed=13,
+            max_completion_tokens=48,
+        ),
+    )
+    require(
+        code == 200 and answer_text(heaviest) == answer_text(greedy),
+        f"min_p 1 did not answer as a greedy request: {heaviest!r}",
+    )
+
+    bodies = {
+        "greedy": penalized,
+        "sampled": chat_body(
+            model,
+            prompt,
+            temperature=0.8,
+            top_k=-1,
+            presence_penalty=1.5,
+            seed=7,
+            max_completion_tokens=48,
+        ),
+        "whole": chat_body(
+            model,
+            prompt,
+            temperature=1.0,
+            top_k=0,
+            top_p=1.0,
+            seed=11,
+            max_completion_tokens=48,
+        ),
+        "min_p": chat_body(
+            model,
+            prompt,
+            temperature=0.8,
+            min_p=0.1,
+            seed=17,
+            max_completion_tokens=48,
+        ),
+        "tool": chat_body(
+            model,
+            "Call record_probe.",
+            tools=[PROBE_TOOL],
+            tool_choice={"type": "function", "function": {"name": "record_probe"}},
+            repetition_penalty=1.1,
+            presence_penalty=0.5,
+            max_completion_tokens=96,
+        ),
+        "ignore_eos": chat_body(model, prompt, ignore_eos=True),
+    }
+    results = {}
+    with concurrent.futures.ThreadPoolExecutor(len(bodies)) as pool:
+        futures = {
+            name: pool.submit(request, port, "POST", "/v1/chat/completions", body)
+            for name, body in bodies.items()
+        }
+        for name, future in futures.items():
+            try:
+                results[name] = future.result(timeout=300)
+            except Exception as error:
+                raise SmokeFailure(
+                    f"concurrent {name} request failed: {error!r}"
+                ) from error
+    for name, (code, document) in results.items():
+        require(code == 200, f"concurrent {name} request failed: {document!r}")
+    calls = results["tool"][1]["choices"][0]["message"].get("tool_calls", [])
+    require(
+        len(calls) == 1
+        and json.loads(calls[0]["function"]["arguments"]) == {"value": "ok"},
+        "a penalized tool call failed",
+    )
+    require(
+        results["ignore_eos"][1]["usage"]["completion_tokens"] == 32,
+        "ignore_eos beside penalized requests stopped early",
+    )
+    print("sampling penalties, top_k and min_p: PASS", flush=True)
 
 
 def run_protocol_extensions(port: int, model: str, vision: bool = True) -> None:
@@ -1326,6 +1478,7 @@ def add_server_arguments(parser):
     parser.add_argument("--max-context", type=int)
     parser.add_argument("--max-memory")
     parser.add_argument("--max-cache-disk")
+    parser.add_argument("--max-image-pixels", type=int)
     parser.add_argument("--kv-format", choices=("int8", "bf16"), default="int8")
     parser.add_argument("--startup-timeout", type=float, default=1800)
 

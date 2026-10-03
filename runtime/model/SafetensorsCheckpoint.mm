@@ -1,4 +1,5 @@
 #include "model/SafetensorsCheckpoint.hpp"
+#include "Checked.hpp"
 #include "model/WeightStore.hpp"
 
 #import <Foundation/Foundation.h>
@@ -55,7 +56,7 @@ SourceTensor tensorRecord(NSDictionary *record, const WeightSource &file, uint64
   tensor.bytes = elementBytes(tensor.dtype);
   for (id dimension in record[@"shape"]) {
     tensor.shape.push_back(number(dimension));
-    tensor.bytes = checkedWeightMultiply(tensor.bytes, tensor.shape.back(), "source tensor size");
+    tensor.bytes = checkedMultiply<WeightStoreError>(tensor.bytes, tensor.shape.back(), "source tensor size");
   }
   const uint64_t begin = number(record[@"data_offsets"][0]);
   const uint64_t end = number(record[@"data_offsets"][1]);

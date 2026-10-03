@@ -1,11 +1,11 @@
 #include "Vision.hpp"
 
+#include "Checked.hpp"
 #include "metal/abi/Vision.h"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <cstring>
 #include <limits>
 #include <stdexcept>
 
@@ -22,16 +22,19 @@ constexpr uint32_t kMergerColumnTile = 256;
 constexpr uint32_t kKeyTile = 128;
 constexpr uint32_t kQueryTile = 64;
 constexpr uint32_t kQkDimension = 80; // head dimension 72 padded to 16
-constexpr uint64_t kArenaAlignment = 16 * 1024;
 constexpr uint64_t kBf16Bytes = 2;
 constexpr uint64_t kFloatBytes = 4;
 
+// The one vision tower the kernels are specialized for.
+constexpr VisionLayout kTower{};
+static_assert(kTower.headDimension + 8 == kQkDimension && kTower.hiddenSize % kGemmColumnTile == 0 &&
+                  kTower.paddedIntermediateSize % kGemmColumnTile == 0 &&
+                  kTower.mergedHiddenSize % kMergerColumnTile == 0 &&
+                  kTower.patchDimension % kGemmColumnTile == 0,
+              "vision kernels' tile assumptions");
+
 uint32_t roundUp(uint32_t value, uint32_t multiple) noexcept {
   return (value + multiple - 1) / multiple * multiple;
-}
-
-uint64_t alignArena(uint64_t bytes) noexcept {
-  return (bytes + kArenaAlignment - 1) / kArenaAlignment * kArenaAlignment;
 }
 
 // Scratch tensor byte sizes for one encoder sized to maximumPatches. GEMM
@@ -66,14 +69,8 @@ void requireLayout(const VisionLayout &layout) {
   // Packages share the same vision tower; only the language-space projection
   // width varies with the text model.
   VisionLayout tower = layout;
-  tower.outputHiddenSize = VisionLayout{}.outputHiddenSize;
-  if (tower != VisionLayout{} || !layout.outputHiddenSize ||
-      layout.headDimension + 8 != kQkDimension ||
-      layout.hiddenSize % kGemmColumnTile ||
-      layout.paddedIntermediateSize % kGemmColumnTile ||
-      layout.mergedHiddenSize % kMergerColumnTile ||
-      layout.outputHiddenSize % kMergerColumnTile ||
-      layout.patchDimension % kGemmColumnTile) {
+  tower.outputHiddenSize = kTower.outputHiddenSize;
+  if (tower != kTower || !layout.outputHiddenSize || layout.outputHiddenSize % kMergerColumnTile) {
     throw std::invalid_argument(
         "vision kernels are specialized for the Qwen3.5 27-block tower");
   }
@@ -90,7 +87,7 @@ uint64_t Vision::scratchBytes(const VisionLayout &layout,
   }
   uint64_t total = 0;
   for (uint64_t bytes : scratchLayout(layout, maximumPatches)) {
-    const uint64_t aligned = alignArena(bytes);
+    const uint64_t aligned = alignUp(bytes);
     if (aligned > std::numeric_limits<uint64_t>::max() - total) {
       throw std::overflow_error("vision scratch byte count overflows");
     }
@@ -107,16 +104,15 @@ Vision::Vision(metal::MetalBackend &backend, const VisionWeights &model,
                uint32_t maximumPatches)
     : model_(model), maximumPatches_(maximumPatches) {
   const uint64_t total = scratchBytes(model.layout, maximumPatches);
+  // New backend buffers are zero-filled, so padding rows read by whole tiles
+  // start finite.
   arena_ = backend.allocateBuffer(total, metal::BufferStorage::Shared,
                                   "vision-scratch");
-  // Padding rows and tokens are read by whole tiles but never consumed as
-  // results; zeroed storage guarantees they are finite.
-  std::memset(arena_.contents(), 0, static_cast<size_t>(total));
   uint64_t cursor = 0;
   const auto layout = scratchLayout(model.layout, maximumPatches);
   for (uint32_t index = 0; index < layout.size(); ++index) {
     scratch_[index] = backend.view(arena_, cursor, layout[index]);
-    cursor += alignArena(layout[index]);
+    cursor += alignUp(layout[index]);
   }
   if (cursor != total)
     throw std::logic_error("vision scratch arena mismatch");
@@ -143,10 +139,10 @@ void Vision::encode(CommandGraph &graph, ImageGrid grid,
                     const MetalBuffer &pixels,
                     const MetalBuffer &embeddings) const {
   const VisionLayout &layout = model_.layout;
-  const uint32_t tokens = grid.patches();
-  if (!grid.valid() || tokens > maximumPatches_) {
+  if (!grid.valid() || grid.patches() > maximumPatches_) {
     throw std::invalid_argument("image grid exceeds the vision encoder");
   }
+  const auto tokens = static_cast<uint32_t>(grid.patches());
   if (!pixels || pixels.sizeBytes() < grid.pixelBytes()) {
     throw std::invalid_argument("image pixels do not cover the grid");
   }

@@ -6,10 +6,10 @@
 #include "Qwen3_6Moe.hpp"
 #include "Qwen3_8.hpp"
 #include "QwenVision.hpp"
+#include "VisionLoader.hpp"
 #include "ops/AneFfn.hpp"
 #include "ops/PageStorage.hpp"
 #include "ops/ExecutionPlans.hpp"
-#include "model/SlotFile.hpp"
 
 #include <filesystem>
 #include <memory>
@@ -17,6 +17,8 @@
 #include <variant>
 
 namespace splash::model {
+
+class QwenStateStorage;
 
 using TargetWeights = std::variant<Qwen3_8Weights, Qwen3_6MoeWeights>;
 
@@ -30,8 +32,7 @@ struct ModelPackage final {
   [[nodiscard]] const std::string &name() const noexcept {
     return descriptor.name;
   }
-  [[nodiscard]] kv::Layout targetKvLayout(
-      kv::Format format = kv::Format::Int8) const noexcept {
+  [[nodiscard]] kv::Layout targetKvLayout(kv::Format format) const noexcept {
     auto layout = descriptor.targetKvLayout;
     layout.format = format;
     return layout;
@@ -60,21 +61,14 @@ struct ModelPackage final {
   }
 };
 
-// Model execution resources; physical memory admission remains governed by
-// the engine through admitAllocation.
-class KvPageTier;
-
+// Model execution resources, which the engine assembles. What a request's
+// start allocates is admitted through the state storage.
 struct RuntimeContext final {
   metal::MetalBackend &backend;
-  metal::AllocationAdmission admitAllocation;
   const ModelPackage &package;
   kv::PageStorage &kvPages;
-  StateStorage &stateStorage;
+  QwenStateStorage &stateStorage;
   const ops::ExecutionPlans &operators;
-  uint32_t maximumImagePatches = ops::kMaximumImagePatches;
-  uint64_t pipelineReserveBytes = 0;
-  uint64_t runtimeOverheadReserveBytes = 0;
-  KvPageTier *kvTier = nullptr;
   // The share of the prefill FFN's Neural Engine split (calibrateAneFfn), or
   // 0 for none.
   double aneFfnShare = 0.0;
@@ -91,7 +85,7 @@ void requireCompatibleModelPackage(const ModelPackage &package);
 // packed vision file or a model without vision.
 [[nodiscard]] std::unique_ptr<VisionLoader>
 planVisionLoader(metal::MetalBackend &backend, const std::filesystem::path &root,
-                 const ModelDescriptor &descriptor, PreparationCheck admitConversion = {});
+                 const ModelDescriptor &descriptor, PreparationCheck admitConversion);
 // The vision role: prepared by `loader` when there is one, else the packed
 // file; empty weights for a model without vision.
 [[nodiscard]] QwenVisionWeights
@@ -102,17 +96,8 @@ loadVisionWeights(metal::MetalBackend &backend, const std::filesystem::path &roo
 // is one shared engine and DFlash controller; only model execution differs.
 [[nodiscard]] ModelPackage
 loadModelPackage(metal::MetalBackend &backend,
-                 const std::filesystem::path &root);
-[[nodiscard]] ModelPackage
-loadModelPackage(metal::MetalBackend &backend,
                  const std::filesystem::path &root,
-                 const ModelDescriptor &descriptor, PreparationCheck admitConversion = {});
-
-// Fixed reserves the memory plan carries beside the planned arenas: Metal
-// pipeline objects and encoder scratch, and the process's own runtime
-// overhead. Startup counts them before a model loads.
-inline constexpr uint64_t kPipelineReserveBytes = 256ULL << 20;
-inline constexpr uint64_t kRuntimeOverheadReserveBytes = 512ULL << 20;
+                 const ModelDescriptor &descriptor, PreparationCheck admitConversion);
 
 // The Neural Engine split of the package's prefill FFN calibrated on this
 // device (ops::AneFfn::calibrate) on a prefill arena of its own; a target
@@ -124,14 +109,7 @@ inline constexpr uint64_t kRuntimeOverheadReserveBytes = 512ULL << 20;
 plannedRuntimeMemory(const DeviceCapabilities &device,
                      const ModelPackage &package,
                      const ops::ExecutionPlans &operators,
-                     kv::Format format = kv::Format::Int8, double aneFfnShare = 0.0);
-// The file, when given, holds one state per slot and shares the cache's
-// disk budget.
-[[nodiscard]] std::unique_ptr<StateStorage>
-createStateStorage(metal::MetalBackend &backend,
-                   metal::AllocationAdmission admitAllocation,
-                   const ModelPackage &package,
-                   std::shared_ptr<SlotFile> file = nullptr);
+                     kv::Format format, double aneFfnShare = 0.0);
 [[nodiscard]] std::unique_ptr<RuntimeModel>
 createRuntime(RuntimeContext context);
 

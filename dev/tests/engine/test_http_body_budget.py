@@ -5,6 +5,7 @@ import gc
 import http.client
 import io
 import json
+import math
 import socket
 import threading
 import time
@@ -15,8 +16,7 @@ from unittest import mock
 from PIL import Image
 
 from dev.tests import test_server as fixtures
-from install import launcher
-from server import frontend, json_codec
+from server import frontend, json_codec, serve_options
 from server import server as api
 
 
@@ -55,15 +55,14 @@ class HttpBodyBudgetTests(unittest.TestCase):
         return connection
 
     def test_config_and_exact_body_boundary(self):
-        for parse in (launcher._parse_request_size, api._parse_request_size):
-            for value in ("128M", "128MB", "128MiB", "134217728"):
-                self.assertEqual(parse(value), 128 * 1024**2)
-            for value in ("auto", "0", "-1", "bad", str(2**64)):
-                with (
-                    self.subTest(value=value),
-                    self.assertRaises(argparse.ArgumentTypeError),
-                ):
-                    parse(value)
+        for value in ("128M", "128MB", "128MiB", "134217728"):
+            self.assertEqual(serve_options.parse_request_size(value), 128 * 1024**2)
+        for value in ("auto", "0", "-1", "bad", str(2**64)):
+            with (
+                self.subTest(value=value),
+                self.assertRaises(argparse.ArgumentTypeError),
+            ):
+                serve_options.parse_request_size(value)
         harness = self.harness(max_request_bytes=128)
         body = json.dumps({"content": "hello"}).encode().ljust(128)
         connection = self.headers(harness, len(body), "/tokenize")
@@ -99,7 +98,6 @@ class HttpBodyBudgetTests(unittest.TestCase):
             handler.server = SimpleNamespace(
                 max_request_bytes=4096,
                 request_bodies=api.HttpAdmission(4096),
-                io_timeout=1,
             )
             handler.connection = SimpleNamespace(settimeout=lambda _: None)
             handler.rfile = io.BytesIO(payload)
@@ -297,9 +295,13 @@ class HttpBodyBudgetTests(unittest.TestCase):
                     harness.request("POST", "/v1/chat/completions", body)[0], status
                 )
             self.wait_bytes(harness, 0)
-        with mock.patch.object(harness.backend, "submit", return_value=False):
+        with mock.patch.object(
+            harness.backend.runtime,
+            "submit",
+            side_effect=api.engine_runtime.PendingLimitExceeded("full"),
+        ):
             self.assertEqual(
-                harness.request("POST", "/v1/chat/completions", body)[0], 429
+                harness.request("POST", "/v1/chat/completions", body)[0], 503
             )
         self.wait_bytes(harness, 0)
 
@@ -423,13 +425,14 @@ class HttpBodyBudgetTests(unittest.TestCase):
             {"id": "resp_previous"}, [{"role": "user", "content": "old history"}]
         )
         reservation = api.RequestBodyReservation(harness.server.request_bodies, 100)
-        job, *_ = harness.app.prepare_responses(
+        job = harness.app.prepare_responses(
             {
                 "input": "continue",
                 "previous_response_id": "resp_previous",
                 "store": False,
             },
             reserve_input=reservation.grow,
+            deadline=fixtures.FOREVER,
         )
         self.assertIn("old history", str(harness.tokenizer.templates))
         self.assertIsNone(job.response_history_items)
@@ -454,6 +457,7 @@ class HttpBodyBudgetTests(unittest.TestCase):
             (1024, 1800, 30 + 1 / 512),
             (128 * 1024**2, 1800, 286),
             (256 * 1024**2, 1800, 542),
+            (256 * 1024**2, math.inf, 542),
             (128 * 1024**2, 5, 5),
         ):
             with self.subTest(length=length, request_seconds=request_seconds):
@@ -478,7 +482,6 @@ class HttpBodyBudgetTests(unittest.TestCase):
                 handler.server = SimpleNamespace(
                     max_request_bytes=length,
                     request_bodies=api.HttpAdmission(length),
-                    io_timeout=30,
                 )
                 handler.connection = SimpleNamespace(settimeout=settimeout)
                 handler.rfile = SimpleNamespace(read1=drip)
@@ -586,7 +589,7 @@ class HttpBodyBudgetTests(unittest.TestCase):
         self.assertGreater(len(json.dumps(body)), 16 * 1024**2)
         status, _, payload = harness.request("POST", "/v1/chat/completions", body)
         self.assertEqual(status, 200, payload)
-        request = harness.backend.runtime.requests[-1]
+        request = harness.backend.runtime.requests[-1].frame
         self.assertEqual(len(request.image_spans), 5)
         self.wait_bytes(harness, 0)
 

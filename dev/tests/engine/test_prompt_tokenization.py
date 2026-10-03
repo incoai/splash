@@ -1,6 +1,7 @@
 import random
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from unittest import mock
 
 from tokenizers import (
     AddedToken,
@@ -80,7 +81,9 @@ class PromptTokenizationTests(unittest.TestCase):
         self.assertGreater(self.cache.stats()["reused_tokens"], 10000)
 
     def test_concurrent_requests_eviction_and_oversized_prefix(self):
-        cache = PromptTokenizer(self.tokenizer, capacity=2, budget_bytes=40000)
+        self.enterContext(mock.patch.object(PromptTokenizer, "CAPACITY", 2))
+        self.enterContext(mock.patch.object(PromptTokenizer, "BUDGET_BYTES", 40000))
+        cache = PromptTokenizer(self.tokenizer)
         prompts = [
             "<|im_start|>user\n" + str(i) + " Hello world!" * 400 + "<|im_end|>\n"
             for i in range(8)

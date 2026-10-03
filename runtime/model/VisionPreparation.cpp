@@ -47,8 +47,9 @@ struct Staging {
 // Writes a section in batches of whole rows converted to BF16. The packed
 // patch embedding orders a row [channel, frame, patch-row, patch-col]; MLX
 // stores [frame, patch-row, patch-col, channel] and GGUF one [channel,
-// patch-row, patch-col] tensor per frame. Padded rows, columns and alignment
-// stay zero: a prepared file starts zeroed.
+// patch-row, patch-col] tensor per frame. Padded rows and alignment stay zero:
+// a prepared file starts zeroed. Padded columns are zeroed in each staged row,
+// since the staging rows are reused across sections.
 void writeSection(int destination, const Section &s, uint32_t pixels, Staging &staging,
                   const PreparationCheck &admit) {
   const auto frames = static_cast<uint32_t>(s.inputs.size());
@@ -89,6 +90,9 @@ void writeSection(int destination, const Section &s, uint32_t pixels, Staging &s
                           : values[(uint64_t(frame) * count + r) * columns + uint64_t(channel) * pixels + pixel];
         }
     }
+    for (uint32_t r = 0; r < count; ++r)
+      std::fill_n(output.begin() + uint64_t(r) * s.storedColumns + s.columns, s.storedColumns - s.columns,
+                  uint16_t{0});
     writeWeightBytes(destination, s.offset + row * storedRowBytes,
                      {reinterpret_cast<const uint8_t *>(output.data()), count * storedRowBytes});
   }

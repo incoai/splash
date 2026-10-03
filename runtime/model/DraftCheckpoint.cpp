@@ -71,59 +71,43 @@ Image modelImage(const DFlashDraftLayout &layout) {
   return result;
 }
 
-// Every file of a layout: the layers, then model.bin.
-std::vector<Image> draftImages(const DFlashDraftLayout &layout) {
+} // namespace
+
+std::vector<Image> draftCheckpointImages(const DFlashDraftLayout &layout) {
   std::vector<Image> result;
   for (uint32_t layer = 0; layer < layout.layers; ++layer) result.push_back(layerImage(layout, layer));
   result.push_back(modelImage(layout));
   return result;
 }
 
-} // namespace
-
 struct DraftCheckpointLoader::Impl {
   metal::MetalBackend &backend;
   SafetensorsCheckpoint source;
-  std::vector<Image> images; // layers, then model.bin
-  std::vector<PreparedWeight> weights;
-  PreparedFiles files;
+  PreparedImages<Image> images; // layers, then model.bin
   Impl(metal::MetalBackend &backend, const std::filesystem::path &directory, const DFlashDraftLayout &layout,
        PreparationCheck admitConversion)
       : backend(backend), source(directory, [&backend] { backend.checkOperation(); }),
-        files([&backend] { backend.checkOperation(); }, std::move(admitConversion),
-              [this] { source.checkUnchanged(); }) {
-    images = draftImages(layout);
-    for (Image &image : images) {
+        images(PreparedFiles([&backend] { backend.checkOperation(); }, std::move(admitConversion),
+                             [this] { source.checkUnchanged(); }),
+               [](const Image &image) { return affine::affineImageWriter(image); }) {
+    for (Image &image : draftCheckpointImages(layout)) {
       backend.checkOperation();
       affine::bind(image, source);
-      weights.push_back(affine::affineImageWeight(image, "draft", directory.string()));
+      PreparedWeight weight = affine::affineImageWeight(image, "draft", directory.string());
+      images.add(std::move(image), std::move(weight));
     }
-  }
-  WeightFile open(size_t index) {
-    const Image &image = images[index];
-    return files.open(backend, weights[index], affine::affineImageWriter(image), image.magic, image.layer,
-                      image.type);
   }
 };
 DraftCheckpointLoader::DraftCheckpointLoader(metal::MetalBackend &backend, const std::filesystem::path &directory,
                                              const DFlashDraftLayout &layout, PreparationCheck admitConversion)
     : impl_(std::make_unique<Impl>(backend, directory, layout, std::move(admitConversion))) {}
 DraftCheckpointLoader::~DraftCheckpointLoader() = default;
-std::span<const PreparedWeight> DraftCheckpointLoader::weights() const noexcept { return impl_->weights; }
-void DraftCheckpointLoader::prepare() {
-  for (size_t index = 0; index < impl_->images.size(); ++index)
-    static_cast<void>(impl_->files.prepare(impl_->weights[index], affine::affineImageWriter(impl_->images[index])));
-}
+std::span<const PreparedWeight> DraftCheckpointLoader::weights() const noexcept { return impl_->images.weights(); }
+void DraftCheckpointLoader::prepare() { impl_->images.prepare(); }
 WeightFile DraftCheckpointLoader::layer(uint32_t index) {
   if (index >= impl_->images.size() - 1) throw WeightStoreError("draft layer is out of range");
-  return impl_->open(index);
+  return impl_->images.open(impl_->backend, index);
 }
-WeightFile DraftCheckpointLoader::model() { return impl_->open(impl_->images.size() - 1); }
-
-uint64_t preparedDraftBytes(const DFlashDraftLayout &layout) {
-  uint64_t bytes = 0;
-  for (const Image &image : draftImages(layout)) bytes += image.bytes;
-  return bytes;
-}
+WeightFile DraftCheckpointLoader::model() { return impl_->images.open(impl_->backend, impl_->images.size() - 1); }
 
 } // namespace splash::model

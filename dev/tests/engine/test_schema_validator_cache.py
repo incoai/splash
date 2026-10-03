@@ -1,15 +1,11 @@
-import gc
 import threading
 import unittest
-import weakref
 from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
 
 from jsonschema import SchemaError
-from referencing import Registry
 
 from server import schema_validation as validation
-from server import tool_schema
 from server.errors import APIError
 
 
@@ -25,9 +21,7 @@ class ValidatorCacheTests(unittest.TestCase):
             validation._validator_cache_bytes = 0
 
     def build(self, schema):
-        return validation.build_validator(
-            schema, tool_schema._schemas, tool_schema.LOCAL_REGISTRY
-        )
+        return validation.build_validator(schema)
 
     def test_eviction_obeys_both_count_and_source_byte_limits(self):
         for count, budget in ((2, 10000), (256, 180)):
@@ -44,7 +38,7 @@ class ValidatorCacheTests(unittest.TestCase):
                     self.assertLessEqual(validation._validator_cache_bytes, budget)
                     self.assertEqual(
                         validation._validator_cache_bytes,
-                        sum(len(key[2]) for key in cache),
+                        sum(len(key) for key in cache),
                     )
 
     def test_cache_hit_refreshes_lru(self):
@@ -107,24 +101,6 @@ class ValidatorCacheTests(unittest.TestCase):
         self.assertFalse(second.is_valid({"x": 1}))
         self.assertTrue(second.is_valid({"x": "1"}))
 
-    def test_identity_contexts_stay_alive_until_eviction(self):
-        def nodes(schema):
-            return [schema]
-
-        ref = weakref.ref(nodes)
-        registry = Registry()
-        schema = {"type": "integer"}
-        first = validation.build_validator(schema, nodes, registry)
-        self.assertIsNot(
-            first, validation.build_validator(schema, lambda s: [s], registry)
-        )
-        del nodes
-        gc.collect()
-        self.assertIsNotNone(ref())
-        self.clear()
-        gc.collect()
-        self.assertIsNone(ref())
-
     def test_concurrent_misses_account_for_one_entry(self):
         barrier = threading.Barrier(4)
         bounded_class = validation._bounded_class
@@ -142,5 +118,5 @@ class ValidatorCacheTests(unittest.TestCase):
         self.assertEqual(len(validation._validator_cache), 1)
         self.assertEqual(
             validation._validator_cache_bytes,
-            sum(len(key[2]) for key in validation._validator_cache),
+            sum(len(key) for key in validation._validator_cache),
         )

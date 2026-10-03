@@ -1,12 +1,17 @@
+#include "ProtocolPeer.hpp"
 #include "engine/Protocol.hpp"
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
+#include <fstream>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <random>
 #include <span>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -17,6 +22,13 @@
 namespace {
 
 using namespace splash::protocol;
+using splash::ConstraintMode;
+using splash::ImageSpan;
+using splash::RequestIgnoreEndOfSequence;
+using splash::SamplingParameters;
+using splash::engine::EngineFinishReason;
+using splash::engine::RequestPriority;
+using splash::model::ExecutionLimits;
 
 int failures = 0;
 
@@ -31,10 +43,32 @@ void check(bool condition, std::string_view expression, std::string_view test,
 #define CHECK(testName, expression)                                            \
   check(static_cast<bool>(expression), #expression, testName, __LINE__)
 
-uint16_t loadU16(const std::vector<uint8_t> &bytes, size_t offset) {
-  return static_cast<uint16_t>(bytes.at(offset)) |
-         (static_cast<uint16_t>(bytes.at(offset + 1)) << 8);
-}
+const ProtocolLimits kLimits{};
+
+// Payload offsets of the request's fixed fields, each the previous field's
+// offset plus that field's size.
+namespace request_offset {
+constexpr size_t priority = 8;
+constexpr size_t constraint = priority + 1;
+constexpr size_t absoluteDeadline = constraint + 1;
+constexpr size_t remainingDeadline = absoluteDeadline + 8;
+constexpr size_t logicalMaxOutput = remainingDeadline + 8;
+constexpr size_t promptCount = logicalMaxOutput + 4;
+constexpr size_t imageSpanCount = promptCount + 4;
+constexpr size_t temperature = imageSpanCount + 4;
+constexpr size_t topP = temperature + 4;
+constexpr size_t topK = topP + 4;
+constexpr size_t presencePenalty = topK + 4;
+constexpr size_t frequencyPenalty = presencePenalty + 4;
+constexpr size_t repetitionPenalty = frequencyPenalty + 4;
+constexpr size_t minP = repetitionPenalty + 4;
+constexpr size_t seed = minP + 4;
+constexpr size_t returnProgress = seed + 8;
+constexpr size_t scoreCount = returnProgress + 1;
+constexpr size_t generationPrompt = scoreCount + 4;
+constexpr size_t flags = generationPrompt + 4;
+static_assert(flags + 4 == kRequestFixedBytes);
+} // namespace request_offset
 
 uint32_t loadU32(const std::vector<uint8_t> &bytes, size_t offset) {
   uint32_t result = 0;
@@ -71,7 +105,7 @@ void storeU64(std::vector<uint8_t> &bytes, size_t offset, uint64_t value) {
 }
 
 std::vector<Frame> parseAll(const std::vector<uint8_t> &bytes,
-                            const ProtocolLimits &limits = {}) {
+                            const ProtocolLimits &limits) {
   FrameParser parser(limits);
   std::vector<Frame> frames;
   size_t offset = 0;
@@ -93,25 +127,37 @@ std::vector<Frame> parseAll(const std::vector<uint8_t> &bytes,
   return frames;
 }
 
-template <typename T>
-T roundTrip(const T &message, const ProtocolLimits &limits = {}) {
-  auto bytes = serializeMessage(Message{message}, limits);
-  if (!bytes)
-    throw std::runtime_error(bytes.issue->describe());
-  std::vector<Frame> frames = parseAll(*bytes.value, limits);
+Frame singleFrame(const std::vector<uint8_t> &wire,
+                  const ProtocolLimits &limits) {
+  std::vector<Frame> frames = parseAll(wire, limits);
   if (frames.size() != 1) {
-    throw std::runtime_error("round trip did not produce one frame");
+    throw std::runtime_error("expected one frame");
   }
-  auto decoded = decodeFrame(frames.front(), limits);
+  return std::move(frames.front());
+}
+
+// The engine's view of one frame the server wrote.
+ProtocolResult<ClientMessage> decodeClient(const std::vector<uint8_t> &wire,
+                                           const ProtocolLimits &limits) {
+  return decodeFrame(singleFrame(wire, limits), limits);
+}
+
+template <typename T> T roundTrip(const T &message) {
+  auto decoded = decodeClient(peer::serialize(message), kLimits);
   if (!decoded)
     throw std::runtime_error(decoded.issue->describe());
-  if (!std::holds_alternative<T>(*decoded.value)) {
-    throw std::runtime_error("round trip produced the wrong message type");
-  }
   return std::get<T>(std::move(*decoded.value));
 }
 
-Frame decodeSingleFrame(const std::vector<uint8_t> &wire);
+template <typename T> T roundTripEvent(const T &event) {
+  auto bytes = serializeEvent(event, kLimits);
+  if (!bytes)
+    throw std::runtime_error(bytes.issue->describe());
+  std::vector<EngineEvent> events = peer::decodeEvents(*bytes.value);
+  if (events.size() != 1)
+    throw std::runtime_error("round trip did not produce one event");
+  return std::get<T>(std::move(events.front()));
+}
 
 RequestFrame exampleRequest() {
   RequestFrame request;
@@ -121,9 +167,8 @@ RequestFrame exampleRequest() {
   request.remainingDeadlineMicros = 45'000'000;
   request.logicalMaxOutputTokens = 32'768;
   request.promptTokens = {0, 1, 42, 0x80000000U, 0xffffffffU};
-  request.sampling = {0.8f, 0.95f, 32};
-  request.seed = 0xfedcba9876543210ULL;
-  request.cohort = Cohort::Constrained;
+  request.sampling = {0.8f, 0.95f, 32, 1.5f, -0.25f, 1.1f, 0.05f};
+  request.sampling.seed = 0xfedcba9876543210ULL;
   request.constraint = ConstraintMode::TokenMask;
   request.generationPromptTokens = 2;
   return request;
@@ -142,85 +187,146 @@ RequestFrame exampleImageRequest() {
 }
 
 RequestFrame exampleScoreRequest() {
-  RequestFrame request;
-  request.requestId = 0x1111111111111111ULL;
-  request.priority = RequestPriority::Normal;
-  request.absoluteDeadlineUnixMicros = 1'800'000'000'000'000ULL;
-  request.remainingDeadlineMicros = 45'000'000;
+  RequestFrame request = exampleRequest();
   request.logicalMaxOutputTokens = 0;
-  request.promptTokens = {1, 2, 3, 4};
-  request.sampling = {0.0f, 1.0f, 0};
-  request.seed = 7;
-  request.cohort = Cohort::Greedy;
+  request.promptTokens = {5, 6, 7};
+  request.sampling = {.seed = request.sampling.seed};
   request.constraint = ConstraintMode::None;
-  request.scoreTokens = {32, 65, 97};
+  request.scoreTokens = {101, 202, 303};
   return request;
 }
 
-void testRequestWireAndRoundTrip() {
-  constexpr std::string_view test = "request wire and round trip";
+RequestFrame exampleIgnoreEosRequest() {
   RequestFrame request = exampleRequest();
-  auto serialized = serializeMessage(Message{request});
-  CHECK(test, serialized);
-  if (!serialized)
-    return;
-  const auto &wire = *serialized.value;
+  request.constraint = ConstraintMode::None;
+  request.flags = RequestIgnoreEndOfSequence;
+  return request;
+}
 
-  CHECK(test, wire.size() ==
-                  kFrameHeaderBytes + 72 + request.promptTokens.size() * 4);
-  CHECK(test, std::string(wire.begin(), wire.begin() + 4) == "SPLH");
-  CHECK(test, loadU16(wire, 4) == kProtocolVersion);
-  CHECK(test, loadU16(wire, 6) == kFrameHeaderBytes);
-  CHECK(test, loadU16(wire, 8) == static_cast<uint16_t>(FrameType::Request));
-  CHECK(test, loadU16(wire, 10) == 0);
-  CHECK(test, loadU64(wire, 12) == 72 + request.promptTokens.size() * 4);
-  CHECK(test, loadU32(wire, 20) == 0);
-  CHECK(test, loadU64(wire, kFrameHeaderBytes) == request.requestId);
-  CHECK(test,
-        loadU32(wire, kFrameHeaderBytes + 31) == request.promptTokens.size());
-  CHECK(test, loadU32(wire, kFrameHeaderBytes + 35) == 0);
-  CHECK(test, loadU32(wire, kFrameHeaderBytes + 60) == 0);
-  CHECK(test, loadU32(wire, kFrameHeaderBytes + 64) ==
-                  request.generationPromptTokens);
-  CHECK(test, loadU32(wire, kFrameHeaderBytes + 68) == request.flags);
-  CHECK(test, loadU32(wire, kFrameHeaderBytes + 72) == 0);
-  CHECK(test, loadU32(wire, kFrameHeaderBytes + 72 + 16) == 0xffffffffU);
-  RequestFrame decoded = roundTrip(request);
-  CHECK(test, decoded == request);
+const std::vector<std::pair<std::string, ClientMessage>> &clientMessages() {
+  static const std::vector<std::pair<std::string, ClientMessage>> messages{
+      {"request", exampleRequest()},
+      {"request_image", exampleImageRequest()},
+      {"request_score", exampleScoreRequest()},
+      {"request_ignore_eos", exampleIgnoreEosRequest()},
+      {"cancel", CancelFrame{91}},
+      {"mask_response",
+       MaskResponseFrame{91, 7, {0xffffffffU, 0, 0xa5a5a5a5U}}},
+      {"status_request", StatusRequestFrame{808}},
+  };
+  return messages;
+}
 
+const std::vector<std::pair<std::string, EngineEvent>> &engineEvents() {
+  static const std::vector<std::pair<std::string, EngineEvent>> events{
+      {"ready", ReadyEvent{4, 524'288, false}},
+      {"ready_vision", ReadyEvent{4, 524'288, true}},
+      {"start", StartEvent{91, 2, 4096}},
+      {"prompt_progress", PromptProgressEvent{91, 2048, 123456}},
+      {"tokens", TokensEvent{91, 17, {10, 11, 12}}},
+      {"mask_request_initial", MaskRequestEvent{91, 6, 4, {}}},
+      {"mask_request_verify", MaskRequestEvent{91, 7, 4, {101, 102, 103}}},
+      {"done", DoneEvent{91, EngineFinishReason::Stop, 4096, 512, 1000, 2000,
+                         3500, {}}},
+      {"done_scored", DoneEvent{91, EngineFinishReason::Stop, 4096, 0, 1000, 0,
+                                3500, {1.5f, -2.25f, 0.5f}}},
+      {"error_request",
+       ErrorEvent{FailureClass::RequestError, 91, true, "deadline_exceeded",
+                  "request deadline expired"}},
+      {"error_engine", ErrorEvent{FailureClass::EngineUnhealthy, 0, false,
+                                  "gpu_fault", "Metal command buffer failed"}},
+      {"error_protocol",
+       ErrorEvent{FailureClass::ProtocolFatal, 0, false, "bad_frame",
+                  "stream framing cannot be trusted"}},
+      {"status_json",
+       StatusJsonEvent{808, "{\n  \"schema_version\": 6, \"ready\": true\n}"}},
+  };
+  return events;
+}
+
+std::map<std::string, std::vector<uint8_t>> readGolden(const char *path) {
+  std::ifstream file(path);
+  if (!file)
+    throw std::runtime_error(std::string("cannot read ") + path);
+  std::map<std::string, std::vector<uint8_t>> golden;
+  std::string line;
+  while (std::getline(file, line)) {
+    if (line.empty() || line.front() == '#')
+      continue;
+    std::istringstream fields(line);
+    std::string name;
+    std::string hex;
+    fields >> name >> hex;
+    std::vector<uint8_t> bytes;
+    for (size_t index = 0; index + 1 < hex.size(); index += 2)
+      bytes.push_back(
+          static_cast<uint8_t>(std::stoul(hex.substr(index, 2), nullptr, 16)));
+    golden.emplace(std::move(name), std::move(bytes));
+  }
+  return golden;
+}
+
+// Each client frame the server writes decodes to its message, and each event
+// serializes to exactly the bytes the server decodes.
+void testGoldenVectors(const char *path) {
+  constexpr std::string_view test = "golden vectors";
+  const auto golden = readGolden(path);
+  CHECK(test, golden.size() == clientMessages().size() + engineEvents().size());
+  for (const auto &[name, expected] : clientMessages()) {
+    const auto found = golden.find(name);
+    const auto decoded = found == golden.end()
+                             ? ProtocolResult<ClientMessage>{}
+                             : decodeClient(found->second, kLimits);
+    check(decoded && *decoded.value == expected, name, test, __LINE__);
+  }
+  for (const auto &[name, expected] : engineEvents()) {
+    const auto found = golden.find(name);
+    const auto serialized = serializeEvent(expected, kLimits);
+    check(found != golden.end() && serialized &&
+              *serialized.value == found->second,
+          name, test, __LINE__);
+  }
+}
+
+void testRequestRoundTrip() {
+  constexpr std::string_view test = "request round trip";
+  RequestFrame request = exampleRequest();
+  CHECK(test, roundTrip(request) == request);
   RequestFrame withImage = exampleImageRequest();
-  auto imageWire = serializeMessage(Message{withImage});
-  CHECK(test, imageWire);
-  if (!imageWire)
-    return;
-  const size_t spanOffset =
-      kFrameHeaderBytes + 72 + withImage.promptTokens.size() * 4;
-  CHECK(test, imageWire.value->size() ==
-                  spanOffset + 32 + withImage.imagePixels.size());
-  CHECK(test, loadU32(*imageWire.value, kFrameHeaderBytes + 35) == 1);
-  CHECK(test, loadU32(*imageWire.value, spanOffset) == 1);
-  CHECK(test, loadU32(*imageWire.value, spanOffset + 4) == 1);
-  CHECK(test, loadU32(*imageWire.value, spanOffset + 8) == 2);
-  CHECK(test, loadU32(*imageWire.value, spanOffset + 12) == 2);
-  CHECK(test, loadU64(*imageWire.value, spanOffset + 16) ==
-                  withImage.imageSpans[0].digestLo);
   CHECK(test, roundTrip(withImage) == withImage);
+  RequestFrame progress = request;
+  progress.returnProgress = true;
+  CHECK(test, roundTrip(progress) == progress);
+}
+
+// A request's error carries its id, so the stream survives it.
+void expectRequestIssue(std::string_view test, const RequestFrame &invalid,
+                        IssueCode code,
+                        const ProtocolLimits &limits = kLimits) {
+  auto decoded = decodeClient(peer::serialize(invalid), limits);
+  CHECK(test, !decoded);
+  if (decoded.issue) {
+    CHECK(test, decoded.issue->failureClass == FailureClass::RequestError);
+    CHECK(test, decoded.issue->code == code);
+    CHECK(test, decoded.issue->requestId == invalid.requestId);
+  }
+}
+
+// An event that breaks its rules is the engine's defect.
+void expectEventIssue(std::string_view test, const EngineEvent &invalid,
+                      IssueCode code, const ProtocolLimits &limits = kLimits) {
+  auto serialized = serializeEvent(invalid, limits);
+  CHECK(test, !serialized);
+  if (serialized.issue) {
+    CHECK(test,
+          serialized.issue->failureClass == FailureClass::EngineUnhealthy);
+    CHECK(test, serialized.issue->code == code);
+  }
 }
 
 void testScoreRequestAndDoneLogits() {
   constexpr std::string_view test = "score request and done logits";
   RequestFrame request = exampleScoreRequest();
-  auto serialized = serializeMessage(Message{request});
-  CHECK(test, serialized);
-  if (!serialized)
-    return;
-  const auto &wire = *serialized.value;
-  const size_t scoreOffset =
-      kFrameHeaderBytes + 72 + request.promptTokens.size() * 4;
-  CHECK(test, wire.size() == scoreOffset + request.scoreTokens.size() * 4);
-  CHECK(test, loadU32(wire, kFrameHeaderBytes + 27) == 0);
-  CHECK(test, loadU32(wire, kFrameHeaderBytes + 60) ==
-                  request.scoreTokens.size());
   CHECK(test, roundTrip(request) == request);
 
   RequestFrame emptyScores = request;
@@ -228,202 +334,132 @@ void testScoreRequestAndDoneLogits() {
   emptyScores.logicalMaxOutputTokens = 16;
   CHECK(test, roundTrip(emptyScores) == emptyScores);
 
-  auto expectRequestIssue = [&](RequestFrame invalid, IssueCode code) {
-    auto encoded = encodeMessage(Message{invalid});
-    CHECK(test, !encoded);
-    if (encoded.issue) {
-      CHECK(test, encoded.issue->failureClass == FailureClass::RequestError);
-      CHECK(test, encoded.issue->code == code);
-      CHECK(test, encoded.issue->requestId == invalid.requestId);
-    }
-  };
-
   RequestFrame tooFew = request;
   tooFew.scoreTokens = {32};
-  expectRequestIssue(tooFew, IssueCode::InvalidCount);
+  expectRequestIssue(test, tooFew, IssueCode::InvalidCount);
 
   RequestFrame tooMany = request;
-  tooMany.scoreTokens.resize(kMaximumScoreOptions + 1);
+  tooMany.scoreTokens.resize(ExecutionLimits::maximumScoreOptions + 1);
   for (uint32_t index = 0; index < tooMany.scoreTokens.size(); ++index)
     tooMany.scoreTokens[index] = index;
-  expectRequestIssue(tooMany, IssueCode::InvalidCount);
-
-  auto oversizedWire = wire;
-  oversizedWire.resize(scoreOffset + tooMany.scoreTokens.size() * 4);
-  storeU32(oversizedWire, kFrameHeaderBytes + 60, tooMany.scoreTokens.size());
-  storeU64(oversizedWire, 12, oversizedWire.size() - kFrameHeaderBytes);
-  for (size_t index = 0; index < tooMany.scoreTokens.size(); ++index)
-    storeU32(oversizedWire, scoreOffset + index * 4, tooMany.scoreTokens[index]);
-  auto oversizedDecoded = decodeFrame(decodeSingleFrame(oversizedWire));
-  CHECK(test, !oversizedDecoded);
-  if (oversizedDecoded.issue) {
-    CHECK(test, oversizedDecoded.issue->failureClass == FailureClass::RequestError);
-    CHECK(test, oversizedDecoded.issue->code == IssueCode::InvalidCount);
-    CHECK(test, oversizedDecoded.issue->requestId == request.requestId);
-  }
+  expectRequestIssue(test, tooMany, IssueCode::InvalidCount);
 
   RequestFrame duplicates = request;
   duplicates.scoreTokens = {32, 65, 32};
-  expectRequestIssue(duplicates, IssueCode::InvalidCount);
+  expectRequestIssue(test, duplicates, IssueCode::InvalidCount);
 
   RequestFrame withOutput = request;
   withOutput.logicalMaxOutputTokens = 8;
-  expectRequestIssue(withOutput, IssueCode::InvalidCount);
+  expectRequestIssue(test, withOutput, IssueCode::InvalidCount);
 
   RequestFrame withImage = request;
   withImage.imageSpans = {
       {0, 1, 2, 2, 0x1111222233334444ULL, 0x5555666677778888ULL}};
   withImage.imagePixels.resize(withImage.imageSpans[0].pixelBytes());
-  expectRequestIssue(withImage, IssueCode::InvalidCount);
+  expectRequestIssue(test, withImage, IssueCode::InvalidCount);
 
   RequestFrame constrained = request;
   constrained.constraint = ConstraintMode::TokenMask;
-  constrained.cohort = Cohort::Constrained;
-  expectRequestIssue(constrained, IssueCode::InvalidCohortConstraint);
+  expectRequestIssue(test, constrained, IssueCode::InvalidConstraint);
 
   RequestFrame sampling = request;
   sampling.sampling = {0.8f, 0.95f, 32};
-  sampling.cohort = Cohort::Sampling;
-  expectRequestIssue(sampling, IssueCode::InvalidSampling);
+  expectRequestIssue(test, sampling, IssueCode::InvalidSampling);
 
-  DoneEvent scored{91, FinishReason::Stop, 4096, 0, 1000, 0, 3500, {1.5f, -2.0f, 0.25f}};
-  CHECK(test, roundTrip(scored) == scored);
+  // A score request reads raw logits: it may carry any seed, and no other
+  // sampling option.
+  RequestFrame seeded = request;
+  seeded.sampling.seed = 99;
+  CHECK(test, roundTrip(seeded) == seeded);
+  RequestFrame topK = request;
+  topK.sampling.topK = 5;
+  expectRequestIssue(test, topK, IssueCode::InvalidSampling);
+  RequestFrame topP = request;
+  topP.sampling.topP = 0.9f;
+  expectRequestIssue(test, topP, IssueCode::InvalidSampling);
 
-  auto encodedDone = serializeMessage(Message{scored});
+  DoneEvent scored{91, EngineFinishReason::Stop, 4096, 0, 1000, 0, 3500,
+                   {1.5f, -2.0f, 0.25f}};
+  CHECK(test, roundTripEvent(scored) == scored);
+  auto encodedDone = serializeEvent(scored, kLimits);
   CHECK(test, encodedDone);
   if (encodedDone) {
     CHECK(test, encodedDone.value->size() == kFrameHeaderBytes + 45 + 12);
     CHECK(test, loadU32(*encodedDone.value, kFrameHeaderBytes + 41) == 3);
   }
 
-  DoneEvent generation{91, FinishReason::Length, 10, 4, 1, 2, 3, {}};
-  CHECK(test, roundTrip(generation) == generation);
+  DoneEvent generation{91, EngineFinishReason::Length, 10, 4, 1, 2, 3, {}};
+  CHECK(test, roundTripEvent(generation) == generation);
 
-  DoneEvent cancelled{91, FinishReason::Cancelled, 10, 0, 1, 0, 3, {}};
-  CHECK(test, roundTrip(cancelled) == cancelled);
-
-  auto expectDoneIssue = [&](DoneEvent invalid, IssueCode code) {
-    auto encoded = encodeMessage(Message{invalid});
-    CHECK(test, !encoded);
-    if (encoded.issue) {
-      CHECK(test, encoded.issue->failureClass == FailureClass::EngineUnhealthy);
-      CHECK(test, encoded.issue->code == code);
-    }
-  };
+  DoneEvent cancelled{91, EngineFinishReason::Cancelled, 10, 0, 1, 0, 3, {}};
+  CHECK(test, roundTripEvent(cancelled) == cancelled);
 
   DoneEvent oneLogit = scored;
   oneLogit.optionLogits = {1.0f};
-  expectDoneIssue(oneLogit, IssueCode::InvalidCount);
+  expectEventIssue(test, oneLogit, IssueCode::InvalidCount);
 
   DoneEvent nanLogit = scored;
   nanLogit.optionLogits = {1.0f, std::numeric_limits<float>::quiet_NaN()};
-  expectDoneIssue(nanLogit, IssueCode::InvalidCount);
+  expectEventIssue(test, nanLogit, IssueCode::InvalidCount);
 
   DoneEvent infLogit = scored;
   infLogit.optionLogits = {1.0f, std::numeric_limits<float>::infinity()};
-  expectDoneIssue(infLogit, IssueCode::InvalidCount);
+  expectEventIssue(test, infLogit, IssueCode::InvalidCount);
 
   DoneEvent withCompletion = scored;
   withCompletion.completionTokens = 1;
-  expectDoneIssue(withCompletion, IssueCode::InvalidCount);
+  expectEventIssue(test, withCompletion, IssueCode::InvalidCount);
 
   DoneEvent withDecode = scored;
   withDecode.decodeMicros = 5;
-  expectDoneIssue(withDecode, IssueCode::InvalidCount);
+  expectEventIssue(test, withDecode, IssueCode::InvalidCount);
 
   DoneEvent cancelledScored = scored;
-  cancelledScored.reason = FinishReason::Cancelled;
-  expectDoneIssue(cancelledScored, IssueCode::InvalidCount);
+  cancelledScored.reason = EngineFinishReason::Cancelled;
+  expectEventIssue(test, cancelledScored, IssueCode::InvalidCount);
 
   DoneEvent lengthScored = scored;
-  lengthScored.reason = FinishReason::Length;
-  expectDoneIssue(lengthScored, IssueCode::InvalidCount);
+  lengthScored.reason = EngineFinishReason::Length;
+  expectEventIssue(test, lengthScored, IssueCode::InvalidCount);
+}
 
-  if (encodedDone) {
-    auto truncated = *encodedDone.value;
-    truncated.resize(truncated.size() - 4);
-    storeU64(truncated, 12, truncated.size() - kFrameHeaderBytes);
-    auto result = decodeFrame(decodeSingleFrame(truncated));
-    CHECK(test, !result);
-    if (result.issue) {
-      CHECK(test, result.issue->failureClass == FailureClass::ProtocolFatal);
-      CHECK(test, result.issue->code == IssueCode::InvalidPayloadLength);
-    }
-
-    auto lengthWire = *encodedDone.value;
-    lengthWire[kFrameHeaderBytes + 8] =
-        static_cast<uint8_t>(FinishReason::Length);
-    auto lengthResult = decodeFrame(decodeSingleFrame(lengthWire));
-    CHECK(test, !lengthResult);
-    if (lengthResult.issue) {
-      CHECK(test,
-            lengthResult.issue->failureClass == FailureClass::ProtocolFatal);
-      CHECK(test, lengthResult.issue->code == IssueCode::InvalidCount);
-    }
+// Client frames arrive one after another on one stream; the engine's events
+// leave the same way.
+void testClientAndEventStreams() {
+  constexpr std::string_view test = "client and event streams";
+  std::vector<uint8_t> clients;
+  for (const auto &[name, message] : clientMessages()) {
+    const auto wire = peer::serialize(message);
+    clients.insert(clients.end(), wire.begin(), wire.end());
   }
-}
+  std::vector<Frame> frames = parseAll(clients, kLimits);
+  CHECK(test, frames.size() == clientMessages().size());
+  for (size_t index = 0;
+       index < std::min(frames.size(), clientMessages().size()); ++index) {
+    auto decoded = decodeFrame(std::move(frames[index]), kLimits);
+    CHECK(test, decoded && *decoded.value == clientMessages()[index].second);
+  }
 
-
-std::vector<Message> everyOtherMessage() {
-  return {
-      Message{exampleImageRequest()},
-      CancelFrame{91},
-      MaskResponseFrame{91, 7, {0xffffffffU, 0, 0xa5a5a5a5U}},
-      StatusRequestFrame{808},
-      ReadyEvent{1001, 4, 524'288, kNativeFeatureBits | FeatureVision},
-      StartEvent{91, CacheDisposition::PrefixHit, 2, 4096, 131'072},
-      PromptProgressEvent{91, 2048, 123456},
-      TokensEvent{91, 17, {10, 11, 12}},
-      MaskRequestEvent{91, 6, 4, {}},
-      MaskRequestEvent{91, 7, 4, {101, 102, 103}},
-      DoneEvent{91, FinishReason::Stop, 4096, 512, 1000, 2000, 3500},
-      ErrorEvent{FailureClass::RequestError, 91, true, "deadline_exceeded",
-                 "request deadline expired"},
-      ErrorEvent{FailureClass::EngineUnhealthy, 0, false, "gpu_fault",
-                 "Metal command buffer failed"},
-      ErrorEvent{FailureClass::ProtocolFatal, 0, false, "bad_frame",
-                 "stream framing cannot be trusted"},
-      CapacityExhaustedEvent{92, 40, 12, 50'000},
-      StatusJsonEvent{808, kStatusSchemaVersion,
-                      "{\n  \"schema_version\": 4, \"ready\": true\n}"},
-  };
-}
-
-void testEveryMessageAndMultiplexedStream() {
-  constexpr std::string_view test = "all messages and multiplexing";
-  std::vector<Message> expected = everyOtherMessage();
-  std::vector<uint8_t> stream;
-  for (const Message &message : expected) {
-    auto wire = serializeMessage(message);
+  std::vector<uint8_t> events;
+  for (const auto &[name, event] : engineEvents()) {
+    auto wire = serializeEvent(event, kLimits);
     CHECK(test, wire);
-    if (!wire)
-      continue;
-    stream.insert(stream.end(), wire.value->begin(), wire.value->end());
+    if (wire)
+      events.insert(events.end(), wire.value->begin(), wire.value->end());
   }
-
-  std::vector<Frame> frames = parseAll(stream);
-  CHECK(test, frames.size() == expected.size());
-  if (frames.size() != expected.size())
-    return;
-  for (size_t index = 0; index < frames.size(); ++index) {
-    auto decoded = decodeFrame(frames[index]);
-    CHECK(test, decoded);
-    if (decoded)
-      CHECK(test, *decoded.value == expected[index]);
-  }
+  std::vector<EngineEvent> decoded = peer::decodeEvents(events);
+  CHECK(test, decoded.size() == engineEvents().size());
+  for (size_t index = 0;
+       index < std::min(decoded.size(), engineEvents().size()); ++index)
+    CHECK(test, decoded[index] == engineEvents()[index].second);
 }
 
 void testOneByteIncrementalParsing() {
   constexpr std::string_view test = "one-byte incremental parser";
   RequestFrame request = exampleRequest();
-  auto wire = serializeMessage(Message{request});
-  CHECK(test, wire);
-  if (!wire)
-    return;
-
-  FrameParser parser;
+  FrameParser parser(kLimits);
   std::optional<Frame> frame;
-  for (uint8_t byte : *wire.value) {
+  for (uint8_t byte : peer::serialize(request)) {
     std::array<uint8_t, 1> input{byte};
     ParseStep step = parser.consume(input);
     CHECK(test, !step.issue);
@@ -437,14 +473,14 @@ void testOneByteIncrementalParsing() {
   CHECK(test, !parser.finish());
   if (!frame)
     return;
-  auto decoded = decodeFrame(*frame);
+  auto decoded = decodeFrame(std::move(*frame), kLimits);
   CHECK(test, decoded);
   if (decoded)
     CHECK(test, std::get<RequestFrame>(*decoded.value) == request);
 }
 
 ProtocolIssue parserIssue(const std::vector<uint8_t> &wire,
-                          const ProtocolLimits &limits = {}) {
+                          const ProtocolLimits &limits) {
   FrameParser parser(limits);
   size_t offset = 0;
   while (offset < wire.size()) {
@@ -463,20 +499,16 @@ ProtocolIssue parserIssue(const std::vector<uint8_t> &wire,
 
 void testLargeIncrementalFrameHasNoGeometricCapacitySlack() {
   constexpr std::string_view test = "large incremental frame storage";
-  StatusJsonEvent expected{1, kStatusSchemaVersion,
-                           "\"" + std::string(1024 * 1024 + 7, 'a') + "\""};
-  auto encoded = serializeMessage(Message{expected});
-  CHECK(test, encoded);
-  if (!encoded)
-    return;
-  FrameParser parser;
+  RequestFrame expected = exampleRequest();
+  expected.promptTokens.assign(256 * 1024 + 7, 11);
+  const std::vector<uint8_t> wire = peer::serialize(expected);
+  FrameParser parser(kLimits);
   size_t offset = 0;
   std::optional<Frame> frame;
-  while (offset < encoded.value->size()) {
-    const size_t count =
-        std::min<size_t>(64 * 1024, encoded.value->size() - offset);
-    auto step = parser.consume(
-        std::span<const uint8_t>(*encoded.value).subspan(offset, count));
+  while (offset < wire.size()) {
+    const size_t count = std::min<size_t>(64 * 1024, wire.size() - offset);
+    auto step =
+        parser.consume(std::span<const uint8_t>(wire).subspan(offset, count));
     CHECK(test, !step.issue);
     CHECK(test, step.consumedBytes == count);
     if (!step.consumedBytes)
@@ -490,27 +522,46 @@ void testLargeIncrementalFrameHasNoGeometricCapacitySlack() {
   if (!frame)
     return;
   CHECK(test, frame->payload.capacity() == frame->payload.size());
-  auto decoded = decodeFrame(*frame);
+  auto decoded = decodeFrame(std::move(*frame), kLimits);
   CHECK(test, decoded);
   if (decoded)
-    CHECK(test, std::get<StatusJsonEvent>(*decoded.value) == expected);
-  auto next = serializeMessage(Message{StatusRequestFrame{2}});
-  auto step = parser.consume(*next.value);
+    CHECK(test, std::get<RequestFrame>(*decoded.value) == expected);
+  auto step = parser.consume(peer::serialize(StatusRequestFrame{2}));
   CHECK(test, !step.issue && step.frame);
   if (step.frame)
     CHECK(test, step.frame->payload.size() == 8);
 }
 
+// A request's image pixels are most of its frame: decoding keeps them in the
+// frame's buffer instead of copying them out.
+void testImagePixelsMoveOutOfThePayload() {
+  constexpr std::string_view test = "image pixels move out of the payload";
+  RequestFrame expected = exampleImageRequest();
+  expected.imageSpans[0].gridHeight = 64;
+  expected.imageSpans[0].gridWidth = 32;
+  expected.imageSpans[0].tokens = 32 * 16;
+  expected.promptTokens.assign(expected.imageSpans[0].tokens + 2, 7);
+  expected.imagePixels.resize(expected.imageSpans[0].pixelBytes());
+  for (size_t index = 0; index < expected.imagePixels.size(); ++index)
+    expected.imagePixels[index] = static_cast<uint8_t>(index * 13 + 5);
+  CHECK(test, expected.imagePixels.size() >= 1024 * 1024);
+  Frame frame = singleFrame(peer::serialize(expected), kLimits);
+  const uint8_t *buffer = frame.payload.data();
+  auto decoded = decodeFrame(std::move(frame), kLimits);
+  CHECK(test, decoded);
+  if (!decoded)
+    return;
+  const auto &request = std::get<RequestFrame>(*decoded.value);
+  CHECK(test, request.imagePixels.data() == buffer);
+  CHECK(test, request == expected);
+}
+
 void testHeaderFailures() {
   constexpr std::string_view test = "fatal header validation";
-  auto serialized = serializeMessage(Message{exampleRequest()});
-  CHECK(test, serialized);
-  if (!serialized)
-    return;
-  const std::vector<uint8_t> valid = *serialized.value;
+  const std::vector<uint8_t> valid = peer::serialize(exampleRequest());
 
   auto expect = [&](std::vector<uint8_t> wire, IssueCode code) {
-    ProtocolIssue issue = parserIssue(wire);
+    ProtocolIssue issue = parserIssue(wire, kLimits);
     CHECK(test, issue.failureClass == FailureClass::ProtocolFatal);
     CHECK(test, issue.code == code);
   };
@@ -531,6 +582,14 @@ void testHeaderFailures() {
   storeU16(unknownType, 8, 0x7777);
   expect(std::move(unknownType), IssueCode::UnknownFrameType);
 
+  // The engine never receives the frames it sends.
+  for (const auto &[name, event] : engineEvents()) {
+    auto wire = serializeEvent(event, kLimits);
+    CHECK(test, wire);
+    if (wire)
+      expect(std::move(*wire.value), IssueCode::UnknownFrameType);
+  }
+
   auto flags = valid;
   storeU16(flags, 10, 1);
   expect(std::move(flags), IssueCode::NonZeroHeaderFlags);
@@ -550,29 +609,26 @@ void testHeaderFailures() {
   std::vector<uint8_t> invalidMagic(24, 'r');
   expect(std::move(invalidMagic), IssueCode::BadMagic);
 
-  FrameParser sticky;
+  // A caller that keeps feeding a failed parser is a bug.
+  FrameParser sticky(kLimits);
   auto corrupted = valid;
   corrupted[0] = 0;
   ParseStep first = sticky.consume(corrupted);
   CHECK(test, first.issue);
-  ParseStep second = sticky.consume(valid);
-  CHECK(test, second.issue);
-  if (second.issue) {
-    CHECK(test, second.issue->code == IssueCode::ParserAlreadyFailed);
-    CHECK(test, second.consumedBytes == 0);
+  bool refused = false;
+  try {
+    static_cast<void>(sticky.consume(valid));
+  } catch (const std::logic_error &) {
+    refused = true;
   }
+  CHECK(test, refused);
 }
 
 void testTruncationAtEveryBoundary() {
   constexpr std::string_view test = "truncation boundaries";
-  auto serialized = serializeMessage(Message{exampleRequest()});
-  CHECK(test, serialized);
-  if (!serialized)
-    return;
-  const std::vector<uint8_t> &wire = *serialized.value;
-
+  const std::vector<uint8_t> wire = peer::serialize(exampleRequest());
   for (size_t cut = 1; cut < wire.size(); ++cut) {
-    FrameParser parser;
+    FrameParser parser(kLimits);
     size_t offset = 0;
     while (offset < cut) {
       ParseStep step = parser.consume(
@@ -589,164 +645,82 @@ void testTruncationAtEveryBoundary() {
     }
   }
 
-  FrameParser empty;
+  FrameParser empty(kLimits);
   CHECK(test, !empty.finish());
-}
-
-Frame decodeSingleFrame(const std::vector<uint8_t> &wire) {
-  std::vector<Frame> frames = parseAll(wire);
-  if (frames.size() != 1) {
-    throw std::runtime_error("expected one frame");
-  }
-  return std::move(frames.front());
 }
 
 void testMalformedPayloadClassification() {
   constexpr std::string_view test = "malformed payload classification";
-  auto serialized = serializeMessage(Message{exampleRequest()});
-  CHECK(test, serialized);
-  if (!serialized)
-    return;
+  const std::vector<uint8_t> valid = peer::serialize(exampleRequest());
+  auto expect = [&](const std::vector<uint8_t> &wire, IssueCode code) {
+    auto decoded = decodeClient(wire, kLimits);
+    CHECK(test, !decoded);
+    if (decoded.issue) {
+      CHECK(test, decoded.issue->failureClass == FailureClass::RequestError);
+      CHECK(test, decoded.issue->code == code);
+    }
+  };
 
-  auto invalidPriority = *serialized.value;
-  invalidPriority[kFrameHeaderBytes + 8] = 0xff;
-  auto priorityResult = decodeFrame(decodeSingleFrame(invalidPriority));
-  CHECK(test, !priorityResult);
-  if (priorityResult.issue) {
-    CHECK(test,
-          priorityResult.issue->failureClass == FailureClass::RequestError);
-    CHECK(test, priorityResult.issue->code == IssueCode::InvalidEnumValue);
-  }
+  auto invalidPriority = valid;
+  invalidPriority[kFrameHeaderBytes + request_offset::priority] = 0xff;
+  expect(invalidPriority, IssueCode::InvalidEnumValue);
 
+  // A request error leaves the stream aligned on the next frame.
   std::vector<uint8_t> recoverableStream = invalidPriority;
-  recoverableStream.insert(recoverableStream.end(), serialized.value->begin(),
-                           serialized.value->end());
-  std::vector<Frame> recoverableFrames = parseAll(recoverableStream);
+  recoverableStream.insert(recoverableStream.end(), valid.begin(), valid.end());
+  std::vector<Frame> recoverableFrames = parseAll(recoverableStream, kLimits);
   CHECK(test, recoverableFrames.size() == 2);
   if (recoverableFrames.size() == 2) {
-    auto rejected = decodeFrame(recoverableFrames[0]);
-    auto accepted = decodeFrame(recoverableFrames[1]);
+    auto rejected = decodeFrame(std::move(recoverableFrames[0]), kLimits);
+    auto accepted = decodeFrame(std::move(recoverableFrames[1]), kLimits);
     CHECK(test, rejected.issue &&
                     rejected.issue->failureClass == FailureClass::RequestError);
     CHECK(test, accepted);
   }
 
-  auto hugePromptCount = *serialized.value;
-  storeU32(hugePromptCount, kFrameHeaderBytes + 31,
+  auto hugePromptCount = valid;
+  storeU32(hugePromptCount, kFrameHeaderBytes + request_offset::promptCount,
            std::numeric_limits<uint32_t>::max());
-  auto countResult = decodeFrame(decodeSingleFrame(hugePromptCount));
-  CHECK(test, !countResult);
-  if (countResult.issue) {
-    CHECK(test, countResult.issue->failureClass == FailureClass::RequestError);
-    CHECK(test, countResult.issue->code == IssueCode::LimitExceeded);
-  }
+  expect(hugePromptCount, IssueCode::LimitExceeded);
 
-  auto zeroDeadline = *serialized.value;
-  storeU64(zeroDeadline, kFrameHeaderBytes + 11, 0);
-  auto deadlineResult = decodeFrame(decodeSingleFrame(zeroDeadline));
-  CHECK(test, !deadlineResult);
-  if (deadlineResult.issue) {
-    CHECK(test,
-          deadlineResult.issue->failureClass == FailureClass::RequestError);
-    CHECK(test, deadlineResult.issue->code == IssueCode::InvalidDeadline);
-  }
+  // A wrong count desynchronizes the tail and fails the request.
+  auto shortScores = peer::serialize(exampleScoreRequest());
+  storeU32(shortScores, kFrameHeaderBytes + request_offset::scoreCount, 2);
+  expect(shortScores, IssueCode::InvalidPayloadLength);
 
-  auto nanSampling = *serialized.value;
-  storeU32(nanSampling, kFrameHeaderBytes + 39, 0x7fc00000U);
-  auto samplingResult = decodeFrame(decodeSingleFrame(nanSampling));
-  CHECK(test, !samplingResult);
-  if (samplingResult.issue) {
-    CHECK(test,
-          samplingResult.issue->failureClass == FailureClass::RequestError);
-    CHECK(test, samplingResult.issue->code == IssueCode::InvalidSampling);
-  }
+  auto zeroDeadline = valid;
+  storeU64(zeroDeadline, kFrameHeaderBytes + request_offset::absoluteDeadline,
+           0);
+  expect(zeroDeadline, IssueCode::InvalidDeadline);
 
-  auto mismatchedConstraint = *serialized.value;
-  mismatchedConstraint[kFrameHeaderBytes + 10] =
-      static_cast<uint8_t>(ConstraintMode::None);
-  auto cohortResult = decodeFrame(decodeSingleFrame(mismatchedConstraint));
-  CHECK(test, !cohortResult);
-  if (cohortResult.issue) {
-    CHECK(test, cohortResult.issue->failureClass == FailureClass::RequestError);
-    CHECK(test, cohortResult.issue->code == IssueCode::InvalidCohortConstraint);
-  }
+  auto returnProgress = valid;
+  returnProgress[kFrameHeaderBytes + request_offset::returnProgress] = 2;
+  expect(returnProgress, IssueCode::InvalidEnumValue);
 
-  auto tokenWire = serializeMessage(Message{TokensEvent{7, 0, {1, 2}}});
-  CHECK(test, tokenWire);
-  if (tokenWire) {
-    storeU32(*tokenWire.value, kFrameHeaderBytes + 12, 3);
-    auto result = decodeFrame(decodeSingleFrame(*tokenWire.value));
-    CHECK(test, !result);
-    if (result.issue) {
-      CHECK(test, result.issue->failureClass == FailureClass::ProtocolFatal);
-      CHECK(test, result.issue->code == IssueCode::InvalidPayloadLength);
-    }
-  }
+  auto nanSampling = valid;
+  storeU32(nanSampling, kFrameHeaderBytes + request_offset::temperature,
+           0x7fc00000U);
+  expect(nanSampling, IssueCode::InvalidSampling);
 
-  auto errorWire = serializeMessage(Message{
-      ErrorEvent{FailureClass::RequestError, 7, false, "bad", "message"}});
-  CHECK(test, errorWire);
-  if (errorWire) {
-    storeU32(*errorWire.value, kFrameHeaderBytes + 10,
-             std::numeric_limits<uint32_t>::max());
-    auto result = decodeFrame(decodeSingleFrame(*errorWire.value));
-    CHECK(test, !result);
-    if (result.issue) {
-      CHECK(test, result.issue->failureClass == FailureClass::ProtocolFatal);
-      CHECK(test, result.issue->code == IssueCode::InvalidPayloadLength);
-    }
-  }
-
-  auto statusWire = serializeMessage(Message{
-      StatusJsonEvent{0, kStatusSchemaVersion, "{\"schema_version\":4}"}});
-  CHECK(test, statusWire);
-  if (statusWire) {
-    storeU32(*statusWire.value, kFrameHeaderBytes + 8, 2);
-    auto result = decodeFrame(decodeSingleFrame(*statusWire.value));
-    CHECK(test, !result);
-    if (result.issue) {
-      CHECK(test, result.issue->failureClass == FailureClass::ProtocolFatal);
-      CHECK(test, result.issue->code == IssueCode::InvalidStatusSchema);
-    }
-  }
+  auto undefinedConstraint = valid;
+  undefinedConstraint[kFrameHeaderBytes + request_offset::constraint] = 2;
+  expect(undefinedConstraint, IssueCode::InvalidEnumValue);
 }
 
 // Every rejection of a request's prompt or image spans is that request's own
-// error, from the encoder and from the decoder that guards the native
-// process.
+// error.
 void testPromptAndImageSpanRejections() {
   constexpr std::string_view test = "prompt and image span rejections";
-  auto expectIssue = [&](const RequestFrame &invalid, IssueCode code,
-                         const ProtocolLimits &limits = {}) {
-    auto encoded = encodeMessage(Message{invalid}, limits);
-    CHECK(test, !encoded);
-    if (encoded.issue) {
-      CHECK(test, encoded.issue->failureClass == FailureClass::RequestError);
-      CHECK(test, encoded.issue->code == code);
-      CHECK(test, encoded.issue->requestId == invalid.requestId);
-    }
-  };
-  auto expectDecodeIssue = [&](const std::vector<uint8_t> &wire,
-                               IssueCode code,
-                               const ProtocolLimits &limits = {}) {
-    auto decoded = decodeFrame(decodeSingleFrame(wire), limits);
-    CHECK(test, !decoded);
-    if (decoded.issue) {
-      CHECK(test, decoded.issue->failureClass == FailureClass::RequestError);
-      CHECK(test, decoded.issue->code == code);
-      CHECK(test, decoded.issue->requestId == exampleRequest().requestId);
-    }
-  };
-
   RequestFrame empty = exampleRequest();
   empty.promptTokens.clear();
-  expectIssue(empty, IssueCode::LimitExceeded);
+  expectRequestIssue(test, empty, IssueCode::LimitExceeded);
   ProtocolLimits fourTokens;
   fourTokens.maxPromptTokens = 4;
-  expectIssue(exampleRequest(), IssueCode::LimitExceeded, fourTokens);
+  expectRequestIssue(test, exampleRequest(), IssueCode::LimitExceeded,
+                     fourTokens);
   RequestFrame wholePrompt = exampleRequest();
   wholePrompt.generationPromptTokens = wholePrompt.promptTokens.size();
-  expectIssue(wholePrompt, IssueCode::InvalidCount);
+  expectRequestIssue(test, wholePrompt, IssueCode::InvalidCount);
 
   const RequestFrame image = exampleImageRequest();
   auto withSpan = [&](auto change) {
@@ -755,111 +729,154 @@ void testPromptAndImageSpanRejections() {
     result.imagePixels.resize(result.imageSpans[0].pixelBytes());
     return result;
   };
-  expectIssue(withSpan([](ImageSpanFrame &span) { span.gridHeight = 3; }),
-              IssueCode::InvalidCount);
-  expectIssue(withSpan([](ImageSpanFrame &span) {
-                span.gridHeight = span.gridWidth = span.tokens = 0;
-              }),
-              IssueCode::InvalidCount);
-  ProtocolLimits onePatch;
-  onePatch.maxImagePatches = 1;
-  expectIssue(image, IssueCode::InvalidCount, onePatch);
-  expectIssue(withSpan([](ImageSpanFrame &span) { span.tokens = 2; }),
-              IssueCode::InvalidCount);
-  expectIssue(withSpan([](ImageSpanFrame &span) { span.offset = 3; }),
-              IssueCode::InvalidCount);
+  expectRequestIssue(test,
+                     withSpan([](ImageSpan &span) { span.gridHeight = 3; }),
+                     IssueCode::InvalidCount);
+  expectRequestIssue(test, withSpan([](ImageSpan &span) {
+                       span.gridHeight = span.gridWidth = span.tokens = 0;
+                     }),
+                     IssueCode::InvalidCount);
+  // A grid at the patch limit, and the smallest even-sided one past it, in
+  // prompts that hold their tokens.
+  auto withGrid = [&](uint32_t gridWidth) {
+    RequestFrame result = withSpan([&](ImageSpan &span) {
+      span.gridHeight = 2;
+      span.gridWidth = gridWidth;
+      span.tokens = gridWidth / 2;
+    });
+    result.promptTokens.resize(1 + result.imageSpans[0].tokens, 7);
+    return result;
+  };
+  const RequestFrame largest = withGrid(splash::ops::kMaximumImagePatches / 2);
+  CHECK(test, roundTrip(largest) == largest);
+  expectRequestIssue(test, withGrid(splash::ops::kMaximumImagePatches / 2 + 2),
+                     IssueCode::InvalidCount);
+  // A grid whose patch count would wrap to zero in 32 bits, as its pixel
+  // bytes do in 64, with no tokens or pixels.
+  const RequestFrame wrapped = withSpan([](ImageSpan &span) {
+    span.gridHeight = span.gridWidth = 1U << 28;
+    span.tokens = 0;
+  });
+  CHECK(test, wrapped.imagePixels.empty());
+  expectRequestIssue(test, wrapped, IssueCode::InvalidCount);
+  expectRequestIssue(test, withSpan([](ImageSpan &span) { span.tokens = 2; }),
+                     IssueCode::InvalidCount);
+  expectRequestIssue(test, withSpan([](ImageSpan &span) { span.offset = 3; }),
+                     IssueCode::InvalidCount);
   RequestFrame overlapping = image;
   overlapping.imageSpans.push_back(image.imageSpans[0]);
   overlapping.imagePixels.resize(2 * image.imagePixels.size());
-  expectIssue(overlapping, IssueCode::InvalidCount);
+  expectRequestIssue(test, overlapping, IssueCode::InvalidCount);
   RequestFrame shortPixels = image;
   shortPixels.imagePixels.pop_back();
-  expectIssue(shortPixels, IssueCode::InvalidCount);
+  expectRequestIssue(test, shortPixels, IssueCode::InvalidPayloadLength);
   RequestFrame twoImages = overlapping;
   twoImages.imageSpans[0].offset = 0;
+  CHECK(test, roundTrip(twoImages) == twoImages);
   ProtocolLimits oneImage;
   oneImage.maxImageSpans = 1;
-  CHECK(test, encodeMessage(Message{twoImages}));
-  expectIssue(twoImages, IssueCode::LimitExceeded, oneImage);
+  expectRequestIssue(test, twoImages, IssueCode::LimitExceeded, oneImage);
+}
 
-  auto serialized = serializeMessage(Message{exampleRequest()});
-  auto imageWire = serializeMessage(Message{image});
-  CHECK(test, serialized && imageWire);
-  if (!serialized || !imageWire)
-    return;
-  // Only the fixed fields and the prompt tokens: drop the tokens.
-  auto emptyWire = *serialized.value;
-  emptyWire.resize(kFrameHeaderBytes + 72);
-  storeU32(emptyWire, kFrameHeaderBytes + 31, 0);
-  storeU64(emptyWire, 12, 72);
-  expectDecodeIssue(emptyWire, IssueCode::LimitExceeded);
-  auto wholePromptWire = *serialized.value;
-  storeU32(wholePromptWire, kFrameHeaderBytes + 64,
-           wholePrompt.generationPromptTokens);
-  expectDecodeIssue(wholePromptWire, IssueCode::InvalidCount);
-  const size_t spanOffset =
-      kFrameHeaderBytes + 72 + image.promptTokens.size() * 4;
-  auto tokensWire = *imageWire.value;
-  storeU32(tokensWire, spanOffset + 4, 2);
-  expectDecodeIssue(tokensWire, IssueCode::InvalidCount);
-  expectDecodeIssue(*imageWire.value, IssueCode::InvalidCount, onePatch);
-  auto outsideWire = *imageWire.value;
-  storeU32(outsideWire, spanOffset, 3);
-  expectDecodeIssue(outsideWire, IssueCode::InvalidCount);
+// The sampling parameters are one block after the image span count:
+// temperature, top_p, top_k, the presence, frequency and repetition
+// penalties, min_p and the seed. A request takes any top_k and is refused a
+// subnormal temperature, a penalty or a min_p outside its range, and as a
+// score request anything but the defaults.
+void testSamplingBlock() {
+  constexpr std::string_view test = "sampling block";
+  RequestFrame request = exampleRequest();
+  CHECK(test, roundTrip(request) == request);
+
+  auto expectInvalid = [&](const RequestFrame &invalid) {
+    expectRequestIssue(test, invalid, IssueCode::InvalidSampling);
+  };
+  constexpr float nan = std::numeric_limits<float>::quiet_NaN();
+  constexpr float inf = std::numeric_limits<float>::infinity();
+  constexpr float normalMinimum = std::numeric_limits<float>::min();
+  // The kernels divide by a sampling temperature, and Metal flushes a
+  // subnormal one to zero.
+  for (const float temperature :
+       {std::numeric_limits<float>::denorm_min(), 1e-40f,
+        std::nextafter(normalMinimum, 0.0f), -1.0f, nan, inf}) {
+    RequestFrame invalid = request;
+    invalid.sampling.temperature = temperature;
+    expectInvalid(invalid);
+  }
+  for (const float temperature : {normalMinimum, 0.0f, -0.0f}) {
+    RequestFrame valid = request;
+    valid.sampling.temperature = temperature;
+    CHECK(test, roundTrip(valid) == valid);
+  }
+  for (const float penalty : {-2.01f, 2.01f, nan, -inf}) {
+    RequestFrame presence = request;
+    presence.sampling.presencePenalty = penalty;
+    expectInvalid(presence);
+    RequestFrame frequency = request;
+    frequency.sampling.frequencyPenalty = penalty;
+    expectInvalid(frequency);
+  }
+  for (const float repetition : {0.0f, -0.0f, -1.0f, nan, inf}) {
+    RequestFrame invalid = request;
+    invalid.sampling.repetitionPenalty = repetition;
+    expectInvalid(invalid);
+  }
+  for (const float minP : {-0.01f, 1.01f, nan, inf, -inf}) {
+    RequestFrame invalid = request;
+    invalid.sampling.minP = minP;
+    expectInvalid(invalid);
+  }
+  // The limits themselves, the smallest and largest repetition, min_p's 0
+  // and 1, and any top_k, 0 keeping every token.
+  for (const SamplingParameters limit :
+       {SamplingParameters{0.8f, 0.95f, 32, -2.0f, 2.0f,
+                           std::numeric_limits<float>::denorm_min(), 0.0f},
+        SamplingParameters{0.8f, 0.95f, 32, 2.0f, -2.0f,
+                           std::numeric_limits<float>::max(), 1.0f},
+        SamplingParameters{0.8f, 0.95f, 0}, SamplingParameters{0.8f, 1.0f, 1000},
+        SamplingParameters{1.0f, 0.9f, 0xffffffffU}}) {
+    RequestFrame valid = request;
+    valid.sampling = limit;
+    CHECK(test, roundTrip(valid) == valid);
+  }
+
+  // Greedy requests carry penalties and min_p too; score requests carry
+  // none.
+  RequestFrame greedy = exampleScoreRequest();
+  greedy.scoreTokens.clear();
+  greedy.logicalMaxOutputTokens = 16;
+  greedy.sampling.presencePenalty = 1.5f;
+  greedy.sampling.minP = 0.1f;
+  CHECK(test, roundTrip(greedy) == greedy);
+  for (size_t field = 0; field < 4; ++field) {
+    RequestFrame score = exampleScoreRequest();
+    float *values[] = {&score.sampling.presencePenalty,
+                       &score.sampling.frequencyPenalty,
+                       &score.sampling.repetitionPenalty,
+                       &score.sampling.minP};
+    *values[field] += 0.5f;
+    expectInvalid(score);
+  }
 }
 
 // The flags word follows the generation prompt count. Unconstrained
 // generation can ignore end-of-sequence; an undefined bit, or that flag on a
-// constrained or score request, is the request's own error from the encoder
-// and from the decoder that guards the native process.
+// constrained or score request, is the request's own error.
 void testRequestFlags() {
   constexpr std::string_view test = "request flags";
-  RequestFrame request = exampleRequest();
-  request.cohort = Cohort::Sampling;
-  request.constraint = ConstraintMode::None;
-  request.flags = RequestIgnoreEndOfSequence;
-  auto serialized = serializeMessage(Message{request});
-  CHECK(test, serialized);
-  if (!serialized)
-    return;
-  CHECK(test, loadU32(*serialized.value, kFrameHeaderBytes + 68) ==
-                  RequestIgnoreEndOfSequence);
+  RequestFrame request = exampleIgnoreEosRequest();
   CHECK(test, roundTrip(request) == request);
-
-  auto expectIssue = [&](const RequestFrame &invalid, IssueCode code) {
-    auto encoded = encodeMessage(Message{invalid});
-    CHECK(test, !encoded);
-    if (encoded.issue) {
-      CHECK(test, encoded.issue->failureClass == FailureClass::RequestError);
-      CHECK(test, encoded.issue->code == code);
-      CHECK(test, encoded.issue->requestId == invalid.requestId);
-    }
-    RequestFrame valid = invalid;
-    valid.flags = 0;
-    auto wire = serializeMessage(Message{valid});
-    CHECK(test, wire);
-    if (!wire)
-      return;
-    storeU32(*wire.value, kFrameHeaderBytes + 68, invalid.flags);
-    auto decoded = decodeFrame(decodeSingleFrame(*wire.value));
-    CHECK(test, !decoded);
-    if (decoded.issue) {
-      CHECK(test, decoded.issue->failureClass == FailureClass::RequestError);
-      CHECK(test, decoded.issue->code == code);
-      CHECK(test, decoded.issue->requestId == invalid.requestId);
-    }
-  };
   for (const uint32_t flags : {1U << 1, 1U << 31, 0xffffffffU}) {
     RequestFrame undefined = request;
     undefined.flags = flags;
-    expectIssue(undefined, IssueCode::InvalidEnumValue);
+    expectRequestIssue(test, undefined, IssueCode::InvalidEnumValue);
   }
   RequestFrame constrained = exampleRequest();
   constrained.flags = RequestIgnoreEndOfSequence;
-  expectIssue(constrained, IssueCode::InvalidCohortConstraint);
+  expectRequestIssue(test, constrained, IssueCode::InvalidConstraint);
   RequestFrame score = exampleScoreRequest();
   score.flags = RequestIgnoreEndOfSequence;
-  expectIssue(score, IssueCode::InvalidCohortConstraint);
+  expectRequestIssue(test, score, IssueCode::InvalidConstraint);
 }
 
 std::string jsonOfExactSize(size_t bytes) {
@@ -868,45 +885,37 @@ std::string jsonOfExactSize(size_t bytes) {
   return "{\"x\":\"" + std::string(bytes - 8, 'a') + "\"}";
 }
 
-void testBoundedArbitraryStatusJson() {
-  constexpr std::string_view test = "bounded arbitrary status JSON";
+// The status JSON is opaque and only its size is bounded; a client frame over
+// the frame limit is refused at its header.
+void testBoundedArbitraryStatusJsonAndFrames() {
+  constexpr std::string_view test = "bounded status JSON and frames";
   ProtocolLimits limits;
   limits.maxFramePayloadBytes = 128 * 1024;
-  limits.maxStatusJsonBytes = limits.maxFramePayloadBytes - 12;
+  limits.maxStatusJsonBytes = limits.maxFramePayloadBytes - 8;
   limits.maxErrorStringBytes = 1024;
-  limits.maxPromptTokens = 1024;
-  limits.maxTokenBatch = 128;
-  limits.maxSimulationTokens = 8;
-  limits.maxMaskWords = 4096;
-
   StatusJsonEvent maximum{
-      99, kStatusSchemaVersion,
-      jsonOfExactSize(static_cast<size_t>(limits.maxStatusJsonBytes))};
-  StatusJsonEvent decoded = roundTrip(maximum, limits);
-  CHECK(test, decoded == maximum);
+      99, jsonOfExactSize(static_cast<size_t>(limits.maxStatusJsonBytes))};
+  auto encoded = serializeEvent(maximum, limits);
+  CHECK(test, encoded);
+  if (encoded) {
+    std::vector<EngineEvent> decoded = peer::decodeEvents(*encoded.value);
+    CHECK(test, decoded.size() == 1 && decoded.front() == EngineEvent{maximum});
+  }
 
   StatusJsonEvent tooLarge = maximum;
   tooLarge.json.push_back(' ');
-  auto rejected = serializeMessage(Message{tooLarge}, limits);
-  CHECK(test, !rejected);
-  if (rejected.issue) {
-    CHECK(test, rejected.issue->failureClass == FailureClass::EngineUnhealthy);
-    CHECK(test, rejected.issue->code == IssueCode::LimitExceeded);
-  }
+  expectEventIssue(test, tooLarge, IssueCode::LimitExceeded, limits);
+  expectEventIssue(test, StatusJsonEvent{1, ""}, IssueCode::LimitExceeded,
+                   limits);
 
-  auto normalWire = serializeMessage(
-      Message{StatusJsonEvent{1, kStatusSchemaVersion, jsonOfExactSize(4096)}});
-  CHECK(test, normalWire);
-  if (normalWire) {
-    ProtocolLimits tiny = limits;
-    tiny.maxStatusJsonBytes = 100;
-    ProtocolIssue issue = parserIssue(*normalWire.value, tiny);
-    CHECK(test, issue.failureClass == FailureClass::ProtocolFatal);
-    CHECK(test, issue.code == IssueCode::FrameTooLarge);
-  }
+  RequestFrame oversized = exampleRequest();
+  oversized.promptTokens.assign(limits.maxFramePayloadBytes / 4, 7);
+  ProtocolIssue issue = parserIssue(peer::serialize(oversized), limits);
+  CHECK(test, issue.failureClass == FailureClass::ProtocolFatal);
+  CHECK(test, issue.code == IssueCode::FrameTooLarge);
 }
 
-void testFailureTaxonomyAndCapacityEvent() {
+void testFailureTaxonomy() {
   constexpr std::string_view test = "failure taxonomy";
   for (ErrorEvent expected : {
            ErrorEvent{FailureClass::RequestError, 5, true, "busy",
@@ -916,8 +925,7 @@ void testFailureTaxonomyAndCapacityEvent() {
            ErrorEvent{FailureClass::ProtocolFatal, 0, false, "framing_error",
                       "close stream"},
        }) {
-    ErrorEvent decoded = roundTrip(expected);
-    CHECK(test, decoded == expected);
+    CHECK(test, roundTripEvent(expected) == expected);
   }
 
   CHECK(test, !connectionMustClose(FailureClass::RequestError));
@@ -926,93 +934,35 @@ void testFailureTaxonomyAndCapacityEvent() {
 
   RequestFrame invalid = exampleRequest();
   invalid.sampling.topP = 0.0f;
-  auto requestIssue = serializeMessage(Message{invalid});
-  CHECK(test, !requestIssue);
-  if (requestIssue.issue) {
-    CHECK(test, requestIssue.issue->failureClass == FailureClass::RequestError);
-  }
+  expectRequestIssue(test, invalid, IssueCode::InvalidSampling);
 
-  auto unhealthy = serializeMessage(Message{ReadyEvent{0, 4, 4096, 0}});
-  CHECK(test, !unhealthy);
-  if (unhealthy.issue) {
-    CHECK(test, unhealthy.issue->failureClass == FailureClass::EngineUnhealthy);
-  }
-
-  CapacityExhaustedEvent capacity{8, 24, 3, 100'000};
-  CHECK(test, roundTrip(capacity) == capacity);
-
-  TokensEvent overflow{8, std::numeric_limits<uint32_t>::max(), {1}};
-  auto overflowResult = serializeMessage(Message{overflow});
-  CHECK(test, !overflowResult);
-  if (overflowResult.issue) {
-    CHECK(test,
-          overflowResult.issue->failureClass == FailureClass::EngineUnhealthy);
-    CHECK(test, overflowResult.issue->code == IssueCode::IntegerOverflow);
-  }
+  expectEventIssue(test, ReadyEvent{0, 4096, false}, IssueCode::InvalidCount);
+  expectEventIssue(test, StartEvent{8, ExecutionLimits::maximumBatchWidth, 0},
+                   IssueCode::InvalidCount);
+  expectEventIssue(test,
+                   TokensEvent{8, std::numeric_limits<uint32_t>::max(), {1}},
+                   IssueCode::IntegerOverflow);
+  expectEventIssue(test,
+                   ErrorEvent{FailureClass::RequestError, 0, false, "bad", ""},
+                   IssueCode::InvalidErrorClassification);
 }
 
-void testOverflowLimitsAndOuterTruncation() {
-  constexpr std::string_view test = "overflow limits and outer truncation";
+void testInvalidLimitsAndOuterTruncation() {
+  constexpr std::string_view test = "invalid limits and outer truncation";
   ProtocolLimits invalid;
   invalid.maxFramePayloadBytes = std::numeric_limits<uint64_t>::max();
-  FrameParser parser(invalid);
-  CHECK(test, parser.failed());
-  ParseStep step = parser.consume({});
-  CHECK(test, step.issue);
-  if (step.issue) {
-    CHECK(test, step.issue->code == IssueCode::ParserAlreadyFailed);
+  const std::optional<ProtocolIssue> refused = validateLimits(invalid);
+  CHECK(test, refused);
+  if (refused) {
+    CHECK(test, refused->failureClass == FailureClass::ProtocolFatal);
+    CHECK(test, refused->code == IssueCode::LimitExceeded);
   }
 
-  auto invalidEncode = serializeMessage(Message{exampleRequest()}, invalid);
-  CHECK(test, !invalidEncode);
-  if (invalidEncode.issue) {
-    CHECK(test,
-          invalidEncode.issue->failureClass == FailureClass::ProtocolFatal);
-    CHECK(test, invalidEncode.issue->code == IssueCode::LimitExceeded);
-  }
-
-  ProtocolLimits tight;
-  tight.maxFramePayloadBytes = 1024;
-  tight.maxStatusJsonBytes = 100;
-  tight.maxErrorStringBytes = 700;
-  tight.maxPromptTokens = 1000;
-  tight.maxLogicalOutputTokens = 1000;
-  tight.maxTokenBatch = 16;
-  tight.maxSimulationTokens = 4;
-  tight.maxMaskWords = 64;
-
-  ErrorEvent oversizedEvent{FailureClass::EngineUnhealthy, 0, false,
-                            std::string(700, 'c'), std::string(700, 'm')};
-  auto oversizedEventResult = encodeMessage(Message{oversizedEvent}, tight);
-  CHECK(test, !oversizedEventResult);
-  if (oversizedEventResult.issue) {
-    CHECK(test, oversizedEventResult.issue->failureClass ==
-                    FailureClass::EngineUnhealthy);
-    CHECK(test, oversizedEventResult.issue->code == IssueCode::FrameTooLarge);
-  }
-
-  RequestFrame oversizedRequest = exampleRequest();
-  oversizedRequest.logicalMaxOutputTokens = 100;
-  oversizedRequest.promptTokens.assign(300, 7);
-  auto oversizedRequestResult = encodeMessage(Message{oversizedRequest}, tight);
-  CHECK(test, !oversizedRequestResult);
-  if (oversizedRequestResult.issue) {
-    CHECK(test, oversizedRequestResult.issue->failureClass ==
-                    FailureClass::RequestError);
-    CHECK(test, oversizedRequestResult.issue->code == IssueCode::FrameTooLarge);
-    CHECK(test, oversizedRequestResult.issue->requestId ==
-                    oversizedRequest.requestId);
-  }
-
-  auto serialized = serializeMessage(Message{exampleRequest()});
-  CHECK(test, serialized);
-  if (serialized) {
-    auto claimsOneMore = *serialized.value;
-    storeU64(claimsOneMore, 12, loadU64(claimsOneMore, 12) + 1);
-    ProtocolIssue issue = parserIssue(claimsOneMore);
-    CHECK(test, issue.code == IssueCode::TruncatedFrame);
-    CHECK(test, issue.failureClass == FailureClass::ProtocolFatal);
-  }
+  auto claimsOneMore = peer::serialize(exampleRequest());
+  storeU64(claimsOneMore, 12, loadU64(claimsOneMore, 12) + 1);
+  ProtocolIssue issue = parserIssue(claimsOneMore, kLimits);
+  CHECK(test, issue.code == IssueCode::TruncatedFrame);
+  CHECK(test, issue.failureClass == FailureClass::ProtocolFatal);
 }
 
 void testFuzzLikeInputsAndMutations() {
@@ -1025,75 +975,85 @@ void testFuzzLikeInputsAndMutations() {
     for (uint8_t &byte : bytes)
       byte = static_cast<uint8_t>(random());
 
-    FrameParser parser;
+    FrameParser parser(kLimits);
     size_t offset = 0;
     uint32_t steps = 0;
-    while (offset < bytes.size() && !parser.failed()) {
+    bool failed = false;
+    while (offset < bytes.size() && !failed) {
       size_t chunk = std::min<size_t>(1 + random() % 31, bytes.size() - offset);
       ParseStep step = parser.consume(
           std::span<const uint8_t>(bytes.data() + offset, chunk));
       CHECK(test, step.consumedBytes <= chunk);
-      if (!step.consumedBytes && !step.issue) {
+      failed = step.issue.has_value();
+      if (!step.consumedBytes && !failed) {
         CHECK(test, false);
         break;
       }
       offset += step.consumedBytes;
       if (step.frame) {
-        static_cast<void>(decodeFrame(*step.frame));
+        static_cast<void>(decodeFrame(std::move(*step.frame), kLimits));
       }
       if (++steps > 1024) {
         CHECK(test, false);
         break;
       }
     }
-    static_cast<void>(parser.finish());
+    if (!failed)
+      static_cast<void>(parser.finish());
   }
 
-  auto valid = serializeMessage(Message{exampleRequest()});
-  CHECK(test, valid);
-  if (!valid)
-    return;
+  const std::vector<uint8_t> valid = peer::serialize(exampleRequest());
   for (uint32_t iteration = 0; iteration < 2000; ++iteration) {
-    std::vector<uint8_t> mutated = *valid.value;
+    std::vector<uint8_t> mutated = valid;
     size_t mutations = 1 + random() % 4;
     for (size_t count = 0; count < mutations; ++count) {
       mutated[random() % mutated.size()] = static_cast<uint8_t>(random());
     }
-    FrameParser parser;
+    FrameParser parser(kLimits);
     size_t offset = 0;
-    while (offset < mutated.size() && !parser.failed()) {
+    bool failed = false;
+    while (offset < mutated.size() && !failed) {
       ParseStep step =
           parser.consume(std::span<const uint8_t>(mutated).subspan(offset));
-      if (!step.consumedBytes && !step.issue) {
+      failed = step.issue.has_value();
+      if (!step.consumedBytes && !failed) {
         CHECK(test, false);
         break;
       }
       offset += step.consumedBytes;
       if (step.frame) {
-        static_cast<void>(decodeFrame(*step.frame));
+        static_cast<void>(decodeFrame(std::move(*step.frame), kLimits));
       }
     }
-    static_cast<void>(parser.finish());
+    if (!failed)
+      static_cast<void>(parser.finish());
   }
 }
 
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
+  if (argc != 2) {
+    std::cerr << "usage: " << argv[0] << " protocol_golden.txt\n";
+    return 2;
+  }
   try {
-    testRequestWireAndRoundTrip();
+    testGoldenVectors(argv[1]);
+    testRequestRoundTrip();
     testScoreRequestAndDoneLogits();
-    testEveryMessageAndMultiplexedStream();
+    testClientAndEventStreams();
     testOneByteIncrementalParsing();
     testLargeIncrementalFrameHasNoGeometricCapacitySlack();
+    testImagePixelsMoveOutOfThePayload();
     testHeaderFailures();
     testTruncationAtEveryBoundary();
     testMalformedPayloadClassification();
     testPromptAndImageSpanRejections();
+    testSamplingBlock();
     testRequestFlags();
-    testBoundedArbitraryStatusJson();
-    testFailureTaxonomyAndCapacityEvent();
-    testOverflowLimitsAndOuterTruncation();
+    testBoundedArbitraryStatusJsonAndFrames();
+    testFailureTaxonomy();
+    testInvalidLimitsAndOuterTruncation();
     testFuzzLikeInputsAndMutations();
   } catch (const std::exception &error) {
     ++failures;

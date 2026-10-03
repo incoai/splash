@@ -1,3 +1,4 @@
+#include "TestBuffers.hpp"
 #include "model/GgufImageLayout.hpp"
 #include "model/ModelFactory.hpp"
 #include "model/PreparedFiles.hpp"
@@ -46,6 +47,7 @@ using splash::model::weightManifestFingerprint;
 using splash::metal::BufferStorage;
 using splash::metal::MetalBackend;
 using splash::metal::MetalBuffer;
+using splash::test::sharedBuffer;
 
 constexpr std::string_view kDraftLayerMagic = "MDFD0004";
 constexpr std::string_view kGgufImageMagic = "MDGG0001";
@@ -389,15 +391,6 @@ void testWeightFileValidationAndLifetime(MetalBackend &backend,
                 "GPU read of retained mapped weights was incorrect");
         requireCleanFileMapping(mappedAddress);
     }
-    // The file object is gone but its weights are not: the base is still
-    // kept resident, so keeping it again throws.
-    bool kept = false;
-    try {
-        backend.keepResident(retained);
-    } catch (const splash::metal::MetalBackendError &) {
-        kept = true;
-    }
-    require(kept, "mapped weights were not kept resident");
     retained = MetalBuffer{};
     require(backend.memoryStats().allocatedBytes == baseline,
             "released mapped buffer remains in backend accounting");
@@ -449,7 +442,7 @@ void testWeightFileValidationAndLifetime(MetalBackend &backend,
         [&] {
             WeightFile truncated(
                 backend, validPath, "test/valid.bin", "TEST0001", 7, 9);
-            (void)truncated.section(fileBytes);
+            (void)truncated.section(fileBytes, {});
         },
         "truncated packed section was accepted");
 
@@ -460,7 +453,7 @@ void testWeightFileValidationAndLifetime(MetalBackend &backend,
         [&] {
             WeightFile extra(
                 backend, extraPath, "test/extra.bin", "TEST0001", 1, 2);
-            (void)extra.section(64);
+            (void)extra.section(64, {});
             extra.finish();
         },
         "unconsumed packed bytes were accepted");
@@ -570,9 +563,9 @@ void testGgufImageLayout(MetalBackend &backend, const std::filesystem::path &roo
     const auto table = splash::model::readBlockEmbedding(file, rows, columns, "embedding");
     file.finish();
     constexpr uint32_t gathered = 8;
-    const MetalBuffer tokens = backend.allocateBuffer(gathered * sizeof(uint32_t), BufferStorage::Shared);
+    const MetalBuffer tokens = sharedBuffer(backend, gathered * sizeof(uint32_t));
     const MetalBuffer output =
-        backend.allocateBuffer(uint64_t{gathered} * columns * splash::model::kBFloat16Bytes, BufferStorage::Shared);
+        sharedBuffer(backend, uint64_t{gathered} * columns * splash::model::kBFloat16Bytes);
     splash::metal::CommandGraph graph;
     splash::ops::Embedding::add(graph, tokens, table, output, gathered);
     for (const auto &[tokenBytes, outputBytes] :
@@ -724,7 +717,7 @@ void testSyntheticPackage(MetalBackend &backend,
         auto package = loadModelPackage(
             backend, root,
             makeModelDescriptor("Qwen dense loader oracle", target, draft,
-                                vision));
+                                vision), {});
         const auto &loadedTarget = std::get<Qwen3_8Weights>(package.target);
         require(loadedTarget.layers.size() == target.layers,
                 "target layer vector is incomplete");
@@ -814,7 +807,7 @@ void validateRealPackage(MetalBackend &backend,
     std::string fingerprint;
     std::string name;
     {
-        auto package = loadModelPackage(backend, root);
+        auto package = loadModelPackage(backend, root, splash::model::inspectModelPackage(root), {});
         targetBytes = declaredBytes(package.targetFiles());
         draftBytes = declaredBytes(package.draft.files);
         visionBytes = declaredBytes(package.vision.files);

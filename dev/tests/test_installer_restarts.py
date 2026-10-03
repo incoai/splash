@@ -212,7 +212,7 @@ class InstallerRestartsTest(unittest.TestCase):
         ):
             upstream.prepare(chosen)
         weights = self.root / "weights"
-        (weights / "verified").mkdir(parents=True)
+        (weights / "verified-v3").mkdir(parents=True)
 
         def entry(key, component, inputs=None):
             data = b"draft" if component.startswith("draft/") else b"data"

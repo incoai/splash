@@ -4,7 +4,6 @@
 
 #include <cstdint>
 #include <functional>
-#include <mutex>
 #include <optional>
 
 namespace splash::engine {
@@ -30,8 +29,7 @@ struct HostMemoryPages {
 // carve-out, tag storage) is never available. The governor also enforces
 // the engine budget, host reserve and system pressure.
 [[nodiscard]] uint64_t estimateHostAvailableMemory(
-    const HostMemoryPages &pages, uint64_t pageSize,
-    bool compression = false) noexcept;
+    const HostMemoryPages &pages, uint64_t pageSize, bool compression) noexcept;
 // The live estimate, counting compression unless macOS reports critical
 // memory pressure (or none): a Mac that uses its compressor as designed keeps
 // serving, the credit shrinking as the anonymous pages it counts are
@@ -62,20 +60,19 @@ memoryPressureName(MemoryPressure pressure) noexcept {
 [[nodiscard]] std::optional<MemoryPressure> querySystemMemoryPressure() noexcept;
 
 // Allocation and recovery use separate watermarks to avoid oscillation.
-// Low availability causes paced reclaim; unavailable telemetry pauses growth;
-// the OS critical signal causes full eviction of unpinned cache entries.
+// Low availability causes paced reclaim and pauses growth that no request in
+// service needs; unavailable telemetry does the same; the OS critical signal
+// causes full eviction of unpinned cache entries and stops all growth.
 inline constexpr uint64_t kHostWarningMarginBytes = 1ULL << 30;
 inline constexpr uint64_t kHostRecoveryMarginBytes = 2ULL << 30;
 
 struct MemoryGovernorSnapshot {
   uint64_t limitBytes = 0;
-  // Charged against the limit: the backend's resident buffers plus the
+  // Charged against the limit: the backend's allocated buffers plus the
   // untracked reserve, or the device's allocation when that is larger.
-  uint64_t observedResidentBytes = 0;
-  // The observed resident bytes once warmup released all but one lane's
-  // state and the KV runway (markServingFootprint); zero until then.
-  uint64_t servingFootprintBytes = 0;
-  uint64_t reservedBytes = 0;
+  uint64_t chargedBytes = 0;
+  // Room under the limit beside what is charged and reserved: zero once the
+  // engine's limit is reached.
   uint64_t headroomBytes = 0;
   MemoryPressure pressure = MemoryPressure::Normal;
   // Failed reservation attempts, including retries of the same request.
@@ -85,30 +82,34 @@ struct MemoryGovernorSnapshot {
   uint64_t hostReserveBytes = 0;
   uint64_t hostHeadroomBytes = 0;
   MemoryPressure systemPressure = MemoryPressure::Normal;
-  bool growthAllowed = true;
-  // Whether the host has room for growth beyond the serving footprint.
-  // Growth back to that footprint needs only the host's reserve, so
-  // tryReserve can grant it while this is false.
+  // Whether the host has room for growth that no request in service needs.
+  // Admission still grants what such a request needs while this is false,
+  // short of critical pressure. Allocation need not ask: admission names
+  // the host as the cause of every refusal the host shares.
   bool hostGrowthAllowed = true;
 };
 
+// Critical pressure evicts every unpinned entry and takes what a request
+// starts from, one lane's pooled state buffers and the empty KV runway
+// extent, so it has no target. Every other pass keeps those, since growth is
+// paused; targetBytes zero returns only empty extents. keepResumePoint keeps
+// the newest state publication (else the newest checkpoint), the point a
+// follow-up request resumes from; only a shrink nothing waits for can afford
+// to.
 struct MemoryReclaimDirective {
-  bool reclaimEmptyKvExtents = false;
-  bool evictAllUnpinnedPrefixes = false;
+  bool critical = false;
   uint64_t targetBytes = 0;
-  // Keep the newest state publication, the point a follow-up request resumes
-  // from. Only a shrink that nothing is waiting for can afford to.
   bool keepResumePoint = false;
 };
 
 // What a reclaim pass made of its directive's target.
 enum class ReclaimOutcome : uint8_t {
-  // The directive set none; the pass returned only empty backing.
+  // The directive set none; the pass returned only empty extents.
   Untargeted,
   // Released, counting the pages whose copies are being written.
   Met,
-  // Transfers or a release in flight hold back the rest, which a pass can
-  // take once they land.
+  // Transfers in flight hold back the rest, which a pass can take once they
+  // land.
   Pending,
   // Nothing is left to release.
   Exhausted,
@@ -123,9 +124,10 @@ struct MemoryReclaimResult {
 // pressure is never offset by bytes reclaimed earlier in the same episode.
 class MemoryPressurePolicy final {
 public:
-  // requestWaiting reports whether a request cannot proceed for want of
-  // memory. Without one the pass is speculative and keeps the resume point.
-  [[nodiscard]] MemoryReclaimDirective
+  // The pass to run now; none under normal pressure. requestWaiting reports
+  // whether a request cannot proceed for want of memory. Without one the
+  // pass is speculative and keeps the resume point.
+  [[nodiscard]] std::optional<MemoryReclaimDirective>
   update(const MemoryGovernorSnapshot &snapshot, double nowMilliseconds,
          bool requestWaiting) noexcept;
   // What the pass of `directive` achieved. The passes up to the next
@@ -139,25 +141,60 @@ private:
   std::optional<MemoryReclaimDirective> continued_;
 };
 
-// The sole physical-memory admission ledger. It does not allocate, evict, or
+// The sole memory admission ledger. It does not allocate, evict, or
 // schedule work; it only gives a short-lived byte reservation to a caller that
-// is about to commit a placement heap. That keeps policy out of MetalBackend
-// and makes every growth operation transactional.
+// is about to allocate Metal memory. That keeps policy out of MetalBackend
+// and makes every growth operation transactional. Single-threaded: startup,
+// the engine and the control pass all run on the native loop thread; nothing
+// here is synchronized.
 class MemoryGovernor final {
 public:
   using HostAvailableMemoryProvider =
       std::function<std::optional<uint64_t>()>;
 
+  // Metal memory outside the backend's buffers (pipelines, driver
+  // allocations) is charged only beyond untrackedReserveBytes, the part of
+  // the limit the caller has set aside for it.
+  MemoryGovernor(metal::MetalBackend &backend, uint64_t limitBytes,
+                 uint64_t hostReserveBytes,
+                 HostAvailableMemoryProvider hostAvailableMemory,
+                 uint64_t untrackedReserveBytes);
+
+  // The only way to reserve memory. Low-level storage/model components
+  // receive only this transactional callback, so allocation stays governed
+  // without introducing a reverse dependency on engine policy. It reserves
+  // the bytes under the limit and the host's headroom while the allocation
+  // runs, or refuses them with the cause: HostPressure when the host refuses,
+  // whether or not the limit does too, and EngineBudget when only the limit
+  // does. The host refuses under critical pressure and, unless a request in
+  // service needs the bytes (setServing), inside the warning margin or while
+  // it holds for the recovery margin.
+  [[nodiscard]] metal::AllocationAdmission allocationAdmission() noexcept;
+  // Marks the reservations that follow as memory a request in service needs,
+  // until it is cleared. The host's margins do not refuse those: holding
+  // them back would strand the request and the memory it already has, while
+  // the cache it could give up instead is what the paced reclaim returns.
+  // The limit and critical pressure refuse them like any other.
+  void setServing(bool serving) noexcept;
+  void setPressure(MemoryPressure pressure) noexcept;
+  // The outcome of the engine's last reclaim pass with a target. While one
+  // finds nothing left to release, the hold for the recovery margin is
+  // waived: growth that clears the warning margin proceeds, since only other
+  // applications could restore the rest, and the paced passes keep looking.
+  // A pass that releases or waits for memory again, or the host's recovery,
+  // ends the waiver.
+  void reclaimed(ReclaimOutcome outcome) noexcept;
+  [[nodiscard]] MemoryGovernorSnapshot snapshot() const noexcept;
+
+private:
+  // Held while an admitted allocation runs; released when it ends.
   class Reservation final {
   public:
-    Reservation() = default;
     ~Reservation();
     Reservation(const Reservation &) = delete;
     Reservation &operator=(const Reservation &) = delete;
     Reservation(Reservation &&) noexcept;
-    Reservation &operator=(Reservation &&) noexcept;
 
-    [[nodiscard]] explicit operator bool() const noexcept;
     void commit();
 
   private:
@@ -170,39 +207,12 @@ public:
     friend class MemoryGovernor;
   };
 
-  MemoryGovernor(metal::MetalBackend &backend, uint64_t limitBytes,
-                 uint64_t hostReserveBytes);
-  // Metal memory outside the backend's buffers (pipelines, driver
-  // allocations) is charged only beyond untrackedReserveBytes, the part of
-  // the limit the caller has set aside for it.
-  MemoryGovernor(metal::MetalBackend &backend, uint64_t limitBytes,
-                 uint64_t hostReserveBytes,
-                 HostAvailableMemoryProvider hostAvailableMemory,
-                 uint64_t untrackedReserveBytes = 0);
-
-  [[nodiscard]] std::optional<Reservation> tryReserve(
-      uint64_t bytes, metal::AllocationFailure *failure = nullptr);
-  // Low-level storage/model components receive only this transactional
-  // callback, so physical allocation stays governed without introducing a
-  // reverse dependency on engine policy.
-  [[nodiscard]] metal::AllocationAdmission allocationAdmission() noexcept;
-  void setPressure(MemoryPressure pressure) noexcept;
-  // The outcome of the engine's last reclaim pass with a target. While one
-  // finds nothing left to release, the hold for the recovery margin is
-  // waived: growth that clears the warning margin proceeds, since only other
-  // applications could restore the rest, and the paced passes keep looking.
-  // A pass that releases or waits for memory again, or the host's recovery,
-  // ends the waiver.
-  void reclaimed(ReclaimOutcome outcome) noexcept;
-  // Records what is resident once warmup has released all but one lane's
-  // state and the KV runway: the footprint a request is served from. Growth
-  // back to it needs only the host's reserve (tryReserve).
-  void markServingFootprint() noexcept;
-  [[nodiscard]] MemoryGovernorSnapshot snapshot() const noexcept;
-
-private:
+  // allocationAdmission's reservation, or nothing with the cause of the
+  // refusal in failure.
+  [[nodiscard]] std::optional<Reservation>
+  tryReserve(uint64_t bytes, metal::AllocationFailure &failure);
   [[nodiscard]] uint64_t
-  observedResidentBytes(bool refreshDevice = false) const noexcept;
+  chargedBytes(bool refreshDevice = false) const noexcept;
   [[nodiscard]] std::optional<uint64_t> sampleHostAvailable() const noexcept;
   [[nodiscard]] uint64_t
   hostHeadroomBytes(const std::optional<uint64_t> &hostAvailable,
@@ -221,9 +231,8 @@ private:
   uint64_t hostReserveBytes_ = 0;
   HostAvailableMemoryProvider hostAvailableMemory_;
   uint64_t untrackedReserveBytes_ = 0;
-  mutable std::mutex mutex_;
   uint64_t reservedBytes_ = 0;
-  uint64_t servingFootprintBytes_ = 0;
+  bool serving_ = false;
   uint64_t deniedReservations_ = 0;
   MemoryPressure systemPressure_ = MemoryPressure::Normal;
   mutable bool hostConstrained_ = false;

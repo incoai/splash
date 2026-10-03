@@ -1,6 +1,7 @@
 """Prepare tiny MLX and GGUF vision towers and compare them with an independently
-serialized packed file; check the exact-BF16 rule, the MLX cache identity and
-that invalid sources fail naming what is wrong and publish nothing."""
+serialized packed file; check the exact-BF16 rule, the MLX cache identity, that
+invalid sources fail naming what is wrong and publish nothing, and that a padded
+section written after another keeps its padding zero."""
 
 import hashlib
 import json
@@ -283,9 +284,16 @@ def main():
         result = prepare(binary, directory, "mlx", "warm", expected=False)
         errors = result.stderr.strip().splitlines()
         assert errors[-1] == "unexpected warm conversion", result.stderr
+
+        directory = root / "padding"
+        directory.mkdir()
+        result = subprocess.run(
+            [binary, "padding", str(directory)], text=True, capture_output=True
+        )
+        assert result.returncode == 0, result.stderr
         print(
-            "Vision layouts from MLX and GGUF, exact BF16 conversion, MLX identity "
-            "and rejected sources PASS"
+            "Vision layouts from MLX and GGUF, exact BF16 conversion, MLX identity, "
+            "rejected sources and zero padding PASS"
         )
 
 

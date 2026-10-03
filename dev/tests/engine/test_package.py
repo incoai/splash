@@ -63,7 +63,7 @@ class PackageTests(unittest.TestCase):
                     mock.patch("sys.stdout"),
                 ):
                     package.main(["--version", version, "--macos-min", "26.4"])
-                self.assertEqual(run.call_count, 3)
+                self.assertEqual(run.call_count, 4)
                 with tarfile.open(
                     root / f"dist/splash-{version}-arm64-macos26.tar.gz"
                 ) as archive:

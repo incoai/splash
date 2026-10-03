@@ -548,7 +548,6 @@ class ChatTemplateFrontendTests(unittest.TestCase):
                 None,
                 "test-model",
                 4096,
-                16,
                 10,
                 2,
                 vision=True,
@@ -570,18 +569,19 @@ class ChatTemplateFrontendTests(unittest.TestCase):
                         "messages": messages,
                         "reasoning_effort": effort,
                     }
-                    job, _thinking, _tools = app.prepare(body)
+                    job = app.prepare(body, deadline=fixtures.FOREVER)
                     self.assertEqual(job.generation_prompt_tokens, expected)
                     history = app.apply_template(
-                        {**body, "add_generation_prompt": False}
+                        {**body, "add_generation_prompt": False},
+                        deadline=fixtures.FOREVER,
                     )
                     self.assertEqual(
                         job.prompt_tokens[:-expected],
                         app.tokenizer(history, add_special_tokens=False)["input_ids"],
                     )
                     # Images precede it, so expanding them keeps its length.
-                    image_job, _thinking, _tools = app.prepare(
-                        {**body, "messages": with_image}
+                    image_job = app.prepare(
+                        {**body, "messages": with_image}, deadline=fixtures.FOREVER
                     )
                     self.assertEqual(image_job.generation_prompt_tokens, expected)
                     self.assertEqual(
@@ -592,8 +592,10 @@ class ChatTemplateFrontendTests(unittest.TestCase):
         # without a turn-start token finds the same boundary.
         app = frontend("qwen36_gguf", "<|im_end|>")
         body = {"model": "test-model", "messages": messages}
-        job, _thinking, _tools = app.prepare(body)
-        history = app.apply_template({**body, "add_generation_prompt": False})
+        job = app.prepare(body, deadline=fixtures.FOREVER)
+        history = app.apply_template(
+            {**body, "add_generation_prompt": False}, deadline=fixtures.FOREVER
+        )
         self.assertGreater(job.generation_prompt_tokens, 0)
         self.assertEqual(
             job.prompt_tokens[: -job.generation_prompt_tokens],
@@ -645,11 +647,13 @@ class ChatTemplateFrontendTests(unittest.TestCase):
 
         def frontend(template_tokenizer):
             return fixtures.make_frontend(
-                template_tokenizer, None, "test-model", 4096, 16, 10, 2, vision=False
+                template_tokenizer, None, "test-model", 4096, 10, 2, vision=False
             )
 
-        job, thinking, _tools = frontend(gemma_tokenizer).prepare(body)
-        self.assertEqual((job.generation_prompt_tokens, thinking), (len(ids), False))
+        job = frontend(gemma_tokenizer).prepare(body, deadline=fixtures.FOREVER)
+        self.assertEqual(
+            (job.generation_prompt_tokens, job.thinking), (len(ids), False)
+        )
         self.assertEqual(tuple(job.prompt_tokens[-len(ids) :]), ids)
         for template in (appends_nothing, rewrites_last_turn):
             with self.subTest(template=template):
@@ -657,7 +661,72 @@ class ChatTemplateFrontendTests(unittest.TestCase):
                 chosen = ChatTemplates(template_tokenizer).select(None)
                 self.assertEqual(chosen.generation_prompts, {})
                 with self.assertRaisesRegex(APIError, "assistant generation prefix"):
-                    frontend(template_tokenizer).prepare(body)
+                    frontend(template_tokenizer).prepare(
+                        body, deadline=fixtures.FOREVER
+                    )
+
+    def test_template_kwargs_are_template_variables(self):
+        """A request's chat_template_kwargs reach the template: its own
+        enable_thinking outranks the reasoning effort and the server default,
+        and a variable only another template reads is probed when first set."""
+        messages = [{"role": "user", "content": "Hi"}]
+
+        def frontend(template, **options):
+            return fixtures.make_frontend(
+                chat_tokenizer(template, "<|im_start|>", "<|im_end|>"),
+                None,
+                "test-model",
+                4096,
+                10,
+                2,
+                vision=False,
+                **options,
+            )
+
+        qwen = source("qwen36_gguf")
+        off, on = {"enable_thinking": False}, {"enable_thinking": True}
+        for options, extra, kwargs, thinking, tokens in (
+            ({}, {}, off, False, 7),
+            ({"default_reasoning_effort": "high"}, {}, off, False, 7),
+            ({}, {"reasoning_effort": "high"}, off, False, 7),
+            ({}, {"reasoning_effort": "none"}, on, True, 5),
+        ):
+            with self.subTest(options=options, extra=extra, kwargs=kwargs):
+                job = frontend(qwen, **options).prepare(
+                    {
+                        "model": "test-model",
+                        "messages": messages,
+                        "chat_template_kwargs": kwargs,
+                        **extra,
+                    },
+                    deadline=fixtures.FOREVER,
+                )
+                self.assertEqual(
+                    (job.thinking, job.generation_prompt_tokens), (thinking, tokens)
+                )
+        # A switch Splash does not set, as DeepSeek's templates name it.
+        switch = (
+            "{% for m in messages %}<|{{ m.role }}|>{{ m.content }}{% endfor %}"
+            "{% if add_generation_prompt %}<|assistant|>"
+            "{% if thinking %}<think>{% else %}</think>{% endif %}{% endif %}"
+        )
+        app = frontend(switch)
+        body = {"model": "test-model", "messages": messages}
+        for kwargs, expected in ((None, False), ({"thinking": True}, True)) * 2:
+            job = app.prepare(
+                {**body, "chat_template_kwargs": kwargs}, deadline=fixtures.FOREVER
+            )
+            self.assertEqual(job.thinking, expected)
+        self.assertEqual(app.chat_templates.select(None).probe.cache_info().misses, 1)
+        for kwargs, error in (
+            ("on", "must be an object"),
+            ({"tools": []}, "cannot set tools"),
+            ({"add_generation_prompt": False}, "cannot set add_generation_prompt"),
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaisesRegex(APIError, error):
+                app.prepare(
+                    {**body, "chat_template_kwargs": kwargs}, deadline=fixtures.FOREVER
+                )
 
     class ScoringTokenizer(
         fixtures.TemplateTokenizer, fixtures.ServerTest.CharTokenizer
@@ -667,12 +736,15 @@ class ChatTemplateFrontendTests(unittest.TestCase):
     def test_scoring_prompts_use_the_template_chosen_at_startup(self):
         tokenizer = self.ScoringTokenizer(source("qwen36"))
         app = fixtures.make_frontend(
-            tokenizer, None, "test-model", 8192, 16, 10, 2, vision=True
+            tokenizer, None, "test-model", 8192, 10, 2, vision=True
         )
         tokenizer.templates.clear()
-        app.prepare_judgment(fixtures.ServerTest.judgment_body())
+        app.prepare_judgment(
+            fixtures.ServerTest.judgment_body(), deadline=fixtures.FOREVER
+        )
         app.prepare_systemone(
-            {"model": "test-model", "state": {}, "questions": {"q": {"type": "noul"}}}
+            {"model": "test-model", "state": {}, "questions": {"q": {"type": "noul"}}},
+            deadline=fixtures.FOREVER,
         )
         self.assertEqual(
             [kwargs.get("chat_template") for _, kwargs in tokenizer.templates],
@@ -691,9 +763,11 @@ class ChatTemplateFrontendTests(unittest.TestCase):
                 {"type": "message", "role": "user", "content": "Continue"},
             ],
         }
-        chat = api_shapes.responses_to_chat_body(body)
+        chat, _ = api_shapes.responses_to_chat_body(body, body["input"])
         prompt = harness.app._render_prompt(
-            harness.app._prepare_prompt(chat), float("inf"), check_context=False
+            harness.app._prepare_prompt(chat, None, deadline=fixtures.FOREVER),
+            float("inf"),
+            check_context=False,
         ).text
         self.assertTrue(
             prompt.startswith(
@@ -765,6 +839,7 @@ class LeadingSystemMergeTests(unittest.TestCase):
                 {"role": "system", "content": "Later still"},
             ],
             vision=True,
+            deadline=fixtures.FOREVER,
         )
         self.assertEqual(
             merged,
@@ -782,20 +857,19 @@ class LeadingSystemMergeTests(unittest.TestCase):
                     {"role": "user", "content": "x"},
                 ],
                 vision=True,
+                deadline=fixtures.FOREVER,
             )[0],
             {"role": "system", "content": "  Only  "},
         )
 
     def test_every_api_shape_leads_with_one_system_message(self):
         responses = api_shapes.responses_to_chat_body(
-            {
-                "instructions": "Base",
-                "input": [
-                    {"role": "developer", "content": "Developer"},
-                    {"role": "user", "content": "Ask"},
-                ],
-            }
-        )["messages"]
+            {"instructions": "Base"},
+            [
+                {"role": "developer", "content": "Developer"},
+                {"role": "user", "content": "Ask"},
+            ],
+        )[0]["messages"]
         anthropic = api_shapes.anthropic_to_chat_prompt(
             {
                 "model": "m",
@@ -810,7 +884,9 @@ class LeadingSystemMergeTests(unittest.TestCase):
         for messages in (responses, anthropic):
             with self.subTest(messages=messages):
                 self.assertEqual(
-                    api_shapes.normalize_messages(messages, vision=True),
+                    api_shapes.normalize_messages(
+                        messages, vision=True, deadline=fixtures.FOREVER
+                    ),
                     [
                         {"role": "system", "content": "Base\n\nDeveloper"},
                         {"role": "user", "content": "Ask"},

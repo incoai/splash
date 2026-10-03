@@ -28,14 +28,20 @@ no login; private or gated ones need `HF_TOKEN` or `hf auth login`. Ctrl+C
 stops serving, and a second Ctrl+C stops the engine at once; stop before
 upgrading.
 
-An engine that fails is restarted at once, and failed restarts back off from
-1 to 16 seconds. Meanwhile generation requests get 503 `engine_recovering`,
-whose message names the last failure.
+An engine that fails is restarted at once. If it fails again within 60 s of
+starting, the next restart waits 5 s; after a third such failure (failed
+restarts count) Splash stops restarting it, and requests get 500
+`engine_failed` naming the crash trace until the server is restarted.
+Meanwhile generation requests get 503 `engine_recovering`, whose message names
+the last failure. An engine whose loop leaves a status request unanswered for
+30 seconds, while requests are pending or during a background status refresh,
+is failed and restarted by the same rules.
 
 Use `--max-context 100K` or `--max-memory 28G` to set optional limits. Memory
 limits cap Metal allocations, not combined process RSS. Agents must already be
 installed; `./splash claude|opencode|codex|hermes|pi` connects to the running server.
-Arguments pass through, for example `./splash codex resume --last`.
+Arguments pass through, for example `./splash codex resume --last` or
+`./splash hermes chat -q "Hello"`.
 
 Set `SPLASH_API_KEY` in the server and agent shells to require authentication;
 `serve --api-key KEY` overrides the server's environment value. API requests
@@ -56,7 +62,7 @@ every connection slot is taken, the first with that 503, so stalled clients
 cannot lock others out. Image and model context limits apply independently.
 Stored Responses history is charged before decoding. Uploads allow 30 seconds
 of inactivity; total upload time is limited to 30 seconds plus the body size
-at 512 KiB/s (286 seconds for 128 MiB), capped by the overall request deadline.
+at 512 KiB/s (286 seconds for 128 MiB), capped by `--request-timeout` when set.
 Timed-out uploads return 408 and release their input reservation. An upload
 refused before it is read, such as one over the shared budget, is still
 received on these terms, so a client that sends its whole body before reading
@@ -85,6 +91,23 @@ gets 403 with the `--allowed-host` flag that would accept it; the check keeps ou
 web pages that rebind a DNS name to this address. The chat page works over plain
 HTTP from another machine too.
 
+A page served elsewhere, or an application's webview such as Jan's and other
+Tauri apps', calls the API from another origin, which its browser names in
+`Origin`. `--allowed-origin ORIGIN` admits one, such as `tauri://localhost` or
+`http://localhost:3000`; repeat it for more, or pass `'*'` for every origin,
+which is vLLM's default. The server then answers the browser's preflight
+`OPTIONS` request and names the origin in `Access-Control-Allow-Origin` on its
+responses, which let the page read `Retry-After` and `WWW-Authenticate` too. A
+page of any other origin gets 403. Its browser hides that response from the
+page, which sees a network error, so the server prints the refused origin and
+the `--allowed-origin` flag that would accept it, once per origin. A `file://`
+page or a sandboxed frame sends `Origin: null` instead, which only `'*'`
+admits; the server does not print its refusal. Origins match exactly: a pattern
+such as `tauri://*` or `http://*.example.com` is refused at startup; only a
+bare `'*'` admits every origin. With `'*'` every page open in a browser that
+reaches the server can use it, so set `--api-key` too; the server warns at
+startup without one.
+
 Use `--port 8001` or set `SPLASH_PORT=8001` to select another port. Set the same
 `SPLASH_PORT` in the local agent shell. Separate ports allow separate servers;
 their memory limits are independent. The packaged agent launchers connect to
@@ -105,9 +128,12 @@ loopback, so use a listener that includes loopback when launching agents locally
 | `--max-context` | Auto | Context limit, up to `256K`, e.g. `100K`. |
 | `--max-cache-disk` | `0` (off) | Session-local SSD cache, e.g. `16G`. See [disk cache](#disk-cache). |
 | `--kv-format` | `int8` | Target KV storage: `int8` or `bf16`. |
-| `--max-image-pixels` | `4194304` | Maximum resized pixels per image. |
-| `--request-timeout` | `1800` | Seconds a request may take from its arrival; a request's own `timeout` can only shorten it. |
+| `--decode-share` | `0.5` | Decode time owed per unit of prefill time while other requests generate. Higher keeps their output faster during a long prompt and slows that prompt; `0` alternates one command each. |
+| `--max-image-pixels` | `4194304` | Maximum resized pixels per image. An image's vision scratch grows with its patches (pixels / 256), to about 600 MiB at the default. |
+| `--request-timeout` | None | Seconds a request may take from its arrival; a request's own `timeout` can only shorten it. |
+| `--queue-size` | `32` | Requests admitted at once, running or waiting; more get 503 with `Retry-After`. |
 | `--allowed-host` | No extra names | Additional HTTP Host name, e.g. `mymac.local`; repeatable. |
+| `--allowed-origin` | No other origin | Origin whose pages may call the API from a browser or webview, e.g. `tauri://localhost`; `'*'` for any; repeatable. |
 | `--api-key` | `SPLASH_API_KEY` or none | Require a bearer token or `x-api-key`. |
 | `--no-webui` | Off | Disable the chat page. |
 
@@ -123,6 +149,12 @@ cannot fit, startup prints a memory budget breakdown and stops.
 a server on another port), preserving other providers, settings and sessions.
 The browser chat and agent launchers connect to the running server; a model
 need not appear in a client's catalog to serve it by its full repository ID.
+`splash opencode`, `pi` and `hermes` configure an output limit per response
+of 32K tokens (`CLIENT_RESPONSE_TOKENS` in `install/clients.py`); OpenCode and
+Hermes, which reserve it out of the context they compact at, get a quarter of
+a context under 128K instead. Hermes 2026.9.7 and later ignore it and, like
+Codex, leave the limit to the server; Claude Code keeps its own, which
+`CLAUDE_CODE_MAX_OUTPUT_TOKENS` raises.
 
 `splash hermes` runs Hermes in the `splash` profile (`splash-<port>`) of the
 user's Hermes root, `~/.hermes` or the root `HERMES_HOME` belongs to, and
@@ -158,10 +190,18 @@ stored bytes without further quantization; it does not survive a restart.
 ## API model aliases
 
 Repeat `--served-model-name NAME` to accept additional API model IDs. The full
-`--model` ID still selects the model. `/v1/models` lists that ID first, followed
-by unique aliases; each alias's `root` identifies the loaded model. Generation
-and scoring responses always report the real model ID, even when requested
-through an alias. The model list and lookup support both names.
+`--model` ID still selects the model. By default `/v1/models` lists that ID
+first, followed by unique aliases; each alias's `root` identifies the loaded
+model, and generation and scoring responses report the real model ID even when
+requested through an alias. The model list and lookup support both names.
+
+Some clients check a response's `model` against the name they requested and
+reject the real ID. For them, add `--announce-served-name`, which requires
+`--served-model-name`: responses then report the first alias, whichever
+accepted name the request used, and `/v1/models` lists that alias first and
+gives every other entry, the real ID included, that alias as its `root`, so
+`splash <client>` configures clients with it. `/status` keeps reporting the
+loaded model.
 
 ```sh
 splash serve --model mlx-community/Qwen3.8-27B-4bit --served-model-name local-qwen
@@ -185,7 +225,13 @@ splash serve --model mlx-community/Qwen3.8-27B-4bit --default-reasoning-effort n
 ```
 
 `/apply-template` uses the same default. Anthropic `thinking` keeps its protocol
-semantics (off when omitted); judgment endpoints always disable thinking.
+semantics (off when omitted); judgment endpoints always disable thinking. The
+built-in chat page sends no effort unless the user picks one.
+
+A Chat request's `chat_template_kwargs`, as vLLM and SGLang accept them, are
+passed to the template as variables and outrank the effort, so
+`{"enable_thinking": false}` turns reasoning off. They cannot set what Splash
+passes itself, such as `tools` or `add_generation_prompt`.
 
 ## Upstream model loading
 
@@ -403,7 +449,9 @@ target, `DraftCheckpointLoader` (`DraftCheckpoint.cpp`) and `AffinePreparation`
 for the draft, `GgufTargetLoader` (`GgufTarget.cpp`, planned by `GgufImage.cpp`)
 and `GgufPreparation` for a GGUF target, `VisionLoader` and `VisionPreparation`
 for an MLX or GGUF vision tower. They open their files through `PreparedFiles`,
-the `PreparedWeights` cache with the load's guards. `AffinePreparation` reorders
+the `PreparedWeights` cache with the load's guards; the target and draft loaders
+keep their planned images in `PreparedImages` (`PreparedFiles.hpp`), whose
+sizes `preparedModelWeightBytes` sums. `AffinePreparation` reorders
 an MLX target's codes, scales and biases into 256-row tiles without
 requantization, quantizes the draft's BF16 projections into the same tiles
 ([Drafts](#drafts)) and computes GDN decay as `float(-exp(double(A_log)))`,
@@ -448,28 +496,31 @@ Each entry records in `source` its component (such as `target/layer-0.bin`),
 the digest of the source data it was written from and the source path.
 Publishing an entry removes the complete entries it supersedes: the same
 component from the same source data under another key, which an earlier
-preparation identity wrote, and entries of earlier Splash versions prepared from
-the same source path. Entries of other sources or revisions, which
+preparation identity wrote. Entries of other sources or revisions, which
 installations may share, stay. Removal happens under the converter lock, so no
 entry being written is touched, and a running process keeps the files it has
 mapped until it unmaps them. Two builds of different preparation identities
 sharing one cache supersede each other's entries at every start; give a
 development build its own `SPLASH_WEIGHT_CACHE`.
 
-One writer per cache serializes conversion; complete cache hits bypass this
-lock. Each output's disk space is preallocated before writing. Interruption,
-disk-full errors and memory-pressure rejection cannot publish partial files;
-concurrent external disk activity can still exhaust the volume. Retrying removes
-abandoned writes under the converter lock and reuses previously completed
+One writer per cache serializes conversion; complete cache hits never wait for
+this lock. Each output's disk space is preallocated before writing.
+Interruption, disk-full errors and memory-pressure rejection cannot publish
+partial files; concurrent external disk activity can still exhaust the volume.
+Every converter-lock acquisition removes abandoned writes, and so does a warm
+start that finds the lock free; a warm start that cannot lock or clean the cache
+(read-only, or without `flock`) leaves them and still loads. Replacing an
+invalid entry also drops its digest proof. Retrying reuses previously completed
 files, which are read-only. Cold preparation reports each artifact's progress.
 
 Cold source hashing and output validation stream bounded buffers. Unchanged
-files reuse a digest proof tied to device, inode, size, birth time, mtime and
-ctime; a write or replacement invalidates it. This is not a full disk scrub on
-every startup. Preparation uses uncached destination I/O. Every adapter sizes
-its conversion steps to one staging bound, input and output together, of
-32 MiB (`kWeightPreparationStagingBytes`), whatever the tensor, layer or expert
-count, inside a 64 MiB admission reserve that also covers source metadata.
+files reuse a digest proof tied to inode, size, birth time, mtime and ctime, so
+a remounted volume keeps its proofs; a write or replacement invalidates it.
+This is not a full disk scrub on every startup. Preparation uses uncached
+destination I/O. Every adapter sizes its conversion steps to one staging bound,
+input and output together, of 32 MiB (`kWeightPreparationStagingBytes`),
+whatever the tensor, layer or expert count, inside a 64 MiB admission reserve
+that also covers source metadata.
 Complete rows and multiple row tiles are processed together where possible,
 avoiding per-row I/O and small GPU waits. Startup runs two checks
 (`RuntimeResources.mm`), both stopped by cancellation. `admitWeightPreparation`,
@@ -488,13 +539,49 @@ replaced or changed after `prepare` checked it is refused.
 Runtime admission counts prepared weights, draft and vision exactly once
 (`preparedModelWeightBytes`, which `tune-kernels` and the runtime oracle use
 too). Before loading, startup refuses a model whose prepared weights, with the
-pipeline and runtime reserves, one state cell, one KV extent and any disk tier
-KV staging, exceed the hard budget, so a model that can never fit is not
-prepared. File backing does not make Metal-resident pages reclaimable, and
-`WeightFile` keeps its buffer resident (`MetalBackend::keepResident`): the
-weights stay wired between requests until 10 minutes pass without a command,
-and the next command wires them again. macOS page cache, driver allocations and
-other applications still affect memory pressure and swap.
+pipeline and runtime reserves, one lane's state, the KV runway and any disk tier
+state staging, exceed the hard budget, so a model that can never fit is not
+prepared. File backing does not make Metal-resident pages reclaimable.
+Every buffer the backend allocates or wraps belongs to one residency set
+attached to its command queue (`MetalBackend::allocateBuffer`): weights, KV
+extents, state cells and draft rings, and scratch alike stay wired between
+requests until 10 minutes pass without a command, and the next command wires
+them again. Memory returns to macOS when the engine releases it, never because
+macOS compressed or dropped an idle buffer. macOS page cache, driver
+allocations and other applications still affect memory pressure and swap.
+
+KV pages live in extents: ordinary shared Metal buffers of one size per pool,
+between half and one and a half times 128 MiB, in which every tensor region of
+each attention layer starts 64 KiB-aligned, sized to leave the fewest of the
+budget's pages unused (`Layout::extentPagesFor`). The pool allocates an extent
+when it needs one of its pages. When it is built it allocates the runway, the
+extents of the first 64 pages, which startup warmup runs on; nothing but the
+pool allocates or releases an extent. An extent whose last page is free stays
+allocated until a reclaim releases it, at once and only between commands: memory
+pressure, an admission the budget denies, the publication of a replay point in
+use or a junction, or startup cleanup. Kernels reach a page through the GPU
+address in its request's page table, so no command binds KV; the residency set
+makes extents resident for every command. The host reaches the same memory
+(`PageStorage::spans`), which is how the disk tier moves pages. A reclaim
+returns free pages before it evicts anything: an empty extent as it is, and the
+free pages scattered over the others as soon as they cover the extent that holds
+the fewest pages, whose pages the pool copies to them (`KvPool::compactExtent`).
+The blocks and requests on those pages follow them, a page a disk transfer reads
+or writes stays where it is, and a pass that evicts everything copies only what
+is left afterwards. Every extent a pass empties is released, except that a
+warning pass, like startup cleanup, keeps one empty extent as the runway the next
+request starts from.
+`/status` reports under `kv` the pages of allocated extents (`pages_allocated`),
+those requests and the cache hold (`pages_active`, `pages_cache`) and those
+nothing holds (`pages_free`), the bytes allocated and the bytes of empty extents
+(`allocated_bytes`, `reclaimable_bytes`), the extents allocated and released
+(`extent_allocations`, `extent_releases`) and those emptied by moving pages
+(`extent_compactions`, `pages_moved`), and the longest allocation, release and
+emptying of one (`extent_allocate_max_ms`, `extent_release_max_ms`,
+`extent_compact_max_ms`); the last includes re-pointing the cached blocks and
+requests on the moved pages. The counts and the longest allocation include the
+runway allocated at startup, before serving begins; how long a whole pass holds
+the loop shows in `loop.max_tick_ms`.
 
 `loadQwenTarget` (`QwenTargetLoader.hpp`) reads a target's files
 (`QwenTargetFiles`: packed files, or the files `AffineTargetLoader` or
@@ -514,6 +601,17 @@ and represent different operator contracts. Arena sizing collects each
 projection's actual layout (a GGUF target's block projections beside its
 affine draft's) and reserves the vocabulary head only for decode.
 
+Affine Q4 decode (`runtime/ops/Linear.cpp`) runs MPP tiles on Apple10 and later
+(the M6 reports family 11 and runs the same rules) and bf16 simdgroup matrix
+tiles on Apple9. On Apple10 a projection with at most two N128 tiles per core
+runs that tile over two, four or eight K partitions (`LinearTile::Split128`,
+`kernels/decode/linear_q4_grid_split.metal`), the most whose split grid still
+fits four 256-thread threadgroups per core; the last partition of each tile
+adds the fp32 partials in split order, so the sums do not depend on
+scheduling. The split count depends on the grid per core, never on the batch
+width, so a request's sums are the same alone and batched. Every other
+projection keeps the sequential tiles (`dev/benchmarks/device-policy.md`).
+
 ### GGUF targets
 
 `--model unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M` selects the repository's
@@ -529,15 +627,20 @@ and lists every unsupported tensor in one error:
 - linears and experts: Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, Q4_1,
   IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL,
   MXFP4 or PQ2_0;
-- token embeddings: Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, Q4_1 or PQ2_0;
+- token embeddings: Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, Q4_1, IQ3_S,
+  IQ4_NL or IQ4_XS, every type llama-quantize gives a token table by default
+  in a file whose linears load, and Prism's PQ2_0;
 - norms, the MoE router and shared-expert scalar gate, and the GDN
   convolution, decay and time-step bias: F32;
-- GDN alpha and beta: both Q8_0, both F32 or both BF16, which preparation
-  widens to the F32 values it equals.
+- GDN alpha and beta: both of one type, any of the linears' formats (one
+  segment of the GDN input projection), F32 or BF16, which preparation widens
+  to the F32 values it equals.
 
-Of Unsloth's files in September 2026 that covers every file of Qwen3.8-27B
-and Qwen3.6-35B-A3B, from UD-IQ1_S up, but UD-Q8_K_XL and BF16, whose BF16
-tensors need kernels that do not exist yet. PQ2_0 is Prism ML's type 142,
+Of Unsloth's files in September 2026 that covers every file of Qwen3.8-27B and
+Qwen3.6-35B-A3B, from UD-IQ1_S up, but UD-Q8_K_XL and BF16, whose BF16 tensors
+need kernels that do not exist yet. llama-quantize's default type selection
+stores alpha and beta in the file type's format (Q4_K in a Q4_K_M), as in
+lmstudio-community's files, so those load too. PQ2_0 is Prism ML's type 142,
 `block_pq2_0` of PrismML-Eng/llama.cpp, which upstream GGML does not define:
 2-bit codes q worth d (q - 1) with one half d per 128 weights. A format's
 image takes the bits per weight of its GGUF blocks, but for Q3_K's and Q6_K's
@@ -550,13 +653,15 @@ tensors whose weights multiply H (D x), H the normalized Walsh-Hadamard
 transform of each block of 1024 inputs and D an explicit sign per input, and
 the token table, whose rows are stored as H (D e). The engine runs that one
 form, on dense targets whose rotation names exactly the tensors the planner
-repacks (every quantized projection and the head, and alpha/beta when Q8_0),
-a PQ2_0 token table, and GDN value heads in grouped order (the installer
-screens the parameters, `GgufFile` and the planner check the rest).
+repacks (every quantized projection and the head, and alpha/beta when
+quantized), a PQ2_0 token table, and GDN value heads in grouped order (the
+installer screens the parameters, `GgufFile` and the planner check the rest).
 A rotated projection rotates its input once into `LinearScratch::rotated`
 (`gguf_rotate`, in fp32 and rounded once to bf16) before its quantized
 segments, whose kernels are the format's, while float segments read the input
-as it is; the table gathers each row through the inverse (`gguf_embed_rotated_pq20`).
+as it is; the register tile prepares its table from the rotated rows, so the
+input's producer writes plain rows. The token table gathers each row through
+the inverse (`gguf_embed_rotated_pq20`).
 
 At load time the engine validates the GGUF metadata, including the rotary
 embedding and norm epsilon the kernels assume (`rope.freq_base`,
@@ -589,17 +694,16 @@ takes wherever the tile holds its lanes' rows unpadded. On Apple10 (M5) the stag
 which dequantize each weight once to half in threadgroup memory (`kernels/common/gguf_staged.h`)
 for MPP `matmul2d`, the neural accelerator's path, on bf16 activations; a step of three request
 lanes runs the 32-row tile over four lanes of storage. Prefill runs the staged kernels on both
-families, chunks of up to 32 rows on the decode tiles. Every projection splits its K across
-threadgroups by one rule (`decodeSplits`: each tile's tiers of threadgroups per core and inputs
-per partition, from measured occupancy, Apple9's staged tile taking the register tile's) that
-does not depend on the batch width. The MoE experts (`runtime/ops/MoE.cpp`) run the same numerics
-per family over the grouped rows: the register form in `linear_gguf_sgmatrix.metal`, the staged
-one in `kernels/shared/moe_gguf.metal`, which Apple9 takes for experts mostly in the formats it
-stages (`MoeShape::expertFormat`). The float router and alpha/beta projections run in
-`kernels/shared/gguf_float.metal`, and the token rows are gathered by one template in
-`kernels/shared/embedding.metal`. These plans are fixed rules of GPU family, core count, shape and
-format: `Linear::setChoices` and `ExecutionPlans::install` reject tuned entries for block
-projections and GGUF MoE blocks.
+families: the 128-row prefill tile (`LinearTile::GgufPrefill`), and the staged tile for chunks of
+up to 32 rows. Every projection splits its K across threadgroups by one rule (`decodeSplits`: each
+tile's tiers of threadgroups per core and inputs per partition, from measured occupancy, Apple9's
+staged tile taking the register tile's) that does not depend on the batch width. The MoE experts
+(`runtime/ops/MoE.cpp`) run the same numerics per family over the grouped rows: the register form
+in `linear_gguf_sgmatrix.metal`, the staged one in `kernels/shared/moe_gguf.metal`, which Apple9
+takes for experts mostly in the formats it stages (`MoeShape::expertFormat`). The float router and
+alpha/beta projections run in `kernels/shared/gguf_float.metal`, and the token rows are gathered
+by one template in `kernels/shared/embedding.metal`. These plans are fixed rules of GPU family,
+core count, shape and format.
 
 A GGUF kernel of one quantized tensor names its epilogue last: `a` none, `r` residual, `g` the
 up pass with the silu gate. The staged ones are `gguf_decode_<format>_m<rows>_<e>` and
@@ -607,9 +711,10 @@ up pass with the silu gate. The staged ones are `gguf_decode_<format>_m<rows>_<e
 experts `moe_expert_gguf_m<rows>_<e>` and `moe_expert_gguf_sg_<e>`; the fused projections run
 `gguf_decode_fused_m<rows>` and `gguf_decode_sg_fused_l<lanes>`. The norm, GDN and
 attention-gate variants that also write a register kernel's input table carry `table64` (the
-affine Q4 kernel's) or `table16` (the GGUF one's) in their names. The epilogue kinds and SiLU of
-both GGUF families are in `kernels/common/gguf_tile.h`, and the MMA helpers every register
-kernel uses, affine, GGUF or fp32, in `kernels/common/sgmatrix.h`.
+affine Q4 kernel's) or `table16` (the GGUF one's) in their names. The epilogue kinds of both GGUF
+families are in `kernels/common/gguf_tile.h`, the SiLU and sigmoid every kernel shares in
+`kernels/common/activation.h`, and the MMA helpers every register kernel uses, affine, GGUF or
+fp32, in `kernels/common/sgmatrix.h`.
 
 The ABIs are in `runtime/metal/abi/Gguf.h`, which also defines the tile geometry the kernels
 and `LinearGguf.cpp` share, and `MoE.h`; the image formats in
@@ -642,7 +747,9 @@ GGML directly and prints GGML's hashes.
 Two benchmark tools repeat the measurements behind the GGUF split tiers and MoE plans, with the
 weights DRAM-cold. `make benchmark-gguf-projection GGUF_PROJECTION_ARGS='q4k 5120 8192'` times one
 projection (up to three fused formats and widths, then `K` and an optional epilogue) on both
-decode tiles at one to four lanes and every K split, and marks the device policy's pick;
+decode tiles at one to four lanes and every K split, and marks the device policy's pick, or, with
+a trailing `prefill=R[,R...]` after the epilogue and the round count, one format's 128-row
+prefill tile at each chunk of `R` rows (more than 32);
 `make benchmark-gguf-moe` times one MoE layer at the 35B shape, GGUF against affine Q4, on the
 device's plans and the other GGUF tile.
 
@@ -676,9 +783,27 @@ variants, so a `:VARIANT` suffix is rejected, and `--revision`,
 Within `server/`, `server.py` owns HTTP and startup; `frontend.py` prepares
 requests and history; `backend.py` owns native request lifecycles. `judgments.py`
 owns finite-choice prompts, validation and typed answer math. `output.py` parses
-generated text for both streaming and complete responses, and `constraints.py`
-compiles token constraints. `make architecture-check` prevents lower layers from
-importing the HTTP entry module.
+generated text as it arrives, one parser serving streamed and complete
+responses alike, and `constraints.py` compiles token constraints. Messages and
+Responses build streamed and complete responses from the same block sequence;
+the one difference is a call cut by the token limit, which a complete Messages
+response leaves out. `make architecture-check` prevents lower layers from
+importing the HTTP entry module, and keeps one import style in `server/` and
+`install/`: a module imports its package's modules relatively. The server
+runs as `python -m server.server`; `install/launcher.py`, `install/models.py`
+and `install/catalog.py`, which run as scripts, import their siblings through
+a PEP 366 header. `serve_options.py` defines the options
+`splash serve` shares with the server once, each with its check, default and
+help, and how the launcher passes it on; it imports only the standard library,
+since the launcher parses them before `.venv` exists.
+
+Tests substitute the values the native runtime holds constant (the Metal
+command timeout and residency keep-alive, the KV tier's transfers, the input
+queue's bound, the latency window, the prefill checkpoint interval and the
+resource wait) and its clocks and live host-memory estimate through
+`runtime/TestConfig.hpp` with `test::ScopedTestConfig`, never through a
+production parameter; `make architecture-check` keeps production from writing
+that configuration.
 
 Tools can be combined with structured answers. Tool argument framing resolves
 local references and projects object fields through schema composition. The
@@ -700,10 +825,41 @@ output requirements in their own messages.
 Hidden thinking signatures use a persistent user key; imported encrypted thinking
 preserves visible history without recovering the private reasoning.
 
-`/status.admission` distinguishes memory and concurrency waits, reports suspended
-requests, recovery draining and the oldest current wait age. Memory transitions
-also appear in the console. Warning pressure can pause growth while `/ready`
-remains healthy for work that fits existing allocations.
+`/status.admission` distinguishes memory and concurrency waits, counts the
+requests held back behind one refused memory (`held_behind_refusal`, the
+refused request included while a pass defers it; during recovery, the suspended
+ones and those of a strictly higher priority) and those waiting for a disk
+restore (`restoring`), reports suspended requests, recovery draining and the
+oldest current wait age, which for a request holding admission closed runs from
+when its wait began. Memory transitions also appear in the console. When macOS
+runs short of memory, growth that no request in service needs pauses and the
+cache gives memory back, a paced pass at a time, down to one lane's state
+buffers and one KV extent. A pass counts only memory that leaves the engine; a
+cached state it evicts first refills the lane's state buffers it keeps. A
+request in service keeps growing within `--max-memory`, first into cached pages
+no request holds: it takes cached KV, and a cached state only where it sits on
+the KV that goes next, since a state's buffers give it no page. A new request
+waits while another is in service unless it can start from what the engine
+already holds, and with none in service it starts. A request whose start was
+refused memory, under host pressure or at `--max-memory`, holds back the
+requests that arrived after it until it starts, fails or is cancelled, so the
+lanes that finish leave their memory to it; a higher priority is not held back.
+It keeps holding them back while it waits for a prefix another lane is
+computing. After a suspension, suspended requests resume before new work of
+their priority or below, one at a time, higher priority first and then in the
+order they arrived; one refused memory holds back the suspended requests after
+it, and their resource waits do not run out while it does. A request of a
+strictly higher priority than every suspended request waits for neither. When
+every lane is taken, or a new request's start is refused memory that no copy
+being written to disk is about to free, the resident of the lowest priority
+below it is suspended for it (`cache.priority_suspensions` in `/status`) and
+resumes once a lane and its memory are free. A new request below the priority
+of a running lane neither starts nor takes a lane until no lane of that
+priority runs, since it could not run before. Critical pressure evicts every
+unpinned cache entry and stops all growth. `/ready` stays healthy under warning
+pressure, and reports 503 while macOS reports critical pressure; requests
+already running continue, and one that needs more memory is suspended until the
+pressure lifts.
 
 PDF input supports base64 documents within a shared 64 MiB source/rendering
 budget and the native 64-image limit (one image per page). Model context and
@@ -727,10 +883,58 @@ special tokens such as a BOS and recognizing special-token strings, or one array
 of token IDs from its vocabulary. No chat template, reasoning split, tools or
 images apply: `text` is the generated text, decoded without special tokens.
 `max_tokens` defaults to 16, OpenAI's default for the endpoint as in vLLM and
-SGLang, or to what the context leaves when that is less. `temperature`,
-`top_p`, `top_k`, `seed`, `stop`, `priority`, `timeout` and `stream` with
+SGLang, or to what the context leaves when that is less. The sampling fields
+below, `seed`, `stop`, `priority`, `timeout` and `stream` with
 `stream_options.include_usage` work as in Chat. Batched prompts, `suffix`,
 `echo`, `logprobs`, `best_of` and `n` other than 1 are rejected.
+
+Chat, text completions and Responses sample with `temperature` (default 1.0,
+in [0, 2]), `top_p` (0.95), `top_k` (20, a positive integer, 0 or -1), `min_p`
+(0, in [0, 1]), `presence_penalty` and `frequency_penalty` (0, in [-2, 2]) and
+`repetition_penalty` (1, positive); the defaults are Qwen's generation config,
+which sets no penalties, so its recommended `presence_penalty` of 1.5 for
+non-thinking use must be sent explicitly. Each field that is out of range
+returns 400 naming it. As in vLLM, a nonzero temperature below 0.01 samples at
+0.01, and the penalties rewrite the raw logits before temperature, for greedy
+requests too: repetition divides a positive logit and multiplies a negative
+one for every token of the prompt or of the output so far, and presence and
+frequency lower the logit of every output token by `presence_penalty` plus
+`frequency_penalty` times its count. Speculative decoding stays exact: each
+verified draft position counts the draft tokens before it, so a penalized
+request samples as it would without a draft. Splash does not implement
+`logit_bias`: a non-empty one returns 400; `null` and `{}` are accepted. Like
+vLLM and HF, repetition counts every prompt token: with the Qwen templates
+that includes the tool-call syntax every tool-enabled system prompt carries,
+earlier tool calls and reasoning, and the `<think>` markers of the generation
+prompt, so a `repetition_penalty` above 1 can delay tool calls and the end of
+reasoning and change names copied from the context. Anthropic Messages defines
+no penalties and no `min_p`.
+
+In vLLM's order, after temperature `min_p` first drops every token less
+likely than `min_p` times the most likely one, `top_k` then keeps the most
+likely of the rest, every one when it is 0 or -1 or past the vocabulary, and
+`top_p` then the fewest of those whose probabilities, renormalized over them,
+sum past it. All three apply to the whole vocabulary, exactly, for the first
+token, the verified draft positions and their corrections alike: the sampler
+sums each row's softmax denominator, finds where its distribution ends
+without sorting the vocabulary, and draws over every token the distribution
+keeps. vLLM itself refuses a nonzero `min_p` with speculative decoding; here
+it is one more cut of the target distribution, which acceptance and
+correction read as they read the others, so sampling stays exact.
+
+Chat's `max_completion_tokens` or `max_tokens` and Responses'
+`max_output_tokens` bound a response's output. Omitted, the output may use
+all the context the prompt leaves, as in vLLM and SGLang: the context limit,
+and `--request-timeout` when set, are the only server bounds on a request that
+names no limit. A value larger than what the context leaves returns 400
+`context_length_exceeded` with the prompt's tokens, the value and the window,
+as in vLLM and SGLang; that error and an invalid value's name the field the
+request sent. Messages requires `max_tokens`; a larger value than the context
+leaves generates up to the context limit, since Claude Code asks for the same
+limit on every turn and does not compact for it. A response the context limit
+ends then has the `stop_reason` `model_context_window_exceeded`, as in
+Anthropic's API, not `max_tokens`. Messages refuses a final assistant message
+(prefill) with 400; `count_tokens` still counts it.
 
 Chat and text completions accept `"ignore_eos":true` (default false), as vLLM
 and llama.cpp do: the model never selects its own stop tokens, and a draft
@@ -739,7 +943,7 @@ finishes with `length` unless a `stop` string ends it first. Benchmarks use it
 to generate a fixed number of tokens. Tools and structured output generate
 under a grammar, which decides where the output ends, so combining them with
 `ignore_eos` returns 400. The engine receives it as bit 0 of the request
-frame's flags word (native wire version 7), which rejects undefined bits.
+frame's flags word, which rejects undefined bits.
 
 Streaming requests accept `"return_progress":true` (default false). Before output,
 `prompt_progress` reports `{total, cache, processed, time_ms}`: prompt tokens,
@@ -758,18 +962,28 @@ Proxy consumers can use these fields; additional fields may be added:
 | `requests.submitted`, `completed`, `cancelled`, `failed` | Native request counters since engine start |
 | `memory_actual.current_bytes`, `peak_bytes` | Metal allocations, not process RSS |
 | `metrics.decode_tokens_per_second` | Aggregate native decode throughput, not a request's end-to-end rate |
+| `metrics.decode_wall_ms` | Total wall time of the decode commands on the GPU, from submission to completion |
+| `metrics.decode_cycle_ms` | Total engine time of the decode commands, each from the previous command's completion (or its plan after idleness) to its own: the GPU command plus the host work between commands |
+| `loop.max_tick_ms` | Longest control pass and engine step of the native loop. A reader thread keeps reading requests meanwhile, so a request frame whose write stalls 5 s after it started fails the engine only when the process stopped reading; while requests are pending the server asks for status every 10 s and fails an engine whose loop does not answer within 30 s. |
 | `maximum_context_tokens` | Declared context limit; available memory may limit admission |
 | `vision`, `input_modalities` | Whether image and PDF input is accepted; `false` and `["text"]` after `--language-only` |
 | `chat_template.later_system` | `native`, `patched` or `unsupported`: how system messages after the first render (per name for named templates) |
-| `transport.recovering`, `transport.error` | The engine is restarting; `error` names its failure or the last failed restart |
+| `transport.recovering`, `transport.stopped`, `transport.error` | The engine is restarting, or Splash stopped restarting it after repeated failures; `error` names its failure, the last failed restart, or why restarts stopped |
 
-`GET /metrics` exposes the same counters in Prometheus text format. Both endpoints
-require the API key when authentication is enabled. Consumers should tolerate
-missing native fields while the engine is unavailable, and counter resets after
-an engine restart. Chat and text completion streams include token usage when
-the request sets `"stream_options":{"include_usage":true}`; their non-streaming
-responses always include usage. A proxy must consume these fields to display
-statistics.
+`GET /ready` is 200 while the engine's own `ready` is true. While the engine
+loop is busy, `/ready` keeps its last answer until the loop has left status
+requests unanswered for 30 s; a loop that leaves a status refresh unanswered
+that long fails the engine, which then restarts.
+
+`GET /metrics` exposes the same counters in Prometheus text format.
+`splash_kv_free_allocated_pages` counts free pages of allocated extents, not
+remaining capacity; memory headroom is `splash_memory_headroom_bytes`. Both
+endpoints require the API key when authentication is enabled. Consumers should
+tolerate missing native fields while the engine is unavailable, and counter
+resets after an engine restart. Chat and text completion streams include token
+usage when the request sets `"stream_options":{"include_usage":true}`; their
+non-streaming responses always include usage. A proxy must consume these fields
+to display statistics.
 
 Chat and text completions include a llama-server-style `timings` object, both in
 non-streaming responses and in the final finish-reason chunk of a stream,
@@ -790,33 +1004,66 @@ response writing for admitted API requests. Preparation, queue, template,
 tokenization, output grammar preparation and image preparation are measured
 separately; preparation includes its nested stages. Tokenization covers the encoding call, including reuse when
 available. Histogram buckets are cumulative and labeled by upper bound.
-TTFT starts before upload and ends at the first native token
-event. Output intervals are between native token events, which can contain
+HTTP TTFT (`http_ttft`) starts before upload and ends at the first native
+token event; native TTFT (`metrics.ttft_ms`, per-request
+`request_latency.ttft_ms`) starts when the engine receives the request.
+Output intervals are between native token events, which can contain
 multiple speculative tokens; they are not per-token latency. Native queue timing
 is recorded from successful completions. These histograms live with the HTTP
 process and survive a native engine restart.
 
-HTTP bodies require Content-Length, and browser
-Origin must match Host. `--allowed-host` permits additional hostnames. Request
+HTTP bodies require Content-Length, and a browser's
+Origin must match Host or be one `--allowed-origin` names. `--allowed-host`
+permits additional hostnames. Request
 logs omit bodies; full crash traces require explicit `SPLASH_CRASH_TRACE=1` and
 can contain private conversation data. A frame over 16 MiB, such as a request
 with large images, is kept only as a marker with its size and SHA-256
 (`omitted_frames` counts them), and a trace missing engine input that way
-cannot be replayed.
+cannot be replayed. `python -m server.crash_trace <trace>`, run from the
+checkout root, replays a trace.
 
 A request keeps its reusable model state at the last whole 32-token page before
 its generation prompt, the text a chat template appends to open the reply: the
 next turn may render it differently, so a follow-up resumes from there.
+
+Until the request ends, suspended or not, that replay point is in use, and so is
+the KV it restores through. When the last request using it ends, the point
+becomes the newest ordinary state; the older points on its chain keep their age.
+Cache victims come in three classes: checkpoints, then ordinary states and KV
+(first the KV no state restores through, which saves no prefill), then what is
+in use. No work displaces anything of a class above its own. Memory for running
+requests takes what is in use after everything else. A start that a resident
+lane holds back takes nothing in use: it waits for that lane. Nor does the lane
+that yields first when no lane's growth fits, such as one just started beside a
+decoding lane: its own suspension pays for the memory, and while other lanes fit
+it waits for them, resident. A publication in use takes cached KV and states in
+the same order, then the oldest state in use; of the KV it takes only leaves
+whose page frees at once, and only while an extent can be emptied; the extent is
+released at once, and the snapshot follows. An ordinary publication (a junction)
+makes room the same way short of what is in use, and an optional checkpoint
+takes only checkpoints; neither drops a state whose write must wait for the
+write in flight. A disk copy in use may displace the oldest copy in use, and
+ordinary or optional work never displaces anything in use. Nothing in use is
+pinned, so running work that needs the memory still takes it once nothing else
+is left. A resumed lane that lost its prompt's replay point rebuilds it on the
+way; the point its generated history reaches is a disposable checkpoint.
+`/status` reports under `state` the replay points unfinished requests hold
+(`in_use`, zero when idle) and those evicted all the same (`in_use_evictions`).
+
 Requests sharing a cold prefix can wait for a resident request's planned recovery
-point, then enter through the ordinary cache restore path. Waiting requests hold
-no active state cell or KV pages and return to ordinary admission when no useful
-producer remains. Late arrivals can extend the plan at complete state boundaries.
+point, including one whose prefix is still being restored from disk, then enter
+through the ordinary cache restore path. Waiting requests hold no lane or KV
+pages and return to ordinary admission when no useful producer remains. Late
+arrivals can extend the plan at complete state boundaries.
 Higher-priority work does not wait for a lower-priority producer. `/status` exposes
 `scheduler.waiting_prefix` separately from resource waits.
 
-Greedy and sampled requests can share an unconstrained decode batch; each lane
-keeps its own sampling policy and RNG. Pure greedy batches retain their argmax
-path. Constrained requests use a separate batch for the host mask exchange.
+Greedy and sampled requests share unconstrained decode batches; each lane keeps
+its own sampling policy and RNG, and a greedy lane takes the argmax path in any
+batch. Constrained requests use a separate batch for the host mask exchange.
+A mask request the server leaves unanswered for 5 s fails that request with
+the retryable `mask_timeout` (HTTP 503), so a stalled grammar cannot hold the
+batch's command.
 A lane's arithmetic can depend on the batch it decodes in and on how its
 prompt is chunked. Concurrent requests change both, and chunk boundaries also
 come from the cached boundary a request resumes from and from the junctions
@@ -824,16 +1071,28 @@ and checkpoints earlier requests left. So a greedy or seeded request repeats
 its output when it runs alone with the same cached prefixes; alongside other
 requests, or with other prefixes cached, it can differ.
 
-Long prefill uses disposable rolling checkpoints every 4096 tokens. Contended
-prefill adapts toward a 500 ms slice, keeping 2048-token chunks for long unopposed
-work. These policies do not extend client deadlines. Memory recovery waits are
+Long prefill uses disposable rolling checkpoints every 4096 tokens; none is
+planned within one prefill chunk (2048 tokens) of where the request resumes or
+of its replay boundary. Contended prefill adapts toward a 500 ms slice, keeping
+2048-token chunks for long unopposed work. Without contention, a prompt that
+can finish within one 2048-token chunk ends its chunk at its last row instead
+of sharing it with a longer prompt. While requests of the same or a higher
+priority decode (a lane waiting for its token mask is owed nothing), each slice
+owes them decode time, `--decode-share` times its own, before the next slice
+runs.
+These policies do not extend client deadlines. Memory recovery waits are
 bounded: after a suspension, new work waits for resident requests only while
 memory is still short, and at most for the 30 s resource wait; suspended
-requests then resume first, each within its own resource wait. A resource
-wait's limit restarts whenever a lane submitted before the waiting request has
-work in flight, since that lane holds memory the request waits for until it
-finishes; lanes submitted after the request do not extend it. Readiness does
-not guarantee that a request-sized allocation fits.
+requests then resume first, each within its own resource wait. A request of a
+strictly higher priority than every suspended request waits for neither. A
+resource wait's limit restarts whenever a lane submitted before the waiting
+request, or admitted before the request was first refused memory or was
+suspended, has work in flight, since that lane holds memory the request waits
+for until it finishes; other lanes do not extend it. Readiness does not
+guarantee that a request-sized allocation fits. A request that cannot fit even
+alone, after every cached prefix was evicted, fails with 400
+`capacity_exhausted`, naming `--max-memory` and `--max-context`; retrying it
+fails the same way.
 
 ### Disk cache
 
@@ -851,42 +1110,59 @@ The estimate is conservative, since macOS compresses other applications further
 once the engine loads. The tier does not raise the context limit.
 
 Writes happen when RAM reclamation selects a victim. States copy through one
-host staging buffer, freeing their RAM immediately. KV leaves needed by a state
-on them or below them copy through a 128-page staging ring and are released
-after the write succeeds. Unneeded tails are dropped without writing, together
-with any disk copies below them. When staging is busy, admission waits for the
-transfer instead of evicting additional victims.
-Demotions may occupy half the ring and restores three quarters, leaving room
-for the other direction. Copies ride Metal commands, including a copy-only
-command when inference is idle.
+staging buffer, freeing their RAM immediately. KV leaves needed by a state
+on them or below them are written straight from their extents and released
+after the write succeeds. Unneeded tails are dropped without writing, before any
+state, together with any disk copies below them. A restored page is read
+straight into its extent. Either way the transfer runs on the file's IO worker
+beside whatever command the model runs: a cached page is never written by a
+command, and no command uses a page before its read has landed. At most 128 KV
+pages are in transfer at a time, demotions at most half of them and restores at
+most three quarters, since one worker serves both in order and a burst of either
+kind must leave the other its share. When the tier takes no more, leaves that
+need a write stay until a transfer lands, while leaves whose page frees without
+one still go.
 
 A state with no available RAM cache slot can be written directly from its lane.
+When every state in RAM is in use and no cached KV is left to take, a replay
+point takes the slot of the oldest by writing that one out, and goes
+unpublished while the staging buffer is busy.
 Rolling checkpoints replace the least recently used copies like any state, so
 a suspended request keeps its progress when the quota is full; they retire when
-replaced or no longer needed. With the disk tier enabled, a checkpoint less than one full
-prefill chunk (2048 tokens) before the final replay boundary is captured only
-if a RAM slot is available without reclamation. Otherwise its predecessor stays
-usable for cancellation recovery; the final reusable state still uses the disk
-tier. Matched KV restores start from the root toward the selected
-state, with the state read alongside. Cancellation drops unsubmitted, unshared
-reads; submitted transfers drain before their buffers can be reused. Restored
-states remain usable even when there is no room to promote them into RAM cache.
+replaced or no longer needed. Matched KV restores start from the root toward
+the selected state, in that order as the tier takes them, with the state read
+alongside. Cancellation drops unsubmitted, unshared reads; submitted transfers
+drain before their buffers can be reused. Restored states remain usable even
+when there is no room to promote them into RAM cache. Promotion takes only the
+RAM of a state that keeps a disk copy.
 
 Two unlinked temporary files share one quota for live slots. A full quota
 replaces the oldest redundant copy first, then the oldest sole copy, across
-both KV and states. A quota smaller than the working set can cause repeated
-reads and writes; it is not a write-rate limit. Each file retains its allocated
-high-water mark until shutdown, so filesystem space can exceed the live-slot
-quota. Closing the server releases both files.
+both KV and states. Sole copies of states in use, and the KV they restore
+through, make room only for a copy that is itself in use, and last; an ordinary
+state that finds no other room is dropped. A quota smaller than the working set
+can cause repeated reads and writes; it is not a write-rate limit. A freed slot
+returns its quota at once and its blocks to the volume (`F_PUNCHHOLE`) once its
+file's IO worker finishes the transfer it is in, so the two files together
+occupy about the live slots instead of each keeping its high-water mark;
+`/status` reports that as `disk.file_bytes` beside `disk.used_bytes`. Until the
+punch the other file can take that quota, so allocated blocks can briefly exceed
+`--max-cache-disk` by the slots freed but not yet punched, bounded by the
+transfer each file's worker is in: about 2% of a 10G tier in a 25-minute churn
+run on an M5 Max. A volume sized exactly to the quota can therefore fill; the
+write that finds it full stops that file's writes for the rest of the process,
+as below, while serving continues. On a volume that cannot punch holes the
+files keep the blocks of freed slots, which the runtime reports once. Closing
+the server releases both files.
 
-Transfers use `pread`/`pwrite` with `F_NOCACHE`. The KV staging ring, 128
-pages that the GPU copies through, is Metal memory within `--max-memory`: about
-42 MiB for 35B and 130 MiB for 27B with INT8 KV, 80 MiB and 256 MiB with BF16 KV.
-The memory plan sets it aside whenever the flag is set, even if the tier then
-fails to start, so the KV pool and the advertised context shrink by it.
-The state staging buffer, one state (109 MiB for 35B, 187 MiB for 27B), is host
-memory outside `--max-memory`.
-A quota too small for one state leaves the tier disabled.
+Transfers use `pread`/`pwrite` with `F_NOCACHE`, every one an aligned range:
+whole 1 MiB chunks of 16 KiB-aligned memory that start at an aligned offset of
+the slot (a state's staging buffer and lane buffers) move directly, everything
+else through the file's own 1 MiB buffer. The KV tier takes no Metal memory.
+The state staging buffer, one state (109 MiB for 35B, 187 MiB for 27B), is a
+buffer of the backend's like every other: resident, and set aside by the memory
+plan within `--max-memory` when the tier starts. A quota too small for one
+state leaves the tier disabled and sets nothing aside.
 A failed write disables further writes to that file. Failed KV writes retain
 RAM pages; failed state writes invalidate the disk copy. A failed read
 invalidates its cached data, allowing lookup to fall back to the surviving
@@ -903,6 +1179,9 @@ counters include:
   transfers count once, including those completed before cancellation or a
   resource retry.
 - `lost_state_misses`: lookups that matched KV where a reusable state used to be.
+- `probe_hashed_blocks`: KV pages hashed to rank waiting requests between
+  commands. A waiting request's match is kept across passes and extended only
+  past what the cache changed.
 
 ### Judgment contracts
 
@@ -992,20 +1271,22 @@ entropy concentration, `1 - H(p) / log(K)`, not an estimate of correctness.
 Score answers are probability-weighted level indices. Measure accuracy and
 calibrate on representative held-out data before using decision thresholds.
 
-Native wire version 6 appends score-token IDs to requests and selected f32 logits
-to Done events; a version mismatch is fatal. Scoring requires 2–255 distinct,
-in-vocabulary tokens, no images or generation constraints, and a zero output budget.
-It may use the full context window because no generated token needs a reserved
-position. The final prefill chunk runs the target head but no sampling policy or
-DFlash decode. Successful scoring emits no Tokens event, finishes with Stop, and
-reports zero decode time. Cancelled requests carry no logits.
+Requests carry the score-token IDs and Done events the selected f32 logits; the
+server and the engine must speak the same native wire version. Scoring requires
+2–255 distinct, in-vocabulary tokens, no images or generation constraints, and a
+zero output budget. It may use the full context window because no generated
+token needs a reserved position. The final prefill chunk runs the target head
+but no sampling policy or DFlash decode. Successful scoring emits no Tokens
+event, finishes with Stop, and reports zero decode time. Cancelled requests
+carry no logits.
 
-A non-finite score logit is a per-request failure, not an engine fault: the
-engine reports `model_result_invalid` for that request alone, before it
-publishes the failing step's cache state or any output, and the rest of the
-batch finishes normally. Prompt chunks that already succeeded keep the blocks
-they committed, exactly as they do for a cancelled request. GPU faults and
-broken engine invariants stay fatal and still mark the runtime unhealthy.
+A non-finite logit row is a per-request failure, not an engine fault: a score
+logit, or a token the sampling kernels could only select outside the
+vocabulary. The engine reports `model_result_invalid` for that request alone,
+before it publishes the failing step's cache state or any output, and the rest
+of the batch finishes normally. Prompt chunks that already succeeded keep the
+blocks they committed, exactly as they do for a cancelled request. GPU faults
+and broken engine invariants stay fatal and still mark the runtime unhealthy.
 
 ## Validate
 
@@ -1041,6 +1322,14 @@ and `REVISION`, `DRAFT_MODEL` and `LANGUAGE_ONLY=1` as its `--revision`,
 root, `splash-test-<id>`, which moves into the run's folder under
 `build/release` when Hermes finishes.
 
+Each phase's record keeps what its requests reused of the cache (`reuse`).
+Every request after a phase's first resends the conversation, so a phase that
+completed two or more requests and reused no cached prompt token fails. Two
+phases are exempt: the cancellation phase (`cancel`), and the reference wave
+that compacts the conversation, whose summary request and the request after it
+share only the system prompt and tools. Replay points of unfinished requests
+evicted during a phase only print a warning.
+
 `benchmark-backend`, `benchmark-decode-profile` and `tune-kernels` take `MODEL`
 the same way. The models they are run with, one per family and source format:
 
@@ -1069,13 +1358,13 @@ unnoticed, but no target runs it because it needs real models: after
 matching installed package to compare every prepared byte.
 
 Compare performance on the same idle Mac with the same model and workload.
-`make tune-kernels MODEL=...` measures the precompiled kernel candidates for the
-installed model on this Mac against the policy defaults in `runtime/ops` and
-prints, per key, the winner with its paired GPU and wall-time gain, spelled as
-the enumerators it would install, or that the default is kept; it changes no
-default and saves no profile. For a GGUF model
-it measures only the attention kernels and the draft, and says so in its
-header, since GGUF projection and MoE plans read no tuned choice
+`make tune-kernels MODEL=...` measures each projection key of the installed
+model on this Mac: the policy default in `runtime/ops` against the tile
+configurations that won an earlier run (`dev/tuning/LinearTuning.hpp`). It
+prints, per key, the winning configuration with its paired GPU and wall-time
+gain, or that the default is kept; it changes no default and saves no profile.
+For a GGUF model it measures only the draft's projections, and says so in its
+header, since the device policy alone plans block projections
 ([GGUF targets](#gguf-targets)). Keep generated reports, profiles, local paths
 and experiment notes out of the source tree and commits.
 
@@ -1141,6 +1430,12 @@ the three 27B comparisons. A laptop can cap its GPU power during a long
 comparison and so make it inconclusive; rerun `make test-performance-real` for
 that model alone once the Mac has cooled.
 
+When the native wire layout or the status schema changed since the last
+release, bump `kProtocolVersion` (`runtime/engine/Protocol.hpp`) and
+`PROTOCOL_VERSION` (`server/protocol.py`) together: builds between releases
+share a version while its layout changes, and a server refuses an engine of
+another version.
+
 ### Local benchmarks
 
 From a source checkout with the model installed, use the native benchmark for
@@ -1165,8 +1460,10 @@ report. Its cache checks reuse each context's cached prefix, so they need that
 memory free: when other programs leave too little, the engine evicts cached
 prefixes and the checks fail, naming what each lookup found.
 
-For a same-machine HTTP regression check, retain the previous `splash` binary
-**and its adjacent `splash.metallib`**, then run from the candidate checkout:
+For a same-machine HTTP regression check, retain a `splash` binary **and its
+adjacent `splash.metallib`** built from a checkout with the same native wire
+version and status schema as this one (the server refuses any other), then run
+from the candidate checkout:
 
 ```sh
 .venv/bin/python -m dev.benchmarks.http_regression \
@@ -1178,8 +1475,17 @@ For a same-machine HTTP regression check, retain the previous `splash` binary
 It takes any installed model and, for an upstream one, holds its assembly for
 the whole run, so every round serves the same model. It starts isolated servers
 in ABBA order, compares matched cold, exact-prefix and decode requests by the
-release check's speed rule and prepared bytes, and saves
-`build/release/http-regression.json`.
+release check's speed rule and prepared bytes (decode by
+`metrics.decode_cycle_ms` per output token, so host work between commands
+counts; against a baseline that does not report it, both versions by
+`metrics.decode_wall_ms` per output token, as each comparison's `metric`
+says), and saves `build/release/http-regression.json`. With `--burst N` it
+sends N requests of each context at once instead, 16 output tokens each, and
+reports each build's replay points lost to the burst
+(`replay_state_publication_failures`), its decode rate and advertised context;
+`--follow-up`, which a burst run needs to pass, then sends each conversation's
+next turn and compares their time to first token and how many resumed at their
+replay point.
 It does not contact your running server. Use the same power mode and charger,
 stop other GPU workloads, and report chip/GPU cores, memory, Splash version,
 model revision, actual input/output token counts, and cache hits with results.
@@ -1187,7 +1493,7 @@ Keep cold prefill, cached TTFT and sustained decode separate; a UI token rate
 alone does not measure end-to-end agent performance.
 
 For slow tool-bearing requests, the `latency` section of `/status` separates
-preparation, tokenization, grammar preparation, native queueing and TTFT. Grammar preparation
+preparation, tokenization, grammar preparation, native queueing and HTTP TTFT. Grammar preparation
 includes construction, compilation/cache lookup and per-request cloning;
 it does not include generation-time masks. The `grammar_cache` counters show
 whether compiled output grammars are reused. Tool definitions still contribute

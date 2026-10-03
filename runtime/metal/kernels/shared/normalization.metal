@@ -48,25 +48,13 @@ inline float rms_inverse_of(thread const bfloat (&first)[kNormColumns],
                             device const bfloat *row, uint width,
                             threadgroup float *reductions, uint tid, uint lane,
                             uint sg) {
-#pragma clang fp reassociate(off)
   float sum = add_squares(first, 0.0f);
   for (uint begin = kNormChunk; begin < width; begin += kNormChunk) {
     bfloat x[kNormColumns];
     load_norm_chunk(row, width, begin, tid, x);
     sum = add_squares(x, sum);
   }
-  sum = simd_sum(sum);
-  if (lane == 0)
-    reductions[sg] = sum;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (tid == 0) {
-    float total = 0.0f;
-    for (uint i = 0; i < 8; ++i)
-      total += reductions[i];
-    reductions[0] = rsqrt(total / width + 1e-6f);
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  return reductions[0];
+  return rms_inverse_of_sums(sum, width, reductions, tid, lane, sg);
 }
 
 template <class W>

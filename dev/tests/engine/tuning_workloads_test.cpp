@@ -1,5 +1,7 @@
+#include "TestChecks.hpp"
 #include "tuning/TuningWorkloads.hpp"
 
+#include "metal/BackendInstrumentation.hpp"
 #include "metal/abi/QuantFormat.h"
 
 #include <algorithm>
@@ -13,15 +15,13 @@ namespace {
 
 using namespace splash::model;
 using namespace splash::ops;
+using splash::metal::BackendInstrumentation;
 
 static_assert(!tuning::kPrefillProbeRows.empty() &&
               tuning::kPrefillProbeRows.back() == ExecutionLimits::prefillTokenBudget);
 static_assert(tuning::kDecodeProbeWidths == std::array<uint32_t, 4>{1, 2, 3, 4});
 
-void require(bool condition, const char *message) {
-  if (!condition)
-    throw std::runtime_error(message);
-}
+using splash::test::require;
 
 template <class Function> void rejects(Function function) {
   try {
@@ -93,9 +93,9 @@ DFlashDraftWeights draftWeights(DFlashDraftLayout layout) {
   return draft;
 }
 
-std::set<LinearWorkload> linearKeys(const TuningWorkloads &inventory) {
+std::set<LinearWorkload> linearKeys(const std::vector<tuning::LinearTuningInput> &inventory) {
   std::set<LinearWorkload> result;
-  for (const auto &input : inventory.linear) {
+  for (const auto &input : inventory) {
     require(result.insert(input.workload).second, "duplicate linear workload");
     require(!input.weights.empty() &&
                 input.weights.size() <= tuning::kMaximumLinearTuningRepresentatives,
@@ -113,7 +113,7 @@ std::set<LinearWorkload> linearKeys(const TuningWorkloads &inventory) {
                 "fused gate/up lost its matching gate projection");
     }
   }
-  require(std::is_sorted(inventory.linear.begin(), inventory.linear.end(),
+  require(std::is_sorted(inventory.begin(), inventory.end(),
                         [](const auto &a, const auto &b) {
                           return a.workload < b.workload;
                         }),
@@ -165,33 +165,19 @@ std::set<LinearWorkload> expectedLinear(
   return result;
 }
 
-void checkPair(ModelPackage package, bool sparse) {
+void checkPair(ModelPackage package) {
   const auto startup = collectTuningWorkloads(
       package, tuning::kPrefillProbeRows, tuning::kDecodeProbeWidths);
   require(linearKeys(startup) == expectedLinear(
               package, tuning::kPrefillProbeRows, tuning::kDecodeProbeWidths),
           "startup inventory differs from fixed 2048 prefill and B1-B4 decode");
-  require(startup.moe.size() ==
-              (sparse ? tuning::kPrefillProbeRows.size() +
-                            tuning::kDecodeProbeWidths.size()
-                      : 0U),
-          "startup MoE inventory contains extra prefill shapes");
-  for (const auto &input : startup.moe)
-    require(input.workload.phase == MoePhase::Prefill
-                ? std::find(tuning::kPrefillProbeRows.begin(),
-                            tuning::kPrefillProbeRows.end(),
-                            input.workload.rows) !=
-                      tuning::kPrefillProbeRows.end()
-                : input.workload.rows >= 8 && input.workload.rows <= 32 &&
-                      input.workload.rows % 8 == 0,
-            "startup MoE inventory contains an unsupported row count");
   // The metadata collector still describes exact ragged rows for correctness
   // and dependency checks; these are not additional calibration workloads.
   constexpr std::array prefill{2048U, 17U, 2048U};
   constexpr std::array decode{4U, 1U, 3U, 2U, 4U};
   const auto inventory = collectTuningWorkloads(package, prefill, decode);
   const auto keys = linearKeys(inventory);
-  for (const auto &input : inventory.linear) {
+  for (const auto &input : inventory) {
     require(input.weights.size() == 1, "tied empty views were not deduplicated");
     const auto &weight = input.weights.front().projection;
     require(!weight.affine().weights && !weight.affine().scales && !weight.affine().biases,
@@ -199,33 +185,6 @@ void checkPair(ModelPackage package, bool sparse) {
   }
   require(keys == expectedLinear(package, prefill, decode),
           "inventory differs from production operation/phase/epilogue set");
-  const auto geometry = std::visit([](const auto &weights) {
-    return qwenTargetGeometry(weights);
-  }, package.target);
-  require(inventory.targetAttention == AttentionShape{
-              geometry.attentionQueryHeads, geometry.attentionKvHeads,
-              geometry.attentionHeadDimension} &&
-              inventory.draftAttention == package.draft.layout.attentionShape(),
-          "attention geometry was inferred from a model-name preset");
-  std::set<MoeWorkload> actualMoe;
-  for (const auto &input : inventory.moe) {
-    require(actualMoe.insert(input.workload).second, "duplicate MoE workload");
-    require(input.weights.size() == 1, "tied empty MoE views were not deduplicated");
-    for (const auto &weights : input.weights)
-      require(weights.affine().expertGate.inputSize == input.workload.shape.hiddenSize &&
-                  weights.affine().expertDown.outputSize == input.workload.shape.hiddenSize &&
-                  weights.affine().expertGate.experts == input.workload.shape.experts &&
-                  weights.affine().sharedGate.experts == 1,
-              "MoE representative lost real router/expert geometry");
-  }
-  std::set<MoeWorkload> expectedMoe;
-  if (sparse) {
-    for (uint32_t rows : prefill)
-      expectedMoe.insert({geometry.moeShape(), rows, MoePhase::Prefill});
-    for (uint32_t width : decode)
-      expectedMoe.insert({geometry.moeShape(), width * 8, MoePhase::Decode});
-  }
-  require(actualMoe == expectedMoe, "dense/sparse FFN inventory is incorrect");
 
   package.descriptor.name = "unseen-paired-model-with-identical-operators";
   package.manifestFingerprintSha256 = "different-weight-identity";
@@ -236,20 +195,13 @@ void checkPair(ModelPackage package, bool sparse) {
   }, package.target);
   package.draft.layers.push_back(package.draft.layers.front());
   const auto renamed = collectTuningWorkloads(package, prefill, decode);
-  require(linearKeys(renamed) == keys &&
-              renamed.targetAttention == inventory.targetAttention &&
-              renamed.draftAttention == inventory.draftAttention,
+  require(linearKeys(renamed) == keys,
           "dedup depends on layer count or model/weight names");
-  std::set<MoeWorkload> renamedMoe;
-  for (const auto &input : renamed.moe)
-    renamedMoe.insert(input.workload);
-  require(renamedMoe == actualMoe && renamed.moe.size() == inventory.moe.size(),
-          "MoE dedup depends on layer count or model/weight names");
   const auto noDecode = collectTuningWorkloads(package, prefill, {});
   require(linearKeys(noDecode) == expectedLinear(package, prefill, {}),
           "prefill-only sweep introduced decode work");
   const auto empty = collectTuningWorkloads(package, {}, {});
-  require(empty.linear.empty() && empty.moe.empty(), "empty probe sets created work");
+  require(empty.empty(), "empty probe sets created work");
   rejects([&] { (void)collectTuningWorkloads(package, std::array{0U}, decode); });
   rejects([&] { (void)collectTuningWorkloads(package, std::array{2049U}, decode); });
   rejects([&] { (void)collectTuningWorkloads(package, prefill, std::array{0U}); });
@@ -258,9 +210,8 @@ void checkPair(ModelPackage package, bool sparse) {
   rejects([&] { (void)collectTuningWorkloads(package, prefill, decode); });
 }
 
-// A GGUF target is not tuned: the collector takes none of its projections or
-// MoE blocks, only the affine draft's, and a choice table may not hold a
-// block projection or GGUF MoE workload.
+// A GGUF target is not tuned: the collector takes none of its projections,
+// only the affine draft's.
 void blockTarget() {
   ModelPackage package;
   const Qwen3_6MoeLayout layout;
@@ -277,7 +228,6 @@ void blockTarget() {
     }, layer.mixer);
     layer.ffn = BlockMoeWeights{};
   }
-  const MoeShape shape = qwenTargetGeometry(target).moeShape();
   package.target = std::move(target);
   DFlashDraftLayout draft;
   draft.layers = 6;
@@ -288,35 +238,19 @@ void blockTarget() {
   package.draft = draftWeights(draft);
   const auto inventory = collectTuningWorkloads(package, tuning::kPrefillProbeRows,
                                                 tuning::kDecodeProbeWidths);
-  require(inventory.moe.empty(), "a GGUF target's MoE blocks were collected for tuning");
   for (const auto &input : linearKeys(inventory))
     require(input.epilogue != LinearEpilogue::Residual &&
                 input.matrix != LinearMatrix{layout.vocabularySize, layout.hiddenSize} &&
                 input.matrix != LinearMatrix{layout.packedGdnWidth, layout.hiddenSize} &&
                 input.matrix != LinearMatrix{layout.packedFullWidth, layout.hiddenSize},
             "a GGUF target's projections were collected for tuning");
-  require(shape.weightLayout == WeightLayout::Block32, "the block target lost its MoE layout");
-  splash::DeviceCapabilities device;
-  device.appleGpuFamily = 10;
-  device.gpuCoreCount = 16;
-  ExecutionPlans plans(device);
-  OperatorChoices choices;
-  choices.moe.push_back({{shape, 512, MoePhase::Prefill}, {MoeExpertTile::M8}});
-  rejects([&] { plans.install(choices); });
-  choices.moe.clear();
-  choices.linear.push_back({{{layout.vocabularySize, layout.hiddenSize}, 8, LinearPhase::Decode,
-                             LinearEpilogue::None, WeightLayout::Block32},
-                            plans.linear().plan({{layout.vocabularySize, layout.hiddenSize}, 8, LinearPhase::Decode,
-                                                 LinearEpilogue::None, WeightLayout::Block32})
-                                .configuration()});
-  rejects([&] { plans.install(choices); });
 }
 
 void run() {
   ModelPackage dense;
   dense.target = targetWeights<Qwen3_8Weights>(Qwen3_8Layout{});
   dense.draft = draftWeights(DFlashDraftLayout{});
-  checkPair(dense, false);
+  checkPair(dense);
 
   ModelPackage sparse;
   sparse.target = targetWeights<Qwen3_6MoeWeights>(Qwen3_6MoeLayout{});
@@ -327,7 +261,7 @@ void run() {
   smallerDraft.intermediateSize = 6144;
   smallerDraft.targetHiddenSize = 16384;
   sparse.draft = draftWeights(smallerDraft);
-  checkPair(sparse, true);
+  checkPair(sparse);
 
   Qwen3_8Layout alternateDense;
   alternateDense.hiddenSize = 4096;
@@ -339,7 +273,7 @@ void run() {
   alternateDraft.targetHiddenSize = 20480;
   dense.target = targetWeights<Qwen3_8Weights>(alternateDense);
   dense.draft = draftWeights(alternateDraft);
-  checkPair(dense, false);
+  checkPair(dense);
 
   Qwen3_6MoeLayout alternateSparse;
   alternateSparse.hiddenSize = 1024;
@@ -359,7 +293,7 @@ void run() {
   smallerDraft.targetHiddenSize = 8192;
   sparse.target = targetWeights<Qwen3_6MoeWeights>(alternateSparse);
   sparse.draft = draftWeights(smallerDraft);
-  checkPair(sparse, true);
+  checkPair(sparse);
 
   dense.draft.layers.clear();
   rejects([&] { (void)collectTuningWorkloads(dense, std::array{32U}, std::array{1U}); });
@@ -370,7 +304,7 @@ void run() {
 void metadataViews(const char *metallib) {
   using namespace splash::metal;
   MetalBackend backend(metallib);
-  const uint64_t submissions = backend.submissionCount();
+  const uint64_t submissions = BackendInstrumentation::submittedCommands(backend);
   // Metadata-only test: one small allocation, no data access or GPU command.
   // Components are intentionally tiny because no projection is executed.
   const auto backing = backend.allocateBuffer(32 * 1024, BufferStorage::Shared,
@@ -414,9 +348,9 @@ void metadataViews(const char *metallib) {
     const auto bytes = backend.memoryStats().allocatedBytes;
     const auto inventory = collectTuningWorkloads(package, std::array{32U}, std::array{1U});
     (void)linearKeys(inventory);
-    const auto found = std::find_if(inventory.linear.begin(), inventory.linear.end(),
+    const auto found = std::find_if(inventory.begin(), inventory.end(),
                                     [&](const auto &input) { return input.workload == key; });
-    require(found != inventory.linear.end(), "GateUp inventory disappeared");
+    require(found != inventory.end(), "GateUp inventory disappeared");
     const size_t expected = variation == Variation::Tied
         ? 1 : tuning::kMaximumLinearTuningRepresentatives;
     require(found->weights.size() == expected,
@@ -440,81 +374,7 @@ void metadataViews(const char *metallib) {
             "collecting representative views copied weight backing");
   }
 
-  package.target = targetWeights<Qwen3_6MoeWeights>(Qwen3_6MoeLayout{});
-  auto &sparse = std::get<Qwen3_6MoeWeights>(package.target);
-  DFlashDraftLayout sparseDraft;
-  sparseDraft.layers = 6;
-  sparseDraft.hiddenSize = 2048;
-  sparseDraft.dynamicSize = 512;
-  sparseDraft.intermediateSize = 6144;
-  sparseDraft.targetHiddenSize = 16384;
-  package.draft = draftWeights(sparseDraft);
-  auto moeView = [&](uint32_t index) {
-    auto buffer = [&](uint32_t component) {
-      return backend.view(backing, uint64_t{index * 12 + component} * 128, 128);
-    };
-    const auto &layout = sparse.layout;
-    const Q8Projection router{{buffer(0), buffer(1), buffer(2)}, 256, layout.hiddenSize};
-    const Q8Projection sharedRouter{{buffer(3), buffer(4), buffer(5)}, 256, layout.hiddenSize};
-    auto expert = [&](uint32_t component, uint32_t count, bool down) {
-      return ExpertProjection{buffer(component), count,
-          down ? layout.hiddenSize : layout.expertIntermediateSize,
-          down ? layout.expertIntermediateSize : layout.hiddenSize, 16'384};
-    };
-    return AffineMoeWeights{router, expert(6, layout.experts, false),
-        expert(7, layout.experts, false), expert(8, layout.experts, true),
-        expert(9, 1, false), expert(10, 1, false), expert(11, 1, true), sharedRouter};
-  };
-  enum class MoeVariation { Distinct, RouterOnly, SharedOnly, StrideOnly, Tied };
-  for (const auto variation : {MoeVariation::Distinct, MoeVariation::RouterOnly,
-                                MoeVariation::SharedOnly, MoeVariation::StrideOnly,
-                                MoeVariation::Tied}) {
-    for (uint32_t index = 0; index < sparse.layers.size(); ++index) {
-      const uint32_t representative = index / 2;
-      AffineMoeWeights weights = moeView(variation == MoeVariation::Distinct ? representative : 0);
-      if (variation == MoeVariation::RouterOnly)
-        weights.router.planes.scales = moeView(representative).router.planes.scales;
-      if (variation == MoeVariation::SharedOnly)
-        weights.sharedDown.packed = moeView(representative).sharedDown.packed;
-      if (variation == MoeVariation::StrideOnly)
-        weights.expertGate.expertStrideBytes += representative * 16'384;
-      sparse.layers[index].ffn = weights;
-    }
-    const auto bytes = backend.memoryStats().allocatedBytes;
-    const auto inventory = collectTuningWorkloads(package, std::array{32U}, std::array{1U});
-    require(inventory.moe.size() == 2, "MoE metadata changed workload geometry");
-    for (const auto &input : inventory.moe) {
-      const size_t expected = variation == MoeVariation::Tied
-          ? 1 : tuning::kMaximumMoeTuningRepresentatives;
-      require(input.weights.size() == expected,
-              "MoE representative bound ignored routed/shared weight identities");
-      // The 40-layer sparse fixture has 20 distinct router/expert bundles.
-      constexpr std::array<size_t, 8> sourceLayers{0, 4, 10, 16, 20, 26, 32, 38};
-      for (size_t index = 0; index < expected; ++index) {
-        const auto &actual = input.weights[index];
-        const auto &source = sparse.layers[sourceLayers[index]].ffn;
-        for (auto field : {&AffineMoeWeights::router, &AffineMoeWeights::sharedScalarGate}) {
-          const auto &left = (actual.affine().*field).planes;
-          const auto &right = (source.affine().*field).planes;
-          require(left.weights.sameView(right.weights) &&
-                      left.scales.sameView(right.scales) && left.biases.sameView(right.biases),
-                  "MoE representatives missed router layer depth");
-        }
-        for (auto field : {&AffineMoeWeights::expertGate, &AffineMoeWeights::expertUp,
-                            &AffineMoeWeights::expertDown, &AffineMoeWeights::sharedGate,
-                            &AffineMoeWeights::sharedUp, &AffineMoeWeights::sharedDown}) {
-          const auto &left = actual.affine().*field;
-          const auto &right = source.affine().*field;
-          require(left.packed.sameView(right.packed) &&
-                      left.expertStrideBytes == right.expertStrideBytes,
-                  "MoE representative lost router/expert/shared pairing");
-        }
-      }
-    }
-    require(backend.memoryStats().allocatedBytes == bytes,
-            "collecting MoE representatives copied weight backing");
-  }
-  require(backend.submissionCount() == submissions,
+  require(BackendInstrumentation::submittedCommands(backend) == submissions,
           "collecting representative metadata submitted GPU work");
 }
 

@@ -13,11 +13,11 @@
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "model/ModelFactory.hpp"
+#include "model/PreparedWeights.hpp"
 #include "ops/Vision.hpp"
 #include "tuning/LinearNumerics.hpp"
 
 #import <Foundation/Foundation.h>
-#include <CommonCrypto/CommonDigest.h>
 
 #include <algorithm>
 #include <cmath>
@@ -195,7 +195,7 @@ int main(int argc, char **argv) {
       if (descriptor.visionSource == splash::model::VisionSource::None)
         throw std::runtime_error("the model has no vision role");
       MetalBackend backend(argv[1]);
-      const auto loader = splash::model::planVisionLoader(backend, argv[2], descriptor);
+      const auto loader = splash::model::planVisionLoader(backend, argv[2], descriptor, {});
       const splash::model::QwenVisionWeights model =
           splash::model::loadVisionWeights(backend, argv[2], descriptor, loader.get());
       const std::string fixture = argv[3];
@@ -227,11 +227,9 @@ int main(int argc, char **argv) {
       const std::vector<float> first =
           encodeOnce(backend, encoder, grid, pixels,
                      model.tensors.layout.outputHiddenSize, &gpuSeconds);
-      unsigned char digest[CC_SHA256_DIGEST_LENGTH];
-      CC_SHA256(first.data(), static_cast<CC_LONG>(first.size() * sizeof(float)), digest);
-      std::printf("embedding SHA-256: ");
-      for (unsigned char byte : digest) std::printf("%02x", byte);
-      std::printf("\n");
+      const std::string digest = splash::model::weightDigest(
+          {reinterpret_cast<const uint8_t *>(first.data()), first.size() * sizeof(float)});
+      std::printf("embedding SHA-256: %s\n", digest.c_str());
       const Parity parity =
           compare(first, expected, descriptor.vision.outputHiddenSize);
       std::printf("grid %ux%u: relative_error %.4f max_abs %.4f "

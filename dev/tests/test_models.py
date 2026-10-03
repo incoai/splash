@@ -1057,6 +1057,24 @@ class ScriptEntryTests(unittest.TestCase):
         output = self.run_script("--model", "someone/model:Q4_K_M", "verify")
         self.assertIn("error: someone/model:Q4_K_M is not installed in ", output)
 
+    def test_install_entry_points_run_as_scripts(self):
+        # As the launcher, make and spawn_refresh run them: by path, from
+        # any working directory.
+        install = Path(installer.__file__).resolve().parent
+        for script in ("catalog.py", "models.py"):
+            with (
+                self.subTest(script=script),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                result = subprocess.run(
+                    [sys.executable, str(install / script), "--help"],
+                    cwd=temporary,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

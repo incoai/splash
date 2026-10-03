@@ -1,20 +1,31 @@
 import array
+import base64
 import errno
+import http.client
+import json
 import select
 import socket
 import struct
+import sys
 import unittest
 from unittest import mock
 
-from referencing import Registry
-
+from dev.tests.engine import native_peer
+from dev.tests.engine.test_documents import pdf_bytes
 from dev.tests.engine.test_runtime import FakeFactory, request
-from dev.tests.test_server import FakeRuntime, Harness, no_signed_thinking
+from dev.tests.test_server import (
+    FOREVER,
+    FakeConstraintFactory,
+    FakeRuntime,
+    Harness,
+    no_signed_thinking,
+)
+from server import documents, runtime, schema_validation, tool_schema
 from server import frontend as request_frontend
 from server import protocol as wire
-from server import runtime, schema_validation, tool_schema
 from server import server as api
 from server.api_shapes import anthropic_to_chat_prompt, normalize_messages
+from server.errors import APIError
 
 
 class RequestContractTests(unittest.TestCase):
@@ -35,9 +46,65 @@ class RequestContractTests(unittest.TestCase):
         }
         status, _, payload = harness.request("POST", "/v1/chat/completions", body)
         self.assertEqual(status, 200, payload)
-        with mock.patch.object(api.time, "monotonic", return_value=10):
-            deadline = harness.app.request_deadline({"timeout": 1e6})
+        deadline = harness.app.request_deadline({"timeout": 1e6}, 10)
         self.assertEqual(deadline, 10 + harness.app.request_timeout)
+
+    def test_invalid_generation_fields_fail_before_document_rendering(self):
+        constraints = FakeConstraintFactory()
+        harness = Harness(FakeRuntime(), constraint_factory=constraints)
+        self.addCleanup(harness.close)
+        pdf = base64.b64encode(pdf_bytes(pages=1)).decode()
+        document = {
+            "type": "file",
+            "file": {"file_data": "data:application/pdf;base64," + pdf},
+        }
+        tool = {
+            "type": "function",
+            "function": {"name": "lookup", "parameters": {"type": "object"}},
+        }
+        rendering = "the PDF reached rendering"
+        invalid = (
+            ({"temperature": 5}, "temperature must be"),
+            ({"seed": -1}, "seed must be"),
+            ({"priority": "urgent"}, "priority must be"),
+            ({"n": 2}, "n and logprobs"),
+        )
+        # The valid request shows that the PDF otherwise reaches the renderer.
+        for fields, message in (*invalid, ({}, rendering)):
+            with (
+                self.subTest(fields=fields),
+                mock.patch.dict(documents._cache, clear=True),
+                mock.patch.object(
+                    documents, "_render", side_effect=APIError(400, rendering)
+                ) as render,
+            ):
+                status, _, payload = harness.request(
+                    "POST",
+                    "/v1/chat/completions",
+                    {
+                        "model": "test-model",
+                        "messages": [{"role": "user", "content": [document]}],
+                        **fields,
+                    },
+                )
+                self.assertEqual(status, 400, payload)
+                self.assertIn(message, json.loads(payload)["error"]["message"])
+                self.assertEqual(render.called, not fields)
+        for fields, message in invalid:
+            with self.subTest(fields=fields, tools=True):
+                status, _, payload = harness.request(
+                    "POST",
+                    "/v1/chat/completions",
+                    {
+                        "model": "test-model",
+                        "messages": [{"role": "user", "content": "Look it up."}],
+                        "tools": [tool],
+                        **fields,
+                    },
+                )
+                self.assertEqual(status, 400, payload)
+                self.assertIn(message, json.loads(payload)["error"]["message"])
+                self.assertEqual(constraints.grammars, [])
 
     def test_enabled_thinking_honors_effort(self):
         for effort in ("low", "medium", "high", "xhigh", "max"):
@@ -69,7 +136,9 @@ class RequestContractTests(unittest.TestCase):
         ]
         self.assertEqual(
             normalize_messages(
-                [{"role": "user", "content": "Hi"}, *messages], vision=True
+                [{"role": "user", "content": "Hi"}, *messages],
+                vision=True,
+                deadline=FOREVER,
             )[1]["tool_calls"][0]["id"],
             "call_42",
         )
@@ -123,6 +192,36 @@ class RequestContractTests(unittest.TestCase):
             self.assertFalse(handler.parse_request())
         handler.send_error.assert_called_once_with(505, "HTTP version not supported")
         self.assertTrue(handler.close_connection)
+
+    def test_unparsable_requests_get_an_http_1_1_json_error(self):
+        harness = Harness(FakeRuntime())
+        self.addCleanup(harness.close)
+        # Each request is all the server reads: bytes it left unread would
+        # reset the connection under its response.
+        for data, status, anthropic in (
+            (b"GARBAGE\r\n", 400, False),
+            (b"GET / FOO/1.1\r\n", 400, False),
+            # HTTP/0.9's request line, which has no version. Python before
+            # 3.13 reads headers after it all the same.
+            (b"GET /\r\n" + b"\r\n" * (sys.version_info < (3, 13)), 505, False),
+            # One byte over the stdlib's request and header line limits.
+            (b"x" * 65537, 414, False),
+            (b"POST /v1/messages HTTP/1.1\r\n" + b"x" * 65537, 431, True),
+        ):
+            with self.subTest(data=data[:24]):
+                client = socket.create_connection(
+                    harness.server.server_address, timeout=2
+                )
+                self.addCleanup(client.close)
+                client.sendall(data)
+                response = http.client.HTTPResponse(client)
+                response.begin()
+                self.assertEqual((response.version, response.status), (11, status))
+                self.assertEqual(response.getheader("Connection"), "close")
+                self.assertEqual(response.getheader("Content-Type"), "application/json")
+                payload = json.loads(response.read())
+                self.assertEqual(payload.get("type"), "error" if anthropic else None)
+                self.assertTrue(payload["error"]["message"])
 
     def test_missing_native_executable_has_upgrade_guidance(self):
         with self.assertRaisesRegex(
@@ -196,7 +295,8 @@ class RequestContractTests(unittest.TestCase):
                     {
                         "model": "test-model",
                         "messages": [{"role": "user", "content": "hello"}],
-                    }
+                    },
+                    deadline=FOREVER,
                 )
         self.assertEqual(
             log.call_args.args[0], "Template error · ValueError · <template>:2"
@@ -208,7 +308,7 @@ class RequestContractTests(unittest.TestCase):
             "patternProperties": {"^key": {"type": "integer"}},
             "additionalProperties": False,
         }
-        validator = schema_validation.build_validator(schema, lambda s: [s], Registry())
+        validator = schema_validation.build_validator(schema)
         self.assertTrue(validator.is_valid({"key_one": 1}))
         self.assertFalse(validator.is_valid({"other": 1}))
         self.assertFalse(validator.is_valid({"key_one": "1"}))
@@ -220,12 +320,11 @@ class RequestContractTests(unittest.TestCase):
                 validator.is_valid({"key_one": 1})
 
     def test_build_validator_reuses_a_cached_instance_for_the_same_schema(self):
-        nodes, registry = lambda s: [s], Registry()
         schema_a = {"type": "object", "properties": {"x": {"type": "integer"}}}
         schema_b = {"type": "object", "properties": {"x": {"type": "string"}}}
-        first = schema_validation.build_validator(schema_a, nodes, registry)
-        second = schema_validation.build_validator(dict(schema_a), nodes, registry)
-        third = schema_validation.build_validator(schema_b, nodes, registry)
+        first = schema_validation.build_validator(schema_a)
+        second = schema_validation.build_validator(dict(schema_a))
+        third = schema_validation.build_validator(schema_b)
         self.assertIs(first, second)
         self.assertIsNot(first, third)
 
@@ -247,13 +346,14 @@ class RequestContractTests(unittest.TestCase):
                 )
             self.assertEqual(caught.exception.status, 400)
 
-    def test_mask_byte_payload_is_wire_equivalent(self):
-        words = (0, 1, 0xFFFFFFFF, 42)
-        original = wire.MaskResponseFrame(1, 2, words)
-        packed = wire.MaskResponseFrame(1, 2, array.array("I", words).tobytes())
-        self.assertEqual(
-            wire.serialize_message(original), wire.serialize_message(packed)
+    def test_mask_byte_payload_round_trips(self):
+        response = wire.MaskResponseFrame(
+            1, 2, array.array("I", (0, 1, 0xFFFFFFFF, 42)).tobytes()
         )
+        encoded = wire.serialize_message(response)
+        ((decoded, raw),) = native_peer.ClientFrameReader().feed(encoded)
+        self.assertEqual(raw, encoded)
+        self.assertEqual(decoded, response)
 
     def test_unacknowledged_cancel_fails_generation_and_releases_calls(self):
         factory = FakeFactory()

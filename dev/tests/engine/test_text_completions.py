@@ -94,11 +94,10 @@ class TextCompletionTests(unittest.TestCase):
         self.assertIn("timings", response)
         self.assertEqual(harness.tokenizer.templates, [])
         self.assertEqual(harness.tokenizer.encodings, [("once upon a time", True)])
-        request = runtime.requests[0]
+        request = runtime.requests[0].frame
         self.assertEqual(request.prompt_tokens, (9, 14, 15, 16, 17))
         self.assertEqual(request.generation_prompt_tokens, 0)
         self.assertEqual(request.logical_max_output_tokens, 8)
-        self.assertEqual(request.cohort, wire.Cohort.GREEDY)
         self.assertEqual(request.constraint, wire.ConstraintMode.NONE)
 
     def test_token_ids_are_sent_as_given_within_the_vocabulary(self):
@@ -106,7 +105,7 @@ class TextCompletionTests(unittest.TestCase):
         status, response = self.complete(harness, prompt=[3, 1, 27])
         self.assertEqual(status, 200, response)
         self.assertEqual(response["choices"][0]["text"], "plain answer\n")
-        self.assertEqual(runtime.requests[0].prompt_tokens, (3, 1, 27))
+        self.assertEqual(runtime.requests[0].frame.prompt_tokens, (3, 1, 27))
         self.assertEqual(harness.tokenizer.encodings, [])
         for prompt in ([28], [-1], [3, 2**32]):
             with self.subTest(prompt=prompt):
@@ -223,11 +222,16 @@ class TextCompletionTests(unittest.TestCase):
         harness.tokenizer.bos = 9
         status, response = self.complete(harness, prompt="")
         self.assertEqual(status, 200, response)
-        self.assertEqual(runtime.requests[0].prompt_tokens, (9,))
+        self.assertEqual(runtime.requests[0].frame.prompt_tokens, (9,))
 
     def test_default_values_of_unsupported_fields_are_accepted(self):
         harness, runtime = self.harness()
-        defaults = {"suffix": None, "echo": False, "logprobs": None, "best_of": 1}
+        defaults = {
+            "suffix": None,
+            "echo": False,
+            "logprobs": None,
+            "best_of": 1,
+        }
         for fields in (defaults, {key: None for key in defaults}, {"n": 1}):
             with self.subTest(fields=fields):
                 status, response = self.complete(harness, **fields)
@@ -235,43 +239,45 @@ class TextCompletionTests(unittest.TestCase):
         self.assertEqual(len(runtime.requests), 3)
 
     def test_omitted_max_tokens_is_openais_default_within_the_context(self):
-        # 16 tokens, not the server's chat budget; a prompt that leaves less
-        # context generates up to the rest instead of failing.
-        harness, runtime = self.harness(max_context=64, default_max_new=8)
+        # 16 tokens, not all the context leaves as in chat; a prompt that
+        # leaves less context generates up to the rest instead of failing.
+        harness, runtime = self.harness(max_context=64)
         for fields in ({}, {"max_tokens": None}):
             status, response = self.complete(harness, **fields)
             self.assertEqual(status, 200, response)
-            self.assertEqual(runtime.requests[-1].logical_max_output_tokens, 16)
-        harness, runtime = self.harness(max_context=16, default_max_new=8)
+            self.assertEqual(runtime.requests[-1].frame.logical_max_output_tokens, 16)
+        harness, runtime = self.harness(max_context=16)
         status, response = self.complete(harness)
         self.assertEqual(status, 200, response)
-        request = runtime.requests[0]
+        request = runtime.requests[0].frame
         self.assertEqual(
             request.logical_max_output_tokens, 16 - len(request.prompt_tokens)
         )
 
     def test_sampling_budget_seed_and_priority_are_validated_as_in_chat(self):
-        harness, runtime = self.harness(max_context=16, default_max_new=8)
+        harness, runtime = self.harness(max_context=16)
         status, response = self.complete(
             harness,
             temperature=0.7,
             top_p=0.5,
             top_k=5,
+            presence_penalty=1.5,
+            frequency_penalty=-0.5,
+            repetition_penalty=1.1,
+            min_p=0.25,
             seed=7,
             priority="foreground",
         )
         self.assertEqual(status, 200, response)
-        request = runtime.requests[0]
-        self.assertEqual(request.cohort, wire.Cohort.SAMPLING)
-        self.assertAlmostEqual(request.sampling.temperature, 0.7)
-        self.assertEqual((request.sampling.top_p, request.sampling.top_k), (0.5, 5))
+        request = runtime.requests[0].frame
+        self.assertEqual(
+            request.sampling,
+            wire.SamplingParameters(0.7, 0.5, 5, 1.5, -0.5, 1.1, 0.25),
+        )
         self.assertEqual(request.seed, 7)
         self.assertEqual(request.priority, wire.RequestPriority.FOREGROUND)
         invalid = (
-            ({"temperature": -1}, "invalid sampling parameters"),
-            ({"top_k": 33}, "invalid sampling parameters"),
-            ({"presence_penalty": 1}, "output transformation is not supported"),
-            ({"logit_bias": {"1": 2}}, "output transformation is not supported"),
+            ({"min_p": 1.1}, "min_p must be a number in [0, 1]"),
             ({"seed": 2**64}, "seed must be an unsigned 64-bit integer"),
             ({"priority": "urgent"}, "priority must be"),
             ({"max_tokens": 0}, "max_tokens must be a positive integer"),
@@ -417,8 +423,14 @@ class TextCompletionLifecycleTests(unittest.TestCase):
         for path, body in (CHAT, COMPLETION):
             with self.subTest(path=path):
                 harness, _ = self.harness(
-                    Plan(error=("runtime_error", "broken")),
-                    Plan(error=("runtime_error", "broken")),
+                    *(
+                        Plan(
+                            exception=api.engine_runtime.RequestFailed(
+                                1, b"runtime_error", b"broken"
+                            )
+                        )
+                        for _ in range(2)
+                    )
                 )
                 status, _, payload = harness.request("POST", path, body)
                 self.assertEqual(status, 500)

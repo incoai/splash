@@ -43,7 +43,7 @@ function createChat(storage = new Map(), writable = true, models = null,
   for (const id of ['chat', 'form', 'input', 'attachments', 'image-input',
                    'attach', 'effort', 'api-key', 'send', 'recents', 'new-chat',
                    'mobile-new', 'menu', 'scrim']) elements[id] = new Element();
-  elements.effort.options = ['xhigh', 'medium', 'low', 'none'].map(value => ({value}));
+  elements.effort.options = ['', 'xhigh', 'medium', 'low', 'none'].map(value => ({value}));
   class FileReader {
     readAsDataURL(file) {
       this.result = `data:image/png;base64,${file.name}`;
@@ -217,6 +217,26 @@ for (const writable of [true, false]) {
   assert.equal(chat.requests[0].body.messages[0].content, 'remembered message');
   assert.equal(storage.get('splash-thinking-effort'), 'low');
 }
+""")
+
+    def test_default_effort_omits_reasoning_effort(self):
+        # The server's --default-reasoning-effort, or the template's default,
+        # applies until the user picks an effort.
+        self.run_chat(r"""
+(async () => {
+  const chat = createChat();
+  assert.equal(chat.elements.effort.value, '');
+  setText(chat, 'hello');
+  submit(chat);
+  assert.ok(!('reasoning_effort' in chat.requests[0].body));
+  succeed(chat.requests[0]);
+  await flush();
+  chat.elements.effort.value = 'low';
+  chat.elements.effort.handlers.change();
+  setText(chat, 'again');
+  submit(chat);
+  assert.equal(chat.requests[1].body.reasoning_effort, 'low');
+})().catch(error => { console.error(error); process.exitCode = 1; });
 """)
 
     def test_saves_chats_without_crypto_random_uuid(self):

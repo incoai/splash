@@ -12,12 +12,7 @@ from __future__ import annotations
 from pathlib import Path, PurePosixPath
 from typing import NamedTuple
 
-if __package__:
-    from . import families, hub, models
-else:
-    import families
-    import hub
-    import models
+from . import families, hub, models
 
 ALIGNMENT = 16384
 # The tokenizer/ files a package ships.

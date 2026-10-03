@@ -95,7 +95,7 @@ window. To set your own limits or cache options, add these to `splash serve`:
 On a Mac you also use for other work, `--max-memory` leaves room for other
 applications.
 The server listens on localhost without authentication by default. For LAN
-access, authentication, and other options, see
+access, authentication, browser apps on other origins, and other options, see
 [server configuration](DEVELOPMENT.md#server-configuration) or
 `splash serve --help`.
 [KV precision](DEVELOPMENT.md#kv-cache-precision) ·

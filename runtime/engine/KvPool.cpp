@@ -1,129 +1,113 @@
 #include "engine/KvPool.hpp"
 
+#include <algorithm>
+#include <chrono>
 #include <limits>
+#include <numeric>
 #include <stdexcept>
+#include <string>
+#include <utility>
 
 namespace splash::engine {
+namespace {
 
-KvPool::KvPool(KvBacking &backing)
-    : backing_(backing), pages_(backing.pageCount()) {
-  if (pages_.empty() || !backing_.bytesPerPage()) {
-    throw std::invalid_argument("invalid elastic KV backing");
+double millisecondsSince(std::chrono::steady_clock::time_point start) {
+  return std::chrono::duration<double, std::milli>(
+             std::chrono::steady_clock::now() - start)
+      .count();
+}
+
+} // namespace
+
+KvPool::KvPool(kv::ExtentStorage &storage, uint32_t runwayPages)
+    : storage_(storage), extentPages_(storage.extentPages()),
+      pages_(storage.pageCount()) {
+  if (pages_.empty() || !storage_.bytesPerPage() || !extentPages_ ||
+      pages_.size() % extentPages_) {
+    throw std::invalid_argument("invalid KV extent storage");
   }
-  for (uint32_t first = 0; first < pages_.size();) {
-    const uint32_t count = backing_.extentPageCount(first);
-    if (!count || backing_.extentFirstPage(first) != first ||
-        count > pages_.size() - first) {
-      throw std::invalid_argument("invalid elastic KV extent geometry");
+  if (runwayPages > pages_.size())
+    throw std::invalid_argument("the KV runway exceeds the page pool");
+  extents_.resize(pages_.size() / extentPages_);
+  for (uint32_t extent = 0; firstPage(extent) < runwayPages; ++extent) {
+    if (const metal::AllocationResult allocated = allocateExtent(extent);
+        !allocated) {
+      throw metal::MetalAllocationError(
+          std::string("unable to allocate the KV runway: ") +
+              metal::allocationFailureName(allocated.failure),
+          allocated.failure);
     }
-    const uint32_t extent = static_cast<uint32_t>(extents_.size());
-    ExtentRecord record;
-    record.firstPage = first;
-    record.pageCount = count;
-    record.resident = backing_.isResident(first);
-    extents_.push_back(record);
-    if (record.resident)
-      residentPages_ += count;
-    for (uint32_t page = first; page < first + count; ++page)
-      pages_[page].extent = extent;
-    first += count;
-  }
-  for (uint32_t page = static_cast<uint32_t>(pages_.size()); page > 0;) {
-    --page;
-    insertFree(page, extents_[pages_[page].extent].resident
-                         ? FreeClass::Resident
-                         : FreeClass::Unbacked);
-  }
-  for (uint32_t extent = 0; extent < extents_.size(); ++extent) {
-    if (extents_[extent].resident)
-      setExtentReclaimable(extent, true);
   }
 }
 
-KvPageAcquisition KvPool::acquirePages(uint32_t count, bool prefixOwner) {
+KvPageAcquisition KvPool::acquirePages(uint32_t count) {
   if (!count)
     return {};
-  if (count > freePageCount())
-    return {{}, KvPageAcquireFailure::LogicalCapacity};
 
   std::vector<uint32_t> selected;
   selected.reserve(count);
-  std::vector<uint32_t> newlyResidentExtents;
-  newlyResidentExtents.reserve((count + backing_.extentPageCount(0) - 1) /
-                               backing_.extentPageCount(0));
   auto returnSelected = [&] {
     for (auto p = selected.rbegin(); p != selected.rend(); ++p)
-      insertFree(*p, FreeClass::Resident);
+      insertFree(*p);
   };
   while (selected.size() < count) {
-    if (freeResidentPages_) {
-      selected.push_back(popFreeResident());
+    if (freePages_) {
+      selected.push_back(popFree());
       continue;
     }
-    if (!freeUnbacked_.count)
-      throw std::logic_error("free KV lists disagree with accounting");
-    const uint32_t page = freeUnbacked_.head;
-    const uint32_t extent = pages_[page].extent;
-    metal::AllocationResult mapped = false;
-    try {
-      mapped = backing_.ensureResident(page);
-    } catch (...) {
+    // Page ids cover every extent the hard budget could hold, so the budget
+    // refuses growth before they run out.
+    const uint32_t extent = unallocatedExtent();
+    if (extent == noIndex)
+      throw std::logic_error("KV page ids ran out before the memory budget did");
+    const metal::AllocationResult allocated = allocateExtent(extent);
+    if (!allocated) {
+      // The extents this acquisition allocated stay, reclaimable: the
+      // budget admitted them, and the retry that follows a reclaim takes
+      // their pages first instead of allocating them again. A reclaim pass
+      // returns them if they stay unused.
       returnSelected();
-      throw;
+      return {{}, allocated.failure};
     }
-    if (!mapped) {
-      returnSelected();
-      // Paced like reclaim: an extent the backing cannot release yet stays
-      // resident and reclaimable rather than waiting on the serving path.
-      for (uint32_t resident : newlyResidentExtents) {
-        if (!extents_[resident].usedPages && releaseReady() &&
-            releaseBacking(extents_[resident].firstPage)) {
-          setExtentResident(resident, false);
-        }
-      }
-      return {{}, KvPageAcquireFailure::PhysicalCapacity, mapped.failure};
-    }
-    setExtentResident(extent, true);
-    newlyResidentExtents.push_back(extent);
   }
 
   for (uint32_t page : selected) {
-    PageRecord &record = pages_[page];
     markUsed(page);
-    uint32_t &references =
-        prefixOwner ? record.prefixReferences : record.activeReferences;
-    references = 1;
-    ++(prefixOwner ? prefixPages_ : activePages_);
+    pages_[page].activeReferences = 1;
+    ++activePages_;
   }
-  return {std::move(selected), KvPageAcquireFailure::None};
+  return {std::move(selected)};
 }
 
 void KvPool::retainPage(uint32_t page, bool prefixOwner) {
-  if (!backing_.isResident(page)) {
-    throw std::logic_error("cannot retain an unbacked KV page");
-  }
   PageRecord &record = pages_.at(page);
-  uint32_t &references =
-      prefixOwner ? record.prefixReferences : record.activeReferences;
-  if (references == std::numeric_limits<uint32_t>::max()) {
-    throw std::overflow_error("KV page reference overflow");
+  if (!extents_[extentOf(page)].allocated) {
+    throw std::logic_error("cannot retain a KV page of an unallocated extent");
   }
+  if (prefixOwner && record.prefixOwned)
+    throw std::logic_error("KV page already belongs to a cached block");
+  if (!prefixOwner && record.activeReferences == std::numeric_limits<uint32_t>::max())
+    throw std::overflow_error("KV page reference overflow");
   if (pageFree(page))
     markUsed(page);
-  if (!references)
-    ++(prefixOwner ? prefixPages_ : activePages_);
-  ++references;
+  if (prefixOwner) {
+    record.prefixOwned = true;
+    ++prefixPages_;
+  } else if (!record.activeReferences++) {
+    ++activePages_;
+  }
 }
 
 void KvPool::releasePage(uint32_t page, bool prefixOwner) {
   PageRecord &record = pages_.at(page);
-  uint32_t &references =
-      prefixOwner ? record.prefixReferences : record.activeReferences;
-  if (!references)
+  if (prefixOwner ? !record.prefixOwned : !record.activeReferences)
     throw std::logic_error("invalid KV page release");
-  --references;
-  if (!references)
-    --(prefixOwner ? prefixPages_ : activePages_);
+  if (prefixOwner) {
+    record.prefixOwned = false;
+    --prefixPages_;
+  } else if (!--record.activeReferences) {
+    --activePages_;
+  }
   if (pageFree(page))
     markFree(page);
 }
@@ -133,128 +117,173 @@ uint32_t KvPool::pageCount() const noexcept {
 }
 
 uint64_t KvPool::bytesPerPage() const noexcept {
-  return backing_.bytesPerPage();
+  return storage_.bytesPerPage();
 }
 
-uint32_t KvPool::freePageCount() const noexcept {
-  return freeResidentPages_ + freeUnbacked_.count;
-}
+uint32_t KvPool::freePageCount() const noexcept { return freePages_; }
 
-uint32_t KvPool::freeResidentPageCount() const noexcept { return freeResidentPages_; }
-
-uint32_t KvPool::activeReferences(uint32_t page) const {
-  return pages_.at(page).activeReferences;
+bool KvPool::pageActive(uint32_t page) const {
+  return pages_.at(page).activeReferences != 0;
 }
 
 bool KvPool::pageFree(uint32_t page) const {
   const PageRecord &record = pages_.at(page);
-  return !record.activeReferences && !record.prefixReferences;
+  return !record.activeReferences && !record.prefixOwned;
 }
 
-uint64_t KvPool::residentBackingBytes() const noexcept {
-  return uint64_t{residentPages_} * bytesPerPage();
+uint64_t KvPool::allocatedBytes() const noexcept {
+  return uint64_t{allocatedExtents_} * extentPages_ * bytesPerPage();
 }
 
-uint32_t KvPool::reclaimEmptyExtents(bool keepRunway, uint32_t maxExtents) {
+uint64_t KvPool::reclaimEmptyExtents(bool keepRunway, uint32_t limit) {
   uint32_t reclaimed = 0;
   bool kept = false;
   uint32_t extent = reclaimableExtents_.head;
-  while (extent != noIndex && reclaimed < maxExtents) {
+  while (extent != noIndex && reclaimed < limit) {
     const uint32_t next = extents_[extent].nextReclaimable;
     if (keepRunway && !kept) {
       kept = true;
-    } else if (!releaseReady()) {
-      // Keep the serving transport responsive while the previous release
-      // drains; retry at the next command-free point.
-      break;
-    } else if (releaseBacking(extents_[extent].firstPage)) {
-      setExtentResident(extent, false);
+    } else {
+      releaseExtent(extent);
       ++reclaimed;
     }
     extent = next;
   }
-  return reclaimed;
+  return uint64_t{reclaimed} * extentPages_ * bytesPerPage();
 }
 
-uint32_t KvPool::reclaimableExtentCount() const noexcept {
-  return reclaimableExtents_.count;
-}
-
-bool KvPool::releaseBacking(uint32_t page) {
-  if (!backing_.releaseBackingForPage(page))
-    return false;
-  ++releaseGeneration_;
-  releaseOutstanding_ = true;
-  return true;
-}
-
-bool KvPool::releaseReady() const noexcept {
-  const bool ready = backing_.releaseReady();
-  if (ready && releaseOutstanding_) {
-    // Completion may be observed after an allocator has already denied growth.
-    ++releaseGeneration_;
-    releaseOutstanding_ = false;
+metal::AllocationResult KvPool::allocateExtent(uint32_t extent) {
+  const auto start = std::chrono::steady_clock::now();
+  const metal::AllocationResult allocated = storage_.allocateExtent(extent);
+  if (allocated) {
+    ++extentAllocations_;
+    extentAllocateMaxMilliseconds_ =
+        std::max(extentAllocateMaxMilliseconds_, millisecondsSince(start));
+    setExtentAllocated(extent, true);
   }
-  return ready;
+  return allocated;
 }
 
-uint64_t KvPool::releaseGeneration() const noexcept {
-  return releaseGeneration_;
+void KvPool::releaseExtent(uint32_t extent) {
+  const auto start = std::chrono::steady_clock::now();
+  storage_.releaseExtent(extent);
+  ++extentReleases_;
+  extentReleaseMaxMilliseconds_ =
+      std::max(extentReleaseMaxMilliseconds_, millisecondsSince(start));
+  setExtentAllocated(extent, false);
 }
 
-void KvPool::awaitRelease() {
-  backing_.awaitRelease();
-  static_cast<void>(releaseReady());
+KvPageMoves KvPool::compactExtent(std::span<const uint32_t> fixed) {
+  // Pages move only into extents that hold pages already: an empty extent is
+  // released as it is, never filled to release another.
+  uint32_t freeInUse = 0;
+  for (const ExtentRecord &extent : extents_) {
+    if (extent.allocated && extent.usedPages)
+      freeInUse += extent.freePages.count;
+  }
+  uint32_t emptied = noIndex;
+  for (uint32_t index = 0; index < extents_.size(); ++index) {
+    const ExtentRecord &extent = extents_[index];
+    if (!extent.allocated || !extent.usedPages ||
+        extent.usedPages > freeInUse - extent.freePages.count ||
+        (emptied != noIndex && extent.usedPages >= extents_[emptied].usedPages))
+      continue;
+    if (std::none_of(fixed.begin(), fixed.end(),
+                     [&](uint32_t page) { return extentOf(page) == index; }))
+      emptied = index;
+  }
+  if (emptied == noIndex)
+    return {};
+
+  std::vector<uint32_t> receivers;
+  for (uint32_t index = 0; index < extents_.size(); ++index) {
+    const ExtentRecord &extent = extents_[index];
+    if (index != emptied && extent.allocated && extent.usedPages &&
+        extent.freePages.count)
+      receivers.push_back(index);
+  }
+  std::stable_sort(receivers.begin(), receivers.end(),
+                   [&](uint32_t left, uint32_t right) {
+                     return extents_[left].usedPages > extents_[right].usedPages;
+                   });
+  const uint32_t first = firstPage(emptied);
+  std::vector<kv::PageCopy> copies;
+  copies.reserve(extents_[emptied].usedPages);
+  auto receiver = receivers.begin();
+  uint32_t to = extents_[*receiver].freePages.head;
+  for (uint32_t page = first; page < first + extentPages_; ++page) {
+    if (pageFree(page))
+      continue;
+    // The receivers' free pages cover the extent, so one always follows.
+    while (to == noIndex)
+      to = extents_[*++receiver].freePages.head;
+    copies.push_back({page, to});
+    to = pages_[to].nextFree;
+  }
+
+  storage_.copyPages(copies);
+  KvPageMoves moves{first, std::vector<uint32_t>(extentPages_)};
+  std::iota(moves.destinations.begin(), moves.destinations.end(), first);
+  for (const kv::PageCopy &copy : copies) {
+    markUsed(copy.to);
+    pages_[copy.to].activeReferences =
+        std::exchange(pages_[copy.from].activeReferences, 0);
+    pages_[copy.to].prefixOwned = std::exchange(pages_[copy.from].prefixOwned, false);
+    markFree(copy.from);
+    moves.destinations[copy.from - moves.firstPage] = copy.to;
+  }
+  ++extentCompactions_;
+  pagesMoved_ += copies.size();
+  return moves;
 }
 
 KvPoolSnapshot KvPool::snapshot() const {
   KvPoolSnapshot result;
-  result.pagesTotal = pageCount();
-  result.pagesFree = freePageCount();
-  result.pagesResident = residentPages_;
+  result.pagesAllocated = allocatedExtents_ * extentPages_;
   result.pagesActive = activePages_;
   result.pagesPrefix = prefixPages_;
-  result.pagesFreeResident = freeResidentPages_;
-  result.residentBackingBytes = residentBackingBytes();
-  result.reclaimableExtents = reclaimableExtents_.count;
-  result.reclaimableBackingBytes = reclaimableBackingBytes_;
+  result.pagesFree = freePages_;
+  result.allocatedBytes = allocatedBytes();
+  result.reclaimableBytes =
+      uint64_t{reclaimableExtents_.count} * extentPages_ * bytesPerPage();
+  result.extentAllocations = extentAllocations_;
+  result.extentReleases = extentReleases_;
+  result.extentAllocateMaxMilliseconds = extentAllocateMaxMilliseconds_;
+  result.extentReleaseMaxMilliseconds = extentReleaseMaxMilliseconds_;
+  result.extentCompactions = extentCompactions_;
+  result.pagesMoved = pagesMoved_;
   return result;
 }
 
-KvPool::IndexList &KvPool::freeList(FreeClass kind, uint32_t page) noexcept {
-  if (kind == FreeClass::Resident)
-    return extents_[pages_[page].extent].freeResident;
-  if (kind == FreeClass::Unbacked)
-    return freeUnbacked_;
-  std::terminate();
+uint32_t KvPool::unallocatedExtent() const noexcept {
+  for (uint32_t extent = 0; extent < extents_.size(); ++extent) {
+    if (!extents_[extent].allocated)
+      return extent;
+  }
+  return noIndex;
 }
 
-void KvPool::insertFree(uint32_t page, FreeClass kind) noexcept {
+void KvPool::insertFree(uint32_t page) noexcept {
   PageRecord &record = pages_[page];
-  if (kind == FreeClass::None || record.freeClass != FreeClass::None ||
-      !pageFree(page)) {
+  if (record.onFreeList || !pageFree(page))
     std::terminate();
-  }
-  IndexList &list = freeList(kind, page);
+  IndexList &list = extents_[extentOf(page)].freePages;
   record.previousFree = noIndex;
   record.nextFree = list.head;
-  record.freeClass = kind;
+  record.onFreeList = true;
   if (list.head != noIndex)
     pages_[list.head].previousFree = page;
   list.head = page;
   ++list.count;
-  if (kind == FreeClass::Resident) {
-    ++freeResidentPages_;
-    packingExtent_ = noIndex;
-  }
+  ++freePages_;
+  packingExtent_ = noIndex;
 }
 
 void KvPool::removeFree(uint32_t page) noexcept {
   PageRecord &record = pages_[page];
-  if (record.freeClass == FreeClass::None)
+  if (!record.onFreeList)
     std::terminate();
-  const FreeClass kind = record.freeClass;
-  IndexList &list = freeList(kind, page);
+  IndexList &list = extents_[extentOf(page)].freePages;
   if (record.previousFree == noIndex) {
     if (list.head != page)
       std::terminate();
@@ -266,36 +295,32 @@ void KvPool::removeFree(uint32_t page) noexcept {
     pages_[record.nextFree].previousFree = record.previousFree;
   record.previousFree = noIndex;
   record.nextFree = noIndex;
-  record.freeClass = FreeClass::None;
-  if (!list.count)
+  record.onFreeList = false;
+  if (!list.count || !freePages_)
     std::terminate();
   --list.count;
-  if (kind == FreeClass::Resident) {
-    if (!freeResidentPages_)
-      std::terminate();
-    --freeResidentPages_;
-  }
+  --freePages_;
 }
 
-uint32_t KvPool::popFreeResident() noexcept {
-  const uint32_t page = extents_[packingExtent()].freeResident.head;
+uint32_t KvPool::popFree() noexcept {
+  const uint32_t page = extents_[packingExtent()].freePages.head;
   if (page == noIndex)
     std::terminate();
   removeFree(page);
   return page;
 }
 
-// The extent with the most live pages that still has a free resident page;
+// The allocated extent with the most live pages that still has a free page;
 // ties go to the lowest index, and empty extents lose to any used one. The
 // answer only changes when another extent gains or loses a page, so it is
 // reused until then.
 uint32_t KvPool::packingExtent() noexcept {
-  if (packingExtent_ != noIndex && extents_[packingExtent_].freeResident.count)
+  if (packingExtent_ != noIndex && extents_[packingExtent_].freePages.count)
     return packingExtent_;
   uint32_t best = noIndex;
   for (uint32_t index = 0; index < extents_.size(); ++index) {
     const ExtentRecord &extent = extents_[index];
-    if (extent.freeResident.count &&
+    if (extent.freePages.count &&
         (best == noIndex || extent.usedPages > extents_[best].usedPages)) {
       best = index;
     }
@@ -307,58 +332,54 @@ uint32_t KvPool::packingExtent() noexcept {
 }
 
 void KvPool::markUsed(uint32_t page) noexcept {
-  PageRecord &record = pages_[page];
   if (!pageFree(page))
     std::terminate();
-  if (record.freeClass != FreeClass::None) {
+  const uint32_t extentIndex = extentOf(page);
+  if (pages_[page].onFreeList) {
     removeFree(page);
-    if (record.extent != packingExtent_)
+    if (extentIndex != packingExtent_)
       packingExtent_ = noIndex;
   }
-  ExtentRecord &extent = extents_[record.extent];
+  ExtentRecord &extent = extents_[extentIndex];
   if (!extent.usedPages)
-    setExtentReclaimable(record.extent, false);
+    setExtentReclaimable(extentIndex, false);
   ++extent.usedPages;
 }
 
 void KvPool::markFree(uint32_t page) noexcept {
-  PageRecord &record = pages_[page];
-  if (!pageFree(page) || record.freeClass != FreeClass::None)
-    std::terminate();
-  ExtentRecord &extent = extents_[record.extent];
+  const uint32_t extentIndex = extentOf(page);
+  ExtentRecord &extent = extents_[extentIndex];
   if (!extent.usedPages)
     std::terminate();
   --extent.usedPages;
-  insertFree(page, extent.resident ? FreeClass::Resident : FreeClass::Unbacked);
-  if (!extent.usedPages && extent.resident)
-    setExtentReclaimable(record.extent, true);
+  insertFree(page);
+  if (!extent.usedPages)
+    setExtentReclaimable(extentIndex, true);
 }
 
-void KvPool::setExtentResident(uint32_t extentIndex, bool resident) noexcept {
+// An extent changes state only while none of its pages is held: its pages
+// join the free lists when it is allocated, lowest page first, and leave
+// them when it is released.
+void KvPool::setExtentAllocated(uint32_t extentIndex, bool allocated) noexcept {
   ExtentRecord &extent = extents_[extentIndex];
-  if (extent.resident == resident)
-    return;
-  if (extent.usedPages)
+  if (extent.allocated == allocated || extent.usedPages)
     std::terminate();
-  setExtentReclaimable(extentIndex, false);
-  extent.resident = resident;
-  if (resident) {
-    residentPages_ += extent.pageCount;
-  } else {
-    if (residentPages_ < extent.pageCount)
-      std::terminate();
-    residentPages_ -= extent.pageCount;
-  }
-  for (uint32_t page = extent.firstPage + extent.pageCount;
-       page > extent.firstPage;) {
-    --page;
-    if (pages_[page].freeClass == FreeClass::None)
-      continue;
-    removeFree(page);
-    insertFree(page, resident ? FreeClass::Resident : FreeClass::Unbacked);
-  }
-  if (resident)
+  const uint32_t first = firstPage(extentIndex);
+  if (allocated) {
+    extent.allocated = true;
+    ++allocatedExtents_;
+    for (uint32_t page = first + extentPages_; page > first;)
+      insertFree(--page);
     setExtentReclaimable(extentIndex, true);
+    return;
+  }
+  setExtentReclaimable(extentIndex, false);
+  for (uint32_t page = first; page < first + extentPages_; ++page)
+    removeFree(page);
+  if (!allocatedExtents_)
+    std::terminate();
+  extent.allocated = false;
+  --allocatedExtents_;
 }
 
 void KvPool::setExtentReclaimable(uint32_t extentIndex,
@@ -367,7 +388,7 @@ void KvPool::setExtentReclaimable(uint32_t extentIndex,
   if (extent.reclaimable == reclaimable)
     return;
   if (reclaimable) {
-    if (!extent.resident || extent.usedPages)
+    if (!extent.allocated || extent.usedPages)
       std::terminate();
     extent.previousReclaimable = noIndex;
     extent.nextReclaimable = reclaimableExtents_.head;
@@ -376,7 +397,6 @@ void KvPool::setExtentReclaimable(uint32_t extentIndex,
     }
     reclaimableExtents_.head = extentIndex;
     ++reclaimableExtents_.count;
-    reclaimableBackingBytes_ += uint64_t{extent.pageCount} * bytesPerPage();
     extent.reclaimable = true;
     return;
   }
@@ -395,12 +415,9 @@ void KvPool::setExtentReclaimable(uint32_t extentIndex,
   extent.previousReclaimable = noIndex;
   extent.nextReclaimable = noIndex;
   extent.reclaimable = false;
-  if (!reclaimableExtents_.count ||
-      reclaimableBackingBytes_ < uint64_t{extent.pageCount} * bytesPerPage()) {
+  if (!reclaimableExtents_.count)
     std::terminate();
-  }
   --reclaimableExtents_.count;
-  reclaimableBackingBytes_ -= uint64_t{extent.pageCount} * bytesPerPage();
 }
 
 } // namespace splash::engine

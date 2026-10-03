@@ -30,7 +30,7 @@ class IgnoreEosTests(unittest.TestCase):
                     choice = json.loads(payload)["choices"][0]
                     self.assertEqual(choice["finish_reason"], "length")
         self.assertEqual(
-            [request.flags for request in runtime.requests],
+            [request.frame.flags for request in runtime.requests],
             [0, 0, IGNORE_EOS] * 2,
         )
 
@@ -79,8 +79,8 @@ class IgnoreEosTests(unittest.TestCase):
             {**CHAT[1], "response_format": {"type": "text"}, "ignore_eos": True},
         )
         self.assertEqual(status, 200, payload)
-        self.assertEqual(runtime.requests[0].flags, IGNORE_EOS)
-        self.assertEqual(runtime.requests[0].constraint, wire.ConstraintMode.NONE)
+        self.assertEqual(runtime.requests[0].frame.flags, IGNORE_EOS)
+        self.assertEqual(runtime.requests[0].frame.constraint, wire.ConstraintMode.NONE)
 
 
 if __name__ == "__main__":

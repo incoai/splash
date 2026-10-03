@@ -132,10 +132,7 @@ void bindMmproj(const GgufFile &gguf, const ops::VisionLayout &layout, Plan &pla
                                           : s.columns == 1 ? std::vector<uint64_t>{s.rows}
                                                            : std::vector<uint64_t>{s.columns, s.rows};
       if (t.dims != shape) throw WeightStoreError("vision tensor shape mismatch: " + name);
-      const std::string dtype = t.type == ggml::kBF16  ? "BF16"
-                                : t.type == ggml::kF16 ? "F16"
-                                : t.type == ggml::kF32 ? "F32"
-                                                       : ggmlTypeName(t.type);
+      const std::string dtype = ggmlTypeName(t.type);
       used.insert(name);
       s.inputs.push_back(input(std::move(name), {&gguf.source(), dtype, t.dims, t.offset, t.bytes}));
     }

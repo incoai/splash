@@ -19,6 +19,7 @@
 #include <stdexcept>
 #include <sstream>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 namespace splash::model {
@@ -62,7 +63,8 @@ constexpr uint64_t kDiskReserveBytes = uint64_t{2} << 30;
 class Descriptor final {
 public:
   explicit Descriptor(int fd) : fd_(fd) { if (fd < 0) fail("open prepared weights"); }
-  ~Descriptor() { close(fd_); }
+  Descriptor(Descriptor &&other) noexcept : fd_(std::exchange(other.fd_, -1)) {}
+  ~Descriptor() { if (fd_ >= 0) close(fd_); }
   Descriptor(const Descriptor &) = delete;
   Descriptor &operator=(const Descriptor &) = delete;
   operator int() const noexcept { return fd_; }
@@ -70,29 +72,38 @@ private:
   int fd_;
 };
 
+// The converter lock of a cache, which every writer holds. The OS releases
+// it when its holder exits, crashes included.
 class PreparationLock final {
 public:
-  PreparationLock(const std::filesystem::path &root, const PreparationCheck &check)
-      : file_(open((root / "prepare.lock").c_str(), O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600)) {
-    while (flock(file_, LOCK_EX | LOCK_NB) < 0) {
-      if (errno != EINTR && errno != EWOULDBLOCK) fail("lock weight preparation");
+  // Waits while another process holds the lock; check runs meanwhile.
+  PreparationLock(const std::filesystem::path &root, const PreparationCheck &check) : file_(lockFile(root)) {
+    while (!take(file_)) {
       run(check);
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
   }
+  // The lock, or nothing when another process holds it; never waits.
+  [[nodiscard]] static std::optional<PreparationLock> tryAcquire(const std::filesystem::path &root) {
+    Descriptor file(lockFile(root));
+    if (!take(file)) return std::nullopt;
+    return PreparationLock(std::move(file));
+  }
 private:
+  explicit PreparationLock(Descriptor file) : file_(std::move(file)) {}
+  static Descriptor lockFile(const std::filesystem::path &root) {
+    return Descriptor(open((root / "prepare.lock").c_str(), O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600));
+  }
+  // False when another process holds the lock.
+  static bool take(int file) {
+    while (flock(file, LOCK_EX | LOCK_NB) < 0) {
+      if (errno == EWOULDBLOCK) return false;
+      if (errno != EINTR) fail("lock weight preparation");
+    }
+    return true;
+  }
   Descriptor file_;
 };
-
-std::string hex(const unsigned char *digest) {
-  constexpr char digits[] = "0123456789abcdef";
-  std::string result;
-  for (size_t i = 0; i < CC_SHA256_DIGEST_LENGTH; ++i) {
-    result += digits[digest[i] >> 4];
-    result += digits[digest[i] & 15];
-  }
-  return result;
-}
 
 // Whether two stats describe the same, unmodified file.
 bool sameFile(const struct stat &a, const struct stat &b) {
@@ -130,14 +141,20 @@ std::string fileDigest(int fd, uint64_t from, const PreparationCheck &check) {
   if (!sameFile(before, after)) throw std::runtime_error("weight file changed while reading");
   unsigned char digest[CC_SHA256_DIGEST_LENGTH];
   CC_SHA256_Final(digest, &context);
-  return hex(digest);
+  return digestHex(digest);
 }
 
+// Where the proofs of hashed files are.
+constexpr std::string_view kProofDirectory = "verified-v3";
+
 // The proof of a hashed file names the digest of its bytes [from, end) and
-// holds for this device, inode, length, birth time, mtime and ctime only.
+// holds for this inode, length, birth time, mtime and ctime only. The device
+// is left out: an external volume's follows its BSD disk number, which can
+// change at every mount, and the rest already identify the file (a
+// block-level clone that reproduces them reproduces its bytes).
 std::string verificationKey(const struct stat &state, uint64_t from) {
   std::ostringstream identity;
-  identity << "splash-verified-file-v2 " << state.st_dev << ' ' << state.st_ino << ' ' << state.st_size << ' '
+  identity << "splash-verified-file-v3 " << state.st_ino << ' ' << state.st_size << ' '
            << state.st_mtimespec.tv_sec << ' ' << state.st_mtimespec.tv_nsec << ' '
            << state.st_ctimespec.tv_sec << ' ' << state.st_ctimespec.tv_nsec << ' '
            << state.st_birthtimespec.tv_sec << ' ' << state.st_birthtimespec.tv_nsec << ' ' << from;
@@ -156,7 +173,7 @@ std::string verificationRecord(std::string_view key, std::string_view digest) {
 
 void rememberDigest(const std::filesystem::path &root, const struct stat &state, uint64_t from,
                     const std::string &digest) {
-  const auto directory = root / "verified";
+  const auto directory = root / kProofDirectory;
   std::filesystem::create_directories(directory);
   const auto key = verificationKey(state, from);
   std::string temporary = (directory / ".pending-XXXXXX").string();
@@ -174,7 +191,7 @@ void rememberDigest(const std::filesystem::path &root, const struct stat &state,
 // state; empty when none does.
 std::string provenDigest(const struct stat &state, uint64_t from, const std::filesystem::path &root) {
   const auto key = verificationKey(state, from);
-  const int existing = open((root / "verified" / key).c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  const int existing = open((root / kProofDirectory / key).c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
   if (existing < 0) {
     if (errno != ENOENT) fail("open weight verification");
     return {};
@@ -215,8 +232,7 @@ std::string verifiedDigest(int fd, uint64_t from, const std::filesystem::path &p
 }
 
 // What an entry records in its source file: the component, the digest of the
-// source data it was written from and the source path. Entries of earlier
-// versions recorded only the source path and the file name.
+// source data it was written from and the source path.
 constexpr std::string_view kProvenance = "splash-prepared-weight-v1";
 
 std::string provenance(const PreparedWeight &weight) {
@@ -236,27 +252,44 @@ std::vector<std::string> sourceLines(const std::filesystem::path &directory) {
 
 // Whether an entry whose source file starts with `lines` is an earlier
 // preparation of what weight holds: the same component from the same source
-// data under another key (a new preparation identity or plan), or an entry of
-// an earlier version prepared from the same source path.
+// data under another key (a new preparation identity or plan).
 bool supersedes(const PreparedWeight &weight, std::span<const std::string> lines) {
-  if (lines.size() == 4 && lines[0] == kProvenance)
-    return lines[1] == "component " + weight.component && lines[2] == "inputs " + weight.inputs;
-  return lines.size() == 2 && lines[0] == weight.source;
+  return lines.size() == 4 && lines[0] == kProvenance && lines[1] == "component " + weight.component &&
+         lines[2] == "inputs " + weight.inputs;
 }
 
-// Removes a complete entry. Its directory is first renamed to staging, which
-// any converter reclaims if the removal is interrupted; a process mapping
-// its file keeps the file until it unmaps it.
-void removeEntry(const std::filesystem::path &root, const std::filesystem::path &directory) {
+// The proof of the file of the entry at `directory`; none when it has no
+// file.
+std::optional<std::filesystem::path> proofOf(const std::filesystem::path &root,
+                                             const std::filesystem::path &directory) {
   struct stat state{};
-  const bool hashed = !stat((directory / "weights").c_str(), &state);
+  if (stat((directory / "weights").c_str(), &state)) return std::nullopt;
+  return root / kProofDirectory / verificationKey(state, 0);
+}
+
+// Removes a complete entry and its file's proof. Its directory is first
+// renamed to staging, which any converter reclaims if the removal is
+// interrupted; a process mapping its file keeps the file until it unmaps it.
+void removeEntry(const std::filesystem::path &root, const std::filesystem::path &directory) {
+  const auto proof = proofOf(root, directory);
   const auto staging = stagingPath(root, directory.filename().string());
   std::error_code error;
   std::filesystem::remove_all(staging, error);
   std::filesystem::rename(directory, staging, error);
   if (error) return;
   std::filesystem::remove_all(staging, error);
-  if (hashed) unlink((root / "verified" / verificationKey(state, 0)).c_str());
+  if (proof) unlink(proof->c_str());
+}
+
+// Removes what interrupted writers left, under the converter lock, which
+// every live writer holds: each staging entry, whichever model or version
+// wrote it, and the proofs of an earlier key format.
+void reclaimAbandoned(const std::filesystem::path &root) {
+  for (const auto &entry : std::filesystem::directory_iterator(root))
+    if (entry.path().extension() == ".partial") std::filesystem::remove_all(entry.path());
+  // v2 proofs keyed by device, written by Splash 1.1; delete this line in the
+  // release after next.
+  std::filesystem::remove_all(root / "verified");
 }
 
 // The digest the entry at `directory` records for its file; empty when it
@@ -330,11 +363,13 @@ void writeStaged(const std::filesystem::path &root, const std::filesystem::path 
 }
 
 // Renames the sealed staging entry to its key. Invalid cached generations may
-// be replaced; existing read-only mappings retain their inode. No valid
-// generation is rewritten in place.
+// be replaced, with their proofs; existing read-only mappings retain their
+// inode. No valid generation is rewritten in place.
 void publish(const std::filesystem::path &root, const std::filesystem::path &staging,
              const std::filesystem::path &destination) {
+  const auto replaced = proofOf(root, destination);
   std::filesystem::remove_all(destination);
+  if (replaced) unlink(replaced->c_str());
   std::filesystem::rename(staging, destination);
   Descriptor directory(open(root.c_str(), O_RDONLY | O_CLOEXEC));
   if (fsync(directory)) fail("flush prepared weight directory");
@@ -419,7 +454,7 @@ std::string weightDigest(std::span<const uint8_t> bytes) {
     throw std::overflow_error("weight identity is too large");
   unsigned char digest[CC_SHA256_DIGEST_LENGTH];
   CC_SHA256(bytes.data(), static_cast<CC_LONG>(bytes.size()), digest);
-  return hex(digest);
+  return digestHex(digest);
 }
 
 std::string weightDigest(std::string_view text) {
@@ -533,14 +568,21 @@ void PreparedWeights::requireSpace(std::span<const PreparedWeight> weights,
     }
     return result;
   };
-  if (missing().empty()) return;
+  if (missing().empty()) {
+    // A warm start reclaims abandoned writes only when no converter runs: it
+    // never waits for the lock. A cache it cannot lock or clean (read-only,
+    // or without flock) still serves its complete entries, so a failed
+    // reclaim leaves the writes to the next converter.
+    try {
+      if (const auto lock = PreparationLock::tryAcquire(root_)) reclaimAbandoned(root_);
+    } catch (const std::system_error &) {
+    }
+    return;
+  }
   std::filesystem::create_directories(root_);
   PreparationLock lock(root_, check);
-  // Reclaim abandoned writes before budgeting a retry. Live converters hold
-  // the lock, so every staging entry is abandoned, whichever model or version
-  // wrote it.
-  for (const auto &entry : std::filesystem::directory_iterator(root_))
-    if (entry.path().extension() == ".partial") std::filesystem::remove_all(entry.path());
+  // Abandoned writes go before a retry is budgeted.
+  reclaimAbandoned(root_);
   requireWeightDiskSpace(std::filesystem::space(root_).available, requiredBytes(root_, missing(), check));
 }
 
@@ -560,6 +602,7 @@ std::filesystem::path PreparedWeights::prepare(const PreparedWeight &weight, con
   // One converter per user cache: concurrent cold loads cannot multiply the
   // bounded conversion workspace. OS locks are released on crashes.
   PreparationLock lock(root_, guards.check);
+  reclaimAbandoned(root_);
   if (complete(destination, weight.bytes, guards.check)) {
     run(guards.unchanged);
     return destination / "weights";
@@ -568,10 +611,9 @@ std::filesystem::path PreparedWeights::prepare(const PreparedWeight &weight, con
   run(guards.admitConversion);
   const auto started = std::chrono::steady_clock::now();
   writeStderrLine("Preparing weights: " + weight.component);
-  // This name belongs only to this key under the converter lock. An abandoned
-  // staging directory is never a cache hit and is safe to replace.
+  // This name belongs only to this key under the converter lock, and
+  // reclaimAbandoned removed any earlier writer's.
   const auto staging = stagingPath(root_, weight.key);
-  std::filesystem::remove_all(staging);
   requireWeightDiskSpace(std::filesystem::space(root_).available, weight.bytes);
   std::filesystem::create_directory(staging);
   try {

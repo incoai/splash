@@ -5,6 +5,7 @@ import unittest
 from dev.tests import test_server
 from dev.tests.engine.test_documents import document_block
 from dev.tests.test_server import (
+    FOREVER,
     FakeConstraintFactory,
     FakeRuntime,
     Harness,
@@ -138,7 +139,7 @@ class AnthropicAdapterTest(unittest.TestCase):
             with self.subTest(fields=fields):
                 body = request_body(**fields)
                 original = copy.deepcopy(body)
-                translated = anthropic_to_chat_body(
+                translated, _ = anthropic_to_chat_body(
                     body, thinking_resolver=no_signed_thinking
                 )
                 self.assertEqual(body, original)
@@ -160,6 +161,17 @@ class AnthropicAdapterTest(unittest.TestCase):
         self.assertEqual(translated["reasoning_effort"], "xhigh")
         self.assertEqual(translated["response_format"]["json_schema"]["schema"], SCHEMA)
         self.assertEqual(translated["tools"][0]["function"]["name"], "lookup")
+
+    def test_a_strict_tool_stays_strict(self):
+        body = request_body(
+            tools=[
+                {"name": "lookup", "input_schema": {"type": "object"}, "strict": True}
+            ],
+        )
+        translated = anthropic_to_chat_prompt(
+            body, thinking_resolver=no_signed_thinking
+        )
+        self.assertIs(translated["tools"][0]["function"]["strict"], True)
 
     def test_format_shape_validation_is_independent_of_thinking(self):
         invalid = [
@@ -196,6 +208,29 @@ class AnthropicHTTPContractTest(unittest.TestCase):
         harness = Harness(runtime or FakeRuntime(), **kwargs)
         self.addCleanup(harness.close)
         return harness
+
+    def test_trailing_assistant_prefill_is_refused(self):
+        runtime = FakeRuntime()
+        harness = self.harness(runtime)
+        body = request_body(
+            messages=[
+                {"role": "user", "content": "Answer in JSON."},
+                {"role": "assistant", "content": "{"},
+            ]
+        )
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                status, _, payload = harness.request(
+                    "POST", "/v1/messages", {**body, "stream": stream}
+                )
+                self.assertEqual(status, 400, payload)
+                error = json.loads(payload)["error"]
+                self.assertEqual(error["type"], "invalid_request_error")
+                self.assertIn("prefill", error["message"])
+        self.assertEqual(runtime.requests, [])
+        status, _, payload = harness.request("POST", "/v1/messages/count_tokens", body)
+        self.assertEqual(status, 200, payload)
+        self.assertGreater(json.loads(payload)["input_tokens"], 0)
 
     def test_redacted_history_count_and_generation_use_same_visible_prompt(self):
         tokenizer = test_server.FakeTokenizer()
@@ -393,7 +428,7 @@ class AnthropicHTTPContractTest(unittest.TestCase):
         ):
             with self.subTest(tool_result=len(messages) > 1):
                 body = request_body(messages=messages)
-                translated = anthropic_to_chat_body(
+                translated, _ = anthropic_to_chat_body(
                     body, thinking_resolver=no_signed_thinking
                 )
                 # Conversion leaves the PDF to request preparation.
@@ -409,9 +444,9 @@ class AnthropicHTTPContractTest(unittest.TestCase):
                         }
                     ],
                 )
-                parts = normalize_messages(translated["messages"], vision=True)[-1][
-                    "content"
-                ]
+                parts = normalize_messages(
+                    translated["messages"], vision=True, deadline=FOREVER
+                )[-1]["content"]
                 self.assertIn("ALPHA 42", parts[0]["text"])
                 self.assertEqual(parts[1]["type"], "image_url")
                 status, _, payload = harness.request(
@@ -419,7 +454,7 @@ class AnthropicHTTPContractTest(unittest.TestCase):
                 )
                 self.assertEqual(status, 200, payload)
                 counted = json.loads(payload)["input_tokens"]
-                job, *_ = harness.app.prepare(translated)
+                job = harness.app.prepare(translated, deadline=FOREVER)
                 self.assertEqual(len(job.prompt_tokens), counted)
                 self.assertGreater(counted, 2)
                 self.assertEqual(len(job.image_spans), 1)
