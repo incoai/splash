@@ -1677,6 +1677,7 @@ void Engine::apply(const BatchPlan &plan,
         throw std::logic_error("model returned mismatched score logits");
       }
       active.scoreLogits = result.scoreLogits;
+      active.scoreReadout = {result.scoreLogNormalizer, result.scoreTopIds, result.scoreTopLogits};
     }
     // Score requests carry maxNewTokens == 0; only the model's finished flag
     // on the final prompt chunk completes them.
@@ -1712,7 +1713,7 @@ void Engine::apply(const BatchPlan &plan,
     } else if (schedulerResults[index].finished) {
       finish(active, result.finished ? EngineFinishReason::Stop
                                      : EngineFinishReason::Length,
-             active.scoreLogits);
+             active.scoreLogits, active.scoreReadout);
     } else if (plan.kind == WorkKind::Prefill &&
                scheduler_.phase(active.request.id) == Phase::Prefill) {
       armNextStateBoundary(active);
@@ -1759,14 +1760,14 @@ Engine::LaneEnd Engine::capacityExhausted(std::string_view what,
 }
 
 void Engine::finish(Request &active, EngineFinishReason reason,
-                    std::span<const float> optionLogits) {
+                    std::span<const float> optionLogits, const ScoreReadout &score) {
   if (reason == EngineFinishReason::Cancelled) {
     scheduler_.cancel(active.request.id);
   }
   active.finalized = true;
   const uint32_t completionTokens = generatedTokens(active);
   events_.completed(active.request.id, reason, active.promptTokens,
-                    completionTokens, optionLogits);
+                    completionTokens, optionLogits, score);
   if (reason == EngineFinishReason::Cancelled) {
     ++counters_.cancelled;
   } else {

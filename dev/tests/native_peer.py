@@ -91,7 +91,7 @@ def _event_payload(event: wire.EngineEvent) -> tuple[wire.FrameType, bytes]:
                 *event.simulation_tokens,
             )
         case wire.DoneEvent():
-            return wire.FrameType.DONE, struct.pack(
+            payload = struct.pack(
                 f"<QBIIQQQI{len(event.option_logits)}f",
                 event.request_id,
                 event.reason,
@@ -103,6 +103,17 @@ def _event_payload(event: wire.EngineEvent) -> tuple[wire.FrameType, bytes]:
                 len(event.option_logits),
                 *event.option_logits,
             )
+            if event.option_logits:
+                # The score readout: normalizer, top count, ids, logits.
+                count = len(event.top_token_ids)
+                payload += struct.pack(
+                    f"<dI{count}I{count}f",
+                    event.log_normalizer,
+                    count,
+                    *event.top_token_ids,
+                    *event.top_logits,
+                )
+            return wire.FrameType.DONE, payload
         case wire.ErrorEvent():
             return wire.FrameType.ERROR, struct.pack(
                 f"<BBQII{len(event.code)}s{len(event.message)}s",

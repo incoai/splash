@@ -293,6 +293,8 @@ class Plan:
         after_terminal=False,
         matched_tokens=1,
         logits=None,
+        normalizer=0.0,
+        top=(),
     ):
         self.batches = list(batches)
         self.reason = reason
@@ -301,6 +303,8 @@ class Plan:
         self.delay = delay
         self.matched_tokens = matched_tokens
         self.logits = logits
+        self.normalizer = normalizer
+        self.top = tuple(top)
         self.started = threading.Event()
         self.release = threading.Event()
         if not block:
@@ -486,6 +490,11 @@ class FakeRuntime:
             2_000,
             3_000,
             tuple(plan.logits) if plan.logits is not None else (),
+            float(plan.normalizer) if plan.logits is not None else 0.0,
+            tuple(token for token, _ in plan.top) if plan.logits is not None else (),
+            tuple(float(value) for _, value in plan.top)
+            if plan.logits is not None
+            else (),
         )
         call.complete(result=done)
 
