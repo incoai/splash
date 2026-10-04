@@ -245,6 +245,9 @@ const std::vector<std::pair<std::string, EngineEvent>> &engineEvents() {
                          3500, {}, 64, {350, 280, 50}}},
       {"done_scored", DoneEvent{91, EngineFinishReason::Stop, 4096, 0, 1000, 0,
                                 3500, {1.5f, -2.25f, 0.5f}, 32}},
+      {"done_scored_readout",
+       DoneEvent{91, EngineFinishReason::Stop, 4096, 0, 1000, 0, 3500, {1.5f, -2.25f}, 16, {},
+                 12.75, {7, 3, 11}, {9.5f, 9.25f, -1.0f}}},
       {"error_request",
        ErrorEvent{FailureClass::RequestError, 91, true, "deadline_exceeded",
                   "request deadline expired"}},
@@ -370,7 +373,8 @@ void testScoreRequestAndDoneLogits() {
   withImage.imageSpans = {
       {0, 1, 2, 2, 0x1111222233334444ULL, 0x5555666677778888ULL}};
   withImage.imagePixels.resize(withImage.imageSpans[0].pixelBytes());
-  expectRequestIssue(test, withImage, IssueCode::InvalidCount);
+  // Score requests may carry images: prefill encodes them as for generation.
+  CHECK(test, roundTrip(withImage) == withImage);
 
   RequestFrame constrained = request;
   constrained.constraint = ConstraintMode::TokenMask;
@@ -398,7 +402,9 @@ void testScoreRequestAndDoneLogits() {
   auto encodedDone = serializeEvent(scored, kLimits);
   CHECK(test, encodedDone);
   if (encodedDone) {
-    CHECK(test, encodedDone.value->size() == kFrameHeaderBytes + 61 + 12);
+    // The deduplicated count, the speculative counts, 3 option logits, the f64
+    // normalizer and an empty top count.
+    CHECK(test, encodedDone.value->size() == kFrameHeaderBytes + 61 + 12 + 12);
     CHECK(test, loadU32(*encodedDone.value, kFrameHeaderBytes + 41) == 96);
     CHECK(test, loadU32(*encodedDone.value, kFrameHeaderBytes + 57) == 3);
   }

@@ -7,11 +7,14 @@ RETRY_STATUSES = (503, 529)
 
 
 class APIError(Exception):
-    def __init__(self, status, message, code="invalid_request_error"):
+    def __init__(self, status, message, code="invalid_request_error", *, details=None):
         super().__init__(message)
         self.status = status
         self.message = message
         self.code = code
+        # Optional structured detail an OpenAI-shaped error body carries as
+        # error.details (for example a /v1/score label's token breakdown).
+        self.response_details = details
 
 
 class RequestValidationError(APIError):
@@ -57,9 +60,10 @@ class ErrorDialect:
     def payload(self, error):
         """`error` as a response or an event stream carries it."""
         error_type = "server_error" if error.status >= 500 else "invalid_request_error"
-        return {
-            "error": {"message": error.message, "type": error_type, "code": error.code}
-        }
+        body = {"message": error.message, "type": error_type, "code": error.code}
+        if error.response_details is not None:
+            body["details"] = error.response_details
+        return {"error": body}
 
 
 class AnthropicErrors(ErrorDialect):

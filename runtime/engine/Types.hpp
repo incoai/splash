@@ -18,6 +18,14 @@ enum class RequestPriority : uint8_t {
   Background = 2,
 };
 
+// A score request's full-vocabulary readout at its final position, beside
+// its option logits: log-sum-exp over the vocabulary and the highest logits.
+struct ScoreReadout final {
+  double logNormalizer = 0.0;
+  std::vector<uint32_t> topIds;
+  std::vector<float> topLogits;
+};
+
 struct StepResult final {
   uint64_t requestId = 0;
   uint32_t consumedPromptTokens = 0;
@@ -150,7 +158,8 @@ public:
                          uint32_t promptTokens, uint32_t completionTokens,
                          uint32_t deduplicatedTokens,
                          std::span<const float> optionLogits,
-                         const SpeculativeCounts &speculation) = 0;
+                         const SpeculativeCounts &speculation,
+                         const ScoreReadout &score) = 0;
   virtual void failed(uint64_t requestId, LaneOutcome outcome,
                       std::string message) = 0;
 };
