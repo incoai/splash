@@ -9,6 +9,6 @@ a stream. A request's preparation takes the app (server.frontend.Frontend)
 and no exchange. The HTTP itself stays in the router.
 """
 
-from . import anthropic, openai, responses, scoring
+from . import anthropic, openai, responses, score, scoring
 
-__all__ = ("anthropic", "openai", "responses", "scoring")
+__all__ = ("anthropic", "openai", "responses", "score", "scoring")

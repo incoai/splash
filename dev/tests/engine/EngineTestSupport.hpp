@@ -57,7 +57,8 @@ public:
   }
   void completed(uint64_t id, engine::EngineFinishReason reason, bool bounded, uint32_t prompt,
                  uint32_t completion, uint32_t deduplicated,
-                 std::span<const float>, const engine::SpeculativeCounts &speculation) override {
+                 std::span<const float>, const engine::SpeculativeCounts &speculation,
+                 const engine::ScoreReadout &) override {
     ++completedCount;
     reasons[id] = reason;
     if (bounded)

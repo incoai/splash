@@ -994,6 +994,8 @@ ROUTES = {
     ("POST", "/v1/memory/release"): Route(
         FrontendHandler._post_memory_release, fieldless=True
     ),
+    ("POST", "/v1/score"): Route(dialects.score.post_score),
+    ("POST", "/v1/decisions"): Route(dialects.score.post_decisions),
 }
 
 

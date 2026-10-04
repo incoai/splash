@@ -161,6 +161,11 @@ LinearConfig bf16Projection(const KernelCalibration &calibration, LinearWorkload
   const ProjectionCalibration &p = calibration.projection;
   const uint32_t cores = calibration.cores;
   if (w.phase == LinearPhase::Prefill) {
+    // A split-free workload (a score request's prefill) keeps one K pass,
+    // whose outputs equal the prefill tile's bit for bit: the staged tile
+    // unsplit up to kMaximumDecodeTileRows rows, the prefill tile past them.
+    if (w.splitFree)
+      return LinearConfig{.tile = w.rows <= kMaximumDecodeTileRows ? LinearTile::GgufStaged : LinearTile::GgufPrefill};
     if (w.rows <= p.stagedPrefillRows) return staged(p, n, k, w.rows, unit.weightBits16, cores, Passes::Two);
     return {.tile = LinearTile::GgufPrefill};
   }
@@ -244,7 +249,10 @@ SplitChoice splitsFor(const SplitLaw &law, uint32_t n, uint32_t k, uint32_t rows
 LinearConfig selectProjection(const KernelCalibration &calibration, Int8Activations int8Activations,
                               LinearWorkload w, const UnitFormats &unit, std::span<const UnitFormats> pairTensors) {
   LinearConfig config = bf16Projection(calibration, w, unit, pairTensors);
-  if (int8Activations == Int8Activations::Off) return config;
+  // A split-free workload stays in bf16: its chunks up to 32 rows run the
+  // staged tile, which has no int8 prefill, so the prefill tile's must not
+  // either for a score to read the same logits in any chunk.
+  if (int8Activations == Int8Activations::Off || w.splitFree) return config;
   const ProjectionCalibration &p = calibration.projection;
   if (config.tile == LinearTile::GgufPrefill && p.prefillInt8 && unit.prefillInt8Takes)
     config.tile = LinearTile::GgufPrefillInt8;

@@ -49,6 +49,7 @@ SERVER_FILES = (
     "output.py",
     "frontend.py",
     "chat_templates.py",
+    "scoring.py",
     "diagnostics.py",
     "chat_messages.py",
     "chat_format.py",
@@ -83,6 +84,7 @@ DIALECT_FILES = (
     "anthropic.py",
     "openai.py",
     "responses.py",
+    "score.py",
     "scoring.py",
 )
 CHAT_ASSET_FILES = (
