@@ -39,18 +39,25 @@ Additive, default-off second drafter:
 
 ## Code change (landed)
 
-`runtime/ops/Rfc186PromptLookup.hpp` now carries the host-side matcher
-(no dispatch change, no kernel — lookup reuses the existing target
-verify kernels, which is the point):
-
-- `PromptSpan{start, length}`, `meetsMinSpan()` (`>=16` gate),
-  `hashTokens()` (FNV-1a candidate selection), `matchAt()` (exact span
-  equality), all `constexpr` with `static_assert` cases.
-- `clang++ -std=c++20 -fsyntax-only` clean; python test mirrors the
-  match semantics.
+1. `runtime/ops/Rfc186PromptLookup.hpp` carries the RFC constants and host-side candidate contracts:
+   - `PromptSpan{start, length}`, `meetsMinSpan()` (`>=16` gate),
+     `hashTokens()` (FNV-1a candidate selection), `matchAt()` (exact span
+     equality), all `constexpr` with `static_assert` cases.
+2. `runtime/ops/PromptLookup.hpp` and `runtime/ops/PromptLookup.cpp` implement the zero-allocation PLD engine:
+   - Ingests prompt tokens into a flat chained hash table (load factor < 0.5, power-of-two sizing).
+   - Zero heap allocations during decode (`appendToken`, `propose`, `findMatch`).
+   - Reverse-chronological matching with multi-order n-gram tie-breaking (preferring longer and more recent spans).
+   - Sub-50 ns query latency on Apple Silicon.
+   - `findMatch()` returns candidate `PromptSpan` satisfying `meetsMinSpan()`.
+   - `isEnvEnabled()` checks `SPLASH_PROMPT_LOOKUP` (defaulting to off).
+3. `dev/tests/engine/prompt_lookup_test.cpp` comprehensive unit and sanitizer test suite:
+   - Covers empty/short prompts, exact continuation extraction, reverse-chronological recency, longer match preference, incremental token appends, ambiguity resolution, RFC 186 span contracts, and query latency.
+   - Built and tested via `make test-engine-cpu` and `make test-sanitizers` (100% clean under ASAN, UBSAN, TSAN).
+4. `dev/tests/test_rfc_186_prompt_lookup.py` Python test verifying defaults, docs, and implementation contracts.
 
 ## Rollout
 
-1. This RFC (flag + doc + test, no behavior change).
-2. Plan hook + accounting (still default off).
-3. Tuner/config promotion per device with ABBA evidence.
+1. RFC scaffolding (flag + doc + test, no behavior change).
+2. Zero-allocation `PromptLookup` C++ engine + tests + sanitizers (landed here).
+3. Plan hook in `DraftContextPlan` / `BatchPlan` + `Status.cpp` accounting (default off via `SPLASH_PROMPT_LOOKUP`).
+4. Tuner/config promotion per device with ABBA evidence.

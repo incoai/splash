@@ -41,6 +41,33 @@ class Rfc186PromptLookupTest(unittest.TestCase):
             with self.subTest(symbol=symbol):
                 self.assertIn(symbol, header)
 
+    def test_engine_implementation_present(self):
+        hpp = ROOT / "runtime/ops/PromptLookup.hpp"
+        cpp = ROOT / "runtime/ops/PromptLookup.cpp"
+        test_cpp = ROOT / "dev/tests/engine/prompt_lookup_test.cpp"
+        native_mk = ROOT / "dev/native.mk"
+
+        self.assertTrue(hpp.is_file())
+        self.assertTrue(cpp.is_file())
+        self.assertTrue(test_cpp.is_file())
+        self.assertTrue(native_mk.is_file())
+
+        hpp_text = hpp.read_text()
+        for method in (
+            "indexPrompt",
+            "appendToken",
+            "propose",
+            "findMatch",
+            "clear",
+            "isEnvEnabled",
+        ):
+            with self.subTest(method=method):
+                self.assertIn(method, hpp_text)
+
+        mk_text = native_mk.read_text()
+        self.assertIn("TEST_PROMPT_LOOKUP", mk_text)
+        self.assertIn("prompt_lookup_test.cpp", mk_text)
+
 
 if __name__ == "__main__":
     unittest.main()
