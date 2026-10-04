@@ -10,7 +10,7 @@ namespace splash::metal {
 // this clock even if its model ticket continues waiting for CPU work.
 class CommandWatchdog final {
 public:
-  explicit CommandWatchdog(double timeoutSeconds = 120.0)
+  explicit CommandWatchdog(double timeoutSeconds)
       : timeoutSeconds_(timeoutSeconds) {
     if (!std::isfinite(timeoutSeconds) || timeoutSeconds <= 0.0)
       throw std::invalid_argument("command timeout must be finite and positive");

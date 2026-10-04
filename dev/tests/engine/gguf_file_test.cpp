@@ -13,8 +13,9 @@ namespace {
 namespace gguf = splash::test::gguf;
 using splash::test::require;
 using splash::model::ggml::kF32;
-using splash::model::ggml::kQ4_K;
 
+constexpr uint32_t kQ4_K = 12;
+static_assert(std::string_view(splash::model::ggmlTypeTraits(kQ4_K)->name) == "Q4_K");
 constexpr uint64_t kQ4KBlockBytes = 144;
 
 // A file of one tensor, "weight", with one Q4_K block of data.
@@ -60,7 +61,7 @@ int main() {
     require(source.dataOffset() + weight.offset + weight.bytes == source.bytes(),
             "valid data must end exactly at EOF");
 
-    constexpr std::string_view overflow = "GGUF size overflows uint64", pastEnd = "runs past the end of the file";
+    constexpr std::string_view overflow = "GGUF size overflows", pastEnd = "runs past the end of the file";
     rejects("shape overflow", model({256, uint64_t{1} << 60}), overflow);
     rejects("row product overflow", model({256, uint64_t{1} << 63, 2}), overflow);
     rejects("byte size overflow", model({uint64_t{1} << 62}, 0, kF32), overflow);

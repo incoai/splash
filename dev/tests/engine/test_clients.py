@@ -3,6 +3,7 @@ import io
 import json
 import os
 import secrets
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -21,18 +22,37 @@ from install import clients, launcher
 MODEL = "incoai/Qwen3.6-35B-A3B-Splash"
 
 
+def hermes_profile_create(argv, *, env, **options):
+    """`hermes profile create NAME --no-alias` as Hermes runs it: the profile
+    in the root of env's HERMES_HOME, with a copy of the user's default model."""
+    assert argv[1:3] == ["profile", "create"] and argv[4:] == ["--no-alias"], argv
+    home = clients.hermes_profile_home(env, argv[3])
+    home.mkdir(parents=True)
+    seed = {"model": {"default": "cloud-model", "api_key_env": "CLOUD_API_KEY"}}
+    (home / "config.yaml").write_text(yaml.safe_dump(seed))
+    return subprocess.CompletedProcess(argv, 0, "", "")
+
+
 class ClientTests(unittest.TestCase):
     def setUp(self):
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        self.runtime = Path(directory.name)
-        # Pi's default models.json is in the home directory; no launch here
-        # touches the developer's.
+        # Pi's default models.json and the Hermes root are in the home
+        # directory; no launch here touches the developer's.
         home = tempfile.TemporaryDirectory()
         self.addCleanup(home.cleanup)
         self.home = Path(home.name)
         self.enterContext(mock.patch.dict(os.environ, {"HOME": home.name}))
         self.pi_models = self.home / ".pi/agent/models.json"
+        self.hermes_root = self.home / ".hermes"
+        # The environment each creation ran with, before the launch adds its own.
+        self.created = []
+
+        def create(argv, *, env, **options):
+            self.created.append((argv, dict(env), options))
+            return hermes_profile_create(argv, env=env, **options)
+
+        self.create = self.enterContext(
+            mock.patch.object(clients.subprocess, "run", side_effect=create)
+        )
 
     def command(
         self,
@@ -50,7 +70,6 @@ class ClientTests(unittest.TestCase):
             "http://127.0.0.1:8000/",
             model,
             context,
-            self.runtime,
             {} if env is None else env,
             client_args=client_args,
             client_version=client_version,
@@ -133,7 +152,6 @@ class ClientTests(unittest.TestCase):
                 "http://127.0.0.1:8000",
                 MODEL,
                 102400,
-                self.runtime,
                 input_modalities=["text"],
             )
             self.assertEqual(dict(os.environ), before)
@@ -283,14 +301,27 @@ class ClientTests(unittest.TestCase):
                 "model_auto_compact_token_limit": 92160,
             },
         )
-        self.assertEqual(list(self.runtime.iterdir()), [])
 
     def test_hermes_launch_writes_a_private_profile(self):
+        # The user's own configuration, which Splash leaves as it is.
+        self.hermes_root.mkdir()
+        user = self.hermes_root / "config.yaml"
+        user.write_text("model:\n  default: cloud-model\n  provider: anthropic\n")
         argv, env = self.command("hermes", env={"PATH": "/bin"})
-        home = self.runtime / "hermes"
+        home = self.hermes_root / "profiles/splash"
+        self.assertEqual(
+            self.created,
+            [
+                (
+                    ["/bin/hermes", "profile", "create", "splash", "--no-alias"],
+                    {"PATH": "/bin"},
+                    {"capture_output": True, "text": True, "stdin": subprocess.DEVNULL},
+                )
+            ],
+        )
         self.assertEqual(
             argv,
-            ["/bin/hermes", "chat", "--provider", "custom", "--model", MODEL],
+            ["/bin/hermes", "--provider", "custom", "--model", MODEL],
         )
         self.assertEqual(
             env,
@@ -317,8 +348,107 @@ class ClientTests(unittest.TestCase):
                 }
             },
         )
-        self.assertEqual(home.stat().st_mode & 0o777, 0o700)
+        self.assertEqual((home / "config.yaml").stat().st_mode & 0o777, 0o600)
         self.assertEqual({path.name for path in home.iterdir()}, {"config.yaml"})
+        self.assertEqual(
+            user.read_text(), "model:\n  default: cloud-model\n  provider: anthropic\n"
+        )
+        self.assertEqual(
+            {path.name for path in self.hermes_root.iterdir()},
+            {"config.yaml", "profiles"},
+        )
+
+    def test_hermes_arguments_pass_through_as_hermes_takes_them(self):
+        # Hermes takes --provider and --model before any subcommand; -q is
+        # chat's, and -z the top level's.
+        for args in (["chat", "-q", "Hello"], ["sessions", "list"], ["-z", "Hello"]):
+            with self.subTest(args=args):
+                argv, _ = self.command("hermes", client_args=args)
+                self.assertEqual(
+                    argv,
+                    ["/bin/hermes", "--provider", "custom", "--model", MODEL, *args],
+                )
+
+    def test_hermes_names_a_profile_per_port(self):
+        for port, name in ((8000, "splash"), (8001, "splash-8001")):
+            with self.subTest(port=port):
+                _, env = clients.command(
+                    "hermes",
+                    "/bin/hermes",
+                    f"http://127.0.0.1:{port}/",
+                    MODEL,
+                    102400,
+                    {},
+                    input_modalities=["text"],
+                )
+                home = self.hermes_root / "profiles" / name
+                self.assertEqual(env["HERMES_HOME"], str(home))
+                self.assertEqual(self.create.call_args.args[0][3], name)
+                config = yaml.safe_load((home / "config.yaml").read_text())
+                self.assertEqual(
+                    config["model"]["base_url"], f"http://127.0.0.1:{port}/v1"
+                )
+
+    def test_hermes_profile_is_in_the_root_of_the_users_hermes_home(self):
+        # Hermes's own rule: a home inside ~/.hermes belongs to ~/.hermes,
+        # <root>/profiles/<name> to <root>, and any other home is its root.
+        custom = self.home / "data"
+        for configured, root in (
+            ("~/.hermes", self.hermes_root),
+            ("~/.hermes/profiles/work", self.hermes_root),
+            (f"{custom}/profiles/work", custom),
+            (f"{custom}/hermes", custom / "hermes"),
+        ):
+            with self.subTest(HERMES_HOME=configured):
+                _, env = self.command("hermes", env={"HERMES_HOME": configured})
+                home = root / "profiles/splash"
+                self.assertEqual(env["HERMES_HOME"], str(home))
+                self.assertEqual(self.created[-1][1], {"HERMES_HOME": configured})
+                config = yaml.safe_load((home / "config.yaml").read_text())
+                self.assertEqual(config["model"]["default"], MODEL)
+                shutil.rmtree(home)
+        self.assertFalse((self.hermes_root / "config.yaml").exists())
+
+    def test_hermes_profile_is_created_once_and_then_kept(self):
+        _, env = self.command("hermes")
+        path = Path(env["HERMES_HOME"]) / "config.yaml"
+        config = yaml.safe_load(path.read_text())
+        config["model"]["reasoning_effort"] = "low"
+        path.write_text(yaml.safe_dump(config))
+        self.command("hermes", context=262144)
+        self.create.assert_called_once()
+        changed = yaml.safe_load(path.read_text())["model"]
+        self.assertEqual(changed["context_length"], 262144)
+        self.assertEqual(changed["reasoning_effort"], "low")
+
+    def test_failed_hermes_profile_creation_is_reported(self):
+        failed = subprocess.CompletedProcess([], 1, "", "Error: permission denied\n")
+        self.create.side_effect = None
+        self.create.return_value = failed
+        with self.assertRaisesRegex(
+            clients.ClientError,
+            "hermes profile create splash failed: Error: permission denied$",
+        ):
+            self.command("hermes")
+        self.assertFalse(self.hermes_root.exists())
+        self.create.side_effect = OSError("Exec format error")
+        with self.assertRaisesRegex(clients.ClientError, "Exec format error"):
+            self.command("hermes")
+
+    def test_hermes_profile_another_launch_created_is_configured(self):
+        # Hermes refuses to create a profile that exists; a launch that lost
+        # the race configures it.
+        home = self.hermes_root / "profiles/splash"
+        home.mkdir(parents=True)
+        (home / ".env").write_text("")
+        self.create.side_effect = None
+        self.create.return_value = subprocess.CompletedProcess(
+            [], 1, "", "Error: Profile 'splash' already exists\n"
+        )
+        _, env = self.command("hermes")
+        self.assertEqual(env["HERMES_HOME"], str(home))
+        config = yaml.safe_load((home / "config.yaml").read_text())
+        self.assertEqual(config["model"]["default"], MODEL)
 
     def test_pi_launch_adds_the_served_model_to_the_users_pi_models(self):
         argv, env = self.command("pi", env={"PATH": "/bin"})
@@ -339,7 +469,7 @@ class ClientTests(unittest.TestCase):
                                 "thinkingLevelMap": {"off": "none"},
                                 "input": ["text", "image"],
                                 "contextWindow": 102400,
-                                "maxTokens": 25600,
+                                "maxTokens": 32768,
                             }
                         ],
                     }
@@ -350,7 +480,6 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(agent.stat().st_mode & 0o777, 0o700)
         self.assertEqual(self.pi_models.stat().st_mode & 0o777, 0o600)
         self.assertEqual([path.name for path in agent.iterdir()], ["models.json"])
-        self.assertEqual(list(self.runtime.iterdir()), [])
 
     def test_pi_names_a_provider_per_port(self):
         self.command("pi")
@@ -360,7 +489,6 @@ class ClientTests(unittest.TestCase):
             "http://127.0.0.1:8001/",
             MODEL,
             102400,
-            self.runtime,
             {},
             input_modalities=["text"],
         )
@@ -673,12 +801,7 @@ class ClientTests(unittest.TestCase):
             argv, ["/bin/opencode", "run", "--standalone", "--", "--server"]
         )
 
-    def test_version_probe_parses_client_output_and_fails_closed(self):
-        def completed(stdout, returncode=0):
-            return subprocess.CompletedProcess(
-                ["opencode", "--version"], returncode, stdout=stdout, stderr=""
-            )
-
+    def test_major_version_reads_a_client_version_output(self):
         outputs = {
             "1.18.31\n": 1,
             "2.0.12": 2,
@@ -691,7 +814,17 @@ class ClientTests(unittest.TestCase):
             "2\n": None,
             "warning: requires macOS 26.4\n": None,
         }
-        for stdout, expected in outputs.items():
+        for text, expected in outputs.items():
+            with self.subTest(text=text):
+                self.assertEqual(clients.major_version(text), expected)
+
+    def test_version_probe_parses_client_output_and_fails_closed(self):
+        def completed(stdout, returncode=0):
+            return subprocess.CompletedProcess(
+                ["opencode", "--version"], returncode, stdout=stdout, stderr=""
+            )
+
+        for stdout, expected in (("opencode v2.0.12\n", 2), ("unknown\n", None)):
             with self.subTest(stdout=stdout):
                 with mock.patch.object(
                     clients.subprocess, "run", return_value=completed(stdout)
@@ -738,8 +871,8 @@ class ClientTests(unittest.TestCase):
         self.assertEqual({p.name for p in home.iterdir()}, {"state.db", "config.yaml"})
 
     def test_invalid_hermes_profile_is_not_overwritten(self):
-        home = self.runtime / "hermes"
-        home.mkdir()
+        home = self.hermes_root / "profiles/splash"
+        home.mkdir(parents=True)
         path = home / "config.yaml"
         for profile in (
             b"model: broken\n",
@@ -758,8 +891,8 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(), profile)
 
     def test_empty_hermes_profile_is_configured_from_scratch(self):
-        home = self.runtime / "hermes"
-        home.mkdir()
+        home = self.hermes_root / "profiles/splash"
+        home.mkdir(parents=True)
         path = home / "config.yaml"
         for profile, kept in (
             ("", {}),
@@ -775,8 +908,8 @@ class ClientTests(unittest.TestCase):
                 self.assertEqual(configured, kept)
 
     def test_failed_profile_replacement_keeps_the_previous_profile(self):
-        home = self.runtime / "hermes"
-        home.mkdir()
+        home = self.hermes_root / "profiles/splash"
+        home.mkdir(parents=True)
         path = home / "config.yaml"
         path.write_text("display: {interface: tui}\n")
         with (
@@ -885,20 +1018,25 @@ class ClientLifecycleTests(unittest.TestCase):
                 "owned_by": "splash",
                 "input_modalities": ["text", "image", "pdf"],
             }
-        status = {"ready": True, "maximum_context_tokens": context}
+        # Pi's models.json and the Hermes root are in the home directory.
         with (
-            tempfile.TemporaryDirectory() as runtime,
-            mock.patch.object(launcher, "PROFILES_DIR", Path(runtime)),
+            tempfile.TemporaryDirectory() as home,
+            mock.patch.dict(os.environ, {"HOME": home}),
+            mock.patch.object(
+                clients.subprocess, "run", side_effect=hermes_profile_create
+            ),
             mock.patch.object(
                 clients, "find_executable", return_value=f"/bin/{client}"
             ),
-            mock.patch.object(launcher, "_running_status", return_value=status),
             mock.patch.object(
-                launcher, "_request_json", return_value={"data": [model]}
+                launcher,
+                "_request_json",
+                return_value={"data": [{"context_length": context, **model}]},
             ),
             mock.patch.object(launcher.os, "execvpe") as execute,
             mock.patch("sys.stdout", io.StringIO()),
         ):
+            os.environ.pop("HERMES_HOME", None)
             yield execute
 
     def test_clients_accept_arguments_with_or_without_separator(self):
@@ -940,22 +1078,22 @@ class ClientLifecycleTests(unittest.TestCase):
         for arguments in (["--help"], ["serve", "--help"]):
             with (
                 self.subTest(arguments=arguments),
-                mock.patch.object(launcher, "_running_status") as status,
+                mock.patch.object(launcher, "_request_json") as request,
                 mock.patch("sys.stdout", io.StringIO()),
                 self.assertRaises(SystemExit) as result,
             ):
                 launcher.main(arguments)
             self.assertEqual(result.exception.code, 0)
-            status.assert_not_called()
+            request.assert_not_called()
 
     def test_missing_client_is_checked_before_connection(self):
         with (
             mock.patch.object(clients.shutil, "which", return_value=None),
-            mock.patch.object(launcher, "_running_status") as status,
+            mock.patch.object(launcher, "_request_json") as request,
             mock.patch("sys.stderr", io.StringIO()) as error,
         ):
             self.assertEqual(launcher.main(["claude"]), 1)
-        status.assert_not_called()
+        request.assert_not_called()
         self.assertIn("claude is not installed", error.getvalue())
 
     def test_ready_server_is_source_of_model_and_context(self):
@@ -1028,7 +1166,7 @@ class ClientLifecycleTests(unittest.TestCase):
         with (
             mock.patch.object(clients, "find_executable", return_value="/bin/opencode"),
             mock.patch.object(clients, "probe_major_version") as probe,
-            mock.patch.object(launcher, "_running_status", return_value=None),
+            mock.patch.object(launcher, "_request_json", return_value=None),
             mock.patch.object(launcher.os, "execvpe") as execute,
             mock.patch("sys.stderr", io.StringIO()),
         ):
@@ -1047,32 +1185,21 @@ class ClientLifecycleTests(unittest.TestCase):
             execute.assert_called_once()
             probe.assert_not_called()
 
-    def test_source_checkout_keeps_hermes_sessions_out_of_build(self):
-        # make clean removes build/, and a Hermes home there with it.
-        self.assertFalse(launcher.paths.PACKAGED)
+    def test_hermes_runs_in_a_profile_of_the_users_hermes_root(self):
+        # Never in a directory of Splash's, which Hermes would take for its
+        # root: it would install its tools there and point the user's hermes
+        # command at them.
         model = {"id": MODEL, "owned_by": "splash", "input_modalities": ["text"]}
-        status = {"ready": True, "maximum_context_tokens": 102400}
-        for port in (launcher.PORT, launcher.PORT + 1):
+        for port, name in ((launcher.PORT, "splash"), (8001, "splash-8001")):
             with (
                 self.subTest(port=port),
                 mock.patch.dict(os.environ, {"SPLASH_PORT": str(port)}),
-                mock.patch.object(
-                    clients, "find_executable", return_value="/bin/hermes"
-                ),
-                # The launcher's own home; nothing is written into the checkout.
-                mock.patch.object(clients, "_write_hermes_profile") as write,
-                mock.patch.object(launcher, "_running_status", return_value=status),
-                mock.patch.object(
-                    launcher, "_request_json", return_value={"data": [model]}
-                ),
-                mock.patch.object(launcher.os, "execvpe") as execute,
-                mock.patch("sys.stdout", io.StringIO()),
+                self.ready_server("hermes", model=model) as execute,
             ):
                 launcher.main(["hermes"])
-            home = Path(execute.call_args.args[2]["HERMES_HOME"])
-            write.assert_called_once_with(home, mock.ANY)
-            self.assertTrue(home.is_relative_to(launcher.ROOT))
-            self.assertFalse(home.is_relative_to(launcher.ROOT / "build"))
+                home = Path(os.environ["HOME"], ".hermes/profiles", name)
+                self.assertEqual(execute.call_args.args[2]["HERMES_HOME"], str(home))
+                self.assertTrue((home / "config.yaml").is_file())
 
     def test_unready_server_never_launches_or_downloads(self):
         for payload in ([], ["--help"]):
@@ -1081,7 +1208,7 @@ class ClientLifecycleTests(unittest.TestCase):
                 mock.patch.object(
                     clients, "find_executable", return_value="/bin/claude"
                 ),
-                mock.patch.object(launcher, "_running_status", return_value=None),
+                mock.patch.object(launcher, "_request_json", return_value=None),
                 mock.patch.object(launcher, "_ensure_installed") as install,
                 mock.patch.object(launcher.os, "execvpe") as execute,
                 mock.patch("sys.stderr", io.StringIO()) as error,
@@ -1093,19 +1220,17 @@ class ClientLifecycleTests(unittest.TestCase):
 
     def test_unidentified_server_never_launches_client(self):
         for catalog in (
-            None,
             {},
             {"data": None},
             {"data": []},
-            {"data": [{"id": "other", "owned_by": "other"}]},
+            {"data": [{"id": "other", "owned_by": "other", "context_length": 1}]},
+            {"data": [{"id": MODEL, "owned_by": "splash"}]},
+            {"data": [{"id": MODEL, "owned_by": "splash", "context_length": 0}]},
         ):
             with (
                 self.subTest(catalog=catalog),
                 mock.patch.object(
                     clients, "find_executable", return_value="/bin/codex"
-                ),
-                mock.patch.object(
-                    launcher, "_running_status", return_value={"ready": True}
                 ),
                 mock.patch.object(launcher, "_request_json", return_value=catalog),
                 mock.patch.object(launcher.os, "execvpe") as execute,
@@ -1155,7 +1280,6 @@ class InstalledOpenCodeTests(unittest.TestCase):
                 "http://127.0.0.1:18997",
                 model,
                 102400,
-                work / "runtime",
                 environment,
                 client_version=version,
                 client_args=query[1:],
@@ -1195,7 +1319,7 @@ class InstalledCodexTests(unittest.TestCase):
         # The installed client and production HTTP adapter are real. A
         # controlled length stop keeps this boundary test independent of model text.
         runtime = FakeRuntime(*(Plan([[4]], reason="length") for _ in range(32)))
-        harness = Harness(runtime, max_context=131072, default_max_new=16, timeout=60)
+        harness = Harness(runtime, max_context=131072, timeout=60)
         self.addCleanup(harness.close)
         base_url = f"http://127.0.0.1:{harness.server.server_port}"
         with tempfile.TemporaryDirectory() as directory:
@@ -1219,7 +1343,6 @@ class InstalledCodexTests(unittest.TestCase):
                 base_url,
                 "test-model",
                 131072,
-                work / "runtime",
                 environment,
                 input_modalities=["text", "image", "pdf"],
                 client_args=[
@@ -1262,6 +1385,13 @@ class InstalledCodexTests(unittest.TestCase):
                 32,
                 "client exhausted the bounded truncation fixture",
             )
+            # Codex names no output limit, so each request may use all the
+            # context its prompt leaves.
+            for request in runtime.requests:
+                self.assertEqual(
+                    request.frame.logical_max_output_tokens,
+                    131072 - len(request.frame.prompt_tokens),
+                )
             rows = [
                 json.loads(line) for line in stdout.splitlines() if line.startswith("{")
             ]
@@ -1385,7 +1515,6 @@ class InstalledCodexTests(unittest.TestCase):
                         base_url,
                         MODEL,
                         102400,
-                        work / "runtime",
                         env,
                         input_modalities=["text", "image", "pdf"],
                         client_args=args,
@@ -1485,7 +1614,6 @@ class InstalledPiTests(unittest.TestCase):
                 f"http://127.0.0.1:{harness.server.server_port}",
                 "test-model",
                 131072,
-                work / "runtime",
                 environment,
                 input_modalities=["text", "image", "pdf"],
                 client_args=[

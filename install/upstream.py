@@ -20,15 +20,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-if __package__:
-    from . import assembly, families, gguf, hub, legacy, models
-else:
-    import assembly
-    import families
-    import gguf
-    import hub
-    import legacy
-    import models
+from . import assembly, families, gguf, hub, legacy, models
 
 # The tokenizer files an MLX target may supply, linked when present.
 TOKENIZER_FILES = (

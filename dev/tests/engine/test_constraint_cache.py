@@ -32,10 +32,13 @@ class ConstraintCacheTests(unittest.TestCase):
             ("LLExecutor", lambda: None),
             ("TokenConstraint", constraint),
         ):
-            patch = mock.patch.object(constraints, target, replacement)
-            patch.start()
-            self.addCleanup(patch.stop)
-        return constraints.ConstraintFactory(object(), cache_source_bytes=budget)
+            self.enterContext(mock.patch.object(constraints, target, replacement))
+        self.enterContext(
+            mock.patch.object(
+                constraints.ConstraintFactory, "CACHE_SOURCE_BYTES", budget
+            )
+        )
+        return constraints.ConstraintFactory(object())
 
     def test_byte_budget_evicts_lru_and_counts_utf8(self):
         factory = self.factory()
@@ -65,12 +68,7 @@ class ConstraintCacheTests(unittest.TestCase):
         self.assertEqual(
             factory.source_bytes, sum(len(key.encode()) for key in factory.cache)
         )
-        self.assertLessEqual(len(factory.cache), factory.cache_size)
-
-    def test_invalid_budget_is_rejected(self):
-        for value in (0, -1, True, 1.5):
-            with self.subTest(value=value), self.assertRaises(ValueError):
-                self.factory(value)
+        self.assertLessEqual(len(factory.cache), factory.CACHE_SIZE)
 
     def test_cold_compile_does_not_block_hits_stats_or_other_compilation(self):
         entered, release = threading.Event(), threading.Event()

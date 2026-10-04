@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <limits>
 
 namespace splash::ops::tuning {
 namespace {
@@ -17,8 +16,8 @@ bool validPolicy(const Policy &policy) noexcept {
          std::isfinite(policy.maximumPairedGainSpread) &&
          policy.maximumPairedGainSpread >= 0 &&
          policy.maximumPairedGainSpread < 1 &&
-         std::isfinite(policy.minimumMeanImprovement) &&
-         policy.minimumMeanImprovement > 0 && policy.minimumMeanImprovement < 1;
+         std::isfinite(policy.minimumImprovement) &&
+         policy.minimumImprovement > 0 && policy.minimumImprovement < 1;
 }
 
 struct Distribution final {
@@ -105,7 +104,7 @@ TimingAssessment evaluate(std::span<const PairedTiming> samples,
   } else if (result.conservativeGain < 0) {
     result.verdict = TimingVerdict::Uncertain;
   } else {
-    result.verdict = result.conservativeGain >= policy.minimumMeanImprovement
+    result.verdict = result.conservativeGain >= policy.minimumImprovement
                          ? TimingVerdict::Improved
                          : TimingVerdict::Stable;
   }
@@ -113,20 +112,11 @@ TimingAssessment evaluate(std::span<const PairedTiming> samples,
 }
 
 Selection selectCandidate(std::span<const CandidateMeasurements> candidates,
-                          std::span<const WorkloadId> requiredWorkloads,
                           const Policy &policy) noexcept {
   Selection result;
-  if (!validPolicy(policy) || requiredWorkloads.empty()) {
+  if (!validPolicy(policy)) {
     result.verdict = SelectionVerdict::InvalidInput;
     return result;
-  }
-  for (size_t i = 0; i < requiredWorkloads.size(); ++i) {
-    for (size_t j = 0; j < i; ++j) {
-      if (requiredWorkloads[i] == requiredWorkloads[j]) {
-        result.verdict = SelectionVerdict::InvalidInput;
-        return result;
-      }
-    }
   }
   for (size_t i = 0; i < candidates.size(); ++i) {
     if (candidates[i].id == kBaseline) {
@@ -142,55 +132,15 @@ Selection selectCandidate(std::span<const CandidateMeasurements> candidates,
   }
 
   for (const auto &candidate : candidates) {
-    if (candidate.workloads.size() != requiredWorkloads.size())
+    const auto assessment = evaluate(candidate.samples, policy);
+    if (assessment.verdict != TimingVerdict::Improved)
       continue;
-    bool qualified = true;
-    double meanGain = 0;
-    double worstGain = std::numeric_limits<double>::infinity();
-    // Iterating in the required ID order also makes rounding and tie-breaking
-    // independent of the input order of a candidate's workload records.
-    for (const auto required : requiredWorkloads) {
-      const WorkloadMeasurements *matched = nullptr;
-      for (const auto &workload : candidate.workloads) {
-        if (workload.id != required)
-          continue;
-        if (matched) {
-          qualified = false;
-          break;
-        }
-        matched = &workload;
-      }
-      if (!qualified || !matched) {
-        qualified = false;
-        break;
-      }
-      double gain = 0;
-      if (matched->equivalentToBaseline) {
-        if (!matched->samples.empty()) {
-          qualified = false;
-          break;
-        }
-      } else {
-        const auto assessment = evaluate(matched->samples, policy);
-        if (!assessment.qualified()) {
-          qualified = false;
-          break;
-        }
-        gain = assessment.conservativeGain;
-      }
-      meanGain += gain / requiredWorkloads.size();
-      worstGain = std::min(worstGain, gain);
-    }
-    if (!qualified || meanGain < policy.minimumMeanImprovement)
-      continue;
+    const double gain = assessment.conservativeGain;
     if (result.verdict == SelectionVerdict::Baseline ||
-        meanGain > result.conservativeMeanGain ||
-        (meanGain == result.conservativeMeanGain &&
-         (worstGain > result.worstWorkloadGain ||
-          (worstGain == result.worstWorkloadGain &&
-           candidate.id.value < result.candidate.value)))) {
-      result = {SelectionVerdict::Selected, candidate.id, meanGain, worstGain};
-    }
+        gain > result.conservativeGain ||
+        (gain == result.conservativeGain &&
+         candidate.id.value < result.candidate.value))
+      result = {SelectionVerdict::Selected, candidate.id, gain};
   }
   return result;
 }

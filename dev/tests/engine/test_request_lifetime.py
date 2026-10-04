@@ -3,6 +3,7 @@ import threading
 import time
 import unittest
 import weakref
+from types import SimpleNamespace
 from unittest import mock
 
 from dev.tests.engine.test_runtime import FakeFactory, request, send_success
@@ -24,12 +25,17 @@ class RequestLifetimeTests(unittest.TestCase):
     def backend(self):
         factory = FakeFactory()
         runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
-        backend = backend_api.NativeBackend(runtime, FakeTokenizer())
+        backend = backend_api.NativeBackend(
+            runtime, FakeTokenizer(), lambda _record: None
+        )
         self.addCleanup(backend.close)
         return backend, factory.processes[0]
 
     def job(self):
-        cache = images.ImageCache(request_budget_bytes=1024)
+        self.enterContext(
+            mock.patch.object(images.ImageCache, "REQUEST_BUDGET_BYTES", 1024)
+        )
+        cache = images.ImageCache()
         owner = cache.request_batch()
         owner.append(images.PreparedImage(2, 2, b"pixels", 0, 0))
         job = backend_api.Job(
@@ -37,9 +43,7 @@ class RequestLifetimeTests(unittest.TestCase):
             prompt_tokens=[101, 102],
             max_new_tokens=16,
             seed=0,
-            temperature=0,
-            top_p=1,
-            top_k=1,
+            sampling=wire.SamplingParameters(top_k=1),
             deadline=time.monotonic() + 30,
             image_owner=owner,
         )
@@ -62,7 +66,7 @@ class RequestLifetimeTests(unittest.TestCase):
         for outcome in (
             "complete",
             "cancel",
-            "capacity",
+            "request_error",
             "callback_error",
             "runtime_callback_error",
             "shutdown",
@@ -73,7 +77,7 @@ class RequestLifetimeTests(unittest.TestCase):
                 if outcome == "callback_error":
 
                     class Constraint:
-                        def consume(self, _tokens):
+                        def commit(self, _tokens):
                             raise api.APIError(400, "constraint callback failed")
 
                     job.constraint = Constraint()
@@ -83,24 +87,26 @@ class RequestLifetimeTests(unittest.TestCase):
                         raise RuntimeError("event callback failed")
 
                     backend._on_event = fail_event
-                self.assertTrue(backend.submit(job))
+                backend.submit(job)
                 call = backend.active[job.request_id].call
                 if outcome in ("complete", "runtime_callback_error"):
                     send_success(process, call, tokens=(4,))
-                elif outcome == "capacity":
+                elif outcome == "request_error":
                     process.send(
-                        wire.CapacityExhaustedEvent(call.request_id, 40, 12, 50000)
+                        wire.ErrorEvent(
+                            wire.FailureClass.REQUEST_ERROR,
+                            call.request_id,
+                            False,
+                            b"capacity_exhausted",
+                            b"could not allocate KV target: engine budget",
+                        )
                     )
                 elif outcome == "shutdown":
                     backend.close()
                 else:
                     count = 0
                     if outcome == "callback_error":
-                        process.send(
-                            wire.StartEvent(
-                                call.request_id, wire.CacheDisposition.MISS, 0, 0, 4096
-                            )
-                        )
+                        process.send(wire.StartEvent(call.request_id, 0, 0))
                         process.send(wire.TokensEvent(call.request_id, 0, (4,)))
                         process.stdin.wait_for(wire.CancelFrame)
                         count = 1
@@ -115,6 +121,7 @@ class RequestLifetimeTests(unittest.TestCase):
                             100,
                             0,
                             100,
+                            (),
                         )
                     )
                 kind, result = self.terminal(job)
@@ -126,7 +133,7 @@ class RequestLifetimeTests(unittest.TestCase):
                     self.assertIsNone(result.__traceback__)
                 elif outcome == "runtime_callback_error":
                     self.assertEqual(result.message, "event callback failed")
-                    self.assertIsNone(call.callback_errors[0].__traceback__)
+                    self.assertIsNone(call.callback_error.__traceback__)
                 del call, job
                 self.assert_released(cache, owner)
                 self.assertFalse(backend.active)
@@ -138,16 +145,16 @@ class RequestLifetimeTests(unittest.TestCase):
                 job, cache, owner = self.job()
                 if outcome == "expired":
                     job.deadline = time.monotonic() - 1
-                    self.assertTrue(backend.submit(job))
+                    backend.submit(job)
                 elif outcome == "closed":
                     backend.close()
-                    self.assertTrue(backend.submit(job))
+                    backend.submit(job)
                 elif outcome == "full":
                     slots = backend.runtime._admission_slots
                     for _ in range(backend.runtime.pending_limit):
                         self.assertTrue(slots.acquire(blocking=False))
                     try:
-                        self.assertFalse(backend.submit(job))
+                        backend.submit(job)
                     finally:
                         for _ in range(backend.runtime.pending_limit):
                             slots.release()
@@ -161,14 +168,41 @@ class RequestLifetimeTests(unittest.TestCase):
                         "_write_bytes",
                         new=fail_write,
                     ):
-                        self.assertTrue(backend.submit(job))
-                if outcome != "full":
-                    kind, error = self.terminal(job)
-                    self.assertEqual(kind, "error")
-                    self.assertIsNone(error.__traceback__)
+                        backend.submit(job)
+                kind, error = self.terminal(job)
+                self.assertEqual(kind, "error")
+                self.assertIsNone(error.__traceback__)
                 del job
                 self.assert_released(cache, owner)
                 self.assertFalse(backend.active)
+
+    def test_pixel_bytes_are_released_once_the_request_frame_is_written(self):
+        backend, process = self.backend()
+        job, cache, owner = self.job()
+        span = wire.ImageSpan(1, 256, 32, 32, 1, 2)
+        pixels = bytes(span.pixel_bytes)
+        job.prompt_tokens = [101] * 258
+        job.image_spans = (span,)
+        job.image_pixels = pixels
+        backend.submit(job)
+        process.stdin.wait_for(wire.RequestFrame)
+
+        self.assertEqual(job.image_pixels, b"")
+        holders = (
+            engine_runtime.RuntimeCall,
+            engine_runtime.GenerationRequest,
+            wire.RequestFrame,
+        )
+        self.assertFalse(
+            [held for held in gc.get_referrers(pixels) if isinstance(held, holders)]
+        )
+        # The charge for the images is a separate lease, held until the end.
+        self.assertGreater(cache.stats()["request_bytes"], 0)
+        call = backend.active[job.request_id].call
+        send_success(process, call, tokens=(4,))
+        self.assertEqual(self.terminal(job)[0], "done")
+        del call, job
+        self.assert_released(cache, owner)
 
     def test_mask_worker_keeps_image_lease_until_it_exits(self):
         backend, process = self.backend()
@@ -185,17 +219,15 @@ class RequestLifetimeTests(unittest.TestCase):
 
         job, cache, owner = self.job()
         job.constraint = Constraint()
-        self.assertTrue(backend.submit(job))
+        backend.submit(job)
         call = backend.active[job.request_id].call
-        process.send(
-            wire.StartEvent(call.request_id, wire.CacheDisposition.MISS, 0, 0, 4096)
-        )
+        process.send(wire.StartEvent(call.request_id, 0, 0))
         process.send(wire.MaskRequestEvent(call.request_id, 88, 2, ()))
         self.assertTrue(entered.wait(1))
         backend.cancel(job)
         process.send(
             wire.DoneEvent(
-                call.request_id, wire.FinishReason.CANCELLED, 2, 0, 100, 0, 100
+                call.request_id, wire.FinishReason.CANCELLED, 2, 0, 100, 0, 100, ()
             )
         )
         self.assertEqual(self.terminal(job)[0], "done")
@@ -227,7 +259,7 @@ class RequestLifetimeTests(unittest.TestCase):
         release.set()
         thread.join(1)
         self.assertFalse(thread.is_alive())
-        self.assertFalse(call.callback_errors)
+        self.assertIsNone(call.callback_error)
         self.assert_released(cache, owner)
 
     def test_callback_failure_after_native_failure_does_not_retain_retired_state(self):
@@ -237,7 +269,7 @@ class RequestLifetimeTests(unittest.TestCase):
         self.addCleanup(release.set)
 
         class Constraint:
-            def consume(self, _tokens):
+            def commit(self, _tokens):
                 entered.set()
                 if not release.wait(2):
                     raise TimeoutError("test callback was not released")
@@ -245,11 +277,9 @@ class RequestLifetimeTests(unittest.TestCase):
 
         job, cache, owner = self.job()
         job.constraint = Constraint()
-        self.assertTrue(backend.submit(job))
+        backend.submit(job)
         call = backend.active[job.request_id].call
-        process.send(
-            wire.StartEvent(call.request_id, wire.CacheDisposition.MISS, 0, 0, 4096)
-        )
+        process.send(wire.StartEvent(call.request_id, 0, 0))
         process.send(wire.TokensEvent(call.request_id, 0, (4,)))
         self.assertTrue(entered.wait(1))
         # The failure starts a replacement engine with a reader of its own.
@@ -276,8 +306,10 @@ class RequestLifetimeTests(unittest.TestCase):
                     except ValueError as cause:
                         raise RuntimeError("callback failed") from cause
 
+                # A failed event callback cancels its call.
+                client = SimpleNamespace(_cancel_call=lambda _call: None)
                 call = engine_runtime.RuntimeCall(
-                    None,
+                    client,
                     1,
                     1,
                     request(100, image_owner=job.image_owner),
@@ -286,8 +318,9 @@ class RequestLifetimeTests(unittest.TestCase):
                 )
                 if not completion:
                     call._emit(None)
+                    self.assertTrue(call.cancel_requested)
                 call._set_terminal(error=engine_runtime.RuntimeClosed("finished"))
-                (failure,) = call.callback_errors
+                failure = call.callback_error
                 self.assertIsInstance(failure, RuntimeError)
                 self.assertEqual(str(failure), "callback failed")
                 self.assertIsNone(failure.__traceback__)

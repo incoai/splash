@@ -1,26 +1,32 @@
 #pragma once
 
+#include "ops/PagedKv.hpp"
 #include "ops/Vision.hpp"
 #include "model/StateTransfer.hpp"
 
 #include <array>
 #include <atomic>
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace splash {
 
-enum class BatchCohort : uint8_t { Greedy, Sampling, Constrained };
 enum class WorkKind : uint8_t { Prefill, Decode };
 
 enum class DecodeStage : uint8_t {
+  // Drafts and verifies.
   Regular,
-  RequestInitialMask,
+  // A constrained request's prompt is done; it waits for, or holds, the mask
+  // its first token is selected under.
   ApplyInitialMask,
 };
 
@@ -28,20 +34,76 @@ enum class DecodeStage : uint8_t {
   return stage == DecodeStage::ApplyInitialMask;
 }
 
-enum class ConstraintMode : uint8_t { None, TokenMask };
+// Values are the native request frame's constraint byte.
+enum class ConstraintMode : uint8_t { None = 0, TokenMask = 1 };
 
+// Request options, one bit each, as the native request frame's flags word
+// carries them; a request with any other bit set is a request error.
+enum RequestFlag : uint32_t {
+  // Never select the model's stop tokens, so generation runs to its output
+  // limit. Only unconstrained generation can carry it.
+  RequestIgnoreEndOfSequence = 1U << 0,
+};
+
+inline constexpr uint32_t kRequestFlagBits = RequestIgnoreEndOfSequence;
+
+// A request's token selection, its fields in the native request frame's
+// order. The defaults are greedy selection with nothing changing the logits.
 struct SamplingParameters final {
+  // Zero selects greedily; sampling divides the logits by it.
   float temperature = 0.0F;
   float topP = 1.0F;
+  // Sampling keeps the topK most likely tokens; 0 keeps every token, as does
+  // a topK past the vocabulary.
   uint32_t topK = 0;
+  // The sampling penalties, applied before greedy and sampled selection alike:
+  // repetition scales the logits of prompt and output tokens, presence and
+  // frequency lower those of output tokens. The defaults change nothing.
+  float presencePenalty = 0.0F;
+  float frequencyPenalty = 0.0F;
+  float repetitionPenalty = 1.0F;
+  // Sampling drops the tokens less likely than minP times the most likely
+  // one, before top-k and top-p; 0 drops none.
+  float minP = 0.0F;
   uint64_t seed = 0;
+
+  bool operator==(const SamplingParameters &) const = default;
+
+  // The first rule the parameters break, or none. A sampling temperature is
+  // at least FLT_MIN: the kernels divide by it, and Metal flushes a subnormal
+  // one to zero.
+  [[nodiscard]] std::optional<std::string_view>
+  validationError() const noexcept {
+    const bool temperatureValid =
+        temperature == 0.0F ||
+        (std::isfinite(temperature) &&
+         temperature >= std::numeric_limits<float>::min());
+    if (!temperatureValid || !(topP > 0.0F && topP <= 1.0F) ||
+        !(minP >= 0.0F) || minP > 1.0F) {
+      return "sampling requires temperature 0 or at least FLT_MIN, top_p in "
+             "(0,1] and min_p in [0,1]";
+    }
+    if (!(std::fabs(presencePenalty) <= 2.0F) ||
+        !(std::fabs(frequencyPenalty) <= 2.0F) ||
+        !std::isfinite(repetitionPenalty) || repetitionPenalty <= 0.0F) {
+      return "sampling requires presence and frequency penalties in [-2,2] "
+             "and a positive repetition penalty";
+    }
+    return std::nullopt;
+  }
+
+  // Greedy selection with nothing changing the logits, whatever the seed.
+  [[nodiscard]] bool isNeutral() const noexcept {
+    SamplingParameters neutral;
+    neutral.seed = seed;
+    return *this == neutral;
+  }
 };
 
 // Immutable view of the fields a model needs to activate a sequence.  Engine
 // priority and deadline policy deliberately do not cross this boundary.
 struct ModelRequest final {
   uint64_t id = 0;
-  BatchCohort cohort = BatchCohort::Greedy;
   std::span<const uint32_t> prompt;
   std::span<const struct ImageSpan> images;
   std::span<const uint8_t> imagePixels;
@@ -52,8 +114,19 @@ struct ModelRequest final {
   // generated, and the raw final-position logits at these ids are returned in
   // ModelStepResult::scoreLogits. maxNewTokens must be zero.
   std::span<const uint32_t> scoreTokens{};
+  // RequestFlag bits.
+  uint32_t flags = 0;
+  // Prompt tokens the lane takes from a cached state. Images that end at or
+  // before it are neither staged nor encoded; their spans still place
+  // rotary positions.
+  uint32_t restoredTokens = 0;
 };
 
+// One image in the prompt: the run of placeholder tokens it occupies (one per
+// merged 2x2 patch group, row-major over the merged grid), the patch grid of
+// the frontend's resized pixels, and a 128-bit digest of that content.
+// Placeholder token ids are identical for every image, so cache identity keys
+// on the digest as well as the tokens.
 struct ImageSpan final {
   uint32_t offset = 0;
   uint32_t tokens = 0;
@@ -63,11 +136,42 @@ struct ImageSpan final {
   uint64_t digestHi = 0;
 
   [[nodiscard]] uint32_t end() const noexcept { return offset + tokens; }
+  [[nodiscard]] ops::ImageGrid grid() const noexcept {
+    return {gridHeight, gridWidth};
+  }
   [[nodiscard]] uint64_t pixelBytes() const noexcept {
-    return ops::imagePixelBytes(gridHeight, gridWidth);
+    return grid().pixelBytes();
   }
   bool operator==(const ImageSpan &) const = default;
 };
+
+// The first rule a request's image spans break, or none: each covers a valid
+// grid within the patch limit with one token per merged patch group, the
+// runs are sorted, disjoint and inside the prompt, and the pixels are the
+// grids' own.
+[[nodiscard]] inline std::optional<std::string_view>
+imageSpansValidationError(std::span<const ImageSpan> spans, size_t promptTokens,
+                          uint64_t pixelBytes) noexcept {
+  uint64_t previousEnd = 0;
+  uint64_t gridPixelBytes = 0;
+  for (const ImageSpan &span : spans) {
+    const ops::ImageGrid grid = span.grid();
+    if (!grid.valid() || grid.patches() > ops::kMaximumImagePatches)
+      return "image grid must be even-sided and within the patch limit";
+    if (span.tokens != grid.mergedTokens())
+      return "image span tokens must equal the merged grid size";
+    const uint64_t end = uint64_t{span.offset} + span.tokens;
+    if (span.offset < previousEnd || end > promptTokens) {
+      return "image spans must be sorted, non-overlapping runs inside the "
+             "prompt";
+    }
+    previousEnd = end;
+    gridPixelBytes += grid.pixelBytes();
+  }
+  if (pixelBytes != gridPixelBytes)
+    return "image pixels do not match the image grids";
+  return std::nullopt;
+}
 
 // Immutable target-recurrent plus draft-context state.  Concrete model
 // implementations own its buffers; the engine only pins and accounts it.
@@ -75,8 +179,8 @@ class CompositeState {
 public:
   virtual ~CompositeState() = default;
   // Footprint retained by the cache. A cached state owns a private copy of
-  // the lane's state; dropping the reference returns that slot to the model's
-  // pool, and idle-state reclaim frees it.
+  // the lane's state; dropping the reference returns its buffers to the
+  // model's pool, and idle-state reclaim frees them.
   [[nodiscard]] virtual uint64_t bytes() const noexcept = 0;
   [[nodiscard]] virtual uint64_t residentBytes() const noexcept { return bytes(); }
   [[nodiscard]] virtual bool canOffload() const noexcept { return false; }
@@ -85,6 +189,15 @@ public:
   // A null ticket means that the disk quota cannot admit another state.
   [[nodiscard]] virtual std::unique_ptr<StateOffload>
   offload(std::function<void()>) const { return {}; }
+  // Starts writing this state to the disk tier from its own buffers, for a
+  // persistent tier's copy of a state that stays in RAM: the buffers must
+  // stay as they are until the ticket is ready. Null as for offload().
+  [[nodiscard]] virtual std::unique_ptr<StateOffload>
+  persist(std::function<void()>) const { return {}; }
+  // On a disk copy in a persistent tier, keeps the label with its slot once
+  // the write started before has landed (SlotFile::label). Nothing
+  // otherwise.
+  virtual void label(std::vector<std::byte>) const {}
 };
 
 enum class DraftBoundaryPurpose : uint8_t { Active, Materialization };
@@ -104,27 +217,12 @@ struct DraftBoundaryPlan final {
 struct DraftContextPlan final {
   uint32_t replayBegin = 0;
   uint32_t replayEnd = 0;
-  std::optional<uint32_t> restoredDraftBoundary;
   std::vector<DraftCaptureSpan> captureSpans;
   std::vector<DraftBoundaryPlan> boundaries;
-
-  uint64_t targetPrefillRows = 0;
-  uint64_t draftContextRowsActive = 0;
-  uint64_t draftContextRowsMaterialization = 0;
-  uint64_t draftContextRowsAvoided = 0;
-  uint64_t draftStateRestoreSkipped = 0;
-  uint64_t draftStateResets = 0;
-
-  [[nodiscard]] uint64_t draftContextRows() const noexcept {
-    return draftContextRowsActive + draftContextRowsMaterialization;
-  }
-  [[nodiscard]] std::span<const DraftCaptureSpan> captures() const noexcept {
-    return captureSpans;
-  }
-  [[nodiscard]] std::span<const DraftBoundaryPlan>
-  plannedBoundaries() const noexcept {
-    return boundaries;
-  }
+  // The first capture continues the restored draft ring: a non-zero replay
+  // whose first boundary is within one draft window of it. Otherwise the
+  // restore skips the ring.
+  bool restoresDraftState = false;
 };
 
 struct DispatchDraftCaptureSpan final {
@@ -149,9 +247,10 @@ struct DispatchDraftCapturePlan final {
   [[nodiscard]] auto end() const noexcept { return values.begin() + count; }
 };
 
+// A replay from a non-zero boundary starts from the composite state restored
+// there.
 [[nodiscard]] DraftContextPlan
 planDraftContext(uint32_t replayBegin, uint32_t replayEnd,
-                 std::optional<uint32_t> restoredDraftBoundary,
                  std::span<const uint32_t> materializationBoundaries);
 
 [[nodiscard]] DispatchDraftCapturePlan
@@ -166,7 +265,9 @@ struct BatchItem final {
 
 struct BatchPlan final {
   WorkKind kind = WorkKind::Decode;
-  BatchCohort cohort = BatchCohort::Greedy;
+  // A decode's lanes exchange token masks with the host; constrained and
+  // unconstrained lanes never share a command.
+  bool constrained = false;
   std::vector<BatchItem> items;
   DecodeStage decodeStage = DecodeStage::Regular;
 
@@ -179,21 +280,26 @@ struct BatchPlan final {
 enum class StateFailure : uint8_t { None, ConcurrencyLimit, MemoryPressure };
 
 struct StateAdmission final {
-  std::optional<uint32_t> cell;
+  std::optional<uint32_t> lane;
   StateFailure failure = StateFailure::None;
   metal::AllocationFailure allocationFailure = metal::AllocationFailure::None;
+  // On a refused start: what the attempt matched (cached image rows, the
+  // encoder it would use). The caller keeps it while it reclaims and
+  // retries, so the retry finds them.
+  std::shared_ptr<const void> held{};
 
-  [[nodiscard]] bool granted() const noexcept { return cell.has_value(); }
+  [[nodiscard]] bool granted() const noexcept { return lane.has_value(); }
 };
 
 struct ModelBatchItem final {
   uint64_t requestId = 0;
-  uint32_t stateSlot = 0;
   uint64_t logicalPosition = 0;
-  uint32_t promptOffset = 0;
   uint32_t tokenCount = 0;
   std::span<const uint32_t> pageTable;
+  // pageTableRevision names the page list and is nonzero; the list equals
+  // the one at revision - 1 below pageTableFirstChanged.
   uint64_t pageTableRevision = 0;
+  uint32_t pageTableFirstChanged = 0;
   std::span<const uint32_t> inputTokens{};
 };
 
@@ -215,9 +321,11 @@ struct ModelStepResult final {
   // requested order. Empty for generation and for cancelled/failed scoring.
   std::vector<float> scoreLogits{};
   // Set when the model computed an unusable result for this lane alone, such
-  // as a non-finite score logit. The engine fails that one request before it
-  // publishes cache state or emits output, and the rest of the batch stands.
-  // Broken invariants and GPU faults stay exceptions and remain engine-fatal.
+  // as a non-finite score logit or a selection outside the vocabulary (the
+  // sampling kernels' sentinel for a non-finite logit row). The engine fails
+  // that one request before it publishes cache state or emits output, and the
+  // rest of the batch stands. Broken invariants and GPU faults stay
+  // exceptions and remain engine-fatal.
   std::string failure{};
 
   bool operator==(const ModelStepResult &) const = default;
@@ -255,20 +363,24 @@ namespace model {
 struct ModelCapabilities final {
   uint32_t vocabularySize = 0;
   uint32_t maximumContextTokens = 0;
-  uint32_t maximumBatchWidth = 0;
-  uint32_t prefillTokenBudget = 0;
-  uint32_t draftQueryRows = 0;
-  uint32_t draftProposalTokens = 0;
-  uint32_t targetVerifyRows = 0;
-  uint32_t draftContextTokens = 0;
 };
 
+// A token mask row holds one bit per vocabulary token in 32-bit words.
+[[nodiscard]] constexpr uint32_t
+maskWordsPerToken(uint32_t vocabularySize) noexcept {
+  return static_cast<uint32_t>((uint64_t{vocabularySize} + 31) / 32);
+}
+
 // Compile-time ceiling of the one native DFlash execution contract. Concrete
-// target/draft manifests are validated against these capabilities at startup;
+// target/draft manifests are validated against these limits at startup;
 // cache-page and attention-kernel geometry live with their operators.
 struct ExecutionLimits final {
   static constexpr uint32_t maximumBatchWidth = 4;
   static constexpr uint32_t prefillTokenBudget = 2048;
+  // KV pages startup warmup runs on, from page 0: the runway the engine's KV
+  // pool allocates when it is built.
+  static constexpr uint32_t warmupKvPages =
+      (prefillTokenBudget + kv::kPageTokens - 1) / kv::kPageTokens;
   static constexpr uint32_t draftQueryRows = 8;
   static constexpr uint32_t draftProposalTokens = 7;
   static constexpr uint32_t targetVerifyRows = 8;
@@ -290,106 +402,40 @@ static_assert(ExecutionLimits::targetVerifyRows ==
 
 // Shared accounting for model-owned state allocations.  Target and draft
 // implementations may allocate from separate physical pools while the engine
-// observes one byte total through StateStorage.
+// observes one byte total through ModelMemoryActual::stateActualAllocatedBytes.
 struct StateAllocationTracker final {
   std::atomic<uint64_t> bytes{0};
-};
-
-class StateStorage {
-public:
-  virtual ~StateStorage() = default;
-  [[nodiscard]] virtual uint64_t actualAllocatedBytes() const noexcept = 0;
-  // Frees pooled idle buffers beyond the counts kept warm and returns the
-  // bytes released. Active lanes and cached states are never touched.
-  [[nodiscard]] virtual uint64_t releaseIdle(uint32_t keepCells,
-                                             uint32_t keepRings) noexcept = 0;
-};
-
-// One slot of the disk tier holding a KV page; releasing the last handle
-// frees the slot.
-class KvDiskSlot {
-public:
-  virtual ~KvDiskSlot() = default;
-};
-
-// One KV page moving between its pool page and the disk tier. The copy rides
-// the next command; ready() then means the write has finished (demotion) or
-// the page holds the data (restore), and finish() reports success. The page
-// stays valid throughout, so a failed demotion loses nothing.
-class KvTransfer {
-public:
-  virtual ~KvTransfer() = default;
-  [[nodiscard]] virtual bool ready() const noexcept = 0;
-  [[nodiscard]] virtual bool finish() = 0;
-};
-
-// The disk tier for KV pages as the engine drives it. A queued copy moves
-// only inside a Metal command, so every command the model submits for a
-// batch carries the copies queued so far, each command of a multi-command
-// ticket included, and a batch with no work of its own still submits one
-// while copies are queued. The engine adds a copy-only command
-// (Model::submitTransfers) only when no batch runs, so while the model is
-// busy its own commands keep the copies moving.
-class KvTier {
-public:
-  virtual ~KvTier() = default;
-  [[nodiscard]] virtual uint64_t slotBytes() const noexcept = 0;
-  // False once a write has failed; existing copies stay readable.
-  [[nodiscard]] virtual bool writable() const noexcept = 0;
-  // Engine-thread admission probe, before replacing any disk copies.
-  [[nodiscard]] virtual bool canDemote() const noexcept = 0;
-  // Null when the disk quota is full.
-  [[nodiscard]] virtual std::shared_ptr<KvDiskSlot> acquireSlot() = 0;
-  // Null when no demotion staging is available; the caller waits while
-  // transfers are in flight.
-  [[nodiscard]] virtual std::unique_ptr<KvTransfer>
-  demote(uint32_t page, std::shared_ptr<KvDiskSlot> slot,
-         std::function<void()> completion) = 0;
-  // Null when no staging is free; the caller retries later.
-  [[nodiscard]] virtual std::unique_ptr<KvTransfer>
-  restore(std::shared_ptr<KvDiskSlot> slot, uint32_t page,
-          std::function<void()> completion) = 0;
-  // Copies waiting for a command; the engine submits one when the model is
-  // idle.
-  [[nodiscard]] virtual bool copiesQueued() const noexcept = 0;
-  // Engine-thread bookkeeping after commands and IO complete.
-  virtual void poll() = 0;
 };
 
 // Startup sizing and observability are part of the concrete model runtime,
 // not cache or scheduler state. The engine consumes these values without
 // knowing the target or draft architecture that produced them.
 struct ModelMemoryPlan final {
-  uint64_t activeStateCellPlannedAllocatedBytes = 0;
+  uint64_t laneStatePlannedAllocatedBytes = 0;
   uint64_t sharedPrefillPlannedAllocatedBytes = 0;
   uint64_t sharedDecodePlannedAllocatedBytes = 0;
-  uint64_t pipelineReserveBytes = 0;
-  uint64_t runtimeOverheadReserveBytes = 0;
-
-  [[nodiscard]] std::optional<std::string> validationError() const {
-    if (!activeStateCellPlannedAllocatedBytes)
-      return "active_state_cell_planned_allocated_bytes_required";
-    if (!sharedPrefillPlannedAllocatedBytes)
-      return "shared_prefill_planned_allocated_bytes_required";
-    if (!sharedDecodePlannedAllocatedBytes)
-      return "shared_decode_planned_allocated_bytes_required";
-    if (!pipelineReserveBytes)
-      return "pipeline_reserve_required";
-    if (!runtimeOverheadReserveBytes)
-      return "runtime_overhead_reserve_required";
-    return std::nullopt;
-  }
 };
+
+// Fixed reserves the memory plan carries beside the planned arenas: Metal
+// pipeline objects and encoder scratch, and the process's own runtime
+// overhead. Startup counts them before a model loads.
+inline constexpr uint64_t kPipelineReserveBytes = 256ULL << 20;
+inline constexpr uint64_t kRuntimeOverheadReserveBytes = 512ULL << 20;
 
 struct ModelMemoryActual final {
   uint64_t stateActualAllocatedBytes = 0;
   uint64_t sharedPrefillActualAllocatedBytes = 0;
   uint64_t sharedDecodeActualAllocatedBytes = 0;
+  // The buffer a state's write to the disk tier stages through; zero without
+  // a tier.
+  uint64_t stateStagingBytes = 0;
 };
 
 struct ModelTelemetry final {
-  uint64_t stateResidentBytes = 0;
-  uint32_t warmIdleStateCells = 0;
+  uint64_t stateAllocatedBytes = 0;
+  // Pooled state buffers no lane holds: GDN parity cells and draft rings.
+  uint32_t idleGdnCells = 0;
+  uint32_t idleDraftRings = 0;
   uint64_t targetPrefillRows = 0;
   uint64_t draftContextRowsActive = 0;
   uint64_t draftContextRowsMaterialization = 0;
@@ -398,11 +444,15 @@ struct ModelTelemetry final {
   uint64_t draftStateResets = 0;
   uint64_t imageEncodes = 0;
   uint64_t imageEmbeddingReuses = 0;
+  // The vision encoder's scratch while it exists, the encoded rows the
+  // embedding cache keeps for reuse, those states in RAM hold to resume
+  // inside an image, and every image's rows anything holds, each counted
+  // once.
+  uint64_t visionArenaBytes = 0;
+  uint64_t embeddingCacheBytes = 0;
+  uint64_t stateHeldImageBytes = 0;
+  uint64_t imageRowsBytes = 0;
   uint32_t lastDecodeWidth = 0;
-  uint64_t lastDecodeFusedOperations = 0;
-  uint64_t lastDecodeM16Dispatches = 0;
-  uint64_t lastDecodeM24Dispatches = 0;
-  uint64_t lastDecodeM32Dispatches = 0;
   uint64_t constrainedMaskOverlapBatches = 0;
   uint64_t constrainedMaskOverlapRequests = 0;
   double lastConstrainedTargetForwardGpuSeconds = 0.0;
@@ -419,33 +469,19 @@ struct ModelTelemetry final {
   double totalDecodeWallSeconds = 0.0;
 };
 
-// Observable outcome used to check repeated runs of the same configuration.
-// Different configurations may round differently and choose different tokens;
-// paired timings only require comparable work, not identical token IDs.
+// One warmup lane's observable outcome: its step result, the anchor the step
+// left pending and the tokens it committed. The runtime oracle checks the
+// warmups' tokens and their repeatability by it; the decode warmup's anchor
+// is set inside the runtime, so no public request reproduces that lane.
 struct WarmupLaneResult final {
   ModelStepResult step;
   std::optional<uint32_t> pendingToken;
   uint64_t committedTokens = 0;
 
   bool operator==(const WarmupLaneResult &) const = default;
-
-  [[nodiscard]] bool sameWorkAs(const WarmupLaneResult &other) const noexcept {
-    return step.requestId == other.step.requestId &&
-        step.consumedPromptTokens == other.step.consumedPromptTokens &&
-        step.outputTokens.size() == other.step.outputTokens.size() &&
-        step.finished == other.step.finished &&
-        step.nextDecodeStage == other.step.nextDecodeStage &&
-        step.draftedTokens == other.step.draftedTokens &&
-        step.acceptedDraftTokens == other.step.acceptedDraftTokens &&
-        step.outputTokensWithoutKv == other.step.outputTokensWithoutKv &&
-        pendingToken.has_value() == other.pendingToken.has_value() &&
-        committedTokens == other.committedTokens;
-  }
 };
 
 struct WarmupStepResult final {
-  bool completed = false;
-  uint64_t estimatedPeakBytes = 0;
   std::string detail;
   // For prefill/decode-batch warmup, the synchronous production phase
   // including graph construction and result finalization, but not setup,
@@ -455,59 +491,71 @@ struct WarmupStepResult final {
   std::vector<WarmupLaneResult> lanes;
 };
 
+// What a reclaim step may release of the model's idle memory.
+enum class IdleMemory : uint8_t {
+  // Pooled state buffers.
+  Buffers,
+  // Pooled state buffers, then caches that can be rebuilt.
+  BuffersThenCaches,
+};
+
 class Model {
 public:
   virtual ~Model() = default;
   virtual void checkHealth() {}
-  [[nodiscard]] virtual bool needsHealthCheck() const noexcept { return false; }
   [[nodiscard]] virtual StateAdmission begin(const ModelRequest &request) = 0;
-  // Safe-point preemption releases execution backing, retaining only the
-  // request's host-side sampling/constraint continuation. Resume replays the
+  // Safe-point preemption returns the request's state buffers, retaining
+  // only its host-side sampling/constraint continuation. Resume replays the
   // supplied committed history through the ordinary packed-prefill path.
   virtual void suspend(uint64_t requestId) = 0;
   [[nodiscard]] virtual StateAdmission resume(const ModelRequest &request) = 0;
-  virtual void restore(uint64_t requestId, uint32_t restoredPrefixLength,
-                       std::shared_ptr<const CompositeState> state,
-                       bool restoreDraftState) = 0;
+  // Restores a cached state into the request's lane at `boundary`. A RAM
+  // state is copied now and the call returns null; a disk state returns the
+  // read, whose finish() commits it. `completion` only wakes the engine.
   [[nodiscard]] virtual std::unique_ptr<StateRestore>
   beginRestore(uint64_t requestId, uint32_t boundary,
                std::shared_ptr<const CompositeState> state, bool restoreDraft,
-               std::function<void()>) {
-    restore(requestId, boundary, std::move(state), restoreDraft);
-    return {};
-  }
+               std::function<void()> completion) = 0;
   virtual void setDraftContextPlan(uint64_t requestId,
                                    DraftContextPlan plan) = 0;
   // Optional async wake hook; an immediately ready ticket need not call it.
   [[nodiscard]] virtual std::unique_ptr<ModelBatchTicket>
   submit(const BatchPlan &plan, std::span<const ModelBatchItem> items,
          std::function<void()> completion) = 0;
-  // A command carrying only queued KV copies, for an idle model; null when
-  // nothing is queued. Its ticket yields no step results.
-  [[nodiscard]] virtual std::unique_ptr<ModelBatchTicket>
-  submitTransfers(std::function<void()>) { return nullptr; }
   // Copies the request's committed state at its current page-aligned
-  // boundary into a cache slot. Returns nullptr when no slot is free and the
-  // governor denies a new one; the caller may release a cached state and
-  // retry.
+  // boundary into the cached state's buffers. Returns nullptr when the pool
+  // has none free and the governor denies new ones; the caller may release a
+  // cached state and retry.
   [[nodiscard]] virtual std::shared_ptr<const CompositeState>
   snapshot(uint64_t requestId) = 0;
+  // The bytes one lane's state snapshot allocates.
+  [[nodiscard]] virtual uint64_t snapshotBytes() const noexcept = 0;
   // Whether the disk tier takes a state written from a lane: a tier exists
   // and its state file accepts writes. The quota is the write's own concern.
   [[nodiscard]] virtual bool canSnapshotToDisk() const noexcept { return false; }
   // Writes the request's committed state at its current page-aligned
-  // boundary to the disk tier from the lane's own buffers, for a state no
-  // cache slot can hold; the ticket carries its disk copy. Null when the
-  // quota cannot admit another state: the caller may free quota and retry.
+  // boundary to the disk tier from the lane's own buffers, for a state the
+  // pool has no cached state's buffers for; the ticket carries its disk copy.
+  // Null when the quota cannot admit another state: the caller may free quota
+  // and retry.
   [[nodiscard]] virtual std::unique_ptr<StateOffload>
   snapshotToDisk(uint64_t, std::function<void()>) { return {}; }
-  // Releases one unit of idle model state (an unused buffer, then caches
-  // that can be rebuilt) and returns its bytes; zero when nothing is idle.
-  // A denied allocation retries between calls, so it frees only what it
-  // needs.
-  [[nodiscard]] virtual uint64_t reclaimIdleState() noexcept = 0;
-  virtual void provideMask(uint64_t requestId,
-                           std::span<const uint32_t> words) = 0;
+  // The cached states whose buffers a lane's activation would still have to
+  // allocate: each one evicted returns to the pool what a lane takes. Zero
+  // when the pool holds a lane's buffers.
+  [[nodiscard]] virtual uint32_t statesToActivate() const noexcept { return 0; }
+  // Releases one unit of idle model memory and returns its bytes; zero when
+  // nothing in scope is idle. A unit is one pooled state buffer (keepLane
+  // keeps those one lane starts from); with BuffersThenCaches, once no
+  // buffer is idle, the vision arena when no image waits for its encode and
+  // nothing holds it, and then one embedding entry nothing else holds,
+  // oldest first. A denied allocation retries between calls, so it frees
+  // only what it needs.
+  [[nodiscard]] virtual uint64_t reclaimIdleState(bool keepLane,
+                                                  IdleMemory scope) noexcept = 0;
+  // Why this request's mask is unusable, or nothing when the model took it.
+  [[nodiscard]] virtual std::optional<std::string>
+  provideMask(uint64_t requestId, std::span<const uint32_t> words) = 0;
   virtual void end(uint64_t requestId) = 0;
 };
 
@@ -519,7 +567,6 @@ public:
   // Actual rows, not padded dispatch rows; valid range is 1..prefillTokenBudget.
   virtual WarmupStepResult warmupPrefill(uint32_t rows) = 0;
   virtual WarmupStepResult warmupDecodeBatch(uint32_t width) = 0;
-  virtual WarmupStepResult warmupDraftVerifyCommit() = 0;
   virtual WarmupStepResult warmupCompositeStateRestore() = 0;
   [[nodiscard]] virtual ModelMemoryActual actualRuntimeMemory() const = 0;
   [[nodiscard]] virtual ModelTelemetry telemetry() const noexcept = 0;

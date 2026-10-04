@@ -1,12 +1,12 @@
-// Editing this file re-prepares every vision model.
 #include "model/VisionPreparation.hpp"
-#include "WeightPreparationIdentity.hpp"
 #include "model/Bfloat16.hpp"
+#include "model/WeightImages.hpp"
 #include "model/WeightLayout.hpp"
 #include "model/WeightStore.hpp"
 
 #include <algorithm>
 #include <cstring>
+#include <functional>
 #include <span>
 
 namespace splash::model::vision {
@@ -37,81 +37,75 @@ bool convert(const SourceTensor &tensor, const uint8_t *source, uint16_t *destin
   return true;
 }
 
-// Source bytes, patch values and output rows of one batch, reused by every
-// section of a file.
+// Source bytes and patch values of one task.
 struct Staging {
   std::vector<uint8_t> source;
-  std::vector<uint16_t> values, output;
+  std::vector<uint16_t> values;
 };
 
-// Writes a section in batches of whole rows converted to BF16. The packed
-// patch embedding orders a row [channel, frame, patch-row, patch-col]; MLX
-// stores [frame, patch-row, patch-col, channel] and GGUF one [channel,
-// patch-row, patch-col] tensor per frame. Padded rows, columns and alignment
-// stay zero: a prepared file starts zeroed.
-void writeSection(int destination, const Section &s, uint32_t pixels, Staging &staging,
-                  const PreparationCheck &admit) {
+// The tasks that write a section in batches of whole rows converted to BF16.
+// The packed patch embedding orders a row [channel, frame, patch-row,
+// patch-col]; MLX stores [frame, patch-row, patch-col, channel] and GGUF one
+// [channel, patch-row, patch-col] tensor per frame. Padded columns are zero;
+// padded rows are not written.
+void addSectionTasks(uint8_t *image, const Section &s, uint32_t pixels,
+                     std::vector<std::function<void(Staging &)>> &tasks) {
   const auto frames = static_cast<uint32_t>(s.inputs.size());
   const uint32_t columns = s.columns / frames;
   uint32_t widest = 0;
   for (const auto &in : s.inputs) widest = std::max(widest, elementBytes(in.tensor));
-  const uint64_t storedRowBytes = uint64_t(s.storedColumns) * kBFloat16Bytes;
-  const uint64_t rowBytes = uint64_t(columns) * widest + (s.patch ? uint64_t(s.columns) * kBFloat16Bytes : 0) +
-                            storedRowBytes;
-  const auto batchRows = static_cast<uint32_t>(
-      std::clamp<uint64_t>(kWeightPreparationStagingBytes / rowBytes, 1, s.rows));
-  auto &[source, values, output] = staging;
-  source.resize(uint64_t(batchRows) * columns * widest);
-  values.resize(s.patch ? uint64_t(batchRows) * s.columns : 0);
-  output.resize(uint64_t(batchRows) * s.storedColumns);
-  // Converts count rows of one input to rows of stride BF16 values.
-  const auto convertRows = [&](const Input &in, uint32_t row, uint32_t count, uint16_t *to, uint32_t stride) {
-    const uint64_t bytes = uint64_t(columns) * elementBytes(in.tensor);
-    in.tensor.read(row * bytes, std::span(source).first(count * bytes));
-    for (uint32_t r = 0; r < count; ++r)
-      if (!convert(in.tensor, source.data() + r * bytes, to + uint64_t(r) * stride, columns))
-        throw WeightStoreError("vision tensor " + in.name + " in " + in.tensor.file->path().string() +
-                               " is not exactly representable in BF16");
-  };
+  const uint64_t stagedRowBytes = uint64_t(columns) * widest + (s.patch ? uint64_t(s.columns) * kBFloat16Bytes : 0);
+  const auto batchRows = static_cast<uint32_t>(std::clamp<uint64_t>(kLoadStepBytes / stagedRowBytes, 1, s.rows));
   for (uint32_t row = 0; row < s.rows; row += batchRows) {
-    admit();
     const uint32_t count = std::min(batchRows, s.rows - row);
-    if (!s.patch) {
-      convertRows(s.inputs.front(), row, count, output.data(), s.storedColumns);
-    } else {
-      for (uint32_t frame = 0; frame < frames; ++frame)
-        convertRows(s.inputs[frame], row, count, values.data() + uint64_t(frame) * count * columns, columns);
+    auto *output = reinterpret_cast<uint16_t *>(image + s.offset) + uint64_t(row) * s.storedColumns;
+    tasks.push_back([&s, pixels, frames, columns, row, count, output](Staging &staging) {
+      // Converts count rows of one input to rows of stride BF16 values.
+      const auto convertRows = [&](const Input &in, uint16_t *to, uint32_t stride) {
+        const uint64_t bytes = uint64_t(columns) * elementBytes(in.tensor);
+        if (staging.source.size() < count * bytes) staging.source.resize(count * bytes);
+        in.tensor.read(row * bytes, std::span(staging.source).first(count * bytes));
+        for (uint32_t r = 0; r < count; ++r)
+          if (!convert(in.tensor, staging.source.data() + r * bytes, to + uint64_t(r) * stride, columns))
+            throw WeightStoreError("vision tensor " + in.name + " in " + in.tensor.file->path().string() +
+                                   " is not exactly representable in BF16");
+      };
+      if (!s.patch) {
+        convertRows(s.inputs.front(), output, s.storedColumns);
+      } else {
+        if (staging.values.size() < uint64_t(count) * s.columns) staging.values.resize(uint64_t(count) * s.columns);
+        uint16_t *values = staging.values.data();
+        for (uint32_t frame = 0; frame < frames; ++frame)
+          convertRows(s.inputs[frame], values + uint64_t(frame) * count * columns, columns);
+        for (uint32_t r = 0; r < count; ++r)
+          for (uint32_t c = 0; c < s.columns; ++c) {
+            const uint32_t channel = c / (2 * pixels), frame = c / pixels % 2, pixel = c % pixels;
+            output[uint64_t(r) * s.storedColumns + c] =
+                frames == 1 ? values[uint64_t(r) * columns + (uint64_t(frame) * pixels + pixel) * 3 + channel]
+                            : values[(uint64_t(frame) * count + r) * columns + uint64_t(channel) * pixels + pixel];
+          }
+      }
       for (uint32_t r = 0; r < count; ++r)
-        for (uint32_t c = 0; c < s.columns; ++c) {
-          const uint32_t channel = c / (2 * pixels), frame = c / pixels % 2, pixel = c % pixels;
-          output[uint64_t(r) * s.storedColumns + c] =
-              frames == 1 ? values[uint64_t(r) * columns + (uint64_t(frame) * pixels + pixel) * 3 + channel]
-                          : values[(uint64_t(frame) * count + r) * columns + uint64_t(channel) * pixels + pixel];
-        }
-    }
-    writeWeightBytes(destination, s.offset + row * storedRowBytes,
-                     {reinterpret_cast<const uint8_t *>(output.data()), count * storedRowBytes});
+        std::fill_n(output + uint64_t(r) * s.storedColumns + s.columns, s.storedColumns - s.columns, uint16_t{0});
+    });
   }
 }
 
 } // namespace
 
-// The plan and the source tensors are all these bytes depend on; no
-// configuration value enters them.
-PreparedWeight visionWeight(const Plan &plan, const std::string &source) {
-  WeightIdentity identity("splash-vision-preparation-v2 " SPLASH_VISION_PREPARATION_ID);
-  identity.record("file", plan.depth, plan.patchSize, plan.bytes);
-  for (const auto &s : plan.sections) {
-    identity.record("section", s.offset, s.rows, s.columns, s.storedRows, s.storedColumns, s.patch);
-    for (const auto &in : s.inputs) in.tensor.identify(identity);
-  }
-  return identity.weight(plan.bytes, "vision/model.bin", source);
-}
-
-void writeVision(int destination, const Plan &plan, const PreparationCheck &admit) {
-  writeWeightBytes(destination, 0, weightFileHeader(kVisionMagic, plan.depth, 0));
-  Staging staging;
-  for (const auto &s : plan.sections) writeSection(destination, s, plan.patchSize * plan.patchSize, staging, admit);
+void writeVision(std::span<uint8_t> destination, const Plan &plan) {
+  if (destination.size() != plan.bytes) throw WeightStoreError("vision image destination size differs");
+  const auto header = weightFileHeader(kVisionMagic, plan.depth, 0);
+  std::vector<std::pair<uint64_t, uint64_t>> extents{{0, header.size()}};
+  for (const auto &s : plan.sections)
+    extents.emplace_back(s.offset, uint64_t(s.rows) * s.storedColumns * kBFloat16Bytes);
+  zeroUnwritten(destination, std::move(extents));
+  std::memcpy(destination.data(), header.data(), header.size());
+  std::vector<std::function<void(Staging &)>> tasks;
+  for (const auto &s : plan.sections)
+    addSectionTasks(destination.data(), s, plan.patchSize * plan.patchSize, tasks);
+  std::vector<Staging> staging(loadThreads());
+  parallelFor(tasks.size(), [&](size_t index, unsigned thread) { tasks[index](staging[thread]); });
 }
 
 } // namespace splash::model::vision

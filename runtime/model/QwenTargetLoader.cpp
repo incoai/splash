@@ -1,4 +1,5 @@
 #include "model/QwenTargetLoader.hpp"
+#include "Checked.hpp"
 
 #include <utility>
 
@@ -37,18 +38,19 @@ QwenMixerWeights readQwenMixer(WeightFile &file, const Format &format,
   gdn.inputProjection = format.fused(file, geometry.packedGdnWidth, geometry.hiddenSize,
                                      "gdn-input", {"gdn-qkv", "gdn-z", "gdn-ab"});
   gdn.convolutionWeights = file.section(
-      checkedWeightMultiply(
-          checkedWeightMultiply(geometry.convolutionDimension, kGdnConvolutionTaps,
-                                "convolution elements"),
+      checkedMultiply<WeightStoreError>(
+          checkedMultiply<WeightStoreError>(geometry.convolutionDimension,
+                                            kGdnConvolutionTaps,
+                                            "convolution elements"),
           kBFloat16Bytes, "convolution bytes"),
       "gdn-convolution");
-  gdn.decay = file.section(checkedWeightMultiply(geometry.gdnValueHeads,
-                                                 kFloat32Bytes,
-                                                 "GDN decay bytes"),
-                           "gdn-decay");
+  gdn.decay = file.section(
+      checkedMultiply<WeightStoreError>(geometry.gdnValueHeads, kFloat32Bytes,
+                                        "GDN decay bytes"),
+      "gdn-decay");
   gdn.timeBias = file.section(
-      checkedWeightMultiply(geometry.gdnValueHeads, kBFloat16Bytes,
-                            "GDN time bias bytes"),
+      checkedMultiply<WeightStoreError>(geometry.gdnValueHeads, kBFloat16Bytes,
+                                        "GDN time bias bytes"),
       "gdn-time-bias");
   gdn.mixerNorm = format.norm(file, geometry.gdnHeadDimension, "gdn-norm");
   gdn.outputProjection =

@@ -5,12 +5,17 @@
 // tensors it reads. AffineTarget.cpp plans an MLX target with it,
 // DraftCheckpoint.cpp a DFlash2 draft.
 
+#include "Checked.hpp"
 #include "model/AffinePreparation.hpp"
 #include "model/SafetensorsCheckpoint.hpp"
+#include "model/WeightImages.hpp"
 #include "model/WeightLayout.hpp"
 #include "model/WeightStore.hpp"
 
 #include <algorithm>
+#include <filesystem>
+#include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -34,7 +39,8 @@ inline void copy(Image &image, const std::string &name, std::vector<uint64_t> sh
                  const std::string &dtype = "BF16") {
   Section section;
   section.bytes = dtype == "U32" ? 4 : kBFloat16Bytes;
-  for (uint64_t dimension : shape) section.bytes = checkedWeightMultiply(section.bytes, dimension, "affine tensor");
+  for (uint64_t dimension : shape)
+    section.bytes = checkedMultiply<WeightStoreError>(section.bytes, dimension, "affine tensor");
   section.input = {name, {dtype}, std::move(shape)};
   append(image, std::move(section));
 }
@@ -56,6 +62,26 @@ inline void bind(Image &image, const SafetensorsCheckpoint &source) {
     for (ProjectionPart &part : section.parts)
       for (Input &field : part.fields) bindInput(field);
   }
+}
+
+// A checkpoint and the images planned from it, which their writers share:
+// each image's inputs point into the checkpoint's tensors.
+struct PlannedCheckpoint final {
+  explicit PlannedCheckpoint(const std::filesystem::path &directory) : source(directory) {}
+  SafetensorsCheckpoint source;
+  std::vector<Image> images;
+};
+
+// Image `index` of planned, the component directory/name, written from the
+// checkpoint.
+[[nodiscard]] inline ImagePlan imagePlan(const std::shared_ptr<const PlannedCheckpoint> &planned, size_t index,
+                                         std::string_view directory) {
+  const Image &image = planned->images.at(index);
+  return {std::string(directory) + "/" + image.name, image.magic, image.layer, image.type, image.bytes,
+          [planned, index](std::span<uint8_t> bytes, const metal::MetalBuffer &) {
+            writeAffineImage(bytes, planned->images[index]);
+            planned->source.checkUnchanged();
+          }};
 }
 
 } // namespace splash::model::affine
