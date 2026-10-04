@@ -1,18 +1,20 @@
 #pragma once
 
-#include "model/Model.hpp"
+#include "engine/KvTier.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <set>
 #include <vector>
 
 namespace splash::test {
 
-// A KV disk tier without a disk: slots count against a quota, every
-// transfer holds one staging slot until it finishes, and transfers finish
-// when the test says so.
-class TestKvTier final : public model::KvTier {
+// A KV disk tier without a disk: slots count against a quota, a bounded
+// number of transfers is in flight, and transfers finish when the test says
+// so.
+class TestKvTier final : public engine::KvTier {
 public:
   struct Transfer final {
     bool ready = false;
@@ -20,26 +22,35 @@ public:
     bool finished = false;
   };
 
+  TestKvTier() = default;
+  explicit TestKvTier(bool persistent) : persistentTier(persistent) {}
+
   uint64_t slotBytes() const noexcept override { return 100; }
   bool writable() const noexcept override { return writableFile; }
-  bool canDemote() const noexcept override { return writableFile && staging < stagingSlots; }
-  std::shared_ptr<model::KvDiskSlot> acquireSlot() override {
+  bool persistent() const noexcept override { return persistentTier; }
+  void label(const std::shared_ptr<engine::KvDiskSlot> &slot, std::vector<std::byte> label) override {
+    static_cast<Slot &>(*slot).label = std::move(label);
+  }
+  bool canDemote() const noexcept override { return writableFile && inFlight() < transferLimit; }
+  bool canRestore() const noexcept override { return inFlight() < transferLimit; }
+  std::shared_ptr<engine::KvDiskSlot> acquireSlot() override {
     if (slots >= capacity) return {};
     return std::make_shared<Slot>(*this);
   }
-  std::unique_ptr<model::KvTransfer>
-  demote(uint32_t, std::shared_ptr<model::KvDiskSlot>, std::function<void()>) override {
+  std::unique_ptr<engine::KvTransfer>
+  demote(uint32_t, std::shared_ptr<engine::KvDiskSlot>, std::function<void()>) override {
     if (!canDemote()) return {};
     ++demotions;
     return start();
   }
-  std::unique_ptr<model::KvTransfer>
-  restore(std::shared_ptr<model::KvDiskSlot>, uint32_t, std::function<void()>) override {
-    if (staging >= stagingSlots) return {};
+  std::unique_ptr<engine::KvTransfer>
+  restore(std::shared_ptr<engine::KvDiskSlot>, uint32_t page, std::function<void()>) override {
+    ++restoreCalls;
+    if (!canRestore()) return {};
     ++restores;
+    restoredPages.push_back(page);
     return start();
   }
-  bool copiesQueued() const noexcept override { return queued; }
   void poll() override {}
 
   // Finishes every transfer still in flight.
@@ -49,31 +60,44 @@ public:
       transfer->ready = true;
       transfer->success = success;
     }
-    queued = false;
   }
-  [[nodiscard]] uint32_t inFlight() const noexcept {
-    uint32_t count = 0;
-    for (const auto &transfer : transfers) count += !transfer->finished;
-    return count;
+  [[nodiscard]] uint32_t inFlight() const noexcept { return inFlight_; }
+  // The labels of the slots a persistent tier holds, as the next process
+  // finds them, and a slot that process takes back.
+  [[nodiscard]] std::vector<std::vector<std::byte>> labels() const {
+    std::vector<std::vector<std::byte>> result;
+    for (const Slot *slot : live_)
+      if (!slot->label.empty()) result.push_back(slot->label);
+    return result;
   }
+  [[nodiscard]] std::shared_ptr<engine::KvDiskSlot> adopt() { return std::make_shared<Slot>(*this); }
 
   uint32_t slots = 0;
   uint32_t capacity = 4;
-  uint32_t staging = 0;
-  uint32_t stagingSlots = 2;
+  uint32_t transferLimit = 2;
   uint32_t demotions = 0;
+  // Restores started, every restore() call, and the pages of those started.
   uint32_t restores = 0;
+  uint32_t restoreCalls = 0;
+  std::vector<uint32_t> restoredPages;
   bool writableFile = true;
-  bool queued = false;
+  bool persistentTier = false;
   std::vector<std::shared_ptr<Transfer>> transfers;
 
 private:
-  struct Slot final : model::KvDiskSlot {
-    explicit Slot(TestKvTier &owner) : tier(owner) { ++tier.slots; }
-    ~Slot() override { --tier.slots; }
+  struct Slot final : engine::KvDiskSlot {
+    explicit Slot(TestKvTier &owner) : tier(owner) {
+      ++tier.slots;
+      tier.live_.insert(this);
+    }
+    ~Slot() override {
+      --tier.slots;
+      tier.live_.erase(this);
+    }
     TestKvTier &tier;
+    std::vector<std::byte> label;
   };
-  class Ticket final : public model::KvTransfer {
+  class Ticket final : public engine::KvTransfer {
   public:
     Ticket(TestKvTier &owner, std::shared_ptr<Transfer> transfer)
         : tier_(owner), transfer_(std::move(transfer)) {}
@@ -81,7 +105,7 @@ private:
     bool finish() override {
       if (!transfer_->finished) {
         transfer_->finished = true;
-        --tier_.staging;
+        --tier_.inFlight_;
       }
       return transfer_->success;
     }
@@ -91,13 +115,15 @@ private:
     std::shared_ptr<Transfer> transfer_;
   };
 
-  std::unique_ptr<model::KvTransfer> start() {
+  std::unique_ptr<engine::KvTransfer> start() {
     auto transfer = std::make_shared<Transfer>();
     transfers.push_back(transfer);
-    ++staging;
-    queued = true;
+    ++inFlight_;
     return std::make_unique<Ticket>(*this, std::move(transfer));
   }
+
+  uint32_t inFlight_ = 0;
+  std::set<const Slot *> live_;
 };
 
 } // namespace splash::test

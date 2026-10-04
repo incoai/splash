@@ -4,6 +4,7 @@
 // fp64 RMS norm the kernels that read them are checked against. Shared by the
 // Metal tests of those kernels.
 
+#include "TestBuffers.hpp"
 #include "metal/MetalBackend.hpp"
 #include "ops/Normalization.hpp"
 #include "tuning/LinearNumerics.hpp"
@@ -20,7 +21,7 @@ template <class Value>
 ops::NormWeights makeNormWeights(metal::MetalBackend &backend, uint32_t size, bool float32,
                                  Value value) {
   ops::NormWeights norm{{}, float32};
-  norm.buffer = backend.allocateBuffer(norm.bytes(size));
+  norm.buffer = sharedBuffer(backend, norm.bytes(size));
   for (uint32_t index = 0; index < size; ++index) {
     const float weight = value(index);
     if (float32)

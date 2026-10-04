@@ -25,12 +25,14 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-if __package__:
-    from . import paths
-    from .models import ModelError, validate_repo_id
-else:  # Executed directly, e.g. `python install/catalog.py --refresh`.
-    import paths
-    from models import ModelError, validate_repo_id
+if __name__ == "__main__" and not __package__:
+    # Run as a script by spawn_refresh: import siblings as the install
+    # package.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    __package__ = "install"
+
+from . import paths
+from .models import ModelError, validate_repo_id
 
 # The collection is the source of truth for which packages are official.
 COLLECTION = "incoai/splash-6aac69afeba907af0511ec14"

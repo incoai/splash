@@ -1,32 +1,24 @@
-// Offline kernel measurement. Loads an installed model, measures every
-// precompiled operator candidate against the policy default in runtime/ops
-// through the production encoders, and prints one line per key: the winner
-// with its paired GPU/wall gain, or "default kept". With --candidates every
-// timed candidate is listed, so a policy rule can be judged by what it costs.
-// --confirm times the complete prefill/decode graphs, defaults versus winners.
-#include "engine/Bootstrap.hpp"
+// Offline kernel measurement. Loads an installed model, measures each
+// projection key's tuning candidates (tuning::linearCandidates) against the
+// policy default in runtime/ops through the production encoders, and prints
+// one line per key: the winner with its paired GPU/wall gain, or "default
+// kept". With --candidates every timed candidate is listed, so a policy rule
+// can be judged by what it costs.
 #include "engine/MemoryGovernor.hpp"
 #include "engine/MemoryPlan.hpp"
 #include "model/ModelDescriptor.hpp"
 #include "model/ModelFactory.hpp"
-#include "tuning/AttentionTuning.hpp"
-#include "tuning/DraftAttentionTuning.hpp"
 #include "tuning/LinearTuning.hpp"
-#include "tuning/MoeTuning.hpp"
 #include "tuning/TuningWorkloads.hpp"
 
 #import <Foundation/Foundation.h>
 
-#include <array>
 #include <charconv>
-#include <chrono>
 #include <cmath>
 #include <csignal>
-#include <ctime>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
-#include <limits>
 #include <algorithm>
 #include <optional>
 #include <sstream>
@@ -45,11 +37,9 @@ using namespace splash::ops::tuning;
 
 constexpr std::string_view kUsage =
     "usage: tune-kernels METALLIB MODEL_ROOT [--seconds PER_KEY] [--pairs N]\n"
-    "                    [--confirm [PAIRS]] [--candidates]\n"
-    "  --seconds  wall budget per operator key (default 10; attention gets 4x)\n"
+    "                    [--candidates]\n"
+    "  --seconds  wall budget per operator key (default 10)\n"
     "  --pairs    paired samples per candidate, 12..64 (default 12)\n"
-    "  --confirm  also time the complete prefill/decode graphs, defaults vs\n"
-    "             winners, with PAIRS pairs each (default 12, the minimum)\n"
     "  --candidates  after each Linear key, list every timed candidate with its\n"
     "             median GPU/wall gain over the default, best first\n";
 
@@ -58,7 +48,6 @@ void stopSignal(int) { interrupted = 1; }
 
 struct Options final {
   MeasurementOptions measurement;
-  std::optional<size_t> confirmPairs;
   bool candidates = false;
 };
 
@@ -93,9 +82,6 @@ Options parse(int argc, char **argv) {
       options.measurement.samplePairs = pairCount(argv[++i], option);
     } else if (option == "--candidates") {
       options.candidates = true;
-    } else if (option == "--confirm") {
-      options.confirmPairs =
-          hasValue ? pairCount(argv[++i], option) : kMinPairedSamples;
     } else {
       throw std::invalid_argument("unknown option or missing value: " + std::string(option) +
                                   "\n" + std::string(kUsage));
@@ -104,8 +90,8 @@ Options parse(int argc, char **argv) {
   return options;
 }
 
-// The choice lines are pasted as code, so an enumerator prints as the token of
-// its own case label: a rename changes both, and -Wswitch catches a new one.
+// An enumerator prints as the token of its own case label: a rename changes
+// both, and -Wswitch catches a new one.
 #define ENUMERATOR_NAME(enumerator) \
   case enumerator:                  \
     return #enumerator
@@ -116,11 +102,11 @@ std::string_view name(LinearTile tile) {
     ENUMERATOR_NAME(LinearTile::N128);
     ENUMERATOR_NAME(LinearTile::N256);
     ENUMERATOR_NAME(LinearTile::Paired128);
-    ENUMERATOR_NAME(LinearTile::Split32);
-    ENUMERATOR_NAME(LinearTile::Split64);
+    ENUMERATOR_NAME(LinearTile::Split128);
     ENUMERATOR_NAME(LinearTile::Paired256);
     ENUMERATOR_NAME(LinearTile::Simdgroup);
     ENUMERATOR_NAME(LinearTile::GgufStaged);
+    ENUMERATOR_NAME(LinearTile::GgufPrefill);
     ENUMERATOR_NAME(LinearTile::GgufRegister);
   }
   unnamed();
@@ -143,87 +129,23 @@ std::string_view name(LinearEpilogue epilogue) {
 }
 std::string_view name(LinearSimdgroups groups) {
   switch (groups) {
-    ENUMERATOR_NAME(LinearSimdgroups::Two);
     ENUMERATOR_NAME(LinearSimdgroups::Four);
     ENUMERATOR_NAME(LinearSimdgroups::Eight);
   }
   unnamed();
 }
-std::string_view name(AttentionScalePlacement placement) {
-  switch (placement) {
-    ENUMERATOR_NAME(AttentionScalePlacement::Softmax);
-    ENUMERATOR_NAME(AttentionScalePlacement::Cooperative);
-  }
-  unnamed();
-}
-std::string_view name(PrefillSplitMultiplier value) {
-  switch (value) {
-    ENUMERATOR_NAME(PrefillSplitMultiplier::One);
-    ENUMERATOR_NAME(PrefillSplitMultiplier::Two);
-  }
-  unnamed();
-}
-std::string name(VerifySplitCount value) {
-  return "VerifySplitCount(" + std::to_string(static_cast<uint32_t>(value)) + ")";
-}
-std::string_view name(MoePhase phase) {
-  switch (phase) {
-    ENUMERATOR_NAME(MoePhase::Prefill);
-    ENUMERATOR_NAME(MoePhase::Decode);
-  }
-  unnamed();
-}
 #undef ENUMERATOR_NAME
-std::string name(MoeExpertTile tile) {
-  return "MoeExpertTile::M" + std::to_string(static_cast<uint32_t>(tile));
-}
 
 std::string describe(const LinearConfig &c) {
   std::ostringstream out;
   out << "{" << name(c.tile) << ", " << c.groups << ", " << name(c.simdgroups) << ", " << c.splits << "}";
   return out.str();
 }
-std::string describe(const PrefillAttentionConfig &c) {
-  return "{" + std::string(name(c.splitMultiplier)) + ", " + std::string(name(c.scalePlacement)) + "}";
-}
-std::string describe(const VerifyAttentionConfig &c) {
-  return "{" + name(c.splitCount) + ", " + std::string(name(c.scalePlacement)) + "}";
-}
-std::string describe(const DraftAttentionConfiguration &c) {
-  return "{" + (c.groups ? std::to_string(c.groups) : std::string("full")) + "}";
-}
-std::string describe(const MoeConfig &c) { return "{" + name(c.expertTile) + "}"; }
 
-std::string describe(const AttentionShape &s) {
-  std::ostringstream out;
-  out << "{" << s.queryHeads << ", " << s.kvHeads << ", " << s.headDimension << "}";
-  return out.str();
-}
 std::string describe(const LinearWorkload &w) {
   std::ostringstream out;
   out << "{{" << w.matrix.outputSize << ", " << w.matrix.inputSize << "}, " << w.rows << ", "
       << name(w.phase) << ", " << name(w.epilogue) << "}";
-  return out.str();
-}
-std::string describe(const PrefillAttentionPolicy &w) {
-  return "{" + describe(w.shape) + ", " + std::to_string(w.rows) + "}";
-}
-std::string describe(const VerifyAttentionPolicy &w) {
-  return "{" + describe(w.shape) + ", " + std::to_string(w.lanes) + "}";
-}
-std::string describe(const DraftAttentionWorkload &w) {
-  const auto &s = w.shape;
-  std::ostringstream out;
-  out << "{{" << s.hiddenSize << ", " << s.dynamicSize << ", " << s.qkvSize << ", "
-      << s.attentionSize << ", " << s.queryHeads << ", " << s.kvHeads << ", "
-      << s.headDimension << "}, " << w.lanes << "}";
-  return out.str();
-}
-std::string describe(const MoeWorkload &w) {
-  const auto &s = w.shape;
-  std::ostringstream out;
-  out << "{{" << s.hiddenSize << ", " << s.experts << ", " << s.expertsPerToken << ", "
-      << s.expertIntermediateSize << "}, " << w.rows << ", " << name(w.phase) << "}";
   return out.str();
 }
 
@@ -248,22 +170,16 @@ std::string evidence(std::span<const MeasurementResult> measurements,
   return "";
 }
 
-template <class Plans, class Config>
-std::optional<CandidateId> candidateOf(const Plans &plans, const Config &config) {
-  for (size_t index = 0; index < plans.size(); ++index) {
-    if constexpr (requires { plans[index].configuration(); }) {
-      if (plans[index].configuration() == config) return CandidateId{uint32_t(index)};
-    } else {
-      if (plans[index] == config) return CandidateId{uint32_t(index)};
-    }
-  }
+std::optional<CandidateId> candidateOf(std::span<const LinearPlan> plans, const LinearConfig &config) {
+  for (size_t index = 0; index < plans.size(); ++index)
+    if (plans[index].configuration() == config) return CandidateId{uint32_t(index)};
   return std::nullopt;
 }
 
-void outcome(std::string_view family, const std::string &workload, bool complete,
-             bool changed, const std::string &chosen, const std::string &proof,
+void outcome(const std::string &workload, bool complete, bool changed,
+             const std::string &chosen, const std::string &proof,
              std::exception_ptr failure) {
-  std::cout << "  " << std::left << std::setw(18) << family << workload << "\n    ";
+  std::cout << "  " << workload << "\n    ";
   if (failure) {
     try { std::rethrow_exception(failure); }
     catch (const std::exception &error) { std::cout << "FAILED: " << error.what(); }
@@ -276,97 +192,6 @@ void outcome(std::string_view family, const std::string &workload, bool complete
     std::cout << "default kept";
   }
   std::cout << '\n';
-}
-
-struct Confirmation final {
-  std::string graph;
-  TimingAssessment gpu;
-  TimingAssessment wall;
-};
-
-// Complete-graph timing, defaults versus winners, through the production
-// bootstrap. Arenas are sized for both because the winners are supplied as
-// the creation-time choices; only those two tables are ever installed.
-std::vector<Confirmation> confirm(const std::filesystem::path &metallib,
-                                  const std::filesystem::path &modelRoot,
-                                  const OperatorChoices &winners, size_t pairs) {
-  engine::RuntimeBootstrapConfig config;
-  config.resources.metallibPath = metallib;
-  config.resources.modelRoot = modelRoot;
-  config.resources.model = model::inspectModelPackage(modelRoot);
-  config.resources.buildId = SPLASH_BUILD_ID;
-  config.resources.operatorChoices = winners;
-  const auto &capabilities = config.resources.model.capabilities;
-  const uint32_t maskWordsPerToken = (capabilities.vocabularySize + 31) / 32;
-  config.nativeLoop.maskWordsPerToken = maskWordsPerToken;
-  config.protocolLimits.maxTokenBatch = model::ExecutionLimits::maximumStepTokens;
-  config.protocolLimits.maxSimulationTokens = capabilities.draftQueryRows;
-  config.protocolLimits.maxMaskWords = maskWordsPerToken * (capabilities.draftQueryRows + 1);
-  auto bootstrap = engine::RuntimeBootstrap::start(
-      std::move(config), [](std::span<const uint8_t>) {},
-      []() -> std::string { throw std::logic_error("no status requests during tuning"); });
-  if (!bootstrap->report().ready)
-    throw std::runtime_error("production bootstrap did not reach Ready");
-  auto &resources = bootstrap->resources();
-  auto &runtime = bootstrap->modelRuntime();
-  const OperatorChoices &choices = winners;
-  if (choices.empty()) throw std::runtime_error("no kernel choices to confirm");
-
-  std::vector<Confirmation> results;
-  auto measure = [&](const std::string &graph, auto &&run) {
-    std::vector<PairedTiming> gpu, wall;
-    for (size_t pair = 0; pair < pairs && !interrupted; ++pair) {
-      const MeasurementOrder order = measurementOrder(pair);
-      double gpuSeconds[2]{};
-      std::array<model::WarmupStepResult, 2> steps;
-      for (int slot = 0; slot < 2; ++slot) {
-        const bool baseline = (slot == 0) == (order == MeasurementOrder::BaselineFirst);
-        resources.installOperatorChoices(baseline ? OperatorChoices{} : choices);
-        auto [g, step] = run();
-        gpuSeconds[baseline ? 0 : 1] = g;
-        steps[baseline ? 0 : 1] = std::move(step);
-      }
-      try {
-        const auto [gpuPair, wallPair] = pairWarmupMeasurements(
-            steps[0], gpuSeconds[0], steps[1], gpuSeconds[1], order);
-        gpu.push_back(gpuPair);
-        wall.push_back(wallPair);
-      } catch (const std::runtime_error &error) {
-        throw std::runtime_error(graph + ": " + error.what());
-      }
-    }
-    resources.installOperatorChoices(choices);
-    results.push_back({graph, evaluate(gpu), evaluate(wall)});
-  };
-  measure("prefill 2048 rows", [&] {
-    auto step = runtime.warmupPrefill(model::ExecutionLimits::prefillTokenBudget);
-    return std::pair{runtime.telemetry().lastPrefillGpuSeconds, std::move(step)};
-  });
-  for (uint32_t width = 1; width <= model::ExecutionLimits::maximumBatchWidth; ++width) {
-    measure("decode B" + std::to_string(width), [&] {
-      auto step = runtime.warmupDecodeBatch(width);
-      return std::pair{runtime.telemetry().lastDecodeGpuSeconds, std::move(step)};
-    });
-  }
-  return results;
-}
-
-void printAssessment(std::string_view label, const TimingAssessment &value) {
-  std::cout << "  " << label << ' ' << std::fixed << std::setprecision(2)
-            << value.baselineMedianSeconds * 1000 << " -> "
-            << value.candidateMedianSeconds * 1000 << " ms, "
-            << timingVerdictName(value.verdict);
-  if (value.verdict == TimingVerdict::Improved || value.verdict == TimingVerdict::Stable ||
-      value.verdict == TimingVerdict::Uncertain || value.verdict == TimingVerdict::Regressed)
-    std::cout << " (median gain " << percent(value.medianPairedGain) << ")";
-  std::cout << '\n';
-}
-
-std::string today() {
-  char buffer[32];
-  std::time_t now = std::time(nullptr);
-  std::strftime(buffer, sizeof buffer, "%Y-%m-%d", std::localtime(&now));
-  return buffer;
 }
 
 } // namespace
@@ -384,83 +209,66 @@ int main(int argc, char **argv) {
       std::cout << std::unitbuf;  // progress lines reach a log as they happen
       const std::filesystem::path metallib = argv[1], modelRoot = argv[2];
 
-      OperatorChoices choices;
       uint32_t measured = 0, changed = 0, incomplete = 0, failed = 0;
-      std::string deviceName, modelName;
-      uint32_t gpuFamily = 0;
-      {
       metal::MetalBackend backend(metallib.string());
       const auto &device = backend.capabilities();
-      deviceName = device.deviceName;
-      gpuFamily = device.appleGpuFamily;
       if (const auto error = device.validationError()) throw std::runtime_error(*error);
       const uint64_t budget =
-          engine::EngineMemoryPolicy::hardBudgetBytes(device.recommendedMaxWorkingSetBytes);
+          engine::EngineMemoryPolicy::hardBudgetBytes(device.recommendedMaxWorkingSetBytes, 0);
       if (!budget)
         throw std::runtime_error("device working set does not cover its protected margin");
       engine::MemoryGovernor governor(
           backend, budget,
-          engine::EngineMemoryPolicy::hostAvailableReserveBytes(device.physicalMemoryBytes));
+          engine::EngineMemoryPolicy::hostAvailableReserveBytes(device.physicalMemoryBytes),
+          engine::queryHostAvailableMemory, 0);
       const MeasurementStop underPressure = [&] {
         const auto state = governor.snapshot();
-        return state.pressure != engine::MemoryPressure::Normal || !state.growthAllowed ||
+        return state.pressure != engine::MemoryPressure::Normal ||
+               !state.hostGrowthAllowed || !state.headroomBytes ||
                NSProcessInfo.processInfo.thermalState >= NSProcessInfoThermalStateSerious;
       };
       const MeasurementStop stop = [] { return interrupted != 0; };
       const auto governed = governor.allocationAdmission();
-      const metal::AllocationAdmission admit = [&](uint64_t bytes, const auto &allocate) {
-        return !interrupted && !underPressure() && governed(bytes, allocate);
+      const metal::AllocationAdmission admit =
+          [&](uint64_t bytes, const auto &allocate) -> metal::AllocationResult {
+        if (interrupted || underPressure())
+          return metal::AllocationFailure::HostPressure;
+        return governed(bytes, allocate);
       };
 
       const auto descriptor = model::inspectModelPackage(modelRoot);
       std::optional<model::ModelPackage> package;
-      if (!admit(model::preparedModelWeightBytes(modelRoot, descriptor),
+      if (!admit(model::modelWeightBytes(modelRoot, descriptor),
                  [&] { package.emplace(model::loadModelPackage(backend, modelRoot, descriptor)); }))
         throw std::runtime_error("model package memory admission denied or interrupted");
       const auto workloads =
           model::collectTuningWorkloads(*package, kPrefillProbeRows, kDecodeProbeWidths);
-      modelName = package->name();
 
       std::cout << "tune-kernels: " << device.deviceName << " (Apple GPU family "
                 << device.appleGpuFamily << "), model " << package->name() << ", build "
                 << SPLASH_BUILD_ID << "\n  " << options.measurement.samplePairs
                 << " pairs per candidate, " << options.measurement.maximumWallSeconds
-                << " s per key (attention " << options.measurement.maximumWallSeconds * 4
-                << " s per policy)\n";
+                << " s per key\n";
       // The workloads keep only Affine64 weights, and a GGUF source prepares
       // every target projection and expert as Block32.
       if (descriptor.targetSource == model::TargetSource::Gguf)
         std::cout << "  GGUF target: its projections and experts follow the device policy; "
-                     "only attention and the draft are measured\n";
+                     "only the draft's projections are measured\n";
       std::cout << '\n';
 
-      MeasurementOptions attention = options.measurement;
-      attention.maximumWallSeconds = options.measurement.maximumWallSeconds * 4;
-      auto account = [&](bool complete, bool didChange, std::exception_ptr failure) {
-        ++measured;
-        changed += complete && didChange;
-        incomplete += !complete && !failure;
-        failed += bool(failure);
-        if (!backend.healthy()) throw std::runtime_error("Metal backend became unhealthy");
-      };
-
-      const Linear linear(device);
-      const auto verifyBaseline = VerifyAttentionConfig{};
-      for (const auto &input : workloads.linear) {
+      for (const auto &input : workloads) {
         if (interrupted) break;
         const auto result = tuneLinear(backend, admit, input, options.measurement, underPressure, stop);
-        const auto baseline = linear.plan(input.workload).configuration();
-        const bool didChange = result.complete && result.choice.configuration != baseline;
-        if (didChange) choices.linear.push_back(result.choice);
-        outcome("linear", describe(input.workload), result.complete, didChange,
-                describe(result.choice.configuration),
-                evidence(result.measurements,
-                         candidateOf(linear.candidates(input.workload), result.choice.configuration)),
+        const auto plans = linearCandidates(device, input.workload);
+        const auto baseline = plans.front().configuration();
+        const bool didChange = result.complete && result.configuration != baseline;
+        outcome(describe(input.workload), result.complete, didChange,
+                describe(result.configuration),
+                evidence(result.measurements, candidateOf(plans, result.configuration)),
                 result.failure);
         if (options.candidates) {
           // Every candidate's own paired evidence against the default, so a
           // policy rule can be judged by what it costs, not only by who won.
-          const auto plans = linear.candidates(input.workload);
           std::vector<std::pair<double, std::string>> rows;
           for (const auto &m : result.measurements) {
             if (m.candidate.value >= plans.size()) continue;
@@ -478,103 +286,16 @@ int main(int argc, char **argv) {
           std::cout << "      default " << describe(baseline) << '\n';
           for (const auto &row : rows) std::cout << "      " << row.second << '\n';
         }
-        account(result.complete, didChange, result.failure);
-      }
-      if (!interrupted) {
-        const PrefillAttentionPolicy policy{workloads.targetAttention};
-        const auto result = tunePrefillAttentionPolicy(backend, admit, policy, attention, underPressure, stop);
-        const bool didChange = result.complete && result.choice.configuration != PrefillAttentionConfig{};
-        if (didChange) choices.prefillAttention.push_back(result.choice);
-        std::string proof;
-        for (const auto &probe : result.probes)
-          proof += "\n      history " + std::to_string(probe.choice.workload.historyTokens) +
-                   evidence(probe.measurements,
-                            candidateOf(PagedAttention::prefillCandidates(), result.choice.configuration));
-        outcome("prefill attention", describe(policy), result.complete, didChange,
-                describe(result.choice.configuration), proof, result.failure);
-        account(result.complete, didChange, result.failure);
-      }
-      for (uint32_t width : kDecodeProbeWidths) {
-        if (interrupted) break;
-        const VerifyAttentionPolicy policy{workloads.targetAttention, width};
-        const auto result = tuneVerifyAttentionPolicy(backend, admit, policy, attention, underPressure, stop);
-        const bool didChange = result.complete && result.choice.configuration != verifyBaseline;
-        if (didChange) choices.verifyAttention.push_back(result.choice);
-        std::string proof;
-        for (const auto &probe : result.probes)
-          proof += "\n      probe" + evidence(probe.measurements,
-                       candidateOf(verifyAttentionTuningCandidates(verifyBaseline),
-                                   result.choice.configuration));
-        outcome("verify attention", describe(policy), result.complete, didChange,
-                describe(result.choice.configuration), proof, result.failure);
-        account(result.complete, didChange, result.failure);
-      }
-      for (uint32_t width : kDecodeProbeWidths) {
-        if (interrupted) break;
-        const DraftAttentionWorkload workload{workloads.draftAttention, width};
-        const auto result = tuneDraftAttention(backend, admit, workload, options.measurement, underPressure, stop);
-        const bool didChange = result.complete && result.choice.configuration != DraftAttentionConfiguration{};
-        if (didChange) choices.draftAttention.push_back(result.choice);
-        outcome("draft attention", describe(workload), result.complete, didChange,
-                describe(result.choice.configuration),
-                evidence(result.measurements,
-                         candidateOf(DraftAttention::candidates(workload.shape), result.choice.configuration)),
-                result.failure);
-        account(result.complete, didChange, result.failure);
-      }
-      for (const auto &input : workloads.moe) {
-        if (interrupted) break;
-        const auto result = tuneMoe(backend, admit, input, options.measurement, underPressure, stop);
-        const auto candidates = ExecutionPlans(backend.capabilities()).moeCandidates(input.workload);
-        const MoeConfig baseline = candidates.front().configuration();
-        const bool didChange = result.complete && result.choice.configuration != baseline;
-        if (didChange) choices.moe.push_back(result.choice);
-        outcome("moe", describe(input.workload), result.complete, didChange,
-                describe(result.choice.configuration),
-                evidence(result.measurements, candidateOf(candidates, result.choice.configuration)),
-                result.failure);
-        account(result.complete, didChange, result.failure);
+        ++measured;
+        changed += didChange;
+        incomplete += !result.complete && !result.failure;
+        failed += bool(result.failure);
+        if (!backend.healthy()) throw std::runtime_error("Metal backend became unhealthy");
       }
 
       std::cout << "\nmeasured " << measured << " keys: " << changed << " changed, "
                 << incomplete << " incomplete, " << failed << " failed"
-                << (interrupted ? ", interrupted" : "") << "\n\n";
-      }  // sweep scope: release the model, fixtures and backend before confirmation
-
-      std::cout << "// Apple GPU family " << gpuFamily << " (" << deviceName
-                << "), " << modelName
-                << ", tune-kernels " << today() << ", build " << SPLASH_BUILD_ID << "\n"
-                << "// " << changed << " of " << measured
-                << " keys have a candidate that beat the policy default; if a margin\n"
-                << "// matters, change the rules in runtime/ops, not a table.\n";
-      for (const auto &c : choices.linear)
-        std::cout << "choices.linear.push_back({" << describe(c.workload) << ", "
-                  << describe(c.configuration) << "});\n";
-      for (const auto &c : choices.prefillAttention)
-        std::cout << "choices.prefillAttention.push_back({" << describe(c.workload) << ", "
-                  << describe(c.configuration) << "});\n";
-      for (const auto &c : choices.verifyAttention)
-        std::cout << "choices.verifyAttention.push_back({" << describe(c.workload) << ", "
-                  << describe(c.configuration) << "});\n";
-      for (const auto &c : choices.draftAttention)
-        std::cout << "choices.draftAttention.push_back({" << describe(c.workload) << ", "
-                  << describe(c.configuration) << "});\n";
-      for (const auto &c : choices.moe)
-        std::cout << "choices.moe.push_back({" << describe(c.workload) << ", "
-                  << describe(c.configuration) << "});\n";
-      if (choices.empty()) std::cout << "// (no entry: every measured key kept its default)\n";
-
-      if (options.confirmPairs && !interrupted && !choices.empty()) {
-        std::cout << "confirming complete graphs (" << *options.confirmPairs
-                  << " pairs each; defaults -> winners)...\n";
-        for (const auto &row : confirm(metallib, modelRoot, choices, *options.confirmPairs)) {
-          std::cout << row.graph << '\n';
-          printAssessment("GPU ", row.gpu);
-          printAssessment("wall", row.wall);
-        }
-        std::cout << '\n';
-      }
-
+                << (interrupted ? ", interrupted" : "") << '\n';
       return failed || interrupted ? 1 : 0;
     } catch (const std::exception &error) {
       std::cerr << "tune-kernels: " << error.what() << '\n';

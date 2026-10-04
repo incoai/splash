@@ -1,7 +1,6 @@
 #pragma once
 
-// Checks of the weight preparation tests, which throw a message naming what
-// failed.
+// Checks that throw a message naming what failed.
 
 #include <stdexcept>
 #include <string>
@@ -9,8 +8,8 @@
 
 namespace splash::test {
 
-inline void require(bool value, const std::string &message) {
-  if (!value) throw std::runtime_error(message);
+inline void require(bool value, std::string_view message) {
+  if (!value) throw std::runtime_error(std::string(message));
 }
 
 // run must fail with an error whose message contains expected, so that an

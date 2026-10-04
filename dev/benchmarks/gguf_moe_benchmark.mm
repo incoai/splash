@@ -1,18 +1,19 @@
 // GPU time of one sparse MoE layer at the 35B shape (hidden 2048, 256 experts, top 8, intermediate 512) in GGUF
 // (by default the 35B UD-Q4_K_M's Q4_K gate/up and Q5_K down experts, a Q8_0 shared expert, F32 router) against the
 // affine Q4 layer, on the device's plans and the other GGUF tile: a 2048-row prefill chunk, decode B1-B4 and prefill
-// chunks of their rows, the affine decode candidates (the other simdgroup count, the 32-row tile) in alternating
-// rounds with a bitwise output check, then every dispatch of the long chunk, B1 and B4 replayed as its own command.
-// The numbers behind the MoE plans of ops/MoE.cpp:
+// chunks of their rows, the affine decode candidates (the other simdgroup count, the 32-row prefill plan) in
+// alternating rounds with a bitwise output check, prefill chunks of 64 to 512 rows, then every dispatch of the long
+// chunk, B1 and B4 replayed as its own command. The numbers behind the MoE plans of ops/MoE.cpp:
 //   gguf-moe-benchmark <metallib> [rounds] [gate/up format] [down format] [decode pool]
 // Printed are medians of GPU ms per layer over `rounds` (31) commands. Every row routes to 8 experts of a pool of
-// `decode pool` (24, at most 256) per request lane (decode, short chunks) or of all 256 (the long chunk), identically
-// for both formats: expert e scores 4 x[e], so the first 256 inputs pick the routes. A pool of 24 caps a lane at 25
-// live tiles; 256 lets a lane's 64 routes spread as diffusely as uniform routing (about 58 tiles), so the pool
-// brackets real routes, whose live-tile count is printed beside each decode line with the affine layer's streamed
-// expert-slab rate. The weights exceed the system cache, so each layer streams its experts from DRAM.
+// `decode pool` (24, at most 256) per request lane (decode, short chunks) or of all 256 (chunks of 64 rows or more),
+// identically for both formats: expert e scores 4 x[e], so the first 256 inputs pick the routes. A pool of 24 caps a
+// lane at 25 live tiles; 256 lets a lane's 64 routes spread as diffusely as uniform routing (about 58 tiles), so the
+// pool brackets real routes, whose live-tile count is printed beside each decode line with the affine layer's
+// streamed expert-slab rate. The weights exceed the system cache, so each layer streams its experts from DRAM.
 #include "../tests/engine/AffineQ4Fixture.hpp"
 #include "../tests/engine/GgufFormatReference.hpp"
+#include "DispatchReplay.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "ops/ExecutionPlans.hpp"
@@ -168,7 +169,7 @@ int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFor
                              {planes(gateUpFormat, E * I, H), planes(Q80, I, H)},
                              {planes(gateUpFormat, E * I, H), planes(Q80, I, H)},
                              {planes(downFormat, E * H, I), planes(Q80, H, I)}};
-  // Rows route to 8 of a pool of 24 experts per lane of 8 rows (decode) or of all 256 (prefill).
+  // Rows route to 8 of the selected pool per lane of 8 rows (decode) or of all 256 (long prefill).
   const auto input = [&](uint32_t rows, uint32_t pool) {
     std::uniform_real_distribution<float> unit(-1.0f, 1.0f);
     std::vector<float> x(uint64_t{rows} * H);
@@ -229,8 +230,9 @@ int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFor
            routes.tiles, (routes.experts + 1) * kAffineExpertBytes / (a * 1e6));
   }
   // The affine decode candidates against the device plan: the other 8-row simdgroup count (the family rule of
-  // ops::moeDecodeSimdgroups, which the MoE tuner does not vary) and the 32-row tile. Rounds alternate between the
-  // plans so clock drift lands on all of them, and every candidate's output must match the device plan's bitwise.
+  // ops::moeDecodeSimdgroups) and the 32-row prefill plan on the same input rows. Affine M32 plans run the split
+  // expert passes; decode plans require the fused M8 tile. Rounds alternate between the plans so clock drift lands
+  // on all of them, and every candidate's output is checked against the device plan's bitwise.
   printf("  affine decode candidates, alternating rounds:\n");
   for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
     b.input = bfloatBuffer(backend, input(lanes * 8, pool), "input");
@@ -244,7 +246,7 @@ int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFor
         {"device", shipped},
         {simdgroups.m8Simdgroups == splash::ops::MoeExpertSimdgroups::Four ? "sg4" : "sg8",
          MoE::decodePlan(affineShape, lanes, simdgroups)},
-        {"m32", MoE::decodePlan(affineShape, lanes, rows32)}};
+        {"m32", MoE::prefillPlan(affineShape, shipped.rows(), rows32)}};
     std::vector<MoeBuffers> buffers(candidates.size(), b);
     std::vector<CommandGraph> graphs(candidates.size());
     std::vector<std::vector<double>> samples(candidates.size());
@@ -269,6 +271,12 @@ int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFor
     }
     printf("\n");
   }
+  for (const uint32_t rows : {64u, 128u, 256u, 512u}) {
+    b.input = bfloatBuffer(backend, input(rows, E), "input");
+    const double ap = time(affine, plans.moePrefill(affineShape, rows));
+    const double gp = time(gguf, plans.moePrefill(ggufShape, rows));
+    printf("  prefill chunk of %u rows: affine %.3f  gguf %.3f\n", rows, ap, gp);
+  }
   // Where the time goes: every dispatch replayed as its own command.
   for (const auto &[label, weights, plan] :
        {std::tuple{"affine prefill", &affine, plans.moePrefill(affineShape, kRowsMax)},
@@ -281,11 +289,10 @@ int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFor
     allocate(backend, b, plan);
     CommandGraph graph;
     MoE::add(graph, b, *weights, plan);
-    backend.setDispatchProfiling(true);
-    for (uint32_t i = 0; i < rounds; ++i) static_cast<void>(backend.submitCommand(graph.dispatches()));
-    backend.setDispatchProfiling(false);
     std::map<std::string, double> spent;
-    for (const auto &t : backend.takeDispatchProfile()) spent[t.pipelineName] += t.gpuSeconds * 1e3 / rounds;
+    for (uint32_t i = 0; i < rounds; ++i)
+      for (const auto &[name, seconds] : splash::benchmark::replayDispatches(backend, graph.dispatches()))
+        spent[name] += seconds * 1e3 / rounds;
     printf("  %s:", label);
     for (const auto &[name, ms] : spent) printf(" %s %.3f", name.c_str(), ms);
     printf("\n");

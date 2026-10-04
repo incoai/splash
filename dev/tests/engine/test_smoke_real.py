@@ -100,7 +100,7 @@ class FakeServer:
 
 
 class SmokeRealTests(unittest.TestCase):
-    def test_status_checks_selected_kv_format_and_legacy_int8(self):
+    def test_status_checks_selected_kv_format(self):
         for format in ("int8", "bf16"):
             kv = {
                 "format": format,
@@ -118,15 +118,13 @@ class SmokeRealTests(unittest.TestCase):
                 smoke_real.validate_status(
                     status, "bf16" if format == "int8" else "int8"
                 )
-            if format == "int8":
-                old = {k: v for k, v in kv.items() if k != "format"}
-                self.assertEqual(smoke_real.kv_identity({"q8": old}), kv)
-                status["identity"] = {"cache": {"block_tokens": 32}, "q8": old}
-                smoke_real.validate_status(status, "int8")
-            else:
+            if format == "bf16":
                 kv["scale_type"] = "float32"
                 with self.assertRaises(smoke_real.SmokeFailure):
                     smoke_real.validate_status(status, "bf16")
+        status["identity"] = {"cache": {"block_tokens": 32}}
+        with self.assertRaises(smoke_real.SmokeFailure):
+            smoke_real.validate_status(status)
 
     def test_server_paths_are_resolved_from_caller_directory(self):
         with TemporaryDirectory() as directory, contextlib.chdir(directory):
@@ -141,6 +139,7 @@ class SmokeRealTests(unittest.TestCase):
                         max_context=None,
                         max_memory=None,
                         max_cache_disk=None,
+                        max_image_pixels=None,
                         kv_format="bf16" if absolute else "int8",
                     )
                     with (
@@ -161,10 +160,8 @@ class SmokeRealTests(unittest.TestCase):
                                 popen.call_args.kwargs["cwd"], smoke_real.ROOT
                             )
                             self.assertEqual(
-                                command[2], str(package.resolve() / "target")
-                            )
-                            self.assertEqual(
-                                command[3], str(package.resolve() / "draft")
+                                command[1:4],
+                                ["-m", "server.server", str(package.resolve())],
                             )
                             self.assertEqual(
                                 command[command.index("--tokenizer") + 1],
@@ -289,6 +286,8 @@ class SmokeRealTests(unittest.TestCase):
             red,
             {"images": {"encodes": 1, "embedding_reuses": 0}},
             repeat,
+            {"images": {"encodes": 1, "embedding_reuses": 0}},
+            red,
             {"images": {"encodes": 1, "embedding_reuses": 1}},
             blue,
             {"type": "message", "content": [{"type": "text", "text": "red"}]},
@@ -445,10 +444,12 @@ class SmokeRealTests(unittest.TestCase):
                         smoke_real, "run_protocol_extensions"
                     ) as extensions,
                     mock.patch.object(smoke_real, "run_judgments"),
+                    mock.patch.object(smoke_real, "run_sampling") as sampling,
                     contextlib.redirect_stdout(io.StringIO()),
                 ):
                     smoke_real.run(8000, "test-model")
                 vision = "image" in modalities
+                self.assertTrue(sampling.called)
                 self.assertEqual(images.called, vision)
                 self.assertEqual(text_only.called, not vision)
                 self.assertEqual(extensions.call_args.args[2], vision)
@@ -456,6 +457,54 @@ class SmokeRealTests(unittest.TestCase):
                     any(path == "/apply-template" for _, path, _ in server.calls),
                     later_system != "unsupported",
                 )
+
+    def test_sampling_requires_repeats_the_tool_call_and_the_whole_budget(self):
+        def serve(repeat=True, arguments=None, ignored=32, heaviest="x", failing=None):
+            answers = iter(("first", "second", "second" if repeat else "third"))
+
+            def answer(port, method, path, body=None, **_kwargs):
+                if body.get("min_p") == 0.1 and failing == "min_p":
+                    raise TimeoutError("timed out")
+                if body.get("tools"):
+                    call = {
+                        "function": {
+                            "name": "record_probe",
+                            "arguments": json.dumps(arguments or {"value": "ok"}),
+                        }
+                    }
+                    return 200, {"choices": [{"message": {"tool_calls": [call]}}]}
+                usage = {"completion_tokens": ignored if body.get("ignore_eos") else 5}
+                if body.get("min_p") == 1:
+                    content = heaviest
+                elif body.get("temperature"):
+                    content = "mon, tue"
+                else:
+                    content = next(answers, "x")
+                return 200, {
+                    "choices": [{"message": {"content": content}}],
+                    "usage": usage,
+                }
+
+            return answer
+
+        with (
+            mock.patch.object(smoke_real, "request", serve()),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            smoke_real.run_sampling(8000, "test-model")
+        for failure, server in (
+            ("did not repeat", serve(repeat=False)),
+            ("min_p 1 did not answer", serve(heaviest="y")),
+            ("tool call failed", serve(arguments={"value": "no"})),
+            ("stopped early", serve(ignored=7)),
+            ("concurrent min_p request failed", serve(failing="min_p")),
+        ):
+            with (
+                self.subTest(failure=failure),
+                mock.patch.object(smoke_real, "request", server),
+                self.assertRaisesRegex(smoke_real.SmokeFailure, failure),
+            ):
+                smoke_real.run_sampling(8000, "test-model")
 
     def test_text_only_refuses_every_media_request_and_serves_text(self):
         def run(server):

@@ -114,9 +114,9 @@ MoeWorkspace workspaceFor(MoeShape shape, uint32_t rows, uint32_t tileRows,
           groupedRows * outputWidth * sizeof(uint16_t), sumsBytes};
 }
 
-// Pipelines, column tiles and threadgroup width of a plan's fused gate/up
-// and down passes. Only the 8-row tiles have a four-simdgroup form; see
-// MoeExpertSimdgroups for its geometry and measurements.
+// Pipelines, column tiles and threadgroup width of a decode plan's fused
+// gate/up and down passes; see MoeExpertSimdgroups for the four-simdgroup
+// form's geometry and measurements.
 struct ExpertPasses final {
   const char *gateUp;
   const char *down;
@@ -126,9 +126,6 @@ struct ExpertPasses final {
 };
 
 ExpertPasses fusedExpertPasses(const MoeConfig &config) noexcept {
-  if (config.expertTile == MoeExpertTile::M32)
-    return {"moe_expert_gate_up_q4_m32", "moe_expert_down_q4_m32", 128, 128,
-            metal::CommandGraph::kDefaultThreads};
   const uint32_t threads = static_cast<uint32_t>(config.m8Simdgroups) * 32;
   if (config.m8Simdgroups == MoeExpertSimdgroups::Four)
     return {"moe_expert_gate_up_q4_m8_n128_sg4",
@@ -243,21 +240,19 @@ void addGgufExperts(metal::CommandGraph &graph, const MoeScratch &scratch,
 
 } // namespace
 
-// GGUF plans always run the three expert passes of the split plan.
+// Prefill plans and GGUF plans run the three expert passes of the split
+// plan, affine decode plans the fused gate/up tile.
 MoePlan::MoePlan(MoeShape shape, uint32_t rows, MoeConfig config,
                  MoePhase phase)
     : shape_(shape), rows_(rows), config_(config),
-      splitExperts_(shape.weightLayout == WeightLayout::Block32 ||
-                    (phase == MoePhase::Prefill && config.expertTile == MoeExpertTile::M32)) {
-  // Affine plans have 8- and 32-row kernels in both phases, GGUF plans 8-row
-  // kernels in both phases and 32-row prefill kernels.
+      splitExperts_(shape.weightLayout == WeightLayout::Block32 || phase == MoePhase::Prefill) {
+  // Affine plans have 32-row prefill and 8-row decode kernels, GGUF plans
+  // 8-row kernels in both phases and 32-row prefill kernels.
   const bool gguf = shape.weightLayout == WeightLayout::Block32;
-  if ((config.expertTile != MoeExpertTile::M8 && config.expertTile != MoeExpertTile::M32) ||
-      (gguf && phase == MoePhase::Decode && config.expertTile != MoeExpertTile::M8))
+  const bool prefill = phase == MoePhase::Prefill;
+  if ((!prefill && config.expertTile != MoeExpertTile::M8) ||
+      (!gguf && prefill && config.expertTile != MoeExpertTile::M32))
     throw std::invalid_argument("invalid MoE expert tile configuration");
-  if (config.m8Simdgroups != MoeExpertSimdgroups::Eight &&
-      config.m8Simdgroups != MoeExpertSimdgroups::Four)
-    throw std::invalid_argument("invalid MoE expert simdgroup configuration");
   if (config.ggufTile == MoeGgufTile::Register &&
       (shape.weightLayout != WeightLayout::Block32 || config.expertTile != MoeExpertTile::M8))
     throw std::invalid_argument("the register expert tile takes block 8-row tiles");
@@ -325,8 +320,8 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
               gather, {tiles, shape.hiddenSize / 256, 1});
   else
     graph.add("moe_gather_rows",
-              {buffers.input, scratch.groupedRoutes, scratch.tileCount,
-               scratch.groupedInput},
+              {buffers.input, scratch.groupedRoutes, scratch.tileDescriptors,
+               scratch.tileCount, scratch.groupedInput},
               gather, {tiles, shape.hiddenSize / 256, 1});
   if (block)
     addGgufExperts(graph, scratch, weights.blocks(), plan);

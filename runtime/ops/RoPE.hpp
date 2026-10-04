@@ -1,15 +1,11 @@
 #pragma once
 
 #include "metal/CommandGraph.hpp"
+#include "metal/abi/RoPE.h"
 
 #include <cstdint>
 
 namespace splash::ops {
-
-struct RoPETableShape final {
-  uint32_t targetRows = 0;
-  uint32_t draftRows = 0;
-};
 
 class RoPE final {
 public:
@@ -20,7 +16,7 @@ public:
       metal::MetalBuffer draftInverseFrequencies,
       metal::MetalBuffer targetCosine, metal::MetalBuffer targetSine,
       metal::MetalBuffer draftCosine, metal::MetalBuffer draftSine,
-      RoPETableShape shape, uint32_t maximumRows);
+      RopeTableParams rows, uint32_t maximumRows);
 };
 
 } // namespace splash::ops

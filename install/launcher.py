@@ -7,40 +7,72 @@ import fcntl
 import http.client
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
 import urllib.error
 import urllib.request
+from pathlib import Path
 
-try:
-    from . import assembly, catalog, clients, paths
-    from . import models as model_artifacts
-except ImportError:  # Executed directly by the source or packaged entry point.
-    import assembly
-    import catalog
-    import clients
-    import models as model_artifacts
-    import paths
+if __name__ == "__main__" and not __package__:
+    # Run as a script by the PATH wrappers and ./splash: import siblings as
+    # the install package.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    __package__ = "install"
+
+# The options serve shares with the server, in modules of the standard
+# library alone: the launcher runs before .venv exists.
+from server import serve_options
+
+from . import assembly, catalog, clients, paths
+from . import models as model_artifacts
 
 ROOT = paths.ROOT
 RUNTIME_DIR = paths.RUNTIME
-PROFILES_DIR = paths.PROFILES
 PORT = 8000
-# A copy: the launcher runs before .venv exists; server/chat_templates imports Jinja2.
-REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+# Either stops `splash serve` wherever it is. The programs with handlers of
+# their own, the installer it runs and the server it executes, start with
+# them blocked, not ignored, until those handlers are in place, so one sent
+# meanwhile waits for its handler instead of being lost or ending the
+# program in a traceback. make and the device check run with them unblocked.
+STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 
 
 class LauncherError(RuntimeError):
     pass
 
 
+class StopSignal(KeyboardInterrupt):
+    """One of STOP_SIGNALS, raised where it arrives, as Ctrl+C is."""
+
+    def __init__(self, number):
+        super().__init__(number)
+        self.number = number
+
+
+def _interrupt(number, _frame):
+    raise StopSignal(number)
+
+
+def _run_held(command, **options):
+    """Run a program that unblocks the stop signals itself, holding them from
+    its spawn. One the launcher takes meanwhile ends the program too."""
+    signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
+    try:
+        with subprocess.Popen(command, **options) as program:
+            try:
+                signal.pthread_sigmask(signal.SIG_UNBLOCK, STOP_SIGNALS)
+                return program.wait()
+            except BaseException:
+                program.kill()
+                raise
+    finally:
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, STOP_SIGNALS)
+
+
 def _base_url(port):
     return f"http://127.0.0.1:{port}"
-
-
-def _profiles_dir(port):
-    return PROFILES_DIR if port == PORT else PROFILES_DIR / "ports" / str(port)
 
 
 def _request_json(path, timeout=2, *, port=PORT):
@@ -64,13 +96,6 @@ def _request_json(path, timeout=2, *, port=PORT):
         http.client.HTTPException,
     ):
         return None
-
-
-def _running_status(port=PORT):
-    status = _request_json("/status", timeout=10, port=port)
-    if not isinstance(status, dict):
-        return None
-    return status
 
 
 def _ensure_installed(selection):
@@ -117,7 +142,7 @@ def _ensure_installed(selection):
             command[-1:-1] = [flag, value]
     if selection.language_only:
         command.insert(-1, "--language-only")
-    if subprocess.run(command, cwd=ROOT).returncode:
+    if _run_held(command, cwd=ROOT):
         raise LauncherError("model download or verification failed")
 
 
@@ -167,6 +192,13 @@ def _check_port(host, port):
 
 
 def serve(args):
+    # Started in the background from a non-interactive shell, the launcher
+    # inherits SIGINT as ignored; take both stop signals from the start.
+    for number in STOP_SIGNALS:
+        signal.signal(number, _interrupt)
+    if args.offline:
+        # The installer, the catalog refresh and the server all read it.
+        os.environ["HF_HUB_OFFLINE"] = "1"
     # Keep both locks across exec until the foreground server exits.
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     with (
@@ -214,81 +246,65 @@ def serve(args):
         root, record = assembly.hold(selection.link, selection.models_root)
         if record is not None:
             os.set_inheritable(record.fileno(), True)
+        # The server package of this installation, from any working
+        # directory: -P keeps the directory, which may hold a package of the
+        # same name, off sys.path, and PYTHONPATH names the root.
         command = [
             str(paths.PYTHON),
             "-u",
-            str(ROOT / "server/server.py"),
-            str(root / "target"),
-            str(root / "draft"),
+            "-P",
+            "-m",
+            "server.server",
+            str(root),
             "--tokenizer",
             str(root / "tokenizer"),
             "--model",
             args.model,
             "--binary",
             str(paths.BINARY),
-            "--host",
-            args.host,
             "--port",
             str(args.port),
-            "--max-memory",
-            "auto" if args.max_memory is None else str(args.max_memory),
-            "--max-context",
-            "auto" if args.max_context is None else str(args.max_context),
+            *serve_options.serve_argv(args),
         ]
-        if args.kv_format != "int8":
-            command.extend(("--kv-format", args.kv_format))
-        for name in args.served_model_name:
-            command.append(f"--served-model-name={name}")
-        if args.default_reasoning_effort is not None:
-            command.extend(
-                ["--default-reasoning-effort", args.default_reasoning_effort]
-            )
-        if args.max_request_size is not None:
-            command.extend(["--max-request-size", str(args.max_request_size)])
-        if args.max_cache_disk:
-            command.extend(["--max-cache-disk", str(args.max_cache_disk)])
-        if args.max_image_pixels is not None:
-            command.extend(["--max-image-pixels", str(args.max_image_pixels)])
-        if args.no_webui:
-            command.append("--no-webui")
-        for host in args.allowed_host:
-            command.extend(["--allowed-host", host])
         environment = dict(
-            os.environ, PYTHONUNBUFFERED="1", TRANSFORMERS_VERBOSITY="error"
+            os.environ,
+            PYTHONUNBUFFERED="1",
+            TRANSFORMERS_VERBOSITY="error",
+            PYTHONPATH=str(ROOT),
+            **serve_options.serve_environment(args),
         )
-        if args.api_key is not None:
-            environment["SPLASH_API_KEY"] = args.api_key
         # Detached, because execve replaces this process a line later and a
         # thread would not survive it. Failure is silent by design.
         catalog.spawn_refresh()
         os.set_inheritable(installation.fileno(), True)
         os.set_inheritable(lock.fileno(), True)
+        # The exec resets the handlers; the server unblocks the signals once
+        # its own are in place, past its imports.
+        signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
         os.execve(command[0], command, environment)
 
 
 def coding_client(args):
     path = clients.find_executable(args.command)
-    snapshot = _running_status(args.port)
-    if snapshot is None:
+    listing = _request_json("/v1/models", port=args.port)
+    if listing is None:
         raise LauncherError(
             f"No ready Splash server at {_base_url(args.port)}. "
             "Run 'splash serve --model <HF_REPO_ID>' "
             "in another terminal first."
         )
-    listing = _request_json("/v1/models", port=args.port)
     models = listing.get("data", []) if isinstance(listing, dict) else []
     if (
         not isinstance(models, list)
         or not models
         or not isinstance(models[0], dict)
         or models[0].get("owned_by") != "splash"
+        or type(models[0].get("context_length")) is not int
+        or models[0]["context_length"] <= 0
     ):
         raise LauncherError("Could not identify the local Splash server")
-    model, context = models[0].get("id"), snapshot.get("maximum_context_tokens")
-    if type(context) is not int or context <= 0:
-        raise LauncherError(
-            "Splash is running but its context limit is not available yet; wait and retry"
-        )
+    # The first entry is the name responses report.
+    model, context = models[0].get("id"), models[0]["context_length"]
     # Only opencode needs its major version: the launch defaults changed
     # between its first and second major releases. A failed probe adds nothing.
     client_version = (
@@ -300,7 +316,6 @@ def coding_client(args):
         _base_url(args.port),
         model,
         context,
-        _profiles_dir(args.port),
         input_modalities=models[0].get("input_modalities"),
         client_args=args.client_args,
         client_version=client_version,
@@ -333,93 +348,12 @@ def _parse_port(value):
     return port
 
 
-def _parse_max_cache_disk(value):
-    if value.strip() == "0":
-        return 0
-    try:
-        result = _parse_max_memory(value)
-    except argparse.ArgumentTypeError:
-        result = None
-    if result is None:
-        raise argparse.ArgumentTypeError("use 0 to disable, or a size such as 5G")
-    return result
-
-
-def _parse_max_memory(value):
-    normalized = value.strip().upper()
-    if normalized == "AUTO":
-        return None
-    suffixes = {
-        unit + suffix: 1024**power
-        for power, unit in enumerate(("K", "M", "G"), 1)
-        for suffix in ("", "B", "IB")
-    }
-    multiplier = 1
-    for suffix in sorted(suffixes, key=len, reverse=True):
-        if normalized.endswith(suffix):
-            normalized, multiplier = normalized[: -len(suffix)], suffixes[suffix]
-            break
-    try:
-        result = int(normalized) * multiplier
-    except ValueError:
-        raise argparse.ArgumentTypeError("use a value such as 32G") from None
-    if not 1 <= result <= 2**63 - 1:
-        raise argparse.ArgumentTypeError("use a positive value such as 32G")
-    return result
-
-
-def _parse_request_size(value):
-    size = _parse_max_memory(value)
-    if size is None:
-        raise argparse.ArgumentTypeError("use a positive byte count such as 128M")
-    return size
-
-
-def _parse_max_context(value):
-    normalized = value.strip().upper()
-    if normalized == "AUTO":
-        return None
-    try:
-        result = (
-            int(normalized[:-1]) * 1024 if normalized.endswith("K") else int(normalized)
-        )
-    except ValueError:
-        raise argparse.ArgumentTypeError("use a value such as 100K") from None
-    if not 1 <= result <= 262144:
-        raise argparse.ArgumentTypeError("must be between 1 and 256K tokens")
-    return result
-
-
 def _version():
     if not paths.PACKAGED:
         return "Splash (source checkout)"
     return "Splash " + str(
         json.loads((paths.ROOT / "release.json").read_text())["version"]
     )
-
-
-def _parse_served_model_name(value):
-    if (
-        not value
-        or any(not c.isprintable() or c.isspace() or c in "\\%?#" for c in value)
-        or any(part in ("", ".", "..") for part in value.split("/"))
-    ):
-        raise argparse.ArgumentTypeError(
-            "model alias must be a non-empty name without whitespace or URL delimiters"
-        )
-    return value
-
-
-def _parse_max_image_pixels(value):
-    try:
-        pixels = int(value)
-    except ValueError:
-        pixels = 0
-    # Match the server's supported image budget without importing its runtime
-    # dependencies before help, argument validation or first-time installation.
-    if not 65_536 <= pixels <= 4_194_304:
-        raise argparse.ArgumentTypeError("must be between 65536 and 4194304 pixels")
-    return pixels
 
 
 def parse_args(argv=None):
@@ -461,12 +395,6 @@ def parse_args(argv=None):
         ),
     )
     server.add_argument(
-        "--host",
-        default="127.0.0.1",
-        help="HTTP bind address (default: 127.0.0.1; 0.0.0.0 for all IPv4 interfaces); "
-        "clients use an IP address, localhost or a name given with --allowed-host",
-    )
-    server.add_argument(
         "--port",
         type=_parse_port,
         default=os.environ.get("SPLASH_PORT", str(PORT)),
@@ -494,85 +422,21 @@ def parse_args(argv=None):
         help="skip vision preparation and loading",
     )
     server.add_argument(
-        "--served-model-name",
-        action="append",
-        default=[],
-        type=_parse_served_model_name,
-        help="additional API model name; responses keep the loaded model ID (repeatable)",
+        "--offline",
+        action="store_true",
+        help="start the installed model without contacting the Hugging Face Hub (as HF_HUB_OFFLINE=1)",
     )
-    server.add_argument(
-        "--default-reasoning-effort",
-        choices=REASONING_EFFORTS,
-        default=os.environ.get("SPLASH_DEFAULT_REASONING_EFFORT"),
-        help="Chat/Responses effort when unspecified (default: SPLASH_DEFAULT_REASONING_EFFORT or model template)",
-    )
-    server.add_argument(
-        "--kv-format",
-        choices=("int8", "bf16"),
-        default="int8",
-        help="target KV cache storage (default: int8); bf16 uses more memory",
-    )
-    server.add_argument(
-        "--max-memory",
-        type=_parse_max_memory,
-        help="Metal budget ceiling, e.g. 28G (default: auto)",
-    )
-    server.add_argument(
-        "--max-cache-disk",
-        dest="max_cache_disk",
-        type=_parse_max_cache_disk,
-        default=0,
-        help="SSD quota for cached KV pages and states, e.g. 5G (default: 0, disabled)",
-    )
-    server.add_argument(
-        "--max-context",
-        type=_parse_max_context,
-        help="context token limit, up to 256K (K = 1024; default: auto within the memory budget)",
-    )
-    server.add_argument(
-        "--allowed-host",
-        action="append",
-        default=[],
-        metavar="HOST",
-        help="additional HTTP Host name to accept, e.g. mymac.local; does not change "
-        "the bind address (repeatable)",
-    )
-    server.add_argument(
-        "--max-request-size",
-        type=_parse_request_size,
-        help="maximum HTTP request body size, e.g. 128M (default: 128M); "
-        "shared input budget is max(512M, twice this limit)",
-    )
-    server.add_argument(
-        "--max-image-pixels",
-        type=_parse_max_image_pixels,
-        help="maximum resized pixels per image, 65536–4194304 (default: 4194304)",
-    )
-    server.add_argument(
-        "--api-key",
-        default=os.environ.get("SPLASH_API_KEY"),
-        help="API key (default: SPLASH_API_KEY environment variable)",
-    )
-    server.add_argument("--no-webui", action="store_true", help="disable the chat page")
+    serve_options.add_serve_arguments(server)
     for name in clients.INSTALL_URLS:
         commands.add_parser(name, help=f"connect {name} to the running server")
     args = parser.parse_args(argv)
-    if (
-        args.command == "serve"
-        and args.default_reasoning_effort is not None
-        and args.default_reasoning_effort not in REASONING_EFFORTS
-    ):
-        parser.error(
-            "invalid --default-reasoning-effort / SPLASH_DEFAULT_REASONING_EFFORT"
-        )
+    if args.command == "serve":
+        serve_options.check_serve_arguments(parser, args)
     if args.command in clients.INSTALL_URLS:
         try:
             args.port = _parse_port(os.environ.get("SPLASH_PORT", str(PORT)))
         except argparse.ArgumentTypeError as error:
             parser.error(f"SPLASH_PORT: {error}")
-    if args.command == "serve" and args.api_key is not None:
-        if not args.api_key or any(ord(c) <= 32 or ord(c) >= 127 for c in args.api_key):
-            parser.error("API key must contain only visible ASCII characters")
     if client_args and args.command == "serve":
         parser.error("arguments after -- are only supported for coding clients")
     args.client_args = client_args
@@ -586,8 +450,12 @@ def main(argv=None):
     except (LauncherError, clients.ClientError, OSError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
+    except StopSignal as stop:
+        # The status a shell gives a program the signal ends: 130 for
+        # SIGINT, 143 for SIGTERM.
+        return 128 + stop.number
     except KeyboardInterrupt:
-        return 130
+        return 128 + signal.SIGINT
 
 
 if __name__ == "__main__":

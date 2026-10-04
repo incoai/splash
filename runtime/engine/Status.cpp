@@ -7,7 +7,6 @@
 
 #include <algorithm>
 #include <iomanip>
-#include <limits>
 #include <sstream>
 #include <utility>
 
@@ -15,12 +14,6 @@ namespace splash::engine {
 namespace {
 
 const char *boolean(bool value) noexcept { return value ? "true" : "false"; }
-
-uint64_t saturatingAdd(uint64_t left, uint64_t right) noexcept {
-  return right > std::numeric_limits<uint64_t>::max() - left
-             ? std::numeric_limits<uint64_t>::max()
-             : left + right;
-}
 
 void appendBatch(std::ostringstream &out,
                  const RuntimeBatchMetricsSnapshot &batch) {
@@ -36,25 +29,6 @@ void appendBatch(std::ostringstream &out,
 
 } // namespace
 
-std::string MemoryStatusReporter::update(const ResourceWaitSnapshot &wait,
-                                         bool growthAllowed) {
-  const unsigned state = (!growthAllowed ? 1u : 0u) |
-                         (wait.memory ? 2u : 0u) |
-                         (wait.suspended ? 4u : 0u) |
-                         (wait.draining ? 8u : 0u);
-  if (state == state_)
-    return {};
-  state_ = state;
-  if (!state)
-    return "Memory: growth available; resource wait cleared";
-  std::ostringstream out;
-  out << "Memory: growth " << (growthAllowed ? "available" : "paused")
-      << "; waiting=" << wait.memory << "; suspended=" << wait.suspended;
-  if (wait.draining)
-    out << "; waiting for resident requests to finish";
-  return out.str();
-}
-
 std::string runtimeStatusJson(
     const EngineMemoryPlan &plan, const engine::EngineSnapshot &core,
     const metal::MetalMemoryStats &metalMemory, const WarmupReport &warmup,
@@ -62,39 +36,30 @@ std::string runtimeStatusJson(
     const model::ModelTelemetry &executorTelemetry,
     const engine::RuntimeCacheIdentity &cacheIdentity,
     const MemoryGovernorSnapshot &memoryGovernor, bool metalHealthy,
-    std::string metalFailureReason, const ResourceWaitSnapshot &resourceWait) {
+    std::string metalFailureReason, const ResourceWaitSnapshot &resourceWait,
+    const NativeLoopTiming &loop) {
   const auto &resources = core.resources;
   const auto &scheduler = core.scheduler;
   const auto &pool = resources.pool;
   const auto &state = resources.stateCache;
   const auto &lookup = resources.lookup;
-  const uint64_t trackedPhysical = saturatingAdd(
-      metalMemory.allocatedBytes, metalMemory.sparseResidentBytes);
-  const uint64_t currentBytes =
-      std::max(trackedPhysical, metalMemory.deviceCurrentAllocatedBytes);
+  const uint64_t currentBytes = std::max(
+      metalMemory.allocatedBytes, metalMemory.deviceCurrentAllocatedBytes);
   const uint64_t peakBytes = std::max(
-      {currentBytes, metalMemory.peakResidentBytes,
+      {currentBytes, metalMemory.peakAllocatedBytes,
        metalMemory.devicePeakAllocatedBytes});
   // Warning pressure pauses growth but permits serving; only the governor's
-  // critical verdict makes host pressure a readiness failure.
+  // critical verdict makes host pressure a readiness failure. A status exists
+  // only after warmup and the memory audit passed.
   const bool hostSafe = memoryGovernor.pressure != MemoryPressure::Critical;
-  const bool ready = warmup.ready() && memoryAudit.valid && metalHealthy &&
-                     hostSafe && currentBytes <= plan.breakdown().hardBudgetBytes;
+  const bool ready = metalHealthy && hostSafe &&
+                     currentBytes <= plan.breakdown().hardBudgetBytes;
   const double hitRate =
       core.cacheHits + core.coldMisses
           ? double(core.cacheHits) / double(core.cacheHits + core.coldMisses)
           : 0.0;
 
-  std::ostringstream kvIdentity;
-  kvIdentity << "{\"target_model_sha256\":"
-      << json::quote(digestHex(cacheIdentity.kvLayout.modelArtifactSha256))
-      << ",\"format\":" << json::quote(kv::formatName(cacheIdentity.kvLayout.format()))
-      << ",\"quantization\":" << json::quote(
-          cacheIdentity.kvLayout.format() == kv::Format::Int8 ? "symmetric_int8" : "none")
-      << ",\"scale_type\":" << json::quote(
-          cacheIdentity.kvLayout.format() == kv::Format::Int8 ? "float32" : "none")
-      << ",\"key_layout\":\"token_major\""
-      << ",\"value_layout\":\"dimension_major\"}";
+  const kv::Format kvFormat = cacheIdentity.kvLayout.format;
 
   std::ostringstream out;
   out << std::setprecision(10) << '{' << "\"schema_version\":" << protocol::kStatusSchemaVersion << ','
@@ -106,33 +71,34 @@ std::string runtimeStatusJson(
       << resourceWait.memory + resourceWait.concurrency
       << ",\"waiting_memory\":" << resourceWait.memory
       << ",\"waiting_concurrency\":" << resourceWait.concurrency
+      << ",\"held_behind_refusal\":" << resourceWait.heldBehindRefusal
+      << ",\"restoring\":" << resourceWait.restoring
       << ",\"suspended\":" << resourceWait.suspended
       << ",\"draining\":" << boolean(resourceWait.draining)
       << ",\"oldest_wait_ms\":" << resourceWait.oldestWaitMilliseconds << "}"
+      << ",\"loop\":{\"max_tick_ms\":" << loop.maxTickMilliseconds << "}"
       << ",\"identity\":{\"cache\":{"
       << "\"loaded_model_layout_sha256\":"
       << json::quote(cacheIdentity.modelLayoutSha256)
-      << ",\"runtime_cache_namespace\":"
-      << json::quote(cacheIdentity.namespaceSha256)
       << ",\"build_id\":" << json::quote(cacheIdentity.buildId)
-      << ",\"dtype\":" << json::quote(kv::storageFormatName(cacheIdentity.kvLayout.format()))
+      << ",\"dtype\":" << json::quote(kv::storageFormatName(kvFormat))
       << ",\"block_tokens\":" << kv::kPageTokens
-      << "},\"kv\":" << kvIdentity.str();
-  // Additive status evolution: retain the previous INT8 identity field.
-  if (cacheIdentity.kvLayout.format() == kv::Format::Int8)
-    out << ",\"q8\":" << kvIdentity.str();
-  out << "},"
+      << "},\"kv\":{\"target_model_sha256\":"
+      << json::quote(cacheIdentity.targetModelSha256)
+      << ",\"format\":" << json::quote(kv::formatName(kvFormat))
+      << ",\"quantization\":"
+      << json::quote(kvFormat == kv::Format::Int8 ? "symmetric_int8" : "none")
+      << ",\"scale_type\":" << json::quote(kvFormat == kv::Format::Int8 ? "float32" : "none")
+      << ",\"key_layout\":\"token_major\""
+      << ",\"value_layout\":\"dimension_major\"}},"
       << "\"memory_plan\":" << plan.toStatusJson()
-      << ",\"memory_actual\":{\"dense_bytes\":" << metalMemory.allocatedBytes
-      << ",\"sparse_virtual_bytes\":" << metalMemory.sparseVirtualBytes
-      << ",\"sparse_resident_bytes\":" << metalMemory.sparseResidentBytes
+      << ",\"memory_actual\":{\"allocated_bytes\":" << metalMemory.allocatedBytes
       << ",\"current_bytes\":" << currentBytes
       << ",\"peak_bytes\":" << peakBytes << "}"
       << ",\"memory_governor\":{\"limit_bytes\":" << memoryGovernor.limitBytes
-      << ",\"observed_resident_bytes\":" << memoryGovernor.observedResidentBytes
-      << ",\"reserved_bytes\":" << memoryGovernor.reservedBytes
+      << ",\"charged_bytes\":" << memoryGovernor.chargedBytes
       << ",\"headroom_bytes\":" << memoryGovernor.headroomBytes
-      << ",\"growth_allowed\":" << boolean(memoryGovernor.growthAllowed)
+      << ",\"growth_allowed\":" << boolean(memoryGovernor.hostGrowthAllowed)
       << ",\"denied_reservations\":" << memoryGovernor.deniedReservations
       << ",\"system_pressure\":"
       << json::quote(memoryPressureName(memoryGovernor.systemPressure))
@@ -143,43 +109,34 @@ std::string runtimeStatusJson(
       << ",\"host_headroom_bytes\":" << memoryGovernor.hostHeadroomBytes << "}"
       << ",\"memory_audit\":" << memoryAudit.toStatusJson()
       << ",\"kv\":{\"block_tokens\":" << kv::kPageTokens
-      << ",\"blocks\":" << resources.kvCache.blocks
-      << ",\"cache_bytes\":" << resources.kvCache.bytes
-      << ",\"pages_total\":" << pool.pagesTotal
+      << ",\"pages_allocated\":" << pool.pagesAllocated
       << ",\"pages_active\":" << pool.pagesActive
       << ",\"pages_cache\":" << pool.pagesPrefix
       << ",\"pages_free\":" << pool.pagesFree
-      << ",\"pages_free_resident\":" << pool.pagesFreeResident
-      << ",\"pages_resident\":" << pool.pagesResident
-      << ",\"resident_backing_bytes\":" << pool.residentBackingBytes
-      << ",\"reclaimable_backing_bytes\":" << pool.reclaimableBackingBytes
-      << ",\"sparse_tile_bytes\":" << metalMemory.sparseTileBytes
-      << ",\"pending_unmaps\":" << metalMemory.pendingSparseUnmaps
-      << ",\"pending_unmap_ms\":"
-      << metalMemory.pendingSparseUnmapSeconds * 1000.0
-      << ",\"unmaps_completed\":" << metalMemory.completedSparseUnmaps
-      << ",\"unmap_last_ms\":" << metalMemory.lastSparseUnmapSeconds * 1000.0
-      << ",\"unmap_max_ms\":" << metalMemory.maxSparseUnmapSeconds * 1000.0
-      << ",\"map_wait_event\":" << metalMemory.sparseMapWaitEvent
-      << ",\"pending_map_wait_ms\":" << metalMemory.pendingSparseMapWaitSeconds * 1000.0
-      << ",\"map_wait_last_ms\":" << metalMemory.lastSparseMapWaitSeconds * 1000.0
-      << ",\"map_wait_max_ms\":" << metalMemory.maxSparseMapWaitSeconds * 1000.0
+      << ",\"allocated_bytes\":" << pool.allocatedBytes
+      << ",\"reclaimable_bytes\":" << pool.reclaimableBytes
+      << ",\"extent_allocations\":" << pool.extentAllocations
+      << ",\"extent_releases\":" << pool.extentReleases
+      << ",\"extent_allocate_max_ms\":" << pool.extentAllocateMaxMilliseconds
+      << ",\"extent_release_max_ms\":" << pool.extentReleaseMaxMilliseconds
+      << ",\"extent_compactions\":" << pool.extentCompactions
+      << ",\"pages_moved\":" << pool.pagesMoved
+      << ",\"extent_compact_max_ms\":" << resources.extentCompactMaxMilliseconds
       << "}"
       << ",\"state\":{\"entries\":" << state.entries
-      << ",\"pinned\":" << state.pinned << ",\"bytes\":" << state.bytes
-      << ",\"resident_bytes\":" << executorTelemetry.stateResidentBytes
-      << ",\"active_cells\":" << resources.activeRequests
-      << ",\"warm_idle_cells\":" << executorTelemetry.warmIdleStateCells
-      << ",\"cell_ceiling\":" << model::ExecutionLimits::maximumBatchWidth
-      << ",\"hits\":" << state.hits << ",\"misses\":" << state.misses
+      << ",\"pinned\":" << state.pinned << ",\"in_use\":" << state.inUse
+      << ",\"in_use_evictions\":" << state.inUseEvictions << ",\"bytes\":" << state.bytes
+      << ",\"allocated_bytes\":" << executorTelemetry.stateAllocatedBytes
+      << ",\"active_lanes\":" << resources.activeRequests
+      << ",\"idle_gdn_cells\":" << executorTelemetry.idleGdnCells
+      << ",\"idle_draft_rings\":" << executorTelemetry.idleDraftRings
       << ",\"publications\":" << state.publications
-      << ",\"deduplicated_publications\":" << state.deduplicatedPublications
       << ",\"evictions\":" << state.evictions
       << ",\"checkpoint_entries\":" << state.checkpointEntries
       << ",\"checkpoint_bytes\":" << state.checkpointBytes
       << ",\"checkpoint_evictions\":" << state.checkpointEvictions
       << ",\"checkpoint_retirements\":" << state.checkpointRetirements
-      << ",\"disk_hits\":" << state.diskHits
+      << ",\"disk_hits\":" << lookup.stateDiskHits
       << ",\"disk_promotions\":" << state.promotions
       << ",\"disk_promotions_skipped\":" << state.promotionsSkipped
       << ",\"disk_bytes\":" << state.diskBytes
@@ -189,6 +146,7 @@ std::string runtimeStatusJson(
       << "}"
       << ",\"disk\":{\"capacity_bytes\":" << resources.kvTier.capacityBytes
       << ",\"used_bytes\":" << resources.kvTier.usedBytes
+      << ",\"file_bytes\":" << resources.kvTier.fileBytes
       << ",\"read_bytes\":" << resources.kvTier.readBytes
       << ",\"written_bytes\":" << resources.kvTier.writtenBytes
       << ",\"kv_blocks\":" << resources.kvTier.diskBlocks
@@ -199,13 +157,23 @@ std::string runtimeStatusJson(
       << ",\"kv_restores\":" << resources.kvTier.restores
       << ",\"kv_restore_failures\":" << resources.kvTier.restoreFailures
       << ",\"kv_pending_pages\":" << resources.kvTier.pendingPages
+      << ",\"persistent\":" << boolean(resources.persistent)
+      << ",\"kv_copies\":" << resources.kvTier.copies
+      << ",\"kv_copy_failures\":" << resources.kvTier.copyFailures
+      << ",\"taken_back\":{\"states\":" << resources.adoption.states
+      << ",\"kv_blocks\":" << resources.adoption.blocks
+      << ",\"bytes\":" << resources.adoption.bytes
+      << ",\"left_behind\":" << resources.adoption.dropped << "}"
+      << ",\"write_behind\":{\"waiting\":" << core.writeBehind.waiting
+      << ",\"durable\":" << core.writeBehind.durable
+      << ",\"unneeded\":" << core.writeBehind.unneeded
+      << ",\"refused\":" << core.writeBehind.refused << "}"
       << "}"
-      << ",\"cache\":{\"lookups\":" << lookup.lookups
+      << ",\"cache\":{\"probe_hashed_blocks\":" << lookup.probeHashedBlocks
       << ",\"hits\":" << core.cacheHits
       << ",\"cold_misses\":" << core.coldMisses << ",\"hit_rate\":" << hitRate
       << ",\"kv_hit_tokens\":" << lookup.kvHitTokens
       << ",\"kv_disk_hit_tokens\":" << resources.kvTier.restores * kv::kPageTokens
-      << ",\"state_hit_tokens\":" << lookup.stateHitTokens
       << ",\"lost_state_misses\":" << lookup.lostStateMisses
       << ",\"reused_tokens\":" << core.reusedTokens
       << ",\"replay_state_publications\":" << core.replayStatePublications
@@ -224,6 +192,7 @@ std::string runtimeStatusJson(
       << ",\"checkpoint_publication_failures\":"
       << core.checkpointPublicationFailures
       << ",\"resource_suspensions\":" << core.resourceSuspensions
+      << ",\"priority_suspensions\":" << core.prioritySuspensions
       << ",\"resource_resumptions\":" << core.resourceResumptions
       << ",\"resource_replay_tokens\":" << core.resourceReplayTokens << "}"
       << ",\"draft_context\":{\"target_prefill_rows\":"
@@ -261,6 +230,10 @@ std::string runtimeStatusJson(
       << executorTelemetry.totalConstrainedMaskWaitSeconds * 1000.0 << "}"
       << ",\"images\":{\"encodes\":" << executorTelemetry.imageEncodes
       << ",\"embedding_reuses\":" << executorTelemetry.imageEmbeddingReuses
+      << ",\"arena_bytes\":" << executorTelemetry.visionArenaBytes
+      << ",\"cached_bytes\":" << executorTelemetry.embeddingCacheBytes
+      << ",\"state_held_bytes\":" << executorTelemetry.stateHeldImageBytes
+      << ",\"rows_bytes\":" << executorTelemetry.imageRowsBytes
       << "}"
       << ",\"scheduler\":{\"queued\":" << scheduler.queued
       << ",\"waiting_resources\":" << scheduler.waitingResources
@@ -276,9 +249,7 @@ std::string runtimeStatusJson(
       << scheduler.decodeBatchesByWidth[0]
       << ",\"b2\":" << scheduler.decodeBatchesByWidth[1]
       << ",\"b3\":" << scheduler.decodeBatchesByWidth[2]
-      << ",\"b4\":" << scheduler.decodeBatchesByWidth[3] << "}"
-      << ",\"decode_mixed_greedy_sampling_batches\":"
-      << scheduler.decodeMixedGreedySamplingBatches << "}"
+      << ",\"b4\":" << scheduler.decodeBatchesByWidth[3] << "}}"
       << ",\"requests\":{\"submitted\":" << core.submitted
       << ",\"completed\":" << core.completed
       << ",\"cancelled\":" << core.cancelled << ",\"failed\":" << core.failed
@@ -294,6 +265,7 @@ std::string runtimeStatusJson(
       << ",\"prefill_tokens_per_second\":" << metrics.prefillTokensPerSecond
       << ",\"decode_output_tokens\":" << metrics.decodeOutputTokens
       << ",\"decode_wall_ms\":" << metrics.decodeWallMilliseconds
+      << ",\"decode_cycle_ms\":" << metrics.decodeCycleMilliseconds
       << ",\"decode_tokens_per_second\":" << metrics.decodeTokensPerSecond
       << ",\"drafted_tokens\":" << metrics.draftedTokens
       << ",\"accepted_draft_tokens\":" << metrics.acceptedDraftTokens
@@ -312,7 +284,6 @@ std::string runtimeStatusJson(
       {"decode_b2", warmup.decodeBatches[1]},
       {"decode_b3", warmup.decodeBatches[2]},
       {"decode_b4", warmup.decodeBatches[3]},
-      {"draft_verify_commit", warmup.draftVerifyCommit},
       {"composite_state_restore", warmup.compositeStateRestore},
   };
   out << "},\"warmup\":{";
@@ -330,11 +301,7 @@ std::string runtimeStatusJson(
     out << json::quote(name);
     separator = true;
   }
-  out << "],\"memory_budget_validated\":"
-      << boolean(warmup.memoryBudgetValidated)
-      << ",\"actual_peak_bytes\":" << warmup.actualPeakBytes
-      << ",\"detail\":" << json::quote(warmup.maximumPrefillDetail)
-      << ",\"error\":" << json::quote(warmup.error) << "}"
+  out << "],\"detail\":" << json::quote(warmup.maximumPrefillDetail) << "}"
       << ",\"metal\":{\"healthy\":" << boolean(metalHealthy)
       << ",\"failure_reason\":" << json::quote(metalFailureReason) << "}}";
   return out.str();

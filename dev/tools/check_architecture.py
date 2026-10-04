@@ -12,17 +12,22 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE_SUFFIXES = {".c", ".cc", ".cpp", ".h", ".hpp", ".m", ".mm", ".metal"}
 INCLUDE = re.compile(r'^\s*#\s*(?:include|import)\s*(["<])([^">]+)[">]', re.MULTILINE)
+# Tile, split and kernel-configuration names runtime/ops owns: model/ and
+# engine/ size workspaces through the operators, never through these.
+OPERATOR_WORKSPACE_POLICY_NAMES: tuple[str, ...] = (
+    "prefillAttentionTiles",
+    "kVerifySplits",
+    "kPrefillAttentionTileRows",
+    "moeMaximumTiles",
+    "LinearTile",
+    "LinearConfig",
+    "LinearSimdgroups",
+    "MoeExpertTile",
+    "MoeExpertSimdgroups",
+    "MoeConfig",
+)
 OPERATOR_WORKSPACE_POLICY = re.compile(
-    r"\b(?:PrefillAttentionWave|prefillAttentionTiles|"
-    r"kQ8VerifySplits|kQ8PrefillAttentionTileRows|"
-    r"moeMaximumTiles|kMoePrefillTileRows|kMoeDecodeTileRows|"
-    r"Q4DecodeKind|Q4DecodeShape|Q4PrefillShape|kQ4PrefillTileRows|"
-    r"narrowAffineKind|narrowResidualKind|headKind|gdnInputGroups|"
-    r"attentionGroups|addPrefill128|LinearTile|LinearConfig|LinearSimdgroups|"
-    r"PrefillSplitMultiplier|PrefillAttentionConfig|VerifySplitCount|"
-    r"VerifyAttentionConfig|AttentionScalePlacement|MoeExpertTile|"
-    r"MoeExpertSimdgroups|MoeConfig|"
-    r"DraftAttentionConfiguration|selectorShards)\b"
+    r"\b(?:" + "|".join(OPERATOR_WORKSPACE_POLICY_NAMES) + r")\b"
 )
 
 
@@ -96,16 +101,54 @@ def check_server_dependencies() -> list[str]:
     return errors
 
 
-def check() -> list[str]:
-    errors = check_server_dependencies()
-    obsolete_roots = (
-        ROOT / "runtime" / "kernels",
-        ROOT / "runtime" / "src" / "metal",
+def check_package_imports() -> list[str]:
+    # The server and the installer each import their own modules one way,
+    # relatively, never by their package's name. The installer's script
+    # entry points name their package in a PEP 366 header, their one use of
+    # __package__.
+    header = ast.dump(
+        ast.parse('__name__ == "__main__" and not __package__', mode="eval").body
     )
-    for path in obsolete_roots:
-        if path.exists():
-            errors.append(f"obsolete production directory exists: {relative(path)}")
+    entry_points = {"install/launcher.py", "install/models.py", "install/catalog.py"}
+    errors = []
+    for package in ("server", "install"):
+        paths = sorted((ROOT / package).glob("*.py"))
+        own_names = {package, *(path.stem for path in paths)}
+        for path in paths:
+            name = relative(path)
+            tree = ast.parse(path.read_text())
+            allowed = set()
+            if name in entry_points:
+                allowed = {
+                    id(node)
+                    for statement in tree.body
+                    if isinstance(statement, ast.If)
+                    and ast.dump(statement.test) == header
+                    for node in ast.walk(statement)
+                }
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and not node.level:
+                    modules = [node.module]
+                elif isinstance(node, ast.Import):
+                    modules = [alias.name for alias in node.names]
+                else:
+                    modules = []
+                for module in modules:
+                    if module.split(".")[0] in own_names:
+                        errors.append(
+                            f"{name}: imports {module} without a relative import"
+                        )
+                if (
+                    isinstance(node, ast.Name)
+                    and node.id == "__package__"
+                    and id(node) not in allowed
+                ):
+                    errors.append(f"{name}: reads __package__")
+    return errors
 
+
+def check() -> list[str]:
+    errors = check_server_dependencies() + check_package_imports()
     forbidden_metal_dependencies = ("engine/", "model/", "ops/")
     forbidden_model_dependencies = ("engine/",)
     forbidden_operator_dependencies = ("engine/", "model/")
@@ -174,21 +217,40 @@ def check() -> list[str]:
                     )
             if concrete_model_symbols.search(text):
                 errors.append(f"{name}: startup names a concrete model type")
-        if (
-            name.startswith("runtime/engine/")
-            and name != "runtime/engine/Checked.hpp"
-            and re.search(r"^namespace splash\s*\{", text, re.MULTILINE)
+        if name.startswith("runtime/engine/") and re.search(
+            r"^namespace splash\s*\{", text, re.MULTILINE
         ):
             errors.append(f"{name}: engine declarations leak into root namespace")
         if client_names.search(text):
             errors.append(
                 f"{name}: production backend contains client-specific behavior"
             )
+        # Tests alone substitute what production holds constant.
+        if name != "runtime/TestConfig.hpp" and "testConfigStorage" in text:
+            errors.append(f"{name}: production writes the test configuration")
     return errors
 
 
+def stale_policy_names() -> list[str]:
+    """The guarded operator policy names no source under runtime/ops uses,
+    which the rule would keep guarding for nothing."""
+    operators = [
+        path.read_text(errors="replace")
+        for path in production_sources()
+        if relative(path).startswith("runtime/ops/")
+    ]
+    return [
+        name
+        for name in OPERATOR_WORKSPACE_POLICY_NAMES
+        if not any(re.search(rf"\b{name}\b", text) for text in operators)
+    ]
+
+
 def main() -> int:
-    errors = check()
+    errors = check() + [
+        f"rule guards vanished operator policy symbol {name}"
+        for name in stale_policy_names()
+    ]
     if errors:
         for error in errors:
             print(f"architecture error: {error}", file=sys.stderr)

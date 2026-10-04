@@ -1,6 +1,6 @@
 #pragma once
 
-// Plans the prepared images (model/GgufImageLayout.hpp) of a Qwen3.8 (qwen35)
+// Plans the images (model/GgufImageLayout.hpp) of a Qwen3.8 (qwen35)
 // or Qwen3.6 MoE (qwen35moe) target read straight from a llama.cpp GGUF, from
 // its metadata alone: section offsets, the header and descriptor bytes, and
 // the source rows each tensor section is written from
@@ -72,14 +72,15 @@ struct Fill {
   uint64_t offset = 0;
   std::vector<uint8_t> bytes;
 };
-// Rows written back to back as stored or, for F32 rows the kernels read as
-// bf16, as the bf16 values they equal exactly, or for BF16 rows the kernels
-// read as F32, as the F32 values they equal.
+// How a copy writes each value: as stored, narrowed from F32 to the bf16
+// value it equals exactly (rows the kernels read as bf16), or widened from
+// BF16 to the F32 value it equals (rows the kernels read as F32).
+enum class Conversion : uint8_t { None, NarrowToBfloat16, WidenToFloat32 };
+// Rows written back to back, each value converted as `conversion` says.
 struct Copy {
   uint64_t destination = 0;
   TensorRows source;
-  bool bfloat16 = false;
-  bool float32 = false;
+  Conversion conversion = Conversion::None;
 };
 // Quantized rows repacked into the planes of their format; the rows of the
 // sources in order, then zero rows up to `rows`.
@@ -92,6 +93,7 @@ struct Repack {
 };
 struct Image {
   std::string name; // layer-N.bin, head.bin, embedding.bin
+  std::string magic; // kGgufImageMagic
   uint32_t layer = 0;
   uint32_t type = 0;
   uint64_t bytes = 0;

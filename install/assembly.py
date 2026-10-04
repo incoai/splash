@@ -40,12 +40,7 @@ import shutil
 import tempfile
 from pathlib import Path
 
-if __package__:
-    from . import gguf, hub, models
-else:
-    import gguf
-    import hub
-    import models
+from . import gguf, hub, models
 
 GGUF_VISION = "vision/mmproj.gguf"
 TARGET_FORMATS = ("mlx-affine", "gguf")

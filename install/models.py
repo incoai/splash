@@ -24,16 +24,20 @@ import hashlib
 import json
 import os
 import re
+import signal
 import sys
 import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
-if __package__:
-    from . import paths
-else:
-    import paths
+if __name__ == "__main__" and not __package__:
+    # Run as a script by make, the launcher and `python install/models.py`:
+    # import siblings as the install package.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    __package__ = "install"
+
+from . import paths
 
 MODELS = paths.MODELS
 # The bound on one JSON metadata file.
@@ -315,13 +319,12 @@ def main(argv=None):
         print(selection.link)
         return 0
     # The installers import this module, so it imports them once it exists.
-    if __package__:
-        from . import assembly, legacy, upstream
-    else:
-        import assembly
-        import legacy
-        import upstream
+    from . import assembly, legacy, upstream
+
     try:
+        # The launcher starts this with the stop signals blocked, so that one
+        # sent while it starts is not lost; it arrives here.
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGINT, signal.SIGTERM))
         if args.command == "prepare":
             upstream.prepare(selection)
         else:
@@ -339,6 +342,8 @@ def main(argv=None):
     except (ModelError, OSError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
+    except KeyboardInterrupt:
+        return 130
     return 0
 
 
@@ -348,7 +353,5 @@ if __name__ == "__main__":
     # one main() reports.
     import importlib
 
-    installer = importlib.import_module(
-        f"{__package__}.models" if __package__ else "models"
-    )
+    installer = importlib.import_module("install.models")
     raise SystemExit(installer.main())

@@ -7,6 +7,7 @@ from tempfile import TemporaryDirectory
 from unittest import mock
 
 from dev.benchmarks import http_regression as benchmark
+from dev.benchmarks import weights
 from dev.tests import smoke_real as smoke
 
 
@@ -90,6 +91,15 @@ class HttpRegressionTests(unittest.TestCase):
                 with mock.patch.object(smoke.model_artifacts, "MODELS", models):
                     smoke.hold_package(arguments)
 
+            # The candidate's weight images are compared by its weight-digests.
+            with (
+                contextlib.redirect_stderr(io.StringIO()) as error,
+                self.assertRaises(SystemExit),
+            ):
+                parse(legacy)
+            self.assertIn("weight-digests", error.getvalue())
+            (root / weights.WEIGHT_DIGESTS).parent.mkdir()
+            (root / weights.WEIGHT_DIGESTS).touch()
             arguments = parse(legacy)
             self.assertEqual(arguments.package, models / legacy)
             hold(arguments)
@@ -112,6 +122,38 @@ class HttpRegressionTests(unittest.TestCase):
             with contextlib.redirect_stderr(error), self.assertRaises(SystemExit):
                 parse("community/not-installed")
             self.assertIn("missing installed model", error.getvalue())
+
+    def test_another_checkouts_assembly_is_held_by_its_installation(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            # This checkout installed nothing; another one built the assembly.
+            checkout = root / "checkout/install/models"
+            models = root / "other/install/models"
+            assembly = models / ".resolved/assembly"
+            assembly.mkdir(parents=True)
+            (assembly / "model.json").write_text("{}")
+            link = models / "owner/model"
+            link.parent.mkdir()
+            link.symlink_to(assembly, target_is_directory=True)
+            for package in (assembly, link):
+                with self.subTest(package=str(package.relative_to(models))):
+                    with mock.patch.object(smoke.model_artifacts, "MODELS", checkout):
+                        arguments = smoke.parse_args(
+                            [
+                                "--package",
+                                str(package),
+                                "--model",
+                                "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M",
+                            ]
+                        )
+                        smoke.hold_package(arguments)
+                    try:
+                        self.assertEqual(arguments.package, assembly)
+                        self.assertTrue(smoke.assembly.is_held(assembly))
+                    finally:
+                        arguments.held_record.close()
+            self.assertTrue((models / ".install.lock").exists())
+            self.assertFalse(checkout.exists())
 
     def row(self, version, sample=0, latency=10, round=None):
         return {
@@ -168,7 +210,7 @@ class HttpRegressionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no samples"):
             benchmark.summarize(rows[:3] + [{**rows[3], "round": 0}])
 
-    def test_layout_identity_is_compared_only_where_keys_must_agree(self):
+    def test_layout_identity_is_compared_within_each_build(self):
         def status(build, layout, kv="int8"):
             return {
                 "identity": {
@@ -178,22 +220,18 @@ class HttpRegressionTests(unittest.TestCase):
             }
 
         baseline = {"version": "baseline", **status("b", "layout-b")}
-        # Another preparation identity prepares under other keys.
-        benchmark.check_identity(
-            status("c", "layout-c"), "candidate", [baseline], False
-        )
-        for shared, current, version in (
-            (True, status("c", "layout-c"), "candidate"),
-            (False, status("b", "layout-c"), "baseline"),
-            (False, status("b2", "layout-b"), "baseline"),
-            (False, status("c", "layout-c", "bf16"), "candidate"),
+        # The builds' weights are compared by their bytes instead.
+        benchmark.check_identity(status("c", "layout-c"), "candidate", [baseline])
+        for current, version in (
+            (status("b", "layout-c"), "baseline"),
+            (status("b2", "layout-b"), "baseline"),
+            (status("c", "layout-c", "bf16"), "candidate"),
         ):
             with (
-                self.subTest(shared=shared, current=current, version=version),
+                self.subTest(current=current, version=version),
                 self.assertRaises(smoke.SmokeFailure),
             ):
-                benchmark.check_identity(current, version, [baseline], shared)
-        benchmark.check_identity(status("c", "layout-b"), "candidate", [baseline], True)
+                benchmark.check_identity(current, version, [baseline])
 
     def test_missing_duplicate_or_changed_transcript_fails(self):
         baseline, candidate = self.row("baseline"), self.row("candidate")
@@ -206,14 +244,141 @@ class HttpRegressionTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "transcript differs"):
                 benchmark.summarize([baseline, changed])
 
-    def test_decode_uses_native_decode_time_per_token(self):
+    def burst_rows(self, failures, ttft, decode):
+        """One burst per round in ABBA order: each version's replay-point
+        publication failures, and per round the next turn's time to first
+        token (no next turn when ttft is None) and the burst's decode time
+        per token."""
+        return [
+            {
+                "version": version,
+                "round": round,
+                "sample": round // 2,
+                "context": 16384,
+                "scenario": "burst",
+                "replay_state_publication_failures": failures[version],
+                "decode_ms_per_token": decode[round],
+                "maximum_context_tokens": 100000,
+                "follow_ups": []
+                if ttft is None
+                else [
+                    {"ttft_ms": ttft[round], "matched_tokens": 16352, "resumed": True}
+                ],
+            }
+            for round, version in enumerate(benchmark.ROUNDS)
+        ]
+
+    def test_a_burst_keeps_the_candidate_only_by_every_rule(self):
+        lost = {"baseline": 2, "candidate": 0}
+        sooner = (100, 80, 81, 102)
+        steady = (10, 10.1, 10.1, 10)
+        kept = benchmark.summarize_bursts(self.burst_rows(lost, sooner, steady))[0]
+        self.assertTrue(kept["keep"])
+        self.assertEqual(kept["baseline"]["failures_per_burst"], 2)
+        self.assertEqual(kept["candidate"]["resumed_follow_ups"], 2)
+        for name, failures, ttft, decode in (
+            ("nothing lost", {"baseline": 0, "candidate": 0}, sooner, steady),
+            ("still lost", {"baseline": 2, "candidate": 1}, sooner, steady),
+            ("not 15% sooner", lost, (100, 90, 90, 100), steady),
+            ("overlapping rounds", lost, (100, 60, 85, 80), steady),
+            ("decode slower", lost, sooner, (10, 10.5, 10.5, 10)),
+            ("decode inconclusive", lost, sooner, (10, 9, 10, 10)),
+            ("no follow-ups", lost, None, steady),
+        ):
+            with self.subTest(name):
+                summary = benchmark.summarize_bursts(
+                    self.burst_rows(failures, ttft, decode)
+                )[0]
+                self.assertFalse(summary["keep"])
+
+    def test_a_follow_up_needs_a_burst_of_two(self):
+        model = "incoai/Qwen3.8-27B-Splash"
+        for extra in (["--follow-up"], ["--burst", "1", "--follow-up"]):
+            with (
+                self.subTest(extra=extra),
+                contextlib.redirect_stderr(io.StringIO()) as error,
+                self.assertRaises(SystemExit),
+            ):
+                benchmark.parse_args(
+                    ["--model", model, "--baseline-binary", "baseline", *extra]
+                )
+            self.assertIn("--burst needs two or more", error.getvalue())
+
+    def test_decode_uses_native_decode_cycle_per_token(self):
         rows = self.abba_rows((10, 10, 10, 10))
         for row in rows:
             row["scenario"] = "decode"
-            row["native_delta"] = {"decode_wall_ms": 100, "decode_output_tokens": 50}
+            row["native_delta"] = {
+                "decode_wall_ms": 80,
+                "decode_cycle_ms": 100,
+                "decode_output_tokens": 50,
+            }
         summary = benchmark.summarize(rows)[0]
-        self.assertEqual(summary["metric"], "decode_ms_per_token")
+        self.assertEqual(summary["metric"], "decode_cycle_ms_per_token")
         self.assertEqual(summary["baseline_median"], 2)
+
+    def test_baseline_without_decode_cycles_judges_both_by_wall(self):
+        # A baseline built before metrics.decode_cycle_ms reports only the
+        # command wall, which then judges both versions.
+        idle = {
+            "scheduler": dict.fromkeys(
+                (
+                    "queued",
+                    "waiting_resources",
+                    "prefilling",
+                    "decoding",
+                    "waiting_mask",
+                ),
+                0,
+            ),
+            "state": {"active_lanes": 0},
+            "kv": {"pages_active": 0},
+        }
+        response = {
+            "metrics": {"cache": {"matched_tokens": 0}, "prefill": {"tokens": 128}},
+            "usage": {"prompt_tokens": 128, "completion_tokens": 64},
+            "choices": [{"message": {"role": "assistant", "content": "1"}}],
+        }
+
+        def measure(metrics):
+            replies = [
+                (200, {**idle, "metrics": dict.fromkeys(metrics, 0)}),
+                (200, response),
+                (200, {**idle, "metrics": metrics}),
+            ]
+            with (
+                mock.patch.object(smoke, "request", side_effect=replies),
+                mock.patch.object(smoke, "validate_status"),
+            ):
+                return benchmark.measure(
+                    mock.Mock(port=0), "model", "prompt", 64, "decode", 128, 60
+                )
+
+        wall = {
+            "prefill_wall_ms": 4,
+            "decode_wall_ms": 96,
+            "prefill_input_tokens": 128,
+            "decode_output_tokens": 64,
+            "drafted_tokens": 70,
+            "accepted_draft_tokens": 50,
+        }
+        measured = {
+            "baseline": measure(wall),
+            "candidate": measure({**wall, "decode_cycle_ms": 128}),
+        }
+        self.assertEqual(measured["baseline"]["native_delta"], wall)
+        self.assertEqual(measured["candidate"]["native_delta"]["decode_cycle_ms"], 128)
+        rows = [
+            {**measured[version], "version": version, "round": round, "sample": sample}
+            for round, (version, sample) in enumerate(
+                zip(benchmark.ROUNDS, (0, 0, 1, 1))
+            )
+        ]
+        summary = benchmark.summarize(rows)[0]
+        self.assertEqual(summary["metric"], "decode_wall_ms_per_token")
+        self.assertEqual(
+            (summary["baseline_median"], summary["candidate_median"]), (1.5, 1.5)
+        )
 
 
 if __name__ == "__main__":

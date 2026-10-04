@@ -56,6 +56,8 @@ jobs:
           cache-dependency-path: |
             install/requirements.txt
             dev/requirements.txt
+      - name: Install fish for the completion tests
+        run: HOMEBREW_NO_AUTO_UPDATE=1 brew install fish
       - name: Run current runtime Python, model-manifest, and source checks
         run: |
           make check-python-engine PYTHON_CANDIDATES=python3

@@ -2,6 +2,8 @@
 
 #include "tuning/LinearNumerics.hpp"
 
+#include "metal/abi/ExecutionGeometry.h"
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -16,8 +18,8 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 // ReferenceGate/ReferenceUp hold the exact gate and up projections a split-K
-// gate/up plan is held to; they exist only when the candidates mix split-K
-// and sequential tiles for a gate/up workload.
+// gate/up plan is held to; they exist only when a gate/up workload has a
+// candidate that is not bitwise comparable with its baseline.
 enum Field : size_t {
   Input, Output, Sums, Residual, GateScratch, DownSums,
   ReferenceOutput, ReferenceDownSums, ReferenceGate, ReferenceUp,
@@ -28,6 +30,17 @@ struct Layout final {
   std::array<Region, FieldCount> fields{};
   uint64_t bytes = 0;
 };
+
+// Plans of one K partition outside the Simdgroup tile store
+// bitwise-identical outputs for a workload. Any other pair may round
+// differently even with as many K splits on both sides, so it is held to the
+// derived bound.
+bool sequential(const LinearPlan &plan) {
+  return plan.configuration().splits == 1 && !plan.usesSimdgroup();
+}
+bool bitwiseComparable(const LinearPlan &baseline, const LinearPlan &candidate) {
+  return sequential(baseline) && sequential(candidate);
+}
 
 uint64_t align(uint64_t value, uint64_t alignment) {
   if (value > std::numeric_limits<uint64_t>::max() - (alignment - 1))
@@ -59,10 +72,9 @@ Layout layout(const DeviceCapabilities &device,
         std::max(result.fields[DownSums].bytes, plan.downSumsBytes());
   }
   result.fields[ReferenceDownSums].bytes = result.fields[DownSums].bytes;
-  bool mixed = false;
-  for (const auto &plan : plans)
-    mixed |= plan.partialSums() != plans.front().partialSums() ||
-        plan.usesSimdgroup() || plans.front().usesSimdgroup();
+  const bool mixed = std::any_of(plans.begin() + 1, plans.end(), [&](const LinearPlan &plan) {
+    return !bitwiseComparable(plans.front(), plan);
+  });
   if (mixed && workload.epilogue == LinearEpilogue::GateUp)
     result.fields[ReferenceGate].bytes = result.fields[ReferenceUp].bytes =
         result.fields[Output].bytes;
@@ -103,14 +115,17 @@ void poisonFloat(metal::MetalBuffer buffer) {
   auto *values = static_cast<float *>(buffer.contents());
   std::fill_n(values, buffer.sizeBytes() / 4, std::numeric_limits<float>::quiet_NaN());
 }
-// A split-K plan and a sequential plan are not bitwise comparable, so every
-// output element is held to the derived bound instead (LinearNumerics.hpp),
-// with the sequential plan's output as the reference whichever side it is.
+// Two plans that are not bitwise comparable hold every output element to the
+// derived bound instead (LinearNumerics.hpp), with the sequential plan's
+// output as the reference whichever side it is. Two split plans each
+// reassociate the sum: `associations` counts the sides whose fp32 slack the
+// bound covers.
 void requireWithinSplitTolerance(LinearWorkload workload, const metal::MetalBuffer &exact,
                                  const metal::MetalBuffer &split,
                                  const metal::MetalBuffer &residual,
                                  const metal::MetalBuffer &gate,
-                                 const metal::MetalBuffer &up, float operandSlack = 0) {
+                                 const metal::MetalBuffer &up, uint32_t associations,
+                                 float operandSlack) {
   const auto values = [](const metal::MetalBuffer &buffer) {
     return buffer ? static_cast<const uint16_t *>(buffer.contents()) : nullptr;
   };
@@ -123,7 +138,7 @@ void requireWithinSplitTolerance(LinearWorkload workload, const metal::MetalBuff
   float maxAbs = 0;
   for (uint64_t i = 0; i < elements; ++i)
     maxAbs = std::max(maxAbs, std::fabs(bf16ToFloat(exactValues[i])));
-  const float slack = reassociationSlack(workload.matrix.inputSize, maxAbs) + operandSlack;
+  const float slack = float(associations) * reassociationSlack(workload.matrix.inputSize, maxAbs) + operandSlack;
   for (uint64_t i = 0; i < elements; ++i) {
     SplitReference reference{bf16ToFloat(exactValues[i])};
     if (residualValues) reference.residual = bf16ToFloat(residualValues[i]);
@@ -151,9 +166,41 @@ void requireFinite(metal::MetalBuffer buffer, bool floats) {
 
 } // namespace
 
+std::vector<LinearPlan> linearCandidates(const DeviceCapabilities &device,
+                                         LinearWorkload w) {
+  if (w.weightLayout != WeightLayout::Affine64)
+    throw std::invalid_argument("Linear tuning takes affine workloads");
+  std::vector<LinearPlan> result{Linear(device).plan(w)};
+  const auto append = [&](LinearConfig config) {
+    if (std::none_of(result.begin(), result.end(), [&](const LinearPlan &plan) {
+          return plan.configuration() == config;
+        }))
+      result.push_back(Linear::plan(w, config, ops::FloatOutput::BFloat16));
+  };
+  const uint32_t columns = w.matrix.outputSize;
+  if (w.phase == LinearPhase::Prefill) {
+    // The fused up projection has no eight-simdgroup N128 kernel.
+    if (w.epilogue != LinearEpilogue::UpWithGate) append({LinearTile::N128, 0});
+    append({LinearTile::N128, 0, LinearSimdgroups::Four});
+    append({LinearTile::N256, 0});
+    return result;
+  }
+  // Gate/up runs N256 and residual N128 among the unsplit tiles.
+  if (w.epilogue != LinearEpilogue::GateUp) append({LinearTile::N128, columns / 128});
+  if (w.epilogue != LinearEpilogue::Residual) append({LinearTile::N256, columns / 256});
+  // Split128 partitions K in whole 256-input blocks.
+  if (device.appleGpuFamily >= 10)
+    for (uint32_t splits = 2;
+         splits <= LinearConfig::kMaximumSplits && splits <= w.matrix.inputSize / 256; splits *= 2)
+      append({LinearTile::Split128, 0, LinearSimdgroups::Eight, splits});
+  if (w.rows == SPLASH_TARGET_VERIFY_ROWS && w.epilogue == LinearEpilogue::None)
+    append({LinearTile::Paired256, columns / 256, LinearSimdgroups::Four});
+  return result;
+}
+
 uint64_t linearTuningFixtureBytes(const DeviceCapabilities &device,
                                   LinearWorkload workload) {
-  return layout(device, Linear(device).candidates(workload)).bytes;
+  return layout(device, linearCandidates(device, workload)).bytes;
 }
 
 LinearTuningResult tuneLinear(metal::MetalBackend &backend,
@@ -164,21 +211,17 @@ LinearTuningResult tuneLinear(metal::MetalBackend &backend,
                               const MeasurementStop &shouldStop) {
   const auto start = Clock::now();
   LinearTuningResult result;
-  result.choice.workload = input.workload;
   auto elapsed = [&] {
     return std::chrono::duration<double>(Clock::now() - start).count();
   };
   try {
     Linear linear(backend.capabilities());
-    const auto plans = linear.candidates(input.workload);
-    result.choice.configuration = plans.front().configuration();
+    const auto plans = linearCandidates(backend.capabilities(), input.workload);
+    result.configuration = plans.front().configuration();
     if (!validMeasurementOptions(options) || !admit)
       throw std::invalid_argument("invalid Linear tuning measurement options or admission");
     if (input.weights.empty() || input.weights.size() > kMaximumLinearTuningRepresentatives)
       throw std::invalid_argument("Linear tuning requires 1..8 representative weight views");
-    // Block-quantized plans are not tuned: their only candidate is the baseline.
-    if (input.workload.weightLayout != WeightLayout::Affine64)
-      throw std::invalid_argument("Linear tuning takes affine workloads");
     result.representativeCount = static_cast<uint32_t>(input.weights.size());
     for (const auto &weights : input.weights) {
       requireAffineProjection(weights.projection, input.workload.matrix);
@@ -260,7 +303,7 @@ LinearTuningResult tuneLinear(metal::MetalBackend &backend,
     const std::optional<LinearPlan> exactPlain = fields[ReferenceGate]
         ? std::optional{Linear::plan(
               {workload.matrix, workload.rows, LinearPhase::Decode, LinearEpilogue::None},
-              {LinearTile::N128, workload.matrix.outputSize / 128})}
+              {LinearTile::N128, workload.matrix.outputSize / 128}, ops::FloatOutput::BFloat16)}
         : std::nullopt;
     float operandSlack = 0;
     auto referenceGateUp = [&](uint32_t representative) {
@@ -281,19 +324,19 @@ LinearTuningResult tuneLinear(metal::MetalBackend &backend,
     auto qualify = [&](size_t candidate, bool baseline) {
       requireFinite(buffers.output, false);
       requireFinite(buffers.downSums, true);
-      const bool mixed = plans[candidate].partialSums() != plans[0].partialSums() ||
-          plans[candidate].usesSimdgroup() || plans[0].usesSimdgroup();
+      const bool bitwise = bitwiseComparable(plans[0], plans[candidate]);
       for (const auto pair : {std::pair{Output, ReferenceOutput},
                               std::pair{DownSums, ReferenceDownSums}}) {
         const auto &actual = fields[pair.first];
         const auto &reference = fields[pair.second];
         if (!actual) continue;
         if (baseline) std::memcpy(reference.contents(), actual.contents(), actual.sizeBytes());
-        else if (mixed && pair.first == Output) {
-          const bool baselineExact = plans[0].partialSums() == 1 && !plans[0].usesSimdgroup();
+        else if (!bitwise && pair.first == Output) {
+          const bool baselineExact = sequential(plans[0]);
           requireWithinSplitTolerance(workload, baselineExact ? reference : actual,
                                       baselineExact ? actual : reference, buffers.residual,
-                                      fields[ReferenceGate], fields[ReferenceUp], operandSlack);
+                                      fields[ReferenceGate], fields[ReferenceUp],
+                                      baselineExact || sequential(plans[candidate]) ? 1 : 2, operandSlack);
         } else if (std::memcmp(reference.contents(), actual.contents(), actual.sizeBytes()))
           throw std::runtime_error("Linear tuning candidate output differs from baseline");
       }
@@ -334,13 +377,12 @@ LinearTuningResult tuneLinear(metal::MetalBackend &backend,
     }
 
     result.measurements.reserve(plans.size() - 1);
-    constexpr WorkloadId workloadId{0};
     for (size_t i = 1; i < plans.size(); ++i) {
       if (!control()) return result;
       auto remaining = options;
       remaining.maximumWallSeconds = options.maximumWallSeconds - elapsed();
       result.measurements.push_back(measureWorkload(
-          CandidateId{uint32_t(i)}, workloadId,
+          CandidateId{uint32_t(i)},
           [&](CandidateId candidate) { return run(candidate, 0, result.repetitions); },
           remaining, shouldStop));
       const auto &measurement = result.measurements.back();
@@ -351,26 +393,21 @@ LinearTuningResult tuneLinear(metal::MetalBackend &backend,
       }
     }
     if (!control()) return result;
-    std::vector<WorkloadMeasurements> gpuWorkloads, wallWorkloads;
     std::vector<CandidateMeasurements> gpuCandidates, wallCandidates;
-    gpuWorkloads.reserve(result.measurements.size());
-    wallWorkloads.reserve(result.measurements.size());
     gpuCandidates.reserve(result.measurements.size());
     wallCandidates.reserve(result.measurements.size());
     for (const auto &measurement : result.measurements) {
       // Every record here finished the full sample count. Evaluate the metrics
       // independently, including a candidate rejected by the other metric;
       // otherwise filtering could disguise disagreement between their winners.
-      gpuWorkloads.push_back({workloadId, measurement.rawGpuSamples()});
-      wallWorkloads.push_back({workloadId, measurement.rawWallSamples()});
-      gpuCandidates.push_back({measurement.candidate, {&gpuWorkloads.back(), 1}});
-      wallCandidates.push_back({measurement.candidate, {&wallWorkloads.back(), 1}});
+      gpuCandidates.push_back({measurement.candidate, measurement.rawGpuSamples()});
+      wallCandidates.push_back({measurement.candidate, measurement.rawWallSamples()});
     }
-    const auto gpu = selectCandidate(gpuCandidates, {&workloadId, 1}, options.policy);
-    const auto wall = selectCandidate(wallCandidates, {&workloadId, 1}, options.policy);
+    const auto gpu = selectCandidate(gpuCandidates, options.policy);
+    const auto wall = selectCandidate(wallCandidates, options.policy);
     if (gpu.verdict == SelectionVerdict::Selected &&
         wall.verdict == SelectionVerdict::Selected && gpu.candidate == wall.candidate)
-      result.choice.configuration = plans.at(gpu.candidate.value).configuration();
+      result.configuration = plans.at(gpu.candidate.value).configuration();
     result.complete = true;
   } catch (...) {
     result.failure = std::current_exception();
