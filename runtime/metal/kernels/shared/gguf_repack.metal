@@ -1,4 +1,3 @@
-// Editing this file re-prepares every GGUF model.
 #pragma clang fp reassociate(off)
 #include "metal/abi/GgufRepack.h"
 #include <metal_stdlib>

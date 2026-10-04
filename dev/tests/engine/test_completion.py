@@ -29,6 +29,21 @@ def bash_paths():
     return tuple(dict.fromkeys(path for path in candidates if os.access(path, os.X_OK)))
 
 
+FISH = next(
+    (
+        path
+        for path in (
+            os.environ.get("SPLASH_TEST_FISH", ""),
+            shutil.which("fish") or "",
+            "/opt/homebrew/bin/fish",
+            "/usr/local/bin/fish",
+        )
+        if path and os.access(path, os.X_OK)
+    ),
+    None,
+)
+
+
 class CompletionTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="splash completion ")
@@ -177,6 +192,27 @@ class CompletionTests(unittest.TestCase):
         )
         self.assertEqual(result.stderr, b"")
         return result.stdout.decode().split("\0")[:-1]
+
+    def fish_complete(self, script, line, *paths):
+        """The candidates fish offers for line after running script, which
+        reads line as $argv[1] and paths from $argv[2]."""
+        result = subprocess.run(
+            [FISH, "--no-config", "-c", script, line, *map(str, paths)],
+            env={
+                **self.env,
+                "XDG_CONFIG_HOME": str(self.home / ".config"),
+                "XDG_DATA_HOME": str(self.home / ".local/share"),
+                "XDG_CACHE_HOME": str(self.home / ".cache"),
+            },
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        )
+        self.assertEqual(result.stderr, "")
+        return sorted(
+            candidate.split("\t")[0] for candidate in result.stdout.splitlines()
+        )
 
     def test_model_helper_source_and_release_are_offline(self):
         for release in (False, True):
@@ -513,6 +549,97 @@ class CompletionTests(unittest.TestCase):
                 autoload=True,
             ),
             f"splash serve --model={LOCAL[1]} ",
+        )
+
+    @unittest.skipUnless(FISH, "fish is not installed")
+    def test_actual_fish_completion(self):
+        _, directory = self.layout()
+        models = sorted((*OFFICIAL, *SUGGESTED, *LOCAL, *UPSTREAM))
+        cases = (
+            (
+                "splash ",
+                sorted(("serve", "claude", "codex", "opencode", "hermes", "pi")),
+            ),
+            ("splash co", ["codex"]),
+            ("splash serve --model ", models),
+            ("splash serve --model community/l", [LOCAL[1]]),
+            ("splash serve --model=community/l", [f"--model={LOCAL[1]}"]),
+            ("splash serve --model unsloth/Model-GGUF:UD", [GGUF[1]]),
+            (
+                "splash serve --model=unsloth/Model-GGUF:",
+                [f"--model={model}" for model in GGUF],
+            ),
+            ("splash serve --port 8001 --model community/l", [LOCAL[1]]),
+            ("splash serve -- --model ", []),
+            ("splash serve --max-context ", []),
+            # Neither model IDs as arguments nor option names, as in Bash.
+            ("splash serve ", []),
+            ("splash serve -", []),
+            # A command only as the first word, and serve's --model only
+            # after serve as the first word.
+            ("splash --version s", []),
+            ("splash opencode serve --model ", []),
+            *(
+                (f"splash {agent} --model ", [])
+                for agent in ("claude", "codex", "opencode", "hermes", "pi")
+            ),
+        )
+        for line, expected in cases:
+            with self.subTest(line=line):
+                self.assertEqual(
+                    self.fish_complete(
+                        "source $argv[2]; complete -C $argv[1]",
+                        line,
+                        directory / "splash.fish",
+                    ),
+                    expected,
+                )
+
+    @unittest.skipUnless(FISH, "fish is not installed")
+    def test_fish_loaded_completion_survives_release_upgrade(self):
+        old, _ = self.layout("old release", release=True)
+        new = self.root / "new release"
+        shutil.copytree(old, new)
+        link = self.root / "app current"
+        link.symlink_to(old, target_is_directory=True)
+        self.assertEqual(
+            self.fish_complete(
+                "source $argv[2]/install/completions/splash.fish; "
+                "/bin/rm $argv[2]; /bin/ln -s $argv[3] $argv[2]; /bin/rm -rf $argv[4]; "
+                "complete -C $argv[1]",
+                "splash serve --model community/l",
+                link,
+                new,
+                old,
+            ),
+            [LOCAL[1]],
+        )
+
+    @unittest.skipUnless(FISH, "fish is not installed")
+    def test_fish_autoload_through_global_symlink_survives_upgrade(self):
+        old, _ = self.layout("old keg", release=True)
+        new = self.root / "new keg"
+        shutil.copytree(old, new)
+        opt = self.root / "opt/splash"
+        opt.parent.mkdir()
+        opt.symlink_to(old, target_is_directory=True)
+        entry = self.root / "share/fish/vendor_completions.d/splash.fish"
+        entry.parent.mkdir(parents=True)
+        entry.symlink_to(opt / "install/completions/splash.fish")
+        # fish autoloads completions only for a command it finds: the blocked
+        # splash on PATH stands in for the launcher, which never runs.
+        self.assertEqual(
+            self.fish_complete(
+                "set -p fish_complete_path $argv[2]; complete -C $argv[1] >/dev/null; "
+                "/bin/rm $argv[3]; /bin/ln -s $argv[4] $argv[3]; /bin/rm -rf $argv[5]; "
+                "complete -C $argv[1]",
+                "splash serve --model=community/l",
+                entry.parent,
+                opt,
+                new,
+                old,
+            ),
+            [f"--model={LOCAL[1]}"],
         )
 
 

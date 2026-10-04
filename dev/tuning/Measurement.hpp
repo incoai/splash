@@ -1,13 +1,10 @@
 #pragma once
 
-#include "model/Model.hpp"
 #include "tuning/Tuning.hpp"
 
 #include <array>
 #include <exception>
 #include <functional>
-#include <stdexcept>
-#include <string>
 
 namespace splash::ops::tuning {
 
@@ -16,25 +13,6 @@ struct RunTiming final {
   double wallSeconds = 0;
   bool underPressure = false;
 };
-
-// A complete-graph comparison may choose different tokens, but each lane must
-// perform the same work before either timing is admitted as paired evidence.
-// The returned entries are GPU and phase-wall timing, respectively.
-[[nodiscard]] inline std::array<PairedTiming, 2> pairWarmupMeasurements(
-    const model::WarmupStepResult &baseline, double baselineGpuSeconds,
-    const model::WarmupStepResult &candidate, double candidateGpuSeconds,
-    MeasurementOrder order) {
-  if (!baseline.completed || !candidate.completed)
-    throw std::runtime_error("cannot confirm incomplete warmups");
-  if (baseline.lanes.empty() || baseline.lanes.size() != candidate.lanes.size())
-    throw std::runtime_error("cannot confirm warmups with missing or different lane counts");
-  for (size_t lane = 0; lane < baseline.lanes.size(); ++lane)
-    if (!baseline.lanes[lane].sameWorkAs(candidate.lanes[lane]))
-      throw std::runtime_error("cannot confirm different warmup work at lane " +
-                               std::to_string(lane + 1));
-  return {{{baselineGpuSeconds, candidateGpuSeconds, order, false},
-           {baseline.wallSeconds, candidate.wallSeconds, order, false}}};
-}
 
 // The caller executes the same warmed workload through its production encoder
 // for either ID. It owns input/state restoration and command completion. Each
@@ -101,7 +79,6 @@ struct MeasurementAccounting final {
 
 struct MeasurementResult final {
   CandidateId candidate;
-  WorkloadId workload;
   MeasurementStatus status = MeasurementStatus::InvalidInput;
   MeasurementAccounting warmup;
   MeasurementAccounting measurement;
@@ -130,11 +107,10 @@ struct MeasurementResult final {
 // and cancellation are checked between synchronous calls, never by interrupting
 // an active command. A callback must return before its deadline can be observed.
 // Both timing metrics must pass the existing noise/non-regression policy;
-// meaningful aggregate improvement remains selectCandidate's responsibility.
+// meaningful improvement remains selectCandidate's responsibility.
 // This function does not encode work, change execution policy or persist data.
 [[nodiscard]] MeasurementResult
-measureWorkload(CandidateId candidate, WorkloadId workload,
-                const MeasurementRun &run,
+measureWorkload(CandidateId candidate, const MeasurementRun &run,
                 const MeasurementOptions &options = {},
                 const MeasurementStop &shouldStop = {});
 

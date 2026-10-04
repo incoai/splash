@@ -7,7 +7,6 @@
 #include <functional>
 #include <limits>
 #include <optional>
-#include <span>
 #include <stdexcept>
 #include <type_traits>
 #include <vector>
@@ -41,52 +40,43 @@ TargetWeights readTarget(metal::MetalBackend &backend, const Qwen3_6MoeLayout &l
   return loadQwen3_6MoeWeights(backend, layout, files);
 }
 
-ModelPackage loadPackage(metal::MetalBackend &backend,
-                         const std::filesystem::path &root,
-                         ModelDescriptor descriptor, PreparationCheck admitConversion = {}) {
+template <class Image> uint64_t imageBytes(const std::vector<Image> &images) {
+  uint64_t total = 0;
+  for (const Image &image : images) total += image.bytes;
+  return total;
+}
+
+} // namespace
+
+ModelPackage loadModelPackage(metal::MetalBackend &backend,
+                              const std::filesystem::path &root,
+                              const ModelDescriptor &descriptor) {
   ModelPackage result;
-  result.descriptor = std::move(descriptor);
+  result.descriptor = descriptor;
   if (!result.descriptor.valid())
     throw std::invalid_argument("model descriptor is invalid");
-  const PreparationCheck check = [&backend] { backend.checkOperation(); };
-  // Every prepared file of the model, the vision tower's, the draft's and the
-  // target's, is planned before the first is written, so one disk check
-  // budgets them all.
-  const auto vision = planVisionLoader(backend, root, result.descriptor, admitConversion);
-  std::vector<PreparedWeight> prepared;
-  if (vision) prepared.push_back(vision->weight());
+  result.images = std::make_shared<WeightImages>(backend, result.descriptor.sourceIdentity);
+  WeightImages &images = *result.images;
+  // Every source's metadata is checked before the first image is written:
+  // the vision tower's and the draft's here, the target's by its loader.
+  const auto vision = planVisionLoader(root, result.descriptor);
   std::optional<DraftCheckpointLoader> draft;
-  if (result.descriptor.draftSource == DraftSource::Checkpoint) {
-    draft.emplace(backend, root / "draft", result.descriptor.draft, admitConversion);
-    prepared.insert(prepared.end(), draft->weights().begin(), draft->weights().end());
-  }
+  if (result.descriptor.draftFromCheckpoint())
+    draft.emplace(images, root / "draft", result.descriptor.draft);
   result.target = std::visit(
       [&](const auto &layout) -> TargetWeights {
         using Layout = std::remove_cvref_t<decltype(layout)>;
         const std::filesystem::path directory = root / "target";
-        // Every missing file is written before the first is mapped: conversion
-        // needs normal memory pressure, which the residency of the files
-        // mapped before it would take away on a Mac with little memory.
-        const auto read = [&](const QwenTargetFiles<Layout> &files,
-                              std::span<const PreparedWeight> target, const auto &prepareTarget) {
-          prepared.insert(prepared.end(), target.begin(), target.end());
-          if (!prepared.empty()) PreparedWeights().requireSpace(prepared, check);
-          if (vision) static_cast<void>(vision->prepare());
-          if (draft) draft->prepare();
-          prepareTarget();
-          return readTarget(backend, layout, files);
-        };
         switch (result.descriptor.targetSource) {
         case TargetSource::Packed:
-          return read(PackedTargetFiles<Layout>{backend, directory, layout}, {}, [] {});
+          return readTarget(backend, layout, PackedTargetFiles<Layout>{images, directory, layout});
         case TargetSource::Mlx: {
-          AffineTargetLoader loader(backend, directory, layout, admitConversion);
-          return read(loader, loader.weights(), [&] { loader.prepare(); });
+          AffineTargetLoader loader(images, directory, layout);
+          return readTarget(backend, layout, std::ref(loader));
         }
         case TargetSource::Gguf: {
-          GgufTargetLoader loader(backend, findTargetGguf(directory), ggufTargetGeometry(layout),
-                                  admitConversion);
-          return read(loader, loader.weights(), [&] { loader.prepare(); });
+          GgufTargetLoader loader(backend, images, findTargetGguf(directory), ggufTargetGeometry(layout));
+          return readTarget(backend, layout, std::ref(loader));
         }
         }
         throw std::invalid_argument("unknown target source");
@@ -95,9 +85,9 @@ ModelPackage loadPackage(metal::MetalBackend &backend,
   result.draft = loadDFlashDraftWeights(
       backend,
       draft ? DraftFiles(std::ref(*draft))
-            : DraftFiles(PackedDraftFiles{backend, root / "draft", result.descriptor.draft}),
+            : DraftFiles(PackedDraftFiles{images, root / "draft", result.descriptor.draft}),
       result.descriptor.draft);
-  result.vision = loadVisionWeights(backend, root, result.descriptor, vision.get());
+  result.vision = loadVisionWeights(backend, images, root, result.descriptor, vision.get());
 
   std::vector<WeightFileRecord> records(result.targetFiles().begin(),
                                         result.targetFiles().end());
@@ -110,55 +100,39 @@ ModelPackage loadPackage(metal::MetalBackend &backend,
   return result;
 }
 
-} // namespace
-
-ModelPackage loadModelPackage(metal::MetalBackend &backend,
-                              const std::filesystem::path &root) {
-  return loadPackage(backend, root, inspectModelPackage(root));
-}
-
-ModelPackage loadModelPackage(metal::MetalBackend &backend,
-                              const std::filesystem::path &root,
-                              const ModelDescriptor &descriptor, PreparationCheck admitConversion) {
-  return loadPackage(backend, root, descriptor, std::move(admitConversion));
-}
-
-std::unique_ptr<VisionLoader> planVisionLoader(metal::MetalBackend &backend, const std::filesystem::path &root,
-                                               const ModelDescriptor &descriptor,
-                                               PreparationCheck admitConversion) {
+std::unique_ptr<VisionLoader> planVisionLoader(const std::filesystem::path &root, const ModelDescriptor &descriptor) {
   if (descriptor.visionSource != VisionSource::Mlx && descriptor.visionSource != VisionSource::Gguf)
     return nullptr;
-  return std::make_unique<VisionLoader>(root / "vision", descriptor.visionSource, descriptor.vision,
-                                        [&backend] { backend.checkOperation(); },
-                                        std::move(admitConversion));
+  return std::make_unique<VisionLoader>(root / "vision", descriptor.visionSource, descriptor.vision);
 }
 
-QwenVisionWeights loadVisionWeights(metal::MetalBackend &backend, const std::filesystem::path &root,
-                                    const ModelDescriptor &descriptor, const VisionLoader *loader) {
-  if (loader) return loadQwenVisionWeights(backend, *loader);
+QwenVisionWeights loadVisionWeights(metal::MetalBackend &backend, WeightImages &images,
+                                    const std::filesystem::path &root, const ModelDescriptor &descriptor,
+                                    const VisionLoader *loader) {
+  if (loader) return loadQwenVisionWeights(backend, images, *loader);
   if (descriptor.visionSource == VisionSource::Packed)
-    return loadQwenVisionWeights(backend, root / "vision", descriptor.vision);
+    return loadQwenVisionWeights(backend, images, root / "vision", descriptor.vision);
   return {};
 }
 
-uint64_t preparedModelWeightBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor) {
+uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor) {
   uint64_t bytes = 0;
   if (descriptor.targetSource == TargetSource::Gguf) {
     WeightSource source(findTargetGguf(root / "target"));
     const GgufFile file(source);
-    for (const gguf::Image &image :
-         std::visit([&](const auto &layout) { return gguf::planImages(file, ggufTargetGeometry(layout)); },
-                    descriptor.target))
-      bytes += image.bytes;
+    bytes = std::visit(
+        [&](const auto &layout) { return imageBytes(gguf::planImages(file, ggufTargetGeometry(layout))); },
+        descriptor.target);
   } else if (descriptor.targetSource == TargetSource::Mlx) {
-    bytes = std::visit([](const auto &layout) { return preparedAffineBytes(layout); }, descriptor.target);
+    bytes = std::visit([](const auto &layout) { return imageBytes(affineTargetImages(layout)); }, descriptor.target);
   }
-  if (descriptor.draftSource == DraftSource::Checkpoint) bytes += preparedDraftBytes(descriptor.draft);
+  if (descriptor.draftFromCheckpoint())
+    bytes += imageBytes(draftCheckpointImages(descriptor.draft));
   if (descriptor.visionSource == VisionSource::Mlx || descriptor.visionSource == VisionSource::Gguf)
-    bytes += preparedVisionBytes(descriptor.vision);
+    bytes += visionImageBytes(descriptor.vision);
   for (std::string_view directory : {"target", "draft", "vision"}) {
     if (directory == "vision" && descriptor.visionSource != VisionSource::Packed) continue;
-    if (directory == "draft" && descriptor.draftSource != DraftSource::Packed) continue;
+    if (directory == "draft" && descriptor.draftFromCheckpoint()) continue;
     if (directory == "target" && descriptor.targetSource != TargetSource::Packed) continue;
     for (const auto &entry : std::filesystem::recursive_directory_iterator(root / directory)) {
       if (!entry.is_regular_file()) continue;

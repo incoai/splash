@@ -2,21 +2,15 @@
 
 from __future__ import annotations
 
-import copy
 import hashlib
 import json
 import re
 
-if __package__:
-    from . import json_codec
-    from .documents import DocumentBudget, document_parts, file_content
-    from .errors import APIError
-    from .metrics import metrics_dict, timings_dict, usage_dict
-else:  # ``python server/server.py`` from the repo root.
-    import json_codec
-    from documents import DocumentBudget, document_parts, file_content
-    from errors import APIError
-    from metrics import metrics_dict, timings_dict, usage_dict
+from . import json_codec
+from . import protocol as wire
+from .documents import DocumentBudget, document_parts, file_content
+from .errors import APIError
+from .metrics import timings_dict, usage_dict
 
 IMAGE_PAD_TOKEN = "<|image_pad|>"
 VISION_UNAVAILABLE = (
@@ -205,7 +199,7 @@ def _unfinished_json(text):
     return stack != ["done"]
 
 
-def normalize_messages(messages, *, vision, deadline=None):
+def normalize_messages(messages, *, vision, deadline):
     document_budget = DocumentBudget(deadline=deadline)
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "messages must be a non-empty array")
@@ -463,11 +457,12 @@ def normalize_responses_input(instructions, items):
 
 
 def canonical_responses_input(items):
+    """A Responses input as its list of items, a string as one user message."""
     if isinstance(items, str):
         return [{"type": "message", "role": "user", "content": items}]
     if not isinstance(items, list):
         raise APIError(400, "input must be a non-empty string or array")
-    return copy.deepcopy(items)
+    return items
 
 
 def _namespace_alias(namespace, name):
@@ -497,8 +492,6 @@ def _response_function(tool, name=None):
 
 
 def normalize_responses_tools(tools):
-    if tools is None:
-        return None
     if not isinstance(tools, list):
         raise APIError(400, "tools must be an array")
     output, namespaces = [], {}
@@ -548,7 +541,10 @@ def _responses_format(text):
     }
 
 
-def responses_to_chat_body(body, previous_items=()):
+def responses_to_chat_body(body, items):
+    """A Responses request as a Chat body, and the namespace and name of
+    each namespaced tool by its alias. `items` are the request's canonical
+    input items after those of the response it continues."""
     if body.get("conversation") is not None:
         raise APIError(400, "conversation is not supported")
     if body.get("background") not in (None, False):
@@ -559,11 +555,8 @@ def responses_to_chat_body(body, previous_items=()):
         raise APIError(400, "Responses context_management edits are not supported")
     if body.get("stream") is not None and not isinstance(body["stream"], bool):
         raise APIError(400, "stream must be a boolean")
-    current_items = canonical_responses_input(body.get("input"))
     chat = {
-        "messages": normalize_responses_input(
-            body.get("instructions"), [*previous_items, *current_items]
-        ),
+        "messages": normalize_responses_input(body.get("instructions"), items),
         "parallel_tool_calls": body.get("parallel_tool_calls"),
     }
     namespaces = {}
@@ -591,11 +584,12 @@ def responses_to_chat_body(body, previous_items=()):
     if response_format is not None:
         chat["response_format"] = response_format
     aliases = {"max_output_tokens": "max_completion_tokens"}
+    # Chat validates what it receives, so a field Splash cannot honor, such
+    # as logit_bias, is refused rather than dropped.
     for field_name in (
         "model",
-        "temperature",
-        "top_p",
-        "top_k",
+        *wire.SAMPLING_FIELDS,
+        "logit_bias",
         "seed",
         "timeout",
         "priority",
@@ -604,8 +598,7 @@ def responses_to_chat_body(body, previous_items=()):
     ):
         if field_name in body and body[field_name] is not None:
             chat[aliases.get(field_name, field_name)] = body[field_name]
-    chat["_tool_namespaces"] = namespaces
-    return chat
+    return chat, namespaces
 
 
 def _anthropic_system_text(value, label):
@@ -661,6 +654,9 @@ def _anthropic_content(value, label):
 
 
 def anthropic_to_chat_body(body, *, thinking_resolver):
+    """A Messages generation request as a Chat body, and how its response
+    shows reasoning. count_tokens converts only the prompt, so it still
+    counts a final assistant message."""
     max_tokens = body.get("max_tokens")
     if (
         not isinstance(max_tokens, int)
@@ -670,7 +666,15 @@ def anthropic_to_chat_body(body, *, thinking_resolver):
         raise APIError(400, "max_tokens must be a positive integer")
     if not isinstance(body.get("stream", False), bool):
         raise APIError(400, "stream must be a boolean")
-    chat = anthropic_to_chat_prompt(body, thinking_resolver=thinking_resolver)
+    chat, thinking_display = _anthropic_chat(body, thinking_resolver)
+    # Anthropic continues a final assistant message (a prefill); Splash would
+    # close that turn and start another, so it refuses it.
+    if body["messages"][-1]["role"] == "assistant":
+        raise APIError(
+            400,
+            "a final assistant message (prefill) is not supported; "
+            "end messages with a user turn",
+        )
     chat.update(
         max_completion_tokens=max_tokens,
         stop=body.get("stop_sequences"),
@@ -681,7 +685,8 @@ def anthropic_to_chat_body(body, *, thinking_resolver):
         timeout=body.get("timeout"),
         priority=body.get("priority"),
     )
-    return {key: value for key, value in chat.items() if value is not None}
+    chat = {key: value for key, value in chat.items() if value is not None}
+    return chat, thinking_display
 
 
 def _anthropic_preserve_thinking(context_management):
@@ -706,7 +711,45 @@ def _anthropic_preserve_thinking(context_management):
     return True if edits else None
 
 
+def _anthropic_thinking(thinking, effort):
+    """The reasoning effort and the reasoning display of a Messages
+    request's thinking, which is off when omitted."""
+    if thinking is None:
+        return "none", "summarized"
+    if not isinstance(thinking, dict) or thinking.get("type") not in (
+        "enabled",
+        "disabled",
+        "adaptive",
+    ):
+        raise APIError(400, "thinking.type must be enabled, disabled, or adaptive")
+    thinking_type = thinking["type"]
+    display = thinking.get("display")
+    if "display" in thinking:
+        if thinking_type == "disabled":
+            raise APIError(
+                400, "thinking.display requires enabled or adaptive thinking"
+            )
+        if display not in (None, "summarized", "omitted", "updates"):
+            raise APIError(
+                400,
+                "thinking.display must be summarized, omitted, updates, or null",
+            )
+    return (
+        "none" if thinking_type == "disabled" else effort,
+        # Models expose reasoning and text, not separate progress-update blocks.
+        "omitted" if display in ("omitted", "updates") else "summarized",
+    )
+
+
 def anthropic_to_chat_prompt(body, *, thinking_resolver):
+    """The prompt of a Messages request as a Chat body, as count_tokens
+    counts it."""
+    return _anthropic_chat(body, thinking_resolver)[0]
+
+
+def _anthropic_chat(body, thinking_resolver):
+    """A Messages request's prompt as a Chat body, and how its response
+    shows reasoning."""
     if not isinstance(body.get("model"), str) or not body["model"]:
         raise APIError(400, "model must be a non-empty string")
     preserve_thinking = _anthropic_preserve_thinking(body.get("context_management"))
@@ -872,44 +915,16 @@ def anthropic_to_chat_prompt(body, *, thinking_resolver):
     if system_text:
         translated.insert(0, {"role": "system", "content": system_text})
 
+    reasoning_effort, thinking_display = _anthropic_thinking(
+        body.get("thinking"), effort
+    )
     chat = {
         "model": body["model"],
         "messages": translated,
         "response_format": response_format,
         "preserve_thinking": preserve_thinking,
+        "reasoning_effort": reasoning_effort,
     }
-    thinking = body.get("thinking")
-    if thinking is None:
-        chat["reasoning_effort"] = "none"
-    elif not isinstance(thinking, dict) or thinking.get("type") not in (
-        "enabled",
-        "disabled",
-        "adaptive",
-    ):
-        raise APIError(400, "thinking.type must be enabled, disabled, or adaptive")
-    else:
-        thinking_type = thinking["type"]
-        if "display" in thinking:
-            if thinking_type == "disabled":
-                raise APIError(
-                    400, "thinking.display requires enabled or adaptive thinking"
-                )
-            display = thinking["display"]
-            if display not in (None, "summarized", "omitted", "updates"):
-                raise APIError(
-                    400,
-                    "thinking.display must be summarized, omitted, updates, or null",
-                )
-            # Models expose reasoning and text, not separate progress-update blocks.
-            chat["thinking_display"] = (
-                "omitted" if display in ("omitted", "updates") else "summarized"
-            )
-        if thinking_type == "disabled":
-            chat["reasoning_effort"] = "none"
-        elif thinking_type == "adaptive":
-            chat["reasoning_effort"] = effort
-        else:
-            chat["reasoning_effort"] = effort
 
     tools = body.get("tools")
     if tools is not None:
@@ -935,6 +950,8 @@ def anthropic_to_chat_prompt(body, *, thinking_resolver):
             }
             if isinstance(tool.get("description"), str):
                 function["description"] = tool["description"]
+            if "strict" in tool:
+                function["strict"] = tool["strict"]
             chat["tools"].append({"type": "function", "function": function})
     choice = body.get("tool_choice")
     if choice is not None:
@@ -958,7 +975,8 @@ def anthropic_to_chat_prompt(body, *, thinking_resolver):
             }
         else:
             raise APIError(400, "invalid Anthropic tool_choice")
-    return {key: value for key, value in chat.items() if value is not None}
+    chat = {key: value for key, value in chat.items() if value is not None}
+    return chat, thinking_display
 
 
 def responses_response(model, job, status, output, result=None, error=None):
@@ -1025,9 +1043,47 @@ def completion_response(model, job, result, message, tool_calls):
             }
         ],
         "usage": usage_dict(result, job),
-        "metrics": metrics_dict(result),
+        "metrics": result.metrics,
         "timings": timings_dict(result),
     }
+
+
+def text_completion_response(model, job, result, text):
+    return {
+        "id": f"cmpl-{job.public_id}",
+        "object": "text_completion",
+        "created": job.created_at,
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "text": text,
+                "logprobs": None,
+                "finish_reason": result.reason,
+            }
+        ],
+        "usage": usage_dict(result, job),
+        "metrics": result.metrics,
+        "timings": timings_dict(result),
+    }
+
+
+def _chunk(object_type, chunk_id, created, model, choice, usage, metrics, timings):
+    chunk = {
+        "id": chunk_id,
+        "object": object_type,
+        "created": created,
+        "model": model,
+        "choices": [choice],
+    }
+    if usage is not None:
+        chunk["choices"] = []
+        chunk["usage"] = usage
+    if metrics is not None:
+        chunk["metrics"] = metrics
+    if timings is not None:
+        chunk["timings"] = timings
+    return chunk
 
 
 def stream_chunk(
@@ -1040,80 +1096,101 @@ def stream_chunk(
     metrics=None,
     timings=None,
 ):
-    chunk = {
-        "id": f"chatcmpl-{request_id}",
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": model,
-        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
-    }
-    if usage is not None:
-        chunk["choices"] = []
-        chunk["usage"] = usage
-    if metrics is not None:
-        chunk["metrics"] = metrics
-    if timings is not None:
-        chunk["timings"] = timings
-    return chunk
+    return _chunk(
+        "chat.completion.chunk",
+        f"chatcmpl-{request_id}",
+        created,
+        model,
+        {"index": 0, "delta": delta, "finish_reason": finish_reason},
+        usage,
+        metrics,
+        timings,
+    )
 
 
-def responses_item(job, kind, value, index=0, status="completed"):
-    public_id = job.public_id
-    if kind == "reasoning":
+def text_completion_chunk(
+    model,
+    request_id,
+    created,
+    text,
+    finish_reason=None,
+    usage=None,
+    metrics=None,
+    timings=None,
+):
+    return _chunk(
+        "text_completion",
+        f"cmpl-{request_id}",
+        created,
+        model,
+        {"index": 0, "text": text, "logprobs": None, "finish_reason": finish_reason},
+        usage,
+        metrics,
+        timings,
+    )
+
+
+_RESPONSES_ITEM_PREFIXES = {"reasoning": "rs", "text": "msg", "tool": "fc"}
+
+
+def responses_item_id(job, kind, index):
+    """The id of the Responses item of a block of `kind` at `index`."""
+    return f"{_RESPONSES_ITEM_PREFIXES[kind]}_{job.public_id}_{index}"
+
+
+def responses_item(job, block, index):
+    """The Responses output item of `block` at `index`. An item in progress
+    carries no text or arguments yet."""
+    item_id = responses_item_id(job, block.kind, index)
+    status = block.status
+    text = "" if status == "in_progress" else block.text
+    if block.kind == "reasoning":
         return {
-            "id": f"rs_{public_id}_{index}",
-            "type": kind,
+            "id": item_id,
+            "type": "reasoning",
             "status": status,
-            "summary": ([{"type": "summary_text", "text": value}] if value else []),
-            "content": ([{"type": "reasoning_text", "text": value}] if value else []),
+            "summary": ([{"type": "summary_text", "text": text}] if text else []),
+            "content": ([{"type": "reasoning_text", "text": text}] if text else []),
             "encrypted_content": None,
         }
-    if kind == "message":
+    if block.kind == "text":
         return {
-            "id": f"msg_{public_id}_{index}",
-            "type": kind,
+            "id": item_id,
+            "type": "message",
             "status": status,
             "role": "assistant",
-            "content": [{"type": "output_text", "text": value, "annotations": []}],
+            "content": (
+                []
+                if status == "in_progress"
+                else [{"type": "output_text", "text": text, "annotations": []}]
+            ),
         }
-    name = value["function"]["name"]
-    wire = job.tool_policy.namespaces.get(name) if job.tool_policy else None
+    namespaced = job.tool_policy.namespaces.get(block.name) if job.tool_policy else None
     item = {
-        "id": f"fc_{public_id}_{index}",
+        "id": item_id,
         "type": "function_call",
         "status": status,
-        "call_id": value["id"],
-        "name": wire[1] if wire else name,
-        "arguments": "" if status == "in_progress" else value["function"]["arguments"],
+        "call_id": block.call_id,
+        "name": namespaced[1] if namespaced else block.name,
+        "arguments": text,
     }
-    if wire:
-        item["namespace"] = wire[0]
+    if namespaced:
+        item["namespace"] = namespaced[0]
     return item
 
 
-def responses_output(
-    job, reasoning, content, calls, status="completed", reasoning_status="completed"
-):
-    output = []
-    if reasoning:
-        output.append(
-            responses_item(job, "reasoning", reasoning, status=reasoning_status)
-        )
-    if content or not calls:
-        output.append(
-            responses_item(job, "message", content, len(output), status=status)
-        )
-    for call in calls:
-        output.append(
-            responses_item(job, "function_call", call, len(output), status=status)
-        )
-    return output
+def responses_output(job, blocks):
+    return [responses_item(job, block, index) for index, block in enumerate(blocks)]
 
 
-def anthropic_stop(result, tool_calls):
+def anthropic_stop(result, tool_calls, output_clamped_to_context):
     if tool_calls and result.reason != "length":
         return "tool_use"
     if result.reason == "length":
+        # Anthropic's reason when the context window, not max_tokens, ends
+        # the response.
+        if output_clamped_to_context:
+            return "model_context_window_exceeded"
         return "max_tokens"
     if result.stop_sequence is not None:
         return "stop_sequence"
@@ -1128,45 +1205,49 @@ def anthropic_usage(prompt_tokens, output_tokens, cache):
     }
 
 
-def anthropic_response(
-    model, job, reasoning, content, tool_calls, result, thinking_signature=""
-):
-    parsed_calls = []
-    for call in tool_calls:
-        try:
-            arguments = json_codec.loads(call["function"]["arguments"])
-        except ValueError:
-            if result.reason != "length":
-                raise
-            continue
-        parsed_calls.append((call, arguments))
-    blocks = []
-    if reasoning:
-        blocks.append(
-            {
-                "type": "thinking",
-                "thinking": "" if job.thinking_display == "omitted" else reasoning,
-                "signature": thinking_signature,
-            }
-        )
-    if content or not parsed_calls:
-        blocks.append({"type": "text", "text": content})
-    for call, arguments in parsed_calls:
-        blocks.append(
-            {
-                "type": "tool_use",
-                "id": call["id"],
-                "name": call["function"]["name"],
-                "input": arguments,
-            }
-        )
+def anthropic_response(model, job, blocks, result, tool_calls, thinking_signature):
+    content = []
+    for block in blocks:
+        if block.kind == "reasoning":
+            content.append(
+                {
+                    "type": "thinking",
+                    "thinking": (
+                        "" if job.thinking_display == "omitted" else block.text
+                    ),
+                    "signature": thinking_signature,
+                }
+            )
+        elif block.kind == "text":
+            content.append({"type": "text", "text": block.text})
+        else:
+            try:
+                arguments = json_codec.loads(block.text)
+            except ValueError:
+                # Only a call the token limit cut has unfinished arguments,
+                # and a complete message leaves it out.
+                if result.reason != "length":
+                    raise
+                continue
+            content.append(
+                {
+                    "type": "tool_use",
+                    "id": block.call_id,
+                    "name": block.name,
+                    "input": arguments,
+                }
+            )
+    if all(item["type"] == "thinking" for item in content):
+        content.append({"type": "text", "text": ""})
     return {
         "id": f"msg_{job.public_id}",
         "type": "message",
         "role": "assistant",
         "model": model,
-        "content": blocks,
-        "stop_reason": anthropic_stop(result, tool_calls),
+        "content": content,
+        "stop_reason": anthropic_stop(
+            result, tool_calls, job.output_clamped_to_context
+        ),
         "stop_sequence": result.stop_sequence,
         "usage": anthropic_usage(
             result.prompt_tokens, result.completion_tokens, result.cache

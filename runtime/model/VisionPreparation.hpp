@@ -2,12 +2,14 @@
 
 // The packed vision/model.bin (MDFV0001, every tensor BF16) of a vision
 // tower, as model/VisionLoader.cpp plans it from an MLX checkpoint or a GGUF
-// mmproj: its identity and its writer. A BF16 tensor is copied; an F32 or F16
-// tensor is converted only when every value is exactly a BF16, and
-// preparation fails otherwise.
+// mmproj, and its writer. A BF16 tensor is copied; an F32 or F16 tensor is
+// converted only when every value is exactly a BF16, and loading fails
+// otherwise.
 
-#include "model/PreparedWeights.hpp"
+#include "model/WeightSource.hpp"
 
+#include <cstdint>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -38,11 +40,7 @@ struct Plan {
   std::vector<Section> sections;
 };
 
-// The identity of a plan of the source at `source`.
-[[nodiscard]] PreparedWeight visionWeight(const Plan &plan, const std::string &source);
-
-// Writes a plan into its preallocated, zeroed destination within the
-// preparation staging bound; admit runs before each chunk.
-void writeVision(int destination, const Plan &plan, const PreparationCheck &admit);
+// Writes every byte of a bound plan into destination, which is its size.
+void writeVision(std::span<uint8_t> destination, const Plan &plan);
 
 } // namespace splash::model::vision

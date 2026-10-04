@@ -72,12 +72,24 @@ Measured on a 24 GB M6 (12-core GPU), with each model's DFlash2 draft:
 
 | Unsloth GGUF | Code decode | Advertised context limit |
 | --- | ---: | ---: |
-| `Qwen3.8-27B-GGUF:UD-IQ3_XXS` | 43.5 tok/s | 102,393 tokens |
+| `Qwen3.8-27B-GGUF:UD-IQ3_XXS` | 43.5 tok/s | 73,721 tokens (102,393 with `--language-only`) |
 | `Qwen3.6-35B-A3B-GGUF:UD-Q2_K_XL` | 145 tok/s | 256K tokens |
 
 The context column reports capacity, not the prompt length of the decode
-measurement. Host memory pressure can suspend a long request. Startup
-suggests `--max-cache-disk` when memory may not hold that context.
+measurement. Coding agents need about 100K tokens (Claude Code's own prompt is
+about 33K, and at 64K it compacted repeatedly and stopped), so serve the 27B
+with `--language-only` for them.
+
+Splash grows its caches only while macOS has 3 GiB free and gives cached memory
+back when it runs short, but a request in service still takes the memory it
+needs within `--max-memory`, so these models leave other applications little
+room. A request that cannot get memory waits for it, then fails with
+`resource_timeout`: close memory-heavy applications, or serve with
+`--language-only`. Critical memory pressure can suspend a long request. Startup
+suggests `--max-cache-disk` when memory may not hold the advertised context.
+The tier then writes whenever memory runs short: serving Ternary-Bonsai-2-27B
+PQ2_0 to six clients' mixed traffic for 30 minutes, a 16 GiB tier on the M6
+wrote 26 GB, about 50 GB an hour, and read 36 GB.
 
 See [the low-bit GGUF measurements](https://github.com/incoai/splash/pull/160)
 for the workloads, memory pressure, SSD settings and limitations, and

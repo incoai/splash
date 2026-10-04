@@ -20,10 +20,7 @@ import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
-if __package__:
-    from . import models
-else:
-    import models
+from . import models
 
 # Seconds the Hub may take to resolve a revision before the installed
 # assembly starts without it.

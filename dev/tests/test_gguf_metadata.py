@@ -86,10 +86,10 @@ def fixture(*, native=False):
 
 def loadable_tensors(values, directory):
     """A tensor table the native loader accepts for the header values: each
-    tensor it reads, quantized as Q4_K, Q8_0 (GDN alpha and beta) or F32."""
+    tensor it reads, quantized as Q4_K or F32."""
     header = gguf.Metadata(write_gguf(directory / "header.gguf", values))
     return {
-        name: GGML[next(t for t in ("Q4_K", "Q8_0", "F32") if t in types)]
+        name: GGML[next(t for t in ("Q4_K", "F32") if t in types)]
         for name, types in gguf.loaded_tensors(header).items()
     }
 
@@ -349,10 +349,15 @@ class GgufMetadataTests(unittest.TestCase):
         # Layer 3 is full attention; the others around it GDN.
         self.assertIn("blk.3.attn_q.weight", tensors)
         self.assertNotIn("blk.2.attn_q.weight", tensors)
-        # GDN alpha and beta may also both be F32, and the MTP layer (block
-        # 40) is never loaded, so its types do not matter.
+        # GDN alpha and beta may be both of any one quantized format or both
+        # F32, and the MTP layer (block 40) is never loaded, so its types do
+        # not matter.
+        tensors |= {"blk.0.ssm_alpha.weight": GGML["IQ4_XS"]}
+        tensors |= {"blk.0.ssm_beta.weight": GGML["IQ4_XS"]}
         tensors |= {"blk.1.ssm_alpha.weight": GGML["F32"]}
         tensors |= {"blk.1.ssm_beta.weight": GGML["F32"]}
+        tensors |= {"blk.2.ssm_alpha.weight": GGML["Q8_0"]}
+        tensors |= {"blk.2.ssm_beta.weight": GGML["Q8_0"]}
         tensors |= {"blk.40.ffn_up_exps.weight": GGML["BF16"]}
         tensors |= {"blk.0.ffn_down_exps.weight": GGML["IQ4_XS"]}
         # The low-bit formats of Unsloth's smaller files, the embedding too.
@@ -375,7 +380,7 @@ class GgufMetadataTests(unittest.TestCase):
                 },
                 "attn_qkv.weight BF16 [(]2 tensors[)]",
             ),
-            ({"token_embd.weight": GGML["IQ4_XS"]}, "token_embd.weight IQ4_XS"),
+            ({"token_embd.weight": GGML["IQ2_XXS"]}, "token_embd.weight IQ2_XXS"),
             ({"blk.3.attn_q.weight": GGML["BF16"]}, "attn_q.weight BF16"),
             # F32 only where the loader reads floats: not a projection, not
             # a quantized router or norm, not half an alpha/beta pair.
@@ -388,6 +393,13 @@ class GgufMetadataTests(unittest.TestCase):
             (
                 {"blk.1.ssm_alpha.weight": GGML["Q8_0"]},
                 "ssm_alpha.weight and ssm_beta.weight of different types",
+            ),
+            (
+                {
+                    "blk.1.ssm_alpha.weight": GGML["F16"],
+                    "blk.1.ssm_beta.weight": GGML["F16"],
+                },
+                "ssm_alpha.weight F16",
             ),
             # An all-F32 file, whose types the loader reads somewhere.
             (f32, "attn_output.weight F32 [(]10 tensors[)]"),

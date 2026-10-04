@@ -229,7 +229,7 @@ def encode_prompt(tokenizer, chat_template, messages, labels, *, admit, checkpoi
     return ids, slots, prompt
 
 
-def judgment_response(model, row, meta, result):
+def judgment_response(model, row, job, result):
     logits = list(result.option_logits)
     return {
         "id": row["id"],
@@ -237,8 +237,8 @@ def judgment_response(model, row, meta, result):
         "probabilities": softmax(logits),
         "option_logits": logits,
         "input_tokens": result.prompt_tokens,
-        "answer_token_ids": list(meta["answer_token_ids"]),
-        "prompt_sha256": meta["prompt_sha256"],
+        "answer_token_ids": list(job.score_tokens),
+        "prompt_sha256": job.prompt_sha256,
         "prompt_version": PROMPT_VERSION,
         "model": {"id": model},
         "readout": READOUT,

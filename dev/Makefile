@@ -42,7 +42,7 @@ HTTP_SMOKE_ARGS ?=
 	check-native-engine check-native-cpu check-native-metal check-python-engine \
 	install-development _install-development release-check test \
 	test-agent-real test-http-real test-performance-real test-release-real \
-	test-models test-python test-real \
+	test-models test-python test-real verify-models \
 	test-engine test-engine-cpu test-engine-metal test-sanitizers
 
 # Decided by the stamp's content, as the environment is: a rebuilt
@@ -74,12 +74,11 @@ test-python: install-development
 	$(PYTHON) -m unittest discover -s dev/tests/engine -p '$(ENGINE_PYTHON_TEST_PATTERN)'
 	$(PYTHON) -m unittest dev/tests/test_server.py
 
-# Installer, model manifest, upstream resolution, GGUF metadata and
-# prepared-weight identity tests; none downloads or loads real weights.
+# Installer, model manifest, upstream resolution and GGUF metadata tests;
+# none downloads or loads real weights.
 test-models: install-development
 	$(PYTHON) -m unittest dev/tests/test_models.py dev/tests/test_upstream.py \
-		dev/tests/test_weight_preparation_identity.py dev/tests/test_gguf_metadata.py \
-		dev/tests/test_installer_restarts.py
+		dev/tests/test_gguf_metadata.py dev/tests/test_installer_restarts.py
 
 check-python-engine: install-development test-python test-models
 	$(PYTHON) -m compileall -q server install/*.py \
@@ -119,12 +118,15 @@ test-release-real: preflight $(TARGET) agent-preflight verify-build-identity
 	TRANSFORMERS_VERBOSITY=error $(PYTHON) dev/tests/agent_real.py $(AGENT_ARGS) \
 		--http-smoke
 
-# BASELINE is a checkout whose build/ holds another build's splash.metallib
-# and engine-tests/backend-benchmark: this build is compared with it on this
-# machine in ABBA order (dev/benchmarks/backend_regression.py). Without it,
-# the release scenarios characterize this build alone.
+# BASELINE is a checkout whose build/ holds another build's splash.metallib,
+# engine-tests/backend-benchmark and, for a build that loads the weights into
+# memory, engine-tests/weight-digests: this build is compared with it on this
+# machine in ABBA order, and so are their weight images
+# (dev/benchmarks/backend_regression.py). Without it, the release scenarios
+# characterize this build alone.
 BASELINE ?=
-test-performance-real: preflight $(TARGET) $(TEST_BACKEND_BENCHMARK) $(LIB)
+test-performance-real: preflight $(TARGET) $(TEST_BACKEND_BENCHMARK) $(LIB) \
+		$(if $(BASELINE),$(WEIGHT_DIGESTS))
 	@mkdir -p "$(MODEL_RESULTS)"
 	@$(BUILD_ID_PYTHON) $(BUILD_ID_SCRIPT) check --root . \
 		--header $(BUILD_ID_HEADER) --stamp $(BUILD_ID_STAMP) \
@@ -133,22 +135,27 @@ ifneq ($(BASELINE),)
 	$(PYTHON) -m dev.benchmarks.backend_regression --baseline "$(BASELINE)" \
 		--package "$(MODEL_ROOT)" --output-dir "$(MODEL_RESULTS)"
 else
-	@set +e; \
-		$(TEST_BACKEND_BENCHMARK) $(LIB) "$(MODEL_ROOT)" \
-			--scenario decode,partial --samples 3 \
-			--progress "$(MODEL_RESULTS)/backend-benchmark-progress.jsonl" \
-			> "$(MODEL_RESULTS)/backend-benchmark.json"; \
-		status=$$?; \
-		$(PYTHON) -m json.tool "$(MODEL_RESULTS)/backend-benchmark.json" >/dev/null \
-			|| exit 1; \
-		test $$status -eq 0 || exit $$status
+	@$(TEST_BACKEND_BENCHMARK) $(LIB) "$(MODEL_ROOT)" \
+		--scenario decode,partial --samples 3 \
+		--progress "$(MODEL_RESULTS)/backend-benchmark-progress.jsonl" \
+		> "$(MODEL_RESULTS)/backend-benchmark.json" \
+		&& $(PYTHON) -m json.tool "$(MODEL_RESULTS)/backend-benchmark.json" >/dev/null
 	@echo "native backend characterization: PASS ($(MODEL_RESULTS)/backend-benchmark.json)"
 endif
+
+# The installer's restarts without the Hub, a full source hash and the
+# digests of the weight images a load of the installation holds
+# (DEVELOPMENT.md, Release check).
+verify-models: preflight $(WEIGHT_DIGESTS) $(LIB)
+	@$(PYTHON) dev/tools/installer_restarts.py $(MODEL_ARGS)
+	@mkdir -p "$(MODEL_RESULTS)"
+	@$(WEIGHT_DIGESTS) $(LIB) "$(MODEL_ROOT)" > "$(MODEL_RESULTS)/weights.json.tmp"
+	@mv "$(MODEL_RESULTS)/weights.json.tmp" "$(MODEL_RESULTS)/weights.json"
+	@echo "weight images: $(MODEL_RESULTS)/weights.json"
 
 # One model on this machine against BASELINE, a retained build that loads it
 # (DEVELOPMENT.md, Release check); make check and test-sanitizers run once per
 # source identity, check-native-metal and the agent clients once per machine.
-# verify-models follows test-real, whose load prepares the weights it records.
 release-check: preflight
 	@test -n "$(BASELINE)" || { \
 		echo "error: release-check compares with BASELINE, a retained build that loads the model" >&2; \

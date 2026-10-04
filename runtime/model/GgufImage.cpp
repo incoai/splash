@@ -28,15 +28,15 @@ static_assert([] {
     if (format.meta_groups * 32 != format.block_elements) return false;
   return true;
 }(), "a meta unit is one native block");
-static_assert(GGUF_TYPE_F32 == ggml::kF32, "float segments carry the GGUF type id");
 
 bool quantizedType(uint32_t type) { return gguf_format_of(type) != GGUF_FMT_COUNT; }
 bool floatType(uint32_t type) { return type == ggml::kF32; }
 // The token rows the embedding kernel gathers.
 bool embeddingType(uint32_t type) { return gguf_embedding_format(gguf_format_of(type)); }
-// alpha/beta run in their stored format: both Q8_0 (one repacked tensor) or
-// both F32 (one float tensor), which both BF16 become exactly.
-bool alphaBetaType(uint32_t type) { return type == ggml::kQ8_0 || type == ggml::kF32 || type == ggml::kBF16; }
+// alpha/beta run as one segment of their shared type: any format of the
+// projections (one repacked tensor) or F32 (one float tensor), which BF16
+// becomes exactly.
+bool alphaBetaType(uint32_t type) { return quantizedType(type) || type == ggml::kF32 || type == ggml::kBF16; }
 
 // Plans one image. A missing tensor or one of a type this build cannot load
 // is added to `problems` and left out of the image, so the planner can name
@@ -47,9 +47,10 @@ public:
           std::string name, uint32_t layer, uint32_t type)
       : file_(file), geometry_(geometry), problems_(problems) {
     image_.name = std::move(name);
+    image_.magic = kGgufImageMagic;
     image_.layer = layer;
     image_.type = type;
-    const auto header = weightFileHeader(kGgufImageMagic, layer, type);
+    const auto header = weightFileHeader(image_.magic, layer, type);
     image_.fills.push_back({0, {header.begin(), header.end()}});
     cursor_ = header.size();
   }
@@ -72,8 +73,8 @@ public:
   }
 
   // beta (value heads rows) | alpha (value heads rows), rows in grouped head
-  // order: Q8_0 as one 256-row tensor padded with zero rows, or F32 as one
-  // float tensor, which BF16 is widened to exactly.
+  // order: one 256-row tensor of their format padded with zero rows, or F32 as
+  // one float tensor, which BF16 is widened to exactly.
   void alphaBeta(const std::string &betaName, const std::string &alphaName) {
     const GgufTensor *beta = file_.find(betaName), *alpha = file_.find(alphaName);
     if (!beta || !alpha || beta->type != alpha->type || !alphaBetaType(beta->type)) {
@@ -91,16 +92,17 @@ public:
       descriptor(ggml::kF32, 2ull * heads, hidden, {}, {bytes, 0, 0}, betaName);
       uint64_t destination = section(bytes);
       for (const GgufTensor *t : {beta, alpha}) {
-        image_.copies.push_back(
-            {destination, tensorRows(*t, heads, t->bytes / heads, grouped(0, 1)), false, widening == 2});
+        image_.copies.push_back({destination, tensorRows(*t, heads, t->bytes / heads, grouped(0, 1)),
+                                 widening == 2 ? Conversion::WidenToFloat32 : Conversion::None});
         destination += t->bytes * widening;
       }
       return;
     }
     if (2 * heads > QUANT_TILE_ROWS) throw GgufError("alpha/beta rows exceed one 256-row tile");
-    Repack repack = planes(GGUF_FMT_Q80, QUANT_TILE_ROWS, hidden, alphaName);
-    for (const GgufTensor *t : {beta, alpha})
-      repack.sources.push_back(tensorRows(*t, heads, ggufRowBytes(kQuantFormats[GGUF_FMT_Q80], hidden), grouped(0, 1)));
+    const uint32_t format = gguf_format_of(beta->type);
+    const uint64_t rowBytes = ggufRowBytes(kQuantFormats[format], hidden);
+    Repack repack = planes(format, QUANT_TILE_ROWS, hidden, alphaName);
+    for (const GgufTensor *t : {beta, alpha}) repack.sources.push_back(tensorRows(*t, heads, rowBytes, grouped(0, 1)));
     image_.repacks.push_back(std::move(repack));
   }
 
@@ -110,15 +112,16 @@ public:
   void convolution(const std::string &name, uint64_t keyRows) {
     const uint32_t channels = geometry_.convolutionDimension;
     if (const GgufTensor *tensor = floatVector(name, uint64_t{channels} * kGdnConvolutionTaps))
-      copy(tensorRows(*tensor, channels, tensor->bytes / channels, grouped(keyRows, geometry_.gdnHeadDimension)), true);
+      copy(tensorRows(*tensor, channels, tensor->bytes / channels, grouped(keyRows, geometry_.gdnHeadDimension)),
+           Conversion::NarrowToBfloat16);
   }
 
   // A per value head F32 vector in grouped head order: as stored, or as the
   // exact bf16 values the kernels read.
-  void headVector(const std::string &name, bool bfloat16) {
+  void headVector(const std::string &name, Conversion conversion) {
     const uint32_t heads = geometry_.gdnValueHeads;
     if (const GgufTensor *tensor = floatVector(name, heads))
-      copy(tensorRows(*tensor, heads, tensor->bytes / heads, grouped(0, 1)), bfloat16);
+      copy(tensorRows(*tensor, heads, tensor->bytes / heads, grouped(0, 1)), conversion);
   }
 
   // Native token rows, gathered by the embedding kernel.
@@ -182,10 +185,10 @@ private:
     return {tensor.name, tensor.type, tensor.offset, count, rowBytes, order};
   }
 
-  // Rows written as stored, or converted to bf16, into their own section.
-  void copy(TensorRows source, bool bfloat16 = false) {
-    const uint64_t bytes = source.rows * source.rowBytes / (bfloat16 ? 2 : 1);
-    image_.copies.push_back({section(bytes), std::move(source), bfloat16});
+  // Rows written as stored, or narrowed to bf16, into their own section.
+  void copy(TensorRows source, Conversion conversion = Conversion::None) {
+    const uint64_t bytes = source.rows * source.rowBytes / (conversion == Conversion::NarrowToBfloat16 ? 2 : 1);
+    image_.copies.push_back({section(bytes), std::move(source), conversion});
   }
 
   // A tensor's rows as stored, after their descriptor.
@@ -316,8 +319,8 @@ Image layerImage(const GgufFile &file, const TargetGeometry &g, std::vector<std:
     b.quantized(p + "attn_gate.weight", valueRows, g.hiddenSize, b.grouped(0, g.gdnHeadDimension));
     b.alphaBeta(p + "ssm_beta.weight", p + "ssm_alpha.weight");
     b.convolution(p + "ssm_conv1d.weight", keyRows);
-    b.headVector(p + "ssm_a", false);
-    b.headVector(p + "ssm_dt.bias", true);
+    b.headVector(p + "ssm_a", Conversion::None);
+    b.headVector(p + "ssm_dt.bias", Conversion::NarrowToBfloat16);
     b.floatNorm(p + "ssm_norm.weight", g.gdnHeadDimension);
     b.quantized(p + "ssm_out.weight", g.hiddenSize, valueRows);
   }

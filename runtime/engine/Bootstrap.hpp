@@ -1,5 +1,6 @@
 #pragma once
 
+#include "engine/MemoryControl.hpp"
 #include "engine/NativeRuntime.hpp"
 #include "engine/RuntimeResources.hpp"
 #include "engine/Status.hpp"
@@ -20,7 +21,6 @@ enum class RuntimeBootstrapStage {
     ModelCreation,
     MaximumPrefill,
     DecodeWarmup,
-    DraftVerifyCommit,
     CompositeStateRestore,
     MemoryAudit,
     AnnounceReady,
@@ -30,8 +30,8 @@ enum class RuntimeBootstrapStage {
 [[nodiscard]] std::string_view runtimeBootstrapStageName(
     RuntimeBootstrapStage stage);
 
+// A report of a successful bootstrap is at stage Ready.
 struct RuntimeBootstrapReport {
-    bool ready = false;
     RuntimeBootstrapStage stage = RuntimeBootstrapStage::ResourceAssembly;
     RuntimeResourceFailure resourceFailure = RuntimeResourceFailure::Other;
     std::string message;
@@ -60,9 +60,9 @@ private:
 
 // Startup retries a temporary host or driver allocation failure for a
 // bounded time. The window opens at the first such failure, not at process
-// start, since a cold start can prepare weights for minutes before one; a
-// failure at a later stage than the last one follows progress and opens a
-// new window.
+// start, since a start loads the weights and warms up for a while before
+// one; a failure at a later stage than the last one follows progress and
+// opens a new window.
 class StartupRetryWindow final {
 public:
     using Clock = std::chrono::steady_clock;
@@ -89,14 +89,21 @@ private:
                                     uint64_t hostAvailableBytes,
                                     uint32_t contextTokens);
 
+// The wire limits of a model served with maxContext tokens: prompts and
+// outputs up to the context, the engine's step and draft query rows, and a
+// mask row per draft query and the anchor.
+[[nodiscard]] protocol::ProtocolLimits
+protocolLimitsFor(const model::ModelCapabilities &capabilities,
+                  uint32_t maxContext) noexcept;
+
 struct RuntimeBootstrapConfig {
     RuntimeResourcesConfig resources;
-    NativeLoopConfig nativeLoop;
-    protocol::ProtocolLimits protocolLimits;
+    // A zero engine maxContext is what the memory plan holds, as serve's
+    // default; a larger one than that fails the bootstrap.
+    NativeLoopConfig nativeLoop{.engine = {.maxContext = 0}};
 };
 
-using ActualMemoryReporter =
-    std::function<ActualMemoryReport(uint64_t estimatedWarmupPeakBytes)>;
+using ActualMemoryReporter = std::function<ActualMemoryReport()>;
 
 // Complete owner returned only after the real loop has emitted its binary
 // ReadyEvent. No partially warmed instance escapes start().
@@ -129,6 +136,16 @@ public:
         return report_;
     }
 
+    // The memory control pass the transport runs at a command-free point
+    // (MemoryControl::run).
+    [[nodiscard]] bool controlPass(MemoryPressure pressure) {
+        return memoryControl_.run(pressure);
+    }
+    // The status document, with the metrics and the loop timing the
+    // transport keeps.
+    [[nodiscard]] std::string statusJson(const RuntimeMetricsSnapshot &metrics,
+                                         const NativeLoopTiming &loop);
+
 private:
     RuntimeBootstrap(std::unique_ptr<RuntimeResources> resources,
                      std::unique_ptr<model::RuntimeModel> modelRuntime,
@@ -139,6 +156,7 @@ private:
     std::unique_ptr<RuntimeResources> resources_;
     std::unique_ptr<model::RuntimeModel> model_;
     std::unique_ptr<NativeRuntime> nativeLoop_;
+    MemoryControl memoryControl_;
     RuntimeBootstrapReport report_;
 };
 

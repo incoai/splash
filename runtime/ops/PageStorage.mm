@@ -1,224 +1,169 @@
 #include "ops/PageStorage.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
-#include <vector>
 
 namespace splash::kv {
 
-static_assert(kv::kSparseMappingAlignmentBytes ==
-                  metal::MetalBackend::kPlacementSparsePageBytes,
-              "KV sparse mapping alignment must equal the Metal placement page");
-namespace {
-
-uint64_t checkedMultiply(uint64_t left, uint64_t right) {
-    if (left && right > std::numeric_limits<uint64_t>::max() / left) {
-        throw std::overflow_error("KV page storage size overflow");
-    }
-    return left * right;
-}
-
-}  // namespace
-
 PageStorage::PageStorage(metal::MetalBackend &backend,
     metal::AllocationAdmission admitAllocation, Layout layout,
-    uint32_t pageCount)
+    uint32_t pageCount, uint32_t extentPages)
     : backend_(backend), admitAllocation_(std::move(admitAllocation)),
-      layout_(layout), pageCount_(pageCount), layers_(layout.attentionLayers) {
+      layout_(layout), pageCount_(pageCount), extentPages_(extentPages) {
     if (!admitAllocation_) {
         throw std::invalid_argument(
-            "KV page storage requires physical allocation admission");
+            "KV page storage requires allocation admission");
     }
     if (!layout_.valid()) {
         throw std::invalid_argument("KV page storage layout is invalid");
     }
-    if (!pageCount || pageCount % sparseMappingBatchPages()) {
+    // Page entries carry the index in an extent in their low bits, and
+    // SplashKvLayer places a layer's region with a 32-bit offset, so an
+    // extent stays below 4 GiB.
+    if (!extentPages_ || extentPages_ % layout_.extentAlignmentPages() ||
+        extentPages_ > SPLASH_KV_PAGE_INDEX_MASK ||
+        extentBytes() > std::numeric_limits<uint32_t>::max() ||
+        extentBytes() > backend_.capabilities().maxBufferLengthBytes) {
+        throw std::invalid_argument("KV extent geometry is invalid");
+    }
+    if (!pageCount_ || pageCount_ % extentPages_) {
         throw std::invalid_argument(
-            "KV page pool is not sparse-mapping aligned");
+            "KV page pool is not a whole number of extents");
     }
-    const StorageByteCounts bytes = layout_.storageByteCounts(pageCount);
-    for (uint32_t layerIndex = 0; layerIndex < layers_.size();
-         ++layerIndex) {
-        std::string prefix = "kv-layer-" +
-                             std::to_string(layerIndex) + "-";
-        LayerStorage &storage = layers_[layerIndex];
-        storage.format = layout_.format;
-        storage.keyData = backend_.allocatePlacementSparseBuffer(
-            checkedMultiply(pageCount, layout_.dataBytesPerLayerPage()),
-            kSparseMappingAlignmentBytes, prefix + "keys");
-        if (layout_.scaleBytesPerLayerPage()) {
-            storage.keyScales = backend_.allocatePlacementSparseBuffer(
-                checkedMultiply(pageCount, layout_.scaleBytesPerLayerPage()),
-                kSparseMappingAlignmentBytes, prefix + "key-scales");
-        }
-        storage.valueData = backend_.allocatePlacementSparseBuffer(
-            checkedMultiply(pageCount, layout_.dataBytesPerLayerPage()),
-            kSparseMappingAlignmentBytes, prefix + "values");
-        if (layout_.scaleBytesPerLayerPage()) {
-            storage.valueScales = backend_.allocatePlacementSparseBuffer(
-                checkedMultiply(pageCount, layout_.scaleBytesPerLayerPage()),
-                kSparseMappingAlignmentBytes, prefix + "value-scales");
-        }
-    }
-    if (declaredBytes() != bytes.total) {
-        throw std::logic_error("KV storage accounting mismatch");
-    }
-
-    for (uint32_t first = 0; first < pageCount_;
-         first += backingExtentPages()) {
-        uint32_t count = std::min(backingExtentPages(), pageCount_ - first);
-        if (count % sparseMappingBatchPages()) {
-            throw std::logic_error("KV backing extent is not tile aligned");
-        }
-        extents_.push_back(Extent{first, count, std::nullopt});
-    }
-    // One small runway makes startup warmup and the first requests allocation
-    // free. Every later extent remains virtual until real tokens need it.
-    if (auto result = ensureResident(0); !result) {
-        throw metal::MetalAllocationError(
-            std::string("unable to allocate initial KV backing extent: ") +
-                metal::allocationFailureName(result.failure), result.failure);
-    }
-}
-
-PageStorage::~PageStorage() {
-    // Pace GPU-written extent releases to avoid long stalls in the OS kernel.
-    for (Extent &extent : extents_) {
-        if (!backend_.healthy()) break;
-        if (!extent.heap) continue;
-        try {
-            // unmapSparse waits for the previous extent's unmap itself.
-            auto mappings = mappingsFor(extent);
-            backend_.unmapSparse(mappings, std::move(*extent.heap));
-        } catch (...) {
-            // Shutdown cannot recover or safely report an exception. The
-            // Metal resources are still released in deterministic C++ order.
-        }
-        extent.heap.reset();
-    }
-    if (!backend_.healthy()) return;
-    try {
-        backend_.drainSparseUnmaps();
-    } catch (...) {
-    }
-}
-
-uint64_t PageStorage::declaredBytes() const noexcept {
-    return uint64_t(pageCount_) * layout_.bytesPerModelPage();
-}
-
-uint64_t PageStorage::actualAllocatedBytes() const noexcept {
-    return residentBackingBytes_;
-}
-
-uint32_t PageStorage::residentPages() const noexcept {
-    return residentPages_;
+    const auto data = static_cast<uint32_t>(layout_.dataBytesPerLayerPage());
+    const auto scale = static_cast<uint32_t>(layout_.scaleBytesPerLayerPage());
+    for (uint32_t layer = 0; layer < layout_.attentionLayers; ++layer)
+        layers_.push_back(splash_kv_layer(extentPages_, data, scale, layer));
+    extents_.resize(pageCount_ / extentPages_);
+    extentAddresses_.resize(extents_.size());
 }
 
 size_t PageStorage::extentIndex(uint32_t page) const {
     if (page >= pageCount_) throw std::out_of_range("invalid KV page id");
-    return page / backingExtentPages();
+    return page / extentPages_;
 }
 
-uint32_t PageStorage::extentFirstPage(uint32_t page) const {
-    return extents_.at(extentIndex(page)).firstPage;
+uint64_t PageStorage::actualAllocatedBytes() const noexcept {
+    const auto allocated = std::count_if(
+        extents_.begin(), extents_.end(),
+        [](const metal::MetalBuffer &extent) { return static_cast<bool>(extent); });
+    return static_cast<uint64_t>(allocated) * extentBytes();
 }
 
-uint32_t PageStorage::extentPageCount(uint32_t page) const {
-    return extents_.at(extentIndex(page)).pageCount;
+bool PageStorage::isAllocated(uint32_t page) const {
+    return static_cast<bool>(extents_[extentIndex(page)]);
 }
 
-bool PageStorage::isResident(uint32_t page) const {
-    return extents_.at(extentIndex(page)).heap.has_value();
-}
-
-std::vector<metal::SparseMapping> PageStorage::mappingsFor(
-    const Extent &extent) const {
-    std::vector<metal::SparseMapping> mappings;
-    mappings.reserve(uint64_t{layout_.attentionLayers} * 4);
-    uint64_t heapOffset = 0;
-    auto append = [&](const metal::MetalBuffer &buffer,
-                      uint64_t bytesPerPage) {
-        if (!bytesPerPage) return;
-        uint64_t bufferOffset = checkedMultiply(
-            extent.firstPage, bytesPerPage);
-        uint64_t size = checkedMultiply(extent.pageCount, bytesPerPage);
-        mappings.push_back({buffer, bufferOffset, size, heapOffset});
-        heapOffset += size;
-    };
-    for (const LayerStorage &storage : layers_) {
-        append(storage.keyData, layout_.dataBytesPerLayerPage());
-        append(storage.keyScales, layout_.scaleBytesPerLayerPage());
-        append(storage.valueData, layout_.dataBytesPerLayerPage());
-        append(storage.valueScales, layout_.scaleBytesPerLayerPage());
+metal::AllocationResult PageStorage::allocateExtent(uint32_t extent) {
+    metal::MetalBuffer &buffer = extents_.at(extent);
+    if (buffer) {
+        throw std::logic_error(
+            "KV extent " + std::to_string(extent) + " is already allocated");
     }
-    uint64_t expected = checkedMultiply(
-        extent.pageCount, layout_.bytesPerModelPage());
-    if (heapOffset != expected) {
-        throw std::logic_error("KV sparse mapping geometry mismatch");
-    }
-    return mappings;
+    const uint64_t bytes = extentBytes();
+    return admitAllocation_(bytes, [&] {
+        metal::MetalBuffer allocated = backend_.allocateBuffer(
+            bytes, metal::BufferStorage::Shared,
+            "kv-extent-" + std::to_string(extent * extentPages_));
+        if (allocated.gpuAddress() & SPLASH_KV_PAGE_INDEX_MASK) {
+            throw std::logic_error(
+                "KV extent address leaves no room for the page index");
+        }
+        extentAddresses_[extent] = allocated.gpuAddress();
+        buffer = std::move(allocated);
+    });
 }
 
-metal::AllocationResult PageStorage::ensureResident(uint32_t page) {
-    Extent &extent = extents_.at(extentIndex(page));
-    if (extent.heap) return true;
-    uint64_t bytes = checkedMultiply(extent.pageCount,
-                                     layout_.bytesPerModelPage());
-    try {
-        return admitAllocation_(bytes, [&] {
-            std::optional<metal::SparseHeap> heap;
-            heap.emplace(backend_.allocatePlacementHeap(
-                bytes, kSparseMappingAlignmentBytes,
-                "kv-extent-" + std::to_string(extent.firstPage)));
-            if (heap->sizeBytes() != bytes) {
-                throw std::logic_error(
-                    "placement heap size differs from admitted KV extent bytes");
+void PageStorage::releaseExtent(uint32_t extent) {
+    metal::MetalBuffer &buffer = extents_.at(extent);
+    if (!buffer) {
+        throw std::logic_error(
+            "KV extent " + std::to_string(extent) + " is not allocated");
+    }
+    if (backend_.commandInFlight()) {
+        throw std::logic_error(
+            "cannot release a KV extent while a command is in flight");
+    }
+    buffer = {};
+    extentAddresses_[extent] = 0;
+}
+
+void PageStorage::copyPages(std::span<const PageCopy> copies) {
+    if (backend_.commandInFlight()) {
+        throw std::logic_error(
+            "cannot copy KV pages while a command is in flight");
+    }
+    for (const PageCopy &copy : copies) {
+        if (!isAllocated(copy.from) || !isAllocated(copy.to)) {
+            throw std::logic_error(
+                "cannot copy a KV page of an extent that is not allocated");
+        }
+    }
+    for (const PageCopy &copy : copies) {
+        const auto source = spans(copy.from);
+        const auto destination = spans(copy.to);
+        for (size_t tensor = 0; tensor < source.size(); ++tensor) {
+            std::memcpy(destination[tensor].data(), source[tensor].data(),
+                        source[tensor].size());
+        }
+    }
+}
+
+SplashKvPage PageStorage::entry(uint32_t page) const {
+    const size_t extent = extentIndex(page);
+    const uint64_t address = extentAddresses_[extent];
+    if (!address) {
+        throw std::logic_error("KV page " + std::to_string(page) +
+                               " is in an extent that is not allocated");
+    }
+    return splash_kv_page_entry(
+        address, page - static_cast<uint32_t>(extent) * extentPages_);
+}
+
+void PageStorage::writeEntries(std::span<const uint32_t> pages,
+                               uint32_t first,
+                               const metal::MetalBuffer &table) const {
+    auto *entries = static_cast<SplashKvPage *>(table.contents());
+    if (!entries || table.sizeBytes() / sizeof(SplashKvPage) < pages.size()) {
+        throw std::logic_error(
+            "KV page table is not CPU-visible or too small for its entries");
+    }
+    if (first > pages.size()) {
+        throw std::invalid_argument(
+            "KV page table entries start past the end of its pages");
+    }
+    for (size_t index = first; index < pages.size(); ++index)
+        entries[index] = entry(pages[index]);
+}
+
+std::vector<std::span<std::byte>> PageStorage::spans(uint32_t page) const {
+    auto *extent =
+        static_cast<std::byte *>(extents_[extentIndex(page)].contents());
+    if (!extent) {
+        throw std::logic_error("KV page " + std::to_string(page) +
+                               " is in an extent that is not allocated");
+    }
+    const auto data = static_cast<uint32_t>(layout_.dataBytesPerLayerPage());
+    const auto scale = static_cast<uint32_t>(layout_.scaleBytesPerLayerPage());
+    const uint32_t index = page % extentPages_;
+    std::vector<std::span<std::byte>> result;
+    result.reserve(size_t{layout_.attentionLayers} * (scale ? 4 : 2));
+    for (uint32_t layer = 0; layer < layout_.attentionLayers; ++layer) {
+        for (uint32_t tensor = SPLASH_KV_KEYS; tensor <= SPLASH_KV_VALUE_SCALES;
+             ++tensor) {
+            if (const uint32_t bytes = splash_kv_page_bytes(data, scale, tensor)) {
+                result.emplace_back(extent + splash_kv_offset(extentPages_, data,
+                                                              scale, layer,
+                                                              tensor, index),
+                                    bytes);
             }
-            auto mappings = mappingsFor(extent);
-            backend_.mapSparse(*heap, mappings);
-            residentBackingBytes_ += heap->sizeBytes();
-            residentPages_ += extent.pageCount;
-            extent.heap = std::move(heap);
-        });
-    } catch (const metal::MetalAllocationError &error) {
-        return error.failure();
+        }
     }
-}
-
-bool PageStorage::releaseBackingForPage(uint32_t page) {
-    Extent &extent = extents_.at(extentIndex(page));
-    if (!extent.heap) return false;
-    const uint64_t heapBytes = extent.heap->sizeBytes();
-    if (residentBackingBytes_ < heapBytes || residentPages_ < extent.pageCount) {
-        throw std::logic_error("KV resident accounting underflowed");
-    }
-    auto mappings = mappingsFor(extent);
-    // The backend owns the heap from here until the unmap has completed.
-    // A validation failure throws before the move, leaving the extent intact.
-    backend_.unmapSparse(mappings, std::move(*extent.heap));
-    residentBackingBytes_ -= heapBytes;
-    residentPages_ -= extent.pageCount;
-    extent.heap.reset();
-    return true;
-}
-
-bool PageStorage::releaseReady() const noexcept {
-    return !backend_.sparseUnmapPending();
-}
-
-void PageStorage::awaitRelease() {
-    backend_.drainSparseUnmaps();
-}
-
-const LayerStorage &PageStorage::layer(uint32_t index) const {
-    if (index >= layers_.size()) {
-        throw std::out_of_range("invalid attention layer index");
-    }
-    return layers_[index];
+    return result;
 }
 
 }  // namespace splash::kv

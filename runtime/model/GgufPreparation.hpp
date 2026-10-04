@@ -2,19 +2,19 @@
 
 #include "metal/MetalBackend.hpp"
 #include "model/GgufImage.hpp"
-#include "model/PreparedWeights.hpp"
+#include "model/WeightSource.hpp"
+
+#include <cstdint>
 
 namespace splash::model {
 
-// The identity of a planned image of source: the preparation identity, the
-// whole plan and the bytes and type of every tensor it reads.
-[[nodiscard]] PreparedWeight ggufImageWeight(const WeightSource &source, const gguf::Image &image);
+// The Metal staging of the rows of one repack step, whatever the tensor,
+// layer or expert count.
+inline constexpr uint64_t kGgufRepackStagingBytes = 32 << 20;
 
-// Writes a planned image into its preallocated, zeroed destination file: the
-// header and descriptors, the copied rows and the planes the GPU repacks.
-// Staging stays within kWeightPreparationStagingBytes whatever the tensor,
-// layer or expert count; admit runs before each chunk.
-void writeGgufImage(metal::MetalBackend &backend, const WeightSource &source, int destination,
-                    const gguf::Image &image, const PreparationCheck &admit);
+// Writes every byte of a planned image into its buffer: the header and
+// descriptors, the copied rows and the planes the GPU repacks into it.
+void writeGgufImage(metal::MetalBackend &backend, const WeightSource &source, const metal::MetalBuffer &image,
+                    const gguf::Image &plan);
 
 } // namespace splash::model

@@ -60,7 +60,7 @@ class TokenizerContractTests(unittest.TestCase):
 
     def test_startup_rejects_tokenizer_before_starting_the_native_worker(self):
         args = server.parse_args(
-            ["target", "draft", "--tokenizer", "tokenizer", "--model", "owner/model"]
+            ["model", "--tokenizer", "tokenizer", "--model", "owner/model"]
         )
         tokenizer = self.tokenizer()
         tokenizer.get_vocab()["</think>"] = 0

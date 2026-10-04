@@ -3,7 +3,7 @@ manifest.json, which predate upstream loading and stay installable.
 
 A package is installed as a selection link to its verified Hub snapshot,
 pinned for that installation. The native model descriptor validates
-architecture, tensors, headers and execution geometry before mapping weights.
+architecture, tensors, headers and execution geometry before loading weights.
 huggingface_hub is imported where it is used, for the reasons hub.py gives.
 """
 
@@ -12,12 +12,7 @@ from __future__ import annotations
 from pathlib import Path, PurePosixPath
 from typing import NamedTuple
 
-if __package__:
-    from . import families, hub, models
-else:
-    import families
-    import hub
-    import models
+from . import families, hub, models
 
 ALIGNMENT = 16384
 # The tokenizer/ files a package ships.

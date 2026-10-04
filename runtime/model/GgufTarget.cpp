@@ -1,5 +1,4 @@
 #include "model/GgufTarget.hpp"
-#include "model/GgufImageLayout.hpp"
 #include "model/GgufPreparation.hpp"
 
 namespace splash::model {
@@ -16,44 +15,31 @@ std::filesystem::path findTargetGguf(const std::filesystem::path &directory) {
   return found;
 }
 
-GgufTargetLoader::GgufTargetLoader(metal::MetalBackend &backend, const std::filesystem::path &path,
-                                   const gguf::TargetGeometry &geometry, PreparationCheck admitConversion)
-    : backend_(backend), source_(path, [&backend] { backend.checkOperation(); }),
-      files_([&backend] { backend.checkOperation(); }, std::move(admitConversion),
-             [this] { source_.checkUnchanged(); }) {
-  const GgufFile file(source_);
-  source_.checkUnchanged();
-  // Validates the whole source before its tensor data is hashed.
-  images_ = gguf::planImages(file, geometry);
+GgufTargetLoader::GgufTargetLoader(metal::MetalBackend &backend, WeightImages &images,
+                                   const std::filesystem::path &path, const gguf::TargetGeometry &geometry)
+    : backend_(backend), images_(images), planned_(std::make_shared<Planned>(path)) {
+  const GgufFile file(planned_->source);
   rotation_ = file.rotation();
-  for (const gguf::Image &image : images_) {
-    backend.checkOperation();
-    weights_.push_back(ggufImageWeight(source_, image));
-  }
-}
-
-WeightFile GgufTargetLoader::layer(uint32_t index) {
-  if (index >= images_.size() - 2) throw GgufError("target layer is out of range");
-  return open(index);
-}
-
-WeightFile GgufTargetLoader::head() { return open(images_.size() - 2); }
-
-WeightFile GgufTargetLoader::embedding() { return open(images_.size() - 1); }
-
-void GgufTargetLoader::prepare() {
-  for (size_t index = 0; index < images_.size(); ++index) static_cast<void>(files_.prepare(weights_[index], writer(index)));
-}
-
-WeightWriter GgufTargetLoader::writer(size_t index) {
-  return [this, index](int destination, const PreparationCheck &admit) {
-    writeGgufImage(backend_, source_, destination, images_[index], admit);
-  };
+  planned_->images = gguf::planImages(file, geometry);
 }
 
 WeightFile GgufTargetLoader::open(size_t index) {
-  const gguf::Image &image = images_[index];
-  return files_.open(backend_, weights_[index], writer(index), kGgufImageMagic, image.layer, image.type);
+  const gguf::Image &plan = planned_->images[index];
+  return images_.load({"target/" + plan.name, plan.magic, plan.layer, plan.type, plan.bytes,
+                       [&backend = backend_, planned = planned_, index](std::span<uint8_t>,
+                                                                         const metal::MetalBuffer &buffer) {
+                         writeGgufImage(backend, planned->source, buffer, planned->images[index]);
+                         planned->source.checkUnchanged();
+                       }});
 }
+
+WeightFile GgufTargetLoader::layer(uint32_t index) {
+  if (index >= planned_->images.size() - 2) throw GgufError("target layer is out of range");
+  return open(index);
+}
+
+WeightFile GgufTargetLoader::head() { return open(planned_->images.size() - 2); }
+
+WeightFile GgufTargetLoader::embedding() { return open(planned_->images.size() - 1); }
 
 } // namespace splash::model

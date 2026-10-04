@@ -8,7 +8,8 @@ from unittest import mock
 from tokenizers import Tokenizer, models, pre_tokenizers, processors
 from transformers import PreTrainedTokenizerFast
 
-from dev.tests.test_server import FakeRuntime, Harness
+from dev.tests.test_server import FOREVER, FakeRuntime, Harness
+from server.errors import APIError
 
 
 class PromptToolsTests(unittest.TestCase):
@@ -22,7 +23,7 @@ class PromptToolsTests(unittest.TestCase):
         def tokenize(index):
             option = bool(index % 2)
             return option, self.harness.app.tokenize(
-                {"content": text, "add_special": option}
+                {"content": text, "add_special": option}, deadline=FOREVER
             )
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
@@ -61,7 +62,13 @@ class PromptToolsTests(unittest.TestCase):
                     release.set()
                 for response in pending:
                     self.assertEqual(response.result()[0], 200)
-        self.assertTrue(self.harness.server.token_counts.idle.wait(2))
+        deadline = time.monotonic() + 2
+        while (
+            self.harness.server.token_counts.stats()["active"]
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.005)
+        self.assertEqual(self.harness.server.token_counts.stats()["active"], 0)
         self.post("/tokenize", {"content": "hello"})
         self.post("/apply-template", body)
 
@@ -139,7 +146,7 @@ class PromptToolsTests(unittest.TestCase):
             with self.subTest(effort=effort):
                 rendered = self.post("/apply-template", body)["prompt"]
                 tokens = self.post("/tokenize", {"content": rendered})["tokens"]
-                job, _, _ = self.harness.app.prepare(body)
+                job = self.harness.app.prepare(body, deadline=FOREVER)
                 self.assertEqual(tokens, job.prompt_tokens)
                 self.assertEqual("<think>" in rendered, effort != "none")
         self.assertFalse(self.runtime.requests)
@@ -176,13 +183,13 @@ class PromptToolsTests(unittest.TestCase):
             "tools": [{"type": "function", "function": {"name": "note"}}],
         }
         for _ in range(2):
-            app.prepare(body)
+            app.prepare(body, deadline=FOREVER)
         self.assertEqual(app.latencies.snapshot()["grammar"]["count"], 2)
-        app.prepare({"messages": body["messages"]})
+        app.prepare({"messages": body["messages"]}, deadline=FOREVER)
         self.assertEqual(app.latencies.snapshot()["grammar"]["count"], 2)
         app.constraint_factory.create.side_effect = ValueError("compile failed")
         with self.assertRaisesRegex(ValueError, "compile failed"):
-            app.prepare(body)
+            app.prepare(body, deadline=FOREVER)
         sample = app.latencies.snapshot()["grammar"]
         self.assertEqual(sample["count"], 3)
         self.assertGreaterEqual(sample["sum"], 0)
@@ -219,7 +226,11 @@ class PromptToolsTests(unittest.TestCase):
     def test_utilities_do_not_require_engine_admission_or_fit_context(self):
         self.harness.app.max_context = 1
         with (
-            mock.patch.object(self.harness.backend, "can_submit", return_value=False),
+            mock.patch.object(
+                self.harness.backend,
+                "refusal",
+                return_value=APIError(503, "engine is recovering", "engine_recovering"),
+            ),
             mock.patch.object(
                 self.harness.server.requests,
                 "acquire",

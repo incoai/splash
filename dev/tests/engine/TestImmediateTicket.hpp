@@ -2,6 +2,7 @@
 
 #include "engine/Types.hpp"
 
+#include <atomic>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -23,6 +24,29 @@ public:
 
 private:
   std::vector<ModelStepResult> results_;
+};
+
+// A command that stays in flight until the test sets `ready`, from any
+// thread.
+class HeldTicket final : public ModelBatchTicket {
+public:
+  HeldTicket(std::vector<ModelStepResult> results,
+             std::shared_ptr<std::atomic<bool>> ready, double wallMilliseconds)
+      : results_(std::move(results)), ready_(std::move(ready)),
+        wallMilliseconds_(wallMilliseconds) {}
+
+  [[nodiscard]] bool ready() const noexcept override { return *ready_; }
+  [[nodiscard]] std::vector<ModelStepResult> wait() override {
+    return std::move(results_);
+  }
+  [[nodiscard]] double wallMilliseconds() const noexcept override {
+    return wallMilliseconds_;
+  }
+
+private:
+  std::vector<ModelStepResult> results_;
+  std::shared_ptr<std::atomic<bool>> ready_;
+  double wallMilliseconds_ = 0.0;
 };
 
 inline std::unique_ptr<ModelBatchTicket>

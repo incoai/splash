@@ -7,7 +7,6 @@
 #include <stdint.h>
 #endif
 
-// Separate from ops::RoPETableShape so host-only fields cannot change the ABI.
 struct RopeTableParams {
   uint32_t target_rows;
   uint32_t draft_rows;
