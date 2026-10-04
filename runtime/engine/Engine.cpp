@@ -2581,6 +2581,7 @@ void Engine::apply(const Pending &command, std::span<const ModelStepResult> resu
         throw std::logic_error("model returned mismatched score logits");
       }
       active.scoreLogits = result.scoreLogits;
+      active.scoreReadout = {result.scoreLogNormalizer, result.scoreTopIds, result.scoreTopLogits};
     }
     // Score requests carry maxNewTokens == 0; only the model's finished flag
     // on the final prompt chunk completes them. A request whose output the
@@ -2634,7 +2635,7 @@ void Engine::apply(const Pending &command, std::span<const ModelStepResult> resu
     } else if (schedulerResults[index].finished) {
       finish(active, result.finished ? EngineFinishReason::Stop
                                      : EngineFinishReason::Length,
-             active.scoreLogits);
+             active.scoreLogits, active.scoreReadout);
     }
   }
 }
@@ -2682,7 +2683,7 @@ Engine::LaneEnd Engine::capacityExhausted(std::string_view what,
 }
 
 void Engine::finish(Request &active, EngineFinishReason reason,
-                    std::span<const float> optionLogits) {
+                    std::span<const float> optionLogits, const ScoreReadout &score) {
   if (reason == EngineFinishReason::Cancelled)
     scheduler_.cancel(active.request.id);
   else
@@ -2695,7 +2696,7 @@ void Engine::finish(Request &active, EngineFinishReason reason,
       reason == EngineFinishReason::Length && completionTokens < active.request.maxNewTokens;
   events_.completed(active.request.id, reason, bounded, active.promptTokens,
                     completionTokens, active.deduplicatedKvTokens, optionLogits,
-                    active.speculation);
+                    active.speculation, score);
   if (reason == EngineFinishReason::Cancelled) {
     ++counters_.cancelled;
   } else {
