@@ -1,11 +1,11 @@
 #include "Vision.hpp"
 
+#include "Checked.hpp"
 #include "metal/abi/Vision.h"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <cstring>
 #include <limits>
 #include <stdexcept>
 
@@ -22,21 +22,25 @@ constexpr uint32_t kMergerColumnTile = 256;
 constexpr uint32_t kKeyTile = 128;
 constexpr uint32_t kQueryTile = 64;
 constexpr uint32_t kQkDimension = 80; // head dimension 72 padded to 16
-constexpr uint64_t kArenaAlignment = 16 * 1024;
 constexpr uint64_t kBf16Bytes = 2;
+constexpr uint64_t kFloatBytes = 4;
+
+// The one vision tower the kernels are specialized for.
+constexpr VisionLayout kTower{};
+static_assert(kTower.headDimension + 8 == kQkDimension && kTower.hiddenSize % kGemmColumnTile == 0 &&
+                  kTower.paddedIntermediateSize % kGemmColumnTile == 0 &&
+                  kTower.mergedHiddenSize % kMergerColumnTile == 0 &&
+                  kTower.patchDimension % kGemmColumnTile == 0,
+              "vision kernels' tile assumptions");
 
 uint32_t roundUp(uint32_t value, uint32_t multiple) noexcept {
   return (value + multiple - 1) / multiple * multiple;
 }
 
-uint64_t alignArena(uint64_t bytes) noexcept {
-  return (bytes + kArenaAlignment - 1) / kArenaAlignment * kArenaAlignment;
-}
-
 // Scratch tensor byte sizes for one encoder sized to maximumPatches. GEMM
 // tiles read and write whole 64-row tiles, attention reads whole 128-key
 // tiles, and the merger reads the normalized rows as (patches / 4, 4608).
-std::array<uint64_t, 13> scratchLayout(const VisionLayout &layout,
+std::array<uint64_t, 12> scratchLayout(const VisionLayout &layout,
                                        uint32_t maximumPatches) {
   const uint64_t rows = roundUp(maximumPatches, kGemmRowTile);
   const uint64_t padded = roundUp(maximumPatches, kKeyTile);
@@ -45,10 +49,9 @@ std::array<uint64_t, 13> scratchLayout(const VisionLayout &layout,
   const uint64_t headRows = uint64_t{layout.heads} * padded;
   return {
       rows * layout.patchDimension * kBf16Bytes,                 // Patches
-      rows * hidden * kBf16Bytes,                                // Positions
-      uint64_t{maximumPatches} * layout.headDimension * 4,       // RopeCos
-      uint64_t{maximumPatches} * layout.headDimension * 4,       // RopeSin
-      rows * hidden * kBf16Bytes,                                // Hidden
+      uint64_t{maximumPatches} * layout.headDimension * kFloatBytes, // RopeCos
+      uint64_t{maximumPatches} * layout.headDimension * kFloatBytes, // RopeSin
+      rows * hidden * kFloatBytes,                               // Hidden
       std::max(rows * hidden, mergedRows * layout.mergedHiddenSize) *
           kBf16Bytes,                                            // Normalized
       std::max(rows * 3 * hidden, mergedRows * layout.mergedHiddenSize) *
@@ -66,14 +69,8 @@ void requireLayout(const VisionLayout &layout) {
   // Packages share the same vision tower; only the language-space projection
   // width varies with the text model.
   VisionLayout tower = layout;
-  tower.outputHiddenSize = VisionLayout{}.outputHiddenSize;
-  if (tower != VisionLayout{} || !layout.outputHiddenSize ||
-      layout.headDimension + 8 != kQkDimension ||
-      layout.hiddenSize % kGemmColumnTile ||
-      layout.paddedIntermediateSize % kGemmColumnTile ||
-      layout.mergedHiddenSize % kMergerColumnTile ||
-      layout.outputHiddenSize % kMergerColumnTile ||
-      layout.patchDimension % kGemmColumnTile) {
+  tower.outputHiddenSize = kTower.outputHiddenSize;
+  if (tower != kTower || !layout.outputHiddenSize || layout.outputHiddenSize % kMergerColumnTile) {
     throw std::invalid_argument(
         "vision kernels are specialized for the Qwen3.5 27-block tower");
   }
@@ -90,7 +87,7 @@ uint64_t Vision::scratchBytes(const VisionLayout &layout,
   }
   uint64_t total = 0;
   for (uint64_t bytes : scratchLayout(layout, maximumPatches)) {
-    const uint64_t aligned = alignArena(bytes);
+    const uint64_t aligned = alignUp(bytes);
     if (aligned > std::numeric_limits<uint64_t>::max() - total) {
       throw std::overflow_error("vision scratch byte count overflows");
     }
@@ -107,16 +104,15 @@ Vision::Vision(metal::MetalBackend &backend, const VisionWeights &model,
                uint32_t maximumPatches)
     : model_(model), maximumPatches_(maximumPatches) {
   const uint64_t total = scratchBytes(model.layout, maximumPatches);
+  // New backend buffers are zero-filled, so padding rows read by whole tiles
+  // start finite.
   arena_ = backend.allocateBuffer(total, metal::BufferStorage::Shared,
                                   "vision-scratch");
-  // Padding rows and tokens are read by whole tiles but never consumed as
-  // results; zeroed storage guarantees they are finite.
-  std::memset(arena_.contents(), 0, static_cast<size_t>(total));
   uint64_t cursor = 0;
   const auto layout = scratchLayout(model.layout, maximumPatches);
   for (uint32_t index = 0; index < layout.size(); ++index) {
     scratch_[index] = backend.view(arena_, cursor, layout[index]);
-    cursor += alignArena(layout[index]);
+    cursor += alignUp(layout[index]);
   }
   if (cursor != total)
     throw std::logic_error("vision scratch arena mismatch");
@@ -143,10 +139,10 @@ void Vision::encode(CommandGraph &graph, ImageGrid grid,
                     const MetalBuffer &pixels,
                     const MetalBuffer &embeddings) const {
   const VisionLayout &layout = model_.layout;
-  const uint32_t tokens = grid.patches();
-  if (!grid.valid() || tokens > maximumPatches_) {
+  if (!grid.valid() || grid.patches() > maximumPatches_) {
     throw std::invalid_argument("image grid exceeds the vision encoder");
   }
+  const auto tokens = static_cast<uint32_t>(grid.patches());
   if (!pixels || pixels.sizeBytes() < grid.pixelBytes()) {
     throw std::invalid_argument("image pixels do not cover the grid");
   }
@@ -169,14 +165,14 @@ void Vision::encode(CommandGraph &graph, ImageGrid grid,
 
   graph.add("vision_patchify", {pixels, scratch(Scratch::Patches)}, gridParams,
             {tokens, 1, 1});
+  // The positions start the residual stream the patch embedding adds to.
   graph.add("vision_prepare_positions",
-            {model_.positionTable, scratch(Scratch::Positions),
-             scratch(Scratch::RopeCos), scratch(Scratch::RopeSin)},
-            gridParams, {tokens, 1, 1});
+            {model_.positionTable, hidden, scratch(Scratch::RopeCos),
+             scratch(Scratch::RopeSin)},
+            gridParams, {roundUp(tokens, kGemmRowTile), 1, 1});
   addGemm(graph, "vision_gemm_m64n128_residual", scratch(Scratch::Patches),
-          model_.patchEmbedding, hidden, scratch(Scratch::Positions),
-          layout.hiddenSize, layout.patchDimension, tokens, kGemmRowTile,
-          kGemmColumnTile);
+          model_.patchEmbedding, hidden, hidden, layout.hiddenSize,
+          layout.patchDimension, tokens, kGemmRowTile, kGemmColumnTile);
 
   for (const VisionBlock &block : model_.blocks) {
     addNorm(graph, hidden, block.norm1, normalized, tokens);

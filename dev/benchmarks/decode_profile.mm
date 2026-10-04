@@ -14,9 +14,10 @@
 // Those counts set how many expert weight bytes a layer streams.
 
 #include "engine/Types.hpp"
-#include "metal/abi/MoE.h"
+#include "MoeRoutes.hpp"
 #include "model/Runtime.hpp"
 #include "ops/PageStorage.hpp"
+#include "metal/BackendInstrumentation.hpp"
 #include "metal/MetalBackend.hpp"
 #include "model/ModelFactory.hpp"
 #include "engine/MemoryGovernor.hpp"
@@ -31,7 +32,6 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
-#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <map>
@@ -42,6 +42,9 @@
 
 using namespace splash;
 using namespace splash::engine;
+using metal::BackendInstrumentation;
+using benchmark::MoeRoutes;
+using benchmark::recordRoutes;
 
 namespace {
 
@@ -91,53 +94,6 @@ std::vector<uint32_t> pageRange(uint32_t first, uint32_t count) {
   for (uint32_t index = 0; index < count; ++index)
     result[index] = first + index;
   return result;
-}
-
-// The routes of one MoE layer call, read after its moe_group_routes
-// dispatch: rows, routed experts per row and in the router, tile rows, and
-// the distinct routed experts and live tiles (routed plus shared) it grouped.
-struct MoeRoutes final {
-  ::MoeGroupParams params{};
-  uint32_t experts = 0;
-  uint32_t tiles = 0;
-};
-
-const metal::MetalBuffer *boundBuffer(const metal::ComputeDispatch &dispatch,
-                                      uint32_t index) {
-  for (const metal::BufferBinding &binding : dispatch.buffers)
-    if (binding.index == index) return &binding.buffer;
-  return nullptr;
-}
-
-// Reads the shared-storage scratch of a moe_group_routes dispatch (bindings
-// of kernels/shared/moe.metal): selected expert ids at 0, the tile count at 2
-// and MoeGroupParams at 5. Other dispatches, or unreadable bindings, are
-// skipped.
-void recordRoutes(const metal::ComputeDispatch &dispatch,
-                  std::vector<MoeRoutes> &routes) {
-  if (dispatch.pipelineName != "moe_group_routes") return;
-  const metal::MetalBuffer *selected = boundBuffer(dispatch, 0);
-  const metal::MetalBuffer *tileCount = boundBuffer(dispatch, 2);
-  const auto params = std::find_if(
-      dispatch.bytes.begin(), dispatch.bytes.end(),
-      [](const metal::BytesBinding &binding) { return binding.index == 5; });
-  if (!selected || !tileCount || !selected->contents() || !tileCount->contents() ||
-      params == dispatch.bytes.end() || params->sizeBytes != sizeof(::MoeGroupParams))
-    return;
-  MoeRoutes entry;
-  std::memcpy(&entry.params, params->data, sizeof(entry.params));
-  const uint32_t perRow = entry.params.top_k + 1;
-  const auto *ids = static_cast<const uint32_t *>(selected->contents());
-  std::vector<bool> seen(entry.params.experts, false);
-  for (uint64_t route = 0; route < uint64_t{entry.params.rows} * perRow; ++route) {
-    if (route % perRow == entry.params.top_k || ids[route] >= seen.size() ||
-        seen[ids[route]])
-      continue;
-    seen[ids[route]] = true;
-    ++entry.experts;
-  }
-  entry.tiles = *static_cast<const uint32_t *>(tileCount->contents());
-  routes.push_back(entry);
 }
 
 // Summarises the layer calls of each row count separately (a prefill packs
@@ -204,9 +160,11 @@ uint32_t parseCount(std::string_view text, std::string_view label) {
 
 struct Lane final {
   uint64_t id = 0;
-  uint32_t slot = 0;
+  uint32_t stateLane = 0;
   uint64_t position = 0;
   std::vector<uint32_t> pages;
+  // The pages never change, so the page table keeps its first revision.
+  uint64_t pageTableRevision = 1;
 };
 
 void prefill(model::Runtime &executor, Lane &lane,
@@ -215,21 +173,24 @@ void prefill(model::Runtime &executor, Lane &lane,
   request.id = lane.id;
   request.prompt.assign(prompt.begin(), prompt.end());
   request.maxNewTokens = 256;
-  executor.beginColdRequest(request.modelView(), lane.slot);
+  executor.beginColdRequest(request.modelView(), lane.stateLane);
   uint32_t offset = 0;
   while (offset < prompt.size()) {
     const uint32_t count = std::min<uint32_t>(
         model::ExecutionLimits::prefillTokenBudget,
         static_cast<uint32_t>(prompt.size()) - offset);
-    BatchPlan plan{WorkKind::Prefill, BatchCohort::Greedy,
-                   {{lane.id, count, offset}}, DecodeStage::Regular};
-    ModelBatchItem item{lane.id, lane.slot, offset, offset, count,
-                           lane.pages};
+    BatchPlan plan{.kind = WorkKind::Prefill,
+                   .items = {{lane.id, count, offset}},
+                   .decodeStage = DecodeStage::Regular};
+    ModelBatchItem item{lane.id, offset, count, lane.pages,
+                        lane.pageTableRevision};
     item.inputTokens = prompt.subspan(offset, count);
     auto results =
         executor.prefill(plan, std::span<const ModelBatchItem>(&item, 1));
     if (results.size() != 1 || results[0].consumedPromptTokens != count)
       throw std::runtime_error("prefill consumed the wrong row count");
+    if (!results[0].failure.empty())
+      throw std::runtime_error(results[0].failure);
     offset += count;
   }
   lane.position = prompt.size();
@@ -244,20 +205,23 @@ struct CycleTiming final {
 CycleTiming decodeCycle(metal::MetalBackend &backend,
                         model::Runtime &executor,
                         std::span<Lane> lanes) {
-  const uint64_t submissionsBefore = backend.submissionCount();
+  const uint64_t submissionsBefore =
+      BackendInstrumentation::submittedCommands(backend);
   const auto started = std::chrono::steady_clock::now();
   BatchPlan plan;
   plan.kind = WorkKind::Decode;
-  plan.cohort = BatchCohort::Greedy;
   std::vector<ModelBatchItem> items;
   for (Lane &lane : lanes) {
     plan.items.push_back({lane.id, 0, 0});
-    items.push_back({lane.id, lane.slot, lane.position, 0, 0, lane.pages});
+    items.push_back({lane.id, lane.position, 0, lane.pages,
+                     lane.pageTableRevision});
   }
   auto results = executor.decode(plan, items);
   if (results.size() != lanes.size())
     throw std::runtime_error("decode width changed");
   for (size_t index = 0; index < lanes.size(); ++index) {
+    if (!results[index].failure.empty())
+      throw std::runtime_error(results[index].failure);
     if (results[index].finished)
       throw std::runtime_error("the answer ended before profiling finished");
     lanes[index].position += results[index].outputTokens.size() -
@@ -266,7 +230,7 @@ CycleTiming decodeCycle(metal::MetalBackend &backend,
   const auto finished = std::chrono::steady_clock::now();
   return {executor.telemetry().lastDecodeGpuSeconds,
           std::chrono::duration<double>(finished - started).count(),
-          backend.submissionCount() - submissionsBefore};
+          BackendInstrumentation::submittedCommands(backend) - submissionsBefore};
 }
 
 } // namespace
@@ -300,37 +264,35 @@ int main(int argc, char **argv) {
       }
 
       metal::MetalBackend backend(argv[1]);
-      model::ModelPackage model = model::loadModelPackage(
-          backend, std::filesystem::path(argv[2]));
+      const std::filesystem::path root(argv[2]);
+      model::ModelPackage model =
+          model::loadModelPackage(backend, root, model::inspectModelPackage(root));
       ops::ExecutionPlans operators(backend.capabilities());
-      model::ModelMemoryPlan executorPlan =
-          model::plannedRuntimeMemory(backend.capabilities(), model, operators, format);
 
       // Enough Page32 pages for four lanes of prompt plus generated rows.
       const uint32_t pagesPerLane =
           (promptTokens + 256 + model::ExecutionLimits::targetVerifyRows) /
               kv::kPageTokens +
           2;
+      // Whole extents of the largest size the pool rule picks, as a large
+      // pool's would be.
+      const kv::Layout kvLayout = model.targetKvLayout(format);
+      const uint32_t extentPages = kvLayout.maximumExtentPages();
       const uint32_t pageCount =
-          (pagesPerLane * 4 + model.targetKvLayout(format).sparseMappingBatchPages() -
-           1) /
-          model.targetKvLayout(format).sparseMappingBatchPages() *
-          model.targetKvLayout(format).sparseMappingBatchPages();
+          (pagesPerLane * 4 + extentPages - 1) / extentPages * extentPages;
       MemoryGovernor governor(
-          backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
-      kv::PageStorage pages(backend, governor.allocationAdmission(),
-                              model.targetKvLayout(format), pageCount);
-      for (uint32_t page = 0; page < pageCount; ++page) {
-        if (!pages.ensureResident(page))
-          throw std::runtime_error("could not back the KV pages");
+          backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
+          queryHostAvailableMemory, 0);
+      kv::PageStorage pages(backend, governor.allocationAdmission(), kvLayout,
+                            pageCount, extentPages);
+      for (uint32_t extent = 0; extent < pageCount / extentPages; ++extent) {
+        if (!pages.allocateExtent(extent))
+          throw std::runtime_error("could not allocate the KV extents");
       }
       model::QwenStateStorage states(backend,
                                       governor.allocationAdmission(),
-                                      model.stateLayout());
-      model::RuntimeContext context{
-          backend, governor.allocationAdmission(), model, pages, states, operators,
-          ops::kMaximumImagePatches, executorPlan.pipelineReserveBytes,
-          executorPlan.runtimeOverheadReserveBytes};
+                                      model.stateLayout(), nullptr);
+      model::RuntimeContext context{backend, model, pages, states, operators};
       model::Runtime executor(context);
 
       std::printf("device %s, %u prompt tokens, %u cycles per width\n",
@@ -345,9 +307,10 @@ int main(int argc, char **argv) {
       const std::vector<uint32_t> prompt = chatPrompt(promptTokens);
       // Filled only by profiled replays, so fused timings are unaffected.
       std::vector<MoeRoutes> routes;
-      backend.setDispatchObserver([&](const metal::ComputeDispatch &dispatch) {
-        recordRoutes(dispatch, routes);
-      });
+      BackendInstrumentation::setDispatchObserver(
+          backend, [&](const metal::ComputeDispatch &dispatch) {
+            recordRoutes(dispatch, routes);
+          });
 
       // Warm prefill and B1 decode with real work before measuring.
       prefill(executor, lanes[0], prompt);
@@ -361,11 +324,12 @@ int main(int argc, char **argv) {
       const double prefillFused =
           executor.telemetry().totalPrefillGpuSeconds - prefillBefore;
       executor.end(lanes[0].id);
-      backend.setDispatchProfiling(true);
+      BackendInstrumentation::setDispatchProfiling(backend, true);
       prefill(executor, lanes[0], prompt);
-      backend.setDispatchProfiling(false);
+      BackendInstrumentation::setDispatchProfiling(backend, false);
       Table prefillTable;
-      accumulate(prefillTable, backend.takeDispatchProfile());
+      accumulate(prefillTable,
+                 BackendInstrumentation::takeDispatchProfile(backend));
       print("prefill " + std::to_string(promptTokens) + " rows", prefillTable,
             1.0, prefillFused);
       printRoutes(routes);
@@ -383,12 +347,13 @@ int main(int argc, char **argv) {
                     "command(s) per cycle\n",
                     title, median.gpuSeconds * 1e3, median.wallSeconds * 1e3,
                     static_cast<unsigned long long>(median.commands));
-        backend.setDispatchProfiling(true);
+        BackendInstrumentation::setDispatchProfiling(backend, true);
         for (uint32_t cycle = 0; cycle < cycles; ++cycle)
           static_cast<void>(decodeCycle(backend, executor, active));
-        backend.setDispatchProfiling(false);
+        BackendInstrumentation::setDispatchProfiling(backend, false);
         Table table;
-        accumulate(table, backend.takeDispatchProfile());
+        accumulate(table,
+                   BackendInstrumentation::takeDispatchProfile(backend));
         print(title, table, cycles, median.gpuSeconds);
         printRoutes(routes);
       };
@@ -402,7 +367,7 @@ int main(int argc, char **argv) {
 
       for (Lane &lane : lanes)
         executor.end(lane.id);
-      backend.setDispatchObserver({});
+      BackendInstrumentation::setDispatchObserver(backend, {});
       return 0;
     } catch (const std::exception &error) {
       std::cerr << "decode-profile: " << error.what() << '\n';

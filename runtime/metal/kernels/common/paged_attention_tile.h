@@ -1,7 +1,8 @@
 #pragma once
 
 #include "metal/abi/PagedAttention.h"
-#include "metal/kernels/common/q8_paging.h"
+#include "metal/kernels/common/kv_extent.h"
+#include "metal/kernels/common/kv_paging.h"
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 #include <metal_stdlib>
 
@@ -24,47 +25,41 @@ constant uint SplashPrefillTileRows = SPLASH_PREFILL_ATTENTION_TILE_ROWS;
 constant uint SplashPrefillMaximumSplits =
     SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS;
 
-inline bool splash_q8_prefill_attention_contract_valid(
-    constant SplashQ8PrefillAttentionParams &params) {
+inline bool splash_prefill_attention_contract_valid(
+    constant SplashPrefillAttentionParams &params) {
   return params.rows > 0 && params.rows <= SPLASH_PREFILL_TOKEN_BUDGET &&
          params.chunk_stride >= params.rows &&
          params.chunk_stride <= SPLASH_PREFILL_TOKEN_BUDGET &&
          params.chunk_stride % SPLASH_TARGET_KV_BLOCK_TOKENS == 0 &&
          params.page_table_entries >=
              (params.committed_tokens + params.rows +
-              SplashQ8PageTokens - 1) /
-                 SplashQ8PageTokens &&
-         params.physical_page_count > 0 && params.split_count > 0 &&
+              SplashKvPageTokens - 1) /
+                 SplashKvPageTokens &&
+         params.kv.extent_pages > 0 && params.split_count > 0 &&
          params.split_count <= SplashPrefillMaximumSplits &&
          ulong(params.committed_tokens) + params.rows <=
-             ulong(SPLASH_MAXIMUM_PHYSICAL_KV_TOKENS) &&
-         params.reserved0 == 0 && params.reserved1 == 0;
+             ulong(SPLASH_MAXIMUM_PHYSICAL_KV_TOKENS);
 }
 
-inline bool splash_q8_verify_attention_contract_valid(
-    constant SplashQ8VerifyAttentionParams &params) {
-  return params.active_rows > 0 &&
-         params.active_rows <= SPLASH_TARGET_VERIFY_ROWS &&
-         params.chunk_stride % SPLASH_TARGET_KV_BLOCK_TOKENS == 0 &&
-         params.chunk_stride >= params.active_rows &&
-         params.page_table_entries >=
-             (params.committed_tokens + params.active_rows +
-              SplashQ8PageTokens - 1) /
-                 SplashQ8PageTokens &&
-         params.physical_page_count > 0 &&
-         ulong(params.committed_tokens) + params.active_rows <=
+inline bool splash_verify_attention_contract_valid(
+    constant SplashVerifyAttentionParams &params) {
+  return params.page_table_entries >=
+             (params.committed_tokens + SPLASH_TARGET_VERIFY_ROWS +
+              SplashKvPageTokens - 1) /
+                 SplashKvPageTokens &&
+         params.kv.extent_pages > 0 &&
+         ulong(params.committed_tokens) + SPLASH_TARGET_VERIFY_ROWS <=
              ulong(SPLASH_MAXIMUM_PHYSICAL_KV_TOKENS) &&
          params.split_count > 0 &&
          params.split_count <= SplashVerifyMaximumSplits &&
          params.slot_splits >= params.split_count &&
-         params.slot_splits <= SplashVerifyMaximumSplits &&
-         params.reserved2 == 0;
+         params.slot_splits <= SplashVerifyMaximumSplits;
 }
 
 // Split and reduce derive the same balanced partition of each query tile's
 // visible pages. Causal masking remains per query row inside each split.
 inline uint splash_attention_pages(uint visible_tokens) {
-  return (visible_tokens + SplashQ8PageTokens - 1) / SplashQ8PageTokens;
+  return (visible_tokens + SplashKvPageTokens - 1) / SplashKvPageTokens;
 }
 
 inline uint splash_attention_pages_per_split(uint pages, uint splits) {
@@ -79,14 +74,13 @@ inline uint splash_attention_pages_per_split(uint pages, uint splits) {
 // (kv4_g6: simdgroups 6 and 7) only take part in the caller's barriers.
 // The float4 loads need 16-byte aligned slabs (alignas in the entries) and
 // the page's 32 key and value scales as float4 vectors, in device memory
-// (splash_q8_scale_index is a multiple of 32 floats and the bound scale
-// buffers start at their placement-aligned base).
+// (splash_q8_scale_index is a multiple of 32 floats and every region of an
+// extent starts 64 KiB-aligned).
 // Rows whose running maximum grew atomically set the shared boolean rescale
 // flag. Existing threadgroup barriers separate reset, concurrent set, and
 // read; relaxed atomics make the same-value writes safe without changing
 // arithmetic.
-template <uint QueryHeadsPerKVHead, uint RowsPerTile, bool ScaleInSoftmax,
-          bool Quantized>
+template <uint QueryHeadsPerKVHead, uint RowsPerTile, bool Quantized>
 inline void splash_attention_page_softmax(
     threadgroup const float *scores, threadgroup bfloat *probabilities,
     threadgroup float *row_max, threadgroup float *row_sum,
@@ -95,7 +89,7 @@ inline void splash_attention_page_softmax(
     uint token_start,
     uint visible_tokens, uint committed_tokens, uint active_rows,
     uint thread_index) {
-  constexpr uint N = SplashQ8PageTokens;
+  constexpr uint N = SplashKvPageTokens;
   constexpr uint FusedRows = RowsPerTile * QueryHeadsPerKVHead;
   constexpr uint TokensPerLane = 8;
   constexpr uint LanesPerRow = N / TokensPerLane;
@@ -118,7 +112,7 @@ inline void splash_attention_page_softmax(
   float score[TokensPerLane];
   {
     float4 low = scores4[0], high = scores4[1];
-    if constexpr (Quantized && ScaleInSoftmax) {
+    if constexpr (Quantized) {
       low *= key_scales[vector];
       high *= key_scales[vector + 1];
     }
@@ -180,15 +174,15 @@ inline void splash_attention_page_softmax(
 // in place as device tensor operands: the prefill tile, and the verify tile
 // in its direct placement, which differs only in RowsPerTile. Queries are
 // KV-head-major [kv head][row][query head in group][dimension], so the tile's
-// fused rows form one contiguous M x D tensor. Three barriers per page order
-// the score store, the softmax and the probability reads of PV.
+// fused rows form one contiguous M x D tensor. Each page is reached through
+// its table entry (kv_extent.h).
+// Three barriers per page order the score store, the softmax and the
+// probability reads of PV.
 template <uint KVHeads, uint QueryHeadsPerKVHead, uint RowsPerTile,
-          bool ScaleInSoftmax, typename CacheElement>
+          typename CacheElement>
 inline void splash_paged_attention_tile(
-    device bfloat *tile_queries, device CacheElement *cache_keys,
-    device const float *key_scales_buffer, device CacheElement *cache_values,
-    device const float *value_scales_buffer, device const uint *page_table,
-    uint kv_head, uint committed_tokens, uint active_rows, uint splits,
+    device bfloat *tile_queries, device const SplashKvPage *page_table,
+    SplashKvLayer kv, uint kv_head, uint committed_tokens, uint active_rows, uint splits,
     uint split, device float *partials, device float *statistics, ulong slot,
     threadgroup float *scores, threadgroup bfloat *probabilities,
     threadgroup float *row_max, threadgroup float *row_sum,
@@ -196,8 +190,8 @@ inline void splash_paged_attention_tile(
     uint thread_index) {
   constexpr ushort M = RowsPerTile * QueryHeadsPerKVHead;
   constexpr bool Quantized = is_same<CacheElement, int8_t>::value;
-  constexpr ushort N = SplashQ8PageTokens;
-  constexpr ushort D = SplashQ8HeadDimension;
+  constexpr ushort N = SplashKvPageTokens;
+  constexpr ushort D = SplashKvHeadDimension;
   uint visible_tokens = committed_tokens + active_rows;
   uint pages = splash_attention_pages(visible_tokens);
   uint per_split = splash_attention_pages_per_split(pages, splits);
@@ -215,14 +209,16 @@ inline void splash_paged_attention_tile(
   auto st = tensor(scores, dextents<int, 2>{N, M}, array<int, 2>{1, N});
   auto pt = tensor(probabilities, dextents<int, 2>{N, M}, array<int, 2>{1, N});
   auto p0 = pt.slice<N, M>(0, 0);
-  auto key_type = tensor(cache_keys, dextents<int, 2>{D, N}, array<int, 2>{1, D});
-  auto value_type =
-      tensor(cache_values, dextents<int, 2>{N, D}, array<int, 2>{1, N});
+  auto key_type = tensor(static_cast<device CacheElement *>(nullptr),
+                         dextents<int, 2>{D, N}, array<int, 2>{1, D});
+  auto value_type = tensor(static_cast<device CacheElement *>(nullptr),
+                           dextents<int, 2>{N, D}, array<int, 2>{1, N});
+  const SplashKvAddressing<KVHeads, CacheElement> addressing(kv, kv_head);
   auto q0 = qt.slice<D, M>(0, 0);
   auto k0 = key_type.template slice<D, N>(0, 0);
   auto v0 = value_type.template slice<N, D>(0, 0);
-  // QK writes a complete page score tile; PV accumulates the running output.
-  // Key scaling is a precompiled placement choice; both use the same QK/PV.
+  // QK writes a complete page score tile, the softmax applies an INT8 page's
+  // key scales and PV accumulates the running output.
   constexpr auto qk_descriptor =
       matmul2d_descriptor(M, N, D, false, true, false,
                           matmul2d_descriptor::mode::multiply);
@@ -244,44 +240,24 @@ inline void splash_paged_attention_tile(
   }
 
   for (uint page = page_begin; page < page_end; ++page) {
-    uint physical = page_table[page];
+    const SplashKvPageTensors<CacheElement> tensors =
+        addressing.page(page_table[page]);
     uint token_start = page * N;
-    auto kt = tensor(
-        cache_keys + splash_q8_key_index<KVHeads>(physical, kv_head, 0, 0),
-        dextents<int, 2>{D, N}, array<int, 2>{1, D});
-    auto vt = tensor(
-        cache_values + splash_q8_value_index<KVHeads>(physical, kv_head, 0, 0),
-        dextents<int, 2>{N, D}, array<int, 2>{1, N});
-    device const float *key_scales = nullptr;
-    device const float *value_scales = nullptr;
-    if constexpr (Quantized) {
-      ulong scale_index = splash_q8_scale_index<KVHeads>(physical, kv_head, 0);
-      key_scales = key_scales_buffer + scale_index;
-      value_scales = value_scales_buffer + scale_index;
-    }
+    auto kt = tensor(tensors.keys, dextents<int, 2>{D, N}, array<int, 2>{1, D});
+    auto vt = tensor(tensors.values, dextents<int, 2>{N, D}, array<int, 2>{1, N});
+    device const float *key_scales = tensors.key_scales;
+    device const float *value_scales = tensors.value_scales;
 
     auto page_scores = qk.template get_destination_cooperative_tensor<
         decltype(q0), decltype(k0), float>();
     // One full-dimension product initializes the score CT through MPP.
     auto ks = kt.template slice<D, N>(0, 0);
     qk.run(q0, ks, page_scores);
-    if constexpr (Quantized && !ScaleInSoftmax) {
-      const bool scores_full =
-          uint(page_scores.get_capacity()) * (8u * 32u) == uint(M) * N;
-#pragma unroll
-      for (ushort index = 0; index < page_scores.get_capacity(); ++index) {
-        if (!scores_full && !page_scores.is_valid_element(index))
-          continue;
-        const auto coordinates = page_scores.get_multidimensional_index(index);
-        page_scores[index] *= key_scales[coordinates[0]];
-      }
-    }
     page_scores.store(st.slice<N, M>(0, 0));
     if (thread_index == 0)
       atomic_store_explicit(rescale, 0u, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    splash_attention_page_softmax<QueryHeadsPerKVHead, RowsPerTile,
-                             ScaleInSoftmax, Quantized>(
+    splash_attention_page_softmax<QueryHeadsPerKVHead, RowsPerTile, Quantized>(
         scores, probabilities, row_max, row_sum, previous_scale, rescale,
         reinterpret_cast<device const float4 *>(key_scales),
         reinterpret_cast<device const float4 *>(value_scales), token_start,
@@ -313,50 +289,19 @@ inline void splash_paged_attention_tile(
 // [slot][fused row]{max, sum}. The callers lay slots out as
 // [tile][KV head][split] (prefill) and [lane][KV head][split] (verify).
 // Combines the splits of one fused row in split order. Only splits that own
-// at least one page were written; the partition is recomputed here.
+// at least one page were written; the partition is recomputed here. The
+// statistics are shared by all 256 output dimensions: their weights are
+// computed once per row, then each lane streams one dimension of the
+// partials. A row past the tile's active rows is written as zeros; a
+// threadgroup owns one fused row, so it returns uniformly.
 template <uint QueryHeadsPerKVHead, uint RowsPerTile>
-inline void splash_q8_attention_reduce_row(
-    device const float *partials, device const float *statistics,
-    device bfloat *tile_output, uint committed_tokens, uint active_rows,
-    uint splits, ulong head_slot, uint fused_row, uint thread_index) {
-  constexpr ushort M = RowsPerTile * QueryHeadsPerKVHead;
-  constexpr ushort D = SplashQ8HeadDimension;
-  uint query_row = fused_row / QueryHeadsPerKVHead;
-  uint visible_tokens = committed_tokens + active_rows;
-  uint pages = splash_attention_pages(visible_tokens);
-  uint per_split = splash_attention_pages_per_split(pages, splits);
-  uint written = (pages + per_split - 1) / per_split;
-  float value = 0.0f;
-  if (query_row < active_rows) {
-    float maximum = -INFINITY;
-    for (uint split = 0; split < written; ++split)
-      maximum =
-          max(maximum, statistics[((head_slot + split) * M + fused_row) * 2]);
-    float numerator = 0.0f;
-    float denominator = 0.0f;
-    for (uint split = 0; split < written; ++split) {
-      ulong stat = ((head_slot + split) * M + fused_row) * 2;
-      float weight = fast::exp(statistics[stat] - maximum);
-      numerator +=
-          weight *
-          partials[((head_slot + split) * M + fused_row) * D + thread_index];
-      denominator += weight * statistics[stat + 1];
-    }
-    value = denominator > 0.0f ? numerator / denominator : 0.0f;
-  }
-  tile_output[fused_row * D + thread_index] = bfloat(value);
-}
-
-// Statistics are shared by all 256 output dimensions. Compute their weights
-// once per row, then let each lane stream one dimension of the partials.
-template <uint QueryHeadsPerKVHead, uint RowsPerTile>
-inline void splash_q8_attention_reduce_row_shared(
+inline void splash_attention_reduce_row(
     device const float *partials, device const float *statistics,
     device bfloat *tile_output, uint committed_tokens, uint active_rows,
     uint splits, ulong head_slot, uint fused_row, uint thread_index,
     threadgroup float *weights, threadgroup float *group_values) {
   constexpr uint M = RowsPerTile * QueryHeadsPerKVHead;
-  constexpr uint D = SplashQ8HeadDimension;
+  constexpr uint D = SplashKvHeadDimension;
   if (fused_row / QueryHeadsPerKVHead >= active_rows) {
     tile_output[fused_row * D + thread_index] = bfloat(0.0f);
     return;

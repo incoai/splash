@@ -12,15 +12,9 @@ from llguidance.numpy import (
     fill_next_token_bitmask_par_with_draft_tokens,
 )
 
-if __package__:
-    from . import runtime as engine_runtime
-    from .errors import APIError, NativeError
-    from .tool_schema import THINK_END, THINK_END_TOKEN_ID
-else:
-    from errors import APIError, NativeError
-    from tool_schema import THINK_END, THINK_END_TOKEN_ID
-
-    import runtime as engine_runtime
+from . import runtime as engine_runtime
+from .errors import APIError, ConstraintError
+from .tool_schema import THINK_END, THINK_END_TOKEN_ID
 
 
 class TokenConstraint:
@@ -32,10 +26,26 @@ class TokenConstraint:
         self.matcher = matcher
         self.executor = executor
         self.bitmask = allocate_token_bitmask(self.MAX_ROWS, self.VOCABULARY)
+        # Generated batches the grammar has not consumed yet. The reader
+        # thread commits them; the mask thread consumes them before the next
+        # mask, so reading the native stream never waits for the grammar.
+        self._lock = threading.Lock()
+        self._committed: list[tuple[int, ...]] = []
+
+    def commit(self, token_ids):
+        if any(not 0 <= token < self.VOCABULARY for token in token_ids):
+            raise ConstraintError("generated token is out of range")
+        with self._lock:
+            self._committed.append(tuple(token_ids))
+
+    def finish(self):
+        """Checks the tokens generated after the last mask."""
+        self._consume_committed()
 
     def masks(self, simulation_tokens):
+        self._consume_committed()
         if len(simulation_tokens) >= self.MAX_ROWS:
-            raise NativeError("constraint_error", "too many simulation tokens")
+            raise ConstraintError("too many simulation tokens")
         in_range = next(
             (
                 index
@@ -44,8 +54,7 @@ class TokenConstraint:
             ),
             len(simulation_tokens),
         )
-        probe = self.matcher.deep_copy()
-        valid_count = probe.validate_tokens(list(simulation_tokens[:in_range]))
+        valid_count = self.matcher.validate_tokens(list(simulation_tokens[:in_range]))
         valid_tokens = simulation_tokens[:valid_count]
         if valid_tokens:
             fill_next_token_bitmask_par_with_draft_tokens(
@@ -62,29 +71,33 @@ class TokenConstraint:
         if valid_rows < rows:
             self.bitmask[valid_rows:rows] = self.bitmask[valid_rows - 1]
         if not self.bitmask[:valid_rows].any(axis=1).all():
-            raise NativeError("constraint_error", "output grammar has no valid token")
+            raise ConstraintError("output grammar has no valid token")
         return self.bitmask[:rows].tobytes()
 
-    def consume(self, token_ids):
-        if any(not 0 <= token < self.VOCABULARY for token in token_ids):
-            raise NativeError("constraint_error", "generated token is out of range")
-        # LLGuidance's bulk API rejects EOS after a NoExtension stop.
-        stopped_eos = (
-            len(token_ids) == 1
-            and token_ids[0] in self.EOS_TOKENS
-            and not self.matcher.is_error()
-            and self.matcher.is_stopped()
-            and self.matcher.is_accepting()
-        )
-        valid = (
-            self.matcher.consume_token(token_ids[0])
-            if stopped_eos
-            else self.matcher.consume_tokens(token_ids)
-        )
-        if not valid:
-            raise NativeError(
-                "constraint_error", self.matcher.get_error() or "invalid token"
+    def _consume_committed(self):
+        with self._lock:
+            batches, self._committed = self._committed, []
+        for token_ids in batches:
+            # LLGuidance's bulk API rejects EOS after a NoExtension stop.
+            stopped_eos = (
+                len(token_ids) == 1
+                and token_ids[0] in self.EOS_TOKENS
+                and not self.matcher.is_error()
+                and self.matcher.is_stopped()
+                and self.matcher.is_accepting()
             )
+            valid = (
+                self.matcher.consume_token(token_ids[0])
+                if stopped_eos
+                else self.matcher.consume_tokens(token_ids)
+            )
+            if not valid:
+                # The lines after the first dump the parser state, output
+                # included.
+                error = self.matcher.get_error()
+                raise ConstraintError(
+                    error.splitlines()[0] if error else "invalid token"
+                )
 
 
 def validate_tokenizer(tokenizer):
@@ -123,27 +136,10 @@ def _grammar_error(error):
 
 
 class ConstraintFactory:
-    DEFAULT_CACHE_SIZE = 32
-    DEFAULT_CACHE_SOURCE_BYTES = 8 * 1024 * 1024
+    CACHE_SIZE = 32
+    CACHE_SOURCE_BYTES = 8 * 1024 * 1024
 
-    def __init__(
-        self,
-        tokenizer,
-        cache_size=DEFAULT_CACHE_SIZE,
-        cache_source_bytes=DEFAULT_CACHE_SOURCE_BYTES,
-    ):
-        if (
-            not isinstance(cache_size, int)
-            or isinstance(cache_size, bool)
-            or cache_size <= 0
-        ):
-            raise ValueError("constraint cache size must be positive")
-        if (
-            not isinstance(cache_source_bytes, int)
-            or isinstance(cache_source_bytes, bool)
-            or cache_source_bytes <= 0
-        ):
-            raise ValueError("constraint cache byte budget must be positive")
+    def __init__(self, tokenizer):
         self.tokenizer = guidance_tokenizer(
             tokenizer,
             n_vocab=TokenConstraint.VOCABULARY,
@@ -151,8 +147,6 @@ class ConstraintFactory:
             slices=LLTokenizer.json_slices(),
         )
         self.executor = LLExecutor()
-        self.cache_size = cache_size
-        self.cache_source_bytes = cache_source_bytes
         self.source_bytes = 0
         self.cache = OrderedDict()
         self.lock = threading.Lock()
@@ -160,11 +154,16 @@ class ConstraintFactory:
         self.hits = 0
         self.misses = 0
 
-    def create(self, grammar, *, timeout=None):
-        matcher = self._matcher(grammar, timeout)
+    def create(self, grammar, *, timeout=None, prefixes=None):
+        """`prefixes`, called when the grammar is compiled, returns pairs of
+        tokens the output must be able to begin with and the error for a
+        grammar that cannot. A grammar can compile and still exceed the
+        parser's limits where generation reaches a construct, after the whole
+        prompt has been processed."""
+        matcher = self._matcher(grammar, timeout, prefixes)
         return TokenConstraint(matcher.deep_copy(), self.executor)
 
-    def _matcher(self, grammar, timeout):
+    def _matcher(self, grammar, timeout, prefixes):
         # Compilation uses the frontend's bounded preparation slots. Share
         # identical misses without blocking unrelated immutable templates.
         with self.lock:
@@ -193,17 +192,20 @@ class ConstraintFactory:
             matcher = LLMatcher(self.tokenizer, grammar, log_level=0)
             if matcher.is_error():
                 raise _grammar_error(matcher.get_error())
+            for tokens, message in prefixes() if prefixes else ():
+                if not matcher.deep_copy().consume_tokens(tokens):
+                    raise APIError(400, message)
             size = len(grammar.encode())
             # Oversized grammars remain usable without displacing the cache.
             # This bounds source bytes; LLGuidance bounds compiler complexity.
             with self.lock:
                 self.misses += 1
-                if size <= self.cache_source_bytes:
+                if size <= self.CACHE_SOURCE_BYTES:
                     self.cache[grammar] = (matcher, size)
                     self.source_bytes += size
                     while (
-                        len(self.cache) > self.cache_size
-                        or self.source_bytes > self.cache_source_bytes
+                        len(self.cache) > self.CACHE_SIZE
+                        or self.source_bytes > self.CACHE_SOURCE_BYTES
                     ):
                         _, (_, evicted_size) = self.cache.popitem(last=False)
                         self.source_bytes -= evicted_size
@@ -220,9 +222,9 @@ class ConstraintFactory:
         with self.lock:
             return {
                 "entries": len(self.cache),
-                "capacity": self.cache_size,
+                "capacity": self.CACHE_SIZE,
                 "source_bytes": self.source_bytes,
-                "source_budget_bytes": self.cache_source_bytes,
+                "source_budget_bytes": self.CACHE_SOURCE_BYTES,
                 "hits": self.hits,
                 "misses": self.misses,
             }

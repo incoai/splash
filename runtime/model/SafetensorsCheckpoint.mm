@@ -1,4 +1,5 @@
 #include "model/SafetensorsCheckpoint.hpp"
+#include "Checked.hpp"
 #include "model/WeightStore.hpp"
 
 #import <Foundation/Foundation.h>
@@ -55,7 +56,7 @@ SourceTensor tensorRecord(NSDictionary *record, const WeightSource &file, uint64
   tensor.bytes = elementBytes(tensor.dtype);
   for (id dimension in record[@"shape"]) {
     tensor.shape.push_back(number(dimension));
-    tensor.bytes = checkedWeightMultiply(tensor.bytes, tensor.shape.back(), "source tensor size");
+    tensor.bytes = checkedMultiply<WeightStoreError>(tensor.bytes, tensor.shape.back(), "source tensor size");
   }
   const uint64_t begin = number(record[@"data_offsets"][0]);
   const uint64_t end = number(record[@"data_offsets"][1]);
@@ -132,18 +133,15 @@ struct SafetensorsCheckpoint::Impl {
   }
 };
 
-SafetensorsCheckpoint::SafetensorsCheckpoint(const std::filesystem::path &directory, const PreparationCheck &check)
+SafetensorsCheckpoint::SafetensorsCheckpoint(const std::filesystem::path &directory)
     : impl_(std::make_unique<Impl>()) {
   @autoreleasepool {
-    if (check) check();
     impl_->readConfiguration(directory / "config.json");
     uint64_t metadataBytes = 0;
     for (const auto &path : shardPaths(directory)) {
       @autoreleasepool {
-        if (check) check();
-        auto file = std::make_unique<WeightSource>(path, check);
+        auto file = std::make_unique<WeightSource>(path);
         indexShard(*file, impl_->tensors, metadataBytes);
-        file->checkUnchanged();
         impl_->files.push_back(std::move(file));
       }
     }
@@ -193,9 +191,14 @@ void SafetensorsCheckpoint::requireConfigNumber(std::string_view key, double exp
       throw WeightStoreError("source model configuration does not match: " + std::string(key));
   }
 }
-void SafetensorsCheckpoint::requireConfigString(std::string_view key, std::string_view expected) const {
+void SafetensorsCheckpoint::requireConfigString(std::string_view key, std::string_view expected,
+                                               std::string_view legacyKey) const {
   @autoreleasepool {
     id value = configValue(impl_->textConfig, key);
+    if (!value && !legacyKey.empty()) {
+      key = legacyKey;
+      value = configValue(impl_->textConfig, key);
+    }
     if (![value isKindOfClass:[NSString class]] || std::string_view([value UTF8String]) != expected)
       throw WeightStoreError("source model configuration does not match: " + std::string(key));
   }

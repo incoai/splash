@@ -23,10 +23,9 @@ brew install incoai/tap/splash
 splash serve --model unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M
 ```
 
-The first run downloads the model and its matching draft, prepares the
-weights, and starts serving on `127.0.0.1:8000`. Later starts reuse them.
-Leave room on disk for both the downloads and prepared weights
-([storage requirements](DEVELOPMENT.md#model-storage)).
+The first run downloads the model and its matching draft and starts serving
+on `127.0.0.1:8000`. Later starts reuse the downloads; leave room on disk for
+them ([storage requirements](DEVELOPMENT.md#model-storage)).
 
 Once it prints `Ready`, leave this terminal open. Open <http://127.0.0.1:8000>
 in your browser, or run an installed coding agent from another terminal:
@@ -40,8 +39,8 @@ For LM Studio Bionic, follow its [Splash setup guide](https://lmstudio.ai/blog/s
 
 ## Use the API
 
-OpenAI Chat Completions and Responses, and Anthropic Messages, with streaming,
-tool calls, JSON Schema output, images, and inline PDFs:
+OpenAI Chat Completions, Responses and Completions, and Anthropic Messages,
+with streaming, tool calls, JSON Schema output, images, and inline PDFs:
 
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions \
@@ -91,11 +90,11 @@ window. To set your own limits or cache options, add these to `splash serve`:
 | `--language-only` | Skip vision; serve text only. |
 | `--kv-format bf16` | Use BF16 KV cache. Default: 8-bit (INT8). |
 | `--max-cache-disk 16G` | Offload KV cache and GDN states to SSD as needed. Off by default. |
+| `--persistent-cache` | Keep the SSD cache across restarts. Off by default. |
 
-On a Mac you also use for other work, `--max-memory` leaves room for other
-applications.
+Use `--max-memory` to leave room for other applications.
 The server listens on localhost without authentication by default. For LAN
-access, authentication, and other options, see
+access, authentication, browser apps on other origins, and other options, see
 [server configuration](DEVELOPMENT.md#server-configuration) or
 `splash serve --help`.
 [KV precision](DEVELOPMENT.md#kv-cache-precision) ·
@@ -147,9 +146,9 @@ Splash uses BF16 KV in this comparison.
 ## Design
 
 Each supported model pairs a trained DFlash2 draft with Metal kernels for its
-shapes. The runtime, scheduler, cache, and API are shared. Weights are prepared
-once and mapped from disk; kernels ship precompiled, with no Xcode or local
-tuning required.
+shapes. The runtime, scheduler, cache, and API are shared. Weights are
+converted to the kernels' layouts as they load, with no copy on disk; kernels
+ship precompiled, with no Xcode or local tuning required.
 [How Splash works](https://inco.ai/blog/splash/)
 
 ## More

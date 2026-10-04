@@ -3,11 +3,11 @@
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/MetalBackend.hpp"
 
-#include <array>
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <string_view>
-#include <type_traits>
 
 namespace splash::kv {
 
@@ -37,32 +37,35 @@ enum class Format : uint32_t { Int8 = 1, BFloat16 = 2 };
   return "invalid";
 }
 
-// Physical backing for the engine's page pool. Implementations provide Metal
-// storage or deterministic test storage.
-class Backing {
-public:
-  virtual ~Backing() = default;
-  [[nodiscard]] virtual uint32_t pageCount() const noexcept = 0;
-  [[nodiscard]] virtual uint64_t bytesPerPage() const noexcept = 0;
-  [[nodiscard]] virtual bool isResident(uint32_t page) const = 0;
-  [[nodiscard]] virtual metal::AllocationResult ensureResident(uint32_t page) = 0;
-  [[nodiscard]] virtual bool releaseBackingForPage(uint32_t page) = 0;
-  [[nodiscard]] virtual uint32_t extentFirstPage(uint32_t page) const = 0;
-  [[nodiscard]] virtual uint32_t extentPageCount(uint32_t page) const = 0;
-  // Physical release is asynchronous and paced: while a previous release is
-  // still being torn down by the kernel, callers keep the next empty extent
-  // resident instead of queueing more unmap work. Test backings are always
-  // ready; awaitRelease() blocks only at startup and shutdown.
-  [[nodiscard]] virtual bool releaseReady() const noexcept { return true; }
-  virtual void awaitRelease() {}
+// A page whose content goes to another page.
+struct PageCopy final {
+  uint32_t from = 0;
+  uint32_t to = 0;
 };
 
-struct LayerStorage final {
-  metal::MetalBuffer keyData;
-  metal::MetalBuffer keyScales;
-  metal::MetalBuffer valueData;
-  metal::MetalBuffer valueScales;
-  Format format = Format::Int8;
+// The memory of the engine's page pool: extents of extentPages() pages,
+// pageCount() a whole number of them. Only KvPool allocates and releases
+// them. Implementations provide Metal storage or deterministic test storage.
+class ExtentStorage {
+public:
+  virtual ~ExtentStorage() = default;
+  [[nodiscard]] virtual uint32_t pageCount() const noexcept = 0;
+  [[nodiscard]] virtual uint64_t bytesPerPage() const noexcept = 0;
+  [[nodiscard]] virtual uint32_t extentPages() const noexcept = 0;
+  // Allocates extent `extent`, which is not allocated: granted, or the
+  // refusal's cause with nothing allocated. std::logic_error for an
+  // allocated extent.
+  [[nodiscard]] virtual metal::AllocationResult allocateExtent(uint32_t extent) = 0;
+  // Releases allocated extent `extent` at once. std::logic_error, changing
+  // nothing, for an unallocated extent or while a command is in flight (a
+  // command reaches extents through its page tables without retaining them).
+  virtual void releaseExtent(uint32_t extent) = 0;
+  // Copies each page's content onto its destination, both in allocated
+  // extents: how the pool moves the pages of an extent it empties.
+  // std::logic_error, copying nothing, for a page of an unallocated extent
+  // or while a command is in flight (it reaches both pages through its
+  // tables and may still write the source).
+  virtual void copyPages(std::span<const PageCopy> copies) = 0;
 };
 
 // Shared cache format and execution limits; model dimensions live in Layout.
@@ -73,17 +76,15 @@ inline constexpr uint32_t kMaximumPhysicalTokens =
     SPLASH_MAXIMUM_PHYSICAL_KV_TOKENS;
 inline constexpr int32_t kQuantizedMinimum = -127;
 inline constexpr int32_t kQuantizedMaximum = 127;
-inline constexpr uint64_t kSparseMappingAlignmentBytes = 64 * 1024;
-inline constexpr uint64_t kAllocationExtentTargetBytes =
-    SPLASH_ALLOCATION_EXTENT_TARGET_BYTES;
-
-struct StorageByteCounts final {
-  uint64_t keyData = 0;
-  uint64_t keyScales = 0;
-  uint64_t valueData = 0;
-  uint64_t valueScales = 0;
-  uint64_t total = 0;
-};
+// Every tensor region of an extent starts on this boundary. The attention
+// kernels were tuned on it, and regions aligned to less cost Apple10's 35B
+// verify kernel a fixed ~25 µs per dispatch.
+inline constexpr uint64_t kExtentRegionAlignmentBytes = 64 * 1024;
+// The size a pool aims its extents at (Layout::extentPagesFor stays within
+// half and one and a half times it): each extent costs the serving loop an
+// allocation and a release, and an extent returns memory only once all of
+// its pages are free.
+inline constexpr uint64_t kAllocationExtentTargetBytes = 128ull * 1024 * 1024;
 
 namespace detail {
 
@@ -100,11 +101,12 @@ namespace detail {
   return left && right ? left / gcd(left, right) * right : 0;
 }
 
-[[nodiscard]] constexpr uint64_t pagesForAlignedMapping(
+// Pages whose bytes of one tensor fill whole region alignment units.
+[[nodiscard]] constexpr uint64_t pagesForAlignedRegion(
     uint64_t bytesPerPage) noexcept {
   return bytesPerPage
-             ? kSparseMappingAlignmentBytes /
-                   gcd(kSparseMappingAlignmentBytes, bytesPerPage)
+             ? kExtentRegionAlignmentBytes /
+                   gcd(kExtentRegionAlignmentBytes, bytesPerPage)
              : 0;
 }
 
@@ -144,103 +146,68 @@ struct Layout final {
     return uint64_t{attentionLayers} * bytesPerLayerPage();
   }
 
-  // Metal sparse mappings must begin and end on 64-KiB tile boundaries. The
-  // INT8 scale buffers are the tightest constraint: 4 heads require 128
-  // pages and 2 heads require 256. BF16 needs only 1 or 2 pages. This is physical
-  // allocation geometry; prefix matching remains Page32 in both cases.
-  [[nodiscard]] constexpr uint32_t sparseMappingBatchPages() const noexcept {
+  // An extent holds a whole number of these pages, so that every tensor
+  // region starts 64 KiB-aligned. The INT8 scales are the tightest
+  // constraint: 4 heads require 128 pages and 2 heads require 256. BF16
+  // needs only 1 or 2 pages. This is allocation geometry only; prefix
+  // matching remains Page32 in both cases.
+  [[nodiscard]] constexpr uint32_t extentAlignmentPages() const noexcept {
     if (format == Format::BFloat16)
       return static_cast<uint32_t>(
-          detail::pagesForAlignedMapping(dataBytesPerLayerPage()));
+          detail::pagesForAlignedRegion(dataBytesPerLayerPage()));
     return static_cast<uint32_t>(detail::lcm(
-        detail::pagesForAlignedMapping(dataBytesPerLayerPage()),
-        detail::pagesForAlignedMapping(scaleBytesPerLayerPage())));
+        detail::pagesForAlignedRegion(dataBytesPerLayerPage()),
+        detail::pagesForAlignedRegion(scaleBytesPerLayerPage())));
   }
 
-  [[nodiscard]] constexpr uint64_t sparseMappingBatchBytes() const noexcept {
-    return uint64_t{sparseMappingBatchPages()} * bytesPerModelPage();
-  }
-
-  [[nodiscard]] constexpr uint32_t backingExtentPages() const noexcept {
-    const uint64_t unit = sparseMappingBatchBytes();
+  // Extents hold whole alignment units, between half and one and a half
+  // times the allocation target; a unit larger than that is an extent on its
+  // own. These are the smallest and the largest sizes.
+  [[nodiscard]] constexpr uint32_t minimumExtentPages() const noexcept {
+    const uint64_t unit = uint64_t{extentAlignmentPages()} * bytesPerModelPage();
     if (!unit)
       return 0;
-    return static_cast<uint32_t>(
-        ((kAllocationExtentTargetBytes + unit - 1) / unit) *
-        sparseMappingBatchPages());
+    const uint64_t units =
+        std::max<uint64_t>(1, (kAllocationExtentTargetBytes / 2 + unit - 1) / unit);
+    return static_cast<uint32_t>(units * extentAlignmentPages());
+  }
+  [[nodiscard]] constexpr uint32_t maximumExtentPages() const noexcept {
+    const uint64_t unit = uint64_t{extentAlignmentPages()} * bytesPerModelPage();
+    if (!unit)
+      return 0;
+    const uint64_t units = kAllocationExtentTargetBytes * 3 / 2 / unit;
+    return std::max(static_cast<uint32_t>(units * extentAlignmentPages()),
+                    minimumExtentPages());
   }
 
-  [[nodiscard]] constexpr StorageByteCounts
-  storageByteCounts(uint64_t pageCount) const noexcept {
-    const uint64_t data = pageCount * attentionLayers * dataBytesPerLayerPage();
-    const uint64_t scale =
-        pageCount * attentionLayers * scaleBytesPerLayerPage();
-    return {data, scale, data, scale, pageCount * bytesPerModelPage()};
+  // The extent size of a pool that holds `pages` pages: all of a pool's
+  // extents hold the same number of pages, because kernels find a layer's
+  // region from that number. Of the sizes above that fit the pool, the one
+  // that leaves the fewest pages over, and the one nearest the target on a
+  // tie. Zero when the pool holds fewer pages than the smallest size.
+  [[nodiscard]] constexpr uint32_t extentPagesFor(uint64_t pages) const noexcept {
+    const uint32_t step = extentAlignmentPages();
+    const uint64_t smallest = minimumExtentPages();
+    if (!smallest || pages < smallest)
+      return 0;
+    const uint64_t largest = std::min<uint64_t>(maximumExtentPages(), pages);
+    uint64_t best = 0, bestLeft = 0, bestDistance = 0;
+    for (uint64_t extent = smallest; extent <= largest; extent += step) {
+      const uint64_t bytes = extent * bytesPerModelPage();
+      const uint64_t distance = bytes > kAllocationExtentTargetBytes
+                                    ? bytes - kAllocationExtentTargetBytes
+                                    : kAllocationExtentTargetBytes - bytes;
+      if (!best || pages % extent < bestLeft ||
+          (pages % extent == bestLeft && distance < bestDistance)) {
+        best = extent;
+        bestLeft = pages % extent;
+        bestDistance = distance;
+      }
+    }
+    return static_cast<uint32_t>(best);
   }
 
   bool operator==(const Layout &) const = default;
 };
-
-enum class Quantization : uint32_t { SymmetricInt8 = 1, BFloat16 = 2 };
-enum class ScaleType : uint32_t { None = 0, Float32 = 2 };
-enum class KeyLayout : uint32_t { TokenMajor = 1 };
-enum class ValueLayout : uint32_t { DimensionMajor = 1 };
-
-// Identity of the KV page format and of the target it belongs to:
-// modelArtifactSha256 is the digest of the exact packed target artifact set;
-// geometry/layout fields remain explicit so format changes cannot alias. Its
-// fields enter the runtime cache namespace and the status report
-// (RuntimeResources.mm, Status.cpp); nothing stores or compares the struct.
-struct alignas(8) LayoutGuard final {
-  uint32_t quantization = 0;
-  uint32_t scaleType = 0;
-  uint32_t keyLayout = 0;
-  uint32_t valueLayout = 0;
-  uint32_t pageTokens = 0;
-  uint32_t elementsPerScale = 0;
-  uint32_t attentionLayers = 0;
-  uint32_t kvHeads = 0;
-  uint32_t headDimension = 0;
-  int32_t quantizedMinimum = 0;
-  int32_t quantizedMaximum = 0;
-  uint64_t bytesPerLayerPage = 0;
-  uint64_t bytesPerModelPage = 0;
-  std::array<uint8_t, 32> modelArtifactSha256{};
-
-  [[nodiscard]] Format format() const noexcept {
-    switch (quantization) {
-    case uint32_t(Quantization::SymmetricInt8): return Format::Int8;
-    case uint32_t(Quantization::BFloat16): return Format::BFloat16;
-    default: return static_cast<Format>(0);
-    }
-  }
-};
-
-static_assert(sizeof(LayoutGuard) == 96);
-static_assert(std::is_standard_layout_v<LayoutGuard>);
-static_assert(std::is_trivially_copyable_v<LayoutGuard>);
-
-[[nodiscard]] inline LayoutGuard makeLayoutGuard(
-    Layout layout,
-    const std::array<uint8_t, 32> &modelArtifactSha256) {
-  LayoutGuard result;
-  const bool quantized = layout.format == Format::Int8;
-  result.quantization = uint32_t(quantized ? Quantization::SymmetricInt8
-                                         : Quantization::BFloat16);
-  result.scaleType = uint32_t(quantized ? ScaleType::Float32 : ScaleType::None);
-  result.keyLayout = uint32_t(KeyLayout::TokenMajor);
-  result.valueLayout = uint32_t(ValueLayout::DimensionMajor);
-  result.pageTokens = kPageTokens;
-  result.elementsPerScale = layout.elementsPerScale();
-  result.attentionLayers = layout.attentionLayers;
-  result.kvHeads = layout.kvHeads;
-  result.headDimension = layout.headDimension;
-  result.quantizedMinimum = quantized ? kQuantizedMinimum : 0;
-  result.quantizedMaximum = quantized ? kQuantizedMaximum : 0;
-  result.bytesPerLayerPage = layout.bytesPerLayerPage();
-  result.bytesPerModelPage = layout.bytesPerModelPage();
-  result.modelArtifactSha256 = modelArtifactSha256;
-  return result;
-}
 
 } // namespace splash::kv

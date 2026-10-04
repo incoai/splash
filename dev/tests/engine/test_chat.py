@@ -39,10 +39,11 @@ function createChat(storage = new Map(), writable = true, models = null,
   const requests = [];
   const modelRequests = [];
   const reads = [];
+  let scrolls = 0;
   for (const id of ['chat', 'form', 'input', 'attachments', 'image-input',
                    'attach', 'effort', 'api-key', 'send', 'recents', 'new-chat',
                    'mobile-new', 'menu', 'scrim']) elements[id] = new Element();
-  elements.effort.options = ['xhigh', 'medium', 'low', 'none'].map(value => ({value}));
+  elements.effort.options = ['', 'xhigh', 'medium', 'low', 'none'].map(value => ({value}));
   class FileReader {
     readAsDataURL(file) {
       this.result = `data:image/png;base64,${file.name}`;
@@ -62,7 +63,7 @@ function createChat(storage = new Map(), writable = true, models = null,
         storage.set(key, value);
       },
     },
-    scrollTo() {}, AbortController, TextDecoder, Uint8Array, console, FileReader,
+    scrollTo() { scrolls += 1; }, AbortController, TextDecoder, Uint8Array, console, FileReader,
     crypto,
     fetch(url, options) {
       if (url === '/v1/models') {
@@ -80,7 +81,7 @@ function createChat(storage = new Map(), writable = true, models = null,
     },
   });
   vm.runInContext(script, context);
-  return {elements, requests, reads, modelRequests};
+  return {elements, requests, reads, modelRequests, scrolls: () => scrolls};
 }
 
 const flush = () => new Promise(resolve => setImmediate(resolve));
@@ -120,18 +121,19 @@ function removeImage(chat, index) {
   item.children.find(child => child.tagName === 'BUTTON').handlers.click();
 }
 
-function succeed(request) {
+function respond(request, events) {
   let sent = false;
   request.resolve({ok: true, body: {getReader: () => ({
     async read() {
       if (sent) return {done: true};
       sent = true;
-      return {done: false, value: Buffer.from(
-        'data: {"choices":[{"delta":{"content":"answer"}}]}\n\ndata: [DONE]\n\n'
-      )};
+      return {done: false, value: Buffer.from(events)};
     },
   })}});
 }
+const succeed = request => respond(
+  request, 'data: {"choices":[{"delta":{"content":"answer"}}]}\n\ndata: [DONE]\n\n'
+);
 """
 
 
@@ -215,6 +217,26 @@ for (const writable of [true, false]) {
   assert.equal(chat.requests[0].body.messages[0].content, 'remembered message');
   assert.equal(storage.get('splash-thinking-effort'), 'low');
 }
+""")
+
+    def test_default_effort_omits_reasoning_effort(self):
+        # The server's --default-reasoning-effort, or the template's default,
+        # applies until the user picks an effort.
+        self.run_chat(r"""
+(async () => {
+  const chat = createChat();
+  assert.equal(chat.elements.effort.value, '');
+  setText(chat, 'hello');
+  submit(chat);
+  assert.ok(!('reasoning_effort' in chat.requests[0].body));
+  succeed(chat.requests[0]);
+  await flush();
+  chat.elements.effort.value = 'low';
+  chat.elements.effort.handlers.change();
+  setText(chat, 'again');
+  submit(chat);
+  assert.equal(chat.requests[1].body.reasoning_effort, 'low');
+})().catch(error => { console.error(error); process.exitCode = 1; });
 """)
 
     def test_saves_chats_without_crypto_random_uuid(self):
@@ -384,6 +406,28 @@ for (const [name, overrides, shouldSend] of [
       }
     }
   }
+})().catch(error => { console.error(error); process.exitCode = 1; });
+""")
+
+    def test_chunks_without_text_neither_render_nor_scroll(self):
+        self.run_chat(r"""
+(async () => {
+  const scrolls = [];
+  for (const count of [0, 3]) {
+    const chat = createChat();
+    const {elements, requests} = chat;
+    elements.input.value = 'prompt';
+    submit(chat);
+    const empty = 'data: {"choices":[{"delta":{}}]}\n\n'.repeat(count);
+    respond(requests[0], 'data: {"choices":[{"delta":{"role":"assistant","content":""}}]}\n\n' +
+      empty + 'data: {"choices":[{"delta":{"content":"answer"}}]}\n\n' + empty + 'data: [DONE]\n\n');
+    await flush();
+    scrolls.push(chat.scrolls());
+    elements.input.value = 'next';
+    submit(chat);
+    assert.equal(requests[1].body.messages[1].content, 'answer');
+  }
+  assert.equal(scrolls[1], scrolls[0], 'chunks without text must not scroll the page');
 })().catch(error => { console.error(error); process.exitCode = 1; });
 """)
 

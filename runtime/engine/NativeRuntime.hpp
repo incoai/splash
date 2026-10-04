@@ -3,6 +3,7 @@
 #include "engine/Engine.hpp"
 #include "engine/Protocol.hpp"
 #include "engine/Status.hpp"
+#include "model/WeightMemory.hpp"
 
 #include <cstdint>
 #include <exception>
@@ -17,17 +18,22 @@ namespace splash::engine {
 
 struct NativeLoopConfig {
   engine::EngineConfig engine;
-  uint64_t engineInstanceId = 1;
-  uint32_t maskWordsPerToken = 1;
   RuntimeMetrics *metrics = nullptr;
-};
-
-struct NativeLoopClocks {
-  std::function<uint64_t()> unixMicros;
-  std::function<double()> monotonicMilliseconds;
+  // The model's weights: released once the engine has held no request for
+  // the residency keep-alive (metal::kResidencyKeepAliveSeconds), and written
+  // back, an image per tick, before the engine runs the next request. Null
+  // where they stay, as in tests of other behavior.
+  model::WeightMemory *weights = nullptr;
 };
 
 // Translates native protocol messages and events at the Engine boundary.
+//
+// The engine's failure boundary. Every received frame, tick(), runControl()
+// and flushRestorePoints() run inside it: an exception is reported once as an
+// EngineUnhealthy ErrorEvent (metal_execution_failed for MetalBackendError,
+// else engine_execution_failed), the connection closes and the process exits.
+// Request-scoped problems never arrive as exceptions here except
+// std::invalid_argument from Engine::submit.
 class NativeRuntime final : private EngineEventSink {
 public:
   using ByteSink = std::function<void(std::span<const uint8_t>)>;
@@ -35,18 +41,24 @@ public:
 
   NativeRuntime(NativeLoopConfig config, engine::Cache &cache,
                 model::Model &model, ByteSink output,
-                StatusProvider statusProvider, NativeLoopClocks clocks = {},
-                protocol::ProtocolLimits limits = {});
+                StatusProvider statusProvider, protocol::ProtocolLimits limits);
 
   // Processes every complete frame in bytes. False means the connection
   // must close. Request-scoped errors return true and preserve framing.
   bool receive(std::span<const uint8_t> bytes);
   bool finishInput();
 
-  // Executes at most one explicit GPU BatchPlan.
+  // Executes at most one explicit GPU BatchPlan, or writes back one image of
+  // released weights.
   bool tick();
   // Command-free control work uses the same failure boundary as execution.
   bool runControl(const std::function<bool()> &control);
+  // At a clean stop (Engine::flushRestorePoints). False until no restore
+  // point is left, and once the engine has failed.
+  bool flushRestorePoints();
+  // Releases the weights once the engine has held no request for the
+  // residency keep-alive. Runs between commands, in the control pass.
+  void releaseIdleWeights();
   void setCompletionNotifier(std::function<void()> notifier) {
     core_.setCompletionNotifier(std::move(notifier));
   }
@@ -66,7 +78,6 @@ public:
   [[nodiscard]] const std::string &engineFailure() const noexcept {
     return engineFailure_;
   }
-  [[nodiscard]] bool idle() const { return core_.idle(); }
   [[nodiscard]] bool commandInFlight() const noexcept {
     return core_.commandInFlight();
   }
@@ -79,12 +90,12 @@ public:
   [[nodiscard]] engine::ResourceWaitSnapshot resourceWaitSnapshot() const {
     return core_.resourceWaitSnapshot(clocks_.monotonicMilliseconds());
   }
+  [[nodiscard]] double monotonicMilliseconds() const {
+    return clocks_.monotonicMilliseconds();
+  }
   [[nodiscard]] MemoryReclaimResult
   reclaimMemory(const MemoryReclaimDirective &directive) {
     return core_.reclaimMemory(directive);
-  }
-  [[nodiscard]] bool reclaimDeferred() const noexcept {
-    return core_.reclaimDeferred();
   }
 
 private:
@@ -101,8 +112,9 @@ private:
     uint64_t expectedWords = 0;
   };
 
-  bool handle(protocol::Message &message);
+  bool handle(protocol::ClientMessage &message);
   bool handleRequest(protocol::RequestFrame &request);
+  void restoreWeights();
   bool handleCancel(const protocol::CancelFrame &cancel);
   bool handleMask(const protocol::MaskResponseFrame &mask);
   bool handleStatus(const protocol::StatusRequestFrame &status);
@@ -112,14 +124,14 @@ private:
                     bool retryable = false);
   void engineError(std::string code, std::string message);
   void executionFailed(std::exception_ptr error);
-  bool send(protocol::Message message);
+  bool send(const protocol::EngineEvent &event);
 
-  void started(uint64_t requestId, EngineCacheStatus cacheStatus,
-               uint32_t matchedTokens, uint32_t stateSlot) override;
+  void started(uint64_t requestId, uint32_t matchedTokens,
+               uint32_t lane) override;
   void batchCompleted(WorkKind kind, uint32_t width, uint32_t inputTokens,
                       uint32_t outputTokens, uint32_t draftedTokens,
-                      uint32_t acceptedDraftTokens,
-                      double wallMilliseconds) override;
+                      uint32_t acceptedDraftTokens, double wallMilliseconds,
+                      double cycleMilliseconds) override;
   void promptProgress(uint64_t requestId, uint32_t processedTokens) override;
   void tokens(uint64_t requestId, std::span<const uint32_t> values) override;
   void maskRequested(uint64_t requestId,
@@ -127,26 +139,36 @@ private:
   void completed(uint64_t requestId, EngineFinishReason reason,
                  uint32_t promptTokens, uint32_t completionTokens,
                  std::span<const float> optionLogits) override;
-  void failed(uint64_t requestId, std::string code, std::string message,
-              bool retryable) override;
-  void capacityExhausted(uint64_t requestId, uint32_t requiredKvPages,
-                         uint32_t availableKvPages,
-                         uint64_t retryAfterMicros) override;
+  void failed(uint64_t requestId, LaneOutcome outcome,
+              std::string message) override;
 
-  static NativeLoopClocks defaultClocks();
+  // The system clock in microseconds and the steady clock in milliseconds,
+  // or the test seam's (TestConfig).
+  struct Clocks {
+    std::function<uint64_t()> unixMicros;
+    std::function<double()> monotonicMilliseconds;
+  };
+  static Clocks clocks();
   static uint64_t durationMicros(double startMilliseconds,
                                  double endMilliseconds);
 
   NativeLoopConfig config_;
   ByteSink output_;
   StatusProvider statusProvider_;
-  NativeLoopClocks clocks_;
+  Clocks clocks_;
   protocol::ProtocolLimits limits_;
   protocol::FrameParser parser_;
   engine::Engine core_;
   std::unordered_map<uint64_t, RequestTelemetry> telemetry_;
   std::unordered_map<uint64_t, PendingMask> pendingMasks_;
   uint64_t nextMaskRequestId_ = 1;
+  // metal::kResidencyKeepAliveSeconds, or the test seam's (TestConfig), and
+  // when the engine last held a request: when one ended, or when weights were
+  // restored for one.
+  double weightKeepAliveMilliseconds_;
+  double lastRequestMilliseconds_;
+  // When the weights began to be written back for a request, until they are.
+  std::optional<double> restoreStarted_;
   bool ready_ = false;
   bool closeConnection_ = false;
   bool engineHealthy_ = true;

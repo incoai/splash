@@ -1,7 +1,5 @@
 #pragma once
 
-// Editing this file re-prepares every GGUF and vision model.
-
 #include <bit>
 #include <cstdint>
 #include <optional>

@@ -2,9 +2,10 @@
 
 Run as ``python -m dev.benchmarks.backend_regression --baseline CHECKOUT
 --package MODEL_ROOT``. Each checkout's build/ holds splash.metallib and
-engine-tests/backend-benchmark. The native benchmark's decode and partial
-scenarios run in ABBA order (baseline, candidate, candidate, baseline) on this
-machine, which must be otherwise idle:
+engine-tests/backend-benchmark, the candidate's engine-tests/weight-digests
+too. The native benchmark's decode and partial scenarios run in ABBA order
+(baseline, candidate, candidate, baseline) on this machine, which must be
+otherwise idle:
 
 - outputs: every width's output_token_hash and accepted/drafted counts and
   every partial request's output tokens are identical in all four rounds. With
@@ -14,12 +15,10 @@ machine, which must be otherwise idle:
 - speed (abba.compare): decode GPU milliseconds per step for B1-B4, the GPU
   time of the 14,096-token cold prefill (partial_4k_cold) and the TTFT of its
   partial hit (partial_4k_hit).
-- prepared bytes: when the builds' preparation identities differ, the
-  baseline prepares into its own cache, <output dir>/baseline-weights, and
-  the candidate keeps the cache its other release steps use, so neither
-  re-prepares between steps; the candidate's cache must hold the bytes of
-  every entry the baseline prepared from the model (prepared.compare). Equal
-  identities share every entry, which then holds by construction.
+- weight bytes: after the rounds both builds load the model's weight images
+  once more and must hold the same images with the same bytes
+  (weights.compare_builds). A baseline of an earlier release prepares into a
+  cache of its own, <output dir>/baseline-weights.
 
 The candidate's own benchmark invariants must hold too, and the baseline must
 be another build: one with the candidate's build_id compares nothing. The
@@ -36,7 +35,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from dev.benchmarks import abba, prepared
+from dev.benchmarks import abba, weights
 from dev.tests import smoke_real as smoke
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -336,8 +335,8 @@ def parse_args(argv=None):
         for path in (tree / BENCHMARK, tree / METALLIB):
             if not path.is_file():
                 parser.error(f"missing retained benchmark or library: {path}")
-    if prepared.preparation_identity(args.candidate / "build") is None:
-        parser.error(f"the candidate build has no {prepared.IDENTITY_HEADER}")
+    if not weights.loads_in_memory(args.candidate / "build"):
+        parser.error(f"the candidate build has no {weights.WEIGHT_DIGESTS}")
     args.kind = smoke.model_artifacts.installation_kind(args.package)
     if args.kind is None:
         parser.error(f"missing installed model: {args.package}")
@@ -351,12 +350,9 @@ def main(argv=None) -> int:
     smoke.hold_package(args)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     trees = {"baseline": args.baseline.resolve(), "candidate": args.candidate.resolve()}
-    shared = prepared.preparation_identity(
-        trees["baseline"] / "build"
-    ) == prepared.preparation_identity(trees["candidate"] / "build")
     environments = {"baseline": dict(os.environ), "candidate": dict(os.environ)}
-    if not shared:
-        environments["baseline"].update(prepared.baseline_environment(args.output_dir))
+    if not weights.loads_in_memory(trees["baseline"] / "build"):
+        environments["baseline"].update(weights.baseline_environment(args.output_dir))
     args.combined = all(
         supports_scenario_list(tree / BENCHMARK) for tree in trees.values()
     )
@@ -386,21 +382,15 @@ def main(argv=None) -> int:
         ]
         document["rounds"] = rounds
         document["comparison"] = summarize(rounds, args.expect_output_change)
-        document["prepared"] = (
-            {"shared_identity": True, "pass": True}
-            if shared
-            else {
-                "shared_identity": False,
-                **prepared.compare(
-                    prepared.cache_root(environments["baseline"]),
-                    prepared.cache_root(environments["candidate"]),
-                    package=args.package,
-                    required=args.kind == smoke.model_artifacts.ASSEMBLY,
-                ),
-            }
+        document["weights"] = weights.compare_builds(
+            trees["baseline"] / "build",
+            trees["candidate"] / "build",
+            args.package,
+            environments["baseline"],
+            args.kind == smoke.model_artifacts.ASSEMBLY,
         )
         document["pass"] = (
-            document["comparison"]["pass"] and document["prepared"]["pass"]
+            document["comparison"]["pass"] and document["weights"]["pass"]
         )
     except Exception as error:
         document["error"] = str(error)
@@ -424,11 +414,10 @@ def report(document: dict) -> None:
             f"{width} acceptance: baseline {rate['baseline']:.4f}, "
             f"candidate {rate['candidate']:.4f}"
         )
-    prepared_bytes = document["prepared"]
+    images = document["weights"]
     print(
-        "prepared bytes: "
-        + ("shared identity" if prepared_bytes.get("shared_identity") else "compared")
-        + (" PASS" if prepared_bytes["pass"] else f" FAIL {prepared_bytes['failures']}")
+        f"weight bytes: {len(images['images'])} images "
+        + ("PASS" if images["pass"] else f"FAIL {images['failures']}")
     )
     for failure in comparison["failures"]:
         print(f"FAIL: {failure}")

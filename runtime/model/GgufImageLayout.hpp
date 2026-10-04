@@ -1,7 +1,7 @@
 #pragma once
 
-// The layout of a prepared GGUF target image: the planner writes it, the
-// weight store reads it. After the 16-byte file header (model/WeightLayout.hpp)
+// The layout of a GGUF target image: the planner writes it, the weight store
+// reads it. After the 16-byte file header (model/WeightLayout.hpp)
 // come 16 KiB-aligned sections. A quantized tensor is a descriptor section,
 // then its plane0, optional plane1 and meta sections in its format's layout
 // (metal/abi/QuantFormat.h). A tensor copied as stored (the token
@@ -9,7 +9,6 @@
 // alpha/beta) is a descriptor and its rows; a norm, the convolution and the
 // GDN head vectors are their rows alone, F32 or narrowed to the bf16 values
 // they equal.
-// Editing this file re-prepares every GGUF model.
 
 #include "metal/abi/QuantFormat.h"
 

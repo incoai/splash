@@ -10,10 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-if __package__:
-    from . import models
-else:
-    import models
+from . import models
 
 
 @dataclass(frozen=True)

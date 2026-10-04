@@ -1,15 +1,16 @@
 // GPU time of one sparse MoE layer at the 35B shape (hidden 2048, 256 experts, top 8, intermediate 512) in GGUF
 // (by default the 35B UD-Q4_K_M's Q4_K gate/up and Q5_K down experts, a Q8_0 shared expert, F32 router) against the
 // affine Q4 layer, on the device's plans and the other GGUF tile: a 2048-row prefill chunk, decode B1-B4 and prefill
-// chunks of their rows, then every dispatch of the long chunk, B1 and B4 replayed as its own command. The numbers
-// behind the MoE plans of ops/MoE.cpp:
+// chunks of their rows, prefill chunks of 64 to 512 rows, then every dispatch of the long chunk, B1 and B4 replayed as
+// its own command. The numbers behind the MoE plans of ops/MoE.cpp:
 //   gguf-moe-benchmark <metallib> [rounds] [gate/up format] [down format]
 // Printed are medians of GPU ms per layer over `rounds` (20) commands. Every row routes to 8 experts of a pool of 24
-// per request lane (decode, short chunks) or of all 256 (the long chunk), identically for both formats: expert e
-// scores 4 x[e], so the first 256 inputs pick the routes. The weights exceed the system cache, so each layer streams
-// its experts from DRAM.
+// per request lane (decode, short chunks) or of all 256 (chunks of 64 rows or more), identically for both formats:
+// expert e scores 4 x[e], so the first 256 inputs pick the routes. The weights exceed the system cache, so each layer
+// streams its experts from DRAM.
 #include "../tests/engine/AffineQ4Fixture.hpp"
 #include "../tests/engine/GgufFormatReference.hpp"
+#include "DispatchReplay.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "ops/ExecutionPlans.hpp"
@@ -198,6 +199,12 @@ int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFor
            lanes, a, device == MoeGgufTile::Register ? "register" : "staged", g,
            other == MoeGgufTile::Register ? "register" : "staged", o, lanes * 8, ap, gp);
   }
+  for (const uint32_t rows : {64u, 128u, 256u, 512u}) {
+    b.input = bfloatBuffer(backend, input(rows, E), "input");
+    const double ap = time(affine, plans.moePrefill(affineShape, rows));
+    const double gp = time(gguf, plans.moePrefill(ggufShape, rows));
+    printf("  prefill chunk of %u rows: affine %.3f  gguf %.3f\n", rows, ap, gp);
+  }
   // Where the time goes: every dispatch replayed as its own command.
   for (const auto &[label, weights, plan] :
        {std::tuple{"affine prefill", &affine, plans.moePrefill(affineShape, kRowsMax)},
@@ -210,11 +217,10 @@ int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFor
     allocate(backend, b, plan);
     CommandGraph graph;
     MoE::add(graph, b, *weights, plan);
-    backend.setDispatchProfiling(true);
-    for (uint32_t i = 0; i < rounds; ++i) static_cast<void>(backend.submitCommand(graph.dispatches()));
-    backend.setDispatchProfiling(false);
     std::map<std::string, double> spent;
-    for (const auto &t : backend.takeDispatchProfile()) spent[t.pipelineName] += t.gpuSeconds * 1e3 / rounds;
+    for (uint32_t i = 0; i < rounds; ++i)
+      for (const auto &[name, seconds] : splash::benchmark::replayDispatches(backend, graph.dispatches()))
+        spent[name] += seconds * 1e3 / rounds;
     printf("  %s:", label);
     for (const auto &[name, ms] : spent) printf(" %s %.3f", name.c_str(), ms);
     printf("\n");

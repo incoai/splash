@@ -3,7 +3,6 @@
 #include "model/SafetensorsCheckpoint.hpp"
 
 #include <array>
-#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <initializer_list>
@@ -18,12 +17,12 @@ using namespace splash::model;
 using splash::test::rejects;
 using splash::test::require;
 namespace {
-void shard(const std::filesystem::path &path, std::string_view header, size_t bytes = 16, uint8_t first = 1) {
+void shard(const std::filesystem::path &path, std::string_view header, size_t bytes = 16) {
   const uint64_t length = header.size();
   std::vector<uint8_t> file(sizeof length);
   std::memcpy(file.data(), &length, sizeof length);
   file.insert(file.end(), header.begin(), header.end());
-  for (size_t i = 0; i < bytes; ++i) file.push_back(static_cast<uint8_t>(i + first));
+  for (size_t i = 0; i < bytes; ++i) file.push_back(static_cast<uint8_t>(i + 1));
   splash::test::writeFile(path, file);
 }
 constexpr auto valid = R"({"a":{"dtype":"U32","shape":[2,2],"data_offsets":[0,16]}})";
@@ -32,7 +31,6 @@ int main() {
   try {
     const splash::test::TemporaryDirectory directory("splash-affine-checkpoint");
     const std::filesystem::path &root = directory.path();
-    setenv("SPLASH_WEIGHT_CACHE", (root / "cache").c_str(), 1);
     splash::test::writeFile(root / "config.json", R"({"quantization":{"bits":4,"group_size":64,"router":{"bits":8}},"text_config":{"layers":2,"model_type":"fixture","layer_types":["linear_attention","full_attention"]}})");
     shard(root / "model.safetensors", valid);
     SafetensorsCheckpoint source(root);
@@ -52,25 +50,13 @@ int main() {
             "wrong quantization accepted");
     rejects([&] { source.requireLayerTypes(2, 1); }, "source layer schedule does not match",
             "wrong layer schedule accepted");
-    // A tensor's identity is its bytes in its shard's tensor data, dtype and
-    // shape: rewriting the same content keeps it, a header-only edit keeps it,
-    // a changed data byte changes it.
-    const auto identity = [](const SafetensorsCheckpoint &checkpoint) {
-      WeightIdentity identity("fixture");
-      checkpoint.require("a").identify(identity);
-      return identity.weight(16, "fixture", "").key;
-    };
-    const auto first = identity(source);
+    // Rewriting a shard in place, even with the same content, writes the
+    // file the checkpoint holds.
     shard(root / "model.safetensors", valid);
-    rejects([&] { source.checkUnchanged(); }, "source weights changed", "changed source accepted");
-    require(identity(SafetensorsCheckpoint(root)) == first, "same content changed identity");
-    shard(root / "model.safetensors", R"({"__metadata__":{"format":"mlx"},"a":{"dtype":"U32","shape":[2,2],"data_offsets":[0,16]}})");
-    require(identity(SafetensorsCheckpoint(root)) == first, "a header-only edit changed the tensor identity");
-    shard(root / "model.safetensors", valid, 16, 9);
-    require(identity(SafetensorsCheckpoint(root)) != first, "changed tensor data kept its identity");
-    shard(root / "model.safetensors", valid);
+    rejects([&] { source.checkUnchanged(); }, "written while the model is loaded", "written source accepted");
     shard(root / "extra.safetensors", valid);
-    rejects([&] { SafetensorsCheckpoint invalid(root); }, "duplicate source tensor: a", "duplicate tensor accepted");
+    rejects([&] { SafetensorsCheckpoint invalid(root); }, "duplicate source tensor: a",
+            "duplicate tensor accepted");
     std::filesystem::remove(root / "extra.safetensors");
     for (const auto &[header, error] : std::initializer_list<std::pair<std::string_view, std::string_view>>{
              {R"({"a":{"dtype":"U32","shape":[2,2],"data_offsets":[0,15]}})", "safetensors data range is invalid"},
@@ -91,7 +77,7 @@ int main() {
     shard(root / "model.safetensors", valid, 8);
     rejects([&] { SafetensorsCheckpoint invalid(root); }, "safetensors data range is invalid",
             "truncated tensor accepted");
-    std::cout << "affine checkpoint: bounded reads, metadata, quantization, identity and malformed sources PASS\n";
+    std::cout << "affine checkpoint: bounded reads, metadata, quantization, written and malformed sources PASS\n";
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
     return 1;

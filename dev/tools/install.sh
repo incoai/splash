@@ -157,5 +157,8 @@ if [ -f "$APP/current/install/completions/splash.bash" ] && [ -f "$APP/current/i
     echo "  Optional shell completion (Zsh needs compinit initialized):"
     echo '    Bash: source "$HOME/Library/Application Support/Splash/app/current/install/completions/splash.bash"'
     echo '    Zsh:  source "$HOME/Library/Application Support/Splash/app/current/install/completions/_splash"'
+    if [ -f "$APP/current/install/completions/splash.fish" ]; then
+        echo '    Fish: source "$HOME/Library/Application Support/Splash/app/current/install/completions/splash.fish"'
+    fi
 fi
 echo "  Upgrade: run this installer again.  Uninstall: rm -rf \"$APP\" \"$wrapper\""
