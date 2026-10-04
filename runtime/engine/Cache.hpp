@@ -79,10 +79,24 @@ struct KvTierSnapshot final {
   uint64_t demotionsRefused = 0;
   uint64_t restores = 0;
   uint64_t restoreFailures = 0;
+  // KV pages a persistent tier wrote while they stayed in RAM (persist).
+  uint64_t copies = 0;
+  uint64_t copyFailures = 0;
   // Pages whose demotion is in flight.
   uint32_t pendingPages = 0;
   uint32_t diskBlocks = 0;
   uint64_t diskBytes = 0;
+};
+
+// What a start took back from a persistent tier: the states and KV blocks
+// the cache holds afterwards, and their bytes.
+struct CacheAdoption final {
+  uint32_t states = 0;
+  uint32_t blocks = 0;
+  uint64_t bytes = 0;
+  // Records left behind, damaged, incomplete or of no state, and copies
+  // given up for the quota.
+  uint32_t dropped = 0;
 };
 
 struct CacheSnapshot final {
@@ -94,6 +108,9 @@ struct CacheSnapshot final {
   // The longest emptying of one extent by moving its pages, re-pointing the
   // cached blocks and requests on them included.
   double extentCompactMaxMilliseconds = 0.0;
+  // A persistent tier, and what the start took back from it.
+  bool persistent = false;
+  CacheAdoption adoption;
 };
 
 enum class TokenAdmissionFailure : uint8_t {
@@ -174,6 +191,19 @@ struct StateRoom final {
 // KV restores a request waits for before it can run.
 enum class KvRestoreStatus : uint8_t { None, Pending, Failed };
 
+// A slot an earlier process left in a persistent tier's file: its label
+// (KvBlockLabel or StateLabel), and how to take it back, which only what
+// the cache keeps is.
+struct PersistedKv final {
+  std::vector<std::byte> label;
+  std::function<std::shared_ptr<KvDiskSlot>()> adopt;
+};
+struct PersistedState final {
+  std::vector<std::byte> label;
+  // The disk copy of a state at that many tokens.
+  std::function<std::shared_ptr<const CompositeState>(uint32_t tokens)> adopt;
+};
+
 // Owns active KV page leases, the content-addressed KV graph and cached
 // composite states. Physical recurrent-state cells remain model-owned.
 // A state in RAM always sits on a resident KV block: reclaim takes such a
@@ -183,11 +213,41 @@ enum class KvRestoreStatus : uint8_t { None, Pending, Failed };
 class Cache final {
 public:
   // The disk budget is the quota the states' file shares with the KV tier;
-  // the states' file can run on it without the tier.
+  // the states' file can run on it without the tier. A persistent KV tier
+  // makes the cache persistent: its copies are labelled for the next
+  // process, and the quota keeps whole restore points by the recency of
+  // their states (dropOldestPoint).
   Cache(KvPool &pool, KvTier *kvTier,
         std::shared_ptr<const model::DiskBudget> diskBudget);
   Cache(const Cache &) = delete;
   Cache &operator=(const Cache &) = delete;
+
+  [[nodiscard]] bool persistent() const noexcept { return persistent_; }
+  // Before the first request, takes back the restore points an earlier
+  // process left in a persistent tier: each state whose block's chain is
+  // whole, and that chain. Everything else stays behind, and once the files
+  // finish adoption its slots are free. Then the oldest copies go while the
+  // quota is exceeded. Ids and recency continue after those taken back.
+  [[nodiscard]] CacheAdoption adopt(std::vector<PersistedKv> blocks,
+                                    std::vector<PersistedState> states);
+  // One step of making the restore point at this block durable in a
+  // persistent tier, while it stays in RAM: the pages of its chain that have
+  // no disk copy are written, root first, beside the commands that may read
+  // them, then the state from its own buffers. Nothing starts while a
+  // restore waits, and the pages take a small share of the tier's writes.
+  // A point is unneeded once it is gone or an ordinary state on its only
+  // branch below supersedes it: its conversation went on from there. One
+  // larger than the quota, or given up to make room for itself, is refused.
+  [[nodiscard]] PersistStatus persist(uint64_t block);
+  // At a clean stop: the label of each state copy a persistent tier keeps
+  // takes its state's current recency and class, which the next process
+  // keeps and orders them by. KV copies keep the labels of their writes: a
+  // chain goes with the states that need it (dropOldestPoint).
+  void relabelStates() const;
+  // Bytes the disk tier has written in all.
+  [[nodiscard]] uint64_t diskWrittenBytes() const noexcept {
+    return diskBudget_ ? diskBudget_->writtenBytes() : 0;
+  }
 
   void setCompletionNotifier(std::function<void()> notifier) {
     states_.setCompletionNotifier(notifier);
@@ -507,10 +567,26 @@ private:
   [[nodiscard]] std::shared_ptr<KvDiskSlot> acquireDiskSlot(bool inUse);
   // Gives up one disk copy for a new copy, in use or not: the oldest
   // redundant one, KV or state, else the oldest that is the only copy, never
-  // the KV of a state in RAM. The only copy of a state in use, and the KV it
-  // restores through, go only for a copy in use, and after every other.
+  // the KV of a state in RAM. A persistent tier gives up restore points
+  // instead (dropOldestPoint). The only copy of a state in use, and the KV
+  // it restores through, go only for a copy in use, and after every other.
   // False when the disk holds nothing the new copy may displace.
   [[nodiscard]] bool freeDiskSpace(bool inUse);
+  // In a persistent tier a redundant copy is what the next process takes
+  // back, and the unit worth keeping is a restore point, a state and its
+  // chain. A copy no state needs goes first (dropUnneededCopy), then the
+  // oldest state copy, redundant or not: the copies of its chain that no
+  // other state needs become unneeded and go on later calls, so a chain
+  // stays whole while a state needs it. The only copy of a state in use goes
+  // only for a copy in use, and last. False when no state copy can go.
+  [[nodiscard]] bool dropOldestPoint(bool inUse);
+  [[nodiscard]] bool dropUnneededCopy();
+  // A persistent tier's label for the block's disk copy.
+  void labelKv(uint64_t block, const std::shared_ptr<KvDiskSlot> &slot);
+  // Ordinary states below the block sit on exactly one of its branches.
+  [[nodiscard]] bool superseded(uint64_t block) const;
+  // An ordinary state at the block or anywhere below it.
+  [[nodiscard]] bool holdsOrdinaryState(uint64_t block) const;
   void startRestore(uint64_t block);
   // Evicting ordinary KV may empty an extent: the pages Ordinary may reuse
   // (reusablePages), less those whose demotion is in flight, cover one. That
@@ -529,12 +605,20 @@ private:
 
   KvPool &pool_;
   KvTier *tier_;
+  bool persistent_;
+  CacheAdoption adoption_;
   std::shared_ptr<const model::DiskBudget> diskBudget_;
   CacheRecency recency_;
   KvCache kv_;
   StateCache states_;
   std::unordered_map<uint64_t, Request> requests_;
   std::vector<Demotion> demotions_;
+  // Pages persist() writes while they stay in RAM: transfers that free
+  // nothing, so they hold no memory a reclaim waits for (pendingPages), only
+  // their blocks.
+  std::vector<Demotion> copies_;
+  // At most this many at once, of the tier's demotion share.
+  static constexpr uint32_t kCopies = 16;
   // Block IDs increase from parent to child. Restores start in that order so
   // cancellation can discard an unread suffix without stranding its parents.
   std::map<uint64_t, Restore> restores_;

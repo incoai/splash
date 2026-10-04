@@ -26,8 +26,6 @@
 #include <unordered_map>
 #include <utility>
 
-#include <unistd.h>
-
 namespace splash::metal {
 namespace {
 
@@ -194,29 +192,44 @@ struct AllocationAccounting {
 };
 
 struct MetalAllocation {
-    // Own the host mapping for our views as well as the Metal deallocator.
-    // Validation wrappers may not retain the supplied deallocator block.
-    std::shared_ptr<void> externalOwner;
+    // Nil while the memory is released (MetalBackend::releaseMemory).
     __strong id<MTLBuffer> buffer = nil;
     std::shared_ptr<AllocationAccounting> accounting;
+    // What the buffer adds to the accounting: its allocated size, or zero
+    // while released.
     uint64_t bytes = 0;
+    // The length, storage and label a restored buffer is allocated with.
+    uint64_t length = 0;
     BufferStorage storage = BufferStorage::Shared;
+    __strong NSString *label = nil;
     // The residency set the buffer belongs to, held weakly as allocations
     // may outlive the backend. The set retains the buffer, and with it its
     // memory, so the last view takes it out.
     std::weak_ptr<Residency> residency;
 
-    ~MetalAllocation() {
-        if (auto kept = residency.lock()) kept->remove(buffer);
-        if (accounting && bytes) {
-            accounting->allocatedBytes.fetch_sub(
-                bytes, std::memory_order_relaxed);
-        }
+    // Takes the buffer, which joins the residency set and the accounting.
+    void attach(id<MTLBuffer> allocated) {
+        buffer = allocated;
+        bytes = allocated.allocatedSize;
+        if (auto kept = residency.lock()) kept->add(buffer);
+        raisePeak(accounting->peakAllocatedBytes,
+                  accounting->allocatedBytes.fetch_add(
+                      bytes, std::memory_order_relaxed) + bytes);
     }
+    // Lets the buffer go: it leaves the residency set and the accounting.
+    void detach() noexcept {
+        if (!buffer) return;
+        if (auto kept = residency.lock()) kept->remove(buffer);
+        accounting->allocatedBytes.fetch_sub(bytes, std::memory_order_relaxed);
+        buffer = nil;
+        bytes = 0;
+    }
+
+    ~MetalAllocation() { detach(); }
 };
 
-// Every Impl has an allocation with a buffer: only registerBuffer and view
-// create one.
+// Every Impl has an allocation, whose buffer is nil only while its memory is
+// released: only allocateBuffer and view create one.
 struct MetalBuffer::Impl {
     std::shared_ptr<MetalAllocation> allocation;
     uint64_t offsetBytes = 0;
@@ -548,25 +561,29 @@ struct MetalBackend::Impl {
         asyncState->markUnhealthy(std::move(reason));
     }
 
-    MetalBuffer registerBuffer(id<MTLBuffer> buffer, BufferStorage storage,
-                               std::shared_ptr<void> externalOwner = {}) {
-        auto allocation = std::make_shared<MetalAllocation>();
-        allocation->externalOwner = std::move(externalOwner);
-        allocation->buffer = buffer;
-        allocation->accounting = accounting;
-        allocation->bytes = buffer.allocatedSize;
-        allocation->storage = storage;
-        residency->add(buffer);
-        allocation->residency = residency;
-        raisePeak(accounting->peakAllocatedBytes,
-                  accounting->allocatedBytes.fetch_add(
-                      allocation->bytes, std::memory_order_relaxed) +
-                      allocation->bytes);
-        sampleDeviceMemory();
-        auto result = std::make_shared<MetalBuffer::Impl>();
-        result->lengthBytes = buffer.length;
-        result->allocation = std::move(allocation);
-        return MetalBuffer(std::move(result));
+    id<MTLBuffer> newBuffer(uint64_t bytes, BufferStorage storage,
+                            NSString *label) {
+        MTLResourceOptions options = storage == BufferStorage::Shared
+            ? MTLResourceStorageModeShared : MTLResourceStorageModePrivate;
+        id<MTLBuffer> buffer = [device newBufferWithLength:bytes
+                                                   options:options];
+        if (!buffer)
+            throw MetalAllocationError("Metal buffer allocation failed");
+        if (label) buffer.label = label;
+        return buffer;
+    }
+
+    // The base allocation of a buffer, which must be a whole buffer of this
+    // backend.
+    MetalAllocation &baseAllocation(const MetalBuffer &buffer) const {
+        if (!buffer.impl_ ||
+            buffer.impl_->allocation->accounting.get() != accounting.get())
+            throw MetalBackendError("Metal buffer is not a buffer of this backend");
+        MetalAllocation &allocation = *buffer.impl_->allocation;
+        if (buffer.impl_->offsetBytes ||
+            buffer.impl_->lengthBytes != allocation.length)
+            throw MetalBackendError("a view's memory is its base buffer's");
+        return allocation;
     }
 
     id<MTLComputePipelineState> pipeline(std::string_view name) {
@@ -647,6 +664,13 @@ struct MetalBackend::Impl {
                     accounting.get()) {
                     throw MetalBackendError(
                         "compute dispatch buffer belongs to another backend");
+                }
+                if (!binding.buffer.impl_->allocation->buffer) {
+                    std::ostringstream message;
+                    message << "compute dispatch '" << dispatch.pipelineName
+                            << "' binds released memory at index "
+                            << binding.index;
+                    throw MetalBackendError(message.str());
                 }
                 claim(binding.index);
                 item.bufferIndices |= uint32_t{1} << binding.index;
@@ -834,7 +858,8 @@ BufferStorage MetalBuffer::storage() const noexcept {
 }
 
 void *MetalBuffer::contents() const noexcept {
-    if (!impl_ || impl_->allocation->storage != BufferStorage::Shared) {
+    if (!impl_ || impl_->allocation->storage != BufferStorage::Shared ||
+        !impl_->allocation->buffer) {
         return nullptr;
     }
     return static_cast<uint8_t *>(impl_->allocation->buffer.contents) +
@@ -842,7 +867,7 @@ void *MetalBuffer::contents() const noexcept {
 }
 
 uint64_t MetalBuffer::gpuAddress() const noexcept {
-    if (!impl_) return 0;
+    if (!impl_ || !impl_->allocation->buffer) return 0;
     return impl_->allocation->buffer.gpuAddress + impl_->offsetBytes;
 }
 
@@ -995,57 +1020,39 @@ MetalBuffer MetalBackend::allocateBuffer(uint64_t bytes,
     if (bytes > impl_->capabilities.maxBufferLengthBytes) {
         throw MetalBackendError("Metal buffer exceeds maxBufferLength");
     }
-
-    MTLResourceOptions options = storage == BufferStorage::Shared
-        ? MTLResourceStorageModeShared : MTLResourceStorageModePrivate;
-    id<MTLBuffer> buffer = [impl_->device
-        newBufferWithLength:bytes
-        options:options];
-    if (!buffer) throw MetalAllocationError("Metal buffer allocation failed");
-    if (!label.empty()) buffer.label = checkedNSString(label, "buffer label");
-    return impl_->registerBuffer(buffer, storage);
+    auto allocation = std::make_shared<MetalAllocation>();
+    allocation->accounting = impl_->accounting;
+    allocation->length = bytes;
+    allocation->storage = storage;
+    if (!label.empty()) allocation->label = checkedNSString(label, "buffer label");
+    allocation->residency = impl_->residency;
+    allocation->attach(impl_->newBuffer(bytes, storage, allocation->label));
+    impl_->sampleDeviceMemory();
+    auto result = std::make_shared<MetalBuffer::Impl>();
+    result->lengthBytes = bytes;
+    result->allocation = std::move(allocation);
+    return MetalBuffer(std::move(result));
 }
 
-MetalBuffer MetalBackend::wrapSharedMemory(
-    void *address, uint64_t bytes, std::shared_ptr<void> lifetime,
-    std::string_view label) {
-    checkOperation();
-    if (!address || !bytes) {
-        throw MetalBackendError("shared memory address and size are required");
-    }
-    if (!lifetime) {
-        throw MetalBackendError("shared memory lifetime token is required");
-    }
-    if (bytes > impl_->capabilities.maxBufferLengthBytes) {
-        throw MetalBackendError("shared memory exceeds maxBufferLength");
-    }
-    long systemPageSize = sysconf(_SC_PAGESIZE);
-    if (systemPageSize <= 0) {
-        throw MetalBackendError("unable to determine system page size");
-    }
-    uint64_t pageSize = static_cast<uint64_t>(systemPageSize);
-    if (reinterpret_cast<uintptr_t>(address) % pageSize || bytes % pageSize) {
+void MetalBackend::releaseMemory(const MetalBuffer &buffer) {
+    MetalAllocation &allocation = impl_->baseAllocation(buffer);
+    if (!allocation.buffer)
+        throw MetalBackendError("Metal buffer memory is already released");
+    if (commandInFlight())
         throw MetalBackendError(
-            "shared memory address and size must be page-aligned");
-    }
+            "Metal buffer memory is released while a command is in flight");
+    allocation.detach();
+    impl_->sampleDeviceMemory();
+}
 
-    id<MTLBuffer> buffer = [impl_->device
-        newBufferWithBytesNoCopy:address
-        length:bytes
-        options:MTLResourceStorageModeShared
-        deallocator:^(void *, NSUInteger) {
-            // Metal may retain the buffer beyond our last C++ view/ticket,
-            // including while a completed command's handler is returning.
-            // Keep its backing owner until Metal actually releases it.
-            (void)lifetime;
-        }];
-    if (!buffer) {
-        // The checks above passed, so the driver refused the mapping.
-        throw MetalAllocationError("zero-copy Metal buffer creation failed");
-    }
-    if (!label.empty()) buffer.label = checkedNSString(label, "buffer label");
-    return impl_->registerBuffer(buffer, BufferStorage::Shared,
-                                 std::move(lifetime));
+void MetalBackend::restoreMemory(const MetalBuffer &buffer) {
+    checkOperation();
+    MetalAllocation &allocation = impl_->baseAllocation(buffer);
+    if (allocation.buffer)
+        throw MetalBackendError("Metal buffer memory is not released");
+    allocation.attach(impl_->newBuffer(allocation.length, allocation.storage,
+                                       allocation.label));
+    impl_->sampleDeviceMemory();
 }
 
 MetalBuffer MetalBackend::view(const MetalBuffer &base,

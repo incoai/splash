@@ -60,6 +60,16 @@ uint64_t KvPageTier::slotBytes() const noexcept { return file_->slotBytes(); }
 
 bool KvPageTier::writable() const noexcept { return file_->writable(); }
 
+bool KvPageTier::persistent() const noexcept { return file_->persistent(); }
+
+void KvPageTier::label(const std::shared_ptr<KvDiskSlot> &slot, std::vector<std::byte> label) {
+  file_->label(diskSlot(slot)->slot, std::move(label));
+}
+
+std::shared_ptr<KvDiskSlot> KvPageTier::adopt(const model::SlotRecord &record) {
+  return std::make_shared<DiskSlot>(file_->adopt(record));
+}
+
 bool KvPageTier::canDemote() const noexcept {
   return demotions_ < demotionLimit_ && inFlight_.size() < transferLimit_ && writable();
 }

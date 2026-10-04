@@ -523,6 +523,8 @@ def main_args(**overrides):
             "max_context": None,
             "max_memory": None,
             "max_cache_disk": 0,
+            "persistent_cache": False,
+            "cache_dir": None,
             "decode_share": None,
             "max_image_pixels": images.MAX_PIXELS,
             "request_timeout": None,
@@ -3528,6 +3530,21 @@ class ServerTest(unittest.TestCase):
         disk_args = api.parse_args([*required, "--max-cache-disk", "5G"])
         self.assertEqual(disk_args.max_cache_disk, 5 * 1024**3)
         self.assertEqual(api._native_command(disk_args)[-1], str(5 * 1024**3))
+        # A persistent cache names its directory; the server picks the default.
+        persistent_args = api.parse_args(
+            [*required, "--max-cache-disk", "5G", "--persistent-cache"]
+        )
+        self.assertEqual(
+            api._native_command(persistent_args)[-3:],
+            [str(5 * 1024**3), "--cache-dir", str(serve_options.DEFAULT_CACHE_DIR)],
+        )
+        directory_args = api.parse_args(
+            [*required, "--max-cache-disk", "5G", "--persistent-cache"]
+            + ["--cache-dir", "/srv/cache"]
+        )
+        self.assertEqual(
+            api._native_command(directory_args)[-2:], ["--cache-dir", "/srv/cache"]
+        )
         self.assertEqual(args.kv_format, "int8")
         self.assertNotIn("--kv-format", api._native_command(args))
         bf16_args = api.parse_args([*required, "--kv-format", "bf16"])

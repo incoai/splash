@@ -29,17 +29,14 @@ ops::VisionNorm readNorm(WeightFile &file, uint32_t width,
   return {file.section(bytes, label), file.section(bytes, label)};
 }
 
-QwenVisionWeights readVision(metal::MetalBackend &backend,
-                             const std::filesystem::path &path,
-                             std::string contentIdentity,
-                             const ops::VisionLayout &layout) {
+QwenVisionWeights readVision(metal::MetalBackend &backend, WeightImages &images,
+                             ImagePlan image, const ops::VisionLayout &layout) {
   const uint64_t allocationBaseline = backend.memoryStats().allocatedBytes;
   QwenVisionWeights result;
   result.tensors.layout = layout;
   result.tensors.blocks.reserve(layout.depth);
 
-  WeightFile file(backend, path, "vision/model.bin", kVisionMagic, layout.depth,
-                  0, std::move(contentIdentity));
+  WeightFile file = images.load(std::move(image));
   result.tensors.patchEmbedding =
       readAffine(file, layout.hiddenSize, layout.patchDimension, "patch-embed");
   result.tensors.positionTable = file.section(
@@ -79,16 +76,19 @@ QwenVisionWeights readVision(metal::MetalBackend &backend,
 
 } // namespace
 
-QwenVisionWeights loadQwenVisionWeights(metal::MetalBackend &backend,
+QwenVisionWeights loadQwenVisionWeights(metal::MetalBackend &backend, WeightImages &images,
                                         const std::filesystem::path &directory,
                                         ops::VisionLayout layout) {
   requireVisionLayout(layout);
-  return readVision(backend, directory / "model.bin", {}, layout);
+  return readVision(backend, images,
+                    packedImage(directory / "model.bin", "vision/model.bin", kVisionMagic, layout.depth, 0),
+                    layout);
 }
 
 // The loader checked its layout when it was built.
-QwenVisionWeights loadQwenVisionWeights(metal::MetalBackend &backend, const VisionLoader &source) {
-  return readVision(backend, source.prepare(), source.weight().key, source.layout());
+QwenVisionWeights loadQwenVisionWeights(metal::MetalBackend &backend, WeightImages &images,
+                                        const VisionLoader &source) {
+  return readVision(backend, images, source.image(), source.layout());
 }
 
 } // namespace splash::model

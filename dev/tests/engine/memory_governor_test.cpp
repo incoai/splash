@@ -55,17 +55,17 @@ void testHostAvailabilityCountsReclaimablePages() {
   pages.purgeable = 0;
   require(availablePages(pages) == 35,
           "non-purgeable backing received reclaimable credit");
-  // Wired file pages leave external_page_count: GPU pinning must reduce
-  // available memory, rather than crediting hot weights for KV growth.
+  // Wired file pages leave external_page_count: pinned pages must reduce
+  // available memory rather than count as reclaimable.
   pages.fileBacked -= 10;
   require(availablePages(pages) == 25,
-          "wired weights remained available for new allocations");
+          "wired file pages remained available for new allocations");
 
-  // Reading a file into clean cache does not require a second full copy
-  // when that same immutable file is mapped again on the next startup.
+  // Clean file cache is reclaimable: reading a file takes no capacity from
+  // a later allocation.
   require(availablePages({.free = 75}) == 75 &&
               availablePages({.free = 35, .fileBacked = 40}) == 75,
-          "cached weights reduced model reload capacity");
+          "clean file cache reduced allocation capacity");
   // A 64 GB M5 Pro, whose hw.memsize less its VM queues left 1.2 GiB more
   // (the firmware carve-out, tag storage) that no allocation can have.
   require(estimateHostAvailableMemory(

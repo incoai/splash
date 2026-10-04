@@ -78,7 +78,10 @@ std::string executionManifest(uint32_t draftRows = 8,
 void testInstalledManifestBindsExecutionGeometry() {
   TemporaryModelRoot root;
   root.write(executionManifest());
-  static_cast<void>(model::inspectModelPackage(root.path()));
+  // The sources' identity is the digest of the record naming them.
+  const std::string sourceIdentity = model::inspectModelPackage(root.path()).sourceIdentity;
+  require(sourceIdentity == model::weightDigest(executionManifest()),
+          "the sources' identity is not the manifest's digest");
 
   root.write(executionManifest(7));
   try {
@@ -91,7 +94,8 @@ void testInstalledManifestBindsExecutionGeometry() {
   }
 
   root.write(executionManifest(8, R"(,"description":"package metadata")"));
-  static_cast<void>(model::inspectModelPackage(root.path()));
+  require(model::inspectModelPackage(root.path()).sourceIdentity != sourceIdentity,
+          "another manifest named the same sources");
 
   // A whole number written as a float, as Python writes 1e7, is that
   // integer; a fraction is not one.
@@ -628,7 +632,7 @@ void testStartupRetryWindowOpensAtFirstFailure() {
   RuntimeBootstrapReport failure;
   failure.resourceFailure = RuntimeResourceFailure::HostCapacity;
   StartupRetryWindow window(30s);
-  // A cold start fails for the first time after minutes of preparation.
+  // A slow start fails for the first time minutes in.
   const auto first = StartupRetryWindow::Clock::time_point{} + 5min;
   require(window.retryUntil(failure, first) == first + 30s &&
               window.retryUntil(failure, first + 29s) == first + 30s &&

@@ -30,7 +30,8 @@ CACHE_SOURCES := \
 	runtime/engine/KvPool.cpp \
 	runtime/engine/KvCache.cpp \
 	runtime/engine/StateCache.cpp \
-	runtime/engine/Cache.cpp
+	runtime/engine/Cache.cpp \
+	runtime/engine/WriteBehind.cpp
 BACKEND_CONTROL_SOURCES := \
 	runtime/engine/Scheduler.cpp \
 	runtime/model/DraftContextPlan.cpp \
@@ -41,6 +42,10 @@ NATIVE_RUNTIME_SOURCES := $(BACKEND_CONTROL_SOURCES) \
 	runtime/engine/NativeRuntime.cpp
 TEST_SLOT_FILE_ASAN := $(ENGINE_SANITIZER_BUILD)/slot-file-asan-ubsan
 TEST_SLOT_FILE_TSAN := $(ENGINE_SANITIZER_BUILD)/slot-file-tsan
+TEST_CACHE_DIRECTORY_ASAN := $(ENGINE_SANITIZER_BUILD)/cache-directory-asan-ubsan
+TEST_CACHE_DIRECTORY_TSAN := $(ENGINE_SANITIZER_BUILD)/cache-directory-tsan
+TEST_PERSISTENT_CACHE_ASAN := $(ENGINE_SANITIZER_BUILD)/persistent-cache-asan-ubsan
+TEST_PERSISTENT_CACHE_TSAN := $(ENGINE_SANITIZER_BUILD)/persistent-cache-tsan
 TEST_BACKEND_ASAN := $(ENGINE_SANITIZER_BUILD)/kv-first-engine-asan-ubsan
 TEST_BACKEND_TSAN := $(ENGINE_SANITIZER_BUILD)/kv-first-engine-tsan
 TEST_FD_TRANSPORT_ASAN := $(ENGINE_SANITIZER_BUILD)/native-fd-asan-ubsan
@@ -53,7 +58,7 @@ TEST_MEMORY_TEST := $(ENGINE_TEST_BUILD)/engine-memory-plan
 TEST_VISION_PREPARATION := $(ENGINE_TEST_BUILD)/vision-preparation
 TEST_AFFINE_PREPARATION := $(ENGINE_TEST_BUILD)/affine-preparation
 TEST_AFFINE_CHECKPOINT := $(ENGINE_TEST_BUILD)/affine-checkpoint
-TEST_PREPARED_WEIGHTS := $(ENGINE_TEST_BUILD)/prepared-weights
+TEST_WEIGHT_SOURCE := $(ENGINE_TEST_BUILD)/weight-source
 TEST_GGUF_FILE := $(ENGINE_TEST_BUILD)/gguf-file
 TEST_GGUF_PROJECTION := $(ENGINE_TEST_BUILD)/gguf-projection
 TEST_GGUF_DEQUANT := $(ENGINE_TEST_BUILD)/gguf-dequant
@@ -118,6 +123,7 @@ TEST_GGUF_PROJECTION_BENCHMARK := $(ENGINE_TEST_BUILD)/gguf-projection-benchmark
 TEST_GGUF_MOE_BENCHMARK := $(ENGINE_TEST_BUILD)/gguf-moe-benchmark
 TEST_MODEL_RUNTIME_ORACLE := $(ENGINE_TEST_BUILD)/model-runtime-oracle
 TEST_AFFINE_SOURCE_ORACLE := $(ENGINE_TEST_BUILD)/affine-source-oracle
+WEIGHT_DIGESTS := $(ENGINE_TEST_BUILD)/weight-digests
 TEST_VISION_ENCODER_TEST := $(ENGINE_TEST_BUILD)/vision-encoder
 TEST_Q8_AIR := $(ENGINE_TEST_BUILD)/q8-paged-kv.air
 TEST_Q8_LIB := $(ENGINE_TEST_BUILD)/q8-paged-kv.metallib
@@ -138,8 +144,10 @@ TEST_METAL_BACKEND_LIB := $(ENGINE_TEST_BUILD)/metal-backend.metallib
 TEST_PRODUCTION_LIB := $(ENGINE_TEST_BUILD)/production-and-test.metallib
 
 TEST_SLOT_FILE := $(ENGINE_TEST_BUILD)/slot-file
+TEST_CACHE_DIRECTORY := $(ENGINE_TEST_BUILD)/cache-directory
+TEST_PERSISTENT_CACHE := $(ENGINE_TEST_BUILD)/persistent-cache
 
-TEST_CPU_TARGETS := $(TEST_SLOT_FILE) $(TEST_VISION_PREPARATION) $(TEST_AFFINE_CHECKPOINT) $(TEST_PREPARED_WEIGHTS) $(TEST_OPERATOR_WORKSPACE) \
+TEST_CPU_TARGETS := $(TEST_SLOT_FILE) $(TEST_CACHE_DIRECTORY) $(TEST_VISION_PREPARATION) $(TEST_AFFINE_CHECKPOINT) $(TEST_WEIGHT_SOURCE) $(TEST_OPERATOR_WORKSPACE) \
 	$(TEST_GGUF_FILE) \
 	$(TEST_GGUF_REFERENCE) $(TEST_GGUF_PLANNER) \
 	$(TEST_TUNING_WORKLOADS) \
@@ -151,6 +159,7 @@ TEST_CPU_TARGETS := $(TEST_SLOT_FILE) $(TEST_VISION_PREPARATION) $(TEST_AFFINE_C
 	$(TEST_MEMORY_TEST) \
 	$(TEST_KV_PAGE_CACHE_TEST) \
 	$(TEST_KV_FIRST_CACHE_TEST) \
+	$(TEST_PERSISTENT_CACHE) \
 	$(TEST_DRAFT_CONTEXT_PLAN_TEST) \
 	$(TEST_RAGGED_SCHEDULER_TEST) \
 	$(TEST_KV_FIRST_ENGINE_TEST) \
@@ -206,9 +215,11 @@ TEST_CONFIG_TARGETS := $(filter-out $(LIB),$(sort $(TEST_CPU_TARGETS) $(TEST_MET
 	$(TEST_GGUF_DEQUANT_AIR)
 # Benchmarks and the tuning tool that build with the production flags.
 PRODUCTION_FLAG_TOOLS := $(TEST_Q4_PREFILL_PROFILE) $(TEST_Q4_DECODE_PROFILE) \
-	$(TEST_BACKEND_BENCHMARK) $(TUNE_KERNELS)
+	$(TEST_BACKEND_BENCHMARK) $(TUNE_KERNELS) $(WEIGHT_DIGESTS)
 PRODUCTION_CONFIG_TARGETS += $(PRODUCTION_FLAG_TOOLS)
 SANITIZER_CONFIG_TARGETS := $(TEST_SLOT_FILE_ASAN) $(TEST_SLOT_FILE_TSAN) \
+	$(TEST_CACHE_DIRECTORY_ASAN) $(TEST_CACHE_DIRECTORY_TSAN) \
+	$(TEST_PERSISTENT_CACHE_ASAN) $(TEST_PERSISTENT_CACHE_TSAN) \
 	$(TEST_BACKEND_ASAN) $(TEST_BACKEND_TSAN) \
 	$(TEST_FD_TRANSPORT_ASAN) $(TEST_FD_TRANSPORT_TSAN) \
 	$(TEST_OPERATOR_TUNING_ASAN) $(TEST_OPERATOR_TUNING_TSAN) \
@@ -228,7 +239,7 @@ $(ENGINE_TEST_BUILD):
 $(ENGINE_SANITIZER_BUILD):
 	mkdir -p $@
 
-$(TEST_PREPARED_WEIGHTS): dev/tests/engine/prepared_weights_test.cpp runtime/model/PreparedWeights.cpp | $(ENGINE_TEST_BUILD)
+$(TEST_WEIGHT_SOURCE): dev/tests/engine/weight_source_test.cpp runtime/model/WeightSource.cpp | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
 $(TEST_AFFINE_CHECKPOINT): dev/tests/engine/affine_checkpoint_test.cpp $(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
@@ -240,7 +251,7 @@ $(TEST_AFFINE_PREPARATION): dev/tests/engine/affine_preparation_test.mm $(ENGINE
 $(TEST_VISION_PREPARATION): dev/tests/engine/vision_preparation_test.cpp $(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $< $(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
 
-$(TEST_GGUF_FILE): dev/tests/engine/gguf_file_test.cpp runtime/model/GgufFile.cpp runtime/model/PreparedWeights.cpp \
+$(TEST_GGUF_FILE): dev/tests/engine/gguf_file_test.cpp runtime/model/GgufFile.cpp runtime/model/WeightSource.cpp \
 		| $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
@@ -532,13 +543,17 @@ $(TEST_MODEL_RUNTIME_ORACLE): dev/tests/engine/model_runtime_oracle_test.mm \
 		$(ENGINE_INSTRUMENTED_METAL_OBJECT) $(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
 
-# Compares locally prepared affine artifacts with the released package,
-# including all padding and metadata bytes. test-engine-cpu builds it so it
-# cannot break unnoticed; no target runs it, as it needs an installed MLX model
-# and the matching package (DEVELOPMENT.md).
+# Compares the affine images loaded from an MLX model with the released
+# package, including all padding and metadata bytes. test-engine-cpu builds it
+# so it cannot break unnoticed; no target runs it, as it needs an installed MLX
+# model and the matching package (DEVELOPMENT.md).
 $(TEST_AFFINE_SOURCE_ORACLE): dev/tests/engine/affine_source_oracle_test.mm \
 		$(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) \
+		$(ENGINE_LINKFLAGS) -o $@
+
+$(WEIGHT_DIGESTS): dev/tools/weight_digests.mm $(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_OBJCXXFLAGS) $< $(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
 
 $(TEST_DECODE_PROFILE): dev/benchmarks/decode_profile.mm \
@@ -592,11 +607,12 @@ test-engine: test-engine-cpu test-engine-metal
 
 test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TUNE_KERNELS) \
 		$(TEST_GGUF_PROJECTION_BENCHMARK) $(TEST_GGUF_MOE_BENCHMARK) \
-		$(TEST_AFFINE_SOURCE_ORACLE)
+		$(TEST_AFFINE_SOURCE_ORACLE) $(WEIGHT_DIGESTS)
 	$(TEST_SLOT_FILE)
+	$(TEST_CACHE_DIRECTORY)
 	$(BUILD_ID_PYTHON) dev/tests/engine/run_vision_preparation.py $(TEST_VISION_PREPARATION) $(WEIGHT_GOLDENS)
 	$(TEST_AFFINE_CHECKPOINT)
-	$(TEST_PREPARED_WEIGHTS)
+	$(TEST_WEIGHT_SOURCE)
 	$(TEST_GGUF_FILE)
 	$(TEST_GGUF_REFERENCE) $(WEIGHT_GOLDENS)
 	$(TEST_GGUF_PLANNER)
@@ -613,6 +629,7 @@ test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TUNE_KERNELS) \
 	$(TEST_MEMORY_TEST)
 	$(TEST_KV_PAGE_CACHE_TEST)
 	$(TEST_KV_FIRST_CACHE_TEST)
+	$(TEST_PERSISTENT_CACHE)
 	$(TEST_DRAFT_CONTEXT_PLAN_TEST)
 	$(TEST_RAGGED_SCHEDULER_TEST)
 	$(TEST_KV_FIRST_ENGINE_TEST)
@@ -721,6 +738,10 @@ benchmark-backend: preflight $(TARGET) $(TEST_BACKEND_BENCHMARK) $(LIB)
 # from the same sources.
 $(TEST_SLOT_FILE) $(TEST_SLOT_FILE_ASAN) $(TEST_SLOT_FILE_TSAN): \
 		runtime/model/SlotFile.cpp dev/tests/engine/slot_file_test.cpp
+$(TEST_CACHE_DIRECTORY) $(TEST_CACHE_DIRECTORY_ASAN) $(TEST_CACHE_DIRECTORY_TSAN): \
+		runtime/engine/CacheDirectory.cpp dev/tests/engine/cache_directory_test.cpp
+$(TEST_PERSISTENT_CACHE) $(TEST_PERSISTENT_CACHE_ASAN) $(TEST_PERSISTENT_CACHE_TSAN): \
+		$(CACHE_SOURCES) runtime/model/SlotFile.cpp dev/tests/engine/persistent_cache_test.cpp
 $(TEST_KV_FIRST_ENGINE_TEST) $(TEST_BACKEND_ASAN) $(TEST_BACKEND_TSAN): \
 		$(BACKEND_CONTROL_SOURCES) \
 		dev/benchmarks/PrefillWork.hpp \
@@ -737,8 +758,8 @@ $(TEST_OPERATOR_MEASUREMENT) $(TEST_OPERATOR_MEASUREMENT_ASAN) $(TEST_OPERATOR_M
 		dev/tuning/Tuning.cpp dev/tuning/Measurement.cpp \
 		dev/tests/engine/operator_measurement_test.cpp
 
-$(TEST_SLOT_FILE) $(TEST_KV_FIRST_ENGINE_TEST) $(TEST_FD_TRANSPORT_TEST) \
-		$(TEST_OPERATOR_TUNING) $(TEST_OPERATOR_MEASUREMENT): | $(ENGINE_TEST_BUILD)
+$(TEST_SLOT_FILE) $(TEST_CACHE_DIRECTORY) $(TEST_PERSISTENT_CACHE) $(TEST_KV_FIRST_ENGINE_TEST) \
+		$(TEST_FD_TRANSPORT_TEST) $(TEST_OPERATOR_TUNING) $(TEST_OPERATOR_MEASUREMENT): | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
 $(filter %-asan-ubsan,$(SANITIZER_CONFIG_TARGETS)): SANITIZERS := address,undefined
@@ -754,6 +775,10 @@ TSAN_TEST_ENV := TSAN_OPTIONS=halt_on_error=1
 test-sanitizers: $(SANITIZER_CONFIG_TARGETS)
 	$(ASAN_TEST_ENV) $(TEST_SLOT_FILE_ASAN)
 	$(TSAN_TEST_ENV) $(TEST_SLOT_FILE_TSAN)
+	$(ASAN_TEST_ENV) $(TEST_CACHE_DIRECTORY_ASAN)
+	$(TSAN_TEST_ENV) $(TEST_CACHE_DIRECTORY_TSAN)
+	$(ASAN_TEST_ENV) $(TEST_PERSISTENT_CACHE_ASAN)
+	$(TSAN_TEST_ENV) $(TEST_PERSISTENT_CACHE_TSAN)
 	$(ASAN_TEST_ENV) $(TEST_BACKEND_ASAN)
 	$(TSAN_TEST_ENV) $(TEST_BACKEND_TSAN)
 	$(ASAN_TEST_ENV) $(TEST_FD_TRANSPORT_ASAN)

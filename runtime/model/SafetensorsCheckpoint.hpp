@@ -1,20 +1,19 @@
 #pragma once
 
-#include "model/PreparedWeights.hpp"
+#include "model/WeightSource.hpp"
 
+#include <filesystem>
 #include <memory>
 #include <string_view>
 
 namespace splash::model {
 
 // Checkpoint configuration and safetensors index. Opening parses only
-// metadata; tensor data is hashed when a prepared file's identity first
-// needs it and read in bounded slices, without loading the MLX runtime or
-// allocating tensors.
+// metadata; the images read tensor data in bounded slices, without loading
+// the MLX runtime or allocating tensors.
 class SafetensorsCheckpoint final {
 public:
-  explicit SafetensorsCheckpoint(const std::filesystem::path &directory,
-                        const PreparationCheck &check);
+  explicit SafetensorsCheckpoint(const std::filesystem::path &directory);
   ~SafetensorsCheckpoint();
   [[nodiscard]] const SourceTensor *find(std::string_view name) const noexcept;
   [[nodiscard]] const SourceTensor &require(std::string_view name) const;

@@ -11,6 +11,7 @@ import math
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 
 from . import images, origins
 from .http_security import validate_api_key
@@ -19,6 +20,8 @@ REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 MAX_CONTEXT_TOKENS = 262144
 DEFAULT_MAX_REQUEST_BYTES = 128 * 1024 * 1024
 DEFAULT_QUEUE_SIZE = 32
+# Where --persistent-cache keeps its files unless --cache-dir says otherwise.
+DEFAULT_CACHE_DIR = Path.home() / "Library/Caches/Splash/prefix-cache"
 _SIZE_UNITS = {
     unit + suffix: 1024**power
     for power, unit in enumerate(("K", "M", "G"), 1)
@@ -75,6 +78,12 @@ def parse_max_cache_disk(value):
     if size is None:
         raise argparse.ArgumentTypeError("use 0 to disable, or a size such as 5G")
     return size
+
+
+def parse_cache_dir(value):
+    if not value.strip():
+        raise argparse.ArgumentTypeError("must name a directory")
+    return Path(value).expanduser().absolute()
 
 
 def parse_request_size(value):
@@ -268,6 +277,24 @@ SERVE_OPTIONS = (
         ),
     ),
     ServeOption(
+        "--persistent-cache",
+        dict(
+            action="store_true",
+            default=False,
+            help="keep the SSD cache across restarts (needs --max-cache-disk)",
+        ),
+    ),
+    ServeOption(
+        "--cache-dir",
+        dict(
+            type=parse_cache_dir,
+            default=None,
+            metavar="DIRECTORY",
+            help="where --persistent-cache keeps its files (default: "
+            "~/Library/Caches/Splash/prefix-cache)",
+        ),
+    ),
+    ServeOption(
         "--max-context",
         dict(
             type=parse_max_context,
@@ -374,6 +401,10 @@ def check_serve_arguments(parser, args):
     """The checks of the shared options that involve more than one."""
     if args.announce_served_name and not args.served_model_name:
         parser.error("--announce-served-name needs --served-model-name")
+    if args.persistent_cache and not args.max_cache_disk:
+        parser.error("--persistent-cache needs --max-cache-disk")
+    if args.cache_dir is not None and not args.persistent_cache:
+        parser.error("--cache-dir needs --persistent-cache")
 
 
 def serve_argv(args):

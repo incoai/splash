@@ -9,6 +9,7 @@ from tempfile import TemporaryDirectory
 from unittest import mock
 
 from dev.benchmarks import backend_regression as regression
+from dev.benchmarks import weights
 from dev.tests import smoke_real as smoke
 
 SCENARIO_NAMES = ("decode", "partial")
@@ -168,7 +169,7 @@ class BackendRegressionTests(unittest.TestCase):
                 self.assertTrue(any("did not repeat" in f for f in summary["failures"]))
 
     def test_identity_is_compared_within_each_build(self):
-        # Different preparation identities load different keys: allowed.
+        # Two builds may load different layouts of one model: allowed.
         self.assertTrue(regression.summarize(rounds(), False)["pass"])
 
         def relayout(document):
@@ -249,14 +250,20 @@ class BackendRegressionTests(unittest.TestCase):
         with self.assertRaisesRegex(regression.RegressionError, "lacks"):
             regression.round_record("baseline", [benchmark_document(("decode",))])
 
-    def fake_checkout(self, root: Path, name: str, identity: str, list_support: bool):
+    def fake_checkout(
+        self, root: Path, name: str, digest: str | None, list_support: bool
+    ):
         """A checkout whose backend-benchmark prints canned output and logs
-        its invocations."""
+        its invocations. With digest its weight-digests prints one image of
+        that digest; without, it has none, as a build of an earlier release."""
         checkout = root / name
         (checkout / "build/engine-tests").mkdir(parents=True)
-        (checkout / "build/engine").mkdir()
         (checkout / "build/splash.metallib").write_text("")
-        (checkout / "build/engine/WeightPreparationIdentity.hpp").write_text(identity)
+        if digest:
+            tool = checkout / "build" / weights.WEIGHT_DIGESTS
+            image = {"component": "target/layer-0.bin", "bytes": 1, "sha256": digest}
+            tool.write_text(f"#!/bin/sh\necho '{json.dumps([image])}'\n")
+            tool.chmod(0o755)
         usage = (
             "[--scenario NAME[,NAME...]]"
             if list_support
@@ -272,7 +279,7 @@ class BackendRegressionTests(unittest.TestCase):
             "scenarios = sys.argv[sys.argv.index('--scenario') + 1].split(',')\n"
             f"with open({str(root / 'calls.jsonl')!r}, 'a') as log:\n"
             f"    log.write(json.dumps([{name!r}, scenarios, os.environ.get('SPLASH_WEIGHT_CACHE')]) + '\\n')\n"
-            f"document = json.loads({json.dumps(json.dumps(benchmark_document(build=name, layout=identity)))})\n"
+            f"document = json.loads({json.dumps(json.dumps(benchmark_document(build=name)))})\n"
             "if 'decode' not in scenarios: document['decode_throughput']['samples'] = []\n"
             "if 'partial' not in scenarios: document['measurements'] = []\n"
             "print(json.dumps(document))\n"
@@ -308,8 +315,8 @@ class BackendRegressionTests(unittest.TestCase):
     def test_a_failed_benchmark_stops_the_comparison_with_its_error(self):
         with TemporaryDirectory() as directory:
             root = Path(directory).resolve()
-            self.fake_checkout(root, "baseline", "same", True)
-            candidate = self.fake_checkout(root, "candidate", "same", True)
+            self.fake_checkout(root, "baseline", "a" * 64, True)
+            candidate = self.fake_checkout(root, "candidate", "a" * 64, True)
             script = candidate / regression.BENCHMARK
             script.write_text(
                 script.read_text().replace(
@@ -334,15 +341,16 @@ class BackendRegressionTests(unittest.TestCase):
                 [json.loads(line)[0] for line in calls], ["baseline", "candidate"]
             )
 
-    def test_main_runs_abba_rounds_and_isolates_another_preparation_identity(self):
-        for identity, list_support in (("same", True), ("new", True), ("new", False)):
+    def test_main_runs_abba_rounds_and_compares_the_weights(self):
+        a, b = "a" * 64, "b" * 64
+        for baseline, list_support in ((a, True), (None, True), (None, False)):
             with (
-                self.subTest(identity=identity, list_support=list_support),
+                self.subTest(baseline=baseline, list_support=list_support),
                 TemporaryDirectory() as directory,
             ):
                 root = Path(directory).resolve()
-                self.fake_checkout(root, "baseline", "same", list_support)
-                self.fake_checkout(root, "candidate", identity, True)
+                self.fake_checkout(root, "baseline", baseline, list_support)
+                self.fake_checkout(root, "candidate", a, True)
                 output = root / "release"
                 self.assertEqual(self.run_main(root), 0)
                 calls = [
@@ -360,10 +368,11 @@ class BackendRegressionTests(unittest.TestCase):
                         [
                             version,
                             names,
-                            # The candidate keeps the cache of its other steps.
-                            str(root / "cache")
-                            if version == "candidate" or identity == "same"
-                            else str(output / "baseline-weights"),
+                            # Only a baseline of an earlier release gets a
+                            # cache of its own.
+                            str(output / "baseline-weights")
+                            if version == "baseline" and not baseline
+                            else str(root / "cache"),
                         ]
                         for version in regression.ROUNDS
                         for names in scenarios
@@ -371,11 +380,31 @@ class BackendRegressionTests(unittest.TestCase):
                 )
                 document = json.loads((output / "backend-regression.json").read_text())
                 self.assertTrue(document["pass"])
+                # An earlier release mapped a legacy package as it is.
                 self.assertEqual(
-                    document["prepared"]["shared_identity"], identity == "same"
+                    len(document["weights"]["images"]), 1 if baseline else 0
                 )
-                # A legacy package prepares nothing, which is no failure.
-                self.assertEqual(document["prepared"].get("entries", []), [])
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            self.fake_checkout(root, "baseline", a, True)
+            self.fake_checkout(root, "candidate", b, True)
+            self.assertEqual(self.run_main(root), 1)
+            document = json.loads(
+                (root / "release/backend-regression.json").read_text()
+            )
+            self.assertFalse(document["pass"])
+            self.assertEqual(
+                document["weights"]["failures"],
+                [f"target/layer-0.bin: the baseline loaded {a}, the candidate {b}"],
+            )
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            self.fake_checkout(root, "baseline", a, True)
+            self.fake_checkout(root, "candidate", None, True)
+            with self.assertRaises(SystemExit):
+                self.run_main(root)
 
     def test_package_slug_names_results_by_selection(self):
         models = Path("/install/models")

@@ -1,12 +1,10 @@
 """Prepare tiny MLX and GGUF vision towers and compare them with an independently
-serialized packed file; check the exact-BF16 rule, the MLX cache identity, that
-invalid sources fail naming what is wrong and publish nothing, and that a padded
-section written after another keeps its padding zero."""
+serialized packed file; check the exact-BF16 rule, that invalid sources fail
+naming what is wrong, and that a padded section written after another keeps its
+padding zero."""
 
-import hashlib
 import json
 import math
-import os
 import struct
 import subprocess
 import sys
@@ -190,16 +188,9 @@ def fixture(root, source, shift=0, case=None):
     write_gguf(root / "mmproj.gguf", metadata, gguf_tensors)
 
 
-def prepare(binary, directory, source, mode, expected=True):
-    command = [binary, source, str(directory), mode]
-    if expected:
-        command.append(str(directory / "expected.bin"))
-    env = {**os.environ, "SPLASH_WEIGHT_CACHE": str(directory / "cache")}
-    return subprocess.run(command, env=env, text=True, capture_output=True)
-
-
-def published(directory):
-    return list((directory / "cache").glob("*/weights"))
+def prepare(binary, directory, source):
+    command = [binary, source, str(directory), str(directory / "expected.bin")]
+    return subprocess.run(command, text=True, capture_output=True)
 
 
 def main():
@@ -218,10 +209,9 @@ def main():
                 directory = root / f"{source}-{shift}"
                 directory.mkdir()
                 fixture(directory, source, shift)
-                result = prepare(binary, directory, source, "cold")
+                result = prepare(binary, directory, source)
                 assert result.returncode == 0, (source, shift, result.stderr)
-                path = Path(result.stdout.split()[0])
-                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                digest = result.stdout.split()[0]
                 assert digest == golden, (source, shift, digest)
             patch = (
                 "vision_tower.patch_embed.proj.weight" if mlx else "v.patch_embd.weight"
@@ -255,7 +245,7 @@ def main():
                 directory = root / f"{source}-{case}"
                 directory.mkdir()
                 fixture(directory, source, shift, case)
-                result = prepare(binary, directory, source, "cold")
+                result = prepare(binary, directory, source)
                 errors = result.stderr.strip().splitlines()
                 assert result.returncode == 1 and errors, (source, case, result.stderr)
                 named = [part.format(directory / file) for part in parts]
@@ -265,25 +255,6 @@ def main():
                     named,
                     result.stderr,
                 )
-                assert not published(directory), (source, case)
-
-        # The MLX tower's identity is the tensors it reads: the language
-        # model's shard and config.json do not enter it, a tower byte does.
-        directory = root / "mlx-0"
-        cached = prepare(binary, directory, "mlx", "warm").stdout.split()
-        write_safetensors(
-            directory / TEXT_SHARD,
-            {"language_model.model.norm.weight": ([8], "BF16", bytes(range(16)))},
-        )
-        (directory / "config.json").write_text('{"text_config": {}}')
-        result = prepare(binary, directory, "mlx", "warm")
-        assert result.returncode == 0 and result.stdout.split() == cached, result.stderr
-        data = bytearray((directory / VISION_SHARD).read_bytes())
-        data[-1] ^= 1
-        (directory / VISION_SHARD).write_bytes(data)
-        result = prepare(binary, directory, "mlx", "warm", expected=False)
-        errors = result.stderr.strip().splitlines()
-        assert errors[-1] == "unexpected warm conversion", result.stderr
 
         directory = root / "padding"
         directory.mkdir()
@@ -292,7 +263,7 @@ def main():
         )
         assert result.returncode == 0, result.stderr
         print(
-            "Vision layouts from MLX and GGUF, exact BF16 conversion, MLX identity, "
+            "Vision layouts from MLX and GGUF, exact BF16 conversion, "
             "rejected sources and zero padding PASS"
         )
 

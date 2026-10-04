@@ -386,9 +386,9 @@ def run_images(port: int, model: str, nonce: str) -> None:
                     ],
                 }
             ],
-            # Responses requests reason by default; leave room for the
-            # thinking block before the one-word answer.
-            "max_output_tokens": 256,
+            # Responses requests reason by default, and the thinking before
+            # the one-word answer can take more than 256 tokens.
+            "max_output_tokens": 1024,
             "temperature": 0,
             "store": False,
         },
@@ -1496,9 +1496,18 @@ def hold_package(arguments):
     """As splash serve does, serve every server this process starts, and its
     tokenizer, from one assembly, which installations keep while it is held:
     point arguments.package at the assembly it links now, held until the
-    process exits by arguments.held_record (None for a legacy package)."""
+    process exits by arguments.held_record (None for a legacy package). The
+    installation that collects an assembly is the one of the models root it
+    was built in (models/.resolved/<record>), which may be another
+    checkout's."""
+    resolved = arguments.package.resolve()
+    models_root = (
+        resolved.parent.parent
+        if resolved.parent.name == ".resolved"
+        else model_artifacts.MODELS
+    )
     arguments.package, arguments.held_record = assembly.hold(
-        arguments.package, model_artifacts.MODELS
+        arguments.package, models_root
     )
 
 

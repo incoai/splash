@@ -361,6 +361,25 @@ NativeProcessExit FdTransport::run(NativeRuntime &loop) {
   return loopFailure(loop);
 }
 
+bool FdTransport::runFlush(NativeRuntime &loop, std::chrono::milliseconds budget) {
+  const auto deadline = std::chrono::steady_clock::now() + budget;
+  while (!loop.flushRestorePoints()) {
+    const auto left = std::chrono::ceil<std::chrono::milliseconds>(
+        deadline - std::chrono::steady_clock::now());
+    if (!loop.engineHealthy() || left.count() <= 0)
+      return false;
+    pollfd descriptor{wake_->readFd, POLLIN, 0};
+    const int result = poll(&descriptor, 1, static_cast<int>(left.count()));
+    if (result < 0 && errno != EINTR) {
+      failure_ = "poll(loop wake): " + std::string(std::strerror(errno));
+      return false;
+    }
+    if (result > 0 && (descriptor.revents & POLLIN))
+      wake_->drain();
+  }
+  return true;
+}
+
 bool FdTransport::shutdownRequested() const noexcept {
   return wake_->shutdownRequested.load(std::memory_order_acquire);
 }

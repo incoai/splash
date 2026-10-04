@@ -8,10 +8,14 @@
 #include "Checked.hpp"
 #include "model/AffinePreparation.hpp"
 #include "model/SafetensorsCheckpoint.hpp"
+#include "model/WeightImages.hpp"
 #include "model/WeightLayout.hpp"
 #include "model/WeightStore.hpp"
 
 #include <algorithm>
+#include <filesystem>
+#include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -58,6 +62,26 @@ inline void bind(Image &image, const SafetensorsCheckpoint &source) {
     for (ProjectionPart &part : section.parts)
       for (Input &field : part.fields) bindInput(field);
   }
+}
+
+// A checkpoint and the images planned from it, which their writers share:
+// each image's inputs point into the checkpoint's tensors.
+struct PlannedCheckpoint final {
+  explicit PlannedCheckpoint(const std::filesystem::path &directory) : source(directory) {}
+  SafetensorsCheckpoint source;
+  std::vector<Image> images;
+};
+
+// Image `index` of planned, the component directory/name, written from the
+// checkpoint.
+[[nodiscard]] inline ImagePlan imagePlan(const std::shared_ptr<const PlannedCheckpoint> &planned, size_t index,
+                                         std::string_view directory) {
+  const Image &image = planned->images.at(index);
+  return {std::string(directory) + "/" + image.name, image.magic, image.layer, image.type, image.bytes,
+          [planned, index](std::span<uint8_t> bytes, const metal::MetalBuffer &) {
+            writeAffineImage(bytes, planned->images[index]);
+            planned->source.checkUnchanged();
+          }};
 }
 
 } // namespace splash::model::affine

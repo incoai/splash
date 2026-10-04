@@ -855,36 +855,12 @@ int main(int argc, char **argv) {
         decodeWarmupWall{};
     std::array<double, model::ExecutionLimits::maximumBatchWidth>
         decodeWarmupGpu{};
-    std::array<std::vector<double>, model::ExecutionLimits::maximumBatchWidth>
-        decodeSamples;
     std::vector<std::string> performanceFailures;
     for (uint32_t width = 1; width <= decodeWarmupWall.size(); ++width) {
       decodeWarmupWall[width - 1] =
           executor->warmupDecodeBatch(width).wallSeconds * 1000.0;
       decodeWarmupGpu[width - 1] =
           executor->telemetry().lastDecodeGpuSeconds * 1000.0;
-      decodeSamples[width - 1].reserve(samples);
-    }
-    for (uint32_t sample = 0; sample < samples; ++sample) {
-      for (uint32_t offset = 0; offset < decodeWarmupWall.size(); ++offset) {
-        const uint32_t width =
-            1 + (sample + offset) % decodeWarmupWall.size();
-        if (progress)
-          progress->begin("warmup", "decode", sample, 0, width);
-        static_cast<void>(executor->warmupDecodeBatch(width));
-        const double gpuMilliseconds =
-            executor->telemetry().lastDecodeGpuSeconds * 1000.0;
-        decodeSamples[width - 1].push_back(gpuMilliseconds);
-        if (progress) {
-          progress->complete("decode_warmup", "B" + std::to_string(width),
-                             sample, 0, width, 0.0, gpuMilliseconds, 0.0);
-        }
-      }
-    }
-    if (median(decodeSamples[2]) >
-        median(decodeSamples[0]) + median(decodeSamples[1])) {
-      performanceFailures.push_back(
-          "direct B3 decode is slower than separate B1 plus B2 commands");
     }
 
     Events events;
@@ -937,6 +913,26 @@ int main(int argc, char **argv) {
           *std::min_element(b2.begin(), b2.end())) {
         performanceFailures.push_back(
             "B3 aggregate decode throughput fell below B2");
+      }
+      // Nor may a B3 step take longer than a B1 step and a B2 step, which
+      // would decode the three lanes sooner apart. Every width is timed over
+      // its own run of steps here. A warmup command is not comparable across
+      // widths: it follows one setup prefill per lane, so where sustained
+      // load lowers the GPU clock (an M3 Max in Low Power Mode) a wider one
+      // runs at a lower clock.
+      const auto stepGpuMilliseconds = [&](uint32_t width) {
+        std::vector<double> values;
+        for (const DecodeThroughputMeasurement &measurement : decodeThroughput) {
+          if (measurement.width == width)
+            values.push_back(measurement.decodeGpuMilliseconds /
+                             static_cast<double>(measurement.decodeBatches));
+        }
+        return median(std::move(values));
+      };
+      if (stepGpuMilliseconds(3) >
+          stepGpuMilliseconds(1) + stepGpuMilliseconds(2)) {
+        performanceFailures.push_back(
+            "a B3 decode step takes longer than a B1 step and a B2 step");
       }
     }
 
@@ -1232,18 +1228,6 @@ int main(int argc, char **argv) {
       if (index)
         std::cout << ',';
       std::cout << decodeWarmupGpu[index];
-    }
-    std::cout << "],\"decode_gpu_samples_ms\":[";
-    for (size_t width = 0; width < decodeSamples.size(); ++width) {
-      if (width)
-        std::cout << ',';
-      std::cout << '[';
-      for (size_t sample = 0; sample < decodeSamples[width].size(); ++sample) {
-        if (sample)
-          std::cout << ',';
-        std::cout << decodeSamples[width][sample];
-      }
-      std::cout << ']';
     }
     std::cout << "]},\"decode_throughput\":{\"prompt_tokens\":"
               << decodeThroughputPrompt.size()

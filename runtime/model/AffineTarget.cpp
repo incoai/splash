@@ -162,45 +162,37 @@ std::vector<Image> images(const Layout &layout) {
   return result;
 }
 
+// The checkpoint at directory with every image of layout bound to it.
+template<class Layout>
+std::shared_ptr<affine::PlannedCheckpoint> plan(const std::filesystem::path &directory, const Layout &layout) {
+  auto planned = std::make_shared<affine::PlannedCheckpoint>(directory);
+  validateConfiguration(planned->source, layout);
+  planned->images = images(layout);
+  for (Image &image : planned->images) affine::bind(image, planned->source);
+  return planned;
+}
+
 } // namespace
 
 std::vector<Image> affineTargetImages(const Qwen3_8Layout &layout) { return images(layout); }
 std::vector<Image> affineTargetImages(const Qwen3_6MoeLayout &layout) { return images(layout); }
 
-struct AffineTargetLoader::Impl {
-  metal::MetalBackend &backend;
-  SafetensorsCheckpoint source;
-  PreparedImages<Image> images; // layers, head, embedding
-  template<class Layout>
-  Impl(metal::MetalBackend &backend, const std::filesystem::path &directory, const Layout &layout,
-       PreparationCheck admitConversion)
-      : backend(backend), source(directory, [&backend] { backend.checkOperation(); }),
-        images(PreparedFiles([&backend] { backend.checkOperation(); }, std::move(admitConversion),
-                             [this] { source.checkUnchanged(); }),
-               [](const Image &image) { return affine::affineImageWriter(image); }) {
-    validateConfiguration(source, layout);
-    for (Image &image : affineTargetImages(layout)) {
-      backend.checkOperation();
-      affine::bind(image, source);
-      PreparedWeight weight = affine::affineImageWeight(image, "target", directory.string());
-      images.add(std::move(image), std::move(weight));
-    }
-  }
-};
-AffineTargetLoader::AffineTargetLoader(metal::MetalBackend &backend, const std::filesystem::path &directory,
-                                       const Qwen3_8Layout &layout, PreparationCheck admitConversion)
-    : impl_(std::make_unique<Impl>(backend, directory, layout, std::move(admitConversion))) {}
-AffineTargetLoader::AffineTargetLoader(metal::MetalBackend &backend, const std::filesystem::path &directory,
-                                       const Qwen3_6MoeLayout &layout, PreparationCheck admitConversion)
-    : impl_(std::make_unique<Impl>(backend, directory, layout, std::move(admitConversion))) {}
+AffineTargetLoader::AffineTargetLoader(WeightImages &images, const std::filesystem::path &directory,
+                                       const Qwen3_8Layout &layout)
+    : images_(images), planned_(plan(directory, layout)) {}
+AffineTargetLoader::AffineTargetLoader(WeightImages &images, const std::filesystem::path &directory,
+                                       const Qwen3_6MoeLayout &layout)
+    : images_(images), planned_(plan(directory, layout)) {}
 AffineTargetLoader::~AffineTargetLoader() = default;
-std::span<const PreparedWeight> AffineTargetLoader::weights() const noexcept { return impl_->images.weights(); }
-void AffineTargetLoader::prepare() { impl_->images.prepare(); }
 WeightFile AffineTargetLoader::layer(uint32_t index) {
-  if (index >= impl_->images.size() - 2) throw WeightStoreError("target layer is out of range");
-  return impl_->images.open(impl_->backend, index);
+  if (index >= planned_->images.size() - 2) throw WeightStoreError("target layer is out of range");
+  return images_.load(affine::imagePlan(planned_, index, "target"));
 }
-WeightFile AffineTargetLoader::head() { return impl_->images.open(impl_->backend, impl_->images.size() - 2); }
-WeightFile AffineTargetLoader::embedding() { return impl_->images.open(impl_->backend, impl_->images.size() - 1); }
+WeightFile AffineTargetLoader::head() {
+  return images_.load(affine::imagePlan(planned_, planned_->images.size() - 2, "target"));
+}
+WeightFile AffineTargetLoader::embedding() {
+  return images_.load(affine::imagePlan(planned_, planned_->images.size() - 1, "target"));
+}
 
 } // namespace splash::model

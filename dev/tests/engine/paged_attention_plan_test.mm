@@ -625,7 +625,9 @@ void checkVerify(metal::MetalBackend &backend, uint32_t heads, kv::Layout layout
   auto data = makeCase(backend, heads, layout, lanes, 8, history, true);
   const auto output = run<Phase::Verify>(backend, data, true);
   checkReference(data, output);
-  if (history == 1023 && (lanes == 1 || lanes == 4))
+  // Empty history exercises a true one-split plan; a partial history also
+  // checks the history-scaled base and mixed lane split counts.
+  if ((history == 0 || history == 1023) && (lanes == 1 || lanes == 4))
     for (uint32_t splitBase : {1U, 8U, 16U}) {
       const auto candidate = run<Phase::Verify>(backend, data, true, splitBase);
       checkReference(data, candidate);

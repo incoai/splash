@@ -17,9 +17,11 @@ private:
   unsigned state_ = 0;
 };
 
-// The engine's memory control between commands: it records the system's
-// pressure, logs a change in what requests wait for, and runs the reclaim
-// pass the pressure policy asks for, telling the governor what it found.
+// The engine's memory control between commands: it releases the weights of
+// an engine left without a request (NativeRuntime::releaseIdleWeights),
+// records the system's pressure, logs a change in what requests wait for,
+// and runs the reclaim pass the pressure policy asks for, telling the
+// governor what it found.
 class MemoryControl final {
 public:
   MemoryControl(MemoryGovernor &governor, metal::MetalBackend &backend,

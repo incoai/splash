@@ -188,6 +188,29 @@ std::unique_ptr<StateOffload> QwenCompositeState::write(
   }
 }
 
+std::unique_ptr<StateOffload>
+QwenCompositeState::persist(std::function<void()> completion) const {
+  if (!canOffload())
+    return {};
+  auto disk = file_->acquire();
+  if (!disk)
+    return {};
+  auto copy = std::shared_ptr<const CompositeState>(
+      new QwenCompositeState(layout_, lengths_, file_, disk));
+  const auto spans = stateSpans(buffers_.gdn->buffers(), buffers_.draft->layers());
+  auto operation = file_->write(std::move(disk), {spans.begin(), spans.end()},
+                                std::move(completion));
+  // As for write(): only a failed write of its own closes the file.
+  if (!operation)
+    throw std::logic_error("the state file closed with no state write in flight");
+  return std::make_unique<FileOffload>(operation, std::move(copy), nullptr);
+}
+
+void QwenCompositeState::label(std::vector<std::byte> label) const {
+  if (disk_)
+    file_->label(disk_, std::move(label));
+}
+
 QwenCompositeState::~QwenCompositeState() {
   if (!pool_ || !pool_->open)
     return;
@@ -468,6 +491,19 @@ std::unique_ptr<StateRestore> QwenStateStorage::beginRestore(
     operation->drain();
     throw;
   }
+}
+
+std::shared_ptr<const CompositeState> QwenStateStorage::adopt(const SlotRecord &record,
+                                                              uint32_t tokens) {
+  if (!file_)
+    throw std::logic_error("Qwen states are taken back only from a disk tier");
+  const uint32_t window = std::min(tokens, ExecutionLimits::draftContextTokens);
+  const QwenLogicalLengths lengths{tokens, tokens - window, window};
+  validateLengths(lengths, true);
+  if (record.payloadBytes != layout_.cachedBytes())
+    throw std::invalid_argument("a recorded Qwen state does not match the state layout");
+  return std::shared_ptr<const CompositeState>(
+      new QwenCompositeState(layout_, lengths, file_, file_->adopt(record)));
 }
 
 QwenStateStorage::Lane &QwenStateStorage::lane(uint32_t index) {

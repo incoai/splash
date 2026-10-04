@@ -7,6 +7,7 @@ from tempfile import TemporaryDirectory
 from unittest import mock
 
 from dev.benchmarks import http_regression as benchmark
+from dev.benchmarks import weights
 from dev.tests import smoke_real as smoke
 
 
@@ -90,6 +91,15 @@ class HttpRegressionTests(unittest.TestCase):
                 with mock.patch.object(smoke.model_artifacts, "MODELS", models):
                     smoke.hold_package(arguments)
 
+            # The candidate's weight images are compared by its weight-digests.
+            with (
+                contextlib.redirect_stderr(io.StringIO()) as error,
+                self.assertRaises(SystemExit),
+            ):
+                parse(legacy)
+            self.assertIn("weight-digests", error.getvalue())
+            (root / weights.WEIGHT_DIGESTS).parent.mkdir()
+            (root / weights.WEIGHT_DIGESTS).touch()
             arguments = parse(legacy)
             self.assertEqual(arguments.package, models / legacy)
             hold(arguments)
@@ -112,6 +122,38 @@ class HttpRegressionTests(unittest.TestCase):
             with contextlib.redirect_stderr(error), self.assertRaises(SystemExit):
                 parse("community/not-installed")
             self.assertIn("missing installed model", error.getvalue())
+
+    def test_another_checkouts_assembly_is_held_by_its_installation(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            # This checkout installed nothing; another one built the assembly.
+            checkout = root / "checkout/install/models"
+            models = root / "other/install/models"
+            assembly = models / ".resolved/assembly"
+            assembly.mkdir(parents=True)
+            (assembly / "model.json").write_text("{}")
+            link = models / "owner/model"
+            link.parent.mkdir()
+            link.symlink_to(assembly, target_is_directory=True)
+            for package in (assembly, link):
+                with self.subTest(package=str(package.relative_to(models))):
+                    with mock.patch.object(smoke.model_artifacts, "MODELS", checkout):
+                        arguments = smoke.parse_args(
+                            [
+                                "--package",
+                                str(package),
+                                "--model",
+                                "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M",
+                            ]
+                        )
+                        smoke.hold_package(arguments)
+                    try:
+                        self.assertEqual(arguments.package, assembly)
+                        self.assertTrue(smoke.assembly.is_held(assembly))
+                    finally:
+                        arguments.held_record.close()
+            self.assertTrue((models / ".install.lock").exists())
+            self.assertFalse(checkout.exists())
 
     def row(self, version, sample=0, latency=10, round=None):
         return {
@@ -168,7 +210,7 @@ class HttpRegressionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no samples"):
             benchmark.summarize(rows[:3] + [{**rows[3], "round": 0}])
 
-    def test_layout_identity_is_compared_only_where_keys_must_agree(self):
+    def test_layout_identity_is_compared_within_each_build(self):
         def status(build, layout, kv="int8"):
             return {
                 "identity": {
@@ -178,22 +220,18 @@ class HttpRegressionTests(unittest.TestCase):
             }
 
         baseline = {"version": "baseline", **status("b", "layout-b")}
-        # Another preparation identity prepares under other keys.
-        benchmark.check_identity(
-            status("c", "layout-c"), "candidate", [baseline], False
-        )
-        for shared, current, version in (
-            (True, status("c", "layout-c"), "candidate"),
-            (False, status("b", "layout-c"), "baseline"),
-            (False, status("b2", "layout-b"), "baseline"),
-            (False, status("c", "layout-c", "bf16"), "candidate"),
+        # The builds' weights are compared by their bytes instead.
+        benchmark.check_identity(status("c", "layout-c"), "candidate", [baseline])
+        for current, version in (
+            (status("b", "layout-c"), "baseline"),
+            (status("b2", "layout-b"), "baseline"),
+            (status("c", "layout-c", "bf16"), "candidate"),
         ):
             with (
-                self.subTest(shared=shared, current=current, version=version),
+                self.subTest(current=current, version=version),
                 self.assertRaises(smoke.SmokeFailure),
             ):
-                benchmark.check_identity(current, version, [baseline], shared)
-        benchmark.check_identity(status("c", "layout-b"), "candidate", [baseline], True)
+                benchmark.check_identity(current, version, [baseline])
 
     def test_missing_duplicate_or_changed_transcript_fails(self):
         baseline, candidate = self.row("baseline"), self.row("candidate")

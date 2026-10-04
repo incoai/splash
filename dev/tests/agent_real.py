@@ -1220,4 +1220,9 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    # A shell starts a background job with SIGINT ignored, and the clients
+    # would inherit that: stop_process could not interrupt them, and this
+    # run could not be interrupted either. Handled here, the signal is back
+    # to its default in every program the run starts.
+    signal.signal(signal.SIGINT, signal.default_int_handler)
     raise SystemExit(main())

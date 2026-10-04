@@ -157,6 +157,17 @@ std::string runtimeStatusJson(
       << ",\"kv_restores\":" << resources.kvTier.restores
       << ",\"kv_restore_failures\":" << resources.kvTier.restoreFailures
       << ",\"kv_pending_pages\":" << resources.kvTier.pendingPages
+      << ",\"persistent\":" << boolean(resources.persistent)
+      << ",\"kv_copies\":" << resources.kvTier.copies
+      << ",\"kv_copy_failures\":" << resources.kvTier.copyFailures
+      << ",\"taken_back\":{\"states\":" << resources.adoption.states
+      << ",\"kv_blocks\":" << resources.adoption.blocks
+      << ",\"bytes\":" << resources.adoption.bytes
+      << ",\"left_behind\":" << resources.adoption.dropped << "}"
+      << ",\"write_behind\":{\"waiting\":" << core.writeBehind.waiting
+      << ",\"durable\":" << core.writeBehind.durable
+      << ",\"unneeded\":" << core.writeBehind.unneeded
+      << ",\"refused\":" << core.writeBehind.refused << "}"
       << "}"
       << ",\"cache\":{\"probe_hashed_blocks\":" << lookup.probeHashedBlocks
       << ",\"hits\":" << core.cacheHits

@@ -92,6 +92,36 @@ uint64_t minimumBytes(const RuntimeResourcesConfig &config,
       .value();
 }
 
+// A persistent cache's directory is named for what its copies hold: the same
+// models and layouts name the same one under any build, and a change to any
+// of them names another.
+void testPersistentCacheNamespace() {
+  const model::ModelDescriptor model = model::makeModelDescriptor(
+      "namespace-test", model::Qwen3_8Layout{}, model::DFlashDraftLayout{},
+      ops::VisionLayout{});
+  const auto identity = [&](char models, std::string_view build, kv::Format format) {
+    kv::Layout layout = model.targetKvLayout;
+    layout.format = format;
+    return makeRuntimeCacheIdentity(std::string(64, models), std::string(64, 'b'), build,
+                                    layout);
+  };
+  const std::string name =
+      persistentCacheNamespace(identity('a', "build", kv::Format::Int8), model.stateLayout);
+  require(name.size() == 32 && name.find_first_not_of("0123456789abcdef") == std::string::npos,
+          "a cache namespace is not 32 lowercase hex digits");
+  require(persistentCacheNamespace(identity('a', "another build", kv::Format::Int8),
+                                   model.stateLayout) == name,
+          "the build changed the cache namespace");
+  model::CompositeStateLayout states = model.stateLayout;
+  ++states.draft.layers;
+  require(persistentCacheNamespace(identity('c', "build", kv::Format::Int8), model.stateLayout) !=
+                  name &&
+              persistentCacheNamespace(identity('a', "build", kv::Format::BFloat16),
+                                       model.stateLayout) != name &&
+              persistentCacheNamespace(identity('a', "build", kv::Format::Int8), states) != name,
+          "other models or layouts shared a cache namespace");
+}
+
 void testWeightBudgetBeforeLoading(const char *metallibPath) {
   TemporaryModelRoot root;
   RuntimeResourcesConfig config = budgetConfig(metallibPath, root);
@@ -201,7 +231,7 @@ void testImagePatchCapIsBounded(const char *metallibPath) {
 
 // A 34.5 GiB model under a 35 GiB budget: the weights alone fit, but not
 // with what the runtime needs beside them. Startup refuses it before any
-// weight is prepared or registered.
+// weight is loaded.
 void testModelBeyondBudgetIsRefusedBeforeLoading(const char *metallibPath) {
   TemporaryModelRoot root(23 * kGiB / 2);
   RuntimeResourcesConfig config = budgetConfig(metallibPath, root);
@@ -220,7 +250,8 @@ void testModelBeyondBudgetIsRefusedBeforeLoading(const char *metallibPath) {
 // The rule that keeps users off the startup floor: admission weighs
 // reclaimable memory against the macOS reserve, never against the model.
 // A package far larger than everything reclaimable still starts, because
-// mapped weights become resident page by page under the operation guard.
+// the operation guard checks each image's allocation as loading builds the
+// residency up.
 void testStartupAdmissionIgnoresPackageSize(const char *metallibPath) {
   TemporaryModelRoot root(2 * kGiB);
   RuntimeResourcesConfig config = budgetConfig(metallibPath, root);
@@ -315,6 +346,7 @@ int main(int argc, char **argv) {
     try {
       require(argc == 2, "expected metallib path");
       testLoadedVisionIsRequiredOnlyWithVision();
+      testPersistentCacheNamespace();
       testWeightBudgetBeforeLoading(argv[1]);
       testStateStagingNeedsAStartedTier(argv[1]);
       testImagePatchCapIsBounded(argv[1]);

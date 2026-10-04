@@ -60,9 +60,9 @@ private:
 
 // Startup retries a temporary host or driver allocation failure for a
 // bounded time. The window opens at the first such failure, not at process
-// start, since a cold start can prepare weights for minutes before one; a
-// failure at a later stage than the last one follows progress and opens a
-// new window.
+// start, since a start loads the weights and warms up for a while before
+// one; a failure at a later stage than the last one follows progress and
+// opens a new window.
 class StartupRetryWindow final {
 public:
     using Clock = std::chrono::steady_clock;

@@ -7,7 +7,6 @@
 #import <Metal/Metal.h>
 #import <objc/runtime.h>
 
-#include <sys/mman.h>
 #include <unistd.h>
 
 #include <array>
@@ -825,19 +824,15 @@ void residencyReturnsRemovedBuffers(const std::string &metallibPath) {
 
 // Every buffer is held from its allocation until the keep-alive passes
 // without a command, the next command holds it again at once, and its last
-// view takes it out of the set: allocated and wrapped buffers alike.
+// view takes it out of the set.
 void buffersStayResident(const std::string &metallibPath) {
     constexpr double kKeepAliveSeconds = 1.0;
     ResidencyCalls calls;
     const ScopedTestConfig seam({.residencyKeepAliveSeconds = kKeepAliveSeconds});
     MetalBackend backend(metallibPath);
     const uint64_t page = static_cast<uint64_t>(getpagesize());
-    void *address = mmap(nullptr, page, PROT_READ | PROT_WRITE,
-                         MAP_PRIVATE | MAP_ANON, -1, 0);
-    require(address != MAP_FAILED, "unable to map memory to wrap");
-    std::shared_ptr<void> mapping(address, [page](void *memory) { munmap(memory, page); });
     const auto start = std::chrono::steady_clock::now();
-    MetalBuffer dropped = backend.view(backend.wrapSharedMemory(address, page, mapping, {}), 0, 64);
+    MetalBuffer dropped = backend.view(sharedBuffer(backend, page), 0, 64);
     MetalBuffer used = sharedBuffer(backend, page);
     const uint64_t each = backend.memoryStats().allocatedBytes / 2;
     require(waitFor([&] { return calls.requests != 0; }, std::chrono::seconds(1)),
@@ -1082,62 +1077,56 @@ void bindingRunsKeepOffsets(MetalBackend &backend) {
     }
 }
 
-void sharedMemoryCompletionLifetime(MetalBackend &backend) {
-    struct Gate {
-        std::mutex mutex;
-        std::condition_variable condition;
-        bool entered = false;
-        bool release = false;
-        std::atomic<bool> ownerReleased{false};
-    };
-    auto gate = std::make_shared<Gate>();
-    const size_t bytes = static_cast<size_t>(getpagesize());
-    void *address = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
-                         MAP_PRIVATE | MAP_ANON, -1, 0);
-    require(address != MAP_FAILED, "unable to allocate lifetime witness");
-    auto owner = std::shared_ptr<void>(address, [gate, bytes](void *memory) {
-        munmap(memory, bytes);
-        gate->ownerReleased.store(true);
-    });
-    auto buffer = backend.wrapSharedMemory(address, bytes, owner, {});
-    owner.reset();
-    const uint32_t count = 1, increment = 1;
-    ComputeDispatch dispatch{"test_add_u32", {{0, buffer}},
+// Released memory leaves the residency set and the accounting while the
+// buffer's views stay handles that no command may bind; a restore gives the
+// buffer memory again, which commands use as before. Only whole buffers with
+// no command in flight are released, each once until restored.
+void releasedMemory(const std::string &metallibPath) {
+    ResidencyCalls calls;
+    MetalBackend backend(metallibPath);
+    const uint64_t page = static_cast<uint64_t>(getpagesize());
+    const uint64_t before = backend.memoryStats().allocatedBytes;
+    MetalBuffer buffer = sharedBuffer(backend, page);
+    const MetalBuffer view = backend.view(buffer, 0, sizeof(uint32_t));
+    const uint64_t bytes = backend.memoryStats().allocatedBytes - before;
+    const uint32_t count = 1, increment = 7;
+    const ComputeDispatch dispatch{"test_add_u32", {{0, view}},
         {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
         {1, 1, 1}, {1, 1, 1}};
-    auto ticket = backend.submitCommandAsync({&dispatch, 1}, [gate] {
-        std::unique_lock lock(gate->mutex);
-        gate->entered = true;
-        gate->condition.notify_all();
-        gate->condition.wait_for(lock, std::chrono::seconds(5),
-                                [&] { return gate->release; });
-    });
-    dispatch.buffers.clear();
+    const auto rejects = [](const auto &operation, std::string_view expected, const std::string &message) {
+        try {
+            operation();
+        } catch (const MetalBackendError &error) {
+            if (std::string_view(error.what()).find(expected) != std::string_view::npos) return;
+        }
+        fail(message);
+    };
+    {
+        auto ticket = backend.submitAsync(dispatch);
+        rejects([&] { backend.releaseMemory(buffer); }, "command is in flight",
+                "memory was released under a command in flight");
+        (void)ticket.wait();
+    }
+    rejects([&] { backend.releaseMemory(view); }, "base buffer", "a view's memory was released");
+    rejects([&] { backend.restoreMemory(buffer); }, "not released", "allocated memory was restored");
+    const unsigned removals = calls.removals;
+    backend.releaseMemory(buffer);
+    require(!buffer.contents() && !view.contents() && !view.gpuAddress() &&
+                backend.memoryStats().allocatedBytes == before && calls.removals == removals + 1,
+            "released memory kept its contents, its accounting or its residency");
+    rejects([&] { backend.releaseMemory(buffer); }, "already released", "memory was released twice");
+    rejects([&] { (void)backend.submit(dispatch); }, "binds released memory",
+            "a command bound released memory");
+    backend.restoreMemory(buffer);
+    require(view.contents() && view.sizeBytes() == sizeof(uint32_t) &&
+                backend.memoryStats().allocatedBytes == before + bytes,
+            "restored memory lacks its contents or its accounting");
+    *static_cast<uint32_t *>(view.contents()) = 0;
+    (void)backend.submit(dispatch);
+    require(*static_cast<uint32_t *>(view.contents()) == increment,
+            "a command on restored memory produced the wrong result");
     buffer = {};
-    {
-        std::unique_lock lock(gate->mutex);
-        require(gate->condition.wait_for(lock, std::chrono::seconds(5),
-                                         [&] { return gate->entered; }),
-                "lifetime witness completion did not arrive");
-    }
-    require(!gate->ownerReleased.load(),
-            "external memory released while the command ticket still owns it");
-    // Applying the ticket drops its C++ allocations. Metal may release the
-    // underlying buffer before, during or after the completion callback;
-    // only the ticket-owned lifetime above and eventual release are required.
-    (void)ticket.wait();
-    {
-        std::lock_guard lock(gate->mutex);
-        gate->release = true;
-    }
-    gate->condition.notify_all();
-    const auto deadline = std::chrono::steady_clock::now() +
-                          std::chrono::seconds(5);
-    while (!gate->ownerReleased.load() &&
-           std::chrono::steady_clock::now() < deadline)
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    require(gate->ownerReleased.load(),
-            "external memory leaked after Metal released its buffer");
+    std::cout << "PASS released memory\n";
 }
 
 void run(const std::string &metallibPath) {
@@ -1383,7 +1372,6 @@ void run(const std::string &metallibPath) {
             "private allocation release was not tracked");
 
     bindingRunsKeepOffsets(backend);
-    sharedMemoryCompletionLifetime(backend);
     require(capabilities.gpuCoreCount >= 1 && capabilities.gpuCoreCount <= 4096,
             "GPU core count was not read from the IORegistry");
     require(capabilities.meetsMinimumMacos(),
@@ -1421,6 +1409,7 @@ int main(int argc, const char *argv[]) {
             dispatchProfilingCoversEveryCommand(argv[1]);
             preparedPipelinesCompileAhead(argv[1]);
             buffersStayResident(argv[1]);
+            releasedMemory(argv[1]);
             allocationDoesNotRequestResidency(argv[1]);
             residencyRacesTheHeartbeat(argv[1]);
             residencyEndsWithoutBlits(argv[1]);

@@ -238,8 +238,8 @@ int main(int argc, char **argv) {
 
       const auto descriptor = model::inspectModelPackage(modelRoot);
       std::optional<model::ModelPackage> package;
-      if (!admit(model::preparedModelWeightBytes(modelRoot, descriptor),
-                 [&] { package.emplace(model::loadModelPackage(backend, modelRoot, descriptor, {})); }))
+      if (!admit(model::modelWeightBytes(modelRoot, descriptor),
+                 [&] { package.emplace(model::loadModelPackage(backend, modelRoot, descriptor)); }))
         throw std::runtime_error("model package memory admission denied or interrupted");
       const auto workloads =
           model::collectTuningWorkloads(*package, kPrefillProbeRows, kDecodeProbeWidths);

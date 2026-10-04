@@ -4,24 +4,16 @@
 #include "metal/abi/Gguf.h"
 #include "model/GgufFile.hpp"
 #include "model/GgufImageLayout.hpp"
-#include "model/PreparedWeights.hpp"
+
+#include <CommonCrypto/CommonDigest.h>
 
 #include <algorithm>
-#include <cerrno>
 #include <cstring>
-#include <fcntl.h>
 #include <sstream>
-#include <system_error>
 #include <tuple>
 #include <utility>
 
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
-
 namespace splash::model {
-
-static_assert(kWeightFileAlignment == kHostPageBytes, "weight files are mapped at host page boundaries");
 
 namespace {
 
@@ -59,85 +51,10 @@ uint64_t alignPacked(uint64_t value) {
     return alignWeightOffset(value);
 }
 
-std::string systemError(std::string_view operation,
-                        const std::filesystem::path &path, int error) {
-    return std::string(operation) + " " + path.string() + ": " +
-        std::error_code(error, std::generic_category()).message();
-}
-
-static_assert(sizeof(size_t) == sizeof(uint64_t), "weight files are mapped whole");
-
-class MappedRegion final {
-public:
-    // A prepared file is mapped only as the cache verified it.
-    static std::shared_ptr<MappedRegion> openReadOnly(
-        const std::filesystem::path &path, bool prepared) {
-        int descriptor = open(path.c_str(), O_RDONLY | O_CLOEXEC);
-        if (descriptor < 0) {
-            throw WeightStoreError(systemError("unable to open", path, errno));
-        }
-
-        struct stat status {};
-        if (fstat(descriptor, &status) != 0) {
-            int error = errno;
-            close(descriptor);
-            throw WeightStoreError(systemError("unable to stat", path, error));
-        }
-        if (!S_ISREG(status.st_mode) || status.st_size <= 0) {
-            close(descriptor);
-            throw WeightStoreError("packed file is not a non-empty regular file: " +
-                                   path.string());
-        }
-        if (prepared) {
-            try {
-                requireVerifiedFile(descriptor, path);
-            } catch (...) {
-                close(descriptor);
-                throw;
-            }
-        }
-        uint64_t bytes = static_cast<uint64_t>(status.st_size);
-
-        // Metal can materialize MAP_PRIVATE file mappings as anonymous dirty
-        // pages on GPU use. Preserve file backing; pages held resident by Metal
-        // are still wired and cannot be reclaimed until that residency ends.
-        void *address = mmap(nullptr, static_cast<size_t>(bytes), PROT_READ,
-                             MAP_SHARED, descriptor, 0);
-        int mapError = errno;
-        close(descriptor);
-        if (address == MAP_FAILED) {
-            throw WeightStoreError(
-                systemError("unable to mmap", path, mapError));
-        }
-        return std::shared_ptr<MappedRegion>(
-            new MappedRegion(address, bytes));
-    }
-
-    ~MappedRegion() {
-        if (address_) {
-            munmap(address_, static_cast<size_t>(bytes_));
-        }
-    }
-
-    MappedRegion(const MappedRegion &) = delete;
-    MappedRegion &operator=(const MappedRegion &) = delete;
-
-    [[nodiscard]] void *address() const noexcept { return address_; }
-    [[nodiscard]] uint64_t bytes() const noexcept { return bytes_; }
-
-private:
-    MappedRegion(void *address, uint64_t bytes)
-        : address_(address), bytes_(bytes) {}
-
-    void *address_ = nullptr;
-    uint64_t bytes_ = 0;
-};
-
 } // namespace
 
 struct WeightFile::Impl {
     metal::MetalBackend *backend = nullptr;
-    std::shared_ptr<MappedRegion> mapping;
     metal::MetalBuffer base;
     WeightFileRecord record;
     uint64_t offset = kHeaderBytes;
@@ -157,25 +74,18 @@ void checkWeightHeader(const uint8_t *header, uint64_t bytes, std::string_view e
 }
 } // namespace
 
-WeightFile::WeightFile(metal::MetalBackend &backend,
-                       std::filesystem::path path,
-                       std::string relativePath,
-                       std::string_view expectedMagic,
-                       uint32_t expectedLayer,
-                       uint32_t expectedType, std::string contentIdentity)
+WeightFile::WeightFile(metal::MetalBackend &backend, metal::MetalBuffer image,
+                       std::string relativePath, std::string_view expectedMagic,
+                       uint32_t expectedLayer, uint32_t expectedType,
+                       std::string contentIdentity)
     : impl_(std::make_unique<Impl>()) {
+    const auto *header = static_cast<const uint8_t *>(image.contents());
+    if (!header) throw WeightStoreError("weight image is not host visible: " + relativePath);
+    checkWeightHeader(header, image.sizeBytes(), expectedMagic, expectedLayer, expectedType, relativePath);
     impl_->backend = &backend;
-    impl_->mapping = MappedRegion::openReadOnly(path, !contentIdentity.empty());
-    checkWeightHeader(static_cast<const uint8_t *>(impl_->mapping->address()),
-                      impl_->mapping->bytes(), expectedMagic, expectedLayer, expectedType,
-                      path.string());
-    impl_->record = {
-        std::move(relativePath), std::string(expectedMagic), expectedLayer, expectedType,
-        impl_->mapping->bytes(), std::move(contentIdentity),
-    };
-    impl_->base = backend.wrapSharedMemory(
-        impl_->mapping->address(), impl_->mapping->bytes(), impl_->mapping,
-        impl_->record.relativePath);
+    impl_->record = {std::move(relativePath), std::string(expectedMagic), expectedLayer, expectedType,
+                     image.sizeBytes(), std::move(contentIdentity)};
+    impl_->base = std::move(image);
 }
 
 WeightFile::WeightFile(WeightFile &&) noexcept = default;
@@ -188,7 +98,7 @@ metal::MetalBuffer WeightFile::section(uint64_t bytes,
     if (!bytes) throw WeightStoreError("packed section must not be empty");
     uint64_t start = alignPacked(impl_->offset);
     uint64_t end = checkedAdd<WeightStoreError>(start, bytes, "packed section end");
-    if (start % kWeightFileAlignment || end > impl_->mapping->bytes()) {
+    if (start % kWeightFileAlignment || end > impl_->base.sizeBytes()) {
         throw WeightStoreError(
             "packed file is truncated at section " + std::string(label));
     }
@@ -212,7 +122,7 @@ std::vector<metal::MetalBuffer> WeightFile::split(std::initializer_list<uint64_t
 
 void WeightFile::finish() {
     uint64_t consumed = alignPacked(impl_->offset);
-    if (consumed != impl_->mapping->bytes()) {
+    if (consumed != impl_->base.sizeBytes()) {
         throw WeightStoreError(
             "packed file has unconsumed or missing bytes: " +
             impl_->record.relativePath);
@@ -361,6 +271,23 @@ std::string weightManifestFingerprint(
         canonical << '\n';
     }
     return weightDigest(canonical.str());
+}
+
+std::string weightDigest(std::span<const uint8_t> bytes) {
+    CC_SHA256_CTX context;
+    CC_SHA256_Init(&context);
+    // CommonCrypto takes 32-bit lengths.
+    constexpr size_t kPieceBytes = size_t(1) << 30;
+    for (size_t at = 0; at < bytes.size(); at += kPieceBytes)
+        CC_SHA256_Update(&context, bytes.data() + at,
+                         static_cast<CC_LONG>(std::min(kPieceBytes, bytes.size() - at)));
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256_Final(digest, &context);
+    return digestHex(digest);
+}
+
+std::string weightDigest(std::string_view text) {
+    return weightDigest({reinterpret_cast<const uint8_t *>(text.data()), text.size()});
 }
 
 } // namespace splash::model

@@ -1,6 +1,6 @@
 #pragma once
 
-// Plans the prepared images (model/GgufImageLayout.hpp) of a Qwen3.8 (qwen35)
+// Plans the images (model/GgufImageLayout.hpp) of a Qwen3.8 (qwen35)
 // or Qwen3.6 MoE (qwen35moe) target read straight from a llama.cpp GGUF, from
 // its metadata alone: section offsets, the header and descriptor bytes, and
 // the source rows each tensor section is written from

@@ -1,8 +1,8 @@
 // GGUF weight preparation on the GPU: every format's planes through the
-// production executor against the CPU reference, the bytes the loader
-// prepares from the small dense and MoE targets, their golden hashes and
-// planned weights, warm loads, offsets past 4 GiB, the cache keys, and the
-// target loader's reading of a prepared GGUF.
+// production executor against the CPU reference, the images the loader
+// writes from the small dense and MoE targets, their golden hashes, offsets
+// past 4 GiB, a restore of released images, and the target loader's reading
+// of a GGUF.
 //   gguf-preparation METALLIB GOLDENS
 // GOLDENS is dev/tests/fixtures/weight-goldens/goldens.json; its README says
 // how to update it.
@@ -11,12 +11,11 @@
 #include "model/GgufTarget.hpp"
 #include "model/Qwen3_8.hpp"
 #include "model/QwenTargetLoader.hpp"
+#include "model/WeightImages.hpp"
 #include "model/WeightLayout.hpp"
 
-#include <fcntl.h>
-#include <unistd.h>
-
 #include <array>
+#include <cstring>
 #include <fstream>
 
 using namespace gguf_fixtures;
@@ -57,21 +56,28 @@ std::vector<uint8_t> slice(const std::vector<uint8_t> &bytes, uint64_t offset, u
   return {bytes.begin() + offset, bytes.begin() + offset + size};
 }
 
-std::vector<uint8_t> cachedImage(const model::WeightFile &weights) {
-  return splash::test::readFile(std::filesystem::path(std::getenv("SPLASH_WEIGHT_CACHE")) /
-                                weights.record().contentIdentity / "weights");
+// Loads every image of the GGUF at path into images: the layers', the head's
+// and the embedding's.
+void loadImages(MetalBackend &backend, model::WeightImages &images, const std::filesystem::path &path,
+                const model::gguf::TargetGeometry &geometry) {
+  model::GgufTargetLoader loader(backend, images, path, geometry);
+  for (uint32_t layer = 0; layer < geometry.layers; ++layer) static_cast<void>(loader.layer(layer));
+  static_cast<void>(loader.head());
+  static_cast<void>(loader.embedding());
 }
 
-// Every byte of each image the loader prepares: the layers', the head's and
-// the embedding's.
+std::vector<std::vector<uint8_t>> bytesOf(const model::WeightImages &images) {
+  std::vector<std::vector<uint8_t>> result;
+  for (const auto &image : images.contents()) result.emplace_back(image.bytes.begin(), image.bytes.end());
+  return result;
+}
+
+// Every byte of each image the loader writes.
 std::vector<std::vector<uint8_t>> preparedImages(MetalBackend &backend, const std::filesystem::path &path,
                                                  const model::gguf::TargetGeometry &geometry) {
-  model::GgufTargetLoader loader(backend, path, geometry, {});
-  std::vector<std::vector<uint8_t>> images;
-  for (uint32_t layer = 0; layer < geometry.layers; ++layer) images.push_back(cachedImage(loader.layer(layer)));
-  images.push_back(cachedImage(loader.head()));
-  images.push_back(cachedImage(loader.embedding()));
-  return images;
+  model::WeightImages images(backend);
+  loadImages(backend, images, path, geometry);
+  return bytesOf(images);
 }
 
 std::vector<model::gguf::Image> planned(const std::filesystem::path &path,
@@ -81,37 +87,29 @@ std::vector<model::gguf::Image> planned(const std::filesystem::path &path,
   return model::gguf::planImages(gguf, geometry);
 }
 
-// Every image the loader prepares from the GGUF at path against the goldens of
-// `name`, and every golden of `name` prepared.
+// Every image the loader writes from the GGUF at path against the goldens of
+// `name`, and every golden of `name` written; then the same bytes again once
+// the images are released and restored.
 void checkGoldenImages(MetalBackend &backend, const std::filesystem::path &path,
                        const model::gguf::TargetGeometry &geometry, const std::string &name, const Goldens &hashes) {
-  model::GgufTargetLoader loader(backend, path, geometry, {});
-  uint64_t compared = 0;
-  const auto compare = [&](const model::WeightFile &weights) {
-    const auto &record = weights.record();
-    const std::string image = name + "/" + record.relativePath;
-    // The model's disk check budgets weights(): it must be the files the
-    // loader writes, in order.
-    check(compared < loader.weights().size() && loader.weights()[compared].key == record.contentIdentity &&
-              loader.weights()[compared].bytes == record.declaredBytes &&
-              loader.weights()[compared].component == record.relativePath,
-          "GGUF loader plans the file it writes: " + image);
-    checkGolden(hashes, image, cachedImage(weights), "golden prepared bytes: " + image);
-    ++compared;
-  };
-  for (uint32_t layer = 0; layer < geometry.layers; ++layer) compare(loader.layer(layer));
-  compare(loader.head());
-  compare(loader.embedding());
+  model::WeightImages images(backend);
+  loadImages(backend, images, path, geometry);
+  const auto loaded = bytesOf(images);
+  for (const auto &image : images.contents())
+    checkGolden(hashes, name + "/" + std::string(image.component), image.bytes,
+                "golden prepared bytes: " + name + "/" + std::string(image.component));
   const auto goldens = std::count_if(hashes.begin(), hashes.end(), [&](const auto &golden) {
     return golden.first.starts_with(name + "/");
   });
-  check(uint64_t(goldens) == compared, "every golden " + name + " image is prepared");
-  check(compared == loader.weights().size(), "GGUF loader plans only the files it writes: " + name);
+  check(uint64_t(goldens) == loaded.size(), "every golden " + name + " image is prepared");
+  images.release();
+  while (!images.restore()) {
+  }
+  check(bytesOf(images) == loaded, "restored " + name + " images are the bytes loaded");
 }
 
 // The dense target: the F32 norms, the convolution, decay and time bias in
-// grouped head order, the bf16-exact rule, the golden images and the cache
-// keys.
+// grouped head order, the bf16-exact rule and the golden images.
 void checkDense(MetalBackend &backend, const std::filesystem::path &directory, const Goldens &hashes) {
   SmallTarget target = smallTarget(false);
   const model::gguf::TargetGeometry &g = target.geometry;
@@ -157,28 +155,6 @@ void checkDense(MetalBackend &backend, const std::filesystem::path &directory, c
     check(refused.find(name) != std::string::npos && refused.find("bf16") != std::string::npos,
           "preparation refuses to round " + name + " to bf16");
   }
-
-  // Keys follow the tensor data the images read: a metadata edit (a chat
-  // template, so every tensor moves in the file) keeps every prepared image,
-  // a changed tensor byte prepares its image again.
-  bool allowPreparation = true;
-  const auto keys = [&] {
-    model::GgufTargetLoader loader(backend, path, g, [&] {
-      if (!allowPreparation) throw std::runtime_error("conversion forbidden");
-    });
-    return std::array<std::string, 2>{loader.layer(0).record().contentIdentity, loader.head().record().contentIdentity};
-  };
-  writeGguf(path, target.tensors, g);
-  const auto original = keys();
-  std::vector<test_gguf::Key> edited = metadata(g);
-  edited.push_back(test_gguf::stringKey("tokenizer.chat_template", std::string(100, 'x')));
-  splash::test::writeFile(path, test_gguf::file(edited, target.tensors));
-  allowPreparation = false;
-  check(keys() == original, "a GGUF metadata edit keeps every prepared image");
-  target.data("blk.0.ssm_out.weight")[100] ^= 1;
-  writeGguf(path, target.tensors, g);
-  allowPreparation = true;
-  check(keys()[0] != original[0], "a changed tensor byte prepares its image again");
 }
 
 // alpha/beta of every quantized format on either architecture: one tensor of
@@ -224,8 +200,8 @@ void checkQuantizedAlphaBeta(MetalBackend &backend, const std::filesystem::path 
     }
 }
 
-// The MoE layer: the F32 alpha/beta tensor, the golden images, warm loads
-// and tensor offsets past 4 GiB.
+// The MoE layer: the F32 alpha/beta tensor, the golden images and tensor
+// offsets past 4 GiB.
 void checkMoe(MetalBackend &backend, const std::filesystem::path &directory, const Goldens &hashes) {
   SmallTarget target = smallTarget(true);
   const model::gguf::TargetGeometry &g = target.geometry;
@@ -236,19 +212,7 @@ void checkMoe(MetalBackend &backend, const std::filesystem::path &directory, con
   const auto *beta = copyOf(images[0], "blk.0.ssm_beta.weight"), *alpha = copyOf(images[0], "blk.0.ssm_alpha.weight");
   if (!beta || !alpha) throw std::runtime_error("the plan has no F32 alpha/beta tensor");
 
-  bool allowPreparation = true;
-  const auto load = [&] {
-    model::GgufTargetLoader loader(backend, path, g, [&] {
-      if (!allowPreparation) throw std::runtime_error("conversion forbidden on warm load");
-    });
-    auto weights = loader.layer(0);
-    const auto bytes = weights.section(weights.record().declaredBytes - model::kWeightFileAlignment, {});
-    const auto *begin = static_cast<const uint8_t *>(bytes.contents());
-    std::vector<uint8_t> image(model::kWeightFileAlignment, 0);
-    image.insert(image.end(), begin, begin + bytes.sizeBytes());
-    weights.finish();
-    return image;
-  };
+  const auto load = [&] { return preparedImages(backend, path, g).front(); };
   const auto image = load();
   const uint64_t rowBytes = uint64_t{g.hiddenSize} * sizeof(float);
   std::vector<uint8_t> gates = orderedRows(target.data(beta->source.name), rowBytes, beta->source.order);
@@ -256,13 +220,10 @@ void checkMoe(MetalBackend &backend, const std::filesystem::path &directory, con
   gates.insert(gates.end(), alphaRows.begin(), alphaRows.end());
   check(slice(image, beta->destination, gates.size()) == gates,
         "prepared F32 alpha/beta tensor: beta then alpha rows in grouped order");
-  allowPreparation = false;
-  check(load() == image, "GGUF warm load does not require conversion headroom");
 
   // A layer may have tensors on opposite sides of the 4 GiB boundary. Keep
   // the file sparse and zero the old location so a truncated offset cannot
   // read the right data.
-  allowPreparation = true;
   constexpr uint64_t kDisplacement = uint64_t{1} << 32;
   for (const std::string name : {"blk.0.ffn_down_exps.weight", "blk.0.ffn_gate_inp.weight"}) {
     writeGguf(path, target.tensors, g);
@@ -306,8 +267,7 @@ void checkWidenedAlphaBeta(MetalBackend &backend, const std::filesystem::path &d
             alpha->conversion == model::gguf::Conversion::WidenToFloat32 &&
             alpha->destination == beta->destination + 2 * target.data(beta->source.name).size(),
         "planner widens BF16 alpha/beta into one F32 tensor");
-  model::GgufTargetLoader loader(backend, path, g, {});
-  const std::vector<uint8_t> image = cachedImage(loader.layer(0));
+  const std::vector<uint8_t> image = preparedImages(backend, path, g).front();
   const uint64_t rowBytes = uint64_t{g.hiddenSize} * sizeof(float);
   std::vector<uint8_t> gates = orderedRows(floats[beta->source.name], rowBytes, beta->source.order);
   const auto alphaRows = orderedRows(floats[alpha->source.name], rowBytes, alpha->source.order);
@@ -372,7 +332,8 @@ void checkDenseTarget(MetalBackend &backend, const std::filesystem::path &direct
                                      {"output.weight", kQ6_K},
                                      {"token_embd.weight", kIQ4_XS}}),
             geometry);
-  model::GgufTargetLoader files(backend, model::findTargetGguf(target), geometry, {});
+  model::WeightImages images(backend);
+  model::GgufTargetLoader files(backend, images, model::findTargetGguf(target), geometry);
   const model::Qwen3_8Weights weights = model::loadQwen3_8Weights(backend, layout, files);
   check(weights.layers.size() == layout.layers, "GGUF target: every layer");
   check(weights.finalNorm.float32, "GGUF target: F32 final norm");
@@ -426,15 +387,11 @@ struct Shape {
   model::gguf::RowOrder order;
 };
 
-// The narrowest K whose tile of source and plane bytes exceeds the
-// preparation staging, so preparation must split the rows by columns.
+// The narrowest K whose tile of source rows exceeds the repack staging, so
+// preparation must split the rows by columns.
 uint32_t widerThanStaging(Fmt f) {
-  const QuantFormat &format = kQuantFormats[f];
-  const model::GgufPlaneBytes planes = model::ggufPlaneBytes(format, 1, model::kGgufBlockColumns);
-  const uint64_t perBlock = model::ggufRowBytes(format, model::kGgufBlockColumns) + planes.plane0 + planes.plane1 +
-                            planes.meta;
-  return uint32_t((model::kWeightPreparationStagingBytes / (QUANT_TILE_ROWS * perBlock) + 1) *
-                  model::kGgufBlockColumns);
+  const uint64_t perBlock = model::ggufRowBytes(kQuantFormats[f], model::kGgufBlockColumns);
+  return uint32_t((model::kGgufRepackStagingBytes / (QUANT_TILE_ROWS * perBlock) + 1) * model::kGgufBlockColumns);
 }
 
 // One quantized tensor through the production executor, from a file whose
@@ -450,14 +407,11 @@ void checkRepack(MetalBackend &backend, const std::filesystem::path &directory, 
   const uint64_t bytes = model::alignWeightOffset(meta + expected.meta.size()) + model::kWeightFileAlignment;
   const std::string what = std::string("prepared ") + fmtName(f) + " rows=" + std::to_string(rows) +
                            " K=" + std::to_string(K) + (shape.order.from == UINT64_MAX ? "" : " permuted");
-  const auto inputPath = directory / "repack-source", outputPath = directory / "repack-output";
-  int output = -1;
+  const auto inputPath = directory / "repack-source";
   try {
     std::vector<uint8_t> input(kSourceOffset, 0);
     input.insert(input.end(), native.begin(), native.end());
     splash::test::writeFile(inputPath, input);
-    output = open(outputPath.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
-    if (output < 0 || ftruncate(output, bytes)) throw std::runtime_error("cannot create the repack output");
     model::gguf::Repack step;
     step.format = f;
     step.rows = rows;
@@ -469,23 +423,27 @@ void checkRepack(MetalBackend &backend, const std::filesystem::path &directory, 
     model::gguf::Image plan;
     plan.bytes = bytes;
     plan.repacks.push_back(step);
-    const uint64_t before = backend.memoryStats().allocatedBytes;
+    const auto image = backend.allocateBuffer(bytes, splash::metal::BufferStorage::Shared, "repack-output");
+    // The writer writes every byte: none of these is left.
+    std::memset(image.contents(), 0xFF, bytes);
+    const auto before = backend.memoryStats();
     model::WeightSource source(inputPath);
     source.setDataOffset(kSourceOffset);
-    model::writeGgufImage(backend, source, output, plan, [] {});
-    check(backend.memoryStats().allocatedBytes == before, "repack releases its staging buffers");
-    check(backend.memoryStats().peakAllocatedBytes <= model::kWeightPreparationStagingBytes,
-          "repack staging stays within the preparation staging bound");
-    std::vector<uint8_t> actual(bytes), reference(bytes, 0);
-    model::readWeightBytes(output, 0, actual);
+    model::writeGgufImage(backend, source, image, plan);
+    const auto after = backend.memoryStats();
+    check(after.allocatedBytes == before.allocatedBytes, "repack releases its staging buffer");
+    check(after.peakAllocatedBytes <=
+              std::max(before.peakAllocatedBytes, before.allocatedBytes + model::kGgufRepackStagingBytes),
+          "repack staging stays within the repack staging bound");
+    const auto actual = model::contentsOf(image);
+    std::vector<uint8_t> reference(bytes, 0);
     std::copy(expected.w0.begin(), expected.w0.end(), reference.begin() + plane0);
     if (layout.plane1_bytes) std::copy(expected.w1.begin(), expected.w1.end(), reference.begin() + plane1);
     std::copy(expected.meta.begin(), expected.meta.end(), reference.begin() + meta);
-    check(actual == reference, what);
+    check(std::equal(actual.begin(), actual.end(), reference.begin(), reference.end()), what);
   } catch (const std::exception &error) {
     check(false, what + ": " + error.what());
   }
-  if (output >= 0) close(output);
 }
 
 void checkExecutor(MetalBackend &backend, const std::filesystem::path &directory) {
@@ -507,17 +465,16 @@ int main(int argc, char **argv) {
       std::fprintf(stderr, "usage: gguf-preparation METALLIB GOLDENS\n");
       return 2;
     }
-    // Every run must exercise conversion, including the >4 GiB source offsets.
     const splash::test::TemporaryDirectory directory("splash-gguf-preparation");
-    setenv("SPLASH_WEIGHT_CACHE", (directory.path() / "cache").c_str(), 1);
     const Goldens hashes = goldens(argv[2], @"gguf_images");
     MetalBackend backend(argv[1]);
+    // First, so that the peak allocation it checks against is its own.
+    checkExecutor(backend, directory.path());
     guarded("preparation of the dense target", [&] { checkDense(backend, directory.path(), hashes); });
     guarded("preparation of the MoE target", [&] { checkMoe(backend, directory.path(), hashes); });
     guarded("preparation of BF16 alpha/beta", [&] { checkWidenedAlphaBeta(backend, directory.path()); });
     guarded("preparation of quantized alpha/beta", [&] { checkQuantizedAlphaBeta(backend, directory.path()); });
     guarded("the target loader", [&] { checkDenseTarget(backend, directory.path()); });
-    checkExecutor(backend, directory.path());
     std::printf("%s (%d failures)\n", failures ? "GGUF preparation tests FAILED" : "GGUF preparation tests passed",
                 failures);
     return failures ? 1 : 0;

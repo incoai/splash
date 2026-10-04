@@ -30,6 +30,7 @@ std::string MemoryStatusReporter::update(const ResourceWaitSnapshot &wait,
 }
 
 bool MemoryControl::run(MemoryPressure pressure) {
+  loop_.releaseIdleWeights();
   governor_.setPressure(pressure);
   const double now = loop_.monotonicMilliseconds();
   static_cast<void>(backend_.refreshMemoryStats());

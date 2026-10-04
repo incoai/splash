@@ -24,10 +24,13 @@ MODEL_ID = "community/custom-splash"
 def with_stop_held(command, number):
     """The command, started with a stop signal already sent and held, as the
     launcher holds one sent while it starts a program."""
+    # A test run as a background job inherits SIGINT ignored, which would
+    # discard the signal instead of holding it.
     return [
         sys.executable,
         "-c",
         "import os, signal, sys; "
+        f"signal.signal({int(number)}, signal.SIG_DFL); "
         f"signal.pthread_sigmask(signal.SIG_BLOCK, ({int(number)},)); "
         f"os.kill(os.getpid(), {int(number)}); "
         "os.execv(sys.argv[1], sys.argv[1:])",

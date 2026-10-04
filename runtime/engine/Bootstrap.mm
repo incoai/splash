@@ -338,6 +338,7 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
   std::unique_ptr<NativeRuntime> nativeLoop;
   try {
     connectToGovernor(config.nativeLoop.engine, resources->memoryGovernor());
+    config.nativeLoop.weights = &resources->weightImages();
     // The parser and engine consume the same resolved ceiling. In automatic
     // mode it cannot be known until resource planning has measured the device.
     nativeLoop = std::make_unique<NativeRuntime>(
@@ -376,6 +377,7 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
   // The per-operation guard RuntimeResources installed is only for startup:
   // once Ready, the engine meets memory pressure between its ticks.
   resources->backend().setOperationGuard({});
+  resources->beginServing();
   return std::unique_ptr<RuntimeBootstrap>(
       new RuntimeBootstrap(std::move(resources), std::move(modelRuntime),
                            std::move(nativeLoop), std::move(report)));

@@ -3,6 +3,7 @@
 #include "TestChecks.hpp"
 #include "TestImmediateTicket.hpp"
 #include "TestKvPool.hpp"
+#include "TestKvTier.hpp"
 #include "TestStatus.hpp"
 #include "engine/Cache.hpp"
 #include "engine/FdTransport.hpp"
@@ -34,6 +35,11 @@ using namespace splash::engine;
 
 namespace {
 
+class State final : public CompositeState {
+public:
+  uint64_t bytes() const noexcept override { return 64; }
+};
+
 class Executor final : public model::Model {
 public:
   // Unless admit is set, no request gets a lane: one waits for it until its
@@ -45,6 +51,8 @@ public:
       std::make_shared<std::atomic<bool>>(false);
   std::function<void()> heldCompletion;
   std::function<void()> onSubmit;
+  // Unless set, a request publishes no state.
+  bool snapshots = false;
 
   StateAdmission begin(const ModelRequest &request) override {
     if (!admit)
@@ -85,7 +93,7 @@ public:
   }
   uint64_t snapshotBytes() const noexcept override { return 64; }
   std::shared_ptr<const CompositeState> snapshot(uint64_t) override {
-    return {};
+    return snapshots ? std::make_shared<State>() : nullptr;
   }
   uint64_t reclaimIdleState(bool, model::IdleMemory) noexcept override { return 0; }
   std::optional<std::string> provideMask(uint64_t,
@@ -146,6 +154,29 @@ struct Harness final {
   std::function<std::string()> status = test::readyStatusJson;
   engine::NativeRuntime loop{{}, resources, executor, transport.outputSink(),
                              [this] { return status(); }, protocol::ProtocolLimits{}};
+};
+
+// A loop over a persistent tier, with room for a 2060-token prompt, that
+// admits requests, publishes their states and runs each command at once.
+// The tier's copies land only when the test says so.
+struct PersistentHarness final {
+  PersistentHarness() {
+    storage.commandInFlight = [this] { return loop.commandInFlight(); };
+    tier.transferLimit = 64;
+    tier.capacity = 128;
+    executor.admit = true;
+    executor.snapshots = true;
+    *executor.ticketReady = true;
+  }
+  Pipes pipes;
+  test::TestKvStorage storage{72, 4096, 4};
+  KvPool pool{storage, 0};
+  test::TestKvTier tier{true};
+  engine::Cache resources{pool, &tier, nullptr};
+  Executor executor;
+  engine::FdTransport transport{pipes.input[0], pipes.output[1]};
+  engine::NativeRuntime loop{{}, resources, executor, transport.outputSink(),
+                             test::readyStatusJson, protocol::ProtocolLimits{}};
 };
 
 // A request for three prompt tokens and one output token: its wall-clock
@@ -623,6 +654,30 @@ void testCleanEofAndProtocolFailure() {
           "malformed input did not return protocol failure");
 }
 
+// A clean stop's flush ends at once with no restore point waiting, and
+// stops at its deadline while the writes it started have not landed.
+void testFlushEndsOrStopsAtItsDeadline() {
+  using namespace std::chrono_literals;
+  {
+    Harness harness;
+    require(harness.transport.runFlush(harness.loop, 0ms),
+            "a flush with nothing waiting did not end");
+  }
+  PersistentHarness harness;
+  harness.loop.announceReady();
+  protocol::RequestFrame frame = requestFrame(1, 30'000'000);
+  frame.promptTokens.assign(2060, 7);
+  require(harness.loop.receive(protocol::peer::serialize(frame)), "the request was refused");
+  for (uint32_t step = 0; step < 16 && !harness.loop.snapshot().writeBehind.waiting; ++step)
+    static_cast<void>(harness.loop.tick());
+  require(harness.loop.snapshot().writeBehind.waiting == 1,
+          "the replay point did not wait to be written");
+  const auto started = std::chrono::steady_clock::now();
+  require(!harness.transport.runFlush(harness.loop, 50ms) &&
+              std::chrono::steady_clock::now() - started >= 50ms && harness.tier.demotions == 16,
+          "a flush whose writes never land did not stop at its deadline");
+}
+
 } // namespace
 
 int main() {
@@ -637,6 +692,7 @@ int main() {
     testShutdownJoinsTheReader();
     testInputEndsAfterItsBytes();
     testShutdownInterruptsABlockedOutputWrite();
+    testFlushEndsOrStopsAtItsDeadline();
     std::cout << "native fd transport tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

@@ -3,6 +3,7 @@
 #include "ops/Vision.hpp"
 #include "engine/MemoryPlan.hpp"
 #include "engine/Cache.hpp"
+#include "engine/CacheDirectory.hpp"
 #include "engine/MemoryGovernor.hpp"
 #include "engine/KvPageTier.hpp"
 #include "ops/PageStorage.hpp"
@@ -11,14 +12,17 @@
 #include "engine/MemoryAudit.hpp"
 #include "ops/ExecutionPlans.hpp"
 
+#include <condition_variable>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 
 namespace splash::engine {
 
@@ -53,6 +57,22 @@ makeRuntimeCacheIdentity(std::string_view combinedManifestSha256,
                          std::string_view buildId,
                          kv::Layout targetKvLayout);
 
+// The name of the directory a persistent cache tier keeps its files in:
+// what its copies hold, from the models that computed them, the KV and
+// state layouts and the format of the cache's files. The build is not part
+// of it; a change to what a copy holds bumps the cache's format instead.
+[[nodiscard]] std::string
+persistentCacheNamespace(const RuntimeCacheIdentity &identity,
+                         const model::CompositeStateLayout &states);
+
+// A persistent cache tier's directory, and the files of its KV pages and
+// states there.
+struct PersistentCacheFiles final {
+  std::unique_ptr<CacheDirectory> directory;
+  std::shared_ptr<model::SlotFile> kv;
+  std::shared_ptr<model::SlotFile> states;
+};
+
 // The memory plan counts each weight category from the loaded package, so
 // every category the model has must report its allocation and identity.
 void requireLoadedModel(const model::ModelPackage &package);
@@ -66,6 +86,10 @@ struct RuntimeResourcesConfig {
   uint64_t maximumMemoryBytes = 0;
   // Disk quota shared by cached KV pages and states; zero disables the tier.
   uint64_t maximumCacheDiskBytes = 0;
+  // Where the tier keeps its files for the next process to take back
+  // (--cache-dir): one directory per persistentCacheNamespace(). Empty for
+  // temporary files that go with the process.
+  std::filesystem::path persistentCacheRoot;
   // Patches per image, from --max-image-patches: the engine admits images up
   // to it when the model loaded vision and none otherwise. The wire parser
   // keeps the protocol ceiling.
@@ -126,17 +150,32 @@ private:
 
 // Owns every process-wide native resource exactly once. Members go in
 // reverse declaration order: Cache -> KV pool -> KV disk tier -> state
-// storage -> KV page storage -> governor -> model package -> Metal backend.
-// The KV disk tier must go before the KV page storage: its IO worker reads
-// and writes pages in place in the extents, and its destructor waits for
-// every transfer in flight.
+// storage -> KV page storage -> governor -> model package -> Metal backend
+// -> a persistent tier's directory, whose lock goes last. The KV disk tier
+// must go before the KV page storage: its IO worker reads and writes pages
+// in place in the extents, and its destructor waits for every transfer in
+// flight. A persistent tier's files are sealed first, however the process
+// ends, so that the copies the cache lets go of stay for the next process.
 class RuntimeResources final {
 public:
+  // A persistent tier takes back what the last process left before create()
+  // returns.
   [[nodiscard]] static std::unique_ptr<RuntimeResources>
   create(const RuntimeResourcesConfig &config);
 
   RuntimeResources(const RuntimeResources &) = delete;
   RuntimeResources &operator=(const RuntimeResources &) = delete;
+  ~RuntimeResources();
+
+  // The engine is Ready: a persistent tier's directory marks this process
+  // serving, on probation for its first minute after an unclean end
+  // (CacheDirectory::beginServing).
+  void beginServing();
+  // At a clean stop, after the engine's flush (Engine::flushRestorePoints):
+  // each state copy's label takes its state's current recency, both files
+  // reach the drive and the directory records a clean end. False when they
+  // did not; true at once without a persistent tier.
+  [[nodiscard]] bool closePersistentCache();
 
   [[nodiscard]] metal::MetalBackend &backend() noexcept { return *backend_; }
   [[nodiscard]] const EngineMemoryPlan &memoryPlan() const noexcept {
@@ -158,12 +197,14 @@ public:
   }
 
   [[nodiscard]] model::RuntimeContext modelContext() noexcept;
+  [[nodiscard]] model::WeightImages &weightImages() noexcept { return *model_.images; }
   [[nodiscard]] ActualMemoryReport
   actualMemoryReport(const model::ModelMemoryActual &modelMemory) const;
 
 private:
 
-  RuntimeResources(std::unique_ptr<metal::MetalBackend> backend,
+  RuntimeResources(PersistentCacheFiles persistentCache,
+                   std::unique_ptr<metal::MetalBackend> backend,
                    model::ModelPackage model, ops::ExecutionPlans operators,
                    EngineMemoryPlan memoryPlan,
                    RuntimeCacheIdentity cacheIdentity,
@@ -174,7 +215,12 @@ private:
                    std::unique_ptr<KvPool> kvPool,
                    std::unique_ptr<engine::Cache> cache,
                    std::optional<uint64_t> hostAvailableAtStart);
+  // Takes back the restore points the last process left in a persistent
+  // tier (Cache::adopt) and opens its files for this one.
+  void adoptPersistentCache();
+  void stopProbation() noexcept;
 
+  PersistentCacheFiles persistentCache_;
   std::unique_ptr<metal::MetalBackend> backend_;
   model::ModelPackage model_;
   ops::ExecutionPlans operators_;
@@ -187,6 +233,11 @@ private:
   std::unique_ptr<KvPool> kvPool_;
   std::unique_ptr<engine::Cache> cache_;
   std::optional<uint64_t> hostAvailableAtStart_;
+  // Ends a probation once it has lasted, unless the process stops first.
+  std::thread probation_;
+  std::mutex probationMutex_;
+  std::condition_variable probationWake_;
+  bool probationStopped_ = false;
 };
 
 // Connects an engine to the governor that admits its memory: the engine asks

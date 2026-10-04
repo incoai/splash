@@ -368,13 +368,13 @@ DFlashDraftWeights readDraft(metal::MetalBackend &backend, Files &files,
 
 WeightFile PackedDraftFiles::layer(uint32_t index) const {
   const std::string filename = "layer-" + std::to_string(index) + ".bin";
-  return WeightFile(backend, directory / filename, "draft/" + filename,
-                    kDFlashLayerMagic, index, 0);
+  return images.load(packedImage(directory / filename, "draft/" + filename,
+                                 kDFlashLayerMagic, index, 0));
 }
 
 WeightFile PackedDraftFiles::model() const {
-  return WeightFile(backend, directory / "model.bin", "draft/model.bin",
-                    kDFlashLayerMagic, layout.layers, 1);
+  return images.load(packedImage(directory / "model.bin", "draft/model.bin",
+                                 kDFlashLayerMagic, layout.layers, 1));
 }
 
 DFlashDraftWeights loadDFlashDraftWeights(metal::MetalBackend &backend,

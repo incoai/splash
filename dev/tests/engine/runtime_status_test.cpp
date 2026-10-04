@@ -103,6 +103,10 @@ void testCleanRuntimeStatus() {
   engine.resources.kvTier.readBytes = 12345;
   engine.resources.kvTier.writtenBytes = 67890;
   engine.resources.kvTier.fileBytes = 24680;
+  engine.resources.persistent = true;
+  engine.resources.kvTier.copies = 64;
+  engine.resources.adoption = {2, 96, 4096, 1};
+  engine.writeBehind = {1, 5, 3, 0};
 
   WarmupReport warmup;
   warmup.maximumPrefill = WarmupStepStatus::Complete;
@@ -183,6 +187,11 @@ void testCleanRuntimeStatus() {
               json.find("\"written_bytes\":67890") != std::string::npos &&
               json.find("\"file_bytes\":24680,") != std::string::npos,
           "disk byte accounting was not exposed");
+  require(json.find("\"persistent\":true,\"kv_copies\":64,\"kv_copy_failures\":0,"
+                    "\"taken_back\":{\"states\":2,\"kv_blocks\":96,\"bytes\":4096,"
+                    "\"left_behind\":1},\"write_behind\":{\"waiting\":1,\"durable\":5,"
+                    "\"unneeded\":3,\"refused\":0}}") != std::string::npos,
+          "status lost the persistent tier");
   require(json.find("\"state_staging_bytes\":0,\"fixed_runtime_bytes\"") !=
               std::string::npos,
           "the memory plan status omitted the disk tier's state staging");
