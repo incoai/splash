@@ -53,7 +53,8 @@ kernel void moe_route_scores_q8_m8(
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   constexpr uint Rows = 8;
   constexpr uint TileN = 32;
-  constexpr uint StorageN = SPLASH_MOE_EXPERT_SLOTS;
+  constexpr uint StorageN = kQ4StorageColumns;
+  constexpr uint Slots = SPLASH_MOE_EXPERT_SLOTS;
   constexpr uint Simdgroups = 8;
   static_assert(Simdgroups == kMoeRouteSlices, "one simdgroup per K slice");
   threadgroup uint4 staged_storage[Simdgroups * Rows * 64 * 2 / 16];
@@ -149,7 +150,7 @@ kernel void moe_route_scores_q8_m8(
   for (uint s = 0; s < kMoeRouteSlices; ++s)
     total += partials[(s * Rows + row) * TileN + column];
   if (row < live_rows) {
-    scores[ulong(row_base + row) * StorageN + expert_origin + column] = total;
+    scores[ulong(row_base + row) * Slots + expert_origin + column] = total;
   }
 }
 
@@ -169,7 +170,8 @@ kernel void moe_route_scores_q8_m32(
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   constexpr uint Rows = 32;
   constexpr uint TileN = 128;
-  constexpr uint StorageN = SPLASH_MOE_EXPERT_SLOTS;
+  constexpr uint StorageN = kQ4StorageColumns;
+  constexpr uint Slots = SPLASH_MOE_EXPERT_SLOTS;
   constexpr uint Simdgroups = 8;
   threadgroup uint4 staged_storage[Rows * 64 * 2 / 16];
   // Scales/biases and row sums alternate buffers so the next group's stores
@@ -262,7 +264,7 @@ kernel void moe_route_scores_q8_m32(
   q4_visit(total, traversal, [&](ushort i) {
     auto index = total.get_multidimensional_index(i);
     if (uint(index[1]) < live_rows) {
-      scores[ulong(row_base + index[1]) * StorageN + expert_origin +
+      scores[ulong(row_base + index[1]) * Slots + expert_origin +
              index[0]] = total[i];
     }
   });

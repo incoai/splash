@@ -49,15 +49,16 @@ struct AffineWeights final {
   metal::MetalBuffer biases;
 };
 
-// A Q8 affine projection, quantized per 64 inputs in StorageN=256 order: the
-// MoE router and the shared expert's scalar gate.
+// A Q8 affine projection, quantized per 64 inputs in storage tiles of
+// SPLASH_AFFINE_TILE_ROWS rows (metal/abi/Linear.h): the MoE router and the
+// shared expert's scalar gate.
 struct Q8Projection final {
   AffineWeights planes;
   uint32_t outputSize = 0;
   uint32_t inputSize = 0;
 };
 
-// An expert-major Q4 slab holding one complete StorageN-packed projection per
+// An expert-major Q4 slab holding one complete storage-tiled projection per
 // expert, expertStrideBytes apart: the operator selects an expert by its
 // offset, so no per-expert buffer or copy exists at run time.
 struct ExpertProjection final {

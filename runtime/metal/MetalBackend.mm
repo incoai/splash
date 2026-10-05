@@ -925,20 +925,17 @@ MetalBackend::MetalBackend(std::string metallibPath, double residencyKeepAliveSe
         if (!(residencyKeepAliveSeconds > 0.0)) {
             throw MetalBackendError("residency keep-alive must be positive");
         }
-        // Check the OS floor before loading Metal resources so an unsupported
-        // system reports the version requirement first.
-        readMacosVersion(impl_->capabilities);
-        if (!impl_->capabilities.meetsMinimumMacos()) {
-            throw MetalBackendError(
-                "Splash requires macOS " +
-                std::to_string(DeviceCapabilities::kMinimumMacosMajor) + '.' +
-                std::to_string(DeviceCapabilities::kMinimumMacosMinor) +
-                " or newer; this Mac runs macOS " +
-                impl_->capabilities.macosVersion());
-        }
         impl_->device = MTLCreateSystemDefaultDevice();
         if (!impl_->device) {
             throw MetalBackendError("Metal device unavailable");
+        }
+        // Check the OS floor before loading Metal resources so an unsupported
+        // system reports the version requirement first, in a message that
+        // names the device as the device check does.
+        readMacosVersion(impl_->capabilities);
+        readDeviceCapabilities(impl_->device, impl_->capabilities);
+        if (!impl_->capabilities.meetsMinimumMacos()) {
+            throw MetalBackendError(*impl_->capabilities.validationMessage());
         }
         impl_->asyncState->device = impl_->device;
         impl_->queue = [impl_->device newCommandQueue];
@@ -973,8 +970,6 @@ MetalBackend::MetalBackend(std::string metallibPath, double residencyKeepAliveSe
         impl_->residency = std::make_shared<Residency>(
             impl_->device, impl_->queue,
             impl_->newPipeline(Residency::kKickPipeline), residencyKeepAliveSeconds);
-
-        readDeviceCapabilities(impl_->device, impl_->capabilities);
     }
     impl_->sampleDeviceMemory();
 }

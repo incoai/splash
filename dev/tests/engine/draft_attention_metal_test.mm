@@ -384,7 +384,7 @@ void surroundingPhases(MetalBackend &backend, DraftAttentionShape shape,
         double squares = 0;
         for (uint32_t d = 0; d < kHeadDim; ++d)
           squares += double(tuning::bf16ToFloat(source[d])) * tuning::bf16ToFloat(source[d]);
-        const double inverse = 1 / std::sqrt(squares / kHeadDim + 1e-6);
+        const double inverse = 1 / std::sqrt(squares / kHeadDim + SPLASH_RMS_EPSILON);
         for (uint32_t d = 0; d < kPairs; ++d) {
           const double first = tuning::bf16ToFloat(
               tuning::floatToBf16(float(tuning::bf16ToFloat(source[d]) * inverse)));
@@ -473,7 +473,8 @@ void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
         float square = 0.0F;
         for (uint32_t d = 0; d < kHeadDim; ++d)
           square += tuning::bf16ToFloat(key[d]) * tuning::bf16ToFloat(key[d]);
-        const float inverse = 1.0F / std::sqrt(square / kHeadDim + 1e-6F);
+        const float inverse =
+            1.0F / std::sqrt(square / kHeadDim + float(SPLASH_RMS_EPSILON));
         std::array<float, kHeadDim> normalized;
         for (uint32_t d = 0; d < kHeadDim; ++d)
           normalized[d] = tuning::bf16ToFloat(

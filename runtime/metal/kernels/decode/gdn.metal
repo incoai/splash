@@ -59,7 +59,7 @@ inline void gdn_decode_prologue(
   // The key head's q/k rows and conv carry are shared by HeadsPerKey value
   // heads; the first of them writes the shared copies.
   const bool shared_writer = value_head % HeadsPerKey == 0;
-  const bool carrier = simd_group < 3;
+  const bool carrier = simd_group < SPLASH_GDN_CONVOLUTION_TAPS - 1;
   const uint token = simd_group;
   const uint q_channel = key_head * HeadDim + lane;
   const uint k_channel = KeyWidth + q_channel;
@@ -267,7 +267,8 @@ gdn_commit_phase(device const bfloat *packed, device const bfloat *mixed_qkv,
   uint count = retained;
   if (count == SPLASH_TARGET_VERIFY_ROWS)
     return;
-  for (uint element = group * 256 + thread_index; element < 3 * ConvDim;
+  for (uint element = group * 256 + thread_index;
+       element < (SPLASH_GDN_CONVOLUTION_TAPS - 1) * ConvDim;
        element += ValueHeads * 256) {
     uint row = element / ConvDim;
     uint channel = element % ConvDim;

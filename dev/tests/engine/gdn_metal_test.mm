@@ -6,6 +6,8 @@
 #include "../../../runtime/metal/CommandGraph.hpp"
 #include "../../../runtime/metal/MetalBackend.hpp"
 #include "../../../runtime/ops/GDN.hpp"
+#include "metal/abi/ExecutionGeometry.h"
+#include "metal/abi/GDN.h"
 #include "tuning/LinearNumerics.hpp"
 
 #include "NormReference.hpp"
@@ -35,7 +37,9 @@ using splash::ops::GdnShape;
 using splash::ops::NormWeights;
 
 constexpr uint32_t kHeadDim = 128;
-constexpr double kEpsilon = 1e-6;
+// The convolution's taps; a state carries the inputs of all but the current
+// token's.
+constexpr uint32_t kTaps = SPLASH_GDN_CONVOLUTION_TAPS, kCarried = kTaps - 1;
 constexpr double kQueryScale = 0.0078125;
 constexpr double kKeyScale = 0.08838834765;
 
@@ -118,7 +122,7 @@ GdnPrefillBuffers prefillBuffers(MetalBackend &backend, const GdnShape &shape,
   return {std::move(packed),
           std::move(convolutionWeights),
           std::move(convolutionIn),
-          shared(backend, uint64_t{3} * convDim * 2, "conv out"),
+          shared(backend, uint64_t{kCarried} * convDim * 2, "conv out"),
           shared(backend, uint64_t{tokens} * keyWidth * 2, "queries"),
           shared(backend, uint64_t{tokens} * keyWidth * 2, "keys"),
           shared(backend, uint64_t{tokens} * valueWidth * 2, "values"),
@@ -143,9 +147,9 @@ GdnPrefillBuffers randomPrefill(MetalBackend &backend, const GdnShape &shape,
   GdnPrefillBuffers buffers = prefillBuffers(
       backend, shape, tokens,
       shared(backend, uint64_t{tokens} * packedWidth * 2, "packed"),
-      shared(backend, uint64_t{3} * convDim * 2, "conv in"),
+      shared(backend, uint64_t{kCarried} * convDim * 2, "conv in"),
       shared(backend, stateElements * 4, "state in"),
-      shared(backend, uint64_t{convDim} * 4 * 2, "conv weights"),
+      shared(backend, uint64_t{convDim} * kTaps * 2, "conv weights"),
       shared(backend, valueHeads * 4, "a scale"),
       shared(backend, valueHeads * 2, "dt bias"), {});
 
@@ -154,10 +158,10 @@ GdnPrefillBuffers randomPrefill(MetalBackend &backend, const GdnShape &shape,
   for (uint64_t i = 0; i < uint64_t{tokens} * packedWidth; ++i)
     packed[i] = toBf16(random.gauss());
   auto *convWeights = data<uint16_t>(buffers.convolutionWeights);
-  for (uint64_t i = 0; i < uint64_t{convDim} * 4; ++i)
+  for (uint64_t i = 0; i < uint64_t{convDim} * kTaps; ++i)
     convWeights[i] = toBf16(0.3 * random.gauss());
   auto *convIn = data<uint16_t>(buffers.convolutionIn);
-  for (uint64_t i = 0; i < uint64_t{3} * convDim; ++i)
+  for (uint64_t i = 0; i < uint64_t{kCarried} * convDim; ++i)
     convIn[i] = toBf16(random.gauss());
   auto *aScale = data<float>(buffers.decayWeights);
   auto *dtBias = data<uint16_t>(buffers.timeBias);
@@ -213,13 +217,14 @@ void runCase(MetalBackend &backend, const GdnShape &shape, uint32_t tokens,
   // Prepare pass: convolution + SiLU per channel, q/k RMS normalisation.
   auto convolved = [&](uint32_t token, uint32_t channel) {
     double value = 0.0;
-    for (uint32_t tap = 0; tap < 4; ++tap) {
+    for (uint32_t tap = 0; tap < kTaps; ++tap) {
       const uint32_t position = token + tap;
       const double input =
-          position < 3 ? fromBf16(convIn[position * convDim + channel])
-                       : fromBf16(packed[uint64_t{position - 3} * packedWidth +
-                                         channel]);
-      value += input * fromBf16(convWeights[channel * 4 + tap]);
+          position < kCarried
+              ? fromBf16(convIn[position * convDim + channel])
+              : fromBf16(packed[uint64_t{position - kCarried} * packedWidth +
+                                channel]);
+      value += input * fromBf16(convWeights[channel * kTaps + tap]);
     }
     return roundBf16(silu(roundBf16(value)));
   };
@@ -241,7 +246,8 @@ void runCase(MetalBackend &backend, const GdnShape &shape, uint32_t tokens,
           row[dim] = convolved(token, which * keyWidth + head * kHeadDim + dim);
           squares += row[dim] * row[dim];
         }
-        const double inverse = 1.0 / std::sqrt(squares / kHeadDim + kEpsilon);
+        const double inverse =
+            1.0 / std::sqrt(squares / kHeadDim + SPLASH_RMS_EPSILON);
         const double scale = which == 0 ? kQueryScale : kKeyScale;
         const uint16_t *out = (which == 0 ? queries : keys) +
                               uint64_t{token} * keyWidth + head * kHeadDim;
@@ -285,14 +291,15 @@ void runCase(MetalBackend &backend, const GdnShape &shape, uint32_t tokens,
     }
   }
 
-  // Carried convolution state: the last three inputs seen.
+  // Carried convolution state: the last inputs seen, one per carried row.
   const auto *convOut = data<uint16_t>(buffers.convolutionOut);
-  for (uint32_t carried = 0; carried < 3; ++carried) {
+  for (uint32_t carried = 0; carried < kCarried; ++carried) {
     for (uint32_t channel = 0; channel < convDim; ++channel) {
       const uint32_t source = tokens + carried;
       const uint16_t expected =
-          source < 3 ? convIn[source * convDim + channel]
-                     : packed[uint64_t{source - 3} * packedWidth + channel];
+          source < kCarried
+              ? convIn[source * convDim + channel]
+              : packed[uint64_t{source - kCarried} * packedWidth + channel];
       require(convOut[carried * convDim + channel] == expected,
               label + "carried convolution state is wrong");
     }
@@ -511,11 +518,11 @@ void bufferExtents(MetalBackend &backend, const GdnShape &shape, bool float32) {
             (uint64_t{tokens - 1} * shape.packedWidth + shape.convolutionDimension + valueWidth +
              2 * shape.valueHeads) * 2,
             2, "GDN packed"},
-           {&GdnPrefillBuffers::convolutionWeights, uint64_t{shape.convolutionDimension} * 4 * 2, 2,
+           {&GdnPrefillBuffers::convolutionWeights, uint64_t{shape.convolutionDimension} * kTaps * 2, 2,
             "GDN convolution weight"},
-           {&GdnPrefillBuffers::convolutionIn, uint64_t{3} * shape.convolutionDimension * 2, 2,
+           {&GdnPrefillBuffers::convolutionIn, uint64_t{kCarried} * shape.convolutionDimension * 2, 2,
             "GDN convolution state"},
-           {&GdnPrefillBuffers::convolutionOut, uint64_t{3} * shape.convolutionDimension * 2, 2,
+           {&GdnPrefillBuffers::convolutionOut, uint64_t{kCarried} * shape.convolutionDimension * 2, 2,
             "GDN next convolution state"},
            {&GdnPrefillBuffers::queries, keyRows, 2, "GDN query"},
            {&GdnPrefillBuffers::keys, keyRows, 2, "GDN key"},

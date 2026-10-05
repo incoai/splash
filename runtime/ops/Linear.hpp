@@ -6,6 +6,7 @@
 #include "ops/Weights.hpp"
 
 #include <algorithm>
+#include <array>
 #include <compare>
 #include <cstdint>
 #include <span>
@@ -39,26 +40,30 @@ struct LinearMatrix final {
 // Throws unless `projection` is an affine projection of `matrix` whose planes
 // hold all of its Q4 weights, scales and biases.
 void requireAffineProjection(const Projection &projection, LinearMatrix matrix);
+// Throws unless the planes of the quantized `segment` hold every tile of its
+// outputSize x inputSize weights (metal/abi/QuantFormat.h), naming them
+// "<what> plane0", "<what> plane1" and "<what> meta".
+void requireSegmentPlanes(const QuantizedSegment &segment, std::string_view what);
 
 enum class LinearPhase : uint8_t { Prefill, Decode };
 enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate };
-// Compute tiles over the StorageN=256 packing. Paired tiles pipeline two
+// Compute tiles over the affine storage tiles. Paired tiles pipeline two
 // quant groups of one lane. Split128 is the N128 tile with K split across
 // `splits` threadgroups, grid (column tiles, splits), every lane's rows in each
 // tile; the last threadgroup of a tile to finish reduces the fp32 partial sums
 // before the bf16 rounding. Paired256 is the four-simdgroup N256 paired tile.
-// Simdgroup uses bf16 8x8 matrix operations and an explicit activation/split
+// Q4Register is the register tile on bf16 8x8 matrix operations (Apple9),
+// over an activation table and with optional K splits in an explicit
 // workspace.
 // The GGUF tiles run 64 columns per threadgroup. The staged tiles, GgufStaged
 // and GgufPrefill, dequantize GGUF weights into threadgroup memory for
 // matmul2d. GgufStaged: the two-simdgroup staged tile of 8, 16 or 32 rows
 // (decode, and prefill chunks of up to 32 rows), each simdgroup staging its
 // own columns, with optional K splits. GgufPrefill: the 128-row shared-stage
-// prefill tile. GgufRegister is the exact register tile on bf16 8x8 matrix
-// operations (Apple9): every request lane in one threadgroup, optional K
-// splits.
+// prefill tile. GgufRegister is Q4Register's twin over GGUF weights, exact:
+// every request lane in one threadgroup, optional K splits.
 enum class LinearTile : uint8_t {
-  N128, N256, Paired128, Split128, Paired256, Simdgroup, GgufStaged, GgufPrefill, GgufRegister
+  N128, N256, Paired128, Split128, Paired256, Q4Register, GgufStaged, GgufPrefill, GgufRegister
 };
 // The decode tiles hold at most a full decode batch; GGUF prefill chunks of up
 // to this many rows run the staged tile (Linear::ggufBaseline).
@@ -90,7 +95,7 @@ struct LinearConfig final {
   // four). The GGUF tiles fix their threadgroups in their kernels
   // (GGUF_*_THREADS) and leave this at its default.
   LinearSimdgroups simdgroups = LinearSimdgroups::Eight;
-  // Cross-threadgroup K partitions for Split128, Simdgroup, GgufStaged and
+  // Cross-threadgroup K partitions for Split128, Q4Register, GgufStaged and
   // GgufRegister, a power of two up to kMaximumSplits (Split128 takes at
   // least two); all other tiles use one.
   uint32_t splits = 1;
@@ -104,7 +109,7 @@ struct LinearConfig final {
 // Reused serially within one decode command stream. Counters are zeroed at
 // allocation and restored by each completed split dispatch. Never share this
 // workspace between concurrent command streams. Within a batched dispatch of
-// the Simdgroup tile, each eight-row tile owns disjoint input, sums, partials
+// the Q4Register tile, each eight-row tile owns disjoint input, sums, partials
 // and counters; Split128 holds every row of the step in each tile.
 struct LinearScratch final {
   metal::MetalBuffer input;
@@ -134,8 +139,8 @@ struct LinearScratchSize final {
 // alongside its ordinary output.
 enum class LinearInput : uint8_t {
   Plain,    // bf16 [rows][K]
-  Table64,  // affine simdgroup table, one sum per 64 inputs (kernels/common/q4_sgmatrix.h)
-  Table16,  // GGUF simdgroup table, sums per 16 and 32 inputs (kernels/common/gguf_sgmatrix.h)
+  Table64,  // Q4Register's table, one sum per 64 inputs (kernels/common/q4_sgmatrix.h)
+  Table16,  // GgufRegister's table, sums per 16 and 32 inputs (kernels/common/gguf_sgmatrix.h)
 };
 // Scratch bytes a producer writes for `rows` rows of `width` inputs.
 [[nodiscard]] constexpr uint64_t tableBytes(uint32_t width, uint64_t rows) noexcept {
@@ -168,7 +173,7 @@ public:
   // persistent decode tile, every column tile otherwise.
   [[nodiscard]] uint32_t groups() const noexcept;
   [[nodiscard]] uint32_t threadsPerThreadgroup() const noexcept;
-  [[nodiscard]] bool usesSimdgroup() const noexcept;
+  [[nodiscard]] bool usesQ4Register() const noexcept;
   // The layout the producer of this plan's input writes. A rotated
   // projection prepares its table from the rotated rows itself
   // (LinearGguf.cpp), so its producer writes plain rows.
@@ -293,6 +298,10 @@ private:
   // runs.
   [[nodiscard]] LinearConfig baseline(LinearWorkload workload,
                                       std::span<const Projection *const> projections = {}) const;
+  // The partials and counters a dispatch of `splits` K partitions binds: the
+  // scratch's, or for one partition, which reads neither, the output.
+  [[nodiscard]] static std::array<metal::MetalBuffer, 2> splitScratch(const LinearBuffers &buffers,
+                                                                      uint32_t splits);
   // GGUF policy and dispatch (LinearGguf.cpp). Block plans are not tuned.
   [[nodiscard]] LinearConfig ggufBaseline(LinearWorkload workload,
                                           std::span<const Projection *const> projections) const;

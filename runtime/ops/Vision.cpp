@@ -9,6 +9,7 @@
 #include <cmath>
 #include <limits>
 #include <stdexcept>
+#include <string>
 
 namespace splash::ops {
 namespace {
@@ -77,6 +78,43 @@ void requireLayout(const VisionLayout &layout) {
   }
 }
 
+// Every weight of the tower the kernels read, in each of its layout's blocks:
+// bf16 [output][input] matrices with a bias per output, a LayerNorm's weight
+// and bias per hidden value, and the learned position of every cell of the
+// grid.
+void requireWeights(const VisionWeights &model) {
+  const VisionLayout &layout = model.layout;
+  if (model.blocks.size() != layout.depth) {
+    throw std::invalid_argument("vision tower holds " + std::to_string(model.blocks.size()) + " blocks, needs " +
+                                std::to_string(layout.depth));
+  }
+  const uint64_t hidden = layout.hiddenSize, merged = layout.mergedHiddenSize;
+  const auto requireAffine = [](const VisionAffine &affine, uint64_t output, uint64_t input,
+                                const std::string &name) {
+    requireBytes(affine.weight, output * input * kBf16Bytes, name + " weight");
+    requireBytes(affine.bias, output * kBf16Bytes, name + " bias");
+  };
+  const auto requireNorm = [&](const VisionNorm &norm, const std::string &name) {
+    requireBytes(norm.weight, hidden * kBf16Bytes, name + " weight");
+    requireBytes(norm.bias, hidden * kBf16Bytes, name + " bias");
+  };
+  requireAffine(model.patchEmbedding, hidden, layout.patchDimension, "vision patch embedding");
+  requireBytes(model.positionTable,
+               uint64_t{layout.positionGridSide} * layout.positionGridSide * hidden * kBf16Bytes,
+               "vision position table");
+  for (const VisionBlock &block : model.blocks) {
+    requireNorm(block.norm1, "vision attention norm");
+    requireAffine(block.qkv, 3 * hidden, hidden, "vision q/k/v");
+    requireAffine(block.projection, hidden, hidden, "vision attention projection");
+    requireNorm(block.norm2, "vision MLP norm");
+    requireAffine(block.upProjection, layout.paddedIntermediateSize, hidden, "vision up projection");
+    requireAffine(block.downProjection, hidden, layout.paddedIntermediateSize, "vision down projection");
+  }
+  requireNorm(model.mergerNorm, "vision merger norm");
+  requireAffine(model.mergerUpProjection, merged, merged, "vision merger up projection");
+  requireAffine(model.mergerDownProjection, layout.outputHiddenSize, merged, "vision merger down projection");
+}
+
 } // namespace
 
 uint64_t Vision::scratchBytes(const VisionLayout &layout,
@@ -105,6 +143,7 @@ Vision::Vision(metal::MetalBackend &backend, const VisionWeights &model,
                uint32_t maximumPatches)
     : model_(model), maximumPatches_(maximumPatches) {
   const uint64_t total = scratchBytes(model.layout, maximumPatches);
+  requireWeights(model);
   // New backend buffers are zero-filled, so padding rows read by whole tiles
   // start finite.
   arena_ = backend.allocateBuffer(total, metal::BufferStorage::Shared,

@@ -174,7 +174,8 @@ private:
   // Penalizes the row at rowOffset of each penalized lane or, for verify,
   // all its rows, each also counting the draft tokens its context adds.
   // Policies come from validated requests (Model.hpp
-  // SamplingParameters::validationError).
+  // SamplingParameters::validationError). It follows selection(), whose
+  // check of every lane's logits covers those it rewrites.
   void addPenalties(metal::CommandGraph &graph,
                     std::span<const SamplingPolicy> policies,
                     const SamplingBuffers &buffers, const PenaltyTable &table,

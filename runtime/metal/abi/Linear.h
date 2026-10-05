@@ -7,6 +7,12 @@
 #include <stdint.h>
 #endif
 
+// Affine (MLX) Q4 and Q8 projections store each of their weight, scale and
+// bias planes in tiles of this many output rows, [N / T][K / 64][T], every
+// row of a tile holding its quant group's values. The routing kernels read an
+// affine router as one tile of expert slots (SPLASH_MOE_EXPERT_SLOTS).
+#define SPLASH_AFFINE_TILE_ROWS 256u
+
 // A Q4 projection's matrix, for prefill and the decode tiles whose grid
 // covers it (a K-split tile reads its split count from the grid). Separate
 // from ops::LinearMatrix so host-only fields cannot change the ABI.

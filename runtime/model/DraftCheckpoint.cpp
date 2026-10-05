@@ -1,4 +1,5 @@
 #include "model/DraftCheckpoint.hpp"
+#include "metal/abi/DraftAttention.h"
 #include "model/AffinePlan.hpp"
 #include "model/DFlashDraft.hpp"
 
@@ -41,7 +42,7 @@ Image layerImage(const DFlashDraftLayout &layout, uint32_t layer) {
   const uint32_t hidden = layout.hiddenSize;
   const uint32_t kv = layout.kvHeads * layout.attentionHeadDimension;
   const auto convolution = [&](const std::string &name) {
-    copy(result, name + ".base_kernel", {2, 2, hidden});
+    copy(result, name + ".base_kernel", {SPLASH_DRAFT_CONVOLUTION_STAGES, SPLASH_DRAFT_CONVOLUTION_TAPS, hidden});
     quantized(result, {{name + ".kernel_projection", layout.dynamicSize}}, layout.dynamicSize, hidden);
   };
   copy(result, prefix + "input_layernorm.weight", {hidden});

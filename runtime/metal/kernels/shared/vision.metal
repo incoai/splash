@@ -295,7 +295,7 @@ kernel void vision_layer_norm(
     #pragma unroll
     for (ushort i = 0; i < 8; ++i) variance += reductions[i];
     variance /= float(params.width);
-    float inverse = rsqrt(variance + 1e-6f);
+    float inverse = rsqrt(variance + SPLASH_VISION_NORM_EPSILON);
 
     for (uint column = thread_index; column < params.width; column += 256) {
         float normalized = (row[column] - mean) * inverse;

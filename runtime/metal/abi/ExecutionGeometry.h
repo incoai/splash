@@ -50,6 +50,10 @@
 // prefill/gdn.metal ties the two literals together.
 #define SPLASH_GDN_SCAN_STATE_ROWS 16u
 #define SPLASH_GDN_SCAN_THREADS 128u
+// The epsilon of every RMS norm the kernels compute, which a target's and a
+// draft's configurations must state. Unsuffixed, so the host compares a
+// configuration's double with it exactly and the kernels take it as a float.
+#define SPLASH_RMS_EPSILON 1e-6
 // Plain norms of at most SPLASH_STAGED_NORM_ROWS rows of at most
 // SPLASH_STAGED_NORM_WIDTH columns run norm_rms_staged, whose 1024-thread
 // groups hold a row in threadgroup memory: the region where it measured

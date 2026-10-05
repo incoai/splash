@@ -99,6 +99,7 @@ public:
   // this many rows of layout.outputHiddenSize bf16 values per image.
   [[nodiscard]] static uint32_t embeddingRows(ImageGrid grid) noexcept;
 
+  // Throws unless `model` holds every weight of the tower its layout names.
   Vision(metal::MetalBackend &backend, const VisionWeights &model,
          uint32_t maximumPatches);
   Vision(const Vision &) = delete;

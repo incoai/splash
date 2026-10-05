@@ -2,6 +2,7 @@
 #include "TestChecks.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/Gguf.h"
+#include "metal/abi/Linear.h"
 #include "ops/Linear.hpp"
 #include "ops/Normalization.hpp"
 #include "ops/PagedAttention.hpp"
@@ -33,7 +34,7 @@ struct Guarded {
   Guarded(metal::MetalBackend &backend, uint64_t bytes) : size(bytes) {
     backing = test::sharedBuffer(backend, bytes + 256);
     std::memset(backing.contents(), 0xa5, bytes + 256);
-    view = backend.view(backing, 0, bytes);
+    if (bytes) view = backend.view(backing, 0, bytes);
   }
   void check() const {
     const auto *p = static_cast<const uint8_t *>(backing.contents());
@@ -65,8 +66,9 @@ Exact exact(const Projection &p, const uint16_t *input, uint32_t row, uint32_t c
   const auto *bi = static_cast<const uint16_t *>(p.affine().biases.contents());
   double value = 0, magnitude = 0, quantMagnitude = 0;
   const uint32_t groups = p.inputSize / 64;
+  constexpr uint32_t tile = SPLASH_AFFINE_TILE_ROWS;
   for (uint32_t g = 0; g < groups; ++g) {
-    const uint64_t at = (uint64_t(col / 256) * groups + g) * 256 + col % 256;
+    const uint64_t at = (uint64_t(col / tile) * groups + g) * tile + col % tile;
     double dot = 0, sum = 0, absolute = 0;
     for (uint32_t k = 0; k < 64; ++k) {
       const double x = bf16ToFloat(input[uint64_t(row) * p.inputSize + g * 64 + k]);
@@ -115,12 +117,12 @@ void runCase(metal::MetalBackend &backend, uint32_t n, uint32_t k, uint32_t spli
              LinearEpilogue epilogue, uint32_t fixture, uint32_t rows) {
   const LinearWorkload workload{{n, k}, rows, LinearPhase::Decode, epilogue};
   const auto plan =
-      Linear::plan(workload, {LinearTile::Simdgroup, 0, LinearSimdgroups::Four, splits}, FloatOutput::BFloat16);
+      Linear::plan(workload, {LinearTile::Q4Register, 0, LinearSimdgroups::Four, splits}, FloatOutput::BFloat16);
   const auto size = plan.scratchSize();
   Guarded input(backend, 2ULL * rows * k), output(backend, 2ULL * rows * n), residual(backend, 2ULL * rows * n);
   Guarded table(backend, size.input), sums(backend, size.sums), partials(backend, size.partials), counters(backend, size.counters);
   LinearScratch scratch{table.view, sums.view, partials.view, counters.view};
-  std::memset(counters.view.contents(), 0, size.counters);
+  if (size.counters) std::memset(counters.view.contents(), 0, size.counters);
   auto *x = static_cast<uint16_t *>(input.view.contents());
   auto *r = static_cast<uint16_t *>(residual.view.contents());
   for (uint32_t i = 0; i < rows * k; ++i) {
@@ -170,7 +172,7 @@ void runCase(metal::MetalBackend &backend, uint32_t n, uint32_t k, uint32_t spli
         std::cerr << "M=" << rows << " N=" << n << " K=" << k << " S=" << splits << " epilogue=" << int(epilogue)
                   << " fixture=" << fixture << " row=" << row << " col=" << col
                   << " actual=" << bf16ToFloat(value) << " reference=" << ref.value << " error=" << ref.error << '\n';
-        throw std::runtime_error("simdgroup result exceeds independent fp64 error bound");
+        throw std::runtime_error("Q4 register tile result exceeds independent fp64 error bound");
       }
       if (fixture == 3)
         require(bf16ToFloat(value) == bf16ToFloat(floatToBf16(float(ref.value))),
@@ -235,13 +237,13 @@ void splitVisibility(metal::MetalBackend &backend,
     const Linear policy(device);
     const auto a = policy.plan(operands[0].workload).configuration();
     const auto b = policy.plan(operands[1].workload).configuration();
-    if (a.tile == LinearTile::Simdgroup && b.tile == LinearTile::Simdgroup && std::max(a.splits, b.splits) > 1)
+    if (a.tile == LinearTile::Q4Register && b.tile == LinearTile::Q4Register && std::max(a.splits, b.splits) > 1)
       splitPairs.insert({a.splits, b.splits});
   }
   require(!splitPairs.empty(), "the policy splits neither projection");
   const auto plan = [&](uint32_t i, uint32_t splits) {
     const LinearWorkload &w = operands[i].workload;
-    return Linear::plan(w, {LinearTile::Simdgroup, 0, LinearSimdgroups::Four, splits}, FloatOutput::BFloat16);
+    return Linear::plan(w, {LinearTile::Q4Register, 0, LinearSimdgroups::Four, splits}, FloatOutput::BFloat16);
   };
   LinearScratchSize size;
   const auto grow = [&](const LinearPlan &p) {
@@ -505,8 +507,8 @@ int main(int argc,char **argv) {
       splitVisibility(backend, {{{{5120, 6144}, LinearEpilogue::Residual}, {{5120, 17408}, LinearEpilogue::Residual}}}, lanes);
       splitVisibility(backend, {{{{16640, 5120}, LinearEpilogue::None}, {{17408, 5120}, LinearEpilogue::GateUp}}}, lanes);
     }
-    std::cout << "Q4 simdgroup: PASS cases=" << cases
+    std::cout << "Q4 register tile: PASS cases=" << cases
               << " (fp64, range, cancellation, guards, repeated dispatch, fused norm and attention gate in both"
                  " table layouts, norms with bf16 and F32 weights, shared split scratch)\n";
-  } catch (const std::exception &e) { std::cerr << "Q4 simdgroup: FAIL: " << e.what() << '\n'; return 1; }
+  } catch (const std::exception &e) { std::cerr << "Q4 register tile: FAIL: " << e.what() << '\n'; return 1; }
 }

@@ -233,9 +233,11 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/MoE.cpp \
 	runtime/ops/Normalization.cpp \
 	runtime/ops/PagedAttention.cpp \
+	runtime/ops/PageStorage.cpp \
 	runtime/ops/RoPE.cpp \
 	runtime/ops/RowCopy.cpp \
 	runtime/ops/Sampling.cpp \
+	runtime/ops/Vision.cpp \
 	runtime/metal/DeviceCapabilities.cpp \
 	runtime/engine/MemoryPlan.cpp \
 	runtime/engine/Scheduler.cpp \
@@ -276,14 +278,12 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/DFlashDraft.cpp \
 	runtime/model/ModelFactory.cpp \
 	runtime/model/SlotFile.cpp \
-	runtime/model/QwenState.cpp
+	runtime/model/QwenState.cpp \
+	runtime/model/Runtime.cpp \
+	runtime/model/RuntimeArenas.cpp
 ENGINE_MM_SOURCES := \
 	runtime/model/SafetensorsCheckpoint.mm \
 	runtime/model/ModelDescriptor.mm \
-	runtime/model/Runtime.mm \
-	runtime/model/RuntimeArenas.mm \
-	runtime/ops/Vision.mm \
-	runtime/ops/PageStorage.mm \
 	runtime/engine/RuntimeResources.mm \
 	runtime/engine/Bootstrap.mm
 ENGINE_OBJECTS := \

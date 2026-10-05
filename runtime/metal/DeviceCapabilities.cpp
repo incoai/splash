@@ -1,8 +1,19 @@
 #include "metal/DeviceCapabilities.hpp"
 
+#include "metal/abi/ExecutionGeometry.h"
+
+#include <algorithm>
 #include <string>
 
 namespace splash {
+namespace {
+
+// The widest threadgroups the kernels dispatch: the vocabulary groups of a
+// sampled row and the staged norm.
+constexpr uint64_t kWidestThreadgroup = std::max(SPLASH_TARGET_VOCABULARY_THREADS, SPLASH_STAGED_NORM_THREADS);
+static_assert(kWidestThreadgroup == 1024, "name the width in the reason");
+
+} // namespace
 
 std::string DeviceCapabilities::macosVersion() const {
     return std::to_string(macosMajor) + '.' + std::to_string(macosMinor) + '.' +
@@ -24,8 +35,8 @@ std::optional<std::string> DeviceCapabilities::validationError() const {
     if (maxThreadgroupMemoryBytes < 32 * 1024) {
         return "threadgroup_memory_below_32_kib";
     }
-    if (maxThreadgroupWidth < 256) {
-        return "threadgroup_width_below_256";
+    if (maxThreadgroupWidth < kWidestThreadgroup) {
+        return "threadgroup_width_below_1024";
     }
     if (!hasUnifiedMemory) return "unified_memory_required";
     return std::nullopt;

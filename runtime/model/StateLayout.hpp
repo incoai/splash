@@ -2,14 +2,15 @@
 
 #include "Checked.hpp"
 #include "metal/abi/ExecutionGeometry.h"
+#include "metal/abi/GDN.h"
 
 #include <cstdint>
 
 namespace splash::model {
 
-// The GDN short convolution has four taps; the recurrent state keeps the
-// three previous inputs.
-inline constexpr uint32_t kGdnConvolutionTaps = 4;
+// The taps of the GDN short convolution the kernels compute; a state cell
+// keeps the inputs of all taps but the current token's.
+inline constexpr uint32_t kGdnConvolutionTaps = SPLASH_GDN_CONVOLUTION_TAPS;
 
 // Physical state geometry is supplied by the paired target and draft models.
 // The engine sees only opaque CompositeState handles and byte accounting.

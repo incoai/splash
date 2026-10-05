@@ -13,6 +13,7 @@
 #include "TestChecks.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/ExecutionGeometry.h"
+#include "metal/abi/GDN.h"
 #include "model/StateLayout.hpp"
 #include "ops/GDN.hpp"
 #include "tuning/LinearNumerics.hpp"
@@ -47,6 +48,9 @@ using splash::ops::tuning::floatToBf16;
 constexpr uint32_t kRows = SPLASH_TARGET_VERIFY_ROWS;
 constexpr uint32_t kMaxLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
 constexpr uint32_t kHeadDim = 128;
+// The convolution's taps; a state carries the inputs of all but the current
+// token's.
+constexpr uint32_t kTaps = SPLASH_GDN_CONVOLUTION_TAPS, kCarried = kTaps - 1;
 constexpr uint32_t kLayers = 2;
 // The scales of the normalized q and k rows.
 constexpr double kQueryScale = 0.0078125, kKeyScale = 0.08838834765;
@@ -145,7 +149,7 @@ struct Fixture final {
     };
     packed = alloc(kLayers * kMaxLanes * packedStride * 2, "gdn packed");
     fill(packed, 1.0F);
-    convWeights = alloc(uint64_t{shape.convolutionDimension} * 4 * 2,
+    convWeights = alloc(uint64_t{shape.convolutionDimension} * kTaps * 2,
                         "gdn conv weights");
     fill(convWeights, 0.5F);
     mixed = alloc(kLayers * kMaxLanes * mixedStride * 2, "gdn mixed");
@@ -243,22 +247,22 @@ struct Fixture final {
   }
 };
 
-// Four-tap causal convolution of one channel at one token, three carried
-// rows then the command's rows, rounded to bf16 and gated by SiLU.
+// The causal convolution of one channel at one token over its taps, the
+// carried rows then the command's rows, rounded to bf16 and gated by SiLU.
 double convolutionSilu(const Fixture &fixture, uint32_t layer, uint32_t lane,
                        uint32_t token, uint32_t channel) {
   const uint16_t *weights =
       static_cast<const uint16_t *>(fixture.convWeights.contents()) +
-      uint64_t{channel} * 4;
+      uint64_t{channel} * kTaps;
   const uint16_t *carried =
       fixture.cell.conv(fixture.cellBytes(fixture.current[lane]), layer);
   double value = 0.0;
-  for (uint32_t tap = 0; tap < 4; ++tap) {
+  for (uint32_t tap = 0; tap < kTaps; ++tap) {
     const uint32_t position = token + tap;
     const uint16_t input =
-        position < 3
+        position < kCarried
             ? carried[position * fixture.shape.convolutionDimension + channel]
-            : fixture.packedRow(layer, lane, position - 3)[channel];
+            : fixture.packedRow(layer, lane, position - kCarried)[channel];
     value += double(bf16ToFloat(input)) * bf16ToFloat(weights[tap]);
   }
   value = roundBfloat(value);
@@ -271,9 +275,9 @@ uint16_t convolutionCarry(const Fixture &fixture, uint32_t layer,
   const uint32_t source = consumed + row;
   const uint16_t *carried =
       fixture.cell.conv(fixture.cellBytes(fixture.current[lane]), layer);
-  return source < 3
+  return source < kCarried
              ? carried[source * fixture.shape.convolutionDimension + channel]
-             : fixture.packedRow(layer, lane, source - 3)[channel];
+             : fixture.packedRow(layer, lane, source - kCarried)[channel];
 }
 
 // The q or k row of one key head at one token, from the head's first
@@ -288,7 +292,8 @@ std::vector<double> normalizedHead(const Fixture &fixture, uint32_t layer,
     conv[dim] = convolutionSilu(fixture, layer, lane, token, first + dim);
     squares += conv[dim] * conv[dim];
   }
-  const double inverse = 1.0 / std::sqrt(squares / kHeadDim + 1e-6);
+  const double inverse =
+      1.0 / std::sqrt(squares / kHeadDim + SPLASH_RMS_EPSILON);
   for (double &value : conv)
     value = roundBfloat(value * inverse) * scale;
   return conv;
@@ -418,7 +423,7 @@ void checkCarry(const Fixture &fixture, uint32_t layer, uint32_t lane,
                 uint32_t consumed, const std::string &where) {
   const uint16_t *carry =
       fixture.cell.conv(fixture.cellBytes(fixture.next[lane]), layer);
-  for (uint32_t row = 0; row < 3; ++row)
+  for (uint32_t row = 0; row < kCarried; ++row)
     for (uint32_t channel = 0; channel < fixture.shape.convolutionDimension;
          ++channel)
       require(carry[row * fixture.shape.convolutionDimension + channel] ==
@@ -713,7 +718,7 @@ void bufferExtents(MetalBackend &backend, const GdnShape &shape, LinearInput lay
            {&GdnDecodeBuffers::packed,
             ((rows - 1) * shape.packedWidth + shape.convolutionDimension + width + 2 * shape.valueHeads) * 2, 2,
             "GDN packed"},
-           {&GdnDecodeBuffers::convolutionWeights, uint64_t{shape.convolutionDimension} * 4 * 2, 2,
+           {&GdnDecodeBuffers::convolutionWeights, uint64_t{shape.convolutionDimension} * kTaps * 2, 2,
             "GDN convolution weight"},
            {&GdnDecodeBuffers::mixed, rows * shape.convolutionDimension * 2, 2, "GDN mixed"},
            {&GdnDecodeBuffers::decayWeights, uint64_t{shape.valueHeads} * 4, 4, "GDN decay weight"},
@@ -825,9 +830,9 @@ void gateMatchesPrefill(MetalBackend &backend, const GdnShape &shape, bool float
   Random random(0x6a7e + shape.valueHeads + float32);
 
   auto *convWeights = static_cast<uint16_t *>(fixture.convWeights.contents());
-  std::fill_n(convWeights, uint64_t{shape.convolutionDimension} * 4, uint16_t{0});
+  std::fill_n(convWeights, uint64_t{shape.convolutionDimension} * kTaps, uint16_t{0});
   for (uint32_t channel = 0; channel < keyWidth; ++channel)
-    convWeights[channel * 4 + 3] = kOne;
+    convWeights[channel * kTaps + kCarried] = kOne;
   std::fill_n(static_cast<float *>(fixture.decayWeights.contents()), shape.valueHeads, 0.0F);
   for (uint32_t lane = 0; lane < kMaxLanes; ++lane) {
     for (uint32_t token = 0; token < kRows; ++token) {
@@ -855,7 +860,7 @@ void gateMatchesPrefill(MetalBackend &backend, const GdnShape &shape, bool float
   GdnPrefillBuffers prefill{{},
                             fixture.convWeights,
                             {},
-                            buffer(uint64_t{3} * shape.convolutionDimension * 2),
+                            buffer(uint64_t{kCarried} * shape.convolutionDimension * 2),
                             buffer(uint64_t{kRows} * keyWidth * 2),
                             buffer(uint64_t{kRows} * keyWidth * 2),
                             buffer(valueRows),
@@ -872,7 +877,8 @@ void gateMatchesPrefill(MetalBackend &backend, const GdnShape &shape, bool float
     const std::string where = what + " lane " + std::to_string(lane);
     prefill.packed = backend.view(fixture.packed, uint64_t{lane} * fixture.packedStride * 2,
                                   fixture.packedStride * 2);
-    prefill.convolutionIn = backend.view(fixture.current[lane], 0, uint64_t{3} * shape.convolutionDimension * 2);
+    prefill.convolutionIn =
+        backend.view(fixture.current[lane], 0, uint64_t{kCarried} * shape.convolutionDimension * 2);
     prefill.recurrentIn = backend.view(fixture.current[lane], fixture.cell.convBytes, stateBytes);
     CommandGraph graph;
     GDN::addPrefill(graph, prefill, shape, kRows, order);

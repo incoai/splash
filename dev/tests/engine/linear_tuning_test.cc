@@ -207,7 +207,7 @@ void gpuSweep(metal::MetalBackend &backend, std::span<const Projection> projecti
   bool mixed = false;
   for (const auto &plan : plans)
     mixed |= plan.configuration().splits != plans.front().configuration().splits ||
-        plan.usesSimdgroup() || plans.front().usesSimdgroup();
+        plan.usesQ4Register() || plans.front().usesQ4Register();
   const uint64_t referenceSubmissions =
       mixed && epilogue == LinearEpilogue::GateUp ? projections.size() : 0;
   const uint64_t before = BackendInstrumentation::submittedCommands(backend);
@@ -477,13 +477,13 @@ int main(int argc, char **argv) {
     for (uint32_t rows : {8U, 16U, 24U, 32U})
       gpuSweep(backend, gate, rows, LinearPhase::Decode, LinearEpilogue::GateUp);
     // Four 256-input blocks of K list Split128 at two and four K splits on
-    // Apple10 and later, and Apple9's baseline is its simdgroup tile, so
+    // Apple10 and later, and Apple9's baseline is its Q4 register tile, so
     // these sweeps hold outputs to the derived bound as well as bitwise.
     std::array split{deterministicQ4Projection(backend, {512, 1024}, 29),
                      deterministicQ4Projection(backend, {512, 1024}, 131)};
     bool mixedClasses = false;
     for (const auto &plan : linearCandidates(backend.capabilities(), {{512, 1024}, 8}))
-      mixedClasses |= plan.configuration().splits > 1 || plan.usesSimdgroup();
+      mixedClasses |= plan.configuration().splits > 1 || plan.usesQ4Register();
     require(mixedClasses, "no candidate of a four-block K workload splits K");
     for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
                                LinearEpilogue::GateUp})

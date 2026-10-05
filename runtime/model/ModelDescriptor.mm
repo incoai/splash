@@ -1,5 +1,6 @@
 #include "ModelDescriptor.hpp"
 #include "WeightStore.hpp"
+#include "metal/abi/DraftAttention.h"
 #include "metal/abi/ExecutionGeometry.h"
 
 #import <Foundation/Foundation.h>
@@ -290,8 +291,8 @@ void validateQwen36(NSDictionary *manifest,
                   {"intermediate_size", draftLayout.intermediateSize},
                   {"sliding_window", ExecutionLimits::draftContextTokens},
                   {"block_size", ExecutionLimits::draftQueryRows},
-                  {"dynamic_conv_group_size", kDraftConvolutionGroup},
-                  {"dynamic_conv_kernel_size", kDraftConvolutionTaps},
+                  {"dynamic_conv_group_size", SPLASH_DRAFT_CONVOLUTION_GROUP},
+                  {"dynamic_conv_kernel_size", SPLASH_DRAFT_CONVOLUTION_TAPS},
                   {"selector_rank", draftLayout.selectorRank},
                   {"selector_top_k", SPLASH_DRAFT_CANDIDATES}});
   requireNumbers(requireArray(draft, @"target_capture_layers",
@@ -323,7 +324,7 @@ void validateTextConfig(NSDictionary *text, const QwenTargetDimensions &target,
                   {"linear_value_head_dim", target.gdnHeadDimension},
                   {"linear_conv_kernel_dim", kGdnConvolutionTaps},
                   {"full_attention_interval", target.fullAttentionPeriod},
-                  {"rms_norm_eps", 1e-6}});
+                  {"rms_norm_eps", SPLASH_RMS_EPSILON}});
   if (target.ffnKind == QwenFfnKind::SparseMoe)
     requireNumbers(text, "text config",
                    {{"num_experts", target.experts},
@@ -378,7 +379,7 @@ void validateDraftConfig(NSDictionary *draft, const DFlashDraftLayout &layout,
                   {"num_key_value_heads", layout.kvHeads},
                   {"head_dim", layout.attentionHeadDimension},
                   {"sliding_window", ExecutionLimits::draftContextTokens},
-                  {"rms_norm_eps", 1e-6}});
+                  {"rms_norm_eps", SPLASH_RMS_EPSILON}});
   requireBooleans(draft, "draft config",
                   {{"is_causal", false},
                    {"attention_bias", false},
@@ -396,8 +397,8 @@ void validateDraftConfig(NSDictionary *draft, const DFlashDraftLayout &layout,
       requireObject(draft, @"dflash_config", "draft config dflash_config");
   requireNumbers(flash, "draft config dflash_config",
                  {{"block_size", ExecutionLimits::draftQueryRows},
-                  {"conv_group_size", kDraftConvolutionGroup},
-                  {"conv_kernel_size", kDraftConvolutionTaps},
+                  {"conv_group_size", SPLASH_DRAFT_CONVOLUTION_GROUP},
+                  {"conv_kernel_size", SPLASH_DRAFT_CONVOLUTION_TAPS},
                   {"selector_rank", layout.selectorRank},
                   {"selector_top_k", SPLASH_DRAFT_CANDIDATES},
                   {"mask_token_id", maskToken}});

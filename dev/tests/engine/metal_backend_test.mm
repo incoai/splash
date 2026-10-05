@@ -1171,7 +1171,7 @@ void run(const std::string &metallibPath) {
             "Apple GPU family capability is missing");
     require(capabilities.maxThreadgroupMemoryBytes >= 32 * 1024,
             "threadgroup memory capability is insufficient");
-    require(capabilities.maxThreadgroupWidth >= 256,
+    require(capabilities.maxThreadgroupWidth >= 1024,
             "threadgroup thread capability is insufficient");
     const auto probed = splash::metal::probeDeviceCapabilities();
     require(probed.deviceName == capabilities.deviceName &&

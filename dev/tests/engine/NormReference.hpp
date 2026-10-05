@@ -6,6 +6,7 @@
 
 #include "TestBuffers.hpp"
 #include "metal/MetalBackend.hpp"
+#include "metal/abi/ExecutionGeometry.h"
 #include "ops/Normalization.hpp"
 #include "tuning/LinearNumerics.hpp"
 
@@ -39,7 +40,8 @@ inline double normWeight(const ops::NormWeights &norm, uint32_t index) {
       : ops::tuning::bf16ToFloat(static_cast<const uint16_t *>(norm.buffer.contents())[index]);
 }
 
-// The fp64 RMS norm (epsilon 1e-6) of a bf16 row, scaled by the weights.
+// The fp64 RMS norm of a bf16 row with the kernels' epsilon, scaled by the
+// weights.
 inline std::vector<double> rmsNorm(const uint16_t *row, const ops::NormWeights &norm,
                                    uint32_t size) {
   double squares = 0;
@@ -47,7 +49,7 @@ inline std::vector<double> rmsNorm(const uint16_t *row, const ops::NormWeights &
     const double value = ops::tuning::bf16ToFloat(row[index]);
     squares += value * value;
   }
-  const double inverse = 1 / std::sqrt(squares / size + 1e-6);
+  const double inverse = 1 / std::sqrt(squares / size + SPLASH_RMS_EPSILON);
   std::vector<double> normalized(size);
   for (uint32_t index = 0; index < size; ++index)
     normalized[index] = ops::tuning::bf16ToFloat(row[index]) * inverse * normWeight(norm, index);

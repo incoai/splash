@@ -10,26 +10,31 @@ inline void draft_conv_phase(device const bfloat *input,
                              device const bfloat *residual,
                              device bfloat *output, bool finish, uint group,
                              uint thread_index) {
-  constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS;
-  constexpr uint ConvGroups = Hidden / 16;
-  constexpr uint Dynamic = 4 * ConvGroups;
+  constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS,
+                 Taps = SPLASH_DRAFT_CONVOLUTION_TAPS;
+  static_assert(SPLASH_DRAFT_CONVOLUTION_STAGES == 2 && Taps == 2,
+                "a stage prepares or finishes; its taps are a row and the "
+                "row before");
+  constexpr uint ConvGroups = Hidden / SPLASH_DRAFT_CONVOLUTION_GROUP;
+  constexpr uint Dynamic = draft_dynamic_width(Hidden);
   const uint element = group * 256 + thread_index;
   if (element >= Rows * Hidden)
     return;
   uint row = element / Hidden;
   uint channel = element % Hidden;
-  uint conv_group = channel / 16;
+  uint conv_group = channel / SPLASH_DRAFT_CONVOLUTION_GROUP;
   uint kind = finish ? 1 : 0;
   float value =
       float(input[element]) *
-      (float(base[(kind * 2) * Hidden + channel]) +
-       float(dynamic[row * Dynamic + (kind * 2) * ConvGroups + conv_group]));
+      (float(base[(kind * Taps) * Hidden + channel]) +
+       float(dynamic[row * Dynamic + (kind * Taps) * ConvGroups +
+                     conv_group]));
   if (row > 0) {
     value +=
         float(input[(row - 1) * Hidden + channel]) *
-        (float(base[(kind * 2 + 1) * Hidden + channel]) +
+        (float(base[(kind * Taps + 1) * Hidden + channel]) +
          float(
-             dynamic[row * Dynamic + (kind * 2 + 1) * ConvGroups +
+             dynamic[row * Dynamic + (kind * Taps + 1) * ConvGroups +
                      conv_group]));
   }
   if (finish)
@@ -449,7 +454,7 @@ inline void draft_conv_decode_batch_impl(
     device bfloat *output, constant DraftConvBatchParams &params, uint2 group,
     uint thread_index) {
   constexpr ulong Rows = SPLASH_DRAFT_QUERY_ROWS;
-  constexpr ulong Dynamic = Hidden / 4;
+  constexpr ulong Dynamic = draft_dynamic_width(Hidden);
   uint batch = group.y;
   draft_conv_phase<Hidden>(input + batch * Rows * Hidden,
                            dynamic + batch * Rows * Dynamic, base,

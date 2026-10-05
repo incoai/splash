@@ -2643,14 +2643,10 @@ ModelTelemetry Runtime::telemetry() const noexcept {
   return result;
 }
 
-ModelMemoryPlan plannedRuntimeMemory(const DeviceCapabilities &device,
-                                     const ModelPackage &package,
+ModelMemoryPlan plannedRuntimeMemory(const ModelPackage &package,
                                      const ops::ExecutionPlans &operators,
                                      kv::Format format) {
   requireCompatibleModelPackage(package);
-  if (device.appleGpuFamily < DeviceCapabilities::kMinimumAppleGpuFamily) {
-    throw std::invalid_argument("model runtime requires Apple tensor BF16");
-  }
   const RuntimeGeometry geometry = RuntimeGeometry::from(package, format);
   return {package.stateLayout().laneBytes(),
           plannedPrefillBytes(geometry, operators),

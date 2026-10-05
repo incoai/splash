@@ -573,7 +573,10 @@ std::vector<uint16_t> runPlan(MetalBackend &backend, const Model &m, Buffers &b,
 }
 
 // Each buffer a register decode plan and a staged 32-row prefill plan reach,
-// at its extent and one element short.
+// at its extent and one element short, and each weight: the planes of every
+// expert tensor, whose rows fill whole tiles, in units of a row's group of
+// 32 inputs or meta unit (metal/abi/QuantFormat.h), and the shared scalar
+// gate's fp32 weights.
 void bufferExtents(MetalBackend &backend) {
   const Model m = makeModel(backend, 0);
   const MoeShape shape{kHidden, kExperts, kTopK, kIntermediate, WeightLayout::Block32};
@@ -589,6 +592,38 @@ void bufferExtents(MetalBackend &backend) {
     allocate(backend, b, plan);
     splash::test::requireMoeExtents(backend, b.moe, m.weights, plan);
   }
+  const MoePlan plan = MoE::prefillPlan(shape, 33, MoeConfig{MoeExpertTile::M32});
+  allocate(backend, b, plan);
+  const BlockMoeWeights &blocks = m.weights.blocks();
+  // A weight buffer of the block that `with` puts in its place.
+  const auto requireWeightExtent = [&](const MetalBuffer &buffer, uint64_t bytes, uint64_t element,
+                                       const std::string &name, const auto &with) {
+    splash::test::requireExtent(backend, buffer, bytes, element, name, [&](CommandGraph &graph, const MetalBuffer &view) {
+      BlockMoeWeights changed = blocks;
+      with(changed, view);
+      MoE::add(graph, b.moe, changed, plan);
+    });
+  };
+  for (const auto &[member, name] : {std::pair{&BlockMoeWeights::gate, "gate"}, std::pair{&BlockMoeWeights::up, "up"},
+                                     std::pair{&BlockMoeWeights::down, "down"}})
+    for (const auto &[segment, kind] : {std::pair{&BlockExpertProjection::routed, "MoE expert "},
+                                        std::pair{&BlockExpertProjection::shared, "MoE shared "}}) {
+      const QuantizedSegment &tensor = blocks.*member.*segment;
+      const QuantFormat &format = kQuantFormats[tensor.formatId];
+      const uint64_t groups = uint64_t{tensor.outputSize} * (tensor.inputSize / 32);
+      for (const auto &[plane, planeName, unitBytes, units] :
+           {std::tuple{&QuantizedSegment::plane0, " plane0", format.plane0_bytes, groups},
+            std::tuple{&QuantizedSegment::plane1, " plane1", format.plane1_bytes, groups},
+            std::tuple{&QuantizedSegment::meta, " meta", format.meta_bytes, groups / format.meta_groups}}) {
+        if (!unitBytes) continue;
+        requireWeightExtent(tensor.*plane, units * unitBytes, unitBytes, std::string(kind) + name + planeName,
+                            [&](BlockMoeWeights &changed, const MetalBuffer &view) {
+                              (changed.*member.*segment).*plane = view;
+                            });
+      }
+    }
+  requireWeightExtent(blocks.sharedScalarGate.plane0, uint64_t{kHidden} * 4, 4, "MoE shared scalar gate weight",
+                      [](BlockMoeWeights &changed, const MetalBuffer &view) { changed.sharedScalarGate.plane0 = view; });
 }
 
 int moe(MetalBackend &backend) {

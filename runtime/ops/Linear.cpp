@@ -19,7 +19,7 @@ namespace {
 constexpr uint32_t kAffinePrefillTileRows = 32;
 constexpr uint32_t kQuantGroup = 64;
 static_assert(SPLASH_TARGET_VERIFY_ROWS == 8,
-              "simdgroup Q4 tiles require eight verify rows per lane");
+              "Q4 register tiles require eight verify rows per lane");
 // The kernels sum their input per block of four quant groups (256 inputs);
 // Split128 partitions K in whole blocks.
 constexpr uint32_t kInputSumBlock = 4 * kQuantGroup;
@@ -40,7 +40,7 @@ bool blockTile(LinearTile tile) noexcept {
 // Split128 the N128 tile's eight.
 std::optional<LinearSimdgroups> fixedSimdgroups(LinearTile tile) noexcept {
   switch (tile) {
-  case LinearTile::Simdgroup:
+  case LinearTile::Q4Register:
   case LinearTile::Paired256: return LinearSimdgroups::Four;
   case LinearTile::Split128: return LinearSimdgroups::Eight;
   case LinearTile::N128:
@@ -79,10 +79,10 @@ LinearWorkload decode(LinearMatrix matrix, uint32_t lanes, LinearEpilogue epilog
 constexpr uint64_t rotatedBytes(uint32_t width, uint64_t rows) noexcept { return uint64_t{width} * rows * 2; }
 
 // The four-simdgroup kernels: every prefill N128 tile, the decode M24 N128
-// plain and residual projections, all matrix row tiles, and the one-lane
+// plain and residual projections, the Q4 register tile, and the one-lane
 // Paired256 (plain) tile.
 bool supportsFourSimdgroups(LinearWorkload w, LinearTile tile) noexcept {
-  if (tile == LinearTile::Simdgroup) return w.phase == LinearPhase::Decode;
+  if (tile == LinearTile::Q4Register) return w.phase == LinearPhase::Decode;
   // Only the affine paired N256 kernel is instantiated: this tile is used
   // for wide plain projections; residual and gate/up retain their own tiles.
   if (tile == LinearTile::Paired256)
@@ -131,7 +131,7 @@ uint32_t LinearPlan::storageRows() const noexcept {
 }
 uint32_t LinearPlan::tileColumns() const noexcept {
   switch (config_.tile) {
-  case LinearTile::Simdgroup: return workload_.epilogue == LinearEpilogue::GateUp ? 32 : 64;
+  case LinearTile::Q4Register: return workload_.epilogue == LinearEpilogue::GateUp ? 32 : 64;
   case LinearTile::GgufStaged:
   case LinearTile::GgufPrefill:
   case LinearTile::GgufRegister: return GGUF_TILE_COLUMNS;
@@ -156,15 +156,15 @@ uint32_t LinearPlan::threadsPerThreadgroup() const noexcept {
   case LinearTile::Paired128:
   case LinearTile::Split128:
   case LinearTile::Paired256:
-  case LinearTile::Simdgroup: return static_cast<uint32_t>(config_.simdgroups) * 32;
+  case LinearTile::Q4Register: return static_cast<uint32_t>(config_.simdgroups) * 32;
   }
   return 0;
 }
-bool LinearPlan::usesSimdgroup() const noexcept { return config_.tile == LinearTile::Simdgroup; }
+bool LinearPlan::usesQ4Register() const noexcept { return config_.tile == LinearTile::Q4Register; }
 LinearInput LinearPlan::input() const noexcept {
   if (rotated_) return LinearInput::Plain;
   if (config_.tile == LinearTile::GgufRegister) return LinearInput::Table16;
-  return usesSimdgroup() ? LinearInput::Table64 : LinearInput::Plain;
+  return usesQ4Register() ? LinearInput::Table64 : LinearInput::Plain;
 }
 LinearScratchSize LinearPlan::scratchSize() const noexcept {
   if (workload_.weightLayout == WeightLayout::Block32) return blockScratchSize();
@@ -174,14 +174,14 @@ LinearScratchSize LinearPlan::scratchSize() const noexcept {
   if (config_.tile == LinearTile::Split128)
     return {0, 0, uint64_t{config_.splits} * workload_.rows * n * sizeof(float),
             uint64_t{n / tileColumns()} * sizeof(uint32_t)};
-  if (!usesSimdgroup()) return {};
+  if (!usesQ4Register()) return {};
   const uint64_t rows = workload_.rows;
   const uint64_t lanes = rows / SPLASH_TARGET_VERIFY_ROWS;
   // Each row tile owns two fp32 fragment streams per K partition and one
-  // completion counter per column tile. Single-partition kernels use neither.
+  // completion counter per column tile; a single partition needs neither.
   return {tableBytes(k, workload_.rows), tableSumsBytes(LinearInput::Table64, k, workload_.rows),
-          config_.splits > 1 ? config_.splits * 2 * rows * n * sizeof(float) : sizeof(float),
-          config_.splits > 1 ? lanes * (n / tileColumns()) * sizeof(uint32_t) : sizeof(uint32_t)};
+          config_.splits > 1 ? config_.splits * 2 * rows * n * sizeof(float) : 0,
+          config_.splits > 1 ? lanes * (n / tileColumns()) * sizeof(uint32_t) : 0};
 }
 
 uint64_t LinearPlan::sumsBytes() const noexcept {
@@ -218,9 +218,9 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destin
     requireBlockConfiguration();
     return;
   }
-  const bool splitsK = config.tile == LinearTile::Simdgroup || config.tile == LinearTile::Split128;
+  const bool splitsK = config.tile == LinearTile::Q4Register || config.tile == LinearTile::Split128;
   if (!splitsK && config.splits != 1)
-    throw std::invalid_argument("K splits require the simdgroup or Split128 Q4 tile");
+    throw std::invalid_argument("K splits require the register or Split128 Q4 tile");
   if (config.simdgroups == LinearSimdgroups::Four && !supportsFourSimdgroups(w, config.tile))
     throw std::invalid_argument("invalid Q4 cooperative execution scope");
   if (const auto fixed = fixedSimdgroups(config.tile); fixed && config.simdgroups != *fixed)
@@ -251,10 +251,10 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destin
   const uint32_t lane = w.rows / SPLASH_TARGET_VERIFY_ROWS - 1;
   if (oneLaneTile(config.tile) && lane != 0)
     throw std::invalid_argument("paired Q4 tile requires one lane");
-  if (usesSimdgroup()) {
+  if (usesQ4Register()) {
     const uint32_t groups = w.matrix.inputSize / kQuantGroup;
     if (!config.validSplits() || groups % config.splits)
-      throw std::invalid_argument("simdgroup Q4 requires whole power-of-two K partitions");
+      throw std::invalid_argument("the Q4 register tile requires whole power-of-two K partitions");
     pipeline_ = w.epilogue == LinearEpilogue::GateUp ? "decode_linear_q4_sg_gate_up" :
         residual ? "decode_linear_q4_sg_residual" : "decode_linear_q4_sg";
     return;
@@ -387,15 +387,9 @@ constexpr double kApple9WidePrefillGroupsPerCore = 8.0;
 // two up to LinearConfig::kMaximumSplits whose split grid still fits four
 // threadgroups per core (1024 threads, twice the 512-thread occupancy knee),
 // with at least one 256-input block per partition. A grid of more than two
-// tiles per core keeps one split, the sequential tiles. Measured DRAM-cold on
-// a 20-core M5 Pro over the 27B and 35B MLX 4-bit decode projections and their
-// drafts at one to four lanes, with 10 to 80 cores emulated by width, and on a
-// 12-core M6 (Apple11): grids that only reach the knee leave time (the 20
-// tiles of 2560 x 4096 take 0.48-0.60 of the sequential time with four
-// splits, 0.60-0.71 with two), and a grid past four per core loses to its
-// second wave (6144 x 5120 in two splits is 9% slower at one lane). The rule is
-// never slower than the sequential tiles on the M5 Pro or on the M6's own 12
-// cores (20 cores emulated on the M6 ran 5120 x 4096 4% slower at one lane).
+// tiles per core keeps one split, the sequential tiles. A split grid that
+// only reaches the knee leaves time, and one past four threadgroups per core
+// loses to its second wave.
 constexpr uint32_t kSplitGroupsPerCore = 4;
 
 uint32_t apple10Splits(LinearMatrix matrix, uint32_t cores) noexcept {
@@ -408,8 +402,8 @@ uint32_t apple10Splits(LinearMatrix matrix, uint32_t cores) noexcept {
 }
 
 // Apple10 wide plain projections reduce input re-reads with paired N256
-// tiles at one resident wave, measured on 16/20-core GPUs. Apple9's simdgroup
-// policy is independent.
+// tiles at one resident wave, measured on 16/20-core GPUs. Apple9's register
+// tile policy is independent.
 constexpr uint32_t kPaired256TilesPerCore = 8;
 constexpr uint32_t kPaired256WaveGroupsPerCore = 4;
 
@@ -467,7 +461,7 @@ LinearConfig Linear::baseline(LinearWorkload w, std::span<const Projection *cons
     while (splits < LinearConfig::kMaximumSplits && uint64_t(grid) * splits < 16ULL * gpuCores_ &&
            groups % (2 * splits) == 0 && groups / (2 * splits) >= 12)
       splits *= 2;
-    return {LinearTile::Simdgroup, 0, LinearSimdgroups::Four, splits};
+    return {LinearTile::Q4Register, 0, LinearSimdgroups::Four, splits};
   }
   if (family_ == GpuFamilyClass::Apple10) {
     if (const uint32_t splits = apple10Splits(w.matrix, gpuCores_); splits > 1)
@@ -545,6 +539,11 @@ LinearScratchSize Linear::prefillScratchSize(ProjectionShape shape) const {
 }
 
 
+std::array<metal::MetalBuffer, 2> Linear::splitScratch(const LinearBuffers &buffers, uint32_t splits) {
+  if (splits > 1) return {buffers.scratch.partials, buffers.scratch.counters};
+  return {buffers.output, buffers.output};
+}
+
 PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
     const Projection &p, const LinearPlan &selected, const Projection *gate) const {
   const LinearWorkload w = selected.workload();
@@ -581,13 +580,14 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
   requireAffineProjection(p, w.matrix);
   if (gate) requireAffineProjection(*gate, w.matrix);
   const AffineWeights &weights = p.affine();
-  if (selected.usesSimdgroup()) {
+  if (selected.usesQ4Register()) {
     if (b.prepared.layout != LinearInput::Table64 || !b.prepared.source.sameView(b.input))
       graph.add("decode_linear_q4_prepare", {b.input, b.scratch.input, b.scratch.sums},
                 k, {k / 32, w.rows / SPLASH_TARGET_VERIFY_ROWS, 1}, {128, 1, 1});
     const AffineWeights &first = gate ? gate->affine() : weights;
+    const auto [partials, counters] = splitScratch(b, selected.configuration().splits);
     std::vector<metal::MetalBuffer> bindings{b.scratch.input, first.weights, first.scales, first.biases,
-                                             b.output, b.scratch.sums, b.scratch.partials, b.scratch.counters};
+                                             b.output, b.scratch.sums, partials, counters};
     if (gate) bindings.insert(bindings.end(), {weights.weights, weights.scales, weights.biases});
     else if (w.epilogue == LinearEpilogue::Residual) bindings.push_back(b.residual);
     graph.add(kernelInstance(selected.pipeline(), selected.destination()), std::move(bindings),

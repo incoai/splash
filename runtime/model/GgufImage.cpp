@@ -1,5 +1,6 @@
 #include "model/GgufImage.hpp"
 
+#include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Gguf.h"
 #include "model/GgufImageLayout.hpp"
 #include "model/StateLayout.hpp"
@@ -274,7 +275,7 @@ void requireMetadata(const GgufFile &file, const QwenTargetDimensions &geometry)
   expect("attention.value_length", geometry.attentionHeadDimension);
   expect("rope.dimension_count", 2ull * geometry.rotaryPairs);
   expectFloat("rope.freq_base", geometry.rotaryTheta);
-  expectFloat("attention.layer_norm_rms_epsilon", 1e-6);
+  expectFloat("attention.layer_norm_rms_epsilon", SPLASH_RMS_EPSILON);
   if (const auto scaling = file.stringValue(arch + ".rope.scaling.type"); scaling && *scaling != "none")
     mismatched += (mismatched.empty() ? "" : ", ") + std::string("rope.scaling.type ") + *scaling + " (expected none)";
   expect("full_attention_interval", geometry.fullAttentionPeriod);

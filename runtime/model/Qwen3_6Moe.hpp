@@ -4,6 +4,8 @@
 #include "QwenHybridLayout.hpp"
 #include "QwenTarget.hpp"
 #include "QwenTargetFiles.hpp"
+#include "metal/abi/DraftAttention.h"
+#include "metal/abi/RoPE.h"
 #include "ops/MoE.hpp"
 #include "ops/Normalization.hpp"
 
@@ -30,7 +32,7 @@ struct Qwen3_6MoeLayout final : QwenHybridLayout<8> {
                           .attentionQueryHeads = 16,
                           .attentionKvHeads = 2,
                           .attentionHeadDimension = 256,
-                          .rotaryPairs = 32,
+                          .rotaryPairs = SPLASH_TARGET_ROPE_PAIRS,
                           .rotaryTheta = 10'000'000.0F,
                           .fullAttentionPeriod = 4,
                           .maskToken = 248077,
@@ -47,15 +49,15 @@ struct Qwen3_6MoeLayout final : QwenHybridLayout<8> {
 inline constexpr DFlashDraftLayout kQwen3_6MoeDraftLayout{.layers = 6,
                                                           .hiddenSize = 2048,
                                                           .vocabularySize = 248320,
-                                                          .dynamicSize = 512,
-                                                          .qkvSize = 6144,
-                                                          .attentionSize = 4096,
+                                                          .dynamicSize = draft_dynamic_width(2048),
+                                                          .qkvSize = SPLASH_DRAFT_QKV_WIDTH,
+                                                          .attentionSize = SPLASH_DRAFT_ATTENTION_WIDTH,
                                                           .intermediateSize = 6144,
-                                                          .attentionHeadDimension = 128,
+                                                          .attentionHeadDimension = SPLASH_DRAFT_HEAD_DIMENSION,
                                                           .rotaryTheta = 10'000'000.0F,
                                                           .targetHiddenSize = 16384,
-                                                          .selectorRank = 256,
-                                                          .kvHeads = 8};
+                                                          .selectorRank = SPLASH_DRAFT_SELECTOR_RANK,
+                                                          .kvHeads = SPLASH_DRAFT_KV_HEADS};
 
 struct Qwen3_6MoeLayerWeights final {
   ops::NormWeights inputNorm;

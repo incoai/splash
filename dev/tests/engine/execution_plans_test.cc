@@ -131,9 +131,9 @@ void baselinePlans() {
 }
 
 // Affine decode plans run the fused 8-row expert tiles, four-simdgroup on
-// Apple9 and the shipped N128 x 8 tile on every other family; affine prefill
-// plans run the split 32-row passes on every family and keep the shipped
-// simdgroups they do not run.
+// Apple9 and the eight-simdgroup N128 tile on every other family; affine
+// prefill plans run the split 32-row passes on every family and keep the
+// eight simdgroups, which they do not run.
 void moeDeviceTiles() {
   for (uint32_t family : {9U, 10U, 11U}) {
     const auto expected = family == 9 ? MoeExpertSimdgroups::Four

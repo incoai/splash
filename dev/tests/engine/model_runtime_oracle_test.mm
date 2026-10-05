@@ -1444,7 +1444,7 @@ int main(int argc, char **argv) {
         model::loadModelPackage(backend, modelRoot, descriptor);
     ops::ExecutionPlans operators(backend.capabilities());
     model::ModelMemoryPlan executorPlan =
-        model::plannedRuntimeMemory(backend.capabilities(), model, operators, format);
+        model::plannedRuntimeMemory(model, operators, format);
     ModelMemoryFootprint footprint{
         model.targetActualAllocatedBytes(),
         model.draft.actualAllocatedBytes,

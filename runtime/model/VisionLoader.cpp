@@ -1,4 +1,5 @@
 #include "model/VisionLoader.hpp"
+#include "metal/abi/Vision.h"
 #include "model/GgufFile.hpp"
 #include "model/SafetensorsCheckpoint.hpp"
 #include "model/VisionPreparation.hpp"
@@ -100,7 +101,7 @@ void requireMmprojMetadata(const GgufFile &gguf, const ops::VisionLayout &layout
            {"clip.use_gelu", 1}})
     if (gguf.unsignedValue(key) != expected) throw WeightStoreError(std::string("vision metadata mismatch: ") + key);
   const auto epsilon = gguf.floatValue("clip.vision.attention.layer_norm_epsilon");
-  if (!epsilon || !std::isfinite(*epsilon) || std::abs(*epsilon - 1e-6) > 1e-12)
+  if (!epsilon || !std::isfinite(*epsilon) || std::abs(*epsilon - SPLASH_VISION_NORM_EPSILON) > 1e-12)
     throw WeightStoreError("vision LayerNorm epsilon mismatch");
   for (const char *key : {"clip.vision.image_mean", "clip.vision.image_std"}) {
     const auto values = gguf.numericArray(key);

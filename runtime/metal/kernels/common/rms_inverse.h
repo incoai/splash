@@ -3,7 +3,7 @@
 #include "metal/abi/KernelABI.h"
 
 // The epsilon of every RMS norm.
-constant constexpr float kRmsEpsilon = 1e-6f;
+constant constexpr float kRmsEpsilon = SPLASH_RMS_EPSILON;
 
 // The inverse RMS of `width` values from each thread's sum of squares,
 // reduced per simdgroup and then over the first Simdgroups simdgroups, in

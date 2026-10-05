@@ -51,17 +51,11 @@ uint32_t decodeSplits(uint32_t n, uint32_t k, uint32_t cores, std::span<const Sp
   return splits;
 }
 
-// Apple9 register tile (128 threads). Four of its threadgroups are resident
-// on a core at once: on a 40-core M3 Max its time steps every four per core
-// (Q4_K, K = 8192, one lane, ms: 3 per core 0.156, 4 0.157, 5 0.220, 7 0.281,
-// 8 0.286; the same steps at two to four lanes and for Q8_0). Below one wave
-// a core must fill it, down to one 256-input coefficient unit per partition;
-// below eight waves more threadgroups shrink the last wave's tail while
-// partitions of 1024 inputs amortize the partial sums (flat from eight to 32
-// waves). Over every 27B and 35B projection kind at one to four lanes and
-// 10-80 cores emulated by width, the decode step's projections run 0.95%
-// slower than the fastest split of each shape on average and 2.3% at worst
-// (sixteen threadgroups per core with two units per partition: 2.8%, 7.8%).
+// Apple9 register tile (128 threads). A core holds four of its threadgroups
+// at once, so the tile's time steps with every four threadgroups per core.
+// Below one wave a core must fill it, down to one 256-input coefficient unit
+// per partition; below eight waves more threadgroups shrink the last wave's
+// tail while partitions of 1024 inputs amortize the partial sums.
 constexpr SplitTier kRegisterTiers[] = {{4, 256}, {32, 1024}};
 
 // Staged tile (64 threads): one fitted tier, six threadgroups per core with
@@ -118,17 +112,19 @@ bool apple9Stages(LinearWorkload w, std::span<const Projection *const> projectio
 
 // The projection is the plan's matrix, and each of its segments (which tile
 // its leading columns) fills whole column tiles of its kernels: 64 columns
-// for a quantized segment, 8 for a float one (addGgufFloat; F32 alpha/beta
-// are 96 columns on the 27B); the columns past the last segment are padding
-// no kernel writes. A fused projection keeps the layout's sizes: the 35B
-// GGUF's packed GDN row is 12544 columns (the affine layout's), its
-// qkv|z|alpha-beta segments 12352.
+// for a quantized segment, whose planes hold its tiles, 8 for a float one
+// (addGgufFloat; F32 alpha/beta are 96 columns on the 27B); the columns past
+// the last segment are padding no kernel writes. A fused projection keeps the
+// layout's sizes: the 35B GGUF's packed GDN row is 12544 columns (the affine
+// layout's), its qkv|z|alpha-beta segments 12352.
 void requireSegments(const Projection &p, LinearMatrix matrix) {
   if (p.outputSize != matrix.outputSize || p.inputSize != matrix.inputSize)
     throw std::invalid_argument("block projection does not match plan");
-  for (const QuantizedSegment &s : p.blocks().segments)
+  for (const QuantizedSegment &s : p.blocks().segments) {
     if (s.outputSize % (s.isFloat() ? 8u : GGUF_TILE_COLUMNS))
       throw std::invalid_argument("block segments do not fill whole column tiles");
+    if (!s.isFloat()) requireSegmentPlanes(s, "projection");
+  }
 }
 
 // Columns of the segments, which the fused kernels' grids cover.
@@ -225,14 +221,14 @@ uint32_t LinearPlan::blockStorageRows() const noexcept {
 
 LinearScratchSize LinearPlan::blockScratchSize() const noexcept {
   const auto [n, k] = workload_.matrix;
-  // Register tile: the Table16 table and sums, [lane][split][row][column]
-  // partials and one counter per 64-column tile, which covers every lane.
-  // Every binding exists even without splits.
+  // Register tile: the Table16 table and sums, and split, [lane][split][row]
+  // [column] partials and one counter per 64-column tile, which covers every
+  // lane.
   if (config_.tile == LinearTile::GgufRegister) {
     const uint64_t rows = workload_.rows;
     return {tableBytes(k, rows), tableSumsBytes(LinearInput::Table16, k, rows),
-            config_.splits > 1 ? config_.splits * rows * n * sizeof(float) : sizeof(float),
-            config_.splits > 1 ? uint64_t{n / tileColumns()} * sizeof(uint32_t) : sizeof(uint32_t)};
+            config_.splits > 1 ? config_.splits * rows * n * sizeof(float) : 0,
+            config_.splits > 1 ? uint64_t{n / tileColumns()} * sizeof(uint32_t) : 0};
   }
   // Staged split-K: [split][row][column] fp32 partials over the tile's rows
   // and one counter per 64-column tile (a tile covers every row of the
@@ -324,7 +320,7 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
   case LinearTile::Paired128:
   case LinearTile::Split128:
   case LinearTile::Paired256:
-  case LinearTile::Simdgroup: break;
+  case LinearTile::Q4Register: break;
   }
 }
 
@@ -342,9 +338,7 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
   const auto [n, k] = w.matrix;
   const std::vector<QuantizedSegment> &segments = p.blocks().segments;
   const uint32_t rows = plan.storageRows(), splits = config.splits;
-  // One partition never touches the partials and counters: the output stands in.
-  const metal::MetalBuffer partials = splits > 1 ? b.scratch.partials : b.output;
-  const metal::MetalBuffer counters = splits > 1 ? b.scratch.counters : b.output;
+  const auto [partials, counters] = splitScratch(b, splits);
   const auto tensor = [&](const QuantizedSegment &s, char epilogue, const metal::MetalBuffer &output,
                           const metal::MetalBuffer &aux) {
     graph.add(kernelInstance(decodeKernel(s.name(), rows, epilogue), plan.destination()),
@@ -413,20 +407,20 @@ void Linear::addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &b,
               {k / 32, lanes, 1}, {128, 1, 1});
   const metal::DispatchSize grid{segmentColumns(p) / GGUF_TILE_COLUMNS, config.splits, 1};
   const std::string suffix = "_l" + std::to_string(lanes);
+  const auto [partials, counters] = splitScratch(b, config.splits);
   if (segments.size() > 1) {
     std::vector<const QuantizedSegment *> order;
     for (const QuantizedSegment &s : segments) order.push_back(&s);
     std::vector<metal::MetalBuffer> bindings{b.scratch.input, b.scratch.sums};
     const GgufDecodeFusedParams params = fusedSegments(plan, order, bindings);
-    bindings.insert(bindings.end(), {b.output, b.scratch.partials, b.scratch.counters});
+    bindings.insert(bindings.end(), {b.output, partials, counters});
     graph.add("gguf_decode_sg_fused" + suffix, std::move(bindings), params, grid, {GGUF_REGISTER_THREADS, 1, 1});
     return;
   }
   const auto tensor = [&](const QuantizedSegment &s, char epilogue, const metal::MetalBuffer &output,
                           const metal::MetalBuffer &aux) {
     graph.add(kernelInstance(std::string("gguf_decode_sg_") + s.name() + suffix + "_" + epilogue, plan.destination()),
-              {b.scratch.input, b.scratch.sums, s.plane0, s.plane1Slot(), s.meta, output, b.scratch.partials,
-               b.scratch.counters, aux},
+              {b.scratch.input, b.scratch.sums, s.plane0, s.plane1Slot(), s.meta, output, partials, counters, aux},
               GgufDecodeParams{k, config.splits, n, s.columnOffset}, grid, {GGUF_REGISTER_THREADS, 1, 1});
   };
   addDecodeTensor(b, w.epilogue, segments.front(), gate, tensor);
@@ -447,14 +441,10 @@ void Linear::addGgufFloatSegments(metal::CommandGraph &graph, const LinearBuffer
 // The neural accelerator tile needs one (Apple9's matrix operations share the
 // FP32 pipe, where three bf16 matmuls cost three fp32 ones) and a grid of its
 // 64-row by 32-column tiles of at least three threadgroups per two cores. A
-// tile runs K / 32 dependent steps (~50 us at the 35B's K = 2048), while the
-// fp32 kernel spreads fewer rows over 8-column tiles with 16 K partitions
-// each and finishes first below that: at K = 2048 its time equals the
-// accelerator's at 1.4-1.6 tiles per core for both float projections of the
-// 35B on the 16- and 20-core M5 Pro (router, N 256: 170 and 210 rows;
-// alpha/beta, N 64: 720 and 850 rows). Above it the accelerator is up to
-// 2.2x (router) and 2.3x (alpha/beta) faster at 2048 rows, ms per dispatch
-// 0.81 -> 0.36 and 0.20 -> 0.083 on 16 cores.
+// tile runs K / 32 dependent steps, while the fp32 kernel spreads fewer rows
+// over 8-column tiles with 16 K partitions each and finishes first below that
+// grid: at the 35B's K = 2048 the two take the same time at 1.4-1.6 tiles per
+// core for both of its float projections on the 16- and 20-core M5 Pro.
 FloatTile Linear::ggufFloatTile(uint32_t rows, uint32_t outputSize) const noexcept {
   const uint64_t tiles = uint64_t{(rows + 63) / 64} * ((outputSize + 31) / 32);
   return family_ == GpuFamilyClass::Apple10 && rows >= 16 && 2 * tiles >= uint64_t{3} * gpuCores_
@@ -482,6 +472,20 @@ void addGgufFloat(metal::CommandGraph &graph, metal::MetalBuffer input, const Qu
                                                : metal::DispatchSize{n / 8, (rows + 31) / 32, 1};
   graph.add(kernel, {std::move(input), weights.plane0, std::move(output)},
             GgufFloatParams{rows, k, n, outStride, outOffset}, grid, {accelerator ? 128u : 512u, 1, 1});
+}
+
+void requireSegmentPlanes(const QuantizedSegment &segment, std::string_view what) {
+  // Each plane ends at its unit of the last row's last group, or meta unit:
+  // tile row (rows - 1) % T of the last group of its tile.
+  const QuantFormat &format = segment.format();
+  const uint32_t groups = segment.inputSize / 32, units = groups / format.meta_groups;
+  const auto planeBytes = [&](uint32_t blocks, uint32_t unitBytes) {
+    return (quant_tile_index(segment.outputSize - 1, blocks - 1, blocks) + 1) * unitBytes;
+  };
+  const std::string name(what);
+  requireBytes(segment.plane0, planeBytes(groups, format.plane0_bytes), name + " plane0");
+  if (format.plane1_bytes) requireBytes(segment.plane1, planeBytes(groups, format.plane1_bytes), name + " plane1");
+  requireBytes(segment.meta, planeBytes(units, format.meta_bytes), name + " meta");
 }
 
 bool apple9StagesFormat(uint32_t format) noexcept {

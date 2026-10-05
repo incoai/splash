@@ -31,12 +31,12 @@ struct Layout final {
   uint64_t bytes = 0;
 };
 
-// Plans of one K partition outside the Simdgroup tile store
+// Plans of one K partition outside the Q4Register tile store
 // bitwise-identical outputs for a workload. Any other pair may round
 // differently even with as many K splits on both sides, so it is held to the
 // derived bound.
 bool sequential(const LinearPlan &plan) {
-  return plan.configuration().splits == 1 && !plan.usesSimdgroup();
+  return plan.configuration().splits == 1 && !plan.usesQ4Register();
 }
 bool bitwiseComparable(const LinearPlan &baseline, const LinearPlan &candidate) {
   return sequential(baseline) && sequential(candidate);
@@ -308,9 +308,9 @@ LinearTuningResult tuneLinear(metal::MetalBackend &backend,
     float operandSlack = 0;
     auto referenceGateUp = [&](uint32_t representative) {
       if (fields[PreparedInput]) {
-        operandSlack = simdgroupSlack(workload, buffers.input, input.weights[representative].projection);
+        operandSlack = q4RegisterSlack(workload, buffers.input, input.weights[representative].projection);
         if (input.weights[representative].gate)
-          operandSlack = std::max(operandSlack, simdgroupSlack(workload, buffers.input, *input.weights[representative].gate));
+          operandSlack = std::max(operandSlack, q4RegisterSlack(workload, buffers.input, *input.weights[representative].gate));
       }
       if (!exactPlain) return;
       const auto &weights = input.weights[representative];

@@ -62,21 +62,21 @@ void requireLanes(uint32_t lanes) {
 
 enum class KernelLayout : uint8_t { Hidden5120, Hidden2048 };
 
-// The compiled attention (metal/abi/DraftAttention.h) behind each draft
-// hidden size.
+// The compiled draft (metal/abi/DraftAttention.h) of each hidden size the
+// convolution kernels take.
 [[nodiscard]] KernelLayout kernelShape(DraftAttentionShape shape) {
-  const auto compiled = [](uint32_t hidden, uint32_t dynamic) {
+  const auto compiled = [](uint32_t hidden) {
     return DraftAttentionShape{hidden,
-                               dynamic,
+                               draft_dynamic_width(hidden),
                                SPLASH_DRAFT_QKV_WIDTH,
                                SPLASH_DRAFT_ATTENTION_WIDTH,
                                SPLASH_DRAFT_QUERY_HEADS,
                                SPLASH_DRAFT_KV_HEADS,
                                SPLASH_DRAFT_HEAD_DIMENSION};
   };
-  if (shape == compiled(5120, 1280))
+  if (shape == compiled(5120))
     return KernelLayout::Hidden5120;
-  if (shape == compiled(2048, 512))
+  if (shape == compiled(2048))
     return KernelLayout::Hidden2048;
   throw std::invalid_argument("unsupported compiled draft attention shape");
 }
@@ -120,7 +120,9 @@ void DraftAttention::addConvolution(metal::CommandGraph &graph,
   requireBytes(buffers.output, workspace.convolutionBytes, "draft convolution output");
   requireBytes(buffers.residual, workspace.convolutionBytes, "draft convolution residual");
   requireBytes(buffers.dynamic, uint64_t{lanes} * kRows * shape.dynamicSize * 2, "draft dynamic convolution");
-  requireBytes(buffers.weights, uint64_t{4} * shape.hiddenSize * 2, "draft convolution weight");
+  requireBytes(buffers.weights,
+               uint64_t{SPLASH_DRAFT_CONVOLUTION_STAGES} * SPLASH_DRAFT_CONVOLUTION_TAPS * shape.hiddenSize * 2,
+               "draft convolution weight");
   const KernelLayout kernel = kernelShape(shape);
   const DraftConvBatchParams params{finish};
   graph.add(kernel == KernelLayout::Hidden5120 ? "draft_conv"

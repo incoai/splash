@@ -86,8 +86,7 @@ loadModelPackage(metal::MetalBackend &backend,
                  const ModelDescriptor &descriptor);
 
 [[nodiscard]] ModelMemoryPlan
-plannedRuntimeMemory(const DeviceCapabilities &device,
-                     const ModelPackage &package,
+plannedRuntimeMemory(const ModelPackage &package,
                      const ops::ExecutionPlans &operators,
                      kv::Format format);
 [[nodiscard]] std::unique_ptr<RuntimeModel>

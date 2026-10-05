@@ -73,7 +73,7 @@ class BuildIdentityTests(unittest.TestCase):
         inputs = set(build_identity.production_input_paths())
         self.assertIn("runtime/main.mm", inputs)
         self.assertIn("runtime/metal/abi/ExecutionGeometry.h", inputs)
-        self.assertIn("runtime/model/Runtime.mm", inputs)
+        self.assertIn("runtime/model/Runtime.cpp", inputs)
         self.assertIn("runtime/metal/kernels/decode/linear_q4.metal", inputs)
         self.assertIn("runtime/metal/kernels/prefill/linear_q4.metal", inputs)
         self.assertIn("runtime/metal/abi/KernelABI.h", inputs)

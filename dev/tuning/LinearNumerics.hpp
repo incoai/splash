@@ -1,5 +1,6 @@
 #pragma once
 
+#include "metal/abi/Linear.h"
 #include "ops/Linear.hpp"
 
 #include <algorithm>
@@ -65,15 +66,16 @@ inline float reassociationSlack(uint32_t inputSize, float maxAbsReference) noexc
 // 64 products plus row-sum/correction rounding; gamma(2G+8) covers the two
 // affine FMAs per group and up to eight split additions. Maxima over columns
 // keep this qualification pass linear in packed metadata, not matrix FLOPs.
-inline float simdgroupSlack(LinearWorkload w, const metal::MetalBuffer &input,
-                           const Projection &projection) {
+inline float q4RegisterSlack(LinearWorkload w, const metal::MetalBuffer &input,
+                            const Projection &projection) {
   const uint32_t groups = w.matrix.inputSize / 64;
+  constexpr uint32_t tile = SPLASH_AFFINE_TILE_ROWS;
   std::vector<double> scale(groups), bias(groups);
   const auto *sc = static_cast<const uint16_t *>(projection.affine().scales.contents());
   const auto *bi = static_cast<const uint16_t *>(projection.affine().biases.contents());
   for (uint32_t n = 0; n < w.matrix.outputSize; ++n)
     for (uint32_t g = 0; g < groups; ++g) {
-      const uint64_t i = (uint64_t(n / 256) * groups + g) * 256 + n % 256;
+      const uint64_t i = (uint64_t(n / tile) * groups + g) * tile + n % tile;
       scale[g] = std::max(scale[g], double(std::fabs(bf16ToFloat(sc[i]))));
       bias[g] = std::max(bias[g], double(std::fabs(bf16ToFloat(bi[i]))));
     }

@@ -8,8 +8,8 @@
 // threadgroup computes Rows x TileN outputs with fp32 accumulation and a
 // per-quant-group scale/bias epilogue.
 
-// Packed Q4 stores 256-column tiles.
-constant constexpr ushort kQ4StorageColumns = 256;
+// The columns of a packed Q4 storage tile.
+constant constexpr ushort kQ4StorageColumns = SPLASH_AFFINE_TILE_ROWS;
 
 // Resolve cooperative fragment traversal once, outside the quant-group loop.
 // The compact path is used only after every validity bit matches; a different

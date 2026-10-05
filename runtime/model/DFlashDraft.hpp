@@ -50,12 +50,6 @@ private:
   uint64_t actualAllocatedBytes_ = 0;
 };
 
-// The dynamic convolutions of every DFlash2 draft layer, as the draft
-// kernels run them (decode/draft.metal): two taps, a row and the one before
-// it, each with one dynamic weight per group of 16 channels.
-inline constexpr uint32_t kDraftConvolutionGroup = 16;
-inline constexpr uint32_t kDraftConvolutionTaps = 2;
-
 // The dimensions of a DFlash2 draft. Each target's draft is defined beside
 // the target (Qwen3_8.hpp, Qwen3_6Moe.hpp).
 struct DFlashDraftLayout final {

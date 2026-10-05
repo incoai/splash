@@ -34,15 +34,12 @@ enum class KernelLayout : uint8_t { Value48, Value32 };
   return shape == KernelLayout::Value48 ? value48 : value32;
 }
 
-// The kernels' causal convolution: four taps over a channel's input and the
-// three inputs before it, which a state carries as three rows of every
-// channel.
-constexpr uint64_t kConvolutionTaps = 4;
-
 uint64_t valueWidth(const GdnShape &shape) { return uint64_t{shape.valueHeads} * shape.headDimension; }
 // One layer's carried convolution rows and fp32 recurrent state, a head
 // dimension square per value head.
-uint64_t carriedBytes(const GdnShape &shape) { return (kConvolutionTaps - 1) * shape.convolutionDimension * 2; }
+uint64_t carriedBytes(const GdnShape &shape) {
+  return uint64_t{SPLASH_GDN_CONVOLUTION_TAPS - 1} * shape.convolutionDimension * 2;
+}
 uint64_t recurrentBytes(const GdnShape &shape) { return valueWidth(shape) * shape.headDimension * sizeof(float); }
 
 // The bytes of `rows` rows of the packed projection the kernels read: each
@@ -55,7 +52,8 @@ uint64_t packedBytes(const GdnShape &shape, uint64_t rows) {
 // value head.
 void requireMixerWeights(const GdnShape &shape, const metal::MetalBuffer &convolution,
                          const metal::MetalBuffer &decay, const metal::MetalBuffer &timeBias) {
-  requireBytes(convolution, uint64_t{shape.convolutionDimension} * kConvolutionTaps * 2, "GDN convolution weight");
+  requireBytes(convolution, uint64_t{shape.convolutionDimension} * SPLASH_GDN_CONVOLUTION_TAPS * 2,
+               "GDN convolution weight");
   requireBytes(decay, uint64_t{shape.valueHeads} * sizeof(float), "GDN decay weight");
   requireBytes(timeBias, uint64_t{shape.valueHeads} * 2, "GDN time bias");
 }

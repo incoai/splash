@@ -172,7 +172,7 @@ inline constexpr auto kMoeWorkspaceFields = [] {
 
 // The tile applies to grouping, gather and both expert projections together;
 // changing it never changes the physical rows in a command. Affine plans
-// consume Q4 expert slabs in StorageN=256 order: decode plans run the fused
+// consume Q4 expert slabs in storage tiles: decode plans run the fused
 // gate/up tile on M8 tiles, prefill plans the experts on M32 tiles as three
 // N256 passes (gate, up with the silu gate, down) whose tiles shrink to the
 // descriptor's live rows. GGUF plans run three passes of M8 tiles, or of M32
@@ -204,10 +204,8 @@ moeDecodeSimdgroups(GpuFamilyClass family) noexcept {
 // grouped rows (8-row tiles only). Apple9 runs Register in both phases but
 // for experts mostly in a format it stages. In decode, as its dense GGUF
 // projections do (LinearGguf.cpp): its matrix operations share the FP32 pipe,
-// where the register tile beats staging. In prefill it equals the decode
-// numerics; against the staged 32-row tiles, on the 35B's real routes on the
-// 40-core M3 Max (ms per layer), it is faster at 512 rows (3.52 vs 3.72) and
-// slower at 2048 (12.6-13.1 vs 11.0-11.7).
+// where the register tile beats staging. In prefill it keeps the decode
+// numerics at a cost: the staged 32-row tiles run long chunks faster.
 enum class MoeGgufTile : uint8_t { Staged, Register };
 
 // Apple9 stages experts mostly in a format apple9StagesFormat names: one
@@ -221,13 +219,10 @@ enum class MoeGgufTile : uint8_t { Staged, Register };
 
 // The rows of a GGUF prefill plan's tiles on the device's `tile`: 8 on the
 // register tile. Staged: 8-row tiles while the chunk's routes average at most
-// one row per expert (rows * topK <= experts), 32-row tiles beyond, which
-// stream an expert's weights once for up to 32 of its rows (its tiles run 8-,
-// 16- or 32-row matmuls by their live rows, moe_live_rows). On the 35B's
-// real prefill routes (wikitext, 16-core M5 Pro, the three expert passes of a
-// layer, ms, with 16-row matmuls for up to 16 live rows) 8- vs 32-row tiles:
-// 32 rows 0.72 / 0.71, 64 rows 1.03 / 0.97, 128 rows 1.59 / 1.29, 256 rows
-// 2.60 / 1.71.
+// one row per expert (rows * topK <= experts), where the two tiles take the
+// same time, and 32-row tiles beyond, which stream an expert's weights once
+// for up to 32 of its rows (its tiles run 8-, 16- or 32-row matmuls by their
+// live rows, moe_live_rows).
 [[nodiscard]] constexpr MoeExpertTile moeGgufPrefillTile(MoeShape shape, uint32_t rows,
                                                          MoeGgufTile tile) noexcept {
   return tile == MoeGgufTile::Register ||

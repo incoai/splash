@@ -35,8 +35,8 @@ uint64_t q4PackedBytes(uint32_t outputSize, uint32_t inputSize) {
 void validateQ4Layout(uint32_t outputSize, uint32_t inputSize) {
     static_cast<void>(q4Elements(outputSize, inputSize));
     if (outputSize % kQ4StorageN) {
-        throw WeightStoreError(
-            "Q4 output dimension is incompatible with StorageN=256");
+        throw WeightStoreError("Q4 output dimension is not a whole number of " + std::to_string(kQ4StorageN) +
+                               "-row storage tiles");
     }
 }
 

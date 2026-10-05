@@ -4,6 +4,8 @@
 #include "QwenHybridLayout.hpp"
 #include "QwenTarget.hpp"
 #include "QwenTargetFiles.hpp"
+#include "metal/abi/DraftAttention.h"
+#include "metal/abi/RoPE.h"
 #include "ops/Linear.hpp"
 #include "ops/Normalization.hpp"
 
@@ -30,7 +32,7 @@ struct Qwen3_8Layout final : QwenHybridLayout<5> {
                           .attentionQueryHeads = 24,
                           .attentionKvHeads = 4,
                           .attentionHeadDimension = 256,
-                          .rotaryPairs = 32,
+                          .rotaryPairs = SPLASH_TARGET_ROPE_PAIRS,
                           .rotaryTheta = 10'000'000.0F,
                           .fullAttentionPeriod = 4,
                           .maskToken = 248070,
@@ -45,15 +47,15 @@ struct Qwen3_8Layout final : QwenHybridLayout<5> {
 inline constexpr DFlashDraftLayout kQwen3_8DraftLayout{.layers = 5,
                                                        .hiddenSize = 5120,
                                                        .vocabularySize = 248320,
-                                                       .dynamicSize = 1280,
-                                                       .qkvSize = 6144,
-                                                       .attentionSize = 4096,
+                                                       .dynamicSize = draft_dynamic_width(5120),
+                                                       .qkvSize = SPLASH_DRAFT_QKV_WIDTH,
+                                                       .attentionSize = SPLASH_DRAFT_ATTENTION_WIDTH,
                                                        .intermediateSize = 17408,
-                                                       .attentionHeadDimension = 128,
+                                                       .attentionHeadDimension = SPLASH_DRAFT_HEAD_DIMENSION,
                                                        .rotaryTheta = 10'000'000.0F,
                                                        .targetHiddenSize = 25600,
-                                                       .selectorRank = 256,
-                                                       .kvHeads = 8};
+                                                       .selectorRank = SPLASH_DRAFT_SELECTOR_RANK,
+                                                       .kvHeads = SPLASH_DRAFT_KV_HEADS};
 
 struct Qwen3_8LayerWeights final {
   ops::NormWeights inputNorm;

@@ -28,7 +28,7 @@ inline void moe_live_rows(uint rows, Run run) {
 }
 
 // One expert's Q4 slab, [weights][BF16 scales][BF16 biases] in the same
-// StorageN=256 affine package as the dense kernels. Routed experts sit at
+// affine storage tiles as the dense kernels. Routed experts sit at
 // their stride in the packed buffer; expert `experts` is the shared expert,
 // whose single slab lives in its own buffer.
 struct MoeQ4Slab {

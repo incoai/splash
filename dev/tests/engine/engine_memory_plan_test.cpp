@@ -323,6 +323,15 @@ void testDeviceValidationNamesTheMacosFloor() {
   require(!newer.validationError(), "a newer macOS major was refused");
 }
 
+// The widest kernels dispatch threadgroups of 1024 threads.
+void testDeviceValidationNamesTheThreadgroupWidth() {
+  DeviceCapabilities narrow = device();
+  narrow.maxThreadgroupWidth = 512;
+  require(narrow.validationError().value_or("") ==
+              "threadgroup_width_below_1024",
+          "512-thread threadgroups were not refused for their width");
+}
+
 void testDeviceValidationMessageNamesWhatTheMacHas() {
   require(!device().validationMessage(),
           "the reference device has a validation message");
@@ -359,6 +368,7 @@ int main() {
     testModelProvidedKvGeometry();
     testExtentSizeFollowsThePool();
     testDeviceValidationNamesTheMacosFloor();
+    testDeviceValidationNamesTheThreadgroupWidth();
     testDeviceValidationMessageNamesWhatTheMacHas();
     std::cout << "elastic memory plan tests passed\n";
     return EXIT_SUCCESS;

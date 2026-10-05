@@ -13,6 +13,7 @@
 #include "../../../runtime/model/WeightStore.hpp"
 #include "../../../runtime/ops/ExecutionPlans.hpp"
 #include "../../../runtime/ops/MoE.hpp"
+#include "metal/abi/Linear.h"
 #include "metal/abi/MoE.h"
 
 #import <Foundation/Foundation.h>
@@ -72,7 +73,11 @@ constexpr uint32_t kGpuCores = 20;
 // Covers both router tiles: 8-row tiles below 520 rows and 32-row tiles with
 // a ragged 8-row tail from there.
 constexpr uint32_t kMaximumRows = 520;
-constexpr uint32_t kStorageColumns = 256;
+// The router's rows are the expert slots, which each input row's scores
+// fill; its Q8 planes hold them as one storage tile, and the shared scalar
+// gate pads its one row to a tile.
+constexpr uint32_t kExpertSlots = SPLASH_MOE_EXPERT_SLOTS;
+constexpr uint32_t kStorageColumns = SPLASH_AFFINE_TILE_ROWS;
 
 [[noreturn]] void fail(const std::string &message) {
   std::cerr << "FAIL: " << message << '\n';
@@ -114,10 +119,10 @@ MetalBuffer shared(MetalBackend &backend, uint64_t bytes, const char *label) {
 
 float bf16(float value) { return float(__bf16(value)); }
 
-// One expert's Q4 slab in the packed 256-column storage order:
+// One expert's Q4 slab in the packed storage tile order:
 // [weights][scales][biases], the parameter of output n and quant group g at
-// (tile(n) * groups + g) * 256 + n % 256 and its 64 nibbles right after the
-// previous column's.
+// (tile(n) * groups + g) * kStorageColumns + n % kStorageColumns and its 64
+// nibbles right after the previous column's.
 struct ExpertSlab final {
   std::vector<uint8_t> nibbles; // [n][k] dequantized as q * scale + bias
   std::vector<float> scales;    // [parameter]
@@ -195,11 +200,12 @@ float silu(float value) { return value / (1.0F + std::exp(-value)); }
 // routing distribution through the production router without CPU routing
 // injection. The shared gate remains a scalar bias-only Q8 projection.
 Q8Projection fixtureRouter(MetalBackend &backend, bool sharedGate) {
-  const uint64_t elements = uint64_t{kStorageColumns} * kHidden;
+  const uint32_t outputs = sharedGate ? kStorageColumns : kExpertSlots;
+  const uint64_t elements = uint64_t{outputs} * kHidden;
   Q8Projection projection{{shared(backend, elements, "moe-router-weights"),
                            shared(backend, elements / 32, "moe-router-scales"),
                            shared(backend, elements / 32, "moe-router-biases")},
-                          kStorageColumns, kHidden};
+                          outputs, kHidden};
   if (!sharedGate) {
     auto *weights = static_cast<uint8_t *>(projection.planes.weights.contents());
     auto *scales = static_cast<__bf16 *>(projection.planes.scales.contents());
@@ -385,7 +391,7 @@ void check(const Fixture &fixture, uint32_t rows, uint32_t tileRows,
   const auto *groupedInput = static_cast<const uint8_t *>(
       fixture.buffers.scratch.groupedInput.contents());
   const uint64_t inputRowBytes = uint64_t{kHidden} * kBFloat16Bytes;
-  const uint64_t scoresBytes = uint64_t{rows} * kStorageColumns * sizeof(float);
+  const uint64_t scoresBytes = uint64_t{rows} * kExpertSlots * sizeof(float);
   for (uint32_t tile = 0; tile < *tileCount; ++tile) {
     const uint32_t liveRows = tiles[tile * 2 + 1];
     require(liveRows > 0 && liveRows <= tileRows,
@@ -517,7 +523,7 @@ void check(const Fixture &fixture, uint32_t rows, uint32_t tileRows,
 
 // Expert ids, route rows and grouped routes are uint32, routing weights fp32
 // and activations bf16. The grouped input first holds the router's fp32
-// scores, one kStorageColumns row per token.
+// scores, a row of expert slots per token.
 void checkPlan(const MoePlan &plan) {
   const auto shape = plan.shape();
   const uint64_t rows = plan.rows();
@@ -537,7 +543,7 @@ void checkPlan(const MoePlan &plan) {
               w.groupedRoutesBytes == grouped * sizeof(uint32_t) &&
               w.routeRowsBytes == routes * sizeof(uint32_t) &&
               w.groupedInputBytes == std::max<uint64_t>(grouped * shape.hiddenSize * kBFloat16Bytes,
-                                                        rows * kStorageColumns * sizeof(float)) &&
+                                                        rows * kExpertSlots * sizeof(float)) &&
               w.expertIntermediateBytes == grouped * shape.expertIntermediateSize * kBFloat16Bytes &&
               w.expertOutputBytes == grouped * outputWidth * kBFloat16Bytes && w.groupedSumsBytes == 0,
           "plan workspace disagrees with independent geometry bound");
@@ -666,7 +672,7 @@ void checkEncoding(const CommandGraph &graph, const MoePlan &plan) {
   }
   require(dispatches[0].threadgroups.x ==
                   (plan.rows() + route.rows - 1) / route.rows &&
-              dispatches[0].threadgroups.y == kStorageColumns / route.experts &&
+              dispatches[0].threadgroups.y == kExpertSlots / route.experts &&
               dispatches[1].threadgroups.x == plan.rows() &&
               dispatches[3].threadgroups.x == plan.maximumTiles() && tileGrids &&
               dispatches[combine].threadgroups.x == plan.rows(),
@@ -680,50 +686,69 @@ void bufferBounds(MetalBackend &backend, Fixture &fixture) {
   for (const MoePlan &plan : {shipped.moePrefill(fixture.shape, 33),
                               shipped.moeDecode(fixture.shape, 4)}) {
     allocateScratch(backend, fixture, plan);
-    const auto rejectWeights = [&](const MoeWeights &weights, const char *label) {
+    const auto rejectWeights = [&](const MoeWeights &weights, const std::string &refusal, const char *label) {
       CommandGraph graph;
-      rejects([&] { MoE::add(graph, fixture.buffers, weights, plan); },
-              "MoE weights do not match execution shape", std::string(label) + " was accepted");
+      rejects([&] { MoE::add(graph, fixture.buffers, weights, plan); }, refusal, std::string(label) + " was accepted");
       require(graph.empty(), "invalid weights partially encoded MoE");
     };
-    for (auto projection : {&splash::ops::AffineMoeWeights::router, &splash::ops::AffineMoeWeights::sharedScalarGate}) {
-      for (auto field : {&splash::ops::AffineWeights::weights, &splash::ops::AffineWeights::scales,
-                         &splash::ops::AffineWeights::biases}) {
-        AffineMoeWeights shortWeights = fixture.weights.affine();
-        auto &buffer = (shortWeights.*projection).planes.*field;
-        buffer = backend.view(buffer, 0, buffer.sizeBytes() - 1);
-        rejectWeights(shortWeights, "undersized Q8 weight view");
-      }
+    // Each weight buffer at its extent and one element short; `with` puts
+    // the buffer in the weights.
+    const auto requireWeightExtent = [&](const MetalBuffer &buffer, uint64_t bytes, uint64_t element,
+                                         const std::string &name, const auto &with) {
+      splash::test::requireExtent(backend, buffer, bytes, element, name,
+                                  [&](CommandGraph &graph, const MetalBuffer &view) {
+                                    AffineMoeWeights changed = fixture.weights.affine();
+                                    with(changed, view);
+                                    MoE::add(graph, fixture.buffers, changed, plan);
+                                  });
+    };
+    // The router's rows, the expert slots, and the shared scalar gate's one
+    // row padded to a storage tile: a byte per weight and a bf16 scale and
+    // bias per 64 weights.
+    for (const auto &[projection, name, rows] :
+         {std::tuple{&splash::ops::AffineMoeWeights::router, "MoE router", kExpertSlots},
+          std::tuple{&splash::ops::AffineMoeWeights::sharedScalarGate, "MoE shared scalar gate", kStorageColumns}}) {
+      const uint64_t q8Weights = uint64_t{rows} * kHidden;
+      for (const auto &[field, plane, bytes, element] :
+           {std::tuple{&splash::ops::AffineWeights::weights, " weight", q8Weights, uint64_t{1}},
+            std::tuple{&splash::ops::AffineWeights::scales, " scale", q8Weights / 32, uint64_t{2}},
+            std::tuple{&splash::ops::AffineWeights::biases, " bias", q8Weights / 32, uint64_t{2}}})
+        requireWeightExtent((fixture.weights.affine().*projection).planes.*field, bytes, element,
+                            std::string(name) + plane, [&](AffineMoeWeights &changed, const MetalBuffer &view) {
+                              (changed.*projection).planes.*field = view;
+                            });
     }
-    for (auto member : {&splash::ops::AffineMoeWeights::expertGate, &splash::ops::AffineMoeWeights::expertUp,
-                        &splash::ops::AffineMoeWeights::expertDown, &splash::ops::AffineMoeWeights::sharedGate,
-                        &splash::ops::AffineMoeWeights::sharedUp, &splash::ops::AffineMoeWeights::sharedDown}) {
+    // The expert slabs, each its Q4 weights, then a bf16 scale and bias per
+    // 64, up to the last slab's biases.
+    for (const auto &[member, name] :
+         {std::pair{&splash::ops::AffineMoeWeights::expertGate, "MoE expert gate"},
+          std::pair{&splash::ops::AffineMoeWeights::expertUp, "MoE expert up"},
+          std::pair{&splash::ops::AffineMoeWeights::expertDown, "MoE expert down"},
+          std::pair{&splash::ops::AffineMoeWeights::sharedGate, "MoE shared gate"},
+          std::pair{&splash::ops::AffineMoeWeights::sharedUp, "MoE shared up"},
+          std::pair{&splash::ops::AffineMoeWeights::sharedDown, "MoE shared down"}}) {
       const auto &source = fixture.weights.affine().*member;
       const uint64_t payload = q4PackedBytes(source.outputSize, source.inputSize);
+      requireWeightExtent(source.packed, uint64_t{source.experts} * payload, 2, name,
+                          [&](AffineMoeWeights &changed, const MetalBuffer &view) { (changed.*member).packed = view; });
       AffineMoeWeights changed = fixture.weights.affine();
       auto &projection = changed.*member;
-      projection.packed = backend.view(source.packed, 0, payload - 1);
-      rejectWeights(changed, "undersized expert payload");
-      projection.packed = source.packed;
       for (uint64_t stride : {uint64_t{0}, payload - 2, payload + 1}) {
         projection.expertStrideBytes = stride;
-        rejectWeights(changed, "invalid expert stride");
+        rejectWeights(changed, std::string(name) + " does not match the plan", "invalid expert stride");
       }
       if (source.experts > 1) {
         projection.expertStrideBytes = std::numeric_limits<uint64_t>::max() - 1;
-        rejectWeights(changed, "overflowing final expert boundary");
+        rejectWeights(changed, std::string(name) + " buffer holds", "overflowing final expert boundary");
       }
       // A padded stride is legal. Only the last expert's payload must fit;
       // padding after that payload is never addressed by the shader.
-      projection.expertStrideBytes = payload + 2;
-      const uint64_t bytes = uint64_t{source.experts - 1} *
-                                 projection.expertStrideBytes + payload;
-      projection.packed = shared(backend, bytes, "moe-padded-expert-bound");
-      CommandGraph graph;
-      MoE::add(graph, fixture.buffers, changed, plan);
-      checkEncoding(graph, plan);
-      projection.packed = backend.view(projection.packed, 0, bytes - 1);
-      rejectWeights(changed, "undersized final expert boundary");
+      const uint64_t stride = payload + 2, bytes = uint64_t{source.experts - 1} * stride + payload;
+      requireWeightExtent(shared(backend, bytes, "moe-padded-expert-bound"), bytes, 2, name,
+                          [&](AffineMoeWeights &padded, const MetalBuffer &view) {
+                            (padded.*member).packed = view;
+                            (padded.*member).expertStrideBytes = stride;
+                          });
     }
     splash::test::requireMoeExtents(backend, fixture.buffers, fixture.weights, plan);
   }
@@ -742,11 +767,11 @@ void bufferBounds(MetalBackend &backend, Fixture &fixture) {
 // A dense random Q8 router: the routing fixture's one-weight experts cannot
 // expose accumulation-order differences between the scores tiles.
 Q8Projection randomRouter(MetalBackend &backend, Random &random) {
-  const uint64_t elements = uint64_t{kStorageColumns} * kHidden;
+  const uint64_t elements = uint64_t{kExpertSlots} * kHidden;
   Q8Projection projection{{shared(backend, elements, "dense-router-weights"),
                            shared(backend, elements / 32, "dense-router-scales"),
                            shared(backend, elements / 32, "dense-router-biases")},
-                          kStorageColumns, kHidden};
+                          kExpertSlots, kHidden};
   auto *weights = static_cast<uint8_t *>(projection.planes.weights.contents());
   auto *scales = static_cast<__bf16 *>(projection.planes.scales.contents());
   auto *biases = static_cast<__bf16 *>(projection.planes.biases.contents());
@@ -769,7 +794,7 @@ void routerTiles(MetalBackend &backend, const Fixture &fixture) {
   const auto *weights = static_cast<const uint8_t *>(router.planes.weights.contents());
   const auto *scales = static_cast<const __bf16 *>(router.planes.scales.contents());
   const auto *biases = static_cast<const __bf16 *>(router.planes.biases.contents());
-  const uint64_t scoreBytes = uint64_t{kMaximumRows} * kStorageColumns * 4;
+  const uint64_t scoreBytes = uint64_t{kMaximumRows} * kExpertSlots * 4;
   MetalBuffer narrow = shared(backend, scoreBytes, "scores-m8");
   MetalBuffer wide = shared(backend, scoreBytes, "scores-m32");
   for (const uint32_t rows : {8U, 33U, kMaximumRows}) {
@@ -778,19 +803,19 @@ void routerTiles(MetalBackend &backend, const Fixture &fixture) {
     graph.add("moe_route_scores_q8_m8",
               {fixture.buffers.input, router.planes.weights, router.planes.scales,
                router.planes.biases, narrow},
-              params, {(rows + 7) / 8, kStorageColumns / 32, 1});
+              params, {(rows + 7) / 8, kExpertSlots / 32, 1});
     graph.add("moe_route_scores_q8_m32",
               {fixture.buffers.input, router.planes.weights, router.planes.scales,
                router.planes.biases, wide},
-              params, {(rows + 31) / 32, kStorageColumns / 128, 1});
+              params, {(rows + 31) / 32, kExpertSlots / 128, 1});
     (void)backend.submitCommandAsync(graph.dispatches()).wait();
     const std::string label = "router tiles rows=" + std::to_string(rows);
     require(std::memcmp(narrow.contents(), wide.contents(),
-                        uint64_t{rows} * kStorageColumns * 4) == 0,
+                        uint64_t{rows} * kExpertSlots * 4) == 0,
             label + ": 8-row and 32-row tiles disagree");
     const auto *values = static_cast<const float *>(narrow.contents());
     for (uint32_t row = 0; row < rows; ++row) {
-      for (uint32_t expert = 0; expert < kStorageColumns; ++expert) {
+      for (uint32_t expert = 0; expert < kExpertSlots; ++expert) {
         double reference = 0;
         double magnitude = 0;
         for (uint32_t g = 0; g < kHidden / 64; ++g) {
@@ -805,7 +830,7 @@ void routerTiles(MetalBackend &backend, const Fixture &fixture) {
             magnitude += std::abs(x) * (q * std::abs(scale) + std::abs(bias));
           }
         }
-        const float value = values[uint64_t{row} * kStorageColumns + expert];
+        const float value = values[uint64_t{row} * kExpertSlots + expert];
         require(std::isfinite(value) &&
                     std::abs(value - reference) <=
                         std::ldexp(magnitude * kHidden, -24),

@@ -24,6 +24,20 @@
 #define SPLASH_DRAFT_ATTENTION_ROWS                                            \
   (SPLASH_DRAFT_QUERY_HEADS / SPLASH_DRAFT_KV_HEADS * SPLASH_DRAFT_QUERY_ROWS)
 
+// The dynamic convolutions of a draft layer (draft_conv), each run in two
+// stages, before its attention or MLP and after it with the residual: a
+// stage weighs a channel's row and the row before it, its two taps, each by
+// a base weight plus the dynamic weight of the channel's group of 16
+// channels. The draft projects every row's dynamic weights, for each stage,
+// tap and group of a `hidden`-wide layer.
+#define SPLASH_DRAFT_CONVOLUTION_STAGES 2u
+#define SPLASH_DRAFT_CONVOLUTION_TAPS 2u
+#define SPLASH_DRAFT_CONVOLUTION_GROUP 16u
+inline constexpr uint32_t draft_dynamic_width(uint32_t hidden) {
+  return SPLASH_DRAFT_CONVOLUTION_STAGES * SPLASH_DRAFT_CONVOLUTION_TAPS *
+         (hidden / SPLASH_DRAFT_CONVOLUTION_GROUP);
+}
+
 // The batched draft kernels' grids cover exactly the dispatch's lanes:
 // per-lane arrays hold those lanes, and entries past them are zero and unread.
 
