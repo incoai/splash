@@ -306,7 +306,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
           model::SlotFile::slotBytesFor(stateBytes), diskBudget);
     } catch (const std::exception &error) {
       diskBudget.reset();
-      logLine("Cache disk tier disabled (", error.what(),
+      logLine("SSD cache disabled (", error.what(),
               "); no state staging is set aside.");
     }
   }
@@ -339,7 +339,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
       throw RuntimeResourcesError(
           RuntimeResourceStage::MemoryPlanning,
           "model weights with the runtime reserves, one lane's state, the KV "
-          "runway and any disk tier state staging require " +
+          "runway and any SSD cache state staging require " +
               std::to_string(requiredBytes) +
               " bytes but the Metal memory budget is " +
               std::to_string(hardBudgetBytes) + " bytes",
@@ -467,8 +467,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
             *kvPages, persistentCache.kv
                           ? persistentCache.kv
                           : std::make_shared<model::SlotFile>(slotBytes, diskBudget));
-        logLine(persistentCache.directory ? "Persistent cache tier: " : "Cache disk tier: ",
-                config.maximumCacheDiskBytes / kMiB, " MiB for KV pages of ",
+        logLine("SSD cache: ", config.maximumCacheDiskBytes / kMiB, " MiB for KV pages of ",
                 slotBytes / 1024, " KiB and states of ", stateBytes / kMiB,
                 " MiB; a state's write stages through ", stateStagingBytes / kMiB,
                 " MiB of the memory plan.");
@@ -477,7 +476,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
         // would keep or replace their copies.
         if (persistentCache.directory)
           throw;
-        logLine("Cache disk KV storage disabled; state storage remains enabled (",
+        logLine("SSD cache KV storage disabled; state storage remains enabled (",
                 error.what(), ").");
       }
     }

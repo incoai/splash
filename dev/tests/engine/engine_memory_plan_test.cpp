@@ -163,7 +163,7 @@ void testUserCeilingAndFailure() {
 void testDiskTierStateStagingIsBudgeted() {
   const EngineMemoryPlan without = test::requireMemoryPlan(device(), model());
   ModelMemoryProfile tiered = model();
-  // One Qwen3.8-27B state (DEVELOPMENT.md, Disk cache).
+  // One Qwen3.8-27B state (DEVELOPMENT.md, SSD cache).
   const uint64_t staging = 187 * kMiB;
   tiered.footprint.stateStagingBytes = staging;
   const EngineMemoryPlan with = test::requireMemoryPlan(device(), tiered);
@@ -189,7 +189,7 @@ void testDiskTierStateStagingIsBudgeted() {
   require(with.toStatusJson().find(field + ",\"fixed_runtime_bytes\"") !=
                   std::string::npos &&
               with.toStatusJson().find(field + "}}") != std::string::npos &&
-              budget.describe().find("disk tier state staging: " +
+              budget.describe().find("SSD cache state staging: " +
                                      std::to_string(staging)) != std::string::npos,
           "state staging is missing from the memory plan status");
   require(without.breakdown().stateStagingBytes == 0 &&

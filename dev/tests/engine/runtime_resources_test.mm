@@ -1,6 +1,7 @@
 #include "TestChecks.hpp"
 #include "TestFiles.hpp"
 #include "TestPackage.hpp"
+#include "TestStderr.hpp"
 #include "engine/Bootstrap.hpp"
 #include "engine/RuntimeResources.hpp"
 #include "engine/Engine.hpp"
@@ -180,7 +181,8 @@ void testWeightBudgetBeforeLoading(const char *metallibPath) {
 
 // A state's write to the disk tier stages through a state-sized buffer the
 // plan sets aside only when the tier starts: a quota that holds no state
-// leaves the tier off and the budget to KV.
+// leaves the tier off and the budget to KV. The notice and the refusal name
+// the tier as users know it, the SSD cache.
 void testStateStagingNeedsAStartedTier(const char *metallibPath) {
   TemporaryModelRoot root;
   RuntimeResourcesConfig config = budgetConfig(metallibPath, root);
@@ -188,8 +190,12 @@ void testStateStagingNeedsAStartedTier(const char *metallibPath) {
   const uint64_t stateBytes = config.model.stateLayout.cachedBytes();
   config.maximumMemoryBytes = minimum;
   config.maximumCacheDiskBytes = stateBytes - 1;
-  requireReachesModelLoader(config, root.path,
-                            "a quota that holds no state set staging aside");
+  const std::string notice = test::capturedStderr([&] {
+    requireReachesModelLoader(config, root.path,
+                              "a quota that holds no state set staging aside");
+  });
+  require(notice.find("SSD cache disabled (") != std::string::npos,
+          "the notice of a quota that holds no state did not name the SSD cache");
 
   config.maximumCacheDiskBytes = stateBytes;
   try {
@@ -199,9 +205,10 @@ void testStateStagingNeedsAStartedTier(const char *metallibPath) {
     require(error.failure() == RuntimeResourceFailure::EngineCapacity &&
                 error.stage() == RuntimeResourceStage::MemoryPlanning &&
                 std::string_view(error.what())
-                        .find("require " + std::to_string(minimum + stateBytes) +
+                        .find("SSD cache state staging require " +
+                              std::to_string(minimum + stateBytes) +
                               " bytes") != std::string_view::npos,
-            "a started tier's staging was not counted before loading");
+            "a started tier's staging was not counted by name before loading");
   }
   config.maximumMemoryBytes = minimum + stateBytes;
   requireReachesModelLoader(config, root.path,
@@ -377,9 +384,14 @@ void testFailedStepIsNamed(const char *metallibPath) {
   const auto host = [&](uint64_t available) {
     config.hostAvailableMemory = [available] { return std::optional<uint64_t>(available); };
   };
-  // Nothing but the host refuses this model.
+  // Nothing but the host refuses this model. The suite's one complete start
+  // also reports the SSD cache a disk quota gives it, by that name.
   host(64 * kGiB);
-  static_cast<void>(RuntimeResources::create(config));
+  config.maximumCacheDiskBytes = kGiB;
+  require(test::capturedStderr([&] { static_cast<void>(RuntimeResources::create(config)); })
+                  .find("SSD cache: 1024 MiB for KV pages of ") != std::string::npos,
+          "a start did not report its SSD cache by that name");
+  config.maximumCacheDiskBytes = 0;
   const auto failure = [&](uint64_t available) {
     host(available);
     try {

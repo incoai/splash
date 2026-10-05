@@ -36,9 +36,9 @@ Loading changes layout, never values:
   GDN layers differs by at most one float ULP from the package's MLX
   exponential; the adapter computes `float(-exp(double(A_log)))`, and the
   source oracle allows at most two ULP in that section.
-- GGUF: the bounded repack of all eight supported formats, with multiple row
-  tiles, wide rows, head permutations and offsets above 4 GiB, matches the CPU
-  reference bytewise on the M3 Max and the M5 Pro.
+- GGUF: the bounded repack of all eight formats supported then, with multiple
+  row tiles, wide rows, head permutations and offsets above 4 GiB, matches the
+  CPU reference bytewise on the M3 Max and the M5 Pro.
 - Vision: every source is written into the packed `vision/model.bin`, padding
   included.
 

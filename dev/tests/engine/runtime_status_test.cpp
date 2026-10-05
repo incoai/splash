@@ -1,15 +1,12 @@
 #include "TestChecks.hpp"
 #include "TestModel.hpp"
+#include "TestStderr.hpp"
 #include "engine/RuntimeResources.hpp"
 #include "StderrLine.hpp"
 #include "engine/Status.hpp"
 
-#include <unistd.h>
-
-#include <cstdio>
 #include <cstdlib>
 #include <fstream>
-#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <iterator>
@@ -25,6 +22,7 @@ using namespace splash::engine;
 
 namespace {
 
+using splash::test::capturedStderr;
 using splash::test::require;
 
 EngineMemoryPlan plan() {
@@ -524,23 +522,6 @@ void testWeightsStatus() {
                   .find("\"weights\":{\"idle_release_seconds\":null,\"released\":false,"
                         "\"restores\":0}") != std::string::npos,
           "an idle release that is off is not null");
-}
-
-// What `write` puts on stderr.
-std::string capturedStderr(const std::function<void()> &write) {
-  std::FILE *log = std::tmpfile();
-  require(log != nullptr, "no temporary file");
-  const int saved = ::dup(STDERR_FILENO);
-  ::dup2(::fileno(log), STDERR_FILENO);
-  write();
-  ::dup2(saved, STDERR_FILENO);
-  ::close(saved);
-  std::rewind(log);
-  std::ostringstream text;
-  for (int character; (character = std::fgetc(log)) != EOF;)
-    text.put(static_cast<char>(character));
-  std::fclose(log);
-  return text.str();
 }
 
 // The server and the runtime share stderr, as `serve > log 2>&1` does: a

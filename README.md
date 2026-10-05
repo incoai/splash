@@ -40,7 +40,7 @@ For LM Studio Bionic, follow its [Splash setup guide](https://lmstudio.ai/blog/s
 ## Use the API
 
 OpenAI Chat Completions, Responses and Completions, and Anthropic Messages,
-with streaming, tool calls, JSON Schema output, images, and inline PDFs:
+with streaming, tool calls, JSON Schema output, and base64 images and PDFs:
 
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions \
@@ -51,10 +51,11 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   }'
 ```
 
-Reasoning follows the model default; `"reasoning_effort": "none"` turns it off.
+Reasoning follows the model default; `"reasoning_effort": "none"` turns it off
+in Chat. Anthropic Messages requests reason only when they set `thinking`.
 [Reasoning settings](DEVELOPMENT.md#default-reasoning-effort) ·
 [Tool calls](DEVELOPMENT.md#tool-calls) ·
-[API details](DEVELOPMENT.md#code-and-api-boundaries)
+[API details](DEVELOPMENT.md#api)
 
 ## Models
 
@@ -70,7 +71,8 @@ Unsloth GGUF variants span **1–8 bits**, including mixed-precision UD formats;
 `UD-Q8_K_XL` and BF16 targets are not supported.
 [Prism ML Ternary Bonsai 2](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf)
 is also supported in PQ2_0 (7.2 GB), including vision. Pass `OWNER/REPO:VARIANT`
-to `--model`, as in the quick start. Smaller variants run on
+to `--model`, as in the quick start. MLX targets must be affine 4-bit with
+groups of 64, like the examples. Smaller variants run on
 [24 GB Macs](docs/performance.md#smaller-ggufs-on-24-gb-macs).
 [27B variants](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/tree/main) ·
 [35B variants](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/tree/main)
@@ -88,11 +90,11 @@ window. To set your own limits or cache options, add these to `splash serve`:
 | --- | --- |
 | `--max-memory 28G` | Cap Metal memory use. |
 | `--idle-release off` | Keep the model in memory while idle (default: release after 10m). |
-| `--max-context 100K` | Set the context limit. |
+| `--max-context 100K` | Lower the context limit. |
 | `--language-only` | Skip vision; serve text only. |
 | `--kv-format bf16` | Use BF16 KV cache. Default: 8-bit (INT8). |
-| `--max-cache-disk 16G` | Offload KV cache and GDN states to SSD as needed. Off by default. |
-| `--persistent-cache` | Keep the SSD cache across restarts. Off by default. |
+| `--max-cache-disk 16G` | Keep cached prompts on SSD when memory runs short. Off by default. |
+| `--persistent-cache` | Keep the SSD cache across restarts; needs `--max-cache-disk`. Off by default. |
 
 Use `--max-memory` to leave room for other applications.
 The server listens on localhost without authentication by default. For LAN
@@ -100,11 +102,11 @@ access, authentication, browser apps on other origins, and other options, see
 [server configuration](DEVELOPMENT.md#server-configuration) or
 `splash serve --help`.
 [KV precision](DEVELOPMENT.md#kv-cache-precision) ·
-[SSD cache](DEVELOPMENT.md#disk-cache)
+[SSD cache](DEVELOPMENT.md#ssd-cache)
 
 ## Performance
 
-Measured on an M5 Pro (16-core GPU, 48 GB), using the Splash
+Measured with Splash 1.0 on an M5 Pro (16-core GPU, 48 GB), using its model
 packages and selected SPEED-Bench coding prompts over HTTP. Ratios compare
 with the next-fastest engine measured in that benchmark.
 
@@ -123,7 +125,7 @@ with the next-fastest engine measured in that benchmark.
 
 Same Unsloth UD-Q4_K_M weights on Metal. Decode speed in tok/s:
 
-| Model | Engine | M5 Pro | M3 Max |
+| Model | Engine | M5 Pro, 20-core GPU | M3 Max, 40-core GPU |
 | --- | --- | ---: | ---: |
 | 27B | llama.cpp | 16 | 17 |
 | | llama.cpp with MTP | 27 | 20 |
@@ -155,7 +157,7 @@ ship precompiled, with no Xcode or local tuning required.
 
 ## More
 
-- [Development](DEVELOPMENT.md): build from source, architecture, tests, and releases.
+- [Development](DEVELOPMENT.md): configuration, API, internals, building, and testing.
 - [Issues and feedback](https://github.com/incoai/splash/issues)
 - [Apache-2.0](LICENSE). GGUF kernels include MIT-licensed material from
   llama.cpp; see [third-party notices](THIRD_PARTY_NOTICES). Model weights keep their own licenses.

@@ -62,9 +62,10 @@ with the MTP draft Unsloth ships:
 | Qwen3.8-27B · llama.cpp with MTP | 27 | 20 |
 
 Splash decodes 2.5–3.2× as fast as llama.cpp on the 35B and 4.5–5.3× on
-the 27B (2.7–4.6× against its MTP). Prefilling a 2,048-token chunk, it runs
-at 559 tok/s against 374 on the 27B and 3,662 against 1,968 on the 35B on
-the M5 Pro, and at 245 against 193 and 1,814 against 1,575 on the M3 Max.
+the 27B (2.7–4.6× against its MTP); the ratios are of the unrounded rates.
+Prefilling a 2,048-token chunk, it runs at 559 tok/s against 374 on the 27B
+and 3,662 against 1,968 on the 35B on the M5 Pro, and at 245 against 193 and
+1,814 against 1,575 on the M3 Max.
 
 ## Smaller GGUFs on 24 GB Macs
 
@@ -87,9 +88,9 @@ room. A request that cannot get memory waits for it, then fails with
 `resource_timeout`: close memory-heavy applications, or serve with
 `--language-only`. Critical memory pressure can suspend a long request. Startup
 suggests `--max-cache-disk` when memory may not hold the advertised context.
-The tier then writes whenever memory runs short: serving Ternary-Bonsai-2-27B
-PQ2_0 to six clients' mixed traffic for 30 minutes, a 16 GiB tier on the M6
-wrote 26 GB, about 50 GB an hour, and read 36 GB.
+The SSD cache then writes whenever memory runs short: serving
+Ternary-Bonsai-2-27B PQ2_0 to six clients' mixed traffic for 30 minutes, a
+16 GiB SSD cache on the M6 wrote 26 GB, about 50 GB an hour, and read 36 GB.
 
 See [the low-bit GGUF measurements](https://github.com/incoai/splash/pull/160)
 for the workloads, memory pressure, SSD settings and limitations, and

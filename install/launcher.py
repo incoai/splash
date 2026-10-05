@@ -371,7 +371,7 @@ def parse_args(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Quick start:\n"
-            "  splash serve --model mlx-community/Qwen3.8-27B-4bit\n"
+            "  splash serve --model unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M\n"
             "  splash opencode  # in another terminal, after Ready\n\n"
             "Use splash serve --help for server settings. Client arguments,\n"
             "including --help, are passed through to the installed agent."
@@ -386,46 +386,57 @@ def parse_args(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  splash serve --model mlx-community/Qwen3.8-27B-4bit\n"
+            "  splash serve --model unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M\n"
             "  splash serve --model unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M --max-context 128K\n\n"
-            "After Ready, open http://127.0.0.1:8000 or connect an installed agent.\n"
-            "The startup summary and /status report the effective context limit.\n"
-            "A client may impose a smaller limit. Keep this terminal open; Ctrl+C stops serving."
+            "SIZE is bytes, or a number with K, M or G (1024-based), such as 28G.\n"
+            "DURATION is seconds, or a number with s, m or h, such as 30m.\n\n"
+            "After Ready, open http://127.0.0.1:PORT in a browser on this Mac, or\n"
+            "connect an installed agent; both reach the server on loopback, which\n"
+            "the default --host and 0.0.0.0 include. The startup summary and\n"
+            "/status report the effective context limit; a client may impose a\n"
+            "smaller one. Keep this terminal open; Ctrl+C stops serving."
         ),
     )
-    server.add_argument(
-        "--port",
-        type=_parse_port,
-        default=os.environ.get("SPLASH_PORT", str(PORT)),
-        help="HTTP port (default: SPLASH_PORT or 8000)",
-    )
-    server.add_argument(
+    # The launcher's own options join the shared options' groups: the model
+    # options first, --port among the network options.
+    groups = serve_options.option_groups(server)
+    model = groups["model"]
+    model.add_argument(
         "--model",
         type=model_artifacts.parse_model_id,
         required=True,
         metavar="OWNER/REPO[:VARIANT]",
         help="upstream Hugging Face model, with a GGUF variant after ':' (e.g. :UD-Q4_K_M)",
     )
-    server.add_argument(
+    model.add_argument(
         "--revision",
-        help="optional model branch, tag or commit (default: repository default)",
+        metavar="REVISION",
+        help="model branch, tag or commit (default: the repository's default branch)",
     )
-    server.add_argument(
+    model.add_argument(
         "--draft-model",
         type=model_artifacts.parse_draft_model,
-        help="override the automatically selected DFlash2 repository or local directory",
+        metavar="DRAFT",
+        help="DFlash2 draft repository or local directory to use instead of the "
+        "automatically selected one",
     )
-    server.add_argument(
+    model.add_argument(
         "--language-only",
         action="store_true",
-        help="skip vision preparation and loading",
+        help="skip vision preparation and loading; image and PDF input is refused",
     )
-    server.add_argument(
+    model.add_argument(
         "--offline",
         action="store_true",
         help="start the installed model without contacting the Hugging Face Hub (as HF_HUB_OFFLINE=1)",
     )
-    serve_options.add_serve_arguments(server)
+    groups["network"].add_argument(
+        "--port",
+        type=_parse_port,
+        default=os.environ.get("SPLASH_PORT", str(PORT)),
+        help="HTTP port (default: SPLASH_PORT or 8000)",
+    )
+    serve_options.add_serve_arguments(server, groups)
     for name in clients.INSTALL_URLS:
         commands.add_parser(name, help=f"connect {name} to the running server")
     args = parser.parse_args(argv)

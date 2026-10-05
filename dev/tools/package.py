@@ -153,7 +153,7 @@ class Splash < Formula
   def caveats
     <<~CAVEAT
       Serve a model:
-        splash serve --model mlx-community/Qwen3.8-27B-4bit
+        splash serve --model unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M
     CAVEAT
   end
 

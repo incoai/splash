@@ -109,7 +109,7 @@ void testUnreportedAllocationsCountAgainstReserves() {
 // audit bounds it by that plan: it is neither charged to the reserves nor
 // counted a second time beside the backend's peak that includes it.
 void testStateStagingHasItsOwnBound() {
-  // One Qwen3.8-27B state (DEVELOPMENT.md, Disk cache).
+  // One Qwen3.8-27B state (DEVELOPMENT.md, SSD cache).
   const uint64_t staging = 187 * kMiB;
   const auto memoryPlan = plan(kGiB, staging);
   const auto &budget = memoryPlan.breakdown();
