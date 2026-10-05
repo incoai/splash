@@ -226,7 +226,7 @@ void Vision::encode(CommandGraph &graph, ImageGrid grid,
                scratch(Scratch::Values), scratch(Scratch::Attention)},
               attentionParams,
               {(tokens + kQueryTile - 1) / kQueryTile, layout.heads, 1});
-    graph.add("vision_attention_pack", {scratch(Scratch::Attention), context},
+    graph.add("vision_attention_gather", {scratch(Scratch::Attention), context},
               qkvParams, {tokens, 1, 1});
     addGemm(graph, "vision_gemm_m64n128_residual", context, block.projection, hidden,
             hidden, layout.hiddenSize, layout.hiddenSize, tokens, kGemmRowTile,

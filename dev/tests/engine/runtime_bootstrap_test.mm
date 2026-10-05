@@ -83,13 +83,13 @@ void testInstalledManifestBindsExecutionGeometry() {
   TemporaryModelRoot root;
   root.write(executionManifest());
   // The sources' identity is the digest of the record naming them.
-  const std::string sourceIdentity = model::inspectModelPackage(root.path()).sourceIdentity;
+  const std::string sourceIdentity = model::inspectModelRoot(root.path()).sourceIdentity;
   require(sourceIdentity == model::weightDigest(executionManifest()),
           "the sources' identity is not the manifest's digest");
 
   root.write(executionManifest(7));
   try {
-    static_cast<void>(model::inspectModelPackage(root.path()));
+    static_cast<void>(model::inspectModelRoot(root.path()));
     throw std::runtime_error("geometry mismatch was accepted");
   } catch (const std::invalid_argument &error) {
     require(std::string_view(error.what()).find("draft_query_rows") !=
@@ -98,7 +98,7 @@ void testInstalledManifestBindsExecutionGeometry() {
   }
 
   root.write(executionManifest(8, R"(,"description":"package metadata")"));
-  require(model::inspectModelPackage(root.path()).sourceIdentity != sourceIdentity,
+  require(model::inspectModelRoot(root.path()).sourceIdentity != sourceIdentity,
           "another manifest named the same sources");
 
   // The batch width, prefill budget, KV page and verify rows a package
@@ -114,7 +114,7 @@ void testInstalledManifestBindsExecutionGeometry() {
     retuned.replace(at, published.size(), other);
   }
   root.write(retuned);
-  static_cast<void>(model::inspectModelPackage(root.path()));
+  static_cast<void>(model::inspectModelRoot(root.path()));
 
   // A whole number written as a float, as Python writes 1e7, is that
   // integer; a fraction is not one.
@@ -124,11 +124,11 @@ void testInstalledManifestBindsExecutionGeometry() {
   require(rowsAt != std::string::npos, "test manifest lost draft rows");
   root.write(std::string(floatRows).replace(rowsAt, rows.size(),
                                             "\"draft_query_rows\":8.0,"));
-  static_cast<void>(model::inspectModelPackage(root.path()));
+  static_cast<void>(model::inspectModelRoot(root.path()));
   root.write(floatRows.replace(rowsAt, rows.size(),
                                "\"draft_query_rows\":8.5,"));
   try {
-    static_cast<void>(model::inspectModelPackage(root.path()));
+    static_cast<void>(model::inspectModelRoot(root.path()));
     throw std::runtime_error("fractional geometry was accepted");
   } catch (const std::invalid_argument &error) {
     require(std::string_view(error.what()).find("draft_query_rows") !=
@@ -143,7 +143,7 @@ void testInstalledManifestBindsExecutionGeometry() {
   missingGeometry.erase(field, requiredField.size());
   root.write(missingGeometry);
   try {
-    static_cast<void>(model::inspectModelPackage(root.path()));
+    static_cast<void>(model::inspectModelRoot(root.path()));
     throw std::runtime_error("missing geometry field was accepted");
   } catch (const std::invalid_argument &error) {
     require(std::string_view(error.what()).find("draft_sliding_window") !=
@@ -158,7 +158,7 @@ void testInstalledManifestBindsExecutionGeometry() {
                        "\"q4_storage_n\":128");
   root.write(wrongStorage);
   try {
-    static_cast<void>(model::inspectModelPackage(root.path()));
+    static_cast<void>(model::inspectModelRoot(root.path()));
     throw std::runtime_error("wrong Q4 storage was accepted");
   } catch (const std::invalid_argument &error) {
     require(std::string_view(error.what()).find("q4_storage_n") !=

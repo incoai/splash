@@ -16,7 +16,7 @@ struct PlannedCheckpoint;
 }
 
 // A DFlash2 checkpoint as its repository releases it, config.json and BF16
-// safetensors -> the packed draft files of a Splash package (DFlashDraft.cpp):
+// safetensors -> the draft files of a Splash package (DFlashDraft.cpp):
 // every projection quantized to affine Q4 as those drafts were, every other
 // tensor copied as stored. The checkpoint is planned once; each file is
 // written into memory when it is opened.

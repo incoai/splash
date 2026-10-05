@@ -152,7 +152,7 @@ private:
   void insertFree(uint32_t page) noexcept;
   void removeFree(uint32_t page) noexcept;
   [[nodiscard]] uint32_t popFree() noexcept;
-  [[nodiscard]] uint32_t packingExtent() noexcept;
+  [[nodiscard]] uint32_t fillingExtent() noexcept;
   void markUsed(uint32_t page) noexcept;
   void markFree(uint32_t page) noexcept;
   void setExtentAllocated(uint32_t extent, bool allocated) noexcept;
@@ -177,7 +177,7 @@ private:
   // The extent currently being filled. Stays valid while only this extent
   // changes, so a burst of allocations rescans the extents once per extent
   // it moves into.
-  uint32_t packingExtent_ = noIndex;
+  uint32_t fillingExtent_ = noIndex;
   IndexList reclaimableExtents_;
   uint32_t activePages_ = 0;
   uint32_t prefixPages_ = 0;

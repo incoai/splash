@@ -2,7 +2,7 @@
 #include "metal/kernels/common/gguf_sgmatrix.h"
 #include "metal/kernels/common/rms_inverse.h"
 
-// Every norm reads its weights in their stored type W: bfloat in the packed
+// Every norm reads its weights in their stored type W: bfloat in the affine
 // formats, float for a GGUF's F32 norms (the _f32 entry points). Both widen to
 // fp32 exactly, so W changes only the loads.
 //

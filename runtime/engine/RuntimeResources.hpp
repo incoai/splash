@@ -73,9 +73,9 @@ struct PersistentCacheFiles final {
   std::shared_ptr<model::SlotFile> states;
 };
 
-// The memory plan counts each weight category from the loaded package, so
+// The memory plan counts each weight category from the loaded model, so
 // every category the model has must report its allocation and identity.
-void requireLoadedModel(const model::ModelPackage &package);
+void requireLoadedModel(const model::LoadedModel &loaded);
 
 struct RuntimeResourcesConfig {
   kv::Format kvFormat = kv::Format::Int8;
@@ -157,7 +157,7 @@ private:
 
 // Owns every process-wide native resource exactly once. Members go in
 // reverse declaration order: Cache -> KV pool -> KV disk tier -> state
-// storage -> KV page storage -> governor -> model package -> Metal backend
+// storage -> KV page storage -> governor -> loaded model -> Metal backend
 // -> a persistent tier's directory, whose lock goes last. The KV disk tier
 // must go before the KV page storage: its IO worker reads and writes pages
 // in place in the extents, and its destructor waits for every transfer in
@@ -212,7 +212,7 @@ private:
 
   RuntimeResources(PersistentCacheFiles persistentCache,
                    std::unique_ptr<metal::MetalBackend> backend,
-                   model::ModelPackage model, ops::ExecutionPlans operators,
+                   model::LoadedModel model, ops::ExecutionPlans operators,
                    EngineMemoryPlan memoryPlan,
                    RuntimeCacheIdentity cacheIdentity,
                    std::unique_ptr<MemoryGovernor> memoryGovernor,
@@ -229,7 +229,7 @@ private:
 
   PersistentCacheFiles persistentCache_;
   std::unique_ptr<metal::MetalBackend> backend_;
-  model::ModelPackage model_;
+  model::LoadedModel model_;
   ops::ExecutionPlans operators_;
   EngineMemoryPlan memoryPlan_;
   RuntimeCacheIdentity cacheIdentity_;

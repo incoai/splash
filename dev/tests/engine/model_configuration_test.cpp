@@ -72,7 +72,7 @@ model::ModelDescriptor inspect(const SourceModel &model) {
   test::writeFile(root.path() / "model.json", model.record);
   test::writeFile(root.path() / "config.json", model.config);
   test::writeFile(root.path() / "draft" / "config.json", model.draft);
-  return model::inspectModelPackage(root.path());
+  return model::inspectModelRoot(root.path());
 }
 
 void refuses(const SourceModel &model, std::string_view error, const std::string &message) {
@@ -117,6 +117,21 @@ void testFamilies(const std::filesystem::path &fixtures) {
             "no supported model has this architecture (" + std::string(refused.difference) + ")" +
                 std::string(supported),
             "a config of another model was accepted with " + std::string(refused.to));
+}
+
+// A descriptor states where its weights come from: one that leaves either
+// source unset, which draftFromCheckpoint and hasVision would read as a
+// checkpoint draft and a vision tower, is not valid.
+void testSources() {
+  const auto described = [](model::TargetSource target, model::VisionSource vision) {
+    return model::makeModelDescriptor("sources", model::Qwen3_8Layout{}, model::kQwen3_8DraftLayout,
+                                      model::kQwen3_8VisionLayout, target, vision);
+  };
+  require(described(model::TargetSource::Mlx, model::VisionSource::None).valid(),
+          "a descriptor of its sources was not valid");
+  require(!described(model::TargetSource{}, model::VisionSource::None).valid() &&
+              !described(model::TargetSource::Mlx, model::VisionSource{}).valid(),
+          "a descriptor without a source was valid");
 }
 
 // Each config is checked where the descriptor is made, once, and each number
@@ -327,11 +342,12 @@ int main(int argc, char **argv) {
   try {
     if (argc != 2) throw std::invalid_argument("usage: model-configuration FIXTURES");
     testFamilies(argv[1]);
+    testSources();
     testOneRulePerValue(argv[1]);
     testQuantization(argv[1]);
     testVisionConfig(argv[1]);
     testConfigurationCheck(argv[1]);
-    std::cout << "model configuration: both families, one rule per value, quantization, vision, the "
+    std::cout << "model configuration: both families, sources, one rule per value, quantization, vision, the "
                  "installer's check PASS\n";
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';

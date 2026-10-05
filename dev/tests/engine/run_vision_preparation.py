@@ -1,5 +1,5 @@
 """Prepare tiny MLX and GGUF vision towers and compare them with an independently
-serialized packed file; check the exact-BF16 rule, that invalid sources fail
+serialized vision/model.bin; check the exact-BF16 rule, that invalid sources fail
 naming what is wrong, and that a padded section written after another keeps its
 padding zero."""
 
@@ -41,7 +41,7 @@ def encode(values, dtype):
 
 def fixture(root, source, shift=0, case=None):
     """Writes a tiny tower (depth 2, width 8, 2x2 patches) whose tensors cycle
-    through BF16, F16 and F32, and the packed file it must prepare."""
+    through BF16, F16 and F32, and the vision/model.bin it must prepare."""
     tensors = {}
     sections = []
 
@@ -59,8 +59,8 @@ def fixture(root, source, shift=0, case=None):
             values[5] = 1 + 2.0**-10
         if index == 0:
             # One patch row is [frame, patch-row, patch-col, channel] in MLX and
-            # [channel, patch-row, patch-col] per frame in GGUF. Packed rows are
-            # [channel, frame, patch-row, patch-col].
+            # [channel, patch-row, patch-col] per frame in GGUF. The image's rows
+            # are [channel, frame, patch-row, patch-col].
             def at(row, frame, pixel, channel):
                 return values[row * 24 + (frame * 4 + pixel) * 3 + channel]
 

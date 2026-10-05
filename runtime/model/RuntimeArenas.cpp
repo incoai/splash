@@ -59,11 +59,11 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
                          geometry.target.packedFullWidth));
   put(PrefillTensor::FullQueries,
       bytesFor<uint16_t>(uint64_t{geometry.target.attentionQueryHeads} *
-                         kPackedAttentionRows *
+                         kRaggedAttentionRows *
                          geometry.target.attentionHeadDimension));
   put(PrefillTensor::FullAttention,
       bytesFor<uint16_t>(uint64_t{geometry.target.attentionQueryHeads} *
-                         kPackedAttentionRows *
+                         kRaggedAttentionRows *
                          geometry.target.attentionHeadDimension));
   const ops::AttentionWorkspace attentionWorkspace =
       operators.prefillAttentionWorkspace(
@@ -109,11 +109,11 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
                       geometry.draftRotaryPairs()));
   put(PrefillTensor::ChunkKeys,
       bytesFor<uint16_t>(uint64_t{geometry.target.attentionKvHeads} *
-                         kPackedAttentionRows *
+                         kRaggedAttentionRows *
                          geometry.target.attentionHeadDimension));
   put(PrefillTensor::ChunkValues,
       bytesFor<uint16_t>(uint64_t{geometry.target.attentionKvHeads} *
-                         kPackedAttentionRows *
+                         kRaggedAttentionRows *
                          geometry.target.attentionHeadDimension));
   // The split partials and counters and the rotated rows of the largest
   // prefill plan.

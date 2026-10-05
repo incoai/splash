@@ -494,7 +494,7 @@ runDecodeThroughput(engine::Engine &engine, Driver &driver,
   // publishes the composite state there and splits its prefill around it, so
   // it would start decoding one command after the deduplicated lanes. Warm
   // the prefix with a one-token request; every lane then resumes from the
-  // published prefix in a single packed prefill and decodes in lockstep.
+  // published prefix in a single ragged prefill and decodes in lockstep.
   {
     EngineRequest warm;
     warm.id = requestId++;
@@ -792,7 +792,7 @@ int main(int argc, char **argv) {
     auto &config = bootstrapConfig.resources;
     config.metallibPath = std::filesystem::path(argv[1]);
     config.modelRoot = std::filesystem::path(argv[2]);
-    config.model = model::inspectModelPackage(config.modelRoot);
+    config.model = model::inspectModelRoot(config.modelRoot);
     config.buildId = SPLASH_BUILD_ID;
     const std::string modelRoot = config.modelRoot.string();
     const auto &capabilities = config.model.capabilities;

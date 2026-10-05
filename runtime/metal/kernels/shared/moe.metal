@@ -271,8 +271,8 @@ kernel void moe_route_scores_q8_m32(
 }
 
 // The shared expert's scalar gate weight of input `dimension`: the Q8 affine
-// row of a packed model, or the F32 tensor of a GGUF (ffn_gate_inp_shexp),
-// which runs unrounded.
+// row of a package or an MLX model, or the F32 tensor of a GGUF
+// (ffn_gate_inp_shexp), which runs unrounded.
 struct MoeSharedGateQ8 {
   device uint8_t *weights;
   device bfloat *scales;

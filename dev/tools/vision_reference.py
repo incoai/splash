@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""fp32 reference for the packed Qwen3.5 vision tower.
+"""fp32 reference for a Splash package's Qwen3.5 vision tower.
 
 This is the executable specification the native Metal encoder is graded
 against. It reads a runtime package's ``vision/model.bin`` (the padded engine
@@ -40,7 +40,7 @@ ROPE_THETA = 10000.0
 
 @dataclass(frozen=True)
 class VisionLayout:
-    """The packed tower's geometry, mirroring ``ops::VisionLayout``."""
+    """The tower's geometry, mirroring ``ops::VisionLayout``."""
 
     depth: int = 27
     hidden: int = 1152
@@ -54,7 +54,7 @@ class VisionLayout:
 
 
 def sections(layout: VisionLayout):
-    """(section name, shape) in the order the engine reads the pack."""
+    """(section name, shape) in the order the engine reads vision/model.bin."""
 
     def affine(name, out_size, in_size):
         yield name + ".weight", (out_size, in_size)
@@ -83,7 +83,7 @@ def bf16_to_f32(words: np.ndarray) -> np.ndarray:
     return (words.astype(np.uint32) << 16).view(np.float32)
 
 
-def load_pack(root: Path) -> tuple[VisionLayout, dict]:
+def load_package(root: Path) -> tuple[VisionLayout, dict]:
     """The package's vision layout and its fp32 weights by section name."""
     config = json.loads((root / "tokenizer" / "config.json").read_text())
     layout = VisionLayout(out_hidden=config["text_config"]["hidden_size"])
@@ -91,7 +91,7 @@ def load_pack(root: Path) -> tuple[VisionLayout, dict]:
     data = np.memmap(path, dtype=np.uint8, mode="r")
     magic, depth, kind = struct.unpack("<8sII", data[:16].tobytes())
     if magic != MAGIC or depth != layout.depth or kind != 0:
-        raise ValueError(f"invalid vision pack header: {path}")
+        raise ValueError(f"invalid vision file header: {path}")
     weights = {}
     offset = 16
     for name, shape in sections(layout):
@@ -101,7 +101,7 @@ def load_pack(root: Path) -> tuple[VisionLayout, dict]:
         weights[name] = bf16_to_f32(words).reshape(shape)
         offset += count * 2
     if -(-offset // legacy.ALIGNMENT) * legacy.ALIGNMENT != data.size:
-        raise ValueError(f"unexpected vision pack size: {path}")
+        raise ValueError(f"unexpected vision file size: {path}")
     return layout, weights
 
 
@@ -221,7 +221,7 @@ def encode(layout: VisionLayout, weights: dict, pixels: np.ndarray) -> np.ndarra
         normalized = layer_norm(
             x, weights[p + "norm2.weight"], weights[p + "norm2.bias"]
         )
-        # The pack pads the MLP width to 4352 with zero rows/columns; the
+        # vision/model.bin pads the MLP width to 4352 with zero rows/columns; the
         # padded activations are exactly zero and contribute nothing.
         hidden = linear(
             normalized,
@@ -252,7 +252,7 @@ def fixture_image(height: int = 96, width: int = 128) -> np.ndarray:
 
 
 def write_fixture(root: Path, out: Path, height: int = 96, width: int = 128) -> None:
-    layout, weights = load_pack(root)
+    layout, weights = load_package(root)
     pixels = fixture_image(height, width)
     expected = encode(layout, weights, pixels).astype(np.float32)
     out.mkdir(parents=True, exist_ok=True)

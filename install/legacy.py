@@ -1,4 +1,4 @@
-"""Legacy Splash packages: prebuilt packed weights published on the Hub with a
+"""Legacy Splash packages: prebuilt weight files published on the Hub with a
 manifest.json, which predate upstream loading and stay installable.
 
 A package is installed as a selection link to its verified Hub snapshot,
@@ -28,8 +28,8 @@ PACKAGE_TOKENIZER_FILES = {
 class PackageFormat(NamedTuple):
     schema_version: int
     target_layer_magic: str
-    # The layer files the format packs for the target and for the draft,
-    # one per layer of the family it packs (Qwen3.8-27B, Qwen3.6-35B-A3B).
+    # The layer files the format holds for the target and for the draft,
+    # one per layer of the family it holds (Qwen3.8-27B, Qwen3.6-35B-A3B).
     target_layers: int
     draft_layers: int
     # Manifest section -> the architecture it must declare.
@@ -74,7 +74,7 @@ def _validate_records(records, artifact_paths):
             and record["size"] % ALIGNMENT
         ):
             raise models.ModelError(
-                f"runtime package packed file is unaligned: {record['path']}"
+                f"runtime package weight file is unaligned: {record['path']}"
             )
         artifact_paths.add(record["path"])
 
@@ -103,9 +103,7 @@ def validate_manifest(path: Path):
         type(format_.get(key)) is not type(value) or format_[key] != value
         for key, value in expected_format.items()
     ):
-        raise models.ModelError(
-            "runtime package has an unsupported packed weight format"
-        )
+        raise models.ModelError("runtime package has an unsupported weight format")
     for key, architecture in layout.declarations.items():
         declaration = manifest.get(key)
         if (
@@ -153,7 +151,7 @@ def verify_artifacts(root: Path, manifest, *, full: bool):
             )
         if path.suffix == ".bin" and record["size"] % ALIGNMENT:
             raise models.ModelError(
-                f"installed packed file is unaligned: {record['path']}"
+                f"installed weight file is unaligned: {record['path']}"
             )
         if full and models.sha256(path) != record["sha256"].lower():
             raise models.ModelError(

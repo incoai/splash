@@ -73,7 +73,7 @@ void testAdmissionSharesDispatchOrderAndBudget() {
                               PrefillAdmission{4, 0}};
   require(scheduler.prefillAdmissionOrder(candidates) ==
               std::vector<uint64_t>({3, 4}),
-          "admission did not pack cached and short work ahead of cold work");
+          "admission did not take cached and short work ahead of cold work");
   scheduler.resourcesReady(3, 4096);
   scheduler.resourcesReady(4, 0);
   const auto plan = *scheduler.next({});
@@ -180,7 +180,7 @@ void testShortestRemainingFirstUsesActualRows() {
   scheduler.resourcesReady(3, 0);
   BatchPlan plan = *scheduler.next({});
   require(plan.kind == WorkKind::Prefill && plan.items.size() == 3,
-          "ragged prefill did not pack all ready sequences");
+          "ragged prefill did not batch all ready sequences");
   uint32_t rows = 0;
   for (const BatchItem &item : plan.items)
     rows += item.tokenCount;
@@ -720,7 +720,7 @@ void testMeasuredBudgetDoesNotCountBlockedPeers() {
           "queued or resource-blocked work reduced resident throughput");
 }
 
-void testMeasuredBudgetPreservesPurePrefillPacking() {
+void testMeasuredBudgetPreservesPurePrefillBatching() {
   engine::Scheduler scheduler(0.0);
   scheduler.submit(request(1, 20'000));
   scheduler.resourcesReady(1, 0);
@@ -734,7 +734,7 @@ void testMeasuredBudgetPreservesPurePrefillPacking() {
   require(plan.kind == WorkKind::Prefill && plan.width() == 2 &&
               plan.items[0].tokenCount == 32 &&
               plan.items[1].tokenCount == 2016,
-          "pure prefill contention lost throughput or stopped packing peers");
+          "pure prefill contention lost throughput or stopped batching peers");
 }
 
 void testTinyTailDoesNotDistortPrefillThroughput() {
@@ -781,7 +781,7 @@ void testMeasuredBudgetFinishesShortPrefillPromptly() {
 // At a measured 2.75 ms per row the slice is 128 rows. An arrival that
 // finishes within the full budget, though not within one slice, takes a
 // command of its own rows instead of a full one shared with a long prompt;
-// one that does not finish in it still packs a full command.
+// one that does not finish in it still takes a full command.
 void testShortArrivalBesideLongPrefillEndsAtItsLastRow() {
   const auto beside = [](std::initializer_list<uint32_t> arrivals) {
     Scheduler scheduler(0.0);
@@ -807,9 +807,9 @@ void testShortArrivalBesideLongPrefillEndsAtItsLastRow() {
               slice.items[0].tokenCount == 128,
           "the long prefill did not return to slices beside the decoding arrival");
 
-  const BatchPlan packed = *beside({3000}).next({});
-  require(packed.width() == 1 && packed.items[0].requestId == 2 &&
-              packed.items[0].tokenCount == 2048,
+  const BatchPlan full = *beside({3000}).next({});
+  require(full.width() == 1 && full.items[0].requestId == 2 &&
+              full.items[0].tokenCount == 2048,
           "an arrival that does not finish in one command lost the full budget");
 
   const BatchPlan first = *beside({300, 300}).next({});
@@ -1131,7 +1131,7 @@ int main() {
     testMeasuredBudgetPreservesPriorityAndStateBoundaries();
     testUnavailableTimingAndMinimumBudget();
     testMeasuredBudgetDoesNotCountBlockedPeers();
-    testMeasuredBudgetPreservesPurePrefillPacking();
+    testMeasuredBudgetPreservesPurePrefillBatching();
     testTinyTailDoesNotDistortPrefillThroughput();
     testMeasuredBudgetFinishesShortPrefillPromptly();
     testShortArrivalBesideLongPrefillEndsAtItsLastRow();

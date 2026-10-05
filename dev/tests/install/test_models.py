@@ -52,7 +52,7 @@ class ModelArtifactTest(unittest.TestCase):
         return value
 
     @staticmethod
-    def packed_file(path):
+    def weight_file(path):
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("wb") as file:
             file.write(struct.pack("<8sII", b"MDFT0001", 0, 0))
@@ -80,7 +80,7 @@ class ModelArtifactTest(unittest.TestCase):
             *(f"target/{file}" for file in target_files),
             *(f"draft/layer-{index}.bin" for index in range(draft_layers)),
         ):
-            self.packed_file(snapshot / name)
+            self.weight_file(snapshot / name)
         tokenizer = snapshot / "tokenizer"
         tokenizer.mkdir()
         for name in legacy.PACKAGE_TOKENIZER_FILES:
@@ -216,8 +216,8 @@ class ModelArtifactTest(unittest.TestCase):
         installer.link_selection(models / self.MODEL_ID, snapshot)
         for full in (False, True):
             legacy.verify(models / self.MODEL_ID, self.MODEL_ID, full=full)
-        packed = snapshot / "target/embedding.bin"
-        with packed.open("r+b") as file:
+        embedding = snapshot / "target/embedding.bin"
+        with embedding.open("r+b") as file:
             file.seek(128)
             file.write(b"x")
         legacy.verify(models / self.MODEL_ID, self.MODEL_ID, full=False)

@@ -115,7 +115,7 @@ public:
   explicit Sampling(uint32_t vocabulary);
 
   // Exact scratch/output bytes for the fixed precompiled sampling ABI.
-  // Counts may cover one lane or a packed batch; the operator owns sharding.
+  // Counts may cover one lane or a batch of lanes; the operator owns sharding.
   [[nodiscard]] static SamplingWorkspace workspace(uint32_t rows);
 
   // A penalized request's penalty words (metal/abi/Sampling.h), rebuilt

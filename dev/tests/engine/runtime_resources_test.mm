@@ -62,7 +62,8 @@ RuntimeResourcesConfig budgetConfig(const char *metallibPath,
   config.modelRoot = root.path;
   config.model = model::makeModelDescriptor(
       "budget-test", model::Qwen3_8Layout{}, model::kQwen3_8DraftLayout,
-      model::kQwen3_8VisionLayout);
+      model::kQwen3_8VisionLayout, model::TargetSource::Package,
+      model::VisionSource::Package);
   config.buildId = "budget-test";
   return config;
 }
@@ -103,7 +104,8 @@ uint64_t minimumBytes(const RuntimeResourcesConfig &config,
 void testPersistentCacheNamespace() {
   const model::ModelDescriptor model = model::makeModelDescriptor(
       "namespace-test", model::Qwen3_8Layout{}, model::kQwen3_8DraftLayout,
-      model::kQwen3_8VisionLayout);
+      model::kQwen3_8VisionLayout, model::TargetSource::Package,
+      model::VisionSource::Package);
   const auto identity = [&](char models, std::string_view build, kv::Format format) {
     kv::Layout layout = model.targetKvLayout;
     layout.format = format;
@@ -304,10 +306,11 @@ void testStartupAdmissionIgnoresPackageSize(const char *metallibPath) {
 // The memory plan takes the vision category from what loaded, so a model
 // with vision whose loader produced no vision bytes must stop here.
 void testLoadedVisionIsRequiredOnlyWithVision() {
-  model::ModelPackage package;
+  model::LoadedModel package;
   package.descriptor = model::makeModelDescriptor(
       "loaded-test", model::Qwen3_8Layout{}, model::kQwen3_8DraftLayout,
-      model::kQwen3_8VisionLayout);
+      model::kQwen3_8VisionLayout, model::TargetSource::Package,
+      model::VisionSource::Package);
   model::Qwen3_8Weights target;
   target.actualAllocatedBytes = 1;
   target.manifestFingerprintSha256 = "target";
@@ -316,7 +319,7 @@ void testLoadedVisionIsRequiredOnlyWithVision() {
   package.manifestFingerprintSha256 = "package";
   require(package.descriptor.hasVision(), "the test model has no vision");
   rejects([&] { requireLoadedModel(package); },
-          "loaded model package has incomplete allocation accounting",
+          "loaded model has incomplete allocation accounting",
           "a multimodal model without loaded vision weights was accepted");
   package.vision.actualAllocatedBytes = 1;
   requireLoadedModel(package);
@@ -378,7 +381,8 @@ void testFailedStepIsNamed(const char *metallibPath) {
   config.metallibPath = metallibPath;
   config.modelRoot = root.path();
   config.model = model::makeModelDescriptor("assembly-test", planned.target, planned.draft,
-                                            planned.vision);
+                                            planned.vision, model::TargetSource::Package,
+                                            model::VisionSource::Package);
   config.model.sourceIdentity = "synthetic";
   config.buildId = "assembly-test";
   const auto host = [&](uint64_t available) {

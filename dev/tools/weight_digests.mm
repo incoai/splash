@@ -29,9 +29,9 @@ int main(int argc, char **argv) {
     try {
       metal::MetalBackend backend(argv[1]);
       const std::filesystem::path root = std::filesystem::canonical(argv[2]);
-      const model::ModelPackage package =
-          model::loadModelPackage(backend, root, model::inspectModelPackage(root));
-      const auto images = package.images->contents();
+      const model::LoadedModel loaded =
+          model::loadModel(backend, root, model::inspectModelRoot(root));
+      const auto images = loaded.images->contents();
       std::vector<std::string> digests(images.size());
       model::parallelFor(images.size(), [&](size_t index, unsigned) {
         digests[index] = model::weightDigest(images[index].bytes);

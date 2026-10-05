@@ -572,7 +572,7 @@ void checkPrefill(metal::MetalBackend &backend, uint32_t heads, kv::Layout layou
   require(run<Phase::Prefill>(backend, oneExtent, false) == output,
           "prefill attention over extents differs from one extent of the same pages");
   if (rows == 1057) {
-    // Reuse the identical packed BF16 inputs and KV history across unaligned
+    // Reuse the identical BF16 inputs and KV history across unaligned
     // host chunks, checking each path against its independent causal oracle.
     const auto copy = [](metal::MetalBuffer buffer) {
       const auto *begin = static_cast<const uint16_t *>(buffer.contents());

@@ -48,7 +48,7 @@ void retainRepresentatives(std::vector<LinearTuningWeights> &weights) {
 } // namespace
 
 std::vector<LinearTuningInput> collectTuningWorkloads(
-    const ModelPackage &package, std::span<const uint32_t> prefillRows,
+    const LoadedModel &model, std::span<const uint32_t> prefillRows,
     std::span<const uint32_t> decodeWidths) {
   using ops::LinearEpilogue;
   using ops::LinearPhase;
@@ -105,9 +105,9 @@ std::vector<LinearTuningInput> collectTuningWorkloads(
     }
     projection(target.logitsProjection, LinearPhase::Decode,
                  LinearEpilogue::None);
-  }, package.target);
+  }, model.target);
 
-  const auto &draft = package.draft;
+  const auto &draft = model.draft;
   if (draft.layers.empty())
     throw std::invalid_argument("operator probes require draft layers");
   bothPhases(draft.contextProjection);

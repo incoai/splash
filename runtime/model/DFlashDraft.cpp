@@ -367,15 +367,15 @@ DFlashDraftWeights readDraft(metal::MetalBackend &backend, Files &files,
 
 } // namespace
 
-WeightFile PackedDraftFiles::layer(uint32_t index) const {
+WeightFile PackageDraftFiles::layer(uint32_t index) const {
   const std::string filename = "layer-" + std::to_string(index) + ".bin";
-  return images.load(packedImage(directory / filename, "draft/" + filename,
-                                 kDFlashLayerMagic, index, 0));
+  return images.load(packageImage(directory / filename, "draft/" + filename,
+                                  kDFlashLayerMagic, index, 0));
 }
 
-WeightFile PackedDraftFiles::model() const {
-  return images.load(packedImage(directory / "model.bin", "draft/model.bin",
-                                 kDFlashLayerMagic, layout.layers, 1));
+WeightFile PackageDraftFiles::model() const {
+  return images.load(packageImage(directory / "model.bin", "draft/model.bin",
+                                  kDFlashLayerMagic, layout.layers, 1));
 }
 
 DFlashDraftWeights loadDFlashDraftWeights(metal::MetalBackend &backend,
@@ -385,7 +385,7 @@ DFlashDraftWeights loadDFlashDraftWeights(metal::MetalBackend &backend,
   if (const auto *checkpoint =
           std::get_if<std::reference_wrapper<DraftCheckpointLoader>>(&files))
     return readDraft(backend, checkpoint->get(), layout);
-  return readDraft(backend, std::get<PackedDraftFiles>(files), layout);
+  return readDraft(backend, std::get<PackageDraftFiles>(files), layout);
 }
 
 } // namespace splash::model

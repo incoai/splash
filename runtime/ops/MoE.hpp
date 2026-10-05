@@ -72,7 +72,7 @@ struct AffineMoeWeights final {
   Q8Projection sharedScalarGate;
 };
 
-// All weights for one sparse MoE block. The model package owns the buffers;
+// All weights for one sparse MoE block. The loaded model owns the buffers;
 // this value only exposes semantic projections to the operator.
 using MoeWeights = LayoutWeights<AffineMoeWeights, BlockMoeWeights>;
 

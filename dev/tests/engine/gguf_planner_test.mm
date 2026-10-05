@@ -154,7 +154,7 @@ void checkMoe(const std::filesystem::path &directory) {
   writeGguf(path, target.tensors, dense);
   check(names(plan(path, g),
               {"architecture", model::gguf::architecture(dense.ffnKind), model::gguf::architecture(g.ffnKind)}),
-        "planner checks the architecture against the package");
+        "planner checks the architecture against the model's target");
 
   writeGguf(path, target.tensors, g);
   const Plan moe = plan(path, g);

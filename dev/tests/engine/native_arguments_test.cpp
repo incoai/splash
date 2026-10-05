@@ -206,7 +206,7 @@ void testRefusals() {
     refuses({"auto", memory}, "MAX_MEMORY_BYTES must be auto or a positive integer");
   // The model's own context bounds MAX_CONTEXT.
   const std::string maximum = std::to_string(
-      model::inspectModelPackage(model.path()).capabilities.maximumContextTokens);
+      model::inspectModelRoot(model.path()).capabilities.maximumContextTokens);
   for (const std::string &context : {std::string("0"), std::string("100K"),
                                      std::to_string(std::stoull(maximum) + 1)})
     refuses({context, "auto"},

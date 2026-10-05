@@ -29,7 +29,7 @@ namespace splash::model {
 // allocation/offset/length, without reading weight data. No weights,
 // dispatch code, device policy or model-name table is duplicated.
 [[nodiscard]] std::vector<ops::tuning::LinearTuningInput> collectTuningWorkloads(
-    const ModelPackage &package, std::span<const uint32_t> prefillRows,
+    const LoadedModel &model, std::span<const uint32_t> prefillRows,
     std::span<const uint32_t> decodeWidths);
 
 } // namespace splash::model

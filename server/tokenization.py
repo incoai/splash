@@ -99,14 +99,14 @@ class PromptTokenizer:
             # case this literal occurrence is not a tokenizer boundary.
             if not tokens or tokens[-1] != self.marker_id:
                 return self._encode(text)
-            packed = array("I", tokens).tobytes()
-            size = sys.getsizeof(prefix) + sys.getsizeof(packed)
+            token_bytes = array("I", tokens).tobytes()
+            size = sys.getsizeof(prefix) + sys.getsizeof(token_bytes)
             if size <= self.BUDGET_BYTES:
                 with self.lock:
                     # An extension replaces its earlier prefix; unrelated
                     # concurrent conversations retain their own LRU entries.
                     self.entries.pop(key)
-                    self.entries.put(prefix, packed, size)
+                    self.entries.put(prefix, token_bytes, size)
         return tokens + self._encode(text[boundary:])
 
     def split(self, text):

@@ -9,7 +9,7 @@
 
 namespace splash::ops {
 
-// The per-channel multipliers of an RMS norm as stored: bf16 in the packed
+// The per-channel multipliers of an RMS norm as stored: bf16 in the affine
 // formats, F32 in a GGUF, which keeps its norms unquantized as llama.cpp
 // does. Every kernel that reads them widens them to fp32, so the type only
 // selects the kernel variant that loads them (normKernel).

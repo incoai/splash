@@ -247,7 +247,7 @@ template <class Layout, class Layer>
 qwenTargetGeometry(const QwenTargetWeights<Layout, Layer> &weights);
 
 // Builds the shared Qwen GDN/attention layer graph with the target's dense
-// or sparse-MoE FFN. Architecture-specific loaders supply the package tensors.
+// or sparse-MoE FFN. Architecture-specific loaders supply the model's tensors.
 class QwenTarget final {
 public:
   template <class Layout, class Layer>

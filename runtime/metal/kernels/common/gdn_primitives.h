@@ -75,7 +75,7 @@ inline uint gdn_output_head(uint head, bool tiled) {
 // thread per dimension, stored at the head's output position. Prefill
 // dispatches one task per threadgroup; decode runs gdn_decode_gate, which
 // reproduces these rows bitwise. The norm weights are read in their stored
-// type W: bfloat in the packed formats, float for a GGUF's F32 norms.
+// type W: bfloat in the affine formats, float for a GGUF's F32 norms.
 template <uint KeyHeads, uint ValueHeads, uint HeadDim, uint ConvDim,
           uint PackedWidth, class W>
 inline void

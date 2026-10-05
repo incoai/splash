@@ -2,7 +2,7 @@
 
 A target's family is the one the engine finds its configuration to describe,
 by the rules it holds every start to (upstream.check_model), never its
-repository's name. Legacy Splash packages pack these same families.
+repository's name. Legacy Splash packages hold these same families.
 """
 
 from __future__ import annotations

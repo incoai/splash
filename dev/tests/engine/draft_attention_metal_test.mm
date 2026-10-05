@@ -304,7 +304,7 @@ void surroundingPhases(MetalBackend &backend, DraftAttentionShape shape,
   const auto queries = allocate(workspace.groupedQueriesBytes);
   const auto queryKeys = allocate(workspace.queryKeysBytes);
   const auto queryValues = allocate(workspace.queryValuesBytes);
-  const auto packed = allocate(workspace.groupedQueriesBytes);
+  const auto rowMajor = allocate(workspace.groupedQueriesBytes);
   const auto queryNorm = allocate(kHeadDim * 2);
   const auto keyNorm = allocate(kHeadDim * 2);
   std::fill_n(static_cast<uint16_t *>(queryNorm.contents()), kHeadDim,
@@ -360,7 +360,7 @@ void surroundingPhases(MetalBackend &backend, DraftAttentionShape shape,
   DraftAttention::addPrepare(graph,
       {qkv, queries, queryNorm, keyNorm, ropeCos, ropeSin, queryKeys,
        queryValues}, plan);
-  DraftAttention::addReorder(graph, queries, packed, plan);
+  DraftAttention::addReorder(graph, queries, rowMajor, plan);
   static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
   require(std::equal(originalQkv.begin(), originalQkv.end(),
                      static_cast<const uint16_t *>(qkv.contents())),
@@ -408,7 +408,7 @@ void surroundingPhases(MetalBackend &backend, DraftAttentionShape shape,
       }
     }
   const auto *grouped = static_cast<const uint16_t *>(queries.contents());
-  const auto *reordered = static_cast<const uint16_t *>(packed.contents());
+  const auto *reordered = static_cast<const uint16_t *>(rowMajor.contents());
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     const uint64_t laneOffset = uint64_t{lane} * kRows * kAttention;
     for (uint32_t row = 0; row < kRows; ++row) {

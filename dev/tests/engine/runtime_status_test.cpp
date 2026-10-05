@@ -118,7 +118,7 @@ void testCleanRuntimeStatus(const char *goldenPath) {
   warmup.maximumPrefill = WarmupStepStatus::Complete;
   warmup.decodeBatches.fill(WarmupStepStatus::Complete);
   warmup.compositeStateRestore = WarmupStepStatus::Complete;
-  warmup.maximumPrefillDetail = "packed_rows=2048";
+  warmup.maximumPrefillDetail = "rows=2048";
 
   RuntimeMetricsSnapshot metrics;
   metrics.prefillInputTokens = 4096;

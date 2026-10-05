@@ -133,7 +133,7 @@ std::vector<Image> images(const Layout &layout) {
 
 // The checkpoint at directory with every image of layout bound to it. The
 // images keep each module in the bits inspection holds the model's
-// config.json to (inspectModelPackage); nothing here reads a configuration.
+// config.json to (inspectModelRoot); nothing here reads a configuration.
 template<class Layout>
 std::shared_ptr<affine::PlannedCheckpoint> plan(const std::filesystem::path &directory, const Layout &layout) {
   auto planned = std::make_shared<affine::PlannedCheckpoint>(directory);

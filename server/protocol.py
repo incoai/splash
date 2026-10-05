@@ -488,7 +488,7 @@ def _bytes(value: object, label: str) -> bytes:
 
 
 def _words(values: object, label: str) -> array.array:
-    """A tuple of uint32 words, packed as the frame carries them."""
+    """A tuple of uint32 words as an array, laid out as the frame carries them."""
     if type(values) is not tuple:
         raise ValueError(f"{label} must be a tuple of uint32 values")
     # Prompts run to a million words, so accept the common valid case in C:
@@ -706,7 +706,7 @@ def _validated_request(
 
 def _mask_payload(values):
     if not isinstance(values, bytes):
-        raise ValueError("mask words must be packed bytes")
+        raise ValueError("mask words must be bytes")
     if len(values) % 4:
         raise ValueError("mask bytes must contain complete uint32 words")
     return values

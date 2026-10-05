@@ -126,7 +126,7 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
   if (!result.persistentCacheRoot.empty() && !result.maxCacheDiskBytes)
     throw UsageError("--cache-dir requires a MAX_CACHE_DISK_BYTES quota");
   result.modelRoot = requireModelRoot(argv[2]);
-  result.model = model::inspectModelPackage(result.modelRoot);
+  result.model = model::inspectModelRoot(result.modelRoot);
   result.maxContext = parseMaxContext(argv[3], result.model.capabilities);
   result.maxMemoryBytes = parseMaxMemory(argv[4]);
   return result;

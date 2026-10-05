@@ -236,7 +236,7 @@ struct Runtime::Impl {
   };
 
   MetalBackend &backend;
-  const ModelPackage &package;
+  const LoadedModel &model;
   const RuntimeGeometry geometry;
   const ops::ExecutionPlans &operators;
   kv::PageStorage &kvPages;
@@ -281,8 +281,8 @@ struct Runtime::Impl {
   DFlashDraft draftModel;
   explicit Impl(RuntimeContext value)
       : backend(value.backend),
-        package(value.package),
-        geometry(RuntimeGeometry::from(value.package, value.kvPages.layout().format)),
+        model(value.model),
+        geometry(RuntimeGeometry::from(value.model, value.kvPages.layout().format)),
         operators(value.operators),
         kvPages(value.kvPages),
         states(value.stateStorage),
@@ -292,16 +292,17 @@ struct Runtime::Impl {
                           return QwenTarget(weights, geometry.target,
                                             value.backend, operators);
                         },
-                        value.package.target)),
-        draftModel(value.package.draft, value.backend, operators) {
-    if (states.layout() != package.stateLayout() ||
-        kvPages.layout() != package.targetKvLayout(kvPages.layout().format)) {
+                        value.model.target)),
+        draftModel(value.model.draft, value.backend, operators) {
+    if (states.layout() != model.stateLayout() ||
+        kvPages.layout() != model.targetKvLayout(kvPages.layout().format)) {
       throw std::invalid_argument(
-          "model runtime resources do not match the loaded package");
+          "model runtime resources do not match the loaded model");
     }
     prefillArena = std::make_unique<PrefillArena>(backend, geometry, operators);
     decodeArena = std::make_unique<DecodeArena>(backend, geometry, operators);
-    penaltyTable = decodeArena->packed(DecodeTensor::PenaltyState, kLaneCount);
+    penaltyTable =
+        decodeArena->batchSlice(DecodeTensor::PenaltyState, kLaneCount);
     preparePolicyPipelines();
   }
 
@@ -539,7 +540,7 @@ struct Runtime::Impl {
     if (request.images.empty())
       return laneAdmission(stateLane, states.tryActivateLane(stateLane, request.id));
     // The engine rejects image requests at submission when there is no vision.
-    if (!package.descriptor.hasVision())
+    if (!model.descriptor.hasVision())
       throw std::logic_error("image request reached a model without vision");
     std::vector<ImageState> staged;
     staged.reserve(request.images.size());
@@ -569,14 +570,14 @@ struct Runtime::Impl {
     }
     const uint64_t encoderBytes =
         encodePatches && !(vision && vision->maximumPatches() >= encodePatches)
-            ? ops::Vision::scratchBytes(package.vision.tensors.layout, encodePatches)
+            ? ops::Vision::scratchBytes(model.vision.tensors.layout, encodePatches)
             : 0;
     std::shared_ptr<ops::Vision> encoder;
     const uint8_t *pixels = request.imagePixels.data();
     const auto allocate = [&] {
       if (encoderBytes) {
         encoder = std::make_shared<ops::Vision>(
-            backend, package.vision.tensors, encodePatches);
+            backend, model.vision.tensors, encodePatches);
       }
       for (ImageState &image : staged) {
         const ImageSpan &span = image.span;
@@ -643,7 +644,7 @@ struct Runtime::Impl {
         rows.encoding = true;
         ++counters.imageEncodes;
       }
-      const uint32_t width = package.vision.tensors.layout.outputHiddenSize;
+      const uint32_t width = model.vision.tensors.layout.outputHiddenSize;
       ops::RowCopy::add(
           graph, rows.embeddings,
           {static_cast<uint32_t>(begin - image.span.offset), width, 0},
@@ -802,7 +803,7 @@ struct Runtime::Impl {
 
   ops::SamplingBuffers samplingBuffers(uint32_t lanes) const {
     auto d = [&](DecodeTensor tensor) {
-      return decodeArena->packed(tensor, lanes);
+      return decodeArena->batchSlice(tensor, lanes);
     };
     return {d(DecodeTensor::Logits),
             d(DecodeTensor::TargetPartialMasses),
@@ -893,7 +894,7 @@ struct Runtime::Impl {
                                uint32_t width) {
     const uint32_t storage = targetModel.decodeStorageLanes(width);
     auto d = [&](DecodeTensor tensor) {
-      return decodeArena->packed(tensor, storage);
+      return decodeArena->batchSlice(tensor, storage);
     };
     targetModel.addHeadBatch(graph, d(DecodeTensor::Hidden0),
                              d(DecodeTensor::FinalHidden),
@@ -920,7 +921,7 @@ struct Runtime::Impl {
   // selection writes one output token per lane, in lane order.
   uint32_t initialToken(uint32_t lane) const {
     return contents<uint32_t>(
-        decodeArena->packed(DecodeTensor::OutputTokens, lane + 1),
+        decodeArena->batchSlice(DecodeTensor::OutputTokens, lane + 1),
         "initial tokens")[lane];
   }
 
@@ -987,7 +988,7 @@ struct Runtime::Impl {
         static_cast<uint32_t>(pages.size()));
   }
 
-  struct PackedPrefillSequence final {
+  struct RaggedPrefillSequence final {
     Request *entry = nullptr;
     const ModelBatchItem *item = nullptr;
     uint32_t lane = 0;
@@ -1001,8 +1002,8 @@ struct Runtime::Impl {
     DispatchDraftCapturePlan captures;
   };
 
-  struct PackedPrefillBatch final {
-    std::vector<PackedPrefillSequence> sequences;
+  struct RaggedPrefillBatch final {
+    std::vector<RaggedPrefillSequence> sequences;
     uint32_t rows = 0;
     uint32_t capturedRows = 0;
   };
@@ -1013,10 +1014,10 @@ struct Runtime::Impl {
                         bytesFor<uint16_t>(uint64_t{rows} * width));
   }
 
-  PackedPrefillBatch
-  preparePackedPrefill(std::span<const ModelBatchItem> items,
+  RaggedPrefillBatch
+  prepareRaggedPrefill(std::span<const ModelBatchItem> items,
                        std::array<Request *, kLaneCount> &entries) {
-    PackedPrefillBatch batch;
+    RaggedPrefillBatch batch;
     batch.sequences.reserve(items.size());
     uint64_t queryOffset = 0;
     uint64_t kvOffset = 0;
@@ -1027,17 +1028,17 @@ struct Runtime::Impl {
           item.logicalPosition > entry.promptTokens ||
           item.tokenCount > entry.promptTokens - item.logicalPosition ||
           !entry.resident) {
-        throw std::invalid_argument("invalid packed Qwen prefill item");
+        throw std::invalid_argument("invalid ragged Qwen prefill item");
       }
       const QwenLaneMetadata &metadata = states.metadata(entry.stateLane);
       if (metadata.requestId != entry.id ||
           metadata.lengths.targetTokens != item.logicalPosition) {
-        throw std::logic_error("packed prefill state length is not exact");
+        throw std::logic_error("ragged prefill state length is not exact");
       }
       if (item.logicalPosition == 0)
         states.clearForColdStart(entry.stateLane);
       if (item.tokenCount > kPrefillRows - batch.rows) {
-        throw std::invalid_argument("packed prefill exceeds actual-row budget");
+        throw std::invalid_argument("ragged prefill exceeds actual-row budget");
       }
       auto captures = activeDraftCaptures(entry, item);
       const uint32_t capturedRows = captureRows(captures);
@@ -1065,19 +1066,19 @@ struct Runtime::Impl {
         queryOffset >
             prefillArena->get(PrefillTensor::FullQueries).sizeBytes() ||
         kvOffset > prefillArena->get(PrefillTensor::ChunkKeys).sizeBytes()) {
-      throw std::logic_error("packed prefill scratch geometry overflowed");
+      throw std::logic_error("ragged prefill scratch geometry overflowed");
     }
 
     auto *input =
         contents<uint32_t>(prefillArena->get(PrefillTensor::InputTokens),
-                           "packed prefill input tokens");
+                           "ragged prefill input tokens");
     auto *targetPositions =
         contents<uint32_t>(prefillArena->get(PrefillTensor::TargetPositions),
                            "target RoPE positions");
     auto *draftPositions =
         contents<uint32_t>(prefillArena->get(PrefillTensor::DraftPositions),
                            "draft RoPE positions");
-    for (const PackedPrefillSequence &sequence : batch.sequences) {
+    for (const RaggedPrefillSequence &sequence : batch.sequences) {
       const ModelBatchItem &item = *sequence.item;
       std::copy(item.inputTokens.begin(), item.inputTokens.end(),
                 input + sequence.rowBegin);
@@ -1103,14 +1104,14 @@ struct Runtime::Impl {
     return batch;
   }
 
-  void addPackedDraftContext(CommandGraph &graph,
-                             const PackedPrefillBatch &batch) {
+  void addRaggedDraftContext(CommandGraph &graph,
+                             const RaggedPrefillBatch &batch) {
     if (!batch.capturedRows)
       return;
     auto p = [&](PrefillTensor tensor) { return prefillArena->get(tensor); };
     std::array<DFlashPrefillSpan, kLaneCount * 2> spans{};
     uint32_t spanCount = 0;
-    for (const PackedPrefillSequence &sequence : batch.sequences) {
+    for (const RaggedPrefillSequence &sequence : batch.sequences) {
       for (const DispatchDraftCaptureSpan &capture : sequence.captures) {
         DFlashPrefillSpan &span = spans.at(spanCount++);
         span.compactRow = sequence.captureBegin + capture.compactDestinationRow;
@@ -1130,10 +1131,10 @@ struct Runtime::Impl {
 
   // Returns each lane's draft captures, indexed like `entries`.
   std::array<DispatchDraftCapturePlan, kLaneCount>
-  encodePackedPrefillGraph(CommandGraph &graph,
+  encodeRaggedPrefillGraph(CommandGraph &graph,
                            std::span<const ModelBatchItem> items,
                            std::array<Request *, kLaneCount> &entries) {
-    PackedPrefillBatch batch = preparePackedPrefill(items, entries);
+    RaggedPrefillBatch batch = prepareRaggedPrefill(items, entries);
     auto p = [&](PrefillTensor tensor) { return prefillArena->get(tensor); };
 
     addRopeTables(graph, p(PrefillTensor::TargetPositions), batch.rows,
@@ -1144,7 +1145,7 @@ struct Runtime::Impl {
 
     targetModel.addEmbedding(graph, p(PrefillTensor::InputTokens),
                              p(PrefillTensor::Hidden0), batch.rows);
-    for (const PackedPrefillSequence &sequence : batch.sequences) {
+    for (const RaggedPrefillSequence &sequence : batch.sequences) {
       addImageRows(graph, *sequence.entry, *sequence.item, sequence.rowBegin);
     }
 
@@ -1158,7 +1159,7 @@ struct Runtime::Impl {
     std::vector<MetalBuffer> recurrentIn(stateBindingCount);
     std::vector<MetalBuffer> recurrentOut(stateBindingCount);
     for (uint32_t lane = 0; lane < batch.sequences.size(); ++lane) {
-      const PackedPrefillSequence &sequence = batch.sequences[lane];
+      const RaggedPrefillSequence &sequence = batch.sequences[lane];
       QwenTargetPrefillSequence &destination = modelSequences[lane];
       destination.rowBegin = sequence.rowBegin;
       destination.rows = sequence.item->tokenCount;
@@ -1233,7 +1234,7 @@ struct Runtime::Impl {
         graph, std::move(buffers),
         std::span(modelSequences).first(batch.sequences.size()), batch.rows,
         kvPages.layers());
-    addPackedDraftContext(graph, batch);
+    addRaggedDraftContext(graph, batch);
 
     // A lane that finishes its prompt copies the prompt's last row to row 0
     // of its Hidden0 block. A constrained lane's completion captures that
@@ -1243,7 +1244,7 @@ struct Runtime::Impl {
     // first token.
     std::array<InitialSelection, kLaneCount> selections{};
     uint32_t selectionCount = 0;
-    for (const PackedPrefillSequence &sequence : batch.sequences) {
+    for (const RaggedPrefillSequence &sequence : batch.sequences) {
       Request &entry = *sequence.entry;
       const ModelBatchItem &item = *sequence.item;
       if (entry.replayingGeneration ||
@@ -1269,7 +1270,7 @@ struct Runtime::Impl {
           static_cast<uint32_t>(batch.sequences.size()));
     }
     std::array<DispatchDraftCapturePlan, kLaneCount> captures{};
-    for (const PackedPrefillSequence &sequence : batch.sequences)
+    for (const RaggedPrefillSequence &sequence : batch.sequences)
       captures[sequence.lane] = sequence.captures;
     return captures;
   }
@@ -1343,7 +1344,7 @@ struct Runtime::Impl {
     // The draft shares the target's vocabulary head and its storage rows.
     const uint32_t storage = targetModel.decodeStorageLanes(lanes);
     auto d = [&](DecodeTensor tensor) {
-      return decodeArena->packed(tensor, storage);
+      return decodeArena->batchSlice(tensor, storage);
     };
     std::array<uint32_t, kLaneCount> cacheLengths{};
     for (uint32_t lane = 0; lane < lanes; ++lane)
@@ -1404,7 +1405,7 @@ struct Runtime::Impl {
     const uint32_t lanes = static_cast<uint32_t>(entries.size());
     const uint32_t storage = targetModel.decodeStorageLanes(lanes);
     auto d = [&](DecodeTensor tensor) {
-      return decodeArena->packed(tensor, storage);
+      return decodeArena->batchSlice(tensor, storage);
     };
 
     std::array<ChunkedPrefillParams, kLaneCount> chunks{};
@@ -1503,7 +1504,7 @@ struct Runtime::Impl {
     }
     const uint32_t lanes = static_cast<uint32_t>(entries.size());
     auto d = [&](DecodeTensor tensor) {
-      return decodeArena->packed(tensor, lanes);
+      return decodeArena->batchSlice(tensor, lanes);
     };
 
     std::array<uint32_t, kLaneCount> startPositions{};
@@ -1541,14 +1542,14 @@ struct Runtime::Impl {
     const uint32_t width = static_cast<uint32_t>(lanes.size());
     sampling.addAcceptance(
         graph,
-        {decodeArena->packed(DecodeTensor::ProposedTokens, width),
-         decodeArena->packed(DecodeTensor::Candidates, width),
-         decodeArena->packed(DecodeTensor::ProposalProbs, width),
-         decodeArena->packed(DecodeTensor::TargetVocabularyRows, width),
-         decodeArena->packed(DecodeTensor::SamplingUniforms, width),
-         decodeArena->packed(DecodeTensor::OutputTokens, width),
-         decodeArena->packed(DecodeTensor::RetainedCount, width),
-         decodeArena->packed(DecodeTensor::AcceptedCount, width)},
+        {decodeArena->batchSlice(DecodeTensor::ProposedTokens, width),
+         decodeArena->batchSlice(DecodeTensor::Candidates, width),
+         decodeArena->batchSlice(DecodeTensor::ProposalProbs, width),
+         decodeArena->batchSlice(DecodeTensor::TargetVocabularyRows, width),
+         decodeArena->batchSlice(DecodeTensor::SamplingUniforms, width),
+         decodeArena->batchSlice(DecodeTensor::OutputTokens, width),
+         decodeArena->batchSlice(DecodeTensor::RetainedCount, width),
+         decodeArena->batchSlice(DecodeTensor::AcceptedCount, width)},
         maximumRetained, std::span(policies).first(width),
         geometry.target.stopTokens[0], geometry.target.stopTokens[1]);
   }
@@ -1558,17 +1559,17 @@ struct Runtime::Impl {
     if (!lanes || lanes > kLaneCount)
       throw std::invalid_argument("invalid embedding batch width");
     const uint32_t rows = lanes * kDecodeRows;
-    targetModel.addEmbedding(graph, decodeArena->packed(tokens, lanes),
-                             decodeArena->packed(output, lanes), rows);
+    targetModel.addEmbedding(graph, decodeArena->batchSlice(tokens, lanes),
+                             decodeArena->batchSlice(output, lanes), rows);
   }
 
   void encodeBatchVerifyInput(CommandGraph &graph, uint32_t lanes) {
     if (!lanes || lanes > kLaneCount)
       throw std::invalid_argument("invalid verify-input batch width");
     targetModel.addVerifyInput(
-        graph, decodeArena->packed(DecodeTensor::DraftInputTokens, lanes),
-        decodeArena->packed(DecodeTensor::ProposedTokens, lanes),
-        decodeArena->packed(DecodeTensor::InputTokens, lanes), lanes);
+        graph, decodeArena->batchSlice(DecodeTensor::DraftInputTokens, lanes),
+        decodeArena->batchSlice(DecodeTensor::ProposedTokens, lanes),
+        decodeArena->batchSlice(DecodeTensor::InputTokens, lanes), lanes);
   }
 
   void encodeBatchGdnCommit(CommandGraph &graph,
@@ -1591,7 +1592,8 @@ struct Runtime::Impl {
          decodeArena->gdnStorage(DecodeTensor::VerifyMixedBase),
          decodeArena->gdnStorage(DecodeTensor::VerifyDecayBase),
          decodeArena->gdnStorage(DecodeTensor::VerifyBetaBase), currentStates,
-         nextStates, decodeArena->packed(DecodeTensor::RetainedCount, width)},
+         nextStates,
+         decodeArena->batchSlice(DecodeTensor::RetainedCount, width)},
         width);
   }
 
@@ -2060,7 +2062,7 @@ Runtime::prefillAsync(const BatchPlan &plan,
 
   std::array<Impl::Request *, kLaneCount> entries{};
   CommandGraph graph;
-  const auto captures = impl_->encodePackedPrefillGraph(graph, items, entries);
+  const auto captures = impl_->encodeRaggedPrefillGraph(graph, items, entries);
   const bool encodesImages = std::any_of(
       entries.begin(), entries.begin() + items.size(), [](const auto *entry) {
         return std::any_of(entry->images.begin(), entry->images.end(),
@@ -2253,12 +2255,12 @@ Runtime::decodeAsync(const BatchPlan &plan,
   CommandGraph commandGraph;
   impl_->addRopeTables(
       commandGraph,
-      impl_->decodeArena->packed(DecodeTensor::Positions, width), ropeRows,
-      impl_->decodeArena->packed(DecodeTensor::DraftPositions, width),
-      ropeRows, impl_->decodeArena->packed(DecodeTensor::RopeCos, width),
-      impl_->decodeArena->packed(DecodeTensor::RopeSin, width),
-      impl_->decodeArena->packed(DecodeTensor::DraftRopeCos, width),
-      impl_->decodeArena->packed(DecodeTensor::DraftRopeSin, width));
+      impl_->decodeArena->batchSlice(DecodeTensor::Positions, width), ropeRows,
+      impl_->decodeArena->batchSlice(DecodeTensor::DraftPositions, width),
+      ropeRows, impl_->decodeArena->batchSlice(DecodeTensor::RopeCos, width),
+      impl_->decodeArena->batchSlice(DecodeTensor::RopeSin, width),
+      impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeCos, width),
+      impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeSin, width));
   impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::DraftInputTokens,
                               DecodeTensor::DraftHidden0, width);
   impl_->encodeDraftBatchGraph(commandGraph, entries,
@@ -2462,7 +2464,7 @@ WarmupStepResult Runtime::warmupPrefill(uint32_t rows) {
     throw;
   }
   return {"real " + std::to_string(rows) +
-              "-row packed KV target+draft prefill [M32]",
+              "-row KV target+draft prefill [M32]",
           wallSeconds, std::move(lanes)};
 }
 
@@ -2643,12 +2645,12 @@ ModelTelemetry Runtime::telemetry() const noexcept {
   return result;
 }
 
-ModelMemoryPlan plannedRuntimeMemory(const ModelPackage &package,
+ModelMemoryPlan plannedRuntimeMemory(const LoadedModel &model,
                                      const ops::ExecutionPlans &operators,
                                      kv::Format format) {
-  requireCompatibleModelPackage(package);
-  const RuntimeGeometry geometry = RuntimeGeometry::from(package, format);
-  return {package.stateLayout().laneBytes(),
+  requireCompatibleModel(model);
+  const RuntimeGeometry geometry = RuntimeGeometry::from(model, format);
+  return {model.stateLayout().laneBytes(),
           plannedPrefillBytes(geometry, operators),
           plannedDecodeBytes(geometry, operators)};
 }

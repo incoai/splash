@@ -206,7 +206,7 @@ int main(int argc, char **argv) {
       const auto inconsistent = [&](const model::Qwen3_8Layout &broken) {
         try {
           static_cast<void>(model::loadQwen3_8Weights(
-              backend, broken, model::PackedTargetFiles<model::Qwen3_8Layout>{images, root, broken}));
+              backend, broken, model::PackageTargetFiles<model::Qwen3_8Layout>{images, root, broken}));
         } catch (const model::WeightStoreError &error) {
           return std::string_view(error.what()) == "Qwen target layout is inconsistent";
         }

@@ -217,14 +217,18 @@ static_assert(Qwen3_8Layout{}.maximumContextTokens <= kv::kMaximumLogicalTokens 
                   Qwen3_6MoeLayout{}.maximumContextTokens <= kv::kMaximumLogicalTokens,
               "a family's native window exceeds the runtime's KV ceiling");
 
-ModelDescriptor qwen38Descriptor(std::string name) {
+ModelDescriptor qwen38Descriptor(std::string name, TargetSource targetSource,
+                                 VisionSource visionSource) {
   return makeModelDescriptor(std::move(name), Qwen3_8Layout{},
-                             kQwen3_8DraftLayout, kQwen3_8VisionLayout);
+                             kQwen3_8DraftLayout, kQwen3_8VisionLayout,
+                             targetSource, visionSource);
 }
 
-ModelDescriptor qwen36Descriptor(std::string name) {
+ModelDescriptor qwen36Descriptor(std::string name, TargetSource targetSource,
+                                 VisionSource visionSource) {
   return makeModelDescriptor(std::move(name), Qwen3_6MoeLayout{},
-                             kQwen3_6MoeDraftLayout, kQwen3_6MoeVisionLayout);
+                             kQwen3_6MoeDraftLayout, kQwen3_6MoeVisionLayout,
+                             targetSource, visionSource);
 }
 
 void validateTokenizer(const std::filesystem::path &root,
@@ -498,17 +502,19 @@ ModelDescriptor describeSourceModel(std::string name, std::string_view targetFor
   NSDictionary *text = config[@"text_config"];
   if (![text isKindOfClass:[NSDictionary class]]) throw unsupportedModel("its config has no text_config");
   const auto type = requireString(text, @"model_type", "text model type");
-  ModelDescriptor result;
-  if (type == "qwen3_5_moe_text") result = qwen36Descriptor(std::move(name));
-  else if (type == "qwen3_5_text") result = qwen38Descriptor(std::move(name));
-  else throw unsupportedModel("text model type " + type);
-  if (targetFormat == "mlx-affine") result.targetSource = TargetSource::Mlx;
-  else if (targetFormat == "gguf") result.targetSource = TargetSource::Gguf;
+  const bool moe = type == "qwen3_5_moe_text";
+  if (!moe && type != "qwen3_5_text") throw unsupportedModel("text model type " + type);
+  TargetSource targetSource;
+  if (targetFormat == "mlx-affine") targetSource = TargetSource::Mlx;
+  else if (targetFormat == "gguf") targetSource = TargetSource::Gguf;
   else throw std::invalid_argument("unsupported target source format: " + std::string(targetFormat));
-  if (visionFormat == "none") result.visionSource = VisionSource::None;
-  else if (visionFormat == "safetensors") result.visionSource = VisionSource::Mlx;
-  else if (visionFormat == "gguf") result.visionSource = VisionSource::Gguf;
+  VisionSource visionSource;
+  if (visionFormat == "none") visionSource = VisionSource::None;
+  else if (visionFormat == "safetensors") visionSource = VisionSource::Mlx;
+  else if (visionFormat == "gguf") visionSource = VisionSource::Gguf;
   else throw std::invalid_argument("unsupported vision source format: " + std::string(visionFormat));
+  ModelDescriptor result = moe ? qwen36Descriptor(std::move(name), targetSource, visionSource)
+                               : qwen38Descriptor(std::move(name), targetSource, visionSource);
   std::visit([&](const auto &layout) {
     validateTextConfig(text, layout, layout.family, result.targetSource);
     if (result.targetSource == TargetSource::Mlx) validateQuantization(config, layout);
@@ -576,12 +582,16 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
 
 ModelDescriptor makeModelDescriptor(std::string name, TargetLayout target,
                                     DFlashDraftLayout draft,
-                                    ops::VisionLayout vision) {
+                                    ops::VisionLayout vision,
+                                    TargetSource targetSource,
+                                    VisionSource visionSource) {
   ModelDescriptor result;
   result.name = std::move(name);
   result.target = target;
   result.draft = draft;
   result.vision = vision;
+  result.targetSource = targetSource;
+  result.visionSource = visionSource;
   std::visit(
       [&](const auto &layout) {
         result.capabilities = {layout.vocabularySize,
@@ -594,7 +604,8 @@ ModelDescriptor makeModelDescriptor(std::string name, TargetLayout target,
 }
 
 bool ModelDescriptor::valid() const noexcept {
-  if (name.empty() || !capabilities.vocabularySize ||
+  if (name.empty() || targetSource == TargetSource{} || visionSource == VisionSource{} ||
+      !capabilities.vocabularySize ||
       !capabilities.maximumContextTokens ||
       !targetKvLayout.valid() || !stateLayout.valid() ||
       stateLayout.draft != draft.stateLayout() ||
@@ -614,7 +625,7 @@ bool ModelDescriptor::valid() const noexcept {
       target);
 }
 
-ModelDescriptor inspectModelPackage(const std::filesystem::path &root) {
+ModelDescriptor inspectModelRoot(const std::filesystem::path &root) {
   @autoreleasepool {
     if (std::filesystem::exists(root / "model.json")) return inspectSourceModel(root);
     std::string sourceIdentity;
@@ -626,10 +637,10 @@ ModelDescriptor inspectModelPackage(const std::filesystem::path &root) {
         @"name", "weight format");
     ModelDescriptor descriptor;
     if (format == "splash-packed-q4") {
-      descriptor = qwen38Descriptor(model);
+      descriptor = qwen38Descriptor(model, TargetSource::Package, VisionSource::Package);
       validateQwen38(manifest, root, descriptor);
     } else if (format == "splash-packed-q4-moe") {
-      descriptor = qwen36Descriptor(model);
+      descriptor = qwen36Descriptor(model, TargetSource::Package, VisionSource::Package);
       validateQwen36(manifest, root, descriptor);
     } else {
       throw std::invalid_argument("unsupported weight format: " + format);

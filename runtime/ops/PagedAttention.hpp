@@ -186,7 +186,7 @@ public:
 
   // The runtime owns allocation, not the selected kernel's workspace layout.
   // Prefill storage covers every sequence length up to maximumRows; sequences
-  // in a packed command reuse it serially. Verify storage covers all lanes at
+  // in a ragged command reuse it serially. Verify storage covers all lanes at
   // the maximum split count.
   [[nodiscard]] static AttentionWorkspace
   prefillWorkspace(uint32_t maximumRows, uint32_t queryHeads,

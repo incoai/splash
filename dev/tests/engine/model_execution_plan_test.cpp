@@ -20,8 +20,8 @@ using splash::test::rejects;
 using splash::test::require;
 
 template <class Weights>
-model::ModelPackage package() {
-  model::ModelPackage result;
+model::LoadedModel package() {
+  model::LoadedModel result;
   Weights target;
   const model::DFlashDraftLayout draft = std::is_same_v<Weights, model::Qwen3_6MoeWeights>
                                              ? model::kQwen3_6MoeDraftLayout
@@ -54,7 +54,8 @@ model::ModelPackage package() {
   ops::VisionLayout vision;
   vision.outputHiddenSize = target.layout.hiddenSize;
   result.descriptor = model::makeModelDescriptor(
-      "operator workspace test", target.layout, draft, vision);
+      "operator workspace test", target.layout, draft, vision,
+      model::TargetSource::Package, model::VisionSource::Package);
   result.target = std::move(target);
   result.draft.layout = draft;
   return result;
@@ -126,7 +127,7 @@ void checkMixedLayouts() {
 // Split128 plan's partials grow with the rows. The arena must hold every
 // lane's plan of every affine target and draft projection at the measured
 // core counts.
-void checkLaneScratch(const model::ModelPackage &package) {
+void checkLaneScratch(const model::LoadedModel &package) {
   const auto geometry = model::RuntimeGeometry::from(package, kv::Format::Int8);
   const auto &d = geometry.draft;
   std::vector<ops::LinearMatrix> matrices{

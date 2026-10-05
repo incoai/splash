@@ -107,7 +107,7 @@ void moe() {
       require(workspace.groupedInputBytes <= lanes * single.groupedInputBytes &&
                   workspace.tileDescriptorsBytes <=
                       lanes * single.tileDescriptorsBytes,
-              "packed decode workspace exceeds per-lane allocation bound");
+              "batched decode workspace exceeds per-lane allocation bound");
     }
     for (const uint32_t rows : {0U, 2049U})
       rejects([&] { (void)MoE::prefillPlan(shape, rows, {MoeExpertTile::M32}); },
@@ -125,7 +125,7 @@ void moe() {
 void sampling() {
   using splash::ops::DraftSelector;
   using splash::ops::Sampling;
-  // Independent ABI formulas, including one lane and B1-B4 packed
+  // Independent ABI formulas, including one lane and B1-B4 batch
   // extents. No backend, allocation or GPU graph is needed to size buffers.
   for (uint32_t rows : {1U, 8U, 16U, 24U, 32U,
                         std::numeric_limits<uint32_t>::max()}) {

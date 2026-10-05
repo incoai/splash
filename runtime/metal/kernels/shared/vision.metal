@@ -507,7 +507,7 @@ kernel void vision_attention(
 
 // Gather padded attention output back to (tokens, 1152) rows.
 
-kernel void vision_attention_pack(
+kernel void vision_attention_gather(
     device const bfloat *padded [[buffer(0)]],
     device bfloat *output [[buffer(1)]],
     constant VisionQkvParams &params [[buffer(2)]],

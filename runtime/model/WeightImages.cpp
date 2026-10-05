@@ -51,10 +51,10 @@ std::vector<WeightImages::Contents> WeightImages::contents() const {
   return result;
 }
 
-ImagePlan packedImage(const std::filesystem::path &path, std::string component, std::string_view magic,
-                      uint32_t layer, uint32_t type) {
+ImagePlan packageImage(const std::filesystem::path &path, std::string component, std::string_view magic,
+                       uint32_t layer, uint32_t type) {
   auto source = std::make_shared<WeightSource>(path);
-  if (!source->bytes()) throw WeightStoreError("packed file is empty: " + path.string());
+  if (!source->bytes()) throw WeightStoreError("package file is empty: " + path.string());
   return {std::move(component), std::string(magic), layer, type, source->bytes(),
           [source](std::span<uint8_t> destination, const metal::MetalBuffer &) {
             parallelFor((destination.size() + kLoadStepBytes - 1) / kLoadStepBytes, [&](size_t index, unsigned) {

@@ -1085,7 +1085,7 @@ architecture never replaces one that loads. Native loading validates the
 configuration against the target again and loads the draft like a target
 ([Weight loading](#weight-loading)):
 `DraftCheckpointLoader` (`DraftCheckpoint.cpp`) plans the images of a Splash
-package's packed draft files, `layer-<N>.bin` and `model.bin`, and
+package's draft files, `layer-<N>.bin` and `model.bin`, and
 `AffinePreparation` quantizes each projection to 4 bits in groups of 64 as
 MLX's affine quantization rounds it and copies every other tensor as stored.
 For both families the images are byte for byte the Q4 drafts of the Splash
@@ -1109,7 +1109,7 @@ Both sources are written into an image laid out as a package's
 copied, and F32 or F16 tensors are converted under the exact-BF16 rule of
 [weight loading](#weight-loading).
 Unsloth's mmproj stores its 1-D tensors, patch embedding and position table as
-F32, all of them BF16-exact, and loads byte-identical to the packed file.
+F32, all of them BF16-exact, and loads byte-identical to the package's file.
 Quantized MLX towers, deepstack projectors and mmproj tensors the tower does not
 use are rejected.
 
@@ -1184,13 +1184,13 @@ upstream fixtures are in `dev/tests/fixtures/chat_templates/`.
 
 Splash packages, such as `incoai/Qwen3.8-27B-Splash`, are the prebuilt format
 that predates upstream loading, and `--model` still accepts them. They contain
-`manifest.json`, packed `target/`, `draft/` and `vision/` weights and
+`manifest.json`, the `target/`, `draft/` and `vision/` weight files and
 `tokenizer/`; the manifest lists artifact paths, sizes and SHA-256 hashes.
 Qwen3.8-27B packages use schema 3 / `splash-packed-q4`, Qwen3.6-35B-A3B
 packages schema 4 / `splash-packed-q4-moe`. Compatible community fine-tunes may
 use any nonempty manifest model name. Native loading validates geometry, tensor
 sizes, binary headers, tokenizer and target/draft compatibility, and reads the
-packed files into memory as they are. `install/legacy.py` installs a package
+weight files into memory as they are. `install/legacy.py` installs a package
 as a selection link to its verified Hub snapshot, pinned like an assembly's
 sources. An installed package starts without a Hub request. A package has no
 variants, so a `:VARIANT` suffix is rejected, and `--revision`,
@@ -1295,7 +1295,7 @@ never rewrites upstream files.
 
 Every start writes a model's target, draft and vision tensors into weight
 images in memory, in the layouts the kernels read: an MLX target, the DFlash2
-draft and any vision tower in the packed layouts of Splash packages, which run
+draft and any vision tower in the layouts of a Splash package's files, which run
 the same kernels, and a GGUF target in the `MDGG0001` layout of the GGUF
 kernels. Each source adapter is a loader, which validates the source's metadata
 and plans its images, and a writer: `AffineTargetLoader` (`AffineTarget.cpp`)
@@ -1303,8 +1303,8 @@ and `AffinePreparation` for an MLX target, `DraftCheckpointLoader`
 (`DraftCheckpoint.cpp`) and `AffinePreparation` for the draft,
 `GgufTargetLoader` (`GgufTarget.cpp`, planned by `GgufImage.cpp`) and
 `GgufPreparation` for a GGUF target, `VisionLoader` and `VisionPreparation` for
-an MLX or GGUF vision tower. A package's packed files are read as they are
-(`packedImage`). `AffinePreparation` reorders an MLX target's codes, scales and
+an MLX or GGUF vision tower. A package's files are read as they are
+(`packageImage`). `AffinePreparation` reorders an MLX target's codes, scales and
 biases into 256-row tiles without requantization, quantizes the draft's BF16
 projections into the same tiles ([Drafts](#drafts)) and computes GDN decay as
 `float(-exp(double(A_log)))`, which may differ by one float ULP in this small
@@ -1373,9 +1373,9 @@ fails (an allocation the driver refuses, a read error, a source written in
 place) stops the engine, which the server starts again.
 
 `loadQwenTarget` (`QwenTargetLoader.hpp`) reads a target's images
-(`QwenTargetFiles`: a package's packed files, or the images
+(`QwenTargetFiles`: a package's files, or the images
 `AffineTargetLoader` or `GgufTargetLoader` plans) through the format that
-stores them. `AffineTargetFormat`, for packed and MLX images, reads every
+stores them. `AffineTargetFormat`, for package and MLX images, reads every
 projection, a fused one too, as one affine Q4 tensor and the norms as bf16.
 `BlockTargetFormat`, for GGUF images, reads each GGUF tensor as one
 block-quantized `QuantizedSegment` (a fused projection's tensors in output
@@ -1460,7 +1460,7 @@ and `LinearGguf.cpp` share, and `MoE.h`; the image formats in
 and the decode-only value tables in `runtime/metal/abi/QuantTables.h`, which no image byte
 depends on; weight loading's repack ABI is `runtime/metal/abi/GgufRepack.h`. The tables are
 llama.cpp's and the decoding follows its Metal kernels: both keep llama.cpp's MIT notice in
-`THIRD_PARTY_NOTICES`, which the package ships.
+`THIRD_PARTY_NOTICES`, which the release archive ships.
 
 The tests' CPU reference (`dev/tests/engine/GgufFormatReference.hpp`) must reproduce the golden
 hashes of upstream GGML's dequantization (llama.cpp 7ab4ee7; for PQ2_0, which upstream lacks,
@@ -1853,9 +1853,9 @@ the same way. The models they are run with, one per family and source format:
 | Qwen3.8-27B | `mlx-community/Qwen3.8-27B-4bit` | `unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M` | `incoai/Qwen3.8-27B-Splash` |
 | Qwen3.6-35B-A3B | `mlx-community/Qwen3.6-35B-A3B-4bit` | `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M` | `incoai/Qwen3.6-35B-A3B-Splash` |
 
-The source formats load differently: an MLX target is written into the packed
+The source formats load differently: an MLX target is written into a package's
 layout, a GGUF target into its own layout for the GGUF projection and MoE
-kernels, and a package's packed files are read as they are.
+kernels, and a package's files are read as they are.
 
 On a 24 GB Mac, `test-agent-real` stops a client's workflow at macOS's warning
 memory pressure, which the smaller GGUF variants such a Mac uses can reach under

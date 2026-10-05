@@ -21,7 +21,7 @@ void compare(model::WeightFile file, const std::filesystem::path &target, uint64
   if (std::filesystem::file_size(path) != record.declaredBytes)
     throw std::runtime_error("image size differs: " + record.relativePath);
   const int fd = open(path.c_str(), O_RDONLY);
-  if (fd < 0) throw std::runtime_error("cannot open packed oracle");
+  if (fd < 0) throw std::runtime_error("cannot open the package's file");
   try {
     std::array<uint8_t, 16> header;
     model::readWeightBytes(fd, 0, header);
@@ -61,7 +61,7 @@ void compare(model::WeightFile file, const std::filesystem::path &target, uint64
       }
     }
     file.finish();
-    std::cout << record.relativePath << " bytes=" << record.declaredBytes << " packed_exact=true decay_max_ulp=" << maximumDecayUlp << std::endl;
+    std::cout << record.relativePath << " bytes=" << record.declaredBytes << " package_exact=true decay_max_ulp=" << maximumDecayUlp << std::endl;
   } catch (...) { close(fd); throw; }
   close(fd);
 }
@@ -69,11 +69,11 @@ void compare(model::WeightFile file, const std::filesystem::path &target, uint64
 int main(int argc, char **argv) {
   @autoreleasepool {
     try {
-      if (argc < 4 || argc > 5) throw std::runtime_error("usage: affine-source-oracle METALLIB SOURCE PACKED_PACKAGE [LAYER]");
+      if (argc < 4 || argc > 5) throw std::runtime_error("usage: affine-source-oracle METALLIB SOURCE PACKAGE [LAYER]");
       const auto started = std::chrono::steady_clock::now();
       metal::MetalBackend backend(argv[1]);
       const std::filesystem::path package(argv[3]);
-      const auto descriptor = model::inspectModelPackage(package);
+      const auto descriptor = model::inspectModelRoot(package);
       std::visit([&](const auto &layout) {
         // Each image is written into memory of its own, so one is held at a
         // time.

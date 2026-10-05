@@ -12,7 +12,7 @@ namespace splash::model {
 // the images read tensor data in bounded slices, without loading the MLX
 // runtime or allocating tensors. It reads no configuration: inspection checks
 // the model's config.json, the target's quantization included
-// (inspectModelPackage).
+// (inspectModelRoot).
 class SafetensorsCheckpoint final {
 public:
   explicit SafetensorsCheckpoint(const std::filesystem::path &directory);

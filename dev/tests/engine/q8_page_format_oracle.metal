@@ -3,7 +3,7 @@
 using namespace metal;
 
 // Native Metal oracle for the persistent Q8 page format. Production writes
-// pages directly from packed prefill/verify kernels and does not link these
+// pages directly from its prefill and verify kernels and does not link these
 // conversion or gather symbols.
 constant uint SplashQ8PageTokens = SPLASH_TARGET_KV_BLOCK_TOKENS;
 constant uint SplashQ8KVHeads = 4;

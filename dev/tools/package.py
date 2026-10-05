@@ -241,8 +241,8 @@ def main(argv=None):
             cwd=stage,
             check=True,
         )
-        packed = Path(temporary) / archive.name
-        with tarfile.open(packed, "w:gz") as release:
+        temporary_archive = Path(temporary) / archive.name
+        with tarfile.open(temporary_archive, "w:gz") as release:
             release.add(
                 stage,
                 arcname=name,
@@ -250,7 +250,7 @@ def main(argv=None):
                     None if "__pycache__" in Path(item.name).parts else item
                 ),
             )
-        packed.replace(archive)
+        temporary_archive.replace(archive)
     checksum = digest(archive)
     archive.with_suffix(archive.suffix + ".sha256").write_text(checksum + "\n")
     url = (

@@ -268,7 +268,7 @@ void KvPool::insertFree(uint32_t page) noexcept {
   list.head = page;
   ++list.count;
   ++freePages_;
-  packingExtent_ = noIndex;
+  fillingExtent_ = noIndex;
 }
 
 void KvPool::removeFree(uint32_t page) noexcept {
@@ -295,7 +295,7 @@ void KvPool::removeFree(uint32_t page) noexcept {
 }
 
 uint32_t KvPool::popFree() noexcept {
-  const uint32_t page = extents_[packingExtent()].freePages.head;
+  const uint32_t page = extents_[fillingExtent()].freePages.head;
   if (page == noIndex)
     std::terminate();
   removeFree(page);
@@ -306,9 +306,9 @@ uint32_t KvPool::popFree() noexcept {
 // ties go to the lowest index, and empty extents lose to any used one. The
 // answer only changes when another extent gains or loses a page, so it is
 // reused until then.
-uint32_t KvPool::packingExtent() noexcept {
-  if (packingExtent_ != noIndex && extents_[packingExtent_].freePages.count)
-    return packingExtent_;
+uint32_t KvPool::fillingExtent() noexcept {
+  if (fillingExtent_ != noIndex && extents_[fillingExtent_].freePages.count)
+    return fillingExtent_;
   uint32_t best = noIndex;
   for (uint32_t index = 0; index < extents_.size(); ++index) {
     const ExtentRecord &extent = extents_[index];
@@ -319,7 +319,7 @@ uint32_t KvPool::packingExtent() noexcept {
   }
   if (best == noIndex)
     std::terminate();
-  packingExtent_ = best;
+  fillingExtent_ = best;
   return best;
 }
 
@@ -329,8 +329,8 @@ void KvPool::markUsed(uint32_t page) noexcept {
   const uint32_t extentIndex = extentOf(page);
   if (pages_[page].onFreeList) {
     removeFree(page);
-    if (extentIndex != packingExtent_)
-      packingExtent_ = noIndex;
+    if (extentIndex != fillingExtent_)
+      fillingExtent_ = noIndex;
   }
   ExtentRecord &extent = extents_[extentIndex];
   if (!extent.usedPages)

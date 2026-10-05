@@ -40,8 +40,9 @@ struct NativeArguments final {
 };
 
 // Reads `serve-native MODEL_DIRECTORY MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto
-// [MAX_CACHE_DISK_BYTES] [--name value]...` and inspects the model package
-// the directory holds. Throws UsageError for a command line it refuses.
+// [MAX_CACHE_DISK_BYTES] [--name value]...` and inspects the model the
+// directory, its model root, holds. Throws UsageError for a command line it
+// refuses.
 [[nodiscard]] NativeArguments parseNativeArguments(int argc,
                                                    const char *const *argv);
 

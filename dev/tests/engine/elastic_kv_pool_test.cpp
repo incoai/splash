@@ -28,7 +28,7 @@ uint64_t reclaimEvery(KvPool &pool, bool keepRunway) {
     return pool.reclaimEmptyExtents(keepRunway, std::numeric_limits<uint32_t>::max());
 }
 
-void testGrowthPacksAllocatedExtents() {
+void testGrowthFillsAllocatedExtents() {
     TestKvStorage storage(12, 100, 4);
     KvPool pool(storage, 4);
     auto pages = pool.acquirePages(5);
@@ -332,8 +332,8 @@ void testCompactionNeedsFreePagesInExtentsInUse() {
             "compaction filled an empty extent");
     // Each extent holds more than the other has free.
     TestKvStorage tight(8, 100, 4);
-    KvPool packed = held(tight, {2, 3, 7});
-    require(packed.compactExtent({}).empty() && tight.copies.empty(),
+    KvPool tightPool = held(tight, {2, 3, 7});
+    require(tightPool.compactExtent({}).empty() && tight.copies.empty(),
             "compaction moved an extent the free pages did not cover");
 }
 
@@ -375,7 +375,7 @@ void testCompactionMovesNothingWhenTheStorageRefuses() {
 
 int main() {
     try {
-        testGrowthPacksAllocatedExtents();
+        testGrowthFillsAllocatedExtents();
         testRunwayIsAllocatedThroughThePool();
         testIdExhaustionIsALogicError();
         testFailedGrowthKeepsItsExtentsForTheRetry();

@@ -54,7 +54,7 @@ struct SchedulerSnapshot final {
       decodeBatchesByWidth{};
 };
 
-// One single-owner scheduling policy. Prefill packs the shortest remaining
+// One single-owner scheduling policy. Prefill batches the shortest remaining
 // sequences first into an actual-row budget, with a bound on how often later
 // arrivals may overtake a lane; decode takes the ready lanes of one priority,
 // constraint mode and stage without waiting for more, so it runs only the
@@ -80,7 +80,7 @@ public:
   void remove(uint64_t requestId);
 
   // A sparse-state materialization point can stop one sequence without
-  // padding or shortening any peer in the same packed command. The boundary
+  // padding or shortening any peer in the same ragged command. The boundary
   // must lie past the request's progress; complete() consumes a boundary its
   // command reached.
   void setPrefillBoundary(uint64_t requestId,

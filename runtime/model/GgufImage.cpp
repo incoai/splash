@@ -314,7 +314,7 @@ void requireRotation(const GgufFile &file, const QwenTargetDimensions &g, const 
 void requireMetadata(const GgufMetadata &metadata, const QwenTargetDimensions &geometry) {
   const std::string arch = architecture(geometry.ffnKind);
   if (metadata.architecture() != arch)
-    throw GgufError("GGUF architecture is " + metadata.architecture() + ", but the package's target is " + arch);
+    throw GgufError("GGUF architecture is " + metadata.architecture() + ", but the model's target is " + arch);
   std::string mismatched;
   const auto expect = [&](const char *key, uint64_t value) {
     const std::optional<uint64_t> found = metadata.unsignedValue(arch + "." + key);

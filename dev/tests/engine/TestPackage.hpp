@@ -1,8 +1,8 @@
 #pragma once
 
-// Synthetic packed model packages: the weight files of a package of given
-// layouts, each section at its aligned offset and zero, which
-// loadModelPackage loads as it loads a Splash package.
+// Synthetic model packages: the weight files of a package of given layouts,
+// each section at its aligned offset and zero, which loadModel loads
+// as it loads a Splash package.
 
 #include "TestChecks.hpp"
 #include "model/DFlashDraft.hpp"
@@ -32,11 +32,6 @@ inline constexpr std::string_view kTargetHeadMagic = "MDFL0002";
 inline constexpr std::string_view kTargetLayerMagic = "MDFL0006";
 inline constexpr std::string_view kVisionMagic = "MDFV0001";
 
-inline uint64_t alignPacked(uint64_t value) {
-  return (value + model::kWeightFileAlignment - 1) &
-         ~(model::kWeightFileAlignment - 1);
-}
-
 inline uint64_t checkedProduct(uint64_t left, uint64_t right) {
   require(!left || right <= std::numeric_limits<uint64_t>::max() / left,
           "synthetic layout size overflow");
@@ -64,7 +59,7 @@ inline uint64_t writeWeightFile(const std::filesystem::path &path,
   std::filesystem::create_directories(path.parent_path());
   int descriptor = open(path.c_str(), O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC,
                         0600);
-  require(descriptor >= 0, "unable to create synthetic packed file");
+  require(descriptor >= 0, "unable to create synthetic weight file");
 
   std::array<uint8_t, 16> header{};
   std::memcpy(header.data(), magic.data(), magic.size());
@@ -73,19 +68,19 @@ inline uint64_t writeWeightFile(const std::filesystem::path &path,
   ssize_t written = pwrite(descriptor, header.data(), header.size(), 0);
   if (written != static_cast<ssize_t>(header.size())) {
     close(descriptor);
-    throw std::runtime_error("unable to write synthetic packed header");
+    throw std::runtime_error("unable to write synthetic weight file header");
   }
 
   uint64_t offset = header.size();
   for (uint64_t bytes : sections) {
     require(bytes > 0, "synthetic section is empty");
-    offset = alignPacked(offset) + bytes;
+    offset = model::alignWeightOffset(offset) + bytes;
   }
-  uint64_t fileBytes = alignPacked(offset);
+  uint64_t fileBytes = model::alignWeightOffset(offset);
   if (fileBytes > static_cast<uint64_t>(std::numeric_limits<off_t>::max()) ||
       ftruncate(descriptor, static_cast<off_t>(fileBytes)) != 0) {
     close(descriptor);
-    throw std::runtime_error("unable to size synthetic packed file");
+    throw std::runtime_error("unable to size synthetic weight file");
   }
   close(descriptor);
   return fileBytes;

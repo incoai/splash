@@ -21,7 +21,7 @@ class VisionLoader;
 
 using TargetWeights = std::variant<Qwen3_8Weights, Qwen3_6MoeWeights>;
 
-struct ModelPackage final {
+struct LoadedModel final {
   ModelDescriptor descriptor;
   // The memory of every image the weights below are views of.
   std::shared_ptr<WeightImages> images;
@@ -66,7 +66,7 @@ struct ModelPackage final {
 // start allocates is admitted through the state storage.
 struct RuntimeContext final {
   metal::MetalBackend &backend;
-  const ModelPackage &package;
+  const LoadedModel &model;
   kv::PageStorage &kvPages;
   QwenStateStorage &stateStorage;
   const ops::ExecutionPlans &operators;
@@ -74,7 +74,7 @@ struct RuntimeContext final {
 
 // Validates only the interface between independently defined target and draft
 // architectures. Each architecture validates its own tensor and state layout.
-void requireCompatibleModelPackage(const ModelPackage &package);
+void requireCompatibleModel(const LoadedModel &model);
 
 // The bytes of every image the model's weights load into.
 [[nodiscard]] uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor);
@@ -89,15 +89,15 @@ void requireCompatibleModelPackage(const ModelPackage &package);
                                                   const std::filesystem::path &root,
                                                   const ModelDescriptor &descriptor, const VisionLoader *loader);
 
-// Production loading is selected by the validated package descriptor. There
+// Production loading is selected by the validated descriptor. There
 // is one shared engine and DFlash controller; only model execution differs.
-[[nodiscard]] ModelPackage
-loadModelPackage(metal::MetalBackend &backend,
+[[nodiscard]] LoadedModel
+loadModel(metal::MetalBackend &backend,
                  const std::filesystem::path &root,
                  const ModelDescriptor &descriptor);
 
 [[nodiscard]] ModelMemoryPlan
-plannedRuntimeMemory(const ModelPackage &package,
+plannedRuntimeMemory(const LoadedModel &model,
                      const ops::ExecutionPlans &operators,
                      kv::Format format);
 [[nodiscard]] std::unique_ptr<RuntimeModel>

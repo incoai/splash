@@ -38,9 +38,11 @@ using splash::model::QwenAttentionWeights;
 using splash::model::QwenGdnWeights;
 using splash::model::Qwen3_8Layout;
 using splash::model::Qwen3_8Weights;
+using splash::model::TargetSource;
+using splash::model::VisionSource;
 using splash::ops::VisionLayout;
 using splash::model::kWeightFileAlignment;
-using splash::model::loadModelPackage;
+using splash::model::loadModel;
 using splash::model::makeModelDescriptor;
 using splash::model::weightManifestFingerprint;
 using splash::metal::BufferStorage;
@@ -105,7 +107,7 @@ private:
     std::filesystem::path path_;
 };
 
-// A packed file loaded into an image: its sections are aligned views the GPU
+// A package file loaded into an image: its sections are aligned views the GPU
 // reads and its memory is tracked; once released, a command that binds it
 // fails until a restore reads the file again, which fails once the file was
 // written.
@@ -141,7 +143,7 @@ void testWeightImages(MetalBackend &backend, const std::filesystem::path &root) 
     {
         splash::model::WeightImages images(backend, "fixture");
         WeightFile file = images.load(
-            splash::model::packedImage(validPath, "test/valid.bin", "TEST0001", 7, 9));
+            splash::model::packageImage(validPath, "test/valid.bin", "TEST0001", 7, 9));
         retained = file.section(sizeof(expected), "payload");
         require(retained.contents() != nullptr &&
                     reinterpret_cast<uintptr_t>(retained.contents()) % kWeightFileAlignment == 0,
@@ -174,22 +176,22 @@ void testWeightImages(MetalBackend &backend, const std::filesystem::path &root) 
     const auto load = [&](const std::filesystem::path &path, std::string_view magic, uint32_t layer,
                           uint32_t type) {
         splash::model::WeightImages images(backend, "fixture");
-        return images.load(splash::model::packedImage(path, "test/" + path.filename().string(), magic, layer, type));
+        return images.load(splash::model::packageImage(path, "test/" + path.filename().string(), magic, layer, type));
     };
     auto headerPath = root / "header.bin";
     writeWeightFile(headerPath, "TEST0001", 7, 9, sections);
     rejects([&] { (void)load(headerPath, "WRONG000", 7, 9); }, "weight image header mismatch",
-            "wrong packed magic was accepted");
+            "wrong magic was accepted");
     rejects([&] { (void)load(headerPath, "TEST0001", 8, 9); }, "weight image header mismatch",
-            "wrong packed layer was accepted");
+            "wrong layer was accepted");
     rejects([&] { (void)load(headerPath, "TEST0001", 7, 8); }, "weight image header mismatch",
-            "wrong packed type was accepted");
+            "wrong type was accepted");
     rejects(
         [&] {
             WeightFile truncated = load(headerPath, "TEST0001", 7, 9);
             (void)truncated.section(fileBytes, {});
         },
-        "is truncated at section", "truncated packed section was accepted");
+        "is truncated at section", "truncated section was accepted");
 
     auto extraPath = root / "extra.bin";
     std::array<uint64_t, 2> extraSections{64, 64};
@@ -200,7 +202,7 @@ void testWeightImages(MetalBackend &backend, const std::filesystem::path &root) 
             (void)extra.section(64, {});
             extra.finish();
         },
-        "weight image has unconsumed or missing bytes", "unconsumed packed bytes were accepted");
+        "weight image has unconsumed or missing bytes", "unconsumed bytes were accepted");
 
     auto unalignedPath = root / "unaligned.bin";
     writeWeightFile(unalignedPath, "TEST0001", 1, 2, sections);
@@ -208,7 +210,7 @@ void testWeightImages(MetalBackend &backend, const std::filesystem::path &root) 
                      static_cast<off_t>(fileBytes - 1)) == 0,
             "unable to truncate synthetic file");
     rejects([&] { (void)load(unalignedPath, "TEST0001", 1, 2); }, "weight image size is not 16 KiB-aligned",
-            "unaligned packed file size was accepted");
+            "unaligned file size was accepted");
 }
 
 // One tensor of a GGUF image: its descriptor, then its sections.
@@ -253,7 +255,7 @@ void testGgufImageLayout(MetalBackend &backend, const std::filesystem::path &roo
     splash::model::WeightImages images(backend, "fixture");
     const auto loaded = [&](const std::filesystem::path &path) {
         return images.load(
-            splash::model::packedImage(path, "test/" + path.filename().string(), kGgufImageMagic, 0, 0));
+            splash::model::packageImage(path, "test/" + path.filename().string(), kGgufImageMagic, 0, 0));
     };
     {
         // finish() proves the reader took exactly the descriptor, plane0 and
@@ -353,9 +355,10 @@ void testSyntheticPackage(MetalBackend &backend,
     uint64_t actualTrackedBytes = 0;
     {
         ModelDescriptor descriptor =
-            makeModelDescriptor("Qwen dense loader oracle", target, draft, vision);
+            makeModelDescriptor("Qwen dense loader oracle", target, draft, vision,
+                                TargetSource::Package, VisionSource::Package);
         descriptor.sourceIdentity = "sources";
-        auto package = loadModelPackage(backend, root, descriptor);
+        auto package = loadModel(backend, root, descriptor);
         const auto &loadedTarget = std::get<Qwen3_8Weights>(package.target);
         require(loadedTarget.layers.size() == target.layers,
                 "target layer vector is incomplete");
@@ -451,7 +454,7 @@ void testSyntheticPackage(MetalBackend &backend,
                 "restored weights differ from the loaded ones");
     }
     require(backend.memoryStats().allocatedBytes == baseline,
-            "model package allocations survived package destruction");
+            "the package's allocations survived its destruction");
 
     std::cout << "synthetic declared_target=" << expected.targetBytes
               << " declared_draft=" << expected.draftBytes
@@ -469,7 +472,7 @@ void validateRealPackage(MetalBackend &backend,
     std::string fingerprint;
     std::string name;
     {
-        auto package = loadModelPackage(backend, root, splash::model::inspectModelPackage(root));
+        auto package = loadModel(backend, root, splash::model::inspectModelRoot(root));
         targetBytes = declaredBytes(package.targetFiles());
         draftBytes = declaredBytes(package.draft.files);
         visionBytes = declaredBytes(package.vision.files);
@@ -514,7 +517,7 @@ void testRealPackageMetadata(const std::filesystem::path &root) {
     std::filesystem::create_directory(temporary.path() / "tokenizer");
     std::filesystem::copy_file(root / "tokenizer/config.json",
                                temporary.path() / "tokenizer/config.json");
-    const auto expected = splash::model::inspectModelPackage(root);
+    const auto expected = splash::model::inspectModelRoot(root);
     for (std::string_view name : {std::string_view(expected.name),
                                   std::string_view("Community fine-tune")}) {
         for (std::string_view prefix : {"splash-packed-q4", "unknown-packed-q4"}) {
@@ -533,7 +536,7 @@ void testRealPackageMetadata(const std::filesystem::path &root) {
             }
             try {
                 const auto descriptor =
-                    splash::model::inspectModelPackage(temporary.path());
+                    splash::model::inspectModelRoot(temporary.path());
                 require(prefix != "unknown-packed-q4",
                         "unknown model format was accepted");
                 require(descriptor.name == name &&
@@ -569,7 +572,7 @@ int main(int argc, const char *argv[]) {
             testRealPackageMetadata(argv[2]);
             validateRealPackage(backend, argv[2]);
         }
-        std::cout << "PASS ModelPackage\n";
+        std::cout << "PASS model-package\n";
     } catch (const std::exception &error) {
         std::cerr << "FAIL: unexpected exception: " << error.what() << '\n';
         return 1;

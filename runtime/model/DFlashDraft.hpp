@@ -172,7 +172,7 @@ struct DFlashDraftWeights final {
 inline constexpr std::string_view kDFlashLayerMagic = "MDFD0004";
 
 // A Splash package's draft files: layer-<N>.bin and model.bin.
-struct PackedDraftFiles final {
+struct PackageDraftFiles final {
   WeightImages &images;
   std::filesystem::path directory;
   const DFlashDraftLayout &layout;
@@ -182,16 +182,16 @@ struct PackedDraftFiles final {
 
 class DraftCheckpointLoader;
 
-// The files a draft is read from: a package's packed files, or the images
+// The files a draft is read from: a package's files, or the images
 // DraftCheckpointLoader writes from a DFlash2 checkpoint.
-using DraftFiles = std::variant<PackedDraftFiles, std::reference_wrapper<DraftCheckpointLoader>>;
+using DraftFiles = std::variant<PackageDraftFiles, std::reference_wrapper<DraftCheckpointLoader>>;
 
 [[nodiscard]] DFlashDraftWeights
 loadDFlashDraftWeights(metal::MetalBackend &backend, const DraftFiles &files,
                        DFlashDraftLayout layout);
 
 // Builds the draft layer graph and its proposal selection
-// (ops::DraftSelector) from packed buffers and persistent context; the
+// (ops::DraftSelector) from batch buffers and persistent context; the
 // target's sampling and acceptance policy remain outside the model.
 class DFlashDraft final {
 public:

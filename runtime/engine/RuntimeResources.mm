@@ -139,14 +139,14 @@ std::array<uint8_t, 32> parseSha256(std::string_view value) {
 
 } // namespace
 
-void requireLoadedModel(const model::ModelPackage &package) {
-  if (!package.targetActualAllocatedBytes() ||
-      !package.draft.actualAllocatedBytes ||
-      (package.descriptor.hasVision() && !package.vision.actualAllocatedBytes) ||
-      package.manifestFingerprintSha256.empty() ||
-      package.targetManifestFingerprint().empty()) {
+void requireLoadedModel(const model::LoadedModel &loaded) {
+  if (!loaded.targetActualAllocatedBytes() ||
+      !loaded.draft.actualAllocatedBytes ||
+      (loaded.descriptor.hasVision() && !loaded.vision.actualAllocatedBytes) ||
+      loaded.manifestFingerprintSha256.empty() ||
+      loaded.targetManifestFingerprint().empty()) {
     throw std::invalid_argument(
-        "loaded model package has incomplete allocation accounting");
+        "loaded model has incomplete allocation accounting");
   }
 }
 
@@ -217,7 +217,7 @@ RuntimeResourcesError::RuntimeResourcesError(RuntimeResourceStage stage,
 
 RuntimeResources::RuntimeResources(
     PersistentCacheFiles persistentCache,
-    std::unique_ptr<metal::MetalBackend> backend, model::ModelPackage model,
+    std::unique_ptr<metal::MetalBackend> backend, model::LoadedModel model,
     ops::ExecutionPlans operators, EngineMemoryPlan memoryPlan,
     RuntimeCacheIdentity cacheIdentity,
     std::unique_ptr<MemoryGovernor> memoryGovernor,
@@ -345,7 +345,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
               std::to_string(hardBudgetBytes) + " bytes",
           {}, RuntimeResourceFailure::EngineCapacity);
     }
-    // Fail before opening the package when the machine has no headroom at
+    // Fail before loading the model when the machine has no headroom at
     // all; the guard installed above keeps checking as residency grows.
     admitMetalOperation();
   } catch (const RuntimeResourcesError &) {
@@ -359,11 +359,11 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
                                 error.what());
   }
 
-  model::ModelPackage package;
+  model::LoadedModel loaded;
   try {
     const auto started = AwakeClock::now();
-    package = model::loadModelPackage(*backend, config.modelRoot, config.model);
-    requireLoadedModel(package);
+    loaded = model::loadModel(*backend, config.modelRoot, config.model);
+    requireLoadedModel(loaded);
     const std::chrono::duration<double> loading = AwakeClock::now() - started;
     logLine("Weights loaded in ", std::fixed, std::setprecision(2),
             loading.count(), " s.");
@@ -381,7 +381,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
   ops::ExecutionPlans operators(device);
   model::ModelMemoryPlan modelMemoryPlan;
   try {
-    modelMemoryPlan = model::plannedRuntimeMemory(package, operators, config.kvFormat);
+    modelMemoryPlan = model::plannedRuntimeMemory(loaded, operators, config.kvFormat);
   } catch (const std::exception &error) {
     throw RuntimeResourcesError(
         RuntimeResourceStage::MemoryPlanning,
@@ -389,16 +389,16 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
   }
 
   ModelMemoryFootprint footprint{
-      package.targetActualAllocatedBytes(),
-      package.draft.actualAllocatedBytes,
-      package.vision.actualAllocatedBytes,
+      loaded.targetActualAllocatedBytes(),
+      loaded.draft.actualAllocatedBytes,
+      loaded.vision.actualAllocatedBytes,
       modelMemoryPlan,
       stateStagingBytes,
   };
 
   ModelMemoryProfile modelProfile{
-      package.name(), package.maximumContextTokens(),
-      package.targetKvLayout(config.kvFormat), footprint};
+      loaded.name(), loaded.maximumContextTokens(),
+      loaded.targetKvLayout(config.kvFormat), footprint};
   EngineMemoryPlanResult planResult =
       evaluateEngineMemoryPlan(device, modelProfile, config.maximumMemoryBytes);
   if (!planResult.plan) {
@@ -411,9 +411,9 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
   RuntimeCacheIdentity cacheIdentity;
   try {
     cacheIdentity = makeRuntimeCacheIdentity(
-        package.manifestFingerprintSha256,
-        package.targetManifestFingerprint(), config.buildId,
-        package.targetKvLayout(config.kvFormat));
+        loaded.manifestFingerprintSha256,
+        loaded.targetManifestFingerprint(), config.buildId,
+        loaded.targetKvLayout(config.kvFormat));
   } catch (const std::exception &error) {
     throw RuntimeResourcesError(RuntimeResourceStage::ModelLoading,
                                 error.what(),
@@ -440,7 +440,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
         (budget.hardBudgetBytes + budget.kvExtentBytes - 1) / budget.kvExtentBytes,
         std::numeric_limits<uint32_t>::max() / budget.kvExtentPages);
     auto kvPages = std::make_unique<kv::PageStorage>(
-        *backend, memoryGovernor->allocationAdmission(), package.targetKvLayout(config.kvFormat),
+        *backend, memoryGovernor->allocationAdmission(), loaded.targetKvLayout(config.kvFormat),
         static_cast<uint32_t>(poolExtents * budget.kvExtentPages), budget.kvExtentPages);
     auto kvPool = std::make_unique<KvPool>(*kvPages, model::ExecutionLimits::warmupKvPages);
     // A persistent tier keeps its files in a cache directory of its own.
@@ -450,14 +450,14 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
     if (stateFile && !config.persistentCacheRoot.empty()) {
       persistentCache = openPersistentCache(
           config.persistentCacheRoot,
-          persistentCacheNamespace(cacheIdentity, package.stateLayout()),
+          persistentCacheNamespace(cacheIdentity, loaded.stateLayout()),
           model::SlotFile::slotBytesFor(kvPages->bytesPerPage()), stateFile->slotBytes(),
           diskBudget, config.cancelled);
       if (persistentCache.directory)
         stateFile = persistentCache.states;
     }
     auto stateStorage = std::make_unique<model::QwenStateStorage>(
-        *backend, memoryGovernor->allocationAdmission(), package.stateLayout(),
+        *backend, memoryGovernor->allocationAdmission(), loaded.stateLayout(),
         stateFile);
     std::unique_ptr<KvPageTier> kvTier;
     if (diskBudget) {
@@ -498,7 +498,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
     }
 
     auto result = std::unique_ptr<RuntimeResources>(new RuntimeResources(
-        std::move(persistentCache), std::move(backend), std::move(package),
+        std::move(persistentCache), std::move(backend), std::move(loaded),
         std::move(operators), std::move(memoryPlan), std::move(cacheIdentity),
         std::move(memoryGovernor), std::move(kvPages), std::move(stateStorage),
         std::move(kvTier), std::move(kvPool), std::move(cache),

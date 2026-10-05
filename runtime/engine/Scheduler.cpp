@@ -264,8 +264,8 @@ std::optional<BatchPlan> Scheduler::next(std::span<const uint64_t> excluded) con
                                              : std::move(prefill);
   }
 
-  // Prefill and decode use different Metal graphs and cannot be packed into
-  // one command. Honor request priority first. Then decode runs while
+  // Prefill and decode use different Metal graphs and cannot share one
+  // command. Honor request priority first. Then decode runs while
   // prefill owes it time, and otherwise the kinds alternate at command
   // boundaries so equal-priority work cannot starve.
   if (decodeDebtMilliseconds_ > 0.0)
@@ -365,7 +365,7 @@ uint32_t Scheduler::prefillBudget(
   // A leader that finishes within the full budget ends the command at its
   // last row, or at its next state boundary: prefill cost is linear above
   // the slice, so shortest-first sequential commands minimise first-token
-  // latency. Long prefills stay packed only when no lane finishes.
+  // latency. Long prefills share a command only when no lane finishes.
   if (leaderRemaining <= maximum)
     return dispatchRemaining(leader);
   return maximum;

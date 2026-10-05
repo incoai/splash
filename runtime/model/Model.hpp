@@ -373,7 +373,7 @@ maskWordsPerToken(uint32_t vocabularySize) noexcept {
 
 // Compile-time ceiling of the one native DFlash execution contract. A draft
 // must have been trained for blocks of draftQueryRows rows over
-// draftContextTokens context tokens, which inspectModelPackage checks a
+// draftContextTokens context tokens, which inspectModelRoot checks a
 // package's manifest and a DFlash2 checkpoint's config for; the other limits
 // are the runtime's own. Cache-page and attention-kernel geometry live with
 // their operators.
@@ -508,7 +508,7 @@ public:
   [[nodiscard]] virtual StateAdmission begin(const ModelRequest &request) = 0;
   // Safe-point preemption returns the request's state buffers, retaining
   // only its host-side sampling/constraint continuation. Resume replays the
-  // supplied committed history through the ordinary packed-prefill path.
+  // supplied committed history through the ordinary prefill path.
   virtual void suspend(uint64_t requestId) = 0;
   [[nodiscard]] virtual StateAdmission resume(const ModelRequest &request) = 0;
   // Restores a cached state into the request's lane at `boundary`. A RAM

@@ -195,7 +195,7 @@ metal::MetalBuffer QwenTarget::addPrefill(
       sequences.size() > ExecutionLimits::maximumBatchWidth || !rows ||
       rows > ExecutionLimits::prefillTokenBudget ||
       kvLayers.size() != geometry_.kvLayout.attentionLayers) {
-    throw std::invalid_argument("invalid Qwen packed prefill batch");
+    throw std::invalid_argument("invalid Qwen ragged prefill batch");
   }
   for (const QwenTargetPrefillSequence &sequence : sequences) {
     if (sequence.convolutionIn.size() != geometry_.stateLayout.layers ||

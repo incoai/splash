@@ -456,7 +456,7 @@ struct AllocationFault final {
 
 void requireAtomicImageAdmission(model::Runtime &executor,
                                  metal::MetalBackend &backend,
-                                 const model::ModelPackage &model,
+                                 const model::LoadedModel &model,
                                  AllocationFault &fault) {
   const uint64_t originalBytes = backend.memoryStats().allocatedBytes;
   const uint64_t originalSubmissions =
@@ -599,7 +599,7 @@ void requireAtomicImageAdmission(model::Runtime &executor,
 void requireImageRowsAfterReclaim(model::Runtime &executor,
                                   metal::MetalBackend &backend,
                                   model::QwenStateStorage &states,
-                                  const model::ModelPackage &model,
+                                  const model::LoadedModel &model,
                                   AllocationFault &fault) {
   while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
   }
@@ -906,7 +906,7 @@ EngineRequest imageRequest(uint64_t id, ImageSpan span) {
 }
 
 // Two requests with the same image share its rows from their start: both
-// admitted before either prefills, one packed command encodes the image
+// admitted before either prefills, one ragged command encodes the image
 // once and both lanes inject it.
 void requireConcurrentRequestsShareOneEncode(model::Runtime &executor,
                                              metal::MetalBackend &backend) {
@@ -1019,7 +1019,7 @@ void requireInjectedRowsBecomeReclaimable(model::Runtime &executor,
 // refused; one at it continues past the image without encoding it.
 void requireCoveredImagesAreNotStaged(model::Runtime &executor,
                                       metal::MetalBackend &backend,
-                                      const model::ModelPackage &model) {
+                                      const model::LoadedModel &model) {
   while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
   }
   const uint64_t originalBytes = backend.memoryStats().allocatedBytes;
@@ -1091,7 +1091,7 @@ void requireCoveredImagesAreNotStaged(model::Runtime &executor,
 // the refused attempt did.
 void requireRefusedStartKeepsItsRows(model::Runtime &executor,
                                      metal::MetalBackend &backend,
-                                     const model::ModelPackage &model,
+                                     const model::LoadedModel &model,
                                      AllocationFault &fault) {
   while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
   }
@@ -1180,7 +1180,7 @@ void requireRefusedStartKeepsItsRows(model::Runtime &executor,
 // them.
 void requireReclaimTakesOneCacheUnit(model::Runtime &executor,
                                      metal::MetalBackend &backend,
-                                     const model::ModelPackage &model) {
+                                     const model::LoadedModel &model) {
   while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
   }
   const uint64_t originalBytes = backend.memoryStats().allocatedBytes;
@@ -1227,7 +1227,7 @@ void requireReclaimTakesOneCacheUnit(model::Runtime &executor,
 // encoder only when it covers the start's image.
 void requireEncoderFitsItsImages(model::Runtime &executor,
                                  metal::MetalBackend &backend,
-                                 const model::ModelPackage &model,
+                                 const model::LoadedModel &model,
                                  AllocationFault &fault) {
   while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
   }
@@ -1341,7 +1341,7 @@ void requireReplayPointKeepsItsImageRows(model::Runtime &executor,
   std::cout << "replay_point_keeps_its_image_rows=PASS\n";
 }
 
-void warmupEos(model::RuntimeContext context, model::ModelPackage &package) {
+void warmupEos(model::RuntimeContext context, model::LoadedModel &model) {
   uint32_t prefillStop = 0;
   uint32_t decodeStop = 0;
   {
@@ -1356,12 +1356,12 @@ void warmupEos(model::RuntimeContext context, model::ModelPackage &package) {
     require(decodeStop != 0 && !decoded.lanes[0].step.finished,
             "warmup EOS fixture needs a non-terminal baseline continuation");
   }
-  const auto originalTarget = package.descriptor.target;
+  const auto originalTarget = model.descriptor.target;
   const auto setStops = [&](uint32_t stop) {
     std::visit([&](auto &weights) {
       weights.layout.stopTokens = {stop, stop};
-      package.descriptor.target = weights.layout;
-    }, package.target);
+      model.descriptor.target = weights.layout;
+    }, model.target);
   };
   setStops(prefillStop);
   {
@@ -1392,8 +1392,8 @@ void warmupEos(model::RuntimeContext context, model::ModelPackage &package) {
   std::visit([&](auto &weights) {
     using Layout = std::decay_t<decltype(weights.layout)>;
     weights.layout = std::get<Layout>(originalTarget);
-  }, package.target);
-  package.descriptor.target = originalTarget;
+  }, model.target);
+  model.descriptor.target = originalTarget;
   const model::QwenStateStorage &states = context.stateStorage;
   for (uint32_t lane = 0; lane < 4; ++lane)
     require(!states.metadata(lane).assigned(),
@@ -1429,19 +1429,19 @@ int main(int argc, char **argv) {
     require(hostAvailableBytes.has_value(),
             "cannot measure available host memory before loading the oracle model");
     const std::filesystem::path modelRoot(argv[2]);
-    const auto descriptor = model::inspectModelPackage(modelRoot);
+    const auto descriptor = model::inspectModelRoot(modelRoot);
     // Production's weight byte count with a different bound. Production checks
     // it only against the Metal hard budget, then guards host headroom at every
     // Metal operation while loading. This oracle has no such guard, so the
     // weights must fit in reclaimable memory above the macOS reserve before
-    // any is loaded; it can refuse a package production starts.
+    // any is loaded; it can refuse a model production starts.
     const uint64_t weightBytes = model::modelWeightBytes(modelRoot, descriptor);
     if (*hostAvailableBytes <= hostReserveBytes ||
         weightBytes > *hostAvailableBytes - hostReserveBytes)
       stopForHostMemory("the weights need " + mebibytes(weightBytes),
                         *hostAvailableBytes, hostReserveBytes);
-    model::ModelPackage model =
-        model::loadModelPackage(backend, modelRoot, descriptor);
+    model::LoadedModel model =
+        model::loadModel(backend, modelRoot, descriptor);
     ops::ExecutionPlans operators(backend.capabilities());
     model::ModelMemoryPlan executorPlan =
         model::plannedRuntimeMemory(model, operators, format);
@@ -2379,7 +2379,7 @@ int main(int argc, char **argv) {
             "production snapshot allocation failed");
     executor.end(70);
 
-    // One packed command consumes exactly 2048 real, unequal rows. Repeating
+    // One ragged command consumes exactly 2048 real, unequal rows. Repeating
     // its M32 decode with permuted lanes proves ragged addressing and state
     // isolation without requiring another batch width's numerical decisions.
     constexpr std::array<uint64_t, 4> raggedIds{100, 101, 102, 103};
@@ -2499,7 +2499,7 @@ int main(int argc, char **argv) {
       executor.end(104 + lane);
     }
 
-    // Lanes that finish their prompts in one packed prefill share one LM
+    // Lanes that finish their prompts in one ragged prefill share one LM
     // head and one selection. Kernels choose their tiles by a command's
     // rows, so the reference for a lane is a command of the same rows, not
     // the lane alone. With the lanes in the reverse order, each finishing
@@ -2534,13 +2534,13 @@ int main(int argc, char **argv) {
       const std::array<std::vector<uint32_t>, 4> pages{
           pageRange(52, 2), pageRange(54, 2), pageRange(56, 7),
           pageRange(63, 3)};
-      // One packed prefill of the four lanes, each on its own state lane, in
+      // One ragged prefill of the four lanes, each on its own state lane, in
       // `order`; `others` gives every lane but the score lane another
       // prompt. The open lane's prompt then ends in a command of its own.
       // The results are by lane.
       uint64_t nextId = 140;
-      const auto packedPrefill = [&](const std::array<uint32_t, 4> &order,
-                                     bool others) {
+      const auto prefillInOrder = [&](const std::array<uint32_t, 4> &order,
+                                      bool others) {
         BatchPlan plan{.kind = WorkKind::Prefill,
                        .decodeStage = DecodeStage::Regular};
         std::array<EngineRequest, 4> requests;
@@ -2557,11 +2557,11 @@ int main(int argc, char **argv) {
           items[position].inputTokens =
               std::span(requests[lane].prompt).first(rows[lane]);
         }
-        std::vector<ModelStepResult> packed = executor.prefill(plan, items);
-        require(packed.size() == items.size(), "packed prefill width mismatch");
+        std::vector<ModelStepResult> byPosition = executor.prefill(plan, items);
+        require(byPosition.size() == items.size(), "ragged prefill width mismatch");
         std::array<ModelStepResult, 4> results;
         for (uint32_t position = 0; position < order.size(); ++position)
-          results[order[position]] = std::move(packed[position]);
+          results[order[position]] = std::move(byPosition[position]);
         require(results[kOpen].outputTokens.empty() && !results[kOpen].finished &&
                     states.metadata(kOpen).lengths.targetTokens == rows[kOpen],
                 "a lane that did not finish its prompt took part in the head");
@@ -2583,22 +2583,22 @@ int main(int argc, char **argv) {
                       1e-3F * std::max(1.0F, std::fabs(right.scoreLogits[option])),
                   message);
       };
-      const auto packed =
-          packedPrefill({kScoredRow, kGreedy, kOpen, kSampled}, false);
+      const auto inOrder =
+          prefillInOrder({kScoredRow, kGreedy, kOpen, kSampled}, false);
       const auto reversed =
-          packedPrefill({kSampled, kOpen, kGreedy, kScoredRow}, false);
+          prefillInOrder({kSampled, kOpen, kGreedy, kScoredRow}, false);
       for (const uint32_t lane : {kGreedy, kOpen, kSampled}) {
-        require(reversed[lane].outputTokens == packed[lane].outputTokens &&
-                    packed[lane].outputTokens.size() == 1,
+        require(reversed[lane].outputTokens == inOrder[lane].outputTokens &&
+                    inOrder[lane].outputTokens.size() == 1,
                 "a lane selected another first token beside the lanes in "
                 "another order");
       }
-      sameScores(reversed[kScoredRow], packed[kScoredRow],
+      sameScores(reversed[kScoredRow], inOrder[kScoredRow],
                  "a score lane read other logits beside the lanes in another "
                  "order");
       const auto others =
-          packedPrefill({kScoredRow, kGreedy, kOpen, kSampled}, true);
-      sameScores(others[kScoredRow], packed[kScoredRow],
+          prefillInOrder({kScoredRow, kGreedy, kOpen, kSampled}, true);
+      sameScores(others[kScoredRow], inOrder[kScoredRow],
                  "a score lane's logits changed with the other lanes' prompts");
     }
 

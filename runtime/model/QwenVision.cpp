@@ -81,7 +81,7 @@ QwenVisionWeights loadQwenVisionWeights(metal::MetalBackend &backend, WeightImag
                                         ops::VisionLayout layout) {
   requireVisionLayout(layout);
   return readVision(backend, images,
-                    packedImage(directory / "model.bin", "vision/model.bin", kVisionMagic, layout.depth, 0),
+                    packageImage(directory / "model.bin", "vision/model.bin", kVisionMagic, layout.depth, 0),
                     layout);
 }
 

@@ -23,8 +23,9 @@
 namespace splash::model {
 
 // How a target's files store its tensors; loadQwenTarget pairs each source's
-// files with their format. Affine files, packed or written from MLX, hold
-// every projection, a fused one too, as one affine Q4 tensor, and bf16 norms.
+// files with their format. Affine files, from a package or written from MLX,
+// hold every projection, a fused one too, as one affine Q4 tensor, and bf16
+// norms.
 struct AffineTargetFormat final {
   static constexpr ops::GdnHeadOrder gdnOutputOrder = ops::GdnHeadOrder::Grouped;
 
@@ -81,23 +82,23 @@ template <class Format>
                                              const QwenTargetDimensions &target,
                                              bool fullAttention);
 
-// Loads the packed files of a target directory: one per hybrid layer,
+// Loads the files of a package's target directory: one per hybrid layer,
 // head.bin and embedding.bin.
-template <class Layout> struct PackedTargetFiles final {
+template <class Layout> struct PackageTargetFiles final {
   WeightImages &images;
   std::filesystem::path directory;
   const Layout &layout;
   [[nodiscard]] WeightFile layer(uint32_t index) const {
     const std::string filename = "layer-" + std::to_string(index) + ".bin";
-    return images.load(packedImage(directory / filename, "target/" + filename, Layout::layerMagic, index,
-                                   layout.isFullAttentionLayer(index) ? 1U : 0U));
+    return images.load(packageImage(directory / filename, "target/" + filename, Layout::layerMagic, index,
+                                    layout.isFullAttentionLayer(index) ? 1U : 0U));
   }
   [[nodiscard]] WeightFile head() const {
-    return images.load(packedImage(directory / "head.bin", "target/head.bin", Layout::headMagic, layout.layers, 2));
+    return images.load(packageImage(directory / "head.bin", "target/head.bin", Layout::headMagic, layout.layers, 2));
   }
   [[nodiscard]] WeightFile embedding() const {
-    return images.load(packedImage(directory / "embedding.bin", "target/embedding.bin", kEmbeddingMagic,
-                                   layout.vocabularySize, layout.hiddenSize));
+    return images.load(packageImage(directory / "embedding.bin", "target/embedding.bin", kEmbeddingMagic,
+                                    layout.vocabularySize, layout.hiddenSize));
   }
 };
 
@@ -196,7 +197,7 @@ loadQwenTarget(metal::MetalBackend &backend, const Layout &layout, const QwenTar
   const AffineTargetFormat affine{};
   if (const auto *mlx = std::get_if<std::reference_wrapper<AffineTargetLoader>>(&files))
     return readQwenTargetWeights<Weights>(backend, layout, mlx->get(), affine, readFfn);
-  return readQwenTargetWeights<Weights>(backend, layout, std::get<PackedTargetFiles<Layout>>(files), affine,
+  return readQwenTargetWeights<Weights>(backend, layout, std::get<PackageTargetFiles<Layout>>(files), affine,
                                         readFfn);
 }
 
