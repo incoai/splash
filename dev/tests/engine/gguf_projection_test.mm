@@ -35,6 +35,7 @@
 #include <random>
 #include <set>
 #include <string>
+#include <tuple>
 #include <vector>
 
 using namespace splash;
@@ -734,6 +735,66 @@ void tokenGather(MetalBackend &backend) {
   section("token gather: " + std::to_string(formats) + " embedding formats, each value bf16 of GGML's fp32 value");
 }
 
+// Each buffer the token gathers reach, at its extent and one element short:
+// the rows' token ids and bf16 output rows, every token's native blocks, the
+// rotation signs of a rotated PQ2_0 table, and an affine table's Q4 rows with
+// a scale and a bias per 64 values.
+void gatherExtents(MetalBackend &backend) {
+  constexpr uint32_t kVocabulary = 64, kHidden = 1024, kRows = 9;
+  const MetalBuffer tokens = test::sharedBuffer(backend, kRows * 4),
+                    output = test::sharedBuffer(backend, uint64_t{kRows} * kHidden * 2);
+  // A buffer of the table `with` returns with it.
+  const auto requireTableExtent = [&](const MetalBuffer &buffer, uint64_t bytes, uint64_t element, const char *what,
+                                      const auto &with) {
+    test::requireExtent(backend, buffer, bytes, element, what, [&](CommandGraph &graph, const MetalBuffer &view) {
+      Embedding::add(graph, tokens, with(view), output, kRows);
+    });
+  };
+  std::vector<EmbeddingWeights> tables;
+  for (const Fmt f : {Q80, PQ20}) {
+    const QuantFormat &format = kQuantFormats[f];
+    const uint64_t rowBytes = uint64_t{kHidden} / format.block_elements * format.block_bytes;
+    EmbeddingWeights table(kVocabulary, kHidden, NativeRows(test::sharedBuffer(backend, kVocabulary * rowBytes), f));
+    if (f == PQ20) table.rotation.signs = test::sharedBuffer(backend, kHidden);
+    requireTableExtent(table.blocks().rows, kVocabulary * rowBytes, format.block_bytes, "token table",
+                       [&](const MetalBuffer &rows) {
+                         EmbeddingWeights changed(kVocabulary, kHidden, NativeRows(rows, f));
+                         changed.rotation = table.rotation;
+                         return changed;
+                       });
+    if (table.rotation)
+      requireTableExtent(table.rotation.signs, kHidden, 1, "embedding rotation sign", [&](const MetalBuffer &signs) {
+        EmbeddingWeights changed = table;
+        changed.rotation.signs = signs;
+        return changed;
+      });
+    tables.push_back(table);
+  }
+  const uint64_t parameters = uint64_t{kVocabulary} * (kHidden / 64) * 2;
+  const AffineWeights planes{test::sharedBuffer(backend, uint64_t{kVocabulary} * kHidden / 2),
+                             test::sharedBuffer(backend, parameters), test::sharedBuffer(backend, parameters)};
+  for (const auto &[member, bytes, element, what] :
+       std::initializer_list<std::tuple<MetalBuffer AffineWeights::*, uint64_t, uint64_t, const char *>>{
+           {&AffineWeights::weights, uint64_t{kVocabulary} * kHidden / 2, 1, "token table"},
+           {&AffineWeights::scales, parameters, 2, "token table scale"},
+           {&AffineWeights::biases, parameters, 2, "token table bias"}})
+    requireTableExtent(planes.*member, bytes, element, what, [&](const MetalBuffer &view) {
+      AffineWeights changed = planes;
+      changed.*member = view;
+      return EmbeddingWeights(kVocabulary, kHidden, changed);
+    });
+  tables.emplace_back(kVocabulary, kHidden, planes);
+  for (const EmbeddingWeights &table : tables) {
+    test::requireExtent(backend, tokens, kRows * 4, 4, "embedding token", [&](CommandGraph &graph, const MetalBuffer &view) {
+      Embedding::add(graph, view, table, output, kRows);
+    });
+    test::requireExtent(backend, output, uint64_t{kRows} * kHidden * 2, 2, "embedding output",
+                        [&](CommandGraph &graph, const MetalBuffer &view) { Embedding::add(graph, tokens, table, view, kRows); });
+  }
+  section("token gather extents: every buffer of native, rotated and affine tables at its extent and refused one "
+          "element short");
+}
+
 int main(int argc, char **argv) {
   @autoreleasepool {
     if (argc != 2) {
@@ -762,6 +823,7 @@ int main(int argc, char **argv) {
       section("split visibility: both tiles, 1 and 4 lanes, every split pair the policy picks for 8-80 cores, "
               "independent of poisoned partials and within fp64");
       tokenGather(backend);
+      gatherExtents(backend);
     } catch (const std::exception &e) {
       std::cerr << "gguf-projection: FAIL: " << e.what() << '\n';
       return 1;

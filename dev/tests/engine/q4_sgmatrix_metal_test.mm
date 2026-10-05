@@ -18,6 +18,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -340,18 +341,12 @@ void fusedNorm(metal::MetalBackend &backend, uint32_t k, uint32_t rows, LinearIn
 }
 // The affine prefill's norm, with bf16 weights only, whose rows need not fill
 // its 32-row sum tiles. Its rows equal the plain norm's bit for bit, which a
-// prefill whose consumer reads no sums runs instead. F32 weights, which have
-// no kernel, are refused before anything is encoded.
+// prefill whose consumer reads no sums runs instead.
 void prefillNorm(metal::MetalBackend &backend, uint32_t k, uint32_t rows) {
   const NormCase c=normCase(backend,k,rows,false);
   auto output=test::sharedBuffer(backend, k*rows*2), plain=test::sharedBuffer(backend, k*rows*2);
   auto sums=test::sharedBuffer(backend, (rows+31)/32*32*(k/64)*4);
   metal::CommandGraph graph;
-  const NormCase f32=normCase(backend,k,rows,true);
-  bool refused=false;
-  try { Normalization::addRmsWithQ4Sums(graph,f32.input,f32.weight,output,sums,k,rows); }
-  catch (const std::invalid_argument &) { refused=true; }
-  require(refused && graph.empty(),"the Q4-sum norm took F32 weights");
   Normalization::addRmsWithQ4Sums(graph,c.input,c.weight,output,sums,k,rows);
   Normalization::addRms(graph,c.input,c.weight,plain,k,rows);
   require(graph.dispatches().back().pipelineName.starts_with("norm_rms_staged")==
@@ -360,6 +355,87 @@ void prefillNorm(metal::MetalBackend &backend, uint32_t k, uint32_t rows) {
   (void)backend.submitCommandAsync(graph.dispatches()).wait();
   requireNorm(c,output,k,rows,"prefill norm differs from the fp64 reference");
   require(!std::memcmp(output.contents(),plain.contents(),k*rows*2),"prefill norm rows differ from the plain norm's");
+}
+// Each buffer the norms reach, at its extent and one element short: the rows
+// of inputs and outputs, the weights in either type, the table and sums a
+// table layout writes, and the Q4-sum norm's sums, [32-row tile][64-input
+// group][row of the tile], which end at the last row's sum of the last group.
+// The Q4-sum norm refuses F32 weights, which have no kernel, and no rows or a
+// width of partial groups, before anything is encoded.
+void normExtents(metal::MetalBackend &backend) {
+  const auto requireNormExtents = [&](uint32_t width, uint32_t rows, bool float32, const auto &encode) {
+    const NormCase c = normCase(backend, width, rows, float32);
+    const metal::MetalBuffer output = test::sharedBuffer(backend, uint64_t{width} * rows * 2);
+    const uint64_t weightElement = float32 ? 4 : 2;
+    requireExtent(backend, c.input, uint64_t{width} * rows * 2, 2, "norm input",
+                  [&](metal::CommandGraph &graph, const metal::MetalBuffer &input) {
+                    encode(graph, input, c.weight, output);
+                  });
+    requireExtent(backend, output, uint64_t{width} * rows * 2, 2, "norm output",
+                  [&](metal::CommandGraph &graph, const metal::MetalBuffer &view) {
+                    encode(graph, c.input, c.weight, view);
+                  });
+    requireExtent(backend, c.weight.buffer, width * weightElement, weightElement, "norm weight",
+                  [&](metal::CommandGraph &graph, const metal::MetalBuffer &weights) {
+                    encode(graph, c.input, NormWeights{weights, float32}, output);
+                  });
+  };
+  // The plain kernel, the staged one and the table layouts.
+  for (const auto [width, rows, float32] :
+       {std::tuple{5120U, 37U, false}, std::tuple{2048U, 8U, true}})
+    requireNormExtents(width, rows, float32,
+                       [&](metal::CommandGraph &graph, const metal::MetalBuffer &input, const NormWeights &weight,
+                           const metal::MetalBuffer &output) {
+                         (void)Normalization::addRms(graph, input, weight, output, width, rows);
+                       });
+  constexpr uint32_t width = 5120;
+  for (const auto [layout, float32] :
+       {std::pair{LinearInput::Table64, false}, std::pair{LinearInput::Table16, true}}) {
+    constexpr uint32_t rows = 16;
+    const metal::MetalBuffer table = test::sharedBuffer(backend, tableBytes(width, rows)),
+                             sums = test::sharedBuffer(backend, tableSumsBytes(layout, width, rows));
+    const auto encode = [&](metal::CommandGraph &graph, const metal::MetalBuffer &input, const NormWeights &weight,
+                            const metal::MetalBuffer &output, const LinearScratch &scratch) {
+      (void)Normalization::addRms(graph, input, weight, output, width, rows, scratch, layout);
+    };
+    requireNormExtents(width, rows, float32,
+                       [&](metal::CommandGraph &graph, const metal::MetalBuffer &input, const NormWeights &weight,
+                           const metal::MetalBuffer &output) {
+                         encode(graph, input, weight, output, {table, sums, {}, {}});
+                       });
+    const NormCase c = normCase(backend, width, rows, float32);
+    const metal::MetalBuffer output = test::sharedBuffer(backend, uint64_t{width} * rows * 2);
+    requireExtent(backend, table, tableBytes(width, rows), 2, "linear table",
+                  [&](metal::CommandGraph &graph, const metal::MetalBuffer &view) {
+                    encode(graph, c.input, c.weight, output, {view, sums, {}, {}});
+                  });
+    requireExtent(backend, sums, tableSumsBytes(layout, width, rows), 4, "linear table sums",
+                  [&](metal::CommandGraph &graph, const metal::MetalBuffer &view) {
+                    encode(graph, c.input, c.weight, output, {table, view, {}, {}});
+                  });
+  }
+  constexpr uint32_t rows = 37, groups = width / 64;
+  // Row 36 is row 4 of the second tile.
+  const uint64_t sumsBytes = ((uint64_t{1} * groups + groups - 1) * 32 + 4 + 1) * 4;
+  const metal::MetalBuffer sums = test::sharedBuffer(backend, sumsBytes);
+  requireNormExtents(width, rows, false,
+                     [&](metal::CommandGraph &graph, const metal::MetalBuffer &input, const NormWeights &weight,
+                         const metal::MetalBuffer &output) {
+                       Normalization::addRmsWithQ4Sums(graph, input, weight, output, sums, width, rows);
+                     });
+  const NormCase c = normCase(backend, width, rows, false), f32 = normCase(backend, width, rows, true);
+  const metal::MetalBuffer output = test::sharedBuffer(backend, uint64_t{width} * rows * 2);
+  requireExtent(backend, sums, sumsBytes, 4, "norm sums", [&](metal::CommandGraph &graph, const metal::MetalBuffer &view) {
+    Normalization::addRmsWithQ4Sums(graph, c.input, c.weight, output, view, width, rows);
+  });
+  metal::CommandGraph graph;
+  for (const auto &[weight, normWidth, normRows] :
+       {std::tuple{f32.weight, width, rows}, std::tuple{c.weight, width - 32, rows}, std::tuple{c.weight, 0U, rows},
+        std::tuple{c.weight, width, 0U}})
+    rejects([&] { Normalization::addRmsWithQ4Sums(graph, c.input, weight, output, sums, normWidth, normRows); },
+            "the Q4-sum norm takes bf16 weights and whole 64-input groups",
+            "the Q4-sum norm took F32 weights, a partial group or no rows");
+  require(graph.empty(), "a refused Q4-sum norm encoded a dispatch");
 }
 void fusedAttentionGate(metal::MetalBackend &backend, uint32_t heads, uint32_t kvHeads, uint32_t lanes,
                         LinearInput layout) {
@@ -423,6 +499,7 @@ int main(int argc,char **argv) {
         for (uint32_t rows : {8U,16U,24U,32U}) fusedNorm(backend, width, rows, layout, float32);
     for (uint32_t width : {64U, 2048U, 5120U, 17408U})
       for (uint32_t rows : {1U,37U,64U,65U}) prefillNorm(backend, width, rows);
+    normExtents(backend);
     // 27B out_proj then down, and gdn_in then gate/up: K 6144, 17408 and 5120.
     for (uint32_t lanes : {1U, 4U}) {
       splitVisibility(backend, {{{{5120, 6144}, LinearEpilogue::Residual}, {{5120, 17408}, LinearEpilogue::Residual}}}, lanes);

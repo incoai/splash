@@ -21,6 +21,7 @@
 #include "../../../runtime/ops/Linear.hpp"
 #include "../../../runtime/ops/MoE.hpp"
 #include "GgufFormatReference.hpp"
+#include "MoeExtents.hpp"
 #include "metal/abi/Gguf.h"
 #include "metal/abi/MoE.h"
 
@@ -571,6 +572,25 @@ std::vector<uint16_t> runPlan(MetalBackend &backend, const Model &m, Buffers &b,
   return result;
 }
 
+// Each buffer a register decode plan and a staged 32-row prefill plan reach,
+// at its extent and one element short.
+void bufferExtents(MetalBackend &backend) {
+  const Model m = makeModel(backend, 0);
+  const MoeShape shape{kHidden, kExperts, kTopK, kIntermediate, WeightLayout::Block32};
+  Buffers b;
+  b.moe.input = zeros(backend, uint64_t{kMaximumRows} * kHidden * 2, "moe-input");
+  b.moe.residual = zeros(backend, uint64_t{kMaximumRows} * kHidden * 2, "moe-residual");
+  b.moe.output = zeros(backend, uint64_t{kMaximumRows} * kHidden * 2, "moe-output");
+  for (const MoePlan &plan :
+       {MoE::decodePlan(shape, 4,
+                        MoeConfig{MoeExpertTile::M8, moeRouteWideRows(kAssumedGpuCores), MoeExpertSimdgroups::Eight,
+                                  MoeGgufTile::Register}),
+        MoE::prefillPlan(shape, 33, MoeConfig{MoeExpertTile::M32})}) {
+    allocate(backend, b, plan);
+    splash::test::requireMoeExtents(backend, b.moe, m.weights, plan);
+  }
+}
+
 int moe(MetalBackend &backend) {
   int failures = 0;
   Buffers b;
@@ -665,6 +685,7 @@ int main(int argc, const char *argv[]) {
     }
     try {
       MetalBackend backend(argv[1]);
+      bufferExtents(backend);
       const int failures = floatProjection(backend) + floatSegments(backend, 64) + floatSegments(backend, 96) +
                            floatOnlyChain(backend) + moe(backend);
       if (failures) {

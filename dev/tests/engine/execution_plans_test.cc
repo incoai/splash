@@ -11,13 +11,8 @@ namespace {
 using namespace splash;
 using namespace splash::ops;
 
+using splash::test::rejects;
 using splash::test::require;
-template <typename Function> void rejects(Function function) {
-  bool rejected = false;
-  try { function(); }
-  catch (const std::invalid_argument &) { rejected = true; }
-  require(rejected, "invalid operator lookup was accepted");
-}
 
 // The target attention shapes: query heads over a KV layout.
 struct AttentionShape final {
@@ -229,14 +224,19 @@ void ggufMoePlans() {
   }
   // The register tile reads GGUF 8-row tiles only.
   rejects([&] { (void)MoE::decodePlan(routedShape, 1, {MoeExpertTile::M8, moeRouteWideRows(kAssumedGpuCores),
-                                                       MoeExpertSimdgroups::Eight, MoeGgufTile::Register}); });
-  rejects([&] { (void)MoE::decodePlan(shape, 1, {MoeExpertTile::M32, moeRouteWideRows(kAssumedGpuCores),
-                                                 MoeExpertSimdgroups::Eight, MoeGgufTile::Register}); });
+                                                       MoeExpertSimdgroups::Eight, MoeGgufTile::Register}); },
+          "the register expert tile takes block 8-row tiles", "an affine plan took the register tile");
+  rejects([&] { (void)MoE::prefillPlan(shape, 1, {MoeExpertTile::M32, moeRouteWideRows(kAssumedGpuCores),
+                                                  MoeExpertSimdgroups::Eight, MoeGgufTile::Register}); },
+          "the register expert tile takes block 8-row tiles", "the register tile took 32-row tiles");
   // GGUF kernels exist for 8-row tiles and 32-row prefill tiles only, affine
   // ones for 32-row prefill and 8-row decode tiles.
-  rejects([&] { (void)MoE::decodePlan(shape, 1, {MoeExpertTile::M32}); });
-  rejects([&] { (void)MoE::decodePlan(routedShape, 1, {MoeExpertTile::M32}); });
-  rejects([&] { (void)MoE::prefillPlan(routedShape, 9, {MoeExpertTile::M8}); });
+  rejects([&] { (void)MoE::decodePlan(shape, 1, {MoeExpertTile::M32}); },
+          "invalid MoE expert tile configuration", "a GGUF decode plan took 32-row tiles");
+  rejects([&] { (void)MoE::decodePlan(routedShape, 1, {MoeExpertTile::M32}); },
+          "invalid MoE expert tile configuration", "an affine decode plan took 32-row tiles");
+  rejects([&] { (void)MoE::prefillPlan(routedShape, 9, {MoeExpertTile::M8}); },
+          "invalid MoE expert tile configuration", "an affine prefill plan took 8-row tiles");
 }
 
 // A device that reports no core count gets the plans of kAssumedGpuCores
@@ -266,7 +266,8 @@ void unknownCoreCount() {
 void workspaceBounds() {
   const ExecutionPlans plans(device());
   const std::array<uint32_t, 4> histories{31, 32, 2049, std::numeric_limits<uint32_t>::max()};
-  rejects([&] { (void)plans.verifyAttention(3, 24, attentionShapes[0].layout, histories); });
+  rejects([&] { (void)plans.verifyAttention(3, 24, attentionShapes[0].layout, histories); },
+          "invalid verify attention history vector", "a verify plan took more histories than lanes");
   const auto exact =
       plans.verifyAttention(3, 24, attentionShapes[0].layout, std::span(histories).first(3));
   require(exact.laneSplits[3] == 0 && exact.splits == kv::verifyAttentionSplits(2049),
@@ -299,24 +300,35 @@ void invalidLookupsAndContextEdges() {
   const ExecutionPlans plans(device());
   const auto kvLayout = attentionShapes[0].layout;
   const std::array<uint32_t, 4> histories{0, 1, 2, 3};
-  rejects([&] { (void)plans.verifyAttention(0, 24, kvLayout, histories); });
-  rejects([&] { (void)plans.verifyAttention(UINT32_MAX, 24, kvLayout, histories); });
-  rejects([&] { (void)plans.verifyAttention(3, 24, kvLayout, std::span(histories).first(2)); });
-  rejects([&] { (void)plans.verifyAttention(1, 24, {}, std::span(histories).first(1)); });
-  rejects([&] { (void)plans.prefillAttention(1, 24, {}); });
-  rejects([&] { (void)plans.prefillAttentionWorkspace(0, 24, kvLayout); });
-  rejects([&] { (void)plans.prefillAttentionWorkspace(UINT32_MAX, 24, kvLayout); });
-  rejects([&] { (void)plans.moeDecode(routedShape, UINT32_MAX); });
-  rejects([&] { (void)plans.moeDecode(routedShape, 0); });
-  rejects([&] { (void)plans.moePrefillWorkspace(routedShape, 0); });
-  rejects([&] { (void)plans.gateUpWorkspace({256, 64}); });
-  rejects([&] { (void)plans.draftAttentionWorkspacePerLane({}); });
+  for (const uint32_t lanes : {0U, UINT32_MAX})
+    rejects([&] { (void)plans.verifyAttention(lanes, 24, kvLayout, histories); },
+            "invalid attention workspace batch width", "a verify plan of no lanes or past a batch was accepted");
+  rejects([&] { (void)plans.verifyAttention(3, 24, kvLayout, std::span(histories).first(2)); },
+          "invalid verify attention history vector", "a verify plan without a history per lane was accepted");
+  rejects([&] { (void)plans.verifyAttention(1, 24, {}, std::span(histories).first(1)); },
+          "no KV store kernel for layout", "a verify plan of an empty KV layout was accepted");
+  rejects([&] { (void)plans.prefillAttention(1, 24, {}); }, "no KV store kernel for layout",
+          "a prefill plan of an empty KV layout was accepted");
+  for (const uint32_t rows : {0U, UINT32_MAX})
+    rejects([&] { (void)plans.prefillAttentionWorkspace(rows, 24, kvLayout); },
+            "invalid attention workspace rows", "a prefill workspace of no rows or past the budget was accepted");
+  for (const uint32_t lanes : {UINT32_MAX, 0U})
+    rejects([&] { (void)plans.moeDecode(routedShape, lanes); }, "invalid MoE decode width",
+            "a MoE decode of no lanes or past a batch was accepted");
+  rejects([&] { (void)plans.moePrefillWorkspace(routedShape, 0); }, "invalid MoE prefill rows",
+          "a MoE prefill workspace of no rows was accepted");
+  rejects([&] { (void)plans.gateUpWorkspace({256, 64}); }, "invalid linear decode workload",
+          "a gate/up workspace of a partial 256-input block was accepted");
+  rejects([&] { (void)plans.draftAttentionWorkspacePerLane({}); },
+          "unsupported compiled draft attention shape", "a draft workspace of an empty shape was accepted");
   std::array<uint32_t, 1> edge{kv::kMaximumPhysicalTokens - 8};
   const auto finalVerify = plans.verifyAttention(1, 24, kvLayout, edge);
   require(finalVerify.splits == kv::kVerifyMaximumSplits,
           "valid final physical verify rows were rejected");
   ++edge[0];
-  rejects([&] { (void)plans.verifyAttention(1, 24, kvLayout, edge); });
+  rejects([&] { (void)plans.verifyAttention(1, 24, kvLayout, edge); },
+          "verify attention history exceeds physical context",
+          "verify rows past the physical context were accepted");
 }
 } // namespace
 

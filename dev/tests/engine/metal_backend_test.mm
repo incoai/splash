@@ -1,6 +1,7 @@
 #include "../../../runtime/metal/BackendInstrumentation.hpp"
 #include "../../../runtime/metal/MetalBackend.hpp"
 #include "TestBuffers.hpp"
+#include "TestChecks.hpp"
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -36,6 +37,7 @@ using splash::metal::BytesBinding;
 using splash::metal::ComputeDispatch;
 using splash::metal::MetalBackend;
 using splash::metal::MetalBackendError;
+using splash::test::rejects;
 using splash::test::sharedBuffer;
 using splash::metal::MetalBuffer;
 using splash::metal::kResidencyKeepAliveSeconds;
@@ -64,16 +66,6 @@ struct TemporaryMetallib final {
     ~TemporaryMetallib() { ::unlink(path.c_str()); }
     std::string path;
 };
-
-template <typename Function>
-void requireBackendError(Function &&function, const std::string &message) {
-    try {
-        function();
-    } catch (const MetalBackendError &) {
-        return;
-    }
-    fail(message);
-}
 
 class MethodReplacement final {
 public:
@@ -320,8 +312,8 @@ void terminalCommandRecovers(const std::string &metallibPath, bool failed,
     if (failed) {
         require(!backend.healthy() && error.find("Metal command 1 failed") != std::string::npos,
                 "delayed GPU failure was lost or misclassified: " + error);
-        requireBackendError([&] { (void)backend.submitCommandAsync({&dispatch, 1}); },
-                            "failed GPU command admitted further work");
+        rejects([&] { (void)backend.submitCommandAsync({&dispatch, 1}); },
+                "Metal backend is unhealthy", "failed GPU command admitted further work");
         std::cout << "PASS delayed GPU failure preserves its error\n";
         return;
     }
@@ -368,8 +360,8 @@ void pendingCommandStillTimesOut(const std::string &metallibPath) {
                 (failure.find("status=committed") != std::string::npos ||
                  failure.find("status=scheduled") != std::string::npos),
             "command timeout lost its submission diagnostics: " + failure);
-    requireBackendError([&] { (void)backend.submitCommandAsync({&dispatch, 1}); },
-                        "timed-out backend accepted more work");
+    rejects([&] { (void)backend.submitCommandAsync({&dispatch, 1}); },
+            "Metal backend is unhealthy", "timed-out backend accepted more work");
     require(*static_cast<uint32_t *>(buffer.contents()) == increment,
             "timed-out command lost resources before GPU completion");
     std::cout << "PASS pending GPU command watchdog and resource lifetime\n";
@@ -447,8 +439,14 @@ void abandonedTicketReturnsAfterTheWatchdog(const std::string &metallibPath) {
         ticket = backend.submitCommandAsync({&dispatch, 1}, [&] { completed = true; });
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    requireBackendError([&] { backend.checkHealth(); },
-                        "the watchdog did not give up on a pending command");
+    // A failure exits here: unwinding would destroy the ticket, which waits for
+    // the watchdog this checks.
+    try {
+        rejects([&] { backend.checkHealth(); }, "Metal command completion timed out",
+                "the watchdog did not give up on a pending command");
+    } catch (const std::exception &error) {
+        fail(error.what());
+    }
     auto destroyed = std::async(std::launch::async, [&ticket] {
         splash::metal::CommandTicket dropped = std::move(ticket);
     });
@@ -476,14 +474,8 @@ void stopRefusesSubmission(const std::string &metallibPath) {
         {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
         {1, 1, 1}, {1, 1, 1}};
     backend.stop();
-    std::string error;
-    try {
-        (void)backend.submitCommandAsync({&dispatch, 1});
-    } catch (const MetalBackendError &failure) {
-        error = failure.what();
-    }
-    require(error.find("stopping") != std::string::npos,
-            "a stopped backend accepted a submission: " + error);
+    rejects([&] { (void)backend.submitCommandAsync({&dispatch, 1}); },
+            "Metal backend is stopping", "a stopped backend accepted a submission");
     require(backend.healthy() && !backend.commandInFlight(),
             "refusing a submission while stopping marked the backend unhealthy "
             "or left a command in flight");
@@ -672,12 +664,14 @@ void preparedPipelinesCompileAhead(const std::string &metallibPath) {
             "submitting a prepared dispatch compiled its pipeline again");
     ComputeDispatch oversized = dispatch;
     oversized.threadsPerThreadgroup = {4096, 1, 1};
-    requireBackendError([&] { backend.preparePipelines({&oversized, 1}); },
-                        "a dispatch past its pipeline's thread limit was prepared");
+    rejects([&] { backend.preparePipelines({&oversized, 1}); },
+            "threadsPerThreadgroup exceeds pipeline capability",
+            "a dispatch past its pipeline's thread limit was prepared");
     ComputeDispatch missing = dispatch;
     missing.pipelineName = "does_not_exist";
-    requireBackendError([&] { backend.preparePipelines({&missing, 1}); },
-                        "a dispatch of a missing function was prepared");
+    rejects([&] { backend.preparePipelines({&missing, 1}); },
+            "missing Metal function: does_not_exist",
+            "a dispatch of a missing function was prepared");
     require(backend.healthy() &&
                 BackendInstrumentation::submittedCommands(backend) == 1,
             "a rejected preparation poisoned the backend or submitted work");
@@ -868,15 +862,10 @@ void infiniteKeepAliveHoldsResidency(const std::string &metallibPath) {
                 "the heartbeat stopped requesting an infinitely kept set");
         require(calls.ends == 0, "an infinite keep-alive ended residency");
     }
-    for (double keepAlive : {0.0, -1.0, std::numeric_limits<double>::quiet_NaN()}) {
-        bool refused = false;
-        try {
-            MetalBackend backend(metallibPath, keepAlive);
-        } catch (const MetalBackendError &) {
-            refused = true;
-        }
-        require(refused, "a keep-alive that is not positive was accepted");
-    }
+    for (double keepAlive : {0.0, -1.0, std::numeric_limits<double>::quiet_NaN()})
+        rejects([&] { MetalBackend backend(metallibPath, keepAlive); },
+                "residency keep-alive must be positive",
+                "a keep-alive that is not positive was accepted");
     std::cout << "PASS infinite keep-alive holds residency\n";
 }
 
@@ -1111,14 +1100,6 @@ void releasedMemory(const std::string &metallibPath) {
     const ComputeDispatch dispatch{"test_add_u32", {{0, view}},
         {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
         {1, 1, 1}, {1, 1, 1}};
-    const auto rejects = [](const auto &operation, std::string_view expected, const std::string &message) {
-        try {
-            operation();
-        } catch (const MetalBackendError &error) {
-            if (std::string_view(error.what()).find(expected) != std::string_view::npos) return;
-        }
-        fail(message);
-    };
     {
         auto ticket = backend.submitCommandAsync({&dispatch, 1});
         rejects([&] { backend.releaseMemory(buffer); }, "command is in flight",
@@ -1278,8 +1259,9 @@ void run(const std::string &metallibPath) {
                 auto notified = completion.get_future();
                 auto ticket = backend.submitCommandAsync(
                     {&dispatch, 1}, [&] { completion.set_value(); });
-                requireBackendError(
+                rejects(
                     [&] { (void)backend.submit(dispatch); },
+                    "Metal backend already has an in-flight command",
                     "a second in-flight command was accepted");
                 timing = ticket.wait();
                 require(ticket.ready(),
@@ -1333,27 +1315,28 @@ void run(const std::string &metallibPath) {
                 "multi-dispatch command produced an incorrect result");
     }
 
-    requireBackendError(
+    rejects(
         [&] { (void)backend.view(base, base.sizeBytes(), 1); },
-        "out-of-range view was accepted");
+        "Metal buffer view is out of range", "out-of-range view was accepted");
 
     ComputeDispatch missingPipeline;
     missingPipeline.pipelineName = "does_not_exist";
-    requireBackendError(
+    rejects(
         [&] { (void)backend.submit(missingPipeline); },
-        "missing pipeline was accepted");
+        "missing Metal function: does_not_exist", "missing pipeline was accepted");
     {
         // A binding takes one of the argument table's 31 entries of its own.
         ComputeDispatch rebound;
         rebound.pipelineName = "test_add_u32";
         rebound.buffers = {{0, view}};
         rebound.bytes = {{0, &kIncrement, sizeof(kIncrement)}};
-        requireBackendError(
+        rejects(
             [&] { (void)backend.submit(rebound); },
-            "a binding index bound twice was accepted");
+            "duplicate compute binding index", "a binding index bound twice was accepted");
         rebound.bytes = {{31, &kIncrement, sizeof(kIncrement)}};
-        requireBackendError(
+        rejects(
             [&] { (void)backend.submit(rebound); },
+            "compute binding index exceeds the argument table",
             "a binding index past the argument table was accepted");
     }
     require(backend.healthy(),

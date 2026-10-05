@@ -21,16 +21,8 @@ static_assert(!tuning::kPrefillProbeRows.empty() &&
               tuning::kPrefillProbeRows.back() == ExecutionLimits::prefillTokenBudget);
 static_assert(tuning::kDecodeProbeWidths == std::array<uint32_t, 4>{1, 2, 3, 4});
 
+using splash::test::rejects;
 using splash::test::require;
-
-template <class Function> void rejects(Function function) {
-  try {
-    function();
-  } catch (const std::invalid_argument &) {
-    return;
-  }
-  throw std::runtime_error("invalid tuning inventory was accepted");
-}
 
 // The collector only borrows projection metadata. Empty immutable Metal
 // handles make any accidental allocation, weight access or dispatch fail;
@@ -202,12 +194,18 @@ void checkPair(ModelPackage package) {
           "prefill-only sweep introduced decode work");
   const auto empty = collectTuningWorkloads(package, {}, {});
   require(empty.empty(), "empty probe sets created work");
-  rejects([&] { (void)collectTuningWorkloads(package, std::array{0U}, decode); });
-  rejects([&] { (void)collectTuningWorkloads(package, std::array{2049U}, decode); });
-  rejects([&] { (void)collectTuningWorkloads(package, prefill, std::array{0U}); });
-  rejects([&] { (void)collectTuningWorkloads(package, prefill, std::array{5U}); });
+  for (const uint32_t rows : {0U, 2049U})
+    rejects([&] { (void)collectTuningWorkloads(package, std::array{rows}, decode); },
+            "invalid operator prefill probe size",
+            "a prefill probe of no rows or past the budget was accepted");
+  for (const uint32_t width : {0U, 5U})
+    rejects([&] { (void)collectTuningWorkloads(package, prefill, std::array{width}); },
+            "invalid operator decode probe width",
+            "a decode probe of no lanes or more than a batch was accepted");
   package.draft.contextProjection.inputSize = 0;
-  rejects([&] { (void)collectTuningWorkloads(package, prefill, decode); });
+  rejects([&] { (void)collectTuningWorkloads(package, prefill, decode); },
+          "operator probe projection has no geometry",
+          "a projection without an input width was collected");
 }
 
 // A GGUF target is not tuned: the collector takes none of its projections,
@@ -285,9 +283,11 @@ void run() {
   checkPair(sparse);
 
   dense.draft.layers.clear();
-  rejects([&] { (void)collectTuningWorkloads(dense, std::array{32U}, std::array{1U}); });
+  rejects([&] { (void)collectTuningWorkloads(dense, std::array{32U}, std::array{1U}); },
+          "operator probes require draft layers", "a draft without layers was collected");
   std::get<Qwen3_6MoeWeights>(sparse.target).layers.clear();
-  rejects([&] { (void)collectTuningWorkloads(sparse, std::array{32U}, std::array{1U}); });
+  rejects([&] { (void)collectTuningWorkloads(sparse, std::array{32U}, std::array{1U}); },
+          "operator probes require target layers", "a target without layers was collected");
 }
 
 void metadataViews(const char *metallib) {

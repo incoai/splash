@@ -13,16 +13,8 @@
 
 namespace {
 
+using splash::test::rejects;
 using splash::test::require;
-
-template <class Function> void rejects(Function function) {
-  try {
-    (void)function();
-  } catch (const std::invalid_argument &) {
-    return;
-  }
-  throw std::runtime_error("invalid workspace request was accepted");
-}
 
 void attention() {
   using namespace splash;
@@ -58,11 +50,17 @@ void attention() {
       require(workspace.statisticsBytes == values * 2 * 4,
               "verify statistics workspace is not sized for the maximum split count");
     }
-    rejects([&] { return ops::PagedAttention::prefillWorkspace(0, queryHeads, layout); });
-    rejects([&] { return ops::PagedAttention::prefillWorkspace(2049, queryHeads, layout); });
-    rejects([&] { return ops::PagedAttention::verifyWorkspace(0, queryHeads, layout); });
-    rejects([&] { return ops::PagedAttention::verifyWorkspace(5, queryHeads, layout); });
-    rejects([&] { return ops::PagedAttention::verifyWorkspace(1, 0, layout); });
+    for (const uint32_t rows : {0U, 2049U})
+      rejects([&] { (void)ops::PagedAttention::prefillWorkspace(rows, queryHeads, layout); },
+              "invalid attention workspace rows",
+              "a prefill workspace of no rows or past the budget was sized");
+    for (const uint32_t lanes : {0U, 5U})
+      rejects([&] { (void)ops::PagedAttention::verifyWorkspace(lanes, queryHeads, layout); },
+              "invalid attention workspace batch width",
+              "a verify workspace of no lanes or more than a batch was sized");
+    rejects([&] { (void)ops::PagedAttention::verifyWorkspace(1, 0, layout); },
+            "no paged-attention kernel for layout",
+            "a verify workspace of no query heads was sized");
   }
 }
 
@@ -111,12 +109,17 @@ void moe() {
                       lanes * single.tileDescriptorsBytes,
               "packed decode workspace exceeds per-lane allocation bound");
     }
-    rejects([&] { return MoE::prefillPlan(shape, 0, {MoeExpertTile::M32}); });
-    rejects([&] { return MoE::prefillPlan(shape, 2049, {MoeExpertTile::M32}); });
-    rejects([&] { return MoE::decodePlan(shape, 0, {MoeExpertTile::M8}); });
-    rejects([&] { return MoE::decodePlan(shape, 5, {MoeExpertTile::M8}); });
+    for (const uint32_t rows : {0U, 2049U})
+      rejects([&] { (void)MoE::prefillPlan(shape, rows, {MoeExpertTile::M32}); },
+              "invalid MoE prefill rows",
+              "a MoE prefill of no rows or past the budget was planned");
+    for (const uint32_t lanes : {0U, 5U})
+      rejects([&] { (void)MoE::decodePlan(shape, lanes, {MoeExpertTile::M8}); },
+              "invalid MoE decode batch width",
+              "a MoE decode of no lanes or more than a batch was planned");
   }
-  rejects([] { return MoE::prefillPlan({}, 1, {MoeExpertTile::M32}); });
+  rejects([] { (void)MoE::prefillPlan({}, 1, {MoeExpertTile::M32}); },
+          "invalid MoE workspace shape", "a MoE plan of an empty shape was sized");
 }
 
 void sampling() {
@@ -149,8 +152,11 @@ void sampling() {
                 workspace.proposalProbabilitiesBytes == count * 16 * 4,
             "draft sampling workspace changed from the shipped 8-shard ABI");
   }
-  rejects([] { return Sampling::workspace(0); });
-  rejects([] { return DraftSelector::workspace(0); });
+  rejects([] { (void)Sampling::workspace(0); }, "invalid sampling workspace row count",
+          "a sampling workspace of no rows was sized");
+  rejects([] { (void)DraftSelector::workspace(0); },
+          "invalid draft selector workspace position count",
+          "a draft selector workspace of no positions was sized");
 }
 
 } // namespace

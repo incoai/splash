@@ -21,6 +21,7 @@
 // of non-finite logits select the sentinel 0xFFFFFFFF. The host
 // word helpers and the lifecycle that rebuilds a resumed request's words are
 // checked bitwise.
+#include "TestBuffers.hpp"
 #include "TestChecks.hpp"
 #include "metal/MetalBackend.hpp"
 #include "ops/DraftSelector.hpp"
@@ -42,7 +43,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
-#include <typeinfo>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -62,20 +63,8 @@ constexpr float kFloatMax = std::numeric_limits<float>::max();
 // Both stop tokens sit below every spike of fillRow.
 constexpr std::array<uint32_t, 2> kStopTokens{1, 2};
 
+using splash::test::rejects;
 using splash::test::require;
-
-// Requires function to throw an Error itself, not a subclass of it.
-template <class Error = std::invalid_argument, class Function>
-void rejects(Function function, const char *what) {
-  try {
-    function();
-  } catch (const Error &error) {
-    require(typeid(error) == typeid(Error),
-            std::string("refused ") + what + " with another error");
-    return;
-  }
-  throw std::runtime_error(std::string("accepted ") + what);
-}
 
 // Stop tokens in the first shard of the vocabulary and in the last, so a
 // lane that excludes them skips them in both.
@@ -884,6 +873,154 @@ void extremes(MetalBackend &backend) {
   }
 }
 
+// Each buffer the selections, their penalties and acceptance reach, at its
+// extent and one element short. A buffer holds the rows of every lane up to
+// the last lane that reads it (metal/abi/Sampling.h). The first token at row
+// 3 of three lanes: a sampled lane, a constrained greedy lane penalized from
+// table row 2, and a greedy lane. The verify rows of three lanes: a greedy
+// lane, a constrained sampled lane, and a greedy lane penalized from table row
+// 1, whose penalty reads the verify input rows past the sampled lane's draft;
+// and of two, a greedy and a sampled lane, whose draft reads them. The
+// acceptance of the three verify lanes, the last retaining five rows or all
+// eight.
+void bufferExtents(MetalBackend &backend) {
+  constexpr uint32_t vocabulary = 1003, lanes = 3;
+  const Sampling sampling(vocabulary);
+  const Batch batch = makeBatch(backend, vocabulary, lanes);
+  const MetalBuffer table = penaltyTable(backend, vocabulary);
+  const uint64_t logitsRow = uint64_t{vocabulary} * 4, maskRow = uint64_t{batch.maskWords()} * 4;
+  const SamplingPenalties penalized{1.0F, 1.5F, 0.0F};
+  const SamplingPolicy greedy{}, sampled{32, 0.8F, 0.95F};
+  SamplingPolicy constrainedSampled = sampled, constrainedGreedy = greedy, penalizedGreedy = greedy;
+  constrainedSampled.constrained = constrainedGreedy.constrained = true;
+  constrainedGreedy.penalties = penalizedGreedy.penalties = penalized;
+  struct Extent final {
+    MetalBuffer SamplingBuffers::*member;
+    uint64_t bytes;
+    uint64_t element;
+    const char *what;
+  };
+  const auto requireExtents = [&](std::initializer_list<Extent> extents, const auto &encode) {
+    for (const Extent &extent : extents)
+      splash::test::requireExtent(backend, batch.buffers.*extent.member, extent.bytes, extent.element, extent.what,
+                                  [&](CommandGraph &graph, const MetalBuffer &buffer) {
+                                    SamplingBuffers changed = batch.buffers;
+                                    changed.*extent.member = buffer;
+                                    encode(graph, changed);
+                                  });
+  };
+  // The workspaces of `rows` selected rows.
+  const auto workspace = [](uint64_t rows) {
+    return std::array<uint64_t, 6>{rows * SPLASH_TARGET_SAMPLING_SHARDS * 4,
+                                   rows * SPLASH_TARGET_SAMPLING_SHARDS * 4,
+                                   rows * SPLASH_TARGET_SAMPLING_SHARDS * sizeof(TargetShardMass),
+                                   rows * sizeof(TargetVocabularyRow),
+                                   rows * SPLASH_TARGET_VOCABULARY_RANGES * sizeof(TargetVocabularyRange),
+                                   rows * 4};
+  };
+
+  {
+    const std::array policies{sampled, constrainedGreedy, greedy};
+    const std::array<uint32_t, lanes> tableRows{0, 2, 0};
+    const auto encode = [&](CommandGraph &graph, const SamplingBuffers &buffers, const MetalBuffer &words) {
+      sampling.addInitial(graph, policies, buffers, 3, kStopTokens[0], kStopTokens[1], {words, tableRows});
+    };
+    // One row of every lane up to the last greedy lane, three, and up to the
+    // last sampled lane, one.
+    const auto greedyRows = workspace(3), sampledRows = workspace(1);
+    requireExtents({{&SamplingBuffers::logits, (2 * kRows + 3 + 1) * logitsRow, 4, "sampling logits"},
+                    {&SamplingBuffers::constraintMasks, (kRows + 1 + 1) * maskRow, 4, "constraint mask"},
+                    {&SamplingBuffers::outputTokens, lanes * 4, 4, "sampled token"},
+                    {&SamplingBuffers::argmaxValues, greedyRows[0], 4, "argmax value"},
+                    {&SamplingBuffers::argmaxIndices, greedyRows[1], 4, "argmax index"},
+                    {&SamplingBuffers::partialMasses, sampledRows[2], sizeof(TargetShardMass), "sampling mass"},
+                    {&SamplingBuffers::vocabularyRows, sampledRows[3], sizeof(TargetVocabularyRow),
+                     "sampling vocabulary row"},
+                    {&SamplingBuffers::vocabularyRanges, sampledRows[4], sizeof(TargetVocabularyRange),
+                     "sampling vocabulary range"},
+                    {&SamplingBuffers::vocabularyArrivals, sampledRows[5], 4, "sampling arrival"},
+                    {&SamplingBuffers::uniforms, (SPLASH_UNIFORM_INITIAL + 1) * 4, 4, "sampling uniform"}},
+                   [&](CommandGraph &graph, const SamplingBuffers &buffers) { encode(graph, buffers, table); });
+    splash::test::requireExtent(backend, table, 3 * logitsRow, 4, "penalty table",
+                                [&](CommandGraph &graph, const MetalBuffer &words) {
+                                  encode(graph, batch.buffers, words);
+                                });
+  }
+  {
+    const std::array policies{greedy, constrainedSampled, penalizedGreedy};
+    const std::array<uint32_t, lanes> tableRows{0, 0, 1};
+    const auto encode = [&](CommandGraph &graph, const SamplingBuffers &buffers, const MetalBuffer &words) {
+      sampling.addVerify(graph, policies, buffers, kStopTokens[0], kStopTokens[1], {words, tableRows});
+    };
+    // Every row of every lane up to the last greedy lane, three, and up to
+    // the last sampled lane, two, whose draft reads its candidates at all
+    // seven positions.
+    const auto greedyRows = workspace(3 * kRows), sampledRows = workspace(2 * kRows);
+    const uint64_t candidates = 2 * kPositions * kDraftCandidates * 4;
+    requireExtents(
+        {{&SamplingBuffers::logits, 3 * kRows * logitsRow, 4, "sampling logits"},
+         {&SamplingBuffers::constraintMasks, (kRows + 1 + 1 + kRows) * maskRow, 4, "constraint mask"},
+         {&SamplingBuffers::outputTokens, lanes * kRows * 4, 4, "sampled token"},
+         {&SamplingBuffers::argmaxValues, greedyRows[0], 4, "argmax value"},
+         {&SamplingBuffers::argmaxIndices, greedyRows[1], 4, "argmax index"},
+         {&SamplingBuffers::partialMasses, sampledRows[2], sizeof(TargetShardMass), "sampling mass"},
+         {&SamplingBuffers::vocabularyRows, sampledRows[3], sizeof(TargetVocabularyRow), "sampling vocabulary row"},
+         {&SamplingBuffers::vocabularyRanges, sampledRows[4], sizeof(TargetVocabularyRange),
+          "sampling vocabulary range"},
+         {&SamplingBuffers::vocabularyArrivals, sampledRows[5], 4, "sampling arrival"},
+         {&SamplingBuffers::uniforms, (kUniforms + SPLASH_UNIFORM_CORRECTION + 1) * 4, 4, "sampling uniform"},
+         {&SamplingBuffers::inputTokens, lanes * kRows * 4, 4, "verify input token"},
+         {&SamplingBuffers::draftCandidates, candidates, 4, "draft candidate"},
+         {&SamplingBuffers::draftProbabilities, candidates, 4, "draft probability"}},
+        [&](CommandGraph &graph, const SamplingBuffers &buffers) { encode(graph, buffers, table); });
+    splash::test::requireExtent(backend, table, 2 * logitsRow, 4, "penalty table",
+                                [&](CommandGraph &graph, const MetalBuffer &words) {
+                                  encode(graph, batch.buffers, words);
+                                });
+  }
+  {
+    const std::array policies{greedy, sampled};
+    requireExtents({{&SamplingBuffers::inputTokens, 2 * kRows * 4, 4, "verify input token"}},
+                   [&](CommandGraph &graph, const SamplingBuffers &buffers) {
+                     sampling.addVerify(graph, policies, buffers, kStopTokens[0], kStopTokens[1], {});
+                   });
+  }
+
+  const std::array policies{greedy, sampled, greedy};
+  const AcceptanceBuffers acceptance{allocate(backend, lanes * kPositions * 4),
+                                     batch.buffers.draftCandidates,
+                                     batch.buffers.draftProbabilities,
+                                     batch.buffers.vocabularyRows,
+                                     batch.buffers.uniforms,
+                                     batch.buffers.outputTokens,
+                                     allocate(backend, lanes * 4),
+                                     allocate(backend, lanes * 4)};
+  const uint64_t candidates = 2 * kPositions * kDraftCandidates * 4;
+  for (const uint32_t lastRetained : {5U, kRows}) {
+    const std::array<uint32_t, lanes> retained{kRows, kRows, lastRetained};
+    for (const auto &[member, bytes, element, what] :
+         std::initializer_list<std::tuple<MetalBuffer AcceptanceBuffers::*, uint64_t, uint64_t, const char *>>{
+             {&AcceptanceBuffers::proposedTokens, lanes * kPositions * 4, 4, "proposed token"},
+             {&AcceptanceBuffers::candidates, candidates, 4, "draft candidate"},
+             {&AcceptanceBuffers::proposalProbabilities, candidates, 4, "draft probability"},
+             {&AcceptanceBuffers::targetVocabularyRows, (kRows + kPositions) * sizeof(TargetVocabularyRow),
+              sizeof(TargetVocabularyRow), "target vocabulary row"},
+             {&AcceptanceBuffers::uniforms, (kUniforms + SPLASH_UNIFORM_ACCEPTANCE + kPositions) * 4, 4,
+              "acceptance uniform"},
+             {&AcceptanceBuffers::outputTokens, (2 * kRows + std::max(kPositions, lastRetained)) * 4, 4,
+              "target token"},
+             {&AcceptanceBuffers::retainedCounts, lanes * 4, 4, "retained count"},
+             {&AcceptanceBuffers::acceptedCounts, lanes * 4, 4, "accepted count"}})
+      splash::test::requireExtent(backend, acceptance.*member, bytes, element, what,
+                                  [&](CommandGraph &graph, const MetalBuffer &buffer) {
+                                    AcceptanceBuffers changed = acceptance;
+                                    changed.*member = buffer;
+                                    sampling.addAcceptance(graph, changed, retained, policies, kStopTokens[0],
+                                                           kStopTokens[1]);
+                                  });
+  }
+}
+
 // A penalized lane needs a table row inside the table. A refused request
 // encodes nothing.
 void invalidPenalties(MetalBackend &backend) {
@@ -897,15 +1034,18 @@ void invalidPenalties(MetalBackend &backend) {
   CommandGraph graph;
   rejects([&] {
     sampling.addVerify(graph, {&penalized, 1}, batch.buffers, 1, 2, {});
-  }, "penalties without a table");
+  }, "penalized lane has no penalty table row",
+          "penalties without a table were accepted");
   rejects([&] {
     sampling.addVerify(graph, {&penalized, 1}, batch.buffers, 1, 2,
                        {table, outside});
-  }, "a table row outside the table");
+  }, "penalty table buffer holds",
+          "a table row outside the table was accepted");
   rejects([&] {
     sampling.addInitial(graph, {&penalized, 1}, batch.buffers, 0, 1, 2,
                         {table, outside});
-  }, "an initial table row outside the table");
+  }, "penalty table buffer holds",
+          "an initial table row outside the table was accepted");
   require(graph.empty(), "a refused penalty request encoded a dispatch");
   // Unpenalized lanes need no table row.
   const SamplingPolicy greedy{1, 0.0F, 1.0F, false};
@@ -1946,19 +2086,21 @@ void penaltyWords() {
           "counted penalty words differ");
   const std::vector<uint32_t> before = words;
   const std::vector<uint32_t> outside{2, 8};
-  rejects([&] { Sampling::countPenaltyTokens(words, outside); },
-          "a counted token outside the vocabulary");
+  constexpr const char *kOutside = "penalty token is outside the vocabulary";
+  rejects([&] { Sampling::countPenaltyTokens(words, outside); }, kOutside,
+          "a counted token outside the vocabulary was accepted");
   rejects([&] {
     Sampling::rebuildPenaltyWords(words, outside, 0, std::nullopt, true);
-  }, "a prompt token outside the vocabulary");
+  }, kOutside, "a prompt token outside the vocabulary was accepted");
   rejects([&] {
     Sampling::rebuildPenaltyWords(words, outside, 1, std::nullopt, false);
-  }, "a generated token outside the vocabulary");
+  }, kOutside, "a generated token outside the vocabulary was accepted");
   rejects([&] { Sampling::rebuildPenaltyWords(words, step, 0, 8, false); },
-          "a pending token outside the vocabulary");
-  rejects<std::logic_error>([&] {
+          kOutside, "a pending token outside the vocabulary was accepted");
+  rejects([&] {
     Sampling::rebuildPenaltyWords(words, step, 2, std::nullopt, false);
-  }, "a history without a prompt");
+  }, "request history holds no prompt",
+          "a history without a prompt was accepted");
   require(words == before, "a refused token changed the penalty words");
 }
 
@@ -2051,6 +2193,8 @@ int main(int argc, char **argv) {
     MetalBackend backend(argv[1]);
     stage = "invalid penalties";
     invalidPenalties(backend);
+    stage = "buffer extents";
+    bufferExtents(backend);
     stage = "extreme penalties";
     extremes(backend);
     for (const uint32_t samplingMask : {0U, 1U, 2U, 3U}) {

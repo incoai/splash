@@ -1,8 +1,10 @@
+#include "TestBuffers.hpp"
 #include "TestChecks.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/Sampling.h"
 #include "model/Model.hpp"
+#include "ops/Embedding.hpp"
 #include "ops/RowCopy.hpp"
 
 #import <Foundation/Foundation.h>
@@ -14,6 +16,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -23,6 +26,7 @@ using splash::metal::CommandGraph;
 using splash::metal::ComputeDispatch;
 using splash::metal::MetalBackend;
 using splash::metal::MetalBuffer;
+using splash::ops::Embedding;
 using splash::ops::RowCopy;
 using splash::ops::RowRegion;
 
@@ -40,7 +44,9 @@ template <class T> T *contents(const MetalBuffer &buffer) {
   return static_cast<T *>(buffer.contents());
 }
 
+using splash::test::rejects;
 using splash::test::require;
+using splash::test::requireExtent;
 
 void runWidth(MetalBackend &backend, uint32_t width,
               const std::array<uint32_t, kLanes> &acceptedReference,
@@ -135,8 +141,9 @@ void runWidth(MetalBackend &backend, uint32_t width,
 // four of the captured rows from row 2, the gather of the last 3 of 11
 // prefill rows into the head's input, and an image's embedding rows 1-2
 // (width 5120) over a chunk's placeholder rows from row 2. Every value
-// outside the destination region keeps its poison, and regions past a row or
-// a buffer are refused.
+// outside the destination region keeps its poison, and regions past a row are
+// refused. Each buffer holds its region at its extent, the end of its last
+// row's values, and is refused one value short.
 void testRowCopy(MetalBackend &backend) {
   constexpr uint16_t kPoison = 0xA5A5;
   const auto check = [&](uint32_t sourceRows, RowRegion from,
@@ -170,21 +177,51 @@ void testRowCopy(MetalBackend &backend) {
 
   MetalBuffer rows = shared(backend, uint64_t{4} * kWidth * 2, "row-copy-invalid");
   CommandGraph invalid;
-  const auto rejects = [&](RowRegion from, RowRegion to, uint32_t count, uint32_t width) {
-    try {
-      RowCopy::add(invalid, rows, from, rows, to, count, width);
-    } catch (const std::invalid_argument &) {
-      return;
-    }
-    throw std::runtime_error("invalid row copy was accepted");
+  const auto copy = [&](RowRegion from, RowRegion to, uint32_t count, uint32_t width) {
+    RowCopy::add(invalid, rows, from, rows, to, count, width);
   };
-  rejects({0, kWidth, 0}, {0, kWidth, 0}, 0, kWidth);
-  rejects({0, kWidth, 0}, {0, kWidth, 0}, 1, 0);
-  rejects({0, kWidth, 1}, {0, kWidth, 0}, 1, kWidth);
-  rejects({0, kWidth, 0}, {0, kWidth / 2, 0}, 1, kWidth);
-  rejects({1, kWidth, 0}, {0, kWidth, 0}, 4, kWidth);
-  rejects({0, kWidth, 0}, {3, kWidth, 0}, 2, kWidth);
+  rejects([&] { copy({0, kWidth, 0}, {0, kWidth, 0}, 0, kWidth); }, "invalid row copy",
+          "a row copy of no rows was accepted");
+  rejects([&] { copy({0, kWidth, 0}, {0, kWidth, 0}, 1, 0); }, "invalid row copy",
+          "a row copy of no values was accepted");
+  rejects([&] { copy({0, kWidth, 1}, {0, kWidth, 0}, 1, kWidth); }, "invalid row copy",
+          "a row copy past the end of its source row was accepted");
+  rejects([&] { copy({0, kWidth, 0}, {0, kWidth / 2, 0}, 1, kWidth); }, "invalid row copy",
+          "a row copy past the end of its destination row was accepted");
   require(invalid.empty(), "an invalid row copy encoded a dispatch");
+  // The capture's regions: source rows 5-17 of 2048 values, destination rows
+  // 2-14 of 8192 from column 4096.
+  constexpr RowRegion from{5, kWidth, 0}, to{2, 4 * kWidth, 2 * kWidth};
+  constexpr uint32_t copied = 13;
+  const MetalBuffer source = shared(backend, uint64_t{18} * kWidth * 2, "row-copy-source"),
+                    destination = shared(backend, uint64_t{16} * 4 * kWidth * 2, "row-copy-destination");
+  requireExtent(backend, source, uint64_t{17 * kWidth + kWidth} * 2, 2, "row copy source",
+                [&](CommandGraph &graph, const MetalBuffer &view) {
+                  RowCopy::add(graph, view, from, destination, to, copied, kWidth);
+                });
+  requireExtent(backend, destination, (uint64_t{14} * 4 * kWidth + 2 * kWidth + kWidth) * 2, 2,
+                "row copy destination", [&](CommandGraph &graph, const MetalBuffer &view) {
+                  RowCopy::add(graph, source, from, view, to, copied, kWidth);
+                });
+}
+
+// Each buffer the verify input reaches, at its extent and one element short,
+// for three lanes: each lane's anchor, row 0 of its eight draft input rows,
+// its seven proposals and its eight verify input rows.
+void verifyInputExtents(MetalBackend &backend) {
+  constexpr uint32_t lanes = 3, vocabulary = 1003;
+  const std::array buffers{shared(backend, lanes * kRows * 4, "draft-input"),
+                           shared(backend, lanes * kProposals * 4, "proposed"),
+                           shared(backend, lanes * kRows * 4, "verify-input")};
+  for (const auto &[index, bytes, what] :
+       {std::tuple{size_t{0}, uint64_t{(lanes - 1) * kRows + 1} * 4, "draft input token"},
+        std::tuple{size_t{1}, uint64_t{lanes * kProposals} * 4, "proposed token"},
+        std::tuple{size_t{2}, uint64_t{lanes * kRows} * 4, "verify input token"}})
+    requireExtent(backend, buffers[index], bytes, 4, what, [&](CommandGraph &graph, const MetalBuffer &view) {
+      auto changed = buffers;
+      changed[index] = view;
+      Embedding::addVerifyInput(graph, changed[0], changed[1], changed[2], vocabulary, lanes);
+    });
 }
 
 } // namespace
@@ -209,6 +246,7 @@ int main(int argc, char **argv) {
     constexpr std::array<uint32_t, kLanes> shortRemaining{1, 2, 3, 8};
     runWidth(backend, kLanes, allAccepted, shortRemaining, 3, 3);
     testRowCopy(backend);
+    verifyInputExtents(backend);
     std::cout << "dflash_batch_control_metal_test: PASS\n";
     return 0;
   } catch (const std::exception &error) {

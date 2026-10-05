@@ -6,6 +6,7 @@
 // exactly one or several splits, and the last slot of the ring, so that tile
 // bounds, the window mask, empty splits and the empty-row softmax guard are
 // all exercised.
+#include "TestBuffers.hpp"
 #include "TestChecks.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/ExecutionGeometry.h"
@@ -14,6 +15,7 @@
 
 #import <Foundation/Foundation.h>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -48,16 +50,8 @@ constexpr std::array kShapes{
     DraftAttentionShape{5120, 1280, 6144, 4096, 32, 8, 128},
     DraftAttentionShape{2048, 512, 6144, 4096, 32, 8, 128}};
 
+using splash::test::rejects;
 using splash::test::require;
-
-template <class Function> void rejects(Function function) {
-  try {
-    function();
-  } catch (const std::invalid_argument &) {
-    return;
-  }
-  throw std::runtime_error("invalid draft attention request was accepted");
-}
 
 class Random final {
 public:
@@ -197,12 +191,14 @@ void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
   static_cast<void>(backend.submitCommandAsync(dispatches).wait());
   // A cache length for each of the plan's lanes, no fewer.
   CommandGraph mismatched;
-  rejects([&] {
-    DraftAttention::addDecode(mismatched,
-        {queries, keys, values, queryKeys, queryValues},
-        std::span(cacheLengths).first(lanes - 1),
-        DraftAttention::plan(shape, lanes));
-  });
+  rejects(
+      [&] {
+        DraftAttention::addDecode(mismatched,
+            {queries, keys, values, queryKeys, queryValues},
+            std::span(cacheLengths).first(lanes - 1),
+            DraftAttention::plan(shape, lanes));
+      },
+      "invalid draft attention geometry", "fewer cache lengths than lanes were accepted");
   require(mismatched.empty(), "mismatched cache lengths encoded a graph");
 
   const auto *output = static_cast<const uint16_t *>(queries.contents());
@@ -258,13 +254,18 @@ void planGeometry() {
                   workspace.queryValuesBytes == rows * 8 * 128 * 2,
               "draft plan padded lanes or changed tensor storage");
     }
-    rejects([&] { (void)DraftAttention::plan(shape, 0); });
-    rejects([&] { (void)DraftAttention::plan(shape, 5); });
+    rejects([&] { (void)DraftAttention::plan(shape, 0); }, "invalid draft batch width",
+            "a draft plan of no lanes was accepted");
+    rejects([&] { (void)DraftAttention::plan(shape, 5); }, "invalid draft batch width",
+            "a draft plan wider than a batch was accepted");
   }
   auto unsupported = kShapes[0];
   unsupported.queryHeads = 16;
-  rejects([&] { (void)DraftAttention::plan(unsupported, 1); });
-  rejects([&] { (void)DraftAttention::plan({}, 1); });
+  rejects([&] { (void)DraftAttention::plan(unsupported, 1); },
+          "unsupported compiled draft attention shape",
+          "a draft shape without a compiled kernel was accepted");
+  rejects([&] { (void)DraftAttention::plan({}, 1); }, "unsupported compiled draft attention shape",
+          "an empty draft shape was accepted");
 }
 
 void fillDyadic(const MetalBuffer &buffer, uint32_t multiplier, uint32_t modulus) {
@@ -422,29 +423,6 @@ void surroundingPhases(MetalBackend &backend, DraftAttentionShape shape,
     }
   }
 
-  CommandGraph invalid;
-  const auto shortBuffer = backend.view(output, 0, output.sizeBytes() - 2);
-  rejects([&] {
-    DraftAttention::addConvolution(invalid,
-        {input, dynamic, weights, residual, shortBuffer}, plan,
-        DraftConvolutionStage::Prepare);
-  });
-  rejects([&] {
-    DraftAttention::addPrepare(invalid,
-        {qkv, queries, queryNorm, keyNorm, ropeCos, ropeSin, {}, queryValues},
-        plan);
-  });
-  rejects([&] {
-    DraftAttention::addReorder(invalid, queries, {}, plan);
-  });
-  const std::array<MetalBuffer, kLanes> emptyRings{};
-  const std::array<uint32_t, kLanes> lengths{};
-  rejects([&] {
-    DraftAttention::addDecode(invalid,
-        {queries, emptyRings, emptyRings, queryKeys, queryValues},
-        std::span(lengths).first(lanes), plan);
-  });
-  require(invalid.empty(), "invalid draft request partially encoded a graph");
 }
 
 // The context writers against a CPU ring: a row's key is RMS-normalized,
@@ -452,8 +430,7 @@ void surroundingPhases(MetalBackend &backend, DraftAttentionShape shape,
 // position % 2048 of each KV head's ring (keys [head][slot][dim], values
 // [head][dim][slot]); every other slot keeps its bits. The prefill writes
 // its rows from a start position, the commit each lane's retained verify
-// rows (at most eight). The buffers hold exactly what the writers read, and
-// the host rejects a buffer below its rows.
+// rows (at most eight). The buffers hold exactly what the writers read.
 void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
   // A context row holds its keys, then its values.
   constexpr uint32_t kRowWidth = 2048, kKeyColumn = 0, kValueColumn = 1024;
@@ -577,42 +554,112 @@ void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
               uint64_t{lane} * kRows * kHeadDim / 2,
           std::min(retained[lane], kRows), starts[lane]);
 
-  const auto shorter = [&](const MetalBuffer &buffer) {
-    return backend.view(buffer, 0, buffer.sizeBytes() - 2);
-  };
   CommandGraph invalid;
-  const auto prefillWith = [&](const MetalBuffer &q, const MetalBuffer &sines,
-                               const MetalBuffer &k) {
-    DraftAttention::addContextPrefill(invalid, q, keyNorm, ropeCos, sines, k,
-                                      values, kTokens, kStart, shape);
-  };
-  rejects([&] { prefillWith(kv, ropeSin, shorter(keys)); });
-  rejects([&] { prefillWith(shorter(kv), ropeSin, keys); });
-  rejects([&] { prefillWith(kv, shorter(ropeSin), keys); });
-  // The last lane's values ring.
-  const MetalBuffer lastRing = laneValues[kCommitLanes - 1];
-  const auto commitWith = [&](const MetalBuffer &q, const MetalBuffer &counts,
-                              const MetalBuffer &last) {
-    std::array<MetalBuffer, kLanes> rings = laneValues;
-    rings[kCommitLanes - 1] = last;
-    DraftAttention::addContextCommit(invalid, q, keyNorm, laneCos, laneSin,
-                                     laneKeys, rings, counts, starts, shape);
-  };
-  rejects([&] { commitWith(laneKv, retainedCounts, shorter(lastRing)); });
-  rejects([&] { commitWith(shorter(laneKv), retainedCounts, lastRing); });
-  rejects([&] { commitWith(laneKv, shorter(retainedCounts), lastRing); });
   // The start positions name the lanes: none, or more than a batch, commit
   // nothing.
   const std::array<uint32_t, kLanes + 1> overfull{};
   for (const std::span<const uint32_t> positions :
        {std::span<const uint32_t>(), std::span<const uint32_t>(overfull)})
-    rejects([&] {
-      DraftAttention::addContextCommit(invalid, laneKv, keyNorm, laneCos,
-                                       laneSin, laneKeys, laneValues,
-                                       retainedCounts, positions, shape);
-    });
+    rejects(
+        [&] {
+          DraftAttention::addContextCommit(invalid, laneKv, keyNorm, laneCos,
+                                           laneSin, laneKeys, laneValues,
+                                           retainedCounts, positions, shape);
+        },
+        "invalid draft batch width",
+        "a context commit of no lanes or more than a batch was accepted");
   require(invalid.empty(),
           "invalid draft context write partially encoded a graph");
+}
+
+// Each buffer the draft phases reach, at its extent and one element short,
+// for three lanes of eight rows: the convolution's rows, the lanes' dynamic
+// weights and the taps' base weights; the prepare's q|k|v rows, its grouped
+// query rows, the current rows' keys and values, the norms and the RoPE rows;
+// the attention's query rows, followed by the split partials, and each lane's
+// rings; the reorder's rows; the context writers' key and value rows, norm,
+// RoPE rows, rings and the commit's retained counts.
+void bufferExtents(MetalBackend &backend, DraftAttentionShape shape) {
+  constexpr uint32_t lanes = 3, contextTokens = 37;
+  const auto plan = DraftAttention::plan(shape, lanes);
+  const uint64_t rows = uint64_t{lanes} * kRows, hidden = rows * shape.hiddenSize * 2;
+  const uint64_t queryRows = rows * kAttention * 2, current = rows * kKvHeads * kHeadDim * 2;
+  const uint64_t ring = uint64_t{kKvHeads} * kWindow * kHeadDim * 2, norm = kHeadDim * 2;
+  const uint64_t ropeRow = kHeadDim / 2 * 4, contextRow = uint64_t{shape.qkvSize - shape.attentionSize} * 2;
+  using Extents = std::initializer_list<splash::test::BufferExtent>;
+  using Buffers = std::vector<MetalBuffer>;
+  splash::test::requireExtents(backend,
+                               Extents{{0, hidden, 2, "draft convolution input"},
+                                       {1, rows * shape.dynamicSize * 2, 2, "draft dynamic convolution"},
+                                       {2, uint64_t{4} * shape.hiddenSize * 2, 2, "draft convolution weight"},
+                                       {3, hidden, 2, "draft convolution residual"},
+                                       {4, hidden, 2, "draft convolution output"}},
+                               [&](CommandGraph &graph, const Buffers &b) {
+                                 DraftAttention::addConvolution(graph, {b[0], b[1], b[2], b[3], b[4]}, plan,
+                                                                DraftConvolutionStage::Residual);
+                               });
+  splash::test::requireExtents(backend,
+                               Extents{{0, rows * shape.qkvSize * 2, 2, "draft q/k/v"},
+                                       {1, queryRows, 2, "draft grouped queries"},
+                                       {2, norm, 2, "draft query norm"},
+                                       {3, norm, 2, "draft key norm"},
+                                       {4, rows * ropeRow, 4, "draft RoPE cosine"},
+                                       {5, rows * ropeRow, 4, "draft RoPE sine"},
+                                       {6, current, 2, "draft query keys"},
+                                       {7, current, 2, "draft query values"}},
+                               [&](CommandGraph &graph, const Buffers &b) {
+                                 DraftAttention::addPrepare(graph, {b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]},
+                                                            plan);
+                               });
+  // Every lane's rings follow the query rows and current keys and values; a
+  // batch binds a ring for each of its lanes, those past the plan's unread.
+  const auto rings = [](const Buffers &b, size_t first) {
+    std::array<MetalBuffer, kLanes> result;
+    for (uint32_t lane = 0; lane < kLanes; ++lane) result[lane] = b[first + std::min(lane, lanes - 1)];
+    return result;
+  };
+  std::vector<splash::test::BufferExtent> extents{
+      {0, queryRows + uint64_t{lanes} * kKvHeads * kSplits * kPartialBytes, 4, "draft grouped queries"},
+      {1, current, 2, "draft query keys"},
+      {2, current, 2, "draft query values"}};
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    extents.push_back({3 + lane, ring, 2, "draft key ring"});
+    extents.push_back({3 + lanes + lane, ring, 2, "draft value ring"});
+  }
+  const std::array<uint32_t, lanes> lengths{0, 2047, 6000};
+  splash::test::requireExtents(backend, extents, [&](CommandGraph &graph, const Buffers &b) {
+    DraftAttention::addDecode(graph, {b[0], rings(b, 3), rings(b, 3 + lanes), b[1], b[2]}, lengths, plan);
+  });
+  splash::test::requireExtents(backend,
+                               Extents{{0, queryRows, 2, "draft grouped attention"}, {1, queryRows, 2, "draft attention"}},
+                               [&](CommandGraph &graph, const Buffers &b) {
+                                 DraftAttention::addReorder(graph, b[0], b[1], plan);
+                               });
+  splash::test::requireExtents(backend,
+                               Extents{{0, contextTokens * contextRow, 2, "draft context K/V"},
+                                       {1, norm, 2, "draft key norm"},
+                                       {2, contextTokens * ropeRow, 4, "draft RoPE cosine"},
+                                       {3, contextTokens * ropeRow, 4, "draft RoPE sine"},
+                                       {4, ring, 2, "draft key ring"},
+                                       {5, ring, 2, "draft value ring"}},
+                               [&](CommandGraph &graph, const Buffers &b) {
+                                 DraftAttention::addContextPrefill(graph, b[0], b[1], b[2], b[3], b[4], b[5],
+                                                                   contextTokens, 6130, shape);
+                               });
+  extents = {{0, rows * contextRow, 2, "draft context K/V"},
+             {1, norm, 2, "draft key norm"},
+             {2, rows * ropeRow, 4, "draft RoPE cosine"},
+             {3, rows * ropeRow, 4, "draft RoPE sine"},
+             {4, uint64_t{lanes} * 4, 4, "draft retained counts"}};
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    extents.push_back({5 + lane, ring, 2, "draft key ring"});
+    extents.push_back({5 + lanes + lane, ring, 2, "draft value ring"});
+  }
+  const std::array<uint32_t, lanes> starts{2044, 0, 4101};
+  splash::test::requireExtents(backend, extents, [&](CommandGraph &graph, const Buffers &b) {
+    DraftAttention::addContextCommit(graph, b[0], b[1], b[2], b[3], rings(b, 5), rings(b, 5 + lanes), b[4], starts,
+                                     shape);
+  });
 }
 
 } // namespace
@@ -624,6 +671,7 @@ int main(int argc, char **argv) {
     planGeometry();
     MetalBackend backend(argv[1]);
     for (const auto shape : kShapes) {
+      bufferExtents(backend, shape);
       for (uint32_t lanes = 1; lanes <= kLanes; ++lanes)
         surroundingPhases(backend, shape, lanes);
       contextWriters(backend, shape);

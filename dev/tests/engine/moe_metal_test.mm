@@ -5,6 +5,8 @@
 // fixtures cover dispersed, concentrated and skewed expert utilization with
 // hidden width 1024 and intermediate width 512.
 #include "AffineQ4Fixture.hpp"
+#include "MoeExtents.hpp"
+#include "TestChecks.hpp"
 #include "../../../runtime/metal/BackendInstrumentation.hpp"
 #include "../../../runtime/metal/CommandGraph.hpp"
 #include "../../../runtime/metal/MetalBackend.hpp"
@@ -55,6 +57,7 @@ using splash::ops::MoePlan;
 using splash::ops::MoeShape;
 using splash::ops::MoeWeights;
 using splash::ops::Q8Projection;
+using splash::test::rejects;
 
 // 16 quant groups on the hidden side, so the 32-row expert tiles refill their
 // staged scales and biases several times, as the production shapes do.
@@ -512,15 +515,6 @@ void check(const Fixture &fixture, uint32_t rows, uint32_t tileRows,
   }
 }
 
-template <class Function> void rejects(Function function, const char *label) {
-  try {
-    function();
-  } catch (const std::invalid_argument &) {
-    return;
-  }
-  fail(std::string(label) + ": invalid plan or buffers were accepted");
-}
-
 // Expert ids, route rows and grouped routes are uint32, routing weights fp32
 // and activations bf16. The grouped input first holds the router's fp32
 // scores, one kStorageColumns row per token.
@@ -583,16 +577,21 @@ void planBounds() {
                   narrow.workspace() == plan.workspace(),
               "four-simdgroup tiles changed the plan geometry or workspace");
     }
-    rejects([&] { (void)shipped.moePrefill(shape, 0); }, "zero prefill");
-    rejects([&] { (void)shipped.moePrefill(shape, 2049); }, "large prefill");
-    rejects([&] { (void)shipped.moeDecode(shape, 0); }, "zero batch");
-    rejects([&] { (void)shipped.moeDecode(shape, 5); }, "large batch");
+    rejects([&] { (void)shipped.moePrefill(shape, 0); }, "invalid MoE prefill rows",
+            "a prefill of no rows was accepted");
+    rejects([&] { (void)shipped.moePrefill(shape, 2049); }, "invalid MoE prefill rows",
+            "a prefill past the token budget was accepted");
+    rejects([&] { (void)shipped.moeDecode(shape, 0); }, "invalid MoE decode width",
+            "a decode of no lanes was accepted");
+    rejects([&] { (void)shipped.moeDecode(shape, 5); }, "invalid MoE decode width",
+            "a decode wider than a batch was accepted");
     rejects([&] { (void)MoE::prefillPlan(shape, 1, {MoeExpertTile::M8}); },
-            "affine 8-row prefill tile");
+            "invalid MoE expert tile configuration", "an affine prefill plan took 8-row tiles");
     rejects([&] { (void)MoE::decodePlan(shape, 1, {MoeExpertTile::M32}); },
-            "affine 32-row decode tile");
+            "invalid MoE expert tile configuration", "an affine decode plan took 32-row tiles");
   }
-  rejects([] { (void)MoE::prefillPlan({}, 1, {MoeExpertTile::M32}); }, "invalid shape");
+  rejects([] { (void)MoE::prefillPlan({}, 1, {MoeExpertTile::M32}); }, "invalid MoE workspace shape",
+          "a plan of an empty shape was accepted");
   // Only family 9 runs the four-simdgroup decode tiles; families 10 and
   // later run eight.
   using splash::ops::gpuFamilyClass;
@@ -683,7 +682,8 @@ void bufferBounds(MetalBackend &backend, Fixture &fixture) {
     allocateScratch(backend, fixture, plan);
     const auto rejectWeights = [&](const MoeWeights &weights, const char *label) {
       CommandGraph graph;
-      rejects([&] { MoE::add(graph, fixture.buffers, weights, plan); }, label);
+      rejects([&] { MoE::add(graph, fixture.buffers, weights, plan); },
+              "MoE weights do not match execution shape", std::string(label) + " was accepted");
       require(graph.empty(), "invalid weights partially encoded MoE");
     };
     for (auto projection : {&splash::ops::AffineMoeWeights::router, &splash::ops::AffineMoeWeights::sharedScalarGate}) {
@@ -725,32 +725,15 @@ void bufferBounds(MetalBackend &backend, Fixture &fixture) {
       projection.packed = backend.view(projection.packed, 0, bytes - 1);
       rejectWeights(changed, "undersized final expert boundary");
     }
-    for (const MoeScratchField &field : kMoeScratchFields) {
-      const auto &buffer = fixture.buffers.scratch.*field.buffer;
-      if (!(plan.workspace().*field.bytes)) continue;
-      MoeBuffers shortBuffers = fixture.buffers;
-      shortBuffers.scratch.*field.buffer = backend.view(buffer, 0, buffer.sizeBytes() - 1);
-      CommandGraph graph;
-      rejects([&] { MoE::add(graph, shortBuffers, fixture.weights, plan); },
-              "undersized scratch");
-      require(graph.empty(), "invalid scratch partially encoded MoE");
-    }
-    for (auto member : {&MoeBuffers::input, &MoeBuffers::residual, &MoeBuffers::output}) {
-      MoeBuffers shortBuffers = fixture.buffers;
-      shortBuffers.*member = backend.view(fixture.buffers.*member, 0,
-          uint64_t{plan.rows()} * fixture.shape.hiddenSize * 2 - 1);
-      CommandGraph graph;
-      rejects([&] { MoE::add(graph, shortBuffers, fixture.weights, plan); },
-              "undersized row buffer");
-      require(graph.empty(), "invalid row buffer partially encoded MoE");
-    }
+    splash::test::requireMoeExtents(backend, fixture.buffers, fixture.weights, plan);
   }
   const auto smallTiles = shipped.moeDecode(fixture.shape, 4);
   const auto largeTiles = shipped.moePrefill(fixture.shape, 33);
   allocateScratch(backend, fixture, smallTiles);
   CommandGraph graph;
+  // The decode plan's 32 rows select fewer experts than the prefill plan's 33.
   rejects([&] { MoE::add(graph, fixture.buffers, fixture.weights, largeTiles); },
-          "scratch from incompatible plan");
+          "MoE selected experts buffer holds", "scratch from an incompatible plan was accepted");
   require(graph.empty(), "incompatible plan partially encoded MoE");
   require(BackendInstrumentation::submittedCommands(backend) == submissions,
           "MoE buffer validation submitted a GPU command");

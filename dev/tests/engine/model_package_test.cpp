@@ -1,4 +1,5 @@
 #include "TestBuffers.hpp"
+#include "TestChecks.hpp"
 #include "TestPackage.hpp"
 #include "model/GgufImageLayout.hpp"
 #include "model/ModelFactory.hpp"
@@ -19,6 +20,7 @@
 #include <span>
 #include <string>
 #include <system_error>
+#include <tuple>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -32,7 +34,6 @@ using splash::model::DFlashDraftLayout;
 using splash::model::ModelDescriptor;
 using splash::model::WeightFile;
 using splash::model::WeightFileRecord;
-using splash::model::WeightStoreError;
 using splash::model::QwenAttentionWeights;
 using splash::model::QwenGdnWeights;
 using splash::model::Qwen3_8Layout;
@@ -46,6 +47,7 @@ using splash::metal::BufferStorage;
 using splash::metal::MetalBackend;
 using splash::metal::MetalBuffer;
 using splash::test::SyntheticAccounting;
+using splash::test::rejects;
 using splash::test::sharedBuffer;
 using splash::test::writeSyntheticPackage;
 using splash::test::writeWeightFile;
@@ -70,16 +72,6 @@ void testStartupCapabilities() {
                 ExecutionLimits::targetVerifyRows == 8 &&
                 ExecutionLimits::draftContextTokens == 2048,
             "DFlash execution contract changed");
-}
-
-template <typename Function>
-void requirePackedError(Function &&function, const std::string &message) {
-    try {
-        function();
-    } catch (const WeightStoreError &) {
-        return;
-    }
-    fail(message);
 }
 
 uint64_t declaredBytes(std::span<const WeightFileRecord> records) {
@@ -161,13 +153,7 @@ void testWeightImages(MetalBackend &backend, const std::filesystem::path &root) 
         images.release();
         require(!retained.contents() && backend.memoryStats().allocatedBytes == baseline,
                 "released image memory remains");
-        bool refused = false;
-        try {
-            (void)readBack();
-        } catch (const splash::metal::MetalBackendError &error) {
-            refused = std::string_view(error.what()).find("binds released memory") != std::string_view::npos;
-        }
-        require(refused, "a command bound released image memory");
+        rejects([&] { (void)readBack(); }, "binds released memory", "a command bound released image memory");
         require(images.restore() && !images.released() &&
                     backend.memoryStats().allocatedBytes >= baseline + fileBytes && readBack(),
                 "GPU read of a restored image section was incorrect");
@@ -178,14 +164,8 @@ void testWeightImages(MetalBackend &backend, const std::filesystem::path &root) 
                     pwrite(descriptor, &edit, sizeof(edit), kWeightFileAlignment) == sizeof(edit),
                 "unable to write the loaded file");
         close(descriptor);
-        bool written = false;
-        try {
-            static_cast<void>(images.restore());
-        } catch (const std::runtime_error &error) {
-            written = std::string_view(error.what()).find("written while the model is loaded") !=
-                      std::string_view::npos;
-        }
-        require(written, "a restore read a file written since it was opened");
+        rejects([&] { static_cast<void>(images.restore()); }, "written while the model is loaded",
+                "a restore read a file written since it was opened");
     }
     retained = MetalBuffer{};
     require(backend.memoryStats().allocatedBytes == baseline,
@@ -198,34 +178,37 @@ void testWeightImages(MetalBackend &backend, const std::filesystem::path &root) 
     };
     auto headerPath = root / "header.bin";
     writeWeightFile(headerPath, "TEST0001", 7, 9, sections);
-    requirePackedError([&] { (void)load(headerPath, "WRONG000", 7, 9); }, "wrong packed magic was accepted");
-    requirePackedError([&] { (void)load(headerPath, "TEST0001", 8, 9); }, "wrong packed layer was accepted");
-    requirePackedError([&] { (void)load(headerPath, "TEST0001", 7, 8); }, "wrong packed type was accepted");
-    requirePackedError(
+    rejects([&] { (void)load(headerPath, "WRONG000", 7, 9); }, "weight image header mismatch",
+            "wrong packed magic was accepted");
+    rejects([&] { (void)load(headerPath, "TEST0001", 8, 9); }, "weight image header mismatch",
+            "wrong packed layer was accepted");
+    rejects([&] { (void)load(headerPath, "TEST0001", 7, 8); }, "weight image header mismatch",
+            "wrong packed type was accepted");
+    rejects(
         [&] {
             WeightFile truncated = load(headerPath, "TEST0001", 7, 9);
             (void)truncated.section(fileBytes, {});
         },
-        "truncated packed section was accepted");
+        "is truncated at section", "truncated packed section was accepted");
 
     auto extraPath = root / "extra.bin";
     std::array<uint64_t, 2> extraSections{64, 64};
     writeWeightFile(extraPath, "TEST0001", 1, 2, extraSections);
-    requirePackedError(
+    rejects(
         [&] {
             WeightFile extra = load(extraPath, "TEST0001", 1, 2);
             (void)extra.section(64, {});
             extra.finish();
         },
-        "unconsumed packed bytes were accepted");
+        "weight image has unconsumed or missing bytes", "unconsumed packed bytes were accepted");
 
     auto unalignedPath = root / "unaligned.bin";
     writeWeightFile(unalignedPath, "TEST0001", 1, 2, sections);
     require(truncate(unalignedPath.c_str(),
                      static_cast<off_t>(fileBytes - 1)) == 0,
             "unable to truncate synthetic file");
-    requirePackedError([&] { (void)load(unalignedPath, "TEST0001", 1, 2); },
-                       "unaligned packed file size was accepted");
+    rejects([&] { (void)load(unalignedPath, "TEST0001", 1, 2); }, "weight image size is not 16 KiB-aligned",
+            "unaligned packed file size was accepted");
 }
 
 // One tensor of a GGUF image: its descriptor, then its sections.
@@ -282,17 +265,19 @@ void testGgufImageLayout(MetalBackend &backend, const std::filesystem::path &roo
         require(segment.formatId == GGUF_FMT_Q80 && !segment.plane1, "GGUF projection did not read a Q8_0 segment");
     }
     for (const auto [output, input] : {std::pair{2 * rows, columns}, std::pair{rows, 2 * columns}}) {
-        requirePackedError(
+        rejects(
             [&] {
                 WeightFile file = loaded(projection);
                 (void)splash::model::readBlockProjection(file, output, input, "projection");
             },
+            "GGUF tensor does not match the layout",
             "GGUF projection of other sizes than the layout's was accepted");
-        requirePackedError(
+        rejects(
             [&] {
                 WeightFile file = loaded(embedding);
                 (void)splash::model::readBlockEmbedding(file, output, input, "embedding");
             },
+            "GGUF embedding does not match the layout",
             "GGUF embedding of other sizes than the layout's was accepted");
     }
     WeightFile file = loaded(embedding);
@@ -304,18 +289,16 @@ void testGgufImageLayout(MetalBackend &backend, const std::filesystem::path &roo
         sharedBuffer(backend, uint64_t{gathered} * columns * splash::model::kBFloat16Bytes);
     splash::metal::CommandGraph graph;
     splash::ops::Embedding::add(graph, tokens, table, output, gathered);
-    for (const auto &[tokenBytes, outputBytes] :
-         {std::pair{tokens.sizeBytes() - sizeof(uint32_t), output.sizeBytes()},
-          std::pair{tokens.sizeBytes(), output.sizeBytes() - splash::model::kBFloat16Bytes}}) {
-        bool rejected = false;
-        try {
-            splash::ops::Embedding::add(graph, backend.view(tokens, 0, tokenBytes), table,
-                                        backend.view(output, 0, outputBytes), gathered);
-        } catch (const std::invalid_argument &) {
-            rejected = true;
-        }
-        require(rejected, "token gather past its buffers was accepted");
-    }
+    for (const auto &[tokenBytes, outputBytes, refusal] :
+         {std::tuple{tokens.sizeBytes() - sizeof(uint32_t), output.sizeBytes(), "embedding token buffer holds"},
+          std::tuple{tokens.sizeBytes(), output.sizeBytes() - splash::model::kBFloat16Bytes,
+                     "embedding output buffer holds"}})
+        rejects(
+            [&] {
+                splash::ops::Embedding::add(graph, backend.view(tokens, 0, tokenBytes), table,
+                                            backend.view(output, 0, outputBytes), gathered);
+            },
+            refusal, "token gather past its buffers was accepted");
 }
 
 void testSyntheticPackage(MetalBackend &backend,

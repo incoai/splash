@@ -19,6 +19,7 @@
 #include <cstring>
 #include <iostream>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -490,10 +491,64 @@ void runTiledCase(MetalBackend &backend, const GdnShape &shape,
   std::cout << label << "byte-identical to the grouped order\n";
 }
 
+// Each buffer the prefill reaches, at its extent and one element short: the
+// packed rows up to the last row's alpha, the four taps of every channel's
+// convolution weights and its three carried rows, the q/k/v and gate rows of
+// every token, a value head's state, and the mixer norm in either type.
+void bufferExtents(MetalBackend &backend, const GdnShape &shape, bool float32) {
+  constexpr uint32_t tokens = 37;
+  const GdnPrefillBuffers buffers = randomPrefill(backend, shape, tokens, float32);
+  const uint64_t valueWidth = uint64_t{shape.valueHeads} * kHeadDim;
+  const uint64_t keyRows = uint64_t{tokens} * shape.keyHeads * kHeadDim * 2;
+  const uint64_t valueRows = tokens * valueWidth * 2;
+  const uint64_t state = valueWidth * kHeadDim * 4;
+  const auto encode = [&](CommandGraph &graph, const GdnPrefillBuffers &changed) {
+    GDN::addPrefill(graph, changed, shape, tokens, GdnHeadOrder::Grouped);
+  };
+  for (const auto &[member, bytes, element, what] :
+       std::initializer_list<std::tuple<MetalBuffer GdnPrefillBuffers::*, uint64_t, uint64_t, const char *>>{
+           {&GdnPrefillBuffers::packed,
+            (uint64_t{tokens - 1} * shape.packedWidth + shape.convolutionDimension + valueWidth +
+             2 * shape.valueHeads) * 2,
+            2, "GDN packed"},
+           {&GdnPrefillBuffers::convolutionWeights, uint64_t{shape.convolutionDimension} * 4 * 2, 2,
+            "GDN convolution weight"},
+           {&GdnPrefillBuffers::convolutionIn, uint64_t{3} * shape.convolutionDimension * 2, 2,
+            "GDN convolution state"},
+           {&GdnPrefillBuffers::convolutionOut, uint64_t{3} * shape.convolutionDimension * 2, 2,
+            "GDN next convolution state"},
+           {&GdnPrefillBuffers::queries, keyRows, 2, "GDN query"},
+           {&GdnPrefillBuffers::keys, keyRows, 2, "GDN key"},
+           {&GdnPrefillBuffers::values, valueRows, 2, "GDN value"},
+           {&GdnPrefillBuffers::decayWeights, uint64_t{shape.valueHeads} * 4, 4, "GDN decay weight"},
+           {&GdnPrefillBuffers::timeBias, uint64_t{shape.valueHeads} * 2, 2, "GDN time bias"},
+           {&GdnPrefillBuffers::decay, uint64_t{tokens} * shape.valueHeads * 4, 4, "GDN decay"},
+           {&GdnPrefillBuffers::beta, uint64_t{tokens} * shape.valueHeads * 2, 2, "GDN beta"},
+           {&GdnPrefillBuffers::recurrentIn, state, 4, "GDN recurrent state"},
+           {&GdnPrefillBuffers::recurrentOut, state, 4, "GDN next recurrent state"},
+           {&GdnPrefillBuffers::recurrentRows, valueRows, 2, "GDN recurrent row"},
+           {&GdnPrefillBuffers::hidden, valueRows, 2, "GDN hidden"}})
+    splash::test::requireExtent(backend, buffers.*member, bytes, element, what,
+                                [&](CommandGraph &graph, const MetalBuffer &buffer) {
+                                  GdnPrefillBuffers changed = buffers;
+                                  changed.*member = buffer;
+                                  encode(graph, changed);
+                                });
+  const uint64_t normElement = float32 ? 4 : 2;
+  splash::test::requireExtent(backend, buffers.mixerNorm.buffer, kHeadDim * normElement, normElement,
+                              "norm weight", [&](CommandGraph &graph, const MetalBuffer &buffer) {
+                                GdnPrefillBuffers changed = buffers;
+                                changed.mixerNorm.buffer = buffer;
+                                encode(graph, changed);
+                              });
+}
+
 void run(const std::string &metallib) {
   MetalBackend backend(metallib);
   for (const GdnShape &shape :
        {GdnShape{16, 48, 128, 10240, 16640}, GdnShape{16, 32, 128, 8192, 12544}}) {
+    for (bool float32 : {false, true})
+      bufferExtents(backend, shape, float32);
     for (uint32_t tokens : {1u, 37u, 1000u, 2048u})
       runCase(backend, shape, tokens);
     for (uint32_t tokens : {1u, 37u})

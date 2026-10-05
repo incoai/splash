@@ -40,6 +40,7 @@ namespace {
   throw std::runtime_error(message);
 }
 
+using splash::test::rejects;
 using splash::test::require;
 
 std::string mebibytes(uint64_t bytes) {
@@ -1061,14 +1062,9 @@ void requireCoveredImagesAreNotStaged(model::Runtime &executor,
                     before + model.stateLayout().laneBytes(),
             "a start staged an image its restored prefix covers");
     if (id == 115) {
-      bool refused = false;
-      try {
-        static_cast<void>(executor.beginRestore(id, 32, beforeImage, true, {}));
-      } catch (const std::invalid_argument &error) {
-        refused = std::string(error.what()) ==
-                  "restore stops before images its activation left out";
-      }
-      require(refused, "a restore before a left-out image was accepted");
+      rejects([&] { static_cast<void>(executor.beginRestore(id, 32, beforeImage, true, {})); },
+              "restore stops before images its activation left out",
+              "a restore before a left-out image was accepted");
     } else {
       restoreActivePrefix(executor, id, prompt.size(), 64, pastImage);
       prefillChunk(executor, id, 64,
@@ -1546,17 +1542,13 @@ int main(int argc, char **argv) {
       const uint64_t beforeWarmupRows = executor.telemetry().targetPrefillRows;
       const uint64_t beforeCommands =
           BackendInstrumentation::submittedCommands(backend);
-      bool rejected = false;
-      try {
-        static_cast<void>(executor.warmupPrefill(1));
-      } catch (const std::logic_error &error) {
-        rejected = std::string(error.what()).find("runway") != std::string::npos;
-      }
-      require(rejected && !states.metadata(0).assigned() &&
+      rejects([&] { static_cast<void>(executor.warmupPrefill(1)); },
+              "is outside the startup runway", "real warmup ran without its KV runway");
+      require(!states.metadata(0).assigned() &&
                   executor.telemetry().targetPrefillRows == beforeWarmupRows &&
                   BackendInstrumentation::submittedCommands(backend) ==
                       beforeCommands,
-              "real warmup ran without its KV runway or executed/leaked work");
+              "a refused warmup executed or leaked work");
     }
     require(static_cast<bool>(pages.allocateExtent(0)),
             "warmup runway fixture failed to recover its KV extent");
@@ -1693,13 +1685,8 @@ int main(int argc, char **argv) {
       require(scoredResult.scoreLogits[0] >= scoredResult.scoreLogits[1] &&
                   scoredResult.scoreLogits[0] >= scoredResult.scoreLogits[2],
               "greedy decode token is not the maximum scored logit");
-      bool decodeRejected = false;
-      try {
-        decodeOne(executor, 99, 128, pageTable);
-      } catch (const std::exception &) {
-        decodeRejected = true;
-      }
-      require(decodeRejected, "score request allowed a decode step");
+      rejects([&] { decodeOne(executor, 99, 128, pageTable); },
+              "decode request has no current anchor", "score request allowed a decode step");
       executor.end(99);
     }
     requireNonFiniteRowFailsOnlyItsLane(executor, pages, states, backend,
@@ -3328,27 +3315,19 @@ int main(int argc, char **argv) {
       item.inputTokens = std::span<const uint32_t>(extended).subspan(128, 100);
       auto ticket =
           executor.submit(plan, std::span<const ModelBatchItem>(&item, 1), {});
-      bool threw = false;
-      try {
-        static_cast<void>(ticket->wait());
-      } catch (const std::logic_error &) {
-        threw = true;
-      }
+      rejects([&] { static_cast<void>(ticket->wait()); },
+              "draft capture does not continue the draft ring",
+              "a capture continued a draft ring its restore skipped");
       executor.end(93);
-      require(threw, "a capture continued a draft ring its restore skipped");
       std::cout << "discontinuous_capture_fails=PASS\n";
     }
 
     const auto rowsBeforeInvalidWarmup = executor.telemetry().targetPrefillRows;
     for (uint32_t rows : {0U, model::ExecutionLimits::prefillTokenBudget + 1,
                           std::numeric_limits<uint32_t>::max()}) {
-      bool rejected = false;
-      try {
-        static_cast<void>(executor.warmupPrefill(rows));
-      } catch (const std::invalid_argument &) {
-        rejected = true;
-      }
-      require(rejected && executor.telemetry().targetPrefillRows == rowsBeforeInvalidWarmup,
+      rejects([&] { static_cast<void>(executor.warmupPrefill(rows)); },
+              "invalid prefill warmup row count", "invalid warmup rows were accepted");
+      require(executor.telemetry().targetPrefillRows == rowsBeforeInvalidWarmup,
               "invalid warmup rows reached the production prefill phase");
     }
     for (uint32_t rows : {32U, 128U, 512U}) {

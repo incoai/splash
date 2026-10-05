@@ -10,6 +10,7 @@
 // reference. It then verifies determinism, a second grid through the same
 // scratch arena, and reports the encode time of a 64x64-patch image.
 
+#include "TestChecks.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "model/ModelDescriptor.hpp"
@@ -40,6 +41,7 @@ using splash::metal::MetalBackend;
 using splash::metal::MetalBuffer;
 using splash::ops::ImageGrid;
 using splash::ops::Vision;
+using splash::test::rejects;
 
 std::vector<uint8_t> readFile(const std::string &path) {
   std::ifstream file(path, std::ios::binary);
@@ -126,12 +128,8 @@ void verifyComparison() {
     if (compare(actual, reference, width).worstRowError < 1.99)
       throw std::runtime_error("parity comparison skipped the final row");
     actual.back() = std::numeric_limits<float>::quiet_NaN();
-    try {
-      static_cast<void>(compare(actual, reference, width));
-    } catch (const std::runtime_error &) {
-      continue;
-    }
-    throw std::runtime_error("parity comparison accepted NaN");
+    rejects([&] { static_cast<void>(compare(actual, reference, width)); },
+            "non-finite parity embedding", "parity comparison accepted NaN");
   }
 }
 

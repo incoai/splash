@@ -30,6 +30,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -51,15 +52,6 @@ constexpr uint32_t kLayers = 2;
 constexpr double kQueryScale = 0.0078125, kKeyScale = 0.08838834765;
 constexpr std::array kShapes{GdnShape{16, 48, 128, 10240, 16640},
                              GdnShape{16, 32, 128, 8192, 12544}};
-
-template <class Function> void rejects(Function function) {
-  try {
-    function();
-  } catch (const std::invalid_argument &) {
-    return;
-  }
-  throw std::runtime_error("invalid GDN request was accepted");
-}
 
 double roundBfloat(double value) {
   return bf16ToFloat(floatToBf16(static_cast<float>(value)));
@@ -615,10 +607,12 @@ void fusedPreparation(MetalBackend &backend, const GdnShape &shape, uint32_t lan
   CommandGraph reference;
   // Without scratch the table cannot be written: GDN refuses it before it
   // encodes anything.
-  rejects([&] {
-    GDN::addDecode(reference, fixture.decodeBuffers(0), shape, lanes, 0, fixture.cell.strides(),
-                   GdnHeadOrder::Grouped, layout);
-  });
+  rejects(
+      [&] {
+        GDN::addDecode(reference, fixture.decodeBuffers(0), shape, lanes, 0, fixture.cell.strides(),
+                       GdnHeadOrder::Grouped, layout);
+      },
+      "linear table buffer holds", what + " wrote a table without scratch");
   require(GDN::addDecode(reference, fixture.decodeBuffers(0), shape, lanes, 0, fixture.cell.strides(),
                          GdnHeadOrder::Grouped, LinearInput::Plain)
                   .layout == LinearInput::Plain,
@@ -690,6 +684,122 @@ void tiledHeadOrder(MetalBackend &backend, const GdnShape &shape, uint32_t lanes
   }
   require(!std::memcmp(expected.data(), hidden, expected.size()),
           what + " output is not the grouped output in tiled head order");
+}
+
+// Each buffer the decode and the commit of `lanes` lanes reach, at its extent
+// and one element short. The decode in the last layer reads each lane's rows
+// of the packed projection up to its last row's alpha, writes its mixed, gate
+// and hidden rows and the out-projection's table, and reaches each lane's
+// state cells to the end of that layer's state. The commit of both layers
+// reaches the last lane's seventh row of the last layer, the last a lane
+// retains, past the rows of every lane of the layer before: the packed row up
+// to its convolution inputs, the mixed and gate rows, and each lane's
+// retained count and state cells.
+void bufferExtents(MetalBackend &backend, const GdnShape &shape, LinearInput layout, bool float32,
+                   uint32_t lanes) {
+  constexpr uint32_t layer = kLayers - 1;
+  Fixture fixture(backend, shape, lanes, float32);
+  const uint32_t width = shape.valueHeads * shape.headDimension;
+  const PreparedTables tables(backend, layout, width, lanes);
+  GdnDecodeBuffers decode = fixture.decodeBuffers(layer);
+  decode.linearScratch = tables.scratch();
+  const GdnStateStrides production = fixture.cell.strides();
+  const auto encodeDecode = [&](CommandGraph &graph, const GdnDecodeBuffers &buffers, GdnStateStrides strides) {
+    (void)GDN::addDecode(graph, buffers, shape, lanes, layer, strides, GdnHeadOrder::Grouped, layout);
+  };
+  const uint64_t rows = uint64_t{lanes} * kRows;
+  for (const auto &[member, bytes, element, what] :
+       std::initializer_list<std::tuple<MetalBuffer GdnDecodeBuffers::*, uint64_t, uint64_t, const char *>>{
+           {&GdnDecodeBuffers::packed,
+            ((rows - 1) * shape.packedWidth + shape.convolutionDimension + width + 2 * shape.valueHeads) * 2, 2,
+            "GDN packed"},
+           {&GdnDecodeBuffers::convolutionWeights, uint64_t{shape.convolutionDimension} * 4 * 2, 2,
+            "GDN convolution weight"},
+           {&GdnDecodeBuffers::mixed, rows * shape.convolutionDimension * 2, 2, "GDN mixed"},
+           {&GdnDecodeBuffers::decayWeights, uint64_t{shape.valueHeads} * 4, 4, "GDN decay weight"},
+           {&GdnDecodeBuffers::timeBias, uint64_t{shape.valueHeads} * 2, 2, "GDN time bias"},
+           {&GdnDecodeBuffers::decay, rows * shape.valueHeads * 4, 4, "GDN decay"},
+           {&GdnDecodeBuffers::beta, rows * shape.valueHeads * 2, 2, "GDN beta"},
+           {&GdnDecodeBuffers::hidden, rows * width * 2, 2, "GDN hidden"}})
+    requireExtent(backend, decode.*member, bytes, element, what, [&](CommandGraph &graph, const MetalBuffer &buffer) {
+      GdnDecodeBuffers changed = decode;
+      changed.*member = buffer;
+      encodeDecode(graph, changed, production);
+    });
+  const uint64_t normElement = float32 ? 4 : 2;
+  requireExtent(backend, decode.mixerNorm.buffer, shape.headDimension * normElement, normElement, "norm weight",
+                [&](CommandGraph &graph, const MetalBuffer &buffer) {
+                  GdnDecodeBuffers changed = decode;
+                  changed.mixerNorm.buffer = buffer;
+                  encodeDecode(graph, changed, production);
+                });
+  for (const auto &[member, bytes, element, what] :
+       std::initializer_list<std::tuple<MetalBuffer LinearScratch::*, uint64_t, uint64_t, const char *>>{
+           {&LinearScratch::input, tables.tableSize, 2, "linear table"},
+           {&LinearScratch::sums, tables.sumsSize, 4, "linear table sums"}})
+    requireExtent(backend, decode.linearScratch.*member, bytes, element, what,
+                  [&](CommandGraph &graph, const MetalBuffer &buffer) {
+                    GdnDecodeBuffers changed = decode;
+                    changed.linearScratch.*member = buffer;
+                    encodeDecode(graph, changed, production);
+                  });
+  // Each running lane's current and next state cells, to the end of the last
+  // layer's state: its recurrent state in the production layout (Cell), and
+  // its convolution rows in a layout that puts them after every recurrent
+  // state (layer 0's rows, the recurrent states, layer 1's rows). The
+  // fixture's cells hold either layout.
+  const uint64_t carried = uint64_t{fixture.cell.layout.convolutionHistory} * shape.convolutionDimension * 2,
+                 recurrent = uint64_t{width} * shape.headDimension * 4;
+  const GdnStateStrides convolutionLast{carried + kLayers * recurrent, recurrent, carried};
+  const auto requireStates = [&](const auto &encode) {
+    for (const auto &[strides, bytes, element] : std::initializer_list<std::tuple<GdnStateStrides, uint64_t, uint64_t>>{
+             {production, production.convolutionStateBytes + layer * production.recurrentLayerBytes + recurrent, 4},
+             {convolutionLast, layer * convolutionLast.convolutionLayerBytes + carried, 2}})
+      for (const bool next : {false, true})
+        for (uint32_t lane = 0; lane < lanes; ++lane) {
+          const MetalBuffer &cell = (next ? fixture.next : fixture.current)[lane];
+          requireExtent(backend, cell, bytes, element, next ? "GDN next state" : "GDN current state",
+                        [&](CommandGraph &graph, const MetalBuffer &buffer) {
+                          std::array<MetalBuffer, kMaxLanes> current = fixture.current, nextStates = fixture.next;
+                          (next ? nextStates : current)[lane] = buffer;
+                          encode(graph, strides, current, nextStates);
+                        });
+        }
+  };
+  requireStates([&](CommandGraph &graph, GdnStateStrides strides, std::span<const MetalBuffer> current,
+                    std::span<const MetalBuffer> next) {
+    GdnDecodeBuffers changed = decode;
+    changed.currentStates = current;
+    changed.nextStates = next;
+    encodeDecode(graph, changed, strides);
+  });
+
+  // The commit's last retained row: row 7 of the last lane of the last layer.
+  const uint64_t commitRows = (uint64_t{kLayers - 1} * kMaxLanes + lanes - 1) * kRows + kRows - 1;
+  const GdnCommitBuffers commit = fixture.commitBuffers();
+  const auto encodeCommit = [&](CommandGraph &graph, const GdnCommitBuffers &buffers, GdnStateStrides strides) {
+    GDN::addCommit(graph, buffers, shape, kLayers, lanes, strides);
+  };
+  for (const auto &[member, bytes, element, what] :
+       std::initializer_list<std::tuple<MetalBuffer GdnCommitBuffers::*, uint64_t, uint64_t, const char *>>{
+           {&GdnCommitBuffers::packed,
+            ((commitRows - 1) * shape.packedWidth + shape.convolutionDimension) * 2, 2, "GDN packed"},
+           {&GdnCommitBuffers::mixed, commitRows * shape.convolutionDimension * 2, 2, "GDN mixed"},
+           {&GdnCommitBuffers::decay, commitRows * shape.valueHeads * 4, 4, "GDN decay"},
+           {&GdnCommitBuffers::beta, commitRows * shape.valueHeads * 2, 2, "GDN beta"},
+           {&GdnCommitBuffers::retainedCounts, uint64_t{lanes} * 4, 4, "GDN retained counts"}})
+    requireExtent(backend, commit.*member, bytes, element, what, [&](CommandGraph &graph, const MetalBuffer &buffer) {
+      GdnCommitBuffers changed = commit;
+      changed.*member = buffer;
+      encodeCommit(graph, changed, production);
+    });
+  requireStates([&](CommandGraph &graph, GdnStateStrides strides, std::span<const MetalBuffer> current,
+                    std::span<const MetalBuffer> next) {
+    GdnCommitBuffers changed = commit;
+    changed.currentStates = current;
+    changed.nextStates = next;
+    encodeCommit(graph, changed, strides);
+  });
 }
 
 // The decode gate (gdn_decode_gate, decode/gdn.metal) reproduces the prefill
@@ -793,46 +903,56 @@ void rejectsInvalid(MetalBackend &backend) {
   const GdnShape &shape = kShapes[1];
   Fixture fixture(backend, shape, 1);
   CommandGraph graph;
-  rejects([&] {
-    GDN::addDecode(graph, fixture.decodeBuffers(0), shape, 0, 0,
-                   fixture.cell.strides(), GdnHeadOrder::Grouped, LinearInput::Plain);
-  });
-  rejects([&] {
-    GDN::addDecode(graph, fixture.decodeBuffers(0), shape, kMaxLanes + 1, 0,
-                   fixture.cell.strides(), GdnHeadOrder::Grouped, LinearInput::Plain);
-  });
-  rejects([&] {
-    GDN::addDecode(graph, fixture.decodeBuffers(0),
-                   GdnShape{16, 40, 128, 9216, 14400}, 1, 0,
-                   fixture.cell.strides(), GdnHeadOrder::Grouped, LinearInput::Plain);
-  });
-  rejects([&] {
-    GDN::addCommit(graph, fixture.commitBuffers(), shape, 0, 1,
-                   fixture.cell.strides());
-  });
-  rejects([&] {
-    auto buffers = fixture.decodeBuffers(0);
-    buffers.linearScratch.input = sharedBuffer(backend, 16);
-    buffers.linearScratch.sums = sharedBuffer(backend, 4);
-    GDN::addDecode(graph, buffers, shape, 1, 0, fixture.cell.strides(), GdnHeadOrder::Grouped,
-                   splash::ops::LinearInput::Table64);
-  });
-  rejects([&] {
-    // Sums sized for the affine table are below the GGUF table's.
-    const uint32_t width = shape.valueHeads * shape.headDimension;
-    auto buffers = fixture.decodeBuffers(0);
-    buffers.linearScratch.input = sharedBuffer(backend, tableBytes(width, kRows));
-    buffers.linearScratch.sums = sharedBuffer(backend, tableSumsBytes(LinearInput::Table64, width, kRows));
-    GDN::addDecode(graph, buffers, shape, 1, 0, fixture.cell.strides(), GdnHeadOrder::Grouped,
-                   LinearInput::Table16);
-  });
-  rejects([&] {
-    // F32 weights need twice the bytes of bf16 ones.
-    auto buffers = fixture.decodeBuffers(0);
-    buffers.mixerNorm.float32 = true;
-    GDN::addDecode(graph, buffers, shape, 1, 0, fixture.cell.strides(), GdnHeadOrder::Grouped,
-                   LinearInput::Plain);
-  });
+  for (const uint32_t lanes : {0U, kMaxLanes + 1})
+    rejects(
+        [&] {
+          GDN::addDecode(graph, fixture.decodeBuffers(0), shape, lanes, 0,
+                         fixture.cell.strides(), GdnHeadOrder::Grouped, LinearInput::Plain);
+        },
+        "invalid GDN decode geometry", "a GDN decode of no lanes or more than a batch was accepted");
+  rejects(
+      [&] {
+        GDN::addDecode(graph, fixture.decodeBuffers(0),
+                       GdnShape{16, 40, 128, 9216, 14400}, 1, 0,
+                       fixture.cell.strides(), GdnHeadOrder::Grouped, LinearInput::Plain);
+      },
+      "invalid GDN shape", "an inconsistent GDN shape was accepted");
+  rejects(
+      [&] {
+        GDN::addCommit(graph, fixture.commitBuffers(), shape, 0, 1,
+                       fixture.cell.strides());
+      },
+      "invalid GDN commit geometry", "a GDN commit of no layers was accepted");
+  rejects(
+      [&] {
+        auto buffers = fixture.decodeBuffers(0);
+        buffers.linearScratch.input = sharedBuffer(backend, 16);
+        buffers.linearScratch.sums = sharedBuffer(backend, 4);
+        GDN::addDecode(graph, buffers, shape, 1, 0, fixture.cell.strides(), GdnHeadOrder::Grouped,
+                       splash::ops::LinearInput::Table64);
+      },
+      "linear table buffer holds", "a GDN decode wrote a table into short scratch");
+  rejects(
+      [&] {
+        // Sums sized for the affine table are below the GGUF table's.
+        const uint32_t width = shape.valueHeads * shape.headDimension;
+        auto buffers = fixture.decodeBuffers(0);
+        buffers.linearScratch.input = sharedBuffer(backend, tableBytes(width, kRows));
+        buffers.linearScratch.sums =
+            sharedBuffer(backend, tableSumsBytes(LinearInput::Table64, width, kRows));
+        GDN::addDecode(graph, buffers, shape, 1, 0, fixture.cell.strides(), GdnHeadOrder::Grouped,
+                       LinearInput::Table16);
+      },
+      "linear table sums buffer holds", "a GGUF table's sums were written into an affine table's");
+  rejects(
+      [&] {
+        // F32 weights need twice the bytes of bf16 ones.
+        auto buffers = fixture.decodeBuffers(0);
+        buffers.mixerNorm.float32 = true;
+        GDN::addDecode(graph, buffers, shape, 1, 0, fixture.cell.strides(), GdnHeadOrder::Grouped,
+                       LinearInput::Plain);
+      },
+      "norm weight buffer holds", "bf16 norm weights were read as F32");
   require(graph.empty(), "invalid GDN request partially encoded a graph");
 }
 
@@ -844,6 +964,13 @@ int main(int argc, char **argv) {
       throw std::invalid_argument("usage: gdn-decode METALLIB");
     MetalBackend backend(argv[1]);
     rejectsInvalid(backend);
+    // A commit's layers are a full batch of rows apart, so one lane's commit
+    // reaches past the rows of the lanes it runs.
+    for (const GdnShape &shape : kShapes)
+      for (const uint32_t lanes : {1U, kMaxLanes}) {
+        bufferExtents(backend, shape, LinearInput::Table64, false, lanes);
+        bufferExtents(backend, shape, LinearInput::Table16, true, lanes);
+      }
     // Table64 feeds the affine models, whose norms are bf16; Table16 a GGUF's, whose norms are F32.
     for (LinearInput layout : {LinearInput::Table64, LinearInput::Table16})
       for (const GdnShape &shape : kShapes)
