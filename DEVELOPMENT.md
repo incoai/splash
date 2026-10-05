@@ -1628,7 +1628,18 @@ batch's command.
 
 Long prefill uses disposable rolling checkpoints every 4096 tokens; none is
 planned within one prefill chunk (2048 tokens) of where the request resumes or
-of its replay boundary. Contended prefill adapts toward a 500 ms slice, keeping
+of its replay boundary. Each retires when the next one or a junction lands, but
+the last stays cached once the replay point is published: a later request that
+shares the prompt up to it, such as another conversation with the same long
+system prompt, resumes there instead of from the start. It stays only if the
+replay state fits beside it; refused memory, the replay state takes its buffers
+rather than another lane's checkpoint. With the SSD cache it costs a write as
+well: reclaim takes checkpoints first and writes the states it evicts to the
+SSD, this one too (187 MiB for 27B), and one published straight to the SSD,
+when no RAM slot took it, stays there. The persistent cache's hourly write limit
+does not pause these writes, and a full quota makes room for one by dropping the
+oldest copy, perhaps an older conversation's restore point.
+Contended prefill adapts toward a 500 ms slice, keeping
 2048-token chunks for long unopposed work. Without contention, a prompt that can
 finish within one 2048-token chunk ends its chunk at its last row instead of
 sharing it with a longer prompt. While requests of the same or a higher priority
@@ -1682,7 +1693,7 @@ point takes the slot of the oldest by writing that one out, and goes
 unpublished while the staging buffer is busy.
 Rolling checkpoints replace the least recently used copies like any state, so
 a suspended request keeps its progress when the quota is full; they retire when
-replaced or no longer needed. Matched KV restores start from the root toward
+replaced; a prompt's last stays. Matched KV restores start from the root toward
 the selected state, in that order as the tier takes them, with the state read
 alongside. Cancellation drops unsubmitted, unshared reads; submitted transfers
 drain before their buffers can be reused. Restored states remain usable even

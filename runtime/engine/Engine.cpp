@@ -1021,20 +1021,20 @@ void Engine::discardPendingStateBoundaries(Request &active) noexcept {
   active.stateBoundaryCursor = 0;
 }
 
+bool Engine::checkpointShared(const Request &active) const {
+  const auto point = active.latestCheckpoint;
+  return point && std::any_of(requests_.begin(), requests_.end(), [&](const auto &entry) {
+           const auto &peer = entry.second;
+           return &peer != &active && !peer.finalized &&
+                  peer.latestCheckpoint.kvBlock == point.kvBlock &&
+                  peer.latestCheckpoint.publication == point.publication;
+         });
+}
+
 bool Engine::retireCheckpoint(Request &active) {
   // Shared progress points remain disposable under memory pressure, but a
   // lane's normal rolling replacement must not retire its peer's recovery point.
-  const auto point = active.latestCheckpoint;
-  if (point && std::any_of(requests_.begin(), requests_.end(), [&](const auto &entry) {
-        const auto &peer = entry.second;
-        return &peer != &active && !peer.finalized &&
-               peer.latestCheckpoint.kvBlock == point.kvBlock &&
-               peer.latestCheckpoint.publication == point.publication;
-      })) {
-    active.latestCheckpoint = {};
-    return true;
-  }
-  if (!cache_.retireCheckpointState(active.latestCheckpoint))
+  if (!checkpointShared(active) && !cache_.retireCheckpointState(active.latestCheckpoint))
     return false;
   active.latestCheckpoint = {};
   return true;
@@ -1079,13 +1079,19 @@ void Engine::publishReachedStateBoundaries(Request &active,
       // can delay this optional publication. A checkpoint only on disk
       // frees no cache slot for an ordinary state, so it stays the recovery
       // point until that state is published; it retires after the
-      // publication, as does the one a reused state leaves.
-      if ((checkpoint || cache_.stateResident(active.latestCheckpoint.kvBlock)) &&
-          !retireCheckpoint(active) && checkpoint) {
+      // publication, as does the one a reused state leaves. The prompt's
+      // replay point keeps the lane's checkpoint (below) only beside a
+      // snapshot that fits: refused room, it hands a resident one's buffers
+      // to the snapshot before making room, unless a peer still holds it.
+      const bool resident = cache_.stateResident(active.latestCheckpoint.kvBlock);
+      if ((checkpoint || (!replay && resident)) && !retireCheckpoint(active) && checkpoint) {
         ++failures;
         continue;
       }
       std::shared_ptr<const CompositeState> state = model_.snapshot(active.request.id);
+      if (!state && replay && resident && !checkpointShared(active) &&
+          retireCheckpoint(active))
+        state = model_.snapshot(active.request.id);
       // Room comes from what this publication's class may take: cached KV
       // unless it is an optional checkpoint, and states in use only for a
       // block in use. A state in use is never dropped for a busy write
@@ -1131,8 +1137,14 @@ void Engine::publishReachedStateBoundaries(Request &active,
         continue;
       }
     }
-    // The previous recovery point, if the lane still holds one, retires now.
-    static_cast<void>(retireCheckpoint(active));
+    // The previous recovery point, if the lane still holds one, retires now,
+    // except at the prompt's replay point: there it stays cached, as
+    // disposable as any checkpoint, for a later request that shares the
+    // prompt up to it but not up to the replay point. The lane holds it
+    // until this state is published; a refused publication leaves it the
+    // lane's recovery point, unless it gave the snapshot its buffers.
+    if (!replay)
+      static_cast<void>(retireCheckpoint(active));
     active.latestCheckpoint = checkpoint ? cache_.checkpointState(block)
                                          : StateCheckpoint{};
     if (!checkpoint)

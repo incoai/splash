@@ -223,7 +223,9 @@ private:
     struct StateBoundary final {
       uint32_t tokens = 0;
       // A rolling checkpoint, the lane's own progress, retired when the next
-      // one lands; otherwise a state a later request resumes from.
+      // one or a junction lands; the prompt's replay point leaves the last
+      // one cached when its own state fits beside it. Otherwise a state a
+      // later request resumes from.
       bool disposable = false;
     };
 
@@ -345,6 +347,8 @@ private:
   // admission, and after the scheduler has taken a command's progress.
   void armNextStateBoundary(Request &request);
   void discardPendingStateBoundaries(Request &request) noexcept;
+  // Another unfinished lane holds this lane's recovery point as its own.
+  [[nodiscard]] bool checkpointShared(const Request &request) const;
   [[nodiscard]] bool retireCheckpoint(Request &request);
   void publishReachedStateBoundaries(Request &request,
                                      uint32_t promptProcessed, double nowMilliseconds);
