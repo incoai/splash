@@ -478,26 +478,67 @@ class LauncherTests(unittest.TestCase):
                 9123,
             )
             for name in launcher.clients.INSTALL_URLS:
+                self.assertEqual(launcher.parse_args([name]).port, 8123)
                 args = launcher.parse_args([name, "--port", "7777"])
-                self.assertEqual(args.port, 8123)
-                self.assertEqual(args.client_args, ["--port", "7777"])
+                self.assertEqual(args.port, 7777)
+                self.assertEqual(args.client_args, [])
         for value in ("", "0", "-1", "65536", "invalid", "1.5"):
             with (
                 self.subTest(value=value),
                 mock.patch.dict(os.environ, {"SPLASH_PORT": value}),
-                mock.patch("sys.stderr", io.StringIO()),
             ):
-                for arguments in (["serve", "--model", MODEL_ID], ["claude"]):
-                    with self.assertRaises(SystemExit):
+                for arguments in (
+                    ["serve", "--model", MODEL_ID],
+                    *([name] for name in launcher.clients.INSTALL_URLS),
+                ):
+                    with (
+                        mock.patch("sys.stderr", io.StringIO()) as error,
+                        self.assertRaises(SystemExit),
+                    ):
                         launcher.parse_args(arguments)
-                self.assertEqual(
-                    launcher.parse_args(
-                        ["serve", "--model", MODEL_ID, "--port", "9123"]
-                    ).port,
-                    9123,
-                )
-                with self.assertRaises(SystemExit):
-                    launcher.parse_args(["serve", "--model", MODEL_ID, "--port", value])
+                    self.assertIn("SPLASH_PORT: ", error.getvalue())
+                    self.assertEqual(
+                        launcher.parse_args([*arguments, "--port", "9123"]).port,
+                        9123,
+                    )
+                    with (
+                        mock.patch("sys.stderr", io.StringIO()),
+                        self.assertRaises(SystemExit),
+                    ):
+                        launcher.parse_args([*arguments, "--port", value])
+
+    def test_client_port_selection_preserves_agent_arguments(self):
+        cases = (
+            (["--port", "2268", "--help"], 2268, ["--help"]),
+            (["--port=2268", "--version"], 2268, ["--version"]),
+            (["resume", "--last", "--port", "2268"], 2268, ["resume", "--last"]),
+            (["--por", "2268"], 8000, ["--por", "2268"]),
+            (["--", "--port", "7777"], 8000, ["--port", "7777"]),
+            (
+                ["--port", "2268", "--", "--port=7777", "--help"],
+                2268,
+                ["--port=7777", "--help"],
+            ),
+            (
+                ["--port=2268", "exec", "--", "--port", "7777"],
+                2268,
+                ["exec", "--", "--port", "7777"],
+            ),
+        )
+        for name in launcher.clients.INSTALL_URLS:
+            for arguments, port, forwarded in cases:
+                with self.subTest(name=name, arguments=arguments):
+                    args = launcher.parse_args([name, *arguments])
+                    self.assertEqual(args.port, port)
+                    self.assertEqual(args.client_args, forwarded)
+            for arguments in (["--port"], ["--port", "--help"]):
+                with (
+                    self.subTest(name=name, arguments=arguments),
+                    mock.patch("sys.stderr", io.StringIO()),
+                ):
+                    with self.assertRaises(SystemExit) as failed:
+                        launcher.parse_args([name, *arguments])
+                    self.assertEqual(failed.exception.code, 2)
 
     def test_serve_help_names_the_default_port(self):
         with (
@@ -679,15 +720,26 @@ class LauncherTests(unittest.TestCase):
                 ):
                     os.environ.pop("HERMES_HOME", None)
                     for name in launcher.clients.INSTALL_URLS:
-                        launcher.main([name])
-                        self.assertEqual(
-                            command.call_args.args[2], f"http://127.0.0.1:{port}"
-                        )
-                        self.assertEqual(
-                            command.call_args.args[3:5], (MODEL_ID, 102400)
-                        )
+                        for arguments in ([], ["--port", str(port)]):
+                            with self.subTest(name=name, arguments=arguments):
+                                # An explicit port must override the environment
+                                # for both discovery and the agent's connection.
+                                os.environ["SPLASH_PORT"] = (
+                                    "invalid" if arguments else str(port)
+                                )
+                                launcher.main([name, *arguments])
+                                self.assertEqual(
+                                    command.call_args.args[2],
+                                    f"http://127.0.0.1:{port}",
+                                )
+                                self.assertEqual(
+                                    command.call_args.args[3:5], (MODEL_ID, 102400)
+                                )
+                                self.assertEqual(
+                                    command.call_args.kwargs["client_args"], []
+                                )
                     self.assertEqual(
-                        execute.call_count, len(launcher.clients.INSTALL_URLS)
+                        execute.call_count, 2 * len(launcher.clients.INSTALL_URLS)
                     )
             finally:
                 server.shutdown()
@@ -695,8 +747,35 @@ class LauncherTests(unittest.TestCase):
             self.assertEqual(
                 requests,
                 [("/v1/models", "Bearer test-key")]
-                * len(launcher.clients.INSTALL_URLS),
+                * (2 * len(launcher.clients.INSTALL_URLS)),
             )
+
+    def test_only_a_given_port_that_finds_no_server_mentions_the_agents_own(self):
+        with (
+            mock.patch.object(
+                launcher.clients, "find_executable", return_value="/bin/echo"
+            ),
+            mock.patch.object(launcher, "_request_json", return_value=None),
+            mock.patch.object(launcher.os, "execvpe") as execute,
+        ):
+            for environment, arguments, mentioned in (
+                ({}, [], False),
+                ({"SPLASH_PORT": "2268"}, [], False),
+                ({}, ["--port", "4096"], True),
+            ):
+                with (
+                    self.subTest(environment=environment, arguments=arguments),
+                    mock.patch.dict(os.environ, environment),
+                    mock.patch("sys.stderr", io.StringIO()) as error,
+                ):
+                    self.assertEqual(launcher.main(["opencode", *arguments]), 1)
+                    self.assertIn("No ready Splash server", error.getvalue())
+                    self.assertEqual(
+                        "If --port was meant for opencode itself, put it after --."
+                        in error.getvalue(),
+                        mentioned,
+                    )
+        execute.assert_not_called()
 
     def test_client_setup_works_while_status_is_unavailable(self):
         class Handler(BaseHTTPRequestHandler):

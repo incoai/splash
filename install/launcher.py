@@ -282,11 +282,16 @@ def coding_client(args):
     path = clients.find_executable(args.command)
     listing = _request_json("/v1/models", port=args.port)
     if listing is None:
-        raise LauncherError(
+        message = (
             f"No ready Splash server at {_base_url(args.port)}. "
-            "Run 'splash serve --model <HF_REPO_ID>' "
-            "in another terminal first."
+            "Run 'splash serve --model <HF_REPO_ID>' in another terminal first."
         )
+        # OpenCode and Hermes have a --port of their own, which goes after --.
+        if args.explicit_port:
+            message += (
+                f" If --port was meant for {args.command} itself, put it after --."
+            )
+        raise LauncherError(message)
     models = listing.get("data", []) if isinstance(listing, dict) else []
     if (
         not isinstance(models, list)
@@ -353,11 +358,8 @@ def _version():
 def parse_args(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     client_args = []
-    if argv and argv[0] in clients.INSTALL_URLS:
-        argv, client_args = argv[:1], argv[1:]
-        if client_args[:1] == ["--"]:
-            client_args = client_args[1:]
-    elif "--" in argv:
+    is_client = bool(argv and argv[0] in clients.INSTALL_URLS)
+    if not is_client and "--" in argv:
         boundary = argv.index("--")
         argv, client_args = argv[:boundary], argv[boundary + 1 :]
     parser = argparse.ArgumentParser(
@@ -368,8 +370,11 @@ def parse_args(argv=None):
             "Quick start:\n"
             "  splash serve --model unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M\n"
             "  splash opencode  # in another terminal, after Ready\n\n"
-            "Use splash serve --help for server settings. Client arguments,\n"
-            "including --help, are passed through to the installed agent."
+            "Use splash serve --help for server settings. An agent command takes\n"
+            "--port PORT for a server on another port and passes every other\n"
+            "argument, including --help, to the installed agent. To pass the\n"
+            "agent's own --port, start its arguments with --:\n"
+            "  splash opencode --port 8001 -- --port 4096"
         ),
     )
     parser.add_argument("--version", action="version", version=_version())
@@ -428,22 +433,40 @@ def parse_args(argv=None):
     groups["network"].add_argument(
         "--port",
         type=_parse_port,
-        default=os.environ.get("SPLASH_PORT", str(serve_options.DEFAULT_PORT)),
         help=f"HTTP port (default: SPLASH_PORT or {serve_options.DEFAULT_PORT})",
     )
     serve_options.add_serve_arguments(server, groups)
     for name in clients.INSTALL_URLS:
-        commands.add_parser(name, help=f"connect {name} to the running server")
-    args = parser.parse_args(argv)
-    if args.command == "serve":
-        serve_options.check_serve_arguments(parser, args)
-    if args.command in clients.INSTALL_URLS:
+        client = commands.add_parser(
+            name,
+            help=f"connect {name} to the running server",
+            add_help=False,
+            allow_abbrev=False,
+        )
+        client.add_argument(
+            "--port",
+            type=_parse_port,
+            help=f"server port (default: SPLASH_PORT or {serve_options.DEFAULT_PORT})",
+        )
+    if is_client:
+        # Only --port belongs to Splash; preserve the agent's other arguments,
+        # including --help, and stop interpreting options at its separator.
+        args, client_args = parser.parse_known_args(argv)
+        if client_args[:1] == ["--"]:
+            client_args = client_args[1:]
+    else:
+        args = parser.parse_args(argv)
+    # An explicit --port wins; SPLASH_PORT is read only without one.
+    args.explicit_port = args.port is not None
+    if not args.explicit_port:
         try:
             args.port = _parse_port(
                 os.environ.get("SPLASH_PORT", str(serve_options.DEFAULT_PORT))
             )
         except argparse.ArgumentTypeError as error:
             parser.error(f"SPLASH_PORT: {error}")
+    if args.command == "serve":
+        serve_options.check_serve_arguments(parser, args)
     if client_args and args.command == "serve":
         parser.error("arguments after -- are only supported for coding clients")
     args.client_args = client_args

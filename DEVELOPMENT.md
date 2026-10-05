@@ -154,12 +154,15 @@ refusal. Origins match exactly: a pattern such as `tauri://*` or
 origin. With `'*'` every page open in a browser that reaches the server can use
 it, so set `--api-key` too; the server warns at startup without one.
 
-Use `--port 8001` or set `SPLASH_PORT=8001` to select another port. Set the same
-`SPLASH_PORT` in the local agent shell. Separate ports allow separate servers.
-Each plans its memory from the whole Mac, as if it ran alone, so give each a
-`--max-memory` that leaves room for the others. The packaged agent launchers
-connect to loopback, so use a listener that includes loopback when launching
-agents locally.
+Use `--port 8001` or set `SPLASH_PORT=8001` to select another port. The agent
+launchers take the same `--port`, as in `splash pi --port 8001`, or read the
+same `SPLASH_PORT`; `--port` overrides it. They pass every other argument,
+`--help` included, to the agent; to pass an agent's own `--port`, start its
+arguments with `--`, as in `splash opencode --port 8001 -- --port 4096`.
+Separate ports allow separate servers. Each plans its memory from the whole Mac,
+as if it ran alone, so give each a `--max-memory` that leaves room for the
+others. The packaged agent launchers connect to loopback, so use a listener
+that includes loopback when launching agents locally.
 
 ### Memory and context
 

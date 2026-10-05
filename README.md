@@ -34,6 +34,8 @@ in your browser, or run an installed coding agent from another terminal:
 splash opencode    # or: splash claude / splash codex / splash hermes / splash pi
 ```
 
+For a server started with another `--port`, pass the same `--port` to the agent.
+
 Press Ctrl+C in the server terminal to stop Splash.
 For LM Studio Bionic, follow its [Splash setup guide](https://lmstudio.ai/blog/splash-engine).
 
