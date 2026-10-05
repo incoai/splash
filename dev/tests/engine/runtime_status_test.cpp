@@ -64,7 +64,7 @@ MemoryAuditResult audit(const EngineMemoryPlan &memoryPlan) {
 
 // A representative status document, every section of it set, and the golden
 // copy of the whole document that the server's reading of it is tested on
-// (dev/tests/engine/test_status_contract.py).
+// (dev/tests/server/test_status_contract.py).
 void testCleanRuntimeStatus(const char *goldenPath) {
   EngineMemoryPlan memoryPlan = plan();
   engine::EngineSnapshot engine;

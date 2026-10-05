@@ -24,7 +24,7 @@ publish-test:
 	$(PYTHON) dev/tools/publish_test.py --version "$(RELEASE_VERSION)" \
 		--repo "$(TEST_RELEASE_REPO)"
 
-ENGINE_PYTHON_TEST_PATTERN ?= test_*.py
+PYTHON_TEST_PATTERN ?= test_*.py
 # Comma-separated subset of claude,opencode,codex,hermes,pi for the real client
 # gates on a machine that lacks one of them; empty runs all five.
 AGENT_CLIENTS ?=
@@ -40,10 +40,10 @@ HTTP_SMOKE_ARGS ?=
 
 .PHONY: agent-preflight architecture-check check check-source \
 	check-native-engine check-native-cpu check-native-metal check-native-build \
-	check-python-engine \
+	check-python \
 	install-development _install-development release-check test \
 	test-agent-real test-http-real test-performance-real test-release-real \
-	test-models test-python test-real verify-models \
+	test-python test-real verify-models \
 	test-engine test-engine-cpu test-engine-metal test-sanitizers
 
 # Decided by the stamp's content, as the environment is: a rebuilt
@@ -77,19 +77,14 @@ check-native-metal: platform-check $(TARGET) test-engine-metal
 check-native-build: platform-check $(TARGET) $(TEST_CONFIG_TARGETS) \
 	$(PRODUCTION_FLAG_TOOLS)
 
-# Discovering dev/tests/engine keeps this gate complete as new current runtime
-# Python tests are added.
+# Every Python test, each in the directory of what it tests (dev/tests/server,
+# install or tools). Discovering dev/tests keeps this gate complete as tests
+# are added; discovered from the checkout root (-t .), a module has the package
+# name it is imported by, so none loads twice.
 test-python: install-development
-	$(PYTHON) -m unittest discover -s dev/tests/engine -p '$(ENGINE_PYTHON_TEST_PATTERN)'
-	$(PYTHON) -m unittest dev/tests/test_server.py
+	$(PYTHON) -m unittest discover -s dev/tests -t . -p '$(PYTHON_TEST_PATTERN)'
 
-# Installer, model manifest, upstream resolution and GGUF metadata tests;
-# none downloads or loads real weights.
-test-models: install-development
-	$(PYTHON) -m unittest dev/tests/test_models.py dev/tests/test_upstream.py \
-		dev/tests/test_gguf_metadata.py dev/tests/test_installer_restarts.py
-
-check-python-engine: install-development test-python test-models
+check-python: install-development test-python
 	$(PYTHON) -m compileall -q server install/*.py \
 		dev/tools dev/tests dev/benchmarks
 	$(PYTHON) -m ruff check --config dev/ruff.toml server \
@@ -102,14 +97,14 @@ check-python-engine: install-development test-python test-models
 architecture-check: install-environment
 	$(PYTHON) dev/tools/check_architecture.py
 
-check: check-source check-native-engine check-python-engine
+check: check-source check-native-engine check-python
 
 check-source: architecture-check
 	@git diff --check
 	@empty_tree=$$(git hash-object -t tree /dev/null); \
 		git diff --check $$empty_tree HEAD
 
-test: test-engine test-python test-models
+test: test-engine test-python
 
 test-http-real: preflight $(TARGET) verify-build-identity
 	TRANSFORMERS_VERBOSITY=error $(PYTHON) dev/tests/smoke_real.py \

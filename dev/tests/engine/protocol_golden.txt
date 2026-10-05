@@ -3,8 +3,9 @@
 # The client frames are what server/protocol.py's serialize_message writes,
 # and runtime/engine/Protocol.cpp must decode them; the events are what
 # Protocol.cpp's serializeEvent writes, and server/protocol.py must decode
-# them. dev/tests/engine/protocol_test.cpp and test_protocol_python.py build
-# the messages; runtime/engine/Protocol.hpp describes every layout.
+# them. dev/tests/engine/protocol_test.cpp and
+# dev/tests/server/test_protocol_python.py build the messages;
+# runtime/engine/Protocol.hpp describes every layout.
 
 # Client frames.
 request 53504c48080001006a00000000000000efcdab89674523010001008098281765060040a5ae0200000000008000000500000000000000cdcc4c3f3333733f200000000000c03f000080becdcc8c3fcdcc4c3d1032547698badcfe00000000020000000000000000000000010000002a00000000000080ffffffff

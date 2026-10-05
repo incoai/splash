@@ -106,7 +106,7 @@ def run_installed_client_tests(versions):
     for name, test in INSTALLED_CLIENT_TESTS.items():
         if name in versions:
             environment[f"SPLASH_{name.upper()}_BINARY"] = versions[name]["path"]
-            tests.append(f"dev.tests.engine.test_clients.{test}")
+            tests.append(f"dev.tests.install.test_clients.{test}")
     if not tests:
         return
     command = [sys.executable, "-m", "unittest", *tests]

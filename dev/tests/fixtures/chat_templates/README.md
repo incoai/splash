@@ -1,6 +1,6 @@
 These unmodified upstream templates exercise the startup probe and the structural
 patch for system messages after the first message (`server/chat_templates.py`,
-tested by `dev/tests/engine/test_chat_templates.py`). They are test fixtures,
+tested by `dev/tests/server/test_chat_templates.py`). They are test fixtures,
 not templates distributed with the runtime.
 
 - `qwen36.jinja`: [mlx-community/Qwen3.6-35B-A3B-4bit](https://huggingface.co/mlx-community/Qwen3.6-35B-A3B-4bit/blob/38740b847e4cb78f352aba30aa41c76e08e6eb46/chat_template.jinja),

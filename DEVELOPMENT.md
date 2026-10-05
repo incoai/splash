@@ -680,7 +680,7 @@ writes may. Tags written otherwise are text. Besides:
   text, which writes back as valid JSON;
 - a call's opening also ends the reasoning where a call may follow.
 
-`dev/tests/engine/test_tool_call_reading.py` holds model outputs with the calls
+`dev/tests/server/test_tool_call_reading.py` holds model outputs with the calls
 and content they read as.
 
 Every tool's schema is checked against its JSON Schema dialect as the request
@@ -1721,6 +1721,11 @@ and the GGUF kernels on synthetic tensors. `make check-native-build` builds
 every native test, benchmark and tool and runs none. Hosted CI runs the CPU
 checks, `check-native-build` and the sanitizers.
 
+The native tests are in `dev/tests/engine`; each Python test is in the
+directory of what it tests: `dev/tests/server`, `dev/tests/install` (launcher,
+client configuration and model installation) or `dev/tests/tools`
+(`dev/tools`, `dev/benchmarks`, the Makefiles and the real-model harnesses).
+
 The real-model targets run against an installation in this checkout's
 `install/models`: run `make install` with the same options first, or in the
 same command, as above. They take `MODEL` exactly as `splash serve --model`
@@ -1738,7 +1743,7 @@ does, and `REVISION`, `DRAFT_MODEL` and `LANGUAGE_ONLY=1` as its `--revision`,
 | `release-check` | one model on this Mac ([Release check](#release-check)) |
 
 `test-agent-real` and `test-release-real` first run the tests
-`dev/tests/engine/test_clients.py` has of the installed OpenCode, Codex and Pi
+`dev/tests/install/test_clients.py` has of the installed OpenCode, Codex and Pi
 among the selected clients, which need no model.
 
 `test-agent-real` runs Hermes in a profile of its own in the developer's Hermes

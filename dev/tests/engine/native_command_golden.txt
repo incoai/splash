@@ -2,7 +2,7 @@
 # "<name> | <splash serve options> | <arguments after MODEL_DIRECTORY>" lines.
 #
 # server/server.py's _native_command writes the arguments for the options
-# (dev/tests/test_server.py checks it), and
+# (dev/tests/server/test_serve_options.py checks it), and
 # runtime/engine/NativeArguments.cpp must read them as the server means them
 # (dev/tests/engine/native_arguments_test.cpp checks each line).
 

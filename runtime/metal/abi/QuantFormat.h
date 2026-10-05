@@ -11,9 +11,9 @@
 //
 // It holds what defines the image's bytes, plus each format's kernel name
 // token, which the host reads.
-// dev/tests/test_gguf_metadata.py reads the GGUF type of each kQuantFormats
-// row with a regex on the row's leading number. The decode-only value tables
-// are in metal/abi/QuantTables.h.
+// dev/tests/install/test_gguf_metadata.py reads the GGUF type of each
+// kQuantFormats row with a regex on the row's leading number. The decode-only
+// value tables are in metal/abi/QuantTables.h.
 //
 // Inside a group of 32 the elements are in lane-owned chunk order: chunk c
 // (0..3) holds elements 4c..4c+3 and 16+4c..16+4c+3 as pairs p = 0..3, pair p
