@@ -8,6 +8,7 @@
 #include "metal/abi/RoPE.h"
 #include "ops/MoE.hpp"
 #include "ops/Normalization.hpp"
+#include "ops/Vision.hpp"
 
 #include <cstdint>
 #include <string_view>
@@ -15,11 +16,14 @@
 namespace splash::model {
 
 struct Qwen3_6MoeLayout final : QwenHybridLayout<8> {
+  // The family's name, as the installer pairs its draft (install/families.py).
+  static constexpr std::string_view family = "Qwen3.6-35B-A3B";
   static constexpr std::string_view layerMagic = "MDFM0001";
   static constexpr std::string_view headMagic = "MDFM0002";
 
   constexpr Qwen3_6MoeLayout()
-      : QwenHybridLayout{{.layers = 40,
+      : QwenHybridLayout{{.maximumContextTokens = 262'144,
+                          .layers = 40,
                           .hiddenSize = 2048,
                           .vocabularySize = 248320,
                           .packedGdnWidth = 12544,
@@ -58,6 +62,9 @@ inline constexpr DFlashDraftLayout kQwen3_6MoeDraftLayout{.layers = 6,
                                                           .targetHiddenSize = 16384,
                                                           .selectorRank = SPLASH_DRAFT_SELECTOR_RANK,
                                                           .kvHeads = SPLASH_DRAFT_KV_HEADS};
+
+// The vision tower of Qwen3.6-35B-A3B, projecting into its hidden width.
+inline constexpr ops::VisionLayout kQwen3_6MoeVisionLayout{.outputHiddenSize = Qwen3_6MoeLayout{}.hiddenSize};
 
 struct Qwen3_6MoeLayerWeights final {
   ops::NormWeights inputNorm;

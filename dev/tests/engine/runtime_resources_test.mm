@@ -62,7 +62,7 @@ RuntimeResourcesConfig budgetConfig(const char *metallibPath,
   config.modelRoot = root.path;
   config.model = model::makeModelDescriptor(
       "budget-test", model::Qwen3_8Layout{}, model::kQwen3_8DraftLayout,
-      ops::VisionLayout{});
+      model::kQwen3_8VisionLayout);
   config.buildId = "budget-test";
   return config;
 }
@@ -103,7 +103,7 @@ uint64_t minimumBytes(const RuntimeResourcesConfig &config,
 void testPersistentCacheNamespace() {
   const model::ModelDescriptor model = model::makeModelDescriptor(
       "namespace-test", model::Qwen3_8Layout{}, model::kQwen3_8DraftLayout,
-      ops::VisionLayout{});
+      model::kQwen3_8VisionLayout);
   const auto identity = [&](char models, std::string_view build, kv::Format format) {
     kv::Layout layout = model.targetKvLayout;
     layout.format = format;
@@ -307,7 +307,7 @@ void testLoadedVisionIsRequiredOnlyWithVision() {
   model::ModelPackage package;
   package.descriptor = model::makeModelDescriptor(
       "loaded-test", model::Qwen3_8Layout{}, model::kQwen3_8DraftLayout,
-      ops::VisionLayout{});
+      model::kQwen3_8VisionLayout);
   model::Qwen3_8Weights target;
   target.actualAllocatedBytes = 1;
   target.manifestFingerprintSha256 = "target";

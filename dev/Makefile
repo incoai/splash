@@ -80,8 +80,9 @@ check-native-build: platform-check $(TARGET) $(TEST_CONFIG_TARGETS) \
 # Every Python test, each in the directory of what it tests (dev/tests/server,
 # install or tools). Discovering dev/tests keeps this gate complete as tests
 # are added; discovered from the checkout root (-t .), a module has the package
-# name it is imported by, so none loads twice.
-test-python: install-development
+# name it is imported by, so none loads twice. The installer tests check
+# configurations with the engine.
+test-python: install-development $(TARGET)
 	$(PYTHON) -m unittest discover -s dev/tests -t . -p '$(PYTHON_TEST_PATTERN)'
 
 check-python: install-development test-python
@@ -152,7 +153,7 @@ endif
 # The installer's restarts without the Hub, a full source hash and the
 # digests of the weight images a load of the installation holds
 # (DEVELOPMENT.md, Release check).
-verify-models: preflight $(WEIGHT_DIGESTS) $(LIB)
+verify-models: preflight $(TARGET) $(WEIGHT_DIGESTS) $(LIB)
 	@$(PYTHON) dev/tools/installer_restarts.py $(MODEL_ARGS)
 	@mkdir -p "$(MODEL_RESULTS)"
 	@$(WEIGHT_DIGESTS) $(LIB) "$(MODEL_ROOT)" > "$(MODEL_RESULTS)/weights.json.tmp"

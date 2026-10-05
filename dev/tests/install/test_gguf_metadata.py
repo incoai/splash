@@ -1,5 +1,6 @@
 import contextlib
 import io
+import math
 import re
 import shutil
 import struct
@@ -7,6 +8,7 @@ import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from tokenizers import Tokenizer, pre_tokenizers
@@ -19,9 +21,10 @@ from dev.tests.installer_fixtures import (
     MOE,
     FakeHub,
     draft_dir,
+    family_config,
     selection,
 )
-from install import assembly, families, gguf, hub, models, upstream
+from install import assembly, gguf, hub, models, upstream
 
 GGUF_REPO = "unsloth/Qwen3.6-35B-A3B-GGUF"
 
@@ -54,6 +57,9 @@ def write_gguf(path, values, tensors=()):
 
 
 def fixture(*, native=False):
+    """A Qwen3.6-35B-A3B GGUF's metadata: its architecture's, as the native
+    configuration test reads it too, and a tokenizer's, native=True of the
+    family's vocabulary size."""
     tokens = sorted(pre_tokenizers.ByteLevel.alphabet())
     tokens += ["ab", "<|endoftext|>", "<|im_end|>", "<think>", "<|im_start|>"]
     types = [NORMAL] * 257 + [CONTROL, CONTROL, USER_DEFINED, CONTROL]
@@ -61,27 +67,23 @@ def fixture(*, native=False):
         padding = 248320 - len(tokens)
         tokens += [f"[unused{i}]" for i in range(padding)]
         types += [UNUSED] * padding
-    return {
-        "general.architecture": "qwen35moe",
-        "qwen35moe.embedding_length": 2048,
-        "qwen35moe.block_count": 40,
-        "qwen35moe.full_attention_interval": 4,
-        "qwen35moe.context_length": 262144,
-        "qwen35moe.attention.head_count": 16,
-        "qwen35moe.attention.head_count_kv": 2,
-        "qwen35moe.attention.key_length": 256,
-        "qwen35moe.expert_count": 256,
-        "qwen35moe.expert_used_count": 8,
-        "tokenizer.ggml.model": "gpt2",
-        "tokenizer.ggml.pre": "qwen35",
-        "tokenizer.ggml.tokens": tokens,
-        "tokenizer.ggml.token_type": types,
-        "tokenizer.ggml.merges": ["a b"],
-        "tokenizer.ggml.eos_token_id": 258,
-        "tokenizer.ggml.bos_token_id": 257,
-        "tokenizer.ggml.padding_token_id": 257,
-        "tokenizer.chat_template": "{% for message in messages %}{{ message.content }}<|im_end|>{% endfor %}",
-    }
+    typed = family_config(MOE, "gguf-metadata.json")
+    return (
+        typed["unsigned"]
+        | typed["float"]
+        | typed["string"]
+        | {
+            "tokenizer.ggml.model": "gpt2",
+            "tokenizer.ggml.pre": "qwen35",
+            "tokenizer.ggml.tokens": tokens,
+            "tokenizer.ggml.token_type": types,
+            "tokenizer.ggml.merges": ["a b"],
+            "tokenizer.ggml.eos_token_id": 258,
+            "tokenizer.ggml.bos_token_id": 257,
+            "tokenizer.ggml.padding_token_id": 257,
+            "tokenizer.chat_template": "{% for message in messages %}{{ message.content }}<|im_end|>{% endfor %}",
+        }
+    )
 
 
 def loadable_tensors(values, directory):
@@ -472,11 +474,73 @@ class GgufMetadataTests(unittest.TestCase):
             ):
                 derive(metadata)
 
-    def test_moe_config_states_its_experts_and_identifies_the_family(self):
-        config = gguf.model_config(self.metadata(fixture(native=True)))
-        text = config["text_config"]
-        self.assertEqual((text["num_experts"], text["num_experts_per_tok"]), (256, 8))
-        self.assertEqual(families.family_for(config).name, "Qwen3.6-35B-A3B")
+    def test_the_engine_checks_a_gguf_by_its_config_and_metadata(self):
+        # The derived config holds the sizes the engine reads in it; the rest
+        # of what the planner checks in the GGUF at every start, the engine
+        # checks in the metadata copied from the header.
+        values = fixture(native=True)
+        config = gguf.model_config(self.metadata(values))
+        self.assertEqual(
+            set(config["text_config"]),
+            {
+                "model_type",
+                "hidden_size",
+                "num_hidden_layers",
+                "vocab_size",
+                "max_position_embeddings",
+                "num_attention_heads",
+                "num_key_value_heads",
+                "head_dim",
+            },
+        )
+        path, metadata = self.root / "config.json", self.root / "gguf-metadata.json"
+        path.write_bytes(models.json_bytes(config))
+        for changes, refusal in (
+            ({}, None),
+            ({"qwen35moe.expert_used_count": 16}, "expert_used_count 16 [(]expected 8"),
+            ({"qwen35moe.rope.scaling.type": "yarn"}, "rope.scaling.type yarn"),
+            (
+                {"qwen35moe.attention.layer_norm_rms_epsilon": 1e-5},
+                "attention.layer_norm_rms_epsilon 1e-05 [(]expected 1e-06",
+            ),
+            (
+                {"qwen35moe.expert_feed_forward_length": 768},
+                "expert_feed_forward_length 768 [(]expected 512",
+            ),
+        ):
+            with self.subTest(changes=changes):
+                header = self.metadata(values | changes)
+                metadata.write_bytes(models.json_bytes(gguf.scalar_metadata(header)))
+                if refusal is None:
+                    family = upstream.check_model(
+                        "gguf", "none", path, gguf_metadata=metadata
+                    )
+                    self.assertEqual(family.name, "Qwen3.6-35B-A3B")
+                    continue
+                with self.assertRaisesRegex(
+                    models.ModelError,
+                    "GGUF metadata does not match the target: " + refusal,
+                ):
+                    upstream.check_model("gguf", "none", path, gguf_metadata=metadata)
+
+    def test_metadata_is_typed_as_the_native_reader_keeps_it(self):
+        values = {
+            "count": 7,
+            "signed": -1,
+            "flag": True,
+            "base": 0.5,
+            "nan": math.nan,
+            "name": "qwen35",
+            "sections": [11, 11, 10],
+        }
+        self.assertEqual(
+            gguf.scalar_metadata(SimpleNamespace(values=values)),
+            {
+                "unsigned": {"count": 7, "signed": 2**64 - 1, "flag": 1},
+                "float": {"base": 0.5},
+                "string": {"name": "qwen35"},
+            },
+        )
 
     def test_config_uses_metadata_and_subtracts_only_mtp_layers(self):
         values = fixture()
@@ -663,7 +727,7 @@ class GgufMetadataTests(unittest.TestCase):
 
         fake = FakeHub(self, self.root / "hub")
         fake.publish(GGUF_REPO, "a" * 40, build)
-        fake.publish(MOE.draft.repo, DRAFT_COMMIT, lambda p: draft_dir(p, MOE))
+        fake.publish(MOE.draft_repo, DRAFT_COMMIT, lambda p: draft_dir(p, MOE))
         return fake
 
     @staticmethod
@@ -687,7 +751,7 @@ class GgufMetadataTests(unittest.TestCase):
                 self.assertIn(f"Selected model-Q4_K_M.gguf from {GGUF_REPO}.", output)
                 self.assertEqual(
                     fake.requests,
-                    [(GGUF_REPO, None), (MOE.draft.repo, None)],
+                    [(GGUF_REPO, None), (MOE.draft_repo, None)],
                 )
                 assembly.verify(chosen.link, full=True)
                 config = models.read_json(chosen.link / "config.json")
@@ -706,8 +770,8 @@ class GgufMetadataTests(unittest.TestCase):
                 [
                     f"{GGUF_REPO}/mmproj-F32.gguf",
                     f"{GGUF_REPO}/model-Q4_K_M.gguf",
-                    f"{MOE.draft.repo}/config.json",
-                    f"{MOE.draft.repo}/model.safetensors",
+                    f"{MOE.draft_repo}/config.json",
+                    f"{MOE.draft_repo}/model.safetensors",
                 ]
             ),
         )
@@ -724,11 +788,77 @@ class GgufMetadataTests(unittest.TestCase):
                 gguf, "loaded_tensors", side_effect=AssertionError("screened")
             ),
             self.assertRaisesRegex(
-                models.ModelError, "no supported model has this architecture"
+                models.ModelError,
+                "no supported model has this architecture [(]text config "
+                "num_hidden_layers: GGUF 4294967295, Qwen3.6-35B-A3B 40[)]",
             ),
         ):
             self.prepare(selection(self.root, GGUF_REPO + ":Q4_K_M"))
         self.assertEqual(fake.downloads, [])
+
+    def test_a_gguf_splash_cannot_serve_is_refused_before_its_projector(self):
+        # Another architecture, with a projector Splash would not take either.
+        fake = FakeHub(self, self.root / "hub")
+
+        def build(root):
+            root.mkdir(parents=True)
+            write_gguf(root / "model-Q4_K_M.gguf", {"general.architecture": "gemma3"})
+            projector = vision_fixture() | {"clip.projector_type": "gemma3"}
+            write_gguf(
+                root / "mmproj-F16.gguf",
+                projector,
+                [("v.patch_embd.weight", GGML["F16"])],
+            )
+
+        fake.publish("someone/gemma-GGUF", "a" * 40, build)
+        with self.assertRaisesRegex(
+            models.ModelError, "unsupported GGUF model architecture: gemma3"
+        ):
+            self.prepare(
+                selection(self.root, "someone/gemma-GGUF:Q4_K_M", language_only=False)
+            )
+        self.assertEqual(fake.range_reads, ["someone/gemma-GGUF/model-Q4_K_M.gguf"])
+        self.assertEqual(fake.downloads, [])
+
+    def test_metadata_the_engine_refuses_is_refused_before_any_download(self):
+        # A GGUF whose header states what the planner refuses at every start,
+        # with its projector: the metadata is checked before the projector is
+        # chosen, and neither a weight file nor the draft is downloaded.
+        fake = FakeHub(self, self.root / "hub")
+        fake.publish(MOE.draft_repo, DRAFT_COMMIT, lambda p: draft_dir(p, MOE))
+        for index, (changes, refusal) in enumerate(
+            (
+                (
+                    {"qwen35moe.expert_used_count": 16},
+                    "expert_used_count 16 [(]expected 8",
+                ),
+                ({"qwen35moe.rope.scaling.type": "yarn"}, "rope.scaling.type yarn"),
+            )
+        ):
+            repo = f"someone/model-{index}-GGUF"
+
+            def build(root, values=fixture(native=True) | changes):
+                root.mkdir(parents=True)
+                tensors = loadable_tensors(values, self.root).items()
+                write_gguf(root / "model-Q4_K_M.gguf", values, tensors)
+                write_gguf(
+                    root / "mmproj-F32.gguf",
+                    vision_fixture(),
+                    [("v.patch_embd.weight", GGML["F32"])],
+                )
+
+            fake.publish(repo, "a" * 40, build)
+            fake.range_reads.clear()
+            with self.subTest(changes=changes):
+                with self.assertRaisesRegex(
+                    models.ModelError,
+                    "GGUF metadata does not match the target: " + refusal,
+                ):
+                    self.prepare(
+                        selection(self.root, repo + ":Q4_K_M", language_only=False)
+                    )
+                self.assertEqual(fake.range_reads, [f"{repo}/model-Q4_K_M.gguf"])
+                self.assertEqual(fake.downloads, [])
 
     def test_an_unsupported_projector_normalization_is_rejected_before_download(self):
         fake = self.gguf_repository(vision=False)
@@ -767,7 +897,7 @@ class GgufMetadataTests(unittest.TestCase):
         # The unchanged target and draft are assembled again from the cache.
         self.assertEqual(
             fake.requests,
-            [] if offline else [(GGUF_REPO, None), (MOE.draft.repo, None)],
+            [] if offline else [(GGUF_REPO, None), (MOE.draft_repo, None)],
         )
         self.assertEqual(fake.downloads, [])
         self.assertIn("the GGUF metadata adapter changed", output)

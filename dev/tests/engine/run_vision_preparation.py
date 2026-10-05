@@ -153,7 +153,6 @@ def fixture(root, source, shift=0, case=None):
         write_safetensors(root / VISION_SHARD, tensors)
         text = {"language_model.model.norm.weight": ([8], "BF16", bytes(16))}
         write_safetensors(root / TEXT_SHARD, text)
-        (root / "config.json").write_text("{}")
         return
     metadata = {
         "general.architecture": "clip",

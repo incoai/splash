@@ -2,20 +2,24 @@
 trained for its architecture, as an assembly (assembly.py).
 
 The Hub owns downloads and snapshots; this module inspects the target,
-selects its components and decides when to follow the Hub, and the native
-source adapters own tensor validation and preparation. A target is
-identified by its own metadata (a GGUF header or an MLX config), read before
-any weight download, and paired with the draft trained for its family
-(families.py); repository names play no part. Every start follows the
-target's revision, then its draft's, with one Hub request each, and
-publishes a new commit's assembly atomically; the installed assembly starts
-when the Hub cannot answer or the new commit cannot be installed.
+selects its components and decides when to follow the Hub. The engine owns
+the model rules, which it applies to the target's and the draft's
+configurations, and a GGUF's metadata, before any weight download
+(check_model), and its source adapters own tensor validation and
+preparation. A target's family is the one the engine finds its
+configuration (an MLX config, or the one derived from a GGUF header) to
+describe, paired with the draft trained for it (families.py); repository
+names play no part. Every start follows the target's revision, then its
+draft's, with one Hub request each, and publishes a new commit's assembly
+atomically; the installed assembly starts when the Hub cannot answer or the
+new commit cannot be installed.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,8 +46,14 @@ class Target:
     format: str
     # The record's vision_format: "none", "safetensors" or "gguf".
     vision_format: str
-    # The configuration that identifies the target's family.
-    config: dict
+    # The configuration the engine reads, the assembly's config.json: the MLX
+    # repository's, or the one derived from the GGUF's metadata.
+    config: Path
+    # A GGUF's scalar metadata, which the engine checks as it checks the
+    # GGUF's at every start (gguf.scalar_metadata); None for MLX.
+    gguf_metadata: Path | None
+    # The family the engine finds the configuration to describe.
+    family: families.ModelFamily
     # Assembly path -> repository file, for every path a repository file
     # serves (the layout in assembly.py). A GGUF's configuration and tokenizer
     # are derived from it at installation instead.
@@ -132,17 +142,41 @@ def select_vision(repo):
     )
 
 
-def inspect_target(repo, variant, language_only):
+def check_model(
+    target_format, vision_format, config, *, gguf_metadata=None, draft=None
+):
+    """The family the engine finds a model's configuration to describe, by
+    the rules it holds the model's assembly to at every start (its
+    model-check command): config, the target's configuration, with the
+    source formats the record names; gguf_metadata, a GGUF target's
+    (gguf.scalar_metadata); and draft, its draft's config.json once chosen. A
+    ModelError gives the engine's reason when it refuses them."""
+    arguments = ["model-check", target_format, vision_format, str(config)]
+    if gguf_metadata is not None:
+        arguments.append(str(gguf_metadata))
+    if draft is not None:
+        arguments.append(str(draft))
+    name = json.loads(models.run_engine(arguments, "model check"))["family"]
+    if (family := families.named(name)) is None:
+        raise models.ModelError(f"no DFlash2 draft is known for the {name} family")
+    return family
+
+
+def inspect_target(repo, variant, language_only, scratch):
     """What the target repository supplies, from metadata alone: a GGUF
-    header read by range requests, or an MLX config and shard index. A
-    :VARIANT names a GGUF, and so does a repository without a safetensors
-    checkpoint."""
+    header read by range requests, or an MLX config and shard index, and the
+    family the engine finds its configuration to describe. A :VARIANT names a
+    GGUF, and so does a repository without a safetensors checkpoint; a GGUF's
+    configuration and metadata are written into scratch. The target's text
+    configuration is checked first, then its vision tower and the tower's
+    configuration, so a model Splash cannot serve is refused for that,
+    whatever its tower."""
     if variant is not None or not any(n.endswith(".safetensors") for n in repo.files):
-        return _gguf_target(repo, variant, language_only)
+        return _gguf_target(repo, variant, language_only, scratch)
     return _mlx_target(repo, language_only)
 
 
-def _gguf_target(repo, variant, language_only):
+def _gguf_target(repo, variant, language_only, scratch):
     name, by_ending = select_gguf(repo.files, variant)
     if by_ending:
         print(
@@ -152,17 +186,22 @@ def _gguf_target(repo, variant, language_only):
         )
     with repo.open(name) as stream:
         header = gguf.Metadata(stream, tensors=True)
-    # The family bounds the layers whose tensors the screening lists.
-    families.family_for(gguf.model_config(header))
-    gguf.require_loadable(header)
     files = {"target/" + name: name}
-    vision_header = None
+    config, metadata = scratch / "config.json", scratch / "gguf-metadata.json"
+    config.write_bytes(models.json_bytes(gguf.model_config(header)))
+    metadata.write_bytes(models.json_bytes(gguf.scalar_metadata(header)))
+    # The family bounds the layers whose tensors the screening lists.
+    family = check_model("gguf", "none", config, gguf_metadata=metadata)
+    gguf.require_loadable(header)
+    vision_format = "none"
     if not language_only:
         files[assembly.GGUF_VISION], vision_header = select_vision(repo)
         _validate_processor(gguf.processor_config(vision_header))
-    config = gguf.model_config(header, vision_header)
+        config.write_bytes(models.json_bytes(gguf.model_config(header, vision_header)))
+        vision_format = "gguf"
+        check_model("gguf", vision_format, config, gguf_metadata=metadata)
     print(f"Selected {name} from {repo.name}.", flush=True)
-    return Target("gguf", "none" if language_only else "gguf", config, files)
+    return Target("gguf", vision_format, config, metadata, family, files)
 
 
 def _mlx_target(repo, language_only):
@@ -181,24 +220,14 @@ def _mlx_target(repo, language_only):
             "Configuration, tokenizer and processor must come from the target "
             f"repository{hint}."
         )
-    config = models.read_json(repo.file("config.json"))
-    # MLX states its quantization under "quantization"; a transformers
-    # quantization_config alone describes another method (GPTQ, AWQ, ...).
-    quant = config.get("quantization")
-    if (
-        not isinstance(quant, dict)
-        or quant.get("mode", "affine") != "affine"
-        or quant.get("bits") != 4
-        or quant.get("group_size") != 64
-    ):
-        raise models.ModelError(
-            "this model requires an MLX affine 4-bit/group-64 checkpoint or a supported GGUF"
-        )
+    config = repo.file("config.json")
+    family = check_model("mlx-affine", "none", config)
     files = {
         path: "config.json"
         for path in ("config.json", "target/config.json", "tokenizer/config.json")
     }
     files |= {"tokenizer/" + n: n for n in TOKENIZER_FILES if n in repo.files}
+    vision_format = "none"
     if not language_only:
         _validate_processor(models.read_json(repo.file("preprocessor_config.json")))
         shards = _weight_files(repo, "vision_tower.")
@@ -206,12 +235,12 @@ def _mlx_target(repo, language_only):
             raise models.ModelError(
                 f"{repo.name} has no vision tower; use --language-only to serve text only"
             )
+        vision_format = "safetensors"
+        check_model("mlx-affine", vision_format, config)
         files["vision/config.json"] = "config.json"
         files |= {"vision/" + n: n for n in shards}
     files |= {"target/" + n: n for n in _weight_files(repo)}
-    return Target(
-        "mlx-affine", "none" if language_only else "safetensors", config, files
-    )
+    return Target("mlx-affine", vision_format, config, None, family, files)
 
 
 def _weight_files(repo, prefix=""):
@@ -420,14 +449,18 @@ def _install(selection, repo, installed, draft=None):
     it, or None to resolve it here, asking the Hub only when it answered for
     repo."""
     # Every Hub request (header reads, downloads) happens here.
-    with hub.as_model_errors(f"cannot install {selection.model}"):
-        target = inspect_target(repo, selection.variant, selection.language_only)
-        family = families.family_for(target.config)
+    with (
+        hub.as_model_errors(f"cannot install {selection.model}"),
+        tempfile.TemporaryDirectory(prefix="splash-target-") as scratch,
+    ):
+        target = inspect_target(
+            repo, selection.variant, selection.language_only, Path(scratch)
+        )
         if draft is None:
-            draft = _resolve_draft(family, selection, installed, repo)
-        draft, files = _draft(family, installed, draft)
+            draft = _resolve_draft(target.family, selection, installed, repo)
+        draft, files = _draft(target, installed, draft)
         print(
-            f"Installing {selection.model} as {family.name} ({target.format}); "
+            f"Installing {selection.model} as {target.family.name} ({target.format}); "
             f"draft {draft.name}; "
             f"vision {'disabled' if selection.language_only else 'enabled'}.",
             flush=True,
@@ -437,7 +470,7 @@ def _install(selection, repo, installed, draft=None):
     record = {
         "version": 1,
         "model": selection.model,
-        "family": family.name,
+        "family": target.family.name,
         "target_format": target.format,
         "vision_format": target.vision_format,
         "sources": {"target": repo.identity(), "draft": draft.identity()},
@@ -499,7 +532,7 @@ def _resolve_draft(family, selection, installed, target):
     installed draft stands in, unlisted, or without one a commit the Hub
     cache holds for this selection; the installed draft also stands in, with
     the reason, when the draft cannot be resolved."""
-    name = selection.draft_model or family.draft.repo
+    name = selection.draft_model or family.draft_repo
     recorded = installed and installed["sources"]["draft"]
     asked = _answered(target)
     if recorded and not asked:
@@ -525,16 +558,17 @@ def _resolve_draft(family, selection, installed, target):
         )
 
 
-def _draft(family, installed, draft):
+def _draft(target, installed, draft):
     """The draft repository and its downloaded files, by assembly path: draft,
     as this start resolved it, when it is not the installed draft, or else
     the installed one, which is kept too when draft cannot be fetched
-    (downloaded and checked)."""
+    (downloaded and checked for the target)."""
+    family = target.family
     recorded = installed and installed["sources"]["draft"]
     if draft.identity() != recorded:
         try:
             with hub.as_model_errors(f"cannot fetch the {family.name} draft"):
-                return draft, _draft_files(draft, family)
+                return draft, _draft_files(draft, target)
         except models.ModelError as error:
             if not recorded:
                 raise
@@ -543,7 +577,7 @@ def _draft(family, installed, draft):
                 f"keeping the installed one: {error}"
             )
     repo = hub.Repository.recorded(recorded)
-    return repo, _draft_files(repo, family)
+    return repo, _draft_files(repo, target)
 
 
 def _answered(repo):
@@ -557,12 +591,14 @@ def _at(repo):
     return f"{repo.name}@{repo.revision[:12]}" if repo.revision else repo.name
 
 
-def _draft_files(repo, family):
-    """The family's DFlash2 checkpoint in repo, downloaded, by assembly path:
-    config.json and the safetensors weights, model.safetensors or the shards
-    its index names, at the root of the repository or --draft-model
-    directory, as a DFlash2 release holds them. Its configuration must state
-    the family's draft signature."""
+def _draft_files(repo, target):
+    """The DFlash2 checkpoint in repo for target's family, downloaded, by
+    assembly path: config.json and the safetensors weights,
+    model.safetensors or the shards its index names, at the root of the
+    repository or --draft-model directory, as a DFlash2 release holds them.
+    The weights download only once the engine accepts its configuration with
+    the target's (check_model)."""
+    family = target.family
     try:
         if "config.json" not in repo.files:
             raise models.ModelError("no config.json")
@@ -572,30 +608,18 @@ def _draft_files(repo, family):
             f"{repo.name} does not contain a DFlash2 checkpoint for {family.name}"
             f" ({error})"
         ) from error
-    config = models.read_json(repo.file("config.json"))
-    differences = [
-        f"{key} {_config_value(config, key)!r}, not {expected!r}"
-        for key, expected in family.draft.signature
-        if not _same(_config_value(config, key), expected)
-    ]
-    if differences:
-        raise models.ModelError(
-            f"draft configuration is incompatible with {family.name}: "
-            + "; ".join(differences)
+    config = repo.file("config.json")
+    try:
+        check_model(
+            target.format,
+            target.vision_format,
+            target.config,
+            gguf_metadata=target.gguf_metadata,
+            draft=config,
         )
+    except models.ModelError as error:
+        raise models.ModelError(
+            f"draft configuration is incompatible with {family.name}: {error}"
+        ) from error
     downloaded = repo.download({"config.json", *weights})
     return {"draft/" + name: path for name, path in downloaded.items()}
-
-
-def _config_value(config, key):
-    """config's value at a key dotted into its objects, lists as tuples, or
-    None."""
-    value = config
-    for part in key.split("."):
-        value = value.get(part) if isinstance(value, dict) else None
-    return tuple(value) if isinstance(value, list) else value
-
-
-def _same(value, expected):
-    """JSON equality that tells booleans from numbers."""
-    return value == expected and isinstance(value, bool) == isinstance(expected, bool)

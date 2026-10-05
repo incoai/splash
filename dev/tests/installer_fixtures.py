@@ -3,11 +3,14 @@ Hub errors, and FakeHub, the stand-in for the Hugging Face Hub that the
 upstream and GGUF tests install from. The legacy package tests
 (test_models.py) mock huggingface_hub's functions directly: the frozen legacy
 installer calls them with other arguments (token, repo_type,
-force_download, and model_info without a timeout)."""
+force_download, and model_info without a timeout). The installer checks a
+model's configuration with the engine, build/splash, which make test-python
+builds."""
 
 import hashlib
 import json
 import shutil
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -20,6 +23,10 @@ from install import families, hub, models
 DENSE = families.named("Qwen3.8-27B")
 MOE = families.named("Qwen3.6-35B-A3B")
 MODEL = "mlx-community/Qwen3.8-27B-4bit"
+# An MLX config.json, a DFlash2 draft config and the scalar metadata of a
+# GGUF (gguf.scalar_metadata) built like each family's, in its lower-case
+# name, which the native configuration test reads too.
+CONFIGS = Path(__file__).resolve().parent / "fixtures" / "model-configs"
 # The commit the main branch of every family's draft repository names.
 DRAFT_COMMIT = "d" * 40
 # The image preprocessing Splash implements (server/images.py).
@@ -32,34 +39,36 @@ PROCESSOR = {
 }
 
 
-def text_config(family, **changes):
-    return dict(family.signature) | changes
+def family_config(family, name="config.json"):
+    """The family's fixture configuration at name: its MLX config.json,
+    draft/config.json, its DFlash2 draft's, or gguf-metadata.json."""
+    return json.loads((CONFIGS / family.name.lower() / name).read_text())
 
 
 def mlx_target(root, family, *, changes=None):
+    """An MLX repository of family's target: its config.json, with changes
+    to its text_config, tokenizer files and weights."""
     root.mkdir(parents=True, exist_ok=True)
-    config = {
-        "text_config": text_config(family, **(changes or {})),
-        "quantization": {"bits": 4, "group_size": 64},
-    }
-    (root / "config.json").write_text(json.dumps(config))
+    target = family_config(family)
+    target["text_config"] |= changes or {}
+    (root / "config.json").write_text(json.dumps(target))
     for name in ("tokenizer.json", "tokenizer_config.json", "model.safetensors"):
         (root / name).write_text("{}")
     return root
 
 
 def draft_dir(root, family, **changes):
-    """A DFlash2 release of family's draft: its configuration, stating the
-    draft signature with changes (dotted keys), and weights."""
+    """A DFlash2 release of family's draft: its config.json, with changes
+    (dotted keys), and weights."""
     root.mkdir(parents=True, exist_ok=True)
-    config = {}
-    for key, value in (dict(family.draft.signature) | changes).items():
+    draft = family_config(family, "draft/config.json")
+    for key, value in changes.items():
         *objects, name = key.split(".")
-        node = config
+        node = draft
         for part in objects:
-            node = node.setdefault(part, {})
-        node[name] = list(value) if isinstance(value, tuple) else value
-    (root / "config.json").write_text(json.dumps(config))
+            node = node[part]
+        node[name] = value
+    (root / "config.json").write_text(json.dumps(draft))
     (root / "model.safetensors").write_bytes(b"draft")
     return root
 
@@ -181,7 +190,7 @@ def fake_hub(test, cache, *, target=DENSE, commit="a" * 40):
     fake = FakeHub(test, cache)
     fake.publish(MODEL, commit, lambda p: mlx_target(p, target))
     for family in families.FAMILIES:
-        fake.publish(family.draft.repo, DRAFT_COMMIT, lambda p: draft_dir(p, family))
+        fake.publish(family.draft_repo, DRAFT_COMMIT, lambda p: draft_dir(p, family))
     return fake
 
 

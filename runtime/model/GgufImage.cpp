@@ -242,59 +242,6 @@ private:
 
 std::string prefix(uint32_t layer) { return "blk." + std::to_string(layer) + "."; }
 
-// The target geometry the metadata declares, with the rotary embedding and
-// norms the kernels compute: the RoPE base and rotated dimensions, the RMS
-// epsilon and no RoPE scaling. One error names every mismatch.
-void requireMetadata(const GgufFile &file, const QwenTargetDimensions &geometry) {
-  const std::string arch = architecture(geometry.ffnKind);
-  if (file.architecture() != arch)
-    throw GgufError("GGUF architecture is " + file.architecture() + ", but the package's target is " + arch);
-  std::string mismatched;
-  const auto expect = [&](const char *key, uint64_t value) {
-    const std::optional<uint64_t> found = file.unsignedValue(arch + "." + key);
-    if (found != value)
-      mismatched += (mismatched.empty() ? "" : ", ") + std::string(key) + " " +
-                    (found ? std::to_string(*found) : "missing") + " (expected " + std::to_string(value) + ")";
-  };
-  // A float equal to value up to its F32 rounding.
-  const auto expectFloat = [&](const char *key, double value) {
-    const std::optional<double> found = file.floatValue(arch + "." + key);
-    if (found && std::abs(*found - value) <= value * 1e-6) return;
-    std::ostringstream text;
-    text << (mismatched.empty() ? "" : ", ") << key << ' ';
-    if (found) text << *found;
-    else text << "missing";
-    text << " (expected " << value << ')';
-    mismatched += text.str();
-  };
-  expect("block_count", geometry.layers + file.unsignedValue(arch + ".nextn_predict_layers").value_or(0));
-  expect("embedding_length", geometry.hiddenSize);
-  expect("attention.head_count", geometry.attentionWidth / geometry.attentionHeadDimension);
-  expect("attention.head_count_kv", geometry.attentionKvHeads);
-  expect("attention.key_length", geometry.attentionHeadDimension);
-  expect("attention.value_length", geometry.attentionHeadDimension);
-  expect("rope.dimension_count", 2ull * geometry.rotaryPairs);
-  expectFloat("rope.freq_base", geometry.rotaryTheta);
-  expectFloat("attention.layer_norm_rms_epsilon", SPLASH_RMS_EPSILON);
-  if (const auto scaling = file.stringValue(arch + ".rope.scaling.type"); scaling && *scaling != "none")
-    mismatched += (mismatched.empty() ? "" : ", ") + std::string("rope.scaling.type ") + *scaling + " (expected none)";
-  expect("full_attention_interval", geometry.fullAttentionPeriod);
-  expect("ssm.conv_kernel", kGdnConvolutionTaps);
-  expect("ssm.group_count", geometry.gdnKeyHeads);
-  expect("ssm.time_step_rank", geometry.gdnValueHeads);
-  expect("ssm.state_size", geometry.gdnHeadDimension);
-  expect("ssm.inner_size", uint64_t{geometry.gdnValueHeads} * geometry.gdnHeadDimension);
-  if (geometry.ffnKind == QwenFfnKind::SparseMoe) {
-    expect("expert_count", geometry.experts);
-    expect("expert_used_count", geometry.expertsPerToken);
-    expect("expert_feed_forward_length", geometry.expertIntermediateSize);
-    expect("expert_shared_feed_forward_length", geometry.expertIntermediateSize);
-  } else {
-    expect("feed_forward_length", geometry.intermediateSize);
-  }
-  if (!mismatched.empty()) throw GgufError("GGUF metadata does not match the target: " + mismatched);
-}
-
 Image layerImage(const GgufFile &file, const QwenTargetDimensions &g, std::vector<std::string> &problems,
                  uint32_t index) {
   const std::string p = prefix(index);
@@ -364,8 +311,58 @@ void requireRotation(const GgufFile &file, const QwenTargetDimensions &g, const 
 
 } // namespace
 
+void requireMetadata(const GgufMetadata &metadata, const QwenTargetDimensions &geometry) {
+  const std::string arch = architecture(geometry.ffnKind);
+  if (metadata.architecture() != arch)
+    throw GgufError("GGUF architecture is " + metadata.architecture() + ", but the package's target is " + arch);
+  std::string mismatched;
+  const auto expect = [&](const char *key, uint64_t value) {
+    const std::optional<uint64_t> found = metadata.unsignedValue(arch + "." + key);
+    if (found != value)
+      mismatched += (mismatched.empty() ? "" : ", ") + std::string(key) + " " +
+                    (found ? std::to_string(*found) : "missing") + " (expected " + std::to_string(value) + ")";
+  };
+  // A float equal to value up to its F32 rounding.
+  const auto expectFloat = [&](const char *key, double value) {
+    const std::optional<double> found = metadata.floatValue(arch + "." + key);
+    if (found && std::abs(*found - value) <= value * 1e-6) return;
+    std::ostringstream text;
+    text << (mismatched.empty() ? "" : ", ") << key << ' ';
+    if (found) text << *found;
+    else text << "missing";
+    text << " (expected " << value << ')';
+    mismatched += text.str();
+  };
+  expect("block_count", geometry.layers + metadata.unsignedValue(arch + ".nextn_predict_layers").value_or(0));
+  expect("embedding_length", geometry.hiddenSize);
+  expect("attention.head_count", geometry.attentionWidth / geometry.attentionHeadDimension);
+  expect("attention.head_count_kv", geometry.attentionKvHeads);
+  expect("attention.key_length", geometry.attentionHeadDimension);
+  expect("attention.value_length", geometry.attentionHeadDimension);
+  expect("rope.dimension_count", 2ull * geometry.rotaryPairs);
+  expectFloat("rope.freq_base", geometry.rotaryTheta);
+  expectFloat("attention.layer_norm_rms_epsilon", SPLASH_RMS_EPSILON);
+  if (const auto scaling = metadata.stringValue(arch + ".rope.scaling.type"); scaling && *scaling != "none")
+    mismatched += (mismatched.empty() ? "" : ", ") + std::string("rope.scaling.type ") + *scaling + " (expected none)";
+  expect("full_attention_interval", geometry.fullAttentionPeriod);
+  expect("ssm.conv_kernel", kGdnConvolutionTaps);
+  expect("ssm.group_count", geometry.gdnKeyHeads);
+  expect("ssm.time_step_rank", geometry.gdnValueHeads);
+  expect("ssm.state_size", geometry.gdnHeadDimension);
+  expect("ssm.inner_size", uint64_t{geometry.gdnValueHeads} * geometry.gdnHeadDimension);
+  if (geometry.ffnKind == QwenFfnKind::SparseMoe) {
+    expect("expert_count", geometry.experts);
+    expect("expert_used_count", geometry.expertsPerToken);
+    expect("expert_feed_forward_length", geometry.expertIntermediateSize);
+    expect("expert_shared_feed_forward_length", geometry.expertIntermediateSize);
+  } else {
+    expect("feed_forward_length", geometry.intermediateSize);
+  }
+  if (!mismatched.empty()) throw GgufError("GGUF metadata does not match the target: " + mismatched);
+}
+
 std::vector<Image> planImages(const GgufFile &file, const QwenTargetDimensions &geometry) {
-  requireMetadata(file, geometry);
+  requireMetadata(file.metadata(), geometry);
   std::vector<std::string> problems;
   std::vector<Image> images;
   for (uint32_t layer = 0; layer < geometry.layers; ++layer)

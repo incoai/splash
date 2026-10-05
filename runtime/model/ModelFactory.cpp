@@ -29,6 +29,21 @@ void requireCompatibleModelPackage(const ModelPackage &package) {
   }
 }
 
+std::unique_ptr<VisionLoader> planVisionLoader(const std::filesystem::path &root, const ModelDescriptor &descriptor) {
+  if (descriptor.visionSource != VisionSource::Mlx && descriptor.visionSource != VisionSource::Gguf)
+    return nullptr;
+  return std::make_unique<VisionLoader>(root / "vision", descriptor.visionSource, descriptor.vision);
+}
+
+QwenVisionWeights loadVisionWeights(metal::MetalBackend &backend, WeightImages &images,
+                                    const std::filesystem::path &root, const ModelDescriptor &descriptor,
+                                    const VisionLoader *loader) {
+  if (loader) return loadQwenVisionWeights(backend, images, *loader);
+  if (descriptor.visionSource == VisionSource::Packed)
+    return loadQwenVisionWeights(backend, images, root / "vision", descriptor.vision);
+  return {};
+}
+
 namespace {
 
 TargetWeights readTarget(metal::MetalBackend &backend, const Qwen3_8Layout &layout,
@@ -39,25 +54,6 @@ TargetWeights readTarget(metal::MetalBackend &backend, const Qwen3_8Layout &layo
 TargetWeights readTarget(metal::MetalBackend &backend, const Qwen3_6MoeLayout &layout,
                          const QwenTargetFiles<Qwen3_6MoeLayout> &files) {
   return loadQwen3_6MoeWeights(backend, layout, files);
-}
-
-// The vision role's upstream source, planned; null for a packed vision file
-// or a model without vision.
-std::unique_ptr<VisionLoader> planVisionLoader(const std::filesystem::path &root, const ModelDescriptor &descriptor) {
-  if (descriptor.visionSource != VisionSource::Mlx && descriptor.visionSource != VisionSource::Gguf)
-    return nullptr;
-  return std::make_unique<VisionLoader>(root / "vision", descriptor.visionSource, descriptor.vision);
-}
-
-// The vision role: written by `loader` when there is one, else the packed
-// file; empty weights for a model without vision.
-QwenVisionWeights loadVisionWeights(metal::MetalBackend &backend, WeightImages &images,
-                                    const std::filesystem::path &root, const ModelDescriptor &descriptor,
-                                    const VisionLoader *loader) {
-  if (loader) return loadQwenVisionWeights(backend, images, *loader);
-  if (descriptor.visionSource == VisionSource::Packed)
-    return loadQwenVisionWeights(backend, images, root / "vision", descriptor.vision);
-  return {};
 }
 
 template <class Image> uint64_t imageBytes(const std::vector<Image> &images) {

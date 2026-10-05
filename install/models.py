@@ -25,6 +25,7 @@ import json
 import os
 import re
 import signal
+import subprocess
 import sys
 import tempfile
 from contextlib import contextmanager
@@ -44,7 +45,9 @@ from server import serve_options
 from . import paths
 
 MODELS = paths.MODELS
-# The bound on one JSON metadata file.
+# The bound on one JSON metadata file the installer reads; such files are
+# kilobytes, so a larger one is refused unread. The engine bounds the files it
+# reads by its own rule.
 MAX_JSON_BYTES = 4 * 1024 * 1024
 # What installation_kind finds at a selection link.
 ASSEMBLY, PACKAGE = "assembly", "package"
@@ -62,6 +65,40 @@ class ModelError(RuntimeError):
 def warn(message):
     """Report something the user may need to act on, on stderr."""
     print(f"Warning: {message}", file=sys.stderr, flush=True)
+
+
+def run_engine(arguments, check):
+    """The output of one of the engine's checks, `ENGINE ARGUMENTS`, which
+    check names. A ModelError names an engine that cannot run, or that
+    refuses the command line as one built before the check does, and what
+    replaces it; else it gives the engine's refusal, its error: line without
+    that prefix, or the whole report of an engine that ended before main()
+    (dyld on an older macOS)."""
+    engine = paths.BINARY
+    replace = "reinstall Splash" if paths.PACKAGED else "rebuild it with make"
+    try:
+        result = subprocess.run(
+            [str(engine), *arguments], capture_output=True, text=True
+        )
+    except OSError as error:
+        raise ModelError(
+            f"cannot run the engine {engine} ({error.strerror}); {replace}"
+        ) from None
+    if result.returncode == os.EX_USAGE:
+        raise ModelError(f"the engine {engine} does not know this {check}; {replace}")
+    if result.returncode:
+        report = result.stderr.strip()
+        refusals = [
+            line.removeprefix("error: ")
+            for line in report.splitlines()
+            if line.startswith("error: ")
+        ]
+        raise ModelError(
+            refusals[-1]
+            if result.returncode > 0 and refusals
+            else f"the engine's {check} failed: {report or f'status {result.returncode}'}"
+        )
+    return result.stdout
 
 
 def is_hex_digest(value, length: int) -> bool:

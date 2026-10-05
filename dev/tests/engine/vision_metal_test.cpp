@@ -7,6 +7,7 @@
 #include "TestChecks.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
+#include "model/Qwen3_8.hpp"
 #include "ops/Vision.hpp"
 
 #include <cstdint>
@@ -27,7 +28,7 @@ constexpr uint64_t kBf16Bytes = 2;
 constexpr ops::ImageGrid kGrid{2, 2};
 
 void run(metal::MetalBackend &backend) {
-  const ops::VisionLayout layout;
+  const ops::VisionLayout layout = model::kQwen3_8VisionLayout;
   const uint64_t hidden = layout.hiddenSize, merged = layout.mergedHiddenSize;
   // The largest tensor is the merger's down projection.
   const metal::MetalBuffer storage =

@@ -46,8 +46,7 @@ inline void copy(Image &image, const std::string &name, std::vector<uint64_t> sh
 }
 
 // Binds every input of image to its checkpoint tensor, which must have one of
-// the input's dtypes and its shape, once the checkpoint states the
-// quantization of every affine module the image reads.
+// the input's dtypes and its shape.
 inline void bind(Image &image, const SafetensorsCheckpoint &source) {
   const auto bindInput = [&](Input &input) {
     const SourceTensor &tensor = source.require(input.name);
@@ -56,7 +55,6 @@ inline void bind(Image &image, const SafetensorsCheckpoint &source) {
       throw WeightStoreError("source tensor type or shape does not match: " + input.name);
     input.tensor = &tensor;
   };
-  for (const auto &[module, bits] : image.quantized) source.requireQuantization(module, bits);
   for (Section &section : image.sections) {
     if (section.parts.empty()) bindInput(section.input);
     for (ProjectionPart &part : section.parts)

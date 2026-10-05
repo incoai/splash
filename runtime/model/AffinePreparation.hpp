@@ -49,7 +49,8 @@ struct Section {
 };
 
 // A 16-byte header (magic, layer, type) in a 16 KiB block, then 16 KiB-aligned
-// sections; quantized lists the affine modules it reads and their bits.
+// sections; quantized lists the affine modules it reads and their bits, which
+// inspection holds an MLX checkpoint's quantization to (ModelDescriptor.mm).
 struct Image {
   std::string name, magic;
   uint32_t layer = 0, type = 0;

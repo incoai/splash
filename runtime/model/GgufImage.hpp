@@ -77,10 +77,16 @@ struct Image {
   std::vector<Repack> repacks;
 };
 
+// The target geometry a GGUF's metadata declares, its architecture included,
+// with the rotary embedding and norms the kernels compute: the RoPE base and
+// rotated dimensions, the RMS epsilon and no RoPE scaling. planImages checks
+// the file's first, and model-check the installer's copy before any weight
+// download. Throws GgufError naming every mismatch.
+void requireMetadata(const GgufMetadata &metadata, const QwenTargetDimensions &geometry);
+
 // The layers' images, then the head's and the embedding's. Checks the
-// architecture, the geometry the metadata declares, its rotary embedding and
-// norms included, and each tensor's shape; throws GgufError naming every
-// missing tensor and every tensor of a type this build cannot load.
+// metadata (requireMetadata) and each tensor's shape; throws GgufError naming
+// every missing tensor and every tensor of a type this build cannot load.
 [[nodiscard]] std::vector<Image> planImages(const GgufFile &file, const QwenTargetDimensions &geometry);
 
 } // namespace splash::model::gguf

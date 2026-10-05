@@ -4,6 +4,7 @@
 #include "engine/Bootstrap.hpp"
 #include "engine/NativeArguments.hpp"
 #include "engine/Status.hpp"
+#include "model/ModelDescriptor.hpp"
 
 #include <IOKit/pwr_mgt/IOPMLib.h>
 #include <dispatch/dispatch.h>
@@ -21,6 +22,7 @@
 #include <filesystem>
 #include <limits.h>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -144,13 +146,17 @@ private:
 };
 
 void printUsage(std::string_view executable) {
+  const std::string command(executable);
   writeStderrLine(
-      "usage: " + std::string(executable) +
+      "usage: " + command +
       " serve-native MODEL_DIRECTORY"
       " MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto [MAX_CACHE_DISK_BYTES]"
       " [--kv-format int8|bf16] [--decode-share SHARE]"
       " [--max-image-patches PATCHES] [--cache-dir DIRECTORY]"
       " [--idle-release SECONDS|off] [--idle-sleep prevent|allow]");
+  writeStderrLine("       " + command + " model-check mlx-affine none|safetensors CONFIG [DRAFT_CONFIG]");
+  writeStderrLine("       " + command + " model-check gguf none|gguf CONFIG GGUF_METADATA [DRAFT_CONFIG]");
+  writeStderrLine("       " + command + " device-check");
 }
 
 std::filesystem::path executablePath() {
@@ -354,6 +360,25 @@ int checkDevice() {
   return static_cast<int>(engine::NativeProcessExit::EngineFailure);
 }
 
+// The engine's rules for an upstream model's configuration, which the
+// installer applies before any weight download: the family it describes, as
+// JSON, or the refusal (model::inspectSourceConfiguration).
+int checkModel(int argc, char **argv) {
+  // The draft's config, when given, follows the target's: its config, and a
+  // GGUF's metadata after it.
+  const int draftIndex = argc > 2 && std::string_view(argv[2]) == "gguf" ? 6 : 5;
+  if (argc != draftIndex && argc != draftIndex + 1)
+    throw engine::UsageError(
+        "model-check takes the source formats, the target's config, a GGUF target's metadata and the draft's config");
+  const auto path = [&](int index) {
+    return index < argc ? std::optional<std::filesystem::path>(argv[index]) : std::nullopt;
+  };
+  const std::string_view family = model::inspectSourceConfiguration(
+      argv[2], argv[3], argv[4], draftIndex == 6 ? path(5) : std::nullopt, path(draftIndex));
+  std::printf("{\"family\":\"%.*s\"}\n", static_cast<int>(family.size()), family.data());
+  return 0;
+}
+
 } // namespace
 } // namespace splash
 
@@ -362,6 +387,8 @@ int main(int argc, char **argv) {
     try {
       if (argc == 2 && std::string_view(argv[1]) == "device-check")
         return splash::checkDevice();
+      if (argc > 1 && std::string_view(argv[1]) == "model-check")
+        return splash::checkModel(argc, argv);
       const splash::engine::NativeArguments arguments =
           splash::engine::parseNativeArguments(argc, argv);
       return splash::runNative(arguments);

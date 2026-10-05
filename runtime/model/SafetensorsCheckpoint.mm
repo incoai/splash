@@ -25,13 +25,6 @@ uint64_t number(id value) {
   return [value unsignedLongLongValue];
 }
 
-NSDictionary *object(NSData *data) {
-  if (!data) throw WeightStoreError("unreadable safetensors JSON");
-  id parsed = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-  if (![parsed isKindOfClass:[NSDictionary class]]) throw WeightStoreError("invalid safetensors JSON object");
-  return parsed;
-}
-
 uint32_t elementBytes(const std::string &type) {
   if (type == "BF16" || type == "F16" || type == "I16" || type == "U16") return 2;
   if (type == "F32" || type == "I32" || type == "U32") return 4;
@@ -78,7 +71,8 @@ void indexShard(WeightSource &file, TensorIndex &tensors, uint64_t &metadataByte
   file.setDataOffset(8 + headerBytes);
   NSMutableData *header = [NSMutableData dataWithLength:headerBytes];
   readWeightBytes(file.descriptor(), 8, {static_cast<uint8_t *>(header.mutableBytes), static_cast<size_t>(headerBytes)});
-  NSDictionary *index = object(header);
+  NSDictionary *index = [NSJSONSerialization JSONObjectWithData:header options:0 error:nil];
+  if (![index isKindOfClass:[NSDictionary class]]) throw WeightStoreError("invalid safetensors JSON object");
   std::vector<std::pair<uint64_t, uint64_t>> ranges;
   for (id key in index) {
     if (![key isKindOfClass:[NSString class]] || [key lengthOfBytesUsingEncoding:NSUTF8StringEncoding] > 1024)
@@ -114,25 +108,11 @@ std::vector<std::filesystem::path> shardPaths(const std::filesystem::path &direc
 struct SafetensorsCheckpoint::Impl {
   std::vector<std::unique_ptr<WeightSource>> files;
   TensorIndex tensors;
-  NSDictionary *quantization = nil;
-
-  void readConfiguration(const std::filesystem::path &path) {
-    if (std::filesystem::file_size(path) > 1024 * 1024)
-      throw WeightStoreError("source configuration exceeds metadata bound");
-    NSData *configuration = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:path.c_str()]];
-    if (!configuration) throw WeightStoreError("cannot read " + path.string());
-    NSDictionary *config = object(configuration);
-    id quantizationConfig = config[@"quantization"] ?: config[@"quantization_config"];
-    if (quantizationConfig && ![quantizationConfig isKindOfClass:[NSDictionary class]])
-      throw WeightStoreError("invalid source quantization configuration");
-    quantization = quantizationConfig;
-  }
 };
 
 SafetensorsCheckpoint::SafetensorsCheckpoint(const std::filesystem::path &directory)
     : impl_(std::make_unique<Impl>()) {
   @autoreleasepool {
-    impl_->readConfiguration(directory / "config.json");
     uint64_t metadataBytes = 0;
     for (const auto &path : shardPaths(directory)) {
       @autoreleasepool {
@@ -153,17 +133,6 @@ const SourceTensor &SafetensorsCheckpoint::require(std::string_view name) const 
   const SourceTensor *tensor = find(name);
   if (!tensor) throw WeightStoreError("missing source tensor: " + std::string(name));
   return *tensor;
-}
-void SafetensorsCheckpoint::requireQuantization(std::string_view projection, uint32_t bits) const {
-  @autoreleasepool {
-    NSString *key = [[NSString alloc] initWithBytes:projection.data() length:projection.size() encoding:NSUTF8StringEncoding];
-    NSDictionary *entry = impl_->quantization[key] ?: impl_->quantization;
-    id mode = [entry isKindOfClass:[NSDictionary class]] ? entry[@"mode"] ?: impl_->quantization[@"mode"] : nil;
-    if (![entry isKindOfClass:[NSDictionary class]] || number(entry[@"bits"] ?: impl_->quantization[@"bits"]) != bits ||
-        number(entry[@"group_size"] ?: impl_->quantization[@"group_size"]) != 64 ||
-        (mode && ![mode isEqual:@"affine"]))
-      throw WeightStoreError("unsupported affine quantization for " + std::string(projection));
-  }
 }
 void SafetensorsCheckpoint::checkUnchanged() const { for (const auto &source : impl_->files) source->checkUnchanged(); }
 

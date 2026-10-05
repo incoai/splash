@@ -22,7 +22,9 @@ inline constexpr std::string_view kEmbeddingMagic = "MDFE0001";
 // and every view of a target reads them from there: the target loaders, the
 // GGUF planner and the runtime's QwenTargetGeometry.
 struct QwenTargetDimensions {
-  uint32_t maximumContextTokens = kv::kMaximumLogicalTokens;
+  // The native window, the context max_position_embeddings states, which
+  // must fit the runtime's KV ceiling (kv::kMaximumLogicalTokens).
+  uint32_t maximumContextTokens = 0;
   uint32_t layers = 0;
   uint32_t hiddenSize = 0;
   uint32_t vocabularySize = 0;

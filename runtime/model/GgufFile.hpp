@@ -87,17 +87,30 @@ struct GgufRotation {
   std::map<uint32_t, std::vector<int8_t>> signs;
 };
 
+// A GGUF's scalar metadata by key: every integer and boolean as unsigned, a
+// negative integer as its two's complement, every float as a double, and the
+// strings. GgufFile reads it from a header, and model-check from the
+// installer's copy of the header's (install/gguf.py scalar_metadata), so that
+// gguf::requireMetadata holds either to the same rules.
+struct GgufMetadata {
+  std::map<std::string, uint64_t, std::less<>> unsigneds;
+  std::map<std::string, double, std::less<>> floats;
+  std::map<std::string, std::string, std::less<>> strings;
+
+  [[nodiscard]] std::optional<uint64_t> unsignedValue(std::string_view key) const;
+  [[nodiscard]] std::optional<double> floatValue(std::string_view key) const;
+  [[nodiscard]] std::optional<std::string> stringValue(std::string_view key) const;
+  // general.architecture, empty when the metadata names none.
+  [[nodiscard]] std::string architecture() const;
+};
+
 class GgufFile final {
 public:
   // Parses the header of source and sets where its tensor data starts.
   explicit GgufFile(WeightSource &source);
 
   [[nodiscard]] const WeightSource &source() const noexcept { return source_; }
-  [[nodiscard]] const std::string &architecture() const noexcept { return architecture_; }
-
-  [[nodiscard]] std::optional<uint64_t> unsignedValue(std::string_view key) const;
-  [[nodiscard]] std::optional<std::string> stringValue(std::string_view key) const;
-  [[nodiscard]] std::optional<double> floatValue(std::string_view key) const;
+  [[nodiscard]] const GgufMetadata &metadata() const noexcept { return metadata_; }
   [[nodiscard]] std::optional<std::span<const double>> numericArray(std::string_view key) const;
   // The rotation the metadata declares, if any.
   [[nodiscard]] const std::optional<GgufRotation> &rotation() const noexcept { return rotation_; }
@@ -108,10 +121,7 @@ public:
 
 private:
   const WeightSource &source_;
-  std::string architecture_;
-  std::map<std::string, uint64_t, std::less<>> unsigned_;
-  std::map<std::string, std::string, std::less<>> strings_;
-  std::map<std::string, double, std::less<>> floats_;
+  GgufMetadata metadata_;
   std::map<std::string, std::vector<double>, std::less<>> arrays_;
   // The string arrays of the rotation keys, the only ones kept.
   std::map<std::string, std::vector<std::string>, std::less<>> names_;

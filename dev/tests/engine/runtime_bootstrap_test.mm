@@ -2,7 +2,6 @@
 #include "Q8PageFormatReference.hpp"
 #include "TestChecks.hpp"
 #include "TestEngine.hpp"
-#include "TestFiles.hpp"
 #include "TestImmediateTicket.hpp"
 #include "TestKvPool.hpp"
 #include "TestStatus.hpp"
@@ -166,117 +165,6 @@ void testInstalledManifestBindsExecutionGeometry() {
                 std::string_view::npos,
             "Q4 storage mismatch did not identify the weight format");
   }
-}
-
-// What an installed Qwen3.8-27B assembly records: model.json, the MLX
-// target's config.json and the DFlash2 draft's config.json.
-struct SourceModel final {
-  std::string record =
-      R"({"version":1,"model":"Qwen3.8-27B","target_format":"mlx-affine","vision_format":"none"})";
-  std::string config =
-      R"({"model_type":"qwen3_5","text_config":{"model_type":"qwen3_5_text","hidden_size":5120,)"
-      R"("num_hidden_layers":64,"vocab_size":248320,"max_position_embeddings":262144,)"
-      R"("num_attention_heads":24,"num_key_value_heads":4,"head_dim":256,"linear_num_key_heads":16,)"
-      R"("linear_num_value_heads":48,"linear_key_head_dim":128,"linear_value_head_dim":128,)"
-      R"("linear_conv_kernel_dim":4,"full_attention_interval":4,"rms_norm_eps":1e-06,)"
-      R"("intermediate_size":17408,"attention_bias":false,"attn_output_gate":true,)"
-      R"("tie_word_embeddings":false,"hidden_act":"silu","rope_parameters":{"rope_theta":10000000,)"
-      R"("partial_rotary_factor":0.25,"rope_type":"default"},"layer_types":)" +
-      layerTypes() + "}}";
-  std::string draft =
-      R"({"architectures":["DFlash2DraftModel"],"num_hidden_layers":5,"hidden_size":5120,)"
-      R"("vocab_size":248320,"intermediate_size":17408,"num_attention_heads":32,)"
-      R"("num_key_value_heads":8,"head_dim":128,"sliding_window":2048,"is_causal":false,)"
-      R"("attention_bias":false,"tie_word_embeddings":false,"rms_norm_eps":1e-06,"hidden_act":"silu",)"
-      R"("rope_parameters":{"rope_type":"default","rope_theta":10000000},"dflash_config":{"block_size":8,)"
-      R"("conv_group_size":16,"conv_kernel_size":2,"selector_rank":256,"selector_top_k":16,)"
-      R"("mask_token_id":248070,"target_layer_ids":[5,19,33,47,61]}})";
-
-  // Every fourth layer full attention.
-  static std::string layerTypes() {
-    std::string types;
-    for (uint32_t layer = 0; layer < 64; ++layer)
-      types += std::string(layer ? "," : "") + ((layer + 1) % 4 ? R"("linear_attention")" : R"("full_attention")");
-    return "[" + types + "]";
-  }
-
-  // This model with the first `from` of one of its files replaced by `to`.
-  [[nodiscard]] SourceModel with(std::string SourceModel::*file, std::string_view from,
-                                 std::string_view to) const {
-    SourceModel result = *this;
-    std::string &text = result.*file;
-    const size_t at = text.find(from);
-    require(at != std::string::npos, "the source model has no " + std::string(from));
-    text.replace(at, from.size(), to);
-    return result;
-  }
-};
-
-// An upstream model's configs are checked where the descriptor is made, each
-// once, and each number by one rule: a JSON number, never a boolean, of the
-// model's value, which a whole number may also spell as a float.
-void testSourceModelConfigs() {
-  const test::TemporaryDirectory root("splash-source-model");
-  std::filesystem::create_directory(root.path() / "draft");
-  const auto inspect = [&](const SourceModel &source) {
-    test::writeFile(root.path() / "model.json", source.record);
-    test::writeFile(root.path() / "config.json", source.config);
-    test::writeFile(root.path() / "draft" / "config.json", source.draft);
-    return model::inspectModelPackage(root.path());
-  };
-  const SourceModel source;
-  const model::ModelDescriptor descriptor = inspect(source);
-  require(descriptor.name == "Qwen3.8-27B" && descriptor.targetSource == model::TargetSource::Mlx &&
-              !descriptor.hasVision() && descriptor.draft == model::kQwen3_8DraftLayout,
-          "an MLX Qwen3.8-27B made another descriptor");
-  static_cast<void>(inspect(source.with(&SourceModel::config, R"("rope_theta":10000000)", R"("rope_theta":1e7)")
-                                .with(&SourceModel::draft, R"("block_size":8)", R"("block_size":8.0)")));
-  // Transformers also reads the rope type from the older `type` key.
-  static_cast<void>(inspect(source.with(&SourceModel::config, R"("rope_type":"default")", R"("type":"default")")));
-  // A GGUF's config, which the installer derives from its metadata, holds
-  // only the sizes the descriptor shares with it.
-  SourceModel gguf = source.with(&SourceModel::record, R"("mlx-affine")", R"("gguf")");
-  gguf.config = R"({"model_type":"qwen3_5","text_config":{"model_type":"qwen3_5_text","hidden_size":5120,)"
-                R"("max_position_embeddings":262144,"num_attention_heads":24,"num_key_value_heads":4,)"
-                R"("head_dim":256,"num_hidden_layers":64,"vocab_size":248320}})";
-  require(inspect(gguf).targetSource == model::TargetSource::Gguf, "a GGUF's derived config was refused");
-
-  struct Refused final {
-    std::string SourceModel::*file;
-    std::string_view from, to, error;
-  };
-  for (const Refused &refused : std::initializer_list<Refused>{
-           {&SourceModel::config, R"("num_hidden_layers":64)", R"("num_hidden_layers":true)",
-            "text config num_hidden_layers must be a number"},
-           {&SourceModel::config, R"("head_dim":256,)", "", "text config head_dim must be a number"},
-           {&SourceModel::config, R"("linear_num_value_heads":48)", R"("linear_num_value_heads":47)",
-            "text config linear_num_value_heads mismatch: package 47, runtime 48"},
-           {&SourceModel::config, R"("attn_output_gate":true)", R"("attn_output_gate":1)",
-            "text config attn_output_gate must be true"},
-           {&SourceModel::config, R"("rope_type":"default")", R"("type":"yarn")",
-            "text config rope_parameters type mismatch"},
-           {&SourceModel::config, R"("linear_attention","full_attention")", R"("linear_attention","linear_attention")",
-            "text config layer_types 3 must be full_attention"},
-           {&SourceModel::draft, R"("target_layer_ids":[5,)", R"("target_layer_ids":[5.9,)",
-            "draft config target_layer_ids 0 mismatch: package 5.9, runtime 5"},
-           {&SourceModel::draft, R"(19,33,47,61])", R"(19,33,47,61,1])",
-            "draft config target_layer_ids count mismatch: package 6, runtime 5"},
-           {&SourceModel::draft, R"("rope_theta":10000000)", R"("rope_theta":1000000)",
-            "draft config rope_parameters rope_theta mismatch"},
-           {&SourceModel::draft, R"("selector_top_k":16)", R"("selector_top_k":8)",
-            "draft config dflash_config selector_top_k mismatch"},
-           {&SourceModel::draft, R"("is_causal":false)", R"("is_causal":0)", "draft config is_causal must be false"},
-       })
-    test::rejects([&] { static_cast<void>(inspect(source.with(refused.file, refused.from, refused.to))); },
-                  refused.error, "an upstream config was accepted with " + std::string(refused.to));
-  // A file past a megabyte is not a record or a config, and is not read.
-  test::rejects(
-      [&] {
-        static_cast<void>(inspect(source.with(&SourceModel::config, R"({"model_type")",
-                                              R"({"padding":")" + std::string(1 << 20, ' ') +
-                                                  R"(","model_type")")));
-      },
-      "upstream model config exceeds 1048576 bytes", "an oversized config was read");
 }
 
 // The identity reports the loaded model's digests in lowercase hex and the
@@ -844,7 +732,6 @@ void testProtocolLimitsFollowTheModel() {
 int main() {
   try {
     testInstalledManifestBindsExecutionGeometry();
-    testSourceModelConfigs();
     testRuntimeCacheIdentityReportsTheLoadedModel();
     testAllNativeWarmupsPrecedeReady();
     testBudgetLimitedWarmupKeepsRuntimeConcurrency();

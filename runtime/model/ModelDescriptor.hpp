@@ -8,7 +8,9 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <variant>
 
 namespace splash::model {
@@ -51,6 +53,9 @@ struct ModelDescriptor final {
   [[nodiscard]] bool hasVision() const noexcept {
     return visionSource != VisionSource::None;
   }
+  [[nodiscard]] std::string_view family() const noexcept {
+    return std::visit([](const auto &layout) { return layout.family; }, target);
+  }
   [[nodiscard]] bool valid() const noexcept;
 };
 
@@ -62,5 +67,20 @@ struct ModelDescriptor final {
                                                   ops::VisionLayout vision);
 [[nodiscard]] ModelDescriptor
 inspectModelPackage(const std::filesystem::path &root);
+
+// The family of an upstream model's configuration, checked by the rules
+// inspectModelPackage holds its assembly to: config, the target's config.json
+// or the one the installer derives from its GGUF; targetFormat and
+// visionFormat, the source formats its record names (mlx-affine or gguf;
+// none, safetensors or gguf); ggufMetadata, a GGUF target's scalar metadata
+// as the installer read it from the header, which every start's planner
+// checks in the GGUF (gguf::requireMetadata); and draft, once chosen, the
+// DFlash2 draft's config.json. The installer runs it before any weight
+// download (the engine's model-check command).
+[[nodiscard]] std::string_view
+inspectSourceConfiguration(std::string_view targetFormat, std::string_view visionFormat,
+                           const std::filesystem::path &config,
+                           const std::optional<std::filesystem::path> &ggufMetadata,
+                           const std::optional<std::filesystem::path> &draft);
 
 } // namespace splash::model

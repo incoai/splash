@@ -112,18 +112,10 @@ def _ensure_installed(selection):
                     raise LauncherError("source build failed; see the output above")
     # The engine refuses an unsupported Mac only once the model is prepared;
     # its own check refuses it before tens of GB are downloaded.
-    check = subprocess.run(
-        [str(paths.BINARY), "device-check"], capture_output=True, text=True
-    )
-    if check.returncode:
-        # The binary's own refusal is its last line; one that dies before
-        # main() (dyld on an older macOS) leaves a report worth showing whole.
-        report = check.stderr.strip()
-        raise LauncherError(
-            report.splitlines()[-1].removeprefix("error: ")
-            if check.returncode > 0 and report
-            else f"the engine's device check failed: {report or f'status {check.returncode}'}"
-        )
+    try:
+        model_artifacts.run_engine(["device-check"], "device check")
+    except model_artifacts.ModelError as error:
+        raise LauncherError(str(error)) from None
     command = [
         str(paths.PYTHON),
         str(ROOT / "install/models.py"),

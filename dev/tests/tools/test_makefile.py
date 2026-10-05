@@ -36,6 +36,11 @@ case "$1 $2 $3" in
 esac
 """
 
+# make install builds the engine first, as the installer checks a model's
+# configuration with it; no installer runs under the fake interpreter, so
+# these tests take the engine as built.
+ENGINE_BUILT = ("-o", "build/splash")
+
 
 # What a calling make or shell exports that would configure the make tested.
 INHERITED = (
@@ -127,6 +132,7 @@ class MakefileTests(unittest.TestCase):
             ):
                 directory = Path(directory)
                 result = self.make(
+                    *ENGINE_BUILT,
                     "install",
                     "MODEL=owner/repo",
                     f"LANGUAGE_ONLY={value}",

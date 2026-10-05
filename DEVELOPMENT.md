@@ -982,15 +982,32 @@ its path, `/v1/systemone`'s included: OpenAI's `server_error` with code
 
 ### Upstream model loading
 
-A target is identified by its own metadata: an MLX config's `text_config`, or
-the one `gguf.model_config` derives from the selected GGUF's header, read with a
-few HTTP range requests before any weight download. The registry
-(`families.FAMILIES`) states each supported architecture's signature and the
-draft trained for it; repository names and model-card `base_model` fields play
-no part. An MLX target must declare affine 4-bit, group-64 `quantization` in
-`config.json`. Native source adapters validate model geometry, quantization,
-tensor shapes and draft compatibility again before execution. Remote Python
-code is not loaded.
+A target is identified by its own configuration: an MLX `config.json`, or the
+one `gguf.model_config` derives from the selected GGUF's header, read with a
+few HTTP range requests. Before any weight file is downloaded, the installer
+runs the engine's own check on it, `model-check` (`build/splash model-check`
+in a checkout, `engine/splash model-check` in a packaged installation), which
+holds it to the rules every start applies to the installation
+(`inspectSourceConfiguration` in `ModelDescriptor.mm`) and names the family
+it describes. For a GGUF the check also takes the scalar metadata of its
+header, which the installer copies (`gguf.scalar_metadata`), and holds it to
+the rules every start's planner holds the file to (`gguf::requireMetadata`):
+its sizes, RoPE base, dimensions and scaling, RMS epsilon, GDN sizes, FFN
+widths and experts. The target's text configuration is checked before its
+vision tower (a GGUF's projector, an MLX target's processor and the shards
+holding its tower) and the tower's configuration, so a model of no family
+Splash serves is told so whatever its tower, and the check runs again with the
+draft's `config.json` once the family's draft is chosen.
+A model the engine refuses is refused with its reason, and so is a GGUF with
+tensors of types the loader cannot read (`gguf.require_loadable`, [GGUF
+targets](#gguf-targets)); no weight file is downloaded for either. Tensor
+shapes, and an MLX vision tower's weights, which must not be quantized
+(`VisionLoader.cpp`), are checked only when the model loads.
+`families.FAMILIES` names the draft trained for each family; repository names
+and model-card `base_model` fields play no part. An MLX target must declare
+affine 4-bit, group-64 `quantization` in `config.json`, a MoE's router and
+shared-expert gate 8-bit. Every start checks the configuration again. Remote
+Python code is not loaded.
 
 ```bash
 splash serve --model mlx-community/Qwen3.6-35B-A3B-4bit
@@ -1052,16 +1069,16 @@ the parameters, `GgufFile` and the planner check the rest).
 ### Drafts
 
 Each family names the repository of the DFlash2 checkpoint trained for it
-(`Draft` in `families.FAMILIES`), which holds it as the release publishes it:
+(`families.FAMILIES`), which holds it as the release publishes it:
 `config.json` and BF16 `model.safetensors` (or the shards its index names).
 Installation downloads only those files and follows the repository's default
 branch as it follows the target's ([Revisions](#revisions)); `--draft-model`
 accepts another repository, followed the same way, or a local directory that
-holds them. A checkpoint is installed only when its configuration states the
-family's draft signature (`Draft.signature`), every field and value native
-loading requires, so a draft of another architecture never replaces one that
-loads. Native loading validates the configuration against the target and
-loads the draft like a target ([Weight loading](#weight-loading)):
+holds them. A checkpoint is installed only when the engine accepts its
+configuration with the target's (its `model-check`), so a draft of another
+architecture never replaces one that loads. Native loading validates the
+configuration against the target again and loads the draft like a target
+([Weight loading](#weight-loading)):
 `DraftCheckpointLoader` (`DraftCheckpoint.cpp`) plans the images of a Splash
 package's packed draft files, `layer-<N>.bin` and `model.bin`, and
 `AffinePreparation` quantizes each projection to 4 bits in groups of 64 as
@@ -1082,9 +1099,10 @@ GGUF's `clip.vision` metadata) must describe the one preprocessing Splash
 implements (`server/images.py`); it is checked before any weight download and
 not installed.
 
-Both sources are written into the packed `vision/model.bin` layout, which the
-one BF16 vision operator reads: BF16 tensors are copied, and F32 or F16 tensors
-are converted under the exact-BF16 rule of [weight loading](#weight-loading).
+Both sources are written into an image laid out as a package's
+`vision/model.bin`, which the one BF16 vision operator reads: BF16 tensors are
+copied, and F32 or F16 tensors are converted under the exact-BF16 rule of
+[weight loading](#weight-loading).
 Unsloth's mmproj stores its 1-D tensors, patch embedding and position table as
 F32, all of them BF16-exact, and loads byte-identical to the packed file.
 Quantized MLX towers, deepstack projectors and mmproj tensors the tower does not
@@ -1223,10 +1241,13 @@ the Hub. The result is an assembly, a local directory of links to the sources'
 Hub snapshots, published atomically. The other installer modules each own one
 part: `hub.py` the sources, the Hub cache and its pins; `assembly.py` the
 assembly layout, its build, verification and garbage collection, and the
-metadata derived from a GGUF; `families.py` the registry; `legacy.py` Splash
-packages; and `models.py` model IDs, selections, the installation lock and the
-command line (`install/models.py --model ID prepare|verify|link`, where `link`
-prints the selection link). The assembly's
+metadata derived from a GGUF; `families.py` each family's draft repository;
+`legacy.py` Splash packages; and `models.py` model IDs, selections, the
+installation lock, the command line (`install/models.py --model ID
+prepare|verify|link`, where `link` prints the selection link) and running the
+engine's checks. Since the installer checks a model with the engine, a source
+checkout builds the engine before it installs, as `make install` and the first
+`./splash serve` do, and a packaged install ships it. The assembly's
 `model.json` records the resolved sources and selected formats. The native
 loader reads it, and `splash serve`, `test-http-real` and the HTTP regression
 benchmark hold it while they run, so a concurrent installation cannot collect

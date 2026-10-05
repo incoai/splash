@@ -66,7 +66,9 @@ LIB := $(BUILD)/splash.metallib
 
 all: $(TARGET)
 
-install: model-selection platform-check
+# The installer checks a model's configuration with the engine (build/splash
+# model-check) before it downloads any weight.
+install: model-selection platform-check $(TARGET)
 	@/usr/bin/lockf -k "$(INSTALL_LOCK)" $(MAKE) --no-print-directory \
 		-f "$(SPLASH_MAKEFILE)" _install
 

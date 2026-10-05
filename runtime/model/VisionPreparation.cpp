@@ -44,7 +44,7 @@ struct Staging {
 };
 
 // The tasks that write a section in batches of whole rows converted to BF16.
-// The packed patch embedding orders a row [channel, frame, patch-row,
+// The image's patch embedding orders a row [channel, frame, patch-row,
 // patch-col]; MLX stores [frame, patch-row, patch-col, channel] and GGUF one
 // [channel, patch-row, patch-col] tensor per frame. Padded columns are zero;
 // padded rows are not written.

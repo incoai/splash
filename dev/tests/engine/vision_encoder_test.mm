@@ -13,8 +13,7 @@
 #include "TestChecks.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
-#include "model/ModelDescriptor.hpp"
-#include "model/QwenVision.hpp"
+#include "model/ModelFactory.hpp"
 #include "model/VisionLoader.hpp"
 #include "model/WeightImages.hpp"
 #include "ops/Vision.hpp"
@@ -161,16 +160,11 @@ int main(int argc, char **argv) {
       if (descriptor.visionSource == splash::model::VisionSource::None)
         throw std::runtime_error("the model has no vision role");
       MetalBackend backend(argv[1]);
-      const std::filesystem::path vision = std::filesystem::path(argv[2]) / "vision";
       splash::model::WeightImages images(backend, descriptor.sourceIdentity);
-      // A package's vision file is read as it is; an upstream source is
-      // written through its loader.
+      // The vision role as the model factory loads it.
+      const auto loader = splash::model::planVisionLoader(argv[2], descriptor);
       const splash::model::QwenVisionWeights model =
-          descriptor.visionSource == splash::model::VisionSource::Packed
-              ? splash::model::loadQwenVisionWeights(backend, images, vision, descriptor.vision)
-              : splash::model::loadQwenVisionWeights(
-                    backend, images,
-                    splash::model::VisionLoader(vision, descriptor.visionSource, descriptor.vision));
+          splash::model::loadVisionWeights(backend, images, argv[2], descriptor, loader.get());
       const std::string fixture = argv[3];
 
       ImageGrid grid;

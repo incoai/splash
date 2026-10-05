@@ -31,11 +31,8 @@ int main() {
   try {
     const splash::test::TemporaryDirectory directory("splash-affine-checkpoint");
     const std::filesystem::path &root = directory.path();
-    splash::test::writeFile(root / "config.json", R"({"quantization":{"bits":4,"group_size":64,"router":{"bits":8}}})");
     shard(root / "model.safetensors", valid);
     SafetensorsCheckpoint source(root);
-    source.requireQuantization("projection", 4);
-    source.requireQuantization("router", 8);
     require(source.require("a").shape == std::vector<uint64_t>({2, 2}), "shape changed");
     std::array<uint8_t, 4> data{};
     source.require("a").read(7, data);
@@ -43,8 +40,6 @@ int main() {
     rejects([&] { source.require("a").read(14, data); }, "source tensor read is out of bounds",
             "out-of-bounds read accepted");
     rejects([&] { (void)source.require("missing"); }, "missing source tensor: missing", "missing tensor accepted");
-    rejects([&] { source.requireQuantization("router", 4); }, "unsupported affine quantization for router",
-            "wrong quantization accepted");
     // Rewriting a shard in place, even with the same content, writes the
     // file the checkpoint holds.
     shard(root / "model.safetensors", valid);
@@ -72,7 +67,7 @@ int main() {
     shard(root / "model.safetensors", valid, 8);
     rejects([&] { SafetensorsCheckpoint invalid(root); }, "safetensors data range is invalid",
             "truncated tensor accepted");
-    std::cout << "affine checkpoint: bounded reads, metadata, quantization, written and malformed sources PASS\n";
+    std::cout << "affine checkpoint: bounded reads, metadata, written and malformed sources PASS\n";
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
     return 1;

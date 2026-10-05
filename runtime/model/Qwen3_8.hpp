@@ -8,6 +8,7 @@
 #include "metal/abi/RoPE.h"
 #include "ops/Linear.hpp"
 #include "ops/Normalization.hpp"
+#include "ops/Vision.hpp"
 
 #include <cstdint>
 #include <string_view>
@@ -15,11 +16,14 @@
 namespace splash::model {
 
 struct Qwen3_8Layout final : QwenHybridLayout<5> {
+  // The family's name, as the installer pairs its draft (install/families.py).
+  static constexpr std::string_view family = "Qwen3.8-27B";
   static constexpr std::string_view layerMagic = "MDFL0006";
   static constexpr std::string_view headMagic = "MDFL0002";
 
   constexpr Qwen3_8Layout()
-      : QwenHybridLayout{{.layers = 64,
+      : QwenHybridLayout{{.maximumContextTokens = 262'144,
+                          .layers = 64,
                           .hiddenSize = 5120,
                           .vocabularySize = 248320,
                           .packedGdnWidth = 16640,
@@ -56,6 +60,9 @@ inline constexpr DFlashDraftLayout kQwen3_8DraftLayout{.layers = 5,
                                                        .targetHiddenSize = 25600,
                                                        .selectorRank = SPLASH_DRAFT_SELECTOR_RANK,
                                                        .kvHeads = SPLASH_DRAFT_KV_HEADS};
+
+// The vision tower of Qwen3.8-27B, projecting into its hidden width.
+inline constexpr ops::VisionLayout kQwen3_8VisionLayout{.outputHiddenSize = Qwen3_8Layout{}.hiddenSize};
 
 struct Qwen3_8LayerWeights final {
   ops::NormWeights inputNorm;

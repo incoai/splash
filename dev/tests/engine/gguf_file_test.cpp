@@ -53,7 +53,8 @@ int main() {
                                              {{"weight", {256, 1}, kQ4_K, gguf::Bytes(kQ4KBlockBytes)}}));
     splash::model::WeightSource source(path);
     splash::model::GgufFile valid(source);
-    require(valid.architecture() == "fixture" && valid.unsignedValue("fixture.block_count") == 2,
+    const splash::model::GgufMetadata &metadata = valid.metadata();
+    require(metadata.architecture() == "fixture" && metadata.unsignedValue("fixture.block_count") == 2,
             "metadata values changed");
     const auto &weight = valid.require("weight");
     require(weight.bytes == kQ4KBlockBytes && weight.elements() == 256 && weight.rows() == 1,

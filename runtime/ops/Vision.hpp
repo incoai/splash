@@ -8,6 +8,10 @@
 
 namespace splash::ops {
 
+// A vision tower's geometry. The defaults are the one tower the kernels are
+// specialized for, Qwen3.5's 27 blocks; outputHiddenSize, the width of the
+// text model its merger projects into, is each family's, stated beside its
+// target (Qwen3_8.hpp, Qwen3_6Moe.hpp).
 struct VisionLayout final {
   uint32_t depth = 27;
   uint32_t hiddenSize = 1152;
@@ -15,7 +19,7 @@ struct VisionLayout final {
   uint32_t intermediateSize = 4304;
   uint32_t paddedIntermediateSize = 4352;
   uint32_t mergedHiddenSize = 4608;
-  uint32_t outputHiddenSize = 5120;
+  uint32_t outputHiddenSize = 0;
   uint32_t heads = 16;
   uint32_t headDimension = 72;
   uint32_t positionGridSide = 48;

@@ -88,7 +88,8 @@ void bindCheckpoint(const SafetensorsCheckpoint &checkpoint, const ops::VisionLa
 // The metadata of a clip qwen3vl_merger mmproj of this layout, with no
 // deepstack block.
 void requireMmprojMetadata(const GgufFile &gguf, const ops::VisionLayout &layout) {
-  if (gguf.architecture() != "clip" || gguf.stringValue("clip.projector_type") != "qwen3vl_merger")
+  const GgufMetadata &metadata = gguf.metadata();
+  if (metadata.architecture() != "clip" || metadata.stringValue("clip.projector_type") != "qwen3vl_merger")
     throw WeightStoreError("unsupported vision GGUF architecture");
   for (const auto &[key, expected] : std::initializer_list<std::pair<const char *, uint64_t>>{
            {"clip.vision.projection_dim", layout.outputHiddenSize},
@@ -99,8 +100,8 @@ void requireMmprojMetadata(const GgufFile &gguf, const ops::VisionLayout &layout
            {"clip.vision.attention.head_count", layout.heads},
            {"clip.vision.spatial_merge_size", layout.spatialMerge},
            {"clip.use_gelu", 1}})
-    if (gguf.unsignedValue(key) != expected) throw WeightStoreError(std::string("vision metadata mismatch: ") + key);
-  const auto epsilon = gguf.floatValue("clip.vision.attention.layer_norm_epsilon");
+    if (metadata.unsignedValue(key) != expected) throw WeightStoreError(std::string("vision metadata mismatch: ") + key);
+  const auto epsilon = metadata.floatValue("clip.vision.attention.layer_norm_epsilon");
   if (!epsilon || !std::isfinite(*epsilon) || std::abs(*epsilon - SPLASH_VISION_NORM_EPSILON) > 1e-12)
     throw WeightStoreError("vision LayerNorm epsilon mismatch");
   for (const char *key : {"clip.vision.image_mean", "clip.vision.image_std"}) {
@@ -173,7 +174,7 @@ VisionLoader::VisionLoader(const std::filesystem::path &directory, VisionSource 
     planned->mmproj = std::make_unique<WeightSource>(directory / "mmproj.gguf");
     bindMmproj(GgufFile(*planned->mmproj), layout, planned->plan);
   } else {
-    throw WeightStoreError("only MLX and GGUF vision sources are written into the packed layout");
+    throw WeightStoreError("only MLX and GGUF vision sources are written into images");
   }
   planned_ = std::move(planned);
 }
@@ -192,8 +193,8 @@ ImagePlan VisionLoader::image() const {
 
 uint64_t visionImageBytes(const ops::VisionLayout &layout) { return plan(layout).bytes; }
 
-// The writer relies on the packed patch width and on padding that only adds
-// rows or columns.
+// The writer relies on the patch embedding's width, two frames of RGB
+// patches, and on padding that only adds rows or columns.
 void requireVisionLayout(const ops::VisionLayout &layout) {
   if (!layout.depth || !layout.hiddenSize || !layout.patchDimension || !layout.intermediateSize ||
       !layout.paddedIntermediateSize || !layout.mergedHiddenSize || !layout.outputHiddenSize || !layout.heads ||

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import math
 import struct
 from pathlib import Path
 
@@ -305,11 +306,6 @@ def model_config(metadata, vision=None):
         model_type=TEXT_MODEL_TYPES[arch],
         vocab_size=len(metadata.require("tokenizer.ggml.tokens", list)),
     )
-    if arch == "qwen35moe":
-        text.update(
-            num_experts=metadata.positive(arch + ".expert_count"),
-            num_experts_per_tok=metadata.positive(arch + ".expert_used_count"),
-        )
     config = {
         "model_type": TEXT_MODEL_TYPES[arch].removesuffix("_text"),
         "text_config": text,
@@ -317,6 +313,25 @@ def model_config(metadata, vision=None):
     if vision is not None:
         config["vision_config"] = vision_config(vision)
     return config
+
+
+def scalar_metadata(metadata):
+    """The header's scalar values as the native reader keeps them, for the
+    engine's model check, which holds them to the rules its GGUF planner
+    holds the file to at every start (GgufMetadata in
+    runtime/model/GgufFile.hpp): integers and booleans unsigned, a negative
+    one as its 64-bit two's complement, floats and strings, each kind apart,
+    as JSON alone would not keep them. JSON has no NaN or infinity, which no
+    rule accepts."""
+    typed = {"unsigned": {}, "float": {}, "string": {}}
+    for key, value in metadata.values.items():
+        if isinstance(value, int):
+            typed["unsigned"][key] = value % (1 << 64)
+        elif isinstance(value, float) and math.isfinite(value):
+            typed["float"][key] = value
+        elif isinstance(value, str):
+            typed["string"][key] = value
+    return typed
 
 
 def loaded_layers(metadata, arch):

@@ -23,13 +23,20 @@ from dev.tests.installer_fixtures import (
     cached_snapshot,
     draft_dir,
     fake_hub,
+    family_config,
     http_error,
     mlx_target,
     pins,
     selection,
-    text_config,
 )
-from install import assembly, families, hub, legacy, models, upstream
+from install import assembly, families, hub, legacy, models, paths, upstream
+
+# The engine's refusal of a model of no family Splash serves, naming what
+# tells it apart.
+UNSUPPORTED = (
+    "no supported model has this architecture [(]{}[)]; "
+    "supported: Qwen3.8-27B, Qwen3.6-35B-A3B"
+)
 
 
 class UpstreamTest(unittest.TestCase):
@@ -50,36 +57,85 @@ class UpstreamTest(unittest.TestCase):
         return output.getvalue(), warnings.getvalue()
 
     def test_every_family_names_its_own_draft_repository(self):
-        repos = [family.draft.repo for family in families.FAMILIES]
+        repos = [family.draft_repo for family in families.FAMILIES]
         for repo in repos:
             with self.subTest(repo=repo):
                 self.assertEqual(models.validate_repo_id(repo), repo)
         self.assertEqual(len(set(repos)), len(repos))
 
     def test_family_is_identified_by_architecture_not_name(self):
+        # The engine's check (its model-check command), with and without the
+        # draft.
         for family in families.FAMILIES:
-            self.assertIs(
-                families.family_for({"text_config": text_config(family)}), family
-            )
-        # A differing field is another architecture, whatever the repository is called.
-        for changes in (
-            {"num_hidden_layers": 48},
-            {"max_position_embeddings": 131072},
-            {"vocab_size": 151936},
-            {"head_dim": 128},
-            {"model_type": "qwen3_moe"},
-            {"num_experts": 128},
+            config = mlx_target(self.root / family.name, family) / "config.json"
+            draft = draft_dir(self.root / family.name / "draft", family)
+            for arguments in ({}, {"draft": draft / "config.json"}):
+                self.assertIs(
+                    upstream.check_model(
+                        "mlx-affine", "safetensors", config, **arguments
+                    ),
+                    family,
+                )
+        # A differing size or model type is another model, whatever the
+        # repository is called; the engine names it. A field a family's
+        # fine-tune could change is refused as a mismatch.
+        for changes, refusal in (
+            (
+                {"num_hidden_layers": 48},
+                UNSUPPORTED.format(
+                    "text config num_hidden_layers: MLX 48, Qwen3.8-27B 64"
+                ),
+            ),
+            (
+                {"max_position_embeddings": 131072},
+                UNSUPPORTED.format(
+                    "text config max_position_embeddings: MLX 131072, "
+                    "Qwen3.8-27B 262144"
+                ),
+            ),
+            (
+                {"vocab_size": 151936},
+                UNSUPPORTED.format(
+                    "text config vocab_size: MLX 151936, Qwen3.8-27B 248320"
+                ),
+            ),
+            (
+                {"head_dim": 128},
+                UNSUPPORTED.format("text config head_dim: MLX 128, Qwen3.8-27B 256"),
+            ),
+            (
+                {"model_type": "qwen3_moe"},
+                UNSUPPORTED.format("text model type qwen3_moe"),
+            ),
+            ({"num_experts": 128}, "num_experts mismatch: MLX 128, runtime 256"),
         ):
+            family = MOE if "num_experts" in changes else DENSE
+            root = mlx_target(self.root / "changed", family, changes=changes)
             with (
                 self.subTest(changes=changes),
-                self.assertRaisesRegex(
-                    models.ModelError, "no supported model has this architecture"
-                ),
+                self.assertRaisesRegex(models.ModelError, refusal),
             ):
-                family = MOE if "num_experts" in changes else DENSE
-                families.family_for({"text_config": text_config(family, **changes)})
-        with self.assertRaises(models.ModelError):
-            families.family_for({"hidden_size": 5120})
+                upstream.check_model("mlx-affine", "none", root / "config.json")
+        (self.root / "changed/config.json").write_text(
+            json.dumps({"hidden_size": 5120})
+        )
+        with self.assertRaisesRegex(
+            models.ModelError, UNSUPPORTED.format("its config has no text_config")
+        ):
+            upstream.check_model(
+                "mlx-affine", "none", self.root / "changed/config.json"
+            )
+
+    def test_a_family_without_a_known_draft_is_refused(self):
+        config = mlx_target(self.root / "target", MOE) / "config.json"
+        with (
+            mock.patch.object(families, "FAMILIES", (DENSE,)),
+            self.assertRaisesRegex(
+                models.ModelError,
+                "no DFlash2 draft is known for the Qwen3.6-35B-A3B family",
+            ),
+        ):
+            upstream.check_model("mlx-affine", "none", config)
 
     def test_gguf_selection_is_exact_and_ignores_subfolders(self):
         files = {
@@ -141,16 +197,47 @@ class UpstreamTest(unittest.TestCase):
                 upstream.select_gguf({"Qwen3.8-27B-Q4_K_M.GGUF"}, variant)
 
     def test_architecture_is_checked_before_weight_downloads(self):
+        # Another architecture, and fine-tunes of a supported one the engine
+        # refuses at every start, such as one that ropes with YaRN, named by
+        # the older `type` key.
+        rope = family_config(DENSE)["text_config"]["rope_parameters"]
+        del rope["rope_type"]
         fake = FakeHub(self, self.cache)
-        fake.publish(
-            "someone/renamed-27b",
-            "a" * 40,
-            lambda p: mlx_target(p, DENSE, changes={"num_hidden_layers": 48}),
-        )
-        with self.assertRaisesRegex(models.ModelError, "no supported model"):
-            self.prepare(selection(self.root, "someone/renamed-27b"))
-        self.assertEqual(fake.requests, [("someone/renamed-27b", None)])
-        self.assertEqual(fake.downloads, ["someone/renamed-27b/config.json"])
+        for index, (changes, refusal) in enumerate(
+            (
+                (
+                    {"num_hidden_layers": 48},
+                    UNSUPPORTED.format(
+                        "text config num_hidden_layers: MLX 48, Qwen3.8-27B 64"
+                    ),
+                ),
+                (
+                    {"rms_norm_eps": 1e-5},
+                    "text config rms_norm_eps mismatch: MLX 1e-05, runtime 1e-06",
+                ),
+                (
+                    {"tie_word_embeddings": True},
+                    "text config tie_word_embeddings must be false",
+                ),
+                (
+                    {"rope_parameters": rope | {"type": "yarn"}},
+                    "text config rope_parameters type mismatch: MLX yarn, "
+                    "runtime default",
+                ),
+            )
+        ):
+            model = f"someone/fine-tune-{index}"
+            fake.publish(
+                model, "a" * 40, lambda p: mlx_target(p, DENSE, changes=changes)
+            )
+            fake.requests.clear(), fake.downloads.clear()
+            with (
+                self.subTest(changes=changes),
+                self.assertRaisesRegex(models.ModelError, refusal),
+            ):
+                self.prepare(selection(self.root, model))
+            self.assertEqual(fake.requests, [(model, None)])
+            self.assertEqual(fake.downloads, [f"{model}/config.json"])
 
     def test_only_a_splash_manifest_makes_a_legacy_package(self):
         def target(root):
@@ -209,13 +296,18 @@ class UpstreamTest(unittest.TestCase):
             def build(root):
                 mlx_target(root, DENSE)
                 config = json.loads((root / "config.json").read_text())
-                del config["quantization"]
+                del config["quantization"], config["quantization_config"]
                 (root / "config.json").write_text(json.dumps(config | quantization))
 
             return build
 
         fake = fake_hub(self, self.cache)
-        for name, quantization in (
+        first = "quantization language_model.model.layers.0.linear_attn.in_proj_qkv"
+        required = (
+            "this model requires an MLX affine 4-bit/group-64 checkpoint or a "
+            "supported GGUF"
+        )
+        for name, quantization, refusal in (
             # A transformers quantization_config alone is another method.
             (
                 "gptq",
@@ -226,6 +318,7 @@ class UpstreamTest(unittest.TestCase):
                         "group_size": 64,
                     }
                 },
+                required,
             ),
             (
                 "awq",
@@ -236,25 +329,133 @@ class UpstreamTest(unittest.TestCase):
                         "group_size": 64,
                     }
                 },
+                required,
             ),
-            ("mxfp4", {"quantization": {"mode": "mxfp4", "bits": 4, "group_size": 64}}),
-            ("q8", {"quantization": {"bits": 8, "group_size": 64}}),
+            (
+                "mxfp4",
+                {"quantization": {"mode": "mxfp4", "bits": 4, "group_size": 64}},
+                first + " mode must be affine",
+            ),
+            (
+                "q8",
+                {"quantization": {"bits": 8, "group_size": 64}},
+                first + " bits mismatch: MLX 8, runtime 4",
+            ),
         ):
             with self.subTest(name=name):
                 fake.publish(f"someone/{name}", "b" * 40, target(quantization))
-                with self.assertRaisesRegex(
-                    models.ModelError, "requires an MLX affine 4-bit/group-64"
-                ):
+                with self.assertRaisesRegex(models.ModelError, refusal):
                     self.prepare(selection(self.root, f"someone/{name}"))
         # MLX writes both keys, and states the mode only in newer versions.
-        affine = {"bits": 4, "group_size": 64, "mode": "affine"}
-        fake.publish(
-            "someone/mlx",
-            "c" * 40,
-            target({"quantization": affine, "quantization_config": affine}),
+        for name, affine in (
+            ("mlx", {"bits": 4, "group_size": 64, "mode": "affine"}),
+            ("older-mlx", {"bits": 4, "group_size": 64}),
+        ):
+            fake.publish(
+                f"someone/{name}",
+                "c" * 40,
+                target({"quantization": affine, "quantization_config": affine}),
+            )
+            self.prepare(selection(self.root, f"someone/{name}"))
+            assembly.verify(selection(self.root, f"someone/{name}").link)
+
+    def test_a_model_splash_cannot_serve_is_refused_before_its_vision_tower(self):
+        # With vision or without, a BF16 release as transformers saves it,
+        # its tower named model.visual.*, and a model of another size with an
+        # MLX tower, as Qwen3.5-4B is, are refused for what they are, before
+        # anything but config.json is fetched.
+        def tower(root, prefix):
+            (root / "model.safetensors").unlink()
+            shards = {
+                prefix + "blocks.0.attn.qkv.weight": "model-00001-of-00002.safetensors",
+                "lm_head.weight": "model-00002-of-00002.safetensors",
+            }
+            (root / "model.safetensors.index.json").write_text(
+                json.dumps({"weight_map": shards})
+            )
+            for name in set(shards.values()):
+                (root / name).write_text(name)
+            (root / "preprocessor_config.json").write_text(json.dumps(PROCESSOR))
+
+        def transformers_release(root):
+            mlx_target(root, DENSE)
+            config = json.loads((root / "config.json").read_text())
+            del config["quantization"], config["quantization_config"]
+            (root / "config.json").write_text(json.dumps(config))
+            tower(root, "model.visual.")
+
+        def other_size(root):
+            mlx_target(root, DENSE, changes={"hidden_size": 2560})
+            tower(root, "vision_tower.")
+
+        fake = FakeHub(self, self.cache)
+        for model, build, refusal in (
+            (
+                "Qwen/Qwen3.8-27B",
+                transformers_release,
+                "this model requires an MLX affine 4-bit/group-64 checkpoint or a "
+                "supported GGUF",
+            ),
+            (
+                "mlx-community/Qwen3.5-4B-MLX-4bit",
+                other_size,
+                UNSUPPORTED.format(
+                    "text config hidden_size: MLX 2560, Qwen3.8-27B 5120"
+                ),
+            ),
+        ):
+            fake.publish(model, "a" * 40, build)
+            fake.downloads.clear()
+            with self.subTest(model=model):
+                for language_only in (False, True):
+                    with self.assertRaisesRegex(models.ModelError, refusal):
+                        self.prepare(
+                            selection(self.root, model, language_only=language_only)
+                        )
+                self.assertEqual(fake.downloads, [f"{model}/config.json"])
+
+    def test_an_engine_that_cannot_check_a_model_is_named(self):
+        # install/models.py prepare, run by hand, may find no engine, or one
+        # built before the check it runs, which refuses the command line as
+        # it does any it does not take (EX_USAGE).
+        fake_hub(self, self.cache)
+        missing, stale = self.root / "missing/splash", self.root / "stale/splash"
+        stale.parent.mkdir()
+        stale.write_text(
+            "#!/bin/sh\n"
+            "echo 'error: expected the serve-native command' >&2\n"
+            'echo "usage: $0 serve-native MODEL_DIRECTORY" >&2\n'
+            "exit 64\n"
         )
-        self.prepare(selection(self.root, "someone/mlx"))
-        assembly.verify(selection(self.root, "someone/mlx").link)
+        stale.chmod(0o755)
+        for engine, packaged, refusal in (
+            (
+                missing,
+                False,
+                f"cannot run the engine {missing} (No such file or directory); "
+                "rebuild it with make",
+            ),
+            (
+                missing,
+                True,
+                f"cannot run the engine {missing} (No such file or directory); "
+                "reinstall Splash",
+            ),
+            (
+                stale,
+                False,
+                f"the engine {stale} does not know this model check; "
+                "rebuild it with make",
+            ),
+        ):
+            with self.subTest(engine=engine.parent.name, packaged=packaged):
+                with (
+                    mock.patch.object(paths, "BINARY", engine),
+                    mock.patch.object(paths, "PACKAGED", packaged),
+                    self.assertRaises(models.ModelError) as refused,
+                ):
+                    self.prepare(selection(self.root))
+                self.assertEqual(str(refused.exception), refusal)
 
     def test_missing_metadata_never_falls_back_to_another_repository(self):
         required = (
@@ -297,7 +498,7 @@ class UpstreamTest(unittest.TestCase):
         fake.publish(
             "someone/my-favourite-model", "a" * 40, lambda p: mlx_target(p, MOE)
         )
-        fake.publish(MOE.draft.repo, DRAFT_COMMIT, lambda p: draft_dir(p, MOE))
+        fake.publish(MOE.draft_repo, DRAFT_COMMIT, lambda p: draft_dir(p, MOE))
         # The name says nothing about the model; the configuration does.
         chosen = selection(self.root, "someone/my-favourite-model")
         self.prepare(chosen)
@@ -305,7 +506,7 @@ class UpstreamTest(unittest.TestCase):
             fake.requests,
             [
                 ("someone/my-favourite-model", None),
-                (MOE.draft.repo, None),
+                (MOE.draft_repo, None),
             ],
         )
         record = assembly.verify(chosen.link)
@@ -314,7 +515,7 @@ class UpstreamTest(unittest.TestCase):
             record["sources"],
             {
                 "target": {"repo": chosen.model, "revision": "a" * 40},
-                "draft": {"repo": MOE.draft.repo, "revision": DRAFT_COMMIT},
+                "draft": {"repo": MOE.draft_repo, "revision": DRAFT_COMMIT},
             },
         )
         self.assertEqual(record["vision_format"], "none")
@@ -366,13 +567,27 @@ class UpstreamTest(unittest.TestCase):
             sorted(p.name for p in (chosen.link / "target").iterdir()),
             ["config.json", *sorted(set(shards.values()))],
         )
-        # A checkpoint without the tower cannot serve images.
+        # A checkpoint without the tower cannot serve images, nor can a
+        # text-only conversion that keeps the processor but drops the tower's
+        # configuration too: its text configuration is checked first.
         del shards["vision_tower.blocks.0.attn.qkv.weight"]
         fake.publish("someone/text-model", "b" * 40, target)
-        with self.assertRaisesRegex(models.ModelError, "no vision tower"):
-            self.prepare(
-                selection(self.root, "someone/text-model", language_only=False)
-            )
+
+        def text_conversion(root):
+            target(root)
+            config = json.loads((root / "config.json").read_text())
+            del config["vision_config"]
+            (root / "config.json").write_text(json.dumps(config))
+
+        fake.publish("someone/text-conversion", "c" * 40, text_conversion)
+        for model in ("someone/text-model", "someone/text-conversion"):
+            with (
+                self.subTest(model=model),
+                self.assertRaisesRegex(
+                    models.ModelError, "no vision tower; use --language-only"
+                ),
+            ):
+                self.prepare(selection(self.root, model, language_only=False))
 
     def test_a_shard_name_read_as_a_glob_is_never_downloaded(self):
         def target(root):
@@ -447,7 +662,7 @@ class UpstreamTest(unittest.TestCase):
         self.prepare(chosen)
         fake.requests.clear(), fake.downloads.clear()
         output, _ = self.prepare(chosen)
-        self.assertEqual(fake.requests, [(MODEL, None), (DENSE.draft.repo, None)])
+        self.assertEqual(fake.requests, [(MODEL, None), (DENSE.draft_repo, None)])
         self.assertEqual(fake.downloads, [])
         self.assertIn("is already installed", output)
 
@@ -472,8 +687,8 @@ class UpstreamTest(unittest.TestCase):
         self.assertEqual(
             assembly.verify(chosen.link)["sources"]["target"]["revision"], "b" * 40
         )
-        self.assertEqual(fake.requests, [(MODEL, None), (DENSE.draft.repo, None)])
-        self.assertNotIn(f"{DENSE.draft.repo}/model.safetensors", fake.downloads)
+        self.assertEqual(fake.requests, [(MODEL, None), (DENSE.draft_repo, None)])
+        self.assertNotIn(f"{DENSE.draft_repo}/model.safetensors", fake.downloads)
         self.assertEqual(pins(self.cache), sorted(["b" * 40, DRAFT_COMMIT]))
 
     def test_publishing_removes_what_no_installation_uses(self):
@@ -573,7 +788,9 @@ class UpstreamTest(unittest.TestCase):
         _, warnings = self.prepare(chosen)
         self.assertIn(
             f"Warning: keeping the installed {MODEL}@{'a' * 12}; cannot install "
-            f"{MODEL}@{'b' * 40}: no supported model has this architecture",
+            f"{MODEL}@{'b' * 40}: no supported model has this architecture (text "
+            "config head_dim: MLX 128, Qwen3.8-27B 256); supported: Qwen3.8-27B, "
+            "Qwen3.6-35B-A3B",
             warnings,
         )
         self.assertEqual(chosen.link.resolve(), installed)
@@ -600,51 +817,49 @@ class UpstreamTest(unittest.TestCase):
         fake = fake_hub(self, self.cache)
         chosen = selection(self.root)
         self.prepare(chosen)
-        fake.publish(DENSE.draft.repo, "e" * 40, lambda p: draft_dir(p, DENSE))
+        fake.publish(DENSE.draft_repo, "e" * 40, lambda p: draft_dir(p, DENSE))
         fake.requests.clear(), fake.downloads.clear()
         output, _ = self.prepare(chosen)
         self.assertIn(
-            f"{DENSE.draft.repo} moved from {DRAFT_COMMIT[:12]} to {'e' * 12}", output
+            f"{DENSE.draft_repo} moved from {DRAFT_COMMIT[:12]} to {'e' * 12}", output
         )
         self.assertEqual(
             assembly.verify(chosen.link)["sources"],
             {
                 "target": {"repo": MODEL, "revision": "a" * 40},
-                "draft": {"repo": DENSE.draft.repo, "revision": "e" * 40},
+                "draft": {"repo": DENSE.draft_repo, "revision": "e" * 40},
             },
         )
         # Only the new draft is fetched; the target is not downloaded again.
-        self.assertEqual(fake.requests, [(MODEL, None), (DENSE.draft.repo, None)])
+        self.assertEqual(fake.requests, [(MODEL, None), (DENSE.draft_repo, None)])
         self.assertTrue(
-            all(name.startswith(DENSE.draft.repo + "/") for name in fake.downloads)
+            all(name.startswith(DENSE.draft_repo + "/") for name in fake.downloads)
         )
         self.assertEqual(pins(self.cache), sorted(["a" * 40, "e" * 40]))
 
     def test_an_installation_of_another_draft_repository_moves_to_the_familys(self):
         fake = fake_hub(self, self.cache)
         chosen = selection(self.root)
-        other = dataclasses.replace(
-            DENSE, draft=dataclasses.replace(DENSE.draft, repo="someone/other-draft")
-        )
-        fake.publish(other.draft.repo, "c" * 40, lambda p: draft_dir(p, DENSE))
+        other = dataclasses.replace(DENSE, draft_repo="someone/other-draft")
+        fake.publish(other.draft_repo, "c" * 40, lambda p: draft_dir(p, DENSE))
         with mock.patch.object(families, "FAMILIES", (other, MOE)):
             self.prepare(chosen)
         # Another installation pins the same draft.
         hub.pin(
-            fake.snapshot(other.draft.repo, "c" * 40),
-            other.draft.repo,
+            fake.snapshot(other.draft_repo, "c" * 40),
+            other.draft_repo,
             chosen.models_root / "someone/other",
         )
         fake.requests.clear()
         output, _ = self.prepare(chosen)
         self.assertIn(
-            f"its draft is now {DENSE.draft.repo}@{DRAFT_COMMIT[:12]}", output
+            f"its draft is now {DENSE.draft_repo}@{DRAFT_COMMIT[:12]}", output
         )
         self.assertEqual(
             assembly.verify(chosen.link)["sources"]["draft"],
-            {"repo": DENSE.draft.repo, "revision": DRAFT_COMMIT},
+            {"repo": DENSE.draft_repo, "revision": DRAFT_COMMIT},
         )
-        self.assertEqual(fake.requests, [(MODEL, None), (DENSE.draft.repo, None)])
+        self.assertEqual(fake.requests, [(MODEL, None), (DENSE.draft_repo, None)])
         # Its pin of the repository it no longer links is retired too; the
         # other installation's pin stays.
         self.assertEqual(pins(self.cache), sorted(["a" * 40, "c" * 40, DRAFT_COMMIT]))
@@ -654,12 +869,12 @@ class UpstreamTest(unittest.TestCase):
         chosen = selection(self.root)
         self.prepare(chosen)
         # The draft's main names a commit the Hub cannot serve.
-        fake.branches[DENSE.draft.repo, "main"] = "f" * 40
+        fake.branches[DENSE.draft_repo, "main"] = "f" * 40
         fake.downloads.clear()
         output, _ = self.prepare(chosen)
         self.assertIn("Could not reach the Hub (404 Client Error", output)
         self.assertIn(
-            f"using the installed draft {DENSE.draft.repo}@{DRAFT_COMMIT[:12]}.", output
+            f"using the installed draft {DENSE.draft_repo}@{DRAFT_COMMIT[:12]}.", output
         )
         self.assertIn("is already installed", output)
         self.assertEqual(
@@ -676,7 +891,7 @@ class UpstreamTest(unittest.TestCase):
         chosen = selection(self.root)
         self.prepare(chosen)
         fake.publish(MODEL, "b" * 40, lambda p: mlx_target(p, DENSE))
-        fake.publish(DENSE.draft.repo, "e" * 40, build_draft)
+        fake.publish(DENSE.draft_repo, "e" * 40, build_draft)
         fetch = fake.fetch
 
         def fetch_or_fail(repo_id, name, revision):
@@ -691,7 +906,7 @@ class UpstreamTest(unittest.TestCase):
             assembly.verify(chosen.link)["sources"],
             {
                 "target": {"repo": MODEL, "revision": "b" * 40},
-                "draft": {"repo": DENSE.draft.repo, "revision": DRAFT_COMMIT},
+                "draft": {"repo": DENSE.draft_repo, "revision": DRAFT_COMMIT},
             },
         )
         self.assertEqual(pins(self.cache), sorted(["b" * 40, DRAFT_COMMIT]))
@@ -702,7 +917,7 @@ class UpstreamTest(unittest.TestCase):
             lambda p: draft_dir(p, DENSE), failing_revision="e" * 40
         )
         self.assertIn(
-            f"Warning: cannot use the {DENSE.name} draft {DENSE.draft.repo}@"
+            f"Warning: cannot use the {DENSE.name} draft {DENSE.draft_repo}@"
             f"{'e' * 12}; keeping the installed one: cannot fetch the {DENSE.name} "
             f"draft: [Errno {errno.ECONNRESET}] connection reset by peer",
             warnings,
@@ -715,8 +930,8 @@ class UpstreamTest(unittest.TestCase):
 
         warnings = self.move_target_and_draft(incomplete)
         self.assertIn(
-            f"Warning: cannot use the {DENSE.name} draft {DENSE.draft.repo}@"
-            f"{'e' * 12}; keeping the installed one: {DENSE.draft.repo} does not "
+            f"Warning: cannot use the {DENSE.name} draft {DENSE.draft_repo}@"
+            f"{'e' * 12}; keeping the installed one: {DENSE.draft_repo} does not "
             f"contain a DFlash2 checkpoint for {DENSE.name}",
             warnings,
         )
@@ -726,10 +941,32 @@ class UpstreamTest(unittest.TestCase):
             lambda p: draft_dir(p, DENSE, **{"dflash_config.block_size": 16})
         )
         self.assertIn(
-            f"Warning: cannot use the {DENSE.name} draft {DENSE.draft.repo}@"
+            f"Warning: cannot use the {DENSE.name} draft {DENSE.draft_repo}@"
             f"{'e' * 12}; keeping the installed one: draft configuration is "
-            f"incompatible with {DENSE.name}: dflash_config.block_size 16, not 8",
+            f"incompatible with {DENSE.name}: draft config dflash_config block_size "
+            "mismatch: checkpoint 16, runtime 8",
             warnings,
+        )
+
+    def test_a_draft_the_engine_refuses_is_never_downloaded(self):
+        # JSON's true equals 1, the first layer this draft reads, in Python;
+        # the engine takes no boolean for a number.
+        layers = [True, 6, 11, 16, 22, 27, 32, 37]
+        fake = FakeHub(self, self.cache)
+        fake.publish(MODEL, "a" * 40, lambda p: mlx_target(p, MOE))
+        fake.publish(
+            MOE.draft_repo,
+            DRAFT_COMMIT,
+            lambda p: draft_dir(p, MOE, **{"dflash_config.target_layer_ids": layers}),
+        )
+        with self.assertRaisesRegex(
+            models.ModelError,
+            f"draft configuration is incompatible with {MOE.name}: draft config "
+            "target_layer_ids 0 must be a number",
+        ):
+            self.prepare(selection(self.root))
+        self.assertEqual(
+            fake.downloads, [f"{MODEL}/config.json", f"{MOE.draft_repo}/config.json"]
         )
 
     def test_a_moved_hub_cache_starts_the_installation_it_links(self):
@@ -748,7 +985,7 @@ class UpstreamTest(unittest.TestCase):
             (
                 "the Hub answers",
                 lambda: self.prepare(chosen),
-                [(MODEL, None), (DENSE.draft.repo, None)],
+                [(MODEL, None), (DENSE.draft_repo, None)],
             ),
             ("a commit revision", lambda: self.prepare(pinned), []),
             ("offline", lambda: self.prepare(chosen), []),
@@ -796,13 +1033,13 @@ class UpstreamTest(unittest.TestCase):
         installed = chosen.link.resolve()
         moved = self.root / "moved"
         moved.mkdir()
-        fake.publish(DENSE.draft.repo, "e" * 40, lambda p: draft_dir(p, DENSE))
+        fake.publish(DENSE.draft_repo, "e" * 40, lambda p: draft_dir(p, DENSE))
         fake.downloads.clear()
         with mock.patch("huggingface_hub.constants.HF_HUB_CACHE", str(moved)):
             _, warnings = self.prepare(chosen)
         self.assertIn(
             f"Warning: keeping the installed {MODEL}@{'a' * 12}; cannot update it "
-            f"({DENSE.draft.repo} moved from {DRAFT_COMMIT[:12]} to {'e' * 12}): "
+            f"({DENSE.draft_repo} moved from {DRAFT_COMMIT[:12]} to {'e' * 12}): "
             f"the Hub cache has no snapshot {'a' * 40} of {MODEL}",
             warnings,
         )
@@ -812,11 +1049,12 @@ class UpstreamTest(unittest.TestCase):
 
     def test_an_incompatible_draft_is_an_error_not_a_crash(self):
         fake_hub(self, self.cache)
-        local = draft_dir(self.root / "draft", DENSE)
-        config = json.loads((local / "config.json").read_text())
-        layers = {"num_hidden_layers": DENSE.draft.layers + 1}
-        (local / "config.json").write_text(json.dumps(config | layers))
-        with self.assertRaisesRegex(models.ModelError, "draft configuration"):
+        local = draft_dir(self.root / "draft", DENSE, num_hidden_layers=6)
+        with self.assertRaisesRegex(
+            models.ModelError,
+            "draft configuration is incompatible with Qwen3.8-27B: draft config "
+            "num_hidden_layers mismatch: checkpoint 6, runtime 5",
+        ):
             self.prepare(selection(self.root, draft_model=str(local)))
 
     def test_hub_snapshots_are_pinned_and_old_pins_retired(self):
@@ -832,7 +1070,7 @@ class UpstreamTest(unittest.TestCase):
             )
             self.assertEqual([ref.name for ref in refs], [commit])
             draft_refs = sorted(
-                (self.cache / hub.folder_name(DENSE.draft.repo) / "refs/splash").glob(
+                (self.cache / hub.folder_name(DENSE.draft_repo) / "refs/splash").glob(
                     "*/*"
                 )
             )
@@ -906,7 +1144,7 @@ class UpstreamTest(unittest.TestCase):
         self.assertEqual(fake.requests, [(MODEL, None)])
         self.assertEqual(
             assembly.verify(chosen.link)["sources"]["draft"],
-            {"repo": DENSE.draft.repo, "revision": DRAFT_COMMIT},
+            {"repo": DENSE.draft_repo, "revision": DRAFT_COMMIT},
         )
 
     def test_damaged_assembly_is_rebuilt(self):
@@ -1069,7 +1307,7 @@ class UpstreamTest(unittest.TestCase):
             # which no installation of it records.
             with self.assertRaisesRegex(
                 models.ModelError,
-                f"cannot resolve {DENSE.draft.repo}: HF_HUB_OFFLINE is set",
+                f"cannot resolve {DENSE.draft_repo}: HF_HUB_OFFLINE is set",
             ):
                 self.prepare(selection(self.root, revision="a" * 40))
             with self.assertRaisesRegex(

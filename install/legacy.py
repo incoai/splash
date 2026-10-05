@@ -12,7 +12,7 @@ from __future__ import annotations
 from pathlib import Path, PurePosixPath
 from typing import NamedTuple
 
-from . import families, hub, models
+from . import hub, models
 
 ALIGNMENT = 16384
 # The tokenizer/ files a package ships.
@@ -28,18 +28,21 @@ PACKAGE_TOKENIZER_FILES = {
 class PackageFormat(NamedTuple):
     schema_version: int
     target_layer_magic: str
-    # The family whose target and draft layout the format packs.
-    family: str
+    # The layer files the format packs for the target and for the draft,
+    # one per layer of the family it packs (Qwen3.8-27B, Qwen3.6-35B-A3B).
+    target_layers: int
+    draft_layers: int
     # Manifest section -> the architecture it must declare.
     declarations: dict
 
 
 PACKAGE_FORMATS = {
-    "splash-packed-q4": PackageFormat(3, "MDFL0006", "Qwen3.8-27B", {}),
+    "splash-packed-q4": PackageFormat(3, "MDFL0006", 64, 5, {}),
     "splash-packed-q4-moe": PackageFormat(
         4,
         "MDFM0001",
-        "Qwen3.6-35B-A3B",
+        40,
+        6,
         {"target": "qwen3_5_moe", "draft": "DFlash2DraftModel"},
     ),
 }
@@ -124,14 +127,12 @@ def validate_manifest(path: Path):
         for parent in PurePosixPath(name).parents
     ):
         raise models.ModelError("runtime package artifact paths overlap")
-    family = families.named(layout.family)
-    target_layers = dict(family.signature)["num_hidden_layers"]
     required_files = {
         "target/embedding.bin",
         "target/head.bin",
-        *(f"target/layer-{index}.bin" for index in range(target_layers)),
+        *(f"target/layer-{index}.bin" for index in range(layout.target_layers)),
         "draft/model.bin",
-        *(f"draft/layer-{index}.bin" for index in range(family.draft.layers)),
+        *(f"draft/layer-{index}.bin" for index in range(layout.draft_layers)),
         "vision/model.bin",
         *(f"tokenizer/{name}" for name in PACKAGE_TOKENIZER_FILES),
     }
