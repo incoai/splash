@@ -103,12 +103,14 @@ uint32_t expectedApple10Splits(uint32_t cores, LinearMatrix matrix) {
   return selected;
 }
 
-// Apple10 one-lane MPP rule: paired N256 from eight tiles per core.
+// Apple10 one-lane MPP rule: paired N256 from two tiles per core while the
+// grid fits one wave of four groups per core, and from eight tiles per core.
 std::optional<LinearConfig> expectedOneLane(uint32_t cores,
                                             LinearMatrix matrix, LinearEpilogue epilogue) {
   const uint32_t n = matrix.outputSize;
   const uint32_t tiles256 = n / 256;
-  if (epilogue == LinearEpilogue::None && tiles256 >= 8 * cores)
+  const bool oneWave = tiles256 >= 2 * cores && tiles256 <= 4 * cores;
+  if (epilogue == LinearEpilogue::None && (oneWave || tiles256 >= 8 * cores))
     return LinearConfig{LinearTile::Paired256,
                         std::min(tiles256, 4 * cores),
                         LinearSimdgroups::Four};
@@ -359,7 +361,8 @@ void baselinePlans() {
               configured(10, 16, mixer35) == split(4) &&
               configured(10, 10, mixer35) == split(2) &&
               configured(10, 40, mixer35) == split(8) &&
-              configured(10, 10, {{5120, 17408}, 8}) == LinearConfig{LinearTile::Paired128, 40} &&
+              configured(10, 10, {{5120, 17408}, 8}) ==
+                  LinearConfig{LinearTile::Paired256, 20, LinearSimdgroups::Four} &&
               configured(10, 20, {{1280, 5120}, 8}) == split(8) &&
               configured(10, 16, {{1280, 5120}, 8}) == split(4) &&
               configured(10, 16, {{256, 5120}, 8}) == split(8) &&
@@ -375,6 +378,8 @@ void baselinePlans() {
               configured(9, 40, {{256, 5120}, 8}) == LinearConfig{LinearTile::Q4Register, 0, LinearSimdgroups::Four, 4} &&
               configured(9, 18, mixer27) == LinearConfig{LinearTile::Q4Register, 0, LinearSimdgroups::Four, 4},
           "Apple9 Q4 register tile anchors changed");
+  // One-lane paired N256 grids of one wave, 2 to 4 tiles per core, and of 8
+  // tiles per core and more.
   const LinearConfig paired256Apple10_20{LinearTile::Paired256, 80, LinearSimdgroups::Four};
   require(configured(10, 20, {{248320, 5120}, 8}) == paired256Apple10_20 &&
               configured(10, 20, {{248320, 2048}, 8}) == paired256Apple10_20 &&
@@ -388,7 +393,15 @@ void baselinePlans() {
                   LinearConfig{LinearTile::Q4Register, 0, LinearSimdgroups::Four, 1} &&
               configured(10, 20, {{40960, 5120}, 8}) ==
                   LinearConfig{LinearTile::Paired256, 80, LinearSimdgroups::Four} &&
-              configured(10, 20, {{40704, 5120}, 8}) == LinearConfig{LinearTile::Paired128, 318},
+              configured(10, 20, {{40704, 5120}, 8}) == LinearConfig{LinearTile::Paired128, 318} &&
+              configured(10, 20, {{20480, 5120}, 8}) == paired256Apple10_20 &&
+              configured(10, 20, {{20736, 5120}, 8}) == LinearConfig{LinearTile::Paired128, 80} &&
+              configured(10, 20, {{10240, 5120}, 8}) ==
+                  LinearConfig{LinearTile::Paired256, 40, LinearSimdgroups::Four} &&
+              configured(10, 20, {{9984, 5120}, 8}) == LinearConfig{LinearTile::Paired128, 78} &&
+              configured(11, 12, {{6144, 5120}, 8}) ==
+                  LinearConfig{LinearTile::Paired256, 24, LinearSimdgroups::Four} &&
+              configured(10, 40, {{16640, 5120}, 8}) == LinearConfig{LinearTile::Paired128, 130},
           "one-lane paired N256 anchors changed");
   // K % 1024 != 0 is legal for the Q4 register tile, and Split128 partitions
   // differ by at most one 256-input block (17 into 8 and 9, 3 into 1 and 2).
@@ -404,13 +417,18 @@ void baselinePlans() {
               configured(10, 20, {{6144, 2048}, 32, LinearPhase::Decode, LinearEpilogue::GateUp}) ==
                   LinearConfig{LinearTile::N256, 24},
           "one-lane fallbacks or multi-lane rules changed");
-  // Balanced two-tile groups above one wave: 130 paired tiles keep three
-  // groups per core on 20 cores and one full wave of longer chains on 16; 98
-  // tiles land on 60 and 50 groups; the M16 grid holds to five per core.
-  require(configured(10, 20, {{16640, 5120}, 8}) == LinearConfig{LinearTile::Paired128, 70} &&
+  // Balanced two-tile groups above one wave: 130 paired tiles run one full
+  // wave of longer chains on 16 cores, where their 65 paired N256 tiles would
+  // need a second wave; on 20 cores those 65, and the 49 of the 98-tile
+  // projection on 16 and 20, run as one paired N256 wave. The M16 grid holds
+  // to five per core.
+  require(configured(10, 20, {{16640, 5120}, 8}) ==
+                  LinearConfig{LinearTile::Paired256, 65, LinearSimdgroups::Four} &&
               configured(10, 16, {{16640, 5120}, 8}) == LinearConfig{LinearTile::Paired128, 64} &&
-              configured(10, 20, {{12544, 2048}, 8}) == LinearConfig{LinearTile::Paired128, 60} &&
-              configured(10, 16, {{12544, 2048}, 8}) == LinearConfig{LinearTile::Paired128, 50} &&
+              configured(10, 20, {{12544, 2048}, 8}) ==
+                  LinearConfig{LinearTile::Paired256, 49, LinearSimdgroups::Four} &&
+              configured(10, 16, {{12544, 2048}, 8}) ==
+                  LinearConfig{LinearTile::Paired256, 49, LinearSimdgroups::Four} &&
               configured(10, 20, {{16640, 5120}, 16}) == LinearConfig{LinearTile::N128, 75} &&
               configured(10, 16, {{16640, 5120}, 16}) == LinearConfig{LinearTile::N128, 64} &&
               configured(10, 20, {{12544, 2048}, 16}) == LinearConfig{LinearTile::N128, 98} &&

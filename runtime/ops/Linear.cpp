@@ -401,17 +401,25 @@ uint32_t apple10Splits(LinearMatrix matrix, uint32_t cores) noexcept {
   return splits;
 }
 
-// Apple10 wide plain projections reduce input re-reads with paired N256
-// tiles at one resident wave, measured on 16/20-core GPUs. Apple9's register
+// Apple10 one-lane plain projections reduce input re-reads with paired N256
+// tiles at one resident wave: one tile per group while the grid fits the
+// wave, several per group from kPaired256TilesPerCore. Apple9's register
 // tile policy is independent.
+// From eight tiles per core each group streams enough tiles (16/20-core GPUs).
 constexpr uint32_t kPaired256TilesPerCore = 8;
+// One resident wave; a grid past it needs a second wave, 11-23% slower.
 constexpr uint32_t kPaired256WaveGroupsPerCore = 4;
+// From two tiles per core one wave takes 0.78-1.04 times as long as the paired
+// N128 tile on 12-, 20- and 40-core GPUs; below two it loses on 40 cores.
+constexpr uint32_t kPaired256OneWaveTilesPerCore = 2;
 
 std::optional<LinearConfig> apple10OneLaneConfig(LinearWorkload w, uint32_t cores) {
   // validate() requires outputSize % 256 == 0, so every tile width divides it.
   const uint32_t n = w.matrix.outputSize;
   const uint32_t tiles256 = n / 256;
-  if (w.epilogue == LinearEpilogue::None && tiles256 >= kPaired256TilesPerCore * cores)
+  const bool oneWave = tiles256 >= kPaired256OneWaveTilesPerCore * cores &&
+                       tiles256 <= kPaired256WaveGroupsPerCore * cores;
+  if (w.epilogue == LinearEpilogue::None && (oneWave || tiles256 >= kPaired256TilesPerCore * cores))
     return LinearConfig{LinearTile::Paired256,
                         std::min(tiles256, kPaired256WaveGroupsPerCore * cores),
                         LinearSimdgroups::Four};
