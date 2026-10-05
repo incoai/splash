@@ -287,7 +287,7 @@ LinearTuningResult tuneLinear(metal::MetalBackend &backend,
         linear.add(graph, buffers, weights.projection, plans.at(candidate.value),
                    weights.gate ? &*weights.gate : nullptr);
       }
-      const auto timing = backend.submitCommand(graph.dispatches());
+      const auto timing = backend.submitCommandAsync(graph.dispatches()).wait();
       const double wall = std::chrono::duration<double>(Clock::now() - wallStart).count();
       return {timing.gpuSeconds, wall, underPressure && underPressure()};
     };
@@ -319,7 +319,7 @@ LinearTuningResult tuneLinear(metal::MetalBackend &backend,
                  *weights.gate, *exactPlain);
       linear.add(graph, {buffers.input, fields[ReferenceUp], {}, {}, {}, {}},
                  weights.projection, *exactPlain);
-      (void)backend.submitCommand(graph.dispatches());
+      (void)backend.submitCommandAsync(graph.dispatches()).wait();
     };
     auto qualify = [&](size_t candidate, bool baseline) {
       requireFinite(buffers.output, false);

@@ -787,6 +787,8 @@ int main(int argc, char **argv) {
       progress = std::make_unique<ProgressJournal>(*progressPath, samples);
 
     engine::RuntimeBootstrapConfig bootstrapConfig;
+    engine::RuntimeMetrics metrics;
+    bootstrapConfig.nativeLoop.metrics = &metrics;
     auto &config = bootstrapConfig.resources;
     config.metallibPath = std::filesystem::path(argv[1]);
     config.modelRoot = std::filesystem::path(argv[2]);
@@ -820,8 +822,8 @@ int main(int argc, char **argv) {
         std::this_thread::sleep_for(std::chrono::seconds(2));
       }
     }
-    if (!bootstrap->nativeLoop().ready() ||
-        !bootstrap->nativeLoop().engineHealthy() ||
+    // start() returns once the loop has announced Ready.
+    if (!bootstrap->nativeLoop().engineHealthy() ||
         bootstrap->nativeLoop().commandInFlight())
       throw std::runtime_error("benchmark production bootstrap did not finish idle and ready");
     // Non-owning borrows. This scope never feeds or ticks the bootstrap loop;

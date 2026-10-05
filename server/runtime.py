@@ -114,6 +114,11 @@ FailureListener: TypeAlias = Callable[[EngineRuntimeError, float], None]
 _READ_CHUNK_BYTES = 64 * 1024
 _MAX_U64 = (1 << 64) - 1
 
+# How long the engine's loop may leave a status request unanswered before its
+# engine counts as stuck and fails: far above any legitimate tick (release
+# passes take <= 0.5 s, pipeline compiles < 1 s).
+STATUS_ANSWER_LIMIT_SECONDS = 30.0
+
 
 def _remaining(deadline: float) -> float:
     remaining = deadline - time.monotonic()
@@ -176,7 +181,7 @@ class RuntimeCall:
         self._prompt_tokens = len(frame.prompt_tokens)
         self._logical_max = frame.logical_max_output_tokens
         self._score_tokens = len(frame.score_tokens)
-        self._return_progress = frame.return_progress
+        self._return_progress = bool(frame.flags & wire.RequestFlag.RETURN_PROGRESS)
         self.mask_provider = request.mask_provider
         self.image_owner = request.image_owner
         self._on_event = on_event
@@ -417,15 +422,10 @@ class MultiplexedRuntime:
     _shutdown_grace_seconds = 15.0
     # How long a started frame write may make no progress.
     _io_timeout_seconds = 5.0
-    # CPU token-mask workers; None lets the executor choose.
-    _mask_workers = None
     # Allow the native 120-second command watchdog to finish before fencing it.
     _cancel_grace_seconds = 150.0
     # While calls are pending, how often the loop must answer a status request.
     _liveness_interval_seconds = 10.0
-    # Far above any legitimate tick: release passes take <= 0.5 s, pipeline
-    # compiles < 1 s.
-    _liveness_timeout_seconds = 30.0
 
     def __init__(
         self,
@@ -434,7 +434,9 @@ class MultiplexedRuntime:
         process_factory: Callable[[], ProcessLike] | None = None,
         startup_timeout: float = 30.0,
         pending_limit: int = 64,
-        eager_start: bool = True,
+        eager_start: bool = False,
+        # CPU token-mask workers; None lets the executor choose.
+        mask_workers: int | None = None,
     ):
         if process_factory is None and not command:
             raise ValueError("command or process_factory is required")
@@ -452,7 +454,7 @@ class MultiplexedRuntime:
         # necessarily finishes. Bound queued + running jobs independently.
         self._mask_slots = threading.BoundedSemaphore(pending_limit)
         self._mask_executor = ThreadPoolExecutor(
-            max_workers=self._mask_workers,
+            max_workers=mask_workers,
             thread_name_prefix="splash-mask",
         )
 
@@ -1032,7 +1034,7 @@ class MultiplexedRuntime:
                     return
             try:
                 self._status(
-                    self._liveness_timeout_seconds, generation, fail_unanswered=True
+                    STATUS_ANSWER_LIMIT_SECONDS, generation, fail_unanswered=True
                 )
             except (EngineRuntimeError, TimeoutError):
                 # Left unanswered, the generation has failed. Otherwise it
@@ -1082,10 +1084,10 @@ class MultiplexedRuntime:
             self._fail_generation(generation, error)
 
     def _issue_error(self, issue: wire.ProtocolIssue) -> EngineRuntimeError:
+        # The parser and the decoder fail the stream, or the engine when an
+        # allocation fails; a request's own failure arrives as an ErrorEvent.
         if issue.failure_class is wire.FailureClass.ENGINE_UNHEALTHY:
             return EngineUnhealthy(issue.describe())
-        # Request-scoped decode issues cannot be trusted on the engine->client
-        # stream unless they arrive as a valid ErrorEvent.
         return ProtocolFatal(issue.describe())
 
     def _dispatch_message(self, generation: int, message: wire.EngineEvent) -> None:

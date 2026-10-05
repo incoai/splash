@@ -1,8 +1,8 @@
 #include "AllocationFailure.hpp"
 #include "ProtocolPeer.hpp"
-#include "ScopedTestConfig.hpp"
 #include "TestChecks.hpp"
-#include "TestImmediateTicket.hpp"
+#include "TestEngine.hpp"
+#include "TestExecutor.hpp"
 #include "TestKvPool.hpp"
 #include "TestMetalMemory.hpp"
 #include "TestStatus.hpp"
@@ -21,7 +21,6 @@
 #include <string_view>
 #include <system_error>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 
 using namespace splash;
@@ -29,164 +28,10 @@ using namespace splash::engine;
 
 namespace {
 
-class State final : public CompositeState {
-public:
-  uint64_t bytes() const noexcept override { return 64; }
-};
-
-class Executor final : public model::Model {
-public:
-  std::shared_ptr<std::atomic<bool>> ticketReady;
-  std::function<void()> onBegin;
-  std::function<void()> onSubmit;
-  std::function<void()> onHealthCheck;
-  // Score requests whose final prompt chunk reports a per-lane model failure.
-  std::unordered_set<uint64_t> invalidScores;
-  // The request flags and sampling each request began with.
-  std::unordered_map<uint64_t, uint32_t> beganFlags;
-  std::unordered_map<uint64_t, SamplingParameters> beganSampling;
-  // Prefill chunks each request received, to prove a failure was isolated to
-  // the last one rather than to a prefill that never chunked.
-  std::unordered_map<uint64_t, uint32_t> prefillChunks;
-  uint32_t widestBatch = 0;
-  void checkHealth() override {
-    if (onHealthCheck)
-      onHealthCheck();
-  }
-  StateAdmission begin(const ModelRequest &request) override {
-    if (onBegin)
-      onBegin();
-    beganFlags[request.id] = request.flags;
-    beganSampling[request.id] = request.sampling;
-    for (uint32_t slot = 0; slot < model::ExecutionLimits::maximumBatchWidth;
-         ++slot) {
-      const bool used = std::any_of(
-          requests_.begin(), requests_.end(),
-          [slot](const auto &entry) { return entry.second.slot == slot; });
-      if (!used) {
-        requests_.emplace(
-            request.id,
-            Active{slot, static_cast<uint32_t>(request.prompt.size()),
-                   {request.scoreTokens.begin(), request.scoreTokens.end()},
-                   request.constraint == ConstraintMode::TokenMask});
-        return {slot, StateFailure::None};
-      }
-    }
-    return {{}, StateFailure::ConcurrencyLimit};
-  }
-  void suspend(uint64_t) override {}
-  StateAdmission resume(const ModelRequest &) override {
-    return {{}, StateFailure::ConcurrencyLimit};
-  }
-  std::unique_ptr<StateRestore> beginRestore(uint64_t, uint32_t length,
-                                             std::shared_ptr<const CompositeState> state,
-                                             bool, std::function<void()>) override {
-    if (!state)
-      throw std::runtime_error("missing composite state");
-    restored_ += length;
-    return {};
-  }
-  void setDraftContextPlan(uint64_t, DraftContextPlan) override {}
-  std::vector<ModelStepResult>
-  prefill(const BatchPlan &, std::span<const ModelBatchItem> items) {
-    std::vector<ModelStepResult> results;
-    for (const auto &item : items) {
-      ++prefillChunks[item.requestId];
-      auto found = requests_.find(item.requestId);
-      const bool last =
-          found != requests_.end() &&
-          item.logicalPosition + item.tokenCount == found->second.promptTokens;
-      const bool scoring =
-          found != requests_.end() && !found->second.scoreTokens.empty();
-      std::vector<float> logits;
-      std::string failure;
-      if (scoring && last) {
-        if (invalidScores.contains(item.requestId)) {
-          failure = "score logit is not finite";
-        } else {
-          logits.reserve(found->second.scoreTokens.size());
-          for (size_t index = 0; index < found->second.scoreTokens.size();
-               ++index) {
-            logits.push_back(static_cast<float>(index) + 0.5f);
-          }
-        }
-      }
-      // A constrained prompt's end asks for the first token's mask.
-      const bool awaitsMask =
-          found != requests_.end() && found->second.constrained && last;
-      results.push_back({item.requestId, item.tokenCount, {}, scoring && last,
-                         awaitsMask ? DecodeStage::ApplyInitialMask
-                                    : DecodeStage::Regular,
-                         0, 0, 0, std::move(logits), std::move(failure)});
-    }
-    return results;
-  }
-  std::vector<ModelStepResult>
-  decode(const BatchPlan &plan, std::span<const ModelBatchItem> items) {
-    std::vector<ModelStepResult> results;
-    for (const auto &item : items) {
-      // The first token's selection under the mask emits nothing here.
-      if (plan.decodeStage == DecodeStage::ApplyInitialMask) {
-        results.push_back(
-            {item.requestId, 0, {}, false, DecodeStage::Regular, 0, 0});
-        continue;
-      }
-      results.push_back({item.requestId,
-                         0,
-                         std::vector<uint32_t>(stepTokens, 42),
-                         true,
-                         DecodeStage::Regular,
-                         7,
-                         7});
-    }
-    return results;
-  }
-  // Tokens one decode step emits; the last one is the terminal anchor.
-  uint32_t stepTokens = 1;
-  std::unique_ptr<ModelBatchTicket>
-  submit(const BatchPlan &plan, std::span<const ModelBatchItem> items,
-              std::function<void()> completion) override {
-    widestBatch = std::max(widestBatch, static_cast<uint32_t>(items.size()));
-    if (onSubmit)
-      onSubmit();
-    auto result = plan.kind == WorkKind::Prefill ? prefill(plan, items)
-                                               : decode(plan, items);
-    if (ticketReady)
-      return std::make_unique<test::HeldTicket>(std::move(result), ticketReady,
-                                                0.0);
-    return test::immediateTicket(std::move(result), completion);
-  }
-  uint64_t snapshotBytes() const noexcept override { return 64; }
-  std::shared_ptr<const CompositeState> snapshot(uint64_t) override {
-    return std::make_shared<State>();
-  }
-  uint64_t reclaimIdleState(bool, model::IdleMemory) noexcept override { return 0; }
-  std::optional<std::string>
-  provideMask(uint64_t, std::span<const uint32_t> words) override {
-    // As in the model, a mask row must permit some token.
-    if (std::none_of(words.begin(), words.end(),
-                     [](uint32_t word) { return word != 0; }))
-      return "token mask row permits no vocabulary token";
-    ++providedMasks;
-    return std::nullopt;
-  }
-  uint32_t providedMasks = 0;
-  void end(uint64_t id) override { requests_.erase(id); }
-  uint32_t restored() const noexcept { return restored_; }
-  bool holdsSlot(uint64_t id) const { return requests_.contains(id); }
-
-private:
-  struct Active {
-    uint32_t slot = 0;
-    uint32_t promptTokens = 0;
-    std::vector<uint32_t> scoreTokens;
-    bool constrained = false;
-  };
-  std::unordered_map<uint64_t, Active> requests_;
-  uint32_t restored_ = 0;
-};
-
+using splash::test::Executor;
+using splash::test::rejects;
 using splash::test::require;
+using splash::test::Weights;
 
 // Every submitted request has ended and no command is in flight.
 bool idle(const engine::NativeRuntime &loop) {
@@ -235,17 +80,19 @@ struct PoolShape {
 };
 
 // A native loop over the fake model, collecting the bytes it writes. Its
-// clocks come from the test seam: the unix clock stands still and the awake
-// clock reads `monotonic`, advanced by `clockStep` on every read.
+// config is completed with the engine's (test::engineConfig), and the
+// fixture's metrics and weights where the test gave none; the weights' idle
+// release is production's unless the test gives one. Its unix clock stands
+// still and its awake clock reads `monotonic`, advanced by `clockStep` on
+// every read.
 struct LoopFixture {
   explicit LoopFixture(NativeLoopConfig config = {}, PoolShape shape = {},
-                       protocol::ProtocolLimits limits = {})
-      : seam({.unixMicros = [] { return uint64_t{1'000'000}; },
-              .monotonicMilliseconds = [this] { return monotonic += clockStep; }}),
-        storage(shape.pages, 4096, shape.extentPages),
+                       protocol::ProtocolLimits limits = {},
+                       double idleReleaseSeconds = metal::kResidencyKeepAliveSeconds)
+      : storage(shape.pages, 4096, shape.extentPages),
         pool(storage, shape.runwayPages), cache(pool, nullptr, nullptr),
         loop(
-            std::move(config), cache, executor,
+            clocked(std::move(config)), idleReleaseSeconds, cache, executor,
             [this](std::span<const uint8_t> bytes) {
               if (writeFailure)
                 throw *writeFailure;
@@ -260,7 +107,17 @@ struct LoopFixture {
     return protocol::peer::decodeEvents(output);
   }
 
-  test::ScopedTestConfig seam;
+  NativeLoopConfig clocked(NativeLoopConfig config) {
+    config.engine = test::engineConfig(std::move(config.engine));
+    if (!config.metrics)
+      config.metrics = &metrics;
+    if (!config.weights)
+      config.weights = &weights;
+    config.unixMicros = [] { return uint64_t{1'000'000}; };
+    config.monotonicMilliseconds = [this] { return monotonic += clockStep; };
+    return config;
+  }
+
   test::TestKvStorage storage;
   KvPool pool;
   engine::Cache cache;
@@ -272,6 +129,8 @@ struct LoopFixture {
   std::function<std::string()> status = test::readyStatusJson;
   double monotonic = 100.0;
   double clockStep = 0.0;
+  RuntimeMetrics metrics;
+  Weights weights;
   engine::NativeRuntime loop;
 };
 
@@ -285,7 +144,7 @@ void testPromptProgress() {
   loop.announceReady();
   auto submit = [&](uint64_t id, bool enabled) {
     auto input = request(id);
-    input.returnProgress = enabled;
+    input.flags = enabled ? protocol::kReturnProgressFlag : 0;
     input.promptTokens.resize(4097);
     for (uint32_t i = 0; i < input.promptTokens.size(); ++i)
       input.promptTokens[i] = i + 1;
@@ -293,7 +152,7 @@ void testPromptProgress() {
             "progress request failed");
   };
 
-  executor.ticketReady = std::make_shared<std::atomic<bool>>(false);
+  const auto commandsReady = executor.holdCommands();
   submit(1, true);
   require(loop.tick() && loop.commandInFlight(), "prefill was not submitted");
   for (int i = 0; i < 3; ++i)
@@ -308,7 +167,7 @@ void testPromptProgress() {
     }
   }
   require(count == 1, "missing initial progress or repeated pending progress");
-  *executor.ticketReady = true;
+  *commandsReady = true;
   runUntilIdle(loop);
   submit(2, true);
   runUntilIdle(loop);
@@ -349,13 +208,13 @@ void testPromptProgress() {
           "missing incremental progress or terminal output");
 
   fixture.output.clear();
-  *executor.ticketReady = false;
+  *commandsReady = false;
   submit(4, true);
   require(loop.tick() && loop.commandInFlight(),
           "cancel test needs pending work");
   require(loop.receive(protocol::peer::serialize(protocol::CancelFrame{4})),
           "cancel request failed");
-  *executor.ticketReady = true;
+  *commandsReady = true;
   runUntilIdle(loop);
   count = 0;
   bool cancelled = false;
@@ -426,7 +285,7 @@ void testWireLifecycleAndCacheHit() {
       statusSeen = reported->correlationId == 77;
     }
   }
-  require(misses == 1 && hits == 2 && executor.restored() == 128,
+  require(misses == 1 && hits == 2 && executor.restored == 128,
           "cold/latest-replay/hit classification is wrong");
   require(tokens == 3 && done == 3 && statusSeen,
           "native lifecycle events are incomplete");
@@ -511,7 +370,7 @@ void testFatalFramingClosesConnection() {
                                               protocol::ProtocolLimits{});
   require(static_cast<bool>(event), "status event encoding failed");
   for (const auto &[invalid, code] :
-       {std::pair{std::vector<uint8_t>(24), "bad_magic"},
+       {std::pair{std::vector<uint8_t>(protocol::kFrameHeaderBytes), "bad_magic"},
         std::pair{*event.value, "unknown_frame_type"}}) {
     LoopFixture fixture({}, {.pages = 8});
     engine::NativeRuntime &loop = fixture.loop;
@@ -629,10 +488,10 @@ void testCommandWatchdogAndPendingHealthWake() {
     Executor &executor = fixture.executor;
     double &now = fixture.monotonic;
     now = 0.0;
-    executor.ticketReady = std::make_shared<std::atomic<bool>>(false);
+    const auto commandReady = executor.holdCommands();
     metal::CommandWatchdog watchdog(120.0);
-    executor.onSubmit = [&] { watchdog.start(1, now / 1000.0); };
-    executor.onHealthCheck = [&] {
+    executor.submitObserver = [&] { watchdog.start(1, now / 1000.0); };
+    executor.healthCheck = [&] {
       if (watchdog.expired(now / 1000.0))
         throw metal::MetalBackendError("test command completion timeout");
     };
@@ -655,7 +514,7 @@ void testCommandWatchdogAndPendingHealthWake() {
     if (gpuCompleted) {
       require(loop.engineHealthy() && loop.commandInFlight(),
               "a model-side wait was mistaken for a pending GPU command");
-      *executor.ticketReady = true;
+      *commandReady = true;
       require(loop.tick() && idle(loop), "completed GPU ownership did not drain");
     } else {
       uint32_t errors = 0;
@@ -811,14 +670,30 @@ void testFrameFailureUsesExecutionBoundary() {
 void testInvalidLimitsAreRejectedAtConstruction() {
   protocol::ProtocolLimits limits;
   limits.maxMaskWords = 0;
-  bool refused = false;
-  try {
-    LoopFixture fixture({}, {.pages = 8}, limits);
-  } catch (const std::invalid_argument &error) {
-    refused = std::string(error.what()).find("limit_exceeded") !=
-              std::string::npos;
+  rejects([&] { LoopFixture fixture({}, {.pages = 8}, limits); }, "limit_exceeded",
+          "the loop accepted invalid protocol limits");
+}
+
+// The loop refuses a config without the metrics or the weights the bootstrap
+// always gives it.
+void testLoopNeedsItsMetricsAndWeights() {
+  for (const bool metrics : {true, false}) {
+    test::TestKvStorage storage(8, 4096, 4);
+    KvPool pool(storage, 8);
+    engine::Cache cache(pool, nullptr, nullptr);
+    Executor executor;
+    RuntimeMetrics runtimeMetrics;
+    Weights weights;
+    NativeLoopConfig config{.engine = test::engineConfig(),
+                            .metrics = metrics ? &runtimeMetrics : nullptr,
+                            .weights = metrics ? nullptr : &weights};
+    rejects([&] {
+      engine::NativeRuntime(std::move(config), metal::kResidencyKeepAliveSeconds, cache,
+                            executor, [](std::span<const uint8_t>) {},
+                            test::readyStatusJson, protocol::ProtocolLimits{});
+    }, "the native engine loop lacks a component it needs",
+            "a loop without its metrics or its weights was built");
   }
-  require(refused, "the loop accepted invalid protocol limits");
 }
 
 // An exception while the engine admits a request is engine-fatal: nothing
@@ -826,7 +701,7 @@ void testInvalidLimitsAreRejectedAtConstruction() {
 void testAdmissionExceptionStopsTheEngineOnce() {
   LoopFixture fixture;
   engine::NativeRuntime &loop = fixture.loop;
-  fixture.executor.onBegin = [] { throw std::runtime_error("begin failed"); };
+  fixture.executor.beginObserver = [] { throw std::runtime_error("begin failed"); };
   loop.announceReady();
   require(loop.receive(protocol::peer::serialize(request(1))),
           "admission fixture was refused");
@@ -1010,11 +885,11 @@ void testStepTokensFitTheWire() {
     LoopFixture fixture(config, {}, limits);
     engine::NativeRuntime &loop = fixture.loop;
     Executor &executor = fixture.executor;
-    executor.stepTokens = model::ExecutionLimits::maximumStepTokens;
+    executor.decodeTokens = model::ExecutionLimits::maximumStepTokens;
 
     loop.announceReady();
     require(loop.receive(
-                protocol::peer::serialize(request(5, executor.stepTokens))),
+                protocol::peer::serialize(request(5, executor.decodeTokens))),
             "step request wire failed");
     runUntilIdle(loop);
 
@@ -1032,8 +907,8 @@ void testStepTokensFitTheWire() {
                             protocol::FailureClass::EngineUnhealthy;
       }
     }
-    if (limit >= executor.stepTokens) {
-      require(streamed == executor.stepTokens && completion == streamed &&
+    if (limit >= executor.decodeTokens) {
+      require(streamed == executor.decodeTokens && completion == streamed &&
                   !encodeErrors && loop.engineHealthy(),
               "a full step with its terminal anchor did not fit one event");
     } else {
@@ -1085,7 +960,7 @@ void testCancelledScoreReturnsEmptyLogits() {
   LoopFixture fixture(config);
   engine::NativeRuntime &loop = fixture.loop;
   Executor &executor = fixture.executor;
-  executor.ticketReady = std::make_shared<std::atomic<bool>>(false);
+  const auto commandReady = executor.holdCommands();
   loop.announceReady();
   require(loop.receive(protocol::peer::serialize(scoreRequest(11, 65))),
           "cancel-score request failed");
@@ -1093,7 +968,7 @@ void testCancelledScoreReturnsEmptyLogits() {
   protocol::CancelFrame cancel{11};
   require(loop.receive(protocol::peer::serialize(cancel)),
           "score cancel failed");
-  *executor.ticketReady = true;
+  *commandReady = true;
   runUntilIdle(loop);
 
   uint32_t doneCount = 0;
@@ -1108,6 +983,29 @@ void testCancelledScoreReturnsEmptyLogits() {
     }
   }
   require(doneCount == 1, "cancelled score did not emit Done");
+}
+
+// A request's prefill time runs from when the engine starts it, even when
+// its clock reads zero then, not from its arrival.
+void testPrefillTimeCountsFromTheStart() {
+  engine::NativeLoopConfig config;
+  config.engine.maxContext = 1024;
+  LoopFixture fixture(config);
+  engine::NativeRuntime &loop = fixture.loop;
+  loop.announceReady();
+  fixture.monotonic = -2.0;
+  require(loop.receive(protocol::peer::serialize(request(1))), "request wire failed");
+  fixture.monotonic = 0.0;
+  require(loop.tick() && loop.snapshot().submitted == 1 && loop.commandInFlight(),
+          "the request did not start");
+  fixture.monotonic = 3.0;
+  runUntilIdle(loop);
+  std::optional<protocol::DoneEvent> done;
+  for (const protocol::EngineEvent &message : fixture.events())
+    if (const auto *event = std::get_if<protocol::DoneEvent>(&message))
+      done = *event;
+  require(done && done->prefillMicros == 3000 && done->wallMicros == 5000,
+          "a request started at time zero counted its prefill from its arrival");
 }
 
 struct ScoreBesideChat final {
@@ -1153,9 +1051,9 @@ ScoreBesideChat runScoreBesideChat(bool invalidScore) {
   ScoreBesideChat result;
   result.publishedBlocks = fixture.cache.snapshot().pool.pagesPrefix;
   result.healthy = loop.engineHealthy() && !loop.connectionMustClose();
-  result.slotsReleased = !executor.holdsSlot(21) && !executor.holdsSlot(22);
+  result.slotsReleased = !executor.requests.contains(21) && !executor.requests.contains(22);
   result.scoreChunks = executor.prefillChunks[21];
-  result.widestBatch = executor.widestBatch;
+  result.widestBatch = std::ranges::max(executor.prefillWidths);
 
   require(loop.receive(protocol::peer::serialize(request(23))),
           "post-batch request wire failed");
@@ -1210,9 +1108,10 @@ void testInvalidScoreFailsOneRequestAndKeepsTheBatch() {
 
 // A constrained request's initial token mask crosses the native protocol.
 // Only the response to the pending mask request, with one row of the
-// configured width, reaches the model. Any other response fails that
-// request alone, and one that arrives after the request ended, cancelled or
-// timed out waiting for it, is ignored.
+// configured width, reaches the model, and the request goes on to its first
+// cycle's verify mask. Any other response fails that request alone, and one
+// that arrives after the request ended, cancelled or timed out waiting for
+// it, is ignored.
 void testConstrainedMaskExchange() {
   enum class Reply {
     Valid,
@@ -1281,6 +1180,26 @@ void testConstrainedMaskExchange() {
     } else {
       send(response);
     }
+    if (reply == Reply::Valid) {
+      // Drafting starts once the first token is selected: the first cycle
+      // asks for its verify mask, a row for each draft token and the anchor.
+      std::optional<protocol::MaskRequestEvent> verify;
+      for (uint32_t step = 0; step < 32 && !verify; ++step) {
+        static_cast<void>(loop.tick());
+        for (const auto &message : fixture.events()) {
+          const auto *event = std::get_if<protocol::MaskRequestEvent>(&message);
+          if (event && event->maskRequestId != asked->maskRequestId)
+            verify = *event;
+        }
+      }
+      require(verify && verify->requestId == 7 && verify->wordsPerMask == 3 &&
+                  verify->simulationTokens.size() == 8,
+              "the first constrained cycle did not ask for its verify mask");
+      protocol::MaskResponseFrame rows{7, verify->maskRequestId, {}};
+      for (size_t row = 0; row <= verify->simulationTokens.size(); ++row)
+        rows.maskWords.insert(rows.maskWords.end(), {1, 0, 0});
+      send(rows);
+    }
     runUntilIdle(loop);
 
     std::optional<EngineFinishReason> done;
@@ -1299,13 +1218,13 @@ void testConstrainedMaskExchange() {
       }
       maskRequests += std::holds_alternative<protocol::MaskRequestEvent>(message);
     }
-    require(maskRequests == 1 && loop.engineHealthy() &&
-                !loop.connectionMustClose() && !executor.holdsSlot(7),
+    require(maskRequests == (reply == Reply::Valid ? 2U : 1U) && loop.engineHealthy() &&
+                !loop.connectionMustClose() && !executor.requests.contains(7),
             "mask exchange stopped the engine or kept the request's slot");
     if (reply == Reply::Valid) {
       require(done == EngineFinishReason::Stop && errors.empty() &&
-                  executor.providedMasks == 1,
-              "valid initial mask did not let the request finish");
+                  executor.providedMasks == 2,
+              "valid masks did not let the request finish");
     } else if (reply == Reply::AfterCancel) {
       require(done == EngineFinishReason::Cancelled && errors.empty() &&
                   executor.providedMasks == 0,
@@ -1381,32 +1300,6 @@ void testControlPassReclaimsUnderHostPressure() {
           "critical pressure did not empty the cache and release every extent");
 }
 
-// Weights of three images that count what the loop does with them.
-class Weights final : public model::WeightMemory {
-public:
-  static constexpr uint32_t kImages = 3;
-  [[nodiscard]] bool released() const noexcept override {
-    return restored_ < kImages;
-  }
-  void release() override {
-    require(!released(), "weights were released twice");
-    restored_ = 0;
-  }
-  bool restore() override {
-    if (failRestore)
-      throw std::runtime_error("weights restore test");
-    require(released(), "held weights were restored");
-    ++restores;
-    return ++restored_ == kImages;
-  }
-  bool failRestore = false;
-  // The images written back.
-  uint32_t restores = 0;
-
-private:
-  uint32_t restored_ = kImages;
-};
-
 bool answeredStatus(const LoopFixture &fixture, uint64_t correlationId) {
   const auto events = fixture.events();
   return std::any_of(events.begin(), events.end(), [&](const auto &message) {
@@ -1428,10 +1321,9 @@ void testIdleWeightsAreReleasedAndRestored() {
   engine::NativeLoopConfig config;
   config.engine.maxContext = 1024;
   config.weights = &weights;
-  config.idleReleaseSeconds = kIdleReleaseSeconds;
-  LoopFixture fixture(config);
+  LoopFixture fixture(config, {}, {}, kIdleReleaseSeconds);
   engine::NativeRuntime &loop = fixture.loop;
-  fixture.executor.onBegin = [&] {
+  fixture.executor.beginObserver = [&] {
     require(!weights.released(), "the model began a request on released weights");
   };
   test::metalStatistics() = {};
@@ -1509,22 +1401,16 @@ void testIdleReleaseOffKeepsTheWeights() {
   engine::NativeLoopConfig config;
   config.engine.maxContext = 1024;
   config.weights = &weights;
-  config.idleReleaseSeconds = std::numeric_limits<double>::infinity();
-  LoopFixture fixture(config);
+  LoopFixture fixture(config, {}, {}, std::numeric_limits<double>::infinity());
   fixture.loop.announceReady();
   fixture.monotonic += 1e12;
   fixture.loop.releaseIdleWeights();
   require(!weights.released(), "weights were released with the idle release off");
   // An idle release that is not positive is refused.
   for (double seconds : {0.0, -1.0, std::numeric_limits<double>::quiet_NaN()}) {
-    config.idleReleaseSeconds = seconds;
-    bool refused = false;
-    try {
-      LoopFixture refusedFixture(config);
-    } catch (const std::invalid_argument &) {
-      refused = true;
-    }
-    require(refused, "an idle release that is not positive was accepted");
+    rejects([&] { LoopFixture refusedFixture(config, {}, {}, seconds); },
+            "the idle release must be positive",
+            "an idle release that is not positive was accepted");
   }
 }
 
@@ -1602,6 +1488,7 @@ int main() {
     testCapacityFailureHasOneTerminalFrame();
     testFatalFramingClosesConnection();
     testInvalidLimitsAreRejectedAtConstruction();
+    testLoopNeedsItsMetricsAndWeights();
     testRequestErrorKeepsFraming();
     testCommandWatchdogAndPendingHealthWake();
     testDuplicateLiveRequestClosesWithoutAmbiguousError();
@@ -1616,6 +1503,7 @@ int main() {
     testStepTokensFitTheWire();
     testScoreRequestCompletesAfterFullPrompt();
     testCancelledScoreReturnsEmptyLogits();
+    testPrefillTimeCountsFromTheStart();
     testInvalidScoreFailsOneRequestAndKeepsTheBatch();
     testConstrainedMaskExchange();
     testControlPassReclaimsUnderHostPressure();
@@ -1623,10 +1511,10 @@ int main() {
     testIdleReleaseOffKeepsTheWeights();
     testHoldingRequestsSpansFirstToLastRequest();
     testMemoryStatusReporterLogsTransitionsOnly();
-    std::cout << "native KV-first loop tests passed\n";
+    std::cout << "native engine loop tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {
-    std::cerr << "native KV-first loop tests failed: " << error.what() << '\n';
+    std::cerr << "native engine loop tests failed: " << error.what() << '\n';
     return EXIT_FAILURE;
   }
 }

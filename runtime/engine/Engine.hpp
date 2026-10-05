@@ -6,11 +6,9 @@
 #include "engine/Scheduler.hpp"
 #include "engine/Types.hpp"
 #include "engine/WriteBehind.hpp"
-#include "ops/PagedKv.hpp"
 
 #include <cstdint>
 #include <functional>
-#include <limits>
 #include <optional>
 #include <string_view>
 #include <type_traits>
@@ -20,20 +18,23 @@
 namespace splash::engine {
 
 // Prefill checkpoints sit at multiples of this many tokens
-// (plannedCheckpoints): two draft windows balance recovery granularity and
-// capture work. Tests substitute another interval through TestConfig.
+// (plannedCheckpoints) by default: two draft windows balance recovery
+// granularity and capture work.
 inline constexpr uint32_t kPrefillCheckpointTokens =
     2 * model::ExecutionLimits::draftContextTokens;
 static_assert(kPrefillCheckpointTokens >= model::ExecutionLimits::draftContextTokens &&
                   kPrefillCheckpointTokens % KvCache::pageTokens == 0,
               "a prefill checkpoint interval spans a draft window and whole KV pages");
 // How long a request waits for memory before it fails, and a resident
-// drain lasts. Tests substitute another bound through TestConfig.
+// drain lasts, by default.
 inline constexpr double kResourceWaitTimeoutMilliseconds = 30000.0;
 
+// The engine's constructor refuses a config without its context window, its
+// vocabulary or the governor's two hooks, which the bootstrap sets from the
+// model, its memory plan and the governor (connectToGovernor).
 struct EngineConfig final {
-  uint32_t maxContext = kv::kMaximumLogicalTokens;
-  uint32_t vocabularySize = std::numeric_limits<uint32_t>::max();
+  uint32_t maxContext = 0;
+  uint32_t vocabularySize = 0;
   // Patches per image the server's --max-image-pixels allows; zero rejects
   // images.
   uint32_t maxImagePatches = ops::kMaximumImagePatches;
@@ -42,9 +43,13 @@ struct EngineConfig final {
   // its solo rate through a long prefill, which meanwhile takes 1.5x as long;
   // zero alternates one command of each kind.
   double decodeShare = 0.5;
-  // Host growth admission, supplied by the runtime governor. Queried only
-  // while resident lanes drain after a suspension; allocation reads the
-  // cause of a refusal instead.
+  // The prefill checkpoint interval and the resource wait limit.
+  uint32_t prefillCheckpointTokens = kPrefillCheckpointTokens;
+  double resourceWaitTimeoutMilliseconds = kResourceWaitTimeoutMilliseconds;
+  // Host growth admission, supplied by the runtime governor. Queried while
+  // resident lanes drain after a suspension, and when a boundary's snapshot
+  // is denied: while growth is paused, extents released for it cannot hold
+  // it. Allocation reads the cause of a refusal instead.
   std::function<bool()> growthPaused;
   // Marks the allocations that follow as memory a request in service needs,
   // which the pause does not hold back, and clears the mark
@@ -74,11 +79,11 @@ plannedCheckpoints(uint32_t resumeBoundary, uint32_t replayBoundary, uint32_t in
 struct ResourceWaitSnapshot final {
   uint32_t memory = 0;
   uint32_t concurrency = 0;
-  // Requests that admission holds back behind the first one refused memory,
-  // whatever they wait for themselves, and that request itself while a pass
-  // keeps it out of its memory wait. During recovery only suspended requests
-  // and those of a strictly higher priority are admitted, and only they
-  // count.
+  // Requests the latest admission pass held back behind the first one
+  // refused memory, whatever they wait for themselves, and a request refused
+  // memory while a pass keeps it out of its memory wait. During recovery
+  // admission tries only suspended requests and those of a strictly higher
+  // priority, and holds back only those.
   uint32_t heldBehindRefusal = 0;
   // Requests admitted into a restore of their prefix from disk, waiting for
   // its reads rather than for memory.
@@ -240,6 +245,10 @@ private:
     // (admitQueued); a pass that does not schedule it or a prefix wait
     // leaves it in place.
     bool refusedMemory = false;
+    // The request refused memory that the latest admission pass held it
+    // back behind, without trying it. It counts as held while that request
+    // still waits refused (ResourceWaitSnapshot::heldBehindRefusal).
+    std::optional<uint64_t> heldBehind;
     // The prompt from submit on, then the committed output; request.prompt
     // is empty.
     std::vector<uint32_t> exactTokens;
@@ -352,7 +361,6 @@ private:
   [[nodiscard]] CacheReclaimResult reuseCachedStateWhilePaused(ReclaimClass upTo);
   [[nodiscard]] CacheReclaimResult reuseCachedPagesWhilePaused(
       const TokenAdmission &admission, ReclaimClass upTo);
-  [[nodiscard]] bool growthPaused() const;
   // Memory a lane could not get, and what the engine knows about its return.
   struct Denial {
     metal::AllocationFailure allocationFailure = metal::AllocationFailure::None;
@@ -472,10 +480,6 @@ private:
   void sweepTerminal();
 
   EngineConfig config_;
-  // kPrefillCheckpointTokens and kResourceWaitTimeoutMilliseconds, or the
-  // test seam's (TestConfig).
-  uint32_t checkpointTokens_;
-  double resourceWaitTimeoutMilliseconds_;
   Cache &cache_;
   WriteBehind writeBehind_;
   model::Model &model_;
@@ -495,6 +499,10 @@ private:
   [[nodiscard]] bool admissionTries(const Request &request,
                                     std::optional<RequestPriority> tier,
                                     bool draining) const;
+  // Whether the request refused memory that a pass held another one back
+  // behind (Request::heldBehind) still waits refused: it is neither
+  // finalized nor started since.
+  [[nodiscard]] bool holdsBack(std::optional<uint64_t> refused) const;
   std::function<void()> completionNotifier_;
   std::optional<Pending> pending_;
   // When the latest command retired, until a tick finds nothing to do.

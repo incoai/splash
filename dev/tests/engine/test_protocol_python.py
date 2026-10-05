@@ -31,7 +31,6 @@ REQUEST_FIELDS = (
     "repetition_penalty",
     "min_p",
     "seed",
-    "return_progress",
     "score_count",
     "generation_prompt_tokens",
     "flags",
@@ -98,12 +97,17 @@ def example_ignore_eos_request():
     )
 
 
+def example_progress_request():
+    return replace(example_request(), flags=p.RequestFlag.RETURN_PROGRESS)
+
+
 def client_messages():
     return {
         "request": example_request(),
         "request_image": example_image_request(),
         "request_score": example_score_request(),
         "request_ignore_eos": example_ignore_eos_request(),
+        "request_progress": example_progress_request(),
         "cancel": p.CancelFrame(91),
         "mask_response": p.MaskResponseFrame(
             91, 7, struct.pack("<3I", 0xFFFFFFFF, 0, 0xA5A5A5A5)
@@ -260,13 +264,13 @@ class ProtocolPythonTests(unittest.TestCase):
                 self.assertEqual(decode_event(golden[name]), event)
 
     def test_progress_wire_validation(self):
-        request = replace(example_request(), return_progress=True)
-        self.assertEqual(decode_client(p.serialize_message(request)), request)
-        self.assert_protocol_error(
-            p.FailureClass.REQUEST_ERROR,
-            p.IssueCode.INVALID_ENUM_VALUE,
-            lambda: p.serialize_message(replace(request, return_progress=2)),
+        # A request asks for its prompt's progress with a flag bit.
+        request = example_progress_request()
+        wire = p.serialize_message(request)
+        self.assertEqual(
+            struct.unpack_from("<I", wire, p.FRAME_HEADER_BYTES + OFFSET["flags"])[0], 2
         )
+        self.assertEqual(decode_client(wire), request)
         for event in (
             p.PromptProgressEvent(0, 1, 0),
             p.PromptProgressEvent(1, p.MAX_PROMPT_TOKENS + 1, 0),
@@ -407,7 +411,6 @@ class ProtocolPythonTests(unittest.TestCase):
                 len(request.image_spans),
                 *astuple(request.sampling),
                 request.seed,
-                request.return_progress,
                 len(request.score_tokens),
                 request.generation_prompt_tokens,
                 int(request.flags),
@@ -420,11 +423,8 @@ class ProtocolPythonTests(unittest.TestCase):
             p._HEADER.format,
             b"SPLH",
             p.PROTOCOL_VERSION,
-            p.FRAME_HEADER_BYTES,
             int(p.FrameType.REQUEST),
-            0,
             len(payload),
-            0,
         )
         self.assertEqual(frame, header + payload)
 
@@ -495,11 +495,11 @@ class ProtocolPythonTests(unittest.TestCase):
         self.assert_protocol_error(
             p.FailureClass.PROTOCOL_FATAL,
             p.IssueCode.INVALID_PAYLOAD_LENGTH,
-            lambda: decode_event(mutate_u32(wire, 24 + 41, 2)),
+            lambda: decode_event(mutate_u32(wire, p.FRAME_HEADER_BYTES + 41, 2)),
         )
         # A Done payload without its option-logit count (41 bytes) is below
         # the minimum.
-        short = mutate_u64(wire[: 24 + 41], 12, 41)
+        short = mutate_u64(wire[: p.FRAME_HEADER_BYTES + 41], 8, 41)
         self.assertEqual(parser_issue(short).code, p.IssueCode.INVALID_PAYLOAD_LENGTH)
 
     def test_done_option_logits_validation(self):
@@ -554,14 +554,11 @@ class ProtocolPythonTests(unittest.TestCase):
         wire = p.serialize_message(request)
         self.assertEqual(wire[:4], b"SPLH")
         self.assertEqual(
-            struct.unpack_from("<HHHHQI", wire, 4),
+            struct.unpack_from("<HHQ", wire, 4),
             (
                 p.PROTOCOL_VERSION,
-                p.FRAME_HEADER_BYTES,
                 int(p.FrameType.REQUEST),
-                0,
                 p.REQUEST_FIXED_BYTES + 4 * len(request.prompt_tokens),
-                0,
             ),
         )
         self.assertEqual(
@@ -634,7 +631,7 @@ class ProtocolPythonTests(unittest.TestCase):
         # scoring decides the output, fails the request.
         cases = [
             (replace(request, flags=flags), p.IssueCode.INVALID_ENUM_VALUE)
-            for flags in (1 << 1, 1 << 31, 0xFFFFFFFF, True, -1, 1 << 32, 1.0)
+            for flags in (1 << 2, 1 << 31, 0xFFFFFFFF, True, -1, 1 << 32, 1.0)
         ] + [
             (
                 replace(base, flags=p.RequestFlag.IGNORE_END_OF_SEQUENCE),
@@ -712,7 +709,7 @@ class ProtocolPythonTests(unittest.TestCase):
     def test_refresh_request_deadline_leaves_an_unparsable_frame_alone(self):
         truncated = mutate_u16(
             p.serialize_message(p.StatusRequestFrame(808)),
-            8,
+            6,
             int(p.FrameType.REQUEST),
         )
         now = 1_900_000_000_000_000
@@ -781,16 +778,16 @@ class ProtocolPythonTests(unittest.TestCase):
         mutations.extend(
             [
                 (mutate_u16(valid, 4, 1), p.IssueCode.UNSUPPORTED_VERSION),
-                (mutate_u16(valid, 6, 23), p.IssueCode.INVALID_HEADER_SIZE),
-                (mutate_u16(valid, 8, 0x7777), p.IssueCode.UNKNOWN_FRAME_TYPE),
-                (mutate_u16(valid, 10, 1), p.IssueCode.NON_ZERO_HEADER_FLAGS),
-                (mutate_u32(valid, 20, 1), p.IssueCode.NON_ZERO_RESERVED_FIELD),
+                (mutate_u16(valid, 6, 0x7777), p.IssueCode.UNKNOWN_FRAME_TYPE),
                 (
-                    mutate_u64(valid, 12, 0xFFFFFFFFFFFFFFFF),
+                    mutate_u64(valid, 8, 0xFFFFFFFFFFFFFFFF),
                     p.IssueCode.FRAME_TOO_LARGE,
                 ),
-                (mutate_u64(valid, 12, 15), p.IssueCode.INVALID_PAYLOAD_LENGTH),
-                (b"ready\n".ljust(24, b"r"), p.IssueCode.BAD_MAGIC),
+                (mutate_u64(valid, 8, 15), p.IssueCode.INVALID_PAYLOAD_LENGTH),
+                (
+                    b"ready\n".ljust(p.FRAME_HEADER_BYTES, b"r"),
+                    p.IssueCode.BAD_MAGIC,
+                ),
             ]
         )
         # The server never receives the frames it sends.
@@ -850,7 +847,7 @@ class ProtocolPythonTests(unittest.TestCase):
         header = native_peer.serialize_event(p.StatusJsonEvent(99, b"{}"))[
             : p.FRAME_HEADER_BYTES
         ]
-        too_large = mutate_u64(header, 12, 8 + p.MAX_STATUS_JSON_BYTES + 1)
+        too_large = mutate_u64(header, 8, 8 + p.MAX_STATUS_JSON_BYTES + 1)
         issue = parser_issue(too_large)
         self.assertEqual(issue.failure_class, p.FailureClass.PROTOCOL_FATAL)
         self.assertEqual(issue.code, p.IssueCode.FRAME_TOO_LARGE)
@@ -898,14 +895,61 @@ class ProtocolPythonTests(unittest.TestCase):
             p.IssueCode.INVALID_ENUM_VALUE, p.ReadyEvent(4, 4096, 2)
         )
 
+    def test_unnamed_request_failures_are_fatal(self):
+        """A client frame's failure is its request's error only when the
+        frame names the request; one that names none fails the stream, as
+        the engine classifies it (protocol_test.cpp)."""
+        for message, code, failure_class in (
+            (
+                replace(example_request(), request_id=0),
+                p.IssueCode.INVALID_REQUEST_ID,
+                p.FailureClass.PROTOCOL_FATAL,
+            ),
+            (
+                replace(example_request(), request_id=-1),
+                p.IssueCode.INVALID_REQUEST_ID,
+                p.FailureClass.PROTOCOL_FATAL,
+            ),
+            (
+                p.CancelFrame(0),
+                p.IssueCode.INVALID_REQUEST_ID,
+                p.FailureClass.PROTOCOL_FATAL,
+            ),
+            (
+                p.MaskResponseFrame(0, 7, bytes(4)),
+                p.IssueCode.INVALID_REQUEST_ID,
+                p.FailureClass.PROTOCOL_FATAL,
+            ),
+            (
+                p.MaskResponseFrame(91, 0, bytes(4)),
+                p.IssueCode.INVALID_REQUEST_ID,
+                p.FailureClass.REQUEST_ERROR,
+            ),
+            (
+                p.StatusRequestFrame(-1),
+                p.IssueCode.INTEGER_OVERFLOW,
+                p.FailureClass.PROTOCOL_FATAL,
+            ),
+        ):
+            with self.subTest(message=message):
+                issue = self.assert_protocol_error(
+                    failure_class,
+                    code,
+                    lambda message=message: p.serialize_message(message),
+                )
+                self.assertEqual(
+                    issue.request_id,
+                    91 if failure_class is p.FailureClass.REQUEST_ERROR else 0,
+                )
+
     def test_overflow_lengths_fail_before_allocation(self):
         valid = native_peer.serialize_event(engine_events()["tokens"])
-        claimed = struct.unpack_from("<Q", valid, 12)[0]
-        issue = parser_issue(mutate_u64(valid, 12, claimed + 1))
+        claimed = struct.unpack_from("<Q", valid, 8)[0]
+        issue = parser_issue(mutate_u64(valid, 8, claimed + 1))
         self.assertEqual(issue.failure_class, p.FailureClass.PROTOCOL_FATAL)
         self.assertEqual(issue.code, p.IssueCode.TRUNCATED_FRAME)
 
-        enormous = mutate_u64(valid, 12, 0xFFFFFFFFFFFFFFFF)
+        enormous = mutate_u64(valid, 8, 0xFFFFFFFFFFFFFFFF)
         issue = parser_issue(enormous[: p.FRAME_HEADER_BYTES])
         self.assertEqual(issue.code, p.IssueCode.FRAME_TOO_LARGE)
 

@@ -1,6 +1,5 @@
 #include "engine/FdTransport.hpp"
 #include "AwakeClock.hpp"
-#include "TestConfig.hpp"
 
 #include <algorithm>
 #include <array>
@@ -264,13 +263,12 @@ private:
   std::thread thread_;
 };
 
-FdTransport::FdTransport(int inputFd, int outputFd)
-    : inputFd_(inputFd), outputFd_(outputFd),
-      inputQueueBytes_(
-          testConfig().transportInputQueueBytes.value_or(kInputQueueBytes)),
+FdTransport::FdTransport(int inputFd, int outputFd, size_t inputQueueBytes)
+    : inputFd_(inputFd), outputFd_(outputFd), inputQueueBytes_(inputQueueBytes),
       wake_(std::make_shared<LoopWake>()) {
-  if (inputFd_ < 0 || outputFd_ < 0) {
-    throw std::invalid_argument("native transport requires valid fds");
+  if (inputFd_ < 0 || outputFd_ < 0 || !inputQueueBytes_) {
+    throw std::invalid_argument(
+        "native transport requires valid fds and room for input");
   }
 }
 

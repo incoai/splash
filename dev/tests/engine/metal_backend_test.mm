@@ -1,6 +1,5 @@
 #include "../../../runtime/metal/BackendInstrumentation.hpp"
 #include "../../../runtime/metal/MetalBackend.hpp"
-#include "ScopedTestConfig.hpp"
 #include "TestBuffers.hpp"
 
 #import <Foundation/Foundation.h>
@@ -37,9 +36,12 @@ using splash::metal::BytesBinding;
 using splash::metal::ComputeDispatch;
 using splash::metal::MetalBackend;
 using splash::metal::MetalBackendError;
-using splash::test::ScopedTestConfig;
 using splash::test::sharedBuffer;
 using splash::metal::MetalBuffer;
+using splash::metal::kResidencyKeepAliveSeconds;
+
+// The watchdog limit of the tests whose commands the GPU holds for 200 ms.
+constexpr double kShortCommandTimeoutSeconds = 0.1;
 
 [[noreturn]] void fail(const std::string &message) {
     std::cerr << "FAIL: " << message << '\n';
@@ -116,8 +118,7 @@ NSUInteger delayedCompletionMemoryQuery(id device, SEL selector) {
 }
 
 void completionDoesNotWaitForMemoryTelemetry(const std::string &metallibPath) {
-    const ScopedTestConfig seam({.commandTimeoutSeconds = 0.1});
-    MetalBackend backend(metallibPath);
+    MetalBackend backend(metallibPath, kResidencyKeepAliveSeconds, kShortCommandTimeoutSeconds);
     auto buffer = sharedBuffer(backend, sizeof(uint32_t));
     *static_cast<uint32_t *>(buffer.contents()) = 0;
     const uint32_t count = 1, increment = 7;
@@ -142,7 +143,7 @@ void completionDoesNotWaitForMemoryTelemetry(const std::string &metallibPath) {
     MethodReplacement memory(device, @selector(currentAllocatedSize),
                              reinterpret_cast<IMP>(delayedCompletionMemoryQuery));
     originalAllocatedSize = memory.original;
-    auto ticket = backend.submitAsync(dispatch);
+    auto ticket = backend.submitCommandAsync({&dispatch, 1});
     const bool sampledOnSubmission = memoryQueries != 0;
     const bool completed = gpuDone.wait_for(std::chrono::seconds(5)) ==
                            std::future_status::ready;
@@ -222,8 +223,7 @@ void delayCompletionNotification(id command, SEL selector, MTLCommandBufferHandl
 
 void terminalCommandRecovers(const std::string &metallibPath, bool failed,
                                    bool pendingNext = false) {
-    const ScopedTestConfig seam({.commandTimeoutSeconds = 0.1});
-    MetalBackend backend(metallibPath);
+    MetalBackend backend(metallibPath, kResidencyKeepAliveSeconds, kShortCommandTimeoutSeconds);
     auto buffer = sharedBuffer(backend, sizeof(uint32_t));
     *static_cast<uint32_t *>(buffer.contents()) = 0;
     const uint32_t count = 1, increment = 7;
@@ -287,9 +287,9 @@ void terminalCommandRecovers(const std::string &metallibPath, bool failed,
                 MethodReplacement commit(command, @selector(commit),
                                          reinterpret_cast<IMP>(commitBehindWatchdogGate));
                 originalCommandCommit = commit.original;
-                next = backend.submitAsync(dispatch);
+                next = backend.submitCommandAsync({&dispatch, 1});
             } else {
-                next = backend.submitAsync(dispatch);
+                next = backend.submitCommandAsync({&dispatch, 1});
             }
         }
         // Metal may serialize later status notifications behind this handler.
@@ -320,7 +320,7 @@ void terminalCommandRecovers(const std::string &metallibPath, bool failed,
     if (failed) {
         require(!backend.healthy() && error.find("Metal command 1 failed") != std::string::npos,
                 "delayed GPU failure was lost or misclassified: " + error);
-        requireBackendError([&] { (void)backend.submitAsync(dispatch); },
+        requireBackendError([&] { (void)backend.submitCommandAsync({&dispatch, 1}); },
                             "failed GPU command admitted further work");
         std::cout << "PASS delayed GPU failure preserves its error\n";
         return;
@@ -333,8 +333,7 @@ void terminalCommandRecovers(const std::string &metallibPath, bool failed,
 }
 
 void pendingCommandStillTimesOut(const std::string &metallibPath) {
-    const ScopedTestConfig seam({.commandTimeoutSeconds = 0.1});
-    MetalBackend backend(metallibPath);
+    MetalBackend backend(metallibPath, kResidencyKeepAliveSeconds, kShortCommandTimeoutSeconds);
     auto buffer = sharedBuffer(backend, sizeof(uint32_t));
     *static_cast<uint32_t *>(buffer.contents()) = 0;
     const uint32_t count = 1, increment = 7;
@@ -353,7 +352,7 @@ void pendingCommandStillTimesOut(const std::string &metallibPath) {
         MethodReplacement commit(command, @selector(commit),
                                  reinterpret_cast<IMP>(commitBehindWatchdogGate));
         originalCommandCommit = commit.original;
-        ticket = backend.submitAsync(dispatch);
+        ticket = backend.submitCommandAsync({&dispatch, 1});
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     const bool pending = !ticket.ready();
@@ -369,7 +368,7 @@ void pendingCommandStillTimesOut(const std::string &metallibPath) {
                 (failure.find("status=committed") != std::string::npos ||
                  failure.find("status=scheduled") != std::string::npos),
             "command timeout lost its submission diagnostics: " + failure);
-    requireBackendError([&] { (void)backend.submitAsync(dispatch); },
+    requireBackendError([&] { (void)backend.submitCommandAsync({&dispatch, 1}); },
                         "timed-out backend accepted more work");
     require(*static_cast<uint32_t *>(buffer.contents()) == increment,
             "timed-out command lost resources before GPU completion");
@@ -388,8 +387,7 @@ bool awaitAllocationsReleased(const MetalBackend &backend) {
 // A synchronous submission throws once the watchdog gives up on its command,
 // which keeps its allocations until the GPU ends it.
 void synchronousWaitObeysTheWatchdog(const std::string &metallibPath) {
-    const ScopedTestConfig seam({.commandTimeoutSeconds = 0.1});
-    MetalBackend backend(metallibPath);
+    MetalBackend backend(metallibPath, kResidencyKeepAliveSeconds, kShortCommandTimeoutSeconds);
     auto buffer = sharedBuffer(backend, sizeof(uint32_t));
     const uint32_t count = 1, increment = 7;
     ComputeDispatch dispatch{"test_add_u32", {{0, buffer}},
@@ -405,7 +403,7 @@ void synchronousWaitObeysTheWatchdog(const std::string &metallibPath) {
         originalCommandCommit = commit.original;
         submitted = std::async(std::launch::async, [&]() -> std::string {
             try {
-                (void)backend.submitCommand({&dispatch, 1});
+                (void)backend.submitCommandAsync({&dispatch, 1}).wait();
             } catch (const MetalBackendError &error) {
                 return error.what();
             }
@@ -431,8 +429,7 @@ void synchronousWaitObeysTheWatchdog(const std::string &metallibPath) {
 // Destroying a ticket whose command the watchdog gave up on returns while the
 // command is still pending, and the command completes once the GPU ends it.
 void abandonedTicketReturnsAfterTheWatchdog(const std::string &metallibPath) {
-    const ScopedTestConfig seam({.commandTimeoutSeconds = 0.1});
-    MetalBackend backend(metallibPath);
+    MetalBackend backend(metallibPath, kResidencyKeepAliveSeconds, kShortCommandTimeoutSeconds);
     auto buffer = sharedBuffer(backend, sizeof(uint32_t));
     const uint32_t count = 1, increment = 7;
     ComputeDispatch dispatch{"test_add_u32", {{0, buffer}},
@@ -481,7 +478,7 @@ void stopRefusesSubmission(const std::string &metallibPath) {
     backend.stop();
     std::string error;
     try {
-        (void)backend.submitAsync(dispatch);
+        (void)backend.submitCommandAsync({&dispatch, 1});
     } catch (const MetalBackendError &failure) {
         error = failure.what();
     }
@@ -515,7 +512,7 @@ void shutdownInterruptsACommandWait(const std::string &metallibPath) {
         originalCommandCommit = commit.original;
         submitted = std::async(std::launch::async, [&]() -> std::string {
             try {
-                (void)backend.submitCommand({&dispatch, 1});
+                (void)backend.submitCommandAsync({&dispatch, 1}).wait();
             } catch (const MetalBackendError &error) {
                 return error.what();
             }
@@ -559,7 +556,7 @@ void shutdownLeavesTicketTeardownToTheCommand(const std::string &metallibPath) {
         MethodReplacement commit(command, @selector(commit),
                                  reinterpret_cast<IMP>(commitBehindWatchdogGate));
         originalCommandCommit = commit.original;
-        ticket = backend.submitAsync(dispatch);
+        ticket = backend.submitCommandAsync({&dispatch, 1});
     }
     auto destroyed = std::async(std::launch::async, [&ticket] {
         splash::metal::CommandTicket dropped = std::move(ticket);
@@ -849,7 +846,7 @@ void buffersStayResident(const std::string &metallibPath) {
         {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
         {1, 1, 1}, {1, 1, 1}};
     const unsigned requested = calls.requests;
-    auto ticket = backend.submitAsync(dispatch);
+    auto ticket = backend.submitCommandAsync({&dispatch, 1});
     require(waitFor([&] { return calls.requests > requested; }, std::chrono::seconds(1)),
             "a command did not hold the buffers again");
     (void)ticket.wait();
@@ -897,7 +894,7 @@ void allocationDoesNotRequestResidency(const std::string &metallibPath) {
     const ComputeDispatch dispatch{"test_add_u32", {{0, used}},
         {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
         {1, 1, 1}, {1, 1, 1}};
-    (void)backend.submitAsync(dispatch).wait();
+    (void)backend.submitCommandAsync({&dispatch, 1}).wait();
     require(waitFor([&] { return calls.requests != 0; }, std::chrono::seconds(1)),
             "the set was not held before the allocations");
     const unsigned held = calls.requests;
@@ -959,7 +956,7 @@ void residencyRacesTheHeartbeat(const std::string &metallibPath) {
             const unsigned ended = calls.ends;
             lapses += waitFor([&] { return calls.ends > ended; }, std::chrono::seconds(2));
         }
-        (void)backend->submitAsync(dispatch).wait();
+        (void)backend->submitCommandAsync({&dispatch, 1}).wait();
     }
     {
         std::lock_guard lock(mutex);
@@ -970,7 +967,7 @@ void residencyRacesTheHeartbeat(const std::string &metallibPath) {
     require(*static_cast<uint32_t *>(used.contents()) == kRounds,
             "a command racing the residency heartbeat produced the wrong result");
     require(lapses == kRounds / 3, "residency did not lapse between the racing commands");
-    (void)backend->submitAsync(dispatch).wait();
+    (void)backend->submitCommandAsync({&dispatch, 1}).wait();
     backend.reset();
     used = {};
     std::cout << "PASS residency races the heartbeat rounds=" << kRounds
@@ -1123,7 +1120,7 @@ void releasedMemory(const std::string &metallibPath) {
         fail(message);
     };
     {
-        auto ticket = backend.submitAsync(dispatch);
+        auto ticket = backend.submitCommandAsync({&dispatch, 1});
         rejects([&] { backend.releaseMemory(buffer); }, "command is in flight",
                 "memory was released under a command in flight");
         (void)ticket.wait();
@@ -1327,7 +1324,7 @@ void run(const std::string &metallibPath) {
         first.threadgroups = {1, 1, 1};
         first.threadsPerThreadgroup = {kViewElementCount, 1, 1};
         std::vector<ComputeDispatch> command{first, first};
-        (void)backend.submitCommand(command);
+        (void)backend.submitCommandAsync(command).wait();
     }
     require(BackendInstrumentation::submittedCommands(backend) == 3,
             "explicit operation list did not use one command buffer");

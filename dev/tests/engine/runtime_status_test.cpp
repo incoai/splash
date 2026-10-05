@@ -8,7 +8,11 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
+#include <functional>
+#include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <regex>
 #include <sstream>
@@ -60,7 +64,10 @@ MemoryAuditResult audit(const EngineMemoryPlan &memoryPlan) {
   return auditActualMemory(memoryPlan, actual);
 }
 
-void testCleanRuntimeStatus() {
+// A representative status document, every section of it set, and the golden
+// copy of the whole document that the server's reading of it is tested on
+// (dev/tests/engine/test_status_contract.py).
+void testCleanRuntimeStatus(const char *goldenPath) {
   EngineMemoryPlan memoryPlan = plan();
   engine::EngineSnapshot engine;
   engine.maximumContextTokens = 102400;
@@ -177,10 +184,16 @@ void testCleanRuntimeStatus() {
   executorTelemetry.embeddingCacheBytes = 6;
   executorTelemetry.stateHeldImageBytes = 7;
   executorTelemetry.imageRowsBytes = 8;
-  const std::string json =
-      runtimeStatusJson(memoryPlan, engine, metal, warmup, audit(memoryPlan),
-                        metrics, executorTelemetry, identity, governor, true, {},
-                        {}, {}, {});
+  const ResourceWaitSnapshot wait{.memory = 2, .concurrency = 1, .heldBehindRefusal = 4,
+                                  .restoring = 1, .suspended = 1,
+                                  .oldestWaitMilliseconds = 1250.0, .draining = true};
+  const std::string json = runtimeStatusJson(
+      memoryPlan, engine, metal, warmup, audit(memoryPlan), metrics, executorTelemetry,
+      identity, governor, true, {}, wait, NativeLoopTiming{1843.25}, {600.0, false, 2});
+  std::ifstream golden(goldenPath);
+  const std::string expected{std::istreambuf_iterator<char>(golden), {}};
+  require(golden && json + '\n' == expected,
+          std::string(goldenPath) + " is not the status document, which is now:\n" + json);
   require(json.find("\"kv_disk_hit_tokens\":96") != std::string::npos &&
               json.find("\"kv_restores\":3") != std::string::npos,
           "disk token accounting must include transfers completed before admission retries");
@@ -317,7 +330,7 @@ void testCleanRuntimeStatus() {
                     "\"total_target_forward_gpu_ms\":250,\"last_residual_"
                     "wait_ms\":1.5,\"total_residual_wait_ms\":12}") !=
               std::string::npos,
-      "elastic KV-first status is incomplete");
+      "status lacks the engine's memory, cache or constraint counters");
 }
 
 void testCurrentReadinessAndSimultaneousPeak() {
@@ -513,22 +526,13 @@ void testWeightsStatus() {
           "an idle release that is off is not null");
 }
 
-// The server and the runtime share stderr, as `serve > log 2>&1` does: a
-// line written from any thread arrives whole.
-void testStderrLinesStayWhole() {
+// What `write` puts on stderr.
+std::string capturedStderr(const std::function<void()> &write) {
   std::FILE *log = std::tmpfile();
   require(log != nullptr, "no temporary file");
   const int saved = ::dup(STDERR_FILENO);
   ::dup2(::fileno(log), STDERR_FILENO);
-  std::vector<std::thread> writers;
-  for (int writer = 0; writer < 8; ++writer)
-    writers.emplace_back([writer] {
-      for (int line = 0; line < 300; ++line)
-        writeStderrLine("writer " + std::to_string(writer) + " line " +
-                        std::to_string(line));
-    });
-  for (std::thread &writer : writers)
-    writer.join();
+  write();
   ::dup2(saved, STDERR_FILENO);
   ::close(saved);
   std::rewind(log);
@@ -536,7 +540,23 @@ void testStderrLinesStayWhole() {
   for (int character; (character = std::fgetc(log)) != EOF;)
     text.put(static_cast<char>(character));
   std::fclose(log);
-  std::istringstream lines(text.str());
+  return text.str();
+}
+
+// The server and the runtime share stderr, as `serve > log 2>&1` does: a
+// line written from any thread arrives whole.
+void testStderrLinesStayWhole() {
+  std::istringstream lines(capturedStderr([] {
+    std::vector<std::thread> writers;
+    for (int writer = 0; writer < 8; ++writer)
+      writers.emplace_back([writer] {
+        for (int line = 0; line < 300; ++line)
+          writeStderrLine("writer " + std::to_string(writer) + " line " +
+                          std::to_string(line));
+      });
+    for (std::thread &writer : writers)
+      writer.join();
+  }));
   const std::regex whole("writer [0-7] line [0-9]+");
   int count = 0;
   for (std::string line; std::getline(lines, line); ++count)
@@ -544,17 +564,35 @@ void testStderrLinesStayWhole() {
   require(count == 8 * 300, "stderr lines were lost or merged");
 }
 
+// A notice carries the time first, as the server's console lines do, and
+// stays on its line: an exception message's newline becomes a space.
+void testNoticesCarryTheTime() {
+  const std::string notice = capturedStderr([] {
+    logLine("Weights restored in ", std::fixed, std::setprecision(2), 1.5,
+            " s (first line\nsecond line)");
+  });
+  require(std::regex_match(notice,
+                           std::regex("[0-9]{2}:[0-9]{2}:[0-9]{2} Weights restored in "
+                                      "1\\.50 s \\(first line second line\\)\n")),
+          "a notice did not carry the time on one line: " + notice);
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
+  if (argc != 2) {
+    std::cerr << "usage: " << argv[0] << " status_golden.json\n";
+    return 2;
+  }
   try {
-    testCleanRuntimeStatus();
+    testCleanRuntimeStatus(argv[1]);
     testCurrentReadinessAndSimultaneousPeak();
     testWarmupStepsReportMeasurementTruth();
     testMemoryPressureTelemetry();
     testResourceWaitDiagnostics();
     testWeightsStatus();
     testStderrLinesStayWhole();
+    testNoticesCarryTheTime();
     std::cout << "runtime status tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

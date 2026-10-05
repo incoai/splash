@@ -53,6 +53,16 @@ from server.tool_schema import _grammar_compatible_schema
 FOREVER = math.inf
 
 
+def native_command_lines():
+    """(name, serve options, serve-native arguments after the model directory)
+    of each line of the command lines both sides read."""
+    golden = api.ROOT / "dev/tests/engine/native_command_golden.txt"
+    for line in golden.read_text().splitlines():
+        if line and not line.startswith("#"):
+            name, options, arguments = line.split("|")
+            yield name.strip(), options.split(), arguments.split()
+
+
 def _byte_alphabet():
     byte_values = [
         *range(ord("!"), ord("~") + 1),
@@ -3611,67 +3621,24 @@ class ServerTest(unittest.TestCase):
         args = api.parse_args(required)
         self.assertEqual(Path(args.model_root), package)
         self.assertEqual(Path(args.tokenizer), package / "tokenizer")
-        self.assertIsNone(args.max_context)
-        self.assertIsNone(args.max_memory)
-        self.assertEqual(args.max_cache_disk, 0)
-        disk_args = api.parse_args([*required, "--max-cache-disk", "5G"])
-        self.assertEqual(disk_args.max_cache_disk, 5 * 1024**3)
-        self.assertEqual(api._native_command(disk_args)[-1], str(5 * 1024**3))
+        # The engine's command line for each option, which the engine reads as
+        # the server means it (native_arguments_test.cpp). The engine keeps
+        # its own default of an option the server does not pass, and the
+        # per-image patch limit is the most patches a resized image within
+        # the pixel cap can have, a whole number of merge units.
+        for name, options, arguments in native_command_lines():
+            with self.subTest(name=name):
+                self.assertEqual(
+                    api._native_command(api.parse_args([*required, *options])),
+                    [args.binary, "serve-native", args.model_root, *arguments],
+                )
         # A persistent cache names its directory; the server picks the default.
         persistent_args = api.parse_args(
             [*required, "--max-cache-disk", "5G", "--persistent-cache"]
         )
         self.assertEqual(
-            api._native_command(persistent_args)[-3:],
-            [str(5 * 1024**3), "--cache-dir", str(serve_options.DEFAULT_CACHE_DIR)],
-        )
-        directory_args = api.parse_args(
-            [*required, "--max-cache-disk", "5G", "--persistent-cache"]
-            + ["--cache-dir", "/srv/cache"]
-        )
-        self.assertEqual(
-            api._native_command(directory_args)[-2:], ["--cache-dir", "/srv/cache"]
-        )
-        self.assertEqual(args.kv_format, "int8")
-        self.assertNotIn("--kv-format", api._native_command(args))
-        bf16_args = api.parse_args([*required, "--kv-format", "bf16"])
-        self.assertEqual(api._native_command(bf16_args)[-2:], ["--kv-format", "bf16"])
-        disk_bf16_args = api.parse_args(
-            [*required, "--max-cache-disk", "5G", "--kv-format", "bf16"]
-        )
-        self.assertEqual(
-            api._native_command(disk_bf16_args)[-3:],
-            [str(5 * 1024**3), "--kv-format", "bf16"],
-        )
-        # The engine keeps its own default unless told one.
-        self.assertIsNone(args.idle_release)
-        self.assertNotIn("--idle-release", api._native_command(args))
-        for value, text in (("30m", "1800.0"), ("off", "off")):
-            release_args = api.parse_args([*required, "--idle-release", value])
-            self.assertEqual(
-                api._native_command(release_args)[-2:], ["--idle-release", text]
-            )
-        self.assertIsNone(args.decode_share)
-        self.assertNotIn("--decode-share", api._native_command(args))
-        share_args = api.parse_args(
-            [*required, "--max-cache-disk", "5G", "--decode-share", "0"]
-        )
-        self.assertEqual(
-            api._native_command(share_args)[-3:],
-            [str(5 * 1024**3), "--decode-share", "0.0"],
-        )
-        # The engine's per-image patch limit follows the pixel cap: the most
-        # patches a resized image can have, a whole number of merge units.
-        self.assertNotIn("--max-image-patches", api._native_command(args))
-        for pixels, patches in (("1048576", "4096"), ("1000000", "3904")):
-            pixel_args = api.parse_args([*required, "--max-image-pixels", pixels])
-            self.assertEqual(
-                api._native_command(pixel_args)[-2:], ["--max-image-patches", patches]
-            )
-        self.assertNotIn("--idle-sleep", api._native_command(args))
-        sleep_args = api.parse_args([*required, "--allow-idle-sleep"])
-        self.assertEqual(
-            api._native_command(sleep_args)[-2:], ["--idle-sleep", "allow"]
+            api._native_command(persistent_args)[-2:],
+            ["--cache-dir", str(serve_options.DEFAULT_CACHE_DIR)],
         )
         self.assertIsNone(args.request_timeout)
         self.assertEqual(args.model, model)
@@ -3816,7 +3783,6 @@ class ServerTest(unittest.TestCase):
             ],
             startup_timeout=api.NATIVE_START_TIMEOUT,
             pending_limit=1,
-            eager_start=False,
         )
         backend_type.assert_called_once_with(
             runtime, tokenizer, request_logger=diagnostics.print_request

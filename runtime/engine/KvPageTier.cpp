@@ -1,5 +1,4 @@
 #include "engine/KvPageTier.hpp"
-#include "TestConfig.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -35,11 +34,11 @@ std::shared_ptr<KvPageTier::DiskSlot> diskSlot(const std::shared_ptr<KvDiskSlot>
 }
 } // namespace
 
-KvPageTier::KvPageTier(kv::PageStorage &pages, std::shared_ptr<model::SlotFile> file)
-    : pages_(pages), file_(std::move(file)),
-      transferLimit_(testConfig().kvTierTransfers.value_or(kTransfers)) {
-  if (!file_)
-    throw std::invalid_argument("KV tier needs a slot file");
+KvPageTier::KvPageTier(kv::PageStorage &pages, std::shared_ptr<model::SlotFile> file,
+                       uint32_t transfers)
+    : pages_(pages), file_(std::move(file)), transferLimit_(transfers) {
+  if (!file_ || !transferLimit_)
+    throw std::invalid_argument("KV tier needs a slot file and room for a transfer");
   demotionLimit_ = std::max<uint32_t>(1, transferLimit_ / 2);
   restoreLimit_ = std::max<uint32_t>(1, transferLimit_ - transferLimit_ / 4);
   // Tracking a submitted IO must not allocate: the tier drains every IO it

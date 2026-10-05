@@ -224,7 +224,9 @@ class ServerRecoveryTests(unittest.TestCase):
 
     def test_changed_ready_limits_stop_restarting_at_once(self):
         factory = FakeFactory(handler=answer_status)
-        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, eager_start=True
+        )
         backend = self.backend(runtime)
         factory.initial_output = native_peer.serialize_event(
             wire.ReadyEvent(4, 65_536, False)
@@ -259,7 +261,9 @@ class ServerRecoveryTests(unittest.TestCase):
                 process.close_stdout()
             return process
 
-        runtime = engine_runtime.MultiplexedRuntime(process_factory=launch)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=launch, eager_start=True
+        )
         factory.initial_output = b""
         trace = mock.Mock(last_dump=None)
 
@@ -290,7 +294,9 @@ class ServerRecoveryTests(unittest.TestCase):
                 process.close_stdout()
             return process
 
-        runtime = engine_runtime.MultiplexedRuntime(process_factory=launch)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=launch, eager_start=True
+        )
         backend = self.backend(runtime)
         relaunch = backend._relaunch
         relaunched = threading.Event()
@@ -326,7 +332,9 @@ class ServerRecoveryTests(unittest.TestCase):
 
     def test_crash_that_stops_restarts_fails_its_request_without_retry(self):
         factory = FakeFactory(handler=answer_status)
-        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, eager_start=True
+        )
         backend = self.backend(runtime)
         job = make_job()
         with (
@@ -506,7 +514,9 @@ class ServerRecoveryTests(unittest.TestCase):
 
     def test_background_recovery_and_waiters_share_the_native_startup(self):
         factory = FakeFactory(handler=answer_status)
-        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, eager_start=True
+        )
         backend = self.backend(runtime)
         self.assertTrue(backend.status()["ready"])
         factory.initial_output = b""
@@ -528,7 +538,9 @@ class ServerRecoveryTests(unittest.TestCase):
 
     def test_idle_engine_death_restarts_before_traffic_arrives(self):
         factory = FakeFactory()
-        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, eager_start=True
+        )
         backend = self.backend(runtime)
         factory.processes[0].kill()
         self.wait_until(lambda: len(factory.processes) == 2 and runtime.ready, 2)
@@ -541,10 +553,12 @@ class ServerRecoveryTests(unittest.TestCase):
                 answer_status(process, message)
 
         factory = FakeFactory(handler=answer_after_the_first)
-        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, eager_start=True
+        )
         backend = self.backend(runtime)
         with (
-            mock.patch.object(backend_api, "STATUS_BACKGROUND_TIMEOUT_SECONDS", 0.05),
+            mock.patch.object(engine_runtime, "STATUS_ANSWER_LIMIT_SECONDS", 0.05),
             mock.patch.object(backend_api, "print_status") as console,
         ):
             # The probe's timeout owes a refresh, which goes unanswered too.
@@ -566,7 +580,9 @@ class ServerRecoveryTests(unittest.TestCase):
                 raise FileNotFoundError("splash")
             return factory()
 
-        runtime = engine_runtime.MultiplexedRuntime(process_factory=launch)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=launch, eager_start=True
+        )
         backend = self.backend(runtime)
         with mock.patch.object(backend_api, "print_status") as console:
             factory.processes[0].kill()
@@ -588,7 +604,9 @@ class ServerRecoveryTests(unittest.TestCase):
                 raise FileNotFoundError("splash")
             return factory()
 
-        runtime = engine_runtime.MultiplexedRuntime(process_factory=launch)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=launch, eager_start=True
+        )
         backend = self.backend(runtime)
         with (
             mock.patch.object(backend_api, "RESTART_BACKOFF_SECONDS", 0.01),
@@ -609,31 +627,52 @@ class ServerRecoveryTests(unittest.TestCase):
         self.assertFalse(transport["recovering"])
 
     def test_engine_failure_under_a_request_asks_its_client_to_retry(self):
-        factory = FakeFactory()
-        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
-        backend = self.backend(runtime)
-        job = make_job()
-        with mock.patch.object(backend_api, "print_status") as console:
-            backend.submit(job)
-            factory.processes[0].stdin.wait_for(wire.RequestFrame)
-            factory.processes[0].close_stdout()
-            kind, error = job.events.get(timeout=1)
-            self.wait_until(lambda: console.called)
-        self.assertEqual(kind, "error")
-        self.assertEqual(
-            (error.status, error.code, error.message),
+        # The engine stops, or breaks the protocol; either way it fails, and
+        # its requests with it.
+        protocol_failure = wire.ErrorEvent(
+            wire.FailureClass.PROTOCOL_FATAL,
+            0,
+            False,
+            b"invalid_request_id",
+            b"request id is already active",
+        )
+        for fail, reason in (
             (
-                503,
-                "runtime_unavailable",
-                "the inference engine stopped unexpectedly and is restarting; "
-                "retry the request",
+                lambda process: process.close_stdout(),
+                "native protocol reached EOF",
             ),
-        )
-        # The engine's own reason stays on the console.
-        self.assertEqual(
-            console.call_args_list[0].args[0],
-            "Engine failed · native protocol reached EOF",
-        )
+            (
+                lambda process: process.send(protocol_failure),
+                "request id is already active",
+            ),
+        ):
+            with self.subTest(reason=reason):
+                factory = FakeFactory()
+                runtime = engine_runtime.MultiplexedRuntime(
+                    process_factory=factory, eager_start=True
+                )
+                backend = self.backend(runtime)
+                job = make_job()
+                with mock.patch.object(backend_api, "print_status") as console:
+                    backend.submit(job)
+                    factory.processes[0].stdin.wait_for(wire.RequestFrame)
+                    fail(factory.processes[0])
+                    kind, error = job.events.get(timeout=1)
+                    self.wait_until(lambda: console.called)
+                self.assertEqual(kind, "error")
+                self.assertEqual(
+                    (error.status, error.code, error.message),
+                    (
+                        503,
+                        "runtime_unavailable",
+                        "the inference engine stopped unexpectedly and is "
+                        "restarting; retry the request",
+                    ),
+                )
+                # The engine's own reason stays on the console.
+                self.assertEqual(
+                    console.call_args_list[0].args[0], f"Engine failed · {reason}"
+                )
 
     def test_recovery_refusals_carry_the_last_engine_failure(self):
         runtime = RecoveringRuntime()
@@ -706,7 +745,9 @@ class ServerRecoveryTests(unittest.TestCase):
         ):
             with self.subTest(restarted=restarted):
                 factory = FakeFactory()
-                runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+                runtime = engine_runtime.MultiplexedRuntime(
+                    process_factory=factory, eager_start=True
+                )
                 try:
                     self.assertEqual(runtime.readiness.max_context_tokens, 131072)
                     with mock.patch.object(runtime._crash_trace, "dump"):

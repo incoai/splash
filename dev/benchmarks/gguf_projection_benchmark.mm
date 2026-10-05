@@ -174,7 +174,7 @@ int main(int argc, char **argv) {
         for (uint32_t i = 0; i < copies / step; ++i, next += step)
           static_cast<void>(linear.add(graph, b, ring[next % copies], c.plan,
                                        step > 1 ? &ring[(next + 1) % copies] : nullptr));
-        return backend.submitCommand(graph.dispatches()).gpuSeconds * 1e3 / (copies / step);
+        return backend.submitCommandAsync(graph.dispatches()).wait().gpuSeconds * 1e3 / (copies / step);
       };
       for (Case &c : cases)
         for (double spent = 0; spent < kWarmupSeconds * 1e3;) spent += time(c) * copies;

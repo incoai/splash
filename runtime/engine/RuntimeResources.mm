@@ -1,12 +1,11 @@
 #include "engine/RuntimeResources.hpp"
 #include "AwakeClock.hpp"
 #include "Checked.hpp"
+#include "StderrLine.hpp"
 #include "engine/DiskLabels.hpp"
 #include "engine/Engine.hpp"
-#include "engine/StartupLog.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 #include "model/WeightStore.hpp"
-#include "TestConfig.hpp"
 
 #import <Foundation/Foundation.h>
 
@@ -35,17 +34,6 @@ static_assert(model::ExecutionLimits::draftContextTokens ==
               SPLASH_DRAFT_SLIDING_WINDOW);
 static_assert(model::ExecutionLimits::speculativeScratchTokens ==
               SPLASH_SPECULATIVE_SCRATCH_TOKENS);
-
-std::string errorText(RuntimeResourceStage stage, std::string_view message,
-                      std::string_view budgetDescription) {
-  std::ostringstream out;
-  out << "runtime resource assembly failed [" << runtimeResourceStageName(stage)
-      << "]: " << message;
-  if (!budgetDescription.empty()) {
-    out << '\n' << budgetDescription;
-  }
-  return out.str();
-}
 
 uint8_t hexNibble(char value) {
   if (value >= '0' && value <= '9') {
@@ -114,8 +102,8 @@ PersistentCacheFiles openPersistentCache(const std::filesystem::path &root,
                                            kStaleCache, cancelled);
     if (!files.directory) {
       if (!cancelled || !cancelled())
-        logStartup("Persistent cache ", (root / cacheNamespace).string(),
-                   " is in use by another process; this one keeps a temporary cache.");
+        logLine("Persistent cache ", (root / cacheNamespace).string(),
+                " is in use by another process; this one keeps a temporary cache.");
       return {};
     }
     const std::vector<std::byte> tag(reinterpret_cast<const std::byte *>(cacheNamespace.data()),
@@ -131,7 +119,7 @@ PersistentCacheFiles openPersistentCache(const std::filesystem::path &root,
                                      files.directory->stateRecords(), tag, sizeof(StateLabel)});
     return files;
   } catch (const std::exception &error) {
-    logStartup("Persistent cache disabled (", error.what(), "); this process keeps a temporary cache.");
+    logLine("Persistent cache disabled (", error.what(), "); this process keeps a temporary cache.");
     return {};
   }
 }
@@ -222,12 +210,9 @@ std::string persistentCacheNamespace(const RuntimeCacheIdentity &identity,
 
 RuntimeResourcesError::RuntimeResourcesError(RuntimeResourceStage stage,
                                              std::string message,
-                                             std::string statusJson,
                                              std::string budgetDescription,
                                              RuntimeResourceFailure failure)
-    : std::runtime_error(errorText(stage, message, budgetDescription)),
-      failure_(failure),
-      message_(std::move(message)), statusJson_(std::move(statusJson)),
+    : std::runtime_error(std::move(message)), stage_(stage), failure_(failure),
       budgetDescription_(std::move(budgetDescription)) {}
 
 RuntimeResources::RuntimeResources(
@@ -255,14 +240,15 @@ std::unique_ptr<RuntimeResources>
 RuntimeResources::create(const RuntimeResourcesConfig &config) {
   if (config.metallibPath.empty() || config.modelRoot.empty() ||
       !kv::validFormat(config.kvFormat) ||
-      !config.model.valid() ||
+      !config.model.valid() || !config.hostAvailableMemory ||
       config.buildId.empty() || !config.maximumImagePatches ||
       config.maximumImagePatches % 4 ||
       config.maximumImagePatches > ops::kMaximumImagePatches) {
     throw RuntimeResourcesError(
         RuntimeResourceStage::Configuration,
-        "metallib path, model root, build id, and a merge-aligned image "
-        "patch limit no larger than the protocol's are required");
+        "metallib path, model root, a valid model layout and KV format, a "
+        "host memory probe, build id, and a merge-aligned image patch limit no "
+        "larger than the protocol's are required");
   }
   std::unique_ptr<metal::MetalBackend> backend;
   try {
@@ -270,7 +256,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
                                                     config.idleReleaseSeconds);
   } catch (const metal::MetalAllocationError &error) {
     throw RuntimeResourcesError(RuntimeResourceStage::BackendCreation,
-                                error.what(), {}, {},
+                                error.what(), {},
                                 resourceAllocationFailure(error.failure()));
   } catch (const std::exception &error) {
     throw RuntimeResourcesError(RuntimeResourceStage::BackendCreation,
@@ -280,18 +266,14 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
   const DeviceCapabilities &device = backend->capabilities();
   if (auto error = device.validationError()) {
     throw RuntimeResourcesError(RuntimeResourceStage::CapabilityValidation,
-                                *error, deviceStatusJson(device));
+                                *error);
   }
 
   const uint64_t hostReserveBytes =
       EngineMemoryPolicy::hostAvailableReserveBytes(device.physicalMemoryBytes);
-  // Reclaimable host memory, sampled at every Metal operation during startup
-  // and by the governor afterwards.
-  MemoryGovernor::HostAvailableMemoryProvider hostAvailableMemory =
-      testConfig().hostAvailableMemory ? testConfig().hostAvailableMemory
-                                       : queryHostAvailableMemory;
   // What other applications leave, measured before the engine takes any.
-  const std::optional<uint64_t> hostAvailableAtStart = hostAvailableMemory();
+  const std::optional<uint64_t> hostAvailableAtStart =
+      config.hostAvailableMemory();
   // Startup work stops on cancellation and keeps its reserve of host memory.
   const auto throwIfCancelled = [cancelled = config.cancelled] {
     if (cancelled && cancelled())
@@ -301,7 +283,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
     return pressure ? pressure() : MemoryPressure::Normal;
   };
   const auto admitMetalOperation = [throwIfCancelled, currentPressure,
-                                    hostAvailableMemory, hostReserveBytes] {
+                                    hostAvailableMemory = config.hostAvailableMemory,
+                                    hostReserveBytes] {
     throwIfCancelled();
     requireStartupHeadroom(hostAvailableMemory, hostReserveBytes,
                            currentPressure());
@@ -323,8 +306,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
           model::SlotFile::slotBytesFor(stateBytes), diskBudget);
     } catch (const std::exception &error) {
       diskBudget.reset();
-      logStartup("Cache disk tier disabled (", error.what(),
-                 "); no state staging is set aside.");
+      logLine("Cache disk tier disabled (", error.what(),
+              "); no state staging is set aside.");
     }
   }
   // A state's write to the disk tier stages through one buffer of a state's
@@ -360,7 +343,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
               std::to_string(requiredBytes) +
               " bytes but the Metal memory budget is " +
               std::to_string(hardBudgetBytes) + " bytes",
-          deviceStatusJson(device), {}, RuntimeResourceFailure::EngineCapacity);
+          {}, RuntimeResourceFailure::EngineCapacity);
     }
     // Fail before opening the package when the machine has no headroom at
     // all; the guard installed above keeps checking as residency grows.
@@ -369,11 +352,11 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
     throw;
   } catch (const metal::MetalAllocationError &error) {
     throw RuntimeResourcesError(RuntimeResourceStage::ModelLoading,
-                                error.what(), deviceStatusJson(device), {},
+                                error.what(), {},
                                 resourceAllocationFailure(error.failure()));
   } catch (const std::exception &error) {
     throw RuntimeResourcesError(RuntimeResourceStage::ModelLoading,
-                                error.what(), deviceStatusJson(device));
+                                error.what());
   }
 
   model::ModelPackage package;
@@ -382,15 +365,15 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
     package = model::loadModelPackage(*backend, config.modelRoot, config.model);
     requireLoadedModel(package);
     const std::chrono::duration<double> loading = AwakeClock::now() - started;
-    logStartup("Weights loaded in ", std::fixed, std::setprecision(2),
-               loading.count(), " s.");
+    logLine("Weights loaded in ", std::fixed, std::setprecision(2),
+            loading.count(), " s.");
   } catch (const metal::MetalAllocationError &error) {
     throw RuntimeResourcesError(RuntimeResourceStage::ModelLoading,
-                                error.what(), deviceStatusJson(device), {},
+                                error.what(), {},
                                 resourceAllocationFailure(error.failure()));
   } catch (const std::exception &error) {
     throw RuntimeResourcesError(RuntimeResourceStage::ModelLoading,
-                                error.what(), deviceStatusJson(device));
+                                error.what());
   }
 
   // One plan owner is used both before allocation and during encoding. The
@@ -402,8 +385,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
   } catch (const std::exception &error) {
     throw RuntimeResourcesError(
         RuntimeResourceStage::MemoryPlanning,
-        std::string("model allocated-size plan is invalid: ") + error.what(),
-        deviceStatusJson(device));
+        std::string("model allocated-size plan is invalid: ") + error.what());
   }
 
   ModelMemoryFootprint footprint{
@@ -420,9 +402,9 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
   EngineMemoryPlanResult planResult =
       evaluateEngineMemoryPlan(device, modelProfile, config.maximumMemoryBytes);
   if (!planResult.plan) {
-    throw RuntimeResourcesError(
-        RuntimeResourceStage::MemoryPlanning, planResult.status.message,
-        planResult.status.toStatusJson(), planResult.status.describe());
+    throw RuntimeResourcesError(RuntimeResourceStage::MemoryPlanning,
+                                planResult.status.message,
+                                planResult.status.describe());
   }
   EngineMemoryPlan memoryPlan = std::move(*planResult.plan);
 
@@ -434,7 +416,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
         package.targetKvLayout(config.kvFormat));
   } catch (const std::exception &error) {
     throw RuntimeResourcesError(RuntimeResourceStage::ModelLoading,
-                                error.what(), memoryPlan.toStatusJson(),
+                                error.what(),
                                 memoryPlan.breakdown().describe());
   }
 
@@ -445,12 +427,12 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
     // allocator reserves, so memory outside the backend's buffers is charged
     // only beyond them, and elastic state and KV never grow into them.
     auto memoryGovernor = std::make_unique<MemoryGovernor>(
-        *backend, budget.hardBudgetBytes, hostReserveBytes, hostAvailableMemory,
+        *backend, budget.hardBudgetBytes, hostReserveBytes, config.hostAvailableMemory,
         budget.pipelineReserveBytes + budget.runtimeOverheadReserveBytes);
     if (config.memoryPressure)
       memoryGovernor->setPressure(config.memoryPressure());
-    logStartup("Kernel policy for GPU family ", device.appleGpuFamily,
-               " with ", device.gpuCoreCount, " cores.");
+    logLine("Kernel policy for GPU family ", device.appleGpuFamily,
+            " with ", device.gpuCoreCount, " cores.");
 
     // Page ids for every extent the hard budget could hold: the governor,
     // never the id range, limits the pool.
@@ -485,18 +467,18 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
             *kvPages, persistentCache.kv
                           ? persistentCache.kv
                           : std::make_shared<model::SlotFile>(slotBytes, diskBudget));
-        logStartup(persistentCache.directory ? "Persistent cache tier: " : "Cache disk tier: ",
-                   config.maximumCacheDiskBytes / kMiB, " MiB for KV pages of ",
-                   slotBytes / 1024, " KiB and states of ", stateBytes / kMiB,
-                   " MiB; a state's write stages through ", stateStagingBytes / kMiB,
-                   " MiB of the memory plan.");
+        logLine(persistentCache.directory ? "Persistent cache tier: " : "Cache disk tier: ",
+                config.maximumCacheDiskBytes / kMiB, " MiB for KV pages of ",
+                slotBytes / 1024, " KiB and states of ", stateBytes / kMiB,
+                " MiB; a state's write stages through ", stateStagingBytes / kMiB,
+                " MiB of the memory plan.");
       } catch (const std::exception &error) {
         // The persistent files are open by now; without the tier nothing
         // would keep or replace their copies.
         if (persistentCache.directory)
           throw;
-        logStartup("Cache disk KV storage disabled; state storage remains enabled (",
-                   error.what(), ").");
+        logLine("Cache disk KV storage disabled; state storage remains enabled (",
+                error.what(), ").");
       }
     }
     auto cache = std::make_unique<engine::Cache>(*kvPool, kvTier.get(), diskBudget);
@@ -526,12 +508,12 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
     return result;
   } catch (const metal::MetalAllocationError &error) {
     throw RuntimeResourcesError(RuntimeResourceStage::StorageAllocation,
-                                error.what(), memoryPlan.toStatusJson(),
+                                error.what(),
                                 memoryPlan.breakdown().describe(),
                                 resourceAllocationFailure(error.failure()));
   } catch (const std::exception &error) {
     throw RuntimeResourcesError(RuntimeResourceStage::StorageAllocation,
-                                error.what(), memoryPlan.toStatusJson(),
+                                error.what(),
                                 memoryPlan.breakdown().describe());
   }
 }
@@ -549,7 +531,7 @@ void RuntimeResources::adoptPersistentCache() {
     return;
   CacheDirectory &directory = *persistentCache_.directory;
   if (!directory.coldReason().empty())
-    logStartup("Persistent cache emptied: ", directory.coldReason(), ".");
+    logLine("Persistent cache emptied: ", directory.coldReason(), ".");
   std::vector<PersistedKv> blocks;
   for (const model::SlotRecord &record : persistentCache_.kv->records())
     blocks.push_back({record.label, [this, record] { return kvTier_->adopt(record); }});
@@ -561,13 +543,13 @@ void RuntimeResources::adoptPersistentCache() {
   const CacheAdoption adoption = cache_->adopt(std::move(blocks), std::move(states));
   persistentCache_.kv->finishAdoption();
   persistentCache_.states->finishAdoption();
-  logStartup("Persistent cache ", directory.path().string(), ": took back ", adoption.states,
-             " restore points over ", adoption.blocks, " KV blocks (", adoption.bytes / kMiB,
-             " MiB); left ", adoption.dropped, " copies behind.",
-             directory.uncleanExit()
-                 ? " The last process did not stop cleanly: this one serves on probation for "
-                   "its first minute."
-                 : "");
+  logLine("Persistent cache ", directory.path().string(), ": took back ", adoption.states,
+          " restore points over ", adoption.blocks, " KV blocks (", adoption.bytes / kMiB,
+          " MiB); left ", adoption.dropped, " copies behind.",
+          directory.uncleanExit()
+              ? " The last process did not stop cleanly: this one serves on probation for "
+                "its first minute."
+              : "");
 }
 
 void RuntimeResources::beginServing() {
@@ -578,8 +560,8 @@ void RuntimeResources::beginServing() {
   try {
     directory->beginServing(probation);
   } catch (const std::exception &error) {
-    logStartup("Persistent cache cannot mark this process serving (", error.what(),
-               "); the next start will not know how it ended.");
+    logLine("Persistent cache cannot mark this process serving (", error.what(),
+            "); the next start will not know how it ended.");
     return;
   }
   if (!probation)
@@ -592,7 +574,7 @@ void RuntimeResources::beginServing() {
     try {
       directory->endProbation();
     } catch (const std::exception &error) {
-      logStartup("Persistent cache probation did not end (", error.what(), ").");
+      logLine("Persistent cache probation did not end (", error.what(), ").");
     }
   });
 }

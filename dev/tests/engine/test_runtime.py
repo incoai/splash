@@ -230,8 +230,10 @@ def request(
         sampling=sampling or wire.SamplingParameters(),
         seed=seed,
         constraint=constraint,
-        return_progress=return_progress,
         score_tokens=score_tokens,
+        flags=wire.RequestFlag.RETURN_PROGRESS
+        if return_progress
+        else wire.RequestFlag(0),
         generation_prompt_tokens=generation_prompt_tokens,
     )
     return engine_runtime.GenerationRequest(
@@ -275,10 +277,9 @@ def answer_status(process, message):
 
 def fast_liveness_probe(test):
     """Probes the loop every 50 ms and fails it after 200 ms without an answer."""
-    return mock.patch.multiple(
-        engine_runtime.MultiplexedRuntime,
-        _liveness_interval_seconds=0.05,
-        _liveness_timeout_seconds=0.2,
+    test = mock.patch.object(engine_runtime, "STATUS_ANSWER_LIMIT_SECONDS", 0.2)(test)
+    return mock.patch.object(
+        engine_runtime.MultiplexedRuntime, "_liveness_interval_seconds", 0.05
     )(test)
 
 
@@ -288,6 +289,7 @@ class RuntimeTests(unittest.TestCase):
         runtime = engine_runtime.MultiplexedRuntime(
             process_factory=factory,
             pending_limit=4,
+            eager_start=True,
         )
         self.addCleanup(runtime.close)
         process = factory.processes[0]
@@ -414,7 +416,9 @@ class RuntimeTests(unittest.TestCase):
 
     def test_result_is_available_before_completion_callback_finishes(self):
         factory = FakeFactory()
-        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, eager_start=True
+        )
         self.addCleanup(runtime.close)
         callback_entered = threading.Event()
         callback_release = threading.Event()
@@ -457,7 +461,9 @@ class RuntimeTests(unittest.TestCase):
         for name, valid_chunks, bad_offset, bad_tokens, message in cases:
             with self.subTest(name=name):
                 factory = FakeFactory()
-                runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+                runtime = engine_runtime.MultiplexedRuntime(
+                    process_factory=factory, eager_start=True
+                )
                 process = factory.processes[0]
                 call = runtime.submit(request(11))
                 try:
@@ -526,7 +532,9 @@ class RuntimeTests(unittest.TestCase):
         ) in cases:
             with self.subTest(name=name):
                 factory = FakeFactory()
-                runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+                runtime = engine_runtime.MultiplexedRuntime(
+                    process_factory=factory, eager_start=True
+                )
                 process = factory.processes[0]
                 call = runtime.submit(request(12))
                 try:
@@ -554,7 +562,9 @@ class RuntimeTests(unittest.TestCase):
 
     def test_length_done_at_logical_max_is_valid(self):
         factory = FakeFactory()
-        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, eager_start=True
+        )
         self.addCleanup(runtime.close)
         process = factory.processes[0]
         call = runtime.submit(request(13, logical_max_output_tokens=3))
@@ -573,7 +583,9 @@ class RuntimeTests(unittest.TestCase):
 
     def test_stop_done_at_logical_max_is_valid(self):
         factory = FakeFactory()
-        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, eager_start=True
+        )
         self.addCleanup(runtime.close)
         process = factory.processes[0]
         call = runtime.submit(request(14, logical_max_output_tokens=3))
@@ -585,7 +597,9 @@ class RuntimeTests(unittest.TestCase):
 
     def test_cancel_is_a_correlated_frame(self):
         factory = FakeFactory()
-        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, eager_start=True
+        )
         self.addCleanup(runtime.close)
         process = factory.processes[0]
         events = []
@@ -610,7 +624,9 @@ class RuntimeTests(unittest.TestCase):
 
     def test_generation_prompt_tokens_reach_the_request_frame(self):
         factory = FakeFactory()
-        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, eager_start=True
+        )
         self.addCleanup(runtime.close)
         runtime.submit(request(10, generation_prompt_tokens=1))
         frame = factory.processes[0].stdin.wait_for(wire.RequestFrame)[0]
@@ -618,7 +634,9 @@ class RuntimeTests(unittest.TestCase):
 
     def test_score_request_passes_slots_and_returns_option_logits(self):
         factory = FakeFactory()
-        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, eager_start=True
+        )
         self.addCleanup(runtime.close)
         process = factory.processes[0]
         call = runtime.submit(
@@ -654,7 +672,9 @@ class RuntimeTests(unittest.TestCase):
                 reason=reason, logits=logits, decode_micros=decode_micros
             ):
                 factory = FakeFactory()
-                runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+                runtime = engine_runtime.MultiplexedRuntime(
+                    process_factory=factory, eager_start=True
+                )
                 process = factory.processes[0]
                 call = runtime.submit(
                     request(
@@ -685,7 +705,9 @@ class RuntimeTests(unittest.TestCase):
 
     def test_generation_done_with_option_logits_is_fatal(self):
         factory = FakeFactory()
-        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, eager_start=True
+        )
         process = factory.processes[0]
         call = runtime.submit(request(10))
         try:
@@ -710,7 +732,9 @@ class RuntimeTests(unittest.TestCase):
 
     def test_cancelled_score_done_returns_no_logits(self):
         factory = FakeFactory()
-        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, eager_start=True
+        )
         self.addCleanup(runtime.close)
         process = factory.processes[0]
         call = runtime.submit(
@@ -746,7 +770,9 @@ class RuntimeTests(unittest.TestCase):
             )
 
         factory = FakeFactory(handler)
-        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, eager_start=True
+        )
         self.addCleanup(runtime.close)
         events = []
         call = runtime.submit(
@@ -768,10 +794,9 @@ class RuntimeTests(unittest.TestCase):
             ).tobytes()
 
         factory = FakeFactory()
-        self.enterContext(
-            mock.patch.object(engine_runtime.MultiplexedRuntime, "_mask_workers", 1)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, eager_start=True, mask_workers=1
         )
-        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
         self.addCleanup(runtime.close)
         process = factory.processes[0]
         call = runtime.submit(
@@ -799,7 +824,9 @@ class RuntimeTests(unittest.TestCase):
         ):
             with self.subTest(message=message):
                 factory = FakeFactory()
-                runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+                runtime = engine_runtime.MultiplexedRuntime(
+                    process_factory=factory, eager_start=True
+                )
                 self.addCleanup(runtime.close)
                 process = factory.processes[0]
                 bad = runtime.submit(
@@ -846,7 +873,9 @@ class RuntimeTests(unittest.TestCase):
 
     def test_mask_request_for_unconstrained_request_is_protocol_fatal(self):
         factory = FakeFactory()
-        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, eager_start=True
+        )
         self.addCleanup(runtime.close)
         process = factory.processes[0]
         call = runtime.submit(request(10))
@@ -866,7 +895,9 @@ class RuntimeTests(unittest.TestCase):
             return b""
 
         factory = FakeFactory()
-        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, eager_start=True
+        )
         self.addCleanup(runtime.close)
         process = factory.processes[0]
         call = runtime.submit(
@@ -900,7 +931,9 @@ class RuntimeTests(unittest.TestCase):
                 raise failures[event.sequence_offset]
 
         factory = FakeFactory()
-        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, eager_start=True
+        )
         self.addCleanup(runtime.close)
         process = factory.processes[0]
         call = runtime.submit(request(10), on_event=on_event)
@@ -931,10 +964,9 @@ class RuntimeTests(unittest.TestCase):
             return array("I", (1,) * (event.words_per_mask * event.mask_rows)).tobytes()
 
         factory = FakeFactory()
-        self.enterContext(
-            mock.patch.object(engine_runtime.MultiplexedRuntime, "_mask_workers", 1)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, eager_start=True, mask_workers=1
         )
-        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
         self.addCleanup(runtime.close)
         process = factory.processes[0]
         call = runtime.submit(
@@ -973,11 +1005,8 @@ class RuntimeTests(unittest.TestCase):
             return array("I", (1,) * (event.words_per_mask * event.mask_rows)).tobytes()
 
         factory = FakeFactory()
-        self.enterContext(
-            mock.patch.object(engine_runtime.MultiplexedRuntime, "_mask_workers", 1)
-        )
         runtime = engine_runtime.MultiplexedRuntime(
-            process_factory=factory, pending_limit=2
+            process_factory=factory, pending_limit=2, eager_start=True, mask_workers=1
         )
         self.addCleanup(runtime.close)
         self.addCleanup(release.set)
@@ -1040,7 +1069,7 @@ class RuntimeTests(unittest.TestCase):
 
         factory = FakeFactory()
         runtime = engine_runtime.MultiplexedRuntime(
-            process_factory=factory, pending_limit=1
+            process_factory=factory, pending_limit=1, eager_start=True
         )
         self.addCleanup(runtime.close)
         self.addCleanup(release.set)
@@ -1089,7 +1118,9 @@ class RuntimeTests(unittest.TestCase):
                 answer_status(process, message)
 
         factory = FakeFactory(handler)
-        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, eager_start=True
+        )
         self.addCleanup(runtime.close)
         process = factory.processes[0]
 
@@ -1118,7 +1149,9 @@ class RuntimeTests(unittest.TestCase):
                 answer_status(process, message)
 
         factory = FakeFactory(handler)
-        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, eager_start=True
+        )
         self.addCleanup(runtime.close)
         call = runtime.submit(request(1))
         # The reader thread keeps taking writes; only the loop stops.
@@ -1138,7 +1171,9 @@ class RuntimeTests(unittest.TestCase):
                 answer_status(process, message)
 
         factory = FakeFactory(handler)
-        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, eager_start=True
+        )
         self.addCleanup(runtime.close)
         process = factory.processes[0]
         time.sleep(0.3)
@@ -1156,7 +1191,9 @@ class RuntimeTests(unittest.TestCase):
 
     def test_status_with_correlation_zero_is_protocol_fatal(self):
         factory = FakeFactory()
-        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, eager_start=True
+        )
         self.addCleanup(runtime.close)
         call = runtime.submit(request(10))
         factory.processes[0].send(wire.StatusJsonEvent(0, READY_STATUS))
@@ -1168,7 +1205,9 @@ class RuntimeTests(unittest.TestCase):
 
     def test_request_failures_are_scoped(self):
         factory = FakeFactory()
-        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, eager_start=True
+        )
         self.addCleanup(runtime.close)
         process = factory.processes[0]
         request_error = runtime.submit(request(50))
@@ -1194,7 +1233,9 @@ class RuntimeTests(unittest.TestCase):
 
     def test_unhealthy_fatal_and_eof_fail_all_then_restart_on_wait_ready(self):
         factory = FakeFactory()
-        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, eager_start=True
+        )
         self.addCleanup(runtime.close)
 
         def relaunch():
@@ -1258,7 +1299,9 @@ class RuntimeTests(unittest.TestCase):
         self,
     ):
         factory = FakeFactory()
-        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, eager_start=True
+        )
         self.addCleanup(runtime.close)
         order = []
         completed = threading.Event()
@@ -1287,7 +1330,9 @@ class RuntimeTests(unittest.TestCase):
 
     def test_fatal_error_property_reports_changed_limits(self):
         factory = FakeFactory()
-        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, eager_start=True
+        )
         self.addCleanup(runtime.close)
         self.assertIsNone(runtime.fatal_error)
         factory.initial_output = native_peer.serialize_event(
@@ -1304,7 +1349,9 @@ class RuntimeTests(unittest.TestCase):
 
     def test_unanswered_status_with_fail_unanswered_fails_only_its_generation(self):
         factory = FakeFactory()
-        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, eager_start=True
+        )
         self.addCleanup(runtime.close)
         failures = []
         runtime.on_engine_failure = lambda error, _served: failures.append(error)
@@ -1342,7 +1389,7 @@ class RuntimeTests(unittest.TestCase):
     def test_invalidation_before_registration_returns_the_admission_slot(self):
         factory = FakeFactory()
         runtime = engine_runtime.MultiplexedRuntime(
-            process_factory=factory, pending_limit=1
+            process_factory=factory, pending_limit=1, eager_start=True
         )
         self.addCleanup(runtime.close)
         serialize = wire.serialize_message
@@ -1369,7 +1416,9 @@ class RuntimeTests(unittest.TestCase):
 
     def test_eof_restarts_and_close_is_terminal(self):
         factory = FakeFactory()
-        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, eager_start=True
+        )
         call = runtime.submit(request(130))
         factory.processes[0].close_stdout()
         with self.assertRaisesRegex(engine_runtime.EngineUnhealthy, "reached EOF"):
@@ -1386,7 +1435,9 @@ class RuntimeTests(unittest.TestCase):
 
     def test_failed_call_releases_its_request_when_the_caller_drops_it(self):
         factory = FakeFactory()
-        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, eager_start=True
+        )
         self.addCleanup(runtime.close)
 
         class ImageOwner:
@@ -1429,6 +1480,7 @@ class RuntimeTests(unittest.TestCase):
             runtime = engine_runtime.MultiplexedRuntime(
                 command=("fake-native", "serve-native"),
                 process_factory=factory,
+                eager_start=True,
             )
             call = runtime.submit(request(130))
             factory.processes[0].close_stdout()
@@ -1452,6 +1504,7 @@ class RuntimeTests(unittest.TestCase):
                 command=("fake-native", "serve-native"),
                 process_factory=factory,
                 pending_limit=1,
+                eager_start=True,
             )
             runtime.on_engine_failure = lambda error, _served: failures.append(
                 str(error)
@@ -1470,7 +1523,9 @@ class RuntimeTests(unittest.TestCase):
 
     def test_close_callback_can_reenter_without_process_lock_deadlock(self):
         factory = FakeFactory()
-        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, eager_start=True
+        )
         callback_finished = threading.Event()
         callback_error = []
 
@@ -1500,6 +1555,7 @@ class RuntimeTests(unittest.TestCase):
             engine_runtime.MultiplexedRuntime(
                 process_factory=factory,
                 startup_timeout=0.2,
+                eager_start=True,
             )
         self.assertIsNotNone(factory.processes[0].poll())
 
@@ -1508,7 +1564,6 @@ class RuntimeTests(unittest.TestCase):
         runtime = engine_runtime.MultiplexedRuntime(
             process_factory=factory,
             startup_timeout=0.2,
-            eager_start=False,
         )
         self.addCleanup(runtime.close)
         barrier = threading.Barrier(4)
@@ -1530,7 +1585,6 @@ class RuntimeTests(unittest.TestCase):
         runtime = engine_runtime.MultiplexedRuntime(
             process_factory=factory,
             startup_timeout=10.0,
-            eager_start=False,
         )
         failure = []
 
@@ -1565,7 +1619,6 @@ class RuntimeTests(unittest.TestCase):
         runtime = engine_runtime.MultiplexedRuntime(
             process_factory=FakeFactory(),
             startup_timeout=10.0,
-            eager_start=False,
         )
         try:
             with mock.patch.object(
@@ -1591,7 +1644,9 @@ class RuntimeTests(unittest.TestCase):
 
         process = SlowTeardown(1000)
         self.addCleanup(process.kill)
-        runtime = engine_runtime.MultiplexedRuntime(process_factory=lambda: process)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=lambda: process, eager_start=True
+        )
         closing = threading.Thread(target=runtime.close)
         closing.start()
         self.assertTrue(waiting.wait(1.0))
@@ -1609,7 +1664,6 @@ class RuntimeTests(unittest.TestCase):
         runtime = engine_runtime.MultiplexedRuntime(
             process_factory=FakeFactory(),
             startup_timeout=10.0,
-            eager_start=False,
         )
         try:
             with mock.patch.object(
@@ -1626,7 +1680,9 @@ class RuntimeTests(unittest.TestCase):
     def test_wire_deadline_is_stamped_once_at_submission(self):
         wall = 1_700_000_000_000_000
         factory = FakeFactory()
-        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, eager_start=True
+        )
         self.addCleanup(runtime.close)
         with mock.patch.object(
             engine_runtime.time, "time_ns", return_value=wall * 1000
@@ -1654,7 +1710,6 @@ class RuntimeTests(unittest.TestCase):
         factory = FakeFactory(initial_output=b"")
         runtime = engine_runtime.MultiplexedRuntime(
             process_factory=factory,
-            eager_start=False,
             startup_timeout=1,
             pending_limit=2,
         )
@@ -1686,7 +1741,7 @@ class RuntimeTests(unittest.TestCase):
             return process
 
         runtime = engine_runtime.MultiplexedRuntime(
-            process_factory=create_process, eager_start=False, startup_timeout=2.0
+            process_factory=create_process, startup_timeout=2.0
         )
         self.addCleanup(runtime.close)
         with self.assertRaises(TimeoutError):
@@ -1706,7 +1761,7 @@ class RuntimeTests(unittest.TestCase):
             return factory()
 
         runtime = engine_runtime.MultiplexedRuntime(
-            process_factory=slow_factory, eager_start=False, startup_timeout=1
+            process_factory=slow_factory, startup_timeout=1
         )
         self.addCleanup(runtime.close)
         try:
@@ -1721,9 +1776,7 @@ class RuntimeTests(unittest.TestCase):
 
     def test_submit_on_a_not_ready_runtime_fails_fast_and_launches_nothing(self):
         factory = FakeFactory()
-        runtime = engine_runtime.MultiplexedRuntime(
-            process_factory=factory, eager_start=False
-        )
+        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
         self.addCleanup(runtime.close)
         started = time.monotonic()
         with self.assertRaisesRegex(engine_runtime.EngineUnhealthy, "not ready"):
@@ -1746,7 +1799,7 @@ class RuntimeTests(unittest.TestCase):
             return process
 
         runtime = engine_runtime.MultiplexedRuntime(
-            process_factory=slow_factory, eager_start=False, startup_timeout=0.02
+            process_factory=slow_factory, startup_timeout=0.02
         )
         self.addCleanup(runtime.close)
         try:
@@ -1762,7 +1815,9 @@ class RuntimeTests(unittest.TestCase):
 
     def test_write_lock_waits_consume_request_and_status_deadlines(self):
         factory = FakeFactory()
-        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, eager_start=True
+        )
         self.addCleanup(runtime.close)
         with runtime._write_lock:
             for action in (
@@ -1783,7 +1838,9 @@ class RuntimeTests(unittest.TestCase):
 
     def test_cancel_write_timeout_fails_generation(self):
         factory = FakeFactory()
-        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, eager_start=True
+        )
         self.addCleanup(runtime.close)
         runtime._io_timeout_seconds = 0.02
         call = runtime.submit(request(1))
@@ -1798,7 +1855,9 @@ class RuntimeTests(unittest.TestCase):
 
     def test_nonblocking_retries_and_short_writes_preserve_exact_frame(self):
         factory = FakeFactory()
-        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, eager_start=True
+        )
         self.addCleanup(runtime.close)
         stdin = factory.processes[0].stdin
         write = stdin.write
@@ -1832,7 +1891,9 @@ class RuntimeTests(unittest.TestCase):
         def factory():
             return processes.pop() if processes else replacement_factory()
 
-        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, eager_start=True
+        )
         self.addCleanup(runtime.close)
         runtime._io_timeout_seconds = 0.15
         failure_state = []
@@ -1877,7 +1938,9 @@ class RuntimeTests(unittest.TestCase):
         read_fd, write_fd = os.pipe()
         process.stdin = os.fdopen(write_fd, "wb", buffering=0)
         self.addCleanup(os.close, read_fd)
-        runtime = engine_runtime.MultiplexedRuntime(process_factory=lambda: process)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=lambda: process, eager_start=True
+        )
         self.addCleanup(runtime.close)
         active = runtime.submit(request(1))
         os.read(read_fd, 65536)  # Drain just the first complete request.

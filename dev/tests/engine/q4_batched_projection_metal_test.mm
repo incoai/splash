@@ -196,7 +196,7 @@ std::vector<uint8_t> runSplitPlan(MetalBackend &backend, const splash::ops::Line
       dispatches.push_back(dispatch);
     }
   }
-  (void)backend.submitCommand(dispatches);
+  (void)backend.submitCommandAsync(dispatches).wait();
   const auto *count = static_cast<const uint32_t *>(counters.view.contents());
   if (!output.intact() || !partials.intact() || !counters.intact() || (gateScratch && !gateScratch->intact()) ||
       !std::all_of(count, count + scratch.counters / 4, [](uint32_t value) { return value == 0; }))
@@ -261,7 +261,7 @@ void splitCase(MetalBackend &backend, const SplitCase &c) {
     linear.add(graph, {input, output, {}, epilogue == LinearEpilogue::Residual ? residual : MetalBuffer{},
                        reference.gateScratchBytes() ? gateScratch : MetalBuffer{}, {}},
                weights, reference, epilogue == LinearEpilogue::GateUp ? &gate : nullptr);
-    (void)backend.submitCommand(graph.dispatches());
+    (void)backend.submitCommandAsync(graph.dispatches()).wait();
     return output;
   };
   const bool gateUp = c.epilogue == LinearEpilogue::GateUp;
@@ -371,7 +371,7 @@ void run(const std::string &metallibPath) {
                      outputElements * sizeof(__bf16)),
         params));
   }
-  (void)backend.submitCommand(singles);
+  (void)backend.submitCommandAsync(singles).wait();
 
   // The pipelined narrow-projection kernel issues two quant groups before
   // either epilogue; its outputs must be byte-identical to the sequential M8.
@@ -390,7 +390,7 @@ void run(const std::string &metallibPath) {
                      outputElements * sizeof(__bf16)),
         params));
   }
-  (void)backend.submitCommand(pairedSingles);
+  (void)backend.submitCommandAsync(pairedSingles).wait();
   if (std::memcmp(reference.contents(), paired.contents(), paired.sizeBytes()))
     fail("paired M8 projection differs from the sequential M8 projection");
   std::cout << "PASS q4 paired M8 exact=true\n";
@@ -407,7 +407,7 @@ void run(const std::string &metallibPath) {
         backend.view(input, 0,
                      uint64_t{width} * inputElements * sizeof(__bf16)),
         weights, scales, biases, candidate, params);
-    const auto timing = backend.submitCommand({&batch, 1});
+    const auto timing = backend.submitCommandAsync({&batch, 1}).wait();
     const uint64_t comparedBytes =
         uint64_t{width} * outputElements * sizeof(__bf16);
     if (std::memcmp(reference.contents(), candidate.contents(), comparedBytes))
@@ -434,7 +434,7 @@ void run(const std::string &metallibPath) {
                      outputElements * sizeof(__bf16)),
         params);
   }
-  (void)backend.submitCommand(gateUpSingles);
+  (void)backend.submitCommandAsync(gateUpSingles).wait();
   std::array<ComputeDispatch, 2> splitDispatches{
       affine("decode_linear_q4_n256_m24",
              backend.view(input, 0, uint64_t{3} * inputElements * sizeof(__bf16)),
@@ -442,7 +442,7 @@ void run(const std::string &metallibPath) {
       upSilu("decode_linear_q4_n256_up_silu_m24",
              backend.view(input, 0, uint64_t{3} * inputElements * sizeof(__bf16)),
              weights, scales, biases, gateScratch, combined, params)};
-  const auto timing = backend.submitCommand(splitDispatches);
+  const auto timing = backend.submitCommandAsync(splitDispatches).wait();
   if (std::memcmp(gateUpReference.contents(), combined.contents(), m24Bytes))
     fail("M24 split gate/up differs from its M8 references");
   std::cout << "PASS q4 M24 split-gate exact=true wall_seconds="
@@ -480,7 +480,7 @@ void run(const std::string &metallibPath) {
         "decode_linear_q4_n128_m24",
         backend.view(input, 0, kPersistentLanes * laneInputBytes), weights,
         scales, biases, persistent, oneGroup));
-    (void)backend.submitCommand(dispatches);
+    (void)backend.submitCommandAsync(dispatches).wait();
     if (std::memcmp(singleTile.contents(), persistent.contents(), outputBytes))
       fail("persistent M24 projection at K=" + std::to_string(persistentInput) +
            " differs from its single-tile M8 references");

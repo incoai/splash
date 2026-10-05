@@ -156,7 +156,7 @@ void testRowCopy(MetalBackend &backend) {
             input[uint64_t{from.row + row} * from.stride + from.column + column];
     CommandGraph graph;
     RowCopy::add(graph, source, from, destination, to, rows, width);
-    static_cast<void>(backend.submitCommand(graph.dispatches()));
+    static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
     require(std::equal(expected.begin(), expected.end(), contents<uint16_t>(destination)), what);
   };
   constexpr uint32_t kWidth = 2048;

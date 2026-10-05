@@ -17,6 +17,7 @@ from server import constraints as generation_constraints
 from server import errors as api_errors
 from server import images, runtime
 from server import protocol as wire
+from server.runtime import STATUS_ANSWER_LIMIT_SECONDS
 
 
 class FakeTokenizer:
@@ -160,6 +161,8 @@ class FakeRuntime:
             raise runtime.PendingLimitExceeded("full")
         if self.mode == "raise_before_call":
             raise runtime.EngineUnhealthy("native process is not ready")
+        if self.mode == "protocol_failure_before_call":
+            raise runtime.ProtocolFatal("native sent more than one ReadyEvent")
         call = FakeCall(len(self.calls) + 1, request, on_event, on_complete)
         self.calls.append(call)
         if self.mode == "block_after_call":
@@ -322,6 +325,7 @@ class NativeBackendContractTests(unittest.TestCase):
         native = runtime.MultiplexedRuntime(
             process_factory=factory,
             pending_limit=4,
+            eager_start=True,
         )
         transport, _runtime = self.make_transport(native)
         job = make_job(404, temperature=0.6)
@@ -365,6 +369,7 @@ class NativeBackendContractTests(unittest.TestCase):
         native = runtime.MultiplexedRuntime(
             process_factory=factory,
             pending_limit=4,
+            eager_start=True,
         )
         transport, _runtime = self.make_transport(native)
         app = make_frontend(
@@ -388,6 +393,7 @@ class NativeBackendContractTests(unittest.TestCase):
         native = runtime.MultiplexedRuntime(
             process_factory=factory,
             pending_limit=4,
+            eager_start=True,
         )
         transport, _runtime = self.make_transport(native)
         job = make_job(404)
@@ -424,6 +430,7 @@ class NativeBackendContractTests(unittest.TestCase):
         native = runtime.MultiplexedRuntime(
             process_factory=factory,
             pending_limit=4,
+            eager_start=True,
         )
         transport, _runtime = self.make_transport(native)
         constraint = FakeConstraint(words_per_mask=2)
@@ -485,7 +492,9 @@ class NativeBackendContractTests(unittest.TestCase):
     def test_finalized_request_returns_its_image_budget(self):
         factory = FakeFactory()
         transport, _runtime = self.make_transport(
-            runtime.MultiplexedRuntime(process_factory=factory, pending_limit=4)
+            runtime.MultiplexedRuntime(
+                process_factory=factory, pending_limit=4, eager_start=True
+            )
         )
         self.enterContext(mock.patch.object(images.ImageCache, "BUDGET_BYTES", 0))
         self.enterContext(
@@ -539,18 +548,21 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertFalse(transport.active)
 
     def test_pre_admission_native_failure_is_refused_once_without_retry(self):
-        # The engine died after do_POST's own refusal check passed.
-        runtime_client = FakeRuntime("raise_before_call")
-        runtime_client.ready = False
-        transport, _runtime = self.make_transport(runtime_client)
-        job = make_job()
+        # The engine died, or broke the protocol, after do_POST's own refusal
+        # check passed.
+        for mode in ("raise_before_call", "protocol_failure_before_call"):
+            with self.subTest(mode=mode):
+                runtime_client = FakeRuntime(mode)
+                runtime_client.ready = False
+                transport, _runtime = self.make_transport(runtime_client)
+                job = make_job()
 
-        transport.submit(job)
-        self.assertEqual(runtime_client.submit_attempts, 1)
-        kind, error = self.terminal(job)
-        self.assertEqual(kind, "error")
-        self.assertEqual((error.status, error.code), (503, "engine_recovering"))
-        self.assertFalse(transport.active)
+                transport.submit(job)
+                self.assertEqual(runtime_client.submit_attempts, 1)
+                kind, error = self.terminal(job)
+                self.assertEqual(kind, "error")
+                self.assertEqual((error.status, error.code), (503, "engine_recovering"))
+                self.assertFalse(transport.active)
 
     def test_pending_limit_does_not_leave_active_state(self):
         transport, _runtime = self.make_transport(FakeRuntime("pending_limit"))
@@ -799,7 +811,7 @@ class NativeBackendContractTests(unittest.TestCase):
             )
             self.assertTrue(transport.is_ready())
 
-            clock[0] += backend_api.STATUS_BACKGROUND_TIMEOUT_SECONDS
+            clock[0] += STATUS_ANSWER_LIMIT_SECONDS
             status = transport.status(timeout=0.01)
             self.assertFalse(status["ready"])
             self.assertTrue(status["transport"]["status_stale"])
@@ -905,7 +917,7 @@ class NativeBackendContractTests(unittest.TestCase):
             release.set()
             self.wait_for_recovery(transport)
             self.assertIsNone(transport.status_unanswered_since)
-            clock[0] += backend_api.STATUS_BACKGROUND_TIMEOUT_SECONDS
+            clock[0] += STATUS_ANSWER_LIMIT_SECONDS
             native.mode = "status_timeout_once"
             # One missed probe later on is a busy loop, not a wedged one.
             self.assertTrue(transport.status()["ready"])
@@ -931,7 +943,7 @@ class NativeBackendContractTests(unittest.TestCase):
             self.assertTrue(transport.status()["ready"])
             self.wait_for_recovery(transport)
             self.assertIsNone(transport.status_unanswered_since)
-            clock[0] += backend_api.STATUS_BACKGROUND_TIMEOUT_SECONDS
+            clock[0] += STATUS_ANSWER_LIMIT_SECONDS
             self.assertTrue(transport.status()["ready"])
             self.wait_for_recovery(transport)
 
@@ -1076,7 +1088,7 @@ class NativeBackendContractTests(unittest.TestCase):
                 (400, "invalid_count"),
             ),
             (runtime.EngineUnhealthy("gpu failed"), (503, "runtime_unavailable")),
-            (runtime.ProtocolFatal("bad frame"), (500, "protocol_error")),
+            (runtime.ProtocolFatal("bad frame"), (503, "runtime_unavailable")),
             (
                 runtime.MaskComputationFailed("grammar has no valid token"),
                 (400, "constraint_error"),

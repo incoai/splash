@@ -21,6 +21,7 @@
 #include <utility>
 
 using splash::engine::CacheDirectory;
+using splash::test::rejects;
 using splash::test::require;
 using namespace std::chrono_literals;
 
@@ -53,16 +54,6 @@ private:
 
 void touch(const std::filesystem::path &path) { std::ofstream(path) << "cache"; }
 
-template <typename Exception, typename Call>
-bool throws(Call call) {
-  try {
-    call();
-  } catch (const Exception &) {
-    return true;
-  }
-  return false;
-}
-
 // A namespace belongs to one process at a time; a second opener gives up
 // after its wait, and takes it once it is free.
 void testOneProcessAtATime() {
@@ -86,9 +77,10 @@ void testOneProcessAtATime() {
           "a cancelled wait for the lock did not stop");
   first.reset();
   require(root.open() != nullptr, "a released cache directory could not be opened");
-  require(throws<std::invalid_argument>([&] { static_cast<void>(root.open("../escape")); }) &&
-              throws<std::invalid_argument>([&] { static_cast<void>(root.open("ABCD")); }),
-          "a namespace that is not a plain name was accepted");
+  for (const char *name : {"../escape", "ABCD"})
+    rejects([&] { static_cast<void>(root.open(name)); },
+            "a cache namespace is a name of lowercase hex digits",
+            "a namespace that is not a plain name was accepted");
 }
 
 // The marks say how the last process ended: serving without closing is an
@@ -207,7 +199,8 @@ void testForeignDirectoriesAreRefused() {
   static_cast<void>(root.open());
   require(::chmod((root.path() / "0123abcd").c_str(), 0777) == 0,
           "cache directory permissions could not be widened");
-  require(throws<std::system_error>([&] { static_cast<void>(root.open()); }),
+  rejects([&] { static_cast<void>(root.open()); },
+          "it belongs to another user or others may write to it",
           "a cache directory others may write to was opened");
 }
 

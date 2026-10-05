@@ -22,17 +22,8 @@ using namespace splash::engine;
 
 namespace {
 
+using splash::test::rejects;
 using splash::test::require;
-
-template <typename Error, typename Function>
-void requireThrows(Function &&function, const char *message) {
-  try {
-    function();
-  } catch (const Error &) {
-    return;
-  }
-  throw std::runtime_error(message);
-}
 
 class TestState final : public CompositeState {
 public:
@@ -443,13 +434,9 @@ void testProbeCannotCrossCaches() {
   const auto lookup = second.lookup(firstPrompt, {}, &probe);
   require(lookup.kvBoundary == 0 && lookup.resumeBoundary() == 0,
           "a probe from another cache reused a colliding block id");
-  bool refused = false;
-  try {
-    second.refresh(probe, firstPrompt, {});
-  } catch (const std::logic_error &) {
-    refused = true;
-  }
-  require(refused, "a probe from another cache was refreshed");
+  rejects([&] { second.refresh(probe, firstPrompt, {}); },
+          "a scheduling probe belongs to another cache",
+          "a probe from another cache was refreshed");
 }
 
 // Every change of a request's page list moves its revision by one and says
@@ -515,7 +502,7 @@ void testCacheLookupAndOneTokenReplay() {
   require(full.kvBoundary == 128 && full.resumeBoundary() == 96 &&
               full.junctionBoundary == 0 && full.state &&
               full.state->kvBlock() == fixture.blocks[2],
-          "KV-first lookup did not coordinate dense KV and sparse state");
+          "a lookup did not pair the cached KV prefix with the latest state within it");
 
   full.state.reset();
   auto exactEdge = fixture.lookup(128);
@@ -674,20 +661,14 @@ void testKvEvictionInvalidatesStateFirst() {
 void testStatePublicationValidation() {
   CacheFixture fixture;
   fixture.publish(0);
-  bool duplicateRejected = false;
-  try {
-    fixture.publish(0);
-  } catch (const std::logic_error &) {
-    duplicateRejected = true;
-  }
-  bool missingKvRejected = false;
-  try {
-    fixture.cache.publishCompositeState(999, std::make_shared<TestState>(100), false);
-  } catch (const std::invalid_argument &) {
-    missingKvRejected = true;
-  }
-  require(duplicateRejected && missingKvRejected &&
-              fixture.cache.snapshot().stateCache.entries == 1,
+  rejects([&] { fixture.publish(0); }, "duplicate composite state key",
+          "a state was published twice at one block");
+  rejects(
+      [&] {
+        fixture.cache.publishCompositeState(999, std::make_shared<TestState>(100), false);
+      },
+      "composite state KV block is unknown", "a state was published without its KV block");
+  require(fixture.cache.snapshot().stateCache.entries == 1,
           "invalid state publication changed the cache");
 }
 
@@ -1460,9 +1441,9 @@ void testDiskPublicationLifecycle() {
   require(fixture.cache.reuseStoredState(fixture.blocks[3]) &&
               fixture.cache.snapshot().stateCache.offloads == 1,
           "a block already on disk was written again");
-  requireThrows<std::logic_error>(
-      [&] { static_cast<void>(fixture.cache.publishStateToDisk(fixture.blocks[3], write, false)); },
-      "a second disk publication of one block was accepted");
+  rejects([&] { static_cast<void>(fixture.cache.publishStateToDisk(fixture.blocks[3], write, false)); },
+          "a block's state is published once; reuse it through reuseStoredState",
+          "a second disk publication of one block was accepted");
   control->ready = true;
   require(fixture.cache.pollTransfers() && !fixture.cache.pollTransfers(),
           "the write was not consumed exactly once");
@@ -4224,10 +4205,10 @@ int main() {
     testCompactionLeavesAPageBeingDemoted();
     testReplacementKeepsTheExtentItEmpties();
     testReleaseTimeCoversOneExtent();
-    std::cout << "KV-first cache tests passed\n";
+    std::cout << "engine cache tests passed\n";
     return 0;
   } catch (const std::exception &error) {
-    std::cerr << "KV-first cache tests failed: " << error.what() << '\n';
+    std::cerr << "engine cache tests failed: " << error.what() << '\n';
     return 1;
   }
 }

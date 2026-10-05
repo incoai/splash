@@ -16,21 +16,27 @@
 
 namespace splash::engine {
 
+// The clocks a native loop reads unless told others: the system clock in
+// Unix microseconds, which a request's absolute deadline is on, and the awake
+// clock (AwakeClock) in milliseconds, which it measures every duration on.
+[[nodiscard]] uint64_t systemUnixMicros() noexcept;
+[[nodiscard]] double awakeMilliseconds() noexcept;
+
+// The loop's constructor refuses a config without its metrics, its weights or
+// its clocks.
 struct NativeLoopConfig {
   engine::EngineConfig engine;
   RuntimeMetrics *metrics = nullptr;
   // The model's weights: released once the engine has held no request for
-  // idleReleaseSeconds, and written back, an image per tick, before the
-  // engine runs the next request. Null where they stay, as in tests of other
-  // behavior.
+  // the idle release, and written back, an image per tick, before the engine
+  // runs the next request.
   model::WeightMemory *weights = nullptr;
-  // Positive; infinite never releases them. Bootstrap binds it to
-  // RuntimeResourcesConfig::idleReleaseSeconds.
-  double idleReleaseSeconds = metal::kResidencyKeepAliveSeconds;
   // Told true when the engine takes a request while it holds none, and false
   // when its last request ends; the process keeps the Mac from idle sleep in
   // between (main.mm). It must not throw. Empty where nothing needs to know.
   std::function<void(bool)> holdingRequests;
+  std::function<uint64_t()> unixMicros = systemUnixMicros;
+  std::function<double()> monotonicMilliseconds = awakeMilliseconds;
 };
 
 // Translates native protocol messages and events at the Engine boundary.
@@ -46,8 +52,11 @@ public:
   using ByteSink = std::function<void(std::span<const uint8_t>)>;
   using StatusProvider = std::function<std::string()>;
 
-  NativeRuntime(NativeLoopConfig config, engine::Cache &cache,
-                model::Model &model, ByteSink output,
+  // idleReleaseSeconds is the engine's idle release
+  // (RuntimeResourcesConfig::idleReleaseSeconds): positive, and infinite
+  // where the weights stay.
+  NativeRuntime(NativeLoopConfig config, double idleReleaseSeconds,
+                engine::Cache &cache, model::Model &model, ByteSink output,
                 StatusProvider statusProvider, protocol::ProtocolLimits limits);
 
   // Processes every complete frame in bytes. False means the connection
@@ -76,7 +85,6 @@ public:
 
   void announceReady();
 
-  [[nodiscard]] bool ready() const noexcept { return ready_; }
   [[nodiscard]] bool connectionMustClose() const noexcept {
     return closeConnection_;
   }
@@ -88,21 +96,20 @@ public:
   [[nodiscard]] bool commandInFlight() const noexcept {
     return core_.commandInFlight();
   }
-  // Used by the fd event host to block in poll(2) without periodic sleeps,
-  // waking for either a request deadline or a deferred resource retry.
+  // How long FdTransport may block in poll(2): until the engine's next timed
+  // event (Engine::nextWakeupMilliseconds), without a limit when it has none.
   [[nodiscard]] std::optional<double> millisecondsUntilNextWakeup() const;
   [[nodiscard]] engine::EngineSnapshot snapshot() const {
     return core_.snapshot();
   }
   [[nodiscard]] WeightsSnapshot weightsSnapshot() const {
-    return {config_.idleReleaseSeconds, config_.weights && config_.weights->released(),
-            weightRestores_};
+    return {idleReleaseSeconds_, config_.weights->released(), weightRestores_};
   }
   [[nodiscard]] engine::ResourceWaitSnapshot resourceWaitSnapshot() const {
-    return core_.resourceWaitSnapshot(clocks_.monotonicMilliseconds());
+    return core_.resourceWaitSnapshot(config_.monotonicMilliseconds());
   }
   [[nodiscard]] double monotonicMilliseconds() const {
-    return clocks_.monotonicMilliseconds();
+    return config_.monotonicMilliseconds();
   }
   [[nodiscard]] MemoryReclaimResult
   reclaimMemory(const MemoryReclaimDirective &directive) {
@@ -112,7 +119,8 @@ public:
 private:
   struct RequestTelemetry {
     double arrivedMilliseconds = 0.0;
-    double startedMilliseconds = 0.0;
+    // Empty until the engine starts the request (EngineEventSink::started).
+    std::optional<double> startedMilliseconds;
     std::optional<double> firstTokenMilliseconds;
     std::optional<double> lastTokenMilliseconds;
     uint32_t emittedTokens = 0;
@@ -155,20 +163,13 @@ private:
   void failed(uint64_t requestId, LaneOutcome outcome,
               std::string message) override;
 
-  // The system clock in microseconds and the awake clock in milliseconds,
-  // or the test seam's (TestConfig).
-  struct Clocks {
-    std::function<uint64_t()> unixMicros;
-    std::function<double()> monotonicMilliseconds;
-  };
-  static Clocks clocks();
   static uint64_t durationMicros(double startMilliseconds,
                                  double endMilliseconds);
 
   NativeLoopConfig config_;
+  double idleReleaseSeconds_;
   ByteSink output_;
   StatusProvider statusProvider_;
-  Clocks clocks_;
   protocol::ProtocolLimits limits_;
   protocol::FrameParser parser_;
   engine::Engine core_;

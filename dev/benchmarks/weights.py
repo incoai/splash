@@ -12,8 +12,8 @@ source}, have build/engine/WeightPreparationIdentity.hpp: such a baseline
 prepares into a cache of its own, whose images are compared after its rounds.
 Once the release baselines of assemblies have weight-digests, delete
 IDENTITY_HEADER, PROVENANCE, DIGEST, baseline_environment and prepared, and
-compare_builds' environment with the baseline environments that the
-regression benchmarks pass it.
+compare_builds' environment with the baseline environment that
+backend_regression passes it.
 """
 
 from __future__ import annotations

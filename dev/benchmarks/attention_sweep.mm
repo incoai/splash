@@ -149,7 +149,7 @@ std::vector<Case> measure(std::span<metal::MetalBackend *> backends,
   double warmup = 0.0;
   while (warmup < warmupSeconds)
     for (size_t i = 0; i < backends.size(); ++i)
-      warmup += backends[i]->submitCommand(graphs[i].dispatches()).gpuSeconds;
+      warmup += backends[i]->submitCommandAsync(graphs[i].dispatches()).wait().gpuSeconds;
   for (size_t i = 1; i < fixtures.size(); ++i)
     if (!std::ranges::equal(outputBytes(*fixtures[0]), outputBytes(*fixtures[i])))
       throw std::runtime_error("comparison metallib changed attention output bits");
@@ -160,7 +160,7 @@ std::vector<Case> measure(std::span<metal::MetalBackend *> backends,
   for (uint32_t round = 0; round < repeat; ++round)
     for (size_t offset = 0; offset < backends.size(); ++offset) {
       const size_t i = (round + offset) % backends.size();
-      fused[i].push_back(backends[i]->submitCommand(graphs[i].dispatches()).gpuSeconds * 1000.0);
+      fused[i].push_back(backends[i]->submitCommandAsync(graphs[i].dispatches()).wait().gpuSeconds * 1000.0);
     }
   for (uint64_t round = 0; round <= repeat; ++round)
     for (size_t offset = 0; offset < backends.size(); ++offset) {

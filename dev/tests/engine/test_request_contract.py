@@ -229,7 +229,8 @@ class RequestContractTests(unittest.TestCase):
             runtime.EngineUnhealthy, "restart Splash from the current installation"
         ):
             runtime.MultiplexedRuntime(
-                process_factory=mock.Mock(side_effect=FileNotFoundError())
+                process_factory=mock.Mock(side_effect=FileNotFoundError()),
+                eager_start=True,
             )
 
     def test_head_and_options(self):
@@ -430,7 +431,7 @@ class RequestContractTests(unittest.TestCase):
 
     def test_unacknowledged_cancel_fails_generation_and_releases_calls(self):
         factory = FakeFactory()
-        engine = runtime.MultiplexedRuntime(process_factory=factory)
+        engine = runtime.MultiplexedRuntime(process_factory=factory, eager_start=True)
         self.addCleanup(engine.close)
         engine._cancel_grace_seconds = 0.02
         call = engine.submit(request(10))

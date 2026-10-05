@@ -16,6 +16,7 @@ namespace {
 
 using namespace splash;
 
+using splash::test::rejects;
 using splash::test::require;
 
 template <class Weights>
@@ -66,10 +67,9 @@ void checkMixedLayouts() {
   up = ops::Projection(up.outputSize, up.inputSize,
                        ops::BlockWeights{{ops::QuantizedSegment::planes(GGUF_FMT_Q4K, up.outputSize,
                                                                         up.inputSize, {}, {}, {})}});
-  bool mismatchRejected = false;
-  try { static_cast<void>(model::qwenTargetGeometry(target)); }
-  catch (const model::WeightStoreError &) { mismatchRejected = true; }
-  require(mismatchRejected, "incompatible fused gate/up layouts reached execution");
+  rejects([&] { static_cast<void>(model::qwenTargetGeometry(target)); },
+          "fused gate/up projections must have matching shapes and layouts",
+          "incompatible fused gate/up layouts reached execution");
   target.layers.front().gateProjection = up;
   require(target.logitsProjection.layout() == ops::WeightLayout::Affine64,
           "mixed fixture must keep an affine vocabulary head");
@@ -117,10 +117,9 @@ void checkMixedLayouts() {
               moe.logitsProjection.layout() == ops::WeightLayout::Affine64,
           "the MoE shape must follow the expert layers, not the head");
   moe.layers.back().ffn = ops::AffineMoeWeights{};
-  bool mixedRejected = false;
-  try { static_cast<void>(model::qwenTargetGeometry(moe)); }
-  catch (const model::WeightStoreError &) { mixedRejected = true; }
-  require(mixedRejected, "a target mixing MoE layouts reached execution");
+  rejects([&] { static_cast<void>(model::qwenTargetGeometry(moe)); },
+          "the MoE blocks of a target must share one weight layout",
+          "a target mixing MoE layouts reached execution");
 }
 
 // One decode arena serves every lane count, and on Apple10 and later a
@@ -161,10 +160,8 @@ void checkLaneScratch(const model::ModelPackage &package) {
 void checkUnsizedProjection() {
   auto broken = package<model::Qwen3_8Weights>();
   std::get<model::Qwen3_8Weights>(broken.target).layers.back().downProjection = ops::Projection();
-  bool rejected = false;
-  try { static_cast<void>(model::RuntimeGeometry::from(broken, kv::Format::Int8)); }
-  catch (const std::invalid_argument &) { rejected = true; }
-  require(rejected, "a target projection without sizes reached arena sizing");
+  rejects([&] { static_cast<void>(model::RuntimeGeometry::from(broken, kv::Format::Int8)); },
+          "invalid model runtime geometry", "a target projection without sizes reached arena sizing");
 }
 
 // The GDN value rows are sized with attentionWidth, so a layout whose value
@@ -173,29 +170,24 @@ void checkUnsizedProjection() {
 // value head.
 void checkGdnWidths() {
   const auto sparse = package<model::Qwen3_6MoeWeights>();
-  const auto layoutRejected = [](const model::Qwen3_6MoeLayout &layout) {
-    try { model::requireQwenLayout(layout); }
-    catch (const model::WeightStoreError &) { return true; }
-    return false;
+  const auto sizeArenas = [&](const model::Qwen3_6MoeLayout &layout) {
+    auto candidate = sparse;
+    std::get<model::Qwen3_6MoeWeights>(candidate.target).layout = layout;
+    static_cast<void>(model::RuntimeGeometry::from(candidate, kv::Format::Int8));
   };
-  const auto geometryRejected = [&](const model::Qwen3_6MoeLayout &layout) {
-    auto broken = sparse;
-    std::get<model::Qwen3_6MoeWeights>(broken.target).layout = layout;
-    try { static_cast<void>(model::RuntimeGeometry::from(broken, kv::Format::Int8)); }
-    catch (const std::invalid_argument &) { return true; }
-    return false;
-  };
+  // The shipped sparse layout passes both checks.
   const model::Qwen3_6MoeLayout shipped;
-  require(!layoutRejected(shipped) && !geometryRejected(shipped),
-          "the shipped sparse layout was refused");
+  model::requireQwenLayout(shipped);
+  sizeArenas(shipped);
   auto narrowValues = shipped;
   narrowValues.gdnValueHeads = narrowValues.gdnKeyHeads;
   narrowValues.convolutionDimension = 3 * narrowValues.gdnKeyHeads * narrowValues.gdnHeadDimension;
-  require(layoutRejected(narrowValues),
+  rejects([&] { model::requireQwenLayout(narrowValues); }, "Qwen target layout is inconsistent",
           "a GDN value width other than attentionWidth was accepted");
   auto withoutGates = shipped;
   withoutGates.packedGdnWidth = shipped.convolutionDimension + shipped.attentionWidth;
-  require(geometryRejected(withoutGates), "packed GDN rows without the gates reached arena sizing");
+  rejects([&] { sizeArenas(withoutGates); }, "invalid model runtime geometry",
+          "packed GDN rows without the gates reached arena sizing");
 }
 
 } // namespace

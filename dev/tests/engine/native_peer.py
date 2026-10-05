@@ -7,8 +7,8 @@ from dataclasses import replace
 
 from server import protocol as wire
 
-_HEADER = struct.Struct("<4sHHHHQI")
-_REQUEST = struct.Struct("<QBBQQIIIffIffffQBIII")
+_HEADER = struct.Struct("<4sHHQ")
+_REQUEST = struct.Struct("<QBBQQIIIffIffffQIII")
 _IMAGE_SPAN = struct.Struct("<IIIIQQ")
 _MASK_RESPONSE = struct.Struct("<QQI")
 _ID = struct.Struct("<Q")
@@ -29,7 +29,6 @@ def request_frame(**overrides) -> wire.RequestFrame:
         constraint=wire.ConstraintMode.NONE,
         image_spans=(),
         image_pixels=b"",
-        return_progress=False,
         score_tokens=(),
         generation_prompt_tokens=0,
         flags=wire.RequestFlag(0),
@@ -125,16 +124,9 @@ def serialize_event(event: wire.EngineEvent) -> bytes:
     """Header and payload exactly as the engine writes them, without
     validation, so fakes can send the server invalid events."""
     frame_type, payload = _event_payload(event)
-    header = _HEADER.pack(
-        b"SPLH",
-        wire.PROTOCOL_VERSION,
-        wire.FRAME_HEADER_BYTES,
-        frame_type,
-        0,
-        len(payload),
-        0,
+    return (
+        _HEADER.pack(b"SPLH", wire.PROTOCOL_VERSION, frame_type, len(payload)) + payload
     )
-    return header + payload
 
 
 def _words(payload: bytes, offset: int, count: int) -> tuple[int, ...]:
@@ -153,7 +145,6 @@ def _decode_request(payload: bytes) -> wire.RequestFrame:
         span_count,
         *sampling,
         seed,
-        return_progress,
         score_count,
         generation_prompt_tokens,
         flags,
@@ -183,7 +174,6 @@ def _decode_request(payload: bytes) -> wire.RequestFrame:
         wire.ConstraintMode(constraint),
         spans,
         pixels,
-        bool(return_progress),
         scores,
         generation_prompt_tokens,
         wire.RequestFlag(flags),
@@ -219,14 +209,10 @@ class ClientFrameReader:
         self._buffer.extend(data)
         frames = []
         while len(self._buffer) >= wire.FRAME_HEADER_BYTES:
-            magic, version, header_bytes, frame_type, _, payload_bytes, _ = (
-                _HEADER.unpack_from(self._buffer)
+            magic, version, frame_type, payload_bytes = _HEADER.unpack_from(
+                self._buffer
             )
-            if (magic, version, header_bytes) != (
-                b"SPLH",
-                wire.PROTOCOL_VERSION,
-                wire.FRAME_HEADER_BYTES,
-            ):
+            if (magic, version) != (b"SPLH", wire.PROTOCOL_VERSION):
                 raise ValueError("client frame header is invalid")
             end = wire.FRAME_HEADER_BYTES + payload_bytes
             if len(self._buffer) < end:

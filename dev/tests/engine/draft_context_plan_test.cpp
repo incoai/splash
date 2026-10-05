@@ -16,6 +16,7 @@ using benchmark::draftContextRows;
 
 namespace {
 
+using splash::test::rejects;
 using splash::test::require;
 
 DraftContextPlan activePlan(uint32_t replayBegin, uint32_t replayEnd) {
@@ -299,22 +300,12 @@ void testRestoresDraftStateFlag() {
 }
 
 void testInvalidInputs() {
-  bool threw = false;
-  try {
-    const auto plan = activePlan(0, 4096);
-    (void)draftCaptureSpansForDispatch(plan, 0, 2049);
-  } catch (const std::invalid_argument &) {
-    threw = true;
-  }
-  require(threw, "oversized packed dispatch was accepted");
-
-  threw = false;
-  try {
-    (void)cachedPlan(0, 4096, {2048, 1024});
-  } catch (const std::invalid_argument &) {
-    threw = true;
-  }
-  require(threw, "unsorted cache-state boundaries were accepted");
+  const auto plan = activePlan(0, 4096);
+  rejects([&] { (void)draftCaptureSpansForDispatch(plan, 0, 2049); },
+          "invalid target-prefill dispatch range", "oversized packed dispatch was accepted");
+  rejects([] { (void)cachedPlan(0, 4096, {2048, 1024}); },
+          "draft materialization boundaries are not sorted and unique",
+          "unsorted cache-state boundaries were accepted");
 }
 
 } // namespace

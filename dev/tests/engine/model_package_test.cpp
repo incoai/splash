@@ -1,4 +1,5 @@
 #include "TestBuffers.hpp"
+#include "TestPackage.hpp"
 #include "model/GgufImageLayout.hpp"
 #include "model/ModelFactory.hpp"
 #include "model/WeightImages.hpp"
@@ -44,14 +45,12 @@ using splash::model::weightManifestFingerprint;
 using splash::metal::BufferStorage;
 using splash::metal::MetalBackend;
 using splash::metal::MetalBuffer;
+using splash::test::SyntheticAccounting;
 using splash::test::sharedBuffer;
+using splash::test::writeSyntheticPackage;
+using splash::test::writeWeightFile;
 
-constexpr std::string_view kDraftLayerMagic = "MDFD0004";
 constexpr std::string_view kGgufImageMagic = "MDGG0001";
-constexpr std::string_view kTargetEmbeddingMagic = "MDFE0001";
-constexpr std::string_view kTargetHeadMagic = "MDFL0002";
-constexpr std::string_view kTargetLayerMagic = "MDFL0006";
-constexpr std::string_view kVisionMagic = "MDFV0001";
 
 [[noreturn]] void fail(const std::string &message) {
     std::cerr << "FAIL: " << message << '\n';
@@ -81,22 +80,6 @@ void requirePackedError(Function &&function, const std::string &message) {
         return;
     }
     fail(message);
-}
-
-uint64_t alignPacked(uint64_t value) {
-    return (value + kWeightFileAlignment - 1) &
-        ~(kWeightFileAlignment - 1);
-}
-
-uint64_t checkedProduct(uint64_t left, uint64_t right) {
-    if (left && right > std::numeric_limits<uint64_t>::max() / left) {
-        fail("synthetic layout size overflow");
-    }
-    return left * right;
-}
-
-uint64_t q4Bytes(uint32_t outputSize, uint32_t inputSize) {
-    return checkedProduct(outputSize, inputSize) * 9 / 16;
 }
 
 uint64_t declaredBytes(std::span<const WeightFileRecord> records) {
@@ -129,189 +112,6 @@ public:
 private:
     std::filesystem::path path_;
 };
-
-void storeLittleEndian32(uint8_t *destination, uint32_t value) {
-    destination[0] = static_cast<uint8_t>(value);
-    destination[1] = static_cast<uint8_t>(value >> 8);
-    destination[2] = static_cast<uint8_t>(value >> 16);
-    destination[3] = static_cast<uint8_t>(value >> 24);
-}
-
-uint64_t writeWeightFile(const std::filesystem::path &path,
-                         std::string_view magic, uint32_t layer,
-                         uint32_t type,
-                         std::span<const uint64_t> sections) {
-    require(magic.size() == 8, "synthetic magic has the wrong size");
-    std::filesystem::create_directories(path.parent_path());
-    int descriptor = open(path.c_str(), O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC,
-                          0600);
-    if (descriptor < 0) fail("unable to create synthetic packed file");
-
-    std::array<uint8_t, 16> header{};
-    std::memcpy(header.data(), magic.data(), magic.size());
-    storeLittleEndian32(header.data() + 8, layer);
-    storeLittleEndian32(header.data() + 12, type);
-    ssize_t written = pwrite(descriptor, header.data(), header.size(), 0);
-    if (written != static_cast<ssize_t>(header.size())) {
-        close(descriptor);
-        fail("unable to write synthetic packed header");
-    }
-
-    uint64_t offset = header.size();
-    for (uint64_t bytes : sections) {
-        require(bytes > 0, "synthetic section is empty");
-        offset = alignPacked(offset) + bytes;
-    }
-    uint64_t fileBytes = alignPacked(offset);
-    if (fileBytes > static_cast<uint64_t>(
-                        std::numeric_limits<off_t>::max()) ||
-        ftruncate(descriptor, static_cast<off_t>(fileBytes)) != 0) {
-        close(descriptor);
-        fail("unable to size synthetic packed file");
-    }
-    close(descriptor);
-    return fileBytes;
-}
-
-std::vector<uint64_t> targetLayerSections(
-    const Qwen3_8Layout &layout, bool full) {
-    constexpr uint64_t bf16 = 2;
-    std::vector<uint64_t> result{
-        uint64_t(layout.hiddenSize) * bf16,
-        q4Bytes(full ? layout.packedFullWidth : layout.packedGdnWidth,
-                layout.hiddenSize),
-    };
-    if (full) {
-        result.insert(result.end(), {
-            uint64_t(layout.attentionHeadDimension) * bf16,
-            uint64_t(layout.attentionHeadDimension) * bf16,
-            q4Bytes(layout.hiddenSize, layout.attentionWidth),
-        });
-    } else {
-        result.insert(result.end(), {
-            uint64_t(layout.convolutionDimension) * 4 * bf16,
-            uint64_t(layout.gdnValueHeads) * 4,
-            uint64_t(layout.gdnValueHeads) * bf16,
-            uint64_t(layout.gdnHeadDimension) * bf16,
-            q4Bytes(layout.hiddenSize, layout.attentionWidth),
-        });
-    }
-    result.insert(result.end(), {
-        uint64_t(layout.hiddenSize) * bf16,
-        q4Bytes(layout.intermediateSize, layout.hiddenSize),
-        q4Bytes(layout.intermediateSize, layout.hiddenSize),
-        q4Bytes(layout.hiddenSize, layout.intermediateSize),
-    });
-    return result;
-}
-
-std::vector<uint64_t> draftLayerSections(const DFlashDraftLayout &layout) {
-    constexpr uint64_t bf16 = 2;
-    return {
-        uint64_t(layout.hiddenSize) * bf16,
-        uint64_t(4) * layout.hiddenSize * bf16,
-        q4Bytes(layout.dynamicSize, layout.hiddenSize),
-        q4Bytes(layout.qkvSize, layout.hiddenSize),
-        uint64_t(layout.attentionHeadDimension) * bf16,
-        uint64_t(layout.attentionHeadDimension) * bf16,
-        q4Bytes(layout.hiddenSize, layout.attentionSize),
-        uint64_t(layout.hiddenSize) * bf16,
-        uint64_t(4) * layout.hiddenSize * bf16,
-        q4Bytes(layout.dynamicSize, layout.hiddenSize),
-        q4Bytes(layout.intermediateSize, layout.hiddenSize),
-        q4Bytes(layout.intermediateSize, layout.hiddenSize),
-        q4Bytes(layout.hiddenSize, layout.intermediateSize),
-    };
-}
-
-std::vector<uint64_t> visionSections(const VisionLayout &layout) {
-    constexpr uint64_t bf16 = 2;
-    auto affine = [&](uint64_t outputSize, uint64_t inputSize,
-                      std::vector<uint64_t> &sections) {
-        sections.push_back(outputSize * inputSize * bf16);
-        sections.push_back(outputSize * bf16);
-    };
-    auto norm = [&](std::vector<uint64_t> &sections) {
-        sections.push_back(uint64_t(layout.hiddenSize) * bf16);
-        sections.push_back(uint64_t(layout.hiddenSize) * bf16);
-    };
-    std::vector<uint64_t> result;
-    affine(layout.hiddenSize, layout.patchDimension, result);
-    result.push_back(uint64_t(layout.positionGridSide) *
-                     layout.positionGridSide * layout.hiddenSize * bf16);
-    for (uint32_t block = 0; block < layout.depth; ++block) {
-        norm(result);
-        affine(uint64_t(3) * layout.hiddenSize, layout.hiddenSize, result);
-        affine(layout.hiddenSize, layout.hiddenSize, result);
-        norm(result);
-        affine(layout.paddedIntermediateSize, layout.hiddenSize, result);
-        affine(layout.hiddenSize, layout.paddedIntermediateSize, result);
-    }
-    norm(result);
-    affine(layout.mergedHiddenSize, layout.mergedHiddenSize, result);
-    affine(layout.outputHiddenSize, layout.mergedHiddenSize, result);
-    return result;
-}
-
-struct SyntheticAccounting {
-    uint64_t targetBytes = 0;
-    uint64_t draftBytes = 0;
-    uint64_t visionBytes = 0;
-};
-
-SyntheticAccounting writeSyntheticPackage(
-    const std::filesystem::path &root, const Qwen3_8Layout &target,
-    const DFlashDraftLayout &draft, const VisionLayout &vision) {
-    SyntheticAccounting result;
-    for (uint32_t layer = 0; layer < target.layers; ++layer) {
-        bool full = target.isFullAttentionLayer(layer);
-        auto sections = targetLayerSections(target, full);
-        result.targetBytes += writeWeightFile(
-            root / "target" / ("layer-" + std::to_string(layer) + ".bin"),
-            kTargetLayerMagic, layer, full ? 1U : 0U, sections);
-    }
-    std::array<uint64_t, 2> headSections{
-        uint64_t(target.hiddenSize) * 2,
-        q4Bytes(target.vocabularySize, target.hiddenSize),
-    };
-    result.targetBytes += writeWeightFile(
-        root / "target/head.bin", kTargetHeadMagic, target.layers, 2,
-        headSections);
-    uint64_t embeddingElements =
-        uint64_t(target.vocabularySize) * target.hiddenSize;
-    std::array<uint64_t, 3> embeddingSections{
-        embeddingElements / 2,
-        embeddingElements / 32,
-        embeddingElements / 32,
-    };
-    result.targetBytes += writeWeightFile(
-        root / "target/embedding.bin", kTargetEmbeddingMagic,
-        target.vocabularySize, target.hiddenSize, embeddingSections);
-
-    for (uint32_t layer = 0; layer < draft.layers; ++layer) {
-        auto sections = draftLayerSections(draft);
-        result.draftBytes += writeWeightFile(
-            root / "draft" / ("layer-" + std::to_string(layer) + ".bin"),
-            kDraftLayerMagic, layer, 0, sections);
-    }
-    uint64_t codebookBytes =
-        uint64_t(draft.vocabularySize) * draft.selectorRank * 2;
-    std::array<uint64_t, 6> modelSections{
-        q4Bytes(draft.hiddenSize, draft.targetHiddenSize),
-        uint64_t(draft.hiddenSize) * 2,
-        uint64_t(draft.hiddenSize) * 2,
-        q4Bytes(draft.selectorRank, draft.hiddenSize),
-        codebookBytes,
-        codebookBytes,
-    };
-    result.draftBytes += writeWeightFile(
-        root / "draft/model.bin", kDraftLayerMagic, draft.layers, 1,
-        modelSections);
-    auto sections = visionSections(vision);
-    result.visionBytes += writeWeightFile(
-        root / "vision/model.bin", kVisionMagic, vision.depth, 0, sections);
-    return result;
-}
 
 // A packed file loaded into an image: its sections are aligned views the GPU
 // reads and its memory is tracked; once released, a command that binds it

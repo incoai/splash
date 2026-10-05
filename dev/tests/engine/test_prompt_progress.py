@@ -11,7 +11,9 @@ class ProgressRuntime(FakeRuntime):
     def submit(self, request, *, on_event, on_complete):
         def emit(call, event):
             on_event(call, event)
-            if request.frame.return_progress and isinstance(event, wire.StartEvent):
+            if request.frame.flags & wire.RequestFlag.RETURN_PROGRESS and isinstance(
+                event, wire.StartEvent
+            ):
                 counts = sorted(
                     {event.matched_prompt_tokens, len(request.frame.prompt_tokens)}
                 )
@@ -71,7 +73,11 @@ class PromptProgressTests(unittest.TestCase):
                                 if "prompt_progress" in event
                             ]
                             self.assertEqual(
-                                runtime.requests[0].frame.return_progress, enabled
+                                bool(
+                                    runtime.requests[0].frame.flags
+                                    & wire.RequestFlag.RETURN_PROGRESS
+                                ),
+                                enabled,
                             )
                             self.assertIn(b"plain answer", payload)
                             if not enabled:

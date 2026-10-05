@@ -15,8 +15,10 @@ from dataclasses import dataclass, fields
 from enum import IntEnum, IntFlag
 from typing import TypeAlias
 
-PROTOCOL_VERSION = 7
-FRAME_HEADER_BYTES = 24
+PROTOCOL_VERSION = 8
+# A frame is its header, the magic, the protocol version, the frame type and
+# the payload length, then the payload.
+FRAME_HEADER_BYTES = 16
 STATUS_SCHEMA_VERSION = 6
 # Score-only requests carry 2..255 distinct option token ids and produce no
 # generated tokens; a successful score DoneEvent returns one raw
@@ -39,10 +41,10 @@ MAX_IMAGE_SPANS = 64
 MAX_MASK_WORDS = 1 << 20
 
 _MAGIC = b"SPLH"
-_HEADER = struct.Struct("<4sHHHHQI")
+_HEADER = struct.Struct("<4sHHQ")
 # Replay can update the integer deadlines without decoding sampling floats.
 _REQUEST_HEAD = struct.Struct("<QBBQQ")
-_REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIffIffffQBIII")
+_REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIffIffffQIII")
 _IMAGE_SPAN = struct.Struct("<IIIIQQ")
 _CANCEL = struct.Struct("<Q")
 _MASK_RESPONSE = struct.Struct("<QQI")
@@ -62,7 +64,7 @@ assert (
     and sys.byteorder == "little"
 )
 assert _HEADER.size == FRAME_HEADER_BYTES
-assert _REQUEST.size == 87
+assert _REQUEST.size == 86
 assert _IMAGE_SPAN.size == 32
 assert _READY.size == 9
 assert _START.size == 16
@@ -111,28 +113,25 @@ class FailureClass(IntEnum):
     PROTOCOL_FATAL = 3
 
 
-# Issue codes travel by name; the values need not be contiguous.
+# Issue codes travel by name; the values are runtime/engine/Protocol.hpp's.
 class IssueCode(IntEnum):
     NONE = 0
     BAD_MAGIC = 1
     UNSUPPORTED_VERSION = 2
-    INVALID_HEADER_SIZE = 3
-    UNKNOWN_FRAME_TYPE = 4
-    NON_ZERO_HEADER_FLAGS = 5
-    NON_ZERO_RESERVED_FIELD = 6
-    FRAME_TOO_LARGE = 7
-    INVALID_PAYLOAD_LENGTH = 8
-    TRUNCATED_FRAME = 9
-    INVALID_REQUEST_ID = 10
-    INVALID_ENUM_VALUE = 11
-    INVALID_DEADLINE = 12
-    INVALID_SAMPLING = 13
-    INVALID_COUNT = 14
-    INVALID_CONSTRAINT = 15
-    INVALID_ERROR_CLASSIFICATION = 16
-    LIMIT_EXCEEDED = 18
-    INTEGER_OVERFLOW = 19
-    ALLOCATION_FAILURE = 20
+    UNKNOWN_FRAME_TYPE = 3
+    FRAME_TOO_LARGE = 4
+    INVALID_PAYLOAD_LENGTH = 5
+    TRUNCATED_FRAME = 6
+    INVALID_REQUEST_ID = 7
+    INVALID_ENUM_VALUE = 8
+    INVALID_DEADLINE = 9
+    INVALID_SAMPLING = 10
+    INVALID_COUNT = 11
+    INVALID_CONSTRAINT = 12
+    INVALID_ERROR_CLASSIFICATION = 13
+    LIMIT_EXCEEDED = 14
+    INTEGER_OVERFLOW = 15
+    ALLOCATION_FAILURE = 16
 
 
 def frame_type_name(frame_type: FrameType) -> str:
@@ -186,10 +185,14 @@ class RequestFlag(IntFlag):
     # Never select the model's stop tokens, so generation runs to its output
     # limit. Only unconstrained generation can carry it.
     IGNORE_END_OF_SEQUENCE = 1 << 0
+    # Report the prompt's progress while it prefills (PromptProgressEvent).
+    RETURN_PROGRESS = 1 << 1
 
 
 # A request with any other bit set is a request error.
-_REQUEST_FLAG_BITS = int(RequestFlag.IGNORE_END_OF_SEQUENCE)
+_REQUEST_FLAG_BITS = int(
+    RequestFlag.IGNORE_END_OF_SEQUENCE | RequestFlag.RETURN_PROGRESS
+)
 
 
 @dataclass(slots=True, frozen=True)
@@ -248,7 +251,6 @@ class RequestFrame:
     # concatenated in span order; both empty for text-only requests.
     image_spans: tuple[ImageSpan, ...]
     image_pixels: bytes
-    return_progress: bool
     # Option token ids for score-only requests; empty means ordinary
     # generation. Score tokens serialize after the image pixel bytes.
     score_tokens: tuple[int, ...]
@@ -410,6 +412,18 @@ def _fail(
 def _fatal(code: IssueCode, message: str, request_id: int = 0) -> None:
     """An engine event that breaks the protocol: the stream is not trusted."""
     _fail(FailureClass.PROTOCOL_FATAL, code, message, request_id)
+
+
+def _fail_request(code: IssueCode, message: str, request_id: int = 0) -> None:
+    """A client frame's failure fails the request it names. One that names
+    none cannot be answered as a request's error and fails the stream, as
+    the engine classifies it (Protocol.cpp requestIssue)."""
+    _fail(
+        FailureClass.REQUEST_ERROR if request_id else FailureClass.PROTOCOL_FATAL,
+        code,
+        message,
+        request_id,
+    )
 
 
 def _allocation_issue(message: str) -> ProtocolIssue:
@@ -578,21 +592,13 @@ def _validated_request(
     """The request's prompt and score words as uint32 arrays and its float32
     sampling block, each checked once; raises a ProtocolError with the first
     rule the request breaks."""
-    request_id = request.request_id if type(request.request_id) is int else 0
     try:
         request_id = _u64(request.request_id, "request id")
         if not request_id:
             raise ValueError("request id must be non-zero")
     except ValueError as error:
-        _fail(
-            FailureClass.REQUEST_ERROR,
-            IssueCode.INVALID_REQUEST_ID,
-            str(error),
-            request_id,
-        )
+        _fail_request(IssueCode.INVALID_REQUEST_ID, str(error))
     try:
-        if not isinstance(request.return_progress, bool):
-            raise ValueError("return_progress must be a boolean")
         _enum_value(request.priority, RequestPriority, "request priority")
         constraint = _enum_value(request.constraint, ConstraintMode, "constraint mode")
         flags = _u32(
@@ -604,32 +610,21 @@ def _validated_request(
         if flags & ~_REQUEST_FLAG_BITS:
             raise ValueError("request flags are not defined by native protocol")
     except ValueError as error:
-        _fail(
-            FailureClass.REQUEST_ERROR,
-            IssueCode.INVALID_ENUM_VALUE,
-            str(error),
-            request_id,
-        )
+        _fail_request(IssueCode.INVALID_ENUM_VALUE, str(error), request_id)
     try:
         absolute = _u64(request.absolute_deadline_unix_micros, "absolute deadline")
         remaining = _u64(request.remaining_deadline_micros, "remaining deadline")
         if not absolute or not remaining:
             raise ValueError("absolute and remaining deadlines must be non-zero")
     except ValueError as error:
-        _fail(
-            FailureClass.REQUEST_ERROR,
-            IssueCode.INVALID_DEADLINE,
-            str(error),
-            request_id,
-        )
+        _fail_request(IssueCode.INVALID_DEADLINE, str(error), request_id)
     try:
         output_tokens = _u32(request.logical_max_output_tokens, "logical max output")
         prompt = _words(request.prompt_tokens, "prompt tokens")
         scores = _words(request.score_tokens, "score tokens")
         if scores:
             if output_tokens:
-                _fail(
-                    FailureClass.REQUEST_ERROR,
+                _fail_request(
                     IssueCode.INVALID_COUNT,
                     "score requests must not generate output tokens",
                     request_id,
@@ -641,12 +636,7 @@ def _validated_request(
         if len(request.image_spans) > MAX_IMAGE_SPANS:
             raise ValueError("image span count exceeds its limit")
     except ValueError as error:
-        _fail(
-            FailureClass.REQUEST_ERROR,
-            IssueCode.LIMIT_EXCEEDED,
-            str(error),
-            request_id,
-        )
+        _fail_request(IssueCode.LIMIT_EXCEEDED, str(error), request_id)
     try:
         _image_spans_check(request, len(prompt))
         generation = _u32(request.generation_prompt_tokens, "generation prompt tokens")
@@ -664,12 +654,7 @@ def _validated_request(
                 "distinct option tokens"
             )
     except ValueError as error:
-        _fail(
-            FailureClass.REQUEST_ERROR,
-            IssueCode.INVALID_COUNT,
-            str(error),
-            request_id,
-        )
+        _fail_request(IssueCode.INVALID_COUNT, str(error), request_id)
     try:
         sampling = _sampling_values(request.sampling)
         temperature, top_p, _, presence, frequency, repetition, min_p = sampling
@@ -696,15 +681,9 @@ def _validated_request(
         if scores and sampling != _NEUTRAL_SAMPLING:
             raise ValueError("score requests require default greedy sampling")
     except (AttributeError, ValueError) as error:
-        _fail(
-            FailureClass.REQUEST_ERROR,
-            IssueCode.INVALID_SAMPLING,
-            str(error),
-            request_id,
-        )
+        _fail_request(IssueCode.INVALID_SAMPLING, str(error), request_id)
     if scores and constraint is not ConstraintMode.NONE:
-        _fail(
-            FailureClass.REQUEST_ERROR,
+        _fail_request(
             IssueCode.INVALID_CONSTRAINT,
             "score requests do not accept output constraints",
             request_id,
@@ -713,8 +692,7 @@ def _validated_request(
     if flags & RequestFlag.IGNORE_END_OF_SEQUENCE and (
         scores or constraint is not ConstraintMode.NONE
     ):
-        _fail(
-            FailureClass.REQUEST_ERROR,
+        _fail_request(
             IssueCode.INVALID_CONSTRAINT,
             "only unconstrained generation can ignore end-of-sequence",
             request_id,
@@ -722,12 +700,7 @@ def _validated_request(
     try:
         _u64(request.seed, "seed")
     except ValueError as error:
-        _fail(
-            FailureClass.REQUEST_ERROR,
-            IssueCode.INTEGER_OVERFLOW,
-            str(error),
-            request_id,
-        )
+        _fail_request(IssueCode.INTEGER_OVERFLOW, str(error), request_id)
     return prompt, scores, sampling
 
 
@@ -743,15 +716,7 @@ def _frame(frame_type: FrameType, payload_bytes: int) -> bytearray:
     """A frame's header, in a buffer sized for the payload written after it."""
     frame = bytearray(FRAME_HEADER_BYTES + payload_bytes)
     _HEADER.pack_into(
-        frame,
-        0,
-        _MAGIC,
-        PROTOCOL_VERSION,
-        FRAME_HEADER_BYTES,
-        int(frame_type),
-        0,
-        payload_bytes,
-        0,
+        frame, 0, _MAGIC, PROTOCOL_VERSION, int(frame_type), payload_bytes
     )
     return frame
 
@@ -766,7 +731,7 @@ def _request_frame(request: RequestFrame) -> bytearray:
     scores_offset = pixels_offset + len(request.image_pixels)
     payload_bytes = scores_offset + 4 * len(scores) - FRAME_HEADER_BYTES
     if issue := _payload_length_issue(FrameType.REQUEST, payload_bytes):
-        _fail(FailureClass.REQUEST_ERROR, issue.code, issue.message, request.request_id)
+        _fail_request(issue.code, issue.message, request.request_id)
     frame = _frame(FrameType.REQUEST, payload_bytes)
     _REQUEST.pack_into(
         frame,
@@ -781,7 +746,6 @@ def _request_frame(request: RequestFrame) -> bytearray:
         len(request.image_spans),
         *sampling,
         request.seed,
-        request.return_progress,
         len(request.score_tokens),
         request.generation_prompt_tokens,
         request.flags,
@@ -810,37 +774,27 @@ def _cancel_frame(cancel: CancelFrame) -> bytearray:
         if not _u64(cancel.request_id, "cancel request id"):
             raise ValueError("cancel request id must be non-zero")
     except ValueError as error:
-        _fail(FailureClass.REQUEST_ERROR, IssueCode.INVALID_REQUEST_ID, str(error))
+        _fail_request(IssueCode.INVALID_REQUEST_ID, str(error))
     frame = _frame(FrameType.CANCEL, _CANCEL.size)
     _CANCEL.pack_into(frame, FRAME_HEADER_BYTES, cancel.request_id)
     return frame
 
 
 def _mask_response_frame(response: MaskResponseFrame) -> bytearray:
-    request_id = response.request_id if type(response.request_id) is int else 0
+    request_id = 0
     try:
         request_id = _u64(response.request_id, "mask response request id")
         mask_request_id = _u64(response.mask_request_id, "mask request id")
         if not request_id or not mask_request_id:
             raise ValueError("mask response request ids must be non-zero")
     except ValueError as error:
-        _fail(
-            FailureClass.REQUEST_ERROR,
-            IssueCode.INVALID_REQUEST_ID,
-            str(error),
-            request_id,
-        )
+        _fail_request(IssueCode.INVALID_REQUEST_ID, str(error), request_id)
     try:
         mask = _mask_payload(response.mask_words)
         if not mask or len(mask) // 4 > MAX_MASK_WORDS:
             raise ValueError("mask response word count exceeds its limit")
     except ValueError as error:
-        _fail(
-            FailureClass.REQUEST_ERROR,
-            IssueCode.LIMIT_EXCEEDED,
-            str(error),
-            request_id,
-        )
+        _fail_request(IssueCode.LIMIT_EXCEEDED, str(error), request_id)
     frame = _frame(FrameType.MASK_RESPONSE, _MASK_RESPONSE.size + len(mask))
     _MASK_RESPONSE.pack_into(
         frame, FRAME_HEADER_BYTES, request_id, mask_request_id, len(mask) // 4
@@ -853,7 +807,7 @@ def _status_request_frame(request: StatusRequestFrame) -> bytearray:
     try:
         correlation_id = _u64(request.correlation_id, "status correlation id")
     except ValueError as error:
-        _fail(FailureClass.REQUEST_ERROR, IssueCode.INTEGER_OVERFLOW, str(error))
+        _fail_request(IssueCode.INTEGER_OVERFLOW, str(error))
     frame = _frame(FrameType.STATUS_REQUEST, _STATUS_REQUEST.size)
     _STATUS_REQUEST.pack_into(frame, FRAME_HEADER_BYTES, correlation_id)
     return frame
@@ -908,15 +862,7 @@ def serialize_frame(frame: Frame) -> bytes:
     frame_type, payload = _checked_frame(frame)
     try:
         return (
-            _HEADER.pack(
-                _MAGIC,
-                PROTOCOL_VERSION,
-                FRAME_HEADER_BYTES,
-                int(frame_type),
-                0,
-                len(payload),
-                0,
-            )
+            _HEADER.pack(_MAGIC, PROTOCOL_VERSION, int(frame_type), len(payload))
             + payload
         )
     except MemoryError as error:
@@ -935,7 +881,7 @@ def refresh_request_deadline(frame: bytes, now_unix_micros: int) -> bytes:
     """
     if len(frame) < _HEADER.size + _REQUEST.size:
         return frame
-    _, _, _, frame_type, _, _, _ = _HEADER.unpack_from(frame)
+    _, _, frame_type, _ = _HEADER.unpack_from(frame)
     if frame_type != FrameType.REQUEST:
         return frame
     request_id, priority, constraint, _, remaining = _REQUEST_HEAD.unpack_from(
@@ -1151,9 +1097,7 @@ class FrameParser:
         self._payload.clear()
 
     def _parse_header(self) -> ProtocolIssue | None:
-        magic, version, header_bytes, raw_type, flags, payload_bytes, reserved = (
-            _HEADER.unpack(self._header)
-        )
+        magic, version, raw_type, payload_bytes = _HEADER.unpack(self._header)
         if magic != _MAGIC:
             return _issue(
                 FailureClass.PROTOCOL_FATAL,
@@ -1166,12 +1110,6 @@ class FrameParser:
                 IssueCode.UNSUPPORTED_VERSION,
                 "unsupported native protocol version",
             )
-        if header_bytes != FRAME_HEADER_BYTES:
-            return _issue(
-                FailureClass.PROTOCOL_FATAL,
-                IssueCode.INVALID_HEADER_SIZE,
-                "native protocol frame header must be exactly 24 bytes",
-            )
         if raw_type not in _EVENT_TYPES:
             return _issue(
                 FailureClass.PROTOCOL_FATAL,
@@ -1179,18 +1117,6 @@ class FrameParser:
                 "frame type is not a native protocol event",
             )
         self._current_type = FrameType(raw_type)
-        if flags:
-            return _issue(
-                FailureClass.PROTOCOL_FATAL,
-                IssueCode.NON_ZERO_HEADER_FLAGS,
-                "native protocol frame flags must be zero",
-            )
-        if reserved:
-            return _issue(
-                FailureClass.PROTOCOL_FATAL,
-                IssueCode.NON_ZERO_RESERVED_FIELD,
-                "native protocol reserved header field must be zero",
-            )
         if issue := _payload_length_issue(self._current_type, payload_bytes):
             return issue
         self._expected_payload_bytes = payload_bytes
@@ -1267,7 +1193,10 @@ class FrameParser:
         if not self._header and not self._reading_payload:
             return None
         if not self._reading_payload:
-            message = f"stream ended after {len(self._header)} of 24 frame-header bytes"
+            message = (
+                f"stream ended after {len(self._header)} of "
+                f"{FRAME_HEADER_BYTES} frame-header bytes"
+            )
         else:
             message = (
                 f"stream ended after {len(self._payload)} of "

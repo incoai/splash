@@ -28,7 +28,7 @@ struct WriteBehindSnapshot final {
 // a point that is newest only briefly, like a step of a tool loop, costs no
 // write, and a shorter one recomputes in less time than its state takes to
 // write. Points become durable one at a time, in the order they were
-// published. While the tier has written kHourlyBytes in the last hour these
+// published. While the tier has written hourlyBytes in the last hour these
 // writes wait; the writes eviction needs never do.
 class WriteBehind final {
 public:
@@ -36,7 +36,7 @@ public:
   static constexpr uint32_t kMinimumTokens = 2048;
   static constexpr uint64_t kHourlyBytes = uint64_t{128} << 30;
 
-  explicit WriteBehind(Cache &cache);
+  explicit WriteBehind(Cache &cache, uint64_t hourlyBytes = kHourlyBytes);
   WriteBehind(const WriteBehind &) = delete;
   WriteBehind &operator=(const WriteBehind &) = delete;
 

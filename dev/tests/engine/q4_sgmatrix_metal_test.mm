@@ -139,7 +139,7 @@ void runCase(metal::MetalBackend &backend, uint32_t n, uint32_t k, uint32_t spli
   // publication, stale counters and dependencies between consecutive dispatches.
   for (uint32_t repeat = 0; repeat < 3; ++repeat)
     linear.add(graph, b, p, plan, epilogue == LinearEpilogue::GateUp ? &gate : nullptr);
-  (void)backend.submitCommand(graph.dispatches());
+  (void)backend.submitCommandAsync(graph.dispatches()).wait();
   const auto *prepared = static_cast<const uint16_t *>(table.view.contents());
   const auto *rowSums = static_cast<const float *>(sums.view.contents());
   for (uint32_t g=0;g<k/64;++g) for (uint32_t row=0;row<rows;++row) {
@@ -154,7 +154,7 @@ void runCase(metal::MetalBackend &backend, uint32_t n, uint32_t k, uint32_t spli
   }
   const auto *actual = static_cast<const uint16_t *>(output.view.contents());
   const std::vector<uint16_t> first(actual, actual + rows * n);
-  (void)backend.submitCommand(graph.dispatches());
+  (void)backend.submitCommandAsync(graph.dispatches()).wait();
   require(std::memcmp(first.data(), actual, 2ULL * rows * n) == 0, "nondeterministic split reduction");
   const auto *counts = static_cast<const uint32_t *>(counters.view.contents());
   for (uint64_t i = 0; i < size.counters / 4; ++i) require(counts[i] == 0, "counter not reset");
@@ -266,7 +266,7 @@ void splitVisibility(metal::MetalBackend &backend,
       std::to_string(pair[1].first.inputSize);
   metal::CommandGraph unsplit;
   for (uint32_t i = 0; i < 2; ++i) add(unsplit, i, 1);
-  (void)backend.submitCommand(unsplit.dispatches());
+  (void)backend.submitCommandAsync(unsplit.dispatches()).wait();
   for (uint32_t i = 0; i < 2; ++i) requireFp64(operands[i], 1, shape + " unsplit");
   for (const auto &splits : splitPairs) {
     const std::string what = shape + " splits " + std::to_string(splits[0]) + "/" + std::to_string(splits[1]);
@@ -280,7 +280,7 @@ void splitVisibility(metal::MetalBackend &backend,
     std::vector<std::vector<uint8_t>> first;
     for (uint32_t bits : {0x7E800000U, 0x7FC00000U, 0x7E800000U}) {
       std::fill_n(static_cast<uint32_t *>(poison.contents()), size.partials / 4, bits);
-      (void)backend.submitCommand(graph.dispatches());
+      (void)backend.submitCommandAsync(graph.dispatches()).wait();
       const auto *counts = static_cast<const uint32_t *>(counters.view.contents());
       for (uint64_t c = 0; c < size.counters / 4; ++c) require(counts[c] == 0, "counter not reset");
       for (uint32_t i = 0; i < 2; ++i) {
@@ -332,7 +332,7 @@ void fusedNorm(metal::MetalBackend &backend, uint32_t k, uint32_t rows, LinearIn
   addReferencePreparation(graph,layout,output,a,sa,k,rows/8);
   const PreparedInput prepared=Normalization::addRms(graph,c.input,c.weight,fused,k,rows,{b,sb,{},{}},layout);
   require(prepared.layout==layout && prepared.source.sameView(fused),"fused norm did not report the table it wrote");
-  (void)backend.submitCommand(graph.dispatches());
+  (void)backend.submitCommandAsync(graph.dispatches()).wait();
   requireNorm(c,output,k,rows,"norm differs from the fp64 reference");
   require(!std::memcmp(output.contents(),fused.contents(),k*rows*2),"fused norm changed bf16 output");
   require(!std::memcmp(a.contents(),b.contents(),tableBytes(k,rows)),"fused operand permutation mismatch");
@@ -357,7 +357,7 @@ void prefillNorm(metal::MetalBackend &backend, uint32_t k, uint32_t rows) {
   require(graph.dispatches().back().pipelineName.starts_with("norm_rms_staged")==
               (rows<=SPLASH_STAGED_NORM_ROWS && k<=SPLASH_STAGED_NORM_WIDTH),
           "plain norm staged the wrong rows");
-  (void)backend.submitCommand(graph.dispatches());
+  (void)backend.submitCommandAsync(graph.dispatches()).wait();
   requireNorm(c,output,k,rows,"prefill norm differs from the fp64 reference");
   require(!std::memcmp(output.contents(),plain.contents(),k*rows*2),"prefill norm rows differ from the plain norm's");
 }
@@ -386,7 +386,7 @@ void fusedAttentionGate(metal::MetalBackend &backend, uint32_t heads, uint32_t k
                                     heads, {1, kvHeads, 256}, lanes, {b.view, sb.view, {}, {}}, layout);
   require(prepared.layout == layout && prepared.source.sameView(fused.view),
           "fused attention gate did not report the table it wrote");
-  (void)backend.submitCommand(graph.dispatches());
+  (void)backend.submitCommandAsync(graph.dispatches()).wait();
   require(!std::memcmp(output.view.contents(), fused.view.contents(), width * 16 * lanes),
           "fused attention gate output");
   require(!std::memcmp(a.view.contents(), b.view.contents(), tableBytes(width, rows)),

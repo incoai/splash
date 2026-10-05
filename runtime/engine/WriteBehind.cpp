@@ -1,7 +1,5 @@
 #include "engine/WriteBehind.hpp"
 
-#include "TestConfig.hpp"
-
 #include <algorithm>
 
 namespace splash::engine {
@@ -12,9 +10,8 @@ constexpr double kSampleMilliseconds = 60'000.0;
 
 } // namespace
 
-WriteBehind::WriteBehind(Cache &cache)
-    : cache_(cache),
-      hourlyBytes_(testConfig().writeBehindHourlyBytes.value_or(kHourlyBytes)) {}
+WriteBehind::WriteBehind(Cache &cache, uint64_t hourlyBytes)
+    : cache_(cache), hourlyBytes_(hourlyBytes) {}
 
 void WriteBehind::published(uint64_t block, uint32_t tokens, double now) {
   if (!cache_.persistent() || tokens < kMinimumTokens || !queued_.insert(block).second)

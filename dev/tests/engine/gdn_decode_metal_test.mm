@@ -503,7 +503,7 @@ void runDecode(MetalBackend &backend, const GdnShape &shape, uint32_t lanes,
                            layer, fixture.cell.strides(), GdnHeadOrder::Grouped, LinearInput::Plain)
                     .layout == LinearInput::Plain,
             where + ": plain GDN claimed a table");
-  static_cast<void>(backend.submitCommand(graph.dispatches()));
+  static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
   for (uint32_t lane = 0; lane < kMaxLanes; ++lane) {
     if (lane >= lanes) {
       requireUntouched(fixture, lane, where);
@@ -533,7 +533,7 @@ void runDecode(MetalBackend &backend, const GdnShape &shape, uint32_t lanes,
     for (uint32_t lane = 0; lane < lanes; ++lane)
       std::memcpy(fixture.next[lane].contents(), decoded[lane].data(),
                   fixture.cell.bytes);
-    static_cast<void>(backend.submitCommand(commit.dispatches()));
+    static_cast<void>(backend.submitCommandAsync(commit.dispatches()).wait());
     for (uint32_t lane = 0; lane < lanes; ++lane) {
       const uint32_t count = retained[lane];
       const std::string commitWhere =
@@ -624,7 +624,7 @@ void fusedPreparation(MetalBackend &backend, const GdnShape &shape, uint32_t lan
                   .layout == LinearInput::Plain,
           what + " plain kernel claimed a table");
   tables.addReference(reference, fixture.hidden);
-  (void)backend.submitCommand(reference.dispatches());
+  (void)backend.submitCommandAsync(reference.dispatches()).wait();
   // The active lanes' bf16 hidden rows.
   std::vector<uint8_t> expected(uint64_t{lanes} * kRows * tables.width * 2);
   std::memcpy(expected.data(), fixture.hidden.contents(), expected.size());
@@ -639,7 +639,7 @@ void fusedPreparation(MetalBackend &backend, const GdnShape &shape, uint32_t lan
   CommandGraph fused;
   const PreparedInput prepared =
       GDN::addDecode(fused, buffers, shape, lanes, 0, fixture.cell.strides(), GdnHeadOrder::Grouped, layout);
-  (void)backend.submitCommand(fused.dispatches());
+  (void)backend.submitCommandAsync(fused.dispatches()).wait();
   require(!std::memcmp(expected.data(), fixture.hidden.contents(), expected.size()),
           what + " changed output");
   tables.requireWritten(prepared, fixture.hidden, what);
@@ -662,7 +662,7 @@ void tiledHeadOrder(MetalBackend &backend, const GdnShape &shape, uint32_t lanes
                          GdnHeadOrder::Grouped, LinearInput::Plain)
                   .layout == LinearInput::Plain,
           what + " grouped reference claimed a table");
-  (void)backend.submitCommand(grouped.dispatches());
+  (void)backend.submitCommandAsync(grouped.dispatches()).wait();
   const auto *hidden = static_cast<const uint8_t *>(fixture.hidden.contents());
   std::vector<uint8_t> expected(fixture.hidden.sizeBytes());
   for (uint64_t row = 0; row < uint64_t{kMaxLanes} * kRows; ++row)
@@ -677,7 +677,7 @@ void tiledHeadOrder(MetalBackend &backend, const GdnShape &shape, uint32_t lanes
     require(GDN::addDecode(tiled, fixture.decodeBuffers(0), shape, lanes, 0, fixture.cell.strides(),
                            GdnHeadOrder::Tiled, LinearInput::Plain).layout == LinearInput::Plain,
             what + " claimed a table");
-    (void)backend.submitCommand(tiled.dispatches());
+    (void)backend.submitCommandAsync(tiled.dispatches()).wait();
   } else {
     const PreparedTables tables(backend, layout, width, lanes);
     auto buffers = fixture.decodeBuffers(0);
@@ -685,7 +685,7 @@ void tiledHeadOrder(MetalBackend &backend, const GdnShape &shape, uint32_t lanes
     const PreparedInput prepared =
         GDN::addDecode(tiled, buffers, shape, lanes, 0, fixture.cell.strides(), GdnHeadOrder::Tiled, layout);
     tables.addReference(tiled, fixture.hidden);
-    (void)backend.submitCommand(tiled.dispatches());
+    (void)backend.submitCommandAsync(tiled.dispatches()).wait();
     tables.requireWritten(prepared, fixture.hidden, what);
   }
   require(!std::memcmp(expected.data(), hidden, expected.size()),
@@ -738,7 +738,7 @@ void gateMatchesPrefill(MetalBackend &backend, const GdnShape &shape, bool float
                          LinearInput::Plain)
                   .layout == LinearInput::Plain,
           what + ": plain GDN claimed a table");
-  (void)backend.submitCommand(decode.dispatches());
+  (void)backend.submitCommandAsync(decode.dispatches()).wait();
 
   const auto buffer = [&](uint64_t bytes) { return sharedBuffer(backend, bytes); };
   const uint64_t valueRows = uint64_t{kRows} * valueWidth * 2;
@@ -766,7 +766,7 @@ void gateMatchesPrefill(MetalBackend &backend, const GdnShape &shape, bool float
     prefill.recurrentIn = backend.view(fixture.current[lane], fixture.cell.convBytes, stateBytes);
     CommandGraph graph;
     GDN::addPrefill(graph, prefill, shape, kRows, order);
-    (void)backend.submitCommand(graph.dispatches());
+    (void)backend.submitCommandAsync(graph.dispatches()).wait();
 
     const float *state = fixture.cell.recurrent(fixture.cellBytes(fixture.current[lane]), 0);
     const auto *rows = static_cast<const uint16_t *>(prefill.recurrentRows.contents());

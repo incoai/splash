@@ -236,9 +236,6 @@ def check() -> list[str]:
         # server's time.monotonic() does.
         if SLEEP_COUNTING_CLOCK.search(text):
             errors.append(f"{name}: measures time on a clock that counts sleep")
-        # Tests alone substitute what production holds constant.
-        if name != "runtime/TestConfig.hpp" and "testConfigStorage" in text:
-            errors.append(f"{name}: production writes the test configuration")
     return errors
 
 

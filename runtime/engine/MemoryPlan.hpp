@@ -8,12 +8,8 @@
 #include <cstdint>
 #include <optional>
 #include <string>
-#include <string_view>
 
 namespace splash::engine {
-
-[[nodiscard]] std::string
-deviceStatusJson(const DeviceCapabilities &device);
 
 inline constexpr uint64_t kMiB = 1024ULL * 1024;
 inline constexpr uint64_t kGiB = 1024ULL * 1024 * 1024;
@@ -101,8 +97,6 @@ enum class BudgetErrorCode {
   KvPoolDoesNotFit,
 };
 
-[[nodiscard]] std::string_view budgetErrorCodeName(BudgetErrorCode code);
-
 struct EngineMemoryBreakdown {
   uint64_t physicalMemoryBytes = 0;
   uint64_t recommendedWorkingSetBytes = 0;
@@ -157,7 +151,6 @@ struct BudgetValidationStatus {
   std::string message;
   EngineMemoryBreakdown breakdown;
 
-  [[nodiscard]] std::string toStatusJson() const;
   [[nodiscard]] std::string describe() const;
 };
 

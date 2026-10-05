@@ -24,6 +24,7 @@ from transformers import AutoTokenizer
 
 from . import images as image_input
 from . import json_codec, judgments, serve_options
+from . import protocol as wire
 from . import runtime as engine_runtime
 from .api_shapes import (
     anthropic_block,
@@ -137,14 +138,15 @@ def _normalize_path(raw_path):
     return normalized
 
 
-def _return_progress(body):
-    """A generation request's return_progress, which only a stream takes."""
+def _progress_flag(body):
+    """The request flag of a generation request's return_progress, which only
+    a stream takes."""
     value = body.get("return_progress", False)
     if not isinstance(value, bool) or (value and body.get("stream") is not True):
         raise APIError(
             400, "return_progress requires stream: true and must be a boolean"
         )
-    return value
+    return wire.RequestFlag.RETURN_PROGRESS if value else wire.RequestFlag(0)
 
 
 def _stream_options(body):
@@ -696,10 +698,10 @@ class FrontendHandler(BaseHTTPRequestHandler):
             self.app.backend.cancel(self._submitted)
 
     def _post_chat_completions(self, body, deadline):
-        return_progress = _return_progress(body)
+        progress = _progress_flag(body)
         stream, stream_options = _stream_options(body)
         job = self.app.prepare(body, deadline=deadline)
-        job.return_progress = return_progress
+        job.flags |= progress
         if stream:
             return job, partial(
                 self._openai_stream, stream_options=stream_options, chat=True
@@ -707,10 +709,10 @@ class FrontendHandler(BaseHTTPRequestHandler):
         return job, self._complete
 
     def _post_completions(self, body, deadline):
-        return_progress = _return_progress(body)
+        progress = _progress_flag(body)
         stream, stream_options = _stream_options(body)
         job = self.app.prepare_completion(body, deadline=deadline)
-        job.return_progress = return_progress
+        job.flags |= progress
         if stream:
             return job, partial(
                 self._openai_stream, stream_options=stream_options, chat=False
@@ -718,17 +720,17 @@ class FrontendHandler(BaseHTTPRequestHandler):
         return job, self._text_completion
 
     def _post_responses(self, body, deadline):
-        return_progress = _return_progress(body)
+        progress = _progress_flag(body)
         job = self.app.prepare_responses(
             body, deadline=deadline, reserve_input=self._body_reservation.grow
         )
-        job.return_progress = return_progress
+        job.flags |= progress
         if body.get("stream"):
             return job, self._responses_stream
         return job, self._responses_complete
 
     def _post_messages(self, body, deadline):
-        return_progress = _return_progress(body)
+        progress = _progress_flag(body)
         chat, thinking_display = anthropic_to_chat_body(
             body, thinking_resolver=self.app.thinking_codec.decode
         )
@@ -739,7 +741,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             clamp_output_budget=True,
             thinking_display=thinking_display,
         )
-        job.return_progress = return_progress
+        job.flags |= progress
         if body.get("stream"):
             return job, self._anthropic_stream
         return job, self._anthropic_complete
@@ -1645,7 +1647,6 @@ def main():
             _native_command(args),
             startup_timeout=NATIVE_START_TIMEOUT,
             pending_limit=args.queue_size,
-            eager_start=False,
         )
         backend = NativeBackend(
             runtime,

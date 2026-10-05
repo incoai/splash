@@ -91,8 +91,6 @@ MemoryGovernor::Reservation::Reservation(Reservation &&other) noexcept
   other.bytes_ = 0;
 }
 
-void MemoryGovernor::Reservation::commit() { release(); }
-
 void MemoryGovernor::Reservation::release() noexcept {
   if (owner_ && bytes_)
     owner_->release(bytes_);
@@ -176,8 +174,8 @@ MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure &failure) {
   uint64_t requested =
       overflows ? std::numeric_limits<uint64_t>::max() : reservedBytes_ + bytes;
   std::optional<uint64_t> hostAvailable = sampleHostAvailable();
-  MemoryPressure pressure = updateEffectivePressure(
-      hostAvailable, reservedBytes_);
+  host_ = hostState(hostAvailable);
+  const MemoryPressure pressure = effectivePressure(host_);
   bool engineFits = !overflows && observed <= limitBytes_ &&
                     requested <= limitBytes_ - observed;
   // Growth leaves the warning margin free above the host's reserve and waits
@@ -190,9 +188,9 @@ MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure &failure) {
   // while the idle headroom may still clear the margin. Hold host pressure
   // so the paced reclaim frees toward the recovery margin for it.
   if (engineFits && !serving_ && !hostRoomFits)
-    hostConstrained_ = true;
+    host_.constrained = true;
   const bool hostRefuses = pressure == MemoryPressure::Critical ||
-                           (!serving_ && (!hostRoomFits || hostHeld()));
+                           (!serving_ && (!hostRoomFits || host_.held()));
   if (hostRefuses || !engineFits) {
     // The host's refusal lifts with its pressure, the limit's only once
     // memory is freed: a refusal they share is the host's.
@@ -220,7 +218,6 @@ metal::AllocationAdmission MemoryGovernor::allocationAdmission() noexcept {
       // Host headroom is an estimate; the driver can still deny the allocation.
       return error.failure();
     }
-    reservation->commit();
     return {};
   };
 }
@@ -236,10 +233,23 @@ void MemoryGovernor::setPressure(MemoryPressure pressure) noexcept {
 void MemoryGovernor::reclaimed(ReclaimOutcome outcome) noexcept {
   if (outcome == ReclaimOutcome::Untargeted)
     return;
-  reclaimExhausted_ = outcome == ReclaimOutcome::Exhausted;
+  host_.reclaimExhausted = outcome == ReclaimOutcome::Exhausted;
 }
 
 MemoryGovernorSnapshot MemoryGovernor::snapshot() const noexcept {
+  const std::optional<uint64_t> hostAvailable = sampleHostAvailable();
+  return snapshot(hostAvailable, hostState(hostAvailable));
+}
+
+MemoryGovernorSnapshot MemoryGovernor::evaluate() noexcept {
+  const std::optional<uint64_t> hostAvailable = sampleHostAvailable();
+  host_ = hostState(hostAvailable);
+  return snapshot(hostAvailable, host_);
+}
+
+MemoryGovernorSnapshot
+MemoryGovernor::snapshot(const std::optional<uint64_t> &hostAvailable,
+                         const HostState &host) const noexcept {
   uint64_t observed = chargedBytes();
   uint64_t used = observed;
   if (reservedBytes_ <= std::numeric_limits<uint64_t>::max() - used) {
@@ -247,17 +257,15 @@ MemoryGovernorSnapshot MemoryGovernor::snapshot() const noexcept {
   } else {
     used = std::numeric_limits<uint64_t>::max();
   }
-  std::optional<uint64_t> hostAvailable = sampleHostAvailable();
   uint64_t hostHeadroom = hostHeadroomBytes(hostAvailable, reservedBytes_);
-  MemoryPressure effectivePressure = updateEffectivePressure(
-      hostAvailable, reservedBytes_);
-  bool hostGrowthAllowed = effectivePressure != MemoryPressure::Critical &&
-      !hostHeld() && hostHeadroom >= kHostWarningMarginBytes;
+  const MemoryPressure pressure = effectivePressure(host);
+  bool hostGrowthAllowed = pressure != MemoryPressure::Critical &&
+      !host.held() && hostHeadroom >= kHostWarningMarginBytes;
   return {
       limitBytes_,
       observed,
       used < limitBytes_ ? limitBytes_ - used : 0,
-      effectivePressure,
+      pressure,
       deniedReservations_,
       hostAvailable.has_value(),
       hostAvailable.value_or(0),
@@ -268,24 +276,27 @@ MemoryGovernorSnapshot MemoryGovernor::snapshot() const noexcept {
   };
 }
 
-MemoryPressure MemoryGovernor::updateEffectivePressure(
-    const std::optional<uint64_t> &hostAvailable,
-    uint64_t reservedBytes) const noexcept {
-  uint64_t hostHeadroom = hostHeadroomBytes(hostAvailable, reservedBytes);
+MemoryGovernor::HostState MemoryGovernor::hostState(
+    const std::optional<uint64_t> &hostAvailable) const noexcept {
+  const uint64_t hostHeadroom =
+      hostHeadroomBytes(hostAvailable, reservedBytes_);
+  HostState next;
+  next.constrained = !hostAvailable ||
+      hostHeadroom < kHostWarningMarginBytes ||
+      (host_.constrained && hostHeadroom < kHostRecoveryMarginBytes);
+  next.reclaimExhausted = host_.reclaimExhausted && next.constrained;
+  return next;
+}
 
+MemoryPressure
+MemoryGovernor::effectivePressure(const HostState &host) const noexcept {
   // Availability controls growth and paced reclaim. Only the system's
   // critical signal warrants dropping every evictable cache entry.
-  hostConstrained_ = !hostAvailable ||
-      hostHeadroom < kHostWarningMarginBytes ||
-      (hostConstrained_ && hostHeadroom < kHostRecoveryMarginBytes);
-  reclaimExhausted_ = reclaimExhausted_ && hostConstrained_;
-  MemoryPressure next = MemoryPressure::Normal;
-  if (systemPressure_ == MemoryPressure::Critical) {
-    next = MemoryPressure::Critical;
-  } else if (hostConstrained_ || systemPressure_ == MemoryPressure::Warning) {
-    next = MemoryPressure::Warning;
-  }
-  return next;
+  if (systemPressure_ == MemoryPressure::Critical)
+    return MemoryPressure::Critical;
+  if (host.constrained || systemPressure_ == MemoryPressure::Warning)
+    return MemoryPressure::Warning;
+  return MemoryPressure::Normal;
 }
 
 void MemoryGovernor::release(uint64_t bytes) noexcept {

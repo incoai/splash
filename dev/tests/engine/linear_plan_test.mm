@@ -1627,13 +1627,13 @@ void numericalCase(metal::MetalBackend &backend, Linear &linear,
       const auto *values = static_cast<const uint16_t *>(b.residual.contents());
       immutableResidual.assign(values, values + b.residual.sizeBytes() / sizeof(uint16_t));
     }
-    (void)backend.submitCommand(graph.dispatches());
+    (void)backend.submitCommandAsync(graph.dispatches()).wait();
     if (workload.phase == LinearPhase::Decode && workload.rows == 24) {
       const auto firstOutput = snapshot(b.output);
       if (inPlaceResidual)
         std::memcpy(b.residual.contents(), immutableResidual.data(),
                     immutableResidual.size() * sizeof(uint16_t));
-      (void)backend.submitCommand(graph.dispatches());
+      (void)backend.submitCommandAsync(graph.dispatches()).wait();
       require(std::memcmp(firstOutput.data(), b.output.contents(), firstOutput.size()) == 0,
               "repeated M24 dispatch changed its output bytes");
     }
@@ -1690,7 +1690,7 @@ void numericalCase(metal::MetalBackend &backend, Linear &linear,
       linear.add(fp32Graph, fp32Buffers, p, fp32);
       require(fp32Graph.dispatches().back().pipelineName == kernelInstance(plan.pipeline(), FloatOutput::Float32),
               "an fp32 plan did not dispatch its kernel's fp32 instance");
-      (void)backend.submitCommand(fp32Graph.dispatches());
+      (void)backend.submitCommandAsync(fp32Graph.dispatches()).wait();
       checkGuard(fp32Backing, fp32Bytes, "fp32 output");
       const auto *values = static_cast<const float *>(fp32Buffers.output.contents());
       for (uint64_t i = 0; i < elements; ++i)
@@ -1724,7 +1724,7 @@ void numericalCase(metal::MetalBackend &backend, Linear &linear,
     metal::CommandGraph graph;
     linear.add(graph, {input, gateOutput, {}, {}, {}, {}}, gate, plain);
     linear.add(graph, {input, upOutput, {}, {}, {}, {}}, p, plain);
-    (void)backend.submitCommand(graph.dispatches());
+    (void)backend.submitCommandAsync(graph.dispatches()).wait();
     const auto *g = static_cast<const uint16_t *>(gateOutput.contents());
     const auto *u = static_cast<const uint16_t *>(upOutput.contents());
     gateReference.assign(g, g + baseline.size());

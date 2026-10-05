@@ -1,5 +1,5 @@
 #include "engine/Bootstrap.hpp"
-#include "engine/StartupLog.hpp"
+#include "StderrLine.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -11,7 +11,6 @@ namespace {
 
 RuntimeBootstrapReport reportForPlan(const EngineMemoryPlan &plan) {
   RuntimeBootstrapReport report;
-  report.memoryPlanJson = plan.toStatusJson();
   report.budgetDescription = plan.breakdown().describe();
   return report;
 }
@@ -19,9 +18,9 @@ RuntimeBootstrapReport reportForPlan(const EngineMemoryPlan &plan) {
 RuntimeBootstrapReport
 reportForResourceFailure(const RuntimeResourcesError &error) {
   RuntimeBootstrapReport report;
+  report.resourceStage = error.stage();
   report.resourceFailure = error.failure();
-  report.message = error.message();
-  report.memoryPlanJson = error.statusJson();
+  report.message = error.what();
   report.budgetDescription = error.budgetDescription();
   return report;
 }
@@ -61,7 +60,10 @@ std::string RuntimeBootstrapReport::describe() const {
   std::ostringstream out;
   out << (stage == RuntimeBootstrapStage::Ready ? "runtime bootstrap ready"
                                                 : "runtime bootstrap failed")
-      << " [" << runtimeBootstrapStageName(stage) << "]: " << message;
+      << " [" << runtimeBootstrapStageName(stage);
+  if (resourceStage)
+    out << '/' << runtimeResourceStageName(*resourceStage);
+  out << "]: " << message;
   if (!memoryAudit.message.empty()) {
     out << '\n' << memoryAudit.describe();
   }
@@ -82,9 +84,10 @@ StartupRetryWindow::retryUntil(const RuntimeBootstrapReport &failure,
   if (failure.resourceFailure != RuntimeResourceFailure::HostCapacity &&
       failure.resourceFailure != RuntimeResourceFailure::DriverAllocation)
     return std::nullopt;
-  if (!deadline_ || failure.stage > stage_) {
+  const std::pair reached{failure.stage, failure.resourceStage};
+  if (!deadline_ || reached > reached_) {
     deadline_ = now + length_;
-    stage_ = failure.stage;
+    reached_ = reached;
   }
   if (now >= *deadline_)
     return std::nullopt;
@@ -237,10 +240,10 @@ RuntimeBootstrapReport RuntimeBootstrap::requireWarmupAndAnnounce(
     nativeLoop.announceReady();
   } catch (const std::exception &error) {
     fail(report, RuntimeBootstrapStage::AnnounceReady,
-         std::string("binary ReadyEvent announcement failed: ") + error.what());
+         std::string("ReadyEvent announcement failed: ") + error.what());
   } catch (...) {
     fail(report, RuntimeBootstrapStage::AnnounceReady,
-         "binary ReadyEvent announcement failed with an unknown exception");
+         "ReadyEvent announcement failed with an unknown exception");
   }
   report.stage = RuntimeBootstrapStage::Ready;
   report.message = "required warmup paths and memory audit passed";
@@ -285,12 +288,12 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
   if (!config.resources.maximumCacheDiskBytes && hostAvailable &&
       memoryMayNotHold(resources->memoryPlan(), *hostAvailable,
                        config.nativeLoop.engine.maxContext)) {
-    logStartup("The ", *hostAvailable / kMiB,
-               " MiB this Mac had available at startup may not hold a ",
-               config.nativeLoop.engine.maxContext,
-               "-token request; one that runs out of memory is suspended"
-               " and replays its prompt. --max-cache-disk SIZE keeps its"
-               " progress and cached prefixes on SSD.");
+    logLine("The ", *hostAvailable / kMiB,
+            " MiB this Mac had available at startup may not hold a ",
+            config.nativeLoop.engine.maxContext,
+            "-token request; one that runs out of memory is suspended"
+            " and replays its prompt. --max-cache-disk SIZE keeps its"
+            " progress and cached prefixes on SSD.");
   }
   config.nativeLoop.engine.vocabularySize =
       config.resources.model.capabilities.vocabularySize;
@@ -339,12 +342,11 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
   try {
     connectToGovernor(config.nativeLoop.engine, resources->memoryGovernor());
     config.nativeLoop.weights = &resources->weightImages();
-    config.nativeLoop.idleReleaseSeconds = config.resources.idleReleaseSeconds;
     // The parser and engine consume the same resolved ceiling. In automatic
     // mode it cannot be known until resource planning has measured the device.
     nativeLoop = std::make_unique<NativeRuntime>(
-        config.nativeLoop, resources->cache(), *modelRuntime,
-        std::move(output), std::move(statusProvider),
+        config.nativeLoop, config.resources.idleReleaseSeconds, resources->cache(),
+        *modelRuntime, std::move(output), std::move(statusProvider),
         protocolLimitsFor(config.resources.model.capabilities,
                           config.nativeLoop.engine.maxContext));
   } catch (const metal::MetalAllocationError &error) {

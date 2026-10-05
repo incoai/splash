@@ -3,6 +3,8 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <ctime>
+#include <sstream>
 #include <string>
 #include <string_view>
 
@@ -22,6 +24,32 @@ inline void writeStderrLine(std::string_view text) noexcept {
         return;
       rest.remove_prefix(static_cast<size_t>(written));
     }
+  } catch (...) {
+    // Diagnostics must not affect startup or serving.
+  }
+}
+
+// A notice the runtime gives while it starts, serves or stops, as the server
+// prints its own (server/diagnostics.py print_status): the local time, then
+// the parts on one line, bounded, with control characters, such as those of
+// a caught exception's message, as spaces. An error that ends the process
+// is written as an "error: ..." line instead (main.mm).
+template <typename... Parts> void logLine(const Parts &...parts) noexcept {
+  try {
+    std::ostringstream text;
+    (text << ... << parts);
+    const std::string message = text.str();
+    const std::time_t now = std::time(nullptr);
+    std::tm local{};
+    char timestamp[9] = "--:--:--";
+    if (localtime_r(&now, &local))
+      std::strftime(timestamp, sizeof(timestamp), "%H:%M:%S", &local);
+    std::ostringstream line;
+    line << timestamp << ' ';
+    for (unsigned char character : std::string_view(message).substr(0, 768))
+      line << (character < 32 || character == 127 ? ' ' : char(character));
+    if (message.size() > 768) line << "...";
+    writeStderrLine(line.str());
   } catch (...) {
     // Diagnostics must not affect startup or serving.
   }

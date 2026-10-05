@@ -169,7 +169,7 @@ int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFor
     MoE::add(graph, b, weights, plan);
     std::vector<double> samples;
     for (uint32_t i = 0; i < rounds + 1; ++i) {
-      const double seconds = backend.submitCommand(graph.dispatches()).gpuSeconds;
+      const double seconds = backend.submitCommandAsync(graph.dispatches()).wait().gpuSeconds;
       if (i) samples.push_back(seconds * 1e3);   // the first round warms the pipelines
     }
     std::sort(samples.begin(), samples.end());

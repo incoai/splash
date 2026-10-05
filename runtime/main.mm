@@ -2,27 +2,23 @@
 #include "StderrLine.hpp"
 #include "engine/FdTransport.hpp"
 #include "engine/Bootstrap.hpp"
+#include "engine/NativeArguments.hpp"
 #include "engine/Status.hpp"
-#include "model/Model.hpp"
-#include "model/ModelDescriptor.hpp"
 
 #include <IOKit/pwr_mgt/IOPMLib.h>
 #include <dispatch/dispatch.h>
 #include <mach-o/dyld.h>
 #include <mach/mach_error.h>
+#include <sysexits.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
-#include <charconv>
 #include <csignal>
 #include <chrono>
-#include <cmath>
 #include <cstdint>
-#include <cstdio>
 #include <filesystem>
-#include <limits>
 #include <limits.h>
 #include <memory>
 #include <stdexcept>
@@ -45,29 +41,6 @@ namespace {
 // failures remain immediate and fail-closed.
 constexpr auto kStartupMemoryRecoveryTimeout = std::chrono::seconds(30);
 constexpr auto kStartupMemoryRecoveryPoll = std::chrono::seconds(1);
-class UsageError final : public std::runtime_error {
-public:
-  using std::runtime_error::runtime_error;
-};
-
-struct NativeArguments final {
-  std::filesystem::path modelRoot;
-  model::ModelDescriptor model;
-  uint32_t maxContext = 0;
-  uint64_t maxMemoryBytes = 0;
-  uint64_t maxCacheDiskBytes = 0;
-  // --cache-dir: where the cache tier keeps its files for the next process;
-  // empty for temporary ones.
-  std::filesystem::path persistentCacheRoot;
-  kv::Format kvFormat = kv::Format::Int8;
-  double decodeShare = engine::EngineConfig{}.decodeShare;
-  uint32_t maxImagePatches = ops::kMaximumImagePatches;
-  // --idle-release SECONDS|off, infinite for off.
-  double idleReleaseSeconds = engine::RuntimeResourcesConfig{}.idleReleaseSeconds;
-  // --idle-sleep prevent|allow: whether the engine keeps the Mac from sleeping
-  // automatically while it holds a request.
-  bool preventIdleSleep = true;
-};
 
 // One observer spans bootstrap and serving. The dispatch queue only records
 // pressure and wakes control; all allocation/reclaim decisions stay on the
@@ -161,13 +134,8 @@ public:
     if (reported_)
       return;
     reported_ = true;
-    // Formatted without allocating: hold() must not throw.
-    char line[160];
-    std::snprintf(line, sizeof line,
-                  "Splash cannot keep the Mac awake while requests run (%s); "
-                  "it may sleep during one.",
-                  mach_error_string(result));
-    writeStderrLine(line);
+    logLine("Splash cannot keep the Mac awake while requests run (",
+            mach_error_string(result), "); it may sleep during one.");
   }
 
 private:
@@ -183,126 +151,6 @@ void printUsage(std::string_view executable) {
       " [--kv-format int8|bf16] [--decode-share SHARE]"
       " [--max-image-patches PATCHES] [--cache-dir DIRECTORY]"
       " [--idle-release SECONDS|off] [--idle-sleep prevent|allow]");
-}
-
-template <typename T>
-bool parsePositive(std::string_view value, T &result) {
-  const char *end = value.data() + value.size();
-  auto parsed = std::from_chars(value.data(), end, result);
-  return parsed.ec == std::errc{} && parsed.ptr == end && result != 0;
-}
-
-uint64_t parseMaxMemory(std::string_view value) {
-  if (value == "auto")
-    return 0;
-  uint64_t result = 0;
-  if (!parsePositive(value, result))
-    throw UsageError("MAX_MEMORY_BYTES must be auto or a positive integer");
-  return result;
-}
-
-uint32_t parseMaxContext(std::string_view value,
-                         const model::ModelCapabilities &capabilities) {
-  if (value == "auto")
-    return 0;
-  uint32_t result = 0;
-  if (!parsePositive(value, result) ||
-      result > capabilities.maximumContextTokens) {
-    throw UsageError("MAX_CONTEXT must be auto or an integer in [1, " +
-                     std::to_string(capabilities.maximumContextTokens) + "]");
-  }
-  return result;
-}
-
-uint32_t parseMaxImagePatches(std::string_view value) {
-  uint32_t result = 0;
-  if (!parsePositive(value, result) || result % 4 ||
-      result > ops::kMaximumImagePatches)
-    throw UsageError("--max-image-patches requires a positive multiple of 4 "
-                     "up to " + std::to_string(ops::kMaximumImagePatches));
-  return result;
-}
-
-bool parseFinite(std::string_view value, double &result) {
-  const char *end = value.data() + value.size();
-  auto parsed = std::from_chars(value.data(), end, result);
-  return parsed.ec == std::errc{} && parsed.ptr == end && std::isfinite(result);
-}
-
-double parseIdleRelease(std::string_view value) {
-  if (value == "off")
-    return std::numeric_limits<double>::infinity();
-  double result = 0.0;
-  if (!parseFinite(value, result) || result <= 0.0)
-    throw UsageError("--idle-release requires off or a positive number of seconds");
-  return result;
-}
-
-double parseDecodeShare(std::string_view value) {
-  double result = 0.0;
-  if (!parseFinite(value, result) || result < 0.0)
-    throw UsageError("--decode-share requires a nonnegative number");
-  return result;
-}
-
-std::filesystem::path requireModelRoot(std::string_view argument) {
-  std::error_code error;
-  const std::filesystem::path root =
-      std::filesystem::canonical(std::filesystem::path(argument), error);
-  if (error || !std::filesystem::is_directory(root, error))
-    throw UsageError("MODEL_DIRECTORY must name an existing directory");
-  for (const char *role : {"target", "draft"}) {
-    if (!std::filesystem::is_directory(root / role, error))
-      throw UsageError(
-          "MODEL_DIRECTORY must hold the model's target/ and draft/ directories");
-  }
-  return root;
-}
-
-NativeArguments parseArguments(int argc, char **argv) {
-  if (argc < 5 || std::string_view(argv[1]) != "serve-native") {
-    throw UsageError("expected the serve-native command");
-  }
-  NativeArguments result;
-  int next = 5;
-  if (next < argc && !std::string_view(argv[next]).starts_with("--")) {
-    const std::string_view quota(argv[next++]);
-    if (quota != "0" && !parsePositive(quota, result.maxCacheDiskBytes))
-      throw UsageError("MAX_CACHE_DISK_BYTES must be a nonnegative integer");
-  }
-  // Options follow as --name value pairs; a missing value fails its check.
-  for (; next < argc; next += 2) {
-    const std::string_view option(argv[next]);
-    const std::string_view value(next + 1 < argc ? argv[next + 1] : "");
-    if (option == "--kv-format") {
-      if (value != "int8" && value != "bf16")
-        throw UsageError("--kv-format requires int8 or bf16");
-      result.kvFormat = value == "int8" ? kv::Format::Int8 : kv::Format::BFloat16;
-    } else if (option == "--decode-share") {
-      result.decodeShare = parseDecodeShare(value);
-    } else if (option == "--max-image-patches") {
-      result.maxImagePatches = parseMaxImagePatches(value);
-    } else if (option == "--cache-dir") {
-      if (value.empty())
-        throw UsageError("--cache-dir requires a directory");
-      result.persistentCacheRoot = std::filesystem::absolute(std::filesystem::path(value));
-    } else if (option == "--idle-release") {
-      result.idleReleaseSeconds = parseIdleRelease(value);
-    } else if (option == "--idle-sleep") {
-      if (value != "prevent" && value != "allow")
-        throw UsageError("--idle-sleep requires prevent or allow");
-      result.preventIdleSleep = value == "prevent";
-    } else {
-      throw UsageError("unexpected argument " + std::string(option));
-    }
-  }
-  if (!result.persistentCacheRoot.empty() && !result.maxCacheDiskBytes)
-    throw UsageError("--cache-dir requires a MAX_CACHE_DISK_BYTES quota");
-  result.modelRoot = requireModelRoot(argv[2]);
-  result.model = model::inspectModelPackage(result.modelRoot);
-  result.maxContext = parseMaxContext(argv[3], result.model.capabilities);
-  result.maxMemoryBytes = parseMaxMemory(argv[4]);
-  return result;
 }
 
 std::filesystem::path executablePath() {
@@ -324,7 +172,7 @@ std::filesystem::path executablePath() {
 }
 
 engine::RuntimeBootstrapConfig
-bootstrapConfig(const NativeArguments &arguments) {
+bootstrapConfig(const engine::NativeArguments &arguments) {
   engine::RuntimeBootstrapConfig config;
   config.resources.metallibPath =
       executablePath().parent_path() / "splash.metallib";
@@ -402,14 +250,13 @@ void closePersistentCache(engine::FdTransport &transport,
     return;
   }
   if (!flushed)
-    writeStderrLine("Persistent cache: stopping before every newest restore point reached the "
-                    "disk.");
+    logLine("Persistent cache: stopping before every newest restore point reached the disk.");
   if (!bootstrap.resources().closePersistentCache())
     writeStderrLine("error: the persistent cache did not reach the disk; the next start takes it "
                     "back on probation.");
 }
 
-int runNative(const NativeArguments &arguments) {
+int runNative(const engine::NativeArguments &arguments) {
   engine::FdTransport transport(STDIN_FILENO, STDOUT_FILENO);
   ShutdownSignals signals(transport);
   MemoryPressureMonitor pressureMonitor(transport.controlNotifier());
@@ -445,9 +292,8 @@ int runNative(const NativeArguments &arguments) {
       if (!recoveryDeadline)
         throw;
       if (!reportedRecoveryWait) {
-        writeStderrLine(
-            "Waiting for sufficient available memory to start; "
-            "the macOS reserve remains protected...");
+        logLine("Waiting for sufficient available memory to start; "
+                "the macOS reserve remains protected...");
         reportedRecoveryWait = true;
       }
       const auto resumeAt = std::min(now + kStartupMemoryRecoveryPoll, *recoveryDeadline);
@@ -498,12 +344,6 @@ int runNative(const NativeArguments &arguments) {
   return static_cast<int>(exit);
 }
 
-void printBootstrapError(const engine::RuntimeBootstrapReport &report) {
-  writeStderrLine("error: " + report.describe());
-  if (!report.memoryPlanJson.empty())
-    writeStderrLine("memory_plan_json: " + report.memoryPlanJson);
-}
-
 // The engine's device rule, which the launcher runs before any download:
 // serve-native applies it only once the model is prepared.
 int checkDevice() {
@@ -522,17 +362,13 @@ int main(int argc, char **argv) {
     try {
       if (argc == 2 && std::string_view(argv[1]) == "device-check")
         return splash::checkDevice();
-      splash::NativeArguments arguments = splash::parseArguments(argc, argv);
+      const splash::engine::NativeArguments arguments =
+          splash::engine::parseNativeArguments(argc, argv);
       return splash::runNative(arguments);
-    } catch (const splash::UsageError &error) {
+    } catch (const splash::engine::UsageError &error) {
       splash::writeStderrLine(std::string("error: ") + error.what());
       splash::printUsage(argc > 0 ? argv[0] : "splash");
-      return static_cast<int>(
-          splash::engine::NativeProcessExit::ProtocolFailure);
-    } catch (const splash::engine::RuntimeBootstrapError &error) {
-      splash::printBootstrapError(error.report());
-      return static_cast<int>(
-          splash::engine::NativeProcessExit::EngineFailure);
+      return EX_USAGE;
     } catch (const std::system_error &error) {
       splash::writeStderrLine(
           std::string("error: native runtime I/O failed: ") + error.what());

@@ -252,6 +252,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/DraftContextPlan.cpp \
 	runtime/engine/Protocol.cpp \
 	runtime/engine/NativeRuntime.cpp \
+	runtime/engine/NativeArguments.cpp \
 	runtime/engine/FdTransport.cpp \
 	runtime/engine/MemoryAudit.cpp \
 	runtime/engine/Status.cpp \

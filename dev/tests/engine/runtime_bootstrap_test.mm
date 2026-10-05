@@ -1,6 +1,7 @@
 #include "ProtocolPeer.hpp"
 #include "Q8PageFormatReference.hpp"
 #include "TestChecks.hpp"
+#include "TestEngine.hpp"
 #include "TestFiles.hpp"
 #include "TestImmediateTicket.hpp"
 #include "TestKvPool.hpp"
@@ -18,11 +19,13 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -32,6 +35,7 @@ using namespace splash;
 using namespace splash::engine;
 namespace runtime = splash::engine;
 
+using splash::test::rejects;
 using splash::test::require;
 
 class TemporaryModelRoot final {
@@ -293,20 +297,18 @@ void testRuntimeCacheIdentityReportsTheLoadedModel() {
       engine::makeRuntimeCacheIdentity(combined, target, "build", bf16Layout);
   require(bf16.kvLayout == bf16Layout && bf16.kvLayout.format != int8.kvLayout.format,
           "the cache identity did not report the KV format");
-  const auto rejected = [&](std::string_view combinedDigest,
-                            std::string_view targetDigest, std::string_view build) {
-    try {
-      static_cast<void>(engine::makeRuntimeCacheIdentity(combinedDigest, targetDigest,
-                                                         build, int8Layout));
-    } catch (const std::invalid_argument &) {
-      return true;
-    }
-    return false;
+  const auto identity = [&](std::string_view combinedDigest, std::string_view targetDigest,
+                            std::string_view build) {
+    static_cast<void>(
+        engine::makeRuntimeCacheIdentity(combinedDigest, targetDigest, build, int8Layout));
   };
-  require(rejected(std::string(63, 'a'), target, "build") &&
-              rejected(combined, std::string(63, 'c') + 'g', "build") &&
-              rejected(combined, target, ""),
-          "a malformed digest or an empty build id was accepted");
+  rejects([&] { identity(std::string(63, 'a'), target, "build"); },
+          "manifest SHA-256 must contain exactly 64 hex characters",
+          "a digest of 63 characters was accepted");
+  rejects([&] { identity(combined, std::string(63, 'c') + 'g', "build"); },
+          "manifest SHA-256 is not hexadecimal", "a digest that is not hexadecimal was accepted");
+  rejects([&] { identity(combined, target, ""); }, "runtime build id is required",
+          "an empty build id was accepted");
 }
 
 DeviceCapabilities device() {
@@ -447,7 +449,7 @@ public:
         resources_(pool_, nullptr, nullptr),
         executor_(throwingStep),
         loop_(
-            loopConfig(), resources_, executor_,
+            loopConfig(), metal::kResidencyKeepAliveSeconds, resources_, executor_,
             [this, failReadyWrite](std::span<const uint8_t> bytes) {
               if (failReadyWrite) {
                 throw std::runtime_error("injected output failure");
@@ -463,10 +465,10 @@ public:
   const std::vector<uint8_t> &output() const noexcept { return output_; }
 
 private:
-  static engine::NativeLoopConfig loopConfig() {
-    engine::NativeLoopConfig config;
-    config.engine.maxContext = 1024;
-    return config;
+  engine::NativeLoopConfig loopConfig() {
+    return {.engine = test::engineConfig({.maxContext = 1024}),
+            .metrics = &metrics_,
+            .weights = &weights_};
   }
 
   test::TestKvStorage backing_;
@@ -474,19 +476,22 @@ private:
   engine::Cache resources_;
   Executor executor_;
   std::vector<uint8_t> output_;
+  RuntimeMetrics metrics_;
+  test::Weights weights_;
   engine::NativeRuntime loop_;
 };
 
 void testAllNativeWarmupsPrecedeReady() {
   const EngineMemoryPlan plan = memoryPlan();
   Harness harness;
-  require(!harness.loop().ready() && harness.output().empty(),
+  require(harness.output().empty(),
           "runtime became visible before warmup");
   auto report = engine::RuntimeBootstrap::requireWarmupAndAnnounce(
       plan, harness.executor(), [&] { return validActual(plan); },
       harness.loop());
+  const auto events = protocol::peer::decodeEvents(harness.output());
   require(report.stage == RuntimeBootstrapStage::Ready && report.memoryAudit.valid &&
-              harness.loop().ready() && !harness.output().empty(),
+              events.size() == 1 && std::holds_alternative<protocol::ReadyEvent>(events.front()),
           "successful native bootstrap was incomplete");
   require(harness.executor().calls == std::vector<int>({0, 1, 2, 3, 4, 5}),
           "bootstrap did not warm fixed prefill and B1/B2/B3/B4 in order");
@@ -504,8 +509,7 @@ RuntimeBootstrapReport warmup(Harness &harness, const EngineMemoryPlan &plan) {
 
 void requireReadyWithoutReducingConcurrency(
     Harness &harness, const RuntimeBootstrapReport &report) {
-  require(report.stage == RuntimeBootstrapStage::Ready && report.memoryAudit.valid &&
-              harness.loop().ready(),
+  require(report.stage == RuntimeBootstrapStage::Ready && report.memoryAudit.valid,
           "memory-limited warmup did not become ready");
   const auto events = protocol::peer::decodeEvents(harness.output());
   require(events.size() == 1, "bootstrap did not emit one complete Ready frame");
@@ -589,16 +593,20 @@ void testResourceFailureClassificationSurvivesBootstrap() {
       for (const char *message : {
                "currently available; close memory-heavy applications and retry",
                "different diagnostic wording"}) {
-        RuntimeResourcesError resourceError(stage, message, "{\"budget\":1}",
-                                             "budget details", failure);
+        RuntimeResourcesError resourceError(stage, message, "budget details",
+                                             failure);
         RuntimeBootstrapError error(resourceError);
         const auto &report = error.report();
         require(report.stage == RuntimeBootstrapStage::ResourceAssembly &&
+                    report.resourceStage == stage &&
                     report.resourceFailure == failure &&
                     report.message == message &&
-                    report.memoryPlanJson == "{\"budget\":1}" &&
                     report.budgetDescription == "budget details",
                 "bootstrap lost resource failure classification or diagnostics");
+        require(report.describe().starts_with(
+                    "runtime bootstrap failed [resource_assembly/" +
+                    std::string(runtimeResourceStageName(stage)) + "]: "),
+                "the failure did not name its step of resource assembly");
       }
     }
   }
@@ -625,7 +633,7 @@ void testRequiredWarmupPreservesAllocationFailure() {
       throw std::runtime_error("required allocation refusal announced ready");
     } catch (const RuntimeBootstrapError &error) {
       require(error.report().resourceFailure == resourceAllocationFailure(failure) &&
-                  !harness.loop().ready() && harness.output().empty(),
+                  harness.output().empty(),
               "required warmup erased allocation refusal classification");
     }
   }
@@ -644,7 +652,7 @@ void testFinalHostPressurePreventsReady() {
     throw std::runtime_error("final pressure check announced ready");
   } catch (const RuntimeBootstrapError &error) {
     require(error.report().resourceFailure == RuntimeResourceFailure::HostCapacity &&
-                !harness.loop().ready() && harness.output().empty(),
+                harness.output().empty(),
             "final host pressure lost retryability or announced ready");
   }
 }
@@ -699,7 +707,6 @@ void testWarmupErrorsCannotMasqueradeAsMemoryLimits() {
         require(error.report().stage == stages[step] &&
                     (failure == Failure::Allocation ||
                      error.report().resourceFailure == RuntimeResourceFailure::Other) &&
-                    !harness.loop().ready() &&
                     harness.output().empty() &&
                     harness.executor().calls.back() == step,
                 "warmup failure was swallowed as a memory-limited success");
@@ -720,7 +727,7 @@ void testExceptionsMemoryAndReadyWriteAreFailClosed() {
     } catch (const engine::RuntimeBootstrapError &error) {
       require(error.report().stage ==
                       engine::RuntimeBootstrapStage::DecodeWarmup &&
-                  !harness.loop().ready(),
+                  harness.output().empty(),
               "warmup exception was not contained");
     }
   }
@@ -734,7 +741,7 @@ void testExceptionsMemoryAndReadyWriteAreFailClosed() {
     } catch (const engine::RuntimeBootstrapError &error) {
       require(error.report().stage ==
                       engine::RuntimeBootstrapStage::MemoryAudit &&
-                  !harness.loop().ready(),
+                  harness.output().empty(),
               "invalid memory report escaped the audit");
     }
   }
@@ -748,7 +755,7 @@ void testExceptionsMemoryAndReadyWriteAreFailClosed() {
     } catch (const engine::RuntimeBootstrapError &error) {
       require(error.report().stage ==
                       engine::RuntimeBootstrapStage::AnnounceReady &&
-                  !harness.loop().ready() && harness.output().empty(),
+                  harness.output().empty(),
               "Ready write failure left a visible runtime");
     }
   }
@@ -756,7 +763,9 @@ void testExceptionsMemoryAndReadyWriteAreFailClosed() {
 
 void testStartupRetryWindowOpensAtFirstFailure() {
   using namespace std::chrono_literals;
+  // A refusal of host memory before the weights load.
   RuntimeBootstrapReport failure;
+  failure.resourceStage = RuntimeResourceStage::ModelLoading;
   failure.resourceFailure = RuntimeResourceFailure::HostCapacity;
   StartupRetryWindow window(30s);
   // A slow start fails for the first time minutes in.
@@ -765,15 +774,26 @@ void testStartupRetryWindowOpensAtFirstFailure() {
               window.retryUntil(failure, first + 29s) == first + 30s &&
               !window.retryUntil(failure, first + 30s),
           "the startup retry window did not open at the first failure");
-  // A retry that fails later in startup made progress: a new window opens.
-  // Failing again at that stage or before does not extend it.
-  failure.stage = RuntimeBootstrapStage::MaximumPrefill;
+  // A retry that fails later in startup made progress: a new window opens,
+  // at a later step of resource assembly, as after the weights loaded, and at
+  // a later stage. Failing again there or before does not extend it.
+  failure.resourceStage = RuntimeResourceStage::StorageAllocation;
   require(window.retryUntil(failure, first + 40s) == first + 70s,
+          "progress through resource assembly did not open a new window");
+  failure.stage = RuntimeBootstrapStage::MaximumPrefill;
+  failure.resourceStage.reset();
+  require(window.retryUntil(failure, first + 80s) == first + 110s,
           "progress to a later startup stage did not open a new window");
-  for (auto stage : {RuntimeBootstrapStage::MaximumPrefill,
-                     RuntimeBootstrapStage::ResourceAssembly}) {
+  for (const auto &[stage, resourceStage] :
+       {std::pair{RuntimeBootstrapStage::MaximumPrefill,
+                  std::optional<RuntimeResourceStage>()},
+        std::pair{RuntimeBootstrapStage::ResourceAssembly,
+                  std::optional(RuntimeResourceStage::StorageAllocation)},
+        std::pair{RuntimeBootstrapStage::ResourceAssembly,
+                  std::optional(RuntimeResourceStage::ModelLoading)}}) {
     failure.stage = stage;
-    require(window.retryUntil(failure, first + 50s) == first + 70s,
+    failure.resourceStage = resourceStage;
+    require(window.retryUntil(failure, first + 90s) == first + 110s,
             "a failure without progress extended the retry window");
   }
   failure.resourceFailure = RuntimeResourceFailure::DriverAllocation;

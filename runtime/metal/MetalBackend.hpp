@@ -199,8 +199,8 @@ private:
 // enough to refuse an unsupported Mac before a model is downloaded.
 [[nodiscard]] DeviceCapabilities probeDeviceCapabilities();
 
-// How long a command may run before the backend gives up on it, in time the
-// Mac is awake (AwakeClock). Tests substitute a shorter one through TestConfig.
+// How long a command may run before the backend gives up on it by default,
+// in time the Mac is awake (AwakeClock).
 inline constexpr double kCommandTimeoutSeconds = 120.0;
 // How long every buffer stays wired after the last command by default (see
 // allocateBuffer), also the default of the engine's idle release
@@ -215,9 +215,11 @@ static_assert(kCommandTimeoutSeconds > 0.0 && kResidencyKeepAliveSeconds > 0.0);
 class MetalBackend final {
 public:
   // Buffers stay wired for residencyKeepAliveSeconds after the last command;
-  // an infinite keep-alive holds them while the backend lives.
+  // an infinite keep-alive holds them while the backend lives. The watchdog
+  // gives up on a command that runs longer than commandTimeoutSeconds.
   explicit MetalBackend(std::string metallibPath,
-                        double residencyKeepAliveSeconds = kResidencyKeepAliveSeconds);
+                        double residencyKeepAliveSeconds = kResidencyKeepAliveSeconds,
+                        double commandTimeoutSeconds = kCommandTimeoutSeconds);
   ~MetalBackend();
   // Invoked before allocations and submissions; may throw to stop bootstrap.
   void setOperationGuard(std::function<void()> guard);
@@ -269,15 +271,11 @@ public:
   // and reports both GPU and end-to-end wall time.
   [[nodiscard]] CommandTiming submit(const ComputeDispatch &dispatch);
 
-  // Encodes an ordered dispatch list into one command buffer and waits for it.
-  [[nodiscard]] CommandTiming
-  submitCommand(std::span<const ComputeDispatch> dispatches);
-
-  // Encodes and commits without waiting. The completion callback only
-  // notifies host control flow; command results and errors are consumed from
-  // the returned ticket. A second command is rejected until wait() consumes
-  // the first ticket, preserving the one-in-flight runtime invariant.
-  [[nodiscard]] CommandTicket submitAsync(const ComputeDispatch &dispatch);
+  // Encodes an ordered dispatch list into one command buffer and commits it
+  // without waiting. The completion callback only notifies host control
+  // flow; command results and errors are consumed from the returned ticket.
+  // A second command is rejected until wait() consumes the first ticket,
+  // preserving the one-in-flight runtime invariant.
   [[nodiscard]] CommandTicket
   submitCommandAsync(std::span<const ComputeDispatch> dispatches,
                      CommandCompletion completion = {});

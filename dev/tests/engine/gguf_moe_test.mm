@@ -209,7 +209,7 @@ int floatProjection(MetalBackend &backend) {
             std::memset(output.contents(), 0x7F, output.sizeBytes());
             CommandGraph graph;
             splash::ops::addGgufFloat(graph, input, w.segment, output, rows, stride, offset, type, tile);
-            static_cast<void>(backend.submitCommand(graph.dispatches()));
+            static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
             size_t outside = 0, touched = 0;
             for (uint32_t r = 0; r <= rows; ++r)
               for (uint32_t c = 0; c < stride; ++c) {
@@ -288,7 +288,7 @@ int floatSegments(MetalBackend &backend, uint32_t floatColumns) {
       CommandGraph graph;
       add(graph, input, full, y);
       add(graph, input, quantizedOnly, reference);
-      static_cast<void>(backend.submitCommand(graph.dispatches()));
+      static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
       const auto *got = static_cast<const uint16_t *>(y.contents()), *want = static_cast<const uint16_t *>(reference.contents());
       size_t differ = 0, outside = 0, written = 0;
       for (uint32_t r = 0; r < rows; ++r)
@@ -372,9 +372,9 @@ int floatOnlyChain(MetalBackend &backend) {
         linear.add(graph, {.input = input, .output = scores, .scratch = scratch}, floats, linear.decodePlan(floats, lanes));
     static_cast<void>(
         linear.add(graph, {.input = input, .output = chained, .scratch = scratch, .prepared = prepared}, blocks, plan));
-    static_cast<void>(backend.submitCommand(graph.dispatches()));
+    static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
     static_cast<void>(linear.add(reference, {.input = input, .output = alone, .scratch = scratch}, blocks, plan));
-    static_cast<void>(backend.submitCommand(reference.dispatches()));
+    static_cast<void>(backend.submitCommandAsync(reference.dispatches()).wait());
     if (std::memcmp(chained.contents(), alone.contents(), bytes)) {
       printf("  float-only projection B%u: a register plan chained after it read another table FAIL\n", lanes);
       ++failures;
@@ -447,7 +447,7 @@ std::vector<uint16_t> runPlan(MetalBackend &backend, const Model &m, Buffers &b,
   std::memset(b.moe.output.contents(), 0, b.moe.output.sizeBytes());
   CommandGraph graph;
   MoE::add(graph, b.moe, m.weights, plan);
-  static_cast<void>(backend.submitCommand(graph.dispatches()));
+  static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
   const auto *selected = static_cast<const uint32_t *>(b.moe.scratch.selectedExperts.contents());
   const auto *routing = static_cast<const float *>(b.moe.scratch.routingWeights.contents());
   const auto *routeRows = static_cast<const uint32_t *>(b.moe.scratch.routeRows.contents());

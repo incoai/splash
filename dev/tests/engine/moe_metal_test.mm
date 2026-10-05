@@ -800,7 +800,7 @@ void routerTiles(MetalBackend &backend, const Fixture &fixture) {
               {fixture.buffers.input, router.planes.weights, router.planes.scales,
                router.planes.biases, wide},
               params, {(rows + 31) / 32, kStorageColumns / 128, 1});
-    (void)backend.submitCommand(graph.dispatches());
+    (void)backend.submitCommandAsync(graph.dispatches()).wait();
     const std::string label = "router tiles rows=" + std::to_string(rows);
     require(std::memcmp(narrow.contents(), wide.contents(),
                         uint64_t{rows} * kStorageColumns * 4) == 0,
@@ -858,7 +858,7 @@ void run(const std::string &metallibPath) {
       for (const MetalBuffer *buffer : {&fixture.buffers.scratch.groupedRoutes,
                                         &fixture.buffers.scratch.groupedInput})
         std::memset(buffer->contents(), kCanary, buffer->sizeBytes());
-      wallSeconds += backend.submitCommand(graph.dispatches()).wallSeconds;
+      wallSeconds += backend.submitCommandAsync(graph.dispatches()).wait().wallSeconds;
       check(fixture, plan.rows(), plan.tileRows(), label + " " + routingLabel +
             " M" + std::to_string(plan.tileRows()));
       ++cases;

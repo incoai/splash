@@ -194,7 +194,7 @@ void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
               dispatches[1].threadgroups.y == lanes &&
               dispatches[1].threadgroups.z == 1,
           "draft attention core dispatch changed");
-  static_cast<void>(backend.submitCommand(dispatches));
+  static_cast<void>(backend.submitCommandAsync(dispatches).wait());
   // A cache length for each of the plan's lanes, no fewer.
   CommandGraph mismatched;
   rejects([&] {
@@ -331,7 +331,7 @@ void surroundingPhases(MetalBackend &backend, DraftAttentionShape shape,
     require(graph.dispatches()[0].threadgroups.x == (kRows * shape.hiddenSize + 255) / 256 &&
                 params == (finish ? 1U : 0U),
             "convolution dispatch does not cover each element once");
-    static_cast<void>(backend.submitCommand(graph.dispatches()));
+    static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
     const auto *actual = static_cast<const uint16_t *>(output.contents());
     const uint32_t kind = finish ? 1 : 0;
     for (uint64_t row = 0; row < rows; ++row) {
@@ -360,7 +360,7 @@ void surroundingPhases(MetalBackend &backend, DraftAttentionShape shape,
       {qkv, queries, queryNorm, keyNorm, ropeCos, ropeSin, queryKeys,
        queryValues}, plan);
   DraftAttention::addReorder(graph, queries, packed, plan);
-  static_cast<void>(backend.submitCommand(graph.dispatches()));
+  static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
   require(std::equal(originalQkv.begin(), originalQkv.end(),
                      static_cast<const uint16_t *>(qkv.contents())),
           "draft prepare wrote its QKV input");
@@ -540,7 +540,7 @@ void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
   CommandGraph prefill;
   DraftAttention::addContextPrefill(prefill, kv, keyNorm, ropeCos, ropeSin,
                                     keys, values, kTokens, kStart, shape);
-  static_cast<void>(backend.submitCommand(prefill.dispatches()));
+  static_cast<void>(backend.submitCommandAsync(prefill.dispatches()).wait());
   check(keys, values, static_cast<const uint16_t *>(kv.contents()),
         static_cast<const float *>(ropeCos.contents()),
         static_cast<const float *>(ropeSin.contents()), kTokens, kStart);
@@ -566,7 +566,7 @@ void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
   DraftAttention::addContextCommit(commit, laneKv, keyNorm, laneCos, laneSin,
                                    laneKeys, laneValues, retainedCounts, starts,
                                    shape);
-  static_cast<void>(backend.submitCommand(commit.dispatches()));
+  static_cast<void>(backend.submitCommandAsync(commit.dispatches()).wait());
   for (uint32_t lane = 0; lane < kCommitLanes; ++lane)
     check(laneKeys[lane], laneValues[lane],
           static_cast<const uint16_t *>(laneKv.contents()) +

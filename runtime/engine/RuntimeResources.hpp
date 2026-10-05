@@ -100,6 +100,10 @@ struct RuntimeResourcesConfig {
   // passes without a request (NativeRuntime::releaseIdleWeights). Infinite
   // keeps both while the engine runs.
   double idleReleaseSeconds = metal::kResidencyKeepAliveSeconds;
+  // Reclaimable host memory, sampled at every Metal operation during startup
+  // and by the governor afterwards.
+  MemoryGovernor::HostAvailableMemoryProvider hostAvailableMemory =
+      queryHostAvailableMemory;
   // The process's existing pressure observer runs before resource assembly;
   // it only publishes a level. Bootstrap checks it at Metal operation
   // boundaries; after Ready the transport control handler keeps it current.
@@ -128,29 +132,26 @@ enum class RuntimeResourceFailure {
   }
 }
 
+// A step of resource assembly that failed, with what() its message. Startup
+// reports it with its step (RuntimeBootstrapReport::describe).
 class RuntimeResourcesError final : public std::runtime_error {
 public:
   RuntimeResourcesError(RuntimeResourceStage stage, std::string message,
-                        std::string statusJson = {},
                         std::string budgetDescription = {},
                         RuntimeResourceFailure failure =
                             RuntimeResourceFailure::Other);
 
+  [[nodiscard]] RuntimeResourceStage stage() const noexcept { return stage_; }
   [[nodiscard]] RuntimeResourceFailure failure() const noexcept {
     return failure_;
-  }
-  [[nodiscard]] const std::string &message() const noexcept { return message_; }
-  [[nodiscard]] const std::string &statusJson() const noexcept {
-    return statusJson_;
   }
   [[nodiscard]] const std::string &budgetDescription() const noexcept {
     return budgetDescription_;
   }
 
 private:
+  RuntimeResourceStage stage_;
   RuntimeResourceFailure failure_;
-  std::string message_;
-  std::string statusJson_;
   std::string budgetDescription_;
 };
 

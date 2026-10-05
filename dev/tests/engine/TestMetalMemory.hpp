@@ -22,7 +22,7 @@ namespace splash::test {
 namespace splash::metal {
 
 struct MetalBackend::Impl {};
-MetalBackend::MetalBackend(std::string, double)
+MetalBackend::MetalBackend(std::string, double, double)
     : impl_(std::make_unique<Impl>()) {}
 MetalBackend::~MetalBackend() = default;
 MetalMemoryStats MetalBackend::memoryStats() const noexcept {

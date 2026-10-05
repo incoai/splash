@@ -453,7 +453,7 @@ void checkBf16StoreEdges(metal::MetalBackend &backend) {
     metal::CommandGraph graph;
     ops::PagedAttention::addPrefillStore(graph, data.layer, data.keys, data.values,
                                         data.tables[0], data.stores[0], data.layout);
-    (void)backend.submitCommand(graph.dispatches());
+    (void)backend.submitCommandAsync(graph.dispatches()).wait();
     checkBf16Store(data, expected);
   }
 }
@@ -560,7 +560,7 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data, bool testBou
   const auto expected = data.layout.format == kv::Format::BFloat16
                             ? expectedBf16Store(data)
                             : std::vector<std::vector<std::byte>>{};
-  (void)backend.submitCommand(graph.dispatches());
+  (void)backend.submitCommandAsync(graph.dispatches()).wait();
   if (data.layout.format == kv::Format::BFloat16) checkBf16Store(data, expected);
   for (size_t i = 0; i < sizes.size(); ++i) {
     const auto *bytes = static_cast<const uint8_t *>(backing[i].contents());
@@ -677,7 +677,7 @@ void checkProjection(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layo
   };
   metal::CommandGraph graph;
   addProjection(graph, keyNorm);
-  (void)backend.submitCommand(graph.dispatches());
+  (void)backend.submitCommandAsync(graph.dispatches()).wait();
 
   const auto *queryData = static_cast<const uint16_t *>(queries.contents());
   const auto *keyData = static_cast<const uint16_t *>(keys.contents());

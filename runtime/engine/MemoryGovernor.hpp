@@ -184,7 +184,14 @@ public:
   // A pass that releases or waits for memory again, or the host's recovery,
   // ends the waiver.
   void reclaimed(ReclaimOutcome outcome) noexcept;
+  // What the governor makes of a fresh sample of the host. Reading it
+  // changes nothing: the host's hysteresis moves only with the samples a
+  // reservation or the control pass (evaluate) takes, so /status and the
+  // engine's growth queries do not move admission.
   [[nodiscard]] MemoryGovernorSnapshot snapshot() const noexcept;
+  // The control pass's evaluation: snapshot(), with the host's hysteresis
+  // moved to its sample, as a reservation's moves it.
+  MemoryGovernorSnapshot evaluate() noexcept;
 
 private:
   // Held while an admitted allocation runs; released when it ends.
@@ -195,8 +202,6 @@ private:
     Reservation &operator=(const Reservation &) = delete;
     Reservation(Reservation &&) noexcept;
 
-    void commit();
-
   private:
     Reservation(MemoryGovernor *owner, uint64_t bytes);
     void release() noexcept;
@@ -205,6 +210,20 @@ private:
     uint64_t bytes_ = 0;
 
     friend class MemoryGovernor;
+  };
+
+  // The host under the hysteresis at one sample of its available memory.
+  struct HostState final {
+    // From when its headroom falls inside the warning margin, or cannot be
+    // measured, until the headroom clears the recovery margin.
+    bool constrained = false;
+    // Reclaim found nothing to release in this episode of host pressure.
+    bool reclaimExhausted = false;
+
+    // Growth waits for the recovery margin.
+    [[nodiscard]] bool held() const noexcept {
+      return constrained && !reclaimExhausted;
+    }
   };
 
   // allocationAdmission's reservation, or nothing with the cause of the
@@ -217,13 +236,14 @@ private:
   [[nodiscard]] uint64_t
   hostHeadroomBytes(const std::optional<uint64_t> &hostAvailable,
                     uint64_t reservedBytes) const noexcept;
-  [[nodiscard]] MemoryPressure updateEffectivePressure(
-      const std::optional<uint64_t> &hostAvailable,
-      uint64_t reservedBytes) const noexcept;
-  // Growth waits for the recovery margin.
-  [[nodiscard]] bool hostHeld() const noexcept {
-    return hostConstrained_ && !reclaimExhausted_;
-  }
+  // The host's state at this sample, from the one it was last evaluated at.
+  [[nodiscard]] HostState
+  hostState(const std::optional<uint64_t> &hostAvailable) const noexcept;
+  [[nodiscard]] MemoryPressure
+  effectivePressure(const HostState &host) const noexcept;
+  [[nodiscard]] MemoryGovernorSnapshot
+  snapshot(const std::optional<uint64_t> &hostAvailable,
+           const HostState &host) const noexcept;
   void release(uint64_t bytes) noexcept;
 
   metal::MetalBackend &backend_;
@@ -235,9 +255,8 @@ private:
   bool serving_ = false;
   uint64_t deniedReservations_ = 0;
   MemoryPressure systemPressure_ = MemoryPressure::Normal;
-  mutable bool hostConstrained_ = false;
-  // Reclaim found nothing to release in this episode of host pressure.
-  mutable bool reclaimExhausted_ = false;
+  // As the latest reservation or control pass evaluated it.
+  HostState host_;
 };
 
 } // namespace splash::engine

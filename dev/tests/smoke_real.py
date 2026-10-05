@@ -90,13 +90,11 @@ class RealServer:
     def __init__(
         self,
         arguments,
-        environment: dict | None = None,
         *,
         cache_dir: Path | None = None,
     ):
-        """A server of arguments.package, its process started with these
-        variables added to this process's environment, and with a persistent
-        cache in cache_dir when one is given."""
+        """A server of arguments.package, with a persistent cache in cache_dir
+        when one is given."""
         package = arguments.package.resolve()
         binary = arguments.binary.resolve()
         self.port = available_port()
@@ -133,7 +131,6 @@ class RealServer:
         self.process = subprocess.Popen(
             command,
             cwd=ROOT,
-            env=None if environment is None else {**os.environ, **environment},
             stdout=self.log,
             stderr=subprocess.STDOUT,
             text=True,

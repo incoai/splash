@@ -36,7 +36,6 @@ RESTART_BACKOFF_SECONDS = 5.0
 
 # Control requests use a short live probe and explicitly label stale snapshots.
 STATUS_REFRESH_TIMEOUT_SECONDS = 0.05
-STATUS_BACKGROUND_TIMEOUT_SECONDS = 30.0
 
 
 def remaining_request_time(deadline):
@@ -109,7 +108,6 @@ class Job:
     tools_signature: tuple | None = None
     response_previous_id: str | None = None
     response_history_items: list | None = None
-    return_progress: bool = False
     # Option token ids for score-only jobs; empty means ordinary generation.
     score_tokens: tuple = ()
     # Trailing prompt tokens of the chat template's generation prompt; zero
@@ -411,7 +409,8 @@ class NativeBackend:
             try:
                 restarts = self.runtime.restart_count
                 event = self.runtime.status(
-                    timeout=STATUS_BACKGROUND_TIMEOUT_SECONDS, fail_unanswered=True
+                    timeout=engine_runtime.STATUS_ANSWER_LIMIT_SECONDS,
+                    fail_unanswered=True,
                 )
                 self._cache_status(self._decode_status_event(event), restarts)
             except Exception as error:
@@ -542,7 +541,7 @@ class NativeBackend:
                     and snapshot.get("ready") is True
                     and (
                         unanswered is None
-                        or now - unanswered < STATUS_BACKGROUND_TIMEOUT_SECONDS
+                        or now - unanswered < engine_runtime.STATUS_ANSWER_LIMIT_SECONDS
                     )
                 )
         else:
@@ -603,7 +602,6 @@ class NativeBackend:
             constraint=constraint,
             image_spans=job.image_spans,
             image_pixels=job.image_pixels,
-            return_progress=job.return_progress,
             score_tokens=job.score_tokens,
             generation_prompt_tokens=job.generation_prompt_tokens,
             flags=job.flags,
@@ -689,7 +687,11 @@ class NativeBackend:
                 refusal = None
                 if isinstance(
                     error,
-                    (engine_runtime.EngineUnhealthy, engine_runtime.RuntimeClosed),
+                    (
+                        engine_runtime.EngineUnhealthy,
+                        engine_runtime.ProtocolFatal,
+                        engine_runtime.RuntimeClosed,
+                    ),
                 ):
                     # Not admitted: refused as a request arriving now would be.
                     refusal = self.refusal()
@@ -801,10 +803,11 @@ class NativeBackend:
                 queued = latency.get("queue_to_start_ms")
                 if queued is not None:
                     job.latency.metrics.observe("native_queue", queued / 1000.0)
-        except engine_runtime.EngineUnhealthy:
-            # An admitted request ends with EngineUnhealthy only when the
-            # engine running it fails. The listener has already decided
-            # whether that engine restarts; the console names the failure.
+        except (engine_runtime.EngineUnhealthy, engine_runtime.ProtocolFatal):
+            # An admitted request ends with EngineUnhealthy or ProtocolFatal
+            # only when the engine running it fails: it stopped or broke the
+            # protocol. The listener has already decided whether that engine
+            # restarts; the console names the failure.
             with self.lock:
                 fatal_error = self.fatal_error
             if fatal_error is not None:
@@ -852,13 +855,11 @@ class NativeBackend:
                     code,
                 )
             request_codes = {
-                "integer_overflow",
                 "invalid_constraint",
                 "invalid_count",
                 "invalid_deadline",
                 "invalid_enum_value",
                 "invalid_request",
-                "invalid_request_id",
                 "invalid_sampling",
                 "limit_exceeded",
             }
@@ -875,11 +876,14 @@ class NativeBackend:
             # overload like the gate's own, retried the same way.
             return APIError(503, "request queue is full", "frontend_overloaded")
         if isinstance(
-            error, (engine_runtime.EngineUnhealthy, engine_runtime.RuntimeClosed)
+            error,
+            (
+                engine_runtime.EngineUnhealthy,
+                engine_runtime.ProtocolFatal,
+                engine_runtime.RuntimeClosed,
+            ),
         ):
             return APIError(503, str(error), "runtime_unavailable")
-        if isinstance(error, engine_runtime.ProtocolFatal):
-            return APIError(500, str(error), "protocol_error")
         if isinstance(error, TimeoutError):
             return APIError(504, "request timed out", "request_timeout")
         return APIError(500, str(error), "runtime_error")

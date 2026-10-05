@@ -67,7 +67,7 @@ std::vector<float> encodeOnce(MetalBackend &backend,
   std::memset(embeddings.contents(), 0, embeddings.sizeBytes());
   CommandGraph graph;
   encoder.encode(graph, grid, pixels, embeddings);
-  const auto timing = backend.submitCommand(graph.dispatches());
+  const auto timing = backend.submitCommandAsync(graph.dispatches()).wait();
   if (gpuSeconds)
     *gpuSeconds = timing.gpuSeconds;
   const auto *words = static_cast<const uint16_t *>(embeddings.contents());

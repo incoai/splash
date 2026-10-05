@@ -14,6 +14,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace splash::engine {
 
@@ -34,13 +35,12 @@ enum class RuntimeBootstrapStage {
 // A report of a successful bootstrap is at stage Ready.
 struct RuntimeBootstrapReport {
     RuntimeBootstrapStage stage = RuntimeBootstrapStage::ResourceAssembly;
+    // The step of resource assembly that failed; empty past resource assembly.
+    std::optional<RuntimeResourceStage> resourceStage;
     RuntimeResourceFailure resourceFailure = RuntimeResourceFailure::Other;
     std::string message;
     WarmupReport warmup;
     MemoryAuditResult memoryAudit;
-    // Always present once an immutable plan exists. On planning failure this
-    // is the full BudgetValidationStatus JSON instead.
-    std::string memoryPlanJson;
     std::string budgetDescription;
 
     [[nodiscard]] std::string describe() const;
@@ -62,8 +62,9 @@ private:
 // Startup retries a temporary host or driver allocation failure for a
 // bounded time. The window opens at the first such failure, not at process
 // start, since a start loads the weights and warms up for a while before
-// one; a failure at a later stage than the last one follows progress and
-// opens a new window.
+// one; a failure at a later stage, or a later step of resource assembly,
+// than the failure that opened the window follows progress and opens a new
+// one.
 class StartupRetryWindow final {
 public:
     using Clock = AwakeClock;
@@ -79,7 +80,9 @@ public:
 private:
     Clock::duration length_;
     std::optional<Clock::time_point> deadline_;
-    RuntimeBootstrapStage stage_ = RuntimeBootstrapStage::ResourceAssembly;
+    // How far the failure that opened the window got.
+    std::pair<RuntimeBootstrapStage, std::optional<RuntimeResourceStage>>
+        reached_;
 };
 
 // Whether memory may not hold a request of contextTokens: the plan within
@@ -101,12 +104,12 @@ struct RuntimeBootstrapConfig {
     RuntimeResourcesConfig resources;
     // A zero engine maxContext is what the memory plan holds, as serve's
     // default; a larger one than that fails the bootstrap.
-    NativeLoopConfig nativeLoop{.engine = {.maxContext = 0}};
+    NativeLoopConfig nativeLoop;
 };
 
 using ActualMemoryReporter = std::function<ActualMemoryReport()>;
 
-// Complete owner returned only after the real loop has emitted its binary
+// Complete owner returned only after the native loop has sent its
 // ReadyEvent. No partially warmed instance escapes start().
 class RuntimeBootstrap final {
 public:
@@ -132,9 +135,6 @@ public:
     [[nodiscard]] model::RuntimeModel &modelRuntime() noexcept { return *model_; }
     [[nodiscard]] NativeRuntime &nativeLoop() noexcept {
         return *nativeLoop_;
-    }
-    [[nodiscard]] const RuntimeBootstrapReport &report() const noexcept {
-        return report_;
     }
 
     // The memory control pass the transport runs at a command-free point

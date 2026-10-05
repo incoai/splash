@@ -2,7 +2,6 @@
 #include "AwakeClock.hpp"
 #include "CommandWatchdog.hpp"
 #include "Residency.hpp"
-#include "TestConfig.hpp"
 #ifdef SPLASH_BACKEND_INSTRUMENTATION
 #include "BackendInstrumentation.hpp"
 #endif
@@ -506,6 +505,9 @@ struct CommandTicket::State {
 };
 
 struct MetalBackend::Impl {
+    explicit Impl(double commandTimeoutSeconds)
+        : asyncState(std::make_shared<BackendAsyncState>(commandTimeoutSeconds)) {}
+
     // One dispatch of a command, validated and resolved to its pipeline.
     struct PreparedDispatch {
         const ComputeDispatch *source = nullptr;
@@ -545,9 +547,7 @@ struct MetalBackend::Impl {
     DeviceCapabilities capabilities;
     std::shared_ptr<AllocationAccounting> accounting =
         std::make_shared<AllocationAccounting>();
-    std::shared_ptr<BackendAsyncState> asyncState =
-        std::make_shared<BackendAsyncState>(
-            testConfig().commandTimeoutSeconds.value_or(kCommandTimeoutSeconds));
+    std::shared_ptr<BackendAsyncState> asyncState;
 
     void sampleDeviceMemory() const noexcept {
         asyncState->sampleDeviceMemory();
@@ -915,8 +915,9 @@ CommandTiming CommandTicket::wait() {
     return timing;
 }
 
-MetalBackend::MetalBackend(std::string metallibPath, double residencyKeepAliveSeconds)
-    : impl_(std::make_unique<Impl>()) {
+MetalBackend::MetalBackend(std::string metallibPath, double residencyKeepAliveSeconds,
+                           double commandTimeoutSeconds)
+    : impl_(std::make_unique<Impl>(commandTimeoutSeconds)) {
     @autoreleasepool {
         if (metallibPath.empty()) {
             throw MetalBackendError("metallib path must not be empty");
@@ -1082,16 +1083,7 @@ MetalBuffer MetalBackend::view(const MetalBuffer &base,
 }
 
 CommandTiming MetalBackend::submit(const ComputeDispatch &dispatch) {
-    return submitAsync(dispatch).wait();
-}
-
-CommandTiming MetalBackend::submitCommand(
-    std::span<const ComputeDispatch> dispatches) {
-    return submitCommandAsync(dispatches).wait();
-}
-
-CommandTicket MetalBackend::submitAsync(const ComputeDispatch &dispatch) {
-    return submitCommandAsync(std::span<const ComputeDispatch>(&dispatch, 1));
+    return submitCommandAsync({&dispatch, 1}).wait();
 }
 
 CommandTicket MetalBackend::submitCommandAsync(

@@ -7,6 +7,7 @@
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 
 namespace splash::engine {
@@ -22,6 +23,42 @@ std::string bytesAndMiB(uint64_t bytes) {
 BudgetValidationStatus failure(BudgetErrorCode code, std::string message,
                                EngineMemoryBreakdown breakdown) {
   return {false, code, std::move(message), std::move(breakdown)};
+}
+
+std::string_view budgetErrorCodeName(BudgetErrorCode code) {
+  switch (code) {
+  case BudgetErrorCode::None:
+    return "none";
+  case BudgetErrorCode::InvalidDeviceCapabilities:
+    return "invalid_device_capabilities";
+  case BudgetErrorCode::InvalidModelSpec:
+    return "invalid_model_spec";
+  case BudgetErrorCode::WorkingSetTooSmall:
+    return "working_set_too_small";
+  case BudgetErrorCode::ArithmeticOverflow:
+    return "arithmetic_overflow";
+  case BudgetErrorCode::KvPoolDoesNotFit:
+    return "kv_pool_does_not_fit";
+  }
+  return "unknown";
+}
+
+std::string deviceStatusJson(const DeviceCapabilities &device) {
+  std::ostringstream out;
+  out << '{' << "\"device_name\":" << json::quote(device.deviceName) << ','
+      << "\"macos_version\":" << json::quote(device.macosVersion()) << ','
+      << "\"apple_gpu_family\":" << device.appleGpuFamily << ','
+      << "\"gpu_core_count\":" << device.gpuCoreCount << ','
+      << "\"physical_memory_bytes\":" << device.physicalMemoryBytes << ','
+      << "\"recommended_max_working_set_bytes\":"
+      << device.recommendedMaxWorkingSetBytes << ','
+      << "\"max_buffer_length_bytes\":" << device.maxBufferLengthBytes << ','
+      << "\"max_threadgroup_memory_bytes\":"
+      << device.maxThreadgroupMemoryBytes << ','
+      << "\"max_threadgroup_width\":" << device.maxThreadgroupWidth << ','
+      << "\"has_unified_memory\":"
+      << (device.hasUnifiedMemory ? "true" : "false") << '}';
+  return out.str();
 }
 
 std::string modelStatusJson(const ModelMemoryProfile &model) {
@@ -67,42 +104,6 @@ std::optional<uint64_t> minimumRequiredBytes(uint64_t fixedBytes,
       !checkedAdd(fixedBytes, dynamicBytes, result))
     return std::nullopt;
   return result;
-}
-
-std::string_view budgetErrorCodeName(BudgetErrorCode code) {
-  switch (code) {
-  case BudgetErrorCode::None:
-    return "none";
-  case BudgetErrorCode::InvalidDeviceCapabilities:
-    return "invalid_device_capabilities";
-  case BudgetErrorCode::InvalidModelSpec:
-    return "invalid_model_spec";
-  case BudgetErrorCode::WorkingSetTooSmall:
-    return "working_set_too_small";
-  case BudgetErrorCode::ArithmeticOverflow:
-    return "arithmetic_overflow";
-  case BudgetErrorCode::KvPoolDoesNotFit:
-    return "kv_pool_does_not_fit";
-  }
-  return "unknown";
-}
-
-std::string deviceStatusJson(const DeviceCapabilities &device) {
-  std::ostringstream out;
-  out << '{' << "\"device_name\":" << json::quote(device.deviceName) << ','
-      << "\"macos_version\":" << json::quote(device.macosVersion()) << ','
-      << "\"apple_gpu_family\":" << device.appleGpuFamily << ','
-      << "\"gpu_core_count\":" << device.gpuCoreCount << ','
-      << "\"physical_memory_bytes\":" << device.physicalMemoryBytes << ','
-      << "\"recommended_max_working_set_bytes\":"
-      << device.recommendedMaxWorkingSetBytes << ','
-      << "\"max_buffer_length_bytes\":" << device.maxBufferLengthBytes << ','
-      << "\"max_threadgroup_memory_bytes\":"
-      << device.maxThreadgroupMemoryBytes << ','
-      << "\"max_threadgroup_width\":" << device.maxThreadgroupWidth << ','
-      << "\"has_unified_memory\":"
-      << (device.hasUnifiedMemory ? "true" : "false") << '}';
-  return out.str();
 }
 
 std::optional<std::string> ModelMemoryProfile::validationError() const {
@@ -214,20 +215,6 @@ std::string EngineMemoryBreakdown::describe() const {
       << "minimum dynamic runtime: " << bytesAndMiB(minimumDynamicBytes) << '\n'
       << "minimum required: " << bytesAndMiB(minimumRequiredBytes) << '\n'
       << "deficit: " << bytesAndMiB(deficitBytes);
-  return out.str();
-}
-
-std::string BudgetValidationStatus::toStatusJson() const {
-  std::ostringstream out;
-  out << '{' << "\"schema_version\":2,"
-      << "\"valid\":" << (valid ? "true" : "false") << ',' << "\"error_code\":";
-  if (valid) {
-    out << "null";
-  } else {
-    out << json::quote(budgetErrorCodeName(code));
-  }
-  out << ',' << "\"message\":" << json::quote(message) << ','
-      << "\"budget\":" << breakdown.toStatusJson() << '}';
   return out.str();
 }
 

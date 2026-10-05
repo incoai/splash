@@ -24,7 +24,9 @@ class RequestLifetimeTests(unittest.TestCase):
 
     def backend(self):
         factory = FakeFactory()
-        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, eager_start=True
+        )
         backend = backend_api.NativeBackend(
             runtime, FakeTokenizer(), lambda _record: None
         )

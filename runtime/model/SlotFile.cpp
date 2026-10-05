@@ -18,6 +18,7 @@
 #include <limits>
 #include <new>
 #include <optional>
+#include <ostream>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -114,6 +115,15 @@ off_t slotOffset(uint64_t index, uint64_t slotBytes) {
   return static_cast<off_t>(index * slotBytes);
 }
 
+// An errno value as a part of a notice: logLine builds its message inside
+// its try, so the notices below, which must not throw, build no string.
+struct ErrnoMessage final {
+  int error;
+  friend std::ostream &operator<<(std::ostream &out, ErrnoMessage part) {
+    return out << std::generic_category().message(part.error);
+  }
+};
+
 // Once per process: the volume keeps the blocks of freed slots.
 // The slots a persistent file does not take back keep their records until
 // they are reused: their payloads are punched, so a later read of one fails
@@ -121,16 +131,15 @@ off_t slotOffset(uint64_t index, uint64_t slotBytes) {
 void reportRecordFailure(int error) noexcept {
   static std::atomic<bool> reported{false};
   if (!reported.exchange(true, std::memory_order_relaxed))
-    writeStderrLine("A persistent cache file could not clear the records it does not take back (" +
-                    std::generic_category().message(error) + "); they stay until reused.");
+    logLine("A persistent cache file could not clear the records it does not take back (",
+            ErrnoMessage{error}, "); they stay until reused.");
 }
 
 void reportPunchFailure(int error) noexcept {
   static std::atomic<bool> reported{false};
   if (!reported.exchange(true, std::memory_order_relaxed))
-    writeStderrLine("Freed cache slots cannot return their blocks on this volume (" +
-                    std::generic_category().message(error) +
-                    "); disk use may exceed --max-cache-disk.");
+    logLine("Freed cache slots cannot return their blocks on this volume (",
+            ErrnoMessage{error}, "); disk use may exceed --max-cache-disk.");
 }
 
 template <typename Span>

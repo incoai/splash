@@ -1,5 +1,7 @@
-#include "ScopedTestConfig.hpp"
 #include "TestChecks.hpp"
+#include "TestFiles.hpp"
+#include "TestPackage.hpp"
+#include "engine/Bootstrap.hpp"
 #include "engine/RuntimeResources.hpp"
 #include "engine/Engine.hpp"
 #include "engine/MemoryPlan.hpp"
@@ -7,6 +9,7 @@
 #import <Foundation/Foundation.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -14,12 +17,14 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace {
 
 using namespace splash;
 using namespace splash::engine;
 
+using splash::test::rejects;
 using splash::test::require;
 
 class TemporaryModelRoot final {
@@ -71,12 +76,11 @@ void requireReachesModelLoader(RuntimeResourcesConfig config,
     auto resources = RuntimeResources::create(config);
     throw std::runtime_error("placeholder model unexpectedly loaded");
   } catch (const RuntimeResourcesError &error) {
+    const std::string_view text = error.what();
     require(error.failure() == RuntimeResourceFailure::Other &&
-                std::string(error.what()).find("[model_loading]") !=
-                    std::string::npos &&
-                error.message().find("unable to open") != std::string::npos &&
-                error.message().find((root / "target").string()) !=
-                    std::string::npos,
+                error.stage() == RuntimeResourceStage::ModelLoading &&
+                text.find("unable to open") != std::string_view::npos &&
+                text.find((root / "target").string()) != std::string_view::npos,
             message);
   }
 }
@@ -134,8 +138,8 @@ void testWeightBudgetBeforeLoading(const char *metallibPath) {
     } catch (const RuntimeResourcesError &error) {
       require(error.failure() == RuntimeResourceFailure::HostCapacity,
               "startup pressure did not remain retryable");
-      require(error.message().find("not enough free memory") !=
-                  std::string::npos,
+      require(std::string_view(error.what()).find("not enough free memory") !=
+                  std::string_view::npos,
               "startup pressure reached the weight loader");
     }
   }
@@ -155,14 +159,12 @@ void testWeightBudgetBeforeLoading(const char *metallibPath) {
       if (ceiling == minimum - 1) {
         require(error.failure() == RuntimeResourceFailure::EngineCapacity,
                 "hard weight budget lost its engine-capacity classification");
-        require(std::string(error.what()).find("[memory_planning]") !=
-                    std::string::npos &&
-                    error.message().find(
-                        "require " + std::to_string(minimum) + " bytes") !=
-                        std::string::npos &&
-                    error.message().find(
-                        "budget is " + std::to_string(minimum - 1) +
-                        " bytes") != std::string::npos,
+        const std::string_view text = error.what();
+        require(error.stage() == RuntimeResourceStage::MemoryPlanning &&
+                    text.find("require " + std::to_string(minimum) + " bytes") !=
+                        std::string_view::npos &&
+                    text.find("budget is " + std::to_string(minimum - 1) +
+                              " bytes") != std::string_view::npos,
                 "weight loading began before checking the memory ceiling");
       } else {
         require(error.failure() == RuntimeResourceFailure::Other,
@@ -195,11 +197,10 @@ void testStateStagingNeedsAStartedTier(const char *metallibPath) {
     throw std::runtime_error("placeholder model unexpectedly loaded");
   } catch (const RuntimeResourcesError &error) {
     require(error.failure() == RuntimeResourceFailure::EngineCapacity &&
-                std::string(error.what()).find("[memory_planning]") !=
-                    std::string::npos &&
-                error.message().find(
-                    "require " + std::to_string(minimum + stateBytes) +
-                    " bytes") != std::string::npos,
+                error.stage() == RuntimeResourceStage::MemoryPlanning &&
+                std::string_view(error.what())
+                        .find("require " + std::to_string(minimum + stateBytes) +
+                              " bytes") != std::string_view::npos,
             "a started tier's staging was not counted before loading");
   }
   config.maximumMemoryBytes = minimum + stateBytes;
@@ -220,13 +221,28 @@ void testImagePatchCapIsBounded(const char *metallibPath) {
       auto resources = RuntimeResources::create(config);
       throw std::runtime_error("an image patch cap outside the protocol's was accepted");
     } catch (const RuntimeResourcesError &error) {
-      require(std::string(error.what()).find("[configuration]") != std::string::npos,
+      require(error.stage() == RuntimeResourceStage::Configuration,
               "an invalid image patch cap was not a configuration error");
     }
   }
   config.maximumImagePatches = 4096;
   requireReachesModelLoader(config, root.path,
                             "a smaller image patch cap did not reach the model loader");
+}
+
+// Startup and the governor sample host memory through the config's probe:
+// without one, the config is refused before the backend is created.
+void testHostMemoryProbeIsRequired(const char *metallibPath) {
+  TemporaryModelRoot root;
+  RuntimeResourcesConfig config = budgetConfig(metallibPath, root);
+  config.hostAvailableMemory = {};
+  try {
+    auto resources = RuntimeResources::create(config);
+    throw std::runtime_error("resources were assembled without a host memory probe");
+  } catch (const RuntimeResourcesError &error) {
+    require(error.stage() == RuntimeResourceStage::Configuration,
+            "a missing host memory probe was not a configuration error");
+  }
 }
 
 // A 34.5 GiB model under a 35 GiB budget: the weights alone fit, but not
@@ -241,8 +257,7 @@ void testModelBeyondBudgetIsRefusedBeforeLoading(const char *metallibPath) {
     throw std::runtime_error("placeholder model unexpectedly loaded");
   } catch (const RuntimeResourcesError &error) {
     require(error.failure() == RuntimeResourceFailure::EngineCapacity &&
-                std::string(error.what()).find("[memory_planning]") !=
-                    std::string::npos,
+                error.stage() == RuntimeResourceStage::MemoryPlanning,
             "a model that cannot fit reached the weight loader");
   }
 }
@@ -256,28 +271,24 @@ void testStartupAdmissionIgnoresPackageSize(const char *metallibPath) {
   TemporaryModelRoot root(2 * kGiB);
   RuntimeResourcesConfig config = budgetConfig(metallibPath, root);
   require(root.packageBytes > 3 * kGiB, "the package must exceed the sample");
-  {
-    const test::ScopedTestConfig seam(
-        {.hostAvailableMemory = [] { return std::optional<uint64_t>(3 * kGiB); }});
-    requireReachesModelLoader(config, root.path,
-                              "a package larger than reclaimable host memory "
-                              "refused to start");
-  }
+  config.hostAvailableMemory = [] { return std::optional<uint64_t>(3 * kGiB); };
+  requireReachesModelLoader(config, root.path,
+                            "a package larger than reclaimable host memory "
+                            "refused to start");
 
   // Below the reserve macOS is the one at risk, so startup waits instead.
   // Unmeasurable telemetry waits the same way.
   for (std::optional<uint64_t> available :
        {std::optional<uint64_t>(64 * kMiB), std::optional<uint64_t>()}) {
-    const test::ScopedTestConfig seam(
-        {.hostAvailableMemory = [available] { return available; }});
+    config.hostAvailableMemory = [available] { return available; };
     try {
       auto resources = RuntimeResources::create(config);
       throw std::runtime_error("model load ignored the macOS reserve");
     } catch (const RuntimeResourcesError &error) {
       require(error.failure() == RuntimeResourceFailure::HostCapacity,
               "exhausted host memory did not remain retryable");
-      require(error.message().find("not enough free memory") !=
-                  std::string::npos,
+      require(std::string_view(error.what()).find("not enough free memory") !=
+                  std::string_view::npos,
               "exhausted host memory reached the weight loader");
     }
   }
@@ -296,19 +307,105 @@ void testLoadedVisionIsRequiredOnlyWithVision() {
   package.target = std::move(target);
   package.draft.actualAllocatedBytes = 1;
   package.manifestFingerprintSha256 = "package";
-  bool rejected = false;
-  try {
-    requireLoadedModel(package);
-  } catch (const std::invalid_argument &) {
-    rejected = true;
-  }
-  require(rejected && package.descriptor.hasVision(),
+  require(package.descriptor.hasVision(), "the test model has no vision");
+  rejects([&] { requireLoadedModel(package); },
+          "loaded model package has incomplete allocation accounting",
           "a multimodal model without loaded vision weights was accepted");
   package.vision.actualAllocatedBytes = 1;
   requireLoadedModel(package);
   package.vision.actualAllocatedBytes = 0;
   package.descriptor.visionSource = model::VisionSource::None;
   requireLoadedModel(package);
+}
+
+// A small model whose package loads and whose geometry the runtime plans:
+// four target and two draft layers of the 2048-wide hidden state a compiled
+// draft attention takes, with Qwen3.8-27B's attention and GDN heads and a
+// two-block vision tower.
+struct PlannedModel final {
+  model::Qwen3_8Layout target;
+  model::DFlashDraftLayout draft = model::kQwen3_8DraftLayout;
+  ops::VisionLayout vision;
+};
+
+PlannedModel plannedModel() {
+  PlannedModel result;
+  model::Qwen3_8Layout &target = result.target;
+  target.layers = 4;
+  target.hiddenSize = 2048;
+  target.vocabularySize = 1024;
+  target.intermediateSize = 1024;
+  target.hiddenCaptureLayers.fill(target.layers - 1);
+  model::DFlashDraftLayout &draft = result.draft;
+  draft.layers = 2;
+  draft.hiddenSize = target.hiddenSize;
+  draft.vocabularySize = target.vocabularySize;
+  draft.dynamicSize = 512;
+  draft.intermediateSize = 1024;
+  draft.targetHiddenSize = target.capturedHiddenSize();
+  ops::VisionLayout &vision = result.vision;
+  vision.depth = 2;
+  vision.hiddenSize = 128;
+  vision.patchDimension = 1536;
+  vision.intermediateSize = 200;
+  vision.paddedIntermediateSize = 256;
+  vision.mergedHiddenSize = 512;
+  vision.outputHiddenSize = target.hiddenSize;
+  vision.heads = 2;
+  vision.headDimension = 64;
+  vision.positionGridSide = 4;
+  return result;
+}
+
+// Resource assembly names the step it fails at, at its real throw sites on
+// either side of the weight load: a host with less than its reserve refuses
+// the start before the package is opened, and one with its reserve but not
+// the warning margin beyond it refuses the KV runway once the weights have
+// loaded. The startup retry window counts the later step as progress.
+void testFailedStepIsNamed(const char *metallibPath) {
+  using namespace std::chrono_literals;
+  const test::TemporaryDirectory root("splash-assembly");
+  const PlannedModel planned = plannedModel();
+  test::writeSyntheticPackage(root.path(), planned.target, planned.draft, planned.vision);
+  RuntimeResourcesConfig config;
+  config.metallibPath = metallibPath;
+  config.modelRoot = root.path();
+  config.model = model::makeModelDescriptor("assembly-test", planned.target, planned.draft,
+                                            planned.vision);
+  config.model.sourceIdentity = "synthetic";
+  config.buildId = "assembly-test";
+  const auto host = [&](uint64_t available) {
+    config.hostAvailableMemory = [available] { return std::optional<uint64_t>(available); };
+  };
+  // Nothing but the host refuses this model.
+  host(64 * kGiB);
+  static_cast<void>(RuntimeResources::create(config));
+  const auto failure = [&](uint64_t available) {
+    host(available);
+    try {
+      static_cast<void>(RuntimeResources::create(config));
+    } catch (const RuntimeResourcesError &error) {
+      return RuntimeBootstrapError(error).report();
+    }
+    throw std::runtime_error("resources were assembled on a host short of memory");
+  };
+  const uint64_t reserve = EngineMemoryPolicy::hostAvailableReserveBytes(
+      metal::probeDeviceCapabilities().physicalMemoryBytes);
+  const RuntimeBootstrapReport before = failure(reserve / 2);
+  require(before.resourceStage == RuntimeResourceStage::ModelLoading &&
+              before.resourceFailure == RuntimeResourceFailure::HostCapacity &&
+              before.message.find("not enough free memory to start") != std::string::npos,
+          "a start the host refused before the weights loaded named another step");
+  const RuntimeBootstrapReport after = failure(reserve + kHostWarningMarginBytes / 2);
+  require(after.resourceStage == RuntimeResourceStage::StorageAllocation &&
+              after.resourceFailure == RuntimeResourceFailure::HostCapacity &&
+              after.message.find("unable to allocate the KV runway") != std::string::npos,
+          "a KV runway the host refused after the weights loaded named another step");
+  StartupRetryWindow window(30s);
+  const auto first = StartupRetryWindow::Clock::time_point{};
+  require(window.retryUntil(before, first) == first + 30s &&
+              window.retryUntil(after, first + 20s) == first + 50s,
+          "a failure after the weights loaded did not count as progress");
 }
 
 // The engine asks the governor whether the host pauses growth, and its
@@ -350,8 +447,10 @@ int main(int argc, char **argv) {
       testWeightBudgetBeforeLoading(argv[1]);
       testStateStagingNeedsAStartedTier(argv[1]);
       testImagePatchCapIsBounded(argv[1]);
+      testHostMemoryProbeIsRequired(argv[1]);
       testModelBeyondBudgetIsRefusedBeforeLoading(argv[1]);
       testStartupAdmissionIgnoresPackageSize(argv[1]);
+      testFailedStepIsNamed(argv[1]);
       testEngineFollowsTheGovernor(argv[1]);
       std::cout << "runtime resources tests passed\n";
       return EXIT_SUCCESS;

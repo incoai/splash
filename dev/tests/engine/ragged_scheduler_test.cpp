@@ -13,6 +13,7 @@ using namespace splash::engine;
 
 namespace {
 
+using splash::test::rejects;
 using splash::test::require;
 
 engine::RequestSpec
@@ -239,13 +240,8 @@ void testReachedBoundaryIsConsumedBeforeTheNextIsArmed() {
   const BatchPlan reaching = *scheduler.next({});
   require(reaching.items[0].tokenCount == 64, "the boundary did not cap the command");
   completePrefill(scheduler, reaching);
-  bool refused = false;
-  try {
-    scheduler.setPrefillBoundary(1, 64);
-  } catch (const std::invalid_argument &) {
-    refused = true;
-  }
-  require(refused, "a boundary the request has reached was armed again");
+  rejects([&] { scheduler.setPrefillBoundary(1, 64); }, "invalid prefill boundary",
+          "a boundary the request has reached was armed again");
   scheduler.setPrefillBoundary(1, 128);
   const BatchPlan next = *scheduler.next({});
   require(next.items[0].promptOffset == 64 && next.items[0].tokenCount == 64,
@@ -435,13 +431,9 @@ void testRejectedCommitCountsNothing() {
   scheduler.resourcesReady(2, 1);
   const BatchPlan stale = *scheduler.next({});
   scheduler.cancel(2);
-  bool rejected = false;
-  try {
-    scheduler.commit(stale, {});
-  } catch (const std::logic_error &) {
-    rejected = true;
-  }
-  require(rejected && scheduler.snapshot().decodeBatches == 0,
+  rejects([&] { scheduler.commit(stale, {}); }, "batch no longer matches scheduler state",
+          "a commit of a cancelled request's batch was accepted");
+  require(scheduler.snapshot().decodeBatches == 0,
           "rejected commit incremented decode counters");
   completeDecode(scheduler);
   require(scheduler.snapshot().decodeBatches == 1,
@@ -1010,13 +1002,8 @@ void testWaitingMaskExpiresAtRequestDeadline() {
               scheduler.phase(1) == engine::Phase::Failed,
           "waiting mask survived its request deadline");
 
-  bool rejectedLateMask = false;
-  try {
-    scheduler.maskReady(1);
-  } catch (const std::logic_error &) {
-    rejectedLateMask = true;
-  }
-  require(rejectedLateMask, "late mask revived an expired request");
+  rejects([&] { scheduler.maskReady(1); }, "request is not waiting for a mask",
+          "late mask revived an expired request");
 }
 
 void testWaitingMaskBoundsPeerPrefill() {

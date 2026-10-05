@@ -310,7 +310,7 @@ Outcome run(MetalBackend &backend, const Linear &linear, const LinearPlan &plan,
   scratch.poison(poison);
   CommandGraph graph;
   static_cast<void>(linear.add(graph, o.bindings(plan, scratch), p, plan, gate));
-  static_cast<void>(backend.submitCommand(graph.dispatches()));
+  static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
   if (!scratch.intact() || !o.input.intact() || !o.aux.intact() || !o.output.intact() || !o.gate.intact())
     fail(label + ": a counter is not reset or a write past a buffer");
   Outcome out{o.output.halves(), plan.workload().epilogue == LinearEpilogue::GateUp ? o.gate.halves()
@@ -372,7 +372,7 @@ void floatOutput(MetalBackend &backend, const Linear &linear, const LinearPlan &
   CommandGraph graph;
   static_cast<void>(linear.add(graph, {.input = input.view, .output = output.view, .scratch = scratch.bindings()},
                                p, plan));
-  static_cast<void>(backend.submitCommand(graph.dispatches()));
+  static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
   if (!scratch.intact() || !input.intact() || !output.intact())
     fail(label + " fp32: a counter is not reset or a write past a buffer");
   const auto *values = static_cast<const uint32_t *>(output.view.contents());
@@ -672,7 +672,7 @@ void splitVisibility(MetalBackend &backend, const Linear &linear, LinearTile til
   for (uint32_t i = 0; i < 2; ++i)
     static_cast<void>(linear.add(unsplit, operands[i].bindings(plan(i, 1), scratch), weights[i][0], plan(i, 1),
                                  gateOf(i)));
-  static_cast<void>(backend.submitCommand(unsplit.dispatches()));
+  static_cast<void>(backend.submitCommandAsync(unsplit.dispatches()).wait());
   check({1, 1}, shape + " unsplit");
   for (const auto &splits : splitPairs) {
     const std::string what = shape + " splits " + std::to_string(splits[0]) + "/" + std::to_string(splits[1]);
@@ -688,7 +688,7 @@ void splitVisibility(MetalBackend &backend, const Linear &linear, LinearTile til
     std::array<bool, 2> varies{};
     for (const uint32_t bits : {kPoisonFinite, kPoisonNaN, kPoisonFinite}) {
       std::fill_n(static_cast<uint32_t *>(poison.contents()), size.partials / 4, bits);
-      static_cast<void>(backend.submitCommand(graph.dispatches()));
+      static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
       for (uint32_t i = 0; i < 2; ++i) {
         const std::vector<uint16_t> output = operands[i].output.halves();
         if (first[i].empty()) first[i] = output;
@@ -720,7 +720,7 @@ void tokenGather(MetalBackend &backend) {
     std::memcpy(ids.view.contents(), tokens.data(), ids.bytes);
     CommandGraph graph;
     Embedding::add(graph, ids.view, table, output.view, uint32_t(tokens.size()));
-    static_cast<void>(backend.submitCommand(graph.dispatches()));
+    static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
     if (!output.intact()) fail(std::string(fmtName(f)) + " gather writes past its output");
     const std::vector<uint16_t> got = output.halves();
     std::vector<float> values(kHidden);

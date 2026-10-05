@@ -187,29 +187,6 @@ class ArchitectureTests(unittest.TestCase):
             with mock.patch.object(check_architecture, "ROOT", root):
                 self.assertEqual(check_architecture.stale_policy_names(), [symbols[0]])
 
-    def test_only_the_seam_header_names_test_configuration_storage(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            seam = root / "runtime/TestConfig.hpp"
-            seam.parent.mkdir(parents=True)
-            seam.write_text("inline TestConfig &testConfigStorage() noexcept;\n")
-            with mock.patch.object(check_architecture, "ROOT", root):
-                self.assertEqual(check_architecture.check(), [])
-                for relative in (
-                    "runtime/engine/FdTransport.cpp",
-                    "runtime/metal/MetalBackend.mm",
-                    "runtime/main.mm",
-                ):
-                    with self.subTest(source=relative):
-                        source = root / relative
-                        source.parent.mkdir(parents=True, exist_ok=True)
-                        source.write_text("detail::testConfigStorage() = {};\n")
-                        self.assertEqual(
-                            check_architecture.check(),
-                            [f"{relative}: production writes the test configuration"],
-                        )
-                        source.unlink()
-
     def test_production_measures_time_the_mac_is_awake(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

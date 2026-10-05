@@ -52,7 +52,7 @@ int main(int argc, char **argv) {
         CommandGraph graph;
         graph.add(std::string("gguf_test_dequant_") + fmtName(f), {w0, w1, meta, output}, GgufDecodeParams{K, 1, N, 0},
                   {N * (K / kGroup) / kThreads, 1, 1}, {kThreads, 1, 1});
-        static_cast<void>(backend.submitCommand(graph.dispatches()));
+        static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
         const auto *got = static_cast<const uint16_t *>(output.contents());
         size_t differ = 0;
         for (size_t i = 0; i < values.size(); ++i) differ += got[i] != f2h(values[i]);

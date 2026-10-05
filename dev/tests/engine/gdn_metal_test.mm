@@ -184,7 +184,7 @@ void submitPrefill(MetalBackend &backend, const GdnPrefillBuffers &buffers,
   GDN::addPrefill(graph, buffers, shape, tokens, order);
   require(graph.dispatches().size() == 3,
           label + "prefill is not three dispatches");
-  (void)backend.submitCommand(graph.dispatches());
+  (void)backend.submitCommandAsync(graph.dispatches()).wait();
 }
 
 void runCase(MetalBackend &backend, const GdnShape &shape, uint32_t tokens,

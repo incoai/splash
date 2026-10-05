@@ -1,5 +1,4 @@
 #include "Checked.hpp"
-#include "ScopedTestConfig.hpp"
 #include "TestCache.hpp"
 #include "TestChecks.hpp"
 #include "TestKvPool.hpp"
@@ -619,10 +618,9 @@ void testPointsWaitTheirTurn() {
 // waits, and the limit is looked at again a minute later.
 void testWritesKeepToTheHourlyLimit() {
   constexpr double kMinute = 60'000.0, kHour = 3'600'000.0;
-  const test::ScopedTestConfig config({.writeBehindHourlyBytes = kHostPageBytes});
   auto budget = std::make_shared<model::DiskBudget>(4 * kHostPageBytes);
   Process process(true, budget);
-  WriteBehind writes(process.cache);
+  WriteBehind writes(process.cache, kHostPageBytes);
   const std::vector<uint64_t> blocks = process.cachePrompt(1, promptOf(1000, 2));
   process.publish(blocks[1]);
   writes.published(blocks[1], WriteBehind::kMinimumTokens, 0.0);

@@ -317,69 +317,6 @@ class HttpRegressionTests(unittest.TestCase):
         self.assertEqual(summary["metric"], "decode_cycle_ms_per_token")
         self.assertEqual(summary["baseline_median"], 2)
 
-    def test_baseline_without_decode_cycles_judges_both_by_wall(self):
-        # A baseline built before metrics.decode_cycle_ms reports only the
-        # command wall, which then judges both versions.
-        idle = {
-            "scheduler": dict.fromkeys(
-                (
-                    "queued",
-                    "waiting_resources",
-                    "prefilling",
-                    "decoding",
-                    "waiting_mask",
-                ),
-                0,
-            ),
-            "state": {"active_lanes": 0},
-            "kv": {"pages_active": 0},
-        }
-        response = {
-            "metrics": {"cache": {"matched_tokens": 0}, "prefill": {"tokens": 128}},
-            "usage": {"prompt_tokens": 128, "completion_tokens": 64},
-            "choices": [{"message": {"role": "assistant", "content": "1"}}],
-        }
-
-        def measure(metrics):
-            replies = [
-                (200, {**idle, "metrics": dict.fromkeys(metrics, 0)}),
-                (200, response),
-                (200, {**idle, "metrics": metrics}),
-            ]
-            with (
-                mock.patch.object(smoke, "request", side_effect=replies),
-                mock.patch.object(smoke, "validate_status"),
-            ):
-                return benchmark.measure(
-                    mock.Mock(port=0), "model", "prompt", 64, "decode", 128, 60
-                )
-
-        wall = {
-            "prefill_wall_ms": 4,
-            "decode_wall_ms": 96,
-            "prefill_input_tokens": 128,
-            "decode_output_tokens": 64,
-            "drafted_tokens": 70,
-            "accepted_draft_tokens": 50,
-        }
-        measured = {
-            "baseline": measure(wall),
-            "candidate": measure({**wall, "decode_cycle_ms": 128}),
-        }
-        self.assertEqual(measured["baseline"]["native_delta"], wall)
-        self.assertEqual(measured["candidate"]["native_delta"]["decode_cycle_ms"], 128)
-        rows = [
-            {**measured[version], "version": version, "round": round, "sample": sample}
-            for round, (version, sample) in enumerate(
-                zip(benchmark.ROUNDS, (0, 0, 1, 1))
-            )
-        ]
-        summary = benchmark.summarize(rows)[0]
-        self.assertEqual(summary["metric"], "decode_wall_ms_per_token")
-        self.assertEqual(
-            (summary["baseline_median"], summary["candidate_median"]), (1.5, 1.5)
-        )
-
 
 if __name__ == "__main__":
     unittest.main()

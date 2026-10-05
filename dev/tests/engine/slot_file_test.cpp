@@ -33,13 +33,8 @@ static_assert(SlotFile::slotBytesFor(1) == kHostPageBytes &&
               SlotFile::slotBytesFor(kHostPageBytes) == kHostPageBytes &&
               SlotFile::slotBytesFor(kHostPageBytes + 1) == 2 * kHostPageBytes);
 
+using splash::test::rejects;
 using splash::test::require;
-
-template <typename Exception, typename Call>
-static bool throws(Call call) {
-  try { call(); } catch (const Exception &) { return true; }
-  return false;
-}
 
 static void testFailedWriteStopsWriting() {
   const pid_t child = fork();
@@ -73,8 +68,8 @@ static void testFailedWriteStopsWriting() {
               "storage failure did not stop further writes");
       // A closed file still rejects a write that does not fit its slots.
       std::vector<std::byte> oversized(size + 1);
-      require(throws<std::invalid_argument>(
-                  [&] { static_cast<void>(file.write(partial, {oversized}, {})); }),
+      rejects([&] { static_cast<void>(file.write(partial, {oversized}, {})); },
+              "slot write does not match this file's slots",
               "a closed file absorbed a write of more than a slot");
       require(file.read(complete, {output}, {})->wait() && output.front() == std::byte{1},
               "complete slot became unreadable after a storage failure");
@@ -368,8 +363,8 @@ static void testPersistentSlotsComeBack() {
                 records[1].payloadBytes == size,
             "the next process did not find exactly the labelled slots it kept");
     auto first = file.adopt(records[0]);
-    require(throws<std::invalid_argument>([&] { static_cast<void>(file.adopt(records[0])); }),
-            "a slot was adopted twice");
+    rejects([&] { static_cast<void>(file.adopt(records[0])); },
+            "adopted slot is not one of this file's records", "a slot was adopted twice");
     file.finishAdoption();
     require(budget->usedBytes() == size && budget->fileBytes() == size &&
                 sizeOf(directory.slots()) == size,
@@ -377,7 +372,8 @@ static void testPersistentSlotsComeBack() {
     std::vector<std::byte> output(size / 2);
     require(file.read(first, {output}, {})->wait() && output == one,
             "an adopted slot did not read back");
-    require(throws<std::logic_error>([&] { static_cast<void>(file.adopt(records[1])); }),
+    rejects([&] { static_cast<void>(file.adopt(records[1])); },
+            "slots are adopted only while a persistent slot file opens",
             "a slot was adopted after adoption finished");
     file.seal();
   }
@@ -481,8 +477,11 @@ static void testAdoptionCountsPastTheQuota() {
   }
   auto budget = std::make_shared<DiskBudget>(size);
   SlotFile file(size, budget, directory.persistence());
-  require(throws<std::logic_error>([&] { static_cast<void>(file.acquire()); }) &&
-              throws<std::logic_error>([&] { static_cast<void>(file.synchronize({})); }),
+  rejects([&] { static_cast<void>(file.acquire()); },
+          "a persistent slot file acquires slots only after adoption",
+          "a persistent file acquired a slot before adoption finished");
+  rejects([&] { static_cast<void>(file.synchronize({})); },
+          "a persistent slot file takes operations only after adoption",
           "a persistent file ran an operation before adoption finished");
   std::vector<std::shared_ptr<SlotFile::Slot>> adopted;
   for (const SlotRecord &record : file.records())
@@ -567,21 +566,21 @@ int main() {
     auto reused = file.acquire();
     second = file.acquire();
     require(reused && second && !file.acquire(), "released quota was not reusable");
-    require(throws<std::invalid_argument>(
-                [&] { SlotFile(size, std::make_shared<DiskBudget>(size - 1)); }),
-            "quota below one slot was accepted");
-    require(throws<std::invalid_argument>(
-                [&] { SlotFile(size + 1, std::make_shared<DiskBudget>(4 * size)); }),
-            "unaligned slot size was accepted");
+    rejects([&] { SlotFile(size, std::make_shared<DiskBudget>(size - 1)); },
+            "slot file quota holds no slot", "quota below one slot was accepted");
+    rejects([&] { SlotFile(size + 1, std::make_shared<DiskBudget>(4 * size)); },
+            "slot size is not aligned for uncached IO", "unaligned slot size was accepted");
     std::vector<std::byte> oversized(size + 1);
-    require(throws<std::invalid_argument>(
-                [&] { static_cast<void>(file.read(reused, {oversized}, {})); }) &&
-                throws<std::invalid_argument>([&] {
-                  static_cast<void>(file.write(
-                      reused, {std::span<const std::byte>(source), std::span<const std::byte>(oversized).first(1)},
-                      {}));
-                }),
-            "a transfer of more than a slot was accepted");
+    rejects([&] { static_cast<void>(file.read(reused, {oversized}, {})); },
+            "slot read does not match this file's slots",
+            "a read of more than a slot was accepted");
+    rejects(
+        [&] {
+          static_cast<void>(file.write(
+              reused, {std::span<const std::byte>(source), std::span<const std::byte>(oversized).first(1)},
+              {}));
+        },
+        "slot write does not match this file's slots", "a write of more than a slot was accepted");
     {
       // Two files of different slot sizes draw on one budget.
       auto shared = std::make_shared<DiskBudget>(4 * size);
@@ -602,8 +601,7 @@ int main() {
       one.reset();
       require(shared->usedBytes() == 2 * size && large.acquire() && !small.acquire(),
               "a released slot did not return its bytes to the budget");
-      require(throws<std::invalid_argument>(
-                  [&] { SlotFile(8 * size, shared); }),
+      rejects([&] { SlotFile(8 * size, shared); }, "slot file quota holds no slot",
               "a file whose slot exceeds the shared budget was accepted");
     }
     std::cout << "Slot file tests passed\n";

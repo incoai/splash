@@ -34,18 +34,8 @@ constexpr model::DraftStateLayout kDraftState{5, 8, 128};
 constexpr model::CompositeStateLayout kStateLayout{kTargetState, kDraftState};
 constexpr uint64_t kStateSlotBytes = model::SlotFile::slotBytesFor(kStateLayout.cachedBytes());
 
+using splash::test::rejects;
 using splash::test::require;
-
-template <typename Exception = std::exception>
-void requireThrows(const std::function<void()> &operation,
-                   const char *message) {
-  try {
-    operation();
-  } catch (const Exception &) {
-    return;
-  }
-  throw std::runtime_error(message);
-}
 
 uint32_t &word(const metal::MetalBuffer &buffer, uint64_t byteOffset = 0) {
   require(byteOffset + sizeof(uint32_t) <= buffer.sizeBytes(),
@@ -430,8 +420,9 @@ void testPersistentStateComesBack(metal::MetalBackend &backend) {
   const std::vector<model::SlotRecord> records = file->records();
   require(records.size() == 2 && records[0].label == std::vector<std::byte>(8, std::byte{40}),
           "the next process did not find both labelled states");
-  requireThrows<std::invalid_argument>([&] { static_cast<void>(storage.adopt(records[0], 4100)); },
-                                       "a state was taken back at a boundary off a page");
+  rejects([&] { static_cast<void>(storage.adopt(records[0], 4100)); },
+          "composite snapshot requires equal page-aligned committed lengths",
+          "a state was taken back at a boundary off a page");
   auto intact = storage.adopt(records[0], 4096);
   auto changed = storage.adopt(records[1], 4096);
   file->finishAdoption();
@@ -531,9 +522,8 @@ void run(const std::string &metallib) {
          lane < model::ExecutionLimits::maximumBatchWidth;
          ++lane)
       require(!storage.metadata(lane).assigned(), "lane was assigned eagerly");
-    requireThrows<std::out_of_range>(
-        [&] { static_cast<void>(storage.current(4)); },
-        "storage exposed more than four lanes");
+    rejects([&] { static_cast<void>(storage.current(4)); }, "invalid Qwen lane",
+            "storage exposed more than four lanes");
 
     require(static_cast<bool>(storage.tryActivateLane(0, 101)),
             "lane activation failed");
@@ -570,9 +560,9 @@ void run(const std::string &metallib) {
     require(storage.metadata(0).requestId == 101 &&
                 storage.metadata(0).activeParity == 0,
             "lane activation metadata is wrong");
-    requireThrows<std::logic_error>(
-        [&] { static_cast<void>(storage.tryActivateLane(0, 303)); },
-        "double lane activation was accepted");
+    rejects([&] { static_cast<void>(storage.tryActivateLane(0, 303)); },
+            "Qwen lane is already assigned",
+            "double lane activation was accepted");
 
     // Hot metadata updates must leave every buffer and marker untouched.
     word(storage.current(0).convolutionLayers[0]) = 0x10101010;
@@ -683,8 +673,8 @@ void run(const std::string &metallib) {
     require(storage.idleCells() == 2 && storage.idleRings() == 1 &&
                 storage.statesToActivate() == 0,
             "released lane buffers did not return to the pool");
-    requireThrows<std::logic_error>([&] { storage.swapParity(0); },
-                                    "unassigned lane accepted a parity update");
+    rejects([&] { storage.swapParity(0); }, "Qwen lane is not assigned",
+            "unassigned lane accepted a parity update");
     require(static_cast<bool>(storage.tryActivateLane(0, 303)), "lane reuse failed");
     require(storage.idleCells() == 0 && storage.idleRings() == 0,
             "reactivation left pooled buffers behind");
@@ -708,21 +698,22 @@ void run(const std::string &metallib) {
     // Rejected publications fail before any cache slot is taken or admitted.
     const uint64_t beforeRejected = storage.actualAllocatedBytes();
     storage.updateLengths(0, {128, 0, 127});
-    requireThrows<std::logic_error>([&] { storage.clearForColdStart(0); },
-                                    "a lane past length zero was cleared for a cold start");
-    requireThrows<std::invalid_argument>(
-        [&] { static_cast<void>(storage.snapshot(0)); },
-        "snapshot accepted divergent target/draft lengths");
-    requireThrows<std::invalid_argument>(
+    rejects([&] { storage.clearForColdStart(0); }, "a cold start begins at logical length zero",
+            "a lane past length zero was cleared for a cold start");
+    rejects([&] { static_cast<void>(storage.snapshot(0)); },
+            "composite snapshot requires equal page-aligned committed lengths",
+            "snapshot accepted divergent target/draft lengths");
+    rejects(
         [&] {
           storage.updateLengths(0, {129, 0, 129});
           static_cast<void>(storage.snapshot(0));
         },
+        "composite snapshot requires equal page-aligned committed lengths",
         "unaligned prefix snapshot was accepted");
     require(storage.actualAllocatedBytes() == beforeRejected,
             "rejected snapshot allocated or consumed a cache slot");
-    requireThrows<std::logic_error>([&] { storage.releaseLane(0, 404); },
-                                    "lane release accepted the wrong owner");
+    rejects([&] { storage.releaseLane(0, 404); }, "Qwen lane owner mismatch",
+            "lane release accepted the wrong owner");
 
     const uint64_t beforeSuspend = storage.actualAllocatedBytes();
     storage.releaseLane(0, 303);

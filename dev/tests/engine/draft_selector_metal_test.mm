@@ -180,7 +180,7 @@ void runCase(MetalBackend &backend, const Case &c) {
   selector.add(graph, buffers, codebooks, anchors, policies);
   require(graph.dispatches().size() == 3,
           "draft selector dispatch count changed");
-  static_cast<void>(backend.submitCommand(graph.dispatches()));
+  static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
 
   const auto *candidates =
       static_cast<const uint32_t *>(buffers.candidates.contents());

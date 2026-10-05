@@ -104,14 +104,12 @@ def measure(server, model, content, output_tokens, scenario, context, timeout):
     keys = [
         "prefill_wall_ms",
         "decode_wall_ms",
+        "decode_cycle_ms",
         "prefill_input_tokens",
         "decode_output_tokens",
         "drafted_tokens",
         "accepted_draft_tokens",
     ]
-    # A build older than the engine's decode cycle timing does not report it.
-    if "decode_cycle_ms" in after["metrics"]:
-        keys.append("decode_cycle_ms")
     delta = {key: after["metrics"][key] - before["metrics"][key] for key in keys}
     return {
         "scenario": scenario,
@@ -211,18 +209,6 @@ def summarize(records: list[dict]) -> list[dict]:
     both versions must be identical."""
     groups = defaultdict(lambda: defaultdict(list))
     outputs = {}
-    # Decode is judged by the engine's cycle, so host work between commands
-    # counts, unless a version does not report it: then both versions are
-    # judged by the GPU command's wall, never one metric against the other.
-    decode_metric = (
-        "decode_cycle_ms"
-        if all(
-            "decode_cycle_ms" in row["native_delta"]
-            for row in records
-            if row["scenario"] == "decode"
-        )
-        else "decode_wall_ms"
-    )
     for row in records:
         key = row["sample"], row["context"], row["scenario"]
         output = (
@@ -236,8 +222,10 @@ def summarize(records: list[dict]) -> list[dict]:
         if paired and next(iter(paired.values())) != output:
             raise ValueError(f"baseline/candidate transcript differs: {key}")
         paired[row["version"]] = output
+        # Decode is judged by the engine's cycle, so host work between
+        # commands counts.
         if row["scenario"] == "decode":
-            latency = row["native_delta"][decode_metric] / max(
+            latency = row["native_delta"]["decode_cycle_ms"] / max(
                 1, row["native_delta"]["decode_output_tokens"]
             )
         else:
@@ -255,7 +243,7 @@ def summarize(records: list[dict]) -> list[dict]:
                 "context": context,
                 "scenario": scenario,
                 "metric": (
-                    f"{decode_metric}_per_token" if scenario == "decode" else "ttft_ms"
+                    "decode_cycle_ms_per_token" if scenario == "decode" else "ttft_ms"
                 ),
                 "samples_per_round": [
                     len(rounds[index]) for index in range(len(ROUNDS))
@@ -370,14 +358,15 @@ def parse_args(argv=None):
         parser.error("the request timeout must be positive")
     if len(set(args.contexts)) != len(args.contexts):
         parser.error("contexts must be unique")
+    # A build that speaks this server's wire version loads the weights into
+    # memory; its weight-digests reads the images it loads.
     for binary in (args.baseline_binary, args.binary):
         for path in (binary, binary.parent / "splash.metallib"):
             if not path.is_file():
                 parser.error(f"missing retained executable/library: {path}")
-    if not weights.loads_in_memory(args.binary.resolve().parent):
-        parser.error(f"the candidate build has no {weights.WEIGHT_DIGESTS}")
-    args.kind = smoke.model_artifacts.installation_kind(args.package)
-    if args.kind is None:
+        if not weights.loads_in_memory(binary.resolve().parent):
+            parser.error(f"{binary.parent} has no {weights.WEIGHT_DIGESTS}")
+    if smoke.model_artifacts.installation_kind(args.package) is None:
         parser.error(f"missing installed model: {args.package}")
     return args
 
@@ -385,7 +374,7 @@ def parse_args(argv=None):
 def check_identity(status: dict, version: str, rounds: list[dict]):
     """Every round serves the same model and KV format, and a build's rounds
     load the same executable and model layout. The builds' weights are
-    compared by their bytes after the rounds (weights.compare_builds)."""
+    compared by their bytes after the rounds (weights.compare)."""
     identity = status["identity"]
     for previous in rounds:
         expected = previous["identity"]
@@ -420,9 +409,6 @@ def main(argv=None):
     )
     binaries = {"baseline": args.baseline_binary, "candidate": args.binary}
     builds = {version: binary.resolve().parent for version, binary in binaries.items()}
-    environments = {"baseline": None, "candidate": None}
-    if not weights.loads_in_memory(builds["baseline"]):
-        environments["baseline"] = weights.baseline_environment(args.output.parent)
     document = {
         "schema_version": 1,
         "timing": "HTTP/native wall; not GPU time",
@@ -436,7 +422,7 @@ def main(argv=None):
         for round_id, version in enumerate(ROUNDS):
             run_args = argparse.Namespace(**vars(args))
             run_args.binary = binaries[version]
-            server = smoke.RealServer(run_args, environments[version])
+            server = smoke.RealServer(run_args)
             try:
                 status = server.wait_ready(args.startup_timeout)
                 smoke.validate_status(status, args.kv_format)
@@ -513,13 +499,11 @@ def main(argv=None):
         document["comparison"] = (summarize_bursts if args.burst else summarize)(
             document["samples"]
         )
-        document["weights"] = weights.compare_builds(
-            builds["baseline"],
-            builds["candidate"],
-            # The model root RealServer gives both builds.
-            args.package.resolve(),
-            environments["baseline"],
-            args.kind == smoke.model_artifacts.ASSEMBLY,
+        # The model root RealServer gives both builds.
+        package = args.package.resolve()
+        document["weights"] = weights.compare(
+            weights.digests(builds["baseline"], package),
+            weights.digests(builds["candidate"], package),
         )
         smoke.require(
             document["weights"]["pass"],

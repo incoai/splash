@@ -1,6 +1,5 @@
 #include "engine/KvPageTier.hpp"
 #include "tests/engine/AllocationFailure.hpp"
-#include "tests/engine/ScopedTestConfig.hpp"
 #include "tests/engine/TestBuffers.hpp"
 #include "tests/engine/TestChecks.hpp"
 #include "tests/engine/TestPageEntries.hpp"
@@ -33,6 +32,7 @@ using model::SlotFile;
 
 namespace {
 
+using splash::test::rejects;
 using splash::test::require;
 
 std::vector<std::byte> pattern(uint64_t bytes, uint32_t seed) {
@@ -162,7 +162,8 @@ void roundTrip(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
 // most half of the bound and restores at most three quarters, so a burst of
 // restores leaves a demotion its turn and a burst of demotions leaves
 // restores theirs. A transfer counts until poll() has retired it, and a read
-// that fails gives its room back like any other.
+// that fails gives its room back like any other. A bound of no transfer is
+// refused.
 void limits(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
             kv::Format format) {
   const kv::Layout layout{2, 2, 256, format};
@@ -171,8 +172,9 @@ void limits(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
   require(static_cast<bool>(pages.allocateExtent(0)), "the test extent was not allocated");
   const uint64_t slotBytes = SlotFile::slotBytesFor(pages.bytesPerPage());
   auto file = std::make_shared<SlotFile>(slotBytes, std::make_shared<DiskBudget>(8 * slotBytes));
-  const test::ScopedTestConfig seam({.kvTierTransfers = 4});
-  KvPageTier tier(pages, file);
+  rejects([&] { KvPageTier refused(pages, file, 0); }, "room for a transfer",
+          "a tier with no room for a transfer was built");
+  KvPageTier tier(pages, file, 4);
   const auto bytes = fill(pages, 9, 0x51a5e5u);
   std::vector<std::shared_ptr<engine::KvDiskSlot>> written;
   for (int index = 0; index < 2; ++index) {
@@ -231,8 +233,7 @@ void allocationFailure(metal::MetalBackend &backend, engine::MemoryGovernor &gov
     for (int failure = 0; failure < 64; ++failure) {
       auto budget = std::make_shared<DiskBudget>(bytes);
       auto file = std::make_shared<SlotFile>(bytes, budget);
-      const test::ScopedTestConfig seam({.kvTierTransfers = 1});
-      KvPageTier tier(pages, file);
+      KvPageTier tier(pages, file, 1);
       auto slot = tier.acquireSlot();
       const auto payload = fill(pages, 0, 123);
       require(file->write(fileSlot(slot), {payload}, {})->wait(), "fault slot seed failed");
@@ -427,8 +428,7 @@ void teardown(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
   auto budget = std::make_shared<DiskBudget>(16 * slotBytes);
   auto file = std::make_shared<SlotFile>(slotBytes, budget);
   {
-    const test::ScopedTestConfig seam({.kvTierTransfers = 16});
-    KvPageTier tier(pages, file);
+    KvPageTier tier(pages, file, 16);
     std::vector<std::unique_ptr<KvTransfer>> demotions;
     for (uint32_t page = 0; page < 8; ++page) {
       auto slot = tier.acquireSlot();

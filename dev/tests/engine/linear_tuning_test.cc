@@ -381,7 +381,7 @@ void gpuBatchEquivalence(metal::MetalBackend &backend,
       linear.add(graph, buffers, projection, plan,
           epilogue == LinearEpilogue::GateUp ? &projection : nullptr);
     }
-    const auto timing = backend.submitCommand(graph.dispatches());
+    const auto timing = backend.submitCommandAsync(graph.dispatches()).wait();
     return RunTiming{timing.gpuSeconds,
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(), false};
   };

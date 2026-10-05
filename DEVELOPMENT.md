@@ -813,16 +813,15 @@ a PEP 366 header. `serve_options.py` defines the options
 help, and how the launcher passes it on; it imports only the standard library,
 since the launcher parses them before `.venv` exists.
 
-Tests substitute the values the native runtime holds constant (the Metal
-command timeout, the KV tier's transfers, the input queue's bound, the latency
-window, the prefill checkpoint interval and the resource wait) and its clocks
-and live host-memory estimate through
-`runtime/TestConfig.hpp` with `test::ScopedTestConfig`, never through a
-production parameter; `make architecture-check` keeps production from writing
-that configuration, and from measuring durations on the standard library's
-steady clock or its timed waits, which count sleep: the runtime measures them
-on `AwakeClock` (`runtime/AwakeClock.hpp`), and wall-clock instants on
-`system_clock`.
+The values the native runtime holds constant (the Metal command timeout, the
+KV tier's transfers, the input queue's bound, the latency window, the
+write-behind budget, the prefill checkpoint interval and the resource wait),
+its clocks and its live host-memory estimate are parameters of the component
+that holds them: production leaves them at their defaults and tests set them.
+`make architecture-check` keeps production from measuring durations on the
+standard library's steady clock or its timed waits, which count sleep: the
+runtime measures them on `AwakeClock` (`runtime/AwakeClock.hpp`), and
+wall-clock instants on `system_clock`.
 
 `dev/tests/engine/test_tool_call_reading.py` holds model outputs with the calls
 and content they read as. The projector reads a call as the chat template lays
@@ -860,12 +859,13 @@ Hidden thinking signatures use a persistent user key; imported encrypted thinkin
 preserves visible history without recovering the private reasoning.
 
 `/status.admission` distinguishes memory and concurrency waits, counts the
-requests held back behind one refused memory (`held_behind_refusal`, the
-refused request included while a pass defers it; during recovery, the suspended
-ones and those of a strictly higher priority) and those waiting for a disk
-restore (`restoring`), reports suspended requests, recovery draining and the
-oldest current wait age, which for a request holding admission closed runs from
-when its wait began. Memory transitions also appear in the console. When macOS
+requests held back behind one refused memory (`held_behind_refusal`; during
+recovery only the suspended ones and those of a strictly higher priority, and
+the refused request itself while a pass defers it, even one that recovery does
+not try, which still waits for memory) and those waiting for a disk restore
+(`restoring`), reports suspended requests, recovery draining and the oldest
+current wait age, which for a request holding admission closed runs from when
+its wait began. Memory transitions also appear in the console. When macOS
 runs short of memory, growth that no request in service needs pauses and the
 cache gives memory back, a paced pass at a time, down to one lane's state
 buffers and one KV extent. A pass counts only memory that leaves the engine; a
@@ -1535,8 +1535,8 @@ prefixes and the checks fail, naming what each lookup found.
 For a same-machine HTTP regression check, retain a `splash` binary **and its
 adjacent `splash.metallib`** built from a checkout with the same native wire
 version and status schema as this one (the server refuses any other), with
-`engine-tests/weight-digests` beside them when that build loads the weights
-into memory, then run from the candidate checkout, after
+`engine-tests/weight-digests` beside them, then run from the candidate
+checkout, after
 `make build/engine-tests/weight-digests`:
 
 ```sh
@@ -1551,9 +1551,7 @@ the whole run, so every round serves the same model. It starts isolated servers
 in ABBA order, compares matched cold, exact-prefix and decode requests by the
 release check's speed rule and weight bytes (decode by
 `metrics.decode_cycle_ms` per output token, so host work between commands
-counts; against a baseline that does not report it, both versions by
-`metrics.decode_wall_ms` per output token, as each comparison's `metric`
-says), and saves `build/release/http-regression.json`. With `--burst N` it
+counts), and saves `build/release/http-regression.json`. With `--burst N` it
 sends N requests of each context at once instead, 16 output tokens each, and
 reports each build's replay points lost to the burst
 (`replay_state_publication_failures`), its decode rate and advertised context;

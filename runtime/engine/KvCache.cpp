@@ -210,11 +210,6 @@ KvCache::Key KvCache::key(uint64_t blockId) const {
 
 uint64_t KvCache::lastUsed(uint64_t blockId) const { return block(blockId).lastUsed; }
 
-bool KvCache::idle(uint64_t blockId) const {
-  const Block &entry = block(blockId);
-  return !entry.activeUsers && !entry.transferring;
-}
-
 bool KvCache::transferring(uint64_t blockId) const { return block(blockId).transferring; }
 
 std::vector<uint64_t> KvCache::children(uint64_t blockId) const {
