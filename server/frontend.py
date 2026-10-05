@@ -4,7 +4,6 @@ import hashlib
 import json
 import secrets
 import threading
-from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from itertools import count
@@ -35,6 +34,7 @@ from .errors import (
     field_error,
 )
 from .latency import LatencyMetrics
+from .lru import LRUCache
 from .metrics import is_finite_number
 from .serve_options import REASONING_EFFORTS, parse_served_model_name
 from .tokenization import PromptTokenizer
@@ -95,11 +95,11 @@ assert set(SAMPLING_NUMBERS) | {"top_k"} == set(wire.SAMPLING_FIELDS)
 
 def _preparation_checkpoint(deadline, disconnected):
     """A check that a request's preparation may go on: its deadline has not
-    passed, and its client has not left, where `disconnected` can tell."""
+    passed, and its client has not left."""
 
     def checkpoint():
         remaining_request_time(deadline)
-        if disconnected is not None and disconnected():
+        if disconnected():
             raise ConnectionResetError("client disconnected during preparation")
 
     return checkpoint
@@ -163,57 +163,38 @@ class ResponseStore:
     BUDGET_BYTES = 64 * 1024 * 1024
 
     def __init__(self):
-        self.records = OrderedDict()
-        self.bytes = 0
-        self.evictions = 0
+        self.records = LRUCache(self.BUDGET_BYTES)
         self.hits = 0
         self.misses = 0
         self.lock = threading.Lock()
 
     def get(self, response_id):
         with self.lock:
-            record = self.records.pop(response_id, None)
+            record = self.records.get(response_id)
             if record is None:
                 self.misses += 1
-                return None
-            self.records[response_id] = record
-            self.hits += 1
+            else:
+                self.hits += 1
         return record
 
     def put(self, response, history_items):
         record = StoredResponse(
             json_codec.encode(response), json_codec.encode(history_items)
         )
-        if record.size > self.BUDGET_BYTES:
-            return False
-        response_id = response["id"]
         with self.lock:
-            previous = self.records.pop(response_id, None)
-            if previous is not None:
-                self.bytes -= previous.size
-            self.records[response_id] = record
-            self.bytes += record.size
-            while self.bytes > self.BUDGET_BYTES:
-                _, evicted = self.records.popitem(last=False)
-                self.bytes -= evicted.size
-                self.evictions += 1
-        return True
+            return self.records.put(response["id"], record, record.size)
 
     def delete(self, response_id):
         with self.lock:
-            record = self.records.pop(response_id, None)
-            if record is None:
-                return False
-            self.bytes -= record.size
-            return True
+            return self.records.pop(response_id) is not None
 
     def stats(self):
         with self.lock:
             return {
                 "entries": len(self.records),
-                "bytes": self.bytes,
-                "budget_bytes": self.BUDGET_BYTES,
-                "evictions": self.evictions,
+                "bytes": self.records.bytes,
+                "budget_bytes": self.records.budget_bytes,
+                "evictions": self.records.evictions,
                 "hits": self.hits,
                 "misses": self.misses,
             }
@@ -644,7 +625,7 @@ class Frontend:
         except Exception as error:
             raise APIError(400, f"{what} prompt could not be rendered") from error
 
-    def prepare_judgment(self, body, *, deadline, disconnected=None):
+    def prepare_judgment(self, body, *, deadline, disconnected):
         unknown = sorted(
             set(body)
             - {"id", "state", "question", "options", "model", "timeout", "priority"}
@@ -679,7 +660,7 @@ class Frontend:
             )
         return job, body
 
-    def prepare_systemone(self, body, *, deadline, disconnected=None):
+    def prepare_systemone(self, body, *, deadline, disconnected):
         details = []
         model = body.get("model")
         if not isinstance(model, str) or not model:
@@ -1154,7 +1135,7 @@ class Frontend:
             **fields,
         )
 
-    def prepare_responses(self, body, *, deadline, reserve_input=None):
+    def prepare_responses(self, body, *, deadline, reserve_input):
         store = body.get("store")
         if store is not None and not isinstance(store, bool):
             raise APIError(400, "store must be a boolean")
@@ -1177,8 +1158,7 @@ class Frontend:
                     )
                 # The immutable record remains valid if the store evicts it.
                 # Reserve its input bytes before materializing the history.
-                if reserve_input is not None:
-                    reserve_input(len(previous.history_json))
+                reserve_input(len(previous.history_json))
                 previous_items = json_codec.loads(previous.history_json)
             items = [*previous_items, *canonical_responses_input(body.get("input"))]
             chat, namespaces = responses_to_chat_body(body, items)

@@ -10,12 +10,14 @@ from PIL import Image
 
 from dev.tests.server_fixtures import (
     document_block,
+    empty_page_cache,
     full_render_limits,
     pdf_bytes,
     render_pdf,
 )
 from server import documents, images
 from server.errors import APIError
+from server.lru import LRUCache
 
 
 class DocumentTests(unittest.TestCase):
@@ -30,9 +32,7 @@ class DocumentTests(unittest.TestCase):
             render_pdf(locked)
 
     def setUp(self):
-        with documents._cache_lock:
-            documents._cache.clear()
-            documents._cache_bytes = 0
+        self.enterContext(empty_page_cache())
 
     def test_document_block_puts_title_and_context_before_its_pdf(self):
         block = document_block(title="Report", context="Local fixture")
@@ -224,7 +224,7 @@ class DocumentTests(unittest.TestCase):
 
     def test_request_budget_counts_repeated_pdfs_with_and_without_cache(self):
         render_pdf()
-        size = sum(page.size for pages in documents._cache.values() for page in pages)
+        size = documents._cache.bytes
         source_size = len(pdf_bytes())
         for keep_cache in (False, True):
             self.setUp()
@@ -305,24 +305,22 @@ class DocumentTests(unittest.TestCase):
         self.assertEqual(len(handles), 3)
         self.assertTrue(all(handle.raw is None for handle in handles))
         self.assertFalse(documents._cache)
-        self.assertEqual(documents._cache_bytes, 0)
+        self.assertEqual(documents._cache.bytes, 0)
         self.assertFalse(documents._render_lock.locked())
         self.assertIn("ALPHA 42", render_pdf()[0]["text"])
 
     def test_cache_evicts_by_bytes_and_entry_count(self):
         page = documents.Page("text", "image")
         for budget, entries in ((page.size, 16), (documents.CACHE_BYTES, 1)):
-            self.setUp()
             with (
                 mock.patch.object(documents, "_render", return_value=(page,)) as render,
-                mock.patch.object(documents, "CACHE_BYTES", budget),
-                mock.patch.object(documents, "CACHE_ENTRIES", entries),
+                mock.patch.object(documents, "_cache", LRUCache(budget, entries)),
             ):
                 for payload in (b"first", b"second", b"first"):
                     render_pdf(payload)
                 self.assertEqual(render.call_count, 3)
                 self.assertEqual(len(documents._cache), 1)
-                self.assertLessEqual(documents._cache_bytes, budget)
+                self.assertLessEqual(documents._cache.bytes, budget)
 
 
 if __name__ == "__main__":

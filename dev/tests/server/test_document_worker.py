@@ -5,16 +5,19 @@ import unittest
 from dataclasses import asdict
 from unittest import mock
 
-from dev.tests.server_fixtures import full_render_limits, pdf_bytes, render_pdf
+from dev.tests.server_fixtures import (
+    empty_page_cache,
+    full_render_limits,
+    pdf_bytes,
+    render_pdf,
+)
 from server import document_worker, documents
 from server.errors import APIError
 
 
 class DocumentWorkerTests(unittest.TestCase):
     def setUp(self):
-        with documents._cache_lock:
-            documents._cache.clear()
-            documents._cache_bytes = 0
+        self.enterContext(empty_page_cache())
 
     def sleeping_worker(self, children):
         start = subprocess.Popen

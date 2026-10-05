@@ -765,156 +765,19 @@ def _anthropic_chat(body, thinking_resolver):
         "max",
     ):
         raise APIError(400, "output_config.effort is invalid")
-    if "format" in output_config and "output_format" in body:
-        raise APIError(400, "output_config.format and output_format cannot be combined")
-    response_format = None
-    if "format" in output_config or "output_format" in body:
-        output_format = output_config.get("format", body.get("output_format"))
-        if (
-            not isinstance(output_format, dict)
-            or output_format.get("type") != "json_schema"
-            or not isinstance(output_format.get("schema"), (dict, bool))
-        ):
-            raise APIError(
-                400, "output format must be a json_schema object with a schema"
-            )
-        response_format = {
-            "type": "json_schema",
-            "json_schema": {"schema": output_format["schema"]},
-        }
+    response_format = _anthropic_response_format(body, output_config)
     messages = body.get("messages")
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "messages must be a non-empty array")
-
-    translated = []
-    system_text = None
     system = body.get("system")
-    if system is not None:
-        system_text = _anthropic_system_text(system, "system")
-    for message in messages:
-        if not isinstance(message, dict):
-            raise APIError(400, "Anthropic messages must be objects")
-        role = message.get("role")
-        content = message.get("content")
-        if role not in ("user", "assistant", "system"):
-            raise APIError(
-                400, "Anthropic messages require user/assistant/system roles"
-            )
-        if role == "system":
-            text = _anthropic_system_text(content, "system message")
-            if text:
-                translated.append({"role": "system", "content": text})
-            continue
-        if isinstance(content, str):
-            translated.append({"role": role, "content": content})
-            continue
-        if not isinstance(content, list):
-            raise APIError(400, "Anthropic message content must be text or blocks")
-        text_parts = []
-        user_blocks = []
-        reasoning_parts = []
-        tool_calls = []
-        tool_results = []
-        for block in content:
-            if not isinstance(block, dict):
-                raise APIError(400, "Anthropic content blocks must be objects")
-            kind = block.get("type")
-            if kind == "text" and isinstance(block.get("text"), str):
-                text_parts.append(block["text"])
-                user_blocks.append(block)
-            elif role == "user" and kind in ("image", "document"):
-                user_blocks.append(block)
-            elif (
-                role == "assistant"
-                and kind == "thinking"
-                and isinstance(block.get("thinking"), str)
-            ):
-                signature = block.get("signature", "")
-                if not isinstance(signature, str):
-                    raise APIError(400, "invalid thinking signature")
-                if signature:
-                    try:
-                        reasoning = thinking_resolver(signature)
-                    except APIError as error:
-                        # Other providers' signatures are opaque, as are ours
-                        # under another key. Preserve their visible history;
-                        # hidden content is dropped, as redacted_thinking is.
-                        if error.code != "invalid_thinking_signature":
-                            raise
-                        reasoning = block["thinking"]
-                    if reasoning:
-                        reasoning_parts.append(reasoning)
-                else:
-                    reasoning_parts.append(block["thinking"])
-            elif role == "assistant" and kind == "redacted_thinking":
-                if not isinstance(block.get("data"), str) or not block["data"]:
-                    raise APIError(400, "invalid redacted_thinking data")
-                # Provider-encrypted reasoning cannot be rendered in this
-                # model's prompt. Keep the surrounding visible history.
-            elif role == "assistant" and kind == "tool_use":
-                if (
-                    not isinstance(block.get("id"), str)
-                    or not isinstance(block.get("name"), str)
-                    or not isinstance(block.get("input"), dict)
-                ):
-                    raise APIError(400, "invalid Anthropic tool_use block")
-                tool_calls.append(
-                    {
-                        "id": block["id"],
-                        "type": "function",
-                        "function": {
-                            "name": block["name"],
-                            "arguments": block["input"],
-                        },
-                    }
-                )
-            elif role == "user" and kind == "tool_result":
-                if not isinstance(block.get("tool_use_id"), str):
-                    raise APIError(400, "invalid Anthropic tool_result block")
-                if not isinstance(block.get("is_error", False), bool):
-                    raise APIError(400, "tool_result.is_error must be a boolean")
-                tool_results.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": block["tool_use_id"],
-                        "content": _anthropic_content(
-                            block.get("content", ""), "tool_result"
-                        ),
-                    }
-                )
-                if block.get("is_error"):
-                    result = tool_results[-1]
-                    content = result["content"]
-                    result["content"] = (
-                        "Tool execution failed:\n" + content
-                        if isinstance(content, str)
-                        else [
-                            {"type": "text", "text": "Tool execution failed:\n"},
-                            *content,
-                        ]
-                    )
-            else:
-                raise APIError(400, f"unsupported Anthropic content block: {kind}")
-        if role == "assistant":
-            item = {"role": role, "content": "".join(text_parts)}
-            if reasoning_parts:
-                item["reasoning_content"] = "".join(reasoning_parts)
-            if tool_calls:
-                item["tool_calls"] = tool_calls
-            translated.append(item)
-        else:
-            translated.extend(tool_results)
-            if user_blocks or not tool_results:
-                translated.append(
-                    {
-                        "role": role,
-                        "content": _anthropic_content(user_blocks, "user message"),
-                    }
-                )
-
+    system_text = None if system is None else _anthropic_system_text(system, "system")
+    translated = [
+        translation
+        for message in messages
+        for translation in _anthropic_message(message, thinking_resolver)
+    ]
     if system_text:
         translated.insert(0, {"role": "system", "content": system_text})
-
     reasoning_effort, thinking_display = _anthropic_thinking(
         body.get("thinking"), effort
     )
@@ -925,58 +788,188 @@ def _anthropic_chat(body, thinking_resolver):
         "preserve_thinking": preserve_thinking,
         "reasoning_effort": reasoning_effort,
     }
-
-    tools = body.get("tools")
-    if tools is not None:
-        if not isinstance(tools, list):
-            raise APIError(400, "tools must be an array")
-        chat["tools"] = []
-        for tool in tools:
-            if isinstance(tool, dict) and tool.get("type", "custom") != "custom":
-                raise APIError(
-                    400,
-                    "only custom function tools are supported; "
-                    f"received type {tool['type']!r}",
-                )
-            if (
-                not isinstance(tool, dict)
-                or not isinstance(tool.get("name"), str)
-                or not isinstance(tool.get("input_schema", {}), (dict, bool))
-            ):
-                raise APIError(400, "invalid Anthropic tool")
-            function = {
-                "name": tool["name"],
-                "parameters": tool.get("input_schema", {}),
-            }
-            if isinstance(tool.get("description"), str):
-                function["description"] = tool["description"]
-            if "strict" in tool:
-                function["strict"] = tool["strict"]
-            chat["tools"].append({"type": "function", "function": function})
-    choice = body.get("tool_choice")
-    if choice is not None:
-        if not isinstance(choice, dict):
-            raise APIError(400, "tool_choice must be an object")
-        disable_parallel = choice.get("disable_parallel_tool_use", False)
-        if not isinstance(disable_parallel, bool):
-            raise APIError(400, "disable_parallel_tool_use must be a boolean")
-        chat["parallel_tool_calls"] = not disable_parallel
-        kind = choice.get("type")
-        if kind == "auto":
-            chat["tool_choice"] = "auto"
-        elif kind == "any":
-            chat["tool_choice"] = "required"
-        elif kind == "none":
-            chat["tool_choice"] = "none"
-        elif kind == "tool" and isinstance(choice.get("name"), str):
-            chat["tool_choice"] = {
-                "type": "function",
-                "function": {"name": choice["name"]},
-            }
-        else:
-            raise APIError(400, "invalid Anthropic tool_choice")
+    if body.get("tools") is not None:
+        chat["tools"] = _anthropic_tools(body["tools"])
+    if body.get("tool_choice") is not None:
+        chat.update(_anthropic_tool_choice(body["tool_choice"]))
     chat = {key: value for key, value in chat.items() if value is not None}
     return chat, thinking_display
+
+
+def _anthropic_response_format(body, output_config):
+    """The format of a Messages request's output, in output_config.format or
+    output_format, as a Chat response_format; None without one."""
+    if "format" in output_config and "output_format" in body:
+        raise APIError(400, "output_config.format and output_format cannot be combined")
+    if "format" not in output_config and "output_format" not in body:
+        return None
+    output_format = output_config.get("format", body.get("output_format"))
+    if (
+        not isinstance(output_format, dict)
+        or output_format.get("type") != "json_schema"
+        or not isinstance(output_format.get("schema"), (dict, bool))
+    ):
+        raise APIError(400, "output format must be a json_schema object with a schema")
+    return {"type": "json_schema", "json_schema": {"schema": output_format["schema"]}}
+
+
+def _anthropic_message(message, thinking_resolver):
+    """The Chat messages a Messages message stands for: a system message's
+    text; an assistant's text, reasoning and calls as one message; a user's
+    tool results, then the rest of its content."""
+    if not isinstance(message, dict):
+        raise APIError(400, "Anthropic messages must be objects")
+    role = message.get("role")
+    content = message.get("content")
+    if role not in ("user", "assistant", "system"):
+        raise APIError(400, "Anthropic messages require user/assistant/system roles")
+    if role == "system":
+        text = _anthropic_system_text(content, "system message")
+        return [{"role": "system", "content": text}] if text else []
+    if isinstance(content, str):
+        return [{"role": role, "content": content}]
+    if not isinstance(content, list):
+        raise APIError(400, "Anthropic message content must be text or blocks")
+    text_parts = []
+    user_blocks = []
+    reasoning_parts = []
+    tool_calls = []
+    tool_results = []
+    for block in content:
+        if not isinstance(block, dict):
+            raise APIError(400, "Anthropic content blocks must be objects")
+        kind = block.get("type")
+        if kind == "text" and isinstance(block.get("text"), str):
+            text_parts.append(block["text"])
+            user_blocks.append(block)
+        elif role == "user" and kind in ("image", "document"):
+            user_blocks.append(block)
+        elif (
+            role == "assistant"
+            and kind == "thinking"
+            and isinstance(block.get("thinking"), str)
+        ):
+            signature = block.get("signature", "")
+            if not isinstance(signature, str):
+                raise APIError(400, "invalid thinking signature")
+            if signature:
+                try:
+                    reasoning = thinking_resolver(signature)
+                except APIError as error:
+                    # Other providers' signatures are opaque, as are ours
+                    # under another key. Preserve their visible history;
+                    # hidden content is dropped, as redacted_thinking is.
+                    if error.code != "invalid_thinking_signature":
+                        raise
+                    reasoning = block["thinking"]
+                if reasoning:
+                    reasoning_parts.append(reasoning)
+            else:
+                reasoning_parts.append(block["thinking"])
+        elif role == "assistant" and kind == "redacted_thinking":
+            if not isinstance(block.get("data"), str) or not block["data"]:
+                raise APIError(400, "invalid redacted_thinking data")
+            # Provider-encrypted reasoning cannot be rendered in this
+            # model's prompt. Keep the surrounding visible history.
+        elif role == "assistant" and kind == "tool_use":
+            if (
+                not isinstance(block.get("id"), str)
+                or not isinstance(block.get("name"), str)
+                or not isinstance(block.get("input"), dict)
+            ):
+                raise APIError(400, "invalid Anthropic tool_use block")
+            tool_calls.append(
+                {
+                    "id": block["id"],
+                    "type": "function",
+                    "function": {"name": block["name"], "arguments": block["input"]},
+                }
+            )
+        elif role == "user" and kind == "tool_result":
+            tool_results.append(_anthropic_tool_result(block))
+        else:
+            raise APIError(400, f"unsupported Anthropic content block: {kind}")
+    if role == "assistant":
+        item = {"role": role, "content": "".join(text_parts)}
+        if reasoning_parts:
+            item["reasoning_content"] = "".join(reasoning_parts)
+        if tool_calls:
+            item["tool_calls"] = tool_calls
+        return [item]
+    if user_blocks or not tool_results:
+        user = {
+            "role": role,
+            "content": _anthropic_content(user_blocks, "user message"),
+        }
+        return [*tool_results, user]
+    return tool_results
+
+
+def _anthropic_tool_result(block):
+    """A user's tool_result block as a Chat tool message, whose content
+    says first that the tool failed where it did."""
+    if not isinstance(block.get("tool_use_id"), str):
+        raise APIError(400, "invalid Anthropic tool_result block")
+    if not isinstance(block.get("is_error", False), bool):
+        raise APIError(400, "tool_result.is_error must be a boolean")
+    content = _anthropic_content(block.get("content", ""), "tool_result")
+    if block.get("is_error"):
+        failed = "Tool execution failed:\n"
+        content = (
+            failed + content
+            if isinstance(content, str)
+            else [{"type": "text", "text": failed}, *content]
+        )
+    return {"role": "tool", "tool_call_id": block["tool_use_id"], "content": content}
+
+
+def _anthropic_tools(tools):
+    """Messages tools, custom ones only, as Chat function tools."""
+    if not isinstance(tools, list):
+        raise APIError(400, "tools must be an array")
+    functions = []
+    for tool in tools:
+        if isinstance(tool, dict) and tool.get("type", "custom") != "custom":
+            raise APIError(
+                400,
+                "only custom function tools are supported; "
+                f"received type {tool['type']!r}",
+            )
+        if (
+            not isinstance(tool, dict)
+            or not isinstance(tool.get("name"), str)
+            or not isinstance(tool.get("input_schema", {}), (dict, bool))
+        ):
+            raise APIError(400, "invalid Anthropic tool")
+        function = {"name": tool["name"], "parameters": tool.get("input_schema", {})}
+        if isinstance(tool.get("description"), str):
+            function["description"] = tool["description"]
+        if "strict" in tool:
+            function["strict"] = tool["strict"]
+        functions.append({"type": "function", "function": function})
+    return functions
+
+
+def _anthropic_tool_choice(choice):
+    """A Messages tool_choice as Chat's parallel_tool_calls and
+    tool_choice."""
+    if not isinstance(choice, dict):
+        raise APIError(400, "tool_choice must be an object")
+    disable_parallel = choice.get("disable_parallel_tool_use", False)
+    if not isinstance(disable_parallel, bool):
+        raise APIError(400, "disable_parallel_tool_use must be a boolean")
+    kind = choice.get("type")
+    if kind == "auto":
+        tool_choice = "auto"
+    elif kind == "any":
+        tool_choice = "required"
+    elif kind == "none":
+        tool_choice = "none"
+    elif kind == "tool" and isinstance(choice.get("name"), str):
+        tool_choice = {"type": "function", "function": {"name": choice["name"]}}
+    else:
+        raise APIError(400, "invalid Anthropic tool_choice")
+    return {"parallel_tool_calls": not disable_parallel, "tool_choice": tool_choice}
 
 
 def responses_response(model, job, status, output, result=None, error=None):

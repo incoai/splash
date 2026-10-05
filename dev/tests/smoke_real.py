@@ -30,6 +30,7 @@ sys.path.insert(0, str(ROOT))
 
 from install import assembly  # noqa: E402
 from install import models as model_artifacts  # noqa: E402
+from server import serve_options  # noqa: E402
 
 
 class SmokeFailure(RuntimeError):
@@ -1617,7 +1618,7 @@ def add_server_arguments(parser):
         type=Path,
         help="installed model package root (target, draft and tokenizer)",
     )
-    parser.add_argument("--model", type=model_artifacts.parse_model_id, required=True)
+    parser.add_argument("--model", type=serve_options.parse_model_id, required=True)
     parser.add_argument("--max-context", type=int)
     parser.add_argument("--max-memory")
     parser.add_argument("--max-cache-disk")

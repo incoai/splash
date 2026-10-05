@@ -8,18 +8,26 @@ from jsonschema import SchemaError
 from server import schema_validation as validation
 from server import tool_schema
 from server.errors import APIError
+from server.lru import LRUCache
+
+
+def empty_cache(name, budget=None, count=None):
+    """A patch of schema_validation's cache `name` with an empty one, of the
+    server's budget and entry count unless given."""
+    cache = getattr(validation, name)
+    return mock.patch.object(
+        validation,
+        name,
+        LRUCache(
+            cache.budget_bytes if budget is None else budget,
+            cache.capacity if count is None else count,
+        ),
+    )
 
 
 class ValidatorCacheTests(unittest.TestCase):
     def setUp(self):
-        self.clear()
-        self.addCleanup(self.clear)
-
-    @staticmethod
-    def clear():
-        with validation._validator_cache_lock:
-            validation._validator_cache.clear()
-            validation._validator_cache_bytes = 0
+        self.enterContext(empty_cache("_validator_cache"))
 
     def build(self, schema):
         return validation.build_validator(schema)
@@ -28,22 +36,17 @@ class ValidatorCacheTests(unittest.TestCase):
         for count, budget in ((2, 10000), (256, 180)):
             with (
                 self.subTest(count=count, budget=budget),
-                mock.patch.object(validation, "_VALIDATOR_CACHE_SIZE", count),
-                mock.patch.object(validation, "_VALIDATOR_CACHE_SOURCE_BYTES", budget),
+                empty_cache("_validator_cache", budget, count),
             ):
-                self.clear()
                 for i in range(20):
                     self.build({"type": "string", "description": str(i) + "x" * 30})
                     cache = validation._validator_cache
                     self.assertLessEqual(len(cache), count)
-                    self.assertLessEqual(validation._validator_cache_bytes, budget)
-                    self.assertEqual(
-                        validation._validator_cache_bytes,
-                        sum(len(key) for key in cache),
-                    )
+                    self.assertLessEqual(cache.bytes, budget)
+                    self.assertEqual(cache.bytes, sum(len(key) for key in cache))
 
     def test_cache_hit_refreshes_lru(self):
-        with mock.patch.object(validation, "_VALIDATOR_CACHE_SIZE", 2):
+        with empty_cache("_validator_cache", count=2):
             a, b, c = ({"const": i} for i in range(3))
             first = self.build(a)
             second = self.build(b)
@@ -53,13 +56,13 @@ class ValidatorCacheTests(unittest.TestCase):
             self.assertIsNot(second, self.build(b))
 
     def test_oversized_schema_is_validated_without_retention(self):
-        with mock.patch.object(validation, "_VALIDATOR_CACHE_SOURCE_BYTES", 100):
+        with empty_cache("_validator_cache", budget=100):
             schema = {"type": "integer", "description": "x" * 200}
             first = self.build(schema)
             self.assertTrue(first.is_valid(1))
             self.assertFalse(first.is_valid("1"))
             self.assertIsNot(first, self.build(schema))
-            self.assertEqual(validation._validator_cache_bytes, 0)
+            self.assertEqual(validation._validator_cache.bytes, 0)
             self.assertFalse(validation._validator_cache)
             with self.assertRaises(SchemaError):
                 self.build({**schema, "type": "invalid"})
@@ -69,7 +72,7 @@ class ValidatorCacheTests(unittest.TestCase):
             with self.assertRaises(SchemaError):
                 self.build({"type": "invalid"})
         self.assertFalse(validation._validator_cache)
-        self.assertEqual(validation._validator_cache_bytes, 0)
+        self.assertEqual(validation._validator_cache.bytes, 0)
 
     def test_unevaluated_properties_cannot_reach_unbounded_patterns(self):
         # jsonschema matches these patterns with the standard-library engine,
@@ -148,26 +151,15 @@ class ValidatorCacheTests(unittest.TestCase):
         ):
             results = list(pool.map(self.build, [{"type": "integer"}] * 4))
         self.assertTrue(all(v is results[0] for v in results))
-        self.assertEqual(len(validation._validator_cache), 1)
-        self.assertEqual(
-            validation._validator_cache_bytes,
-            sum(len(key) for key in validation._validator_cache),
-        )
+        cache = validation._validator_cache
+        self.assertEqual(len(cache), 1)
+        self.assertEqual(cache.bytes, sum(len(key) for key in cache))
 
 
 class SchemaCheckCacheTests(unittest.TestCase):
     def setUp(self):
-        self.clear()
-        self.addCleanup(self.clear)
-
-    @staticmethod
-    def clear():
-        with validation._checked_schemas_lock:
-            validation._checked_schemas.clear()
-            validation._checked_schemas_bytes = 0
-        with validation._validator_cache_lock:
-            validation._validator_cache.clear()
-            validation._validator_cache_bytes = 0
+        self.enterContext(empty_cache("_checked_schemas"))
+        self.enterContext(empty_cache("_validator_cache"))
 
     @staticmethod
     def tools(*schemas):
@@ -205,21 +197,16 @@ class SchemaCheckCacheTests(unittest.TestCase):
         for count, budget in ((2, 10000), (1024, 180)):
             with (
                 self.subTest(count=count, budget=budget),
-                mock.patch.object(validation, "_CHECKED_SCHEMAS_SIZE", count),
-                mock.patch.object(validation, "_CHECKED_SCHEMAS_SOURCE_BYTES", budget),
+                empty_cache("_checked_schemas", budget, count),
             ):
-                self.clear()
                 for i in range(20):
                     validation.check_schema(
                         {"type": "string", "description": str(i) + "x" * 30}
                     )
                     checked = validation._checked_schemas
                     self.assertLessEqual(len(checked), count)
-                    self.assertLessEqual(validation._checked_schemas_bytes, budget)
-                    self.assertEqual(
-                        validation._checked_schemas_bytes,
-                        sum(len(key) for key in checked),
-                    )
+                    self.assertLessEqual(checked.bytes, budget)
+                    self.assertEqual(checked.bytes, sum(len(key) for key in checked))
 
     def test_tools_take_schemas_only_a_validator_could_not_evaluate(self):
         # Calls are not validated, so a tool's schema need only be valid; a

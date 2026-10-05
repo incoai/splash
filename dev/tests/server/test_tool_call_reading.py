@@ -8,6 +8,7 @@ read as they do.
 import json
 import unittest
 
+from dev.tests.server_fixtures import FakeRuntime, Harness, anthropic_body
 from dev.tests.tool_output import (
     argument_grammar,
     project,
@@ -15,9 +16,14 @@ from dev.tests.tool_output import (
     streamed_text,
     tool_policy,
 )
+from server import json_codec
 from server import output as model_output
 from server import server as api
-from server.output import MAX_JSON_NESTING
+from server.output import MAX_ARGUMENTS_DEPTH
+
+# The deepest a parameter value reads as JSON: one level less than its call's
+# arguments.
+MAX_VALUE_DEPTH = MAX_ARGUMENTS_DEPTH - 1
 
 SCHEMAS = {
     "roll_cut": {
@@ -237,12 +243,12 @@ class ToolCallReadingTests(unittest.TestCase):
         )
 
     def test_json_values_have_an_explicit_nesting_limit(self):
-        allowed = "[" * MAX_JSON_NESTING + "0" + "]" * MAX_JSON_NESTING
-        deep_array = "[" * (MAX_JSON_NESTING + 1) + "0" + "]" * (MAX_JSON_NESTING + 1)
+        allowed = "[" * MAX_VALUE_DEPTH + "0" + "]" * MAX_VALUE_DEPTH
+        deep_array = "[" * (MAX_VALUE_DEPTH + 1) + "0" + "]" * (MAX_VALUE_DEPTH + 1)
         deep_object = (
-            '{"value":' * (MAX_JSON_NESTING + 1) + "0" + "}" * (MAX_JSON_NESTING + 1)
+            '{"value":' * (MAX_VALUE_DEPTH + 1) + "0" + "}" * (MAX_VALUE_DEPTH + 1)
         )
-        escaped = r"brackets in a string: \"[{]}\"" * (MAX_JSON_NESTING + 1)
+        escaped = r"brackets in a string: \"[{]}\"" * (MAX_VALUE_DEPTH + 1)
         convert = model_output.convert_value
         self.assertIsInstance(convert(allowed, {"array"}), list)
         # Too deep to write back, the value keeps its text.
@@ -250,6 +256,78 @@ class ToolCallReadingTests(unittest.TestCase):
         self.assertEqual(convert(deep_object, {"object"}), deep_object)
         # Text that reads as none of the types is the JSON value it spells.
         self.assertEqual(convert(json.dumps(escaped), {"integer"}), escaped)
+        # The arguments of a call holding the deepest value read back.
+        _, calls, _ = project(
+            "<tool_call>\n<function=f>\n"
+            f"<parameter=value>\n{allowed}\n</parameter>\n"
+            "</function>\n</tool_call>",
+            tool_policy({"f": {}}),
+        )
+        arguments = json_codec.loads(calls[0]["function"]["arguments"])
+        self.assertEqual(arguments, {"value": json.loads(allowed)})
+
+    def test_the_deepest_arguments_read_back_in_a_messages_history(self):
+        # A Messages history carries a call's arguments as an object five
+        # levels into the request's body, deeper than any other request does.
+        harness = Harness(FakeRuntime())
+        self.addCleanup(harness.close)
+
+        def history(arguments):
+            return anthropic_body(
+                tools=[{"name": "f", "input_schema": {"type": "object"}}],
+                messages=[
+                    {"role": "user", "content": "hello"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_1",
+                                "name": "f",
+                                "input": arguments,
+                            }
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "toolu_1",
+                                "content": "ok",
+                            }
+                        ],
+                    },
+                ],
+            )
+
+        for depth in (MAX_VALUE_DEPTH, MAX_VALUE_DEPTH + 1):
+            with self.subTest(depth=depth):
+                value = "[" * depth + "0" + "]" * depth
+                _, calls, _ = project(
+                    "<tool_call>\n<function=f>\n"
+                    f"<parameter=value>\n{value}\n</parameter>\n"
+                    "</function>\n</tool_call>",
+                    tool_policy({"f": {}}),
+                )
+                # The input a complete Messages response holds.
+                arguments = json_codec.loads(calls[0]["function"]["arguments"])
+                # A value one level deeper keeps its text.
+                expected = json.loads(value) if depth == MAX_VALUE_DEPTH else value
+                self.assertEqual(arguments, {"value": expected})
+                status, _, payload = harness.request(
+                    "POST", "/v1/messages", history(arguments)
+                )
+                self.assertEqual(status, 200, payload)
+        # Arguments one level deeper than the server writes would not read back.
+        deeper = {
+            "value": json.loads(
+                "[" * MAX_ARGUMENTS_DEPTH + "0" + "]" * MAX_ARGUMENTS_DEPTH
+            )
+        }
+        self.assertEqual(
+            harness.request("POST", "/v1/messages", history(deeper))[0], 400
+        )
 
     def test_tool_parser_preserves_schema_typed_strings(self):
         schema = {

@@ -3,7 +3,6 @@
 import copy
 import json
 import threading
-from collections import OrderedDict
 from functools import lru_cache
 
 import attrs
@@ -13,6 +12,7 @@ from jsonschema.exceptions import UndefinedTypeCheck
 from referencing import Registry
 
 from .errors import APIError
+from .lru import LRUCache
 
 
 class SchemaEvaluationError(Exception):
@@ -171,20 +171,15 @@ def _bounded_class(base):
     return bounded
 
 
-_VALIDATOR_CACHE_SIZE = 256
-_VALIDATOR_CACHE_SOURCE_BYTES = 8 * 1024 * 1024
+# The validators build_validator has built, by their schemas' sources.
 _validator_cache_lock = threading.Lock()
-_validator_cache = OrderedDict()
-_validator_cache_bytes = 0
+_validator_cache = LRUCache(8 * 1024 * 1024, capacity=256)
 # Empty: callers refuse remote references, so a schema refers only to itself.
 _REGISTRY = Registry()
-# The sources of the schemas check_schema has passed, the least recently
-# checked first, apart from the validators response formats keep.
-_CHECKED_SCHEMAS_SIZE = 1024
-_CHECKED_SCHEMAS_SOURCE_BYTES = 8 * 1024 * 1024
+# The sources of the schemas check_schema has passed, apart from the
+# validators response formats keep.
 _checked_schemas_lock = threading.Lock()
-_checked_schemas = OrderedDict()
-_checked_schemas_bytes = 0
+_checked_schemas = LRUCache(8 * 1024 * 1024, capacity=1024)
 
 
 def check_schema(schema):
@@ -192,32 +187,17 @@ def check_schema(schema):
 
     A tool's schema needs no other check, as its calls are not validated, and
     a client sends its tools on every turn, so those that pass are kept."""
-    global _checked_schemas_bytes
     # json.dumps uses ASCII escapes, so character count equals source bytes.
     key = json.dumps(schema, sort_keys=True)
     with _checked_schemas_lock:
-        if key in _checked_schemas:
-            _checked_schemas.move_to_end(key)
+        if _checked_schemas.get(key):
             return
     validators.validator_for(schema).check_schema(schema)
-    if len(key) > _CHECKED_SCHEMAS_SOURCE_BYTES:
-        return
     with _checked_schemas_lock:
-        # Another preparation thread may have checked the same schema.
-        if key in _checked_schemas:
-            return
-        _checked_schemas[key] = None
-        _checked_schemas_bytes += len(key)
-        while (
-            len(_checked_schemas) > _CHECKED_SCHEMAS_SIZE
-            or _checked_schemas_bytes > _CHECKED_SCHEMAS_SOURCE_BYTES
-        ):
-            evicted_key, _ = _checked_schemas.popitem(last=False)
-            _checked_schemas_bytes -= len(evicted_key)
+        _checked_schemas.put(key, True, len(key))
 
 
 def build_validator(schema):
-    global _validator_cache_bytes
     # check_schema walks the whole JSON Schema meta-schema; a response_format
     # schema is the same on every turn of a conversation, so cache the built
     # validator instead of re-validating and rebuilding it.
@@ -225,9 +205,8 @@ def build_validator(schema):
     key = json.dumps(schema, sort_keys=True)
     with _validator_cache_lock:
         cached = _validator_cache.get(key)
-        if cached is not None:
-            _validator_cache.move_to_end(key)
-            return cached
+    if cached is not None:
+        return cached
     base = validators.validator_for(schema)
     base.check_schema(schema)
     # Draft 3 accepts any type name, and validation fails on one the dialect
@@ -257,20 +236,10 @@ def build_validator(schema):
                 raise APIError(400, "mixed schema dialects are not supported")
             node.pop("$schema")
     validator = _bounded_class(base)(validated, registry=_REGISTRY)
-    if len(key) > _VALIDATOR_CACHE_SOURCE_BYTES:
-        return validator
     with _validator_cache_lock:
         # Another preparation thread may have filled the same miss.
         cached = _validator_cache.get(key)
         if cached is not None:
-            _validator_cache.move_to_end(key)
             return cached
-        _validator_cache[key] = validator
-        _validator_cache_bytes += len(key)
-        while (
-            len(_validator_cache) > _VALIDATOR_CACHE_SIZE
-            or _validator_cache_bytes > _VALIDATOR_CACHE_SOURCE_BYTES
-        ):
-            evicted_key, _ = _validator_cache.popitem(last=False)
-            _validator_cache_bytes -= len(evicted_key)
+        _validator_cache.put(key, validator, len(key))
     return validator

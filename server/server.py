@@ -6,20 +6,20 @@ import math
 import os
 import queue
 import re
+import resource
 import secrets
 import select
 import signal
 import socket
 import sys
-import threading
 import time
 from dataclasses import dataclass
 from functools import partial
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import unquote
 
-from huggingface_hub.utils import validate_repo_id
 from transformers import AutoTokenizer
 
 from . import images as image_input
@@ -45,18 +45,13 @@ from .api_shapes import (
 )
 from .backend import NativeBackend, NativeResult, remaining_request_time
 from .chat_templates import ChatTemplateError, ChatTemplates
-from .connections import (
-    ConnectionSlots,
-    HttpAdmission,
-    LingeringCloser,
-    RequestBodyReservation,
-    refuse_connection,
-)
+from .connections import ConnectionSlots, HttpAdmission, RequestBodyReservation
 from .constraints import ConstraintFactory, validate_tokenizer
 from .diagnostics import log_unexpected, print_request, print_status
 from .errors import (
     ANTHROPIC_ERRORS,
     OPENAI_ERRORS,
+    RETRY_STATUSES,
     SYSTEMONE_ERRORS,
     APIError,
     ErrorDialect,
@@ -92,6 +87,11 @@ HTTP_UPLOAD_BYTES_PER_SECOND = 512 * 1024
 CLIENT_DISCONNECT_POLL = 0.1
 # How long a connection refused unread may take its client to close.
 REFUSED_LINGER_SECONDS = 2.0
+# The soft descriptor limit the server raises its own to: macOS starts a
+# process with 256, fewer than its connection slots, the refused connections
+# lingering after a burst and the engine's pipes and files can need. 10240 is
+# macOS's OPEN_MAX.
+DESCRIPTOR_LIMIT = 10240
 SSE_KEEPALIVE_SECONDS = 2.0
 NATIVE_START_TIMEOUT = 600.0
 ROOT = Path(__file__).parents[1]
@@ -200,6 +200,17 @@ POST_ROUTES = {
 }
 
 
+def path_errors(path):
+    """How every error on `path` is answered, whatever its method and
+    whether it arises before a handler runs or in one: as the API of its
+    POST route answers it, on Anthropic's other paths, those under
+    /v1/messages, as that API does, and elsewhere as OpenAI's."""
+    route = POST_ROUTES.get(path)
+    if route is not None:
+        return route.errors
+    return ANTHROPIC_ERRORS if path.startswith("/v1/messages/") else OPENAI_ERRORS
+
+
 @dataclass(slots=True)
 class Collected:
     """A generation as FrontendHandler._collect gathered it."""
@@ -228,15 +239,8 @@ class FrontendHandler(BaseHTTPRequestHandler):
         self._last_sse_write = time.monotonic()
         super().setup()
         self.connection.settimeout(HTTP_IO_TIMEOUT)
-        self._header_timer = threading.Timer(HTTP_IO_TIMEOUT, self._expire_headers)
-        self._header_timer.daemon = True
-        self._header_timer.start()
-
-    def _expire_headers(self):
-        self.server.connections.expire(self.connection)
 
     def finish(self):
-        self._header_timer.cancel()
         if self._unread_body:
             self._discard_unread_body()
         super().finish()
@@ -266,14 +270,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         pass
 
     def parse_request(self):
-        try:
-            parsed = super().parse_request()
-        finally:
-            self._header_timer.cancel()
-        if not self.server.connections.serving(self.connection):
-            self.close_connection = True
-            return False
-        if not parsed:
+        if not super().parse_request():
             return False
         if self.request_version not in {"HTTP/1.0", "HTTP/1.1"}:
             self.close_connection = True
@@ -310,7 +307,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             if isinstance(error, OriginRefused):
                 self.server.refused_origins.report(error.origin)
             self.close_connection = True
-            self._safe_error(error, self._path_errors(), log=False)
+            self._safe_error(error, log=False)
             return False
         return True
 
@@ -319,12 +316,13 @@ class FrontendHandler(BaseHTTPRequestHandler):
         # route and parse_request's 505, writes an HTML page. After a request
         # line it cannot parse, or HTTP/0.9's, request_version is HTTP/0.9,
         # and it writes that page with no status line or headers. Answer as
-        # any other error, over HTTP/1.1.
+        # any other error, over HTTP/1.1, a method or version the server does
+        # not implement as a server error.
         self.request_version = self.protocol_version
+        status = HTTPStatus(code)
+        error_code = status.name.lower() if code >= 500 else "invalid_request_error"
         self._safe_error(
-            APIError(code, message or self.responses[code][0]),
-            self._path_errors(),
-            log=False,
+            APIError(code, message or status.phrase, error_code), log=False
         )
 
     @property
@@ -337,12 +335,10 @@ class FrontendHandler(BaseHTTPRequestHandler):
         all read it; empty before a request line parses."""
         return _normalize_path(getattr(self, "path", ""))
 
-    def _path_errors(self):
-        """How errors are answered that no route answers: as Anthropic's API
-        answers them on its paths, else as OpenAI's."""
-        return (
-            ANTHROPIC_ERRORS if self.route.startswith("/v1/messages") else OPENAI_ERRORS
-        )
+    @property
+    def errors(self):
+        """How errors on the request's path are answered (path_errors)."""
+        return path_errors(self.route)
 
     def end_headers(self):
         # A browser hands a page the response from another origin only when
@@ -358,9 +354,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
             )
         super().end_headers()
 
-    def _send(self, status, data, content_type, *, retry_after=False):
+    def _send(self, status, data, content_type):
         self.send_response(status)
-        if retry_after:
+        if status in RETRY_STATUSES:
             self.send_header("Retry-After", "1")
         if status == 401:
             self.send_header("WWW-Authenticate", "Bearer")
@@ -379,33 +375,32 @@ class FrontendHandler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(data)
 
-    def _json(self, status, payload, *, retry_after=False):
+    def _json(self, status, payload):
         try:
             data = json_codec.encode(payload)
         except json_codec.JSONEncodingError as error:
             log_unexpected(error)
             self._safe_error(
                 APIError(500, "internal server error", "internal_server_error"),
-                self._path_errors(),
                 log=False,
             )
             return
-        self._send(status, data, "application/json", retry_after=retry_after)
+        self._send(status, data, "application/json")
 
     def _log_api_error(self, code):
         path = "".join(char if char.isprintable() else "?" for char in self.route)
         print_status(f"Error · {code} · {self.command} {path[:256]}", error=True)
 
-    def _safe_error(self, error, errors=OPENAI_ERRORS, *, log=True):
-        """Answer with `error` as the API whose `errors` dialect it is answers
-        it, unless the response has begun."""
+    def _safe_error(self, error, *, log=True):
+        """Answer with `error` as its path's API answers it, unless the
+        response has begun."""
         if self._response_started:
             return
-        status, code, payload = errors.answer(error)
+        status, code, payload = self.errors.answer(error)
         if log:
             self._log_api_error(code)
         try:
-            self._json(status, payload, retry_after=error.retryable)
+            self._json(status, payload)
         except (BrokenPipeError, ConnectionResetError, TimeoutError):
             pass
 
@@ -470,9 +465,8 @@ class FrontendHandler(BaseHTTPRequestHandler):
             text = payload.decode(json.detect_encoding(payload), "surrogatepass")
             payload.clear()
             body = json_codec.loads(text)
-        except (ValueError, RecursionError):
-            # Text that is not JSON, or JSON nested deeper than the parser
-            # reads.
+        except ValueError:
+            # Text that is not JSON, or JSON nested past json_codec.MAX_DEPTH.
             raise RequestValidationError(
                 [field_error([], "invalid JSON request body")]
             ) from None
@@ -522,9 +516,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         if path == "/ready":
             ready = self.app.backend.is_ready()
             self._json(
-                200 if ready else 503,
-                {"status": "ready" if ready else "unavailable"},
-                retry_after=not ready,
+                200 if ready else 503, {"status": "ready" if ready else "unavailable"}
             )
             return
         if path == "/status":
@@ -610,7 +602,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             return
         refusal = None if route.prompt_only else self.app.backend.refusal()
         if refusal is not None:
-            self._safe_error(refusal, route.errors, log=False)
+            self._safe_error(refusal, log=False)
             return
         # Hold one ingress slot through body parsing, preparation, and the
         # complete response. Slow uploads/readers cannot accumulate outside
@@ -624,8 +616,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     503,
                     "frontend request capacity is exhausted",
                     "frontend_overloaded",
-                ),
-                route.errors,
+                )
             )
             return
         self._body_reservation = None
@@ -640,28 +631,24 @@ class FrontendHandler(BaseHTTPRequestHandler):
         except TimeoutError:
             self._cancel_submitted()
             error = APIError(408, "HTTP I/O timed out", "request_timeout")
-            self._safe_error(error, route.errors, log=self._submitted is None)
+            self._safe_error(error, log=self._submitted is None)
         except APIError as error:
             self._cancel_submitted()
             # The native outcome was already logged; a server-side failure
             # after submission must still reach the console.
-            self._safe_error(
-                error,
-                route.errors,
-                log=self._submitted is None or error.status >= 500,
-            )
+            self._safe_error(error, log=self._submitted is None or error.status >= 500)
         except Exception as error:
             self._cancel_submitted()
             log_unexpected(error)
             error = APIError(500, "internal server error", "internal_server_error")
-            self._safe_error(error, route.errors, log=False)
+            self._safe_error(error, log=False)
         finally:
             if self._body_reservation is not None:
                 self._body_reservation.release()
                 self._body_reservation = None
-            # The handler, in a reference cycle with its header timer,
-            # outlives the request; the job must not, as freeing it returns
-            # the input it retains.
+            # The handler outlives the request, through what finish()
+            # still reads of an upload refused unread; the job must not, as
+            # freeing it returns the input it retains.
             self._submitted = None
             admission.release()
             self.app.latencies.observe("http_request", time.monotonic() - started_at)
@@ -1086,7 +1073,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             send("message_stop", {})
 
         def send_error(error):
-            self._event_sse("error", ANTHROPIC_ERRORS.payload(error))
+            self._event_sse("error", self.errors.payload(error))
 
         self._guarded_stream(job, run, send_error)
 
@@ -1153,7 +1140,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         self._write_sse(b": splash-keepalive\n\n")
 
     def _sse_error(self, error):
-        self._sse(OPENAI_ERRORS.payload(error))
+        self._sse(self.errors.payload(error))
         self._sse("[DONE]")
 
     def _guarded_stream(self, job, run, send_error):
@@ -1354,11 +1341,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     job,
                     "failed",
                     output,
-                    error={
-                        "type": error.protocol_type(),
-                        "code": error.code,
-                        "message": error.message,
-                    },
+                    error=self.errors.payload(error)["error"],
                 ),
             )
 
@@ -1423,8 +1406,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         self._guarded_stream(job, run, self._sse_error)
 
 
-class FrontendServer(ThreadingHTTPServer):
-    daemon_threads = True
+class FrontendServer(HTTPServer):
     allow_reuse_address = True
     # Connections the kernel holds until the accept loop takes them. A burst
     # beyond this queue is reset by the kernel, unseen by the server, so ask
@@ -1434,9 +1416,13 @@ class FrontendServer(ThreadingHTTPServer):
     # Keep control/catalog capacity separate from generation capacity.
     # Neither gate allocates workers in advance.
     control_connection_capacity = 64
-    # Connections refused at the accept that wait at once, on one thread,
-    # for their clients to close.
-    refused_connection_capacity = 64
+    # Connections answered without their requests read that wait at once,
+    # on one thread, for their clients to close. A burst refuses all that
+    # arrive while every slot is held, and a client that sends its request
+    # after its connection closed is reset before it reads the 503, so
+    # enough linger for a burst well beyond the kernel's queue, within the
+    # descriptors the server raises its limit to.
+    refused_connection_capacity = 1024
 
     def __init__(
         self,
@@ -1475,10 +1461,10 @@ class FrontendServer(ThreadingHTTPServer):
         self.requests = HttpAdmission(request_capacity)
         self.token_counts = HttpAdmission(request_capacity)
         self.connections = ConnectionSlots(
-            request_capacity + self.control_connection_capacity
-        )
-        self.refused = LingeringCloser(
-            self.refused_connection_capacity, REFUSED_LINGER_SECONDS
+            request_capacity + self.control_connection_capacity,
+            self._serve_connection,
+            self.refused_connection_capacity,
+            REFUSED_LINGER_SECONDS,
         )
         super().__init__(address, FrontendHandler, bind_and_activate)
         self.app = app
@@ -1502,14 +1488,51 @@ class FrontendServer(ThreadingHTTPServer):
         }
         return status
 
+    def server_activate(self):
+        super().server_activate()
+        # accept() then returns at once when the kernel holds no connection.
+        self.socket.setblocking(False)
+
+    def _handle_request_noblock(self):
+        """Take every connection the kernel holds at each wakeup of the accept
+        loop, as asyncio's accept does, not one: a burst arrives faster than a
+        select per connection takes it, and macOS resets what overflows the
+        kernel's queue."""
+        while True:
+            try:
+                request, client_address = self.get_request()
+            except OSError:
+                return
+            # macOS gives a connection accepted from a nonblocking socket that
+            # socket's mode.
+            request.setblocking(True)
+            if not self.verify_request(request, client_address):
+                self.shutdown_request(request)
+                continue
+            try:
+                self.process_request(request, client_address)
+            except Exception:
+                self.handle_error(request, client_address)
+                self.shutdown_request(request)
+            except BaseException:
+                self.shutdown_request(request)
+                raise
+
     def process_request(self, request, client_address):
-        if not self.connections.admit(request):
-            # Do not create a thread or block the accept loop to reject an
-            # excess socket.
-            refuse_connection(request)
-            self.refused.close(request)
-            return
-        super().process_request(request, client_address)
+        if not self.connections.admit(
+            request, client_address, time.monotonic() + HTTP_IO_TIMEOUT
+        ):
+            self.connections.refuse(request)
+
+    def _serve_connection(self, request, client_address):
+        """Serve the connection `request`, ready for its thread, on a
+        connection worker, as ThreadingMixIn's thread for a request does."""
+        try:
+            self.finish_request(request, client_address)
+        except Exception:
+            self.handle_error(request, client_address)
+        finally:
+            self.shutdown_request(request)
 
     def shutdown_request(self, request):
         self.connections.release(request)
@@ -1517,7 +1540,7 @@ class FrontendServer(ThreadingHTTPServer):
 
     def server_close(self):
         super().server_close()
-        self.refused.stop()
+        self.connections.stop()
         self.connections.idle.wait(min(2.0, HTTP_IO_TIMEOUT))
 
     def handle_error(self, request, client_address):
@@ -1525,23 +1548,6 @@ class FrontendServer(ThreadingHTTPServer):
         if isinstance(error, (BrokenPipeError, ConnectionResetError)):
             return
         super().handle_error(request, client_address)
-
-
-def _parse_model_id(value):
-    repo_id, separator, variant = value.partition(":")
-    if repo_id.count("/") != 1:
-        raise argparse.ArgumentTypeError(
-            "use a full Hugging Face repository ID: owner/repo[:variant]"
-        )
-    try:
-        validate_repo_id(repo_id)
-    except ValueError as error:
-        raise argparse.ArgumentTypeError(str(error)) from None
-    if separator and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", variant):
-        raise argparse.ArgumentTypeError(
-            "model variant must be a short name such as UD-Q4_K_M"
-        )
-    return value
 
 
 def parse_args(argv=None):
@@ -1553,9 +1559,12 @@ def parse_args(argv=None):
     )
     parser.add_argument("--tokenizer", required=True)
     parser.add_argument(
-        "--model", type=_parse_model_id, required=True, metavar="OWNER/REPO"
+        "--model",
+        type=serve_options.parse_model_id,
+        required=True,
+        metavar="OWNER/REPO",
     )
-    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--port", type=int, default=serve_options.DEFAULT_PORT)
     parser.add_argument("--binary", default=str(ROOT / "build" / "splash"))
     serve_options.add_serve_arguments(parser)
     args = parser.parse_args(argv)
@@ -1596,6 +1605,17 @@ def _native_command(args):
     return command
 
 
+def _raise_descriptor_limit():
+    """Raise the soft descriptor limit to DESCRIPTOR_LIMIT, or to the hard
+    limit when that is lower; a higher soft limit stays."""
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    wanted = DESCRIPTOR_LIMIT
+    if hard != resource.RLIM_INFINITY:
+        wanted = min(wanted, hard)
+    if soft < wanted:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (wanted, hard))
+
+
 def _interrupt(_signum, _frame):
     raise KeyboardInterrupt
 
@@ -1614,6 +1634,7 @@ def main():
         # The launcher blocks both across its exec: one sent while this module
         # imported arrives here and ends the startup cleanly.
         signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGINT, signal.SIGTERM))
+        _raise_descriptor_limit()
         # Bind before loading the tokenizer or model so duplicates fail early.
         # Activate only after the runtime is ready, keeping a partially started
         # service from receiving requests.

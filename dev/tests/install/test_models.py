@@ -22,6 +22,7 @@ from huggingface_hub.hf_api import RepoSibling
 from dev.tests.installer_fixtures import http_error
 from install import hub, legacy
 from install import models as installer
+from server import serve_options
 
 
 class ModelArtifactTest(unittest.TestCase):
@@ -156,7 +157,7 @@ class ModelArtifactTest(unittest.TestCase):
         ):
             with self.subTest(model=model_id):
                 self.assertEqual(installer.validate_repo_id(model_id), model_id)
-                self.assertEqual(installer.parse_model_id(model_id), model_id)
+                self.assertEqual(serve_options.parse_model_id(model_id), model_id)
                 self.assertEqual(
                     installer.selection_link(self.root, model_id), self.root / model_id
                 )
@@ -201,7 +202,7 @@ class ModelArtifactTest(unittest.TestCase):
         with self.assertRaises(installer.ModelError):
             installer.validate_repo_id(None)
         with self.assertRaises(argparse.ArgumentTypeError):
-            installer.parse_model_id("short-name")
+            serve_options.parse_model_id("short-name")
 
     def test_a_selection_validates_its_model_before_creating_paths(self):
         models = self.root / "uncreated"
@@ -690,14 +691,14 @@ class ModelArtifactTest(unittest.TestCase):
         )
         self.assertEqual(installer.split_model_id("owner/repo"), ("owner/repo", None))
         self.assertEqual(
-            installer.parse_model_id("owner/repo:UD-Q4_K_M"),
+            serve_options.parse_model_id("owner/repo:UD-Q4_K_M"),
             "owner/repo:UD-Q4_K_M",
         )
         for bad in ("owner/repo:", "owner/repo:a b", "owner/repo:..", "owner:v"):
             with self.assertRaises(installer.ModelError):
                 installer.split_model_id(bad)
         with self.assertRaises(argparse.ArgumentTypeError):
-            installer.parse_model_id("owner/repo:")
+            serve_options.parse_model_id("owner/repo:")
         models = self.root / "models"
         self.assertEqual(
             installer.selection_link(models, "owner/repo:UD-Q4_K_M"),

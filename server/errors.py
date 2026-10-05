@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+# The statuses of a refusal the client may retry shortly, which a response
+# invites with Retry-After: the server is overloaded, restarting its engine
+# or shutting down. Each API answers these with 503, /v1/systemone with 529.
+RETRY_STATUSES = (503, 529)
+
 
 class APIError(Exception):
     def __init__(self, status, message, code="invalid_request_error"):
@@ -7,29 +12,6 @@ class APIError(Exception):
         self.status = status
         self.message = message
         self.code = code
-
-    @property
-    def retryable(self):
-        """Whether the same request may succeed when retried shortly: the
-        server is overloaded, restarting its engine or shutting down. It
-        reports each with 503, whatever status an API answers it with."""
-        return self.status == 503
-
-    def protocol_type(self, anthropic=False):
-        if not anthropic:
-            return "server_error" if self.status >= 500 else "invalid_request_error"
-        return {
-            401: "authentication_error",
-            403: "permission_error",
-            404: "not_found_error",
-            408: "timeout_error",
-            413: "request_too_large",
-            429: "rate_limit_error",
-            503: "overloaded_error",
-            504: "timeout_error",
-        }.get(
-            self.status, "api_error" if self.status >= 500 else "invalid_request_error"
-        )
 
 
 class RequestValidationError(APIError):
@@ -64,8 +46,8 @@ class ContextLengthError(APIError):
 
 
 class ErrorDialect:
-    """How an API answers errors; this one, OpenAI's, also answers requests
-    no other API's route takes."""
+    """How an API answers errors; this one, OpenAI's, also answers on the
+    paths of no other API (server.path_errors)."""
 
     def answer(self, error):
         """The status of the response that answers `error`, the code the
@@ -74,16 +56,26 @@ class ErrorDialect:
 
     def payload(self, error):
         """`error` as a response or an event stream carries it."""
+        error_type = "server_error" if error.status >= 500 else "invalid_request_error"
         return {
-            "error": {
-                "message": error.message,
-                "type": error.protocol_type(),
-                "code": error.code,
-            }
+            "error": {"message": error.message, "type": error_type, "code": error.code}
         }
 
 
 class AnthropicErrors(ErrorDialect):
+    # The type of an error of each status Anthropic's API names one for; any
+    # other is an api_error from 500, else an invalid_request_error.
+    TYPES = {
+        401: "authentication_error",
+        403: "permission_error",
+        404: "not_found_error",
+        408: "timeout_error",
+        413: "request_too_large",
+        429: "rate_limit_error",
+        503: "overloaded_error",
+        504: "timeout_error",
+    }
+
     def payload(self, error):
         message = error.message
         if isinstance(error, ContextLengthError):
@@ -93,10 +85,11 @@ class AnthropicErrors(ErrorDialect):
             )
             if error.image_tokens_only:
                 message += " (image tokens alone; text not yet counted)"
-        return {
-            "type": "error",
-            "error": {"type": error.protocol_type(True), "message": message},
-        }
+        error_type = self.TYPES.get(
+            error.status,
+            "api_error" if error.status >= 500 else "invalid_request_error",
+        )
+        return {"type": "error", "error": {"type": error_type, "message": message}}
 
 
 class SystemOneErrors(ErrorDialect):

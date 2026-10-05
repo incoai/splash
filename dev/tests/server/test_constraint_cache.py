@@ -67,9 +67,9 @@ class ConstraintCacheTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=8) as pool:
             results = list(pool.map(factory.create, (str(i) for i in range(200))))
         self.assertEqual(results, [str(i) for i in range(200)])
-        self.assertLessEqual(factory.source_bytes, 12)
+        self.assertLessEqual(factory.cache.bytes, 12)
         self.assertEqual(
-            factory.source_bytes, sum(len(key.encode()) for key in factory.cache)
+            factory.cache.bytes, sum(len(key.encode()) for key in factory.cache)
         )
         self.assertLessEqual(len(factory.cache), factory.CACHE_SIZE)
 

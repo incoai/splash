@@ -800,11 +800,14 @@ class ChatTemplateFrontendTests(unittest.TestCase):
         )
         tokenizer.templates.clear()
         judgment, _ = app.prepare_judgment(
-            fixtures.judgment_body(), deadline=fixtures.FOREVER
+            fixtures.judgment_body(),
+            deadline=fixtures.FOREVER,
+            disconnected=fixtures.stays_connected,
         )
         systemone = app.prepare_systemone(
             {"model": "test-model", "state": {}, "questions": {"q": {"type": "noul"}}},
             deadline=fixtures.FOREVER,
+            disconnected=fixtures.stays_connected,
         )
         for job in (judgment, systemone[0][2]):
             prompt = tokenizer.decode(job.prompt_tokens)

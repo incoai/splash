@@ -17,6 +17,7 @@ from unittest import mock
 
 from dev.tests.server_fixtures import keep_stop_signals, server_arguments
 from install import launcher
+from server import serve_options
 from server import server as api
 
 MODEL_ID = "community/custom-splash"
@@ -185,7 +186,7 @@ class LauncherTests(unittest.TestCase):
             owner = {
                 "pid": os.getpid(),
                 "model": MODEL_ID,
-                "port": launcher.PORT,
+                "port": serve_options.DEFAULT_PORT,
             }
 
             def check_install(chosen):
@@ -200,7 +201,7 @@ class LauncherTests(unittest.TestCase):
                     served = api.parse_args(server_arguments(argv))
                 self.assertEqual(
                     (served.binary, served.model, served.port),
-                    (str(launcher.paths.BINARY), MODEL_ID, launcher.PORT),
+                    (str(launcher.paths.BINARY), MODEL_ID, serve_options.DEFAULT_PORT),
                 )
                 self.assertEqual(
                     (served.max_context, served.max_memory, served.kv_format),
@@ -497,6 +498,17 @@ class LauncherTests(unittest.TestCase):
                 )
                 with self.assertRaises(SystemExit):
                     launcher.parse_args(["serve", "--model", MODEL_ID, "--port", value])
+
+    def test_serve_help_names_the_default_port(self):
+        with (
+            mock.patch.dict(os.environ),
+            mock.patch.object(serve_options, "DEFAULT_PORT", 8123),
+            mock.patch("sys.stdout", io.StringIO()) as output,
+        ):
+            os.environ.pop("SPLASH_PORT", None)
+            with self.assertRaises(SystemExit):
+                launcher.parse_args(["serve", "--help"])
+        self.assertIn("SPLASH_PORT or 8123", " ".join(output.getvalue().split()))
 
     def test_distinct_ports_have_independent_locks_and_same_port_is_rejected(self):
         with tempfile.TemporaryDirectory() as temporary, socket.socket() as listener:

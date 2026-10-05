@@ -1,7 +1,6 @@
 """Tokenizer contract and cached token-level output constraints."""
 
 import threading
-from collections import OrderedDict
 from concurrent.futures import Future, wait
 
 from llguidance import LLExecutor, LLMatcher, LLTokenizer
@@ -14,6 +13,7 @@ from llguidance.numpy import (
 
 from . import runtime as engine_runtime
 from .errors import APIError, ConstraintError
+from .lru import LRUCache
 from .tool_schema import (
     THINK_END,
     THINK_END_TOKEN_ID,
@@ -156,8 +156,8 @@ class ConstraintFactory:
             slices=LLTokenizer.json_slices(),
         )
         self.executor = LLExecutor()
-        self.source_bytes = 0
-        self.cache = OrderedDict()
+        # Compiled matchers by grammar, within a budget of grammar bytes.
+        self.cache = LRUCache(self.CACHE_SOURCE_BYTES, self.CACHE_SIZE)
         self.lock = threading.Lock()
         self.pending = {}
         self.hits = 0
@@ -178,9 +178,8 @@ class ConstraintFactory:
         with self.lock:
             cached = self.cache.get(grammar)
             if cached is not None:
-                self.cache.move_to_end(grammar)
                 self.hits += 1
-                return cached[0]
+                return cached
             pending = self.pending.get(grammar)
             owner = pending is None
             if owner:
@@ -190,8 +189,8 @@ class ConstraintFactory:
                 raise APIError(504, "request timed out", "request_timeout")
             matcher = pending.result()
             with self.lock:
-                if grammar in self.cache:
-                    self.cache.move_to_end(grammar)
+                # The shared matcher, if kept, is now the most recently used.
+                self.cache.get(grammar)
                 self.hits += 1
             return matcher
         try:
@@ -209,15 +208,7 @@ class ConstraintFactory:
             # This bounds source bytes; LLGuidance bounds compiler complexity.
             with self.lock:
                 self.misses += 1
-                if size <= self.CACHE_SOURCE_BYTES:
-                    self.cache[grammar] = (matcher, size)
-                    self.source_bytes += size
-                    while (
-                        len(self.cache) > self.CACHE_SIZE
-                        or self.source_bytes > self.CACHE_SOURCE_BYTES
-                    ):
-                        _, (_, evicted_size) = self.cache.popitem(last=False)
-                        self.source_bytes -= evicted_size
+                self.cache.put(grammar, matcher, size)
             pending.set_result(matcher)
             return matcher
         except BaseException as error:
@@ -231,9 +222,9 @@ class ConstraintFactory:
         with self.lock:
             return {
                 "entries": len(self.cache),
-                "capacity": self.CACHE_SIZE,
-                "source_bytes": self.source_bytes,
-                "source_budget_bytes": self.CACHE_SOURCE_BYTES,
+                "capacity": self.cache.capacity,
+                "source_bytes": self.cache.bytes,
+                "source_budget_bytes": self.cache.budget_bytes,
                 "hits": self.hits,
                 "misses": self.misses,
             }

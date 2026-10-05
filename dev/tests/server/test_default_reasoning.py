@@ -131,7 +131,9 @@ class DefaultReasoningTests(unittest.TestCase):
             job = harness.app.prepare(fixtures.chat_body(), deadline=fixtures.FOREVER)
             self.assertEqual(job.thinking, default)
             job = harness.app.prepare_responses(
-                fixtures.responses_body(), deadline=fixtures.FOREVER
+                fixtures.responses_body(),
+                deadline=fixtures.FOREVER,
+                reserve_input=fixtures.reserve_unbounded,
             )
             self.assertEqual(job.thinking, default)
 
@@ -142,7 +144,9 @@ class DefaultReasoningTests(unittest.TestCase):
                 effort, tokenizer=fixtures.CharTokenizer(), max_context=8192
             )
             job, _ = harness.app.prepare_judgment(
-                fixtures.judgment_body(), deadline=fixtures.FOREVER
+                fixtures.judgment_body(),
+                deadline=fixtures.FOREVER,
+                disconnected=fixtures.stays_connected,
             )
             self.assertFalse(job.thinking)
             jobs.append((job.prompt_tokens, job.score_tokens))
@@ -153,6 +157,7 @@ class DefaultReasoningTests(unittest.TestCase):
                     "questions": {"q": {"type": "noul"}},
                 },
                 deadline=fixtures.FOREVER,
+                disconnected=fixtures.stays_connected,
             )
             self.assertFalse(systemone[0][2].thinking)
         self.assertEqual(jobs, [jobs[0]] * 3)

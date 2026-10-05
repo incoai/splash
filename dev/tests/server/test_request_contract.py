@@ -20,12 +20,14 @@ from dev.tests.server_fixtures import (
     Harness,
     HarnessTestCase,
     chat_body,
+    empty_page_cache,
     no_signed_thinking,
     pdf_bytes,
     request,
+    reserve_unbounded,
     responses_body,
 )
-from server import documents, runtime, schema_validation, tool_schema
+from server import documents, json_codec, runtime, schema_validation, tool_schema
 from server import frontend as request_frontend
 from server import protocol as wire
 from server import server as api
@@ -78,7 +80,7 @@ class RequestContractTests(HarnessTestCase):
         for fields, message in (*invalid, ({}, rendering)):
             with (
                 self.subTest(fields=fields),
-                mock.patch.dict(documents._cache, clear=True),
+                empty_page_cache(),
                 mock.patch.object(
                     documents, "_render", side_effect=APIError(400, rendering)
                 ) as render,
@@ -185,7 +187,6 @@ class RequestContractTests(HarnessTestCase):
 
     def test_unsupported_http_version_is_rejected_before_header_validation(self):
         handler = object.__new__(api.FrontendHandler)
-        handler._header_timer = mock.Mock()
         handler.server = mock.Mock()
         handler.connection = mock.Mock()
         handler.request_version = "HTTP/0.9"
@@ -203,15 +204,20 @@ class RequestContractTests(HarnessTestCase):
         self.addCleanup(harness.close)
         # Each request is all the server reads: bytes it left unread would
         # reset the connection under its response.
-        for data, status, anthropic in (
-            (b"GARBAGE\r\n", 400, False),
-            (b"GET / FOO/1.1\r\n", 400, False),
+        for data, status, code in (
+            (b"GARBAGE\r\n", 400, "invalid_request_error"),
+            (b"GET / FOO/1.1\r\n", 400, "invalid_request_error"),
             # HTTP/0.9's request line, which has no version. Python before
             # 3.13 reads headers after it all the same.
-            (b"GET /\r\n" + b"\r\n" * (sys.version_info < (3, 13)), 505, False),
+            (
+                b"GET /\r\n" + b"\r\n" * (sys.version_info < (3, 13)),
+                505,
+                "http_version_not_supported",
+            ),
             # One byte over the stdlib's request and header line limits.
-            (b"x" * 65537, 414, False),
-            (b"POST /v1/messages HTTP/1.1\r\n" + b"x" * 65537, 431, True),
+            (b"x" * 65537, 414, "invalid_request_error"),
+            # Anthropic's errors carry no code.
+            (b"POST /v1/messages HTTP/1.1\r\n" + b"x" * 65537, 431, None),
         ):
             with self.subTest(data=data[:24]):
                 client = socket.create_connection(
@@ -225,8 +231,87 @@ class RequestContractTests(HarnessTestCase):
                 self.assertEqual(response.getheader("Connection"), "close")
                 self.assertEqual(response.getheader("Content-Type"), "application/json")
                 payload = json.loads(response.read())
-                self.assertEqual(payload.get("type"), "error" if anthropic else None)
+                self.assertEqual(payload.get("type"), None if code else "error")
+                self.assertEqual(payload["error"].get("code"), code)
                 self.assertTrue(payload["error"]["message"])
+
+    def test_every_error_on_a_path_answers_as_its_api(self):
+        harness = Harness(FakeRuntime())
+        self.addCleanup(harness.close)
+        openai_404 = {
+            "error": {
+                "message": "not found",
+                "type": "invalid_request_error",
+                "code": "not_found",
+            }
+        }
+        anthropic_404 = {
+            "type": "error",
+            "error": {"type": "not_found_error", "message": "not found"},
+        }
+        for method, path, status, payload in (
+            # A method the server does not implement is a server error.
+            (
+                "PUT",
+                "/v1/chat/completions",
+                501,
+                {
+                    "error": {
+                        "message": "Unsupported method ('PUT')",
+                        "type": "server_error",
+                        "code": "not_implemented",
+                    }
+                },
+            ),
+            (
+                "PUT",
+                "/v1/messages",
+                501,
+                {
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": "Unsupported method ('PUT')",
+                    },
+                },
+            ),
+            # Anthropic's paths answer as its API does whatever the method,
+            # its unknown paths too.
+            ("GET", "/v1/messages", 404, anthropic_404),
+            ("DELETE", "/v1/messages/count_tokens", 404, anthropic_404),
+            ("POST", "/v1/messages/batches", 404, anthropic_404),
+            # A path that only begins as theirs is not one of them.
+            ("POST", "/v1/messagesX", 404, openai_404),
+            ("GET", "/v1/messages_batches", 404, openai_404),
+            ("GET", "/v1/systemone", 404, openai_404),
+            ("POST", "/v1/unknown", 404, openai_404),
+        ):
+            with self.subTest(method=method, path=path):
+                response = harness.request(
+                    method, path, {} if method == "POST" else None
+                )
+                self.assertEqual(
+                    (response[0], json.loads(response[2])), (status, payload)
+                )
+
+    def test_only_a_retryable_refusal_invites_a_retry(self):
+        harness = Harness(FakeRuntime())
+        self.addCleanup(harness.close)
+
+        def retry_after(path):
+            connection = http.client.HTTPConnection(
+                *harness.server.server_address, timeout=3
+            )
+            self.addCleanup(connection.close)
+            connection.request("GET", path)
+            response = connection.getresponse()
+            response.read()
+            return response.status, response.getheader("Retry-After")
+
+        self.assertEqual(retry_after("/ready"), (200, None))
+        self.assertEqual(retry_after("/v1/unknown"), (404, None))
+        with mock.patch.object(harness.backend, "is_ready", return_value=False):
+            self.assertEqual(retry_after("/ready"), (503, "1"))
 
     def test_missing_native_executable_has_upgrade_guidance(self):
         with self.assertRaisesRegex(
@@ -401,8 +486,8 @@ class RequestContractTests(HarnessTestCase):
                         f"{tool_schema.MAX_SCHEMA_DEPTH} levels deep",
                     ),
                 )
-        # A schema the parser reads but that would exhaust the stack where it
-        # is read recursively is refused as a schema, not as unreadable JSON.
+        # The deepest schema a body can carry, three levels inside it, is
+        # refused as a schema, not as unreadable JSON.
         harness = Harness(FakeRuntime())
         self.addCleanup(harness.close)
         status, _, payload = harness.request(
@@ -413,7 +498,7 @@ class RequestContractTests(HarnessTestCase):
                 "messages": [{"role": "user", "content": "Hi"}],
                 "response_format": {
                     "type": "json_schema",
-                    "json_schema": {"schema": nested(600)},
+                    "json_schema": {"schema": nested(json_codec.MAX_DEPTH - 3)},
                 },
             },
         )
@@ -423,6 +508,61 @@ class RequestContractTests(HarnessTestCase):
             "invalid response schema: nested more than 64 levels deep",
         )
         self.assertEqual(harness.backend.runtime.requests, [])
+
+    def test_json_nested_deeper_than_it_is_read_is_a_request_error(self):
+        harness = Harness(FakeRuntime())
+        self.addCleanup(harness.close)
+        limit = json_codec.MAX_DEPTH
+
+        def post(path, text):
+            connection = http.client.HTTPConnection(
+                *harness.server.server_address, timeout=3
+            )
+            self.addCleanup(connection.close)
+            connection.request(
+                "POST", path, text.encode(), {"Content-Type": "application/json"}
+            )
+            response = connection.getresponse()
+            payload = json.loads(response.read())
+            return response.status, payload.get("error") and payload["error"]["message"]
+
+        def arrays(depth):
+            return "[" * depth + "]" * depth
+
+        def with_field(body, value):
+            return json.dumps(body)[:-1] + f',"extra":{value}}}'
+
+        def history(arguments):
+            call = {"id": "c1", "type": "function"}
+            call["function"] = {"name": "f", "arguments": arguments}
+            assistant = {"role": "assistant", "content": "", "tool_calls": [call]}
+            tool = {"role": "tool", "tool_call_id": "c1", "content": "ok"}
+            messages = [{"role": "user", "content": "Hi"}, assistant, tool]
+            return json.dumps(chat_body(messages=messages))
+
+        def responses(depth):
+            # An input item's field, three levels inside the body.
+            item = {"type": "message", "role": "user", "content": "Hi"}
+            item = with_field(item, arrays(depth - 3))
+            return f'{{"model":"test-model","input":[{item}]}}'
+
+        chat, invalid = "/v1/chat/completions", (400, "invalid JSON request body")
+        objects = '{"a":' * (limit - 1) + "{}" + "}" * (limit - 1)
+        for path, text, expected in (
+            (chat, with_field(chat_body(), arrays(limit - 1)), (200, None)),
+            (chat, with_field(chat_body(), arrays(limit)), invalid),
+            (chat, with_field(chat_body(), arrays(10_000)), invalid),
+            (chat, history(objects), (200, None)),
+            (
+                chat,
+                history(arrays(10_000)),
+                (400, "tool call arguments must be valid JSON"),
+            ),
+            ("/v1/responses", responses(limit), (200, None)),
+            ("/v1/responses", responses(2000), invalid),
+        ):
+            with self.subTest(path=path, size=len(text)):
+                self.assertEqual(post(path, text), expected)
 
     def test_mask_byte_payload_round_trips(self):
         response = wire.MaskResponseFrame(
@@ -450,7 +590,9 @@ class RequestContractTests(HarnessTestCase):
             with self.assertRaisesRegex(api.APIError, "priority"):
                 harness.app.prepare(chat_body(priority=value), deadline=FOREVER)
         job = harness.app.prepare_responses(
-            responses_body(priority="foreground"), deadline=FOREVER
+            responses_body(priority="foreground"),
+            deadline=FOREVER,
+            reserve_input=reserve_unbounded,
         )
         self.assertEqual(job.priority, wire.RequestPriority.FOREGROUND)
 

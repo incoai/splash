@@ -13,6 +13,7 @@ from dev.tests.server_fixtures import (
     Plan,
     judgment_body,
     make_frontend,
+    stays_connected,
 )
 from server import judgments
 from server import server as api
@@ -190,7 +191,7 @@ class JudgmentTests(HarnessTestCase):
             mock.patch.object(api.time, "monotonic", side_effect=lambda: clock[0]),
             self.assertRaises(api.APIError) as error,
         ):
-            app.prepare_judgment(body, deadline=deadline)
+            app.prepare_judgment(body, deadline=deadline, disconnected=stays_connected)
         self.assertEqual(
             (error.exception.status, error.exception.code), (504, "request_timeout")
         )
@@ -228,6 +229,7 @@ class JudgmentTests(HarnessTestCase):
                     ]
                 ),
                 deadline=FOREVER,
+                disconnected=stays_connected,
             )
         self.assertEqual(
             (error.exception.status, error.exception.code),

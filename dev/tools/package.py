@@ -56,6 +56,7 @@ SERVER_FILES = (
     "tool_schema.py",
     "tokenization.py",
     "json_codec.py",
+    "lru.py",
     "latency.py",
     "metrics.py",
     "errors.py",

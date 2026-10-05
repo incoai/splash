@@ -227,14 +227,14 @@ class JsonResponseTests(unittest.TestCase):
             record = store.get("resp_test")
             self.assertEqual(record.response, response)
             self.assertEqual(json.loads(record.history_json), history)
-            self.assertEqual(store.bytes, record.size)
+            self.assertEqual(store.stats()["bytes"], record.size)
             for bad in (math.nan, math.inf, object()):
                 with self.assertRaises(json_codec.JSONEncodingError):
                     store.put({"id": "resp_test", "value": bad}, history)
                 self.assertEqual(store.get("resp_test").response, response)
-                self.assertEqual(store.bytes, record.size)
+                self.assertEqual(store.stats()["bytes"], record.size)
         self.assertTrue(store.delete("resp_test"))
-        self.assertEqual(store.bytes, 0)
+        self.assertEqual(store.stats()["bytes"], 0)
 
     def test_responses_store_retrieve_continue_and_delete(self):
         harness = self.harness([TEXT])

@@ -505,23 +505,47 @@ budget of at least 512 MiB (or twice the request limit), including retained
 generation inputs. This is an input-byte budget, not a process RSS limit: large
 ASCII/base64 strings can use roughly twice their encoded size during JSON
 parsing alone. Decoded images and object-heavy JSON need additional memory.
-Oversized requests return 413; exhausted ingress capacity returns 503. A
-connection that has sent no request yet, or is receiving an upload refused
-unread, gives way to a new one when every connection slot is taken, the first
-with that 503, so stalled clients cannot lock others out. Image and model
-context limits apply independently. Stored Responses history is charged before
-decoding. Uploads allow 30 seconds of inactivity; total upload time is limited
-to 30 seconds plus the body size at 512 KiB/s (286 seconds for 128 MiB), capped
-by `--request-timeout` when set. Timed-out uploads return 408 and release their
-input reservation. An upload refused before it is read, such as one over the
-shared budget, is still received on these terms, so a client that sends its
+Oversized requests return 413; exhausted ingress capacity returns 503. Image and
+model context limits apply independently. Stored Responses history is charged
+before decoding. Uploads allow 30 seconds of inactivity; total upload time is
+limited to 30 seconds plus the body size at 512 KiB/s (286 seconds for 128 MiB),
+capped by `--request-timeout` when set. Timed-out uploads return 408 and release
+their input reservation. An upload refused before it is read, such as one over
+the shared budget, is still received on these terms, so a client that sends its
 whole body before reading the response gets the refusal. An inference request
 ends when its client disconnects, and a client that shuts down its sending side
 after the request, as `nc` does at the end of its input, counts as disconnected
 and gets no response. A response write waits up to 30 seconds for a client that
 has stopped reading, past `--request-timeout` too, and the request counts
 against `--queue-size` until then. `/status` reports `http.request_body_bytes`
-and `http.max_request_bytes`.
+and `http.max_request_bytes`. A body's JSON, and JSON inside it such as a
+history tool call's arguments, nests at most 128 levels of arrays and objects;
+deeper is refused as invalid JSON.
+
+The server holds at most `--queue-size` + 64 connections at once (96 by
+default), each in a connection slot. A connection waits for its request without
+a thread until the request's head, its request line and headers, has arrived, or
+its client has closed; one of the server's worker threads, one per slot and all
+started with the server, then reads and serves the request, and the connection
+keeps its slot until it has been answered. The server takes every connection the
+kernel holds at each wakeup and starts no thread while connections arrive: macOS
+queues at most 128 connections the server has yet to take and resets those
+beyond, so the accept loop must keep up with a burst. The head is due 30 seconds
+after the server accepted the connection, which is closed without a response if
+the head has not arrived by then; a head that passes 64 KiB goes to its thread
+unfinished, to be read with 30 seconds allowed between reads. When every slot is
+taken, a connection still waiting for its head, or receiving an upload refused
+unread, gives way to the new one, the longest waiting first, so stalled clients
+cannot lock others out; when every slot holds a request whose head has arrived,
+the new connection is refused. A connection refused, or giving way, before its
+request is read gets a fixed 503 with code `frontend_overloaded` in OpenAI's
+shape whatever its path ([errors](#errors)). The server then reads and drops
+what its client still sends until the client closes or 2 seconds pass, so that
+the client reads the 503 rather than a reset, even one that sends its request
+only after the refusal. At most 1024 such connections linger at once; one more
+takes the place of the one refused longest ago. The server raises its soft limit
+of open files to 10240 at start (macOS starts a process at 256), so the
+connections it holds cannot exhaust it.
 
 ### Sampling
 
@@ -676,8 +700,11 @@ writes may. Tags written otherwise are text. Besides:
 - a call the token limit cuts keeps the unfinished arguments it has, which
   Chat and Responses (with status `incomplete`) return and a Messages stream
   has streamed, while a complete Messages response leaves the call out;
-- JSON that would decode to a lone surrogate or nest past 256 levels keeps its
-  text, which writes back as valid JSON;
+- JSON that would decode to a lone surrogate or nest past 122 levels keeps its
+  text, which writes back as valid JSON, so that the call's arguments read back
+  within the 128 levels the server reads where a request carries them deepest,
+  as a `tool_use` block's `input` in a Messages history, five levels into the
+  body;
 - a call's opening also ends the reasoning where a call may follow.
 
 `dev/tests/server/test_tool_call_reading.py` holds model outputs with the calls
@@ -911,13 +938,20 @@ its usage. It does not alter prompt text, token IDs or the GPU KV cache.
 
 ### Errors
 
-OpenAI routes answer an error as `{"error": {"message", "type", "code"}}`, with
-`type` `server_error` for a 5xx status and `invalid_request_error` otherwise.
-Messages routes answer as Anthropic's API does,
+An error is answered as the API of its path answers it, whatever the method
+and whether the request was read past its request line. OpenAI's paths, and
+every path no other API has, answer `{"error": {"message", "type", "code"}}`,
+with `type` `server_error` for a 5xx status and `invalid_request_error`
+otherwise.
+`/v1/messages` and the paths under it answer as Anthropic's API does,
 `{"type": "error", "error": {"type", "message"}}`, with Anthropic's type for the
 status, such as `overloaded_error` for 503. `/v1/systemone` answers invalid
 requests with 422 `detail` arrays and every 503 with 529. Every 503, and every
-529, carries `Retry-After: 1`. The codes a client may act on:
+529, carries `Retry-After: 1`. A connection the server refuses before reading
+any of its request, as when every connection slot is taken
+([request limits](#request-limits-and-timeouts)), gets one fixed 503 whatever
+its path, `/v1/systemone`'s included: OpenAI's `server_error` with code
+`frontend_overloaded`. The codes a client may act on:
 
 | Status | `code` | Meaning |
 | --- | --- | --- |
@@ -934,6 +968,7 @@ requests with 422 `detail` arrays and every 503 with 529. Every 503, and every
 | 500 | `engine_failed` | The engine failed repeatedly and Splash stopped restarting it ([engine restarts](#engine-restarts-and-sleep)). |
 | 500 | `model_result_invalid` | The model produced a non-finite result for this request; others continue ([failures](#failures-and-crash-traces)). |
 | 500 | `internal_server_error` | A fault in the server, not in the request; the console names the error's type and the server line it arose at. |
+| 501 | `not_implemented` | The request's method is not one the server has. |
 | 503 | `engine_recovering`, `runtime_unavailable` | The engine is restarting; retry. |
 | 503 | `server_shutdown` | The server is stopping: requests that arrive or are still running get it. |
 | 503 | `frontend_overloaded` | The server holds `--queue-size` requests, every connection slot holds a request ([request limits](#request-limits-and-timeouts)), or a shared input budget or request preparation is full; retry. |
@@ -941,6 +976,7 @@ requests with 422 `detail` arrays and every 503 with 529. Every 503, and every
 | 503 | `mask_timeout` | The server left the request's token mask unanswered for 5 s; retry. |
 | 503 | `runtime_busy` | The server could not hand the request's token mask to the engine: its mask queue was full or the engine connection failed; retry. |
 | 504 | `request_timeout` | The request's `timeout`, or `--request-timeout`, ran out. |
+| 505 | `http_version_not_supported` | The request is not HTTP/1.0 or HTTP/1.1. |
 
 ## Models
 

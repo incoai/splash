@@ -37,17 +37,15 @@ if __name__ == "__main__" and not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     __package__ = "install"
 
+# The model ID syntax, which --model shares with the server, in modules of
+# the standard library alone: the launcher imports this before .venv exists.
+from server import serve_options
+
 from . import paths
 
 MODELS = paths.MODELS
 # The bound on one JSON metadata file.
 MAX_JSON_BYTES = 4 * 1024 * 1024
-REPO_ID = re.compile(
-    r"[A-Za-z0-9_](?:[A-Za-z0-9._-]*[A-Za-z0-9_])?/"
-    r"[A-Za-z0-9_](?:[A-Za-z0-9._-]{0,94}[A-Za-z0-9_])?"
-)
-VARIANT_SEPARATOR = ":"
-VARIANT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 # What installation_kind finds at a selection link.
 ASSEMBLY, PACKAGE = "assembly", "package"
 # Staging an interrupted installation leaves, which garbage collection
@@ -91,40 +89,18 @@ def is_safe_path(name) -> bool:
 
 
 def validate_repo_id(value: str) -> str:
-    # Keep argument validation available before the Hub dependency is installed.
-    if (
-        not isinstance(value, str)
-        or not REPO_ID.fullmatch(value)
-        or "--" in value
-        or ".." in value
-        or value.endswith(".git")
-    ):
-        raise ModelError("model must be a full Hugging Face repository ID (owner/repo)")
-    return value
+    try:
+        return serve_options.check_repo_id(value)
+    except ValueError as error:
+        raise ModelError(str(error)) from None
 
 
 def split_model_id(value: str) -> tuple[str, str | None]:
     """owner/repo[:variant] -> (repository ID, variant or None)."""
-    if not isinstance(value, str):
-        raise ModelError("model must be a full Hugging Face repository ID (owner/repo)")
-    repo_id, separator, variant = value.partition(VARIANT_SEPARATOR)
-    validate_repo_id(repo_id)
-    if not separator:
-        return repo_id, None
-    if not VARIANT.fullmatch(variant) or ".." in variant:
-        raise ModelError(
-            "model variant must be a short name such as UD-Q4_K_M "
-            f"(owner/repo{VARIANT_SEPARATOR}VARIANT)"
-        )
-    return repo_id, variant
-
-
-def parse_model_id(value: str) -> str:
     try:
-        split_model_id(value)
-    except ModelError as error:
-        raise argparse.ArgumentTypeError(str(error)) from error
-    return value
+        return serve_options.split_model_id(value)
+    except ValueError as error:
+        raise ModelError(str(error)) from None
 
 
 def parse_draft_model(value: str) -> str:
@@ -186,7 +162,7 @@ def selection_link(
         return models / ".selections" / hashlib.sha256(selection.encode()).hexdigest()
     if variant is None:
         return models / repo_id
-    return models / f"{repo_id}{VARIANT_SEPARATOR}{variant}"
+    return models / f"{repo_id}{serve_options.VARIANT_SEPARATOR}{variant}"
 
 
 def selection_links(models: Path):
@@ -285,7 +261,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--model",
         required=True,
-        type=parse_model_id,
+        type=serve_options.parse_model_id,
         help="Hugging Face repository ID (owner/repo[:variant])",
     )
     parser.add_argument("--revision", help="optional upstream branch, tag or commit")

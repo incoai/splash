@@ -4,7 +4,8 @@ import json
 import sys
 import threading
 from array import array
-from collections import OrderedDict
+
+from .lru import LRUCache
 
 
 class PromptTokenizer:
@@ -21,8 +22,8 @@ class PromptTokenizer:
             if self.enabled
             else None
         )
-        self.entries = OrderedDict()
-        self.bytes = self.hits = self.reused_tokens = 0
+        self.entries = LRUCache(self.BUDGET_BYTES, self.CAPACITY)
+        self.hits = self.reused_tokens = 0
         self.lock = threading.Lock()
 
     @classmethod
@@ -89,7 +90,6 @@ class PromptTokenizer:
             )
             cached = self.entries.get(key)
             if cached is not None:
-                self.entries.move_to_end(key)
                 self.hits += 1
                 self.reused_tokens += len(cached) // array("I").itemsize
         tokens = array("I", cached).tolist() if cached is not None else []
@@ -105,18 +105,8 @@ class PromptTokenizer:
                 with self.lock:
                     # An extension replaces its earlier prefix; unrelated
                     # concurrent conversations retain their own LRU entries.
-                    for old in {key, prefix}:
-                        previous = self.entries.pop(old, None)
-                        if previous is not None:
-                            self.bytes -= sys.getsizeof(old) + sys.getsizeof(previous)
-                    self.entries[prefix] = packed
-                    self.bytes += size
-                    while (
-                        self.bytes > self.BUDGET_BYTES
-                        or len(self.entries) > self.CAPACITY
-                    ):
-                        old, previous = self.entries.popitem(last=False)
-                        self.bytes -= sys.getsizeof(old) + sys.getsizeof(previous)
+                    self.entries.pop(key)
+                    self.entries.put(prefix, packed, size)
         return tokens + self._encode(text[boundary:])
 
     def split(self, text):
@@ -138,9 +128,9 @@ class PromptTokenizer:
             return {
                 "enabled": self.enabled,
                 "entries": len(self.entries),
-                "bytes": self.bytes,
-                "budget_bytes": self.BUDGET_BYTES,
-                "capacity": self.CAPACITY,
+                "bytes": self.entries.bytes,
+                "budget_bytes": self.entries.budget_bytes,
+                "capacity": self.entries.capacity,
                 "hits": self.hits,
                 "reused_tokens": self.reused_tokens,
             }

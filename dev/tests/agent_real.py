@@ -34,7 +34,7 @@ from server import serve_options  # noqa: E402
 
 CLIENTS = tuple(clients.INSTALL_URLS)
 # The server this harness starts or finds, on the default port.
-BASE_URL = launcher._base_url(launcher.PORT)
+BASE_URL = launcher._base_url(serve_options.DEFAULT_PORT)
 # The project's tests: the prompts give their command with python3, and the
 # harness reruns them with its own Python.
 TEST_ARGUMENTS = ("-m", "unittest", "-v")
@@ -1056,7 +1056,7 @@ def parse_args(argv=None):
     parser.add_argument("--clients", default=",".join(CLIENTS))
     parser.add_argument(
         "--model",
-        type=launcher.model_artifacts.parse_model_id,
+        type=serve_options.parse_model_id,
         required=True,
     )
     # The installation's source options, which splash serve is given, and
@@ -1185,7 +1185,7 @@ def main(argv=None):
         document["validation_script_sha256"] = hashlib.sha256(
             Path(__file__).read_bytes()
         ).hexdigest()
-        port = launcher.PORT
+        port = serve_options.DEFAULT_PORT
         if args.http_smoke:
             smoke_real.run(port, model)
         reference = (

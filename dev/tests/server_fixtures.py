@@ -33,6 +33,7 @@ from server import protocol as wire
 from server import runtime as engine_runtime
 from server import server as api
 from server.chat_templates import ChatTemplates
+from server.lru import LRUCache
 from server.origins import parse_allowed_origin
 from server.thinking import ThinkingCodec
 
@@ -41,6 +42,16 @@ FOREVER = math.inf
 READY = wire.ReadyEvent(4, 131_072, False)
 # The generation APIs: Chat Completions, Responses and Messages.
 PATHS = ("/v1/chat/completions", "/v1/responses", "/v1/messages")
+
+
+def stays_connected():
+    """Whether the client of a request prepared directly has left: never."""
+    return False
+
+
+def reserve_unbounded(size):
+    """Reserve `size` more input bytes for a request prepared directly, which
+    no input budget bounds."""
 
 
 def byte_alphabet():
@@ -1206,6 +1217,14 @@ def full_render_limits():
         documents.MAX_TEXT_CHARACTERS,
         documents.MAX_RENDERED_BYTES,
         documents.MAX_REQUEST_DOCUMENT_BYTES,
+    )
+
+
+def empty_page_cache():
+    """A patch of the rendered-page cache with an empty one, as the server
+    starts with."""
+    return mock.patch.object(
+        documents, "_cache", LRUCache(documents.CACHE_BYTES, documents.CACHE_ENTRIES)
     )
 
 

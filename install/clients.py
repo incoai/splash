@@ -14,6 +14,8 @@ import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 
+from server import serve_options
+
 INSTALL_URLS = {
     "claude": "https://code.claude.com/docs/en/overview",
     "opencode": "https://opencode.ai/docs/",
@@ -63,10 +65,10 @@ class _Server:
 
     @property
     def name(self):
-        """splash for the default port, 8000, and splash-<port> for another,
-        so a client's session keeps the server it was started for."""
+        """splash for the default port and splash-<port> for another, so a
+        client's session keeps the server it was started for."""
         port = urllib.parse.urlsplit(self.base_url).port
-        return "splash" if port == 8000 else f"splash-{port}"
+        return "splash" if port == serve_options.DEFAULT_PORT else f"splash-{port}"
 
 
 def find_executable(name):

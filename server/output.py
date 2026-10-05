@@ -23,9 +23,12 @@ from .tool_schema import (
 )
 
 TOOL_ARGUMENT_DELTA_CHARS = 16 * 1024
-# A value read as JSON nests at most this deep, so that encoding it back never
-# exhausts the stack.
-MAX_JSON_NESTING = 256
+# The deepest a call's arguments nest as an object the server writes, so that
+# they read back within json_codec.MAX_DEPTH where a request carries them
+# deepest: as a tool_use block's input in a Messages history, inside the body,
+# its messages, a message, the message's content and the block. Chat and
+# Responses carry arguments as strings, read on their own.
+MAX_ARGUMENTS_DEPTH = json_codec.MAX_DEPTH - 5
 _SURROGATE = re.compile("[\ud800-\udfff]")
 
 
@@ -108,21 +111,23 @@ _PYTHON_LITERALS = {"True": True, "False": False, "None": None}
 
 
 def _json_value(text):
-    """The JSON value `text` spells, if it can be written back as JSON: its
-    numbers finite, its strings Unicode and its containers nested at most
-    MAX_JSON_NESTING deep. Otherwise _NOT_JSON."""
+    """The JSON value `text` spells, if it can be written back as JSON in its
+    call's arguments: its numbers finite, its strings Unicode and its
+    containers, in the arguments object, nested at most MAX_ARGUMENTS_DEPTH
+    deep. Otherwise _NOT_JSON."""
     try:
         value = json_codec.loads(text)
-    except (ValueError, RecursionError):
+    except ValueError:
         return _NOT_JSON
-    pending = [(value, 0)]
+    # The value's level in the arguments object.
+    pending = [(value, 2)]
     while pending:
         item, depth = pending.pop()
         if isinstance(item, str):
             if _SURROGATE.search(item):
                 return _NOT_JSON
         elif isinstance(item, (dict, list)):
-            if depth == MAX_JSON_NESTING:
+            if depth > MAX_ARGUMENTS_DEPTH:
                 return _NOT_JSON
             children = [*item, *item.values()] if isinstance(item, dict) else item
             pending.extend((child, depth + 1) for child in children)

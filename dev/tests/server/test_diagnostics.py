@@ -14,7 +14,7 @@ from server import server as api
 class DiagnosticsTests(HarnessTestCase):
     def test_expected_client_disconnect_does_not_print_server_traceback(self):
         harness = self.harness(FakeRuntime())
-        with mock.patch.object(api.ThreadingHTTPServer, "handle_error") as parent:
+        with mock.patch.object(api.HTTPServer, "handle_error") as parent:
             with mock.patch.object(
                 api.sys,
                 "exc_info",

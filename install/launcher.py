@@ -30,7 +30,6 @@ from . import models as model_artifacts
 
 ROOT = paths.ROOT
 RUNTIME_DIR = paths.RUNTIME
-PORT = 8000
 # Either stops `splash serve` wherever it is. The programs with handlers of
 # their own, the installer it runs and the server it executes, start with
 # them blocked, not ignored, until those handlers are in place, so one sent
@@ -75,7 +74,7 @@ def _base_url(port):
     return f"http://127.0.0.1:{port}"
 
 
-def _request_json(path, timeout=2, *, port=PORT):
+def _request_json(path, timeout=2, *, port=serve_options.DEFAULT_PORT):
     request = urllib.request.Request(_base_url(port) + path)
     if key := os.environ.get("SPLASH_API_KEY"):
         request.add_header("Authorization", f"Bearer {key}")
@@ -403,7 +402,7 @@ def parse_args(argv=None):
     model = groups["model"]
     model.add_argument(
         "--model",
-        type=model_artifacts.parse_model_id,
+        type=serve_options.parse_model_id,
         required=True,
         metavar="OWNER/REPO[:VARIANT]",
         help="upstream Hugging Face model, with a GGUF variant after ':' (e.g. :UD-Q4_K_M)",
@@ -433,8 +432,8 @@ def parse_args(argv=None):
     groups["network"].add_argument(
         "--port",
         type=_parse_port,
-        default=os.environ.get("SPLASH_PORT", str(PORT)),
-        help="HTTP port (default: SPLASH_PORT or 8000)",
+        default=os.environ.get("SPLASH_PORT", str(serve_options.DEFAULT_PORT)),
+        help=f"HTTP port (default: SPLASH_PORT or {serve_options.DEFAULT_PORT})",
     )
     serve_options.add_serve_arguments(server, groups)
     for name in clients.INSTALL_URLS:
@@ -444,7 +443,9 @@ def parse_args(argv=None):
         serve_options.check_serve_arguments(parser, args)
     if args.command in clients.INSTALL_URLS:
         try:
-            args.port = _parse_port(os.environ.get("SPLASH_PORT", str(PORT)))
+            args.port = _parse_port(
+                os.environ.get("SPLASH_PORT", str(serve_options.DEFAULT_PORT))
+            )
         except argparse.ArgumentTypeError as error:
             parser.error(f"SPLASH_PORT: {error}")
     if client_args and args.command == "serve":

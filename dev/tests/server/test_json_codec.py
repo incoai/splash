@@ -90,6 +90,29 @@ class JsonCodecTests(unittest.TestCase):
             data = list(pool.map(self.assert_roundtrip, values))
         self.assertEqual([json.loads(item) for item in data], values)
 
+    def test_loading_refuses_json_nested_deeper_than_its_bound(self):
+        limit = json_codec.MAX_DEPTH
+
+        def arrays(depth):
+            return "[" * depth + "]" * depth
+
+        def objects(depth):
+            return '{"a":' * (depth - 1) + "{}" + "}" * (depth - 1)
+
+        for spell in (arrays, objects):
+            with self.subTest(spell=spell.__name__):
+                text = spell(limit)
+                self.assertEqual(json_codec.loads(text), json.loads(text))
+                # Past the bound, and past the parser's own, near 10,000.
+                for depth in (limit + 1, 10_000, 100_000):
+                    with self.assertRaisesRegex(ValueError, f"deeper than {limit}"):
+                        json_codec.loads(spell(depth))
+        # Width costs nothing; one deep branch among shallow ones counts.
+        wide = [[0] * 1000, {"a": [1], "b": "[[["}] * 1000
+        self.assertEqual(json_codec.loads(json.dumps(wide)), wide)
+        with self.assertRaises(ValueError):
+            json_codec.loads(json.dumps([*wide, {"deep": json.loads(arrays(limit))}]))
+
     def test_strict_loading_preserves_finite_numbers_and_numeric_strings(self):
         data = '{"values":[1.7976931348623157e308, 5e-324, -0.0, 12345678901234567890, "1e400"]}'
         self.assertEqual(json_codec.loads(data), json.loads(data))

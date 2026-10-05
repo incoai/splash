@@ -9,6 +9,7 @@ import argparse
 import copy
 import math
 import os
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +21,9 @@ REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 MAX_CONTEXT_TOKENS = 262144
 DEFAULT_MAX_REQUEST_BYTES = 128 * 1024 * 1024
 DEFAULT_QUEUE_SIZE = 32
+# The port both commands serve on unless --port names another, or for the
+# launcher SPLASH_PORT does.
+DEFAULT_PORT = 8000
 # Where --persistent-cache keeps its files unless --cache-dir says otherwise.
 DEFAULT_CACHE_DIR = Path.home() / "Library/Caches/Splash/prefix-cache"
 _SIZE_UNITS = {
@@ -27,6 +31,54 @@ _SIZE_UNITS = {
     for power, unit in enumerate(("K", "M", "G"), 1)
     for suffix in ("", "B", "IB")
 }
+# A model ID, as --model takes it: OWNER/REPO, a Hugging Face repository ID
+# by the Hub's rule, then optionally :VARIANT, which names the GGUF to serve,
+# such as UD-Q4_K_M.
+REPO_ID = re.compile(
+    r"[A-Za-z0-9_](?:[A-Za-z0-9._-]*[A-Za-z0-9_])?/"
+    r"[A-Za-z0-9_](?:[A-Za-z0-9._-]{0,94}[A-Za-z0-9_])?"
+)
+VARIANT_SEPARATOR = ":"
+VARIANT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+
+
+def check_repo_id(value):
+    """`value`, if it is a full Hugging Face repository ID; ValueError
+    otherwise."""
+    if (
+        not isinstance(value, str)
+        or not REPO_ID.fullmatch(value)
+        or "--" in value
+        or ".." in value
+        or value.endswith(".git")
+    ):
+        raise ValueError("model must be a full Hugging Face repository ID (owner/repo)")
+    return value
+
+
+def split_model_id(value):
+    """A model ID's repository ID and variant, None without one; ValueError
+    for a value that is no model ID."""
+    if not isinstance(value, str):
+        raise ValueError("model must be a full Hugging Face repository ID (owner/repo)")
+    repo_id, separator, variant = value.partition(VARIANT_SEPARATOR)
+    check_repo_id(repo_id)
+    if not separator:
+        return repo_id, None
+    if not VARIANT.fullmatch(variant) or ".." in variant:
+        raise ValueError(
+            "model variant must be a short name such as UD-Q4_K_M "
+            f"(owner/repo{VARIANT_SEPARATOR}VARIANT)"
+        )
+    return repo_id, variant
+
+
+def parse_model_id(value):
+    try:
+        split_model_id(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from None
+    return value
 
 
 def parse_max_context(value):

@@ -6,11 +6,11 @@ import io
 import math
 import threading
 import time
-from collections import OrderedDict
 from contextlib import closing
 from dataclasses import asdict, dataclass
 
 from .errors import APIError
+from .lru import LRUCache
 from .protocol import MAX_IMAGE_SPANS
 
 MAX_REQUEST_DOCUMENT_BYTES = 64 * 1024 * 1024
@@ -76,10 +76,9 @@ class RenderLimits:
 # up its PDF before it waits for the worker, so a cached PDF never waits
 # behind another one's render.
 _render_lock = threading.Lock()
-# Rendered pages by the SHA-256 of their PDF, the least recently used first.
+# Rendered pages by the SHA-256 of their PDF.
 _cache_lock = threading.Lock()
-_cache: OrderedDict[bytes, tuple[Page, ...]] = OrderedDict()
-_cache_bytes = 0
+_cache = LRUCache(CACHE_BYTES, CACHE_ENTRIES)
 
 
 def _render(payload, budget):
@@ -172,9 +171,8 @@ def _cached(key, budget):
     None when none are cached."""
     with _cache_lock:
         pages = _cache.get(key)
-        if pages is None:
-            return None
-        _cache.move_to_end(key)
+    if pages is None:
+        return None
     budget.charge_pages(len(pages))
     budget.charge(sum(page.size for page in pages))
     return pages
@@ -183,16 +181,9 @@ def _cached(key, budget):
 def _cache_pages(key, pages):
     """Keep the rendered `pages` of the PDF with digest `key`, unless they
     alone outgrow the cache."""
-    global _cache_bytes
     size = sum(page.size for page in pages)
-    if size > CACHE_BYTES:
-        return
     with _cache_lock:
-        _cache[key] = pages
-        _cache_bytes += size
-        while _cache_bytes > CACHE_BYTES or len(_cache) > CACHE_ENTRIES:
-            _, evicted = _cache.popitem(last=False)
-            _cache_bytes -= sum(page.size for page in evicted)
+        _cache.put(key, pages, size)
 
 
 def _pages(encoded, budget):

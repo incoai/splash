@@ -41,6 +41,7 @@ from dataclasses import dataclass
 
 from .chat_templates import render_chat_template, template_options
 from .errors import field_error
+from .protocol import MAX_SCORE_TOKENS
 
 LETTERS = "ABCDEFGHIJKLMNOP"
 DIRECT_SYSTEM = (
@@ -54,8 +55,6 @@ READOUT = (
     "native full-vocabulary last-position logits restricted to declared answer slots"
 )
 PROBABILITY_STATUS = "conditional option score; uncalibrated as decision confidence"
-# Native score-only requests carry at most this many option tokens.
-MAX_OPTIONS = 255
 # A /v1/systemone batch prepares every question before the first inference
 # and runs them under one shared deadline, so the batch carries its own
 # caps: at most this many questions holding at most this many prepared
@@ -155,7 +154,7 @@ def _derive_slot_labels(tokenizer):
             encoded = tokenizer.encode(label, add_special_tokens=False)
             if len(encoded) == 1 and tokenizer.decode(encoded) == label:
                 labels.append(label)
-                if len(labels) >= MAX_OPTIONS:
+                if len(labels) >= MAX_SCORE_TOKENS:
                     return labels
     return labels
 
@@ -330,11 +329,11 @@ def _question_spec(qid, question):
                     "to descriptions",
                 )
             )
-        elif len(criteria) > MAX_OPTIONS:
+        elif len(criteria) > MAX_SCORE_TOKENS:
             details.append(
                 field_error(
                     [*loc, "criteria"],
-                    f"choice supports at most {MAX_OPTIONS} options",
+                    f"choice supports at most {MAX_SCORE_TOKENS} options",
                 )
             )
         elif any(not isinstance(label, str) for label in criteria):
@@ -363,11 +362,11 @@ def _question_spec(qid, question):
                     "score criteria must be a nonempty array of level descriptions",
                 )
             )
-        elif len(criteria) > MAX_OPTIONS:
+        elif len(criteria) > MAX_SCORE_TOKENS:
             details.append(
                 field_error(
                     [*loc, "criteria"],
-                    f"score supports at most {MAX_OPTIONS} levels",
+                    f"score supports at most {MAX_SCORE_TOKENS} levels",
                 )
             )
         elif any(not isinstance(value, (str, dict, list)) for value in criteria):

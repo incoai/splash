@@ -18,6 +18,7 @@ from unittest import mock
 import yaml
 
 from install import clients, launcher
+from server import serve_options
 
 MODEL = "incoai/Qwen3.6-35B-A3B-Splash"
 
@@ -388,6 +389,18 @@ class ClientTests(unittest.TestCase):
                 self.assertEqual(
                     config["model"]["base_url"], f"http://127.0.0.1:{port}/v1"
                 )
+        # The default port's profile is splash, whichever port that is.
+        with mock.patch.object(serve_options, "DEFAULT_PORT", 8002):
+            _, env = clients.command(
+                "hermes",
+                "/bin/hermes",
+                "http://127.0.0.1:8002/",
+                MODEL,
+                102400,
+                {},
+                input_modalities=["text"],
+            )
+        self.assertEqual(env["HERMES_HOME"], str(self.hermes_root / "profiles/splash"))
 
     def test_hermes_profile_is_in_the_root_of_the_users_hermes_home(self):
         # Hermes's own rule: a home inside ~/.hermes belongs to ~/.hermes,
@@ -1190,7 +1203,10 @@ class ClientLifecycleTests(unittest.TestCase):
         # root: it would install its tools there and point the user's hermes
         # command at them.
         model = {"id": MODEL, "owned_by": "splash", "input_modalities": ["text"]}
-        for port, name in ((launcher.PORT, "splash"), (8001, "splash-8001")):
+        for port, name in (
+            (serve_options.DEFAULT_PORT, "splash"),
+            (8001, "splash-8001"),
+        ):
             with (
                 self.subTest(port=port),
                 mock.patch.dict(os.environ, {"SPLASH_PORT": str(port)}),

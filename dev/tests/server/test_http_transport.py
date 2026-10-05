@@ -1,6 +1,7 @@
 import concurrent.futures
 import http.client
 import json
+import queue
 import socket
 import threading
 import time
@@ -303,18 +304,6 @@ class HttpTransportTests(HarnessTestCase):
         stalled.sendall(b"GET /health HTTP/1.1\r\nHost:")
         return stalled
 
-    def _wait_until_read(self, server):
-        # Until the thread of every connection with a slot has read what its
-        # client sent.
-        deadline = time.monotonic() + 1
-        while time.monotonic() < deadline:
-            with server.connections.lock:
-                held = list(server.connections.holders)
-            if not any(connections._has_input(connection) for connection in held):
-                return
-            time.sleep(0.005)
-        self.fail("a connection's input stayed unread")
-
     def test_stalled_connections_give_their_slots_to_new_ones(self):
         with mock.patch.object(api.FrontendServer, "control_connection_capacity", 2):
             harness = self.harness(FakeRuntime(), queue_size=1)
@@ -323,25 +312,169 @@ class HttpTransportTests(HarnessTestCase):
         self._wait_for_http_active(harness.server.requests, 1)
         waiting = [self._stalled(address), self._stalled(address)]
         self._wait_for_http_active(harness.server.connections, 3)
-        self._wait_until_read(harness.server)
         # Every slot is taken; the longest waiting stalled one gives way, never
         # the older connection with a request in progress.
         for _ in range(3):
             self.assertEqual(harness.request("GET", "/health")[0], 200)
             self._assert_refused(waiting.pop(0))
-            # The answered connection keeps its slot until its thread sees its
-            # client close; a stalled one arriving before then would take the
+            # The answered connection keeps its slot until its thread has
+            # closed it; a stalled one arriving before then would take the
             # slot of the longest waiting one.
             self._wait_for_http_active(harness.server.connections, 2)
             waiting.append(self._stalled(address))
             self._wait_for_http_active(harness.server.connections, 3)
-            self._wait_until_read(harness.server)
             self._assert_open(waiting[0])
         self._assert_open(upload)
         self.assertEqual(harness.server.requests.stats()["active"], 1)
         # Before the server closes, so it has no connection to wait for.
         for connection in (upload, *waiting):
             connection.close()
+
+    def test_a_connection_giving_way_before_its_request_reads_its_answer(self):
+        body = json.dumps(chat_body()).encode()
+        head = (
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n"
+            b"Content-Type: application/json\r\n"
+            + f"Content-Length: {len(body)}\r\n\r\n".encode()
+        )
+        # Its client has sent nothing yet, or part of the head.
+        for sent in (0, head.index(b"Content-Type")):
+            with self.subTest(sent=sent):
+                with mock.patch.object(
+                    api.FrontendServer, "control_connection_capacity", 0
+                ):
+                    harness = self.harness(FakeRuntime(), queue_size=1)
+                address = harness.server.server_address
+                waiting = socket.create_connection(address, timeout=2)
+                self.addCleanup(waiting.close)
+                waiting.sendall(head[:sent])
+                self._wait_for_http_active(harness.server.connections, 1)
+                time.sleep(0.05)
+                self.assertEqual(harness.request("GET", "/health")[0], 200)
+                # The rest of its request arrives only now, the rest of its
+                # head and its body in two writes as http.client sends them,
+                # the second after a reset would have come back: the answer
+                # still arrives whole, and nothing is reset.
+                waiting.sendall(head[sent:])
+                time.sleep(0.05)
+                waiting.sendall(body)
+                self._assert_refused(waiting)
+
+    def test_a_connection_whose_head_arrived_keeps_its_slot(self):
+        with mock.patch.object(api.FrontendServer, "control_connection_capacity", 0):
+            harness = self.harness(FakeRuntime(), queue_size=1)
+        address = harness.server.server_address
+        body = json.dumps(chat_body()).encode()
+        parsed, resume = threading.Event(), threading.Event()
+        parse = api.BaseHTTPRequestHandler.parse_request
+
+        def descheduled(handler):
+            # Its thread loses the processor between reading the head and
+            # acting on it.
+            result = parse(handler)
+            parsed.set()
+            resume.wait(2)
+            return result
+
+        with mock.patch.object(
+            api.BaseHTTPRequestHandler, "parse_request", descheduled
+        ):
+            arrived = socket.create_connection(address, timeout=2)
+            self.addCleanup(arrived.close)
+            # Its head, with its body to follow, as http.client sends them.
+            arrived.sendall(
+                b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n"
+                b"Content-Type: application/json\r\n"
+                + f"Content-Length: {len(body)}\r\n\r\n".encode()
+            )
+            self.assertTrue(parsed.wait(1))
+            # Its request arrived, so a new connection finds no slot to take.
+            excess = socket.create_connection(address, timeout=2)
+            self.addCleanup(excess.close)
+            self._assert_refused(excess)
+            resume.set()
+            arrived.sendall(body)
+            response = http.client.HTTPResponse(arrived)
+            response.begin()
+            self.assertEqual(response.status, 200)
+            response.read()
+
+    def test_a_head_the_waiting_thread_has_yet_to_see_keeps_its_slot(self):
+        with mock.patch.object(api.FrontendServer, "control_connection_capacity", 0):
+            harness = self.harness(FakeRuntime(), queue_size=1)
+        address = harness.server.server_address
+        looking, resume = threading.Event(), threading.Event()
+        ready = connections._ready
+
+        def delayed(connection):
+            # The waiting thread loses the processor before it looks.
+            if threading.current_thread() is harness.server.connections.waiting.thread:
+                looking.set()
+                resume.wait(2)
+            return ready(connection)
+
+        with mock.patch.object(connections, "_ready", delayed):
+            arrived = socket.create_connection(address, timeout=2)
+            self.addCleanup(arrived.close)
+            arrived.sendall(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            self.assertTrue(looking.wait(1))
+            # Its head arrived, so a new connection finds no slot to take.
+            excess = socket.create_connection(address, timeout=2)
+            self.addCleanup(excess.close)
+            self._assert_refused(excess)
+            resume.set()
+            response = http.client.HTTPResponse(arrived)
+            response.begin()
+            self.assertEqual(response.status, 200)
+            response.read()
+
+    def test_the_workers_start_with_the_server(self):
+        # Threads started while a burst arrives hold off the accept loop, and
+        # the kernel resets what overflows its queue meanwhile: a thread per
+        # slot starts with the server, and none while it serves.
+        harness = self.harness(FakeRuntime())
+        workers = [
+            thread
+            for thread in harness.server.connections.workers.threads
+            if thread.is_alive() and thread.name == "connection worker"
+        ]
+        self.assertEqual(len(workers), harness.server.connections.capacity)
+        with mock.patch.object(threading.Thread, "start") as start:
+            for _ in range(20):
+                self.assertEqual(harness.request("GET", "/health")[0], 200)
+        start.assert_not_called()
+
+    def test_the_accept_loop_takes_every_waiting_connection_at_once(self):
+        server = api.FrontendServer(("127.0.0.1", 0), None)
+        self.addCleanup(server.server_close)
+        clients = []
+        for _ in range(5):
+            client = socket.create_connection(server.server_address, timeout=2)
+            self.addCleanup(client.close)
+            clients.append(client)
+        # One wakeup takes all five, as a burst needs, and returns once the
+        # kernel holds none.
+        server._handle_request_noblock()
+        self.assertEqual(server.connections.stats()["active"], 5)
+        server._handle_request_noblock()
+        self.assertEqual(server.connections.stats()["active"], 5)
+
+    def test_a_request_head_is_due_by_the_deadline_of_its_accept(self):
+        harness = self.harness(FakeRuntime(), io_timeout=1.0)
+        address = harness.server.server_address
+        silent = socket.create_connection(address, timeout=3)
+        self.addCleanup(silent.close)
+        late = socket.create_connection(address, timeout=3)
+        self.addCleanup(late.close)
+        accepted = time.monotonic()
+        # Its first bytes come just before the deadline and the rest never:
+        # it has only what is left of the time since its accept. Each is
+        # closed with what it sent read, so that it sees no reset.
+        time.sleep(0.7)
+        late.sendall(b"GET /health HTTP/1.1\r\nHost:")
+        for connection in (late, silent):
+            self.assertEqual(connection.recv(1), b"")
+            self.assertLess(time.monotonic() - accepted, 1.4)
 
     def test_complete_requests_beyond_capacity_are_answered(self):
         with mock.patch.object(api.FrontendServer, "control_connection_capacity", 0):
@@ -424,40 +557,62 @@ class HttpTransportTests(HarnessTestCase):
         for upload in uploads:
             upload.close()
 
-    @mock.patch.object(connections, "_has_input", return_value=False)
-    def test_connection_slots_close_the_longest_waiting_connection(self, _):
-        slots = api.ConnectionSlots(2)
-        first, second, third, fourth = (mock.Mock() for _ in range(4))
-        self.assertTrue(slots.admit(first))
-        self.assertTrue(slots.admit(second))
-        self.assertTrue(slots.serving(first))
-        self.assertTrue(slots.admit(third))
-        # Still awaiting its request, it is answered before it is closed.
+    @mock.patch.object(connections, "Workers")
+    @mock.patch.object(connections, "WaitingConnections")
+    def test_connection_slots_close_the_longest_waiting_connection(self, *_):
+        slots = api.ConnectionSlots(2, None, 1, 0.5)
+        waiting = slots.waiting
+        # Connections whose clients have sent nothing yet.
+        first, second, third, fourth, refused = (
+            mock.Mock(**{"recv.side_effect": BlockingIOError}) for _ in range(5)
+        )
+        self.assertTrue(slots.admit(first, "first", 10.0))
+        waiting.wait.assert_called_once_with(first, "first", 10.0)
+        self.assertTrue(slots.admit(second, "second", 10.0))
+        # The head of its request has arrived: it keeps its slot.
+        self.assertTrue(slots.arrived(first))
+        self.assertTrue(slots.admit(third, "third", 10.0))
+        # Waiting for its request without a thread, it is answered and closed
+        # as a refused connection is.
         second.send.assert_called_once_with(
             connections.CONNECTION_OVERLOADED_RESPONSE, socket.MSG_DONTWAIT
         )
-        second.shutdown.assert_called_once_with(socket.SHUT_RDWR)
-        # A connection that lost its slot is not served.
-        self.assertFalse(slots.serving(second))
-        self.assertTrue(slots.serving(third))
-        self.assertFalse(slots.admit(fourth))
-        # One draining an upload, which has its response, is last in line
-        # and closed without another.
+        waiting.close.assert_called_once_with(second)
+        second.shutdown.assert_not_called()
+        # A connection that lost its slot is neither served nor expired.
+        self.assertFalse(slots.arrived(second))
+        self.assertFalse(slots.expire(second))
+        # When every slot has a request whose head arrived, the new
+        # connection is refused, whether or not the waiting thread has looked
+        # at the head yet.
+        third.recv.side_effect = None
+        third.recv.return_value = b"GET /health HTTP/1.1\r\n\r\n"
+        self.assertFalse(slots.admit(fourth, "fourth", 10.0))
+        self.assertTrue(slots.arrived(third))
+        self.assertFalse(slots.admit(fourth, "fourth", 10.0))
+        # One draining an upload, which has its response, is last in line,
+        # and shut down without another, for its thread to see the end.
         slots.draining(first)
-        slots.expire(third)
-        third.shutdown.assert_not_called()
-        self.assertTrue(slots.admit(fourth))
+        self.assertTrue(slots.admit(fourth, "fourth", 10.0))
         first.send.assert_not_called()
         first.shutdown.assert_called_once_with(socket.SHUT_RDWR)
-        # The header timeout closes a connection awaiting its request.
-        slots.expire(fourth)
-        fourth.send.assert_not_called()
-        fourth.shutdown.assert_called_once_with(socket.SHUT_RDWR)
+        waiting.close.assert_called_once_with(second)
+        # The head deadline frees the slot of one still waiting, for the
+        # caller to close it.
+        self.assertTrue(slots.expire(fourth))
+        fourth.shutdown.assert_not_called()
         self.assertEqual(slots.stats(), {"active": 1, "capacity": 2})
         for connection in (first, second, third, fourth):
             slots.release(connection)
         self.assertTrue(slots.idle.is_set())
         self.assertEqual(slots.stats(), {"active": 0, "capacity": 2})
+        # One refused at the accept is answered and closed as one that gives
+        # way without a thread.
+        slots.refuse(refused)
+        refused.send.assert_called_once_with(
+            connections.CONNECTION_OVERLOADED_RESPONSE, socket.MSG_DONTWAIT
+        )
+        waiting.close.assert_called_with(refused)
 
     def _socket_pairs(self, count):
         pairs = [socket.socketpair() for _ in range(count)]
@@ -467,59 +622,197 @@ class HttpTransportTests(HarnessTestCase):
         return pairs
 
     def test_a_connection_whose_request_arrived_keeps_its_slot(self):
-        slots = api.ConnectionSlots(2)
         pairs = self._socket_pairs(4)
         (arrived, arrived_client), (idle, idle_client) = pairs[:2]
         (new, new_client), (excess, _) = pairs[2:]
+        # Its head arrived, a connection goes to a worker, which here only
+        # records it, and keeps its slot.
+        served = queue.SimpleQueue()
+        slots = api.ConnectionSlots(
+            2, lambda connection, _: served.put(connection), 1, 0.5
+        )
+        self.addCleanup(slots.stop)
+        deadline = time.monotonic() + 10
         arrived_client.sendall(b"GET /health HTTP/1.1\r\n\r\n")
-        self.assertTrue(slots.admit(arrived))
-        self.assertTrue(slots.admit(idle))
+        self.assertTrue(slots.admit(arrived, None, deadline))
+        self.assertIs(served.get(timeout=1), arrived)
+        self.assertTrue(slots.admit(idle, None, deadline))
         # The idle connection gives way, although it waited less long.
-        self.assertTrue(slots.admit(new))
-        self.assertFalse(slots.serving(idle))
+        self.assertTrue(slots.admit(new, None, deadline))
+        self.assertFalse(slots.arrived(idle))
         self.assertEqual(
             idle_client.recv(65536), connections.CONNECTION_OVERLOADED_RESPONSE
         )
         self.assertEqual(idle_client.recv(1), b"")
-        # When every slot has a request, the new connection is refused.
+        # When every slot has a request whose head arrived, the new connection
+        # is refused.
         new_client.sendall(b"GET /health HTTP/1.1\r\n\r\n")
-        self.assertFalse(slots.admit(excess))
-        self.assertTrue(slots.serving(arrived))
-        self.assertTrue(slots.serving(new))
+        self.assertIs(served.get(timeout=1), new)
+        self.assertFalse(slots.admit(excess, None, deadline))
+
+    def _wait_closed(self, connection, seconds):
+        deadline = time.monotonic() + seconds
+        while connection.fileno() != -1 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertEqual(connection.fileno(), -1)
 
     def test_refused_connections_linger_until_their_clients_close(self):
-        closer = api.LingeringCloser(2, 0.5)
-        self.addCleanup(closer.stop)
-        (answered, answered_client), (silent, silent_client), (excess, _) = (
-            self._socket_pairs(3)
-        )
+        (answered, answered_client), (silent, silent_client) = self._socket_pairs(2)
+        waiting = connections.WaitingConnections(None, None, 2, 0.5)
+        self.addCleanup(waiting.stop)
         answered.sendall(b"answer")
-        closer.close(answered)
-        closer.close(silent)
-        # Beyond its capacity, the closer closes at once.
-        closer.close(excess)
-        self.assertEqual(excess.fileno(), -1)
+        waiting.close(answered)
+        waiting.close(silent)
         # Its client reads the answer to its end, and what it sends after
         # it is read and dropped until it closes.
         answered_client.sendall(b"x" * 100_000)
         self.assertEqual(answered_client.recv(64), b"answer")
         self.assertEqual(answered_client.recv(1), b"")
         answered_client.close()
-        deadline = time.monotonic() + 0.4
-        while answered.fileno() != -1 and time.monotonic() < deadline:
-            time.sleep(0.005)
-        self.assertEqual(answered.fileno(), -1)
+        self._wait_closed(answered, 0.4)
         # A connection whose client never closes is closed after the linger.
         self.assertNotEqual(silent.fileno(), -1)
         self.assertEqual(silent_client.recv(1), b"")
-        deadline = time.monotonic() + 1
-        while silent.fileno() != -1 and time.monotonic() < deadline:
-            time.sleep(0.005)
-        self.assertEqual(silent.fileno(), -1)
-        closer.stop()
+        self._wait_closed(silent, 1)
+        waiting.stop()
         stopped, _ = self._socket_pairs(1)[0]
-        closer.close(stopped)
+        waiting.close(stopped)
         self.assertEqual(stopped.fileno(), -1)
+
+    def test_the_longest_lingering_connection_gives_way(self):
+        pairs = self._socket_pairs(3)
+        waiting = connections.WaitingConnections(None, None, 2, 5.0)
+        self.addCleanup(waiting.stop)
+        for connection, client in pairs:
+            connection.sendall(b"answer")
+            waiting.close(connection)
+            # The thread takes it before the next is answered.
+            deadline = time.monotonic() + 1
+            while waiting.answered and time.monotonic() < deadline:
+                time.sleep(0.005)
+        # Beyond its capacity, the connection answered first is closed, its
+        # client having had the longest to read its answer; the newest one,
+        # whose request may still be on its way, lingers.
+        (first, first_client), *rest = pairs
+        self._wait_closed(first, 1)
+        self.assertEqual(first_client.recv(64), b"answer")
+        self.assertEqual(first_client.recv(1), b"")
+        for connection, client in rest:
+            self.assertNotEqual(connection.fileno(), -1)
+            client.sendall(b"a request sent late")
+        time.sleep(0.05)
+        for connection, client in rest:
+            self.assertEqual(client.recv(64), b"answer")
+
+    def test_answered_connections_waiting_for_the_thread_are_bounded(self):
+        # The thread is busy, here handing a connection to its worker.
+        handing, resume = threading.Event(), threading.Event()
+
+        def dispatch(connection, address):
+            handing.set()
+            resume.wait(2)
+
+        (ready, ready_client), *answered = self._socket_pairs(4)
+        waiting = connections.WaitingConnections(mock.Mock(), dispatch, 2, 5.0)
+        self.addCleanup(waiting.stop)
+        self.addCleanup(resume.set)
+        ready_client.sendall(b"GET /health HTTP/1.1\r\n\r\n")
+        waiting.wait(ready, None, time.monotonic() + 10)
+        self.assertTrue(handing.wait(1))
+        for connection, _ in answered:
+            waiting.close(connection)
+        # Beyond its capacity of answered connections waiting for the busy
+        # thread, a connection is closed as it is handed over.
+        self.assertEqual(
+            [connection.fileno() == -1 for connection, _ in answered],
+            [False, False, True],
+        )
+
+    def test_a_burst_beyond_capacity_is_answered_within_bounded_descriptors(self):
+        with (
+            mock.patch.object(api.FrontendServer, "control_connection_capacity", 1),
+            mock.patch.object(api.FrontendServer, "refused_connection_capacity", 4),
+        ):
+            harness = self.harness(FakeRuntime(), queue_size=1)
+        address = harness.server.server_address
+        # Each connection the server accepts, to count those it holds open:
+        # at most its 2 slots, 4 lingering and 4 waiting to linger, besides the
+        # one it accepts and one a worker has released and is closing.
+        accepted, peak, done = [], 0, threading.Event()
+        get_request = api.FrontendServer.get_request
+
+        def recorded(server):
+            request = get_request(server)
+            accepted.append(request[0])
+            return request
+
+        def sample():
+            nonlocal peak
+            while not done.is_set():
+                held = sum(connection.fileno() != -1 for connection in list(accepted))
+                peak = max(peak, held)
+                time.sleep(0.0005)
+
+        outcomes, go = [], threading.Event()
+
+        def client():
+            go.wait(2)
+            connection = socket.create_connection(address, timeout=5)
+            try:
+                connection.sendall(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                response = http.client.HTTPResponse(connection)
+                response.begin()
+                response.read()
+                outcomes.append((response.status, response.getheader("Retry-After")))
+            except (OSError, http.client.HTTPException) as error:
+                outcomes.append(error)
+            finally:
+                connection.close()
+
+        clients = [threading.Thread(target=client) for _ in range(60)]
+        for thread in [*clients, sampler := threading.Thread(target=sample)]:
+            thread.start()
+        start = threading.Thread.start
+
+        def slow_start(thread):
+            # Thread starts slow, as under load.
+            time.sleep(0.005)
+            start(thread)
+
+        with (
+            mock.patch.object(api.FrontendServer, "get_request", recorded),
+            mock.patch.object(threading.Thread, "start", slow_start),
+        ):
+            go.set()
+            for thread in clients:
+                thread.join(10)
+        done.set()
+        sampler.join()
+        self.assertEqual(len(outcomes), 60)
+        for outcome in outcomes:
+            self.assertIn(outcome, ((200, None), (503, "1")))
+        self.assertLessEqual(peak, 2 + 2 * 4 + 2)
+        self._wait_for_http_active(harness.server.connections, 0)
+
+    def test_the_server_raises_its_descriptor_limit(self):
+        unlimited = api.resource.RLIM_INFINITY
+        for limits, raised in (
+            ((256, unlimited), (api.DESCRIPTOR_LIMIT, unlimited)),
+            ((256, 4096), (4096, 4096)),
+            ((1 << 20, unlimited), None),
+        ):
+            with (
+                self.subTest(limits=limits),
+                mock.patch.object(api.resource, "getrlimit", return_value=limits),
+                mock.patch.object(api.resource, "setrlimit") as setrlimit,
+            ):
+                api._raise_descriptor_limit()
+                if raised is None:
+                    setrlimit.assert_not_called()
+                else:
+                    setrlimit.assert_called_once_with(
+                        api.resource.RLIMIT_NOFILE, raised
+                    )
 
     def test_a_burst_waits_in_the_kernel_queue_instead_of_being_reset(self):
         # Nothing accepts while the connections arrive, as when the accept
@@ -532,23 +825,51 @@ class HttpTransportTests(HarnessTestCase):
             self.addCleanup(client.close)
             client.sendall(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
 
-    def test_thread_start_failure_returns_connection_slot(self):
+    def test_a_connection_whose_serving_fails_returns_its_slot(self):
         server = api.FrontendServer(("127.0.0.1", 0), None)
         self.addCleanup(server.server_close)
         client = socket.create_connection(server.server_address, timeout=2)
         self.addCleanup(client.close)
+        # A connection goes to a worker once its client sends or closes.
+        client.shutdown(socket.SHUT_WR)
+        failed = threading.Event()
         with (
             mock.patch.object(
-                api.ThreadingHTTPServer,
-                "process_request",
-                side_effect=RuntimeError("test"),
+                api.FrontendServer, "finish_request", side_effect=RuntimeError("test")
             ),
-            mock.patch.object(api.ThreadingHTTPServer, "handle_error") as handle_error,
+            mock.patch.object(
+                api.HTTPServer, "handle_error", side_effect=lambda *_: failed.set()
+            ) as handle_error,
         ):
             server.handle_request()
+            self.assertTrue(failed.wait(1))
         handle_error.assert_called_once()
-        self.assertEqual(server.connections.stats()["active"], 0)
+        self._wait_for_http_active(server.connections, 0)
         self.assertEqual(client.recv(1), b"")
+
+    def test_stopping_closes_waiting_connections_and_ends_workers(self):
+        before = set(threading.enumerate())
+        harness = self.harness(FakeRuntime())
+        address = harness.server.server_address
+        self.assertEqual(harness.request("GET", "/health")[0], 200)
+        workers = [
+            thread
+            for thread in set(threading.enumerate()) - before
+            if thread.name == "connection worker"
+        ]
+        self.assertTrue(workers)
+        silent = socket.create_connection(address, timeout=2)
+        self.addCleanup(silent.close)
+        stalled = self._stalled(address)
+        self._wait_for_http_active(harness.server.connections, 2)
+        harness.close()
+        self.assertEqual(harness.server.connections.stats()["active"], 0)
+        # Each is closed without a response, and without a reset.
+        for connection in (silent, stalled):
+            self.assertEqual(connection.recv(1), b"")
+        for worker in workers:
+            worker.join(1)
+            self.assertFalse(worker.is_alive())
 
     def test_http_admission_capacity_is_exact_and_validated(self):
         for invalid in (0, -1, True, 1.5):
