@@ -101,7 +101,11 @@ def _ensure_installed(selection):
     if not paths.PACKAGED:
         # Serialize builds across ports; make keeps the lock if the launcher exits.
         with (RUNTIME_DIR / "build.lock").open("a+") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print("Another Splash build is running; waiting...", flush=True)
+                fcntl.flock(lock, fcntl.LOCK_EX)
             for command in (
                 ["make", "platform-check", "install-environment"],
                 ["make", "-j4", "all"],

@@ -836,6 +836,40 @@ class LauncherTests(unittest.TestCase):
                 with (runtime / "build.lock").open("a+") as probe:
                     fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
+    def test_source_build_says_when_it_waits_for_another(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = Path(temporary)
+            with (runtime / "build.lock").open("a+") as other:
+                fcntl.flock(other, fcntl.LOCK_EX)
+                # The other build ends once the launcher says it waits, or
+                # after ten seconds: one that waits without a word fails
+                # instead of hanging.
+                ended = threading.Timer(10, fcntl.flock, (other, fcntl.LOCK_UN))
+                ended.start()
+                self.addCleanup(ended.cancel)
+
+                class Output(io.StringIO):
+                    def write(self, text):
+                        fcntl.flock(other, fcntl.LOCK_UN)
+                        return super().write(text)
+
+                with (
+                    mock.patch.object(launcher.paths, "PACKAGED", False),
+                    mock.patch.object(launcher, "RUNTIME_DIR", runtime),
+                    mock.patch.object(
+                        launcher.subprocess,
+                        "run",
+                        return_value=subprocess.CompletedProcess([], 0),
+                    ) as run,
+                    mock.patch.object(launcher, "_run_held", return_value=0),
+                    mock.patch("sys.stdout", Output()) as output,
+                ):
+                    launcher._ensure_installed(selection(runtime))
+            self.assertEqual(
+                output.getvalue(), "Another Splash build is running; waiting...\n"
+            )
+            self.assertEqual(run.call_args_list[0].args[0][0], "make")
+
     def test_source_selection_reaches_installation_and_served_root(self):
         with tempfile.TemporaryDirectory() as temporary:
             runtime = Path(temporary)

@@ -6,7 +6,7 @@ from tempfile import TemporaryDirectory
 
 from dev.benchmarks import weights
 
-PACKAGE = Path("/models/.resolved/assembly")
+MODEL_ROOT = Path("/models/.resolved/assembly")
 A, B, C = ("a" * 64, "b" * 64, "c" * 64)
 
 
@@ -42,7 +42,7 @@ def entry(cache: Path, key: str, digest: str, lines: list[str]):
     (directory / "source").write_text("".join(f"{line}\n" for line in lines))
 
 
-def provenance(component: str, source=PACKAGE / "target") -> list[str]:
+def provenance(component: str, source=MODEL_ROOT / "target") -> list[str]:
     return [
         weights.PROVENANCE,
         f"component {component}",
@@ -79,37 +79,42 @@ class WeightBytesTests(unittest.TestCase):
             digest_tool(build, {"target/layer-0.bin": A, "vision/model.bin": B})
             self.assertTrue(weights.loads_in_memory(build))
             self.assertEqual(
-                weights.digests(build, PACKAGE),
+                weights.digests(build, MODEL_ROOT),
                 {"target/layer-0.bin": A, "vision/model.bin": B},
             )
-            self.assertEqual((build / "roots").read_text(), f"{PACKAGE}\n")
+            self.assertEqual((build / "roots").read_text(), f"{MODEL_ROOT}\n")
             digest_tool(build, {}, status=1)
             with self.assertRaisesRegex(RuntimeError, "exited 1: error: no model"):
-                weights.digests(build, PACKAGE)
+                weights.digests(build, MODEL_ROOT)
 
-    def test_an_earlier_release_prepared_the_images_of_the_package(self):
+    def test_an_earlier_release_prepared_the_images_of_the_model_root(self):
         with TemporaryDirectory() as directory:
             output = Path(directory).resolve() / "release/model"
             environment = weights.baseline_environment(output)
             cache = output / "baseline-weights"
             self.assertEqual(environment, {"SPLASH_WEIGHT_CACHE": str(cache)})
             self.assertTrue(cache.is_dir())
-            self.assertEqual(weights.prepared(environment, PACKAGE), {})
+            self.assertEqual(weights.prepared(environment, MODEL_ROOT), {})
 
             entry(cache, "1" * 64, A, provenance("target/layer-0.bin"))
             entry(
-                cache, "2" * 64, B, provenance("vision/model.bin", PACKAGE / "vision")
+                cache,
+                "2" * 64,
+                B,
+                provenance("vision/model.bin", MODEL_ROOT / "vision"),
             )
             # Another model's and another revision's entries, an entry of an
             # earlier format, one without its digest and staging are not.
             entry(cache, "3" * 64, C, provenance("target/head.bin", "/other"))
-            entry(cache, "4" * 64, C, provenance("target/head.bin", f"{PACKAGE}-old"))
-            entry(cache, "5" * 64, C, [str(PACKAGE / "target"), "head.bin"])
+            entry(
+                cache, "4" * 64, C, provenance("target/head.bin", f"{MODEL_ROOT}-old")
+            )
+            entry(cache, "5" * 64, C, [str(MODEL_ROOT / "target"), "head.bin"])
             entry(cache, "6" * 64, "not a digest", provenance("target/head.bin"))
             entry(cache, ".staging-7", C, provenance("target/head.bin"))
             (cache / ("8" * 64)).mkdir()
             self.assertEqual(
-                weights.prepared(environment, PACKAGE),
+                weights.prepared(environment, MODEL_ROOT),
                 {"target/layer-0.bin": A, "vision/model.bin": B},
             )
 
@@ -122,7 +127,7 @@ class WeightBytesTests(unittest.TestCase):
             # A package an earlier release mapped as it is: nothing to compare.
             self.assertEqual(
                 weights.compare_builds(
-                    baseline, candidate, PACKAGE, environment, False
+                    baseline, candidate, MODEL_ROOT, environment, False
                 ),
                 {"images": [], "failures": [], "pass": True},
             )
@@ -131,7 +136,9 @@ class WeightBytesTests(unittest.TestCase):
             with self.assertRaisesRegex(
                 RuntimeError, "has no engine-tests/weight-digests"
             ):
-                weights.compare_builds(baseline, candidate, PACKAGE, environment, True)
+                weights.compare_builds(
+                    baseline, candidate, MODEL_ROOT, environment, True
+                )
             (baseline / weights.IDENTITY_HEADER).parent.mkdir(parents=True)
             (baseline / weights.IDENTITY_HEADER).write_text("")
             entry(
@@ -141,7 +148,7 @@ class WeightBytesTests(unittest.TestCase):
                 provenance("target/layer-0.bin"),
             )
             result = weights.compare_builds(
-                baseline, candidate, PACKAGE, environment, True
+                baseline, candidate, MODEL_ROOT, environment, True
             )
             self.assertEqual(
                 result["failures"],
@@ -151,7 +158,7 @@ class WeightBytesTests(unittest.TestCase):
             digest_tool(baseline, {"target/layer-0.bin": A})
             for assembly in (True, False):
                 result = weights.compare_builds(
-                    baseline, candidate, PACKAGE, None, assembly
+                    baseline, candidate, MODEL_ROOT, None, assembly
                 )
                 self.assertTrue(result["pass"], result["failures"])
                 self.assertEqual(len(result["images"]), 1)

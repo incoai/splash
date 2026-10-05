@@ -299,7 +299,7 @@ class BackendRegressionTests(unittest.TestCase):
             str(root / "baseline"),
             "--candidate",
             str(root / "candidate"),
-            "--package",
+            "--model-root",
             str(package),
             "--output-dir",
             str(root / "release"),
@@ -406,17 +406,17 @@ class BackendRegressionTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 self.run_main(root)
 
-    def test_package_slug_names_results_by_selection(self):
+    def test_results_are_named_by_selection(self):
         models = Path("/install/models")
         with mock.patch.object(smoke.model_artifacts, "MODELS", models):
             self.assertEqual(
-                regression.package_slug(models / "mlx-community/Qwen3.8-27B-4bit"),
+                regression.results_slug(models / "mlx-community/Qwen3.8-27B-4bit"),
                 "mlx-community--Qwen3.8-27B-4bit",
             )
             self.assertEqual(
-                regression.package_slug(models / ".selections/abc"), ".selections--abc"
+                regression.results_slug(models / ".selections/abc"), ".selections--abc"
             )
-            self.assertEqual(regression.package_slug(Path("/elsewhere/pkg")), "pkg")
+            self.assertEqual(regression.results_slug(Path("/elsewhere/model")), "model")
 
 
 if __name__ == "__main__":

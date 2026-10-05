@@ -1,7 +1,7 @@
 """Compare a candidate build with a baseline build on one installed model.
 
 Run as ``python -m dev.benchmarks.backend_regression --baseline CHECKOUT
---package MODEL_ROOT``. Each checkout's build/ holds splash.metallib and
+--model-root MODEL_ROOT``. Each checkout's build/ holds splash.metallib and
 engine-tests/backend-benchmark, the candidate's engine-tests/weight-digests
 too. The native benchmark's decode and partial scenarios run in ABBA order
 (baseline, candidate, candidate, baseline) on this machine, which must be
@@ -84,7 +84,7 @@ def parse_document(stdout: str, returncode: int) -> dict:
     return document
 
 
-def run_round(tree: Path, package: Path, round_index: int, version: str, args, env):
+def run_round(tree: Path, model_root: Path, round_index: int, version: str, args, env):
     documents = []
     for scenario in invocations(args.combined):
         stem = args.output_dir / (
@@ -93,7 +93,7 @@ def run_round(tree: Path, package: Path, round_index: int, version: str, args, e
         command = [
             str(tree / BENCHMARK),
             str(tree / METALLIB),
-            str(package),
+            str(model_root),
             "--samples",
             str(args.samples),
             "--scenario",
@@ -296,10 +296,10 @@ def summarize(rounds: list[dict], expect_output_change: bool) -> dict:
     }
 
 
-def package_slug(package: Path) -> str:
-    """The name of a package's results under build/release: its path below
-    the models directory, or its own name elsewhere."""
-    path = Path(os.path.abspath(package))
+def results_slug(model_root: Path) -> str:
+    """The name of a model root's results under build/release: its path
+    below the models directory, or its own name elsewhere."""
+    path = Path(os.path.abspath(model_root))
     models = Path(os.path.abspath(smoke.model_artifacts.MODELS))
     try:
         return "--".join(path.relative_to(models).parts)
@@ -316,11 +316,11 @@ def parse_args(argv=None):
         "--candidate", type=Path, default=ROOT, help="candidate checkout (this one)"
     )
     parser.add_argument(
-        "--package", required=True, type=Path, help="installed model root"
+        "--model-root", required=True, type=Path, help="installed model root"
     )
     parser.add_argument("--samples", type=int, default=3)
     parser.add_argument(
-        "--output-dir", type=Path, help="results directory (build/release/<package>)"
+        "--output-dir", type=Path, help="results directory (build/release/<model root>)"
     )
     parser.add_argument(
         "--expect-output-change",
@@ -337,17 +337,17 @@ def parse_args(argv=None):
                 parser.error(f"missing retained benchmark or library: {path}")
     if not weights.loads_in_memory(args.candidate / "build"):
         parser.error(f"the candidate build has no {weights.WEIGHT_DIGESTS}")
-    args.kind = smoke.model_artifacts.installation_kind(args.package)
+    args.kind = smoke.model_artifacts.installation_kind(args.model_root)
     if args.kind is None:
-        parser.error(f"missing installed model: {args.package}")
+        parser.error(f"missing installed model: {args.model_root}")
     if args.output_dir is None:
-        args.output_dir = ROOT / "build/release" / package_slug(args.package)
+        args.output_dir = ROOT / "build/release" / results_slug(args.model_root)
     return args
 
 
 def main(argv=None) -> int:
     args = parse_args(argv)
-    smoke.hold_package(args)
+    smoke.hold_model_root(args)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     trees = {"baseline": args.baseline.resolve(), "candidate": args.candidate.resolve()}
     environments = {"baseline": dict(os.environ), "candidate": dict(os.environ)}
@@ -359,7 +359,7 @@ def main(argv=None) -> int:
     document = {
         "schema_version": 1,
         "timing": "native GPU time and TTFT; ABBA rule of dev/benchmarks/abba.py",
-        "package": str(args.package),
+        "model_root": str(args.model_root),
         "trees": {name: str(tree) for name, tree in trees.items()},
         "samples": args.samples,
         "scenario_invocations": invocations(args.combined),
@@ -371,7 +371,7 @@ def main(argv=None) -> int:
                 version,
                 run_round(
                     trees[version],
-                    args.package,
+                    args.model_root,
                     index,
                     version,
                     args,
@@ -385,7 +385,7 @@ def main(argv=None) -> int:
         document["weights"] = weights.compare_builds(
             trees["baseline"] / "build",
             trees["candidate"] / "build",
-            args.package,
+            args.model_root,
             environments["baseline"],
             args.kind == smoke.model_artifacts.ASSEMBLY,
         )

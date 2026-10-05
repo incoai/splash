@@ -7,10 +7,10 @@ files. The bundled catalog is versioned with the source; the cache is
 refreshed in the background by `splash serve` and lives
 under the per-user data directory.
 
-Readers take the union of the two. A cache that is missing, stale, empty or
-corrupt can therefore only ever fail to *add* entries — it can never remove a
-model the package already knew about, and it can never make completion worse
-than a fresh install.
+Readers (install/completions/models) take the union of the two. A cache that
+is missing, stale, empty or corrupt can therefore only ever fail to *add*
+entries — it can never remove a model the package already knew about, and it
+can never make completion worse than a fresh install.
 """
 
 from __future__ import annotations
@@ -38,7 +38,6 @@ from .models import ModelError, validate_repo_id
 COLLECTION = "incoai/splash-6aac69afeba907af0511ec14"
 HUB_ENDPOINT = os.environ.get("HF_ENDPOINT", "https://huggingface.co")
 
-BUNDLED = paths.ROOT / "install/completions/official-models.txt"
 CACHE = (
     paths.DATA if paths.PACKAGED else paths.RUNTIME
 ) / "catalog/official-models.txt"
@@ -49,30 +48,6 @@ CACHE = (
 MAX_AGE_SECONDS = 24 * 60 * 60
 # Bounded so a hung network cannot keep a background process alive.
 TIMEOUT_SECONDS = 10
-
-
-def _read(path: Path) -> list[str]:
-    try:
-        text = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
-        return []
-    identifiers = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            identifiers.append(validate_repo_id(line))
-        except ModelError:
-            # A malformed cache entry is dropped rather than propagated: this
-            # feeds shell completion, and the sh helper trusts what it reads.
-            continue
-    return identifiers
-
-
-def official_ids() -> list[str]:
-    """Every official model ID this installation knows about."""
-    return sorted(set(_read(BUNDLED)) | set(_read(CACHE)))
 
 
 def is_stale(now: float | None = None) -> bool:
@@ -193,19 +168,11 @@ def main(argv=None) -> int:
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--refresh", action="store_true", help="refresh the cache")
-    parser.add_argument("--output", type=Path, help="write here instead of the cache")
-    parser.add_argument("--force", action="store_true", help="ignore the age check")
-    parser.add_argument("--list", action="store_true", help="print known model IDs")
     args = parser.parse_args(argv)
 
-    if args.refresh or args.output:
-        if not (args.force or args.output or is_stale()):
-            return 0
-        if not refresh(destination=args.output):
-            print("could not refresh the model catalog", file=sys.stderr)
-            return 1
-    if args.list:
-        print("\n".join(official_ids()))
+    if args.refresh and is_stale() and not refresh():
+        print("could not refresh the model catalog", file=sys.stderr)
+        return 1
     return 0
 
 

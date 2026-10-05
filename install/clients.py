@@ -4,13 +4,16 @@ Connection/model configuration and safe launch defaults belong here. Tool
 inventories, prompts and permission enforcement remain the client's responsibility.
 """
 
+import fcntl
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import urllib.parse
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -337,7 +340,7 @@ def _hermes(path, server, environment, arguments, profile):
     created = not (home / "config.yaml").exists() and _create_hermes_profile(
         path, home, environment
     )
-    _write_hermes_profile(home, server, created)
+    _write_hermes_profile(home, server, environment, created)
     environment.update(
         HERMES_HOME=str(home),
         CUSTOM_BASE_URL=server.endpoint,
@@ -384,7 +387,7 @@ def _create_hermes_profile(path, home, environment):
     return result.returncode == 0
 
 
-def _write_hermes_profile(home, server, created=False):
+def _write_hermes_profile(home, server, environment, created=False):
     # The launcher imports this module before the environment that provides
     # PyYAML is installed.
     import yaml
@@ -409,7 +412,9 @@ def _write_hermes_profile(home, server, created=False):
         default=server.model,
         provider="custom",
         base_url=server.endpoint,
-        api_key=server.api_key,
+        # Hermes expands the reference from its environment, which the
+        # launch passes on; the server's key is never saved.
+        api_key="${SPLASH_API_KEY}" if environment.get("SPLASH_API_KEY") else "local",
         api_mode="chat_completions",
         supports_vision="image" in server.input_modalities,
         context_length=server.context,
@@ -441,51 +446,70 @@ def _pi_models_path(environment):
 def _write_pi_provider(path, provider, server, environment):
     # Write through a symlinked models.json, as dotfile managers link it.
     path = path.resolve()
-    invalid = f"Invalid Pi models.json: {path}"
-    try:
-        config = json.loads(path.read_text()) if path.exists() else {}
-    except ValueError as error:
-        raise ClientError(invalid) from error
-    providers = config.get("providers", {}) if isinstance(config, dict) else None
-    if not isinstance(providers, dict):
-        raise ClientError(invalid)
-    # Pi expands the variable for each request. The server's key is never
-    # saved, nor run as a command when it begins with "!".
-    api_key = "$SPLASH_API_KEY" if environment.get("SPLASH_API_KEY") else "local"
-    # Pi accepts only text and image input; any other entry invalidates the
-    # user's whole models.json.
-    vision = "image" in server.input_modalities
-    model = {
-        "id": server.model,
-        "reasoning": True,
-        # Pi sends no effort when thinking is off, which leaves the
-        # template's default; "none" turns thinking off.
-        "thinkingLevelMap": {"off": "none"},
-        "input": ["text", "image"] if vision else ["text"],
-        "contextWindow": server.context,
-        # Pi lowers this on each request to what its context leaves, and
-        # compacts at a fixed distance from the window whatever it is.
-        "maxTokens": CLIENT_RESPONSE_TOKENS,
-    }
-    config["providers"] = {
-        **providers,
-        provider: {
-            "baseUrl": server.endpoint,
-            "api": "openai-completions",
-            "apiKey": api_key,
-            "models": [model],
-        },
-    }
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    _replace_file(path, json.dumps(config, indent=2) + "\n")
+    # Launches for servers on other ports add their providers to the same
+    # file: each reads and replaces it under the lock, so none replaces it
+    # with a copy that lacks another's provider.
+    with _locked(path.parent):
+        invalid = f"Invalid Pi models.json: {path}"
+        try:
+            config = json.loads(path.read_text()) if path.exists() else {}
+        except ValueError as error:
+            raise ClientError(invalid) from error
+        providers = config.get("providers", {}) if isinstance(config, dict) else None
+        if not isinstance(providers, dict):
+            raise ClientError(invalid)
+        # Pi expands the variable for each request. The server's key is never
+        # saved, nor run as a command when it begins with "!".
+        api_key = "$SPLASH_API_KEY" if environment.get("SPLASH_API_KEY") else "local"
+        # Pi accepts only text and image input; any other entry invalidates
+        # the user's whole models.json.
+        vision = "image" in server.input_modalities
+        model = {
+            "id": server.model,
+            "reasoning": True,
+            # Pi sends no effort when thinking is off, which leaves the
+            # template's default; "none" turns thinking off.
+            "thinkingLevelMap": {"off": "none"},
+            "input": ["text", "image"] if vision else ["text"],
+            "contextWindow": server.context,
+            # Pi lowers this on each request to what its context leaves, and
+            # compacts at a fixed distance from the window whatever it is.
+            "maxTokens": CLIENT_RESPONSE_TOKENS,
+        }
+        config["providers"] = {
+            **providers,
+            provider: {
+                "baseUrl": server.endpoint,
+                "api": "openai-completions",
+                "apiKey": api_key,
+                "models": [model],
+            },
+        }
+        _replace_file(path, json.dumps(config, indent=2) + "\n")
+
+
+@contextmanager
+def _locked(directory):
+    """Hold the exclusive lock of directory, which the launchers take to
+    update a file in it."""
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(descriptor)
 
 
 def _replace_file(path, text):
-    """Replace path only once text is complete: two launching shells never
-    expose a partially written configuration to the client."""
+    """Replace path only once text is complete, keeping its mode; a new file
+    is private. Two launching shells never expose a partially written
+    configuration to the client."""
+    mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
     with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as output:
         temporary = Path(output.name)
         try:
+            os.fchmod(output.fileno(), mode)
             output.write(text)
             output.close()
             temporary.replace(path)

@@ -1,3 +1,4 @@
+import fcntl
 import http.server
 import io
 import json
@@ -105,13 +106,16 @@ class ClientTests(unittest.TestCase):
                         config["providers"]["splash"]["apiKey"], "$SPLASH_API_KEY"
                     )
                 else:
+                    # Hermes expands the profile's reference from its
+                    # environment.
+                    self.assertEqual(env["SPLASH_API_KEY"], "test-server-key")
                     self.assertEqual(env["OPENAI_API_KEY"], "test-server-key")
                     profile = Path(env["HERMES_HOME"]) / "config.yaml"
+                    self.assertNotIn("test-server-key", profile.read_text())
                     self.assertEqual(
                         yaml.safe_load(profile.read_text())["model"]["api_key"],
-                        "test-server-key",
+                        "${SPLASH_API_KEY}",
                     )
-                    self.assertEqual(profile.stat().st_mode & 0o777, 0o600)
 
     def test_missing_clients_have_actionable_install_message(self):
         for name in clients.INSTALL_URLS:
@@ -303,7 +307,7 @@ class ClientTests(unittest.TestCase):
             },
         )
 
-    def test_hermes_launch_writes_a_private_profile(self):
+    def test_hermes_launch_writes_its_profile(self):
         # The user's own configuration, which Splash leaves as it is.
         self.hermes_root.mkdir()
         user = self.hermes_root / "config.yaml"
@@ -349,7 +353,6 @@ class ClientTests(unittest.TestCase):
                 }
             },
         )
-        self.assertEqual((home / "config.yaml").stat().st_mode & 0o777, 0o600)
         self.assertEqual({path.name for path in home.iterdir()}, {"config.yaml"})
         self.assertEqual(
             user.read_text(), "model:\n  default: cloud-model\n  provider: anthropic\n"
@@ -587,6 +590,36 @@ class ClientTests(unittest.TestCase):
         config = json.loads((dotfiles / "models.json").read_text())
         self.assertEqual(config["providers"]["splash"]["models"][0]["id"], MODEL)
         self.assertEqual([path.name for path in dotfiles.iterdir()], ["models.json"])
+
+    def test_pi_waits_for_another_launch_updating_its_models(self):
+        # A launch for a server on another port holds the lock meanwhile.
+        agent = self.pi_models.parent
+        agent.mkdir(parents=True)
+        other = os.open(agent, os.O_RDONLY)
+        self.addCleanup(os.close, other)
+        fcntl.flock(other, fcntl.LOCK_EX)
+        launch = threading.Thread(target=self.command, args=("pi",))
+        launch.start()
+        launch.join(0.5)
+        self.assertTrue(launch.is_alive())
+        self.assertFalse(self.pi_models.exists())
+        fcntl.flock(other, fcntl.LOCK_UN)
+        launch.join(10)
+        self.assertFalse(launch.is_alive())
+        self.assertIn("splash", json.loads(self.pi_models.read_text())["providers"])
+
+    def test_rewritten_configurations_keep_their_mode(self):
+        for name in ("hermes", "pi"):
+            with self.subTest(client=name):
+                _, env = self.command(name)
+                path = (
+                    Path(env["HERMES_HOME"]) / "config.yaml"
+                    if name == "hermes"
+                    else self.pi_models
+                )
+                path.chmod(0o640)
+                self.command(name, context=262144)
+                self.assertEqual(path.stat().st_mode & 0o777, 0o640)
 
     def test_opencode_preserves_unrelated_inline_config(self):
         user = {
@@ -880,7 +913,6 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(changed["display"], config["display"])
         self.assertEqual(changed["mcp_servers"], config["mcp_servers"])
         self.assertEqual((home / "state.db").read_bytes(), b"session data")
-        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
         self.assertEqual({p.name for p in home.iterdir()}, {"state.db", "config.yaml"})
 
     def test_invalid_hermes_profile_is_not_overwritten(self):

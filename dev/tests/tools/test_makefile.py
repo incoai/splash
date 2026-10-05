@@ -1,5 +1,7 @@
+import fcntl
 import hashlib
 import os
+import select
 import shlex
 import subprocess
 import tempfile
@@ -15,7 +17,8 @@ ROOT = Path(__file__).resolve().parents[3]
 # A base interpreter that passes the Makefile's version checks and creates
 # environments whose python logs each pip install, and each program it is
 # asked to run, beside the environment, so the rules run without a real
-# interpreter, index or program.
+# interpreter, index or program. A program run while the environment's lock
+# is held is logged in locked.log too.
 BOOTSTRAP = """#!/bin/sh
 here=$(cd "$(dirname "$0")" && pwd)
 case "$1" in
@@ -32,7 +35,9 @@ case "$1 $2 $3" in
   -c*) test ! -e "$environment/broken";;
   "-m pip install") shift 3; echo "$*" >> "$environment/../pip.log";;
   "-m pip --version"|"-m pip check") ;;
-  *) echo "$*" >> "$environment/../python.log";;
+  *) echo "$*" >> "$environment/../python.log"
+     /usr/bin/lockf -s -k -t 0 "$environment.install.lock" true \\
+       || echo "$*" >> "$environment/../locked.log";;
 esac
 """
 
@@ -55,13 +60,16 @@ INHERITED = (
 )
 
 
+def inherited_environment():
+    return {k: v for k, v in os.environ.items() if k not in INHERITED}
+
+
 class MakefileTests(unittest.TestCase):
     def make(self, *arguments, **environment):
-        inherited = {k: v for k, v in os.environ.items() if k not in INHERITED}
         return subprocess.run(
             ("make", "--no-print-directory", *arguments),
             cwd=ROOT,
-            env={**inherited, **environment},
+            env={**inherited_environment(), **environment},
             capture_output=True,
             text=True,
             timeout=120,
@@ -149,6 +157,61 @@ class MakefileTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("LANGUAGE_ONLY is 1 (text only) or 0", result.stderr)
 
+    def test_the_model_installs_without_the_environments_lock(self):
+        # Another setup of the environment, such as splash serve's, need not
+        # wait for the download.
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            result = self.make(
+                *ENGINE_BUILT,
+                "install",
+                "MODEL=owner/repo",
+                f"VENV={directory / 'venv'}",
+                f"PYTHON_CANDIDATES={self.interpreter(directory)}",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                (directory / "python.log").read_text(),
+                "install/models.py --model owner/repo prepare\n",
+            )
+            self.assertFalse(
+                (directory / "locked.log").exists(),
+                "the installer runs holding the environment's lock",
+            )
+
+    def test_a_setup_says_when_it_waits_for_another(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            environment = directory / "venv"
+            other = Path(f"{environment}.install.lock").open("a+")
+            fcntl.flock(other, fcntl.LOCK_EX)
+            with subprocess.Popen(
+                (
+                    "make",
+                    "--no-print-directory",
+                    "install-environment",
+                    f"VENV={environment}",
+                    f"PYTHON_CANDIDATES={self.interpreter(directory)}",
+                ),
+                cwd=ROOT,
+                env=inherited_environment(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            ) as setup:
+                try:
+                    said, _, _ = select.select([setup.stdout], [], [], 30)
+                    self.assertTrue(said, "the setup waits without a word")
+                    self.assertEqual(
+                        setup.stdout.readline(),
+                        f"Another setup of {environment} is running; waiting...\n",
+                    )
+                finally:
+                    other.close()
+                _, errors = setup.communicate(timeout=120)
+            self.assertEqual(setup.returncode, 0, errors)
+            self.assertTrue((environment / "pyvenv.cfg").exists())
+
     def test_architecture_check_runs_on_the_environments_python(self):
         # It parses the server's sources, which python3, possibly Xcode's
         # 3.9, cannot.
@@ -217,7 +280,7 @@ class MakefileTests(unittest.TestCase):
                     self.assertTrue(commands, f"{target} does not run {script}")
                     for command in commands:
                         arguments = parse_args(command[command.index(script) + 1 :])
-                        self.assertEqual(arguments.package, model_root)
+                        self.assertEqual(arguments.model_root, model_root)
 
 
 if __name__ == "__main__":

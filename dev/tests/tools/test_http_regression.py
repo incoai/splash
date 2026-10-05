@@ -23,7 +23,7 @@ class CharacterTokenizer:
 
 
 class HttpRegressionTests(unittest.TestCase):
-    def test_any_repository_selects_matching_package_and_api_name(self):
+    def test_any_repository_selects_matching_model_root_and_api_name(self):
         for selected in (
             "incoai/Qwen3.8-27B-Splash",
             "incoai/Qwen3.6-35B-A3B-Splash",
@@ -35,14 +35,14 @@ class HttpRegressionTests(unittest.TestCase):
                 arguments = smoke.parse_args(["--model", selected])
                 self.assertEqual(arguments.model, selected)
                 self.assertEqual(
-                    arguments.package,
+                    arguments.model_root,
                     smoke.model_artifacts.selection_link(
                         smoke.model_artifacts.MODELS, selected
                     ),
                 )
         model = "incoai/Qwen3.8-27B-Splash"
-        arguments = smoke.parse_args(["--package", "custom-package", "--model", model])
-        self.assertEqual(str(arguments.package), "custom-package")
+        arguments = smoke.parse_args(["--model-root", "custom-root", "--model", model])
+        self.assertEqual(str(arguments.model_root), "custom-root")
         self.assertEqual(arguments.model, model)
 
     def test_real_helpers_require_a_canonical_model(self):
@@ -89,7 +89,7 @@ class HttpRegressionTests(unittest.TestCase):
 
             def hold(arguments):
                 with mock.patch.object(smoke.model_artifacts, "MODELS", models):
-                    smoke.hold_package(arguments)
+                    smoke.hold_model_root(arguments)
 
             # The candidate's weight images are compared by its weight-digests.
             with (
@@ -101,19 +101,19 @@ class HttpRegressionTests(unittest.TestCase):
             (root / weights.WEIGHT_DIGESTS).parent.mkdir()
             (root / weights.WEIGHT_DIGESTS).touch()
             arguments = parse(legacy)
-            self.assertEqual(arguments.package, models / legacy)
+            self.assertEqual(arguments.model_root, models / legacy)
             hold(arguments)
             self.assertEqual(
-                (arguments.package, arguments.held_record), (models / legacy, None)
+                (arguments.model_root, arguments.held_record), (models / legacy, None)
             )
             # Parsing only names the selection link; the servers' run holds it.
             arguments = parse(upstream)
-            self.assertEqual(arguments.package, models / upstream)
+            self.assertEqual(arguments.model_root, models / upstream)
             self.assertFalse(smoke.assembly.is_held(assembly))
             hold(arguments)
             try:
                 # Installations collect an unlinked assembly unless it is held.
-                self.assertEqual(arguments.package, assembly)
+                self.assertEqual(arguments.model_root, assembly)
                 self.assertTrue(smoke.assembly.is_held(assembly))
             finally:
                 arguments.held_record.close()
@@ -135,20 +135,20 @@ class HttpRegressionTests(unittest.TestCase):
             link = models / "owner/model"
             link.parent.mkdir()
             link.symlink_to(assembly, target_is_directory=True)
-            for package in (assembly, link):
-                with self.subTest(package=str(package.relative_to(models))):
+            for model_root in (assembly, link):
+                with self.subTest(model_root=str(model_root.relative_to(models))):
                     with mock.patch.object(smoke.model_artifacts, "MODELS", checkout):
                         arguments = smoke.parse_args(
                             [
-                                "--package",
-                                str(package),
+                                "--model-root",
+                                str(model_root),
                                 "--model",
                                 "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M",
                             ]
                         )
-                        smoke.hold_package(arguments)
+                        smoke.hold_model_root(arguments)
                     try:
-                        self.assertEqual(arguments.package, assembly)
+                        self.assertEqual(arguments.model_root, assembly)
                         self.assertTrue(smoke.assembly.is_held(assembly))
                     finally:
                         arguments.held_record.close()

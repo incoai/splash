@@ -1066,7 +1066,7 @@ def parse_args(argv=None):
         "--draft-model", type=launcher.model_artifacts.parse_draft_model
     )
     parser.add_argument("--language-only", action="store_true")
-    parser.add_argument("--package", type=Path)
+    parser.add_argument("--model-root", type=Path)
     parser.add_argument("--max-context", default="100K")
     # Complete runs include several long-context turns and can take minutes.
     parser.add_argument("--client-timeout", type=float, default=900)
@@ -1077,8 +1077,8 @@ def parse_args(argv=None):
         "--output", type=Path, default=ROOT / "build/release/agent-real.json"
     )
     args = parser.parse_args(argv)
-    if args.package is None:
-        args.package = launcher.model_artifacts.Selection.of(
+    if args.model_root is None:
+        args.model_root = launcher.model_artifacts.Selection.of(
             launcher.model_artifacts.MODELS,
             args.model,
             revision=args.revision,
@@ -1189,7 +1189,7 @@ def main(argv=None):
         if args.http_smoke:
             smoke_real.run(port, model)
         reference = (
-            reference_fixture(args.package / "tokenizer", context)
+            reference_fixture(args.model_root / "tokenizer", context)
             if args.scenario == "complete"
             else ""
         )

@@ -9,7 +9,11 @@ VENV := .venv
 PYTHON = $(VENV)/bin/python
 # Holds the hash of the requirements the environment was last installed from.
 VENV_STAMP = $(VENV)/.requirements-installed
+# Held while the environment is set up. lockf waits for it without a word, so
+# each wait for it is announced first.
 INSTALL_LOCK = $(VENV).install.lock
+ANNOUNCE_INSTALL_WAIT = /usr/bin/lockf -s -k -t 0 "$(INSTALL_LOCK)" true \
+	|| echo "Another setup of $(VENV) is running; waiting..."
 REQUIREMENTS := install/requirements.txt
 PYTHON_CANDIDATES ?= python3.13 python3 python3.12 python3.14
 BUILD_ID_PYTHON ?= python3
@@ -60,19 +64,17 @@ ENGINE_CXXFLAGS := -std=c++20 -O3 -Wall -Wextra -Werror -Iruntime \
 	$(MACOS_TARGET_FLAG)
 ENGINE_OBJCXXFLAGS := $(ENGINE_CXXFLAGS) -fobjc-arc
 LIB := $(BUILD)/splash.metallib
-.PHONY: all clean force-build-identity install _install \
+.PHONY: all clean force-build-identity install \
 	install-environment _install-environment \
-	platform-check model-selection preflight serve
+	platform-check model-selection preflight
 
 all: $(TARGET)
 
 # The installer checks a model's configuration with the engine (build/splash
-# model-check) before it downloads any weight.
-install: model-selection platform-check $(TARGET)
-	@/usr/bin/lockf -k "$(INSTALL_LOCK)" $(MAKE) --no-print-directory \
-		-f "$(SPLASH_MAKEFILE)" _install
-
-_install: model-selection _install-environment
+# model-check) before it downloads any weight. It takes the models' own lock
+# for what it writes; the download holds up no other setup of the
+# environment.
+install: model-selection platform-check install-environment $(TARGET)
 	$(MODEL_INSTALL) prepare
 
 model-selection:
@@ -102,6 +104,7 @@ platform-check:
 	done
 
 install-environment:
+	@$(ANNOUNCE_INSTALL_WAIT)
 	@/usr/bin/lockf -k "$(INSTALL_LOCK)" $(MAKE) --no-print-directory \
 		-f "$(SPLASH_MAKEFILE)" _install-environment
 
@@ -168,9 +171,6 @@ preflight: model-selection
 	@$(MODEL_INSTALL) verify
 	@$(PYTHON) -m pip check >/dev/null
 	@TRANSFORMERS_VERBOSITY=error $(PYTHON) -c 'import server.server'
-
-serve: preflight $(TARGET)
-	./splash serve $(MODEL_ARGS)
 
 $(BUILD):
 	mkdir -p $(BUILD)

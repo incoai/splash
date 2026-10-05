@@ -94,9 +94,9 @@ class RealServer:
         *,
         cache_dir: Path | None = None,
     ):
-        """A server of arguments.package, with a persistent cache in cache_dir
-        when one is given."""
-        package = arguments.package.resolve()
+        """A server of arguments.model_root, with a persistent cache in
+        cache_dir when one is given."""
+        model_root = arguments.model_root.resolve()
         binary = arguments.binary.resolve()
         self.port = available_port()
         self.log = tempfile.NamedTemporaryFile(
@@ -106,7 +106,7 @@ class RealServer:
             sys.executable,
             "-m",
             "server.server",
-            str(package),
+            str(model_root),
             "--host",
             "127.0.0.1",
             "--port",
@@ -114,7 +114,7 @@ class RealServer:
             "--binary",
             str(binary),
             "--tokenizer",
-            str(package / "tokenizer"),
+            str(model_root / "tokenizer"),
             "--model",
             arguments.model,
         ]
@@ -1614,9 +1614,9 @@ def run_persistent_cache(arguments) -> None:
 def add_server_arguments(parser):
     parser.add_argument("--binary", type=Path, default=ROOT / "build/splash")
     parser.add_argument(
-        "--package",
+        "--model-root",
         type=Path,
-        help="installed model package root (target, draft and tokenizer)",
+        help="installed model root (target, draft and tokenizer)",
     )
     parser.add_argument("--model", type=serve_options.parse_model_id, required=True)
     parser.add_argument("--max-context", type=int)
@@ -1628,30 +1628,30 @@ def add_server_arguments(parser):
 
 
 def resolve_server_arguments(arguments):
-    """Serve --package, or else the selection link of --model."""
-    if arguments.package is None:
-        arguments.package = model_artifacts.selection_link(
+    """Serve --model-root, or else the selection link of --model."""
+    if arguments.model_root is None:
+        arguments.model_root = model_artifacts.selection_link(
             model_artifacts.MODELS, arguments.model
         )
     return arguments
 
 
-def hold_package(arguments):
+def hold_model_root(arguments):
     """As splash serve does, serve every server this process starts, and its
     tokenizer, from one assembly, which installations keep while it is held:
-    point arguments.package at the assembly it links now, held until the
+    point arguments.model_root at the assembly it links now, held until the
     process exits by arguments.held_record (None for a legacy package). The
     installation that collects an assembly is the one of the models root it
     was built in (models/.resolved/<record>), which may be another
     checkout's."""
-    resolved = arguments.package.resolve()
+    resolved = arguments.model_root.resolve()
     models_root = (
         resolved.parent.parent
         if resolved.parent.name == ".resolved"
         else model_artifacts.MODELS
     )
-    arguments.package, arguments.held_record = assembly.hold(
-        arguments.package, models_root
+    arguments.model_root, arguments.held_record = assembly.hold(
+        arguments.model_root, models_root
     )
 
 
@@ -1673,7 +1673,7 @@ def parse_args(argv=None):
 
 def main(argv=None) -> int:
     arguments = parse_args(argv)
-    hold_package(arguments)
+    hold_model_root(arguments)
     if arguments.persistent_cache:
         run_persistent_cache(arguments)
         return 0

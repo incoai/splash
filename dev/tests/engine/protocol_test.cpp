@@ -1085,6 +1085,6 @@ int main(int argc, char **argv) {
     std::cerr << failures << " failure(s)\n";
     return 1;
   }
-  std::cout << "native current protocol tests passed\n";
+  std::cout << "native protocol tests passed\n";
   return 0;
 }

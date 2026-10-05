@@ -128,12 +128,12 @@ class SmokeRealTests(unittest.TestCase):
 
     def test_server_paths_are_resolved_from_caller_directory(self):
         with TemporaryDirectory() as directory, contextlib.chdir(directory):
-            package = Path("model package")
+            model_root = Path("model root")
             binary = Path("native build/splash")
             for absolute in (False, True):
                 with self.subTest(absolute=absolute):
                     arguments = SimpleNamespace(
-                        package=package.resolve() if absolute else package,
+                        model_root=model_root.resolve() if absolute else model_root,
                         binary=binary.resolve() if absolute else binary,
                         model="test-model",
                         max_context=None,
@@ -161,11 +161,11 @@ class SmokeRealTests(unittest.TestCase):
                             )
                             self.assertEqual(
                                 command[1:4],
-                                ["-m", "server.server", str(package.resolve())],
+                                ["-m", "server.server", str(model_root.resolve())],
                             )
                             self.assertEqual(
                                 command[command.index("--tokenizer") + 1],
-                                str(package.resolve() / "tokenizer"),
+                                str(model_root.resolve() / "tokenizer"),
                             )
                             self.assertEqual(
                                 command[command.index("--binary") + 1],
@@ -177,7 +177,7 @@ class SmokeRealTests(unittest.TestCase):
     @staticmethod
     def server_arguments():
         return SimpleNamespace(
-            package=Path("/models/package"),
+            model_root=Path("/models/owner/model"),
             binary=Path("/build/splash"),
             model="test-model",
             max_context=None,

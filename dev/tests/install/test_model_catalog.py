@@ -17,12 +17,9 @@ class ModelCatalogTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         self.output = self.root / "cache/models.txt"
-        self.bundled = self.root / "bundled.txt"
-        self.bundled.write_text("company/Bundled\n")
-        for name, value in (("CACHE", self.output), ("BUNDLED", self.bundled)):
-            patch = mock.patch.object(catalog, name, value)
-            patch.start()
-            self.addCleanup(patch.stop)
+        patch = mock.patch.object(catalog, "CACHE", self.output)
+        patch.start()
+        self.addCleanup(patch.stop)
         patch = mock.patch.object(catalog.urllib.request, "urlopen")
         self.urlopen = patch.start()
         self.addCleanup(patch.stop)
@@ -58,10 +55,6 @@ class ModelCatalogTests(unittest.TestCase):
             request.full_url,
             f"{catalog.HUB_ENDPOINT}/api/collections/{catalog.COLLECTION}",
         )
-        self.assertEqual(
-            catalog.official_ids(),
-            ["community/Zeta", "company/Alpha", "company/Bundled"],
-        )
 
     def test_repeated_refresh_succeeds_and_reports_destination_count(self):
         for _ in range(2):
@@ -70,9 +63,10 @@ class ModelCatalogTests(unittest.TestCase):
                 update_model_catalog.main(["--output", str(self.output)])
             self.assertIn("Wrote 1 official model IDs", output.getvalue())
             self.assertFalse(catalog.is_stale())
+        # The background refresh of a stale cache marks it checked.
         os.utime(self.output, (0, 0))
         self.response({"items": [{"type": "model", "id": "company/Alpha"}]})
-        self.assertEqual(catalog.main(["--output", str(self.output)]), 0)
+        self.assertEqual(catalog.main(["--refresh"]), 0)
         self.assertFalse(catalog.is_stale())
 
     def test_failed_or_invalid_collection_preserves_previous_snapshot(self):
@@ -91,19 +85,19 @@ class ModelCatalogTests(unittest.TestCase):
                 self.assertEqual(self.output.read_text(), "company/Existing\n")
                 self.assertEqual(list(self.output.parent.iterdir()), [self.output])
         self.urlopen.side_effect = urllib.error.URLError("offline")
+        os.utime(self.output, (0, 0))
         with mock.patch("sys.stderr", io.StringIO()):
-            self.assertEqual(catalog.main(["--output", str(self.output)]), 1)
+            self.assertEqual(catalog.main(["--refresh"]), 1)
         with self.assertRaises(SystemExit):
             update_model_catalog.main(["--output", str(self.output)])
         self.assertEqual(self.output.read_text(), "company/Existing\n")
 
-    def test_corrupt_cache_can_be_replaced_without_losing_bundled_entries(self):
+    def test_corrupt_cache_is_replaced(self):
         self.output.parent.mkdir()
         self.output.write_bytes(b"\xff")
-        self.assertEqual(catalog.official_ids(), ["company/Bundled"])
         self.response({"items": [{"type": "model", "id": "company/New"}]})
         self.assertTrue(catalog.refresh())
-        self.assertEqual(catalog.official_ids(), ["company/Bundled", "company/New"])
+        self.assertEqual(self.output.read_text(), "company/New\n")
 
     def test_background_refresh_is_detached_and_fresh_cache_skips_spawn(self):
         with mock.patch.object(catalog.subprocess, "Popen") as process:

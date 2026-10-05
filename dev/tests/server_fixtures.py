@@ -362,7 +362,7 @@ class FakeCall:
     def result(self, timeout=None):
         with self._lock:
             if not self._done:
-                raise TimeoutError("fake current runtime call is not complete")
+                raise TimeoutError("fake runtime call is not complete")
             if self._error is not None:
                 raise self._error
             return self._result
@@ -419,9 +419,7 @@ class FakeRuntime:
 
     def submit(self, request, *, on_event=None, on_complete=None):
         if self.pending_count >= self.pending_limit:
-            raise engine_runtime.PendingLimitExceeded(
-                "fake current runtime runtime is full"
-            )
+            raise engine_runtime.PendingLimitExceeded("fake runtime is full")
         plan = None
         if not self.manual:
             plan = self.plans.pop(0) if self.plans else Plan([[4]])

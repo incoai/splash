@@ -367,6 +367,11 @@ creates it with `hermes profile create` on first use. It writes only the
 profile's model settings; Hermes's tools and the root's `config.yaml` remain
 the user's.
 
+With `SPLASH_API_KEY` set, Pi's `models.json` and the Hermes profile name the
+variable instead of holding the key: Pi and Hermes read the key from their
+environment, so one started without `splash` needs the variable in its shell.
+A file these launchers rewrite keeps its mode; one they create is private.
+
 ## Upgrading from earlier versions
 
 Before 1.2.0, Splash gave Hermes a home of its own: `hermes` in
@@ -1486,6 +1491,17 @@ prefill tile at each chunk of `R` rows (more than 32);
 `make benchmark-gguf-moe` times one MoE layer at the 35B shape, GGUF against affine Q4, on the
 device's plans and the other GGUF tile.
 
+Two more time the affine Q4 kernels on synthetic weights, with no model. `make benchmark-decode`
+times the N128, N256 and paired N128 decode tiles on eight simdgroups, plain and with the residual
+and gate/up epilogues each takes, at 8 to 32 rows, on the 27B's projection shapes, its draft's
+context projection and the LM head, over a range of threadgroup counts, and prints each one's time
+and effective bandwidth. It leaves out the other decode tiles the device policy chooses: Apple9's
+register tile (`LinearTile::Q4Register`), Apple10's `Split128` and paired N256 tiles, and N128 on
+four simdgroups at 24 rows. `make benchmark-prefill` times the prefill tiles the device policy
+chooses among (N128 and N256 on eight simdgroups, N128 on four), with their residual and gated
+epilogues, on the 27B's and 35B's projection shapes at 17 to 2,048 rows: the measurements behind
+the Apple9 prefill rule in `runtime/ops/Linear.cpp`.
+
 ### Residency and KV extents
 
 Every buffer the backend allocates belongs to one residency set attached to its
@@ -1776,7 +1792,10 @@ kernel tests under shader validation, and the Linear pipeline resource check
 without it. They include loading small synthetic MLX, GGUF and vision sources
 and the GGUF kernels on synthetic tensors. `make check-native-build` builds
 every native test, benchmark and tool and runs none. Hosted CI runs the CPU
-checks, `check-native-build` and the sanitizers.
+checks, `check-native-build` and the sanitizers. `make architecture-check`, one
+of the source checks, also fails when a workflow under `.github/workflows`
+names a Hugging Face token (`HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN` or a
+`secrets.HF_*` secret): CI installs public models alone and never receives one.
 
 The native tests are in `dev/tests/engine`; each Python test is in the
 directory of what it tests: `dev/tests/server`, `dev/tests/install` (launcher,
@@ -1793,7 +1812,7 @@ does, and `REVISION`, `DRAFT_MODEL` and `LANGUAGE_ONLY=1` as its `--revision`,
 | --- | --- |
 | `verify-models` | the installer's restarts without the Hub, `verify --full`, and the record of the weight images (`dev/tools/installer_restarts.py`, `weight-digests`, [Release check](#release-check)) |
 | `test-real` | vision parity with the family's fixture in `dev/tests/fixtures/vision-parity/` when the installation serves vision, and the native model runtime oracle |
-| `test-http-real` | the HTTP frontend on an isolated server (`dev/tests/smoke_real.py`); with `HTTP_SMOKE_ARGS="--persistent-cache --max-cache-disk 8G"`, instead of that smoke, the [persistent cache](#persistent-cache) across a restart in a fresh cache directory: a clean stop, a restart that takes the restore point back, and a next turn that restores the prompt from disk |
+| `test-http-real` | the HTTP frontend on an isolated server (`dev/tests/smoke_real.py`); with `HTTP_SMOKE_ARGS="--persistent-cache --max-cache-disk 8G"`, instead of that smoke, the [persistent cache](#persistent-cache) across a restart in a fresh cache directory: a clean stop, a restart that takes the restore point back, and a next turn that restores the prompt from disk; `release-check` runs both |
 | `test-agent-real` | the five official clients through `splash serve` (`dev/tests/agent_real.py`), in `AGENT_SCENARIO` `complete` (the default) or `smoke` |
 | `test-release-real` | the HTTP smoke and all five clients on one `splash serve` |
 | `test-performance-real` | the native decode and partial-prefix benchmark, or with `BASELINE` its ABBA comparison with that build (`dev/benchmarks/backend_regression.py`) |
@@ -1895,6 +1914,9 @@ the other. Per model, `release-check`:
   every weight image the installation loads (`verify-models`);
 - runs the HTTP smoke, which for a text-only installation checks the 400s
   instead of images (`test-http-real`);
+- stops and restarts a server with a [persistent cache](#persistent-cache),
+  and requires the conversation's next turn to restore its prompt from disk
+  (`test-http-real` with `HTTP_SMOKE_ARGS="--persistent-cache --max-cache-disk 8G"`);
 - compares this build with `BASELINE`, which must have another build
   identity, in ABBA order (`test-performance-real`): output tokens and
   acceptance must be identical (`EXPECT_OUTPUT_CHANGE=1` allows changed
@@ -1983,8 +2005,10 @@ does not measure end-to-end agent performance.
 ## Package
 
 Release archives contain no Hugging Face credentials and use the official model
-list committed with the source. The model-catalog workflow updates that list
-from the official collection independently of packaging.
+list committed with the source. `dev/tools/update_model_catalog.py` regenerates
+that list from the official collection, independently of packaging; the
+model-catalog workflow runs it and opens a pull request while the workflow is
+enabled.
 Users accessing private models supply their own `HF_TOKEN` or Hugging Face login.
 
 Release versions are three-part, `x.y.z`, with no `v` prefix: after `1.2.1`
@@ -2024,3 +2048,32 @@ is not an installation check.
 The runtime package allowlists engine, Python, server and launcher files; tests,
 benchmarks and developer documents are excluded. User model links survive
 upgrades; downloads remain in the Hugging Face cache.
+
+### Private test releases
+
+Testers can install a build before it is public, from a private Hugging Face
+repository:
+
+```sh
+make package RELEASE_VERSION=$VERSION
+make publish-test RELEASE_VERSION=$VERSION TEST_RELEASE_REPO=owner/splash-releases
+```
+
+`make publish-test` (`dev/tools/publish_test.py`) uploads the archive, its
+checksum, the tester installer `dev/tools/install.sh` and `latest`, which
+names this version, to `TEST_RELEASE_REPO` with the developer's own
+`hf auth login`, creating the repository as a private one if it does not
+exist; `publish_test.py --no-latest` uploads without moving `latest`. It
+prints the command testers run with a read token for the repository in
+`SPLASH_TOKEN`: curl reads the token's header from its standard input, so the
+token is in no command line or URL. The installer requires an Apple Silicon
+Mac on macOS 26.4 or newer. It downloads the version `latest` names, or
+`SPLASH_VERSION`, checks its SHA-256, unpacks it under
+`~/Library/Application Support/Splash/app`, points `current` at it, writes a
+`splash` command into `/opt/homebrew/bin` or `/usr/local/bin` when writable,
+else `~/.local/bin` (`SPLASH_BIN_DIR` chooses), and removes older versions. It
+refuses to replace a `splash` command it did not write, and to switch versions
+while a server runs. Running it again upgrades; installed models stay. To try
+an archive before uploading it, serve `dist/` (`python3 -m http.server`) and
+run the installer with `SPLASH_BASE_URL` naming that server, `SPLASH_VERSION`
+and any `SPLASH_TOKEN`.

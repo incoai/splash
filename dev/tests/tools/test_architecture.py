@@ -378,3 +378,45 @@ class ArchitectureTests(unittest.TestCase):
             )
             with mock.patch.object(check_architecture, "ROOT", root):
                 self.assertEqual(check_architecture.check(), [])
+
+    def test_no_workflow_passes_a_hugging_face_token(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workflows = root / ".github/workflows"
+            workflows.mkdir(parents=True)
+            # The path that turns the token store off names no token.
+            (workflows / "ci.yml").write_text("env:\n  HF_TOKEN_PATH: /nonexistent\n")
+            with mock.patch.object(check_architecture, "ROOT", root):
+                self.assertEqual(check_architecture.check(), [])
+                for name, text, token in (
+                    (
+                        "release.yml",
+                        "env:\n  HF_TOKEN: ${{ secrets.HF_TOKEN }}\n",
+                        "HF_TOKEN",
+                    ),
+                    (
+                        "release.yaml",
+                        "run: HUGGING_FACE_HUB_TOKEN=x make\n",
+                        "HUGGING_FACE_HUB_TOKEN",
+                    ),
+                    (
+                        "release.yml",
+                        "with:\n  token: ${{ secrets.HF_READ }}\n",
+                        "secrets.HF_",
+                    ),
+                    (
+                        "release.yml",
+                        "with:\n  token: ${{ secrets['HF_READ'] }}\n",
+                        "secrets['HF_",
+                    ),
+                ):
+                    with self.subTest(text=text):
+                        workflow = workflows / name
+                        workflow.write_text(text)
+                        self.assertEqual(
+                            check_architecture.check(),
+                            [
+                                f".github/workflows/{name}: passes a Hugging Face token ({token})"
+                            ],
+                        )
+                        workflow.unlink()

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Enforce production dependency boundaries."""
+"""Enforce production dependency boundaries, and keep Hugging Face tokens out
+of CI."""
 
 from __future__ import annotations
 
@@ -35,6 +36,11 @@ OPERATOR_WORKSPACE_POLICY = re.compile(
 SLEEP_COUNTING_CLOCK = re.compile(
     r"\b(?:steady_clock|high_resolution_clock|wait_for|try_lock_for"
     r"|try_acquire_for)\b"
+)
+# The variables huggingface_hub reads a token from, and the repository
+# secrets a workflow would pass one in.
+HUGGING_FACE_TOKEN = re.compile(
+    r"\b(?:HF_TOKEN|HUGGING_FACE_HUB_TOKEN)\b|\bsecrets\s*(?:\.\s*|\[\s*['\"])HF_"
 )
 
 
@@ -154,8 +160,18 @@ def check_package_imports() -> list[str]:
     return errors
 
 
+def check_workflows() -> list[str]:
+    # CI installs public models alone, which need no token, and a token a
+    # workflow passes reaches every program its job runs.
+    return [
+        f"{relative(path)}: passes a Hugging Face token ({match.group()})"
+        for path in sorted((ROOT / ".github/workflows").glob("*.y*ml"))
+        if (match := HUGGING_FACE_TOKEN.search(path.read_text()))
+    ]
+
+
 def check() -> list[str]:
-    errors = check_server_dependencies() + check_package_imports()
+    errors = check_server_dependencies() + check_package_imports() + check_workflows()
     forbidden_metal_dependencies = ("engine/", "model/", "ops/")
     forbidden_model_dependencies = ("engine/",)
     forbidden_operator_dependencies = ("engine/", "model/")

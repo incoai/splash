@@ -1,9 +1,10 @@
 name: Refresh official model catalog
 
-# install/completions/official-models.txt is generated from the Splash
-# collection on Hugging Face and bundled into the shell completion, so it can
-# drift the moment a model is added to the collection. This keeps it in sync
-# without waiting for someone to remember.
+# install/completions/official-models.txt, which shell completion bundles, is
+# generated from the Splash collection on Hugging Face and drifts when a model
+# joins the collection. This regenerates it and opens a pull request when it
+# changed, daily and on demand, while the workflow is enabled in the
+# repository's Actions settings.
 
 on:
   schedule:

@@ -366,8 +366,8 @@ def parse_args(argv=None):
                 parser.error(f"missing retained executable/library: {path}")
         if not weights.loads_in_memory(binary.resolve().parent):
             parser.error(f"{binary.parent} has no {weights.WEIGHT_DIGESTS}")
-    if smoke.model_artifacts.installation_kind(args.package) is None:
-        parser.error(f"missing installed model: {args.package}")
+    if smoke.model_artifacts.installation_kind(args.model_root) is None:
+        parser.error(f"missing installed model: {args.model_root}")
     return args
 
 
@@ -396,11 +396,11 @@ def check_identity(status: dict, version: str, rounds: list[dict]):
 
 def main(argv=None):
     args = parse_args(argv)
-    smoke.hold_package(args)
+    smoke.hold_model_root(args)
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(
-        args.package / "tokenizer", local_files_only=True
+        args.model_root / "tokenizer", local_files_only=True
     )
     nonce = uuid.uuid4().hex
     # A burst's requests each have a prefix of their own.
@@ -412,7 +412,7 @@ def main(argv=None):
     document = {
         "schema_version": 1,
         "timing": "HTTP/native wall; not GPU time",
-        "package": str(args.package.resolve()),
+        "model_root": str(args.model_root.resolve()),
         "rounds": [],
         "samples": [],
         "correctness_pass": False,
@@ -500,10 +500,10 @@ def main(argv=None):
             document["samples"]
         )
         # The model root RealServer gives both builds.
-        package = args.package.resolve()
+        model_root = args.model_root.resolve()
         document["weights"] = weights.compare(
-            weights.digests(builds["baseline"], package),
-            weights.digests(builds["candidate"], package),
+            weights.digests(builds["baseline"], model_root),
+            weights.digests(builds["candidate"], model_root),
         )
         smoke.require(
             document["weights"]["pass"],

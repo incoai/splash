@@ -31,7 +31,7 @@ AGENT_CLIENTS ?=
 AGENT_CLIENT_ARGS = $(if $(AGENT_CLIENTS),--clients $(AGENT_CLIENTS),)
 # smoke: implement and resume; complete adds compaction and cancellation.
 AGENT_SCENARIO ?= complete
-AGENT_ARGS = $(MODEL_ARGS) --package "$(MODEL_ROOT)" --scenario $(AGENT_SCENARIO) \
+AGENT_ARGS = $(MODEL_ARGS) --model-root "$(MODEL_ROOT)" --scenario $(AGENT_SCENARIO) \
 	$(AGENT_CLIENT_ARGS)
 HTTP_SMOKE_ARGS ?=
 
@@ -50,6 +50,7 @@ HTTP_SMOKE_ARGS ?=
 # environment has no stamp, and under -j make may read the stamp's time
 # before install-environment rebuilds it.
 install-development: install-environment
+	@$(ANNOUNCE_INSTALL_WAIT)
 	@/usr/bin/lockf -k "$(INSTALL_LOCK)" $(MAKE) --no-print-directory \
 		-f "$(SPLASH_MAKEFILE)" _install-development
 
@@ -109,7 +110,7 @@ test: test-engine test-python
 
 test-http-real: preflight $(TARGET) verify-build-identity
 	TRANSFORMERS_VERBOSITY=error $(PYTHON) dev/tests/smoke_real.py \
-		--model "$(MODEL)" --package "$(MODEL_ROOT)" $(HTTP_SMOKE_ARGS)
+		--model "$(MODEL)" --model-root "$(MODEL_ROOT)" $(HTTP_SMOKE_ARGS)
 
 # Finds the selected clients and runs test_clients.py's tests of the installed
 # OpenCode, Codex and Pi among them, which need no model.
@@ -140,7 +141,7 @@ test-performance-real: preflight $(TARGET) $(TEST_BACKEND_BENCHMARK) $(LIB) \
 		$(BUILD_ID_CONSTANT_ARGS) --binary $(TEST_BACKEND_BENCHMARK)
 ifneq ($(BASELINE),)
 	$(PYTHON) -m dev.benchmarks.backend_regression --baseline "$(BASELINE)" \
-		--package "$(MODEL_ROOT)" --output-dir "$(MODEL_RESULTS)"
+		--model-root "$(MODEL_ROOT)" --output-dir "$(MODEL_RESULTS)"
 else
 	@$(TEST_BACKEND_BENCHMARK) $(LIB) "$(MODEL_ROOT)" \
 		--scenario decode,partial --samples 3 \
@@ -177,6 +178,8 @@ release-check: preflight
 	$(MAKE) --no-print-directory test-real
 	$(MAKE) --no-print-directory verify-models
 	$(MAKE) --no-print-directory test-http-real
+	$(MAKE) --no-print-directory test-http-real \
+		HTTP_SMOKE_ARGS="--persistent-cache --max-cache-disk 8G"
 	$(MAKE) --no-print-directory test-performance-real
 	@test -z "$$(git status --porcelain)" || { \
 		echo "error: release checkout is not clean" >&2; \
