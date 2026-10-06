@@ -170,16 +170,23 @@ def json_bytes(value) -> bytes:
 
 
 def selection_link(
-    models: Path, model_id: str, *, revision=None, language_only=False, draft_model=None
+    models: Path,
+    model_id: str,
+    *,
+    revision=None,
+    language_only=False,
+    draft_model=None,
+    model_dir=None,
 ) -> Path:
     """The selection link of model_id with these source options:
     OWNER/REPO[:VARIANT] under models for the model alone, else
     .selections/<hash of the selection>."""
     repo_id, variant = split_model_id(model_id)
-    if revision or language_only or draft_model:
-        selection = json.dumps(
-            [model_id, revision, language_only, draft_model], separators=(",", ":")
-        )
+    if revision or language_only or draft_model or model_dir is not None:
+        values = [model_id, revision, language_only, draft_model]
+        if model_dir is not None:
+            values = [*values, str(Path(model_dir).expanduser().resolve())]
+        selection = json.dumps(values, separators=(",", ":"))
         return models / ".selections" / hashlib.sha256(selection.encode()).hexdigest()
     if variant is None:
         return models / repo_id
@@ -203,19 +210,33 @@ class Selection:
     draft_model: str | None
     models_root: Path
     link: Path
+    model_dir: Path | None = None
+    download_draft: bool = False
 
     @classmethod
     def of(
-        cls, models_root, model, *, revision=None, language_only=False, draft_model=None
+        cls,
+        models_root,
+        model,
+        *,
+        revision=None,
+        language_only=False,
+        draft_model=None,
+        model_dir=None,
+        download_draft=False,
     ):
         repo_id, variant = split_model_id(model)
         models_root = Path(models_root).resolve()
+        model_dir = (
+            Path(model_dir).expanduser().resolve() if model_dir is not None else None
+        )
         link = selection_link(
             models_root,
             model,
             revision=revision,
             language_only=language_only,
             draft_model=draft_model,
+            model_dir=model_dir,
         )
         return cls(
             model,
@@ -226,6 +247,8 @@ class Selection:
             draft_model,
             models_root,
             link,
+            model_dir,
+            download_draft,
         )
 
 
@@ -287,6 +310,16 @@ def parse_args(argv=None):
     )
     parser.add_argument("--revision", help="optional upstream branch, tag or commit")
     parser.add_argument(
+        "--model-dir",
+        type=Path,
+        help="reuse or download OWNER/REPO files in this library",
+    )
+    parser.add_argument(
+        "--download-draft",
+        action="store_true",
+        help="allow missing draft weights to be downloaded",
+    )
+    parser.add_argument(
         "--draft-model",
         type=parse_draft_model,
         help="override the automatically selected DFlash2 repository or local directory",
@@ -298,6 +331,10 @@ def parse_args(argv=None):
     )
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("prepare")
+    commands.add_parser(
+        "download-draft",
+        help="download the selected target's compatible draft, then exit",
+    )
     commands.add_parser("verify").add_argument("--full", action="store_true")
     commands.add_parser("link", help="print the selection link")
     return parser.parse_args(argv)
@@ -311,16 +348,19 @@ def main(argv=None):
         revision=args.revision,
         language_only=args.language_only,
         draft_model=args.draft_model,
+        model_dir=args.model_dir,
+        download_draft=args.download_draft or args.command == "download-draft",
     )
     if args.command == "link":
         print(selection.link)
         return 0
     # The installers import this module, so it imports them once it exists.
     if __package__:
-        from . import assembly, legacy, upstream
+        from . import assembly, legacy, local_models, upstream
     else:
         import assembly
         import legacy
+        import local_models
         import upstream
     try:
         # The launcher starts this with the stop signals blocked, so that one
@@ -328,6 +368,8 @@ def main(argv=None):
         signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGINT, signal.SIGTERM))
         if args.command == "prepare":
             upstream.prepare(selection)
+        elif args.command == "download-draft":
+            local_models.download_draft(selection)
         else:
             kind = installation_kind(selection.link)
             if kind == ASSEMBLY:

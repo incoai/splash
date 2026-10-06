@@ -11,13 +11,34 @@ _splash() {
     cur=${COMP_WORDS[COMP_CWORD]}
     prev=${COMP_WORDS[COMP_CWORD-1]}
     if [[ $COMP_CWORD -eq 1 ]]; then
-        COMPREPLY=($(compgen -W 'serve claude codex opencode hermes pi' -- "$cur"))
+        COMPREPLY=($(compgen -W 'serve download-draft claude codex opencode hermes pi' -- "$cur"))
         return 0
     fi
-    [[ ${COMP_WORDS[1]} == serve ]] || return 0
+    [[ ${COMP_WORDS[1]} == serve || ${COMP_WORDS[1]} == download-draft ]] || return 0
     for ((i=2; i<COMP_CWORD; i++)); do
         [[ ${COMP_WORDS[i]} == -- ]] && return 0
     done
+    if [[ $prev == --model-dir || $cur == --model-dir=* ||
+            $prev == = && ${COMP_WORDS[COMP_CWORD-2]} == --model-dir ]]; then
+        prefix=$cur
+        if [[ $cur == --model-dir=* ]]; then
+            prefix=${cur#--model-dir=}
+            [[ ${COMP_WORDBREAKS-} == *=* ]] || value_prefix=--model-dir=
+        elif [[ $cur == = ]]; then
+            prefix=
+        fi
+        while IFS= read -r directory; do
+            COMPREPLY[${#COMPREPLY[@]}]=$value_prefix$directory/
+        done < <(compgen -d -- "$prefix")
+        compopt -o filenames 2>/dev/null || true
+        return 0
+    fi
+    if [[ $cur == --* && $cur != --model=* ]]; then
+        local options='--model --model-dir --revision --draft-model'
+        [[ ${COMP_WORDS[1]} == serve ]] && options="$options --download-draft"
+        COMPREPLY=($(compgen -W "$options" -- "$cur"))
+        return 0
+    fi
     if [[ $cur == --model=* ]]; then
         prefix=${cur#--model=}
         [[ ${COMP_WORDBREAKS-} == *=* ]] || value_prefix=--model=

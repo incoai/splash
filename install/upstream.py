@@ -42,6 +42,10 @@ TOKENIZER_FILES = (
 )
 
 
+class MissingCheckpoint(models.ModelError):
+    """Required checkpoint files have not been installed yet."""
+
+
 @dataclass(frozen=True)
 class Target:
     """What the target repository supplies, known before any weight download."""
@@ -240,12 +244,11 @@ def _weight_files(repo, prefix=""):
         )
         names = {"model.safetensors"} if holds else set()
     else:
-        raise models.ModelError("model has no safetensors checkpoint")
-    if not all(
-        name in repo.files and "/" not in name and name.endswith(".safetensors")
-        for name in names
-    ):
+        raise MissingCheckpoint("model has no safetensors checkpoint")
+    if not all("/" not in name and name.endswith(".safetensors") for name in names):
         raise models.ModelError("checkpoint has missing or unsupported shards")
+    if not names <= repo.files:
+        raise MissingCheckpoint("checkpoint has missing or unsupported shards")
     return names
 
 
@@ -292,6 +295,12 @@ def prepare(selection):
     cannot answer, or a new commit cannot be installed, the verified
     installation starts instead. A legacy Splash package is installed by
     legacy.prepare."""
+    if selection.model_dir is not None:
+        if __package__:
+            from . import local_models
+        else:
+            import local_models
+        return local_models.prepare(selection)
     kind = models.installation_kind(selection.link)
     if kind == models.PACKAGE:
         legacy.prepare(selection)
@@ -442,10 +451,15 @@ def _install(selection, repo, installed, draft=None):
         )
         downloaded = repo.download(set(target.files.values()))
     files |= {path: downloaded[name] for path, name in target.files.items()}
+    publish(selection, repo, target, draft, files)
+
+
+def publish(selection, repo, target, draft, files):
+    """Publish a verified set of local source paths as an immutable assembly."""
     record = {
         "version": 1,
         "model": selection.model,
-        "family": family.name,
+        "family": families.family_for(target.config).name,
         "target_format": target.format,
         "vision_format": target.vision_format,
         "sources": {"target": repo.identity(), "draft": draft.identity()},
@@ -566,17 +580,22 @@ def _at(repo):
 
 
 def _draft_files(repo, family):
-    """The family's DFlash2 checkpoint in repo, downloaded, by assembly path:
+    downloaded = repo.download(inspect_draft(repo, family))
+    return {"draft/" + name: path for name, path in downloaded.items()}
+
+
+def inspect_draft(repo, family):
+    """Validate draft metadata and return required checkpoint filenames:
     config.json and the safetensors weights, model.safetensors or the shards
     its index names, at the root of the repository or --draft-model
     directory, as a DFlash2 release holds them. Its configuration must state
     the family's draft signature."""
     try:
         if "config.json" not in repo.files:
-            raise models.ModelError("no config.json")
+            raise MissingCheckpoint("no config.json")
         weights = _weight_files(repo)
     except models.ModelError as error:
-        raise models.ModelError(
+        raise type(error)(
             f"{repo.name} does not contain a DFlash2 checkpoint for {family.name}"
             f" ({error})"
         ) from error
@@ -591,8 +610,7 @@ def _draft_files(repo, family):
             f"draft configuration is incompatible with {family.name}: "
             + "; ".join(differences)
         )
-    downloaded = repo.download({"config.json", *weights})
-    return {"draft/" + name: path for name, path in downloaded.items()}
+    return {"config.json", *weights}
 
 
 def _config_value(config, key):

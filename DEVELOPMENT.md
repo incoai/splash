@@ -97,6 +97,8 @@ loopback, so use a listener that includes loopback when launching agents locally
 | Option | Default | Purpose |
 | --- | --- | --- |
 | `--revision` | Default branch | Select an upstream target branch, tag, or commit. See [revisions](#revisions). |
+| `--model-dir` | Hugging Face cache | Reuse a library of `OWNER/REPO/` directories; download missing targets there. See [model storage](#model-storage). |
+| `--download-draft` | Off | With `--model-dir`, allow draft downloads into that library; otherwise use the default cache. |
 | `--draft-model` | Matching DFlash2 checkpoint | Override the draft with a compatible repository or local directory. See [drafts](#drafts). |
 | `--language-only` | Off | Skip vision loading; image and PDF input is rejected. See [vision](#vision). |
 | `--host` | `127.0.0.1` | HTTP bind address. |
@@ -221,7 +223,7 @@ splash serve --model unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M
 splash serve --model mlx-community/Qwen3.8-27B-4bit --language-only
 ```
 
-A model ID with `--revision`, `--language-only` or `--draft-model` is a
+A model ID with `--revision`, `--language-only`, `--draft-model` or `--model-dir` is a
 separate installation from the same ID without them.
 
 ### Revisions
@@ -272,6 +274,49 @@ use the Hugging Face cache; prepared weights use `~/Library/Caches/Splash/weight
 (`SPLASH_WEIGHT_CACHE` relocates them). Later starts reuse prepared weights,
 and `brew upgrade splash` preserves models and agent sessions.
 See [weight preparation](#weight-preparation) for cache validation and cleanup.
+
+Use `--model-dir PATH` to reuse existing GGUF or supported MLX weights in a
+library such as LM Studio's `~/.lmstudio/models/`. The root contains
+`OWNER/REPO/` directories, with selected GGUF files at each repository's root.
+Relative paths and `~` are resolved before selecting an installation. Existing
+weights stay in place. Missing targets download as files beneath that library,
+with only the required quantization and supporting files fetched.
+
+```sh
+splash serve --model unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M --model-dir ~/.lmstudio/models/
+splash serve --model unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M --model-dir ~/.lmstudio/models/ --download-draft
+```
+
+Without `--download-draft`, local-library serving checks for a compatible draft
+in the library first, then an existing installation or the Hugging Face cache.
+A missing draft stops startup before target weight downloads and reports the
+required download command. An incompatible local draft is an error. Explicit
+`--download-draft` installs the draft into the selected library, even if it is
+cached elsewhere. `--draft-model` continues to accept a compatible repository
+or an existing local draft directory.
+
+To download the matching draft without downloading target weights, building
+the engine or starting a server:
+
+```sh
+splash download-draft --model unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M --model-dir ~/.lmstudio/models/
+splash download-draft --model mlx-community/Qwen3.8-27B-4bit
+```
+
+The command inspects target metadata and may fetch small metadata files or
+remote GGUF headers. Without `--model-dir`, it uses the default Hugging Face
+cache. Running it again reuses the installed draft. Ordinary `serve` without
+`--model-dir` retains automatic target and draft downloads.
+
+Complete local targets are reused without checking for upstream updates.
+`--revision` is rejected for unmanaged local files whose revision cannot be
+verified; Splash-managed downloads record their commit. Invalid existing files
+are reported rather than silently replaced. Local vision files must be present,
+or select `--language-only` to serve without vision.
+
+Splash's assembly links and generated tokenizer metadata remain in its model
+installation directory. Prepared weights remain in their separate cache.
+Cleaning Splash assemblies never removes files from the external library.
 
 ### Model cache
 

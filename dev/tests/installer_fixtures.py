@@ -140,7 +140,10 @@ class FakeHub:
                 RepoSibling(
                     rfilename=name,
                     size=(root / name).stat().st_size,
-                    blob_id=hashlib.sha1((root / name).read_bytes()).hexdigest(),
+                    blob_id=hashlib.sha1(
+                        f"blob {(root / name).stat().st_size}\0".encode()
+                        + (root / name).read_bytes()
+                    ).hexdigest(),
                 )
                 for name in listing(root)
             ],
@@ -162,7 +165,15 @@ class FakeHub:
             self.fetch(repo_id, name, revision)
         return str(self.snapshot(repo_id, revision))
 
-    def hf_hub_download(self, repo_id, filename, *, revision):
+    def hf_hub_download(self, repo_id, filename, *, revision, local_dir=None):
+        if local_dir is not None:
+            if self.download_failure:
+                raise self.download_failure
+            path = local_dir / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(self.remote / repo_id / revision / filename, path)
+            self.downloads.append(f"{repo_id}/{filename}")
+            return str(path)
         return str(self.fetch(repo_id, filename, revision))
 
     def try_to_load_from_cache(self, repo_id, filename, *, revision):
