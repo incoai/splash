@@ -259,9 +259,20 @@ class CompletionTests(unittest.TestCase):
         cases = (
             (
                 ["splash", ""],
-                ["serve", "claude", "codex", "opencode", "hermes", "pi"],
+                [
+                    "serve",
+                    "download-draft",
+                    "claude",
+                    "codex",
+                    "opencode",
+                    "hermes",
+                    "pi",
+                ],
             ),
             (["splash", "co"], ["codex"]),
+            (["splash", "download-draft", "--model", "community/l"], [LOCAL[1]]),
+            (["splash", "serve", "--download"], ["--download-draft"]),
+            (["splash", "download-draft", "--model-d"], ["--model-dir"]),
             (
                 ["splash", "serve", "--model", ""],
                 sorted((*OFFICIAL, *SUGGESTED, *LOCAL, *UPSTREAM)),
@@ -342,6 +353,30 @@ class CompletionTests(unittest.TestCase):
                         ),
                         [],
                     )
+
+    def test_bash_completes_library_directories_with_spaces(self):
+        _, directory = self.layout()
+        library = self.home / "model library"
+        library.mkdir()
+        prefix = str(self.home / "model")
+        for shell in bash_paths():
+            for command in ("serve", "download-draft"):
+                for arguments in (
+                    ["--model-dir", prefix],
+                    ["--model-dir=" + prefix],
+                    ["--model-dir", "=", prefix],
+                ):
+                    with self.subTest(
+                        shell=shell, command=command, arguments=arguments
+                    ):
+                        self.assertEqual(
+                            self.bash_complete(
+                                shell,
+                                directory / "splash.bash",
+                                ["splash", command, *arguments],
+                            ),
+                            [str(library) + "/"],
+                        )
 
     def test_bash_loaded_completion_survives_release_upgrade(self):
         for index, shell in enumerate(bash_paths()):
@@ -469,6 +504,12 @@ class CompletionTests(unittest.TestCase):
         for line, expected in (
             ("splash se", "splash serve "),
             ("splash p", "splash pi "),
+            ("splash dow", "splash download-draft "),
+            ("splash serve --download", "splash serve --download-draft "),
+            (
+                "splash download-draft --model community/l",
+                f"splash download-draft --model {LOCAL[1]} ",
+            ),
             ("splash serve --model community/l", f"splash serve --model {LOCAL[1]} "),
             ("splash serve --model=community/l", f"splash serve --model={LOCAL[1]} "),
             (

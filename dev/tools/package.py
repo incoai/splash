@@ -30,6 +30,8 @@ INSTALL_FILES = (
     "assembly.py",
     "legacy.py",
     "upstream.py",
+    "local_models.py",
+    "library.py",
     "gguf.py",
     "catalog.py",
     "requirements.txt",

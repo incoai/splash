@@ -120,6 +120,11 @@ def _ensure_installed(selection):
         model_artifacts.run_engine(["device-check"], "device check")
     except model_artifacts.ModelError as error:
         raise LauncherError(str(error)) from None
+    if _run_held(_model_command(selection, "prepare"), cwd=ROOT):
+        raise LauncherError("model download or verification failed")
+
+
+def _model_command(selection, action):
     command = [
         str(paths.PYTHON),
         str(ROOT / "install/models.py"),
@@ -127,18 +132,61 @@ def _ensure_installed(selection):
         str(selection.models_root),
         "--model",
         selection.model,
-        "prepare",
     ]
     for flag, value in (
         ("--revision", selection.revision),
         ("--draft-model", selection.draft_model),
+        ("--model-dir", selection.model_dir),
     ):
         if value is not None:
-            command[-1:-1] = [flag, value]
+            command.extend([flag, str(value)])
     if selection.language_only:
-        command.insert(-1, "--language-only")
-    if _run_held(command, cwd=ROOT):
-        raise LauncherError("model download or verification failed")
+        command.append("--language-only")
+    if selection.download_draft:
+        command.append("--download-draft")
+    return [*command, action]
+
+
+def download_draft(args):
+    for number in STOP_SIGNALS:
+        signal.signal(number, _interrupt)
+    selection = model_artifacts.Selection.of(
+        paths.MODELS,
+        args.model,
+        revision=args.revision,
+        draft_model=args.draft_model,
+        model_dir=args.model_dir,
+        download_draft=True,
+    )
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    with (RUNTIME_DIR / "serve.lock").open("a+") as installation:
+        try:
+            fcntl.flock(installation, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise LauncherError(
+                "Splash installation is busy; wait for the upgrade to finish"
+            ) from None
+        if not paths.PACKAGED and not paths.PYTHON.is_file():
+            with (RUNTIME_DIR / "build.lock").open("a+") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                if (
+                    not paths.PYTHON.is_file()
+                    and subprocess.run(
+                        ["make", "install-environment"],
+                        cwd=ROOT,
+                        pass_fds=(lock.fileno(),),
+                    ).returncode
+                ):
+                    raise LauncherError(
+                        "Python environment setup failed; see the output above"
+                    )
+        if _run_held(
+            _model_command(selection, "download-draft"),
+            cwd=ROOT,
+            pass_fds=(installation.fileno(),),
+        ):
+            raise LauncherError("draft download or verification failed")
+    return 0
 
 
 def _serve_lock_owner(lock):
@@ -232,6 +280,8 @@ def serve(args):
             revision=args.revision,
             language_only=args.language_only,
             draft_model=args.draft_model,
+            model_dir=args.model_dir,
+            download_draft=args.download_draft,
         )
         _ensure_installed(selection)
         # A concurrent install may advance the selection link. Keep this
@@ -275,7 +325,11 @@ def serve(args):
         # The exec resets the handlers; the server unblocks the signals once
         # its own are in place, past its imports.
         signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
-        os.execve(command[0], command, environment)
+        try:
+            os.execve(command[0], command, environment)
+        finally:
+            if record is not None:
+                record.close()
 
 
 def coding_client(args):
@@ -401,24 +455,41 @@ def parse_args(argv=None):
     # options first, --port among the network options.
     groups = serve_options.option_groups(server)
     model = groups["model"]
-    model.add_argument(
-        "--model",
-        type=serve_options.parse_model_id,
-        required=True,
-        metavar="OWNER/REPO[:VARIANT]",
-        help="upstream Hugging Face model, with a GGUF variant after ':' (e.g. :UD-Q4_K_M)",
+    draft = commands.add_parser(
+        "download-draft",
+        help="download the matching draft weights, without starting the server",
+        description="Inspect target metadata and download its compatible DFlash2 draft only.",
     )
+    draft.set_defaults(port=None)
+    for command in (model, draft):
+        command.add_argument(
+            "--model",
+            type=serve_options.parse_model_id,
+            required=True,
+            metavar="OWNER/REPO[:VARIANT]",
+            help="upstream Hugging Face model, with a GGUF variant after ':' (e.g. :UD-Q4_K_M)",
+        )
+        command.add_argument(
+            "--revision",
+            metavar="REVISION",
+            help="model branch, tag or commit (default: the repository's default branch)",
+        )
+        command.add_argument(
+            "--draft-model",
+            type=model_artifacts.parse_draft_model,
+            metavar="DRAFT",
+            help="DFlash2 draft repository or local directory to use instead of the "
+            "automatically selected one",
+        )
+        command.add_argument(
+            "--model-dir",
+            metavar="PATH",
+            help="model library containing OWNER/REPO directories; missing weights download here",
+        )
     model.add_argument(
-        "--revision",
-        metavar="REVISION",
-        help="model branch, tag or commit (default: the repository's default branch)",
-    )
-    model.add_argument(
-        "--draft-model",
-        type=model_artifacts.parse_draft_model,
-        metavar="DRAFT",
-        help="DFlash2 draft repository or local directory to use instead of the "
-        "automatically selected one",
+        "--download-draft",
+        action="store_true",
+        help="download missing draft weights to --model-dir or the default Hugging Face cache",
     )
     model.add_argument(
         "--language-only",
@@ -476,7 +547,11 @@ def parse_args(argv=None):
 def main(argv=None):
     args = parse_args(argv)
     try:
-        return serve(args) if args.command == "serve" else coding_client(args)
+        if args.command == "serve":
+            return serve(args)
+        if args.command == "download-draft":
+            return download_draft(args)
+        return coding_client(args)
     except (LauncherError, clients.ClientError, OSError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1

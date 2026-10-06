@@ -67,6 +67,158 @@ class LauncherTests(unittest.TestCase):
             os.environ.pop(name, None)
         keep_stop_signals(self)
 
+    def test_model_library_flags_are_public(self):
+        for command in ("serve", "download-draft"):
+            args = launcher.parse_args(
+                [
+                    command,
+                    "--model",
+                    MODEL_ID,
+                    "--model-dir",
+                    "~/my models",
+                    "--revision",
+                    "v2",
+                    "--draft-model",
+                    "community/draft",
+                ]
+            )
+            self.assertEqual(args.model_dir, "~/my models")
+            self.assertEqual(args.revision, "v2")
+            self.assertEqual(args.draft_model, "community/draft")
+        args = launcher.parse_args(["serve", "--model", MODEL_ID, "--download-draft"])
+        self.assertTrue(args.download_draft)
+        self.assertIsNone(args.model_dir)
+        self.assertFalse(
+            launcher.parse_args(["serve", "--model", MODEL_ID]).download_draft
+        )
+
+    def test_standalone_draft_download_does_not_build_or_serve(self):
+        chosen = mock.Mock(
+            models_root=Path("/models"),
+            model=MODEL_ID,
+            revision="v2",
+            draft_model="community/draft",
+            model_dir=Path("/local models"),
+            download_draft=True,
+            language_only=False,
+        )
+        with (
+            mock.patch.object(
+                launcher.model_artifacts.Selection, "of", return_value=chosen
+            ),
+            mock.patch.object(launcher.paths, "PACKAGED", True),
+            mock.patch.object(
+                launcher,
+                "RUNTIME_DIR",
+                Path(self.enterContext(tempfile.TemporaryDirectory())),
+            ),
+            mock.patch.object(launcher, "_version", return_value="test"),
+            mock.patch.object(launcher, "_ensure_installed") as install,
+            mock.patch.object(launcher.subprocess, "run") as native,
+            mock.patch.object(launcher, "_run_held", return_value=0) as run,
+            mock.patch.object(launcher.os, "execve") as execute,
+        ):
+            result = launcher.main(
+                [
+                    "download-draft",
+                    "--model",
+                    MODEL_ID,
+                    "--model-dir",
+                    "/local models",
+                    "--revision",
+                    "v2",
+                    "--draft-model",
+                    "community/draft",
+                ]
+            )
+        self.assertEqual(result, 0)
+        install.assert_not_called()
+        native.assert_not_called()
+        execute.assert_not_called()
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[-1], "download-draft")
+        for flag, value in (
+            ("--model-dir", "/local models"),
+            ("--revision", "v2"),
+            ("--draft-model", "community/draft"),
+        ):
+            self.assertEqual(argv[argv.index(flag) + 1], value)
+
+    def test_standalone_draft_failure_is_reported(self):
+        with (
+            mock.patch.object(launcher.paths, "PACKAGED", True),
+            mock.patch.object(
+                launcher,
+                "RUNTIME_DIR",
+                Path(self.enterContext(tempfile.TemporaryDirectory())),
+            ),
+            mock.patch.object(launcher, "_version", return_value="test"),
+            mock.patch.object(launcher, "_run_held", return_value=1),
+            mock.patch("sys.stderr", io.StringIO()) as error,
+        ):
+            result = launcher.main(["download-draft", "--model", MODEL_ID])
+        self.assertEqual(result, 1)
+        self.assertIn("draft download or verification failed", error.getvalue())
+
+    def test_standalone_source_bootstraps_only_python_when_needed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for failure in (False, True):
+                with (
+                    self.subTest(failure=failure),
+                    mock.patch.object(launcher.paths, "PACKAGED", False),
+                    mock.patch.object(launcher.paths, "PYTHON", root / "python"),
+                    mock.patch.object(launcher, "RUNTIME_DIR", root / "runtime"),
+                    mock.patch.object(
+                        launcher.subprocess,
+                        "run",
+                        return_value=subprocess.CompletedProcess([], int(failure)),
+                    ) as bootstrap,
+                    mock.patch.object(launcher, "_run_held", return_value=0) as run,
+                    mock.patch("sys.stderr", io.StringIO()) as error,
+                ):
+                    result = launcher.main(["download-draft", "--model", MODEL_ID])
+                self.assertEqual(result, int(failure))
+                self.assertEqual(
+                    bootstrap.call_args.args[0], ["make", "install-environment"]
+                )
+                if failure:
+                    run.assert_not_called()
+                    self.assertIn("Python environment setup failed", error.getvalue())
+                else:
+                    run.assert_called_once()
+
+    def test_standalone_draft_holds_installation_lease(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = Path(temporary)
+            with (
+                mock.patch.object(launcher, "RUNTIME_DIR", runtime),
+                mock.patch.object(launcher.paths, "PYTHON", Path(sys.executable)),
+                mock.patch.object(launcher, "_run_held") as run,
+            ):
+
+                def check_lease(*args, **kwargs):
+                    self.assertEqual(len(kwargs["pass_fds"]), 1)
+                    with (runtime / "serve.lock").open("a+") as other:
+                        with self.assertRaises(BlockingIOError):
+                            fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return 0
+
+                run.side_effect = check_lease
+                self.assertEqual(
+                    launcher.main(["download-draft", "--model", MODEL_ID]), 0
+                )
+                run.assert_called_once()
+                run.reset_mock()
+                with (runtime / "serve.lock").open("a+") as other:
+                    fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    with mock.patch("sys.stderr", io.StringIO()) as error:
+                        self.assertEqual(
+                            launcher.main(["download-draft", "--model", MODEL_ID]), 1
+                        )
+                    self.assertIn("installation is busy", error.getvalue())
+                run.assert_not_called()
+
     def test_serve_requires_exact_repository_id_before_build(self):
         for arguments in (
             ["serve"],
@@ -958,6 +1110,7 @@ class LauncherTests(unittest.TestCase):
                 "revision": "v2",
                 "language_only": True,
                 "draft_model": str(draft.resolve()),
+                "model_dir": (runtime / "local models").resolve(),
             }
             with (
                 mock.patch.object(launcher, "RUNTIME_DIR", runtime),
@@ -979,10 +1132,15 @@ class LauncherTests(unittest.TestCase):
                         "v2",
                         "--draft-model",
                         str(draft),
+                        "--model-dir",
+                        str(options["model_dir"]),
+                        "--download-draft",
                         "--language-only",
                     ]
                 )
             (chosen,) = install.call_args.args
+            self.assertEqual(chosen.model_dir, options["model_dir"])
+            self.assertTrue(chosen.download_draft)
             self.assertEqual(
                 (chosen.model, chosen.link),
                 (MODEL_ID, runtime / "selected"),
@@ -1004,6 +1162,8 @@ class LauncherTests(unittest.TestCase):
             command = run.call_args.args[0]
             self.assertEqual(run.call_args.kwargs["cwd"], launcher.ROOT)
             parsed = launcher.model_artifacts.parse_args(command[2:])
+            self.assertEqual(Path(parsed.model_dir), options["model_dir"])
+            self.assertTrue(parsed.download_draft)
             self.assertEqual(
                 (
                     parsed.command,

@@ -79,6 +79,25 @@ groups of 64, like the examples. Smaller variants run on
 [27B variants](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/tree/main) ·
 [35B variants](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/tree/main)
 
+Reuse a model library, including LM Studio downloads, with `--model-dir`:
+
+```sh
+splash serve --model unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M --model-dir ~/.lmstudio/models/
+```
+
+Splash looks inside `OWNER/REPO/` and downloads a missing target there. With
+`--model-dir`, the matching draft must already be installed; if it is missing,
+Splash reports the command to download it. Add `--download-draft` to download
+the draft into that library and serve, or download it separately:
+
+```sh
+splash download-draft --model unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M --model-dir ~/.lmstudio/models/
+```
+
+Omit `--model-dir` from the download command to use the default Hugging Face
+cache. This command downloads only the draft, without starting the server.
+See [model storage](DEVELOPMENT.md#model-storage) for cache and revision behavior.
+
 Vision and the tokenizer come from the target model's source.
 [Model loading and compatibility](DEVELOPMENT.md#upstream-model-loading) ·
 [Supported formats](DEVELOPMENT.md#gguf-targets)
