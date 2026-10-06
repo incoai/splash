@@ -38,6 +38,7 @@ For a server started with another `--port`, pass the same `--port` to the agent.
 
 Press Ctrl+C in the server terminal to stop Splash.
 For LM Studio Bionic, follow its [Splash setup guide](https://lmstudio.ai/blog/splash-engine).
+For VS Code's local agent, follow the [VS Code setup](docs/vscode.md).
 
 ## Use the API
 
