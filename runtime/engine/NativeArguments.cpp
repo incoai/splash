@@ -102,9 +102,11 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
     const std::string_view option(argv[next]);
     const std::string_view value(next + 1 < argc ? argv[next + 1] : "");
     if (option == "--kv-format") {
-      if (value != "int8" && value != "bf16")
-        throw UsageError("--kv-format requires int8 or bf16");
-      result.kvFormat = value == "int8" ? kv::Format::Int8 : kv::Format::BFloat16;
+      if (value != "int8" && value != "bf16" && value != "zbf16")
+        throw UsageError("--kv-format requires int8, bf16 or zbf16");
+      result.kvFormat = value == "int8"   ? kv::Format::Int8
+                        : value == "bf16" ? kv::Format::BFloat16
+                                          : kv::Format::ZipBFloat16;
     } else if (option == "--decode-share") {
       result.decodeShare = parseDecodeShare(value);
     } else if (option == "--max-image-patches") {

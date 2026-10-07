@@ -11,7 +11,7 @@ namespace splash::kv {
 
 PageStorage::PageStorage(metal::MetalBackend &backend,
     metal::AllocationAdmission admitAllocation, Layout layout,
-    uint32_t pageCount, uint32_t extentPages)
+    uint32_t pageCount, uint32_t extentPages, std::span<const uint8_t> zipBases)
     : backend_(backend), admitAllocation_(std::move(admitAllocation)),
       layout_(layout), pageCount_(pageCount), extentPages_(extentPages) {
     if (!admitAllocation_) {
@@ -40,6 +40,29 @@ PageStorage::PageStorage(metal::MetalBackend &backend,
         layers_.push_back(splash_kv_layer(extentPages_, data, scale, layer));
     extents_.resize(pageCount_ / extentPages_);
     extentAddresses_.resize(extents_.size());
+    if (layout_.format != Format::ZipBFloat16) {
+        if (!zipBases.empty())
+            throw std::invalid_argument("only ZBF16 KV pages take codec bases");
+        return;
+    }
+    const uint32_t bytes = splash_kvzip_codec_bytes(layout_.attentionLayers, layout_.kvHeads);
+    if (zipBases.size() != bytes - SPLASH_KVZIP_HEADER_BYTES) {
+        throw std::invalid_argument("ZBF16 codec bases do not match the KV layout");
+    }
+    codec_ = backend_.allocateBuffer(bytes, metal::BufferStorage::Shared, "kv-zip-codec");
+    auto *contents = static_cast<std::byte *>(codec_.contents());
+    SplashKvZipHeader header{};
+    header.layers = layout_.attentionLayers;
+    header.kv_heads = layout_.kvHeads;
+    std::memcpy(contents, &header, sizeof(header));
+    std::memcpy(contents + SPLASH_KVZIP_HEADER_BYTES, zipBases.data(), zipBases.size());
+}
+
+uint32_t PageStorage::zipOverflowSlabs() const noexcept {
+    if (!codec_) return 0;
+    uint32_t count = 0;
+    std::memcpy(&count, codec_.contents(), sizeof(count));
+    return count;
 }
 
 size_t PageStorage::extentIndex(uint32_t page) const {

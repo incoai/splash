@@ -151,7 +151,7 @@ void printUsage(std::string_view executable) {
       "usage: " + command +
       " serve-native MODEL_DIRECTORY"
       " MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto [MAX_CACHE_DISK_BYTES]"
-      " [--kv-format int8|bf16] [--decode-share SHARE]"
+      " [--kv-format int8|bf16|zbf16] [--decode-share SHARE]"
       " [--max-image-patches PATCHES] [--cache-dir DIRECTORY]"
       " [--idle-release SECONDS|off] [--idle-sleep prevent|allow] [--ane on|off]");
   writeStderrLine("       " + command + " model-check mlx-affine none|safetensors CONFIG [DRAFT_CONFIG]");

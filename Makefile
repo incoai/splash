@@ -288,6 +288,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/DFlashDraft.cpp \
 	runtime/model/ModelFactory.cpp \
 	runtime/model/SlotFile.cpp \
+	runtime/model/KvZipBases.cpp \
 	runtime/model/QwenState.cpp \
 	runtime/model/Runtime.cpp \
 	runtime/model/RuntimeArenas.cpp

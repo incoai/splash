@@ -122,6 +122,10 @@ enum class PrefillTensor : uint32_t {
   LinearCounters,
   // The rotated input of a rotated projection (ops::LinearScratch::rotated).
   LinearRotated,
+  // ZBF16 prefill's BF16 scratch and its page table (ops::KvZipPrefill);
+  // empty for other KV formats.
+  ZipScratch,
+  ZipScratchTable,
   Count,
 };
 
@@ -175,6 +179,13 @@ public:
     // Split projections return their counters to zero; they start there.
     if (const metal::MetalBuffer counters = get(PrefillTensor::LinearCounters))
       std::memset(counters.contents(), 0, counters.sizeBytes());
+    // The ZBF16 scratch's table names its pages in order.
+    if (const metal::MetalBuffer table = get(PrefillTensor::ZipScratchTable)) {
+      auto *entries = static_cast<SplashKvPage *>(table.contents());
+      const uint64_t extent = get(PrefillTensor::ZipScratch).gpuAddress();
+      for (uint32_t page = 0; page < kv::zipScratchPages(); ++page)
+        entries[page] = splash_kv_page_entry(extent, page);
+    }
   }
 
   [[nodiscard]] metal::MetalBuffer get(PrefillTensor tensor) const {

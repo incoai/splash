@@ -179,6 +179,8 @@ QwenTargetPrefillBuffers prefillBuffers(const PrefillArena &arena) {
   buffers.ropeSin = arena.get(PrefillTensor::RopeSin);
   buffers.chunkKeys = arena.get(PrefillTensor::ChunkKeys);
   buffers.chunkValues = arena.get(PrefillTensor::ChunkValues);
+  buffers.kvZip.scratch = arena.get(PrefillTensor::ZipScratch);
+  buffers.kvZip.scratchTable = arena.get(PrefillTensor::ZipScratchTable);
   buffers.moe = arena.moeScratch();
   return buffers;
 }
@@ -1247,6 +1249,7 @@ struct Runtime::Impl {
       }
     }
     QwenTargetPrefillBuffers buffers = prefillBuffers(*prefillArena);
+    buffers.kvZip.codec = kvPages.codec();
     const MetalBuffer finalHidden = targetModel.addPrefill(
         graph, std::move(buffers),
         std::span(modelSequences).first(batch.sequences.size()), batch.rows,
@@ -1462,6 +1465,7 @@ struct Runtime::Impl {
     buffers.chunkKeys = chunkKeys;
     buffers.chunkValues = chunkValues;
     buffers.moe = decodeArena->moeScratch(storage);
+    buffers.kvCodec = kvPages.codec();
     for (uint32_t lane = 0; lane < lanes; ++lane)
       chunks[lane] = ops::PagedAttention::verifyParams(
           items[lane].logicalPosition,

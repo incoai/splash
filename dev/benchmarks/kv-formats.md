@@ -54,7 +54,7 @@ power condition.
   state cells returned to zero after each request. The M5 INT8 output also
   matched the retained main run on the same input token-for-token.
 
-The benchmark tools accept `--kv-format int8|bf16`. `attention-sweep` accepts
+The benchmark tools accept `--kv-format int8|bf16|zbf16`. `attention-sweep` accepts
 `--compare-metallib BASELINE` and checks exact output equality (the baseline
 must be built from a tree with `residency_kick`, which every backend loads);
 `paged-attention-plan METALLIB --long` runs the long independent references.
@@ -73,7 +73,7 @@ The combined Python suite ran 766 tests: 764 passed and two opt-in external CLI
 routing tests were skipped. Production/CPU/sanitizers and Python 3.12–3.14 CI
 passed, as did the full Metal gate with shader validation on M5 Pro 20.
 
-The real HTTP smoke and ABBA tools accept `--kv-format int8|bf16` and check
+The real HTTP smoke and ABBA tools accept `--kv-format int8|bf16|zbf16` and check
 the running format and its quantization/scale identity. M5 Pro 20 HTTP ABBA
 against main passed transcript/usage equality and the unchanged 2% regression
 limit for both models (three samples per build, 2K/8K cold and cached requests,
@@ -104,3 +104,61 @@ token at all eight positions. Mean KL against those references was
 were byte-identical and retained the original state-cosine failure. This is a
 focused reproducer check, not a general task-quality or long-generation bound.
 Diagnostic capture code and model tensors are not part of production sources.
+
+## Lossless ZBF16 (2026-10-07)
+
+`--kv-format zbf16` stores BF16 target KV bit for bit in 0.8125 of its bytes
+(`runtime/metal/abi/KvZip.h`): each value's sign and mantissa byte as it is,
+its exponent as a 4-bit code against a per-(layer, tensor, KV head, dimension)
+16-binade window calibrated per model family, and the values outside their
+window as escapes in a 252-entry table per 32-token slab of one head, the
+coding SplitZip (Guo and Joshi, 2026) uses for KV transfer. Pages keep the
+BF16 extent geometry: the data regions hold sign/mantissa bytes and codes,
+the scale regions the escape tables, so the pool, prefix cache, SSD tier,
+persistent cache and memory plan handle the pages unchanged.
+
+Boundaries:
+
+- `kv::Format::ZipBFloat16` is a third format of the same `kv::Layout`;
+  `PageStorage` owns the codec buffer (a header with the escape-overflow count,
+  then the bases of `runtime/model/kvzip/<family>.inc`), which the store and
+  attention kernels bind after their page tables.
+- Prefill runs the BF16 split and reduce: the store expands a chunk's committed
+  history into a one-layer BF16 scratch of the prefill arena
+  (`PrefillTensor::ZipScratch`) and writes the chunk's rows there as well, one
+  bandwidth pass per layer and chunk (27B: 0.9 ms at 32K, 3.8 ms at 128K).
+- Verify decodes each page into a 16 KiB threadgroup tile, token-major, and
+  runs the BF16 loop's MPP products and softmax over it, bit for bit.
+- A slab with more escapes than its table stores the rest with code 0 (never
+  an infinity or NaN); the store counts it, `/status` reports
+  `identity.kv.overflow_slabs` and the server logs an error. Real KV needs 0.8
+  escapes per slab on average (at most 26 over 150K captured tokens of both
+  models); prompts of one repeated token up to ~200.
+- The persistent cache namespace includes the bases' digest.
+
+Validation on M5 Pro (16 cores, 48 GB), both models, GGUF UD-Q4_K_M:
+
+- `kv-zip` (shader-validated): the stores write the host reference codec's
+  bytes; every row decodes to its bits; prefill and verify attention equal the
+  BF16 kernels' output bit for bit, including rewritten rejected rows and a
+  slab past its escape table.
+- Greedy HTTP outputs on four prompts (short, story, 30K code, 40K prose):
+  identical to `--kv-format bf16` on both models; prefill times within noise
+  of BF16's.
+- `attention-sweep --kv-sample` on captured KV, per layer at 128K history,
+  one lane: verify 27B 3.06 ms (BF16 2.71), 35B 1.79 ms (BF16 1.54); at
+  32K 0.85 (0.76) and 0.53 (0.44). The BF16 verify kernel runs within ~25%
+  of its compute floor under 8-row speculative verify, so a decoded page's
+  wait for its own bytes costs more than the 19% fewer bytes save: lossless
+  pages give capacity (23% more context), not a decode speedup, on this GPU.
+- INT8 and BF16 unchanged: every attention kernel's bits and times match the
+  upstream metallib (36 cases), and the ABBA regression against upstream
+  (`test-performance-real` with `BASELINE`, idle, ANE split off on both)
+  passes every metric within 1.2%.
+
+Calibration: serve the model with `--kv-format bf16 --max-cache-disk 40G
+--persistent-cache --cache-dir DIR`, send prompts as long as the contexts it
+will serve, stop it cleanly and run `dev/tools/kvzip_calibrate.py` on the
+directory's `kv.slots`; the earlier calibration (NPLG, 3-bit codes in groups
+promoted to 16-binade or raw tiers, 0.734 of BF16's bytes) decoded 1.8x
+slower than BF16 and is in this branch's history.

@@ -5,13 +5,18 @@
 #include "metal/abi/KvExtent.h"
 #include "ops/PagedAttention.hpp"
 #include "tuning/HostKvExtents.hpp"
+#include "tuning/KvZipHost.hpp"
 #include "tuning/LinearNumerics.hpp"
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <fcntl.h>
 #include <functional>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <limits>
 #include <span>
 #include <stdexcept>
@@ -23,6 +28,56 @@
 // history of every lane in the extents of a pool, one chunk of rows per lane
 // with its queries, and the production store and attention graph over them.
 namespace splash::ops::tuning {
+
+// Real BF16 KV a fixture can hold instead of its synthetic history: the
+// pages a persistent cache wrote for a model (dev/tools/kvzip_calibrate.py
+// reads the same files), one page per slot of `layers` attention layers,
+// each the keys then the values of every KV head (keys token-major, values
+// dimension-major). History token t of a lane takes row t % 32 of a sample
+// page, layer `layer`, KV head h % heads.
+class KvSample final {
+public:
+  KvSample(const std::string &path, uint32_t layers, uint32_t heads)
+      : heads_(heads) {
+    const int file = ::open(path.c_str(), O_RDONLY);
+    struct stat info {};
+    if (file < 0 || ::fstat(file, &info) != 0)
+      throw std::runtime_error("cannot open KV sample " + path);
+    const uint64_t payload = uint64_t{layers} * 2 * heads * kv::kPageTokens * kDimensions * 2;
+    slotBytes_ = (payload + 16383) / 16384 * 16384;
+    bytes_ = uint64_t(info.st_size);
+    pages_ = uint32_t(bytes_ / slotBytes_);
+    void *mapped = pages_ ? ::mmap(nullptr, bytes_, PROT_READ, MAP_PRIVATE, file, 0) : MAP_FAILED;
+    ::close(file);
+    if (mapped == MAP_FAILED)
+      throw std::runtime_error("KV sample " + path + " holds no page of this shape");
+    data_ = static_cast<const uint16_t *>(mapped);
+    layer_ = layers / 2;
+  }
+  ~KvSample() { ::munmap(const_cast<uint16_t *>(data_), bytes_); }
+  KvSample(const KvSample &) = delete;
+  KvSample &operator=(const KvSample &) = delete;
+
+  [[nodiscard]] uint32_t heads() const noexcept { return heads_; }
+  // The BF16 bits of element d of KV head `head`'s token in tensor 0 (keys)
+  // or 1 (values) of the lane's history.
+  [[nodiscard]] uint16_t bits(uint32_t lane, uint32_t tensor, uint32_t head, uint32_t token,
+                              uint32_t d) const noexcept {
+    const uint32_t page = uint32_t((uint64_t{lane} * 7919 + token / kv::kPageTokens) % pages_);
+    const uint32_t row = token % kv::kPageTokens;
+    const uint64_t slab = uint64_t{kv::kPageTokens} * kDimensions;
+    const uint64_t at = uint64_t{page} * (slotBytes_ / 2) +
+                        ((uint64_t{layer_} * 2 + tensor) * heads_ + head % heads_) * slab +
+                        (tensor ? uint64_t{d} * kv::kPageTokens + row : uint64_t{row} * kDimensions + d);
+    return data_[at];
+  }
+
+private:
+  static constexpr uint32_t kDimensions = SPLASH_KV_HEAD_DIMENSION;
+  uint32_t heads_, layer_ = 0, pages_ = 0;
+  uint64_t slotBytes_ = 0, bytes_ = 0;
+  const uint16_t *data_ = nullptr;
+};
 
 // The target attention layer a fixture holds: its query and KV heads and its
 // cache format.
@@ -49,9 +104,12 @@ struct AttentionFixturePlan final {
   static constexpr uint32_t kMaximumLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
   static constexpr uint32_t kHeadDimension = SPLASH_KV_HEAD_DIMENSION;
   static constexpr uint64_t kAlignment = 16 * 1024;
-  // Table0 is lane 0's page table; every other lane's follows it.
+  // Table0 is lane 0's page table; every other lane's follows it. The ZBF16
+  // codec, prefill scratch and its table (KvZipPrefill) are empty for other
+  // formats.
   enum class Tensor : uint32_t {
     ChunkKeys, ChunkValues, Queries, Output, Partials, Statistics,
+    ZipCodec, ZipScratch, ZipScratchTable,
     Table0, Count = Table0 + kMaximumLanes
   };
   using Histories = std::array<uint32_t, kMaximumLanes>;
@@ -137,6 +195,12 @@ struct AttentionFixturePlan final {
     plan.size(Tensor::Output, queries);
     plan.size(Tensor::Partials, scratch.partialsBytes);
     plan.size(Tensor::Statistics, scratch.statisticsBytes);
+    if (shape.format == kv::Format::ZipBFloat16) {
+      plan.size(Tensor::ZipCodec, splash_kvzip_codec_bytes(geometry.poolLayers, shape.kvHeads));
+      plan.size(Tensor::ZipScratch, uint64_t{kv::zipScratchPages()} *
+                                        kv::zipScratchLayout(pool).bytesPerModelPage());
+      plan.size(Tensor::ZipScratchTable, uint64_t{kv::zipScratchPages()} * sizeof(SplashKvPage));
+    }
     plan.bytes = aligned(plan.poolBytes);
     for (uint64_t size : plan.sizes) {
       const uint64_t allocation = aligned(size);
@@ -210,11 +274,19 @@ public:
       tables_[lane] = tables_[0];
   }
 
+  // ZBF16's codec and prefill scratch; empty for other formats.
+  [[nodiscard]] KvZipPrefill zip() const {
+    return {buffer(Tensor::ZipCodec), buffer(Tensor::ZipScratch), buffer(Tensor::ZipScratchTable)};
+  }
+
   // Zeroes the allocation, then writes the page tables, every lane's
   // history, chunk and queries. Long histories consult `stop` every 256
-  // tokens; false when it stopped the fill.
-  bool fill(const std::function<bool()> &stop = {}) {
+  // tokens; false when it stopped the fill. BF16 and ZBF16 history comes
+  // from `sample` when one is given.
+  bool fill(const std::function<bool()> &stop = {}, const KvSample *sample = nullptr) {
     std::memset(base_.contents(), 0, plan_.bytes);
+    const bool zipped = plan_.shape.format == kv::Format::ZipBFloat16;
+    sample_ = plan_.shape.format == kv::Format::Int8 ? nullptr : sample;
     auto *chunkKeys = data<uint16_t>(Tensor::ChunkKeys);
     auto *chunkValues = data<uint16_t>(Tensor::ChunkValues);
     auto *queries = data<uint16_t>(Tensor::Queries);
@@ -224,14 +296,8 @@ public:
       for (uint32_t token = 0; token < plan_.histories[lane]; ++token) {
         if (token % 256 == 0 && stop && stop()) return false;
         for (uint32_t head = 0; head < plan_.shape.kvHeads; ++head) {
-          const auto key = [&](uint32_t d) {
-            return int((uint64_t{token} * 37 + head * 101 + d * 17 +
-                        uint64_t{token} * d * 3 + lane * 7) % 255) - 127;
-          };
-          const auto value = [&](uint32_t d) {
-            return int((uint64_t{token} * 53 + head * 79 + d * 29 +
-                        uint64_t{token} * d * 5 + lane * 19) % 255) - 127;
-          };
+          const auto key = [&](uint32_t d) { return historyKey(lane, head, token, d); };
+          const auto value = [&](uint32_t d) { return historyValue(lane, head, token, d); };
           if (plan_.shape.format == kv::Format::Int8) {
             *scale(lane, SPLASH_KV_KEY_SCALES, head, token) = 0.006f;
             *scale(lane, SPLASH_KV_VALUE_SCALES, head, token) = 0.007f;
@@ -241,12 +307,14 @@ public:
               keys[d] = key(d);
               values[d * kv::kPageTokens] = value(d);
             }
+          } else if (zipped) {
+            break; // encodeZipHistory writes the pages
           } else {
             auto *keys = keyRow<uint16_t>(lane, head, token);
             auto *values = valueColumn<uint16_t>(lane, head, token);
             for (uint32_t d = 0; d < dimensions; ++d) {
-              keys[d] = floatToBf16(key(d) * 0.006f);
-              values[d * kv::kPageTokens] = floatToBf16(value(d) * 0.007f);
+              keys[d] = historyBits(lane, 0, head, token, d);
+              values[d * kv::kPageTokens] = historyBits(lane, 1, head, token, d);
             }
           }
         }
@@ -270,7 +338,79 @@ public:
                 1018.0f);
       }
     }
+    if (zipped) {
+      auto *scratch = data<SplashKvPage>(Tensor::ZipScratchTable);
+      for (uint32_t page = 0; page < kv::zipScratchPages(); ++page)
+        scratch[page] = splash_kv_page_entry(buffer(Tensor::ZipScratch).gpuAddress(), page);
+      encodeZipHistory();
+    }
     return true;
+  }
+
+  // A lane's history token: INT8 keys and values, and BF16 ones scaled by
+  // 0.006 and 0.007.
+  [[nodiscard]] static int historyKey(uint32_t lane, uint32_t head, uint32_t token, uint32_t d) {
+    return int((uint64_t{token} * 37 + head * 101 + d * 17 + uint64_t{token} * d * 3 + lane * 7) %
+               255) - 127;
+  }
+  [[nodiscard]] static int historyValue(uint32_t lane, uint32_t head, uint32_t token, uint32_t d) {
+    return int((uint64_t{token} * 53 + head * 79 + d * 29 + uint64_t{token} * d * 5 + lane * 19) %
+               255) - 127;
+  }
+
+  // A lane's BF16 history element, keys (tensor 0) or values: the sample's,
+  // or the INT8 history scaled.
+  [[nodiscard]] uint16_t historyBits(uint32_t lane, uint32_t tensor, uint32_t head, uint32_t token,
+                                     uint32_t d) const {
+    if (sample_)
+      return sample_->bits(lane, tensor, head, token, d);
+    return tensor ? floatToBf16(historyValue(lane, head, token, d) * 0.007f)
+                  : floatToBf16(historyKey(lane, head, token, d) * 0.006f);
+  }
+
+  // ZBF16 history: the BF16 history the other formats hold, encoded page by
+  // page (tuning/KvZipHost.hpp) with bases fitted to all of it, as a model's
+  // calibration fits its KV.
+  void encodeZipHistory() {
+    using namespace kvzip;
+    const uint32_t heads = plan_.shape.kvHeads;
+    const auto element = [&](uint32_t lane, uint32_t tensor, uint32_t head, uint32_t token,
+                             uint32_t d) { return historyBits(lane, tensor, head, token, d); };
+    std::vector<std::vector<std::array<uint32_t, 256>>> histograms(
+        2 * heads, std::vector<std::array<uint32_t, 256>>(kDims));
+    for (uint32_t lane = 0; lane < plan_.lanes; ++lane)
+      for (uint32_t token = 0; token < plan_.histories[lane]; ++token)
+        for (uint32_t tensor = 0; tensor < 2; ++tensor)
+          for (uint32_t head = 0; head < heads; ++head)
+            for (uint32_t d = 0; d < kDims; ++d)
+              ++histograms[tensor * heads + head][d][(element(lane, tensor, head, token, d) >> 7) & 0xFF];
+    std::vector<HeadBases> bases;
+    auto *codec = data<uint8_t>(Tensor::ZipCodec);
+    SplashKvZipHeader header{};
+    header.layers = plan_.geometry.poolLayers;
+    header.kv_heads = heads;
+    std::memcpy(codec, &header, sizeof(header));
+    for (uint32_t tensor = 0; tensor < 2; ++tensor)
+      for (uint32_t head = 0; head < heads; ++head) {
+        bases.push_back(windows(histograms[tensor * heads + head]));
+        uint8_t *at = codec + splash_kvzip_base_offset(heads, plan_.geometry.layer, tensor, head);
+        std::memcpy(at, bases.back().base3.data(), kDims);
+        std::memcpy(at + kDims, bases.back().base4.data(), kDims);
+      }
+    std::vector<uint16_t> rows(kRows * kDims);
+    for (uint32_t lane = 0; lane < plan_.lanes; ++lane)
+      for (uint32_t page = 0; page * kRows < plan_.histories[lane]; ++page) {
+        const ZipPage zip{pages_, heads, pageIds_[lane][page], plan_.geometry.layer};
+        const uint32_t count = std::min(kRows, plan_.histories[lane] - page * kRows);
+        for (uint32_t tensor = 0; tensor < 2; ++tensor)
+          for (uint32_t head = 0; head < heads; ++head) {
+            for (uint32_t row = 0; row < count; ++row)
+              for (uint32_t d = 0; d < kDims; ++d)
+                rows[row * kDims + d] = element(lane, tensor, head, page * kRows + row, d);
+            if (storeRows(zip, tensor, head, rows.data(), 0, count, bases[tensor * heads + head]))
+              throw std::runtime_error("attention fixture ZBF16 history dropped escapes");
+          }
+      }
   }
 
   // One store and attention of the fixture's rows, encoded as the runtime
@@ -280,10 +420,10 @@ public:
         plan_.histories[0], plan_.rows, plan_.stride, plan_.pages[0]);
     PagedAttention::addPrefillStore(graph, layer_, buffer(Tensor::ChunkKeys),
                                     buffer(Tensor::ChunkValues), tables_[0], chunk,
-                                    plan_.layout());
+                                    plan_.layout(), zip());
     PagedAttention::addPrefill(graph, layer_, buffer(Tensor::Queries), buffer(Tensor::Output),
                                buffer(Tensor::Partials), buffer(Tensor::Statistics), tables_[0],
-                               chunk, attention);
+                               chunk, attention, zip());
   }
   // Each lane's rows are its verify rows, in the verify chunk stride.
   void addGraph(metal::CommandGraph &graph, const VerifyAttentionPlan &attention) const {
@@ -296,7 +436,8 @@ public:
     PagedAttention::addVerify(
         graph, layer_,
         {buffer(Tensor::ChunkKeys), buffer(Tensor::ChunkValues), buffer(Tensor::Queries),
-         buffer(Tensor::Partials), buffer(Tensor::Statistics), buffer(Tensor::Output), tables_},
+         buffer(Tensor::Partials), buffer(Tensor::Statistics), buffer(Tensor::Output), tables_,
+         buffer(Tensor::ZipCodec)},
         std::span(chunks).first(attention.lanes), attention);
   }
 
@@ -334,6 +475,7 @@ private:
   }
 
   AttentionFixturePlan plan_;
+  const KvSample *sample_ = nullptr;
   metal::MetalBuffer base_;
   HostKvExtents pages_;
   SplashKvLayer layer_;

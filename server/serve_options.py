@@ -387,9 +387,10 @@ SERVE_OPTIONS = (
         "--kv-format",
         "memory",
         dict(
-            choices=("int8", "bf16"),
+            choices=("int8", "bf16", "zbf16"),
             default="int8",
-            help="target KV cache storage (default: int8); bf16 uses more memory",
+            help="target KV cache storage (default: int8); bf16 uses more memory; "
+            "zbf16 stores bf16 losslessly in about 0.81 of its memory",
         ),
     ),
     ServeOption(

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "metal/abi/ExecutionGeometry.h"
+#include "metal/abi/KvZip.h"
 #include "metal/MetalBackend.hpp"
 
 #include <algorithm>
@@ -13,16 +14,19 @@ namespace splash::kv {
 
 // Selected once for a runtime and its entire page pool. Weight storage is
 // independent of the KV format; requests never change it while serving.
-enum class Format : uint32_t { Int8 = 1, BFloat16 = 2 };
+// ZipBFloat16 is BF16 stored losslessly in fewer bytes (abi/KvZip.h).
+enum class Format : uint32_t { Int8 = 1, BFloat16 = 2, ZipBFloat16 = 3 };
 
 [[nodiscard]] constexpr bool validFormat(Format format) noexcept {
-  return format == Format::Int8 || format == Format::BFloat16;
+  return format == Format::Int8 || format == Format::BFloat16 ||
+         format == Format::ZipBFloat16;
 }
 
 [[nodiscard]] constexpr std::string_view formatName(Format format) noexcept {
   switch (format) {
   case Format::Int8: return "int8";
   case Format::BFloat16: return "bf16";
+  case Format::ZipBFloat16: return "zbf16";
   }
   return "invalid";
 }
@@ -33,6 +37,8 @@ enum class Format : uint32_t { Int8 = 1, BFloat16 = 2 };
     return "q8s8_f32_scale_per_token_head_k_token_major_v_dimension_major";
   case Format::BFloat16:
     return "bf16_k_token_major_v_dimension_major";
+  case Format::ZipBFloat16:
+    return "bf16_lossless_4bit_exponent_window_k_v_token_major_escapes";
   }
   return "invalid";
 }
@@ -112,7 +118,8 @@ namespace detail {
 
 } // namespace detail
 
-// Physical KV geometry: Page32, either BF16 or per-(token, head) symmetric INT8.
+// Physical KV geometry: Page32, either BF16, per-(token, head) symmetric INT8
+// or lossless ZBF16, whose escapes take the scales' region.
 // Layer and head counts vary by target.
 struct Layout final {
   uint32_t attentionLayers = 0;
@@ -121,7 +128,8 @@ struct Layout final {
   Format format = Format::Int8;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
-    return attentionLayers && kvHeads && headDimension && validFormat(format);
+    return attentionLayers && kvHeads && headDimension && validFormat(format) &&
+           (format != Format::ZipBFloat16 || headDimension == SPLASH_KVZIP_DIMENSIONS);
   }
   [[nodiscard]] constexpr uint32_t elementsPerScale() const noexcept {
     return format == Format::Int8 ? headDimension : 0;
@@ -134,9 +142,13 @@ struct Layout final {
   }
   // Keys and values share one data and one scale geometry per layer page.
   [[nodiscard]] constexpr uint64_t dataBytesPerLayerPage() const noexcept {
+    if (format == Format::ZipBFloat16)
+      return uint64_t{kvHeads} * SPLASH_KVZIP_DATA_BYTES_PER_HEAD;
     return elementsPerLayerPage() * (format == Format::Int8 ? 1 : 2);
   }
   [[nodiscard]] constexpr uint64_t scaleBytesPerLayerPage() const noexcept {
+    if (format == Format::ZipBFloat16)
+      return uint64_t{kvHeads} * SPLASH_KVZIP_AUX_BYTES_PER_HEAD;
     return scalesPerTensorLayerPage() * sizeof(float);
   }
   [[nodiscard]] constexpr uint64_t bytesPerLayerPage() const noexcept {
@@ -149,7 +161,8 @@ struct Layout final {
   // An extent holds a whole number of these pages, so that every tensor
   // region starts 64 KiB-aligned. The INT8 scales are the tightest
   // constraint: 4 heads require 128 pages and 2 heads require 256. BF16
-  // needs only 1 or 2 pages. This is allocation geometry only; prefix
+  // needs only 1 or 2 pages; ZBF16's escape region 16 (4 heads) or 32 (2
+  // heads). This is allocation geometry only; prefix
   // matching remains Page32 in both cases.
   [[nodiscard]] constexpr uint32_t extentAlignmentPages() const noexcept {
     if (format == Format::BFloat16)
@@ -209,5 +222,16 @@ struct Layout final {
 
   bool operator==(const Layout &) const = default;
 };
+
+// ZBF16 prefill's BF16 scratch (ops::KvZipPrefill): one layer's pages of the
+// longest physical context, an even count so its regions stay 64 KiB-aligned
+// as a BF16 extent's do.
+[[nodiscard]] constexpr uint32_t zipScratchPages() noexcept {
+  const uint32_t pages = (kMaximumPhysicalTokens + kPageTokens - 1) / kPageTokens;
+  return (pages + 1) / 2 * 2;
+}
+[[nodiscard]] constexpr Layout zipScratchLayout(Layout layout) noexcept {
+  return {1, layout.kvHeads, layout.headDimension, Format::BFloat16};
+}
 
 } // namespace splash::kv

@@ -282,6 +282,6 @@ struct AneFfnSnapshot {
     const MemoryGovernorSnapshot &memoryGovernor, bool metalHealthy,
     std::string metalFailureReason, const ResourceWaitSnapshot &resourceWait,
     const NativeLoopTiming &loop, const WeightsSnapshot &weights,
-    const AneFfnSnapshot &aneFfn);
+    const AneFfnSnapshot &aneFfn, uint32_t kvZipOverflowSlabs = 0);
 
 } // namespace splash::engine

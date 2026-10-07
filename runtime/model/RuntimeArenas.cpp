@@ -123,6 +123,11 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
     put(PrefillTensor::LinearCounters, linear.counters);
     put(PrefillTensor::LinearRotated, linear.rotated);
   }
+  if (geometry.target.kvLayout.format == kv::Format::ZipBFloat16) {
+    const kv::Layout scratch = kv::zipScratchLayout(geometry.target.kvLayout);
+    put(PrefillTensor::ZipScratch, uint64_t{kv::zipScratchPages()} * scratch.bytesPerModelPage());
+    put(PrefillTensor::ZipScratchTable, uint64_t{kv::zipScratchPages()} * sizeof(SplashKvPage));
+  }
   if (geometry.target.ffnKind == QwenFfnKind::SparseMoe) {
     const ops::MoeWorkspace workspace =
         operators.moePrefillWorkspace(geometry.target.moeShape(), kPrefillRows);

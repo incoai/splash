@@ -140,6 +140,7 @@ public:
     // The memory control pass the transport runs at a command-free point
     // (MemoryControl::run).
     [[nodiscard]] bool controlPass(MemoryPressure pressure) {
+        reportKvZipOverflow();
         return memoryControl_.run(pressure);
     }
     // The status document, with the metrics and the loop timing the
@@ -159,6 +160,11 @@ private:
     std::unique_ptr<NativeRuntime> nativeLoop_;
     MemoryControl memoryControl_;
     RuntimeBootstrapReport report_;
+    // ZBF16 overflowing slabs already logged (reportKvZipOverflow).
+    uint32_t kvZipOverflowLogged_ = 0;
+
+    // Logs ZBF16 slabs that dropped escapes since the last pass.
+    void reportKvZipOverflow();
 };
 
 }  // namespace splash::engine

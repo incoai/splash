@@ -121,6 +121,7 @@ void testServerCommandLines(const char *path) {
          read.persistentCacheRoot = "/srv/cache";
        }},
       {"bf16", [](NativeArguments &read) { read.kvFormat = kv::Format::BFloat16; }},
+      {"zbf16", [](NativeArguments &read) { read.kvFormat = kv::Format::ZipBFloat16; }},
       {"disk_bf16",
        [](NativeArguments &read) {
          read.maxCacheDiskBytes = 5 * kGiB;
@@ -191,9 +192,9 @@ void testRefusals() {
             "the engine read a command line it must refuse");
   };
   refuses({"auto", "auto", "--kv-format", "fp16"},
-          "--kv-format requires int8 or bf16");
+          "--kv-format requires int8, bf16 or zbf16");
   // An option's missing value fails its check.
-  refuses({"auto", "auto", "--kv-format"}, "--kv-format requires int8 or bf16");
+  refuses({"auto", "auto", "--kv-format"}, "--kv-format requires int8, bf16 or zbf16");
   for (const char *share : {"-1", "nan", "inf", "half"})
     refuses({"auto", "auto", "--decode-share", share},
             "--decode-share requires a nonnegative number");

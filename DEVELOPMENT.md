@@ -87,7 +87,7 @@ access.
 | `--no-webui` | Off | Disable the chat page. |
 | `--max-memory` | Auto | Lower the ceiling on Metal allocations, e.g. `28G`; not combined process RSS. See [memory and context](#memory-and-context). |
 | `--max-context` | Auto | Set the context limit, e.g. `100K`. See [memory and context](#memory-and-context). |
-| `--kv-format` | `int8` | Target KV storage: `int8` or `bf16`. See [KV cache precision](#kv-cache-precision). |
+| `--kv-format` | `int8` | Target KV storage: `int8`, `bf16` or `zbf16` (BF16 compressed losslessly). See [KV cache precision](#kv-cache-precision). |
 | `--idle-release` | `10m` | Time without a request before the engine unwires its memory and frees the weights; the next request restores them. `off` keeps both. See [weight loading](#weight-loading). |
 | `--max-cache-disk` | `0` (off) | SSD quota for cached KV pages and states, e.g. `16G`; kept for the session, or across restarts with `--persistent-cache`. See [SSD cache](#ssd-cache). |
 | `--persistent-cache` | Off | Keep the SSD cache across restarts; needs `--max-cache-disk`. See [persistent cache](#persistent-cache). |
@@ -198,8 +198,26 @@ splash serve --model mlx-community/Qwen3.8-27B-4bit --kv-format bf16
 BF16 avoids target KV quantization, uses approximately twice the target KV
 memory, and can be slower at long contexts. Model weights are unchanged. Restart
 to switch formats. Omit `--kv-format` or use `--kv-format int8` for the default.
-The [SSD cache](#ssd-cache) supports both formats, preserving their stored
+The [SSD cache](#ssd-cache) supports every format, preserving their stored
 bytes without further quantization.
+
+`--kv-format zbf16` keeps BF16 KV bit for bit in 0.81 of its memory (1.63 MiB
+instead of 2 MiB per 27B page, so 23% more context in the same memory): each
+value's sign and mantissa as they are, and its exponent as a 4-bit code in a
+16-binade window that each (layer, KV head, dimension) calibrates per model
+family, with the rare value outside its window listed as an escape
+(`runtime/metal/abi/KvZip.h`; the coding follows SplitZip). Outputs match
+`--kv-format bf16` bit for bit: prefill decodes a chunk's history into a BF16
+scratch and runs the BF16 kernels, and decode's attention decodes each page into
+threadgroup memory and attends as BF16 does. Prefill costs about what BF16's
+does; decode attention takes 13–16% longer per layer at 128K history (M5 Pro:
+27B 3.06 ms against 2.71, 35B 1.79 against 1.54), less at shorter ones. Only
+model families with a calibration start (Qwen3.8-27B, Qwen3.6-35B-A3B);
+calibrate one from BF16 pages the persistent cache captured with
+`dev/tools/kvzip_calibrate.py`. A slab with more escapes than its table holds
+(252 per 8,192 values; real and repetitive prompts need under 200) stores the
+rest approximately: `/status` counts such slabs as `identity.kv.overflow_slabs`
+and the server logs an error.
 
 ### SSD cache
 
@@ -2182,7 +2200,15 @@ order, as the release check does ([Release check](#release-check)), and writes
 or a test of agent task quality.
 
 `benchmark-backend` lists the contexts the memory plan cannot hold in its
-report. Its cache checks reuse each context's cached prefix, so they need that
+report. Both take `--kv-format int8|bf16|zbf16`
+(`make benchmark-backend MODEL=... BACKEND_BENCHMARK_ARGS='--kv-format zbf16'`
+runs the tool with extra arguments); with `bf16`, whose startup runway spans
+more than one extent, the warmup timings are skipped. The attention sweep
+(`make benchmark-attention-sweep ATTENTION_SWEEP_ARGS='--kv-format zbf16
+--kv-sample 27b=PATH'`) fills BF16 and ZBF16 history from real KV pages a
+persistent cache captured (`kv.slots` in its directory), so ZBF16 decodes the
+escapes real KV has; `--compare-metallib` checks a candidate's bits and times
+against another build's kernels. Its cache checks reuse each context's cached prefix, so they need that
 memory free: when other programs leave too little, the engine evicts cached
 prefixes and the checks fail, naming what each lookup found.
 

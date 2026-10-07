@@ -14,8 +14,12 @@
 //
 // usage: attention-sweep METALLIB [--histories 0,2048,...] [--shapes 27b,35b]
 //                        [--lanes 1,4] [--repeat N] [--phases both|verify|prefill]
-//                        [--compare-metallib PATH] [--kv-format int8|bf16]
-//                        [--extent-pages N]
+//                        [--compare-metallib PATH] [--kv-format int8|bf16|zbf16]
+//                        [--extent-pages N] [--kv-sample SHAPE=PATH[,SHAPE=PATH]]
+//
+// --kv-sample fills BF16 and ZBF16 history with real KV pages a persistent
+// cache wrote for that shape's model (tuning/AttentionFixture.hpp KvSample),
+// so ZBF16 decodes real escapes; INT8 keeps the synthetic history.
 //
 // The comparison library loads into a MetalBackend of its own, which needs
 // residency_kick (kernels/shared/residency.metal) in every library it loads:
@@ -49,6 +53,7 @@ using namespace splash::ops;
 using tuning::AttentionFixture;
 using tuning::AttentionFixturePlan;
 using tuning::AttentionShape;
+using tuning::KvSample;
 
 constexpr uint32_t kMaximumLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
 constexpr uint32_t kVerifyRows = SPLASH_TARGET_VERIFY_ROWS;
@@ -134,14 +139,14 @@ double median(std::vector<double> values) {
 // a run also brings an idle GPU up to its clocks.
 std::vector<Case> measure(std::span<metal::MetalBackend *> backends,
                           const AttentionFixturePlan &plan, bool prefill, uint32_t repeat,
-                          double warmupSeconds) {
+                          double warmupSeconds, const KvSample *sample) {
   std::vector<std::unique_ptr<AttentionFixture>> fixtures;
   std::vector<metal::CommandGraph> graphs;
   std::vector<Case> results(backends.size());
   for (size_t i = 0; i < backends.size(); ++i) {
     fixtures.push_back(
         std::make_unique<AttentionFixture>(*backends[i], plan, "attention-sweep-fixture"));
-    fixtures.back()->fill();
+    fixtures.back()->fill({}, sample);
     graphs.push_back(caseGraph(*fixtures.back(), prefill));
     results[i].kvBytes = historyBytes(plan);
   }
@@ -233,7 +238,7 @@ int main(int argc, const char *argv[]) {
     if (argc < 2) {
       std::cerr << "usage: attention-sweep METALLIB [--histories LIST] [--shapes 27b,35b] "
                    "[--lanes LIST] [--repeat N] [--phases both|verify|prefill] "
-                   "[--compare-metallib PATH] [--kv-format int8|bf16] "
+                   "[--compare-metallib PATH] [--kv-format int8|bf16|zbf16] "
                    "[--extent-pages N]\n";
       return 64;
     }
@@ -245,6 +250,7 @@ int main(int argc, const char *argv[]) {
     uint32_t extentPages = 0;
     kv::Format format = kv::Format::Int8;
     std::string comparisonLibrary, phases = "both";
+    std::map<std::string, std::string> samples;
     for (int index = 2; index < argc; index += 2) {
       const std::string option(argv[index]);
       if (index + 1 >= argc)
@@ -260,11 +266,27 @@ int main(int argc, const char *argv[]) {
         extentPages = parseCount(argv[index + 1], 1, SPLASH_KV_PAGE_INDEX_MASK, option);
       else if (option == "--kv-format") {
         const std::string_view value(argv[index + 1]);
-        if (value != "int8" && value != "bf16")
-          throw std::invalid_argument("--kv-format takes int8 or bf16");
-        format = value == "int8" ? kv::Format::Int8 : kv::Format::BFloat16;
+        if (value != "int8" && value != "bf16" && value != "zbf16")
+          throw std::invalid_argument("--kv-format takes int8, bf16 or zbf16");
+        format = value == "int8"   ? kv::Format::Int8
+                 : value == "bf16" ? kv::Format::BFloat16
+                                   : kv::Format::ZipBFloat16;
       }
       else if (option == "--compare-metallib") comparisonLibrary = argv[index + 1];
+      else if (option == "--kv-sample") {
+        std::string text(argv[index + 1]);
+        size_t start = 0;
+        while (start < text.size()) {
+          const size_t comma = std::min(text.find(',', start), text.size());
+          const std::string item = text.substr(start, comma - start);
+          const size_t equals = item.find('=');
+          if (equals == std::string::npos ||
+              (item.substr(0, equals) != "27b" && item.substr(0, equals) != "35b"))
+            throw std::invalid_argument("--kv-sample takes 27b=PATH or 35b=PATH");
+          samples[item.substr(0, equals)] = item.substr(equals + 1);
+          start = comma + 1;
+        }
+      }
       else if (option == "--phases") {
         phases = argv[index + 1];
         if (phases != "both" && phases != "verify" && phases != "prefill")
@@ -314,6 +336,11 @@ int main(int argc, const char *argv[]) {
                       : kv::Layout{shape == "27b" ? kModelLayers27b : kModelLayers35b,
                                    geometry.kvHeads, geometry.headDimension, format}
                             .maximumExtentPages();
+      std::unique_ptr<KvSample> sample;
+      if (samples.count(shape))
+        sample = std::make_unique<KvSample>(samples[shape],
+                                            shape == "27b" ? kModelLayers27b : kModelLayers35b,
+                                            geometry.kvHeads);
       std::cerr << "\n" << name << "  (" << geometry.queryHeads << " query heads, "
                 << geometry.kvHeads << " KV heads, d=" << geometry.headDimension
                 << ", extents of " << shapeExtentPages << " pages)\n";
@@ -321,7 +348,7 @@ int main(int argc, const char *argv[]) {
         auto report = [&](bool prefill, uint32_t lane) {
           const auto cases =
               measure(backends, casePlan(geometry, prefill, lane, history, shapeExtentPages),
-                      prefill, repeat, warmupSeconds);
+                      prefill, repeat, warmupSeconds, sample.get());
           warmupSeconds = 0.1;
           for (size_t i = 0; i < cases.size(); ++i) {
             std::cout << (firstCase ? "" : ",")

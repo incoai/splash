@@ -64,9 +64,12 @@ makeRuntimeCacheIdentity(std::string_view combinedManifestSha256,
 // what its copies hold, from the models that computed them, the KV and
 // state layouts and the format of the cache's files. The build is not part
 // of it; a change to what a copy holds bumps the cache's format instead.
+// ZBF16 pages decode only with the bases that encoded them, so their
+// digest is part of it too.
 [[nodiscard]] std::string
 persistentCacheNamespace(const RuntimeCacheIdentity &identity,
-                         const model::CompositeStateLayout &states);
+                         const model::CompositeStateLayout &states,
+                         std::span<const uint8_t> kvZipBases = {});
 
 // A persistent cache tier's directory, and the files of its KV pages and
 // states there.
@@ -205,6 +208,7 @@ public:
   [[nodiscard]] engine::Cache &cache() noexcept {
     return *cache_;
   }
+  [[nodiscard]] const kv::PageStorage &kvPages() const noexcept { return *kvPages_; }
   [[nodiscard]] const RuntimeCacheIdentity &cacheIdentity() const noexcept {
     return cacheIdentity_;
   }
