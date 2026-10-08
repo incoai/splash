@@ -173,7 +173,7 @@ such as `--max-memory 28G` to leave room for other applications. The budget
 caps Metal allocations, not combined process RSS. The context limit is the
 model's native window, 256K tokens for both supported families, when the budget
 holds it beside the weights and, unless `--disable-ane`, the
-[Neural Engine split](#neural-engine-prefill) this Mac's calibration of a dense
+[Neural Engine split](#neural-engine-prefill) the start's calibration of a dense
 model takes, and otherwise as much as the budget holds beside them.
 `--max-context` sets it, such as `--max-context 100K`, up to what the budget
 holds without the split: beyond what the split leaves, the split takes fewer
@@ -1556,20 +1556,18 @@ ANE takes: with `--max-context` the split takes at most the channels whose plan
 still holds that context, and if even the fewest do not, the GPU runs alone and
 the start warns how much context any split leaves. Without it the engine serves
 the automatic context, which while the split may run is what the plan holds
-with the split this Mac's calibration of the model takes (below), the GPU
-alone's if it found no gain, whatever the start then makes of it: a split that
-failed leaves the GPU alone at the same context, and the memory the split would
-hold stays with the KV cache. Every start of a model on a Mac, the server's
-relaunch of the engine after a failure among them, so serves the same context.
-Until a calibration is remembered, a start that fails assumes the largest split
-the model could take (all its channel units but one, or the most whose plan
-holds any context). The log line names it beside the context without the split
+with the split the start's calibration chose (below), the GPU alone's if it
+found no gain; a start whose calibration fails assumes the largest split the
+model could take (all its channel units but one, or the most whose plan holds
+any context), and the memory the split would hold stays with the KV cache.
+Starts whose calibrations choose different splits so serve different contexts.
+The log line names it beside the context without the split
 (`context 61,433 tokens (73,721 with --disable-ane)`); `--disable-ane`, a
 target the split does not take and a Mac without the interface serve the
 latter. The start then logs `Setting up the Neural Engine FFN split (splash
 serve --disable-ane keeps the FFN on the GPU)`, so that a fault in the private
-client that ended the process would leave the way around it above, and, when it
-calibrates (below), times the split as a prefill runs it
+client that ended the process would leave the way around it above, and times
+the split as a prefill runs it
 (`runtime/ops/AneFfnMeasurement.cpp`): commands of layers through `begin()`,
 `add()`, `commit()` and the handoff, each split layer after the GPU alone's FFN
 of the same layer, a stand-in for the mixer, which the GPU's layer alone timed
@@ -1592,16 +1590,13 @@ and an M5 Pro the ANE's is the longer (1.7 ms a unit of the full-chunk layer
 against 0.6 and 1.1 ms), on an M6 the GPU's (1.9 against 1.2 ms). On
 Qwen3.8-27B that takes 8 of the 34 units on an M5 Max, 14-15 on an M5 Pro and
 25-26 on an M6, the best each Mac's sweeps measured. The split runs if T there
-gains 5% on the GPU alone. A start calibrates the split once for a Mac, a
-model, a macOS version, an engine build and the most units its memory plan
-holds, and remembers what it found (`remembered-*` in the cache directory
-below): the units, the least chunk and the GPU alone's layer at 512 and 2048
-rows, or that no split gains enough. Later starts take it untimed: they build
-the split, check it as below and serve, in 0.6 s on an M5 Max, 0.9 s on an M5
-Pro and 1.4 s on an M6. Across many starts over hours of prefill on those three
-Macs the timings chose the same units within their noise, while timing every
-start cost 3-8 s, and a start whose timings strayed could change the share,
-each share compiling a program of its own (half a minute on an M6).
+gains 5% on the GPU alone. Every start calibrates the split afresh, which takes
+about 6 s on an M5 Max with Qwen3.8-27B once the programs are compiled (23 s
+for a start that compiles them), so that the share follows what the GPU and
+the ANE do at that start: a calibration kept from a start while another process
+loaded the ANE would hold every later start to a low share. A start whose
+timings stray can choose another share, whose program compiles once (half a
+minute on an M6) and is then kept like the others.
 
 The start then builds the split that serves and checks every function of its
 program against the GPU alone (`AneFfn::verify`): at the function's own rows
@@ -1610,8 +1605,8 @@ ANE's output filled with NaN first so that rows it leaves unwritten show,
 against the leading rows of a full chunk on the GPU alone, which computes every
 row alike whatever the chunk's rows. The outputs must be finite and differ from
 the GPU's by at most 10% of what the ANE adds over the GPU's part; int8 leaves
-2.5-2.8% on Qwen3.8-27B. A start that calibrates then times the GPU's FFN layer
-alone at 512 and 2048 rows and the split layer of every function as above, and
+2.5-2.8% on Qwen3.8-27B. The start then times the GPU's FFN layer alone at 512
+and 2048 rows and the split layer of every function as above, and
 splits the chunks from the least rows from which every larger chunk's split
 layer takes at most 2% longer than the GPU's at the chunk's rows. Every row
 count is checked, since a batch's chunk sums its lanes' rows: an evaluation
@@ -1652,8 +1647,7 @@ Engine FFN split stopped (...)`. A split that loses to the GPU alone stops the
 same way, after a chunk whose results it keeps (`ops::ane_ffn::Breaker`): over
 each 8 commands it ran, the ANE's evaluations, each from the GPU's signal to
 start it to its report, took as long as the GPU alone's FFN layers of their
-functions' rows, on the line through the timings calibration took; the start's
-calibration is then forgotten, so that the next start calibrates again. The GPU
+functions' rows, on the line through the timings calibration took. The GPU
 then waits on the ANE at every layer, so the split is slower than the GPU
 alone; another process keeping the ANE busy costs the split 2-8% and a minute
 of prefill slows the M6's ANE by a third, far short of that. A given share
@@ -1671,11 +1665,10 @@ on Qwen3.8-27B); `splash serve --disable-ane` keeps the FFN on the GPU, and
 `backend-benchmark --ane-ffn-share` runs a given share over chunks of
 `--ane-ffn-minimum-rows` rows or more (512 by default), which
 `backend_regression` pins to its first round's. `make test-engine-cpu` runs
-`ane-ffn-calibration`, the fit, the choice, the least chunk, a calibration's
-line of text and the breaker on timings it is given, also under the sanitizers,
-and `ane-ffn-startup`, each outcome of a start on a model it plays, a
-remembered calibration among them, and the automatic context, the same in each
-where the split may run. `make test-engine-metal` runs `ane-ffn`: its kernels
+`ane-ffn-calibration`, the fit, the choice, the least chunk and the breaker on
+timings it is given, also under the sanitizers, and `ane-ffn-startup`, each
+outcome of a start on a model it plays, a second start that calibrates again
+among them, and the automatic context of each. `make test-engine-metal` runs `ane-ffn`: its kernels
 against CPU references for affine Q4 and every GGUF format under shader
 validation, then, without it, the split's memory and its output against the GPU
 alone, the same output once its program is unloaded and loaded again, a chunk's
@@ -1684,7 +1677,7 @@ function the client's instrumented build
 (`runtime/ane/ProgramInstrumentation.hpp`) binds to another's procedure, each
 fault of an evaluation it injects at each layer, a program that does not load
 again and evaluations slower than the GPU alone, which the breaker stops after
-8 commands, telling the start to forget its calibration, and the private
+8 commands, and the private
 client's failures, limits, unload and load, and cache files on a small program.
 `handoff` runs the event handoff against an agent the CPU plays in each way it
 can fail, and `ane-program-faults` checks that an Objective-C exception and a

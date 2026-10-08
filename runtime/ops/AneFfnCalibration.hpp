@@ -82,20 +82,6 @@ struct ChunkTimings final {
 // a chunk of the most rows does.
 [[nodiscard]] std::optional<uint32_t> minimumRows(const ChunkTimings &timings);
 
-// What one calibration of the split on this Mac decided, which later starts
-// take again (engine::startAneFfn): the ANE's units and the least rows of a
-// chunk the split takes, none of either when no split gained enough; and the
-// GPU alone's layer at the least and the most rows of the split's functions,
-// which the breaker judges the split against.
-struct Calibration final {
-  uint32_t aneUnits = 0, minimumRows = 0;
-  std::array<ChunkTimings::Gpu, 2> gpu{};
-
-  // As one line of text, and back: none for text that is not such a line.
-  [[nodiscard]] std::string text() const;
-  [[nodiscard]] static std::optional<Calibration> parse(std::string_view text);
-};
-
 // When a split that serves loses to the GPU alone (AneFfnCalibration.cpp):
 // over each kWindow commands it finishes, the Neural Engine's milliseconds
 // against the GPU alone's of as many layers.

@@ -20,10 +20,6 @@ constexpr double kMinimumGain = 0.05;
 // a prefill, so a chunk that splits within this prefills at most about 1%
 // slower.
 constexpr double kChunkNoise = 0.02;
-// The first word of a Calibration's text, which a change to its fields
-// renumbers.
-constexpr std::string_view kCalibrationTag = "ane-ffn-calibration-1";
-
 // The GPU alone's milliseconds of a chunk's FFN layer by its rows: the line
 // through its timings, which the GPU follows within 1% between them.
 Line gpuAlone(const std::array<ChunkTimings::Gpu, 2> &gpu) {
@@ -124,32 +120,6 @@ std::optional<uint32_t> minimumRows(const ChunkTimings &timings) {
       minimum = rows;
     }
   return minimum;
-}
-
-std::string Calibration::text() const {
-  std::ostringstream text;
-  text << std::setprecision(9) << kCalibrationTag << ' ' << aneUnits << ' ' << minimumRows;
-  for (const ChunkTimings::Gpu &point : gpu) text << ' ' << point.rows << ' ' << point.milliseconds;
-  return text.str();
-}
-
-// A record of units holds least rows and the GPU alone at ascending rows of
-// usable milliseconds; one of none holds neither.
-std::optional<Calibration> Calibration::parse(std::string_view text) {
-  std::istringstream in{std::string(text)};
-  std::string tag;
-  Calibration calibration;
-  in >> tag >> calibration.aneUnits >> calibration.minimumRows;
-  for (ChunkTimings::Gpu &point : calibration.gpu) in >> point.rows >> point.milliseconds;
-  std::string rest;
-  if (!in || tag != kCalibrationTag || (in >> rest)) return std::nullopt;
-  const auto &[low, high] = calibration.gpu;
-  const auto usableMilliseconds = [](double value) { return value > 0.0 && std::isfinite(value); };
-  if (!calibration.aneUnits) return calibration.minimumRows ? std::nullopt : std::optional(Calibration{});
-  if (!calibration.minimumRows || !(low.rows < high.rows) || !usableMilliseconds(low.milliseconds) ||
-      !usableMilliseconds(high.milliseconds))
-    return std::nullopt;
-  return calibration;
 }
 
 // Each layer the GPU waits for the Neural Engine's evaluation before it joins

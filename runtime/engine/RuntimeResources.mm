@@ -126,19 +126,6 @@ PersistentCacheFiles openPersistentCache(const std::filesystem::path &root,
   }
 }
 
-// The layers' part of what ane::recall() keeps a calibration under: their
-// shapes and formats.
-std::string calibrationKey(std::span<const ops::SwiGluProjections> layers) {
-  std::string key = "ane-ffn calibration";
-  for (const ops::SwiGluProjections &layer : layers)
-    for (const ops::Projection *projection : {layer.gate, layer.up, layer.down}) {
-      const bool affine = projection->layout() == ops::WeightLayout::Affine64;
-      key += " " + std::to_string(projection->outputSize) + "x" + std::to_string(projection->inputSize) + ":" +
-             (affine ? "a" : "g" + std::to_string(projection->blocks().segments.front().formatId));
-    }
-  return key;
-}
-
 // The split's part of what the engine gives back while idle, if it runs one.
 std::optional<ReleasableMemory::Split> idleSplit(ops::AneFfn *split) {
   if (!split)
@@ -465,7 +452,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     logLine("Kernel policy for GPU family ", device.appleGpuFamily,
             " with ", device.gpuCoreCount, " cores.");
     AneFfnStart aneFfn =
-        startAneFfn(aneFfnModel(*backend, loaded, operators, config.kvFormat, config.buildId, config.cancelled),
+        startAneFfn(aneFfnModel(*backend, loaded, operators, config.kvFormat, config.cancelled),
                     config.aneFfn,
                     requestedContextTokens, planMemory, config.cancelled);
     if (aneFfn.plan)
@@ -699,7 +686,7 @@ ActualMemoryReport RuntimeResources::actualMemoryReport(
 }
 
 AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &loaded,
-                        const ops::ExecutionPlans &operators, kv::Format format, std::string_view buildId,
+                        const ops::ExecutionPlans &operators, kv::Format format,
                         std::function<bool()> cancelled) {
   auto layers = std::make_shared<const std::vector<ops::SwiGluProjections>>(model::aneFfnLayers(loaded));
   AneFfnModel model;
@@ -733,17 +720,6 @@ AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &
     });
     return prepared;
   };
-  const std::string key = calibrationKey(*layers) + " device " + backend.capabilities().deviceName + " macos " +
-                          [[NSProcessInfo processInfo] operatingSystemVersionString].UTF8String + " build " +
-                          std::string(buildId) + " most ";
-  model.recall = [key](uint32_t maxAneUnits) -> std::optional<ops::ane_ffn::Calibration> {
-    const std::optional<std::string> line = ane::recall(key + std::to_string(maxAneUnits));
-    return line ? ops::ane_ffn::Calibration::parse(*line) : std::nullopt;
-  };
-  model.remember = [key](uint32_t maxAneUnits, const ops::ane_ffn::Calibration &calibration) {
-    ane::remember(key + std::to_string(maxAneUnits), calibration.text());
-  };
-  model.forget = [key](uint32_t maxAneUnits) { ane::forget(key + std::to_string(maxAneUnits)); };
   model.healthy = [&backend] { return backend.healthy(); };
   return model;
 }

@@ -365,11 +365,6 @@ void evaluateWithFaults(const ProgramInstrumentation::Faults &faults, uint64_t s
 }
 #endif
 
-// The file recall() reads under `key`, which remember() writes.
-std::filesystem::path rememberedFile(std::string_view key) {
-  return cacheDirectory() / ("remembered-" + hex(fnv1a(bytesOf(key))));
-}
-
 } // namespace
 
 std::filesystem::path cacheDirectory() {
@@ -827,34 +822,5 @@ void ProgramInstrumentation::arm(Faults faults) {
   armed().faults = std::move(faults);
 }
 #endif
-
-std::optional<std::string> recall(std::string_view key) noexcept {
-  try {
-    std::ifstream file(rememberedFile(key));
-    std::string line;
-    if (std::getline(file, line)) return line;
-  } catch (const std::exception &) {
-    // Nothing remembered can be read.
-  }
-  return std::nullopt;
-}
-
-void remember(std::string_view key, std::string_view line) noexcept {
-  try {
-    std::filesystem::create_directories(cacheDirectory());
-    writeWhole(rememberedFile(key), bytesOf(line));
-  } catch (const std::exception &) {
-    // The next start calibrates again.
-  }
-}
-
-void forget(std::string_view key) noexcept {
-  std::error_code error;
-  try {
-    std::filesystem::remove(rememberedFile(key), error);
-  } catch (const std::exception &) {
-    // The next start takes what is remembered.
-  }
-}
 
 } // namespace splash::ane

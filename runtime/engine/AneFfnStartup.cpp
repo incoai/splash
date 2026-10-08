@@ -123,9 +123,8 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, uint3
   // The automatic context of a start whose split takes `aneUnits`, the
   // GPU alone's for none: what the plan holds with them.
   const auto automaticWith = [&](uint32_t aneUnits) { return aneUnits ? contextWith(aneUnits) : without; };
-  // The units the automatic context assumes: this Mac's calibration once
-  // remembered, so that every start that takes it serves the same context,
-  // whatever it makes of the split, and until then the most.
+  // The units the automatic context of a start that does not serve the split
+  // assumes: none when it found no gain, else the most.
   uint32_t assumed = maxAneUnits;
   const auto gpuAloneServing = [&](Kind kind, std::string reason) {
     return gpuAlone(kind, std::move(reason), automaticWith(assumed));
@@ -166,37 +165,11 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, uint3
       if (prepared.split) prepared.split->setMinimumRows(setting.given->minimumRows);
       return serve(std::move(prepared), *given, setting.given->minimumRows, "", "set up");
     }
-    // The split takes the calibration's least chunk, and judges itself
-    // against the GPU alone as calibrated, forgetting the calibration once it
-    // loses.
-    const auto take = [&](AneFfnPrepared &prepared, const ane_ffn::Calibration &calibration) {
-      if (!prepared.split) return;
-      prepared.split->setMinimumRows(calibration.minimumRows);
-      prepared.split->setBreaker(ane_ffn::Breaker(calibration.gpu),
-                                 [forget = model.forget, maxAneUnits] { forget(maxAneUnits); });
-    };
-    // No split gains enough: the start remembers so, and the GPU alone serves
-    // its own context.
+    // No split gains enough: the GPU alone serves its own context.
     const auto noGain = [&](std::string reason) {
-      model.remember(maxAneUnits, {});
       assumed = 0;
       return gpuAloneServing(Kind::NoGain, std::move(reason));
     };
-
-    std::optional<ane_ffn::Calibration> calibration = model.recall(maxAneUnits);
-    if (calibration && calibration->aneUnits &&
-        (calibration->aneUnits > maxAneUnits || calibration->minimumRows < ops::AneFfn::kMinimumRows ||
-         calibration->minimumRows > ops::AneFfn::kMaximumRows))
-      calibration.reset();
-    if (calibration) {
-      assumed = calibration->aneUnits;
-      if (!calibration->aneUnits)
-        return gpuAloneServing(Kind::NoGain, "no Neural Engine split beat it by enough when this Mac calibrated it");
-      AneFfnPrepared prepared = model.prepare(calibration->aneUnits, false);
-      take(prepared, *calibration);
-      return serve(std::move(prepared), calibration->aneUnits, calibration->minimumRows, "",
-                   "set up as calibrated before");
-    }
 
     const ane_ffn::Timings timings = model.time();
     const std::optional<uint32_t> chosen =
@@ -213,12 +186,13 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, uint3
     if (!minimumRows)
       return noGain("no chunk of the Neural Engine split beats it by enough, " + timed + " (calibrated in " +
                     seconds() + ")");
-    const ane_ffn::Calibration made{*chosen, *minimumRows, chunks.gpu};
-    take(prepared, made);
-    AneFfnStart start = serve(std::move(prepared), *chosen, *minimumRows, ": " + timed + " on the GPU alone",
-                              "calibrated");
-    model.remember(maxAneUnits, made);
-    return start;
+    // The split takes the calibration's least chunk, and judges itself
+    // against the GPU alone as calibrated.
+    if (prepared.split) {
+      prepared.split->setMinimumRows(*minimumRows);
+      prepared.split->setBreaker(ane_ffn::Breaker(chunks.gpu), {});
+    }
+    return serve(std::move(prepared), *chosen, *minimumRows, ": " + timed + " on the GPU alone", "calibrated");
   } catch (const ane::Interrupted &) {
     throw;
   } catch (const std::exception &error) {

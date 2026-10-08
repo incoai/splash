@@ -1,6 +1,6 @@
 // How the prefill FFN's Neural Engine split is calibrated (ops/AneFfnCalibration.cpp), from timings it is given: the
-// model's fit, the share it chooses, the timings it takes, the least chunk it splits, the calibration later starts
-// take again and when a split that serves stops for losing to the GPU alone.
+// model's fit, the share it chooses, the timings it takes, the least chunk it splits and when a split that serves
+// stops for losing to the GPU alone.
 
 #include "TestChecks.hpp"
 #include "ops/AneFfnCalibration.hpp"
@@ -187,27 +187,6 @@ void testMinimumRows() {
     rejects([&] { static_cast<void>(minimumRows(timings)); }, "not those of its functions", what + " were taken");
 }
 
-// A calibration as a line of text comes back as it was, and one of no split as none; a line of another tag or
-// version, with more or fewer fields, units without least rows or the GPU alone out of order or unusable is not one.
-void testCalibrationText() {
-  const Calibration made{8, 655, {{{512, 5.25}, {2048, 19.375}}}};
-  const std::optional<Calibration> back = Calibration::parse(made.text());
-  require(back && back->aneUnits == 8 && back->minimumRows == 655 && back->gpu[0].rows == 512 &&
-              back->gpu[0].milliseconds == 5.25 && back->gpu[1].rows == 2048 && back->gpu[1].milliseconds == 19.375,
-          "a calibration did not come back as it was: " + made.text());
-  const std::optional<Calibration> none = Calibration::parse(Calibration{}.text());
-  require(none && !none->aneUnits && !none->minimumRows, "a calibration of no split did not come back");
-  for (const std::string_view line : {"", "ane-ffn-calibration-0 8 655 512 5.25 2048 19.375",
-                                      "ane-ffn-calibration-1 8 655 512 5.25 2048",
-                                      "ane-ffn-calibration-1 8 655 512 5.25 2048 19.375 1",
-                                      "ane-ffn-calibration-1 8 0 512 5.25 2048 19.375",
-                                      "ane-ffn-calibration-1 0 655 0 0 0 0",
-                                      "ane-ffn-calibration-1 8 655 2048 19.375 512 5.25",
-                                      "ane-ffn-calibration-1 8 655 512 0 2048 19.375",
-                                      "ane-ffn-calibration-1 8 655 512 nan 2048 19.375"})
-    require(!Calibration::parse(line), "\"" + std::string(line) + "\" was taken for a calibration");
-}
-
 // The breaker against the GPU alone on the line through 8 ms at 512 rows and 20 at 2048, 4 ms + rows / 128: a window
 // of 8 commands whose evaluations take as long as the GPU alone's layers trips it on its 8th command, one a little
 // faster never does, nor one that never was given the GPU alone. An evaluation of fewer rows counts against the GPU
@@ -267,7 +246,6 @@ int main() {
     testUsable();
     testNearestUnits();
     testMinimumRows();
-    testCalibrationText();
     testBreaker();
     std::cout << "ane ffn calibration tests passed\n";
     return EXIT_SUCCESS;

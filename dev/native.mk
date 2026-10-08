@@ -397,10 +397,7 @@ $(TEST_HANDOFF_TEST): dev/tests/engine/handoff_test.mm $(ENGINE_LIBRARY)
 $(TEST_VISION_ENCODER_TEST): dev/tests/engine/vision_encoder_test.mm \
 		$(ENGINE_LIBRARY)
 $(TEST_MODEL_RUNTIME_ORACLE): dev/tests/engine/model_runtime_oracle_test.mm \
-		$(ENGINE_INSTRUMENTED_METAL_OBJECT) $(ENGINE_INSTRUMENTED_ANE_OBJECT) $(ENGINE_LIBRARY) $(LIB) \
-		$(BUILD_ID_HEADER)
-# The oracle remembers the split's calibration under the build, as the engine does.
-$(TEST_MODEL_RUNTIME_ORACLE): ENGINE_TEST_CXXFLAGS += -include $(BUILD_ID_HEADER)
+		$(ENGINE_INSTRUMENTED_METAL_OBJECT) $(ENGINE_INSTRUMENTED_ANE_OBJECT) $(ENGINE_LIBRARY) $(LIB)
 # Compares the affine images loaded from an MLX model with the released
 # package, including all padding and metadata bytes. No target runs it, as it
 # needs an installed MLX model and the matching package (DEVELOPMENT.md).

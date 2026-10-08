@@ -276,13 +276,10 @@ private:
 // The model's side of the split of `loaded`'s target on `backend`, valid
 // while `backend`, `loaded` and `operators` are: its timing and prepared split
 // run on a prefill arena of their own, its programs wait for the ANE's
-// service until `cancelled` returns true, and its calibrations are
-// remembered beside the programs (ane::recall) under its layers' shapes and
-// formats, the device, the macOS version, the engine's `buildId` and the
-// most units the plan holds.
+// service until `cancelled` returns true.
 [[nodiscard]] AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &loaded,
                                       const ops::ExecutionPlans &operators, kv::Format format,
-                                      std::string_view buildId, std::function<bool()> cancelled);
+                                      std::function<bool()> cancelled);
 
 // Connects an engine to the governor that admits its memory: the engine asks
 // it whether the host pauses growth, and marks the allocations a request in

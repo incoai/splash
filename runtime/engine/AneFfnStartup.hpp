@@ -62,11 +62,6 @@ struct AneFfnModel final {
   // chunks timed (ops::ane_ffn::Measurement::chunks) when `timeChunks`. A
   // model a test plays prepares no split.
   std::function<AneFfnPrepared(uint32_t aneUnits, bool timeChunks)> prepare;
-  // This Mac's calibration of the split within `maxAneUnits` units, if one
-  // is remembered; remembering one; and forgetting it.
-  std::function<std::optional<ops::ane_ffn::Calibration>(uint32_t maxAneUnits)> recall;
-  std::function<void(uint32_t maxAneUnits, const ops::ane_ffn::Calibration &calibration)> remember;
-  std::function<void(uint32_t maxAneUnits)> forget;
   // Whether the Metal backend still serves.
   std::function<bool()> healthy;
 };
@@ -80,12 +75,11 @@ struct AneFfnOutcome final {
   std::string reason;
   // The context the engine serves without --max-context, and the one the
   // memory plan holds without the split. While the split may run, the first
-  // is what the plan holds with the split this Mac's calibration of the model
-  // takes, none if it found no gain, whatever the start makes of it, so that
-  // every start of the model on this Mac serves the same; with no calibration
-  // made, with the largest split the model could take. Otherwise both are the
-  // same. For a split refused a --max-context, the first is the most context
-  // a split leaves instead.
+  // is what the plan holds with the split the start's calibration chose,
+  // none if it found no gain, and with the largest split the model could take
+  // if the calibration failed. Otherwise both are the same. For a split
+  // refused a --max-context, the first is the most context a split leaves
+  // instead.
   uint32_t context = 0, contextWithout = 0;
 };
 // The kind's name in lowercase, as "no_gain".
@@ -103,16 +97,13 @@ struct AneFfnStart final {
 // within the memory plan `planMemory` makes with the split's bytes set aside:
 // one whose plan still holds `requestedContextTokens`, or with zero the
 // automatic context (AneFfnOutcome::context). Every step is arithmetic until
-// the plan holds a split; then it logs that it sets the split up. The split
-// takes this Mac's calibration of the model within the units the plan holds,
-// once remembered; else it is calibrated: timed, its share chosen
-// (ops::ane_ffn::choose), the split that serves prepared, its chunks timed
-// and the least it takes found (ops::ane_ffn::minimumRows), and the outcome
-// remembered, a split or none. The split then judges itself against the GPU
-// alone as calibrated (ops::ane_ffn::Breaker), which forgets the calibration
-// when it trips, so that the next start calibrates again; a given split
-// takes the given least chunk, no breaker, and nothing remembered. Logs the
-// outcome. A failure leaves the GPU alone, unless `cancelled` returns true,
+// the plan holds a split; then it logs that it sets the split up. Every start
+// calibrates the split within the units the plan holds: times it, chooses its
+// share (ops::ane_ffn::choose), prepares the split that serves, times its
+// chunks and finds the least it takes (ops::ane_ffn::minimumRows). The split
+// then judges itself against the GPU alone as calibrated
+// (ops::ane_ffn::Breaker); a given split takes the given least chunk and no
+// breaker. Logs the outcome. A failure leaves the GPU alone, unless `cancelled` returns true,
 // the wait for the ANE was interrupted or the backend no longer serves, which
 // the failure's exception reports. Throws std::invalid_argument for a given
 // split of no units or of least rows no function holds.

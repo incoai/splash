@@ -1484,8 +1484,7 @@ int main(int argc, char **argv) {
     const uint32_t extentPages = kvLayout.extentPagesFor(budgetPages);
     const uint32_t pageCount = budgetPages - budgetPages % extentPages;
     // A dense target's prefill FFN splits with the Neural Engine as a start
-    // splits it (engine::startAneFfn), calibrated by the build's first run and
-    // remembered for the runs after it unless a share is given,
+    // splits it (engine::startAneFfn), calibrated unless a share is given,
     // within a plan that holds the oracle's pages. The split is allocated
     // beside the weights, outside the governor's admissions, and its own
     // category of the plan bounds it, as the memory audit requires. A split
@@ -1497,8 +1496,7 @@ int main(int argc, char **argv) {
       require(aneFfnSetting.given.has_value(), "--ane-ffn-fault takes a share given by --ane-ffn-share");
       ane::ProgramInstrumentation::arm({.failingEvaluation = aneFfnFault});
     }
-    const engine::AneFfnModel aneFfnModel =
-        engine::aneFfnModel(backend, model, operators, format, "model-runtime-oracle " SPLASH_BUILD_ID, {});
+    const engine::AneFfnModel aneFfnModel = engine::aneFfnModel(backend, model, operators, format, {});
     engine::AneFfnStart aneFfnStart =
         engine::startAneFfn(aneFfnModel, aneFfnSetting, pageCount * kv::kPageTokens, planMemory, {});
     std::cout << "ane_ffn_outcome=" << engine::aneFfnOutcomeName(aneFfnStart.outcome.kind) << ' '
@@ -1506,8 +1504,7 @@ int main(int argc, char **argv) {
     require(aneFfnStart.outcome.kind != engine::AneFfnOutcome::Kind::Unavailable,
             "the Neural Engine split is unavailable: " + aneFfnStart.outcome.reason);
     // The automatic context is what the plan holds with the split the start
-    // runs, as this Mac's calibration of the model remembers it, and without
-    // the split otherwise.
+    // runs, and without the split otherwise.
     const auto contextOf = [&](uint64_t aneFfnBytes) {
       const EngineMemoryPlanResult result = planMemory(aneFfnBytes);
       return result.plan ? result.plan->maximumContextTokens() : 0u;

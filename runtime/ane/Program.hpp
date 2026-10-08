@@ -48,8 +48,7 @@ inline constexpr uint64_t kConstantOffset = 64;
 [[nodiscard]] std::vector<uint8_t> constantBlob(std::span<const _Float16> values);
 
 // splash-ane in the per-user cache directory, where programs keep their
-// sources and recall() keeps what remember() wrote. Throws if macOS names no
-// per-user cache directory.
+// sources. Throws if macOS names no per-user cache directory.
 [[nodiscard]] std::filesystem::path cacheDirectory();
 
 // Why no Program can run in this process, as constructing one would throw
@@ -150,12 +149,5 @@ private:
   std::shared_ptr<Impl> impl_;
   Limits limits_;
 };
-
-// A line kept beside the compiled programs under `key`, such as a model's
-// calibration on this Mac; none until remembered, once forgotten or macOS
-// clears the cache directory, or when it cannot be read.
-[[nodiscard]] std::optional<std::string> recall(std::string_view key) noexcept;
-void remember(std::string_view key, std::string_view line) noexcept;
-void forget(std::string_view key) noexcept;
 
 } // namespace splash::ane
