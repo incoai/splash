@@ -321,7 +321,12 @@ def prepare(selection):
         raise models.ModelError(
             "this runtime package has no variants; drop the :VARIANT suffix"
         )
-    if selection.revision or selection.language_only or selection.draft_model:
+    if (
+        selection.revision
+        or selection.language_only
+        or selection.draft_model
+        or selection.mmproj is not None
+    ):
         raise models.ModelError("source selection options require an upstream model ID")
     link = selection.link
     selection.models_root.mkdir(parents=True, exist_ok=True)

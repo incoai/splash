@@ -98,7 +98,16 @@ Omit `--model-dir` from the download command to use the default Hugging Face
 cache. This command downloads only the draft, without starting the server.
 See [model storage](DEVELOPMENT.md#model-storage) for cache and revision behavior.
 
-Vision and the tokenizer come from the target model's source.
+The tokenizer comes from the target model's source. Vision normally does too;
+for a GGUF without vision weights, use an existing compatible projector:
+
+```sh
+splash serve --model OWNER/REPO --mmproj /path/to/mmproj-BF16.gguf
+```
+
+`--mmproj` overrides the repository's projector. It accepts a local BF16/F32
+GGUF with supported vision geometry and an output dimension matching the target.
+It cannot be combined with `--language-only`.
 [Model loading and compatibility](DEVELOPMENT.md#upstream-model-loading) ·
 [Supported formats](DEVELOPMENT.md#gguf-targets)
 
@@ -113,6 +122,7 @@ window. To set your own limits or cache options, add these to `splash serve`:
 | `--idle-release off` | Keep the model in memory while idle (default: release after 10m). |
 | `--max-context 100K` | Set the context limit. |
 | `--language-only` | Skip vision; serve text only. |
+| `--mmproj PATH` | Use a local BF16/F32 vision projector for a GGUF target. |
 | `--kv-format bf16` | Use BF16 KV cache. Default: 8-bit (INT8). |
 | `--disable-ane` | Prefill on the GPU alone. Default: the 27B also uses the Neural Engine. |
 | `--max-cache-disk 16G` | Keep cached prompts on SSD when memory runs short. Off by default. |

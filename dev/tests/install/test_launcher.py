@@ -101,6 +101,7 @@ class LauncherTests(unittest.TestCase):
             model_dir=Path("/local models"),
             download_draft=True,
             language_only=False,
+            mmproj=None,
         )
         with (
             mock.patch.object(
@@ -160,7 +161,7 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertIn("draft download or verification failed", error.getvalue())
 
-    def test_standalone_source_bootstraps_only_python_when_needed(self):
+    def test_standalone_source_builds_environment_and_native_validator(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             for failure in (False, True):
@@ -180,12 +181,16 @@ class LauncherTests(unittest.TestCase):
                     result = launcher.main(["download-draft", "--model", MODEL_ID])
                 self.assertEqual(result, int(failure))
                 self.assertEqual(
-                    bootstrap.call_args.args[0], ["make", "install-environment"]
+                    bootstrap.call_args_list[0].args[0],
+                    ["make", "platform-check", "install-environment"],
                 )
                 if failure:
                     run.assert_not_called()
-                    self.assertIn("Python environment setup failed", error.getvalue())
+                    self.assertIn("source build failed", error.getvalue())
                 else:
+                    self.assertEqual(
+                        bootstrap.call_args_list[1].args[0], ["make", "-j4", "all"]
+                    )
                     run.assert_called_once()
 
     def test_standalone_draft_holds_installation_lease(self):
@@ -194,6 +199,7 @@ class LauncherTests(unittest.TestCase):
             with (
                 mock.patch.object(launcher, "RUNTIME_DIR", runtime),
                 mock.patch.object(launcher.paths, "PYTHON", Path(sys.executable)),
+                mock.patch.object(launcher, "_build_engine"),
                 mock.patch.object(launcher, "_run_held") as run,
             ):
 
@@ -218,6 +224,48 @@ class LauncherTests(unittest.TestCase):
                         )
                     self.assertIn("installation is busy", error.getvalue())
                 run.assert_not_called()
+
+    def test_standalone_draft_builds_native_validator_before_installation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for existing, failure in (
+                (True, False),
+                (True, True),
+                (False, False),
+                (False, True),
+            ):
+                binary = root / "engine"
+                binary.unlink(missing_ok=True)
+                if existing:
+                    binary.write_bytes(b"old native engine")
+                with (
+                    self.subTest(existing=existing, failure=failure),
+                    mock.patch.object(launcher.paths, "PACKAGED", False),
+                    mock.patch.object(launcher.paths, "PYTHON", Path(sys.executable)),
+                    mock.patch.object(launcher.paths, "BINARY", binary),
+                    mock.patch.object(launcher, "RUNTIME_DIR", root / "runtime"),
+                    mock.patch.object(
+                        launcher.subprocess,
+                        "run",
+                        return_value=subprocess.CompletedProcess([], int(failure)),
+                    ) as build,
+                    mock.patch.object(launcher, "_run_held", return_value=0) as run,
+                    mock.patch("sys.stderr", io.StringIO()),
+                ):
+                    result = launcher.main(["download-draft", "--model", MODEL_ID])
+                self.assertEqual(result, int(failure))
+                self.assertEqual(build.call_count, 1 if failure else 2)
+                self.assertEqual(
+                    build.call_args_list[0].args[0],
+                    ["make", "platform-check", "install-environment"],
+                )
+                if failure:
+                    run.assert_not_called()
+                else:
+                    self.assertEqual(
+                        build.call_args_list[1].args[0], ["make", "-j4", "all"]
+                    )
+                    run.assert_called_once()
 
     def test_serve_requires_exact_repository_id_before_build(self):
         for arguments in (
@@ -1111,6 +1159,7 @@ class LauncherTests(unittest.TestCase):
                 "language_only": True,
                 "draft_model": str(draft.resolve()),
                 "model_dir": (runtime / "local models").resolve(),
+                "mmproj": None,
             }
             with (
                 mock.patch.object(launcher, "RUNTIME_DIR", runtime),

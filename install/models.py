@@ -154,6 +154,20 @@ def parse_draft_model(value: str) -> str:
         ) from None
 
 
+def mmproj_path(value) -> Path:
+    path = Path(value).expanduser().resolve()
+    if not path.is_file():
+        raise ModelError(f"--mmproj must name an existing GGUF file: {path}")
+    return path
+
+
+def parse_mmproj(value: str) -> Path:
+    try:
+        return mmproj_path(value)
+    except (ModelError, OSError) as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
 def hash_file(path: Path, digest) -> str:
     """The hex digest of path's content fed to digest, a hashlib object."""
     with path.open("rb") as file:
@@ -193,15 +207,24 @@ def selection_link(
     language_only=False,
     draft_model=None,
     model_dir=None,
+    mmproj=None,
 ) -> Path:
     """The selection link of model_id with these source options:
     OWNER/REPO[:VARIANT] under models for the model alone, else
     .selections/<hash of the selection>."""
     repo_id, variant = split_model_id(model_id)
-    if revision or language_only or draft_model or model_dir is not None:
+    if (
+        revision
+        or language_only
+        or draft_model
+        or model_dir is not None
+        or mmproj is not None
+    ):
         values = [model_id, revision, language_only, draft_model]
         if model_dir is not None:
             values = [*values, str(Path(model_dir).expanduser().resolve())]
+        if mmproj is not None:
+            values.append(["mmproj", str(Path(mmproj).expanduser().resolve())])
         selection = json.dumps(values, separators=(",", ":"))
         return models / ".selections" / hashlib.sha256(selection.encode()).hexdigest()
     if variant is None:
@@ -228,6 +251,7 @@ class Selection:
     link: Path
     model_dir: Path | None = None
     download_draft: bool = False
+    mmproj: Path | None = None
 
     @classmethod
     def of(
@@ -240,12 +264,17 @@ class Selection:
         draft_model=None,
         model_dir=None,
         download_draft=False,
+        mmproj=None,
     ):
         repo_id, variant = split_model_id(model)
         models_root = Path(models_root).resolve()
         model_dir = (
             Path(model_dir).expanduser().resolve() if model_dir is not None else None
         )
+        if mmproj is not None:
+            if language_only:
+                raise ModelError("--mmproj cannot be combined with --language-only")
+            mmproj = mmproj_path(mmproj)
         link = selection_link(
             models_root,
             model,
@@ -253,6 +282,7 @@ class Selection:
             language_only=language_only,
             draft_model=draft_model,
             model_dir=model_dir,
+            mmproj=mmproj,
         )
         return cls(
             model,
@@ -265,6 +295,7 @@ class Selection:
             link,
             model_dir,
             download_draft,
+            mmproj,
         )
 
 
@@ -340,7 +371,14 @@ def parse_args(argv=None):
         type=parse_draft_model,
         help="override the automatically selected DFlash2 repository or local directory",
     )
-    parser.add_argument(
+    vision = parser.add_mutually_exclusive_group()
+    vision.add_argument(
+        "--mmproj",
+        type=parse_mmproj,
+        metavar="PATH",
+        help="override a GGUF target's vision projector with a local BF16/F32 GGUF",
+    )
+    vision.add_argument(
         "--language-only",
         action="store_true",
         help="skip vision preparation and loading",
@@ -366,6 +404,7 @@ def main(argv=None):
         draft_model=args.draft_model,
         model_dir=args.model_dir,
         download_draft=args.download_draft or args.command == "download-draft",
+        mmproj=args.mmproj,
     )
     if args.command == "link":
         print(selection.link)

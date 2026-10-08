@@ -18,10 +18,11 @@ new commit cannot be installed.
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import assembly, families, gguf, hub, legacy, models
@@ -62,6 +63,8 @@ class Target:
     # serves (the layout in assembly.py). A GGUF's configuration and tokenizer
     # are derived from it at installation instead.
     files: dict[str, str]
+    # Assembly path -> external local file, supplied by an explicit override.
+    local_files: dict[str, Path] = field(default_factory=dict)
 
 
 def _root_ggufs(files):
@@ -166,7 +169,7 @@ def check_model(
     return family
 
 
-def inspect_target(repo, variant, language_only, scratch):
+def inspect_target(repo, variant, language_only, scratch, mmproj=None):
     """What the target repository supplies, from metadata alone: a GGUF
     header read by range requests, or an MLX config and shard index, and the
     family the engine finds its configuration to describe. A :VARIANT names a
@@ -176,11 +179,53 @@ def inspect_target(repo, variant, language_only, scratch):
     configuration, so a model Splash cannot serve is refused for that,
     whatever its tower."""
     if variant is not None or not any(n.endswith(".safetensors") for n in repo.files):
-        return _gguf_target(repo, variant, language_only, scratch)
+        return _gguf_target(repo, variant, language_only, scratch, mmproj)
+    if mmproj is not None:
+        raise models.ModelError("--mmproj requires a GGUF target")
     return _mlx_target(repo, language_only)
 
 
-def _gguf_target(repo, variant, language_only, scratch):
+def inspect_mmproj(path, hidden_size):
+    """Validate an explicit projector's metadata before downloading weights.
+
+    The native loader still checks every tensor's shape and exact conversion.
+    """
+    with Path(path).open("rb") as stream:
+        header = gguf.Metadata(stream, tensors=True)
+    types = {gguf.TENSOR_TYPES.get(kind) for kind in header.tensors.values()}
+    if not types or not types <= {"BF16", "F32"}:
+        raise models.ModelError("--mmproj requires BF16 or F32 vision weights")
+    config = gguf.vision_config(header)
+    expected = {
+        "depth": 27,
+        "hidden_size": 1152,
+        "num_heads": 16,
+        "intermediate_size": 4304,
+        "out_hidden_size": hidden_size,
+        "patch_size": 16,
+        "spatial_merge_size": 2,
+        "num_position_embeddings": 2304,
+    }
+    for key, value in expected.items():
+        if config[key] != value:
+            raise models.ModelError(
+                f"--mmproj vision {key} must be {value}, got {config[key]}"
+            )
+    epsilon = header.require("clip.vision.attention.layer_norm_epsilon", float)
+    if not math.isclose(epsilon, 1e-6, rel_tol=0, abs_tol=1e-12):
+        raise models.ModelError("--mmproj vision LayerNorm epsilon must be 1e-6")
+    deepstack = header.require("clip.vision.is_deepstack_layers", list)
+    if len(deepstack) != config["depth"] or not all(
+        type(value) in (bool, int, float) and value == 0 for value in deepstack
+    ):
+        raise models.ModelError(
+            "--mmproj must declare deepstack status for every vision block"
+        )
+    _validate_processor(gguf.processor_config(header))
+    return header
+
+
+def _gguf_target(repo, variant, language_only, scratch, mmproj=None):
     name, by_ending = select_gguf(repo.files, variant)
     if by_ending:
         print(
@@ -191,6 +236,7 @@ def _gguf_target(repo, variant, language_only, scratch):
     with repo.open(name) as stream:
         header = gguf.Metadata(stream, tensors=True)
     files = {"target/" + name: name}
+    local_files = {}
     config, metadata = scratch / "config.json", scratch / "gguf-metadata.json"
     config.write_bytes(models.json_bytes(gguf.model_config(header)))
     metadata.write_bytes(models.json_bytes(gguf.scalar_metadata(header)))
@@ -199,13 +245,19 @@ def _gguf_target(repo, variant, language_only, scratch):
     gguf.require_loadable(header)
     vision_format = "none"
     if not language_only:
-        files[assembly.GGUF_VISION], vision_header = select_vision(repo)
+        if mmproj is None:
+            files[assembly.GGUF_VISION], vision_header = select_vision(repo)
+        else:
+            vision_header = inspect_mmproj(
+                mmproj, gguf.model_config(header)["text_config"]["hidden_size"]
+            )
+            local_files[assembly.GGUF_VISION] = mmproj
         _validate_processor(gguf.processor_config(vision_header))
         config.write_bytes(models.json_bytes(gguf.model_config(header, vision_header)))
         vision_format = "gguf"
         check_model("gguf", vision_format, config, gguf_metadata=metadata)
     print(f"Selected {name} from {repo.name}.", flush=True)
-    return Target("gguf", vision_format, config, metadata, family, files)
+    return Target("gguf", vision_format, config, metadata, family, files, local_files)
 
 
 def _mlx_target(repo, language_only):
@@ -463,7 +515,11 @@ def _install(selection, repo, installed, draft=None):
         tempfile.TemporaryDirectory(prefix="splash-target-") as scratch,
     ):
         target = inspect_target(
-            repo, selection.variant, selection.language_only, Path(scratch)
+            repo,
+            selection.variant,
+            selection.language_only,
+            Path(scratch),
+            selection.mmproj,
         )
         if draft is None:
             draft = _resolve_draft(target.family, selection, installed, repo)
@@ -476,6 +532,7 @@ def _install(selection, repo, installed, draft=None):
         )
         downloaded = repo.download(set(target.files.values()))
     files |= {path: downloaded[name] for path, name in target.files.items()}
+    files |= target.local_files
     publish(selection, repo, target, draft, files)
 
 

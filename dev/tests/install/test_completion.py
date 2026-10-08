@@ -378,6 +378,27 @@ class CompletionTests(unittest.TestCase):
                             [str(library) + "/"],
                         )
 
+    def test_bash_completes_mmproj_files_with_spaces(self):
+        _, directory = self.layout()
+        projector = self.home / "vision projector.gguf"
+        projector.write_bytes(b"")
+        prefix = str(self.home / "vision")
+        for shell in bash_paths():
+            for arguments in (
+                ["--mmproj", prefix],
+                ["--mmproj=" + prefix],
+                ["--mmproj", "=", prefix],
+            ):
+                with self.subTest(shell=shell, arguments=arguments):
+                    self.assertEqual(
+                        self.bash_complete(
+                            shell,
+                            directory / "splash.bash",
+                            ["splash", "serve", *arguments],
+                        ),
+                        [str(projector)],
+                    )
+
     def test_bash_loaded_completion_survives_release_upgrade(self):
         for index, shell in enumerate(bash_paths()):
             with self.subTest(shell=shell):

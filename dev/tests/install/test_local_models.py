@@ -261,7 +261,9 @@ class LocalModelsTest(unittest.TestCase):
         self.assertFalse(original.exists())
         self.assertEqual((target / "tokenizer.json").read_text(), '{"changed": true}')
         (target / "config.json").write_text("invalid")
-        with self.assertRaisesRegex(models.ModelError, "could not read"):
+        with self.assertRaisesRegex(
+            models.ModelError, "could not parse upstream model config"
+        ):
             self.prepare(chosen)
         self.assertEqual((target / "config.json").read_text(), "invalid")
         self.assertEqual(self.fake.requests, [])

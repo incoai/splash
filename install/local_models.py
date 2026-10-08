@@ -191,7 +191,7 @@ def _prepare(selection, scratch):
     repo = target_repository(selection)
     try:
         target = upstream.inspect_target(
-            repo, selection.variant, selection.language_only, scratch
+            repo, selection.variant, selection.language_only, scratch, selection.mmproj
         )
     except upstream.MissingCheckpoint:
         if not Path(repo.name).is_absolute():
@@ -202,7 +202,7 @@ def _prepare(selection, scratch):
             selection.repo_id, selection.revision, installation=selection.link
         )
         target = upstream.inspect_target(
-            repo, selection.variant, selection.language_only, scratch
+            repo, selection.variant, selection.language_only, scratch, selection.mmproj
         )
     draft, files = resolve_draft(selection, target)
     if not Path(repo.name).is_absolute():
@@ -211,5 +211,6 @@ def _prepare(selection, scratch):
         )
     downloaded = repo.download(set(target.files.values()))
     files = files | {path: downloaded[name] for path, name in target.files.items()}
+    files |= target.local_files
     if not _reuse(selection, repo, target, draft, files):
         upstream.publish(selection, repo, target, draft, files)

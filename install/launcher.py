@@ -97,7 +97,7 @@ def _request_json(path, timeout=2, *, port=serve_options.DEFAULT_PORT):
         return None
 
 
-def _ensure_installed(selection):
+def _build_engine():
     if not paths.PACKAGED:
         # Serialize builds across ports; make keeps the lock if the launcher exits.
         with (RUNTIME_DIR / "build.lock").open("a+") as lock:
@@ -114,6 +114,10 @@ def _ensure_installed(selection):
                     command, cwd=ROOT, pass_fds=(lock.fileno(),)
                 ).returncode:
                     raise LauncherError("source build failed; see the output above")
+
+
+def _ensure_installed(selection):
+    _build_engine()
     # The engine refuses an unsupported Mac only once the model is prepared;
     # its own check refuses it before tens of GB are downloaded.
     try:
@@ -137,6 +141,7 @@ def _model_command(selection, action):
         ("--revision", selection.revision),
         ("--draft-model", selection.draft_model),
         ("--model-dir", selection.model_dir),
+        ("--mmproj", selection.mmproj),
     ):
         if value is not None:
             command.extend([flag, str(value)])
@@ -166,20 +171,9 @@ def download_draft(args):
             raise LauncherError(
                 "Splash installation is busy; wait for the upgrade to finish"
             ) from None
-        if not paths.PACKAGED and not paths.PYTHON.is_file():
-            with (RUNTIME_DIR / "build.lock").open("a+") as lock:
-                fcntl.flock(lock, fcntl.LOCK_EX)
-                if (
-                    not paths.PYTHON.is_file()
-                    and subprocess.run(
-                        ["make", "install-environment"],
-                        cwd=ROOT,
-                        pass_fds=(lock.fileno(),),
-                    ).returncode
-                ):
-                    raise LauncherError(
-                        "Python environment setup failed; see the output above"
-                    )
+        # Configuration checks use the native engine even for draft-only
+        # downloads. Incremental Make also refreshes an existing source binary.
+        _build_engine()
         if _run_held(
             _model_command(selection, "download-draft"),
             cwd=ROOT,
@@ -282,6 +276,7 @@ def serve(args):
             draft_model=args.draft_model,
             model_dir=args.model_dir,
             download_draft=args.download_draft,
+            mmproj=args.mmproj,
         )
         _ensure_installed(selection)
         # A concurrent install may advance the selection link. Keep this
@@ -491,7 +486,14 @@ def parse_args(argv=None):
         action="store_true",
         help="download missing draft weights to --model-dir or the default Hugging Face cache",
     )
-    model.add_argument(
+    vision = model.add_mutually_exclusive_group()
+    vision.add_argument(
+        "--mmproj",
+        type=model_artifacts.parse_mmproj,
+        metavar="PATH",
+        help="override a GGUF target's vision projector with a local BF16/F32 GGUF",
+    )
+    vision.add_argument(
         "--language-only",
         action="store_true",
         help="skip vision preparation and loading; image and PDF input is refused",

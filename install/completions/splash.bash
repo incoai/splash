@@ -18,6 +18,21 @@ _splash() {
     for ((i=2; i<COMP_CWORD; i++)); do
         [[ ${COMP_WORDS[i]} == -- ]] && return 0
     done
+    if [[ $prev == --mmproj || $cur == --mmproj=* ||
+            $prev == = && ${COMP_WORDS[COMP_CWORD-2]} == --mmproj ]]; then
+        prefix=$cur
+        if [[ $cur == --mmproj=* ]]; then
+            prefix=${cur#--mmproj=}
+            [[ ${COMP_WORDBREAKS-} == *=* ]] || value_prefix=--mmproj=
+        elif [[ $cur == = ]]; then
+            prefix=
+        fi
+        while IFS= read -r directory; do
+            COMPREPLY[${#COMPREPLY[@]}]=$value_prefix$directory
+        done < <(compgen -f -- "$prefix")
+        compopt -o filenames 2>/dev/null || true
+        return 0
+    fi
     if [[ $prev == --model-dir || $cur == --model-dir=* ||
             $prev == = && ${COMP_WORDS[COMP_CWORD-2]} == --model-dir ]]; then
         prefix=$cur
@@ -35,7 +50,7 @@ _splash() {
     fi
     if [[ $cur == --* && $cur != --model=* ]]; then
         local options='--model --model-dir --revision --draft-model'
-        [[ ${COMP_WORDS[1]} == serve ]] && options="$options --download-draft"
+        [[ ${COMP_WORDS[1]} == serve ]] && options="$options --download-draft --mmproj"
         COMPREPLY=($(compgen -W "$options" -- "$cur"))
         return 0
     fi

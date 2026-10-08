@@ -314,7 +314,8 @@ Complete local targets are reused without checking for upstream updates.
 `--revision` is rejected for unmanaged local files whose revision cannot be
 verified; Splash-managed downloads record their commit. Invalid existing files
 are reported rather than silently replaced. Local vision files must be present,
-or select `--language-only` to serve without vision.
+supplied with `--mmproj PATH` for a GGUF target, or select `--language-only` to
+serve without vision.
 
 Splash's assembly links and generated tokenizer metadata remain in its model
 installation directory. Prepared weights remain in their separate cache.
@@ -1076,8 +1077,8 @@ splash serve --model unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M
 splash serve --model mlx-community/Qwen3.8-27B-4bit --language-only
 ```
 
-A model ID with `--revision`, `--language-only`, `--draft-model` or `--model-dir` is a
-separate installation from the same ID without them.
+A model ID with `--revision`, `--language-only`, `--draft-model`, `--model-dir`
+or `--mmproj` selects a separate installation from the same ID without them.
 
 ### GGUF targets
 
@@ -1159,6 +1160,16 @@ is not used. The processor configuration (MLX `preprocessor_config.json`, the
 GGUF's `clip.vision` metadata) must describe the one preprocessing Splash
 implements (`server/images.py`); it is checked before any weight download and
 not installed.
+
+For a GGUF target, `--mmproj PATH` overrides the repository's projector with
+an existing local file. Its canonical absolute path distinguishes the selection;
+the assembly records its file identity and digest like other source files, so
+replacing it rebuilds the assembly. Architecture, BF16/F32 precision, supported
+vision geometry, target output dimension, normalization and LayerNorm epsilon
+are checked before weight downloads. Native configuration checks also validate
+the target and draft together. Native loading still validates every tensor's
+shape and exact BF16 conversion. This option requires a GGUF target and cannot
+be combined with `--language-only`.
 
 Both sources are written into an image laid out as a package's
 `vision/model.bin`, which the one BF16 vision operator reads: BF16 tensors are
@@ -1250,7 +1261,7 @@ weight files into memory as they are. `install/legacy.py` installs a package
 as a selection link to its verified Hub snapshot, pinned like an assembly's
 sources. An installed package starts without a Hub request. A package has no
 variants, so a `:VARIANT` suffix is rejected, and `--revision`,
-`--language-only` and `--draft-model` require an upstream model ID.
+`--language-only`, `--draft-model` and `--mmproj` require an upstream model ID.
 
 ## Internals
 
