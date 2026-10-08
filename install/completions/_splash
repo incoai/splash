@@ -7,13 +7,29 @@ _splash() {
     local word helper
     local -a models
     if (( CURRENT == 2 )); then
-        compadd -- serve claude codex opencode hermes pi
+        compadd -- serve download-draft claude codex opencode hermes pi
         return
     fi
-    [[ $words[2] == serve ]] || return 0
+    [[ $words[2] == serve || $words[2] == download-draft ]] || return 0
     for word in "${words[@]:2:$(( CURRENT - 3 ))}"; do
         [[ $word == -- ]] && return 0
     done
+    if [[ $words[CURRENT-1] == --mmproj || $words[CURRENT] == --mmproj=* ]]; then
+        [[ $words[CURRENT] == --mmproj=* ]] && compset -P '--mmproj='
+        _files -g '*.gguf'
+        return
+    fi
+    if [[ $words[CURRENT-1] == --model-dir || $words[CURRENT] == --model-dir=* ]]; then
+        [[ $words[CURRENT] == --model-dir=* ]] && compset -P '--model-dir='
+        _files -/
+        return
+    fi
+    if [[ $words[CURRENT] == --* && $words[CURRENT] != --model=* ]]; then
+        local -a options=(--model --model-dir --revision --draft-model)
+        [[ $words[2] == serve ]] && options+=(--download-draft --mmproj)
+        compadd -- "${options[@]}"
+        return
+    fi
     if [[ $words[CURRENT-1] == --model ]]; then
         :
     elif [[ $words[CURRENT] == --model=* ]]; then

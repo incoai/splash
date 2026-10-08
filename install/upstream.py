@@ -18,10 +18,11 @@ new commit cannot be installed.
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import assembly, families, gguf, hub, legacy, models
@@ -36,6 +37,10 @@ TOKENIZER_FILES = (
     "added_tokens.json",
     "special_tokens_map.json",
 )
+
+
+class MissingCheckpoint(models.ModelError):
+    """Required checkpoint files have not been installed yet."""
 
 
 @dataclass(frozen=True)
@@ -58,6 +63,8 @@ class Target:
     # serves (the layout in assembly.py). A GGUF's configuration and tokenizer
     # are derived from it at installation instead.
     files: dict[str, str]
+    # Assembly path -> external local file, supplied by an explicit override.
+    local_files: dict[str, Path] = field(default_factory=dict)
 
 
 def _root_ggufs(files):
@@ -162,7 +169,7 @@ def check_model(
     return family
 
 
-def inspect_target(repo, variant, language_only, scratch):
+def inspect_target(repo, variant, language_only, scratch, mmproj=None):
     """What the target repository supplies, from metadata alone: a GGUF
     header read by range requests, or an MLX config and shard index, and the
     family the engine finds its configuration to describe. A :VARIANT names a
@@ -172,11 +179,53 @@ def inspect_target(repo, variant, language_only, scratch):
     configuration, so a model Splash cannot serve is refused for that,
     whatever its tower."""
     if variant is not None or not any(n.endswith(".safetensors") for n in repo.files):
-        return _gguf_target(repo, variant, language_only, scratch)
+        return _gguf_target(repo, variant, language_only, scratch, mmproj)
+    if mmproj is not None:
+        raise models.ModelError("--mmproj requires a GGUF target")
     return _mlx_target(repo, language_only)
 
 
-def _gguf_target(repo, variant, language_only, scratch):
+def inspect_mmproj(path, hidden_size):
+    """Validate an explicit projector's metadata before downloading weights.
+
+    The native loader still checks every tensor's shape and exact conversion.
+    """
+    with Path(path).open("rb") as stream:
+        header = gguf.Metadata(stream, tensors=True)
+    types = {gguf.TENSOR_TYPES.get(kind) for kind in header.tensors.values()}
+    if not types or not types <= {"BF16", "F32"}:
+        raise models.ModelError("--mmproj requires BF16 or F32 vision weights")
+    config = gguf.vision_config(header)
+    expected = {
+        "depth": 27,
+        "hidden_size": 1152,
+        "num_heads": 16,
+        "intermediate_size": 4304,
+        "out_hidden_size": hidden_size,
+        "patch_size": 16,
+        "spatial_merge_size": 2,
+        "num_position_embeddings": 2304,
+    }
+    for key, value in expected.items():
+        if config[key] != value:
+            raise models.ModelError(
+                f"--mmproj vision {key} must be {value}, got {config[key]}"
+            )
+    epsilon = header.require("clip.vision.attention.layer_norm_epsilon", float)
+    if not math.isclose(epsilon, 1e-6, rel_tol=0, abs_tol=1e-12):
+        raise models.ModelError("--mmproj vision LayerNorm epsilon must be 1e-6")
+    deepstack = header.require("clip.vision.is_deepstack_layers", list)
+    if len(deepstack) != config["depth"] or not all(
+        type(value) in (bool, int, float) and value == 0 for value in deepstack
+    ):
+        raise models.ModelError(
+            "--mmproj must declare deepstack status for every vision block"
+        )
+    _validate_processor(gguf.processor_config(header))
+    return header
+
+
+def _gguf_target(repo, variant, language_only, scratch, mmproj=None):
     name, by_ending = select_gguf(repo.files, variant)
     if by_ending:
         print(
@@ -187,6 +236,7 @@ def _gguf_target(repo, variant, language_only, scratch):
     with repo.open(name) as stream:
         header = gguf.Metadata(stream, tensors=True)
     files = {"target/" + name: name}
+    local_files = {}
     config, metadata = scratch / "config.json", scratch / "gguf-metadata.json"
     config.write_bytes(models.json_bytes(gguf.model_config(header)))
     metadata.write_bytes(models.json_bytes(gguf.scalar_metadata(header)))
@@ -195,13 +245,19 @@ def _gguf_target(repo, variant, language_only, scratch):
     gguf.require_loadable(header)
     vision_format = "none"
     if not language_only:
-        files[assembly.GGUF_VISION], vision_header = select_vision(repo)
+        if mmproj is None:
+            files[assembly.GGUF_VISION], vision_header = select_vision(repo)
+        else:
+            vision_header = inspect_mmproj(
+                mmproj, gguf.model_config(header)["text_config"]["hidden_size"]
+            )
+            local_files[assembly.GGUF_VISION] = mmproj
         _validate_processor(gguf.processor_config(vision_header))
         config.write_bytes(models.json_bytes(gguf.model_config(header, vision_header)))
         vision_format = "gguf"
         check_model("gguf", vision_format, config, gguf_metadata=metadata)
     print(f"Selected {name} from {repo.name}.", flush=True)
-    return Target("gguf", vision_format, config, metadata, family, files)
+    return Target("gguf", vision_format, config, metadata, family, files, local_files)
 
 
 def _mlx_target(repo, language_only):
@@ -261,12 +317,11 @@ def _weight_files(repo, prefix=""):
         )
         names = {"model.safetensors"} if holds else set()
     else:
-        raise models.ModelError("model has no safetensors checkpoint")
-    if not all(
-        name in repo.files and "/" not in name and name.endswith(".safetensors")
-        for name in names
-    ):
+        raise MissingCheckpoint("model has no safetensors checkpoint")
+    if not all("/" not in name and name.endswith(".safetensors") for name in names):
         raise models.ModelError("checkpoint has missing or unsupported shards")
+    if not names <= repo.files:
+        raise MissingCheckpoint("checkpoint has missing or unsupported shards")
     return names
 
 
@@ -313,6 +368,10 @@ def prepare(selection):
     cannot answer, or a new commit cannot be installed, the verified
     installation starts instead. A legacy Splash package is installed by
     legacy.prepare."""
+    if selection.model_dir is not None:
+        from . import local_models
+
+        return local_models.prepare(selection)
     kind = models.installation_kind(selection.link)
     if kind == models.PACKAGE:
         legacy.prepare(selection)
@@ -454,7 +513,11 @@ def _install(selection, repo, installed, draft=None):
         tempfile.TemporaryDirectory(prefix="splash-target-") as scratch,
     ):
         target = inspect_target(
-            repo, selection.variant, selection.language_only, Path(scratch)
+            repo,
+            selection.variant,
+            selection.language_only,
+            Path(scratch),
+            selection.mmproj,
         )
         if draft is None:
             draft = _resolve_draft(target.family, selection, installed, repo)
@@ -467,6 +530,12 @@ def _install(selection, repo, installed, draft=None):
         )
         downloaded = repo.download(set(target.files.values()))
     files |= {path: downloaded[name] for path, name in target.files.items()}
+    files |= target.local_files
+    publish(selection, repo, target, draft, files)
+
+
+def publish(selection, repo, target, draft, files):
+    """Publish a verified set of local source paths as an immutable assembly."""
     record = {
         "version": 1,
         "model": selection.model,
@@ -598,13 +667,19 @@ def _draft_files(repo, target):
     repository or --draft-model directory, as a DFlash2 release holds them.
     The weights download only once the engine accepts its configuration with
     the target's (check_model)."""
+    downloaded = repo.download(inspect_draft(repo, target))
+    return {"draft/" + name: path for name, path in downloaded.items()}
+
+
+def inspect_draft(repo, target):
+    """Validate a draft against the target before downloading its weights."""
     family = target.family
     try:
         if "config.json" not in repo.files:
-            raise models.ModelError("no config.json")
+            raise MissingCheckpoint("no config.json")
         weights = _weight_files(repo)
     except models.ModelError as error:
-        raise models.ModelError(
+        raise type(error)(
             f"{repo.name} does not contain a DFlash2 checkpoint for {family.name}"
             f" ({error})"
         ) from error
@@ -621,5 +696,4 @@ def _draft_files(repo, target):
         raise models.ModelError(
             f"draft configuration is incompatible with {family.name}: {error}"
         ) from error
-    downloaded = repo.download({"config.json", *weights})
-    return {"draft/" + name: path for name, path in downloaded.items()}
+    return {"config.json", *weights}
