@@ -129,7 +129,8 @@ std::string runtimeStatusJson(
       << boolean(memoryGovernor.hostMeasurementValid)
       << ",\"host_available_bytes\":" << memoryGovernor.hostAvailableBytes
       << ",\"host_reserve_bytes\":" << memoryGovernor.hostReserveBytes
-      << ",\"host_headroom_bytes\":" << memoryGovernor.hostHeadroomBytes << "}"
+      << ",\"host_headroom_bytes\":" << memoryGovernor.hostHeadroomBytes
+      << ",\"host_debt_bytes\":" << memoryGovernor.hostDebtBytes << "}"
       << ",\"memory_audit\":" << memoryAudit.toStatusJson()
       << ",\"weights\":";
   appendWeights(out, weights);

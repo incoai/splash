@@ -2,6 +2,7 @@
 
 #include "StderrLine.hpp"
 
+#include <iomanip>
 #include <optional>
 #include <sstream>
 
@@ -29,12 +30,50 @@ std::string MemoryStatusReporter::update(const ResourceWaitSnapshot &wait,
   return out.str();
 }
 
+bool MemoryControl::guardCompression(const MemoryGovernorSnapshot &memory, double now) {
+  // The weights are released only here, in the control pass, so a pass
+  // without a sample always comes between their release and their restore.
+  std::optional<CompressionGuard::Sample> sample;
+  if (!loop_.weightsSnapshot().released && memory.hostMeasurementValid) {
+    if (const std::optional<uint64_t> compressed = compressorContent_()) {
+      const uint64_t room = memory.hostAvailableBytes > memory.hostReserveBytes
+          ? memory.hostAvailableBytes - memory.hostReserveBytes
+          : 0;
+      sample = CompressionGuard::Sample{*compressed, memory.chargedBytes, room};
+    }
+  }
+  switch (guard_.update(now, sample)) {
+  case CompressionGuard::Event::None:
+    return false;
+  case CompressionGuard::Event::Fired: {
+    governor_.setHostDebt(guard_.debtBytes());
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(1) << "Memory: macOS compressed "
+        << static_cast<double>(guard_.growthBytes()) / static_cast<double>(1ULL << 30)
+        << " GiB of memory in "
+        << static_cast<int>(kCompressionWindowMilliseconds / 1000.0)
+        << " s while the engine grew; cache growth holds for "
+        << static_cast<int>(kCompressionHoldMilliseconds / 60'000.0)
+        << " min and the cache gives that back";
+    logLine(out.str());
+    return true;
+  }
+  case CompressionGuard::Event::Expired:
+    governor_.setHostDebt(0);
+    logLine("Memory: compression hold ended");
+    return true;
+  }
+  return false;
+}
+
 bool MemoryControl::run(MemoryPressure pressure) {
   loop_.releaseIdleWeights();
   governor_.setPressure(pressure);
   const double now = loop_.monotonicMilliseconds();
   static_cast<void>(backend_.refreshMemoryStats());
-  const MemoryGovernorSnapshot memory = governor_.evaluate();
+  MemoryGovernorSnapshot memory = governor_.evaluate();
+  if (guardCompression(memory, now))
+    memory = governor_.evaluate();
   const ResourceWaitSnapshot wait = loop_.resourceWaitSnapshot();
   const std::string diagnostic = reporter_.update(wait, memory.hostGrowthAllowed);
   if (!diagnostic.empty())

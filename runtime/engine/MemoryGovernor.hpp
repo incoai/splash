@@ -3,6 +3,7 @@
 #include "metal/MetalBackend.hpp"
 
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <optional>
 
@@ -59,6 +60,10 @@ memoryPressureName(MemoryPressure pressure) noexcept {
 
 [[nodiscard]] std::optional<MemoryPressure> querySystemMemoryPressure() noexcept;
 
+// What the compressor holds, uncompressed: the anonymous memory macOS has
+// compressed, all programs' together.
+[[nodiscard]] std::optional<uint64_t> queryCompressorContent() noexcept;
+
 // Allocation and recovery use separate watermarks to avoid oscillation.
 // Low availability causes paced reclaim and pauses growth that no request in
 // service needs; unavailable telemetry does the same; the OS critical signal
@@ -81,6 +86,9 @@ struct MemoryGovernorSnapshot {
   uint64_t hostAvailableBytes = 0;
   uint64_t hostReserveBytes = 0;
   uint64_t hostHeadroomBytes = 0;
+  // What the headroom leaves out of the host's available memory for the
+  // compression the engine's growth caused (CompressionGuard).
+  uint64_t hostDebtBytes = 0;
   MemoryPressure systemPressure = MemoryPressure::Normal;
   // Whether the host has room for growth that no request in service needs.
   // Admission still grants what such a request needs while this is false,
@@ -118,6 +126,56 @@ enum class ReclaimOutcome : uint8_t {
 struct MemoryReclaimResult {
   uint64_t releasedBytes = 0;
   ReclaimOutcome outcome = ReclaimOutcome::Untargeted;
+};
+
+// The window in which the compressor's growth counts, and how long the debt
+// it leaves holds.
+inline constexpr double kCompressionWindowMilliseconds = 10'000.0;
+inline constexpr double kCompressionHoldMilliseconds = 300'000.0;
+
+// Catches macOS paying for the engine's growth by compressing other programs.
+// The host estimate cannot see it: it counts file pages and a compression
+// credit that macOS may take back only by compressing the anonymous memory of
+// whoever uses it, so the estimate stays high while the compressor fills.
+// When what the compressor holds grows by the warning margin within the
+// window while the engine grows, the guard owes the host its room above the
+// reserve and that growth, for the hold: the governor's headroom falls that
+// far below zero (MemoryGovernor::setHostDebt), growth no request in service
+// needs stops, and the paced reclaim returns the growth and the recovery
+// margin. The debt is fixed while it holds: memory other programs free comes
+// back to the headroom, and memory they take comes out of it. A fire within
+// the hold renews it, owing at least what it owed. Wiring the weights compresses other programs too: a pass
+// without a sample, as while they are released, starts the window again.
+class CompressionGuard final {
+public:
+  struct Sample final {
+    // What the compressor holds (queryCompressorContent).
+    uint64_t compressedBytes = 0;
+    // What the governor charges.
+    uint64_t chargedBytes = 0;
+    // The host's available memory above its reserve, before any debt.
+    uint64_t hostRoomBytes = 0;
+  };
+  enum class Event : uint8_t { None, Fired, Expired };
+
+  // The pass at `milliseconds` with its sample, or none. Fired when it
+  // starts or renews the debt, Expired when the hold ends.
+  [[nodiscard]] Event update(double milliseconds, const std::optional<Sample> &sample);
+  [[nodiscard]] uint64_t debtBytes() const noexcept { return debtBytes_; }
+  // The compressor's growth within the window when the guard last fired.
+  [[nodiscard]] uint64_t growthBytes() const noexcept { return growthBytes_; }
+
+private:
+  struct Point final {
+    double milliseconds = 0.0;
+    uint64_t compressedBytes = 0;
+    uint64_t chargedBytes = 0;
+  };
+
+  std::deque<Point> window_;
+  uint64_t debtBytes_ = 0;
+  uint64_t growthBytes_ = 0;
+  double holdEndMilliseconds_ = 0.0;
 };
 
 // Bounded shrink passes separated by a telemetry settling interval. New host
@@ -177,6 +235,9 @@ public:
   // The limit and critical pressure refuse them like any other.
   void setServing(bool serving) noexcept;
   void setPressure(MemoryPressure pressure) noexcept;
+  // Leaves this much of the host's available memory out of the headroom,
+  // until it is set again: what CompressionGuard found the engine owes.
+  void setHostDebt(uint64_t bytes) noexcept;
   // The outcome of the engine's last reclaim pass with a target. While one
   // finds nothing left to release, the hold for the recovery margin is
   // waived: growth that clears the warning margin proceeds, since only other
@@ -255,6 +316,7 @@ private:
   bool serving_ = false;
   uint64_t deniedReservations_ = 0;
   MemoryPressure systemPressure_ = MemoryPressure::Normal;
+  uint64_t hostDebtBytes_ = 0;
   // As the latest reservation or control pass evaluated it.
   HostState host_;
 };

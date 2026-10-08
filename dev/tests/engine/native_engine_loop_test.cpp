@@ -1301,6 +1301,99 @@ void testControlPassReclaimsUnderHostPressure() {
           "critical pressure did not empty the cache and release every extent");
 }
 
+// Between commands the control pass samples what the compressor holds. When
+// it grows by the warning margin within the window while the engine grows,
+// the engine owes the host its room and that growth for the hold: growth
+// outside service stops and the paced pass returns cache, keeping the resume
+// point, until the hold ends. While the weights are released, and across
+// their restore, no growth counts.
+void testCompressionGuardReturnsTheCache() {
+  constexpr double kIdleReleaseSeconds = 2.0 * kCompressionHoldMilliseconds / 1000.0;
+  engine::NativeLoopConfig config;
+  config.engine.maxContext = 1024;
+  LoopFixture fixture(config, {}, {}, kIdleReleaseSeconds);
+  engine::NativeRuntime &loop = fixture.loop;
+  const engine::Cache &resources = fixture.cache;
+  loop.announceReady();
+  // Two finished requests with different prompts leave two replay states.
+  for (uint64_t id : {1, 2}) {
+    auto input = request(id);
+    for (uint32_t &token : input.promptTokens)
+      token += static_cast<uint32_t>(100 * id);
+    require(loop.receive(protocol::peer::serialize(input)), "a guarded request failed");
+    runUntilIdle(loop);
+  }
+  require(resources.snapshot().stateCache.entries == 2,
+          "the fixture did not cache two replay states");
+
+  test::metalStatistics() = {};
+  metal::MetalBackend backend("unused");
+  constexpr uint64_t hostReserve = 2ULL << 30;
+  constexpr uint64_t room = 30ULL << 30;
+  std::optional<uint64_t> available = hostReserve + room;
+  MemoryGovernor governor(backend, 40ULL << 30, hostReserve, [&available] { return available; }, 0);
+  uint64_t compressed = 4ULL << 30;
+  MemoryControl control(governor, backend, loop,
+                        [&compressed] { return std::optional<uint64_t>{compressed}; });
+  const auto pass = [&](double elapsed) {
+    fixture.monotonic += elapsed;
+    static_cast<void>(control.run(MemoryPressure::Normal));
+    return governor.snapshot();
+  };
+  // The engine grows as the compressor does, a request's worth at a time.
+  const auto grow = [&](uint64_t compression) {
+    test::metalStatistics().allocatedBytes += 200 * kMiB;
+    compressed += compression;
+  };
+  require(pass(500.0).hostDebtBytes == 0, "a quiet pass held a debt");
+  grow(kHostWarningMarginBytes - 1);
+  const MemoryGovernorSnapshot below = pass(500.0);
+  require(below.hostDebtBytes == 0 && below.hostGrowthAllowed &&
+              resources.snapshot().stateCache.entries == 2,
+          "compression short of the warning margin held growth");
+  grow(1);
+  const MemoryGovernorSnapshot owed = pass(500.0);
+  require(owed.hostDebtBytes == room + kHostWarningMarginBytes && !owed.hostGrowthAllowed &&
+              owed.hostHeadroomBytes == 0,
+          "the engine's growth paid for by compression left growth open");
+  const auto returned = resources.snapshot();
+  require(returned.stateCache.entries == 1 && returned.stateCache.evictions == 1,
+          "the guard's pass did not return cache, keeping the resume point");
+  require(pass(kCompressionHoldMilliseconds - 1000.0).hostDebtBytes != 0,
+          "the hold ended early");
+  const MemoryGovernorSnapshot ended = pass(1000.0);
+  require(ended.hostDebtBytes == 0 && ended.hostGrowthAllowed, "the hold did not end");
+  // A pass that cannot measure the host samples nothing: growth across it
+  // does not count.
+  grow(kHostWarningMarginBytes / 2);
+  require(pass(500.0).hostDebtBytes == 0, "half the margin fired");
+  available.reset();
+  static_cast<void>(pass(500.0));
+  available = hostReserve + room;
+  grow(kHostWarningMarginBytes / 2);
+  require(pass(500.0).hostDebtBytes == 0, "growth across an unmeasured pass fired");
+
+  // The weights are released once idle, then taken back for a request: the
+  // compression their wiring causes counts for nothing, also within the
+  // window of the last sample before the release.
+  for (int passes = 0; !loop.weightsSnapshot().released; ++passes) {
+    require(passes < 1000, "the weights were not released");
+    static_cast<void>(pass(1000.0));
+  }
+  grow(2 * kHostWarningMarginBytes);
+  require(pass(500.0).hostDebtBytes == 0, "growth while the weights were released fired");
+  require(loop.receive(protocol::peer::serialize(request(3))), "a restoring request failed");
+  while (loop.weightsSnapshot().released)
+    require(loop.tick(), "the weights did not come back");
+  grow(2 * kHostWarningMarginBytes);
+  require(pass(500.0).hostDebtBytes == 0, "growth across the restore fired");
+  runUntilIdle(loop);
+  require(pass(500.0).hostDebtBytes == 0, "a pass after the restore fired");
+  grow(kHostWarningMarginBytes);
+  require(pass(500.0).hostDebtBytes == room + kHostWarningMarginBytes,
+          "the guard did not sample again once the weights were back");
+}
+
 bool answeredStatus(const LoopFixture &fixture, uint64_t correlationId) {
   const auto events = fixture.events();
   return std::any_of(events.begin(), events.end(), [&](const auto &message) {
@@ -1609,6 +1702,7 @@ int main() {
     testInvalidScoreFailsOneRequestAndKeepsTheBatch();
     testConstrainedMaskExchange();
     testControlPassReclaimsUnderHostPressure();
+    testCompressionGuardReturnsTheCache();
     testIdleWeightsAreReleasedAndRestored(false);
     testIdleWeightsAreReleasedAndRestored(true);
     testIdleReleaseRestoresTheSplitLast();

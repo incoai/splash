@@ -24,6 +24,20 @@ uint64_t compressionSavings(const HostMemoryPages &pages) noexcept {
          static_cast<uint64_t>(static_cast<unsigned __int128>(pages.anonymous) * pages.compressor / pages.compressed);
 }
 
+// One host_statistics64 sample and the page size.
+bool sampleHostPages(vm_statistics64_data_t &statistics, vm_size_t &pageSize) noexcept {
+  mach_port_t host = mach_host_self();
+  mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+  kern_return_t pageResult = host_page_size(host, &pageSize);
+  kern_return_t statisticsResult = pageResult == KERN_SUCCESS
+      ? host_statistics64(host, HOST_VM_INFO64,
+                          reinterpret_cast<host_info64_t>(&statistics),
+                          &count)
+      : pageResult;
+  mach_port_deallocate(mach_task_self(), host);
+  return statisticsResult == KERN_SUCCESS && pageSize;
+}
+
 } // namespace
 
 uint64_t estimateHostAvailableMemory(const HostMemoryPages &statistics,
@@ -42,18 +56,9 @@ uint64_t estimateHostAvailableMemory(const HostMemoryPages &statistics,
 }
 
 std::optional<uint64_t> queryHostAvailableMemory() noexcept {
-  mach_port_t host = mach_host_self();
   vm_size_t pageSize = 0;
   vm_statistics64_data_t statistics{};
-  mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
-  kern_return_t pageResult = host_page_size(host, &pageSize);
-  kern_return_t statisticsResult = pageResult == KERN_SUCCESS
-      ? host_statistics64(host, HOST_VM_INFO64,
-                          reinterpret_cast<host_info64_t>(&statistics),
-                          &count)
-      : pageResult;
-  mach_port_deallocate(mach_task_self(), host);
-  if (statisticsResult != KERN_SUCCESS || !pageSize) return std::nullopt;
+  if (!sampleHostPages(statistics, pageSize)) return std::nullopt;
 
   return estimateHostAvailableMemory(
       {.free = statistics.free_count,
@@ -64,6 +69,15 @@ std::optional<uint64_t> queryHostAvailableMemory() noexcept {
        .compressor = statistics.compressor_page_count,
        .compressed = statistics.total_uncompressed_pages_in_compressor},
       pageSize, querySystemMemoryPressure().value_or(MemoryPressure::Critical) != MemoryPressure::Critical);
+}
+
+std::optional<uint64_t> queryCompressorContent() noexcept {
+  vm_size_t pageSize = 0;
+  vm_statistics64_data_t statistics{};
+  if (!sampleHostPages(statistics, pageSize)) return std::nullopt;
+  const uint64_t pages = statistics.total_uncompressed_pages_in_compressor;
+  if (pages > std::numeric_limits<uint64_t>::max() / pageSize) return std::nullopt;
+  return pages * pageSize;
 }
 
 std::optional<MemoryPressure> querySystemMemoryPressure() noexcept {
@@ -158,9 +172,10 @@ uint64_t MemoryGovernor::hostHeadroomBytes(
   if (!hostAvailable || *hostAvailable <= hostReserveBytes_)
     return 0;
   const uint64_t availableAfterReserve = *hostAvailable - hostReserveBytes_;
-  return reservedBytes < availableAfterReserve
-      ? availableAfterReserve - reservedBytes
-      : 0;
+  const uint64_t owed = reservedBytes <= std::numeric_limits<uint64_t>::max() - hostDebtBytes_
+      ? reservedBytes + hostDebtBytes_
+      : std::numeric_limits<uint64_t>::max();
+  return owed < availableAfterReserve ? availableAfterReserve - owed : 0;
 }
 
 std::optional<MemoryGovernor::Reservation>
@@ -230,6 +245,10 @@ void MemoryGovernor::setPressure(MemoryPressure pressure) noexcept {
   systemPressure_ = pressure;
 }
 
+void MemoryGovernor::setHostDebt(uint64_t bytes) noexcept {
+  hostDebtBytes_ = bytes;
+}
+
 void MemoryGovernor::reclaimed(ReclaimOutcome outcome) noexcept {
   if (outcome == ReclaimOutcome::Untargeted)
     return;
@@ -271,6 +290,7 @@ MemoryGovernor::snapshot(const std::optional<uint64_t> &hostAvailable,
       hostAvailable.value_or(0),
       hostReserveBytes_,
       hostHeadroom,
+      hostDebtBytes_,
       systemPressure_,
       hostGrowthAllowed,
   };
@@ -305,6 +325,43 @@ void MemoryGovernor::release(uint64_t bytes) noexcept {
     return;
   }
   reservedBytes_ -= bytes;
+}
+
+CompressionGuard::Event CompressionGuard::update(double milliseconds,
+                                                const std::optional<Sample> &sample) {
+  Event event = Event::None;
+  if (debtBytes_ && milliseconds >= holdEndMilliseconds_) {
+    debtBytes_ = 0;
+    event = Event::Expired;
+  }
+  if (!sample) {
+    window_.clear();
+    return event;
+  }
+  while (!window_.empty() &&
+         window_.front().milliseconds < milliseconds - kCompressionWindowMilliseconds)
+    window_.pop_front();
+  window_.push_back({milliseconds, sample->compressedBytes, sample->chargedBytes});
+  // The growth counts from the window's least compressed point; compression
+  // since then while the engine held still or shrank is another program's
+  // doing.
+  const Point &least = *std::min_element(
+      window_.begin(), window_.end(),
+      [](const Point &a, const Point &b) { return a.compressedBytes < b.compressedBytes; });
+  const uint64_t growth = sample->compressedBytes - least.compressedBytes;
+  if (growth < kHostWarningMarginBytes || sample->chargedBytes <= least.chargedBytes)
+    return event;
+  growthBytes_ = growth;
+  // A fire within the hold owes at least what the earlier one did: memory
+  // taken since then counts against the headroom, as it does for one fire.
+  const uint64_t debt = sample->hostRoomBytes <= std::numeric_limits<uint64_t>::max() - growth
+      ? sample->hostRoomBytes + growth
+      : std::numeric_limits<uint64_t>::max();
+  debtBytes_ = std::max(debtBytes_, debt);
+  holdEndMilliseconds_ = milliseconds + kCompressionHoldMilliseconds;
+  // The growth is paid for: the next fire needs as much again.
+  window_.clear();
+  return Event::Fired;
 }
 
 std::optional<MemoryReclaimDirective> MemoryPressurePolicy::update(

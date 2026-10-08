@@ -598,6 +598,155 @@ void testRequestInServiceGrowsThroughHostPressure() {
           "the mark of a request in service outlived it");
 }
 
+// The guard fires when what the compressor holds grows by the warning margin
+// within the window while the engine grows, and owes the host's room above
+// its reserve and that growth for the hold. Growth spread wider than the
+// window, compression while the engine holds still or shrinks, and growth
+// across a restart do not fire it. A fire within the hold renews it; the hold
+// then ends on its own.
+void testCompressionGuardFiresOnTheEnginesGrowth() {
+  using Event = CompressionGuard::Event;
+  CompressionGuard guard;
+  double now = 0.0;
+  uint64_t compressed = 4 * kGiB;
+  uint64_t charged = 20 * kGiB;
+  const uint64_t room = 30 * kGiB;
+  // Advances the clock by `step` and samples.
+  const auto sample = [&](double step) {
+    now += step;
+    return guard.update(now, CompressionGuard::Sample{compressed, charged, room});
+  };
+  // A pass without a sample: the window starts again.
+  const auto restart = [&] { return guard.update(now, std::nullopt); };
+  require(sample(0.0) == Event::None, "a first sample fired");
+  // Twenty samples half a second apart: the compressor grows short of the
+  // margin within the window while the engine grows.
+  for (int i = 0; i < 20; ++i) {
+    compressed += (kHostWarningMarginBytes - 1) / 20;
+    charged += kMiB;
+    require(sample(500.0) == Event::None, "growth short of the warning margin fired");
+  }
+  // The same pace for longer: no window holds the margin.
+  for (int i = 0; i < 20; ++i) {
+    compressed += (kHostWarningMarginBytes - 1) / 21;
+    charged += kMiB;
+    require(sample(550.0) == Event::None, "growth spread past the window fired");
+  }
+  require(restart() == Event::None && sample(0.0) == Event::None, "a restart fired");
+  // The margin within the window, the engine still: another program's.
+  compressed += kHostWarningMarginBytes;
+  require(sample(500.0) == Event::None, "growth while the engine held still fired");
+  compressed += kHostWarningMarginBytes;
+  charged -= kGiB;
+  require(sample(500.0) == Event::None, "growth while the engine shrank fired");
+  compressed -= kHostWarningMarginBytes;
+  require(sample(500.0) == Event::None, "a falling compressor fired");
+  // A pass without a sample drops what came before it.
+  require(restart() == Event::None, "a restart fired");
+  compressed += kHostWarningMarginBytes;
+  charged += kGiB;
+  require(sample(500.0) == Event::None, "growth across a restart fired");
+  // The margin within the window while the engine grows.
+  compressed += kHostWarningMarginBytes;
+  charged += 200 * kMiB;
+  require(sample(500.0) == Event::Fired && guard.growthBytes() == kHostWarningMarginBytes &&
+              guard.debtBytes() == room + kHostWarningMarginBytes,
+          "the guard missed the engine's growth paid for by compression");
+  // The fire paid for that growth: the window starts again.
+  require(sample(500.0) == Event::None, "one growth fired twice");
+  // A fire within the hold renews it.
+  now += kCompressionHoldMilliseconds / 2;
+  compressed += 2 * kHostWarningMarginBytes;
+  charged += 200 * kMiB;
+  require(sample(0.0) == Event::None, "a first sample after a pause fired");
+  compressed += 2 * kHostWarningMarginBytes;
+  charged += 200 * kMiB;
+  require(sample(500.0) == Event::Fired && guard.growthBytes() == 2 * kHostWarningMarginBytes &&
+              guard.debtBytes() == room + 2 * kHostWarningMarginBytes,
+          "a fire within the hold did not renew it");
+  const double renewed = now;
+  now = renewed + kCompressionHoldMilliseconds - 1.0;
+  require(sample(0.0) == Event::None && guard.debtBytes() != 0, "the hold ended early");
+  // The hold ends also on a pass without a sample.
+  now = renewed + kCompressionHoldMilliseconds;
+  require(restart() == Event::Expired && guard.debtBytes() == 0, "the hold did not end");
+  require(sample(500.0) == Event::None, "an ended hold ended again");
+
+  // The growth counts from the compressor's least point in the window, not
+  // its oldest, and the engine must have grown since that point.
+  const auto at = [&](uint64_t content, uint64_t engine, uint64_t hostRoom = 30 * kGiB) {
+    now += 500.0;
+    return guard.update(now, CompressionGuard::Sample{content, engine, hostRoom});
+  };
+  static_cast<void>(restart());
+  require(at(5 * kGiB, 20 * kGiB) == Event::None && at(4 * kGiB, 20 * kGiB) == Event::None &&
+              at(5 * kGiB, 20 * kGiB + kMiB) == Event::Fired &&
+              guard.debtBytes() == 30 * kGiB + kGiB,
+          "growth from the compressor's least point did not fire");
+  now += kCompressionHoldMilliseconds;
+  static_cast<void>(restart());
+  // The engine shrank since the compressor's least point and grew a little
+  // after: the compression is not its doing.
+  require(at(4 * kGiB, 20 * kGiB) == Event::None &&
+              at(4 * kGiB + kGiB / 2, 15 * kGiB) == Event::None &&
+              at(5 * kGiB, 15 * kGiB + 200 * kMiB) == Event::None,
+          "compression while the engine shrank fired after a small regrowth");
+  // A fire within the hold owes at least what the earlier one did, even
+  // once requests in service took some of the room.
+  static_cast<void>(restart());
+  require(at(4 * kGiB, 20 * kGiB) == Event::None &&
+              at(5 * kGiB, 20 * kGiB + kMiB) == Event::Fired &&
+              guard.debtBytes() == 31 * kGiB,
+          "a fire after a restart did not owe the room and the growth");
+  require(at(5 * kGiB, 40 * kGiB, 10 * kGiB) == Event::None &&
+              at(6 * kGiB, 40 * kGiB + kMiB, 10 * kGiB) == Event::Fired &&
+              guard.debtBytes() == 31 * kGiB,
+          "a renewal owed less than the fire before it");
+}
+
+// The debt comes off the host's headroom: growth no request in service needs
+// stops and the paced reclaim asks for the recovery margin, while a request
+// in service still grows. Memory freed after the fire counts in full, and
+// growth resumes once the headroom clears the margins again.
+void testHostDebtHoldsGrowthOutsideService() {
+  test::metalStatistics() = {};
+  test::metalStatistics().allocatedBytes = 20 * kGiB;
+  test::metalStatistics().deviceCurrentAllocatedBytes = 20 * kGiB;
+  metal::MetalBackend backend("unused");
+  const uint64_t hostReserve = 2 * kGiB;
+  std::optional<uint64_t> available = hostReserve + 30 * kGiB;
+  MemoryGovernor governor(backend, 100 * kGiB, hostReserve, [&available] { return available; }, 0);
+  const auto grow = [&](uint64_t bytes) {
+    return admit(governor, bytes, [bytes] { allocate(bytes); });
+  };
+  require(grow(kMiB) && governor.evaluate().hostDebtBytes == 0, "growth was held without a debt");
+  governor.setHostDebt(30 * kGiB + kGiB);
+  const MemoryGovernorSnapshot owed = governor.evaluate();
+  const metal::AllocationResult held = grow(kMiB);
+  require(!held && held.failure == metal::AllocationFailure::HostPressure &&
+              owed.hostDebtBytes == 31 * kGiB && owed.hostAvailableBytes == hostReserve + 30 * kGiB &&
+              owed.hostHeadroomBytes == 0 && !owed.hostGrowthAllowed &&
+              owed.pressure == MemoryPressure::Warning,
+          "a debt did not hold growth outside service");
+  MemoryPressurePolicy policy;
+  const auto directive = policy.update(owed, 0.0, false);
+  require(directive && !directive->critical && directive->targetBytes == kHostWarningMarginBytes &&
+              directive->keepResumePoint,
+          "a debt did not start the paced reclaim");
+  governor.setServing(true);
+  require(static_cast<bool>(grow(kMiB)), "a debt held a request in service");
+  governor.setServing(false);
+  // The engine returns what it owes and the recovery margin.
+  available = hostReserve + 30 * kGiB + kGiB + kHostRecoveryMarginBytes;
+  const MemoryGovernorSnapshot repaid = governor.evaluate();
+  require(repaid.hostHeadroomBytes == kHostRecoveryMarginBytes && repaid.hostGrowthAllowed &&
+              repaid.pressure == MemoryPressure::Normal && grow(kMiB),
+          "growth did not resume once the debt was repaid");
+  governor.setHostDebt(0);
+  require(governor.evaluate().hostHeadroomBytes == 30 * kGiB + kGiB + kHostRecoveryMarginBytes,
+          "a cleared debt still held the headroom");
+}
+
 } // namespace
 
 int main() {
@@ -614,6 +763,8 @@ int main() {
     testPolicyContinuesHeldBackTarget();
     testExhaustedReclaimWaivesTheHold();
     testRequestInServiceGrowsThroughHostPressure();
+    testCompressionGuardFiresOnTheEnginesGrowth();
+    testHostDebtHoldsGrowthOutsideService();
     std::cout << "memory governor tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

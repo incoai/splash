@@ -1751,7 +1751,18 @@ current wait age, which for a request holding admission closed runs from when
 its wait began. Memory transitions also appear in the console. When macOS runs
 short of memory, growth that no request in service needs pauses and the cache
 gives memory back, a paced pass at a time, down to one lane's state buffers and
-one KV extent. A pass counts only memory that leaves the engine; a cached state
+one KV extent. Short means the memory macOS can hand out without swapping (free,
+file-backed and purgeable pages, and what compressing anonymous memory would
+free) falls near the host's reserve. That measure cannot see macOS compressing
+other programs to pay for the engine's own growth, so the control pass also
+watches what the compressor holds: when it grows by 1 GiB within 10 seconds while
+the engine grows, the engine owes macOS its room above the reserve and that
+growth for five minutes. Growth no request in service needs stops and the cache
+gives back the growth and the recovery margin; while the debt holds, memory other
+programs free or take moves the headroom as before. `memory_governor.host_debt_bytes`
+in `/status` reports what is owed. The guard sees bursts, not a slower trickle,
+and under load that keeps compressing other programs it fires again after each
+hold. A pass counts only memory that leaves the engine; a cached state
 it evicts first refills the lane's state buffers it keeps. A request in service
 keeps growing within `--max-memory`, first into cached pages no request holds:
 it takes cached KV, and a cached state only where it sits on the KV that goes
