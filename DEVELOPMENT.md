@@ -297,8 +297,8 @@ required download command. An incompatible local draft is an error. Explicit
 cached elsewhere. `--draft-model` continues to accept a compatible repository
 or an existing local draft directory.
 
-To download the matching draft without downloading target weights, building
-the engine or starting a server:
+To download the matching draft without downloading target weights or starting
+a server:
 
 ```sh
 splash download-draft --model unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M --model-dir ~/.lmstudio/models/
@@ -306,8 +306,9 @@ splash download-draft --model mlx-community/Qwen3.8-27B-4bit
 ```
 
 The command inspects target metadata and may fetch small metadata files or
-remote GGUF headers. Without `--model-dir`, it uses the default Hugging Face
-cache. Running it again reuses the installed draft. Ordinary `serve` without
+remote GGUF headers. Source checkouts build the native engine for configuration
+validation. Without `--model-dir`, it uses the default Hugging Face cache.
+Running it again reuses the installed draft. Ordinary `serve` without
 `--model-dir` retains automatic target and draft downloads.
 
 Complete local targets are reused without checking for upstream updates.

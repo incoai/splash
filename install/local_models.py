@@ -7,14 +7,7 @@ import tempfile
 from dataclasses import replace
 from pathlib import Path
 
-if __package__:
-    from . import assembly, hub, library, models, upstream
-else:
-    import assembly
-    import hub
-    import library
-    import models
-    import upstream
+from . import assembly, hub, library, models, upstream
 
 
 def _missing_draft(selection, name, detail=None):

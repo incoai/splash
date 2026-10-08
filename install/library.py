@@ -18,11 +18,7 @@ import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
-if __package__:
-    from . import hub, models
-else:
-    import hub
-    import models
+from . import hub, models
 
 
 def _private(root, repo_id):

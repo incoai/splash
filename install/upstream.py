@@ -369,10 +369,8 @@ def prepare(selection):
     installation starts instead. A legacy Splash package is installed by
     legacy.prepare."""
     if selection.model_dir is not None:
-        if __package__:
-            from . import local_models
-        else:
-            import local_models
+        from . import local_models
+
         return local_models.prepare(selection)
     kind = models.installation_kind(selection.link)
     if kind == models.PACKAGE:
