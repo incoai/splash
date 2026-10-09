@@ -483,10 +483,12 @@ Reasoning comes back as `reasoning` output items. `conversation`,
 `background: true`, `truncation` other than `disabled` and `context_management`
 edits return 400.
 
-Messages takes `max_tokens`, `system`, `messages`, custom `tools`, `tool_choice`
-(`auto`, `any`, `tool` or `none`, with `disable_parallel_tool_use`),
-`stop_sequences`, `temperature`, `top_p`, `top_k`, `thinking` and
-`output_config`. A request reasons only when `thinking` sets it:
+Messages takes `max_tokens`, `system`, `messages`, custom `tools` (every one
+declared in the prompt, `defer_loading` ones too, so a `tool_result`'s
+`tool_reference` blocks from a tool search render as lines naming the tools
+found), `tool_choice` (`auto`, `any`, `tool` or `none`, with
+`disable_parallel_tool_use`), `stop_sequences`, `temperature`, `top_p`, `top_k`,
+`thinking` and `output_config`. A request reasons only when `thinking` sets it:
 `{"type": "enabled"}` and `{"type": "adaptive"}` reason at
 `output_config.effort`, one of `low`, `medium`, `high` (the default), `xhigh`
 and `max`, while `{"type": "disabled"}` and an omitted `thinking` do not;

@@ -271,6 +271,79 @@ class AnthropicAdapterTest(unittest.TestCase):
         )
         self.assertFalse(translated["parallel_tool_calls"])
 
+    def test_anthropic_tool_references_name_the_found_tools(self):
+        def tool_message(content):
+            translated, _ = anthropic_to_chat_body(
+                anthropic_body(
+                    messages=[
+                        {"role": "user", "content": "find the tool"},
+                        {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": "toolu_1",
+                                    "name": "ToolSearch",
+                                    "input": {"query": "select:recall"},
+                                }
+                            ],
+                        },
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "toolu_1",
+                                    "content": content,
+                                }
+                            ],
+                        },
+                    ],
+                    tools=[
+                        {"name": "ToolSearch", "input_schema": {"type": "object"}},
+                        {
+                            "name": "recall",
+                            "input_schema": {"type": "object"},
+                            "defer_loading": True,
+                        },
+                    ],
+                ),
+                thinking_resolver=no_signed_thinking,
+            )
+            self.assertEqual(
+                [tool["function"]["name"] for tool in translated["tools"]],
+                ["ToolSearch", "recall"],
+            )
+            return translated["messages"][-1]
+
+        reference = {"type": "tool_reference", "tool_name": "recall"}
+        self.assertEqual(
+            tool_message([reference]),
+            {"role": "tool", "tool_call_id": "toolu_1", "content": "recall"},
+        )
+        self.assertEqual(
+            tool_message(
+                [
+                    {"type": "text", "text": "Found:"},
+                    reference,
+                    {"type": "tool_reference", "tool_name": "remember"},
+                ]
+            )["content"],
+            "Found:\nrecall\nremember",
+        )
+        for invalid in ({"type": "tool_reference"}, {**reference, "tool_name": ""}):
+            with (
+                self.subTest(invalid=invalid),
+                self.assertRaisesRegex(APIError, "invalid Anthropic tool_reference"),
+            ):
+                tool_message([invalid])
+        # A reference belongs in a tool result, not in a user's own content.
+        with self.assertRaisesRegex(APIError, "unsupported Anthropic content block"):
+            anthropic_to_chat_body(
+                anthropic_body(messages=[{"role": "user", "content": [reference]}]),
+                thinking_resolver=no_signed_thinking,
+            )
+
     def test_anthropic_adaptive_thinking_maps_reasoning_effort(self):
         translated, _ = anthropic_to_chat_body(
             anthropic_body(

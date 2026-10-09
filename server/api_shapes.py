@@ -912,7 +912,9 @@ def _anthropic_tool_result(block):
         raise APIError(400, "invalid Anthropic tool_result block")
     if not isinstance(block.get("is_error", False), bool):
         raise APIError(400, "tool_result.is_error must be a boolean")
-    content = _anthropic_content(block.get("content", ""), "tool_result")
+    content = _anthropic_content(
+        _tool_references_as_text(block.get("content", "")), "tool_result"
+    )
     if block.get("is_error"):
         failed = "Tool execution failed:\n"
         content = (
@@ -921,6 +923,24 @@ def _anthropic_tool_result(block):
             else [{"type": "text", "text": failed}, *content]
         )
     return {"role": "tool", "tool_call_id": block["tool_use_id"], "content": content}
+
+
+def _tool_references_as_text(content):
+    """tool_result content with each tool_reference block (a tool search's
+    result) as a line naming the tool. The prompt declares every tool of the
+    request, deferred ones too, so the name is all the model needs to call
+    the tool it found."""
+    if not isinstance(content, list):
+        return content
+    parts = []
+    for part in content:
+        if isinstance(part, dict) and part.get("type") == "tool_reference":
+            name = part.get("tool_name")
+            if not isinstance(name, str) or not name:
+                raise APIError(400, "invalid Anthropic tool_reference block")
+            part = {"type": "text", "text": f"\n{name}" if parts else name}
+        parts.append(part)
+    return parts
 
 
 def _anthropic_tools(tools):
