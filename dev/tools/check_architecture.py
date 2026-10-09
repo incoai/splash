@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Enforce production dependency boundaries."""
+"""Enforce production dependency boundaries, and keep Hugging Face tokens out
+of CI."""
 
 from __future__ import annotations
 
@@ -21,13 +22,23 @@ OPERATOR_WORKSPACE_POLICY_NAMES: tuple[str, ...] = (
     "moeMaximumTiles",
     "LinearTile",
     "LinearConfig",
-    "LinearSimdgroups",
     "MoeExpertTile",
-    "MoeExpertSimdgroups",
     "MoeConfig",
 )
 OPERATOR_WORKSPACE_POLICY = re.compile(
     r"\b(?:" + "|".join(OPERATOR_WORKSPACE_POLICY_NAMES) + r")\b"
+)
+# The standard library's steady clocks, which count sleep on macOS, and the
+# timed waits that measure on them; production measures durations on
+# AwakeClock and wall-clock instants on system_clock.
+SLEEP_COUNTING_CLOCK = re.compile(
+    r"\b(?:steady_clock|high_resolution_clock|wait_for|try_lock_for"
+    r"|try_acquire_for)\b"
+)
+# The variables huggingface_hub reads a token from, and the repository
+# secrets a workflow would pass one in.
+HUGGING_FACE_TOKEN = re.compile(
+    r"\b(?:HF_TOKEN|HUGGING_FACE_HUB_TOKEN)\b|\bsecrets\s*(?:\.\s*|\[\s*['\"])HF_"
 )
 
 
@@ -109,7 +120,7 @@ def check_package_imports() -> list[str]:
     header = ast.dump(
         ast.parse('__name__ == "__main__" and not __package__', mode="eval").body
     )
-    entry_points = {"install/launcher.py", "install/models.py", "install/catalog.py"}
+    entry_points = {"install/launcher.py", "install/models.py"}
     errors = []
     for package in ("server", "install"):
         paths = sorted((ROOT / package).glob("*.py"))
@@ -147,8 +158,18 @@ def check_package_imports() -> list[str]:
     return errors
 
 
+def check_workflows() -> list[str]:
+    # CI installs public models alone, which need no token, and a token a
+    # workflow passes reaches every program its job runs.
+    return [
+        f"{relative(path)}: passes a Hugging Face token ({match.group()})"
+        for path in sorted((ROOT / ".github/workflows").glob("*.y*ml"))
+        if (match := HUGGING_FACE_TOKEN.search(path.read_text()))
+    ]
+
+
 def check() -> list[str]:
-    errors = check_server_dependencies() + check_package_imports()
+    errors = check_server_dependencies() + check_package_imports() + check_workflows()
     forbidden_metal_dependencies = ("engine/", "model/", "ops/")
     forbidden_model_dependencies = ("engine/",)
     forbidden_operator_dependencies = ("engine/", "model/")
@@ -179,8 +200,8 @@ def check() -> list[str]:
         text = path.read_text(errors="replace")
         includes = include_paths(path, text)
         for include in includes:
-            if include.startswith("tuning/"):
-                errors.append(f"{name}: production depends on offline tuning {include}")
+            if include.startswith("tests/"):
+                errors.append(f"{name}: production depends on test code {include}")
         if name.startswith("runtime/metal/"):
             for include in includes:
                 if include.startswith(forbidden_metal_dependencies):
@@ -225,9 +246,10 @@ def check() -> list[str]:
             errors.append(
                 f"{name}: production backend contains client-specific behavior"
             )
-        # Tests alone substitute what production holds constant.
-        if name != "runtime/TestConfig.hpp" and "testConfigStorage" in text:
-            errors.append(f"{name}: production writes the test configuration")
+        # Every timeout and duration counts time the Mac is awake, as the
+        # server's time.monotonic() does.
+        if SLEEP_COUNTING_CLOCK.search(text):
+            errors.append(f"{name}: measures time on a clock that counts sleep")
     return errors
 
 

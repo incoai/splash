@@ -4,7 +4,6 @@ import hashlib
 import json
 import secrets
 import threading
-from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from itertools import count
@@ -28,8 +27,14 @@ from .chat_templates import (
     template_options,
 )
 from .diagnostics import print_status
-from .errors import APIError, ContextLengthError
+from .errors import (
+    APIError,
+    ContextLengthError,
+    RequestValidationError,
+    field_error,
+)
 from .latency import LatencyMetrics
+from .lru import LRUCache
 from .metrics import is_finite_number
 from .serve_options import REASONING_EFFORTS, parse_served_model_name
 from .tokenization import PromptTokenizer
@@ -86,6 +91,18 @@ SAMPLING_NUMBERS = {
 # are. With it, the table covers every sampling option the frame carries.
 TOP_K_DEFAULT = 20
 assert set(SAMPLING_NUMBERS) | {"top_k"} == set(wire.SAMPLING_FIELDS)
+
+
+def _preparation_checkpoint(deadline, disconnected):
+    """A check that a request's preparation may go on: its deadline has not
+    passed, and its client has not left."""
+
+    def checkpoint():
+        remaining_request_time(deadline)
+        if disconnected():
+            raise ConnectionResetError("client disconnected during preparation")
+
+    return checkpoint
 
 
 def _drop_nulls(body, extras):
@@ -146,57 +163,38 @@ class ResponseStore:
     BUDGET_BYTES = 64 * 1024 * 1024
 
     def __init__(self):
-        self.records = OrderedDict()
-        self.bytes = 0
-        self.evictions = 0
+        self.records = LRUCache(self.BUDGET_BYTES)
         self.hits = 0
         self.misses = 0
         self.lock = threading.Lock()
 
     def get(self, response_id):
         with self.lock:
-            record = self.records.pop(response_id, None)
+            record = self.records.get(response_id)
             if record is None:
                 self.misses += 1
-                return None
-            self.records[response_id] = record
-            self.hits += 1
+            else:
+                self.hits += 1
         return record
 
     def put(self, response, history_items):
         record = StoredResponse(
             json_codec.encode(response), json_codec.encode(history_items)
         )
-        if record.size > self.BUDGET_BYTES:
-            return False
-        response_id = response["id"]
         with self.lock:
-            previous = self.records.pop(response_id, None)
-            if previous is not None:
-                self.bytes -= previous.size
-            self.records[response_id] = record
-            self.bytes += record.size
-            while self.bytes > self.BUDGET_BYTES:
-                _, evicted = self.records.popitem(last=False)
-                self.bytes -= evicted.size
-                self.evictions += 1
-        return True
+            return self.records.put(response["id"], record, record.size)
 
     def delete(self, response_id):
         with self.lock:
-            record = self.records.pop(response_id, None)
-            if record is None:
-                return False
-            self.bytes -= record.size
-            return True
+            return self.records.pop(response_id) is not None
 
     def stats(self):
         with self.lock:
             return {
                 "entries": len(self.records),
-                "bytes": self.bytes,
-                "budget_bytes": self.BUDGET_BYTES,
-                "evictions": self.evictions,
+                "bytes": self.records.bytes,
+                "budget_bytes": self.records.budget_bytes,
+                "evictions": self.records.evictions,
                 "hits": self.hits,
                 "misses": self.misses,
             }
@@ -211,7 +209,10 @@ class Prompt:
     response_schema: dict | bool | None = None
     response_validator: object = None
     preserve_thinking: bool | None = None
-    # Template variables from the request, which outrank Splash's own.
+    # The request's own chat_template_kwargs enable_thinking, which outranks
+    # its reasoning effort (template_options); None where it sets none.
+    enable_thinking: bool | None = None
+    # Its other template variables, which outrank Splash's own.
     template_kwargs: dict = field(default_factory=dict)
 
 
@@ -269,7 +270,7 @@ class Frontend:
         self.chat_templates = chat_templates
         self.prompt_tokenizer = PromptTokenizer(tokenizer)
         self.backend = backend
-        # The package id the engine loaded. /status reports it, so an alias
+        # The model id the engine loaded. /status reports it, so an alias
         # can never hide what served a request (#81).
         self.model = model
         served = tuple(parse_served_model_name(name) for name in served_model_names)
@@ -327,7 +328,7 @@ class Frontend:
         status["latency"] = self.latencies.snapshot()
         return status
 
-    def _prepare_images(self, messages, *, check_context=True):
+    def _prepare_images(self, messages, deadline, *, check_context=True):
         """Prepared images in template render order: content parts in message
         order, images in document order."""
         parts = [
@@ -343,6 +344,9 @@ class Frontend:
         prepared = self.images.request_batch()
         tokens = pixel_bytes = 0
         for part in parts:
+            # An image can take a few hundred milliseconds to decode; an
+            # expired request starts no more of them.
+            remaining_request_time(deadline)
             try:
                 payload = image_input.decode_data_url(part["image_url"]["url"])
                 image = self.images.prepare(payload, self.max_image_pixels)
@@ -466,7 +470,9 @@ class Frontend:
         if timeout is None:
             timeout = self.request_timeout
         elif not is_finite_number(timeout) or timeout <= 0:
-            raise APIError(400, "timeout must be positive")
+            raise RequestValidationError(
+                [field_error(["timeout"], "timeout must be positive")]
+            )
         return started_at + min(timeout, self.request_timeout)
 
     def prepare(
@@ -599,26 +605,27 @@ class Frontend:
             prompt_sha256=prompt_sha256,
         )
 
-    def _encode_score_prompt(self, messages, labels, admit, deadline, what):
+    def _encode_score_prompt(self, messages, labels, admit, checkpoint, what):
         """The tokens, answer-slot token ids and text of a scoring prompt. The
         request's input drives the render, so a failure is its error."""
         try:
             return judgments.encode_prompt(
-                self.tokenizer,
+                self.prompt_tokenizer,
                 self.chat_templates.select(None).source,
                 messages,
                 labels,
                 admit=admit,
-                checkpoint=lambda: remaining_request_time(deadline),
+                checkpoint=checkpoint,
             )
         except judgments.ScoringUnsupported as error:
             raise APIError(500, str(error), "scoring_unsupported") from error
-        except (APIError, judgments.SystemOneError):
+        except (APIError, ConnectionResetError):
+            # The request's own limits, deadline and client end preparation.
             raise
         except Exception as error:
             raise APIError(400, f"{what} prompt could not be rendered") from error
 
-    def prepare_judgment(self, body, *, deadline):
+    def prepare_judgment(self, body, *, deadline, disconnected):
         unknown = sorted(
             set(body)
             - {"id", "state", "question", "options", "model", "timeout", "priority"}
@@ -632,10 +639,11 @@ class Frontend:
         except ValueError as error:
             raise APIError(400, str(error)) from error
         priority = self._priority(body)
+        checkpoint = _preparation_checkpoint(deadline, disconnected)
         with self._preparation(deadline):
 
             def admit(prompt_tokens):
-                remaining_request_time(deadline)
+                checkpoint()
                 if prompt_tokens > self.max_context:
                     raise ContextLengthError(prompt_tokens, self.max_context)
 
@@ -643,36 +651,35 @@ class Frontend:
                 judgments.judgment_messages(body),
                 judgments.LETTERS[: len(body["options"])],
                 admit,
-                deadline,
+                checkpoint,
                 "judgment",
             )
-            remaining_request_time(deadline)
+            checkpoint()
             job = self._score_job(
                 tokens, slots, deadline, priority, judgments.digest(prompt)
             )
         return job, body
 
-    def prepare_systemone(self, body, *, deadline):
+    def prepare_systemone(self, body, *, deadline, disconnected):
         details = []
         model = body.get("model")
         if not isinstance(model, str) or not model:
-            details.append(judgments.detail(["model"], "field required", "missing"))
+            details.append(field_error(["model"], "field required", "missing"))
         elif not self.accepts_model(model):
             details.append(
-                judgments.detail(
-                    ["model"], f"model {model} is not served by this endpoint"
-                )
+                field_error(["model"], f"model {model} is not served by this endpoint")
             )
         state, specs, question_details = judgments.validate_systemone(body)
         details.extend(question_details)
         try:
             priority = self._priority(body)
         except APIError as error:
-            details.append(judgments.detail(["priority"], error.message))
+            details.append(field_error(["priority"], error.message))
         if details:
-            raise judgments.SystemOneError(details)
+            raise RequestValidationError(details)
         jobs = []
         total_tokens = 0
+        checkpoint = _preparation_checkpoint(deadline, disconnected)
         with self._preparation(deadline):
             for qid, spec in specs:
                 if spec.deterministic:
@@ -680,9 +687,9 @@ class Frontend:
                     continue
                 slots = judgments.slot_labels(self.tokenizer)
                 if len(spec.labels) > len(slots):
-                    raise judgments.SystemOneError(
+                    raise RequestValidationError(
                         [
-                            judgments.detail(
+                            field_error(
                                 ["questions", qid, "criteria"],
                                 f"the served tokenizer supports "
                                 f"{len(slots)} answer slots; "
@@ -693,13 +700,13 @@ class Frontend:
                 labels = slots[: len(spec.labels)]
 
                 def admit(prompt_tokens, qid=qid, prepared=total_tokens):
-                    remaining_request_time(deadline)
+                    checkpoint()
                     if prompt_tokens > self.max_context:
                         raise ContextLengthError(prompt_tokens, self.max_context)
                     if prepared + prompt_tokens > judgments.MAX_SYSTEMONE_TOTAL_TOKENS:
-                        raise judgments.SystemOneError(
+                        raise RequestValidationError(
                             [
-                                judgments.detail(
+                                field_error(
                                     ["questions", qid],
                                     "total prepared question tokens exceed "
                                     f"{judgments.MAX_SYSTEMONE_TOTAL_TOKENS}",
@@ -711,10 +718,10 @@ class Frontend:
                     judgments.systemone_messages(state, spec, labels),
                     labels,
                     admit,
-                    deadline,
+                    checkpoint,
                     "question",
                 )
-                remaining_request_time(deadline)
+                checkpoint()
                 total_tokens += len(tokens)
                 jobs.append(
                     (qid, spec, self._score_job(tokens, slot_ids, deadline, priority))
@@ -784,6 +791,12 @@ class Frontend:
             raise APIError(400, "chat_template_kwargs must be an object")
         elif reserved := sorted(RESERVED_TEMPLATE_KWARGS & template_kwargs.keys()):
             raise APIError(400, f"chat_template_kwargs cannot set {reserved[0]}")
+        template_kwargs = dict(template_kwargs)
+        enable_thinking = template_kwargs.pop("enable_thinking", None)
+        if enable_thinking is not None and not isinstance(enable_thinking, bool):
+            raise APIError(
+                400, "chat_template_kwargs enable_thinking must be a boolean"
+            )
         messages = template_messages(
             normalize_messages(
                 body.get("messages"), vision=self.vision, deadline=deadline
@@ -806,6 +819,7 @@ class Frontend:
             response_schema,
             response_validator,
             preserve_thinking,
+            enable_thinking,
             template_kwargs,
         )
 
@@ -832,11 +846,14 @@ class Frontend:
                 preserve_thinking=prompt.preserve_thinking,
                 tools=prompt.tools,
                 add_generation_prompt=add_generation_prompt,
+                enable_thinking=prompt.enable_thinking,
             ),
             **prompt.template_kwargs,
         }
         with self.latencies.measure("images"):
-            images = self._prepare_images(prompt.messages, check_context=check_context)
+            images = self._prepare_images(
+                prompt.messages, deadline, check_context=check_context
+            )
         remaining_request_time(deadline)
         if images and self.tokenizer.convert_tokens_to_ids(IMAGE_PAD_TOKEN) is None:
             raise APIError(400, "the tokenizer does not define the image pad token")
@@ -933,12 +950,18 @@ class Frontend:
             raise APIError(
                 400, "stop cannot be combined with tools or structured output"
             )
-        # Tools and structured output generate under a grammar, which decides
-        # where the output ends.
-        constrained = bool(tools) or response_schema is not None
+        # Constrained tool calls and structured output generate under a
+        # grammar, which decides where the output ends; tools beside a
+        # response schema share one.
+        tool_constrained = tool_policy is not None and (
+            tool_policy.constrained or response_schema is not None
+        )
+        constrained = tool_constrained or response_schema is not None
         if options.ignore_eos and constrained:
             raise APIError(
-                400, "ignore_eos cannot be combined with tools or structured output"
+                400,
+                "ignore_eos cannot be combined with constrained tool calls, "
+                "tool_choice none or structured output",
             )
         rendered = self._render_prompt(prompt, deadline)
         prompt_tokens, prepared_images = rendered.tokens, rendered.images
@@ -947,13 +970,13 @@ class Frontend:
         remaining_request_time(deadline)
         if constrained:
             with self.latencies.measure("grammar"):
-                if tools:
+                if tool_constrained:
                     constraint = self.constraint_factory.create(
                         tool_grammar(tool_policy, thinking, response_schema),
                         timeout=remaining_request_time(deadline),
                         prefixes=lambda: self._call_openings(tool_policy, thinking),
                     )
-                elif response_schema is not None:
+                else:
                     constraint = self.constraint_factory.create(
                         json_grammar(response_schema, thinking),
                         timeout=remaining_request_time(deadline),
@@ -1002,9 +1025,9 @@ class Frontend:
         )
 
     def _call_openings(self, policy, thinking):
-        """The tokens that begin each callable tool's call. Its parameter
-        names are all possible next, so a tool with more of them than the
-        parser admits fails there."""
+        """The tokens that begin each strict tool's call. Its parameter names
+        may come next, so a tool with more of them than the parser admits
+        fails there."""
         reasoning = [THINK_END_TOKEN_ID] if thinking else []
         return [
             (
@@ -1015,6 +1038,7 @@ class Frontend:
                 f"tool {name} has too many parameters to constrain",
             )
             for name in policy.schemas
+            if name in policy.strict
         ]
 
     def _generation_options(self, body):
@@ -1111,7 +1135,7 @@ class Frontend:
             **fields,
         )
 
-    def prepare_responses(self, body, *, deadline, reserve_input=None):
+    def prepare_responses(self, body, *, deadline, reserve_input):
         store = body.get("store")
         if store is not None and not isinstance(store, bool):
             raise APIError(400, "store must be a boolean")
@@ -1134,8 +1158,7 @@ class Frontend:
                     )
                 # The immutable record remains valid if the store evicts it.
                 # Reserve its input bytes before materializing the history.
-                if reserve_input is not None:
-                    reserve_input(len(previous.history_json))
+                reserve_input(len(previous.history_json))
                 previous_items = json_codec.loads(previous.history_json)
             items = [*previous_items, *canonical_responses_input(body.get("input"))]
             chat, namespaces = responses_to_chat_body(body, items)

@@ -35,6 +35,8 @@ struct ActualMemoryReport {
     // The buffer state writes to the disk tier stage through; zero without
     // the tier.
     uint64_t stateStagingBytes = 0;
+    // The prefill FFN's Neural Engine split; zero without one.
+    uint64_t aneFfnBytes = 0;
 
     uint64_t backendAllocatedBytes = 0;
     uint64_t deviceCurrentAllocatedBytes = 0;

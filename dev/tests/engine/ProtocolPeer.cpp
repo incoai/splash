@@ -96,7 +96,6 @@ FrameType write(Writer &out, const RequestFrame &request) {
   out.f32(request.sampling.repetitionPenalty);
   out.f32(request.sampling.minP);
   out.u64(request.sampling.seed);
-  out.u8(request.returnProgress);
   out.u32(static_cast<uint32_t>(request.scoreTokens.size()));
   out.u32(request.generationPromptTokens);
   out.u32(request.flags);
@@ -142,11 +141,10 @@ Header readHeader(std::span<const uint8_t> bytes) {
   Reader in(bytes);
   const auto magic = in.bytes(kMagic.size());
   if (!std::equal(magic.begin(), magic.end(), kMagic.begin()) ||
-      in.u16() != kProtocolVersion || in.u16() != kFrameHeaderBytes) {
+      in.u16() != kProtocolVersion) {
     throw std::runtime_error("native frame header is invalid");
   }
   const auto type = static_cast<FrameType>(in.u16());
-  static_cast<void>(in.u16()); // flags
   return {type, in.u64()};
 }
 
@@ -235,11 +233,8 @@ std::vector<uint8_t> serialize(const ClientMessage &message) {
   frame.raw(std::span(reinterpret_cast<const uint8_t *>(kMagic.data()),
                       kMagic.size()));
   frame.u16(kProtocolVersion);
-  frame.u16(static_cast<uint16_t>(kFrameHeaderBytes));
   frame.u16(static_cast<uint16_t>(type));
-  frame.u16(0);
   frame.u64(bytes.size());
-  frame.u32(0);
   frame.raw(bytes);
   return frame.take();
 }

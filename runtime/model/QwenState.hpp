@@ -50,6 +50,9 @@ struct QwenLogicalLengths final {
   uint64_t targetTokens = 0;
   uint64_t draftBase = 0;
   uint32_t draftLength = 0;
+  // Where the rows the context window holds for the rings end: prefill
+  // writes both, decode the rings alone, which leaves the window behind.
+  uint64_t windowEnd = 0;
 
   [[nodiscard]] uint64_t draftEnd() const noexcept {
     return draftBase + draftLength;
@@ -58,6 +61,10 @@ struct QwenLogicalLengths final {
   hasCompleteDraftWindow(uint32_t draftCapacity) const noexcept {
     return draftCapacity && draftEnd() == targetTokens &&
            draftLength == std::min<uint64_t>(targetTokens, draftCapacity);
+  }
+  // The context window holds every row of the rings.
+  [[nodiscard]] bool hasCurrentContextWindow() const noexcept {
+    return windowEnd == draftEnd();
   }
 
   bool operator==(const QwenLogicalLengths &) const = default;
@@ -73,18 +80,19 @@ struct QwenLaneMetadata final {
 
 class QwenStateStorage;
 
-// One GDN cell plus one draft ring: the buffers a cached state occupies.
+// One GDN cell plus one context window: the buffers a cached state occupies.
 struct QwenCachedBuffers final {
   std::shared_ptr<QwenGdnCell> gdn;
-  std::shared_ptr<DFlashDraftRing> draft;
+  std::shared_ptr<DFlashContextWindow> window;
 };
 
-// Free buffers available for reuse: a lane takes two cells and a ring, a
-// cached state one of each. Both return them here; idle buffers are released
-// only by reclaim.
+// Free buffers available for reuse: a lane takes two cells, the draft rings
+// and a context window, a cached state a cell and a window. Both return them
+// here; idle buffers are released only by reclaim.
 struct QwenBufferPool final {
   std::vector<std::shared_ptr<QwenGdnCell>> cells;
   std::vector<std::shared_ptr<DFlashDraftRing>> rings;
+  std::vector<std::shared_ptr<DFlashContextWindow>> windows;
   // Cleared when the storage goes away; late returns then just free.
   bool open = true;
 };
@@ -102,9 +110,9 @@ struct StateStaging final {
 };
 
 // A copy of one lane's committed state, either in RAM (a pooled GDN cell and
-// draft ring, returned to the pool when the last reference drops) or on disk
-// (one slot of the state file). It cannot be rebuilt from KV pages of either
-// format; nothing mutable is exposed.
+// context window, returned to the pool when the last reference drops) or on
+// disk (one slot of the state file). It cannot be rebuilt from KV pages of
+// either format; nothing mutable is exposed.
 class QwenCompositeState final : public CompositeState {
 public:
   ~QwenCompositeState() override;
@@ -122,6 +130,9 @@ public:
   }
   [[nodiscard]] std::unique_ptr<StateOffload>
   offload(std::function<void()> completion) const override;
+  [[nodiscard]] std::unique_ptr<StateOffload>
+  persist(std::function<void()> completion) const override;
+  void label(std::vector<std::byte> label) const override;
 
 private:
   QwenCompositeState(std::shared_ptr<QwenBufferPool> pool,
@@ -169,13 +180,14 @@ public:
   QwenStateStorage &operator=(const QwenStateStorage &) = delete;
 
   [[nodiscard]] const QwenLaneMetadata &metadata(uint32_t lane) const;
-  // An assigned lane's buffers, read through the cells and the ring it
-  // holds: current() is the GDN cell its next transition reads, next() the
-  // one that transition writes, draft() its draft ring. swapParity()
-  // exchanges current and next.
+  // An assigned lane's buffers, read through the cells, the rings and the
+  // window it holds: current() is the GDN cell its next transition reads,
+  // next() the one that transition writes, draft() its draft rings and
+  // window() their context window. swapParity() exchanges current and next.
   [[nodiscard]] const GdnParityBuffers &current(uint32_t lane) const;
   [[nodiscard]] const GdnParityBuffers &next(uint32_t lane) const;
   [[nodiscard]] const std::vector<DFlashDraftRingLayer> &draft(uint32_t lane) const;
+  [[nodiscard]] const metal::MetalBuffer &window(uint32_t lane) const;
 
   // Activation takes pooled buffers and asks the governor once for all the
   // pool lacks, together with `extraBytes` for what else the request's start
@@ -193,15 +205,18 @@ public:
   // state; its first transition overwrites the other parity.
   void clearForColdStart(uint32_t lane);
 
-  // Returns one pooled buffer to macOS, a cell before a ring, keeping one
-  // lane's cells and ring when keepLane: what a reclaim step for a denied
-  // allocation releases. Zero when none is left to give. Active lanes and
-  // cached states are never moved or reclaimed.
+  // Returns one pooled buffer to macOS, a cell before draft rings and rings
+  // before a window, keeping one lane's buffers when keepLane: what a
+  // reclaim step for a denied allocation releases. Zero when none is left
+  // to give. Active lanes and cached states are never moved or reclaimed.
   [[nodiscard]] uint64_t releaseOneIdle(bool keepLane) noexcept;
   [[nodiscard]] uint32_t idleCells() const noexcept;
   [[nodiscard]] uint32_t idleRings() const noexcept;
+  [[nodiscard]] uint32_t idleWindows() const noexcept;
   // What activating a lane lacks in the idle pool, in cached states: each
-  // holds one GDN cell and one draft ring, a lane two cells and a ring.
+  // holds one GDN cell and one context window, a lane two cells, a window
+  // and the draft rings, which no cached state holds: without idle rings no
+  // number of states makes up the lack.
   [[nodiscard]] uint32_t statesToActivate() const noexcept;
 
   // Hot-path metadata operations; neither performs a buffer copy.
@@ -222,12 +237,19 @@ public:
   // tier that accepts writes, or when the quota cannot admit another state.
   [[nodiscard]] std::unique_ptr<StateOffload>
   snapshotToDisk(uint32_t lane, std::function<void()> completion);
-  // Restores `state` into the lane's current cell, and into its draft ring
-  // when restoreDraftState. A RAM state is copied now, runs `committed` and
-  // returns null; a disk state returns the read, whose finish() runs it.
+  // Restores `state` into the lane's current cell, and into its context
+  // window when restoreDraftState: the draft rings are computed from it
+  // again (DFlashDraft::addContextRebuild). A RAM state is copied now, runs
+  // `committed` and returns null; a disk state returns the read, whose
+  // finish() runs it.
   [[nodiscard]] std::unique_ptr<StateRestore> beginRestore(
       uint32_t lane, const CompositeState &state, bool restoreDraftState,
       std::function<void()> completion, std::function<void()> committed);
+  // Takes back the disk copy of a state at `tokens` that an earlier process
+  // recorded in a persistent tier's file. A cached state holds a complete
+  // draft window, so its lengths follow from its boundary.
+  [[nodiscard]] std::shared_ptr<const CompositeState> adopt(const SlotRecord &record,
+                                                            uint32_t tokens);
 
   [[nodiscard]] uint64_t actualAllocatedBytes() const noexcept {
     return allocations_->bytes.load(std::memory_order_relaxed);
@@ -245,6 +267,7 @@ private:
                CompositeStateLayout::kLaneGdnCells>
         gdn;
     std::shared_ptr<DFlashDraftRing> draft;
+    std::shared_ptr<DFlashContextWindow> window;
   };
   struct Lane final {
     QwenLaneMetadata metadata;
@@ -256,14 +279,15 @@ private:
   void validateLengths(const QwenLogicalLengths &lengths,
                        bool cacheSnapshot) const;
   static void requireAssigned(const Lane &lane);
-  // `cells` GDN cells and a draft ring: the pool's buffers, and one
-  // admission for everything the pool lacks and for the caller's extra. A
-  // refusal allocates nothing and takes nothing from the pool.
+  // `cells` GDN cells, the draft rings when `rings` and a context window:
+  // the pool's buffers, and one admission for everything the pool lacks and
+  // for the caller's extra. A refusal allocates nothing and takes nothing
+  // from the pool.
   [[nodiscard]] metal::AllocationResult
-  acquire(uint32_t cells, std::string_view label, Buffers &buffers,
+  acquire(uint32_t cells, bool rings, std::string_view label, Buffers &buffers,
           uint64_t extraBytes = 0, const std::function<void()> &allocateExtra = {});
-  // The bytes of the cells and the ring the pool lacks of that.
-  [[nodiscard]] uint64_t missingBytes(uint32_t cells) const noexcept;
+  // The bytes of those buffers the pool lacks.
+  [[nodiscard]] uint64_t missingBytes(uint32_t cells, bool rings) const noexcept;
   void restore(uint32_t lane, const QwenCompositeState &state,
                bool restoreDraftState);
   void restoreLengths(uint32_t lane, QwenLogicalLengths lengths, bool restoreDraft);

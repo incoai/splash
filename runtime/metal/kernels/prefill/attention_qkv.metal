@@ -1,5 +1,5 @@
 #include "metal/abi/KernelABI.h"
-#include "metal/kernels/common/activation.h"
+#include "metal/kernels/common/attention_gate.h"
 #include "metal/kernels/common/attention_qkv_prepare.h"
 
 // W: the q/k norm weights' stored type (float: a GGUF's F32 norms, _f32).
@@ -36,48 +36,22 @@ inline void full_attention_gate_prefill_phase(
     device const bfloat *packed_qkv, device const bfloat *attention,
     device bfloat *hidden, constant FullPrefillParams &params, uint index,
     uint grid_size) {
-  constexpr uint HeadDim = 256, QStride = 2 * HeadDim;
-  constexpr uint PackedStride = QHeads * QStride + 2 * KHeads * HeadDim;
-  constexpr uint HeadsPerKV = QHeads / KHeads;
-  uint count = params.tokens * QHeads * HeadDim;
-  for (uint element = index; element < count; element += grid_size) {
-    uint row = element / (QHeads * HeadDim);
-    uint remainder = element % (QHeads * HeadDim);
-    uint query_head = remainder / HeadDim;
-    uint dim = remainder % HeadDim;
-    float gate = float(packed_qkv[ulong(row) * PackedStride +
-                                  query_head * QStride + HeadDim + dim]);
-    float gate_scale = splash_sigmoid(gate);
-    uint kv_head = query_head / HeadsPerKV;
-    uint local_head = query_head % HeadsPerKV;
-    hidden[element] = bfloat(
-        float(attention[((ulong(kv_head) * params.stride + row) *
-                             HeadsPerKV +
-                         local_head) *
-                            HeadDim +
-                        dim]) *
-        gate_scale);
+  uint count = params.tokens * QHeads * 256;
+  for (uint element = index; element < count; element += grid_size)
+    hidden[element] = full_attention_gate_value<QHeads, KHeads>(
+        packed_qkv, attention, 0, 0, params.stride, element);
+}
+
+#define PREFILL_ATTENTION_GATE(Name, QHeads, KHeads)                           \
+  kernel void Name(device const bfloat *packed_qkv [[buffer(0)]],              \
+                   device const bfloat *attention [[buffer(1)]],               \
+                   device bfloat *hidden [[buffer(2)]],                        \
+                   constant FullPrefillParams &params [[buffer(3)]],           \
+                   uint index [[thread_position_in_grid]],                     \
+                   uint grid_size [[threads_per_grid]]) {                      \
+    full_attention_gate_prefill_phase<QHeads, KHeads>(                         \
+        packed_qkv, attention, hidden, params, index, grid_size);              \
   }
-}
-
-kernel void
-prefill_attention_gate(device const bfloat *packed_qkv [[buffer(0)]],
-                            device const bfloat *attention [[buffer(1)]],
-                            device bfloat *hidden [[buffer(2)]],
-                            constant FullPrefillParams &params [[buffer(3)]],
-                            uint index [[thread_position_in_grid]],
-                            uint grid_size [[threads_per_grid]]) {
-  full_attention_gate_prefill_phase<24, 4>(
-      packed_qkv, attention, hidden, params, index, grid_size);
-}
-
-kernel void prefill_attention_gate_kv2_g8(
-    device const bfloat *packed_qkv [[buffer(0)]],
-    device const bfloat *attention [[buffer(1)]],
-    device bfloat *hidden [[buffer(2)]],
-    constant FullPrefillParams &params [[buffer(3)]],
-    uint index [[thread_position_in_grid]],
-    uint grid_size [[threads_per_grid]]) {
-  full_attention_gate_prefill_phase<16, 2>(
-      packed_qkv, attention, hidden, params, index, grid_size);
-}
+PREFILL_ATTENTION_GATE(prefill_attention_gate, 24, 4)
+PREFILL_ATTENTION_GATE(prefill_attention_gate_kv2_g8, 16, 2)
+#undef PREFILL_ATTENTION_GATE

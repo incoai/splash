@@ -17,6 +17,7 @@ using namespace splash::engine;
 
 namespace {
 
+using splash::test::rejects;
 using splash::test::require;
 
 // Admits bytes through the governor's one admission path, running allocate
@@ -55,17 +56,17 @@ void testHostAvailabilityCountsReclaimablePages() {
   pages.purgeable = 0;
   require(availablePages(pages) == 35,
           "non-purgeable backing received reclaimable credit");
-  // Wired file pages leave external_page_count: GPU pinning must reduce
-  // available memory, rather than crediting hot weights for KV growth.
+  // Wired file pages leave external_page_count: pinned pages must reduce
+  // available memory rather than count as reclaimable.
   pages.fileBacked -= 10;
   require(availablePages(pages) == 25,
-          "wired weights remained available for new allocations");
+          "wired file pages remained available for new allocations");
 
-  // Reading a file into clean cache does not require a second full copy
-  // when that same immutable file is mapped again on the next startup.
+  // Clean file cache is reclaimable: reading a file takes no capacity from
+  // a later allocation.
   require(availablePages({.free = 75}) == 75 &&
               availablePages({.free = 35, .fileBacked = 40}) == 75,
-          "cached weights reduced model reload capacity");
+          "clean file cache reduced allocation capacity");
   // A 64 GB M5 Pro, whose hw.memsize less its VM queues left 1.2 GiB more
   // (the firmware carve-out, tag storage) that no allocation can have.
   require(estimateHostAvailableMemory(
@@ -234,16 +235,15 @@ void testReservationsAndAdmissionClasses() {
               driverDenied.failure == metal::AllocationFailure::DriverRejected &&
               admit(governor, limit),
           "driver allocation denial did not release its reservation");
-  bool defectPropagated = false;
-  try {
-    static_cast<void>(admit(governor, 1024, [] {
-      throw metal::MetalBackendError("injected backend defect");
-    }));
-  } catch (const metal::MetalBackendError &) {
-    defectPropagated = true;
-  }
-  require(defectPropagated && admit(governor, limit),
-          "admission swallowed a backend defect or leaked its reservation");
+  rejects(
+      [&] {
+        static_cast<void>(admit(governor, 1024, [] {
+          throw metal::MetalBackendError("injected backend defect");
+        }));
+      },
+      "injected backend defect", "admission swallowed a backend defect");
+  require(static_cast<bool>(admit(governor, limit)),
+          "a backend defect leaked its reservation");
 }
 
 // Critical pressure stops all growth. Host headroom below the warning margin
@@ -340,6 +340,31 @@ void testReclaimablePagesReopenGrowth() {
           "system warning blocked growth despite sufficient host headroom");
   available = hostReserve + kGiB / 2;
   require(!admitsMore(), "system warning bypassed insufficient host headroom");
+}
+
+// Reading the governor moves nothing: /status and the engine's growth
+// queries see what it would decide, and only a reservation or the control
+// pass moves the host's hysteresis. A recovery that only a read saw leaves
+// growth held once the host falls back inside the recovery margin.
+void testSnapshotLeavesTheHysteresis() {
+  test::metalStatistics() = {};
+  metal::MetalBackend backend("unused");
+  const uint64_t hostReserve = 64 * 1024;
+  std::optional<uint64_t> available = hostReserve + kGiB / 2;
+  MemoryGovernor governor(backend, 64 * 1024, hostReserve,
+                          [&available] { return available; }, 0);
+  require(!admit(governor, 1), "growth inside the warning margin was admitted");
+  available = hostReserve + 3 * kGiB;
+  require(governor.snapshot().hostGrowthAllowed, "a read did not see the host recover");
+  available = hostReserve + 3 * kGiB / 2;
+  require(!governor.snapshot().hostGrowthAllowed && !admit(governor, 1),
+          "a read moved the host's hysteresis");
+  available = hostReserve + 3 * kGiB;
+  require(governor.evaluate().hostGrowthAllowed,
+          "the control pass did not see the host recover");
+  available = hostReserve + 3 * kGiB / 2;
+  require(governor.snapshot().hostGrowthAllowed && admit(governor, 1),
+          "the control pass did not move the host's hysteresis");
 }
 
 // Warning pressure asks for what measured headroom lacks of the recovery
@@ -522,7 +547,7 @@ void testExhaustedReclaimWaivesTheHold() {
   require(!admit(governor, 100 * kMiB), "the hold did not return with memory to reclaim");
   governor.reclaimed(ReclaimOutcome::Exhausted);
   available = hostReserve + 3 * kGiB;
-  require(governor.snapshot().pressure == MemoryPressure::Normal, "the host did not recover");
+  require(governor.evaluate().pressure == MemoryPressure::Normal, "the host did not recover");
   available = hostReserve + kGiB + kGiB / 2;
   require(!admit(governor, kGiB) && !admit(governor, 100 * kMiB),
           "an earlier episode's exhausted reclaim waived the hold");
@@ -582,6 +607,7 @@ int main() {
     testReservationsAndAdmissionClasses();
     testHostHeadroomHysteresis();
     testReclaimablePagesReopenGrowth();
+    testSnapshotLeavesTheHysteresis();
     testPressurePolicyDirectives();
     testHostRefusalStartsReclaim();
     testHostRefusalComesBeforeTheEngineLimit();

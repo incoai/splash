@@ -11,7 +11,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import statistics
 import sys
 import threading
@@ -20,8 +19,7 @@ import uuid
 from collections import defaultdict
 from pathlib import Path
 
-from dev.benchmarks import abba
-from dev.benchmarks import prepared as prepared_weights
+from dev.benchmarks import abba, weights
 from dev.tests import smoke_real as smoke
 
 
@@ -106,14 +104,12 @@ def measure(server, model, content, output_tokens, scenario, context, timeout):
     keys = [
         "prefill_wall_ms",
         "decode_wall_ms",
+        "decode_cycle_ms",
         "prefill_input_tokens",
         "decode_output_tokens",
         "drafted_tokens",
         "accepted_draft_tokens",
     ]
-    # A build older than the engine's decode cycle timing does not report it.
-    if "decode_cycle_ms" in after["metrics"]:
-        keys.append("decode_cycle_ms")
     delta = {key: after["metrics"][key] - before["metrics"][key] for key in keys}
     return {
         "scenario": scenario,
@@ -213,18 +209,6 @@ def summarize(records: list[dict]) -> list[dict]:
     both versions must be identical."""
     groups = defaultdict(lambda: defaultdict(list))
     outputs = {}
-    # Decode is judged by the engine's cycle, so host work between commands
-    # counts, unless a version does not report it: then both versions are
-    # judged by the GPU command's wall, never one metric against the other.
-    decode_metric = (
-        "decode_cycle_ms"
-        if all(
-            "decode_cycle_ms" in row["native_delta"]
-            for row in records
-            if row["scenario"] == "decode"
-        )
-        else "decode_wall_ms"
-    )
     for row in records:
         key = row["sample"], row["context"], row["scenario"]
         output = (
@@ -238,8 +222,10 @@ def summarize(records: list[dict]) -> list[dict]:
         if paired and next(iter(paired.values())) != output:
             raise ValueError(f"baseline/candidate transcript differs: {key}")
         paired[row["version"]] = output
+        # Decode is judged by the engine's cycle, so host work between
+        # commands counts.
         if row["scenario"] == "decode":
-            latency = row["native_delta"][decode_metric] / max(
+            latency = row["native_delta"]["decode_cycle_ms"] / max(
                 1, row["native_delta"]["decode_output_tokens"]
             )
         else:
@@ -257,7 +243,7 @@ def summarize(records: list[dict]) -> list[dict]:
                 "context": context,
                 "scenario": scenario,
                 "metric": (
-                    f"{decode_metric}_per_token" if scenario == "decode" else "ttft_ms"
+                    "decode_cycle_ms_per_token" if scenario == "decode" else "ttft_ms"
                 ),
                 "samples_per_round": [
                     len(rounds[index]) for index in range(len(ROUNDS))
@@ -372,22 +358,26 @@ def parse_args(argv=None):
         parser.error("the request timeout must be positive")
     if len(set(args.contexts)) != len(args.contexts):
         parser.error("contexts must be unique")
+    # A build that speaks this server's wire version loads the weights into
+    # memory; its weight-digests reads the images it loads.
     for binary in (args.baseline_binary, args.binary):
         for path in (binary, binary.parent / "splash.metallib"):
             if not path.is_file():
                 parser.error(f"missing retained executable/library: {path}")
-    args.kind = smoke.model_artifacts.installation_kind(args.package)
-    if args.kind is None:
-        parser.error(f"missing installed model: {args.package}")
+        if not weights.loads_in_memory(binary.resolve().parent):
+            parser.error(f"{binary.parent} has no {weights.WEIGHT_DIGESTS}")
+    if (
+        smoke.model_artifacts.installation_kind(args.model_root)
+        != smoke.model_artifacts.ASSEMBLY
+    ):
+        parser.error(f"missing installed model: {args.model_root}")
     return args
 
 
-def check_identity(status: dict, version: str, rounds: list[dict], shared: bool):
-    """Every round serves the same model and KV format. A build's rounds
-    load the same executable and prepared files; builds of one preparation
-    identity load the same prepared files too, while builds of different
-    identities prepare under different keys, so their bytes are compared
-    after the rounds instead (prepared.compare)."""
+def check_identity(status: dict, version: str, rounds: list[dict]):
+    """Every round serves the same model and KV format, and a build's rounds
+    load the same executable and model layout. The builds' weights are
+    compared by their bytes after the rounds (weights.compare)."""
     identity = status["identity"]
     for previous in rounds:
         expected = previous["identity"]
@@ -395,27 +385,25 @@ def check_identity(status: dict, version: str, rounds: list[dict], shared: bool)
             smoke.kv_identity(identity) == smoke.kv_identity(expected),
             "KV identity changed",
         )
-        same_layout = (
-            identity["cache"]["loaded_model_layout_sha256"]
-            == expected["cache"]["loaded_model_layout_sha256"]
-        )
         if previous["version"] == version:
             smoke.require(
                 identity["cache"]["build_id"] == expected["cache"]["build_id"],
                 "executable source changed between rounds",
             )
-            smoke.require(same_layout, f"the {version} loaded another model layout")
-        elif shared:
-            smoke.require(same_layout, "loaded target/draft changed")
+            smoke.require(
+                identity["cache"]["loaded_model_layout_sha256"]
+                == expected["cache"]["loaded_model_layout_sha256"],
+                f"the {version} loaded another model layout",
+            )
 
 
 def main(argv=None):
     args = parse_args(argv)
-    smoke.hold_package(args)
+    smoke.hold_model_root(args)
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(
-        args.package / "tokenizer", local_files_only=True
+        args.model_root / "tokenizer", local_files_only=True
     )
     nonce = uuid.uuid4().hex
     # A burst's requests each have a prefix of their own.
@@ -423,20 +411,11 @@ def main(argv=None):
         tokenizer, [128, *args.contexts], args.samples * max(1, args.burst), nonce
     )
     binaries = {"baseline": args.baseline_binary, "candidate": args.binary}
-    shared = prepared_weights.preparation_identity(
-        args.baseline_binary.resolve().parent
-    ) == prepared_weights.preparation_identity(args.binary.resolve().parent)
-    environments = {"baseline": None, "candidate": None}
-    if not shared:
-        # Builds of different preparation identities must not share a cache;
-        # the candidate keeps its own, which its other steps use.
-        environments["baseline"] = prepared_weights.baseline_environment(
-            args.output.parent
-        )
+    builds = {version: binary.resolve().parent for version, binary in binaries.items()}
     document = {
         "schema_version": 1,
         "timing": "HTTP/native wall; not GPU time",
-        "package": str(args.package.resolve()),
+        "model_root": str(args.model_root.resolve()),
         "rounds": [],
         "samples": [],
         "correctness_pass": False,
@@ -446,11 +425,11 @@ def main(argv=None):
         for round_id, version in enumerate(ROUNDS):
             run_args = argparse.Namespace(**vars(args))
             run_args.binary = binaries[version]
-            server = smoke.RealServer(run_args, environments[version])
+            server = smoke.RealServer(run_args)
             try:
                 status = server.wait_ready(args.startup_timeout)
                 smoke.validate_status(status, args.kv_format)
-                check_identity(status, version, document["rounds"], shared)
+                check_identity(status, version, document["rounds"])
                 document["rounds"].append(
                     {
                         "version": version,
@@ -523,23 +502,15 @@ def main(argv=None):
         document["comparison"] = (summarize_bursts if args.burst else summarize)(
             document["samples"]
         )
-        document["prepared"] = (
-            {"shared_identity": True, "pass": True}
-            if shared
-            else {
-                "shared_identity": False,
-                **prepared_weights.compare(
-                    prepared_weights.cache_root(environments["baseline"]),
-                    prepared_weights.cache_root(os.environ),
-                    # The model root RealServer gives both builds.
-                    package=args.package.resolve(),
-                    required=args.kind == smoke.model_artifacts.ASSEMBLY,
-                ),
-            }
+        # The model root RealServer gives both builds.
+        model_root = args.model_root.resolve()
+        document["weights"] = weights.compare(
+            weights.digests(builds["baseline"], model_root),
+            weights.digests(builds["candidate"], model_root),
         )
         smoke.require(
-            document["prepared"]["pass"],
-            f"prepared bytes differ: {document['prepared'].get('failures')}",
+            document["weights"]["pass"],
+            f"weight bytes differ: {document['weights']['failures']}",
         )
         document["correctness_pass"] = True
         document["performance_pass"] = all(

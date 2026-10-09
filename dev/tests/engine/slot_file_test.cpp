@@ -5,34 +5,36 @@
 #include <algorithm>
 #include <future>
 #include <csignal>
+#include <fcntl.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <span>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 using splash::kHostPageBytes;
 using splash::model::DiskBudget;
 using splash::model::SlotFile;
+using splash::model::SlotRecord;
 
 // A slot is its payload rounded up to whole host pages, as uncached IO wants.
 static_assert(SlotFile::slotBytesFor(1) == kHostPageBytes &&
               SlotFile::slotBytesFor(kHostPageBytes) == kHostPageBytes &&
               SlotFile::slotBytesFor(kHostPageBytes + 1) == 2 * kHostPageBytes);
 
+using splash::test::rejects;
 using splash::test::require;
-
-template <typename Exception, typename Call>
-static bool throws(Call call) {
-  try { call(); } catch (const Exception &) { return true; }
-  return false;
-}
 
 static void testFailedWriteStopsWriting() {
   const pid_t child = fork();
@@ -66,8 +68,8 @@ static void testFailedWriteStopsWriting() {
               "storage failure did not stop further writes");
       // A closed file still rejects a write that does not fit its slots.
       std::vector<std::byte> oversized(size + 1);
-      require(throws<std::invalid_argument>(
-                  [&] { static_cast<void>(file.write(partial, {oversized}, {})); }),
+      rejects([&] { static_cast<void>(file.write(partial, {oversized}, {})); },
+              "slot write does not match this file's slots",
               "a closed file absorbed a write of more than a slot");
       require(file.read(complete, {output}, {})->wait() && output.front() == std::byte{1},
               "complete slot became unreadable after a storage failure");
@@ -276,6 +278,224 @@ static void testPunchedSlotIsReusable() {
           "a punched slot did not take a new write");
 }
 
+// A directory of the temporary directory, removed with everything in it.
+class Directory final {
+public:
+  Directory() {
+    std::string name = (std::filesystem::temp_directory_path() / "splash-slots-XXXXXX").string();
+    require(::mkdtemp(name.data()) != nullptr, "temporary directory could not be made");
+    path_ = name;
+  }
+  ~Directory() {
+    std::error_code ignored;
+    std::filesystem::remove_all(path_, ignored);
+  }
+  Directory(const Directory &) = delete;
+  Directory &operator=(const Directory &) = delete;
+
+  [[nodiscard]] std::filesystem::path slots() const { return path_ / "slots"; }
+  [[nodiscard]] std::filesystem::path records() const { return path_ / "records"; }
+  [[nodiscard]] SlotFile::Persistence persistence(std::string_view tag = "cache") const {
+    const auto bytes = std::as_bytes(std::span(tag));
+    return {slots(), records(), {bytes.begin(), bytes.end()}, sizeof(uint64_t)};
+  }
+
+private:
+  std::filesystem::path path_;
+};
+
+static std::vector<std::byte> labelOf(uint64_t value) {
+  std::vector<std::byte> label(sizeof(value));
+  std::memcpy(label.data(), &value, sizeof(value));
+  return label;
+}
+
+// Flips one byte of a file in place, as damage after the fact would.
+static void flipByte(const std::filesystem::path &path, off_t offset) {
+  const int descriptor = ::open(path.c_str(), O_RDWR);
+  require(descriptor >= 0, "file to damage could not be opened");
+  std::byte value{};
+  require(::pread(descriptor, &value, 1, offset) == 1, "byte to damage could not be read");
+  value ^= std::byte{0xff};
+  require(::pwrite(descriptor, &value, 1, offset) == 1, "byte could not be damaged");
+  ::close(descriptor);
+}
+
+static uint64_t sizeOf(const std::filesystem::path &path) {
+  struct stat status {};
+  require(::stat(path.c_str(), &status) == 0, "file could not be measured");
+  return static_cast<uint64_t>(status.st_size);
+}
+
+// A persistent file keeps written, labelled slots for the next process; a
+// slot dropped while the process runs gives up its record, one dropped once
+// the file is sealed keeps it, and one never labelled leaves none. The next
+// process adopts what it keeps and frees the rest.
+static void testPersistentSlotsComeBack() {
+  constexpr size_t size = kHostPageBytes;
+  Directory directory;
+  std::vector<std::byte> one(size / 2, std::byte{1}), two(size, std::byte{2}),
+      three(size, std::byte{3});
+  {
+    auto budget = std::make_shared<DiskBudget>(4 * size);
+    SlotFile file(size, budget, directory.persistence());
+    require(file.persistent() && file.records().empty(), "a new persistent file listed records");
+    file.finishAdoption();
+    auto first = file.acquire(), second = file.acquire(), third = file.acquire(),
+         unlabelled = file.acquire();
+    require(file.write(first, {one}, {})->wait() && file.write(second, {two}, {})->wait() &&
+                file.write(third, {three}, {})->wait() &&
+                file.write(unlabelled, {three}, {})->wait(),
+            "persistent writes failed");
+    file.label(first, labelOf(1));
+    file.label(second, labelOf(2));
+    file.label(third, labelOf(3));
+    third.reset();
+    require(file.synchronize({})->wait(), "a persistent file did not synchronize");
+    file.seal();
+  }
+  {
+    auto budget = std::make_shared<DiskBudget>(4 * size);
+    SlotFile file(size, budget, directory.persistence());
+    const std::vector<SlotRecord> records = file.records();
+    require(records.size() == 2 && records[0].index == 0 && records[0].label == labelOf(1) &&
+                records[0].payloadBytes == size / 2 && records[1].label == labelOf(2) &&
+                records[1].payloadBytes == size,
+            "the next process did not find exactly the labelled slots it kept");
+    auto first = file.adopt(records[0]);
+    rejects([&] { static_cast<void>(file.adopt(records[0])); },
+            "adopted slot is not one of this file's records", "a slot was adopted twice");
+    file.finishAdoption();
+    require(budget->usedBytes() == size && budget->fileBytes() == size &&
+                sizeOf(directory.slots()) == size,
+            "adoption did not keep exactly the adopted slot");
+    std::vector<std::byte> output(size / 2);
+    require(file.read(first, {output}, {})->wait() && output == one,
+            "an adopted slot did not read back");
+    rejects([&] { static_cast<void>(file.adopt(records[1])); },
+            "slots are adopted only while a persistent slot file opens",
+            "a slot was adopted after adoption finished");
+    file.seal();
+  }
+  auto budget = std::make_shared<DiskBudget>(4 * size);
+  SlotFile file(size, budget, directory.persistence());
+  require(file.records().size() == 1 && file.records()[0].label == labelOf(1),
+          "a slot the previous process did not adopt kept its record");
+}
+
+// The first read of an adopted slot checks its payload against the record:
+// damage, or a read that does not cover the payload, fails it, and only it.
+// A slot this process wrote is trusted.
+static void testAdoptedSlotsCheckTheirFirstRead() {
+  constexpr size_t size = kHostPageBytes;
+  Directory directory;
+  std::vector<std::byte> four(size, std::byte{4}), five(size, std::byte{5}), output(size);
+  {
+    SlotFile file(size, std::make_shared<DiskBudget>(3 * size), directory.persistence());
+    file.finishAdoption();
+    const std::vector<std::pair<const std::vector<std::byte> *, uint64_t>> payloads{
+        {&four, 4}, {&five, 5}, {&five, 6}};
+    std::vector<std::shared_ptr<SlotFile::Slot>> kept;
+    for (const auto &[payload, label] : payloads) {
+      kept.push_back(file.acquire());
+      require(file.write(kept.back(), {*payload}, {})->wait(), "persistent write failed");
+      file.label(kept.back(), labelOf(label));
+    }
+    require(file.synchronize({})->wait(), "a persistent file did not synchronize");
+    file.seal();
+  }
+  flipByte(directory.slots(), 10);
+  SlotFile file(size, std::make_shared<DiskBudget>(4 * size), directory.persistence());
+  const std::vector<SlotRecord> records = file.records();
+  require(records.size() == 3, "the records of three written slots did not come back");
+  auto damaged = file.adopt(records[0]);
+  auto intact = file.adopt(records[1]);
+  auto partial = file.adopt(records[2]);
+  file.finishAdoption();
+  require(!file.read(damaged, {output}, {})->wait(), "a damaged slot read back");
+  require(file.read(intact, {output}, {})->wait() && output == five &&
+              file.read(intact, {output}, {})->wait(),
+          "an intact adopted slot did not read back");
+  std::vector<std::byte> half(size / 2);
+  require(!file.read(partial, {half}, {})->wait(),
+          "an adopted slot passed a read that did not cover its payload");
+  auto fresh = file.acquire();
+  require(file.write(fresh, {four}, {})->wait() && file.read(fresh, {half}, {})->wait(),
+          "a slot this process wrote was checked against a record");
+}
+
+// A file written for another tag empties when it opens; so does a record
+// whose bytes changed, alone.
+static void testForeignFilesAndDamagedRecordsAreDropped() {
+  constexpr size_t size = kHostPageBytes;
+  Directory directory;
+  std::vector<std::byte> payload(size, std::byte{6});
+  const auto fill = [&](std::string_view tag, int slots) {
+    SlotFile file(size, std::make_shared<DiskBudget>(4 * size), directory.persistence(tag));
+    file.finishAdoption();
+    std::vector<std::shared_ptr<SlotFile::Slot>> kept;
+    for (int index = 0; index < slots; ++index) {
+      kept.push_back(file.acquire());
+      require(file.write(kept.back(), {payload}, {})->wait(), "persistent write failed");
+      file.label(kept.back(), labelOf(static_cast<uint64_t>(index)));
+    }
+    require(file.synchronize({})->wait(), "a persistent file did not synchronize");
+    file.seal();
+  };
+  fill("one", 2);
+  {
+    SlotFile other(size, std::make_shared<DiskBudget>(4 * size), directory.persistence("two"));
+    require(other.records().empty() && sizeOf(directory.slots()) == 0,
+            "a file written for another tag was taken back");
+  }
+  fill("one", 2);
+  // The second record starts one record after the first, past the header.
+  flipByte(directory.records(), 4096 + 64 + 3);
+  SlotFile file(size, std::make_shared<DiskBudget>(4 * size), directory.persistence("one"));
+  require(file.records().size() == 1 && file.records()[0].label == labelOf(0),
+          "a damaged record was taken back, or took an intact one with it");
+}
+
+// Adopted slots count against the budget past its capacity, so the caller
+// can give up what no longer fits; until it has, nothing new is granted.
+// Nothing runs on a persistent file before adoption finishes.
+static void testAdoptionCountsPastTheQuota() {
+  constexpr size_t size = kHostPageBytes;
+  Directory directory;
+  std::vector<std::byte> payload(size, std::byte{7});
+  {
+    SlotFile file(size, std::make_shared<DiskBudget>(3 * size), directory.persistence());
+    file.finishAdoption();
+    std::vector<std::shared_ptr<SlotFile::Slot>> kept;
+    for (int index = 0; index < 3; ++index) {
+      kept.push_back(file.acquire());
+      require(file.write(kept.back(), {payload}, {})->wait(), "persistent write failed");
+      file.label(kept.back(), labelOf(static_cast<uint64_t>(index)));
+    }
+    require(file.synchronize({})->wait(), "a persistent file did not synchronize");
+    file.seal();
+  }
+  auto budget = std::make_shared<DiskBudget>(size);
+  SlotFile file(size, budget, directory.persistence());
+  rejects([&] { static_cast<void>(file.acquire()); },
+          "a persistent slot file acquires slots only after adoption",
+          "a persistent file acquired a slot before adoption finished");
+  rejects([&] { static_cast<void>(file.synchronize({})); },
+          "a persistent slot file takes operations only after adoption",
+          "a persistent file ran an operation before adoption finished");
+  std::vector<std::shared_ptr<SlotFile::Slot>> adopted;
+  for (const SlotRecord &record : file.records())
+    adopted.push_back(file.adopt(record));
+  file.finishAdoption();
+  require(budget->usedBytes() == 3 * size && !file.acquire(),
+          "adoption did not count past the quota, or a slot was granted beyond it");
+  adopted.pop_back();
+  adopted.pop_back();
+  require(budget->usedBytes() == size && !file.acquire(), "a full quota granted a slot");
+  adopted.pop_back();
+  require(file.acquire() != nullptr, "the quota did not return once adoption gave it up");
+}
+
 int main() {
   try {
     testFailedWriteStopsWriting();
@@ -284,6 +504,10 @@ int main() {
     testCancelledDirectWrite();
     testFreedSlotsReturnTheirBlocks();
     testPunchedSlotIsReusable();
+    testPersistentSlotsComeBack();
+    testAdoptedSlotsCheckTheirFirstRead();
+    testForeignFilesAndDamagedRecordsAreDropped();
+    testAdoptionCountsPastTheQuota();
     constexpr size_t size = 4 * kHostPageBytes;
     auto budget = std::make_shared<DiskBudget>(size * 2 + 1);
     SlotFile file(size, budget);
@@ -342,21 +566,21 @@ int main() {
     auto reused = file.acquire();
     second = file.acquire();
     require(reused && second && !file.acquire(), "released quota was not reusable");
-    require(throws<std::invalid_argument>(
-                [&] { SlotFile(size, std::make_shared<DiskBudget>(size - 1)); }),
-            "quota below one slot was accepted");
-    require(throws<std::invalid_argument>(
-                [&] { SlotFile(size + 1, std::make_shared<DiskBudget>(4 * size)); }),
-            "unaligned slot size was accepted");
+    rejects([&] { SlotFile(size, std::make_shared<DiskBudget>(size - 1)); },
+            "slot file quota holds no slot", "quota below one slot was accepted");
+    rejects([&] { SlotFile(size + 1, std::make_shared<DiskBudget>(4 * size)); },
+            "slot size is not aligned for uncached IO", "unaligned slot size was accepted");
     std::vector<std::byte> oversized(size + 1);
-    require(throws<std::invalid_argument>(
-                [&] { static_cast<void>(file.read(reused, {oversized}, {})); }) &&
-                throws<std::invalid_argument>([&] {
-                  static_cast<void>(file.write(
-                      reused, {std::span<const std::byte>(source), std::span<const std::byte>(oversized).first(1)},
-                      {}));
-                }),
-            "a transfer of more than a slot was accepted");
+    rejects([&] { static_cast<void>(file.read(reused, {oversized}, {})); },
+            "slot read does not match this file's slots",
+            "a read of more than a slot was accepted");
+    rejects(
+        [&] {
+          static_cast<void>(file.write(
+              reused, {std::span<const std::byte>(source), std::span<const std::byte>(oversized).first(1)},
+              {}));
+        },
+        "slot write does not match this file's slots", "a write of more than a slot was accepted");
     {
       // Two files of different slot sizes draw on one budget.
       auto shared = std::make_shared<DiskBudget>(4 * size);
@@ -377,8 +601,7 @@ int main() {
       one.reset();
       require(shared->usedBytes() == 2 * size && large.acquire() && !small.acquire(),
               "a released slot did not return its bytes to the budget");
-      require(throws<std::invalid_argument>(
-                  [&] { SlotFile(8 * size, shared); }),
+      rejects([&] { SlotFile(8 * size, shared); }, "slot file quota holds no slot",
               "a file whose slot exceeds the shared budget was accepted");
     }
     std::cout << "Slot file tests passed\n";

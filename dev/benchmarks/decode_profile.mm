@@ -3,7 +3,7 @@
 //   decode-profile METALLIB MODEL_ROOT [--prompt-tokens N] [--cycles K] [--kv-format int8|bf16] [--live-verify-threshold Q]
 //
 // Drives the real model runtime with Metal dispatch profiling enabled, so
-// every dispatch of a packed prefill command and B1 through B4 DFlash cycles
+// every dispatch of a prefill command and B1 through B4 DFlash cycles
 // is replayed as its own command and attributed to its pipeline.
 // The fused (unprofiled) GPU time of the same work is reported alongside, so
 // the gap between the sum of parts and the fused command shows how much a
@@ -239,8 +239,8 @@ int main(int argc, char **argv) {
 
       metal::MetalBackend backend(argv[1]);
       const std::filesystem::path root(argv[2]);
-      model::ModelPackage model =
-          model::loadModelPackage(backend, root, model::inspectModelPackage(root), {});
+      model::LoadedModel model =
+          model::loadModel(backend, root, model::inspectModelRoot(root));
       ops::ExecutionPlans operators(backend.capabilities());
 
       // Enough Page32 pages for four lanes of prompt plus generated rows.

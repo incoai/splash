@@ -11,10 +11,12 @@ The paths an assembly links, and what reads each:
   config.json            the target configuration: the MLX config.json, or
                          the one derived from the GGUF (ModelDescriptor.mm
                          inspectSourceModel)
-  target/config.json     the same MLX file again, where
-                         SafetensorsCheckpoint.mm reads a checkpoint's
-                         configuration
-  target/<shard>         the MLX safetensors shards (SafetensorsCheckpoint.mm)
+  target/config.json, vision/config.json
+                         the MLX config.json again, as each checkpoint
+                         directory's own config, read by engines up to 1.2,
+                         which a release check runs on this installation
+  target/<shard>         the MLX safetensors shards except those holding only
+                         vision_tower.* (SafetensorsCheckpoint.mm)
   target/<name>.gguf     the GGUF target (GgufTarget.cpp findTargetGguf)
   tokenizer/config.json  the same configuration again, from which the
                          server's AutoTokenizer.from_pretrained chooses the
@@ -25,8 +27,7 @@ The paths an assembly links, and what reads each:
   draft/config.json, draft/<name>.safetensors
                          the DFlash2 checkpoint (ModelDescriptor.mm,
                          DraftCheckpoint.cpp)
-  vision/config.json, vision/<shard>
-                         the MLX shards holding vision_tower.*
+  vision/<shard>         the MLX shards holding vision_tower.*
                          (VisionLoader.cpp, through SafetensorsCheckpoint.mm)
   vision/mmproj.gguf     the GGUF vision projector (VisionLoader.cpp)
 """
@@ -149,8 +150,6 @@ def verify(assembly: Path, *, full=False):
     record = models.read_json(assembly / "model.json")
     if not _well_formed(record):
         raise models.ModelError("invalid resolved model record")
-    if _packed_draft(record["files"]):
-        raise models.ModelError("its draft is not a DFlash2 checkpoint")
     for name, entry in record["files"].items():
         path = assembly / name
         stat = path.stat()
@@ -208,13 +207,6 @@ def _well_formed(record):
             for name, entry in files.items()
         )
     )
-
-
-def _packed_draft(files):
-    """Whether the assembly links a packed draft, draft/model.bin and
-    draft/layer-N.bin, as assemblies did before drafts were prepared from
-    their DFlash2 checkpoints; the runtime loads only a checkpoint now."""
-    return any(name.startswith("draft/") and name.endswith(".bin") for name in files)
 
 
 def pins(record):
@@ -316,14 +308,11 @@ def _check_metadata(entry):
 
 
 def hold(link: Path, models_root: Path):
-    """The directory a selection link serves from, and what holds it: for an
-    assembly, its model.json opened under a shared lock. While that file is
-    open, in this process or one that inherited it, collect_garbage keeps the
-    assembly. The link is read under the installation lock, where collection
-    runs, so there is no moment the assembly is neither linked nor held. A
-    legacy package is served from the link itself: (link, None)."""
-    if models.installation_kind(link) != models.ASSEMBLY:
-        return link, None
+    """The assembly a selection link serves from, and what holds it: its
+    model.json opened under a shared lock. While that file is open, in this
+    process or one that inherited it, collect_garbage keeps the assembly. The
+    link is read under the installation lock, where collection runs, so there
+    is no moment the assembly is neither linked nor held."""
     with models.installation_lock(models_root):
         assembly = link.resolve(strict=True)
         record = (assembly / "model.json").open("rb")

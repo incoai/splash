@@ -18,7 +18,7 @@ struct Plan {
   std::optional<std::string> error;
 };
 
-Plan plan(const std::filesystem::path &path, const model::gguf::TargetGeometry &geometry) {
+Plan plan(const std::filesystem::path &path, const model::QwenTargetDimensions &geometry) {
   try {
     model::WeightSource source(path);
     const model::GgufFile gguf(source);
@@ -44,7 +44,7 @@ const model::gguf::Copy *copyIn(const Plan &result, const std::string &name) {
 
 // Value heads regrouped from llama.cpp's tiled order from row `from` on.
 bool grouped(const model::gguf::RowOrder &order, uint64_t from, uint32_t headRows,
-             const model::gguf::TargetGeometry &g) {
+             const model::QwenTargetDimensions &g) {
   return order.from == from && order.headRows == headRows && order.keyHeads == g.gdnKeyHeads &&
          order.valueHeadsPerKey == g.gdnValueHeads / g.gdnKeyHeads;
 }
@@ -57,7 +57,7 @@ bool asStored(const model::gguf::Copy *copy, const test_gguf::Bytes &data) {
 
 void checkDense(const std::filesystem::path &directory) {
   SmallTarget target = smallTarget(false);
-  const model::gguf::TargetGeometry &g = target.geometry;
+  const model::QwenTargetDimensions &g = target.geometry;
   const auto path = directory / "dense.gguf";
   writeGguf(path, target.tensors, g);
   const Plan dense = plan(path, g);
@@ -102,7 +102,7 @@ void checkDense(const std::filesystem::path &directory) {
 void checkQuantizedAlphaBeta(const std::filesystem::path &directory) {
   for (bool moe : {false, true}) {
     const SmallTarget target = smallTarget(moe);
-    const model::gguf::TargetGeometry &g = target.geometry;
+    const model::QwenTargetDimensions &g = target.geometry;
     const auto path = directory / "alpha-beta.gguf";
     const auto tensorsWith = [&](uint32_t betaType, uint32_t alphaType) {
       std::vector<Tensor> tensors = target.tensors;
@@ -115,6 +115,7 @@ void checkQuantizedAlphaBeta(const std::filesystem::path &directory) {
       return tensors;
     };
     for (uint32_t format = 0; format < GGUF_FMT_COUNT; ++format) {
+      if (quant_affine_format(format)) continue;   // no GGUF tensor type
       const uint32_t type = kQuantFormats[format].ggml_type;
       writeGguf(path, tensorsWith(type, type), g);
       const Plan result = plan(path, g);
@@ -127,7 +128,7 @@ void checkQuantizedAlphaBeta(const std::filesystem::path &directory) {
                 pair->sources.size() == 2 && heads(pair->sources[0], "blk.0.ssm_beta.weight") &&
                 heads(pair->sources[1], "blk.0.ssm_alpha.weight"),
             "planner alpha/beta: one 256-row " + model::ggmlTypeName(type) + " tensor of beta then alpha rows (" +
-                g.architecture() + ")" + (result.error ? ": " + *result.error : ""));
+                model::gguf::architecture(g.ffnKind) + ")" + (result.error ? ": " + *result.error : ""));
     }
     for (const auto &[beta, alpha] : {std::pair{kIQ4_XS, kQ8_0}, std::pair{kQ4_K, model::ggml::kF32}}) {
       writeGguf(path, tensorsWith(beta, alpha), g);
@@ -141,19 +142,20 @@ void checkQuantizedAlphaBeta(const std::filesystem::path &directory) {
 
 void checkMoe(const std::filesystem::path &directory) {
   SmallTarget target = smallTarget(true);
-  const model::gguf::TargetGeometry &g = target.geometry;
+  const model::QwenTargetDimensions &g = target.geometry;
   const auto path = directory / "moe.gguf";
 
-  model::gguf::TargetGeometry wrongExperts = g;
+  model::QwenTargetDimensions wrongExperts = g;
   wrongExperts.experts = 5;
   writeGguf(path, target.tensors, wrongExperts);
   check(names(plan(path, g), {"expert_count"}), "planner names a metadata mismatch");
-  model::gguf::TargetGeometry dense = g;
-  dense.experts = 0;
+  model::QwenTargetDimensions dense = g;
+  dense.ffnKind = model::QwenFfnKind::Dense;
   dense.intermediateSize = g.expertIntermediateSize;
   writeGguf(path, target.tensors, dense);
-  check(names(plan(path, g), {"architecture", dense.architecture(), g.architecture()}),
-        "planner checks the architecture against the package");
+  check(names(plan(path, g),
+              {"architecture", model::gguf::architecture(dense.ffnKind), model::gguf::architecture(g.ffnKind)}),
+        "planner checks the architecture against the model's target");
 
   writeGguf(path, target.tensors, g);
   const Plan moe = plan(path, g);
@@ -188,20 +190,20 @@ void checkMoe(const std::filesystem::path &directory) {
 // RoPE base, rotated dimensions and RMS epsilon, and no RoPE scaling.
 void checkRotary(const std::filesystem::path &directory) {
   const SmallTarget target = smallTarget(false);
-  const model::gguf::TargetGeometry &g = target.geometry;
+  const model::QwenTargetDimensions &g = target.geometry;
   const auto path = directory / "rotary.gguf";
   const auto planned = [&](const std::vector<test_gguf::Key> &keys) {
     splash::test::writeFile(path, test_gguf::file(keys, target.tensors));
     return plan(path, g);
   };
-  const std::string scaling = g.architecture() + std::string(".rope.scaling.type");
+  const std::string scaling = model::gguf::architecture(g.ffnKind) + std::string(".rope.scaling.type");
   std::vector<test_gguf::Key> keys = metadata(g);
   keys.push_back(test_gguf::stringKey(scaling, "none"));
   check(!planned(keys).error, "planner accepts a GGUF that declares no RoPE scaling");
   keys.back() = test_gguf::stringKey(scaling, "yarn");
   check(names(planned(keys), {"rope.scaling.type yarn (expected none)"}), "planner refuses RoPE scaling");
 
-  model::gguf::TargetGeometry other = g;
+  model::QwenTargetDimensions other = g;
   other.rotaryPairs = 64;
   other.rotaryTheta = 1e6F;
   keys = metadata(other);
@@ -225,7 +227,7 @@ void checkRotary(const std::filesystem::path &directory) {
 // so quantized alpha/beta (Q8_0 and IQ4_XS here), whose segment reads the
 // rotated input, and not F32 ones.
 void checkRotation(const std::filesystem::path &directory) {
-  model::gguf::TargetGeometry g;
+  model::QwenTargetDimensions g;
   g.layers = 2;
   g.hiddenSize = GGUF_ROTATION_BLOCK;
   g.vocabularySize = 256;

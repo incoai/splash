@@ -16,6 +16,7 @@ using benchmark::draftContextRows;
 
 namespace {
 
+using splash::test::rejects;
 using splash::test::require;
 
 DraftContextPlan activePlan(uint32_t replayBegin, uint32_t replayEnd) {
@@ -183,14 +184,14 @@ void testJunctionAndLatestReplayAreBothMaterialized() {
           "two-boundary draft work attribution is wrong");
 }
 
-void testDispatchPacking() {
+void testCompactDispatchCaptures() {
   const auto plan = cachedPlan(0, 7000, {4096});
   const auto first = draftCaptureSpansForDispatch(plan, 2000, 4000);
   require(first.size() == 1 && first[0].absoluteBegin == 2048 &&
               first[0].absoluteEnd == 4000 &&
               first[0].compactDestinationRow == 0 && first[0].resetDraftState &&
               first[0].activeRows == 0 && first[0].materializationRows == 1952,
-          "first packed capture span is wrong");
+          "first compact capture span is wrong");
   const auto middle = draftCaptureSpansForDispatch(plan, 4000, 6048);
   require(
       middle.size() == 2 && middle[0].absoluteBegin == 4000 &&
@@ -199,15 +200,15 @@ void testDispatchPacking() {
           middle[1].absoluteBegin == 4952 && middle[1].absoluteEnd == 6048 &&
           middle[1].compactDestinationRow == 96 && middle[1].resetDraftState &&
           middle[1].activeRows == 1096 && middle[1].materializationRows == 0,
-      "two-span packed capture layout is wrong");
+      "two-span compact capture layout is wrong");
 }
 
 void testFourRaggedLanes() {
   constexpr std::array<uint32_t, 4> lengths{33, 2047, 2049, 10000};
-  uint64_t packedRows = 0;
+  uint64_t capturedRows = 0;
   for (uint32_t length : lengths)
-    packedRows += draftContextRows(activePlan(0, length));
-  require(packedRows == 33 + 2047 + 2048 + 2048,
+    capturedRows += draftContextRows(activePlan(0, length));
+  require(capturedRows == 33 + 2047 + 2048 + 2048,
           "ragged lanes shared or padded draft capture rows");
 }
 
@@ -299,22 +300,12 @@ void testRestoresDraftStateFlag() {
 }
 
 void testInvalidInputs() {
-  bool threw = false;
-  try {
-    const auto plan = activePlan(0, 4096);
-    (void)draftCaptureSpansForDispatch(plan, 0, 2049);
-  } catch (const std::invalid_argument &) {
-    threw = true;
-  }
-  require(threw, "oversized packed dispatch was accepted");
-
-  threw = false;
-  try {
-    (void)cachedPlan(0, 4096, {2048, 1024});
-  } catch (const std::invalid_argument &) {
-    threw = true;
-  }
-  require(threw, "unsorted cache-state boundaries were accepted");
+  const auto plan = activePlan(0, 4096);
+  rejects([&] { (void)draftCaptureSpansForDispatch(plan, 0, 2049); },
+          "invalid target-prefill dispatch range", "oversized dispatch was accepted");
+  rejects([] { (void)cachedPlan(0, 4096, {2048, 1024}); },
+          "draft materialization boundaries are not sorted and unique",
+          "unsorted cache-state boundaries were accepted");
 }
 
 } // namespace
@@ -327,7 +318,7 @@ int main() {
     testBenchmarkWorkIncludesRecoveryPoints();
     testJunctionDistancesAndReservation();
     testJunctionAndLatestReplayAreBothMaterialized();
-    testDispatchPacking();
+    testCompactDispatchCaptures();
     testFourRaggedLanes();
     testSparseCheckpointWindowsAndShortResume();
     testCheckpointWindowsAcrossSmallDispatches();

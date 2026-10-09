@@ -92,30 +92,20 @@ PAGED_PREFILL_SPLIT(prefill_attention_bf16_split, 4, 6, bfloat)
 PAGED_PREFILL_SPLIT(prefill_attention_bf16_split_kv2_g8, 2, 8, bfloat)
 #undef PAGED_PREFILL_SPLIT
 
-kernel void prefill_attention_reduce(
-    device const float *partials [[buffer(0)]],
-    device const float *statistics [[buffer(1)]],
-    device bfloat *output [[buffer(2)]],
-    constant SplashPrefillAttentionParams &params [[buffer(3)]],
-    uint3 group [[threadgroup_position_in_grid]],
-    uint thread_index [[thread_index_in_threadgroup]]) {
-  threadgroup float weights[SplashPrefillMaximumSplits];
-  threadgroup float group_values[8];
-  splash_prefill_attention_reduce_phase<4, 6>(
-      partials, statistics, output, params, group, thread_index, weights,
-      group_values);
-}
-
-kernel void prefill_attention_reduce_kv2_g8(
-    device const float *partials [[buffer(0)]],
-    device const float *statistics [[buffer(1)]],
-    device bfloat *output [[buffer(2)]],
-    constant SplashPrefillAttentionParams &params [[buffer(3)]],
-    uint3 group [[threadgroup_position_in_grid]],
-    uint thread_index [[thread_index_in_threadgroup]]) {
-  threadgroup float weights[SplashPrefillMaximumSplits];
-  threadgroup float group_values[8];
-  splash_prefill_attention_reduce_phase<2, 8>(
-      partials, statistics, output, params, group, thread_index, weights,
-      group_values);
-}
+#define PAGED_PREFILL_REDUCE(Name, Heads, Group)                               \
+  kernel void Name(                                                            \
+      device const float *partials [[buffer(0)]],                              \
+      device const float *statistics [[buffer(1)]],                            \
+      device bfloat *output [[buffer(2)]],                                     \
+      constant SplashPrefillAttentionParams &params [[buffer(3)]],             \
+      uint3 group [[threadgroup_position_in_grid]],                            \
+      uint thread_index [[thread_index_in_threadgroup]]) {                     \
+    threadgroup float weights[SplashPrefillMaximumSplits];                     \
+    threadgroup float group_values[8];                                         \
+    splash_prefill_attention_reduce_phase<Heads, Group>(                       \
+        partials, statistics, output, params, group, thread_index, weights,    \
+        group_values);                                                         \
+  }
+PAGED_PREFILL_REDUCE(prefill_attention_reduce, 4, 6)
+PAGED_PREFILL_REDUCE(prefill_attention_reduce_kv2_g8, 2, 8)
+#undef PAGED_PREFILL_REDUCE

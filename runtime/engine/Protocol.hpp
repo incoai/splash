@@ -18,8 +18,10 @@
 // pins the bytes both sides agree on.
 namespace splash::protocol {
 
-inline constexpr uint16_t kProtocolVersion = 7;
-inline constexpr size_t kFrameHeaderBytes = 24;
+inline constexpr uint16_t kProtocolVersion = 8;
+// A frame is its header, the magic "SPLH", the u16 protocol version, the
+// u16 FrameType and the u64 payload length, then the payload.
+inline constexpr size_t kFrameHeaderBytes = 16;
 inline constexpr uint32_t kStatusSchemaVersion = 6;
 // Image pixels travel inside the request frame; a multi-image agent turn can
 // carry well over 64 MiB of resized RGB bytes.
@@ -27,7 +29,7 @@ inline constexpr uint64_t kAbsoluteMaxFramePayloadBytes =
     256ULL * 1024 * 1024;
 
 // Every integer, including binary prompt/token words, is little-endian on the
-// wire.  Header flags and reserved bytes must be zero in native protocol.
+// wire.
 enum class FrameType : uint16_t {
   Request = 0x0001,
   Cancel = 0x0002,
@@ -46,8 +48,8 @@ enum class FrameType : uint16_t {
 
 // Request errors reject one request while preserving the stream.  An
 // engine-unhealthy error asks the supervisor to replace the engine.  A
-// protocol-fatal error means framing is no longer trusted, so the stream must
-// close without attempting another framing mode.
+// protocol-fatal error means framing is no longer trusted, or a client frame
+// failed without naming its request, so the stream must close.
 enum class FailureClass : uint8_t {
   RequestError = 1,
   EngineUnhealthy = 2,
@@ -60,10 +62,7 @@ enum class IssueCode : uint16_t {
   None = 0,
   BadMagic,
   UnsupportedVersion,
-  InvalidHeaderSize,
   UnknownFrameType,
-  NonZeroHeaderFlags,
-  NonZeroReservedField,
   FrameTooLarge,
   InvalidPayloadLength,
   TruncatedFrame,
@@ -128,13 +127,17 @@ validateLimits(const ProtocolLimits &limits);
 //   34 u32 image span count
 //   38 sampling: f32 temperature, f32 topP, u32 topK, f32 presencePenalty,
 //      f32 frequencyPenalty, f32 repetitionPenalty, f32 minP, u64 seed
-//   74 u8  returnProgress
-//   75 u32 score token count
-//   79 u32 generationPromptTokens
-//   83 u32 flags
+//   74 u32 score token count
+//   78 u32 generationPromptTokens
+//   82 u32 flags
 // then the prompt tokens, the 32-byte image spans, the image pixels and the
 // score tokens.
-inline constexpr uint64_t kRequestFixedBytes = 87;
+inline constexpr uint64_t kRequestFixedBytes = 86;
+
+// The request flags word holds the RequestFlag bits and this one, which asks
+// for PromptProgressEvents while the prompt prefills.
+inline constexpr uint32_t kReturnProgressFlag = 1U << 1;
+static_assert(!(kReturnProgressFlag & kRequestFlagBits));
 
 struct RequestFrame {
   uint64_t requestId = 0;
@@ -157,7 +160,6 @@ struct RequestFrame {
   // which score requests require (seed aside).
   SamplingParameters sampling;
   ConstraintMode constraint = ConstraintMode::None;
-  bool returnProgress = false;
   // Empty selects ordinary generation. Nonempty selects score-only mode:
   // 2..255 distinct token ids, logicalMaxOutputTokens must be zero, and the
   // request must be text-only, unconstrained, and greedy.
@@ -165,7 +167,7 @@ struct RequestFrame {
   // Trailing prompt tokens of the chat template's generation prompt; zero
   // when unknown. It must leave at least one prompt token.
   uint32_t generationPromptTokens = 0;
-  // RequestFlag bits.
+  // RequestFlag bits and kReturnProgressFlag.
   uint32_t flags = 0;
 
   bool operator==(const RequestFrame &) const = default;

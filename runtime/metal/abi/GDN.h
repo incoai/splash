@@ -7,6 +7,11 @@
 #include <stdint.h>
 #endif
 
+// The taps of the GDN short convolution: a channel's input at a token and at
+// the SPLASH_GDN_CONVOLUTION_TAPS - 1 tokens before it, which a state cell
+// carries as that many rows of every channel.
+#define SPLASH_GDN_CONVOLUTION_TAPS 4u
+
 // The packed width, the value heads and the packed, mixed and gate row
 // strides of the GDN kernels are constants of their compiled variant and the
 // grids give the tasks; the state cells' strides come from the host.

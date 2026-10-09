@@ -170,12 +170,13 @@ inline void splash_attention_page_softmax(
   probabilities4[1] = bfloat4(high);
 }
 
-// One tile over its split's pages with the INT8 K/V and the scales consumed
-// in place as device tensor operands: the prefill tile, and the verify tile
-// in its direct placement, which differs only in RowsPerTile. Queries are
-// KV-head-major [kv head][row][query head in group][dimension], so the tile's
-// fused rows form one contiguous M x D tensor. Each page is reached through
-// its table entry (kv_extent.h).
+// One tile over its split's pages, whose K/V (INT8 with their scales, or
+// BF16) it consumes in place as device tensor operands: the prefill tile of
+// SPLASH_PREFILL_ATTENTION_TILE_ROWS rows and the verify tile of
+// SPLASH_TARGET_VERIFY_ROWS (RowsPerTile). Queries are KV-head-major
+// [kv head][row][query head in group][dimension], so the tile's fused rows
+// form one contiguous M x D tensor. Each page is reached through its table
+// entry (kv_extent.h).
 // Three barriers per page order the score store, the softmax and the
 // probability reads of PV.
 template <uint KVHeads, uint QueryHeadsPerKVHead, uint RowsPerTile,

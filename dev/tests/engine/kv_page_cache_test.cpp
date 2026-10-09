@@ -14,17 +14,8 @@ using namespace splash::engine;
 
 namespace {
 
+using splash::test::rejects;
 using splash::test::require;
-
-template <typename Exception, typename Function>
-void requireThrows(Function &&function, const char *message) {
-  try {
-    function();
-  } catch (const Exception &) {
-    return;
-  }
-  throw std::runtime_error(message);
-}
 
 std::array<uint32_t, KvCache::pageTokens> page(uint32_t token) {
   std::array<uint32_t, KvCache::pageTokens> result{};
@@ -128,8 +119,8 @@ void testExactChainedBlocksAndPhysicalOwnership() {
               pool.snapshot().pagesPrefix == 4,
           "exact duplicate created a second KV block");
 
-  requireThrows<std::logic_error>([&] { cache.erase(root.id); },
-                                  "parent block was evicted before children");
+  rejects([&] { cache.erase(root.id); }, "cannot evict a referenced KV cache block",
+          "parent block was evicted before children");
   cache.retainActive(left.id);
   require(cache.evictionCandidate(0).value().id == right.id &&
               cache.evictionCandidate(right.id).value().id == other.id &&
@@ -204,17 +195,19 @@ void testInputValidation() {
   auto acquired = pool.acquirePages(1);
   require(acquired.granted(), "validation page was not acquired");
   const std::array<uint32_t, 1> shortTokens{1};
-  requireThrows<std::invalid_argument>(
+  rejects(
       [&] {
         static_cast<void>(
             cache.insert(0, shortTokens, acquired.pages[0], {}));
       },
+      "KV cache block must contain one full page",
       "partial token page was accepted");
-  requireThrows<std::invalid_argument>(
+  rejects(
       [&] {
         static_cast<void>(
             cache.insert(999, page(2), acquired.pages[0], {}));
       },
+      "KV cache parent block is unknown",
       "nonresident parent was accepted");
   pool.releasePage(acquired.pages[0], false);
 }
@@ -406,8 +399,8 @@ void testDiskTierTransitions() {
   require(cache.evictionCandidate(0).value().id == leaf.id &&
               !cache.diskCandidate(true) && !cache.diskCandidate(false),
           "fresh blocks hold disk copies");
-  requireThrows<std::logic_error>([&] { cache.dropPage(leaf.id); },
-                                  "a block without a disk copy dropped its page");
+  rejects([&] { cache.dropPage(leaf.id); }, "KV cache block has no page to drop or no disk copy",
+          "a block without a disk copy dropped its page");
 
   // A copy of a resident block is redundant; the block stays a RAM leaf.
   cache.setSlot(leaf.id, std::make_shared<FakeSlot>());
@@ -441,10 +434,11 @@ void testDiskTierTransitions() {
               cache.chain(leaf.id).pages ==
                   std::vector<uint32_t>{acquired.pages[0], KvCache::noPage},
           "disk-only block did not match through the chain");
-  requireThrows<std::logic_error>([&] { cache.setSlot(leaf.id, nullptr); },
-                                  "a disk-only block was stripped instead of erased");
-  requireThrows<std::logic_error>([&] { cache.erase(root.id); },
-                                  "a parent with a disk child was erased");
+  rejects([&] { cache.setSlot(leaf.id, nullptr); },
+          "a disk-only KV cache block is erased, not stripped",
+          "a disk-only block was stripped instead of erased");
+  rejects([&] { cache.erase(root.id); }, "cannot evict a referenced KV cache block",
+          "a parent with a disk child was erased");
 
   // A user protects a disk copy; a transfer hides the block from every order.
   cache.retainActive(leaf.id);
@@ -453,10 +447,11 @@ void testDiskTierTransitions() {
   require(cache.diskCandidate(false).value().id == leaf.id, "released disk block left the order");
   cache.setTransferring(leaf.id, true);
   require(!cache.diskCandidate(false), "a block in transfer stayed replaceable");
-  requireThrows<std::logic_error>([&] { cache.setTransferring(leaf.id, true); },
-                                  "a block in transfer was not marked as such");
-  requireThrows<std::logic_error>([&] { cache.erase(leaf.id); },
-                                  "a block in transfer was erased");
+  rejects([&] { cache.setTransferring(leaf.id, true); },
+          "KV cache block transfer state did not change",
+          "a block in transfer was not marked as such");
+  rejects([&] { cache.erase(leaf.id); }, "cannot evict a referenced KV cache block",
+          "a block in transfer was erased");
 
   // Adopting a page makes the block resident again while its content is on
   // the way; a writer that recomputes it meanwhile keeps its own page.
@@ -474,8 +469,8 @@ void testDiskTierTransitions() {
   require(cache.evictionCandidate(0).value().id == leaf.id &&
               cache.diskCandidate(true).value().id == leaf.id,
           "restored block did not rejoin the orders");
-  requireThrows<std::logic_error>([&] { cache.adoptPage(leaf.id, acquired.pages[3]); },
-                                  "a resident block adopted a second page");
+  rejects([&] { cache.adoptPage(leaf.id, acquired.pages[3]); }, "KV cache block already has a page",
+          "a resident block adopted a second page");
 
   cache.erase(leaf.id);
   cache.erase(root.id);

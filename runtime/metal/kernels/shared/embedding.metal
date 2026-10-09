@@ -1,194 +1,10 @@
 #include "metal/abi/Gguf.h"
 #include "metal/abi/KernelABI.h"
-#include "metal/abi/QuantTables.h"
+#include "metal/kernels/common/gguf_embedding_formats.h"
 
-template <uint Hidden>
-inline void q4_embedding_impl(device const uint *tokens,
-                              device const uchar *weights,
-                              device const bfloat *scales,
-                              device const bfloat *biases,
-                              device bfloat *output,
-                              constant Q4EmbeddingParams &params, uint index,
-                              uint grid_size) {
-  constexpr uint QuantGroups = Hidden / 64;
-  uint elements = params.rows * Hidden;
-  for (uint element = index; element < elements; element += grid_size) {
-    uint row = element / Hidden;
-    uint dim = element % Hidden;
-    uint raw_token = tokens[row];
-    // Runtime validates every token. Keep the bounds guard local to the
-    // storage table so a malformed direct operator call cannot read past it.
-    uint token = raw_token < params.vocabulary_size ? raw_token : 0;
-    uchar packed = weights[ulong(token) * (Hidden / 2) + dim / 2];
-    float quantized = float((packed >> ((dim & 1) * 4)) & 15);
-    ulong parameter = ulong(token) * QuantGroups + dim / 64;
-    output[element] =
-        bfloat(quantized * float(scales[parameter]) + float(biases[parameter]));
-  }
-}
-
-#define Q4_EMBEDDING_ENTRY(Name, Hidden)                                      \
-  kernel void Name(                                                          \
-      device const uint *tokens [[buffer(0)]],                               \
-      device const uchar *weights [[buffer(1)]],                             \
-      device const bfloat *scales [[buffer(2)]],                             \
-      device const bfloat *biases [[buffer(3)]],                             \
-      device bfloat *output [[buffer(4)]],                                   \
-      constant Q4EmbeddingParams &params [[buffer(5)]],                      \
-      uint index [[thread_position_in_grid]],                                \
-      uint grid_size [[threads_per_grid]]) {                                 \
-    q4_embedding_impl<Hidden>(tokens, weights, scales, biases, output,       \
-                              params, index, grid_size);                     \
-  }
-
-Q4_EMBEDDING_ENTRY(embedding_q4_h5120, 5120)
-Q4_EMBEDDING_ENTRY(embedding_q4_h2048, 2048)
-#undef Q4_EMBEDDING_ENTRY
-
-// Token gathers from native GGUF rows (ops/Embedding.cpp): a row is
-// hidden / Weights blocks of Bytes bytes, each laid out as the format's ggml
-// block_* at the byte offsets its struct names. Every format's value keeps the
-// source order of its float operations (reassociate(off)), as the GGUF GEMMs do.
-
-// The little-endian half at byte `at` of a block.
-inline half gguf_half(device const uchar *block, uint at) {
-  return as_type<half>(ushort(block[at] | (block[at + 1] << 8)));
-}
-
-// block_q4_K: half d | half dmin | uchar scales[12] | uchar qs[128], eight
-// 32-weight groups with 6-bit scales and mins; block_q5_K (Fifth) holds
-// uchar qh[32] before qs, a fifth bit per weight.
-template <bool Fifth> struct GgufEmbedK {
-  enum : uint { Weights = 256, Bytes = Fifth ? 176 : 144, D = 0, DMin = 2, Scales = 4, High = 16, Codes = Fifth ? 48 : 16 };
-  __attribute__((always_inline)) static bfloat value(device const uchar *block, uint dim) {
-#pragma clang fp reassociate(off)
-    const uint j = (dim % Weights) / 32, l = dim % 32;
-    const half d = gguf_half(block, D), dmin = gguf_half(block, DMin);
-    device const uchar *sc = block + Scales; uchar m, s;
-    if (j < 4) { s = sc[j] & 63; m = sc[j + 4] & 63; } else { s = (sc[j + 4] & 0xF) | ((sc[j - 4] >> 6) << 4); m = (sc[j + 4] >> 4) | ((sc[j] >> 6) << 4); }
-    uchar q = (block[Codes + (j / 2) * 32 + l] >> ((j % 2) * 4)) & 15;
-    if (Fifth) q |= ((block[High + l] >> j) & 1) << 4;
-    return bfloat(float(d) * float(s) * float(q) - float(dmin) * float(m));
-  }
-};
-using GgufEmbedQ4K = GgufEmbedK<false>;
-using GgufEmbedQ5K = GgufEmbedK<true>;
-// block_q6_K: uchar ql[128] | uchar qh[64] | int8 scales[16] | half d; codes
-// are 6-bit with zero point 32.
-struct GgufEmbedQ6K {
-  enum : uint { Weights = 256, Bytes = 210, Low = 0, High = 128, Scales = 192, D = 208, Zero = 32 };
-  __attribute__((always_inline)) static bfloat value(device const uchar *block, uint dim) {
-#pragma clang fp reassociate(off)
-    const uint l = dim % Weights, n = l / 128, r = l % 128, quarter = r / 32, pos = r % 32;
-    const uchar lo = (block[Low + n * 64 + (quarter & 1) * 32 + pos] >> ((quarter >> 1) * 4)) & 15;
-    const uchar hi = (block[High + n * 32 + pos] >> (2 * quarter)) & 3;
-    const char sc = as_type<char>(block[Scales + n * 8 + 2 * quarter + pos / 16]);
-    const half d = gguf_half(block, D);
-    return bfloat(float(d) * float(sc) * float(int(lo | (hi << 4)) - int(Zero)));
-  }
-};
-// block_q8_0: half d | int8 qs[32].
-struct GgufEmbedQ80 {
-  enum : uint { Weights = 32, Bytes = 34, D = 0, Codes = 2 };
-  __attribute__((always_inline)) static bfloat value(device const uchar *block, uint dim) {
-#pragma clang fp reassociate(off)
-    const half d = gguf_half(block, D);
-    return bfloat(float(d) * float(as_type<char>(block[Codes + dim % Weights])));
-  }
-};
-// The 2-bit code of weight l of a block_q3_K or block_q2_K's qs[64]: bits 2j of qs[32n + pos] for l = 128n + 32j + pos.
-inline uchar gguf_k2_code(device const uchar *qs, uint l) { return (qs[32 * (l / 128) + l % 32] >> (2 * (l % 128 / 32))) & 3; }
-// block_q3_K: uchar hmask[32] | uchar qs[64] | uchar scales[12] | half d; 16-element groups with a 6-bit scale
-// (offset 32), codes with zero point 4 when their hmask bit is clear.
-struct GgufEmbedQ3K {
-  enum : uint { Weights = 256, Bytes = 110, High = 0, Codes = 32, Scales = 96, D = 108 };
-  __attribute__((always_inline)) static bfloat value(device const uchar *block, uint dim) {
-#pragma clang fp reassociate(off)
-    const uint l = dim % Weights, n = l / 128, j = (l % 128) / 32, pos = l % 32, is = l / 16;
-    const uchar q = gguf_k2_code(block + Codes, l), h = (block[High + pos] >> (4 * n + j)) & 1;
-    const uchar sc = (is < 8 ? block[Scales + is] & 0xF : block[Scales + is - 8] >> 4) |
-                     ((block[Scales + 8 + is % 4] >> (2 * (is / 4))) & 3) << 4;
-    const half d = gguf_half(block, D);
-    return bfloat(float(d) * float(int(sc) - 32) * float(int(q) - (h ? 0 : 4)));
-  }
-};
-// block_q2_K: uchar scales[16] | uchar qs[64] | half d | half dmin; 16-element groups whose scale byte holds a
-// 4-bit scale and min.
-struct GgufEmbedQ2K {
-  enum : uint { Weights = 256, Bytes = 84, Scales = 0, Codes = 16, D = 80, DMin = 82 };
-  __attribute__((always_inline)) static bfloat value(device const uchar *block, uint dim) {
-#pragma clang fp reassociate(off)
-    const uint l = dim % Weights;
-    const uchar q = gguf_k2_code(block + Codes, l), sc = block[Scales + l / 16];
-    const half d = gguf_half(block, D), dmin = gguf_half(block, DMin);
-    return bfloat(float(d) * float(sc & 0xF) * float(q) - float(dmin) * float(sc >> 4));
-  }
-};
-// block_q4_0: half d | uchar qs[16], element j in the low nibble of qs[j] and j + 16 in the high one, with zero
-// point 8; block_q4_1 (Min) holds half m after d, the value's offset.
-template <bool Min> struct GgufEmbedQ4 {
-  enum : uint { Weights = 32, Bytes = Min ? 20 : 18, D = 0, M = 2, Codes = Min ? 4 : 2 };
-  __attribute__((always_inline)) static bfloat value(device const uchar *block, uint dim) {
-#pragma clang fp reassociate(off)
-    const uint l = dim % Weights;
-    const uchar q = (block[Codes + l % 16] >> (4 * (l / 16))) & 15;
-    if (Min) return bfloat(float(q) * float(gguf_half(block, D)) + float(gguf_half(block, M)));
-    return bfloat(float(int(q) - 8) * float(gguf_half(block, D)));
-  }
-};
-using GgufEmbedQ40 = GgufEmbedQ4<false>;
-using GgufEmbedQ41 = GgufEmbedQ4<true>;
-
-// block_pq2_0: half d | uchar qs[32], element l in bits 2 (l % 4) of qs[l / 4]; zero point 1.
-struct GgufEmbedPQ20 {
-  enum : uint { Weights = 128, Bytes = 34, D = 0, Codes = 2 };
-  __attribute__((always_inline)) static bfloat value(device const uchar *block, uint dim) {
-#pragma clang fp reassociate(off)
-    const uint l = dim % Weights;
-    const uchar q = (block[Codes + l / 4] >> (2 * (l % 4))) & 3;
-    return bfloat(float(int(q) - 1) * float(gguf_half(block, D)));
-  }
-};
-// block_iq4_nl: block_q4_0's layout, whose codes index the IQ4_NL values.
-struct GgufEmbedIQ4NL {
-  enum : uint { Weights = 32, Bytes = 18, D = 0, Codes = 2 };
-  __attribute__((always_inline)) static bfloat value(device const uchar *block, uint dim) {
-#pragma clang fp reassociate(off)
-    const uint l = dim % Weights;
-    const uchar q = (block[Codes + l % 16] >> (4 * (l / 16))) & 15;
-    return bfloat(float(gguf_half(block, D)) * float(kIQ4NLValues[q]));
-  }
-};
-// block_iq4_xs: half d | ushort scales_h | uchar scales_l[4] | uchar qs[128], eight 32-weight groups of IQ4_NL codes
-// with a 6-bit scale (offset 32): group j's element l in nibble l / 16 of qs[16 j + l % 16].
-struct GgufEmbedIQ4XS {
-  enum : uint { Weights = 256, Bytes = 136, D = 0, High = 2, Low = 4, Codes = 8 };
-  __attribute__((always_inline)) static bfloat value(device const uchar *block, uint dim) {
-#pragma clang fp reassociate(off)
-    const uint j = (dim % Weights) / 32, l = dim % 32;
-    const uint high = block[High] | (block[High + 1] << 8);
-    const int ls = int((block[Low + j / 2] >> (4 * (j % 2))) & 15) | int(((high >> (2 * j)) & 3) << 4);
-    const uchar q = (block[Codes + 16 * j + l % 16] >> (4 * (l / 16))) & 15;
-    return bfloat(float(gguf_half(block, D)) * float(ls - 32) * float(kIQ4NLValues[q]));
-  }
-};
-// block_iq3_s: half d | uchar qs[64] | uchar qh[8] | uchar signs[32] | uchar scales[4], eight 32-weight groups with
-// a 4-bit scale s worth 1 + 2 s: group j's element l is IQ3_S grid entry qs[8 j + l / 4] (ninth index bit l / 4 of
-// qh[j]) at byte l % 4, negated by bit l % 8 of signs[4 j + l / 8].
-struct GgufEmbedIQ3S {
-  enum : uint { Weights = 256, Bytes = 110, D = 0, Codes = 2, High = 66, Signs = 74, Scales = 106 };
-  __attribute__((always_inline)) static bfloat value(device const uchar *block, uint dim) {
-#pragma clang fp reassociate(off)
-    const uint j = (dim % Weights) / 32, l = dim % 32;
-    const uint index = block[Codes + 8 * j + l / 4] | (((block[High + j] >> (l / 4)) & 1) << 8);
-    const uint magnitude = (kIQ3SGrid[index] >> (8 * (l % 4))) & 0xFF;
-    const uint s = (block[Scales + j / 2] >> (4 * (j % 2))) & 15;
-    const float sign = (block[Signs + 4 * j + l / 8] >> (l % 8)) & 1 ? -1.0f : 1.0f;
-    return bfloat(float(gguf_half(block, D)) * float(1 + 2 * s) * float(magnitude) * sign);
-  }
-};
-// Inlined, with each format's value, so every gather stays one function (the
-// compiler otherwise keeps Q6_K's as a call).
+// The token gather from native GGUF rows (ops/Embedding.cpp) of a format of
+// common/gguf_embedding_formats.h. Inlined, with the format's value, so every
+// gather stays one function (the compiler otherwise keeps Q6_K's as a call).
 template <class F>
 __attribute__((always_inline)) inline void gguf_embedding(device const uint *tokens, device const uchar *table,
                                                          device bfloat *output, constant GgufEmbedParams &p,
@@ -219,6 +35,14 @@ GGUF_EMBEDDING_ENTRY(gguf_embed_pq20, GgufEmbedPQ20)
 GGUF_EMBEDDING_ENTRY(gguf_embed_iq4nl, GgufEmbedIQ4NL)
 GGUF_EMBEDDING_ENTRY(gguf_embed_iq4xs, GgufEmbedIQ4XS)
 GGUF_EMBEDDING_ENTRY(gguf_embed_iq3s, GgufEmbedIQ3S)
+GGUF_EMBEDDING_ENTRY(gguf_embed_mxfp4, GgufEmbedMXFP4)
+#define GGUF_EMBEDDING_AFFINE(B)                                                                \
+  GGUF_EMBEDDING_ENTRY(gguf_embed_af##B##g32, GgufEmbedAF##B##G32)                              \
+  GGUF_EMBEDDING_ENTRY(gguf_embed_af##B##g64, GgufEmbedAF##B##G64)                              \
+  GGUF_EMBEDDING_ENTRY(gguf_embed_af##B##g128, GgufEmbedAF##B##G128)
+GGUF_EMBEDDING_AFFINE(2) GGUF_EMBEDDING_AFFINE(3) GGUF_EMBEDDING_AFFINE(4) GGUF_EMBEDDING_AFFINE(5)
+GGUF_EMBEDDING_AFFINE(6) GGUF_EMBEDDING_AFFINE(8)
+#undef GGUF_EMBEDDING_AFFINE
 #undef GGUF_EMBEDDING_ENTRY
 
 // A verify step's input tokens, SPLASH_TARGET_VERIFY_ROWS per lane: the

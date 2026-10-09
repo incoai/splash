@@ -77,7 +77,7 @@ void confidence(MetalBackend &backend) {
         policies.back().constrained = mixed == 2;
         CommandGraph graph;
         selector.addLiveRows(graph, b, budget, policies, threshold);
-        static_cast<void>(backend.submitCommand(graph.dispatches()));
+        static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
         const auto *actual = static_cast<const VerifyLiveRows *>(budget.contents());
         for (uint32_t lane = 0; lane < lanes; ++lane) {
           uint32_t expected = 1;
@@ -102,7 +102,7 @@ void confidence(MetalBackend &backend) {
     unary[0] = NAN;
     CommandGraph invalid;
     selector.addLiveRows(invalid, b, budget, policies, 0.9F);
-    static_cast<void>(backend.submitCommand(invalid.dispatches()));
+    static_cast<void>(backend.submitCommandAsync(invalid.dispatches()).wait());
     require(static_cast<const VerifyLiveRows *>(budget.contents())[0].count == Rows,
             "nonfinite confidence must retain full verification");
     for (float threshold : {-0.1F, 1.1F, NAN, INFINITY})
@@ -122,7 +122,7 @@ void grouping(MetalBackend &backend) {
     const uint32_t maximumTiles = rows * TopK + lanes;
     const auto selected = allocate(backend, rows * Routes * sizeof(uint32_t));
     const auto tiles = allocate(backend, maximumTiles * sizeof(MoeTileDescriptor));
-    const auto count = allocate(backend, sizeof(uint32_t));
+    const auto count = allocate(backend, sizeof(MoeTileCount));
     const auto grouped = allocate(backend, maximumTiles * Tile * sizeof(uint32_t));
     const auto mapping = allocate(backend, rows * Routes * sizeof(uint32_t));
     const auto budget = allocate(backend, DraftSelector::liveRowsBytes(lanes));
@@ -145,9 +145,14 @@ void grouping(MetalBackend &backend) {
         CommandGraph graph;
         graph.add("moe_group_routes_live_rows",
                   {selected, tiles, count, grouped, mapping, budget},
-                  MoeGroupParams{rows, TopK, Tile, Experts}, {1, 1, 1});
-        static_cast<void>(backend.submitCommand(graph.dispatches()));
-        const uint32_t tileCount = *static_cast<const uint32_t *>(count.contents());
+                  MoeGroupParams{rows, TopK, Tile, Experts, 3, 5}, {1, 1, 1}, {SPLASH_MOE_EXPERT_SLOTS, 1, 1});
+        static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+        const auto &dispatch = *static_cast<const MoeTileCount *>(count.contents());
+        const uint32_t tileCount = dispatch.tiles;
+        require(dispatch.gate_up_grid[0] == 3 && dispatch.gate_up_grid[1] == tileCount &&
+                    dispatch.gate_up_grid[2] == 1 && dispatch.down_grid[0] == 5 &&
+                    dispatch.down_grid[1] == tileCount && dispatch.down_grid[2] == 1,
+                "live expert indirect grids differ from compacted tile count");
         const auto *descriptors = static_cast<const MoeTileDescriptor *>(tiles.contents());
         const auto *routes = static_cast<const uint32_t *>(grouped.contents());
         const auto *routeRows = static_cast<const uint32_t *>(mapping.contents());
@@ -223,7 +228,7 @@ void acceptance(MetalBackend &backend) {
           }
           CommandGraph graph;
           sampling.addAcceptance(graph, b, remaining, policies, 999, 998);
-          static_cast<void>(backend.submitCommand(graph.dispatches()));
+          static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
           const auto *retained = static_cast<const uint32_t *>(b.retainedCounts.contents());
           const auto *accepted = static_cast<const uint32_t *>(b.acceptedCounts.contents());
           for (uint32_t lane = 0; lane < lanes; ++lane) {
@@ -247,7 +252,7 @@ void acceptance(MetalBackend &backend) {
       }
       CommandGraph stop;
       sampling.addAcceptance(stop, b, remaining, policies, 10, 11);
-      static_cast<void>(backend.submitCommand(stop.dispatches()));
+      static_cast<void>(backend.submitCommandAsync(stop.dispatches()).wait());
       for (uint32_t lane = 0; lane < lanes; ++lane)
         require(static_cast<const uint32_t *>(b.retainedCounts.contents())[lane] == 1,
                 "live acceptance ignored a stop token");

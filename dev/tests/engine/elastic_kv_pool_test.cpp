@@ -13,17 +13,8 @@ using splash::engine::KvPool;
 using splash::metal::AllocationFailure;
 using splash::test::TestKvStorage;
 
+using splash::test::rejects;
 using splash::test::require;
-
-template <typename Error, typename Function>
-void requireThrows(Function &&function, const char *message) {
-    try {
-        function();
-    } catch (const Error &) {
-        return;
-    }
-    throw std::runtime_error(message);
-}
 
 void release(KvPool &pool, const std::vector<uint32_t> &pages,
              bool prefix = false) {
@@ -37,7 +28,7 @@ uint64_t reclaimEvery(KvPool &pool, bool keepRunway) {
     return pool.reclaimEmptyExtents(keepRunway, std::numeric_limits<uint32_t>::max());
 }
 
-void testGrowthPacksAllocatedExtents() {
+void testGrowthFillsAllocatedExtents() {
     TestKvStorage storage(12, 100, 4);
     KvPool pool(storage, 4);
     auto pages = pool.acquirePages(5);
@@ -90,8 +81,8 @@ void testRunwayIsAllocatedThroughThePool() {
         refused = error.failure() == AllocationFailure::EngineBudget;
     }
     require(refused, "a refused runway did not fail with the budget's cause");
-    requireThrows<std::invalid_argument>([&] { KvPool longPool(blocked, 17); },
-                                         "a runway longer than the pool was accepted");
+    rejects([&] { KvPool longPool(blocked, 17); }, "the KV runway exceeds the page pool",
+            "a runway longer than the pool was accepted");
 }
 
 // Page ids cover every extent the budget could hold, so running out of them
@@ -99,9 +90,9 @@ void testRunwayIsAllocatedThroughThePool() {
 void testIdExhaustionIsALogicError() {
     TestKvStorage storage(8, 100, 4);
     KvPool pool(storage, 8);
-    requireThrows<std::logic_error>(
-        [&] { static_cast<void>(pool.acquirePages(9)); },
-        "running out of page ids was not a logic error");
+    rejects([&] { static_cast<void>(pool.acquirePages(9)); },
+            "KV page ids ran out before the memory budget did",
+            "running out of page ids was not a logic error");
 }
 
 // An extent the storage refuses denies the acquisition, which holds no page
@@ -221,8 +212,9 @@ void testRefusedReleaseChangesNothing() {
     TestKvStorage storage(8, 100, 4);
     KvPool pool(storage, 8);
     storage.commandInFlight = [] { return true; };
-    requireThrows<std::logic_error>([&] { static_cast<void>(reclaimEvery(pool, false)); },
-                                    "an extent was released while a command was in flight");
+    rejects([&] { static_cast<void>(reclaimEvery(pool, false)); },
+            "cannot release a KV extent while a command is in flight",
+            "an extent was released while a command was in flight");
     const auto status = pool.snapshot();
     require(status.pagesAllocated == 8 && status.pagesFree == 8 &&
                 status.reclaimableBytes == 2 * extentBytes && status.extentReleases == 0 &&
@@ -258,11 +250,11 @@ void testCacheOwnsAPageOnce() {
     const uint32_t page = active.pages.front();
     pool.retainPage(page, true);
     require(pool.snapshot().pagesPrefix == 1, "the cache did not own the page");
-    requireThrows<std::logic_error>([&] { pool.retainPage(page, true); },
-                                    "the cache owned a page twice");
+    rejects([&] { pool.retainPage(page, true); }, "KV page already belongs to a cached block",
+            "the cache owned a page twice");
     pool.releasePage(page, true);
-    requireThrows<std::logic_error>([&] { pool.releasePage(page, true); },
-                                    "the cache gave up a page it did not own");
+    rejects([&] { pool.releasePage(page, true); }, "invalid KV page release",
+            "the cache gave up a page it did not own");
     require(pool.snapshot().pagesPrefix == 0 && pool.pageActive(page),
             "a refused claim or release changed the page's references");
     pool.releasePage(page, false);
@@ -340,8 +332,8 @@ void testCompactionNeedsFreePagesInExtentsInUse() {
             "compaction filled an empty extent");
     // Each extent holds more than the other has free.
     TestKvStorage tight(8, 100, 4);
-    KvPool packed = held(tight, {2, 3, 7});
-    require(packed.compactExtent({}).empty() && tight.copies.empty(),
+    KvPool tightPool = held(tight, {2, 3, 7});
+    require(tightPool.compactExtent({}).empty() && tight.copies.empty(),
             "compaction moved an extent the free pages did not cover");
 }
 
@@ -366,14 +358,11 @@ void testCompactionMovesNothingWhenTheStorageRefuses() {
     TestKvStorage storage(12, 100, 4);
     KvPool pool = held(storage, {0, 1, 2, 7, 10, 11});
     storage.commandInFlight = [] { return true; };
-    bool threw = false;
-    try {
-        static_cast<void>(pool.compactExtent({}));
-    } catch (const std::logic_error &) {
-        threw = true;
-    }
+    rejects([&] { static_cast<void>(pool.compactExtent({})); },
+            "cannot copy KV pages while a command is in flight",
+            "a compaction went on without the copy the storage refused");
     const auto status = pool.snapshot();
-    require(threw && pool.pageActive(3) && !pool.pageActive(7) &&
+    require(pool.pageActive(3) && !pool.pageActive(7) &&
                 status.pagesActive == 6 && status.pagesFree == 6 &&
                 status.reclaimableBytes == 0 && status.extentCompactions == 0,
             "a refused copy left pages moved");
@@ -386,7 +375,7 @@ void testCompactionMovesNothingWhenTheStorageRefuses() {
 
 int main() {
     try {
-        testGrowthPacksAllocatedExtents();
+        testGrowthFillsAllocatedExtents();
         testRunwayIsAllocatedThroughThePool();
         testIdExhaustionIsALogicError();
         testFailedGrowthKeepsItsExtentsForTheRetry();

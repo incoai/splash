@@ -1,5 +1,6 @@
 // GPU time of one GGUF projection through ops::Linear on both decode tiles (the Apple9 register tile and the staged
-// tile) at one to four lanes and every K split, the measurements behind the split tiers of runtime/ops/LinearGguf.cpp:
+// tile, on the device policy's walk) at one to four lanes and every K split, the measurements behind the split tiers
+// of runtime/ops/LinearGguf.cpp:
 //   gguf-projection-benchmark <metallib> <fmt[+fmt+fmt]> <N[+N+N]> <K> [none|residual|gateup] [rounds]
 //                             [prefill=R[,R...]]
 // The projection has one segment per format and width (up to three, fused, no epilogue), each a multiple of 256
@@ -125,19 +126,19 @@ int main(int argc, char **argv) {
       const Linear linear(backend.capabilities());
       std::vector<Case> cases;
       for (const uint32_t rows : prefillRows) {
-        const LinearWorkload w{{N, K}, rows, LinearPhase::Prefill, epilogue, WeightLayout::Block32};
+        const LinearWorkload w{{N, K}, rows, LinearPhase::Prefill, epilogue};
         const LinearConfig config{.tile = LinearTile::GgufPrefill};
         cases.push_back({"R" + std::to_string(rows), "prefill128", Linear::plan(w, config, FloatOutput::BFloat16),
                          config == linear.plan(w, ring.front()).configuration(), {}});
       }
       for (uint32_t lanes = 1; lanes <= kMaximumLanes && !prefill; ++lanes) {
-        const LinearWorkload w{{N, K}, lanes * kLaneRows, LinearPhase::Decode, epilogue, WeightLayout::Block32};
+        const LinearWorkload w{{N, K}, lanes * kLaneRows, LinearPhase::Decode, epilogue};
         const LinearConfig policy = linear.plan(w, ring.front()).configuration();
         for (const LinearTile tile : {LinearTile::GgufRegister, LinearTile::GgufStaged})
           for (uint32_t splits = 1; splits <= LinearConfig::kMaximumSplits; splits *= 2) {
             const bool registerTile = tile == LinearTile::GgufRegister;
             if (registerTile ? K / 256 < splits : (K / 32) % splits) continue;
-            const LinearConfig config{.tile = tile, .splits = splits};
+            const LinearConfig config{.tile = tile, .splits = splits, .spread = !registerTile && policy.spread};
             cases.push_back({"L" + std::to_string(lanes),
                              std::string(registerTile ? "register" : "staged") + " S" + std::to_string(splits),
                              Linear::plan(w, config, FloatOutput::BFloat16), config == policy, {}});
@@ -174,7 +175,7 @@ int main(int argc, char **argv) {
         for (uint32_t i = 0; i < copies / step; ++i, next += step)
           static_cast<void>(linear.add(graph, b, ring[next % copies], c.plan,
                                        step > 1 ? &ring[(next + 1) % copies] : nullptr));
-        return backend.submitCommand(graph.dispatches()).gpuSeconds * 1e3 / (copies / step);
+        return backend.submitCommandAsync(graph.dispatches()).wait().gpuSeconds * 1e3 / (copies / step);
       };
       for (Case &c : cases)
         for (double spent = 0; spent < kWarmupSeconds * 1e3;) spent += time(c) * copies;

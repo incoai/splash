@@ -1,5 +1,8 @@
 #include "ops/PagedAttention.hpp"
 
+#include "metal/abi/RoPE.h"
+#include "ops/BufferExtent.hpp"
+
 #include <algorithm>
 #include <array>
 #include <limits>
@@ -67,6 +70,48 @@ AttentionWorkspace verifyWorkspaceBound(uint32_t lanes, uint32_t queryHeads,
                             layout.headDimension);
 }
 
+// A staging of `rows` rows of each of `heads` heads, `stride` rows apart:
+// queries and attention rows [KV head][row][query head in group][dimension],
+// keys [KV head][row][dimension] (a group of one), values
+// [KV head][dimension][row]. Verify stages each lane's KV heads in lane
+// order, the lane's rows in kVerifyChunkStride rows of each.
+struct Staging final {
+  uint64_t heads;
+  uint32_t stride;
+  uint32_t rows;
+
+  [[nodiscard]] uint64_t rowBytes(uint32_t group, uint32_t headDimension) const noexcept {
+    const uint64_t row = uint64_t{group} * headDimension;
+    return ops::rowBytes(heads, stride * row, rows * row, 2);
+  }
+  [[nodiscard]] uint64_t valueBytes(uint32_t headDimension) const noexcept {
+    return ops::rowBytes(heads * headDimension, stride, rows, 2);
+  }
+};
+Staging verifyStaging(uint32_t lanes, kv::Layout layout) {
+  return {uint64_t{lanes} * layout.kvHeads, kv::kVerifyChunkStride, kv::kVerifyRows};
+}
+
+// A packed projection row: every query head's q and gate, then the K and V
+// heads. The gates read each row's query heads only.
+uint64_t packedWidth(uint32_t queryHeads, kv::Layout layout) {
+  return (uint64_t{queryHeads} * 2 + uint64_t{layout.kvHeads} * 2) * layout.headDimension;
+}
+uint64_t gateBytes(uint64_t rows, uint32_t queryHeads, kv::Layout layout) {
+  return rowBytes(rows, packedWidth(queryHeads, layout), uint64_t{queryHeads} * 2 * layout.headDimension, 2);
+}
+
+void requireRopeTables(const metal::MetalBuffer &cosine, const metal::MetalBuffer &sine, uint64_t rows) {
+  const uint64_t bytes = rows * SPLASH_TARGET_ROPE_PAIRS * sizeof(float);
+  requireBytes(cosine, bytes, "attention RoPE cosine");
+  requireBytes(sine, bytes, "attention RoPE sine");
+}
+
+// A chunk's page table holds the pages of its visible tokens.
+void requirePageTable(const metal::MetalBuffer &table, const kv::ChunkedPrefillParams &chunk) {
+  requireBytes(table, uint64_t{kv::chunkedPrefillRequiredPages(chunk)} * sizeof(SplashKvPage), "page table");
+}
+
 // Each query tile's history splits: the maximum shared out over the chunk's
 // tiles, at least one.
 uint32_t prefillSplits(uint32_t tiles) {
@@ -95,7 +140,7 @@ PrefillAttentionPlan PagedAttention::prefillPlan(
                          "prefill_attention_q8_split_kv2_g8"),
           pipeline(kernel, "prefill_attention_reduce",
                    "prefill_attention_reduce_kv2_g8"),
-          {layout.kvHeads, tiles, splits}, {layout.kvHeads, fusedRows, tiles}, layout.format};
+          {layout.kvHeads, tiles, splits}, {layout.kvHeads, fusedRows, tiles}, layout, queryHeads};
 }
 
 VerifyAttentionPlan PagedAttention::verifyPlan(
@@ -134,7 +179,7 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
               : pipeline(kernel, "verify_attention_q8_store",
                          "verify_attention_q8_store_kv2_g8"),
           {uint64_t{lanes} * 2 * kv::kVerifyRows * layout.kvHeads, 1, 1},
-          {layout.headDimension, 1, 1}, layout.format};
+          {layout.headDimension, 1, 1}, layout, queryHeads};
 }
 
 AttentionWorkspace PagedAttention::prefillWorkspace(
@@ -169,6 +214,12 @@ void PagedAttention::addPrefillProjection(
   const KernelLayout kernel = attentionKernelLayout(queryHeads, layout);
   if (!tokens || !stride)
     throw std::invalid_argument("invalid paged prefill projection geometry");
+  const Staging staging{layout.kvHeads, stride, tokens};
+  requireBytes(packed, uint64_t{tokens} * packedWidth(queryHeads, layout) * 2, "attention q/k/v");
+  requireRopeTables(ropeCos, ropeSin, tokens);
+  requireBytes(queries, staging.rowBytes(queryHeads / layout.kvHeads, layout.headDimension), "attention query");
+  requireBytes(chunkKeys, staging.rowBytes(1, layout.headDimension), "attention key");
+  requireBytes(chunkValues, staging.valueBytes(layout.headDimension), "attention value");
   const FullPrefillParams params{tokens, stride};
   graph.add(qkNormKernel(pipeline(kernel, "prefill_attention_qkv",
                                   "prefill_attention_qkv_kv2_g8"),
@@ -187,6 +238,11 @@ void PagedAttention::addPrefillGate(
   const KernelLayout kernel = attentionKernelLayout(queryHeads, layout);
   if (!tokens || !stride)
     throw std::invalid_argument("invalid paged prefill gate geometry");
+  requireBytes(packed, gateBytes(tokens, queryHeads, layout), "attention gate");
+  requireBytes(attention,
+               Staging{layout.kvHeads, stride, tokens}.rowBytes(queryHeads / layout.kvHeads, layout.headDimension),
+               "attention row");
+  requireBytes(hidden, uint64_t{tokens} * queryHeads * layout.headDimension * 2, "attention hidden");
   const FullPrefillParams params{tokens, stride};
   graph.add(std::string(pipeline(kernel, "prefill_attention_gate",
                                  "prefill_attention_gate_kv2_g8")),
@@ -204,6 +260,13 @@ void PagedAttention::addVerifyProjection(
   const KernelLayout kernel = attentionKernelLayout(queryHeads, layout);
   if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid paged verify projection geometry");
+  const uint64_t rows = uint64_t{lanes} * kv::kVerifyRows;
+  const Staging staging = verifyStaging(lanes, layout);
+  requireBytes(packed, rows * packedWidth(queryHeads, layout) * 2, "attention q/k/v");
+  requireRopeTables(ropeCos, ropeSin, rows);
+  requireBytes(queries, staging.rowBytes(queryHeads / layout.kvHeads, layout.headDimension), "attention query");
+  requireBytes(chunkKeys, staging.rowBytes(1, layout.headDimension), "attention key");
+  requireBytes(chunkValues, staging.valueBytes(layout.headDimension), "attention value");
   graph.add(qkNormKernel(pipeline(kernel, "verify_attention_qkv",
                                   "verify_attention_qkv_kv2_g8"),
                          queryNorm, keyNorm, layout.headDimension),
@@ -223,6 +286,10 @@ PreparedInput PagedAttention::addVerifyGate(
   if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid paged verify gate geometry");
   const uint32_t rows = lanes * SPLASH_TARGET_VERIFY_ROWS;
+  requireBytes(packed, gateBytes(rows, queryHeads, layout), "attention gate");
+  requireBytes(attention, verifyStaging(lanes, layout).rowBytes(queryHeads / layout.kvHeads, layout.headDimension),
+               "attention row");
+  requireBytes(hidden, uint64_t{rows} * queryHeads * layout.headDimension * 2, "attention hidden");
   if (input != LinearInput::Plain) {
     const uint32_t width = queryHeads * layout.headDimension;
     requireTableScratch(scratch, input, width, rows);
@@ -269,6 +336,10 @@ void PagedAttention::addPrefillStore(
   const auto store = layout.format == kv::Format::BFloat16
       ? pipeline(kernel, "prefill_attention_bf16_store", "prefill_attention_bf16_store_kv2_g8")
       : pipeline(kernel, "prefill_attention_q8_store", "prefill_attention_q8_store_kv2_g8");
+  const Staging staging{layout.kvHeads, params.chunk_stride, params.chunk_tokens};
+  requireBytes(chunkKeys, staging.rowBytes(1, layout.headDimension), "attention key");
+  requireBytes(chunkValues, staging.valueBytes(layout.headDimension), "attention value");
+  requirePageTable(pageTable, params);
   kv::ChunkedPrefillParams layerParams = params;
   layerParams.kv = layer;
   graph.add(std::string(store),
@@ -288,11 +359,15 @@ void PagedAttention::addPrefill(
   const std::string_view error = kv::chunkedPrefillValidationError(chunk);
   if (!error.empty())
     throw std::invalid_argument(std::string(error));
-  if (partials.sizeBytes() < plan.workspace.partialsBytes ||
-      statistics.sizeBytes() < plan.workspace.statisticsBytes) {
-    throw std::invalid_argument(
-        "prefill attention scratch is smaller than its bound");
-  }
+  // The tiles read the queries and write the output in whole tiles of rows.
+  const Staging staging{plan.layout.kvHeads, chunk.chunk_stride,
+                        kv::prefillAttentionTiles(plan.rows) * kv::kPrefillAttentionTileRows};
+  const uint64_t rows = staging.rowBytes(plan.queryHeads / plan.layout.kvHeads, plan.layout.headDimension);
+  requireBytes(queries, rows, "attention query");
+  requireBytes(output, rows, "attention output");
+  requireBytes(partials, plan.workspace.partialsBytes, "prefill attention partials");
+  requireBytes(statistics, plan.workspace.statisticsBytes, "prefill attention statistics");
+  requirePageTable(pageTable, chunk);
   const kv::PrefillAttentionParams params{
       chunk.committed_tokens, chunk.chunk_tokens, chunk.chunk_stride,
       chunk.page_table_entries, layer, plan.splits};
@@ -312,11 +387,17 @@ void PagedAttention::addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
   if (chunks.size() != plan.lanes || buffers.pageTables.size() != maximumLanes) {
     throw std::invalid_argument("invalid paged verify batch");
   }
-  if (buffers.partials.sizeBytes() < plan.workspace.partialsBytes ||
-      buffers.statistics.sizeBytes() < plan.workspace.statisticsBytes) {
-    throw std::invalid_argument(
-        "verify attention scratch is smaller than its bound");
-  }
+  const Staging staging = verifyStaging(plan.lanes, plan.layout);
+  const uint32_t headDimension = plan.layout.headDimension;
+  const uint64_t rows = staging.rowBytes(plan.queryHeads / plan.layout.kvHeads, headDimension);
+  requireBytes(buffers.chunkKeys, staging.rowBytes(1, headDimension), "attention key");
+  requireBytes(buffers.chunkValues, staging.valueBytes(headDimension), "attention value");
+  requireBytes(buffers.queries, rows, "attention query");
+  requireBytes(buffers.output, rows, "attention output");
+  requireBytes(buffers.partials, plan.workspace.partialsBytes, "verify attention partials");
+  requireBytes(buffers.statistics, plan.workspace.statisticsBytes, "verify attention statistics");
+  for (uint32_t lane = 0; lane < plan.lanes; ++lane)
+    requirePageTable(buffers.pageTables[lane], chunks[lane]);
   // verifyParams validated each chunk, and the plan scaled each lane's
   // split count from the same committed history; every lane's partials use
   // the plan-wide slot stride.

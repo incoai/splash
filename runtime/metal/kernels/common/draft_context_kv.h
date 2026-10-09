@@ -13,7 +13,8 @@ inline void draft_context_kv_phase(
     uint active_tokens, uint task,
     uint thread_index, uint lane, uint simd_group,
     threadgroup float *reductions, threadgroup bfloat *normalized) {
-  constexpr uint KVHeads = 8, HeadDim = 128, Window = SPLASH_DRAFT_SLIDING_WINDOW;
+  constexpr uint KVHeads = SPLASH_DRAFT_KV_HEADS, HeadDim = SPLASH_DRAFT_HEAD_DIMENSION,
+                 Window = SPLASH_DRAFT_SLIDING_WINDOW;
   constexpr uint KWidth = KVHeads * HeadDim, RowWidth = 2 * KWidth;
   uint row = task / KVHeads;
   if (row >= active_tokens)
@@ -39,8 +40,8 @@ inline void draft_context_kv_phase(
   if (thread_index < HeadDim / 2) {
     float first = float(normalized[thread_index]);
     float second = float(normalized[thread_index + HeadDim / 2]);
-    float cosine = rope_cos[ulong(row) * (HeadDim / 2) + thread_index];
-    float sine = rope_sin[ulong(row) * (HeadDim / 2) + thread_index];
+    float cosine = rope_cos[ulong(row) * SPLASH_DRAFT_ROPE_PAIRS + thread_index];
+    float sine = rope_sin[ulong(row) * SPLASH_DRAFT_ROPE_PAIRS + thread_index];
     key[thread_index] = bfloat(first * cosine - second * sine);
     key[thread_index + HeadDim / 2] = bfloat(second * cosine + first * sine);
   }

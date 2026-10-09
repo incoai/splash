@@ -1,4 +1,3 @@
-#include "ScopedTestConfig.hpp"
 #include "TestChecks.hpp"
 #include "engine/Status.hpp"
 
@@ -12,13 +11,13 @@ namespace {
 using namespace splash;
 using namespace splash::engine;
 
+using splash::test::rejects;
 using splash::test::require;
 
 bool close(double left, double right) { return std::abs(left - right) < 1e-9; }
 
 void testLatencyWindowAndThroughput() {
-  const test::ScopedTestConfig seam({.metricsLatencyWindow = 3});
-  RuntimeMetrics metrics;
+  RuntimeMetrics metrics(3);
   for (uint64_t id = 1; id <= 4; ++id) {
     double submitted = double(id) * 100.0;
     const double first = submitted + double(id) * 10.0;
@@ -66,15 +65,16 @@ void testLatencyWindowAndThroughput() {
           "current prefill/decode batch samples are incomplete");
 }
 
+// Percentiles over a window that holds no sample are refused at construction.
+void testEmptyLatencyWindowIsRefused() {
+  rejects([] { RuntimeMetrics metrics(0); }, "the latency window must hold a sample",
+          "metrics with an empty latency window were built");
+}
+
 void testValidation() {
   RuntimeMetrics metrics;
-  bool threw = false;
-  try {
-    metrics.tokens(10.0, 20.0, 1, 19.0);
-  } catch (const std::invalid_argument &) {
-    threw = true;
-  }
-  require(threw, "backwards token metrics were accepted");
+  rejects([&] { metrics.tokens(10.0, 20.0, 1, 19.0); }, "metrics token clock moved backwards",
+          "backwards token metrics were accepted");
 }
 
 } // namespace
@@ -82,6 +82,7 @@ void testValidation() {
 int main() {
   try {
     testLatencyWindowAndThroughput();
+    testEmptyLatencyWindowIsRefused();
     testValidation();
     std::cout << "runtime metrics tests passed\n";
     return EXIT_SUCCESS;

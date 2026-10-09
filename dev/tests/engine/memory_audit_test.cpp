@@ -15,7 +15,7 @@ namespace {
 using splash::test::require;
 
 EngineMemoryPlan plan(uint64_t visionBytes = kGiB,
-                      uint64_t stateStagingBytes = 0) {
+                      uint64_t stateStagingBytes = 0, uint64_t aneFfnBytes = 0) {
   DeviceCapabilities device;
   device.deviceName = "test";
   device.appleGpuFamily = 9;
@@ -30,6 +30,7 @@ EngineMemoryPlan plan(uint64_t visionBytes = kGiB,
   ModelMemoryProfile model =
       test::modelMemoryProfile(2 * kGiB, 1 * kGiB, visionBytes);
   model.footprint.stateStagingBytes = stateStagingBytes;
+  model.footprint.aneFfnBytes = aneFfnBytes;
   return test::requireMemoryPlan(device, model);
 }
 
@@ -109,7 +110,7 @@ void testUnreportedAllocationsCountAgainstReserves() {
 // audit bounds it by that plan: it is neither charged to the reserves nor
 // counted a second time beside the backend's peak that includes it.
 void testStateStagingHasItsOwnBound() {
-  // One Qwen3.8-27B state (DEVELOPMENT.md, Disk cache).
+  // One Qwen3.8-27B state (DEVELOPMENT.md, SSD cache).
   const uint64_t staging = 187 * kMiB;
   const auto memoryPlan = plan(kGiB, staging);
   const auto &budget = memoryPlan.breakdown();
@@ -132,6 +133,33 @@ void testStateStagingHasItsOwnBound() {
           "state staging beyond its plan was accepted");
   require(audit(0, 0).valid,
           "a plan with state staging failed without a started disk tier");
+}
+
+// The prefill FFN's Neural Engine split is planned as a category of its own:
+// the audit bounds it by that plan, apart from the reserves, and passes a
+// start that ran without it.
+void testNeuralEngineSplitHasItsOwnBound() {
+  // Qwen3.8-27B's split at the M6's share (DEVELOPMENT.md, Neural Engine prefill).
+  const uint64_t surfaces = 508 * kMiB;
+  const auto memoryPlan = plan(kGiB, 0, surfaces);
+  const auto &budget = memoryPlan.breakdown();
+  const uint64_t reserves =
+      budget.pipelineReserveBytes + budget.runtimeOverheadReserveBytes;
+  const auto audit = [&](uint64_t splitBytes, uint64_t unclassifiedBytes) {
+    ActualMemoryReport actual = report(memoryPlan, unclassifiedBytes);
+    actual.aneFfnBytes = splitBytes;
+    actual.backendAllocatedBytes += splitBytes;
+    actual.deviceCurrentAllocatedBytes += splitBytes;
+    actual.devicePeakAllocatedBytes += splitBytes;
+    actual.backendPeakAllocatedBytes += splitBytes;
+    return auditActualMemory(memoryPlan, actual);
+  };
+  const auto split = audit(surfaces, reserves);
+  require(split.valid && split.backendUnclassifiedBytes == reserves,
+          "the split was charged to the reserves or counted twice");
+  require(audit(surfaces + 1, 0).error == MemoryAuditError::CategoryExceedsPlan,
+          "a split beyond its plan was accepted");
+  require(audit(0, 0).valid, "a start without the split failed its audit");
 }
 
 void testFixedCategoryAndPeakFailures() {
@@ -214,6 +242,7 @@ int main() {
     testOptionalVisionAudit();
     testUnreportedAllocationsCountAgainstReserves();
     testStateStagingHasItsOwnBound();
+    testNeuralEngineSplitHasItsOwnBound();
     testFixedCategoryAndPeakFailures();
     testDevicePeakDeviationExcludesReserves();
     std::cout << "elastic memory audit tests passed\n";

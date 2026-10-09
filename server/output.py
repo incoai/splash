@@ -1,4 +1,4 @@
-"""Incremental model-output parsing, output blocks and final tool/answer
+"""Incremental model-output parsing, output blocks and final answer
 validation."""
 
 import re
@@ -11,70 +11,81 @@ from . import json_codec
 from .errors import APIError
 from .schema_validation import SchemaEvaluationError
 from .tool_schema import (
-    FUNCTION_CLOSE,
-    FUNCTION_OPEN,
+    CALL_OPEN,
+    FUNCTION_END,
+    JSON_TYPES,
+    MAX_NAME_LENGTH,
+    NAME_SPACE,
     PARAMETER_CLOSE,
     PARAMETER_OPEN,
     THINK_END,
-    TOOL_CALL_OPEN,
-    json_value,
-    raw_string_schema,
+    TOOL_CALL_CLOSE,
 )
 
 TOOL_ARGUMENT_DELTA_CHARS = 16 * 1024
+# The deepest a call's arguments nest as an object the server writes, so that
+# they read back within json_codec.MAX_DEPTH where a request carries them
+# deepest: as a tool_use block's input in a Messages history, inside the body,
+# its messages, a message, the message's content and the block. Chat and
+# Responses carry arguments as strings, read on their own.
+MAX_ARGUMENTS_DEPTH = json_codec.MAX_DEPTH - 5
 _SURROGATE = re.compile("[\ud800-\udfff]")
 
 
-def _validate_tool_unicode(value):
-    # Validate decoded values, so literal backslash-u text remains unchanged.
-    if isinstance(value, str):
-        if _SURROGATE.search(value):
-            raise APIError(
-                500,
-                "model returned invalid Unicode in tool arguments",
-                "invalid_model_output",
-            )
-    elif isinstance(value, dict):
-        for key, item in value.items():
-            _validate_tool_unicode(key)
-            _validate_tool_unicode(item)
-    elif isinstance(value, list):
-        for item in value:
-            _validate_tool_unicode(item)
-
-
-def _tool_json(value):
-    _validate_tool_unicode(value)
-    return json_codec.dumps(value)
-
-
-def hold_partial(text, marker):
-    for length in range(min(len(text), len(marker) - 1), 0, -1):
-        if text.endswith(marker[:length]):
+def hold_partial(text, *markers):
+    """`text` split before its longest end that begins one of `markers`, which
+    more text may complete."""
+    longest = max(len(marker) for marker in markers)
+    for length in range(min(len(text), longest - 1), 0, -1):
+        if any(
+            length < len(marker) and text.endswith(marker[:length])
+            for marker in markers
+        ):
             return text[:-length], text[-length:]
     return text, ""
 
 
 class ReasoningSplitter:
-    def __init__(self, thinking):
+    def __init__(self, thinking, tool_calls=False):
         self.reasoning = thinking
         self.pending = ""
+        # Whether the newlines after </think>, which set the answer apart in
+        # the chat template's layout of a turn, are still to be dropped.
+        self.separator = False
+        # Where a call may follow, a call's opening also ends the reasoning
+        # and begins the answer.
+        self.ends = (THINK_END, CALL_OPEN) if tool_calls else (THINK_END,)
 
     def put(self, text):
         if not self.reasoning:
-            return [("content", text)]
+            return self._content(text)
         self.pending += text
-        end = self.pending.find(THINK_END)
-        if end >= 0:
-            output = [("reasoning_content", self.pending[:end])]
-            content = self.pending[end + len(THINK_END) :]
-            if content:
-                output.append(("content", content))
+        ends = [
+            (index, marker)
+            for marker in self.ends
+            if (index := self.pending.find(marker)) >= 0
+        ]
+        if ends:
+            end, marker = min(ends)
+            reasoning = self.pending[:end]
+            content = self.pending[end:]
+            if marker == THINK_END:
+                content = content[len(THINK_END) :]
             self.pending = ""
             self.reasoning = False
-            return [(kind, value) for kind, value in output if value]
-        ready, self.pending = hold_partial(self.pending, THINK_END)
+            self.separator = marker == THINK_END
+            output = [("reasoning_content", reasoning)] if reasoning else []
+            return output + self._content(content)
+        ready, self.pending = hold_partial(self.pending, *self.ends)
         return [("reasoning_content", ready)] if ready else []
+
+    def _content(self, text):
+        if self.separator:
+            text = text.lstrip("\n")
+            if not text:
+                return []
+            self.separator = False
+        return [("content", text)]
 
     def finish(self):
         if not self.pending:
@@ -84,14 +95,87 @@ class ReasoningSplitter:
         return [(kind, text)]
 
 
-class StreamingToolCallProjector:
-    """Parse Qwen tool XML as it arrives into OpenAI JSON argument deltas,
-    for streamed and complete responses alike.
+# Where a value ends: the close the template writes after it, then the next
+# parameter, the function's close, or the call's close a model may write
+# without the function's. A value may hold the tags in any other order.
+_VALUE_ENDS = tuple(
+    PARAMETER_CLOSE + tag for tag in (PARAMETER_OPEN, FUNCTION_END, TOOL_CALL_CLOSE)
+)
+# Text outside calls: a call's opening opens one, and a </think>, which a
+# model that called a tool from its reasoning may still write, is dropped.
+_TEXT_TAGS = (CALL_OPEN, THINK_END)
+_NOT_JSON = object()
+# A template that writes a value through Jinja's string filter, as Nex's and
+# some of Qwen's do, spells a boolean or null as Python does.
+_PYTHON_LITERALS = {"True": True, "False": False, "None": None}
 
-    Emit function names before their arguments finish. Validate each closed
-    call before its closing JSON brace, then validate the complete response
-    at request completion. Text outside calls streams as it arrives, after a
-    call as before one.
+
+def _json_value(text):
+    """The JSON value `text` spells, if it can be written back as JSON in its
+    call's arguments: its numbers finite, its strings Unicode and its
+    containers, in the arguments object, nested at most MAX_ARGUMENTS_DEPTH
+    deep. Otherwise _NOT_JSON."""
+    try:
+        value = json_codec.loads(text)
+    except ValueError:
+        return _NOT_JSON
+    # The value's level in the arguments object.
+    pending = [(value, 2)]
+    while pending:
+        item, depth = pending.pop()
+        if isinstance(item, str):
+            if _SURROGATE.search(item):
+                return _NOT_JSON
+        elif isinstance(item, (dict, list)):
+            if depth > MAX_ARGUMENTS_DEPTH:
+                return _NOT_JSON
+            children = [*item, *item.values()] if isinstance(item, dict) else item
+            pending.extend((child, depth + 1) for child in children)
+    return value
+
+
+def convert_value(text, types):
+    """A parameter's text as the JSON types its schema declares read it, any
+    type where `types` is None: a string as the text, and another value as
+    the JSON the text spells when that is of a declared type or when no
+    declared type is a string. A boolean or null declared without a string
+    may also be spelled as Python spells it. Otherwise the text."""
+    value = _json_value(text)
+    if value is _NOT_JSON:
+        value = _PYTHON_LITERALS.get(text.strip(), _NOT_JSON)
+        declared = (
+            value is not _NOT_JSON
+            and types is not None
+            and "string" not in types
+            and JSON_TYPES[type(value)] in types
+        )
+        return value if declared else text
+    if types is None or "string" in types:
+        kind = JSON_TYPES[type(value)]
+        declared = (
+            types is None or kind in types or (kind == "integer" and "number" in types)
+        )
+        return value if declared and kind != "string" else text
+    return value
+
+
+class StreamingToolCallProjector:
+    """Parse Qwen's XML tool calls out of the output as it arrives into
+    OpenAI JSON argument deltas, for streamed and complete responses alike.
+
+    Calls read as the chat template lays them out. One opens at CALL_OPEN
+    and names its function up to ">". Each parameter is a <parameter=NAME>
+    tag and a value, without the newline the template sets after the tag,
+    that ends at PARAMETER_CLOSE where the next parameter, the function's
+    close or the call's close follows, so a value may hold the tags in any
+    other order. </function> closes the call, and the </tool_call> after it
+    may be left out. Names lose the space around them; a call that names no
+    function is dropped, other text inside a call is dropped, and a repeated
+    parameter keeps its first value, which may have streamed. A value
+    converts by the types its tool declares for it (convert_value), and one
+    that may only be a string streams as it is written. Text outside calls
+    streams as it arrives, after a call as before one, and a </think> there
+    is dropped.
     """
 
     def __init__(self, policy, request_id, structured=False):
@@ -100,14 +184,21 @@ class StreamingToolCallProjector:
         self.pending = ""
         self.state = "output" if structured else "content"
         self.call_index = 0
+        # The open call, None while the text names none or names no function.
         self.call_id = None
         self.function_name = None
-        self.parameter_name = None
-        self.string_schema = None
-        self.parameter_value_fragments = []
-        self.streaming_string = False
-        self.arguments = {}
+        # The types by which its declared parameters and any others convert.
+        self.parameter_types = {}
+        self.other_types = None
+        self.parameter_names = set()
         self.argument_fragments = []
+        self.parameter_count = 0
+        # The open parameter, None while its value is dropped.
+        self.parameter_name = None
+        self.value_types = None
+        self.value_streams = False
+        self.value_started = False
+        self.value_parts = []
         self.content_fragments = []
         # How many content fragments the stream has published (the rest are
         # whitespace it holds), and whether the text since the start of the
@@ -115,18 +206,6 @@ class StreamingToolCallProjector:
         self.streamed_count = 0
         self.text_visible = False
         self.closed_calls = []
-
-    @staticmethod
-    def _malformed():
-        raise APIError(500, "model returned malformed tool XML", "invalid_model_output")
-
-    def _literal(self, value):
-        if self.pending.startswith(value):
-            self.pending = self.pending[len(value) :]
-            return True
-        if value.startswith(self.pending):
-            return False
-        self._malformed()
 
     def _emit_content(self, value, events):
         if not value:
@@ -148,43 +227,9 @@ class StreamingToolCallProjector:
     def _streamed_content(self):
         return "".join(self.content_fragments[: self.streamed_count])
 
-    def _begin_call(self, events):
-        name_end = self.pending.find(">\n")
-        if name_end < 0:
-            return False
-        name = self.pending[:name_end]
-        if not name or self.policy.validators.get(name) is None:
-            raise APIError(
-                500,
-                f"model called unknown tool {name}",
-                "invalid_model_output",
-            )
-        self.pending = self.pending[name_end + 2 :]
-        if not self.streamed_count:
-            # Whitespace before the first text only framed the calls.
-            self.content_fragments.clear()
-        self.function_name = name
-        self.call_id = f"call_{self.request_id}_{self.call_index}"
-        self.arguments = {}
-        self.argument_fragments = ["{"]
-        events.append(
-            (
-                "tool",
-                {
-                    "index": self.call_index,
-                    "id": self.call_id,
-                    "type": "function",
-                    "function": {"name": name},
-                },
-            )
-        )
-        events.append(
-            ("tool", {"index": self.call_index, "function": {"arguments": "{"}})
-        )
-        self.state = "body"
-        return True
-
     def _emit_argument(self, fragment, events):
+        if self.call_id is None:
+            return
         self.argument_fragments.append(fragment)
         for chunk in argument_deltas(fragment):
             events.append(
@@ -197,73 +242,121 @@ class StreamingToolCallProjector:
                 )
             )
 
-    def _emit_string_value(self, value, events):
-        if not value:
+    def _begin_call(self, name, events):
+        self.state = "arguments"
+        self.argument_fragments = []
+        self.parameter_count = 0
+        self.parameter_names = set()
+        name = name.strip(NAME_SPACE)
+        if not name:
             return
-        self.parameter_value_fragments.append(value)
-        self._emit_argument(_tool_json(value)[1:-1], events)
+        if not self.streamed_count:
+            # Whitespace before the first text only framed the calls.
+            self.content_fragments.clear()
+        self.function_name = name
+        self.call_id = f"call_{self.request_id}_{self.call_index}"
+        self.parameter_types, self.other_types = self.policy.parameter_types(name)
+        events.append(
+            (
+                "tool",
+                {
+                    "index": self.call_index,
+                    "id": self.call_id,
+                    "type": "function",
+                    "function": {"name": name},
+                },
+            )
+        )
+        self._emit_argument("{", events)
 
-    def _finish_parameter(self, events):
-        # Only text that may begin the closing marker stays pending, so each
-        # character of a value is scanned and copied a bounded number of times.
-        value_end = self.pending.find(PARAMETER_CLOSE)
-        if value_end < 0:
-            ready, self.pending = hold_partial(self.pending, PARAMETER_CLOSE)
-            if self.streaming_string:
-                self._emit_string_value(ready, events)
-            elif ready:
-                self.parameter_value_fragments.append(ready)
-            return False
-        tail = self.pending[:value_end]
-        self.pending = self.pending[value_end + len(PARAMETER_CLOSE) :]
-        if self.streaming_string:
-            self._emit_string_value(tail, events)
-            value = "".join(self.parameter_value_fragments)
-            self._emit_argument('"', events)
+    def _key(self, name):
+        separator = "," if self.parameter_count else ""
+        self.parameter_count += 1
+        return f"{separator}{json_codec.dumps(name)}:"
+
+    def _begin_parameter(self, name, events):
+        name = name.strip(NAME_SPACE)
+        # A repeated parameter keeps its first value, which may have streamed;
+        # a parameter without a name, or of a call that names no function,
+        # keeps none.
+        kept = name and name not in self.parameter_names and self.call_id is not None
+        self.parameter_names.add(name)
+        self.parameter_name = name if kept else None
+        self.value_types = self.parameter_types.get(name, self.other_types)
+        # A value that may only be a string streams as it is written; any
+        # other waits for its end to convert.
+        self.value_streams = self.value_types == {"string"}
+        self.value_started = False
+        self.value_parts = []
+        if self.value_streams and self.parameter_name is not None:
+            self._emit_argument(self._key(name) + '"', events)
+        self.state = "value"
+
+    def _put_value(self, text, events):
+        if self.parameter_name is None:
+            return
+        if not self.value_started:
+            if not text:
+                return
+            self.value_started = True
+            text = text.removeprefix("\n")
+        if not text:
+            return
+        if self.value_streams:
+            self._emit_argument(json_codec.dumps(text)[1:-1], events)
         else:
-            self.parameter_value_fragments.append(tail)
-            value = _typed_tool_value(
-                "".join(self.parameter_value_fragments), self.string_schema
-            )
-            prefix = "" if len(self.arguments) == 0 else ","
-            fragment = (
-                prefix + _tool_json(self.parameter_name) + ":" + _tool_json(value)
-            )
-            self._emit_argument(fragment, events)
-        self.arguments[self.parameter_name] = value
+            self.value_parts.append(text)
+
+    def _end_parameter(self, text, events):
+        if self.parameter_name is not None:
+            if not self.value_started:
+                self.value_started = True
+                text = text.removeprefix("\n")
+            self._put_value(text, events)
+            if self.value_streams:
+                self._emit_argument('"', events)
+            else:
+                value = convert_value("".join(self.value_parts), self.value_types)
+                self._emit_argument(
+                    self._key(self.parameter_name) + json_codec.dumps(value), events
+                )
         self.parameter_name = None
-        self.string_schema = None
-        self.parameter_value_fragments = []
-        self.streaming_string = False
-        self.state = "body"
-        return True
+        self.value_parts = []
+        self.state = "arguments"
 
     def _finish_call(self, events):
-        arguments = _tool_json(self.arguments)
-        call = {
-            "id": self.call_id,
-            "type": "function",
-            "function": {"name": self.function_name, "arguments": arguments},
-        }
-        validate_tool_calls([call], self.policy)
-        self.argument_fragments.append("}")
-        if "".join(self.argument_fragments) != arguments:
-            raise APIError(
-                500,
-                "streamed tool arguments do not match canonical arguments",
-                "internal_server_error",
+        self._emit_argument("}", events)
+        if self.call_id is not None:
+            self.closed_calls.append(
+                {
+                    "id": self.call_id,
+                    "type": "function",
+                    "function": {
+                        "name": self.function_name,
+                        "arguments": "".join(self.argument_fragments),
+                    },
+                }
             )
-        events.append(
-            ("tool", {"index": self.call_index, "function": {"arguments": "}"}})
-        )
-        self.closed_calls.append(call)
-        self.call_index += 1
+            self.call_index += 1
         self.call_id = None
         self.function_name = None
-        self.arguments = {}
         self.argument_fragments = []
         self.text_visible = False
-        self.state = "content"
+        self.state = "closing"
+
+    def _next_tag(self, *tags):
+        """The tag of `tags` that the pending text spells first, and where."""
+        found = [(index, tag) for tag in tags if (index := self.pending.find(tag)) >= 0]
+        return min(found) if found else (-1, None)
+
+    def _name(self):
+        """The name the pending text spells up to ">", taken off the text; ""
+        for a longer one, and None while it may yet end."""
+        end = self.pending.find(">", 0, MAX_NAME_LENGTH + 1)
+        if end < 0:
+            return None if len(self.pending) <= MAX_NAME_LENGTH else ""
+        name, self.pending = self.pending[:end], self.pending[end + 1 :]
+        return name
 
     def put(self, text):
         self.pending += text
@@ -281,95 +374,104 @@ class StreamingToolCallProjector:
                 self.pending = ""
                 break
             if self.state == "content":
-                start = self.pending.find(TOOL_CALL_OPEN)
-                if start >= 0:
-                    self._emit_content(self.pending[:start], events)
-                    self.pending = self.pending[start + len(TOOL_CALL_OPEN) :]
-                    self.state = "function_prefix"
-                    continue
-                ready, self.pending = hold_partial(self.pending, TOOL_CALL_OPEN)
-                self._emit_content(ready, events)
-                break
-            if self.state == "function_prefix":
-                if not self._literal(FUNCTION_OPEN):
+                start, tag = self._next_tag(*_TEXT_TAGS)
+                if tag is None:
+                    ready, self.pending = hold_partial(self.pending, *_TEXT_TAGS)
+                    self._emit_content(ready, events)
                     break
-                self.state = "function_name"
+                self._emit_content(self.pending[:start], events)
+                self.pending = self.pending[start + len(tag) :]
+                if tag == CALL_OPEN:
+                    self.state = "name"
                 continue
-            if self.state == "function_name":
-                if not self._begin_call(events):
+            if self.state == "name":
+                if (name := self._name()) is None:
                     break
+                self._begin_call(name, events)
                 continue
-            if self.state == "body":
-                if self.pending.startswith(PARAMETER_OPEN):
-                    self.pending = self.pending[len(PARAMETER_OPEN) :]
-                    self.state = "parameter_name"
-                    continue
-                if self.pending.startswith(FUNCTION_CLOSE):
-                    self.pending = self.pending[len(FUNCTION_CLOSE) :]
+            if self.state == "arguments":
+                # Text between parameters is dropped, but for a tag it may
+                # begin.
+                tags = (PARAMETER_OPEN, FUNCTION_END, TOOL_CALL_CLOSE)
+                start, tag = self._next_tag(*tags)
+                if tag is None:
+                    self.pending = hold_partial(self.pending, *tags)[1]
+                    break
+                self.pending = self.pending[start + len(tag) :]
+                if tag == PARAMETER_OPEN:
+                    self.state = "parameter"
+                else:
                     self._finish_call(events)
-                    continue
-                if any(
-                    marker.startswith(self.pending)
-                    for marker in (PARAMETER_OPEN, FUNCTION_CLOSE)
-                ):
-                    break
-                self._malformed()
-            if self.state == "parameter_name":
-                name_end = self.pending.find(">\n")
-                if name_end < 0:
-                    break
-                name = self.pending[:name_end]
-                if not name or name in self.arguments:
-                    raise APIError(
-                        500,
-                        "model repeated a tool parameter",
-                        "invalid_model_output",
-                    )
-                self.pending = self.pending[name_end + 2 :]
-                self.parameter_name = name
-                self.string_schema = raw_string_schema(
-                    _tool_property_schema(self.policy, self.function_name, name)
-                )
-                self.streaming_string = (
-                    self.string_schema is not None and self.string_schema[0] == "raw"
-                )
-                self.parameter_value_fragments = []
-                if self.streaming_string:
-                    prefix = "" if len(self.arguments) == 0 else ","
-                    self._emit_argument(
-                        prefix + _tool_json(name) + ':"',
-                        events,
-                    )
-                self.state = "parameter_value"
+                    if tag == TOOL_CALL_CLOSE:
+                        self.state = "content"
                 continue
-            if self.state == "parameter_value":
-                if not self._finish_parameter(events):
+            if self.state == "parameter":
+                if (name := self._name()) is None:
                     break
+                self._begin_parameter(name, events)
                 continue
+            if self.state == "value":
+                start, tag = self._next_tag(*_VALUE_ENDS)
+                if tag is None:
+                    held = hold_partial(self.pending, *_VALUE_ENDS)[1]
+                    self._put_value(
+                        self.pending[: len(self.pending) - len(held)], events
+                    )
+                    self.pending = held
+                    break
+                self._end_parameter(self.pending[:start], events)
+                # The tag after the close stays for the arguments to read.
+                self.pending = self.pending[start + len(PARAMETER_CLOSE) :]
+                continue
+            if self.state == "closing":
+                # After </function>, the template closes the call's block.
+                rest = self.pending.lstrip(NAME_SPACE)
+                if rest.startswith(TOOL_CALL_CLOSE):
+                    self.pending = rest[len(TOOL_CALL_CLOSE) :]
+                elif TOOL_CALL_CLOSE.startswith(rest):
+                    break
+                self.state = "content"
         return events
 
     def finish(self, incomplete):
-        """The content and calls of the output, and the content the stream
-        still owes, which put() held back to see what followed.
+        """The content and calls of the output, and the events the stream
+        still owes for what put() held back.
 
-        Closed calls are complete, and output cut at the token limit keeps
-        an open call with the arguments it has. Cut output with a call has
-        the content the stream published, which leaves out whitespace that
-        no visible text has followed since the start or the last call.
-        Otherwise the content is the text outside calls without whitespace
-        that only frames them and, when cut, a trailing partial call marker
-        or unfinished call header."""
-        if self.state in ("content", "output", "json"):
-            if self.pending and not (
-                incomplete and TOOL_CALL_OPEN.startswith(self.pending)
-            ):
-                self.content_fragments.append(self.pending)
-            elif self.closed_calls:
-                # Whitespace held after the last text only framed the calls.
-                del self.content_fragments[self.streamed_count :]
+        Output cut at the token limit keeps an open call with the arguments
+        it has, and no call whose name it cut; other output that ends inside
+        a call closes the call, and what it held back after a value could
+        only begin the value's close. Cut output with a call has the content
+        the stream published, which leaves out whitespace that no visible
+        text has followed since the start or the last call. Otherwise the
+        content is the text outside calls without whitespace that only frames
+        them and, when cut, a trailing partial tag."""
+        events = []
+        if not incomplete:
+            if self.state == "name":
+                name = self.pending if len(self.pending) <= MAX_NAME_LENGTH else ""
+                self.pending = ""
+                self._begin_call(name, events)
+            if self.state == "value":
+                self.pending = ""
+                self._end_parameter("", events)
+            if self.state in ("arguments", "parameter"):
+                self.pending = ""
+                self._finish_call(events)
+        if self.state == "closing":
             self.pending = ""
-        elif not incomplete:
-            self._malformed()
+            self.state = "content"
+        if (
+            self.state in ("content", "output", "json")
+            and self.pending
+            and not (
+                incomplete and any(tag.startswith(self.pending) for tag in _TEXT_TAGS)
+            )
+        ):
+            self.content_fragments.append(self.pending)
+        elif self.closed_calls:
+            # Whitespace held after the last text only framed the calls.
+            del self.content_fragments[self.streamed_count :]
+        self.pending = ""
         calls = list(self.closed_calls)
         if self.call_id is not None:
             calls.append(
@@ -384,32 +486,16 @@ class StreamingToolCallProjector:
             )
         streamed = self._streamed_content()
         content = streamed if calls and incomplete else "".join(self.content_fragments)
-        return content, calls, content[len(streamed) :]
+        if unsent := content[len(streamed) :]:
+            events.append(("content", unsent))
+        return content, calls, events
 
 
 def argument_deltas(arguments):
     # Keep individual SSE frames bounded even when a tool has a large string
-    # argument. Callers preserve fragment order and validate the canonical JSON.
+    # argument. Callers preserve fragment order.
     for offset in range(0, len(arguments), TOOL_ARGUMENT_DELTA_CHARS):
         yield arguments[offset : offset + TOOL_ARGUMENT_DELTA_CHARS]
-
-
-def _tool_property_schema(policy, tool_name, parameter_name):
-    if policy is None:
-        return None
-    root = policy.argument_schemas.get(tool_name)
-    if not isinstance(root, dict):
-        return None
-    return root.get("properties", {}).get(
-        parameter_name, root.get("additionalProperties", {})
-    )
-
-
-def _typed_tool_value(value, string_schema):
-    parsed = json_value(value)
-    if string_schema is None:
-        return parsed
-    return value if string_schema[0] == "raw" or value in string_schema[1] else parsed
 
 
 @dataclass(slots=True)
@@ -498,41 +584,6 @@ def _validate(validator, value):
         raise SchemaEvaluationError(
             "schema reference could not be evaluated"
         ) from error
-
-
-def validate_tool_calls(calls, policy):
-    if policy.required and not calls:
-        raise APIError(
-            500, "model did not call a required tool", "invalid_model_output"
-        )
-    if not policy.parallel and len(calls) > 1:
-        raise APIError(
-            500, "model returned parallel tool calls", "invalid_model_output"
-        )
-    for call in calls:
-        function = call["function"]
-        name = function["name"]
-        validator = policy.validators.get(name)
-        if validator is None:
-            raise APIError(
-                500, f"model called unknown tool {name}", "invalid_model_output"
-            )
-        try:
-            arguments = json_codec.loads(function["arguments"])
-            _validate_tool_unicode(arguments)
-            _validate(validator, arguments)
-        except SchemaEvaluationError as error:
-            raise APIError(500, str(error), "output_validation_failed") from error
-        except ValidationError as error:
-            raise APIError(
-                500,
-                f"invalid arguments for {name} at {error.json_path}: {error.message}",
-                "invalid_model_output",
-            ) from error
-        except (Unresolvable, RecursionError) as error:
-            raise APIError(
-                500, f"could not validate tool {name}", "invalid_model_output"
-            ) from error
 
 
 def validate_response_content(content, validator):

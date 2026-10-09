@@ -6,11 +6,12 @@
 // 16-byte vectors and leaves shards with only a few tokens, and one wider
 // than a single register chunk per thread. The logits are fp32, and their
 // order is decided below the bf16 spacing.
+#include "LinearNumerics.hpp"
+#include "TestBuffers.hpp"
 #include "TestChecks.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/Sampling.h"
 #include "ops/DraftSelector.hpp"
-#include "tuning/LinearNumerics.hpp"
 
 #import <Foundation/Foundation.h>
 
@@ -22,6 +23,8 @@
 #include <iostream>
 #include <numeric>
 #include <stdexcept>
+#include <tuple>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -31,6 +34,8 @@ using splash::metal::CommandGraph;
 using splash::metal::MetalBackend;
 using splash::metal::MetalBuffer;
 using namespace splash::ops;
+using splash::test::bf16ToFloat;
+using splash::test::floatToBf16;
 
 constexpr uint32_t kRows = SPLASH_DRAFT_QUERY_ROWS;
 constexpr uint32_t kPositions = SPLASH_DRAFT_PROPOSAL_TOKENS;
@@ -38,16 +43,9 @@ constexpr uint32_t kCandidates = SPLASH_DRAFT_CANDIDATES;
 constexpr uint32_t kRank = SPLASH_DRAFT_SELECTOR_RANK;
 constexpr uint32_t kLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
 
+using splash::test::rejects;
 using splash::test::require;
-
-template <class Function> void rejects(Function function) {
-  try {
-    function();
-  } catch (const std::invalid_argument &) {
-    return;
-  }
-  throw std::runtime_error("invalid draft selector request was accepted");
-}
+using splash::test::requireExtent;
 
 class Random final {
 public:
@@ -76,7 +74,7 @@ MetalBuffer randomBfloat(MetalBackend &backend, uint64_t count, Random &random,
   MetalBuffer buffer = allocate(backend, count * sizeof(uint16_t));
   auto *values = static_cast<uint16_t *>(buffer.contents());
   for (uint64_t index = 0; index < count; ++index)
-    values[index] = tuning::floatToBf16(random.unit() * scale);
+    values[index] = floatToBf16(random.unit() * scale);
   return buffer;
 }
 
@@ -180,7 +178,7 @@ void runCase(MetalBackend &backend, const Case &c) {
   selector.add(graph, buffers, codebooks, anchors, policies);
   require(graph.dispatches().size() == 3,
           "draft selector dispatch count changed");
-  static_cast<void>(backend.submitCommand(graph.dispatches()));
+  static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
 
   const auto *candidates =
       static_cast<const uint32_t *>(buffers.candidates.contents());
@@ -222,9 +220,9 @@ void runCase(MetalBackend &backend, const Case &c) {
             std::min(candidates[global * kCandidates + rank], c.vocabulary - 1);
         double edge = 0.0;
         for (uint32_t dim = 0; dim < kRank; ++dim) {
-          edge += double(tuning::bf16ToFloat(predecessors[uint64_t{predecessor} * kRank + dim])) *
-                  tuning::bf16ToFloat(hidden[(uint64_t{lane} * kRows + position + 1) * kRank + dim]) *
-                  tuning::bf16ToFloat(successors[uint64_t{candidate} * kRank + dim]);
+          edge += double(bf16ToFloat(predecessors[uint64_t{predecessor} * kRank + dim])) *
+                  bf16ToFloat(hidden[(uint64_t{lane} * kRows + position + 1) * kRank + dim]) *
+                  bf16ToFloat(successors[uint64_t{candidate} * kRank + dim]);
         }
         scores[rank] = double(unary[global * kCandidates + rank]) + edge;
       }
@@ -276,8 +274,65 @@ void runCase(MetalBackend &backend, const Case &c) {
   }
 }
 
+// Each buffer the selector reaches, at its extent and one element short, for
+// three lanes of which the second samples: every lane's eight query rows of
+// logits and selector hidden rows, the workspaces of its seven positions,
+// each codebook's row of every token, and the sampled lanes' proposal
+// uniforms and probabilities up to the second lane's.
+void bufferExtents(MetalBackend &backend) {
+  constexpr uint32_t vocabulary = 1003, lanes = 3, sampledLanes = 2;
+  const DraftSelector selector(vocabulary);
+  const auto workspace = DraftSelector::workspace(lanes * kPositions);
+  const DraftSelectorBuffers buffers{
+      allocate(backend, uint64_t{lanes} * kRows * vocabulary * sizeof(float)),
+      allocate(backend, workspace.partialIdsBytes),
+      allocate(backend, workspace.partialValuesBytes),
+      allocate(backend, workspace.candidatesBytes),
+      allocate(backend, workspace.unaryBytes),
+      allocate(backend, uint64_t{lanes} * kRows * kRank * 2),
+      allocate(backend, uint64_t{lanes} * SPLASH_SAMPLING_UNIFORMS * sizeof(float)),
+      allocate(backend, uint64_t{lanes} * kPositions * sizeof(uint32_t)),
+      allocate(backend, workspace.proposalProbabilitiesBytes)};
+  const DraftCodebooks codebooks{allocate(backend, uint64_t{vocabulary} * kRank * 2),
+                                 allocate(backend, uint64_t{vocabulary} * kRank * 2)};
+  const std::array<uint32_t, lanes> anchors{1, 2, 3};
+  const std::array policies{SamplingPolicy{}, SamplingPolicy{16, 0.8F, 1.0F}, SamplingPolicy{}};
+  const uint64_t candidates = uint64_t{lanes} * kPositions * kCandidates;
+  for (const auto &[member, bytes, element, what] :
+       std::initializer_list<std::tuple<MetalBuffer DraftSelectorBuffers::*, uint64_t, uint64_t, const char *>>{
+           {&DraftSelectorBuffers::logits, uint64_t{lanes} * kRows * vocabulary * 4, 4, "draft logits"},
+           {&DraftSelectorBuffers::partialIds, candidates * SPLASH_DRAFT_SAMPLING_SHARDS * 4, 4,
+            "draft selector partial id"},
+           {&DraftSelectorBuffers::partialValues, candidates * (SPLASH_DRAFT_SAMPLING_SHARDS + kCandidates) * 4, 4,
+            "draft selector partial value"},
+           {&DraftSelectorBuffers::candidates, candidates * 4, 4, "draft candidate"},
+           {&DraftSelectorBuffers::unary, candidates * 4, 4, "draft candidate score"},
+           {&DraftSelectorBuffers::selectorHidden, uint64_t{lanes} * kRows * kRank * 2, 2, "draft selector hidden"},
+           {&DraftSelectorBuffers::proposedTokens, uint64_t{lanes} * kPositions * 4, 4, "proposed token"},
+           {&DraftSelectorBuffers::uniforms,
+            ((sampledLanes - 1) * SPLASH_SAMPLING_UNIFORMS + SPLASH_UNIFORM_PROPOSALS + kPositions) * 4, 4,
+            "proposal uniform"},
+           {&DraftSelectorBuffers::proposalProbabilities, uint64_t{sampledLanes} * kPositions * kCandidates * 4, 4,
+            "proposal probability"}})
+    requireExtent(backend, buffers.*member, bytes, element, what, [&](CommandGraph &graph, const MetalBuffer &buffer) {
+      DraftSelectorBuffers changed = buffers;
+      changed.*member = buffer;
+      selector.add(graph, changed, codebooks, anchors, policies);
+    });
+  for (const auto &[member, what] :
+       {std::pair{&DraftCodebooks::predecessor, "draft predecessor codebook"},
+        std::pair{&DraftCodebooks::successor, "draft successor codebook"}})
+    requireExtent(backend, codebooks.*member, uint64_t{vocabulary} * kRank * 2, 2, what,
+                  [&](CommandGraph &graph, const MetalBuffer &buffer) {
+                    DraftCodebooks changed = codebooks;
+                    changed.*member = buffer;
+                    selector.add(graph, buffers, changed, anchors, policies);
+                  });
+}
+
 void invalidRequests(MetalBackend &backend) {
-  rejects([] { DraftSelector(0); });
+  rejects([] { DraftSelector(0); }, "invalid draft selector vocabulary",
+          "a selector over no vocabulary was accepted");
   const DraftSelector selector(1024);
   const auto workspace = DraftSelector::workspace(kPositions);
   const DraftSelectorBuffers buffers{
@@ -295,7 +350,8 @@ void invalidRequests(MetalBackend &backend) {
   const std::array<uint32_t, 2> anchors{1, 2};
   const std::array<SamplingPolicy, 1> policies{SamplingPolicy{}};
   CommandGraph graph;
-  rejects([&] { selector.add(graph, buffers, codebooks, anchors, policies); });
+  rejects([&] { selector.add(graph, buffers, codebooks, anchors, policies); },
+          "invalid draft selector batch", "anchors without a policy each were accepted");
   require(graph.empty(), "invalid draft selector request encoded a graph");
 }
 
@@ -307,6 +363,7 @@ int main(int argc, char **argv) {
       throw std::invalid_argument("usage: draft-selector METALLIB");
     MetalBackend backend(argv[1]);
     invalidRequests(backend);
+    bufferExtents(backend);
     for (const uint32_t vocabulary : {248320U, 1003U, 270005U}) {
       for (uint32_t lanes = 1; lanes <= kLanes; ++lanes) {
         runCase(backend, {vocabulary, lanes, false});

@@ -1,15 +1,17 @@
 #pragma once
 
 #include "Checked.hpp"
+#include "metal/abi/DraftAttention.h"
 #include "metal/abi/ExecutionGeometry.h"
+#include "metal/abi/GDN.h"
 
 #include <cstdint>
 
 namespace splash::model {
 
-// The GDN short convolution has four taps; the recurrent state keeps the
-// three previous inputs.
-inline constexpr uint32_t kGdnConvolutionTaps = 4;
+// The taps of the GDN short convolution the kernels compute; a state cell
+// keeps the inputs of all taps but the current token's.
+inline constexpr uint32_t kGdnConvolutionTaps = SPLASH_GDN_CONVOLUTION_TAPS;
 
 // Physical state geometry is supplied by the paired target and draft models.
 // The engine sees only opaque CompositeState handles and byte accounting.
@@ -49,16 +51,20 @@ struct GdnStateLayout final {
 };
 
 // One ring of SPLASH_DRAFT_SLIDING_WINDOW slots per KV head for the keys and
-// one for the values of every draft layer.
+// one for the values of every draft layer, and the context window the rings
+// are computed from: the draft's context row (contextWidth values) of each
+// slot, in 4-bit codes (metal/abi/DraftAttention.h).
 struct DraftStateLayout final {
   static constexpr uint32_t bfloat16Bytes = 2;
 
   uint32_t layers = 0;
   uint32_t kvHeads = 0;
   uint32_t headDimension = 0;
+  uint32_t contextWidth = 0;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
-    return layers && kvHeads && headDimension;
+    return layers && kvHeads && headDimension && contextWidth &&
+           contextWidth % SPLASH_DRAFT_CONTEXT_GROUP == 0;
   }
   [[nodiscard]] constexpr uint64_t tensorBytes() const noexcept {
     return uint64_t{kvHeads} * SPLASH_DRAFT_SLIDING_WINDOW * headDimension *
@@ -67,12 +73,17 @@ struct DraftStateLayout final {
   [[nodiscard]] constexpr uint64_t ringBytes() const noexcept {
     return uint64_t{layers} * 2 * tensorBytes();
   }
+  [[nodiscard]] constexpr uint64_t windowBytes() const noexcept {
+    return draft_context_window_bytes(contextWidth);
+  }
 
   bool operator==(const DraftStateLayout &) const = default;
 };
 
+// A lane holds two GDN cells, its draft rings and their context window; a
+// cached state one GDN cell and the window, from which a restore that needs
+// the rings computes them again.
 struct CompositeStateLayout final {
-  // The GDN cells a lane holds, with one draft ring.
   static constexpr uint32_t kLaneGdnCells = 2;
 
   GdnStateLayout target;
@@ -82,10 +93,11 @@ struct CompositeStateLayout final {
     return target.valid() && draft.valid();
   }
   [[nodiscard]] constexpr uint64_t laneBytes() const noexcept {
-    return kLaneGdnCells * target.cellBytes() + draft.ringBytes();
+    return kLaneGdnCells * target.cellBytes() + draft.ringBytes() +
+           draft.windowBytes();
   }
   [[nodiscard]] constexpr uint64_t cachedBytes() const noexcept {
-    return target.cellBytes() + draft.ringBytes();
+    return target.cellBytes() + draft.windowBytes();
   }
 
   bool operator==(const CompositeStateLayout &) const = default;

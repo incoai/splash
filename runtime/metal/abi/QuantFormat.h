@@ -9,13 +9,11 @@
 //   meta   [N / T][G / meta_groups][T][meta_bytes]
 // A meta unit is one native block and holds its scale fields.
 //
-// Its contents are hashed into SPLASH_GGUF_PREPARATION_ID
-// (dev/tools/weight_preparation_identity.py): it holds what defines prepared
-// bytes, plus each format's kernel name token, which the host reads.
-// Editing this file re-prepares every GGUF model.
-// dev/tests/test_gguf_metadata.py reads the GGUF type of each kQuantFormats
-// row with a regex on the row's leading number. The decode-only value tables
-// are in metal/abi/QuantTables.h.
+// It holds what defines the image's bytes, plus each format's kernel name
+// token, which the host reads.
+// dev/tests/install/test_gguf_metadata.py reads the GGUF type of each
+// kQuantFormats row with a regex on the row's leading number. The decode-only
+// value tables are in metal/abi/QuantTables.h.
 //
 // Inside a group of 32 the elements are in lane-owned chunk order: chunk c
 // (0..3) holds elements 4c..4c+3 and 16+4c..16+4c+3 as pairs p = 0..3, pair p
@@ -36,6 +34,16 @@
 //     span four or eight elements and so several chunks: its block_*'s fields
 //     for the group's 32 elements, split between the planes as its row below
 //     states. kernels/common/quant_formats.h decodes a chunk from them.
+//
+// The MLX affine formats (mlx.core.quantize, mode "affine") hold b-bit codes
+// q, b of 2, 3, 4, 5, 6 or 8, in groups of 32, 64 or 128 elements with a
+// bf16 scale s and bias z each: value = s * q + z. Their planes hold the codes
+// as the GGUF formats of that width do (2 bits as Q2_K, 3 as Q3_K's low and
+// high bits, 4 as Q4_K, 5 as Q5_K, 6 as Q6_K, 8 as Q8_0's bytes), and their
+// meta unit is the group's s, z. MLX keeps codes, scales and biases in tensors
+// of their own; the loader writes each group as the native block the repack
+// reads: s, z, then the group's codes as MLX packs a row's, a little-endian
+// bit string of b bits per code.
 #ifdef __METAL_VERSION__
 #include <metal_stdlib>
 #define QUANT_CONSTANT constant constexpr
@@ -65,10 +73,33 @@
 #define GGUF_FMT_Q41 16u
 #define GGUF_FMT_MXFP4 17u
 #define GGUF_FMT_PQ20 18u
-#define GGUF_FMT_COUNT 19u
+// MLX affine, b bits in groups of g (GGUF_FMT_AF<b>G<g>).
+#define GGUF_FMT_AF2G32 19u
+#define GGUF_FMT_AF2G64 20u
+#define GGUF_FMT_AF2G128 21u
+#define GGUF_FMT_AF3G32 22u
+#define GGUF_FMT_AF3G64 23u
+#define GGUF_FMT_AF3G128 24u
+#define GGUF_FMT_AF4G32 25u
+#define GGUF_FMT_AF4G64 26u
+#define GGUF_FMT_AF4G128 27u
+#define GGUF_FMT_AF5G32 28u
+#define GGUF_FMT_AF5G64 29u
+#define GGUF_FMT_AF5G128 30u
+#define GGUF_FMT_AF6G32 31u
+#define GGUF_FMT_AF6G64 32u
+#define GGUF_FMT_AF6G128 33u
+#define GGUF_FMT_AF8G32 34u
+#define GGUF_FMT_AF8G64 35u
+#define GGUF_FMT_AF8G128 36u
+#define GGUF_FMT_COUNT 37u
+
+// The tensor type an image descriptor names for an MLX affine format: no GGUF
+// type is of this form.
+#define QUANT_AFFINE_TYPE(bits, group) (0x4D4C0000u | ((bits) << 8) | (group))
 
 struct QuantFormat {
-  uint32_t ggml_type;      // GGUF tensor type
+  uint32_t ggml_type;      // GGUF tensor type, or QUANT_AFFINE_TYPE
   uint32_t block_elements; // elements per native block
   uint32_t block_bytes;    // bytes per native block
   uint32_t plane0_bytes;   // per row and group of 32
@@ -98,13 +129,44 @@ QUANT_CONSTANT QuantFormat kQuantFormats[GGUF_FMT_COUNT] = {
     {3, 32, 20, 16, 0, 4, 1, "q41"},      // meta: d, m
     {39, 32, 17, 16, 0, 1, 1, "mxfp4"},   // meta: e
     {142, 128, 34, 8, 0, 2, 4, "pq20"},   // Prism's block_pq2_0, one d per 128 elements; meta: d
+    // MLX affine: the loader's native block s | z | codes; meta: s, z.
+    {QUANT_AFFINE_TYPE(2, 32), 32, 12, 8, 0, 4, 1, "af2g32"},
+    {QUANT_AFFINE_TYPE(2, 64), 64, 20, 8, 0, 4, 2, "af2g64"},
+    {QUANT_AFFINE_TYPE(2, 128), 128, 36, 8, 0, 4, 4, "af2g128"},
+    {QUANT_AFFINE_TYPE(3, 32), 32, 16, 8, 4, 4, 1, "af3g32"},
+    {QUANT_AFFINE_TYPE(3, 64), 64, 28, 8, 4, 4, 2, "af3g64"},
+    {QUANT_AFFINE_TYPE(3, 128), 128, 52, 8, 4, 4, 4, "af3g128"},
+    {QUANT_AFFINE_TYPE(4, 32), 32, 20, 16, 0, 4, 1, "af4g32"},
+    {QUANT_AFFINE_TYPE(4, 64), 64, 36, 16, 0, 4, 2, "af4g64"},
+    {QUANT_AFFINE_TYPE(4, 128), 128, 68, 16, 0, 4, 4, "af4g128"},
+    {QUANT_AFFINE_TYPE(5, 32), 32, 24, 16, 4, 4, 1, "af5g32"},
+    {QUANT_AFFINE_TYPE(5, 64), 64, 44, 16, 4, 4, 2, "af5g64"},
+    {QUANT_AFFINE_TYPE(5, 128), 128, 84, 16, 4, 4, 4, "af5g128"},
+    {QUANT_AFFINE_TYPE(6, 32), 32, 28, 16, 8, 4, 1, "af6g32"},
+    {QUANT_AFFINE_TYPE(6, 64), 64, 52, 16, 8, 4, 2, "af6g64"},
+    {QUANT_AFFINE_TYPE(6, 128), 128, 100, 16, 8, 4, 4, "af6g128"},
+    {QUANT_AFFINE_TYPE(8, 32), 32, 36, 32, 0, 4, 1, "af8g32"},
+    {QUANT_AFFINE_TYPE(8, 64), 64, 68, 32, 0, 4, 2, "af8g64"},
+    {QUANT_AFFINE_TYPE(8, 128), 128, 132, 32, 0, 4, 4, "af8g128"},
 };
 
-// The format that stores a GGUF tensor type; GGUF_FMT_COUNT when none does.
+// The format that stores a GGUF tensor type (or a QUANT_AFFINE_TYPE);
+// GGUF_FMT_COUNT when none does.
 inline constexpr uint32_t gguf_format_of(uint32_t ggml_type) {
   for (uint32_t format = 0; format < GGUF_FMT_COUNT; ++format)
     if (kQuantFormats[format].ggml_type == ggml_type) return format;
   return GGUF_FMT_COUNT;
+}
+
+// Whether a format is MLX affine, and its code bits.
+inline constexpr bool quant_affine_format(uint32_t format) {
+  return format >= GGUF_FMT_AF2G32 && format < GGUF_FMT_COUNT;
+}
+inline constexpr uint32_t quant_affine_bits(uint32_t format) { return (kQuantFormats[format].ggml_type >> 8) & 0xFF; }
+// The MLX affine format of b bits in groups of g; GGUF_FMT_COUNT when none
+// (QUANT_AFFINE_TYPE holds b and g in a byte each).
+inline constexpr uint32_t quant_affine_format_of(uint32_t bits, uint32_t group) {
+  return bits <= 0xFF && group <= 0xFF ? gguf_format_of(QUANT_AFFINE_TYPE(bits, group)) : GGUF_FMT_COUNT;
 }
 
 // The chunk order slot of element e (0..31) of a group.

@@ -1,4 +1,5 @@
 #include "engine/KvPool.hpp"
+#include "AwakeClock.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -9,15 +10,6 @@
 #include <utility>
 
 namespace splash::engine {
-namespace {
-
-double millisecondsSince(std::chrono::steady_clock::time_point start) {
-  return std::chrono::duration<double, std::milli>(
-             std::chrono::steady_clock::now() - start)
-      .count();
-}
-
-} // namespace
 
 KvPool::KvPool(kv::ExtentStorage &storage, uint32_t runwayPages)
     : storage_(storage), extentPages_(storage.extentPages()),
@@ -153,7 +145,7 @@ uint64_t KvPool::reclaimEmptyExtents(bool keepRunway, uint32_t limit) {
 }
 
 metal::AllocationResult KvPool::allocateExtent(uint32_t extent) {
-  const auto start = std::chrono::steady_clock::now();
+  const auto start = AwakeClock::now();
   const metal::AllocationResult allocated = storage_.allocateExtent(extent);
   if (allocated) {
     ++extentAllocations_;
@@ -165,7 +157,7 @@ metal::AllocationResult KvPool::allocateExtent(uint32_t extent) {
 }
 
 void KvPool::releaseExtent(uint32_t extent) {
-  const auto start = std::chrono::steady_clock::now();
+  const auto start = AwakeClock::now();
   storage_.releaseExtent(extent);
   ++extentReleases_;
   extentReleaseMaxMilliseconds_ =
@@ -276,7 +268,7 @@ void KvPool::insertFree(uint32_t page) noexcept {
   list.head = page;
   ++list.count;
   ++freePages_;
-  packingExtent_ = noIndex;
+  fillingExtent_ = noIndex;
 }
 
 void KvPool::removeFree(uint32_t page) noexcept {
@@ -303,7 +295,7 @@ void KvPool::removeFree(uint32_t page) noexcept {
 }
 
 uint32_t KvPool::popFree() noexcept {
-  const uint32_t page = extents_[packingExtent()].freePages.head;
+  const uint32_t page = extents_[fillingExtent()].freePages.head;
   if (page == noIndex)
     std::terminate();
   removeFree(page);
@@ -314,9 +306,9 @@ uint32_t KvPool::popFree() noexcept {
 // ties go to the lowest index, and empty extents lose to any used one. The
 // answer only changes when another extent gains or loses a page, so it is
 // reused until then.
-uint32_t KvPool::packingExtent() noexcept {
-  if (packingExtent_ != noIndex && extents_[packingExtent_].freePages.count)
-    return packingExtent_;
+uint32_t KvPool::fillingExtent() noexcept {
+  if (fillingExtent_ != noIndex && extents_[fillingExtent_].freePages.count)
+    return fillingExtent_;
   uint32_t best = noIndex;
   for (uint32_t index = 0; index < extents_.size(); ++index) {
     const ExtentRecord &extent = extents_[index];
@@ -327,7 +319,7 @@ uint32_t KvPool::packingExtent() noexcept {
   }
   if (best == noIndex)
     std::terminate();
-  packingExtent_ = best;
+  fillingExtent_ = best;
   return best;
 }
 
@@ -337,8 +329,8 @@ void KvPool::markUsed(uint32_t page) noexcept {
   const uint32_t extentIndex = extentOf(page);
   if (pages_[page].onFreeList) {
     removeFree(page);
-    if (extentIndex != packingExtent_)
-      packingExtent_ = noIndex;
+    if (extentIndex != fillingExtent_)
+      fillingExtent_ = noIndex;
   }
   ExtentRecord &extent = extents_[extentIndex];
   if (!extent.usedPages)

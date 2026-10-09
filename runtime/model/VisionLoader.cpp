@@ -1,4 +1,5 @@
 #include "model/VisionLoader.hpp"
+#include "metal/abi/Vision.h"
 #include "model/GgufFile.hpp"
 #include "model/SafetensorsCheckpoint.hpp"
 #include "model/VisionPreparation.hpp"
@@ -87,7 +88,8 @@ void bindCheckpoint(const SafetensorsCheckpoint &checkpoint, const ops::VisionLa
 // The metadata of a clip qwen3vl_merger mmproj of this layout, with no
 // deepstack block.
 void requireMmprojMetadata(const GgufFile &gguf, const ops::VisionLayout &layout) {
-  if (gguf.architecture() != "clip" || gguf.stringValue("clip.projector_type") != "qwen3vl_merger")
+  const GgufMetadata &metadata = gguf.metadata();
+  if (metadata.architecture() != "clip" || metadata.stringValue("clip.projector_type") != "qwen3vl_merger")
     throw WeightStoreError("unsupported vision GGUF architecture");
   for (const auto &[key, expected] : std::initializer_list<std::pair<const char *, uint64_t>>{
            {"clip.vision.projection_dim", layout.outputHiddenSize},
@@ -98,9 +100,9 @@ void requireMmprojMetadata(const GgufFile &gguf, const ops::VisionLayout &layout
            {"clip.vision.attention.head_count", layout.heads},
            {"clip.vision.spatial_merge_size", layout.spatialMerge},
            {"clip.use_gelu", 1}})
-    if (gguf.unsignedValue(key) != expected) throw WeightStoreError(std::string("vision metadata mismatch: ") + key);
-  const auto epsilon = gguf.floatValue("clip.vision.attention.layer_norm_epsilon");
-  if (!epsilon || !std::isfinite(*epsilon) || std::abs(*epsilon - 1e-6) > 1e-12)
+    if (metadata.unsignedValue(key) != expected) throw WeightStoreError(std::string("vision metadata mismatch: ") + key);
+  const auto epsilon = metadata.floatValue("clip.vision.attention.layer_norm_epsilon");
+  if (!epsilon || !std::isfinite(*epsilon) || std::abs(*epsilon - SPLASH_VISION_NORM_EPSILON) > 1e-12)
     throw WeightStoreError("vision LayerNorm epsilon mismatch");
   for (const char *key : {"clip.vision.image_mean", "clip.vision.image_std"}) {
     const auto values = gguf.numericArray(key);
@@ -147,16 +149,12 @@ void bindMmproj(const GgufFile &gguf, const ops::VisionLayout &layout, Plan &pla
 
 } // namespace
 
-struct VisionLoader::Impl {
+// The source and the plan bound to it, which the image's writer shares.
+struct VisionLoader::Planned {
   ops::VisionLayout layout;
   std::unique_ptr<SafetensorsCheckpoint> checkpoint;
   std::unique_ptr<WeightSource> mmproj;
   Plan plan;
-  PreparedWeight weight;
-  PreparedFiles files;
-
-  Impl(const ops::VisionLayout &layout, PreparationCheck check, PreparationCheck admitConversion)
-      : layout(layout), files(std::move(check), std::move(admitConversion), [this] { checkUnchanged(); }) {}
   void checkUnchanged() const {
     if (checkpoint) checkpoint->checkUnchanged();
     else mmproj->checkUnchanged();
@@ -164,41 +162,39 @@ struct VisionLoader::Impl {
 };
 
 VisionLoader::VisionLoader(const std::filesystem::path &directory, VisionSource source,
-                           const ops::VisionLayout &layout, PreparationCheck check, PreparationCheck admitConversion)
-    : impl_(std::make_unique<Impl>(layout, check, std::move(admitConversion))) {
-  auto &i = *impl_;
+                           const ops::VisionLayout &layout) {
   requireVisionLayout(layout);
-  i.plan = plan(layout);
+  auto planned = std::make_shared<Planned>();
+  planned->layout = layout;
+  planned->plan = plan(layout);
   if (source == VisionSource::Mlx) {
-    i.checkpoint = std::make_unique<SafetensorsCheckpoint>(directory, check);
-    bindCheckpoint(*i.checkpoint, layout, i.plan);
+    planned->checkpoint = std::make_unique<SafetensorsCheckpoint>(directory);
+    bindCheckpoint(*planned->checkpoint, layout, planned->plan);
   } else if (source == VisionSource::Gguf) {
-    i.mmproj = std::make_unique<WeightSource>(directory / "mmproj.gguf", check);
-    bindMmproj(GgufFile(*i.mmproj), layout, i.plan);
+    planned->mmproj = std::make_unique<WeightSource>(directory / "mmproj.gguf");
+    bindMmproj(GgufFile(*planned->mmproj), layout, planned->plan);
   } else {
-    throw WeightStoreError("only MLX and GGUF vision sources are prepared");
+    throw WeightStoreError("only MLX and GGUF vision sources are written into images");
   }
-  i.checkUnchanged();
-  i.weight = vision::visionWeight(i.plan, directory.string());
+  planned_ = std::move(planned);
 }
 
 VisionLoader::~VisionLoader() = default;
 
-const ops::VisionLayout &VisionLoader::layout() const noexcept { return impl_->layout; }
+const ops::VisionLayout &VisionLoader::layout() const noexcept { return planned_->layout; }
 
-const PreparedWeight &VisionLoader::weight() const noexcept { return impl_->weight; }
-
-std::filesystem::path VisionLoader::prepare() const {
-  const auto &i = *impl_;
-  return i.files.prepare(i.weight, [&](int destination, const PreparationCheck &admit) {
-    vision::writeVision(destination, i.plan, admit);
-  });
+ImagePlan VisionLoader::image() const {
+  return {"vision/model.bin", std::string(kVisionMagic), planned_->layout.depth, 0, planned_->plan.bytes,
+          [planned = planned_](std::span<uint8_t> bytes, const metal::MetalBuffer &) {
+            vision::writeVision(bytes, planned->plan);
+            planned->checkUnchanged();
+          }};
 }
 
-uint64_t preparedVisionBytes(const ops::VisionLayout &layout) { return plan(layout).bytes; }
+uint64_t visionImageBytes(const ops::VisionLayout &layout) { return plan(layout).bytes; }
 
-// The writer relies on the packed patch width and on padding that only adds
-// rows or columns.
+// The writer relies on the patch embedding's width, two frames of RGB
+// patches, and on padding that only adds rows or columns.
 void requireVisionLayout(const ops::VisionLayout &layout) {
   if (!layout.depth || !layout.hiddenSize || !layout.patchDimension || !layout.intermediateSize ||
       !layout.paddedIntermediateSize || !layout.mergedHiddenSize || !layout.outputHiddenSize || !layout.heads ||

@@ -8,12 +8,8 @@
 #include <cstdint>
 #include <optional>
 #include <string>
-#include <string_view>
 
 namespace splash::engine {
-
-[[nodiscard]] std::string
-deviceStatusJson(const DeviceCapabilities &device);
 
 inline constexpr uint64_t kMiB = 1024ULL * 1024;
 inline constexpr uint64_t kGiB = 1024ULL * 1024 * 1024;
@@ -44,6 +40,9 @@ struct ModelMemoryFootprint final {
   // when the tier's state file opened (a quota that holds one state); zero
   // otherwise.
   uint64_t stateStagingBytes = 0;
+  // The prefill FFN's Neural Engine split (ops::AneFfn::plannedBytes); zero
+  // without one.
+  uint64_t aneFfnBytes = 0;
 };
 
 struct ModelMemoryProfile final {
@@ -101,8 +100,6 @@ enum class BudgetErrorCode {
   KvPoolDoesNotFit,
 };
 
-[[nodiscard]] std::string_view budgetErrorCodeName(BudgetErrorCode code);
-
 struct EngineMemoryBreakdown {
   uint64_t physicalMemoryBytes = 0;
   uint64_t recommendedWorkingSetBytes = 0;
@@ -121,6 +118,7 @@ struct EngineMemoryBreakdown {
   uint64_t sharedDecodeBytes = 0;
   uint64_t pipelineReserveBytes = 0;
   uint64_t runtimeOverheadReserveBytes = 0;
+  uint64_t aneFfnBytes = 0;
   uint64_t stateStagingBytes = 0;
   uint64_t fixedRuntimeBytes = 0;
 
@@ -157,7 +155,6 @@ struct BudgetValidationStatus {
   std::string message;
   EngineMemoryBreakdown breakdown;
 
-  [[nodiscard]] std::string toStatusJson() const;
   [[nodiscard]] std::string describe() const;
 };
 

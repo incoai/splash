@@ -1,6 +1,6 @@
 #include "metal/kernels/common/gguf_sgmatrix.h"
 #include "metal/abi/KernelABI.h"
-#include "metal/kernels/common/activation.h"
+#include "metal/kernels/common/attention_gate.h"
 #include "metal/kernels/common/attention_qkv_prepare.h"
 
 template <uint QHeads, uint KHeads, class W>
@@ -11,7 +11,7 @@ inline void full_qkv_decode_phase(
     device bfloat *keys, device bfloat *values, threadgroup float *reductions,
     threadgroup bfloat *normalized, uint2 group, uint thread_index, uint lane,
     uint simd_group) {
-  constexpr uint HeadDim = 256, RotaryPairs = 32, QStride = 2 * HeadDim;
+  constexpr uint HeadDim = 256, RotaryPairs = SPLASH_TARGET_ROPE_PAIRS, QStride = 2 * HeadDim;
   constexpr uint PackedStride = QHeads * QStride + 2 * KHeads * HeadDim;
   constexpr uint Rows = SPLASH_TARGET_VERIFY_ROWS;
   constexpr uint Stride = SPLASH_VERIFY_CHUNK_STRIDE;
@@ -54,33 +54,17 @@ VERIFY_ATTENTION_QKV(verify_attention_qkv_f32, 24, 4, float)
 VERIFY_ATTENTION_QKV(verify_attention_qkv_kv2_g8_f32, 16, 2, float)
 #undef VERIFY_ATTENTION_QKV
 
+// Element `element` of every verify lane's rows, lane by lane.
 template <uint QHeads, uint KHeads>
-inline bfloat full_attention_gate_value(device const bfloat *packed_qkv,
-                                        device const bfloat *attention,
-                                        uint element) {
-  constexpr uint HeadDim = 256, QStride = 2 * HeadDim;
-  constexpr uint PackedStride = QHeads * QStride + 2 * KHeads * HeadDim;
-  constexpr uint HeadsPerKV = QHeads / KHeads, Rows = SPLASH_TARGET_VERIFY_ROWS;
-  constexpr uint per_lane = Rows * QHeads * HeadDim;
+inline bfloat verify_attention_gate_value(device const bfloat *packed_qkv,
+                                          device const bfloat *attention,
+                                          uint element) {
+  constexpr uint Rows = SPLASH_TARGET_VERIFY_ROWS;
+  constexpr uint per_lane = Rows * QHeads * 256;
   uint batch = element / per_lane;
-  uint lane_element = element % per_lane;
-  uint row = lane_element / (QHeads * HeadDim);
-  uint remainder = lane_element % (QHeads * HeadDim);
-  uint query_head = remainder / HeadDim;
-  uint dim = remainder % HeadDim;
-  float gate = float(
-      packed_qkv[(ulong(batch) * Rows + row) * PackedStride +
-                 query_head * QStride + HeadDim + dim]);
-  float gate_scale = splash_sigmoid(gate);
-  uint kv_head = query_head / HeadsPerKV;
-  uint local_head = query_head % HeadsPerKV;
-  ulong attention_index =
-      (((ulong(batch) * KHeads + kv_head) * SPLASH_VERIFY_CHUNK_STRIDE + row) *
-           HeadsPerKV +
-       local_head) *
-          HeadDim +
-      dim;
-  return bfloat(float(attention[attention_index]) * gate_scale);
+  return full_attention_gate_value<QHeads, KHeads>(
+      packed_qkv, attention, batch, Rows, SPLASH_VERIFY_CHUNK_STRIDE,
+      element % per_lane);
 }
 
 template <uint QHeads, uint KHeads>
@@ -91,30 +75,22 @@ inline void full_attention_gate_decode_phase(
   const uint count = params.lanes * SPLASH_TARGET_VERIFY_ROWS * QHeads * 256;
   for (uint element = index; element < count; element += grid_size)
     hidden[element] =
-        full_attention_gate_value<QHeads, KHeads>(packed_qkv, attention, element);
+        verify_attention_gate_value<QHeads, KHeads>(packed_qkv, attention, element);
 }
 
-kernel void verify_attention_gate(
-    device const bfloat *packed_qkv [[buffer(0)]],
-    device const bfloat *attention [[buffer(1)]],
-    device bfloat *hidden [[buffer(2)]],
-    constant FullDecodeBatchParams &params [[buffer(3)]],
-    uint index [[thread_position_in_grid]],
-    uint grid_size [[threads_per_grid]]) {
-  full_attention_gate_decode_phase<24, 4>(
-      packed_qkv, attention, hidden, params, index, grid_size);
-}
-
-kernel void verify_attention_gate_kv2_g8(
-    device const bfloat *packed_qkv [[buffer(0)]],
-    device const bfloat *attention [[buffer(1)]],
-    device bfloat *hidden [[buffer(2)]],
-    constant FullDecodeBatchParams &params [[buffer(3)]],
-    uint index [[thread_position_in_grid]],
-    uint grid_size [[threads_per_grid]]) {
-  full_attention_gate_decode_phase<16, 2>(
-      packed_qkv, attention, hidden, params, index, grid_size);
-}
+#define VERIFY_ATTENTION_GATE(Name, QHeads, KHeads)                            \
+  kernel void Name(device const bfloat *packed_qkv [[buffer(0)]],              \
+                   device const bfloat *attention [[buffer(1)]],               \
+                   device bfloat *hidden [[buffer(2)]],                        \
+                   constant FullDecodeBatchParams &params [[buffer(3)]],       \
+                   uint index [[thread_position_in_grid]],                     \
+                   uint grid_size [[threads_per_grid]]) {                      \
+    full_attention_gate_decode_phase<QHeads, KHeads>(                          \
+        packed_qkv, attention, hidden, params, index, grid_size);              \
+  }
+VERIFY_ATTENTION_GATE(verify_attention_gate, 24, 4)
+VERIFY_ATTENTION_GATE(verify_attention_gate_kv2_g8, 16, 2)
+#undef VERIFY_ATTENTION_GATE
 
 #define ATTENTION_GATE_TABLE(Name, QHeads, KHeads, Layout) \
   kernel void Name( \
@@ -126,15 +102,13 @@ kernel void verify_attention_gate_kv2_g8(
       uint lane [[thread_index_in_simdgroup]]) { \
     constexpr uint width = QHeads * 256; \
     const uint element = 2 * index; \
-    const bfloat a = full_attention_gate_value<QHeads, KHeads>(packed, attention, element); \
-    const bfloat b = full_attention_gate_value<QHeads, KHeads>(packed, attention, element + 1); \
+    const bfloat a = verify_attention_gate_value<QHeads, KHeads>(packed, attention, element); \
+    const bfloat b = verify_attention_gate_value<QHeads, KHeads>(packed, attention, element + 1); \
     hidden[element] = a; hidden[element + 1] = b; \
     const uint row = element / width; \
     Layout::write(table + ulong(row / 8) * width * 8, sums + ulong(row / 8) * Layout::sums_per_tile(width), \
                   width, (element % width) / 64, row % 8, lane, a, b); \
   }
-ATTENTION_GATE_TABLE(verify_attention_gate_table64, 24, 4, q4sg::Table64)
-ATTENTION_GATE_TABLE(verify_attention_gate_table64_kv2_g8, 16, 2, q4sg::Table64)
 ATTENTION_GATE_TABLE(verify_attention_gate_table16, 24, 4, gguf_sg::Table16)
 ATTENTION_GATE_TABLE(verify_attention_gate_table16_kv2_g8, 16, 2, gguf_sg::Table16)
 #undef ATTENTION_GATE_TABLE

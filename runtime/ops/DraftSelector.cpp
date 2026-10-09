@@ -2,8 +2,10 @@
 
 #include "metal/abi/Sampling.h"
 #include "metal/abi/LiveRows.h"
+#include "ops/BufferExtent.hpp"
 
 #include <cmath>
+#include <bit>
 #include <stdexcept>
 #include <utility>
 
@@ -83,6 +85,28 @@ void DraftSelector::add(metal::CommandGraph &graph,
     params.temperature[lane] = policies[lane].temperature;
     if (policies[lane].samples())
       params.sampling_mask |= uint32_t{1} << lane;
+  }
+  // A lane's proposal positions take rows 1-7 of its eight query rows of the
+  // logits and the selector hidden rows; a sampling lane draws its proposals
+  // with its proposal uniforms and writes their candidates' probabilities.
+  const DraftSelectorWorkspace workspace = DraftSelector::workspace(lanes * kPositions);
+  const uint64_t rows = uint64_t{lanes} * SPLASH_DRAFT_QUERY_ROWS;
+  const uint64_t codebook = uint64_t{vocabulary_} * SPLASH_DRAFT_SELECTOR_RANK * 2;
+  requireBytes(buffers.logits, rows * vocabulary_ * sizeof(float), "draft logits");
+  requireBytes(buffers.partialIds, workspace.partialIdsBytes, "draft selector partial id");
+  requireBytes(buffers.partialValues, workspace.partialValuesBytes, "draft selector partial value");
+  requireBytes(buffers.candidates, workspace.candidatesBytes, "draft candidate");
+  requireBytes(buffers.unary, workspace.unaryBytes, "draft candidate score");
+  requireBytes(buffers.selectorHidden, rows * SPLASH_DRAFT_SELECTOR_RANK * 2, "draft selector hidden");
+  requireBytes(codebooks.predecessor, codebook, "draft predecessor codebook");
+  requireBytes(codebooks.successor, codebook, "draft successor codebook");
+  requireBytes(buffers.proposedTokens, uint64_t{lanes} * kPositions * sizeof(uint32_t), "proposed token");
+  if (const uint64_t sampledLanes = std::bit_width(params.sampling_mask)) {
+    requireBytes(buffers.uniforms,
+                 ((sampledLanes - 1) * SPLASH_SAMPLING_UNIFORMS + SPLASH_UNIFORM_PROPOSALS + kPositions) * sizeof(float),
+                 "proposal uniform");
+    requireBytes(buffers.proposalProbabilities, sampledLanes * kPositions * SPLASH_DRAFT_CANDIDATES * sizeof(float),
+                 "proposal probability");
   }
   graph.add("draft_select_top16_sharded",
             {buffers.logits, buffers.partialIds, buffers.partialValues},

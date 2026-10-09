@@ -4,35 +4,37 @@
 #include "metal/kernels/common/activation.h"
 #include "metal/kernels/common/rms_inverse.h"
 
-// Four-tap causal convolution of one channel at one token of the command,
-// reading the three preceding tokens from the carried state, rounded to bf16
-// and gated by SiLU.
+// Causal convolution of one channel at one token of the command, reading the
+// preceding tokens from the carried state, rounded to bf16 and gated by SiLU.
 inline bfloat gdn_conv_silu(device const bfloat *packed,
                             device const bfloat *conv_state_in,
                             device const bfloat *conv_weights,
                             uint packed_width, uint conv_dim, uint token,
                             uint channel) {
+  constexpr uint Taps = SPLASH_GDN_CONVOLUTION_TAPS, Carried = Taps - 1;
   float value = 0.0f;
-  for (uint tap = 0; tap < 4; ++tap) {
+  for (uint tap = 0; tap < Taps; ++tap) {
     uint position = token + tap;
-    bfloat input = position < 3
+    bfloat input = position < Carried
                        ? conv_state_in[position * conv_dim + channel]
-                       : packed[(position - 3) * packed_width + channel];
-    value += float(input) * float(conv_weights[channel * 4 + tap]);
+                       : packed[(position - Carried) * packed_width + channel];
+    value += float(input) * float(conv_weights[channel * Taps + tap]);
   }
   value = float(bfloat(value));
   return bfloat(splash_silu(value));
 }
 
-// Row `row` of the carried state after consumed_tokens: the last three inputs
-// seen, still taken from the incoming state when fewer were consumed.
+// Row `row` of the carried state after consumed_tokens: the inputs of the
+// last tokens seen, still taken from the incoming state when fewer were
+// consumed.
 inline bfloat gdn_conv_carry(device const bfloat *packed,
                              device const bfloat *conv_state_in,
                              uint packed_width, uint conv_dim,
                              uint consumed_tokens, uint row, uint channel) {
+  constexpr uint Carried = SPLASH_GDN_CONVOLUTION_TAPS - 1;
   uint source = consumed_tokens + row;
-  return source < 3 ? conv_state_in[source * conv_dim + channel]
-                    : packed[(source - 3) * packed_width + channel];
+  return source < Carried ? conv_state_in[source * conv_dim + channel]
+                          : packed[(source - Carried) * packed_width + channel];
 }
 
 // The gates of one (token, value head): beta = sigmoid(b) and
@@ -73,7 +75,7 @@ inline uint gdn_output_head(uint head, bool tiled) {
 // thread per dimension, stored at the head's output position. Prefill
 // dispatches one task per threadgroup; decode runs gdn_decode_gate, which
 // reproduces these rows bitwise. The norm weights are read in their stored
-// type W: bfloat in the packed formats, float for a GGUF's F32 norms.
+// type W: bfloat for an MLX target's, float for a GGUF's F32 norms.
 template <uint KeyHeads, uint ValueHeads, uint HeadDim, uint ConvDim,
           uint PackedWidth, class W>
 inline void

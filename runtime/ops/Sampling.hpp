@@ -2,6 +2,7 @@
 
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/ExecutionGeometry.h"
+#include "metal/abi/Sampling.h"
 #include "metal/MetalBackend.hpp"
 
 #include <cstdint>
@@ -115,7 +116,7 @@ public:
   explicit Sampling(uint32_t vocabulary);
 
   // Exact scratch/output bytes for the fixed precompiled sampling ABI.
-  // Counts may cover one lane or a packed batch; the operator owns sharding.
+  // Counts may cover one lane or a batch of lanes; the operator owns sharding.
   [[nodiscard]] static SamplingWorkspace workspace(uint32_t rows);
 
   // A penalized request's penalty words (metal/abi/Sampling.h), rebuilt
@@ -174,16 +175,21 @@ private:
   // Penalizes the row at rowOffset of each penalized lane or, for verify,
   // all its rows, each also counting the draft tokens its context adds.
   // Policies come from validated requests (Model.hpp
-  // SamplingParameters::validationError).
+  // SamplingParameters::validationError). It follows selection(), whose
+  // check of every lane's logits covers those it rewrites.
   void addPenalties(metal::CommandGraph &graph,
                     std::span<const SamplingPolicy> policies,
                     const SamplingBuffers &buffers, const PenaltyTable &table,
                     uint32_t rowOffset, bool verify) const;
-  // Selects the rows that rows names of every lane.
-  void addSelection(metal::CommandGraph &graph,
-                    std::span<const SamplingPolicy> policies,
-                    const SamplingBuffers &buffers, const TargetRows &rows,
-                    uint32_t stopToken0, uint32_t stopToken1) const;
+  // The parameters that select the rows `rows` names of every lane; throws
+  // unless the buffers hold what the selection's kernels reach, before
+  // addInitial or addVerify encodes anything.
+  [[nodiscard]] TargetSamplingParams selection(std::span<const SamplingPolicy> policies,
+                                               const SamplingBuffers &buffers, const TargetRows &rows,
+                                               uint32_t stopToken0, uint32_t stopToken1) const;
+  // Selects the rows `selection` names of its `lanes` lanes.
+  void addSelection(metal::CommandGraph &graph, const TargetSamplingParams &selection, uint32_t lanes,
+                    const SamplingBuffers &buffers) const;
 
   uint32_t vocabulary_ = 0;
   uint32_t maskWords_ = 0;

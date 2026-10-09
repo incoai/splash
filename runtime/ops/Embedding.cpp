@@ -3,6 +3,7 @@
 #include "metal/abi/Embedding.h"
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Gguf.h"
+#include "ops/BufferExtent.hpp"
 
 #include <stdexcept>
 #include <string>
@@ -19,36 +20,30 @@ void Embedding::add(metal::CommandGraph &graph, metal::MetalBuffer tokens,
                     const EmbeddingWeights &table, metal::MetalBuffer output,
                     uint32_t rows) {
   if (!rows || !table.outputSize || !table.inputSize)
-    throw std::invalid_argument("invalid Q4 embedding shape");
-  // Both gathers read `rows` token ids and write `rows` bf16 rows of the table's width.
-  if (tokens.sizeBytes() < uint64_t{rows} * sizeof(uint32_t) ||
-      output.sizeBytes() < uint64_t{rows} * table.inputSize * sizeof(uint16_t))
-    throw std::invalid_argument("embedding buffers are smaller than the gathered rows");
-  if (table.layout() == WeightLayout::Block32) {
-    const NativeRows &native = table.blocks();
-    const GgufEmbedParams params{rows, table.outputSize, table.inputSize};
-    if (table.rotation) {
-      // One threadgroup per rotation block of a row, which gathers the block
-      // and inverts its rotation in fp32 (kernels/shared/gguf_rotation.metal).
-      if (native.formatId != GGUF_FMT_PQ20 || table.inputSize % GGUF_ROTATION_BLOCK ||
-          table.rotation.signs.sizeBytes() < table.inputSize)
-        throw std::invalid_argument("a rotated token table takes PQ2_0 rows of whole rotation blocks and their signs");
-      graph.add("gguf_embed_rotated_pq20", {std::move(tokens), native.rows, table.rotation.signs, std::move(output)},
-                params, {table.inputSize / GGUF_ROTATION_BLOCK, rows, 1}, {GGUF_ROTATION_THREADS, 1, 1});
-      return;
-    }
-    graph.add(std::string("gguf_embed_") + native.name(),
-              {std::move(tokens), native.rows, std::move(output)}, params,
-              {(rows * table.inputSize + 255) / 256, 1, 1}, {256, 1, 1});
+    throw std::invalid_argument("invalid embedding shape");
+  // Every gather reads `rows` token ids and writes `rows` bf16 rows of the table's width.
+  requireBytes(tokens, uint64_t{rows} * sizeof(uint32_t), "embedding token");
+  requireBytes(output, uint64_t{rows} * table.inputSize * sizeof(uint16_t), "embedding output");
+  const NativeRows &native = table.blocks();
+  // Every token's row of native blocks (kernels/shared/embedding.metal).
+  const QuantFormat &format = kQuantFormats[native.formatId];
+  if (table.inputSize % format.block_elements)
+    throw std::invalid_argument("native token rows take whole blocks");
+  requireBytes(native.rows, uint64_t{table.outputSize} * (table.inputSize / format.block_elements) * format.block_bytes,
+               "token table");
+  const GgufEmbedParams params{rows, table.outputSize, table.inputSize};
+  if (table.rotation) {
+    // One threadgroup per rotation block of a row, which gathers the block
+    // and inverts its rotation in fp32 (kernels/shared/gguf_rotation.metal).
+    if (native.formatId != GGUF_FMT_PQ20 || table.inputSize % GGUF_ROTATION_BLOCK)
+      throw std::invalid_argument("a rotated token table takes PQ2_0 rows of whole rotation blocks");
+    requireBytes(table.rotation.signs, table.inputSize, "embedding rotation sign");
+    graph.add("gguf_embed_rotated_pq20", {std::move(tokens), native.rows, table.rotation.signs, std::move(output)},
+              params, {table.inputSize / GGUF_ROTATION_BLOCK, rows, 1}, {GGUF_ROTATION_THREADS, 1, 1});
     return;
   }
-  const uint32_t hiddenGroups = (table.inputSize + 127) / 128;
-  const Q4EmbeddingParams params{rows, table.outputSize};
-  const AffineWeights &affine = table.affine();
-  // One kernel per compiled hidden size (kernels/shared/embedding.metal).
-  graph.add("embedding_q4_h" + std::to_string(table.inputSize),
-            {std::move(tokens), affine.weights, affine.scales, affine.biases, std::move(output)},
-            params, {hiddenGroups, 1, 1});
+  graph.add(std::string("gguf_embed_") + native.name(), {std::move(tokens), native.rows, std::move(output)}, params,
+            {(rows * table.inputSize + 255) / 256, 1, 1}, {256, 1, 1});
 }
 
 void Embedding::addVerifyInput(metal::CommandGraph &graph,
@@ -58,6 +53,10 @@ void Embedding::addVerifyInput(metal::CommandGraph &graph,
                                uint32_t vocabulary, uint32_t lanes) {
   if (!vocabulary || !lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid verify input batch");
+  // A lane's anchor is row 0 of its draft input rows.
+  requireBytes(draftInputTokens, rowBytes(lanes, SPLASH_TARGET_VERIFY_ROWS, 1, sizeof(uint32_t)), "draft input token");
+  requireBytes(proposedTokens, uint64_t{lanes} * SPLASH_DRAFT_PROPOSAL_TOKENS * sizeof(uint32_t), "proposed token");
+  requireBytes(verifyInputTokens, uint64_t{lanes} * SPLASH_TARGET_VERIFY_ROWS * sizeof(uint32_t), "verify input token");
   const VerifyInputBatchParams params{vocabulary};
   graph.add("verify_input_tokens",
             {std::move(draftInputTokens), std::move(proposedTokens),

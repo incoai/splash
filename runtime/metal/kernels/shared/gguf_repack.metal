@@ -1,4 +1,3 @@
-// Editing this file re-prepares every GGUF model.
 #pragma clang fp reassociate(off)
 #include "metal/abi/GgufRepack.h"
 #include <metal_stdlib>
@@ -45,6 +44,23 @@ kernel void gguf_repack(device const uchar *src [[buffer(0)]], device uchar *dst
   device uchar *out1 = dst + p.dst_plane1 + quant_tile_index(n, g, G) * f.plane1_bytes;
   device uchar *meta = dst + p.dst_meta + quant_tile_index(n, b, G / f.meta_groups) * f.meta_bytes;
   uchar lo[32], hi[32];   // per slot: the (low) code and its high bits
+  if (quant_affine_format(p.fmt)) {
+    // MLX affine {s, z, codes}: element e of group j is code 32 j + e of the codes' bit string. The planes keep its
+    // low 2 (2, 3 bits) or 4 bits (4, 5, 6) and the rest as Q2_K, Q3_K, Q4_K, Q5_K and Q6_K do; 8 bits as Q8_0.
+    const uint bits = quant_affine_bits(p.fmt), low = bits == 8 ? 8 : bits <= 3 ? 2 : 4;
+    device const uchar *codes = blk + 4;
+    for (uint e = 0; e < 32; ++e) {
+      const uint at = (32 * j + e) * bits, shift = at % 8;
+      const uint word = uint(codes[at / 8]) | (shift + bits > 8 ? uint(codes[at / 8 + 1]) << 8 : 0u);
+      const uint code = (word >> shift) & ((1u << bits) - 1);
+      lo[quant_slot(e)] = code & ((1u << low) - 1);
+      hi[quant_slot(e)] = code >> low;
+    }
+    if (low == 4) gguf_store_pairs(lo, out0); else gguf_store_bits(lo, low, out0);
+    if (bits != low) gguf_store_bits(hi, bits - low, out1);
+    if (j == 0) for (uint i = 0; i < 4; ++i) meta[i] = blk[i];
+    return;
+  }
   switch (p.fmt) {
     case GGUF_FMT_Q4K: {
       for (uint e = 0; e < 32; ++e) lo[quant_slot(e)] = (blk[16 + (j / 2) * 32 + e] >> (4 * (j % 2))) & 15;

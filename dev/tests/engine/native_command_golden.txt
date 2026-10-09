@@ -1,0 +1,22 @@
+# serve-native command lines both sides must agree on, as
+# "<name> | <splash serve options> | <arguments after MODEL_DIRECTORY>" lines.
+#
+# server/server.py's _native_command writes the arguments for the options
+# (dev/tests/server/test_serve_options.py checks it), and
+# runtime/engine/NativeArguments.cpp must read them as the server means them
+# (dev/tests/engine/native_arguments_test.cpp checks each line).
+
+defaults |  | auto auto
+limits | --max-context 100K --max-memory 32G | 102400 34359738368
+disk | --max-cache-disk 5G | auto auto 5368709120
+persistent | --max-cache-disk 5G --persistent-cache --cache-dir /srv/cache | auto auto 5368709120 --cache-dir /srv/cache
+bf16 | --kv-format bf16 | auto auto --kv-format bf16
+disk_bf16 | --max-cache-disk 5G --kv-format bf16 | auto auto 5368709120 --kv-format bf16
+idle_release | --idle-release 30m | auto auto --idle-release 1800.0
+idle_release_off | --idle-release off | auto auto --idle-release off
+decode_share | --max-cache-disk 5G --decode-share 0 | auto auto 5368709120 --decode-share 0.0
+image_patches | --max-image-pixels 1048576 | auto auto --max-image-patches 4096
+image_patches_rounded | --max-image-pixels 1000000 | auto auto --max-image-patches 3904
+image_patches_default | --max-image-pixels 4194304 | auto auto
+idle_sleep | --allow-idle-sleep | auto auto --idle-sleep allow
+disable_ane | --disable-ane | auto auto --ane off

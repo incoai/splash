@@ -256,7 +256,7 @@ inline void gdn_prepare_prefill_phase(
     decay[gate] = gates.decay;
   }
   if (token == 0) {
-    for (uint row = 0; row < 3; ++row) {
+    for (uint row = 0; row < SPLASH_GDN_CONVOLUTION_TAPS - 1; ++row) {
       for (uint head = 0; head < HeadsPerKey + 2; ++head) {
         const uint channel = head == 0   ? query_channel
                              : head == 1 ? key_channel

@@ -38,6 +38,11 @@ inline ulong splash_current_value_index(uint stride, uint head, uint token,
   return (ulong(head) * SplashKvHeadDimension + dimension) * stride + token;
 }
 
+// The scratch of a store entry's scale reduction, by CacheElement: eight
+// simdgroup maxima for INT8; BF16 copies the source bits and has none.
+#define SPLASH_STORE_MAXIMA_int8_t threadgroup float maxima[8];
+#define SPLASH_STORE_MAXIMA_bfloat threadgroup float *maxima = nullptr;
+
 // One lane per dimension stores a current row in its final page slot.
 // INT8 derives a per-row scale; BF16 copies the original bits. Slots are
 // addressed inside the head's slab of the page: the page index functions at

@@ -27,7 +27,8 @@ public:
   // While profiling, submitCommandAsync() commits every dispatch as its own
   // command and waits for it, recording its GPU time, then invokes
   // completion inline and returns an already-completed ticket with the
-  // summed timing. takeDispatchProfile() reads and clears the timings.
+  // summed timing; it refuses a command with event steps (EventStep).
+  // takeDispatchProfile() reads and clears the timings.
   static void setDispatchProfiling(MetalBackend &backend, bool enabled);
   [[nodiscard]] static std::vector<DispatchTiming>
   takeDispatchProfile(MetalBackend &backend);

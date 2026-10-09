@@ -7,6 +7,12 @@
 #include <stdint.h>
 #endif
 
+// The expert slots of the routing kernels (ops::MoE): a row's router scores
+// take this many floats, the block's experts first, and the select and
+// grouping kernels run one thread per slot, so a MoE block routes at most
+// this many experts.
+#define SPLASH_MOE_EXPERT_SLOTS 256u
+
 struct MoeRouteParams {
   uint32_t rows;
   uint32_t input_size;
@@ -31,15 +37,32 @@ struct MoeTileDescriptor {
 static_assert(sizeof(MoeTileDescriptor) == 8,
               "MoE tile descriptors are 8 bytes on both sides");
 
+// The column tiles of the gate/up and down passes, whose grids the grouping
+// writes (MoeTileCount).
 struct MoeGroupParams {
   uint32_t rows;
   uint32_t top_k;
   uint32_t tile_rows;
   uint32_t experts;
+  uint32_t gate_up_columns;
+  uint32_t down_columns;
 };
 
-static_assert(sizeof(MoeGroupParams) == 16,
-              "MoE grouping parameters are 16 bytes on both sides");
+static_assert(sizeof(MoeGroupParams) == 24,
+              "MoE grouping parameters are 24 bytes on both sides");
+
+// What the grouping writes besides the tiles: their count, which every pass
+// over them reads first, and the grids (column tiles, tiles, 1) of the
+// gate/up and down passes, which they read as an indirect dispatch
+// (MTLDispatchThreadgroupsIndirectArguments) to launch the live tiles alone.
+struct MoeTileCount {
+  uint32_t tiles;
+  uint32_t gate_up_grid[3];
+  uint32_t down_grid[3];
+};
+
+static_assert(sizeof(MoeTileCount) == 28,
+              "the MoE tile count is 28 bytes on both sides");
 
 struct MoeGatherParams {
   uint32_t tile_rows;
@@ -49,18 +72,6 @@ struct MoeGatherParams {
 
 static_assert(sizeof(MoeGatherParams) == 12,
               "MoE gather parameters are 12 bytes on both sides");
-
-struct MoeExpertParams {
-  uint32_t input_size;
-  uint32_t output_size;
-  uint32_t experts;
-  uint32_t reserved0;
-  uint64_t expert_stride_bytes_0;
-  uint64_t expert_stride_bytes_1;
-};
-
-static_assert(sizeof(MoeExpertParams) == 32,
-              "MoE expert parameters are 32 bytes on both sides");
 
 // A GGUF expert pass (ops/MoE.cpp): every routed expert of the projection
 // is one image segment of experts * output_size rows, expert e's planes

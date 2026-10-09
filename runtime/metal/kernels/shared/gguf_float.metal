@@ -17,8 +17,7 @@ namespace gguf_float {
 constant constexpr uint kFragments = 4;          // 8-row fragments per threadgroup: 32 rows
 constant constexpr uint kRows = 8 * kFragments;
 // K parts, one per simdgroup. A decode dispatch has few threadgroups (8 or 32 at the 35B's alpha/beta and router
-// widths), so each simdgroup's chain of K / (8 kSplits) dependent loads and MMAs sets its time: on the 40-core M3
-// Max four parts took 26-28 us per decode router or alpha/beta dispatch.
+// widths), so each simdgroup's chain of K / (8 kSplits) dependent loads and MMAs sets its time.
 constant constexpr uint kSplits = 16;
 
 // One threadgroup: output columns [8 tg.x, 8 tg.x + 8) of rows [32 tg.y, 32 tg.y + 32). Simdgroup s accumulates

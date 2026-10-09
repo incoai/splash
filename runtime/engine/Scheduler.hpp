@@ -54,11 +54,11 @@ struct SchedulerSnapshot final {
       decodeBatchesByWidth{};
 };
 
-// One single-owner policy for the specialized backend. Prefill packs the
-// shortest remaining sequences first into an actual-row budget, with a bound
-// on how often later arrivals may overtake a lane; decode dispatches every
-// ready lane immediately and therefore has only the four real
-// M8/M16/M24/M32 shapes.
+// One single-owner scheduling policy. Prefill batches the shortest remaining
+// sequences first into an actual-row budget, with a bound on how often later
+// arrivals may overtake a lane; decode takes the ready lanes of one priority,
+// constraint mode and stage without waiting for more, so it runs only the
+// four real M8/M16/M24/M32 shapes.
 class Scheduler final {
 public:
   // Decode time owed for each unit of time a prefill runs while requests of
@@ -80,7 +80,7 @@ public:
   void remove(uint64_t requestId);
 
   // A sparse-state materialization point can stop one sequence without
-  // padding or shortening any peer in the same packed command. The boundary
+  // padding or shortening any peer in the same ragged command. The boundary
   // must lie past the request's progress; complete() consumes a boundary its
   // command reached.
   void setPrefillBoundary(uint64_t requestId,

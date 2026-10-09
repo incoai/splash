@@ -1,7 +1,6 @@
 // Vision encoder kernels for the Qwen3.5 vision tower: pixel patchify,
 // position/rope preparation, dense bf16 GEMMs with fused epilogues,
-// LayerNorm, 2D-rope QKV preparation, non-causal flash attention, and the
-// embedding injection into the language model's prefill hidden rows.
+// LayerNorm, 2D-rope QKV preparation and non-causal flash attention.
 //
 // Conventions match the text-model kernels: 256 threads (8 simdgroups) per
 // threadgroup, MPP cooperative-tensor matmuls with fp32 accumulation and
@@ -296,7 +295,7 @@ kernel void vision_layer_norm(
     #pragma unroll
     for (ushort i = 0; i < 8; ++i) variance += reductions[i];
     variance /= float(params.width);
-    float inverse = rsqrt(variance + 1e-6f);
+    float inverse = rsqrt(variance + SPLASH_VISION_NORM_EPSILON);
 
     for (uint column = thread_index; column < params.width; column += 256) {
         float normalized = (row[column] - mean) * inverse;
@@ -508,7 +507,7 @@ kernel void vision_attention(
 
 // Gather padded attention output back to (tokens, 1152) rows.
 
-kernel void vision_attention_pack(
+kernel void vision_attention_gather(
     device const bfloat *padded [[buffer(0)]],
     device bfloat *output [[buffer(1)]],
     constant VisionQkvParams &params [[buffer(2)]],
@@ -522,25 +521,5 @@ kernel void vision_attention_pack(
         row[index] = padded[
             (ulong(head) * params.padded_tokens + token) * kVisionHeadDim +
             dim];
-    }
-}
-
-// Overwrites language-model embedding rows with encoded image rows. Encoded
-// after the token-embedding gather on the same serial compute encoder, so
-// layer 0 sees the injected rows.
-
-kernel void vision_inject_embeddings(
-    device const bfloat *source [[buffer(0)]],
-    device bfloat *output [[buffer(1)]],
-    constant VisionInjectParams &params [[buffer(2)]],
-    uint index [[thread_position_in_grid]],
-    uint grid_size [[threads_per_grid]])
-{
-    uint elements = params.rows * params.width;
-    for (uint element = index; element < elements; element += grid_size) {
-        uint row = element / params.width;
-        uint dim = element % params.width;
-        output[ulong(params.destination_row + row) * params.width + dim] =
-            source[ulong(params.source_row + row) * params.width + dim];
     }
 }

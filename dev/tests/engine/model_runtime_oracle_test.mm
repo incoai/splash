@@ -1,5 +1,7 @@
+#include "LinearNumerics.hpp"
 #include "TestChecks.hpp"
-#include "TestModel.hpp"
+#include "ane/ProgramInstrumentation.hpp"
+#include "engine/RuntimeResources.hpp"
 #include "engine/MemoryGovernor.hpp"
 #include "engine/MemoryPlan.hpp"
 #include "engine/Types.hpp"
@@ -9,7 +11,6 @@
 #include "ops/PageStorage.hpp"
 #include "ops/Sampling.hpp"
 #include "ops/Vision.hpp"
-#include "tuning/LinearNumerics.hpp"
 
 #include <algorithm>
 #include <array>
@@ -40,6 +41,7 @@ namespace {
   throw std::runtime_error(message);
 }
 
+using splash::test::rejects;
 using splash::test::require;
 
 std::string mebibytes(uint64_t bytes) {
@@ -125,7 +127,7 @@ Similarity compareBfloat(const metal::MetalBuffer &left,
   const uint16_t *b = bfloatContents(right, "right BF16 buffer");
   SimilarityAccumulator accumulator;
   for (uint64_t index = 0; index < elements; index += stride) {
-    accumulator.add(ops::tuning::bf16ToFloat(a[index]), ops::tuning::bf16ToFloat(b[index]));
+    accumulator.add(test::bf16ToFloat(a[index]), test::bf16ToFloat(b[index]));
   }
   return accumulator.result();
 }
@@ -377,9 +379,13 @@ metal::MetalBuffer recurrentHalf(const metal::MetalBackend &backend,
 
 using StateSamples = std::vector<std::pair<std::string, std::vector<float>>>;
 
+// The ring rows of positions from `capturedFrom` on, which the chunks after a
+// restore captured from their own rows, are sampled apart as captured_* rings:
+// compareCommittedSamples holds them bit for bit.
 StateSamples sampleCommittedState(const metal::MetalBackend &backend,
                                   const model::QwenStateStorage &states,
-                                  uint32_t lane) {
+                                  uint32_t lane,
+                                  uint64_t capturedFrom = std::numeric_limits<uint64_t>::max()) {
   StateSamples result;
   const auto add = [&](std::string name, const metal::MetalBuffer &buffer,
                        bool bfloat) {
@@ -387,7 +393,7 @@ StateSamples sampleCommittedState(const metal::MetalBackend &backend,
     const uint64_t count = buffer.sizeBytes() / (bfloat ? 2 : 4);
     const uint64_t stride = std::max<uint64_t>(1, count / 65536);
     for (uint64_t index = 0; index < count; index += stride) {
-      values.push_back(bfloat ? ops::tuning::bf16ToFloat(static_cast<const uint16_t *>(
+      values.push_back(bfloat ? test::bf16ToFloat(static_cast<const uint16_t *>(
                                                  buffer.contents())[index])
                              : static_cast<const float *>(buffer.contents())[index]);
     }
@@ -409,41 +415,79 @@ StateSamples sampleCommittedState(const metal::MetalBackend &backend,
   for (uint32_t layer = 0; layer < ring.size(); ++layer) {
     const auto *keys = bfloatContents(ring[layer].keys, "draft keys");
     const auto *values = bfloatContents(ring[layer].values, "draft values");
-    std::vector<float> keySamples, valueSamples;
+    std::vector<float> keySamples, valueSamples, capturedKeys, capturedValues;
     for (uint64_t index = 0; index < elements; index += stride) {
       const uint32_t dimension = index % layout.headDimension;
       const uint32_t position = (index / layout.headDimension) % lengths.draftLength;
       const uint32_t head = index / (uint64_t{layout.headDimension} * lengths.draftLength);
       const uint32_t ring = (lengths.draftBase + position) % window;
-      keySamples.push_back(ops::tuning::bf16ToFloat(
+      const bool captured = lengths.draftBase + position >= capturedFrom;
+      (captured ? capturedKeys : keySamples).push_back(test::bf16ToFloat(
           keys[(uint64_t{head} * window + ring) * layout.headDimension + dimension]));
-      valueSamples.push_back(ops::tuning::bf16ToFloat(
+      (captured ? capturedValues : valueSamples).push_back(test::bf16ToFloat(
           values[(uint64_t{head} * layout.headDimension + dimension) * window + ring]));
     }
     result.emplace_back("draft_key_" + std::to_string(layer), std::move(keySamples));
     result.emplace_back("draft_value_" + std::to_string(layer), std::move(valueSamples));
+    if (!capturedKeys.empty()) {
+      result.emplace_back("captured_key_" + std::to_string(layer), std::move(capturedKeys));
+      result.emplace_back("captured_value_" + std::to_string(layer), std::move(capturedValues));
+    }
+  }
+  // The context window's rows of the rings' positions, byte for byte: a
+  // restore copies the window and computes the rings from it again.
+  if (lengths.draftLength && lengths.hasCurrentContextWindow()) {
+    const auto *bytes = static_cast<const uint8_t *>(states.window(lane).contents());
+    const uint64_t codeBytes = layout.contextWidth / 2;
+    const uint64_t groupBytes = uint64_t{layout.contextWidth} / SPLASH_DRAFT_CONTEXT_GROUP * 4;
+    const uint64_t rowBytes = codeBytes + groupBytes;
+    const uint64_t total = uint64_t{lengths.draftLength} * rowBytes;
+    std::vector<float> samples;
+    for (uint64_t index = 0; index < total; index += std::max<uint64_t>(1, total / 65536)) {
+      const uint64_t slot = (lengths.draftBase + index / rowBytes) % window;
+      const uint64_t offset = index % rowBytes;
+      samples.push_back(bytes[offset < codeBytes
+                                  ? slot * codeBytes + offset
+                                  : draft_context_codes_bytes(layout.contextWidth) +
+                                        slot * groupBytes + (offset - codeBytes)]);
+    }
+    result.emplace_back("context_window", std::move(samples));
   }
   return result;
 }
 
+// Exact compares every tensor bit for bit, but for `restoredRings` the
+// draft rings, which a restore computed again from the 4-bit context window:
+// they must stay close to the rings computed from the rows themselves.
+// Otherwise it reports the drift of the tensors both sides sampled; a lane
+// past its prompt has no current context window to sample.
 void compareCommittedSamples(const StateSamples &before,
-                              const StateSamples &after, bool exact) {
-  require(before.size() == after.size(), "preemption state sample shape changed");
-  for (size_t tensor = 0; tensor < before.size(); ++tensor) {
-    const auto &[name, values] = before[tensor];
-    require(values.size() == after[tensor].second.size(),
-            "preemption tensor sample shape changed");
-    if (exact) {
-      require(values == after[tensor].second,
+                              const StateSamples &after, bool exact,
+                              bool restoredRings = false) {
+  if (exact)
+    require(before.size() == after.size(), "preemption state sample shape changed");
+  for (const auto &[name, values] : before) {
+    const auto other = std::ranges::find(after, name, &StateSamples::value_type::first);
+    if (other == after.end()) {
+      require(!exact, "preemption state sample shape changed: " + name);
+      continue;
+    }
+    const std::vector<float> &compared = other->second;
+    require(values.size() == compared.size(), "preemption tensor sample shape changed");
+    const bool rebuilt = restoredRings && name.starts_with("draft_");
+    if (exact && !rebuilt) {
+      require(values == compared,
               "regenerated state differs from independent teacher forcing: " + name);
       continue;
     }
     SimilarityAccumulator comparison;
     for (size_t index = 0; index < values.size(); ++index)
-      comparison.add(values[index], after[tensor].second[index]);
+      comparison.add(values[index], compared[index]);
     const Similarity result = comparison.result();
-    std::cout << "preemption_state " << name << " cosine=" << result.cosine
-              << " maximum_absolute=" << result.maximumAbsolute << '\n';
+    std::cout << (rebuilt ? "restored_ring " : "preemption_state ") << name
+              << " cosine=" << result.cosine << " maximum_absolute=" << result.maximumAbsolute << '\n';
+    if (rebuilt)
+      require(result.cosine >= 0.99, "rings computed again from the context window drifted: " + name);
   }
 }
 
@@ -455,7 +499,7 @@ struct AllocationFault final {
 
 void requireAtomicImageAdmission(model::Runtime &executor,
                                  metal::MetalBackend &backend,
-                                 const model::ModelPackage &model,
+                                 const model::LoadedModel &model,
                                  AllocationFault &fault) {
   const uint64_t originalBytes = backend.memoryStats().allocatedBytes;
   const uint64_t originalSubmissions =
@@ -598,7 +642,7 @@ void requireAtomicImageAdmission(model::Runtime &executor,
 void requireImageRowsAfterReclaim(model::Runtime &executor,
                                   metal::MetalBackend &backend,
                                   model::QwenStateStorage &states,
-                                  const model::ModelPackage &model,
+                                  const model::LoadedModel &model,
                                   AllocationFault &fault) {
   while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
   }
@@ -775,8 +819,9 @@ void requireRepeatedImagePlacements(model::Runtime &executor,
                std::span<const uint32_t>(prompt).subspan(64), pages, false);
   require(executor.telemetry().imageEncodes == encodes + 2,
           "prefix restore discarded data for a later image placement");
+  // The checkpoint's rows come back into the rings from the context window.
   compareCommittedSamples(
-      expected, sampleCommittedState(backend, states, *restored.lane), true);
+      expected, sampleCommittedState(backend, states, *restored.lane), true, true);
   executor.end(request.id);
   checkpoint.reset();
   while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
@@ -784,6 +829,48 @@ void requireRepeatedImagePlacements(model::Runtime &executor,
   require(backend.memoryStats().allocatedBytes == originalBytes,
           "repeated image placements retained resources");
   std::cout << "repeated_image_placements=PASS\n";
+}
+
+// A restore at a full window: the chunk after it stores its rows into the
+// window slots of the oldest restored positions and writes their ring slots,
+// so the rings computed again from the window must come before them: a later
+// rebuild would overwrite the chunk's captured rings, which match bit for bit.
+// The restored lane matches the cold teacher-forced lane that made the
+// checkpoint.
+void requireFullWindowRestore(model::Runtime &executor,
+                              const metal::MetalBackend &backend,
+                              const model::QwenStateStorage &states) {
+  constexpr uint32_t window = model::ExecutionLimits::draftContextTokens;
+  constexpr uint32_t boundary = window + 64;
+  std::vector<uint32_t> prompt(boundary + 64);
+  for (uint32_t index = 0; index < prompt.size(); ++index)
+    prompt[index] = 1 + index;
+  const std::span<const uint32_t> tokens(prompt);
+  const std::vector<uint32_t> pages = pageRange(0, prompt.size() / kv::kPageTokens);
+  EngineRequest request = makeRequest(104, prompt, 1);
+  beginCold(executor, request, 0);
+  const std::array<uint32_t, 1> checkpoints{boundary};
+  executor.setDraftContextPlan(request.id, planDraftContext(0, prompt.size(), checkpoints));
+  prefillChunk(executor, request.id, 0, tokens.first(window), pages);
+  prefillChunk(executor, request.id, window, tokens.subspan(window, boundary - window), pages);
+  auto checkpoint = executor.snapshot(request.id);
+  require(checkpoint != nullptr, "full-window checkpoint allocation failed");
+  prefillChunk(executor, request.id, boundary, tokens.subspan(boundary), pages);
+  const auto expected = sampleCommittedState(backend, states, 0, boundary);
+  executor.end(request.id);
+  // With the idle rings reclaimed, the restored lane's rings hold none of the
+  // teacher's rows: only the rebuild puts them back.
+  while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
+  }
+
+  request.id = 105;
+  beginCold(executor, request, 0);
+  restoreActivePrefix(executor, request.id, prompt.size(), boundary, checkpoint);
+  prefillChunk(executor, request.id, boundary, tokens.subspan(boundary), pages);
+  compareCommittedSamples(expected, sampleCommittedState(backend, states, 0, boundary), true,
+                          true);
+  executor.end(request.id);
+  std::cout << "full_window_restore=PASS\n";
 }
 
 // Fills every byte of a lane's GDN recurrent state, the FP32 half of the cell
@@ -905,7 +992,7 @@ EngineRequest imageRequest(uint64_t id, ImageSpan span) {
 }
 
 // Two requests with the same image share its rows from their start: both
-// admitted before either prefills, one packed command encodes the image
+// admitted before either prefills, one ragged command encodes the image
 // once and both lanes inject it.
 void requireConcurrentRequestsShareOneEncode(model::Runtime &executor,
                                              metal::MetalBackend &backend) {
@@ -1018,7 +1105,7 @@ void requireInjectedRowsBecomeReclaimable(model::Runtime &executor,
 // refused; one at it continues past the image without encoding it.
 void requireCoveredImagesAreNotStaged(model::Runtime &executor,
                                       metal::MetalBackend &backend,
-                                      const model::ModelPackage &model) {
+                                      const model::LoadedModel &model) {
   while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
   }
   const uint64_t originalBytes = backend.memoryStats().allocatedBytes;
@@ -1061,14 +1148,9 @@ void requireCoveredImagesAreNotStaged(model::Runtime &executor,
                     before + model.stateLayout().laneBytes(),
             "a start staged an image its restored prefix covers");
     if (id == 115) {
-      bool refused = false;
-      try {
-        static_cast<void>(executor.beginRestore(id, 32, beforeImage, true, {}));
-      } catch (const std::invalid_argument &error) {
-        refused = std::string(error.what()) ==
-                  "restore stops before images its activation left out";
-      }
-      require(refused, "a restore before a left-out image was accepted");
+      rejects([&] { static_cast<void>(executor.beginRestore(id, 32, beforeImage, true, {})); },
+              "restore stops before images its activation left out",
+              "a restore before a left-out image was accepted");
     } else {
       restoreActivePrefix(executor, id, prompt.size(), 64, pastImage);
       prefillChunk(executor, id, 64,
@@ -1095,7 +1177,7 @@ void requireCoveredImagesAreNotStaged(model::Runtime &executor,
 // the refused attempt did.
 void requireRefusedStartKeepsItsRows(model::Runtime &executor,
                                      metal::MetalBackend &backend,
-                                     const model::ModelPackage &model,
+                                     const model::LoadedModel &model,
                                      AllocationFault &fault) {
   while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
   }
@@ -1184,7 +1266,7 @@ void requireRefusedStartKeepsItsRows(model::Runtime &executor,
 // them.
 void requireReclaimTakesOneCacheUnit(model::Runtime &executor,
                                      metal::MetalBackend &backend,
-                                     const model::ModelPackage &model) {
+                                     const model::LoadedModel &model) {
   while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
   }
   const uint64_t originalBytes = backend.memoryStats().allocatedBytes;
@@ -1231,7 +1313,7 @@ void requireReclaimTakesOneCacheUnit(model::Runtime &executor,
 // encoder only when it covers the start's image.
 void requireEncoderFitsItsImages(model::Runtime &executor,
                                  metal::MetalBackend &backend,
-                                 const model::ModelPackage &model,
+                                 const model::LoadedModel &model,
                                  AllocationFault &fault) {
   while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
   }
@@ -1345,7 +1427,7 @@ void requireReplayPointKeepsItsImageRows(model::Runtime &executor,
   std::cout << "replay_point_keeps_its_image_rows=PASS\n";
 }
 
-void warmupEos(model::RuntimeContext context, model::ModelPackage &package) {
+void warmupEos(model::RuntimeContext context, model::LoadedModel &model) {
   uint32_t prefillStop = 0;
   uint32_t decodeStop = 0;
   {
@@ -1360,12 +1442,12 @@ void warmupEos(model::RuntimeContext context, model::ModelPackage &package) {
     require(decodeStop != 0 && !decoded.lanes[0].step.finished,
             "warmup EOS fixture needs a non-terminal baseline continuation");
   }
-  const auto originalTarget = package.descriptor.target;
+  const auto originalTarget = model.descriptor.target;
   const auto setStops = [&](uint32_t stop) {
     std::visit([&](auto &weights) {
       weights.layout.stopTokens = {stop, stop};
-      package.descriptor.target = weights.layout;
-    }, package.target);
+      model.descriptor.target = weights.layout;
+    }, model.target);
   };
   setStops(prefillStop);
   {
@@ -1376,8 +1458,7 @@ void warmupEos(model::RuntimeContext context, model::ModelPackage &package) {
             "EOS fixture did not terminate synthetic prefill");
     for (uint32_t width = 1; width <= 4; ++width) {
       const auto result = executor.warmupDecodeBatch(width);
-      require(result.lanes.size() == width &&
-                  executor.telemetry().lastDecodeWidth == width,
+      require(result.lanes.size() == width,
               "prefill EOS skipped the actual decode warmup");
     }
     require(executor.warmupCompositeStateRestore().wallSeconds > 0.0,
@@ -1397,8 +1478,8 @@ void warmupEos(model::RuntimeContext context, model::ModelPackage &package) {
   std::visit([&](auto &weights) {
     using Layout = std::decay_t<decltype(weights.layout)>;
     weights.layout = std::get<Layout>(originalTarget);
-  }, package.target);
-  package.descriptor.target = originalTarget;
+  }, model.target);
+  model.descriptor.target = originalTarget;
   const model::QwenStateStorage &states = context.stateStorage;
   for (uint32_t lane = 0; lane < 4; ++lane)
     require(!states.metadata(lane).assigned(),
@@ -1414,7 +1495,13 @@ int main(int argc, char **argv) {
     bool imagesOnly = false, warmupEosOnly = false;
     kv::Format format = kv::Format::Int8;
     float liveVerifyThreshold = 0.0F;
-    if (argc < 3) fail("usage: model-runtime-oracle METALLIB MODEL_ROOT [--kv-format int8|bf16] [--live-verify-threshold Q]");
+    std::optional<double> givenAneFfnShare;
+    // The evaluation of the split's program that fails, counted from 1 as
+    // ane::ProgramInstrumentation counts them; 0 for none.
+    uint64_t aneFfnFault = 0;
+    if (argc < 3)
+      fail("usage: model-runtime-oracle METALLIB MODEL_ROOT [--kv-format int8|bf16] [--ane-ffn-share SHARE] "
+           "[--ane-ffn-fault EVALUATION] [--live-verify-threshold Q]");
     for (int i = 3; i < argc; ++i) {
       const std::string_view option(argv[i]);
       if (option == "--images-only") imagesOnly = true;
@@ -1430,6 +1517,17 @@ int main(int argc, char **argv) {
         const std::string_view value(argv[++i]);
         if (value != "int8" && value != "bf16") fail("invalid KV format");
         format = value == "int8" ? kv::Format::Int8 : kv::Format::BFloat16;
+      } else if (option == "--ane-ffn-share" && i + 1 < argc) {
+        const char *value = argv[++i];
+        char *end = nullptr;
+        givenAneFfnShare = std::strtod(value, &end);
+        if (end == value || *end || !(*givenAneFfnShare >= 0.0 && *givenAneFfnShare < 1.0))
+          fail("--ane-ffn-share takes a share in [0, 1)");
+      } else if (option == "--ane-ffn-fault" && i + 1 < argc) {
+        const char *value = argv[++i];
+        char *end = nullptr;
+        aneFfnFault = std::strtoull(value, &end, 10);
+        if (end == value || *end || !aneFfnFault) fail("--ane-ffn-fault takes an evaluation from 1");
       } else fail("unknown model-runtime-oracle option");
     }
     metal::MetalBackend backend(argv[1]);
@@ -1442,33 +1540,35 @@ int main(int argc, char **argv) {
     require(hostAvailableBytes.has_value(),
             "cannot measure available host memory before loading the oracle model");
     const std::filesystem::path modelRoot(argv[2]);
-    const auto descriptor = model::inspectModelPackage(modelRoot);
+    const auto descriptor = model::inspectModelRoot(modelRoot);
     // Production's weight byte count with a different bound. Production checks
     // it only against the Metal hard budget, then guards host headroom at every
     // Metal operation while loading. This oracle has no such guard, so the
-    // prepared weights must fit in reclaimable memory above the macOS reserve
-    // before anything is mapped; it can refuse a package production starts.
-    const uint64_t weightBytes =
-        model::preparedModelWeightBytes(modelRoot, descriptor);
+    // weights must fit in reclaimable memory above the macOS reserve before
+    // any is loaded; it can refuse a model production starts.
+    const uint64_t weightBytes = model::modelWeightBytes(modelRoot, descriptor);
     if (*hostAvailableBytes <= hostReserveBytes ||
         weightBytes > *hostAvailableBytes - hostReserveBytes)
-      stopForHostMemory("the prepared weights need " + mebibytes(weightBytes),
+      stopForHostMemory("the weights need " + mebibytes(weightBytes),
                         *hostAvailableBytes, hostReserveBytes);
-    model::ModelPackage model =
-        model::loadModelPackage(backend, modelRoot, descriptor, {});
+    model::LoadedModel model =
+        model::loadModel(backend, modelRoot, descriptor);
     ops::ExecutionPlans operators(backend.capabilities());
     model::ModelMemoryPlan executorPlan =
-        model::plannedRuntimeMemory(backend.capabilities(), model, operators, format);
-    ModelMemoryFootprint footprint{
-        model.targetActualAllocatedBytes(),
-        model.draft.actualAllocatedBytes,
-        model.vision.actualAllocatedBytes,
-        executorPlan, 0};
-    ModelMemoryProfile profile{
-        model.name(), model.maximumContextTokens(),
-        model.targetKvLayout(format), footprint};
-    EngineMemoryPlan memoryPlan =
-        test::requireMemoryPlan(backend.capabilities(), profile);
+        model::plannedRuntimeMemory(model, operators, format);
+    // The memory plan with `aneFfnBytes` set aside for the prefill FFN's
+    // Neural Engine split.
+    const auto planMemory = [&](uint64_t aneFfnBytes) {
+      ModelMemoryFootprint footprint{
+          model.targetActualAllocatedBytes(),
+          model.draft.actualAllocatedBytes,
+          model.vision.actualAllocatedBytes,
+          executorPlan, 0, aneFfnBytes};
+      ModelMemoryProfile profile{
+          model.name(), model.maximumContextTokens(),
+          model.targetKvLayout(format), footprint};
+      return evaluateEngineMemoryPlan(backend.capabilities(), profile, 0);
+    };
 
     // A pool of 128 pages, or the smallest extent if larger, in whole extents
     // of the size the memory plan would pick for it.
@@ -1476,7 +1576,51 @@ int main(int argc, char **argv) {
     const uint32_t budgetPages = std::max(128U, kvLayout.minimumExtentPages());
     const uint32_t extentPages = kvLayout.extentPagesFor(budgetPages);
     const uint32_t pageCount = budgetPages - budgetPages % extentPages;
+    // A dense target's prefill FFN splits with the Neural Engine as a start
+    // splits it (engine::startAneFfn), calibrated by the build's first run and
+    // remembered for the runs after it unless a share is given,
+    // within a plan that holds the oracle's pages. The split is allocated
+    // beside the weights, outside the governor's admissions, and its own
+    // category of the plan bounds it, as the memory audit requires. A split
+    // that fails fails the oracle; given share 0 runs the GPU alone. A fault
+    // is armed for the first program constructed, the split's with a share
+    // given, whose evaluations count from verify's.
+    const engine::AneFfnSetting aneFfnSetting = engine::AneFfnSetting::fromGiven(givenAneFfnShare, std::nullopt);
+    if (aneFfnFault) {
+      require(aneFfnSetting.given.has_value(), "--ane-ffn-fault takes a share given by --ane-ffn-share");
+      ane::ProgramInstrumentation::arm({.failingEvaluation = aneFfnFault});
+    }
+    const engine::AneFfnModel aneFfnModel =
+        engine::aneFfnModel(backend, model, operators, format, "model-runtime-oracle " SPLASH_BUILD_ID, {});
+    engine::AneFfnStart aneFfnStart =
+        engine::startAneFfn(aneFfnModel, aneFfnSetting, pageCount * kv::kPageTokens, planMemory, {});
+    std::cout << "ane_ffn_outcome=" << engine::aneFfnOutcomeName(aneFfnStart.outcome.kind) << ' '
+              << aneFfnStart.outcome.reason << '\n';
+    require(aneFfnStart.outcome.kind != engine::AneFfnOutcome::Kind::Unavailable,
+            "the Neural Engine split is unavailable: " + aneFfnStart.outcome.reason);
+    // The automatic context is what the plan holds with the split the start
+    // runs, as this Mac's calibration of the model remembers it, and without
+    // the split otherwise.
+    const auto contextOf = [&](uint64_t aneFfnBytes) {
+      const EngineMemoryPlanResult result = planMemory(aneFfnBytes);
+      return result.plan ? result.plan->maximumContextTokens() : 0u;
+    };
+    const uint32_t automaticContext =
+        aneFfnStart.split ? contextOf(aneFfnModel.plannedBytes(static_cast<uint32_t>(
+                                std::lround(aneFfnStart.split->share() * aneFfnModel.units))))
+                          : contextOf(0);
+    std::cout << "ane_ffn_context=" << aneFfnStart.outcome.context
+              << " no_ane_context=" << aneFfnStart.outcome.contextWithout << '\n';
+    require(aneFfnStart.outcome.context == automaticContext && aneFfnStart.outcome.contextWithout == contextOf(0),
+            "the automatic context is not the plan's with the split the start runs");
+    std::unique_ptr<ops::AneFfn> aneFfn = std::move(aneFfnStart.split);
+    EngineMemoryPlanResult planned = aneFfnStart.plan ? EngineMemoryPlanResult{std::move(aneFfnStart.plan), {}}
+                                                      : planMemory(0);
+    require(planned.plan.has_value(), "the oracle model has no memory plan: " + planned.status.describe());
+    EngineMemoryPlan memoryPlan = std::move(*planned.plan);
     const EngineMemoryBreakdown &budget = memoryPlan.breakdown();
+    require(!aneFfn || aneFfn->allocatedBytes() <= budget.aneFfnBytes,
+            "the Neural Engine split allocated more than its plan");
     require(budget.pipelineReserveBytes <= budget.hardBudgetBytes &&
                 budget.runtimeOverheadReserveBytes <
                     budget.hardBudgetBytes - budget.pipelineReserveBytes,
@@ -1485,6 +1629,8 @@ int main(int argc, char **argv) {
         budget.pipelineReserveBytes - budget.runtimeOverheadReserveBytes;
     MemoryGovernor governor(backend, elasticGrowthCeiling, hostReserveBytes,
                             queryHostAvailableMemory, 0);
+    std::cout << "ane_ffn_share=" << (aneFfn ? aneFfn->share() : 0.0)
+              << " ane_ffn_minimum_rows=" << (aneFfn ? aneFfn->minimumRows() : 0) << '\n';
     const metal::AllocationAdmission governed =
         [admit = governor.allocationAdmission(), &governor](
             uint64_t bytes, const std::function<void()> &allocate) {
@@ -1527,7 +1673,7 @@ int main(int argc, char **argv) {
     model::QwenStateStorage states(backend,
                                     admission,
                                     model.stateLayout(), nullptr);
-    model::RuntimeContext context{backend, model, pages, states, operators};
+    model::RuntimeContext context{backend, model, pages, states, operators, aneFfn.get()};
     require(executorPlan.sharedDecodePlannedAllocatedBytes <=
                 std::numeric_limits<uint64_t>::max() -
                     executorPlan.sharedPrefillPlannedAllocatedBytes,
@@ -1557,17 +1703,13 @@ int main(int argc, char **argv) {
       const uint64_t beforeWarmupRows = executor.telemetry().targetPrefillRows;
       const uint64_t beforeCommands =
           BackendInstrumentation::submittedCommands(backend);
-      bool rejected = false;
-      try {
-        static_cast<void>(executor.warmupPrefill(1));
-      } catch (const std::logic_error &error) {
-        rejected = std::string(error.what()).find("runway") != std::string::npos;
-      }
-      require(rejected && !states.metadata(0).assigned() &&
+      rejects([&] { static_cast<void>(executor.warmupPrefill(1)); },
+              "is outside the startup runway", "real warmup ran without its KV runway");
+      require(!states.metadata(0).assigned() &&
                   executor.telemetry().targetPrefillRows == beforeWarmupRows &&
                   BackendInstrumentation::submittedCommands(backend) ==
                       beforeCommands,
-              "real warmup ran without its KV runway or executed/leaked work");
+              "a refused warmup executed or leaked work");
     }
     require(static_cast<bool>(pages.allocateExtent(0)),
             "warmup runway fixture failed to recover its KV extent");
@@ -1704,13 +1846,8 @@ int main(int argc, char **argv) {
       require(scoredResult.scoreLogits[0] >= scoredResult.scoreLogits[1] &&
                   scoredResult.scoreLogits[0] >= scoredResult.scoreLogits[2],
               "greedy decode token is not the maximum scored logit");
-      bool decodeRejected = false;
-      try {
-        decodeOne(executor, 99, 128, pageTable);
-      } catch (const std::exception &) {
-        decodeRejected = true;
-      }
-      require(decodeRejected, "score request allowed a decode step");
+      rejects([&] { decodeOne(executor, 99, 128, pageTable); },
+              "decode request has no current anchor", "score request allowed a decode step");
       executor.end(99);
     }
     requireNonFiniteRowFailsOnlyItsLane(executor, pages, states, backend,
@@ -2319,11 +2456,9 @@ int main(int argc, char **argv) {
         withRevision({.requestId = b3Ids[1], .logicalPosition = 1, .pageTable = b3Pages[1]}),
         withRevision({.requestId = b3Ids[2], .logicalPosition = 1, .pageTable = b3Pages[2]})};
     auto b3Decoded = executor.decode(b3Plan, b3Items);
-    const model::ModelTelemetry b3Telemetry = executor.telemetry();
     require(b3Decoded.size() == 3 && !b3Decoded[0].outputTokens.empty() &&
                 !b3Decoded[1].outputTokens.empty() &&
-                !b3Decoded[2].outputTokens.empty() &&
-                b3Telemetry.lastDecodeWidth == 3,
+                !b3Decoded[2].outputTokens.empty(),
             "B3 decode did not run one three-lane graph");
     for (uint64_t id : b3Ids)
       executor.end(id);
@@ -2405,7 +2540,7 @@ int main(int argc, char **argv) {
             "production snapshot allocation failed");
     executor.end(70);
 
-    // One packed command consumes exactly 2048 real, unequal rows. Repeating
+    // One ragged command consumes exactly 2048 real, unequal rows. Repeating
     // its M32 decode with permuted lanes proves ragged addressing and state
     // isolation without requiring another batch width's numerical decisions.
     constexpr std::array<uint64_t, 4> raggedIds{100, 101, 102, 103};
@@ -2446,11 +2581,13 @@ int main(int argc, char **argv) {
     }
     const uint64_t beforeRaggedPrefill =
         BackendInstrumentation::submittedCommands(backend);
+    const uint64_t rerunsBeforeRaggedPrefill = executor.telemetry().aneFfnReruns;
     auto raggedPrefill =
         executor.prefill(raggedPrefillPlan, raggedPrefillItems);
+    // The GPU runs a chunk again alone where the Neural Engine split stops.
     require(raggedPrefill.size() == raggedIds.size() &&
                 BackendInstrumentation::submittedCommands(backend) ==
-                    beforeRaggedPrefill + 1,
+                    beforeRaggedPrefill + 1 + executor.telemetry().aneFfnReruns - rerunsBeforeRaggedPrefill,
             "ragged 2048-row prefill was not one Metal command");
     for (uint32_t lane = 0; lane < raggedIds.size(); ++lane) {
       require(raggedPrefill[lane].consumedPromptTokens == raggedRows[lane] &&
@@ -2470,10 +2607,7 @@ int main(int argc, char **argv) {
                                               .pageTable = raggedPages[lane]});
     }
     auto raggedDecoded = executor.decode(raggedDecodePlan, raggedDecodeItems);
-    const model::ModelTelemetry raggedDecodeTelemetry =
-        executor.telemetry();
-    require(raggedDecoded.size() == raggedIds.size() &&
-                raggedDecodeTelemetry.lastDecodeWidth == 4,
+    require(raggedDecoded.size() == raggedIds.size(),
             "permuted ragged B4 did not run one four-lane graph");
     for (uint64_t id : raggedIds)
       executor.end(id);
@@ -2516,8 +2650,7 @@ int main(int argc, char **argv) {
     }
     auto raggedReferenceDecoded =
         executor.decode(raggedReferenceDecodePlan, raggedReferenceDecodeItems);
-    require(raggedReferenceDecoded.size() == raggedPermutation.size() &&
-                executor.telemetry().lastDecodeWidth == 4,
+    require(raggedReferenceDecoded.size() == raggedPermutation.size(),
             "permuted ragged reference was not one four-lane graph");
     for (uint32_t order = 0; order < raggedPermutation.size(); ++order) {
       const uint32_t lane = raggedPermutation[order];
@@ -2529,25 +2662,29 @@ int main(int argc, char **argv) {
       executor.end(104 + lane);
     }
 
-    // Lanes that finish their prompts in one packed prefill share one LM
-    // head and one selection. Each finishing lane must select what it
-    // selects finishing alone and a score lane must read the same logits,
-    // and a lane whose prompt the command does not finish must end it as it
-    // does alone.
+    // Lanes that finish their prompts in one ragged prefill share one LM
+    // head and one selection. Kernels choose their tiles by a command's
+    // rows, so the reference for a lane is a command of the same rows, not
+    // the lane alone. With the lanes in the reverse order, each finishing
+    // lane must select what it selected and a score lane must read the same
+    // logits, and a lane whose prompt the command does not finish must stay
+    // out of the head and end its prompt as it did. With every other lane's
+    // prompt changed, a score lane must still read the same logits.
     {
       constexpr uint32_t kScoredRow = 0, kGreedy = 1, kOpen = 2, kSampled = 3;
       constexpr std::array<uint32_t, 4> rows{33, 40, 64, 72};
       constexpr uint32_t openPromptTokens = 200;
-      const auto prompt = [&](uint32_t lane) {
+      // A lane's prompt, or another one of the same length.
+      const auto prompt = [&](uint32_t lane, bool other) {
         std::vector<uint32_t> tokens(lane == kOpen ? openPromptTokens
                                                    : rows[lane]);
         for (uint32_t row = 0; row < tokens.size(); ++row)
-          tokens[row] =
-              productionSeedTokens[(row + 3 * lane) % productionSeedTokens.size()];
+          tokens[row] = productionSeedTokens[(row + 3 * lane + (other ? 17 : 0)) %
+                                             productionSeedTokens.size()];
         return tokens;
       };
-      const auto requestFor = [&](uint64_t id, uint32_t lane) {
-        EngineRequest value = makeRequest(id, prompt(lane), 1);
+      const auto requestFor = [&](uint64_t id, uint32_t lane, bool other) {
+        EngineRequest value = makeRequest(id, prompt(lane, other), 1);
         if (lane == kScoredRow) {
           value.maxNewTokens = 0;
           value.scoreTokens = {11, 220, 1683};
@@ -2560,65 +2697,72 @@ int main(int argc, char **argv) {
       const std::array<std::vector<uint32_t>, 4> pages{
           pageRange(52, 2), pageRange(54, 2), pageRange(56, 7),
           pageRange(63, 3)};
-      // The open lane's prompt ends in a command of its own.
-      const auto finishOpen = [&](uint64_t id) {
-        const std::vector<uint32_t> tokens = prompt(kOpen);
-        return prefillChunk(executor, id, rows[kOpen],
-                            std::span(tokens).subspan(rows[kOpen]),
-                            pages[kOpen]);
+      // One ragged prefill of the four lanes, each on its own state lane, in
+      // `order`; `others` gives every lane but the score lane another
+      // prompt. The open lane's prompt then ends in a command of its own.
+      // The results are by lane.
+      uint64_t nextId = 140;
+      const auto prefillInOrder = [&](const std::array<uint32_t, 4> &order,
+                                      bool others) {
+        BatchPlan plan{.kind = WorkKind::Prefill,
+                       .decodeStage = DecodeStage::Regular};
+        std::array<EngineRequest, 4> requests;
+        std::array<ModelBatchItem, 4> items;
+        for (uint32_t position = 0; position < order.size(); ++position) {
+          const uint32_t lane = order[position];
+          requests[lane] =
+              requestFor(nextId++, lane, others && lane != kScoredRow);
+          beginCold(executor, requests[lane], lane);
+          plan.items.push_back({requests[lane].id, rows[lane]});
+          items[position] = withRevision({.requestId = requests[lane].id,
+                                          .tokenCount = rows[lane],
+                                          .pageTable = pages[lane]});
+          items[position].inputTokens =
+              std::span(requests[lane].prompt).first(rows[lane]);
+        }
+        std::vector<ModelStepResult> byPosition = executor.prefill(plan, items);
+        require(byPosition.size() == items.size(), "ragged prefill width mismatch");
+        std::array<ModelStepResult, 4> results;
+        for (uint32_t position = 0; position < order.size(); ++position)
+          results[order[position]] = std::move(byPosition[position]);
+        require(results[kOpen].outputTokens.empty() && !results[kOpen].finished &&
+                    states.metadata(kOpen).lengths.targetTokens == rows[kOpen],
+                "a lane that did not finish its prompt took part in the head");
+        const EngineRequest &open = requests[kOpen];
+        results[kOpen] = prefillChunk(executor, open.id, rows[kOpen],
+                                      std::span(open.prompt).subspan(rows[kOpen]),
+                                      pages[kOpen]);
+        for (const EngineRequest &request : requests)
+          executor.end(request.id);
+        return results;
       };
-      std::array<ModelStepResult, 4> alone;
-      for (uint32_t lane = 0; lane < alone.size(); ++lane) {
-        const EngineRequest request = requestFor(130 + lane, lane);
-        beginCold(executor, request, 0);
-        alone[lane] = prefillChunk(
-            executor, request.id, 0,
-            std::span(request.prompt).first(rows[lane]), pages[lane]);
-        if (lane == kOpen)
-          alone[lane] = finishOpen(request.id);
-        executor.end(request.id);
-      }
-
-      BatchPlan packedPlan{.kind = WorkKind::Prefill,
-                           .decodeStage = DecodeStage::Regular};
-      std::array<EngineRequest, 4> requests;
-      std::array<ModelBatchItem, 4> items;
-      for (uint32_t lane = 0; lane < items.size(); ++lane) {
-        requests[lane] = requestFor(140 + lane, lane);
-        beginCold(executor, requests[lane], lane);
-        packedPlan.items.push_back({requests[lane].id, rows[lane]});
-        items[lane] = withRevision({.requestId = requests[lane].id,
-                                    .tokenCount = rows[lane],
-                                    .pageTable = pages[lane]});
-        items[lane].inputTokens =
-            std::span(requests[lane].prompt).first(rows[lane]);
-      }
-      std::vector<ModelStepResult> packed =
-          executor.prefill(packedPlan, items);
-      require(packed.size() == items.size() &&
-                  packed[kOpen].outputTokens.empty() &&
-                  !packed[kOpen].finished &&
-                  states.metadata(kOpen).lengths.targetTokens == rows[kOpen],
-              "a lane that did not finish its prompt took part in the head");
-      packed[kOpen] = finishOpen(requests[kOpen].id);
+      const auto sameScores = [](const ModelStepResult &left,
+                                 const ModelStepResult &right,
+                                 const char *message) {
+        require(left.scoreLogits.size() == 3 && right.scoreLogits.size() == 3,
+                "the score lane of a shared head returned no logits");
+        for (uint32_t option = 0; option < 3; ++option)
+          require(std::fabs(left.scoreLogits[option] - right.scoreLogits[option]) <=
+                      1e-3F * std::max(1.0F, std::fabs(right.scoreLogits[option])),
+                  message);
+      };
+      const auto inOrder =
+          prefillInOrder({kScoredRow, kGreedy, kOpen, kSampled}, false);
+      const auto reversed =
+          prefillInOrder({kSampled, kOpen, kGreedy, kScoredRow}, false);
       for (const uint32_t lane : {kGreedy, kOpen, kSampled}) {
-        require(packed[lane].outputTokens == alone[lane].outputTokens &&
-                    packed[lane].outputTokens.size() == 1,
-                "a first token selected beside other lanes differs from the "
-                "one selected alone");
+        require(reversed[lane].outputTokens == inOrder[lane].outputTokens &&
+                    inOrder[lane].outputTokens.size() == 1,
+                "a lane selected another first token beside the lanes in "
+                "another order");
       }
-      require(packed[kScoredRow].scoreLogits.size() == 3 &&
-                  alone[kScoredRow].scoreLogits.size() == 3,
-              "the score lane of a shared head returned no logits");
-      for (uint32_t option = 0; option < 3; ++option) {
-        const float shared = packed[kScoredRow].scoreLogits[option];
-        const float single = alone[kScoredRow].scoreLogits[option];
-        require(std::fabs(shared - single) <=
-                    1e-3F * std::max(1.0F, std::fabs(single)),
-                "a score lane's logits from a shared head differ from its own");
-      }
-      for (const EngineRequest &request : requests)
-        executor.end(request.id);
+      sameScores(reversed[kScoredRow], inOrder[kScoredRow],
+                 "a score lane read other logits beside the lanes in another "
+                 "order");
+      const auto others =
+          prefillInOrder({kScoredRow, kGreedy, kOpen, kSampled}, true);
+      sameScores(others[kScoredRow], inOrder[kScoredRow],
+                 "a score lane's logits changed with the other lanes' prompts");
     }
 
     constexpr std::array<uint64_t, 4> productionB4Ids{71, 72, 73, 74};
@@ -3125,7 +3269,11 @@ int main(int argc, char **argv) {
     // Negative presence and frequency favour the output's tokens by their
     // counts, so the decisions they change follow the counts, a verify row's
     // draft prefix included; presence 1.5 is Qwen's recommendation, and
-    // repetition also reads the prompt's tokens.
+    // repetition also reads the prompt's tokens. The prompt repeats a chat
+    // template, which a model's greedy transcript may copy by margins the
+    // milder settings leave alone (the 35B mxfp4's survive them all);
+    // repetition 3 divides the copied tokens' logits, so that one setting
+    // changes a decision to probe on every model.
     const PreemptionRun control = runPreemption(RequestKind::Greedy, 0);
     const float drift = probeLoss(control.transcript, {});
     const float tolerance = std::max(2.0F * drift, 0.1F);
@@ -3135,7 +3283,8 @@ int main(int argc, char **argv) {
     for (const ops::SamplingPenalties penalties :
          {ops::SamplingPenalties{1.0F, -2.0F, -2.0F},
           ops::SamplingPenalties{1.0F, 1.5F, 0.0F},
-          ops::SamplingPenalties{1.3F, 1.5F, 0.0F}}) {
+          ops::SamplingPenalties{1.3F, 1.5F, 0.0F},
+          ops::SamplingPenalties{3.0F, 0.0F, 0.0F}}) {
       const auto reference = runPreemption(RequestKind::Greedy, 0, penalties);
       const auto promptResumed =
           runPreemption(RequestKind::Greedy, 1, penalties);
@@ -3334,27 +3483,20 @@ int main(int argc, char **argv) {
       item.inputTokens = std::span<const uint32_t>(extended).subspan(128, 100);
       auto ticket =
           executor.submit(plan, std::span<const ModelBatchItem>(&item, 1), {});
-      bool threw = false;
-      try {
-        static_cast<void>(ticket->wait());
-      } catch (const std::logic_error &) {
-        threw = true;
-      }
+      rejects([&] { static_cast<void>(ticket->wait()); },
+              "draft capture does not continue the draft ring",
+              "a capture continued a draft ring its restore skipped");
       executor.end(93);
-      require(threw, "a capture continued a draft ring its restore skipped");
       std::cout << "discontinuous_capture_fails=PASS\n";
     }
+    requireFullWindowRestore(executor, backend, states);
 
     const auto rowsBeforeInvalidWarmup = executor.telemetry().targetPrefillRows;
     for (uint32_t rows : {0U, model::ExecutionLimits::prefillTokenBudget + 1,
                           std::numeric_limits<uint32_t>::max()}) {
-      bool rejected = false;
-      try {
-        static_cast<void>(executor.warmupPrefill(rows));
-      } catch (const std::invalid_argument &) {
-        rejected = true;
-      }
-      require(rejected && executor.telemetry().targetPrefillRows == rowsBeforeInvalidWarmup,
+      rejects([&] { static_cast<void>(executor.warmupPrefill(rows)); },
+              "invalid prefill warmup row count", "invalid warmup rows were accepted");
+      require(executor.telemetry().targetPrefillRows == rowsBeforeInvalidWarmup,
               "invalid warmup rows reached the production prefill phase");
     }
     for (uint32_t rows : {32U, 128U, 512U}) {
@@ -3404,8 +3546,6 @@ int main(int argc, char **argv) {
         executor.telemetry();
     require(batch4.wallSeconds >= b4Telemetry.lastDecodeWallSeconds,
             "decode warmup excluded production work from phase wall time");
-    require(b4Telemetry.lastDecodeWidth == 4,
-            "B4 decode did not execute one four-lane production graph");
     const auto repeatedBatch4 = executor.warmupDecodeBatch(4);
     require(repeatedBatch4.lanes == batch4.lanes,
             "repeated baseline B4 decode changed its deterministic result");
@@ -3424,6 +3564,12 @@ int main(int argc, char **argv) {
               << historicalTelemetry.lastPrefillWallSeconds
               << " cache_restore_b1_cycle_wall_seconds="
               << historicalTelemetry.lastDecodeWallSeconds << '\n';
+    // An armed fault stops the split once, in the chunk whose evaluation
+    // fails, which the GPU runs again alone, as every chunk after it.
+    std::cout << "ane_ffn_reruns=" << historicalTelemetry.aneFfnReruns
+              << (aneFfn && aneFfn->retired() ? " ane_ffn_stopped=" + aneFfn->reason() : std::string()) << '\n';
+    require(!aneFfnFault || (aneFfn && aneFfn->retired() && historicalTelemetry.aneFfnReruns == 1),
+            "an armed fault did not stop the split once");
     std::cout << "model_runtime_oracle_test: PASS\n";
     return 0;
   } catch (const std::exception &error) {

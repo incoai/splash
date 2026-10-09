@@ -7,6 +7,10 @@
 #include <stdint.h>
 #endif
 
+// The epsilon of the vision tower's LayerNorms, which a vision GGUF must
+// state; unsuffixed, as SPLASH_RMS_EPSILON.
+#define SPLASH_VISION_NORM_EPSILON 1e-6
+
 struct VisionGemmParams {
   uint32_t output_size;
   uint32_t input_size;
@@ -46,13 +50,3 @@ struct VisionAttentionParams {
 
 static_assert(sizeof(VisionAttentionParams) == 12,
               "Vision attention parameters are 12 bytes on both sides");
-
-struct VisionInjectParams {
-  uint32_t source_row;
-  uint32_t destination_row;
-  uint32_t rows;
-  uint32_t width;
-};
-
-static_assert(sizeof(VisionInjectParams) == 16,
-              "Vision injection parameters are 16 bytes on both sides");

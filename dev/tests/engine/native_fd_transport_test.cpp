@@ -1,8 +1,9 @@
 #include "ProtocolPeer.hpp"
-#include "ScopedTestConfig.hpp"
 #include "TestChecks.hpp"
-#include "TestImmediateTicket.hpp"
+#include "TestEngine.hpp"
+#include "TestExecutor.hpp"
 #include "TestKvPool.hpp"
+#include "TestKvTier.hpp"
 #include "TestStatus.hpp"
 #include "engine/Cache.hpp"
 #include "engine/FdTransport.hpp"
@@ -34,70 +35,6 @@ using namespace splash::engine;
 
 namespace {
 
-class Executor final : public model::Model {
-public:
-  // Unless admit is set, no request gets a lane: one waits for it until its
-  // deadline. An admitted request takes lane 0, and each of its commands
-  // stays in flight until the test sets ticketReady and calls
-  // heldCompletion, as Metal's completion handler would.
-  bool admit = false;
-  std::shared_ptr<std::atomic<bool>> ticketReady =
-      std::make_shared<std::atomic<bool>>(false);
-  std::function<void()> heldCompletion;
-  std::function<void()> onSubmit;
-
-  StateAdmission begin(const ModelRequest &request) override {
-    if (!admit)
-      return {{}, StateFailure::ConcurrencyLimit};
-    promptTokens_ = request.prompt.size();
-    return {0, StateFailure::None};
-  }
-  void suspend(uint64_t) override {}
-  StateAdmission resume(const ModelRequest &) override {
-    return {0, StateFailure::None};
-  }
-  std::unique_ptr<StateRestore> beginRestore(uint64_t, uint32_t,
-                                             std::shared_ptr<const CompositeState>, bool,
-                                             std::function<void()>) override {
-    return {};
-  }
-  void setDraftContextPlan(uint64_t, DraftContextPlan) override {}
-  // Prefill consumes its rows; the final chunk selects token 42, which ends
-  // the request.
-  std::unique_ptr<ModelBatchTicket>
-  submit(const BatchPlan &, std::span<const ModelBatchItem> items,
-         std::function<void()> completion) override {
-    std::vector<ModelStepResult> results;
-    for (const ModelBatchItem &item : items) {
-      ModelStepResult step{item.requestId, item.tokenCount, {}};
-      if (item.logicalPosition + item.tokenCount == promptTokens_) {
-        step.outputTokens = {42};
-        step.outputTokensWithoutKv = 1;
-        step.finished = true;
-      }
-      results.push_back(std::move(step));
-    }
-    heldCompletion = std::move(completion);
-    if (onSubmit)
-      onSubmit();
-    return std::make_unique<test::HeldTicket>(std::move(results), ticketReady,
-                                              0.0);
-  }
-  uint64_t snapshotBytes() const noexcept override { return 64; }
-  std::shared_ptr<const CompositeState> snapshot(uint64_t) override {
-    return {};
-  }
-  uint64_t reclaimIdleState(bool, model::IdleMemory) noexcept override { return 0; }
-  std::optional<std::string> provideMask(uint64_t,
-                                         std::span<const uint32_t>) override {
-    return std::nullopt;
-  }
-  void end(uint64_t) override {}
-
-private:
-  uint64_t promptTokens_ = 0;
-};
-
 struct Pipes final {
   std::array<int, 2> input{};
   std::array<int, 2> output{};
@@ -120,6 +57,7 @@ struct Pipes final {
   }
 };
 
+using splash::test::rejects;
 using splash::test::require;
 
 // For a failure that leaves a thread blocked: unwinding would wait for it.
@@ -131,21 +69,57 @@ using splash::test::require;
 struct Harness final {
   explicit Harness(size_t inputQueueBytes = engine::FdTransport::kInputQueueBytes,
                    int inputFd = -1)
-      : seam({.transportInputQueueBytes = inputQueueBytes}),
-        transport(inputFd < 0 ? pipes.input[0] : inputFd, pipes.output[1]) {
+      : transport(inputFd < 0 ? pipes.input[0] : inputFd, pipes.output[1],
+                  inputQueueBytes) {
     storage.commandInFlight = [this] { return loop.commandInFlight(); };
   }
   Pipes pipes;
   test::TestKvStorage storage{8, 4096, 1};
   KvPool pool{storage, 8};
   engine::Cache resources{pool, nullptr, nullptr};
-  Executor executor;
-  test::ScopedTestConfig seam;
+  // No request gets a lane: one waits for it until its deadline.
+  test::Executor executor{0};
   engine::FdTransport transport;
   // What the loop answers a status request with.
   std::function<std::string()> status = test::readyStatusJson;
-  engine::NativeRuntime loop{{}, resources, executor, transport.outputSink(),
-                             [this] { return status(); }, protocol::ProtocolLimits{}};
+  RuntimeMetrics metrics;
+  test::Weights weights;
+  engine::NativeRuntime loop{
+      {.engine = test::engineConfig(),
+       .metrics = &metrics,
+       .weights = &weights,
+       .weightAdmission = test::admitAll},
+      metal::kResidencyKeepAliveSeconds, resources, executor, transport.outputSink(),
+      [this] { return status(); }, protocol::ProtocolLimits{}};
+};
+
+// A loop over a persistent tier, with room for a 2060-token prompt, that
+// admits requests, publishes their states and runs each command at once; a
+// request ends with the token its prompt's last step selects. The tier's
+// copies land only when the test says so.
+struct PersistentHarness final {
+  PersistentHarness() {
+    storage.commandInFlight = [this] { return loop.commandInFlight(); };
+    tier.transferLimit = 64;
+    tier.capacity = 128;
+    executor.prefillAnchor = true;
+  }
+  Pipes pipes;
+  test::TestKvStorage storage{72, 4096, 4};
+  KvPool pool{storage, 0};
+  test::TestKvTier tier{true};
+  engine::Cache resources{pool, &tier, nullptr};
+  test::Executor executor;
+  engine::FdTransport transport{pipes.input[0], pipes.output[1]};
+  RuntimeMetrics metrics;
+  test::Weights weights;
+  engine::NativeRuntime loop{
+      {.engine = test::engineConfig(),
+       .metrics = &metrics,
+       .weights = &weights,
+       .weightAdmission = test::admitAll},
+      metal::kResidencyKeepAliveSeconds, resources, executor, transport.outputSink(),
+      test::readyStatusJson, protocol::ProtocolLimits{}};
 };
 
 // A request for three prompt tokens and one output token: its wall-clock
@@ -297,9 +271,14 @@ void testShutdownRequestAndControlContinuation() {
 // only once the loop has consumed the command.
 void testControlWaitsForTheCommandInFlight() {
   Harness harness;
+  // The request takes the one lane and ends with the token its prefill
+  // selects; the prefill stays in flight until the test completes it, as
+  // Metal's completion handler would.
+  harness.executor.maximumLanes = 1;
+  harness.executor.prefillAnchor = true;
+  const auto commandReady = harness.executor.holdCommands();
   std::promise<void> submitted;
-  harness.executor.admit = true;
-  harness.executor.onSubmit = [&submitted] { submitted.set_value(); };
+  harness.executor.submitObserver = [&submitted] { submitted.set_value(); };
   std::atomic<int> passes{0};
   std::atomic<bool> passedInFlight{false};
   harness.transport.setControlHandler([&harness, &passes, &passedInFlight] {
@@ -319,7 +298,7 @@ void testControlWaitsForTheCommandInFlight() {
   harness.transport.controlNotifier()();
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
   const int passesInFlight = passes;
-  *harness.executor.ticketReady = true;
+  *commandReady = true;
   harness.executor.heldCompletion();
   require(finish(loop) == engine::NativeProcessExit::CleanEof,
           "the control pass after the command did not end the loop cleanly");
@@ -361,11 +340,18 @@ void testLoopWakesForAnEngineDeadline() {
   test::TestKvStorage storage{8, 4096, 1};
   KvPool pool{storage, 8};
   engine::Cache resources{pool, nullptr, nullptr};
-  Executor executor;
+  // No request gets a lane.
+  test::Executor executor{0};
   engine::FdTransport transport{pipes.input[0], pipes.output[1]};
   std::vector<protocol::ErrorEvent> errors;
+  RuntimeMetrics metrics;
+  test::Weights weights;
   engine::NativeRuntime loop{
-      {}, resources, executor,
+      {.engine = test::engineConfig(),
+       .metrics = &metrics,
+       .weights = &weights,
+       .weightAdmission = test::admitAll},
+      metal::kResidencyKeepAliveSeconds, resources, executor,
       [&](std::span<const uint8_t> bytes) {
         for (const auto &event : protocol::peer::decodeEvents(bytes)) {
           if (const auto *error = std::get_if<protocol::ErrorEvent>(&event)) {
@@ -615,6 +601,13 @@ void testShutdownInterruptsABlockedOutputWrite() {
           "an interrupted output write did not fail the engine");
 }
 
+// A reader that may queue no input would never hand the loop a frame.
+void testTransportNeedsRoomForInput() {
+  Pipes pipes;
+  rejects([&] { engine::FdTransport transport(pipes.input[0], pipes.output[1], 0); },
+          "room for input", "a transport with no room for input was built");
+}
+
 void testCleanEofAndProtocolFailure() {
   require(run({}) == engine::NativeProcessExit::CleanEof,
           "empty clean input did not return clean EOF");
@@ -623,10 +616,35 @@ void testCleanEofAndProtocolFailure() {
           "malformed input did not return protocol failure");
 }
 
+// A clean stop's flush ends at once with no restore point waiting, and
+// stops at its deadline while the writes it started have not landed.
+void testFlushEndsOrStopsAtItsDeadline() {
+  using namespace std::chrono_literals;
+  {
+    Harness harness;
+    require(harness.transport.runFlush(harness.loop, 0ms),
+            "a flush with nothing waiting did not end");
+  }
+  PersistentHarness harness;
+  harness.loop.announceReady();
+  protocol::RequestFrame frame = requestFrame(1, 30'000'000);
+  frame.promptTokens.assign(2060, 7);
+  require(harness.loop.receive(protocol::peer::serialize(frame)), "the request was refused");
+  for (uint32_t step = 0; step < 16 && !harness.loop.snapshot().writeBehind.waiting; ++step)
+    static_cast<void>(harness.loop.tick());
+  require(harness.loop.snapshot().writeBehind.waiting == 1,
+          "the replay point did not wait to be written");
+  const auto started = std::chrono::steady_clock::now();
+  require(!harness.transport.runFlush(harness.loop, 50ms) &&
+              std::chrono::steady_clock::now() - started >= 50ms && harness.tier.demotions == 16,
+          "a flush whose writes never land did not stop at its deadline");
+}
+
 } // namespace
 
 int main() {
   try {
+    testTransportNeedsRoomForInput();
     testCleanEofAndProtocolFailure();
     testShutdownRequestAndControlContinuation();
     testControlWaitsForTheCommandInFlight();
@@ -637,6 +655,7 @@ int main() {
     testShutdownJoinsTheReader();
     testInputEndsAfterItsBytes();
     testShutdownInterruptsABlockedOutputWrite();
+    testFlushEndsOrStopsAtItsDeadline();
     std::cout << "native fd transport tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

@@ -33,24 +33,10 @@
       "target/embedding.bin": "86a749f41cab45849eb9a2753025779ef1c58e74842b65290534eff4e29403e9"
     }
   },
-  "affine_images": {
-    "dense": {
-      "target/layer-0.bin": "475768a2f36a25870f844e3c99d5cd1b85c00c8c3569f3f0abc3a1bffc14fd0b",
-      "target/layer-1.bin": "228844988bdd3ecf8cd32395b2a1fd3820f4bd7f91c68683f5b633e1c1919d1f",
-      "target/head.bin": "3dde9dffefd58b1b0bb06e445b4347eb2cf5412b203f1b2f6ebe00d681dc1c8f",
-      "target/embedding.bin": "5bfea1223081c0b006d617ee0fc044517937a4cd9fe9503421537e8d8c459211"
-    },
-    "moe": {
-      "target/layer-0.bin": "5b9926e5cbd89f8c772ed8308abc1e4dae140a67e2c44cddbd4ce8e688dcda61",
-      "target/layer-1.bin": "76e65f55a4b9ed13103583bd44da12fe2dc4258584b82a7df3f0f7cb0aebae69",
-      "target/head.bin": "25556e9c9b5c9629e2707cd4f90f82008a722cf82a64ec0dc97665ae242aefc6",
-      "target/embedding.bin": "3623464c3b923b290f556b1a66612f9012c0e249d3d49982b13300003dd81edf"
-    },
-    "draft": {
-      "draft/layer-0.bin": "283c85c3c12a1777fc05ef1306a45fc3a180963f8477191d49abf09d0a1afb00",
-      "draft/layer-1.bin": "5b5b0e09cba0218be18586751d4412ef689db465c1ac3976011365ff575c4d14",
-      "draft/model.bin": "377d2766849aa742ad6a1027f9779ec5553b1c5a336a333b309207f26e94f901"
-    }
+  "draft_images": {
+    "draft/layer-0.bin": "9f700c359015aa3ff675724ac96e27d387bd315fab822d330687d6efca08a4c9",
+    "draft/layer-1.bin": "2f5f7b1507c362cb8e8b4ec7eb2b66459ada7c01e18b4140abc7420deafbf921",
+    "draft/model.bin": "50532cd62688df5ca2fe846956ec11fa291eb49ecb1690a47a55b34e79a6fcd3"
   },
   "vision_image": "f1a165335c42384479f73d83e69146cfa46d4964d66ed13c663b158fed08cdd5"
 }

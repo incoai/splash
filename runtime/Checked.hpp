@@ -45,8 +45,7 @@ template <class Error = std::overflow_error>
   return result;
 }
 
-// The Apple Silicon VM page: mapped weight files, arenas, state cells and
-// slot files align to it.
+// The Apple Silicon VM page: arenas, state cells and slot files align to it.
 inline constexpr uint64_t kHostPageBytes = 16 * 1024;
 
 // bytes rounded up to a whole number of host pages.

@@ -2,6 +2,7 @@
 
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/ExecutionGeometry.h"
+#include "metal/abi/MoE.h"
 #include "metal/abi/QuantFormat.h"
 #include "ops/Linear.hpp"
 
@@ -18,16 +19,12 @@ struct MoeShape final {
   uint32_t experts = 0;
   uint32_t expertsPerToken = 0;
   uint32_t expertIntermediateSize = 0;
-  // How the weights are stored: affine Q4/Q8 slabs, or the tensors of a GGUF
-  // (BlockMoeWeights), which run their own router and expert kernels.
-  WeightLayout weightLayout = WeightLayout::Affine64;
-  // A GGUF's format of most routed expert weights, which picks the expert
-  // tile on Apple9 (moeGgufTile); GGUF_FMT_COUNT for affine weights.
+  // The format of most routed expert weights, which picks the expert tile on
+  // Apple9 (moeGgufTile).
   uint32_t expertFormat = GGUF_FMT_COUNT;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
-    return (weightLayout == WeightLayout::Affine64 || weightLayout == WeightLayout::Block32) &&
-           hiddenSize && hiddenSize % 256 == 0 && experts && experts <= 256 &&
+    return hiddenSize && hiddenSize % 256 == 0 && experts && experts <= SPLASH_MOE_EXPERT_SLOTS &&
            expertsPerToken && expertsPerToken <= experts &&
            expertIntermediateSize && expertIntermediateSize % 256 == 0;
   }
@@ -47,9 +44,10 @@ struct BlockExpertProjection final {
   QuantizedSegment shared;
 };
 
-// The sparse MoE block of a GGUF target. The router and the shared expert's
-// scalar gate are float tensors llama.cpp keeps unquantized, and they run in
-// fp32.
+// The weights of one sparse MoE block, which the loaded model owns. The
+// router and the shared expert's scalar gate are float tensors (llama.cpp
+// keeps a GGUF's unquantized; an MLX target's load as their F32 values), and
+// they run in fp32.
 struct BlockMoeWeights final {
   QuantizedSegment router;           // [experts][hidden]
   QuantizedSegment sharedScalarGate; // [1][hidden]
@@ -58,47 +56,11 @@ struct BlockMoeWeights final {
   BlockExpertProjection down;
 };
 
-// The affine weights of a sparse MoE block: Q8 router and shared-expert
-// scalar gate, and Q4 expert slabs. The shared expert is a one-expert slab.
-struct AffineMoeWeights final {
-  Q8Projection router;
-  ExpertProjection expertGate;
-  ExpertProjection expertUp;
-  ExpertProjection expertDown;
-  ExpertProjection sharedGate;
-  ExpertProjection sharedUp;
-  ExpertProjection sharedDown;
-  Q8Projection sharedScalarGate;
-};
-
-// All weights for one sparse MoE block. The model package owns the buffers;
-// this value only exposes semantic projections to the operator.
-using MoeWeights = LayoutWeights<AffineMoeWeights, BlockMoeWeights>;
-
-// Router score tiles: 8 x 32 for short chunks, 32 x 128 for longer chunks.
-// The measured Apple10 crossover is about 26 rows per GPU core; an unknown
-// core count plans for ops::kAssumedGpuCores (Linear.hpp). Both tiles
-// preserve scores.
-struct MoeRouteTile final {
-  uint32_t rows;
-  uint32_t experts;
-};
-inline constexpr uint32_t kMoeRouteRowsPerCore = 26;
-
-[[nodiscard]] constexpr uint32_t moeRouteWideRows(uint32_t plannedCores) noexcept {
-  return plannedCores * kMoeRouteRowsPerCore;
-}
-
-[[nodiscard]] constexpr MoeRouteTile
-moeRouteTile(uint32_t rows, uint32_t wideRows) noexcept {
-  return rows >= wideRows ? MoeRouteTile{32, 128} : MoeRouteTile{8, 32};
-}
-
 // Grouped-row scratch. Routes are sorted by expert into tiles of tileRows
 // rows; every routed expert may leave one partially filled tile and no tile
-// is empty, and the shared expert fills one tile per tileRows rows. A split
-// prefill plan also parks the gate projection in expertOutput before the
-// down pass overwrites it, so that field spans the wider of the two widths.
+// is empty, and the shared expert fills one tile per tileRows rows. The gate
+// pass parks its output in expertOutput before the down pass overwrites it,
+// so that field spans the wider of the two widths.
 [[nodiscard]] constexpr uint32_t moeMaximumTiles(uint32_t rows, MoeShape shape,
                                                  uint32_t tileRows) noexcept {
   const uint32_t routed = rows * shape.expertsPerToken;
@@ -126,10 +88,11 @@ struct MoeScratch final {
   // rows * routesPerToken() routes: expert ids and fp32 routing weights.
   metal::MetalBuffer selectedExperts;
   metal::MetalBuffer routingWeights;
-  // Sized by moeMaximumTiles(): tile descriptors, one tile count, the route
-  // at each grouped row, each route's grouped row, and the grouped rows'
-  // inputs, intermediates and outputs. The router parks its fp32 scores in
-  // groupedInput until the gather claims it.
+  // Sized by moeMaximumTiles(): tile descriptors, the tile count with the
+  // expert passes' grids (MoeTileCount), the route at each grouped row,
+  // each route's grouped row, and the grouped rows' inputs, intermediates and
+  // outputs. The router parks its fp32 scores in groupedInput until the
+  // gather claims it.
   metal::MetalBuffer tileDescriptors;
   metal::MetalBuffer tileCount;
   metal::MetalBuffer groupedRoutes;
@@ -145,18 +108,19 @@ struct MoeScratch final {
 struct MoeScratchField final {
   metal::MetalBuffer MoeScratch::*buffer;
   uint64_t MoeWorkspace::*bytes;
+  const char *name;
 };
 inline constexpr std::array<MoeScratchField, 10> kMoeScratchFields{{
-    {&MoeScratch::selectedExperts, &MoeWorkspace::selectedExpertsBytes},
-    {&MoeScratch::routingWeights, &MoeWorkspace::routingWeightsBytes},
-    {&MoeScratch::tileDescriptors, &MoeWorkspace::tileDescriptorsBytes},
-    {&MoeScratch::tileCount, &MoeWorkspace::tileCountBytes},
-    {&MoeScratch::groupedRoutes, &MoeWorkspace::groupedRoutesBytes},
-    {&MoeScratch::routeRows, &MoeWorkspace::routeRowsBytes},
-    {&MoeScratch::groupedInput, &MoeWorkspace::groupedInputBytes},
-    {&MoeScratch::expertIntermediate, &MoeWorkspace::expertIntermediateBytes},
-    {&MoeScratch::expertOutput, &MoeWorkspace::expertOutputBytes},
-    {&MoeScratch::groupedSums, &MoeWorkspace::groupedSumsBytes},
+    {&MoeScratch::selectedExperts, &MoeWorkspace::selectedExpertsBytes, "MoE selected experts"},
+    {&MoeScratch::routingWeights, &MoeWorkspace::routingWeightsBytes, "MoE routing weights"},
+    {&MoeScratch::tileDescriptors, &MoeWorkspace::tileDescriptorsBytes, "MoE tile descriptors"},
+    {&MoeScratch::tileCount, &MoeWorkspace::tileCountBytes, "MoE tile count"},
+    {&MoeScratch::groupedRoutes, &MoeWorkspace::groupedRoutesBytes, "MoE grouped routes"},
+    {&MoeScratch::routeRows, &MoeWorkspace::routeRowsBytes, "MoE route rows"},
+    {&MoeScratch::groupedInput, &MoeWorkspace::groupedInputBytes, "MoE grouped input"},
+    {&MoeScratch::expertIntermediate, &MoeWorkspace::expertIntermediateBytes, "MoE expert intermediate"},
+    {&MoeScratch::expertOutput, &MoeWorkspace::expertOutputBytes, "MoE expert output"},
+    {&MoeScratch::groupedSums, &MoeWorkspace::groupedSumsBytes, "MoE grouped sums"},
 }};
 static_assert(sizeof(MoeWorkspace) == kMoeScratchFields.size() * sizeof(uint64_t) &&
               sizeof(MoeScratch) == kMoeScratchFields.size() * sizeof(metal::MetalBuffer),
@@ -168,70 +132,38 @@ inline constexpr auto kMoeWorkspaceFields = [] {
   return fields;
 }();
 
-// The tile applies to grouping, gather and both expert projections together;
-// changing it never changes the physical rows in a command. Affine plans
-// consume Q4 expert slabs in StorageN=256 order: decode plans run the fused
-// gate/up tile on M8 tiles, prefill plans the experts on M32 tiles as three
-// N256 passes (gate, up with the silu gate, down) whose tiles shrink to the
-// descriptor's live rows. GGUF plans run three passes of M8 tiles, or of M32
-// tiles to prefill (moeGgufPrefillTile).
+// The tile applies to grouping, gather and the expert passes together;
+// changing it never changes the physical rows in a command. Plans run their
+// passes on M8 tiles, or on M32 tiles to prefill (moeGgufPrefillTile).
 enum class MoeExpertTile : uint8_t { M8 = 8, M32 = 32 };
 
-// Simdgroups per affine 8-row expert tile, a device policy the execution
-// plans set. Eight is the shipped N128 tile for both projections.
-// Four halves the threadgroup to 128 threads and runs gate/up at N128 and
-// down at N256, for Apple9 decode plans: family 9 has no per-core matrix
-// unit, and a decode expert grid leaves it latency-bound at low occupancy.
-// Measured on a 40-core Apple9 GPU at the 35B shape (H=2048, E=256,
-// top_k=8, I=512), ms per layer at rows 8/16/24/32: gate/up
-// 0.332/0.551/0.728/0.859 -> 0.314/0.503/0.618/0.699 (1.06x-1.23x), down
-// 0.157/0.274/0.363/0.419 -> 0.137/0.226/0.297/0.335 (1.15x-1.25x). Apple10
-// variants had mixed results across shapes, so family 10 keeps eight.
-// Smaller Apple9 core counts still need performance validation; this family
-// gate does not establish their optimum. Either choice writes bit-identical
-// outputs and needs the same workspace; only the down pass's column grid
-// changes.
-enum class MoeExpertSimdgroups : uint8_t { Eight = 8, Four = 4 };
-
-// Families below 9 are rejected at startup; 10 and later keep the shipped
-// tile, as does an unknown family.
-[[nodiscard]] constexpr MoeExpertSimdgroups
-moeDecodeSimdgroups(uint32_t appleGpuFamily) noexcept {
-  return appleGpuFamily == 9 ? MoeExpertSimdgroups::Four
-                             : MoeExpertSimdgroups::Eight;
-}
-
-// The expert tile of GGUF plans, which run three grouped passes (gate, up
-// with silu(gate), down) over the GGUF image: the half-staged tiles of
+// The expert tile of GGUF plans, which run grouped passes (gate, up with
+// silu(gate), down; the staged tile runs gate and up in one pass where they
+// share their formats) over the GGUF image: the half-staged tiles of
 // kernels/shared/moe_gguf.metal, or Register, the exact register tile of
 // kernels/decode/linear_gguf_sgmatrix.metal over Table16 tiles of the
 // grouped rows (8-row tiles only). Apple9 runs Register in both phases but
 // for experts mostly in a format it stages. In decode, as its dense GGUF
 // projections do (LinearGguf.cpp): its matrix operations share the FP32 pipe,
-// where the register tile beats staging. In prefill it equals the decode
-// numerics; against the staged 32-row tiles, on the 35B's real routes on the
-// 40-core M3 Max (ms per layer), it is faster at 512 rows (3.52 vs 3.72) and
-// slower at 2048 (12.6-13.1 vs 11.0-11.7).
+// where the register tile beats staging. In prefill it keeps the decode
+// numerics at a cost: the staged 32-row tiles run long chunks faster.
 enum class MoeGgufTile : uint8_t { Staged, Register };
 
 // Apple9 stages experts mostly in a format apple9StagesFormat names: one
 // 35B-shaped layer on a 40-core M3 Max decodes UD-Q2_K_XL's IQ2_XS and
 // IQ3_XXS experts, and the IQ2, IQ3_XXS and IQ1 formats alone, 4-21% faster
 // staged at B1-B4, where Q4_K/Q5_K, Q2_K and IQ4_XS experts take 3-34% longer.
-[[nodiscard]] inline MoeGgufTile moeGgufTile(uint32_t appleGpuFamily, MoeShape shape) noexcept {
-  return appleGpuFamily == 9 && !apple9StagesFormat(shape.expertFormat) ? MoeGgufTile::Register
-                                                                         : MoeGgufTile::Staged;
+[[nodiscard]] inline MoeGgufTile moeGgufTile(GpuFamilyClass family, MoeShape shape) noexcept {
+  return family == GpuFamilyClass::Apple9 && !apple9StagesFormat(shape.expertFormat) ? MoeGgufTile::Register
+                                                                                      : MoeGgufTile::Staged;
 }
 
 // The rows of a GGUF prefill plan's tiles on the device's `tile`: 8 on the
 // register tile. Staged: 8-row tiles while the chunk's routes average at most
-// one row per expert (rows * topK <= experts), 32-row tiles beyond, which
-// stream an expert's weights once for up to 32 of its rows (its tiles run 8-,
-// 16- or 32-row matmuls by their live rows, moe_live_rows). On the 35B's
-// real prefill routes (wikitext, 16-core M5 Pro, the three expert passes of a
-// layer, ms, with 16-row matmuls for up to 16 live rows) 8- vs 32-row tiles:
-// 32 rows 0.72 / 0.71, 64 rows 1.03 / 0.97, 128 rows 1.59 / 1.29, 256 rows
-// 2.60 / 1.71.
+// one row per expert (rows * topK <= experts), where the two tiles take the
+// same time, and 32-row tiles beyond, which stream an expert's weights once
+// for up to 32 of its rows (its tiles run 8-, 16- or 32-row matmuls by their
+// live rows, moe_live_rows).
 [[nodiscard]] constexpr MoeExpertTile moeGgufPrefillTile(MoeShape shape, uint32_t rows,
                                                          MoeGgufTile tile) noexcept {
   return tile == MoeGgufTile::Register ||
@@ -244,20 +176,12 @@ enum class MoePhase : uint8_t { Prefill, Decode };
 
 // The device's policy for a MoE plan, which the execution plans derive.
 struct MoeConfig final {
-  // M32 for affine prefill plans, M8 for decode plans; a GGUF prefill plan
-  // takes moeGgufPrefillTile's.
-  MoeExpertTile expertTile = MoeExpertTile::M32;
-  // Rows from which the router uses the 32-row scores tile; the execution
-  // plans derive it from the GPU core count.
-  uint32_t routeWideRows = moeRouteWideRows(kAssumedGpuCores);
-  // Simdgroups of the affine 8-row expert tiles, which decode plans run; the
-  // execution plans derive it from the GPU family for decode plans and keep
-  // eight for prefill plans.
-  MoeExpertSimdgroups m8Simdgroups = MoeExpertSimdgroups::Eight;
-  // GGUF plans only; the execution plans derive it from the GPU family.
+  // M8 for decode plans; a prefill plan takes moeGgufPrefillTile's.
+  MoeExpertTile expertTile = MoeExpertTile::M8;
+  // The execution plans derive it from the GPU family.
   MoeGgufTile ggufTile = MoeGgufTile::Staged;
-  // The tile of a GGUF plan's F32 router; the execution plans derive it from
-  // the device and the plan's rows (Linear::ggufFloatTile).
+  // The tile of the F32 router; the execution plans derive it from the
+  // device and the plan's rows (Linear::ggufFloatTile).
   FloatTile ggufRouterTile = FloatTile::Simdgroup;
   bool operator==(const MoeConfig &) const = default;
 };
@@ -272,7 +196,6 @@ public:
   [[nodiscard]] uint32_t tileRows() const noexcept {
     return static_cast<uint32_t>(config_.expertTile);
   }
-  [[nodiscard]] bool splitExperts() const noexcept { return splitExperts_; }
   [[nodiscard]] uint32_t maximumTiles() const noexcept { return maximumTiles_; }
   [[nodiscard]] const MoeWorkspace &workspace() const noexcept {
     return workspace_;
@@ -286,7 +209,6 @@ private:
   uint32_t rows_;
   MoeConfig config_;
   MoePhase phase_;
-  bool splitExperts_;
   uint32_t maximumTiles_;
   MoeWorkspace workspace_;
 };
@@ -305,7 +227,7 @@ struct MoE final {
   [[nodiscard]] static MoePlan prefillPlan(MoeShape shape, uint32_t rows, MoeConfig config);
   [[nodiscard]] static MoePlan decodePlan(MoeShape shape, uint32_t lanes, MoeConfig config);
   static void add(metal::CommandGraph &graph, const MoeBuffers &buffers,
-                  const MoeWeights &weights, const MoePlan &plan);
+                  const BlockMoeWeights &weights, const MoePlan &plan);
 };
 
 } // namespace splash::ops

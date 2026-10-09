@@ -11,8 +11,9 @@ import io
 import math
 import struct
 import threading
-from collections import OrderedDict
 from dataclasses import dataclass
+
+from .lru import LRUCache
 
 PATCH = 16
 MERGE = 2
@@ -179,8 +180,7 @@ class ImageCache:
         # GC may finalize a cancelled batch during a cache insertion on this
         # same thread; returning its byte charge must not deadlock the cache.
         self._lock = threading.RLock()
-        self._entries: OrderedDict[bytes, PreparedImage] = OrderedDict()
-        self._bytes = 0
+        self._entries = LRUCache(self.BUDGET_BYTES)
         self._request_bytes = 0
 
     def request_batch(self):
@@ -190,27 +190,19 @@ class ImageCache:
         key = hashlib.sha256(struct.pack("<I", max_pixels) + payload).digest()
         with self._lock:
             cached = self._entries.get(key)
-            if cached is not None:
-                self._entries.move_to_end(key)
-                return cached
+        if cached is not None:
+            return cached
         prepared = prepare(payload, max_pixels)
-        if len(prepared.pixels) > self.BUDGET_BYTES:
-            return prepared
         with self._lock:
-            if key not in self._entries:
-                self._entries[key] = prepared
-                self._bytes += len(prepared.pixels)
-                while self._bytes > self.BUDGET_BYTES:
-                    _, evicted = self._entries.popitem(last=False)
-                    self._bytes -= len(evicted.pixels)
+            self._entries.put(key, prepared, len(prepared.pixels))
         return prepared
 
     def stats(self) -> dict:
         with self._lock:
             return {
                 "entries": len(self._entries),
-                "bytes": self._bytes,
-                "budget_bytes": self.BUDGET_BYTES,
+                "bytes": self._entries.bytes,
+                "budget_bytes": self._entries.budget_bytes,
                 "request_bytes": self._request_bytes,
                 "request_budget_bytes": self.REQUEST_BUDGET_BYTES,
             }

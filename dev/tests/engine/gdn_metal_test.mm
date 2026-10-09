@@ -6,8 +6,10 @@
 #include "../../../runtime/metal/CommandGraph.hpp"
 #include "../../../runtime/metal/MetalBackend.hpp"
 #include "../../../runtime/ops/GDN.hpp"
-#include "tuning/LinearNumerics.hpp"
+#include "metal/abi/ExecutionGeometry.h"
+#include "metal/abi/GDN.h"
 
+#include "LinearNumerics.hpp"
 #include "NormReference.hpp"
 
 #import <Foundation/Foundation.h>
@@ -19,6 +21,7 @@
 #include <cstring>
 #include <iostream>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -34,7 +37,9 @@ using splash::ops::GdnShape;
 using splash::ops::NormWeights;
 
 constexpr uint32_t kHeadDim = 128;
-constexpr double kEpsilon = 1e-6;
+// The convolution's taps; a state carries the inputs of all but the current
+// token's.
+constexpr uint32_t kTaps = SPLASH_GDN_CONVOLUTION_TAPS, kCarried = kTaps - 1;
 constexpr double kQueryScale = 0.0078125;
 constexpr double kKeyScale = 0.08838834765;
 
@@ -68,9 +73,9 @@ private:
 };
 
 uint16_t toBf16(double value) {
-  return splash::ops::tuning::floatToBf16(static_cast<float>(value));
+  return splash::test::floatToBf16(static_cast<float>(value));
 }
-double fromBf16(uint16_t value) { return splash::ops::tuning::bf16ToFloat(value); }
+double fromBf16(uint16_t value) { return splash::test::bf16ToFloat(value); }
 double roundBf16(double value) { return fromBf16(toBf16(value)); }
 double bf16Ulp(double value) {
   return std::max(std::fabs(value), 1e-30) * 0.0078125;
@@ -117,7 +122,7 @@ GdnPrefillBuffers prefillBuffers(MetalBackend &backend, const GdnShape &shape,
   return {std::move(packed),
           std::move(convolutionWeights),
           std::move(convolutionIn),
-          shared(backend, uint64_t{3} * convDim * 2, "conv out"),
+          shared(backend, uint64_t{kCarried} * convDim * 2, "conv out"),
           shared(backend, uint64_t{tokens} * keyWidth * 2, "queries"),
           shared(backend, uint64_t{tokens} * keyWidth * 2, "keys"),
           shared(backend, uint64_t{tokens} * valueWidth * 2, "values"),
@@ -142,9 +147,9 @@ GdnPrefillBuffers randomPrefill(MetalBackend &backend, const GdnShape &shape,
   GdnPrefillBuffers buffers = prefillBuffers(
       backend, shape, tokens,
       shared(backend, uint64_t{tokens} * packedWidth * 2, "packed"),
-      shared(backend, uint64_t{3} * convDim * 2, "conv in"),
+      shared(backend, uint64_t{kCarried} * convDim * 2, "conv in"),
       shared(backend, stateElements * 4, "state in"),
-      shared(backend, uint64_t{convDim} * 4 * 2, "conv weights"),
+      shared(backend, uint64_t{convDim} * kTaps * 2, "conv weights"),
       shared(backend, valueHeads * 4, "a scale"),
       shared(backend, valueHeads * 2, "dt bias"), {});
 
@@ -153,10 +158,10 @@ GdnPrefillBuffers randomPrefill(MetalBackend &backend, const GdnShape &shape,
   for (uint64_t i = 0; i < uint64_t{tokens} * packedWidth; ++i)
     packed[i] = toBf16(random.gauss());
   auto *convWeights = data<uint16_t>(buffers.convolutionWeights);
-  for (uint64_t i = 0; i < uint64_t{convDim} * 4; ++i)
+  for (uint64_t i = 0; i < uint64_t{convDim} * kTaps; ++i)
     convWeights[i] = toBf16(0.3 * random.gauss());
   auto *convIn = data<uint16_t>(buffers.convolutionIn);
-  for (uint64_t i = 0; i < uint64_t{3} * convDim; ++i)
+  for (uint64_t i = 0; i < uint64_t{kCarried} * convDim; ++i)
     convIn[i] = toBf16(random.gauss());
   auto *aScale = data<float>(buffers.decayWeights);
   auto *dtBias = data<uint16_t>(buffers.timeBias);
@@ -184,7 +189,7 @@ void submitPrefill(MetalBackend &backend, const GdnPrefillBuffers &buffers,
   GDN::addPrefill(graph, buffers, shape, tokens, order);
   require(graph.dispatches().size() == 3,
           label + "prefill is not three dispatches");
-  (void)backend.submitCommand(graph.dispatches());
+  (void)backend.submitCommandAsync(graph.dispatches()).wait();
 }
 
 void runCase(MetalBackend &backend, const GdnShape &shape, uint32_t tokens,
@@ -212,13 +217,14 @@ void runCase(MetalBackend &backend, const GdnShape &shape, uint32_t tokens,
   // Prepare pass: convolution + SiLU per channel, q/k RMS normalisation.
   auto convolved = [&](uint32_t token, uint32_t channel) {
     double value = 0.0;
-    for (uint32_t tap = 0; tap < 4; ++tap) {
+    for (uint32_t tap = 0; tap < kTaps; ++tap) {
       const uint32_t position = token + tap;
       const double input =
-          position < 3 ? fromBf16(convIn[position * convDim + channel])
-                       : fromBf16(packed[uint64_t{position - 3} * packedWidth +
-                                         channel]);
-      value += input * fromBf16(convWeights[channel * 4 + tap]);
+          position < kCarried
+              ? fromBf16(convIn[position * convDim + channel])
+              : fromBf16(packed[uint64_t{position - kCarried} * packedWidth +
+                                channel]);
+      value += input * fromBf16(convWeights[channel * kTaps + tap]);
     }
     return roundBf16(silu(roundBf16(value)));
   };
@@ -240,7 +246,8 @@ void runCase(MetalBackend &backend, const GdnShape &shape, uint32_t tokens,
           row[dim] = convolved(token, which * keyWidth + head * kHeadDim + dim);
           squares += row[dim] * row[dim];
         }
-        const double inverse = 1.0 / std::sqrt(squares / kHeadDim + kEpsilon);
+        const double inverse =
+            1.0 / std::sqrt(squares / kHeadDim + SPLASH_RMS_EPSILON);
         const double scale = which == 0 ? kQueryScale : kKeyScale;
         const uint16_t *out = (which == 0 ? queries : keys) +
                               uint64_t{token} * keyWidth + head * kHeadDim;
@@ -284,14 +291,15 @@ void runCase(MetalBackend &backend, const GdnShape &shape, uint32_t tokens,
     }
   }
 
-  // Carried convolution state: the last three inputs seen.
+  // Carried convolution state: the last inputs seen, one per carried row.
   const auto *convOut = data<uint16_t>(buffers.convolutionOut);
-  for (uint32_t carried = 0; carried < 3; ++carried) {
+  for (uint32_t carried = 0; carried < kCarried; ++carried) {
     for (uint32_t channel = 0; channel < convDim; ++channel) {
       const uint32_t source = tokens + carried;
       const uint16_t expected =
-          source < 3 ? convIn[source * convDim + channel]
-                     : packed[uint64_t{source - 3} * packedWidth + channel];
+          source < kCarried
+              ? convIn[source * convDim + channel]
+              : packed[uint64_t{source - kCarried} * packedWidth + channel];
       require(convOut[carried * convDim + channel] == expected,
               label + "carried convolution state is wrong");
     }
@@ -490,10 +498,64 @@ void runTiledCase(MetalBackend &backend, const GdnShape &shape,
   std::cout << label << "byte-identical to the grouped order\n";
 }
 
+// Each buffer the prefill reaches, at its extent and one element short: the
+// packed rows up to the last row's alpha, the four taps of every channel's
+// convolution weights and its three carried rows, the q/k/v and gate rows of
+// every token, a value head's state, and the mixer norm in either type.
+void bufferExtents(MetalBackend &backend, const GdnShape &shape, bool float32) {
+  constexpr uint32_t tokens = 37;
+  const GdnPrefillBuffers buffers = randomPrefill(backend, shape, tokens, float32);
+  const uint64_t valueWidth = uint64_t{shape.valueHeads} * kHeadDim;
+  const uint64_t keyRows = uint64_t{tokens} * shape.keyHeads * kHeadDim * 2;
+  const uint64_t valueRows = tokens * valueWidth * 2;
+  const uint64_t state = valueWidth * kHeadDim * 4;
+  const auto encode = [&](CommandGraph &graph, const GdnPrefillBuffers &changed) {
+    GDN::addPrefill(graph, changed, shape, tokens, GdnHeadOrder::Grouped);
+  };
+  for (const auto &[member, bytes, element, what] :
+       std::initializer_list<std::tuple<MetalBuffer GdnPrefillBuffers::*, uint64_t, uint64_t, const char *>>{
+           {&GdnPrefillBuffers::packed,
+            (uint64_t{tokens - 1} * shape.packedWidth + shape.convolutionDimension + valueWidth +
+             2 * shape.valueHeads) * 2,
+            2, "GDN packed"},
+           {&GdnPrefillBuffers::convolutionWeights, uint64_t{shape.convolutionDimension} * kTaps * 2, 2,
+            "GDN convolution weight"},
+           {&GdnPrefillBuffers::convolutionIn, uint64_t{kCarried} * shape.convolutionDimension * 2, 2,
+            "GDN convolution state"},
+           {&GdnPrefillBuffers::convolutionOut, uint64_t{kCarried} * shape.convolutionDimension * 2, 2,
+            "GDN next convolution state"},
+           {&GdnPrefillBuffers::queries, keyRows, 2, "GDN query"},
+           {&GdnPrefillBuffers::keys, keyRows, 2, "GDN key"},
+           {&GdnPrefillBuffers::values, valueRows, 2, "GDN value"},
+           {&GdnPrefillBuffers::decayWeights, uint64_t{shape.valueHeads} * 4, 4, "GDN decay weight"},
+           {&GdnPrefillBuffers::timeBias, uint64_t{shape.valueHeads} * 2, 2, "GDN time bias"},
+           {&GdnPrefillBuffers::decay, uint64_t{tokens} * shape.valueHeads * 4, 4, "GDN decay"},
+           {&GdnPrefillBuffers::beta, uint64_t{tokens} * shape.valueHeads * 2, 2, "GDN beta"},
+           {&GdnPrefillBuffers::recurrentIn, state, 4, "GDN recurrent state"},
+           {&GdnPrefillBuffers::recurrentOut, state, 4, "GDN next recurrent state"},
+           {&GdnPrefillBuffers::recurrentRows, valueRows, 2, "GDN recurrent row"},
+           {&GdnPrefillBuffers::hidden, valueRows, 2, "GDN hidden"}})
+    splash::test::requireExtent(backend, buffers.*member, bytes, element, what,
+                                [&](CommandGraph &graph, const MetalBuffer &buffer) {
+                                  GdnPrefillBuffers changed = buffers;
+                                  changed.*member = buffer;
+                                  encode(graph, changed);
+                                });
+  const uint64_t normElement = float32 ? 4 : 2;
+  splash::test::requireExtent(backend, buffers.mixerNorm.buffer, kHeadDim * normElement, normElement,
+                              "norm weight", [&](CommandGraph &graph, const MetalBuffer &buffer) {
+                                GdnPrefillBuffers changed = buffers;
+                                changed.mixerNorm.buffer = buffer;
+                                encode(graph, changed);
+                              });
+}
+
 void run(const std::string &metallib) {
   MetalBackend backend(metallib);
   for (const GdnShape &shape :
        {GdnShape{16, 48, 128, 10240, 16640}, GdnShape{16, 32, 128, 8192, 12544}}) {
+    for (bool float32 : {false, true})
+      bufferExtents(backend, shape, float32);
     for (uint32_t tokens : {1u, 37u, 1000u, 2048u})
       runCase(backend, shape, tokens);
     for (uint32_t tokens : {1u, 37u})

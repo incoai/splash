@@ -39,6 +39,10 @@ import string
 import weakref
 from dataclasses import dataclass
 
+from .chat_templates import render_chat_template, template_options
+from .errors import field_error
+from .protocol import MAX_SCORE_TOKENS
+
 LETTERS = "ABCDEFGHIJKLMNOP"
 DIRECT_SYSTEM = (
     "Apply the supplied criterion to the supplied evidence. Choose exactly one "
@@ -51,8 +55,6 @@ READOUT = (
     "native full-vocabulary last-position logits restricted to declared answer slots"
 )
 PROBABILITY_STATUS = "conditional option score; uncalibrated as decision confidence"
-# Native score-only requests carry at most this many option tokens.
-MAX_OPTIONS = 255
 # A /v1/systemone batch prepares every question before the first inference
 # and runs them under one shared deadline, so the batch carries its own
 # caps: at most this many questions holding at most this many prepared
@@ -65,18 +67,6 @@ _MISSING = object()
 
 class ScoringUnsupported(RuntimeError):
     """The served tokenizer cannot express exact single-token answer slots."""
-
-
-class SystemOneError(Exception):
-    """One or more /v1/systemone request fields failed validation."""
-
-    def __init__(self, details):
-        self.details = list(details)
-        super().__init__(self.details[0]["msg"] if self.details else "invalid")
-
-
-def detail(loc, msg, error_type="value_error"):
-    return {"loc": ["body", *loc], "msg": msg, "type": error_type}
 
 
 def validate_row(row):
@@ -164,7 +154,7 @@ def _derive_slot_labels(tokenizer):
             encoded = tokenizer.encode(label, add_special_tokens=False)
             if len(encoded) == 1 and tokenizer.decode(encoded) == label:
                 labels.append(label)
-                if len(labels) >= MAX_OPTIONS:
+                if len(labels) >= MAX_SCORE_TOKENS:
                     return labels
     return labels
 
@@ -186,27 +176,40 @@ def slot_labels(tokenizer):
     return labels
 
 
-def encode_prompt(tokenizer, chat_template, messages, labels, *, admit, checkpoint):
-    """Render messages with chat_template and verify single-token answer slots.
+def encode_prompt(
+    prompt_tokenizer, chat_template, messages, labels, *, admit, checkpoint
+):
+    """Render messages with chat_template, without thinking as a request
+    with effort none renders, and verify single-token answer slots.
 
     Mirrors SemIf semif_phase1.direct.encode_prompt: each slot label must be
     one exact round-trip token, and appending the label to the rendered
-    prompt must extend the token ids by exactly that token.
-
-    The boundary pass re-tokenizes the whole prompt once per slot, so a long
-    prompt with many options costs far more than the prompt itself. `admit`
-    receives the prepared prompt token count before that pass begins and
-    `checkpoint` runs once per slot inside it; either may raise to abandon
-    preparation.
+    prompt must extend the token ids by exactly that token. A label can only
+    change the tokens of the text after the prompt's last message boundary,
+    which encodes on its own (PromptTokenizer.split), so the boundary pass
+    encodes that end, the generation prompt, with each label: the whole
+    prompt only where the tokenizer has no such boundary. `admit` receives
+    the prepared prompt token count before that pass begins and `checkpoint`
+    runs once per slot inside it; either may raise to abandon preparation.
     """
-    prompt = tokenizer.apply_chat_template(
+    tokenizer = prompt_tokenizer.tokenizer
+    prompt = render_chat_template(
+        tokenizer,
         messages,
-        chat_template=chat_template,
-        tokenize=False,
-        add_generation_prompt=True,
-        enable_thinking=False,
+        {
+            "chat_template": chat_template,
+            "tokenize": False,
+            **template_options(
+                reasoning_effort="none",
+                preserve_thinking=None,
+                tools=None,
+                add_generation_prompt=True,
+            ),
+        },
     )
-    ids = list(tokenizer.encode(prompt, add_special_tokens=False))
+    head, tail = prompt_tokenizer.split(prompt)
+    tail_ids = list(tokenizer.encode(tail, add_special_tokens=False))
+    ids = head + tail_ids
     if not ids:
         raise ScoringUnsupported("the tokenizer produced an empty prompt")
     slots = []
@@ -222,7 +225,8 @@ def encode_prompt(tokenizer, chat_template, messages, labels, *, admit, checkpoi
     admit(len(ids))
     for label, token in zip(labels, slots):
         checkpoint()
-        if tokenizer.encode(prompt + label, add_special_tokens=False) != ids + [token]:
+        encoded = tokenizer.encode(tail + label, add_special_tokens=False)
+        if encoded != tail_ids + [token]:
             raise ScoringUnsupported(
                 f"answer boundary changes tokenization for slot {label!r}"
             )
@@ -274,16 +278,18 @@ def _question_spec(qid, question):
     """Validate one question; returns (spec, details). Ids never infer."""
     loc = ["questions", qid]
     if not isinstance(question, dict):
-        return None, [detail(loc, "question must be an object", "model_type")]
+        return None, [field_error(loc, "question must be an object", "model_type")]
     details = []
     kind = question.get("type")
     if not isinstance(kind, str) or kind not in _QUESTION_TYPES:
-        details.append(detail([*loc, "type"], "type must be noul, choice, or score"))
+        details.append(
+            field_error([*loc, "type"], "type must be noul, choice, or score")
+        )
         return None, details
     instructions = question.get("instructions")
     if instructions is not None and not isinstance(instructions, (str, dict, list)):
         details.append(
-            detail(
+            field_error(
                 [*loc, "instructions"],
                 "instructions must be a string, object, or array",
             )
@@ -301,7 +307,7 @@ def _question_spec(qid, question):
             )
         ):
             details.append(
-                detail(
+                field_error(
                     [*loc, "criteria"],
                     "noul criteria must map true/false to a string, object, "
                     "array, or null",
@@ -317,24 +323,26 @@ def _question_spec(qid, question):
     elif kind == "choice":
         if not isinstance(criteria, dict) or not criteria:
             details.append(
-                detail(
+                field_error(
                     [*loc, "criteria"],
                     "choice criteria must be a nonempty object mapping labels "
                     "to descriptions",
                 )
             )
-        elif len(criteria) > MAX_OPTIONS:
+        elif len(criteria) > MAX_SCORE_TOKENS:
             details.append(
-                detail(
+                field_error(
                     [*loc, "criteria"],
-                    f"choice supports at most {MAX_OPTIONS} options",
+                    f"choice supports at most {MAX_SCORE_TOKENS} options",
                 )
             )
         elif any(not isinstance(label, str) for label in criteria):
-            details.append(detail([*loc, "criteria"], "choice labels must be strings"))
+            details.append(
+                field_error([*loc, "criteria"], "choice labels must be strings")
+            )
         elif any(not _json_description(value) for value in criteria.values()):
             details.append(
-                detail(
+                field_error(
                     [*loc, "criteria"],
                     "choice descriptions must be strings, objects, arrays, or null",
                 )
@@ -349,21 +357,21 @@ def _question_spec(qid, question):
     else:
         if not isinstance(criteria, list) or not criteria:
             details.append(
-                detail(
+                field_error(
                     [*loc, "criteria"],
                     "score criteria must be a nonempty array of level descriptions",
                 )
             )
-        elif len(criteria) > MAX_OPTIONS:
+        elif len(criteria) > MAX_SCORE_TOKENS:
             details.append(
-                detail(
+                field_error(
                     [*loc, "criteria"],
-                    f"score supports at most {MAX_OPTIONS} levels",
+                    f"score supports at most {MAX_SCORE_TOKENS} levels",
                 )
             )
         elif any(not isinstance(value, (str, dict, list)) for value in criteria):
             details.append(
-                detail(
+                field_error(
                     [*loc, "criteria"],
                     "score descriptions must be strings, objects, or arrays",
                 )
@@ -385,24 +393,28 @@ def validate_systemone(body):
     """Validate every field and question before any inference.
 
     Returns (state, [(question_id, spec), ...], details); callers raise
-    SystemOneError when details is nonempty.
+    RequestValidationError when details is nonempty.
     """
     details = []
     state = body.get("state", _MISSING)
     if state is _MISSING:
-        details.append(detail(["state"], "field required", "missing"))
+        details.append(field_error(["state"], "field required", "missing"))
     elif not isinstance(state, (str, dict, list)):
-        details.append(detail(["state"], "state must be a string, object, or array"))
+        details.append(
+            field_error(["state"], "state must be a string, object, or array")
+        )
         state = None
     questions = body.get("questions", _MISSING)
     specs = []
     if questions is _MISSING:
-        details.append(detail(["questions"], "field required", "missing"))
+        details.append(field_error(["questions"], "field required", "missing"))
     elif not isinstance(questions, dict) or not questions:
-        details.append(detail(["questions"], "questions must be a nonempty object"))
+        details.append(
+            field_error(["questions"], "questions must be a nonempty object")
+        )
     elif len(questions) > MAX_SYSTEMONE_QUESTIONS:
         details.append(
-            detail(
+            field_error(
                 ["questions"],
                 f"questions must contain at most {MAX_SYSTEMONE_QUESTIONS} entries",
             )

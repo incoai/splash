@@ -20,6 +20,10 @@
 #include <variant>
 #include <vector>
 
+namespace splash::ops {
+class AneFfn;
+} // namespace splash::ops
+
 namespace splash::model {
 
 struct Qwen3_8Layout;
@@ -68,39 +72,21 @@ template <class Layout, class Layer> struct QwenTargetWeights final : QwenTarget
 };
 
 // Runtime-visible tensor geometry shared by the supported Qwen hybrid
-// targets. It describes semantics only; operators remain responsible for
-// choosing device-specific Metal pipelines and compute tiles.
-struct QwenTargetGeometry final {
+// targets: the target's dimensions, the layers the draft reads and what its
+// loaded weights add. It describes semantics only; operators remain
+// responsible for choosing device-specific Metal pipelines and compute tiles.
+struct QwenTargetGeometry final : QwenTargetDimensions {
   static constexpr uint32_t maximumCaptureLayers = 8;
 
-  uint32_t layers = 0;
-  uint32_t hiddenSize = 0;
-  uint32_t vocabularySize = 0;
-  uint32_t packedGdnWidth = 0;
-  uint32_t packedFullWidth = 0;
-  uint32_t convolutionDimension = 0;
-  uint32_t gdnKeyHeads = 0;
-  uint32_t gdnValueHeads = 0;
-  uint32_t gdnHeadDimension = 0;
-  uint32_t attentionWidth = 0;
-  uint32_t attentionQueryHeads = 0;
-  uint32_t attentionKvHeads = 0;
-  uint32_t attentionHeadDimension = 0;
-  uint32_t rotaryPairs = 0;
-  float rotaryTheta = 0.0F;
-  uint32_t denseIntermediateSize = 0;
-  uint32_t experts = 0;
-  uint32_t expertsPerToken = 0;
-  uint32_t expertIntermediateSize = 0;
-  QwenFfnKind ffnKind = QwenFfnKind::Dense;
-  // The weight layout every sparse MoE block of the target shares, and in a
-  // GGUF the format of most of its routed expert weights.
-  ops::WeightLayout moeLayout = ops::WeightLayout::Affine64;
+  QwenTargetGeometry() = default;
+  explicit QwenTargetGeometry(const QwenTargetDimensions &dimensions) : QwenTargetDimensions(dimensions) {}
+
+  // The format of most of the sparse MoE blocks' routed expert weights.
   uint32_t moeExpertFormat = GGUF_FMT_COUNT;
-  uint32_t maskToken = 0;
-  std::array<uint32_t, 2> stopTokens{};
   std::array<uint32_t, maximumCaptureLayers> captureLayerValues{};
   uint32_t captureLayerCount = 0;
+  // The target's KV layout in the format the runtime stores KV in, and its
+  // GDN state layout.
   kv::Layout kvLayout{};
   GdnStateLayout stateLayout{};
   // Distinct operator requirements, collected from the loaded weights.
@@ -115,11 +101,7 @@ struct QwenTargetGeometry final {
     return hiddenSize * captureLayerCount;
   }
   [[nodiscard]] constexpr ops::MoeShape moeShape() const noexcept {
-    return {hiddenSize, experts, expertsPerToken, expertIntermediateSize, moeLayout, moeExpertFormat};
-  }
-  [[nodiscard]] constexpr uint32_t ffnScratchWidth() const noexcept {
-    return ffnKind == QwenFfnKind::Dense ? denseIntermediateSize
-                                         : expertIntermediateSize;
+    return {hiddenSize, experts, expertsPerToken, expertIntermediateSize, moeExpertFormat};
   }
   [[nodiscard]] constexpr std::span<const uint32_t>
   captureLayers() const noexcept {
@@ -151,7 +133,7 @@ struct QwenTargetGeometry final {
            kvLayout.kvHeads == attentionKvHeads &&
            kvLayout.headDimension == attentionHeadDimension &&
            sized(prefillProjections) && sized(decodeProjections) &&
-           ((ffnKind == QwenFfnKind::Dense && denseIntermediateSize && sized(gateUpProjections)) ||
+           ((ffnKind == QwenFfnKind::Dense && intermediateSize && sized(gateUpProjections)) ||
             (ffnKind == QwenFfnKind::SparseMoe && moeShape().valid()));
   }
 };
@@ -202,13 +184,16 @@ struct QwenTargetPrefillBuffers final {
   metal::MetalBuffer attentionStatistics;
   metal::MetalBuffer attentionHidden;
   metal::MetalBuffer attentionOutput;
-  metal::MetalBuffer projectionSums;
-  metal::MetalBuffer downProjectionSums;
   metal::MetalBuffer ropeCos;
   metal::MetalBuffer ropeSin;
   metal::MetalBuffer chunkKeys;
   metal::MetalBuffer chunkValues;
   ops::MoeScratch moe;
+
+  // The dense FFN's buffers among these.
+  [[nodiscard]] ops::PrefillFfnBuffers ffn() const {
+    return {normalized, denseGateScratch, denseIntermediate, linearScratch};
+  }
 };
 
 struct QwenTargetVerifyBuffers final {
@@ -264,7 +249,7 @@ template <class Layout, class Layer>
 qwenTargetGeometry(const QwenTargetWeights<Layout, Layer> &weights);
 
 // Builds the shared Qwen GDN/attention layer graph with the target's dense
-// or sparse-MoE FFN. Architecture-specific loaders supply the package tensors.
+// or sparse-MoE FFN. Architecture-specific loaders supply the model's tensors.
 class QwenTarget final {
 public:
   template <class Layout, class Layer>
@@ -280,11 +265,13 @@ public:
   // stale activations and write results no active row reads.
   [[nodiscard]] uint32_t decodeStorageLanes(uint32_t lanes) const;
 
-  // Returns the hidden buffer that holds the last layer's output rows.
+  // Returns the hidden buffer that holds the last layer's output rows. The
+  // dense FFN of a chunk the split takes (AneFfn::splits) runs split with the
+  // Neural Engine on `aneFfn`, when given.
   [[nodiscard]] metal::MetalBuffer addPrefill(
       metal::CommandGraph &graph, QwenTargetPrefillBuffers buffers,
       std::span<const QwenTargetPrefillSequence> sequences, uint32_t rows,
-      std::span<const SplashKvLayer> kvLayers) const;
+      std::span<const SplashKvLayer> kvLayers, ops::AneFfn *aneFfn = nullptr) const;
   void addVerify(
       metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
       std::span<const SplashKvLayer> kvLayers,
@@ -314,18 +301,18 @@ private:
 
   // A layer's parts in dispatch order: the mixer normalizes its input and
   // returns the residual rows the FFN normalizes and adds to into `output`.
-  void addPrefillNorm(PrefillStep &step, metal::MetalBuffer input, const ops::NormWeights &norm,
-                      ops::WeightLayout consumer) const;
+  void addPrefillNorm(PrefillStep &step, metal::MetalBuffer input, const ops::NormWeights &norm) const;
   void addPrefillOutput(PrefillStep &step, metal::MetalBuffer hidden, const ops::Projection &projection,
                         metal::MetalBuffer input, metal::MetalBuffer output) const;
   metal::MetalBuffer addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer, const ops::NormWeights &norm,
                                      metal::MetalBuffer input) const;
   metal::MetalBuffer addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &mixer,
                                      const ops::NormWeights &norm, metal::MetalBuffer input) const;
-  void addPrefillFfn(PrefillStep &step, const Qwen3_8LayerWeights &layer, metal::MetalBuffer residual,
-                     metal::MetalBuffer output) const;
-  void addPrefillFfn(PrefillStep &step, const Qwen3_6MoeLayerWeights &layer, metal::MetalBuffer residual,
-                     metal::MetalBuffer output) const;
+  // The FFN of layer `index`.
+  void addPrefillFfn(PrefillStep &step, uint32_t index, const Qwen3_8LayerWeights &layer,
+                     metal::MetalBuffer residual, metal::MetalBuffer output) const;
+  void addPrefillFfn(PrefillStep &step, uint32_t index, const Qwen3_6MoeLayerWeights &layer,
+                     metal::MetalBuffer residual, metal::MetalBuffer output) const;
   metal::MetalBuffer addVerifyMixer(VerifyStep &step, const QwenGdnWeights &mixer, const ops::NormWeights &norm,
                                     metal::MetalBuffer input) const;
   metal::MetalBuffer addVerifyMixer(VerifyStep &step, const QwenAttentionWeights &mixer,

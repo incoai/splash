@@ -439,13 +439,54 @@ struct FmtPQ20 {
   static QuantCoef coef(Meta mt, ushort) { return {float2(float(as_type<half>(mt)))}; }
 };
 
+// The GGUF format whose planes hold Bits-bit linear codes, which an MLX affine format keeps as it does
+// (metal/abi/QuantFormat.h).
+template <uint Bits> struct AffinePlanes;
+template <> struct AffinePlanes<2> { typedef FmtQ2K F; };
+template <> struct AffinePlanes<3> { typedef FmtQ3K F; };
+template <> struct AffinePlanes<4> { typedef FmtQ4K F; };
+template <> struct AffinePlanes<5> { typedef FmtQ5K F; };
+template <> struct AffinePlanes<6> { typedef FmtQ6K F; };
+template <> struct AffinePlanes<8> { typedef FmtQ80 F; };
+// MLX affine, Bits-bit codes in groups of 32 * Groups elements: the planes of AffinePlanes<Bits>, the 8-bit codes
+// unsigned; meta the group's bf16 scale s and bias z. value = s * code + z.
+template <uint Bits, uint Groups> struct FmtAffine {
+  typedef typename AffinePlanes<Bits>::F Planes;
+  QUANT_FORMAT(quant_affine_format_of(Bits, 32 * Groups), QuantLinear, 0, 32, false);
+  typedef typename Planes::Payload Payload; typedef typename Planes::Chunk Chunk; typedef uint Meta;
+  static Payload load(device uchar *p0, device uchar *p1) { return Planes::load(p0, p1); }
+  static Meta loadMeta(device uchar *m) { return *((device uint *)m); }
+  static Chunk chunk(Payload w, ushort c) { return Planes::chunk(w, c); }
+  static Chunk loadChunk(device uchar *p0, device uchar *p1, ushort c) { return Planes::loadChunk(p0, p1, c); }
+  static uint4 codes(Chunk q) {
+    if constexpr (Bits == 8) return uint4(quant_byte_pairs(q.x), quant_byte_pairs(q.y));
+    else return Planes::codes(q);
+  }
+  static QuantCoef coef(Meta mt, ushort) {
+    return {float2(float(as_type<bfloat>(ushort(mt & 0xFFFF)))), float2(float(as_type<bfloat>(ushort(mt >> 16))))};
+  }
+};
+// Whether a linear format's codes reach 128, past the 7-bit codes a bf16 operand 128 + code holds exactly
+// (kernels/decode/linear_gguf_sgmatrix.metal).
+template <class F> struct QuantWideCodes { static constexpr constant bool value = false; };
+template <uint Groups> struct QuantWideCodes<FmtAffine<8, Groups>> { static constexpr constant bool value = true; };
+#define QUANT_AFFINE_GROUPS(B)                                                                                     \
+  typedef FmtAffine<B, 1> FmtAF##B##G32; typedef FmtAffine<B, 2> FmtAF##B##G64; typedef FmtAffine<B, 4> FmtAF##B##G128;
+QUANT_AFFINE_GROUPS(2) QUANT_AFFINE_GROUPS(3) QUANT_AFFINE_GROUPS(4) QUANT_AFFINE_GROUPS(5) QUANT_AFFINE_GROUPS(6)
+QUANT_AFFINE_GROUPS(8)
+#undef QUANT_AFFINE_GROUPS
+
 #undef QUANT_FORMAT
 
 // Every format as X(format type, kernel name token), the token being its kQuantFormats name.
 #define QUANT_FORMATS(X)                                                                                            \
   X(FmtQ4K, q4k) X(FmtIQ4XS, iq4xs) X(FmtIQ4NL, iq4nl) X(FmtQ5K, q5k) X(FmtQ6K, q6k) X(FmtQ3K, q3k) X(FmtQ80, q80) \
   X(FmtIQ3S, iq3s) X(FmtQ2K, q2k) X(FmtIQ3XXS, iq3xxs) X(FmtIQ2XXS, iq2xxs) X(FmtIQ2XS, iq2xs) X(FmtIQ2S, iq2s)      \
-  X(FmtIQ1S, iq1s) X(FmtIQ1M, iq1m) X(FmtQ40, q40) X(FmtQ41, q41) X(FmtMXFP4, mxfp4) X(FmtPQ20, pq20)
+  X(FmtIQ1S, iq1s) X(FmtIQ1M, iq1m) X(FmtQ40, q40) X(FmtQ41, q41) X(FmtMXFP4, mxfp4) X(FmtPQ20, pq20)            \
+  X(FmtAF2G32, af2g32) X(FmtAF2G64, af2g64) X(FmtAF2G128, af2g128) X(FmtAF3G32, af3g32) X(FmtAF3G64, af3g64)      \
+  X(FmtAF3G128, af3g128) X(FmtAF4G32, af4g32) X(FmtAF4G64, af4g64) X(FmtAF4G128, af4g128) X(FmtAF5G32, af5g32)    \
+  X(FmtAF5G64, af5g64) X(FmtAF5G128, af5g128) X(FmtAF6G32, af6g32) X(FmtAF6G64, af6g64) X(FmtAF6G128, af6g128)    \
+  X(FmtAF8G32, af8g32) X(FmtAF8G64, af8g64) X(FmtAF8G128, af8g128)
 
 // Runs body(F()) with the format type of run-time format id `format` (GGUF_FMT_*), for kernels whose tiles pick
 // their tensor, and so its format, at run time. The branch is uniform in a threadgroup. The host passes known ids

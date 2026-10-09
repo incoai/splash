@@ -1,3 +1,4 @@
+#include "metal/kernels/common/lane_bindings.h"
 #include "metal/kernels/common/paged_store_row.h"
 
 template <uint KVHeads, typename CacheElement>
@@ -19,9 +20,7 @@ inline void splash_store_verify_phase(
       thread_index >= SplashKvHeadDimension)
     return;
   device const SplashKvPage *page_table =
-      batch == 0 ? page_table0
-                 : (batch == 1 ? page_table1
-                               : (batch == 2 ? page_table2 : page_table3));
+      SPLASH_LANE_BINDING(batch, page_table0, page_table1, page_table2, page_table3);
   constexpr ulong lane_tensor_stride =
       ulong(KVHeads) * SPLASH_VERIFY_CHUNK_STRIDE * SplashKvHeadDimension;
   chunk_keys += batch * lane_tensor_stride;
@@ -37,74 +36,27 @@ inline void splash_store_verify_phase(
       head, chunk_token, thread_index, simd_lane, simd_group);
 }
 
-kernel void verify_attention_q8_store(
-    device const bfloat *chunk_keys [[buffer(0)]],
-    device const bfloat *chunk_values [[buffer(1)]],
-    device const SplashKvPage *page_table0 [[buffer(2)]],
-    device const SplashKvPage *page_table1 [[buffer(3)]],
-    device const SplashKvPage *page_table2 [[buffer(4)]],
-    device const SplashKvPage *page_table3 [[buffer(5)]],
-    constant SplashChunkedPrefillParams *params [[buffer(6)]],
-    uint group [[threadgroup_position_in_grid]],
-    uint thread_index [[thread_index_in_threadgroup]],
-    uint simd_lane [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  threadgroup float maxima[8];
-  splash_store_verify_phase<4, int8_t>(
-      chunk_keys, chunk_values, page_table0, page_table1, page_table2,
-      page_table3, params, maxima, group, thread_index, simd_lane, simd_group);
-}
-
-kernel void verify_attention_q8_store_kv2_g8(
-    device const bfloat *chunk_keys [[buffer(0)]],
-    device const bfloat *chunk_values [[buffer(1)]],
-    device const SplashKvPage *page_table0 [[buffer(2)]],
-    device const SplashKvPage *page_table1 [[buffer(3)]],
-    device const SplashKvPage *page_table2 [[buffer(4)]],
-    device const SplashKvPage *page_table3 [[buffer(5)]],
-    constant SplashChunkedPrefillParams *params [[buffer(6)]],
-    uint group [[threadgroup_position_in_grid]],
-    uint thread_index [[thread_index_in_threadgroup]],
-    uint simd_lane [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  threadgroup float maxima[8];
-  splash_store_verify_phase<2, int8_t>(
-      chunk_keys, chunk_values, page_table0, page_table1, page_table2,
-      page_table3, params, maxima, group, thread_index, simd_lane, simd_group);
-}
-
-// BF16 entries copy the source bits and need no scale reduction.
-
-kernel void verify_attention_bf16_store(
-    device const bfloat *chunk_keys [[buffer(0)]],
-    device const bfloat *chunk_values [[buffer(1)]],
-    device const SplashKvPage *page_table0 [[buffer(2)]],
-    device const SplashKvPage *page_table1 [[buffer(3)]],
-    device const SplashKvPage *page_table2 [[buffer(4)]],
-    device const SplashKvPage *page_table3 [[buffer(5)]],
-    constant SplashChunkedPrefillParams *params [[buffer(6)]],
-    uint group [[threadgroup_position_in_grid]],
-    uint thread_index [[thread_index_in_threadgroup]],
-    uint simd_lane [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  splash_store_verify_phase<4, bfloat>(
-      chunk_keys, chunk_values, page_table0, page_table1, page_table2,
-      page_table3, params, nullptr, group, thread_index, simd_lane, simd_group);
-}
-
-kernel void verify_attention_bf16_store_kv2_g8(
-    device const bfloat *chunk_keys [[buffer(0)]],
-    device const bfloat *chunk_values [[buffer(1)]],
-    device const SplashKvPage *page_table0 [[buffer(2)]],
-    device const SplashKvPage *page_table1 [[buffer(3)]],
-    device const SplashKvPage *page_table2 [[buffer(4)]],
-    device const SplashKvPage *page_table3 [[buffer(5)]],
-    constant SplashChunkedPrefillParams *params [[buffer(6)]],
-    uint group [[threadgroup_position_in_grid]],
-    uint thread_index [[thread_index_in_threadgroup]],
-    uint simd_lane [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  splash_store_verify_phase<2, bfloat>(
-      chunk_keys, chunk_values, page_table0, page_table1, page_table2,
-      page_table3, params, nullptr, group, thread_index, simd_lane, simd_group);
-}
+#define PAGED_VERIFY_STORE(Name, Heads, CacheElement)                          \
+  kernel void Name(                                                            \
+      device const bfloat *chunk_keys [[buffer(0)]],                           \
+      device const bfloat *chunk_values [[buffer(1)]],                         \
+      device const SplashKvPage *page_table0 [[buffer(2)]],                    \
+      device const SplashKvPage *page_table1 [[buffer(3)]],                    \
+      device const SplashKvPage *page_table2 [[buffer(4)]],                    \
+      device const SplashKvPage *page_table3 [[buffer(5)]],                    \
+      constant SplashChunkedPrefillParams *params [[buffer(6)]],               \
+      uint group [[threadgroup_position_in_grid]],                             \
+      uint thread_index [[thread_index_in_threadgroup]],                       \
+      uint simd_lane [[thread_index_in_simdgroup]],                            \
+      uint simd_group [[simdgroup_index_in_threadgroup]]) {                    \
+    SPLASH_STORE_MAXIMA_##CacheElement                                         \
+    splash_store_verify_phase<Heads, CacheElement>(                            \
+        chunk_keys, chunk_values, page_table0, page_table1, page_table2,       \
+        page_table3, params, maxima, group, thread_index, simd_lane,           \
+        simd_group);                                                           \
+  }
+PAGED_VERIFY_STORE(verify_attention_q8_store, 4, int8_t)
+PAGED_VERIFY_STORE(verify_attention_q8_store_kv2_g8, 2, int8_t)
+PAGED_VERIFY_STORE(verify_attention_bf16_store, 4, bfloat)
+PAGED_VERIFY_STORE(verify_attention_bf16_store_kv2_g8, 2, bfloat)
+#undef PAGED_VERIFY_STORE

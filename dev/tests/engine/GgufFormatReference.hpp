@@ -2,7 +2,8 @@
 
 // CPU reference for the GGUF image formats (metal/abi/QuantFormat.h): native
 // blocks, their fp32 values with llama.cpp's dequantize_row_* semantics (MIT
-// notice in THIRD_PARTY_NOTICES) and the planes the load-time repack writes,
+// notice in THIRD_PARTY_NOTICES), or MLX's for the affine formats, and the
+// planes the load-time repack writes,
 // and the fp64 bound a GGUF projection's result lies within. Shared by the
 // GGUF tests.
 
@@ -82,9 +83,72 @@ std::vector<uint8_t> makeNative(Fmt f, uint32_t N, uint32_t K, std::mt19937 &rng
   }
   return v;
 }
+// MLX affine (metal/abi/QuantFormat.h): the loader's native block {bf16 s, bf16 z, codes}, code l of a block at
+// bits [l b, l b + b) of its codes; value = fma(code, s, z), as the kernels compute it in fp32.
+inline bool affine(Fmt f) { return quant_affine_format(f); }
+inline float bf2f(uint16_t u) { const uint32_t v = uint32_t(u) << 16; float f; memcpy(&f, &v, 4); return f; }
+inline uint16_t f2bf(float f) {   // nearest, ties to even
+  uint32_t v; memcpy(&v, &f, 4);
+  return uint16_t((v + 0x7FFF + ((v >> 16) & 1)) >> 16);
+}
+inline uint32_t affineCode(const uint8_t *codes, uint32_t bits, uint32_t l) {
+  const uint32_t at = l * bits, shift = at % 8;
+  uint32_t word = codes[at / 8];
+  if (shift + bits > 8) word |= uint32_t(codes[at / 8 + 1]) << 8;
+  return (word >> shift) & ((1u << bits) - 1);
+}
+// The native rows (metal/abi/QuantFormat.h) of `rows` MLX rows of K weights: codes packed as MLX packs a row's,
+// a little-endian bit string of `bits` bits each, and per group of `group` its scale (bf16, or mxfp4's E8M0 byte)
+// and an affine tensor's bf16 bias. An affine group is its scale, its bias and its codes; an mxfp4 group a
+// block_mxfp4, its exponent and its codes with element j < 16 in the low nibble of byte j and j + 16 in its high
+// nibble.
+inline std::vector<uint8_t> mlxNative(bool affineMode, uint32_t bits, uint32_t group, uint32_t rows, uint32_t K,
+                                      const std::vector<uint8_t> &weight, const std::vector<uint8_t> &scales,
+                                      const std::vector<uint8_t> &biases) {
+  const uint32_t groupBytes = group * bits / 8, rowCodes = K * bits / 8, groups = K / group;
+  std::vector<uint8_t> native;
+  for (uint32_t r = 0; r < rows; ++r)
+    for (uint32_t g = 0; g < groups; ++g) {
+      const uint8_t *codes = weight.data() + size_t(r) * rowCodes + g * groupBytes;
+      const size_t parameter = size_t(r) * groups + g;
+      if (!affineMode) {
+        native.push_back(scales[parameter]);
+        for (uint32_t j = 0; j < 16; ++j)
+          native.push_back(uint8_t(affineCode(codes, 4, j) | affineCode(codes, 4, j + 16) << 4));
+        continue;
+      }
+      native.insert(native.end(), scales.begin() + 2 * parameter, scales.begin() + 2 * parameter + 2);
+      native.insert(native.end(), biases.begin() + 2 * parameter, biases.begin() + 2 * parameter + 2);
+      native.insert(native.end(), codes, codes + groupBytes);
+    }
+  return native;
+}
+
+// N native rows of random codes whose scales s are drawn from `scale`, each bias z centering its group's values.
+template <class Scale>
+std::vector<uint8_t> makeAffineNative(Fmt f, uint32_t N, uint32_t K, std::mt19937 &rng, Scale scale) {
+  const QuantFormat &fi = kQuantFormats[f];
+  const uint32_t bits = quant_affine_bits(f);
+  std::vector<uint8_t> v((size_t)N * rowBytes(f, K));
+  for (auto &b : v) b = (uint8_t)rng();
+  std::uniform_real_distribution<float> center(0.4f, 0.6f);
+  for (size_t b = 0; b < v.size() / fi.block_bytes; ++b) {
+    uint8_t *blk = v.data() + b * fi.block_bytes;
+    const float s = scale();
+    const uint16_t sb = f2bf(s), zb = f2bf(-bf2f(sb) * float((1u << bits) - 1) * center(rng));
+    memcpy(blk, &sb, 2); memcpy(blk + 2, &zb, 2);
+  }
+  return v;
+}
+
 // The range of a format's half scales that gives its weights the magnitudes a
-// model's have (a few hundredths), so the GEMM checks see realistic sums.
+// model's have (a few hundredths), so the GEMM checks see realistic sums; an
+// MLX affine format's, its bf16 scales'.
 inline std::uniform_real_distribution<float> scaleRange(Fmt f) {
+  if (affine(f)) {
+    const float top = 0.064f / float(1u << quant_affine_bits(f));
+    return std::uniform_real_distribution<float>(top / 4, top);
+  }
   switch (f) {
     case Q4K: case Q5K: case Q3K: case IQ4NL: case Q80: case Q2K: case Q40: case Q41: case MXFP4:
       return std::uniform_real_distribution<float>(0.0005f, 0.004f);
@@ -101,6 +165,7 @@ inline std::uniform_real_distribution<float> scaleRange(Fmt f) {
 // N native rows with scales in the format's realistic range.
 inline std::vector<uint8_t> makeNative(Fmt f, uint32_t N, uint32_t K, std::mt19937 &rng) {
   std::uniform_real_distribution<float> range = scaleRange(f);
+  if (affine(f)) return makeAffineNative(f, N, K, rng, [&] { return range(rng); });
   return makeNative(f, N, K, rng, [&] { return f2h(range(rng)); });
 }
 
@@ -134,6 +199,19 @@ inline void groupPack(Fmt f, const uint8_t *row, uint32_t g, float vals[32], uin
   const uint8_t *blk = row + (g * 32 / fi.block_elements) * fi.block_bytes;
   const uint32_t j = (g * 32 % fi.block_elements) / 32;
   uint8_t lo[32], hi[32];   // per slot: the (low) code and its high bits
+  if (affine(f)) {   // the codes' low 2 (2, 3 bits) or 4 bits (4, 5, 6) and the rest as Q2_K, Q3_K, Q4_K, Q5_K, Q6_K
+    const uint32_t bits = quant_affine_bits(f), low = bits == 8 ? 8 : bits <= 3 ? 2 : 4;
+    uint16_t sb, zb; memcpy(&sb, blk, 2); memcpy(&zb, blk + 2, 2);
+    for (uint32_t e = 0; e < 32; ++e) {
+      const uint32_t code = affineCode(blk + 4, bits, 32 * j + e);
+      vals[e] = std::fma(float(code), bf2f(sb), bf2f(zb));
+      lo[quant_slot(e)] = uint8_t(code & ((1u << low) - 1));
+      hi[quant_slot(e)] = uint8_t(code >> low);
+    }
+    if (low == 4) packPairs(lo, p0); else packBits(lo, low, p0);
+    if (bits != low) packBits(hi, bits - low, p1);
+    return;
+  }
   switch (f) {
     case Q4K: {
       const uint8_t *q = blk + 16 + (j / 2) * 32;
@@ -352,6 +430,7 @@ inline void groupPack(Fmt f, const uint8_t *row, uint32_t g, float vals[32], uin
 inline void metaPack(Fmt f, const uint8_t *row, uint32_t unit, uint8_t *dst) {
   const QuantFormat &fi = kQuantFormats[f];
   const uint8_t *blk = row + unit * fi.block_bytes;
+  if (affine(f)) { memcpy(dst, blk, fi.meta_bytes); return; }   // s, z
   switch (f) {
     // The block's leading fields.
     case Q4K: case Q5K: case IQ4XS: case IQ4NL: case Q80: case IQ3S: case IQ3XXS: case IQ2XXS: case IQ2XS: case IQ2S:
@@ -397,8 +476,8 @@ inline Packed repack(Fmt f, const std::vector<uint8_t> &native, uint32_t N, uint
   return p;
 }
 // Upstream GGML's fp32 dequantization of native rows from an unmodified libggml-base (for example
-// llama.cpp 7ab4ee7) loaded with dlopen; false and a message when it lacks the format's symbol. PQ2_0's
-// symbol needs PrismML-Eng/llama.cpp 01ae597's libggml.
+// llama.cpp 7ab4ee7) loaded with dlopen; false and a message when it lacks the format's symbol, as for every MLX
+// affine format. PQ2_0's symbol needs PrismML-Eng/llama.cpp 01ae597's libggml.
 inline bool ggmlDequantize(void *ggml, Fmt f, const std::vector<uint8_t> &native, std::vector<float> &values,
                            std::string &error) {
   static const char *const symbols[] = {
@@ -407,7 +486,8 @@ inline bool ggmlDequantize(void *ggml, Fmt f, const std::vector<uint8_t> &native
     "dequantize_row_q2_K", "dequantize_row_iq3_xxs", "dequantize_row_iq2_xxs", "dequantize_row_iq2_xs",
     "dequantize_row_iq2_s", "dequantize_row_iq1_s", "dequantize_row_iq1_m", "dequantize_row_q4_0",
     "dequantize_row_q4_1", "dequantize_row_mxfp4", "dequantize_row_pq2_0"};
-  static_assert(std::size(symbols) == FMT_COUNT, "a GGML dequantize_row_* symbol per format");
+  static_assert(std::size(symbols) == GGUF_FMT_AF2G32, "a GGML dequantize_row_* symbol per GGUF format");
+  if (affine(f)) { error = std::string("GGML has no ") + fmtName(f); return false; }
   using Dequantize = void (*)(const void *, float *, int64_t);
   auto decode = reinterpret_cast<Dequantize>(dlsym(ggml, symbols[f]));
   if (!decode) { error = dlerror(); return false; }

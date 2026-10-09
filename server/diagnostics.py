@@ -2,12 +2,26 @@
 
 import sys
 import time
+import traceback
+from pathlib import Path
+
+# The server package, whose innermost frame locates an unexpected error.
+_PACKAGE = Path(__file__).resolve().parent
 
 
 def log_unexpected(error):
+    """Print the type of an unexpected error and the innermost line of the
+    server it passed through, never its message, which may carry request
+    data."""
     try:
+        location = ""
+        for frame, line in traceback.walk_tb(error.__traceback__):
+            path = Path(frame.f_code.co_filename).resolve()
+            if path.parent == _PACKAGE:
+                location = f" · {_PACKAGE.name}/{path.name}:{line}"
         print_status(
-            f"Error · internal_server_error · {type(error).__name__}", error=True
+            f"Error · internal_server_error · {type(error).__name__}{location}",
+            error=True,
         )
     except Exception:
         pass

@@ -6,16 +6,14 @@
 namespace splash::model {
 
 // Names the files a target is read from without the loaders' headers, so a
-// family's header declares its loader alone; QwenTargetLoader.hpp defines
-// PackedTargetFiles and reads the files.
-template <class Layout> struct PackedTargetFiles;
-class AffineTargetLoader;
+// family's header declares its loader alone; QwenTargetLoader.hpp reads the
+// files.
 class GgufTargetLoader;
+class MlxTargetLoader;
 
-// The files a target is read from: packed files (splash-packed-q4 formats),
-// or the cached files a loader prepares from an MLX or GGUF source.
-template <class Layout>
-using QwenTargetFiles = std::variant<PackedTargetFiles<Layout>, std::reference_wrapper<AffineTargetLoader>,
-                                     std::reference_wrapper<GgufTargetLoader>>;
+// The files a target is read from: the block images a loader writes from an
+// MLX source, in its MLX formats, or from a GGUF.
+using QwenTargetFiles =
+    std::variant<std::reference_wrapper<GgufTargetLoader>, std::reference_wrapper<MlxTargetLoader>>;
 
 } // namespace splash::model

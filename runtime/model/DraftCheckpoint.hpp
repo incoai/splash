@@ -1,10 +1,11 @@
 #pragma once
 
-#include "model/AffinePreparation.hpp"
-#include "model/PreparedFiles.hpp"
+#include "model/GgufImage.hpp"
+#include "model/SafetensorsCheckpoint.hpp"
+#include "model/WeightImages.hpp"
 
+#include <filesystem>
 #include <memory>
-#include <span>
 #include <vector>
 
 namespace splash::model {
@@ -12,30 +13,42 @@ namespace splash::model {
 struct DFlashDraftLayout;
 
 // A DFlash2 checkpoint as its repository releases it, config.json and BF16
-// safetensors -> the packed draft files of a Splash package (DFlashDraft.cpp):
-// every projection quantized to affine Q4 as those drafts were, every other
-// tensor copied as stored. The checkpoint is planned once; each file is
-// prepared when it is opened.
+// safetensors -> the draft's block images (DFlashDraft.cpp), laid out as a
+// target's are (model/GgufImage.hpp): every projection quantized into af4g64
+// planes as MLX's affine quantization rounds it, every other tensor copied as
+// stored. The checkpoint is planned once; each image is written into memory
+// when it is opened.
 class DraftCheckpointLoader final {
 public:
-  DraftCheckpointLoader(metal::MetalBackend &backend, const std::filesystem::path &directory,
-                        const DFlashDraftLayout &layout, PreparationCheck admitConversion);
-  ~DraftCheckpointLoader();
-  // Every file's cache identity and size, layers first, for the model's disk
-  // check before the first file is written.
-  [[nodiscard]] std::span<const PreparedWeight> weights() const noexcept;
-  // Writes every missing file and maps none.
-  void prepare();
+  DraftCheckpointLoader(metal::MetalBackend &backend, WeightImages &images, const std::filesystem::path &directory,
+                        const DFlashDraftLayout &layout);
+  DraftCheckpointLoader(const DraftCheckpointLoader &) = delete;
+  DraftCheckpointLoader &operator=(const DraftCheckpointLoader &) = delete;
+
   [[nodiscard]] WeightFile layer(uint32_t index);
   [[nodiscard]] WeightFile model();
 
 private:
-  struct Impl;
-  std::unique_ptr<Impl> impl_;
+  // The checkpoint and its images, which their writers share.
+  struct Planned {
+    explicit Planned(const std::filesystem::path &directory) : checkpoint(directory) {}
+    SafetensorsCheckpoint checkpoint;
+    std::vector<gguf::Image> images; // layers, then model.bin
+  };
+  [[nodiscard]] WeightFile open(size_t index);
+
+  metal::MetalBackend &backend_;
+  WeightImages &images_;
+  std::shared_ptr<Planned> planned_;
 };
 
-// Every planned file of a layout, its sections at their offsets: the layers,
-// then model.bin.
-[[nodiscard]] std::vector<affine::Image> draftCheckpointImages(const DFlashDraftLayout &layout);
+// The images of a draft checkpoint, in the order DFlashDraft.cpp reads them:
+// the layers, then model.bin. The checkpoint outlives them: their rows read
+// its tensors.
+[[nodiscard]] std::vector<gguf::Image> planDraftImages(const SafetensorsCheckpoint &checkpoint,
+                                                       const DFlashDraftLayout &layout);
+
+// The bytes of every image of the draft checkpoint in directory.
+[[nodiscard]] uint64_t draftImageBytes(const std::filesystem::path &directory, const DFlashDraftLayout &layout);
 
 } // namespace splash::model

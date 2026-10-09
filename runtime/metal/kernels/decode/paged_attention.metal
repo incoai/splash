@@ -1,3 +1,4 @@
+#include "metal/kernels/common/lane_bindings.h"
 #include "metal/kernels/common/paged_attention_tile.h"
 
 // Verify tiles process one lane's eight rows per KV head and history split.
@@ -36,10 +37,7 @@ inline SplashVerifyTile splash_verify_attention_tile_at(
   constexpr ulong group_stride =
       ulong(SPLASH_VERIFY_CHUNK_STRIDE) * QueryHeadsPerKVHead * D;
   tile.queries = queries + (ulong(batch) * KVHeads + kv_head) * group_stride;
-  tile.page_table =
-      batch == 0 ? page_table0
-                 : (batch == 1 ? page_table1
-                               : (batch == 2 ? page_table2 : page_table3));
+  tile.page_table = SPLASH_LANE_BINDING(batch, page_table0, page_table1, page_table2, page_table3);
   tile.slot =
       (ulong(batch) * KVHeads + kv_head) * lane_params.slot_splits + split;
   tile.kv_head = kv_head;
@@ -134,28 +132,20 @@ inline void splash_verify_attention_reduce_phase(
       thread_index, weights, group_values);
 }
 
-kernel void verify_attention_reduce(
-    device const float *partials [[buffer(0)]],
-    device const float *statistics [[buffer(1)]],
-    device bfloat *output [[buffer(2)]],
-    constant SplashVerifyAttentionParams *params [[buffer(3)]],
-    uint3 group [[threadgroup_position_in_grid]],
-    uint thread_index [[thread_index_in_threadgroup]]) {
-  threadgroup float weights[SplashVerifyMaximumSplits];
-  threadgroup float group_values[8];
-  splash_verify_attention_reduce_phase<4, 6>(
-      partials, statistics, output, params, group, thread_index, weights, group_values);
-}
-
-kernel void verify_attention_reduce_kv2_g8(
-    device const float *partials [[buffer(0)]],
-    device const float *statistics [[buffer(1)]],
-    device bfloat *output [[buffer(2)]],
-    constant SplashVerifyAttentionParams *params [[buffer(3)]],
-    uint3 group [[threadgroup_position_in_grid]],
-    uint thread_index [[thread_index_in_threadgroup]]) {
-  threadgroup float weights[SplashVerifyMaximumSplits];
-  threadgroup float group_values[8];
-  splash_verify_attention_reduce_phase<2, 8>(
-      partials, statistics, output, params, group, thread_index, weights, group_values);
-}
+#define PAGED_VERIFY_REDUCE(Name, Heads, Group)                                \
+  kernel void Name(                                                            \
+      device const float *partials [[buffer(0)]],                              \
+      device const float *statistics [[buffer(1)]],                            \
+      device bfloat *output [[buffer(2)]],                                     \
+      constant SplashVerifyAttentionParams *params [[buffer(3)]],              \
+      uint3 group [[threadgroup_position_in_grid]],                            \
+      uint thread_index [[thread_index_in_threadgroup]]) {                     \
+    threadgroup float weights[SplashVerifyMaximumSplits];                      \
+    threadgroup float group_values[8];                                         \
+    splash_verify_attention_reduce_phase<Heads, Group>(                        \
+        partials, statistics, output, params, group, thread_index, weights,    \
+        group_values);                                                         \
+  }
+PAGED_VERIFY_REDUCE(verify_attention_reduce, 4, 6)
+PAGED_VERIFY_REDUCE(verify_attention_reduce_kv2_g8, 2, 8)
+#undef PAGED_VERIFY_REDUCE

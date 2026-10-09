@@ -19,15 +19,15 @@ below with `make all build/engine-tests/<tool>`.
 | 27B `mmproj-BF16.gguf` | `83ee4f4f205fa514161778c41df1ea14144faa0f713510893b63c2395f5c2d53` |
 | 35B `mmproj-BF16.gguf` | `356dfaa3111376a4f7165e32e8749713378d1700b37cf52e0c50d9f23322334d` |
 
-Drafts are prepared from each family's DFlash2 repository (`families.FAMILIES`);
+Drafts are loaded from each family's DFlash2 repository (`families.FAMILIES`);
 the ones measured here were `incoai/Qwen3.8-27B-DFlash2` at `015e7956` and
-`incoai/Qwen3.6-35B-A3B-DFlash2` at `51ef7b69`. The prepared files are
+`incoai/Qwen3.6-35B-A3B-DFlash2` at `51ef7b69`. The draft images are
 byte-identical to the drafts of the released Qwen3.8-27B and Qwen3.6-35B-A3B
 packages.
 
-## Prepared bytes
+## Image bytes
 
-Preparation changes layout, never values:
+Loading changes layout, never values:
 
 - Affine 35B: every byte of all 40 layers, head and embedding matches the
   released package.
@@ -36,10 +36,11 @@ Preparation changes layout, never values:
   GDN layers differs by at most one float ULP from the package's MLX
   exponential; the adapter computes `float(-exp(double(A_log)))`, and the
   source oracle allows at most two ULP in that section.
-- GGUF: the bounded repack of all eight supported formats, with multiple row
-  tiles, wide rows, head permutations and offsets above 4 GiB, matches the CPU
-  reference bytewise on the M3 Max and the M5 Pro.
-- Vision: every source prepares the packed `vision/model.bin`, padding included.
+- GGUF: the bounded repack of all eight formats supported then, with multiple
+  row tiles, wide rows, head permutations and offsets above 4 GiB, matches the
+  CPU reference bytewise on the M3 Max and the M5 Pro.
+- Vision: every source is written into an image laid out as a package's
+  `vision/model.bin`, padding included.
 
 | Vision source | Bytes | SHA-256 |
 | --- | ---: | --- |
@@ -51,24 +52,19 @@ Each Unsloth mmproj holds 334 tensors: 110 BF16 matrices and 224 F32 tensors
 F32 values has non-zero low 16 bits (0 of 4,833,008 for 27B, 0 of 4,829,936 for
 35B), so they convert to BF16 exactly.
 
-The affine comparison is `affine-source-oracle` (DEVELOPMENT.md, Validate),
-which prints `packed_exact=true` and the decay's `decay_max_ulp` per file; give
-it a scratch `SPLASH_WEIGHT_CACHE`. The GGUF repack check is `gguf-preparation`
-in `make test-engine-metal`.
+The affine comparison was `affine-source-oracle`, which printed
+`package_exact=true` and the decay's `decay_max_ulp` per file; it was removed
+with Splash packages, which later releases do not load. The GGUF repack check is
+`gguf-preparation` in `make test-engine-metal`.
 
-```sh
-SPLASH_WEIGHT_CACHE=$(mktemp -d) build/engine-tests/affine-source-oracle build/splash.metallib \
-  install/models/mlx-community/Qwen3.6-35B-A3B-4bit/target install/models/incoai/Qwen3.6-35B-A3B-Splash
-```
-
-A prepared vision file is the `weights` file of the cache entry whose `source`
-names `component vision/model.bin` (`grep -l '^component vision/model.bin'
-~/Library/Caches/Splash/weights/*/source`).
+`weight-digests` prints the size and SHA-256 of every image a model loads,
+`vision/model.bin` among them:
+`build/engine-tests/weight-digests build/splash.metallib MODEL_ROOT`.
 
 The vision fixture embedding is unchanged, with Metal shader validation:
 `7946f077435ef45d0a596461a9d9a234ff458c805c007bb3ea1af7296bd230f9` for 35B on
 both M5 Pro devices, `011d9121bf52f85a26e7eff28e9c9459a48eb0bb36d585ff8e7ef7621cd3a37b`
-for 27B on the M3 Max. The 35B mmproj and MLX sources give the packed embedding.
+for 27B on the M3 Max. The 35B mmproj and MLX sources give the package's embedding.
 `make test-real MODEL=...` prints it (`embedding SHA-256`) with the vision
 parity check.
 
@@ -94,36 +90,41 @@ which shares vocabulary, merges and pre-tokenizer (used only as a test reference
   thinking on and off) match the original template and the reference token IDs.
 
 That comparison script is not in the repository. The committed checks are
-`python -m unittest dev.tests.test_gguf_metadata` (synthetic metadata) and the
-chat-template probe tests over the embedded templates in
+`python -m unittest dev.tests.install.test_gguf_metadata` (synthetic metadata)
+and the chat-template probe tests over the embedded templates in
 `dev/tests/fixtures/chat_templates/`.
 
-## Preparation cost
+## Loading time
 
-35B UD-Q4_K_M GGUF: 42 artifacts, 22,143,172,608 bytes, prepared by the
-batched executor of `2ca5691`; later preparation changes did not repeat this
-timing.
+Every start writes the weight images from their sources, and the first request
+after an idle release writes them again (DEVELOPMENT.md, Weight loading): a
+start logs `Weights loaded in N s.`, a restore `Weights restored in N s`.
+Measured in October 2026 on an M5 Max (40 GPU cores, 64 GB), otherwise idle,
+from its internal SSD: the time that log reports, for one load in a process of
+its own, and the process's peak footprint (`/usr/bin/time -l`).
 
-| Device | Cold preparation | Reuse of prepared files |
-| --- | ---: | ---: |
-| M3 Max | 29.74 s | 0.641 s |
-| M5 Pro 16 cores | 24.30–25.87 s | 0.533–0.539 s |
+| Model | Images | Sources not cached | Sources cached | Peak footprint |
+| --- | ---: | ---: | ---: | ---: |
+| 35B UD-Q2_K_XL GGUF | 11.89 GiB | 2.09 s | 0.71–0.74 s | 12.11 GiB |
+| 35B MLX 4-bit | 19.49 GiB | 2.18 s | 1.63–1.67 s | 19.64 GiB |
+| 27B MLX 4-bit | 16.16 GiB | 2.73 s | 1.44–1.45 s | 16.37 GiB |
 
-Cold means an empty preparation cache and no source hash proof. The times cover
-backend creation, source verification, planning, conversion, output hashing and
-publication, not tokenizer, server startup or warmup. Peak process RSS is about
-65–68 MB; staging is bounded to 32 MiB inside a 64 MiB admission reserve and does
-not grow with tensor, layer or expert count. No run increased the system swap
-counters. Reopening the prepared affine 35B files takes 0.064 s on the M5 Pro 20
-(`affine-source-oracle ... --load-only`, which prints `seconds=`). The GGUF
-timing harness is not in the repository; a cold start logs each artifact's
-`Prepared <component> in N s`.
+"Not cached" reads fresh copies of the sources, which no read has left in the
+page cache, as a start long after the download does; the writers' own reads
+bypass the cache. The peak footprint includes the Metal backend's own 0.1 GiB:
+beside the images, loading stages 4 MiB per thread and one GGUF repack's rows.
+Restores after an idle release took 1.3–2.1 s for these models, and every
+image's bytes after each restore equaled the first load's.
+
+The cache this replaced prepared the 35B UD-Q4_K_M GGUF, on `2ca5691`, in
+29.74 s on the M3 Max and 24.30–25.87 s on the M5 Pro 16 when cold, and then
+reopened the prepared files in 0.641 s and 0.533–0.539 s.
 
 ## Decode throughput
 
 Baseline: PR 114 (`d25020e`), serving the Splash packages. Candidate: its child
 `f72b411`, which introduced source preparation, serving the packages
-("packed"), the MLX checkpoints with the packages' drafts ("prepared"), and the
+("package"), the MLX checkpoints with the packages' drafts ("prepared"), and the
 Unsloth GGUFs through the GGUF packages of that time ("GGUF"). 64 tokens per lane at B1–B4, run
 baseline/candidate/candidate/baseline; ratios are baseline median GPU time over
 candidate median GPU time, so 1.000 is unchanged.
@@ -135,11 +136,11 @@ build/engine-tests/backend-benchmark build/splash.metallib MODEL_ROOT \
 
 | Device | Target | B1 | B2 | B3 | B4 |
 | --- | --- | ---: | ---: | ---: | ---: |
-| M3 Max | packed affine 27B | 0.999 | 1.000 | 0.999 | 0.999 |
-| M3 Max | packed affine 35B | 1.004 | 0.997 | 0.998 | 0.996 |
+| M3 Max | package affine 27B | 0.999 | 1.000 | 0.999 | 0.999 |
+| M3 Max | package affine 35B | 1.004 | 0.997 | 0.998 | 0.996 |
 | M3 Max | GGUF 27B | 1.003 | 1.001 | 1.000 | 1.000 |
 | M3 Max | GGUF 35B | 0.999 | 1.000 | 1.000 | 0.998 |
-| M5 Pro 16 | packed affine 27B | 0.995 | 1.000 | 1.003 | 0.997 |
+| M5 Pro 16 | package affine 27B | 0.995 | 1.000 | 1.003 | 0.997 |
 | M5 Pro 16 | prepared affine 27B | 1.000 | 0.997 | 1.000 | 0.998 |
 | M5 Pro 16 | prepared affine 35B | 0.999 | 1.004 | 1.000 | 0.998 |
 | M5 Pro 16 | GGUF 35B | 1.005 | 1.008 | 1.001 | 1.000 |

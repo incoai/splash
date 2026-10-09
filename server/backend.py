@@ -18,7 +18,12 @@ from .errors import APIError, ConstraintError
 from .latency import RequestLatency
 from .metrics import metrics_dict
 from .output import hold_partial
-from .tool_schema import THINK_END_TOKEN_ID, ToolPolicy
+from .tool_schema import (
+    CALL_OPEN,
+    THINK_END_TOKEN_ID,
+    TOOL_CALL_OPEN_TOKEN_ID,
+    ToolPolicy,
+)
 
 # A failure counts toward a crash loop unless its engine served this long.
 CRASH_LOOP_WINDOW_SECONDS = 60.0
@@ -31,7 +36,6 @@ RESTART_BACKOFF_SECONDS = 5.0
 
 # Control requests use a short live probe and explicitly label stale snapshots.
 STATUS_REFRESH_TIMEOUT_SECONDS = 0.05
-STATUS_BACKGROUND_TIMEOUT_SECONDS = 30.0
 
 
 def remaining_request_time(deadline):
@@ -104,7 +108,6 @@ class Job:
     tools_signature: tuple | None = None
     response_previous_id: str | None = None
     response_history_items: list | None = None
-    return_progress: bool = False
     # Option token ids for score-only jobs; empty means ordinary generation.
     score_tokens: tuple = ()
     # Trailing prompt tokens of the chat template's generation prompt; zero
@@ -117,6 +120,12 @@ class Job:
     # The digest of a judgment's rendered prompt, which its response reports.
     prompt_sha256: str | None = None
     latency: RequestLatency | None = None
+
+    @property
+    def may_call_tools(self):
+        """Whether the output may call a tool: tools are offered under a
+        choice other than none."""
+        return self.tool_policy is not None and bool(self.tool_policy.schemas)
 
 
 class CallbackStreamer:
@@ -207,13 +216,29 @@ class CallbackStreamer:
             self._send(self.pending_text)
             self.pending_text = ""
 
-    def count_reasoning_tokens(self, enabled):
+    def count_reasoning_tokens(self, enabled, tool_calls=False):
+        """The tokens before the reasoning's end, as ReasoningSplitter reads
+        the text: its close, or where a call may follow, a call's opening."""
         if not enabled:
             return 0
-        try:
-            return self.token_ids.index(THINK_END_TOKEN_ID)
-        except ValueError:
-            return len(self.token_ids)
+        for index, token in enumerate(self.token_ids):
+            if token == THINK_END_TOKEN_ID or (
+                tool_calls
+                and token == TOOL_CALL_OPEN_TOKEN_ID
+                and self._opens_call(index)
+            ):
+                return index
+        return len(self.token_ids)
+
+    def _opens_call(self, index):
+        """Whether the text from the call-open token at `index` on begins
+        CALL_OPEN, decoded from as few tokens as decide it."""
+        text = ""
+        for end in range(index + 1, len(self.token_ids) + 1):
+            text = self.tokenizer.decode(self.token_ids[index:end])
+            if len(text) >= len(CALL_OPEN) or not CALL_OPEN.startswith(text):
+                break
+        return text.startswith(CALL_OPEN)
 
 
 @dataclass
@@ -382,10 +407,12 @@ class NativeBackend:
                     self._relaunch(due)
                 continue
             try:
+                restarts = self.runtime.restart_count
                 event = self.runtime.status(
-                    timeout=STATUS_BACKGROUND_TIMEOUT_SECONDS, fail_unanswered=True
+                    timeout=engine_runtime.STATUS_ANSWER_LIMIT_SECONDS,
+                    fail_unanswered=True,
                 )
-                self._cache_status(self._decode_status_event(event))
+                self._cache_status(self._decode_status_event(event), restarts)
             except Exception as error:
                 # The snapshot stays. A refresh left unanswered has failed its
                 # engine, whose relaunch is now owed; after any other failure
@@ -441,11 +468,20 @@ class NativeBackend:
             raise ValueError("native status does not match the current schema")
         return snapshot
 
-    def _cache_status(self, snapshot):
+    def _cache_status(self, snapshot, restarts):
+        """Cache `snapshot` unless the engine that answered it has failed or
+        been replaced since `restarts` was read; return whether it was cached."""
         with self.lock:
-            # An answer from an engine that has failed since is no evidence.
-            if self.closing or not self.runtime.ready:
-                return
+            # An answer from an engine that has failed since is no evidence,
+            # even once a relaunched one serves. Ready is read first, so an
+            # unchanged count means the engine found Ready is the one that
+            # answered.
+            if (
+                self.closing
+                or not self.runtime.ready
+                or self.runtime.restart_count != restarts
+            ):
+                return False
             self.status_snapshot = copy.deepcopy(snapshot)
             self.status_snapshot_at = time.monotonic()
             self.status_unanswered_since = None
@@ -453,6 +489,7 @@ class NativeBackend:
             self.engine_error = None
         if restarted:
             print_status("Engine restarted")
+        return True
 
     def status(self, timeout=STATUS_REFRESH_TIMEOUT_SECONDS):
         stale_error = None
@@ -468,6 +505,7 @@ class NativeBackend:
         try:
             if refresh_pending:
                 raise TimeoutError("native status refresh is pending")
+            restarts = self.runtime.restart_count
             event = self.runtime.status(timeout=timeout)
             snapshot = self._decode_status_event(event)
         except Exception as error:
@@ -503,11 +541,12 @@ class NativeBackend:
                     and snapshot.get("ready") is True
                     and (
                         unanswered is None
-                        or now - unanswered < STATUS_BACKGROUND_TIMEOUT_SECONDS
+                        or now - unanswered < engine_runtime.STATUS_ANSWER_LIMIT_SECONDS
                     )
                 )
         else:
-            self._cache_status(snapshot)
+            if not self._cache_status(snapshot, restarts):
+                snapshot["ready"] = False
         with self.lock:
             transport_ready = not self.closing and self.runtime.ready
             engine_error = self.engine_error
@@ -563,7 +602,6 @@ class NativeBackend:
             constraint=constraint,
             image_spans=job.image_spans,
             image_pixels=job.image_pixels,
-            return_progress=job.return_progress,
             score_tokens=job.score_tokens,
             generation_prompt_tokens=job.generation_prompt_tokens,
             flags=job.flags,
@@ -649,7 +687,11 @@ class NativeBackend:
                 refusal = None
                 if isinstance(
                     error,
-                    (engine_runtime.EngineUnhealthy, engine_runtime.RuntimeClosed),
+                    (
+                        engine_runtime.EngineUnhealthy,
+                        engine_runtime.ProtocolFatal,
+                        engine_runtime.RuntimeClosed,
+                    ),
                 ):
                     # Not admitted: refused as a request arriving now would be.
                     refusal = self.refusal()
@@ -731,7 +773,9 @@ class NativeBackend:
                 # still be computing.
                 job.constraint.finish()
             state.streamer.end()
-            job.reasoning_tokens = state.streamer.count_reasoning_tokens(job.thinking)
+            job.reasoning_tokens = state.streamer.count_reasoning_tokens(
+                job.thinking, job.may_call_tools
+            )
             stop_sequence = state.streamer.stop_sequence
             result = NativeResult(
                 reason=(
@@ -759,10 +803,11 @@ class NativeBackend:
                 queued = latency.get("queue_to_start_ms")
                 if queued is not None:
                     job.latency.metrics.observe("native_queue", queued / 1000.0)
-        except engine_runtime.EngineUnhealthy:
-            # An admitted request ends with EngineUnhealthy only when the
-            # engine running it fails. The listener has already decided
-            # whether that engine restarts; the console names the failure.
+        except (engine_runtime.EngineUnhealthy, engine_runtime.ProtocolFatal):
+            # An admitted request ends with EngineUnhealthy or ProtocolFatal
+            # only when the engine running it fails: it stopped or broke the
+            # protocol. The listener has already decided whether that engine
+            # restarts; the console names the failure.
             with self.lock:
                 fatal_error = self.fatal_error
             if fatal_error is not None:
@@ -810,13 +855,11 @@ class NativeBackend:
                     code,
                 )
             request_codes = {
-                "integer_overflow",
                 "invalid_constraint",
                 "invalid_count",
                 "invalid_deadline",
                 "invalid_enum_value",
                 "invalid_request",
-                "invalid_request_id",
                 "invalid_sampling",
                 "limit_exceeded",
             }
@@ -833,11 +876,14 @@ class NativeBackend:
             # overload like the gate's own, retried the same way.
             return APIError(503, "request queue is full", "frontend_overloaded")
         if isinstance(
-            error, (engine_runtime.EngineUnhealthy, engine_runtime.RuntimeClosed)
+            error,
+            (
+                engine_runtime.EngineUnhealthy,
+                engine_runtime.ProtocolFatal,
+                engine_runtime.RuntimeClosed,
+            ),
         ):
             return APIError(503, str(error), "runtime_unavailable")
-        if isinstance(error, engine_runtime.ProtocolFatal):
-            return APIError(500, str(error), "protocol_error")
         if isinstance(error, TimeoutError):
             return APIError(504, "request timed out", "request_timeout")
         return APIError(500, str(error), "runtime_error")

@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <iterator>
 #include <array>
+#include <charconv>
 #include <chrono>
 #include <thread>
 #include <condition_variable>
@@ -494,7 +495,7 @@ runDecodeThroughput(engine::Engine &engine, Driver &driver,
   // publishes the composite state there and splits its prefill around it, so
   // it would start decoding one command after the deduplicated lanes. Warm
   // the prefix with a one-token request; every lane then resumes from the
-  // published prefix in a single packed prefill and decodes in lockstep.
+  // published prefix in a single ragged prefill and decodes in lockstep.
   {
     EngineRequest warm;
     warm.id = requestId++;
@@ -696,6 +697,34 @@ uint32_t parseSamples(std::string_view value) {
   return static_cast<uint32_t>(parsed);
 }
 
+// A context limit, as serve's --max-context: a positive token count.
+uint32_t parseMaxContext(std::string_view value) {
+  uint32_t tokens = 0;
+  const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), tokens);
+  if (error != std::errc{} || end != value.data() + value.size() || !tokens)
+    throw std::invalid_argument("--max-context takes a positive token count");
+  return tokens;
+}
+
+// --ane-ffn-minimum-rows: the least rows of a chunk the prefill FFN's Neural
+// Engine split takes, a positive count.
+uint32_t parseAneFfnMinimumRows(std::string_view value) {
+  uint32_t rows = 0;
+  const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), rows);
+  if (error != std::errc{} || end != value.data() + value.size() || !rows)
+    throw std::invalid_argument("--ane-ffn-minimum-rows takes a positive row count");
+  return rows;
+}
+
+// --ane-ffn-share: the prefill FFN's Neural Engine share, in [0, 1).
+double parseAneFfnShare(std::string_view value) {
+  double share = 0.0;
+  const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), share);
+  if (error != std::errc{} || end != value.data() + value.size() || !(share >= 0.0 && share < 1.0))
+    throw std::invalid_argument("--ane-ffn-share takes a share in [0, 1)");
+  return share;
+}
+
 double median(std::vector<double> values) {
   if (values.empty())
     throw std::invalid_argument("cannot take the median of no samples");
@@ -725,17 +754,20 @@ std::vector<double> decodeWallThroughputs(
 struct BenchmarkScenarios final {
   bool decode = true;
   bool partial = true;
+  // The short scenario; short is a keyword.
+  bool shortPrompts = false;
   bool context = true;
   bool exact = false;
 };
 
 BenchmarkScenarios parseScenarios(std::string_view value) {
-  BenchmarkScenarios selected{false, false, false, false};
+  BenchmarkScenarios selected{false, false, false, false, false};
   for (;;) {
     const size_t comma = value.find(',');
     const std::string_view name = value.substr(0, comma);
     bool *scenario = name == "decode"    ? &selected.decode
                      : name == "partial" ? &selected.partial
+                     : name == "short"   ? &selected.shortPrompts
                      : name == "context" ? &selected.context
                      : name == "exact"   ? &selected.exact
                                          : nullptr;
@@ -761,14 +793,24 @@ int main(int argc, char **argv) {
     if (argc < 3) {
       std::cerr << "usage: backend-benchmark METALLIB MODEL_ROOT "
                    "[--samples COUNT] [--progress PATH] "
-                   "[--scenario NAME[,NAME...]]\n"
-                   "  NAME: decode, partial, context or exact "
-                   "(default: decode,partial,context)\n";
+                   "[--scenario NAME[,NAME...]] [--ane-ffn-share SHARE "
+                   "[--ane-ffn-minimum-rows ROWS]] [--max-context TOKENS]\n"
+                   "  NAME: decode, partial, short, context or exact "
+                   "(default: decode,partial,context)\n"
+                   "  SHARE: the prefill FFN's Neural Engine share in [0, 1) "
+                   "to run instead of calibrating one (0: GPU alone)\n"
+                   "  ROWS: the least rows of a chunk that share takes "
+                   "(default: 512)\n"
+                   "  TOKENS: the context the engine serves, as serve's "
+                   "--max-context (default: what memory holds)\n";
       return 2;
     }
     uint32_t samples = 1;
     BenchmarkScenarios selected;
     std::optional<std::filesystem::path> progressPath;
+    std::optional<double> aneFfnShare;
+    std::optional<uint32_t> aneFfnMinimumRows;
+    uint32_t maxContext = 0;
     for (int index = 3; index < argc; index += 2) {
       if (index + 1 >= argc)
         throw std::invalid_argument("benchmark option requires a value");
@@ -779,6 +821,12 @@ int main(int argc, char **argv) {
         progressPath = std::filesystem::path(argv[index + 1]);
       } else if (option == "--scenario") {
         selected = parseScenarios(argv[index + 1]);
+      } else if (option == "--ane-ffn-share") {
+        aneFfnShare = parseAneFfnShare(argv[index + 1]);
+      } else if (option == "--ane-ffn-minimum-rows") {
+        aneFfnMinimumRows = parseAneFfnMinimumRows(argv[index + 1]);
+      } else if (option == "--max-context") {
+        maxContext = parseMaxContext(argv[index + 1]);
       } else {
         throw std::invalid_argument("unknown benchmark option");
       }
@@ -787,11 +835,15 @@ int main(int argc, char **argv) {
       progress = std::make_unique<ProgressJournal>(*progressPath, samples);
 
     engine::RuntimeBootstrapConfig bootstrapConfig;
+    engine::RuntimeMetrics metrics;
+    bootstrapConfig.nativeLoop.metrics = &metrics;
     auto &config = bootstrapConfig.resources;
     config.metallibPath = std::filesystem::path(argv[1]);
     config.modelRoot = std::filesystem::path(argv[2]);
-    config.model = model::inspectModelPackage(config.modelRoot);
+    config.model = model::inspectModelRoot(config.modelRoot);
     config.buildId = SPLASH_BUILD_ID;
+    config.aneFfn = engine::AneFfnSetting::fromGiven(aneFfnShare, aneFfnMinimumRows);
+    bootstrapConfig.nativeLoop.engine.maxContext = maxContext;
     const std::string modelRoot = config.modelRoot.string();
     const auto &capabilities = config.model.capabilities;
     // Complete production warmup and memory audit before measuring. Retry
@@ -820,14 +872,17 @@ int main(int argc, char **argv) {
         std::this_thread::sleep_for(std::chrono::seconds(2));
       }
     }
-    if (!bootstrap->nativeLoop().ready() ||
-        !bootstrap->nativeLoop().engineHealthy() ||
+    // start() returns once the loop has announced Ready.
+    if (!bootstrap->nativeLoop().engineHealthy() ||
         bootstrap->nativeLoop().commandInFlight())
       throw std::runtime_error("benchmark production bootstrap did not finish idle and ready");
     // Non-owning borrows. This scope never feeds or ticks the bootstrap loop;
     // its Engine stays empty. The later benchmark Engine is the sole request
     // driver and is destroyed before the bootstrap owner/model/shared cache.
     auto *resources = &bootstrap->resources();
+    // The Neural Engine split startup calibrated, or the one given.
+    const double ranAneFfnShare = resources->aneFfnShare();
+    const uint32_t ranAneFfnMinimumRows = resources->aneFfnMinimumRows();
     auto *executor = &bootstrap->modelRuntime();
     const auto &cacheIdentity = resources->cacheIdentity();
     const std::string identity =
@@ -855,41 +910,17 @@ int main(int argc, char **argv) {
         decodeWarmupWall{};
     std::array<double, model::ExecutionLimits::maximumBatchWidth>
         decodeWarmupGpu{};
-    std::array<std::vector<double>, model::ExecutionLimits::maximumBatchWidth>
-        decodeSamples;
     std::vector<std::string> performanceFailures;
     for (uint32_t width = 1; width <= decodeWarmupWall.size(); ++width) {
       decodeWarmupWall[width - 1] =
           executor->warmupDecodeBatch(width).wallSeconds * 1000.0;
       decodeWarmupGpu[width - 1] =
           executor->telemetry().lastDecodeGpuSeconds * 1000.0;
-      decodeSamples[width - 1].reserve(samples);
-    }
-    for (uint32_t sample = 0; sample < samples; ++sample) {
-      for (uint32_t offset = 0; offset < decodeWarmupWall.size(); ++offset) {
-        const uint32_t width =
-            1 + (sample + offset) % decodeWarmupWall.size();
-        if (progress)
-          progress->begin("warmup", "decode", sample, 0, width);
-        static_cast<void>(executor->warmupDecodeBatch(width));
-        const double gpuMilliseconds =
-            executor->telemetry().lastDecodeGpuSeconds * 1000.0;
-        decodeSamples[width - 1].push_back(gpuMilliseconds);
-        if (progress) {
-          progress->complete("decode_warmup", "B" + std::to_string(width),
-                             sample, 0, width, 0.0, gpuMilliseconds, 0.0);
-        }
-      }
-    }
-    if (median(decodeSamples[2]) >
-        median(decodeSamples[0]) + median(decodeSamples[1])) {
-      performanceFailures.push_back(
-          "direct B3 decode is slower than separate B1 plus B2 commands");
     }
 
     Events events;
     engine::EngineConfig engineConfig;
-    engineConfig.maxContext = resources->memoryPlan().maximumContextTokens();
+    engineConfig.maxContext = bootstrap->nativeLoop().snapshot().maximumContextTokens;
     engineConfig.vocabularySize = capabilities.vocabularySize;
     engine::connectToGovernor(engineConfig, resources->memoryGovernor());
     engine::Engine engine(engineConfig, resources->cache(),
@@ -937,6 +968,26 @@ int main(int argc, char **argv) {
           *std::min_element(b2.begin(), b2.end())) {
         performanceFailures.push_back(
             "B3 aggregate decode throughput fell below B2");
+      }
+      // Nor may a B3 step take longer than a B1 step and a B2 step, which
+      // would decode the three lanes sooner apart. Every width is timed over
+      // its own run of steps here. A warmup command is not comparable across
+      // widths: it follows one setup prefill per lane, so where sustained
+      // load lowers the GPU clock (an M3 Max in Low Power Mode) a wider one
+      // runs at a lower clock.
+      const auto stepGpuMilliseconds = [&](uint32_t width) {
+        std::vector<double> values;
+        for (const DecodeThroughputMeasurement &measurement : decodeThroughput) {
+          if (measurement.width == width)
+            values.push_back(measurement.decodeGpuMilliseconds /
+                             static_cast<double>(measurement.decodeBatches));
+        }
+        return median(std::move(values));
+      };
+      if (stepGpuMilliseconds(3) >
+          stepGpuMilliseconds(1) + stepGpuMilliseconds(2)) {
+        performanceFailures.push_back(
+            "a B3 decode step takes longer than a B1 step and a B2 step");
       }
     }
 
@@ -1139,6 +1190,28 @@ int main(int argc, char **argv) {
       }
     }
 
+    // Cold prefills whose first chunk holds these rows, around where the
+    // prefill FFN's Neural Engine split starts and where its program's
+    // functions step (ops::AneFfn): a cold prompt prefills up to its replay
+    // point, the last 32-token page boundary before its last token, then the
+    // rest, so a prompt of rows + 1 tokens runs a chunk of those rows and one
+    // of a row. Each prompt is unique and runs on an empty cache.
+    if (selected.shortPrompts) {
+      constexpr std::array<uint32_t, 8> shortRows{480, 512, 544, 640, 672, 1024, 1536, 2016};
+      for (uint32_t sample = 0; sample < samples; ++sample) {
+        for (uint32_t rows : shortRows) {
+          evictAllCache(resources->cache());
+          Measurement result = runRequest(
+              engine, driver, *executor, events, progress.get(), requestId++, "short", sample,
+              prompt(rows + 1, (uint64_t{rows} << 32 | sample) ^ 0x53484f5254ULL));
+          if (result.cacheStatus != "miss")
+            throw std::runtime_error("short prompt of a " + std::to_string(rows) +
+                                     "-row chunk was not a cold miss: " + result.cacheStatus);
+          measurements.push_back(std::move(result));
+        }
+      }
+    }
+
     // A request lazily materializes a KV junction where its match ends past
     // its state at a branch point: another branch goes on below and holds a
     // state there, and the junction lies a draft window or more past the
@@ -1209,8 +1282,13 @@ int main(int argc, char **argv) {
       measurements.push_back(std::move(lazyReuse));
     }
 
+    // Shortest form that reads back as the same share.
+    std::array<char, 32> share{};
+    const auto written = std::to_chars(share.data(), share.data() + share.size(), ranAneFfnShare);
     std::cout << "{\"schema_version\":2,\"build_id\":\"" << SPLASH_BUILD_ID
               << "\",\"identity\":" << identity
+              << ",\"ane_ffn_share\":" << std::string_view(share.data(), written.ptr - share.data())
+              << ",\"ane_ffn_minimum_rows\":" << ranAneFfnMinimumRows
               << ",\"geometry\":{\"prefill_rows\":"
               << model::ExecutionLimits::prefillTokenBudget
               << ",\"verify_rows\":" << model::ExecutionLimits::targetVerifyRows
@@ -1232,18 +1310,6 @@ int main(int argc, char **argv) {
       if (index)
         std::cout << ',';
       std::cout << decodeWarmupGpu[index];
-    }
-    std::cout << "],\"decode_gpu_samples_ms\":[";
-    for (size_t width = 0; width < decodeSamples.size(); ++width) {
-      if (width)
-        std::cout << ',';
-      std::cout << '[';
-      for (size_t sample = 0; sample < decodeSamples[width].size(); ++sample) {
-        if (sample)
-          std::cout << ',';
-        std::cout << decodeSamples[width][sample];
-      }
-      std::cout << ']';
     }
     std::cout << "]},\"decode_throughput\":{\"prompt_tokens\":"
               << decodeThroughputPrompt.size()
@@ -1283,7 +1349,15 @@ int main(int argc, char **argv) {
                 << ",\"aggregate_gpu_tokens_per_second\":"
                 << value.aggregateGpuTokensPerSecond << '}';
     }
+    // The context the engine served, the automatic one whatever split the
+    // round ran (engine::AneFfnOutcome::context) unless --max-context gave
+    // it, and the one its memory plan holds without the Neural Engine split,
+    // and its elastic state/KV budget and the split's.
+    const engine::EngineMemoryBreakdown &plan = resources->memoryPlan().breakdown();
     std::cout << "]},\"max_context_tokens\":" << engineConfig.maxContext
+              << ",\"no_ane_context_tokens\":" << resources->aneFfnOutcome().contextWithout
+              << ",\"dynamic_budget_bytes\":" << plan.dynamicBudgetBytes
+              << ",\"ane_ffn_bytes\":" << plan.aneFfnBytes
               << ",\"skipped_context_lengths\":[";
     for (size_t index = 0; index < skippedLengths.size(); ++index)
       std::cout << (index ? "," : "") << skippedLengths[index];

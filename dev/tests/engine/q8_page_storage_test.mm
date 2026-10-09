@@ -21,17 +21,8 @@ using splash::test::entryOf;
 
 namespace {
 
+using splash::test::rejects;
 using splash::test::require;
-
-template <typename Exception, typename Function>
-void requireThrows(Function &&function, const char *message) {
-    try {
-        function();
-    } catch (const Exception &) {
-        return;
-    }
-    throw std::runtime_error(message);
-}
 
 constexpr kv::Layout kvLayout{16, 4, 256};
 constexpr kv::Layout compactLayout{10, 2, 256};
@@ -90,9 +81,9 @@ void entriesFromFirst(const kv::PageStorage &storage, const metal::MetalBuffer &
             "a table written from an index did not keep the entries before it");
     storage.writeEntries(pages, 3, table);
     require(entries[0] == kSentinel, "a table written past its last page changed");
-    requireThrows<std::invalid_argument>(
-        [&] { storage.writeEntries(std::array<uint32_t, 1>{5}, 2, table); },
-        "a table was written from an index past its pages");
+    rejects([&] { storage.writeEntries(std::array<uint32_t, 1>{5}, 2, table); },
+            "KV page table entries start past the end of its pages",
+            "a table was written from an index past its pages");
 }
 
 // An extent released and allocated again gets entries of its new buffer: a
@@ -141,12 +132,12 @@ void run(const std::string &metallib) {
 
     MemoryGovernor governor(
         backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, queryHostAvailableMemory, 0);
-    requireThrows<std::invalid_argument>(
-        [&] { kv::PageStorage(backend, governor.allocationAdmission(), kvLayout, 192, 128); },
-        "a pool of a part of an extent was accepted");
-    requireThrows<std::invalid_argument>(
-        [&] { kv::PageStorage(backend, governor.allocationAdmission(), kvLayout, 256, 64); },
-        "an extent of a part of an alignment unit was accepted");
+    rejects([&] { kv::PageStorage(backend, governor.allocationAdmission(), kvLayout, 192, 128); },
+            "KV page pool is not a whole number of extents",
+            "a pool of a part of an extent was accepted");
+    rejects([&] { kv::PageStorage(backend, governor.allocationAdmission(), kvLayout, 256, 64); },
+            "KV extent geometry is invalid",
+            "an extent of a part of an alignment unit was accepted");
 
     metal::MetalBuffer table = test::sharedBuffer(backend, 4 * sizeof(SplashKvPage));
     const metal::MetalBuffer probe = test::sharedBuffer(backend, sizeof(SplashKvPage));
@@ -163,8 +154,8 @@ void run(const std::string &metallib) {
             "an extent was not allocated at exactly its size");
     require(storage.isAllocated(127) && !storage.isAllocated(128),
             "the first Q8 extent was not the one allocated");
-    requireThrows<std::logic_error>([&] { (void)storage.allocateExtent(0); },
-                                    "an allocated extent was allocated again");
+    rejects([&] { (void)storage.allocateExtent(0); }, "KV extent 0 is already allocated",
+            "an allocated extent was allocated again");
     const SplashKvLayer layer = storage.layers()[15];
     require(storage.layers().size() == kvLayout.attentionLayers && layer.extent_pages == 128 &&
                 layer.offset == 15 * 128 * kvLayout.bytesPerLayerPage(),
@@ -173,15 +164,15 @@ void run(const std::string &metallib) {
     const SplashKvPage runwayPage = entryOf(storage, 5, probe);
     require(runwayPage && (runwayPage & SPLASH_KV_PAGE_INDEX_MASK) == 5,
             "a page entry does not carry the page's index in its extent");
-    requireThrows<std::logic_error>([&] { (void)storage.spans(200); },
-                                    "a page of an unallocated extent received host memory");
+    rejects([&] { (void)storage.spans(200); }, "KV page 200 is in an extent that is not allocated",
+            "a page of an unallocated extent received host memory");
     requireSpansTileExtent(storage, 0);
-    requireThrows<std::logic_error>(
-        [&] { storage.writeEntries(std::array<uint32_t, 1>{200}, 0, table); },
-        "a table was written with a page of an unallocated extent");
-    requireThrows<std::logic_error>(
-        [&] { storage.writeEntries(std::array<uint32_t, 5>{0, 1, 2, 3, 4}, 0, table); },
-        "a table too small for its entries was written");
+    rejects([&] { storage.writeEntries(std::array<uint32_t, 1>{200}, 0, table); },
+            "KV page 200 is in an extent that is not allocated",
+            "a table was written with a page of an unallocated extent");
+    rejects([&] { storage.writeEntries(std::array<uint32_t, 5>{0, 1, 2, 3, 4}, 0, table); },
+            "KV page table is not CPU-visible or too small for its entries",
+            "a table too small for its entries was written");
 
     require(storage.allocateExtent(1) && storage.actualAllocatedBytes() == 2 * extentBytes &&
                 backend.memoryStats().allocatedBytes == before + 2 * extentBytes,
@@ -200,10 +191,10 @@ void run(const std::string &metallib) {
     // none is released while one is in flight.
     {
         const metal::ComputeDispatch kick{"residency_kick", {{0, word}}, {}, {1, 1, 1}, {1, 1, 1}};
-        auto ticket = backend.submitAsync(kick);
-        requireThrows<std::logic_error>(
-            [&] { storage.releaseExtent(1); },
-            "an extent was released while a command was in flight");
+        auto ticket = backend.submitCommandAsync({&kick, 1});
+        rejects([&] { storage.releaseExtent(1); },
+                "cannot release a KV extent while a command is in flight",
+                "an extent was released while a command was in flight");
         require(storage.isAllocated(200) && entryOf(storage, 200, probe) == entries[0],
                 "a refused release changed the extent");
         (void)ticket.wait();
@@ -212,8 +203,8 @@ void run(const std::string &metallib) {
     require(!storage.isAllocated(200) && storage.actualAllocatedBytes() == extentBytes &&
                 backend.memoryStats().allocatedBytes == before + extentBytes,
             "a released extent did not return its memory at once");
-    requireThrows<std::logic_error>([&] { storage.releaseExtent(1); },
-                                    "an unallocated extent was released again");
+    rejects([&] { storage.releaseExtent(1); }, "KV extent 1 is not allocated",
+            "an unallocated extent was released again");
     require(storage.allocateExtent(1) &&
                 (entryOf(storage, 255, probe) & SPLASH_KV_PAGE_INDEX_MASK) == 127,
             "a released extent could not be allocated again");
@@ -246,15 +237,15 @@ void run(const std::string &metallib) {
     fill(255, 210);
     {
         const metal::ComputeDispatch kick{"residency_kick", {{0, word}}, {}, {1, 1, 1}, {1, 1, 1}};
-        auto ticket = backend.submitAsync(kick);
-        requireThrows<std::logic_error>(
-            [&] { storage.copyPages(std::array<kv::PageCopy, 1>{{{5, 200}}}); },
-            "a page was copied while a command was in flight");
+        auto ticket = backend.submitCommandAsync({&kick, 1});
+        rejects([&] { storage.copyPages(std::array<kv::PageCopy, 1>{{{5, 200}}}); },
+                "cannot copy KV pages while a command is in flight",
+                "a page was copied while a command was in flight");
         (void)ticket.wait();
     }
-    requireThrows<std::logic_error>(
-        [&] { storage.copyPages(std::array<kv::PageCopy, 2>{{{5, 200}, {6, 300}}}); },
-        "a page was copied to an extent that is not allocated");
+    rejects([&] { storage.copyPages(std::array<kv::PageCopy, 2>{{{5, 200}, {6, 300}}}); },
+            "cannot copy a KV page of an extent that is not allocated",
+            "a page was copied to an extent that is not allocated");
     require(holds(200, 110), "a refused copy changed a page");
     storage.copyPages(std::array<kv::PageCopy, 2>{{{5, 200}, {6, 255}}});
     require(holds(200, 10) && holds(255, 60) && holds(5, 10) && holds(6, 60) && holds(201, 160),

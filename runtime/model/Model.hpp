@@ -189,6 +189,15 @@ public:
   // A null ticket means that the disk quota cannot admit another state.
   [[nodiscard]] virtual std::unique_ptr<StateOffload>
   offload(std::function<void()>) const { return {}; }
+  // Starts writing this state to the disk tier from its own buffers, for a
+  // persistent tier's copy of a state that stays in RAM: the buffers must
+  // stay as they are until the ticket is ready. Null as for offload().
+  [[nodiscard]] virtual std::unique_ptr<StateOffload>
+  persist(std::function<void()>) const { return {}; }
+  // On a disk copy in a persistent tier, keeps the label with its slot once
+  // the write started before has landed (SlotFile::label). Nothing
+  // otherwise.
+  virtual void label(std::vector<std::byte>) const {}
 };
 
 enum class DraftBoundaryPurpose : uint8_t { Active, Materialization };
@@ -362,9 +371,11 @@ maskWordsPerToken(uint32_t vocabularySize) noexcept {
   return static_cast<uint32_t>((uint64_t{vocabularySize} + 31) / 32);
 }
 
-// Compile-time ceiling of the one native DFlash execution contract. Concrete
-// target/draft manifests are validated against these limits at startup;
-// cache-page and attention-kernel geometry live with their operators.
+// Compile-time ceiling of the one native DFlash execution contract. A draft
+// must have been trained for blocks of draftQueryRows rows over
+// draftContextTokens context tokens, which inspectModelRoot checks a DFlash2
+// checkpoint's config for; the other limits are the runtime's own. Cache-page
+// and attention-kernel geometry live with their operators.
 struct ExecutionLimits final {
   static constexpr uint32_t maximumBatchWidth = 4;
   static constexpr uint32_t prefillTokenBudget = 2048;
@@ -424,9 +435,11 @@ struct ModelMemoryActual final {
 
 struct ModelTelemetry final {
   uint64_t stateAllocatedBytes = 0;
-  // Pooled state buffers no lane holds: GDN parity cells and draft rings.
+  // Pooled state buffers no lane holds: GDN parity cells, draft rings and
+  // context windows.
   uint32_t idleGdnCells = 0;
   uint32_t idleDraftRings = 0;
+  uint32_t idleContextWindows = 0;
   uint64_t targetPrefillRows = 0;
   uint64_t draftContextRowsActive = 0;
   uint64_t draftContextRowsMaterialization = 0;
@@ -448,6 +461,9 @@ struct ModelTelemetry final {
   uint32_t lastDecodeLiveRows = 0;
   uint64_t constrainedMaskOverlapBatches = 0;
   uint64_t constrainedMaskOverlapRequests = 0;
+  // Prefill chunks the GPU ran again alone once the Neural Engine split's
+  // work for them failed (Runtime::prefillAsync).
+  uint64_t aneFfnReruns = 0;
   double lastConstrainedTargetForwardGpuSeconds = 0.0;
   double totalConstrainedTargetForwardGpuSeconds = 0.0;
   double lastConstrainedMaskWaitSeconds = 0.0;
@@ -499,7 +515,7 @@ public:
   [[nodiscard]] virtual StateAdmission begin(const ModelRequest &request) = 0;
   // Safe-point preemption returns the request's state buffers, retaining
   // only its host-side sampling/constraint continuation. Resume replays the
-  // supplied committed history through the ordinary packed-prefill path.
+  // supplied committed history through the ordinary prefill path.
   virtual void suspend(uint64_t requestId) = 0;
   [[nodiscard]] virtual StateAdmission resume(const ModelRequest &request) = 0;
   // Restores a cached state into the request's lane at `boundary`. A RAM
@@ -533,9 +549,10 @@ public:
   // and retry.
   [[nodiscard]] virtual std::unique_ptr<StateOffload>
   snapshotToDisk(uint64_t, std::function<void()>) { return {}; }
-  // The cached states whose buffers a lane's activation would still have to
-  // allocate: each one evicted returns to the pool what a lane takes. Zero
-  // when the pool holds a lane's buffers.
+  // The cached states whose eviction would return to the pool what a lane's
+  // activation still has to allocate: zero when the pool holds a lane's
+  // buffers, and the maximum when no number of states does (a buffer no
+  // cached state holds, such as Qwen's draft rings).
   [[nodiscard]] virtual uint32_t statesToActivate() const noexcept { return 0; }
   // Releases one unit of idle model memory and returns its bytes; zero when
   // nothing in scope is idle. A unit is one pooled state buffer (keepLane

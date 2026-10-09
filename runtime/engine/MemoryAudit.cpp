@@ -58,8 +58,8 @@ MemoryAuditResult auditActualMemory(const EngineMemoryPlan &plan,
   // The plan takes the weight categories from what loaded, so they are
   // counted but have no bound of their own. A buffer a loader does not report
   // is unclassified backend memory, which the pipeline and runtime reserves
-  // bound; only the arenas, KV storage and the disk tier's state staging have
-  // planned category bounds.
+  // bound; only the arenas, KV storage, the disk tier's state staging and the
+  // Neural Engine split have planned category bounds.
   uint64_t categorized = 0;
   for (const uint64_t weights : {actual.targetWeightsBytes,
                                  actual.draftWeightsBytes,
@@ -79,6 +79,7 @@ MemoryAuditResult auditActualMemory(const EngineMemoryPlan &plan,
       {"shared decode", actual.sharedDecodeBytes, budget.sharedDecodeBytes},
       {"KV", actual.kvAllocatedBytes, budget.kvCapacityBytes},
       {"state staging", actual.stateStagingBytes, budget.stateStagingBytes},
+      {"Neural Engine split", actual.aneFfnBytes, budget.aneFfnBytes},
   };
   for (const Category &category : categories) {
     if (category.actual > category.planned) {

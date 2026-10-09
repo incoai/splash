@@ -3,6 +3,15 @@
 import json
 import math
 import re
+from itertools import chain
+
+# Arrays and objects nest at most this deep in JSON the server reads: deeper
+# than any request needs, and shallow enough for every later stage that
+# recurses, such as the pure-Python encoder that sizes retained input.
+# Schemas, read with more stack a level, keep their own 64-level limit.
+MAX_DEPTH = 128
+_CONTAINERS = (dict, list)
+_TOO_DEEP = f"JSON nests deeper than {MAX_DEPTH} levels"
 
 
 class JSONEncodingError(RuntimeError):
@@ -30,9 +39,27 @@ def _finite_json_float(value):
 
 
 def loads(value):
-    return json.loads(
-        value, parse_constant=_reject_json_constant, parse_float=_finite_json_float
-    )
+    """The value JSON text spells; ValueError for text that is not strict
+    JSON or nests deeper than MAX_DEPTH."""
+    try:
+        document = json.loads(
+            value, parse_constant=_reject_json_constant, parse_float=_finite_json_float
+        )
+    except RecursionError:
+        # The parser's own bound, near 10,000 levels.
+        raise ValueError(_TOO_DEEP) from None
+    # The containers of each level in turn, read without recursion.
+    level = [document] if type(document) in _CONTAINERS else []
+    depth = 0
+    while level:
+        depth += 1
+        if depth > MAX_DEPTH:
+            raise ValueError(_TOO_DEEP)
+        children = chain.from_iterable(
+            item.values() if type(item) is dict else item for item in level
+        )
+        level = [child for child in children if type(child) in _CONTAINERS]
+    return document
 
 
 def dumps(value):

@@ -25,64 +25,23 @@ inline void splash_store_chunk_phase(
       chunk_token, thread_index, simd_lane, simd_group);
 }
 
-kernel void
-prefill_attention_q8_store(device const bfloat *chunk_keys [[buffer(0)]],
-                        device const bfloat *chunk_values [[buffer(1)]],
-                        device const SplashKvPage *page_table [[buffer(2)]],
-                        constant SplashChunkedPrefillParams &params
-                        [[buffer(3)]],
-                        uint group [[threadgroup_position_in_grid]],
-                        uint thread_index [[thread_index_in_threadgroup]],
-                        uint simd_lane [[thread_index_in_simdgroup]],
-                        uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  threadgroup float maxima[8];
-  splash_store_chunk_phase<4, int8_t>(
-      chunk_keys, chunk_values, page_table, params, maxima, group,
-      thread_index, simd_lane, simd_group);
-}
-
-kernel void prefill_attention_q8_store_kv2_g8(
-    device const bfloat *chunk_keys [[buffer(0)]],
-    device const bfloat *chunk_values [[buffer(1)]],
-    device const SplashKvPage *page_table [[buffer(2)]],
-    constant SplashChunkedPrefillParams &params [[buffer(3)]],
-    uint group [[threadgroup_position_in_grid]],
-    uint thread_index [[thread_index_in_threadgroup]],
-    uint simd_lane [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  threadgroup float maxima[8];
-  splash_store_chunk_phase<2, int8_t>(
-      chunk_keys, chunk_values, page_table, params, maxima, group,
-      thread_index, simd_lane, simd_group);
-}
-
-// BF16 entries copy the source bits and need no scale reduction.
-
-kernel void
-prefill_attention_bf16_store(device const bfloat *chunk_keys [[buffer(0)]],
-                        device const bfloat *chunk_values [[buffer(1)]],
-                        device const SplashKvPage *page_table [[buffer(2)]],
-                        constant SplashChunkedPrefillParams &params
-                        [[buffer(3)]],
-                        uint group [[threadgroup_position_in_grid]],
-                        uint thread_index [[thread_index_in_threadgroup]],
-                        uint simd_lane [[thread_index_in_simdgroup]],
-                        uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  splash_store_chunk_phase<4, bfloat>(
-      chunk_keys, chunk_values, page_table, params, nullptr, group,
-      thread_index, simd_lane, simd_group);
-}
-
-kernel void prefill_attention_bf16_store_kv2_g8(
-    device const bfloat *chunk_keys [[buffer(0)]],
-    device const bfloat *chunk_values [[buffer(1)]],
-    device const SplashKvPage *page_table [[buffer(2)]],
-    constant SplashChunkedPrefillParams &params [[buffer(3)]],
-    uint group [[threadgroup_position_in_grid]],
-    uint thread_index [[thread_index_in_threadgroup]],
-    uint simd_lane [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  splash_store_chunk_phase<2, bfloat>(
-      chunk_keys, chunk_values, page_table, params, nullptr, group,
-      thread_index, simd_lane, simd_group);
-}
+#define PAGED_PREFILL_STORE(Name, Heads, CacheElement)                         \
+  kernel void Name(                                                            \
+      device const bfloat *chunk_keys [[buffer(0)]],                           \
+      device const bfloat *chunk_values [[buffer(1)]],                         \
+      device const SplashKvPage *page_table [[buffer(2)]],                     \
+      constant SplashChunkedPrefillParams &params [[buffer(3)]],               \
+      uint group [[threadgroup_position_in_grid]],                             \
+      uint thread_index [[thread_index_in_threadgroup]],                       \
+      uint simd_lane [[thread_index_in_simdgroup]],                            \
+      uint simd_group [[simdgroup_index_in_threadgroup]]) {                    \
+    SPLASH_STORE_MAXIMA_##CacheElement                                         \
+    splash_store_chunk_phase<Heads, CacheElement>(                             \
+        chunk_keys, chunk_values, page_table, params, maxima, group,           \
+        thread_index, simd_lane, simd_group);                                  \
+  }
+PAGED_PREFILL_STORE(prefill_attention_q8_store, 4, int8_t)
+PAGED_PREFILL_STORE(prefill_attention_q8_store_kv2_g8, 2, int8_t)
+PAGED_PREFILL_STORE(prefill_attention_bf16_store, 4, bfloat)
+PAGED_PREFILL_STORE(prefill_attention_bf16_store_kv2_g8, 2, bfloat)
+#undef PAGED_PREFILL_STORE

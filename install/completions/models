@@ -5,29 +5,20 @@ set -eu
 completion_dir=$(CDPATH= cd -P "$(dirname "$0")" && pwd -P)
 root=$(CDPATH= cd -P "$completion_dir/../.." && pwd -P)
 if [ -f "$root/release.json" ]; then
-    data_dir="$HOME/Library/Application Support/Splash"
-    models_dir="$data_dir/models"
+    models_dir="$HOME/Library/Application Support/Splash/models"
 else
-    data_dir="$root/build/runtime"
     models_dir="$root/install/models"
 fi
-# official-models.txt is generated from the Splash collection
-# (dev/tools/update_model_catalog.py); suggested-models.txt names the upstream
-# models the README starts with. The cache is refreshed in the background by
-# `splash serve`; read as a union with the bundled catalogs so a missing or
-# stale cache can only fail to add entries.
-cache_file="$data_dir/catalog/official-models.txt"
 
 {
-    for catalog in "$completion_dir/official-models.txt" \
-        "$completion_dir/suggested-models.txt" "$cache_file"; do
-        [ -r "$catalog" ] || continue
-        cat "$catalog"
+    # The upstream models the README starts with.
+    if [ -r "$completion_dir/suggested-models.txt" ]; then
+        cat "$completion_dir/suggested-models.txt"
         printf '\n'
-    done
-    # The files models.installation_kind reads: an assembly's model.json or a
-    # legacy package's manifest.json; a GGUF selection's link is repo:VARIANT.
-    for record in "$models_dir"/*/*/model.json "$models_dir"/*/*/manifest.json; do
+    fi
+    # The record models.installation_kind reads, an assembly's model.json; a
+    # GGUF selection's link is repo:VARIANT.
+    for record in "$models_dir"/*/*/model.json; do
         [ -f "$record" ] || continue
         directory=${record%/*}
         repository=${directory##*/}

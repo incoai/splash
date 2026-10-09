@@ -159,22 +159,25 @@ GgufFile::GgufFile(WeightSource &source) : source_(source) {
   const uint64_t tensorCount = reader.scalar<uint64_t>();
   const uint64_t keyCount = reader.scalar<uint64_t>();
   if (tensorCount > 16384 || keyCount > 16384) throw GgufError("implausible GGUF header counts");
+  // A key holds one value, as llama.cpp's reader and install/gguf.py require.
+  std::set<std::string, std::less<>> keys;
   for (uint64_t i = 0; i < keyCount; ++i) {
     const std::string key = reader.string();
+    if (!keys.insert(key).second) throw GgufError("duplicate GGUF metadata key: " + key);
     const uint32_t type = reader.scalar<uint32_t>();
     switch (type) {
-    case kUint8: unsigned_[key] = reader.scalar<uint8_t>(); break;
-    case kUint16: unsigned_[key] = reader.scalar<uint16_t>(); break;
-    case kUint32: unsigned_[key] = reader.scalar<uint32_t>(); break;
-    case kUint64: unsigned_[key] = reader.scalar<uint64_t>(); break;
-    case kInt8: unsigned_[key] = static_cast<uint64_t>(reader.scalar<int8_t>()); break;
-    case kInt16: unsigned_[key] = static_cast<uint64_t>(reader.scalar<int16_t>()); break;
-    case kInt32: unsigned_[key] = static_cast<uint64_t>(reader.scalar<int32_t>()); break;
-    case kInt64: unsigned_[key] = static_cast<uint64_t>(reader.scalar<int64_t>()); break;
-    case kBool: unsigned_[key] = reader.scalar<uint8_t>() != 0; break;
-    case kString: strings_[key] = reader.string(); break;
-    case kFloat32: floats_[key] = reader.scalar<float>(); break;
-    case kFloat64: floats_[key] = reader.scalar<double>(); break;
+    case kUint8: metadata_.unsigneds[key] = reader.scalar<uint8_t>(); break;
+    case kUint16: metadata_.unsigneds[key] = reader.scalar<uint16_t>(); break;
+    case kUint32: metadata_.unsigneds[key] = reader.scalar<uint32_t>(); break;
+    case kUint64: metadata_.unsigneds[key] = reader.scalar<uint64_t>(); break;
+    case kInt8: metadata_.unsigneds[key] = static_cast<uint64_t>(reader.scalar<int8_t>()); break;
+    case kInt16: metadata_.unsigneds[key] = static_cast<uint64_t>(reader.scalar<int16_t>()); break;
+    case kInt32: metadata_.unsigneds[key] = static_cast<uint64_t>(reader.scalar<int32_t>()); break;
+    case kInt64: metadata_.unsigneds[key] = static_cast<uint64_t>(reader.scalar<int64_t>()); break;
+    case kBool: metadata_.unsigneds[key] = reader.scalar<uint8_t>() != 0; break;
+    case kString: metadata_.strings[key] = reader.string(); break;
+    case kFloat32: metadata_.floats[key] = reader.scalar<float>(); break;
+    case kFloat64: metadata_.floats[key] = reader.scalar<double>(); break;
     case kArray: {
       // Small numeric arrays of any key are kept; strings and long arrays
       // (vocabularies, merges, token types) are skipped without reading them,
@@ -206,10 +209,9 @@ GgufFile::GgufFile(WeightSource &source) : source_(source) {
     default: skipValue(reader, type, 0); break;
     }
   }
-  const uint64_t alignment = unsignedValue("general.alignment").value_or(32);
+  const uint64_t alignment = metadata_.unsignedValue("general.alignment").value_or(32);
   if (alignment == 0 || alignment > 65536 || (alignment & (alignment - 1)))
     throw GgufError("invalid GGUF alignment");
-  architecture_ = stringValue("general.architecture").value_or("");
   tensors_.reserve(tensorCount);
   for (uint64_t i = 0; i < tensorCount; ++i) {
     GgufTensor tensor;
@@ -256,9 +258,9 @@ std::optional<GgufRotation> GgufFile::readRotation() const {
     for (const auto &entry : values)
       if (std::string_view(entry.first).starts_with(kRotationPrefix)) keys.insert(entry.first);
   };
-  collect(unsigned_);
-  collect(strings_);
-  collect(floats_);
+  collect(metadata_.unsigneds);
+  collect(metadata_.strings);
+  collect(metadata_.floats);
   collect(arrays_);
   collect(names_);
   if (keys.empty()) return std::nullopt;
@@ -273,14 +275,15 @@ std::optional<GgufRotation> GgufFile::readRotation() const {
         std::end(kKnown))
       throw GgufError("unsupported rotation metadata: " + key);
   const auto key = [](std::string_view name) { return std::string(kRotationPrefix) + std::string(name); };
-  if (unsignedValue(key("version")) != 1) throw GgufError("unsupported prism.hadamard.version");
-  if (unsignedValue(key("block_size")) != GGUF_ROTATION_BLOCK ||
-      stringValue(key("transform")) != "normalized-sylvester-walsh-hadamard" ||
-      stringValue(key("axis")) != "input-last-dimension" || stringValue(key("sign_mode")) != "explicit")
+  if (metadata_.unsignedValue(key("version")) != 1) throw GgufError("unsupported prism.hadamard.version");
+  if (metadata_.unsignedValue(key("block_size")) != GGUF_ROTATION_BLOCK ||
+      metadata_.stringValue(key("transform")) != "normalized-sylvester-walsh-hadamard" ||
+      metadata_.stringValue(key("axis")) != "input-last-dimension" ||
+      metadata_.stringValue(key("sign_mode")) != "explicit")
     throw GgufError("unsupported rotation: the kernels run explicit signs and normalized Sylvester "
                     "Walsh-Hadamard blocks of " + std::to_string(GGUF_ROTATION_BLOCK) + " inputs");
   GgufRotation rotation;
-  rotation.valueHeadsGrouped = unsignedValue(key("gdn_v_grouped")).value_or(0) != 0;
+  rotation.valueHeadsGrouped = metadata_.unsignedValue(key("gdn_v_grouped")).value_or(0) != 0;
   const auto widths = numericArray(key("sign_widths")), values = numericArray(key("sign_values"));
   if (!widths || !values || widths->empty()) throw GgufError("rotation signs are missing");
   size_t at = 0;
@@ -317,22 +320,23 @@ std::optional<GgufRotation> GgufFile::readRotation() const {
   return rotation;
 }
 
-std::optional<uint64_t> GgufFile::unsignedValue(std::string_view key) const {
-  auto it = unsigned_.find(key);
-  if (it == unsigned_.end()) return std::nullopt;
-  return it->second;
+std::optional<uint64_t> GgufMetadata::unsignedValue(std::string_view key) const {
+  const auto it = unsigneds.find(key);
+  return it == unsigneds.end() ? std::nullopt : std::optional<uint64_t>(it->second);
 }
 
-std::optional<std::string> GgufFile::stringValue(std::string_view key) const {
-  auto it = strings_.find(key);
-  if (it == strings_.end()) return std::nullopt;
-  return it->second;
+std::optional<double> GgufMetadata::floatValue(std::string_view key) const {
+  const auto it = floats.find(key);
+  return it == floats.end() ? std::nullopt : std::optional<double>(it->second);
 }
 
-std::optional<double> GgufFile::floatValue(std::string_view key) const {
-  const auto it = floats_.find(key);
-  return it == floats_.end() ? std::nullopt : std::optional<double>(it->second);
+std::optional<std::string> GgufMetadata::stringValue(std::string_view key) const {
+  const auto it = strings.find(key);
+  return it == strings.end() ? std::nullopt : std::optional<std::string>(it->second);
 }
+
+std::string GgufMetadata::architecture() const { return stringValue("general.architecture").value_or(""); }
+
 std::optional<std::span<const double>> GgufFile::numericArray(std::string_view key) const {
   const auto it = arrays_.find(key);
   if (it == arrays_.end()) return std::nullopt;

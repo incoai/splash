@@ -1,9 +1,9 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
+#include "HostKvExtents.hpp"
 #include "TestChecks.hpp"
 #include "ops/PagedAttention.hpp"
-#include "tuning/HostKvExtents.hpp"
 #include "Q8PageFormatReference.hpp"
 
 #include <algorithm>
@@ -20,7 +20,7 @@
 #include <vector>
 
 using namespace splash::kv;
-using splash::ops::tuning::HostKvExtents;
+using splash::test::HostKvExtents;
 
 namespace {
 

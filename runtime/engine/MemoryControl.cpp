@@ -30,14 +30,15 @@ std::string MemoryStatusReporter::update(const ResourceWaitSnapshot &wait,
 }
 
 bool MemoryControl::run(MemoryPressure pressure) {
+  loop_.releaseIdleWeights();
   governor_.setPressure(pressure);
   const double now = loop_.monotonicMilliseconds();
   static_cast<void>(backend_.refreshMemoryStats());
-  const MemoryGovernorSnapshot memory = governor_.snapshot();
+  const MemoryGovernorSnapshot memory = governor_.evaluate();
   const ResourceWaitSnapshot wait = loop_.resourceWaitSnapshot();
   const std::string diagnostic = reporter_.update(wait, memory.hostGrowthAllowed);
   if (!diagnostic.empty())
-    writeStderrLine(diagnostic);
+    logLine(diagnostic);
   // Requests held back by a refusal wait for memory too, the refused one
   // included while a pass defers it.
   const std::optional<MemoryReclaimDirective> directive = policy_.update(

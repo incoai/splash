@@ -2,8 +2,10 @@
 
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/GDN.h"
+#include "ops/BufferExtent.hpp"
 #include "ops/LaneBindings.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <stdexcept>
 #include <utility>
@@ -32,6 +34,51 @@ enum class KernelLayout : uint8_t { Value48, Value32 };
   return shape == KernelLayout::Value48 ? value48 : value32;
 }
 
+uint64_t valueWidth(const GdnShape &shape) { return uint64_t{shape.valueHeads} * shape.headDimension; }
+// One layer's carried convolution rows and fp32 recurrent state, a head
+// dimension square per value head.
+uint64_t carriedBytes(const GdnShape &shape) {
+  return uint64_t{SPLASH_GDN_CONVOLUTION_TAPS - 1} * shape.convolutionDimension * 2;
+}
+uint64_t recurrentBytes(const GdnShape &shape) { return valueWidth(shape) * shape.headDimension * sizeof(float); }
+
+// The bytes of `rows` rows of the packed projection the kernels read: each
+// row's q, k and v convolution inputs, z, then beta and alpha per value head.
+uint64_t packedBytes(const GdnShape &shape, uint64_t rows) {
+  return rowBytes(rows, shape.packedWidth, shape.convolutionDimension + valueWidth(shape) + 2 * shape.valueHeads, 2);
+}
+
+// The convolution weights of every channel and a_scale and dt_bias of every
+// value head.
+void requireMixerWeights(const GdnShape &shape, const metal::MetalBuffer &convolution,
+                         const metal::MetalBuffer &decay, const metal::MetalBuffer &timeBias) {
+  requireBytes(convolution, uint64_t{shape.convolutionDimension} * SPLASH_GDN_CONVOLUTION_TAPS * 2,
+               "GDN convolution weight");
+  requireBytes(decay, uint64_t{shape.valueHeads} * sizeof(float), "GDN decay weight");
+  requireBytes(timeBias, uint64_t{shape.valueHeads} * 2, "GDN time bias");
+}
+
+// The fp32 decay and bf16 beta gates of `rows` rows of value heads.
+void requireGates(const GdnShape &shape, uint64_t rows, const metal::MetalBuffer &decay,
+                  const metal::MetalBuffer &beta) {
+  requireBytes(decay, rows * shape.valueHeads * sizeof(float), "GDN decay");
+  requireBytes(beta, rows * shape.valueHeads * 2, "GDN beta");
+}
+
+// Each running lane's current and next state cells reach the end of layer
+// `layer`'s state: its carried rows from layer x convolutionLayerBytes, its
+// recurrent state from convolutionStateBytes + layer x recurrentLayerBytes.
+void requireStates(const GdnShape &shape, GdnStateStrides strides, uint32_t layer, uint32_t lanes,
+                   std::span<const metal::MetalBuffer> current, std::span<const metal::MetalBuffer> next) {
+  const uint64_t bytes =
+      std::max(uint64_t{layer} * strides.convolutionLayerBytes + carriedBytes(shape),
+               strides.convolutionStateBytes + uint64_t{layer} * strides.recurrentLayerBytes + recurrentBytes(shape));
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    requireBytes(current[lane], bytes, "GDN current state");
+    requireBytes(next[lane], bytes, "GDN next state");
+  }
+}
+
 } // namespace
 
 void GDN::addPrefill(metal::CommandGraph &graph, GdnPrefillBuffers buffers,
@@ -41,6 +88,20 @@ void GDN::addPrefill(metal::CommandGraph &graph, GdnPrefillBuffers buffers,
   const KernelLayout kernel = kernelShape(shape);
   const std::string gate = normKernel(kernelName(kernel, "prefill_gdn_gate", "prefill_gdn_gate_vh32"),
                                       buffers.mixerNorm, shape.headDimension);
+  const uint64_t keyRows = uint64_t{tokens} * shape.keyHeads * shape.headDimension * 2;
+  const uint64_t valueRows = tokens * valueWidth(shape) * 2;
+  requireBytes(buffers.packed, packedBytes(shape, tokens), "GDN packed");
+  requireMixerWeights(shape, buffers.convolutionWeights, buffers.decayWeights, buffers.timeBias);
+  requireBytes(buffers.convolutionIn, carriedBytes(shape), "GDN convolution state");
+  requireBytes(buffers.convolutionOut, carriedBytes(shape), "GDN next convolution state");
+  requireBytes(buffers.queries, keyRows, "GDN query");
+  requireBytes(buffers.keys, keyRows, "GDN key");
+  requireBytes(buffers.values, valueRows, "GDN value");
+  requireGates(shape, tokens, buffers.decay, buffers.beta);
+  requireBytes(buffers.recurrentIn, recurrentBytes(shape), "GDN recurrent state");
+  requireBytes(buffers.recurrentOut, recurrentBytes(shape), "GDN next recurrent state");
+  requireBytes(buffers.recurrentRows, valueRows, "GDN recurrent row");
+  requireBytes(buffers.hidden, valueRows, "GDN hidden");
   const GDNPrefillParams params{tokens};
   graph.add(kernelName(kernel, "prefill_gdn_prepare",
                        "prefill_gdn_prepare_vh32"),
@@ -73,6 +134,14 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
   if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH || !state.valid())
     throw std::invalid_argument("invalid GDN decode geometry");
   const KernelLayout kernel = kernelShape(shape);
+  // Lane l's rows of the packed, mixed, gate and hidden rows are rows
+  // [8 l, 8 l + 8).
+  const uint64_t rows = uint64_t{lanes} * SPLASH_TARGET_VERIFY_ROWS;
+  requireBytes(buffers.packed, packedBytes(shape, rows), "GDN packed");
+  requireMixerWeights(shape, buffers.convolutionWeights, buffers.decayWeights, buffers.timeBias);
+  requireBytes(buffers.mixed, rows * shape.convolutionDimension * 2, "GDN mixed");
+  requireGates(shape, rows, buffers.decay, buffers.beta);
+  requireBytes(buffers.hidden, rows * valueWidth(shape) * 2, "GDN hidden");
   std::vector<metal::MetalBuffer> bindings{buffers.packed,
                                            buffers.convolutionWeights};
   const bool prepare = input != LinearInput::Plain;
@@ -81,6 +150,7 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
                         lanes * SPLASH_TARGET_VERIFY_ROWS);
   bindings.reserve(prepare ? 19 : 17);
   appendLaneBindings(bindings, buffers.currentStates, buffers.nextStates);
+  requireStates(shape, state, layer, lanes, buffers.currentStates, buffers.nextStates);
   bindings.insert(bindings.end(),
                   {buffers.mixed, buffers.decayWeights, buffers.timeBias,
                    buffers.decay, buffers.beta, buffers.mixerNorm.buffer,
@@ -106,10 +176,22 @@ void GDN::addCommit(metal::CommandGraph &graph, GdnCommitBuffers buffers,
       !state.valid())
     throw std::invalid_argument("invalid GDN commit geometry");
   const KernelLayout kernel = kernelShape(shape);
+  // The decoded rows of lane l in layer y start at row (y x the maximum batch
+  // width + l) x 8 of the packed, mixed and gate rows. A lane replays at most
+  // the 7 rows it retains (all 8 leave the decoded state) and carries its
+  // last three retained inputs, within those rows.
+  const uint64_t rows =
+      (uint64_t{layers - 1} * SPLASH_MAXIMUM_BATCH_WIDTH + lanes - 1) * SPLASH_TARGET_VERIFY_ROWS +
+      SPLASH_TARGET_VERIFY_ROWS - 1;
+  requireBytes(buffers.packed, rowBytes(rows, shape.packedWidth, shape.convolutionDimension, 2), "GDN packed");
+  requireBytes(buffers.mixed, rows * shape.convolutionDimension * 2, "GDN mixed");
+  requireGates(shape, rows, buffers.decay, buffers.beta);
+  requireBytes(buffers.retainedCounts, uint64_t{lanes} * sizeof(uint32_t), "GDN retained counts");
   std::vector<metal::MetalBuffer> bindings{
       buffers.packed, buffers.mixed, buffers.decay, buffers.beta};
   bindings.reserve(13);
   appendLaneBindings(bindings, buffers.currentStates, buffers.nextStates);
+  requireStates(shape, state, layers - 1, lanes, buffers.currentStates, buffers.nextStates);
   bindings.push_back(buffers.retainedCounts);
   const GDNBatchCommitParams params{state.convolutionLayerBytes,
                                     state.recurrentLayerBytes,

@@ -1,6 +1,5 @@
 #include "engine/KvPageTier.hpp"
 #include "tests/engine/AllocationFailure.hpp"
-#include "tests/engine/ScopedTestConfig.hpp"
 #include "tests/engine/TestBuffers.hpp"
 #include "tests/engine/TestChecks.hpp"
 #include "tests/engine/TestPageEntries.hpp"
@@ -8,12 +7,15 @@
 #include "engine/MemoryGovernor.hpp"
 
 #include <sys/resource.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <span>
@@ -30,6 +32,7 @@ using model::SlotFile;
 
 namespace {
 
+using splash::test::rejects;
 using splash::test::require;
 
 std::vector<std::byte> pattern(uint64_t bytes, uint32_t seed) {
@@ -159,7 +162,8 @@ void roundTrip(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
 // most half of the bound and restores at most three quarters, so a burst of
 // restores leaves a demotion its turn and a burst of demotions leaves
 // restores theirs. A transfer counts until poll() has retired it, and a read
-// that fails gives its room back like any other.
+// that fails gives its room back like any other. A bound of no transfer is
+// refused.
 void limits(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
             kv::Format format) {
   const kv::Layout layout{2, 2, 256, format};
@@ -168,8 +172,9 @@ void limits(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
   require(static_cast<bool>(pages.allocateExtent(0)), "the test extent was not allocated");
   const uint64_t slotBytes = SlotFile::slotBytesFor(pages.bytesPerPage());
   auto file = std::make_shared<SlotFile>(slotBytes, std::make_shared<DiskBudget>(8 * slotBytes));
-  const test::ScopedTestConfig seam({.kvTierTransfers = 4});
-  KvPageTier tier(pages, file);
+  rejects([&] { KvPageTier refused(pages, file, 0); }, "room for a transfer",
+          "a tier with no room for a transfer was built");
+  KvPageTier tier(pages, file, 4);
   const auto bytes = fill(pages, 9, 0x51a5e5u);
   std::vector<std::shared_ptr<engine::KvDiskSlot>> written;
   for (int index = 0; index < 2; ++index) {
@@ -228,8 +233,7 @@ void allocationFailure(metal::MetalBackend &backend, engine::MemoryGovernor &gov
     for (int failure = 0; failure < 64; ++failure) {
       auto budget = std::make_shared<DiskBudget>(bytes);
       auto file = std::make_shared<SlotFile>(bytes, budget);
-      const test::ScopedTestConfig seam({.kvTierTransfers = 1});
-      KvPageTier tier(pages, file);
+      KvPageTier tier(pages, file, 1);
       auto slot = tier.acquireSlot();
       const auto payload = fill(pages, 0, 123);
       require(file->write(fileSlot(slot), {payload}, {})->wait(), "fault slot seed failed");
@@ -424,8 +428,7 @@ void teardown(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
   auto budget = std::make_shared<DiskBudget>(16 * slotBytes);
   auto file = std::make_shared<SlotFile>(slotBytes, budget);
   {
-    const test::ScopedTestConfig seam({.kvTierTransfers = 16});
-    KvPageTier tier(pages, file);
+    KvPageTier tier(pages, file, 16);
     std::vector<std::unique_ptr<KvTransfer>> demotions;
     for (uint32_t page = 0; page < 8; ++page) {
       auto slot = tier.acquireSlot();
@@ -438,6 +441,67 @@ void teardown(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
   std::cout << "teardown tests passed\n";
 }
 
+// A persistent tier keeps a demoted page's slot and its label for the next
+// process, whose tier takes the slot back: the page restores byte for byte,
+// and a page whose slot changed after its record fails its restore.
+void persistentRoundTrip(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
+                         kv::Layout layout) {
+  const uint32_t extent = layout.minimumExtentPages();
+  kv::PageStorage pages(backend, governor.allocationAdmission(), layout, extent, extent);
+  require(static_cast<bool>(pages.allocateExtent(0)), "the test extent was not allocated");
+  const uint64_t slotBytes = SlotFile::slotBytesFor(pages.bytesPerPage());
+  std::string name = (std::filesystem::temp_directory_path() / "splash-kv-tier-XXXXXX").string();
+  require(::mkdtemp(name.data()) != nullptr, "temporary directory could not be made");
+  const std::filesystem::path directory = name;
+  const SlotFile::Persistence persistence{directory / "kv.slots", directory / "kv.records", {}, 8};
+  const auto budget = std::make_shared<DiskBudget>(4 * slotBytes);
+  std::vector<std::byte> first, second;
+  {
+    auto file = std::make_shared<SlotFile>(slotBytes, budget, persistence);
+    file->finishAdoption();
+    KvPageTier tier(pages, file);
+    require(tier.persistent(), "a tier over a persistent file is not persistent");
+    first = fill(pages, 0, 0x1357u);
+    second = fill(pages, 1, 0x2468u);
+    std::vector<std::shared_ptr<engine::KvDiskSlot>> kept;
+    for (uint32_t page = 0; page < 2; ++page) {
+      kept.push_back(tier.acquireSlot());
+      auto demotion = tier.demote(page, kept.back(), {});
+      require(demotion != nullptr, "a demotion was refused");
+      tier.label(kept.back(), std::vector<std::byte>(8, std::byte{static_cast<uint8_t>(page + 1)}));
+      runUntilReady(tier, *demotion);
+      require(demotion->finish(), "a demotion failed");
+    }
+    require(file->synchronize({})->wait(), "the tier's file did not synchronize");
+    file->seal();
+  }
+  {
+    // The second page's slot changes after its record was written.
+    std::fstream slots(directory / "kv.slots", std::ios::in | std::ios::out | std::ios::binary);
+    slots.seekp(static_cast<std::streamoff>(slotBytes + 5));
+    slots.put('\x7f');
+  }
+  static_cast<void>(fill(pages, 0, 0xdeadu));
+  static_cast<void>(fill(pages, 1, 0xbeefu));
+  auto file = std::make_shared<SlotFile>(slotBytes, budget, persistence);
+  KvPageTier tier(pages, file);
+  const std::vector<model::SlotRecord> records = file->records();
+  require(records.size() == 2 && records[0].label == std::vector<std::byte>(8, std::byte{1}),
+          "the next process did not find both labelled slots");
+  auto intact = tier.adopt(records[0]);
+  auto changed = tier.adopt(records[1]);
+  file->finishAdoption();
+  auto restoreIntact = tier.restore(intact, 0, {});
+  auto restoreChanged = tier.restore(changed, 1, {});
+  runUntilReady(tier, *restoreIntact);
+  runUntilReady(tier, *restoreChanged);
+  require(restoreIntact->finish() && contents(pages, 0) == first,
+          "an adopted slot did not restore its page byte for byte");
+  require(!restoreChanged->finish(), "a slot that changed after its record was restored");
+  std::error_code ignored;
+  std::filesystem::remove_all(directory, ignored);
+}
+
 void run(const std::string &metallib) {
   metal::MetalBackend backend(metallib);
   engine::MemoryGovernor governor(
@@ -447,6 +511,8 @@ void run(const std::string &metallib) {
     roundTrip(backend, governor, kv::Layout{2, 2, 256, format});
     roundTrip(backend, governor, kv::Layout{10, 2, 256, format}); // Qwen3.6-35B
     roundTrip(backend, governor, kv::Layout{16, 4, 256, format}); // Qwen3.8-27B
+    persistentRoundTrip(backend, governor, kv::Layout{10, 2, 256, format});
+    persistentRoundTrip(backend, governor, kv::Layout{16, 4, 256, format});
     limits(backend, governor, format);
     allocationFailure(backend, governor, format);
     closedFileRefusesDemotion(backend, governor, format);

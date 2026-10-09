@@ -2,6 +2,7 @@
 
 #include "metal/DeviceCapabilities.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -71,8 +72,12 @@ public:
 
   [[nodiscard]] explicit operator bool() const noexcept;
   [[nodiscard]] uint64_t sizeBytes() const noexcept;
+  // The base allocation's MTLResource.allocatedSize, as memoryStats() counts
+  // it; views of one allocation all report it.
+  [[nodiscard]] uint64_t allocatedBytes() const noexcept;
   [[nodiscard]] BufferStorage storage() const noexcept;
-  // Returns nullptr for private buffers. The pointer covers this view only.
+  // Returns nullptr for private buffers and released memory
+  // (MetalBackend::releaseMemory). The pointer covers this view only.
   [[nodiscard]] void *contents() const noexcept;
   // GPU address of the view's first byte, for kernels that reach a buffer
   // through an address another buffer holds.
@@ -84,6 +89,38 @@ public:
 private:
   struct Impl;
   explicit MetalBuffer(std::shared_ptr<Impl> impl);
+
+  std::shared_ptr<Impl> impl_;
+
+  friend class MetalBackend;
+};
+
+// A shared event another agent, such as the Neural Engine, waits on or
+// signals. Copies name the same event. nativeHandle() is its
+// id<MTLSharedEvent> for Objective-C++ callers. Its value never decreases:
+// Metal ignores a signal below it, from the CPU as from the GPU.
+class SharedEvent final {
+public:
+  SharedEvent();
+  ~SharedEvent();
+  SharedEvent(const SharedEvent &);
+  SharedEvent &operator=(const SharedEvent &);
+  SharedEvent(SharedEvent &&) noexcept;
+  SharedEvent &operator=(SharedEvent &&) noexcept;
+
+  [[nodiscard]] explicit operator bool() const noexcept;
+  [[nodiscard]] void *nativeHandle() const noexcept;
+  // Raises the event to `value` from the CPU.
+  void signal(uint64_t value) const noexcept;
+  // Calls `callback` once, when the event reaches `value`, promptly if it
+  // already has. Callbacks run on a serial dispatch queue of the backend
+  // that created the event, one at a time and never within notify(); they
+  // must not throw.
+  void notify(uint64_t value, std::function<void()> callback) const;
+
+private:
+  struct Impl;
+  explicit SharedEvent(std::shared_ptr<Impl> impl);
 
   std::shared_ptr<Impl> impl_;
 
@@ -108,15 +145,52 @@ struct BytesBinding {
   uint64_t sizeBytes = 0;
 };
 
+// A grid the GPU reads as the dispatch starts, so an earlier dispatch of the
+// same command may write it: three uint32 threadgroup counts, x, y and z
+// (MTLDispatchThreadgroupsIndirectArguments), at offsetBytes into buffer and
+// at a multiple of 4 bytes into its allocation.
+struct IndirectGrid {
+  MetalBuffer buffer;
+  uint64_t offsetBytes = 0;
+};
+
 struct ComputeDispatch {
   std::string pipelineName;
   std::vector<BufferBinding> buffers;
   std::vector<BytesBinding> bytes;
+  // With a buffer in indirectThreadgroups the dispatch runs the grid it
+  // holds, which its writer keeps within threadgroups.
   DispatchSize threadgroups;
   DispatchSize threadsPerThreadgroup;
+  IndirectGrid indirectThreadgroups = {};
+};
+
+// Orders a command against another agent, such as the Neural Engine, after
+// the first `before` of its dispatches. A Signal raises the event to `value`
+// once all earlier work has completed; a Wait holds all later work until the
+// event reaches `value`. A command is split into Metal command buffers at its
+// signals, so a signal is never held back behind the dispatches that follow
+// it, and a signal is delivered even when the work before it fails.
+struct EventStep {
+  enum class Kind : uint8_t { Signal, Wait };
+
+  size_t before = 0;
+  SharedEvent event;
+  uint64_t value = 0;
+  Kind kind = Kind::Signal;
+};
+
+// What one submission encodes: its dispatches in order, and the event steps
+// between them in the order of their `before`.
+struct Command {
+  std::span<const ComputeDispatch> dispatches;
+  std::span<const EventStep> events;
 };
 
 struct CommandTiming {
+  // From the GPU start of a command's first Metal command buffer to the end
+  // of its last: a command split at event signals (EventStep) also counts the
+  // time its later buffers wait for the other agent.
   double gpuSeconds = 0.0;
   double wallSeconds = 0.0;
 };
@@ -198,10 +272,12 @@ private:
 // enough to refuse an unsupported Mac before a model is downloaded.
 [[nodiscard]] DeviceCapabilities probeDeviceCapabilities();
 
-// How long a command may run before the backend gives up on it, and how long
-// every buffer stays wired after the last command (see allocateBuffer). Tests
-// substitute shorter ones through TestConfig.
+// How long a command may run before the backend gives up on it by default,
+// in time the Mac is awake (AwakeClock).
 inline constexpr double kCommandTimeoutSeconds = 120.0;
+// How long every buffer stays wired after the last command by default (see
+// allocateBuffer), also the default of the engine's idle release
+// (RuntimeResourcesConfig::idleReleaseSeconds).
 inline constexpr double kResidencyKeepAliveSeconds = 600.0;
 static_assert(kCommandTimeoutSeconds > 0.0 && kResidencyKeepAliveSeconds > 0.0);
 
@@ -211,7 +287,12 @@ static_assert(kCommandTimeoutSeconds > 0.0 && kResidencyKeepAliveSeconds > 0.0);
 // called from any thread.
 class MetalBackend final {
 public:
-  explicit MetalBackend(std::string metallibPath);
+  // Buffers stay wired for residencyKeepAliveSeconds after the last command;
+  // an infinite keep-alive holds them while the backend lives. The watchdog
+  // gives up on a command that runs longer than commandTimeoutSeconds.
+  explicit MetalBackend(std::string metallibPath,
+                        double residencyKeepAliveSeconds = kResidencyKeepAliveSeconds,
+                        double commandTimeoutSeconds = kCommandTimeoutSeconds);
   ~MetalBackend();
   // Invoked before allocations and submissions; may throw to stop bootstrap.
   void setOperationGuard(std::function<void()> guard);
@@ -232,11 +313,11 @@ public:
 
   [[nodiscard]] const DeviceCapabilities &capabilities() const noexcept;
 
-  // Every buffer the backend allocates or wraps belongs to one residency set,
-  // attached to the command queue, until its last view is gone. Metal by
-  // itself wires a buffer only while a command uses it and a few seconds
-  // after, so memory pressure could compress idle state or drop idle weights
-  // and the next request would wait to get them back. A member is wired from
+  // Every buffer the backend allocates belongs to one residency set, attached
+  // to the command queue, until its memory is released or its last view is
+  // gone. Metal by itself wires a buffer only while a command uses it and a
+  // few seconds after, so memory pressure could compress idle state and the
+  // next request would wait to get it back. A member is wired from
   // its allocation on until the keep-alive passes without a command, and
   // again from the next command: memory goes back to macOS when the engine
   // releases it, not when macOS chooses. Kernels may also reach a Shared
@@ -246,29 +327,43 @@ public:
   [[nodiscard]] MetalBuffer
   allocateBuffer(uint64_t bytes, BufferStorage storage,
                  std::string_view label);
-
-  // Wraps page-aligned shared memory without copying it. The lifetime token
-  // is retained by Metal's deallocator, including any internal buffer owners
-  // that outlive our C++ views and completed tickets.
+  // A Shared buffer over whole pages of memory another agent also reads or
+  // writes, such as an IOSurface of the Neural Engine, without a copy. Metal
+  // keeps `owner` until it lets the buffer go; the memory is the owner's, so
+  // releaseMemory refuses it.
   [[nodiscard]] MetalBuffer wrapSharedMemory(void *address, uint64_t bytes,
-                                             std::shared_ptr<void> lifetime,
+                                             std::shared_ptr<void> owner,
                                              std::string_view label);
+
   [[nodiscard]] MetalBuffer view(const MetalBuffer &base, uint64_t offsetBytes,
                                  uint64_t lengthBytes) const;
+  // An event at value 0, whose notify() callbacks run on this backend's
+  // event queue.
+  [[nodiscard]] SharedEvent newSharedEvent();
+
+  // Frees the memory of a buffer from allocateBuffer while no command is in
+  // flight: it leaves the residency set and the accounting. Its views stay
+  // valid handles of no memory: a command that binds one fails, and their
+  // contents are null and GPU addresses 0, until restoreMemory allocates the
+  // buffer's memory again, at another GPU address, its contents undefined
+  // until written.
+  void releaseMemory(const MetalBuffer &buffer);
+  void restoreMemory(const MetalBuffer &buffer);
 
   // Encodes exactly one compute dispatch, commits it, waits for completion,
   // and reports both GPU and end-to-end wall time.
   [[nodiscard]] CommandTiming submit(const ComputeDispatch &dispatch);
 
-  // Encodes an ordered dispatch list into one command buffer and waits for it.
-  [[nodiscard]] CommandTiming
-  submitCommand(std::span<const ComputeDispatch> dispatches);
-
-  // Encodes and commits without waiting. The completion callback only
-  // notifies host control flow; command results and errors are consumed from
-  // the returned ticket. A second command is rejected until wait() consumes
-  // the first ticket, preserving the one-in-flight runtime invariant.
-  [[nodiscard]] CommandTicket submitAsync(const ComputeDispatch &dispatch);
+  // Encodes a command into Metal command buffers, one more than it has event
+  // signals (EventStep), and commits them without waiting. The completion
+  // callback only notifies host control flow; command results and errors are
+  // consumed from the returned ticket, which reports the error of the first
+  // of its buffers that failed. A second command is rejected until wait()
+  // consumes the first ticket, preserving the one-in-flight runtime
+  // invariant.
+  [[nodiscard]] CommandTicket
+  submitCommandAsync(const Command &command, CommandCompletion completion = {});
+  // A command of these dispatches without event steps: one command buffer.
   [[nodiscard]] CommandTicket
   submitCommandAsync(std::span<const ComputeDispatch> dispatches,
                      CommandCompletion completion = {});
