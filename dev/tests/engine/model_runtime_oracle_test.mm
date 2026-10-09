@@ -1494,18 +1494,26 @@ int main(int argc, char **argv) {
   try {
     bool imagesOnly = false, warmupEosOnly = false;
     kv::Format format = kv::Format::Int8;
+    float liveVerifyThreshold = 0.0F;
     std::optional<double> givenAneFfnShare;
     // The evaluation of the split's program that fails, counted from 1 as
     // ane::ProgramInstrumentation counts them; 0 for none.
     uint64_t aneFfnFault = 0;
     if (argc < 3)
       fail("usage: model-runtime-oracle METALLIB MODEL_ROOT [--kv-format int8|bf16] [--ane-ffn-share SHARE] "
-           "[--ane-ffn-fault EVALUATION]");
+           "[--ane-ffn-fault EVALUATION] [--live-verify-threshold Q]");
     for (int i = 3; i < argc; ++i) {
       const std::string_view option(argv[i]);
       if (option == "--images-only") imagesOnly = true;
       else if (option == "--warmup-eos-only") warmupEosOnly = true;
-      else if (option == "--kv-format" && i + 1 < argc) {
+      else if (option == "--live-verify-threshold" && i + 1 < argc) {
+        size_t consumed = 0;
+        const std::string value(argv[++i]);
+        liveVerifyThreshold = std::stof(value, &consumed);
+        if (consumed != value.size() || !std::isfinite(liveVerifyThreshold) ||
+              liveVerifyThreshold < 0.0F || liveVerifyThreshold > 1.0F)
+            fail("invalid live verify threshold");
+      } else if (option == "--kv-format" && i + 1 < argc) {
         const std::string_view value(argv[++i]);
         if (value != "int8" && value != "bf16") fail("invalid KV format");
         format = value == "int8" ? kv::Format::Int8 : kv::Format::BFloat16;
@@ -1687,6 +1695,7 @@ int main(int argc, char **argv) {
       return 0;
     }
     model::Runtime &executor = *runtime;
+    executor.setLiveVerifyThreshold(liveVerifyThreshold);
     // Warmup runs on the KV runway and never allocates: without it, after
     // actual state activation, warmupPrefill fails and cleans up.
     pages.releaseExtent(0);

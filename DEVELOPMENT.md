@@ -2187,6 +2187,22 @@ version while its layout changes.
 
 ### Local benchmarks
 
+Experimental live verification for greedy MoE requests is off by default.
+`SPLASH_LIVE_VERIFY_THRESHOLD=0.1 ./splash serve --model <model>` enables it;
+values must be in `[0, 1]`, and zero retains the original graph. Each request
+keeps its anchor and a contiguous prefix whose cumulative draft confidence
+meets the threshold. Inactive rows skip routed and shared experts. Sampled
+requests, constrained batches and dense targets retain full verification.
+The fixed eight-row layout and existing draft files stay compatible.
+
+To evaluate a threshold, pass `DECODE_PROFILE_ARGS='--live-verify-threshold 0.1'`
+to `make benchmark-decode-profile MODEL=<model>`. The profiler reports live
+rows, tokens per cycle and fused throughput alongside kernel timings. The
+native runtime oracle also accepts `--live-verify-threshold`. Choose a
+threshold from end-to-end comparisons on the intended model, device, weight
+format and workload; confidence is a heuristic and no speedup is guaranteed.
+Dense-row packing needs separate measurements before implementation.
+
 From a source checkout with the model installed, use the native benchmark for
 prefill, decode and batch measurements:
 

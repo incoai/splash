@@ -1,4 +1,5 @@
 #include "metal/abi/KernelABI.h"
+#include "metal/abi/LiveRows.h"
 #include "metal/kernels/common/activation.h"
 #include "metal/kernels/common/gguf_sgmatrix.h"
 #include "metal/kernels/common/moe_expert_slab.h"
@@ -121,29 +122,57 @@ kernel void moe_route_select_f32(
 // (moe_matmul_rows) carry the route ~0u. One threadgroup covers all routes
 // and thread e owns expert e's count, offsets and tile descriptors. The
 // shared expert's tiles follow the routed tiles and hold every row in order.
-// It writes the tile count with the expert passes' grids (MoeTileCount).
-kernel void moe_group_routes(
-    device const uint *selected [[buffer(0)]],
-    device MoeTileDescriptor *tiles [[buffer(1)]],
-    device MoeTileCount *tile_count [[buffer(2)]],
-    device uint *grouped_routes [[buffer(3)]],
-    device uint *route_rows [[buffer(4)]],
-    constant MoeGroupParams &params [[buffer(5)]],
-    uint thread_index [[thread_index_in_threadgroup]],
-    uint simd_lane [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+inline bool verify_row_live(uint row, device const VerifyLiveRows *live_rows) {
+  const uint lane = row / SPLASH_TARGET_VERIFY_ROWS;
+  return row % SPLASH_TARGET_VERIFY_ROWS <
+         clamp(live_rows[lane].count, 1u, SPLASH_TARGET_VERIFY_ROWS);
+}
+
+struct MoeGroupScratch {
+  atomic_uint counts[SPLASH_MOE_EXPERT_SLOTS];
+  atomic_uint cursors[SPLASH_MOE_EXPERT_SLOTS];
+  uint tile_offsets[SPLASH_MOE_EXPERT_SLOTS];
+  uint simd_totals[SPLASH_MOE_EXPERT_SLOTS / 32];
+  uint routed_tiles;
+  uint live_count;
+  uint live_indices[SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS];
+};
+
+template <bool Live>
+inline void group_routes(
+    device const uint *selected, device MoeTileDescriptor *tiles,
+    device MoeTileCount *tile_count, device uint *grouped_routes,
+    device uint *route_rows, constant MoeGroupParams &params,
+    device const VerifyLiveRows *live_rows, uint thread_index,
+    uint simd_lane, uint simd_group, threadgroup MoeGroupScratch &scratch) {
   constexpr uint Slots = SPLASH_MOE_EXPERT_SLOTS;
   const uint routes_per_row = params.top_k + 1;
   const uint routes = params.rows * routes_per_row;
-  threadgroup atomic_uint counts[Slots];
-  threadgroup atomic_uint cursors[Slots];
-  threadgroup uint tile_offsets[Slots];
-  threadgroup uint simd_totals[Slots / 32];
-  threadgroup uint routed_tiles;
+  threadgroup atomic_uint *counts = scratch.counts;
+  threadgroup atomic_uint *cursors = scratch.cursors;
+  threadgroup uint *tile_offsets = scratch.tile_offsets;
+  threadgroup uint *simd_totals = scratch.simd_totals;
+  threadgroup uint &routed_tiles = scratch.routed_tiles;
+  threadgroup uint &live_count = scratch.live_count;
+  threadgroup uint *live_indices = scratch.live_indices;
+  if (thread_index == 0) {
+    live_count = 0;
+    if constexpr (Live) {
+      for (uint row = 0; row < params.rows; ++row)
+        if (verify_row_live(row, live_rows))
+          live_indices[live_count++] = row;
+    } else {
+      live_count = params.rows;
+    }
+  }
   atomic_store_explicit(&counts[thread_index], 0u, memory_order_relaxed);
   atomic_store_explicit(&cursors[thread_index], 0u, memory_order_relaxed);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   for (uint route = thread_index; route < routes; route += Slots) {
+    if constexpr (Live) {
+      if (!verify_row_live(route / routes_per_row, live_rows))
+        continue;
+    }
     if (route % routes_per_row != params.top_k) {
       atomic_fetch_add_explicit(&counts[selected[route]], 1u,
                                 memory_order_relaxed);
@@ -177,6 +206,12 @@ kernel void moe_group_routes(
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   for (uint route = thread_index; route < routes; route += Slots) {
+    if constexpr (Live) {
+      if (!verify_row_live(route / routes_per_row, live_rows)) {
+        route_rows[route] = ~0u;
+        continue;
+      }
+    }
     if (route % routes_per_row == params.top_k)
       continue;
     uint expert = selected[route];
@@ -188,20 +223,23 @@ kernel void moe_group_routes(
   }
 
   const uint shared_tiles =
-      (params.rows + params.tile_rows - 1) / params.tile_rows;
+      (live_count + params.tile_rows - 1) / params.tile_rows;
   const uint shared_base = routed_tiles * params.tile_rows;
   const uint shared_rows =
       (shared_tiles - 1) * params.tile_rows +
-      moe_matmul_rows(params.rows - (shared_tiles - 1) * params.tile_rows,
+      moe_matmul_rows(live_count - (shared_tiles - 1) * params.tile_rows,
                       params.tile_rows);
   for (uint tile = thread_index; tile < shared_tiles; tile += Slots) {
     tiles[routed_tiles + tile] = MoeTileDescriptor{
         params.experts,
-        min(params.tile_rows, params.rows - tile * params.tile_rows)};
+        min(params.tile_rows, live_count - tile * params.tile_rows)};
   }
   for (uint row = thread_index; row < shared_rows; row += Slots) {
-    if (row < params.rows) {
-      uint route = row * routes_per_row + params.top_k;
+    if (row < live_count) {
+      uint source = row;
+      if constexpr (Live)
+        source = live_indices[row];
+      uint route = source * routes_per_row + params.top_k;
       grouped_routes[shared_base + row] = route;
       route_rows[route] = shared_base + row;
     } else {
@@ -213,6 +251,37 @@ kernel void moe_group_routes(
     *tile_count = MoeTileCount{live, {params.gate_up_columns, live, 1},
                                {params.down_columns, live, 1}};
   }
+}
+
+kernel void moe_group_routes(
+    device const uint *selected [[buffer(0)]],
+    device MoeTileDescriptor *tiles [[buffer(1)]],
+    device MoeTileCount *tile_count [[buffer(2)]],
+    device uint *grouped_routes [[buffer(3)]],
+    device uint *route_rows [[buffer(4)]],
+    constant MoeGroupParams &params [[buffer(5)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  threadgroup MoeGroupScratch scratch;
+  group_routes<false>(selected, tiles, tile_count, grouped_routes, route_rows,
+                      params, nullptr, thread_index, simd_lane, simd_group, scratch);
+}
+
+kernel void moe_group_routes_live_rows(
+    device const uint *selected [[buffer(0)]],
+    device MoeTileDescriptor *tiles [[buffer(1)]],
+    device MoeTileCount *tile_count [[buffer(2)]],
+    device uint *grouped_routes [[buffer(3)]],
+    device uint *route_rows [[buffer(4)]],
+    device const VerifyLiveRows *live_rows [[buffer(5)]],
+    constant MoeGroupParams &params [[buffer(6)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  threadgroup MoeGroupScratch scratch;
+  group_routes<true>(selected, tiles, tile_count, grouped_routes, route_rows,
+                     params, live_rows, thread_index, simd_lane, simd_group, scratch);
 }
 
 // Copies each grouped row's input so every expert tile is a dense matrix,
@@ -316,6 +385,35 @@ kernel void moe_combine(
   if (row >= params.rows || dimension >= params.hidden_size)
     return;
   float value = float(residual[ulong(row) * params.hidden_size + dimension]);
+  ulong route = ulong(row) * params.routes_per_row;
+  for (uint slot = 0; slot < params.routes_per_row; ++slot) {
+    value += routing_weights[route + slot] *
+             float(expert_output[ulong(route_rows[route + slot]) *
+                                     params.hidden_size +
+                                 dimension]);
+  }
+  output[ulong(row) * params.hidden_size + dimension] = bfloat(value);
+}
+
+kernel void moe_combine_live_rows(
+    device const bfloat *expert_output [[buffer(0)]],
+    device const uint *route_rows [[buffer(1)]],
+    device const float *routing_weights [[buffer(2)]],
+    device const bfloat *residual [[buffer(3)]],
+    device bfloat *output [[buffer(4)]],
+    device const VerifyLiveRows *live_rows [[buffer(5)]],
+    constant MoeCombineParams &params [[buffer(6)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+  uint row = group.x;
+  uint dimension = group.y * 256 + thread_index;
+  if (row >= params.rows || dimension >= params.hidden_size)
+    return;
+  float value = float(residual[ulong(row) * params.hidden_size + dimension]);
+  if (!verify_row_live(row, live_rows)) {
+    output[ulong(row) * params.hidden_size + dimension] = bfloat(value);
+    return;
+  }
   ulong route = ulong(row) * params.routes_per_row;
   for (uint slot = 0; slot < params.routes_per_row; ++slot) {
     value += routing_weights[route + slot] *

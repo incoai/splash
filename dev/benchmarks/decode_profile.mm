@@ -1,6 +1,6 @@
 // Per-kernel GPU time attribution for the production executor.
 //
-//   decode-profile METALLIB MODEL_ROOT [--prompt-tokens N] [--cycles K] [--kv-format int8|bf16]
+//   decode-profile METALLIB MODEL_ROOT [--prompt-tokens N] [--cycles K] [--kv-format int8|bf16] [--live-verify-threshold Q]
 //
 // Drives the real model runtime with Metal dispatch profiling enabled, so
 // every dispatch of a prefill command and B1 through B4 DFlash cycles
@@ -24,6 +24,7 @@
 #include <array>
 #include <charconv>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -160,6 +161,8 @@ struct CycleTiming final {
   double gpuSeconds = 0.0;
   double wallSeconds = 0.0;
   uint64_t commands = 0;
+  uint32_t liveRows = 0;
+  uint32_t tokens = 0;
 };
 
 CycleTiming decodeCycle(metal::MetalBackend &backend,
@@ -179,18 +182,21 @@ CycleTiming decodeCycle(metal::MetalBackend &backend,
   auto results = executor.decode(plan, items);
   if (results.size() != lanes.size())
     throw std::runtime_error("decode width changed");
+  uint32_t tokens = 0;
   for (size_t index = 0; index < lanes.size(); ++index) {
     if (!results[index].failure.empty())
       throw std::runtime_error(results[index].failure);
     if (results[index].finished)
       throw std::runtime_error("the answer ended before profiling finished");
+    tokens += static_cast<uint32_t>(results[index].outputTokens.size());
     lanes[index].position += results[index].outputTokens.size() -
                              results[index].outputTokensWithoutKv;
   }
   const auto finished = std::chrono::steady_clock::now();
   return {executor.telemetry().lastDecodeGpuSeconds,
           std::chrono::duration<double>(finished - started).count(),
-          BackendInstrumentation::submittedCommands(backend) - submissionsBefore};
+          BackendInstrumentation::submittedCommands(backend) - submissionsBefore,
+          executor.telemetry().lastDecodeLiveRows, tokens};
 }
 
 } // namespace
@@ -200,12 +206,13 @@ int main(int argc, char **argv) {
     try {
       if (argc < 3) {
         std::cerr << "usage: decode-profile METALLIB MODEL_ROOT "
-                     "[--prompt-tokens N] [--cycles K] [--kv-format int8|bf16]\n";
+                     "[--prompt-tokens N] [--cycles K] [--kv-format int8|bf16] [--live-verify-threshold Q]\n";
         return 2;
       }
       uint32_t promptTokens = 512;
       uint32_t cycles = 4;
       kv::Format format = kv::Format::Int8;
+      float liveVerifyThreshold = 0.0F;
       for (int index = 3; index < argc; index += 2) {
         const std::string_view option(argv[index]);
         if (index + 1 >= argc)
@@ -214,7 +221,14 @@ int main(int argc, char **argv) {
           promptTokens = parseCount(argv[index + 1], "--prompt-tokens");
         else if (option == "--cycles")
           cycles = parseCount(argv[index + 1], "--cycles");
-        else if (option == "--kv-format") {
+        else if (option == "--live-verify-threshold") {
+          size_t consumed = 0;
+          const std::string value(argv[index + 1]);
+          liveVerifyThreshold = std::stof(value, &consumed);
+          if (consumed != value.size() || !std::isfinite(liveVerifyThreshold) ||
+              liveVerifyThreshold < 0.0F || liveVerifyThreshold > 1.0F)
+            throw std::invalid_argument("invalid live verify threshold");
+        } else if (option == "--kv-format") {
           const std::string_view value(argv[index + 1]);
           if (value != "int8" && value != "bf16")
             throw std::invalid_argument("--kv-format takes int8 or bf16");
@@ -254,6 +268,8 @@ int main(int argc, char **argv) {
                                       model.stateLayout(), nullptr);
       model::RuntimeContext context{backend, model, pages, states, operators};
       model::Runtime executor(context);
+      executor.setLiveVerifyThreshold(liveVerifyThreshold);
+      std::printf("live verify threshold %.6g (greedy MoE only)\n", liveVerifyThreshold);
 
       std::printf("device %s, %u prompt tokens, %u cycles per width\n",
                   backend.capabilities().deviceName.c_str(), promptTokens,
@@ -300,6 +316,16 @@ int main(int argc, char **argv) {
                     "command(s) per cycle\n",
                     title, median.gpuSeconds * 1e3, median.wallSeconds * 1e3,
                     static_cast<unsigned long long>(median.commands));
+        uint64_t liveRows = 0, produced = 0;
+        double wall = 0.0;
+        for (const CycleTiming &cycle : fused) {
+          liveRows += cycle.liveRows;
+          produced += cycle.tokens;
+          wall += cycle.wallSeconds;
+        }
+        std::printf("mean live rows %.2f/%zu, tokens/cycle %.2f, fused wall %.2f tok/s\n",
+                    double(liveRows) / cycles, active.size() * model::ExecutionLimits::targetVerifyRows,
+                    double(produced) / cycles, double(produced) / wall);
         BackendInstrumentation::setDispatchProfiling(backend, true);
         for (uint32_t cycle = 0; cycle < cycles; ++cycle)
           static_cast<void>(decodeCycle(backend, executor, active));

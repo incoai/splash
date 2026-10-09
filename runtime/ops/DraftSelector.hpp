@@ -49,10 +49,20 @@ public:
 
   // Exact scratch/output bytes for that many proposal positions.
   [[nodiscard]] static DraftSelectorWorkspace workspace(uint32_t positions);
+  [[nodiscard]] static uint64_t liveRowsBytes(uint32_t lanes);
 
   void add(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers,
            const DraftCodebooks &codebooks, std::span<const uint32_t> anchors,
            std::span<const SamplingPolicy> policies) const;
+
+  // After selection, estimate confidence along the actual chosen path and
+  // budget a live prefix on the GPU. Sampling lanes always keep all rows:
+  // stopping based on a sampled proposal would change its distribution.
+  void addLiveRows(metal::CommandGraph &graph,
+                   const DraftSelectorBuffers &buffers,
+                   metal::MetalBuffer liveRows,
+                   std::span<const SamplingPolicy> policies,
+                   float threshold) const;
 
 private:
   uint32_t vocabulary_ = 0;
