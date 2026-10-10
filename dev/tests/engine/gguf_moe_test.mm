@@ -20,8 +20,10 @@
 //   that of every tile's with two gate/up passes, and the grouping: tiles as
 //   each expert's routes fill them, every route's grouped row naming it back,
 //   the padding a tile's matmul reads marked empty and the rows past it
-//   unwritten. Concentrated and skewed router loads on the staged 32-row
-//   tiles of one format, at ragged row counts.
+//   unwritten, or for a plan whose rows fill one 8-row staged tile, one tile
+//   of the plan's rows per expert and no gather. Concentrated and skewed
+//   router loads on the staged 32-row tiles of one format, at ragged row
+//   counts.
 #include "../../../runtime/metal/CommandGraph.hpp"
 #include "../../../runtime/metal/MetalBackend.hpp"
 #include "../../../runtime/ops/Linear.hpp"
@@ -483,14 +485,53 @@ bool untouched(const void *data, uint64_t bytes) {
   return std::all_of(begin, begin + bytes, [](uint8_t byte) { return byte == kCanary; });
 }
 
+// The grouping of a plan that reads its rows in place (MoePlan::rowsInPlace:
+// rows that fill one 8-row tile on the staged tile) of a run whose grouped
+// routes and input held kCanary: one tile per expert the rows route to, each
+// of the plan's rows, a route's grouped row its expert tile's row of the
+// route's row, and the routed tiles' grouped routes and the grouped input past
+// the router's scores as they were, as no gather runs.
+void checkInPlaceGrouping(const MoeScratch &scratch, const MoePlan &plan, const std::string &label) {
+  const uint32_t rows = plan.rows(), tileRows = plan.tileRows();
+  const auto *selected = static_cast<const uint32_t *>(scratch.selectedExperts.contents());
+  const auto *routeRows = static_cast<const uint32_t *>(scratch.routeRows.contents());
+  const auto *groupedRoutes = static_cast<const uint32_t *>(scratch.groupedRoutes.contents());
+  const auto *groupedInput = static_cast<const uint8_t *>(scratch.groupedInput.contents());
+  const auto *tiles = static_cast<const MoeTileDescriptor *>(scratch.tileDescriptors.contents());
+  const uint32_t tileCount = *static_cast<const uint32_t *>(scratch.tileCount.contents());
+  require(rows == tileRows, label + ": an in-place plan's rows are not one tile");
+  std::array<bool, kExperts + 1> routed{};
+  for (uint32_t route = 0; route < rows * kRoutes; ++route) {
+    require(selected[route] <= kExperts, label + ": invalid selected expert");
+    routed[selected[route]] = true;
+    const uint32_t grouped = routeRows[route];
+    require(grouped < tileCount * tileRows && grouped % tileRows == route / kRoutes &&
+                tiles[grouped / tileRows].expert == selected[route],
+            label + ": an in-place route is not its expert tile's row of its own row");
+  }
+  require(tileCount == uint32_t(std::count(routed.begin(), routed.end(), true)),
+          label + ": in-place tiles differ from the experts the rows route to");
+  for (uint32_t tile = 0; tile < tileCount; ++tile) {
+    require(tiles[tile].rows == rows, label + ": an in-place tile does not hold the plan's rows");
+    if (tiles[tile].expert != kExperts)
+      require(untouched(groupedRoutes + uint64_t{tile} * tileRows, uint64_t{tileRows} * sizeof(uint32_t)),
+              label + ": the in-place grouping wrote a routed tile's grouped routes");
+  }
+  const uint64_t scoreBytes = uint64_t{rows} * SPLASH_MOE_EXPERT_SLOTS * 4;
+  require(untouched(groupedInput + scoreBytes, scratch.groupedInput.sizeBytes() - scoreBytes),
+          label + ": an in-place plan gathered its rows");
+}
+
 // The grouping of a run whose grouped routes and input held kCanary: as many
 // tiles as each expert's routes fill, every route at a grouped row that names
 // it back in a tile of its expert, the padding rows a tile's matmul reads
 // (moe_matmul_rows: the smallest of 8, 16 and the tile's rows that holds its
 // live rows) marked empty, and the rows past them written neither by the
 // grouping nor by the gather, but where the router's scores, which come first
-// in the grouped input, overwrote them.
+// in the grouped input, overwrote them; an in-place plan's as
+// checkInPlaceGrouping checks.
 void checkGrouping(const MoeScratch &scratch, const MoePlan &plan, const std::string &label) {
+  if (plan.rowsInPlace()) return checkInPlaceGrouping(scratch, plan, label);
   const uint32_t rows = plan.rows(), tileRows = plan.tileRows();
   const auto *selected = static_cast<const uint32_t *>(scratch.selectedExperts.contents());
   const auto *routeRows = static_cast<const uint32_t *>(scratch.routeRows.contents());
@@ -698,6 +739,7 @@ void bufferExtents(MetalBackend &backend) {
   b.moe.output = zeros(backend, uint64_t{kMaximumRows} * kHidden * 2, "moe-output");
   for (const MoePlan &plan :
        {MoE::decodePlan(shape, 4, MoeConfig{.expertTile = MoeExpertTile::M8, .ggufTile = MoeGgufTile::Register}),
+        MoE::decodePlan(shape, 1, MoeConfig{.expertTile = MoeExpertTile::M8, .ggufTile = MoeGgufTile::Staged}),
         MoE::prefillPlan(shape, 33, MoeConfig{MoeExpertTile::M32})}) {
     allocate(backend, b, plan);
     splash::test::requireMoeExtents(backend, b.moe, m.weights, plan);
@@ -773,8 +815,9 @@ int moe(MetalBackend &backend) {
             ++failures;
           }
         }
-        // Prefill chunks on the same 8-row tiles (ExecutionPlans::moePrefill).
-        for (const uint32_t chunk : {kMaximumRows, 27u, 9u}) {
+        // Prefill chunks on the same 8-row tiles (ExecutionPlans::moePrefill);
+        // a chunk of 8 rows reads them in place on the staged tile.
+        for (const uint32_t chunk : {kMaximumRows, 27u, 9u, 8u}) {
           const MoePlan plan = MoE::prefillPlan(
               shape, chunk,
               MoeConfig{.expertTile = MoeExpertTile::M8, .ggufTile = tile});
@@ -787,7 +830,7 @@ int moe(MetalBackend &backend) {
             ++failures;
           }
         }
-        printf("%-20s %s decode B1-4, prefill 263/27/9: gate/up %.2f%% and down %.2f%% of outputs differ from bf16(fp64), "
+        printf("%-20s %s decode B1-4, prefill 263/27/9/8: gate/up %.2f%% and down %.2f%% of outputs differ from bf16(fp64), "
                "errors at most %.1e/%.1e of sum|x w| %s\n",
                formats.c_str(), tile == MoeGgufTile::Register ? "register" : "staged  ",
                100.0 * stats.gateUpFlips / (stats.outputs / 2), 100.0 * stats.downFlips / stats.outputs,

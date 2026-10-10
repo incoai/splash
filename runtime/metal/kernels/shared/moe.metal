@@ -122,6 +122,10 @@ kernel void moe_route_select_f32(
 // and thread e owns expert e's count, offsets and tile descriptors. The
 // shared expert's tiles follow the routed tiles and hold every row in order.
 // It writes the tile count with the expert passes' grids (MoeTileCount).
+// In place (a plan whose rows fill one tile) each expert gets one tile of the
+// plan's rows: a route's grouped row is its expert tile's row of the route's
+// own row, and the routed tiles' grouped routes go unwritten, as no gather
+// reads them.
 kernel void moe_group_routes(
     device const uint *selected [[buffer(0)]],
     device MoeTileDescriptor *tiles [[buffer(1)]],
@@ -165,9 +169,9 @@ kernel void moe_group_routes(
     routed_tiles = tile_offset + expert_tiles;
   for (uint tile = 0; tile < expert_tiles; ++tile) {
     tiles[tile_offset + tile] = MoeTileDescriptor{
-        thread_index, min(params.tile_rows, count - tile * params.tile_rows)};
+        thread_index, params.in_place ? params.rows : min(params.tile_rows, count - tile * params.tile_rows)};
   }
-  if (expert_tiles) {
+  if (expert_tiles && !params.in_place) {
     const uint last = tile_offset + expert_tiles - 1;
     const uint live = count - (expert_tiles - 1) * params.tile_rows;
     for (uint row = tile_offset * params.tile_rows + count;
@@ -180,6 +184,10 @@ kernel void moe_group_routes(
     if (route % routes_per_row == params.top_k)
       continue;
     uint expert = selected[route];
+    if (params.in_place) {
+      route_rows[route] = tile_offsets[expert] * params.tile_rows + route / routes_per_row;
+      continue;
+    }
     uint slot =
         atomic_fetch_add_explicit(&cursors[expert], 1u, memory_order_relaxed);
     uint row = tile_offsets[expert] * params.tile_rows + slot;

@@ -5,7 +5,7 @@
 #include "metal/kernels/common/moe_expert_slab.h"
 
 // MoE experts (ops/MoE.cpp; kernels/shared/moe.metal groups the rows): threadgroup (x, y) computes
-// 64 columns of grouped tile y with the weights of the tile's expert (moe_gguf_segment), in the format the tile picks
+// 64 columns of tile y with the weights of the tile's expert (moe_gguf_segment), in the format the tile picks
 // at run time: on a 16-core M5 Pro one run-time-format dispatch over two segments is within -11..+8% of a dispatch
 // per format (23040x2048 Q4_K and 92160x512 Q5_K, one to four lanes). aux is the gate of the up pass.
 // Two simdgroups each stream their own 32 columns through the decode tile, grid (N / 64, tiles), on 8-row tiles
@@ -22,7 +22,7 @@ inline void moe_gguf_expert_tile(device bfloat *input, device const MoeTileDescr
   if (group.y >= *tile_count) return;
   const MoeTileDescriptor tile = tiles[group.y];
   const MoeGgufSegment s = moe_gguf_segment(tile.expert, p, w0, w1, meta, sw0, sw1, smeta);
-  device bfloat *x = input + ulong(group.y) * Rows * p.input_size;
+  device bfloat *x = p.in_place ? input : input + ulong(group.y) * Rows * p.input_size;
   const ulong out = ulong(group.y) * Rows * p.output_size;
   const uint origin = group.x * GGUF_TILE_COLUMNS + simd_group * GGUF_STAGED_COLUMNS;
   threadgroup half *my = stage + simd_group * kStagedSimdgroupStage;
@@ -61,7 +61,7 @@ template [[host_name("moe_expert_gguf_m32_g")]] kernel MoeExpertGgufKernel moe_e
 
 // The gate and up passes in one, where gate and up share their routed format and their shared format (ops/MoE.cpp),
 // so the pair table is the threadgroup's: threadgroup (x, y) runs a gate simdgroup and an up simdgroup on the same 32
-// columns of grouped tile y, grid (N / 32, tiles), each through its own stage as in moe_gguf_expert_tile. The gate
+// columns of tile y, grid (N / 32, tiles), each through its own stage as in moe_gguf_expert_tile. The gate
 // simdgroup parks bf16(gate) in its stage, which its loop no longer reads, and the up simdgroup writes
 // bf16(up) * silu(gate) as the up pass does (gguf_epilogue<EpUpWithGate>), so the intermediate is bitwise the two
 // passes'. A pass of few tiles leaves cores idle and every pass ends in a tail; one pass runs gate and up together and
@@ -87,7 +87,7 @@ kernel void moe_expert_gguf_gate_up(device bfloat *input [[buffer(0)]], device c
   const bool up = simd_group == 1;
   const MoeGgufSegment s = up ? moe_gguf_segment(tile.expert, p, uw0, uw1, umeta, usw0, usw1, usmeta)
                               : moe_gguf_segment(tile.expert, p, gw0, gw1, gmeta, gsw0, gsw1, gsmeta);
-  device bfloat *x = input + ulong(group.y) * Rows * p.input_size;
+  device bfloat *x = p.in_place ? input : input + ulong(group.y) * Rows * p.input_size;
   const ulong out = ulong(group.y) * Rows * p.output_size;
   const uint origin = group.x * GGUF_STAGED_COLUMNS;
   threadgroup half *my = stage + simd_group * kStagedSimdgroupStage;

@@ -199,6 +199,16 @@ public:
   [[nodiscard]] const MoeWorkspace &workspace() const noexcept {
     return workspace_;
   }
+  // Whether every expert's tile reads the plan's rows in place, so no gather
+  // runs (MoeGroupParams::in_place): rows that fill one 8-row tile on the
+  // staged tile, a one-lane decode step or an 8-row prefill chunk. An 8-row
+  // tile runs the 8-row matmul whatever rows it holds, so only the gather's
+  // copy and dispatch go. Plans of more rows keep grouped tiles, which run
+  // each expert on its routed rows alone.
+  [[nodiscard]] bool rowsInPlace() const noexcept {
+    return config_.expertTile == MoeExpertTile::M8 && rows_ == tileRows() &&
+           config_.ggufTile == MoeGgufTile::Staged;
+  }
 
 private:
   friend struct MoE;

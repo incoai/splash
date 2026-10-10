@@ -77,9 +77,10 @@ bool oneGateUpPass(const BlockMoeWeights &weights, const MoePlan &plan) noexcept
 // pass overwrites it after the up pass consumed it) and up with silu(gate)
 // into expertIntermediate; then down into expertOutput. Register plans read
 // Table16 tiles from groupedInput: the gather writes the gate/up input's and
-// a prepare dispatch the down input's.
+// a prepare dispatch the down input's. The gate/up passes read `input`: the
+// grouped rows, or with plan.rowsInPlace() the plan's rows in place.
 void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const BlockMoeWeights &weights,
-                const MoePlan &plan, const MoeGroupParams &group) {
+                const MoePlan &plan, const MoeGroupParams &group, const metal::MetalBuffer &input) {
   const MoeShape shape = plan.shape();
   const uint32_t tiles = plan.maximumTiles();
   const bool table16 = plan.configuration().ggufTile == MoeGgufTile::Register;
@@ -88,10 +89,10 @@ void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const Blo
   const metal::IndirectGrid gateUpGrid{scratch.tileCount, offsetof(MoeTileCount, gate_up_grid)};
   const metal::IndirectGrid downGrid{scratch.tileCount, offsetof(MoeTileCount, down_grid)};
   const auto pass = [&](const BlockExpertProjection &projection, bool up,
-                        const metal::MetalBuffer &input,
+                        const metal::MetalBuffer &passInput, uint32_t inPlace,
                         const metal::MetalBuffer &output, uint32_t n, uint32_t k,
                         uint32_t columns, const metal::IndirectGrid &grid) {
-    std::vector<metal::MetalBuffer> bindings{input};
+    std::vector<metal::MetalBuffer> bindings{passInput};
     if (table16) bindings.push_back(scratch.groupedSums);
     bindings.insert(bindings.end(),
                     {scratch.tileDescriptors, scratch.tileCount,
@@ -101,7 +102,7 @@ void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const Blo
                      scratch.expertOutput});
     graph.add(kernel + (up ? "_g" : "_a"), std::move(bindings),
               MoeGgufExpertParams{k, n, shape.experts, projection.routed.formatId,
-                                  projection.shared.formatId},
+                                  projection.shared.formatId, inPlace},
               {columns, tiles, 1}, grid, {threads, 1, 1});
   };
   const uint32_t hidden = shape.hiddenSize;
@@ -109,19 +110,19 @@ void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const Blo
   if (oneGateUpPass(weights, plan)) {
     const BlockExpertProjection &gate = weights.gate, &up = weights.up;
     graph.add(kernel + "_gate_up",
-              {scratch.groupedInput, scratch.tileDescriptors, scratch.tileCount,
+              {input, scratch.tileDescriptors, scratch.tileCount,
                gate.routed.plane0, gate.routed.plane1Slot(), gate.routed.meta,
                gate.shared.plane0, gate.shared.plane1Slot(), gate.shared.meta,
                up.routed.plane0, up.routed.plane1Slot(), up.routed.meta,
                up.shared.plane0, up.shared.plane1Slot(), up.shared.meta,
                scratch.expertIntermediate},
               MoeGgufExpertParams{hidden, intermediate, shape.experts, gate.routed.formatId,
-                                  gate.shared.formatId},
+                                  gate.shared.formatId, group.in_place},
               {group.gate_up_columns, tiles, 1}, gateUpGrid, {threads, 1, 1});
   } else {
-    pass(weights.gate, false, scratch.groupedInput, scratch.expertOutput,
+    pass(weights.gate, false, input, group.in_place, scratch.expertOutput,
          intermediate, hidden, group.gate_up_columns, gateUpGrid);
-    pass(weights.up, true, scratch.groupedInput, scratch.expertIntermediate,
+    pass(weights.up, true, input, group.in_place, scratch.expertIntermediate,
          intermediate, hidden, group.gate_up_columns, gateUpGrid);
   }
   if (table16)
@@ -130,7 +131,7 @@ void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const Blo
                scratch.groupedInput, scratch.groupedSums},
               intermediate, {tiles, intermediate / 256, 1});
   pass(weights.down, false,
-       table16 ? scratch.groupedInput : scratch.expertIntermediate,
+       table16 ? scratch.groupedInput : scratch.expertIntermediate, 0,
        scratch.expertOutput, hidden, intermediate, group.down_columns, downGrid);
 }
 
@@ -183,7 +184,7 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
   const bool oneGateUp = oneGateUpPass(weights, plan);
   const MoeGroupParams group{rows, shape.expertsPerToken, tileRows, shape.experts,
                              shape.expertIntermediateSize / (oneGateUp ? GGUF_STAGED_COLUMNS : GGUF_TILE_COLUMNS),
-                             shape.hiddenSize / GGUF_TILE_COLUMNS};
+                             shape.hiddenSize / GGUF_TILE_COLUMNS, plan.rowsInPlace()};
   graph.add("moe_group_routes",
             {scratch.selectedExperts, scratch.tileDescriptors,
              scratch.tileCount, scratch.groupedRoutes, scratch.routeRows},
@@ -194,12 +195,12 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
               {buffers.input, scratch.groupedRoutes, scratch.tileCount,
                scratch.groupedInput, scratch.groupedSums},
               gather, {tiles, shape.hiddenSize / 256, 1});
-  else
+  else if (!group.in_place)
     graph.add("moe_gather_rows",
               {buffers.input, scratch.groupedRoutes, scratch.tileDescriptors,
                scratch.tileCount, scratch.groupedInput},
               gather, {tiles, shape.hiddenSize / 256, 1});
-  addExperts(graph, scratch, weights, plan, group);
+  addExperts(graph, scratch, weights, plan, group, group.in_place ? buffers.input : scratch.groupedInput);
   graph.add("moe_combine",
             {scratch.expertOutput, scratch.routeRows, scratch.routingWeights,
              buffers.residual, buffers.output},
