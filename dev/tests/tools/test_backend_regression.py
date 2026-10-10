@@ -33,9 +33,11 @@ def benchmark_document(
         for sample in range(2)
         for width in regression.WIDTHS
     ]
-    requests = [
-        (scenario, 14096) for scenario in regression.PARTIAL if "partial" in scenarios
-    ] + [("short", rows + 1) for rows in regression.SHORT if "short" in scenarios]
+    requests = (
+        [(scenario, 14096) for scenario in regression.PARTIAL if "partial" in scenarios]
+        + [("short", rows + 1) for rows in regression.SHORT if "short" in scenarios]
+        + [(name, 40) for name in regression.TRANSCRIPTS if "transcripts" in scenarios]
+    )
     measurements = [
         {
             "scenario": scenario,
@@ -164,11 +166,31 @@ class BackendRegressionTests(unittest.TestCase):
 
             return change
 
+        def changed_transcript(document):
+            for measurement in document["measurements"]:
+                if measurement["scenario"] == "transcript_3":
+                    measurement["output_tokens"] = [9]
+
         summary = regression.summarize(
             rounds({1: changed_output, 2: changed_output}), False
         )
         self.assertTrue(
             any("outputs or acceptance differ" in f for f in summary["failures"])
+        )
+        # A transcript is compared token for token, like the other requests.
+        summary = regression.summarize(
+            rounds({1: changed_transcript, 2: changed_transcript}), False
+        )
+        self.assertTrue(
+            any(
+                "outputs or acceptance differ" in f and "transcript_3 sample 0" in f
+                for f in summary["failures"]
+            )
+        )
+        self.assertTrue(
+            regression.summarize(
+                rounds({1: changed_transcript, 2: changed_transcript}), True
+            )["pass"]
         )
         self.assertTrue(
             regression.summarize(rounds({1: changed_output, 2: changed_output}), True)[
@@ -273,7 +295,8 @@ class BackendRegressionTests(unittest.TestCase):
         self.assertEqual(len(record["decode"][4]), 2)
         self.assertEqual(len(record["partial"]["partial_4k_hit"]), 2)
         self.assertEqual(len(record["short"][2016]), 2)
-        self.assertEqual(len(record["identities"]), 3)
+        self.assertEqual(len(record["transcripts"]["transcript_7"]), 2)
+        self.assertEqual(len(record["identities"]), len(regression.SCENARIOS))
         self.assertEqual(
             record["memory_plans"][0],
             {
@@ -285,7 +308,11 @@ class BackendRegressionTests(unittest.TestCase):
         )
         for documents, scenarios, lacking in (
             ([("decode",)], ("decode", "partial"), "lacks partial samples"),
-            ([("decode", "partial")], regression.SCENARIOS, "lacks short samples"),
+            (
+                [("decode", "partial")],
+                regression.SCENARIOS,
+                "lacks short and transcripts samples",
+            ),
         ):
             with self.assertRaisesRegex(regression.RegressionError, lacking):
                 regression.round_record(
@@ -303,6 +330,7 @@ class BackendRegressionTests(unittest.TestCase):
         share=None,
         honours_share=True,
         short=True,
+        transcripts=True,
         context=CONTEXT,
         minimum_rows=832,
         earlier=False,
@@ -311,7 +339,8 @@ class BackendRegressionTests(unittest.TestCase):
         its invocations. Its weight-digests prints one image of digest; a
         build of an earlier release (earlier) has none, and its benchmark
         prepares that image into its weight cache instead. Its benchmark takes a list of scenarios with list_support, the short
-        scenario among them with short too, and serves context tokens. With a
+        and transcripts scenarios among them with short and transcripts too,
+        and serves context tokens. With a
         share it has the Neural Engine split: it reports that share and
         minimum_rows as calibrated, or runs the share --ane-ffn-share gives
         and the rows --ane-ffn-minimum-rows gives, else 512, unless
@@ -335,7 +364,11 @@ class BackendRegressionTests(unittest.TestCase):
         if share is not None:
             usage += " [--ane-ffn-minimum-rows ROWS]"
         if list_support:
-            names = "decode, partial, short" if short else "decode, partial"
+            names = ", ".join(
+                ["decode", "partial"]
+                + (["short"] if short else [])
+                + (["transcripts"] if transcripts else [])
+            )
             usage += f"\n  NAME: {names}, context or exact"
         document = benchmark_document(build=name)
         document["max_context_tokens"] = document["no_ane_context_tokens"] = context
@@ -379,7 +412,8 @@ class BackendRegressionTests(unittest.TestCase):
             f"document = json.loads({json.dumps(json.dumps(document))})\n"
             "if 'decode' not in scenarios: document['decode_throughput']['samples'] = []\n"
             "document['measurements'] = [m for m in document['measurements'] if "
-            "('short' if m['scenario'] == 'short' else 'partial') in scenarios]\n"
+            "('short' if m['scenario'] == 'short' else 'transcripts' "
+            "if m['scenario'].startswith('transcript_') else 'partial') in scenarios]\n"
             + given
             + prepare
             + "print(json.dumps(document))\n"
@@ -432,7 +466,7 @@ class BackendRegressionTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(
                 regression.RegressionError,
-                r"round-2-candidate-decode-partial-short: .*without JSON(.|\n)*boom",
+                r"round-2-candidate-decode-partial-short-transcripts: .*without JSON(.|\n)*boom",
             ):
                 self.run_main(root)
             document = json.loads(
@@ -448,21 +482,33 @@ class BackendRegressionTests(unittest.TestCase):
 
     def test_main_runs_abba_rounds_and_compares_the_weights(self):
         a, b = "a" * 64, "b" * 64
-        # A baseline without the short scenario runs the others alone, and so
-        # does the candidate.
-        for earlier, list_support, short, scenarios in (
-            (False, True, True, [["decode", "partial", "short"]]),
-            (False, True, False, [["decode", "partial"]]),
-            (True, True, True, [["decode", "partial", "short"]]),
-            (True, False, False, [["decode"], ["partial"]]),
+        # A baseline without the short or transcripts scenario runs the others
+        # alone, and so does the candidate.
+        for earlier, list_support, short, transcripts, scenarios in (
+            (False, True, True, True, [["decode", "partial", "short", "transcripts"]]),
+            (False, True, True, False, [["decode", "partial", "short"]]),
+            (False, True, False, False, [["decode", "partial"]]),
+            (True, True, True, False, [["decode", "partial", "short"]]),
+            (True, False, False, False, [["decode"], ["partial"]]),
         ):
             with (
-                self.subTest(earlier=earlier, list_support=list_support, short=short),
+                self.subTest(
+                    earlier=earlier,
+                    list_support=list_support,
+                    short=short,
+                    transcripts=transcripts,
+                ),
                 TemporaryDirectory() as directory,
             ):
                 root = Path(directory).resolve()
                 self.fake_checkout(
-                    root, "baseline", a, list_support, short=short, earlier=earlier
+                    root,
+                    "baseline",
+                    a,
+                    list_support,
+                    short=short,
+                    transcripts=transcripts,
+                    earlier=earlier,
                 )
                 self.fake_checkout(root, "candidate", a, True)
                 output = root / "release"
@@ -602,7 +648,7 @@ class BackendRegressionTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(
                 regression.RegressionError,
-                r"round-2-candidate-decode-partial-short: ran the Neural Engine split "
+                r"round-2-candidate-decode-partial-short-transcripts: ran the Neural Engine split "
                 r"at share 0.0 from 0 rows, not the first round's 0.3 from 832",
             ):
                 self.run_main(root)
@@ -641,7 +687,7 @@ class BackendRegressionTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(
                 regression.RegressionError,
-                r"round-2-candidate-decode-partial-short: ran the Neural Engine split "
+                r"round-2-candidate-decode-partial-short-transcripts: ran the Neural Engine split "
                 r"at share 0.32, not the given 0.0",
             ):
                 self.run_main(root, "--ane-ffn-share", "0")
