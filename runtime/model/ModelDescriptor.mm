@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <fnmatch.h>
 #include <initializer_list>
 #include <iterator>
@@ -207,7 +208,8 @@ void requireLayerTypes(NSArray *types, const QwenTargetDimensions &target,
 // Each family's native window, which its config's max_position_embeddings
 // states, fits the runtime's KV ceiling.
 static_assert(Qwen3_8Layout{}.maximumContextTokens <= kv::kMaximumLogicalTokens &&
-                  Qwen3_6MoeLayout{}.maximumContextTokens <= kv::kMaximumLogicalTokens,
+                  Qwen3_6MoeLayout{}.maximumContextTokens <= kv::kMaximumLogicalTokens &&
+                  Qwen4ExpLayout{}.maximumContextTokens <= kv::kMaximumLogicalTokens,
               "a family's native window exceeds the runtime's KV ceiling");
 
 ModelDescriptor qwen38Descriptor(std::string name, TargetSource targetSource,
@@ -224,6 +226,19 @@ ModelDescriptor qwen36Descriptor(std::string name, TargetSource targetSource,
                              targetSource, visionSource);
 }
 
+// mtp: whether the MTP head drafts (Qwen4ExpLayout::mtpLayers).
+ModelDescriptor qwen4Descriptor(std::string name, bool mtp, TargetSource targetSource,
+                                VisionSource visionSource) {
+  Qwen4ExpLayout target;
+  target.mtpLayers = mtp ? 1 : 0;
+  ModelDescriptor result = makeModelDescriptor(
+      std::move(name), target,
+      nullDraftLayout(target.hiddenSize, target.vocabularySize, target.capturedHiddenSize()),
+      kQwen4ExpVisionLayout, targetSource, visionSource);
+  result.draftModel = false;
+  return result;
+}
+
 // The name errors give an upstream target's source.
 std::string_view sourceName(TargetSource source) {
   return source == TargetSource::Safetensors ? "MLX" : "GGUF";
@@ -233,7 +248,8 @@ std::string_view sourceName(TargetSource source) {
 // from the family its config's model type names, or that it names none.
 std::invalid_argument unsupportedModel(const std::string &difference) {
   return std::invalid_argument("no supported model has this architecture (" + difference + "); supported: " +
-                               std::string(Qwen3_8Layout::family) + ", " + std::string(Qwen3_6MoeLayout::family));
+                               std::string(Qwen3_8Layout::family) + ", " + std::string(Qwen3_6MoeLayout::family) +
+                               ", " + std::string(Qwen4ExpLayout::family));
 }
 
 // The target's text configuration, of the family its model type names. Every
@@ -614,15 +630,17 @@ void validateVisionConfig(NSDictionary *vision, const ops::VisionLayout &layout,
 // The descriptor, named name, of an upstream model of the family its text
 // config's model type names, from the source formats its record names, with
 // each config checked: the target's, as those formats require, and the
-// draft's unless draft is nil.
+// draft's unless draft is nil. mtp says whether Qwen3.8-Flash-Next's MTP head
+// drafts.
 ModelDescriptor describeSourceModel(std::string name, std::string_view targetFormat,
                                     std::string_view visionFormat, NSDictionary *config,
-                                    NSDictionary *draft) {
+                                    NSDictionary *draft, bool mtp) {
   NSDictionary *text = config[@"text_config"];
   if (![text isKindOfClass:[NSDictionary class]]) throw unsupportedModel("its config has no text_config");
   const auto type = requireString(text, @"model_type", "text model type");
   const bool moe = type == "qwen3_5_moe_text";
-  if (!moe && type != "qwen3_5_text") throw unsupportedModel("text model type " + type);
+  const bool qwen4 = type == "qwen4_exp_text";
+  if (!moe && !qwen4 && type != "qwen3_5_text") throw unsupportedModel("text model type " + type);
   TargetSource targetSource;
   // "mlx-affine" names every safetensors target, as installations record it.
   if (targetFormat == "mlx-affine") targetSource = TargetSource::Safetensors;
@@ -633,11 +651,18 @@ ModelDescriptor describeSourceModel(std::string name, std::string_view targetFor
   else if (visionFormat == "safetensors") visionSource = VisionSource::Safetensors;
   else if (visionFormat == "gguf") visionSource = VisionSource::Gguf;
   else throw std::invalid_argument("unsupported vision source format: " + std::string(visionFormat));
-  ModelDescriptor result = moe ? qwen36Descriptor(std::move(name), targetSource, visionSource)
-                               : qwen38Descriptor(std::move(name), targetSource, visionSource);
+  if (qwen4 && targetSource != TargetSource::Gguf)
+    throw std::invalid_argument("Qwen3.8-Flash-Next loads from a GGUF only");
+  ModelDescriptor result = moe     ? qwen36Descriptor(std::move(name), targetSource, visionSource)
+                           : qwen4 ? qwen4Descriptor(std::move(name), mtp, targetSource, visionSource)
+                                   : qwen38Descriptor(std::move(name), targetSource, visionSource);
+  if (!result.hasDraft() && draft)
+    throw std::invalid_argument("this model decodes without a DFlash2 draft, but a draft config was given");
   std::visit([&](const auto &layout) {
     validateTextConfig(text, layout, layout.family, result.targetSource);
-    if (result.targetSource == TargetSource::Safetensors) requireQuantization(config, layout);
+    // Qwen3.8-Flash-Next loads from a GGUF only.
+    if constexpr (!std::is_same_v<std::remove_cvref_t<decltype(layout)>, Qwen4ExpLayout>)
+      if (result.targetSource == TargetSource::Safetensors) requireQuantization(config, layout);
     if (draft) validateDraftConfig(draft, result.draft, layout.maskToken, layout.hiddenCaptureLayers);
   }, result.target);
   if (result.hasVision())
@@ -723,6 +748,17 @@ bool ModelDescriptor::valid() const noexcept {
       target);
 }
 
+DFlashDraftLayout nullDraftLayout(uint32_t hiddenSize, uint32_t vocabularySize, uint32_t capturedHiddenSize) {
+  DFlashDraftLayout layout;
+  layout.layers = 1;
+  layout.hiddenSize = hiddenSize;
+  layout.vocabularySize = vocabularySize;
+  layout.kvHeads = 1;
+  layout.attentionHeadDimension = 8;
+  layout.targetHiddenSize = capturedHiddenSize;
+  return layout;
+}
+
 ModelDescriptor inspectModelRoot(const std::filesystem::path &root) {
   @autoreleasepool {
     std::string sourceIdentity;
@@ -732,8 +768,17 @@ ModelDescriptor inspectModelRoot(const std::filesystem::path &root) {
     const std::string targetFormat = requireString(record, @"target_format", "target format");
     const std::string visionFormat = requireString(record, @"vision_format", "vision format");
     NSDictionary *config = readObject(root / "config.json", "upstream model config");
-    NSDictionary *draft = readObject(root / "draft" / "config.json", "draft config");
-    ModelDescriptor result = describeSourceModel(std::move(name), targetFormat, visionFormat, config, draft);
+    // A family no DFlash2 draft was trained for (Qwen3.8-Flash-Next) has no
+    // draft/; its MTP head drafts when mtp/ holds it, unless SPLASH_MTP=0.
+    const bool draftDirectory = std::filesystem::exists(root / "draft");
+    NSDictionary *draft = draftDirectory ? readObject(root / "draft" / "config.json", "draft config") : nil;
+    const char *mtpSetting = std::getenv("SPLASH_MTP");
+    const bool mtp = std::filesystem::exists(root / "mtp") && !(mtpSetting && std::string_view(mtpSetting) == "0");
+    ModelDescriptor result = describeSourceModel(std::move(name), targetFormat, visionFormat, config, draft, mtp);
+    if (result.hasDraft() != draftDirectory)
+      throw std::invalid_argument(result.hasDraft()
+                                      ? "the model's root holds no draft/ for its DFlash2 draft"
+                                      : "this model decodes without a DFlash2 draft, but its root holds one");
     result.sourceIdentity = std::move(sourceIdentity);
     if (!result.valid()) throw std::invalid_argument("incompatible target and draft model");
     return result;
@@ -748,7 +793,8 @@ std::string_view inspectSourceConfiguration(std::string_view targetFormat, std::
     NSDictionary *target = readObject(config, "upstream model config");
     NSDictionary *checkpoint = draft ? readObject(*draft, "draft config") : nil;
     // Unnamed: the record names an installation, which this precedes.
-    const ModelDescriptor descriptor = describeSourceModel({}, targetFormat, visionFormat, target, checkpoint);
+    const ModelDescriptor descriptor =
+        describeSourceModel({}, targetFormat, visionFormat, target, checkpoint, false);
     if (descriptor.targetSource == TargetSource::Gguf) {
       if (!ggufMetadata) throw std::invalid_argument("a GGUF target is checked with its metadata");
       const GgufMetadata metadata = readGgufMetadata(*ggufMetadata);

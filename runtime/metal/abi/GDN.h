@@ -24,10 +24,12 @@ struct GDNPrefillParams {
 static_assert(sizeof(GDNPrefillParams) == 4,
               "GDN prefill parameters are 4 bytes on both sides");
 
-// tiled_heads (0 or 1) selects the value-head order of the GDN output, the
+// tiled_heads bit 0 selects the value-head order of the GDN output, the
 // out_proj input columns: 0 keeps a key head's value heads adjacent (head h
 // at h); 1 is llama.cpp's tiled GGUF order, head h at
-// (h % heads per key) * key heads + h / heads per key.
+// (h % heads per key) * key heads + h / heads per key. Bit 1 gates the
+// normalized output by sigmoid(z) (Qwen3.8-Flash-Next) instead of silu(z).
+#define GDN_SIGMOID_GATE 2u
 struct GDNGatePrefillParams {
   uint32_t tiled_heads;
 };

@@ -130,6 +130,15 @@ kernel void gguf_repack(device const uchar *src [[buffer(0)]], device uchar *dst
       for (uint i = 0; i < f.meta_bytes; ++i) meta[i] = blk[i];
       break;
     }
+    case GGUF_FMT_Q51: {   // block_q5_1 {d, m, qh[4], qs[16]}: element e's fifth bit is bit e of qh
+      const uint qh = uint(blk[4]) | uint(blk[5]) << 8 | uint(blk[6]) << 16 | uint(blk[7]) << 24;
+      for (uint l = 0; l < 16; ++l) { const uchar q = blk[8 + l]; lo[quant_slot(l)] = q & 15; lo[quant_slot(16 + l)] = q >> 4; }
+      for (uint e = 0; e < 32; ++e) hi[quant_slot(e)] = (qh >> e) & 1;
+      gguf_store_pairs(lo, out0);
+      gguf_store_bits(hi, 1, out1);
+      for (uint i = 0; i < 4; ++i) meta[i] = blk[i];
+      break;
+    }
     case GGUF_FMT_NVFP4: {   // {E4M3 scales[16], g, codes[128]}: element e of group j in bits 4 (e % 2) of codes[16 j + e / 2]
       for (uint e = 0; e < 32; ++e) lo[quant_slot(e)] = (blk[QUANT_NVFP4_CODES + 16 * j + e / 2] >> (4 * (e % 2))) & 15;
       gguf_store_bits(lo, 4, out0);

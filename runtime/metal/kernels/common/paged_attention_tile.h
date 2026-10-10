@@ -66,6 +66,25 @@ inline uint splash_attention_pages_per_split(uint pages, uint splits) {
   return (pages + splits - 1) / splits;
 }
 
+// QSA (Qwen3.8-Flash-Next): whether any of a tile's active rows attends to
+// one of a page's eight blocks of four tokens. Rows past the active ones read
+// the last active row's bitmap (splash_attention_page_softmax_lane), so the
+// active rows decide. A page's blocks share one bitmap word, and every thread
+// reads the same words, so the page loop skips a page uniformly.
+inline bool splash_qsa_page_attended(device const uint *block_mask,
+                                     uint mask_words, uint active_rows,
+                                     uint page) {
+  constexpr uint BlocksPerPage = SplashKvPageTokens / 4;
+  static_assert(32 % BlocksPerPage == 0,
+                "a page's blocks share one bitmap word");
+  const uint word = page * BlocksPerPage / 32;
+  const uint shift = page * BlocksPerPage % 32;
+  uint attended = 0;
+  for (uint row = 0; row < active_rows; ++row)
+    attended |= block_mask[ulong(row) * mask_words + word] >> shift;
+  return (attended & ((1u << BlocksPerPage) - 1u)) != 0;
+}
+
 // One Page32 block of one tile: key-scaled scores become value-scaled bf16
 // probabilities and the row statistics advance. Four lanes own one fused row,
 // eight consecutive tokens each, so the row maximum and sum are two xor
@@ -81,23 +100,18 @@ inline uint splash_attention_pages_per_split(uint pages, uint splits) {
 // read; relaxed atomics make the same-value writes safe without changing
 // arithmetic.
 template <uint QueryHeadsPerKVHead, uint RowsPerTile, bool Quantized>
-inline void splash_attention_page_softmax(
+inline void splash_attention_page_softmax_lane(
     threadgroup const float *scores, threadgroup bfloat *probabilities,
     threadgroup float *row_max, threadgroup float *row_sum,
     threadgroup float *previous_scale, threadgroup atomic_uint *rescale,
     device const float4 *key_scales, device const float4 *value_scales,
     uint token_start,
     uint visible_tokens, uint committed_tokens, uint active_rows,
-    uint thread_index) {
+    uint thread_index, device const uint *block_mask, uint mask_words) {
   constexpr uint N = SplashKvPageTokens;
-  constexpr uint FusedRows = RowsPerTile * QueryHeadsPerKVHead;
   constexpr uint TokensPerLane = 8;
   constexpr uint LanesPerRow = N / TokensPerLane;
   static_assert(N == 32, "four lanes of eight tokens span one page");
-  static_assert(LanesPerRow * FusedRows <= 256,
-                "one softmax lane per thread of the 256-thread tile");
-  if (thread_index >= LanesPerRow * FusedRows)
-    return;
   const uint fused_row = thread_index / LanesPerRow;
   const uint column = thread_index % LanesPerRow * TokensPerLane;
   const uint query_row = fused_row / QueryHeadsPerKVHead;
@@ -105,6 +119,16 @@ inline void splash_attention_page_softmax(
       committed_tokens + min(query_row, active_rows - 1) + 1;
   const uint limit = min(visible_tokens, causal_end);
   const uint token = token_start + column;
+  // QSA (Qwen3.8-Flash-Next): a row attends only to the blocks of four
+  // tokens its bitmap names; the lane's eight tokens are two blocks.
+  uint allowed = 0xFFu;
+  if (block_mask) {
+    device const uint *row_bits = block_mask + ulong(min(query_row, active_rows - 1)) * mask_words;
+    const uint block = token / 4;
+    const uint first = (row_bits[block / 32] >> (block % 32)) & 1u;
+    const uint second = (row_bits[(block + 1) / 32] >> ((block + 1) % 32)) & 1u;
+    allowed = (first ? 0x0Fu : 0u) | (second ? 0xF0u : 0u);
+  }
   threadgroup const float4 *scores4 =
       reinterpret_cast<threadgroup const float4 *>(scores + fused_row * N +
                                                    column);
@@ -124,7 +148,7 @@ inline void splash_attention_page_softmax(
   float local_max = -INFINITY;
 #pragma unroll
   for (uint j = 0; j < TokensPerLane; ++j) {
-    score[j] = token + j < limit ? score[j] : -INFINITY;
+    score[j] = token + j < limit && ((allowed >> j) & 1u) ? score[j] : -INFINITY;
     local_max = max(local_max, score[j]);
   }
   local_max = max(local_max, simd_shuffle_xor(local_max, 1));
@@ -135,7 +159,7 @@ inline void splash_attention_page_softmax(
   float local_sum = 0.0f;
 #pragma unroll
   for (uint j = 0; j < TokensPerLane; ++j) {
-    probability[j] = token + j < limit ? fast::exp(score[j] - next_max) : 0.0f;
+    probability[j] = token + j < limit && ((allowed >> j) & 1u) ? fast::exp(score[j] - next_max) : 0.0f;
     local_sum += probability[j];
   }
   local_sum += simd_shuffle_xor(local_sum, 1);
@@ -156,18 +180,38 @@ inline void splash_attention_page_softmax(
     low_scales = value_scales[vector];
     high_scales = value_scales[vector + 1];
   }
-  const float4 low(token + 0 < limit ? probability[0] * low_scales.x : 0.0f,
-                   token + 1 < limit ? probability[1] * low_scales.y : 0.0f,
-                   token + 2 < limit ? probability[2] * low_scales.z : 0.0f,
-                   token + 3 < limit ? probability[3] * low_scales.w : 0.0f);
-  const float4 high(token + 4 < limit ? probability[4] * high_scales.x : 0.0f,
-                    token + 5 < limit ? probability[5] * high_scales.y : 0.0f,
-                    token + 6 < limit ? probability[6] * high_scales.z : 0.0f,
-                    token + 7 < limit ? probability[7] * high_scales.w : 0.0f);
+  const float4 low(token + 0 < limit && ((allowed >> 0) & 1u) ? probability[0] * low_scales.x : 0.0f,
+                   token + 1 < limit && ((allowed >> 1) & 1u) ? probability[1] * low_scales.y : 0.0f,
+                   token + 2 < limit && ((allowed >> 2) & 1u) ? probability[2] * low_scales.z : 0.0f,
+                   token + 3 < limit && ((allowed >> 3) & 1u) ? probability[3] * low_scales.w : 0.0f);
+  const float4 high(token + 4 < limit && ((allowed >> 4) & 1u) ? probability[4] * high_scales.x : 0.0f,
+                    token + 5 < limit && ((allowed >> 5) & 1u) ? probability[5] * high_scales.y : 0.0f,
+                    token + 6 < limit && ((allowed >> 6) & 1u) ? probability[6] * high_scales.z : 0.0f,
+                    token + 7 < limit && ((allowed >> 7) & 1u) ? probability[7] * high_scales.w : 0.0f);
   threadgroup bfloat4 *probabilities4 = reinterpret_cast<threadgroup bfloat4 *>(
       probabilities + fused_row * N + column);
   probabilities4[0] = bfloat4(low);
   probabilities4[1] = bfloat4(high);
+}
+
+// One softmax lane per thread of the 256-thread tile, in turns when the tile
+// has more (a GQA group of twelve: 96 fused rows of four lanes). A turn
+// leaves whole simdgroups idle, so each row's four lanes shuffle together.
+template <uint QueryHeadsPerKVHead, uint RowsPerTile, bool Quantized>
+inline void splash_attention_page_softmax(
+    threadgroup const float *scores, threadgroup bfloat *probabilities,
+    threadgroup float *row_max, threadgroup float *row_sum,
+    threadgroup float *previous_scale, threadgroup atomic_uint *rescale,
+    device const float4 *key_scales, device const float4 *value_scales,
+    uint token_start,
+    uint visible_tokens, uint committed_tokens, uint active_rows,
+    uint thread_index, device const uint *block_mask = nullptr, uint mask_words = 0) {
+  constexpr uint Lanes = SplashKvPageTokens / 8 * RowsPerTile * QueryHeadsPerKVHead;
+  static_assert(Lanes % 32 == 0, "softmax turns cover whole simdgroups");
+  for (uint lane = thread_index; lane < Lanes; lane += 256)
+    splash_attention_page_softmax_lane<QueryHeadsPerKVHead, RowsPerTile, Quantized>(
+        scores, probabilities, row_max, row_sum, previous_scale, rescale, key_scales, value_scales,
+        token_start, visible_tokens, committed_tokens, active_rows, lane, block_mask, mask_words);
 }
 
 // One tile over its split's pages, whose K/V (INT8 with their scales, or
@@ -177,8 +221,8 @@ inline void splash_attention_page_softmax(
 // [kv head][row][query head in group][dimension], so the tile's fused rows
 // form one contiguous M x D tensor. Each page is reached through its table
 // entry (kv_extent.h).
-// Three barriers per page order the score store, the softmax and the
-// probability reads of PV.
+// Three barriers per attended page order the score store, the softmax and
+// the probability reads of PV.
 template <uint KVHeads, uint QueryHeadsPerKVHead, uint RowsPerTile,
           typename CacheElement>
 inline void splash_paged_attention_tile(
@@ -188,7 +232,7 @@ inline void splash_paged_attention_tile(
     threadgroup float *scores, threadgroup bfloat *probabilities,
     threadgroup float *row_max, threadgroup float *row_sum,
     threadgroup float *previous_scale, threadgroup atomic_uint *rescale,
-    uint thread_index) {
+    uint thread_index, device const uint *block_mask = nullptr, uint mask_words = 0) {
   constexpr ushort M = RowsPerTile * QueryHeadsPerKVHead;
   constexpr bool Quantized = is_same<CacheElement, int8_t>::value;
   constexpr ushort N = SplashKvPageTokens;
@@ -241,6 +285,12 @@ inline void splash_paged_attention_tile(
   }
 
   for (uint page = page_begin; page < page_end; ++page) {
+    // A page no row attends to adds nothing: its softmax would leave every
+    // row's maximum and sum as they are and add zero probabilities to the
+    // output, so skipping its QK, softmax and PV keeps the result's bits.
+    if (block_mask &&
+        !splash_qsa_page_attended(block_mask, mask_words, active_rows, page))
+      continue;
     const SplashKvPageTensors<CacheElement> tensors =
         addressing.page(page_table[page]);
     uint token_start = page * N;
@@ -262,7 +312,7 @@ inline void splash_paged_attention_tile(
         scores, probabilities, row_max, row_sum, previous_scale, rescale,
         reinterpret_cast<device const float4 *>(key_scales),
         reinterpret_cast<device const float4 *>(value_scales), token_start,
-        visible_tokens, committed_tokens, active_rows, thread_index);
+        visible_tokens, committed_tokens, active_rows, thread_index, block_mask, mask_words);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (atomic_load_explicit(rescale, memory_order_relaxed)) {
 #pragma unroll

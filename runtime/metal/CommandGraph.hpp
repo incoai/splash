@@ -59,6 +59,24 @@ public:
     dispatches_.back().indirectThreadgroups = std::move(grid);
   }
 
+  // A dispatch whose `params` follow its n buffers, then `after` from index
+  // n + 1 and `tail` after them: a kernel whose parameter struct precedes
+  // further bindings.
+  template <class Params, class Tail>
+  void add(std::string pipeline, std::vector<MetalBuffer> buffers, const Params &params,
+           std::vector<MetalBuffer> after, const Tail &tail, DispatchSize groups,
+           DispatchSize threads = {kDefaultThreads, 1, 1}) {
+    static_assert(std::is_trivially_copyable_v<Params> && std::is_trivially_copyable_v<Tail>,
+                  "dispatch parameters must be plain data");
+    add(std::move(pipeline), std::move(buffers), params, groups, threads);
+    ComputeDispatch &dispatch = dispatches_.back();
+    uint32_t index = static_cast<uint32_t>(dispatch.buffers.size()) + 1;
+    for (MetalBuffer &buffer : after) dispatch.buffers.push_back({index++, std::move(buffer)});
+    payloads_.emplace_back(sizeof(Tail));
+    std::memcpy(payloads_.back().data(), &tail, sizeof(Tail));
+    dispatch.bytes.push_back({index, payloads_.back().data(), sizeof(Tail)});
+  }
+
   // Event steps after the dispatches added so far (EventStep): signal once
   // all earlier work has completed, or hold all later work until the event
   // reaches value.

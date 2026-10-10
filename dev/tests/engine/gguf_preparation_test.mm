@@ -65,7 +65,7 @@ std::vector<uint8_t> slice(const std::vector<uint8_t> &bytes, uint64_t offset, u
 // and the embedding's.
 void loadImages(MetalBackend &backend, model::WeightImages &images, const std::filesystem::path &path,
                 const model::QwenTargetDimensions &geometry) {
-  model::GgufTargetLoader loader(backend, images, path, geometry);
+  model::GgufTargetLoader loader(backend, images, {path}, geometry);
   for (uint32_t layer = 0; layer < geometry.layers; ++layer) static_cast<void>(loader.layer(layer));
   static_cast<void>(loader.head());
   static_cast<void>(loader.embedding());
@@ -342,7 +342,7 @@ void checkDenseTarget(MetalBackend &backend, const std::filesystem::path &direct
                                    {"token_embd.weight", kIQ4_XS}}),
             layout);
   model::WeightImages images(backend, "fixture");
-  model::GgufTargetLoader files(backend, images, model::findTargetGguf(target), layout);
+  model::GgufTargetLoader files(backend, images, model::findTargetGgufs(target), layout);
   const model::Qwen3_8Weights weights = model::loadQwen3_8Weights(backend, layout, files);
   check(weights.layers.size() == layout.layers, "GGUF target: every layer");
   check(weights.finalNorm.float32, "GGUF target: F32 final norm");
@@ -536,6 +536,8 @@ void checkFloatSources(MetalBackend &backend, const std::filesystem::path &direc
     for (const Fmt f : {NVFP4, FP8}) {
       const QuantFormat &layout = kQuantFormats[f];
       const uint32_t rows = 96, K = 1280, blocks = K / layout.block_elements;
+      // The rows padded with zero rows to whole tiles.
+      const uint32_t tiled = (rows + QUANT_TILE_ROWS - 1) / QUANT_TILE_ROWS * QUANT_TILE_ROWS;
       std::vector<uint8_t> native = makeNative(f, rows, K, rng);
       // compressed-tensors' g in every block: the F32 reciprocal of a global
       // scale (NVFP4), or each row's bf16 scale (FP8).
@@ -588,13 +590,13 @@ void checkFloatSources(MetalBackend &backend, const std::filesystem::path &direc
       source.scale = {g.file, g.offset, g.bytes, compressed && f == FP8 ? 1 : rows, g.dtype == "BF16",
                       compressed && f == NVFP4};
       std::vector<uint8_t> tile = native;
-      tile.resize(size_t(QUANT_TILE_ROWS) * rowBytes(f, K), 0);
+      tile.resize(size_t(tiled) * rowBytes(f, K), 0);
       std::vector<float> reference;
-      const Packed expected = repack(f, tile, QUANT_TILE_ROWS, K, &reference);
+      const Packed expected = repack(f, tile, tiled, K, &reference);
       reference.resize(size_t(rows) * K);
 
       model::gguf::ImageBuilder builder("float.bin", 0, 0);
-      model::gguf::Repack planes = builder.planes(f, QUANT_TILE_ROWS, K, "m");
+      model::gguf::Repack planes = builder.planes(f, tiled, K, "m");
       planes.sources.push_back(source);
       const model::gguf::Repack step = planes;
       builder.repack(std::move(planes));

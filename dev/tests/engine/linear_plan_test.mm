@@ -755,9 +755,9 @@ void blockExtents(metal::MetalBackend &backend) {
                 });
 
   // A fused projection of a 320-row Q5_K segment and a 192-row Q4_K one.
-  // Each plane is tiles of 256 rows by groups of 32 inputs, or meta units,
-  // and ends at the last row's unit of the last group: row 63 of the Q5_K
-  // segment's second tile, row 191 of the Q4_K segment's first.
+  // Each plane is tiles of QUANT_TILE_ROWS rows by groups of 32 inputs, or
+  // meta units, and ends at the last row's unit of the last group: row 319 of
+  // the Q5_K segment and row 191 of the Q4_K one, in the tile that holds it.
   const std::array segments{segmentPlanes(backend, GGUF_FMT_Q5K, 320, k),
                             segmentPlanes(backend, GGUF_FMT_Q4K, 192, k, 320)};
   const Projection fused(512, k, BlockWeights{{segments[0], segments[1]}});
@@ -773,7 +773,8 @@ void blockExtents(metal::MetalBackend &backend) {
     const QuantFormat &format = kQuantFormats[segments[index].formatId];
     const uint64_t groups = k / 32, units = groups / format.meta_groups;
     const auto lastUnit = [&](uint64_t blocks) {
-      return index == 0 ? (2 * blocks - 1) * 256 + 64 : (blocks - 1) * 256 + 192;
+      const uint64_t last = (index == 0 ? 320 : 192) - 1;
+      return (last / QUANT_TILE_ROWS * blocks + blocks - 1) * QUANT_TILE_ROWS + last % QUANT_TILE_ROWS + 1;
     };
     for (const auto &[member, bytes, element, name] :
          std::initializer_list<std::tuple<metal::MetalBuffer QuantizedSegment::*, uint64_t, uint64_t, const char *>>{
@@ -795,14 +796,14 @@ void blockExtents(metal::MetalBackend &backend) {
 }
 
 // A view of the leading 512 inputs of rows of 1024 (Projection::leadingInputs)
-// over 512 outputs, two tiles of 256 rows: the prefill residual tile encodes
-// its leading-input instance with the view's parameters, and each plane is
-// read up to the last group the view reads of the second tile, after every
-// group of the first. A plane at that extent encodes, one element shorter or
-// holding only a matrix of the view's own inputs is refused. Every other plan
-// and a rotated view are refused before anything is encoded. The views'
-// factories refuse inputs beyond the projection's or of part of a quant group
-// or meta unit, rows of part of a tile, and float or rotated weights or a
+// over 512 outputs, in tiles of QUANT_TILE_ROWS rows: the prefill residual
+// tile encodes its leading-input instance with the view's parameters, and each
+// plane is read up to the last group the view reads of its last tile, after
+// every group of the tiles before. A plane at that extent encodes, one element
+// shorter or holding only a matrix of the view's own inputs is refused. Every
+// other plan and a rotated view are refused before anything is encoded. The
+// views' factories refuse inputs beyond the projection's or of part of a quant
+// group or meta unit, rows of part of a tile, and float or rotated weights or a
 // view; a view of leading rows holds its planes' first tiles.
 void leadingInputViews(metal::MetalBackend &backend) {
   const Linear linear = gpu(10, 16);
@@ -820,11 +821,11 @@ void leadingInputViews(metal::MetalBackend &backend) {
   const auto residualPrefill = [&](LinearConfig config, LinearEpilogue epilogue) {
     return Linear::plan({{n, k}, rows, LinearPhase::Prefill, epilogue}, config, FloatOutput::BFloat16);
   };
-  // The extent of a plane the view reads, in units of `unitBytes`: the first
-  // tile, `rowGroups` groups (or meta units) of each of its 256 rows, then
-  // the first `readGroups` of the second tile.
+  // The extent of a plane the view reads, in units of `unitBytes`: every tile
+  // but the last, `rowGroups` groups (or meta units) of each of its
+  // QUANT_TILE_ROWS rows, then the first `readGroups` of the last tile.
   const auto reach = [](uint64_t rowGroups, uint64_t readGroups, uint64_t unitBytes) {
-    return (rowGroups + readGroups) * 256 * unitBytes;
+    return ((n / QUANT_TILE_ROWS - 1) * rowGroups + readGroups) * QUANT_TILE_ROWS * unitBytes;
   };
 
   const QuantFormat &q5k = kQuantFormats[GGUF_FMT_Q5K];
@@ -899,7 +900,7 @@ void leadingInputViews(metal::MetalBackend &backend) {
   rejects([&] { (void)gguf.leadingInputs(k / 2); }, kSource, "a view of a view");
   rejects([&] { (void)floats.leadingRows(backend, 256); }, kSource, "a view of the rows of float weights");
 
-  // A view of leading rows, whole 256-row tiles, takes each plane's first tiles.
+  // A view of leading rows, whole plane tiles, takes each plane's first tiles.
   const Projection ggufRows = wideGguf.leadingRows(backend, 256);
   const QuantizedSegment &segment = ggufRows.blocks().segments.front();
   require(ggufRows.outputSize == 256 && !ggufRows.planeInputs() && segment.outputSize == 256 &&
@@ -908,7 +909,7 @@ void leadingInputViews(metal::MetalBackend &backend) {
               segment.plane1.sizeBytes() == uint64_t{256} * (wide / 32) * q5k.plane1_bytes &&
               segment.meta.sizeBytes() == uint64_t{256} * (wide / 32 / q5k.meta_groups) * q5k.meta_bytes,
           "a view of 256 Q5_K rows does not hold their tile");
-  for (const uint32_t count : {0u, 128u, n + 256})
+  for (const uint32_t count : {0u, QUANT_TILE_ROWS / 2, n + QUANT_TILE_ROWS})
     rejects([&] { (void)wideGguf.leadingRows(backend, count); }, "whole plane tiles",
             "a view of " + std::to_string(count) + " leading rows");
 }

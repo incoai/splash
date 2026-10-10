@@ -118,6 +118,9 @@ QwenGdnCell::QwenGdnCell(metal::MetalBackend &backend,
             uint64_t{layer} * layout.recurrentLayerBytes(),
         layout.recurrentLayerBytes());
   }
+  if (layout.auxiliaryBytes)
+    buffers_.auxiliary = backend.view(buffers_.stateBase, layout.convolutionBytes() + layout.recurrentBytes(),
+                                      layout.auxiliaryBytes);
   actualAllocatedBytes_ =
       metal::allocationDelta(before, backend.memoryStats().allocatedBytes);
   if (actualAllocatedBytes_ < layout.cellBytes()) {

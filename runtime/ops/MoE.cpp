@@ -46,10 +46,10 @@ MoeWorkspace workspaceFor(MoeShape shape, uint32_t rows, uint32_t tileRows, MoeG
   const uint32_t tiles = moeMaximumTiles(rows, shape, tileRows);
   const uint64_t groupedRows = uint64_t{tiles} * tileRows;
   const uint32_t widest = std::max(shape.hiddenSize, shape.expertIntermediateSize);
-  // The router's fp32 scores, a row of expert slots per row, live in the
-  // grouped input until the gather overwrites them. Register plans also hold
-  // the down pass's Table16 tiles there.
-  const uint64_t scoreBytes = uint64_t{rows} * SPLASH_MOE_EXPERT_SLOTS * sizeof(float);
+  // The router's fp32 scores, a row of routerWidth() expert slots per row,
+  // live in the grouped input until the gather overwrites them. Register
+  // plans also hold the down pass's Table16 tiles there.
+  const uint64_t scoreBytes = uint64_t{rows} * shape.routerWidth() * sizeof(float);
   const bool table16 = ggufTile == MoeGgufTile::Register;
   const uint64_t sumsBytes = table16 ? tableSumsBytes(LinearInput::Table16, widest, groupedRows) : 0;
   return {routes * sizeof(uint32_t), routes * sizeof(float),
@@ -128,7 +128,7 @@ void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const Blo
     graph.add("moe_prepare_table16",
               {scratch.expertIntermediate, scratch.tileCount,
                scratch.groupedInput, scratch.groupedSums},
-              intermediate, {tiles, intermediate / 256, 1});
+              intermediate, {tiles, (intermediate + 255) / 256, 1});
   pass(weights.down, false,
        table16 ? scratch.groupedInput : scratch.expertIntermediate,
        scratch.expertOutput, hidden, intermediate, group.down_columns, downGrid);
@@ -166,15 +166,18 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
     requireBytes(scratch.*field.buffer, required.*field.bytes, field.name);
   const MoeRouteParams routeParams{rows, shape.hiddenSize, shape.experts,
                                    shape.expertsPerToken};
-  // fp32 scores of the F32 router in rows of expert slots, as the select
-  // kernel reads.
+  // fp32 scores of the F32 router in rows of routerWidth() expert slots, as
+  // the select kernel reads; more than SPLASH_MOE_EXPERT_SLOTS experts
+  // (Qwen3.8-Flash-Next's 512) select and group on the 512-thread kernels.
+  const uint32_t width = shape.routerWidth();
+  const bool wide = width > SPLASH_MOE_EXPERT_SLOTS;
   addGgufFloat(graph, buffers.input, weights.router, scratch.groupedInput, rows,
-               SPLASH_MOE_EXPERT_SLOTS, 0, FloatOutput::Float32, plan.configuration().ggufRouterTile);
-  graph.add("moe_route_select_f32",
+               width, 0, FloatOutput::Float32, plan.configuration().ggufRouterTile);
+  graph.add(wide ? "moe_route_select_f32_e512" : "moe_route_select_f32",
             {scratch.groupedInput, buffers.input,
              weights.sharedScalarGate.plane0, scratch.selectedExperts,
              scratch.routingWeights},
-            routeParams, {rows, 1, 1}, {SPLASH_MOE_EXPERT_SLOTS, 1, 1});
+            routeParams, {rows, 1, 1}, {width, 1, 1});
   // The expert passes launch the live tiles alone, on grids the grouping
   // writes with the tile count. Over every tile a step could fill, a 35B
   // decode step of one lane launched 65 tiles' threadgroups for a median of
@@ -184,10 +187,10 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
   const MoeGroupParams group{rows, shape.expertsPerToken, tileRows, shape.experts,
                              shape.expertIntermediateSize / (oneGateUp ? GGUF_STAGED_COLUMNS : GGUF_TILE_COLUMNS),
                              shape.hiddenSize / GGUF_TILE_COLUMNS};
-  graph.add("moe_group_routes",
+  graph.add(wide ? "moe_group_routes_e512" : "moe_group_routes",
             {scratch.selectedExperts, scratch.tileDescriptors,
              scratch.tileCount, scratch.groupedRoutes, scratch.routeRows},
-            group, {1, 1, 1}, {SPLASH_MOE_EXPERT_SLOTS, 1, 1});
+            group, {1, 1, 1}, {width, 1, 1});
   const MoeGatherParams gather{tileRows, shape.hiddenSize, shape.routesPerToken()};
   if (plan.configuration().ggufTile == MoeGgufTile::Register)
     graph.add("moe_gather_table16",

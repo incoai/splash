@@ -16,6 +16,7 @@
 // the fp64 choice on 12-15% of rows (fp32: at most 0.0024%), and bf16 weights
 // round 19-20% of the combine's outputs away from bf16 of its exact sum
 // (fp32: 0.008%).
+template <uint StorageN = SPLASH_MOE_EXPERT_SLOTS>
 inline void moe_route_select(device const float *scores, device bfloat *input,
                              device const float *shared_gate, device uint *selected,
                              device float *routing_weights,
@@ -24,21 +25,21 @@ inline void moe_route_select(device const float *scores, device bfloat *input,
                              uint simd_group, threadgroup float *row_scores,
                              threadgroup float *ordered,
                              threadgroup float *scalar_partials) {
-  constexpr uint Slots = SPLASH_MOE_EXPERT_SLOTS;
-  constexpr uint Simdgroups = Slots / 32;
-  constexpr uint ExpertsPerLane = Slots / 32;
+  // StorageN experts (256, or 512 for Qwen3.8-Flash-Next), one per thread.
+  constexpr uint Simdgroups = StorageN / 32;
+  constexpr uint ExpertsPerLane = StorageN / 32;
   const uint row = group;
   if (row >= params.rows)
     return;
   row_scores[thread_index] =
       thread_index < params.experts
-          ? scores[ulong(row) * Slots + thread_index]
+          ? scores[ulong(row) * StorageN + thread_index]
           : -numeric_limits<float>::infinity();
 
   device bfloat *row_input = input + ulong(row) * params.input_size;
   float scalar = 0.0f;
   for (uint dimension = thread_index; dimension < params.input_size;
-       dimension += Slots) {
+       dimension += StorageN) {
     scalar += float(row_input[dimension]) *
               shared_gate[dimension];
   }
@@ -115,6 +116,26 @@ kernel void moe_route_select_f32(
                    simd_group, row_scores, ordered, scalar_partials);
 }
 
+// The GGUF router of up to 512 experts (Qwen3.8-Flash-Next): rows of 512
+// fp32 scores, 512 threads.
+kernel void moe_route_select_f32_e512(
+    device const float *scores [[buffer(0)]],
+    device bfloat *input [[buffer(1)]],
+    device const float *shared_gate [[buffer(2)]],
+    device uint *selected [[buffer(3)]],
+    device float *routing_weights [[buffer(4)]],
+    constant MoeRouteParams &params [[buffer(5)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float row_scores[512];
+  threadgroup float ordered[512];
+  threadgroup float scalar_partials[16];
+  moe_route_select<512>(scores, input, shared_gate, selected, routing_weights, params, group, thread_index,
+                        simd_lane, simd_group, row_scores, ordered, scalar_partials);
+}
+
 // Sorts one command's routes by expert. Tile t covers grouped rows
 // [t * tile_rows, (t + 1) * tile_rows) of a single expert; the rows past
 // that expert's last route that its last tile's matmul reads
@@ -122,28 +143,20 @@ kernel void moe_route_select_f32(
 // and thread e owns expert e's count, offsets and tile descriptors. The
 // shared expert's tiles follow the routed tiles and hold every row in order.
 // It writes the tile count with the expert passes' grids (MoeTileCount).
-kernel void moe_group_routes(
-    device const uint *selected [[buffer(0)]],
-    device MoeTileDescriptor *tiles [[buffer(1)]],
-    device MoeTileCount *tile_count [[buffer(2)]],
-    device uint *grouped_routes [[buffer(3)]],
-    device uint *route_rows [[buffer(4)]],
-    constant MoeGroupParams &params [[buffer(5)]],
-    uint thread_index [[thread_index_in_threadgroup]],
-    uint simd_lane [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  constexpr uint Slots = SPLASH_MOE_EXPERT_SLOTS;
+// Experts threads (256, or 512 for Qwen3.8-Flash-Next).
+template <uint Experts>
+inline void moe_group_routes_phase(
+    device const uint *selected, device MoeTileDescriptor *tiles, device MoeTileCount *tile_count,
+    device uint *grouped_routes, device uint *route_rows, constant MoeGroupParams &params,
+    uint thread_index, uint simd_lane, uint simd_group, threadgroup atomic_uint *counts,
+    threadgroup atomic_uint *cursors, threadgroup uint *tile_offsets, threadgroup uint *simd_totals,
+    threadgroup uint &routed_tiles) {
   const uint routes_per_row = params.top_k + 1;
   const uint routes = params.rows * routes_per_row;
-  threadgroup atomic_uint counts[Slots];
-  threadgroup atomic_uint cursors[Slots];
-  threadgroup uint tile_offsets[Slots];
-  threadgroup uint simd_totals[Slots / 32];
-  threadgroup uint routed_tiles;
   atomic_store_explicit(&counts[thread_index], 0u, memory_order_relaxed);
   atomic_store_explicit(&cursors[thread_index], 0u, memory_order_relaxed);
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (uint route = thread_index; route < routes; route += Slots) {
+  for (uint route = thread_index; route < routes; route += Experts) {
     if (route % routes_per_row != params.top_k) {
       atomic_fetch_add_explicit(&counts[selected[route]], 1u,
                                 memory_order_relaxed);
@@ -161,7 +174,7 @@ kernel void moe_group_routes(
   for (uint group = 0; group < simd_group; ++group)
     tile_offset += simd_totals[group];
   tile_offsets[thread_index] = tile_offset;
-  if (thread_index == Slots - 1)
+  if (thread_index == Experts - 1)
     routed_tiles = tile_offset + expert_tiles;
   for (uint tile = 0; tile < expert_tiles; ++tile) {
     tiles[tile_offset + tile] = MoeTileDescriptor{
@@ -176,7 +189,7 @@ kernel void moe_group_routes(
       grouped_routes[row] = ~0u;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (uint route = thread_index; route < routes; route += Slots) {
+  for (uint route = thread_index; route < routes; route += Experts) {
     if (route % routes_per_row == params.top_k)
       continue;
     uint expert = selected[route];
@@ -194,12 +207,12 @@ kernel void moe_group_routes(
       (shared_tiles - 1) * params.tile_rows +
       moe_matmul_rows(params.rows - (shared_tiles - 1) * params.tile_rows,
                       params.tile_rows);
-  for (uint tile = thread_index; tile < shared_tiles; tile += Slots) {
+  for (uint tile = thread_index; tile < shared_tiles; tile += Experts) {
     tiles[routed_tiles + tile] = MoeTileDescriptor{
         params.experts,
         min(params.tile_rows, params.rows - tile * params.tile_rows)};
   }
-  for (uint row = thread_index; row < shared_rows; row += Slots) {
+  for (uint row = thread_index; row < shared_rows; row += Experts) {
     if (row < params.rows) {
       uint route = row * routes_per_row + params.top_k;
       grouped_routes[shared_base + row] = route;
@@ -213,6 +226,45 @@ kernel void moe_group_routes(
     *tile_count = MoeTileCount{live, {params.gate_up_columns, live, 1},
                                {params.down_columns, live, 1}};
   }
+}
+
+kernel void moe_group_routes(
+    device const uint *selected [[buffer(0)]],
+    device MoeTileDescriptor *tiles [[buffer(1)]],
+    device MoeTileCount *tile_count [[buffer(2)]],
+    device uint *grouped_routes [[buffer(3)]],
+    device uint *route_rows [[buffer(4)]],
+    constant MoeGroupParams &params [[buffer(5)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  constexpr uint Slots = SPLASH_MOE_EXPERT_SLOTS;
+  threadgroup atomic_uint counts[Slots];
+  threadgroup atomic_uint cursors[Slots];
+  threadgroup uint tile_offsets[Slots];
+  threadgroup uint simd_totals[Slots / 32];
+  threadgroup uint routed_tiles;
+  moe_group_routes_phase<Slots>(selected, tiles, tile_count, grouped_routes, route_rows, params, thread_index,
+                              simd_lane, simd_group, counts, cursors, tile_offsets, simd_totals, routed_tiles);
+}
+
+kernel void moe_group_routes_e512(
+    device const uint *selected [[buffer(0)]],
+    device MoeTileDescriptor *tiles [[buffer(1)]],
+    device MoeTileCount *tile_count [[buffer(2)]],
+    device uint *grouped_routes [[buffer(3)]],
+    device uint *route_rows [[buffer(4)]],
+    constant MoeGroupParams &params [[buffer(5)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  threadgroup atomic_uint counts[512];
+  threadgroup atomic_uint cursors[512];
+  threadgroup uint tile_offsets[512];
+  threadgroup uint simd_totals[16];
+  threadgroup uint routed_tiles;
+  moe_group_routes_phase<512>(selected, tiles, tile_count, grouped_routes, route_rows, params, thread_index,
+                              simd_lane, simd_group, counts, cursors, tile_offsets, simd_totals, routed_tiles);
 }
 
 // Copies each grouped row's input so every expert tile is a dense matrix,
@@ -253,7 +305,9 @@ template <class Source>
 inline void moe_table16_tile(Source source, device bfloat *table,
                              device float *sums, uint width, uint2 group,
                              uint simd_lane, uint simd_group) {
-  for (uint span = group.y * 4; span < group.y * 4 + 4; ++span) {
+  // The last part of a width that is not a multiple of 256 (the 640-wide
+  // Flash-Next expert intermediate) holds fewer spans.
+  for (uint span = group.y * 4; span < min(group.y * 4 + 4, width / 64); ++span) {
     const bfloat2 values = source(simd_group, span * 64 + 2 * simd_lane);
     gguf_sg::write_input(table + ulong(group.x) * width * 8,
                        sums + ulong(group.x) * table16_sums_per_tile(width),

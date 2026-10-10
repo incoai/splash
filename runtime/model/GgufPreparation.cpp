@@ -311,11 +311,25 @@ float e4m3Scaled(uint8_t b) {
 }
 
 // Writes the F32 values, as the kernels compute them, of `count` native
-// blocks of safetensors format `id`: s * code + z (affine), kFP4Values[code]
-// (twice the E2M1 value) times 2^(e - 128) (mxfp4) or times the 16-group's
-// (128 g) * e4m3 / 2^8 (nvfp4), or (256 g) times e4m3 / 2^8 (fp8).
+// blocks of format `id`: s * code + z (affine), kFP4Values[code] (twice the
+// E2M1 value) times 2^(e - 128) (mxfp4) or times the 16-group's (128 g) *
+// e4m3 / 2^8 (nvfp4), (256 g) times e4m3 / 2^8 (fp8), or d * q, exact in F32
+// (GGUF Q8_0).
 void dequantize(const uint8_t *blocks, uint64_t count, uint32_t id, uint8_t *to) {
   const QuantFormat &format = kQuantFormats[id];
+  if (id == GGUF_FMT_Q80) {
+    for (uint64_t block = 0; block < count; ++block) {
+      const uint8_t *in = blocks + block * format.block_bytes;
+      uint16_t d;
+      std::memcpy(&d, in, 2);
+      const float scale = static_cast<float>(std::bit_cast<_Float16>(d));
+      for (uint32_t l = 0; l < format.block_elements; ++l) {
+        const float value = scale * float(static_cast<int8_t>(in[2 + l]));
+        std::memcpy(to + 4 * (block * format.block_elements + l), &value, 4);
+      }
+    }
+    return;
+  }
   if (id == GGUF_FMT_NVFP4 || id == GGUF_FMT_FP8) {
     for (uint64_t block = 0; block < count; ++block) {
       const uint8_t *in = blocks + block * format.block_bytes;
@@ -368,12 +382,16 @@ uint64_t copyBytes(const gguf::Copy &copy) {
 
 // The tasks that write a copy into image, each of whole rows within
 // kLoadStepBytes or, for a wider row, a piece of whole values (whole native
-// blocks of rows a reader builds) of one row: a copy as stored reads in
-// place, a converted one through its thread's staging.
+// blocks of rows a reader builds, whole blocks of a GGUF tensor decoded to
+// F32) of one row: a copy as stored reads in place, a converted one through
+// its thread's staging.
 void addCopyTasks(uint8_t *image, const gguf::Copy &copy,
                   std::vector<std::function<void(std::vector<uint8_t> &)>> &tasks) {
   const gguf::TensorRows &rows = copy.source;
-  const uint64_t unit = rowReader(rows) == RowReader::Stored ? 4 : nativeFormat(rows).block_bytes;
+  const uint64_t unit = rowReader(rows) != RowReader::Stored ? nativeFormat(rows).block_bytes
+                        : copy.conversion == gguf::Conversion::DequantizeToFloat32
+                            ? kQuantFormats[gguf_format_of(rows.type)].block_bytes
+                            : 4;
   const uint64_t span = std::min<uint64_t>(rows.rowBytes, kLoadStepBytes / unit * unit);
   const uint64_t batch = span == rows.rowBytes ? kLoadStepBytes / rows.rowBytes : 1;
   for (uint64_t first = 0; first < rows.rows; first += batch) {
@@ -401,7 +419,8 @@ void addCopyTasks(uint8_t *image, const gguf::Copy &copy,
           break;
         }
         case gguf::Conversion::DequantizeToFloat32:
-          dequantize(staging.data(), count * width / nativeFormat(rows).block_bytes, gguf_format_of(rows.type), to);
+          dequantize(staging.data(), count * width / kQuantFormats[gguf_format_of(rows.type)].block_bytes,
+                     gguf_format_of(rows.type), to);
           break;
         case gguf::Conversion::None: break;
         }
@@ -446,7 +465,7 @@ RepackChunk repackChunk(const gguf::Repack &repack) {
 // shape, sources of its row width and planes inside the image.
 void requireRepack(const gguf::Repack &repack, uint64_t imageBytes) {
   if (repack.format >= GGUF_FMT_COUNT || !repack.rows || repack.rows % QUANT_TILE_ROWS || !repack.columns ||
-      repack.columns % kGgufBlockColumns)
+      repack.columns % ggufColumnUnit(kQuantFormats[repack.format]))
     throw GgufError("invalid prepared weight repack");
   const QuantFormat &format = kQuantFormats[repack.format];
   const uint64_t rowBytes = ggufRowBytes(format, repack.columns);

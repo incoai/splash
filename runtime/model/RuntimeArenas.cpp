@@ -4,6 +4,47 @@
 #include "ops/Sampling.hpp"
 
 namespace splash::model {
+
+namespace {
+
+// Qwen3.8-Flash-Next's scratch of `rows` rows (QwenHyperBuffers).
+template <class Tensor, class Put>
+void putHyper(const RuntimeGeometry &geometry, uint64_t rows, Put put) {
+  const QwenTargetGeometry &g = geometry.target;
+  if (!g.qwen4()) return;
+  put(Tensor::HyperStreams, bytesFor<float>(rows * g.streamWidth()));
+  put(Tensor::HyperNormalized, bytesFor<uint16_t>(rows * g.streamWidth()));
+  put(Tensor::HyperLow, bytesFor<uint16_t>(rows * g.hyperRank));
+  put(Tensor::HyperGate, bytesFor<uint16_t>(rows * g.streamWidth()));
+  put(Tensor::HyperWeights, bytesFor<float>(rows * g.hyperConnections));
+  put(Tensor::HyperBranch, bytesFor<uint16_t>(rows * g.hiddenSize));
+  put(Tensor::HyperZeros, bytesFor<uint16_t>(rows * g.hiddenSize));
+  put(Tensor::PleIndices, bytesFor<uint32_t>(rows * g.pleHeads()));
+  put(Tensor::PleRows, bytesFor<uint16_t>(rows * g.pleWidth()));
+  put(Tensor::PleValue, bytesFor<uint16_t>(rows * g.hiddenSize));
+  put(Tensor::PleGated, bytesFor<float>(rows * g.streamWidth()));
+  put(Tensor::PleConvolution, bytesFor<uint16_t>(rows * g.streamWidth()));
+  // QSA: projections and prepared queries of QWEN4_QSA_HEADS heads, the
+  // score scratch (all decode rows, kQsaPrefillScoreRows prefill rows) and
+  // bitmaps of every block of the context, and the blocks a step pools.
+  const uint64_t words = qsaMaskWords(g.maximumContextTokens);
+  put(Tensor::IndexerQuery, bytesFor<float>(rows * 4 * 128));
+  put(Tensor::IndexerKey, bytesFor<float>(rows * 128));
+  put(Tensor::QsaQueries, bytesFor<float>(rows * 4 * 128));
+  put(Tensor::QsaScores, bytesFor<float>(std::min<uint64_t>(rows, kQsaPrefillScoreRows) * words * 32));
+  put(Tensor::QsaMask, bytesFor<uint32_t>(rows * words));
+  put(Tensor::QsaBlocks, (rows / 4 + 2 * kLaneCount) * 16);
+  // The MTP head's streams, eh-projection inputs and draft tokens; the two
+  // tokens before a decode lane's rows, for the GPU PLE hash.
+  if (g.mtpLayers) {
+    put(Tensor::MtpStreams, bytesFor<float>(rows * g.streamWidth()));
+    put(Tensor::MtpInput, bytesFor<uint16_t>(rows * 2 * g.streamWidth()));
+    put(Tensor::MtpTokens, bytesFor<uint32_t>(rows));
+    put(Tensor::PlePrior, bytesFor<uint32_t>(2));
+  }
+}
+
+} // namespace
 std::array<uint64_t, prefillTensorCount>
 prefillTensorBytes(const RuntimeGeometry &geometry,
                    const ops::ExecutionPlans &operators) {
@@ -109,12 +150,16 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
       bytesFor<uint16_t>(uint64_t{geometry.target.attentionKvHeads} *
                          kRaggedAttentionRows *
                          geometry.target.attentionHeadDimension));
+  putHyper<PrefillTensor>(geometry, kPrefillRows, put);
   // The split partials and counters and the rotated rows of the largest
-  // prefill plan, the draft's context projections' too.
+  // prefill plan, the draft's context projections' too when the model has a
+  // DFlash2 draft.
   const auto &draft = geometry.draft;
   std::vector<ops::ProjectionShape> prefillProjections = geometry.target.prefillProjections;
-  prefillProjections.push_back({draft.hiddenSize, draft.targetHiddenSize});
-  prefillProjections.push_back({draft.contextKvSize(), draft.hiddenSize});
+  if (geometry.hasDraft) {
+    prefillProjections.push_back({draft.hiddenSize, draft.targetHiddenSize});
+    prefillProjections.push_back({draft.contextKvSize(), draft.hiddenSize});
+  }
   for (const auto &projection : prefillProjections) {
     const ops::LinearScratchSize linear = operators.linear().prefillScratchSize(projection);
     put(PrefillTensor::LinearPartials, linear.partials);
@@ -167,7 +212,8 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
                   const ops::ExecutionPlans &operators) {
   std::array<uint64_t, decodeTensorCount> result{};
   const auto draftWorkspace =
-      operators.draftAttentionWorkspacePerLane(geometry.draft.attentionShape());
+      geometry.hasDraft ? operators.draftAttentionWorkspacePerLane(geometry.draft.attentionShape())
+                        : ops::DraftAttentionWorkspace{};
   const auto samplingWorkspace = ops::Sampling::workspace(kDecodeRows);
   const auto selectorWorkspace = ops::DraftSelector::workspace(kDraftProposalTokens);
   auto put = [&](DecodeTensor tensor, uint64_t bytes) {
@@ -175,6 +221,7 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
     size = std::max(size, bytes);
   };
   const uint64_t r = kDecodeRows;
+  putHyper<DecodeTensor>(geometry, r, put);
   put(DecodeTensor::Hidden0,
       bytesFor<uint16_t>(r * geometry.target.hiddenSize));
   put(DecodeTensor::Hidden1,
@@ -325,6 +372,7 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
   ops::LinearScratchSize result;
   // Includes the vocabulary head shared with the draft.
   for (const auto &p : geometry.target.decodeProjections) result.include(operators.linear().decodeScratchSize(p));
+  if (geometry.hasDraft)
   for (const ops::ProjectionShape shape : {ops::ProjectionShape{d.dynamicSize, d.hiddenSize},
        {d.qkvSize, d.hiddenSize}, {d.contextKvSize(), d.hiddenSize},
        {d.hiddenSize, d.attentionSize},

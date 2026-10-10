@@ -48,6 +48,23 @@ struct QwenTargetDimensions {
   uint32_t experts = 0;
   uint32_t expertsPerToken = 0;
   uint32_t expertIntermediateSize = 0;
+  // Qwen3.8-Flash-Next (model/Qwen4Exp.hpp) when hyperConnections is set: its
+  // residual's streams and the mixes' low rank; the QSA indexer's heads of
+  // indexerHeadDimension values, past indexerTopBlocks blocks of
+  // indexerBlockTokens tokens of which a row attends sparsely; and the PLE
+  // n-gram embedding's layer, n-gram size, heads per n-gram, head width and
+  // convolution taps.
+  uint32_t hyperConnections = 0;
+  uint32_t hyperRank = 0;
+  uint32_t indexerHeads = 0;
+  uint32_t indexerHeadDimension = 0;
+  uint32_t indexerTopBlocks = 0;
+  uint32_t indexerBlockTokens = 0;
+  uint32_t pleLayer = 0;
+  uint32_t pleNgram = 0;
+  uint32_t pleHeadsPerNgram = 0;
+  uint32_t pleHeadDimension = 0;
+  uint32_t pleConvolutionTaps = 0;
 
   [[nodiscard]] constexpr bool
   isFullAttentionLayer(uint32_t layer) const noexcept {
@@ -59,6 +76,19 @@ struct QwenTargetDimensions {
   [[nodiscard]] constexpr uint32_t actualGdnWidth() const noexcept {
     return convolutionDimension + attentionWidth + 2 * gdnValueHeads;
   }
+  [[nodiscard]] constexpr bool qwen4() const noexcept { return hyperConnections != 0; }
+  [[nodiscard]] constexpr uint32_t streamWidth() const noexcept { return hyperConnections * hiddenSize; }
+  [[nodiscard]] constexpr uint32_t pleHeads() const noexcept {
+    return pleNgram ? (pleNgram - 1) * pleHeadsPerNgram : 0;
+  }
+  [[nodiscard]] constexpr uint32_t pleWidth() const noexcept { return pleHeads() * pleHeadDimension; }
+  // The PLE convolution's history: (taps - 1) * dilation rows, the dilation
+  // being the n-gram size.
+  [[nodiscard]] constexpr uint32_t pleHistory() const noexcept {
+    return pleConvolutionTaps ? (pleConvolutionTaps - 1) * pleNgram : 0;
+  }
+  // The tokens a QSA row attends to sparsely past (the indexer's top_k).
+  [[nodiscard]] constexpr uint32_t indexerTokens() const noexcept { return indexerTopBlocks * indexerBlockTokens; }
   bool operator==(const QwenTargetDimensions &) const = default;
 };
 
