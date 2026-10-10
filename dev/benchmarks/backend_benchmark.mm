@@ -93,7 +93,7 @@ public:
   }
 
   void completed(uint64_t requestId, EngineFinishReason, uint32_t,
-                 uint32_t, std::span<const float>) override {
+                 uint32_t, std::span<const float>, const engine::ScoreReadout &) override {
     observations_[requestId].completed = true;
   }
 

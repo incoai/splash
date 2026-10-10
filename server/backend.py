@@ -66,8 +66,12 @@ class NativeResult:
     cache: CacheInfo = field(default_factory=CacheInfo)
     stop_sequence: str | None = None
     first_token_batch_tokens: int = 0
-    # Raw option logits for score-only jobs, in requested token order.
+    # Raw option logits for score-only jobs, in requested token order, and
+    # the final position's full-vocabulary log-sum-exp and highest logits.
     option_logits: tuple = ()
+    log_normalizer: float = 0.0
+    top_token_ids: tuple = ()
+    top_logits: tuple = ()
 
     @functools.cached_property
     def metrics(self):
@@ -119,6 +123,8 @@ class Job:
     output_clamped_to_context: bool = False
     # The digest of a judgment's rendered prompt, which its response reports.
     prompt_sha256: str | None = None
+    # /v1/score: the labels and options its response reads (scoring.py).
+    score_meta: object | None = None
     latency: RequestLatency | None = None
 
     @property
@@ -797,6 +803,9 @@ class NativeBackend:
                     else done.completion_tokens
                 ),
                 option_logits=done.option_logits,
+                log_normalizer=done.log_normalizer,
+                top_token_ids=done.top_token_ids,
+                top_logits=done.top_logits,
                 start_to_first_token_ms=done.prefill_micros / 1000.0,
                 first_token_to_done_ms=done.decode_micros / 1000.0,
                 request_wall_ms=done.wall_micros / 1000.0,

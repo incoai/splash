@@ -1284,6 +1284,13 @@ struct Runtime::Impl {
       }
     }
     QwenTargetPrefillBuffers buffers = prefillBuffers(*prefillArena);
+    // A chunk that prefills a score request runs split-free, so its logits
+    // are the same bits whatever rows share its ragged prefill or how its
+    // prompt is chunked (QwenTargetPrefillBuffers::splitFree).
+    buffers.splitFree = std::any_of(batch.sequences.begin(), batch.sequences.end(),
+                                    [](const RaggedPrefillSequence &sequence) {
+                                      return !sequence.entry->scoreTokens.empty();
+                                    });
     const MetalBuffer finalHidden = targetModel.addPrefill(
         graph, std::move(buffers),
         std::span(modelSequences).first(batch.sequences.size()), batch.rows,
@@ -2255,6 +2262,34 @@ Runtime::prefillAsync(const BatchPlan &plan,
               break;
             }
             result.scoreLogits.push_back(logit);
+          }
+          if (!result.scoreLogits.empty()) {
+            // Full-vocabulary readout: log-sum-exp in fp64 and the highest
+            // logits (ties toward the lower id), from the same fp32 row.
+            const uint32_t vocabulary = impl->geometry.target.vocabularySize;
+            float maximum = -std::numeric_limits<float>::infinity();
+            bool finite = true;
+            for (uint32_t token = 0; token < vocabulary; ++token) {
+              finite = finite && std::isfinite(row[token]);
+              maximum = std::max(maximum, row[token]);
+            }
+            double sum = 0.0;
+            for (uint32_t token = 0; token < vocabulary; ++token)
+              sum += std::exp(static_cast<double>(row[token]) - maximum);
+            const uint32_t top = std::min<uint32_t>(ExecutionLimits::scoreTopTokens, vocabulary);
+            std::vector<uint32_t> ids(vocabulary);
+            std::iota(ids.begin(), ids.end(), 0u);
+            std::partial_sort(ids.begin(), ids.begin() + top, ids.end(), [&](uint32_t a, uint32_t b) {
+              return row[a] != row[b] ? row[a] > row[b] : a < b;
+            });
+            if (!finite) {
+              result.scoreLogits.clear();
+              result.failure = "score logits are not finite";
+            } else {
+              result.scoreLogNormalizer = static_cast<double>(maximum) + std::log(sum);
+              result.scoreTopIds.assign(ids.begin(), ids.begin() + top);
+              for (uint32_t i = 0; i < top; ++i) result.scoreTopLogits.push_back(row[ids[i]]);
+            }
           }
           result.finished = true;
         } else if (selected) {

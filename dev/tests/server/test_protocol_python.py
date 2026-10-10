@@ -129,6 +129,19 @@ def engine_events():
         "done_scored": p.DoneEvent(
             91, p.FinishReason.STOP, 4096, 0, 1000, 0, 3500, (1.5, -2.25, 0.5)
         ),
+        "done_scored_readout": p.DoneEvent(
+            91,
+            p.FinishReason.STOP,
+            4096,
+            0,
+            1000,
+            0,
+            3500,
+            (1.5, -2.25),
+            12.75,
+            (7, 3, 11),
+            (9.5, 9.25, -1.0),
+        ),
         "error_request": p.ErrorEvent(
             p.FailureClass.REQUEST_ERROR,
             91,

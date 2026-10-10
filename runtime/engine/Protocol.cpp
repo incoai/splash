@@ -177,6 +177,7 @@ public:
   }
 
   void f32(float value) { u32(std::bit_cast<uint32_t>(value)); }
+  void f64(double value) { u64(std::bit_cast<uint64_t>(value)); }
 
   void raw(std::span<const uint8_t> bytes) {
     bytes_.insert(bytes_.end(), bytes.begin(), bytes.end());
@@ -331,10 +332,8 @@ std::optional<ProtocolIssue> validateRequest(const RequestFrame &request,
                    "generation prompt must leave a prompt token");
   }
   if (scoring) {
-    if (!request.imageSpans.empty()) {
-      return invalid(IssueCode::InvalidCount,
-                     "score requests are text-only");
-    }
+    // Score requests may carry images: prefill encodes them as for
+    // generation, and only the final position's readout differs.
     if (request.scoreTokens.size() < ExecutionLimits::minimumScoreOptions ||
         request.scoreTokens.size() > ExecutionLimits::maximumScoreOptions) {
       return invalid(IssueCode::InvalidCount,
@@ -501,6 +500,22 @@ std::optional<ProtocolIssue> validateDone(const DoneEvent &event) {
                             "done option logits must be finite");
       }
     }
+    if (!std::isfinite(event.logNormalizer) ||
+        event.topTokenIds.size() != event.topLogits.size() ||
+        event.topTokenIds.size() > ExecutionLimits::scoreTopTokens) {
+      return invalidEvent(IssueCode::InvalidCount, event.requestId,
+                          "done score normalizer or top tokens are invalid");
+    }
+    for (float logit : event.topLogits) {
+      if (!std::isfinite(logit)) {
+        return invalidEvent(IssueCode::InvalidCount, event.requestId,
+                            "done top logits must be finite");
+      }
+    }
+  } else if (event.logNormalizer != 0.0 || !event.topTokenIds.empty() ||
+             !event.topLogits.empty()) {
+    return invalidEvent(IssueCode::InvalidCount, event.requestId,
+                        "only scored done events carry a normalizer or top tokens");
   }
   return std::nullopt;
 }
@@ -606,7 +621,9 @@ EncodedEvent encodeDone(const DoneEvent &event) {
     return failure<std::vector<uint8_t>>(std::move(*issue));
   Writer writer =
       frameWriter(FrameType::Done,
-                  kDoneFixedBytes + event.optionLogits.size() * sizeof(float));
+                  kDoneFixedBytes +
+                      (event.optionLogits.size() + 2 * event.topTokenIds.size()) * sizeof(float) +
+                      (event.optionLogits.empty() ? 0 : sizeof(double) + sizeof(uint32_t)));
   writer.u64(event.requestId);
   writer.u8(static_cast<uint8_t>(event.reason));
   writer.u32(event.promptTokens);
@@ -617,6 +634,16 @@ EncodedEvent encodeDone(const DoneEvent &event) {
   writer.u32(static_cast<uint32_t>(event.optionLogits.size()));
   for (float logit : event.optionLogits)
     writer.f32(logit);
+  // A score readout follows its option logits: the f64 normalizer, the top
+  // count, the top ids and their logits. Generation Done events end here.
+  if (!event.optionLogits.empty()) {
+    writer.f64(event.logNormalizer);
+    writer.u32(static_cast<uint32_t>(event.topTokenIds.size()));
+    for (uint32_t token : event.topTokenIds)
+      writer.u32(token);
+    for (float logit : event.topLogits)
+      writer.f32(logit);
+  }
   return success(writer.take());
 }
 

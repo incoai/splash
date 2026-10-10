@@ -198,6 +198,17 @@ EngineEvent decodeEvent(FrameType type, Reader &in) {
     event.optionLogits.resize(in.u32());
     for (float &logit : event.optionLogits)
       logit = in.f32();
+    if (!event.optionLogits.empty()) {
+      // The score readout: normalizer, top count, ids, logits.
+      event.logNormalizer = std::bit_cast<double>(in.u64());
+      const uint32_t top = in.u32();
+      event.topTokenIds.resize(top);
+      for (uint32_t &token : event.topTokenIds)
+        token = in.u32();
+      event.topLogits.resize(top);
+      for (float &logit : event.topLogits)
+        logit = in.f32();
+    }
     return event;
   }
   case FrameType::Error: {

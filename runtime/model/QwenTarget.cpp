@@ -207,7 +207,9 @@ metal::MetalBuffer QwenTarget::addPrefill(
     step.attention.push_back(operators_.prefillAttention(
         sequence.rows, geometry_.attentionQueryHeads, geometry_.kvLayout));
   if (geometry_.ffnKind == QwenFfnKind::SparseMoe) step.moe = operators_.moePrefill(geometry_.moeShape(), rows);
-  if (aneFfn && aneFfn->splits(rows)) step.aneFfn = aneFfn;
+  // A score request's chunk runs on the GPU alone: the Neural Engine's fp16
+  // share of the dense FFN would make its logits depend on the split.
+  if (aneFfn && !buffers.splitFree && aneFfn->splits(rows)) step.aneFfn = aneFfn;
   std::visit([&](const auto *weights) {
     for (uint32_t index = 0; index < geometry_.layers; ++index) {
       const auto &layer = weights->layers[index];
@@ -238,7 +240,7 @@ void QwenTarget::addPrefillNorm(PrefillStep &step, metal::MetalBuffer input, con
 void QwenTarget::addPrefillOutput(PrefillStep &step, metal::MetalBuffer hidden, const ops::Projection &projection,
                                   metal::MetalBuffer input, metal::MetalBuffer output) const {
   operators_.linear().addPrefillResidual(step.graph, hidden, projection, input, output, step.rows,
-                                         step.buffers.linearScratch);
+                                         step.buffers.linearScratch, step.buffers.splitFree);
 }
 
 metal::MetalBuffer QwenTarget::addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer,
@@ -247,7 +249,7 @@ metal::MetalBuffer QwenTarget::addPrefillMixer(PrefillStep &step, const QwenGdnW
   const uint32_t layer = step.gdnLayer++;
   addPrefillNorm(step, input, norm);
   operators_.linear().addPrefill(step.graph, b.normalized, mixer.inputProjection, b.gdnPacked, step.rows,
-                                 b.linearScratch);
+                                 b.linearScratch, step.buffers.splitFree);
   for (const QwenTargetPrefillSequence &sequence : step.sequences) {
     const auto u16 = [&](const metal::MetalBuffer &buffer, uint32_t width) {
       return rowsOf<uint16_t>(backend_, buffer, sequence.rowBegin, sequence.rows, width);
@@ -275,7 +277,7 @@ metal::MetalBuffer QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAtte
   const uint32_t layer = step.attentionLayer++;
   addPrefillNorm(step, input, norm);
   operators_.linear().addPrefill(step.graph, b.normalized, mixer.inputProjection, b.fullPacked, step.rows,
-                                 b.linearScratch);
+                                 b.linearScratch, step.buffers.splitFree);
   for (size_t index = 0; index < step.sequences.size(); ++index) {
     const QwenTargetPrefillSequence &sequence = step.sequences[index];
     const auto u16 = [&](const metal::MetalBuffer &buffer, uint32_t width) {
@@ -318,7 +320,7 @@ void QwenTarget::addPrefillFfn(PrefillStep &step, uint32_t index, const Qwen3_8L
   else
     operators_.linear().addPrefillSwiGlu(step.graph, {&layer.gateProjection, &layer.upProjection,
                                                       &layer.downProjection},
-                                         ffn, residual, output, step.rows);
+                                         ffn, residual, output, step.rows, step.buffers.splitFree);
 }
 
 void QwenTarget::addPrefillFfn(PrefillStep &step, uint32_t, const Qwen3_6MoeLayerWeights &layer,
