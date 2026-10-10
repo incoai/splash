@@ -7,6 +7,8 @@
 // `rows` live rows first, then padding. Every expert pass runs the matmul of
 // the smallest of 8, 16 and tile_rows rows that holds the live rows, and the
 // grouping and the gather fill exactly those rows: no kernel reads past them.
+// An in-place tile (MoeGroupParams::in_place) is the plan's 8 rows, every one
+// live, and no gather runs.
 inline uint moe_matmul_rows(uint rows, uint tile_rows) {
   return min(tile_rows, rows <= 8 ? 8u : rows <= 16 ? 16u : tile_rows);
 }
