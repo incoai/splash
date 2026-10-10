@@ -338,6 +338,8 @@ public:
         step.outputTokens = {42};
         step.outputTokensWithoutKv = 1;
         step.finished = *prefillAnchor;
+      } else if (last && firstTokens && !state.constrained) {
+        step.firstToken = 42;
       }
       result.push_back(std::move(step));
     }
@@ -618,6 +620,10 @@ public:
   std::optional<uint32_t> poisonToken;
   // Set when prefill itself ends the request: the value is `finished` (stop).
   std::optional<bool> prefillAnchor;
+  // Whether the step that completes an unconstrained request's prompt reports
+  // its first token (ModelStepResult::firstToken), as the runtime does. It is
+  // 42, which the first decode step's tokens start with.
+  bool firstTokens = false;
   std::shared_ptr<std::atomic<bool>> holdDecodeUntil;
   std::shared_ptr<std::atomic<bool>> holdPrefillUntil;
   // The completion of the latest held command, for the test to call as

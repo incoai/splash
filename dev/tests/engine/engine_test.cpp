@@ -5423,6 +5423,45 @@ void testTerminalAnchorWithoutKvIsNotCached() {
   }
 }
 
+// An unconstrained request's first token reaches the client when the prefill
+// selects it, before the first decode cycle that commits it; that cycle's
+// event leaves it out, and the usage counts what the client got, also when the
+// request is cancelled before that cycle.
+void testFirstTokenIsSentAtPrefill() {
+  for (const bool cancel : {false, true}) {
+    test::TestKvStorage storage(8, 4096, 4);
+    KvPool pool(storage, 0);
+    engine::Cache resources(pool, nullptr, nullptr);
+    Executor executor(1);
+    executor.firstTokens = true;
+    executor.decodeFinishes = false;
+    executor.decodeTokens = 4;
+    executor.holdDecodeUntil = std::make_shared<std::atomic<bool>>(false);
+    Events events;
+    engine::Engine engine(test::engineConfig(), resources, executor, events);
+    guardReleases(storage, engine);
+
+    EngineRequest value = request(91, std::vector<uint32_t>(40, 91));
+    value.maxNewTokens = 12;
+    engine.submit(std::move(value));
+    // The first cycle is held in flight: the client has the first token.
+    double now = 1;
+    tickUntil(engine, now, [&] { return !events.outputs[91].empty() && engine.commandInFlight(); },
+              "the first cycle did not start after the prompt");
+    require(events.outputs[91] == std::vector<uint32_t>{42},
+            "the first token did not reach the client before the first cycle");
+    if (cancel)
+      engine.cancel(91);
+    *executor.holdDecodeUntil = true;
+    tickUntil(engine, now, [&] { return idle(engine); }, "the request did not end");
+    const uint32_t expected = cancel ? 1 : 12;
+    require(events.completedCount == 1 && events.outputs[91].size() == expected &&
+                events.usage[91] == std::pair<uint32_t, uint32_t>{40, expected},
+            cancel ? "a cancelled request's usage left out the first token it was sent"
+                   : "the stream and the usage disagree on the tokens sent");
+  }
+}
+
 void testPrefillCanCompleteTheRequest() {
   for (bool stop : {false, true}) {
     test::TestKvStorage storage(8, 4096, 4);
@@ -8971,6 +9010,7 @@ int main() {
     testStalledSuspensionFailsWithCapacity();
     testTerminalAnchorWithoutKvIsNotCached();
     testPrefillCanCompleteTheRequest();
+    testFirstTokenIsSentAtPrefill();
     testOutOfVocabularyOutputFailsLaneOnly();
     std::cout << "engine tests passed\n";
     return EXIT_SUCCESS;

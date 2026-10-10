@@ -282,13 +282,20 @@ ModelStepResult decodeOne(model::Runtime &executor, uint64_t requestId,
 }
 
 // A stop token or a one-token budget is emitted by prefill itself; otherwise
-// the first output tokens come from one decode cycle.
+// the first output tokens come from one decode cycle, which commits first the
+// first token the prefill reported (the engine sends that one ahead).
 ModelStepResult firstStep(model::Runtime &executor, ModelStepResult prefilled,
                           uint64_t requestId, uint64_t logicalPosition,
                           const std::vector<uint32_t> &pageTable) {
   if (!prefilled.outputTokens.empty())
     return prefilled;
-  return decodeOne(executor, requestId, logicalPosition, pageTable);
+  ModelStepResult decoded =
+      decodeOne(executor, requestId, logicalPosition, pageTable);
+  require(!prefilled.firstToken || (!decoded.outputTokens.empty() &&
+                                    decoded.outputTokens.front() ==
+                                        *prefilled.firstToken),
+          "the first cycle did not commit the first token prefill reported");
+  return decoded;
 }
 
 struct PendingMaskedDecode final {

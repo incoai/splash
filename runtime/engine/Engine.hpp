@@ -301,6 +301,10 @@ private:
     // The prompt from submit on, then the committed output; request.prompt
     // is empty.
     std::vector<uint32_t> exactTokens;
+    // The first output token, sent to the client when the prefill selected it
+    // (ModelStepResult::firstToken) and until the first decode cycle commits
+    // it: that cycle emits it first, and its event leaves it out.
+    std::optional<uint32_t> sentFirstToken;
     // Made from exactTokens and request.images, which do not change while
     // the request waits; refreshed each pass and dropped once it starts or
     // skips the cache.

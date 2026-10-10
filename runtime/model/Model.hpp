@@ -327,6 +327,11 @@ struct ModelStepResult final {
   // rest of the batch stands. Broken invariants and GPU faults stay
   // exceptions and remain engine-fatal.
   std::string failure{};
+  // The request's first output token, which the step that completes its
+  // prompt selected and left pending: the first decode cycle writes its KV row
+  // and emits it first. Reported so that the engine can send it to the client
+  // now rather than with that cycle.
+  std::optional<uint32_t> firstToken{};
 
   bool operator==(const ModelStepResult &) const = default;
 };
