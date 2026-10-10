@@ -66,6 +66,25 @@ inline uint splash_attention_pages_per_split(uint pages, uint splits) {
   return (pages + splits - 1) / splits;
 }
 
+// QSA (Qwen3.8-Flash-Next): whether any of a tile's active rows attends to
+// one of a page's eight blocks of four tokens. Rows past the active ones read
+// the last active row's bitmap (splash_attention_page_softmax_lane), so the
+// active rows decide. A page's blocks share one bitmap word, and every thread
+// reads the same words, so the page loop skips a page uniformly.
+inline bool splash_qsa_page_attended(device const uint *block_mask,
+                                     uint mask_words, uint active_rows,
+                                     uint page) {
+  constexpr uint BlocksPerPage = SplashKvPageTokens / 4;
+  static_assert(32 % BlocksPerPage == 0,
+                "a page's blocks share one bitmap word");
+  const uint word = page * BlocksPerPage / 32;
+  const uint shift = page * BlocksPerPage % 32;
+  uint attended = 0;
+  for (uint row = 0; row < active_rows; ++row)
+    attended |= block_mask[ulong(row) * mask_words + word] >> shift;
+  return (attended & ((1u << BlocksPerPage) - 1u)) != 0;
+}
+
 // One Page32 block of one tile: key-scaled scores become value-scaled bf16
 // probabilities and the row statistics advance. Four lanes own one fused row,
 // eight consecutive tokens each, so the row maximum and sum are two xor
@@ -202,8 +221,8 @@ inline void splash_attention_page_softmax(
 // [kv head][row][query head in group][dimension], so the tile's fused rows
 // form one contiguous M x D tensor. Each page is reached through its table
 // entry (kv_extent.h).
-// Three barriers per page order the score store, the softmax and the
-// probability reads of PV.
+// Three barriers per attended page order the score store, the softmax and
+// the probability reads of PV.
 template <uint KVHeads, uint QueryHeadsPerKVHead, uint RowsPerTile,
           typename CacheElement>
 inline void splash_paged_attention_tile(
@@ -266,6 +285,12 @@ inline void splash_paged_attention_tile(
   }
 
   for (uint page = page_begin; page < page_end; ++page) {
+    // A page no row attends to adds nothing: its softmax would leave every
+    // row's maximum and sum as they are and add zero probabilities to the
+    // output, so skipping its QK, softmax and PV keeps the result's bits.
+    if (block_mask &&
+        !splash_qsa_page_attended(block_mask, mask_words, active_rows, page))
+      continue;
     const SplashKvPageTensors<CacheElement> tensors =
         addressing.page(page_table[page]);
     uint token_start = page * N;

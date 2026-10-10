@@ -149,6 +149,16 @@ struct Case {
   std::vector<id<MTLBuffer>> extents;
   std::unique_ptr<HostKvExtents> pool;
   id<MTLBuffer> queries;
+  // QSA bitmaps (Qwen3.8-Flash-Next, GQA-12 only): maskWords words per row
+  // of the rows' attended blocks of four tokens; none when maskWords is 0.
+  std::vector<uint32_t> mask;
+  uint32_t maskWords = 0;
+
+  bool attends(uint32_t row, uint32_t token) const {
+    if (!maskWords) return true;
+    const uint32_t block = token / 4;
+    return (mask[uint64_t{row} * maskWords + block / 32] >> (block % 32)) & 1u;
+  }
 
   uint64_t queryIndex(uint32_t head, uint32_t row, uint32_t dimension) const {
     const uint32_t kvHead = head / shape.queryHeadsPerKvHead;
@@ -207,7 +217,55 @@ Case oneExtentCopy(id<MTLDevice> device, const Case &data) {
       std::memcpy(result.slab<std::byte>(tensor, page), data.slab<std::byte>(tensor, page),
                   tensor % 2 ? scaleBytes : dataBytes);
   std::memcpy(result.queries.contents, data.queries.contents, data.queries.length);
+  result.mask = data.mask;
+  result.maskWords = data.maskWords;
   return result;
+}
+
+// Blocks a QSA row attends past kQsaTopBlocks complete blocks; up to there
+// every block up to its own, as qwen4_qsa_select writes them.
+constexpr uint32_t kQsaTopBlocks = 40;
+// Bitmap rows of every block ahead of a dispatch's rows, which it must skip
+// by its row0: a kernel reading them would attend every page.
+constexpr uint32_t kQsaJunkRows = 3;
+
+
+// Bitmaps whose pages a tile's rows attend in every way the page loop must
+// tell apart: whole pages for every row, one block per row of a page (no
+// single row attends the whole page), half a page or one block that only
+// one row attends, and pages no row attends; each row also attends its own
+// block. Rows past kQsaTopBlocks complete blocks attend sparsely, earlier
+// ones causally.
+// The dispatch's bitmap: kQsaJunkRows rows of every block, then `copies`
+// copies of the case's rows (one per verify lane).
+id<MTLBuffer> qsaBitmapBuffer(id<MTLDevice> device, const Case &data, uint32_t copies) {
+  const uint64_t junk = uint64_t{kQsaJunkRows} * data.maskWords;
+  id<MTLBuffer> result =
+      makeBuffer(device, (junk + uint64_t{copies} * data.mask.size()) * sizeof(uint32_t));
+  auto *words = static_cast<uint32_t *>(result.contents);
+  std::fill_n(words, junk, ~0u);
+  for (uint32_t copy = 0; copy < copies; ++copy)
+    std::memcpy(words + junk + copy * data.mask.size(), data.mask.data(),
+                data.mask.size() * sizeof(uint32_t));
+  return result;
+}
+
+void setQsaMask(Case &data) {
+  const uint32_t visible = data.params.committed_tokens + data.params.rows;
+  data.maskWords = visible / 4 / 32 + 2;
+  data.mask.assign(uint64_t{data.params.rows} * data.maskWords, 0u);
+  for (uint32_t row = 0; row < data.params.rows; ++row) {
+    uint32_t *bits = data.mask.data() + uint64_t{row} * data.maskWords;
+    const uint32_t complete = (data.params.committed_tokens + row + 1) / 4;
+    for (uint32_t block = 0; block <= complete; ++block) {
+      const uint32_t page = block / 8, slot = block % 8;
+      const bool take = complete <= kQsaTopBlocks || block == complete ||
+                        page % 5 == 0 || (page % 5 == 2 && slot == row % 8) ||
+                        (page % 11 == 1 + row % 8 && slot % 2 == 0) ||
+                        (page % 13 == 2 + row % 8 && slot == (page + row) % 8);
+      if (take) bits[block / 32] |= 1u << (block % 32);
+    }
+  }
 }
 
 // The page format is head-major inside a page, so a kv2_g8 page is the first
@@ -308,7 +366,9 @@ std::vector<BFloat16Bits> cpuReference(const Case &data, bool quantized) {
                         keyPattern(token, kvHead, dimension)));
           score += double(query) * key;
         }
-        weights[token] = score * 0.0625;
+        weights[token] = data.attends(row, token)
+                             ? score * 0.0625
+                             : -std::numeric_limits<double>::infinity();
         maximum = std::max(maximum, weights[token]);
       }
       double denominator = 0.0;
@@ -415,10 +475,12 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
   // The kernel reaches the extents only through the page entries.
   for (id<MTLBuffer> extent : data.extents)
     [encoder useResource:extent usage:MTLResourceUsageRead];
-  // A GQA-12 split also binds QSA bitmaps; none here (every row causal).
-  const uint32_t noMask[2] = {0, 0};
-  [encoder setBuffer:partials offset:0 atIndex:8];
-  [encoder setBytes:noMask length:sizeof(noMask) atIndex:9];
+  // A GQA-12 split also binds QSA bitmaps: every lane's rows read the
+  // case's, from bitmap row row0 + 8 lane.
+  const uint32_t maskParams[2] = {data.maskWords, data.maskWords ? kQsaJunkRows : 0};
+  id<MTLBuffer> mask = data.maskWords ? qsaBitmapBuffer(device, data, width) : partials;
+  [encoder setBuffer:mask offset:0 atIndex:8];
+  [encoder setBytes:maskParams length:sizeof(maskParams) atIndex:9];
   [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads, splits, width)
           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   [encoder setComputePipelineState:reduce];
@@ -455,6 +517,11 @@ Dispatch dispatchPrefill(id<MTLDevice> device, id<MTLCommandQueue> queue,
   [encoder setBuffer:statistics offset:0 atIndex:2];
   [encoder setBuffer:data.pageTableBuffer offset:0 atIndex:3];
   [encoder setBytes:&data.params length:sizeof(data.params) atIndex:4];
+  // A GQA-12 split also binds QSA bitmaps, from row row0 on.
+  const uint32_t maskParams[2] = {data.maskWords, data.maskWords ? kQsaJunkRows : 0};
+  id<MTLBuffer> mask = data.maskWords ? qsaBitmapBuffer(device, data, 1) : partials;
+  [encoder setBuffer:mask offset:0 atIndex:5];
+  [encoder setBytes:maskParams length:sizeof(maskParams) atIndex:6];
   for (id<MTLBuffer> extent : data.extents)
     [encoder useResource:extent usage:MTLResourceUsageRead];
   [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads, 1, splits)
@@ -496,9 +563,13 @@ void checkOutput(const Case &data, uint32_t width,
   float qualityMaximumAbsolute = 0.0f;
   uint32_t top1Matches = 0;
   uint32_t top1Rows = 0;
+  // With QSA bitmaps each row attends its own blocks: a row that lost some
+  // must not hide in the cosine pooled over every row.
+  std::vector<std::array<double, 3>> rowSums(uint64_t{width} * activeRows, {0.0, 0.0, 0.0});
   for (uint32_t lane = 0; lane < width; ++lane) {
     for (uint32_t head = 0; head < shape.queryHeads(); ++head) {
       for (uint32_t row = 0; row < activeRows; ++row) {
+        std::array<double, 3> &rowSum = rowSums[uint64_t{lane} * activeRows + row];
         uint32_t actualTop = 0;
         float actualTopValue = -std::numeric_limits<float>::infinity();
         float bf16TopValue = -std::numeric_limits<float>::infinity();
@@ -513,6 +584,9 @@ void checkOutput(const Case &data, uint32_t width,
           dot += double(observed) * q8Reference;
           actualSquared += double(observed) * observed;
           expectedSquared += double(q8Reference) * q8Reference;
+          rowSum[0] += double(observed) * q8Reference;
+          rowSum[1] += double(observed) * observed;
+          rowSum[2] += double(q8Reference) * q8Reference;
           qualityMaximumAbsolute = std::max(
               qualityMaximumAbsolute, std::abs(observed - bf16Reference));
           qualityDot += double(observed) * bf16Reference;
@@ -545,6 +619,10 @@ void checkOutput(const Case &data, uint32_t width,
             << " bf16_top1=" << top1Agreement << '\n';
   require(cosine > 0.9995,
           "production batch attention differs from its Q8 reference");
+  if (data.maskWords)
+    for (const auto &[rowDot, rowActual, rowExpected] : rowSums)
+      require(rowDot / std::sqrt(rowActual * rowExpected) > 0.999,
+              "a QSA row's attention differs from its Q8 reference");
   require(maximumAbsolute < 0.02f,
           "production batch attention exceeds its Q8 error bound");
   require(!qualityGate ||
@@ -615,18 +693,21 @@ void requireIdentical(const std::string &pipeline, const Case &data,
 void runCase(id<MTLDevice> device, id<MTLCommandQueue> queue,
              const Pipelines &pipelines, Shape shape,
              uint32_t committed, uint32_t activeRows, uint32_t width,
-             bool qualityGate = true, uint32_t splits = kVerifySplits) {
+             bool qualityGate = true, uint32_t splits = kVerifySplits,
+             bool qsa = false) {
   require(width >= 1 && width <= 4 &&
               (activeRows == kRows ||
                (width == 1 && splits <= SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS)),
           "invalid attention case");
   Case data = makeCase(device, shape, committed, activeRows, splits);
   fill(data);
+  if (qsa) setQsaMask(data);
   const Case oneExtent = oneExtentCopy(device, data);
   const std::vector<BFloat16Bits> expectedQ8 = cpuReference(data, true);
   const std::vector<BFloat16Bits> expectedBf16 = cpuReference(data, false);
   const bool verify = activeRows == kRows;
-  const std::string &name = verify ? pipelines.splitName : pipelines.prefillSplitName;
+  const std::string name =
+      (verify ? pipelines.splitName : pipelines.prefillSplitName) + (qsa ? "_qsa" : "");
   const auto run = [&](const Case &c) {
     return verify ? dispatch(device, queue, pipelines.split, pipelines.reduce, c, width)
                   : dispatchPrefill(device, queue, pipelines.prefillSplit,
@@ -784,6 +865,21 @@ void run(const char *libraryPath) {
     runCase(device, queue, pipelines, shape, 8'192, 5, 1, false);
     runCase(device, queue, pipelines, shape, 32'768, 7, 1, false);
     runCase(device, queue, pipelines, shape, 32'768, 8, 2, false, 65);
+    if (shape.queryHeadsPerKvHead == 12) {
+      // QSA bitmaps: the page loop skips the pages no row of a tile attends
+      // to. Causal rows only; tiles crossing from causal to sparse rows
+      // (complete blocks 40 to 42, and only the last row past 40); sparse
+      // rows over several pages per split, ragged and empty splits.
+      runCase(device, queue, pipelines, shape, 127, 8, 1, true, kVerifySplits, true);
+      runCase(device, queue, pipelines, shape, 160, 8, 2, true, kVerifySplits, true);
+      runCase(device, queue, pipelines, shape, 158, 6, 1, true, kVerifySplits, true);
+      runCase(device, queue, pipelines, shape, 1'100, 8, 2, false, kVerifySplits, true);
+      runCase(device, queue, pipelines, shape, 1'100, 8, 1, false, 1, true);
+      runCase(device, queue, pipelines, shape, 4'093, 5, 1, false, kVerifySplits, true);
+      runCase(device, queue, pipelines, shape, 4'093, 8, 3, false, 65, true);
+      runCase(device, queue, pipelines, shape, 32'768, 7, 1, false, kVerifySplits, true);
+      runCase(device, queue, pipelines, shape, 32'768, 8, 2, false, 65, true);
+    }
   }
   std::cout << "q8_flash_attention_metal_test: ok\n";
 }
