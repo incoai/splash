@@ -335,10 +335,6 @@ void QwenTarget::addVerify(
     std::span<const kv::ChunkedPrefillParams> chunks, uint32_t lanes) const {
   if (!lanes || lanes > ExecutionLimits::maximumBatchWidth || chunks.size() != lanes ||
       kvLayers.size() != geometry_.kvLayout.attentionLayers ||
-      buffers.gdnPacked.size() != geometry_.stateLayout.layers ||
-      buffers.gdnMixed.size() != geometry_.stateLayout.layers ||
-      buffers.gdnDecay.size() != geometry_.stateLayout.layers ||
-      buffers.gdnBeta.size() != geometry_.stateLayout.layers ||
       buffers.chunkKeys.size() != geometry_.kvLayout.attentionLayers ||
       buffers.chunkValues.size() != geometry_.kvLayout.attentionLayers) {
     throw std::invalid_argument("invalid Qwen verify batch");
@@ -378,15 +374,15 @@ metal::MetalBuffer QwenTarget::addVerifyMixer(VerifyStep &step, const QwenGdnWei
   const ops::PreparedInput normalized = ops::Normalization::addRms(
       step.graph, input, norm, b.normalized, geometry_.hiddenSize, step.rows, b.linearScratch, inputPlan.input());
   linear.add(step.graph,
-             {.input = b.normalized, .output = b.gdnPacked[layer], .scratch = b.linearScratch,
+             {.input = b.normalized, .output = b.gdnPacked, .scratch = b.linearScratch,
               .prepared = normalized},
              mixer.inputProjection, inputPlan);
   const ops::LinearPlan outputPlan =
       linear.decodePlan(mixer.outputProjection, step.lanes, ops::LinearEpilogue::Residual);
   const ops::PreparedInput hidden = ops::GDN::addDecode(
       step.graph,
-      {b.gdnPacked[layer], mixer.convolutionWeights, b.currentGdnStates, b.nextGdnStates, b.gdnMixed[layer],
-       mixer.decay, mixer.timeBias, b.gdnDecay[layer], b.gdnBeta[layer], mixer.mixerNorm, b.gdnHidden,
+      {b.gdnPacked, mixer.convolutionWeights, b.currentGdnStates, b.nextGdnStates, b.gdnTape,
+       std::span(b.gdnTapeLanes).first(step.lanes), mixer.decay, mixer.timeBias, mixer.mixerNorm, b.gdnHidden,
        b.linearScratch},
       geometry_.gdnShape(), step.lanes, layer,
       {geometry_.stateLayout.convolutionLayerBytes(), geometry_.stateLayout.recurrentLayerBytes(),
@@ -486,22 +482,6 @@ void QwenTarget::addEmbedding(metal::CommandGraph &graph,
                               uint32_t rows) const {
   ops::Embedding::add(graph, std::move(tokens), weightsBase_.tokenEmbedding, std::move(hidden),
                       rows);
-}
-
-void QwenTarget::addStateCommit(metal::CommandGraph &graph,
-                                QwenTargetCommitBuffers buffers,
-                                uint32_t lanes) const {
-  if (!lanes || lanes > ExecutionLimits::maximumBatchWidth)
-    throw std::invalid_argument("invalid Qwen state commit batch");
-  ops::GDN::addCommit(
-      graph,
-      {std::move(buffers.packed), std::move(buffers.mixed),
-       std::move(buffers.decay), std::move(buffers.beta), buffers.currentStates,
-       buffers.nextStates, std::move(buffers.retainedCounts)},
-      geometry_.gdnShape(), geometry_.stateLayout.layers, lanes,
-      {geometry_.stateLayout.convolutionLayerBytes(),
-       geometry_.stateLayout.recurrentLayerBytes(),
-       geometry_.stateLayout.convolutionBytes()});
 }
 
 } // namespace splash::model

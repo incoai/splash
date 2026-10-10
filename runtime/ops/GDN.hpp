@@ -65,29 +65,34 @@ struct GdnPrefillBuffers final {
   metal::MetalBuffer hidden;
 };
 
+// A lane's decode tape (metal/abi/GDN.h): each step leaves its rows'
+// convolution inputs, k, v and gates there, and the lane's next step folds
+// the rows it retained into the state before its own, so the state cell a
+// step writes holds the state before the step's rows. A slot holds one step
+// of every layer, gdnTapeLayerBytes(shape) apart; the offsets are in
+// GdnDecodeBuffers::tape.
+struct GdnTapeLane final {
+  uint64_t pendingSlot = 0; // the lane's previous step's
+  uint64_t stepSlot = 0;    // this step's
+  // The previous step's rows the lane retained, which the state does not
+  // hold yet: 0 after a prefill or a restore.
+  uint32_t pendingRows = 0;
+};
+
+[[nodiscard]] uint64_t gdnTapeLayerBytes(const GdnShape &shape) noexcept;
+
 struct GdnDecodeBuffers final {
   metal::MetalBuffer packed;
   metal::MetalBuffer convolutionWeights;
   std::span<const metal::MetalBuffer> currentStates;
   std::span<const metal::MetalBuffer> nextStates;
-  metal::MetalBuffer mixed;
+  metal::MetalBuffer tape;
+  std::span<const GdnTapeLane> tapeLanes;
   metal::MetalBuffer decayWeights;
   metal::MetalBuffer timeBias;
-  metal::MetalBuffer decay;
-  metal::MetalBuffer beta;
   NormWeights mixerNorm;
   metal::MetalBuffer hidden;
   LinearScratch linearScratch{};
-};
-
-struct GdnCommitBuffers final {
-  metal::MetalBuffer packed;
-  metal::MetalBuffer mixed;
-  metal::MetalBuffer decay;
-  metal::MetalBuffer beta;
-  std::span<const metal::MetalBuffer> currentStates;
-  std::span<const metal::MetalBuffer> nextStates;
-  metal::MetalBuffer retainedCounts;
 };
 
 class GDN final {
@@ -103,9 +108,6 @@ public:
                                  GdnStateStrides state,
                                  GdnHeadOrder order,
                                  LinearInput input);
-  static void addCommit(metal::CommandGraph &graph, GdnCommitBuffers buffers,
-                        GdnShape shape, uint32_t layers, uint32_t lanes,
-                        GdnStateStrides state);
 };
 
 } // namespace splash::ops

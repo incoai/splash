@@ -216,10 +216,10 @@ struct QwenTargetVerifyBuffers final {
   metal::MetalBuffer finalHidden;
   metal::MetalBuffer logits;
   metal::MetalBuffer denseGateScratch;
-  std::span<const metal::MetalBuffer> gdnPacked;
-  std::span<const metal::MetalBuffer> gdnMixed;
-  std::span<const metal::MetalBuffer> gdnDecay;
-  std::span<const metal::MetalBuffer> gdnBeta;
+  metal::MetalBuffer gdnPacked;
+  // The lanes' decode tapes (ops::GdnTapeLane).
+  metal::MetalBuffer gdnTape;
+  std::array<ops::GdnTapeLane, ExecutionLimits::maximumBatchWidth> gdnTapeLanes{};
   std::span<const metal::MetalBuffer> chunkKeys;
   std::span<const metal::MetalBuffer> chunkValues;
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth>
@@ -229,18 +229,6 @@ struct QwenTargetVerifyBuffers final {
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth>
       pageTables;
   ops::MoeScratch moe;
-};
-
-struct QwenTargetCommitBuffers final {
-  metal::MetalBuffer packed;
-  metal::MetalBuffer mixed;
-  metal::MetalBuffer decay;
-  metal::MetalBuffer beta;
-  std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth>
-      currentStates;
-  std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth>
-      nextStates;
-  metal::MetalBuffer retainedCounts;
 };
 
 template <class Layout, class Layer>
@@ -288,8 +276,6 @@ public:
                       metal::MetalBuffer verifyInput, uint32_t lanes) const;
   void addEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens,
                     metal::MetalBuffer hidden, uint32_t rows) const;
-  void addStateCommit(metal::CommandGraph &graph,
-                      QwenTargetCommitBuffers buffers, uint32_t lanes) const;
 
 private:
   using WeightView =

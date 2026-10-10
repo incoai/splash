@@ -18,10 +18,16 @@
 // layers with DRAM-cold states that takes 11-28% less time at one to four
 // lanes than the same phases through device memory (40-core M3 Max, 16-core
 // M5 Pro), with the same bits.
+//
+// Which of a step's rows a lane retains is known only after the step, so the
+// state a step writes is the one before its rows: it leaves the rows on the
+// lane's tape, and the lane's next step folds the retained ones into the
+// state before its own rows. A step reads and writes the state once.
 constant uint kDecodeSimdgroups = 8;
 
 // The threadgroup operands of one value head: the rows' prepared q/k, the
-// head's v, the gates and the recurrent output rows.
+// head's v, the gates and the recurrent output rows, and the k, v and gates
+// of the pending rows, which the head folds into its state first.
 template <uint HeadDim> struct GdnDecodeShared {
   bfloat queries[SPLASH_TARGET_VERIFY_ROWS * HeadDim];
   bfloat keys[SPLASH_TARGET_VERIFY_ROWS * HeadDim];
@@ -29,27 +35,56 @@ template <uint HeadDim> struct GdnDecodeShared {
   bfloat rows[SPLASH_TARGET_VERIFY_ROWS * HeadDim];
   float decay[SPLASH_TARGET_VERIFY_ROWS];
   bfloat beta[SPLASH_TARGET_VERIFY_ROWS];
+  bfloat pending_keys[SPLASH_TARGET_VERIFY_ROWS * HeadDim];
+  bfloat pending_values[SPLASH_TARGET_VERIFY_ROWS * HeadDim];
+  float pending_decay[SPLASH_TARGET_VERIFY_ROWS];
+  bfloat pending_beta[SPLASH_TARGET_VERIFY_ROWS];
 };
+
+// One layer's tape of one lane's step (metal/abi/GDN.h): the rows'
+// convolution inputs, their k rows (each key head's) then v rows, decay and
+// beta.
+struct GdnTape {
+  device bfloat *inputs;
+  device bfloat *kv;
+  device float *decay;
+  device bfloat *beta;
+};
+
+template <uint KeyHeads, uint ValueHeads, uint HeadDim, uint ConvDim>
+inline GdnTape gdn_tape(device uchar *tape, ulong offset) {
+  constexpr uint KvWidth = (KeyHeads + ValueHeads) * HeadDim;
+  device uchar *layer = tape + offset;
+  return {reinterpret_cast<device bfloat *>(layer),
+          reinterpret_cast<device bfloat *>(layer + gdn_tape_kv_offset(ConvDim)),
+          reinterpret_cast<device float *>(layer + gdn_tape_decay_offset(ConvDim, KvWidth)),
+          reinterpret_cast<device bfloat *>(
+              layer + gdn_tape_beta_offset(ConvDim, KvWidth, ValueHeads))};
+}
 
 // Eight verify rows' conv+SiLU, q/k RMS norms and gates for one value head.
 // One simdgroup per row holds channels 32g + lane (g = 0..3). RMS reduction
 // sums each 32-channel group, then adds the four partials in channel order.
-// q/k/v and the gates go to threadgroup memory for the scan; k, v and the
-// gates also go to device memory for the commit. mixed holds k and v at their
-// ConvDim columns; its q columns are not written.
+// The convolution reads the inputs before the rows from `history`: the
+// carried rows of the state the lane's pending rows leave, which also go to
+// conv_state_out. q/k/v and the gates go to threadgroup memory for the scan,
+// beside the pending rows' k, v and gates from their tape; the rows'
+// convolution inputs, k, v and gates go to this step's tape, from which the
+// lane's next step folds in the rows the lane retains.
 template <uint KeyHeads, uint ValueHeads, uint HeadDim, uint ConvDim,
           uint PackedWidth>
 inline void gdn_decode_prologue(
     device const bfloat *packed, device const bfloat *conv_weights,
-    device const bfloat *conv_state_in, device bfloat *conv_state_out,
-    device bfloat *mixed_qkv, device const float *a_scale,
-    device const bfloat *dt_bias, device float *decay, device bfloat *beta,
+    GdnConvHistory history, device bfloat *conv_state_out,
+    GdnTape pending_tape, uint pending, GdnTape step_tape,
+    device const float *a_scale, device const bfloat *dt_bias,
     threadgroup GdnDecodeShared<HeadDim> &shared, uint value_head, uint lane,
     uint simd_group) {
   constexpr uint Tokens = SPLASH_TARGET_VERIFY_ROWS;
   constexpr uint HeadsPerKey = ValueHeads / KeyHeads;
   constexpr uint KeyWidth = KeyHeads * HeadDim;
   constexpr uint ValueWidth = ValueHeads * HeadDim;
+  constexpr uint KvWidth = KeyWidth + ValueWidth;
   constexpr uint BOffset = ConvDim + ValueWidth;
   constexpr uint AOffset = BOffset + ValueHeads;
   constexpr uint Groups = HeadDim / 32;
@@ -64,29 +99,40 @@ inline void gdn_decode_prologue(
   const uint q_channel = key_head * HeadDim + lane;
   const uint k_channel = KeyWidth + q_channel;
   const uint v_channel = 2 * KeyWidth + value_head * HeadDim + lane;
+  // The head's k and v columns of a tape row.
+  const uint k_column = key_head * HeadDim + lane;
+  const uint v_column = KeyWidth + value_head * HeadDim + lane;
+
+  if (token < pending) {
+    for (uint g = 0; g < Groups; ++g) {
+      shared.pending_keys[token * HeadDim + 32 * g + lane] =
+          pending_tape.kv[token * KvWidth + k_column + 32 * g];
+      shared.pending_values[token * HeadDim + 32 * g + lane] =
+          pending_tape.kv[token * KvWidth + v_column + 32 * g];
+    }
+    if (lane == 0) {
+      shared.pending_decay[token] =
+          pending_tape.decay[token * ValueHeads + value_head];
+      shared.pending_beta[token] =
+          pending_tape.beta[token * ValueHeads + value_head];
+    }
+  }
 
   float q[Groups], k[Groups];
   bfloat v[Groups], carry_v[Groups], carry_q[Groups], carry_k[Groups];
   for (uint g = 0; g < Groups; ++g) {
-    q[g] = float(gdn_conv_silu(packed, conv_state_in, conv_weights,
-                               PackedWidth, ConvDim, token,
-                               q_channel + 32 * g));
-    k[g] = float(gdn_conv_silu(packed, conv_state_in, conv_weights,
-                               PackedWidth, ConvDim, token,
-                               k_channel + 32 * g));
-    v[g] = gdn_conv_silu(packed, conv_state_in, conv_weights, PackedWidth,
-                         ConvDim, token, v_channel + 32 * g);
+    q[g] = float(gdn_conv_silu(packed, history, conv_weights, PackedWidth,
+                               token, q_channel + 32 * g));
+    k[g] = float(gdn_conv_silu(packed, history, conv_weights, PackedWidth,
+                               token, k_channel + 32 * g));
+    v[g] = gdn_conv_silu(packed, history, conv_weights, PackedWidth, token,
+                         v_channel + 32 * g);
     if (carrier) {
-      carry_v[g] = gdn_conv_carry(packed, conv_state_in, PackedWidth, ConvDim,
-                                  Tokens, simd_group, v_channel + 32 * g);
-      carry_q[g] = shared_writer
-          ? gdn_conv_carry(packed, conv_state_in, PackedWidth, ConvDim, Tokens,
-                           simd_group, q_channel + 32 * g)
-          : bfloat(0.0f);
-      carry_k[g] = shared_writer
-          ? gdn_conv_carry(packed, conv_state_in, PackedWidth, ConvDim, Tokens,
-                           simd_group, k_channel + 32 * g)
-          : bfloat(0.0f);
+      carry_v[g] = history.at(simd_group, v_channel + 32 * g);
+      carry_q[g] = shared_writer ? history.at(simd_group, q_channel + 32 * g)
+                                 : bfloat(0.0f);
+      carry_k[g] = shared_writer ? history.at(simd_group, k_channel + 32 * g)
+                                 : bfloat(0.0f);
     }
   }
   GdnGates gates{};
@@ -100,6 +146,7 @@ inline void gdn_decode_prologue(
   }
   const float q_scale = rsqrt(q_sum / HeadDim + kRmsEpsilon);
   const float k_scale = rsqrt(k_sum / HeadDim + kRmsEpsilon);
+  device const bfloat *inputs = packed + token * PackedWidth;
   for (uint g = 0; g < Groups; ++g) {
     const uint dim = 32 * g + lane;
     const bfloat query = bfloat(float(bfloat(q[g] * q_scale)) * 0.0078125f);
@@ -107,14 +154,21 @@ inline void gdn_decode_prologue(
     shared.queries[token * HeadDim + dim] = query;
     shared.keys[token * HeadDim + dim] = key;
     shared.values[token * HeadDim + dim] = v[g];
-    if (shared_writer)
-      mixed_qkv[token * ConvDim + k_channel + 32 * g] = key;
-    mixed_qkv[token * ConvDim + v_channel + 32 * g] = v[g];
+    step_tape.inputs[token * ConvDim + v_channel + 32 * g] =
+        inputs[v_channel + 32 * g];
+    step_tape.kv[token * KvWidth + v_column + 32 * g] = v[g];
+    if (shared_writer) {
+      step_tape.inputs[token * ConvDim + q_channel + 32 * g] =
+          inputs[q_channel + 32 * g];
+      step_tape.inputs[token * ConvDim + k_channel + 32 * g] =
+          inputs[k_channel + 32 * g];
+      step_tape.kv[token * KvWidth + k_column + 32 * g] = key;
+    }
   }
   if (lane == 0) {
     const uint gate_index = token * ValueHeads + value_head;
-    beta[gate_index] = gates.beta;
-    decay[gate_index] = gates.decay;
+    step_tape.beta[gate_index] = gates.beta;
+    step_tape.decay[gate_index] = gates.decay;
     shared.beta[token] = gates.beta;
     shared.decay[token] = gates.decay;
   }
@@ -131,15 +185,18 @@ inline void gdn_decode_prologue(
 }
 
 // Delta-rule recurrence over 128 state rows, four fp32 columns per lane.
-// RowsInFlight rows advance together to overlap their reductions and arithmetic.
-// Each row preserves the decay, memory, delta, update, output operation order.
-// The next rows' state is loaded before these rows' state is stored, and the
-// output rows go to threadgroup memory for the gate.
+// RowsInFlight rows advance together to overlap their reductions and
+// arithmetic. The pending rows advance the incoming state to the committed
+// one, which goes to state_out; the step's own rows then advance it only for
+// their outputs, which go to threadgroup memory for the gate. Each row
+// preserves the decay, memory, delta, update, output operation order. The
+// next rows' state is loaded before these rows' state is stored.
 template <uint HeadDim, uint RowsInFlight>
 inline void gdn_decode_scan(device const float *state_in,
                             device float *state_out,
                             threadgroup GdnDecodeShared<HeadDim> &shared,
-                            uint value_head, uint lane, uint simd_group) {
+                            uint pending, uint value_head, uint lane,
+                            uint simd_group) {
   constexpr uint Tokens = SPLASH_TARGET_VERIFY_ROWS;
   constexpr uint Batches = HeadDim / kDecodeSimdgroups;
   static_assert(Batches % RowsInFlight == 0, "rows in flight tile the head");
@@ -155,6 +212,38 @@ inline void gdn_decode_scan(device const float *state_in,
     uint value_dim[RowsInFlight];
     for (uint r = 0; r < RowsInFlight; ++r)
       value_dim[r] = (batch + r) * kDecodeSimdgroups + simd_group;
+    for (uint token = 0; token < pending; ++token) {
+      const float d = shared.pending_decay[token];
+      const float b = float(shared.pending_beta[token]);
+      threadgroup const bfloat *key =
+          shared.pending_keys + token * HeadDim + lane * 4;
+      float memory[RowsInFlight];
+      for (uint r = 0; r < RowsInFlight; ++r) {
+        memory[r] = 0.0f;
+        for (uint i = 0; i < 4; ++i) {
+          state[r][i] *= d;
+          memory[r] += state[r][i] * float(key[i]);
+        }
+        memory[r] = simd_sum(memory[r]);
+      }
+      for (uint r = 0; r < RowsInFlight; ++r) {
+        const float delta =
+            (float(shared.pending_values[token * HeadDim + value_dim[r]]) -
+             memory[r]) *
+            b;
+        for (uint i = 0; i < 4; ++i)
+          state[r][i] += float(key[i]) * delta;
+      }
+    }
+    float upcoming[RowsInFlight][4] = {};
+    if (batch + RowsInFlight < Batches) {
+      for (uint r = 0; r < RowsInFlight; ++r)
+        for (uint i = 0; i < 4; ++i)
+          upcoming[r][i] = state_in[base(batch + RowsInFlight, r) + i];
+    }
+    for (uint r = 0; r < RowsInFlight; ++r)
+      for (uint i = 0; i < 4; ++i)
+        state_out[base(batch, r) + i] = state[r][i];
     for (uint token = 0; token < Tokens; ++token) {
       const float d = shared.decay[token];
       const float b = float(shared.beta[token]);
@@ -188,17 +277,9 @@ inline void gdn_decode_scan(device const float *state_in,
           shared.rows[token * HeadDim + value_dim[r]] = bfloat(result[r]);
       }
     }
-    float upcoming[RowsInFlight][4] = {};
-    if (batch + RowsInFlight < Batches) {
-      for (uint r = 0; r < RowsInFlight; ++r)
-        for (uint i = 0; i < 4; ++i)
-          upcoming[r][i] = state_in[base(batch + RowsInFlight, r) + i];
-    }
     for (uint r = 0; r < RowsInFlight; ++r)
-      for (uint i = 0; i < 4; ++i) {
-        state_out[base(batch, r) + i] = state[r][i];
+      for (uint i = 0; i < 4; ++i)
         state[r][i] = upcoming[r][i];
-      }
   }
 }
 
@@ -249,140 +330,6 @@ inline void gdn_decode_gate(threadgroup GdnDecodeShared<HeadDim> &shared,
   }
 }
 
-// Grid x is the value heads.
-template <uint KeyHeads, uint ValueHeads, uint HeadDim, uint ConvDim,
-          uint PackedWidth>
-inline void
-gdn_commit_phase(device const bfloat *packed, device const bfloat *mixed_qkv,
-                 device const float *decay, device const bfloat *beta,
-                 device const bfloat *conv_state_in,
-                 device bfloat *conv_state_out, device const float *state_in,
-                 device float *state_out, uint retained, uint group,
-                 uint thread_index, uint lane, uint simd_group) {
-  constexpr uint KeyDim = HeadDim, ValueDim = HeadDim;
-  constexpr uint ValueBatches = ValueDim / 8;
-  constexpr uint HeadsPerKey = ValueHeads / KeyHeads;
-  constexpr uint KeyWidth = KeyHeads * HeadDim;
-
-  uint count = retained;
-  if (count == SPLASH_TARGET_VERIFY_ROWS)
-    return;
-  for (uint element = group * 256 + thread_index;
-       element < (SPLASH_GDN_CONVOLUTION_TAPS - 1) * ConvDim;
-       element += ValueHeads * 256) {
-    uint row = element / ConvDim;
-    uint channel = element % ConvDim;
-    conv_state_out[element] = gdn_conv_carry(
-        packed, conv_state_in, PackedWidth, ConvDim, count, row, channel);
-  }
-
-  for (uint task = group; task < ValueHeads * ValueBatches;
-       task += ValueHeads) {
-    uint value_head = task / ValueBatches;
-    uint value_dim = (task % ValueBatches) * 8 + simd_group;
-    uint key_head = value_head / HeadsPerKey;
-    ulong state_base = (ulong(value_head) * ValueDim + value_dim) * KeyDim;
-    float local_state[4];
-    for (uint i = 0; i < 4; ++i) {
-      local_state[i] = state_in[state_base + lane * 4 + i];
-    }
-    for (uint token = 0; token < count; ++token) {
-      ulong key_base = ulong(token) * ConvDim + key_head * KeyDim;
-      float memory = 0.0f;
-      float d = decay[token * ValueHeads + value_head];
-      for (uint i = 0; i < 4; ++i) {
-        uint dim = lane * 4 + i;
-        local_state[i] *= d;
-        memory +=
-            local_state[i] * float(mixed_qkv[key_base + dim + KeyWidth]);
-      }
-      memory = simd_sum(memory);
-      ulong value_index =
-          ulong(token) * ConvDim + value_head * ValueDim + value_dim +
-          2 * KeyWidth;
-      float delta = (float(mixed_qkv[value_index]) - memory) *
-                    float(beta[token * ValueHeads + value_head]);
-      for (uint i = 0; i < 4; ++i) {
-        uint dim = lane * 4 + i;
-        local_state[i] += float(mixed_qkv[key_base + dim + KeyWidth]) * delta;
-      }
-    }
-    for (uint i = 0; i < 4; ++i) {
-      state_out[state_base + lane * 4 + i] = local_state[i];
-    }
-  }
-}
-
-// Grid {value heads, layers, lanes}; each lane's rows of a layer's packed,
-// mixed and gate tensors follow the four lanes of the layer before.
-template <uint KeyHeads, uint ValueHeads, uint HeadDim, uint ConvDim,
-          uint PackedWidth>
-inline void gdn_commit_prefix_batch_phase(
-    device const bfloat *packed, device const bfloat *mixed_qkv,
-    device const float *decay, device const bfloat *beta,
-    device const uchar *current_0, device const uchar *current_1,
-    device const uchar *current_2, device const uchar *current_3,
-    device uchar *next_0, device uchar *next_1, device uchar *next_2,
-    device uchar *next_3, device const uint *retained,
-    constant GDNBatchCommitParams &params, uint3 group, uint thread_index,
-    uint simd_lane, uint simd_group) {
-  constexpr uint Rows = SPLASH_TARGET_VERIFY_ROWS;
-  uint batch = group.z;
-  uint layer = group.y;
-  device const uchar *current = SPLASH_LANE_BINDING(batch, current_0, current_1, current_2, current_3);
-  device uchar *next = SPLASH_LANE_BINDING(batch, next_0, next_1, next_2, next_3);
-  const ulong rows = (ulong(layer) * SPLASH_MAXIMUM_BATCH_WIDTH + batch) * Rows;
-  packed += rows * PackedWidth;
-  mixed_qkv += rows * ConvDim;
-  decay += rows * ValueHeads;
-  beta += rows * ValueHeads;
-  device const bfloat *conv_state_in = reinterpret_cast<device const bfloat *>(
-      current + ulong(layer) * params.conv_layer_bytes);
-  device bfloat *conv_state_out = reinterpret_cast<device bfloat *>(
-      next + ulong(layer) * params.conv_layer_bytes);
-  device const float *state_in = reinterpret_cast<device const float *>(
-      current + params.convolution_state_bytes +
-      ulong(layer) * params.recurrent_layer_bytes);
-  device float *state_out = reinterpret_cast<device float *>(
-      next + params.convolution_state_bytes +
-      ulong(layer) * params.recurrent_layer_bytes);
-  gdn_commit_phase<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth>(
-      packed, mixed_qkv, decay, beta, conv_state_in, conv_state_out, state_in,
-      state_out, retained[batch], group.x, thread_index, simd_lane,
-      simd_group);
-}
-
-#define GDN_COMMIT_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim,        \
-                         PackedWidth)                                         \
-  kernel void Name(                                                           \
-      device const bfloat *packed [[buffer(0)]],                              \
-      device const bfloat *mixed_qkv [[buffer(1)]],                           \
-      device const float *decay [[buffer(2)]],                                \
-      device const bfloat *beta [[buffer(3)]],                                \
-      device const uchar *current_0 [[buffer(4)]],                            \
-      device const uchar *current_1 [[buffer(5)]],                            \
-      device const uchar *current_2 [[buffer(6)]],                            \
-      device const uchar *current_3 [[buffer(7)]],                            \
-      device uchar *next_0 [[buffer(8)]], device uchar *next_1 [[buffer(9)]], \
-      device uchar *next_2 [[buffer(10)]],                                    \
-      device uchar *next_3 [[buffer(11)]],                                    \
-      device const uint *retained [[buffer(12)]],                             \
-      constant GDNBatchCommitParams &params [[buffer(13)]],                   \
-      uint3 group [[threadgroup_position_in_grid]],                           \
-      uint thread_index [[thread_index_in_threadgroup]],                      \
-      uint simd_lane [[thread_index_in_simdgroup]],                           \
-      uint simd_group [[simdgroup_index_in_threadgroup]]) {                   \
-    gdn_commit_prefix_batch_phase<KeyHeads, ValueHeads, HeadDim, ConvDim,     \
-                                  PackedWidth>(                               \
-        packed, mixed_qkv, decay, beta, current_0, current_1, current_2,       \
-        current_3, next_0, next_1, next_2, next_3, retained, params, group,    \
-        thread_index, simd_lane, simd_group);                                 \
-  }
-
-GDN_COMMIT_ENTRY(verify_gdn_commit, 16, 48, 128, 10240, 16640)
-GDN_COMMIT_ENTRY(verify_gdn_commit_vh32, 16, 32, 128, 8192, 12544)
-#undef GDN_COMMIT_ENTRY
-
 // Grid {value heads, lanes}.
 template <uint KeyHeads, uint ValueHeads, uint HeadDim, uint ConvDim,
           uint PackedWidth, uint RowsInFlight, class Table, class W>
@@ -391,8 +338,8 @@ inline void gdn_decode_batch_phase(
     device const uchar *current0, device const uchar *current1,
     device const uchar *current2, device const uchar *current3,
     device uchar *next0, device uchar *next1, device uchar *next2,
-    device uchar *next3, device bfloat *mixed, device const float *a_scale,
-    device const bfloat *dt_bias, device float *decay, device bfloat *beta,
+    device uchar *next3, device uchar *tape, device const float *a_scale,
+    device const bfloat *dt_bias,
     device const W *gdn_norm_weight, device bfloat *gdn_hidden,
     constant GDNDecodeBatchParams &params,
     uint2 group, uint lane, uint simd_group,
@@ -404,9 +351,6 @@ inline void gdn_decode_batch_phase(
   device const uchar *current = SPLASH_LANE_BINDING(batch, current0, current1, current2, current3);
   device uchar *next = SPLASH_LANE_BINDING(batch, next0, next1, next2, next3);
   packed += ulong(batch) * Rows * PackedWidth;
-  mixed += ulong(batch) * Rows * ConvDim;
-  decay += ulong(batch) * Rows * ValueHeads;
-  beta += ulong(batch) * Rows * ValueHeads;
   device const bfloat *conv_state_in =
       reinterpret_cast<device const bfloat *>(
           current + ulong(params.layer) * params.conv_layer_bytes);
@@ -419,13 +363,21 @@ inline void gdn_decode_batch_phase(
       next + params.convolution_state_bytes +
       ulong(params.layer) * params.recurrent_layer_bytes);
 
+  const uint pending = params.pending_rows[batch];
+  const GdnTape pending_tape =
+      gdn_tape<KeyHeads, ValueHeads, HeadDim, ConvDim>(tape, params.pending_tape[batch]);
+  const GdnTape step_tape =
+      gdn_tape<KeyHeads, ValueHeads, HeadDim, ConvDim>(tape, params.step_tape[batch]);
+  const GdnConvHistory history{conv_state_in, pending_tape.inputs, ConvDim,
+                               ConvDim, pending};
+
   device bfloat *lane_hidden = gdn_hidden + ulong(batch) * Rows * ValueWidth;
   gdn_decode_prologue<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth>(
-      packed, conv_weights, conv_state_in, conv_state_out, mixed, a_scale,
-      dt_bias, decay, beta, shared, group.x, lane, simd_group);
+      packed, conv_weights, history, conv_state_out, pending_tape, pending,
+      step_tape, a_scale, dt_bias, shared, group.x, lane, simd_group);
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  gdn_decode_scan<HeadDim, RowsInFlight>(state_in, state_out, shared, group.x,
-                                         lane, simd_group);
+  gdn_decode_scan<HeadDim, RowsInFlight>(state_in, state_out, shared, pending,
+                                         group.x, lane, simd_group);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const bool tiled = params.tiled_heads != 0;
   gdn_decode_gate<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth>(
@@ -454,10 +406,9 @@ inline void gdn_decode_batch_phase(
     device const uchar *current2 [[buffer(4)]], device const uchar *current3 [[buffer(5)]], \
     device uchar *next0 [[buffer(6)]], device uchar *next1 [[buffer(7)]], \
     device uchar *next2 [[buffer(8)]], device uchar *next3 [[buffer(9)]], \
-    device bfloat *mixed [[buffer(10)]], device const float *a_scale [[buffer(11)]], \
-    device const bfloat *dt_bias [[buffer(12)]], device float *decay [[buffer(13)]], \
-    device bfloat *beta [[buffer(14)]], device const W *gdn_norm_weight [[buffer(15)]], \
-    device bfloat *gdn_hidden [[buffer(16)]]
+    device uchar *tape [[buffer(10)]], device const float *a_scale [[buffer(11)]], \
+    device const bfloat *dt_bias [[buffer(12)]], device const W *gdn_norm_weight [[buffer(13)]], \
+    device bfloat *gdn_hidden [[buffer(14)]]
 #define GDN_DECODE_THREADS \
     uint2 group [[threadgroup_position_in_grid]], \
     uint lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]]
@@ -465,20 +416,20 @@ inline void gdn_decode_batch_phase(
     threadgroup GdnDecodeShared<HeadDim> shared; \
     gdn_decode_batch_phase<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, 2, Layout>( \
         packed, conv_weights, current0, current1, current2, current3, next0, \
-        next1, next2, next3, mixed, a_scale, dt_bias, decay, beta, \
+        next1, next2, next3, tape, a_scale, dt_bias, \
         gdn_norm_weight, gdn_hidden, params, group, lane, simd_group, shared, \
         table, sums);
 // Entries without a table pass null pointers, which skip the write; their Layout only completes the template.
 #define GDN_DECODE_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, W) \
   kernel void Name(GDN_DECODE_BUFFERS(W), \
-      constant GDNDecodeBatchParams &params [[buffer(17)]], GDN_DECODE_THREADS) { \
+      constant GDNDecodeBatchParams &params [[buffer(15)]], GDN_DECODE_THREADS) { \
     GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, nullptr, nullptr, gguf_sg::Table16) \
   }
 // The out-projection's table (Layout: gguf_sg::Table16).
 #define GDN_DECODE_TABLE_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, Layout, W) \
   kernel void Name(GDN_DECODE_BUFFERS(W), \
-      device bfloat *table [[buffer(17)]], device float *sums [[buffer(18)]], \
-      constant GDNDecodeBatchParams &params [[buffer(19)]], GDN_DECODE_THREADS) { \
+      device bfloat *table [[buffer(15)]], device float *sums [[buffer(16)]], \
+      constant GDNDecodeBatchParams &params [[buffer(17)]], GDN_DECODE_THREADS) { \
     GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, table, sums, Layout) \
   }
 

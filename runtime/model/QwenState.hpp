@@ -74,6 +74,10 @@ struct QwenLaneMetadata final {
   uint64_t requestId = 0;
   uint32_t activeParity = 0;
   QwenLogicalLengths lengths;
+  // The rows of the lane's last decode step it retained, which its current
+  // cell does not hold: they wait on the lane's tape for its next decode step
+  // (ops::GdnTapeLane). Zero after a prefill step or a restore.
+  uint32_t pendingRows = 0;
 
   [[nodiscard]] bool assigned() const noexcept { return requestId != 0; }
 };
@@ -183,7 +187,8 @@ public:
   // An assigned lane's buffers, read through the cells, the rings and the
   // window it holds: current() is the GDN cell its next transition reads,
   // next() the one that transition writes, draft() its draft rings and
-  // window() their context window. swapParity() exchanges current and next.
+  // window() their context window. swapParity() and swapDecodeParity()
+  // exchange current and next.
   [[nodiscard]] const GdnParityBuffers &current(uint32_t lane) const;
   [[nodiscard]] const GdnParityBuffers &next(uint32_t lane) const;
   [[nodiscard]] const std::vector<DFlashDraftRingLayer> &draft(uint32_t lane) const;
@@ -219,14 +224,20 @@ public:
   // number of states makes up the lack.
   [[nodiscard]] uint32_t statesToActivate() const noexcept;
 
-  // Hot-path metadata operations; neither performs a buffer copy.
+  // Hot-path metadata operations; none performs a buffer copy. A step makes
+  // next() current. swapParity: a prefill step's, which read the lane's
+  // whole state (no pending rows) and holds its every row. swapDecodeParity:
+  // a decode step's, which folded the pending rows in and holds the state
+  // before its own rows, `retainedRows` (1 to 8) of which wait on the tape.
   void updateLengths(uint32_t lane, QwenLogicalLengths lengths);
   void swapParity(uint32_t lane);
+  void swapDecodeParity(uint32_t lane, uint32_t retainedRows);
 
   // Copies committed state into a pooled or newly admitted cache slot while
-  // the lane retains its own cells. Returns nullptr on capacity pressure,
-  // with nothing allocated; dropping a cached state makes its slot available
-  // for retry.
+  // the lane retains its own cells; it throws for a lane with pending rows,
+  // whose cell does not hold its state (states are published in prefill).
+  // Returns nullptr on capacity pressure, with nothing allocated; dropping a
+  // cached state makes its slot available for retry.
   [[nodiscard]] std::shared_ptr<const QwenCompositeState>
   snapshot(uint32_t lane);
   [[nodiscard]] bool canSnapshotToDisk() const noexcept {
@@ -279,6 +290,8 @@ private:
   void validateLengths(const QwenLogicalLengths &lengths,
                        bool cacheSnapshot) const;
   static void requireAssigned(const Lane &lane);
+  // Assigned, with no decoded rows pending: its current cell holds its state.
+  static void requireCommitted(const Lane &lane);
   // `cells` GDN cells, the draft rings when `rings` and a context window:
   // the pool's buffers, and one admission for everything the pool lacks and
   // for the caller's extra. A refusal allocates nothing and takes nothing

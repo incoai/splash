@@ -85,8 +85,10 @@ a universal performance guarantee.
 
 The runtime commit test now compares a budget-truncated greedy cycle with a
 constrained cycle that retains the same proposal prefix using a larger budget.
-It requires exact GDN and draft-cache bytes, proposal identity, and retained
-counts. Independent GDN kernel references cover the recurrence and commits.
+It requires exact draft-cache bytes, proposal identity, and retained counts; a
+cycle's GDN state is its cell from before the cycle and the retained rows,
+which the next cycle folds in. Independent GDN kernel references cover the
+recurrence and that fold.
 
 This replaces the former whole-network prefill/decode state-cosine comparison;
 it changes coverage rather than lowering that comparison's tolerance. The old
