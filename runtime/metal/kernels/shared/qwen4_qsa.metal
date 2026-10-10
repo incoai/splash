@@ -255,11 +255,13 @@ kernel void qwen4_qsa_select(device const float *scores [[buffer(0)]],
       }
       if (take) word |= 1u << i;
     }
+    // The tail block, from the thread that writes its word: a threadgroup
+    // barrier does not order another thread's device stores.
+    if (w == complete / 32) word |= 1u << (complete % 32);
     bits[w] = word;
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  // The tail block, and nothing past it.
-  for (uint w = words + tid; w < p.mask_words; w += kThreads) bits[w] = 0u;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (tid == 0) bits[complete / 32] |= 1u << (complete % 32);
+  // Past the complete blocks: the tail block when it starts a word, then
+  // nothing.
+  for (uint w = words + tid; w < p.mask_words; w += kThreads)
+    bits[w] = w == complete / 32 ? 1u << (complete % 32) : 0u;
 }
