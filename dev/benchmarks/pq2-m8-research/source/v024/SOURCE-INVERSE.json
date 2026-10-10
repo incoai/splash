@@ -1,0 +1,38 @@
+[
+  {
+    "path": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/source/runtime/model/Runtime.hpp",
+    "sha256": "b59f29300b837ae64743864ee093cbfad465e26579bdf3260717ad71112ecbda",
+    "parent_sha256": "b8c1b3cca23e55bae67ebe45390fd77af6230318ff0d1f7d439c17fddb9c7afc",
+    "inverse_PASS": true
+  },
+  {
+    "path": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/source/runtime/model/Runtime.mm",
+    "sha256": "35b76f453e6c3ebb0d301eefab15cf4a3ae949da46b217a755df91f2859af700",
+    "parent_sha256": "76e992937f3b666e61ffd20880f8d2d5dc22dff346a781724198bbf5c9e54b21",
+    "inverse_PASS": true
+  },
+  {
+    "path": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/source/runtime/ops/LinearGguf.cpp",
+    "sha256": "1923c465d045f910d5016adb52d5c054df1c76829797b09418429d845e46e281",
+    "parent_sha256": "b52f27a06ee532062dc04c40d1f658f239fe32a2396712c4cc7f65a802d49382",
+    "inverse_PASS": true
+  },
+  {
+    "path": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/verify_host.mm",
+    "sha256": "57c1154a74f581ea5103aecb6fa04717cd1acd84e9b6ff80a657b00a06d14d09",
+    "parent_sha256": "e06dfb12a09f208e53d2c1bf86f16937f005b60cff7088a2dd9bd37db9d4bb0a",
+    "inverse_PASS": true
+  },
+  {
+    "path": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/source/runtime/model/PrivateLegacyRtnDescriptor.hpp",
+    "sha256": "dd26dad90a76a4faf72cbed58926ae99fe5f9766e91e1f33dbc5f314463f1cb6",
+    "parent_sha256": "dd26dad90a76a4faf72cbed58926ae99fe5f9766e91e1f33dbc5f314463f1cb6",
+    "inverse_PASS": true
+  },
+  {
+    "path": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/source/runtime/model/PrivateLegacyRtnPins.hpp",
+    "sha256": "248460f2690716de899be5a052c7fe1cec336f020a4f82793b9ad0b6bb81a21d",
+    "parent_sha256": "248460f2690716de899be5a052c7fe1cec336f020a4f82793b9ad0b6bb81a21d",
+    "inverse_PASS": true
+  }
+]
