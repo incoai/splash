@@ -601,7 +601,9 @@ up in one pass `gguf_decode_<format>_m<rows>_gate_up`, and
 `gguf_prefill_<format>_<e>` (and `gguf_prefill_<format>_r_leading_inputs` over a view of the
 leading inputs of wider rows), the register ones `gguf_decode_sg_<format>_l<lanes>_<e>`, and the
 experts `moe_expert_gguf_m<rows>_<e>` and `moe_expert_gguf_sg_<e>`, with gate and up in one pass
-`moe_expert_gguf_m<rows>_gate_up`; the fused projections run
+`moe_expert_gguf_m<rows>_gate_up`, and on Apple9 in decode `moe_expert_gguf_rows_<e>`, which multiplies
+each half-rounded weight with its tile's live rows alone (`kernels/decode/moe_rows.metal`, so Apple9's
+MoE decode no longer matches its prefill bit for bit); the fused projections run
 `gguf_decode_fused_m<rows>` and `gguf_decode_sg_fused_l<lanes>` in decode and, on Apple10, in
 prefill chunks of 33 to 64 rows (`gguf_decode_fused_m64`), and in longer prefill chunks one
 `gguf_prefill_<format>_a` per format over that format's segments. The norm, GDN,
