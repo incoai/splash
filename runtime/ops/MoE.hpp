@@ -213,6 +213,12 @@ public:
     return config_.expertTile == MoeExpertTile::M8 && rows_ == tileRows() &&
            config_.ggufTile == MoeGgufTile::Staged;
   }
+  [[nodiscard]] MoePhase phase() const noexcept { return phase_; }
+  // Whether the expert passes run on the tiles' live rows
+  // (kernels/decode/moe_rows.metal): decode plans on the register tile.
+  [[nodiscard]] bool liveRows() const noexcept {
+    return phase_ == MoePhase::Decode && config_.ggufTile == MoeGgufTile::Register;
+  }
 
 private:
   friend struct MoE;
@@ -221,6 +227,7 @@ private:
   MoeShape shape_;
   uint32_t rows_;
   MoeConfig config_;
+  MoePhase phase_;
   uint32_t maximumTiles_;
   MoeWorkspace workspace_;
 };
