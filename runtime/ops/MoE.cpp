@@ -75,16 +75,24 @@ bool oneGateUpPass(const BlockMoeWeights &weights, const MoePlan &plan) noexcept
 // `group` and maximumTiles(): gate and up in one pass into
 // expertIntermediate (oneGateUpPass), or gate into expertOutput (the down
 // pass overwrites it after the up pass consumed it) and up with silu(gate)
-// into expertIntermediate; then down into expertOutput. Register plans read
-// Table16 tiles from groupedInput: the gather writes the gate/up input's and
-// a prepare dispatch the down input's.
+// into expertIntermediate; then down into expertOutput. Register prefill
+// plans read Table16 tiles from groupedInput: the gather writes the gate/up
+// input's and a prepare dispatch the down input's. Register decode plans run
+// the live-row passes (MoePlan::liveRows) over the gathered bf16 rows and the
+// up pass's output.
 void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const BlockMoeWeights &weights,
                 const MoePlan &plan, const MoeGroupParams &group) {
   const MoeShape shape = plan.shape();
   const uint32_t tiles = plan.maximumTiles();
-  const bool table16 = plan.configuration().ggufTile == MoeGgufTile::Register;
-  const uint32_t threads = table16 ? GGUF_REGISTER_THREADS : GGUF_STAGED_THREADS;
-  const std::string kernel = table16 ? "moe_expert_gguf_sg" : "moe_expert_gguf_m" + std::to_string(plan.tileRows());
+  // Decode on the register tile runs the live-row passes over bf16 rows;
+  // prefill on it the register tile over Table16 tiles.
+  const bool liveRows = plan.liveRows();
+  const bool table16 = plan.configuration().ggufTile == MoeGgufTile::Register && !liveRows;
+  const uint32_t threads =
+      liveRows ? GGUF_EXPERT_ROWS_THREADS : table16 ? GGUF_REGISTER_THREADS : GGUF_STAGED_THREADS;
+  const std::string kernel = liveRows  ? "moe_expert_gguf_rows"
+                             : table16 ? "moe_expert_gguf_sg"
+                                       : "moe_expert_gguf_m" + std::to_string(plan.tileRows());
   const metal::IndirectGrid gateUpGrid{scratch.tileCount, offsetof(MoeTileCount, gate_up_grid)};
   const metal::IndirectGrid downGrid{scratch.tileCount, offsetof(MoeTileCount, down_grid)};
   const auto pass = [&](const BlockExpertProjection &projection, bool up,
@@ -140,7 +148,7 @@ void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const Blo
 // register tile runs 8-row tiles.
 MoePlan::MoePlan(MoeShape shape, uint32_t rows, MoeConfig config,
                  MoePhase phase)
-    : shape_(shape), rows_(rows), config_(config) {
+    : shape_(shape), rows_(rows), config_(config), phase_(phase) {
   if (phase == MoePhase::Decode && config.expertTile != MoeExpertTile::M8)
     throw std::invalid_argument("invalid MoE expert tile configuration");
   if (config.ggufTile == MoeGgufTile::Register && config.expertTile != MoeExpertTile::M8)
@@ -189,7 +197,7 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
              scratch.tileCount, scratch.groupedRoutes, scratch.routeRows},
             group, {1, 1, 1}, {SPLASH_MOE_EXPERT_SLOTS, 1, 1});
   const MoeGatherParams gather{tileRows, shape.hiddenSize, shape.routesPerToken()};
-  if (plan.configuration().ggufTile == MoeGgufTile::Register)
+  if (plan.configuration().ggufTile == MoeGgufTile::Register && !plan.liveRows())
     graph.add("moe_gather_table16",
               {buffers.input, scratch.groupedRoutes, scratch.tileCount,
                scratch.groupedInput, scratch.groupedSums},

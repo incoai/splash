@@ -32,6 +32,9 @@
 // Apple9 register tile: four simdgroups of GGUF_REGISTER_COLUMNS columns.
 #define GGUF_REGISTER_COLUMNS 16u
 #define GGUF_REGISTER_THREADS (GGUF_TILE_COLUMNS / GGUF_REGISTER_COLUMNS * 32u)
+// The live-row MoE expert passes of decode (kernels/decode/moe_rows.metal): eight
+// simdgroups, one per part of K, each over all columns of the tile.
+#define GGUF_EXPERT_ROWS_THREADS 256u
 
 // The register tile's activations, Table16 (kernels/common/gguf_sgmatrix.h):
 // per eight-row tile of `width` inputs, the X^T table of width * 8 bfloat,

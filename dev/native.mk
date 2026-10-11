@@ -556,7 +556,7 @@ benchmark-gguf-projection: $(TEST_GGUF_PROJECTION_BENCHMARK) $(LIB)
 
 # One MoE layer at the 35B shape in GGUF formats, on the device's
 # plans and the other GGUF tile (ops/MoE.cpp); GGUF_MOE_ARGS passes [rounds]
-# [gate/up format] [down format] (q4k q5k by default).
+# [gate/up format] [down format] [decode pool] (q4k q5k 24 by default).
 benchmark-gguf-moe: $(TEST_GGUF_MOE_BENCHMARK) $(LIB)
 	$(TEST_GGUF_MOE_BENCHMARK) $(LIB) $(GGUF_MOE_ARGS)
 

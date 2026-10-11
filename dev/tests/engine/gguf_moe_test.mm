@@ -763,8 +763,10 @@ int moe(MetalBackend &backend) {
               MoeConfig{.expertTile = MoeExpertTile::M8, .ggufTile = tile});
           const std::string label = formats + (tile == MoeGgufTile::Register ? " register" : " staged") + " decode B" +
                                     std::to_string(lanes);
-          const std::vector<uint16_t> rows =
-              runPlan(backend, m, b, plan, tile == MoeGgufTile::Staged, oneGateUp, products, stats, label);
+          // The live-row passes (Apple9 decode on the register tile) round
+          // every weight to half, as the staged tile does.
+          const std::vector<uint16_t> rows = runPlan(backend, m, b, plan, tile == MoeGgufTile::Staged || plan.liveRows(),
+                                                     oneGateUp, products, stats, label);
           // A row's result depends on its own routes only, not on the lanes it
           // is batched with (the tile rows of one expert are independent).
           if (widest.empty()) widest = rows;
@@ -773,7 +775,11 @@ int moe(MetalBackend &backend) {
             ++failures;
           }
         }
-        // Prefill chunks on the same 8-row tiles (ExecutionPlans::moePrefill).
+        // Prefill chunks on the same 8-row tiles (ExecutionPlans::moePrefill):
+        // a row's result as decode's, but for the register tile, whose decode
+        // runs the live-row passes in another sum order: its chunks agree with
+        // each other.
+        std::vector<uint16_t> prefillWidest;
         for (const uint32_t chunk : {kMaximumRows, 27u, 9u}) {
           const MoePlan plan = MoE::prefillPlan(
               shape, chunk,
@@ -782,8 +788,12 @@ int moe(MetalBackend &backend) {
                                     std::to_string(chunk);
           const std::vector<uint16_t> rows =
               runPlan(backend, m, b, plan, tile == MoeGgufTile::Staged, oneGateUp, products, stats, label);
-          if (!std::equal(rows.begin(), rows.begin() + std::min(rows.size(), widest.size()), widest.begin())) {
-            printf("  %s: rows differ from the four-lane dispatch FAIL\n", label.c_str());
+          const bool liveRowDecode = tile == MoeGgufTile::Register;
+          if (liveRowDecode && prefillWidest.empty()) prefillWidest = rows;
+          const std::vector<uint16_t> &reference = liveRowDecode ? prefillWidest : widest;
+          if (!std::equal(rows.begin(), rows.begin() + std::min(rows.size(), reference.size()), reference.begin())) {
+            printf("  %s: rows differ from the %s FAIL\n", label.c_str(),
+                   liveRowDecode ? "longest chunk" : "four-lane dispatch");
             ++failures;
           }
         }

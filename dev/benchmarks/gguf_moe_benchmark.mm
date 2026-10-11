@@ -3,7 +3,7 @@
 // device's plans and the other GGUF tile: a 2048-row prefill chunk, decode B1-B4 and prefill chunks of their rows,
 // prefill chunks of 64 to 512 rows, then every dispatch of the long chunk, B1 and B4 replayed as its own command. The
 // numbers behind the MoE plans of ops/MoE.cpp:
-//   gguf-moe-benchmark <metallib> [rounds] [gate/up format] [down format]
+//   gguf-moe-benchmark <metallib> [rounds] [gate/up format] [down format] [decode pool]
 // Printed are medians of GPU ms per layer over `rounds` (20) commands. Every row routes to 8 experts of a pool of 24
 // per request lane (decode, short chunks) or of all 256 (chunks of 64 rows or more): expert e scores 4 x[e], so the
 // first 256 inputs pick the routes. The weights exceed the system cache, so each layer streams its experts from DRAM.
@@ -84,7 +84,7 @@ void allocate(MetalBackend &backend, MoeBuffers &m, const MoePlan &plan) {
     m.scratch.*field.buffer = zeros(backend, w.*field.bytes, "moe-scratch");
 }
 
-int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFormat) {
+int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFormat, uint32_t decodePool) {
   constexpr uint32_t H = 2048, I = 512, E = 256, kRowsMax = 2048;
   // gate and up hold most of the routed expert weights.
   const MoeShape ggufShape{H, E, 8, I, uint32_t(gateUpFormat)};
@@ -104,7 +104,7 @@ int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFor
                              {planes(gateUpFormat, E * I, H), planes(Q80, I, H)},
                              {planes(gateUpFormat, E * I, H), planes(Q80, I, H)},
                              {planes(downFormat, E * H, I), planes(Q80, H, I)}};
-  // Rows route to 8 of a pool of 24 experts per lane of 8 rows (decode) or of all 256 (prefill).
+  // Rows route to 8 of a pool of decodePool experts per lane of 8 rows (decode) or of all 256 (prefill).
   const auto input = [&](uint32_t rows, uint32_t pool) {
     std::uniform_real_distribution<float> unit(-1.0f, 1.0f);
     std::vector<float> x(uint64_t{rows} * H);
@@ -144,8 +144,22 @@ int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFor
   // Prefill chunks first: they also bring the GPU clocks up for the short decode layers.
   b.input = bfloatBuffer(backend, input(kRowsMax, E), "input");
   printf("  prefill %u rows: %.3f\n", kRowsMax, time(gguf, plans.moePrefill(ggufShape, kRowsMax)));
+  // Decode on the device's plan against the prefill plan of the same rows (on Apple9 the register tile's MMA, where
+  // decode runs the live-row passes), alternating eight times, each a median of `rounds` commands: both medians.
   for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-    b.input = bfloatBuffer(backend, input(lanes * 8, 24), "input");
+    b.input = bfloatBuffer(backend, input(lanes * 8, decodePool), "input");
+    std::vector<double> decodeTimes, prefillTimes;
+    for (int i = 0; i < 8; ++i) {
+      decodeTimes.push_back(time(gguf, plans.moeDecode(ggufShape, lanes)));
+      prefillTimes.push_back(time(gguf, plans.moePrefill(ggufShape, lanes * 8)));
+    }
+    std::sort(decodeTimes.begin(), decodeTimes.end());
+    std::sort(prefillTimes.begin(), prefillTimes.end());
+    printf("  A/B B%u: decode plan %.3f  prefill plan of its rows %.3f  (%+.1f%%)\n", lanes, decodeTimes[4],
+           prefillTimes[4], 100.0 * (decodeTimes[4] / prefillTimes[4] - 1.0));
+  }
+  for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
+    b.input = bfloatBuffer(backend, input(lanes * 8, decodePool), "input");
     MoeConfig config = plans.moeDecode(ggufShape, lanes).configuration();
     config.ggufTile = other;
     const double g = time(gguf, plans.moeDecode(ggufShape, lanes));
@@ -163,7 +177,7 @@ int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFor
   for (const auto &[label, plan] : {std::pair{"prefill", plans.moePrefill(ggufShape, kRowsMax)},
                                     std::pair{"B1", plans.moeDecode(ggufShape, 1)},
                                     std::pair{"B4", plans.moeDecode(ggufShape, 4)}}) {
-    b.input = bfloatBuffer(backend, input(plan.rows(), plan.rows() == kRowsMax ? E : 24), "input");
+    b.input = bfloatBuffer(backend, input(plan.rows(), plan.rows() == kRowsMax ? E : decodePool), "input");
     allocate(backend, b, plan);
     CommandGraph graph;
     MoE::add(graph, b, gguf, plan);
@@ -183,13 +197,14 @@ int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFor
 int main(int argc, const char *argv[]) {
   @autoreleasepool {
     const Fmt gateUp = argc > 3 ? fmtNamed(argv[3]) : Q4K, down = argc > 4 ? fmtNamed(argv[4]) : Q5K;
-    if (argc < 2 || argc > 5 || gateUp == FMT_COUNT || down == FMT_COUNT) {
-      std::cerr << "usage: gguf-moe-benchmark <metallib> [rounds] [gate/up format] [down format]\n";
+    if (argc < 2 || argc > 6 || gateUp == FMT_COUNT || down == FMT_COUNT) {
+      std::cerr << "usage: gguf-moe-benchmark <metallib> [rounds] [gate/up format] [down format] [decode pool]\n";
       return 2;
     }
     try {
       MetalBackend backend(argv[1]);
-      return timing(backend, argc > 2 ? std::stoul(argv[2]) : 20, gateUp, down);
+      // argv[5]: the experts a decode lane's routes draw from (24); 256 routes every row at random.
+      return timing(backend, argc > 2 ? std::stoul(argv[2]) : 20, gateUp, down, argc > 5 ? std::stoul(argv[5]) : 24);
     } catch (const std::exception &error) {
       std::cerr << "gguf-moe-benchmark: " << error.what() << '\n';
       return 1;
