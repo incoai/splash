@@ -468,6 +468,9 @@ def _write_pi_provider(path, provider, server, environment):
         model = {
             "id": server.model,
             "reasoning": True,
+            # Pi sends reasoning_effort only to a provider it detects or is
+            # told takes it, and some versions detect no local server.
+            "compat": {"supportsReasoningEffort": True},
             # Pi sends no effort when thinking is off, which leaves the
             # template's default; "none" turns thinking off.
             "thinkingLevelMap": {"off": "none"},

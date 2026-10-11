@@ -482,6 +482,7 @@ class ClientTests(unittest.TestCase):
                             {
                                 "id": MODEL,
                                 "reasoning": True,
+                                "compat": {"supportsReasoningEffort": True},
                                 "thinkingLevelMap": {"off": "none"},
                                 "input": ["text", "image"],
                                 "contextWindow": 102400,
