@@ -629,8 +629,9 @@ int compareRepeat(const MoeRun &first, const MoeRun &again, const std::string &l
   return 1;
 }
 
-// One plan's run checked against the fp64 model, gate and up in one pass on the staged tiles; returns its output rows
-// and the tile kinds of its routes.
+// One plan's run checked against the fp64 model, within the bounds of a tile that rounds every weight to half where
+// `staged` (the staged tile's, and the live-row passes' of Apple9 decode on the register tile), gate and up in one
+// pass on the staged tiles; returns its output rows and the tile kinds of its routes.
 MoeRun runPlan(MetalBackend &backend, const Model &m, Buffers &b, const MoePlan &plan, bool staged,
                std::map<std::pair<uint32_t, uint32_t>, GateUp> &products, Stats &stats, const std::string &label) {
   const uint32_t rows = plan.rows();
@@ -665,8 +666,9 @@ MoeRun runPlan(MetalBackend &backend, const Model &m, Buffers &b, const MoePlan 
     gateUpPasses += dispatch.pipelineName.ends_with("_gate_up") || dispatch.pipelineName.ends_with("_gate_up_mixed");
     upPasses += dispatch.pipelineName.ends_with("_g");
   }
-  require(gateUpPasses == staged && upPasses == !staged,
-          label + (staged ? ": gate and up run in two passes" : ": gate and up run in one pass"));
+  const bool oneGateUp = plan.configuration().ggufTile == MoeGgufTile::Staged;
+  require(gateUpPasses == oneGateUp && upPasses == !oneGateUp,
+          label + (oneGateUp ? ": gate and up run in two passes" : ": gate and up run in one pass"));
   for (uint32_t r = 0; r < rows; ++r) {
     const float *x = b.input.data() + uint64_t{r} * kHidden;
     // Routes: the fp64 top-k by descending score, ascending id; the GPU's fp32
@@ -908,15 +910,17 @@ int moe(MetalBackend &backend) {
         const int before = failures;
         Stats stats;
         MoeRun widest;
+        std::string widestName = "four-lane dispatch";
         uint32_t compared = 0, acrossKinds = 0;
-        // The rows of a run that differ from the four-lane dispatch's where their routes ran the same tile kinds.
+        // The rows of a run that differ from the widest run's (the four-lane dispatch's, or the longest prefill
+        // chunk's) where their routes ran the same tile kinds.
         const auto compareWidest = [&](const MoeRun &run, const std::string &label) {
           const RowComparison c =
               compareRows(run, widest, uint32_t(std::min(run.output.size(), widest.output.size()) / kHidden));
           compared += c.compared;
           acrossKinds += c.acrossKinds;
           if (c.differ) {
-            printf("  %s: %u rows differ from the four-lane dispatch FAIL\n", label.c_str(), c.differ);
+            printf("  %s: %u rows differ from the %s FAIL\n", label.c_str(), c.differ, widestName.c_str());
             ++failures;
           }
         };
@@ -926,30 +930,39 @@ int moe(MetalBackend &backend) {
               MoeConfig{.expertTile = MoeExpertTile::M8, .ggufTile = tile});
           const std::string label = formats + (tile == MoeGgufTile::Register ? " register" : " staged") + " decode B" +
                                     std::to_string(lanes);
-          const MoeRun run =
-              runPlan(backend, m, b, plan, tile == MoeGgufTile::Staged, products, stats, label);
+          // The live-row passes (Apple9 decode on the register tile) round
+          // every weight to half, as the staged tile does.
+          const bool halfRounded = tile == MoeGgufTile::Staged || plan.liveRows();
+          const MoeRun run = runPlan(backend, m, b, plan, halfRounded, products, stats, label);
           // A row's result depends on its own routes and the tile kinds they
           // run only, not on the rows it is batched with (the tile rows of one
           // expert are independent).
           if (widest.output.empty()) {
             Stats repeat;
             failures += compareRepeat(
-                run, runPlan(backend, m, b, plan, tile == MoeGgufTile::Staged, products, repeat, label + " repeat"),
-                label);
+                run, runPlan(backend, m, b, plan, halfRounded, products, repeat, label + " repeat"), label);
             widest = run;
           } else {
             compareWidest(run, label);
           }
         }
-        // Prefill chunks on the same 8-row tiles (ExecutionPlans::moePrefill).
+        // Prefill chunks on the same 8-row tiles (ExecutionPlans::moePrefill):
+        // a row's result as decode's, but for the register tile, whose decode
+        // runs the live-row passes in another sum order: its chunks agree with
+        // each other.
+        if (tile == MoeGgufTile::Register) {
+          widest = {};
+          widestName = "longest chunk";
+        }
         for (const uint32_t chunk : {kMaximumRows, 27u, 9u, 8u}) {
           const MoePlan plan = MoE::prefillPlan(
               shape, chunk,
               MoeConfig{.expertTile = MoeExpertTile::M8, .ggufTile = tile});
           const std::string label = formats + (tile == MoeGgufTile::Register ? " register" : " staged") + " prefill rows=" +
                                     std::to_string(chunk);
-          compareWidest(runPlan(backend, m, b, plan, tile == MoeGgufTile::Staged, products, stats, label),
-                        label);
+          const MoeRun run = runPlan(backend, m, b, plan, tile == MoeGgufTile::Staged, products, stats, label);
+          if (widest.output.empty()) widest = run;
+          else compareWidest(run, label);
         }
         printf("%-20s %s decode B1-4, prefill 263/27/9/8: gate/up %.2f%% and down %.2f%% of outputs differ from bf16(fp64), "
                "errors at most %.1e/%.1e of sum|x w|, %u rows compared bitwise, %u across tile kinds %s\n",
