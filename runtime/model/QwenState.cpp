@@ -287,7 +287,7 @@ QwenStateStorage::tryActivateLane(uint32_t index, uint64_t requestId, uint64_t e
       !admission)
     return admission;
   current.cells = std::move(buffers);
-  current.metadata = {requestId, 0, {}};
+  current.metadata = {requestId, 0, {}, 0};
   return {};
 }
 
@@ -369,8 +369,17 @@ void QwenStateStorage::updateLengths(uint32_t index,
 
 void QwenStateStorage::swapParity(uint32_t index) {
   Lane &current = lane(index);
-  requireAssigned(current);
+  requireCommitted(current);
   current.metadata.activeParity ^= 1;
+}
+
+void QwenStateStorage::swapDecodeParity(uint32_t index, uint32_t retainedRows) {
+  Lane &current = lane(index);
+  requireAssigned(current);
+  if (!retainedRows || retainedRows > ExecutionLimits::targetVerifyRows)
+    throw std::invalid_argument("a decode step retains one to all of its rows");
+  current.metadata.activeParity ^= 1;
+  current.metadata.pendingRows = retainedRows;
 }
 
 std::shared_ptr<const QwenCompositeState>
@@ -380,6 +389,7 @@ QwenStateStorage::snapshot(uint32_t index) {
 
 std::shared_ptr<const QwenCompositeState>
 QwenStateStorage::snapshot(uint32_t index, QwenLogicalLengths lengths) {
+  requireCommitted(lane(index));
   const GdnParityBuffers &gdn = current(index);
   validateLengths(lengths, true);
   Buffers buffers;
@@ -396,7 +406,7 @@ QwenStateStorage::snapshot(uint32_t index, QwenLogicalLengths lengths) {
 std::unique_ptr<StateOffload>
 QwenStateStorage::snapshotToDisk(uint32_t index, std::function<void()> completion) {
   const Lane &source = lane(index);
-  requireAssigned(source);
+  requireCommitted(source);
   validateLengths(source.metadata.lengths, true);
   if (!canSnapshotToDisk())
     return {};
@@ -484,7 +494,7 @@ std::unique_ptr<StateRestore> QwenStateStorage::beginRestore(
   if (!typed || typed->layout_ != layout_)
     throw std::invalid_argument("incompatible Qwen composite state");
   validateLengths(typed->lengths_, true);
-  requireAssigned(lane(index));
+  requireCommitted(lane(index));
   if (!typed->disk_) {
     restore(index, *typed, restoreDraftState);
     committed();
@@ -558,6 +568,12 @@ void QwenStateStorage::requireAssigned(const Lane &current) {
   if (!current.metadata.assigned()) {
     throw std::logic_error("Qwen lane is not assigned");
   }
+}
+
+void QwenStateStorage::requireCommitted(const Lane &current) {
+  requireAssigned(current);
+  if (current.metadata.pendingRows)
+    throw std::logic_error("Qwen lane state has decoded rows pending");
 }
 
 } // namespace splash::model

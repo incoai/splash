@@ -632,11 +632,11 @@ void producerTableContract(metal::MetalBackend &backend) {
     buffers.convolutionWeights = allocate(backend, shape.convolutionDimension * 4 * 2);
     buffers.currentStates = states;
     buffers.nextStates = states;
-    buffers.mixed = allocate(backend, kRows * shape.convolutionDimension * 2);
+    const std::array<GdnTapeLane, kLanes> tapes{GdnTapeLane{0, gdnTapeLayerBytes(shape), 0}};
+    buffers.tape = allocate(backend, 2 * gdnTapeLayerBytes(shape));
+    buffers.tapeLanes = tapes;
     buffers.decayWeights = allocate(backend, shape.valueHeads * 4);
     buffers.timeBias = allocate(backend, shape.valueHeads * 2);
-    buffers.decay = allocate(backend, kRows * shape.valueHeads * 4);
-    buffers.beta = allocate(backend, kRows * shape.valueHeads * 2);
     buffers.mixerNorm = {allocate(backend, shape.headDimension * 2)};
     buffers.hidden = allocate(backend, kRows * shape.valueHeads * shape.headDimension * 2);
     metal::CommandGraph graph;

@@ -4,37 +4,41 @@
 #include "metal/kernels/common/activation.h"
 #include "metal/kernels/common/rms_inverse.h"
 
+// The convolution inputs before a command's first row: the rows a state
+// cell carries, or after `consumed` rows (in `rows`) the last of those rows
+// and the carried ones: at(r, c) is row r of the carried state the rows
+// leave.
+struct GdnConvHistory {
+  device const bfloat *carried;
+  device const bfloat *rows;
+  uint conv_dim;
+  uint rows_width;
+  uint consumed;
+
+  bfloat at(uint row, uint channel) const {
+    constexpr uint Carried = SPLASH_GDN_CONVOLUTION_TAPS - 1;
+    const uint source = consumed + row;
+    return source < Carried ? carried[source * conv_dim + channel]
+                            : rows[(source - Carried) * rows_width + channel];
+  }
+};
+
 // Causal convolution of one channel at one token of the command, reading the
-// preceding tokens from the carried state, rounded to bf16 and gated by SiLU.
-inline bfloat gdn_conv_silu(device const bfloat *packed,
-                            device const bfloat *conv_state_in,
+// preceding tokens from the history, rounded to bf16 and gated by SiLU.
+inline bfloat gdn_conv_silu(device const bfloat *packed, GdnConvHistory history,
                             device const bfloat *conv_weights,
-                            uint packed_width, uint conv_dim, uint token,
-                            uint channel) {
+                            uint packed_width, uint token, uint channel) {
   constexpr uint Taps = SPLASH_GDN_CONVOLUTION_TAPS, Carried = Taps - 1;
   float value = 0.0f;
   for (uint tap = 0; tap < Taps; ++tap) {
     uint position = token + tap;
     bfloat input = position < Carried
-                       ? conv_state_in[position * conv_dim + channel]
+                       ? history.at(position, channel)
                        : packed[(position - Carried) * packed_width + channel];
     value += float(input) * float(conv_weights[channel * Taps + tap]);
   }
   value = float(bfloat(value));
   return bfloat(splash_silu(value));
-}
-
-// Row `row` of the carried state after consumed_tokens: the inputs of the
-// last tokens seen, still taken from the incoming state when fewer were
-// consumed.
-inline bfloat gdn_conv_carry(device const bfloat *packed,
-                             device const bfloat *conv_state_in,
-                             uint packed_width, uint conv_dim,
-                             uint consumed_tokens, uint row, uint channel) {
-  constexpr uint Carried = SPLASH_GDN_CONVOLUTION_TAPS - 1;
-  uint source = consumed_tokens + row;
-  return source < Carried ? conv_state_in[source * conv_dim + channel]
-                          : packed[(source - Carried) * packed_width + channel];
 }
 
 // The gates of one (token, value head): beta = sigmoid(b) and

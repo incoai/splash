@@ -153,13 +153,18 @@ Similarity compareFloat(const metal::MetalBuffer &left,
 
 // Budgeted greedy decoding and masked verification of the same prefix must
 // commit identical state. Both use the same target arithmetic; compare bytes.
-// The GDN kernel tests independently check each retained count against FP64.
+// The GDN state a decode step leaves is its lane's cell, which holds the state
+// before the step's rows, and the rows it retained, which wait on its tape for
+// the next step to fold in: the retained counts must match, and lanes that go
+// on for another step must then hold the same cell. The GDN kernel tests
+// independently check the fold of each retained count against FP64.
 void requireCommittedStateIdentical(const model::QwenStateStorage &states,
                                     uint32_t budgetLane, uint32_t maskedLane,
                                     const std::string &label) {
   const auto &budget = states.metadata(budgetLane);
   const auto &masked = states.metadata(maskedLane);
-  require(budget.lengths == masked.lengths,
+  require(budget.lengths == masked.lengths && budget.pendingRows &&
+              budget.pendingRows == masked.pendingRows,
           label + " logical state differs between budget and mask commits");
   auto identical = [&](const metal::MetalBuffer &a, const metal::MetalBuffer &b,
                        const std::string &part) {
@@ -167,8 +172,6 @@ void requireCommittedStateIdentical(const model::QwenStateStorage &states,
                 std::memcmp(a.contents(), b.contents(), a.sizeBytes()) == 0,
             label + " " + part + " differs between budget and mask commits");
   };
-  identical(states.current(budgetLane).stateBase,
-            states.current(maskedLane).stateBase, "GDN state");
   const auto &left = states.draft(budgetLane);
   const auto &right = states.draft(maskedLane);
   for (uint32_t layer = 0; layer < states.layout().draft.layers; ++layer) {
@@ -463,26 +466,19 @@ StateSamples sampleCommittedState(const metal::MetalBackend &backend,
   return result;
 }
 
-// Exact compares every tensor bit for bit, but for `restoredRings` the
-// draft rings, which a restore computed again from the 4-bit context window:
-// they must stay close to the rings computed from the rows themselves.
-// Otherwise it reports the drift of the tensors both sides sampled; a lane
-// past its prompt has no current context window to sample.
+// Compares every tensor bit for bit, but for `restoredRings` the draft rings,
+// which a restore computed again from the 4-bit context window: they must stay
+// close to the rings computed from the rows themselves.
 void compareCommittedSamples(const StateSamples &before,
-                              const StateSamples &after, bool exact,
+                              const StateSamples &after,
                               bool restoredRings = false) {
-  if (exact)
-    require(before.size() == after.size(), "preemption state sample shape changed");
+  require(before.size() == after.size(), "preemption state sample shape changed");
   for (const auto &[name, values] : before) {
     const auto other = std::ranges::find(after, name, &StateSamples::value_type::first);
-    if (other == after.end()) {
-      require(!exact, "preemption state sample shape changed: " + name);
-      continue;
-    }
+    require(other != after.end(), "preemption state sample shape changed: " + name);
     const std::vector<float> &compared = other->second;
     require(values.size() == compared.size(), "preemption tensor sample shape changed");
-    const bool rebuilt = restoredRings && name.starts_with("draft_");
-    if (exact && !rebuilt) {
+    if (!restoredRings || !name.starts_with("draft_")) {
       require(values == compared,
               "regenerated state differs from independent teacher forcing: " + name);
       continue;
@@ -491,10 +487,9 @@ void compareCommittedSamples(const StateSamples &before,
     for (size_t index = 0; index < values.size(); ++index)
       comparison.add(values[index], compared[index]);
     const Similarity result = comparison.result();
-    std::cout << (rebuilt ? "restored_ring " : "preemption_state ") << name
-              << " cosine=" << result.cosine << " maximum_absolute=" << result.maximumAbsolute << '\n';
-    if (rebuilt)
-      require(result.cosine >= 0.99, "rings computed again from the context window drifted: " + name);
+    std::cout << "restored_ring " << name << " cosine=" << result.cosine
+              << " maximum_absolute=" << result.maximumAbsolute << '\n';
+    require(result.cosine >= 0.99, "rings computed again from the context window drifted: " + name);
   }
 }
 
@@ -828,7 +823,7 @@ void requireRepeatedImagePlacements(model::Runtime &executor,
           "prefix restore discarded data for a later image placement");
   // The checkpoint's rows come back into the rings from the context window.
   compareCommittedSamples(
-      expected, sampleCommittedState(backend, states, *restored.lane), true, true);
+      expected, sampleCommittedState(backend, states, *restored.lane), true);
   executor.end(request.id);
   checkpoint.reset();
   while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
@@ -874,8 +869,7 @@ void requireFullWindowRestore(model::Runtime &executor,
   beginCold(executor, request, 0);
   restoreActivePrefix(executor, request.id, prompt.size(), boundary, checkpoint);
   prefillChunk(executor, request.id, boundary, tokens.subspan(boundary), pages);
-  compareCommittedSamples(expected, sampleCommittedState(backend, states, 0, boundary), true,
-                          true);
+  compareCommittedSamples(expected, sampleCommittedState(backend, states, 0, boundary), true);
   executor.end(request.id);
   std::cout << "full_window_restore=PASS\n";
 }
@@ -1999,9 +1993,10 @@ int main(int argc, char **argv) {
     // budgeted commit with a constrained cycle that retains the same prefix,
     // rejecting the next proposal unless all eight rows are retained. The
     // constrained request has a larger budget, so both acceptance paths agree on
-    // the exact GDN state and draft ring. Kernel tests cover the recurrence's
-    // FP64 accuracy; this check does not mix prefill and decode summation
-    // orders, whose tiny differences can amplify through the full model.
+    // the retained rows and the exact draft ring. Kernel tests cover the
+    // recurrence's FP64 accuracy; this check does not mix prefill and decode
+    // summation orders, whose tiny differences can amplify through the full
+    // model.
     for (uint32_t outputLimit = 2; outputLimit <= 8; ++outputLimit) {
       uint64_t id = 10 + outputLimit;
       EngineRequest variant = makeRequest(id, prompt129, outputLimit);
@@ -2071,6 +2066,102 @@ int main(int argc, char **argv) {
               "replay did not commit exactly the supplied prefix");
       requireCommittedStateIdentical(
           states, 0, 1, "fixed DFlash-8 retained=" + std::to_string(stored));
+      executor.end(replayId);
+      executor.end(id);
+    }
+
+    // The next cycle folds the rows a cycle retained into the cell it writes:
+    // a budgeted lane and a masked lane that retain the same rows in two
+    // cycles must then hold the same GDN cell, each folded from its own tape.
+    {
+      constexpr uint64_t id = 60, replayId = 160;
+      EngineRequest budgeted = makeRequest(id, prompt129, 64);
+      beginCold(executor, budgeted, 0);
+      restoreActivePrefix(executor, id, prompt129.size(), 128, promptSnapshot);
+      const ModelStepResult first = firstStep(
+          executor,
+          prefillChunk(executor, id, 128,
+                       std::span<const uint32_t>(prompt129).subspan(128, 1),
+                       pageTable),
+          id, 129, pageTable);
+      const uint64_t firstEnd = states.metadata(0).lengths.targetTokens;
+      require(first.outputTokensWithoutKv == 0 &&
+                  firstEnd == 129 + first.outputTokens.size(),
+              "the budgeted lane's first cycle did not continue");
+      const metal::MetalBuffer &budgetCell = states.current(0).stateBase;
+      const auto *cellBytes = static_cast<const uint8_t *>(budgetCell.contents());
+      require(cellBytes, "the budgeted lane's GDN cell is not readable");
+      const std::vector<uint8_t> beforeFold(cellBytes,
+                                            cellBytes + budgetCell.sizeBytes());
+      const ModelStepResult second =
+          decodeOne(executor, id, firstEnd, pageTable);
+      require(!second.outputTokens.empty() &&
+                  second.outputTokensWithoutKv == 0,
+              "the budgeted lane's second cycle did not continue");
+
+      std::vector<uint32_t> replayPages = pageTable;
+      replayPages[4] = 80;
+      EngineRequest replayRequest = makeRequest(replayId, prompt129, 64);
+      replayRequest.constraint = ConstraintMode::TokenMask;
+      beginCold(executor, replayRequest, 1);
+      restoreActivePrefix(executor, replayId, prompt129.size(), 128,
+                          promptSnapshot);
+      require(prefillChunk(executor, replayId, 128,
+                           std::span<const uint32_t>(prompt129).subspan(128, 1),
+                           replayPages)
+                      .nextDecodeStage == DecodeStage::ApplyInitialMask,
+              "continued replay did not request its initial mask");
+      const std::array<uint32_t, 1> anchor{first.outputTokens.front()};
+      provideMask(executor, replayId, singletonMasks(anchor));
+      static_cast<void>(decodeOne(executor, replayId, 129, replayPages, true,
+                                  DecodeStage::ApplyInitialMask));
+      // A cycle's mask allows the budgeted lane's tokens, then at the row
+      // after them its next anchor, or else a token other than the proposal,
+      // which ends the cycle's acceptance there.
+      const auto replayCycle = [&](uint64_t start, const ModelStepResult &cycle,
+                                   std::optional<uint32_t> next) {
+        auto pending =
+            beginMaskedDecodeOne(executor, replayId, start, replayPages);
+        require(pending.maskRequests.size() == 1 &&
+                    pending.maskRequests[0].simulationTokens.size() == 8,
+                "continued replay proposals were not exposed");
+        const auto &proposed = pending.maskRequests[0].simulationTokens;
+        const size_t rows = cycle.outputTokens.size();
+        std::array<uint32_t, 9> maskTokens{};
+        maskTokens.fill(100);
+        for (size_t row = 0; row < rows; ++row) {
+          require(proposed[row] == cycle.outputTokens[row],
+                  "continued replay proposal differs from committed token");
+          maskTokens[row] = cycle.outputTokens[row];
+        }
+        uint32_t after = 101;
+        if (next)
+          after = *next;
+        else if (rows < proposed.size() && proposed[rows] == 101)
+          after = 102;
+        if (rows < maskTokens.size())
+          maskTokens[rows] = after;
+        provideMask(executor, replayId, singletonMasks(maskTokens));
+        const auto replayed = finishMaskedDecode(std::move(pending));
+        require(replayed.size() == 1 && replayed[0].outputTokensWithoutKv == 0 &&
+                    replayed[0].outputTokens == cycle.outputTokens &&
+                    states.metadata(1).lengths.targetTokens == start + rows,
+                "continued replay did not commit the budgeted lane's rows");
+      };
+      replayCycle(129, first, second.outputTokens.front());
+      replayCycle(firstEnd, second, std::nullopt);
+      requireCommittedStateIdentical(states, 0, 1, "continued second cycle");
+      const metal::MetalBuffer &foldedCell = states.current(0).stateBase;
+      const metal::MetalBuffer &maskedCell = states.current(1).stateBase;
+      require(foldedCell.sizeBytes() == beforeFold.size() &&
+                  std::memcmp(foldedCell.contents(), beforeFold.data(),
+                              beforeFold.size()) != 0,
+              "the second cycle did not fold the first one's rows in");
+      require(maskedCell.sizeBytes() == foldedCell.sizeBytes() &&
+                  maskedCell.contents() &&
+                  std::memcmp(foldedCell.contents(), maskedCell.contents(),
+                              foldedCell.sizeBytes()) == 0,
+              "a folded GDN cell differs between budget and mask commits");
       executor.end(replayId);
       executor.end(id);
     }
@@ -3069,9 +3160,6 @@ int main(int argc, char **argv) {
       };
       const auto rebuild = [&](bool repeatDuringReplay,
                                 bool deliverInitialMask = false) {
-        const StateSamples before =
-            repeatDuringReplay ? sampleCommittedState(backend, states, stateLane)
-                               : StateSamples{};
         executor.suspend(sequence.id);
         require(!states.metadata(stateLane).assigned(),
                 "preempted request retained its GDN/draft buffers");
@@ -3098,10 +3186,9 @@ int main(int argc, char **argv) {
         requireOpen(replay, "regeneration replay emitted historical tokens");
         if (repeatDuringReplay) {
           const StateSamples rebuilt = sampleCommittedState(backend, states, stateLane);
-          // Decode and prefill use different floating-point graphs. Record
-          // that drift, but compare recovery itself to an independent cold
-          // teacher-forced execution with the identical history and geometry.
-          compareCommittedSamples(before, rebuilt, false);
+          // Decode and prefill use different floating-point graphs, so
+          // recovery is compared to an independent cold teacher-forced
+          // execution with the identical history and geometry.
           EngineRequest teacher = sequence;
           teacher.id = 82;
           const uint32_t teacherLane = stateLane == 0 ? 1 : 0;
@@ -3112,7 +3199,7 @@ int main(int argc, char **argv) {
           require(states.metadata(stateLane).lengths == states.metadata(teacherLane).lengths,
                   "recomputed logical lengths differ from teacher forcing");
           compareCommittedSamples(
-              rebuilt, sampleCommittedState(backend, states, teacherLane), true);
+              rebuilt, sampleCommittedState(backend, states, teacherLane));
           executor.end(teacher.id);
         }
         return replay.nextDecodeStage;

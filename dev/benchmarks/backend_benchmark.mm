@@ -4,6 +4,7 @@
 #include "engine/RuntimeResources.hpp"
 #include "model/Runtime.hpp"
 #include "PrefillWork.hpp"
+#include "TranscriptPrompts.hpp"
 
 #include <algorithm>
 #include <iterator>
@@ -756,21 +757,23 @@ struct BenchmarkScenarios final {
   bool partial = true;
   // The short scenario; short is a keyword.
   bool shortPrompts = false;
+  bool transcripts = false;
   bool context = true;
   bool exact = false;
 };
 
 BenchmarkScenarios parseScenarios(std::string_view value) {
-  BenchmarkScenarios selected{false, false, false, false, false};
+  BenchmarkScenarios selected{false, false, false, false, false, false};
   for (;;) {
     const size_t comma = value.find(',');
     const std::string_view name = value.substr(0, comma);
-    bool *scenario = name == "decode"    ? &selected.decode
-                     : name == "partial" ? &selected.partial
-                     : name == "short"   ? &selected.shortPrompts
-                     : name == "context" ? &selected.context
-                     : name == "exact"   ? &selected.exact
-                                         : nullptr;
+    bool *scenario = name == "decode"        ? &selected.decode
+                     : name == "partial"     ? &selected.partial
+                     : name == "short"       ? &selected.shortPrompts
+                     : name == "transcripts" ? &selected.transcripts
+                     : name == "context"     ? &selected.context
+                     : name == "exact"       ? &selected.exact
+                                             : nullptr;
     if (!scenario)
       throw std::invalid_argument("unknown benchmark scenario");
     if (*scenario)
@@ -795,7 +798,7 @@ int main(int argc, char **argv) {
                    "[--samples COUNT] [--progress PATH] "
                    "[--scenario NAME[,NAME...]] [--ane-ffn-share SHARE "
                    "[--ane-ffn-minimum-rows ROWS]] [--max-context TOKENS]\n"
-                   "  NAME: decode, partial, short, context or exact "
+                   "  NAME: decode, partial, short, transcripts, context or exact "
                    "(default: decode,partial,context)\n"
                    "  SHARE: the prefill FFN's Neural Engine share in [0, 1) "
                    "to run instead of calibrating one (0: GPU alone)\n"
@@ -1207,6 +1210,33 @@ int main(int argc, char **argv) {
           if (result.cacheStatus != "miss")
             throw std::runtime_error("short prompt of a " + std::to_string(rows) +
                                      "-row chunk was not a cold miss: " + result.cacheStatus);
+          measurements.push_back(std::move(result));
+        }
+      }
+    }
+
+    // Greedy answers of 512 tokens to real requests (TranscriptPrompts.hpp),
+    // alone and after long contexts of random tokens, each on an empty cache.
+    // Their output tokens, unlike the other scenarios' counting or single
+    // tokens after random ones, move with any change in the target's
+    // arithmetic; backend_regression holds them identical between builds.
+    if (selected.transcripts) {
+      // Each case: a request and the random context tokens before it.
+      constexpr std::array<std::pair<uint32_t, uint32_t>, 8> transcriptCases{
+          {{0, 0}, {1, 0}, {2, 0}, {3, 0}, {4, 0}, {5, 0}, {0, 8192}, {3, 16384}}};
+      for (uint32_t sample = 0; sample < samples; ++sample) {
+        for (uint32_t index = 0; index < transcriptCases.size(); ++index) {
+          const auto [request, context] = transcriptCases[index];
+          std::vector<uint32_t> tokens = prompt(context, uint64_t{index} << 32 | 0x5452414e53ULL);
+          const std::span<const uint32_t> question = benchmark::kTranscriptPrompts[request];
+          tokens.insert(tokens.end(), question.begin(), question.end());
+          evictAllCache(resources->cache());
+          Measurement result =
+              runRequest(engine, driver, *executor, events, progress.get(), requestId++,
+                         "transcript_" + std::to_string(index), sample, std::move(tokens), 512);
+          if (result.cacheStatus != "miss")
+            throw std::runtime_error("transcript request " + std::to_string(index) +
+                                     " was not a cold miss: " + result.cacheStatus);
           measurements.push_back(std::move(result));
         }
       }

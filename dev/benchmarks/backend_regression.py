@@ -3,15 +3,20 @@
 Run as ``python -m dev.benchmarks.backend_regression --baseline CHECKOUT
 --model-root MODEL_ROOT``. Each checkout's build/ holds splash.metallib and
 engine-tests/backend-benchmark, the candidate's engine-tests/weight-digests
-too. The native benchmark's decode, partial and short scenarios (short when
-both builds take it) run in ABBA order (baseline, candidate, candidate,
-baseline) on this machine, which must be otherwise idle:
+too. The native benchmark's decode, partial, short and transcripts scenarios
+(short and transcripts when both builds take them) run in ABBA order
+(baseline, candidate, candidate, baseline) on this machine, which must be
+otherwise idle:
 
 - outputs: every width's output_token_hash and accepted/drafted counts and
-  every partial and short request's output tokens are identical in all four
-  rounds. With --expect-output-change (or EXPECT_OUTPUT_CHANGE=1) each build
-  must still repeat itself, and the candidate's acceptance rate per width may
-  be at most 0.02 below the baseline's.
+  every partial, short and transcript request's output tokens are identical in
+  all four rounds. The decode requests ask for counting, and the partial and
+  short ones for a token after random tokens, which a change in the target's
+  arithmetic seldom moves; the transcripts, greedy answers of 512 tokens to
+  real requests, move with it. With --expect-output-change (or
+  EXPECT_OUTPUT_CHANGE=1) each build must still repeat itself, and the
+  candidate's acceptance rate per width may be at most 0.02 below the
+  baseline's.
 - the prefill FFN's Neural Engine split: with --ane-ffn-share every round of
   a build that takes the option runs that share and must report it, and a
   build that does not must report none. Without it startup calibrates the
@@ -53,7 +58,9 @@ from dev.tests import smoke_real as smoke
 
 ROOT = Path(__file__).resolve().parents[2]
 ROUNDS = ("baseline", "candidate", "candidate", "baseline")
-SCENARIOS = ("decode", "partial", "short")
+SCENARIOS = ("decode", "partial", "short", "transcripts")
+# The scenarios a build may lack, run only when both builds take them.
+OPTIONAL_SCENARIOS = ("short", "transcripts")
 WIDTHS = (1, 2, 3, 4)
 ACCEPTANCE_TOLERANCE = 0.02
 BENCHMARK = Path("build/engine-tests/backend-benchmark")
@@ -62,6 +69,8 @@ PARTIAL = ("partial_4k_cold", "partial_4k_seed", "partial_4k_hit")
 # The rows of the first chunk of the short scenario's cold prefills, whose
 # prompts hold a token more.
 SHORT = (480, 512, 544, 640, 672, 1024, 1536, 2016)
+# The transcripts scenario's requests, one per case of the benchmark's.
+TRANSCRIPTS = tuple(f"transcript_{case}" for case in range(8))
 # The memory plan a load served, as the benchmark reports it.
 MEMORY_PLAN = (
     "max_context_tokens",
@@ -78,7 +87,7 @@ class RegressionError(RuntimeError):
 def usage(benchmark: Path) -> str:
     """A backend-benchmark's usage, which it prints without arguments. It
     names the options a build takes: older builds take one --scenario and no
-    short scenario, and builds before the Neural Engine split no
+    short or transcripts scenario, and builds before the Neural Engine split no
     --ane-ffn-share."""
     return subprocess.run(
         [str(benchmark)], capture_output=True, text=True, timeout=60
@@ -191,11 +200,14 @@ def run_round(tree: Path, model_root: Path, round_index: int, version: str, args
 
 def round_record(version: str, documents: list[dict], scenarios) -> dict:
     """What one round of these scenarios measured: decode samples per width,
-    partial requests per scenario and short requests per first chunk, with
-    the identity and memory plan each load reported."""
+    partial and transcript requests per scenario and short requests per first
+    chunk, with the identity and memory plan each load reported."""
     decode = {width: [] for width in WIDTHS}
     partial = {scenario: [] for scenario in PARTIAL}
     short = {rows: [] for rows in SHORT} if "short" in scenarios else {}
+    transcripts = (
+        {name: [] for name in TRANSCRIPTS} if "transcripts" in scenarios else {}
+    )
     for document in documents:
         for sample in document.get("decode_throughput", {}).get("samples", []):
             decode[sample["width"]].append(
@@ -219,12 +231,19 @@ def round_record(version: str, documents: list[dict], scenarios) -> dict:
             }
             if measurement["scenario"] in partial:
                 partial[measurement["scenario"]].append(request)
+            elif measurement["scenario"] in transcripts:
+                transcripts[measurement["scenario"]].append(request)
             elif (
                 measurement["scenario"] == "short"
                 and measurement["prompt_tokens"] - 1 in short
             ):
                 short[measurement["prompt_tokens"] - 1].append(request)
-    measured = {"decode": decode, "partial": partial, "short": short}
+    measured = {
+        "decode": decode,
+        "partial": partial,
+        "short": short,
+        "transcripts": transcripts,
+    }
     if lacking := [name for name, found in measured.items() if not all(found.values())]:
         raise RegressionError(
             f"a {version} round lacks {' and '.join(lacking)} samples"
@@ -273,7 +292,7 @@ def metrics(rounds: list[dict]) -> dict:
 
 def outputs(record: dict) -> dict:
     """What must repeat: per width and sample the output hash and draft
-    counts, per partial and short request its output tokens."""
+    counts, per partial, short and transcript request its output tokens."""
     result = {}
     for width, samples in record["decode"].items():
         for sample in samples:
@@ -290,6 +309,11 @@ def outputs(record: dict) -> dict:
     for rows, requests in record["short"].items():
         for request in requests:
             result[f"short {rows} rows sample {request['sample']}"] = tuple(
+                request["output_tokens"]
+            )
+    for name, requests in record["transcripts"].items():
+        for request in requests:
+            result[f"{name} sample {request['sample']}"] = tuple(
                 request["output_tokens"]
             )
     return result
@@ -484,9 +508,13 @@ def main(argv=None) -> int:
         environments["baseline"].update(weights.baseline_environment(args.output_dir))
     usages = {name: usage(tree / BENCHMARK) for name, tree in trees.items()}
     args.combined = all("NAME[,NAME...]" in text for text in usages.values())
-    # Both builds run short only when both take it.
-    short = all(re.search(r"\bshort\b", text) for text in usages.values())
-    args.scenarios = [name for name in SCENARIOS if short or name != "short"]
+    # Both builds run an optional scenario only when both take it.
+    args.scenarios = [
+        name
+        for name in SCENARIOS
+        if name not in OPTIONAL_SCENARIOS
+        or all(re.search(rf"\b{name}\b", text) for text in usages.values())
+    ]
     args.takes_ane_ffn_share = {
         name: "--ane-ffn-share" in text for name, text in usages.items()
     }
@@ -547,8 +575,9 @@ def report(document: dict) -> None:
     for name, result in comparison["speed"].items():
         rounds = " ".join(f"{value:.2f}" for value in result["rounds"])
         print(f"{name}: {abba.describe(result)} (ABBA {rounds})")
-    if not any("short" in scenario for scenario in document["scenario_invocations"]):
-        print("short prompts: not compared, a build's backend-benchmark lacks them")
+    for name, what in (("short", "short prompts"), ("transcripts", "transcripts")):
+        if not any(name in scenario for scenario in document["scenario_invocations"]):
+            print(f"{what}: not compared, a build's backend-benchmark lacks them")
     for width, rate in comparison["acceptance"].items():
         print(
             f"{width} acceptance: baseline {rate['baseline']:.4f}, "

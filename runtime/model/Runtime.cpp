@@ -1107,6 +1107,10 @@ struct Runtime::Impl {
           metadata.lengths.targetTokens != item.logicalPosition) {
         throw std::logic_error("ragged prefill state length is not exact");
       }
+      // The chunk reads the lane's state from its current cell, which a
+      // decode step leaves without the rows it retained.
+      if (metadata.pendingRows)
+        throw std::logic_error("ragged prefill lane has decoded rows pending");
       if (item.logicalPosition == 0)
         states.clearForColdStart(entry.stateLane);
       if (item.tokenCount > kPrefillRows - batch.rows) {
@@ -1463,13 +1467,8 @@ struct Runtime::Impl {
     };
 
     std::array<ChunkedPrefillParams, kLaneCount> chunks{};
-    const uint32_t gdnLayers = geometry.target.stateLayout.layers;
     const uint32_t attentionLayers =
         geometry.target.kvLayout.attentionLayers;
-    std::vector<MetalBuffer> gdnPacked(gdnLayers);
-    std::vector<MetalBuffer> gdnMixed(gdnLayers);
-    std::vector<MetalBuffer> gdnDecay(gdnLayers);
-    std::vector<MetalBuffer> gdnBeta(gdnLayers);
     std::vector<MetalBuffer> chunkKeys(attentionLayers);
     std::vector<MetalBuffer> chunkValues(attentionLayers);
     QwenTargetVerifyBuffers buffers;
@@ -1492,10 +1491,8 @@ struct Runtime::Impl {
     buffers.finalHidden = d(DecodeTensor::FinalHidden);
     buffers.logits = d(DecodeTensor::Logits);
     buffers.denseGateScratch = decodeArena->gateScratch();
-    buffers.gdnPacked = gdnPacked;
-    buffers.gdnMixed = gdnMixed;
-    buffers.gdnDecay = gdnDecay;
-    buffers.gdnBeta = gdnBeta;
+    buffers.gdnPacked = d(DecodeTensor::GdnPacked);
+    buffers.gdnTape = decodeArena->batchSlice(DecodeTensor::GdnTape, kLaneCount);
     buffers.chunkKeys = chunkKeys;
     buffers.chunkValues = chunkValues;
     buffers.moe = decodeArena->moeScratch(storage);
@@ -1510,15 +1507,12 @@ struct Runtime::Impl {
       buffers.currentGdnStates[lane] = states.current(entry.stateLane).stateBase;
       buffers.nextGdnStates[lane] = states.next(entry.stateLane).stateBase;
     }
-    for (uint32_t layer = 0; layer < gdnLayers; ++layer) {
-      gdnPacked[layer] = decodeArena->gdnBatchSlice(
-          DecodeTensor::VerifyPackedBase, layer, storage);
-      gdnMixed[layer] = decodeArena->gdnBatchSlice(
-          DecodeTensor::VerifyMixedBase, layer, storage);
-      gdnDecay[layer] = decodeArena->gdnBatchSlice(
-          DecodeTensor::VerifyDecayBase, layer, storage);
-      gdnBeta[layer] = decodeArena->gdnBatchSlice(
-          DecodeTensor::VerifyBetaBase, layer, storage);
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+      const uint32_t stateLane = entries[lane]->stateLane;
+      const QwenLaneMetadata &metadata = states.metadata(stateLane);
+      buffers.gdnTapeLanes[lane] = {decodeArena->gdnTapeSlot(stateLane, metadata.activeParity),
+                                    decodeArena->gdnTapeSlot(stateLane, metadata.activeParity ^ 1),
+                                    metadata.pendingRows};
     }
     for (uint32_t layer = 0; layer < attentionLayers; ++layer) {
       chunkKeys[layer] = decodeArena->attentionBatchSlice(
@@ -1629,31 +1623,6 @@ struct Runtime::Impl {
         decodeArena->batchSlice(DecodeTensor::InputTokens, lanes), lanes);
   }
 
-  void encodeBatchGdnCommit(CommandGraph &graph,
-                            std::span<Request *const> lanes) {
-    if (lanes.empty() || lanes.size() > kLaneCount)
-      throw std::invalid_argument("invalid GDN commit batch");
-    const uint32_t width = static_cast<uint32_t>(lanes.size());
-    std::array<MetalBuffer, kLaneCount> currentStates;
-    std::array<MetalBuffer, kLaneCount> nextStates;
-    for (uint32_t lane = 0; lane < kLaneCount; ++lane) {
-      Request *entry = lanes[std::min(lane, width - 1)];
-      if (!entry)
-        throw std::invalid_argument("empty GDN commit lane");
-      currentStates[lane] = states.current(entry->stateLane).stateBase;
-      nextStates[lane] = states.next(entry->stateLane).stateBase;
-    }
-    targetModel.addStateCommit(
-        graph,
-        {decodeArena->gdnStorage(DecodeTensor::VerifyPackedBase),
-         decodeArena->gdnStorage(DecodeTensor::VerifyMixedBase),
-         decodeArena->gdnStorage(DecodeTensor::VerifyDecayBase),
-         decodeArena->gdnStorage(DecodeTensor::VerifyBetaBase), currentStates,
-         nextStates,
-         decodeArena->batchSlice(DecodeTensor::RetainedCount, width)},
-        width);
-  }
-
   // A stop token or the last budgeted token needs no target work of its own:
   // the next cycle would only echo it as output. Emitting it as soon as it is
   // selected saves that cycle; the engine is told it has no KV row.
@@ -1716,7 +1685,7 @@ struct Runtime::Impl {
       output.insert(output.end(), targetTokens,
                     targetTokens + (laneResult.retained - 1));
 
-      states.swapParity(entry.stateLane);
+      states.swapDecodeParity(entry.stateLane, laneResult.retained);
       const uint64_t nextLength =
           items[lane].logicalPosition + laneResult.retained;
       states.updateLengths(
@@ -1840,7 +1809,6 @@ struct Runtime::Impl {
                                               {entries.data(), lanes_.size()});
           impl_.encodeBatchAcceptance(commit, {entries.data(), lanes_.size()},
                                       {maximumRetained.data(), lanes_.size()});
-          impl_.encodeBatchGdnCommit(commit, {entries.data(), lanes_.size()});
           impl_.encodeDraftStateCommitBatch(
               commit, {entries.data(), lanes_.size()}, items_);
           submit(commit);
@@ -2378,7 +2346,6 @@ Runtime::decodeAsync(const BatchPlan &plan,
   impl_->encodeTargetVerifyBatchPolicy(commandGraph, entries);
   impl_->encodeBatchAcceptance(commandGraph, entries,
                                {maximumRetained.data(), width});
-  impl_->encodeBatchGdnCommit(commandGraph, entries);
   impl_->encodeDraftStateCommitBatch(commandGraph, entries, items);
 
   std::vector<ModelBatchItem> copiedItems(items.begin(), items.end());
