@@ -1,4 +1,5 @@
 #include "metal/abi/KernelABI.h"
+#include "metal/abi/LiveRows.h"
 #include "metal/kernels/common/split_reduce.h"
 
 // The rows of the target policy. A greedy lane takes each row's argmax. A
@@ -1356,6 +1357,71 @@ kernel void draft_select_dflash(
   }
 }
 
+// Confidence of the actual selected path, regardless of how it was selected.
+// This uses the edge tables, not the sampled acceptance buffer, so greedy
+// metadata never overwrites q and an alternative selector needs no special ABI.
+kernel void draft_verify_live_rows(
+    device const uint *candidates [[buffer(0)]],
+    device const float *unary [[buffer(1)]],
+    device const float *partial_values [[buffer(2)]],
+    device const uint *tokens [[buffer(3)]],
+    device VerifyLiveRows *live_rows [[buffer(4)]],
+    constant DraftLiveRowsParams &params [[buffer(5)]],
+    uint batch [[thread_position_in_grid]]) {
+  constexpr uint Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
+  constexpr uint Candidates = SPLASH_DRAFT_CANDIDATES;
+  device VerifyLiveRows &budget = live_rows[batch];
+  budget.count = SPLASH_TARGET_VERIFY_ROWS;
+  // Sample-dependent truncation is not a distribution-preserving stopping
+  // rule. Keep the original sampled path, including in mixed batches.
+  if (params.sampling_mask & (1u << batch)) {
+    for (uint p = 0; p < Positions; ++p)
+      budget.prefix_confidence[p] = 1.0f;
+    return;
+  }
+  candidates += batch * Positions * Candidates;
+  unary += batch * Positions * Candidates;
+  tokens += batch * Positions;
+  device const float *tables = partial_values +
+      params.lanes * Positions * SPLASH_DRAFT_SAMPLING_SHARDS * Candidates +
+      batch * Positions * Candidates * Candidates;
+  uint predecessor = 0;
+  uint rows = 1;
+  float prefix = 1.0f;
+  bool valid = true;
+  for (uint p = 0; p < Positions; ++p) {
+    device const float *edges = tables + (p * Candidates + predecessor) * Candidates;
+    float scores[Candidates];
+    float maximum = -INFINITY;
+    uint chosen = Candidates;
+    for (uint c = 0; c < Candidates; ++c) {
+      scores[c] = unary[p * Candidates + c] + edges[c];
+      valid = valid && !isnan(scores[c]) && scores[c] != INFINITY;
+      maximum = max(maximum, scores[c]);
+      if (chosen == Candidates && candidates[p * Candidates + c] == tokens[p])
+        chosen = c;
+    }
+    if (chosen == Candidates || !isfinite(maximum)) {
+      valid = false;
+      chosen = 0;
+    }
+    float sum = 0.0f;
+    for (uint c = 0; c < Candidates; ++c)
+      sum += exp(scores[c] - maximum);
+    const float q = exp(scores[chosen] - maximum) / sum;
+    valid = valid && isfinite(q);
+    prefix *= clamp(q, 0.0f, 1.0f);
+    budget.prefix_confidence[p] = isfinite(prefix) ? prefix : 1.0f;
+    // Only extend a contiguous prefix. A zero threshold retains all rows,
+    // including prefixes whose confidence underflowed to zero.
+    if (rows == p + 1 && (params.threshold == 0.0f || prefix >= params.threshold))
+      ++rows;
+    predecessor = chosen;
+  }
+  // Invalid confidence must never hide a target failure or read stale tables.
+  budget.count = valid ? rows : SPLASH_TARGET_VERIFY_ROWS;
+}
+
 inline float sparse_lookup(device const uint *ids,
                            device const float *probabilities, uint count,
                            uint token) {
@@ -1371,6 +1437,7 @@ struct AcceptParams {
   uint remaining;
   uint stop_token_0;
   uint stop_token_1;
+  uint proposals;
 };
 
 // Keeps at most params.remaining of the accepted tokens plus the correction,
@@ -1404,7 +1471,7 @@ inline void accept_sampled_lane(device const uint *draft_tokens,
                                 device uint &accepted_count,
                                 AcceptParams params) {
   uint accepted = 0;
-  while (accepted < SPLASH_DRAFT_PROPOSAL_TOKENS) {
+  while (accepted < params.proposals) {
     uint token = draft_tokens[accepted];
     float q = sparse_lookup(draft_ids + accepted * kDraftCandidates,
                             draft_probs + accepted * kDraftCandidates,
@@ -1514,7 +1581,7 @@ inline void accept_greedy_lane(device const uint *draft_tokens,
                                device uint &accepted_count,
                                AcceptParams params) {
   uint accepted = 0;
-  while (accepted < SPLASH_DRAFT_PROPOSAL_TOKENS &&
+  while (accepted < params.proposals &&
          draft_tokens[accepted] == target_tokens[accepted]) {
     ++accepted;
   }
@@ -1522,20 +1589,20 @@ inline void accept_greedy_lane(device const uint *draft_tokens,
                     accepted_count);
 }
 
-kernel void decode_accept_dflash(
-    device const uint *draft_tokens [[buffer(0)]],
-    device const uint *draft_ids [[buffer(1)]],
-    device const float *draft_probs [[buffer(2)]],
-    device const TargetVocabularyRow *target_rows [[buffer(3)]],
-    device const float *uniforms [[buffer(4)]],
-    device uint *target_tokens [[buffer(5)]],
-    device uint *retained [[buffer(6)]],
-    device uint *accepted_count [[buffer(7)]],
-    constant AcceptBatchParams &params [[buffer(8)]],
-    uint batch [[threadgroup_position_in_grid]]) {
-  uint remaining = params.remaining[batch];
+inline void accept_lane(
+    device const uint *draft_tokens,
+    device const uint *draft_ids,
+    device const float *draft_probs,
+    device const TargetVocabularyRow *target_rows,
+    device const float *uniforms,
+    device uint *target_tokens,
+    device uint *retained,
+    device uint *accepted_count,
+    constant AcceptBatchParams &params,
+    uint batch, uint rows) {
+  uint remaining = min(params.remaining[batch], rows);
   AcceptParams lane_params{remaining, params.stop_token_0,
-                           params.stop_token_1};
+                           params.stop_token_1, rows - 1};
   device const uint *lane_draft =
       draft_tokens + batch * SPLASH_DRAFT_PROPOSAL_TOKENS;
   device uint *lane_target =
@@ -1552,4 +1619,39 @@ kernel void decode_accept_dflash(
     accept_greedy_lane(lane_draft, lane_target, retained[batch],
                        accepted_count[batch], lane_params);
   }
+}
+
+kernel void decode_accept_dflash(
+    device const uint *draft_tokens [[buffer(0)]],
+    device const uint *draft_ids [[buffer(1)]],
+    device const float *draft_probs [[buffer(2)]],
+    device const TargetVocabularyRow *target_rows [[buffer(3)]],
+    device const float *uniforms [[buffer(4)]],
+    device uint *target_tokens [[buffer(5)]],
+    device uint *retained [[buffer(6)]],
+    device uint *accepted_count [[buffer(7)]],
+    constant AcceptBatchParams &params [[buffer(8)]],
+    uint batch [[threadgroup_position_in_grid]]) {
+  accept_lane(draft_tokens, draft_ids, draft_probs, target_rows, uniforms,
+              target_tokens, retained, accepted_count, params, batch,
+              SPLASH_TARGET_VERIFY_ROWS);
+}
+
+kernel void decode_accept_dflash_live_rows(
+    device const uint *draft_tokens [[buffer(0)]],
+    device const uint *draft_ids [[buffer(1)]],
+    device const float *draft_probs [[buffer(2)]],
+    device const TargetVocabularyRow *target_rows [[buffer(3)]],
+    device const float *uniforms [[buffer(4)]],
+    device uint *target_tokens [[buffer(5)]],
+    device uint *retained [[buffer(6)]],
+    device uint *accepted_count [[buffer(7)]],
+    device const VerifyLiveRows *live_rows [[buffer(8)]],
+    constant AcceptBatchParams &params [[buffer(9)]],
+    uint batch [[threadgroup_position_in_grid]]) {
+  const uint rows = params.sampling_mask & (1u << batch)
+      ? SPLASH_TARGET_VERIFY_ROWS
+      : clamp(live_rows[batch].count, 1u, SPLASH_TARGET_VERIFY_ROWS);
+  accept_lane(draft_tokens, draft_ids, draft_probs, target_rows, uniforms,
+              target_tokens, retained, accepted_count, params, batch, rows);
 }

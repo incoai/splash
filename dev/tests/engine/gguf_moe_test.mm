@@ -30,6 +30,7 @@
 #include "MoeExtents.hpp"
 #include "metal/abi/Gguf.h"
 #include "metal/abi/MoE.h"
+#include "metal/abi/LiveRows.h"
 
 #import <Foundation/Foundation.h>
 
@@ -765,6 +766,43 @@ int moe(MetalBackend &backend) {
                                     std::to_string(lanes);
           const std::vector<uint16_t> rows =
               runPlan(backend, m, b, plan, tile == MoeGgufTile::Staged, oneGateUp, products, stats, label);
+          // Every GGUF expert format and both decode tiles must preserve the
+          // exact bits of live rows after routed and shared routes are compacted.
+          for (uint32_t cutoff = 1; cutoff <= 9; ++cutoff) {
+            b.moe.liveRows = zeros(backend, lanes * sizeof(VerifyLiveRows), "live rows");
+            auto *budgets = static_cast<VerifyLiveRows *>(b.moe.liveRows.contents());
+            uint32_t liveCount = 0;
+            for (uint32_t lane = 0; lane < lanes; ++lane) {
+              budgets[lane].count = cutoff == 9 ? 8 : (cutoff + lane - 1) % 8 + 1;
+              liveCount += budgets[lane].count;
+            }
+            allocate(backend, b, plan);
+            CommandGraph graph;
+            MoE::add(graph, b.moe, m.weights, plan);
+            static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+            const auto *actual = static_cast<const uint16_t *>(b.moe.output.contents());
+            const auto *residual = static_cast<const uint16_t *>(b.moe.residual.contents());
+            const auto *descriptors = static_cast<const MoeTileDescriptor *>(b.moe.scratch.tileDescriptors.contents());
+            const uint32_t tiles = *static_cast<const uint32_t *>(b.moe.scratch.tileCount.contents());
+            uint32_t routedRows = 0, sharedRows = 0;
+            for (uint32_t tileIndex = 0; tileIndex < tiles; ++tileIndex) {
+              routedRows += descriptors[tileIndex].rows;
+              if (descriptors[tileIndex].expert == kExperts) sharedRows += descriptors[tileIndex].rows;
+            }
+            bool equal = routedRows == liveCount * (kTopK + 1) && sharedRows == liveCount;
+            for (uint32_t row = 0; row < lanes * 8; ++row) {
+              const bool live = row % 8 < budgets[row / 8].count;
+              for (uint32_t column = 0; column < kHidden; ++column) {
+                const uint32_t index = row * kHidden + column;
+                equal = equal && actual[index] == (live ? rows[index] : residual[index]);
+              }
+            }
+            if (!equal) {
+              printf("  %s: live cutoff %u differs bitwise or retains inactive expert routes FAIL\n", label.c_str(), cutoff);
+              ++failures;
+            }
+            b.moe.liveRows = {};
+          }
           // A row's result depends on its own routes only, not on the lanes it
           // is batched with (the tile rows of one expert are independent).
           if (widest.empty()) widest = rows;
