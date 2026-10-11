@@ -782,6 +782,7 @@ def main_args(**overrides):
             "allowed_origin": [],
             "api_key": None,
             "allow_idle_sleep": False,
+            "share_gpu": False,
             "no_webui": False,
             "max_request_size": serve_options.DEFAULT_MAX_REQUEST_BYTES,
             "port": 0,

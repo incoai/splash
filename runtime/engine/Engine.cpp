@@ -248,6 +248,10 @@ bool Engine::tick(double now) {
     return true;
   }
 
+  // The other servers' decoders bound the prefill this tick admits and the
+  // command it plans alike.
+  if (config_.exchangeDecoding)
+    scheduler_.setOtherServersDecoding(config_.exchangeDecoding(scheduler_.decodingPriority()));
   progressed = admitQueued(now) || progressed;
   sweepTerminal();
   // Lanes that wait for memory on its way back cannot run before it lands;

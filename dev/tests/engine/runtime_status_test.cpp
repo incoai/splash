@@ -91,6 +91,7 @@ void testCleanRuntimeStatus(const char *goldenPath) {
   engine.scheduler.prefillRows = 4096;
   engine.scheduler.decodeBatches = 4;
   engine.scheduler.decodeBatchesByWidth = {1, 1, 1, 1};
+  engine.scheduler.otherServersDecoding = engine::RequestPriority::Normal;
   engine.activeRequests = {{.id = 7,
                             .phase = engine::Phase::Prefill,
                             .priority = engine::RequestPriority::Foreground,

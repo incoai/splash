@@ -245,6 +245,16 @@ std::optional<RequestPriority> Scheduler::highestRunnablePriority() const noexce
   return result;
 }
 
+std::optional<RequestPriority> Scheduler::decodingPriority() const noexcept {
+  std::optional<RequestPriority> result;
+  for (const auto &[_, request] : requests_) {
+    if ((request.phase == Phase::Decode || request.phase == Phase::WaitingMask) &&
+        (!result || request.spec.priority < *result))
+      result = request.spec.priority;
+  }
+  return result;
+}
+
 std::optional<BatchPlan> Scheduler::next(std::span<const uint64_t> excluded) const {
   if (active_)
     return std::nullopt;
@@ -344,12 +354,14 @@ uint32_t Scheduler::prefillBudget(
   const uint32_t leaderRemaining =
       leader.request->spec.prefillTokens - leader.promptProcessed;
   const bool leaderFinishing = leaderRemaining <= rows;
-  const bool contended = std::any_of(
-      requests_.begin(), requests_.end(), [&](const auto &entry) {
-        const Request &peer = entry.second;
-        return (peer.phase == Phase::Decode || peer.phase == Phase::WaitingMask) &&
-               peer.spec.priority <= leader.request->spec.priority;
-      }) || std::any_of(ready.begin(), ready.end(), [&](
+  // Decoders of the leader's priority or a higher one, here or in another
+  // Splash server on this Mac.
+  const auto bounds = [&](std::optional<RequestPriority> decoding) {
+    return decoding && *decoding <= leader.request->spec.priority;
+  };
+  const bool contended =
+      bounds(decodingPriority()) || bounds(otherServersDecoding_) ||
+      std::any_of(ready.begin(), ready.end(), [&](
                            const PrefillRequestView &peer) {
         return peer.request->spec.id != leader.request->spec.id &&
                peer.request->spec.priority <= leader.request->spec.priority &&
@@ -358,8 +370,9 @@ uint32_t Scheduler::prefillBudget(
       });
   // Bound commands for peers that decode or wait for a CPU mask, including
   // decoders left out of this command (their streams resume once their
-  // memory lands), and for peers that can finish prefill within this slice.
-  // The first sample and minimum matrix shape remain limits.
+  // memory lands), for the decoders of other Splash servers on this Mac
+  // (setOtherServersDecoding), and for peers that can finish prefill within
+  // this slice. The first sample and minimum matrix shape remain limits.
   if (contended)
     return rows;
   // A leader that finishes within the full budget ends the command at its
@@ -566,6 +579,7 @@ uint32_t Scheduler::promptProcessed(uint64_t id) const {
 
 SchedulerSnapshot Scheduler::snapshot() const noexcept {
   SchedulerSnapshot result = counters_;
+  result.otherServersDecoding = otherServersDecoding_;
   for (const auto &[_, request] : requests_) {
     switch (request.phase) {
     case Phase::Queued:

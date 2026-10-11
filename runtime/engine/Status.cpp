@@ -298,6 +298,10 @@ std::string runtimeStatusJson(
       << ",\"decoding\":" << scheduler.decoding
       << ",\"waiting_mask\":" << scheduler.waitingMask
       << ",\"terminal\":" << scheduler.terminal
+      << ",\"other_servers_decoding\":"
+      << (scheduler.otherServersDecoding
+              ? json::quote(priorityName(*scheduler.otherServersDecoding))
+              : "null")
       << ",\"prefill_batches\":" << scheduler.prefillBatches
       << ",\"prefill_rows\":" << scheduler.prefillRows
       << ",\"decode_batches\":" << scheduler.decodeBatches

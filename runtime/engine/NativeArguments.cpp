@@ -123,6 +123,10 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
       if (value != "on" && value != "off")
         throw UsageError("--ane requires on or off");
       result.neuralEngine = value == "on";
+    } else if (option == "--share-gpu") {
+      if (value != "on" && value != "off")
+        throw UsageError("--share-gpu requires on or off");
+      result.shareGpu = value == "on";
     } else {
       throw UsageError("unexpected argument " + std::string(option));
     }

@@ -3,6 +3,7 @@
 #include "engine/FdTransport.hpp"
 #include "engine/Bootstrap.hpp"
 #include "engine/NativeArguments.hpp"
+#include "engine/GpuShare.hpp"
 #include "engine/Status.hpp"
 #include "model/ModelDescriptor.hpp"
 
@@ -153,7 +154,8 @@ void printUsage(std::string_view executable) {
       " MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto [MAX_CACHE_DISK_BYTES]"
       " [--kv-format int8|bf16] [--decode-share SHARE]"
       " [--max-image-patches PATCHES] [--cache-dir DIRECTORY]"
-      " [--idle-release SECONDS|off] [--idle-sleep prevent|allow] [--ane on|off]");
+      " [--idle-release SECONDS|off] [--idle-sleep prevent|allow] [--ane on|off]"
+      " [--share-gpu on|off]");
   writeStderrLine("       " + command + " model-check mlx-affine none|safetensors CONFIG [DRAFT_CONFIG]");
   writeStderrLine("       " + command + " model-check gguf none|gguf CONFIG GGUF_METADATA [DRAFT_CONFIG]");
   writeStderrLine("       " + command + " device-check");
@@ -270,6 +272,14 @@ int runNative(const engine::NativeArguments &arguments) {
   IdleSleepAssertion idleSleep;
   engine::RuntimeMetrics metrics;
   engine::RuntimeBootstrap *published = nullptr;
+  std::optional<engine::GpuShare> gpuShare;
+  if (arguments.shareGpu) {
+    try {
+      gpuShare.emplace(engine::GpuShare::defaultPath());
+    } catch (const std::exception &error) {
+      throw std::runtime_error(std::string("--share-gpu: ") + error.what());
+    }
+  }
   auto statusProvider = [&] {
     return published->statusJson(
         metrics.snapshot(),
@@ -288,6 +298,10 @@ int runNative(const engine::NativeArguments &arguments) {
     config.nativeLoop.metrics = &metrics;
     if (arguments.preventIdleSleep)
       config.nativeLoop.holdingRequests = [&](bool held) { idleSleep.hold(held); };
+    if (gpuShare)
+      config.nativeLoop.engine.exchangeDecoding = [&](std::optional<engine::RequestPriority> decoding) {
+        return gpuShare->exchange(decoding);
+      };
     try {
       bootstrap = engine::RuntimeBootstrap::start(
           std::move(config), transport.outputSink(), statusProvider);
@@ -318,6 +332,10 @@ int runNative(const engine::NativeArguments &arguments) {
     return published->controlPass(pressureMonitor.pressure());
   });
   const auto exit = transport.run(bootstrap->nativeLoop());
+  // This server decodes no more: the others' prefill need not wait for the
+  // flush and teardown.
+  if (gpuShare)
+    gpuShare->leave();
   switch (exit) {
   case engine::NativeProcessExit::CleanEof:
     if (bootstrap->resources().cache().persistent())

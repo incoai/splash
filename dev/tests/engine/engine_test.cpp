@@ -159,6 +159,38 @@ void testConcurrentColdPrefixesComputeOnce() {
           "shared prefill lost independent completions");
 }
 
+// With --share-gpu the engine tells the other Splash servers on the Mac,
+// before each command it plans, the highest priority it decodes at, and
+// plans with the highest one they decode at.
+void testOtherServersDecodingExchange() {
+  test::TestKvStorage storage(64, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor model;
+  Events events;
+  std::vector<std::optional<RequestPriority>> told;
+  engine::EngineConfig config;
+  config.exchangeDecoding = [&](std::optional<RequestPriority> decoding) {
+    told.push_back(decoding);
+    return std::optional{RequestPriority::Background};
+  };
+  engine::Engine engine(test::engineConfig(std::move(config)), cache, model, events);
+  guardReleases(storage, engine);
+  EngineRequest decoding = request(1, std::vector<uint32_t>(40, 7));
+  decoding.maxNewTokens = 8;
+  engine.submit(decoding);
+  runUntilIdle(engine);
+  require(events.completedCount == 1 &&
+              engine.snapshot().scheduler.otherServersDecoding == RequestPriority::Background,
+          "the engine did not plan with the other servers' decoding priority");
+  require(!told.empty() && told.front() == std::nullopt && told.back() == RequestPriority::Normal,
+          "the engine did not tell the other servers the priority it decodes at");
+  // The native loop ticks again after a tick that progressed: that tick
+  // tells the other servers it no longer decodes.
+  static_cast<void>(engine.tick(100));
+  require(told.back() == std::nullopt, "the engine went on telling the other servers it decodes");
+}
+
 void testSharedPrefillRebuildsTheMissingJunctionOnce() {
   test::TestKvStorage storage(512, 4096, 4);
   KvPool pool(storage, 0);
@@ -8867,6 +8899,7 @@ int main() {
     testEveryEndReleasesTheReplayPoint();
     testWaitingEndsReleaseTheReplayPoint();
     testConcurrentColdPrefixesComputeOnce();
+    testOtherServersDecodingExchange();
     testSharedPrefillRebuildsTheMissingJunctionOnce();
     testSharedPrefillReleasesDifferentJunctionsIndependently();
     testSharedPrefillEvictedPublicationFallsBack();

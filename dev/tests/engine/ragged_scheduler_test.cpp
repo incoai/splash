@@ -630,6 +630,33 @@ void testMeasuredBudgetOnlyLimitsContendedWork() {
           "prefill did not recover isolated throughput after its peer ended");
 }
 
+// The decoders of another Splash server on this Mac bound prefill as this
+// server's own do: those of the same or a higher priority, while they decode.
+void testOtherServersDecodersBoundPrefill() {
+  engine::Scheduler scheduler(0.0);
+  scheduler.submit(request(1, 20'000));
+  scheduler.submit(request(2, 1));
+  scheduler.resourcesReady(1, 0);
+  completePrefill(scheduler, *scheduler.next({}), 4096.0);
+  require(scheduler.next({})->items[0].tokenCount == 2048 &&
+              scheduler.decodingPriority() == std::nullopt,
+          "isolated prefill lost the full budget");
+  scheduler.setOtherServersDecoding(RequestPriority::Background);
+  require(scheduler.next({})->items[0].tokenCount == 2048,
+          "another server's lower-priority decoders bounded prefill");
+  scheduler.setOtherServersDecoding(RequestPriority::Normal);
+  require(scheduler.next({})->items[0].tokenCount == 128 &&
+              scheduler.snapshot().otherServersDecoding == RequestPriority::Normal,
+          "another server's decoders of the same priority did not bound prefill");
+  scheduler.setOtherServersDecoding(std::nullopt);
+  require(scheduler.next({})->items[0].tokenCount == 2048,
+          "prefill stayed bounded once the other server stopped decoding");
+  // What this server tells the others: the highest priority it decodes at.
+  scheduler.resourcesReady(2, 1);
+  require(scheduler.decodingPriority() == RequestPriority::Normal,
+          "a decoding request did not report its priority");
+}
+
 void testAuxiliaryWorkDoesNotTrainTextPrefillTiming() {
   engine::Scheduler scheduler(0.0);
   scheduler.submit(request(1, 20'000));
@@ -1126,6 +1153,7 @@ int main() {
     testDecodeDebtLeavesWithTheLastDecoder();
     testHigherPriorityPrefillPrecedesDecodeDebt();
     testMeasuredBudgetOnlyLimitsContendedWork();
+    testOtherServersDecodersBoundPrefill();
     testAuxiliaryWorkDoesNotTrainTextPrefillTiming();
     testMeasuredBudgetUsesActualRowsAndRecovers();
     testMeasuredBudgetPreservesPriorityAndStateBoundaries();

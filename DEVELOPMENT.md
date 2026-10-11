@@ -105,6 +105,7 @@ access.
 | `--decode-share` | `0.5` | Decode time owed per unit of prefill time while other requests generate. Higher keeps their output faster during a long prompt and slows that prompt; `0` alternates one command each. |
 | `--disable-ane` | Off | Prefill on the GPU alone. By default a dense model's long prompts also use the Neural Engine when that is faster. See [Neural Engine prefill](#neural-engine-prefill). |
 | `--allow-idle-sleep` | Off | Let the Mac sleep automatically while requests run; by default it stays awake until they finish (the display may still sleep). |
+| `--share-gpu` | Off | For several Splash servers of one macOS user on one Mac: while another server started with `--share-gpu` decodes at the same or a higher priority, prefill runs in slices of about 0.5 s, as beside its own decoding requests, which slows that server's streams less. |
 
 Sizes (`--max-memory`, `--max-cache-disk`, `--max-request-size`) are a whole
 number of bytes, or one with a `K`, `M` or `G` suffix in binary units: `28G`
@@ -1931,12 +1932,23 @@ when no RAM slot took it, stays there. The persistent cache's hourly write limit
 does not pause these writes, and a full quota makes room for one by dropping the
 oldest copy, perhaps an older conversation's restore point.
 Contended prefill adapts toward a 500 ms slice, keeping
-2048-token chunks for long unopposed work. Without contention, a prompt that can
-finish within one 2048-token chunk ends its chunk at its last row instead of
-sharing it with a longer prompt. While requests of the same or a higher priority
-decode (a lane waiting for its token mask is owed nothing), each slice owes them
-decode time, `--decode-share` times its own, before the next slice runs. These
-policies do not extend client deadlines. Memory recovery waits are bounded:
+2048-token chunks for long unopposed work. Without contention, a prompt that
+can finish within one 2048-token chunk ends its chunk at its last row instead
+of sharing it with a longer prompt. While requests of the same or a higher
+priority decode (a lane waiting for its token mask is owed nothing), each slice
+owes them decode time, `--decode-share` times its own, before the next slice
+runs. With `--share-gpu`, the decoding requests of the user's other Splash
+servers on the Mac that run with it bound this server's prefill slices too, by
+the same priority rule, though they take no precedence here and are owed no
+decode time: each server holds a lock on the highest priority it decodes at in
+`splash-gpu/decoding` of the per-user cache directory, which the kernel drops
+when the server ends, and `/status` shows the highest priority another server
+decodes at as `scheduler.other_servers_decoding`. A server that cannot open the
+file does not start; one that later fails to use it stops sharing with a
+warning, and a file removed meanwhile is opened again. The GPU already
+interleaves the servers' commands; the shorter slices slow the other server's
+streams less while the long prompt here takes longer. These policies do not
+extend client deadlines. Memory recovery waits are bounded:
 after a suspension, new work waits for resident requests only while memory is
 still short, and at most for the 30 s resource wait; suspended requests then
 resume first, each within its own resource wait. A request of a strictly higher

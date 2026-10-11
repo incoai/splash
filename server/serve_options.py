@@ -548,6 +548,18 @@ SERVE_OPTIONS = (
             "stays awake until they finish; the display may still sleep)",
         ),
     ),
+    ServeOption(
+        "--share-gpu",
+        "requests",
+        dict(
+            action="store_true",
+            default=False,
+            help="while another of this user's Splash servers on this Mac started "
+            "with --share-gpu decodes at the same or a higher priority, prefill "
+            "in commands of about 0.5 s, which slows its streams less "
+            "(default: off)",
+        ),
+    ),
 )
 
 
