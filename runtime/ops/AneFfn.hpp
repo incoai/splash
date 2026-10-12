@@ -3,6 +3,7 @@
 #include "ane/Handoff.hpp"
 #include "ane/Program.hpp"
 #include "metal/CommandGraph.hpp"
+#include "metal/abi/AneFfn.h"
 #include "metal/abi/ExecutionGeometry.h"
 #include "ops/AneFfnCalibration.hpp"
 #include "ops/Linear.hpp"
@@ -21,6 +22,11 @@ namespace splash::ops {
 namespace ane_ffn {
 class Measurement;
 } // namespace ane_ffn
+
+// The Hadamard signs D of the split's rotations R = D H / sqrt(n) of inputs,
+// weights and the ANE's intermediate rows alike, which the GPU's int8 FFN
+// (ops/Int8Ffn.hpp) shares: a block of n values takes the first n.
+[[nodiscard]] std::array<float, ANE_FFN_INTERMEDIATE_BLOCK> aneFfnRotationSigns();
 
 // The dense FFN of a prefill chunk split by intermediate channel between the
 // GPU and the Neural Engine. The GPU runs the leading channels with its

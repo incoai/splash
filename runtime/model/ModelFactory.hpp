@@ -19,6 +19,7 @@
 
 namespace splash::ops {
 class AneFfn;
+class Int8Ffn;
 } // namespace splash::ops
 
 namespace splash::model {
@@ -79,6 +80,9 @@ struct RuntimeContext final {
   const ops::ExecutionPlans &operators;
   // The prefill FFN's Neural Engine split (engine::startAneFfn), if any.
   ops::AneFfn *aneFfn = nullptr;
+  // The GPU's int8 prefill FFN, if any, which the chunks the split does not
+  // take and it takes run (ops::Int8Ffn::takes).
+  ops::Int8Ffn *int8Ffn = nullptr;
 };
 
 // Validates only the interface between independently defined target and draft

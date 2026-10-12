@@ -103,7 +103,7 @@ access.
 | `--request-timeout` | None | Time a request may take from its arrival; a request's own `timeout` can only shorten it. |
 | `--queue-size` | `32` | Requests admitted at once, running or waiting; more get 503 with `Retry-After`. |
 | `--decode-share` | `0.5` | Decode time owed per unit of prefill time while other requests generate. Higher keeps their output faster during a long prompt and slows that prompt; `0` alternates one command each. |
-| `--disable-ane` | Off | Prefill on the GPU alone. By default a dense model's long prompts also use the Neural Engine when that is faster. See [Neural Engine prefill](#neural-engine-prefill). |
+| `--disable-ane` | Off | Prefill on the GPU alone. By default a dense model's long prompts also use the Neural Engine when that is faster, except on an M5 or later, whose GPU runs their FFN in int8 instead. See [Neural Engine prefill](#neural-engine-prefill) and [GPU int8 prefill](#gpu-int8-prefill). |
 | `--allow-idle-sleep` | Off | Let the Mac sleep automatically while requests run; by default it stays awake until they finish (the display may still sleep). |
 
 Sizes (`--max-memory`, `--max-cache-disk`, `--max-request-size`) are a whole
@@ -1811,6 +1811,40 @@ changed method signature fail as `std::runtime_error`. `make test-real` runs
 the model runtime oracle with the GPU alone and with the split as a start makes
 it, which must not be unavailable, and whose automatic context must be what the
 plan holds with the split it runs.
+
+### GPU int8 prefill
+
+On an M5 or later GPU (Apple10), whose int8 matmul runs at about twice its bf16
+rate, prefill chunks of 256 rows or more of a dense target run each layer's FFN
+in int8 by the [Neural Engine split](#neural-engine-prefill)'s W8A8 algorithm
+(`runtime/ops/Int8Ffn.cpp`, `kernels/prefill/int8_ffn.metal`): the normalized
+rows rotated in Hadamard blocks of 128 and the intermediate rows in blocks of
+512, with the split's signs, each quantized to int8 per token, and the weights
+rotated alike and quantized to int8 per row, under scales startup computes once.
+MPP `matmul2d` multiplies them into int32, and each output takes its token's and
+its row's scales in fp32; gate and up run as one dispatch whose epilogue applies
+silu, down as one that adds the residual. The model keeps its weights as they
+are: a command converts each layer's from its planes into one set of int8 rows
+every layer reuses, each GEMM dispatch converting the next one's beside its own
+tiles (gate and up's down's, down's the next layer's gate and up) in
+threadgroups past the GEMM's on a 2D grid, whose order keeps the weight tiles
+cached (a 1D grid ran the GEMM 21% slower). Int4 weight codes (W4A8) ran no
+faster, the GEMM being compute-bound, and requantizing the rotated weights to 4
+bits left 40 times the KL. On Qwen3.8-27B on an M5 Max an FFN layer of 2048
+rows takes 13.9 ms against 22.9 on the bf16 kernels, 512 rows 4.5 against 5.9
+and 256 rows break even, so smaller chunks keep the bf16 kernels; the matmuls
+run at about 92 TOPS, the conversion takes about 1.5 ms a layer. A 2048-token
+prefill takes 1694 against 2273 ms (MLX 4-bit) and 1748 against 2317 ms
+(UD-Q4_K_M). The FFN's output differs from the bf16 kernels' by 2-3% RMS, as
+the split's int8 does, and the logits by a KL of about 5e-4 (24 prompts of 512
+to 2048 tokens, the top token unchanged). Its buffers are a memory category of
+their own (`GPU int8 FFN`, 309 MiB on Qwen3.8-27B), out of the KV cache. The
+Neural Engine split, 1.2x at best there, stays off, and `--disable-ane` leaves
+the int8 FFN on; earlier GPUs run the kernels no faster than bf16 and keep the
+bf16 kernels. `make test-engine-metal` runs `int8-ffn`: the layers, GPUs and
+chunks it takes, its output against the bf16 kernels' on MLX and GGUF layers at
+256, 300 and 2048 rows and with a hidden channel of about 1e5, the rows past a
+chunk untouched, and a layer added out of order.
 
 ### Residency and KV extents
 

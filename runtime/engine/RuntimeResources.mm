@@ -248,7 +248,7 @@ RuntimeResources::RuntimeResources(
     std::unique_ptr<KvPageTier> kvTier,
     std::unique_ptr<KvPool> kvPool, std::unique_ptr<engine::Cache> cache,
     std::unique_ptr<ops::AneFfn> aneFfn, AneFfnOutcome aneFfnOutcome,
-    std::optional<uint64_t> hostAvailableAtStart)
+    std::unique_ptr<ops::Int8Ffn> int8Ffn, std::optional<uint64_t> hostAvailableAtStart)
     : persistentCache_(std::move(persistentCache)),
       backend_(std::move(backend)), model_(std::move(model)),
       operators_(std::move(operators)),
@@ -259,7 +259,8 @@ RuntimeResources::RuntimeResources(
       kvPool_(std::move(kvPool)),
       cache_(std::move(cache)), aneFfn_(std::move(aneFfn)),
       releasableMemory_(*model_.images, idleSplit(aneFfn_.get())),
-      aneFfnOutcome_(std::move(aneFfnOutcome)), hostAvailableAtStart_(hostAvailableAtStart) {}
+      aneFfnOutcome_(std::move(aneFfnOutcome)), int8Ffn_(std::move(int8Ffn)),
+      hostAvailableAtStart_(hostAvailableAtStart) {}
 
 std::unique_ptr<RuntimeResources>
 RuntimeResources::create(const RuntimeResourcesConfig &config,
@@ -413,6 +414,12 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         RuntimeResourceStage::MemoryPlanning,
         std::string("model allocated-size plan is invalid: ") + error.what());
   }
+  // A dense target's prefill FFN runs in int8 on the GPU of an M5 or later,
+  // whose int8 matmul outruns the Neural Engine split there; elsewhere it may
+  // split with the Neural Engine.
+  const std::vector<ops::SwiGluProjections> ffnLayers = model::aneFfnLayers(loaded);
+  const bool int8 = !ffnLayers.empty() && !ops::Int8Ffn::unsupported(device, ffnLayers);
+  const uint64_t int8FfnBytes = int8 ? ops::Int8Ffn::plannedBytes(ffnLayers) : 0;
   // The engine's memory plan, with `aneFfnBytes` set aside for the prefill
   // FFN's Neural Engine split.
   const auto planMemory = [&](uint64_t aneFfnBytes) {
@@ -423,6 +430,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         modelMemoryPlan,
         stateStagingBytes,
         aneFfnBytes,
+        int8FfnBytes,
     };
     ModelMemoryProfile modelProfile{
         loaded.name(), loaded.maximumContextTokens(),
@@ -463,12 +471,18 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
       memoryGovernor->setPressure(config.memoryPressure());
     logLine("Kernel policy for GPU family ", device.appleGpuFamily,
             " with ", device.gpuCoreCount, " cores.");
-    AneFfnStart aneFfn =
-        startAneFfn(aneFfnModel(*backend, loaded, operators, config.kvFormat, config.buildId, config.cancelled),
-                    config.aneFfn,
-                    requestedContextTokens, planMemory, config.cancelled);
+    AneFfnModel aneModel =
+        aneFfnModel(*backend, loaded, operators, config.kvFormat, config.buildId, config.cancelled);
+    if (int8) aneModel.unsupported = "its int8 FFN outruns the Neural Engine split on an M5 or later";
+    AneFfnStart aneFfn = startAneFfn(aneModel, config.aneFfn, requestedContextTokens, planMemory, config.cancelled);
     if (aneFfn.plan)
       memoryPlan = std::move(*aneFfn.plan);
+    std::unique_ptr<ops::Int8Ffn> int8Ffn;
+    if (int8) {
+      int8Ffn = std::make_unique<ops::Int8Ffn>(*backend, ffnLayers);
+      logLine("The GPU runs the prefill FFN of chunks of ", ops::Int8Ffn::kMinimumRows,
+              " rows or more in int8, rotated as the Neural Engine split rotates its own.");
+    }
     const EngineMemoryBreakdown &budget = memoryPlan.breakdown();
 
     // Page ids for every extent the hard budget could hold: the governor,
@@ -539,7 +553,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         std::move(operators), std::move(memoryPlan), std::move(cacheIdentity),
         std::move(memoryGovernor), std::move(kvPages), std::move(stateStorage),
         std::move(kvTier), std::move(kvPool), std::move(cache),
-        std::move(aneFfn.split), std::move(aneFfn.outcome), hostAvailableAtStart));
+        std::move(aneFfn.split), std::move(aneFfn.outcome), std::move(int8Ffn), hostAvailableAtStart));
     result->adoptPersistentCache();
     return result;
   } catch (const metal::MetalAllocationError &error) {
@@ -653,6 +667,7 @@ model::RuntimeContext RuntimeResources::modelContext() noexcept {
       *stateStorage_,
       operators_,
       aneFfn_.get(),
+      int8Ffn_.get(),
   };
 }
 
@@ -685,6 +700,7 @@ ActualMemoryReport RuntimeResources::actualMemoryReport(
   report.kvAllocatedBytes = kvPool_->allocatedBytes();
   report.stateStagingBytes = modelMemory.stateStagingBytes;
   report.aneFfnBytes = aneFfn_ ? aneFfn_->allocatedBytes() : 0;
+  report.int8FfnBytes = int8Ffn_ ? int8Ffn_->allocatedBytes() : 0;
   // Optional warmup may end with a rolled-back allocation and no subsequent
   // command. Refresh the current counts after that rollback; peaks stay intact.
   metal::MetalMemoryStats memory = backend_->refreshMemoryStats();

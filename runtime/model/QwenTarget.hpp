@@ -22,6 +22,7 @@
 
 namespace splash::ops {
 class AneFfn;
+class Int8Ffn;
 } // namespace splash::ops
 
 namespace splash::model {
@@ -254,11 +255,13 @@ public:
 
   // Returns the hidden buffer that holds the last layer's output rows. The
   // dense FFN of a chunk the split takes (AneFfn::splits) runs split with the
-  // Neural Engine on `aneFfn`, when given.
+  // Neural Engine on `aneFfn`, when given; otherwise one Int8Ffn::takes runs
+  // in int8 on `int8Ffn`, when given.
   [[nodiscard]] metal::MetalBuffer addPrefill(
       metal::CommandGraph &graph, QwenTargetPrefillBuffers buffers,
       std::span<const QwenTargetPrefillSequence> sequences, uint32_t rows,
-      std::span<const SplashKvLayer> kvLayers, ops::AneFfn *aneFfn = nullptr) const;
+      std::span<const SplashKvLayer> kvLayers, ops::AneFfn *aneFfn = nullptr,
+      ops::Int8Ffn *int8Ffn = nullptr) const;
   void addVerify(
       metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
       std::span<const SplashKvLayer> kvLayers,

@@ -20,6 +20,14 @@
 #include <utility>
 
 namespace splash::ops {
+
+std::array<float, ANE_FFN_INTERMEDIATE_BLOCK> aneFfnRotationSigns() {
+  std::mt19937 generator(20260930);
+  std::array<float, ANE_FFN_INTERMEDIATE_BLOCK> signs{};
+  for (float &sign : signs) sign = (generator() & 1) ? -1.0f : 1.0f;
+  return signs;
+}
+
 namespace {
 
 using Element = ane::Surface::Element;
@@ -111,15 +119,6 @@ uint32_t blockOf(Rotation rotation) {
 }
 std::string kernel(const char *name, Rotation rotation) {
   return std::string(name) + (rotation == Rotation::Inputs ? "_inputs" : "_intermediate");
-}
-
-// The Hadamard signs D of the rotations R = D H / sqrt(n) of inputs, weights
-// and the ANE's intermediate rows alike: a block of n values takes the first n.
-std::array<float, ANE_FFN_INTERMEDIATE_BLOCK> rotationSigns() {
-  std::mt19937 generator(20260930);
-  std::array<float, ANE_FFN_INTERMEDIATE_BLOCK> signs{};
-  for (float &sign : signs) sign = (generator() & 1) ? -1.0f : 1.0f;
-  return signs;
 }
 
 // The program's constant: the rotation of each of the ANE's intermediate
@@ -407,7 +406,7 @@ AneFfn::AneFfn(metal::MetalBackend &backend, std::span<const SwiGluProjections> 
         allocatedBytes_ += surface.buffer.allocatedBytes();
         return surface;
       });
-  const std::array<float, ANE_FFN_INTERMEDIATE_BLOCK> signs = rotationSigns();
+  const std::array<float, ANE_FFN_INTERMEDIATE_BLOCK> signs = aneFfnRotationSigns();
   std::memcpy(memory_.signs.contents(), signs.data(), sizeof signs);
   *static_cast<uint32_t *>(memory_.status.contents()) = 0;
 

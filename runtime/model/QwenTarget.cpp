@@ -4,6 +4,7 @@
 #include "model/Qwen3_8.hpp"
 #include "model/WeightStore.hpp"
 #include "ops/AneFfn.hpp"
+#include "ops/Int8Ffn.hpp"
 #include "ops/Embedding.hpp"
 #include "ops/Normalization.hpp"
 #include "ops/RowCopy.hpp"
@@ -167,6 +168,7 @@ struct QwenTarget::PrefillStep {
   std::vector<ops::PrefillAttentionPlan> attention{};
   std::optional<ops::MoePlan> moe{};
   ops::AneFfn *aneFfn = nullptr;
+  ops::Int8Ffn *int8Ffn = nullptr;
   uint32_t gdnLayer = 0;
   uint32_t attentionLayer = 0;
 };
@@ -187,7 +189,7 @@ struct QwenTarget::VerifyStep {
 metal::MetalBuffer QwenTarget::addPrefill(
     metal::CommandGraph &graph, QwenTargetPrefillBuffers buffers,
     std::span<const QwenTargetPrefillSequence> sequences, uint32_t rows,
-    std::span<const SplashKvLayer> kvLayers, ops::AneFfn *aneFfn) const {
+    std::span<const SplashKvLayer> kvLayers, ops::AneFfn *aneFfn, ops::Int8Ffn *int8Ffn) const {
   if (sequences.empty() ||
       sequences.size() > ExecutionLimits::maximumBatchWidth || !rows ||
       rows > ExecutionLimits::prefillTokenBudget ||
@@ -208,6 +210,7 @@ metal::MetalBuffer QwenTarget::addPrefill(
         sequence.rows, geometry_.attentionQueryHeads, geometry_.kvLayout));
   if (geometry_.ffnKind == QwenFfnKind::SparseMoe) step.moe = operators_.moePrefill(geometry_.moeShape(), rows);
   if (aneFfn && aneFfn->splits(rows)) step.aneFfn = aneFfn;
+  else if (int8Ffn && int8Ffn->takes(rows)) step.int8Ffn = int8Ffn;
   std::visit([&](const auto *weights) {
     for (uint32_t index = 0; index < geometry_.layers; ++index) {
       const auto &layer = weights->layers[index];
@@ -315,6 +318,8 @@ void QwenTarget::addPrefillFfn(PrefillStep &step, uint32_t index, const Qwen3_8L
   const ops::PrefillFfnBuffers ffn = step.buffers.ffn();
   if (step.aneFfn)
     step.aneFfn->add(step.graph, index, ffn, residual, output, step.rows);
+  else if (step.int8Ffn)
+    step.int8Ffn->add(step.graph, index, ffn, residual, output, step.rows);
   else
     operators_.linear().addPrefillSwiGlu(step.graph, {&layer.gateProjection, &layer.upProjection,
                                                       &layer.downProjection},

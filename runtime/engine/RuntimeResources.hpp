@@ -14,6 +14,7 @@
 #include "engine/ReleasableMemory.hpp"
 #include "engine/Status.hpp"
 #include "ops/ExecutionPlans.hpp"
+#include "ops/Int8Ffn.hpp"
 
 #include <condition_variable>
 #include <cstdint>
@@ -243,7 +244,7 @@ private:
                    std::unique_ptr<KvPool> kvPool,
                    std::unique_ptr<engine::Cache> cache,
                    std::unique_ptr<ops::AneFfn> aneFfn, AneFfnOutcome aneFfnOutcome,
-                   std::optional<uint64_t> hostAvailableAtStart);
+                   std::unique_ptr<ops::Int8Ffn> int8Ffn, std::optional<uint64_t> hostAvailableAtStart);
   // Takes back the restore points the last process left in a persistent
   // tier (Cache::adopt) and opens its files for this one.
   void adoptPersistentCache();
@@ -265,6 +266,8 @@ private:
   // Over model_'s images and aneFfn_.
   ReleasableMemory releasableMemory_;
   AneFfnOutcome aneFfnOutcome_;
+  // The GPU's int8 prefill FFN, on an M5 or later (ops::Int8Ffn::unsupported).
+  std::unique_ptr<ops::Int8Ffn> int8Ffn_;
   std::optional<uint64_t> hostAvailableAtStart_;
   // Ends a probation once it has lasted, unless the process stops first.
   std::thread probation_;
