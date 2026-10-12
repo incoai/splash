@@ -1641,6 +1641,8 @@ def _native_command(args):
         )
     if args.allow_idle_sleep:
         command.extend(("--idle-sleep", "allow"))
+    if args.share_gpu:
+        command.extend(("--share-gpu", "on"))
     return command
 
 

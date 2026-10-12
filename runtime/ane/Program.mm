@@ -1,6 +1,7 @@
 #import "ane/Program.hpp"
 
 #include "Checked.hpp"
+#include "UserCacheDirectory.hpp"
 #ifdef SPLASH_ANE_INSTRUMENTATION
 #include "ane/ProgramInstrumentation.hpp"
 #endif
@@ -17,7 +18,6 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <climits>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
@@ -372,12 +372,7 @@ std::filesystem::path rememberedFile(std::string_view key) {
 
 } // namespace
 
-std::filesystem::path cacheDirectory() {
-  char path[PATH_MAX];
-  const size_t size = confstr(_CS_DARWIN_USER_CACHE_DIR, path, sizeof path);
-  if (!size || size > sizeof path) throw std::runtime_error("macOS names no per-user cache directory");
-  return std::filesystem::path(path) / "splash-ane";
-}
+std::filesystem::path cacheDirectory() { return userCacheDirectory() / "splash-ane"; }
 
 std::optional<std::string> unavailable() {
   try {

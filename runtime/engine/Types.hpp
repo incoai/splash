@@ -10,7 +10,9 @@
 
 namespace splash::engine {
 
-// Values are the native request frame's priority byte.
+// Values are the native request frame's priority byte, and the byte of
+// splash-gpu/decoding that servers of any version lock to share the GPU
+// (GpuShare): they do not change.
 enum class RequestPriority : uint8_t {
   Foreground = 0,
   Normal = 1,

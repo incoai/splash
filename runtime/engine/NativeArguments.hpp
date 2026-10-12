@@ -41,6 +41,10 @@ struct NativeArguments final {
   // Neural Engine when that is faster (splash serve --disable-ane turns it
   // off).
   bool neuralEngine = true;
+  // --share-gpu on|off: whether this server tells the other Splash servers on
+  // this Mac that share the GPU the highest priority it decodes at, and their
+  // decoders bound its prefill commands (engine::GpuShare).
+  bool shareGpu = false;
 };
 
 // Reads `serve-native MODEL_DIRECTORY MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto

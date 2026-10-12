@@ -61,6 +61,12 @@ struct EngineConfig final {
   // which the pause does not hold back, and clears the mark
   // (MemoryGovernor::setServing).
   std::function<void(bool)> serving;
+  // With --share-gpu, the exchange with the other Splash servers on this Mac
+  // (GpuShare::exchange): before it plans a command, the engine gives the
+  // highest priority it decodes at and takes the highest another server
+  // decodes at, whose decoders then bound its prefill commands as its own do.
+  std::function<std::optional<RequestPriority>(std::optional<RequestPriority>)>
+      exchangeDecoding;
 };
 
 // While an active one lives, allocations are memory a request in service

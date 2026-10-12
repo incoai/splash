@@ -52,6 +52,9 @@ struct SchedulerSnapshot final {
   uint64_t decodeBatches = 0;
   std::array<uint64_t, model::ExecutionLimits::maximumBatchWidth>
       decodeBatchesByWidth{};
+  // The highest priority another Splash server on this Mac decodes at, as
+  // last set (setOtherServersDecoding).
+  std::optional<RequestPriority> otherServersDecoding;
 };
 
 // One single-owner scheduling policy. Prefill batches the shortest remaining
@@ -96,6 +99,14 @@ public:
   // while it lasts: the plan takes one tier, the highest among resident
   // prefill lanes and candidates, and is dropped when a higher tier decodes.
   [[nodiscard]] std::optional<RequestPriority> highestRunnablePriority() const noexcept;
+  // The highest priority among requests that decode or wait for a mask.
+  [[nodiscard]] std::optional<RequestPriority> decodingPriority() const noexcept;
+  // The highest priority another Splash server on this Mac decodes at
+  // (EngineConfig::exchangeDecoding): its decoders bound prefill commands as
+  // this server's own do.
+  void setOtherServersDecoding(std::optional<RequestPriority> priority) noexcept {
+    otherServersDecoding_ = priority;
+  }
   // The next command, planned without the excluded lanes: those that wait
   // for memory on its way back and cannot run before it lands.
   [[nodiscard]] std::optional<BatchPlan> next(std::span<const uint64_t> excluded) const;
@@ -170,6 +181,7 @@ private:
   // (not those waiting for a mask): equal-priority decode runs until its
   // commands' wall time has worked it off.
   double decodeDebtMilliseconds_ = 0.0;
+  std::optional<RequestPriority> otherServersDecoding_;
   std::optional<WorkKind> lastCommittedKind_;
   SchedulerSnapshot counters_;
 };
