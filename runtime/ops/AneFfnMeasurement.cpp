@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -12,8 +13,13 @@
 namespace splash::ops::ane_ffn {
 namespace {
 
-// The shares calibration times the split at.
-constexpr std::array<double, 2> kTimedShares{0.4, 0.8};
+// The shares calibration times the split at, a low one where the GPU's part
+// takes the longer and a high one where the ANE's does (fit()): with the
+// GPU's part on the bf16 kernels, and in int8, which runs it 1.6 times as
+// fast on an M5 Max and moves the best share from about 0.3 to about 0.2
+// there (0.15 and 0.5 also straddle the best int8 share of an M5 Pro's and
+// an M5's slower GPUs).
+constexpr std::array<double, 2> kTimedShares{0.4, 0.8}, kInt8TimedShares{0.15, 0.5};
 // The layers time() spreads over the model; each of its commands takes all
 // but the last, which gives the last one's next weights to stage.
 constexpr uint32_t kSampledLayers = 5;
@@ -34,9 +40,9 @@ double median(const std::function<double()> &run) {
 
 Measurement::Measurement(metal::MetalBackend &backend, std::span<const SwiGluProjections> layers,
                          const PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden,
-                         std::function<bool()> interrupted)
+                         std::function<bool()> interrupted, Int8Ffn *int8)
     : backend_(backend), layers_(layers), ffn_(ffn), hidden_(hidden), interrupted_(std::move(interrupted)),
-      linear_(backend.capabilities()) {
+      int8_(int8), linear_(backend.capabilities()) {
   if (const char *reason = AneFfn::unsupported(layers)) throw std::invalid_argument(reason);
   if (layers.size() < 2) throw std::invalid_argument("ANE FFN split timed on fewer than two layers");
   // Timing does not depend on the values, but on their being finite.
@@ -57,9 +63,11 @@ Measurement::Measurement(metal::MetalBackend &backend, std::span<const SwiGluPro
 // the jitter of the handoffs and the staging of the first layer's weights,
 // which a prefill's command does once, average out, and the median of kRuns
 // gives a layer's milliseconds. Each layer timed stages the next one's
-// weights.
+// weights. The stand-in runs on the bf16 kernels also when the split's GPU
+// part runs in int8, sharing the int8 FFN's scratch, which its own layers
+// in the same command would overwrite.
 double Measurement::layer(std::span<const SwiGluProjections> layers, uint32_t count, uint32_t rows, AneFfn *split,
-                          double standIn) {
+                          double standIn, Int8Ffn *int8) {
   if (!count || count >= layers.size()) throw std::invalid_argument("ANE FFN layers timed without one to stage");
   const auto command = [&] {
     metal::CommandGraph graph;
@@ -68,6 +76,8 @@ double Measurement::layer(std::span<const SwiGluProjections> layers, uint32_t co
       if (split) {
         linear_.addPrefillSwiGlu(graph, layers[index], ffn_, hidden_[0], hidden_[1], rows);
         split->add(graph, index, ffn_, hidden_[1], hidden_[0], rows);
+      } else if (int8) {
+        int8->add(graph, index, ffn_, hidden_[1], hidden_[0], rows);
       } else {
         linear_.addPrefillSwiGlu(graph, layers[index], ffn_, hidden_[1], hidden_[0], rows);
       }
@@ -116,16 +126,22 @@ Timings Measurement::time() {
   for (uint32_t index = 0; index < kSampledLayers; ++index)
     sampled.push_back(layers_[index * (layers_.size() - 1) / (kSampledLayers - 1)]);
   constexpr uint32_t kRows = AneFfn::kMaximumRows, kCount = kSampledLayers - 1;
+  // The int8 FFN of the sampled layers, sharing the model's one's scratch.
+  std::optional<Int8Ffn> int8;
+  if (int8_) int8.emplace(backend_, sampled, int8_);
   Timings timings;
-  timings.gpuAlone = layer(sampled, kCount, kRows);
+  // The split layer's stand-in, on the bf16 kernels (layer()).
+  const double standIn = layer(sampled, kCount, kRows);
+  timings.gpuAlone = int8 ? layer(sampled, kCount, kRows, nullptr, 0.0, &*int8) : standIn;
   const auto measure = [&](double share) {
     const uint32_t aneUnits = nearestUnits(share, units);
-    AneFfn split(backend_, sampled, aneUnits, interrupted_, std::array{kRows});
+    AneFfn split(backend_, sampled, aneUnits, interrupted_, std::array{kRows}, int8 ? &*int8 : nullptr);
     return Timing{static_cast<double>(aneUnits) / units, gpuPart(sampled, split),
-                  layer(sampled, kCount, kRows, &split, timings.gpuAlone)};
+                  layer(sampled, kCount, kRows, &split, standIn)};
   };
-  timings.low = measure(kTimedShares[0]);
-  timings.high = measure(kTimedShares[1]);
+  const std::array<double, 2> &shares = int8 ? kInt8TimedShares : kTimedShares;
+  timings.low = measure(shares[0]);
+  timings.high = measure(shares[1]);
   return timings;
 }
 
@@ -136,9 +152,14 @@ ChunkTimings Measurement::chunks(AneFfn &split) {
   const auto count = [&](uint32_t chunk) {
     return static_cast<uint32_t>(std::clamp<size_t>(kCommandRows / chunk, 1, layers_.size() - 1));
   };
-  const auto gpu = [&](uint32_t chunk) { return ChunkTimings::Gpu{chunk, layer(layers_, count(chunk), chunk)}; };
-  ChunkTimings timings{{gpu(rows.front()), gpu(rows.back())}, {}};
-  const auto &[low, high] = timings.gpu;
+  const auto gpu = [&](uint32_t chunk, Int8Ffn *int8) {
+    return ChunkTimings::Gpu{chunk, layer(layers_, count(chunk), chunk, nullptr, 0.0, int8)};
+  };
+  ChunkTimings timings{{gpu(rows.front(), int8_), gpu(rows.back(), int8_)}, {}};
+  // The stand-in's line, on the bf16 kernels (layer()).
+  const std::array<ChunkTimings::Gpu, 2> standIn =
+      int8_ ? std::array{gpu(rows.front(), nullptr), gpu(rows.back(), nullptr)} : timings.gpu;
+  const auto &[low, high] = standIn;
   const double slope = (high.milliseconds - low.milliseconds) / (high.rows - low.rows);
   for (size_t function = rows.size(); function-- > 0;)
     timings.functions.push_back({function ? rows[function - 1] + 1 : rows.front(), rows[function],

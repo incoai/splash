@@ -283,9 +283,12 @@ private:
 // remembered beside the programs (ane::recall) under its layers' shapes and
 // formats, the device, the macOS version, the engine's `buildId` and the
 // most units the plan holds.
+// With `int8`, the GPU's int8 FFN of the model, the split runs its GPU part
+// in int8 and is timed and checked against it (ops::AneFfn).
 [[nodiscard]] AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &loaded,
                                       const ops::ExecutionPlans &operators, kv::Format format,
-                                      std::string_view buildId, std::function<bool()> cancelled);
+                                      std::string_view buildId, std::function<bool()> cancelled,
+                                      ops::Int8Ffn *int8 = nullptr);
 
 // Connects an engine to the governor that admits its memory: the engine asks
 // it whether the host pauses growth, and marks the allocations a request in

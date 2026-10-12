@@ -471,18 +471,17 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
       memoryGovernor->setPressure(config.memoryPressure());
     logLine("Kernel policy for GPU family ", device.appleGpuFamily,
             " with ", device.gpuCoreCount, " cores.");
-    AneFfnModel aneModel =
-        aneFfnModel(*backend, loaded, operators, config.kvFormat, config.buildId, config.cancelled);
-    if (int8) aneModel.unsupported = "its int8 FFN outruns the Neural Engine split on an M5 or later";
-    AneFfnStart aneFfn = startAneFfn(aneModel, config.aneFfn, requestedContextTokens, planMemory, config.cancelled);
-    if (aneFfn.plan)
-      memoryPlan = std::move(*aneFfn.plan);
     std::unique_ptr<ops::Int8Ffn> int8Ffn;
     if (int8) {
       int8Ffn = std::make_unique<ops::Int8Ffn>(*backend, ffnLayers);
       logLine("The GPU runs the prefill FFN of chunks of ", ops::Int8Ffn::kMinimumRows,
               " rows or more in int8, rotated as the Neural Engine split rotates its own.");
     }
+    AneFfnStart aneFfn = startAneFfn(
+        aneFfnModel(*backend, loaded, operators, config.kvFormat, config.buildId, config.cancelled, int8Ffn.get()),
+        config.aneFfn, requestedContextTokens, planMemory, config.cancelled);
+    if (aneFfn.plan)
+      memoryPlan = std::move(*aneFfn.plan);
     const EngineMemoryBreakdown &budget = memoryPlan.breakdown();
 
     // Page ids for every extent the hard budget could hold: the governor,
@@ -715,7 +714,7 @@ ActualMemoryReport RuntimeResources::actualMemoryReport(
 
 AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &loaded,
                         const ops::ExecutionPlans &operators, kv::Format format, std::string_view buildId,
-                        std::function<bool()> cancelled) {
+                        std::function<bool()> cancelled, ops::Int8Ffn *int8) {
   auto layers = std::make_shared<const std::vector<ops::SwiGluProjections>>(model::aneFfnLayers(loaded));
   AneFfnModel model;
   model.dense = !layers->empty();
@@ -726,29 +725,32 @@ AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &
   }
   model.unavailable = [] { return ane::unavailable(); };
   model.units = ops::AneFfn::units(*layers);
-  model.plannedBytes = [layers](uint32_t aneUnits) { return ops::AneFfn::plannedBytes(*layers, aneUnits); };
+  model.plannedBytes = [layers, int8](uint32_t aneUnits) {
+    return ops::AneFfn::plannedBytes(*layers, aneUnits, int8 != nullptr);
+  };
   const auto onArena = [&backend, &loaded, &operators, format](const auto &use) {
     model::withPrefillArena(backend, loaded, operators, format, use);
   };
-  model.time = [&backend, layers, cancelled, onArena] {
+  model.time = [&backend, layers, cancelled, onArena, int8] {
     ops::ane_ffn::Timings timings;
     onArena([&](const ops::PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden) {
-      timings = ops::ane_ffn::Measurement(backend, *layers, ffn, hidden, cancelled).time();
+      timings = ops::ane_ffn::Measurement(backend, *layers, ffn, hidden, cancelled, int8).time();
     });
     return timings;
   };
-  model.prepare = [&backend, layers, cancelled, onArena](uint32_t aneUnits, bool timeChunks) {
+  model.prepare = [&backend, layers, cancelled, onArena, int8](uint32_t aneUnits, bool timeChunks) {
     AneFfnPrepared prepared;
     onArena([&](const ops::PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden) {
-      prepared.split = std::make_unique<ops::AneFfn>(backend, *layers, aneUnits, cancelled);
+      prepared.split = std::make_unique<ops::AneFfn>(backend, *layers, aneUnits, cancelled, int8);
       prepared.error = prepared.split->verify(*layers, ffn, hidden);
       if (timeChunks)
         prepared.chunks =
-            ops::ane_ffn::Measurement(backend, *layers, ffn, hidden, cancelled).chunks(*prepared.split);
+            ops::ane_ffn::Measurement(backend, *layers, ffn, hidden, cancelled, int8).chunks(*prepared.split);
     });
     return prepared;
   };
-  const std::string key = calibrationKey(*layers) + " device " + backend.capabilities().deviceName + " macos " +
+  const std::string key = calibrationKey(*layers) + (int8 ? " int8" : "") + " device " +
+                          backend.capabilities().deviceName + " macos " +
                           [[NSProcessInfo processInfo] operatingSystemVersionString].UTF8String + " build " +
                           std::string(buildId) + " most ";
   model.recall = [key](uint32_t maxAneUnits) -> std::optional<ops::ane_ffn::Calibration> {

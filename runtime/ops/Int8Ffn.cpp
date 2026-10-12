@@ -15,7 +15,7 @@ namespace splash::ops {
 Int8Ffn::Planes::Planes(const Projection &projection) {
   const QuantizedSegment &segment = projection.blocks().segments.front();
   requireSegmentPlanes(segment, "int8 FFN projection");
-  groups = projection.inputSize / 32;
+  groups = projection.planeInputSize() / 32;
   format = segment.formatId;
   buffers = {segment.plane0, segment.plane1Slot(), segment.meta};
 }
@@ -34,8 +34,11 @@ const char *Int8Ffn::unsupported(std::span<const SwiGluProjections> layers) {
   if (intermediate % ANE_FFN_INTERMEDIATE_BLOCK || intermediate % INT8_FFN_COLUMNS)
     return "int8 FFN needs an intermediate size of whole intermediate rotation blocks";
   for (const SwiGluProjections &layer : layers) {
-    for (const Projection *projection : {layer.gate, layer.up, layer.down})
-      if (!projection->takesPlaneViews()) return "int8 FFN needs unrotated quantized projections";
+    for (const Projection *projection : {layer.gate, layer.up, layer.down}) {
+      const std::vector<QuantizedSegment> &segments = projection->blocks().segments;
+      if (segments.size() != 1 || segments.front().isFloat() || projection->rotation)
+        return "int8 FFN needs unrotated quantized projections";
+    }
     if (layer.gate->outputSize != intermediate || layer.gate->inputSize != hidden ||
         layer.up->outputSize != intermediate || layer.up->inputSize != hidden || layer.down->outputSize != hidden ||
         layer.down->inputSize != intermediate)
@@ -49,12 +52,15 @@ Int8Ffn::Shape Int8Ffn::shapeOf(std::span<const SwiGluProjections> layers) {
   return {layers.front().gate->inputSize, layers.front().gate->outputSize, static_cast<uint32_t>(layers.size())};
 }
 
-template <class MakeBuffer> Int8Ffn::Memory Int8Ffn::allocate(const Shape &shape, MakeBuffer &&buffer) {
+template <class MakeBuffer>
+Int8Ffn::Memory Int8Ffn::allocate(const Shape &shape, MakeBuffer &&buffer, const Memory *scratch) {
   const uint64_t weights = uint64_t{shape.intermediate} * shape.hidden;
   Memory memory;
+  if (scratch) memory = *scratch;
   memory.signs = buffer(ANE_FFN_INTERMEDIATE_BLOCK * sizeof(float), "int8 ffn signs");
   memory.rowScales =
       buffer(uint64_t{shape.layers} * (2 * shape.intermediate + shape.hidden) * sizeof(float), "int8 ffn row scales");
+  if (scratch) return memory;
   memory.gate = buffer(weights, "int8 ffn gate");
   memory.up = buffer(weights, "int8 ffn up");
   memory.down = buffer(weights, "int8 ffn down");
@@ -65,23 +71,36 @@ template <class MakeBuffer> Int8Ffn::Memory Int8Ffn::allocate(const Shape &shape
   return memory;
 }
 
-uint64_t Int8Ffn::plannedBytes(std::span<const SwiGluProjections> layers) {
+uint64_t Int8Ffn::plannedBytes(uint32_t hidden, uint32_t intermediate, uint32_t layers, bool shared) {
   uint64_t bytes = 0;
-  static_cast<void>(allocate(shapeOf(layers), [&](uint64_t size, const char *) {
-    bytes += alignUp(size);
-    return metal::MetalBuffer{};
-  }));
+  const Memory scratch;
+  static_cast<void>(allocate(
+      {hidden, intermediate, layers},
+      [&](uint64_t size, const char *) {
+        bytes += alignUp(size);
+        return metal::MetalBuffer{};
+      },
+      shared ? &scratch : nullptr));
   return bytes;
 }
+uint64_t Int8Ffn::plannedBytes(std::span<const SwiGluProjections> layers) {
+  const Shape shape = shapeOf(layers);
+  return plannedBytes(shape.hidden, shape.intermediate, shape.layers, false);
+}
 
-Int8Ffn::Int8Ffn(metal::MetalBackend &backend, std::span<const SwiGluProjections> layers)
+Int8Ffn::Int8Ffn(metal::MetalBackend &backend, std::span<const SwiGluProjections> layers, const Int8Ffn *scratch)
     : backend_(backend), shape_(shapeOf(layers)) {
   if (const char *reason = unsupported(layers)) throw std::invalid_argument(reason);
-  memory_ = allocate(shape_, [&](uint64_t bytes, const char *label) {
-    metal::MetalBuffer buffer = backend_.allocateBuffer(bytes, metal::BufferStorage::Shared, label);
-    allocatedBytes_ += buffer.allocatedBytes();
-    return buffer;
-  });
+  if (scratch && (scratch->shape_.hidden != shape_.hidden || scratch->shape_.intermediate < shape_.intermediate))
+    throw std::invalid_argument("int8 FFN shares the scratch of an FFN of another shape");
+  memory_ = allocate(
+      shape_,
+      [&](uint64_t bytes, const char *label) {
+        metal::MetalBuffer buffer = backend_.allocateBuffer(bytes, metal::BufferStorage::Shared, label);
+        allocatedBytes_ += buffer.allocatedBytes();
+        return buffer;
+      },
+      scratch ? &scratch->memory_ : nullptr);
   const std::array<float, ANE_FFN_INTERMEDIATE_BLOCK> signs = aneFfnRotationSigns();
   std::memcpy(memory_.signs.contents(), signs.data(), sizeof signs);
   for (const SwiGluProjections &layer : layers)

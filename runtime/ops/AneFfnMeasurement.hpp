@@ -16,11 +16,14 @@ namespace splash::ops::ane_ffn {
 // begin(), its layers as add() encodes them, commit() and its completion
 // check (layer() in AneFfnMeasurement.cpp). A program it compiles waits for
 // the ANE's service until `interrupted` returns true. Each duration passes
-// usable() where it is measured.
+// usable() where it is measured. With `int8`, the GPU's int8 FFN of
+// `layers`, the GPU alone is that FFN and the splits it builds run their GPU
+// part in int8 (AneFfn); without, the bf16 kernels.
 class Measurement final {
 public:
   Measurement(metal::MetalBackend &backend, std::span<const SwiGluProjections> layers, const PrefillFfnBuffers &ffn,
-              const std::array<metal::MetalBuffer, 2> &hidden, std::function<bool()> interrupted);
+              const std::array<metal::MetalBuffer, 2> &hidden, std::function<bool()> interrupted,
+              Int8Ffn *int8 = nullptr);
 
   // The split's GPU part alone and its split layer of full chunks with the
   // ANE taking the channel units nearest two shares, and the GPU's FFN
@@ -36,10 +39,11 @@ public:
 private:
   // The per-layer milliseconds of `count` `rows`-row FFN layers of `layers`
   // from the first, fewer than all of them (AneFfnMeasurement.cpp): the
-  // GPU's alone without `split`, or `split`'s less `standIn`; and of
-  // `split`'s GPU part alone of full chunks.
+  // GPU's alone without `split`, on `int8` when given and the bf16 kernels
+  // otherwise, or `split`'s less `standIn`; and of `split`'s GPU part alone
+  // of full chunks.
   [[nodiscard]] double layer(std::span<const SwiGluProjections> layers, uint32_t count, uint32_t rows,
-                             AneFfn *split = nullptr, double standIn = 0.0);
+                             AneFfn *split = nullptr, double standIn = 0.0, Int8Ffn *int8 = nullptr);
   [[nodiscard]] double gpuPart(std::span<const SwiGluProjections> layers, AneFfn &split);
 
   metal::MetalBackend &backend_;
@@ -47,6 +51,7 @@ private:
   PrefillFfnBuffers ffn_;
   std::array<metal::MetalBuffer, 2> hidden_;
   std::function<bool()> interrupted_;
+  Int8Ffn *int8_;
   const Linear linear_;
 };
 

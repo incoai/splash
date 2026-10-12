@@ -141,8 +141,9 @@ inline void int8_ffn_convert_row(device uchar *a, device uchar *b, device uchar 
 // 0.5 apart; 4.9 for down converting the next gate and up, against 4.1 and
 // 1.0). Spreading them among the tiles of each row lost the cached order. The
 // conversion reads the planes four values per lane, as ane_ffn_weights does:
-// sixteen per lane, or a group of 32 per thread through threadgroup memory,
-// ran it two to three times slower. True for a conversion threadgroup, with
+// sixteen per lane, a group of 32 per thread through threadgroup memory, or a
+// lane per row of gate's and up's (loads of adjacent rows, but each lane
+// storing its own row) ran it two to three times slower. True for a conversion threadgroup, with
 // `task` its index among them; false for a GEMM tile.
 inline bool int8_ffn_converts(uint2 group, constant Int8FfnGemmParams &params, thread uint &task) {
   if (group.x < params.row_tiles) return false;

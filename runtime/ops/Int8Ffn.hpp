@@ -35,8 +35,13 @@ public:
 
   // Computes the row scales of `layers`, which it takes (unsupported()),
   // whose planes the FFN reads for the life of the object. It runs on any
-  // GPU splash does.
-  Int8Ffn(metal::MetalBackend &backend, std::span<const SwiGluProjections> layers);
+  // GPU splash does. With `scratch`, an FFN of the same hidden size and as
+  // many intermediate channels or more, it shares that one's int8 weights
+  // and chunk rows instead of allocating its own: the two then never add
+  // layers to one command, whose layers each converts the next one's weights
+  // for (the Neural Engine split's GPU part, over the leading channels,
+  // shares the FFN of every channel this way).
+  Int8Ffn(metal::MetalBackend &backend, std::span<const SwiGluProjections> layers, const Int8Ffn *scratch = nullptr);
   Int8Ffn(const Int8Ffn &) = delete;
   Int8Ffn &operator=(const Int8Ffn &) = delete;
 
@@ -48,8 +53,11 @@ public:
   // twice its bf16 rate, the layers the FFN takes.
   [[nodiscard]] static const char *unsupported(const DeviceCapabilities &device,
                                                std::span<const SwiGluProjections> layers);
-  // The Metal memory of the FFN of `layers`.
+  // The Metal memory of the FFN of `layers`, or of `layers` layers of
+  // `hidden` and `intermediate` channels, less what it shares with `scratch`
+  // when `shared`.
   [[nodiscard]] static uint64_t plannedBytes(std::span<const SwiGluProjections> layers);
+  [[nodiscard]] static uint64_t plannedBytes(uint32_t hidden, uint32_t intermediate, uint32_t layers, bool shared);
   // What Metal allocated for it, which plannedBytes() bounds.
   [[nodiscard]] uint64_t allocatedBytes() const noexcept { return allocatedBytes_; }
 
@@ -83,7 +91,10 @@ private:
   enum class Matrix : uint8_t { Gate, Up, Down };
 
   [[nodiscard]] static Shape shapeOf(std::span<const SwiGluProjections> layers);
-  template <class MakeBuffer> [[nodiscard]] static Memory allocate(const Shape &shape, MakeBuffer &&buffer);
+  // Allocates `shape`'s memory through `buffer`, but for the scratch of
+  // `scratch` when given.
+  template <class MakeBuffer>
+  [[nodiscard]] static Memory allocate(const Shape &shape, MakeBuffer &&buffer, const Memory *scratch);
   [[nodiscard]] metal::MetalBuffer rowScales(uint32_t layer, Matrix matrix) const;
   // Layer `layer`'s down over the chunk's `rows` intermediate rows,
   // converting layer `next`'s gate and up beside it when there is one: with

@@ -6,6 +6,7 @@
 #include "metal/abi/AneFfn.h"
 #include "metal/abi/ExecutionGeometry.h"
 #include "ops/AneFfnCalibration.hpp"
+#include "ops/Int8Ffn.hpp"
 #include "ops/Linear.hpp"
 
 #include <array>
@@ -30,7 +31,8 @@ class Measurement;
 
 // The dense FFN of a prefill chunk split by intermediate channel between the
 // GPU and the Neural Engine. The GPU runs the leading channels with its
-// prefill kernels over views of the projections' planes;
+// prefill kernels, or in int8 (ops/Int8Ffn.hpp), over views of the
+// projections' planes;
 // the ANE runs the rest as one W8A8 program over the chunk's rows, with int8
 // weights the GPU requantizes from those planes one layer ahead into
 // double-buffered surfaces, and the GPU adds the ANE's partial down projection
@@ -53,9 +55,13 @@ public:
   // The ANE takes `aneUnits` of the units() of intermediate channels. The
   // program is compiled and loaded here, and the wait for the ANE's service
   // ends with ane::Interrupted once `interrupted` returns true. The split
-  // takes every chunk its functions hold until setMinimumRows().
+  // takes every chunk its functions hold until setMinimumRows(). With
+  // `int8`, the GPU's int8 FFN of `layers` (ops/Int8Ffn.hpp), the GPU runs
+  // its part in int8 too, sharing that FFN's scratch, and verify() checks
+  // the split against it; without, the GPU runs its part on the bf16
+  // kernels.
   AneFfn(metal::MetalBackend &backend, std::span<const SwiGluProjections> layers, uint32_t aneUnits,
-         std::function<bool()> interrupted);
+         std::function<bool()> interrupted, Int8Ffn *int8 = nullptr);
   AneFfn(const AneFfn &) = delete;
   AneFfn &operator=(const AneFfn &) = delete;
 
@@ -65,8 +71,10 @@ public:
   // The units the split moves intermediate channels in, of `layers`, which
   // it takes: the ANE takes from one to all but one of them.
   [[nodiscard]] static uint32_t units(std::span<const SwiGluProjections> layers);
-  // The Metal memory of the split of `layers` with the ANE taking `aneUnits`.
-  [[nodiscard]] static uint64_t plannedBytes(std::span<const SwiGluProjections> layers, uint32_t aneUnits);
+  // The Metal memory of the split of `layers` with the ANE taking
+  // `aneUnits`, with its GPU part in int8 when `int8`.
+  [[nodiscard]] static uint64_t plannedBytes(std::span<const SwiGluProjections> layers, uint32_t aneUnits,
+                                             bool int8 = false);
 
   // The fraction of intermediate channels the ANE takes.
   [[nodiscard]] double share() const noexcept;
@@ -93,8 +101,8 @@ public:
   };
   [[nodiscard]] const Served &served() const noexcept { return served_; }
 
-  // Checks the split against the GPU alone on `layers`, those it was built
-  // from, with chunks in `ffn` and the residual and output of alternate
+  // Checks the split against the GPU alone, in int8 when the split runs its
+  // GPU part in int8, on `layers`, those it was built from, with chunks in `ffn` and the residual and output of alternate
   // layers in `hidden`, all of which it overwrites: each function at its own
   // rows over the first two layers, which stage the ANE's weights through
   // both sets, with the ANE's output filled with NaN before so that rows it
@@ -225,7 +233,7 @@ private:
 
   // The split with a function of each of `functionRows` rows, ascending.
   AneFfn(metal::MetalBackend &backend, std::span<const SwiGluProjections> layers, uint32_t aneUnits,
-         std::function<bool()> interrupted, std::span<const uint32_t> functionRows);
+         std::function<bool()> interrupted, std::span<const uint32_t> functionRows, Int8Ffn *int8 = nullptr);
   [[nodiscard]] static Shape shapeOf(std::span<const SwiGluProjections> layers, uint32_t aneUnits);
   // Every allocation of the split, which `buffer` and `surface` make:
   // plannedBytes() counts them and the constructor allocates them.
@@ -257,6 +265,10 @@ private:
 
   metal::MetalBackend &backend_;
   const Linear linear_;
+  // The GPU's int8 FFN the split was given, and its GPU part in int8 over
+  // layers_' views, sharing its scratch; none for the bf16 kernels.
+  Int8Ffn *int8Alone_ = nullptr;
+  std::unique_ptr<Int8Ffn> int8_;
   Shape shape_;
   uint32_t minimumRows_ = kMinimumRows;
   std::vector<Layer> layers_;
