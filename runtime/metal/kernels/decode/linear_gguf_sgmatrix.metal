@@ -2,10 +2,11 @@
 // on the FP32 pipe there, so the kernel keeps every other FP32 operation to
 // the minimum a group scale needs, and does the rest on the integer pipe:
 // - weights enter the MMA as exact bf16: 128 + code for linear codes with a
-//   min, 160 + code - zero for seeded linear codes (one add), or the
-//   codebook, int8 or grid value;
+//   min, 160 + code - zero for seeded linear codes (one add), the code itself
+//   (converted) for 8-bit linear codes, or the codebook, int8 or grid value;
 // - one MMA chain per coefficient group, closed by the fp32 epilogue
-//   s * chain + b * sum (b = m - 128 s, formats with a min per 32 inputs) or
+//   s * chain + b * sum (b = m - 128 s, formats with a min per 32 inputs, or
+//   b = m for 8-bit codes) or
 //   s * chain with the chain seeded by -160 * sum from the table (formats
 //   with a zero point, and Q2_K, whose min per 16 inputs adds b * seed with
 //   b = m / -160);
@@ -30,7 +31,9 @@ namespace gguf_sg {
 template <class F> struct Shape {
   enum : uint {
     Linear = F::Kind == QuantLinear,
-    HasMin = Linear && F::Zero == 0,                          // Q4_K, Q5_K, Q4_1, Q2_K: s code + m
+    HasMin = Linear && F::Zero == 0,                          // Q4_K, Q5_K, Q4_1, Q2_K, MLX affine: s code + m
+    // Linear codes past 127 (MLX affine 8-bit), which enter the MMA as the code itself: no bf16 128 + code holds them
+    Wide = QuantWideCodes<F>::value,
     // Linear codes chained from the table's seed of their 16 inputs: s (code - zero) with a zero point (Q6_K, Q3_K,
     // Q4_0, IQ1, PQ2_0), and Q2_K's min per 16 inputs
     Seeded = Linear && (!HasMin || F::Group == 16),
@@ -42,9 +45,11 @@ template <class F> struct Shape {
     UnitSpans = F::MetaGroups == 1 ? 1 : CG * (HasMin ? 2 : 1) <= 2 ? 4 : 2,
     J = 2 * UnitSpans * CG,                                   // coefficients per column and unit
   };
-  // Each coefficient reads its own group's meta unit (coefficient_source), so a unit of four groups (PQ2_0's 128
-  // elements) splits a coefficient unit of four spans in two.
-  static_assert(F::MetaGroups == 8 || F::MetaGroups == 4 || F::MetaGroups == 1, "a meta unit is one, four or eight groups");
+  // Each coefficient reads its own group's meta unit (coefficient_source), so a unit of two or four groups (MLX
+  // affine's 64 or 128 elements, PQ2_0's 128) splits a coefficient unit of four spans.
+  static_assert(F::MetaGroups == 8 || F::MetaGroups == 4 || F::MetaGroups == 2 || F::MetaGroups == 1,
+                "a meta unit is one, two, four or eight groups");
+  static_assert(!Wide || (HasMin && !Seeded), "wide codes have a min per 32 inputs");
 };
 template <class F> using Coef = metal::conditional_t<Shape<F>::HasMin != 0, float2, float>;
 // The coefficients of a threadgroup's simdgroups for one unit; the run-time-format kernels hold every format's in
@@ -60,13 +65,20 @@ QUANT_FORMATS(GGUF_SG_COEF_BYTES)
 template <class F>
 inline bfloat2 operand(typename F::Chunk ch, uint f, threadgroup const bfloat2 *lut) {
   typedef Shape<F> S;
-  if constexpr (F::Kind == QuantLinear) {
+  if constexpr (F::Kind == QuantLinear && S::Wide) {
+    const uint pair = F::codes(ch)[f];
+    return bfloat2(float2(pair & 0xFFFFu, pair >> 16));   // exact: bf16 holds every integer to 256
+  } else if constexpr (F::Kind == QuantLinear) {
     return as_type<bfloat2>(F::codes(ch)[f] + S::Operand * 0x00010001u);   // Operand in both halves
   } else if constexpr (F::Kind == QuantCodebook) {
     return lut[(F::indices(ch) >> (8 * f)) & 0xFFu];
   } else if constexpr (F::Kind == QuantInt8) {
     const uint2 v = F::values(ch);
     return bfloat2(float2(as_type<char2>(ushort((f < 2 ? v.x : v.y) >> (16 * (f & 1))))));
+  } else if constexpr (F::Kind == QuantFloat8) {   // exact: an E4M3 value has four significant bits
+    const uint2 v = F::values(ch);
+    const uint pair = ((f < 2 ? v.x : v.y) >> (16 * (f & 1))) & 0xFFFFu;
+    return bfloat2(float2(quant_e4m3_pair(quant_byte_pairs(pair).x)));
   } else {
     const uint2 g = F::grid(ch);
     const uchar4 m = as_type<uchar4>(f < 2 ? g.x : g.y);
@@ -99,8 +111,8 @@ inline CoefSource<F> coefficient_source(device uchar *w0, device uchar *w1, devi
 }
 // Coefficient j of a column in coefficient unit u: group gi = j / CG of the
 // unit, 16-group half h = j % CG. Formats with a min return (s, m - 128 s),
-// or with a seeded min (s, m / -160), whose product with the seed is m times
-// the sum of the inputs.
+// (s, m) with wide codes, or with a seeded min (s, m / -160), whose product
+// with the seed is m times the sum of the inputs.
 template <class F> inline Coef<F> coefficient(CoefSource<F> src, uint u, uint j) {
   typedef Shape<F> S;
   const uint g = u * 2 * S::UnitSpans + j / S::CG, h = j % S::CG;
@@ -109,6 +121,7 @@ template <class F> inline Coef<F> coefficient(CoefSource<F> src, uint u, uint j)
   else k = F::coef(src.meta, ushort(g % F::MetaGroups));
   const float s = h ? k.s.y : k.s.x, m = h ? k.m.y : k.m.x;
   if constexpr (S::HasMin && S::Seeded) return float2(s, m * (-1.0f / kZeroPointOffset));
+  else if constexpr (S::HasMin && S::Wide) return float2(s, m);
   else if constexpr (S::HasMin) return float2(s, fma(-128.0f, s, m));
   else return s;
 }
@@ -339,7 +352,7 @@ inline void gguf_sg_fused(device const bfloat *table, device const float *sums, 
   device uchar *w0 = s == 0 ? w0a : s == 1 ? w0b : w0c;
   device uchar *w1 = s == 0 ? w1a : s == 1 ? w1b : w1c;
   device uchar *meta = s == 0 ? ma : s == 1 ? mb : mc;
-  const GgufDecodeParams q{p.input_size, p.splits, p.out_stride, p.offset[s]};
+  const GgufDecodeParams q{p.input_size, p.splits, p.out_stride, p.offset[s], 0};
   const uint2 local(tg.x - (s == 0 ? 0 : s == 1 ? t0 : t1), tg.y);
   quant_format_switch(p.fmt[s], [&](auto format) {
     typedef decltype(format) F;
@@ -385,7 +398,7 @@ inline void gguf_sg_expert(device const bfloat *table, device const float *sums,
   const MoeGgufSegment s = moe_gguf_segment(tiles[tg.y].expert, p, w0, w1, meta, sw0, sw1, smeta);
   const uint K = p.input_size, N = p.output_size;
   const ulong rows = ulong(tg.y) * 8;
-  const GgufDecodeParams q{K, 1, N, 0};
+  const GgufDecodeParams q{K, 1, N, 0, 0};
   quant_format_switch(s.format, [&](auto format) {
     typedef decltype(format) F;
     quant_pair_table<F>(lut, tid, GGUF_REGISTER_THREADS);

@@ -919,13 +919,24 @@ kernel void decode_sample_vocabulary_draw(
   }
 }
 
+// Whether no token can be selected for a logit: NaN has no order and -inf
+// no probability. A bit test, which Metal's fast math keeps.
+inline bool unselectable_logit(float value) {
+  const uint bits = as_type<uint>(value);
+  return (bits & 0x7fffffffu) > 0x7f800000u || bits == 0xff800000u;
+}
+
 // The sampling penalties of one logit: repetition divides a positive
 // logit and multiplies a negative one when the prompt or the output holds
 // the token, and presence and frequency lower it by the output's count of
-// the token. The result saturates, so no rewritten logit is infinite.
+// the token. The result saturates, so no rewritten logit is infinite; an
+// unselectable logit stays as it is, since saturating would make it
+// selectable.
 inline float penalize_logit(float value, uint count, float repetition,
                             float repetition_inverse, float presence,
                             float frequency) {
+  if (unselectable_logit(value))
+    return value;
   value *= value > 0.0f ? repetition_inverse : repetition;
   if (count)
     value -= frequency * float(count) + presence;
@@ -1419,8 +1430,9 @@ inline void accept_sampled_lane(device const uint *draft_tokens,
                     accepted_count);
 }
 
-// One shard of a greedy row: its admitted token with the largest logit, the
-// lowest id among ties, per thread in token order and then over the group.
+// One shard of a greedy row: its admitted token with the largest selectable
+// logit, the lowest id among ties, per thread in token order and then over
+// the group. A row with no selectable logit keeps the sentinel id.
 inline void argmax_shard(TargetRow row, uint shard, device float &partial_value,
                          device uint &partial_index,
                          threadgroup float *group_values,
@@ -1433,6 +1445,8 @@ inline void argmax_shard(TargetRow row, uint shard, device float &partial_value,
     if (!row.admits(token))
       continue;
     float value = row.logits[token];
+    if (unselectable_logit(value))
+      continue;
     if (value > best || (value == best && token < best_index)) {
       best = value;
       best_index = token;
@@ -1506,6 +1520,31 @@ kernel void decode_sample_argmax_reduce(
   const uint token = argmax_reduce(partial_values, partial_indices, s, lane);
   if (lane == 0)
     tokens[s] = token;
+}
+
+// After the selection, the thinking cutoff of each lane that has one
+// (ThinkingCutoffParams): its row selects end. Draft token r is verify input
+// row r + 1.
+kernel void decode_sample_thinking_cutoff(
+    device const uint *input_tokens [[buffer(0)]],
+    device uint *tokens [[buffer(1)]],
+    device TargetVocabularyRow *vocabulary_rows [[buffer(2)]],
+    constant ThinkingCutoffParams &params [[buffer(3)]],
+    uint lane [[threadgroup_position_in_grid]]) {
+  const uint row = params.row[lane];
+  if (row >= params.rows)
+    return;
+  const uint first = lane * params.rows;
+  const uint end = params.end[lane];
+  for (uint r = 0; r < min(row, params.drafted_rows); ++r) {
+    const uint draft = input_tokens[first + r + 1];
+    if (draft == end || draft == params.also_ends[lane])
+      return;
+  }
+  tokens[first + row] = end;
+  if ((params.sampling_mask & (1u << lane)) && row < params.drafted_rows)
+    vocabulary_rows[first + row].draft_probability =
+        input_tokens[first + row + 1] == end ? 1.0f : 0.0f;
 }
 
 inline void accept_greedy_lane(device const uint *draft_tokens,

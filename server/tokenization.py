@@ -1,11 +1,23 @@
 """Bounded token reuse at literal chat-message boundaries."""
 
 import json
+import re
 import sys
 import threading
 from array import array
 
 from .lru import LRUCache
+
+# A surrogate code point. Request text keeps a lone one that JSON spells, such
+# as half of an emoji ("\ud83d") a client cut, but the tokenizer refuses any
+# text that holds one, and the request with it.
+_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def tokenizable(text):
+    """text with each surrogate code point as U+FFFD, as a UTF-8 decoder reads
+    an invalid byte. One character replaces one, so offsets into text hold."""
+    return _SURROGATE.sub("\ufffd", text)
 
 
 class PromptTokenizer:
@@ -72,7 +84,7 @@ class PromptTokenizer:
         )
 
     def _encode(self, text):
-        return self.tokenizer(text, add_special_tokens=False)["input_ids"]
+        return self.tokenizer(tokenizable(text), add_special_tokens=False)["input_ids"]
 
     def encode(self, text):
         boundary = text.rfind(self.MARKER)

@@ -3,8 +3,8 @@
 #include "metal/abi/KernelABI.h"
 #include "metal/kernels/common/rms_inverse.h"
 
-// q_norm and k_norm are read in their stored type W: bfloat in the affine
-// formats, float for a GGUF's F32 norms.
+// q_norm and k_norm are read in their stored type W: bfloat for an MLX
+// target's, float for a GGUF's F32 norms.
 template <uint QHeads, uint KHeads, class W>
 inline void full_qkv_storage_phase(
     device const bfloat *qkv, device const W *q_norm,

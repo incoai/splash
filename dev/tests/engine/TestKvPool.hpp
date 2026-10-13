@@ -22,8 +22,8 @@ namespace splash::test {
 // page ids than its budget, as production's has. A release or a copy
 // throws std::logic_error while commandInFlight() says a command is in
 // flight, as PageStorage's does. Every page holds one value, which a test
-// sets and a copy carries, so a test can follow the content of pages the
-// pool moves.
+// sets, a copy carries and a clear zeroes, so a test can follow the content
+// of pages the pool moves.
 class TestKvStorage final : public kv::ExtentStorage {
 public:
     TestKvStorage(uint32_t pages, uint64_t bytesPerPage, uint32_t extentPages)
@@ -77,6 +77,18 @@ public:
             copies.push_back(copy);
         }
     }
+    void clearPages(std::span<const uint32_t> pages) override {
+        for (uint32_t page : pages) {
+            if (!allocated_.at(page / extentPages_)) {
+                throw std::logic_error(
+                    "cannot clear a KV page of an extent that is not allocated");
+            }
+        }
+        for (uint32_t page : pages) {
+            content.at(page) = 0;
+            cleared.push_back(page);
+        }
+    }
 
     [[nodiscard]] bool allocated(uint32_t extent) const {
         return allocated_.at(extent);
@@ -104,6 +116,7 @@ public:
     double totalRelease = 0.0;
     std::vector<uint64_t> content;
     std::vector<kv::PageCopy> copies;
+    std::vector<uint32_t> cleared;
 
 private:
     uint32_t pageCount_ = 0;

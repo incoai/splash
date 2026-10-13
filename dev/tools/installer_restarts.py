@@ -5,8 +5,7 @@
 `prepare` runs with the Hub, then three restarts must each start the same
 installation within RESTART_SECONDS without writing to a Hub cache:
 HF_HUB_OFFLINE=1, a Hub that refuses connections, and an empty HF_HUB_CACHE.
-`verify --full` then hashes every source file. A legacy package is only
-verified.
+`verify --full` then hashes every source file.
 """
 
 from __future__ import annotations
@@ -94,49 +93,44 @@ def check(arguments, run=run_installer, hub_cache=None):
         language_only=options.language_only,
         draft_model=options.draft_model,
     )
-    if models.installation_kind(selection.link) != models.PACKAGE:
-        installer(run, arguments, ["prepare"], ONLINE)
-        if hub_cache is None:
-            from huggingface_hub import constants
+    installer(run, arguments, ["prepare"], ONLINE)
+    if hub_cache is None:
+        from huggingface_hub import constants
 
-            hub_cache = Path(constants.HF_HUB_CACHE)
-        installed = selection.link.resolve()
-        sources = models.read_json(installed / "model.json")["sources"]
-        target = sources["target"]
-        # A local draft directory is no Hub repository.
-        repositories = [s["repo"] for s in sources.values() if s["revision"]]
-        started = (
-            f"Splash model {selection.model} is already installed in {selection.link}"
+        hub_cache = Path(constants.HF_HUB_CACHE)
+    installed = selection.link.resolve()
+    sources = models.read_json(installed / "model.json")["sources"]
+    target = sources["target"]
+    # A local draft directory is no Hub repository.
+    repositories = [s["repo"] for s in sources.values() if s["revision"]]
+    started = f"Splash model {selection.model} is already installed in {selection.link}"
+    # A commit revision starts without asking the Hub.
+    fallback = (
+        ()
+        if models.is_hex_digest(selection.revision, 40)
+        else (
+            "Could not reach the Hub (",
+            f"); using the installed {selection.repo_id}@{target['revision'][:12]}.",
         )
-        # A commit revision starts without asking the Hub.
-        fallback = (
-            ()
-            if models.is_hex_digest(selection.revision, 40)
-            else (
-                "Could not reach the Hub (",
-                f"); using the installed {selection.repo_id}@{target['revision'][:12]}.",
-            )
-        )
-        downloads = hub_files(hub_cache, repositories)
-        with tempfile.TemporaryDirectory() as moved:
-            for name, environment, expected in (
-                ("offline", {"HF_HUB_OFFLINE": "1"}, (started,)),
-                (
-                    "unreachable-Hub",
-                    ONLINE | {"HF_ENDPOINT": UNREACHABLE_HUB},
-                    (*fallback, started),
-                ),
-                ("moved-cache", ONLINE | {"HF_HUB_CACHE": moved}, (started,)),
+    )
+    downloads = hub_files(hub_cache, repositories)
+    with tempfile.TemporaryDirectory() as moved:
+        for name, environment, expected in (
+            ("offline", {"HF_HUB_OFFLINE": "1"}, (started,)),
+            (
+                "unreachable-Hub",
+                ONLINE | {"HF_ENDPOINT": UNREACHABLE_HUB},
+                (*fallback, started),
+            ),
+            ("moved-cache", ONLINE | {"HF_HUB_CACHE": moved}, (started,)),
+        ):
+            restart(run, arguments, name, environment, expected)
+            if selection.link.resolve() != installed:
+                raise RestartFailure(f"the {name} restart relinked {selection.link}")
+            if hub_files(hub_cache, repositories) != downloads or any(
+                Path(moved).iterdir()
             ):
-                restart(run, arguments, name, environment, expected)
-                if selection.link.resolve() != installed:
-                    raise RestartFailure(
-                        f"the {name} restart relinked {selection.link}"
-                    )
-                if hub_files(hub_cache, repositories) != downloads or any(
-                    Path(moved).iterdir()
-                ):
-                    raise RestartFailure(f"the {name} restart wrote to a Hub cache")
+                raise RestartFailure(f"the {name} restart wrote to a Hub cache")
     installer(run, arguments, ["verify", "--full"], {})
 
 

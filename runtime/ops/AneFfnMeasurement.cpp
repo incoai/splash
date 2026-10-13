@@ -41,7 +41,7 @@ Measurement::Measurement(metal::MetalBackend &backend, std::span<const SwiGluPro
   if (layers.size() < 2) throw std::invalid_argument("ANE FFN split timed on fewer than two layers");
   // Timing does not depend on the values, but on their being finite.
   AneFfn::fillNormalized(ffn_.normalized);
-  for (const metal::MetalBuffer &buffer : {ffn_.sums, hidden_[0], hidden_[1]})
+  for (const metal::MetalBuffer &buffer : hidden_)
     if (void *data = buffer.contents()) std::memset(data, 0, buffer.sizeBytes());
 }
 

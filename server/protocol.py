@@ -15,7 +15,7 @@ from dataclasses import dataclass, fields
 from enum import IntEnum, IntFlag
 from typing import TypeAlias
 
-PROTOCOL_VERSION = 8
+PROTOCOL_VERSION = 10
 # A frame is its header, the magic, the protocol version, the frame type and
 # the payload length, then the payload.
 FRAME_HEADER_BYTES = 16
@@ -44,17 +44,18 @@ _MAGIC = b"SPLH"
 _HEADER = struct.Struct("<4sHHQ")
 # Replay can update the integer deadlines without decoding sampling floats.
 _REQUEST_HEAD = struct.Struct("<QBBQQ")
-_REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIffIffffQIII")
+_REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIffIffffQIIIQQIII")
 _IMAGE_SPAN = struct.Struct("<IIIIQQ")
 _CANCEL = struct.Struct("<Q")
 _MASK_RESPONSE = struct.Struct("<QQI")
 _STATUS_REQUEST = struct.Struct("<Q")
+_RELEASE_REQUEST = struct.Struct("<Q")
 _READY = struct.Struct("<IIB")
 _START = struct.Struct("<QII")
 _PROMPT_PROGRESS = struct.Struct("<QIQ")
 _TOKENS = struct.Struct("<QII")
 _MASK_REQUEST = struct.Struct("<QQII")
-_DONE = struct.Struct("<QBIIQQQI")
+_DONE = struct.Struct("<QBIIQQQIIIII")
 _ERROR = struct.Struct("<BBQII")
 _STATUS_JSON = struct.Struct("<Q")
 
@@ -64,11 +65,11 @@ assert (
     and sys.byteorder == "little"
 )
 assert _HEADER.size == FRAME_HEADER_BYTES
-assert _REQUEST.size == 86
+assert _REQUEST.size == 114
 assert _IMAGE_SPAN.size == 32
 assert _READY.size == 9
 assert _START.size == 16
-assert _DONE.size == 45
+assert _DONE.size == 61
 assert _ERROR.size == 18
 assert _STATUS_JSON.size == 8
 
@@ -81,6 +82,7 @@ class FrameType(IntEnum):
     CANCEL = 0x0002
     MASK_RESPONSE = 0x0003
     STATUS_REQUEST = 0x0004
+    RELEASE_REQUEST = 0x0005
 
     READY = 0x0100
     START = 0x0101
@@ -237,6 +239,22 @@ class ImageSpan:
 
 
 @dataclass(slots=True, frozen=True)
+class ThinkingBudget:
+    """A request that generates inside a thinking block may select at most
+    `tokens` thinking tokens; the engine then selects `end`, which closes the
+    block. Thinking also ends where the request selects `end` or `also_ends`
+    first, such as a tool call's opening that follows thinking directly."""
+
+    tokens: int
+    end: int
+    also_ends: int
+
+
+# The request frame's thinking budget tokens without one.
+_NO_THINKING_BUDGET = 0xFFFFFFFF
+
+
+@dataclass(slots=True, frozen=True)
 class RequestFrame:
     request_id: int
     priority: RequestPriority
@@ -258,6 +276,12 @@ class RequestFrame:
     # when unknown. It must leave at least one prompt token.
     generation_prompt_tokens: int
     flags: RequestFlag
+    # The request's cache_salt hashed to 128 bits (Frontend._cache_salt);
+    # zero without one.
+    cache_salt: int
+    # Only a request that generates inside a thinking block has one; a score
+    # request never does.
+    thinking_budget: ThinkingBudget | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -275,6 +299,14 @@ class MaskResponseFrame:
 
 @dataclass(slots=True, frozen=True)
 class StatusRequestFrame:
+    correlation_id: int
+
+
+@dataclass(slots=True, frozen=True)
+class ReleaseRequestFrame:
+    """Give the weights back now when the engine holds no request; answered
+    by a status JSON with the same correlation id."""
+
     correlation_id: int
 
 
@@ -344,6 +376,12 @@ class DoneEvent:
     # Raw final-position logits for a score-only request, in requested token
     # order; empty for generation and for cancelled or failed scoring.
     option_logits: tuple[float, ...]
+    # Of the tokens the request computed, those whose KV it then read from a
+    # cached block's page.
+    deduplicated_tokens: int = 0
+    drafted_tokens: int = 0
+    accepted_draft_tokens: int = 0
+    draft_cycles: int = 0
 
 
 @dataclass(slots=True, frozen=True)
@@ -364,7 +402,11 @@ class StatusJsonEvent:
 
 
 ClientMessage: TypeAlias = (
-    RequestFrame | CancelFrame | MaskResponseFrame | StatusRequestFrame
+    RequestFrame
+    | CancelFrame
+    | MaskResponseFrame
+    | StatusRequestFrame
+    | ReleaseRequestFrame
 )
 EngineEvent: TypeAlias = (
     ReadyEvent
@@ -513,6 +555,8 @@ def _payload_bounds(frame_type: FrameType) -> tuple[int, int]:
             bounds = (_MASK_RESPONSE.size, _MASK_RESPONSE.size + MAX_MASK_WORDS * 4)
         case FrameType.STATUS_REQUEST:
             bounds = (_STATUS_REQUEST.size, _STATUS_REQUEST.size)
+        case FrameType.RELEASE_REQUEST:
+            bounds = (_RELEASE_REQUEST.size, _RELEASE_REQUEST.size)
         case FrameType.READY:
             bounds = (_READY.size, _READY.size)
         case FrameType.PROMPT_PROGRESS:
@@ -682,6 +726,16 @@ def _validated_request(
             raise ValueError("score requests require default greedy sampling")
     except (AttributeError, ValueError) as error:
         _fail_request(IssueCode.INVALID_SAMPLING, str(error), request_id)
+    thinking = request.thinking_budget
+    if thinking is not None:
+        try:
+            if scores:
+                raise ValueError("score requests take no thinking budget")
+            _integer(thinking.tokens, 0, _NO_THINKING_BUDGET - 1, "thinking budget")
+            _u32(thinking.end, "thinking end token")
+            _u32(thinking.also_ends, "thinking end token")
+        except (AttributeError, ValueError) as error:
+            _fail_request(IssueCode.INVALID_COUNT, str(error), request_id)
     if scores and constraint is not ConstraintMode.NONE:
         _fail_request(
             IssueCode.INVALID_CONSTRAINT,
@@ -699,6 +753,7 @@ def _validated_request(
         )
     try:
         _u64(request.seed, "seed")
+        _integer(request.cache_salt, 0, (1 << 128) - 1, "cache salt")
     except ValueError as error:
         _fail_request(IssueCode.INTEGER_OVERFLOW, str(error), request_id)
     return prompt, scores, sampling
@@ -749,6 +804,17 @@ def _request_frame(request: RequestFrame) -> bytearray:
         len(request.score_tokens),
         request.generation_prompt_tokens,
         request.flags,
+        request.cache_salt & 0xFFFFFFFFFFFFFFFF,
+        request.cache_salt >> 64,
+        *(
+            (_NO_THINKING_BUDGET, 0, 0)
+            if request.thinking_budget is None
+            else (
+                request.thinking_budget.tokens,
+                request.thinking_budget.end,
+                request.thinking_budget.also_ends,
+            )
+        ),
     )
     for index, span in enumerate(request.image_spans):
         _IMAGE_SPAN.pack_into(
@@ -813,6 +879,16 @@ def _status_request_frame(request: StatusRequestFrame) -> bytearray:
     return frame
 
 
+def _release_request_frame(request: ReleaseRequestFrame) -> bytearray:
+    try:
+        correlation_id = _u64(request.correlation_id, "release correlation id")
+    except ValueError as error:
+        _fail_request(IssueCode.INTEGER_OVERFLOW, str(error))
+    frame = _frame(FrameType.RELEASE_REQUEST, _RELEASE_REQUEST.size)
+    _RELEASE_REQUEST.pack_into(frame, FRAME_HEADER_BYTES, correlation_id)
+    return frame
+
+
 def serialize_message(message: ClientMessage) -> bytearray:
     """Validate and serialize one client message as a whole frame, built in
     one buffer: a request's image pixels are copied once."""
@@ -825,6 +901,8 @@ def serialize_message(message: ClientMessage) -> bytearray:
             return _mask_response_frame(message)
         if isinstance(message, StatusRequestFrame):
             return _status_request_frame(message)
+        if isinstance(message, ReleaseRequestFrame):
+            return _release_request_frame(message)
     except MemoryError as error:
         raise ProtocolError(
             _allocation_issue("allocation failed while serializing a client frame")
@@ -982,7 +1060,16 @@ def _decode_event(frame: Frame) -> EngineEvent:
             )
         return MaskRequestEvent(request_id, mask_request_id, words_per_mask, tokens)
     if frame_type is FrameType.DONE:
-        request_id, reason, *counts, logit_count = _DONE.unpack_from(payload)
+        (
+            request_id,
+            reason,
+            *counts,
+            deduplicated,
+            drafted,
+            accepted,
+            cycles,
+            logit_count,
+        ) = _DONE.unpack_from(payload)
         logits = _tail(
             payload, _DONE.size, logit_count, "f", "option logit", request_id
         )
@@ -998,13 +1085,23 @@ def _decode_event(frame: Frame) -> EngineEvent:
             _fatal(
                 IssueCode.INVALID_REQUEST_ID, "done event request id must be non-zero"
             )
-        event = DoneEvent(request_id, reason, *counts, logits)
+        event = DoneEvent(
+            request_id, reason, *counts, logits, deduplicated, drafted, accepted, cycles
+        )
+        # Each cycle verified at least one drafted token and accepted at most all.
+        if accepted > drafted or cycles > drafted or (drafted and not cycles):
+            _fatal(
+                IssueCode.INVALID_COUNT,
+                "done speculative counts are inconsistent",
+                request_id,
+            )
         if logits and (
             len(logits) < MIN_SCORE_TOKENS
             or not all(map(math.isfinite, logits))
             or reason is not FinishReason.STOP
             or event.completion_tokens
             or event.decode_micros
+            or drafted
         ):
             _fatal(
                 IssueCode.INVALID_COUNT,

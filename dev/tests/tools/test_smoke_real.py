@@ -216,7 +216,7 @@ class SmokeRealTests(unittest.TestCase):
                     )
 
     def test_persistent_cache_scenario_needs_a_disk_quota(self):
-        model = ["--model", "incoai/Qwen3.8-27B-Splash"]
+        model = ["--model", "mlx-community/Qwen3.8-27B-4bit"]
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             smoke_real.parse_args([*model, "--persistent-cache"])
         arguments = smoke_real.parse_args(

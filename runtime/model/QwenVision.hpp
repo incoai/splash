@@ -5,7 +5,6 @@
 #include "ops/Vision.hpp"
 
 #include <cstdint>
-#include <filesystem>
 #include <string_view>
 #include <vector>
 
@@ -22,12 +21,7 @@ struct QwenVisionWeights final {
   uint64_t actualAllocatedBytes = 0;
 };
 
-// A Splash package's vision/model.bin, in directory.
-[[nodiscard]] QwenVisionWeights
-loadQwenVisionWeights(metal::MetalBackend &backend, WeightImages &images,
-                      const std::filesystem::path &directory,
-                      ops::VisionLayout layout);
-// The same layout, written from an upstream source.
+// The tower's image, written from an upstream source.
 [[nodiscard]] QwenVisionWeights
 loadQwenVisionWeights(metal::MetalBackend &backend, WeightImages &images, const VisionLoader &source);
 

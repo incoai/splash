@@ -76,12 +76,6 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
                          geometry.target.attentionWidth));
   put(PrefillTensor::AttentionOutput,
       bytesFor<uint16_t>(uint64_t{kPrefillRows} * geometry.target.hiddenSize));
-  put(PrefillTensor::ProjectionSums,
-      bytesFor<float>(uint64_t{kPrefillRows} *
-                      geometry.projectionSumsWidth()));
-  put(PrefillTensor::DownProjectionSums,
-      bytesFor<float>(uint64_t{kPrefillRows} *
-                      geometry.projectionSumsWidth()));
   // Three rotary axes per row (Qwen3.5 M-RoPE); text rows repeat one value.
   put(PrefillTensor::TargetPositions,
       bytesFor<uint32_t>(uint64_t{kPrefillRows} * 3));
@@ -116,8 +110,12 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
                          kRaggedAttentionRows *
                          geometry.target.attentionHeadDimension));
   // The split partials and counters and the rotated rows of the largest
-  // prefill plan.
-  for (const auto &projection : geometry.target.prefillProjections) {
+  // prefill plan, the draft's context projections' too.
+  const auto &draft = geometry.draft;
+  std::vector<ops::ProjectionShape> prefillProjections = geometry.target.prefillProjections;
+  prefillProjections.push_back({draft.hiddenSize, draft.targetHiddenSize});
+  prefillProjections.push_back({draft.contextKvSize(), draft.hiddenSize});
+  for (const auto &projection : prefillProjections) {
     const ops::LinearScratchSize linear = operators.linear().prefillScratchSize(projection);
     put(PrefillTensor::LinearPartials, linear.partials);
     put(PrefillTensor::LinearCounters, linear.counters);
@@ -146,17 +144,9 @@ static uint64_t gdnPackedStride(const RuntimeGeometry &geometry) noexcept {
   return bytesFor<uint16_t>(uint64_t{kDecodeRows} *
                             geometry.target.packedGdnWidth);
 }
-static uint64_t gdnMixedStride(const RuntimeGeometry &geometry) noexcept {
-  return bytesFor<uint16_t>(uint64_t{kDecodeRows} *
-                            geometry.target.convolutionDimension);
-}
-static uint64_t gdnDecayStride(const RuntimeGeometry &geometry) noexcept {
-  return bytesFor<float>(uint64_t{kDecodeRows} *
-                         geometry.target.gdnValueHeads);
-}
-static uint64_t gdnBetaStride(const RuntimeGeometry &geometry) noexcept {
-  return bytesFor<uint16_t>(uint64_t{kDecodeRows} *
-                            geometry.target.gdnValueHeads);
+uint64_t gdnTapeSlotBytes(const RuntimeGeometry &geometry) noexcept {
+  return uint64_t{geometry.target.stateLayout.layers} *
+         ops::gdnTapeLayerBytes(geometry.target.gdnShape());
 }
 static uint64_t decodeChunkLayerBytes(const RuntimeGeometry &geometry) noexcept {
   return bytesFor<uint16_t>(uint64_t{geometry.target.attentionKvHeads} *
@@ -282,18 +272,8 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   put(DecodeTensor::PageTable, bytesFor<SplashKvPage>(kMaximumPageTableEntries));
   put(DecodeTensor::PenaltyState,
       bytesFor<uint32_t>(geometry.target.vocabularySize));
-  put(DecodeTensor::VerifyPackedBase,
-      uint64_t{geometry.target.stateLayout.layers} *
-          gdnPackedStride(geometry));
-  put(DecodeTensor::VerifyMixedBase,
-      uint64_t{geometry.target.stateLayout.layers} *
-          gdnMixedStride(geometry));
-  put(DecodeTensor::VerifyDecayBase,
-      uint64_t{geometry.target.stateLayout.layers} *
-          gdnDecayStride(geometry));
-  put(DecodeTensor::VerifyBetaBase,
-      uint64_t{geometry.target.stateLayout.layers} *
-          gdnBetaStride(geometry));
+  put(DecodeTensor::GdnPacked, gdnPackedStride(geometry));
+  put(DecodeTensor::GdnTape, 2 * gdnTapeSlotBytes(geometry));
   put(DecodeTensor::ChunkKeysBase,
       uint64_t{geometry.target.kvLayout.attentionLayers} *
           decodeChunkLayerBytes(geometry));
@@ -325,8 +305,7 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
     const RuntimeGeometry &geometry, const ops::ExecutionPlans &operators) {
   const auto &d = geometry.draft;
   ops::LinearScratchSize result;
-  // Includes the vocabulary head shared with the draft, whose own
-  // projections are affine.
+  // Includes the vocabulary head shared with the draft.
   for (const auto &p : geometry.target.decodeProjections) result.include(operators.linear().decodeScratchSize(p));
   for (const ops::ProjectionShape shape : {ops::ProjectionShape{d.dynamicSize, d.hiddenSize},
        {d.qkvSize, d.hiddenSize}, {d.contextKvSize(), d.hiddenSize},
@@ -342,7 +321,7 @@ uint64_t plannedDecodeBytes(const RuntimeGeometry &geometry,
   return checkedAdd(decodeArenaBaseBytes(geometry, operators),
                     checkedAdd(DecodeArena::gateScratchBytes(geometry, operators),
                                DecodeArena::linearScratchSize(geometry, operators).bytes(),
-                               "Q4 decode scratch"),
+                               "linear decode scratch"),
                     "planned gate scratch");
 }
 

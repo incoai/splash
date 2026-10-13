@@ -30,9 +30,12 @@ namespace {
 
 class Events final : public EngineEventSink {
 public:
-  void batchCompleted(WorkKind kind, uint32_t, uint32_t, uint32_t, uint32_t,
-                      uint32_t, double, double cycleMilliseconds) override {
+  void batchCompleted(WorkKind kind, uint32_t, uint32_t, uint32_t,
+                      uint32_t drafted, uint32_t accepted, double,
+                      double cycleMilliseconds) override {
     cycles.emplace_back(kind, cycleMilliseconds);
+    draftedTokens += drafted;
+    acceptedDraftTokens += accepted;
   }
   void started(uint64_t requestId, uint32_t matched, uint32_t) override {
     startIds.push_back(requestId);
@@ -52,9 +55,12 @@ public:
         requestId, std::vector<uint32_t>(simulation.begin(), simulation.end()));
   }
   void completed(uint64_t id, EngineFinishReason, uint32_t prompt,
-                 uint32_t completion, std::span<const float>) override {
+                 uint32_t completion, uint32_t deduplicated,
+                 std::span<const float>, const SpeculativeCounts &speculation) override {
     ++completedCount;
     usage[id] = {prompt, completion};
+    deduplicatedTokens[id] = deduplicated;
+    speculativeCounts[id] = speculation;
   }
   void failed(uint64_t, LaneOutcome outcome, std::string message) override {
     ++failedCount;
@@ -71,6 +77,8 @@ public:
   std::vector<uint64_t> startIds;
   std::unordered_map<uint64_t, std::vector<uint32_t>> outputs;
   std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> usage;
+  std::unordered_map<uint64_t, uint32_t> deduplicatedTokens;
+  std::unordered_map<uint64_t, SpeculativeCounts> speculativeCounts;
   std::vector<std::string> failures;
   std::vector<std::pair<std::string, bool>> failureDetails;
   uint32_t emitted = 0;
@@ -80,6 +88,9 @@ public:
   std::vector<std::pair<uint64_t, std::vector<uint32_t>>> maskRequests;
   // Each completed command's kind and engine cycle.
   std::vector<std::pair<WorkKind, double>> cycles;
+  // The draft tokens of every completed command, as /status sums them.
+  uint32_t draftedTokens = 0;
+  uint32_t acceptedDraftTokens = 0;
 };
 
 using splash::test::rejects;
@@ -157,6 +168,110 @@ void testConcurrentColdPrefixesComputeOnce() {
   require(events.completedCount == 4 && events.failedCount == 0 &&
               events.emitted == 4,
           "shared prefill lost independent completions");
+}
+
+// A cold request whose first blocks match cached ones computes them, then
+// reads the cached blocks' pages in its later commands: it reports those
+// tokens when it completes, though it restored nothing.
+void testColdRequestReportsTheBlocksItReadFromTheCache() {
+  test::TestKvStorage storage(64, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor model;
+  Events events;
+  engine::Engine engine(test::engineConfig(), cache, model, events);
+  guardReleases(storage, engine);
+  std::vector<uint32_t> first(100);
+  std::iota(first.begin(), first.end(), 1);
+  engine.submit(request(1, first));
+  runUntilIdle(engine);
+  // Two full blocks in common and no state where the prompts part.
+  std::vector<uint32_t> second = first;
+  std::fill(second.begin() + 2 * KvCache::pageTokens + 5, second.end(), 7);
+  require(cache.lookup(second, {}).kvBoundary == 2 * KvCache::pageTokens &&
+              cache.lookup(second, {}).resumeBoundary() == 0,
+          "fixture did not share KV without a state");
+  engine.submit(request(2, second));
+  runUntilIdle(engine);
+  require(events.starts == std::vector<uint32_t>{0, 0} && events.completedCount == 2,
+          "the second request did not start cold");
+  require(events.deduplicatedTokens.at(1) == 0 &&
+              events.deduplicatedTokens.at(2) == 2 * KvCache::pageTokens &&
+              engine.snapshot().deduplicatedKvTokens == 2 * KvCache::pageTokens,
+          "a cold request did not report the cached blocks it read");
+}
+
+// Requests of different cache salts share nothing: concurrent ones each
+// compute their prefix instead of waiting for another's state, and a later
+// one restores only a state of its own salt and swaps no other salt's
+// block in.
+void testCacheSaltsShareNothing() {
+  test::TestKvStorage storage(64, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor model;
+  Events events;
+  engine::Engine engine(test::engineConfig(), cache, model, events);
+  guardReleases(storage, engine);
+  const auto salted = [](uint64_t id, const std::vector<uint32_t> &prompt, uint64_t salt) {
+    EngineRequest value = request(id, prompt);
+    value.cacheSalt = {salt, 0};
+    return value;
+  };
+  for (uint32_t id = 1; id <= 4; ++id) {
+    std::vector<uint32_t> prompt(193, 7);
+    std::fill(prompt.begin() + 160, prompt.end(), id + 10);
+    engine.submit(salted(id, prompt, id));
+  }
+  static_cast<void>(engine.tick(0));
+  require(model.requests.size() == 4, "requests of different salts waited for another's prefix");
+  runUntilIdle(engine);
+  require(model.prefillRows == 4 * 193 && model.restored == 0 && events.completedCount == 4,
+          "concurrent requests of different salts shared a prefix");
+  const uint32_t computed = model.prefillRows;
+  std::vector<uint32_t> prompt(193, 7);
+  std::fill(prompt.begin() + 160, prompt.end(), 30);
+  engine.submit(salted(5, prompt, 99));
+  runUntilIdle(engine);
+  require(events.starts.back() == 0 && events.deduplicatedTokens.at(5) == 0 &&
+              model.prefillRows - computed == 193,
+          "a request read another salt's cached blocks");
+  engine.submit(salted(6, prompt, 99));
+  runUntilIdle(engine);
+  require(events.starts.back() > 0, "a request missed its own salt's cached prefix");
+}
+
+// A request whose last command fills blocks found cached never reads their
+// pages, so it reports none of them.
+void testBlocksFoundCachedAfterTheLastCommandAreNotReported() {
+  test::TestKvStorage storage(64, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor model;
+  Events events;
+  engine::Engine engine(test::engineConfig(), cache, model, events);
+  guardReleases(storage, engine);
+  std::vector<uint32_t> first(100);
+  std::iota(first.begin(), first.end(), 1);
+  engine.submit(request(1, first));
+  runUntilIdle(engine);
+  // A generation prompt that starts in the first block leaves the second
+  // request no state boundary, and its prompt's command selects its only
+  // token: that command is its last.
+  const std::vector<uint32_t> second(first.begin(), first.begin() + 70);
+  EngineRequest last = request(2, second);
+  last.generationPromptTokens = 40;
+  require(cache.lookup(second, {}).kvBoundary == 2 * KvCache::pageTokens &&
+              cache.lookup(second, {}).resumeBoundary() == 0,
+          "fixture did not share KV without a state");
+  model.prefillAnchor = true;
+  engine.submit(std::move(last));
+  runUntilIdle(engine);
+  require(events.starts == std::vector<uint32_t>{0, 0} && events.completedCount == 2 &&
+              model.prefillChunks.at(2) == 1 && events.outputs.at(2) == std::vector<uint32_t>{42},
+          "the second request did not end with the command of its prompt");
+  require(events.deduplicatedTokens.at(2) == 0 && engine.snapshot().deduplicatedKvTokens == 0,
+          "a request reported cached blocks no command of it read");
 }
 
 void testSharedPrefillRebuildsTheMissingJunctionOnce() {
@@ -1135,7 +1250,7 @@ void testLongSuffixSkipsDraftRestore() {
   runUntilIdle(engine);
   require(!executor.restoredDraft &&
               !executor.plans.at(11).restoresDraftState,
-          "long suffix copied a draft ring that its final window overwrites");
+          "long suffix restored draft state that its final window overwrites");
 }
 
 // A lane cancelled while the command that ends at its armed boundary is in
@@ -3585,6 +3700,9 @@ void testLongDecodePreemptionPlansTheCurrentReplayBoundary() {
   guardReleases(storage, engine);
 
   constexpr uint64_t id = 255;
+  // Each decode step drafts one token and accepts none: one token a step,
+  // as without a draft.
+  executor.speculativeCounts = {{id, {1, 0}}};
   const std::vector<uint32_t> prompt(4097, 5);
   auto value = request(id, prompt);
   value.maxNewTokens = 10'000;
@@ -3601,6 +3719,7 @@ void testLongDecodePreemptionPlansTheCurrentReplayBoundary() {
   }
   require(executor.suspensions == 1 && !engine.commandInFlight(),
           "long decode did not suspend at KV growth pressure");
+  const uint32_t draftedBeforeSuspension = events.draftedTokens;
   const std::vector<uint32_t> emitted = events.outputs.at(id);
   std::vector<uint32_t> history = prompt;
   history.insert(history.end(), emitted.begin(), emitted.end());
@@ -3652,6 +3771,13 @@ void testLongDecodePreemptionPlansTheCurrentReplayBoundary() {
                                          prompt.size(), expectedOutput.size()} &&
               events.startIds == std::vector<uint64_t>{id},
           "long replay repeated output or changed original request usage");
+  // The request reports the decode steps before its suspension and after,
+  // as /status counts them; the replay drafts nothing.
+  require(draftedBeforeSuspension > 0 &&
+              events.draftedTokens > draftedBeforeSuspension &&
+              events.speculativeCounts.at(id) ==
+                  SpeculativeCounts{events.draftedTokens, 0, events.draftedTokens},
+          "suspension lost the request's speculative counts");
   require(executor.requests.empty() &&
               resources.snapshot().pool.pagesActive == 0 &&
               resources.snapshot().activeRequests == 0,
@@ -4110,9 +4236,9 @@ void testStateAdmissionKeepsThePooledLaneBuffers() {
 
 // While growth is paused, a lane short of state buffers takes a cached
 // state's: the oldest in RAM goes when those in RAM cover what the pool
-// lacks, and none goes when they do not.
+// lacks, and none goes when they do not, or when no number of states can.
 void testPausedStateAdmissionReusesCachedStates() {
-  for (uint32_t lacked : {1U, 2U}) {
+  for (uint32_t lacked : {1U, 2U, std::numeric_limits<uint32_t>::max()}) {
     test::TestKvStorage storage(64, 4096, 4);
     KvPool pool(storage, 0);
     engine::Cache cache(pool, nullptr, nullptr);
@@ -5423,6 +5549,188 @@ void testTerminalAnchorWithoutKvIsNotCached() {
   }
 }
 
+// An unconstrained request's first token reaches the client when the prefill
+// selects it, before the first decode cycle that commits it; that cycle's
+// event leaves it out, and the usage counts what the client got, also when the
+// request is cancelled before that cycle.
+void testFirstTokenIsSentAtPrefill() {
+  for (const bool cancel : {false, true}) {
+    test::TestKvStorage storage(8, 4096, 4);
+    KvPool pool(storage, 0);
+    engine::Cache resources(pool, nullptr, nullptr);
+    Executor executor(1);
+    executor.firstTokens = true;
+    executor.decodeFinishes = false;
+    executor.decodeTokens = 4;
+    executor.holdDecodeUntil = std::make_shared<std::atomic<bool>>(false);
+    Events events;
+    engine::Engine engine(test::engineConfig(), resources, executor, events);
+    guardReleases(storage, engine);
+
+    EngineRequest value = request(91, std::vector<uint32_t>(40, 91));
+    value.maxNewTokens = 12;
+    engine.submit(std::move(value));
+    // The first cycle is held in flight: the client has the first token.
+    double now = 1;
+    tickUntil(engine, now, [&] { return !events.outputs[91].empty() && engine.commandInFlight(); },
+              "the first cycle did not start after the prompt");
+    require(events.outputs[91] == std::vector<uint32_t>{42},
+            "the first token did not reach the client before the first cycle");
+    if (cancel)
+      engine.cancel(91);
+    *executor.holdDecodeUntil = true;
+    tickUntil(engine, now, [&] { return idle(engine); }, "the request did not end");
+    const uint32_t expected = cancel ? 1 : 12;
+    require(events.completedCount == 1 && events.outputs[91].size() == expected &&
+                events.usage[91] == std::pair<uint32_t, uint32_t>{40, expected},
+            cancel ? "a cancelled request's usage left out the first token it was sent"
+                   : "the stream and the usage disagree on the tokens sent");
+  }
+}
+
+// A request suspended after its first token was sent and before its first
+// decode cycle keeps that token pending: it resumes with its prompt alone, and
+// the cycle that commits the token does not send it again. /status counts the
+// token meanwhile.
+void testFirstTokenSentBeforeASuspensionIsNotSentAgain() {
+  test::TestKvStorage storage(512, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, nullptr, nullptr);
+  Executor executor;
+  executor.firstTokens = true;
+  executor.decodeFinishes = false;
+  executor.decodeTokens = 4;
+  // A Normal start is refused memory while the Background lane is resident,
+  // which suspends that lane for it.
+  executor.beginGrowthBlocked = [&] {
+    return executor.lastBeginId == 2 && executor.requests.at(1).resident;
+  };
+  Events events;
+  engine::Engine engine(test::engineConfig(), resources, executor, events);
+  guardReleases(storage, engine);
+
+  const std::vector<uint32_t> prompt(40, 1);
+  auto background = request(1, prompt);
+  background.priority = RequestPriority::Background;
+  background.maxNewTokens = 12;
+  engine.submit(std::move(background));
+  double now = 1;
+  tickUntil(engine, now, [&] { return events.outputs.contains(1); },
+            "the first token was not sent at the prefill");
+  auto normal = request(2, std::vector<uint32_t>(9, 2));
+  normal.maxNewTokens = 4;
+  engine.submit(std::move(normal));
+  tickUntil(engine, now, [&] { return !executor.requests.at(1).resident; },
+            "the Background lane was not suspended");
+  const EngineSnapshot suspended = engine.snapshot();
+  require(events.outputs.at(1) == std::vector<uint32_t>{42} &&
+              suspended.activeRequests.front().id == 1 &&
+              suspended.activeRequests.front().generatedTokens == 1,
+          "the suspended lane did not keep the first token it was sent");
+  tickUntil(engine, now, [&] { return idle(engine); }, "the requests did not end");
+  require(executor.resumedPrompts == std::vector<std::vector<uint32_t>>{prompt} &&
+              events.completedCount == 2 && events.failedCount == 0 &&
+              events.outputs.at(1) == std::vector<uint32_t>(12, 42) &&
+              events.usage.at(1) == std::pair<uint32_t, uint32_t>{40, 12},
+          "the resumed lane replayed its first token or sent it again");
+}
+
+// A lane suspended in its decode takes new pages past the chain it restores
+// when it resumes, which its replay writes in chunks that may end inside any
+// of them: they all come cleared, so rows not yet written read zero whoever
+// held them before.
+void testResumedLaneClearsThePagesPastItsRestoredChain() {
+  test::TestKvStorage storage(512, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, nullptr, nullptr);
+  Executor executor;
+  executor.firstTokens = true;
+  executor.decodeFinishes = false;
+  executor.decodeTokens = 4;
+  executor.beginGrowthBlocked = [&] {
+    return executor.lastBeginId == 2 && executor.requests.at(1).resident;
+  };
+  Events events;
+  engine::Engine engine(test::engineConfig(), resources, executor, events);
+  guardReleases(storage, engine);
+
+  auto background = request(1, std::vector<uint32_t>(40, 1));
+  background.priority = RequestPriority::Background;
+  background.maxNewTokens = 80;
+  engine.submit(std::move(background));
+  double now = 1;
+  tickUntil(engine, now,
+            [&] { return events.outputs.contains(1) && events.outputs.at(1).size() >= 41; },
+            "the lane did not decode");
+  auto normal = request(2, std::vector<uint32_t>(9, 2));
+  normal.maxNewTokens = 4;
+  engine.submit(std::move(normal));
+  tickUntil(engine, now, [&] { return !executor.requests.at(1).resident; },
+            "the Background lane was not suspended");
+  const size_t cleared = storage.cleared.size();
+  tickUntil(engine, now, [&] { return executor.requests.at(1).resident; },
+            "the Background lane did not resume");
+  const auto replayEnd = static_cast<uint32_t>(executor.resumedPrompts.at(0).size());
+  const PageTableView table = resources.pageTable(1);
+  const std::vector<uint32_t> pages(table.pages.begin(), table.pages.end());
+  const uint32_t restored = executor.lastRestoredTokens / KvCache::pageTokens;
+  require(replayEnd % KvCache::pageTokens && replayEnd / KvCache::pageTokens < pages.size() &&
+              restored + 1 < pages.size() && restored <= replayEnd / KvCache::pageTokens,
+          "fixture did not take pages past its restored chain");
+  for (size_t page = restored; page < pages.size(); ++page)
+    require(std::find(storage.cleared.begin() + cleared, storage.cleared.end(), pages[page]) !=
+                storage.cleared.end(),
+            "a page past the resumed lane's restored chain was not cleared");
+  tickUntil(engine, now, [&] { return idle(engine); }, "the requests did not end");
+  require(events.completedCount == 2 && events.failedCount == 0,
+          "the resumed lane did not complete");
+}
+
+// A lane suspended after it published a block past its latest state replays
+// that block when it resumes and finds it cached: its own, not counted as KV
+// another command computed.
+void testReplayFindsItsOwnBlocks() {
+  test::TestKvStorage storage(512, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, nullptr, nullptr);
+  Executor executor;
+  executor.firstTokens = true;
+  executor.decodeFinishes = false;
+  executor.decodeTokens = 4;
+  executor.beginGrowthBlocked = [&] {
+    return executor.lastBeginId == 2 && executor.requests.at(1).resident;
+  };
+  Events events;
+  engine::Engine engine(test::engineConfig(), resources, executor, events);
+  guardReleases(storage, engine);
+
+  const std::vector<uint32_t> prompt(40, 1);
+  auto background = request(1, prompt);
+  background.priority = RequestPriority::Background;
+  background.maxNewTokens = 40;
+  engine.submit(std::move(background));
+  double now = 1;
+  // Its KV reaches past the second block; its latest state is at the first.
+  tickUntil(engine, now,
+            [&] { return events.outputs.contains(1) && events.outputs.at(1).size() >= 28; },
+            "the lane did not decode past its second block");
+  auto normal = request(2, std::vector<uint32_t>(9, 2));
+  normal.maxNewTokens = 4;
+  engine.submit(std::move(normal));
+  tickUntil(engine, now, [&] { return !executor.requests.at(1).resident; },
+            "the Background lane was not suspended");
+  tickUntil(engine, now, [&] { return idle(engine); }, "the requests did not end");
+  require(executor.lastRestoredTokens == KvCache::pageTokens &&
+              executor.resumedPrompts.size() == 1 &&
+              executor.resumedPrompts.front().size() > 2 * KvCache::pageTokens,
+          "the lane did not replay its second block");
+  require(events.completedCount == 2 && events.failedCount == 0 &&
+              events.usage.at(1) == std::pair<uint32_t, uint32_t>{40, 40},
+          "the resumed lane did not complete");
+  require(events.deduplicatedTokens.at(1) == 0 && engine.snapshot().deduplicatedKvTokens == 0,
+          "a replay counted the request's own block as another's");
+}
+
 void testPrefillCanCompleteTheRequest() {
   for (bool stop : {false, true}) {
     test::TestKvStorage storage(8, 4096, 4);
@@ -5476,6 +5784,103 @@ void testOutOfVocabularyOutputFailsLaneOnly() {
           "out-of-vocabulary token reached the event sink");
   require(events.usage.count(2) == 1,
           "clean peer request did not complete");
+}
+
+// A damaged state is one way to a result that is not finite: a request whose
+// first step from the state it restored is not finite takes the state out of
+// the cache, and the next request with the prompt computes it again. The KV
+// blocks below it and what the step published before stay.
+void testNonFiniteFirstStepAfterARestoreInvalidatesTheState() {
+  test::TestKvStorage storage(32, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor model;
+  Events events;
+  engine::Engine engine(test::engineConfig(), cache, model, events);
+  guardReleases(storage, engine);
+  std::vector<uint32_t> prompt(129);
+  std::iota(prompt.begin(), prompt.end(), 1u);
+
+  // A first turn publishes the state at the prompt's second page.
+  engine.submit(request(1, std::vector<uint32_t>(prompt.begin(), prompt.begin() + 65)));
+  runUntilIdle(engine);
+  model.nonFinitePrefills = {2};
+  engine.submit(request(2, prompt));
+  runUntilIdle(engine);
+  require(events.starts == std::vector<uint32_t>{0, 64} &&
+              events.failures == std::vector<std::string>{"model_result_invalid"},
+          "the request did not resume from the state and fail its first step");
+  const CacheLookup lookup = cache.lookup(prompt, {});
+  require(lookup.kvBoundary == 64 && !lookup.state &&
+              cache.snapshot().stateCache.invalidations == 1,
+          "the state the failed step computed from stayed, or the blocks below it went");
+
+  model.nonFinitePrefills.clear();
+  engine.submit(request(3, prompt));
+  runUntilIdle(engine);
+  require(events.starts.back() == 0 && events.completedCount == 2,
+          "the next request resumed from the state a failed step computed from");
+}
+
+// A step from the restored state that was finite proves it: a later step
+// that is not finite leaves it, and the next request resumes from it.
+void testNonFiniteLaterStepKeepsTheRestoredState() {
+  test::TestKvStorage storage(32, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor model;
+  Events events;
+  EngineConfig config = test::engineConfig();
+  config.vocabularySize = 1000;
+  engine::Engine engine(config, cache, model, events);
+  guardReleases(storage, engine);
+  std::vector<uint32_t> prompt(129);
+  std::iota(prompt.begin(), prompt.end(), 1u);
+
+  engine.submit(request(1, std::vector<uint32_t>(prompt.begin(), prompt.begin() + 65)));
+  runUntilIdle(engine);
+  // Its prompt's steps from the state succeed; its first decode fails.
+  model.poisonRequest = 2;
+  model.poisonToken = 0xFFFFFFFFU;
+  engine.submit(request(2, prompt));
+  runUntilIdle(engine);
+  require(events.starts == std::vector<uint32_t>{0, 64} &&
+              events.failures == std::vector<std::string>{"model_result_invalid"},
+          "the request did not resume from the state and fail in its decode");
+  require(cache.lookup(prompt, {}).resumeBoundary() == 128 &&
+              cache.snapshot().stateCache.invalidations == 0,
+          "a failure after a finite step from the state took a state out of the cache");
+}
+
+// A result that is not finite can drain after a cancellation has already
+// ended its request: the cancellation stands as the end, and the state the
+// failed step computed from goes all the same.
+void testNonFiniteStepAfterCancellationInvalidatesTheState() {
+  test::TestKvStorage storage(32, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor model;
+  Events events;
+  engine::Engine engine(test::engineConfig(), cache, model, events);
+  guardReleases(storage, engine);
+  std::vector<uint32_t> prompt(129);
+  std::iota(prompt.begin(), prompt.end(), 1u);
+
+  engine.submit(request(1, std::vector<uint32_t>(prompt.begin(), prompt.begin() + 65)));
+  runUntilIdle(engine);
+  model.nonFinitePrefills = {2};
+  model.holdPrefillUntil = std::make_shared<std::atomic<bool>>(false);
+  engine.submit(request(2, prompt));
+  for (double now = 1; now < 100 && !engine.commandInFlight(); ++now)
+    static_cast<void>(engine.tick(now));
+  require(engine.commandInFlight(), "the resumed request did not launch its held prefill");
+  engine.cancel(2);
+  *model.holdPrefillUntil = true;
+  runUntilIdle(engine);
+  require(engine.snapshot().cancelled == 1 && events.failedCount == 0,
+          "the cancellation did not stand as the request's end");
+  require(!cache.lookup(prompt, {}).state && cache.snapshot().stateCache.invalidations == 1,
+          "a cancelled request's step that was not finite left the state it computed from");
 }
 
 void runUntilCheckpoint(engine::Engine &engine, uint64_t publications) {
@@ -8766,8 +9171,62 @@ void testWaitingEndsReleaseTheReplayPoint() {
   }
 }
 
+void testSpeculativeCountsStayWithEachConcurrentRequest() {
+  test::TestKvStorage storage(128, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor executor;
+  executor.decodeFinishes = false;
+  executor.speculativeCounts = {{1, {7, 2}}, {2, {7, 6}}};
+  Events events;
+  engine::Engine engine(test::engineConfig(), cache, executor, events);
+  guardReleases(storage, engine);
+  auto prose = request(1, std::vector<uint32_t>(65, 11));
+  prose.maxNewTokens = 6;
+  auto arithmetic = request(2, std::vector<uint32_t>(65, 12));
+  arithmetic.maxNewTokens = 21;
+  engine.submit(std::move(prose));
+  engine.submit(std::move(arithmetic));
+  runUntilIdle(engine);
+  require(events.speculativeCounts.at(1) == SpeculativeCounts{14, 4, 2} &&
+              events.speculativeCounts.at(2) == SpeculativeCounts{21, 18, 3} &&
+              events.draftedTokens == 14 + 21 &&
+              events.acceptedDraftTokens == 4 + 18 &&
+              events.outputs.at(1).size() == 6 && events.outputs.at(2).size() == 21,
+          "concurrent requests mixed or dropped their speculative counts");
+  auto score = request(3, std::vector<uint32_t>(65, 13));
+  score.maxNewTokens = 0;
+  score.scoreTokens = {1, 2};
+  engine.submit(std::move(score));
+  runUntilIdle(engine);
+  require(events.speculativeCounts.at(3) == SpeculativeCounts{},
+          "score-only request inherited speculative generation activity");
+}
+
+void testImpossibleSpeculativeCountsFailOnlyTheirOwnLane() {
+  test::TestKvStorage storage(128, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor executor;
+  executor.speculativeCounts = {{1, {7, 9}}, {2, {7, 1}}};
+  Events events;
+  engine::Engine engine(test::engineConfig(), cache, executor, events);
+  guardReleases(storage, engine);
+  engine.submit(request(1, std::vector<uint32_t>(65, 11)));
+  auto healthy = request(2, std::vector<uint32_t>(65, 12));
+  healthy.maxNewTokens = 2;
+  engine.submit(std::move(healthy));
+  runUntilIdle(engine);
+  require(events.failedCount == 1 && events.completedCount == 1 &&
+              !events.speculativeCounts.contains(1) &&
+              events.speculativeCounts.at(2) == SpeculativeCounts{7, 1, 1},
+          "invalid speculative counts poisoned another request's completion");
+}
+
 int main() {
   try {
+    testSpeculativeCountsStayWithEachConcurrentRequest();
+    testImpossibleSpeculativeCountsFailOnlyTheirOwnLane();
     testRunningRequestKeepsItsReplayPoint();
     testSuspendedRequestKeepsItsReplayPoint();
     testResumedLaneKeepsThePromptReplayPoint();
@@ -8781,6 +9240,9 @@ int main() {
     testEveryEndReleasesTheReplayPoint();
     testWaitingEndsReleaseTheReplayPoint();
     testConcurrentColdPrefixesComputeOnce();
+    testColdRequestReportsTheBlocksItReadFromTheCache();
+    testBlocksFoundCachedAfterTheLastCommandAreNotReported();
+    testCacheSaltsShareNothing();
     testSharedPrefillRebuildsTheMissingJunctionOnce();
     testSharedPrefillReleasesDifferentJunctionsIndependently();
     testSharedPrefillEvictedPublicationFallsBack();
@@ -8971,7 +9433,14 @@ int main() {
     testStalledSuspensionFailsWithCapacity();
     testTerminalAnchorWithoutKvIsNotCached();
     testPrefillCanCompleteTheRequest();
+    testFirstTokenIsSentAtPrefill();
+    testFirstTokenSentBeforeASuspensionIsNotSentAgain();
+    testResumedLaneClearsThePagesPastItsRestoredChain();
+    testReplayFindsItsOwnBlocks();
     testOutOfVocabularyOutputFailsLaneOnly();
+    testNonFiniteFirstStepAfterARestoreInvalidatesTheState();
+    testNonFiniteLaterStepKeepsTheRestoredState();
+    testNonFiniteStepAfterCancellationInvalidatesTheState();
     std::cout << "engine tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

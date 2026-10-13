@@ -32,37 +32,42 @@ class OutputBudgetTests(HarnessTestCase):
             app.prepare(chat_body(), deadline=FOREVER).max_new_tokens, 39998
         )
 
-    def test_context_window_rejects_output_budget_without_truncating(self):
+    def test_output_budget_is_a_ceiling_within_the_context_window(self):
+        # Clients such as Claude Code ask for the same limit on every turn:
+        # whichever field names the limit, a request generates up to what its
+        # prompt leaves of the window.
         runtime = FakeRuntime()
         harness = self.harness(runtime, max_context=10)
-        # Each error names the field its client sent and gives the counts.
-        cases = (
-            (
-                "/v1/chat/completions",
-                chat_body(max_completion_tokens=9),
-                "max_completion_tokens",
-            ),
-            ("/v1/chat/completions", chat_body(max_tokens=9), "max_tokens"),
-            (
-                "/v1/responses",
-                responses_body(max_output_tokens=9),
-                "max_output_tokens",
-            ),
-        )
-        for path, body, field in cases:
+        for path, body in (
+            ("/v1/chat/completions", chat_body(max_completion_tokens=9)),
+            ("/v1/chat/completions", chat_body(max_tokens=2**40)),
+            ("/v1/responses", responses_body(max_output_tokens=9)),
+            ("/v1/messages", anthropic_body(max_tokens=9)),
+        ):
             with self.subTest(path=path, body=body):
                 status, _, payload = harness.request("POST", path, body)
-                self.assertEqual(status, 400, payload)
-                self.assertRegex(
-                    json.loads(payload)["error"]["message"],
-                    rf"^prompt and {field} exceed the context window: "
-                    r"[1-9]\d* \+ 9 > 10 tokens$",
-                )
-                error = json.loads(payload)["error"]
-                self.assertEqual(error["type"], "invalid_request_error")
-                if path != "/v1/messages":
-                    self.assertEqual(error["code"], "context_length_exceeded")
-        self.assertEqual(runtime.requests, [])
+                self.assertEqual(status, 200, payload)
+                request = runtime.requests[-1].frame
+                self.assertEqual(request.prompt_tokens, (101, 102))
+                self.assertEqual(request.logical_max_output_tokens, 8)
+
+    def test_a_response_the_window_ends_finishes_as_at_its_limit(self):
+        runtime = FakeRuntime(*(Plan([[4]], reason="length") for _ in range(2)))
+        harness = self.harness(runtime, max_context=10)
+        status, _, payload = harness.request(
+            "POST", "/v1/chat/completions", chat_body(max_tokens=9)
+        )
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(json.loads(payload)["choices"][0]["finish_reason"], "length")
+        status, _, payload = harness.request(
+            "POST", "/v1/responses", responses_body(max_output_tokens=9)
+        )
+        self.assertEqual(status, 200, payload)
+        response = json.loads(payload)
+        self.assertEqual(
+            (response["status"], response["incomplete_details"]),
+            ("incomplete", {"reason": "max_output_tokens"}),
+        )
 
     def test_output_budget_errors_name_the_field_the_client_sent(self):
         runtime = FakeRuntime()
@@ -88,22 +93,6 @@ class OutputBudgetTests(HarnessTestCase):
                     f"{field} must be a positive integer",
                 )
         self.assertEqual(runtime.requests, [])
-
-    def test_anthropic_output_budget_is_clamped_to_the_remaining_window(self):
-        # Claude Code sends max_tokens 32K on every turn and does not compact
-        # for it; the request must proceed with what the window allows.
-        runtime = FakeRuntime()
-        harness = self.harness(runtime, max_context=10)
-        status, _, payload = harness.request(
-            "POST", "/v1/messages", anthropic_body(max_tokens=9)
-        )
-        self.assertEqual(status, 200, payload)
-        self.assertEqual(len(runtime.requests), 1)
-        request = runtime.requests[0].frame
-        self.assertEqual(
-            len(request.prompt_tokens) + request.logical_max_output_tokens, 10
-        )
-        self.assertGreaterEqual(request.logical_max_output_tokens, 1)
 
     def test_anthropic_reports_the_context_window_when_it_ends_the_response(self):
         # The prompt is 2 tokens of a 10-token window: max_tokens 9 is

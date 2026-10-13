@@ -76,15 +76,6 @@ QwenVisionWeights readVision(metal::MetalBackend &backend, WeightImages &images,
 
 } // namespace
 
-QwenVisionWeights loadQwenVisionWeights(metal::MetalBackend &backend, WeightImages &images,
-                                        const std::filesystem::path &directory,
-                                        ops::VisionLayout layout) {
-  requireVisionLayout(layout);
-  return readVision(backend, images,
-                    packageImage(directory / "model.bin", "vision/model.bin", kVisionMagic, layout.depth, 0),
-                    layout);
-}
-
 // The loader checked its layout when it was built.
 QwenVisionWeights loadQwenVisionWeights(metal::MetalBackend &backend, WeightImages &images,
                                         const VisionLoader &source) {

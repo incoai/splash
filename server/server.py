@@ -96,6 +96,15 @@ SSE_KEEPALIVE_SECONDS = 2.0
 NATIVE_START_TIMEOUT = 600.0
 ROOT = Path(__file__).parents[1]
 CHAT_HTML = Path(__file__).with_name("chat.html").read_bytes()
+CHAT_ASSETS = {
+    f"/chat-assets/{name}": (Path(__file__).parent / "chat-assets" / name).read_bytes()
+    for name in (
+        "markdown-it-15.0.2.min.js",
+        "highlight-11.12.0.min.js",
+        "github-11.12.0.min.css",
+        "github-dark-11.12.0.min.css",
+    )
+}
 # The chat page's brand mark, in its text colors, which the page shows too.
 # Browsers, and other clients, ask for a site's icon at /favicon.ico.
 FAVICON_SVG = Path(__file__).with_name("favicon.svg").read_bytes()
@@ -152,18 +161,16 @@ def _progress_flag(body):
 def _stream_options(body):
     """A Chat or text completion request's stream and its stream_options."""
     stream = body.get("stream", False)
-    if stream is None:
-        stream = False
-    options = body.get("stream_options")
-    if options is None:
-        options = {}
-    if (
-        not isinstance(stream, bool)
-        or not isinstance(options, dict)
-        or not isinstance(options.get("include_usage", False), bool)
-    ):
+    options = body.get("stream_options", {})
+    if not isinstance(stream, bool) or not isinstance(options, dict):
         raise APIError(400, "invalid streaming options")
-    return stream, {"include_usage": options.get("include_usage", False)}
+    # A null include_usage is one left out, as a null field is.
+    include_usage = options.get("include_usage")
+    if include_usage is None:
+        include_usage = False
+    if not isinstance(include_usage, bool):
+        raise APIError(400, "invalid streaming options")
+    return stream, {"include_usage": include_usage}
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,6 +188,9 @@ class PostRoute:
     # engine's state refuses none of its requests, which hold slots of the
     # token-count gate instead of the request gate.
     prompt_only: bool = False
+    # Whether it takes no fields: a request carries no body or an empty JSON
+    # object.
+    fieldless: bool = False
 
 
 POST_ROUTES = {
@@ -197,6 +207,9 @@ POST_ROUTES = {
     ),
     "/v1/judgments": PostRoute("_post_judgments", OPENAI_ERRORS),
     "/v1/systemone": PostRoute("_post_systemone", SYSTEMONE_ERRORS),
+    "/v1/memory/release": PostRoute(
+        "_post_memory_release", OPENAI_ERRORS, fieldless=True
+    ),
 }
 
 
@@ -221,9 +234,23 @@ class Collected:
     result: NativeResult
     # The output ended inside its reasoning.
     reasoning_open: bool
-    # The id of the call the token limit cut, whose arguments are
-    # unfinished; None when it cut none.
+    # The token limit or a stop sequence ended the output inside a call.
+    cut_in_call: bool
+    # The id of that call, whose arguments are unfinished; None when it cut
+    # none, or none whose name it had read.
     cut_call: str | None
+
+    @property
+    def cut(self):
+        """Whether the output's end cut its last block short: the token limit
+        cuts any block, a stop sequence only a call, as text may end where
+        the client asks."""
+        return self.result.reason == "length" or self.cut_in_call
+
+    @property
+    def called(self):
+        """Whether the output's tool calls count as made: it cut none."""
+        return bool(self.tool_calls) and not self.cut_in_call
 
 
 class FrontendHandler(BaseHTTPRequestHandler):
@@ -298,8 +325,11 @@ class FrontendHandler(BaseHTTPRequestHandler):
             )
             public = self.command == "OPTIONS" or (
                 self.command in ("GET", "HEAD")
-                and self.route
-                in ("/", "/index.html", "/favicon.ico", "/health", "/ready")
+                and (
+                    self.route
+                    in ("/", "/index.html", "/favicon.ico", "/health", "/ready")
+                    or self.route in CHAT_ASSETS
+                )
             )
             if not public:
                 authenticate(self.headers, self.server.api_key)
@@ -502,11 +532,14 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = self.route
-        if path in ("/", "/index.html", "/favicon.ico"):
+        if path in ("/", "/index.html", "/favicon.ico") or path in CHAT_ASSETS:
             if not self.server.webui:
                 self._safe_error(APIError(404, "not found", "not_found"))
             elif path == "/favicon.ico":
                 self._send(200, FAVICON_SVG, "image/svg+xml")
+            elif path in CHAT_ASSETS:
+                mime = "text/css" if path.endswith(".css") else "text/javascript"
+                self._send(200, CHAT_ASSETS[path], f"{mime}; charset=utf-8")
             else:
                 self._send(200, CHAT_HTML, "text/html; charset=utf-8")
             return
@@ -657,8 +690,16 @@ class FrontendHandler(BaseHTTPRequestHandler):
         """Read the request and serve it: answer it, or prepare the
         generation it asks for and return its job and the method that answers
         with the job's output."""
-        with self.app.latencies.measure("upload"):
-            body = self._read_json_body(started_at + self.app.request_timeout)
+        if route.fieldless and not self._unread_body:
+            body = {}
+        else:
+            with self.app.latencies.measure("upload"):
+                body = self._read_json_body(started_at + self.app.request_timeout)
+            # A field set to null is one left out, as clients that write every
+            # field they do not set as null mean it.
+            body = {key: value for key, value in body.items() if value is not None}
+            if route.fieldless and body:
+                raise APIError(400, "this endpoint takes no fields")
         serve = getattr(self, route.method)
         return serve(body, self.app.request_deadline(body, started_at))
 
@@ -725,7 +766,6 @@ class FrontendHandler(BaseHTTPRequestHandler):
             chat,
             deadline=deadline,
             output_field="max_tokens",
-            clamp_output_budget=True,
             thinking_display=thinking_display,
         )
         job.flags |= progress
@@ -756,6 +796,17 @@ class FrontendHandler(BaseHTTPRequestHandler):
             200,
             judgments.judgment_response(self.app.response_model, row, job, result),
         )
+
+    def _post_memory_release(self, body, deadline):
+        weights = self.app.backend.release_weights().get("weights") or {}
+        if weights.get("released") is not True:
+            raise APIError(
+                409,
+                "the engine is serving requests or restoring its weights; "
+                "the weights stay loaded",
+                "engine_busy",
+            )
+        self._json(200, {"released": True, "weights": weights})
 
     def _post_systemone(self, body, deadline):
         answers = {}
@@ -836,17 +887,22 @@ class FrontendHandler(BaseHTTPRequestHandler):
         except ConnectionError:
             return True
 
-    def _finalize_content(self, content, job, incomplete, projector):
+    def _finalize_content(self, content, job, result, projector, cut_in_call):
         """The content and calls of the output, and the events the stream
-        still owes. An answer without calls is validated against the response
-        format unless it was cut. `content` is read only without tools: with
-        tools, the projector holds the content."""
+        still owes. The token limit cuts the output wherever it ends, and a
+        stop sequence the call it ends inside; text before a stop sequence is
+        the text the client asked for. An answer without calls is validated
+        against the response format only when the model ended it. `content`
+        is read only without tools: with tools, the projector holds it."""
+        ended = result.reason != "length" and result.stop_sequence is None
         if job.tool_policy is None:
-            if not incomplete:
+            if ended:
                 validate_response_content(content, job.response_validator)
             return content, [], []
-        content, tool_calls, events = projector.finish(incomplete)
-        if not incomplete and not tool_calls:
+        content, tool_calls, events = projector.finish(
+            result.reason == "length" or cut_in_call
+        )
+        if ended and not tool_calls:
             validate_response_content(content, job.response_validator)
         return content, tool_calls, events
 
@@ -905,8 +961,13 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 result = value
         for field, text in splitter.finish():
             append(field, text)
+        cut_in_call = (
+            projector is not None
+            and projector.in_call
+            and (result.reason == "length" or result.stop_sequence is not None)
+        )
         content_text, tool_calls, events = self._finalize_content(
-            "".join(content), job, result.reason == "length", projector
+            "".join(content), job, result, projector, cut_in_call
         )
         publish(events)
         return Collected(
@@ -915,6 +976,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             tool_calls,
             result,
             splitter.reasoning,
+            cut_in_call,
             None if projector is None else projector.call_id,
         )
 
@@ -932,7 +994,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 job,
                 collected.result,
                 message,
-                bool(collected.tool_calls),
+                collected.called,
             ),
         )
 
@@ -953,9 +1015,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
             on_tool_delta=sequencer.tool,
         )
         result = collected.result
-        blocks = sequencer.finish(result.reason == "length", collected.reasoning_open)
+        blocks = sequencer.finish(collected.cut, collected.reasoning_open)
         if collected.cut_call is not None:
-            # A complete message leaves out the call the token limit cut.
+            # A complete message leaves out the call the output cut.
             blocks = [block for block in blocks if block.call_id != collected.cut_call]
         signature = (
             self.app.thinking_codec.encode(collected.reasoning)
@@ -969,7 +1031,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 job,
                 blocks,
                 result,
-                collected.tool_calls,
+                collected.called,
                 signature,
             ),
         )
@@ -1055,14 +1117,14 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 ),
             )
             result = collected.result
-            sequencer.finish(result.reason == "length", collected.reasoning_open)
+            sequencer.finish(collected.cut, collected.reasoning_open)
             send(
                 "message_delta",
                 {
                     "delta": {
                         "stop_reason": anthropic_stop(
                             result,
-                            collected.tool_calls,
+                            collected.called,
                             job.output_clamped_to_context,
                         ),
                         "stop_sequence": result.stop_sequence,
@@ -1087,7 +1149,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         result = collected.result
         incomplete = result.reason == "length"
         output = responses_output(
-            job, sequencer.finish(incomplete, collected.reasoning_open)
+            job, sequencer.finish(collected.cut, collected.reasoning_open)
         )
         response = responses_response(
             self.app.response_model,
@@ -1322,7 +1384,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             )
             result = collected.result
             incomplete = result.reason == "length"
-            sequencer.finish(incomplete, collected.reasoning_open)
+            sequencer.finish(collected.cut, collected.reasoning_open)
             status = "incomplete" if incomplete else "completed"
             response = responses_response(
                 self.app.response_model, job, status, output, result=result
@@ -1393,7 +1455,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             self._sse(
                 chunk(
                     empty,
-                    finish_reason(result, collected.tool_calls),
+                    finish_reason(result, collected.called),
                     timings=timings_dict(result),
                 )
             )
@@ -1590,6 +1652,8 @@ def _native_command(args):
         )
     if args.kv_format != "int8":
         command.extend(("--kv-format", args.kv_format))
+    if args.state_format != "fp32":
+        command.extend(("--state-format", args.state_format))
     if args.idle_release is not None:
         command.extend(
             ("--idle-release", serve_options.idle_release_text(args.idle_release))
@@ -1708,6 +1772,7 @@ def main():
             served_model_names=args.served_model_name,
             announce_served_name=args.announce_served_name,
             default_reasoning_effort=args.default_reasoning_effort,
+            default_thinking_token_budget=args.thinking_token_budget,
             vision=readiness.vision,
         )
         server.app = app

@@ -102,6 +102,20 @@ void testBf16BudgetAndStatus() {
           "BF16 startup admitted less than its minimum footprint");
 }
 
+// The memory status names the recurrent state's format, and a profile without
+// one is refused.
+void testStateFormatStatus() {
+  auto profile = model();
+  profile.stateFormat = ops::GdnStateFormat::BFloat16;
+  require(test::requireMemoryPlan(device(), profile).toStatusJson().find("\"state_format\":\"bf16\"") !=
+                  std::string::npos &&
+              test::requireMemoryPlan(device(), model()).toStatusJson().find("\"state_format\":\"fp32\"") !=
+                  std::string::npos,
+          "the memory status did not name the state format");
+  profile.stateFormat = {};
+  require(!evaluateEngineMemoryPlan(device(), profile, 0).plan, "a profile without a state format was planned");
+}
+
 // The minimum holds the KV runway, the whole smallest extents that hold the
 // pages startup warmup runs on: two of the 27B's 32-page BF16 extents.
 void testMinimumHoldsTheWarmupRunway() {
@@ -381,6 +395,7 @@ int main() {
   try {
     testUnifiedElasticBudget();
     testBf16BudgetAndStatus();
+    testStateFormatStatus();
     testMinimumHoldsTheWarmupRunway();
     testMinimumRequiredBytesIsThePlans();
     testUserCeilingAndFailure();

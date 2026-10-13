@@ -73,7 +73,11 @@ class OutputValidationTests(unittest.TestCase):
                 [
                     {
                         "type": "function",
-                        "function": {"name": "echo", "parameters": schema},
+                        "function": {
+                            "name": "echo",
+                            "parameters": schema,
+                            "strict": True,
+                        },
                     }
                 ],
                 "auto",

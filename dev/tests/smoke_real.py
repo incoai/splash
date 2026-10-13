@@ -1640,10 +1640,9 @@ def hold_model_root(arguments):
     """As splash serve does, serve every server this process starts, and its
     tokenizer, from one assembly, which installations keep while it is held:
     point arguments.model_root at the assembly it links now, held until the
-    process exits by arguments.held_record (None for a legacy package). The
-    installation that collects an assembly is the one of the models root it
-    was built in (models/.resolved/<record>), which may be another
-    checkout's."""
+    process exits by arguments.held_record. The installation that collects an
+    assembly is the one of the models root it was built in
+    (models/.resolved/<record>), which may be another checkout's."""
     resolved = arguments.model_root.resolve()
     models_root = (
         resolved.parent.parent

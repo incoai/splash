@@ -12,7 +12,6 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
 COMPLETIONS = REPO / "install/completions"
-OFFICIAL = ("official/Model-A", "official/Model-B")
 SUGGESTED = ("suggested/Model-4bit",)
 LOCAL = ("community/custom-splash", "community/linked-splash")
 GGUF = ("unsloth/Model-GGUF:Q8_0", "unsloth/Model-GGUF:UD-Q4_K_M")
@@ -92,26 +91,25 @@ class CompletionTests(unittest.TestCase):
         root = self.root / name
         directory = root / "install/completions"
         shutil.copytree(COMPLETIONS, directory)
-        (directory / "official-models.txt").write_text("\n".join(OFFICIAL) + "\n")
         (directory / "suggested-models.txt").write_text("\n".join(SUGGESTED) + "\n")
         if release:
             (root / "release.json").write_text("{}")
             models = self.home / "Library/Application Support/Splash/models"
         else:
             models = root / "install/models"
-        for model in (*OFFICIAL, LOCAL[0]):
+        for model in (*SUGGESTED, LOCAL[0]):
             model_root = models / model
             model_root.mkdir(parents=True, exist_ok=True)
-            (model_root / "manifest.json").write_text("{}")
+            (model_root / "model.json").write_text("{}")
         linked = self.root / (name + " external model")
         linked.mkdir()
-        (linked / "manifest.json").write_text("{}")
+        (linked / "model.json").write_text("{}")
         (models / LOCAL[1]).unlink(missing_ok=True)
         (models / LOCAL[1]).symlink_to(linked, target_is_directory=True)
         (models / "community/broken-link").unlink(missing_ok=True)
         (models / "community/broken-link").symlink_to(self.root / "missing")
         (models / "community/incomplete").mkdir(exist_ok=True)
-        (models / "community/directory-manifest/manifest.json").mkdir(
+        (models / "community/directory-record/model.json").mkdir(
             parents=True, exist_ok=True
         )
         # Upstream installations link assemblies that record model.json.
@@ -139,7 +137,7 @@ class CompletionTests(unittest.TestCase):
         ):
             path = models / invalid
             path.mkdir(parents=True, exist_ok=True)
-            (path / "manifest.json").write_text("{}")
+            (path / "model.json").write_text("{}")
         return root, directory
 
     def run_helper(self, directory, prefix=""):
@@ -220,39 +218,12 @@ class CompletionTests(unittest.TestCase):
                 _, directory = self.layout(str(release), release=release)
                 self.assertEqual(
                     self.run_helper(directory),
-                    sorted((*OFFICIAL, *SUGGESTED, *LOCAL, *UPSTREAM)),
+                    sorted((*SUGGESTED, *LOCAL, *UPSTREAM)),
                 )
                 self.assertEqual(self.run_helper(directory, "unsloth/"), list(GGUF))
                 self.assertEqual(self.run_helper(directory, "community/l"), [LOCAL[1]])
                 self.assertEqual(self.run_helper(directory, "community/*"), [])
                 self.assertEqual(self.run_helper(directory, "["), [])
-
-    def test_cached_catalog_adds_valid_entries_in_source_and_release(self):
-        for release in (False, True):
-            with self.subTest(release=release):
-                root, directory = self.layout(str(release), release=release)
-                data = (
-                    self.home / "Library/Application Support/Splash"
-                    if release
-                    else root / "build/runtime"
-                )
-                cache = data / "catalog/official-models.txt"
-                cache.parent.mkdir(parents=True)
-                cache.write_text(
-                    "official/New\n../outside\ninvalid\nofficial/Model-A\n"
-                )
-                self.assertEqual(
-                    self.run_helper(directory),
-                    sorted((*OFFICIAL, *SUGGESTED, *LOCAL, *UPSTREAM, "official/New")),
-                )
-                self.assertEqual(
-                    self.run_helper(directory, "official/N"), ["official/New"]
-                )
-                cache.write_text("invalid\n")
-                self.assertEqual(
-                    self.run_helper(directory),
-                    sorted((*OFFICIAL, *SUGGESTED, *LOCAL, *UPSTREAM)),
-                )
 
     def test_actual_bash_completion(self):
         _, directory = self.layout()
@@ -264,14 +235,14 @@ class CompletionTests(unittest.TestCase):
             (["splash", "co"], ["codex"]),
             (
                 ["splash", "serve", "--model", ""],
-                sorted((*OFFICIAL, *SUGGESTED, *LOCAL, *UPSTREAM)),
+                sorted((*SUGGESTED, *LOCAL, *UPSTREAM)),
             ),
             (["splash", "serve", "--model", "community/l"], [LOCAL[1]]),
             (["splash", "serve", "--model=community/l"], [LOCAL[1]]),
             (["splash", "serve", "--model", "=", "community/l"], [LOCAL[1]]),
             (
                 ["splash", "serve", "--model", "="],
-                sorted((*OFFICIAL, *SUGGESTED, *LOCAL, *UPSTREAM)),
+                sorted((*SUGGESTED, *LOCAL, *UPSTREAM)),
             ),
             (["splash", "serve", "--", "--model", ""], []),
             (["splash", "serve", "--max-context", ""], []),
@@ -554,7 +525,7 @@ class CompletionTests(unittest.TestCase):
     @unittest.skipUnless(FISH, "fish is not installed")
     def test_actual_fish_completion(self):
         _, directory = self.layout()
-        models = sorted((*OFFICIAL, *SUGGESTED, *LOCAL, *UPSTREAM))
+        models = sorted((*SUGGESTED, *LOCAL, *UPSTREAM))
         cases = (
             (
                 "splash ",

@@ -66,21 +66,21 @@ void attention() {
 
 // Expert ids, route rows and grouped routes are uint32, routing weights fp32
 // and activations bf16. The grouped input first holds the router's fp32
-// scores, one row of 256 per token. The split prefill plan parks its gate in
+// scores, one row of 256 per token. Every plan parks its gate in
 // expertOutput, so that field spans the wider of the hidden and intermediate
-// widths.
+// widths. Plans of the staged tiles hold no sums.
 void checkMoe(splash::ops::MoeWorkspace workspace,
-              splash::ops::MoeShape shape, uint32_t rows, uint32_t tileRows,
-              uint32_t outputWidth) {
+              splash::ops::MoeShape shape, uint32_t rows, uint32_t tileRows) {
   using splash::model::kBFloat16Bytes;
   constexpr uint64_t kRouterScores = 256;
+  const uint64_t outputWidth = std::max(shape.hiddenSize, shape.expertIntermediateSize);
   const uint64_t routes = uint64_t{rows} * shape.routesPerToken();
   const uint64_t tiles = splash::ops::moeMaximumTiles(rows, shape, tileRows);
   const uint64_t grouped = tiles * tileRows;
   require(workspace.selectedExpertsBytes == routes * sizeof(uint32_t) &&
               workspace.routingWeightsBytes == routes * sizeof(float) &&
               workspace.tileDescriptorsBytes == tiles * sizeof(MoeTileDescriptor) &&
-              workspace.tileCountBytes == sizeof(uint32_t) &&
+              workspace.tileCountBytes == sizeof(MoeTileCount) &&
               workspace.groupedRoutesBytes == grouped * sizeof(uint32_t) &&
               workspace.routeRowsBytes == routes * sizeof(uint32_t) &&
               workspace.groupedInputBytes == std::max(grouped * shape.hiddenSize * kBFloat16Bytes,
@@ -96,14 +96,12 @@ void moe() {
   using namespace splash::ops;
   for (const MoeShape shape : {MoeShape{256, 8, 2, 512},
                                MoeShape{2048, 256, 8, 512}}) {
-    const uint32_t splitWidth =
-        std::max(shape.hiddenSize, shape.expertIntermediateSize);
     for (uint32_t rows = 1; rows <= 2048; ++rows)
-      checkMoe(MoE::prefillPlan(shape, rows, {MoeExpertTile::M32}).workspace(), shape, rows, 32, splitWidth);
+      checkMoe(MoE::prefillPlan(shape, rows, {MoeExpertTile::M32}).workspace(), shape, rows, 32);
     const auto single = MoE::decodePlan(shape, 1, {MoeExpertTile::M8}).workspace();
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
       const auto workspace = MoE::decodePlan(shape, lanes, {MoeExpertTile::M8}).workspace();
-      checkMoe(workspace, shape, lanes * 8, 8, shape.hiddenSize);
+      checkMoe(workspace, shape, lanes * 8, 8);
       require(workspace.groupedInputBytes <= lanes * single.groupedInputBytes &&
                   workspace.tileDescriptorsBytes <=
                       lanes * single.tileDescriptorsBytes,

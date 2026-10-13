@@ -24,7 +24,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import assembly, families, gguf, hub, legacy, models
+from . import assembly, families, gguf, hub, models
 
 # The tokenizer files an MLX target may supply, linked when present.
 TOKENIZER_FILES = (
@@ -36,6 +36,13 @@ TOKENIZER_FILES = (
     "added_tokens.json",
     "special_tokens_map.json",
 )
+# The name prefixes of a safetensors checkpoint's vision tower tensors: MLX's,
+# and transformers' (as NVIDIA's Model Optimizer keeps them).
+VISION_TOWER = ("vision_tower.", "model.visual.")
+# Where an MLX repository keeps its image processor's configuration: a file of
+# its own, or the image_processor object of processor_config.json, where newer
+# Transformers releases save it.
+PROCESSOR_FILES = ("preprocessor_config.json", "processor_config.json")
 
 
 @dataclass(frozen=True)
@@ -108,13 +115,13 @@ def select_gguf(files, variant):
 def select_vision(repo):
     """The name and header of the GGUF repository's vision projector, chosen
     by content among its root GGUF files named mmproj, whatever the publisher
-    calls them: a clip model whose weights are BF16, or F32, which
-    preparation converts only where every value is exact; BF16 is preferred.
-    The tower runs in BF16 and preparation never rounds a weight: F16 has a
-    narrower exponent than BF16, so an F16 projector has already rounded
-    small weights, as a quantized one has. Each header costs a few range
-    requests."""
-    usable, found = {"BF16": [], "F32": []}, []
+    calls them: a clip model whose weights are BF16, F32 or F16, preferred in
+    that order. The tower runs in BF16 and preparation never rounds a weight:
+    it converts F32 and F16 only where every value is exact. An F16 projector
+    made from a BF16 tower is: F16 rounds the smallest BF16 weights onto its
+    subnormal grid, and what that keeps is still a BF16. Each header costs a
+    few range requests."""
+    usable, found = {"BF16": [], "F32": [], "F16": []}, []
     for name in filter(_projector_named, _root_ggufs(repo.files)):
         with repo.open(name) as stream:
             header = gguf.Metadata(stream, tensors=True)
@@ -124,8 +131,9 @@ def select_vision(repo):
             for kind in header.tensors.values()
         }
         found.append(f"{name} ({architecture}: {', '.join(sorted(types))})")
-        if architecture == "clip" and types and types <= {"BF16", "F32"}:
-            usable["BF16" if "BF16" in types else "F32"].append((name, header))
+        if architecture == "clip" and types and types <= {"BF16", "F32", "F16"}:
+            precision = next(p for p in ("F16", "BF16", "F32") if p in types)
+            usable[precision].append((name, header))
     for precision, projectors in usable.items():
         if len(projectors) == 1:
             return projectors[0]
@@ -136,7 +144,7 @@ def select_vision(repo):
                 + ", describe no single tower; use --language-only to serve text only"
             )
     raise models.ModelError(
-        "the GGUF repository has no BF16 or F32 vision projector ("
+        "the GGUF repository has no BF16, F32 or F16 vision projector ("
         + ("; ".join(found) or "no GGUF named mmproj")
         + "); use --language-only to serve text only"
     )
@@ -206,17 +214,15 @@ def _gguf_target(repo, variant, language_only, scratch):
 
 def _mlx_target(repo, language_only):
     required = {"config.json", "tokenizer.json", "tokenizer_config.json"}
-    if not language_only:
-        required.add("preprocessor_config.json")
-    if missing := required - repo.files:
-        # --language-only drops the processor requirement and no other.
-        hint = (
-            "; use --language-only to serve text only"
-            if missing == {"preprocessor_config.json"}
-            else ""
-        )
+    missing = sorted(required - repo.files)
+    # --language-only drops the processor requirement and no other.
+    processor = language_only or any(n in repo.files for n in PROCESSOR_FILES)
+    if missing or not processor:
+        hint = "" if missing else "; use --language-only to serve text only"
+        if not processor:
+            missing.append(" or ".join(PROCESSOR_FILES))
         raise models.ModelError(
-            f"target repository {repo.name} is missing: {', '.join(sorted(missing))}. "
+            f"target repository {repo.name} is missing: {', '.join(missing)}. "
             "Configuration, tokenizer and processor must come from the target "
             f"repository{hint}."
         )
@@ -229,8 +235,8 @@ def _mlx_target(repo, language_only):
     files |= {"tokenizer/" + n: n for n in TOKENIZER_FILES if n in repo.files}
     vision_format = "none"
     if not language_only:
-        _validate_processor(models.read_json(repo.file("preprocessor_config.json")))
-        shards = _weight_files(repo, "vision_tower.")
+        _validate_processor(_image_processor(repo))
+        shards = _weight_files(repo, VISION_TOWER)
         if not shards:
             raise models.ModelError(
                 f"{repo.name} has no vision tower; use --language-only to serve text only"
@@ -239,12 +245,31 @@ def _mlx_target(repo, language_only):
         check_model("mlx-affine", vision_format, config)
         files["vision/config.json"] = "config.json"
         files |= {"vision/" + n: n for n in shards}
-    files |= {"target/" + n: n for n in _weight_files(repo)}
+    # The target's shards: those holding a tensor other than the tower's. A
+    # tower in a shard of its own is not the target's (an OptiQ checkpoint
+    # keeps it in a subdirectory).
+    files |= {"target/" + n: n for n in _weight_files(repo, exclude=VISION_TOWER)}
     return Target("mlx-affine", vision_format, config, None, family, files)
 
 
-def _weight_files(repo, prefix=""):
-    """The checkpoint's shards holding a tensor whose name starts with prefix."""
+def _image_processor(repo):
+    """An MLX target's image processor configuration, from the first of
+    PROCESSOR_FILES the repository has."""
+    if "preprocessor_config.json" in repo.files:
+        return models.read_json(repo.file("preprocessor_config.json"))
+    config = models.read_json(repo.file("processor_config.json")).get("image_processor")
+    if not isinstance(config, dict):
+        raise models.ModelError(
+            f"{repo.name}'s processor_config.json has no image_processor; "
+            "use --language-only to serve text only"
+        )
+    return config
+
+
+def _weight_files(repo, prefix="", exclude=None):
+    """The checkpoint's shards holding a tensor whose name starts with prefix,
+    and not with exclude (each a string or a tuple of them). exclude filters
+    an index's shards; a single model.safetensors is always the checkpoint's."""
     if "model.safetensors.index.json" in repo.files:
         index = models.read_json(repo.file("model.safetensors.index.json"))
         weights = index.get("weight_map")
@@ -252,9 +277,14 @@ def _weight_files(repo, prefix=""):
             raise models.ModelError("invalid safetensors shard index")
         if not all(isinstance(name, str) for name in weights.values()):
             raise models.ModelError("invalid safetensors shard filename")
-        names = {file for tensor, file in weights.items() if tensor.startswith(prefix)}
+        names = {
+            file
+            for tensor, file in weights.items()
+            if tensor.startswith(prefix)
+            and not (exclude and tensor.startswith(exclude))
+        }
     elif "model.safetensors" in repo.files:
-        # One file: its header says whether it holds such a tensor.
+        # One file: its header is read only to look for prefix.
         holds = not prefix or any(
             tensor.startswith(prefix)
             for tensor in _safetensors_tensors(repo, "model.safetensors")
@@ -275,8 +305,9 @@ def _safetensors_tensors(repo, name):
     little-endian), then a JSON object, read on demand, without a download."""
     with repo.open(name) as stream:
         size = int.from_bytes(stream.read(8), "little")
-        # The native checkpoint reader's bound on one header.
-        if not 2 <= size <= 1 << 20:
+        # The native checkpoint reader's bound on one header, the safetensors
+        # format's own.
+        if not 2 <= size <= 100_000_000:
             raise models.ModelError(f"invalid safetensors header in {name}")
         try:
             header = json.loads(stream.read(size))
@@ -311,12 +342,15 @@ def prepare(selection):
     decides when none is made). The installed assembly of those commits
     starts; a new commit is installed and published atomically; when the Hub
     cannot answer, or a new commit cannot be installed, the verified
-    installation starts instead. A legacy Splash package is installed by
-    legacy.prepare."""
+    installation starts instead. A Splash package, installed or on the Hub,
+    is refused (models.refuse_package)."""
     kind = models.installation_kind(selection.link)
     if kind == models.PACKAGE:
-        legacy.prepare(selection)
-        return
+        models.refuse_package(
+            selection.model,
+            models.read_json(selection.link / "manifest.json"),
+            selection.link,
+        )
     installed = None
     if kind == models.ASSEMBLY:
         try:
@@ -330,22 +364,14 @@ def prepare(selection):
         installation=selection.link,
         installed=installed_commit,
     )
-    if installed is None and _is_legacy_package(target, selection.model):
-        legacy.prepare(selection)
-    elif installed is not None and target.revision == installed_commit:
+    if installed is None and "manifest.json" in target.files:
+        with hub.as_model_errors(f"cannot install {selection.model}"):
+            manifest = models.read_json(target.file("manifest.json"))
+        models.refuse_package(selection.model, manifest)
+    if installed is not None and target.revision == installed_commit:
         _start_installed(selection, target, installed)
     else:
         _install_commit(selection, target, installed)
-
-
-def _is_legacy_package(repo, model):
-    """Whether the target repository is a legacy Splash package, whose
-    manifest.json names a package format."""
-    if "manifest.json" not in repo.files:
-        return False
-    with hub.as_model_errors(f"cannot install {model}"):
-        manifest = models.read_json(repo.file("manifest.json"))
-    return legacy.is_package_manifest(manifest)
 
 
 def _start_installed(selection, target, installed):

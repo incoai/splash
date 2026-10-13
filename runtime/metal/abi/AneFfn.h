@@ -51,9 +51,9 @@ struct AneFfnPackParams {
 };
 
 // Rotated int8 of a projection: its output rows [row, row + N) and inputs
-// [input, input + width), where groups is its input count / 64 (affine Q4) or
-// / 32 (a GGUF image tensor of GGUF_FMT_* format), into rows of stride bytes
-// and their scales scale_stride halves apart.
+// [input, input + width), where groups is its input count / 32 (an image
+// tensor of GGUF_FMT_* format), into rows of stride bytes and their scales
+// scale_stride halves apart.
 struct AneFfnWeightParams {
   uint32_t groups;
   uint32_t row;

@@ -278,10 +278,9 @@ class TextCompletionTests(unittest.TestCase):
         self.assertEqual(request.priority, wire.RequestPriority.FOREGROUND)
         invalid = (
             ({"min_p": 1.1}, "min_p must be a number in [0, 1]"),
-            ({"seed": 2**64}, "seed must be an unsigned 64-bit integer"),
+            ({"seed": 2**64}, "seed must be a 64-bit integer"),
             ({"priority": "urgent"}, "priority must be"),
             ({"max_tokens": 0}, "max_tokens must be a positive integer"),
-            ({"max_tokens": 12}, "prompt and max_tokens exceed the context window"),
             ({"model": "other-model"}, "model other-model not found"),
             ({"timeout": 0}, "timeout must be positive"),
         )
@@ -290,7 +289,15 @@ class TextCompletionTests(unittest.TestCase):
                 status, response = self.complete(harness, **fields)
                 self.assertIn(status, (400, 404))
                 self.assertIn(message, response["error"]["message"])
-        self.assertEqual(len(runtime.requests), 1)
+        # A limit past what the prompt leaves of the window generates up to
+        # its end, as in Chat.
+        status, response = self.complete(harness, max_tokens=12)
+        self.assertEqual(status, 200, response)
+        request = runtime.requests[-1].frame
+        self.assertEqual(
+            len(request.prompt_tokens) + request.logical_max_output_tokens, 16
+        )
+        self.assertEqual(len(runtime.requests), 2)
 
     def test_openai_sdk_reads_completions_and_streams(self):
         harness, _ = self.harness(Plan([[14], [15]]), Plan([[14], [15]]))

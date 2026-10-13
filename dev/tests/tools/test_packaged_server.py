@@ -19,6 +19,7 @@ def stage_release(directory):
     stage.mkdir()
     for folder, names in (
         ("server", package.SERVER_FILES),
+        ("server/chat-assets", package.CHAT_ASSET_FILES),
         ("install", package.INSTALL_FILES),
         ("install/completions", package.COMPLETION_FILES),
     ):

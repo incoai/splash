@@ -59,10 +59,13 @@ memoryPressureName(MemoryPressure pressure) noexcept {
 
 [[nodiscard]] std::optional<MemoryPressure> querySystemMemoryPressure() noexcept;
 
-// Allocation and recovery use separate watermarks to avoid oscillation.
-// Low availability causes paced reclaim and pauses growth that no request in
-// service needs; unavailable telemetry does the same; the OS critical signal
-// causes full eviction of unpinned cache entries and stops all growth.
+// Growth that no request in service needs leaves the warning margin free.
+// Once the host has run short, a request that waits for memory has the paced
+// reclaim free toward the recovery margin, and such growth waits for that
+// margin meanwhile, so that what reclaim frees goes to the request; with no
+// request waiting, a pass only restores the warning margin and growth keeps
+// to it. Unavailable telemetry pauses growth; the OS critical signal causes
+// full eviction of unpinned cache entries and stops all growth.
 inline constexpr uint64_t kHostWarningMarginBytes = 1ULL << 30;
 inline constexpr uint64_t kHostRecoveryMarginBytes = 2ULL << 30;
 
@@ -91,8 +94,8 @@ struct MemoryGovernorSnapshot {
 
 // Critical pressure evicts every unpinned entry and takes what a request
 // starts from, one lane's pooled state buffers and the empty KV runway
-// extent, so it has no target. Every other pass keeps those, since growth is
-// paused; targetBytes zero returns only empty extents. keepResumePoint keeps
+// extent, so it has no target. Every other pass keeps those for the growth
+// that follows; targetBytes zero returns only empty extents. keepResumePoint keeps
 // the newest state publication (else the newest checkpoint), the point a
 // follow-up request resumes from; only a shrink nothing waits for can afford
 // to.
@@ -126,7 +129,8 @@ class MemoryPressurePolicy final {
 public:
   // The pass to run now; none under normal pressure. requestWaiting reports
   // whether a request cannot proceed for want of memory. Without one the
-  // pass is speculative and keeps the resume point.
+  // pass is speculative: it only restores the warning margin and keeps the
+  // resume point.
   [[nodiscard]] std::optional<MemoryReclaimDirective>
   update(const MemoryGovernorSnapshot &snapshot, double nowMilliseconds,
          bool requestWaiting) noexcept;
@@ -168,7 +172,8 @@ public:
   // whether or not the limit does too, and EngineBudget when only the limit
   // does. The host refuses under critical pressure and, unless a request in
   // service needs the bytes (setServing), inside the warning margin or while
-  // it holds for the recovery margin.
+  // it holds for the recovery margin for a waiting request
+  // (setRequestWaiting).
   [[nodiscard]] metal::AllocationAdmission allocationAdmission() noexcept;
   // Marks the reservations that follow as memory a request in service needs,
   // until it is cleared. The host's margins do not refuse those: holding
@@ -176,6 +181,10 @@ public:
   // the cache it could give up instead is what the paced reclaim returns.
   // The limit and critical pressure refuse them like any other.
   void setServing(bool serving) noexcept;
+  // Whether a request cannot proceed for want of memory, as each control pass
+  // finds: only then does growth wait for the recovery margin once the host
+  // has run short.
+  void setRequestWaiting(bool waiting) noexcept;
   void setPressure(MemoryPressure pressure) noexcept;
   // The outcome of the engine's last reclaim pass with a target. While one
   // finds nothing left to release, the hold for the recovery margin is
@@ -220,12 +229,17 @@ private:
     // Reclaim found nothing to release in this episode of host pressure.
     bool reclaimExhausted = false;
 
-    // Growth waits for the recovery margin.
+    // Short of the recovery margin with reclaim not yet exhausted.
     [[nodiscard]] bool held() const noexcept {
       return constrained && !reclaimExhausted;
     }
   };
 
+  // Growth that no request in service needs waits for the recovery margin
+  // while the host holds and a request waits for memory.
+  [[nodiscard]] bool growthHeld(const HostState &host) const noexcept {
+    return requestWaiting_ && host.held();
+  }
   // allocationAdmission's reservation, or nothing with the cause of the
   // refusal in failure.
   [[nodiscard]] std::optional<Reservation>
@@ -253,6 +267,7 @@ private:
   uint64_t untrackedReserveBytes_ = 0;
   uint64_t reservedBytes_ = 0;
   bool serving_ = false;
+  bool requestWaiting_ = false;
   uint64_t deniedReservations_ = 0;
   MemoryPressure systemPressure_ = MemoryPressure::Normal;
   // As the latest reservation or control pass evaluated it.

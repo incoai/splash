@@ -5,9 +5,8 @@ prints the component, size and SHA-256 of every image it holds
 (dev/tools/weight_digests.mm). Both builds must load the same images with the
 same bytes.
 
-Builds of earlier releases have no weight-digests and loaded a package's
-files as they are, so a package's are not compared with theirs. Those that
-prepared an assembly's images into a cache, <cache>/<key>/{weights, sha256,
+Builds of earlier releases that have no weight-digests and prepared an
+assembly's images into a cache, <cache>/<key>/{weights, sha256,
 source}, have build/engine/WeightPreparationIdentity.hpp: such a baseline
 prepares into a cache of its own, whose images are compared after its rounds.
 Once the release baselines of assemblies have weight-digests, delete
@@ -103,15 +102,12 @@ def compare(baseline: dict, candidate: dict) -> dict:
 
 
 def compare_builds(
-    baseline: Path, candidate: Path, model_root: Path, environment: dict, assembly: bool
+    baseline: Path, candidate: Path, model_root: Path, environment: dict
 ) -> dict:
     """Compares the images the build directories load from model_root, which
-    both were given; environment started the baseline, and assembly says
-    whether model_root is one."""
+    both were given; environment started the baseline."""
     if loads_in_memory(baseline):
         images = digests(baseline, model_root)
-    elif not assembly:
-        return {"images": [], "failures": [], "pass": True}
     elif (Path(baseline) / IDENTITY_HEADER).is_file():
         images = prepared(environment, model_root)
     else:

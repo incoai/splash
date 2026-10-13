@@ -4,6 +4,7 @@ import errno
 import fcntl
 import io
 import json
+import re
 import shutil
 import tempfile
 import unittest
@@ -29,7 +30,7 @@ from dev.tests.installer_fixtures import (
     pins,
     selection,
 )
-from install import assembly, families, hub, legacy, models, paths, upstream
+from install import assembly, families, hub, models, paths, upstream
 
 # The engine's refusal of a model of no family Splash serves, naming what
 # tells it apart.
@@ -239,7 +240,7 @@ class UpstreamTest(unittest.TestCase):
             self.assertEqual(fake.requests, [(model, None)])
             self.assertEqual(fake.downloads, [f"{model}/config.json"])
 
-    def test_only_a_splash_manifest_makes_a_legacy_package(self):
+    def test_only_a_splash_manifest_is_refused_as_a_package(self):
         def target(root):
             mlx_target(root, DENSE)
             (root / "manifest.json").write_text(json.dumps({"name": "a tool's file"}))
@@ -255,43 +256,45 @@ class UpstreamTest(unittest.TestCase):
                 (p / "manifest.json").write_text(json.dumps(package)),
             ),
         )
-        packaged = selection(self.root, "someone/package", language_only=False)
-        with mock.patch.object(legacy, "prepare") as install_package:
-            self.prepare(selection(self.root))
-            self.prepare(packaged)
-        install_package.assert_called_once_with(packaged)
+        self.prepare(selection(self.root))
         self.assertEqual(
             assembly.verify(selection(self.root).link)["sources"]["target"]["revision"],
             "b" * 40,
         )
+        with self.assertRaisesRegex(
+            models.ModelError,
+            "someone/package is a Splash package, which Splash no longer loads; "
+            "serve the MLX model of its family instead: splash serve --model "
+            "mlx-community/Qwen3.8-27B-4bit",
+        ):
+            self.prepare(selection(self.root, "someone/package", language_only=False))
+        self.assertFalse(selection(self.root, "someone/package").link.exists())
 
-    def test_a_package_rejects_source_options(self):
-        fake = FakeHub(self, self.cache)
-        fake.publish(
-            "someone/package",
-            "c" * 40,
-            lambda p: (
-                p.mkdir(parents=True),
-                (p / "manifest.json").write_text(
-                    json.dumps({"format": {"name": "splash-packed-q4"}})
-                ),
-            ),
+    def test_an_installed_splash_package_is_refused_before_any_request(self):
+        # What an earlier release installed: a link to the package's snapshot.
+        chosen = selection(self.root, "someone/package", language_only=False)
+        snapshot = self.cache / "models--someone--package/snapshots" / ("c" * 40)
+        snapshot.mkdir(parents=True)
+        (snapshot / "manifest.json").write_text(
+            json.dumps({"format": {"name": "splash-packed-q4-moe"}})
         )
-        for options in ({"revision": "c" * 40}, {"language_only": True}):
-            with (
-                self.subTest(options=options),
-                self.assertRaisesRegex(models.ModelError, "require an upstream"),
-            ):
-                self.prepare(
-                    selection(
-                        self.root,
-                        "someone/package",
-                        **{"language_only": False} | options,
-                    )
-                )
-        self.assertEqual(fake.downloads, ["someone/package/manifest.json"])
+        chosen.link.parent.mkdir(parents=True)
+        chosen.link.symlink_to(snapshot, target_is_directory=True)
+        fake = FakeHub(self, self.cache)
+        # The message names the Hub cache folder the package's files take.
+        with self.assertRaisesRegex(
+            models.ModelError,
+            re.escape(
+                "someone/package is a Splash package, which Splash no longer loads "
+                f"(its files in {(self.cache / 'models--someone--package').resolve()} "
+                "can be deleted); serve the MLX model of its family instead: "
+                "splash serve --model mlx-community/Qwen3.6-35B-A3B-4bit"
+            ),
+        ):
+            self.prepare(chosen)
+        self.assertEqual((fake.requests, fake.downloads), ([], []))
 
-    def test_only_mlx_affine_quantization_is_accepted(self):
+    def test_only_mlx_formats_splash_loads_are_accepted(self):
         def target(quantization):
             def build(root):
                 mlx_target(root, DENSE)
@@ -302,10 +305,14 @@ class UpstreamTest(unittest.TestCase):
             return build
 
         fake = fake_hub(self, self.cache)
-        first = "quantization language_model.model.layers.0.linear_attn.in_proj_qkv"
         required = (
-            "this model requires an MLX affine 4-bit/group-64 checkpoint or a "
-            "supported GGUF"
+            r"this model requires an MLX checkpoint \(affine 2, 3, 4, 5, 6 or 8 bits "
+            r"in groups of 32, 64 or 128, mxfp4 or nvfp4\), an NVFP4 checkpoint of "
+            r"Model Optimizer or compressed-tensors, or a supported GGUF"
+        )
+        formats = (
+            r"; MLX weights load as affine 2, 3, 4, 5, 6 or 8 bits in groups of 32, "
+            "64 or 128, or as mxfp4 or nvfp4"
         )
         for name, quantization, refusal in (
             # A transformers quantization_config alone is another method.
@@ -332,24 +339,124 @@ class UpstreamTest(unittest.TestCase):
                 required,
             ),
             (
-                "mxfp4",
-                {"quantization": {"mode": "mxfp4", "bits": 4, "group_size": 64}},
-                first + " mode must be affine",
+                "nvfp4-g32",
+                {"quantization": {"mode": "nvfp4", "bits": 4, "group_size": 32}},
+                "quantization is nvfp4 4-bit in groups of 32" + formats,
+            ),
+            # Model Optimizer's NVFP4 and FP8 only, its activation scales unused.
+            (
+                "modelopt-awq",
+                {
+                    "quantization_config": {
+                        "quant_method": "modelopt",
+                        "quant_algo": "W4A8_AWQ",
+                    }
+                },
+                "quantization_config is W4A8_AWQ; Model Optimizer weights load as "
+                "NVFP4, W4A16_NVFP4 or FP8",
             ),
             (
-                "q8",
-                {"quantization": {"bits": 8, "group_size": 64}},
-                first + " bits mismatch: MLX 8, runtime 4",
+                "mxfp4-g64",
+                {"quantization": {"mode": "mxfp4", "bits": 4, "group_size": 64}},
+                "quantization is mxfp4 4-bit in groups of 64" + formats,
+            ),
+            (
+                "q7",
+                {"quantization": {"bits": 7, "group_size": 64}},
+                "quantization is affine 7-bit in groups of 64" + formats,
+            ),
+            (
+                "q4-g256",
+                {
+                    "quantization": {
+                        "bits": 4,
+                        "group_size": 64,
+                        "language_model.model.layers.0.mlp.down_proj": {
+                            "bits": 4,
+                            "group_size": 256,
+                        },
+                    }
+                },
+                "quantization language_model.model.layers.0.mlp.down_proj is "
+                "affine 4-bit in groups of 256" + formats,
+            ),
+            # MLX writes false for a module it leaves unquantized.
+            (
+                "bf16-head",
+                {
+                    "quantization": {
+                        "bits": 4,
+                        "group_size": 64,
+                        "language_model.lm_head": False,
+                    }
+                },
+                "quantization language_model.lm_head is unquantized; Splash loads "
+                "quantized MLX projections",
             ),
         ):
             with self.subTest(name=name):
                 fake.publish(f"someone/{name}", "b" * 40, target(quantization))
+                fake.downloads.clear()
                 with self.assertRaisesRegex(models.ModelError, refusal):
                     self.prepare(selection(self.root, f"someone/{name}"))
-        # MLX writes both keys, and states the mode only in newer versions.
+                self.assertEqual(fake.downloads, [f"someone/{name}/config.json"])
+        # MLX writes both keys, and states the mode only in newer versions; a
+        # module's entry gives it its own format, affine unless it says. Model
+        # Optimizer and compressed-tensors write a quantization_config alone.
+        modelopt = {
+            "quant_method": "modelopt",
+            "quant_algo": "NVFP4",
+            "group_size": 16,
+            "ignore": ["mtp*"],
+        }
+        compressed_tensors = {
+            "quant_method": "compressed-tensors",
+            "format": "nvfp4-pack-quantized",
+            "config_groups": {
+                "group_0": {
+                    "targets": ["Linear"],
+                    "weights": {
+                        "num_bits": 4,
+                        "type": "float",
+                        "strategy": "tensor_group",
+                        "group_size": 16,
+                        "symmetric": True,
+                    },
+                }
+            },
+            "ignore": ["re:.*mlp\\.gate$"],
+        }
+        for name, quantization in (
+            ("modelopt", {"quantization_config": modelopt}),
+            ("compressed-tensors", {"quantization_config": compressed_tensors}),
+        ):
+            fake.publish(f"someone/{name}", "c" * 40, target(quantization))
+            self.prepare(selection(self.root, f"someone/{name}"))
+            assembly.verify(selection(self.root, f"someone/{name}").link)
         for name, affine in (
             ("mlx", {"bits": 4, "group_size": 64, "mode": "affine"}),
             ("older-mlx", {"bits": 4, "group_size": 64}),
+            ("q8", {"bits": 8, "group_size": 64}),
+            ("q3-g32", {"bits": 3, "group_size": 32, "mode": "affine"}),
+            ("mxfp4", {"bits": 4, "group_size": 32, "mode": "mxfp4"}),
+            ("nvfp4", {"bits": 4, "group_size": 16, "mode": "nvfp4"}),
+            (
+                "mixed",
+                {
+                    "bits": 2,
+                    "group_size": 128,
+                    "mode": "affine",
+                    "language_model.model.layers.0.mlp.down_proj": {
+                        "bits": 6,
+                        "group_size": 64,
+                    },
+                    "language_model.model.layers.1.mlp.down_proj": {
+                        "bits": 4,
+                        "group_size": 32,
+                        "mode": "mxfp4",
+                    },
+                },
+            ),
         ):
             fake.publish(
                 f"someone/{name}",
@@ -393,8 +500,10 @@ class UpstreamTest(unittest.TestCase):
             (
                 "Qwen/Qwen3.8-27B",
                 transformers_release,
-                "this model requires an MLX affine 4-bit/group-64 checkpoint or a "
-                "supported GGUF",
+                r"this model requires an MLX checkpoint \(affine 2, 3, 4, 5, 6 or 8 "
+                r"bits in groups of 32, 64 or 128, mxfp4 or nvfp4\), an NVFP4 "
+                r"checkpoint of Model Optimizer or compressed-tensors, or a supported "
+                r"GGUF",
             ),
             (
                 "mlx-community/Qwen3.5-4B-MLX-4bit",
@@ -484,9 +593,15 @@ class UpstreamTest(unittest.TestCase):
                     models.ModelError, "must come from the target repository"
                 ) as refused:
                     self.prepare(chosen)
-                # A text-only checkpoint lacks only the processor.
+                # A text-only checkpoint lacks only the processor, which either
+                # of two files holds.
                 self.assertEqual(
                     "use --language-only to serve text only" in str(refused.exception),
+                    missing == "preprocessor_config.json",
+                )
+                self.assertEqual(
+                    "preprocessor_config.json or processor_config.json"
+                    in str(refused.exception),
                     missing == "preprocessor_config.json",
                 )
                 self.assertEqual(fake.downloads, [])
@@ -588,6 +703,96 @@ class UpstreamTest(unittest.TestCase):
                 ),
             ):
                 self.prepare(selection(self.root, model, language_only=False))
+
+    def test_mlx_vision_reads_the_image_processor_of_processor_config(self):
+        # Newer Transformers releases save no preprocessor_config.json: the
+        # image processor's configuration is an object of processor_config.json,
+        # beside the video processor's.
+        def target(processor):
+            def build(root):
+                mlx_target(root, DENSE)
+                (root / "model.safetensors").unlink()
+                shards = {
+                    "vision_tower.blocks.0.attn.qkv.weight": "model-00001-of-00002.safetensors",
+                    "language_model.lm_head.weight": "model-00002-of-00002.safetensors",
+                }
+                (root / "model.safetensors.index.json").write_text(
+                    json.dumps({"weight_map": shards})
+                )
+                for name in set(shards.values()):
+                    (root / name).write_text(name)
+                (root / "processor_config.json").write_text(json.dumps(processor))
+
+            return build
+
+        fake = fake_hub(self, self.cache)
+        for model, processor, refusal in (
+            (
+                "someone/vision-model",
+                {"image_processor": PROCESSOR, "video_processor": PROCESSOR},
+                None,
+            ),
+            (
+                "someone/video-model",
+                {"video_processor": PROCESSOR},
+                "processor_config.json has no image_processor; use --language-only",
+            ),
+            (
+                "someone/other-patches",
+                {"image_processor": PROCESSOR | {"patch_size": 14}},
+                "unsupported vision preprocessing configuration",
+            ),
+        ):
+            with self.subTest(model=model):
+                fake.publish(model, "a" * 40, target(processor))
+                chosen = selection(self.root, model, language_only=False)
+                if refusal is None:
+                    self.prepare(chosen)
+                    self.assertEqual(
+                        assembly.verify(chosen.link)["vision_format"], "safetensors"
+                    )
+                else:
+                    with self.assertRaisesRegex(models.ModelError, refusal):
+                        self.prepare(chosen)
+                    self.assertNotIn(
+                        f"{model}/model-00001-of-00002.safetensors", fake.downloads
+                    )
+
+    def test_a_tower_in_a_shard_of_its_own_is_not_the_targets(self):
+        # OptiQ keeps the tower in a subdirectory shard: the target links the
+        # text shards alone, and only serving images needs the tower's shard.
+        shards = {
+            "vision_tower.blocks.0.attn.qkv.weight": "optiq/optiq_vision.safetensors",
+            "language_model.model.embed_tokens.weight": "model-00001-of-00002.safetensors",
+            "language_model.lm_head.weight": "model-00002-of-00002.safetensors",
+        }
+
+        def target(root):
+            mlx_target(root, DENSE)
+            (root / "model.safetensors").unlink()
+            (root / "model.safetensors.index.json").write_text(
+                json.dumps({"weight_map": shards})
+            )
+            for name in set(shards.values()):
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / name).write_text(name)
+            (root / "preprocessor_config.json").write_text(json.dumps(PROCESSOR))
+
+        fake = fake_hub(self, self.cache)
+        fake.publish(MODEL, "a" * 40, target)
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        self.assertEqual(
+            sorted(p.name for p in (chosen.link / "target").iterdir()),
+            [
+                "config.json",
+                "model-00001-of-00002.safetensors",
+                "model-00002-of-00002.safetensors",
+            ],
+        )
+        self.assertNotIn(f"{MODEL}/optiq/optiq_vision.safetensors", fake.downloads)
+        with self.assertRaisesRegex(models.ModelError, "missing or unsupported shards"):
+            self.prepare(selection(self.root, language_only=False))
 
     def test_a_shard_name_read_as_a_glob_is_never_downloaded(self):
         def target(root):

@@ -15,6 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
+from dev.tests.installer_fixtures import link_assembly
 from dev.tests.server_fixtures import keep_stop_signals, server_arguments
 from install import launcher
 from server import serve_options
@@ -45,19 +46,15 @@ def selection(models_root, **options):
 
 
 MODEL_IDS = (
-    "incoai/Qwen3.8-27B-Splash",
-    "incoai/Qwen3.6-35B-A3B-Splash",
+    "mlx-community/Qwen3.8-27B-4bit",
+    "mlx-community/Qwen3.6-35B-A3B-4bit",
     "community/custom-splash",
 )
 
 
 class LauncherTests(unittest.TestCase):
     def setUp(self):
-        # No serve refreshes the catalog from the Hub into the checkout, and
-        # the launcher's defaults ignore the caller's Splash settings.
-        self.refresh = self.enterContext(
-            mock.patch.object(launcher.catalog, "spawn_refresh")
-        )
+        # The launcher's defaults ignore the caller's Splash settings.
         self.enterContext(mock.patch.dict(os.environ))
         for name in (
             "SPLASH_PORT",
@@ -66,6 +63,9 @@ class LauncherTests(unittest.TestCase):
         ):
             os.environ.pop(name, None)
         keep_stop_signals(self)
+        # Serve installs and holds models under a models root of the test's.
+        models = Path(self.enterContext(tempfile.TemporaryDirectory())) / "models"
+        self.enterContext(mock.patch.object(launcher.paths, "MODELS", models))
 
     def test_serve_requires_exact_repository_id_before_build(self):
         for arguments in (
@@ -126,7 +126,9 @@ class LauncherTests(unittest.TestCase):
                 tempfile.TemporaryDirectory() as temporary,
                 mock.patch.object(launcher, "RUNTIME_DIR", Path(temporary)),
                 mock.patch.object(launcher.socket, "socket") as factory,
-                mock.patch.object(launcher, "_ensure_installed"),
+                mock.patch.object(
+                    launcher, "_ensure_installed", side_effect=link_assembly
+                ),
                 mock.patch.object(launcher.os, "execve") as execute,
             ):
                 arguments = [
@@ -191,9 +193,9 @@ class LauncherTests(unittest.TestCase):
 
             def check_install(chosen):
                 self.assertEqual(json.loads(lock_path.read_text()), owner)
+                link_assembly(chosen)
 
             def check_exec(binary, argv, environment):
-                self.refresh.assert_called_once_with()
                 self.assertEqual(binary, str(launcher.paths.PYTHON))
                 # test_serve_options.py checks every shared option; these
                 # are the launcher's own and the shared options it was given.
@@ -299,7 +301,7 @@ class LauncherTests(unittest.TestCase):
             lock_path = runtime / "serve-8000.lock"
             owner = {
                 "pid": os.getpid(),
-                "model": "incoai/Qwen3.8-27B-Splash",
+                "model": "mlx-community/Qwen3.8-27B-4bit",
                 "port": 8000,
             }
             with lock_path.open("w+") as held:
@@ -315,7 +317,7 @@ class LauncherTests(unittest.TestCase):
                 ):
                     self.assertEqual(launcher.main(["serve", "--model", MODEL_ID]), 1)
                 self.assertIn(f"PID {os.getpid()}", error.getvalue())
-                self.assertIn("model incoai/Qwen3.8-27B-Splash", error.getvalue())
+                self.assertIn("model mlx-community/Qwen3.8-27B-4bit", error.getvalue())
                 self.assertIn("port 8000", error.getvalue())
                 self.assertEqual(json.loads(lock_path.read_text()), owner)
                 probe.assert_not_called()
@@ -405,7 +407,9 @@ class LauncherTests(unittest.TestCase):
                 # without interfering with a user's server on port 8000.
                 with (
                     mock.patch.object(launcher, "RUNTIME_DIR", Path(temporary)),
-                    mock.patch.object(launcher, "_ensure_installed") as install,
+                    mock.patch.object(
+                        launcher, "_ensure_installed", side_effect=link_assembly
+                    ) as install,
                     mock.patch.object(launcher.os, "execve") as execute,
                     mock.patch("sys.stderr", io.StringIO()),
                 ):
@@ -592,7 +596,9 @@ class LauncherTests(unittest.TestCase):
 
             with (
                 mock.patch.object(launcher, "RUNTIME_DIR", runtime),
-                mock.patch.object(launcher, "_ensure_installed") as install,
+                mock.patch.object(
+                    launcher, "_ensure_installed", side_effect=link_assembly
+                ) as install,
                 mock.patch.object(launcher.os, "execve", side_effect=execute),
                 mock.patch("sys.stderr", io.StringIO()) as error,
             ):
@@ -617,12 +623,12 @@ class LauncherTests(unittest.TestCase):
             runtime = root / "runtime"
             script = (
                 "import sys\nfrom pathlib import Path\nfrom install import launcher\n"
+                "from dev.tests.installer_fixtures import link_assembly\n"
                 "launcher.ROOT = Path(sys.argv[1])\n"
                 "launcher.RUNTIME_DIR = launcher.ROOT / 'runtime'\n"
+                "launcher.paths.MODELS = launcher.ROOT / 'models'\n"
                 "launcher.paths.PYTHON = Path(sys.executable)\n"
-                "launcher._ensure_installed = lambda selection: None\n"
-                "launcher.model_artifacts.selection_link = lambda *a, **k: launcher.ROOT\n"
-                "launcher.catalog.spawn_refresh = lambda: None\n"
+                "launcher._ensure_installed = link_assembly\n"
                 "launcher.main(['serve', '--model', 'test/model', '--port', sys.argv[2]])\n"
             )
             processes = []
@@ -962,7 +968,9 @@ class LauncherTests(unittest.TestCase):
             with (
                 mock.patch.object(launcher, "RUNTIME_DIR", runtime),
                 mock.patch.object(launcher.socket, "socket"),
-                mock.patch.object(launcher, "_ensure_installed") as install,
+                mock.patch.object(
+                    launcher, "_ensure_installed", side_effect=link_assembly
+                ) as install,
                 mock.patch.object(
                     launcher.model_artifacts,
                     "selection_link",
@@ -988,8 +996,9 @@ class LauncherTests(unittest.TestCase):
                 (MODEL_ID, runtime / "selected"),
             )
             root.assert_called_once_with(chosen.models_root, MODEL_ID, **options)
+            # The server runs from the assembly the selection links.
             argv = execute.call_args.args[1]
-            self.assertEqual(server_arguments(argv)[0], str(runtime / "selected"))
+            self.assertEqual(server_arguments(argv)[0], str(chosen.link.resolve()))
 
             with (
                 mock.patch.object(
@@ -1015,7 +1024,7 @@ class LauncherTests(unittest.TestCase):
                 ("prepare", MODEL_ID, "v2", True, options["draft_model"]),
             )
 
-    def test_offline_serve_forbids_the_hub_to_installer_refresh_and_server(self):
+    def test_offline_serve_forbids_the_hub_to_installer_and_server(self):
         for offline in (False, True):
             with (
                 self.subTest(offline=offline),
@@ -1027,10 +1036,8 @@ class LauncherTests(unittest.TestCase):
 
                 def install(selection):
                     seen["installer"] = os.environ.get("HF_HUB_OFFLINE")
+                    link_assembly(selection)
 
-                self.refresh.side_effect = lambda: seen.setdefault(
-                    "refresh", os.environ.get("HF_HUB_OFFLINE")
-                )
                 with (
                     mock.patch.object(launcher, "RUNTIME_DIR", runtime),
                     mock.patch.object(launcher.socket, "socket"),
@@ -1054,7 +1061,7 @@ class LauncherTests(unittest.TestCase):
                     )
                 argv, environment = execute.call_args.args[1:]
                 expected = "1" if offline else None
-                self.assertEqual(seen, {"installer": expected, "refresh": expected})
+                self.assertEqual(seen, {"installer": expected})
                 self.assertEqual(environment.get("HF_HUB_OFFLINE"), expected)
                 # The server has no such option: the environment carries it.
                 self.assertNotIn("--offline", argv)
@@ -1106,7 +1113,7 @@ class LauncherTests(unittest.TestCase):
             tempfile.TemporaryDirectory() as temporary,
             mock.patch.object(launcher, "RUNTIME_DIR", Path(temporary)),
             mock.patch.object(launcher.socket, "socket"),
-            mock.patch.object(launcher, "_ensure_installed"),
+            mock.patch.object(launcher, "_ensure_installed", side_effect=link_assembly),
             mock.patch.object(launcher.os, "execve", side_effect=execute),
         ):
             launcher.main(["serve", "--model", MODEL_ID])

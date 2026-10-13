@@ -22,7 +22,6 @@ constexpr uint32_t kGemmColumnTile = 128;
 constexpr uint32_t kMergerRowTile = 32;
 constexpr uint32_t kMergerColumnTile = 256;
 constexpr uint32_t kKeyTile = 128;
-constexpr uint32_t kQueryTile = 64;
 constexpr uint32_t kQkDimension = 80; // head dimension 72 padded to 16
 constexpr uint64_t kBf16Bytes = 2;
 constexpr uint64_t kFloatBytes = 4;
@@ -68,8 +67,8 @@ std::array<uint64_t, 12> scratchLayout(const VisionLayout &layout,
 }
 
 void requireLayout(const VisionLayout &layout) {
-  // Packages share the same vision tower; only the language-space projection
-  // width varies with the text model.
+  // The targets share the same vision tower; only the language-space
+  // projection width varies with the text model.
   VisionLayout tower = layout;
   tower.outputHiddenSize = kTower.outputHiddenSize;
   if (tower != kTower || !layout.outputHiddenSize || layout.outputHiddenSize % kMergerColumnTile) {
@@ -225,7 +224,10 @@ void Vision::encode(CommandGraph &graph, ImageGrid grid,
               {scratch(Scratch::Queries), scratch(Scratch::Keys),
                scratch(Scratch::Values), scratch(Scratch::Attention)},
               attentionParams,
-              {(tokens + kQueryTile - 1) / kQueryTile, layout.heads, 1});
+              {(tokens + SPLASH_VISION_ATTENTION_ROWS - 1) /
+                   SPLASH_VISION_ATTENTION_ROWS,
+               layout.heads, 1},
+              {SPLASH_VISION_ATTENTION_THREADS, 1, 1});
     graph.add("vision_attention_gather", {scratch(Scratch::Attention), context},
               qkvParams, {tokens, 1, 1});
     addGemm(graph, "vision_gemm_m64n128_residual", context, block.projection, hidden,

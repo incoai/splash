@@ -40,12 +40,14 @@ struct RuntimeGeometry final {
   DFlashDraftLayout draft;
 
   [[nodiscard]] static RuntimeGeometry from(const LoadedModel &model,
-                                            kv::Format format) {
+                                            kv::Format kvFormat,
+                                            ops::GdnStateFormat stateFormat) {
     RuntimeGeometry result;
     result.target = std::visit(
         [](const auto &weights) { return qwenTargetGeometry(weights); },
         model.target);
-    result.target.kvLayout = model.targetKvLayout(format);
+    result.target.kvLayout = model.targetKvLayout(kvFormat);
+    result.target.stateLayout = model.stateLayout(stateFormat).target;
     result.draft = model.draft.layout;
     if (!result.target.valid() || !result.draft.stateLayout().valid() ||
         result.target.hiddenSize != result.draft.hiddenSize ||
@@ -61,14 +63,6 @@ struct RuntimeGeometry final {
   }
   [[nodiscard]] uint32_t maskWords() const noexcept {
     return maskWordsPerToken(target.vocabularySize);
-  }
-  [[nodiscard]] uint32_t projectionSumsWidth() const noexcept {
-    uint32_t maximumInput = std::max(
-        {target.hiddenSize, target.attentionWidth,
-         target.capturedHiddenSize(), target.ffnScratchWidth(),
-         draft.targetHiddenSize, draft.hiddenSize,
-         draft.intermediateSize});
-    return (maximumInput + kQ4GroupElements - 1) / kQ4GroupElements;
   }
 };
 
@@ -100,8 +94,6 @@ enum class PrefillTensor : uint32_t {
   AttentionStatistics,
   AttentionHidden,
   AttentionOutput,
-  ProjectionSums,
-  DownProjectionSums,
   TargetPositions,
   DraftPositions,
   TargetInverseFrequencies,
@@ -258,10 +250,11 @@ enum class DecodeTensor : uint32_t {
   // Indexed by state lane, like PageTable: a penalized request's penalty
   // words (ops::Sampling::rebuildPenaltyWords).
   PenaltyState,
-  VerifyPackedBase,
-  VerifyMixedBase,
-  VerifyDecayBase,
-  VerifyBetaBase,
+  // A GDN layer's packed input projection rows, which its mixer reads.
+  GdnPacked,
+  // Indexed by state lane, like PageTable: the lane's two decode tape slots
+  // (ops::GdnTapeLane), one per state parity (gdnTapeSlot).
+  GdnTape,
   ChunkKeysBase,
   ChunkValuesBase,
   // One tensor per ops::kMoeScratchFields entry, in its order (moeScratchTensor).
@@ -273,21 +266,16 @@ enum class DecodeTensor : uint32_t {
 constexpr uint32_t decodeTensorCount =
     static_cast<uint32_t>(DecodeTensor::Count);
 
-constexpr bool isGdnLayerTensor(DecodeTensor tensor) noexcept {
-  return tensor == DecodeTensor::VerifyPackedBase ||
-         tensor == DecodeTensor::VerifyMixedBase ||
-         tensor == DecodeTensor::VerifyDecayBase ||
-         tensor == DecodeTensor::VerifyBetaBase;
-}
-
-constexpr bool isAttentionLayerTensor(DecodeTensor tensor) noexcept {
+// The attention layers' verify chunk staging, which holds a stride per lane
+// for each attention layer, layer by layer.
+constexpr bool isLayerMajorTensor(DecodeTensor tensor) noexcept {
   return tensor == DecodeTensor::ChunkKeysBase ||
          tensor == DecodeTensor::ChunkValuesBase;
 }
 
-constexpr bool isLayerMajorTensor(DecodeTensor tensor) noexcept {
-  return isGdnLayerTensor(tensor) || isAttentionLayerTensor(tensor);
-}
+// One slot of a state lane's decode tape (DecodeTensor::GdnTape): one step of
+// every GDN layer (ops::GdnTapeLane). A lane holds two, one per state parity.
+[[nodiscard]] uint64_t gdnTapeSlotBytes(const RuntimeGeometry &geometry) noexcept;
 
 [[nodiscard]] std::array<uint64_t, decodeTensorCount>
 decodeTensorBytes(const RuntimeGeometry &geometry,
@@ -343,12 +331,12 @@ public:
     const auto allocate = [&](uint64_t bytes, metal::BufferStorage storage, const char *label) {
       return bytes ? backend_.allocateBuffer(bytes, storage, label) : metal::MetalBuffer{};
     };
-    linearScratch_.input = allocate(linearSize.input, metal::BufferStorage::Private, "q4-input");
-    linearScratch_.sums = allocate(linearSize.sums, metal::BufferStorage::Private, "q4-sums");
+    linearScratch_.input = allocate(linearSize.input, metal::BufferStorage::Private, "linear-input");
+    linearScratch_.sums = allocate(linearSize.sums, metal::BufferStorage::Private, "linear-sums");
     linearScratch_.partials =
-        allocate(linearSize.partials, metal::BufferStorage::Private, "q4-partials");
+        allocate(linearSize.partials, metal::BufferStorage::Private, "linear-partials");
     linearScratch_.counters =
-        allocate(linearSize.counters, metal::BufferStorage::Shared, "q4-counters");
+        allocate(linearSize.counters, metal::BufferStorage::Shared, "linear-counters");
     linearScratch_.rotated = allocate(linearSize.rotated, metal::BufferStorage::Private, "linear-rotated");
     if (linearSize.counters)
       std::memset(linearScratch_.counters.contents(), 0, linearSize.counters);
@@ -402,27 +390,19 @@ public:
     // present) and the always-dense DFlash draft. Sparse target FFNs use their
     // own route-major arena tensors, but must not remove the draft's scratch.
     const uint64_t draft = operators.gateUpWorkspace(
-        {geometry.draft.intermediateSize, geometry.draft.hiddenSize, ops::WeightLayout::Affine64});
+        {geometry.draft.intermediateSize, geometry.draft.hiddenSize});
     uint64_t target = 0;
     for (const auto &p : geometry.target.gateUpProjections)
       target = std::max(target, operators.gateUpWorkspace(p));
     return std::max(target, draft);
   }
 
-  [[nodiscard]] metal::MetalBuffer gdnBatchSlice(DecodeTensor base, uint32_t gdnLayer,
-                                          uint32_t lanes) const {
-    const uint32_t layers = geometry_.target.stateLayout.layers;
-    if (!lanes || lanes > kLaneCount || gdnLayer >= layers ||
-        !isGdnLayerTensor(base))
-      throw std::out_of_range("invalid batched GDN layer");
-    return layerBatchSlice(base, layers, gdnLayer, lanes);
-  }
-
-  [[nodiscard]] metal::MetalBuffer gdnStorage(DecodeTensor base) const {
-    if (!isGdnLayerTensor(base))
-      throw std::invalid_argument("tensor is not GDN replay scratch");
-    const uint32_t index = static_cast<uint32_t>(base);
-    return backend_.view(base_, offsets_[index], sizes_[index] * kLaneCount);
+  // The offset in batchSlice(DecodeTensor::GdnTape, kLaneCount) of state
+  // lane `stateLane`'s tape slot of parity `parity`.
+  [[nodiscard]] uint64_t gdnTapeSlot(uint32_t stateLane, uint32_t parity) const {
+    if (stateLane >= kLaneCount || parity > 1)
+      throw std::out_of_range("invalid GDN tape slot");
+    return (uint64_t{stateLane} * 2 + parity) * gdnTapeSlotBytes(geometry_);
   }
 
   [[nodiscard]] metal::MetalBuffer attentionBatchSlice(DecodeTensor base,
@@ -430,7 +410,7 @@ public:
                                                 uint32_t lanes) const {
     const uint32_t layers = geometry_.target.kvLayout.attentionLayers;
     if (!lanes || lanes > kLaneCount || attentionLayer >= layers ||
-        !isAttentionLayerTensor(base)) {
+        !isLayerMajorTensor(base)) {
       throw std::out_of_range("invalid batched attention layer");
     }
     return layerBatchSlice(base, layers, attentionLayer, lanes);

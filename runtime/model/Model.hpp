@@ -100,6 +100,18 @@ struct SamplingParameters final {
   }
 };
 
+// A request that generates inside a thinking block may select at most
+// `tokens` thinking tokens; the target then selects `end`, which closes the
+// block. Thinking also ends where the request selects `end` or `alsoEnds`
+// first, such as a tool call's opening that follows thinking directly.
+struct ThinkingBudget final {
+  uint32_t tokens = 0;
+  uint32_t end = 0;
+  uint32_t alsoEnds = 0;
+
+  bool operator==(const ThinkingBudget &) const = default;
+};
+
 // Immutable view of the fields a model needs to activate a sequence.  Engine
 // priority and deadline policy deliberately do not cross this boundary.
 struct ModelRequest final {
@@ -116,6 +128,8 @@ struct ModelRequest final {
   std::span<const uint32_t> scoreTokens{};
   // RequestFlag bits.
   uint32_t flags = 0;
+  // None for a request without a thinking budget.
+  std::optional<ThinkingBudget> thinkingBudget;
   // Prompt tokens the lane takes from a cached state. Images that end at or
   // before it are neither staged nor encoded; their spans still place
   // rotary positions.
@@ -320,13 +334,20 @@ struct ModelStepResult final {
   // Raw final-prompt-position logits at the request's scoreTokens, in
   // requested order. Empty for generation and for cancelled/failed scoring.
   std::vector<float> scoreLogits{};
-  // Set when the model computed an unusable result for this lane alone, such
-  // as a non-finite score logit or a selection outside the vocabulary (the
-  // sampling kernels' sentinel for a non-finite logit row). The engine fails
-  // that one request before it publishes cache state or emits output, and the
-  // rest of the batch stands. Broken invariants and GPU faults stay
-  // exceptions and remain engine-fatal.
+  // Set when the model computed an unusable result for this lane alone: a
+  // prefill chunk whose last row is not finite, a non-finite score logit or
+  // a selection outside the vocabulary (the sampling kernels' sentinel for a
+  // logit row with no selectable token). Every step that publishes cache
+  // state is checked so, which lets the engine keep what earlier steps
+  // published. The engine fails that one request before it publishes cache
+  // state or emits output, and the rest of the batch stands. Broken
+  // invariants and GPU faults stay exceptions and remain engine-fatal.
   std::string failure{};
+  // The request's first output token, which the step that completes its
+  // prompt selected and left pending: the first decode cycle writes its KV row
+  // and emits it first. Reported so that the engine can send it to the client
+  // now rather than with that cycle.
+  std::optional<uint32_t> firstToken{};
 
   bool operator==(const ModelStepResult &) const = default;
 };
@@ -373,10 +394,9 @@ maskWordsPerToken(uint32_t vocabularySize) noexcept {
 
 // Compile-time ceiling of the one native DFlash execution contract. A draft
 // must have been trained for blocks of draftQueryRows rows over
-// draftContextTokens context tokens, which inspectModelRoot checks a
-// package's manifest and a DFlash2 checkpoint's config for; the other limits
-// are the runtime's own. Cache-page and attention-kernel geometry live with
-// their operators.
+// draftContextTokens context tokens, which inspectModelRoot checks a DFlash2
+// checkpoint's config for; the other limits are the runtime's own. Cache-page
+// and attention-kernel geometry live with their operators.
 struct ExecutionLimits final {
   static constexpr uint32_t maximumBatchWidth = 4;
   static constexpr uint32_t prefillTokenBudget = 2048;
@@ -436,9 +456,11 @@ struct ModelMemoryActual final {
 
 struct ModelTelemetry final {
   uint64_t stateAllocatedBytes = 0;
-  // Pooled state buffers no lane holds: GDN parity cells and draft rings.
+  // Pooled state buffers no lane holds: GDN parity cells, draft rings and
+  // context windows.
   uint32_t idleGdnCells = 0;
   uint32_t idleDraftRings = 0;
+  uint32_t idleContextWindows = 0;
   uint64_t targetPrefillRows = 0;
   uint64_t draftContextRowsActive = 0;
   uint64_t draftContextRowsMaterialization = 0;
@@ -545,9 +567,10 @@ public:
   // and retry.
   [[nodiscard]] virtual std::unique_ptr<StateOffload>
   snapshotToDisk(uint64_t, std::function<void()>) { return {}; }
-  // The cached states whose buffers a lane's activation would still have to
-  // allocate: each one evicted returns to the pool what a lane takes. Zero
-  // when the pool holds a lane's buffers.
+  // The cached states whose eviction would return to the pool what a lane's
+  // activation still has to allocate: zero when the pool holds a lane's
+  // buffers, and the maximum when no number of states does (a buffer no
+  // cached state holds, such as Qwen's draft rings).
   [[nodiscard]] virtual uint32_t statesToActivate() const noexcept { return 0; }
   // Releases one unit of idle model memory and returns its bytes; zero when
   // nothing in scope is idle. A unit is one pooled state buffer (keepLane

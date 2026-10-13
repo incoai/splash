@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <functional>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <type_traits>
 #include <unordered_map>
@@ -28,6 +29,11 @@ static_assert(kPrefillCheckpointTokens >= model::ExecutionLimits::draftContextTo
 // How long a request waits for memory before it fails, and a resident
 // drain lasts, by default.
 inline constexpr double kResourceWaitTimeoutMilliseconds = 30000.0;
+// A request refused memory retries at once when the engine frees some
+// (signalResourceProgress). Memory that comes back without that, as the
+// host's does, it finds by retrying this often: at most a tenth of a second
+// later, without spinning the loop on attempts.
+inline constexpr double kResourceRetryBackoffMilliseconds = 100.0;
 
 // The engine's constructor refuses a config without its context window, its
 // vocabulary or the governor's two hooks, which the bootstrap sets from the
@@ -56,6 +62,30 @@ struct EngineConfig final {
   // (MemoryGovernor::setServing).
   std::function<void(bool)> serving;
 };
+
+// While an active one lives, allocations are memory a request in service
+// needs (EngineConfig::serving).
+class Serving final {
+public:
+  Serving(const std::function<void(bool)> &mark, bool active)
+      : mark_(active ? &mark : nullptr) {
+    if (mark_)
+      (*mark_)(true);
+  }
+  ~Serving() {
+    if (mark_)
+      (*mark_)(false);
+  }
+  Serving(const Serving &) = delete;
+  Serving &operator=(const Serving &) = delete;
+
+private:
+  const std::function<void(bool)> *mark_;
+};
+
+// What a request fails with once it has waited the resource wait limit for
+// memory, last refused for `failure`.
+[[nodiscard]] std::string resourceTimeoutMessage(metal::AllocationFailure failure);
 
 // The progress checkpoints a request plans between the point it resumes from
 // and its replay boundary: the multiples of `interval` at least one prefill
@@ -93,8 +123,25 @@ struct ResourceWaitSnapshot final {
   bool draining = false;
 };
 
+// One live request's progress, for /status active_requests: its phase and
+// priority, how many prompt tokens are encoded (cached ones included) and
+// generated, and its age since it arrived, which the native runtime that
+// received it adds (NativeRuntime::statusSnapshot).
+struct ActiveRequestSnapshot final {
+  uint64_t id = 0;
+  Phase phase = Phase::Queued;
+  RequestPriority priority = RequestPriority::Normal;
+  uint32_t promptTokens = 0;
+  uint32_t promptProcessed = 0;
+  uint32_t generatedTokens = 0;
+  uint32_t maxNewTokens = 0;
+  double ageMilliseconds = 0.0;
+};
+
 struct EngineSnapshot final {
   SchedulerSnapshot scheduler;
+  // Requests not yet finalized, in submission (id) order.
+  std::vector<ActiveRequestSnapshot> activeRequests;
   CacheSnapshot resources;
   uint32_t maximumContextTokens = 0;
   uint64_t submitted = 0;
@@ -104,6 +151,8 @@ struct EngineSnapshot final {
   uint64_t cacheHits = 0;
   uint64_t coldMisses = 0;
   uint64_t reusedTokens = 0;
+  // Tokens requests computed and then read from cached blocks' pages.
+  uint64_t deduplicatedKvTokens = 0;
   uint64_t replayStatePublications = 0;
   uint64_t deduplicatedStatePublications = 0;
   // Publications completed after reclaiming a cached state.
@@ -238,6 +287,19 @@ private:
     uint32_t promptTokens = 0;
     uint32_t reportedPromptTokens = 0;
     uint32_t replayTokens = 0;
+    // The blocks it restored or published in any residency end at this
+    // token. A replay after a suspension finds them cached as its own, so
+    // it counts none of them, though one evicted meanwhile may hold KV
+    // another request computed again; nor does it count blocks past them
+    // that a state another request published there lets it restore.
+    uint32_t publishedTokens = 0;
+    // Tokens of blocks it computed and then found cached
+    // (Cache::publishCommittedBlocks), whose pages its next command reads,
+    // and of those its commands read, which it reports when it completes.
+    uint32_t unreadDeduplicatedKvTokens = 0;
+    uint32_t deduplicatedKvTokens = 0;
+    // Its speculative decoding so far, which it reports when it completes.
+    SpeculativeCounts speculation;
     // A failed dispatch must fit before replay can consume any model work.
     uint64_t resumeKvTargetTokens = 0;
     ResourceWait resourceWait;
@@ -254,8 +316,12 @@ private:
     // The prompt from submit on, then the committed output; request.prompt
     // is empty.
     std::vector<uint32_t> exactTokens;
-    // Made from exactTokens and request.images, which do not change while
-    // the request waits; refreshed each pass and dropped once it starts or
+    // The first output token, sent to the client when the prefill selected it
+    // (ModelStepResult::firstToken) and until the first decode cycle commits
+    // it: that cycle emits it first, and its event leaves it out.
+    std::optional<uint32_t> sentFirstToken;
+    // Made from exactTokens and the request's prompt identity, which do not
+    // change while the request waits; refreshed each pass and dropped once it starts or
     // skips the cache.
     std::optional<CacheProbe> admissionProbe;
     std::vector<StateBoundary> stateBoundaries;
@@ -265,6 +331,9 @@ private:
     // next turn resumes: its state is in use from the moment the request
     // reaches, reuses or restores it until the request ends, suspended or not.
     StateUse replayPoint;
+    // The block of the state it restored in this residency, until a step of
+    // it computed from that state reports a finite result.
+    std::optional<uint64_t> unprovenState;
     // The scheduler owns the terminal phase; this flag records that the
     // corresponding event was emitted and model/resource ownership ended.
     bool finalized = false;
@@ -350,6 +419,9 @@ private:
   // Another unfinished lane holds this lane's recovery point as its own.
   [[nodiscard]] bool checkpointShared(const Request &request) const;
   [[nodiscard]] bool retireCheckpoint(Request &request);
+  // Publishes the request's complete blocks up to committedTokens and keeps
+  // the tokens of those found cached for its next command to read.
+  void publishCommittedBlocks(Request &request, uint32_t committedTokens);
   void publishReachedStateBoundaries(Request &request,
                                      uint32_t promptProcessed, double nowMilliseconds);
   [[nodiscard]] Prepared prepare(BatchPlan &plan,
@@ -389,6 +461,10 @@ private:
   // The prompt rows a lane in prefill has processed, or the tokens a
   // decoding lane holds.
   [[nodiscard]] uint64_t completedTokens(const Request &request) const;
+  // The output tokens the client was sent: the committed ones and a first
+  // token that no cycle has committed yet (Request::sentFirstToken), as when
+  // the request is suspended or cancelled before its first decode cycle.
+  [[nodiscard]] static uint32_t generatedTokens(const Request &request) noexcept;
   // Whether lane a gives up its memory before lane b: the lower priority,
   // then, at equal priority, a lane in prefill before a decoding one, then
   // the one with fewer completed tokens.

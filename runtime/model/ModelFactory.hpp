@@ -45,8 +45,10 @@ struct LoadedModel final {
     layout.format = format;
     return layout;
   }
-  [[nodiscard]] CompositeStateLayout stateLayout() const noexcept {
-    return descriptor.stateLayout;
+  [[nodiscard]] CompositeStateLayout stateLayout(ops::GdnStateFormat format) const noexcept {
+    auto layout = descriptor.stateLayout;
+    layout.target.format = format;
+    return layout;
   }
   [[nodiscard]] uint32_t maximumContextTokens() const noexcept {
     return descriptor.capabilities.maximumContextTokens;
@@ -88,15 +90,13 @@ void requireCompatibleModel(const LoadedModel &model);
 // The bytes of every image the model's weights load into.
 [[nodiscard]] uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor);
 
-// The vision role's upstream source, planned; null for a package's vision
-// file or a model without vision.
+// The vision role's source, planned; null for a model without vision.
 [[nodiscard]] std::unique_ptr<VisionLoader> planVisionLoader(const std::filesystem::path &root,
                                                              const ModelDescriptor &descriptor);
-// The vision role: written by `loader` when there is one, else read from the
-// package's vision file; empty weights for a model without vision.
+// The vision role written by `loader`; empty weights for a model without
+// vision (no loader).
 [[nodiscard]] QwenVisionWeights loadVisionWeights(metal::MetalBackend &backend, WeightImages &images,
-                                                  const std::filesystem::path &root,
-                                                  const ModelDescriptor &descriptor, const VisionLoader *loader);
+                                                  const VisionLoader *loader);
 
 // Production loading is selected by the validated descriptor. There
 // is one shared engine and DFlash controller; only model execution differs.
@@ -116,7 +116,7 @@ void withPrefillArena(
 [[nodiscard]] ModelMemoryPlan
 plannedRuntimeMemory(const LoadedModel &model,
                      const ops::ExecutionPlans &operators,
-                     kv::Format format);
+                     kv::Format kvFormat, ops::GdnStateFormat stateFormat);
 [[nodiscard]] std::unique_ptr<RuntimeModel>
 createRuntime(RuntimeContext context);
 

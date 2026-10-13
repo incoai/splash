@@ -15,6 +15,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using namespace splash;
@@ -76,6 +77,7 @@ void testCleanRuntimeStatus(const char *goldenPath) {
   engine.cacheHits = 1;
   engine.coldMisses = 2;
   engine.reusedTokens = 64;
+  engine.deduplicatedKvTokens = 96;
   engine.junctionMaterializations = 1;
   engine.checkpointPublications = 3;
   engine.checkpointPublicationFailures = 1;
@@ -90,6 +92,20 @@ void testCleanRuntimeStatus(const char *goldenPath) {
   engine.scheduler.prefillRows = 4096;
   engine.scheduler.decodeBatches = 4;
   engine.scheduler.decodeBatchesByWidth = {1, 1, 1, 1};
+  engine.activeRequests = {{.id = 7,
+                            .phase = engine::Phase::Prefill,
+                            .priority = engine::RequestPriority::Foreground,
+                            .promptTokens = 4096,
+                            .promptProcessed = 2048,
+                            .maxNewTokens = 256,
+                            .ageMilliseconds = 1500.5},
+                           {.id = 9,
+                            .phase = engine::Phase::Decode,
+                            .promptTokens = 512,
+                            .promptProcessed = 512,
+                            .generatedTokens = 40,
+                            .maxNewTokens = 128,
+                            .ageMilliseconds = 2250.25}};
   engine.resources.pool = {128, 72, 24, 32, 128 * 4096ULL,
                            32 * 4096ULL, 5, 3, 2.5, 0.75, 2, 9};
   engine.resources.extentCompactMaxMilliseconds = 1.25;
@@ -156,6 +172,7 @@ void testCleanRuntimeStatus(const char *goldenPath) {
   executorTelemetry.stateAllocatedBytes = 350'224'384;
   executorTelemetry.idleGdnCells = 1;
   executorTelemetry.idleDraftRings = 2;
+  executorTelemetry.idleContextWindows = 3;
   executorTelemetry.targetPrefillRows = 10000;
   executorTelemetry.draftContextRowsActive = 2048;
   executorTelemetry.draftContextRowsMaterialization = 31;
@@ -195,7 +212,8 @@ void testCleanRuntimeStatus(const char *goldenPath) {
                                   .oldestWaitMilliseconds = 1250.0, .draining = true};
   const std::string json = runtimeStatusJson(
       memoryPlan, engine, metal, warmup, audit(memoryPlan), metrics, executorTelemetry,
-      identity, governor, true, {}, wait, NativeLoopTiming{1843.25}, {600.0, false, 2}, aneFfn);
+      identity, governor, true, {}, wait, NativeLoopTiming{1843.25}, {600.0, false, 2, 1}, aneFfn,
+      ThermalState::Fair);
   std::ifstream golden(goldenPath);
   const std::string expected{std::istreambuf_iterator<char>(golden), {}};
   require(golden && json + '\n' == expected,
@@ -232,7 +250,7 @@ void testCleanRuntimeStatus(const char *goldenPath) {
   bf16Identity.kvLayout = kv::Layout{16, 4, 256, kv::Format::BFloat16};
   const auto bf16Status = runtimeStatusJson(memoryPlan, engine, metal, warmup, audit(memoryPlan),
                         metrics, executorTelemetry, bf16Identity, governor, true,
-                        {}, {}, {}, {}, {});
+                        {}, {}, {}, {}, {}, {});
   require(bf16Status.find("\"format\":\"bf16\"") != std::string::npos &&
               bf16Status.find("\"scale_type\":\"none\"") != std::string::npos,
           "BF16 cache identity advertised INT8 storage");
@@ -260,7 +278,7 @@ void testCleanRuntimeStatus(const char *goldenPath) {
 
   const std::string unmeasured =
       runtimeStatusJson(memoryPlan, engine, metal, warmup, audit(memoryPlan),
-                        metrics, {}, identity, governor, true, {}, {}, {}, {}, {});
+                        metrics, {}, identity, governor, true, {}, {}, {}, {}, {}, {});
   require(unmeasured.find("\"model_timing\":{\"scope\":\"model_lifetime\","
                           "\"prefill\":{\"last_gpu_ms\":0,\"last_wall_ms\":0,"
                           "\"total_gpu_ms\":0,\"total_wall_ms\":0},"
@@ -288,7 +306,7 @@ void testCleanRuntimeStatus(const char *goldenPath) {
               json.find("\"reserved_bytes\"") == std::string::npos,
           "status reported a governor field nothing reads");
   require(json.find("\"allocated_bytes\":350224384") != std::string::npos &&
-              json.find("\"idle_gdn_cells\":1,\"idle_draft_rings\":2,") !=
+              json.find("\"idle_gdn_cells\":1,\"idle_draft_rings\":2,\"idle_context_windows\":3,") !=
                   std::string::npos &&
               json.find("\"active_lanes\":") != std::string::npos &&
               json.find("\"cell_ceiling\"") == std::string::npos &&
@@ -360,7 +378,7 @@ void testCurrentReadinessAndSimultaneousPeak() {
   memory.devicePeakAllocatedBytes = 22 * kGiB;
   auto status = [&] {
     return runtimeStatusJson(memoryPlan, {}, memory, warmup, audit(memoryPlan),
-                             {}, {}, {}, governor, true, {}, {}, {}, {}, {});
+                             {}, {}, {}, governor, true, {}, {}, {}, {}, {}, {});
   };
   const std::string healthy = status();
   require(healthy.find("\"ready\":true") != std::string::npos &&
@@ -411,7 +429,7 @@ void testWarmupStepsReportMeasurementTruth() {
   governor.hostReserveBytes = 2 * kGiB;
   auto status = [&] {
     return runtimeStatusJson(memoryPlan, {}, {}, warmup, audit(memoryPlan),
-                             {}, {}, {}, governor, true, {}, {}, {}, {}, {});
+                             {}, {}, {}, governor, true, {}, {}, {}, {}, {}, {});
   };
   require(status().find("\"memory_limited_steps\":[]") != std::string::npos,
           "fully measured warmup listed a memory-limited step");
@@ -467,7 +485,7 @@ void testMemoryPressureTelemetry() {
   governor.hostGrowthAllowed = false;
   auto status = [&] {
     return runtimeStatusJson(memoryPlan, {}, {}, {}, {}, {}, {}, {}, governor, true, {},
-                             {}, {}, {}, {});
+                             {}, {}, {}, {}, {});
   };
   const std::string hostLimited = status();
   require(hostLimited.find("\"memory_pressure\":\"critical\"") !=
@@ -496,7 +514,7 @@ void testResourceWaitDiagnostics() {
                             .oldestWaitMilliseconds = 1250.0, .draining = true};
   const auto memoryPlan = plan();
   const std::string json = runtimeStatusJson(
-      memoryPlan, {}, {}, {}, {}, {}, {}, {}, {}, true, {}, wait, {}, {}, {});
+      memoryPlan, {}, {}, {}, {}, {}, {}, {}, {}, true, {}, wait, {}, {}, {}, {});
   require(json.find("\"admission\":{\"waiting\":3,\"waiting_memory\":2,"
                     "\"waiting_concurrency\":1,\"held_behind_refusal\":4,\"restoring\":1,"
                     "\"suspended\":1,\"draining\":true,"
@@ -505,30 +523,30 @@ void testResourceWaitDiagnostics() {
           "resource wait summary is missing or inaccurate");
   const std::string ticked = runtimeStatusJson(
       memoryPlan, {}, {}, {}, {}, {}, {}, {}, {}, true, {}, wait,
-      NativeLoopTiming{1843.25}, {}, {});
+      NativeLoopTiming{1843.25}, {}, {}, {});
   require(ticked.find("\"loop\":{\"max_tick_ms\":1843.25}") != std::string::npos &&
               ticked.find("\"schema_version\":6") != std::string::npos,
           "the loop's longest tick is missing, or changed the status schema");
 }
 
 // The weights' idle release, null with --idle-release off, whether they are
-// released and how often they were written back.
+// released, how often they were written back and how often a restore gave up.
 void testWeightsStatus() {
   const auto memoryPlan = plan();
   const auto status = [&](WeightsSnapshot weights) {
     return runtimeStatusJson(memoryPlan, {}, {}, {}, {}, {}, {}, {}, {}, true, {}, {}, {},
-                             weights, {});
+                             weights, {}, {});
   };
-  require(status({600.0, true, 2})
+  require(status({600.0, true, 2, 1})
                   .find("\"weights\":{\"idle_release_seconds\":600,\"released\":true,"
-                        "\"restores\":2}") != std::string::npos,
+                        "\"restores\":2,\"restore_failures\":1}") != std::string::npos,
           "the weights' status is missing or inaccurate");
   require(status({1234567.5, false, 0}).find("\"idle_release_seconds\":1234567.5,") !=
               std::string::npos,
           "the idle release lost precision");
   require(status({std::numeric_limits<double>::infinity(), false, 0})
                   .find("\"weights\":{\"idle_release_seconds\":null,\"released\":false,"
-                        "\"restores\":0}") != std::string::npos,
+                        "\"restores\":0,\"restore_failures\":0}") != std::string::npos,
           "an idle release that is off is not null");
 }
 
@@ -541,7 +559,7 @@ void testAneFfnStatus() {
     model::ModelTelemetry telemetry;
     telemetry.aneFfnReruns = reruns;
     return runtimeStatusJson(memoryPlan, {}, {}, {}, {}, {}, telemetry, {}, {}, true, {}, {}, {},
-                             {}, split);
+                             {}, split, {});
   };
   require(status({.reason = "as given"}, 0)
                   .find("\"ane_ffn\":{\"state\":\"off\",\"share\":0,\"minimum_rows\":0,"
@@ -569,6 +587,48 @@ void testAneFfnStatus() {
                   .find("\"reason\":\"an evaluation failed\",\"split_commands\":2,\"reruns\":1,") !=
               std::string::npos,
           "a split that failed lost its rerun");
+}
+
+// The thermal state beside the memory pressure, in each of its spellings; a
+// hot Mac serves slower but stays ready.
+void testThermalStateStatus() {
+  const auto memoryPlan = plan();
+  const auto status = [&](ThermalState state) {
+    return runtimeStatusJson(memoryPlan, {}, {}, {}, {}, {}, {}, {}, {}, true, {}, {}, {},
+                             {}, {}, state);
+  };
+  for (const auto &[state, name] :
+       {std::pair{ThermalState::Nominal, "nominal"}, std::pair{ThermalState::Fair, "fair"},
+        std::pair{ThermalState::Serious, "serious"},
+        std::pair{ThermalState::Critical, "critical"}}) {
+    const std::string json = status(state);
+    require(json.find("\"memory_pressure\":\"normal\",\"thermal_state\":\"" +
+                      std::string(name) + "\",\"admission\":") != std::string::npos,
+            std::string("the thermal state ") + name + " is missing or misspelled");
+    require(json.find("\"ready\":true") != std::string::npos,
+            std::string("the thermal state ") + name + " made the engine unready");
+  }
+}
+
+// The log names the thermal state once per change: a start at nominal says
+// nothing, a warm start names its state, and a repeat says nothing.
+void testThermalStateTransitions() {
+  ThermalStateReporter cool;
+  require(cool.update(ThermalState::Nominal).empty() &&
+              cool.state() == ThermalState::Nominal,
+          "a start at nominal was logged");
+  require(cool.update(ThermalState::Fair) == "Thermal state: nominal → fair" &&
+              cool.update(ThermalState::Fair).empty() &&
+              cool.update(ThermalState::Serious) == "Thermal state: fair → serious" &&
+              cool.update(ThermalState::Nominal) == "Thermal state: serious → nominal" &&
+              cool.state() == ThermalState::Nominal,
+          "a thermal transition was not logged once");
+  ThermalStateReporter warm;
+  require(warm.state() == ThermalState::Nominal &&
+              warm.update(ThermalState::Serious) == "Thermal state: serious" &&
+              warm.state() == ThermalState::Serious &&
+              warm.update(ThermalState::Serious).empty(),
+          "a warm start was not logged once");
 }
 
 // The server and the runtime share stderr, as `serve > log 2>&1` does: a
@@ -620,6 +680,8 @@ int main(int argc, char **argv) {
     testResourceWaitDiagnostics();
     testWeightsStatus();
     testAneFfnStatus();
+    testThermalStateStatus();
+    testThermalStateTransitions();
     testStderrLinesStayWhole();
     testNoticesCarryTheTime();
     std::cout << "runtime status tests passed\n";

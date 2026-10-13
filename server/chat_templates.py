@@ -128,7 +128,7 @@ def render_chat_template(tokenizer, messages, options):
     "none" while thinking is off renders by enable_thinking alone."""
     try:
         return tokenizer.apply_chat_template(messages, **options)
-    except TemplateError:
+    except TemplateError as error:
         effort = options.get("reasoning_effort")
         retry = dict(options)
         if effort in REASONING_EFFORT_ALIASES:
@@ -137,7 +137,12 @@ def render_chat_template(tokenizer, messages, options):
             del retry["reasoning_effort"]
         else:
             raise
-        return tokenizer.apply_chat_template(messages, **retry)
+        try:
+            return tokenizer.apply_chat_template(messages, **retry)
+        except TemplateError:
+            # The alias is Splash's own fallback: the request reads what its
+            # own effort met.
+            raise error from None
 
 
 @dataclass(frozen=True, slots=True)

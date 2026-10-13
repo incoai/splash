@@ -366,7 +366,10 @@ def parse_args(argv=None):
                 parser.error(f"missing retained executable/library: {path}")
         if not weights.loads_in_memory(binary.resolve().parent):
             parser.error(f"{binary.parent} has no {weights.WEIGHT_DIGESTS}")
-    if smoke.model_artifacts.installation_kind(args.model_root) is None:
+    if (
+        smoke.model_artifacts.installation_kind(args.model_root)
+        != smoke.model_artifacts.ASSEMBLY
+    ):
         parser.error(f"missing installed model: {args.model_root}")
     return args
 

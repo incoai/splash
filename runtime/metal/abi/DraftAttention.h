@@ -80,3 +80,27 @@ struct DraftContextBatchParams {
 
 static_assert(sizeof(DraftContextBatchParams) == 16,
               "Draft context commit parameters are 16 bytes on both sides");
+
+// A context window holds, per ring slot, the draft's context row, from which
+// every layer's ring keys and values are computed: 4-bit codes over groups of
+// SPLASH_DRAFT_CONTEXT_GROUP values, all slots' codes first, then each
+// group's fp16 scale and minimum. Its kernels run one simdgroup per row and
+// group, SPLASH_DRAFT_CONTEXT_SIMDGROUPS to a threadgroup.
+#define SPLASH_DRAFT_CONTEXT_GROUP 64u
+#define SPLASH_DRAFT_CONTEXT_SIMDGROUPS 8u
+inline constexpr uint64_t draft_context_codes_bytes(uint32_t width) {
+  return uint64_t(SPLASH_DRAFT_SLIDING_WINDOW) * (width / 2);
+}
+inline constexpr uint64_t draft_context_window_bytes(uint32_t width) {
+  return draft_context_codes_bytes(width) +
+         uint64_t(SPLASH_DRAFT_SLIDING_WINDOW) * (width / SPLASH_DRAFT_CONTEXT_GROUP) * 4;
+}
+
+struct DraftContextWindowParams {
+  uint32_t rows;
+  uint32_t start_position;
+  uint32_t width;
+};
+
+static_assert(sizeof(DraftContextWindowParams) == 12,
+              "Draft context window parameters are 12 bytes on both sides");

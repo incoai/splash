@@ -52,14 +52,10 @@ Each Unsloth mmproj holds 334 tensors: 110 BF16 matrices and 224 F32 tensors
 F32 values has non-zero low 16 bits (0 of 4,833,008 for 27B, 0 of 4,829,936 for
 35B), so they convert to BF16 exactly.
 
-The affine comparison is `affine-source-oracle` (DEVELOPMENT.md, Validate),
-which prints `package_exact=true` and the decay's `decay_max_ulp` per file. The
-GGUF repack check is `gguf-preparation` in `make test-engine-metal`.
-
-```sh
-build/engine-tests/affine-source-oracle build/splash.metallib \
-  install/models/mlx-community/Qwen3.6-35B-A3B-4bit/target install/models/incoai/Qwen3.6-35B-A3B-Splash
-```
+The affine comparison was `affine-source-oracle`, which printed
+`package_exact=true` and the decay's `decay_max_ulp` per file; it was removed
+with Splash packages, which later releases do not load. The GGUF repack check is
+`gguf-preparation` in `make test-engine-metal`.
 
 `weight-digests` prints the size and SHA-256 of every image a model loads,
 `vision/model.bin` among them:

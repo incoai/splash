@@ -400,6 +400,10 @@ class FakeRuntime:
         self.restart_count = 0
         self.last_crash_trace = None
         self.status_event = native_peer.status_event()
+        self.release_event = native_peer.status_event(
+            weights={"released": True, "restores": 0, "restore_failures": 0}
+        )
+        self.release_calls = 0
         self.threads = []
 
     @property
@@ -416,6 +420,12 @@ class FakeRuntime:
         if not self.ready:
             raise engine_runtime.EngineUnhealthy("native process is not ready")
         return self.status_event
+
+    def release_weights(self, timeout=5.0):
+        self.release_calls += 1
+        if not self.ready:
+            raise engine_runtime.EngineUnhealthy("native process is not ready")
+        return self.release_event
 
     def submit(self, request, *, on_event=None, on_complete=None):
         if self.pending_count >= self.pending_limit:
@@ -766,6 +776,7 @@ def main_args(**overrides):
             "served_model_name": [],
             "announce_served_name": False,
             "default_reasoning_effort": None,
+            "thinking_token_budget": None,
             "max_context": None,
             "max_memory": None,
             "idle_release": None,
@@ -787,6 +798,7 @@ def main_args(**overrides):
             "port": 0,
             "binary": "splash",
             "kv_format": "int8",
+            "state_format": "fp32",
             **overrides,
         }
     )

@@ -6,7 +6,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <filesystem>
 #include <functional>
 #include <span>
 #include <string>
@@ -59,7 +58,7 @@ public:
   [[nodiscard]] WeightFile load(ImagePlan image);
   [[nodiscard]] bool released() const noexcept override { return released_; }
   void release() override;
-  [[nodiscard]] bool restore() override;
+  [[nodiscard]] bool restore(const metal::AllocationAdmission &admit) override;
 
   struct Contents final {
     std::string_view component;
@@ -83,10 +82,6 @@ private:
   size_t restored_ = 0;
 };
 
-// The image of a Splash package's file at path, read as it is.
-[[nodiscard]] ImagePlan packageImage(const std::filesystem::path &path, std::string component,
-                                     std::string_view magic, uint32_t layer, uint32_t type);
-
 // The threads that read and convert weights while images are written: one
 // per core.
 [[nodiscard]] unsigned loadThreads() noexcept;
@@ -96,6 +91,10 @@ private:
 // through its worker's buffers. Rethrows the first exception once every
 // worker has stopped.
 void parallelFor(size_t count, const std::function<void(size_t index, unsigned thread)> &task);
+
+// Writes the F32 GDN decay of `count` BF16 or F32 values A_log at values,
+// each float(-exp(double(A_log))), to `to`; throws on a non-finite decay.
+void writeGdnDecay(const uint8_t *values, uint64_t count, bool bfloat16, uint8_t *to);
 
 // Zeroes the bytes of image outside the extents, [offset, offset + bytes),
 // that its writer writes: the alignment between sections and any padding.

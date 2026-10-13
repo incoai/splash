@@ -105,6 +105,11 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
       if (value != "int8" && value != "bf16")
         throw UsageError("--kv-format requires int8 or bf16");
       result.kvFormat = value == "int8" ? kv::Format::Int8 : kv::Format::BFloat16;
+    } else if (option == "--state-format") {
+      if (value != "fp32" && value != "bf16")
+        throw UsageError("--state-format requires fp32 or bf16");
+      result.stateFormat =
+          value == "fp32" ? ops::GdnStateFormat::Float32 : ops::GdnStateFormat::BFloat16;
     } else if (option == "--decode-share") {
       result.decodeShare = parseDecodeShare(value);
     } else if (option == "--max-image-patches") {

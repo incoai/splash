@@ -21,3 +21,13 @@ struct RopeTableParams {
 
 static_assert(sizeof(RopeTableParams) == 8,
               "RoPE table parameters are 8 bytes on both sides");
+
+// Draft rows of consecutive positions from start_position, the rows a
+// restore computes its rings from again (ops::RoPE::addDraftRangeTables).
+struct RopeRangeParams {
+  uint32_t rows;
+  uint32_t start_position;
+};
+
+static_assert(sizeof(RopeRangeParams) == 8,
+              "RoPE range parameters are 8 bytes on both sides");

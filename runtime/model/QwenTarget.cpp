@@ -54,30 +54,25 @@ void includeProjection(QwenTargetGeometry &geometry, const ops::Projection &proj
   geometry.decodeProjections.push_back(projection.shape());
 }
 
-// The projections each layer's FFN dispatches, from the first layer on.
-void includeFfn(QwenTargetGeometry &geometry, const Qwen3_8LayerWeights &layer, bool) {
+// The projections a dense layer's FFN dispatches; a MoE block runs its own
+// plans (ops::MoeShape).
+void includeFfn(QwenTargetGeometry &geometry, const Qwen3_8LayerWeights &layer) {
   if (layer.gateProjection.shape() != layer.upProjection.shape())
-    throw WeightStoreError("fused gate/up projections must have matching shapes and layouts");
+    throw WeightStoreError("fused gate/up projections must have matching shapes");
   includeProjection(geometry, layer.gateProjection);
   includeProjection(geometry, layer.upProjection);
   includeProjection(geometry, layer.downProjection);
   geometry.gateUpProjections.push_back(layer.upProjection.shape());
 }
-// No source mixes MoE layouts, so one plan runs every block of a step.
-void includeFfn(QwenTargetGeometry &geometry, const Qwen3_6MoeLayerWeights &layer, bool first) {
-  if (first) geometry.moeLayout = layer.ffn.layout();
-  if (layer.ffn.layout() != geometry.moeLayout)
-    throw WeightStoreError("the MoE blocks of a target must share one weight layout");
-}
+void includeFfn(QwenTargetGeometry &, const Qwen3_6MoeLayerWeights &) {}
 
-// The format of most routed expert weights of a GGUF target's MoE blocks,
+// The format of most routed expert weights of a target's MoE blocks,
 // GGUF_FMT_COUNT for none (ops::MoeShape::expertFormat).
 uint32_t routedExpertFormat(std::span<const Qwen3_8LayerWeights>) { return GGUF_FMT_COUNT; }
 uint32_t routedExpertFormat(std::span<const Qwen3_6MoeLayerWeights> layers) {
   std::array<uint64_t, GGUF_FMT_COUNT> weights{};
   for (const Qwen3_6MoeLayerWeights &layer : layers) {
-    if (layer.ffn.layout() != ops::WeightLayout::Block32) return GGUF_FMT_COUNT;
-    const ops::BlockMoeWeights &block = layer.ffn.blocks();
+    const ops::BlockMoeWeights &block = layer.ffn;
     for (const ops::BlockExpertProjection *projection : {&block.gate, &block.up, &block.down})
       if (!projection->routed.isFloat())
         weights[projection->routed.formatId] += uint64_t{projection->routed.outputSize} * projection->routed.inputSize;
@@ -104,7 +99,7 @@ QwenTargetGeometry qwenTargetGeometry(const QwenTargetWeights<Layout, Layer> &we
       includeProjection(geometry, mixer.inputProjection);
       includeProjection(geometry, mixer.outputProjection);
     }, layer.mixer);
-    includeFfn(geometry, layer, &layer == &weights.layers.front());
+    includeFfn(geometry, layer);
   }
   geometry.moeExpertFormat = routedExpertFormat(weights.layers);
   geometry.prefillProjections = geometry.decodeProjections;
@@ -234,35 +229,25 @@ metal::MetalBuffer QwenTarget::addPrefill(
   return buffers.hidden[geometry_.layers & 1];
 }
 
-// An affine prefill projection reads the Q4 input sums of its rows, which the
-// norm writes beside them; a block projection reads none.
-void QwenTarget::addPrefillNorm(PrefillStep &step, metal::MetalBuffer input, const ops::NormWeights &norm,
-                                ops::WeightLayout consumer) const {
-  const QwenTargetPrefillBuffers &b = step.buffers;
-  if (consumer == ops::WeightLayout::Affine64)
-    ops::Normalization::addRmsWithQ4Sums(step.graph, input, norm, b.normalized, b.projectionSums,
-                                         geometry_.hiddenSize, step.rows);
-  else
-    ops::Normalization::addRms(step.graph, input, norm, b.normalized, geometry_.hiddenSize, step.rows);
+// The normalized rows a layer's prefill projections read.
+void QwenTarget::addPrefillNorm(PrefillStep &step, metal::MetalBuffer input, const ops::NormWeights &norm) const {
+  ops::Normalization::addRms(step.graph, input, norm, step.buffers.normalized, geometry_.hiddenSize, step.rows);
 }
 
 // The mixer output projection adds the mixer's rows to `input`.
 void QwenTarget::addPrefillOutput(PrefillStep &step, metal::MetalBuffer hidden, const ops::Projection &projection,
                                   metal::MetalBuffer input, metal::MetalBuffer output) const {
-  const QwenTargetPrefillBuffers &b = step.buffers;
-  if (projection.layout() == ops::WeightLayout::Affine64)
-    operators_.linear().addPrefillSums(step.graph, hidden, b.projectionSums, projection, step.rows);
-  operators_.linear().addPrefillResidual(step.graph, hidden, projection, input, output, b.projectionSums,
-                                         step.rows, b.linearScratch);
+  operators_.linear().addPrefillResidual(step.graph, hidden, projection, input, output, step.rows,
+                                         step.buffers.linearScratch);
 }
 
 metal::MetalBuffer QwenTarget::addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer,
                                                const ops::NormWeights &norm, metal::MetalBuffer input) const {
   const QwenTargetPrefillBuffers &b = step.buffers;
   const uint32_t layer = step.gdnLayer++;
-  addPrefillNorm(step, input, norm, mixer.inputProjection.layout());
-  operators_.linear().addPrefill(step.graph, b.normalized, mixer.inputProjection, b.gdnPacked, b.projectionSums,
-                                 step.rows, b.linearScratch);
+  addPrefillNorm(step, input, norm);
+  operators_.linear().addPrefill(step.graph, b.normalized, mixer.inputProjection, b.gdnPacked, step.rows,
+                                 b.linearScratch);
   for (const QwenTargetPrefillSequence &sequence : step.sequences) {
     const auto u16 = [&](const metal::MetalBuffer &buffer, uint32_t width) {
       return rowsOf<uint16_t>(backend_, buffer, sequence.rowBegin, sequence.rows, width);
@@ -278,7 +263,7 @@ metal::MetalBuffer QwenTarget::addPrefillMixer(PrefillStep &step, const QwenGdnW
          mixer.timeBias, f32(b.gdnDecay, geometry_.gdnValueHeads), u16(b.gdnBeta, geometry_.gdnValueHeads),
          sequence.recurrentIn[layer], sequence.recurrentOut[layer], u16(b.recurrent, geometry_.attentionWidth),
          mixer.mixerNorm, u16(b.gdnHidden, geometry_.attentionWidth)},
-        geometry_.gdnShape(), sequence.rows, mixer.outputHeadOrder);
+        geometry_.gdnShape(), sequence.rows, geometry_.stateLayout.format, mixer.outputHeadOrder);
   }
   addPrefillOutput(step, b.gdnHidden, mixer.outputProjection, input, b.gdnOutput);
   return b.gdnOutput;
@@ -288,9 +273,9 @@ metal::MetalBuffer QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAtte
                                                const ops::NormWeights &norm, metal::MetalBuffer input) const {
   const QwenTargetPrefillBuffers &b = step.buffers;
   const uint32_t layer = step.attentionLayer++;
-  addPrefillNorm(step, input, norm, mixer.inputProjection.layout());
-  operators_.linear().addPrefill(step.graph, b.normalized, mixer.inputProjection, b.fullPacked, b.projectionSums,
-                                 step.rows, b.linearScratch);
+  addPrefillNorm(step, input, norm);
+  operators_.linear().addPrefill(step.graph, b.normalized, mixer.inputProjection, b.fullPacked, step.rows,
+                                 b.linearScratch);
   for (size_t index = 0; index < step.sequences.size(); ++index) {
     const QwenTargetPrefillSequence &sequence = step.sequences[index];
     const auto u16 = [&](const metal::MetalBuffer &buffer, uint32_t width) {
@@ -326,7 +311,7 @@ metal::MetalBuffer QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAtte
 
 void QwenTarget::addPrefillFfn(PrefillStep &step, uint32_t index, const Qwen3_8LayerWeights &layer,
                                metal::MetalBuffer residual, metal::MetalBuffer output) const {
-  addPrefillNorm(step, residual, layer.postAttentionNorm, layer.gateProjection.layout());
+  addPrefillNorm(step, residual, layer.postAttentionNorm);
   const ops::PrefillFfnBuffers ffn = step.buffers.ffn();
   if (step.aneFfn)
     step.aneFfn->add(step.graph, index, ffn, residual, output, step.rows);
@@ -350,10 +335,6 @@ void QwenTarget::addVerify(
     std::span<const kv::ChunkedPrefillParams> chunks, uint32_t lanes) const {
   if (!lanes || lanes > ExecutionLimits::maximumBatchWidth || chunks.size() != lanes ||
       kvLayers.size() != geometry_.kvLayout.attentionLayers ||
-      buffers.gdnPacked.size() != geometry_.stateLayout.layers ||
-      buffers.gdnMixed.size() != geometry_.stateLayout.layers ||
-      buffers.gdnDecay.size() != geometry_.stateLayout.layers ||
-      buffers.gdnBeta.size() != geometry_.stateLayout.layers ||
       buffers.chunkKeys.size() != geometry_.kvLayout.attentionLayers ||
       buffers.chunkValues.size() != geometry_.kvLayout.attentionLayers) {
     throw std::invalid_argument("invalid Qwen verify batch");
@@ -393,19 +374,17 @@ metal::MetalBuffer QwenTarget::addVerifyMixer(VerifyStep &step, const QwenGdnWei
   const ops::PreparedInput normalized = ops::Normalization::addRms(
       step.graph, input, norm, b.normalized, geometry_.hiddenSize, step.rows, b.linearScratch, inputPlan.input());
   linear.add(step.graph,
-             {.input = b.normalized, .output = b.gdnPacked[layer], .scratch = b.linearScratch,
+             {.input = b.normalized, .output = b.gdnPacked, .scratch = b.linearScratch,
               .prepared = normalized},
              mixer.inputProjection, inputPlan);
   const ops::LinearPlan outputPlan =
       linear.decodePlan(mixer.outputProjection, step.lanes, ops::LinearEpilogue::Residual);
   const ops::PreparedInput hidden = ops::GDN::addDecode(
       step.graph,
-      {b.gdnPacked[layer], mixer.convolutionWeights, b.currentGdnStates, b.nextGdnStates, b.gdnMixed[layer],
-       mixer.decay, mixer.timeBias, b.gdnDecay[layer], b.gdnBeta[layer], mixer.mixerNorm, b.gdnHidden,
+      {b.gdnPacked, mixer.convolutionWeights, b.currentGdnStates, b.nextGdnStates, b.gdnTape,
+       std::span(b.gdnTapeLanes).first(step.lanes), mixer.decay, mixer.timeBias, mixer.mixerNorm, b.gdnHidden,
        b.linearScratch},
-      geometry_.gdnShape(), step.lanes, layer,
-      {geometry_.stateLayout.convolutionLayerBytes(), geometry_.stateLayout.recurrentLayerBytes(),
-       geometry_.stateLayout.convolutionBytes()},
+      geometry_.gdnShape(), step.lanes, layer, geometry_.stateLayout.strides(),
       mixer.outputHeadOrder, outputPlan.input());
   linear.add(step.graph,
              {.input = b.gdnHidden, .output = b.gdnOutput, .residual = input, .scratch = b.linearScratch,
@@ -501,22 +480,6 @@ void QwenTarget::addEmbedding(metal::CommandGraph &graph,
                               uint32_t rows) const {
   ops::Embedding::add(graph, std::move(tokens), weightsBase_.tokenEmbedding, std::move(hidden),
                       rows);
-}
-
-void QwenTarget::addStateCommit(metal::CommandGraph &graph,
-                                QwenTargetCommitBuffers buffers,
-                                uint32_t lanes) const {
-  if (!lanes || lanes > ExecutionLimits::maximumBatchWidth)
-    throw std::invalid_argument("invalid Qwen state commit batch");
-  ops::GDN::addCommit(
-      graph,
-      {std::move(buffers.packed), std::move(buffers.mixed),
-       std::move(buffers.decay), std::move(buffers.beta), buffers.currentStates,
-       buffers.nextStates, std::move(buffers.retainedCounts)},
-      geometry_.gdnShape(), geometry_.stateLayout.layers, lanes,
-      {geometry_.stateLayout.convolutionLayerBytes(),
-       geometry_.stateLayout.recurrentLayerBytes(),
-       geometry_.stateLayout.convolutionBytes()});
 }
 
 } // namespace splash::model

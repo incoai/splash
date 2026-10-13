@@ -30,6 +30,7 @@ struct NativeArguments final {
   // empty for temporary ones.
   std::filesystem::path persistentCacheRoot;
   kv::Format kvFormat = kv::Format::Int8;
+  ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
   double decodeShare = EngineConfig{}.decodeShare;
   uint32_t maxImagePatches = ops::kMaximumImagePatches;
   // --idle-release SECONDS|off, infinite for off.

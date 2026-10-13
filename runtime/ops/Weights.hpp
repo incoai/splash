@@ -6,20 +6,15 @@
 #include <cstdint>
 #include <stdexcept>
 #include <utility>
-#include <variant>
 #include <vector>
 
 struct QuantFormat;
 
 namespace splash::ops {
 
-// Physical layout, independent of the checkpoint container and compute tile.
-enum class WeightLayout : uint8_t { Affine64, Block32 };
-
 struct ProjectionShape final {
   uint32_t outputSize = 0;
   uint32_t inputSize = 0;
-  WeightLayout layout = WeightLayout::Affine64;
   // Its quantized segments multiply the rotated input (InputRotation), which
   // takes LinearScratch::rotated.
   bool rotated = false;
@@ -42,32 +37,6 @@ enum class FloatOutput : uint8_t { BFloat16, Float32 };
 [[nodiscard]] constexpr uint64_t elementBytes(FloatOutput type) noexcept {
   return type == FloatOutput::Float32 ? sizeof(float) : sizeof(uint16_t);
 }
-
-struct AffineWeights final {
-  metal::MetalBuffer weights;
-  metal::MetalBuffer scales;
-  metal::MetalBuffer biases;
-};
-
-// A Q8 affine projection, quantized per 64 inputs in storage tiles of
-// SPLASH_AFFINE_TILE_ROWS rows (metal/abi/Linear.h): the MoE router and the
-// shared expert's scalar gate.
-struct Q8Projection final {
-  AffineWeights planes;
-  uint32_t outputSize = 0;
-  uint32_t inputSize = 0;
-};
-
-// An expert-major Q4 slab holding one complete storage-tiled projection per
-// expert, expertStrideBytes apart: the operator selects an expert by its
-// offset, so no per-expert buffer or copy exists at run time.
-struct ExpertProjection final {
-  metal::MetalBuffer packed;
-  uint32_t experts = 0;
-  uint32_t outputSize = 0;
-  uint32_t inputSize = 0;
-  uint64_t expertStrideBytes = 0;
-};
 
 // A prepared GGUF tensor occupying a projection's output columns
 // [columnOffset, columnOffset + outputSize): repacked planes in the GGUF_FMT_*
@@ -109,64 +78,37 @@ struct BlockWeights final {
   std::vector<QuantizedSegment> segments;
 };
 
-// Immutable weights in one of the two layouts: Affine holds the Affine64
-// form, Block the Block32 form, and layout() names the one held. Projections,
-// token tables and MoE blocks share this pattern; the accessor of the layout
-// not held throws std::bad_variant_access. A default value holds empty affine
-// weights, which a reader replaces.
-template <class Affine, class Block>
-class LayoutWeights {
-public:
-  LayoutWeights() = default;
-  LayoutWeights(Affine weights) : storage_(std::move(weights)) {}
-  LayoutWeights(Block weights) : storage_(std::move(weights)) {}
-
-  [[nodiscard]] WeightLayout layout() const noexcept {
-    return std::visit([](const auto &weights) { return layoutOf(weights); }, storage_);
-  }
-  [[nodiscard]] const Affine &affine() const { return std::get<Affine>(storage_); }
-  [[nodiscard]] const Block &blocks() const { return std::get<Block>(storage_); }
-
-private:
-  // One layout per alternative: an alternative without one does not compile.
-  static constexpr WeightLayout layoutOf(const Affine &) noexcept { return WeightLayout::Affine64; }
-  static constexpr WeightLayout layoutOf(const Block &) noexcept { return WeightLayout::Block32; }
-
-  std::variant<Affine, Block> storage_;
-};
-
-// A projection of outputSize x inputSize. A block projection's segments tile
-// its leading output columns in order: each takes every input and starts
-// where the previous one ends; the columns past the last are padding.
-class Projection final : public LayoutWeights<AffineWeights, BlockWeights> {
+// A projection of outputSize x inputSize. Its segments tile its leading
+// output columns in order: each takes every input and starts where the
+// previous one ends; the columns past the last are padding. A default value
+// holds no segments, which a reader replaces.
+class Projection final {
 public:
   Projection() = default;
-  Projection(uint32_t output, uint32_t input, AffineWeights weights)
-      : LayoutWeights(std::move(weights)), outputSize(output), inputSize(input) {}
   Projection(uint32_t output, uint32_t input, BlockWeights weights)
-      : LayoutWeights(std::move(weights)), outputSize(output), inputSize(input) {
-    if (blocks().segments.empty()) throw std::invalid_argument("block projection has no segments");
+      : outputSize(output), inputSize(input), weights_(std::move(weights)) {
+    if (weights_.segments.empty()) throw std::invalid_argument("block projection has no segments");
     uint32_t covered = 0;
-    for (const QuantizedSegment &s : blocks().segments) {
+    for (const QuantizedSegment &s : weights_.segments) {
       if (s.inputSize != input || s.columnOffset != covered || !s.outputSize || s.outputSize > output - covered)
         throw std::invalid_argument("block segments do not tile the projection");
       covered += s.outputSize;
     }
   }
 
+  [[nodiscard]] const BlockWeights &blocks() const noexcept { return weights_; }
   [[nodiscard]] ProjectionShape shape() const noexcept {
-    return {outputSize, inputSize, layout(), static_cast<bool>(rotation)};
+    return {outputSize, inputSize, static_cast<bool>(rotation)};
   }
 
-  // Views of a projection of affine Q4 weights or of one unrotated quantized
-  // GGUF tensor (Linear.cpp): over the leading `rows` rows of its planes,
-  // whole QUANT_TILE_ROWS tiles; or over the leading `inputs` inputs of each
-  // of its rows, whole quant groups and meta units, which reads its planes as
-  // they are (planeInputs()).
+  // Views of a projection of one unrotated quantized tensor (Linear.cpp):
+  // over the leading `rows` rows of its planes, whole QUANT_TILE_ROWS tiles;
+  // or over the leading `inputs` inputs of each of its rows, whole quant
+  // groups and meta units, which reads its planes as they are (planeInputs()).
   [[nodiscard]] Projection leadingRows(const metal::MetalBackend &backend, uint32_t rows) const;
   [[nodiscard]] Projection leadingInputs(uint32_t inputs) const;
-  // Whether those views take it: its own planes, not a view, of affine Q4
-  // weights or of one unrotated quantized GGUF tensor.
+  // Whether those views take it: its own planes, not a view, of one
+  // unrotated quantized tensor.
   [[nodiscard]] bool takesPlaneViews() const noexcept;
   // The inputs each row of the weight planes holds when the projection reads
   // only their first inputSize, a view of leadingInputs(); zero for
@@ -180,37 +122,52 @@ public:
   // fp32 only for plain decode plans (Linear::plan), which keep the tile of
   // the bf16 plan.
   FloatOutput destination = FloatOutput::BFloat16;
-  // Block projections only.
   InputRotation rotation;
 
 private:
+  BlockWeights weights_;
   uint32_t planeInputs_ = 0;
 };
 
-// A token table's rows as the GGUF stores them, in a gguf_embedding_format
-// (metal/abi/Gguf.h), gathered, never multiplied (Embedding.cpp).
+// A token table's rows as stored, gathered, never multiplied (Embedding.cpp):
+// native blocks of a gguf_embedding_format (metal/abi/Gguf.h), or bf16
+// values, which a safetensors checkpoint may keep unquantized. A default value
+// holds no rows, which a reader replaces.
 struct NativeRows final {
+  // The formatId of bf16 rows, which no kQuantFormats entry describes.
+  static constexpr uint32_t kBfloat16 = 0xffffffff;
+
+  NativeRows() = default;
+  // Rows of a gguf_embedding_format or kBfloat16; throws for any other formatId.
   NativeRows(metal::MetalBuffer rows, uint32_t formatId);
   metal::MetalBuffer rows;
-  uint32_t formatId;
+  uint32_t formatId = 0;
+  [[nodiscard]] bool isBfloat16() const noexcept { return formatId == kBfloat16; }
+  // The kernel name suffix of its format ("bf16" for bf16 rows).
   [[nodiscard]] const char *name() const noexcept;
+  // The elements and bytes of one block: its format's native block, or one bf16 value.
+  [[nodiscard]] uint32_t blockElements() const noexcept;
+  [[nodiscard]] uint32_t blockBytes() const noexcept;
 };
 
 // A token table of outputSize rows of inputSize values, which Embedding
-// gathers: affine Q4 rows or native GGUF rows. It is intentionally a separate
-// type: no table may be bound as a projection.
-class EmbeddingWeights final : public LayoutWeights<AffineWeights, NativeRows> {
+// gathers. It is intentionally a separate type: no table may be bound as a
+// projection.
+class EmbeddingWeights final {
 public:
   EmbeddingWeights() = default;
-  EmbeddingWeights(uint32_t output, uint32_t input, AffineWeights weights)
-      : LayoutWeights(std::move(weights)), outputSize(output), inputSize(input) {}
   EmbeddingWeights(uint32_t output, uint32_t input, NativeRows rows)
-      : LayoutWeights(std::move(rows)), outputSize(output), inputSize(input) {}
+      : outputSize(output), inputSize(input), rows_(std::move(rows)) {}
+
+  [[nodiscard]] const NativeRows &blocks() const noexcept { return rows_; }
 
   uint32_t outputSize = 0;
   uint32_t inputSize = 0;
   // Native rows stored rotated, gathered as D (H r) (InputRotation).
   InputRotation rotation;
+
+private:
+  NativeRows rows_;
 };
 
 } // namespace splash::ops

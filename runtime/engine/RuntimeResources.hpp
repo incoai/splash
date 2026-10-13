@@ -82,6 +82,7 @@ void requireLoadedModel(const model::LoadedModel &loaded);
 
 struct RuntimeResourcesConfig {
   kv::Format kvFormat = kv::Format::Int8;
+  ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
   std::filesystem::path metallibPath;
   std::filesystem::path modelRoot;
   model::ModelDescriptor model;

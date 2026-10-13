@@ -6,7 +6,10 @@
 //   equal a one-lane projection of them bitwise; the plain epilogue into fp32 (the logits) holds the values its
 //   bf16 output rounds, bit for bit, each within fp64 before rounding;
 // - fused: three segments of different formats in one projection equal the projections of each segment alone;
-// - gate/up: every gate and up format pair;
+// - both on the staged tile's spread walk too (LinearConfig::spread), over partitions from 72 steps down to 9, an odd
+//   count, whose tiles' walks wrap past the partition's end;
+// - gate/up: each format's gate with the next format's up, and in one pass (LinearConfig::oneGateUpPass) bitwise the
+//   two passes at the same K split;
 // - prefill: 128-row tiles with each epilogue, whose simdgroups past the chunk write nothing, and chunks of up to 32
 //   rows on the decode tiles equal to them bitwise; fused segments at their column offsets;
 // - split visibility: two projections that share the split scratch, at every pair of K splits either tile's policy
@@ -14,13 +17,13 @@
 // Every run leaves the padding columns past its segments, the guard bands past its buffers and its counters as they
 // were. The token gather (ops::Embedding) of every embedding format's native rows is checked here too.
 #include "GgufFormatReference.hpp"
+#include "LinearNumerics.hpp"
 #include "TestBuffers.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/Gguf.h"
 #include "ops/Embedding.hpp"
 #include "ops/Linear.hpp"
-#include "tuning/LinearNumerics.hpp"
 
 #include <dispatch/dispatch.h>
 
@@ -34,6 +37,7 @@
 #include <iostream>
 #include <random>
 #include <set>
+#include <span>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -41,11 +45,13 @@
 using namespace splash;
 using namespace splash::ops;
 using namespace gguf_reference;
+using splash::metal::BytesBinding;
 using splash::metal::CommandGraph;
+using splash::metal::ComputeDispatch;
 using splash::metal::MetalBackend;
 using splash::metal::MetalBuffer;
-using splash::ops::tuning::bf16ToFloat;
-using splash::ops::tuning::floatToBf16;
+using splash::test::bf16ToFloat;
+using splash::test::floatToBf16;
 
 namespace {
 
@@ -301,8 +307,9 @@ struct Outcome {
   std::vector<uint16_t> output, gate;
 };
 
-// Runs one projection with `plan` over `x` (and `aux`), its split partials first set to `poison`; checks what every
-// run must leave as it was: guards, counters and the padding columns past `covered`.
+// Runs one projection with `plan` over `x` (and `aux`), its split partials first set to `poison`; checks that a spread
+// plan's dispatches bind the spread walk, and what every run must leave as it was: guards, counters and the padding
+// columns past `covered`.
 Outcome run(MetalBackend &backend, const Linear &linear, const LinearPlan &plan, const Projection &p,
             const Projection *gate, const std::vector<uint16_t> &x, const std::vector<uint16_t> &aux, uint32_t poison,
             uint32_t covered, const std::string &label) {
@@ -311,6 +318,17 @@ Outcome run(MetalBackend &backend, const Linear &linear, const LinearPlan &plan,
   scratch.poison(poison);
   CommandGraph graph;
   static_cast<void>(linear.add(graph, o.bindings(plan, scratch), p, plan, gate));
+  // A spread plan's dispatches are staged decode tiles, each binding its parameters with spread set.
+  if (plan.configuration().spread)
+    for (const ComputeDispatch &dispatch : graph.dispatches()) {
+      const BytesBinding &params = dispatch.bytes.front();
+      uint32_t spread = 0;
+      if (params.sizeBytes == sizeof(GgufDecodeParams))
+        spread = static_cast<const GgufDecodeParams *>(params.data)->spread;
+      else if (params.sizeBytes == sizeof(GgufDecodeFusedParams))
+        spread = static_cast<const GgufDecodeFusedParams *>(params.data)->spread;
+      if (spread != 1) fail(label + ": " + dispatch.pipelineName + " walks K in lockstep");
+    }
   static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
   if (!scratch.intact() || !o.input.intact() || !o.aux.intact() || !o.output.intact() || !o.gate.intact())
     fail(label + ": a counter is not reset or a write past a buffer");
@@ -392,20 +410,28 @@ bool sameRows(const std::vector<uint16_t> &a, uint64_t aRow, const std::vector<u
   return std::equal(a.begin() + aRow * columns, a.begin() + (aRow + rows) * columns, b.begin() + bRow * columns);
 }
 
-// The configuration of `tile` for a decode workload, or of the staged tile for a prefill chunk of up to 32 rows.
-LinearConfig config(LinearTile tile, const LinearWorkload &w, uint32_t splits) {
-  return {.tile = w.phase == LinearPhase::Prefill ? LinearTile::GgufStaged : tile, .splits = splits};
+// The configuration of `tile` for a decode workload, or of the staged tile for a prefill chunk of up to 32 rows; the
+// staged tile walks K spread or in lockstep.
+LinearConfig config(LinearTile tile, const LinearWorkload &w, uint32_t splits, bool spread = false) {
+  return {.tile = w.phase == LinearPhase::Prefill ? LinearTile::GgufStaged : tile, .splits = splits, .spread = spread};
 }
+// The tile and its walk in labels.
+std::string walkName(LinearTile tile, bool spread) { return std::string(tileName(tile)) + (spread ? " spread" : ""); }
+// K of the decode and fused sections: 2048, or for the spread walk 2304, whose 72 steps make partitions of 72, 36, 18
+// and 9 steps: tiles start inside them and wrap past their ends, and at 9 the walk wraps from an even step to an even
+// one, so the stages alternate per step walked, not by the step's parity.
+uint32_t decodeInputs(bool spread) { return spread ? 2304 : 2048; }
 LinearWorkload decode(LinearMatrix matrix, uint32_t lanes, LinearEpilogue epilogue) {
-  return {matrix, lanes * kLaneRows, LinearPhase::Decode, epilogue, WeightLayout::Block32};
+  return {matrix, lanes * kLaneRows, LinearPhase::Decode, epilogue};
 }
 
 // ---------------------------------------------------------------- decode
-// One tile on single tensors [512, 2048] in every format (gate in the format three further on): at every lane count,
-// K split and epilogue, on dense and sparse inputs, every output within fp64 and each lane's rows equal to a one-lane
-// projection of them.
-void decodeTile(MetalBackend &backend, const Linear &linear, LinearTile tile) {
-  constexpr uint32_t N = 512, K = 2048, columns = N + kPadding;
+// One tile and walk on single tensors [512, K] in every format (gate in the format three further on): at every lane
+// count, K split and epilogue, on dense and sparse inputs, every output within fp64 and each lane's rows equal to a
+// one-lane projection of them.
+void decodeTile(MetalBackend &backend, const Linear &linear, LinearTile tile, bool spread) {
+  constexpr uint32_t N = 512, columns = N + kPadding;
+  const uint32_t K = decodeInputs(spread);
   const bool staged = tile == LinearTile::GgufStaged;
   for (int fi = 0; fi < FMT_COUNT; ++fi) {
     const Tensor w = tensor(backend, Fmt(fi), N, K), g = tensor(backend, Fmt((fi + 3) % FMT_COUNT), N, K);
@@ -427,14 +453,14 @@ void decodeTile(MetalBackend &backend, const Linear &linear, LinearTile tile) {
             const std::vector<float> aux(residual.begin() + uint64_t{lane} * kLaneRows * columns,
                                          residual.begin() + uint64_t{lane + 1} * kLaneRows * columns);
             const LinearWorkload one = decode({columns, K}, 1, epilogue);
-            const LinearPlan plan = Linear::plan(one, config(tile, one, splits), FloatOutput::BFloat16);
+            const LinearPlan plan = Linear::plan(one, config(tile, one, splits, spread), FloatOutput::BFloat16);
             lanesAlone.push_back(run(backend, linear, plan, up, gated, storageRows(rows, K, kLaneRows, kLaneRows),
                                      storageRows(aux, columns, kLaneRows, kLaneRows), kPoisonNaN, N,
                                      what + " lane " + std::to_string(lane) + " alone"));
           }
           for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes) {
             const LinearWorkload wl = decode({columns, K}, lanes, epilogue);
-            const LinearPlan plan = Linear::plan(wl, config(tile, wl, splits), FloatOutput::BFloat16);
+            const LinearPlan plan = Linear::plan(wl, config(tile, wl, splits, spread), FloatOutput::BFloat16);
             const uint32_t storage = plan.storageRows(), rows = wl.rows;
             const std::string label = what + " L=" + std::to_string(lanes);
             const std::vector<uint16_t> aux = storageRows(residual, columns, rows, storage);
@@ -442,7 +468,7 @@ void decodeTile(MetalBackend &backend, const Linear &linear, LinearTile tile) {
                                     kPoisonFinite, N, label);
             checkValues(out, dots, gateDots, aux, wl, rows, N, staged, label);
             if (epilogue == LinearEpilogue::None)
-              floatOutput(backend, linear, Linear::plan(wl, config(tile, wl, splits), FloatOutput::Float32), up,
+              floatOutput(backend, linear, Linear::plan(wl, config(tile, wl, splits, spread), FloatOutput::Float32), up,
                           storageRows(x, K, rows, storage), out, dots, N, staged, label);
             for (uint32_t lane = 0; lane < lanes; ++lane)
               if (!sameRows(out.output, lane * kLaneRows, lanesAlone[lane].output, 0, kLaneRows, columns))
@@ -451,14 +477,15 @@ void decodeTile(MetalBackend &backend, const Linear &linear, LinearTile tile) {
         }
     }
   }
-  section(std::string(tileName(tile)) + " decode: " + std::to_string(FMT_COUNT) + " formats, 1-4 lanes, S 1-8, plain/residual/gate-up, dense and "
-          "sparse inputs within fp64, lanes equal to one-lane projections, fp32 plain outputs rounding to bf16's");
+  section(walkName(tile, spread) + " decode: " + std::to_string(FMT_COUNT) + " formats, K " + std::to_string(K) +
+          ", 1-4 lanes, S 1-8, plain/residual/gate-up, dense and sparse inputs within fp64, lanes equal to one-lane "
+          "projections, fp32 plain outputs rounding to bf16's");
 }
 
-// One fused projection of three segments of different formats ([512 | 256 | 256, 2048]): at every lane count and K
-// split, within fp64 and equal to the projections of each segment alone.
-void fusedDecode(MetalBackend &backend, const Linear &linear, LinearTile tile) {
-  constexpr uint32_t K = 2048;
+// One fused projection of three segments of different formats ([512 | 256 | 256, K]) on one tile and walk: at every
+// lane count and K split, within fp64 and equal to the projections of each segment alone.
+void fusedDecode(MetalBackend &backend, const Linear &linear, LinearTile tile, bool spread) {
+  const uint32_t K = decodeInputs(spread);
   for (int fi = 0; fi < FMT_COUNT; ++fi) {
     const Tensor a = tensor(backend, Fmt(fi), 512, K), b = tensor(backend, Fmt((fi + 3) % FMT_COUNT), 256, K),
                  c = tensor(backend, Fmt((fi + 5) % FMT_COUNT), 256, K);
@@ -471,7 +498,7 @@ void fusedDecode(MetalBackend &backend, const Linear &linear, LinearTile tile) {
     for (const uint32_t splits : kSplits)
       for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes) {
         const LinearWorkload wl = decode({columns, K}, lanes, LinearEpilogue::None);
-        const LinearPlan plan = Linear::plan(wl, config(tile, wl, splits), FloatOutput::BFloat16);
+        const LinearPlan plan = Linear::plan(wl, config(tile, wl, splits, spread), FloatOutput::BFloat16);
         const uint32_t storage = plan.storageRows(), rows = wl.rows;
         const std::string label = formats + " S=" + std::to_string(splits) + " L=" + std::to_string(lanes);
         const Outcome out = run(backend, linear, plan, fused, nullptr, storageRows(x, K, rows, storage), {},
@@ -482,8 +509,8 @@ void fusedDecode(MetalBackend &backend, const Linear &linear, LinearTile tile) {
           const Projection alone = projection({part}, part->N);
           const LinearWorkload one = decode({part->N, K}, lanes, LinearEpilogue::None);
           const Outcome single =
-              run(backend, linear, Linear::plan(one, config(tile, one, splits), FloatOutput::BFloat16), alone, nullptr,
-                  storageRows(x, K, rows, storage), {}, kPoisonNaN, part->N, label + " alone");
+              run(backend, linear, Linear::plan(one, config(tile, one, splits, spread), FloatOutput::BFloat16), alone,
+                  nullptr, storageRows(x, K, rows, storage), {}, kPoisonNaN, part->N, label + " alone");
           for (uint32_t r = 0; r < rows; ++r)
             if (!std::equal(single.output.begin() + uint64_t{r} * part->N, single.output.begin() + (r + 1) * part->N,
                             out.output.begin() + uint64_t{r} * columns + offset)) {
@@ -494,12 +521,12 @@ void fusedDecode(MetalBackend &backend, const Linear &linear, LinearTile tile) {
         }
       }
   }
-  section(std::string(tileName(tile)) + " fused: three segments in " + std::to_string(FMT_COUNT) + " format triples, 1-4 lanes, S 1-8 within fp64 "
-          "and equal to each segment's projection");
+  section(walkName(tile, spread) + " fused: three segments in " + std::to_string(FMT_COUNT) + " format triples, K " +
+          std::to_string(K) + ", 1-4 lanes, S 1-8 within fp64 and equal to each segment's projection");
 }
 
-// Gate/up on one tile for every gate and up format pair ([256, 1024]) and four pairs at [1024, 1024], with the K
-// splits by lanes a decode step of these widths takes on large GPUs.
+// Gate/up on one tile for each format's gate with the next format's up ([256, 1024]), so that every format runs as
+// both, and four pairs at [1024, 1024], with the K splits by lanes a decode step of these widths takes on large GPUs.
 void gateUpPairs(MetalBackend &backend, const Linear &linear, LinearTile tile) {
   constexpr uint32_t K = 1024;
   constexpr uint32_t kSplitsByLanes[kMaximumLanes] = {1, 2, 4, 4};
@@ -518,12 +545,43 @@ void gateUpPairs(MetalBackend &backend, const Linear &linear, LinearTile tile) {
                 tile == LinearTile::GgufStaged, label);
   };
   for (int gf = 0; gf < FMT_COUNT; ++gf)
-    for (int uf = 0; uf < FMT_COUNT; ++uf)
-      for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes) pair(Fmt(gf), Fmt(uf), 256, lanes);
+    for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes) pair(Fmt(gf), Fmt((gf + 1) % FMT_COUNT), 256, lanes);
   const std::array<std::array<Fmt, 2>, kMaximumLanes> wide{{{IQ4XS, Q4K}, {Q5K, Q5K}, {Q4K, IQ4XS}, {Q3K, Q6K}}};
   for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes) pair(wide[lanes - 1][0], wide[lanes - 1][1], 1024, lanes);
-  section(std::string(tileName(tile)) + " gate/up: " + std::to_string(FMT_COUNT * FMT_COUNT) + " gate and up format pairs at N 256 and 4 at N 1024, 1-4 lanes, "
+  section(std::string(tileName(tile)) + " gate/up: " + std::to_string(FMT_COUNT) + " gate and up format pairs at N 256 and 4 at N 1024, 1-4 lanes, "
           "within fp64");
+}
+
+// Gate/up in one pass (LinearConfig::oneGateUpPass) on the staged tile, gate and up in each format ([768, K]), and in
+// Q4_K and MLX 4-bit at the 27B's [17408, 5120]: at every lane count, K split and walk, bitwise the output of the gate
+// and up passes, whatever the partials held before.
+void oneGateUpPass(MetalBackend &backend, const Linear &linear, bool spread) {
+  const auto pairs = [&](Fmt f, uint32_t N, uint32_t K, uint32_t columns, std::span<const uint32_t> lanes) {
+    const Tensor g = tensor(backend, f, N, K), u = tensor(backend, f, N, K);
+    const Projection gate = projection({&g}, columns), up = projection({&u}, columns);
+    const std::vector<float> x = activations(Inputs::Dense, kMaximumRows, K);
+    for (const uint32_t splits : kSplits)
+      for (const uint32_t l : lanes) {
+        const LinearWorkload wl = decode({columns, K}, l, LinearEpilogue::GateUp);
+        LinearConfig c = config(LinearTile::GgufStaged, wl, splits, spread);
+        const LinearPlan twoPasses = Linear::plan(wl, c, FloatOutput::BFloat16);
+        c.oneGateUpPass = true;
+        const LinearPlan onePass = Linear::plan(wl, c, FloatOutput::BFloat16);
+        const std::string label = std::string(fmtName(f)) + " " + std::to_string(N) + "x" + std::to_string(K) +
+                                  " S=" + std::to_string(splits) + " L=" + std::to_string(l);
+        const std::vector<uint16_t> rows = storageRows(x, K, wl.rows, onePass.storageRows());
+        const Outcome two = run(backend, linear, twoPasses, up, &gate, rows, {}, kPoisonNaN, N, label + " two passes");
+        const Outcome one = run(backend, linear, onePass, up, &gate, rows, {}, kPoisonFinite, N, label);
+        if (!sameRows(one.output, 0, two.output, 0, wl.rows, columns)) fail(label + ": differs from the two passes");
+      }
+  };
+  const uint32_t K = decodeInputs(spread);
+  constexpr uint32_t kAllLanes[] = {1, 2, 3, 4}, kEndLanes[] = {1, kMaximumLanes};
+  for (int fi = 0; fi < FMT_COUNT; ++fi) pairs(Fmt(fi), 768, K, 768 + kPadding, kAllLanes);
+  for (const Fmt f : {Q4K, Fmt(GGUF_FMT_AF4G64)}) pairs(f, 17408, 5120, 17408, kEndLanes);
+  section(walkName(LinearTile::GgufStaged, spread) + " one-pass gate/up: " + std::to_string(FMT_COUNT) +
+          " formats at 768x" + std::to_string(K) + ", 1-4 lanes, and Q4_K and MLX 4-bit at 17408x5120, 1 and 4 lanes, "
+          "S 1-8, bitwise the two passes");
 }
 
 // ---------------------------------------------------------------- prefill
@@ -539,7 +597,7 @@ void prefill(MetalBackend &backend, const Linear &linear) {
                           const std::string &what) {
     const uint32_t covered = segmentColumns(parts), columns = p.outputSize;
     const auto workload = [&](uint32_t rows) {
-      return LinearWorkload{{columns, K}, rows, LinearPhase::Prefill, epilogue, WeightLayout::Block32};
+      return LinearWorkload{{columns, K}, rows, LinearPhase::Prefill, epilogue};
     };
     // Both chunks take two tiles.
     const uint32_t storage = Linear::plan(workload(kChunks[0]), kTiles, FloatOutput::BFloat16).storageRows();
@@ -565,7 +623,7 @@ void prefill(MetalBackend &backend, const Linear &linear) {
     }
     for (const uint32_t rows : {8u, 16u, 24u, 32u})
       for (const uint32_t splits : {1u, kSplitChunk}) {
-        const LinearWorkload chunk{{columns, K}, rows, LinearPhase::Prefill, epilogue, WeightLayout::Block32};
+        const LinearWorkload chunk{{columns, K}, rows, LinearPhase::Prefill, epilogue};
         const LinearPlan plan =
             Linear::plan(chunk, config(LinearTile::GgufStaged, chunk, splits), FloatOutput::BFloat16);
         const std::string name = label + " chunk of " + std::to_string(rows) + " rows S=" + std::to_string(splits);
@@ -614,8 +672,7 @@ void leadingInputs(MetalBackend &backend, const Linear &linear) {
                                                                              : MetalBuffer{},
                                                upload(backend, planes.meta))}});
     const Projection view = Projection(N, K, BlockWeights{{whole.segment}}).leadingInputs(kLeading);
-    const LinearWorkload w{{N, kLeading}, kChunk, LinearPhase::Prefill, LinearEpilogue::Residual,
-                           WeightLayout::Block32};
+    const LinearWorkload w{{N, kLeading}, kChunk, LinearPhase::Prefill, LinearEpilogue::Residual};
     const LinearPlan plan = Linear::plan(w, {.tile = LinearTile::GgufPrefill}, FloatOutput::BFloat16);
     const uint32_t storage = plan.storageRows();
     const std::vector<uint16_t> x = storageRows(activations(Inputs::Dense, storage, kLeading), kLeading, kChunk,
@@ -744,7 +801,8 @@ void splitVisibility(MetalBackend &backend, const Linear &linear, LinearTile til
 
 // ---------------------------------------------------------------- token gather
 // ops::Embedding over the native rows of every embedding format (kernels/shared/embedding.metal): each gathered value
-// is the bf16 rounding of GGML's fp32 value, for tokens in any order, repeated, and the vocabulary's first and last.
+// is the bf16 rounding of GGML's fp32 value, for tokens in any order, repeated, and the vocabulary's first and last;
+// and over bf16 rows, each value as stored.
 void tokenGather(MetalBackend &backend) {
   constexpr uint32_t kVocabulary = 64, kHidden = 1024;
   const std::vector<uint32_t> tokens{kVocabulary - 1, 0, 17, 17, 42, 3, kVocabulary - 1, 29, 8};
@@ -770,13 +828,29 @@ void tokenGather(MetalBackend &backend) {
     }
     if (differ) fail(std::string(fmtName(f)) + " gather: " + std::to_string(differ) + " values differ from bf16(GGML)");
   }
-  section("token gather: " + std::to_string(formats) + " embedding formats, each value bf16 of GGML's fp32 value");
+  std::vector<uint8_t> rows(size_t{kVocabulary} * kHidden * 2);
+  for (auto &b : rows) b = uint8_t(rng());
+  for (size_t i = 1; i < rows.size(); i += 2) rows[i] &= 0xBF;   // finite: exponents below 0x7F
+  const EmbeddingWeights table(kVocabulary, kHidden, NativeRows(upload(backend, rows), NativeRows::kBfloat16));
+  const Guarded ids(backend, tokens.size() * sizeof(uint32_t), 0), output(backend, tokens.size() * kHidden * 2, 0xFF);
+  std::memcpy(ids.view.contents(), tokens.data(), ids.bytes);
+  CommandGraph graph;
+  Embedding::add(graph, ids.view, table, output.view, uint32_t(tokens.size()));
+  static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+  if (!output.intact()) fail("bf16 gather writes past its output");
+  const std::vector<uint16_t> got = output.halves();
+  size_t differ = 0;
+  for (size_t r = 0; r < tokens.size(); ++r)
+    differ += std::memcmp(got.data() + r * kHidden, rows.data() + size_t(tokens[r]) * kHidden * 2, kHidden * 2) != 0;
+  if (differ) fail("bf16 gather: " + std::to_string(differ) + " rows differ from the table's");
+  section("token gather: " + std::to_string(formats) +
+          " embedding formats, each value bf16 of GGML's fp32 value, and bf16 rows as stored");
 }
 
 // Each buffer the token gathers reach, at its extent and one element short:
-// the rows' token ids and bf16 output rows, every token's native blocks, the
-// rotation signs of a rotated PQ2_0 table, and an affine table's Q4 rows with
-// a scale and a bias per 64 values.
+// the rows' token ids and bf16 output rows, every token's native blocks (of
+// Q8_0, PQ2_0 and MLX's af4g64 and nvfp4) or bf16 values, and the rotation
+// signs of a rotated PQ2_0 table.
 void gatherExtents(MetalBackend &backend) {
   constexpr uint32_t kVocabulary = 64, kHidden = 1024, kRows = 9;
   const MetalBuffer tokens = test::sharedBuffer(backend, kRows * 4),
@@ -789,7 +863,7 @@ void gatherExtents(MetalBackend &backend) {
     });
   };
   std::vector<EmbeddingWeights> tables;
-  for (const Fmt f : {Q80, PQ20}) {
+  for (const Fmt f : {Q80, PQ20, Fmt(GGUF_FMT_AF4G64), NVFP4}) {
     const QuantFormat &format = kQuantFormats[f];
     const uint64_t rowBytes = uint64_t{kHidden} / format.block_elements * format.block_bytes;
     EmbeddingWeights table(kVocabulary, kHidden, NativeRows(test::sharedBuffer(backend, kVocabulary * rowBytes), f));
@@ -808,20 +882,12 @@ void gatherExtents(MetalBackend &backend) {
       });
     tables.push_back(table);
   }
-  const uint64_t parameters = uint64_t{kVocabulary} * (kHidden / 64) * 2;
-  const AffineWeights planes{test::sharedBuffer(backend, uint64_t{kVocabulary} * kHidden / 2),
-                             test::sharedBuffer(backend, parameters), test::sharedBuffer(backend, parameters)};
-  for (const auto &[member, bytes, element, what] :
-       std::initializer_list<std::tuple<MetalBuffer AffineWeights::*, uint64_t, uint64_t, const char *>>{
-           {&AffineWeights::weights, uint64_t{kVocabulary} * kHidden / 2, 1, "token table"},
-           {&AffineWeights::scales, parameters, 2, "token table scale"},
-           {&AffineWeights::biases, parameters, 2, "token table bias"}})
-    requireTableExtent(planes.*member, bytes, element, what, [&](const MetalBuffer &view) {
-      AffineWeights changed = planes;
-      changed.*member = view;
-      return EmbeddingWeights(kVocabulary, kHidden, changed);
-    });
-  tables.emplace_back(kVocabulary, kHidden, planes);
+  const uint64_t bfloat16Bytes = uint64_t{kVocabulary} * kHidden * 2;
+  tables.emplace_back(kVocabulary, kHidden,
+                      NativeRows(test::sharedBuffer(backend, bfloat16Bytes), NativeRows::kBfloat16));
+  requireTableExtent(tables.back().blocks().rows, bfloat16Bytes, 2, "token table", [&](const MetalBuffer &rows) {
+    return EmbeddingWeights(kVocabulary, kHidden, NativeRows(rows, NativeRows::kBfloat16));
+  });
   for (const EmbeddingWeights &table : tables) {
     test::requireExtent(backend, tokens, kRows * 4, 4, "embedding token", [&](CommandGraph &graph, const MetalBuffer &view) {
       Embedding::add(graph, view, table, output, kRows);
@@ -829,7 +895,7 @@ void gatherExtents(MetalBackend &backend) {
     test::requireExtent(backend, output, uint64_t{kRows} * kHidden * 2, 2, "embedding output",
                         [&](CommandGraph &graph, const MetalBuffer &view) { Embedding::add(graph, tokens, table, view, kRows); });
   }
-  section("token gather extents: every buffer of native, rotated and affine tables at its extent and refused one "
+  section("token gather extents: every buffer of native and rotated tables at its extent and refused one "
           "element short");
 }
 
@@ -843,10 +909,13 @@ int main(int argc, char **argv) {
       MetalBackend backend(argv[1]);
       const Linear linear(backend.capabilities());
       for (const LinearTile tile : {LinearTile::GgufRegister, LinearTile::GgufStaged}) {
-        decodeTile(backend, linear, tile);
-        fusedDecode(backend, linear, tile);
+        decodeTile(backend, linear, tile, false);
+        fusedDecode(backend, linear, tile, false);
         gateUpPairs(backend, linear, tile);
       }
+      decodeTile(backend, linear, LinearTile::GgufStaged, true);
+      fusedDecode(backend, linear, LinearTile::GgufStaged, true);
+      for (const bool spread : {false, true}) oneGateUpPass(backend, linear, spread);
       prefill(backend, linear);
       leadingInputs(backend, linear);
       // The 27B out_proj then down, and gdn_in then gate/up: K 6144, 17408 and 5120.

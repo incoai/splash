@@ -12,15 +12,12 @@
 #import <Foundation/Foundation.h>
 
 #include <cstdlib>
-#include <filesystem>
-#include <fstream>
 #include <functional>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <span>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -36,136 +33,6 @@ namespace runtime = splash::engine;
 
 using splash::test::rejects;
 using splash::test::require;
-
-class TemporaryModelRoot final {
-public:
-  TemporaryModelRoot() {
-    path_ = std::filesystem::temp_directory_path() /
-            ("splash-geometry-" +
-             std::string([NSUUID UUID].UUIDString.UTF8String));
-    if (!std::filesystem::create_directory(path_))
-      throw std::runtime_error("unable to create temporary model root");
-    std::filesystem::create_directories(path_ / "tokenizer");
-    std::ofstream config(path_ / "tokenizer" / "config.json");
-    config << R"({"text_config":{"model_type":"qwen3_5_text","max_position_embeddings":262144,"hidden_size":5120,"vocab_size":248320}})";
-    if (!config)
-      throw std::runtime_error("unable to write tokenizer config");
-  }
-  ~TemporaryModelRoot() { std::filesystem::remove_all(path_); }
-
-  const std::filesystem::path &path() const noexcept { return path_; }
-  void write(std::string_view document) const {
-    std::ofstream output(path_ / "manifest.json");
-    output << document;
-    if (!output)
-      throw std::runtime_error("unable to write temporary model manifest");
-  }
-
-private:
-  std::filesystem::path path_;
-};
-
-std::string executionManifest(uint32_t draftRows = 8,
-                              std::string_view extraGeometry = {}) {
-  std::ostringstream out;
-  out << R"({"schema_version":3,"model":"Qwen3.8-27B-DFlash2","format":{"name":"splash-packed-q4","q4_bits":4,"q4_group_size":64,"q4_storage_n":256,"section_alignment_bytes":16384,"target_layer_magic":"MDFL0006","draft_layer_magic":"MDFD0004","vision_magic":"MDFV0001"},"execution_geometry":{)"
-      << R"("draft_proposal_tokens":7,)"
-      << "\"draft_query_rows\":" << draftRows << ','
-      << R"("draft_sliding_window":2048,)"
-      << R"("maximum_batch_width":4,)"
-      << R"("prefill_token_budget":2048,)"
-      << R"("target_kv_block_tokens":32,)"
-      << R"("target_verify_rows":8)" << extraGeometry << "}}";
-  return out.str();
-}
-
-void testInstalledManifestBindsExecutionGeometry() {
-  TemporaryModelRoot root;
-  root.write(executionManifest());
-  // The sources' identity is the digest of the record naming them.
-  const std::string sourceIdentity = model::inspectModelRoot(root.path()).sourceIdentity;
-  require(sourceIdentity == model::weightDigest(executionManifest()),
-          "the sources' identity is not the manifest's digest");
-
-  root.write(executionManifest(7));
-  try {
-    static_cast<void>(model::inspectModelRoot(root.path()));
-    throw std::runtime_error("geometry mismatch was accepted");
-  } catch (const std::invalid_argument &error) {
-    require(std::string_view(error.what()).find("draft_query_rows") !=
-                std::string_view::npos,
-            "geometry mismatch did not identify its field");
-  }
-
-  root.write(executionManifest(8, R"(,"description":"package metadata")"));
-  require(model::inspectModelRoot(root.path()).sourceIdentity != sourceIdentity,
-          "another manifest named the same sources");
-
-  // The batch width, prefill budget, KV page and verify rows a package
-  // records are the runtime's choices, not its weights': other ones load.
-  std::string retuned = executionManifest();
-  for (const auto &[published, other] :
-       {std::pair<std::string, std::string>{"\"maximum_batch_width\":4", "\"maximum_batch_width\":8"},
-        {"\"prefill_token_budget\":2048", "\"prefill_token_budget\":4096"},
-        {"\"target_kv_block_tokens\":32", "\"target_kv_block_tokens\":16"},
-        {"\"target_verify_rows\":8", "\"target_verify_rows\":16"}}) {
-    const size_t at = retuned.find(published);
-    require(at != std::string::npos, "test manifest lost " + published);
-    retuned.replace(at, published.size(), other);
-  }
-  root.write(retuned);
-  static_cast<void>(model::inspectModelRoot(root.path()));
-
-  // A whole number written as a float, as Python writes 1e7, is that
-  // integer; a fraction is not one.
-  std::string floatRows = executionManifest();
-  const std::string rows = "\"draft_query_rows\":8,";
-  const size_t rowsAt = floatRows.find(rows);
-  require(rowsAt != std::string::npos, "test manifest lost draft rows");
-  root.write(std::string(floatRows).replace(rowsAt, rows.size(),
-                                            "\"draft_query_rows\":8.0,"));
-  static_cast<void>(model::inspectModelRoot(root.path()));
-  root.write(floatRows.replace(rowsAt, rows.size(),
-                               "\"draft_query_rows\":8.5,"));
-  try {
-    static_cast<void>(model::inspectModelRoot(root.path()));
-    throw std::runtime_error("fractional geometry was accepted");
-  } catch (const std::invalid_argument &error) {
-    require(std::string_view(error.what()).find("draft_query_rows") !=
-                std::string_view::npos,
-            "fractional geometry did not identify its field");
-  }
-
-  std::string missingGeometry = executionManifest();
-  const std::string requiredField = "\"draft_sliding_window\":2048,";
-  const size_t field = missingGeometry.find(requiredField);
-  require(field != std::string::npos, "test manifest lost required geometry");
-  missingGeometry.erase(field, requiredField.size());
-  root.write(missingGeometry);
-  try {
-    static_cast<void>(model::inspectModelRoot(root.path()));
-    throw std::runtime_error("missing geometry field was accepted");
-  } catch (const std::invalid_argument &error) {
-    require(std::string_view(error.what()).find("draft_sliding_window") !=
-                std::string_view::npos,
-            "missing geometry field did not identify its name");
-  }
-
-  std::string wrongStorage = executionManifest();
-  const size_t storage = wrongStorage.find("\"q4_storage_n\":256");
-  require(storage != std::string::npos, "test manifest lost Q4 storage");
-  wrongStorage.replace(storage, std::string("\"q4_storage_n\":256").size(),
-                       "\"q4_storage_n\":128");
-  root.write(wrongStorage);
-  try {
-    static_cast<void>(model::inspectModelRoot(root.path()));
-    throw std::runtime_error("wrong Q4 storage was accepted");
-  } catch (const std::invalid_argument &error) {
-    require(std::string_view(error.what()).find("q4_storage_n") !=
-                std::string_view::npos,
-            "Q4 storage mismatch did not identify the weight format");
-  }
-}
 
 // The identity reports the loaded model's digests in lowercase hex and the
 // KV layout as loaded; a malformed digest or a missing build id fails before
@@ -356,7 +223,8 @@ private:
   engine::NativeLoopConfig loopConfig() {
     return {.engine = test::engineConfig({.maxContext = 1024}),
             .metrics = &metrics_,
-            .weights = &weights_};
+            .weights = &weights_,
+            .weightAdmission = test::admitAll};
   }
 
   test::TestKvStorage backing_;
@@ -731,7 +599,6 @@ void testProtocolLimitsFollowTheModel() {
 
 int main() {
   try {
-    testInstalledManifestBindsExecutionGeometry();
     testRuntimeCacheIdentityReportsTheLoadedModel();
     testAllNativeWarmupsPrecedeReady();
     testBudgetLimitedWarmupKeepsRuntimeConcurrency();

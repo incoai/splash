@@ -109,8 +109,6 @@ VERIFY_ATTENTION_GATE(verify_attention_gate_kv2_g8, 16, 2)
     Layout::write(table + ulong(row / 8) * width * 8, sums + ulong(row / 8) * Layout::sums_per_tile(width), \
                   width, (element % width) / 64, row % 8, lane, a, b); \
   }
-ATTENTION_GATE_TABLE(verify_attention_gate_table64, 24, 4, q4sg::Table64)
-ATTENTION_GATE_TABLE(verify_attention_gate_table64_kv2_g8, 16, 2, q4sg::Table64)
 ATTENTION_GATE_TABLE(verify_attention_gate_table16, 24, 4, gguf_sg::Table16)
 ATTENTION_GATE_TABLE(verify_attention_gate_table16_kv2_g8, 16, 2, gguf_sg::Table16)
 #undef ATTENTION_GATE_TABLE

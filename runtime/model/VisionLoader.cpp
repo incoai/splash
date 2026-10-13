@@ -65,23 +65,32 @@ vision::Input input(std::string name, SourceTensor tensor) {
   return {std::move(name), std::move(tensor)};
 }
 
-// MLX: an unquantized vision_tower.*, whose patch embedding is one Conv3d
-// weight [output, frame, patch-row, patch-col, channel].
+// A safetensors checkpoint's unquantized tower: MLX's vision_tower.*, whose
+// patch embedding is one Conv3d weight [output, frame, patch-row, patch-col,
+// channel], or transformers' model.visual.* (as Model Optimizer keeps it),
+// whose Conv3d weight [output, channel, frame, patch-row, patch-col] is in the
+// image's order already, so the writer copies it as stored.
 void bindCheckpoint(const SafetensorsCheckpoint &checkpoint, const ops::VisionLayout &layout, Plan &plan) {
   const uint64_t p = layout.patchSize;
+  const std::string mlxPrefix = "vision_tower.", transformersPrefix = "model.visual.";
+  const bool transformers = checkpoint.find(transformersPrefix + "patch_embed.proj.weight") != nullptr;
   for (auto &s : plan.sections) {
+    const std::string name = transformers ? transformersPrefix + s.mlx.substr(mlxPrefix.size()) : s.mlx;
     // A quantized module keeps its scales beside the packed weight.
-    const auto scales = s.mlx.substr(0, s.mlx.rfind('.')) + ".scales";
-    if (const SourceTensor *quantized = checkpoint.find(scales))
-      throw WeightStoreError("the MLX vision tower is quantized (" + scales + " in " +
-                             quantized->file->path().string() +
-                             "); preparation needs BF16, F16 or F32 vision weights");
-    const auto &tensor = checkpoint.require(s.mlx);
-    const std::vector<uint64_t> shape = s.patch          ? std::vector<uint64_t>{s.rows, 2, p, p, 3}
+    const auto stem = name.substr(0, name.rfind('.'));
+    for (const auto &scales : {stem + ".scales", stem + ".weight_scale"})
+      if (const SourceTensor *quantized = checkpoint.find(scales))
+        throw WeightStoreError("the vision tower is quantized (" + scales + " in " + quantized->file->path().string() +
+                               "); preparation needs BF16, F16 or F32 vision weights");
+    const auto &tensor = checkpoint.require(name);
+    const std::vector<uint64_t> shape = s.patch          ? transformers ? std::vector<uint64_t>{s.rows, 3, 2, p, p}
+                                                                        : std::vector<uint64_t>{s.rows, 2, p, p, 3}
                                         : s.columns == 1 ? std::vector<uint64_t>{s.rows}
                                                          : std::vector<uint64_t>{s.rows, s.columns};
-    if (tensor.shape != shape) throw WeightStoreError("vision tensor shape mismatch: " + s.mlx);
-    s.inputs.push_back(input(s.mlx, tensor));
+    if (tensor.shape != shape) throw WeightStoreError("vision tensor shape mismatch: " + name);
+    // Transformers' patch embedding needs no reordering.
+    if (transformers) s.patch = false;
+    s.inputs.push_back(input(name, tensor));
   }
 }
 
@@ -167,7 +176,7 @@ VisionLoader::VisionLoader(const std::filesystem::path &directory, VisionSource 
   auto planned = std::make_shared<Planned>();
   planned->layout = layout;
   planned->plan = plan(layout);
-  if (source == VisionSource::Mlx) {
+  if (source == VisionSource::Safetensors) {
     planned->checkpoint = std::make_unique<SafetensorsCheckpoint>(directory);
     bindCheckpoint(*planned->checkpoint, layout, planned->plan);
   } else if (source == VisionSource::Gguf) {

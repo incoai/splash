@@ -625,8 +625,19 @@ class MultiplexedRuntime:
         the request unanswered for `timeout` fails the engine it ran."""
         return self._status(timeout, None, fail_unanswered)
 
+    def release_weights(self, timeout: float = 5.0) -> wire.StatusJsonEvent:
+        """Asks the engine to give its weights back now. It does so only when
+        it holds no request and no restore is under way; the status JSON that
+        answers shows which (`weights.released`). The next request restores
+        them, as after the idle release."""
+        return self._status(timeout, None, False, release=True)
+
     def _status(
-        self, timeout: float, generation: int | None, fail_unanswered: bool
+        self,
+        timeout: float,
+        generation: int | None,
+        fail_unanswered: bool,
+        release: bool = False,
     ) -> wire.StatusJsonEvent:
         """Asks the engine of ``generation``, or the current one when None, so
         that a probe never measures a newer engine."""
@@ -644,7 +655,11 @@ class MultiplexedRuntime:
             waiter = _StatusWaiter()
             self._status_waiters[correlation_id] = waiter
         try:
-            encoded = wire.serialize_message(wire.StatusRequestFrame(correlation_id))
+            encoded = wire.serialize_message(
+                wire.ReleaseRequestFrame(correlation_id)
+                if release
+                else wire.StatusRequestFrame(correlation_id)
+            )
             self._write_bytes(encoded, generation, deadline=deadline)
         except BaseException:
             with self._state_lock:

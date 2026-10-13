@@ -82,8 +82,9 @@ struct PoolShape {
 
 // A native loop over the fake model, collecting the bytes it writes. Its
 // config is completed with the engine's (test::engineConfig), and the
-// fixture's metrics and weights where the test gave none; the weights' idle
-// release is production's unless the test gives one. Its unix clock stands
+// fixture's metrics and weights, each weight allocation admitted
+// (test::admitAll), where the test gave none; the weights' idle release is
+// production's unless the test gives one. Its unix clock stands
 // still and its awake clock reads `monotonic`, advanced by `clockStep` on
 // every read.
 struct LoopFixture {
@@ -114,6 +115,8 @@ struct LoopFixture {
       config.metrics = &metrics;
     if (!config.weights)
       config.weights = &weights;
+    if (!config.weightAdmission)
+      config.weightAdmission = test::admitAll;
     config.unixMicros = [] { return uint64_t{1'000'000}; };
     config.monotonicMilliseconds = [this] { return monotonic += clockStep; };
     return config;
@@ -229,6 +232,28 @@ void testPromptProgress() {
           "cancelled prefill published further progress");
 }
 
+// /status active_requests: a live request's phase, prompt progress, output
+// budget and age since its arrival, until it finishes.
+void testSnapshotReportsLiveRequests() {
+  engine::NativeLoopConfig config;
+  LoopFixture fixture(config, {.pages = 512});
+  engine::NativeRuntime &loop = fixture.loop;
+  loop.announceReady();
+  const auto commandsReady = fixture.executor.holdCommands();
+  require(loop.receive(protocol::peer::serialize(request(7, 4))), "request failed");
+  require(loop.tick() && loop.commandInFlight(), "prefill was not submitted");
+  fixture.monotonic += 250.0;
+  const std::vector<engine::ActiveRequestSnapshot> active = loop.statusSnapshot().activeRequests;
+  require(active.size() == 1 && active[0].id == 7 && active[0].phase == engine::Phase::Prefill &&
+              active[0].priority == RequestPriority::Foreground && active[0].promptTokens == 65 &&
+              active[0].promptProcessed == 0 && active[0].generatedTokens == 0 &&
+              active[0].maxNewTokens == 4 && active[0].ageMilliseconds == 250.0,
+          "a prefilling request's progress or age is wrong");
+  *commandsReady = true;
+  runUntilIdle(loop);
+  require(loop.statusSnapshot().activeRequests.empty(), "a finished request is still reported");
+}
+
 void testWireLifecycleAndCacheHit() {
   engine::NativeLoopConfig config;
   config.engine.maxContext = 1024;
@@ -315,6 +340,54 @@ void testGenerationPromptBoundsTheReplayState() {
   }
   require(matched == std::vector<uint32_t>{0, 32},
           "the replay state did not end before the generation prompt");
+}
+
+// A request's cache salt reaches the engine: the same prompt under another
+// salt starts cold and under its own salt resumes. A Done event reports the
+// tokens a request read from blocks another request computed, and a salt no
+// other request uses reads none.
+void testCacheSaltAndDeduplicationCrossTheWire() {
+  engine::NativeLoopConfig config;
+  config.engine.maxContext = 1024;
+  LoopFixture fixture(config);
+  engine::NativeRuntime &loop = fixture.loop;
+  fixture.clockStep = 0.25;
+  loop.announceReady();
+  const auto send = [&](protocol::RequestFrame input) {
+    require(loop.receive(protocol::peer::serialize(input)), "salted request wire failed");
+    runUntilIdle(loop);
+  };
+  for (const auto &[id, salt] : {std::pair<uint64_t, uint64_t>{1, 7}, {2, 8}, {3, 7}}) {
+    auto input = request(id);
+    input.cacheSalt = {salt, 0};
+    send(input);
+  }
+  // An unsalted longer prompt, then two with its first three blocks' tokens
+  // and no state there: one unsalted, one under a salt no other request uses.
+  auto longer = request(4, 8);
+  longer.promptTokens.resize(129);
+  for (uint32_t i = 0; i < longer.promptTokens.size(); ++i)
+    longer.promptTokens[i] = 1000 + i;
+  send(longer);
+  for (const auto &[id, salt] : {std::pair<uint64_t, uint64_t>{5, 0}, {6, 99}}) {
+    auto branch = longer;
+    branch.requestId = id;
+    branch.cacheSalt = {salt, 0};
+    std::fill(branch.promptTokens.begin() + 100, branch.promptTokens.end(), 7);
+    send(branch);
+  }
+  std::unordered_map<uint64_t, uint32_t> matched, deduplicated;
+  for (const auto &message : fixture.events()) {
+    if (const auto *start = std::get_if<protocol::StartEvent>(&message))
+      matched[start->requestId] = start->matchedPromptTokens;
+    if (const auto *done = std::get_if<protocol::DoneEvent>(&message))
+      deduplicated[done->requestId] = done->deduplicatedTokens;
+  }
+  require(matched.at(1) == 0 && matched.at(2) == 0 && matched.at(3) > 0,
+          "a request's cache salt did not reach the engine");
+  require(matched.at(5) == 0 && deduplicated.at(5) > 0 && matched.at(6) == 0 &&
+              deduplicated.at(6) == 0,
+          "a Done event did not carry the tokens read from another request's blocks");
 }
 
 // A request's flags reach the model with the rest of its request.
@@ -675,10 +748,10 @@ void testInvalidLimitsAreRejectedAtConstruction() {
           "the loop accepted invalid protocol limits");
 }
 
-// The loop refuses a config without the metrics or the weights the bootstrap
-// always gives it.
-void testLoopNeedsItsMetricsAndWeights() {
-  for (const bool metrics : {true, false}) {
+// The loop refuses a config without the metrics, the weights or their
+// admission the bootstrap always gives it; each case lacks one of them.
+void testLoopNeedsItsComponents() {
+  for (const int lacking : {0, 1, 2}) {
     test::TestKvStorage storage(8, 4096, 4);
     KvPool pool(storage, 8);
     engine::Cache cache(pool, nullptr, nullptr);
@@ -686,14 +759,15 @@ void testLoopNeedsItsMetricsAndWeights() {
     RuntimeMetrics runtimeMetrics;
     Weights weights;
     NativeLoopConfig config{.engine = test::engineConfig(),
-                            .metrics = metrics ? &runtimeMetrics : nullptr,
-                            .weights = metrics ? nullptr : &weights};
+                            .metrics = lacking == 0 ? nullptr : &runtimeMetrics,
+                            .weights = lacking == 1 ? nullptr : &weights,
+                            .weightAdmission = lacking == 2 ? nullptr : test::admitAll};
     rejects([&] {
       engine::NativeRuntime(std::move(config), metal::kResidencyKeepAliveSeconds, cache,
                             executor, [](std::span<const uint8_t>) {},
                             test::readyStatusJson, protocol::ProtocolLimits{});
     }, "the native engine loop lacks a component it needs",
-            "a loop without its metrics or its weights was built");
+            "a loop without its metrics, its weights or their admission was built");
   }
 }
 
@@ -1247,9 +1321,10 @@ void testConstrainedMaskExchange() {
 }
 
 // Between commands the control pass runs what the host's pressure asks for:
-// a paced pass toward the recovery margin, which keeps the resume point and
-// the empty runway extent; nothing once the host recovers; and under critical
-// pressure every cache entry and extent. None waits for a transfer.
+// with nothing waiting, a paced pass toward the warning margin, which keeps
+// the resume point and the empty runway extent, and nothing past it; nothing
+// once the host recovers; and under critical pressure every cache entry and
+// extent. None waits for a transfer.
 void testControlPassReclaimsUnderHostPressure() {
   engine::NativeLoopConfig config;
   config.engine.maxContext = 1024;
@@ -1284,13 +1359,28 @@ void testControlPassReclaimsUnderHostPressure() {
           "host pressure did not evict toward its target, keeping the resume "
           "point and the runway extent");
 
+  // Past the warning margin the hysteresis still holds the pressure, but a
+  // pass that nothing waits for evicts nothing there: the state a third
+  // request caches stays beside the resume point.
+  auto third = request(3);
+  for (uint32_t &token : third.promptTokens)
+    token += 300;
+  require(loop.receive(protocol::peer::serialize(third)), "control pass request failed");
+  runUntilIdle(loop);
+  available = hostReserve + kHostWarningMarginBytes + kHostWarningMarginBytes / 2;
+  fixture.monotonic += 1000.0;
+  require(!control.run(MemoryPressure::Normal) &&
+              governor.snapshot().pressure == MemoryPressure::Warning &&
+              resources.snapshot().stateCache.entries == 2,
+          "a pass that nothing waited for evicted past the warning margin");
+
   available = hostReserve + kHostRecoveryMarginBytes + kHostWarningMarginBytes;
   const uint64_t releases = pool.snapshot().extentReleases;
   // The host's recovery lifts the pressure, so no pass runs: the untargeted
   // pass the settle window would otherwise run finds nothing to take either.
   require(!control.run(MemoryPressure::Normal) &&
               governor.snapshot().pressure == MemoryPressure::Normal &&
-              resources.snapshot().stateCache.entries == 1 &&
+              resources.snapshot().stateCache.entries == 2 &&
               pool.snapshot().extentReleases == releases,
           "a recovered host still reclaimed");
 
@@ -1299,6 +1389,51 @@ void testControlPassReclaimsUnderHostPressure() {
   require(critical.stateCache.entries == 0 && critical.pool.pagesPrefix == 0 &&
               critical.pool.pagesAllocated == 0,
           "critical pressure did not empty the cache and release every extent");
+}
+
+// The control pass tells the governor whether a request waits for memory:
+// only for one does growth wait for the recovery margin while the host's
+// headroom sits between the margins.
+void testControlPassHoldsGrowthForAWaitingRequest() {
+  LoopFixture fixture;
+  engine::NativeRuntime &loop = fixture.loop;
+  loop.announceReady();
+  // A finished request leaves cache a pass can free.
+  require(loop.receive(protocol::peer::serialize(request(1))), "the first request failed");
+  runUntilIdle(loop);
+  test::metalStatistics() = {};
+  metal::MetalBackend backend("unused");
+  constexpr uint64_t hostReserve = 2ULL << 30;
+  // A page short of the recovery margin, after growth the host refused.
+  std::optional<uint64_t> available = hostReserve + kHostRecoveryMarginBytes - 4096;
+  MemoryGovernor governor(backend, 40ULL << 30, hostReserve,
+                          [&available] { return available; }, 0);
+  require(!governor.allocationAdmission()(kHostWarningMarginBytes, [] {}),
+          "growth past the warning margin was admitted");
+  MemoryControl control(governor, backend, loop);
+  static_cast<void>(control.run(MemoryPressure::Normal));
+  require(governor.snapshot().pressure == MemoryPressure::Warning &&
+              governor.snapshot().hostGrowthAllowed,
+          "growth waited for the recovery margin with no request waiting");
+
+  // The host refuses the next request's lane, which then waits for memory.
+  fixture.executor.beginGrowthBlocked = [] { return true; };
+  fixture.executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
+  require(loop.receive(protocol::peer::serialize(request(2))) && !loop.tick() &&
+              loop.resourceWaitSnapshot().memory == 1,
+          "the request did not wait for memory");
+  // The next control pass finds it waiting.
+  static_cast<void>(control.run(MemoryPressure::Normal));
+  require(!governor.snapshot().hostGrowthAllowed,
+          "growth did not wait for the recovery margin while a request waited");
+
+  // Its retry, within its deadline, finds its lane.
+  fixture.executor.beginGrowthBlocked = {};
+  fixture.monotonic += 2 * engine::kResourceRetryBackoffMilliseconds;
+  runUntilIdle(loop);
+  static_cast<void>(control.run(MemoryPressure::Normal));
+  require(loop.snapshot().completed == 2 && governor.snapshot().hostGrowthAllowed,
+          "the hold outlived the waiting request");
 }
 
 bool answeredStatus(const LoopFixture &fixture, uint64_t correlationId) {
@@ -1313,10 +1448,11 @@ bool answeredStatus(const LoopFixture &fixture, uint64_t correlationId) {
 // held no request for the idle release, counted from Ready or from the end of
 // the last request however long it ran, never while one is there. A request
 // waits while they are written back, an image per tick, so the loop answers
-// frames between them, and the images all come back even when it is
-// cancelled. A restore that fails stops the engine. What the engine gives
-// back while idle without a Neural Engine split, ReleasableMemory over the
-// images alone, is the images: the test runs through it when `releasable`.
+// frames between them, and the images all come back even when it is cancelled,
+// while memory admits them (testRefusedRestoreWaitsForMemory). A restore that
+// fails other than for memory stops the engine. What the engine gives back
+// while idle without a Neural Engine split, ReleasableMemory over the images
+// alone, is the images: the test runs through it when `releasable`.
 void testIdleWeightsAreReleasedAndRestored(bool releasable) {
   constexpr double kIdleReleaseSeconds = 2.0;
   constexpr double idleRelease = 1000.0 * kIdleReleaseSeconds;
@@ -1496,6 +1632,149 @@ void testIdleReleaseRestoresTheSplitLast() {
   require(loop.snapshot().completed == 4, "a later request did not run");
 }
 
+// A restore takes the weights' memory under the governor's admission as
+// memory the requests waiting need: the host's margins do not refuse it, and
+// critical pressure does. A refused restore keeps the parts that came back
+// and makes no progress; the loop tries again after the retry backoff, and
+// every request waits for memory, as their resource wait reports, for the
+// resource wait limit from the first refusal after the last part that came
+// back. Memory that comes back in time lets the restore go on. Once the limit
+// passes, every request waiting fails retryably and the weights give back the
+// parts that came back, the split's program still released for the next
+// restore to load last; the engine stays up, and the next request starts
+// over, its wait counted afresh. A refused restore that no request waits for
+// any more takes no memory past the host's margins: it gives up at once and
+// counts no failure.
+void testRefusedRestoreWaitsForMemory() {
+  constexpr double kIdleReleaseSeconds = 2.0;
+  constexpr double kWaitLimit = 400.0;
+  constexpr uint64_t kReserve = 2ULL << 30;
+  constexpr uint64_t kHostMemory = 64ULL << 30;
+  test::metalStatistics() = {};
+  metal::MetalBackend backend("unused");
+  uint64_t hostAvailable = kHostMemory;
+  MemoryGovernor governor(backend, 40ULL << 30, kReserve,
+                          [&] { return std::optional<uint64_t>{hostAvailable}; }, 0);
+  Weights weights;
+  uint32_t programReleases = 0, programLoads = 0;
+  ReleasableMemory memory(weights, ReleasableMemory::Split{[&] {
+                                                             ++programReleases;
+                                                             return true;
+                                                           },
+                                                           [&] { ++programLoads; }});
+  engine::NativeLoopConfig config;
+  config.engine.maxContext = 1024;
+  config.engine.resourceWaitTimeoutMilliseconds = kWaitLimit;
+  config.engine.serving = [&](bool serving) { governor.setServing(serving); };
+  config.weights = &memory;
+  config.weightAdmission = governor.allocationAdmission();
+  LoopFixture fixture(config, {}, {}, kIdleReleaseSeconds);
+  engine::NativeRuntime &loop = fixture.loop;
+  MemoryControl control(governor, backend, loop);
+  const auto pass = [&](MemoryPressure pressure, double elapsed = 0.0) {
+    fixture.monotonic += elapsed;
+    static_cast<void>(control.run(pressure));
+  };
+  const auto errorOf = [&](uint64_t id) -> std::optional<protocol::ErrorEvent> {
+    for (const auto &message : fixture.events())
+      if (const auto *error = std::get_if<protocol::ErrorEvent>(&message);
+          error && error->requestId == id)
+        return *error;
+    return std::nullopt;
+  };
+  loop.announceReady();
+
+  pass(MemoryPressure::Normal, 1000.0 * kIdleReleaseSeconds);
+  require(memory.released() && programReleases == 1, "idle weights were kept");
+  hostAvailable = kReserve + (512ULL << 20);
+  require(governor.allocationAdmission()(Weights::kImageBytes, [] {}).failure ==
+              metal::AllocationFailure::HostPressure,
+          "the host's margin admitted memory no request needs");
+  require(loop.receive(protocol::peer::serialize(request(1))) && loop.tick() &&
+              weights.held() == 1,
+          "the host's margin held back weights a request waits for");
+
+  pass(MemoryPressure::Critical);
+  require(!loop.tick() && weights.held() == 1 && weights.restores == 1,
+          "critical pressure admitted the weights' memory");
+  require(loop.millisecondsUntilNextWakeup() == engine::kResourceRetryBackoffMilliseconds &&
+              loop.resourceWaitSnapshot().memory == 1,
+          "the request behind a refused restore did not wait for memory");
+  fixture.monotonic += kWaitLimit - 1.0;
+  require(!loop.tick() && weights.held() == 1 && !errorOf(1) && loop.engineHealthy() &&
+              loop.resourceWaitSnapshot().oldestWaitMilliseconds == kWaitLimit - 1.0,
+          "a refused restore gave up before the resource wait limit");
+  hostAvailable = kHostMemory;
+  pass(MemoryPressure::Normal);
+  runUntilIdle(loop);
+  require(loop.snapshot().completed == 1 && weights.restores == Weights::kImages &&
+              programLoads == 1 && loop.weightsSnapshot().restores == 1,
+          "the restore did not go on once memory came back");
+
+  pass(MemoryPressure::Normal, 1000.0 * kIdleReleaseSeconds);
+  require(memory.released() && programReleases == 2 &&
+              loop.receive(protocol::peer::serialize(request(2))) && loop.tick() &&
+              weights.held() == 1,
+          "the second restore did not write back its first image");
+  pass(MemoryPressure::Critical);
+  require(!loop.tick(), "critical pressure admitted the second image");
+  require(loop.receive(protocol::peer::serialize(request(4))) && !loop.tick() &&
+              loop.resourceWaitSnapshot().memory == 2,
+          "a request that came during a refused restore did not wait for memory");
+  fixture.monotonic += 0.75 * kWaitLimit;
+  pass(MemoryPressure::Normal);
+  require(loop.tick() && weights.held() == 2, "the second image did not come back");
+  pass(MemoryPressure::Critical);
+  require(!loop.tick(), "critical pressure admitted the third image");
+  fixture.monotonic += 0.75 * kWaitLimit;
+  require(!loop.tick() && weights.held() == 2 && !errorOf(2) && !errorOf(4),
+          "the resource wait limit did not restart once a part came back");
+  fixture.monotonic += 0.25 * kWaitLimit;
+  require(loop.tick(), "a restore past the resource wait limit made no progress");
+  for (uint64_t id : {2, 4}) {
+    const std::optional<protocol::ErrorEvent> error = errorOf(id);
+    require(error && error->failureClass == protocol::FailureClass::RequestError &&
+                error->code == "resource_timeout" && error->retryable &&
+                error->message.find("macOS is short of memory") != std::string::npos,
+            "a request behind a restore that gave up did not fail retryably");
+  }
+  require(memory.released() && weights.held() == 0 && programReleases == 2 &&
+              loop.weightsSnapshot().restoreFailures == 1 &&
+              loop.resourceWaitSnapshot().memory == 0 && loop.engineHealthy() &&
+              !loop.connectionMustClose(),
+          "a restore that gave up kept what came back, released the program again or stopped "
+          "the engine");
+
+  pass(MemoryPressure::Normal);
+  static_cast<void>(loop.tick());
+  require(weights.held() == 0, "a restore went on after it gave up");
+
+  pass(MemoryPressure::Critical);
+  require(loop.receive(protocol::peer::serialize(request(3))) && !loop.tick() && !errorOf(3) &&
+              loop.resourceWaitSnapshot().memory == 1,
+          "the next request did not wait for memory afresh");
+  pass(MemoryPressure::Normal);
+  runUntilIdle(loop);
+  require(loop.snapshot().completed == 2 && weights.restores == 2 * Weights::kImages + 2 &&
+              programLoads == 2 && loop.weightsSnapshot().restores == 2,
+          "the next request did not restore the weights from the first image");
+
+  pass(MemoryPressure::Normal, 1000.0 * kIdleReleaseSeconds);
+  require(memory.released() && loop.receive(protocol::peer::serialize(request(5))) &&
+              loop.tick() && weights.held() == 1,
+          "the last restore did not write back its first image");
+  pass(MemoryPressure::Critical);
+  require(!loop.tick() && loop.receive(protocol::peer::serialize(protocol::CancelFrame{5})),
+          "a refused restore's request could not be cancelled");
+  hostAvailable = kReserve + (512ULL << 20);
+  pass(MemoryPressure::Normal);
+  require(loop.tick() && memory.released() && weights.held() == 0 &&
+              loop.weightsSnapshot().restoreFailures == 1 &&
+              !loop.millisecondsUntilNextWakeup(),
+          "a refused restore no request waits for took memory past the host's margin, went "
+          "on, or counted a failure");
+}
+
 // With --idle-release off the control pass never releases the weights,
 // however long the engine holds no request.
 void testIdleReleaseOffKeepsTheWeights() {
@@ -1514,6 +1793,54 @@ void testIdleReleaseOffKeepsTheWeights() {
             "the idle release must be positive",
             "an idle release that is not positive was accepted");
   }
+}
+
+// A release request gives the weights back now, with the idle release off, when the
+// engine holds no request and no restore is under way; the answer is the status
+// document either way. The next request restores them as after the idle release.
+void testReleaseRequestGivesTheWeightsBackWhenIdle() {
+  Weights weights;
+  ReleasableMemory memory(weights, std::nullopt);
+  engine::NativeLoopConfig config;
+  config.engine.maxContext = 1024;
+  config.weights = &memory;
+  LoopFixture fixture(config, {}, {}, std::numeric_limits<double>::infinity());
+  engine::NativeRuntime &loop = fixture.loop;
+  loop.announceReady();
+  require(!weights.released(), "the weights were released before any release request");
+
+  require(loop.receive(protocol::peer::serialize(protocol::ReleaseRequestFrame{5})) &&
+              answeredStatus(fixture, 5),
+          "a release request was not answered with a status document");
+  require(weights.released() && loop.weightsSnapshot().released &&
+              loop.weightsSnapshot().restores == 0,
+          "an idle engine did not release its weights on request");
+  // A second request changes nothing and is answered again.
+  require(loop.receive(protocol::peer::serialize(protocol::ReleaseRequestFrame{6})) &&
+              answeredStatus(fixture, 6) && weights.released(),
+          "releasing released weights again failed");
+
+  // A request restores them, an image per tick.
+  require(loop.receive(protocol::peer::serialize(request(1))) && loop.tick() &&
+              weights.released(),
+          "the request did not start the restore");
+  // A release request during the restore leaves it alone.
+  require(loop.receive(protocol::peer::serialize(protocol::ReleaseRequestFrame{7})) &&
+              answeredStatus(fixture, 7),
+          "a release request during the restore was not answered");
+  while (weights.released())
+    require(loop.tick(), "a tick did not write back an image");
+  require(weights.restores == Weights::kImages, "the restore was disturbed by a release request");
+
+  // With a request in service the weights stay.
+  require(loop.receive(protocol::peer::serialize(request(2))) &&
+              loop.receive(protocol::peer::serialize(protocol::ReleaseRequestFrame{8})) &&
+              answeredStatus(fixture, 8) && !weights.released(),
+          "the weights were released under a request");
+  runUntilIdle(loop);
+  require(loop.receive(protocol::peer::serialize(protocol::ReleaseRequestFrame{9})) &&
+              weights.released(),
+          "the engine did not release once its request ended");
 }
 
 // The loop reports that it holds requests from the first it takes to the end
@@ -1583,14 +1910,16 @@ void testMemoryStatusReporterLogsTransitionsOnly() {
 int main() {
   try {
     testWireLifecycleAndCacheHit();
+    testSnapshotReportsLiveRequests();
     testGenerationPromptBoundsTheReplayState();
+    testCacheSaltAndDeduplicationCrossTheWire();
     testRequestFlagsReachTheModel();
     testSamplingReachesTheModel();
     testPromptProgress();
     testCapacityFailureHasOneTerminalFrame();
     testFatalFramingClosesConnection();
     testInvalidLimitsAreRejectedAtConstruction();
-    testLoopNeedsItsMetricsAndWeights();
+    testLoopNeedsItsComponents();
     testRequestErrorKeepsFraming();
     testCommandWatchdogAndPendingHealthWake();
     testDuplicateLiveRequestClosesWithoutAmbiguousError();
@@ -1609,10 +1938,13 @@ int main() {
     testInvalidScoreFailsOneRequestAndKeepsTheBatch();
     testConstrainedMaskExchange();
     testControlPassReclaimsUnderHostPressure();
+    testControlPassHoldsGrowthForAWaitingRequest();
     testIdleWeightsAreReleasedAndRestored(false);
     testIdleWeightsAreReleasedAndRestored(true);
     testIdleReleaseRestoresTheSplitLast();
+    testRefusedRestoreWaitsForMemory();
     testIdleReleaseOffKeepsTheWeights();
+    testReleaseRequestGivesTheWeightsBackWhenIdle();
     testHoldingRequestsSpansFirstToLastRequest();
     testMemoryStatusReporterLogsTransitionsOnly();
     std::cout << "native engine loop tests passed\n";

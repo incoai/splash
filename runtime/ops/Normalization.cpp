@@ -37,23 +37,4 @@ PreparedInput Normalization::addRms(metal::CommandGraph &graph,
   return {};
 }
 
-void Normalization::addRmsWithQ4Sums(
-    metal::CommandGraph &graph, metal::MetalBuffer input,
-    const NormWeights &weight, metal::MetalBuffer output,
-    metal::MetalBuffer sums, uint32_t width, uint32_t rows) {
-  if (weight.float32 || !rows || !width || width % 64)
-    throw std::invalid_argument("the Q4-sum norm takes bf16 weights and whole 64-input groups");
-  const uint64_t bytes = uint64_t{rows} * width * 2;
-  requireBytes(input, bytes, "norm input");
-  requireBytes(output, bytes, "norm output");
-  // The sums are [32-row tile][64-input group][row of the tile]: the last
-  // row's sum of the last group ends them.
-  const uint64_t groups = width / 64, last = rows - 1;
-  requireBytes(sums, ((last / 32 * groups + groups - 1) * 32 + last % 32 + 1) * sizeof(float), "norm sums");
-  graph.add(normKernel("prefill_norm_rms_sums32", weight, width),
-            {std::move(input), weight.buffer, std::move(output),
-             std::move(sums)},
-            width, {rows, 1, 1});
-}
-
 } // namespace splash::ops

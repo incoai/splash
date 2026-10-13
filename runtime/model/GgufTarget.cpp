@@ -28,7 +28,7 @@ WeightFile GgufTargetLoader::open(size_t index) {
   return images_.load({"target/" + plan.name, plan.magic, plan.layer, plan.type, plan.bytes,
                        [&backend = backend_, planned = planned_, index](std::span<uint8_t>,
                                                                          const metal::MetalBuffer &buffer) {
-                         writeGgufImage(backend, planned->source, buffer, planned->images[index]);
+                         writeGgufImage(backend, buffer, planned->images[index]);
                          planned->source.checkUnchanged();
                        }});
 }

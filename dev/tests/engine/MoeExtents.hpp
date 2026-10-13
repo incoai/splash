@@ -16,7 +16,7 @@ namespace splash::test {
 // tile count, routes and route rows, bf16 grouped rows, intermediates and
 // outputs, and fp32 sums.
 inline void requireMoeExtents(metal::MetalBackend &backend, const ops::MoeBuffers &buffers,
-                              const ops::MoeWeights &weights, const ops::MoePlan &plan) {
+                              const ops::BlockMoeWeights &weights, const ops::MoePlan &plan) {
   constexpr std::array<uint64_t, ops::kMoeScratchFields.size()> elements{4, 4, sizeof(MoeTileDescriptor), 4, 4,
                                                                           4, 2, 2, 2, 4};
   const auto encode = [&](metal::CommandGraph &graph, const ops::MoeBuffers &changed) {

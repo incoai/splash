@@ -787,6 +787,30 @@ class ChatTemplateFrontendTests(unittest.TestCase):
                 job = app.prepare({**body, **fields}, deadline=fixtures.FOREVER)
                 self.assertEqual(job.thinking, thinking)
 
+    def test_a_refusal_reaches_the_client_past_the_effort_alias(self):
+        # A template that takes high but not its alias, xhigh, refuses a
+        # message: the request reads that refusal, not what the alias met.
+        template = (
+            "{% if reasoning_effort is defined and reasoning_effort == 'xhigh' %}"
+            "{{ raise_exception('Unsupported effort xhigh.') }}{% endif %}"
+            "{% for m in messages %}{% if m.content == 'refused' %}"
+            "{{ raise_exception('This template refuses it.') }}{% endif %}"
+            "<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}"
+            "{% if add_generation_prompt %}<|im_start|>assistant\n<think>\n{% endif %}"
+        )
+        app = chat_frontend(template)
+        body = {
+            "model": "test-model",
+            "reasoning_effort": "high",
+            "messages": [{"role": "user", "content": "refused"}],
+        }
+        with self.assertRaises(APIError) as caught:
+            app.prepare(body, deadline=fixtures.FOREVER)
+        self.assertEqual(
+            caught.exception.message,
+            "messages could not be rendered: This template refuses it.",
+        )
+
     class ScoringTokenizer(fixtures.TemplateTokenizer, fixtures.CharTokenizer):
         """Renders the real template; one token per character for answer slots."""
 

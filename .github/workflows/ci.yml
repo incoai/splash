@@ -89,12 +89,12 @@ jobs:
     # arbitrary job timer.
     timeout-minutes: 360
     # The Metal suite once, then each model of DEVELOPMENT.md's Release check
-    # (MLX and GGUF, dense and MoE, each at one commit, and a legacy package)
-    # against the runner's retained baseline build, RUNNER_BASELINE, which
-    # release-check requires and which must load every model: the previous
-    # release's build, or while that loads no upstream model (1.0.x, for 1.1)
-    # a build of the last commit before the change under test. Every model
-    # runs even when an earlier step failed.
+    # (MLX and GGUF, dense and MoE, each at one commit) against the runner's
+    # retained baseline build, RUNNER_BASELINE, which release-check requires
+    # and which must load every model: the previous release's build, or while
+    # that loads no upstream model (1.0.x, for 1.1) a build of the last commit
+    # before the change under test. Every model runs even when an earlier step
+    # failed.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Run the shader-validated Metal suite
@@ -123,11 +123,6 @@ jobs:
           make install release-check BASELINE="$RUNNER_BASELINE"
           MODEL=unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M
           REVISION=a483e9e6cbd595906af30beda3187c2663a1118c
-      - name: incoai/Qwen3.8-27B-Splash
-        if: ${{ !cancelled() }}
-        run: >-
-          make install release-check BASELINE="$RUNNER_BASELINE"
-          MODEL=incoai/Qwen3.8-27B-Splash
       - name: Preserve release reports
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

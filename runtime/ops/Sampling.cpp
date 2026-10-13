@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <bit>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 
 namespace splash::ops {
@@ -141,7 +142,7 @@ void Sampling::addInitial(metal::CommandGraph &graph,
   const TargetSamplingParams params =
       selection(policies, buffers, {1, rowOffset, 0, SPLASH_UNIFORM_INITIAL, 0}, stopToken0, stopToken1);
   addPenalties(graph, policies, buffers, penalties, rowOffset, false);
-  addSelection(graph, params, static_cast<uint32_t>(policies.size()), buffers);
+  addSelection(graph, params, policies, buffers);
 }
 
 void Sampling::addVerify(metal::CommandGraph &graph,
@@ -159,7 +160,7 @@ void Sampling::addVerify(metal::CommandGraph &graph,
                 {SPLASH_TARGET_VERIFY_ROWS, 0, 1, SPLASH_UNIFORM_CORRECTION, SPLASH_DRAFT_PROPOSAL_TOKENS},
                 stopToken0, stopToken1);
   addPenalties(graph, policies, buffers, penalties, 0, true);
-  addSelection(graph, params, static_cast<uint32_t>(policies.size()), buffers);
+  addSelection(graph, params, policies, buffers);
 }
 
 TargetSamplingParams Sampling::selection(std::span<const SamplingPolicy> policies,
@@ -232,10 +233,11 @@ TargetSamplingParams Sampling::selection(std::span<const SamplingPolicy> policie
   return params;
 }
 
-void Sampling::addSelection(metal::CommandGraph &graph, const TargetSamplingParams &params, uint32_t lanes,
-                            const SamplingBuffers &buffers) const {
+void Sampling::addSelection(metal::CommandGraph &graph, const TargetSamplingParams &params,
+                            std::span<const SamplingPolicy> policies, const SamplingBuffers &buffers) const {
   // Greedy and sampled lanes run their own kernels, each over the selected
   // rows of every lane; the groups of the other kind's lanes return at once.
+  const uint32_t lanes = static_cast<uint32_t>(policies.size());
   const uint64_t selected = uint64_t{lanes} * params.rows;
   if (params.sampling_mask != (uint32_t{1} << lanes) - 1) {
     graph.add("decode_sample_argmax_sharded",
@@ -264,6 +266,29 @@ void Sampling::addSelection(metal::CommandGraph &graph, const TargetSamplingPara
               params, {selected * kVocabularyGroups, 1, 1},
               {kVocabularyThreads, 1, 1});
   }
+  // Only a selection that reaches a lane's thinking cutoff dispatches it.
+  ThinkingCutoffParams cutoffs{};
+  cutoffs.rows = params.rows;
+  cutoffs.drafted_rows = params.drafted_rows;
+  cutoffs.sampling_mask = params.sampling_mask;
+  std::optional<uint32_t> lastCut;
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    const std::optional<ThinkingCutoff> &cutoff = policies[lane].thinkingCutoff;
+    cutoffs.row[lane] = cutoff ? cutoff->row : params.rows;
+    if (cutoffs.row[lane] >= params.rows)
+      continue;
+    cutoffs.end[lane] = cutoff->end;
+    cutoffs.also_ends[lane] = cutoff->alsoEnds;
+    lastCut = lane;
+  }
+  if (!lastCut)
+    return;
+  // A cut lane reads its draft tokens up to its drafted rows' last.
+  requireBytes(buffers.inputTokens, (uint64_t{*lastCut} * params.rows + params.drafted_rows + 1) * sizeof(uint32_t),
+               "verify input token");
+  graph.add("decode_sample_thinking_cutoff",
+            {buffers.inputTokens, buffers.outputTokens, buffers.vocabularyRows},
+            cutoffs, {lanes, 1, 1}, {1, 1, 1});
 }
 
 void Sampling::addAcceptance(

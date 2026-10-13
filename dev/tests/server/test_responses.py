@@ -13,7 +13,8 @@ from dev.tests.server_fixtures import (
     rich_weather_tool,
 )
 from server import api_shapes
-from server.api_shapes import _namespace_alias, normalize_responses_input
+from server import protocol as native_wire
+from server.api_shapes import normalize_responses_input
 
 
 class ResponsesTests(HarnessTestCase):
@@ -759,6 +760,27 @@ class ResponsesTests(HarnessTestCase):
         self.assertEqual(runtime.requests, [])
         self.assertEqual(harness.tokenizer.templates, [])
 
+    def test_responses_take_the_chat_extensions(self):
+        runtime = FakeRuntime(Plan([[4]]))
+        harness = self.harness(runtime)
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/responses",
+            responses_body(
+                ignore_eos=True,
+                preserve_thinking=True,
+                chat_template_kwargs={"custom": 1},
+            ),
+        )
+        self.assertEqual(status, 200, payload)
+        # The prompt's render; the generation prompt's probes follow it.
+        _, kwargs = harness.tokenizer.templates[0]
+        self.assertEqual((kwargs["custom"], kwargs["preserve_thinking"]), (1, True))
+        self.assertTrue(
+            runtime.requests[0].frame.flags
+            & native_wire.RequestFlag.IGNORE_END_OF_SEQUENCE
+        )
+
     def test_responses_supports_namespaces(self):
         tools = [
             {
@@ -864,38 +886,58 @@ class ResponsesTests(HarnessTestCase):
         status, _, payload = harness.request("POST", "/v1/responses", bad)
         self.assertEqual(status, 400, payload)
 
-    def test_responses_shortens_long_namespace_aliases_without_collisions(self):
+    def test_responses_namespace_functions_go_by_namespace__name(self):
         namespace = "n" * 64
-        first_name = "same_prefix_" + "a" * 51
-        second_name = "same_prefix_" + "a" * 50 + "b"
+        names = ["mcp.search", "a" * 100]
         tools = [
             {
                 "type": "namespace",
                 "name": namespace,
                 "tools": [
-                    {"type": "function", "name": first_name, "parameters": {}},
-                    {"type": "function", "name": second_name, "parameters": {}},
+                    {"type": "function", "name": name, "parameters": {}}
+                    for name in names
                 ],
             }
         ]
         body = responses_body(
             tools=tools,
-            tool_choice={
-                "type": "function",
-                "namespace": namespace,
-                "name": first_name,
-            },
+            tool_choice={"type": "function", "namespace": namespace, "name": names[0]},
         )
         translated, namespaces = api_shapes.responses_to_chat_body(body, body["input"])
-        aliases = [tool["function"]["name"] for tool in translated["tools"]]
-        self.assertEqual([len(alias) for alias in aliases], [64, 64])
-        self.assertNotEqual(aliases[0], aliases[1])
+        aliases = [f"{namespace}__{name}" for name in names]
+        self.assertEqual(
+            [tool["function"]["name"] for tool in translated["tools"]], aliases
+        )
         self.assertEqual(
             translated["tool_choice"],
             {"type": "function", "function": {"name": aliases[0]}},
         )
-        self.assertEqual(namespaces[aliases[0]], (namespace, first_name))
-        self.assertEqual(_namespace_alias(namespace, first_name), aliases[0])
+        self.assertEqual(
+            namespaces,
+            {alias: (namespace, name) for alias, name in zip(aliases, names)},
+        )
+        # The name a call carries follows the tools' name rule.
+        tools[0]["tools"][1]["name"] = "a" * 200
+        runtime = FakeRuntime()
+        status, _, payload = self.harness(runtime).request(
+            "POST", "/v1/responses", responses_body(tools=tools)
+        )
+        self.assertEqual(status, 400, payload)
+        self.assertIn("tool name must be", json.loads(payload)["error"]["message"])
+        # Neither part of the name may be empty.
+        for namespace, name in (("", "search"), ("ns", "")):
+            tools[0]["name"] = namespace
+            tools[0]["tools"][1]["name"] = name
+            with self.subTest(namespace=namespace, name=name):
+                status, _, payload = self.harness(runtime).request(
+                    "POST", "/v1/responses", responses_body(tools=tools)
+                )
+                self.assertEqual(status, 400, payload)
+                self.assertEqual(
+                    json.loads(payload)["error"]["message"],
+                    "invalid namespace tool name",
+                )
+        self.assertEqual(runtime.requests, [])
 
     def test_responses_streaming_tool_calls(self):
         tool = {

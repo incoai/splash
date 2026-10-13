@@ -4,15 +4,19 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Splash</title>
 <link rel="icon" href="/favicon.ico" type="image/svg+xml">
+<link rel="stylesheet" href="/chat-assets/github-11.12.0.min.css">
+<link rel="stylesheet" href="/chat-assets/github-dark-11.12.0.min.css" media="(prefers-color-scheme: dark)">
 <style>
   * { box-sizing: border-box }
   :root {
     color-scheme: light dark;
     --sidebar: 260px;
+    --sidebar-duration: .22s;
     --bg: #fff;
     --side: #f9f9f9;
     --text: #171717;
     --muted: #727272;
+    --link: #2563eb;
     --hover: #ececec;
     --bubble: #f1f1f1;
     --composer: #fff;
@@ -25,6 +29,7 @@
       --side: #181818;
       --text: #ececec;
       --muted: #9b9b9b;
+      --link: #60a5fa;
       --hover: #2b2b2b;
       --bubble: #303030;
       --composer: #2f2f2f;
@@ -38,38 +43,75 @@
   button:disabled { cursor: default; opacity: .45 }
   svg { display: block }
 
-  aside { position: fixed; inset: 0 auto 0 0; z-index: 20; overflow-y: auto; width: var(--sidebar); padding: 12px 8px; background: var(--side); border-right: 1px solid var(--border) }
+  aside { position: fixed; inset: 0 auto 0 0; z-index: 20; overflow-y: auto; width: 260px; padding: 12px 8px; background: var(--side); border-right: 1px solid var(--border); transition: transform var(--sidebar-duration) ease, visibility 0s }
   .brand { display: flex; align-items: center; gap: 9px; height: 38px; padding: 0 10px; font-size: 17px; font-weight: 650; letter-spacing: -.02em }
   .brand img { width: 19px; height: 19px }
+  #sidebar-close, #sidebar-open { display: grid; place-items: center; width: 34px; height: 34px; padding: 0; border-radius: 9px; color: var(--muted) }
+  #sidebar-close { margin-left: auto }
+  #sidebar-open { position: fixed; top: 14px; left: 18px; z-index: 12; display: none }
+  #sidebar-close:hover, #sidebar-open:hover { color: var(--text); background: var(--hover) }
   #new-chat { display: flex; align-items: center; gap: 10px; width: 100%; margin-top: 9px; padding: 9px 10px; border-radius: 9px; text-align: left }
   #new-chat:hover { background: var(--hover) }
   #new-chat svg { width: 18px; height: 18px }
   .recent-label { margin: 22px 10px 7px; color: var(--muted); font-size: 12px; font-weight: 600 }
   #recents { display: grid; gap: 2px }
-  .recent { overflow: hidden; width: 100%; padding: 8px 10px; border-radius: 9px; text-align: left; text-overflow: ellipsis; white-space: nowrap }
+  .recent { position: relative; display: flex; align-items: center; width: 100%; border-radius: 9px; overflow: hidden }
   .recent:hover, .recent.active { background: var(--hover) }
+  .recent-open { flex: 1; min-width: 0; padding: 8px 10px; overflow: hidden; text-align: left; text-overflow: ellipsis; white-space: nowrap }
+  .recent-delete { position: absolute; top: 50%; right: 5px; transform: translateY(-50%); display: grid; place-items: center; width: 28px; height: 28px; border-radius: 6px; color: var(--muted); opacity: 0; pointer-events: none }
+  .recent:hover .recent-open, .recent:focus-within .recent-open { padding-right: 38px }
+  .recent:hover .recent-delete, .recent:focus-within .recent-delete { opacity: 1; pointer-events: auto }
+  .recent-delete:hover { color: var(--text); background: var(--bubble) }
+  @media (hover: none) {
+    .recent-open { padding-right: 38px }
+    .recent-delete { opacity: 1; pointer-events: auto }
+  }
 
   .credentials { display: block; margin: 18px 10px; color: var(--muted); font-size: 12px }
   #api-key { width: 100%; margin-top: 6px; padding: 6px 8px; color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 6px }
 
-  main { min-height: 100vh; margin-left: var(--sidebar) }
+  main { min-height: 100vh; margin-left: var(--sidebar); transition: margin-left var(--sidebar-duration) ease }
   #chat { width: min(760px, 100%); margin: auto; padding: 38px 20px 150px }
-  #empty { position: fixed; top: calc(50% - 58px); left: calc(var(--sidebar) + (100vw - var(--sidebar)) / 2); transform: translateX(-50%); font-size: 25px; font-weight: 600; letter-spacing: -.025em }
-  .message { margin: 28px 0; white-space: pre-wrap; overflow-wrap: anywhere }
-  .user { width: fit-content; max-width: 80%; margin-left: auto; padding: 10px 16px; border-radius: 20px; background: var(--bubble) }
+  #empty { position: fixed; top: calc(50% - 58px); left: calc(var(--sidebar) + (100vw - var(--sidebar)) / 2); transform: translateX(-50%); font-size: 25px; font-weight: 600; letter-spacing: -.025em; transition: left var(--sidebar-duration) ease }
+  .message { margin: 28px 0; overflow-wrap: anywhere }
+  .user { width: fit-content; max-width: 80%; margin-left: auto; padding: 10px 16px; border-radius: 20px; background: var(--bubble); white-space: pre-wrap }
   .user-images { display: flex; flex-wrap: wrap; gap: 8px }
   .user-text + .user-images { margin-top: 9px }
   .user-images img { display: block; width: min(240px, 100%); max-height: 240px; border-radius: 12px; object-fit: cover }
   .assistant { padding: 0 4px }
+  .content blockquote { margin: 0 0 1em; padding-left: 14px; border-left: 2px solid var(--border); color: var(--muted) }
+  .content hr { margin: 1.5em 0; border: 0; border-top: 1px solid var(--border) }
+  .content a { color: var(--link); text-underline-offset: 2px }
+  .content :not(pre) > code { padding: .15em .35em; border-radius: 6px; background: var(--bubble); font-size: .9em }
+  .table-wrap { overflow-x: auto; margin: 0 0 1em }
+  .content table { border-collapse: collapse; width: 100%; overflow-wrap: normal; font-size: .95em }
+  .content th, .content td { padding: 7px 12px; border-bottom: 1px solid var(--border); text-align: left }
+  .content th { color: var(--muted); font-weight: 600 }
+  .code-block { margin: 12px 0; overflow: hidden; border: 1px solid var(--border); border-radius: 20px; font-size: 13px }
+  .code-block > pre { margin: 0; padding: 0; border-radius: 0; background: transparent; font-size: inherit; line-height: 1.55; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace }
+  .code-block > pre > code { display: block; overflow-x: auto; padding: 0 13px 13px 13px; background: transparent }
+  .code-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 5px 8px }
+  .code-language { min-width: 0; overflow: hidden; padding: 0 8px; color: var(--muted); font-size: 12px; text-overflow: ellipsis; white-space: nowrap }
+  .copy-code, .copy-markdown { display: grid; place-items: center; width: 34px; height: 34px; flex: none; padding: 6px; border-radius: 20px; color: var(--muted) }
+  .copy-code:hover, .copy-markdown:hover { color: var(--text); background: var(--hover) }
+  .copy-markdown[hidden] { display: none }
   .waiting { width: 18px; height: 18px; border: 2px solid var(--border); border-top-color: var(--text); border-radius: 50%; animation: spin .8s linear infinite }
   @keyframes spin { to { transform: rotate(360deg) } }
   details { margin-bottom: 12px; color: var(--muted); font-size: 14px }
   summary { width: fit-content; cursor: pointer; user-select: none; font-weight: 500 }
-  .reasoning { margin-top: 8px; padding-left: 12px; border-left: 2px solid var(--border) }
-  .stats { margin-top: 12px; color: var(--muted); font-size: 12px; line-height: 1 }
+  .reasoning { max-height: 300px; overflow-y: auto; margin-top: 8px; padding-left: 12px; border-left: 2px solid var(--border); white-space: pre-wrap }
+  .reasoning.fade-top { --fade-top: transparent }
+  .reasoning.fade-bottom { --fade-bottom: transparent }
+  .reasoning.fade-top, .reasoning.fade-bottom { mask-image: linear-gradient(to bottom, var(--fade-top, #000), #000 20px, #000 calc(100% - 20px), var(--fade-bottom, #000)) }
+  .message-footer { display: flex; align-items: center; gap: 12px; margin-top: 12px; white-space: normal }
+  .message-footer[hidden] { display: none }
+  .stats { color: var(--muted); font-size: 12px; line-height: 1.5; white-space: nowrap }
   .error { color: #d33 }
 
-  form { position: fixed; left: calc(var(--sidebar) + (100vw - var(--sidebar)) / 2); bottom: max(18px, env(safe-area-inset-bottom)); z-index: 10; display: flex; align-items: flex-end; gap: 8px; width: min(720px, calc(100vw - var(--sidebar) - 28px)); min-height: 54px; transform: translateX(-50%); padding: 9px; border: 1px solid var(--border); border-radius: 28px; background: var(--composer); box-shadow: var(--shadow) }
+  form { position: fixed; left: calc(var(--sidebar) + (100vw - var(--sidebar)) / 2); bottom: max(18px, env(safe-area-inset-bottom)); z-index: 10; display: flex; align-items: flex-end; gap: 8px; width: min(720px, calc(100vw - var(--sidebar) - 28px)); min-height: 54px; transform: translateX(-50%); padding: 9px; border: 1px solid var(--border); border-radius: 28px; background: var(--composer); box-shadow: var(--shadow); transition: left var(--sidebar-duration) ease, width var(--sidebar-duration) ease }
+  #scroll-bottom { position: absolute; right: 8px; bottom: calc(100% + 12px); padding: 7px 13px; border: 1px solid var(--border); border-radius: 20px; background: var(--composer); box-shadow: var(--shadow); font-size: 13px }
+  #scroll-bottom[hidden] { display: none }
+  #scroll-bottom:hover { background: var(--hover) }
   body.empty form { top: 50%; bottom: auto }
   .composer { min-width: 0; flex: 1 }
   #attachments { display: flex; gap: 8px; overflow-x: auto; padding: 2px 0 8px }
@@ -84,17 +126,24 @@
   #attach[hidden] { display: none }
   #attach { display: grid; width: 34px; height: 34px; place-items: center; border-radius: 50%; color: var(--muted) }
   #attach:hover { color: var(--text); background: var(--hover) }
-  .effort { position: relative; display: flex; align-items: center; gap: 5px; padding: 5px 21px 5px 8px; border-radius: 10px; color: var(--muted); font-size: 13px; line-height: 24px }
+  .effort { position: relative; display: flex; align-items: center; gap: 5px; padding: 5px 8px; border-radius: 10px; color: var(--muted); font-size: 13px; line-height: 24px }
   .effort:hover, .effort:focus-within { color: var(--text); background: var(--hover) }
-  .effort::after { position: absolute; right: 8px; content: '\2304'; font-size: 11px; pointer-events: none }
+  .effort-chevron { position: absolute; right: 10px; top: 50%; width: 12px; height: 12px; transform: translateY(-50%); pointer-events: none }
   select { appearance: none; padding: 0; border: 0; outline: 0; background: transparent; cursor: pointer }
+  #effort { padding-right: 18px }
   #send { width: 34px; height: 34px; flex: none; border-radius: 50%; color: var(--bg); background: var(--text); font-size: 17px }
   #send:disabled { color: var(--muted); background: var(--hover) }
   #mobile-header, #scrim { display: none }
 
+  @media (min-width: 721px) {
+    body.sidebar-collapsed { --sidebar: 0px }
+    body.sidebar-collapsed aside { transform: translateX(-100%); visibility: hidden; pointer-events: none; transition-delay: 0s, var(--sidebar-duration) }
+    body.sidebar-collapsed #sidebar-open { display: grid }
+  }
+
   @media (max-width: 720px) {
     :root { --sidebar: 0px }
-    aside { width: 260px; transform: translateX(-100%); transition: transform .18s ease }
+    aside { transform: translateX(-100%) }
     body.menu-open aside { transform: none }
     #scrim { position: fixed; inset: 0; z-index: 15; background: #0005 }
     body.menu-open #scrim { display: block }
@@ -112,15 +161,21 @@
     .effort > span { display: none }
     .user { max-width: 88% }
   }
+  @media (prefers-reduced-motion: reduce) {
+    :root { --sidebar-duration: 0s }
+  }
 </style>
 
 <aside id="sidebar">
   <div class="brand">
     <img src="/favicon.ico" alt="">
     Splash
+    <button id="sidebar-close" type="button" aria-label="Collapse sidebar" title="Collapse sidebar" aria-controls="sidebar" aria-expanded="true">
+      <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18m7-12-3 3 3 3"/></svg>
+    </button>
   </div>
   <button id="new-chat" type="button">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 5H6a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-6"/><path d="m15 4 5 5M14 10l6-6"/></svg>
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 5H6a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-6"/><path d="M18 2v8M14 6h8"/></svg>
     New chat
   </button>
   <div class="recent-label">Recents</div>
@@ -129,14 +184,18 @@
     <input id="api-key" type="password" autocomplete="off" spellcheck="false" aria-label="API key">
   </label>
 </aside>
+<button id="sidebar-open" type="button" aria-label="Open sidebar" title="Open sidebar" aria-controls="sidebar" aria-expanded="false">
+  <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18m4-12 3 3-3 3"/></svg>
+</button>
 <div id="scrim"></div>
 <header id="mobile-header">
-  <button id="menu" type="button" aria-label="Open sidebar"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+  <button id="menu" type="button" aria-label="Open sidebar" aria-controls="sidebar" aria-expanded="false"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
   <div class="brand">Splash</div>
-  <button id="mobile-new" type="button" aria-label="New chat"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 5H6a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-6"/><path d="m15 4 5 5M14 10l6-6"/></svg></button>
+  <button id="mobile-new" type="button" aria-label="New chat"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 5H6a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-6"/><path d="M18 2v8M14 6h8"/></svg></button>
 </header>
 <main><div id="chat"></div></main>
 <form id="form">
+  <button id="scroll-bottom" type="button" hidden aria-label="Jump to latest message">&#8595; Jump to latest</button>
   <button id="attach" type="button" aria-label="Add images" title="Add images">
     <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
   </button>
@@ -154,11 +213,14 @@
         <option value="low">Low</option>
         <option value="none">Off</option>
       </select>
+      <svg class="effort-chevron" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m3 4.5 3 3 3-3"/></svg>
     </label>
     <button id="send" aria-label="Send">&#8593;</button>
   </div>
 </form>
 
+<script src="/chat-assets/markdown-it-15.0.2.min.js"></script>
+<script src="/chat-assets/highlight-11.12.0.min.js"></script>
 <script>
   const $ = selector => document.querySelector(selector);
   const chat = $('#chat');
@@ -171,6 +233,46 @@
   const apiKey = $('#api-key');
   const send = $('#send');
   const recents = $('#recents');
+  const scrollBottom = $('#scroll-bottom');
+  const mobileLayout = window.matchMedia('(max-width: 720px)');
+  const copyIcons = {
+    copy: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
+    success: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg>',
+    error: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 6 12 12M6 18 18 6"/></svg>'
+  };
+  const markdown = window.markdownit({
+    html: false,
+    breaks: true,
+    highlight(source, language) {
+      if (language && window.hljs?.getLanguage(language)) {
+        return window.hljs.highlight(source, {language, ignoreIllegals: true}).value;
+      }
+      return ''; // Markdown escapes code for unknown or omitted languages.
+    }
+  }).disable('image'); // A reply's image would load its URL without a click.
+  for (const rule of ['fence', 'code_block']) {
+    const renderCode = markdown.renderer.rules[rule];
+    markdown.renderer.rules[rule] = (tokens, index, ...args) => {
+      const language = markdown.utils.escapeHtml(markdown.utils.unescapeAll(tokens[index].info || '').trim().split(/\s+/)[0] || 'text');
+      tokens[index].attrJoin('class', 'hljs');
+      return '<div class="code-block"><div class="code-toolbar"><span class="code-language">' + language +
+        '</span><button type="button" class="copy-code" title="Copy code" aria-label="Copy code" aria-live="polite">' + copyIcons.copy + '</button></div>' +
+        renderCode(tokens, index, ...args) + '</div>';
+    };
+  }
+  // A wide table scrolls inside the message instead of widening it. There
+  // are no table rules to wrap, so the generic renderToken emits the tags.
+  const renderToken = markdown.renderer.renderToken.bind(markdown.renderer);
+  markdown.renderer.rules.table_open = (tokens, index, ...args) =>
+    '<div class="table-wrap">' + renderToken(tokens, index, ...args);
+  markdown.renderer.rules.table_close = (tokens, index, ...args) =>
+    renderToken(tokens, index, ...args) + '</div>';
+  // A link opens in a new tab, so following it keeps the chat and its reply.
+  markdown.renderer.rules.link_open = (tokens, index, ...args) => {
+    tokens[index].attrSet('target', '_blank');
+    tokens[index].attrSet('rel', 'noopener noreferrer');
+    return renderToken(tokens, index, ...args);
+  };
   const storeKey = 'splash-chats';
   const effortKey = 'splash-thinking-effort';
   const allowedEfforts = new Set([...effort.options].map(option => option.value));
@@ -179,6 +281,7 @@
   let messages = [];
   let attachments = [];
   let controller;
+  let followResponse = false;
   // Until /v1/models says otherwise; a text-only model takes no images.
   let imagesAccepted = true;
 
@@ -315,6 +418,68 @@
     return content.replace(/^(?:[ \t]*\r?\n)+|(?:\r?\n[ \t]*)+$/g, '');
   }
 
+  function renderMarkdown(element, content) {
+    element.innerHTML = markdown.render(displayContent(content));
+  }
+
+  async function copyText(button, text, label) {
+    let status;
+    try {
+      if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(text);
+      else {
+        // Clipboard API is unavailable on LAN addresses served over plain HTTP.
+        const field = document.createElement('textarea');
+        field.value = text;
+        field.style.cssText = 'position:fixed;left:-9999px;top:0';
+        document.body.append(field);
+        try {
+          field.select();
+          if (!document.execCommand('copy')) throw new Error('Copy failed');
+        } finally {
+          field.remove();
+          button.focus({preventScroll: true});
+        }
+      }
+      button.innerHTML = copyIcons.success;
+      status = 'Copied!';
+    } catch {
+      button.innerHTML = copyIcons.error;
+      status = 'Copy failed';
+    }
+    button.title = status;
+    button.setAttribute('aria-label', status);
+    setTimeout(() => {
+      button.innerHTML = copyIcons.copy;
+      button.title = label;
+      button.setAttribute('aria-label', label);
+    }, 1500);
+  }
+
+  function updateScrollState() {
+    const nearBottom = document.documentElement.scrollHeight - window.scrollY - window.innerHeight <= 300;
+    scrollBottom.hidden = nearBottom || !messages.length;
+  }
+
+  function scrollToLatest(behavior = 'instant') {
+    scrollTo({top: document.documentElement.scrollHeight, behavior});
+    updateScrollState();
+  }
+
+  function updateResponseScroll() {
+    if (controller && followResponse) scrollToLatest();
+    else updateScrollState();
+  }
+
+  function onPageScroll() {
+    followResponse = window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 1;
+    updateScrollState();
+  }
+
+  function updateReasoningFade(reasoning) {
+    reasoning.classList.toggle('fade-top', reasoning.scrollTop > 1);
+    reasoning.classList.toggle('fade-bottom', reasoning.scrollHeight - reasoning.clientHeight - reasoning.scrollTop > 1);
+  }
+
   function assistantBox(message, live = false) {
     const box = document.createElement('div');
     box.className = 'message assistant';
@@ -322,10 +487,17 @@
     details.open = live;
     details.hidden = !message.reasoning_content;
     details.innerHTML = '<summary>Thinking</summary><div class="reasoning"></div>';
-    details.querySelector('.reasoning').textContent = message.reasoning_content || '';
+    const reasoning = details.querySelector('.reasoning');
+    reasoning.textContent = message.reasoning_content || '';
+    reasoning.addEventListener('scroll', () => updateReasoningFade(reasoning), {passive: true});
+    details.addEventListener('toggle', () => updateReasoningFade(reasoning));
     const content = document.createElement('div');
     content.className = 'content';
-    content.textContent = displayContent(message.content || '');
+    renderMarkdown(content, message.content || '');
+    content.addEventListener('click', event => {
+      const button = event.target.closest('.copy-code');
+      if (button) copyText(button, button.closest('.code-block').querySelector('code').textContent, 'Copy code');
+    });
     const waiting = document.createElement('div');
     waiting.className = 'waiting';
     waiting.hidden = !live || Boolean(message.content || message.reasoning_content);
@@ -334,7 +506,20 @@
     stats.className = 'stats';
     stats.hidden = !message.tps;
     if (message.tps) stats.textContent = `${Number(message.tps).toLocaleString(undefined, {maximumFractionDigits: 1})} tok/s`;
-    box.append(details, content, waiting, stats);
+    const copy = document.createElement('button');
+    copy.type = 'button';
+    copy.className = 'copy-markdown';
+    copy.innerHTML = copyIcons.copy;
+    copy.title = 'Copy reply as Markdown';
+    copy.hidden = !message.content;
+    copy.setAttribute('aria-label', 'Copy reply as Markdown');
+    copy.setAttribute('aria-live', 'polite');
+    copy.addEventListener('click', () => copyText(copy, message.content, 'Copy reply as Markdown'));
+    const footer = document.createElement('div');
+    footer.className = 'message-footer';
+    footer.hidden = stats.hidden && copy.hidden;
+    footer.append(copy, stats);
+    box.append(details, content, waiting, footer);
     return box;
   }
 
@@ -362,7 +547,6 @@
       }
     }
     chat.append(box);
-    scrollTo(0, document.body.scrollHeight);
     return box;
   }
 
@@ -375,19 +559,41 @@
       empty.textContent = 'How can I help?';
       chat.append(empty);
     } else messages.forEach(message => addMessage(message));
+    scrollToLatest();
   }
 
   function renderRecents() {
     recents.replaceChildren();
     conversations.forEach(conversation => {
-      const item = document.createElement('button');
-      item.type = 'button';
+      const item = document.createElement('div');
       item.className = `recent${conversation.id === activeId ? ' active' : ''}`;
-      item.textContent = conversation.title;
-      item.disabled = Boolean(controller);
-      item.addEventListener('click', () => openChat(conversation.id));
+      const open = document.createElement('button');
+      open.type = 'button';
+      open.className = 'recent-open';
+      open.textContent = conversation.title;
+      open.title = conversation.title;
+      open.disabled = Boolean(controller);
+      open.addEventListener('click', () => openChat(conversation.id));
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.className = 'recent-delete';
+      remove.setAttribute('aria-label', `Delete chat: ${conversation.title}`);
+      remove.title = 'Delete chat';
+      remove.innerHTML = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18M9 6V4h6v2M5 6l1 14h12l1-14M10 10v6M14 10v6"/></svg>';
+      remove.disabled = Boolean(controller);
+      remove.addEventListener('click', () => deleteChat(conversation.id));
+      item.append(open, remove);
       recents.append(item);
     });
+  }
+
+  function deleteChat(id) {
+    if (controller) return;
+    const conversation = conversations.find(item => item.id === id);
+    if (!conversation || !window.confirm(`Delete chat "${conversation.title}"? This cannot be undone.`)) return;
+    conversations = conversations.filter(conversation => conversation.id !== id);
+    if (activeId === id) newChat();
+    save();
   }
 
   function newChat() {
@@ -396,9 +602,10 @@
     messages = [];
     clearAttachments();
     document.body.classList.remove('menu-open');
+    updateSidebar();
     renderChat();
     renderRecents();
-    input.focus();
+    input.focus({preventScroll: true});
   }
 
   function openChat(id) {
@@ -409,9 +616,10 @@
     messages = conversation.messages;
     clearAttachments();
     document.body.classList.remove('menu-open');
+    updateSidebar();
     renderChat();
     renderRecents();
-    input.focus();
+    input.focus({preventScroll: true});
   }
 
   function persist(firstPrompt) {
@@ -429,6 +637,24 @@
   function resize() {
     input.style.height = 'auto';
     input.style.height = `${input.scrollHeight}px`;
+  }
+
+  function updateSidebar() {
+    if (!mobileLayout.matches) document.body.classList.remove('menu-open');
+    const expanded = mobileLayout.matches
+      ? document.body.classList.contains('menu-open')
+      : !document.body.classList.contains('sidebar-collapsed');
+    $('#sidebar').inert = !expanded;
+    for (const id of ['sidebar-close', 'sidebar-open', 'menu']) {
+      $('#' + id).setAttribute('aria-expanded', String(expanded));
+    }
+  }
+
+  function setSidebarOpen(open) {
+    if (mobileLayout.matches) document.body.classList.toggle('menu-open', open);
+    else document.body.classList.toggle('sidebar-collapsed', !open);
+    updateSidebar();
+    $(open ? '#sidebar-close' : mobileLayout.matches ? '#menu' : '#sidebar-open').focus({preventScroll: true});
   }
 
   function renderAttachments() {
@@ -526,6 +752,7 @@
       const stats = box.querySelector('.stats');
       stats.textContent = `${speed.toLocaleString(undefined, {maximumFractionDigits: 1})} tok/s`;
       stats.hidden = false;
+      box.querySelector('.message-footer').hidden = false;
     }
     const delta = chunk.choices?.[0]?.delta;
     // A chunk without text has nothing to show or scroll to.
@@ -535,13 +762,20 @@
       assistant.reasoning_content += delta.reasoning_content;
       const details = box.querySelector('details');
       details.hidden = false;
-      details.querySelector('.reasoning').textContent = assistant.reasoning_content;
+      const reasoning = details.querySelector('.reasoning');
+      // Thinking follows new text unless the reader scrolled up inside it.
+      const atEnd = reasoning.scrollHeight - reasoning.clientHeight - reasoning.scrollTop <= 1;
+      reasoning.textContent = assistant.reasoning_content;
+      if (atEnd) reasoning.scrollTop = reasoning.scrollHeight;
+      updateReasoningFade(reasoning);
     }
     if (delta.content) {
       assistant.content += delta.content;
-      box.querySelector('.content').textContent = displayContent(assistant.content);
+      renderMarkdown(box.querySelector('.content'), assistant.content);
+      box.querySelector('.copy-markdown').hidden = false;
+      box.querySelector('.message-footer').hidden = false;
     }
-    scrollTo(0, document.body.scrollHeight);
+    updateResponseScroll();
     return false;
   }
 
@@ -563,6 +797,8 @@
     const userBox = addMessage(messages.at(-1));
     const assistant = {role: 'assistant', content: '', reasoning_content: ''};
     const box = addMessage(assistant, true);
+    followResponse = true;
+    scrollToLatest();
     controller = new AbortController();
     setRunning(true);
     try {
@@ -606,9 +842,11 @@
       }
     } finally {
       box.querySelector('details')?.removeAttribute('open');
+      followResponse = false;
       controller = undefined;
       setRunning(false);
-      input.focus();
+      updateScrollState();
+      input.focus({preventScroll: true});
     }
   }
 
@@ -641,8 +879,24 @@
   apiKey.addEventListener('change', loadModalities);
   $('#new-chat').addEventListener('click', newChat);
   $('#mobile-new').addEventListener('click', newChat);
-  $('#menu').addEventListener('click', () => document.body.classList.add('menu-open'));
-  $('#scrim').addEventListener('click', () => document.body.classList.remove('menu-open'));
+  $('#sidebar-close').addEventListener('click', () => setSidebarOpen(false));
+  $('#sidebar-open').addEventListener('click', () => setSidebarOpen(true));
+  $('#menu').addEventListener('click', () => setSidebarOpen(true));
+  $('#scrim').addEventListener('click', () => setSidebarOpen(false));
+  scrollBottom.addEventListener('click', () => {
+    // Jumping during a reply follows it again. The jump is instant then, since
+    // a smooth scroll's first scroll events would stop following midway.
+    followResponse = Boolean(controller);
+    scrollToLatest(controller || window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth');
+  });
+  window.addEventListener('scroll', onPageScroll, {passive: true});
+  window.addEventListener('resize', () => {
+    updateSidebar();
+    chat.querySelectorAll('.reasoning').forEach(updateReasoningFade);
+    updateResponseScroll();
+  });
+  chat.addEventListener('load', updateResponseScroll, true);
+  updateSidebar();
   renderChat();
   renderRecents();
   updateComposer();

@@ -14,8 +14,8 @@ from dev.tests import agent_real as agent
 from server import serve_options
 
 MODEL_IDS = (
-    "incoai/Qwen3.8-27B-Splash",
-    "incoai/Qwen3.6-35B-A3B-Splash",
+    "mlx-community/Qwen3.8-27B-4bit",
+    "mlx-community/Qwen3.6-35B-A3B-4bit",
     "community/custom-splash",
 )
 
@@ -217,7 +217,7 @@ class AgentRunnerTests(unittest.TestCase):
                     agent.current_build_id()
 
     def test_mismatched_existing_server_is_rejected_without_stopping_it(self):
-        model = "incoai/Qwen3.8-27B-Splash"
+        model = "mlx-community/Qwen3.8-27B-4bit"
         identity = "src-" + "a" * 64
         initial = {
             "instance": {"model": model},
@@ -1176,7 +1176,7 @@ class AgentRunnerTests(unittest.TestCase):
                 agent.main(
                     [
                         "--model",
-                        "incoai/Qwen3.8-27B-Splash",
+                        "mlx-community/Qwen3.8-27B-4bit",
                         "--clients",
                         "codex",
                     ]
@@ -1202,7 +1202,7 @@ class AgentRunnerTests(unittest.TestCase):
                             "--clients",
                             "claude",
                             "--model",
-                            "incoai/Qwen3.8-27B-Splash",
+                            "mlx-community/Qwen3.8-27B-4bit",
                             "--preflight-only",
                             "--output",
                             str(report),
@@ -1247,7 +1247,7 @@ class AgentRunnerTests(unittest.TestCase):
                     "--clients",
                     "claude,codex,pi",
                     "--model",
-                    "incoai/Qwen3.8-27B-Splash",
+                    "mlx-community/Qwen3.8-27B-4bit",
                     "--preflight-only",
                     "--output",
                     str(report),
@@ -1292,7 +1292,7 @@ class AgentRunnerTests(unittest.TestCase):
                     "--clients",
                     "opencode",
                     "--model",
-                    "incoai/Qwen3.8-27B-Splash",
+                    "mlx-community/Qwen3.8-27B-4bit",
                     "--preflight-only",
                     "--output",
                     str(report),
@@ -1307,7 +1307,7 @@ class AgentRunnerTests(unittest.TestCase):
                 self.assertEqual(entries["opencode"]["major_version"], major)
 
     def test_opencode_runs_with_the_major_version_preflight_read(self):
-        model = "incoai/Qwen3.8-27B-Splash"
+        model = "mlx-community/Qwen3.8-27B-4bit"
         identity = "src-" + "a" * 64
         initial = {
             "instance": {"model": model},
@@ -1359,7 +1359,7 @@ class AgentRunnerTests(unittest.TestCase):
                 agent.main(
                     [
                         "--model",
-                        "incoai/Qwen3.8-27B-Splash",
+                        "mlx-community/Qwen3.8-27B-4bit",
                         "--clients",
                         value,
                     ]

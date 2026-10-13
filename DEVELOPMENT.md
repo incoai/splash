@@ -20,16 +20,20 @@ make -j4
 ./splash serve --model mlx-community/Qwen3.8-27B-4bit
 ```
 
-`--model` names an upstream Hugging Face model: an MLX affine 4-bit, group-64
-repository such as `mlx-community/Qwen3.8-27B-4bit`, or a GGUF repository and
-variant, `OWNER/REPO:VARIANT`, such as `unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M`.
+`--model` names an upstream Hugging Face model: an MLX repository
+([MLX targets](#mlx-targets)) such as `mlx-community/Qwen3.8-27B-4bit`, an NVFP4
+repository of Model Optimizer ([Model Optimizer targets](#model-optimizer-targets))
+or compressed-tensors ([Compressed-tensors targets](#compressed-tensors-targets))
+such as `nvidia/Qwen3.8-27B-NVFP4` or `unsloth/Qwen3.8-27B-NVFP4`, or a GGUF
+repository and variant, `OWNER/REPO:VARIANT`, such as
+`unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M`.
 Splash identifies the model from its own metadata and pairs the DFlash2 draft
 trained for it. The first serve sets up Python dependencies and downloads the
 model and its draft; each start loads the weights into memory
 ([Weight loading](#weight-loading)) and follows the model's revision
-([Revisions](#revisions)). Legacy Splash packages remain loadable
-([Legacy Splash packages](#legacy-splash-packages)). Public repositories need
-no login; private or gated ones need `HF_TOKEN` or `hf auth login`. Ctrl+C
+([Revisions](#revisions)). Splash packages, the prebuilt format of earlier
+releases, are no longer loaded ([Splash packages](#splash-packages)). Public
+repositories need no login; private or gated ones need `HF_TOKEN` or `hf auth login`. Ctrl+C
 stops serving, and a second Ctrl+C stops the engine at once; stop before
 upgrading.
 
@@ -61,9 +65,8 @@ completions finds them. In a source checkout, source
 `install/completions/splash.bash` for Bash, `install/completions/_splash` for
 Zsh after `compinit`, or `install/completions/splash.fish` for fish.
 
-Completion suggests commands, the official model IDs (bundled, and as
-`splash serve` last refreshed them), the upstream models the README starts with
-and installed models, a GGUF's `OWNER/REPO:VARIANT` included, without network
+Completion suggests commands, the upstream models the README starts with and
+installed models, a GGUF's `OWNER/REPO:VARIANT` included, without network
 access.
 
 ## Server configuration
@@ -88,6 +91,7 @@ access.
 | `--max-memory` | Auto | Lower the ceiling on Metal allocations, e.g. `28G`; not combined process RSS. See [memory and context](#memory-and-context). |
 | `--max-context` | Auto | Set the context limit, e.g. `100K`. See [memory and context](#memory-and-context). |
 | `--kv-format` | `int8` | Target KV storage: `int8` or `bf16`. See [KV cache precision](#kv-cache-precision). |
+| `--state-format` | `fp32` | Recurrent state storage: `fp32` or `bf16`. See [state precision](#state-precision). |
 | `--idle-release` | `10m` | Time without a request before the engine unwires its memory and frees the weights; the next request restores them. `off` keeps both. See [weight loading](#weight-loading). |
 | `--max-cache-disk` | `0` (off) | SSD quota for cached KV pages and states, e.g. `16G`; kept for the session, or across restarts with `--persistent-cache`. See [SSD cache](#ssd-cache). |
 | `--persistent-cache` | Off | Keep the SSD cache across restarts; needs `--max-cache-disk`. See [persistent cache](#persistent-cache). |
@@ -95,6 +99,7 @@ access.
 | `--served-model-name` | None | Additional model name the API accepts; repeatable. See [API model aliases](#api-model-aliases). |
 | `--announce-served-name` | Off | Report the first `--served-model-name` in responses; needs `--served-model-name`. |
 | `--default-reasoning-effort` | `SPLASH_DEFAULT_REASONING_EFFORT` or the template's | Effort of Chat and Responses requests that set none. See [default reasoning effort](#default-reasoning-effort). |
+| `--thinking-token-budget` | `SPLASH_THINKING_TOKEN_BUDGET` or none | Thinking tokens of a request that sets no budget. See [thinking token budget](#thinking-token-budget). |
 | `--max-request-size` | `128M` | Largest HTTP request body. See [request limits](#request-limits-and-timeouts). |
 | `--max-image-pixels` | `4194304` | Maximum resized pixels per image. An image's vision scratch grows with its patches (pixels / 256), to about 600 MiB at the default. |
 | `--request-timeout` | None | Time a request may take from its arrival; a request's own `timeout` can only shorten it. |
@@ -201,6 +206,26 @@ to switch formats. Omit `--kv-format` or use `--kv-format int8` for the default.
 The [SSD cache](#ssd-cache) supports both formats, preserving their stored
 bytes without further quantization.
 
+### State precision
+
+The linear-attention (GDN) layers of the targets carry a recurrent state,
+which every lane holds and every cached state keeps, in memory and on the SSD.
+Select its storage when starting the server:
+
+```bash
+splash serve --model mlx-community/Qwen3.8-27B-4bit --state-format bf16
+```
+
+BF16 halves the recurrent state, most of a cached state's bytes, so memory and
+the [SSD cache](#ssd-cache) hold nearly twice as many cached states, and a
+decode step reads and writes half the state. The kernels compute in FP32
+either way and round the state to BF16 where they store it, at the end of each
+prefill chunk and each decode step, so where a prompt's chunks end also
+changes its state in the last bits ([sampling](#sampling)). Restart to switch
+formats; the SSD cache keeps each format's states apart. Omit `--state-format`
+or use `--state-format fp32` for the default, the precision the models'
+configurations ask for.
+
 ### SSD cache
 
 `--max-cache-disk SIZE` keeps cached prompts on the SSD when memory runs short.
@@ -214,8 +239,8 @@ checkpoints and replays its prompt after each suspension. With it off, startup
 suggests it in one line when the memory available at startup may not hold the
 advertised context. It does not raise the context limit. A quota smaller than
 the working set can cause repeated reads and writes; it is not a write-rate
-limit. Its state writes stage through a buffer of one state (109 MiB for 35B,
-187 MiB for 27B), which the memory plan sets aside within `--max-memory`; a
+limit. Its state writes stage through a buffer of one state (64 MiB for 35B,
+153 MiB for 27B), which the memory plan sets aside within `--max-memory`; a
 quota too small for one state leaves it off.
 
 Restarts recompute everything unless `--persistent-cache` is on (see
@@ -292,7 +317,7 @@ are not moved.
 
 | Path | Holds |
 | --- | --- |
-| `~/Library/Application Support/Splash` | The data directory of a packaged install: `models/`, the installed models' links into the Hugging Face cache and the metadata derived from GGUFs; `runtime/`, the locks of running servers; `catalog/`, the official model list `splash serve` last fetched; and `thinking.key`, which encrypts the Messages reasoning a response hides. A source checkout keeps the first three in `install/models` and `build/runtime`. |
+| `~/Library/Application Support/Splash` | The data directory of a packaged install: `models/`, the installed models' links into the Hugging Face cache and the metadata derived from GGUFs; `runtime/`, the locks of running servers; and `thinking.key`, which encrypts the Messages reasoning a response hides. A source checkout keeps the first two in `install/models` and `build/runtime`. |
 | Hugging Face cache (`HF_HUB_CACHE`, by default `~/.cache/huggingface/hub`) | Model and draft downloads, with Splash's pins under `refs/splash` ([revisions](#revisions)). |
 | `~/Library/Caches/Splash/prefix-cache` (`--cache-dir`) | The [persistent cache](#persistent-cache), with `--persistent-cache` only. |
 | `$TMPDIR/splash-cache-*` | The [SSD cache](#ssd-cache)'s files without `--persistent-cache`, or when another process holds the persistent cache's directory or it cannot be used: one of KV pages and one of states, together at most about `--max-cache-disk`. Each is unlinked as it is created, so no directory lists it, and its space returns when the engine exits, even after a crash. `--cache-dir` does not move them; they follow `TMPDIR`. |
@@ -333,23 +358,59 @@ default or a request's own, reaches the template as `enable_thinking`, false
 for `none`, and as `reasoning_effort`, not as a token budget, so a template that
 switches reasoning by either follows it. A template that rejects an effort
 renders an alias: `xhigh` for `high` and `max`, `low` for `minimal`; one that
-rejects `none` renders by `enable_thinking` alone while thinking is off.
+rejects `none` renders by `enable_thinking` alone while thinking is off. A
+template that cannot give the thinking a request asks for, one that always or
+never thinks, renders as it can, and the request reasons as its prompt does. A
+template that refuses a request's messages returns 400 with its reason.
 
 ```sh
 splash serve --model mlx-community/Qwen3.8-27B-4bit --default-reasoning-effort none
 ```
 
 `/apply-template` uses the same default. Anthropic `thinking` keeps its protocol
-semantics (off when omitted); judgment endpoints always disable thinking. The
+semantics (off when omitted) unless the request's `chat_template_kwargs` set
+`enable_thinking`; judgment endpoints always disable thinking. The
 built-in chat page sends no effort unless the user picks one.
 
-A Chat request's `chat_template_kwargs`, as vLLM and SGLang accept them, are
-passed to the template as variables and outrank the effort, so
+The console's Started line shows how each chat request reasons: the effort it
+sent, or `absent` and the default it took, its `enable_thinking` when it set
+one, and whether it thinks, as in
+`Started · input 2,473 · cached 0 · effort absent → low · thinking on`.
+
+A Chat or Messages request's `chat_template_kwargs` are passed to the template
+as variables and outrank the effort, and in Messages `thinking`, so
 `{"enable_thinking": false}` turns reasoning off and reaches the template as
 `reasoning_effort` `none` too, as effort `none` does, and `true` turns it on,
 at the template's default effort where the effort is `none`. `enable_thinking`
 must be a boolean; null leaves it to the effort. They cannot set what Splash
 passes itself, such as `tools` or `add_generation_prompt`.
+
+## Thinking token budget
+
+A reasoning model can spend its whole output limit thinking and return no
+answer. A thinking token budget caps the thinking: once a request has selected
+that many tokens in its thinking block, the engine selects the block's close,
+`</think>`, and the model answers within the output limit that remains. Its `reasoning_tokens` then
+equal the budget.
+
+- Chat Completions and Responses take `thinking_token_budget`, a non-negative
+  integer; `-1` sets no cap, and an absent or null value takes the server's.
+- Messages caps `{"type": "enabled"}` thinking at its `budget_tokens`, which
+  must be at least 1024 and less than `max_tokens`, as in Anthropic's API;
+  adaptive thinking takes the server's budget.
+- `--thinking-token-budget N` (or `SPLASH_THINKING_TOKEN_BUDGET`) is the
+  server's budget; unset, thinking has no cap.
+
+A budget applies only where generation starts in a thinking block, and one the
+output limit reaches first changes nothing. Where the output may call a tool, a
+call's opening ends thinking too, so the close never lands inside a call. Only
+the close is forced, with no transition text, and a close the model selects
+itself before the budget ends the count. Text completions have no reasoning
+split and refuse a budget with 400.
+
+```sh
+splash serve --model mlx-community/Qwen3.8-27B-4bit --thinking-token-budget 12000
+```
 
 ## Agent launchers
 
@@ -399,7 +460,8 @@ checkout's `install/`, which `git status` lists as untracked.
 
 Splash 1.1 kept prepared copies of the weights in
 `~/Library/Caches/Splash/weights` (or the directory `SPLASH_WEIGHT_CACHE`
-named), which nothing reads now and which can be deleted.
+named), which nothing reads now and which can be deleted. While the default
+directory remains, the native runtime says so when it starts, with its size.
 
 ## API
 
@@ -411,7 +473,8 @@ API key works; with it on, clients send the server's key. `model` names the
 served model ID or one of its [aliases](#api-model-aliases), as `/v1/models`
 lists them; another name returns 404 `model_not_found`, which Messages, whose
 errors carry no code, answers as a `not_found_error`. Chat, text completion and
-Responses requests that omit it get the served model; Messages requires it.
+Responses requests that omit it, or send it empty, get the served model;
+Messages requires it.
 
 ### Endpoints
 
@@ -426,6 +489,7 @@ Responses requests that omit it get the served model; Messages requires it.
 | `GET /v1/models`, `/v1/models/{id}` | The served model and its aliases, with the context limit |
 | `POST /tokenize`, `/apply-template` | A text's tokens, or a conversation's rendered prompt, without inference |
 | `POST /v1/judgments`, `/v1/systemone` | Scores over fixed answers ([judgment contracts](#judgment-contracts)) |
+| `POST /v1/memory/release` | Gives the weights back now, as the idle release does, when no request is in service; the next request restores them ([explicit release](#explicit-weights-release)). It takes no body (or `{}`); `200` with `{"released": true, "weights": …}`, or `409 engine_busy` while the engine serves a request or restores its weights |
 | `GET /status`, `/metrics` | JSON status and Prometheus metrics ([status](#status-readiness-and-metrics)) |
 | `GET /health` | 200 while the server answers; public |
 | `GET /ready` | 200 while the engine is ready, else 503; public |
@@ -433,7 +497,11 @@ Responses requests that omit it get the served model; Messages requires it.
 
 ### Request fields
 
-Chat Completions, text completions, Responses and Messages share these fields:
+A field set to `null` is one left out, at a request's top level on every
+endpoint and in the optional fields Splash reads in its messages, content blocks
+and options, as clients that write every field they do not set as `null` mean
+it; in tool arguments, schemas and template variables `null` is a value. Chat
+Completions, text completions, Responses and Messages share these fields:
 
 - `stream`: stream server-sent events. In Chat and text completions,
   `stream_options.include_usage` adds usage to the stream; their non-streaming
@@ -445,60 +513,82 @@ Chat Completions, text completions, Responses and Messages share these fields:
 - `timeout`: the seconds a request may take from its arrival; it can only
   shorten `--request-timeout`. A request that runs out returns 504
   `request_timeout`.
-- `seed`: an unsigned 64-bit integer, random when omitted
-  ([sampling](#sampling)).
-- `stop`, in Messages `stop_sequences`: a string or up to four strings. It
-  cannot be combined with tools a call may name or with structured output,
-  since it could cut either short.
+- `seed`: a 64-bit integer, random when omitted or `-1`; another negative seed
+  is taken as its 64 bits ([sampling](#sampling)).
+- `stop`, in Messages `stop_sequences`: a string or up to four strings. A stop
+  string ends the output where the model writes it, inside a tool call or
+  structured output too, which it cuts as the token limit does: a call it cuts
+  keeps the arguments it has, and no call of the output counts as made; a cut
+  structured answer is not validated.
 - `return_progress`, with `stream` true: prompt progress before the output
   ([output limits and streaming](#output-limits-and-streaming)).
+- `cache_salt`: a nonempty string. A request shares cached prompts, their KV and
+  states, only with requests of the same salt, and a request without one only
+  with others without one, as vLLM's field does. A salt no other request uses
+  makes it compute its whole prompt itself.
 
 Chat Completions also takes `messages`, `tools`, `tool_choice` and
 `parallel_tool_calls` ([tool calls](#tool-calls)), `response_format`
 ([structured output](#structured-output)), `reasoning_effort` and
 `chat_template_kwargs` ([default reasoning effort](#default-reasoning-effort)),
+`thinking_token_budget` ([thinking token budget](#thinking-token-budget)),
 `preserve_thinking`, which reaches the template (the Qwen templates keep earlier
 turns' reasoning with it), `max_completion_tokens` or `max_tokens`,
 `ignore_eos` and the [sampling](#sampling) fields. The reply's reasoning comes
 in `reasoning_content`, beside `content`, in the message and in each stream
-delta, and an assistant message sent back may carry its `reasoning_content`.
-`n` other than 1 and `logprobs: true` return 400.
+delta, and an assistant message sent back may carry its `reasoning_content`
+(or `reasoning` text). Message content may hold Responses' `input_text`,
+`output_text` and `input_image` parts too, and a `refusal` part, an assistant's
+refusal, is text. A history tool call whose `arguments` are not a JSON object,
+such as one the output limit cut, is kept as text, so the conversation
+continues. `n` other than 1 and `logprobs: true` return 400.
 
 `POST /v1/completions` serves OpenAI's legacy text completions. `prompt` is one
 string, which the loaded tokenizer encodes as a raw prompt, adding its own
 special tokens such as a BOS and recognizing special-token strings, or one array
 of token IDs from its vocabulary. No chat template, reasoning split, tools or
 images apply: `text` is the generated text, decoded without special tokens.
-`max_tokens` defaults to 16, OpenAI's default for the endpoint as in vLLM and
-SGLang, or to what the context leaves when that is less. The sampling fields
+`max_tokens` defaults to 16, OpenAI's default for the endpoint; that or a
+larger value is lowered to what the context leaves, as in Chat
+([output limits](#output-limits-and-streaming)). The sampling fields
 below, `seed`, `stop`, `priority`, `timeout` and `stream` with
 `stream_options.include_usage` work as in Chat. Batched prompts, `suffix`,
 `echo`, `logprobs`, `best_of` and `n` other than 1 are rejected.
 
 Responses takes `input` and `instructions`, function `tools` and `namespace`
 groups of them, `tool_choice`, `parallel_tool_calls`, `reasoning.effort`,
-`text.format` for structured output, `max_output_tokens`, the sampling fields,
-and `store` and `previous_response_id` ([Responses state](#responses-state)).
-Reasoning comes back as `reasoning` output items. `conversation`,
-`background: true`, `truncation` other than `disabled` and `context_management`
-edits return 400.
+`thinking_token_budget`, `text.format` for structured output,
+`max_output_tokens`, the sampling fields, Chat's `ignore_eos`,
+`chat_template_kwargs` and `preserve_thinking`, and `store` and
+`previous_response_id` ([Responses state](#responses-state)). Reasoning comes
+back as `reasoning` output items. `conversation`, `background: true` and
+`truncation` other than `disabled` return 400; Splash compacts nothing, so
+`context_management` leaves the input as sent.
 
-Messages takes `max_tokens`, `system`, `messages`, custom `tools`, `tool_choice`
-(`auto`, `any`, `tool` or `none`, with `disable_parallel_tool_use`),
-`stop_sequences`, `temperature`, `top_p`, `top_k`, `thinking` and
-`output_config`. A request reasons only when `thinking` sets it:
-`{"type": "enabled"}` and `{"type": "adaptive"}` reason at
+Messages takes `max_tokens`, `system`, `messages`, custom `tools` (every one
+declared in the prompt, `defer_loading` ones too, so a `tool_result`'s
+`tool_reference` blocks from a tool search render as text naming the tools
+found; a system message's `tool_addition` and `tool_removal` blocks change
+them in order: a `tool_definition` adds a tool or replaces the one of its name,
+and a removed tool is left out until a later block adds it again),
+`tool_choice` (`auto`, `any`, `tool` or `none`, with
+`disable_parallel_tool_use`), `stop_sequences`, `temperature`, `top_p`, `top_k`,
+`thinking`, `output_config` and Chat's `chat_template_kwargs`, whose
+`enable_thinking` outranks `thinking`. Otherwise a request reasons only when
+`thinking` sets it: `{"type": "enabled"}` and `{"type": "adaptive"}` reason at
 `output_config.effort`, one of `low`, `medium`, `high` (the default), `xhigh`
 and `max`, while `{"type": "disabled"}` and an omitted `thinking` do not;
-`budget_tokens` is not read. Reasoning comes back in `thinking` blocks. With
-`thinking.display` `omitted` (or `updates`) a block carries no text, and its
+enabled thinking's `budget_tokens` caps it ([thinking token
+budget](#thinking-token-budget)). Reasoning comes back in `thinking` blocks.
+With `thinking.display` `omitted` (or `updates`) a block carries no text, and its
 reasoning travels encrypted in its `signature` under the key in `thinking.key`
 ([files Splash writes](#files-splash-writes)); a later request that sends the
 block back has the reasoning restored. A signature Splash cannot read, such as
 another provider's, keeps the block's visible text without recovering the
 private reasoning. Structured output is `output_config.format` (or
-`output_format`) with a JSON schema. `context_management` accepts only
-`clear_thinking_20251015` with `keep: "all"`, which sets `preserve_thinking`.
+`output_format`) with a JSON schema. In `context_management`, a
+`clear_thinking_20251015` edit with `keep: "all"` sets `preserve_thinking`;
+Splash makes no other edit, so the model reads the conversation as sent.
 
 `POST /tokenize` accepts `{"content":"hello","add_special":false}` and returns
 `{"tokens":[...]}` using the loaded tokenizer. Special-token strings are recognized;
@@ -531,9 +621,9 @@ after the request, as `nc` does at the end of its input, counts as disconnected
 and gets no response. A response write waits up to 30 seconds for a client that
 has stopped reading, past `--request-timeout` too, and the request counts
 against `--queue-size` until then. `/status` reports `http.request_body_bytes`
-and `http.max_request_bytes`. A body's JSON, and JSON inside it such as a
-history tool call's arguments, nests at most 128 levels of arrays and objects;
-deeper is refused as invalid JSON.
+and `http.max_request_bytes`. A body's JSON nests at most 128 levels of arrays
+and objects; deeper is refused as invalid JSON. A history tool call's arguments
+nested deeper stay text, as other arguments that are not a JSON object do.
 
 The server holds at most `--queue-size` + 64 connections at once (96 by
 default), each in a connection slot. A connection waits for its request without
@@ -601,23 +691,31 @@ is chunked. Concurrent requests change both, and chunk boundaries also come from
 the cached boundary a request resumes from and from the junctions and
 checkpoints earlier requests left. So a greedy or seeded request repeats its
 output when it runs alone with the same cached prefixes; alongside other
-requests, or with other prefixes cached, it can differ.
+requests, or with other prefixes cached, it can differ. A request that restores
+nothing can still read cached KV: once a command completes, each block it
+filled whose prefix, tokens and identity (images and cache salt) match a
+cached block is swapped for that block's page, which another command
+computed, and its later commands read it. The Done line of the request log
+counts those tokens, as does
+`metrics.cache.deduplicated_tokens` in Chat Completions and text completions
+responses (in a stream, its usage chunk), and `/status` sums them in
+`cache.deduplicated_kv_tokens`. A request with a `cache_salt` no other
+request uses reads no cached KV: alone, it computes what it would on a server
+that served nothing before.
 
 ### Output limits and streaming
 
-Chat's `max_completion_tokens` or `max_tokens` and Responses'
-`max_output_tokens` bound a response's output. Omitted, the output may use
-all the context the prompt leaves, as in vLLM and SGLang: the context limit,
-and `--request-timeout` when set, are the only server bounds on a request that
-names no limit. A value larger than what the context leaves returns 400
-`context_length_exceeded` with the prompt's tokens, the value and the window,
-as in vLLM and SGLang; that error and an invalid value's name the field the
-request sent. Messages requires `max_tokens`; a larger value than the context
-leaves generates up to the context limit, since Claude Code asks for the same
-limit on every turn and does not compact for it. A response the context limit
-ends then has the `stop_reason` `model_context_window_exceeded`, as in
-Anthropic's API, not `max_tokens`. Messages refuses a final assistant message
-(prefill) with 400; `count_tokens` still counts it.
+Chat's `max_completion_tokens` or `max_tokens`, Responses' `max_output_tokens`,
+and text completions' and Messages' `max_tokens` bound a response's output from
+above: a larger value than the context the prompt leaves generates up to the
+context limit, since clients such as Claude Code ask for the same limit on every
+turn. Omitted from Chat or Responses, the output may use all the context the
+prompt leaves: the context limit, and `--request-timeout` when set, are the only
+server bounds on a request that names no limit. A response the context limit
+ends finishes as one its limit ends; Messages gives it the `stop_reason`
+`model_context_window_exceeded`, as in Anthropic's API, not `max_tokens`. An
+invalid value returns 400 naming the field the request sent. Messages refuses
+a final assistant message (prefill) with 400; `count_tokens` still counts it.
 
 Chat and text completions accept `"ignore_eos":true` (default false), as vLLM
 and llama.cpp do: the model never selects its own stop tokens, and a draft
@@ -646,8 +744,12 @@ are not isolated GPU timings. `prompt_per_second` uses only uncached prompt
 tokens; `predicted_per_second` excludes the entire first emission (which can
 contain multiple speculative tokens). Thus rates use tokens processed in the
 measured interval, not the full counts. An unavailable rate is zero, including
-responses completed in one emission. Per-request draft counters are omitted
-because the native runtime only reports them at batch level.
+responses completed in one emission. A request that drafted adds
+llama-server's `draft_n` and `draft_n_accepted`: the tokens its draft proposed
+and those verification accepted, including any a stop or the output limit then
+cut. They count that request alone, so they hold under concurrency.
+`metrics.speculation` carries them with the request's speculative `cycles`, and
+the Done line shows the tokens each cycle yielded, `1 + accepted / cycles`.
 
 ### Tool calls
 
@@ -697,8 +799,7 @@ tool declares for that parameter:
 | not declared | `seven` | `"seven"` |
 
 Calls are not validated against their schemas; a client reports what its tool
-rejects. A `stop` string cannot be combined with tools a call may name
-([request fields](#request-fields)).
+rejects. A `stop` string may cut a call ([request fields](#request-fields)).
 
 The output is read as the chat template lays calls out: a call opens at
 `<tool_call>` and the newline before `<function=`, and a value ends at
@@ -710,9 +811,10 @@ writes may. Tags written otherwise are text. Besides:
   dropped, as is a `</think>` in text;
 - a repeated parameter keeps its first value, which has streamed;
 - text after a call stays content, with or without its `</tool_call>`;
-- a call the token limit cuts keeps the unfinished arguments it has, which
-  Chat and Responses (with status `incomplete`) return and a Messages stream
-  has streamed, while a complete Messages response leaves the call out;
+- a call the token limit or a stop sequence cuts keeps the unfinished
+  arguments it has, which Chat and Responses (with status `incomplete`) return
+  and a Messages stream has streamed, while a complete Messages response leaves
+  the call out;
 - JSON that would decode to a lone surrogate or nest past 122 levels keeps its
   text, which writes back as valid JSON, so that the call's arguments read back
   within the 128 levels the server reads where a request carries them deepest,
@@ -733,15 +835,23 @@ values each member of the value's union lists, as its text, or JSON of a member
 that lists none, leaving out array item bounds and `multipleOf` above 64 and
 patterns the grammar cannot compile (look-around, word boundaries,
 backreferences). The framed schemas of one request are limited to 16 MiB, and a
-strict tool's parameter names cannot contain XML delimiters, start or end with
-whitespace, or run past 256 characters. What a grammar writes reads back as
-written: raw text ends at its first `\n</parameter>\n`, and an enumerated value
-that holds one returns 400.
+strict tool's parameter names follow the rule for a tool's name (below). What a
+grammar writes reads back as written: raw text ends at its first
+`\n</parameter>\n`, and an enumerated value that holds one returns 400.
 
-A tool's schema nests at most 64 levels of JSON objects and arrays, in which an
-object's `properties` map is a level of its own, and cannot reference a remote
-document. Hosted search is unsupported; configure client-owned tools such as
-MCP.
+A strict tool's schema must pass that check, nest at most 64 levels of JSON
+objects and arrays, in which an object's `properties` map is a level of its
+own, and reference no remote document, or the request returns 400. Any other
+tool whose schema does not is still declared as sent, and its arguments convert
+as those of a parameter it does not declare.
+
+A tool's name is written in its calls' tags and read back from them, so it
+holds 1 to 256 characters in Unicode NFC, which a tokenizer such as Qwen's
+keeps text in, other than `<`, `>`, line breaks and lone surrogates, and does
+not start or end with whitespace; a `tool_reference` names a tool the same way.
+A Chat tool or named `tool_choice` that gives no `type` is a function. A
+Responses `namespace` function goes by `namespace__name`. Hosted search is
+unsupported; configure client-owned tools such as MCP.
 
 ### Structured output
 
@@ -751,8 +861,8 @@ in `text.format`, the second without the `json_schema` object around its
 fields: `{"type": "json_schema", "name": ..., "schema": ..., "strict": ...}`.
 Messages takes a schema in `output_config.format` (or
 `output_format`) as `{"type": "json_schema", "schema": ...}`. A schema nests at
-most 64 levels of JSON objects and arrays, as a tool's does, cannot reference a
-remote document, and cannot combine `unevaluatedProperties` with
+most 64 levels of JSON objects and arrays, as a strict tool's does, cannot
+reference a remote document, and cannot combine `unevaluatedProperties` with
 `patternProperties`. `response_format` constrains generation and validates
 final output; it does not inject formatting instructions into the prompt.
 Clients should describe their output requirements in their own messages.
@@ -845,12 +955,15 @@ curl http://127.0.0.1:8000/v1/judgments \
 system prompt and A–P option order. It returns the exact rendered prompt's SHA-256,
 answer token IDs, raw option logits, normalized probabilities and zero completion
 tokens. Every answer label must round-trip as one token, including at the actual
-assistant prompt boundary. Unsupported generation controls return errors rather
-than silently changing the scoring protocol. SemIf-derived code retains its MIT
+assistant prompt boundary. Besides the row it takes `model`, `timeout`,
+`priority` and `cache_salt` as the generation APIs do ([request
+fields](#request-fields)); other generation controls return errors rather than
+silently changing the scoring protocol. SemIf-derived code retains its MIT
 notice in `server/judgments.py`.
 
 `POST /v1/systemone` requires the served `model`, a string/object/array `state`,
-and a nonempty `questions` map. Instructions may be omitted, null or structured;
+and a nonempty `questions` map, and takes `cache_salt` as the generation APIs
+do. Instructions may be omitted, null or structured;
 criteria descriptions may also be structured. Noul criteria may be omitted.
 Choice and score domains contain 1–255 entries. Singletons return their sole
 answer without inference. Other domains use deterministic, distinct single-token
@@ -889,8 +1002,9 @@ Proxy consumers can use these fields; additional fields may be added:
 | Field | Meaning |
 | --- | --- |
 | `requests.submitted`, `completed`, `cancelled`, `failed` | Native request counters since engine start |
+| `active_requests` | Each request the engine holds, in arrival order: its `id`, `phase` (`queued`, `waiting_resources`, `waiting_prefix`, `prefill`, `decode` or `waiting_mask`), `priority`, `prompt_tokens` and how many of them are encoded (`prompt_processed`, cached ones included), `generated_tokens` of `max_new_tokens`, and `age_ms` since it arrived |
 | `memory_actual.current_bytes`, `peak_bytes` | Metal allocations, not process RSS |
-| `weights.idle_release_seconds`, `released`, `restores` | `--idle-release` in seconds (`null` for `off`), whether the weights' memory is released now, and the times it was restored for a request since engine start |
+| `weights.idle_release_seconds`, `released`, `restores`, `restore_failures` | `--idle-release` in seconds (`null` for `off`), whether the weights' memory is released now, the times it was restored for a request since engine start, and the restores that gave up for want of memory |
 | `ane_ffn.state`, `share`, `minimum_rows`, `reason` | The prefill FFN's [Neural Engine split](#neural-engine-prefill): `split` while it serves, at `share` of the FFN's channels over chunks of `minimum_rows` rows or more; `off` when the start left the GPU alone (`share` and `minimum_rows` 0); `stopped` once it stopped while serving, until the engine restarts. `reason` is the start's outcome, or why the split stopped |
 | `ane_ffn.split_commands`, `evaluations`, `ane_ms`, `reruns` | Prefill commands the split ran since engine start, the Neural Engine's evaluations in them and its milliseconds over them (each evaluation's from the GPU's signal to start it to its report); and the chunks the GPU ran again alone after the split's work for them failed |
 | `model_timing.prefill.last_gpu_ms`, `total_gpu_ms` | GPU time of the last prefill command, and of all since engine start, warmup included: each from its first Metal command buffer's start to its last one's end, so with the Neural Engine split it spans the GPU's waits on the Neural Engine; a chunk run again adds the rerun's |
@@ -899,6 +1013,7 @@ Proxy consumers can use these fields; additional fields may be added:
 | `metrics.decode_cycle_ms` | Total engine time of the decode commands, each from the previous command's completion (or its plan after idleness) to its own: the GPU command plus the host work between commands |
 | `loop.max_tick_ms` | Longest control pass and engine step of the native loop. A reader thread keeps reading requests meanwhile, so a request frame whose write stalls 5 s after it started fails the engine only when the process stopped reading; while requests are pending the server asks for status every 10 s and fails an engine whose loop does not answer within 30 s. |
 | `maximum_context_tokens` | Declared context limit; available memory may limit admission |
+| `thermal_state` | The Mac's thermal state as macOS reports it: `nominal`, `fair`, `serious` or `critical`. As the Mac heats, its CPU and GPU clocks drop and prefill and decode slow down, on some Macs already at `fair`; readiness ignores it. The engine samples it twice a second and logs each change (`Thermal state: fair → serious`) |
 | `vision`, `input_modalities` | Whether image and PDF input is accepted; `false` and `["text"]` after `--language-only` |
 | `chat_template.later_system` | `native`, `patched` or `unsupported`: how system messages after the first render (per name for named templates) |
 | `transport.recovering`, `transport.stopped`, `transport.error` | The engine is restarting, or Splash stopped restarting it after repeated failures; `error` names its failure, the last failed restart, or why restarts stopped |
@@ -913,8 +1028,8 @@ until the pressure lifts.
 
 `GET /metrics` exports in Prometheus text format the `requests`,
 `memory_actual` and `metrics` fields above, the status's scheduler, KV, cache,
-admission and image counts, and readiness and memory pressure; the table's
-other fields are in `/status` alone.
+admission and image counts, and readiness, memory pressure and thermal state;
+the table's other fields are in `/status` alone.
 `splash_kv_free_allocated_pages` counts free pages of allocated extents, not
 remaining capacity; memory headroom is `splash_memory_headroom_bytes`. Consumers
 should tolerate missing native fields while the engine is unavailable, and
@@ -972,7 +1087,7 @@ its path, `/v1/systemone`'s included: OpenAI's `server_error` with code
 | Status | `code` | Meaning |
 | --- | --- | --- |
 | 400 | `invalid_request_error` | A malformed request, or a field Splash cannot honor; the message names it. |
-| 400 | `context_length_exceeded` | The prompt, or the prompt and the requested output, exceed the context limit. |
+| 400 | `context_length_exceeded` | The prompt exceeds the context limit, or leaves no room in it for output. |
 | 400 | `capacity_exhausted` | The request cannot fit in memory even alone; retrying fails the same way. |
 | 401 | `authentication_error` | The API key is missing or wrong. |
 | 403 | `forbidden` | A Host or Origin the server does not serve; the message names the flag that admits it. |
@@ -1021,8 +1136,8 @@ shapes, and an MLX vision tower's weights, which must not be quantized
 (`VisionLoader.cpp`), are checked only when the model loads.
 `families.FAMILIES` names the draft trained for each family; repository names
 and model-card `base_model` fields play no part. An MLX target must declare
-affine 4-bit, group-64 `quantization` in `config.json`, a MoE's router and
-shared-expert gate 8-bit. Every start checks the configuration again. Remote
+`quantization` in `config.json` in formats it loads ([MLX
+targets](#mlx-targets)). Every start checks the configuration again. Remote
 Python code is not loaded.
 
 ```bash
@@ -1033,6 +1148,82 @@ splash serve --model mlx-community/Qwen3.8-27B-4bit --language-only
 
 A model ID with `--revision`, `--language-only` or `--draft-model` is a
 separate installation from the same ID without them.
+
+### MLX targets
+
+An MLX target's `quantization` gives a mode, bits and group size, and may give
+a module its own, as mlx-lm writes it; a module's entry wins, and its mode
+defaults to affine. The engine loads affine 2, 3, 4, 5, 6 or 8 bits in groups
+of 32, 64 or 128, mxfp4 (4 bits in groups of 32) and nvfp4 (4 bits in groups
+of 16), mixed in any way across modules, and refuses any other format, naming
+the module (mxfp8). Every projection, the experts' too, and the head load only
+quantized (`safetensors::quantizedModules`): an entry `false`, which mlx-lm writes for
+a module it leaves unquantized, is refused for any of them before any weight
+download, naming it, and the loader refuses one the checkpoint holds
+unquantized. The router, the shared-expert gate, GDN alpha and beta and the
+token table may be unquantized. An affine weight is `s * q + z` for its group's
+bf16 `.scales` and `.biases` and its code `q`, packed little-endian in
+`.weight`'s 32-bit words at every width; an mxfp4 weight is an E2M1 code times
+its group's power of two, a uint8 scale, which is GGUF's MXFP4; an nvfp4 weight
+is an E2M1 code times its 16 elements' E4M3 scale, a uint8, which is NVFP4
+with a tensor scale of 1.
+
+An MLX target loads into the `MDGG0001` images a GGUF target's do
+(`SafetensorsTargetLoader`, [Weight loading](#weight-loading)):
+each quantized tensor in the format mlx-lm infers from its tensors, an affine
+`af<bits>g<group>` format of `runtime/metal/abi/QuantFormat.h`, MXFP4 or
+NVFP4, at the checkpoint's bits per weight (NVFP4's at 4.625, its tensor scale
+stored once per 256 weights); projections and experts as block planes, a
+quantized token table as native rows and an unquantized one as its bf16 rows.
+The block MoE kernels read the router and the shared-expert gate in F32, so
+these load as the F32 values of their quantization, and so do GDN alpha and
+beta unless both are in one format. Norms stay bf16 and the GDN value heads in
+MLX's grouped order.
+
+### Model Optimizer targets
+
+NVIDIA's Model Optimizer checkpoints (`quantization_config` with
+`quant_method` `modelopt`), such as `nvidia/Qwen3.8-27B-NVFP4` and
+`nvidia/Qwen3.6-35B-A3B-NVFP4`, load as safetensors targets beside MLX's. Each
+layer they quantize, by `quantized_layers` or else by `quant_algo` for every
+layer the `ignore` patterns leave, must hold NVFP4 in groups of 16 (`NVFP4`,
+`W4A16_NVFP4`) or FP8 with one scale per tensor (`FP8`), and every projection
+and the head must be such a layer; any other algorithm is refused before any
+weight download, naming the layer. An NVFP4 weight is `g * e4m3 * e2m1`: its
+E2M1 code (two per byte of `.weight`, U8), its 16 elements' E4M3 scale
+(`.weight_scale`, F8_E4M3) and the tensor's FP32 `.weight_scale_2`; an FP8
+weight is `g * e4m3`, its E4M3 value (`.weight`, F8_E4M3) and the tensor's
+FP32 `.weight_scale`. The kernels read them weights-only, as NVFP4 and FP8 rows
+of `runtime/metal/abi/QuantFormat.h` whose meta unit holds `g` beside the
+E4M3 scales, so every kernel decodes them through the format table alone;
+`.input_scale` and the KV cache quantization, which scale activations on
+NVIDIA GPUs, play no part. The checkpoints keep transformers' module names:
+`model.language_model.*`, `lm_head`, each routed expert a module
+`mlp.experts.<e>` of its own (stacked into one tensor's planes, each expert
+with its own `g`), and RMSNorm weights stored 1 below the weight the norm
+multiplies by, which load as the F32 `1 + w` (the GDN's gated norm as stored,
+widened to F32). Their unquantized tensors (GDN alpha and beta, the router,
+the shared-expert gate, the bf16 token table) load as an MLX target's do, and
+their MTP modules are not read.
+
+### Compressed-tensors targets
+
+llm-compressor's checkpoints (`quantization_config` with `quant_method`
+`compressed-tensors`), such as `unsloth/Qwen3.8-27B-NVFP4` and
+`unsloth/Qwen3.6-35B-A3B-NVFP4`, load as Model Optimizer's do. Each config
+group's weights must be NVFP4 (`nvfp4-pack-quantized`: float 4-bit by
+`tensor_group` in groups of 16) or FP8 (`float-quantized`: float 8-bit by
+`channel` or `tensor`), symmetric and in their stored column order, and every
+projection and the head, each routed expert's by its own name (the first and
+the last expert's before the download, every expert's when its tensors load),
+must be a group's target that no `ignore` entry names; a target or entry is a
+module's name, a regular expression after `re:` matched from the start of the
+name (at most 512 bytes), or the class `Linear`. Anything else is refused before any weight download,
+naming the group or the module, so checkpoints that keep the head or a
+projection in BF16 (RedHatAI's) are refused. An NVFP4 weight's codes are
+`.weight_packed`, its `g` the reciprocal of the F32 `.weight_global_scale`;
+an FP8 weight's F32 or BF16 `.weight_scale` is the tensor's `g` or, `[rows,
+1]`, each row's, which that row's meta units hold.
 
 ### GGUF targets
 
@@ -1048,10 +1239,11 @@ and lists every unsupported tensor in one error:
 
 - linears and experts: Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, Q4_1,
   IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL,
-  MXFP4 or PQ2_0;
+  MXFP4, NVFP4 or PQ2_0;
 - token embeddings: Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, Q4_1, IQ3_S,
   IQ4_NL or IQ4_XS, every type llama-quantize gives a token table by default
-  in a file whose linears load, and Prism's PQ2_0;
+  in a file whose linears load, IQ1_M (a published IQ2 mix's), MXFP4, NVFP4,
+  and Prism's PQ2_0;
 - norms, the MoE router and shared-expert scalar gate, and the GDN
   convolution, decay and time-step bias: F32;
 - GDN alpha and beta: both of one type, any of the linears' formats (one
@@ -1065,6 +1257,17 @@ stores alpha and beta in the file type's format (Q4_K in a Q4_K_M), as in
 lmstudio-community's files, so those load too. A format's image takes the bits
 per weight of its GGUF blocks, but for Q3_K's and Q6_K's padded meta units (1/16
 bit more) and IQ3_S's chunk words (4.06 bits for its 3.44).
+
+llama.cpp's NVFP4 (type 40, as in `cdiamond/Qwen3.8-27B-iMatrix-NVFP4-MTP-GGUF`)
+is `block_nvfp4`: 64 elements, a UE4M3 scale per 16 (an E4M3 byte whose bit 7
+llama.cpp ignores, reading 0x7F as 0) and E2M1 codes, beside an optional F32
+`.scale` tensor, one value for a projection or one per expert for an experts
+tensor (`_exps`), which llama.cpp multiplies the products by; a `.scale` beside
+a weight of another type is refused, as only NVFP4's rows hold one. It loads as
+Model Optimizer's NVFP4 does
+([Model Optimizer targets](#model-optimizer-targets)): four blocks make one
+256-element NVFP4 block, whose meta unit holds the `.scale` value as its `g`
+(1 without one), at 4.625 bits per weight for the file's 4.5.
 
 ### PQ2_0
 
@@ -1095,38 +1298,43 @@ configuration with the target's (its `model-check`), so a draft of another
 architecture never replaces one that loads. Native loading validates the
 configuration against the target again and loads the draft like a target
 ([Weight loading](#weight-loading)):
-`DraftCheckpointLoader` (`DraftCheckpoint.cpp`) plans the images of a Splash
-package's draft files, `layer-<N>.bin` and `model.bin`, and
-`AffinePreparation` quantizes each projection to 4 bits in groups of 64 as
-MLX's affine quantization rounds it and copies every other tensor as stored.
-For both families the images are byte for byte the Q4 drafts of the Splash
-packages.
+`DraftCheckpointLoader` (`DraftCheckpoint.cpp`) plans the draft's `MDGG0001`
+images, one per layer and one for the rest, and `GgufPreparation` quantizes
+each projection into af4g64 planes, 4 bits in groups of 64 as MLX's affine
+quantization rounds them, and copies every other tensor as stored. The draft
+runs on the block kernels its target's projections run on.
 
 ### Vision
 
-Vision comes from the target repository: MLX's `vision_tower.*` tensors,
-linking only `config.json` and the shards holding them, or the GGUF
-repository's root projector, a GGUF whose name holds `mmproj` (as
-`mmproj-BF16.gguf` or `MODEL-mmproj-BF16.gguf`), chosen by its header: a `clip`
-projector whose weights are BF16, or F32; BF16 is preferred. F16 has a narrower
-exponent than BF16, so an F16 projector has already rounded small weights and
-is not used. The processor configuration (MLX `preprocessor_config.json`, the
-GGUF's `clip.vision` metadata) must describe the one preprocessing Splash
-implements (`server/images.py`); it is checked before any weight download and
-not installed.
+Vision comes from the target repository: MLX's `vision_tower.*` tensors (or
+transformers' `model.visual.*`, as Model Optimizer keeps them, whose patch
+embedding is already in the image's order), linking
+only `config.json` and the shards holding them, or the GGUF repository's root
+projector, a GGUF whose name holds `mmproj` (as `mmproj-BF16.gguf` or
+`MODEL-mmproj-BF16.gguf`), chosen by its header: a `clip` projector whose
+weights are BF16, F32 or F16, preferred in that order. An F16 projector made
+from a BF16 tower, llama.cpp's default output, loads exactly: F16 rounds the
+smallest BF16 weights onto its subnormal grid, and what that keeps is still a
+BF16. The processor configuration (MLX `preprocessor_config.json`, or the
+`image_processor` object of `processor_config.json`, where newer Transformers
+releases save it; the GGUF's `clip.vision` metadata) must describe the one
+preprocessing Splash implements (`server/images.py`); it is checked before any
+weight download and not installed.
 
-Both sources are written into an image laid out as a package's
-`vision/model.bin`, which the one BF16 vision operator reads: BF16 tensors are
+Both sources are written into one image, which the one BF16 vision operator
+reads: BF16 tensors are
 copied, and F32 or F16 tensors are converted under the exact-BF16 rule of
 [weight loading](#weight-loading).
 Unsloth's mmproj stores its 1-D tensors, patch embedding and position table as
-F32, all of them BF16-exact, and loads byte-identical to the package's file.
+F32, all of them BF16-exact, and loads byte-identical to the MLX tower.
 Quantized MLX towers, deepstack projectors and mmproj tensors the tower does not
 use are rejected.
 
 `--language-only` links and loads no vision weights and removes them from
-memory accounting. It skips a GGUF's mmproj download; MLX vision tensors share
-shards with the language model, which download in full. The native Ready event
+memory accounting. It skips a GGUF's mmproj download and an MLX shard that
+holds only the tower (OptiQ keeps the tower in a subdirectory shard of its own);
+vision tensors in the language model's shards download with them. The native
+Ready event
 announces vision only when the model loaded it. Without it, image and PDF input
 fails with a 400 naming the modality. Every API shape converts its media to
 image and file parts, and message normalization, the one place that accepts or
@@ -1191,21 +1399,17 @@ Every request, including image placeholder, token-count and judgment
 startup; tokenizer files and the tokenizer object are unchanged. The probe's
 upstream fixtures are in `dev/tests/fixtures/chat_templates/`.
 
-### Legacy Splash packages
+### Splash packages
 
 Splash packages, such as `incoai/Qwen3.8-27B-Splash`, are the prebuilt format
-that predates upstream loading, and `--model` still accepts them. They contain
-`manifest.json`, the `target/`, `draft/` and `vision/` weight files and
-`tokenizer/`; the manifest lists artifact paths, sizes and SHA-256 hashes.
-Qwen3.8-27B packages use schema 3 / `splash-packed-q4`, Qwen3.6-35B-A3B
-packages schema 4 / `splash-packed-q4-moe`. Compatible community fine-tunes may
-use any nonempty manifest model name. Native loading validates geometry, tensor
-sizes, binary headers, tokenizer and target/draft compatibility, and reads the
-weight files into memory as they are. `install/legacy.py` installs a package
-as a selection link to its verified Hub snapshot, pinned like an assembly's
-sources. An installed package starts without a Hub request. A package has no
-variants, so a `:VARIANT` suffix is rejected, and `--revision`,
-`--language-only` and `--draft-model` require an upstream model ID.
+of earlier releases, which Splash no longer loads. A `--model` that names one,
+installed or on the Hub, stops and names the MLX model of its family to serve
+instead: `mlx-community/Qwen3.8-27B-4bit` or
+`mlx-community/Qwen3.6-35B-A3B-4bit`, which load the packages' weights byte for
+byte but for the 27B's GDN decay vectors, each within a float ULP. For an
+installed package it also names the Hub cache folder holding the package's
+files, which nothing reads any more and can be deleted. A package is
+recognized by its `manifest.json`, which names the package format.
 
 ## Internals
 
@@ -1230,13 +1434,13 @@ owns finite-choice prompts, validation and typed answer math. `output.py` parses
 generated text as it arrives, one parser serving streamed and complete
 responses alike, and `constraints.py` compiles token constraints. Messages and
 Responses build streamed and complete responses from the same block sequence;
-the one difference is a call cut by the token limit, which a complete Messages
-response leaves out. `make architecture-check` prevents lower layers from
-importing the HTTP entry module, and keeps one import style in `server/` and
-`install/`: a module imports its package's modules relatively. The server
-runs as `python -m server.server`; `install/launcher.py`, `install/models.py`
-and `install/catalog.py`, which run as scripts, import their siblings through
-a PEP 366 header. `serve_options.py` defines the options
+the one difference is a call cut by the token limit or a stop sequence, which a
+complete Messages response leaves out. `make architecture-check` prevents lower
+layers from importing the HTTP entry module, and keeps one import style in
+`server/` and `install/`: a module imports its package's modules relatively.
+The server runs as `python -m server.server`; `install/launcher.py` and
+`install/models.py`, which run as scripts, import their siblings through a
+PEP 366 header. `serve_options.py` defines the options
 `splash serve` shares with the server once, each with its check, default,
 help and help group, and how the launcher passes it on; it imports only the
 standard library, since the launcher parses them before `.venv` exists.
@@ -1260,7 +1464,7 @@ Hub snapshots, published atomically. The other installer modules each own one
 part: `hub.py` the sources, the Hub cache and its pins; `assembly.py` the
 assembly layout, its build, verification and garbage collection, and the
 metadata derived from a GGUF; `families.py` each family's draft repository;
-`legacy.py` Splash packages; and `models.py` model IDs, selections, the
+and `models.py` model IDs, selections, the
 installation lock, the command line (`install/models.py --model ID
 prepare|verify|link`, where `link` prints the selection link) and running the
 engine's checks. Since the installer checks a model with the engine, a source
@@ -1307,25 +1511,27 @@ never rewrites upstream files.
 ### Weight loading
 
 Every start writes a model's target, draft and vision tensors into weight
-images in memory, in the layouts the kernels read: an MLX target, the DFlash2
-draft and any vision tower in the layouts of a Splash package's files, which run
-the same kernels, and a GGUF target in the `MDGG0001` layout of the GGUF
-kernels. Each source adapter is a loader, which validates the source's metadata
-and plans its images, and a writer: `AffineTargetLoader` (`AffineTarget.cpp`)
-and `AffinePreparation` for an MLX target, `DraftCheckpointLoader`
-(`DraftCheckpoint.cpp`) and `AffinePreparation` for the draft,
-`GgufTargetLoader` (`GgufTarget.cpp`, planned by `GgufImage.cpp`) and
-`GgufPreparation` for a GGUF target, `VisionLoader` and `VisionPreparation` for
-an MLX or GGUF vision tower. A package's files are read as they are
-(`packageImage`). `AffinePreparation` reorders an MLX target's codes, scales and
-biases into 256-row tiles without requantization, quantizes the draft's BF16
-projections into the same tiles ([Drafts](#drafts)) and computes GDN decay as
-`float(-exp(double(A_log)))`, which may differ by one float ULP in this small
-vector from packages produced with MLX's float exponential. `GgufPreparation`
-repacks GGUF blocks ([GGUF targets](#gguf-targets)).
+images in memory, in the layouts the kernels read: any vision tower in the
+BF16 layout of the vision operator, and the target, safetensors or GGUF, and
+the DFlash2 draft in the `MDGG0001` layout of the GGUF kernels ([MLX
+targets](#mlx-targets)). Each source adapter is a loader, which validates the
+source's metadata and plans its images, and a writer:
+`SafetensorsTargetLoader` (`SafetensorsTarget.cpp`, planned by
+`SafetensorsImage.cpp`) and `GgufPreparation` for a safetensors target,
+`DraftCheckpointLoader` (`DraftCheckpoint.cpp`) and `GgufPreparation`
+for the draft, `GgufTargetLoader` (`GgufTarget.cpp`, planned by
+`GgufImage.cpp`) and `GgufPreparation` for a GGUF target, `VisionLoader` and
+`VisionPreparation` for a safetensors or GGUF vision tower. `GgufPreparation`
+repacks GGUF blocks ([GGUF targets](#gguf-targets)) and safetensors tensors
+without requantization, quantizes the draft's BF16 projections
+([Drafts](#drafts)), and computes a safetensors target's GDN decay as
+`float(-exp(double(A_log)))`, which may differ by one float ULP from MLX's float
+exponential.
 
-Loading never rounds a target or vision weight, and rounds the draft's
-projections only as the packages' drafts are rounded. A tensor it converts to
+Loading never rounds a target or vision weight but in the F32 values of an MLX
+target's quantized router, shared-expert gate or GDN alpha and beta ([MLX
+targets](#mlx-targets)), and rounds the draft's
+projections only as MLX's affine quantization does ([Drafts](#drafts)). A tensor it converts to
 BF16 (vision tensors stored as F32 or F16, a GGUF's convolution taps and
 time-step bias) must be exactly representable in BF16; otherwise loading fails,
 naming the tensor and, for a vision tensor, its file. The hashes of the images
@@ -1361,14 +1567,14 @@ staging bound, splitting rows wider than it into column chunks, and runs the
 F32 sections are copied in bounded steps.
 
 Each image's record (`WeightFileRecord`) names what it was written from: the
-SHA-256 of the record of every source file's digest, an assembly's `model.json`
-or a package's `manifest.json`, which the installer verifies at every start
+SHA-256 of the record of every source file's digest, the assembly's
+`model.json`, which the installer verifies at every start
 (`ModelDescriptor::sourceIdentity`). The weight manifest fingerprints `/status`
 reports (`loaded_model_layout_sha256`, `target_model_sha256`) cover it, so
 models of one layout from different sources never share a fingerprint.
 
 Runtime admission counts the images exactly once (`modelWeightBytes`, which
-`tune-kernels` and the runtime oracle use too). Before loading, startup refuses
+the runtime oracle uses too). Before loading, startup refuses
 a model whose images, with the pipeline and runtime reserves, one lane's state,
 the KV runway and any disk tier state staging, exceed the hard budget, so a
 model that can never fit is not loaded.
@@ -1379,45 +1585,60 @@ are freed, the weights' views stay the same handles, and a command that binds
 released memory fails (`MetalBackend::releaseMemory`). The next request waits
 while the same writers write the images again (`WeightImages::restore`), an
 image per tick so that the loop keeps answering status and cancellations; this
-takes about as long as the load at startup and logs `Weights restored in N s`. A
-restore is not admitted again: the memory plan counted the images at startup,
-and nothing else allocates while the engine holds no request. A restore that
-fails (an allocation the driver refuses, a read error, a source written in
-place) stops the engine, which the server starts again. With the
-[Neural Engine split](#neural-engine-prefill), the release unloads its program
-after the images, and the restore loads it again in one tick more, after the
-last image (`ReleasableMemory`).
+takes about as long as the load at startup and logs `Weights restored in N s`.
+The governor admits each image's memory (`MemoryGovernor::allocationAdmission`)
+as memory the waiting requests need: the host's margins do not refuse it, as
+they do not refuse memory a request in service needs, and it fits the
+engine's limit, since the cache does not grow while the engine holds no
+request; critical pressure refuses it. A refused image, or one the driver or
+its writer cannot allocate, stays released, and the images before it stay. The
+requests wait for memory, retrying every 0.1 s as a refused request does and
+counted in `admission.waiting_memory`, and the log says `Weights wait for
+memory to be restored`. Once the 30 s resource wait has passed since the first
+refusal after the last image that came back, the restore gives up: the images it
+wrote back are released, the waiting requests fail with `resource_timeout`, and
+`weights.restore_failures` counts the give-up. When no request waits any more,
+it gives up at once and counts nothing. Either way the next request starts over
+from the first image. Any other failure (a read error, a source written in
+place) stops the engine, which the server starts again. With the [Neural Engine
+split](#neural-engine-prefill), the release unloads its program after the
+images, and the restore loads it again in one tick more, after the last image
+(`ReleasableMemory`).
+
+#### Explicit weights release
+
+`POST /v1/memory/release` asks the engine for the same release without waiting
+for the timer: the server sends a `ReleaseRequest` frame (protocol 9), and the
+engine, between commands, releases the weights when it holds no request and no
+restore is under way, then answers with its status document, whose
+`weights.released` tells whether it did (`NativeRuntime::handleRelease`). Nothing
+else changes: the next request restores the weights as after the idle release
+(`Weights restored in N s`), the prefix cache and the other caches stay as they
+are, and `--idle-release off` does not stop it, so a host that shares the Mac
+with other memory-heavy work can take the weights' memory back on demand instead
+of on a timer. A busy engine, serving a request or restoring its weights, answers
+`409 engine_busy` and keeps them. The request takes no body:
+
+```sh
+curl -X POST http://127.0.0.1:8000/v1/memory/release
+```
 
 `loadQwenTarget` (`QwenTargetLoader.hpp`) reads a target's images
-(`QwenTargetFiles`: a package's files, or the images
-`AffineTargetLoader` or `GgufTargetLoader` plans) through the format that
-stores them. `AffineTargetFormat`, for package and MLX images, reads every
-projection, a fused one too, as one affine Q4 tensor and the norms as bf16.
-`BlockTargetFormat`, for GGUF images, reads each GGUF tensor as one
-block-quantized `QuantizedSegment` (a fused projection's tensors in output
-column order), the norms as F32, and keeps the GDN output projection's input
-in llama.cpp's tiled value-head order. Both Qwen families share one layout
+(`QwenTargetFiles`: the images `SafetensorsTargetLoader` or `GgufTargetLoader` plans)
+through `BlockTargetFormat`, which reads each tensor as one block-quantized
+`QuantizedSegment` (a fused projection's tensors in output column order), the
+norms as F32 (bf16 for an MLX checkpoint), and keeps the GDN output projection's
+input in the source's value-head order, llama.cpp's tiled or MLX's grouped.
+Both Qwen families share one layout
 (`QwenHybridLayout`) and its validator.
 
-Operator plans use each projection's physical layout, `Affine64` or `Block32`,
-independently of the source container. `Projection`, `MoeWeights` and
-`EmbeddingWeights` (`runtime/ops/Weights.hpp`, `MoE.hpp`) hold either layout
-and represent different operator contracts. Arena sizing collects each
-projection's actual layout (a GGUF target's block projections beside its
-affine draft's) and reserves the vocabulary head only for decode.
+Every source loads into block planes: `Projection`, `BlockMoeWeights` and
+`EmbeddingWeights` (`runtime/ops/Weights.hpp`, `MoE.hpp`) hold them whatever
+the source container, and represent different operator contracts. Arena
+sizing collects each projection's shape and reserves the vocabulary head only
+for decode.
 
 ### Kernels
-
-Affine Q4 decode (`runtime/ops/Linear.cpp`) runs MPP tiles on Apple10 and later
-(the M6 reports family 11 and runs the same rules) and bf16 simdgroup matrix
-tiles on Apple9. On Apple10 a projection with at most two N128 tiles per core
-runs that tile over two, four or eight K partitions (`LinearTile::Split128`,
-`kernels/decode/linear_q4_grid_split.metal`), the most whose split grid still
-fits four 256-thread threadgroups per core; the last partition of each tile
-adds the fp32 partials in split order, so the sums do not depend on
-scheduling. The split count depends on the grid per core, never on the batch
-width, so a request's sums are the same alone and batched. Every other
-projection keeps the sequential tiles (`dev/benchmarks/device-policy.md`).
 
 Every tensor keeps its stored format: the F32 norm multipliers, GDN decay, the
 MoE router and shared-expert scalar gate, and GDN alpha/beta when a file
@@ -1439,18 +1660,32 @@ decode faster on the staged tile there, which a projection all of whose segments
 takes wherever the tile holds its lanes' rows unpadded. On Apple10 (M5) the staged tile
 (`LinearTile::GgufStaged`) runs the kernels of `runtime/metal/kernels/shared/gguf_linear.metal`,
 which dequantize each weight once to half in threadgroup memory (`kernels/common/gguf_staged.h`)
-for MPP `matmul2d`, the neural accelerator's path, on bf16 activations; a step of three request
-lanes runs the 32-row tile over four lanes of storage. Prefill runs the staged kernels on both
-families: the 128-row prefill tile (`LinearTile::GgufPrefill`), and the staged tile for chunks of
-up to 32 rows. Every projection splits its K across threadgroups by one rule (`decodeSplits`: each
-tile's tiers of threadgroups per core and inputs per partition, from measured occupancy, Apple9's
-staged tile taking the register tile's) that does not depend on the batch width. The MoE experts
-(`runtime/ops/MoE.cpp`) run the same numerics per family over the grouped rows: the register form
-in `linear_gguf_sgmatrix.metal`, the staged one in `kernels/shared/moe_gguf.metal`, which Apple9
-takes for experts mostly in the formats it stages (`MoeShape::expertFormat`). The float router and
-alpha/beta projections run in `kernels/shared/gguf_float.metal`, and the token rows are gathered
-by one template in `kernels/shared/embedding.metal`. These plans are fixed rules of GPU family,
-core count, shape and format.
+for MPP `matmul2d`, the neural accelerator's path, on bf16 activations. A step's weights, and
+its meta unit when it enters a new one, load while the previous step's matmul runs
+(`gguf_staged_steps`): their DRAM round trips overlap a matmul. On Apple10 from 16 cores each
+column tile of a decode projection starts its walk over its K partition at its own step
+(`staged_first_step`, `LinearConfig::spread`), so the tiles do not all wait on the same freshly
+written slice of the input at once; the MoE experts, prefill, Apple9 and fewer cores walk in
+lockstep. There a dense gate/up pair whose tensors share their format also decodes in one
+dispatch (`LinearConfig::oneGateUpPass`), each simdgroup staging both tensors' columns, so a
+chain's serial steps serve both. Its output is bitwise the two passes' at the same K split; it
+splits K as one projection of the pair's columns, and where that split differs from theirs, its
+sums are reassociated. A step of three request lanes runs the 32-row tile over four lanes of
+storage. Prefill runs the staged kernels on both families: the 128-row prefill tile
+(`LinearTile::GgufPrefill`), and the staged tile for chunks of up to 32 rows. Every projection
+splits its K across threadgroups by one rule (`decodeSplits`: each tile's tiers of threadgroups
+per core and inputs per partition, from measured occupancy, Apple9's staged tile taking the
+register tile's) that does not depend on the batch width. The MoE experts
+(`runtime/ops/MoE.cpp`) run the same numerics per family over the grouped rows: the register
+form in `linear_gguf_sgmatrix.metal`, the staged one in `kernels/shared/moe_gguf.metal`, which
+Apple9 takes for experts mostly in the formats it stages (`MoeShape::expertFormat`). Their
+passes launch the live tiles alone: the grouping kernel writes each pass's grid with the tile
+count, and the pass reads it as an indirect dispatch (`ComputeDispatch::indirectThreadgroups`).
+The staged tile runs gate and up in one pass where they share their routed and their shared
+formats, a gate and an up simdgroup on the same columns, bitwise the two passes' intermediate.
+The float router and alpha/beta projections run in `kernels/shared/gguf_float.metal`, and the
+token rows are gathered by one template in `kernels/shared/embedding.metal`. These plans are
+fixed rules of GPU family, core count, shape and format.
 
 A rotated projection rotates its input once into `LinearScratch::rotated`
 (`gguf_rotate`, in fp32 and rounded once to bf16) before its quantized segments,
@@ -1460,16 +1695,18 @@ producer writes plain rows. The token table gathers each row through the inverse
 (`gguf_embed_rotated_pq20`).
 
 A GGUF kernel of one quantized tensor names its epilogue last: `a` none, `r` residual, `g` the
-up pass with the silu gate. The staged ones are `gguf_decode_<format>_m<rows>_<e>` and
+up pass with the silu gate. The staged ones are `gguf_decode_<format>_m<rows>_<e>`, with gate and
+up in one pass `gguf_decode_<format>_m<rows>_gate_up`, and
 `gguf_prefill_<format>_<e>` (and `gguf_prefill_<format>_r_leading_inputs` over a view of the
 leading inputs of wider rows), the register ones `gguf_decode_sg_<format>_l<lanes>_<e>`, and the
-experts `moe_expert_gguf_m<rows>_<e>` and `moe_expert_gguf_sg_<e>`; the fused projections run
-`gguf_decode_fused_m<rows>` and `gguf_decode_sg_fused_l<lanes>`. The norm, GDN and
-attention-gate variants that also write a register kernel's input table carry `table64` (the
-affine Q4 kernel's) or `table16` (the GGUF one's) in their names. The epilogue kinds of both GGUF
-families are in `kernels/common/gguf_tile.h`, the SiLU and sigmoid every kernel shares in
-`kernels/common/activation.h`, and the MMA helpers every register kernel uses, affine, GGUF or
-fp32, in `kernels/common/sgmatrix.h`.
+experts `moe_expert_gguf_m<rows>_<e>` and `moe_expert_gguf_sg_<e>`, with gate and up in one pass
+`moe_expert_gguf_m<rows>_gate_up`; the fused projections run
+`gguf_decode_fused_m<rows>` and `gguf_decode_sg_fused_l<lanes>` in decode, and in prefill one
+`gguf_prefill_<format>_a` per format over that format's segments. The norm, GDN and
+attention-gate variants that also write the register kernels' input table carry `table16` in
+their names. The epilogue kinds of both GGUF families are in `kernels/common/gguf_tile.h`, the
+SiLU and sigmoid every kernel shares in `kernels/common/activation.h`, and the MMA helpers every
+register kernel uses, GGUF or fp32, in `kernels/common/sgmatrix.h`.
 
 The ABIs are in `runtime/metal/abi/Gguf.h`, which also defines the tile geometry the kernels
 and `LinearGguf.cpp` share, and `MoE.h`; the image formats in
@@ -1491,13 +1728,14 @@ the half rounding of every reference weight; `gguf-rotation`, `gguf_rotate` and 
 PQ2_0 token gather bitwise against the fp32 butterflies and within one bf16 step of fp64;
 `gguf-projection`, every GGUF projection through
 `ops::Linear` with each tile forced, so both decode tiles run on every GPU, at one to four
-lanes, every K split and epilogue, fused segments, every gate/up format pair and the prefill
-tiles, each output inside the fp64 bound of `GgufFormatReference.hpp`; and `gguf-moe`: the float
+lanes, every K split and epilogue, fused segments, every format's gate with the next format's up
+and the prefill tiles, each output inside the fp64 bound of `GgufFormatReference.hpp`, and the
+one-pass gate/up bitwise against the two passes at the same K split; and `gguf-moe`: the float
 projections on both float tiles and the MoE layer on every GGUF plan, the staged 8- and 32-row
-tiles and the Apple9 register tile whatever GPU runs it, in every format, against fp64. The
-goldens and how to regenerate them are in `dev/tests/fixtures/weight-goldens/`; with
-`SPLASH_GGML_ORACLE=<libggml-base.dylib>`, `gguf-reference` also compares the reference with
-GGML directly and prints GGML's hashes.
+tiles and the Apple9 register tile whatever GPU runs it, in every format, against fp64, and
+bitwise against the full grids and two gate/up passes. The goldens and how to regenerate them are
+in `dev/tests/fixtures/weight-goldens/`; with `SPLASH_GGML_ORACLE=<libggml-base.dylib>`,
+`gguf-reference` also compares the reference with GGML directly and prints GGML's hashes.
 
 Two benchmark tools repeat the measurements behind the GGUF split tiers and MoE plans, with the
 weights DRAM-cold. `make benchmark-gguf-projection GGUF_PROJECTION_ARGS='q4k 5120 8192'` times one
@@ -1505,19 +1743,8 @@ projection (up to three fused formats and widths, then `K` and an optional epilo
 decode tiles at one to four lanes and every K split, and marks the device policy's pick, or, with
 a trailing `prefill=R[,R...]` after the epilogue and the round count, one format's 128-row
 prefill tile at each chunk of `R` rows (more than 32);
-`make benchmark-gguf-moe` times one MoE layer at the 35B shape, GGUF against affine Q4, on the
-device's plans and the other GGUF tile.
-
-Two more time the affine Q4 kernels on synthetic weights, with no model. `make benchmark-decode`
-times the N128, N256 and paired N128 decode tiles on eight simdgroups, plain and with the residual
-and gate/up epilogues each takes, at 8 to 32 rows, on the 27B's projection shapes, its draft's
-context projection and the LM head, over a range of threadgroup counts, and prints each one's time
-and effective bandwidth. It leaves out the other decode tiles the device policy chooses: Apple9's
-register tile (`LinearTile::Q4Register`), Apple10's `Split128` and paired N256 tiles, and N128 on
-four simdgroups at 24 rows. `make benchmark-prefill` times the prefill tiles the device policy
-chooses among (N128 and N256 on eight simdgroups, N128 on four), with their residual and gated
-epilogues, on the 27B's and 35B's projection shapes at 17 to 2,048 rows: the measurements behind
-the Apple9 prefill rule in `runtime/ops/Linear.cpp`.
+`make benchmark-gguf-moe` times one MoE layer at the 35B shape on the device's plans and the
+other GGUF tile.
 
 ### Neural Engine prefill
 
@@ -1536,7 +1763,7 @@ and writing one set of surfaces sized for 2048 rows. The ANE service holds
 memory for a loaded program's intermediate values, which its functions share:
 13 programs of one function each held it 13 times (3.25 GB at the M6's share,
 against 0.67 GB for the one program). The GPU requantizes the
-ANE's weights from the Q4 or GGUF planes one layer ahead into double-buffered
+ANE's weights from the block planes one layer ahead into double-buffered
 IOSurfaces and adds the ANE's partial down projection to its own. Shared
 events order each evaluation between the GPU's packing and that join inside
 the one prefill command (`metal::EventStep`); each signal ends a Metal command
@@ -1669,7 +1896,7 @@ on Qwen3.8-27B); `splash serve --disable-ane` keeps the FFN on the GPU, and
 timings it is given, also under the sanitizers, and `ane-ffn-startup`, each
 outcome of a start on a model it plays, a second start that calibrates again
 among them, and the automatic context of each. `make test-engine-metal` runs `ane-ffn`: its kernels
-against CPU references for affine Q4 and every GGUF format under shader
+against CPU references for every image format under shader
 validation, then, without it, the split's memory and its output against the GPU
 alone, the same output once its program is unloaded and loaded again, a chunk's
 rows on the GPU alone as a full chunk's, `verify()` of every function and of a
@@ -1682,15 +1909,16 @@ client's failures, limits, unload and load, and cache files on a small program.
 `handoff` runs the event handoff against an agent the CPU plays in each way it
 can fail, and `ane-program-faults` checks that an Objective-C exception and a
 changed method signature fail as `std::runtime_error`. `make test-real` runs
-the model runtime oracle with the GPU alone and with the split as a start makes
-it, which must not be unavailable, and whose automatic context must be what the
-plan holds with the split it runs.
+the model runtime oracle with the GPU alone, with the GPU alone over a BF16
+state (`--state-format bf16`), and with the split as a start makes it, which
+must not be unavailable, and whose automatic context must be what the plan
+holds with the split it runs.
 
 ### Residency and KV extents
 
 Every buffer the backend allocates belongs to one residency set attached to its
-command queue (`MetalBackend::allocateBuffer`): weights, KV extents, state cells
-and draft rings, and scratch alike stay wired between requests until the idle
+command queue (`MetalBackend::allocateBuffer`): weights, KV extents, state
+buffers and scratch alike stay wired between requests until the idle
 release (`--idle-release`, 10 minutes by default) passes without a command, and
 the next command wires them again. `--idle-release off` keeps every buffer
 wired, and the weight images allocated, while the engine runs; KV extents return
@@ -1819,7 +2047,7 @@ system prompt, resumes there instead of from the start. It stays only if the
 replay state fits beside it; refused memory, the replay state takes its buffers
 rather than another lane's checkpoint. With the SSD cache it costs a write as
 well: reclaim takes checkpoints first and writes the states it evicts to the
-SSD, this one too (187 MiB for 27B), and one published straight to the SSD,
+SSD, this one too (153 MiB for 27B), and one published straight to the SSD,
 when no RAM slot took it, stays there. The persistent cache's hourly write limit
 does not pause these writes, and a full quota makes room for one by dropping the
 oldest copy, perhaps an older conversation's restore point.
@@ -1842,9 +2070,20 @@ request-sized allocation fits. A request that cannot fit even alone, after every
 cached prefix was evicted, fails with 400 `capacity_exhausted`, naming
 `--max-memory` and `--max-context`; retrying it fails the same way.
 
+A cached state holds the target's GDN cell and the draft's context window, not
+the draft's rings: the context row of each of the 2048 positions the rings
+cover, from which every draft layer computes its keys and values, in 4-bit
+codes over groups of 64 values with each group's fp16 scale and minimum
+(`DraftStateLayout::windowBytes`: 5.6 MiB for 27B and 2.25 MiB for 35B, where
+the rings take 40 and 48 MiB). Prefill keeps a lane's window beside its rings;
+a restore that continues the rings computes them from the window again at the
+start of the request's first prefill chunk (`DFlashDraft::addContextRebuild`).
+Decode writes the rings alone, so states are published only in prefill.
+
 ### Disk tier
 
-The tier holds cached request states (GDN cell plus draft ring) and KV pages.
+The tier holds cached request states (GDN cell plus the draft's context
+window) and KV pages.
 RAM and disk copies share the same block tree and recency order. Restoring a
 prefix keeps its disk copy, so its next eviction needs no write while that copy
 remains cached. The KV tier takes no Metal memory. The state staging buffer,
@@ -1942,6 +2181,16 @@ counters include:
 The engine receives `ignore_eos` as bit 0 of the request frame's flags word and
 `return_progress` as bit 1; the word rejects undefined bits.
 
+A request that generates in a thinking block may carry a thinking budget: its
+tokens, the token that closes thinking, and a second token that also ends it,
+a call's opening where the output may call a tool. The engine counts the
+thinking tokens it selects. In the selection where the budget runs out, one
+small dispatch gives that row the close, unless a draft token before the row
+ended thinking, and gives a sampled lane's drafted row the target probability 1
+for a drafted close and 0 otherwise, so acceptance keeps the draft only where
+it drafted the close. A selection where no budget runs out dispatches nothing
+more.
+
 Requests carry the score-token IDs and Done events the selected f32 logits; the
 server and the engine must speak the same native wire version. Scoring requires
 2–255 distinct, in-vocabulary tokens, no images or generation constraints, and a
@@ -1953,13 +2202,28 @@ carry no logits.
 
 ### Failures and crash traces
 
-A non-finite logit row is a per-request failure, not an engine fault: a score
-logit, or a token the sampling kernels could only select outside the
-vocabulary. The engine reports `model_result_invalid` for that request alone,
-before it publishes the failing step's cache state or any output, and the rest
-of the batch finishes normally. Prompt chunks that already succeeded keep the
-blocks they committed, exactly as they do for a cancelled request. GPU faults
-and broken engine invariants stay fatal and still mark the runtime unhealthy.
+A row that is not finite is a per-request failure, not an engine fault. Every
+prefill chunk checks the last row of each lane's final hidden, which a value
+that is not finite anywhere in the chunk, or in the state it computed from,
+reaches through the recurrent state, and through attention on a GPU whose tile
+weighs non-finite keys and values (some families' tiles give them zero weight,
+for every reader); a token selection finds one as
+a logit row with no selectable token, its admitted logits all NaN or -inf
+(sampling penalties leave those as they are), and a score request as a score
+logit. The engine reports `model_result_invalid` for that request alone, a
+selection's message counting the row's NaN, +inf and -inf logits, before it
+publishes the failing step's cache state or any output, and the rest of the
+batch finishes normally. Since every step that
+publishes was checked, what earlier steps published stays, as it does for a
+cancelled request. A damaged state is one way to such a result: a request
+whose first step from the state it restored is not finite takes that state out
+of the cache, and the next request with the prompt computes it again. Values
+that are not finite cannot reach the next holder of a request's memory either:
+a page a request takes comes with zeros in the rows its work does not write,
+and the lane of a request that found one returns its draft rings cleared, since
+attention weighs rows past a request's end by zero and a BF16 value is read as
+stored (0 × NaN is NaN). GPU faults and broken engine invariants stay fatal and
+still mark the runtime unhealthy.
 
 Request logs omit bodies; full crash traces require explicit
 `SPLASH_CRASH_TRACE=1` and can contain private conversation data. With it, a
@@ -2029,17 +2293,16 @@ that compacts the conversation, whose summary request and the request after it
 share only the system prompt and tools. Replay points of unfinished requests
 evicted during a phase only print a warning.
 
-`benchmark-backend`, `benchmark-decode-profile` and `tune-kernels` take `MODEL`
-the same way. The models they are run with, one per family and source format:
+`benchmark-backend` and `benchmark-decode-profile` take `MODEL` the same way.
+The models they are run with, one per family and source format:
 
-| Family | MLX | GGUF | Splash package |
-| --- | --- | --- | --- |
-| Qwen3.8-27B | `mlx-community/Qwen3.8-27B-4bit` | `unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M` | `incoai/Qwen3.8-27B-Splash` |
-| Qwen3.6-35B-A3B | `mlx-community/Qwen3.6-35B-A3B-4bit` | `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M` | `incoai/Qwen3.6-35B-A3B-Splash` |
+| Family | MLX | GGUF |
+| --- | --- | --- |
+| Qwen3.8-27B | `mlx-community/Qwen3.8-27B-4bit` | `unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M` |
+| Qwen3.6-35B-A3B | `mlx-community/Qwen3.6-35B-A3B-4bit` | `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M` |
 
-The source formats load differently: an MLX target is written into a package's
-layout, a GGUF target into its own layout for the GGUF projection and MoE
-kernels, and a package's files are read as they are.
+Both source formats load into the block layout of the GGUF projection and MoE
+kernels, an MLX target in its MLX formats, a GGUF target in its GGUF ones.
 
 On a 24 GB Mac, `test-agent-real` stops a client's workflow at macOS's warning
 memory pressure, which the smaller GGUF variants such a Mac uses can reach under
@@ -2050,22 +2313,9 @@ allocates as it runs, must fit in what macOS has available above its reserve,
 so it stops, naming what it needs, while other programs hold that memory. With
 only desktop applications open, a 24 GB Mac runs it for those variants.
 
-`make check-native-build` builds the affine source oracle and `weight-digests` so
-they cannot break unnoticed. No target runs the oracle, as it needs real
-models: after `make all build/engine-tests/affine-source-oracle`, pass it
-`build/splash.metallib`, an installed MLX model's `target` directory and the
-matching installed package to compare every byte of their images.
-
 Compare performance on the same idle Mac with the same model and workload.
-`make tune-kernels MODEL=...` measures each projection key of the installed
-model on this Mac: the policy default in `runtime/ops` against the tile
-configurations that won an earlier run (`dev/tuning/LinearTuning.hpp`). It
-prints, per key, the winning configuration with its paired GPU and wall-time
-gain, or that the default is kept; it changes no default and saves no profile.
-For a GGUF model it measures only the draft's projections, and says so in its
-header, since the device policy alone plans block projections
-([GGUF targets](#gguf-targets)). Keep generated reports, profiles, local paths
-and experiment notes out of the source tree and commits.
+Keep generated reports, profiles, local paths and experiment notes out of the
+source tree and commits.
 
 ### Release check
 
@@ -2075,10 +2325,7 @@ family (an Apple9 M3 and an Apple10 M5) against a retained baseline build,
 `engine-tests/backend-benchmark` and, for a build that loads the weights into
 memory (1.2.0 and later), `engine-tests/weight-digests`. `release-check` fails
 without it. The baseline must load the model: it is the previous release's
-build when that loads the model. The legacy package can always be compared with
-1.0.2, as below; Splash 1.0.x loads only Splash packages and has no
-`weight-digests`, so the package's weight images are not compared with it. From
-a clean checkout:
+build when that loads the model. From a clean checkout:
 
 ```sh
 make check test-sanitizers                      # once, model-free, on one Mac
@@ -2087,7 +2334,6 @@ make install release-check MODEL=mlx-community/Qwen3.8-27B-4bit REVISION=<commit
 make install release-check MODEL=unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M LANGUAGE_ONLY=1 REVISION=<commit> BASELINE=...
 make install release-check MODEL=mlx-community/Qwen3.6-35B-A3B-4bit REVISION=<commit> BASELINE=...
 make install release-check MODEL=unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M REVISION=<commit> BASELINE=...
-make install release-check MODEL=incoai/Qwen3.8-27B-Splash BASELINE=../splash-1.0.2
 make install verify-models MODEL=mlx-community/Qwen3.6-35B-A3B-4bit
 make test-agent-real MODEL=mlx-community/Qwen3.6-35B-A3B-4bit REVISION=<commit> AGENT_SCENARIO=smoke AGENT_CLIENTS=...
 ```
@@ -2104,7 +2350,7 @@ the other. Per model, `release-check`:
   (`HF_ENDPOINT=http://127.0.0.1:9`) and with an empty `HF_HUB_CACHE`: each
   restart must start the same assembly within 10 seconds, name the Hub's
   reason on one line when it asked the Hub ([Revisions](#revisions)), and
-  download nothing; a legacy package is not restarted. It then hashes the
+  download nothing. It then hashes the
   sources and records in `weights.json` the component, size and SHA-256 of
   every weight image the installation loads (`verify-models`);
 - runs the HTTP smoke, which for a text-only installation checks the 400s
@@ -2148,11 +2394,12 @@ the AIR of each kernel the decode path may run in the two builds'
 Two pairs of constants in `runtime/engine/Protocol.hpp` and `server/protocol.py`
 version what the server and the engine exchange. When the native wire layout
 changed since the last release, bump `kProtocolVersion` and `PROTOCOL_VERSION`
-together; each side refuses frames of another version. When the status
-document the engine writes changed, bump `kStatusSchemaVersion` and
-`STATUS_SCHEMA_VERSION` together; the server refuses a status document of
-another schema. Builds between releases share a version while its layout
-changes.
+together; each side refuses frames of another version. When a field of the
+status document the engine writes was removed or changed meaning, bump
+`kStatusSchemaVersion` and `STATUS_SCHEMA_VERSION` together; the server refuses
+a status document of another schema. An added field keeps the version, as
+`weights` did in 1.2.1 and `ane_ffn` in 1.3.0. Builds between releases share a
+version while its layout changes.
 
 ### Local benchmarks
 
@@ -2212,11 +2459,7 @@ does not measure end-to-end agent performance.
 
 ## Package
 
-Release archives contain no Hugging Face credentials and use the official model
-list committed with the source. `dev/tools/update_model_catalog.py` regenerates
-that list from the official collection, independently of packaging; the
-model-catalog workflow runs it and opens a pull request while the workflow is
-enabled.
+Release archives contain no Hugging Face credentials.
 Users accessing private models supply their own `HF_TOKEN` or Hugging Face login.
 
 Release versions are three-part, `x.y.z`, with no `v` prefix: after `1.2.1`

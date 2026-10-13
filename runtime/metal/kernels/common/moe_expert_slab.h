@@ -7,6 +7,8 @@
 // `rows` live rows first, then padding. Every expert pass runs the matmul of
 // the smallest of 8, 16 and tile_rows rows that holds the live rows, and the
 // grouping and the gather fill exactly those rows: no kernel reads past them.
+// An in-place tile (MoeGroupParams::in_place) is the plan's 8 rows, every one
+// live, and no gather runs.
 inline uint moe_matmul_rows(uint rows, uint tile_rows) {
   return min(tile_rows, rows <= 8 ? 8u : rows <= 16 ? 16u : tile_rows);
 }
@@ -25,31 +27,6 @@ inline void moe_live_rows(uint rows, Run run) {
       return run(integral_constant<ushort, 16>{});
   }
   run(integral_constant<ushort, Max>{});
-}
-
-// One expert's Q4 slab, [weights][BF16 scales][BF16 biases] in the same
-// affine storage tiles as the dense kernels. Routed experts sit at
-// their stride in the packed buffer; expert `experts` is the shared expert,
-// whose single slab lives in its own buffer.
-struct MoeQ4Slab {
-  device uchar *weights;
-  device bfloat *scales;
-  device bfloat *biases;
-};
-
-inline MoeQ4Slab moe_q4_slab(device uchar *packed, device uchar *shared,
-                             uint expert, uint experts,
-                             ulong expert_stride_bytes, uint output_size,
-                             uint input_size) {
-  device uchar *base = expert == experts
-                           ? shared
-                           : packed + ulong(expert) * expert_stride_bytes;
-  ulong elements = ulong(output_size) * input_size;
-  ulong weight_bytes = elements / 2;
-  ulong parameter_bytes = elements / 32;
-  return {base, reinterpret_cast<device bfloat *>(base + weight_bytes),
-          reinterpret_cast<device bfloat *>(base + weight_bytes +
-                                            parameter_bytes)};
 }
 
 // A GGUF expert pass's weights for one tile (ops/MoE.cpp, metal/abi/MoE.h):

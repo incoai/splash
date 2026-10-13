@@ -2,49 +2,6 @@
 #include "metal/abi/KernelABI.h"
 #include "metal/kernels/common/gguf_embedding_formats.h"
 
-template <uint Hidden>
-inline void q4_embedding_impl(device const uint *tokens,
-                              device const uchar *weights,
-                              device const bfloat *scales,
-                              device const bfloat *biases,
-                              device bfloat *output,
-                              constant Q4EmbeddingParams &params, uint index,
-                              uint grid_size) {
-  constexpr uint QuantGroups = Hidden / 64;
-  uint elements = params.rows * Hidden;
-  for (uint element = index; element < elements; element += grid_size) {
-    uint row = element / Hidden;
-    uint dim = element % Hidden;
-    uint raw_token = tokens[row];
-    // Runtime validates every token. Keep the bounds guard local to the
-    // storage table so a malformed direct operator call cannot read past it.
-    uint token = raw_token < params.vocabulary_size ? raw_token : 0;
-    uchar packed = weights[ulong(token) * (Hidden / 2) + dim / 2];
-    float quantized = float((packed >> ((dim & 1) * 4)) & 15);
-    ulong parameter = ulong(token) * QuantGroups + dim / 64;
-    output[element] =
-        bfloat(quantized * float(scales[parameter]) + float(biases[parameter]));
-  }
-}
-
-#define Q4_EMBEDDING_ENTRY(Name, Hidden)                                      \
-  kernel void Name(                                                          \
-      device const uint *tokens [[buffer(0)]],                               \
-      device const uchar *weights [[buffer(1)]],                             \
-      device const bfloat *scales [[buffer(2)]],                             \
-      device const bfloat *biases [[buffer(3)]],                             \
-      device bfloat *output [[buffer(4)]],                                   \
-      constant Q4EmbeddingParams &params [[buffer(5)]],                      \
-      uint index [[thread_position_in_grid]],                                \
-      uint grid_size [[threads_per_grid]]) {                                 \
-    q4_embedding_impl<Hidden>(tokens, weights, scales, biases, output,       \
-                              params, index, grid_size);                     \
-  }
-
-Q4_EMBEDDING_ENTRY(embedding_q4_h5120, 5120)
-Q4_EMBEDDING_ENTRY(embedding_q4_h2048, 2048)
-#undef Q4_EMBEDDING_ENTRY
-
 // The token gather from native GGUF rows (ops/Embedding.cpp) of a format of
 // common/gguf_embedding_formats.h. Inlined, with the format's value, so every
 // gather stays one function (the compiler otherwise keeps Q6_K's as a call).
@@ -65,7 +22,7 @@ __attribute__((always_inline)) inline void gguf_embedding(device const uint *tok
                    uint index [[thread_position_in_grid]]) { \
     gguf_embedding<F>(tokens, table, output, p, index); \
   }
-// One gather per gguf_embedding_format (metal/abi/Gguf.h), named by its kQuantFormats token.
+// One gather per gguf_embedding_format (metal/abi/Gguf.h), named by its kQuantFormats token, and one of bf16 rows.
 GGUF_EMBEDDING_ENTRY(gguf_embed_q4k, GgufEmbedQ4K)
 GGUF_EMBEDDING_ENTRY(gguf_embed_q6k, GgufEmbedQ6K)
 GGUF_EMBEDDING_ENTRY(gguf_embed_q80, GgufEmbedQ80)
@@ -78,6 +35,17 @@ GGUF_EMBEDDING_ENTRY(gguf_embed_pq20, GgufEmbedPQ20)
 GGUF_EMBEDDING_ENTRY(gguf_embed_iq4nl, GgufEmbedIQ4NL)
 GGUF_EMBEDDING_ENTRY(gguf_embed_iq4xs, GgufEmbedIQ4XS)
 GGUF_EMBEDDING_ENTRY(gguf_embed_iq3s, GgufEmbedIQ3S)
+GGUF_EMBEDDING_ENTRY(gguf_embed_iq1m, GgufEmbedIQ1M)
+GGUF_EMBEDDING_ENTRY(gguf_embed_mxfp4, GgufEmbedMXFP4)
+GGUF_EMBEDDING_ENTRY(gguf_embed_nvfp4, GgufEmbedNVFP4)
+GGUF_EMBEDDING_ENTRY(gguf_embed_bf16, GgufEmbedBF16)
+#define GGUF_EMBEDDING_AFFINE(B)                                                                \
+  GGUF_EMBEDDING_ENTRY(gguf_embed_af##B##g32, GgufEmbedAF##B##G32)                              \
+  GGUF_EMBEDDING_ENTRY(gguf_embed_af##B##g64, GgufEmbedAF##B##G64)                              \
+  GGUF_EMBEDDING_ENTRY(gguf_embed_af##B##g128, GgufEmbedAF##B##G128)
+GGUF_EMBEDDING_AFFINE(2) GGUF_EMBEDDING_AFFINE(3) GGUF_EMBEDDING_AFFINE(4) GGUF_EMBEDDING_AFFINE(5)
+GGUF_EMBEDDING_AFFINE(6) GGUF_EMBEDDING_AFFINE(8)
+#undef GGUF_EMBEDDING_AFFINE
 #undef GGUF_EMBEDDING_ENTRY
 
 // A verify step's input tokens, SPLASH_TARGET_VERIFY_ROWS per lane: the

@@ -913,6 +913,25 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(status.json, READY_STATUS)
         self.assertTrue(runtime.ready)
 
+    def test_release_weights_is_answered_by_the_correlated_status(self):
+        def handler(process, message):
+            if isinstance(message, wire.ReleaseRequestFrame):
+                answer_status(process, message)
+
+        factory = FakeFactory(handler)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, eager_start=True
+        )
+        self.addCleanup(runtime.close)
+        process = factory.processes[0]
+
+        status = runtime.release_weights(timeout=1.0)
+        sent = process.stdin.messages(wire.ReleaseRequestFrame)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(status.correlation_id, sent[0].correlation_id)
+        self.assertEqual(status.json, READY_STATUS)
+        self.assertEqual(process.stdin.messages(wire.StatusRequestFrame), [])
+
     @fast_liveness_probe
     def test_liveness_probe_fails_a_generation_whose_loop_stops_answering(self):
         alive = threading.Event()
@@ -1718,13 +1737,14 @@ class RuntimeTests(unittest.TestCase):
         self.addCleanup(runtime.close)
         active = runtime.submit(request(1))
         os.read(read_fd, 65536)  # Drain just the first complete request.
-        large = request(0, prompt_tokens=tuple(range(131072)), deadline=0.1)
+        # A loaded CI runner once took over 0.1 s to start the frame.
+        large = request(0, prompt_tokens=tuple(range(131072)), deadline=1.0)
         received = bytearray()
         with ThreadPoolExecutor(max_workers=1) as executor:
             writer = executor.submit(runtime.submit, large)
-            self.assertTrue(select.select([read_fd], [], [], 0.5)[0])
+            self.assertTrue(select.select([read_fd], [], [], 1.0)[0])
             # The frame has started; let its request deadline pass mid-frame.
-            time.sleep(0.3)
+            time.sleep(max(0.0, large.deadline - time.monotonic()) + 0.2)
             self.assertFalse(writer.done())
             while not writer.done():
                 if select.select([read_fd], [], [], 0.05)[0]:

@@ -14,8 +14,12 @@ HARNESS = r"""
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
-const script = fs.readFileSync(process.argv[1], 'utf8')
-  .match(/<script>([\s\S]*?)<\/script>/)[1];
+const path = require('node:path');
+const html = fs.readFileSync(process.argv[1], 'utf8');
+const scripts = [...html.matchAll(/<script(?: src="([^"]+)")?>([\s\S]*?)<\/script>/g)]
+  .map(([, src, script]) => src
+    ? fs.readFileSync(path.join(path.dirname(process.argv[1]), 'chat-assets', path.basename(src)), 'utf8')
+    : script);
 
 class Element {
   constructor(tag = 'div') {
@@ -25,14 +29,30 @@ class Element {
     this.style = {};
     this.options = [];
     this.children = [];
+    this.queries = {};
     this.scrollHeight = 40;
-    this.classList = {add() {}, remove() {}, toggle() {}};
+    const classes = new Set();
+    this.classList = {
+      add: name => classes.add(name),
+      remove: name => classes.delete(name),
+      contains: name => classes.has(name),
+      toggle(name, force = !classes.has(name)) {
+        if (force) classes.add(name); else classes.delete(name);
+        return force;
+      },
+    };
   }
   addEventListener(name, callback) { this.handlers[name] = callback; }
   append(...children) { this.children.push(...children); }
   replaceChildren(...children) { this.children = children; }
   remove() {} focus() {} setAttribute() {} removeAttribute() {}
-  querySelector() { return new Element(); }
+  querySelector(selector) {
+    const descendants = children => children.flatMap(child => [child, ...descendants(child.children)]);
+    const child = descendants(this.children).find(child => selector.startsWith('.')
+      ? (child.className || '').split(' ').includes(selector.slice(1))
+      : child.tagName.toLowerCase() === selector);
+    return child || (this.queries[selector] ||= new Element());
+  }
 }
 
 function createChat(storage = new Map(), writable = true, models = null,
@@ -41,10 +61,16 @@ function createChat(storage = new Map(), writable = true, models = null,
   const requests = [];
   const modelRequests = [];
   const reads = [];
+  const copied = [];
+  const timers = [];
+  const dialog = {accept: true, messages: []};
+  const clipboard = {writeText: async text => { copied.push(text); }};
   let scrolls = 0;
+  let scrollBehavior;
   for (const id of ['chat', 'form', 'input', 'attachments', 'image-input',
                    'attach', 'effort', 'api-key', 'send', 'recents', 'new-chat',
-                   'mobile-new', 'menu', 'scrim']) elements[id] = new Element();
+                   'mobile-new', 'menu', 'scrim', 'scroll-bottom', 'sidebar',
+                   'sidebar-close', 'sidebar-open']) elements[id] = new Element();
   elements.effort.options = ['', 'xhigh', 'medium', 'low', 'none'].map(value => ({value}));
   class FileReader {
     readAsDataURL(file) {
@@ -52,11 +78,15 @@ function createChat(storage = new Map(), writable = true, models = null,
       reads.push(this);
     }
   }
+  const handlers = {};
+  const viewport = {scrollHeight: 3000, clientHeight: 800};
   const context = vm.createContext({
     document: {
       querySelector: selector => elements[selector.slice(1)] || null,
       createElement: tag => new Element(tag),
       body: new Element(),
+      documentElement: viewport,
+      scrollingElement: viewport,
     },
     localStorage: {
       getItem: key => storage.get(key) ?? null,
@@ -65,7 +95,19 @@ function createChat(storage = new Map(), writable = true, models = null,
         storage.set(key, value);
       },
     },
-    scrollTo() { scrolls += 1; }, AbortController, TextDecoder, Uint8Array, console, FileReader,
+    scrollY: 2200, innerHeight: 800,
+    matchMedia: () => ({matches: false}),
+    addEventListener(name, callback) { handlers[name] = callback; },
+    scrollTo(options) {
+      scrolls += 1;
+      scrollBehavior = options.behavior;
+      context.scrollY = Math.min(options.top, viewport.scrollHeight - 800);
+    },
+    AbortController, TextDecoder, Uint8Array, console, FileReader,
+    navigator: {clipboard},
+    confirm(message) { dialog.messages.push(message); return dialog.accept; },
+    setTimeout: callback => { timers.push(callback); },
+    atob: value => Buffer.from(value, 'base64').toString('binary'),
     crypto,
     fetch(url, options) {
       if (url === '/v1/models') {
@@ -82,8 +124,14 @@ function createChat(storage = new Map(), writable = true, models = null,
       });
     },
   });
-  vm.runInContext(script, context);
-  return {elements, requests, reads, modelRequests, scrolls: () => scrolls};
+  context.window = context;
+  scripts.forEach(script => vm.runInContext(script, context));
+  return {elements, requests, reads, modelRequests, clipboard, copied, timers, dialog, scrolls: () => scrolls,
+    scrollBehavior: () => scrollBehavior,
+    scrollTo(y) { context.scrollY = y; handlers.scroll?.(); },
+    scrollEvent() { handlers.scroll?.(); },
+    grow() { viewport.scrollHeight += 200; },
+  };
 }
 
 const flush = () => new Promise(resolve => setImmediate(resolve));
@@ -213,7 +261,7 @@ for (const writable of [true, false]) {
   const chat = createChat(storage, writable);
   assert.equal(chat.elements.effort.value, 'low');
   assert.equal(chat.elements.recents.children.length, 1);
-  chat.elements.recents.children[0].handlers.click();
+  chat.elements.recents.children[0].querySelector('.recent-open').handlers.click();
   setText(chat, 'continue');
   submit(chat);
   assert.equal(chat.requests[0].body.messages[0].content, 'remembered message');
@@ -316,7 +364,7 @@ for (const writable of [true, false]) {
   assert.deepEqual(saved().map(conversation => conversation.title.split(' ')[0]), ['three', 'two']);
   // The open page keeps every chat with its images.
   assert.equal(chat.elements.recents.children.length, 7);
-  chat.elements.recents.children[4].handlers.click();
+  chat.elements.recents.children[4].querySelector('.recent-open').handlers.click();
   setText(chat, 'again');
   submit(chat);
   assert.deepEqual(chat.requests.at(-1).body.messages[0].content,
@@ -431,6 +479,257 @@ for (const [name, overrides, shouldSend] of [
   }
   assert.equal(scrolls[1], scrolls[0], 'chunks without text must not scroll the page');
 })().catch(error => { console.error(error); process.exitCode = 1; });
+""")
+
+    def test_markdown_renders_in_streams_and_saved_chats_without_changing_requests(
+        self,
+    ):
+        self.run_chat(r"""
+(async () => {
+  const storage = new Map();
+  const chat = createChat(storage);
+  const source = '# Title\n\n**bold** and `inline`\n\n- one\n- two\n\n' +
+    '| A | B |\n| --- | --- |\n| 1 | 2 |\n\n' +
+    '```python\ndef greet():\n    return "你好"\n```';
+  setText(chat, 'show code');
+  submit(chat);
+  const event = 'data: ' + JSON.stringify({choices: [{delta: {content: source}}]}) + '\n\n';
+  respond(chat.requests[0], event + 'data: [DONE]\n\n');
+  await flush();
+  const rendered = chat.elements.chat.children.at(-1).querySelector('.content').innerHTML;
+  assert.match(rendered, /<h1>Title<\/h1>/);
+  assert.match(rendered, /<strong>bold<\/strong>/);
+  assert.match(rendered, /<code>inline<\/code>/);
+  assert.match(rendered, /<li>one<\/li>/);
+  assert.match(rendered, /<table>/);
+  assert.match(rendered, /hljs-keyword/);
+  assert.match(rendered, /你好/);
+  chat.elements.recents.children[0].querySelector('.recent-open').handlers.click();
+  assert.equal(chat.elements.chat.children.at(-1).querySelector('.content').innerHTML, rendered);
+  setText(chat, 'next');
+  submit(chat);
+  assert.equal(chat.requests[1].body.messages[1].content, source);
+  succeed(chat.requests[1]);
+  await flush();
+})().catch(error => { console.error(error); process.exitCode = 1; });
+""")
+
+    def test_markdown_handles_partial_fences_unknown_languages_and_unsafe_html(self):
+        self.run_chat(r"""
+(async () => {
+  const chat = createChat();
+  setText(chat, 'show code');
+  submit(chat);
+  let deliver;
+  chat.requests[0].resolve({ok: true, body: {getReader: () => ({
+    read: () => new Promise(resolve => { deliver = resolve; }),
+  })}});
+  await flush();
+  async function chunk(delta) {
+    deliver({done: false, value: Buffer.from('data: ' + JSON.stringify({choices: [{delta}]}) + '\n\n')});
+    await flush();
+  }
+  await chunk({content: '```python\ndef greet():\n    return "你好"'});
+  let content = chat.elements.chat.children.at(-1).querySelector('.content');
+  assert.match(content.innerHTML, /hljs-keyword/);
+  await chunk({content: '\n```\n\n```unknown-lang\n<b>literal</b>\n```\n\n' +
+    '<img src=x onerror=alert(1)>\n\n[bad](javascript:alert(1))\n\n[good](https://example.com)\n\n' +
+    '![x](https://example.com/a.png)'});
+  assert.match(content.innerHTML, /&lt;b&gt;literal&lt;\/b&gt;/);
+  assert.doesNotMatch(content.innerHTML, /href="javascript:/);
+  assert.doesNotMatch(content.innerHTML, /<img/, 'a reply must not load images');
+  assert.match(content.innerHTML, /href="https:\/\/example.com" target="_blank" rel="noopener noreferrer"/,
+    'a link must open in a new tab');
+  const reasoning = '**thinking**\n\n```python\ndef think():\n    return 1\n```';
+  await chunk({reasoning_content: reasoning});
+  assert.equal(chat.elements.chat.children.at(-1).querySelector('details')
+    .querySelector('.reasoning').textContent, reasoning);
+  deliver({done: false, value: Buffer.from('data: [DONE]\n\n')});
+  await flush();
+  deliver({done: true});
+  await flush();
+  chat.elements.recents.children[0].querySelector('.recent-open').handlers.click();
+  assert.equal(chat.elements.chat.children.at(-1).querySelector('details')
+    .querySelector('.reasoning').textContent, reasoning);
+})().catch(error => { console.error(error); process.exitCode = 1; });
+""")
+
+    def test_stream_follows_at_bottom_and_pauses_while_reading_earlier_messages(self):
+        self.run_chat(r"""
+(async () => {
+  const chat = createChat();
+  setText(chat, 'prompt');
+  submit(chat);
+  let deliver;
+  chat.requests[0].resolve({ok: true, body: {getReader: () => ({
+    read: () => new Promise(resolve => { deliver = resolve; }),
+  })}});
+  await flush();
+  async function chunk(delta) {
+    chat.grow();
+    deliver({done: false, value: Buffer.from('data: ' + JSON.stringify({choices: [{delta}]}) + '\n\n')});
+    await flush();
+  }
+  let before = chat.scrolls();
+  await chunk({content: 'first'});
+  assert.equal(chat.scrolls(), before + 1, 'output follows the response after sending');
+  assert.equal(chat.elements['scroll-bottom'].hidden, true);
+  chat.scrollEvent();
+  before = chat.scrolls();
+  await chunk({content: ' second'});
+  assert.equal(chat.scrolls(), before + 1, 'programmatic scroll events must not disable following');
+  chat.scrollTo(400);
+  before = chat.scrolls();
+  await chunk({content: ' more'});
+  const reasoning = chat.elements.chat.children.at(-1).querySelector('details').querySelector('.reasoning');
+  Object.assign(reasoning, {scrollHeight: 900, clientHeight: 300, scrollTop: 600});
+  await chunk({reasoning_content: 'reasoning'});
+  assert.equal(reasoning.scrollTop, 900, 'Thinking at its bottom must follow new text');
+  reasoning.scrollTop = 100;
+  await chunk({reasoning_content: ' more'});
+  assert.equal(reasoning.scrollTop, 100, 'Thinking must not pull a reader down from earlier text');
+  assert.equal(chat.scrolls(), before, 'content and reasoning must not pull a reader down');
+  assert.equal(chat.elements['scroll-bottom'].hidden, false);
+  before = chat.scrolls();
+  chat.elements['scroll-bottom'].handlers.click();
+  assert.equal(chat.scrollBehavior(), 'instant', 'a jump during a reply must not animate');
+  reasoning.scrollTop = 30;
+  // The chunk arrives before the jump's scroll event.
+  await chunk({content: ' latest'});
+  assert.equal(reasoning.scrollTop, 30, 'reply text must not scroll the Thinking area');
+  assert.equal(chat.scrolls(), before + 2, 'a jump to the latest reply resumes following');
+  chat.scrollEvent();
+  assert.equal(chat.elements['scroll-bottom'].hidden, true);
+  chat.scrollTo(400);
+  chat.scrollTo(100000);
+  before = chat.scrolls();
+  await chunk({content: ' tail'});
+  assert.equal(chat.scrolls(), before + 1, 'manual scrolling back to the bottom resumes following');
+  before = chat.scrolls();
+  chat.elements.chat.handlers.load();
+  assert.equal(chat.scrolls(), before + 1, 'image loading follows again after returning to the bottom');
+  chat.scrollTo(400);
+  before = chat.scrolls();
+  deliver({done: false, value: Buffer.from('data: [DONE]\n\n')});
+  await flush();
+  deliver({done: true});
+  await flush();
+  assert.equal(chat.scrolls(), before, 'finishing must also preserve the reading position');
+  setText(chat, 'next prompt');
+  before = chat.scrolls();
+  submit(chat);
+  assert.equal(chat.scrolls(), before + 1, 'every new send must jump to the bottom');
+  chat.requests[1].resolve({ok: true, body: {getReader: () => ({
+    read: () => new Promise(resolve => { deliver = resolve; }),
+  })}});
+  await flush();
+  before = chat.scrolls();
+  await chunk({content: 'next answer'});
+  assert.equal(chat.scrolls(), before + 1, 'the next response resumes following');
+  chat.scrollEvent();
+  before = chat.scrolls();
+  chat.grow();
+  chat.elements.chat.handlers.load();
+  assert.equal(chat.scrolls(), before + 1, 'image loading must follow while enabled');
+  chat.scrollTo(400);
+  before = chat.scrolls();
+  await chunk({content: ' later'});
+  assert.equal(chat.scrolls(), before, 'leaving the bottom stops following again');
+})().catch(error => { console.error(error); process.exitCode = 1; });
+""")
+
+    def test_reply_copy_uses_latest_raw_markdown_and_survives_history_reload(self):
+        self.run_chat(r"""
+(async () => {
+  const storage = new Map();
+  const chat = createChat(storage);
+  setText(chat, 'show code');
+  submit(chat);
+  const box = chat.elements.chat.children.at(-1);
+  const copy = box.querySelector('.copy-markdown');
+  assert.equal(typeof copy.handlers.click, 'function', 'reply needs a Markdown copy button');
+  assert.equal(copy.hidden, true, 'an empty reply cannot be copied');
+  let deliver;
+  chat.requests[0].resolve({ok: true, body: {getReader: () => ({
+    read: () => new Promise(resolve => { deliver = resolve; }),
+  })}});
+  await flush();
+  async function chunk(delta) {
+    deliver({done: false, value: Buffer.from('data: ' + JSON.stringify({choices: [{delta}]}) + '\n\n')});
+    await flush();
+  }
+  await chunk({reasoning_content: 'Private thinking', content: '\n\n# Title\n\n'});
+  assert.equal(copy.hidden, false);
+  await copy.handlers.click();
+  assert.equal(chat.copied.at(-1), '\n\n# Title\n\n');
+  await chunk({content: '```python\nreturn "<value>"\n```\n\n'});
+  await copy.handlers.click();
+  const source = '\n\n# Title\n\n```python\nreturn "<value>"\n```\n\n';
+  assert.equal(chat.copied.at(-1), source, 'copy must preserve fences and surrounding whitespace');
+  deliver({done: false, value: Buffer.from('data: [DONE]\n\n')});
+  await flush();
+  deliver({done: true});
+  await flush();
+  const fresh = createChat(storage);
+  fresh.elements.recents.children[0].querySelector('.recent-open').handlers.click();
+  await fresh.elements.chat.children.at(-1).querySelector('.copy-markdown').handlers.click();
+  assert.equal(fresh.copied.at(-1), source, 'history must copy Markdown, excluding Thinking');
+})().catch(error => { console.error(error); process.exitCode = 1; });
+""")
+
+    def test_copy_failure_is_reported_without_breaking_the_reply(self):
+        self.run_chat(r"""
+(async () => {
+  const chat = createChat();
+  setText(chat, 'prompt');
+  submit(chat);
+  succeed(chat.requests[0]);
+  await flush();
+  const box = chat.elements.chat.children.at(-1);
+  const copy = box.querySelector('.copy-markdown');
+  assert.equal(typeof copy.handlers.click, 'function', 'reply needs a Markdown copy button');
+  chat.clipboard.writeText = async () => { throw new Error('Denied'); };
+  await copy.handlers.click();
+  assert.match(copy.title, /failed/i);
+  assert.match(box.querySelector('.content').innerHTML, /answer/);
+  chat.timers.forEach(callback => callback());
+  assert.match(copy.title, /copy/i);
+})().catch(error => { console.error(error); process.exitCode = 1; });
+""")
+
+    def test_deleting_chats_preserves_other_history_and_resets_the_active_chat(self):
+        self.run_chat(r"""
+const storage = new Map([['splash-chats', JSON.stringify([
+  {id:'first', title:'First', updated:2, messages:[{role:'user', content:'first prompt'}]},
+  {id:'second', title:'Second', updated:1, messages:[{role:'user', content:'second prompt'}]},
+])]]);
+const chat = createChat(storage);
+const first = chat.elements.recents.children[0];
+const remove = first.querySelector('.recent-delete');
+assert.equal(typeof remove.handlers.click, 'function', 'recent chat needs a delete button');
+first.querySelector('.recent-open').handlers.click();
+const content = chat.elements.chat.children[0].querySelector('.user-text').textContent;
+const saved = storage.get('splash-chats');
+chat.dialog.accept = false;
+remove.handlers.click();
+assert.equal(storage.get('splash-chats'), saved, 'cancelling deletion must preserve saved history');
+assert.equal(chat.elements.recents.children.length, 2);
+assert.equal(chat.elements.chat.children[0].querySelector('.user-text').textContent, content,
+  'cancelling deletion must preserve the active conversation');
+assert.match(chat.dialog.messages.at(-1), /First/, 'confirmation must identify the selected chat');
+chat.dialog.accept = true;
+chat.elements.recents.children[1].querySelector('.recent-delete').handlers.click();
+assert.match(chat.dialog.messages.at(-1), /Second/);
+assert.equal(chat.elements.chat.children[0].querySelector('.user-text').textContent, content,
+  'deleting another chat must preserve the active conversation');
+assert.deepEqual(JSON.parse(storage.get('splash-chats')).map(chat => chat.id), ['first']);
+chat.elements.recents.children[0].querySelector('.recent-delete').handlers.click();
+assert.deepEqual(JSON.parse(storage.get('splash-chats')), []);
+assert.equal(chat.elements.recents.children.length, 0);
+assert.equal(chat.elements.chat.children[0].id, 'empty');
+setText(chat, 'new prompt');
+submit(chat);
+assert.deepEqual(chat.requests[0].body.messages, [{role:'user', content:'new prompt'}]);
 """)
 
     def test_loading_image_blocks_send_and_enter_until_ready(self):
@@ -569,7 +868,7 @@ for (const [name, overrides, shouldSend] of [
       await flush();
       const reading = pasteImage(chat, 'old-chat');
       if (navigation === 'new chat') chat.elements['new-chat'].handlers.click();
-      else chat.elements.recents.children[0].handlers.click();
+      else chat.elements.recents.children[0].querySelector('.recent-open').handlers.click();
       assert.equal(chat.elements.attachments.children.length, 0);
       const next = pasteImage(chat, 'new-chat');
       if (outcome === 'load') reading.onload();

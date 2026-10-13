@@ -49,6 +49,16 @@ public:
                               payloads_.back().data(), sizeof(Params)});
   }
 
+  // A dispatch of the grid in `grid`, which an earlier dispatch writes
+  // within `groups` (ComputeDispatch::indirectThreadgroups).
+  template <class Params>
+  void add(std::string pipeline, std::vector<MetalBuffer> buffers,
+           const Params &params, DispatchSize groups, IndirectGrid grid,
+           DispatchSize threads) {
+    add(std::move(pipeline), std::move(buffers), params, groups, threads);
+    dispatches_.back().indirectThreadgroups = std::move(grid);
+  }
+
   // Event steps after the dispatches added so far (EventStep): signal once
   // all earlier work has completed, or hold all later work until the event
   // reaches value.

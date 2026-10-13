@@ -1,5 +1,6 @@
 #pragma once
 
+#include "TestAdmission.hpp"
 #include "TestChecks.hpp"
 #include "engine/Engine.hpp"
 #include "model/WeightMemory.hpp"
@@ -26,25 +27,28 @@ namespace splash::test {
   return config;
 }
 
-// The weights of a native loop under test: three images that count what the
-// loop does with them.
+// The weights of a native loop under test: three images of a gibibyte that
+// count what the loop does with them, each restored under the admission the
+// loop passes.
 class Weights final : public model::WeightMemory {
 public:
   static constexpr uint32_t kImages = 3;
+  static constexpr uint64_t kImageBytes = 1ULL << 30;
   [[nodiscard]] bool released() const noexcept override {
     return restored_ < kImages;
   }
-  void release() override {
-    require(!released(), "weights were released twice");
-    restored_ = 0;
-  }
-  bool restore() override {
+  void release() override { restored_ = 0; }
+  bool restore(const metal::AllocationAdmission &admit) override {
     if (failRestore)
       throw std::runtime_error("weights restore test");
     require(released(), "held weights were restored");
+    if (const metal::AllocationResult admitted = admit(kImageBytes, [] {}); !admitted)
+      throw metal::MetalAllocationError("weights restore test refused", admitted.failure);
     ++restores;
     return ++restored_ == kImages;
   }
+  // The images in memory.
+  [[nodiscard]] uint32_t held() const noexcept { return restored_; }
   bool failRestore = false;
   // The images written back.
   uint32_t restores = 0;

@@ -9,11 +9,6 @@
 namespace splash::engine {
 namespace {
 
-// A request refused memory retries at once when the engine frees some
-// (signalResourceProgress). Memory that comes back without that, as the
-// host's does, it finds by retrying this often: at most a tenth of a second
-// later, without spinning the loop on attempts.
-constexpr double kResourceRetryBackoffMilliseconds = 100.0;
 // While a command is in flight the loop wakes at least this often to run the
 // command watchdog (Model::checkHealth), so a command the backend gives up on
 // fails the engine within a second of its timeout, as a ticket's own wait
@@ -26,25 +21,10 @@ constexpr int kMaskWaitLimitMilliseconds = 5000;
 // draft-context rows; a later request must save at least that much prefill.
 constexpr uint32_t kMinimumJunctionGain = model::ExecutionLimits::draftContextTokens;
 
-// While an active one lives, allocations are memory a request in service
-// needs (EngineConfig::serving).
-class Serving final {
-public:
-  Serving(const std::function<void(bool)> &mark, bool active)
-      : mark_(active ? &mark : nullptr) {
-    if (mark_)
-      (*mark_)(true);
-  }
-  ~Serving() {
-    if (mark_)
-      (*mark_)(false);
-  }
-  Serving(const Serving &) = delete;
-  Serving &operator=(const Serving &) = delete;
-
-private:
-  const std::function<void(bool)> *mark_;
-};
+// What the request's KV blocks are cached under beside its tokens.
+PromptIdentity promptIdentity(const EngineRequest &request) noexcept {
+  return {request.images, request.cacheSalt};
+}
 
 // A refusal for memory, which reclaim or the host's recovery may end.
 bool memoryDenied(const StateAdmission &admission) noexcept {
@@ -69,6 +49,13 @@ std::string pageShortfall(const TokenAdmission &admission) {
 }
 
 } // namespace
+
+std::string resourceTimeoutMessage(metal::AllocationFailure failure) {
+  std::string message = "memory did not become available within the resource wait limit";
+  if (failure == metal::AllocationFailure::HostPressure)
+    message += ": macOS is short of memory; close memory-heavy applications";
+  return message;
+}
 
 Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
                EngineEventSink &events)
@@ -96,6 +83,10 @@ void Engine::submit(EngineRequest value) {
   if (std::any_of(value.scoreTokens.begin(), value.scoreTokens.end(),
                   outOfVocabulary)) {
     throw std::invalid_argument("score token is out of vocabulary");
+  }
+  if (value.thinkingBudget && (outOfVocabulary(value.thinkingBudget->end) ||
+                               outOfVocabulary(value.thinkingBudget->alsoEnds))) {
+    throw std::invalid_argument("thinking end token is out of vocabulary");
   }
   if (!value.images.empty() && !config_.maxImagePatches) {
     throw std::invalid_argument("this model is serving without vision");
@@ -225,10 +216,8 @@ bool Engine::tick(double now) {
       active.resourceWait.earlierLaneWorkMilliseconds = now;
     const double deadline = resourceDeadline(active);
     if (!active.finalized && deadline > 0.0 && now >= deadline) {
-      std::string message = "memory did not become available within the resource wait limit";
-      if (active.resourceWait.allocationFailure == metal::AllocationFailure::HostPressure)
-        message += ": macOS is short of memory; close memory-heavy applications";
-      settle(active, {LaneOutcome::ResourceTimeout, std::move(message)});
+      settle(active, {LaneOutcome::ResourceTimeout,
+                      resourceTimeoutMessage(active.resourceWait.allocationFailure)});
       progressed = true;
     }
   }
@@ -288,6 +277,15 @@ bool Engine::tick(double now) {
         throw std::logic_error("model returned an empty command ticket");
       }
       scheduler_.commit(*plan, excluded);
+      // The command reads the cached pages its lanes' blocks were swapped
+      // for. Selecting a constrained request's first token reads none, but
+      // the cycle after it does; only a first token that stops the request
+      // counts pages nothing read.
+      for (const BatchItem &item : plan->items) {
+        Request &lane = request(item.requestId);
+        lane.deduplicatedKvTokens += lane.unreadDeduplicatedKvTokens;
+        counters_.deduplicatedKvTokens += std::exchange(lane.unreadDeduplicatedKvTokens, 0);
+      }
       pending_ = Pending{std::move(*plan), std::move(ticket),
                          busySinceMilliseconds_.value_or(now)};
       return true;
@@ -388,6 +386,20 @@ EngineSnapshot Engine::snapshot() const {
   result.scheduler = scheduler_.snapshot();
   result.resources = cache_.snapshot();
   result.writeBehind = writeBehind_.snapshot();
+  for (const auto &[id, active] : requests_) {
+    if (active.finalized)
+      continue;
+    result.activeRequests.push_back(
+        {.id = id,
+         .phase = scheduler_.phase(id),
+         .priority = active.request.priority,
+         .promptTokens = active.promptTokens,
+         .promptProcessed =
+             std::min(scheduler_.promptProcessed(id), active.promptTokens),
+         .generatedTokens = generatedTokens(active),
+         .maxNewTokens = active.request.maxNewTokens});
+  }
+  std::ranges::sort(result.activeRequests, {}, &ActiveRequestSnapshot::id);
   return result;
 }
 
@@ -466,9 +478,9 @@ bool Engine::admitQueued(double now) {
     if (active.skipCache)
       return 0;
     if (active.admissionProbe)
-      cache_.refresh(*active.admissionProbe, active.exactTokens, active.request.images);
+      cache_.refresh(*active.admissionProbe, active.exactTokens, promptIdentity(active.request));
     else
-      active.admissionProbe = cache_.probe(active.exactTokens, active.request.images);
+      active.admissionProbe = cache_.probe(active.exactTokens, promptIdentity(active.request));
     return active.admissionProbe->cachedTokens();
   };
   // A request starts only in a free lane. While every lane is resident,
@@ -612,6 +624,9 @@ uint32_t Engine::promptReplayBoundary(const Request &active) noexcept {
 
 uint32_t Engine::sharedPrefillBoundary(const Request &left,
                                        const Request &right) {
+  // Requests of different cache salts share no block.
+  if (left.request.cacheSalt != right.request.cacheSalt)
+    return 0;
   const auto a = std::span<const uint32_t>(left.exactTokens).first(left.promptTokens);
   const auto b = std::span<const uint32_t>(right.exactTokens).first(right.promptTokens);
   const auto end = std::mismatch(a.begin(), a.end(), b.begin(), b.end()).first;
@@ -671,7 +686,7 @@ bool Engine::admit(Request &active, double now) {
   CacheLookup lookup =
       active.skipCache
           ? CacheLookup{}
-          : cache_.lookup(modelRequest.prompt, active.request.images,
+          : cache_.lookup(modelRequest.prompt, promptIdentity(active.request),
                           active.admissionProbe ? &*active.admissionProbe
                                                 : nullptr);
   // Only unstarted requests wait for a resident producer. Recheck planned
@@ -730,7 +745,7 @@ bool Engine::admit(Request &active, double now) {
   active.lane = *state.admission.lane;
   active.admission = ++admissions_;
   if (droppedLease)
-    lookup = cache_.lookup(modelRequest.prompt, active.request.images);
+    lookup = cache_.lookup(modelRequest.prompt, promptIdentity(active.request));
   const uint32_t resumeBoundary = lookup.resumeBoundary();
   const uint64_t requestId = active.request.id;
   // The matched chain first, then the first work's pages for a lane that
@@ -744,9 +759,14 @@ bool Engine::admit(Request &active, double now) {
       lookup.state && (!lookup.state->state()->residentBytes() ||
                        cache_.kvRestoreStatus(requestId) == KvRestoreStatus::Pending);
   if (kv.admission.granted() && (resuming || restoring)) {
+    // A lane that resumes holds the chain it restored and takes new pages
+    // past it, which its replay writes in chunks that may end inside any
+    // of them: they all come cleared.
     const uint64_t workEnd =
         resuming ? active.resumeKvTargetTokens : uint64_t{resumeBoundary} + 1;
-    kv = allocate([&] { return cache_.ensureTokens(requestId, workEnd); }, inService, upTo);
+    const uint64_t written = resuming ? uint64_t{resumeBoundary} : workEnd;
+    kv = allocate([&] { return cache_.ensureTokens(requestId, workEnd, written); }, inService,
+                  upTo);
   }
   if (!kv.admission.granted()) {
     // The host continuation survives this failed admission. No recurrent
@@ -795,10 +815,14 @@ void Engine::completeAdmission(Request &active, CacheLookup &lookup,
   active.skipCache = false;
   active.admissionProbe.reset();
   const uint32_t resumeBoundary = lookup.resumeBoundary();
+  // The restored chain is the request's from the start of this residency.
+  active.publishedTokens = std::max(active.publishedTokens, resumeBoundary);
   if (resuming)
     scheduler_.resumeFromResources(active.request.id, resumeBoundary, active.replayTokens);
   active.latestCheckpoint = {};
+  active.unprovenState.reset();
   if (lookup.state) {
+    active.unprovenState = lookup.state->kvBlock();
     active.latestCheckpoint = cache_.checkpointState(lookup.state->kvBlock());
     // A restored replay point of the prompt already has the ordinary state
     // we need, in whichever tier holds it: a promotion that found no cache
@@ -1040,6 +1064,17 @@ bool Engine::retireCheckpoint(Request &active) {
   return true;
 }
 
+void Engine::publishCommittedBlocks(Request &active, uint32_t committedTokens) {
+  // A replay after a suspension finds the blocks the request published
+  // before as its own; only those past them can be another request's.
+  const uint32_t replayed = std::min(committedTokens, active.publishedTokens);
+  cache_.publishCommittedBlocks(active.request.id, active.exactTokens, replayed,
+                                promptIdentity(active.request));
+  active.unreadDeduplicatedKvTokens += cache_.publishCommittedBlocks(
+      active.request.id, active.exactTokens, committedTokens, promptIdentity(active.request));
+  active.publishedTokens = std::max(active.publishedTokens, committedTokens);
+}
+
 void Engine::publishReachedStateBoundaries(Request &active,
                                            uint32_t promptProcessed, double now) {
   bool materialized = false;
@@ -1268,6 +1303,11 @@ uint64_t Engine::completedTokens(const Request &active) const {
              : active.exactTokens.size();
 }
 
+uint32_t Engine::generatedTokens(const Request &active) noexcept {
+  return static_cast<uint32_t>(active.exactTokens.size() - active.promptTokens) +
+         (active.sentFirstToken ? 1 : 0);
+}
+
 bool Engine::yieldsBefore(const Request &a, const Request &b) const {
   if (a.request.priority != b.request.priority)
     return a.request.priority > b.request.priority;
@@ -1422,10 +1462,11 @@ bool Engine::reclaimIdleState(bool keepLane) noexcept {
 
 // While growth is paused a lane short of state buffers takes a cached
 // state's, as a request short of pages takes idle cached pages below:
-// evicting the state returns its cell and ring to the pool the lane draws
-// from, and nothing is allocated. A state goes only when those in RAM cover
-// what the pool lacks; otherwise the cache survives, and the request grows
-// if it is in service and waits if it is not.
+// evicting the state returns its cell and context window to the pool the
+// lane draws from, and nothing is allocated. A state goes only when those in
+// RAM cover what the pool lacks, which they never do for the draft rings no
+// cached state holds; otherwise the cache survives, and the request grows if
+// it is in service and waits if it is not.
 CacheReclaimResult Engine::reuseCachedStateWhilePaused(ReclaimClass upTo) {
   if (reclaimIdleState(true))
     return {true, 0};
@@ -1579,25 +1620,28 @@ void Engine::apply(const BatchPlan &plan,
       throw std::logic_error("model result order changed");
     }
     Request &active = request(result.requestId);
-    if (!result.failure.empty() && !active.pendingEnd) {
-      // The model rejected this lane's own numerical result. An earlier
-      // cancellation or deadline of the same lane still stands.
-      active.pendingEnd = LaneEnd{LaneOutcome::ModelResultInvalid, result.failure};
-    }
-    if (!active.pendingEnd) {
+    // The model rejected this lane's own numerical result. A model that
+    // accepts more draft tokens than it drafted, or emits a token outside the
+    // vocabulary, without reporting it fails the lane the same way (the Qwen
+    // runtime reports its non-finite rows itself).
+    std::string invalid = result.failure;
+    if (invalid.empty() && result.acceptedDraftTokens > result.draftedTokens)
+      invalid = "model accepted more tokens than it drafted";
+    if (invalid.empty()) {
       const auto outOfVocabulary = std::find_if(
           result.outputTokens.begin(), result.outputTokens.end(),
           [&](uint32_t token) { return token >= config_.vocabularySize; });
-      if (outOfVocabulary != result.outputTokens.end()) {
-        // A model that emits a token outside the vocabulary without reporting
-        // it fails this lane the same way (the Qwen runtime reports its
-        // non-finite rows itself).
-        active.pendingEnd =
-            LaneEnd{LaneOutcome::ModelResultInvalid,
-                    "model emitted out-of-vocabulary token " +
-                        std::to_string(*outOfVocabulary)};
-      }
+      if (outOfVocabulary != result.outputTokens.end())
+        invalid = "model emitted out-of-vocabulary token " + std::to_string(*outOfVocabulary);
     }
+    // A damaged state is one way to such a result: the state the request
+    // restored goes, unless an earlier step computed from it was finite.
+    if (!invalid.empty() && active.unprovenState)
+      cache_.invalidateState(*active.unprovenState);
+    active.unprovenState.reset();
+    // An earlier cancellation or deadline of the same lane still stands.
+    if (!invalid.empty() && !active.pendingEnd)
+      active.pendingEnd = LaneEnd{LaneOutcome::ModelResultInvalid, std::move(invalid)};
     if (active.pendingEnd) {
       // An in-flight Metal command cannot be revoked safely. Its provisional
       // writes remain invisible, but a cancelled, deadline-expired or
@@ -1619,8 +1663,7 @@ void Engine::apply(const BatchPlan &plan,
         counters_.resourceReplayTokens += result.consumedPromptTokens;
       if (promptProcessed == active.replayTokens)
         active.replaying = false;
-      cache_.publishCommittedBlocks(active.request.id, active.exactTokens,
-                                    promptProcessed, active.request.images);
+      publishCommittedBlocks(active, promptProcessed);
       publishReachedStateBoundaries(active, promptProcessed, now);
       // Recovery may replay an already reported prefix, including generated
       // history.
@@ -1636,18 +1679,36 @@ void Engine::apply(const BatchPlan &plan,
                                 result.outputTokens.begin(),
                                 result.outputTokens.end());
       outputTokens += static_cast<uint32_t>(result.outputTokens.size());
-      events_.tokens(active.request.id, result.outputTokens);
+      std::span<const uint32_t> unsent = result.outputTokens;
+      if (active.sentFirstToken) {
+        if (unsent.front() != *active.sentFirstToken)
+          throw std::logic_error(
+              "model committed another first token than the one sent");
+        unsent = unsent.subspan(1);
+        active.sentFirstToken.reset();
+      }
+      if (!unsent.empty())
+        events_.tokens(active.request.id, unsent);
+    }
+    if (result.firstToken) {
+      if (active.sentFirstToken || !result.outputTokens.empty())
+        throw std::logic_error(
+            "model reported a first token twice or beside output");
+      active.sentFirstToken = result.firstToken;
+      events_.tokens(active.request.id, {&*result.firstToken, 1});
     }
     if (plan.kind == WorkKind::Decode) {
       draftedTokens += result.draftedTokens;
       acceptedDraftTokens += result.acceptedDraftTokens;
+      active.speculation.draftedTokens += result.draftedTokens;
+      active.speculation.acceptedDraftTokens += result.acceptedDraftTokens;
+      active.speculation.cycles += result.draftedTokens != 0;
       // A terminal anchor is emitted without a target KV row; it never enters
       // a cached block.
       const uint32_t storedTokens =
           static_cast<uint32_t>(active.exactTokens.size()) -
           result.outputTokensWithoutKv;
-      cache_.publishCommittedBlocks(active.request.id, active.exactTokens,
-                                    storedTokens, active.request.images);
+      publishCommittedBlocks(active, storedTokens);
     }
     const uint64_t completionTokens =
         active.exactTokens.size() - active.promptTokens;
@@ -1748,10 +1809,10 @@ void Engine::finish(Request &active, EngineFinishReason reason,
     scheduler_.cancel(active.request.id);
   }
   active.finalized = true;
-  const auto completionTokens =
-      static_cast<uint32_t>(active.exactTokens.size() - active.promptTokens);
+  const uint32_t completionTokens = generatedTokens(active);
   events_.completed(active.request.id, reason, active.promptTokens,
-                    completionTokens, optionLogits);
+                    completionTokens, active.deduplicatedKvTokens, optionLogits,
+                    active.speculation);
   if (reason == EngineFinishReason::Cancelled) {
     ++counters_.cancelled;
   } else {

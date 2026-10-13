@@ -6,12 +6,12 @@
 // 16-byte vectors and leaves shards with only a few tokens, and one wider
 // than a single register chunk per thread. The logits are fp32, and their
 // order is decided below the bf16 spacing.
+#include "LinearNumerics.hpp"
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/Sampling.h"
 #include "ops/DraftSelector.hpp"
-#include "tuning/LinearNumerics.hpp"
 
 #import <Foundation/Foundation.h>
 
@@ -34,6 +34,8 @@ using splash::metal::CommandGraph;
 using splash::metal::MetalBackend;
 using splash::metal::MetalBuffer;
 using namespace splash::ops;
+using splash::test::bf16ToFloat;
+using splash::test::floatToBf16;
 
 constexpr uint32_t kRows = SPLASH_DRAFT_QUERY_ROWS;
 constexpr uint32_t kPositions = SPLASH_DRAFT_PROPOSAL_TOKENS;
@@ -72,7 +74,7 @@ MetalBuffer randomBfloat(MetalBackend &backend, uint64_t count, Random &random,
   MetalBuffer buffer = allocate(backend, count * sizeof(uint16_t));
   auto *values = static_cast<uint16_t *>(buffer.contents());
   for (uint64_t index = 0; index < count; ++index)
-    values[index] = tuning::floatToBf16(random.unit() * scale);
+    values[index] = floatToBf16(random.unit() * scale);
   return buffer;
 }
 
@@ -218,9 +220,9 @@ void runCase(MetalBackend &backend, const Case &c) {
             std::min(candidates[global * kCandidates + rank], c.vocabulary - 1);
         double edge = 0.0;
         for (uint32_t dim = 0; dim < kRank; ++dim) {
-          edge += double(tuning::bf16ToFloat(predecessors[uint64_t{predecessor} * kRank + dim])) *
-                  tuning::bf16ToFloat(hidden[(uint64_t{lane} * kRows + position + 1) * kRank + dim]) *
-                  tuning::bf16ToFloat(successors[uint64_t{candidate} * kRank + dim]);
+          edge += double(bf16ToFloat(predecessors[uint64_t{predecessor} * kRank + dim])) *
+                  bf16ToFloat(hidden[(uint64_t{lane} * kRows + position + 1) * kRank + dim]) *
+                  bf16ToFloat(successors[uint64_t{candidate} * kRank + dim]);
         }
         scores[rank] = double(unary[global * kCandidates + rank]) + edge;
       }

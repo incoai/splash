@@ -97,6 +97,7 @@ PROMETHEUS_SERIES = {
     "splash_cache_hits_total": ("cache", "hits"),
     "splash_cache_cold_misses_total": ("cache", "cold_misses"),
     "splash_cache_reused_tokens_total": ("cache", "reused_tokens"),
+    "splash_cache_deduplicated_kv_tokens_total": ("cache", "deduplicated_kv_tokens"),
     "splash_cache_lazy_junctions_total": ("cache", "lazy_junctions"),
     "splash_target_prefill_rows_total": (
         "draft_context",
@@ -205,6 +206,11 @@ def prometheus_metrics(status):
         lines.append(
             f'splash_memory_pressure{{state="{state}"}} {1 if pressure == state else 0}'
         )
+    thermal = status.get("thermal_state")
+    for state in ("nominal", "fair", "serious", "critical"):
+        lines.append(
+            f'splash_thermal_state{{state="{state}"}} {1 if thermal == state else 0}'
+        )
     for name, path in PROMETHEUS_SERIES.items():
         metric_value = value(path)
         if metric_value is not None:
@@ -233,7 +239,7 @@ def timings_dict(result):
     latency = result.metrics["request_latency"]
     prompt_ms = latency.get("start_to_first_token_ms", 0.0)
     prompt_rate = result.prefill_tokens * 1000.0 / prompt_ms if prompt_ms else 0.0
-    return {
+    timings = {
         "prompt_n": result.prompt_tokens,
         "prompt_ms": prompt_ms,
         "prompt_per_second": prompt_rate if math.isfinite(prompt_rate) else 0.0,
@@ -242,6 +248,12 @@ def timings_dict(result):
         "predicted_per_second": latency.get("stream_tokens_per_second", 0.0),
         "cache_n": result.cache.matched_tokens,
     }
+    if result.drafted_tokens:
+        timings.update(
+            draft_n=result.drafted_tokens,
+            draft_n_accepted=result.accepted_draft_tokens,
+        )
+    return timings
 
 
 def metrics_dict(result):
@@ -284,6 +296,7 @@ def metrics_dict(result):
     cache = {
         "status": cache_info.status,
         "matched_tokens": cache_info.matched_tokens,
+        "deduplicated_tokens": cache_info.deduplicated_tokens,
         "lane": cache_info.lane if cache_info.lane >= 0 else None,
     }
     metrics = {
@@ -294,4 +307,10 @@ def metrics_dict(result):
         "request_latency": latency,
         "cache": cache,
     }
+    if result.drafted_tokens:
+        metrics["speculation"] = {
+            "drafted_tokens": result.drafted_tokens,
+            "accepted_draft_tokens": result.accepted_draft_tokens,
+            "cycles": result.draft_cycles,
+        }
     return metrics

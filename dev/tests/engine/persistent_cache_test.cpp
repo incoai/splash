@@ -116,10 +116,12 @@ struct Process final {
 
   // Caches the prompt through a finished request and returns
   // its blocks, root first.
-  std::vector<uint64_t> cachePrompt(uint64_t requestId, const std::vector<uint32_t> &prompt) {
+  std::vector<uint64_t> cachePrompt(uint64_t requestId, const std::vector<uint32_t> &prompt,
+                                    CacheSalt salt = {}) {
     cache.beginRequest(requestId);
     require(admitTokens(cache, requestId, prompt.size()).granted(), "prompt KV was not admitted");
-    cache.publishCommittedBlocks(requestId, prompt, static_cast<uint32_t>(prompt.size()), {});
+    cache.publishCommittedBlocks(requestId, prompt, static_cast<uint32_t>(prompt.size()),
+                                 {{}, salt});
     std::vector<uint64_t> blocks;
     for (uint32_t end = KvCache::pageTokens; end <= prompt.size(); end += KvCache::pageTokens)
       blocks.push_back(cache.blockAt(requestId, end));
@@ -234,6 +236,26 @@ void testRestorePointsComeBack() {
   next.cache.endRequest(2);
   const std::vector<uint64_t> later = next.cachePrompt(3, promptOf(5000, 1));
   require(later.front() > blocks.back(), "new blocks reused an id taken back");
+}
+
+// A salted restore point comes back under its salt: the next process finds
+// it for that salt alone.
+void testSaltedPointsComeBackUnderTheirSalt() {
+  const std::vector<uint32_t> prompt = promptOf(1000, 2);
+  const CacheSalt salt{0x5151, 0x7373};
+  Process earlier(true);
+  const std::vector<uint64_t> blocks = earlier.cachePrompt(1, prompt, salt);
+  earlier.publish(blocks[1]);
+  earlier.writeEverything();
+  Process next(true);
+  const CacheAdoption adoption = next.adopt(earlier.kvLabels(), earlier.stateLabels());
+  require(adoption.blocks == 2 && adoption.states == 1 && adoption.dropped == 0,
+          "the next process did not take back the salted restore point");
+  std::vector<uint32_t> continued = prompt;
+  continued.push_back(7);
+  require(next.cache.lookup(continued, {{}, salt}).resumeBoundary() == 64 &&
+              next.cache.lookup(continued, {}).resumeBoundary() == 0,
+          "a salted restore point did not come back under its salt alone");
 }
 
 // A restore point whose chain is broken stays behind, and so do KV no state
@@ -644,6 +666,7 @@ int main() {
   try {
     testCopiesAreLabelled();
     testRestorePointsComeBack();
+    testSaltedPointsComeBackUnderTheirSalt();
     testBrokenChainsStayBehind();
     testOldestPointGoes();
     testAdoptionTrimsToTheQuota();

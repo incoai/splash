@@ -25,28 +25,22 @@ using engine::NativeArguments;
 using splash::test::rejects;
 using splash::test::require;
 
-// A model directory the engine accepts: the target and draft directories,
-// the tokenizer's configuration and the package manifest.
+// The directory of the model configurations (dev/tests/fixtures/model-configs).
+std::filesystem::path modelConfigs;
+
+// A model directory the engine accepts: the target and draft directories and
+// the assembly's record and configurations of an MLX Qwen3.8-27B.
 class ModelDirectory final {
 public:
   ModelDirectory() {
-    for (const char *directory : {"target", "draft", "tokenizer"})
+    for (const char *directory : {"target", "draft"})
       std::filesystem::create_directory(path() / directory);
-    test::writeFile(path() / "tokenizer/config.json",
-                    R"({"text_config":{"model_type":"qwen3_5_text",)"
-                    R"("max_position_embeddings":262144,"hidden_size":5120,)"
-                    R"("vocab_size":248320}})");
-    test::writeFile(path() / "manifest.json",
-                    R"({"schema_version":3,"model":"Qwen3.8-27B-DFlash2",)"
-                    R"("format":{"name":"splash-packed-q4","q4_bits":4,)"
-                    R"("q4_group_size":64,"q4_storage_n":256,)"
-                    R"("section_alignment_bytes":16384,)"
-                    R"("target_layer_magic":"MDFL0006",)"
-                    R"("draft_layer_magic":"MDFD0004","vision_magic":"MDFV0001"},)"
-                    R"("execution_geometry":{"draft_proposal_tokens":7,)"
-                    R"("draft_query_rows":8,"draft_sliding_window":2048,)"
-                    R"("maximum_batch_width":4,"prefill_token_budget":2048,)"
-                    R"("target_kv_block_tokens":32,"target_verify_rows":8}})");
+    test::writeFile(path() / "model.json",
+                    R"({"version":1,"model":"mlx-community/Qwen3.8-27B-4bit",)"
+                    R"("target_format":"mlx-affine","vision_format":"none"})");
+    const std::filesystem::path configs = modelConfigs / "qwen3.8-27b";
+    std::filesystem::copy_file(configs / "config.json", path() / "config.json");
+    std::filesystem::copy_file(configs / "draft" / "config.json", path() / "draft" / "config.json");
   }
 
   [[nodiscard]] const std::filesystem::path &path() const noexcept {
@@ -126,6 +120,8 @@ void testServerCommandLines(const char *path) {
          read.maxCacheDiskBytes = 5 * kGiB;
          read.kvFormat = kv::Format::BFloat16;
        }},
+      {"state_bf16",
+       [](NativeArguments &read) { read.stateFormat = ops::GdnStateFormat::BFloat16; }},
       {"idle_release", [](NativeArguments &read) { read.idleReleaseSeconds = 1800.0; }},
       {"idle_release_off",
        [](NativeArguments &read) {
@@ -152,7 +148,8 @@ void testServerCommandLines(const char *path) {
            read.maxMemoryBytes == meant.maxMemoryBytes &&
            read.maxCacheDiskBytes == meant.maxCacheDiskBytes &&
            read.persistentCacheRoot == meant.persistentCacheRoot &&
-           read.kvFormat == meant.kvFormat && read.decodeShare == meant.decodeShare &&
+           read.kvFormat == meant.kvFormat && read.stateFormat == meant.stateFormat &&
+           read.decodeShare == meant.decodeShare &&
            read.maxImagePatches == meant.maxImagePatches &&
            read.idleReleaseSeconds == meant.idleReleaseSeconds &&
            read.preventIdleSleep == meant.preventIdleSleep &&
@@ -194,6 +191,9 @@ void testRefusals() {
           "--kv-format requires int8 or bf16");
   // An option's missing value fails its check.
   refuses({"auto", "auto", "--kv-format"}, "--kv-format requires int8 or bf16");
+  refuses({"auto", "auto", "--state-format", "fp16"},
+          "--state-format requires fp32 or bf16");
+  refuses({"auto", "auto", "--state-format"}, "--state-format requires fp32 or bf16");
   for (const char *share : {"-1", "nan", "inf", "half"})
     refuses({"auto", "auto", "--decode-share", share},
             "--decode-share requires a nonnegative number");
@@ -246,10 +246,11 @@ void testRefusals() {
 } // namespace
 
 int main(int argc, char **argv) {
-  if (argc != 2) {
-    std::cerr << "usage: " << argv[0] << " native_command_golden.txt\n";
+  if (argc != 3) {
+    std::cerr << "usage: " << argv[0] << " native_command_golden.txt MODEL_CONFIGS\n";
     return 2;
   }
+  modelConfigs = argv[2];
   try {
     testServerCommandLines(argv[1]);
     testNeuralEngine();

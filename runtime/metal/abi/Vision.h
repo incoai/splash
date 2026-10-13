@@ -42,6 +42,12 @@ struct VisionQkvParams {
 static_assert(sizeof(VisionQkvParams) == 8,
               "Vision QKV parameters are 8 bytes on both sides");
 
+// Query rows of one head a vision_attention threadgroup takes, and its
+// threads: four simdgroups whose softmax gives each row four lanes; a
+// static_assert in shared/vision.metal ties the two literals together.
+#define SPLASH_VISION_ATTENTION_ROWS 32u
+#define SPLASH_VISION_ATTENTION_THREADS 128u
+
 struct VisionAttentionParams {
   uint32_t tokens;
   uint32_t padded_tokens;

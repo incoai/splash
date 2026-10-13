@@ -85,7 +85,10 @@ struct Harness final {
   RuntimeMetrics metrics;
   test::Weights weights;
   engine::NativeRuntime loop{
-      {.engine = test::engineConfig(), .metrics = &metrics, .weights = &weights},
+      {.engine = test::engineConfig(),
+       .metrics = &metrics,
+       .weights = &weights,
+       .weightAdmission = test::admitAll},
       metal::kResidencyKeepAliveSeconds, resources, executor, transport.outputSink(),
       [this] { return status(); }, protocol::ProtocolLimits{}};
 };
@@ -111,7 +114,10 @@ struct PersistentHarness final {
   RuntimeMetrics metrics;
   test::Weights weights;
   engine::NativeRuntime loop{
-      {.engine = test::engineConfig(), .metrics = &metrics, .weights = &weights},
+      {.engine = test::engineConfig(),
+       .metrics = &metrics,
+       .weights = &weights,
+       .weightAdmission = test::admitAll},
       metal::kResidencyKeepAliveSeconds, resources, executor, transport.outputSink(),
       test::readyStatusJson, protocol::ProtocolLimits{}};
 };
@@ -341,7 +347,10 @@ void testLoopWakesForAnEngineDeadline() {
   RuntimeMetrics metrics;
   test::Weights weights;
   engine::NativeRuntime loop{
-      {.engine = test::engineConfig(), .metrics = &metrics, .weights = &weights},
+      {.engine = test::engineConfig(),
+       .metrics = &metrics,
+       .weights = &weights,
+       .weightAdmission = test::admitAll},
       metal::kResidencyKeepAliveSeconds, resources, executor,
       [&](std::span<const uint8_t> bytes) {
         for (const auto &event : protocol::peer::decodeEvents(bytes)) {

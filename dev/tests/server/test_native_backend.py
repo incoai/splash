@@ -147,9 +147,25 @@ class DrivenRuntime(FakeRuntime):
         super().close()
 
 
-def success_result(call, *, reason=wire.FinishReason.STOP, tokens=()):
+def success_result(
+    call,
+    *,
+    reason=wire.FinishReason.STOP,
+    tokens=(),
+    deduplicated=0,
+    speculation=(0, 0, 0),
+):
     return wire.DoneEvent(
-        call.request_id, reason, 4, len(tokens), 1_250, 2_500, 4_000, ()
+        call.request_id,
+        reason,
+        4,
+        len(tokens),
+        1_250,
+        2_500,
+        4_000,
+        (),
+        deduplicated,
+        *speculation,
     )
 
 
@@ -211,6 +227,22 @@ class NativeBackendContractTests(unittest.TestCase):
 
         with self.assertRaises(api_errors.ConstraintError):
             generation_constraints.TokenConstraint(None, None).masks(tuple(range(9)))
+
+    def test_release_weights_asks_the_engine_and_returns_its_status(self):
+        transport, runtime = self.make_transport()
+        snapshot = transport.release_weights()
+        self.assertEqual(runtime.release_calls, 1)
+        self.assertIs(snapshot["weights"]["released"], True)
+        runtime.release_event = native_peer.status_event(
+            weights={"released": False, "restores": 0, "restore_failures": 0}
+        )
+        # A busy engine leaves the weights loaded: the status says so.
+        self.assertIs(transport.release_weights()["weights"]["released"], False)
+        transport.closing = True
+        with self.assertRaises(api_errors.APIError) as raised:
+            transport.release_weights()
+        self.assertEqual(raised.exception.status, 503)
+        self.assertEqual(runtime.release_calls, 2)
 
     def test_http_fields_reach_native_generation_request(self):
         transport, runtime = self.make_transport()
@@ -398,7 +430,11 @@ class NativeBackendContractTests(unittest.TestCase):
 
         call.emit(wire.StartEvent(call.request_id, 2, 2))
         call.emit(wire.TokensEvent(call.request_id, 0, (7, 8)))
-        call.complete(result=success_result(call, tokens=(7, 8)))
+        call.complete(
+            result=success_result(
+                call, tokens=(7, 8), deduplicated=64, speculation=(14, 4, 2)
+            )
+        )
 
         self.assertEqual(job.events.get(timeout=1.0), ("start", None))
         self.assertEqual(job.events.get(timeout=1.0), ("text", "7"))
@@ -407,6 +443,12 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertEqual(kind, "done")
         self.assertEqual(result.reason, "stop")
         self.assertEqual(result.cache.status, "hit")
+        self.assertEqual(result.cache.deduplicated_tokens, 64)
+        self.assertEqual(result.metrics["cache"]["deduplicated_tokens"], 64)
+        self.assertEqual(
+            result.metrics["speculation"],
+            {"drafted_tokens": 14, "accepted_draft_tokens": 4, "cycles": 2},
+        )
         self.assertEqual(result.prefill_tokens, 2)
         self.assertEqual(result.start_to_first_token_ms, 1.25)
         self.assertEqual(result.first_token_to_done_ms, 2.5)

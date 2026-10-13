@@ -2,9 +2,9 @@
 #include "TestChecks.hpp"
 #include "ops/PagedAttention.hpp"
 #include "ops/RoPE.hpp"
-#include "tuning/HostKvExtents.hpp"
-#include "tuning/LinearNumerics.hpp"
 
+#include "HostKvExtents.hpp"
+#include "LinearNumerics.hpp"
 #include "NormReference.hpp"
 
 #include <algorithm>
@@ -17,15 +17,16 @@
 #include <string>
 #include <tuple>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace {
 
 using namespace splash;
-using ops::tuning::HostKvExtents;
-using ops::tuning::bf16ToFloat;
-using ops::tuning::floatToBf16;
-using ops::tuning::ulpBf16;
+using test::HostKvExtents;
+using test::bf16ToFloat;
+using test::floatToBf16;
+using test::ulpBf16;
 
 static_assert(!std::is_aggregate_v<ops::PrefillAttentionPlan> &&
               !std::is_default_constructible_v<ops::PrefillAttentionPlan> &&
@@ -813,11 +814,11 @@ void bufferExtents(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layout
                                {1, verifyStaged(queryWidth), 2, "attention row"},
                                {2, verifyRows * width * 2, 2, "attention hidden"},
                                {3, ops::tableBytes(width, verifyRows), 2, "linear table"},
-                               {4, ops::tableSumsBytes(ops::LinearInput::Table64, width, verifyRows), 4,
+                               {4, ops::tableSumsBytes(ops::LinearInput::Table16, width, verifyRows), 4,
                                 "linear table sums"}},
                        [&](metal::CommandGraph &graph, const Buffers &b) {
                          (void)ops::PagedAttention::addVerifyGate(graph, b[0], b[1], b[2], queryHeads, layout, lanes,
-                                                                  {b[3], b[4], {}, {}}, ops::LinearInput::Table64);
+                                                                  {b[3], b[4], {}, {}}, ops::LinearInput::Table16);
                        });
 
   const auto chunk = ops::PagedAttention::prefillParams(committed, tokens, stride, 8);
@@ -879,6 +880,53 @@ void ropeExtents(metal::MetalBackend &backend) {
                        [&](metal::CommandGraph &graph, const std::vector<metal::MetalBuffer> &b) {
                          ops::RoPE::addTables(graph, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], rows, 2048);
                        });
+  test::requireExtents(backend,
+                       std::initializer_list<test::BufferExtent>{
+                           {0, SPLASH_DRAFT_ROPE_PAIRS * 4, 4, "draft inverse frequency"},
+                           {1, rows.draft_rows * SPLASH_DRAFT_ROPE_PAIRS * 4, 4, "draft RoPE cosine"},
+                           {2, rows.draft_rows * SPLASH_DRAFT_ROPE_PAIRS * 4, 4, "draft RoPE sine"}},
+                       [&](metal::CommandGraph &graph, const std::vector<metal::MetalBuffer> &b) {
+                         ops::RoPE::addDraftRangeTables(graph, b[0], b[1], b[2], rows.draft_rows, 6130, 2048);
+                       });
+}
+
+// The draft rows of a range of consecutive positions come out bit for bit as
+// the tables of those positions listed one by one do: a restore rotates the
+// keys it computes again exactly as their capture did.
+void ropeRangeMatchesPositions(metal::MetalBackend &backend) {
+  const auto buffer = [&](uint64_t bytes) { return test::sharedBuffer(backend, bytes); };
+  constexpr uint32_t kMaximumRows = 2048;
+  const metal::MetalBuffer inverse = buffer(SPLASH_DRAFT_ROPE_PAIRS * 4);
+  auto *frequencies = static_cast<float *>(inverse.contents());
+  for (uint32_t pair = 0; pair < SPLASH_DRAFT_ROPE_PAIRS; ++pair)
+    frequencies[pair] = std::pow(1.0e6F, -float(pair) / SPLASH_DRAFT_ROPE_PAIRS);
+  for (const auto [rows, start] : {std::pair{37U, 6130U}, std::pair{kMaximumRows, 260000U}}) {
+    const metal::MetalBuffer targetPositions = buffer(3 * 4), draftPositions = buffer(rows * 4);
+    std::memset(targetPositions.contents(), 0, 3 * 4);
+    for (uint32_t row = 0; row < rows; ++row)
+      static_cast<uint32_t *>(draftPositions.contents())[row] = start + row;
+    const metal::MetalBuffer targetTable = buffer(SPLASH_TARGET_ROPE_PAIRS * 4);
+    const uint64_t tableBytes = uint64_t{rows} * SPLASH_DRAFT_ROPE_PAIRS * 4;
+    const metal::MetalBuffer cosine = buffer(tableBytes), sine = buffer(tableBytes);
+    const metal::MetalBuffer rangeCosine = buffer(tableBytes), rangeSine = buffer(tableBytes);
+    metal::CommandGraph graph;
+    ops::RoPE::addTables(graph, targetPositions, draftPositions,
+                         buffer(SPLASH_TARGET_ROPE_PAIRS * 4), inverse, targetTable,
+                         buffer(SPLASH_TARGET_ROPE_PAIRS * 4), cosine, sine, {1, rows}, kMaximumRows);
+    ops::RoPE::addDraftRangeTables(graph, inverse, rangeCosine, rangeSine, rows, start, kMaximumRows);
+    static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+    require(std::memcmp(cosine.contents(), rangeCosine.contents(), tableBytes) == 0 &&
+                std::memcmp(sine.contents(), rangeSine.contents(), tableBytes) == 0,
+            "draft RoPE tables of a position range differ from those of its positions");
+  }
+  metal::CommandGraph invalid;
+  rejects([&] { ops::RoPE::addDraftRangeTables(invalid, inverse, inverse, inverse, 0, 0, kMaximumRows); },
+          "invalid RoPE table row count", "an empty draft RoPE range was accepted");
+  rejects([&] {
+            ops::RoPE::addDraftRangeTables(invalid, inverse, inverse, inverse, kMaximumRows + 1, 0, kMaximumRows);
+          },
+          "invalid RoPE table row count", "a draft RoPE range past its rows was accepted");
+  require(invalid.empty(), "an invalid draft RoPE range encoded a dispatch");
 }
 
 } // namespace
@@ -896,6 +944,7 @@ int main(int argc, char **argv) {
     metal::MetalBackend backend(argv[1]);
     checkBf16StoreEdges(backend);
     ropeExtents(backend);
+    ropeRangeMatchesPositions(backend);
     for (uint32_t heads : {24U, 16U})
       bufferExtents(backend, heads, {1, heads == 24 ? 4U : 2U, 256, kv::Format::Int8});
     // The prepare kernels do not depend on the KV format.

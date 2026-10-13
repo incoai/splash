@@ -18,8 +18,6 @@ namespace splash::model {
 struct Qwen3_6MoeLayout final : QwenHybridLayout<8> {
   // The family's name, as the installer pairs its draft (install/families.py).
   static constexpr std::string_view family = "Qwen3.6-35B-A3B";
-  static constexpr std::string_view layerMagic = "MDFM0001";
-  static constexpr std::string_view headMagic = "MDFM0002";
 
   constexpr Qwen3_6MoeLayout()
       : QwenHybridLayout{{.maximumContextTokens = 262'144,
@@ -70,13 +68,13 @@ struct Qwen3_6MoeLayerWeights final {
   ops::NormWeights inputNorm;
   QwenMixerWeights mixer;
   ops::NormWeights postAttentionNorm;
-  ops::MoeWeights ffn;
+  ops::BlockMoeWeights ffn;
 };
 
 using Qwen3_6MoeWeights = QwenTargetWeights<Qwen3_6MoeLayout, Qwen3_6MoeLayerWeights>;
 
 [[nodiscard]] Qwen3_6MoeWeights
 loadQwen3_6MoeWeights(metal::MetalBackend &backend, Qwen3_6MoeLayout layout,
-                      const QwenTargetFiles<Qwen3_6MoeLayout> &files);
+                      const QwenTargetFiles &files);
 
 } // namespace splash::model

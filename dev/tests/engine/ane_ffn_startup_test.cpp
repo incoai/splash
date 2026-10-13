@@ -165,7 +165,7 @@ void testOff() {
               started.start.outcome.contextWithout == contextWith(0) &&
               line(started.log, "The GPU runs the prefill FFN alone, as given."),
           "--disable-ane was not taken as given");
-  fake.unsupported = "ANE FFN split needs affine Q4 projections or unrotated quantized GGUF tensors";
+  fake.unsupported = "ANE FFN split needs unrotated quantized projections";
   started = start(fake, {.enabled = false});
   require(started.start.outcome.kind == Kind::Off && started.log.empty(),
           "--disable-ane was logged for a model the split does not take");
@@ -181,7 +181,7 @@ void testUnsupported() {
               started.start.outcome.context == contextWith(0),
           "a MoE model was logged");
   fake = {};
-  fake.unsupported = "ANE FFN split needs affine Q4 projections or unrotated quantized GGUF tensors";
+  fake.unsupported = "ANE FFN split needs unrotated quantized projections";
   started = start(fake);
   require(started.start.outcome.kind == Kind::Unsupported && nothingStarted(fake, started) && !fake.asked &&
               started.start.outcome.context == contextWith(0) &&

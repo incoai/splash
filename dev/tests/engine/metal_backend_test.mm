@@ -9,6 +9,7 @@
 
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -39,6 +40,7 @@ using splash::metal::Command;
 using splash::metal::CommandTicket;
 using splash::metal::ComputeDispatch;
 using splash::metal::EventStep;
+using splash::metal::IndirectGrid;
 using splash::metal::MetalBackend;
 using splash::metal::MetalBackendError;
 using splash::metal::SharedEvent;
@@ -1132,6 +1134,45 @@ void bindingRunsKeepOffsets(MetalBackend &backend) {
     }
 }
 
+// An indirect dispatch runs the grid that an earlier dispatch of its command
+// wrote, at the grid's offset into a view; a grid unaligned in its allocation
+// or past its buffer is refused.
+void indirectGridsRunTheWrittenGrid(MetalBackend &backend) {
+    constexpr uint32_t kWords = 8, gridWords = 3, increment = 1;
+    MetalBuffer grid = sharedBuffer(backend, 8 * sizeof(uint32_t));
+    MetalBuffer written = sharedBuffer(backend, gridWords * sizeof(uint32_t));
+    MetalBuffer values = sharedBuffer(backend, kWords * sizeof(uint32_t));
+    auto *source = static_cast<uint32_t *>(written.contents());
+    source[0] = 3;
+    source[1] = source[2] = 1;
+    std::fill_n(static_cast<uint32_t *>(grid.contents()), 8, 0u);
+    std::fill_n(static_cast<uint32_t *>(values.contents()), kWords, 0u);
+    // The grid {3, 1, 1} lands at byte 8 of the view from byte 4.
+    const MetalBuffer view = backend.view(grid, 4, 7 * sizeof(uint32_t));
+    const ComputeDispatch write{"test_copy_u32",
+        {{0, written}, {1, backend.view(grid, 12, gridWords * sizeof(uint32_t))}},
+        {{2, &gridWords, sizeof(gridWords)}}, {1, 1, 1}, {gridWords, 1, 1}};
+    ComputeDispatch add{"test_add_u32", {{0, values}},
+        {{1, &kWords, sizeof(kWords)}, {2, &increment, sizeof(increment)}},
+        {kWords, 1, 1}, {1, 1, 1}, {view, 8}};
+    const std::array<ComputeDispatch, 2> command{write, add};
+    (void)backend.submitCommandAsync(command).wait();
+    const auto *out = static_cast<const uint32_t *>(values.contents());
+    for (uint32_t word = 0; word < kWords; ++word) {
+        require(out[word] == (word < 3 ? increment : 0),
+                "an indirect dispatch ran another grid than the one written");
+    }
+    // Byte 8 of a view from byte 2 lies at byte 10 of the buffer.
+    const MetalBuffer unaligned = backend.view(grid, 2, 6 * sizeof(uint32_t));
+    for (const IndirectGrid &outside : {IndirectGrid{view, 6},
+                                        IndirectGrid{view, 20},
+                                        IndirectGrid{unaligned, 8}}) {
+        add.indirectThreadgroups = outside;
+        rejects([&] { (void)backend.submit(add); }, "reads its grid outside",
+                "an unaligned or out-of-range grid was accepted");
+    }
+}
+
 // Released memory leaves the residency set and the accounting while the
 // buffer's views stay handles that no command may bind; a restore gives the
 // buffer memory again, which commands use as before. Only whole buffers with
@@ -1684,6 +1725,7 @@ void run(const std::string &metallibPath) {
             "private allocation release was not tracked");
 
     bindingRunsKeepOffsets(backend);
+    indirectGridsRunTheWrittenGrid(backend);
     require(capabilities.gpuCoreCount >= 1 && capabilities.gpuCoreCount <= 4096,
             "GPU core count was not read from the IORegistry");
     require(capabilities.meetsMinimumMacos(),

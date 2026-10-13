@@ -6,8 +6,10 @@
 constant constexpr uint GdnScanBlock = 16;
 
 // One threadgroup carries SPLASH_GDN_SCAN_STATE_ROWS rows of a value head's
-// 128 x 128 fp32 recurrent state through the whole chunk, token by token:
-// S = d S; m = S k; S += k (v - m) beta; o = S q. A lane owns sixteen key
+// 128 x 128 recurrent state through the whole chunk in fp32, token by token:
+// S = d S; m = S k; S += k (v - m) beta; o = S q. State is the stored
+// element: float, or bfloat, widened as it is loaded and rounded to nearest
+// even as it is stored at the chunk's end. A lane owns sixteen key
 // columns of one row, so eight lanes share a row and each key-dimension dot
 // product costs three shuffle steps; a simdgroup covers four rows. Blocks of
 // GdnScanBlock tokens of q and k (widened to fp32), v, decay and beta are
@@ -15,11 +17,11 @@ constant constexpr uint GdnScanBlock = 16;
 // registers, so the dependent per-token chain reads only threadgroup memory.
 // The math is the decode recurrence; only the summation order of the dot
 // products differs from its per-lane form.
-template <uint KeyHeads, uint ValueHeads, uint HeadDim>
+template <uint KeyHeads, uint ValueHeads, uint HeadDim, class State>
 inline void gdn_scan_prefill_phase(
     device const bfloat *q, device const bfloat *k, device const bfloat *v,
     device const float *decay, device const bfloat *beta,
-    device const float *state_in, device float *state_out,
+    device const State *state_in, device State *state_out,
     device bfloat *output, uint tokens, threadgroup float *keys,
     threadgroup float *queries, threadgroup float *values,
     threadgroup float *gates, uint group, uint thread_index, uint lane,
@@ -48,8 +50,8 @@ inline void gdn_scan_prefill_phase(
 
   float4 state[Columns / 4];
   for (uint c = 0; c < Columns / 4; ++c) {
-    state[c] =
-        reinterpret_cast<device const float4 *>(state_in + state_base)[c];
+    state[c] = float4(
+        reinterpret_cast<device const vec<State, 4> *>(state_in + state_base)[c]);
   }
 
   bfloat4 key_fetch[2][2] = {}, query_fetch[2][2] = {}, value_fetch[2] = {};
@@ -154,19 +156,20 @@ inline void gdn_scan_prefill_phase(
     }
   }
   for (uint c = 0; c < Columns / 4; ++c) {
-    reinterpret_cast<device float4 *>(state_out + state_base)[c] = state[c];
+    reinterpret_cast<device vec<State, 4> *>(state_out + state_base)[c] =
+        vec<State, 4>(state[c]);
   }
 }
 
-#define GDN_SCAN_PREFILL_ENTRY(Name, KeyHeads, ValueHeads, HeadDim)            \
+#define GDN_SCAN_PREFILL_KERNEL(Name, KeyHeads, ValueHeads, HeadDim, State)    \
   kernel void Name(                                                           \
       device const bfloat *q [[buffer(0)]],                                   \
       device const bfloat *k [[buffer(1)]],                                   \
       device const bfloat *v [[buffer(2)]],                                   \
       device const float *decay [[buffer(3)]],                                \
       device const bfloat *beta [[buffer(4)]],                                \
-      device const float *state_in [[buffer(5)]],                             \
-      device float *state_out [[buffer(6)]],                                  \
+      device const State *state_in [[buffer(5)]],                             \
+      device State *state_out [[buffer(6)]],                                  \
       device bfloat *output [[buffer(7)]],                                    \
       constant GDNPrefillParams &params [[buffer(8)]],                        \
       uint group [[threadgroup_position_in_grid]],                            \
@@ -177,14 +180,20 @@ inline void gdn_scan_prefill_phase(
     threadgroup float queries[GdnScanBlock * HeadDim];                        \
     threadgroup float values[GdnScanBlock * SPLASH_GDN_SCAN_STATE_ROWS];    \
     threadgroup float gates[2 * GdnScanBlock];                                \
-    gdn_scan_prefill_phase<KeyHeads, ValueHeads, HeadDim>(                    \
+    gdn_scan_prefill_phase<KeyHeads, ValueHeads, HeadDim, State>(             \
         q, k, v, decay, beta, state_in, state_out, output, params.tokens,     \
         keys, queries, values, gates, group, thread_index, lane, simd_group); \
   }
+// Each geometry's scan over an fp32 state and, as Name_bf16_state, a bf16 one.
+#define GDN_SCAN_PREFILL_ENTRY(Name, KeyHeads, ValueHeads, HeadDim)            \
+  GDN_SCAN_PREFILL_KERNEL(Name, KeyHeads, ValueHeads, HeadDim, float)          \
+  GDN_SCAN_PREFILL_KERNEL(Name##_bf16_state, KeyHeads, ValueHeads, HeadDim,    \
+                          bfloat)
 
 GDN_SCAN_PREFILL_ENTRY(prefill_gdn_scan, 16, 48, 128)
 GDN_SCAN_PREFILL_ENTRY(prefill_gdn_scan_vh32, 16, 32, 128)
 #undef GDN_SCAN_PREFILL_ENTRY
+#undef GDN_SCAN_PREFILL_KERNEL
 
 // Prepares one token of one key head: causal convolution, SiLU, q/k RMS
 // normalization, value-head gates and (from the first token) convolution carry.
@@ -212,12 +221,11 @@ inline void gdn_prepare_prefill_phase(
   const uint value_channel =
       2 * KeyWidth + key_head * HeadsPerKey * HeadDim + thread_index;
 
-  const float query =
-      float(gdn_conv_silu(packed, conv_state_in, conv_weights, PackedWidth,
-                          ConvDim, token, query_channel));
-  const float key =
-      float(gdn_conv_silu(packed, conv_state_in, conv_weights, PackedWidth,
-                          ConvDim, token, key_channel));
+  const GdnConvHistory history{conv_state_in, packed, ConvDim, PackedWidth, 0};
+  const float query = float(gdn_conv_silu(packed, history, conv_weights,
+                                          PackedWidth, token, query_channel));
+  const float key = float(gdn_conv_silu(packed, history, conv_weights,
+                                        PackedWidth, token, key_channel));
   const float query_sum = simd_sum(query * query);
   const float key_sum = simd_sum(key * key);
   if (lane == 0) {
@@ -244,8 +252,8 @@ inline void gdn_prepare_prefill_phase(
   for (uint head = 0; head < HeadsPerKey; ++head) {
     const uint channel = value_channel + head * HeadDim;
     v[ulong(token) * ValueWidth + channel - 2 * KeyWidth] =
-        gdn_conv_silu(packed, conv_state_in, conv_weights, PackedWidth,
-                      ConvDim, token, channel);
+        gdn_conv_silu(packed, history, conv_weights, PackedWidth, token,
+                      channel);
   }
   if (thread_index < HeadsPerKey) {
     const uint head = key_head * HeadsPerKey + thread_index;
@@ -256,14 +264,14 @@ inline void gdn_prepare_prefill_phase(
     decay[gate] = gates.decay;
   }
   if (token == 0) {
+    const GdnConvHistory carry{conv_state_in, packed, ConvDim, PackedWidth,
+                               params.tokens};
     for (uint row = 0; row < SPLASH_GDN_CONVOLUTION_TAPS - 1; ++row) {
       for (uint head = 0; head < HeadsPerKey + 2; ++head) {
         const uint channel = head == 0   ? query_channel
                              : head == 1 ? key_channel
                                          : value_channel + (head - 2) * HeadDim;
-        conv_state_out[row * ConvDim + channel] =
-            gdn_conv_carry(packed, conv_state_in, PackedWidth, ConvDim,
-                           params.tokens, row, channel);
+        conv_state_out[row * ConvDim + channel] = carry.at(row, channel);
       }
     }
   }

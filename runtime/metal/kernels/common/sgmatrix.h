@@ -3,8 +3,8 @@
 using namespace metal;
 
 // The 8x8 simdgroup_matrix MMA on operands held in plain registers, shared by
-// the register matrix kernels (decode/linear_q4_sgmatrix.metal,
-// decode/linear_gguf_sgmatrix.metal, shared/gguf_float.metal).
+// the register matrix kernels (decode/linear_gguf_sgmatrix.metal,
+// shared/gguf_float.metal).
 namespace sgmatrix {
 // simdgroup_matrix lane -> element mapping (verified by the driver's probe):
 // a lane's thread_elements() are M[fm][fn] and M[fm][fn + 1].

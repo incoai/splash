@@ -25,6 +25,16 @@ struct SamplingPenalties final {
   }
 };
 
+// Where a lane's thinking budget runs out in a selection: its selected row
+// `row` takes `end`, which closes thinking, unless a draft token before that
+// row is `end` or `alsoEnds`, which ended thinking first. A row past the
+// selection's rows cuts nothing in it.
+struct ThinkingCutoff final {
+  uint32_t row = 0;
+  uint32_t end = 0;
+  uint32_t alsoEnds = 0;
+};
+
 // One lane's target policy. The defaults are a request's: greedy, and a
 // sampling lane keeps every token.
 struct SamplingPolicy final {
@@ -44,6 +54,9 @@ struct SamplingPolicy final {
   // A sampling lane first drops the tokens less likely than minP times its
   // most likely one; 0 drops none.
   float minP = 0.0F;
+  // While the lane thinks under a budget, where that budget runs out; the
+  // cutoff's row selects the end of thinking whatever the lane's logits.
+  std::optional<ThinkingCutoff> thinkingCutoff{};
 
   [[nodiscard]] bool samples() const noexcept { return temperature > 0.0F; }
 };
@@ -143,8 +156,9 @@ public:
   // rowOffset, and every verify row of a batch. Each selected row's token
   // goes to the output tokens in order, one per lane for the first token
   // and eight for verify; acceptance reads a sampled verify row's draft
-  // token probability from the vocabulary rows. Both run the same kernels
-  // (addSelection).
+  // token probability from the vocabulary rows. A lane's row at its
+  // thinking cutoff then takes the end of thinking. Both run the same
+  // kernels (addSelection).
   void addInitial(metal::CommandGraph &graph,
                   std::span<const SamplingPolicy> policies,
                   SamplingBuffers buffers, uint32_t rowOffset,
@@ -186,9 +200,10 @@ private:
   [[nodiscard]] TargetSamplingParams selection(std::span<const SamplingPolicy> policies,
                                                const SamplingBuffers &buffers, const TargetRows &rows,
                                                uint32_t stopToken0, uint32_t stopToken1) const;
-  // Selects the rows `selection` names of its `lanes` lanes.
-  void addSelection(metal::CommandGraph &graph, const TargetSamplingParams &selection, uint32_t lanes,
-                    const SamplingBuffers &buffers) const;
+  // Selects the rows `selection` names of its `lanes` lanes, then the end of
+  // thinking at each lane's thinking cutoff among them.
+  void addSelection(metal::CommandGraph &graph, const TargetSamplingParams &selection,
+                    std::span<const SamplingPolicy> policies, const SamplingBuffers &buffers) const;
 
   uint32_t vocabulary_ = 0;
   uint32_t maskWords_ = 0;

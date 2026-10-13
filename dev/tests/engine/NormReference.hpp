@@ -4,11 +4,11 @@
 // fp64 RMS norm the kernels that read them are checked against. Shared by the
 // Metal tests of those kernels.
 
+#include "LinearNumerics.hpp"
 #include "TestBuffers.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 #include "ops/Normalization.hpp"
-#include "tuning/LinearNumerics.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -28,7 +28,7 @@ ops::NormWeights makeNormWeights(metal::MetalBackend &backend, uint32_t size, bo
     if (float32)
       static_cast<float *>(norm.buffer.contents())[index] = weight;
     else
-      static_cast<uint16_t *>(norm.buffer.contents())[index] = ops::tuning::floatToBf16(weight);
+      static_cast<uint16_t *>(norm.buffer.contents())[index] = floatToBf16(weight);
   }
   return norm;
 }
@@ -37,7 +37,7 @@ ops::NormWeights makeNormWeights(metal::MetalBackend &backend, uint32_t size, bo
 inline double normWeight(const ops::NormWeights &norm, uint32_t index) {
   return norm.float32
       ? static_cast<const float *>(norm.buffer.contents())[index]
-      : ops::tuning::bf16ToFloat(static_cast<const uint16_t *>(norm.buffer.contents())[index]);
+      : bf16ToFloat(static_cast<const uint16_t *>(norm.buffer.contents())[index]);
 }
 
 // The fp64 RMS norm of a bf16 row with the kernels' epsilon, scaled by the
@@ -46,13 +46,13 @@ inline std::vector<double> rmsNorm(const uint16_t *row, const ops::NormWeights &
                                    uint32_t size) {
   double squares = 0;
   for (uint32_t index = 0; index < size; ++index) {
-    const double value = ops::tuning::bf16ToFloat(row[index]);
+    const double value = bf16ToFloat(row[index]);
     squares += value * value;
   }
   const double inverse = 1 / std::sqrt(squares / size + SPLASH_RMS_EPSILON);
   std::vector<double> normalized(size);
   for (uint32_t index = 0; index < size; ++index)
-    normalized[index] = ops::tuning::bf16ToFloat(row[index]) * inverse * normWeight(norm, index);
+    normalized[index] = bf16ToFloat(row[index]) * inverse * normWeight(norm, index);
   return normalized;
 }
 
@@ -60,8 +60,8 @@ inline std::vector<double> rmsNorm(const uint16_t *row, const ops::NormWeights &
 // noise (well below 2^-8 of half an ulp). A norm whose weights were rounded
 // to bf16 anywhere on the way misses this for about a quarter of its values.
 inline bool roundedOnceToBf16(uint16_t got, double exact) {
-  return std::fabs(ops::tuning::bf16ToFloat(got) - exact) <=
-      0.5 * ops::tuning::ulpBf16(float(exact)) * (1 + 1.0 / 256);
+  return std::fabs(bf16ToFloat(got) - exact) <=
+      0.5 * ulpBf16(float(exact)) * (1 + 1.0 / 256);
 }
 
 } // namespace splash::test

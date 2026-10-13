@@ -8,7 +8,7 @@ from dataclasses import replace
 from server import protocol as wire
 
 _HEADER = struct.Struct("<4sHHQ")
-_REQUEST = struct.Struct("<QBBQQIIIffIffffQIII")
+_REQUEST = struct.Struct("<QBBQQIIIffIffffQIIIQQIII")
 _IMAGE_SPAN = struct.Struct("<IIIIQQ")
 _MASK_RESPONSE = struct.Struct("<QQI")
 _ID = struct.Struct("<Q")
@@ -32,6 +32,7 @@ def request_frame(**overrides) -> wire.RequestFrame:
         score_tokens=(),
         generation_prompt_tokens=0,
         flags=wire.RequestFlag(0),
+        cache_salt=0,
     )
     return replace(request, **overrides)
 
@@ -43,6 +44,7 @@ def status_event(correlation_id: int = 1, **fields) -> wire.StatusJsonEvent:
         "schema_version": wire.STATUS_SCHEMA_VERSION,
         "ready": True,
         "memory_pressure": "normal",
+        "thermal_state": "nominal",
         "metal": {"healthy": True},
     }
     for key, value in fields.items():
@@ -91,7 +93,7 @@ def _event_payload(event: wire.EngineEvent) -> tuple[wire.FrameType, bytes]:
             )
         case wire.DoneEvent():
             return wire.FrameType.DONE, struct.pack(
-                f"<QBIIQQQI{len(event.option_logits)}f",
+                f"<QBIIQQQIIIII{len(event.option_logits)}f",
                 event.request_id,
                 event.reason,
                 event.prompt_tokens,
@@ -99,6 +101,10 @@ def _event_payload(event: wire.EngineEvent) -> tuple[wire.FrameType, bytes]:
                 event.prefill_micros,
                 event.decode_micros,
                 event.wall_micros,
+                event.deduplicated_tokens,
+                event.drafted_tokens,
+                event.accepted_draft_tokens,
+                event.draft_cycles,
                 len(event.option_logits),
                 *event.option_logits,
             )
@@ -148,6 +154,11 @@ def _decode_request(payload: bytes) -> wire.RequestFrame:
         score_count,
         generation_prompt_tokens,
         flags,
+        salt_lo,
+        salt_hi,
+        thinking_tokens,
+        thinking_end,
+        thinking_also_ends,
     ) = _REQUEST.unpack_from(payload)
     offset = _REQUEST.size
     prompt = _words(payload, offset, prompt_count)
@@ -177,6 +188,10 @@ def _decode_request(payload: bytes) -> wire.RequestFrame:
         scores,
         generation_prompt_tokens,
         wire.RequestFlag(flags),
+        salt_lo | salt_hi << 64,
+        None
+        if thinking_tokens == 0xFFFFFFFF
+        else wire.ThinkingBudget(thinking_tokens, thinking_end, thinking_also_ends),
     )
 
 
@@ -194,6 +209,8 @@ def decode_client_frame(frame_type: int, payload: bytes) -> wire.ClientMessage:
             return wire.MaskResponseFrame(request_id, mask_request_id, bytes(mask))
         case wire.FrameType.STATUS_REQUEST:
             return wire.StatusRequestFrame(*_ID.unpack(payload))
+        case wire.FrameType.RELEASE_REQUEST:
+            return wire.ReleaseRequestFrame(*_ID.unpack(payload))
     raise ValueError(f"frame type {frame_type:#06x} is not a client frame")
 
 

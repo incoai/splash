@@ -101,6 +101,29 @@ class ResponseTimingsTests(HarnessTestCase):
                 self.assertGreaterEqual(timings["predicted_ms"], 0.0)
                 self.assertEqual(timings["predicted_n"], 5)
 
+    def test_speculative_counts_are_the_requests_own(self):
+        result = NativeResult(
+            "length",
+            100,
+            50,
+            10.0,
+            100.0,
+            120.0,
+            drafted_tokens=210,
+            accepted_draft_tokens=70,
+            draft_cycles=30,
+        )
+        timings = timings_dict(result)
+        self.assertEqual((timings["draft_n"], timings["draft_n_accepted"]), (210, 70))
+        self.assertEqual(
+            metrics_dict(result)["speculation"],
+            {"drafted_tokens": 210, "accepted_draft_tokens": 70, "cycles": 30},
+        )
+        # A request without a draft reports none.
+        result = NativeResult("length", 100, 50, 10.0, 100.0, 120.0)
+        self.assertNotIn("draft_n", timings_dict(result))
+        self.assertNotIn("speculation", metrics_dict(result))
+
     def test_unknown_first_emission_does_not_invent_throughput(self):
         result = NativeResult("stop", 20, 5, 1.0, 2.0, 10.0, prefill_tokens=20)
         self.assertEqual(timings_dict(result)["predicted_per_second"], 0.0)

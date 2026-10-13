@@ -3,10 +3,11 @@
 // LayerNorm, 2D-rope QKV preparation and non-causal flash attention.
 //
 // Conventions match the text-model kernels: 256 threads (8 simdgroups) per
-// threadgroup, MPP cooperative-tensor matmuls with fp32 accumulation and
-// hand-written epilogues, grid {row_tile, output_tile}. Attention runs on the
-// native head dimension (72); token counts are padded to the 128-key tile so
-// K/V tiles read in full, with padded keys zeroed and masked by the softmax.
+// threadgroup (128 for attention), MPP cooperative-tensor matmuls with fp32
+// accumulation and hand-written epilogues, grid {row_tile, output_tile}.
+// Attention runs on the native head dimension (72); token counts are padded
+// to the 128-key tile so K/V tiles read in full, with padded keys zeroed and
+// masked by the softmax.
 //
 // Token order everywhere is spatial-merge-block-major: each consecutive group
 // of four patches is one 2x2 spatial unit, so the merger reads contiguous
@@ -361,7 +362,18 @@ kernel void vision_qkv_prepare(
 }
 
 // Non-causal flash attention over the per-head layout.
-// Grid: {ceil(tokens / 64), heads}. Output: (heads, padded_tokens, 72).
+// Grid: {ceil(tokens / 32), heads} of 128 threads, the query rows and threads
+// of metal/abi/Vision.h. Output: (heads, padded_tokens, 72).
+//
+// A threadgroup takes 32 query rows on four simdgroups and 24.25 KiB of
+// threadgroup memory, which keeps several resident per core. Scores, bf16
+// probabilities and the row statistics each have their own storage, so a
+// key tile needs two barriers: one before the softmax reads its scores and
+// one before PV reads its probabilities. The next tile stores its scores
+// past the second, and writes its probabilities past its first, which no
+// thread reaches before finishing this tile's PV. PV accumulates into the
+// running output, which each tile first rescales by its rows' maximum
+// change, so one M x D fp32 cooperative tensor is live.
 
 kernel void vision_attention(
     device bfloat *queries [[buffer(0)]],
@@ -370,27 +382,29 @@ kernel void vision_attention(
     device bfloat *output [[buffer(3)]],
     constant VisionAttentionParams &params [[buffer(4)]],
     uint2 group [[threadgroup_position_in_grid]],
-    uint simd_lane [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]])
+    uint thread_index [[thread_index_in_threadgroup]])
 {
-    constexpr ushort M = 64, N = 128, D = kVisionHeadDim;
+    constexpr ushort M = SPLASH_VISION_ATTENTION_ROWS, N = 128,
+                     D = kVisionHeadDim;
     constexpr ushort DQ = kVisionQkDim;
-    constexpr ushort RowsPerSimdgroup = M / 8;
-    // Preserve fp32 QK scores through softmax. After every lane has read the
-    // scores, the first half holds bf16 probabilities and the second half
-    // exposes row scales to PV. Running softmax state stays in registers, so
-    // the complete threadgroup allocation is exactly 32 KiB.
-    threadgroup float score_storage[M * N];
-    threadgroup bfloat *probabilities =
-        reinterpret_cast<threadgroup bfloat *>(score_storage);
-    threadgroup float *row_sum = score_storage + M * N / 2;
-    threadgroup float *previous_scale = row_sum + M;
-    float running_max[RowsPerSimdgroup];
-    float running_sum[RowsPerSimdgroup];
-    for (ushort i = 0; i < RowsPerSimdgroup; ++i) {
-        running_max[i] = -INFINITY;
-        running_sum[i] = 0.0f;
-    }
+    constexpr ushort Simdgroups = SPLASH_VISION_ATTENTION_THREADS / 32;
+    // Four lanes own one row, four consecutive keys of every 16, so the row
+    // maximum and sum are two xor shuffles and scores and probabilities move
+    // as vectors.
+    constexpr ushort LanesPerRow = Simdgroups * 32 / M;
+    constexpr ushort Runs = N / (LanesPerRow * 4);
+    static_assert(Simdgroups * 32 == SPLASH_VISION_ATTENTION_THREADS &&
+                      LanesPerRow * M == Simdgroups * 32,
+                  "whole simdgroups whose lanes own whole rows");
+    static_assert(LanesPerRow == 4, "two xor shuffles reduce a row");
+    alignas(16) threadgroup float score_storage[M * N];
+    alignas(16) threadgroup bfloat probabilities[M * N];
+    threadgroup float row_sum[M];
+    threadgroup float previous_scale[M];
+    const ushort row = thread_index / LanesPerRow;
+    const ushort part = thread_index % LanesPerRow;
+    float running_max = -INFINITY;
+    float running_sum = 0.0f;
 
     uint head = group.y;
     uint query_start = group.x * M;
@@ -406,7 +420,7 @@ kernel void vision_attention(
     auto qt = tensor(q, dextents<int, 2>{DQ, M}, array<int, 2>{1, DQ});
     constexpr auto qk_descriptor =
         matmul2d_descriptor(M, N, DQ, false, true, false);
-    matmul2d<qk_descriptor, execution_simdgroups<8>> qk;
+    matmul2d<qk_descriptor, execution_simdgroups<Simdgroups>> qk;
     auto q0 = qt.slice<DQ, M>(0, 0);
 
     auto pt = tensor(probabilities, dextents<int, 2>{N, M},
@@ -418,12 +432,26 @@ kernel void vision_attention(
     auto first_v = tensor(v, dextents<int, 2>{D, N},
                           array<int, 2>{1, D});
     auto first_v0 = first_v.slice<D, N>(0, 0);
-    constexpr auto pv_descriptor =
-        matmul2d_descriptor(M, D, N, false, false, false);
-    matmul2d<pv_descriptor, execution_simdgroups<8>> pv;
+    constexpr auto pv_descriptor = matmul2d_descriptor(
+        M, D, N, false, false, false,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<pv_descriptor, execution_simdgroups<Simdgroups>> pv;
     auto running = pv.template get_destination_cooperative_tensor<
         decltype(p0), decltype(first_v0), float>();
-    for (ushort i = 0; i < running.get_capacity(); ++i) running[i] = 0.0f;
+    // Uniform capacity partitions the M x D output across the simdgroups'
+    // lanes, and equality proves no padding. Otherwise (Apple10 lays the 72
+    // columns out over 96) only valid elements may be accessed: a padding
+    // element's coordinates need not name a row of the statistics.
+    const bool full =
+        uint(running.get_capacity()) * (Simdgroups * 32u) == uint(M) * D;
+    for (ushort i = 0; i < running.get_capacity(); ++i) {
+        if (full || running.is_valid_element(i))
+            running[i] = 0.0f;
+    }
+    threadgroup const float4 *row_scores =
+        reinterpret_cast<threadgroup const float4 *>(score_storage + row * N);
+    threadgroup bfloat4 *row_probabilities =
+        reinterpret_cast<threadgroup bfloat4 *>(probabilities + row * N);
     for (uint tile = 0; tile < tiles; ++tile) {
         device bfloat *tile_k = k + ulong(tile) * N * DQ;
         auto kt = tensor(tile_k, dextents<int, 2>{DQ, N},
@@ -435,70 +463,60 @@ kernel void vision_attention(
         scores.store(s0);
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Each simdgroup owns eight rows. Phase one moves scores into
-        // registers and computes the running softmax state; after one
-        // barrier, phase two overwrites the (aliased) storage with bf16
-        // probabilities.
-        float exponents[RowsPerSimdgroup][4];
-        float scales[RowsPerSimdgroup];
-        for (ushort i = 0; i < RowsPerSimdgroup; ++i) {
-            ushort row = simd_group * RowsPerSimdgroup + i;
-            float values_local[4];
-            float tile_max = -INFINITY;
+        // Keys at or past `limit` lie beyond the image and are masked.
+        const int limit = int(context) - int(tile * N);
+        float logits[Runs * 4];
+        float tile_max = -INFINITY;
+        for (ushort r = 0; r < Runs; ++r) {
+            const ushort run = r * LanesPerRow + part;
+            const float4 score = row_scores[run] * params.scale;
             for (ushort j = 0; j < 4; ++j) {
-                uint column = simd_lane + j * 32;
-                uint key_position = tile * N + column;
-                float score = score_storage[row * N + column] * params.scale;
-                values_local[j] =
-                    key_position < context ? score : -INFINITY;
-                tile_max = max(tile_max, values_local[j]);
+                logits[r * 4 + j] = int(run * 4 + j) < limit ? score[j] : -INFINITY;
+                tile_max = max(tile_max, logits[r * 4 + j]);
             }
-            tile_max = simd_max(tile_max);
-            float next_max = max(running_max[i], tile_max);
-            float scale = fast::exp(running_max[i] - next_max);
-            float tile_sum = 0.0f;
-            for (ushort j = 0; j < 4; ++j) {
-                exponents[i][j] = fast::exp(values_local[j] - next_max);
-                tile_sum += exponents[i][j];
-            }
-            tile_sum = simd_sum(tile_sum);
-            scales[i] = scale;
-            running_sum[i] = running_sum[i] * scale + tile_sum;
-            running_max[i] = next_max;
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (ushort i = 0; i < RowsPerSimdgroup; ++i) {
-            ushort row = simd_group * RowsPerSimdgroup + i;
-            if (simd_lane == 0) {
-                previous_scale[row] = scales[i];
-                row_sum[row] = running_sum[i];
-            }
+        tile_max = max(tile_max, simd_shuffle_xor(tile_max, 1));
+        tile_max = max(tile_max, simd_shuffle_xor(tile_max, 2));
+        const float next_max = max(running_max, tile_max);
+        const float scale = fast::exp(running_max - next_max);
+        float tile_sum = 0.0f;
+        for (ushort r = 0; r < Runs; ++r) {
+            float4 exponents;
             for (ushort j = 0; j < 4; ++j) {
-                uint column = simd_lane + j * 32;
-                probabilities[row * N + column] = bfloat(exponents[i][j]);
+                exponents[j] = fast::exp(logits[r * 4 + j] - next_max);
+                tile_sum += exponents[j];
             }
+            row_probabilities[r * LanesPerRow + part] = bfloat4(exponents);
+        }
+        tile_sum += simd_shuffle_xor(tile_sum, 1);
+        tile_sum += simd_shuffle_xor(tile_sum, 2);
+        running_sum = running_sum * scale + tile_sum;
+        running_max = next_max;
+        if (part == 0) {
+            previous_scale[row] = scale;
+            row_sum[row] = running_sum;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
+        for (ushort i = 0; i < running.get_capacity(); ++i) {
+            if (!full && !running.is_valid_element(i))
+                continue;
+            auto index = running.get_multidimensional_index(i);
+            running[i] *= previous_scale[index[1]];
+        }
         device bfloat *tile_v = v + ulong(tile) * N * D;
         auto vt = tensor(tile_v, dextents<int, 2>{D, N},
                          array<int, 2>{1, D});
         auto v0 = vt.slice<D, N>(0, 0);
-        auto partial_output = pv.template get_destination_cooperative_tensor<
-            decltype(p0), decltype(v0), float>();
-        pv.run(p0, v0, partial_output);
-        for (ushort i = 0; i < running.get_capacity(); ++i) {
-            auto index = running.get_multidimensional_index(i);
-            running[i] = running[i] * previous_scale[index[1]] +
-                partial_output[i];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        pv.run(p0, v0, running);
     }
 
     auto ot = tensor(out, dextents<int, 2>{D, M}, array<int, 2>{1, D});
     auto converted = pv.template get_destination_cooperative_tensor<
         decltype(p0), decltype(first_v0), bfloat>();
     for (ushort i = 0; i < running.get_capacity(); ++i) {
+        if (!full && !running.is_valid_element(i))
+            continue;
         auto index = running.get_multidimensional_index(i);
         converted[i] = bfloat(running[i] / row_sum[index[1]]);
     }

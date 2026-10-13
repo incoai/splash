@@ -12,8 +12,8 @@ namespace splash::test {
 inline uint64_t publishBlocks(engine::Cache &cache, uint64_t requestId,
                               std::span<const uint32_t> tokens,
                               uint32_t committedTokens,
-                              std::span<const ImageSpan> images = {}) {
-  cache.publishCommittedBlocks(requestId, tokens, committedTokens, images);
+                              engine::PromptIdentity identity = {}) {
+  cache.publishCommittedBlocks(requestId, tokens, committedTokens, identity);
   constexpr uint32_t pageTokens = engine::KvCache::pageTokens;
   return committedTokens < pageTokens
              ? 0

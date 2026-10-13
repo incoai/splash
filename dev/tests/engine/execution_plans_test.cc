@@ -31,10 +31,8 @@ constexpr std::array matrices{
     LinearMatrix{17408, 5120}, LinearMatrix{6144, 5120},
     LinearMatrix{6144, 2048}, LinearMatrix{512, 2048},
     LinearMatrix{768, 768}};
-// The affine gate/up projection of `matrix`, which gateUpWorkspace sizes.
-constexpr ProjectionShape affineGateUp(LinearMatrix matrix) {
-  return {matrix.outputSize, matrix.inputSize, WeightLayout::Affine64};
-}
+// The gate/up projection of `matrix`, which gateUpWorkspace sizes.
+constexpr ProjectionShape gateUp(LinearMatrix matrix) { return {matrix.outputSize, matrix.inputSize}; }
 constexpr std::array attentionFields{
     &AttentionWorkspace::partialsBytes, &AttentionWorkspace::statisticsBytes};
 constexpr std::array draftFields{
@@ -74,9 +72,9 @@ void baselinePlans() {
             gateBound = std::max(gateBound, baseline.plan(w).gateScratchBytes());
         }
       }
-      require(plans.gateUpWorkspace(affineGateUp(matrix)) == gateBound &&
-                  gateBound == (family == 9 ? 0 : uint64_t{32} * matrix.outputSize * 2),
-              "gate/up workspace disagrees with fused or decomposed baseline");
+      require(plans.gateUpWorkspace(gateUp(matrix)) == gateBound &&
+                  gateBound == uint64_t{32} * matrix.outputSize * 2,
+              "gate/up workspace disagrees with the baseline's gate pass");
       for (uint32_t rows : {1U, 17U, 2048U})
         for (auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
                               LinearEpilogue::UpWithGate}) {
@@ -121,57 +119,25 @@ void baselinePlans() {
         covers(prefill, plans.moePrefill(shape, rows).workspace(), 1, kMoeWorkspaceFields);
       for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
         const auto selected = plans.moeDecode(shape, lanes);
-        require(selected.tileRows() == 8 &&
-                    selected.configuration().m8Simdgroups == moeDecodeSimdgroups(gpuFamilyClass(family)),
-                "MoE decode baseline changed");
+        require(selected.tileRows() == 8, "MoE decode baseline changed");
         covers(stride, selected.workspace(), lanes, kMoeWorkspaceFields);
       }
     }
   }
 }
 
-// Affine decode plans run the fused 8-row expert tiles, four-simdgroup on
-// Apple9 and the eight-simdgroup N128 tile on every other family; affine
-// prefill plans run the split 32-row passes on every family and keep the
-// eight simdgroups, which they do not run.
-void moeDeviceTiles() {
-  for (uint32_t family : {9U, 10U, 11U}) {
-    const auto expected = family == 9 ? MoeExpertSimdgroups::Four
-                                      : MoeExpertSimdgroups::Eight;
-    require(moeDecodeSimdgroups(gpuFamilyClass(family)) == expected,
-            "decode expert simdgroups are not gated on GPU family 9");
-    const ExecutionPlans plans(device(family));
-    for (auto shape : moeShapes) {
-      for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-        const MoePlan plan = plans.moeDecode(shape, lanes);
-        require(plan.configuration().m8Simdgroups == expected && plan.tileRows() == 8 &&
-                    !plan.splitExperts(),
-                "MoE decode plan departed from the device tile policy");
-      }
-      for (uint32_t rows : {1U, 8U, 17U, 2048U}) {
-        const MoePlan plan = plans.moePrefill(shape, rows);
-        require(plan.tileRows() == 32 && plan.splitExperts() &&
-                    plan.configuration().m8Simdgroups == MoeExpertSimdgroups::Eight,
-                "MoE prefill plan left the split 32-row passes");
-      }
-    }
-  }
-}
-
-// GGUF MoE plans (Block32 weights) run the three expert passes: the
-// exact register tile on Apple9, with its Table16 row sums in the workspace
-// bounds, staged tiles everywhere else (32-row tiles for prefill chunks past
-// one route per expert).
+// MoE plans run the three expert passes: the exact register tile on Apple9,
+// with its Table16 row sums in the workspace bounds, staged tiles everywhere
+// else (32-row tiles for prefill chunks past one route per expert).
 void ggufMoePlans() {
-  MoeShape shape = routedShape;
-  shape.weightLayout = WeightLayout::Block32;
+  const MoeShape shape = routedShape;
   for (uint32_t family : {9U, 10U, 11U}) {
     ExecutionPlans plans(device(family));
     const MoeGgufTile expected = family == 9 ? MoeGgufTile::Register : MoeGgufTile::Staged;
     require(moeGgufTile(gpuFamilyClass(family), shape) == expected, "GGUF expert tile is not gated on GPU family 9");
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
       const MoePlan plan = plans.moeDecode(shape, lanes);
-      require(plan.configuration().ggufTile == expected && plan.tileRows() == 8 && plan.splitExperts() &&
+      require(plan.configuration().ggufTile == expected && plan.tileRows() == 8 &&
                   plan.configuration().ggufRouterTile == FloatTile::Simdgroup,
               "GGUF MoE decode plan left its device tile");
       // Sums of the widest input (hidden, 3 K / 4 fp32) per 8-row tile.
@@ -179,9 +145,6 @@ void ggufMoePlans() {
                   (expected == MoeGgufTile::Register ? uint64_t{plan.maximumTiles()} * 2048 * 3 : 0),
               "GGUF register plan sums its Table16 tiles");
       covers(plans.moeDecodeWorkspacePerLane(shape), plan.workspace(), lanes, kMoeWorkspaceFields);
-      require(plans.moeDecode(routedShape, lanes).configuration().ggufTile == MoeGgufTile::Staged &&
-                  plans.moeDecode(routedShape, lanes).workspace().groupedSumsBytes == 0,
-              "affine MoE plan took the GGUF register tile");
     }
     // Apple9 stages experts mostly in a format it stages (IQ2_XS: UD-Q2_K_XL)
     // and keeps the register tile for the others (Q4_K: UD-Q4_K_M).
@@ -205,7 +168,7 @@ void ggufMoePlans() {
       const MoePlan plan = plans.moePrefill(shape, rows);
       const uint32_t tileRows = expected == MoeGgufTile::Register || rows <= 32 ? 8 : 32;
       const FloatTile router = family != 9 && rows > 320 ? FloatTile::NeuralAccelerator : FloatTile::Simdgroup;
-      require(plan.configuration().ggufTile == expected && plan.tileRows() == tileRows && plan.splitExperts() &&
+      require(plan.configuration().ggufTile == expected && plan.tileRows() == tileRows &&
                   (plan.workspace().groupedSumsBytes > 0) == (expected == MoeGgufTile::Register) &&
                   plan.configuration().ggufRouterTile == router,
               "GGUF MoE prefill plan left the device's tile");
@@ -222,21 +185,15 @@ void ggufMoePlans() {
     require(plans.moePrefillWorkspace(shape, 2048) == devicePlans,
             "GGUF MoE prefill bound is not the bound of the device's plans");
   }
-  // The register tile reads GGUF 8-row tiles only.
-  rejects([&] { (void)MoE::decodePlan(routedShape, 1, {MoeExpertTile::M8, moeRouteWideRows(kAssumedGpuCores),
-                                                       MoeExpertSimdgroups::Eight, MoeGgufTile::Register}); },
-          "the register expert tile takes block 8-row tiles", "an affine plan took the register tile");
-  rejects([&] { (void)MoE::prefillPlan(shape, 1, {MoeExpertTile::M32, moeRouteWideRows(kAssumedGpuCores),
-                                                  MoeExpertSimdgroups::Eight, MoeGgufTile::Register}); },
-          "the register expert tile takes block 8-row tiles", "the register tile took 32-row tiles");
-  // GGUF kernels exist for 8-row tiles and 32-row prefill tiles only, affine
-  // ones for 32-row prefill and 8-row decode tiles.
+  // The register tile reads 8-row tiles only, and the kernels exist for
+  // 8-row tiles and 32-row prefill tiles only.
+  rejects(
+      [&] {
+        (void)MoE::prefillPlan(shape, 1, {.expertTile = MoeExpertTile::M32, .ggufTile = MoeGgufTile::Register});
+      },
+      "the register expert tile takes 8-row tiles", "the register tile took 32-row tiles");
   rejects([&] { (void)MoE::decodePlan(shape, 1, {MoeExpertTile::M32}); },
-          "invalid MoE expert tile configuration", "a GGUF decode plan took 32-row tiles");
-  rejects([&] { (void)MoE::decodePlan(routedShape, 1, {MoeExpertTile::M32}); },
-          "invalid MoE expert tile configuration", "an affine decode plan took 32-row tiles");
-  rejects([&] { (void)MoE::prefillPlan(routedShape, 9, {MoeExpertTile::M8}); },
-          "invalid MoE expert tile configuration", "an affine prefill plan took 8-row tiles");
+          "invalid MoE expert tile configuration", "a decode plan took 32-row tiles");
 }
 
 // A device that reports no core count gets the plans of kAssumedGpuCores
@@ -247,19 +204,16 @@ void unknownCoreCount() {
     assumed.gpuCoreCount = kAssumedGpuCores;
     const ExecutionPlans unknown(device(family)), planned(assumed);
     for (auto matrix : matrices)
-      for (auto layout : {WeightLayout::Affine64, WeightLayout::Block32})
-        for (uint32_t lanes = 1; lanes <= 4; ++lanes)
-          for (auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp}) {
-            const LinearWorkload w{matrix, lanes * 8, LinearPhase::Decode, epilogue, layout};
-            require(unknown.linear().plan(w).configuration() == planned.linear().plan(w).configuration(),
-                    "an unknown core count planned a decode projection for other than the assumed cores");
-          }
-    MoeShape block = routedShape;
-    block.weightLayout = WeightLayout::Block32;
-    for (auto shape : {routedShape, block})
       for (uint32_t lanes = 1; lanes <= 4; ++lanes)
-        require(unknown.moeDecode(shape, lanes).configuration() == planned.moeDecode(shape, lanes).configuration(),
-                "an unknown core count planned a MoE decode step for other than the assumed cores");
+        for (auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp}) {
+          const LinearWorkload w{matrix, lanes * 8, LinearPhase::Decode, epilogue};
+          require(unknown.linear().plan(w).configuration() == planned.linear().plan(w).configuration(),
+                  "an unknown core count planned a decode projection for other than the assumed cores");
+        }
+    for (uint32_t lanes = 1; lanes <= 4; ++lanes)
+      require(unknown.moeDecode(routedShape, lanes).configuration() ==
+                  planned.moeDecode(routedShape, lanes).configuration(),
+              "an unknown core count planned a MoE decode step for other than the assumed cores");
   }
 }
 
@@ -282,10 +236,10 @@ void workspaceBounds() {
   const auto moe = plans.moeDecodeWorkspacePerLane(routedShape);
   require(moe.groupedInputBytes == 2129920 && moe.expertOutputBytes == 2129920 &&
               moe.expertIntermediateBytes == 532480 && moe.groupedRoutesBytes == 2080 &&
-              moe.tileDescriptorsBytes == 520 && moe.tileCountBytes == 4,
+              moe.tileDescriptorsBytes == 520 && moe.tileCountBytes == 28,
           "MoE decode workspace per lane changed");
-  require(plans.gateUpWorkspace(affineGateUp(matrices[0])) == 1114112 &&
-              plans.gateUpWorkspace(affineGateUp(matrices[1])) == 393216,
+  require(plans.gateUpWorkspace(gateUp(matrices[0])) == 1114112 &&
+              plans.gateUpWorkspace(gateUp(matrices[1])) == 393216,
           "gate/up workspace omitted the B3/B4 gate pass");
   const auto draft = plans.draftAttentionWorkspacePerLane(draftShapes[0]);
   // Grouped queries per lane plus eight heads x four splits of 32 x 130 fp32
@@ -335,7 +289,6 @@ void invalidLookupsAndContextEdges() {
 int main() {
   try {
     baselinePlans();
-    moeDeviceTiles();
     ggufMoePlans();
     unknownCoreCount();
     workspaceBounds();

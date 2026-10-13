@@ -22,9 +22,7 @@ OPERATOR_WORKSPACE_POLICY_NAMES: tuple[str, ...] = (
     "moeMaximumTiles",
     "LinearTile",
     "LinearConfig",
-    "LinearSimdgroups",
     "MoeExpertTile",
-    "MoeExpertSimdgroups",
     "MoeConfig",
 )
 OPERATOR_WORKSPACE_POLICY = re.compile(
@@ -122,7 +120,7 @@ def check_package_imports() -> list[str]:
     header = ast.dump(
         ast.parse('__name__ == "__main__" and not __package__', mode="eval").body
     )
-    entry_points = {"install/launcher.py", "install/models.py", "install/catalog.py"}
+    entry_points = {"install/launcher.py", "install/models.py"}
     errors = []
     for package in ("server", "install"):
         paths = sorted((ROOT / package).glob("*.py"))
@@ -202,8 +200,8 @@ def check() -> list[str]:
         text = path.read_text(errors="replace")
         includes = include_paths(path, text)
         for include in includes:
-            if include.startswith("tuning/"):
-                errors.append(f"{name}: production depends on offline tuning {include}")
+            if include.startswith("tests/"):
+                errors.append(f"{name}: production depends on test code {include}")
         if name.startswith("runtime/metal/"):
             for include in includes:
                 if include.startswith(forbidden_metal_dependencies):

@@ -24,7 +24,7 @@ class Measurement;
 
 // The dense FFN of a prefill chunk split by intermediate channel between the
 // GPU and the Neural Engine. The GPU runs the leading channels with its
-// prefill kernels over views of the projections' affine Q4 or GGUF planes;
+// prefill kernels over views of the projections' planes;
 // the ANE runs the rest as one W8A8 program over the chunk's rows, with int8
 // weights the GPU requantizes from those planes one layer ahead into
 // double-buffered surfaces, and the GPU adds the ANE's partial down projection
@@ -53,8 +53,8 @@ public:
   AneFfn(const AneFfn &) = delete;
   AneFfn &operator=(const AneFfn &) = delete;
 
-  // Why the split does not take `layers`, or null when it does: affine Q4 or
-  // quantized GGUF projections of one shape (AneFfn.cpp).
+  // Why the split does not take `layers`, or null when it does: unrotated
+  // quantized projections of one shape (AneFfn.cpp).
   [[nodiscard]] static const char *unsupported(std::span<const SwiGluProjections> layers);
   // The units the split moves intermediate channels in, of `layers`, which
   // it takes: the ANE takes from one to all but one of them.
@@ -113,7 +113,7 @@ public:
   bool begin();
   // Layer `layer`'s FFN of a chunk of `rows` rows, from kMinimumRows to
   // kMaximumRows, encoded in layer order from layer 0 after begin(): output =
-  // residual + FFN of ffn.normalized, whose Q4 sums the norm wrote.
+  // residual + FFN of ffn.normalized.
   void add(metal::CommandGraph &graph, uint32_t layer, const PrefillFfnBuffers &ffn, metal::MetalBuffer residual,
            metal::MetalBuffer output, uint32_t rows);
   // Starts the ANE's evaluations of the command encoded since begin(), then
@@ -171,16 +171,14 @@ private:
     ane::Surface tokenScale, partial;
     std::array<Weights, 2> sets;
   };
-  // A projection's weight planes as the ane_ffn kernels bind them: the affine
-  // Q4 weights, scales and biases, in units of 64 inputs, or a GGUF image
+  // A projection's weight planes as the ane_ffn kernels bind them: an image
   // tensor's plane0, plane1 and meta, in groups of 32 inputs, of their
-  // `groups` per row; GGUF's `format`; and the kernels' name suffix.
+  // `groups` per row, and its `format`.
   struct Planes final {
     // Throws unless the planes hold all of the projection's weights.
     explicit Planes(const Projection &projection);
     std::array<metal::MetalBuffer, 3> buffers;
     uint32_t groups = 0, format = 0;
-    const char *suffix = "";
   };
   // A matrix of a layer: its index in Layer::planes, and the part of the
   // layer's per-row int8 scales rowScales() views.

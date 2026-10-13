@@ -2,14 +2,15 @@
 // geometry: the convolution/normalisation prepare pass, the blocked recurrent
 // scan (output rows and the fp32 state it hands to decode), and the gated
 // output norm, for both compiled head layouts and ragged token counts that
-// leave partial scan blocks and single-token chunks.
+// leave partial scan blocks and single-token chunks. The scan over a bf16
+// state is checked against the fp32 scan.
 #include "../../../runtime/metal/CommandGraph.hpp"
 #include "../../../runtime/metal/MetalBackend.hpp"
 #include "../../../runtime/ops/GDN.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/GDN.h"
-#include "tuning/LinearNumerics.hpp"
 
+#include "LinearNumerics.hpp"
 #include "NormReference.hpp"
 
 #import <Foundation/Foundation.h>
@@ -34,6 +35,7 @@ using splash::ops::GDN;
 using splash::ops::GdnHeadOrder;
 using splash::ops::GdnPrefillBuffers;
 using splash::ops::GdnShape;
+using splash::ops::GdnStateFormat;
 using splash::ops::NormWeights;
 
 constexpr uint32_t kHeadDim = 128;
@@ -73,9 +75,9 @@ private:
 };
 
 uint16_t toBf16(double value) {
-  return splash::ops::tuning::floatToBf16(static_cast<float>(value));
+  return splash::test::floatToBf16(static_cast<float>(value));
 }
-double fromBf16(uint16_t value) { return splash::ops::tuning::bf16ToFloat(value); }
+double fromBf16(uint16_t value) { return splash::test::bf16ToFloat(value); }
 double roundBf16(double value) { return fromBf16(toBf16(value)); }
 double bf16Ulp(double value) {
   return std::max(std::fabs(value), 1e-30) * 0.0078125;
@@ -184,9 +186,10 @@ GdnPrefillBuffers randomPrefill(MetalBackend &backend, const GdnShape &shape,
 void submitPrefill(MetalBackend &backend, const GdnPrefillBuffers &buffers,
                    const GdnShape &shape, uint32_t tokens,
                    const std::string &label,
-                   GdnHeadOrder order = GdnHeadOrder::Grouped) {
+                   GdnHeadOrder order = GdnHeadOrder::Grouped,
+                   GdnStateFormat state = GdnStateFormat::Float32) {
   CommandGraph graph;
-  GDN::addPrefill(graph, buffers, shape, tokens, order);
+  GDN::addPrefill(graph, buffers, shape, tokens, state, order);
   require(graph.dispatches().size() == 3,
           label + "prefill is not three dispatches");
   (void)backend.submitCommandAsync(graph.dispatches()).wait();
@@ -459,6 +462,44 @@ void runSplitCase(MetalBackend &backend, const GdnShape &shape,
   std::cout << label << "byte-identical to the single pass\n";
 }
 
+// A bf16 state's scan computes as the fp32 state's does: from the same state,
+// whose values bf16 holds, its recurrent and hidden rows are the fp32 scan's
+// byte for byte, and the state it stores is the fp32 scan's rounded to
+// nearest even.
+void runBfloatStateCase(MetalBackend &backend, const GdnShape &shape,
+                        uint32_t tokens) {
+  const std::string label = "vh" + std::to_string(shape.valueHeads) +
+                            " tokens=" + std::to_string(tokens) +
+                            " bf16 state: ";
+  GdnPrefillBuffers wide = randomPrefill(backend, shape, tokens);
+  const uint64_t elements = wide.recurrentIn.sizeBytes() / 4;
+  MetalBuffer narrowIn = shared(backend, elements * 2, "bf16 state in");
+  auto *wideState = data<float>(wide.recurrentIn);
+  auto *narrowState = data<uint16_t>(narrowIn);
+  for (uint64_t i = 0; i < elements; ++i) {
+    narrowState[i] = toBf16(wideState[i]);
+    wideState[i] = static_cast<float>(fromBf16(narrowState[i]));
+  }
+  GdnPrefillBuffers narrow = prefillBuffers(
+      backend, shape, tokens, wide.packed, wide.convolutionIn, narrowIn,
+      wide.convolutionWeights, wide.decayWeights, wide.timeBias,
+      wide.mixerNorm);
+  submitPrefill(backend, wide, shape, tokens, label);
+  submitPrefill(backend, narrow, shape, tokens, label, GdnHeadOrder::Grouped,
+                GdnStateFormat::BFloat16);
+  requireSameBytes(narrow.recurrentRows, wide.recurrentRows, 0,
+                   wide.recurrentRows.sizeBytes(),
+                   label + "recurrent rows differ from the fp32 scan's");
+  requireSameBytes(narrow.hidden, wide.hidden, 0, wide.hidden.sizeBytes(),
+                   label + "hidden rows differ from the fp32 scan's");
+  const auto *wideOut = data<float>(wide.recurrentOut);
+  const auto *narrowOut = data<uint16_t>(narrow.recurrentOut);
+  for (uint64_t i = 0; i < elements; ++i)
+    require(narrowOut[i] == toBf16(wideOut[i]),
+            label + "the state is not the fp32 scan's rounded to nearest even");
+  std::cout << label << "the fp32 scan's rows and its state rounded\n";
+}
+
 // The tiled head order only moves each value head's output block: over the
 // same inputs, the tiled hidden rows are the grouped ones with head h at
 // (h % heads per key) * key heads + h / heads per key, byte for byte, and the
@@ -501,16 +542,19 @@ void runTiledCase(MetalBackend &backend, const GdnShape &shape,
 // Each buffer the prefill reaches, at its extent and one element short: the
 // packed rows up to the last row's alpha, the four taps of every channel's
 // convolution weights and its three carried rows, the q/k/v and gate rows of
-// every token, a value head's state, and the mixer norm in either type.
-void bufferExtents(MetalBackend &backend, const GdnShape &shape, bool float32) {
+// every token, a value head's state in its format, and the mixer norm in
+// either type.
+void bufferExtents(MetalBackend &backend, const GdnShape &shape, bool float32,
+                   GdnStateFormat format) {
   constexpr uint32_t tokens = 37;
   const GdnPrefillBuffers buffers = randomPrefill(backend, shape, tokens, float32);
   const uint64_t valueWidth = uint64_t{shape.valueHeads} * kHeadDim;
   const uint64_t keyRows = uint64_t{tokens} * shape.keyHeads * kHeadDim * 2;
   const uint64_t valueRows = tokens * valueWidth * 2;
-  const uint64_t state = valueWidth * kHeadDim * 4;
+  const uint64_t stateElement = splash::ops::elementBytes(format);
+  const uint64_t state = valueWidth * kHeadDim * stateElement;
   const auto encode = [&](CommandGraph &graph, const GdnPrefillBuffers &changed) {
-    GDN::addPrefill(graph, changed, shape, tokens, GdnHeadOrder::Grouped);
+    GDN::addPrefill(graph, changed, shape, tokens, format, GdnHeadOrder::Grouped);
   };
   for (const auto &[member, bytes, element, what] :
        std::initializer_list<std::tuple<MetalBuffer GdnPrefillBuffers::*, uint64_t, uint64_t, const char *>>{
@@ -531,8 +575,8 @@ void bufferExtents(MetalBackend &backend, const GdnShape &shape, bool float32) {
            {&GdnPrefillBuffers::timeBias, uint64_t{shape.valueHeads} * 2, 2, "GDN time bias"},
            {&GdnPrefillBuffers::decay, uint64_t{tokens} * shape.valueHeads * 4, 4, "GDN decay"},
            {&GdnPrefillBuffers::beta, uint64_t{tokens} * shape.valueHeads * 2, 2, "GDN beta"},
-           {&GdnPrefillBuffers::recurrentIn, state, 4, "GDN recurrent state"},
-           {&GdnPrefillBuffers::recurrentOut, state, 4, "GDN next recurrent state"},
+           {&GdnPrefillBuffers::recurrentIn, state, stateElement, "GDN recurrent state"},
+           {&GdnPrefillBuffers::recurrentOut, state, stateElement, "GDN next recurrent state"},
            {&GdnPrefillBuffers::recurrentRows, valueRows, 2, "GDN recurrent row"},
            {&GdnPrefillBuffers::hidden, valueRows, 2, "GDN hidden"}})
     splash::test::requireExtent(backend, buffers.*member, bytes, element, what,
@@ -555,7 +599,8 @@ void run(const std::string &metallib) {
   for (const GdnShape &shape :
        {GdnShape{16, 48, 128, 10240, 16640}, GdnShape{16, 32, 128, 8192, 12544}}) {
     for (bool float32 : {false, true})
-      bufferExtents(backend, shape, float32);
+      bufferExtents(backend, shape, float32, GdnStateFormat::Float32);
+    bufferExtents(backend, shape, false, GdnStateFormat::BFloat16);
     for (uint32_t tokens : {1u, 37u, 1000u, 2048u})
       runCase(backend, shape, tokens);
     for (uint32_t tokens : {1u, 37u})
@@ -564,6 +609,8 @@ void run(const std::string &metallib) {
     runSplitCase(backend, shape, 37, 17);
     for (uint32_t tokens : {1u, 37u, 1000u})
       runTiledCase(backend, shape, tokens);
+    for (uint32_t tokens : {1u, 37u, 1000u})
+      runBfloatStateCase(backend, shape, tokens);
   }
   std::cout << "gdn_metal_test passed\n";
 }

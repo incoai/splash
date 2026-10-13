@@ -66,6 +66,10 @@ public:
   // or while a command is in flight (it reaches both pages through its
   // tables and may still write the source).
   virtual void copyPages(std::span<const PageCopy> copies) = 0;
+  // Zeroes each page's content, in an allocated extent: a page one request
+  // holds alone and that no command reaches yet (KvPool::clearPage).
+  // std::logic_error, clearing nothing, for a page of an unallocated extent.
+  virtual void clearPages(std::span<const uint32_t> pages) = 0;
 };
 
 // Shared cache format and execution limits; model dimensions live in Layout.

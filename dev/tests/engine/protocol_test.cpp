@@ -27,6 +27,7 @@ using splash::ConstraintMode;
 using splash::ImageSpan;
 using splash::RequestIgnoreEndOfSequence;
 using splash::SamplingParameters;
+using splash::ThinkingBudget;
 using splash::engine::EngineFinishReason;
 using splash::engine::RequestPriority;
 using splash::model::ExecutionLimits;
@@ -68,7 +69,9 @@ constexpr size_t seed = minP + 4;
 constexpr size_t scoreCount = seed + 8;
 constexpr size_t generationPrompt = scoreCount + 4;
 constexpr size_t flags = generationPrompt + 4;
-static_assert(flags + 4 == kRequestFixedBytes);
+constexpr size_t cacheSalt = flags + 4;
+constexpr size_t thinkingBudget = cacheSalt + 16;
+static_assert(thinkingBudget + 12 == kRequestFixedBytes);
 } // namespace request_offset
 
 uint32_t loadU32(const std::vector<uint8_t> &bytes, size_t offset) {
@@ -172,6 +175,8 @@ RequestFrame exampleRequest() {
   request.sampling.seed = 0xfedcba9876543210ULL;
   request.constraint = ConstraintMode::TokenMask;
   request.generationPromptTokens = 2;
+  request.cacheSalt = {0x8899aabbccddeeffULL, 0x0011223344556677ULL};
+  request.thinkingBudget = ThinkingBudget{4096, 248069, 248058};
   return request;
 }
 
@@ -194,6 +199,7 @@ RequestFrame exampleScoreRequest() {
   request.sampling = {.seed = request.sampling.seed};
   request.constraint = ConstraintMode::None;
   request.scoreTokens = {101, 202, 303};
+  request.thinkingBudget.reset();
   return request;
 }
 
@@ -221,6 +227,7 @@ const std::vector<std::pair<std::string, ClientMessage>> &clientMessages() {
       {"mask_response",
        MaskResponseFrame{91, 7, {0xffffffffU, 0, 0xa5a5a5a5U}}},
       {"status_request", StatusRequestFrame{808}},
+      {"release_request", ReleaseRequestFrame{808}},
   };
   return messages;
 }
@@ -235,9 +242,9 @@ const std::vector<std::pair<std::string, EngineEvent>> &engineEvents() {
       {"mask_request_initial", MaskRequestEvent{91, 6, 4, {}}},
       {"mask_request_verify", MaskRequestEvent{91, 7, 4, {101, 102, 103}}},
       {"done", DoneEvent{91, EngineFinishReason::Stop, 4096, 512, 1000, 2000,
-                         3500, {}}},
+                         3500, {}, 64, {350, 280, 50}}},
       {"done_scored", DoneEvent{91, EngineFinishReason::Stop, 4096, 0, 1000, 0,
-                                3500, {1.5f, -2.25f, 0.5f}}},
+                                3500, {1.5f, -2.25f, 0.5f}, 32}},
       {"error_request",
        ErrorEvent{FailureClass::RequestError, 91, true, "deadline_exceeded",
                   "request deadline expired"}},
@@ -386,17 +393,26 @@ void testScoreRequestAndDoneLogits() {
   expectRequestIssue(test, topP, IssueCode::InvalidSampling);
 
   DoneEvent scored{91, EngineFinishReason::Stop, 4096, 0, 1000, 0, 3500,
-                   {1.5f, -2.0f, 0.25f}};
+                   {1.5f, -2.0f, 0.25f}, 96};
   CHECK(test, roundTripEvent(scored) == scored);
   auto encodedDone = serializeEvent(scored, kLimits);
   CHECK(test, encodedDone);
   if (encodedDone) {
-    CHECK(test, encodedDone.value->size() == kFrameHeaderBytes + 45 + 12);
-    CHECK(test, loadU32(*encodedDone.value, kFrameHeaderBytes + 41) == 3);
+    CHECK(test, encodedDone.value->size() == kFrameHeaderBytes + 61 + 12);
+    CHECK(test, loadU32(*encodedDone.value, kFrameHeaderBytes + 41) == 96);
+    CHECK(test, loadU32(*encodedDone.value, kFrameHeaderBytes + 57) == 3);
   }
 
   DoneEvent generation{91, EngineFinishReason::Length, 10, 4, 1, 2, 3, {}};
   CHECK(test, roundTripEvent(generation) == generation);
+  for (const auto counts : {splash::engine::SpeculativeCounts{7, 8, 1},
+                             splash::engine::SpeculativeCounts{7, 0, 0},
+                             splash::engine::SpeculativeCounts{0, 0, 1},
+                             splash::engine::SpeculativeCounts{7, 0, 8}}) {
+    DoneEvent invalid = generation;
+    invalid.speculation = counts;
+    expectEventIssue(test, invalid, IssueCode::InvalidCount);
+  }
 
   DoneEvent cancelled{91, EngineFinishReason::Cancelled, 10, 0, 1, 0, 3, {}};
   CHECK(test, roundTripEvent(cancelled) == cancelled);
@@ -869,6 +885,37 @@ void testRequestFlags() {
   expectRequestIssue(test, score, IssueCode::InvalidConstraint);
 }
 
+// A thinking budget follows the cache salt; without one, its tokens word is
+// kNoThinkingBudget and its end tokens are zero.
+void testThinkingBudget() {
+  constexpr std::string_view test = "thinking budget";
+  const size_t at = kFrameHeaderBytes + request_offset::thinkingBudget;
+  const std::vector<uint8_t> wire = peer::serialize(exampleRequest());
+  CHECK(test, loadU32(wire, at) == 4096 && loadU32(wire, at + 4) == 248069 &&
+                  loadU32(wire, at + 8) == 248058);
+
+  RequestFrame none = exampleRequest();
+  none.thinkingBudget.reset();
+  const std::vector<uint8_t> noneWire = peer::serialize(none);
+  CHECK(test, loadU32(noneWire, at) == kNoThinkingBudget &&
+                  loadU32(noneWire, at + 4) == 0 && loadU32(noneWire, at + 8) == 0);
+  CHECK(test, roundTrip(none) == none);
+  RequestFrame zero = exampleRequest();
+  zero.thinkingBudget->tokens = 0;
+  CHECK(test, roundTrip(zero) == zero);
+
+  std::vector<uint8_t> stray = noneWire;
+  storeU32(stray, at + 8, 248058);
+  const auto decoded = decodeClient(stray, kLimits);
+  CHECK(test, !decoded && decoded.issue &&
+                  decoded.issue->failureClass == FailureClass::RequestError &&
+                  decoded.issue->code == IssueCode::InvalidCount);
+
+  RequestFrame score = exampleScoreRequest();
+  score.thinkingBudget = ThinkingBudget{0, 248069, 248069};
+  expectRequestIssue(test, score, IssueCode::InvalidCount);
+}
+
 std::string jsonOfExactSize(size_t bytes) {
   if (bytes < 8)
     throw std::invalid_argument("JSON size is too small");
@@ -1071,6 +1118,7 @@ int main(int argc, char **argv) {
     testPromptAndImageSpanRejections();
     testSamplingBlock();
     testRequestFlags();
+    testThinkingBudget();
     testBoundedArbitraryStatusJsonAndFrames();
     testFailureTaxonomy();
     testUnnamedRequestFailuresAreFatal();

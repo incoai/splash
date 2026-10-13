@@ -8,6 +8,7 @@ from dev.tests.server_fixtures import (
     Plan,
     chat_body,
     openai_client,
+    responses_body,
 )
 from server import backend as backend_api
 
@@ -52,10 +53,54 @@ class ChatCompletionTests(HarnessTestCase):
         self.assertNotIn("batch", response["metrics"])
         self.assertEqual(
             response["metrics"]["cache"],
-            {"status": "hit", "matched_tokens": 1, "lane": 0},
+            {
+                "status": "hit",
+                "matched_tokens": 1,
+                "lane": 0,
+                "deduplicated_tokens": 0,
+            },
         )
         self.assertNotIn("queue_ms", response["metrics"])
         self.assertEqual(runtime.requests[0].frame.seed, 7)
+
+    def test_every_generation_api_sends_the_cache_salt(self):
+        # Responses and Messages reach the engine through chat bodies of
+        # their own, which carry the salt too.
+        requests = (
+            ("/v1/chat/completions", chat_body(cache_salt="tenant-a")),
+            (
+                "/v1/completions",
+                {"model": "test-model", "prompt": "hi", "max_tokens": 1}
+                | {"cache_salt": "tenant-a"},
+            ),
+            ("/v1/responses", responses_body(cache_salt="tenant-a")),
+            (
+                "/v1/messages",
+                {
+                    "model": "test-model",
+                    "max_tokens": 1,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "cache_salt": "tenant-a",
+                },
+            ),
+            ("/v1/chat/completions", chat_body()),
+        )
+        runtime = FakeRuntime(
+            *(Plan([[1]], reason="length") for _ in range(len(requests)))
+        )
+        harness = self.harness(runtime)
+        for path, body in requests:
+            status, _, payload = harness.request("POST", path, body)
+            self.assertEqual(status, 200, (path, payload))
+        *salted, unsalted = (request.frame.cache_salt for request in runtime.requests)
+        # Persisted caches keep salted prompts under this value: changing the
+        # hash orphans them.
+        self.assertEqual(salted, [0xC9D55DE1D7B39AF63B3B58B43F8BDEBE] * 4)
+        self.assertEqual(unsalted, 0)
+        status, _, payload = harness.request(
+            "POST", "/v1/chat/completions", chat_body(cache_salt="")
+        )
+        self.assertEqual(status, 400, payload)
 
     def test_streaming_sse_and_usage(self):
         harness = self.harness(FakeRuntime(Plan([[1], [2], [3]], reason="length")))

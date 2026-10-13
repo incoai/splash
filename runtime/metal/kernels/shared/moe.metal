@@ -2,310 +2,22 @@
 #include "metal/kernels/common/activation.h"
 #include "metal/kernels/common/gguf_sgmatrix.h"
 #include "metal/kernels/common/moe_expert_slab.h"
-#include "metal/kernels/common/q4_mpp_tiles.h"
 
 // Routes group rows by expert so each tile streams its weights once. Each row
 // carries top_k routed experts plus the shared expert (id `experts`), weighted
-// by the sigmoid of its scalar gate. Experts use the packed Q4 layout
-// (kQ4StorageColumns-column tiles).
+// by the sigmoid of its scalar gate.
 //
-// Routing first writes SPLASH_MOE_EXPERT_SLOTS fp32 scores per row, then
-// sorts them. Q8 affine terms accumulate per K slice, and slices sum in fixed
-// order so both score tile shapes produce identical results. The 8-row tile
-// favors short chunks and the 32-row tile, which amortizes weight loads,
-// longer ones; their crossover (ops::moeRouteTile) is measured on Apple10
-// only.
-constant constexpr uint kMoeRouteSlices = 8;
-static_assert(kQ4StorageColumns == SPLASH_MOE_EXPERT_SLOTS,
-              "the affine router is one Q8 storage tile of expert slots");
-
-// Quant groups [x, y) of one K slice; both tiles use this partition.
-inline uint2 moe_route_slice(uint slice, uint quant_groups) {
-  return uint2(slice * quant_groups / kMoeRouteSlices,
-               (slice + 1) * quant_groups / kMoeRouteSlices);
-}
-
-// Sum of a staged 64-wide row in a fixed lane order.
-inline float moe_route_row_sum(threadgroup const bfloat *row, uint simd_lane) {
-  return simd_sum(float(row[simd_lane]) + float(row[simd_lane + 32]));
-}
-
-// One quant group's affine term. The explicit fma pins the rounding so both
-// tiles evaluate it identically.
-inline float moe_route_group_term(float dot, float scale, float sum,
-                                  float bias) {
-  return fma(dot, scale, sum * bias);
-}
-
-// Eight rows by 32 experts per threadgroup. Simdgroup s owns K slice s and
-// stages its rows in threadgroup memory, so a ragged tail never reads past
-// the last live row; the threadgroup then sums the slice partials in order.
-kernel void moe_route_scores_q8_m8(
-    device bfloat *input [[buffer(0)]],
-    device uint8_t *router_weights [[buffer(1)]],
-    device bfloat *router_scales [[buffer(2)]],
-    device bfloat *router_biases [[buffer(3)]],
-    device float *scores [[buffer(4)]],
-    constant MoeRouteParams &params [[buffer(5)]],
-    uint2 group [[threadgroup_position_in_grid]],
-    uint thread_index [[thread_index_in_threadgroup]],
-    uint simd_lane [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  constexpr uint Rows = 8;
-  constexpr uint TileN = 32;
-  constexpr uint StorageN = kQ4StorageColumns;
-  constexpr uint Slots = SPLASH_MOE_EXPERT_SLOTS;
-  constexpr uint Simdgroups = 8;
-  static_assert(Simdgroups == kMoeRouteSlices, "one simdgroup per K slice");
-  threadgroup uint4 staged_storage[Simdgroups * Rows * 64 * 2 / 16];
-  threadgroup float partials[Simdgroups * Rows * TileN];
-  threadgroup float parameters[Simdgroups * 2 * TileN];
-  threadgroup float sums[Simdgroups * Rows];
-  const uint row_base = group.x * Rows;
-  if (row_base >= params.rows)
-    return;
-  const uint live_rows = min(Rows, params.rows - row_base);
-  const uint expert_origin = group.y * TileN;
-  const uint quant_groups = params.input_size / 64;
-
-  threadgroup bfloat *staged =
-      reinterpret_cast<threadgroup bfloat *>(staged_storage) +
-      simd_group * Rows * 64;
-  threadgroup float *slice_parameters = parameters + simd_group * 2 * TileN;
-  threadgroup float *slice_sums = sums + simd_group * Rows;
-  auto a = tensor(staged, dextents<int, 2>{64, int(Rows)},
-                  array<int, 2>{1, 64});
-  constexpr auto descriptor =
-      matmul2d_descriptor(Rows, TileN, 64, false, true, false);
-  matmul2d<descriptor, execution_simdgroups<1>> operation;
-  auto a_slice = a.slice<64, Rows>(0, 0);
-  tensor<device uint8_t, dextents<int, 2>, tensor_inline> first_b(
-      router_weights + ulong(expert_origin) * 64, dextents<int, 2>{64, TileN},
-      array<int, 2>{1, 64});
-  auto first_b_slice = first_b.slice<64, TileN>(0, 0);
-  auto partial = operation.get_destination_cooperative_tensor<
-      decltype(a_slice), decltype(first_b_slice), float>();
-  auto accumulated = operation.get_destination_cooperative_tensor<
-      decltype(a_slice), decltype(first_b_slice), float>();
-  const bool fullyOccupied =
-      uint(accumulated.get_capacity()) * 32u == Rows * TileN;
-  const auto traversal =
-      fullyOccupied ? Q4Traversal::All : q4_traversal(accumulated);
-  q4_visit(accumulated, traversal, [&](ushort i) { accumulated[i] = 0.0f; });
-
-  const uint2 slice = moe_route_slice(simd_group, quant_groups);
-  const uint stage_row = simd_lane / 4;
-  const uint stage_column = (simd_lane % 4) * 16;
-  device const bfloat *stage_source =
-      input +
-      ulong(row_base + min(stage_row, live_rows - 1)) * params.input_size +
-      stage_column;
-  threadgroup uint4 *stage_destination = reinterpret_cast<threadgroup uint4 *>(
-      staged + stage_row * 64 + stage_column);
-  for (uint quant_group = slice.x; quant_group < slice.y; ++quant_group) {
-    if (stage_row < live_rows) {
-      device const uint4 *source = reinterpret_cast<device const uint4 *>(
-          stage_source + quant_group * 64);
-      stage_destination[0] = source[0];
-      stage_destination[1] = source[1];
-    } else {
-      stage_destination[0] = uint4(0);
-      stage_destination[1] = uint4(0);
-    }
-    const ulong parameter =
-        ulong(quant_group) * StorageN + expert_origin + simd_lane;
-    slice_parameters[simd_lane] = float(router_scales[parameter]);
-    slice_parameters[TileN + simd_lane] = float(router_biases[parameter]);
-    simdgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint row = 0; row < Rows; ++row) {
-      const float sum = moe_route_row_sum(staged + row * 64, simd_lane);
-      if (simd_lane == 0)
-        slice_sums[row] = sum;
-    }
-    tensor<device uint8_t, dextents<int, 2>, tensor_inline> b(
-        router_weights + (ulong(quant_group) * StorageN + expert_origin) * 64,
-        dextents<int, 2>{64, TileN}, array<int, 2>{1, 64});
-    auto b_slice = b.slice<64, TileN>(0, 0);
-    operation.run(a_slice, b_slice, partial);
-    simdgroup_barrier(mem_flags::mem_threadgroup);
-    q4_visit(accumulated, traversal,
-             [&](ushort i) __attribute__((always_inline)) {
-      auto index = accumulated.get_multidimensional_index(i);
-      accumulated[i] = accumulated[i] +
-          moe_route_group_term(partial[i], slice_parameters[index[0]],
-                               slice_sums[index[1]],
-                               slice_parameters[TileN + index[0]]);
-    });
-    simdgroup_barrier(mem_flags::mem_threadgroup);
-  }
-  q4_visit(accumulated, traversal, [&](ushort i) {
-    auto index = accumulated.get_multidimensional_index(i);
-    partials[(simd_group * Rows + index[1]) * TileN + index[0]] =
-        accumulated[i];
-  });
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  const uint row = thread_index / TileN;
-  const uint column = thread_index % TileN;
-  float total = 0.0f;
-  for (uint s = 0; s < kMoeRouteSlices; ++s)
-    total += partials[(s * Rows + row) * TileN + column];
-  if (row < live_rows) {
-    scores[ulong(row_base + row) * Slots + expert_origin + column] = total;
-  }
-}
-
-// 32 rows by 128 experts per threadgroup: all eight simdgroups run each
-// quant group's matmul from the staged rows, accumulating the K slices in the
-// same order as the 8-row tile.
-kernel void moe_route_scores_q8_m32(
-    device bfloat *input [[buffer(0)]],
-    device uint8_t *router_weights [[buffer(1)]],
-    device bfloat *router_scales [[buffer(2)]],
-    device bfloat *router_biases [[buffer(3)]],
-    device float *scores [[buffer(4)]],
-    constant MoeRouteParams &params [[buffer(5)]],
-    uint2 group [[threadgroup_position_in_grid]],
-    uint thread_index [[thread_index_in_threadgroup]],
-    uint simd_lane [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  constexpr uint Rows = 32;
-  constexpr uint TileN = 128;
-  constexpr uint StorageN = kQ4StorageColumns;
-  constexpr uint Slots = SPLASH_MOE_EXPERT_SLOTS;
-  constexpr uint Simdgroups = 8;
-  threadgroup uint4 staged_storage[Rows * 64 * 2 / 16];
-  // Scales/biases and row sums alternate buffers so the next group's stores
-  // never race the epilogue reads of the current one.
-  threadgroup float parameters[2 * 2 * TileN];
-  threadgroup float sums[2 * Rows];
-  const uint row_base = group.x * Rows;
-  if (row_base >= params.rows)
-    return;
-  const uint live_rows = min(Rows, params.rows - row_base);
-  const uint expert_origin = group.y * TileN;
-  const uint quant_groups = params.input_size / 64;
-
-  threadgroup bfloat *staged =
-      reinterpret_cast<threadgroup bfloat *>(staged_storage);
-  auto a = tensor(staged, dextents<int, 2>{64, int(Rows)},
-                  array<int, 2>{1, 64});
-  constexpr auto descriptor =
-      matmul2d_descriptor(Rows, TileN, 64, false, true, false);
-  matmul2d<descriptor, execution_simdgroups<Simdgroups>> operation;
-  auto a_slice = a.slice<64, Rows>(0, 0);
-  tensor<device uint8_t, dextents<int, 2>, tensor_inline> first_b(
-      router_weights + ulong(expert_origin) * 64, dextents<int, 2>{64, TileN},
-      array<int, 2>{1, 64});
-  auto first_b_slice = first_b.slice<64, TileN>(0, 0);
-  auto partial = operation.get_destination_cooperative_tensor<
-      decltype(a_slice), decltype(first_b_slice), float>();
-  auto slice_sum = operation.get_destination_cooperative_tensor<
-      decltype(a_slice), decltype(first_b_slice), float>();
-  auto total = operation.get_destination_cooperative_tensor<
-      decltype(a_slice), decltype(first_b_slice), float>();
-  const bool fullyOccupied =
-      uint(total.get_capacity()) * (Simdgroups * 32u) == Rows * TileN;
-  const auto traversal =
-      fullyOccupied ? Q4Traversal::All : q4_traversal(total);
-  q4_visit(total, traversal, [&](ushort i) { total[i] = 0.0f; });
-
-  const uint stage_row = thread_index / 8;
-  const uint stage_column = (thread_index % 8) * 8;
-  device const bfloat *stage_source =
-      input +
-      ulong(row_base + min(stage_row, live_rows - 1)) * params.input_size +
-      stage_column;
-  threadgroup uint4 *stage_destination = reinterpret_cast<threadgroup uint4 *>(
-      staged + stage_row * 64 + stage_column);
-  const bool scale_thread = thread_index < TileN;
-  const uint parameter_column = expert_origin + thread_index % TileN;
-  for (uint s = 0; s < kMoeRouteSlices; ++s) {
-    q4_visit(slice_sum, traversal, [&](ushort i) { slice_sum[i] = 0.0f; });
-    const uint2 slice = moe_route_slice(s, quant_groups);
-    for (uint quant_group = slice.x; quant_group < slice.y; ++quant_group) {
-      const uint buffer = quant_group & 1;
-      if (stage_row < live_rows) {
-        stage_destination[0] = *reinterpret_cast<device const uint4 *>(
-            stage_source + quant_group * 64);
-      } else {
-        stage_destination[0] = uint4(0);
-      }
-      threadgroup float *group_parameters = parameters + buffer * 2 * TileN;
-      threadgroup float *group_sums = sums + buffer * Rows;
-      const ulong parameter = ulong(quant_group) * StorageN + parameter_column;
-      group_parameters[thread_index] =
-          scale_thread ? float(router_scales[parameter])
-                       : float(router_biases[parameter]);
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      for (uint row = simd_group; row < Rows; row += Simdgroups) {
-        const float sum = moe_route_row_sum(staged + row * 64, simd_lane);
-        if (simd_lane == 0)
-          group_sums[row] = sum;
-      }
-      tensor<device uint8_t, dextents<int, 2>, tensor_inline> b(
-          router_weights +
-              (ulong(quant_group) * StorageN + expert_origin) * 64,
-          dextents<int, 2>{64, TileN}, array<int, 2>{1, 64});
-      auto b_slice = b.slice<64, TileN>(0, 0);
-      operation.run(a_slice, b_slice, partial);
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      q4_visit(slice_sum, traversal,
-               [&](ushort i) __attribute__((always_inline)) {
-        auto index = slice_sum.get_multidimensional_index(i);
-        slice_sum[i] = slice_sum[i] +
-            moe_route_group_term(partial[i], group_parameters[index[0]],
-                                 group_sums[index[1]],
-                                 group_parameters[TileN + index[0]]);
-      });
-    }
-    q4_visit(total, traversal,
-             [&](ushort i) { total[i] = total[i] + slice_sum[i]; });
-  }
-  q4_visit(total, traversal, [&](ushort i) {
-    auto index = total.get_multidimensional_index(i);
-    if (uint(index[1]) < live_rows) {
-      scores[ulong(row_base + index[1]) * Slots + expert_origin +
-             index[0]] = total[i];
-    }
-  });
-}
-
-// The shared expert's scalar gate weight of input `dimension`: the Q8 affine
-// row of a package or an MLX model, or the F32 tensor of a GGUF
-// (ffn_gate_inp_shexp), which runs unrounded.
-struct MoeSharedGateQ8 {
-  device uint8_t *weights;
-  device bfloat *scales;
-  device bfloat *biases;
-};
-struct MoeSharedGateF32 {
-  device const float *weights;
-};
-inline float moe_shared_gate_weight(MoeSharedGateQ8 gate, uint dimension) {
-  constexpr uint StorageN = kQ4StorageColumns;
-  uint quant_group = dimension / 64;
-  uint within_group = dimension % 64;
-  ulong weight_index = ulong(quant_group) * StorageN * 64 + within_group;
-  ulong parameter = ulong(quant_group) * StorageN;
-  return float(gate.weights[weight_index]) * float(gate.scales[parameter]) +
-         float(gate.biases[parameter]);
-}
-inline float moe_shared_gate_weight(MoeSharedGateF32 gate, uint dimension) {
-  return gate.weights[dimension];
-}
-
 // One row per threadgroup: thread e holds expert e's score, the threadgroup
-// reduces the shared expert's scalar gate with a fixed partial-sum order, and
-// simdgroup 0 orders the experts, descending score then ascending id, which
-// is the order the shape's routing and tie-break contract requires. Scores
-// and routing weights are fp32. On 40,960 router rows each of real 35B prose,
-// code and chat, top-8 sets chosen from bf16-rounded scores differ from the
-// fp64 choice on 12-15% of rows (fp32: at most 0.0024%), and bf16 weights
+// reduces the shared expert's F32 scalar gate with a fixed partial-sum order,
+// and simdgroup 0 orders the experts, descending score then ascending id,
+// which is the order the shape's routing and tie-break contract requires.
+// Scores and routing weights are fp32. On 40,960 router rows each of real 35B
+// prose, code and chat, top-8 sets chosen from bf16-rounded scores differ from
+// the fp64 choice on 12-15% of rows (fp32: at most 0.0024%), and bf16 weights
 // round 19-20% of the combine's outputs away from bf16 of its exact sum
 // (fp32: 0.008%).
-template <class SharedGate>
 inline void moe_route_select(device const float *scores, device bfloat *input,
-                             SharedGate shared_gate, device uint *selected,
+                             device const float *shared_gate, device uint *selected,
                              device float *routing_weights,
                              constant MoeRouteParams &params, uint group,
                              uint thread_index, uint simd_lane,
@@ -328,7 +40,7 @@ inline void moe_route_select(device const float *scores, device bfloat *input,
   for (uint dimension = thread_index; dimension < params.input_size;
        dimension += Slots) {
     scalar += float(row_input[dimension]) *
-              moe_shared_gate_weight(shared_gate, dimension);
+              shared_gate[dimension];
   }
   scalar = simd_sum(scalar);
   if (simd_lane == 0)
@@ -382,28 +94,6 @@ inline void moe_route_select(device const float *scores, device bfloat *input,
   }
 }
 
-kernel void moe_route_select_q8(
-    device const float *scores [[buffer(0)]],
-    device bfloat *input [[buffer(1)]],
-    device uint8_t *shared_weights [[buffer(2)]],
-    device bfloat *shared_scales [[buffer(3)]],
-    device bfloat *shared_biases [[buffer(4)]],
-    device uint *selected [[buffer(5)]],
-    device float *routing_weights [[buffer(6)]],
-    constant MoeRouteParams &params [[buffer(7)]],
-    uint group [[threadgroup_position_in_grid]],
-    uint thread_index [[thread_index_in_threadgroup]],
-    uint simd_lane [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  threadgroup float row_scores[SPLASH_MOE_EXPERT_SLOTS];
-  threadgroup float ordered[SPLASH_MOE_EXPERT_SLOTS];
-  threadgroup float scalar_partials[SPLASH_MOE_EXPERT_SLOTS / 32];
-  moe_route_select(scores, input,
-                   MoeSharedGateQ8{shared_weights, shared_scales, shared_biases},
-                   selected, routing_weights, params, group, thread_index,
-                   simd_lane, simd_group, row_scores, ordered, scalar_partials);
-}
-
 // The GGUF router: fp32 scores (kernels/shared/gguf_float.metal) and the F32
 // shared-expert scalar gate.
 kernel void moe_route_select_f32(
@@ -420,7 +110,7 @@ kernel void moe_route_select_f32(
   threadgroup float row_scores[SPLASH_MOE_EXPERT_SLOTS];
   threadgroup float ordered[SPLASH_MOE_EXPERT_SLOTS];
   threadgroup float scalar_partials[SPLASH_MOE_EXPERT_SLOTS / 32];
-  moe_route_select(scores, input, MoeSharedGateF32{shared_gate}, selected,
+  moe_route_select(scores, input, shared_gate, selected,
                    routing_weights, params, group, thread_index, simd_lane,
                    simd_group, row_scores, ordered, scalar_partials);
 }
@@ -431,10 +121,15 @@ kernel void moe_route_select_f32(
 // (moe_matmul_rows) carry the route ~0u. One threadgroup covers all routes
 // and thread e owns expert e's count, offsets and tile descriptors. The
 // shared expert's tiles follow the routed tiles and hold every row in order.
+// It writes the tile count with the expert passes' grids (MoeTileCount).
+// In place (a plan whose rows fill one tile) each expert gets one tile of the
+// plan's rows: a route's grouped row is its expert tile's row of the route's
+// own row, and the routed tiles' grouped routes go unwritten, as no gather
+// reads them.
 kernel void moe_group_routes(
     device const uint *selected [[buffer(0)]],
     device MoeTileDescriptor *tiles [[buffer(1)]],
-    device uint *tile_count [[buffer(2)]],
+    device MoeTileCount *tile_count [[buffer(2)]],
     device uint *grouped_routes [[buffer(3)]],
     device uint *route_rows [[buffer(4)]],
     constant MoeGroupParams &params [[buffer(5)]],
@@ -474,9 +169,9 @@ kernel void moe_group_routes(
     routed_tiles = tile_offset + expert_tiles;
   for (uint tile = 0; tile < expert_tiles; ++tile) {
     tiles[tile_offset + tile] = MoeTileDescriptor{
-        thread_index, min(params.tile_rows, count - tile * params.tile_rows)};
+        thread_index, params.in_place ? params.rows : min(params.tile_rows, count - tile * params.tile_rows)};
   }
-  if (expert_tiles) {
+  if (expert_tiles && !params.in_place) {
     const uint last = tile_offset + expert_tiles - 1;
     const uint live = count - (expert_tiles - 1) * params.tile_rows;
     for (uint row = tile_offset * params.tile_rows + count;
@@ -489,6 +184,10 @@ kernel void moe_group_routes(
     if (route % routes_per_row == params.top_k)
       continue;
     uint expert = selected[route];
+    if (params.in_place) {
+      route_rows[route] = tile_offsets[expert] * params.tile_rows + route / routes_per_row;
+      continue;
+    }
     uint slot =
         atomic_fetch_add_explicit(&cursors[expert], 1u, memory_order_relaxed);
     uint row = tile_offsets[expert] * params.tile_rows + slot;
@@ -517,8 +216,11 @@ kernel void moe_group_routes(
       grouped_routes[shared_base + row] = ~0u;
     }
   }
-  if (thread_index == 0)
-    *tile_count = routed_tiles + shared_tiles;
+  if (thread_index == 0) {
+    const uint live = routed_tiles + shared_tiles;
+    *tile_count = MoeTileCount{live, {params.gate_up_columns, live, 1},
+                               {params.down_columns, live, 1}};
+  }
 }
 
 // Copies each grouped row's input so every expert tile is a dense matrix,
@@ -607,94 +309,6 @@ kernel void moe_prepare_table16(device const bfloat *rows [[buffer(0)]],
       },
       table, sums, width, group, simd_lane, simd_group);
 }
-
-// One expert tile: 8 grouped rows times TileN output columns, read through
-// the same Q4 tile as the dense projections. The expert's weights stream once
-// per tile instead of once per route. Decode plans run this fused gate/up
-// tile; prefill plans run the split N256 passes in prefill/moe.metal. The
-// threadgroup is Simdgroups * 32 threads.
-template <bool GateUp, ushort TileN, ushort Simdgroups>
-inline void moe_expert_tile(device bfloat *grouped_input,
-                            device const MoeTileDescriptor *tiles,
-                            device const uint *tile_count,
-                            device uchar *packed_0, device uchar *packed_1,
-                            device uchar *shared_0, device uchar *shared_1,
-                            device bfloat *output,
-                            constant MoeExpertParams &params, uint2 group,
-                            threadgroup float *input_sums, uint simd_lane,
-                            uint simd_group) {
-  if (group.y >= *tile_count)
-    return;
-  const uint expert = tiles[group.y].expert;
-  const MoeQ4Slab slab_0 =
-      moe_q4_slab(packed_0, shared_0, expert, params.experts,
-                  params.expert_stride_bytes_0, params.output_size,
-                  params.input_size);
-  MoeQ4Slab slab_1 = slab_0;
-  if constexpr (GateUp) {
-    slab_1 = moe_q4_slab(packed_1, shared_1, expert, params.experts,
-                         params.expert_stride_bytes_1, params.output_size,
-                         params.input_size);
-  }
-  device bfloat *input = grouped_input + ulong(group.y) * 8 * params.input_size;
-  device bfloat *tile_output = output + ulong(group.y) * 8 * params.output_size;
-  q4_mpp_tile<8, TileN, GateUp, false, false, Simdgroups>(
-      input, slab_0.weights, slab_0.scales, slab_0.biases, tile_output,
-      slab_1.weights, slab_1.scales, slab_1.biases, tile_output,
-      params.output_size, params.input_size, input_sums, group.x * TileN,
-      simd_lane, simd_group);
-}
-
-#define MOE_EXPERT_GATE_UP(Name, TileN, Simdgroups)                            \
-  kernel void Name(                                                            \
-      device bfloat *grouped_input [[buffer(0)]],                              \
-      device const MoeTileDescriptor *tiles [[buffer(1)]],                     \
-      device const uint *tile_count [[buffer(2)]],                             \
-      device uchar *gate_packed [[buffer(3)]],                                 \
-      device uchar *up_packed [[buffer(4)]],                                   \
-      device uchar *shared_gate [[buffer(5)]],                                 \
-      device uchar *shared_up [[buffer(6)]],                                   \
-      device bfloat *output [[buffer(7)]],                                     \
-      constant MoeExpertParams &params [[buffer(8)]],                          \
-      uint2 group [[threadgroup_position_in_grid]],                            \
-      uint simd_lane [[thread_index_in_simdgroup]],                            \
-      uint simd_group [[simdgroup_index_in_threadgroup]]) {                    \
-    threadgroup float input_sums[64];                                          \
-    moe_expert_tile<true, TileN, Simdgroups>(                                  \
-        grouped_input, tiles, tile_count, gate_packed, up_packed, shared_gate, \
-        shared_up, output, params, group, input_sums, simd_lane, simd_group);  \
-  }
-#define MOE_EXPERT_DOWN(Name, TileN, Simdgroups)                               \
-  kernel void Name(                                                            \
-      device bfloat *grouped_input [[buffer(0)]],                              \
-      device const MoeTileDescriptor *tiles [[buffer(1)]],                     \
-      device const uint *tile_count [[buffer(2)]],                             \
-      device uchar *down_packed [[buffer(3)]],                                 \
-      device uchar *shared_down [[buffer(4)]],                                 \
-      device bfloat *output [[buffer(5)]],                                     \
-      constant MoeExpertParams &params [[buffer(6)]],                          \
-      uint2 group [[threadgroup_position_in_grid]],                            \
-      uint simd_lane [[thread_index_in_simdgroup]],                            \
-      uint simd_group [[simdgroup_index_in_threadgroup]]) {                    \
-    threadgroup float input_sums[64];                                          \
-    moe_expert_tile<false, TileN, Simdgroups>(                                 \
-        grouped_input, tiles, tile_count, down_packed, down_packed,            \
-        shared_down, shared_down, output, params, group, input_sums,           \
-        simd_lane, simd_group);                                                \
-  }
-MOE_EXPERT_GATE_UP(moe_expert_gate_up_q4_m8, 128, 8)
-MOE_EXPERT_DOWN(moe_expert_down_q4_m8, 128, 8)
-// Four-simdgroup 8-row tiles for Apple9 decode plans: gate/up at N128 and
-// down at N256, 128 threads per threadgroup, the same buffers as the m8
-// kernels above and a {output_size / TileN, tiles} grid. Which devices run
-// them, and the measurements behind that, is ops::moeDecodeSimdgroups
-// (runtime/ops/MoE.hpp). Every output element sums its quant groups in the
-// same order at either width or simdgroup count, so the outputs are
-// bit-identical to the tiles above.
-MOE_EXPERT_GATE_UP(moe_expert_gate_up_q4_m8_n128_sg4, 128, 4)
-MOE_EXPERT_DOWN(moe_expert_down_q4_m8_n256_sg4, 256, 4)
-#undef MOE_EXPERT_DOWN
-#undef MOE_EXPERT_GATE_UP
 
 kernel void moe_combine(
     device const bfloat *expert_output [[buffer(0)]],

@@ -2,9 +2,9 @@
 #include "metal/kernels/common/gguf_sgmatrix.h"
 #include "metal/kernels/common/rms_inverse.h"
 
-// Every norm reads its weights in their stored type W: bfloat in the affine
-// formats, float for a GGUF's F32 norms (the _f32 entry points). Both widen to
-// fp32 exactly, so W changes only the loads.
+// Every norm reads its weights in their stored type W: bfloat for an MLX
+// target's and the draft's, float for a GGUF's F32 norms (the _f32 entry
+// points). Both widen to fp32 exactly, so W changes only the loads.
 //
 // Wide decode norms hold their row in registers, kNormChunk columns at a time:
 // 256 threads of kNormColumns columns each, one chunk for every hidden size
@@ -148,10 +148,10 @@ NORM_RMS_STAGED(norm_rms_staged_f32, packed_float4)
 #undef NORM_RMS_STAGED
 
 // Keep the ordinary output for non-matrix consumers, and emit the consumer's
-// matrix operand table (Table: q4sg::Table64 affine, gguf_sg::Table16 GGUF) from
-// the same rounded bfloat values. No additional dispatch is needed. The table
-// takes a simdgroup per 64-column span, so the first chunk's span pairs are
-// loaded (L2-hot input, weights) alongside the reduction's columns.
+// matrix operand table (Table: gguf_sg::Table16) from the same rounded bfloat
+// values. No additional dispatch is needed. The table takes a simdgroup per
+// 64-column span, so the first chunk's span pairs are loaded (L2-hot input,
+// weights) alongside the reduction's columns.
 template <class Table, class W>
 inline void norm_rms_table(device const bfloat *input, device const W *weight,
                            device bfloat *output, device bfloat *table, device float *sums,
@@ -215,10 +215,8 @@ inline void norm_rms_table(device const bfloat *input, device const W *weight,
     threadgroup float reductions[8]; \
     norm_rms_table<Table>(input, weight, output, table, sums, width, row, tid, lane, sg, reductions); \
   }
-// The reachable pairs: Table64 feeds affine projections, from the affine targets' and the draft's bf16 norms.
-// Table16 feeds a GGUF target's register-tile projections, from its F32 norms, and also the target's vocabulary
-// head from the draft's bf16 final norm (DFlashDraft::addDecode). No F32 norm feeds an affine projection.
-NORM_RMS_TABLE(norm_rms_table64_decode, q4sg::Table64, bfloat)
+// Table16 feeds the register-tile projections, from a GGUF target's F32 norms and from an MLX target's and the
+// draft's bf16 norms.
 NORM_RMS_TABLE(norm_rms_table16_decode, gguf_sg::Table16, bfloat)
 NORM_RMS_TABLE(norm_rms_table16_decode_f32, gguf_sg::Table16, float)
 #undef NORM_RMS_TABLE

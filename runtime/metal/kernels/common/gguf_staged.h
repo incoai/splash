@@ -26,7 +26,7 @@ inline void dequant32(typename F::Payload w, typename F::Meta meta, ushort j, th
       const uint4 p = F::codes(q);
       lo = half4(staged_linear<F>(p.x, k.s.x, k.m.x), staged_linear<F>(p.y, k.s.x, k.m.x));
       hi = half4(staged_linear<F>(p.z, k.s.y, k.m.y), staged_linear<F>(p.w, k.s.y, k.m.y));
-    } else if constexpr (F::Kind == QuantCodebook) {   // value * s in Scale: one rounding to half either way
+    } else if constexpr (F::Kind == QuantCodebook) {   // value * s in Scale, then to half, as the reference rounds it
       typedef typename F::Scale S;
       const uchar4 b = as_type<uchar4>(F::indices(q));
       lo = half4(half2(vec<S, 2>(tl[b.x]) * S(k.s.x)), half2(vec<S, 2>(tl[b.y]) * S(k.s.x)));
@@ -36,6 +36,10 @@ inline void dequant32(typename F::Payload w, typename F::Meta meta, ushort j, th
       const uint2 v = F::values(q);
       lo = half4(vec<S, 4>(as_type<char4>(v.x)) * S(k.s.x));
       hi = half4(vec<S, 4>(as_type<char4>(v.y)) * S(k.s.y));
+    } else if constexpr (F::Kind == QuantFloat8) {   // exact halves times s in float, then to half, as the reference rounds it
+      const uint2 v = F::values(q);
+      lo = half4(float4(quant_e4m3_word(v.x)) * k.s.x);
+      hi = half4(float4(quant_e4m3_word(v.y)) * k.s.y);
     } else {
       const uint2 g = F::grid(q); const uint s = F::signs(q);
       lo = half4(float4(as_type<uchar4>(g.x)) * k.s.x);

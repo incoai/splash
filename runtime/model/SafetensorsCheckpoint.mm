@@ -29,7 +29,7 @@ uint32_t elementBytes(const std::string &type) {
   if (type == "BF16" || type == "F16" || type == "I16" || type == "U16") return 2;
   if (type == "F32" || type == "I32" || type == "U32") return 4;
   if (type == "F64" || type == "I64" || type == "U64") return 8;
-  if (type == "BOOL" || type == "I8" || type == "U8") return 1;
+  if (type == "BOOL" || type == "I8" || type == "U8" || type == "F8_E4M3") return 1;
   throw WeightStoreError("unsupported safetensors dtype: " + type);
 }
 
@@ -59,14 +59,21 @@ SourceTensor tensorRecord(NSDictionary *record, const WeightSource &file, uint64
   return tensor;
 }
 
+// The bound on one shard's header, the safetensors format's own
+// (MAX_HEADER_SIZE), on all of a checkpoint's and on its tensors: one that
+// stores each routed expert's tensors of its own, as Model Optimizer's do,
+// names 124K tensors in 21 MB of headers.
+constexpr uint64_t kMaxHeaderBytes = 100'000'000, kMaxMetadataBytes = uint64_t{256} << 20;
+constexpr size_t kMaxTensors = size_t{1} << 20;
+
 // Adds the tensors of a shard's header to tensors, whose count and the
 // checkpoint's metadataBytes are bounded, and sets where its data starts.
 void indexShard(WeightSource &file, TensorIndex &tensors, uint64_t &metadataBytes) {
   if (file.bytes() < 8) throw WeightStoreError("truncated safetensors file");
   uint64_t headerBytes = 0;
   readWeightBytes(file.descriptor(), 0, {reinterpret_cast<uint8_t *>(&headerBytes), 8});
-  if (!headerBytes || headerBytes > 1024 * 1024 || headerBytes > file.bytes() - 8 ||
-      (metadataBytes += headerBytes) > 4 * 1024 * 1024)
+  if (!headerBytes || headerBytes > kMaxHeaderBytes || headerBytes > file.bytes() - 8 ||
+      (metadataBytes += headerBytes) > kMaxMetadataBytes)
     throw WeightStoreError("safetensors header exceeds metadata or file bounds");
   file.setDataOffset(8 + headerBytes);
   NSMutableData *header = [NSMutableData dataWithLength:headerBytes];
@@ -78,7 +85,7 @@ void indexShard(WeightSource &file, TensorIndex &tensors, uint64_t &metadataByte
     if (![key isKindOfClass:[NSString class]] || [key lengthOfBytesUsingEncoding:NSUTF8StringEncoding] > 1024)
       throw WeightStoreError("invalid tensor name");
     if ([key isEqualToString:@"__metadata__"]) continue;
-    if (tensors.size() == 16384) throw WeightStoreError("source tensor metadata exceeds bounds");
+    if (tensors.size() == kMaxTensors) throw WeightStoreError("source tensor metadata exceeds bounds");
     SourceTensor tensor = tensorRecord(index[key], file, file.bytes() - file.dataOffset());
     if (tensor.bytes) ranges.emplace_back(tensor.offset, tensor.offset + tensor.bytes);
     const std::string name = [key UTF8String];

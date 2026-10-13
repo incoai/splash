@@ -267,6 +267,16 @@ def parse_reasoning_effort(value):
     return value
 
 
+def parse_thinking_token_budget(value):
+    try:
+        tokens = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a nonnegative integer") from None
+    if tokens < 0:
+        raise argparse.ArgumentTypeError("must be a nonnegative integer")
+    return tokens
+
+
 # The help's option groups, in the order `splash serve --help` lists them:
 # each group's key and title. The launcher's own model options and --port
 # join "model" and "network".
@@ -393,6 +403,16 @@ SERVE_OPTIONS = (
         ),
     ),
     ServeOption(
+        "--state-format",
+        "memory",
+        dict(
+            choices=("fp32", "bf16"),
+            default="fp32",
+            help="recurrent state storage (default: fp32); bf16 halves each "
+            "state, so memory and the SSD cache hold about twice as many",
+        ),
+    ),
+    ServeOption(
         "--idle-release",
         "memory",
         dict(
@@ -471,6 +491,18 @@ SERVE_OPTIONS = (
             "SPLASH_DEFAULT_REASONING_EFFORT, else the model template's)",
         ),
         environment="SPLASH_DEFAULT_REASONING_EFFORT",
+    ),
+    ServeOption(
+        "--thinking-token-budget",
+        "api",
+        dict(
+            type=parse_thinking_token_budget,
+            metavar="N",
+            help="thinking tokens of a thinking request that sets no "
+            "thinking_token_budget, after which its thinking closes (default: "
+            "SPLASH_THINKING_TOKEN_BUDGET, else no cap)",
+        ),
+        environment="SPLASH_THINKING_TOKEN_BUDGET",
     ),
     ServeOption(
         "--max-request-size",

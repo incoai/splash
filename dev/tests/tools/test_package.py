@@ -26,6 +26,7 @@ class PackageTests(unittest.TestCase):
                 ("install", package.INSTALL_FILES),
                 ("install/completions", package.COMPLETION_FILES),
                 ("server", package.SERVER_FILES),
+                ("server/chat-assets", package.CHAT_ASSET_FILES),
                 ("build", ("splash", "splash.metallib")),
             ):
                 (root / folder).mkdir(parents=True)
@@ -33,9 +34,6 @@ class PackageTests(unittest.TestCase):
                     (root / folder / name).write_text("fixture")
             for name in package.LICENSE_FILES:
                 (root / name).write_text("fixture")
-            (root / "install/completions/official-models.txt").write_text(
-                "company/Published\n"
-            )
             (root / "install/download-token").write_text("hf_legacycredential")
             cached = root / "build/release/python-runtime.tar.gz"
             cached.parent.mkdir()
@@ -73,10 +71,6 @@ class PackageTests(unittest.TestCase):
                             content = archive.extractfile(member).read()
                             self.assertNotIn(b"hf_legacycredential", content)
                             self.assertNotIn(b"hf_testcredential", content)
-                    with archive.extractfile(
-                        f"splash-{version}-arm64-macos26/install/completions/official-models.txt"
-                    ) as catalog:
-                        self.assertEqual(catalog.read(), b"company/Published\n")
 
     def test_release_has_only_runtime_files_and_excludes_credentials(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -86,6 +80,7 @@ class PackageTests(unittest.TestCase):
             for folder, names in (
                 ("install", package.INSTALL_FILES),
                 ("server", package.SERVER_FILES),
+                ("server/chat-assets", package.CHAT_ASSET_FILES),
                 ("build", ("splash", "splash.metallib")),
             ):
                 (root / folder).mkdir(parents=True)
@@ -100,7 +95,6 @@ class PackageTests(unittest.TestCase):
                 "_splash",
                 "splash.bash",
                 "splash.fish",
-                "official-models.txt",
                 "suggested-models.txt",
             }
             for name in completion_names:
@@ -109,6 +103,7 @@ class PackageTests(unittest.TestCase):
             (completions / "private-junk").write_text("must not ship")
             (root / "install/private-junk").write_text("must not ship")
             (root / "server/local.log").write_text("must not ship")
+            (root / "server/chat-assets/private-junk").write_text("must not ship")
             token = root / "install/download-token"
             token.write_text("hf_testdistributiontoken")
             with mock.patch.object(package, "ROOT", root):
@@ -137,8 +132,17 @@ class PackageTests(unittest.TestCase):
                 )
             self.assertEqual(
                 {p.name for p in (stage / "server").iterdir()},
-                set(package.SERVER_FILES),
+                {*package.SERVER_FILES, "chat-assets"},
             )
+            assets = stage / "server/chat-assets"
+            self.assertEqual(
+                {p.name for p in assets.iterdir()}, set(package.CHAT_ASSET_FILES)
+            )
+            for name in package.CHAT_ASSET_FILES:
+                self.assertEqual(
+                    (assets / name).read_bytes(),
+                    (root / "server/chat-assets" / name).read_bytes(),
+                )
             self.assertNotIn(
                 "hf_testdistributiontoken", (stage / "release.json").read_text()
             )
@@ -281,7 +285,7 @@ puts SplashMacOSRequirement.check
                 "_splash",
                 "splash.bash",
                 "splash.fish",
-                "official-models.txt",
+                "suggested-models.txt",
             ):
                 (assets / name).write_text(f"fixture {name}\n")
             (assets / "models").write_text("#!/bin/sh\nprintf '%s\\n' new/model\n")
@@ -415,7 +419,7 @@ class InstallerTests(unittest.TestCase):
             helper = assets / "models"
             helper.write_text("#!/bin/sh\nprintf '%s\\n' fixture/model\n")
             helper.chmod(0o755)
-            (assets / "official-models.txt").write_text("fixture/model\n")
+            (assets / "suggested-models.txt").write_text("fixture/model\n")
         archive = self.releases / f"{name}.tar.gz"
         subprocess.run(
             ["tar", "-czf", str(archive), "-C", str(staging), name], check=True

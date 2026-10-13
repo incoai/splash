@@ -44,4 +44,20 @@ void RoPE::addTables(
             rows, {(elements + 255) / 256, 1, 1}, {256, 1, 1});
 }
 
+void RoPE::addDraftRangeTables(metal::CommandGraph &graph,
+                               metal::MetalBuffer draftInverseFrequencies,
+                               metal::MetalBuffer draftCosine,
+                               metal::MetalBuffer draftSine, uint32_t rows,
+                               uint32_t startPosition, uint32_t maximumRows) {
+  if (!rows || rows > maximumRows)
+    throw std::invalid_argument("invalid RoPE table row count");
+  const uint64_t elements = uint64_t{rows} * SPLASH_DRAFT_ROPE_PAIRS;
+  requireBytes(draftInverseFrequencies, SPLASH_DRAFT_ROPE_PAIRS * sizeof(float), "draft inverse frequency");
+  requireBytes(draftCosine, elements * sizeof(float), "draft RoPE cosine");
+  requireBytes(draftSine, elements * sizeof(float), "draft RoPE sine");
+  graph.add("rope_build_draft_range_tables",
+            {std::move(draftInverseFrequencies), std::move(draftCosine), std::move(draftSine)},
+            RopeRangeParams{rows, startPosition}, {(elements + 255) / 256, 1, 1}, {256, 1, 1});
+}
+
 } // namespace splash::ops

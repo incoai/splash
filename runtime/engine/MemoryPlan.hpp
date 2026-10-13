@@ -2,6 +2,7 @@
 
 #include "metal/DeviceCapabilities.hpp"
 #include "model/Model.hpp"
+#include "ops/GDN.hpp"
 #include "ops/PagedKv.hpp"
 
 #include <algorithm>
@@ -50,6 +51,7 @@ struct ModelMemoryProfile final {
   uint32_t maximumContextTokens = 0;
   kv::Layout targetKvLayout;
   ModelMemoryFootprint footprint;
+  ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
 
   [[nodiscard]] std::optional<std::string> validationError() const;
   [[nodiscard]] uint64_t fixedRuntimeBytes() const;

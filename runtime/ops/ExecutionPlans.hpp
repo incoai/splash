@@ -46,7 +46,6 @@ private:
   [[nodiscard]] MoeConfig moeConfig(MoeShape shape, uint32_t rows, MoePhase phase) const;
 
   Linear linear_;
-  uint32_t moeRouteWideRows_;
   GpuFamilyClass family_;
 };
 

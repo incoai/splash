@@ -52,7 +52,13 @@ OPTIONS = {
         {effort: effort for effort in serve_options.REASONING_EFFORTS},
         ("", "turbo", "XHIGH"),
     ),
+    "--thinking-token-budget": values(
+        "--thinking-token-budget", {"0": 0, "4096": 4096}, ("-1", "1.5", "many")
+    ),
     "--kv-format": values("--kv-format", {"int8": "int8", "bf16": "bf16"}, ("fp16",)),
+    "--state-format": values(
+        "--state-format", {"fp32": "fp32", "bf16": "bf16"}, ("fp16", "int8")
+    ),
     "--disable-ane": ([(["--disable-ane"], True)], []),
     "--max-memory": values(
         "--max-memory",
@@ -164,7 +170,11 @@ class ServeOptionsTests(unittest.TestCase):
     def setUp(self):
         # The parsers' defaults ignore the caller's Splash settings.
         self.enterContext(mock.patch.dict(os.environ))
-        for name in ("SPLASH_API_KEY", "SPLASH_DEFAULT_REASONING_EFFORT"):
+        for name in (
+            "SPLASH_API_KEY",
+            "SPLASH_DEFAULT_REASONING_EFFORT",
+            "SPLASH_THINKING_TOKEN_BUDGET",
+        ):
             os.environ.pop(name, None)
 
     def refuse(self, parse, arguments):
@@ -200,16 +210,22 @@ class ServeOptionsTests(unittest.TestCase):
                     self.refuse(parse, [*required, *arguments])
 
     def test_both_parsers_check_defaults_from_the_environment(self):
-        for name, value, flag in (
-            ("SPLASH_DEFAULT_REASONING_EFFORT", "low", "--default-reasoning-effort"),
-            ("SPLASH_API_KEY", "environment-key", "--api-key"),
+        for name, value, parsed, flag in (
+            (
+                "SPLASH_DEFAULT_REASONING_EFFORT",
+                "low",
+                "low",
+                "--default-reasoning-effort",
+            ),
+            ("SPLASH_THINKING_TOKEN_BUDGET", "4096", 4096, "--thinking-token-budget"),
+            ("SPLASH_API_KEY", "environment-key", "environment-key", "--api-key"),
         ):
             for parse, required in PARSERS:
                 with (
                     self.subTest(parser=parse.__module__, name=name),
                     mock.patch.dict(os.environ, {name: value}),
                 ):
-                    self.assertEqual(getattr(parse(required), dest(flag)), value)
+                    self.assertEqual(getattr(parse(required), dest(flag)), parsed)
                     # The command line outranks the environment.
                     explicit = OPTIONS[flag][0][0]
                     self.assertEqual(

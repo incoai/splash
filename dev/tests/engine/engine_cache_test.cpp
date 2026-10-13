@@ -402,13 +402,55 @@ void testProbeBindsImageIdentity() {
   const std::span<const ImageSpan> images(&image, 1);
   cache.beginRequest(1);
   require(admitTokens(cache, 1, 32).granted(), "image KV page was not acquired");
-  const uint64_t block = test::publishBlocks(cache, 1, prompt, 32, images);
+  const uint64_t block = test::publishBlocks(cache, 1, prompt, 32, {images, {}});
   cache.publishCompositeState(block, std::make_shared<TestState>(100), false);
   cache.endRequest(1);
-  const CacheProbe probe = cache.probe(prompt, images);
-  const auto valid = cache.lookup(prompt, images, &probe);
+  const CacheProbe probe = cache.probe(prompt, {images, {}});
+  const auto valid = cache.lookup(prompt, {images, {}}, &probe);
   require(valid.kvBoundary == 32 && valid.resumeBoundary() == 32,
           "matching image probe lost its cached prefix");
+}
+
+// A cache salt goes into the first block's identity alone: a prompt cached
+// under one salt matches only lookups with that salt, and an unsalted
+// prompt only unsalted ones.
+void testCacheSaltSeparatesPrompts() {
+  const CacheSalt red{0x1111, 0x2222}, blue{0x3333, 0x4444};
+  require(blockIdentity(0, 32, {}, {}) == BlockIdentity{} &&
+              blockIdentity(0, 32, {}, red) != BlockIdentity{} &&
+              blockIdentity(0, 32, {}, red) != blockIdentity(0, 32, {}, blue) &&
+              blockIdentity(32, 32, {}, red) == BlockIdentity{},
+          "a salt did not key the first block alone");
+  test::TestKvStorage storage{8, 100, 1};
+  KvPool pool{storage, 8};
+  engine::Cache cache{pool, nullptr, nullptr};
+  std::vector<uint32_t> prompt(65, 77);
+  const auto publish = [&](uint64_t id, CacheSalt salt) {
+    cache.beginRequest(id);
+    require(admitTokens(cache, id, 64).granted(), "KV pages were not acquired");
+    const uint64_t block = test::publishBlocks(cache, id, prompt, 64, {{}, salt});
+    cache.publishCompositeState(block, std::make_shared<TestState>(100), false);
+    cache.endRequest(id);
+  };
+  const auto cached = [&](CacheSalt salt) {
+    return cache.lookup(prompt, {{}, salt}).resumeBoundary();
+  };
+  // Probes taken before the prompt is cached match it, once refreshed, only
+  // under its salt, and a lookup takes the refreshed chain.
+  CacheProbe probe = cache.probe(prompt, {{}, red});
+  CacheProbe other = cache.probe(prompt, {{}, blue});
+  publish(1, red);
+  require(cached(red) == 64 && cached(blue) == 0 && cached({}) == 0,
+          "a prompt cached under a salt matched another salt or none");
+  cache.refresh(probe, prompt, {{}, red});
+  cache.refresh(other, prompt, {{}, blue});
+  require(probe.cachedTokens() == 64 && other.cachedTokens() == 0 &&
+              cache.lookup(prompt, {{}, red}, &probe).resumeBoundary() == 64,
+          "a refreshed probe matched across salts or lost its own");
+  publish(3, blue);
+  publish(2, {});
+  require(cached({}) == 64 && cached(red) == 64 && cached(blue) == 64,
+          "an unsalted prompt did not part from the salted ones");
 }
 
 void testProbeCannotCrossCaches() {
@@ -460,25 +502,25 @@ void testPageTableReportsWhatChanged() {
               cache.pageTable(1).firstChanged == 1 && cache.pageTable(1).pages.size() == 2,
           "an append did not report the length it grew from");
   require(admitTokens(cache, 1, page + 1).granted(), "held pages were denied");
-  cache.publishCommittedBlocks(1, prompt, 2 * page, {});
-  require(cache.pageTable(1).revision == 2,
+  require(cache.publishCommittedBlocks(1, prompt, 2 * page, {}) == 0 &&
+              cache.pageTable(1).revision == 2,
           "tokens on held pages or a request's own blocks moved its revision");
   cache.publishCompositeState(cache.blockAt(1, 2 * page), std::make_shared<TestState>(100), false);
 
   // A second request writes the same blocks into pages of its own, and
-  // publishing each swaps it for the cached page.
+  // publishing each swaps it for the cached page and reports its tokens.
   cache.beginRequest(2);
   require(admitTokens(cache, 2, 2 * page).granted() && cache.pageTable(2).revision == 1,
           "a second request's pages were denied");
-  cache.publishCommittedBlocks(2, prompt, page, {});
-  require(cache.pageTable(2).revision == 2 && cache.pageTable(2).firstChanged == 0 &&
+  require(cache.publishCommittedBlocks(2, prompt, page, {}) == page &&
+              cache.pageTable(2).revision == 2 && cache.pageTable(2).firstChanged == 0 &&
               cache.pageTable(2).pages[0] == cache.pageTable(1).pages[0],
-          "the first swapped block did not report its index");
-  cache.publishCommittedBlocks(2, prompt, 2 * page, {});
-  require(cache.pageTable(2).revision == 3 && cache.pageTable(2).firstChanged == 1 &&
+          "the first swapped block did not report its index or tokens");
+  require(cache.publishCommittedBlocks(2, prompt, 2 * page, {}) == page &&
+              cache.pageTable(2).revision == 3 && cache.pageTable(2).firstChanged == 1 &&
               cache.pageTable(2).pages[1] == cache.pageTable(1).pages[1] &&
               cache.pageTable(1).revision == 2,
-          "a swapped block did not report its index or moved the writer's revision");
+          "a swapped block did not report its index or tokens, or moved the writer's revision");
   cache.endRequest(2);
   cache.endRequest(1);
 
@@ -491,6 +533,39 @@ void testPageTableReportsWhatChanged() {
               cache.pageTable(3).revision == 2 && cache.pageTable(3).firstChanged == 2,
           "an append after a restore did not report the restored length");
   cache.endRequest(3);
+}
+
+// A request's work writes its rows below writtenTokens, every row up to its
+// KV target unless said otherwise: a new page with a row the work does not
+// write comes cleared, and the pages it writes in full keep what they held.
+void testNewPagesTheWorkDoesNotFillComeCleared() {
+  test::TestKvStorage storage{16, 4096, 4};
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  std::fill(storage.content.begin(), storage.content.end(), 7);
+  cache.beginRequest(1);
+  require(cache.ensureTokens(1, 64).granted() && storage.cleared.empty(),
+          "a target at a page boundary cleared a page");
+  require(cache.ensureTokens(1, 70).granted(), "the tail page was not admitted");
+  const PageTableView table = cache.pageTable(1);
+  require(table.pages.size() == 3 &&
+              storage.cleared == std::vector<uint32_t>{table.pages[2]} &&
+              storage.content[table.pages[2]] == 0 &&
+              storage.content[table.pages[0]] == 7 && storage.content[table.pages[1]] == 7,
+          "the new tail page was not cleared, or a page written in full was");
+  require(cache.ensureTokens(1, 90).granted() && storage.cleared.size() == 1,
+          "a target inside the tail page cleared it again");
+  // A resumed lane takes back pages past where its replay ends.
+  cache.beginRequest(2);
+  require(cache.ensureTokens(2, 160, 70).granted(), "the resumed pages were not admitted");
+  const PageTableView resumed = cache.pageTable(2);
+  require(resumed.pages.size() == 5 &&
+              storage.cleared == std::vector<uint32_t>{table.pages[2], resumed.pages[2],
+                                                       resumed.pages[3], resumed.pages[4]} &&
+              storage.content[resumed.pages[1]] == 7,
+          "a page the replay does not write in full was not cleared, or one it does was");
+  cache.endRequest(2);
+  cache.endRequest(1);
 }
 
 void testCacheLookupAndOneTokenReplay() {
@@ -4183,8 +4258,10 @@ int main() {
     testProbeRechecksStateChanges();
     testProbeFallsBackWhenKvChanges();
     testProbeBindsImageIdentity();
+    testCacheSaltSeparatesPrompts();
     testProbeCannotCrossCaches();
     testPageTableReportsWhatChanged();
+    testNewPagesTheWorkDoesNotFillComeCleared();
     testCacheLookupAndOneTokenReplay();
     testPage31Page32Page33Backoff();
     testLazyJunctionMaterialization();

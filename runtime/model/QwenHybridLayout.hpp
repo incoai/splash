@@ -12,10 +12,6 @@ namespace splash::model {
 
 enum class QwenFfnKind : uint8_t { Dense, SparseMoe };
 
-// The magic of a Qwen target's affine embedding image, packaged or written
-// from MLX, whatever its family.
-inline constexpr std::string_view kEmbeddingMagic = "MDFE0001";
-
 // The dimensions and tokens of a Qwen hybrid target: GDN layers, every
 // fullAttentionPeriod-th layer full attention instead, each followed by a
 // dense FFN or a sparse MoE. A family's layout (QwenHybridLayout) sets them,

@@ -5,7 +5,7 @@ import functools
 import queue
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from tokenizers.decoders import DecodeStream
 
@@ -52,6 +52,21 @@ class CacheInfo:
     status: str = "unknown"
     matched_tokens: int = 0
     lane: int = -1
+    # Of the tokens the request computed, those whose KV it then read from a
+    # cached block's page; known once it is done.
+    deduplicated_tokens: int = 0
+
+
+@dataclass(frozen=True)
+class ReasoningRequest:
+    """How a chat request asked to reason: the reasoning effort it sent, None
+    when absent; the effort its template rendered with, the server's default
+    for an absent one and None for the template's own; and its
+    chat_template_kwargs enable_thinking, None when unset."""
+
+    sent: str | None
+    effort: str | None
+    enable_thinking: bool | None
 
 
 @dataclass
@@ -68,6 +83,9 @@ class NativeResult:
     first_token_batch_tokens: int = 0
     # Raw option logits for score-only jobs, in requested token order.
     option_logits: tuple = ()
+    drafted_tokens: int = 0
+    accepted_draft_tokens: int = 0
+    draft_cycles: int = 0
 
     @functools.cached_property
     def metrics(self):
@@ -86,6 +104,12 @@ class Job:
     priority: wire.RequestPriority = wire.RequestPriority.NORMAL
     stop_sequences: tuple[str, ...] = ()
     thinking: bool = False
+    # A chat request's reasoning options, which its Started line shows; None
+    # for a request without a chat template.
+    reasoning: ReasoningRequest | None = None
+    # The thinking tokens the job may select before its thinking closes, set
+    # only where that comes before the output limit; None for no cap.
+    thinking_token_budget: int | None = None
     thinking_display: str = "summarized"
     reasoning_tokens: int = 0
     events: queue.Queue = field(default_factory=queue.Queue)
@@ -119,6 +143,8 @@ class Job:
     output_clamped_to_context: bool = False
     # The digest of a judgment's rendered prompt, which its response reports.
     prompt_sha256: str | None = None
+    # The request's cache_salt hashed to 128 bits; zero without one.
+    cache_salt: int = 0
     latency: RequestLatency | None = None
 
     @property
@@ -605,10 +631,55 @@ class NativeBackend:
             score_tokens=job.score_tokens,
             generation_prompt_tokens=job.generation_prompt_tokens,
             flags=job.flags,
+            cache_salt=job.cache_salt,
+            thinking_budget=self._thinking_budget(job),
         )
         return engine_runtime.GenerationRequest(
             frame, job.deadline, self._mask_provider(job), job.image_owner
         )
+
+    @staticmethod
+    def _thinking_budget(job):
+        """The engine's cutoff of the thinking a job generates in: thinking
+        ends where count_reasoning_tokens ends it, at its close or, where a
+        call may follow, at a call's opening token."""
+        if job.thinking_token_budget is None:
+            return None
+        return wire.ThinkingBudget(
+            job.thinking_token_budget,
+            THINK_END_TOKEN_ID,
+            TOOL_CALL_OPEN_TOKEN_ID if job.may_call_tools else THINK_END_TOKEN_ID,
+        )
+
+    def release_weights(self, timeout=5.0):
+        """Asks the engine to give its weights back now; returns its status.
+
+        It releases only while no request is in service and no restore is
+        under way; `weights.released` in the returned snapshot says whether it
+        did. The next request restores the weights as after the idle release.
+        """
+        with self.lock:
+            if self.closing:
+                raise APIError(503, "server is shutting down", "server_shutdown")
+        restarts = self.runtime.restart_count
+        try:
+            event = self.runtime.release_weights(timeout=timeout)
+        except TimeoutError:
+            # The engine answers between commands: it is running a long one.
+            raise APIError(
+                503,
+                f"the engine did not answer within {timeout:g} s; retry shortly",
+                "engine_busy",
+            ) from None
+        except (
+            engine_runtime.EngineUnhealthy,
+            engine_runtime.ProtocolFatal,
+            engine_runtime.RuntimeClosed,
+        ) as error:
+            raise self.refusal() or self._api_error(error) from None
+        snapshot = self._decode_status_event(event)
+        self._cache_status(snapshot, restarts)
+        return snapshot
 
     def submit(self, job):
         state = None
@@ -712,6 +783,19 @@ class NativeBackend:
             )
             with self.lock:
                 job.cache = cache
+            record = {
+                "outcome": "started",
+                "prompt_tokens": len(job.prompt_tokens),
+                "cached_tokens": cache.matched_tokens,
+            }
+            if job.reasoning is not None:
+                record["reasoning"] = {
+                    "sent_effort": job.reasoning.sent,
+                    "effort": job.reasoning.effort,
+                    "enable_thinking": job.reasoning.enable_thinking,
+                    "thinking": job.thinking,
+                }
+            self._log(record)
             job.events.put(("start", None))
         elif isinstance(event, wire.PromptProgressEvent):
             job.events.put(
@@ -794,9 +878,12 @@ class NativeBackend:
                 first_token_to_done_ms=done.decode_micros / 1000.0,
                 request_wall_ms=done.wall_micros / 1000.0,
                 prefill_tokens=max(0, done.prompt_tokens - job.cache.matched_tokens),
-                cache=job.cache,
+                cache=replace(job.cache, deduplicated_tokens=done.deduplicated_tokens),
                 stop_sequence=stop_sequence,
                 first_token_batch_tokens=state.first_token_batch_tokens,
+                drafted_tokens=done.drafted_tokens,
+                accepted_draft_tokens=done.accepted_draft_tokens,
+                draft_cycles=done.draft_cycles,
             )
             if job.latency is not None:
                 latency = result.metrics["request_latency"]
@@ -903,6 +990,10 @@ class NativeBackend:
             }
         if error:
             record["error_code"] = error.code
+        self._log(record)
+
+    def _log(self, record):
+        # A request's start, when the engine admits it, and its end.
         try:
             self.request_logger(record)
         except Exception:

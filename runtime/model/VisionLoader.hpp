@@ -10,10 +10,9 @@
 namespace splash::model {
 
 // Source adapter for the vision tower: the vision_tower.* tensors of an MLX
-// checkpoint or a GGUF mmproj, both written into an image laid out as a Splash
-// package's vision/model.bin (model/VisionPreparation.hpp). Construction
-// validates the source's metadata and plans the image; tensor values are
-// converted only when it is written.
+// checkpoint or a GGUF mmproj, both written into the tower's image
+// (model/VisionPreparation.hpp). Construction validates the source's metadata
+// and plans the image; tensor values are converted only when it is written.
 class VisionLoader final {
 public:
   VisionLoader(const std::filesystem::path &directory, VisionSource source, const ops::VisionLayout &layout);

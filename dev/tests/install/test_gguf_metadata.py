@@ -45,6 +45,7 @@ GGML = {
     "IQ1_M": 29,
     "BF16": 30,
     "MXFP4": 39,
+    "NVFP4": 40,
     "PQ2_0": 142,
 }
 
@@ -367,6 +368,9 @@ class GgufMetadataTests(unittest.TestCase):
         tensors |= {"blk.2.attn_qkv.weight": GGML["IQ1_M"]}
         tensors |= {"blk.5.ffn_up_exps.weight": GGML["IQ2_XXS"]}
         tensors |= {"token_embd.weight": GGML["Q2_K"]}
+        # llama.cpp's NVFP4, its per-expert tensor scales beside it.
+        tensors |= {"blk.6.ffn_up_exps.weight": GGML["NVFP4"]}
+        tensors |= {"blk.6.ffn_up_exps.scale": GGML["F32"]}
         path = write_gguf(self.root / "ok.gguf", values, tensors.items())
         gguf.require_loadable(gguf.Metadata(path, tensors=True))
         f32 = {name: GGML["F32"] for name in tensors}
@@ -405,6 +409,11 @@ class GgufMetadataTests(unittest.TestCase):
             ),
             # An all-F32 file, whose types the loader reads somewhere.
             (f32, "attn_output.weight F32 [(]10 tensors[)]"),
+            # A tensor scale beside a weight of another type than NVFP4.
+            (
+                {"blk.0.ffn_down_exps.scale": GGML["F32"]},
+                "ffn_down_exps.scale beside IQ4_XS",
+            ),
         ):
             with self.subTest(reason=reason):
                 path = write_gguf(
@@ -431,16 +440,30 @@ class GgufMetadataTests(unittest.TestCase):
         table = header.split("kQuantFormats[GGUF_FMT_COUNT] = {", 1)[1].split("};", 1)[
             0
         ]
-        types = [gguf.TENSOR_TYPES[int(n)] for n in re.findall(r"\{(\d+),", table)]
-        self.assertEqual(set(types), gguf.QUANTIZED_TYPES)
+        # Each format's GGML type, by format id: its table type, or for NVFP4
+        # llama.cpp's, which the planner converts into it (ggml::kNVFP4 in
+        # runtime/model/GgufFile.hpp); MLX affine and fp8 have none.
         ids = {
             name: int(value)
             for name, value in re.findall(r"#define GGUF_FMT_(\w+) (\d+)u", header)
         }
+        rows = re.findall(r"^\s*\{([^,]+),", table, re.M)
+        types = {
+            index: gguf.TENSOR_TYPES[int(row)]
+            for index, row in enumerate(rows)
+            if row.isdigit()
+        }
+        gguf_file = (abi.parents[1] / "model/GgufFile.hpp").read_text()
+        nvfp4 = re.search(r"kNVFP4 = (\d+)", gguf_file).group(1)
+        types[ids["NVFP4"]] = gguf.TENSOR_TYPES[int(nvfp4)]
+        self.assertEqual(set(types.values()), gguf.QUANTIZED_TYPES)
         embedding = (abi / "Gguf.h").read_text().split("gguf_embedding_format", 1)[1]
         embedding = embedding.split("}", 1)[0]
         names = re.findall(r"GGUF_FMT_(\w+)", embedding)
-        self.assertEqual({types[ids[name]] for name in names}, gguf.EMBEDDING_TYPES)
+        self.assertEqual(
+            {types[ids[name]] for name in names if ids[name] in types},
+            gguf.EMBEDDING_TYPES,
+        )
 
     def test_rotation_screen_is_the_native_loaders(self):
         # ROTATION and ROTATION_ARRAYS must be what GgufFile::readRotation
@@ -615,7 +638,9 @@ class GgufMetadataTests(unittest.TestCase):
         f32 = (vision_fixture(), [(name, GGML["F32"]) for name, _ in tensors])
         f16 = (vision_fixture(), [(tensors[0][0], GGML["F16"]), tensors[1]])
         text = (fixture(), tensors)
-        # Other publishers' names; F16 and non-vision files never count.
+        quantized = (vision_fixture(), [(tensors[0][0], GGML["Q8_0"]), tensors[1]])
+        # Other publishers' names; BF16 is preferred to F32 and F32 to F16, and
+        # non-vision files never count.
         repo = projectors(
             **{"mmproj-Model-bf16": bf16, "mmproj-Model-f16": f16, "mmproj-x": text}
         )
@@ -628,12 +653,16 @@ class GgufMetadataTests(unittest.TestCase):
             )[0],
             "mmproj-f32.gguf",
         )
+        only_f16 = projectors(**{"mmproj-f16": f16, "mmproj-x": text})
+        self.assertEqual(upstream.select_vision(only_f16)[0], "mmproj-f16.gguf")
         with self.assertRaisesRegex(
             models.ModelError,
-            r"no BF16 or F32 vision projector \(mmproj-f16.gguf \(clip: F16, F32\); "
+            r"no BF16, F32 or F16 vision projector \(mmproj-q8.gguf \(clip: F32, Q8_0\); "
             r"mmproj-x.gguf \(qwen35moe: BF16, F32\)\); use --language-only",
         ):
-            upstream.select_vision(projectors(**{"mmproj-f16": f16, "mmproj-x": text}))
+            upstream.select_vision(
+                projectors(**{"mmproj-q8": quantized, "mmproj-x": text})
+            )
         with self.assertRaisesRegex(
             models.ModelError, "several BF16 vision projectors"
         ):

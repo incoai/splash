@@ -38,13 +38,13 @@ void testImageIdentityKeysBlocks() {
   const ImageSpan blue{8, 16, 8, 8, 0x3333, 0x4444};
   const std::array<ImageSpan, 1> redSpans{red};
   const std::array<ImageSpan, 1> blueSpans{blue};
-  require(blockImageIdentity(0, 32, {}) == ImageIdentity{},
+  require(blockImageIdentity(0, 32, {}) == BlockIdentity{},
           "text-only block identity must be zero");
-  require(blockImageIdentity(32, 32, redSpans) == ImageIdentity{},
+  require(blockImageIdentity(32, 32, redSpans) == BlockIdentity{},
           "a block after the image must not carry image identity");
-  const ImageIdentity redIdentity = blockImageIdentity(0, 32, redSpans);
-  const ImageIdentity blueIdentity = blockImageIdentity(0, 32, blueSpans);
-  require(redIdentity != ImageIdentity{} && redIdentity != blueIdentity,
+  const BlockIdentity redIdentity = blockImageIdentity(0, 32, redSpans);
+  const BlockIdentity blueIdentity = blockImageIdentity(0, 32, blueSpans);
+  require(redIdentity != BlockIdentity{} && redIdentity != blueIdentity,
           "image identity does not depend on the content digest");
   const ImageSpan redLater{40, 16, 8, 8, 0x1111, 0x2222};
   const std::array<ImageSpan, 1> laterSpans{redLater};

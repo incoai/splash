@@ -14,4 +14,7 @@ namespace splash::model {
   return static_cast<uint16_t>(bits >> 16);
 }
 
+// The float a bf16's bits hold.
+[[nodiscard]] inline float widenBfloat16(uint16_t bits) { return std::bit_cast<float>(uint32_t{bits} << 16); }
+
 } // namespace splash::model

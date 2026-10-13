@@ -37,7 +37,8 @@ class IgnoreEosTests(unittest.TestCase):
     def test_value_must_be_a_boolean(self):
         harness, runtime = self.harness()
         for path, body in (CHAT, COMPLETION):
-            for value in (1, "true", None, {}):
+            # A null ignore_eos is one left out.
+            for value in (1, "true", {}):
                 with self.subTest(path=path, value=value):
                     status, _, payload = harness.request(
                         "POST", path, {**body, "ignore_eos": value}

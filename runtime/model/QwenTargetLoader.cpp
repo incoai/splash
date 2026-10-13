@@ -6,7 +6,6 @@
 namespace splash::model {
 
 ops::Projection BlockTargetFormat::fused(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
-                                         std::string_view,
                                          std::initializer_list<std::string_view> tensors) const {
   ops::BlockWeights weights;
   uint32_t offset = 0;
@@ -19,15 +18,13 @@ ops::Projection BlockTargetFormat::fused(WeightFile &file, uint32_t outputSize, 
   return {outputSize, inputSize, std::move(weights)};
 }
 
-template <class Format>
-QwenMixerWeights readQwenMixer(WeightFile &file, const Format &format,
+QwenMixerWeights readQwenMixer(WeightFile &file, const BlockTargetFormat &format,
                                const QwenTargetDimensions &target, bool fullAttention) {
   constexpr uint64_t kFloat32Bytes = 4;
   if (fullAttention) {
     QwenAttentionWeights attention;
     attention.inputProjection =
-        format.fused(file, target.packedFullWidth, target.hiddenSize, "attention-input",
-                     {"attn-q", "attn-k", "attn-v"});
+        format.fused(file, target.packedFullWidth, target.hiddenSize, {"attn-q", "attn-k", "attn-v"});
     attention.queryNorm = format.norm(file, target.attentionHeadDimension, "query-norm");
     attention.keyNorm = format.norm(file, target.attentionHeadDimension, "key-norm");
     attention.outputProjection =
@@ -35,8 +32,7 @@ QwenMixerWeights readQwenMixer(WeightFile &file, const Format &format,
     return attention;
   }
   QwenGdnWeights gdn;
-  gdn.inputProjection = format.fused(file, target.packedGdnWidth, target.hiddenSize,
-                                     "gdn-input", {"gdn-qkv", "gdn-z", "gdn-ab"});
+  gdn.inputProjection = format.fused(file, target.packedGdnWidth, target.hiddenSize, {"gdn-qkv", "gdn-z", "gdn-ab"});
   gdn.convolutionWeights = file.section(
       checkedMultiply<WeightStoreError>(
           checkedMultiply<WeightStoreError>(target.convolutionDimension,
@@ -55,13 +51,8 @@ QwenMixerWeights readQwenMixer(WeightFile &file, const Format &format,
   gdn.mixerNorm = format.norm(file, target.gdnHeadDimension, "gdn-norm");
   gdn.outputProjection =
       format.projection(file, target.hiddenSize, target.attentionWidth, "gdn-output");
-  gdn.outputHeadOrder = Format::gdnOutputOrder;
+  gdn.outputHeadOrder = format.gdnOutputOrder;
   return gdn;
 }
-
-template QwenMixerWeights readQwenMixer(WeightFile &, const AffineTargetFormat &,
-                                        const QwenTargetDimensions &, bool);
-template QwenMixerWeights readQwenMixer(WeightFile &, const BlockTargetFormat &,
-                                        const QwenTargetDimensions &, bool);
 
 } // namespace splash::model

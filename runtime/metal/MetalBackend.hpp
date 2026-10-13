@@ -145,12 +145,24 @@ struct BytesBinding {
   uint64_t sizeBytes = 0;
 };
 
+// A grid the GPU reads as the dispatch starts, so an earlier dispatch of the
+// same command may write it: three uint32 threadgroup counts, x, y and z
+// (MTLDispatchThreadgroupsIndirectArguments), at offsetBytes into buffer and
+// at a multiple of 4 bytes into its allocation.
+struct IndirectGrid {
+  MetalBuffer buffer;
+  uint64_t offsetBytes = 0;
+};
+
 struct ComputeDispatch {
   std::string pipelineName;
   std::vector<BufferBinding> buffers;
   std::vector<BytesBinding> bytes;
+  // With a buffer in indirectThreadgroups the dispatch runs the grid it
+  // holds, which its writer keeps within threadgroups.
   DispatchSize threadgroups;
   DispatchSize threadsPerThreadgroup;
+  IndirectGrid indirectThreadgroups = {};
 };
 
 // Orders a command against another agent, such as the Neural Engine, after

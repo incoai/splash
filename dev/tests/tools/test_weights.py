@@ -124,21 +124,13 @@ class WeightBytesTests(unittest.TestCase):
             baseline, candidate = root / "baseline", root / "candidate"
             digest_tool(candidate, {"target/layer-0.bin": A})
             environment = weights.baseline_environment(root / "release")
-            # A package an earlier release mapped as it is: nothing to compare.
-            self.assertEqual(
-                weights.compare_builds(
-                    baseline, candidate, MODEL_ROOT, environment, False
-                ),
-                {"images": [], "failures": [], "pass": True},
-            )
-            self.assertFalse((candidate / "roots").exists())
-            # An assembly it prepared into its cache, which its build names.
+            # An earlier release prepared into its cache, which its build
+            # names.
             with self.assertRaisesRegex(
                 RuntimeError, "has no engine-tests/weight-digests"
             ):
-                weights.compare_builds(
-                    baseline, candidate, MODEL_ROOT, environment, True
-                )
+                weights.compare_builds(baseline, candidate, MODEL_ROOT, environment)
+            self.assertFalse((candidate / "roots").exists())
             (baseline / weights.IDENTITY_HEADER).parent.mkdir(parents=True)
             (baseline / weights.IDENTITY_HEADER).write_text("")
             entry(
@@ -148,20 +140,17 @@ class WeightBytesTests(unittest.TestCase):
                 provenance("target/layer-0.bin"),
             )
             result = weights.compare_builds(
-                baseline, candidate, MODEL_ROOT, environment, True
+                baseline, candidate, MODEL_ROOT, environment
             )
             self.assertEqual(
                 result["failures"],
                 [f"target/layer-0.bin: the baseline loaded {B}, the candidate {A}"],
             )
-            # A baseline that loads into memory is asked, whatever it was given.
+            # A baseline that loads into memory is asked.
             digest_tool(baseline, {"target/layer-0.bin": A})
-            for assembly in (True, False):
-                result = weights.compare_builds(
-                    baseline, candidate, MODEL_ROOT, None, assembly
-                )
-                self.assertTrue(result["pass"], result["failures"])
-                self.assertEqual(len(result["images"]), 1)
+            result = weights.compare_builds(baseline, candidate, MODEL_ROOT, None)
+            self.assertTrue(result["pass"], result["failures"])
+            self.assertEqual(len(result["images"]), 1)
 
 
 if __name__ == "__main__":

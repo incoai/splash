@@ -81,9 +81,7 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
   QwenTargetGeometry() = default;
   explicit QwenTargetGeometry(const QwenTargetDimensions &dimensions) : QwenTargetDimensions(dimensions) {}
 
-  // The weight layout every sparse MoE block of the target shares, and in a
-  // GGUF the format of most of its routed expert weights.
-  ops::WeightLayout moeLayout = ops::WeightLayout::Affine64;
+  // The format of most of the sparse MoE blocks' routed expert weights.
   uint32_t moeExpertFormat = GGUF_FMT_COUNT;
   std::array<uint32_t, maximumCaptureLayers> captureLayerValues{};
   uint32_t captureLayerCount = 0;
@@ -103,11 +101,7 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
     return hiddenSize * captureLayerCount;
   }
   [[nodiscard]] constexpr ops::MoeShape moeShape() const noexcept {
-    return {hiddenSize, experts, expertsPerToken, expertIntermediateSize, moeLayout, moeExpertFormat};
-  }
-  [[nodiscard]] constexpr uint32_t ffnScratchWidth() const noexcept {
-    return ffnKind == QwenFfnKind::Dense ? intermediateSize
-                                         : expertIntermediateSize;
+    return {hiddenSize, experts, expertsPerToken, expertIntermediateSize, moeExpertFormat};
   }
   [[nodiscard]] constexpr std::span<const uint32_t>
   captureLayers() const noexcept {
@@ -190,8 +184,6 @@ struct QwenTargetPrefillBuffers final {
   metal::MetalBuffer attentionStatistics;
   metal::MetalBuffer attentionHidden;
   metal::MetalBuffer attentionOutput;
-  metal::MetalBuffer projectionSums;
-  metal::MetalBuffer downProjectionSums;
   metal::MetalBuffer ropeCos;
   metal::MetalBuffer ropeSin;
   metal::MetalBuffer chunkKeys;
@@ -200,7 +192,7 @@ struct QwenTargetPrefillBuffers final {
 
   // The dense FFN's buffers among these.
   [[nodiscard]] ops::PrefillFfnBuffers ffn() const {
-    return {normalized, projectionSums, denseGateScratch, denseIntermediate, downProjectionSums, linearScratch};
+    return {normalized, denseGateScratch, denseIntermediate, linearScratch};
   }
 };
 
@@ -224,10 +216,10 @@ struct QwenTargetVerifyBuffers final {
   metal::MetalBuffer finalHidden;
   metal::MetalBuffer logits;
   metal::MetalBuffer denseGateScratch;
-  std::span<const metal::MetalBuffer> gdnPacked;
-  std::span<const metal::MetalBuffer> gdnMixed;
-  std::span<const metal::MetalBuffer> gdnDecay;
-  std::span<const metal::MetalBuffer> gdnBeta;
+  metal::MetalBuffer gdnPacked;
+  // The lanes' decode tapes (ops::GdnTapeLane).
+  metal::MetalBuffer gdnTape;
+  std::array<ops::GdnTapeLane, ExecutionLimits::maximumBatchWidth> gdnTapeLanes{};
   std::span<const metal::MetalBuffer> chunkKeys;
   std::span<const metal::MetalBuffer> chunkValues;
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth>
@@ -237,18 +229,6 @@ struct QwenTargetVerifyBuffers final {
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth>
       pageTables;
   ops::MoeScratch moe;
-};
-
-struct QwenTargetCommitBuffers final {
-  metal::MetalBuffer packed;
-  metal::MetalBuffer mixed;
-  metal::MetalBuffer decay;
-  metal::MetalBuffer beta;
-  std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth>
-      currentStates;
-  std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth>
-      nextStates;
-  metal::MetalBuffer retainedCounts;
 };
 
 template <class Layout, class Layer>
@@ -296,8 +276,6 @@ public:
                       metal::MetalBuffer verifyInput, uint32_t lanes) const;
   void addEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens,
                     metal::MetalBuffer hidden, uint32_t rows) const;
-  void addStateCommit(metal::CommandGraph &graph,
-                      QwenTargetCommitBuffers buffers, uint32_t lanes) const;
 
 private:
   using WeightView =
@@ -308,8 +286,7 @@ private:
 
   // A layer's parts in dispatch order: the mixer normalizes its input and
   // returns the residual rows the FFN normalizes and adds to into `output`.
-  void addPrefillNorm(PrefillStep &step, metal::MetalBuffer input, const ops::NormWeights &norm,
-                      ops::WeightLayout consumer) const;
+  void addPrefillNorm(PrefillStep &step, metal::MetalBuffer input, const ops::NormWeights &norm) const;
   void addPrefillOutput(PrefillStep &step, metal::MetalBuffer hidden, const ops::Projection &projection,
                         metal::MetalBuffer input, metal::MetalBuffer output) const;
   metal::MetalBuffer addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer, const ops::NormWeights &norm,

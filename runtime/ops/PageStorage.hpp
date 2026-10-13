@@ -65,6 +65,9 @@ public:
   // Copies every tensor of each page in every layer (spans()).
   // std::out_of_range for a page past the pool.
   void copyPages(std::span<const PageCopy> copies) override;
+  // Zeroes every tensor of each page in every layer (spans()).
+  // std::out_of_range for a page past the pool.
+  void clearPages(std::span<const uint32_t> pages) override;
   // Where each attention layer's region sits in every extent, by layer.
   [[nodiscard]] std::span<const SplashKvLayer> layers() const noexcept {
     return layers_;

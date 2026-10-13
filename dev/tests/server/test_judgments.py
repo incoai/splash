@@ -88,6 +88,29 @@ class JudgmentTests(HarnessTestCase):
             list(request.prompt_tokens) + [ord("A")],
         )
 
+    def test_judgments_send_the_cache_salt(self):
+        # Rows of one salt share cached prompts with each other alone.
+        runtime = FakeRuntime(*(Plan(logits=(1.5, -2.25)) for _ in range(4)))
+        harness = self.harness(runtime, tokenizer=CharTokenizer(), max_context=8192)
+        for salt in ("run-1", "run-1", "run-2", None):
+            body = judgment_body() if salt is None else judgment_body(cache_salt=salt)
+            status, _, payload = harness.request("POST", "/v1/judgments", body)
+            self.assertEqual(status, 200, payload)
+        first, again, other, unsalted = (
+            request.frame.cache_salt for request in runtime.requests
+        )
+        self.assertNotEqual(first, 0)
+        self.assertEqual(first, again)
+        self.assertNotIn(other, (0, first))
+        self.assertEqual(unsalted, 0)
+        for salt in ("", 7, ["run-1"]):
+            status, _, payload = harness.request(
+                "POST", "/v1/judgments", judgment_body(cache_salt=salt)
+            )
+            self.assertEqual(status, 400, payload)
+            self.assertIn("cache_salt must be a non-empty string", payload.decode())
+        self.assertEqual(len(runtime.requests), 4)
+
     def test_judgments_rejects_invalid_rows_before_inference(self):
         runtime = FakeRuntime()
         harness = self.harness(runtime, tokenizer=CharTokenizer(), max_context=8192)
@@ -349,6 +372,31 @@ class JudgmentTests(HarnessTestCase):
         self.assertEqual(len(runtime.requests), 2)
         self.assertTrue(blocked.cancelled.is_set())
         self.assertEqual(runtime.cancel_count, 1)
+
+    def test_systemone_sends_the_cache_salt(self):
+        runtime = FakeRuntime(Plan(logits=(1.0, 0.0)), Plan(logits=(1.0, 0.0)))
+        harness = self.harness(runtime, tokenizer=CharTokenizer(), max_context=8192)
+        body = {
+            "model": "test-model",
+            "state": "Some evidence",
+            "questions": {"first": {"type": "noul", "criteria": {}}},
+        }
+        for salt in ("run-1", None):
+            request = body if salt is None else body | {"cache_salt": salt}
+            status, _, payload = harness.request("POST", "/v1/systemone", request)
+            self.assertEqual(status, 200, payload)
+        salted, unsalted = (request.frame.cache_salt for request in runtime.requests)
+        self.assertNotEqual(salted, 0)
+        self.assertEqual(unsalted, 0)
+        status, _, payload = harness.request(
+            "POST", "/v1/systemone", body | {"cache_salt": ""}
+        )
+        self.assertEqual(status, 422, payload)
+        self.assertEqual(
+            [error["loc"] for error in json.loads(payload)["detail"]],
+            [["body", "cache_salt"]],
+        )
+        self.assertEqual(len(runtime.requests), 2)
 
     def test_systemone_question_count_budget_rejects_before_inference(self):
         runtime = FakeRuntime()

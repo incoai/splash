@@ -1,12 +1,12 @@
 // The prefill FFN's Neural Engine split (ops/AneFfn.cpp, kernels/prefill/ane_ffn.metal):
 // - inputs: ane_ffn_rotate and ane_ffn_pack turn bf16 rows into the ANE's channel-major int8 segments at their stride
 //   and the rows' scales, as a CPU rotation of the rows does;
-// - weights: ane_ffn_row_scale and ane_ffn_weights turn the rows of affine Q4 and of every GGUF format into int8 rows
-//   at their stride and their scales at theirs, rotated in either block, as a CPU rotation of their dequantized values
-//   does; rows of zeros take a normal scale and codes of 0;
+// - weights: ane_ffn_row_scale_gguf and ane_ffn_weights_gguf turn the rows of every image format (the GGUF formats
+//   and MLX's affine ones) into int8 rows at their stride and their scales at theirs, rotated in either block, as a
+//   CPU rotation of their dequantized values does; rows of zeros take a normal scale and codes of 0;
 // - join: ane_ffn_join adds the ANE's channel-major partial rows, scaled in fp32, to the chunk's output rows and to no
 //   others, and flags a value of the chunk's rows that is not finite;
-// - the split: which layers, units and chunks it takes; for three layers of affine Q4 and of mixed GGUF formats,
+// - the split: which layers, units and chunks it takes; for three layers of MLX af4g64 and of mixed GGUF formats,
 //   Metal allocates what plannedBytes plans, and chunks of the fewest rows, of a count between two functions and of the
 //   most rows compute what the GPU computes alone within int8's error, as do quiet rows, whose intermediate values
 //   fp16 barely holds, and rows of a hidden channel of about 1e5; verify() passes every function of either model and
@@ -29,11 +29,11 @@
 // share, so `kernels` runs the first three checks, which test-engine-metal validates, and `split`, `faults` and
 // `program` the others. The binary links the instrumented Program, whose faults only `faults` and two checks of
 // `split` arm.
-#include "AffineQ4Fixture.hpp"
 #include "AneProgramFixture.hpp"
 #include "AwakeClock.hpp"
 #include "Checked.hpp"
 #include "GgufFormatReference.hpp"
+#include "LinearNumerics.hpp"
 #include "TestBuffers.hpp"
 #include "TestFiles.hpp"
 #include "ane/ProgramInstrumentation.hpp"
@@ -43,7 +43,6 @@
 #include "metal/abi/QuantFormat.h"
 #include "ops/AneFfn.hpp"
 #include "ops/Linear.hpp"
-#include "tuning/LinearNumerics.hpp"
 
 #include <algorithm>
 #include <array>
@@ -82,8 +81,8 @@ using namespace splash::ops;
 using splash::metal::CommandGraph;
 using splash::metal::MetalBackend;
 using splash::metal::MetalBuffer;
-using splash::ops::tuning::bf16ToFloat;
-using splash::ops::tuning::floatToBf16;
+using splash::test::bf16ToFloat;
+using splash::test::floatToBf16;
 
 namespace {
 
@@ -213,54 +212,27 @@ void inputs(MetalBackend &backend, const MetalBuffer &signs, const std::vector<f
 
 // ---------------------------------------------------------------- weights
 constexpr uint32_t kWeightRows = 512, kWeightInputs = 2048;
-// A [kWeightRows, kWeightInputs] projection's planes as the weight kernels bind them, the parameters and kernel name
-// suffix of its layout, and its values.
+// A [kWeightRows, kWeightInputs] projection's planes as the weight kernels bind them, its parameters and its values.
 struct Source {
   std::string name;
   std::array<MetalBuffer, 3> planes;
   uint32_t groups = 0, format = 0;
-  std::string suffix;
   std::vector<float> values;
 };
 
-// A row of zero weights, which takes the least scale and codes of 0.
+// A row of zero weights, which takes the least scale and codes of 0: native blocks of zero bytes, whose scales are 0.
 constexpr uint32_t kZeroWeightRow = 300;
-
-Source affineSource(MetalBackend &backend) {
-  const Projection projection = test::deterministicQ4Projection(backend, {kWeightRows, kWeightInputs}, 11);
-  const AffineWeights &weights = projection.affine();
-  Source source{"affine Q4", {weights.weights, weights.scales, weights.biases}, kWeightInputs / 64, 0, "", {}};
-  const auto *nibbles = contents<uint8_t>(weights.weights);
-  auto *scales = static_cast<uint16_t *>(weights.scales.contents());
-  auto *biases = static_cast<uint16_t *>(weights.biases.contents());
-  for (uint32_t group = 0; group < kWeightInputs / 64; ++group) {
-    const uint64_t unit = quant_tile_index(kZeroWeightRow, group, kWeightInputs / 64);
-    scales[unit] = biases[unit] = 0;
-  }
-  source.values.resize(uint64_t{kWeightRows} * kWeightInputs);
-  for (uint32_t row = 0; row < kWeightRows; ++row)
-    for (uint32_t input = 0; input < kWeightInputs; ++input) {
-      const uint64_t unit = quant_tile_index(row, input / 64, kWeightInputs / 64);
-      const uint32_t code = (nibbles[unit * 32 + (input & 63) / 2] >> (input & 1 ? 4 : 0)) & 15;
-      source.values[uint64_t{row} * kWeightInputs + input] =
-          float(code) * bf16ToFloat(scales[unit]) + bf16ToFloat(biases[unit]);
-    }
-  return source;
-}
 
 Source ggufSource(MetalBackend &backend, gguf_reference::Fmt format) {
   using namespace gguf_reference;
-  const std::vector<uint8_t> native = makeNative(format, kWeightRows, kWeightInputs, rng);
+  std::vector<uint8_t> native = makeNative(format, kWeightRows, kWeightInputs, rng);
+  const uint32_t nativeRow = rowBytes(format, kWeightInputs);
+  std::fill_n(native.begin() + uint64_t{kZeroWeightRow} * nativeRow, nativeRow, uint8_t{0});
   const Packed packed = repack(format, native, kWeightRows, kWeightInputs, nullptr);
   const MetalBuffer meta = upload(backend, packed.meta);
   // A format without plane1 binds meta in its place (QuantizedSegment::plane1Slot).
   const MetalBuffer plane1 = kQuantFormats[format].plane1_bytes ? upload(backend, packed.w1) : meta;
-  Source source{fmtName(format),
-                {upload(backend, packed.w0), plane1, meta},
-                kWeightInputs / 32,
-                uint32_t(format),
-                "_gguf",
-                {}};
+  Source source{fmtName(format), {upload(backend, packed.w0), plane1, meta}, kWeightInputs / 32, uint32_t(format), {}};
   source.values.resize(uint64_t{kWeightRows} * kWeightInputs);
   for (uint32_t row = 0; row < kWeightRows; ++row)
     rowValues(format, native.data() + uint64_t{row} * rowBytes(format, kWeightInputs), kWeightInputs,
@@ -281,10 +253,10 @@ void weights(MetalBackend &backend, const MetalBuffer &signs, const std::vector<
   const MetalBuffer scales = filled(backend, uint64_t{rows} * scaleStride * sizeof(uint16_t), kUntouched);
   const auto &[a, b, c] = source.planes;
   CommandGraph graph;
-  graph.add("ane_ffn_row_scale" + source.suffix + variant, {a, b, c, rowScales, signs},
+  graph.add("ane_ffn_row_scale_gguf" + variant, {a, b, c, rowScales, signs},
             AneFfnWeightParams{source.groups, row, scaled, kWeightInputs - scaled, 0, 0, source.format},
             {rows / ANE_FFN_WEIGHT_ROWS, 1, 1}, {ANE_FFN_WEIGHT_THREADS, 1, 1});
-  graph.add("ane_ffn_weights" + source.suffix + variant, {a, b, c, rowScales, output, scales, signs},
+  graph.add("ane_ffn_weights_gguf" + variant, {a, b, c, rowScales, output, scales, signs},
             AneFfnWeightParams{source.groups, row, input, width, stride, scaleStride, source.format},
             {rows / ANE_FFN_WEIGHT_ROWS, width / block, 1}, {ANE_FFN_WEIGHT_THREADS, 1, 1});
   run(backend, graph);
@@ -322,15 +294,13 @@ void weights(MetalBackend &backend, const MetalBuffer &signs, const std::vector<
 }
 
 void weights(MetalBackend &backend, const MetalBuffer &signs, const std::vector<float> &sign) {
-  std::vector<Source> sources{affineSource(backend)};
-  for (int format = 0; format < gguf_reference::FMT_COUNT; ++format)
-    sources.push_back(ggufSource(backend, gguf_reference::Fmt(format)));
-  for (const Source &source : sources) {
+  for (int format = 0; format < gguf_reference::FMT_COUNT; ++format) {
+    const Source source = ggufSource(backend, gguf_reference::Fmt(format));
     weights(backend, signs, sign, source, ANE_FFN_INPUT_BLOCK, 256, 0, 512);
     weights(backend, signs, sign, source, ANE_FFN_INTERMEDIATE_BLOCK, 0, 512, 1024);
   }
-  section("weights: affine Q4 and " + std::to_string(gguf_reference::FMT_COUNT) +
-          " GGUF formats as int8 rows and scales, rotated in blocks of 128 and 512; a row of zeros as codes of 0");
+  section("weights: " + std::to_string(gguf_reference::FMT_COUNT) +
+          " image formats as int8 rows and scales, rotated in blocks of 128 and 512; a row of zeros as codes of 0");
 }
 
 // ---------------------------------------------------------------- join
@@ -417,31 +387,23 @@ Model withLayers(Model model) {
 constexpr std::array<LinearMatrix, 3> kMatrices{
     {{kIntermediate, kHidden}, {kIntermediate, kHidden}, {kHidden, kIntermediate}}};
 
-Model affineModel(MetalBackend &backend) {
-  Model model{"affine Q4", {}, {}};
-  for (uint32_t layer = 0; layer < kLayers; ++layer)
-    for (const LinearMatrix matrix : kMatrices)
-      model.projections.push_back(
-          test::deterministicQ4Projection(backend, matrix, uint32_t(model.projections.size()) * 7919));
-  return withLayers(std::move(model));
-}
-
-// Layers of mixed formats, gate's, up's and down's of each, with scales a 32nd of the fixture's: weights of a model's
-// magnitude, whose FFN values the ANE's fp16 holds as it holds a model's. The fixture's random sub-block scales
-// spread a row's values over a range no model's weights span, more so in other formats (Q6_K's split error is 4.8%
-// on them, against 0.6% for Q5_K); `weights` checks every format's int8 rows.
-Model ggufModel(MetalBackend &backend) {
+// Layers of `formats`, gate's, up's and down's of each, of weights of a model's magnitude, whose FFN values the
+// ANE's fp16 holds as it holds a model's: an MLX format's scales from its range (scaleRange), a GGUF format's a 32nd
+// of it. The fixture's random sub-block scales spread a row's values over a range no model's weights span, more so in
+// other formats (Q6_K's split error is 4.8% on them, against 0.6% for Q5_K); `weights` checks every format's int8
+// rows.
+Model blockModel(MetalBackend &backend, std::string name,
+                 const std::array<std::array<gguf_reference::Fmt, 3>, kLayers> &formats) {
   using namespace gguf_reference;
-  constexpr std::array<std::array<Fmt, 3>, kLayers> kFormats{
-      {{Q4K, Q4K, Q5K}, {Q5K, Q5K, Q4K}, {Q4K, Q5K, Q80}}};
-  Model model{"GGUF", {}, {}};
+  Model model{std::move(name), {}, {}};
   for (uint32_t layer = 0; layer < kLayers; ++layer)
     for (uint32_t index = 0; index < 3; ++index) {
-      const Fmt format = kFormats[layer][index];
+      const Fmt format = formats[layer][index];
       const auto [outputs, inputs] = kMatrices[index];
       std::uniform_real_distribution<float> range = scaleRange(format);
       const std::vector<uint8_t> native =
-          makeNative(format, outputs, inputs, rng, [&] { return f2h(range(rng) / 32); });
+          affine(format) ? makeAffineNative(format, outputs, inputs, rng, [&] { return range(rng); })
+                         : makeNative(format, outputs, inputs, rng, [&] { return f2h(range(rng) / 32); });
       const Packed packed = repack(format, native, outputs, inputs, nullptr);
       model.projections.emplace_back(
           outputs, inputs,
@@ -452,22 +414,36 @@ Model ggufModel(MetalBackend &backend) {
     }
   return withLayers(std::move(model));
 }
+// An MLX 4-bit target's layers.
+Model mlxModel(MetalBackend &backend) {
+  using gguf_reference::Fmt;
+  constexpr auto kAf4 = Fmt(GGUF_FMT_AF4G64);
+  return blockModel(backend, "MLX af4g64", {{{kAf4, kAf4, kAf4}, {kAf4, kAf4, kAf4}, {kAf4, kAf4, kAf4}}});
+}
+// Layers of mixed GGUF formats.
+Model ggufModel(MetalBackend &backend) {
+  using namespace gguf_reference;
+  return blockModel(backend, "GGUF", {{{Q4K, Q4K, Q5K}, {Q5K, Q5K, Q4K}, {Q4K, Q5K, Q80}}});
+}
 
 // Which layers and shares the split takes.
-void takes(MetalBackend &backend, const Model &affine, const Model &gguf) {
-  if (AneFfn::unsupported(affine.layers) || AneFfn::unsupported(gguf.layers))
+void takes(const Model &mlx, const Model &gguf) {
+  if (AneFfn::unsupported(mlx.layers) || AneFfn::unsupported(gguf.layers))
     fail("the split does not take the models");
   if (!AneFfn::unsupported({})) fail("the split takes no layers");
   // A hidden size the programs' segments do not take, and layers of two shapes.
-  const Projection gate = test::deterministicQ4Projection(backend, {kIntermediate, 4096}, 1);
-  const Projection down = test::deterministicQ4Projection(backend, {4096, kIntermediate}, 2);
-  const std::vector<SwiGluProjections> narrow{{&gate, &gate, &down}}, mixed{affine.layers[0], narrow[0]};
+  const auto projection = [](uint32_t outputs, uint32_t inputs) {
+    return Projection(outputs, inputs,
+                      BlockWeights{{QuantizedSegment::planes(GGUF_FMT_AF4G64, outputs, inputs, {}, {}, {})}});
+  };
+  const Projection gate = projection(kIntermediate, 4096), down = projection(4096, kIntermediate);
+  const std::vector<SwiGluProjections> narrow{{&gate, &gate, &down}}, mixed{mlx.layers[0], narrow[0]};
   if (!AneFfn::unsupported(narrow)) fail("the split takes a hidden size of 4096");
   if (!AneFfn::unsupported(mixed)) fail("the split takes layers of two shapes");
-  if (AneFfn::units(affine.layers) != kIntermediate / 512) fail("the split moves other units than 512 channels");
+  if (AneFfn::units(mlx.layers) != kIntermediate / 512) fail("the split moves other units than 512 channels");
   // Units that leave the GPU or the ANE no channels.
-  for (const uint32_t aneUnits : {0u, AneFfn::units(affine.layers)})
-    test::rejects([&] { static_cast<void>(AneFfn::plannedBytes(affine.layers, aneUnits)); }, "no channels",
+  for (const uint32_t aneUnits : {0u, AneFfn::units(mlx.layers)})
+    test::rejects([&] { static_cast<void>(AneFfn::plannedBytes(mlx.layers, aneUnits)); }, "no channels",
                   std::to_string(aneUnits) + " units leave the GPU or the ANE no channels, yet plan");
   section("takes: models of one splittable shape, and units that leave each part channels");
 }
@@ -480,10 +456,8 @@ struct Chunk {
 };
 Chunk chunk(MetalBackend &backend, uint32_t rows) {
   const auto bf16Rows = [&](uint32_t width) { return test::sharedBuffer(backend, uint64_t{rows} * width * 2); };
-  const auto sumRows = [&](uint32_t width) { return test::sharedBuffer(backend, uint64_t{rows} * (width / 64) * 4); };
   // Chunks of at least kMinimumRows rows take no split scratch (Linear::prefillScratchSize).
-  return {{bf16Rows(kHidden), sumRows(kHidden), bf16Rows(kIntermediate), bf16Rows(kIntermediate),
-           sumRows(kIntermediate), {}},
+  return {{bf16Rows(kHidden), bf16Rows(kIntermediate), bf16Rows(kIntermediate), {}},
           {bf16Rows(kHidden), bf16Rows(kHidden)}};
 }
 // Normal values scaled by row(r) into the leading rows of the chunk's normalized rows.
@@ -508,8 +482,6 @@ Forward forward(MetalBackend &backend, const Linear &linear, const Model &model,
   const auto &[ffn, hidden] = chunk;
   std::memset(hidden[0].contents(), 0, hidden[0].sizeBytes());
   CommandGraph graph;
-  if (model.layers.front().gate->layout() == WeightLayout::Affine64)
-    linear.addPrefillSums(graph, ffn.normalized, ffn.sums, *model.layers.front().gate, rows);
   const bool splits = split && split->splits(rows);
   if (split) static_cast<void>(split->begin());
   for (uint32_t layer = 0; layer < kLayers; ++layer) {
@@ -712,15 +684,14 @@ void massiveChannel(MetalBackend &backend, const Linear &linear, const Chunk &ch
   constexpr uint32_t kRows = AneFfn::kMaximumRows, kChannel = 1234, kFirst = 4096, kCount = 4;
   static_assert(kFirst >= kIntermediate / 2 && kFirst % 64 + kCount <= 64,
                 "the channels are the ANE's at share 0.5 and lie in one group of down's inputs");
-  const Model model = affineModel(backend);
-  // Scales the bf16 scales and biases of `row`'s groups [first, last) of `projection` by `factor`.
+  const Model model = mlxModel(backend);
+  // Scales the bf16 scales and biases of `row`'s 64-input groups [first, last) of the af4g64 `projection` by
+  // `factor`: its meta holds a scale and a bias per row and group (metal/abi/QuantFormat.h).
   const auto scale = [](const Projection &projection, uint32_t row, uint32_t first, uint32_t last, float factor) {
-    auto *scales = static_cast<uint16_t *>(projection.affine().scales.contents());
-    auto *biases = static_cast<uint16_t *>(projection.affine().biases.contents());
+    auto *meta = static_cast<uint16_t *>(projection.blocks().segments.front().meta.contents());
     for (uint32_t group = first; group < last; ++group) {
-      const uint64_t unit = quant_tile_index(row, group, projection.inputSize / 64);
-      scales[unit] = floatToBf16(bf16ToFloat(scales[unit]) * factor);
-      biases[unit] = floatToBf16(bf16ToFloat(biases[unit]) * factor);
+      uint16_t *parameters = meta + 2 * quant_tile_index(row, group, projection.inputSize / 64);
+      for (uint32_t i = 0; i < 2; ++i) parameters[i] = floatToBf16(bf16ToFloat(parameters[i]) * factor);
     }
   };
   const Projection &up = *model.layers.back().up, &down = *model.layers.back().down;
@@ -860,22 +831,22 @@ void loses(MetalBackend &backend, const Linear &linear, const Model &model, cons
   if (split->release()) fail("a slow Neural Engine: the stopped split loaded its program again");
 }
 
-// The split of the affine Q4 and the GGUF model over normalized rows of normal values, and the numerics of rows the
-// ANE's fp16 barely holds.
+// The split of the MLX and the GGUF model over normalized rows of normal values, and the numerics of rows the ANE's
+// fp16 barely holds.
 void split(MetalBackend &backend) {
   const Linear linear(backend.capabilities());
-  const Model affine = affineModel(backend), gguf = ggufModel(backend);
-  takes(backend, affine, gguf);
+  const Model mlx = mlxModel(backend), gguf = ggufModel(backend);
+  takes(mlx, gguf);
   const Chunk buffers = chunk(backend, AneFfn::kMaximumRows);
-  split(backend, linear, affine, buffers);
+  split(backend, linear, mlx, buffers);
   split(backend, linear, gguf, buffers);
-  misbound(backend, affine, buffers);
-  refusals(backend, affine, buffers);
-  quietRows(backend, linear, affine, buffers);
+  misbound(backend, mlx, buffers);
+  refusals(backend, mlx, buffers);
+  quietRows(backend, linear, mlx, buffers);
   massiveChannel(backend, linear, buffers);
-  idle(backend, linear, affine, buffers);
+  idle(backend, linear, mlx, buffers);
   fillRows(buffers, AneFfn::kMaximumRows, [](uint64_t) { return 1.0f; });
-  stops(backend, linear, affine, buffers, {.poisonedEvaluation = 2}, "an infinity in layer 1's output",
+  stops(backend, linear, mlx, buffers, {.poisonedEvaluation = 2}, "an infinity in layer 1's output",
         AneFfn::kMaximumRows, "not finite");
   section("stops: an infinity in the ANE's output stops the split");
 }
@@ -886,7 +857,7 @@ void split(MetalBackend &backend) {
 void faults(MetalBackend &backend) {
   using Faults = ane::ProgramInstrumentation::Faults;
   const Linear linear(backend.capabilities());
-  const Model model = affineModel(backend);
+  const Model model = mlxModel(backend);
   const Chunk buffers = chunk(backend, AneFfn::kMaximumRows);
   fillRows(buffers, AneFfn::kMaximumRows, [](uint64_t) { return 1.0f; });
   struct Fault {

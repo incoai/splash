@@ -247,10 +247,11 @@ void testReservationsAndAdmissionClasses() {
 }
 
 // Critical pressure stops all growth. Host headroom below the warning margin
-// stops it too, but as warning pressure, which sheds cache in paced passes,
-// and only crossing the recovery margin reopens it. Exhausting the engine's
-// limit is not host pressure, and missing telemetry fails closed without
-// discarding valid cache.
+// stops it too, as warning pressure, which sheds cache in paced passes and
+// lasts until the headroom crosses the recovery margin; with no request
+// waiting for memory, growth that leaves the warning margin free resumes
+// before then. Exhausting the engine's limit is not host pressure, and
+// missing telemetry fails closed without discarding valid cache.
 void testHostHeadroomHysteresis() {
   test::metalStatistics() = {};
   metal::MetalBackend backend("unused");
@@ -327,7 +328,7 @@ void testReclaimablePagesReopenGrowth() {
   const auto hostDirective = hostPolicy.update(governor.snapshot(), 0.0, false);
   require(!admitsMore() && governor.snapshot().pressure == MemoryPressure::Warning &&
               hostDirective && !hostDirective->critical &&
-              hostDirective->targetBytes == kGiB,
+              hostDirective->targetBytes == kGiB / 2,
           "low reclaimable memory bypassed bounded pressure recovery");
   pressurePages.fileBacked = 3 * kGiB;
   available = estimateHostAvailableMemory(pressurePages, 1, false);
@@ -345,7 +346,8 @@ void testReclaimablePagesReopenGrowth() {
 // Reading the governor moves nothing: /status and the engine's growth
 // queries see what it would decide, and only a reservation or the control
 // pass moves the host's hysteresis. A recovery that only a read saw leaves
-// growth held once the host falls back inside the recovery margin.
+// growth held for a waiting request once the host falls back inside the
+// recovery margin.
 void testSnapshotLeavesTheHysteresis() {
   test::metalStatistics() = {};
   metal::MetalBackend backend("unused");
@@ -353,6 +355,7 @@ void testSnapshotLeavesTheHysteresis() {
   std::optional<uint64_t> available = hostReserve + kGiB / 2;
   MemoryGovernor governor(backend, 64 * 1024, hostReserve,
                           [&available] { return available; }, 0);
+  governor.setRequestWaiting(true);
   require(!admit(governor, 1), "growth inside the warning margin was admitted");
   available = hostReserve + 3 * kGiB;
   require(governor.snapshot().hostGrowthAllowed, "a read did not see the host recover");
@@ -367,16 +370,17 @@ void testSnapshotLeavesTheHysteresis() {
           "the control pass did not move the host's hysteresis");
 }
 
-// Warning pressure asks for what measured headroom lacks of the recovery
-// margin, at most the warning margin, once per settled measurement; critical
-// pressure evicts everything.
+// Warning pressure asks, once per settled measurement and for at most the
+// warning margin, for what measured headroom lacks of the warning margin, or
+// of the recovery margin while a request waits for memory; critical pressure
+// evicts everything.
 void testPressurePolicyDirectives() {
   MemoryPressurePolicy policy;
   MemoryGovernorSnapshot policySnapshot;
   policySnapshot.pressure = MemoryPressure::Warning;
   policySnapshot.hostMeasurementValid = true;
   policySnapshot.systemPressure = MemoryPressure::Warning;
-  policySnapshot.hostHeadroomBytes = 3 * kGiB / 2;
+  policySnapshot.hostHeadroomBytes = kGiB / 2;
   const auto firstDirective = policy.update(policySnapshot, 0.0, false);
   require(firstDirective && !firstDirective->critical &&
               firstDirective->targetBytes == kGiB / 2,
@@ -387,10 +391,10 @@ void testPressurePolicyDirectives() {
   // Another application consumed more memory in the SAME warning episode.
   // Earlier reclaimed bytes must not offset this new deficit.
   policySnapshot.hostHeadroomBytes = kGiB / 4;
-  require(policy.update(policySnapshot, 1000.0, false).value().targetBytes == kGiB,
+  require(policy.update(policySnapshot, 1000.0, false).value().targetBytes == 3 * kGiB / 4,
           "persistent warning did not request a new bounded shrink pass");
   policySnapshot.systemPressure = MemoryPressure::Normal;
-  policySnapshot.hostHeadroomBytes = 7 * kGiB / 4;
+  policySnapshot.hostHeadroomBytes = 3 * kGiB / 4;
   require(policy.update(policySnapshot, 2000.0, false).value().targetBytes == kGiB / 4,
           "pressure recovery ignored the current smaller deficit");
   policySnapshot.pressure = MemoryPressure::Normal;
@@ -399,23 +403,34 @@ void testPressurePolicyDirectives() {
   policySnapshot.pressure = MemoryPressure::Warning;
   require(policy.update(policySnapshot, 2101.0, false).value().targetBytes == kGiB / 4,
           "a new pressure episode inherited an old cooldown");
+  // Past the warning margin the hysteresis still holds the pressure. A pass
+  // nothing waits for then evicts nothing; one a request waits for frees
+  // what the recovery margin lacks.
+  policySnapshot.hostHeadroomBytes = 3 * kGiB / 2;
+  const auto idle = policy.update(policySnapshot, 3101.0, false);
+  require(idle && !idle->critical && idle->targetBytes == 0,
+          "a shrink nothing waited for went past the warning margin");
+  const auto waited = policy.update(policySnapshot, 4101.0, true);
+  require(waited && waited->targetBytes == kGiB / 2,
+          "a waiting request's shrink stopped short of the recovery margin");
   policySnapshot.systemPressure = MemoryPressure::Warning;
   policySnapshot.hostHeadroomBytes = 3 * kGiB;
-  const auto advisory = policy.update(policySnapshot, 3101.0, false);
+  const auto advisory = policy.update(policySnapshot, 5101.0, true);
   require(advisory && !advisory->critical && advisory->targetBytes == 0,
           "system warning discarded live cache despite sufficient headroom");
   // The newest publication is what a follow-up resumes from; rebuilding it
   // costs a whole prefill, so a shrink nothing is waiting for leaves it and
   // takes the rest. A waiting request outranks it, and Critical takes all.
   policySnapshot.hostHeadroomBytes = kGiB / 4;
-  const auto speculative = policy.update(policySnapshot, 4101.0, false);
-  require(speculative && speculative->targetBytes == kGiB && speculative->keepResumePoint,
+  const auto speculative = policy.update(policySnapshot, 6101.0, false);
+  require(speculative && speculative->targetBytes == 3 * kGiB / 4 &&
+              speculative->keepResumePoint,
           "a speculative shrink discarded the resume point");
-  const auto demanded = policy.update(policySnapshot, 5101.0, true);
+  const auto demanded = policy.update(policySnapshot, 7101.0, true);
   require(demanded && demanded->targetBytes == kGiB && !demanded->keepResumePoint,
           "a waiting request could not reach the resume point");
   policySnapshot.pressure = MemoryPressure::Critical;
-  const auto criticalDirective = policy.update(policySnapshot, 2102.0, false);
+  const auto criticalDirective = policy.update(policySnapshot, 7102.0, false);
   require(criticalDirective && criticalDirective->critical &&
               !criticalDirective->keepResumePoint,
           "critical pressure did not request aggressive reclaim");
@@ -447,6 +462,8 @@ void testHostRefusalStartsReclaim() {
   const metal::AllocationResult beyondHost = admit(governor, laneState);
   require(!beyondHost && beyondHost.failure == metal::AllocationFailure::HostPressure,
           "a request beyond the host headroom was admitted");
+  // The control pass finds the refused request waiting.
+  governor.setRequestWaiting(true);
   const MemoryGovernorSnapshot refused = governor.snapshot();
   MemoryPressurePolicy policy;
   const std::optional<MemoryReclaimDirective> directive = policy.update(refused, 0.0, true);
@@ -529,6 +546,7 @@ void testExhaustedReclaimWaivesTheHold() {
   const uint64_t hostReserve = 2 * kGiB;
   std::optional<uint64_t> available = hostReserve + kGiB + kGiB / 2;
   MemoryGovernor governor(backend, 40 * kGiB, hostReserve, [&available] { return available; }, 0);
+  governor.setRequestWaiting(true);
   const metal::AllocationResult pastMargin = admit(governor, kGiB);
   require(!pastMargin && pastMargin.failure == metal::AllocationFailure::HostPressure,
           "growth past the warning margin was admitted");
@@ -551,6 +569,48 @@ void testExhaustedReclaimWaivesTheHold() {
   available = hostReserve + kGiB + kGiB / 2;
   require(!admit(governor, kGiB) && !admit(governor, 100 * kMiB),
           "an earlier episode's exhausted reclaim waived the hold");
+}
+
+// Growth waits for the recovery margin only while a request waits for
+// memory, so that what reclaim frees goes to it. With none waiting, paced
+// reclaim only restores the warning margin, and growth that clears that
+// margin proceeds while the host's headroom sits between the margins.
+void testOnlyAWaitingRequestHoldsGrowth() {
+  test::metalStatistics() = {};
+  test::metalStatistics().allocatedBytes = 12 * kGiB;
+  test::metalStatistics().deviceCurrentAllocatedBytes = 12 * kGiB;
+  metal::MetalBackend backend("unused");
+  const uint64_t hostReserve = 2 * kGiB;
+  std::optional<uint64_t> available = hostReserve + kGiB / 2;
+  MemoryGovernor governor(backend, 40 * kGiB, hostReserve, [&available] { return available; }, 0);
+  require(!admit(governor, 100 * kMiB), "growth inside the warning margin was admitted");
+  available = hostReserve + kGiB + kGiB / 2;
+  require(governor.evaluate().pressure == MemoryPressure::Warning &&
+              governor.snapshot().hostGrowthAllowed && admit(governor, 100 * kMiB),
+          "growth that cleared the warning margin waited with no request waiting");
+  governor.setRequestWaiting(true);
+  require(!governor.snapshot().hostGrowthAllowed && !admit(governor, 100 * kMiB),
+          "growth did not wait for the recovery margin while a request waited");
+  governor.setRequestWaiting(false);
+  require(governor.snapshot().hostGrowthAllowed && admit(governor, 100 * kMiB),
+          "the hold outlived the waiting request");
+}
+
+// A pass with no target leaves nothing to settle: a request that starts
+// waiting right after it gets its own pass at once, and that one, which has
+// a target, waits for the host's counters before the next.
+void testOnlyATargetedPassWaitsToSettle() {
+  MemoryPressurePolicy policy;
+  const MemoryGovernorSnapshot between{.pressure = MemoryPressure::Warning,
+                                       .hostMeasurementValid = true,
+                                       .hostHeadroomBytes = kGiB + kGiB / 2};
+  const auto idle = policy.update(between, 0.0, false);
+  const auto waited = policy.update(between, 10.0, true);
+  require(idle && idle->targetBytes == 0 && waited && waited->targetBytes == kGiB / 2,
+          "an empty pass made a waiting request wait for its own");
+  require(policy.update(between, 20.0, true).value().targetBytes == 0 &&
+              policy.update(between, 1010.0, true).value().targetBytes == kGiB / 2,
+          "a pass that freed memory did not wait for the host to settle");
 }
 
 // Host pressure holds back growth that nothing in flight depends on. What a
@@ -613,6 +673,8 @@ int main() {
     testHostRefusalComesBeforeTheEngineLimit();
     testPolicyContinuesHeldBackTarget();
     testExhaustedReclaimWaivesTheHold();
+    testOnlyAWaitingRequestHoldsGrowth();
+    testOnlyATargetedPassWaitsToSettle();
     testRequestInServiceGrowsThroughHostPressure();
     std::cout << "memory governor tests passed\n";
     return EXIT_SUCCESS;

@@ -310,6 +310,13 @@ public:
         }
       }
       Request &state = requests.at(item.requestId);
+      if (nonFinitePrefills.contains(item.requestId)) {
+        // The chunk commits nothing; the engine ends the request.
+        result.push_back({.requestId = item.requestId,
+                          .consumedPromptTokens = item.tokenCount,
+                          .failure = "target prefill row is not finite"});
+        continue;
+      }
       state.position += item.tokenCount;
       prefillRows += item.tokenCount;
       ++prefillChunks[item.requestId];
@@ -338,6 +345,8 @@ public:
         step.outputTokens = {42};
         step.outputTokensWithoutKv = 1;
         step.finished = *prefillAnchor;
+      } else if (last && firstTokens && !state.constrained) {
+        step.firstToken = 42;
       }
       result.push_back(std::move(step));
     }
@@ -359,13 +368,20 @@ public:
         result.push_back({item.requestId, 0, {}, false, DecodeStage::Regular,
                           0, 0});
       } else {
+        const auto speculative = speculativeCounts.find(item.requestId);
+        const uint32_t emitted = speculative == speculativeCounts.end()
+            ? decodeTokens : speculative->second.second + 1;
         const std::vector<uint32_t> tokens =
             item.requestId == poisonRequest && poisonToken
                 ? std::vector<uint32_t>{*poisonToken}
-                : std::vector<uint32_t>(decodeTokens, 42);
+                : std::vector<uint32_t>(emitted, 42);
         ModelStepResult step{item.requestId, 0, tokens, decodeFinishes,
                              DecodeStage::Regular, 0, 0};
         step.outputTokensWithoutKv = decodeTokensWithoutKv;
+        if (speculative != speculativeCounts.end()) {
+          step.draftedTokens = speculative->second.first;
+          step.acceptedDraftTokens = speculative->second.second;
+        }
         result.push_back(std::move(step));
       }
     }
@@ -611,6 +627,7 @@ public:
   bool *kvGrowthBlocked = nullptr;
   bool unblockGrowthOnSuspend = true;
   bool decodeFinishes = true;
+  std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> speculativeCounts;
   uint32_t decodeTokensWithoutKv = 0;
   // When set, the decode step emits poisonToken (instead of 42) for
   // poisonRequest, exercising the engine's output validation.
@@ -618,6 +635,10 @@ public:
   std::optional<uint32_t> poisonToken;
   // Set when prefill itself ends the request: the value is `finished` (stop).
   std::optional<bool> prefillAnchor;
+  // Whether the step that completes an unconstrained request's prompt reports
+  // its first token (ModelStepResult::firstToken), as the runtime does. It is
+  // 42, which the first decode step's tokens start with.
+  bool firstTokens = false;
   std::shared_ptr<std::atomic<bool>> holdDecodeUntil;
   std::shared_ptr<std::atomic<bool>> holdPrefillUntil;
   // The completion of the latest held command, for the test to call as
@@ -629,6 +650,8 @@ public:
   std::function<void()> submitObserver;
   // Score requests whose final prompt step reports a non-finite logit.
   std::unordered_set<uint64_t> invalidScores;
+  // Requests whose prefill steps report a row that is not finite.
+  std::unordered_set<uint64_t> nonFinitePrefills;
   // The flags and sampling each request began with.
   std::unordered_map<uint64_t, uint32_t> beganFlags;
   std::unordered_map<uint64_t, SamplingParameters> beganSampling;

@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "model/GgufFile.hpp"
+#include "model/GgufImageLayout.hpp"
 #include "model/QwenHybridLayout.hpp"
 
 namespace splash::model::gguf {
@@ -32,14 +33,55 @@ struct RowOrder {
   uint32_t valueHeadsPerKey = 0;
 };
 
-// Rows [0, rows) of one source tensor in image order.
+// A quantized safetensors tensor's codes and scales, and an affine one's
+// biases, which the writer interleaves into the native rows of its format
+// (metal/abi/QuantFormat.h): per group an affine tensor's bf16 scale, its
+// bias and its codes, or an mxfp4 tensor's block_mxfp4, its E8M0 scale and
+// codes (GGUF_FMT_MXFP4); per 256 elements an nvfp4 tensor's E4M3 scales, its
+// row's tensor scale (TensorScale) and codes, or an fp8 tensor's row's tensor
+// scale and E4M3 values. Or a BF16 weight, which the writer quantizes into
+// native af4g64 rows as MLX's affine quantization rounds it (a DFlash2
+// draft's projections).
+struct SafetensorsSource {
+  const SourceTensor *codes = nullptr, *scales = nullptr, *biases = nullptr;
+  const SourceTensor *bfloat16 = nullptr;
+};
+// Whether a quantized safetensors tensor may be in a format: MLX affine,
+// mxfp4, nvfp4 or fp8.
+[[nodiscard]] constexpr bool safetensorsFormat(uint32_t format) {
+  return quant_loader_format(format) || format == GGUF_FMT_MXFP4;
+}
+
+// The tensor scale g of an nvfp4 or fp8 tensor's rows: the F32 or BF16 values
+// at `offset` of file's tensor data (`bytes` long), one for every
+// rowsPerValue rows, or their reciprocals. Model Optimizer's weight_scale_2 or
+// per-tensor fp8 weight_scale holds the tensor's g, compressed-tensors'
+// weight_global_scale its 1 / g and its per-channel fp8 weight_scale each
+// row's g [rows, 1], and a llama.cpp NVFP4 projection's .scale its g or
+// each expert's. Without one (rowsPerValue 0), as in MLX's nvfp4, g is 1.
+struct TensorScale {
+  const WeightSource *file = nullptr;
+  uint64_t offset = 0, bytes = 0;
+  uint64_t rowsPerValue = 0;
+  bool bfloat16 = false, reciprocal = false;
+};
+
+// Rows [0, rows) of one source tensor in image order, read from `file`: rows of
+// rowBytes bytes at `offset` of its tensor data, or its format's native rows,
+// which the writer builds from a quantized safetensors tensor's tensors
+// (safetensors.codes or safetensors.bfloat16 set) or from llama.cpp's NVFP4
+// rows (ggufNvfp4RowBytes set: rows of block_nvfp4 that long from `offset` on).
 struct TensorRows {
   std::string name;
-  uint32_t type = 0;   // ggml type
+  uint32_t type = 0;   // ggml type, or a loader's (metal/abi/QuantFormat.h)
   uint64_t offset = 0; // in the file's tensor data
   uint64_t rows = 0;
   uint64_t rowBytes = 0;
   RowOrder order{};
+  const WeightSource *file = nullptr;
+  SafetensorsSource safetensors{};
+  TensorScale scale{};
+  uint64_t ggufNvfp4RowBytes = 0;
 };
 
 // Header and descriptor bytes.
@@ -48,9 +90,16 @@ struct Fill {
   std::vector<uint8_t> bytes;
 };
 // How a copy writes each value: as stored, narrowed from F32 to the bf16
-// value it equals exactly (rows the kernels read as bf16), or widened from
-// BF16 to the F32 value it equals (rows the kernels read as F32).
-enum class Conversion : uint8_t { None, NarrowToBfloat16, WidenToFloat32 };
+// value it equals exactly (rows the kernels read as bf16), widened from BF16
+// to the F32 value it equals (rows the kernels read as F32), as the F32 decay
+// -exp(A_log) of a safetensors GDN's A_log, BF16 or F32, which
+// float(-exp(double)) rounds once, as the F32 values of a quantized
+// safetensors tensor's rows (affine s * code + z, mxfp4, nvfp4 or fp8), which
+// the kernels read unquantized (its MoE router and shared-expert gate, GDN
+// alpha and beta of two formats), or as the F32 1 + w of a BF16 RMSNorm
+// weight w, which transformers stores 1 below the weight the norm multiplies
+// by (exact but for |w| < 2^-16, which it rounds once).
+enum class Conversion : uint8_t { None, NarrowToBfloat16, WidenToFloat32, Decay, DequantizeToFloat32, CenteredNorm };
 // Rows written back to back, each value converted as `conversion` says.
 struct Copy {
   uint64_t destination = 0;
@@ -75,6 +124,40 @@ struct Image {
   std::vector<Fill> fills;
   std::vector<Copy> copies;
   std::vector<Repack> repacks;
+};
+
+// The destination bytes of `sourceBytes` bytes of rows copied with
+// `conversion`: halved when narrowed, doubled when widened (and for the decay
+// of BF16 values and a centered norm), four per element when decoded to F32.
+[[nodiscard]] uint64_t convertedBytes(const TensorRows &source, Conversion conversion, uint64_t sourceBytes);
+
+// Lays out one image: its header block, then 16 KiB-aligned sections, each a
+// descriptor, copied rows or a quantized tensor's planes. The planners of a
+// GGUF target (planImages) and of a safetensors target
+// (model/SafetensorsImage.hpp) build their images with it.
+class ImageBuilder {
+public:
+  ImageBuilder(std::string name, uint32_t layer, uint32_t type);
+
+  // A section of `bytes` bytes after the last one, and its offset.
+  [[nodiscard]] uint64_t section(uint64_t bytes);
+  // Rows copied into a section of their own, converted as `conversion` says.
+  void copy(TensorRows source, Conversion conversion = Conversion::None);
+  // Rows copied to `destination`, inside a section already laid out.
+  void copyAt(uint64_t destination, TensorRows source, Conversion conversion);
+  // The descriptor of a tensor of `type`, quantized in `format` (a float or
+  // native-rows tensor has neither per-group nor meta bytes).
+  void descriptor(uint32_t type, uint64_t rows, uint64_t columns, const QuantFormat &format,
+                  const GgufPlaneBytes &bytes, const std::string &name);
+  // The descriptor and planes of a [rows, columns] tensor in format, whose
+  // sources the caller adds before repack() takes it.
+  [[nodiscard]] Repack planes(uint32_t format, uint64_t rows, uint64_t columns, const std::string &name);
+  void repack(Repack repack);
+  [[nodiscard]] Image finish();
+
+private:
+  Image image_;
+  uint64_t cursor_ = 0;
 };
 
 // The target geometry a GGUF's metadata declares, its architecture included,

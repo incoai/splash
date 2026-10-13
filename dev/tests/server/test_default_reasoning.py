@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest import mock
 
 from dev.tests import server_fixtures as fixtures
+from dev.tests.installer_fixtures import link_assembly
 from install import launcher
 from server import server as api
 
@@ -205,9 +206,11 @@ class DefaultReasoningTests(unittest.TestCase):
                 with (
                     tempfile.TemporaryDirectory() as tmp,
                     mock.patch.object(launcher, "RUNTIME_DIR", Path(tmp)),
+                    mock.patch.object(launcher.paths, "MODELS", Path(tmp) / "models"),
                     mock.patch.object(launcher.socket, "socket"),
-                    mock.patch.object(launcher, "_ensure_installed"),
-                    mock.patch.object(launcher.catalog, "spawn_refresh"),
+                    mock.patch.object(
+                        launcher, "_ensure_installed", side_effect=link_assembly
+                    ),
                     mock.patch.object(launcher.os, "execve") as execute,
                 ):
                     launcher.main(["serve", "--model", "owner/repo", *options])

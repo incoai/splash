@@ -74,8 +74,8 @@ class BuildIdentityTests(unittest.TestCase):
         self.assertIn("runtime/main.mm", inputs)
         self.assertIn("runtime/metal/abi/ExecutionGeometry.h", inputs)
         self.assertIn("runtime/model/Runtime.cpp", inputs)
-        self.assertIn("runtime/metal/kernels/decode/linear_q4.metal", inputs)
-        self.assertIn("runtime/metal/kernels/prefill/linear_q4.metal", inputs)
+        self.assertIn("runtime/metal/kernels/decode/linear_gguf_sgmatrix.metal", inputs)
+        self.assertIn("runtime/metal/kernels/prefill/paged_attention.metal", inputs)
         self.assertIn("runtime/metal/abi/KernelABI.h", inputs)
         self.assertIn("runtime/metal/kernels/common/paged_attention_tile.h", inputs)
         self.assertIn("dev/tools/build_identity.py", inputs)
@@ -153,9 +153,9 @@ class CompileConfigurationTests(unittest.TestCase):
     FLAG_SETS = (
         ("ENGINE_CXXFLAGS", "engine/engine/Status.o"),
         ("PROD_METALFLAGS", "metal/shared/rope.air"),
-        ("ENGINE_TEST_CXXFLAGS", "engine-tests/operator-tuning"),
+        ("ENGINE_TEST_CXXFLAGS", "engine-tests/ane-ffn-calibration"),
         ("TEST_METALFLAGS", "engine-tests/metal-backend.air"),
-        ("ENGINE_SANITIZER_CXXFLAGS", "sanitizers/operator-tuning-asan-ubsan"),
+        ("ENGINE_SANITIZER_CXXFLAGS", "sanitizers/ane-ffn-calibration-asan-ubsan"),
     )
 
     def make(self, *arguments):
@@ -272,7 +272,7 @@ class CompileConfigurationTests(unittest.TestCase):
                 "engine-tests/vision-encoder",
                 "engine-tests/attention-sweep",
                 "engine-tests/metal-backend.metallib",
-                "sanitizers/operator-tuning-asan-ubsan",
+                "sanitizers/ane-ffn-calibration-asan-ubsan",
                 "engine-tests/backend-benchmark",
             )
             targets = [str(build / name) for name in outputs]

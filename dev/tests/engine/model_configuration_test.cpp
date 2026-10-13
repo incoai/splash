@@ -11,6 +11,7 @@
 #include "TestChecks.hpp"
 #include "TestFiles.hpp"
 #include "model/ModelDescriptor.hpp"
+#include "model/WeightStore.hpp"
 
 #include <filesystem>
 #include <initializer_list>
@@ -86,17 +87,22 @@ void testFamilies(const std::filesystem::path &fixtures) {
   const model::ModelDescriptor denseDescriptor = inspect(dense);
   require(denseDescriptor.name == "community/fine-tune" &&
               std::holds_alternative<model::Qwen3_8Layout>(denseDescriptor.target) &&
-              denseDescriptor.targetSource == model::TargetSource::Mlx && !denseDescriptor.hasVision() &&
+              denseDescriptor.targetSource == model::TargetSource::Safetensors && !denseDescriptor.hasVision() &&
               denseDescriptor.draft == model::kQwen3_8DraftLayout,
           "an MLX Qwen3.8-27B made another descriptor");
+  // The sources' identity is the digest of the record naming them.
+  require(denseDescriptor.sourceIdentity == model::weightDigest(dense.record) &&
+              inspect(dense.with(&SourceModel::record, "community/fine-tune", "community/other"))
+                      .sourceIdentity != denseDescriptor.sourceIdentity,
+          "the sources' identity is not the digest of the record naming them");
   require(inspect(dense.with(&SourceModel::record, R"("none")", R"("safetensors")")).visionSource ==
-              model::VisionSource::Mlx,
+              model::VisionSource::Safetensors,
           "an MLX Qwen3.8-27B with its vision tower made another descriptor");
   const SourceModel moe = mlxModel(fixtures, "qwen3.6-35b-a3b");
   const model::ModelDescriptor moeDescriptor =
       inspect(moe.with(&SourceModel::record, R"("none")", R"("safetensors")"));
   require(std::holds_alternative<model::Qwen3_6MoeLayout>(moeDescriptor.target) &&
-              moeDescriptor.visionSource == model::VisionSource::Mlx &&
+              moeDescriptor.visionSource == model::VisionSource::Safetensors &&
               moeDescriptor.draft == model::kQwen3_6MoeDraftLayout,
           "an MLX Qwen3.6-35B-A3B made another descriptor");
   // The model type names the family; the sizes every source's config states
@@ -120,17 +126,16 @@ void testFamilies(const std::filesystem::path &fixtures) {
 }
 
 // A descriptor states where its weights come from: one that leaves either
-// source unset, which draftFromCheckpoint and hasVision would read as a
-// checkpoint draft and a vision tower, is not valid.
+// source unset, which hasVision would read as a vision tower, is not valid.
 void testSources() {
   const auto described = [](model::TargetSource target, model::VisionSource vision) {
     return model::makeModelDescriptor("sources", model::Qwen3_8Layout{}, model::kQwen3_8DraftLayout,
                                       model::kQwen3_8VisionLayout, target, vision);
   };
-  require(described(model::TargetSource::Mlx, model::VisionSource::None).valid(),
+  require(described(model::TargetSource::Safetensors, model::VisionSource::None).valid(),
           "a descriptor of its sources was not valid");
   require(!described(model::TargetSource{}, model::VisionSource::None).valid() &&
-              !described(model::TargetSource::Mlx, model::VisionSource{}).valid(),
+              !described(model::TargetSource::Safetensors, model::VisionSource{}).valid(),
           "a descriptor without a source was valid");
 }
 
@@ -190,13 +195,94 @@ void testOneRulePerValue(const std::filesystem::path &fixtures) {
           "upstream model config exceeds 1048576 bytes", "an oversized config was read");
 }
 
-// An MLX target states each module's quantization as its images read it: 4
-// bits in groups of 64 in MLX's affine mode, a MoE's router and shared-expert
-// gate at 8 bits, each module by its own entry or else the object's. A GGUF
-// target has none (above).
+// The model with a transformers quantization_config in place of MLX's
+// objects: its "quantization" object renamed, which no check reads, and its
+// "quantization_config" object replaced.
+SourceModel withQuantizationConfig(const SourceModel &model, std::string_view quantizationConfig) {
+  SourceModel result = model.with(&SourceModel::config, R"("quantization": {)", R"("unused": {)");
+  std::string &config = result.config;
+  const size_t at = config.find(R"("quantization_config": {)");
+  require(at != std::string::npos, "the source model has no quantization_config");
+  size_t end = config.find('{', at);
+  for (int depth = 0; end < config.size(); ++end)
+    if (config[end] == '{')
+      ++depth;
+    else if (config[end] == '}' && --depth == 0)
+      break;
+  config.replace(at, end + 1 - at, R"("quantization_config": )" + std::string(quantizationConfig));
+  return result;
+}
+
+// An MLX target's quantization is MLX's own object: the object and each
+// module's own entry name affine 2, 3, 4, 5, 6 or 8 bits in groups of 32, 64
+// or 128, mxfp4 or nvfp4; an entry is affine unless it names its mode, and
+// takes its mode's default bits and group size (affine 4 and 64, mxfp4 4 and
+// 32, nvfp4 4 and 16) when it omits them, as MLX loads it. The entry false,
+// which MLX writes for a module it leaves unquantized, is refused for a
+// projection and the head, and accepted for the router, the shared-expert
+// gate, GDN alpha and beta and the token table. A Model Optimizer target's is
+// its quantization_config: NVFP4 in groups of 16 or per-tensor FP8 for each
+// layer it quantizes, every projection and the head among them. So is a
+// compressed-tensors target's: each config group NVFP4 or FP8 per channel or
+// tensor, every projection and the head a group's target that no ignore entry
+// names. A GGUF target has none (above).
 void testQuantization(const std::filesystem::path &fixtures) {
   const SourceModel dense = mlxModel(fixtures, "qwen3.8-27b");
   const SourceModel moe = mlxModel(fixtures, "qwen3.6-35b-a3b");
+  static_cast<void>(inspect(dense));
+  static_cast<void>(inspect(moe));
+  // The dense object and the MoE's leading fields, as mxfp4.
+  const std::string_view affine = R"("group_size": 64,
+    "bits": 4,
+    "mode": "affine")";
+  const std::string_view mxfp4 = R"("group_size": 32,
+    "bits": 4,
+    "mode": "mxfp4")";
+  const std::string_view nvfp4 = R"("group_size": 16,
+    "bits": 4,
+    "mode": "nvfp4")";
+  // The MoE router's entry.
+  const std::string_view router = R"("group_size": 64,
+      "bits": 8)";
+  // The object's first key, before which a module's entry is added.
+  const std::string_view object = R"("quantization": {)";
+  // The MoE's first router and shared-expert gate entries.
+  const std::string_view routerEntry = R"("language_model.model.layers.0.mlp.gate": {
+      "group_size": 64,
+      "bits": 8
+    })";
+  const std::string_view sharedGateEntry = R"("language_model.model.layers.0.mlp.shared_expert_gate": {
+      "group_size": 64,
+      "bits": 8
+    })";
+  const std::string unquantizedTable = std::string(object) + R"("language_model.model.embed_tokens": false,)";
+  struct Accepted final {
+    const SourceModel &model;
+    std::string_view from, to;
+  };
+  for (const Accepted &accepted : std::initializer_list<Accepted>{
+           {dense, R"("bits": 4)", R"("bits": 8)"},
+           {dense, R"("bits": 4)", R"("bits": 3)"},
+           {dense, R"("group_size": 64)", R"("group_size": 128)"},
+           {dense, affine, mxfp4},
+           {dense, affine, nvfp4},
+           // The router 4-bit; under an mxfp4 object, its 8-bit entry stays affine.
+           {moe, R"("bits": 8)", R"("bits": 4)"},
+           {moe, affine, mxfp4},
+           // An entry of only its bits takes affine's group of 64.
+           {moe, router, R"("bits": 8)"},
+           // An entry of only its mode: mxfp4, 4-bit in groups of 32.
+           {moe, router, R"("mode": "mxfp4")"},
+           // Modules the images also read unquantized (as F32).
+           {moe, routerEntry, R"("language_model.model.layers.0.mlp.gate": false)"},
+           {moe, sharedGateEntry, R"("language_model.model.layers.0.mlp.shared_expert_gate": false)"},
+           // A bf16 token table, which the gather reads as stored.
+           {dense, object, unquantizedTable},
+           {dense, object, R"("quantization": {
+    "language_model.model.layers.0.linear_attn.in_proj_a": false,
+    "language_model.model.layers.0.linear_attn.in_proj_b": false,)"},
+       })
+    static_cast<void>(inspect(accepted.model.with(&SourceModel::config, accepted.from, accepted.to)));
   struct Refused final {
     const SourceModel &model;
     std::string_view from, to, error;
@@ -205,20 +291,164 @@ void testQuantization(const std::filesystem::path &fixtures) {
            // MLX's own object, not the quantization_config a transformers
            // checkpoint (GPTQ, AWQ, ...) states.
            {dense, R"("quantization": {)", R"("unused": {)",
-            "this model requires an MLX affine 4-bit/group-64 checkpoint or a supported GGUF"},
-           {dense, R"("bits": 4)", R"("bits": 8)",
-            "quantization language_model.model.layers.0.linear_attn.in_proj_qkv bits mismatch: MLX 8, runtime 4"},
-           {dense, R"("group_size": 64)", R"("group_size": 32)",
-            "quantization language_model.model.layers.0.linear_attn.in_proj_qkv group_size mismatch"},
-           {dense, R"("mode": "affine")", R"("mode": "mxfp4")",
-            "quantization language_model.model.layers.0.linear_attn.in_proj_qkv mode must be affine"},
-           {dense, R"("quantization": {)", R"("quantization": {"language_model.lm_head": false,)",
-            "quantization language_model.lm_head must be an object"},
-           {moe, R"("bits": 8)", R"("bits": 4)",
-            "quantization language_model.model.layers.0.mlp.gate bits mismatch: MLX 4, runtime 8"},
+            "this model requires an MLX checkpoint (affine 2, 3, 4, 5, 6 or 8 bits in groups of 32, 64 or 128, mxfp4 "
+            "or nvfp4), an NVFP4 checkpoint of Model Optimizer or compressed-tensors, or a supported GGUF"},
+           {dense, R"("bits": 4)", R"("bits": 7)",
+            "quantization is affine 7-bit in groups of 64; MLX weights load as affine 2, 3, 4, 5, 6 or 8 bits in "
+            "groups of 32, 64 or 128, or as mxfp4 or nvfp4"},
+           {dense, R"("group_size": 64)", R"("group_size": 16)", "quantization is affine 4-bit in groups of 16"},
+           // A group past a byte is no format (4 bits in groups of 320 are not af5g64).
+           {dense, R"("group_size": 64)", R"("group_size": 320)", "quantization is affine 4-bit in groups of 320"},
+           {dense, R"("mode": "affine")", R"("mode": "nvfp4")", "quantization is nvfp4 4-bit in groups of 64"},
+           {moe, R"("bits": 8
+    },)", R"("bits": 8, "mode": "mxfp8"
+    },)", "quantization language_model.model.layers.0.mlp.gate is mxfp8 8-bit in groups of 64"},
        })
     refuses(refused.model.with(&SourceModel::config, refused.from, refused.to), refused.error,
             "an MLX quantization was accepted with " + std::string(refused.to));
+  // A module the images read only quantized, left unquantized: a projection
+  // of each kind and the head.
+  struct Unquantized final {
+    const SourceModel &model;
+    std::string module;
+  };
+  for (const Unquantized &unquantized : std::initializer_list<Unquantized>{
+           {dense, "language_model.model.layers.3.self_attn.q_proj"},
+           {dense, "language_model.model.layers.0.linear_attn.in_proj_qkv"},
+           {dense, "language_model.model.layers.0.mlp.up_proj"},
+           {dense, "language_model.lm_head"},
+           {moe, "language_model.model.layers.0.mlp.switch_mlp.down_proj"},
+           {moe, "language_model.model.layers.0.mlp.shared_expert.gate_proj"},
+       })
+    refuses(unquantized.model.with(&SourceModel::config, object,
+                                   std::string(object) + "\"" + unquantized.module + "\": false,"),
+            "quantization " + unquantized.module +
+                " is unquantized; Splash loads quantized MLX projections",
+            "an unquantized " + unquantized.module + " was accepted");
+  // Model Optimizer, as NVIDIA's releases state it: NVFP4 or FP8 for every
+  // layer its ignore patterns leave, or each layer's own by quantized_layers,
+  // a MoE layer's routed experts the one layer mlp.experts. Another algorithm
+  // or group size, and a projection, the head or an expert's projection left
+  // out of the layers or named by an ignore pattern, are refused.
+  const auto modelOptimizer = [&](const SourceModel &model, std::string_view quantization) {
+    return withQuantizationConfig(model, R"({"quant_method": "modelopt", )" + std::string(quantization) + "}");
+  };
+  // The MoE fixture's quantized_layers but `leftOut`: its 40 layers, each
+  // fourth full attention.
+  const auto moeLayers = [](std::string_view leftOut) {
+    std::string layers = R"("quantized_layers": {"lm_head": {"quant_algo": "FP8"})";
+    for (int layer = 0; layer < 40; ++layer) {
+      const std::string prefix = "model.language_model.layers." + std::to_string(layer) + ".";
+      std::vector<std::string> modules{"mlp.experts", "mlp.shared_expert.gate_proj", "mlp.shared_expert.up_proj",
+                                       "mlp.shared_expert.down_proj"};
+      if (layer % 4 == 3)
+        modules.insert(modules.end(), {"self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj"});
+      else
+        modules.insert(modules.end(), {"linear_attn.in_proj_qkv", "linear_attn.in_proj_z", "linear_attn.out_proj"});
+      for (const std::string &module : modules)
+        if (prefix + module != leftOut)
+          layers += R"(, ")" + prefix + module + R"(": {"quant_algo": "W4A16_NVFP4", "group_size": 16})";
+    }
+    return R"("quant_algo": "MIXED_PRECISION", "ignore": ["mtp*"], )" + layers + "}";
+  };
+  for (const auto &[model, accepted] : std::initializer_list<std::pair<const SourceModel &, std::string>>{
+           {dense, R"("quant_algo": "NVFP4", "group_size": 16, "ignore": ["mtp*", "model.visual*"])"},
+           {dense, R"("quant_algo": "W4A16_NVFP4", "group_size": 16)"},
+           {dense, R"("quant_algo": "FP8")"},
+           {moe, moeLayers("")},
+           {moe, R"("quant_algo": "NVFP4", "ignore": ["mtp*", "*mlp.gate", "*shared_expert_gate"])"},
+       })
+    static_cast<void>(inspect(modelOptimizer(model, accepted)));
+  struct RefusedModelOptimizer final {
+    const SourceModel &model;
+    std::string quantization;
+    std::string_view error;
+  };
+  for (const RefusedModelOptimizer &refused : std::initializer_list<RefusedModelOptimizer>{
+           {dense, R"("quant_algo": "W4A8_AWQ")",
+            "quantization_config is W4A8_AWQ; Model Optimizer weights load as NVFP4, W4A16_NVFP4 or FP8"},
+           {dense, R"("quant_algo": "NVFP4", "group_size": 32)", "quantization_config is NVFP4 in groups of 32"},
+           {dense, R"("quant_algo": "NVFP4", "ignore": ["*.self_attn.q_proj"])",
+            "quantization_config leaves model.language_model.layers.3.self_attn.q_proj unquantized"},
+           {dense, R"("quant_algo": "MIXED_PRECISION", "quantized_layers": {"lm_head": {"quant_algo": "NVFP4"}})",
+            "quantization_config leaves model.language_model.layers.0.linear_attn.in_proj_qkv unquantized"},
+           {dense, R"("quant_algo": "MIXED_PRECISION", "quantized_layers": {"lm_head": {"quant_algo": "INT4_AWQ"}})",
+            "quantization_config quantized_layers lm_head is INT4_AWQ"},
+           {moe, moeLayers("model.language_model.layers.0.mlp.experts"),
+            "quantization_config leaves model.language_model.layers.0.mlp.experts unquantized"},
+           {moe, R"("quant_algo": "NVFP4", "ignore": ["*.experts.*.down_proj"])",
+            "quantization_config leaves model.language_model.layers.0.mlp.experts.0.down_proj unquantized"},
+       })
+    refuses(modelOptimizer(refused.model, refused.quantization), refused.error,
+            "a Model Optimizer quantization was accepted with " + refused.quantization.substr(0, 200));
+  // compressed-tensors, as unsloth's NVFP4 releases state it: FP8 per channel
+  // for the attention and GDN projections and the head, NVFP4 for the FFN and
+  // the experts, the last layers' experts FP8; or every projection NVFP4 by
+  // class. A group of another format, ordered by activation groups or with a
+  // target that is no regular expression, a pattern past 512 bytes or too
+  // complex to match, and a projection (the first's or the last expert's) no
+  // group targets or an ignore entry names, are refused.
+  const auto compressedTensors = [&](const SourceModel &model, std::string_view groups, std::string_view ignore) {
+    return withQuantizationConfig(
+        model,
+        std::string(R"({"quant_method": "compressed-tensors", "format": "mixed-precision", "config_groups": {)") +
+            std::string(groups) + R"(}, "ignore": )" + std::string(ignore) + "}");
+  };
+  const std::string ignore = R"(["re:^mtp.*", "model.language_model.layers.0.linear_attn.in_proj_a"])";
+  const std::string fp8Group =
+      R"("group_0": {"format": "float-quantized", "targets": ["re:.*self_attn\\.(q|k|v|o)_proj$", )"
+      R"("re:.*linear_attn\\.(in_proj_qkv|in_proj_z|out_proj)$", "re:.*lm_head", )"
+      R"("re:.*layers\\.(38|39)\\.mlp\\.experts\\.\\d+\\.(gate|up|down)_proj$"], )"
+      R"("weights": {"num_bits": 8, "type": "float", "strategy": "channel", "symmetric": true}})";
+  const auto nvfp4Group = [](std::string_view targets, std::string_view weights = R"("group_size": 16)") {
+    return std::string(R"("group_1": {"format": "nvfp4-pack-quantized", "targets": )") + std::string(targets) +
+           R"(, "weights": {"num_bits": 4, "type": "float", "strategy": "tensor_group", )" + std::string(weights) +
+           "}}";
+  };
+  const std::string ffn = nvfp4Group(R"(["re:.*mlp\\.(gate|up|down)_proj$", )"
+                                     R"("re:.*mlp\\.experts\\.\\d+\\.(gate|up|down)_proj$", )"
+                                     R"("re:.*shared_expert\\.(gate|up|down)_proj$"])",
+                                     R"("group_size": 16, "symmetric": true, "actorder": "static")");
+  static_cast<void>(inspect(compressedTensors(dense, fp8Group + ", " + ffn, ignore)));
+  static_cast<void>(inspect(compressedTensors(moe, fp8Group + ", " + ffn, ignore)));
+  static_cast<void>(inspect(compressedTensors(dense, nvfp4Group(R"(["Linear"])"), "[]")));
+  struct RefusedGroups final {
+    const SourceModel &model;
+    std::string groups, ignore;
+    std::string_view error;
+  };
+  for (const RefusedGroups &refused : std::initializer_list<RefusedGroups>{
+           {dense, fp8Group + ", " + ffn, R"(["lm_head"])", "quantization_config leaves lm_head unquantized"},
+           {moe,
+            fp8Group + ", " +
+                nvfp4Group(R"(["re:.*mlp\\.experts\\.\\d+\\.(gate|up)_proj$", )"
+                           R"("re:.*shared_expert\\.(gate|up|down)_proj$"])"),
+            ignore, "quantization_config leaves model.language_model.layers.0.mlp.experts.0.down_proj unquantized"},
+           {dense,
+            R"("group_1": {"format": "pack-quantized", "targets": ["Linear"], )"
+            R"("weights": {"num_bits": 4, "type": "int", )"
+            R"("strategy": "group", "group_size": 128}})",
+            "[]",
+            "quantization_config config_groups group_1 is pack-quantized: int 4-bit by group in groups of 128; "
+            "compressed-tensors weights load as NVFP4"},
+           {dense, nvfp4Group(R"(["Linear"])", R"("group_size": 32)"), "[]",
+            "quantization_config config_groups group_1 is nvfp4-pack-quantized: float 4-bit by tensor_group in "
+            "groups of 32"},
+           {dense, nvfp4Group(R"(["Linear"])", R"("group_size": 16, "actorder": "group")"), "[]",
+            "quantization_config config_groups group_1 is asymmetric or ordered by activation groups"},
+           {dense, nvfp4Group(R"(["re:(lm_head"])"), "[]",
+            "quantization_config config_groups group_1 targets entry re:(lm_head is not a regular expression Splash "
+            "reads"},
+           {moe, fp8Group + ", " + ffn, R"(["re:.*mlp\\.experts\\.255\\.down_proj$"])",
+            "quantization_config leaves model.language_model.layers.0.mlp.experts.255.down_proj unquantized"},
+           {dense, nvfp4Group(R"(["Linear"])"), R"(["re:)" + std::string(600, 'x') + R"("])",
+            "quantization_config ignore entry exceeds 512 bytes"},
+           {dense, nvfp4Group(R"(["Linear"])"), R"(["re:(.+)+x$"])",
+            "quantization_config ignore holds a regular expression too complex to match "
+            "model.language_model.layers.0.linear_attn.in_proj_qkv"},
+       })
+    refuses(compressedTensors(refused.model, refused.groups, refused.ignore), refused.error,
+            "a compressed-tensors quantization was accepted with " + refused.groups);
 }
 
 // The vision tower the record names is the family's, over RGB patches of two

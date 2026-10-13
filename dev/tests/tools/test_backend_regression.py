@@ -33,9 +33,11 @@ def benchmark_document(
         for sample in range(2)
         for width in regression.WIDTHS
     ]
-    requests = [
-        (scenario, 14096) for scenario in regression.PARTIAL if "partial" in scenarios
-    ] + [("short", rows + 1) for rows in regression.SHORT if "short" in scenarios]
+    requests = (
+        [(scenario, 14096) for scenario in regression.PARTIAL if "partial" in scenarios]
+        + [("short", rows + 1) for rows in regression.SHORT if "short" in scenarios]
+        + [(name, 40) for name in regression.TRANSCRIPTS if "transcripts" in scenarios]
+    )
     measurements = [
         {
             "scenario": scenario,
@@ -164,11 +166,31 @@ class BackendRegressionTests(unittest.TestCase):
 
             return change
 
+        def changed_transcript(document):
+            for measurement in document["measurements"]:
+                if measurement["scenario"] == "transcript_3":
+                    measurement["output_tokens"] = [9]
+
         summary = regression.summarize(
             rounds({1: changed_output, 2: changed_output}), False
         )
         self.assertTrue(
             any("outputs or acceptance differ" in f for f in summary["failures"])
+        )
+        # A transcript is compared token for token, like the other requests.
+        summary = regression.summarize(
+            rounds({1: changed_transcript, 2: changed_transcript}), False
+        )
+        self.assertTrue(
+            any(
+                "outputs or acceptance differ" in f and "transcript_3 sample 0" in f
+                for f in summary["failures"]
+            )
+        )
+        self.assertTrue(
+            regression.summarize(
+                rounds({1: changed_transcript, 2: changed_transcript}), True
+            )["pass"]
         )
         self.assertTrue(
             regression.summarize(rounds({1: changed_output, 2: changed_output}), True)[
@@ -273,7 +295,8 @@ class BackendRegressionTests(unittest.TestCase):
         self.assertEqual(len(record["decode"][4]), 2)
         self.assertEqual(len(record["partial"]["partial_4k_hit"]), 2)
         self.assertEqual(len(record["short"][2016]), 2)
-        self.assertEqual(len(record["identities"]), 3)
+        self.assertEqual(len(record["transcripts"]["transcript_7"]), 2)
+        self.assertEqual(len(record["identities"]), len(regression.SCENARIOS))
         self.assertEqual(
             record["memory_plans"][0],
             {
@@ -285,7 +308,11 @@ class BackendRegressionTests(unittest.TestCase):
         )
         for documents, scenarios, lacking in (
             ([("decode",)], ("decode", "partial"), "lacks partial samples"),
-            ([("decode", "partial")], regression.SCENARIOS, "lacks short samples"),
+            (
+                [("decode", "partial")],
+                regression.SCENARIOS,
+                "lacks short and transcripts samples",
+            ),
         ):
             with self.assertRaisesRegex(regression.RegressionError, lacking):
                 regression.round_record(
@@ -298,19 +325,22 @@ class BackendRegressionTests(unittest.TestCase):
         self,
         root: Path,
         name: str,
-        digest: str | None,
+        digest: str,
         list_support: bool,
         share=None,
         honours_share=True,
         short=True,
+        transcripts=True,
         context=CONTEXT,
         minimum_rows=832,
+        earlier=False,
     ):
         """A checkout whose backend-benchmark prints canned output and logs
-        its invocations. With digest its weight-digests prints one image of
-        that digest; without, it has none, as a build of an earlier release.
-        Its benchmark takes a list of scenarios with list_support, the short
-        scenario among them with short too, and serves context tokens. With a
+        its invocations. Its weight-digests prints one image of digest; a
+        build of an earlier release (earlier) has none, and its benchmark
+        prepares that image into its weight cache instead. Its benchmark takes a list of scenarios with list_support, the short
+        and transcripts scenarios among them with short and transcripts too,
+        and serves context tokens. With a
         share it has the Neural Engine split: it reports that share and
         minimum_rows as calibrated, or runs the share --ane-ffn-share gives
         and the rows --ane-ffn-minimum-rows gives, else 512, unless
@@ -318,7 +348,10 @@ class BackendRegressionTests(unittest.TestCase):
         checkout = root / name
         (checkout / "build/engine-tests").mkdir(parents=True)
         (checkout / "build/splash.metallib").write_text("")
-        if digest:
+        if earlier:
+            (checkout / "build" / weights.IDENTITY_HEADER).parent.mkdir()
+            (checkout / "build" / weights.IDENTITY_HEADER).write_text("")
+        else:
             tool = checkout / "build" / weights.WEIGHT_DIGESTS
             image = {"component": "target/layer-0.bin", "bytes": 1, "sha256": digest}
             tool.write_text(f"#!/bin/sh\necho '{json.dumps([image])}'\n")
@@ -331,7 +364,11 @@ class BackendRegressionTests(unittest.TestCase):
         if share is not None:
             usage += " [--ane-ffn-minimum-rows ROWS]"
         if list_support:
-            names = "decode, partial, short" if short else "decode, partial"
+            names = ", ".join(
+                ["decode", "partial"]
+                + (["short"] if short else [])
+                + (["transcripts"] if transcripts else [])
+            )
             usage += f"\n  NAME: {names}, context or exact"
         document = benchmark_document(build=name)
         document["max_context_tokens"] = document["no_ane_context_tokens"] = context
@@ -350,10 +387,22 @@ class BackendRegressionTests(unittest.TestCase):
             if share is not None
             else ""
         )
+        # The cache entry weights.prepared reads: the image's digest and its
+        # provenance, under the model root the benchmark was given.
+        source = [weights.PROVENANCE, "component target/layer-0.bin"]
+        prepare = (
+            "entry = pathlib.Path(os.environ['SPLASH_WEIGHT_CACHE']) / ('1' * 64)\n"
+            "entry.mkdir(exist_ok=True)\n"
+            f"(entry / 'sha256').write_text({digest!r})\n"
+            f"lines = {source!r} + ['source ' + sys.argv[2] + '/target']\n"
+            "(entry / 'source').write_text(''.join(line + '\\n' for line in lines))\n"
+            if earlier
+            else ""
+        )
         script = checkout / regression.BENCHMARK
         script.write_text(
             f"#!{sys.executable}\n"
-            "import json, os, sys\n"
+            "import json, os, pathlib, sys\n"
             "if len(sys.argv) < 3:\n"
             f"    print('usage: backend-benchmark ' + {usage!r}, file=sys.stderr)\n"
             "    raise SystemExit(2)\n"
@@ -363,8 +412,10 @@ class BackendRegressionTests(unittest.TestCase):
             f"document = json.loads({json.dumps(json.dumps(document))})\n"
             "if 'decode' not in scenarios: document['decode_throughput']['samples'] = []\n"
             "document['measurements'] = [m for m in document['measurements'] if "
-            "('short' if m['scenario'] == 'short' else 'partial') in scenarios]\n"
+            "('short' if m['scenario'] == 'short' else 'transcripts' "
+            "if m['scenario'].startswith('transcript_') else 'partial') in scenarios]\n"
             + given
+            + prepare
             + "print(json.dumps(document))\n"
         )
         script.chmod(0o755)
@@ -372,19 +423,22 @@ class BackendRegressionTests(unittest.TestCase):
 
     @staticmethod
     def run_main(root: Path, *options: str) -> int:
-        """main with these options on the fake checkouts under root and a
-        legacy package."""
+        """main with these options on the fake checkouts under root and an
+        installed model."""
         models = root / "models"
-        package = models / "incoai/Qwen3.8-27B-Splash"
-        package.mkdir(parents=True)
-        (package / "manifest.json").write_text("{}")
+        assembly = models / ".resolved/assembly"
+        assembly.mkdir(parents=True)
+        (assembly / "model.json").write_text("{}")
+        link = models / "mlx-community/Qwen3.8-27B-4bit"
+        link.parent.mkdir()
+        link.symlink_to(assembly, target_is_directory=True)
         arguments = [
             "--baseline",
             str(root / "baseline"),
             "--candidate",
             str(root / "candidate"),
             "--model-root",
-            str(package),
+            str(link),
             "--output-dir",
             str(root / "release"),
             *options,
@@ -412,7 +466,7 @@ class BackendRegressionTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(
                 regression.RegressionError,
-                r"round-2-candidate-decode-partial-short: .*without JSON(.|\n)*boom",
+                r"round-2-candidate-decode-partial-short-transcripts: .*without JSON(.|\n)*boom",
             ):
                 self.run_main(root)
             document = json.loads(
@@ -428,21 +482,33 @@ class BackendRegressionTests(unittest.TestCase):
 
     def test_main_runs_abba_rounds_and_compares_the_weights(self):
         a, b = "a" * 64, "b" * 64
-        # A baseline without the short scenario runs the others alone, and so
-        # does the candidate.
-        for baseline, list_support, short, scenarios in (
-            (a, True, True, [["decode", "partial", "short"]]),
-            (a, True, False, [["decode", "partial"]]),
-            (None, True, True, [["decode", "partial", "short"]]),
-            (None, False, False, [["decode"], ["partial"]]),
+        # A baseline without the short or transcripts scenario runs the others
+        # alone, and so does the candidate.
+        for earlier, list_support, short, transcripts, scenarios in (
+            (False, True, True, True, [["decode", "partial", "short", "transcripts"]]),
+            (False, True, True, False, [["decode", "partial", "short"]]),
+            (False, True, False, False, [["decode", "partial"]]),
+            (True, True, True, False, [["decode", "partial", "short"]]),
+            (True, False, False, False, [["decode"], ["partial"]]),
         ):
             with (
-                self.subTest(baseline=baseline, list_support=list_support, short=short),
+                self.subTest(
+                    earlier=earlier,
+                    list_support=list_support,
+                    short=short,
+                    transcripts=transcripts,
+                ),
                 TemporaryDirectory() as directory,
             ):
                 root = Path(directory).resolve()
                 self.fake_checkout(
-                    root, "baseline", baseline, list_support, short=short
+                    root,
+                    "baseline",
+                    a,
+                    list_support,
+                    short=short,
+                    transcripts=transcripts,
+                    earlier=earlier,
                 )
                 self.fake_checkout(root, "candidate", a, True)
                 output = root / "release"
@@ -460,7 +526,7 @@ class BackendRegressionTests(unittest.TestCase):
                             # Only a baseline of an earlier release gets a
                             # cache of its own.
                             str(output / "baseline-weights")
-                            if version == "baseline" and not baseline
+                            if version == "baseline" and earlier
                             else str(root / "cache"),
                         ]
                         for version in regression.ROUNDS
@@ -469,10 +535,8 @@ class BackendRegressionTests(unittest.TestCase):
                 )
                 document = json.loads((output / "backend-regression.json").read_text())
                 self.assertTrue(document["pass"])
-                # An earlier release mapped a legacy package as it is.
-                self.assertEqual(
-                    len(document["weights"]["images"]), 1 if baseline else 0
-                )
+                # An earlier release's image is read from its cache.
+                self.assertEqual(len(document["weights"]["images"]), 1)
 
         with TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -491,7 +555,7 @@ class BackendRegressionTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             self.fake_checkout(root, "baseline", a, True)
-            self.fake_checkout(root, "candidate", None, True)
+            self.fake_checkout(root, "candidate", a, True, earlier=True)
             with self.assertRaises(SystemExit):
                 self.run_main(root)
 
@@ -584,7 +648,7 @@ class BackendRegressionTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(
                 regression.RegressionError,
-                r"round-2-candidate-decode-partial-short: ran the Neural Engine split "
+                r"round-2-candidate-decode-partial-short-transcripts: ran the Neural Engine split "
                 r"at share 0.0 from 0 rows, not the first round's 0.3 from 832",
             ):
                 self.run_main(root)
@@ -623,7 +687,7 @@ class BackendRegressionTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(
                 regression.RegressionError,
-                r"round-2-candidate-decode-partial-short: ran the Neural Engine split "
+                r"round-2-candidate-decode-partial-short-transcripts: ran the Neural Engine split "
                 r"at share 0.32, not the given 0.0",
             ):
                 self.run_main(root, "--ane-ffn-share", "0")

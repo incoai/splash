@@ -34,6 +34,8 @@ class StatusContractTests(unittest.TestCase):
             [],
         )
         self.assertIn('splash_memory_pressure{state="normal"} 1', lines)
+        self.assertIn('splash_thermal_state{state="fair"} 1', lines)
+        self.assertIn('splash_thermal_state{state="nominal"} 0', lines)
 
 
 class StatusRouteTests(HarnessTestCase):
@@ -49,6 +51,7 @@ class StatusRouteTests(HarnessTestCase):
         self.assertEqual(snapshot["schema_version"], wire.STATUS_SCHEMA_VERSION)
         self.assertIs(snapshot["ready"], True)
         self.assertEqual(snapshot["memory_pressure"], "normal")
+        self.assertEqual(snapshot["thermal_state"], "nominal")
         self.assertIs(snapshot["metal"]["healthy"], True)
         self.assertEqual(
             snapshot["transport"],
@@ -70,6 +73,7 @@ class StatusRouteTests(HarnessTestCase):
         harness = self.harness(runtime)
         runtime.status_event = native_peer.status_event(
             2,
+            thermal_state="serious",
             requests={"submitted": 7, "completed": 5},
             admission={
                 "waiting_memory": 2,
@@ -164,6 +168,8 @@ class StatusRouteTests(HarnessTestCase):
         metrics = payload.decode().splitlines()
         self.assertIn("splash_ready 1", metrics)
         self.assertIn('splash_memory_pressure{state="normal"} 1', metrics)
+        self.assertIn('splash_thermal_state{state="serious"} 1', metrics)
+        self.assertIn('splash_thermal_state{state="nominal"} 0', metrics)
         self.assertIn("splash_requests_submitted_total 7", metrics)
         self.assertIn("splash_scheduler_waiting_resources 3", metrics)
         self.assertIn("splash_scheduler_waiting_prefix 2", metrics)

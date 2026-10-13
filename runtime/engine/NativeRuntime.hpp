@@ -22,8 +22,8 @@ namespace splash::engine {
 [[nodiscard]] uint64_t systemUnixMicros() noexcept;
 [[nodiscard]] double awakeMilliseconds() noexcept;
 
-// The loop's constructor refuses a config without its metrics, its weights or
-// its clocks.
+// The loop's constructor refuses a config without its metrics, its weights,
+// their admission or its clocks.
 struct NativeLoopConfig {
   engine::EngineConfig engine;
   RuntimeMetrics *metrics = nullptr;
@@ -31,6 +31,10 @@ struct NativeLoopConfig {
   // the engine has held no request for the idle release, and taken back, a
   // part per tick, before the engine runs the next request.
   model::WeightMemory *weights = nullptr;
+  // Admits the memory the weights take back
+  // (MemoryGovernor::allocationAdmission), as memory the requests waiting for
+  // them need (EngineConfig::serving).
+  metal::AllocationAdmission weightAdmission;
   // Told true when the engine takes a request while it holds none, and false
   // when its last request ends; the process keeps the Mac from idle sleep in
   // between (main.mm). It must not throw. Empty where nothing needs to know.
@@ -65,7 +69,13 @@ public:
   bool finishInput();
 
   // Executes at most one explicit GPU BatchPlan, or takes back one part of
-  // the released weights (model::WeightMemory::restore).
+  // the released weights (model::WeightMemory::restore). While admission
+  // refuses that part, the tick makes no progress and the requests wait for
+  // memory, retrying after kResourceRetryBackoffMilliseconds, until
+  // EngineConfig::resourceWaitTimeoutMilliseconds has passed since the first
+  // refusal after the last part that came back. Then, or at once when no
+  // request waits, the weights give back the parts that came back and the
+  // requests fail with LaneOutcome::ResourceTimeout.
   bool tick();
   // Command-free control work uses the same failure boundary as execution.
   bool runControl(const std::function<bool()> &control);
@@ -96,18 +106,23 @@ public:
   [[nodiscard]] bool commandInFlight() const noexcept {
     return core_.commandInFlight();
   }
-  // How long FdTransport may block in poll(2): until the engine's next timed
-  // event (Engine::nextWakeupMilliseconds), without a limit when it has none.
+  // How long FdTransport may block in poll(2): until a refused restore tries
+  // again, or the engine's next timed event (Engine::nextWakeupMilliseconds),
+  // without a limit when it has none.
   [[nodiscard]] std::optional<double> millisecondsUntilNextWakeup() const;
   [[nodiscard]] engine::EngineSnapshot snapshot() const {
     return core_.snapshot();
   }
+  // The snapshot /status reports: each live request's age counted from its
+  // arrival, on the runtime's clock.
+  [[nodiscard]] engine::EngineSnapshot statusSnapshot() const;
   [[nodiscard]] WeightsSnapshot weightsSnapshot() const {
-    return {idleReleaseSeconds_, config_.weights->released(), weightRestores_};
+    return {idleReleaseSeconds_, config_.weights->released(), weightRestores_,
+            weightRestoreFailures_};
   }
-  [[nodiscard]] engine::ResourceWaitSnapshot resourceWaitSnapshot() const {
-    return core_.resourceWaitSnapshot(config_.monotonicMilliseconds());
-  }
+  // The engine's (Engine::resourceWaitSnapshot), with the requests a refused
+  // restore holds waiting for memory.
+  [[nodiscard]] engine::ResourceWaitSnapshot resourceWaitSnapshot() const;
   [[nodiscard]] double monotonicMilliseconds() const {
     return config_.monotonicMilliseconds();
   }
@@ -133,10 +148,12 @@ private:
 
   bool handle(protocol::ClientMessage &message);
   bool handleRequest(protocol::RequestFrame &request);
-  void restoreWeights();
+  bool restoreWeights();
+  bool weightsRefused(metal::AllocationFailure failure);
   bool handleCancel(const protocol::CancelFrame &cancel);
   bool handleMask(const protocol::MaskResponseFrame &mask);
   bool handleStatus(const protocol::StatusRequestFrame &status);
+  bool handleRelease(const protocol::ReleaseRequestFrame &release);
   bool handleMaskIssue(protocol::ProtocolIssue issue);
   bool handleIssue(protocol::ProtocolIssue issue);
   void requestError(uint64_t requestId, std::string code, std::string message,
@@ -159,7 +176,9 @@ private:
                      std::span<const uint32_t> simulationTokens) override;
   void completed(uint64_t requestId, EngineFinishReason reason,
                  uint32_t promptTokens, uint32_t completionTokens,
-                 std::span<const float> optionLogits) override;
+                 uint32_t deduplicatedTokens,
+                 std::span<const float> optionLogits,
+                 const SpeculativeCounts &speculation) override;
   void failed(uint64_t requestId, LaneOutcome outcome,
               std::string message) override;
 
@@ -181,8 +200,14 @@ private:
   double idleSinceMilliseconds_;
   // When the weights began to be written back for a request, until they are.
   std::optional<double> restoreStarted_;
+  // Since when admission refuses the next part of the weights to the
+  // requests waiting: from the first refusal after the last part that came
+  // back.
+  std::optional<double> restoreRefusedSince_;
   // The times the weights were written back, each for a request.
   uint64_t weightRestores_ = 0;
+  // The restores that gave up for want of memory.
+  uint64_t weightRestoreFailures_ = 0;
   bool ready_ = false;
   bool closeConnection_ = false;
   bool engineHealthy_ = true;

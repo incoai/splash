@@ -1,11 +1,10 @@
 #pragma once
 
-#include "model/AffineTarget.hpp"
 #include "model/GgufTarget.hpp"
 #include "model/QwenHybridLayout.hpp"
 #include "model/QwenTarget.hpp"
 #include "model/QwenTargetFiles.hpp"
-#include "model/WeightImages.hpp"
+#include "model/SafetensorsTarget.hpp"
 #include "model/WeightStore.hpp"
 #include "ops/GDN.hpp"
 #include "ops/Linear.hpp"
@@ -13,61 +12,36 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <filesystem>
 #include <functional>
 #include <initializer_list>
-#include <string>
 #include <string_view>
 #include <variant>
 
 namespace splash::model {
 
-// How a target's files store its tensors; loadQwenTarget pairs each source's
-// files with their format. Affine files, from a package or written from MLX,
-// hold every projection, a fused one too, as one affine Q4 tensor, and bf16
-// norms.
-struct AffineTargetFormat final {
-  static constexpr ops::GdnHeadOrder gdnOutputOrder = ops::GdnHeadOrder::Grouped;
-
-  [[nodiscard]] ops::NormWeights norm(WeightFile &file, uint32_t width, std::string_view label) const {
-    return readNorm(file, width, false, label);
-  }
-  [[nodiscard]] ops::Projection projection(WeightFile &file, uint32_t outputSize,
-                                           uint32_t inputSize, std::string_view label) const {
-    return readAffineProjection(file, outputSize, inputSize, label);
-  }
-  // The tensor `label`; block images keep the projection as `tensors`.
-  [[nodiscard]] ops::Projection fused(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
-                                      std::string_view label,
-                                      std::initializer_list<std::string_view>) const {
-    return projection(file, outputSize, inputSize, label);
-  }
-  [[nodiscard]] ops::EmbeddingWeights embedding(WeightFile &file, uint32_t outputSize,
-                                                uint32_t inputSize) const {
-    return readAffineEmbedding(file, outputSize, inputSize, "embedding");
-  }
-};
-
-// GGUF images hold each GGUF tensor as one block-quantized segment,
-// a fused projection as its tensors in output column order, and the GGUF's
-// F32 norms. The GGUF keeps the GDN output projection's input columns in
-// llama.cpp's tiled value-head order, so the GDN writes its output in it; a
-// rotated Prism ML GGUF keeps them grouped, and rotateInputs (Qwen3_8.cpp)
-// switches its GDN to that order.
+// How a target's block images store its tensors; loadQwenTarget pairs each
+// source's images with their format. Block images hold each tensor as one
+// block-quantized segment, a fused projection as its tensors in output column
+// order. A GGUF's keep its F32 norms and the GDN output projection's input
+// columns in llama.cpp's tiled value-head order, so the GDN writes its output
+// in it (a rotated Prism ML GGUF keeps them grouped, and rotateInputs,
+// Qwen3_8.cpp, switches its GDN to that order); a safetensors target's
+// (model/SafetensorsImage.hpp) keep its grouped value heads and MLX's bf16
+// norms, or the F32 norms of a checkpoint of transformers names.
 struct BlockTargetFormat final {
-  static constexpr ops::GdnHeadOrder gdnOutputOrder = ops::GdnHeadOrder::Tiled;
+  bool float32Norms = true;
+  ops::GdnHeadOrder gdnOutputOrder = ops::GdnHeadOrder::Tiled;
 
   [[nodiscard]] ops::NormWeights norm(WeightFile &file, uint32_t width, std::string_view label) const {
-    return readNorm(file, width, true, label);
+    return readNorm(file, width, float32Norms, label);
   }
   [[nodiscard]] ops::Projection projection(WeightFile &file, uint32_t outputSize,
                                            uint32_t inputSize, std::string_view label) const {
     return readBlockProjection(file, outputSize, inputSize, label);
   }
   // The tensors, which may leave padding columns past the last one
-  // (LinearGguf.cpp requireSegments); affine files keep one tensor.
+  // (LinearGguf.cpp requireSegments).
   [[nodiscard]] ops::Projection fused(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
-                                      std::string_view,
                                       std::initializer_list<std::string_view> tensors) const;
   [[nodiscard]] ops::EmbeddingWeights embedding(WeightFile &file, uint32_t outputSize,
                                                 uint32_t inputSize) const {
@@ -75,41 +49,19 @@ struct BlockTargetFormat final {
   }
 };
 
-// Reads the mixer sections that follow a layer's input norm, in file order
-// (instantiated for both formats).
-template <class Format>
-[[nodiscard]] QwenMixerWeights readQwenMixer(WeightFile &file, const Format &format,
+// Reads the mixer sections that follow a layer's input norm, in file order.
+[[nodiscard]] QwenMixerWeights readQwenMixer(WeightFile &file, const BlockTargetFormat &format,
                                              const QwenTargetDimensions &target,
                                              bool fullAttention);
 
-// Loads the files of a package's target directory: one per hybrid layer,
-// head.bin and embedding.bin.
-template <class Layout> struct PackageTargetFiles final {
-  WeightImages &images;
-  std::filesystem::path directory;
-  const Layout &layout;
-  [[nodiscard]] WeightFile layer(uint32_t index) const {
-    const std::string filename = "layer-" + std::to_string(index) + ".bin";
-    return images.load(packageImage(directory / filename, "target/" + filename, Layout::layerMagic, index,
-                                    layout.isFullAttentionLayer(index) ? 1U : 0U));
-  }
-  [[nodiscard]] WeightFile head() const {
-    return images.load(packageImage(directory / "head.bin", "target/head.bin", Layout::headMagic, layout.layers, 2));
-  }
-  [[nodiscard]] WeightFile embedding() const {
-    return images.load(packageImage(directory / "embedding.bin", "target/embedding.bin", kEmbeddingMagic,
-                                    layout.vocabularySize, layout.hiddenSize));
-  }
-};
-
-// Reads a target through the files of its images, packaged or written from
-// an upstream source, in their format: per layer the input norm, mixer,
+// Reads a target through the files of its images, written from an upstream
+// source, in their format: per layer the input norm, mixer,
 // post-attention norm and the architecture's FFN through readFfn, then the
 // head and the token embedding. Weights is the architecture's weight struct.
-template <class Weights, class Layout, class Files, class Format, class ReadFfn>
+template <class Weights, class Layout, class Files, class ReadFfn>
 [[nodiscard]] Weights
 readQwenTargetWeights(metal::MetalBackend &backend, const Layout &layout, Files &&files,
-                      const Format &format, ReadFfn readFfn) {
+                      const BlockTargetFormat &format, ReadFfn readFfn) {
   const uint64_t allocationBaseline = backend.memoryStats().allocatedBytes;
   Weights result;
   result.layout = layout;
@@ -151,8 +103,9 @@ readQwenTargetWeights(metal::MetalBackend &backend, const Layout &layout, Files 
   return result;
 }
 
-// Throws unless every dimension of a family's layout is set, the dimensions
-// agree with each other and every projection fits the Q4 storage tiles.
+// Throws unless every dimension of a family's layout is set and the
+// dimensions agree with each other. The image planners hold each tensor to
+// whole plane tiles.
 template <class Layout> void requireQwenLayout(const Layout &layout) {
   const auto zero = [](auto... dimensions) { return ((dimensions == 0) || ...); };
   const bool dense = layout.ffnKind == QwenFfnKind::Dense;
@@ -176,12 +129,6 @@ template <class Layout> void requireQwenLayout(const Layout &layout) {
       std::ranges::any_of(layout.hiddenCaptureLayers, [&](uint32_t layer) { return layer >= layout.layers; }) ||
       !layout.kvLayout().valid() || !layout.gdnStateLayout().valid())
     throw WeightStoreError("Qwen target layout is inconsistent");
-  validateQ4Layout(layout.packedGdnWidth, layout.hiddenSize);
-  validateQ4Layout(layout.packedFullWidth, layout.hiddenSize);
-  validateQ4Layout(layout.hiddenSize, layout.attentionWidth);
-  validateQ4Layout(ffnWidth, layout.hiddenSize);
-  validateQ4Layout(layout.hiddenSize, ffnWidth);
-  validateQ4Layout(layout.vocabularySize, layout.hiddenSize);
 }
 
 // Checks the layout and loads a target from its files. The architecture
@@ -189,15 +136,14 @@ template <class Layout> void requireQwenLayout(const Layout &layout) {
 // format.
 template <class Weights, class Layout, class ReadFfn>
 [[nodiscard]] Weights
-loadQwenTarget(metal::MetalBackend &backend, const Layout &layout, const QwenTargetFiles<Layout> &files,
+loadQwenTarget(metal::MetalBackend &backend, const Layout &layout, const QwenTargetFiles &files,
                ReadFfn readFfn) {
   requireQwenLayout(layout);
   if (const auto *gguf = std::get_if<std::reference_wrapper<GgufTargetLoader>>(&files))
     return readQwenTargetWeights<Weights>(backend, layout, gguf->get(), BlockTargetFormat{}, readFfn);
-  const AffineTargetFormat affine{};
-  if (const auto *mlx = std::get_if<std::reference_wrapper<AffineTargetLoader>>(&files))
-    return readQwenTargetWeights<Weights>(backend, layout, mlx->get(), affine, readFfn);
-  return readQwenTargetWeights<Weights>(backend, layout, std::get<PackageTargetFiles<Layout>>(files), affine,
+  SafetensorsTargetLoader &safetensors = std::get<std::reference_wrapper<SafetensorsTargetLoader>>(files).get();
+  return readQwenTargetWeights<Weights>(backend, layout, safetensors,
+                                        BlockTargetFormat{safetensors.float32Norms(), ops::GdnHeadOrder::Grouped},
                                         readFfn);
 }
 

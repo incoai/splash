@@ -114,6 +114,22 @@ public:
       std::span<const metal::MetalBuffer> persistentValues,
       metal::MetalBuffer retainedCounts,
       std::span<const uint32_t> startPositions, DraftAttentionShape shape);
+
+  // A context window: for each slot of a ring, the bf16 context row of
+  // `width` values the slot's keys and values are computed from, in 4-bit
+  // codes of 64-value groups with each group's fp16 scale and minimum
+  // (metal/abi/DraftAttention.h). Positions map to slots as in the rings.
+  [[nodiscard]] static uint64_t contextWindowBytes(uint32_t width);
+  // Stores `rows` context rows in the slots of positions startPosition on.
+  static void addWindowStore(metal::CommandGraph &graph,
+                             metal::MetalBuffer context,
+                             metal::MetalBuffer window, uint32_t rows,
+                             uint32_t startPosition, uint32_t width);
+  // Loads the rows of positions startPosition on back into `rows` rows.
+  static void addWindowLoad(metal::CommandGraph &graph,
+                            metal::MetalBuffer window,
+                            metal::MetalBuffer context, uint32_t rows,
+                            uint32_t startPosition, uint32_t width);
 };
 
 } // namespace splash::ops

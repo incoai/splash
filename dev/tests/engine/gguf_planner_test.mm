@@ -96,9 +96,10 @@ void checkDense(const std::filesystem::path &directory) {
   }
 }
 
-// alpha/beta of any one quantized format, on either architecture: one 256-row
-// tensor of that format, the beta then the alpha rows at its native row bytes
-// in grouped head order; a pair of two types is refused by both names.
+// alpha/beta of any one GGUF tensor type of a format (llama.cpp's NVFP4 as
+// NVFP4), on either architecture: one 256-row tensor of that format, the beta
+// then the alpha rows at its native row bytes in grouped head order; a pair of
+// two types is refused by both names.
 void checkQuantizedAlphaBeta(const std::filesystem::path &directory) {
   for (bool moe : {false, true}) {
     const SmallTarget target = smallTarget(moe);
@@ -115,12 +116,15 @@ void checkQuantizedAlphaBeta(const std::filesystem::path &directory) {
       return tensors;
     };
     for (uint32_t format = 0; format < GGUF_FMT_COUNT; ++format) {
-      const uint32_t type = kQuantFormats[format].ggml_type;
+      const std::optional<uint32_t> stored = ggufType(format);
+      if (!stored) continue;
+      const uint32_t type = *stored;
       writeGguf(path, tensorsWith(type, type), g);
       const Plan result = plan(path, g);
       const auto *pair = result.error ? nullptr : repackOf(result.images[0], "blk.0.ssm_beta.weight");
+      // Rows of the format's native blocks (llama.cpp's NVFP4 as NVFP4's).
       const auto heads = [&](const model::gguf::TensorRows &rows, const char *name) {
-        return rows.name == name && rows.type == type && rows.rows == g.gdnValueHeads &&
+        return rows.name == name && rows.type == kQuantFormats[format].ggml_type && rows.rows == g.gdnValueHeads &&
                rows.rowBytes == gguf_reference::rowBytes(Fmt(format), g.hiddenSize) && grouped(rows.order, 0, 1, g);
       };
       check(pair && pair->format == format && pair->rows == QUANT_TILE_ROWS && pair->columns == g.hiddenSize &&

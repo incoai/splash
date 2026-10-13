@@ -33,3 +33,22 @@ kernel void rope_build_tables(
     draft_sine[element] = sin(angle);
   }
 }
+
+// The draft table rows of rope_build_tables for consecutive positions.
+kernel void rope_build_draft_range_tables(
+    device const float *draft_inverse_frequencies [[buffer(0)]],
+    device float *draft_cosine [[buffer(1)]],
+    device float *draft_sine [[buffer(2)]],
+    constant RopeRangeParams &params [[buffer(3)]],
+    uint index [[thread_position_in_grid]],
+    uint grid_size [[threads_per_grid]]) {
+  const uint draft_elements = params.rows * SPLASH_DRAFT_ROPE_PAIRS;
+  for (uint element = index; element < draft_elements; element += grid_size) {
+    const uint row = element / SPLASH_DRAFT_ROPE_PAIRS;
+    const uint dim = element % SPLASH_DRAFT_ROPE_PAIRS;
+    const float angle = float(params.start_position + row) *
+                        draft_inverse_frequencies[dim];
+    draft_cosine[element] = cos(angle);
+    draft_sine[element] = sin(angle);
+  }
+}

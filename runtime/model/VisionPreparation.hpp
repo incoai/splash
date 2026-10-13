@@ -1,10 +1,9 @@
 #pragma once
 
-// The image of a vision tower laid out as a Splash package's vision/model.bin
-// (MDFV0001, every tensor BF16), as model/VisionLoader.cpp plans it from an
-// MLX checkpoint or a GGUF mmproj, and its writer. A BF16 tensor is copied; an F32 or F16 tensor is
-// converted only when every value is exactly a BF16, and loading fails
-// otherwise.
+// The image of a vision tower (MDFV0001, every tensor BF16), as
+// model/VisionLoader.cpp plans it from an MLX checkpoint or a GGUF mmproj, and
+// its writer. A BF16 tensor is copied; an F32 or F16 tensor is converted only
+// when every value is exactly a BF16, and loading fails otherwise.
 
 #include "model/WeightSource.hpp"
 

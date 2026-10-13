@@ -5,6 +5,7 @@
 #include "metal/MetalBackend.hpp"
 #include "engine/MemoryGovernor.hpp"
 #include "engine/MemoryAudit.hpp"
+#include "engine/ThermalState.hpp"
 
 #include <algorithm>
 #include <array>
@@ -254,6 +255,9 @@ struct WeightsSnapshot {
   bool released = false;
   // The times they were written back, each for a request.
   uint64_t restores = 0;
+  // The restores that gave up for want of memory: their requests failed
+  // retryably and the weights were released again.
+  uint64_t restoreFailures = 0;
 };
 
 // The prefill FFN's Neural Engine split (RuntimeResources::aneFfnSnapshot).
@@ -282,6 +286,6 @@ struct AneFfnSnapshot {
     const MemoryGovernorSnapshot &memoryGovernor, bool metalHealthy,
     std::string metalFailureReason, const ResourceWaitSnapshot &resourceWait,
     const NativeLoopTiming &loop, const WeightsSnapshot &weights,
-    const AneFfnSnapshot &aneFfn);
+    const AneFfnSnapshot &aneFfn, ThermalState thermalState);
 
 } // namespace splash::engine

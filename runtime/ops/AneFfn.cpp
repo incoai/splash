@@ -33,7 +33,6 @@ constexpr uint32_t kSegment = 2560;
 static_assert(kSegment % ANE_FFN_INPUT_BLOCK == 0 && kSegment % ANE_FFN_INTERMEDIATE_BLOCK == 0 &&
                   kSegment % ANE_FFN_TILE == 0,
               "segments hold whole rotation blocks and packing tiles");
-constexpr uint32_t kQuantGroup = 64;
 // The hidden channels ane_ffn_rotate's simdgroups rotate a block each of.
 constexpr uint32_t kRotateGroup = ANE_FFN_INPUT_BLOCK * (ANE_FFN_ROTATE_THREADS / 32);
 // The channels a split moves in: whole blocks of the intermediate rotation
@@ -88,7 +87,7 @@ const char *AneFfn::unsupported(std::span<const SwiGluProjections> layers) {
   for (const SwiGluProjections &layer : layers) {
     for (const Projection *projection : {layer.gate, layer.up, layer.down})
       if (!projection->takesPlaneViews())
-        return "ANE FFN split needs affine Q4 projections or unrotated quantized GGUF tensors";
+        return "ANE FFN split needs unrotated quantized projections";
     if (layer.gate->outputSize != intermediate || layer.gate->inputSize != hidden ||
         layer.up->outputSize != intermediate || layer.up->inputSize != hidden || layer.down->outputSize != hidden ||
         layer.down->inputSize != intermediate)
@@ -110,8 +109,8 @@ enum class Rotation : uint8_t { Inputs, Intermediate };
 uint32_t blockOf(Rotation rotation) {
   return rotation == Rotation::Inputs ? ANE_FFN_INPUT_BLOCK : ANE_FFN_INTERMEDIATE_BLOCK;
 }
-std::string kernel(const char *name, const char *suffix, Rotation rotation) {
-  return std::string(name) + suffix + (rotation == Rotation::Inputs ? "_inputs" : "_intermediate");
+std::string kernel(const char *name, Rotation rotation) {
+  return std::string(name) + (rotation == Rotation::Inputs ? "_inputs" : "_intermediate");
 }
 
 // The Hadamard signs D of the rotations R = D H / sqrt(n) of inputs, weights
@@ -195,18 +194,10 @@ std::vector<float> bf16Values(const metal::MetalBuffer &buffer, uint64_t count) 
 } // namespace
 
 AneFfn::Planes::Planes(const Projection &projection) {
-  if (projection.layout() == WeightLayout::Affine64) {
-    requireAffineProjection(projection, {projection.outputSize, projection.inputSize});
-    const AffineWeights &weights = projection.affine();
-    groups = projection.inputSize / kQuantGroup;
-    buffers = {weights.weights, weights.scales, weights.biases};
-    return;
-  }
   const QuantizedSegment &segment = projection.blocks().segments.front();
   requireSegmentPlanes(segment, "ANE FFN projection");
   groups = projection.inputSize / 32;
   format = segment.formatId;
-  suffix = "_gguf";
   buffers = {segment.plane0, segment.plane1Slot(), segment.meta};
 }
 
@@ -343,8 +334,8 @@ std::string AneFfn::function(const Shape &shape, std::span<const Input> inputs, 
                     block = std::to_string(ANE_FFN_INTERMEDIATE_BLOCK);
   // silu(g) = g/2 (1 + tanh(g/2)): through the ANE's sigmoid, the split of
   // layers whose gate pre-activations are about 0.1 differed from the GPU
-  // alone by 6.5% RMS, against 1.6% at about 1 (ane-ffn split's affine Q4
-  // layers); through its tanh both differ by 1.6%.
+  // alone by 6.5% RMS, against 1.6% at about 1 (the ane-ffn test's split
+  // of its former affine Q4 layers); through its tanh both differ by 1.6%.
   f16("gt", channels, rows, "mul(x = gs, y = tx_t)");
   f16("gh", channels, rows, "mul(x = gt, y = " + fp16(0.5) + ")");
   f16("th", channels, rows, "tanh(x = gh)");
@@ -451,7 +442,7 @@ AneFfn::AneFfn(metal::MetalBackend &backend, std::span<const SwiGluProjections> 
     const auto add = [&](Matrix matrix, uint32_t row, uint32_t input, uint32_t width, uint32_t rows,
                          Rotation rotation) {
       const Planes &planes = layers_[layer].planes[static_cast<size_t>(matrix)];
-      graph.add(kernel("ane_ffn_row_scale", planes.suffix, rotation),
+      graph.add(kernel("ane_ffn_row_scale_gguf", rotation),
                 {planes.buffers[0], planes.buffers[1], planes.buffers[2], rowScales(layer, matrix), memory_.signs},
                 AneFfnWeightParams{planes.groups, row, input, width, 0, 0, planes.format},
                 {rows / ANE_FFN_WEIGHT_ROWS, 1, 1}, {ANE_FFN_WEIGHT_THREADS, 1, 1});
@@ -491,7 +482,7 @@ void AneFfn::addWeights(metal::CommandGraph &graph, uint32_t layer, uint32_t set
     const uint32_t scaleStride = scale.strideBytes / uint32_t{sizeof(_Float16)};
     requireBytes(output.buffer, rowBytes(rows, output.strideBytes, width, 1), "ANE FFN weight surface");
     requireBytes(scale.buffer, rowBytes(rows, scaleStride, 1, sizeof(_Float16)), "ANE FFN weight scale surface");
-    graph.add(kernel("ane_ffn_weights", planes.suffix, rotation),
+    graph.add(kernel("ane_ffn_weights_gguf", rotation),
               {planes.buffers[0], planes.buffers[1], planes.buffers[2], rowScales(layer, matrix), output.buffer,
                scale.buffer, memory_.signs},
               AneFfnWeightParams{planes.groups, row, input, width, output.strideBytes, scaleStride, planes.format},
@@ -682,8 +673,7 @@ double AneFfn::verify(std::span<const SwiGluProjections> layers, const PrefillFf
   fillNormalized(ffn.normalized);
   // Layer l adds its FFN of the normalized rows to hidden[l & 1] into
   // hidden[(l & 1) ^ 1], from zeros, on the GPU alone, as the split's GPU part
-  // alone over a partial output of zeros, or split. The affine Q4 kernels
-  // read the rows' sums, which each command computes first.
+  // alone over a partial output of zeros, or split.
   enum class Way : uint8_t { Gpu, GpuPart, Split };
   const auto forward = [&](Way way, uint32_t count, uint32_t rows) {
     std::memset(hidden[0].contents(), 0, hidden[0].sizeBytes());
@@ -693,8 +683,6 @@ double AneFfn::verify(std::span<const SwiGluProjections> layers, const PrefillFf
       static_cast<void>(begin());
     }
     metal::CommandGraph graph;
-    if (layers.front().gate->layout() == WeightLayout::Affine64)
-      linear_.addPrefillSums(graph, ffn.normalized, ffn.sums, *layers.front().gate, rows);
     for (uint32_t layer = 0; layer < count; ++layer) {
       const metal::MetalBuffer &residual = hidden[layer & 1], &output = hidden[(layer & 1) ^ 1];
       if (way == Way::Gpu)

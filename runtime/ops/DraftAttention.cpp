@@ -17,6 +17,7 @@ constexpr uint32_t kMaximumLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
 constexpr uint32_t kRows = SPLASH_DRAFT_QUERY_ROWS;
 constexpr uint32_t kWindow = SPLASH_DRAFT_SLIDING_WINDOW;
 constexpr uint32_t kThreads = metal::CommandGraph::kDefaultThreads;
+constexpr uint32_t kWindowThreads = SPLASH_DRAFT_CONTEXT_SIMDGROUPS * 32;
 // Each split leaves a partial of its attention rows x (head dimensions + max
 // + sum) fp32 values behind the grouped queries.
 constexpr uint32_t kSplits = SPLASH_DRAFT_ATTENTION_SPLITS;
@@ -53,6 +54,19 @@ void requireContextInputs(const metal::MetalBuffer &contextKv,
   const uint64_t ropeBytes = rows * SPLASH_DRAFT_ROPE_PAIRS * 4;
   requireBytes(ropeCos, ropeBytes, "draft RoPE cosine");
   requireBytes(ropeSin, ropeBytes, "draft RoPE sine");
+}
+
+// The threadgroups of a context window transfer, one simdgroup per row and
+// 64-value group, after checking its buffers.
+metal::DispatchSize windowGroups(const metal::MetalBuffer &context, const metal::MetalBuffer &window,
+                                 uint32_t rows, uint32_t width) {
+  const uint64_t windowBytes = DraftAttention::contextWindowBytes(width);
+  if (!rows || rows > kWindow)
+    throw std::invalid_argument("a context window holds one ring's rows");
+  requireBytes(context, uint64_t{rows} * width * 2, "draft context rows");
+  requireBytes(window, windowBytes, "draft context window");
+  const uint64_t tasks = uint64_t{rows} * (width / SPLASH_DRAFT_CONTEXT_GROUP);
+  return {(tasks + SPLASH_DRAFT_CONTEXT_SIMDGROUPS - 1) / SPLASH_DRAFT_CONTEXT_SIMDGROUPS, 1, 1};
 }
 
 void requireLanes(uint32_t lanes) {
@@ -262,6 +276,30 @@ void DraftAttention::addContextCommit(
   graph.add("draft_context_kv_commit", std::move(bindings), params,
             {uint64_t{lanes} * SPLASH_TARGET_VERIFY_ROWS * shape.kvHeads, 1,
              1});
+}
+
+uint64_t DraftAttention::contextWindowBytes(uint32_t width) {
+  if (!width || width % SPLASH_DRAFT_CONTEXT_GROUP)
+    throw std::invalid_argument("draft context rows are whole 64-value groups");
+  return draft_context_window_bytes(width);
+}
+
+void DraftAttention::addWindowStore(metal::CommandGraph &graph,
+                                    metal::MetalBuffer context,
+                                    metal::MetalBuffer window, uint32_t rows,
+                                    uint32_t startPosition, uint32_t width) {
+  const metal::DispatchSize groups = windowGroups(context, window, rows, width);
+  graph.add("prefill_draft_context_store", {std::move(context), std::move(window)},
+            DraftContextWindowParams{rows, startPosition, width}, groups, {kWindowThreads, 1, 1});
+}
+
+void DraftAttention::addWindowLoad(metal::CommandGraph &graph,
+                                   metal::MetalBuffer window,
+                                   metal::MetalBuffer context, uint32_t rows,
+                                   uint32_t startPosition, uint32_t width) {
+  const metal::DispatchSize groups = windowGroups(context, window, rows, width);
+  graph.add("prefill_draft_context_load", {std::move(window), std::move(context)},
+            DraftContextWindowParams{rows, startPosition, width}, groups, {kWindowThreads, 1, 1});
 }
 
 } // namespace splash::ops

@@ -24,8 +24,7 @@ void include(Workspace &bound, const Workspace &required,
 } // namespace
 
 ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device)
-    : linear_(device), moeRouteWideRows_(moeRouteWideRows(plannedGpuCores(device))),
-      family_(gpuFamilyClass(device.appleGpuFamily)) {}
+    : linear_(device), family_(gpuFamilyClass(device.appleGpuFamily)) {}
 
 PrefillAttentionPlan ExecutionPlans::prefillAttention(
     uint32_t rows, uint32_t queryHeads, kv::Layout layout) const {
@@ -43,20 +42,13 @@ DraftAttentionPlan ExecutionPlans::draftAttention(DraftAttentionShape shape,
   return DraftAttention::plan(shape, lanes);
 }
 
-// The router threshold, the expert tile, the simdgroups of a decode plan's
-// 8-row tiles and, for a GGUF plan, its tiles.
+// The expert tiles and their rows, and the router's tile.
 MoeConfig ExecutionPlans::moeConfig(MoeShape shape, uint32_t rows, MoePhase phase) const {
-  const bool prefill = phase == MoePhase::Prefill;
   MoeConfig config;
-  config.routeWideRows = moeRouteWideRows_;
-  config.expertTile = prefill ? MoeExpertTile::M32 : MoeExpertTile::M8;
-  if (!prefill) config.m8Simdgroups = moeDecodeSimdgroups(family_);
-  if (shape.weightLayout == WeightLayout::Block32) {
-    const MoeGgufTile tile = moeGgufTile(family_, shape);
-    if (prefill) config.expertTile = moeGgufPrefillTile(shape, rows, tile);
-    config.ggufTile = tile;
-    config.ggufRouterTile = linear_.ggufFloatTile(rows, shape.experts);
-  }
+  config.ggufTile = moeGgufTile(family_, shape);
+  config.expertTile =
+      phase == MoePhase::Prefill ? moeGgufPrefillTile(shape, rows, config.ggufTile) : MoeExpertTile::M8;
+  config.ggufRouterTile = linear_.ggufFloatTile(rows, shape.experts);
   return config;
 }
 
@@ -110,7 +102,7 @@ uint64_t ExecutionPlans::gateUpWorkspace(ProjectionShape shape) const {
   uint64_t bound = 0;
   for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes) {
     const LinearWorkload workload{{shape.outputSize, shape.inputSize}, lanes * kDecodeRows,
-                                  LinearPhase::Decode, LinearEpilogue::GateUp, shape.layout};
+                                  LinearPhase::Decode, LinearEpilogue::GateUp};
     bound = std::max(bound, linear_.plan(workload).gateScratchBytes());
   }
   return bound;

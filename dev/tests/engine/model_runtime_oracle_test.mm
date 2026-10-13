@@ -1,3 +1,4 @@
+#include "LinearNumerics.hpp"
 #include "TestChecks.hpp"
 #include "ane/ProgramInstrumentation.hpp"
 #include "engine/RuntimeResources.hpp"
@@ -10,7 +11,6 @@
 #include "ops/PageStorage.hpp"
 #include "ops/Sampling.hpp"
 #include "ops/Vision.hpp"
-#include "tuning/LinearNumerics.hpp"
 
 #include <algorithm>
 #include <array>
@@ -127,7 +127,7 @@ Similarity compareBfloat(const metal::MetalBuffer &left,
   const uint16_t *b = bfloatContents(right, "right BF16 buffer");
   SimilarityAccumulator accumulator;
   for (uint64_t index = 0; index < elements; index += stride) {
-    accumulator.add(ops::tuning::bf16ToFloat(a[index]), ops::tuning::bf16ToFloat(b[index]));
+    accumulator.add(test::bf16ToFloat(a[index]), test::bf16ToFloat(b[index]));
   }
   return accumulator.result();
 }
@@ -153,13 +153,18 @@ Similarity compareFloat(const metal::MetalBuffer &left,
 
 // Budgeted greedy decoding and masked verification of the same prefix must
 // commit identical state. Both use the same target arithmetic; compare bytes.
-// The GDN kernel tests independently check each retained count against FP64.
+// The GDN state a decode step leaves is its lane's cell, which holds the state
+// before the step's rows, and the rows it retained, which wait on its tape for
+// the next step to fold in: the retained counts must match, and lanes that go
+// on for another step must then hold the same cell. The GDN kernel tests
+// independently check the fold of each retained count against FP64.
 void requireCommittedStateIdentical(const model::QwenStateStorage &states,
                                     uint32_t budgetLane, uint32_t maskedLane,
                                     const std::string &label) {
   const auto &budget = states.metadata(budgetLane);
   const auto &masked = states.metadata(maskedLane);
-  require(budget.lengths == masked.lengths,
+  require(budget.lengths == masked.lengths && budget.pendingRows &&
+              budget.pendingRows == masked.pendingRows,
           label + " logical state differs between budget and mask commits");
   auto identical = [&](const metal::MetalBuffer &a, const metal::MetalBuffer &b,
                        const std::string &part) {
@@ -167,8 +172,6 @@ void requireCommittedStateIdentical(const model::QwenStateStorage &states,
                 std::memcmp(a.contents(), b.contents(), a.sizeBytes()) == 0,
             label + " " + part + " differs between budget and mask commits");
   };
-  identical(states.current(budgetLane).stateBase,
-            states.current(maskedLane).stateBase, "GDN state");
   const auto &left = states.draft(budgetLane);
   const auto &right = states.draft(maskedLane);
   for (uint32_t layer = 0; layer < states.layout().draft.layers; ++layer) {
@@ -282,13 +285,20 @@ ModelStepResult decodeOne(model::Runtime &executor, uint64_t requestId,
 }
 
 // A stop token or a one-token budget is emitted by prefill itself; otherwise
-// the first output tokens come from one decode cycle.
+// the first output tokens come from one decode cycle, which commits first the
+// first token the prefill reported (the engine sends that one ahead).
 ModelStepResult firstStep(model::Runtime &executor, ModelStepResult prefilled,
                           uint64_t requestId, uint64_t logicalPosition,
                           const std::vector<uint32_t> &pageTable) {
   if (!prefilled.outputTokens.empty())
     return prefilled;
-  return decodeOne(executor, requestId, logicalPosition, pageTable);
+  ModelStepResult decoded =
+      decodeOne(executor, requestId, logicalPosition, pageTable);
+  require(!prefilled.firstToken || (!decoded.outputTokens.empty() &&
+                                    decoded.outputTokens.front() ==
+                                        *prefilled.firstToken),
+          "the first cycle did not commit the first token prefill reported");
+  return decoded;
 }
 
 struct PendingMaskedDecode final {
@@ -362,8 +372,8 @@ void provideMask(model::Runtime &executor, uint64_t requestId,
                          rejected.value_or(""));
 }
 
-// The convolution and recurrent halves of a GDN cell, which hold BF16 and
-// FP32 values.
+// The convolution and recurrent halves of a GDN cell, which hold BF16 values
+// and the recurrent state's format (FP32 or BF16).
 metal::MetalBuffer convolutionHalf(const metal::MetalBackend &backend,
                                    const model::GdnParityBuffers &gdn,
                                    const model::GdnStateLayout &layout) {
@@ -379,9 +389,13 @@ metal::MetalBuffer recurrentHalf(const metal::MetalBackend &backend,
 
 using StateSamples = std::vector<std::pair<std::string, std::vector<float>>>;
 
+// The ring rows of positions from `capturedFrom` on, which the chunks after a
+// restore captured from their own rows, are sampled apart as captured_* rings:
+// compareCommittedSamples holds them bit for bit.
 StateSamples sampleCommittedState(const metal::MetalBackend &backend,
                                   const model::QwenStateStorage &states,
-                                  uint32_t lane) {
+                                  uint32_t lane,
+                                  uint64_t capturedFrom = std::numeric_limits<uint64_t>::max()) {
   StateSamples result;
   const auto add = [&](std::string name, const metal::MetalBuffer &buffer,
                        bool bfloat) {
@@ -389,7 +403,7 @@ StateSamples sampleCommittedState(const metal::MetalBackend &backend,
     const uint64_t count = buffer.sizeBytes() / (bfloat ? 2 : 4);
     const uint64_t stride = std::max<uint64_t>(1, count / 65536);
     for (uint64_t index = 0; index < count; index += stride) {
-      values.push_back(bfloat ? ops::tuning::bf16ToFloat(static_cast<const uint16_t *>(
+      values.push_back(bfloat ? test::bf16ToFloat(static_cast<const uint16_t *>(
                                                  buffer.contents())[index])
                              : static_cast<const float *>(buffer.contents())[index]);
     }
@@ -397,10 +411,11 @@ StateSamples sampleCommittedState(const metal::MetalBackend &backend,
   };
   const auto &gdn = states.current(lane);
   const auto &target = states.layout().target;
+  const bool bfloatState = target.format == ops::GdnStateFormat::BFloat16;
   add("convolution", convolutionHalf(backend, gdn, target), true);
-  add("recurrent", recurrentHalf(backend, gdn, target), false);
+  add("recurrent", recurrentHalf(backend, gdn, target), bfloatState);
   add("first_convolution", gdn.convolutionLayers.front(), true);
-  add("first_recurrent", gdn.recurrentLayers.front(), false);
+  add("first_recurrent", gdn.recurrentLayers.front(), bfloatState);
   const auto &lengths = states.metadata(lane).lengths;
   const auto layout = states.layout().draft;
   constexpr uint32_t window = model::ExecutionLimits::draftContextTokens;
@@ -411,41 +426,71 @@ StateSamples sampleCommittedState(const metal::MetalBackend &backend,
   for (uint32_t layer = 0; layer < ring.size(); ++layer) {
     const auto *keys = bfloatContents(ring[layer].keys, "draft keys");
     const auto *values = bfloatContents(ring[layer].values, "draft values");
-    std::vector<float> keySamples, valueSamples;
+    std::vector<float> keySamples, valueSamples, capturedKeys, capturedValues;
     for (uint64_t index = 0; index < elements; index += stride) {
       const uint32_t dimension = index % layout.headDimension;
       const uint32_t position = (index / layout.headDimension) % lengths.draftLength;
       const uint32_t head = index / (uint64_t{layout.headDimension} * lengths.draftLength);
       const uint32_t ring = (lengths.draftBase + position) % window;
-      keySamples.push_back(ops::tuning::bf16ToFloat(
+      const bool captured = lengths.draftBase + position >= capturedFrom;
+      (captured ? capturedKeys : keySamples).push_back(test::bf16ToFloat(
           keys[(uint64_t{head} * window + ring) * layout.headDimension + dimension]));
-      valueSamples.push_back(ops::tuning::bf16ToFloat(
+      (captured ? capturedValues : valueSamples).push_back(test::bf16ToFloat(
           values[(uint64_t{head} * layout.headDimension + dimension) * window + ring]));
     }
     result.emplace_back("draft_key_" + std::to_string(layer), std::move(keySamples));
     result.emplace_back("draft_value_" + std::to_string(layer), std::move(valueSamples));
+    if (!capturedKeys.empty()) {
+      result.emplace_back("captured_key_" + std::to_string(layer), std::move(capturedKeys));
+      result.emplace_back("captured_value_" + std::to_string(layer), std::move(capturedValues));
+    }
+  }
+  // The context window's rows of the rings' positions, byte for byte: a
+  // restore copies the window and computes the rings from it again.
+  if (lengths.draftLength && lengths.hasCurrentContextWindow()) {
+    const auto *bytes = static_cast<const uint8_t *>(states.window(lane).contents());
+    const uint64_t codeBytes = layout.contextWidth / 2;
+    const uint64_t groupBytes = uint64_t{layout.contextWidth} / SPLASH_DRAFT_CONTEXT_GROUP * 4;
+    const uint64_t rowBytes = codeBytes + groupBytes;
+    const uint64_t total = uint64_t{lengths.draftLength} * rowBytes;
+    std::vector<float> samples;
+    for (uint64_t index = 0; index < total; index += std::max<uint64_t>(1, total / 65536)) {
+      const uint64_t slot = (lengths.draftBase + index / rowBytes) % window;
+      const uint64_t offset = index % rowBytes;
+      samples.push_back(bytes[offset < codeBytes
+                                  ? slot * codeBytes + offset
+                                  : draft_context_codes_bytes(layout.contextWidth) +
+                                        slot * groupBytes + (offset - codeBytes)]);
+    }
+    result.emplace_back("context_window", std::move(samples));
   }
   return result;
 }
 
+// Compares every tensor bit for bit, but for `restoredRings` the draft rings,
+// which a restore computed again from the 4-bit context window: they must stay
+// close to the rings computed from the rows themselves.
 void compareCommittedSamples(const StateSamples &before,
-                              const StateSamples &after, bool exact) {
+                              const StateSamples &after,
+                              bool restoredRings = false) {
   require(before.size() == after.size(), "preemption state sample shape changed");
-  for (size_t tensor = 0; tensor < before.size(); ++tensor) {
-    const auto &[name, values] = before[tensor];
-    require(values.size() == after[tensor].second.size(),
-            "preemption tensor sample shape changed");
-    if (exact) {
-      require(values == after[tensor].second,
+  for (const auto &[name, values] : before) {
+    const auto other = std::ranges::find(after, name, &StateSamples::value_type::first);
+    require(other != after.end(), "preemption state sample shape changed: " + name);
+    const std::vector<float> &compared = other->second;
+    require(values.size() == compared.size(), "preemption tensor sample shape changed");
+    if (!restoredRings || !name.starts_with("draft_")) {
+      require(values == compared,
               "regenerated state differs from independent teacher forcing: " + name);
       continue;
     }
     SimilarityAccumulator comparison;
     for (size_t index = 0; index < values.size(); ++index)
-      comparison.add(values[index], after[tensor].second[index]);
+      comparison.add(values[index], compared[index]);
     const Similarity result = comparison.result();
-    std::cout << "preemption_state " << name << " cosine=" << result.cosine
+    std::cout << "restored_ring " << name << " cosine=" << result.cosine
               << " maximum_absolute=" << result.maximumAbsolute << '\n';
+    require(result.cosine >= 0.99, "rings computed again from the context window drifted: " + name);
   }
 }
 
@@ -457,6 +502,7 @@ struct AllocationFault final {
 
 void requireAtomicImageAdmission(model::Runtime &executor,
                                  metal::MetalBackend &backend,
+                                 const model::QwenStateStorage &states,
                                  const model::LoadedModel &model,
                                  AllocationFault &fault) {
   const uint64_t originalBytes = backend.memoryStats().allocatedBytes;
@@ -477,7 +523,7 @@ void requireAtomicImageAdmission(model::Runtime &executor,
         span.pixelBytes() +
         uint64_t{ops::Vision::embeddingRows({span.gridHeight, span.gridWidth})} *
             model.vision.tensors.layout.outputHiddenSize * sizeof(uint16_t) +
-        model.stateLayout().laneBytes();
+        states.layout().laneBytes();
     fault.remainingBytes = attemptBytes - 1;
     const StateAdmission denied = executor.begin(image.modelView());
     const uint64_t unspent = fault.remainingBytes;
@@ -641,7 +687,7 @@ void requireImageRowsAfterReclaim(model::Runtime &executor,
   // must fit a fresh lane's state without recreating the reclaimed encoder.
   while (states.releaseOneIdle(false)) {
   }
-  const uint64_t stateBytes = model.stateLayout().laneBytes();
+  const uint64_t stateBytes = states.layout().laneBytes();
   const uint64_t beforeReuse = backend.memoryStats().allocatedBytes;
   request.id = 96;
   fault.remainingBytes = stateBytes;
@@ -777,6 +823,7 @@ void requireRepeatedImagePlacements(model::Runtime &executor,
                std::span<const uint32_t>(prompt).subspan(64), pages, false);
   require(executor.telemetry().imageEncodes == encodes + 2,
           "prefix restore discarded data for a later image placement");
+  // The checkpoint's rows come back into the rings from the context window.
   compareCommittedSamples(
       expected, sampleCommittedState(backend, states, *restored.lane), true);
   executor.end(request.id);
@@ -788,8 +835,49 @@ void requireRepeatedImagePlacements(model::Runtime &executor,
   std::cout << "repeated_image_placements=PASS\n";
 }
 
-// Fills every byte of a lane's GDN recurrent state, the FP32 half of the cell
-// its next transition reads, with 0xFF: NaN, which the recurrence carries into
+// A restore at a full window: the chunk after it stores its rows into the
+// window slots of the oldest restored positions and writes their ring slots,
+// so the rings computed again from the window must come before them: a later
+// rebuild would overwrite the chunk's captured rings, which match bit for bit.
+// The restored lane matches the cold teacher-forced lane that made the
+// checkpoint.
+void requireFullWindowRestore(model::Runtime &executor,
+                              const metal::MetalBackend &backend,
+                              const model::QwenStateStorage &states) {
+  constexpr uint32_t window = model::ExecutionLimits::draftContextTokens;
+  constexpr uint32_t boundary = window + 64;
+  std::vector<uint32_t> prompt(boundary + 64);
+  for (uint32_t index = 0; index < prompt.size(); ++index)
+    prompt[index] = 1 + index;
+  const std::span<const uint32_t> tokens(prompt);
+  const std::vector<uint32_t> pages = pageRange(0, prompt.size() / kv::kPageTokens);
+  EngineRequest request = makeRequest(104, prompt, 1);
+  beginCold(executor, request, 0);
+  const std::array<uint32_t, 1> checkpoints{boundary};
+  executor.setDraftContextPlan(request.id, planDraftContext(0, prompt.size(), checkpoints));
+  prefillChunk(executor, request.id, 0, tokens.first(window), pages);
+  prefillChunk(executor, request.id, window, tokens.subspan(window, boundary - window), pages);
+  auto checkpoint = executor.snapshot(request.id);
+  require(checkpoint != nullptr, "full-window checkpoint allocation failed");
+  prefillChunk(executor, request.id, boundary, tokens.subspan(boundary), pages);
+  const auto expected = sampleCommittedState(backend, states, 0, boundary);
+  executor.end(request.id);
+  // With the idle rings reclaimed, the restored lane's rings hold none of the
+  // teacher's rows: only the rebuild puts them back.
+  while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
+  }
+
+  request.id = 105;
+  beginCold(executor, request, 0);
+  restoreActivePrefix(executor, request.id, prompt.size(), boundary, checkpoint);
+  prefillChunk(executor, request.id, boundary, tokens.subspan(boundary), pages);
+  compareCommittedSamples(expected, sampleCommittedState(backend, states, 0, boundary), true);
+  executor.end(request.id);
+  std::cout << "full_window_restore=PASS\n";
+}
+
+// Fills every byte of a lane's GDN recurrent state, the half of the cell its
+// next transition reads, with 0xFF: NaN in either format, which the recurrence carries into
 // every row the lane computes. Non-finite KV would not do: the paged-attention
 // tile of some GPU families gives non-finite keys and values zero weight.
 void poisonRecurrentState(const metal::MetalBackend &backend,
@@ -799,23 +887,41 @@ void poisonRecurrentState(const metal::MetalBackend &backend,
   std::memset(recurrent.contents(), 0xFF, recurrent.sizeBytes());
 }
 
-// Zeroes the pages: a lane computing from a NaN state writes NaN keys and
-// values there, which the checks that follow must not find.
-void clearPages(const kv::PageStorage &pages, std::span<const uint32_t> ids) {
-  for (const uint32_t page : ids)
-    for (const std::span<std::byte> bytes : pages.spans(page))
-      std::ranges::fill(bytes, std::byte{0});
+
+// Whether a lane's draft rings hold a BF16 value that is not finite, or
+// hold nothing but zero bytes.
+bool ringsHoldNonFinite(const model::QwenStateStorage &states, uint32_t lane) {
+  for (const model::DFlashDraftRingLayer &layer : states.draft(lane))
+    for (const metal::MetalBuffer *tensor : {&layer.keys, &layer.values}) {
+      const auto *bits = static_cast<const uint16_t *>(tensor->contents());
+      for (uint64_t index = 0; index < tensor->sizeBytes() / sizeof(uint16_t); ++index)
+        if ((bits[index] & 0x7F80) == 0x7F80)
+          return true;
+    }
+  return false;
 }
 
-// A request whose own state is non-finite selects outside the vocabulary,
-// which the runtime reports as that lane's failure instead of throwing: in a
-// decode beside a healthy lane, which commits and keeps decoding, at the end
-// of a prefill, and in a constrained request's first selection from its final
-// hidden. The failed lanes emit nothing and the backend stays healthy. The
+bool ringsAreClear(const model::QwenStateStorage &states, uint32_t lane) {
+  for (const model::DFlashDraftRingLayer &layer : states.draft(lane))
+    for (const metal::MetalBuffer *tensor : {&layer.keys, &layer.values}) {
+      const auto *bytes = static_cast<const std::byte *>(tensor->contents());
+      if (std::any_of(bytes, bytes + tensor->sizeBytes(),
+                      [](std::byte value) { return value != std::byte{0}; }))
+        return false;
+    }
+  return true;
+}
+
+// A request whose own state is non-finite fails its lane instead of throwing:
+// in a decode beside a healthy lane, which commits and keeps decoding, it
+// selects outside the vocabulary; in a prefill chunk, the end of its prompt
+// or not, and a constrained prompt's last chunk among them, its last row is
+// not finite. The failed lanes emit nothing and the backend stays healthy. The
 // GDN cells they return to the pool are cleared or overwritten before a lane
-// reads them again.
+// reads them again, and their draft rings, where the failed cycle left rows
+// that are not finite, come back cleared.
 void requireNonFiniteRowFailsOnlyItsLane(model::Runtime &executor,
-                                         const kv::PageStorage &pages,
+                                         kv::PageStorage &pages,
                                          const model::QwenStateStorage &states,
                                          const metal::MetalBackend &backend,
                                          std::span<const uint32_t> chat,
@@ -850,17 +956,30 @@ void requireNonFiniteRowFailsOnlyItsLane(model::Runtime &executor,
   require(decoded.size() == 2 && !decoded[0].failure.empty() &&
               decoded[0].outputTokens.empty(),
           "a decode from a non-finite state did not fail its lane alone");
+  // The poisoned state leaves every logit NaN, which the failure counts.
+  const std::string vocabulary = std::to_string(kVocabulary);
+  require(decoded[0].failure == "target logits had no selectable token: " +
+                                    vocabulary + " NaN, 0 +inf and 0 -inf of " +
+                                    vocabulary,
+          "the failed decode miscounted its logits: " + decoded[0].failure);
   require(decoded[1].failure.empty() && !decoded[1].outputTokens.empty() &&
               !decoded[1].finished && inVocabulary(decoded[1]),
           "a non-finite lane disturbed its healthy neighbour");
+  require(ringsHoldNonFinite(states, 0),
+          "the failed decode left no row that is not finite in its draft rings");
   executor.end(201);
+  // The next start takes the rings the failed lane returned last.
+  beginCold(executor, makeRequest(210, prompt40, 16), 0);
+  require(ringsAreClear(states, 0),
+          "the failed lane's draft rings came back with what it left in them");
+  executor.end(210);
   const ModelStepResult continued =
       decodeOne(executor, 202, 40 + decoded[1].outputTokens.size(), pagesB);
   require(continued.failure.empty() && !continued.outputTokens.empty() &&
               inVocabulary(continued),
           "the healthy lane did not keep decoding after its neighbour failed");
   executor.end(202);
-  clearPages(pages, pagesA);
+  pages.clearPages(pagesA);
 
   beginCold(executor, makeRequest(203, prompt80, 16), 0);
   prefillChunk(executor, 203, 0, std::span(prompt80).first(64), pagesC);
@@ -870,27 +989,123 @@ void requireNonFiniteRowFailsOnlyItsLane(model::Runtime &executor,
   require(!prefilled.failure.empty() && prefilled.outputTokens.empty(),
           "a prefill from a non-finite state did not fail its lane");
   executor.end(203);
-  clearPages(pages, pagesC);
+  pages.clearPages(pagesC);
+
+  // A chunk inside the prompt computes no logits; its last row finds the
+  // state that is not finite all the same.
+  beginCold(executor, makeRequest(205, prompt80, 16), 0);
+  prefillChunk(executor, 205, 0, std::span(prompt80).first(32), pagesC);
+  poisonRecurrentState(backend, states, 0);
+  require(!prefillChunk(executor, 205, 32, std::span(prompt80).subspan(32, 32), pagesC)
+               .failure.empty(),
+          "a prefill chunk inside the prompt from a non-finite state did not fail its lane");
+  executor.end(205);
+  pages.clearPages(pagesC);
 
   EngineRequest constrained = makeRequest(204, prompt80, 16);
   constrained.constraint = ConstraintMode::TokenMask;
   beginCold(executor, constrained, 0);
   prefillChunk(executor, 204, 0, std::span(prompt80).first(64), pagesC);
   poisonRecurrentState(backend, states, 0);
-  require(prefillChunk(executor, 204, 64, std::span(prompt80).subspan(64),
-                       pagesC)
-                  .nextDecodeStage == DecodeStage::ApplyInitialMask,
-          "the non-finite constrained fixture did not ask for its first mask");
-  provideMask(executor, 204, std::vector<uint32_t>(kMaskWords, 0xFFFFFFFFU));
-  const ModelStepResult selected =
-      decodeOne(executor, 204, 80, pagesC, true,
-                DecodeStage::ApplyInitialMask);
-  require(!selected.failure.empty() && selected.outputTokens.empty(),
-          "a constrained selection from a non-finite hidden did not fail its lane");
+  const ModelStepResult constrainedEnd =
+      prefillChunk(executor, 204, 64, std::span(prompt80).subspan(64), pagesC);
+  require(!constrainedEnd.failure.empty() &&
+              constrainedEnd.nextDecodeStage != DecodeStage::ApplyInitialMask,
+          "a constrained prompt's last chunk from a non-finite state asked for its first mask");
   executor.end(204);
-  clearPages(pages, pagesC);
+  pages.clearPages(pagesC);
   require(backend.healthy(), "a non-finite lane made the backend unhealthy");
   std::cout << "non_finite_rows=PASS\n";
+}
+
+// Decodes the requests together from their prompts' ends until each has
+// generated `count` tokens or finished; each one's generated tokens, its
+// first, the prefill's selection, included.
+std::vector<std::vector<uint32_t>>
+decodeTogether(model::Runtime &executor, std::span<const uint64_t> ids,
+               uint32_t promptTokens,
+               std::span<const std::vector<uint32_t>> pageTables, uint32_t count) {
+  std::vector<std::vector<uint32_t>> generated(ids.size());
+  std::vector<bool> finished(ids.size(), false);
+  while (true) {
+    BatchPlan plan{.kind = WorkKind::Decode, .decodeStage = DecodeStage::Regular};
+    std::vector<ModelBatchItem> items;
+    std::vector<size_t> lanes;
+    for (size_t index = 0; index < ids.size(); ++index) {
+      if (finished[index] || generated[index].size() >= count)
+        continue;
+      plan.items.push_back({ids[index], 0});
+      items.push_back(withRevision({.requestId = ids[index],
+                                    .logicalPosition = promptTokens + generated[index].size(),
+                                    .pageTable = pageTables[index]}));
+      lanes.push_back(index);
+    }
+    if (items.empty())
+      return generated;
+    const std::vector<ModelStepResult> results = executor.decode(plan, items);
+    require(results.size() == items.size(), "a joint decode lost a lane");
+    for (size_t index = 0; index < results.size(); ++index) {
+      require(results[index].failure.empty(), "a joint decode failed a lane");
+      std::vector<uint32_t> &tokens = generated[lanes[index]];
+      tokens.insert(tokens.end(), results[index].outputTokens.begin(),
+                    results[index].outputTokens.end());
+      finished[lanes[index]] = results[index].finished;
+    }
+  }
+}
+
+// A thinking budget closes thinking at its token whatever the model's
+// logits: the first generated token for a budget of 0, else the one after
+// that many thinking tokens, greedy and sampled, while the draft proposes
+// beside it. Lanes decoded together close at their own budgets, and one
+// without a budget thinks on.
+void requireThinkingBudgetClosesThinking(model::Runtime &executor) {
+  // "<|im_start|>user\nList every prime number between 1 and 60, then check
+  // each one by trial division before you answer.<|im_end|>\n<|im_start|>
+  // assistant\n<think>\n", which both models think through for well over the
+  // tokens decoded here.
+  const std::vector<uint32_t> prompt{
+      248045, 846,  198,  826,   1396, 9944,  1324, 1881,   220,   16,   321,
+      220,    21,   15,   11,    1179, 1716,  1754, 799,    539,   8818, 12436,
+      1518,   488,  4087, 13,    248046, 198, 248045, 74455, 198,   248068, 198};
+  // The Qwen tokenizer's </think>.
+  constexpr uint32_t kThinkEnd = 248069;
+  const std::array<std::vector<uint32_t>, 3> pageTables{
+      pageRange(108, 4), pageRange(116, 4), pageRange(120, 4)};
+  const std::array<uint64_t, 3> ids{301, 302, 303};
+  for (const float temperature : {0.0F, 0.7F}) {
+    for (const uint32_t budget : {0U, 1U, 5U, 12U}) {
+      const std::array<std::optional<uint32_t>, 3> budgets{budget, budget + 7,
+                                                           std::nullopt};
+      for (size_t lane = 0; lane < ids.size(); ++lane) {
+        EngineRequest request = makeRequest(ids[lane], prompt, 48);
+        request.sampling.temperature = temperature;
+        request.sampling.seed = 0x5eed + budget;
+        if (budgets[lane])
+          request.thinkingBudget = ThinkingBudget{*budgets[lane], kThinkEnd, kThinkEnd};
+        beginCold(executor, request, static_cast<uint32_t>(lane));
+        requireOpen(prefillChunk(executor, ids[lane], 0, prompt, pageTables[lane]),
+                    "thinking budget fixture");
+      }
+      const auto generated = decodeTogether(executor, ids, static_cast<uint32_t>(prompt.size()),
+                                            pageTables, budget + 12);
+      for (size_t lane = 0; lane < ids.size(); ++lane) {
+        const std::vector<uint32_t> &tokens = generated[lane];
+        const auto close = std::find(tokens.begin(), tokens.end(), kThinkEnd);
+        if (!budgets[lane]) {
+          require(close == tokens.end(), "a lane without a thinking budget closed its thinking");
+          continue;
+        }
+        require(close != tokens.end() && close - tokens.begin() == *budgets[lane] &&
+                    close + 1 != tokens.end(),
+                "a thinking budget of " + std::to_string(*budgets[lane]) +
+                    " did not close thinking at its token, then go on");
+      }
+      for (const uint64_t id : ids)
+        executor.end(id);
+    }
+  }
+  std::cout << "thinking_budget=PASS\n";
 }
 
 // A 64-token request with one image of the given span, its pixels a pattern.
@@ -950,6 +1165,80 @@ void requireConcurrentRequestsShareOneEncode(model::Runtime &executor,
   require(backend.memoryStats().allocatedBytes == originalBytes,
           "shared image rows leaked resources");
   std::cout << "concurrent_image_requests_share_one_encode=PASS\n";
+}
+
+// A lane whose chunk is not finite commits nothing of the images its
+// command encoded for it: a request that shares the rows but was not in the
+// command encodes the image again. Rows a finite lane of the same command
+// injected stay encoded, and the next request with the image reuses them.
+void requireNonFiniteChunkLeavesItsImageToEncode(model::Runtime &executor,
+                                                 kv::PageStorage &pages,
+                                                 const model::QwenStateStorage &states,
+                                                 const metal::MetalBackend &backend) {
+  // Each part has an image of its own: the first leaves its image cached.
+  const ImageSpan span{16, 16, 8, 8, 167, 449};
+  const ImageSpan other{16, 16, 8, 8, 173, 457};
+  const std::vector<uint32_t> tableA = pageRange(116, 4);
+  const std::vector<uint32_t> tableB = pageRange(120, 4);
+  {
+    const EngineRequest failing = imageRequest(130, span);
+    EngineRequest sharing = failing;
+    sharing.id = 131;
+    const uint64_t encodes = executor.telemetry().imageEncodes;
+    beginCold(executor, failing, 0);
+    beginCold(executor, sharing, 1);
+    prefillChunk(executor, 130, 0, std::span(failing.prompt).first(16), tableA);
+    poisonRecurrentState(backend, states, 0);
+    require(!prefillChunk(executor, 130, 16, std::span(failing.prompt).subspan(16), tableA)
+                 .failure.empty() &&
+                executor.telemetry().imageEncodes == encodes + 1,
+            "the chunk that encoded the image did not fail its lane");
+    executor.end(130);
+    pages.clearPages(tableA);
+    require(prefillChunk(executor, 131, 0, sharing.prompt, tableB).failure.empty() &&
+                executor.telemetry().imageEncodes == encodes + 2,
+            "a request sharing the image a failed chunk encoded did not encode it again");
+    executor.end(131);
+    pages.clearPages(tableB);
+  }
+  {
+    const EngineRequest failing = imageRequest(132, other);
+    EngineRequest finite = failing;
+    finite.id = 133;
+    EngineRequest next = failing;
+    next.id = 134;
+    beginCold(executor, failing, 0);
+    beginCold(executor, finite, 1);
+    prefillChunk(executor, 132, 0, std::span(failing.prompt).first(16), tableA);
+    prefillChunk(executor, 133, 0, std::span(finite.prompt).first(16), tableB);
+    poisonRecurrentState(backend, states, 0);
+    BatchPlan plan{.kind = WorkKind::Prefill,
+                   .items = {{132, 48}, {133, 48}},
+                   .decodeStage = DecodeStage::Regular};
+    std::array items{
+        withRevision({.requestId = 132, .logicalPosition = 16, .tokenCount = 48,
+                      .pageTable = tableA}),
+        withRevision({.requestId = 133, .logicalPosition = 16, .tokenCount = 48,
+                      .pageTable = tableB})};
+    items[0].inputTokens = std::span(failing.prompt).subspan(16);
+    items[1].inputTokens = std::span(finite.prompt).subspan(16);
+    const uint64_t encodes = executor.telemetry().imageEncodes;
+    const std::vector<ModelStepResult> results = executor.prefill(plan, items);
+    require(results.size() == 2 && !results[0].failure.empty() && results[1].failure.empty() &&
+                executor.telemetry().imageEncodes == encodes + 1,
+            "one command did not encode the image once and fail the poisoned lane alone");
+    executor.end(132);
+    executor.end(133);
+    pages.clearPages(tableA);
+    pages.clearPages(tableB);
+    beginCold(executor, next, 0);
+    require(prefillChunk(executor, 134, 0, next.prompt, tableA).failure.empty() &&
+                executor.telemetry().imageEncodes == encodes + 1,
+            "the image a finite lane injected beside a failed one was encoded again");
+    executor.end(134);
+    pages.clearPages(tableA);
+  }
+  std::cout << "non_finite_chunk_leaves_its_image_to_encode=PASS\n";
 }
 
 // A lane suspended inside its image keeps the encoded rows for its resume:
@@ -1020,7 +1309,7 @@ void requireInjectedRowsBecomeReclaimable(model::Runtime &executor,
 // refused; one at it continues past the image without encoding it.
 void requireCoveredImagesAreNotStaged(model::Runtime &executor,
                                       metal::MetalBackend &backend,
-                                      const model::LoadedModel &model) {
+                                      const model::QwenStateStorage &states) {
   while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
   }
   const uint64_t originalBytes = backend.memoryStats().allocatedBytes;
@@ -1060,7 +1349,7 @@ void requireCoveredImagesAreNotStaged(model::Runtime &executor,
     require(admission.granted() && !started.imageRowsBytes && !started.visionArenaBytes &&
                 started.imageEmbeddingReuses == reuses &&
                 backend.memoryStats().allocatedBytes ==
-                    before + model.stateLayout().laneBytes(),
+                    before + states.layout().laneBytes(),
             "a start staged an image its restored prefix covers");
     if (id == 115) {
       rejects([&] { static_cast<void>(executor.beginRestore(id, 32, beforeImage, true, {})); },
@@ -1092,12 +1381,13 @@ void requireCoveredImagesAreNotStaged(model::Runtime &executor,
 // the refused attempt did.
 void requireRefusedStartKeepsItsRows(model::Runtime &executor,
                                      metal::MetalBackend &backend,
+                                     const model::QwenStateStorage &states,
                                      const model::LoadedModel &model,
                                      AllocationFault &fault) {
   while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
   }
   const uint64_t originalBytes = backend.memoryStats().allocatedBytes;
-  const uint64_t laneBytes = model.stateLayout().laneBytes();
+  const uint64_t laneBytes = states.layout().laneBytes();
   const auto imageBytes = [&](const ImageSpan &span) {
     return span.pixelBytes() +
            uint64_t{ops::Vision::embeddingRows({span.gridHeight, span.gridWidth})} *
@@ -1409,13 +1699,14 @@ int main(int argc, char **argv) {
   try {
     bool imagesOnly = false, warmupEosOnly = false;
     kv::Format format = kv::Format::Int8;
+    ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
     std::optional<double> givenAneFfnShare;
     // The evaluation of the split's program that fails, counted from 1 as
     // ane::ProgramInstrumentation counts them; 0 for none.
     uint64_t aneFfnFault = 0;
     if (argc < 3)
-      fail("usage: model-runtime-oracle METALLIB MODEL_ROOT [--kv-format int8|bf16] [--ane-ffn-share SHARE] "
-           "[--ane-ffn-fault EVALUATION]");
+      fail("usage: model-runtime-oracle METALLIB MODEL_ROOT [--kv-format int8|bf16] [--state-format fp32|bf16] "
+           "[--ane-ffn-share SHARE] [--ane-ffn-fault EVALUATION]");
     for (int i = 3; i < argc; ++i) {
       const std::string_view option(argv[i]);
       if (option == "--images-only") imagesOnly = true;
@@ -1424,6 +1715,10 @@ int main(int argc, char **argv) {
         const std::string_view value(argv[++i]);
         if (value != "int8" && value != "bf16") fail("invalid KV format");
         format = value == "int8" ? kv::Format::Int8 : kv::Format::BFloat16;
+      } else if (option == "--state-format" && i + 1 < argc) {
+        const std::string_view value(argv[++i]);
+        if (value != "fp32" && value != "bf16") fail("invalid state format");
+        stateFormat = value == "fp32" ? ops::GdnStateFormat::Float32 : ops::GdnStateFormat::BFloat16;
       } else if (option == "--ane-ffn-share" && i + 1 < argc) {
         const char *value = argv[++i];
         char *end = nullptr;
@@ -1462,7 +1757,7 @@ int main(int argc, char **argv) {
         model::loadModel(backend, modelRoot, descriptor);
     ops::ExecutionPlans operators(backend.capabilities());
     model::ModelMemoryPlan executorPlan =
-        model::plannedRuntimeMemory(model, operators, format);
+        model::plannedRuntimeMemory(model, operators, format, stateFormat);
     // The memory plan with `aneFfnBytes` set aside for the prefill FFN's
     // Neural Engine split.
     const auto planMemory = [&](uint64_t aneFfnBytes) {
@@ -1473,7 +1768,7 @@ int main(int argc, char **argv) {
           executorPlan, 0, aneFfnBytes};
       ModelMemoryProfile profile{
           model.name(), model.maximumContextTokens(),
-          model.targetKvLayout(format), footprint};
+          model.targetKvLayout(format), footprint, stateFormat};
       return evaluateEngineMemoryPlan(backend.capabilities(), profile, 0);
     };
 
@@ -1576,7 +1871,7 @@ int main(int argc, char **argv) {
               "oracle KV extent is unavailable");
     model::QwenStateStorage states(backend,
                                     admission,
-                                    model.stateLayout(), nullptr);
+                                    model.stateLayout(stateFormat), nullptr);
     model::RuntimeContext context{backend, model, pages, states, operators, aneFfn.get()};
     require(executorPlan.sharedDecodePlannedAllocatedBytes <=
                 std::numeric_limits<uint64_t>::max() -
@@ -1621,14 +1916,15 @@ int main(int argc, char **argv) {
     // The engine refuses image requests to a model without vision before they
     // reach the runtime, which treats one as a broken invariant.
     if (model.descriptor.hasVision()) {
-      requireAtomicImageAdmission(executor, backend, model, allocationFault);
+      requireAtomicImageAdmission(executor, backend, states, model, allocationFault);
       requireImageRowsAfterReclaim(executor, backend, states, model, allocationFault);
       requireRepeatedImagePlacements(executor, backend, states, allocationFault);
       requireConcurrentRequestsShareOneEncode(executor, backend);
+      requireNonFiniteChunkLeavesItsImageToEncode(executor, pages, states, backend);
       requireSuspendedLaneKeepsItsRows(executor, backend);
       requireInjectedRowsBecomeReclaimable(executor, backend);
-      requireCoveredImagesAreNotStaged(executor, backend, model);
-      requireRefusedStartKeepsItsRows(executor, backend, model, allocationFault);
+      requireCoveredImagesAreNotStaged(executor, backend, states);
+      requireRefusedStartKeepsItsRows(executor, backend, states, model, allocationFault);
       requireReclaimTakesOneCacheUnit(executor, backend, model);
       requireEncoderFitsItsImages(executor, backend, model, allocationFault);
       requireReplayPointKeepsItsImageRows(executor, backend);
@@ -1639,7 +1935,8 @@ int main(int argc, char **argv) {
     if (imagesOnly) {
       std::cout << "PASS model-runtime-oracle scope=images-only model=" << model.name()
                 << " (admission rollback, chunk reclaim, cache-only budget, mixed/repeated images,"
-                   " shared, suspended and injected rows, covered images, refused starts,"
+                   " shared, suspended and injected rows, rows a failed chunk encoded,"
+                   " covered images, refused starts,"
                    " one cache unit per reclaim, replay point rows)\n";
       return 0;
     }
@@ -1668,7 +1965,7 @@ int main(int argc, char **argv) {
             "prefill state length mismatch");
 
     const uint64_t predictedPromptSnapshotBytes =
-        model.stateLayout().cachedBytes();
+        states.layout().cachedBytes();
     std::shared_ptr<const CompositeState> promptSnapshot =
         executor.snapshot(1);
     require(promptSnapshot != nullptr,
@@ -1755,11 +2052,16 @@ int main(int argc, char **argv) {
     }
     requireNonFiniteRowFailsOnlyItsLane(executor, pages, states, backend,
                                         samplingSeedTokens, prompt128);
+    requireThinkingBudgetClosesThinking(executor);
 
 
     // Compare the active GDN state from one 16-row chunk and two M8 commits
     // within the numerical tolerance below. Their next-token decisions are
-    // diagnostic because the command partitions round differently.
+    // diagnostic because the command partitions round differently. A BF16
+    // state is also rounded where the first commit stores it, which the rows
+    // after it carry through the model, and a mixture of experts amplifies
+    // (convolution cosine 0.998 on the 35B): its bound is looser, and the FP32
+    // run holds the partition itself to the tight one.
     const std::vector<uint32_t> prompt16{
         248045, 8678, 198,   24342, 286,  4879, 369,   716,
         310,    830,  11553, 13,    5044, 1683, 15060, 1472};
@@ -1785,12 +2087,14 @@ int main(int argc, char **argv) {
                 baselineMetadata.lengths.targetTokens == prompt16.size(),
             "partitioned prefill logical state diverged");
     const model::GdnStateLayout &gdnLayout = states.layout().target;
+    const bool bfloatState = gdnLayout.format == ops::GdnStateFormat::BFloat16;
     const Similarity convolution =
         compareBfloat(convolutionHalf(backend, states.current(2), gdnLayout),
                       convolutionHalf(backend, states.current(3), gdnLayout));
-    const Similarity recurrent =
-        compareFloat(recurrentHalf(backend, states.current(2), gdnLayout),
-                     recurrentHalf(backend, states.current(3), gdnLayout));
+    const metal::MetalBuffer baselineRecurrent = recurrentHalf(backend, states.current(2), gdnLayout),
+                             partitionedRecurrent = recurrentHalf(backend, states.current(3), gdnLayout);
+    const Similarity recurrent = bfloatState ? compareBfloat(baselineRecurrent, partitionedRecurrent)
+                                             : compareFloat(baselineRecurrent, partitionedRecurrent);
     std::cout
         << "partition_equivalence conv_cos=" << convolution.cosine
         << " parity=" << baselineMetadata.activeParity << '/'
@@ -1803,7 +2107,8 @@ int main(int argc, char **argv) {
         << " recurrent_cos=" << recurrent.cosine
         << " recurrent_norms=" << recurrent.leftNorm << '/'
         << recurrent.rightNorm << '\n';
-    require(convolution.cosine > 0.999 && recurrent.cosine > 0.999,
+    const double bound = bfloatState ? 0.99 : 0.999;
+    require(convolution.cosine > bound && recurrent.cosine > bound,
             "partitioned prefill numerical state diverged");
 
     ModelStepResult baselinePending =
@@ -1846,39 +2151,58 @@ int main(int argc, char **argv) {
     require(partitionedSamplingSnapshot != nullptr,
             "partitioned sampling snapshot allocation failed");
     executor.end(54);
+    // The restore copies the target state exactly, so after the replayed
+    // token the restored lane and a cold lane hold the same GDN cell and
+    // select the same anchor. Their draft rings differ: a cached state keeps
+    // the 4-bit context window, from which the restore computes them again,
+    // and a sampled cycle draws a rejected proposal's correction from the
+    // target's distribution less the draft's, so the cycle's later tokens
+    // may differ.
     EngineRequest restoredMicroSampling =
         makeRequest(55, policyReplayPrompt, 2);
     restoredMicroSampling.sampling = partitionedSampling.sampling;
     beginCold(executor, restoredMicroSampling, 0);
     restoreActivePrefix(executor, 55, policyReplayPrompt.size(),
                         promptAligned.size(), partitionedSamplingSnapshot);
-    ModelStepResult restoredMicroSample = firstStep(
-        executor,
-        prefillChunk(executor, 55, promptAligned.size(),
-                     std::span<const uint32_t>(policyReplayPrompt).subspan(128,
-                                                                          1),
-                     policyPages),
-        55, policyReplayPrompt.size(), policyPages);
-    executor.end(55);
+    ModelStepResult restoredReplay = prefillChunk(
+        executor, 55, promptAligned.size(),
+        std::span<const uint32_t>(policyReplayPrompt).subspan(128, 1),
+        policyPages);
     const std::vector<uint32_t> coldPolicyPages = pageRange(15, 5);
     EngineRequest coldMicroSampling = restoredMicroSampling;
     coldMicroSampling.id = 57;
-    beginCold(executor, coldMicroSampling, 0);
+    beginCold(executor, coldMicroSampling, 1);
     prefillChunk(executor, 57, 0,
                  std::span<const uint32_t>(policyReplayPrompt).first(120),
                  coldPolicyPages);
     prefillChunk(executor, 57, 120,
                  std::span<const uint32_t>(policyReplayPrompt).subspan(120, 8),
                  coldPolicyPages);
-    ModelStepResult coldMicroSample = firstStep(
-        executor,
-        prefillChunk(executor, 57, 128,
-                     std::span<const uint32_t>(policyReplayPrompt).subspan(128,
-                                                                          1),
-                     coldPolicyPages),
-        57, policyReplayPrompt.size(), coldPolicyPages);
-    require(restoredMicroSample.outputTokens == coldMicroSample.outputTokens,
-            "one-token recurrent restore replay diverged from cold prefill");
+    ModelStepResult coldReplay = prefillChunk(
+        executor, 57, 128,
+        std::span<const uint32_t>(policyReplayPrompt).subspan(128, 1),
+        coldPolicyPages);
+    const metal::MetalBuffer &restoredCell = states.current(0).stateBase;
+    const metal::MetalBuffer &coldCell = states.current(1).stateBase;
+    require(restoredCell.sizeBytes() == coldCell.sizeBytes() &&
+                restoredCell.contents() && coldCell.contents() &&
+                std::memcmp(restoredCell.contents(), coldCell.contents(),
+                            restoredCell.sizeBytes()) == 0,
+            "one-token recurrent restore replay left another GDN state than "
+            "cold prefill");
+    const ModelStepResult restoredMicroSample = firstStep(
+        executor, std::move(restoredReplay), 55, policyReplayPrompt.size(),
+        policyPages);
+    const ModelStepResult coldMicroSample = firstStep(
+        executor, std::move(coldReplay), 57, policyReplayPrompt.size(),
+        coldPolicyPages);
+    require(!restoredMicroSample.outputTokens.empty() &&
+                !coldMicroSample.outputTokens.empty() &&
+                restoredMicroSample.outputTokens.front() ==
+                    coldMicroSample.outputTokens.front(),
+            "one-token recurrent restore replay selected another anchor than "
+            "cold prefill");
+    executor.end(55);
     executor.end(57);
     partitionedSamplingSnapshot.reset();
 
@@ -1904,9 +2228,10 @@ int main(int argc, char **argv) {
     // budgeted commit with a constrained cycle that retains the same prefix,
     // rejecting the next proposal unless all eight rows are retained. The
     // constrained request has a larger budget, so both acceptance paths agree on
-    // the exact GDN state and draft ring. Kernel tests cover the recurrence's
-    // FP64 accuracy; this check does not mix prefill and decode summation
-    // orders, whose tiny differences can amplify through the full model.
+    // the retained rows and the exact draft ring. Kernel tests cover the
+    // recurrence's FP64 accuracy; this check does not mix prefill and decode
+    // summation orders, whose tiny differences can amplify through the full
+    // model.
     for (uint32_t outputLimit = 2; outputLimit <= 8; ++outputLimit) {
       uint64_t id = 10 + outputLimit;
       EngineRequest variant = makeRequest(id, prompt129, outputLimit);
@@ -1980,6 +2305,102 @@ int main(int argc, char **argv) {
       executor.end(id);
     }
 
+    // The next cycle folds the rows a cycle retained into the cell it writes:
+    // a budgeted lane and a masked lane that retain the same rows in two
+    // cycles must then hold the same GDN cell, each folded from its own tape.
+    {
+      constexpr uint64_t id = 60, replayId = 160;
+      EngineRequest budgeted = makeRequest(id, prompt129, 64);
+      beginCold(executor, budgeted, 0);
+      restoreActivePrefix(executor, id, prompt129.size(), 128, promptSnapshot);
+      const ModelStepResult first = firstStep(
+          executor,
+          prefillChunk(executor, id, 128,
+                       std::span<const uint32_t>(prompt129).subspan(128, 1),
+                       pageTable),
+          id, 129, pageTable);
+      const uint64_t firstEnd = states.metadata(0).lengths.targetTokens;
+      require(first.outputTokensWithoutKv == 0 &&
+                  firstEnd == 129 + first.outputTokens.size(),
+              "the budgeted lane's first cycle did not continue");
+      const metal::MetalBuffer &budgetCell = states.current(0).stateBase;
+      const auto *cellBytes = static_cast<const uint8_t *>(budgetCell.contents());
+      require(cellBytes, "the budgeted lane's GDN cell is not readable");
+      const std::vector<uint8_t> beforeFold(cellBytes,
+                                            cellBytes + budgetCell.sizeBytes());
+      const ModelStepResult second =
+          decodeOne(executor, id, firstEnd, pageTable);
+      require(!second.outputTokens.empty() &&
+                  second.outputTokensWithoutKv == 0,
+              "the budgeted lane's second cycle did not continue");
+
+      std::vector<uint32_t> replayPages = pageTable;
+      replayPages[4] = 80;
+      EngineRequest replayRequest = makeRequest(replayId, prompt129, 64);
+      replayRequest.constraint = ConstraintMode::TokenMask;
+      beginCold(executor, replayRequest, 1);
+      restoreActivePrefix(executor, replayId, prompt129.size(), 128,
+                          promptSnapshot);
+      require(prefillChunk(executor, replayId, 128,
+                           std::span<const uint32_t>(prompt129).subspan(128, 1),
+                           replayPages)
+                      .nextDecodeStage == DecodeStage::ApplyInitialMask,
+              "continued replay did not request its initial mask");
+      const std::array<uint32_t, 1> anchor{first.outputTokens.front()};
+      provideMask(executor, replayId, singletonMasks(anchor));
+      static_cast<void>(decodeOne(executor, replayId, 129, replayPages, true,
+                                  DecodeStage::ApplyInitialMask));
+      // A cycle's mask allows the budgeted lane's tokens, then at the row
+      // after them its next anchor, or else a token other than the proposal,
+      // which ends the cycle's acceptance there.
+      const auto replayCycle = [&](uint64_t start, const ModelStepResult &cycle,
+                                   std::optional<uint32_t> next) {
+        auto pending =
+            beginMaskedDecodeOne(executor, replayId, start, replayPages);
+        require(pending.maskRequests.size() == 1 &&
+                    pending.maskRequests[0].simulationTokens.size() == 8,
+                "continued replay proposals were not exposed");
+        const auto &proposed = pending.maskRequests[0].simulationTokens;
+        const size_t rows = cycle.outputTokens.size();
+        std::array<uint32_t, 9> maskTokens{};
+        maskTokens.fill(100);
+        for (size_t row = 0; row < rows; ++row) {
+          require(proposed[row] == cycle.outputTokens[row],
+                  "continued replay proposal differs from committed token");
+          maskTokens[row] = cycle.outputTokens[row];
+        }
+        uint32_t after = 101;
+        if (next)
+          after = *next;
+        else if (rows < proposed.size() && proposed[rows] == 101)
+          after = 102;
+        if (rows < maskTokens.size())
+          maskTokens[rows] = after;
+        provideMask(executor, replayId, singletonMasks(maskTokens));
+        const auto replayed = finishMaskedDecode(std::move(pending));
+        require(replayed.size() == 1 && replayed[0].outputTokensWithoutKv == 0 &&
+                    replayed[0].outputTokens == cycle.outputTokens &&
+                    states.metadata(1).lengths.targetTokens == start + rows,
+                "continued replay did not commit the budgeted lane's rows");
+      };
+      replayCycle(129, first, second.outputTokens.front());
+      replayCycle(firstEnd, second, std::nullopt);
+      requireCommittedStateIdentical(states, 0, 1, "continued second cycle");
+      const metal::MetalBuffer &foldedCell = states.current(0).stateBase;
+      const metal::MetalBuffer &maskedCell = states.current(1).stateBase;
+      require(foldedCell.sizeBytes() == beforeFold.size() &&
+                  std::memcmp(foldedCell.contents(), beforeFold.data(),
+                              beforeFold.size()) != 0,
+              "the second cycle did not fold the first one's rows in");
+      require(maskedCell.sizeBytes() == foldedCell.sizeBytes() &&
+                  maskedCell.contents() &&
+                  std::memcmp(foldedCell.contents(), maskedCell.contents(),
+                              foldedCell.sizeBytes()) == 0,
+              "a folded GDN cell differs between budget and mask commits");
+      executor.end(replayId);
+      executor.end(id);
+    }
+
     // A Page32 composite state followed by one replayed token must equal a cold
     // run with the same 128+1 command partition.
     EngineRequest extended = makeRequest(20, prompt129, 2);
@@ -2016,7 +2437,11 @@ int main(int argc, char **argv) {
 
     // Recurrent cache entries are policy-neutral. The consumer replays one
     // teacher-forced token, then selects from the regenerated final hidden
-    // with its own sampling stream.
+    // with its own sampling stream: its anchor is a cold run's. The tokens
+    // after the anchor come from draft rings the restore computed again from
+    // the context window (compareCommittedSamples), so they are compared with
+    // those of a second consumer, of a second producer's snapshot under
+    // another policy, whose rings come from an equal context window.
     std::vector<uint32_t> samplingPrefix(128);
     for (uint32_t index = 0; index < samplingPrefix.size(); ++index) {
       samplingPrefix[index] =
@@ -2073,10 +2498,40 @@ int main(int argc, char **argv) {
                      std::span<const uint32_t>(samplingPrompt).subspan(128, 1),
                      coldSamplingPages),
         32, samplingPrompt.size(), coldSamplingPages);
-    require(coldSample.outputTokens == replayedSample.outputTokens,
-            "sampling restore replay reused producer policy state");
+    require(!coldSample.outputTokens.empty() &&
+                coldSample.outputTokens.front() == replayedSample.outputTokens.front(),
+            "sampling restore replay did not select from the regenerated final hidden");
     executor.end(32);
     samplingPromptSnapshot.reset();
+
+    EngineRequest otherSource = samplingSource;
+    otherSource.id = 33;
+    otherSource.sampling = {
+        .temperature = 0.7F, .topP = 0.9F, .topK = 8, .seed = 27183};
+    beginCold(executor, otherSource, 0);
+    prefillChunk(executor, 33, 0,
+                 std::span<const uint32_t>(samplingPrefix).first(120),
+                 coldSamplingPages);
+    prefillChunk(executor, 33, 120,
+                 std::span<const uint32_t>(samplingPrefix).subspan(120, 8),
+                 coldSamplingPages);
+    std::shared_ptr<const CompositeState> otherSnapshot = executor.snapshot(33);
+    require(otherSnapshot != nullptr, "sampling snapshot allocation failed");
+    executor.end(33);
+    EngineRequest otherReplay = replayedSampling;
+    otherReplay.id = 34;
+    beginCold(executor, otherReplay, 0);
+    restoreActivePrefix(executor, 34, samplingPrompt.size(), 128, otherSnapshot);
+    ModelStepResult otherSample = firstStep(
+        executor,
+        prefillChunk(executor, 34, 128,
+                     std::span<const uint32_t>(samplingPrompt).subspan(128, 1),
+                     coldSamplingPages),
+        34, samplingPrompt.size(), coldSamplingPages);
+    require(otherSample.outputTokens == replayedSample.outputTokens,
+            "sampling restore replay reused producer policy state");
+    executor.end(34);
+    otherSnapshot.reset();
 
     const auto beforeConstrained = executor.telemetry();
 
@@ -2940,9 +3395,6 @@ int main(int argc, char **argv) {
       };
       const auto rebuild = [&](bool repeatDuringReplay,
                                 bool deliverInitialMask = false) {
-        const StateSamples before =
-            repeatDuringReplay ? sampleCommittedState(backend, states, stateLane)
-                               : StateSamples{};
         executor.suspend(sequence.id);
         require(!states.metadata(stateLane).assigned(),
                 "preempted request retained its GDN/draft buffers");
@@ -2969,10 +3421,9 @@ int main(int argc, char **argv) {
         requireOpen(replay, "regeneration replay emitted historical tokens");
         if (repeatDuringReplay) {
           const StateSamples rebuilt = sampleCommittedState(backend, states, stateLane);
-          // Decode and prefill use different floating-point graphs. Record
-          // that drift, but compare recovery itself to an independent cold
-          // teacher-forced execution with the identical history and geometry.
-          compareCommittedSamples(before, rebuilt, false);
+          // Decode and prefill use different floating-point graphs, so
+          // recovery is compared to an independent cold teacher-forced
+          // execution with the identical history and geometry.
           EngineRequest teacher = sequence;
           teacher.id = 82;
           const uint32_t teacherLane = stateLane == 0 ? 1 : 0;
@@ -2983,7 +3434,7 @@ int main(int argc, char **argv) {
           require(states.metadata(stateLane).lengths == states.metadata(teacherLane).lengths,
                   "recomputed logical lengths differ from teacher forcing");
           compareCommittedSamples(
-              rebuilt, sampleCommittedState(backend, states, teacherLane), true);
+              rebuilt, sampleCommittedState(backend, states, teacherLane));
           executor.end(teacher.id);
         }
         return replay.nextDecodeStage;
@@ -3172,7 +3623,11 @@ int main(int argc, char **argv) {
     // Negative presence and frequency favour the output's tokens by their
     // counts, so the decisions they change follow the counts, a verify row's
     // draft prefix included; presence 1.5 is Qwen's recommendation, and
-    // repetition also reads the prompt's tokens.
+    // repetition also reads the prompt's tokens. The prompt repeats a chat
+    // template, which a model's greedy transcript may copy by margins the
+    // milder settings leave alone (the 35B mxfp4's survive them all);
+    // repetition 3 divides the copied tokens' logits, so that one setting
+    // changes a decision to probe on every model.
     const PreemptionRun control = runPreemption(RequestKind::Greedy, 0);
     const float drift = probeLoss(control.transcript, {});
     const float tolerance = std::max(2.0F * drift, 0.1F);
@@ -3182,7 +3637,8 @@ int main(int argc, char **argv) {
     for (const ops::SamplingPenalties penalties :
          {ops::SamplingPenalties{1.0F, -2.0F, -2.0F},
           ops::SamplingPenalties{1.0F, 1.5F, 0.0F},
-          ops::SamplingPenalties{1.3F, 1.5F, 0.0F}}) {
+          ops::SamplingPenalties{1.3F, 1.5F, 0.0F},
+          ops::SamplingPenalties{3.0F, 0.0F, 0.0F}}) {
       const auto reference = runPreemption(RequestKind::Greedy, 0, penalties);
       const auto promptResumed =
           runPreemption(RequestKind::Greedy, 1, penalties);
@@ -3387,6 +3843,7 @@ int main(int argc, char **argv) {
       executor.end(93);
       std::cout << "discontinuous_capture_fails=PASS\n";
     }
+    requireFullWindowRestore(executor, backend, states);
 
     const auto rowsBeforeInvalidWarmup = executor.telemetry().targetPrefillRows;
     for (uint32_t rows : {0U, model::ExecutionLimits::prefillTokenBudget + 1,

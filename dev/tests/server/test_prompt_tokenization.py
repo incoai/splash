@@ -16,7 +16,7 @@ from tokenizers import (
 from transformers import PreTrainedTokenizerFast
 
 from server import judgments
-from server.tokenization import PromptTokenizer
+from server.tokenization import PromptTokenizer, tokenizable
 
 
 def tokenizer():
@@ -203,6 +203,27 @@ class PromptTokenizationTests(unittest.TestCase):
         before = stats["bytes"]
         self.assert_encoding("x" * 50000 + "<|im_end|>tail", cache)
         self.assertEqual(cache.stats()["bytes"], before)
+
+    def test_lone_surrogates_encode_as_replacement_characters(self):
+        # JSON spells lone surrogates, such as half of an emoji, which the
+        # tokenizer refuses: text encodes with U+FFFD in their place, one for
+        # one, before and after a cached boundary.
+        prefix = "<|im_start|>user\n" + "Hello world!\n" * 400 + "<|im_end|>"
+        for text, replaced in (
+            ("Hello \ud83d world", "Hello \ufffd world"),
+            ("\udfff\ud800", "\ufffd\ufffd"),
+            (prefix + "\ud83d!", prefix + "\ufffd!"),
+            ("a\ud83d" + prefix + "b", "a\ufffd" + prefix + "b"),
+        ):
+            with self.subTest(text=ascii(text)):
+                self.assertEqual(tokenizable(text), replaced)
+                self.assertEqual(len(tokenizable(text)), len(text))
+                self.assertEqual(
+                    self.cache.encode(text),
+                    self.tokenizer(replaced, add_special_tokens=False)["input_ids"],
+                )
+        with self.assertRaises(TypeError):
+            self.tokenizer("Hello \ud83d world", add_special_tokens=False)
 
     def test_short_prompts_and_missing_boundary_bypass_cache(self):
         for text in (

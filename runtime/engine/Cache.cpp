@@ -101,7 +101,7 @@ CacheAdoption Cache::adopt(std::vector<PersistedKv> blocks, std::vector<Persiste
       }
     }
     if (!slot || !kv_.adoptDiskBlock(id, block.label.parent, block.label.tokens,
-                                     {block.label.imagesLo, block.label.imagesHi},
+                                     {block.label.identityLo, block.label.identityHi},
                                      std::move(slot), block.label.lastUsed)) {
       ++result.dropped;
       continue;
@@ -177,7 +177,7 @@ void Cache::endRequest(uint64_t requestId) {
 }
 
 size_t Cache::extendMatch(std::vector<uint64_t> &blocks, std::span<const uint32_t> prompt,
-                          std::span<const ImageSpan> images) const {
+                          PromptIdentity identity) const {
   if (prompt.empty())
     return 0;
   // Leave one real input token to regenerate request-specific anchor logits.
@@ -187,10 +187,10 @@ size_t Cache::extendMatch(std::vector<uint64_t> &blocks, std::span<const uint32_
   for (size_t index = blocks.size(); index < maximumBlocks; ++index) {
     const size_t begin = index * KvCache::pageTokens;
     const uint64_t parent = blocks.empty() ? 0 : blocks.back();
-    images = spansFrom(images, begin);
+    identity.images = spansFrom(identity.images, begin);
     ++hashed;
     auto match = kv_.find(parent, prompt.subspan(begin, KvCache::pageTokens),
-                          blockImageIdentity(begin, KvCache::pageTokens, images));
+                          blockIdentity(begin, KvCache::pageTokens, identity.images, identity.salt));
     if (!match)
       break;
     blocks.push_back(match->id);
@@ -206,18 +206,17 @@ uint32_t Cache::stateTokens(std::span<const uint64_t> blocks) const {
   return 0;
 }
 
-CacheProbe Cache::probe(std::span<const uint32_t> prompt,
-                        std::span<const ImageSpan> images) {
+CacheProbe Cache::probe(std::span<const uint32_t> prompt, PromptIdentity identity) {
   CacheProbe result;
   result.owner_ = this;
   result.kvGeneration_ = kv_.generation();
-  lookup_.probeHashedBlocks += extendMatch(result.blocks_, prompt, images);
+  lookup_.probeHashedBlocks += extendMatch(result.blocks_, prompt, identity);
   result.cachedTokens_ = stateTokens(result.blocks_);
   return result;
 }
 
 void Cache::refresh(CacheProbe &probe, std::span<const uint32_t> prompt,
-                    std::span<const ImageSpan> images) {
+                    PromptIdentity identity) {
   if (probe.owner_ != this)
     throw std::logic_error("a scheduling probe belongs to another cache");
   if (probe.kvGeneration_ != kv_.generation()) {
@@ -226,7 +225,7 @@ void Cache::refresh(CacheProbe &probe, std::span<const uint32_t> prompt,
     probe.blocks_.erase(std::find_if(probe.blocks_.begin(), probe.blocks_.end(),
                                      [&](uint64_t block) { return !kv_.matchable(block); }),
                         probe.blocks_.end());
-    lookup_.probeHashedBlocks += extendMatch(probe.blocks_, prompt, images);
+    lookup_.probeHashedBlocks += extendMatch(probe.blocks_, prompt, identity);
     probe.kvGeneration_ = kv_.generation();
   }
   // States come and go without a change of the KV graph.
@@ -234,7 +233,7 @@ void Cache::refresh(CacheProbe &probe, std::span<const uint32_t> prompt,
 }
 
 CacheLookup Cache::lookup(std::span<const uint32_t> prompt,
-                          std::span<const ImageSpan> images,
+                          PromptIdentity identity,
                           const CacheProbe *probe) {
   CacheLookup result;
   std::vector<uint64_t> fallback;
@@ -242,7 +241,7 @@ CacheLookup Cache::lookup(std::span<const uint32_t> prompt,
   if (probe && probe->owner_ == this && probe->kvGeneration_ == kv_.generation()) {
     blocks = probe->blocks_;
   } else {
-    extendMatch(fallback, prompt, images);
+    extendMatch(fallback, prompt, identity);
     blocks = fallback;
   }
   if (!blocks.empty()) {
@@ -291,10 +290,10 @@ void Cache::pagesChanged(Request &active, uint32_t first) noexcept {
   active.firstChangedPage = first;
 }
 
-void Cache::publishCommittedBlocks(uint64_t requestId,
-                                   std::span<const uint32_t> exactTokens,
-                                   uint32_t committedTokens,
-                                   std::span<const ImageSpan> images) {
+uint32_t Cache::publishCommittedBlocks(uint64_t requestId,
+                                       std::span<const uint32_t> exactTokens,
+                                       uint32_t committedTokens,
+                                       PromptIdentity identity) {
   Request &active = request(requestId);
   if (committedTokens > exactTokens.size()) {
     throw std::invalid_argument("committed KV exceeds exact token history");
@@ -307,15 +306,16 @@ void Cache::publishCommittedBlocks(uint64_t requestId,
   }
   if (fullBlocks < active.cachedBlocks.size())
     throw std::logic_error("committed KV history moved backwards");
+  uint32_t swappedTokens = 0;
   while (active.cachedBlocks.size() < fullBlocks) {
     const uint32_t logical = static_cast<uint32_t>(active.cachedBlocks.size());
     const uint64_t parent = logical ? active.cachedBlocks.back() : 0;
     const uint32_t begin = logical * KvCache::pageTokens;
-    images = spansFrom(images, begin);
+    identity.images = spansFrom(identity.images, begin);
     auto inserted =
         kv_.insert(parent, exactTokens.subspan(begin, KvCache::pageTokens),
                    active.pages[logical],
-                   blockImageIdentity(begin, KvCache::pageTokens, images));
+                   blockIdentity(begin, KvCache::pageTokens, identity.images, identity.salt));
     const uint32_t writerPage = active.pages[logical];
     const bool replacePage = inserted.physicalPage != writerPage;
     if (replacePage)
@@ -326,10 +326,12 @@ void Cache::publishCommittedBlocks(uint64_t requestId,
       active.pages[logical] = inserted.physicalPage;
       pagesChanged(active, logical);
       pool_.releasePage(writerPage, false);
+      swappedTokens += KvCache::pageTokens;
     }
     if (parent)
       kv_.releaseActive(parent);
   }
+  return swappedTokens;
 }
 
 uint64_t Cache::blockAt(uint64_t requestId, uint32_t boundary) const {
@@ -378,7 +380,8 @@ bool Cache::retireCheckpointState(StateCheckpoint checkpoint) noexcept {
 // the governor admits one. Making room is the caller's reclaim; a page that
 // must be written first comes back when its copy lands.
 
-TokenAdmission Cache::ensureTokens(uint64_t requestId, uint64_t tokenCount) {
+TokenAdmission Cache::ensureTokens(uint64_t requestId, uint64_t tokenCount,
+                                   uint64_t writtenTokens) {
   Request &active = request(requestId);
   const uint64_t needed64 =
       (tokenCount + KvCache::pageTokens - 1) / KvCache::pageTokens;
@@ -392,6 +395,10 @@ TokenAdmission Cache::ensureTokens(uint64_t requestId, uint64_t tokenCount) {
   if (const TokenAdmission admission = admitPages(needed - previousSize, acquired);
       !admission.granted())
     return admission;
+  const uint64_t written = std::min(writtenTokens, tokenCount);
+  for (uint32_t index = 0; index < acquired.size(); ++index)
+    if (uint64_t{previousSize + index + 1} * KvCache::pageTokens > written)
+      pool_.clearPage(acquired[index]);
   active.pages.insert(active.pages.end(), acquired.begin(), acquired.end());
   pagesChanged(active, previousSize);
   return {};
@@ -854,7 +861,7 @@ void Cache::labelKv(uint64_t block, const std::shared_ptr<KvDiskSlot> &slot) {
   if (!persistent_)
     return;
   const KvCache::Key key = kv_.key(block);
-  KvBlockLabel label{block, key.parent, kv_.lastUsed(block), key.images.lo, key.images.hi, {}};
+  KvBlockLabel label{block, key.parent, kv_.lastUsed(block), key.identity.lo, key.identity.hi, {}};
   std::copy(key.tokens.begin(), key.tokens.end(), label.tokens.begin());
   tier_->label(slot, encodeLabel(label));
 }

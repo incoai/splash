@@ -21,7 +21,7 @@ import yaml
 from install import clients, launcher
 from server import serve_options
 
-MODEL = "incoai/Qwen3.6-35B-A3B-Splash"
+MODEL = "mlx-community/Qwen3.6-35B-A3B-4bit"
 
 
 def hermes_profile_create(argv, *, env, **options):
@@ -542,7 +542,7 @@ class ClientTests(unittest.TestCase):
         for name in ("settings.json", "auth.json"):
             (agent / name).write_text('{"keep": true}')
         self.command("pi")
-        self.command("pi", context=262144, model="incoai/Qwen3.8-27B-Splash")
+        self.command("pi", context=262144, model="mlx-community/Qwen3.8-27B-4bit")
         config = json.loads(self.pi_models.read_text())
         self.assertEqual(config["providers"]["other"], other)
         self.assertEqual(config["future"], {"keep": True})
@@ -550,7 +550,7 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(splash["baseUrl"], "http://127.0.0.1:8000/v1")
         self.assertEqual(
             [(m["id"], m["contextWindow"], m["maxTokens"]) for m in splash["models"]],
-            [("incoai/Qwen3.8-27B-Splash", 262144, 32768)],
+            [("mlx-community/Qwen3.8-27B-4bit", 262144, 32768)],
         )
         for name in ("settings.json", "auth.json"):
             self.assertEqual((agent / name).read_text(), '{"keep": true}')
@@ -676,10 +676,10 @@ class ClientTests(unittest.TestCase):
         user = {
             "agent": {
                 "build": {
-                    "model": "splash/incoai/Qwen3.8-27B-Splash",
+                    "model": "splash/mlx-community/Qwen3.8-27B-4bit",
                     "variant": "off",
                 },
-                "title": {"model": "splash/incoai/Qwen3.8-27B-Splash"},
+                "title": {"model": "splash/mlx-community/Qwen3.8-27B-4bit"},
                 "compaction": {"model": "other/cloud-model", "temperature": 0.2},
                 "reviewer": {"model": "other/model", "prompt": "review"},
             }
@@ -904,11 +904,11 @@ class ClientTests(unittest.TestCase):
         config["mcp_servers"] = {"test": {"command": "test-server"}}
         path.write_text(yaml.safe_dump(config))
         (home / "state.db").write_bytes(b"session data")
-        self.command("hermes", context=262144, model="incoai/Qwen3.8-27B-Splash")
+        self.command("hermes", context=262144, model="mlx-community/Qwen3.8-27B-4bit")
         changed = yaml.safe_load(path.read_text())
         self.assertEqual(changed["model"]["context_length"], 262144)
         self.assertEqual(changed["model"]["max_tokens"], 32768)
-        self.assertEqual(changed["model"]["default"], "incoai/Qwen3.8-27B-Splash")
+        self.assertEqual(changed["model"]["default"], "mlx-community/Qwen3.8-27B-4bit")
         self.assertTrue(changed["model"]["supports_vision"])
         self.assertEqual(changed["display"], config["display"])
         self.assertEqual(changed["mcp_servers"], config["mcp_servers"])
@@ -1321,7 +1321,7 @@ class InstalledOpenCodeTests(unittest.TestCase):
                 return result.stdout
 
             query = [binary, "api", "GET", "/api/config"]
-            model = "incoai/Qwen3.8-27B-Splash"
+            model = "mlx-community/Qwen3.8-27B-4bit"
             argv, configured = clients.command(
                 "opencode",
                 binary,

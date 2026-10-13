@@ -25,10 +25,9 @@ class CharacterTokenizer:
 class HttpRegressionTests(unittest.TestCase):
     def test_any_repository_selects_matching_model_root_and_api_name(self):
         for selected in (
-            "incoai/Qwen3.8-27B-Splash",
-            "incoai/Qwen3.6-35B-A3B-Splash",
-            "community/custom-splash",
             "mlx-community/Qwen3.8-27B-4bit",
+            "mlx-community/Qwen3.6-35B-A3B-4bit",
+            "community/custom-splash",
             "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M",
         ):
             with self.subTest(model=selected):
@@ -40,7 +39,7 @@ class HttpRegressionTests(unittest.TestCase):
                         smoke.model_artifacts.MODELS, selected
                     ),
                 )
-        model = "incoai/Qwen3.8-27B-Splash"
+        model = "mlx-community/Qwen3.8-27B-4bit"
         arguments = smoke.parse_args(["--model-root", "custom-root", "--model", model])
         self.assertEqual(str(arguments.model_root), "custom-root")
         self.assertEqual(arguments.model, model)
@@ -62,11 +61,11 @@ class HttpRegressionTests(unittest.TestCase):
             binary.touch()
             (root / "splash.metallib").touch()
             models = root / "models"
-            # A Splash package records manifest.json; an upstream selection
-            # links an assembly that records model.json.
-            legacy = "incoai/Qwen3.6-35B-A3B-Splash"
-            (models / legacy).mkdir(parents=True)
-            (models / legacy / "manifest.json").write_text("{}")
+            # A selection links an assembly that records model.json; a Splash
+            # package an earlier release installed records manifest.json.
+            package = "incoai/Qwen3.6-35B-A3B-Splash"
+            (models / package).mkdir(parents=True)
+            (models / package / "manifest.json").write_text("{}")
             upstream = "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M"
             assembly = models / ".resolved/assembly"
             assembly.mkdir(parents=True)
@@ -96,16 +95,10 @@ class HttpRegressionTests(unittest.TestCase):
                 contextlib.redirect_stderr(io.StringIO()) as error,
                 self.assertRaises(SystemExit),
             ):
-                parse(legacy)
+                parse(upstream)
             self.assertIn("weight-digests", error.getvalue())
             (root / weights.WEIGHT_DIGESTS).parent.mkdir()
             (root / weights.WEIGHT_DIGESTS).touch()
-            arguments = parse(legacy)
-            self.assertEqual(arguments.model_root, models / legacy)
-            hold(arguments)
-            self.assertEqual(
-                (arguments.model_root, arguments.held_record), (models / legacy, None)
-            )
             # Parsing only names the selection link; the servers' run holds it.
             arguments = parse(upstream)
             self.assertEqual(arguments.model_root, models / upstream)
@@ -118,10 +111,12 @@ class HttpRegressionTests(unittest.TestCase):
             finally:
                 arguments.held_record.close()
             self.assertFalse(smoke.assembly.is_held(assembly))
-            error = io.StringIO()
-            with contextlib.redirect_stderr(error), self.assertRaises(SystemExit):
-                parse("community/not-installed")
-            self.assertIn("missing installed model", error.getvalue())
+            # Neither a package nor a model that is not installed is served.
+            for model in (package, "community/not-installed"):
+                error = io.StringIO()
+                with contextlib.redirect_stderr(error), self.assertRaises(SystemExit):
+                    parse(model)
+                self.assertIn("missing installed model", error.getvalue())
 
     def test_another_checkouts_assembly_is_held_by_its_installation(self):
         with TemporaryDirectory() as directory:
@@ -292,7 +287,7 @@ class HttpRegressionTests(unittest.TestCase):
                 self.assertFalse(summary["keep"])
 
     def test_a_follow_up_needs_a_burst_of_two(self):
-        model = "incoai/Qwen3.8-27B-Splash"
+        model = "mlx-community/Qwen3.8-27B-4bit"
         for extra in (["--follow-up"], ["--burst", "1", "--follow-up"]):
             with (
                 self.subTest(extra=extra),
