@@ -1135,7 +1135,13 @@ class FrontendHandler(BaseHTTPRequestHandler):
                         ),
                         "stop_sequence": result.stop_sequence,
                     },
-                    "usage": {"output_tokens": result.completion_tokens},
+                    "usage": {
+                        "output_tokens": result.completion_tokens,
+                        "output_tokens_details": {
+                            "thinking_tokens": job.reasoning_tokens
+                        },
+                    },
+                    "timings": timings_dict(result),
                 },
             )
             send("message_stop", {})

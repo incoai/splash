@@ -822,9 +822,21 @@ completions empty-text chunks, Responses `response.in_progress`, and Messages
 `ping`. Queueing and prompt preparation do not advance this counter.
 Non-streaming requests cannot enable it.
 
+Usage counts cached prompt tokens and the output tokens spent reasoning in each
+API's own fields: Chat `prompt_tokens_details.cached_tokens` and
+`completion_tokens_details.reasoning_tokens`, Responses
+`input_tokens_details.cached_tokens` and `output_tokens_details.reasoning_tokens`,
+and Messages `cache_read_input_tokens` (with `input_tokens` the uncached rest)
+and `output_tokens_details.thinking_tokens`, in a stream's `message_delta`.
+Responses `cache_write_tokens` is 0: the prefix cache stores a prompt as it
+prefills it at no cost of its own, as OpenAI reports its automatic caching, so
+uncached input is `input_tokens` less `cached_tokens`.
+
 Chat and text completions include a llama-server-style `timings` object, both in
 non-streaming responses and in the final finish-reason chunk of a stream,
-even without `include_usage`. `prompt_n` and `predicted_n` are the full prompt
+even without `include_usage`. Messages and Responses include the same object
+in a complete response, and in a stream in `message_delta` and in the response
+of `response.completed` or `response.incomplete`. `prompt_n` and `predicted_n` are the full prompt
 and output counts; `cache_n` is the cached prompt count. `prompt_ms` measures
 native start to first emission, and `predicted_ms` measures first emission to
 completion. These elapsed intervals exclude the initial admission queue and
