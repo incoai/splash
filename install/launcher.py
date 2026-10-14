@@ -27,6 +27,7 @@ from server import serve_options
 
 from . import assembly, clients, paths
 from . import models as model_artifacts
+from . import serve_multi as _serve_multi
 
 ROOT = paths.ROOT
 RUNTIME_DIR = paths.RUNTIME
@@ -432,6 +433,58 @@ def parse_args(argv=None):
         help=f"HTTP port (default: SPLASH_PORT or {serve_options.DEFAULT_PORT})",
     )
     serve_options.add_serve_arguments(server, groups)
+    # Placed right after 'serve' so the help output groups them. Only the
+    # serve-multi-specific flags are parsed here; 'splash serve' flags are
+    # given after '--' and passed through to every engine instance.
+    serve_multi_parser = commands.add_parser(
+        "serve-multi",
+        help="serve multiple models; restart the engine when a request names another",
+        description="Load a JSON config of models, serve them on a single port, and "
+        "switch the native engine transparently when a request targets a "
+        "different model.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  splash serve-multi --config models.json\n"
+            "  splash serve-multi --config models.json -- --port 8001 --no-webui\n\n"
+            "models.json shape:\n"
+            '  {"models": [{"model": "OWNER/REPO", "aliases": ["alias"],'
+            ' "arguments": ["--max-context", "64000"]}, ...]}\n\n'
+            "Per-model 'arguments' pass extra 'splash serve' flags to that "
+            "model's engine. Flags after '--' apply to every engine and take "
+            "precedence over per-model values, flag by flag."
+        ),
+    )
+    serve_multi_parser.add_argument(
+        "--config",
+        required=True,
+        metavar="FILE",
+        help="JSON file listing the models to serve; see epilog for shape",
+    )
+    serve_multi_parser.add_argument(
+        "--switch-timeout",
+        type=float,
+        default=600.0,
+        metavar="SECONDS",
+        help=(
+            "seconds a request waits while its model loads; "
+            "503 is returned after this budget is exhausted (default 600)"
+        ),
+    )
+    serve_multi_parser.add_argument(
+        "--startup-timeout",
+        type=float,
+        default=0.0,
+        metavar="SECONDS",
+        help=(
+            "seconds to wait for an engine to become ready before killing "
+            "and restarting it; 0 waits until it is ready or exits, so a "
+            "first-time model download is never cut short (default 0)"
+        ),
+    )
+    # serve-multi has no --port of its own: every serve flag follows '--'.
+    # The default below still needs a port to report for this command.
+    serve_multi_parser.set_defaults(port=None)
     for name in clients.INSTALL_URLS:
         client = commands.add_parser(
             name,
@@ -472,7 +525,11 @@ def parse_args(argv=None):
 def main(argv=None):
     args = parse_args(argv)
     try:
-        return serve(args) if args.command == "serve" else coding_client(args)
+        if args.command == "serve":
+            return serve(args)
+        if args.command == "serve-multi":
+            return _serve_multi.serve_multi(args)
+        return coding_client(args)
     except (LauncherError, clients.ClientError, OSError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
