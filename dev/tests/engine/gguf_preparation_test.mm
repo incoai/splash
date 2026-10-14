@@ -65,7 +65,7 @@ std::vector<uint8_t> slice(const std::vector<uint8_t> &bytes, uint64_t offset, u
 // and the embedding's.
 void loadImages(MetalBackend &backend, model::WeightImages &images, const std::filesystem::path &path,
                 const model::QwenTargetDimensions &geometry) {
-  model::GgufTargetLoader loader(backend, images, path, geometry);
+  model::GgufTargetLoader loader(backend, images, {path}, geometry);
   for (uint32_t layer = 0; layer < geometry.layers; ++layer) static_cast<void>(loader.layer(layer));
   static_cast<void>(loader.head());
   static_cast<void>(loader.embedding());
@@ -398,7 +398,7 @@ void checkDenseTarget(MetalBackend &backend, const std::filesystem::path &direct
                                    {"token_embd.weight", kIQ4_XS}}),
             layout);
   model::WeightImages images(backend, "fixture");
-  model::GgufTargetLoader files(backend, images, model::findTargetGguf(target), layout);
+  model::GgufTargetLoader files(backend, images, model::findTargetGgufs(target), layout);
   const model::Qwen3_8Weights weights = model::loadQwen3_8Weights(backend, layout, files);
   check(weights.layers.size() == layout.layers, "GGUF target: every layer");
   check(weights.finalNorm.float32, "GGUF target: F32 final norm");
@@ -512,6 +512,78 @@ void checkRepack(MetalBackend &backend, const std::filesystem::path &directory, 
   }
 }
 
+// The draft head of a draft vocabulary through the production loader: each
+// token's row of the head's planes, byte for byte, then zero rows to the
+// tile's end, then the tokens; the same bytes once released and restored.
+void checkDraftHead(MetalBackend &backend, const std::filesystem::path &directory, bool converted = false) {
+  SmallTarget target = smallTarget(false);
+  const model::QwenTargetDimensions &g = target.geometry;
+  if (converted) {
+    std::mt19937 rng(253);
+    auto native = makeNative(NVFP4, g.vocabularySize, g.hiddenSize, rng);
+    setTensorScales(native, NVFP4, g.hiddenSize, [](uint32_t) { return 1.75F; });
+    Tensor &head = tensorNamed(target.tensors, "output.weight");
+    head.type = model::ggml::kNVFP4;
+    head.data = blockNvfp4Rows(native);
+    const float scale = 1.75F;
+    std::vector<uint8_t> bytes(sizeof(scale));
+    std::memcpy(bytes.data(), &scale, sizeof(scale));
+    target.tensors.push_back({"output.scale", {1}, model::ggml::kF32, bytes});
+  }
+  const auto path = directory / (converted ? "draft-head-nvfp4.gguf" : "draft-head.gguf");
+  writeGguf(path, target.tensors, g);
+  const std::vector<uint32_t> tokens{0, 1, 2, 5, 6, 7, 63, 64, 100, 200, 254, 255};
+  model::WeightImages images(backend, "fixture");
+  model::GgufTargetLoader loader(backend, images, {path}, g, tokens);
+  for (uint32_t layer = 0; layer < g.layers; ++layer) static_cast<void>(loader.layer(layer));
+  model::WeightFile head = loader.head();
+  static_cast<void>(model::readNorm(head, g.hiddenSize, true, "norm"));
+  const ops::QuantizedSegment full = model::readQuantizedSegment(head, "logits");
+  head.finish();
+  static_cast<void>(loader.embedding());
+  model::WeightFile drafts = loader.draftHead();
+  const ops::QuantizedSegment draft = model::readQuantizedSegment(drafts, "draft-logits");
+  const auto ids = drafts.section(tokens.size() * sizeof(uint32_t), "draft-tokens");
+  drafts.finish();
+  check(draft.formatId == full.formatId && draft.outputSize == QUANT_TILE_ROWS && draft.inputSize == g.hiddenSize,
+        "draft head: the head's format, whole tiles of rows");
+  // A row's bytes in each plane: [rows / T][units][T][unit bytes].
+  const QuantFormat &format = kQuantFormats[full.formatId];
+  const auto rowOf = [&](const ops::QuantizedSegment &segment, uint32_t row) {
+    std::vector<uint8_t> bytes;
+    const auto append = [&](const splash::metal::MetalBuffer &plane, uint32_t units, uint32_t unitBytes) {
+      const auto *data = static_cast<const uint8_t *>(plane.contents());
+      for (uint32_t unit = 0; unit < units; ++unit) {
+        const uint64_t at =
+            ((uint64_t{row / QUANT_TILE_ROWS} * units + unit) * QUANT_TILE_ROWS + row % QUANT_TILE_ROWS) * unitBytes;
+        bytes.insert(bytes.end(), data + at, data + at + unitBytes);
+      }
+    };
+    const uint32_t groups = segment.inputSize / 32;
+    append(segment.plane0, groups, format.plane0_bytes);
+    if (format.plane1_bytes) append(segment.plane1, groups, format.plane1_bytes);
+    append(segment.meta, groups / format.meta_groups, format.meta_bytes);
+    return bytes;
+  };
+  const auto draftRows = [&] {
+    std::vector<std::vector<uint8_t>> rows;
+    for (uint32_t row = 0; row < QUANT_TILE_ROWS; ++row) rows.push_back(rowOf(draft, row));
+    return rows;
+  };
+  const auto loaded = draftRows();
+  bool same = true, zero = true;
+  for (uint32_t row = 0; row < QUANT_TILE_ROWS; ++row)
+    if (row < tokens.size()) same &= loaded[row] == rowOf(full, tokens[row]);
+    else zero &= std::all_of(loaded[row].begin(), loaded[row].end(), [](uint8_t b) { return b == 0; });
+  check(same, "draft head: each token's row of the head, byte for byte");
+  check(zero, "draft head: zero rows past the tokens");
+  check(!std::memcmp(ids.contents(), tokens.data(), tokens.size() * sizeof(uint32_t)), "draft head: its tokens");
+  images.release();
+  while (!images.restore(splash::test::admitAll)) {
+  }
+  check(draftRows() == loaded, "draft head: the same rows once released and restored");
+}
+
 void checkExecutor(MetalBackend &backend, const std::filesystem::path &directory) {
   const Shape shapes[] = {{512, 1024, {}}, {768, 1280, {256, 16, 8, 4}}, {768, 8448, {128, 16, 8, 5}}};
   for (int s = 0; s < 3; ++s)
@@ -594,6 +666,8 @@ void checkFloatSources(MetalBackend &backend, const std::filesystem::path &direc
     for (const Fmt f : {NVFP4, FP8}) {
       const QuantFormat &layout = kQuantFormats[f];
       const uint32_t rows = 96, K = 1280, blocks = K / layout.block_elements;
+      // The rows padded with zero rows to whole tiles.
+      const uint32_t tiled = (rows + QUANT_TILE_ROWS - 1) / QUANT_TILE_ROWS * QUANT_TILE_ROWS;
       std::vector<uint8_t> native = makeNative(f, rows, K, rng);
       // compressed-tensors' g in every block: the F32 reciprocal of a global
       // scale (NVFP4), or each row's bf16 scale (FP8).
@@ -646,13 +720,13 @@ void checkFloatSources(MetalBackend &backend, const std::filesystem::path &direc
       source.scale = {g.file, g.offset, g.bytes, compressed && f == FP8 ? 1 : rows, g.dtype == "BF16",
                       compressed && f == NVFP4};
       std::vector<uint8_t> tile = native;
-      tile.resize(size_t(QUANT_TILE_ROWS) * rowBytes(f, K), 0);
+      tile.resize(size_t(tiled) * rowBytes(f, K), 0);
       std::vector<float> reference;
-      const Packed expected = repack(f, tile, QUANT_TILE_ROWS, K, &reference);
+      const Packed expected = repack(f, tile, tiled, K, &reference);
       reference.resize(size_t(rows) * K);
 
       model::gguf::ImageBuilder builder("float.bin", 0, 0);
-      model::gguf::Repack planes = builder.planes(f, QUANT_TILE_ROWS, K, "m");
+      model::gguf::Repack planes = builder.planes(f, tiled, K, "m");
       planes.sources.push_back(source);
       const model::gguf::Repack step = planes;
       builder.repack(std::move(planes));
@@ -817,6 +891,8 @@ int main(int argc, char **argv) {
     guarded("preparation of quantized alpha/beta", [&] { checkQuantizedAlphaBeta(backend, directory.path()); });
     guarded("llama.cpp NVFP4", [&] { checkGgufNvfp4(backend, directory.path()); });
     guarded("the target loader", [&] { checkDenseTarget(backend, directory.path()); });
+    guarded("a draft vocabulary's head", [&] { checkDraftHead(backend, directory.path()); });
+    guarded("a converted NVFP4 draft head", [&] { checkDraftHead(backend, directory.path(), true); });
     guarded("MLX sources", [&] { checkMlxSources(backend, directory.path(), argv[3]); });
     guarded("NVFP4 and FP8 sources", [&] { checkFloatSources(backend, directory.path()); });
     std::printf("%s (%d failures)\n", failures ? "GGUF preparation tests FAILED" : "GGUF preparation tests passed",

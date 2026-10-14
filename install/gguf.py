@@ -281,7 +281,11 @@ def tokenizer_files(metadata):
 
 # The GGUF text architectures Splash serves, and the model type of each one's
 # text configuration.
-TEXT_MODEL_TYPES = {"qwen35": "qwen3_5_text", "qwen35moe": "qwen3_5_moe_text"}
+TEXT_MODEL_TYPES = {
+    "qwen35": "qwen3_5_text",
+    "qwen35moe": "qwen3_5_moe_text",
+    "qwen4exp": "qwen4_exp_text",
+}
 
 
 def text_architecture(metadata):
@@ -509,6 +513,53 @@ FUSED_MOE_TENSORS = {
 } | {"ffn_gate_up_exps.weight": FORMAT_TYPES}
 
 
+# Qwen3.8-Flash-Next (qwen4exp): hyper-connections replace every norm, so a
+# layer has none of its own and the model no output norm; its full-attention
+# layers carry the QSA indexer, whose BF16 projections preparation widens to
+# the F32 values they equal; the PLE layers carry the n-gram embedding's
+# projections, norms and convolution.
+QWEN4_MODEL_TENSORS = {
+    "token_embd.weight": EMBEDDING_TYPES,
+    "output.weight": FORMAT_TYPES,
+    "output_hc_norm.weight": F32,
+    "output_hc_down.weight": FORMAT_TYPES,
+    "output_hc_up.weight": FORMAT_TYPES,
+}
+QWEN4_PLE_MODEL_TENSORS = {"per_layer_token_embd.weight": EMBEDDING_TYPES}
+QWEN4_LAYER_TENSORS = {
+    f"hc_{part}_{name}.weight": types
+    for part in ("attn", "ffn")
+    for name, types in (
+        ("norm", F32),
+        ("down", FORMAT_TYPES),
+        ("up", FORMAT_TYPES),
+        ("inject", F32),
+    )
+}
+QWEN4_INDEXER_TENSORS = {
+    "indexer.q_proj.weight": QUANTIZED_TYPES | {"F32", "BF16"},
+    "indexer.k_proj.weight": QUANTIZED_TYPES | {"F32", "BF16"},
+    "indexer.q_norm.weight": F32,
+    "indexer.k_norm.weight": F32,
+}
+QWEN4_PLE_TENSORS = {
+    "ple_key.weight": FORMAT_TYPES,
+    "ple_value.weight": FORMAT_TYPES,
+    "ple_norm_key.weight": F32,
+    "ple_norm_query.weight": F32,
+    "ple_norm_conv.weight": F32,
+    "ple_conv1d.weight": F32,
+}
+
+
+def ple_layers(metadata, arch):
+    """The layers a qwen4exp target's PLE n-gram embedding feeds, 0-based."""
+    layers = metadata.values.get(arch + ".ple.layers", [])
+    if type(layers) is not list or any(type(layer) is not int for layer in layers):
+        raise ModelError("invalid GGUF PLE layers")
+    return set(layers)
+
+
 def loaded_tensors(metadata):
     """Each tensor the native loader reads from the target that metadata
     describes, with the types it accepts. MTP layers are not loaded; every
@@ -517,6 +568,22 @@ def loaded_tensors(metadata):
     of the two."""
     arch = text_architecture(metadata)
     period = metadata.positive(arch + ".full_attention_interval")
+    if arch == "qwen4exp":
+        ple = ple_layers(metadata, arch)
+        tensors = dict(QWEN4_MODEL_TENSORS)
+        if ple:
+            tensors |= QWEN4_PLE_MODEL_TENSORS
+        for layer in range(loaded_layers(metadata, arch)):
+            attention = (layer + 1) % period == 0
+            mixer = (
+                ATTENTION_TENSORS | QWEN4_INDEXER_TENSORS if attention else GDN_TENSORS
+            )
+            parts = QWEN4_LAYER_TENSORS | mixer | MOE_TENSORS
+            if layer in ple:
+                parts |= QWEN4_PLE_TENSORS
+            for name, types in parts.items():
+                tensors[f"blk.{layer}.{name}"] = types
+        return tensors
     tensors = dict(MODEL_TENSORS)
     for layer in range(loaded_layers(metadata, arch)):
         mixer = ATTENTION_TENSORS if (layer + 1) % period == 0 else GDN_TENSORS
@@ -529,6 +596,32 @@ def loaded_tensors(metadata):
         for name, types in (LAYER_TENSORS | mixer | ffn).items():
             tensors[f"blk.{layer}.{name}"] = types
     return tensors
+
+
+def merged_split(headers):
+    """One target's metadata from the headers of its split files (llama.cpp's
+    gguf-split), in split order: the first file's keys, whose split.* keys
+    must describe these files, and every file's tensors."""
+    first = headers[0]
+    count = first.values.get("split.count", 1)
+    if type(count) is not int or count != len(headers):
+        raise ModelError("the GGUF's split files do not match its split.count")
+    tensors = {}
+    for number, header in enumerate(headers):
+        if len(headers) > 1 and (
+            header.values.get("split.no") != number
+            or header.values.get("split.count") != count
+        ):
+            raise ModelError(f"GGUF split file {number + 1} is out of order")
+        for name, kind in header.tensors.items():
+            if name in tensors:
+                raise ModelError("duplicate GGUF tensor across split files: " + name)
+            tensors[name] = kind
+    total = first.values.get("split.tensors.count", len(tensors))
+    if total != len(tensors):
+        raise ModelError("the GGUF's split files hold another number of tensors")
+    first.tensors = tensors
+    return first
 
 
 # Prism ML's input rotation of a dense target: the parameters and keys

@@ -13,6 +13,7 @@
 #include "model/ModelDescriptor.hpp"
 #include "model/WeightStore.hpp"
 
+#include <array>
 #include <filesystem>
 #include <initializer_list>
 #include <iostream>
@@ -108,7 +109,8 @@ void testFamilies(const std::filesystem::path &fixtures) {
   // The model type names the family; the sizes every source's config states
   // tell its target from other models of the architecture, which Splash does
   // not serve, such as Qwen3.5-4B.
-  constexpr std::string_view supported = "; supported: Qwen3.8-27B, Qwen3.6-35B-A3B";
+  constexpr std::string_view supported =
+      "; supported: Qwen3.8-27B, Qwen3.6-35B-A3B, Qwen3.8-Flash-Next";
   struct Refused final {
     std::string_view from, to, difference;
   };
@@ -517,6 +519,30 @@ void testConfigurationCheck(const std::filesystem::path &fixtures) {
     require(at != std::string::npos, "the GGUF metadata has no " + std::string(from));
     return metadata.replace(at, from.size(), to);
   };
+  // Qwen3.8-Flash-Next loads from a GGUF only and decodes without a draft;
+  // its metadata also states the hyper-connections, the QSA indexer and the
+  // PLE n-gram embedding.
+  const std::string flashConfig = text(fixtures / "qwen3.8-flash-next" / "config.json");
+  const std::string flashMetadata = text(fixtures / "qwen3.8-flash-next" / "gguf-metadata.json");
+  require(check("gguf", "none", flashConfig, flashMetadata, std::nullopt) == "Qwen3.8-Flash-Next",
+          "Qwen3.8-Flash-Next's GGUF config and metadata were not found to be its family");
+  rejects([&] { static_cast<void>(check("gguf", "none", flashConfig, flashMetadata, dense.draft)); },
+          "this model decodes without a DFlash2 draft, but a draft config was given",
+          "a family without a draft accepted one");
+  rejects([&] { static_cast<void>(check("mlx-affine", "none", flashConfig, std::nullopt, std::nullopt)); },
+          "Qwen3.8-Flash-Next loads from a GGUF only", "Qwen3.8-Flash-Next was accepted from MLX");
+  for (const auto &[from, to, error] : std::initializer_list<std::array<std::string_view, 3>>{
+           {R"("qwen4exp.hyper_connection.count": 4)", R"("qwen4exp.hyper_connection.count": 2)",
+            "GGUF metadata does not match the target: hyper_connection.count 2 (expected 4)"},
+           {R"("qwen4exp.attention.indexer.top_k": 2048)", R"("qwen4exp.attention.indexer.top_k": 1024)",
+            "GGUF metadata does not match the target: attention.indexer.top_k 1024 (expected 2048)"}}) {
+    std::string metadata = flashMetadata;
+    const size_t at = metadata.find(from);
+    require(at != std::string::npos, "the GGUF metadata has no " + std::string(from));
+    metadata.replace(at, from.size(), to);
+    rejects([&] { static_cast<void>(check("gguf", "none", flashConfig, metadata, std::nullopt)); }, error,
+            "Qwen3.8-Flash-Next accepted metadata the kernels do not compute");
+  }
   struct RefusedMetadata final {
     std::string_view config;
     const std::string &metadata;
@@ -577,7 +603,7 @@ int main(int argc, char **argv) {
     testQuantization(argv[1]);
     testVisionConfig(argv[1]);
     testConfigurationCheck(argv[1]);
-    std::cout << "model configuration: both families, sources, one rule per value, quantization, vision, the "
+    std::cout << "model configuration: every family, sources, one rule per value, quantization, vision, the "
                  "installer's check PASS\n";
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';

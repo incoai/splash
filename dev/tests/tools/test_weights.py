@@ -3,6 +3,7 @@ import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from dev.benchmarks import weights
 
@@ -117,6 +118,29 @@ class WeightBytesTests(unittest.TestCase):
                 weights.prepared(environment, MODEL_ROOT),
                 {"target/layer-0.bin": A, "vision/model.bin": B},
             )
+
+    def test_derived_draft_head_rechecks_all_original_images(self):
+        baseline, candidate = Path("base"), Path("candidate")
+        for original, passed in (
+            ({"target/head.bin": A}, True),
+            ({"target/head.bin": B}, False),
+        ):
+            with (
+                patch.object(weights, "loads_in_memory", return_value=True),
+                patch.object(
+                    weights,
+                    "digests",
+                    side_effect=[
+                        {"target/head.bin": A},
+                        {"target/head.bin": A, "target/draft-head.bin": C},
+                        original,
+                    ],
+                ) as digests,
+            ):
+                result = weights.compare_builds(baseline, candidate, MODEL_ROOT, {})
+            self.assertEqual(result["pass"], passed)
+            self.assertEqual(result["derived_images"], {"target/draft-head.bin": C})
+            self.assertEqual(digests.call_args.kwargs, {"draft_vocabulary": False})
 
     def test_compare_builds_reads_each_baseline_as_it_loads(self):
         with TemporaryDirectory() as directory:

@@ -313,12 +313,16 @@ uint64_t copyBytes(const gguf::Copy &copy) {
 
 // The tasks that write a copy into image, each of whole rows within
 // kLoadStepBytes or, for a wider row, a piece of whole values (whole native
-// blocks of rows a reader builds) of one row: a copy as stored reads in
-// place, a converted one through its thread's staging.
+// blocks of rows a reader builds, whole blocks of a GGUF tensor decoded to
+// F32) of one row: a copy as stored reads in place, a converted one through
+// its thread's staging.
 void addCopyTasks(uint8_t *image, const gguf::Copy &copy,
                   std::vector<std::function<void(std::vector<uint8_t> &)>> &tasks) {
   const gguf::TensorRows &rows = copy.source;
-  const uint64_t unit = rowReader(rows) == RowReader::Stored ? 4 : nativeFormat(rows).block_bytes;
+  const uint64_t unit = rowReader(rows) != RowReader::Stored ? nativeFormat(rows).block_bytes
+                        : copy.conversion == gguf::Conversion::DequantizeToFloat32
+                            ? kQuantFormats[gguf_format_of(rows.type)].block_bytes
+                            : 4;
   const uint64_t span = std::min<uint64_t>(rows.rowBytes, kLoadStepBytes / unit * unit);
   const uint64_t batch = span == rows.rowBytes ? kLoadStepBytes / rows.rowBytes : 1;
   for (uint64_t first = 0; first < rows.rows; first += batch) {
@@ -389,7 +393,7 @@ RepackChunk repackChunk(const gguf::Repack &repack) {
 // shape, sources of its row width and planes inside the image.
 void requireRepack(const gguf::Repack &repack, uint64_t imageBytes) {
   if (repack.format >= GGUF_FMT_COUNT || !repack.rows || repack.rows % QUANT_TILE_ROWS || !repack.columns ||
-      repack.columns % kGgufBlockColumns)
+      repack.columns % ggufColumnUnit(kQuantFormats[repack.format]))
     throw GgufError("invalid prepared weight repack");
   const QuantFormat &format = kQuantFormats[repack.format];
   const uint64_t rowBytes = ggufRowBytes(format, repack.columns);

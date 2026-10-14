@@ -61,13 +61,36 @@ in Chat. Anthropic Messages requests reason only when they set `thinking`.
 
 ## Models
 
-Splash supports these model families, with a matching DFlash2 draft selected
-automatically:
+Splash supports these model families, with a matching DFlash2 draft (or, for
+Qwen3.8-Flash-Next, its MTP head) selected automatically:
 
 | Model | GGUF example | MLX 4-bit |
 | --- | --- | --- |
 | Qwen3.8-27B | `unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M` | `mlx-community/Qwen3.8-27B-4bit` |
 | Qwen3.6-35B-A3B | `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M` | `mlx-community/Qwen3.6-35B-A3B-4bit` |
+| Qwen3.8-Flash-Next | `unsloth/Qwen3.8-Flash-Next-GGUF:UD-Q4_K_XL` | — |
+
+Qwen3.8-Flash-Next has no DFlash2 draft: it drafts with the MTP head Unsloth
+publishes beside the GGUF (`MTP/mtp-*-shared-Q8_0.gguf`), which the first run
+downloads with the model. Greedy MTP decoding is target-controlled; sampled
+decoding preserves the target distribution. Within a build, a lone seeded
+request repeats with the same cached prefixes and configuration. Its stream
+need not match the base build; batching or different cached prefixes can also
+change it. `SPLASH_MTP=0` turns MTP off.
+Adaptive depth defaults to a cap of seven proposals; `SPLASH_MTP_DRAFTS=1`–`7`
+sets the cap. `SPLASH_MTP_ADAPTIVE=0` fixes the depth (default three).
+By default, greedy and sampled batches draft from the vocabulary plus each
+request's context, falling back to the whole head when coverage is poor.
+`SPLASH_MTP_DRAFT_VOCAB=0` uses the whole head. Adaptive batches use the
+common acceptance-threshold depth, including constrained sampling. Head and
+threshold decisions use token history rather than timings. Fixed mode keeps
+its configured depth. Vision runs from the repository's
+`mmproj-BF16.gguf`. `UD-Q4_K_XL` needs about 118 GB of Metal memory; its SSD cache
+(`--max-cache-disk`) keeps GDN states but not KV pages.
+
+```bash
+splash serve --model unsloth/Qwen3.8-Flash-Next-GGUF:UD-Q4_K_XL
+```
 
 Unsloth GGUF variants span **1–8 bits**, including mixed-precision UD formats
 up to `UD-Q8_K_XL`, whose BF16 tensors load too. Whole-BF16 and F16 models are
@@ -80,7 +103,8 @@ including mixed precision, mxfp4 or nvfp4. NVIDIA's and unsloth's NVFP4
 checkpoints and NVFP4 GGUFs also load. Smaller variants run on
 [24 GB Macs](docs/performance.md#smaller-ggufs-on-24-gb-macs).
 [27B variants](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/tree/main) ·
-[35B variants](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/tree/main)
+[35B variants](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/tree/main) ·
+[Flash-Next variants](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/main)
 
 Vision and the tokenizer come from the target model's source.
 [Model loading and compatibility](DEVELOPMENT.md#upstream-model-loading) ·

@@ -274,8 +274,9 @@ public:
   }
 
   // One store and attention of the fixture's rows, encoded as the runtime
-  // encodes them.
-  void addGraph(metal::CommandGraph &graph, const ops::PrefillAttentionPlan &attention) const {
+  // encodes them, with QSA bitmaps for a GQA-12 shape when mask has words.
+  void addGraph(metal::CommandGraph &graph, const ops::PrefillAttentionPlan &attention,
+                ops::QsaMask mask = {}) const {
     const kv::ChunkedPrefillParams chunk = ops::PagedAttention::prefillParams(
         plan_.histories[0], plan_.rows, plan_.stride, plan_.pages[0]);
     ops::PagedAttention::addPrefillStore(graph, layer_, buffer(Tensor::ChunkKeys),
@@ -283,10 +284,12 @@ public:
                                          plan_.layout());
     ops::PagedAttention::addPrefill(graph, layer_, buffer(Tensor::Queries),
                                     buffer(Tensor::Output), buffer(Tensor::Partials),
-                                    buffer(Tensor::Statistics), tables_[0], chunk, attention);
+                                    buffer(Tensor::Statistics), tables_[0], chunk, attention,
+                                    std::move(mask));
   }
   // Each lane's rows are its verify rows, in the verify chunk stride.
-  void addGraph(metal::CommandGraph &graph, const ops::VerifyAttentionPlan &attention) const {
+  void addGraph(metal::CommandGraph &graph, const ops::VerifyAttentionPlan &attention,
+                ops::QsaMask mask = {}) const {
     if (plan_.rows != kv::kVerifyRows || plan_.stride != kv::kVerifyChunkStride)
       throw std::logic_error(
           "a verify fixture stages its lanes' verify rows in the verify chunk stride");
@@ -298,7 +301,7 @@ public:
         graph, layer_,
         {buffer(Tensor::ChunkKeys), buffer(Tensor::ChunkValues), buffer(Tensor::Queries),
          buffer(Tensor::Partials), buffer(Tensor::Statistics), buffer(Tensor::Output), tables_},
-        std::span(chunks).first(attention.lanes), attention);
+        std::span(chunks).first(attention.lanes), attention, std::move(mask));
   }
 
   [[nodiscard]] const AttentionFixturePlan &plan() const noexcept { return plan_; }

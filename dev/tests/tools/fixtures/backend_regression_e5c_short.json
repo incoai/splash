@@ -1,0 +1,158 @@
+{
+  "measurements": [
+    {
+      "scenario": "short",
+      "sample": 0,
+      "prompt_tokens": 480,
+      "target_prefill_rows": 480,
+      "cache_status": "miss",
+      "matched_tokens": 0,
+      "wall_ms": 332.19,
+      "ttft_ms": 332.187,
+      "prefill_gpu_ms": 323.633,
+      "decode_gpu_ms": 0,
+      "draft_context_rows": 480,
+      "draft_context_rows_avoided": 0,
+      "draft_state_restore_skipped": 0,
+      "junction_materializations": 0,
+      "output_tokens": [
+        5513
+      ]
+    },
+    {
+      "scenario": "short",
+      "sample": 0,
+      "prompt_tokens": 512,
+      "target_prefill_rows": 512,
+      "cache_status": "miss",
+      "matched_tokens": 0,
+      "wall_ms": 335.485,
+      "ttft_ms": 335.481,
+      "prefill_gpu_ms": 329.186,
+      "decode_gpu_ms": 0,
+      "draft_context_rows": 512,
+      "draft_context_rows_avoided": 0,
+      "draft_state_restore_skipped": 0,
+      "junction_materializations": 0,
+      "output_tokens": [
+        220
+      ]
+    },
+    {
+      "scenario": "short",
+      "sample": 0,
+      "prompt_tokens": 544,
+      "target_prefill_rows": 544,
+      "cache_status": "miss",
+      "matched_tokens": 0,
+      "wall_ms": 371.392,
+      "ttft_ms": 371.389,
+      "prefill_gpu_ms": 363.206,
+      "decode_gpu_ms": 0,
+      "draft_context_rows": 544,
+      "draft_context_rows_avoided": 0,
+      "draft_state_restore_skipped": 0,
+      "junction_materializations": 0,
+      "output_tokens": [
+        5513
+      ]
+    },
+    {
+      "scenario": "short",
+      "sample": 0,
+      "prompt_tokens": 640,
+      "target_prefill_rows": 640,
+      "cache_status": "miss",
+      "matched_tokens": 0,
+      "wall_ms": 442.838,
+      "ttft_ms": 442.835,
+      "prefill_gpu_ms": 435.365,
+      "decode_gpu_ms": 0,
+      "draft_context_rows": 640,
+      "draft_context_rows_avoided": 0,
+      "draft_state_restore_skipped": 0,
+      "junction_materializations": 0,
+      "output_tokens": [
+        5513
+      ]
+    },
+    {
+      "scenario": "short",
+      "sample": 0,
+      "prompt_tokens": 672,
+      "target_prefill_rows": 672,
+      "cache_status": "miss",
+      "matched_tokens": 0,
+      "wall_ms": 461.267,
+      "ttft_ms": 461.262,
+      "prefill_gpu_ms": 453.664,
+      "decode_gpu_ms": 0,
+      "draft_context_rows": 672,
+      "draft_context_rows_avoided": 0,
+      "draft_state_restore_skipped": 0,
+      "junction_materializations": 0,
+      "output_tokens": [
+        5513
+      ]
+    },
+    {
+      "scenario": "short",
+      "sample": 0,
+      "prompt_tokens": 1024,
+      "target_prefill_rows": 1024,
+      "cache_status": "miss",
+      "matched_tokens": 0,
+      "wall_ms": 616.706,
+      "ttft_ms": 616.702,
+      "prefill_gpu_ms": 609.397,
+      "decode_gpu_ms": 0,
+      "draft_context_rows": 1024,
+      "draft_context_rows_avoided": 0,
+      "draft_state_restore_skipped": 0,
+      "junction_materializations": 0,
+      "output_tokens": [
+        5513
+      ]
+    },
+    {
+      "scenario": "short",
+      "sample": 0,
+      "prompt_tokens": 1536,
+      "target_prefill_rows": 1536,
+      "cache_status": "miss",
+      "matched_tokens": 0,
+      "wall_ms": 978.322,
+      "ttft_ms": 978.318,
+      "prefill_gpu_ms": 972.228,
+      "decode_gpu_ms": 0,
+      "draft_context_rows": 1536,
+      "draft_context_rows_avoided": 0,
+      "draft_state_restore_skipped": 0,
+      "junction_materializations": 0,
+      "output_tokens": [
+        5513
+      ]
+    },
+    {
+      "scenario": "short",
+      "sample": 0,
+      "prompt_tokens": 2016,
+      "target_prefill_rows": 2016,
+      "cache_status": "miss",
+      "matched_tokens": 0,
+      "wall_ms": 1267.99,
+      "ttft_ms": 1267.99,
+      "prefill_gpu_ms": 1260.5,
+      "decode_gpu_ms": 0,
+      "draft_context_rows": 2016,
+      "draft_context_rows_avoided": 0,
+      "draft_state_restore_skipped": 0,
+      "junction_materializations": 0,
+      "output_tokens": [
+        5513
+      ]
+    }
+  ],
+  "performance_pass": true,
+  "performance_failures": []
+}

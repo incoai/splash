@@ -8,7 +8,7 @@ too. The native benchmark's decode, partial, short and transcripts scenarios
 (baseline, candidate, candidate, baseline) on this machine, which must be
 otherwise idle:
 
-- outputs: every width's output_token_hash and accepted/drafted counts and
+- outputs: every width's output_token_hash and
   every partial, short and transcript request's output tokens are identical in
   all four rounds. The decode requests ask for counting, and the partial and
   short ones for a token after random tokens, which a change in the target's
@@ -34,7 +34,9 @@ otherwise idle:
   reported.
 - weight bytes: after the rounds both builds load the model's weight images
   once more and must hold the same images with the same bytes
-  (weights.compare_builds). A baseline of an earlier release prepares into a
+  (weights.compare_builds). If only the candidate adds a derived draft-vocabulary
+  head, it re-loads with that head disabled and compares all original images;
+  the derived image is reported separately. A baseline of an earlier release prepares into a
   cache of its own, <output dir>/baseline-weights.
 
 The candidate's own benchmark invariants must hold too, and the baseline must
@@ -232,11 +234,16 @@ def round_record(version: str, documents: list[dict], scenarios) -> dict:
                 partial[measurement["scenario"]].append(request)
             elif measurement["scenario"] in transcripts:
                 transcripts[measurement["scenario"]].append(request)
-            elif (
-                measurement["scenario"] == "short"
-                and measurement["prompt_tokens"] - 1 in short
-            ):
-                short[measurement["prompt_tokens"] - 1].append(request)
+            elif measurement["scenario"] == "short":
+                # Captured prefills run the whole prompt. Prefer the actual
+                # row count; older prompts held one extra final-token row.
+                rows = measurement.get(
+                    "target_prefill_rows", measurement["prompt_tokens"] - 1
+                )
+                if rows not in short and rows == measurement["prompt_tokens"]:
+                    rows -= 1
+                if rows in short:
+                    short[rows].append(request)
     measured = {
         "decode": decode,
         "partial": partial,
@@ -290,16 +297,11 @@ def metrics(rounds: list[dict]) -> dict:
 
 
 def outputs(record: dict) -> dict:
-    """What must repeat: per width and sample the output hash and draft
-    counts, per partial, short and transcript request its output tokens."""
+    """Token identity only; draft choices can change proposal counts."""
     result = {}
     for width, samples in record["decode"].items():
         for sample in samples:
-            result[f"B{width} sample {sample['sample']}"] = (
-                sample["output_token_hash"],
-                sample["accepted_draft_tokens"],
-                sample["drafted_tokens"],
-            )
+            result[f"B{width} sample {sample['sample']}"] = sample["output_token_hash"]
     for scenario, requests in record["partial"].items():
         for request in requests:
             result[f"{scenario} sample {request['sample']}"] = tuple(

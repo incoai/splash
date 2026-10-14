@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "status": "legacy generation; historical inputs unrecorded",
+  "source_vocabulary": 248320,
+  "selected_tokens": 32768,
+  "bitmap_encoding": "little-endian uint64 words, bit token%64 of word token/64",
+  "bitmap_sha256": "c1da752b2c83811c346b738f87df52641f38182eee9b01537a89a265d9352796",
+  "generated_cpp_sha256": "cb00bf0dfc085c121dde8afc2bdef9bb21f75bc96e52b27192aa1fa565c4f3f6",
+  "tokenizer_revision": null,
+  "corpus_revisions": null,
+  "exact_invocation": null,
+  "generator": "dev/tools/draft_vocabulary.py",
+  "note": "The original inputs cannot be reconstructed from the checked-in bitmap. Future generation emits a manifest with tokenizer/corpus/code content hashes, package versions and the exact invocation. Vocabulary size is a performance compatibility assumption, not a tokenizer identity check."
+}

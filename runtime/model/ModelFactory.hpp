@@ -26,7 +26,7 @@ namespace splash::model {
 class QwenStateStorage;
 class VisionLoader;
 
-using TargetWeights = std::variant<Qwen3_8Weights, Qwen3_6MoeWeights>;
+using TargetWeights = std::variant<Qwen3_8Weights, Qwen3_6MoeWeights, Qwen4ExpWeights>;
 
 struct LoadedModel final {
   ModelDescriptor descriptor;
@@ -40,6 +40,8 @@ struct LoadedModel final {
   [[nodiscard]] const std::string &name() const noexcept {
     return descriptor.name;
   }
+  // Whether a DFlash2 draft runs (ModelDescriptor::hasDraft).
+  [[nodiscard]] bool hasDraft() const noexcept { return descriptor.hasDraft(); }
   [[nodiscard]] kv::Layout targetKvLayout(kv::Format format) const noexcept {
     auto layout = descriptor.targetKvLayout;
     layout.format = format;

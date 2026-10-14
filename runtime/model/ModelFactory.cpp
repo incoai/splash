@@ -1,12 +1,16 @@
 #include "ModelFactory.hpp"
 #include "model/DraftCheckpoint.hpp"
 #include "model/GgufTarget.hpp"
+#include "model/Qwen4DraftVocabulary.hpp"
 #include "model/QwenTargetLoader.hpp"
 #include "model/SafetensorsTarget.hpp"
 #include "model/VisionLoader.hpp"
 
+#include <deque>
 #include <functional>
+#include <optional>
 #include <stdexcept>
+#include <type_traits>
 #include <vector>
 
 namespace splash::model {
@@ -40,19 +44,40 @@ QwenVisionWeights loadVisionWeights(metal::MetalBackend &backend, WeightImages &
 namespace {
 
 TargetWeights readTarget(metal::MetalBackend &backend, const Qwen3_8Layout &layout,
-                         const QwenTargetFiles &files) {
+                         const QwenTargetFiles &files, GgufMtpLoader *) {
   return loadQwen3_8Weights(backend, layout, files);
 }
 
 TargetWeights readTarget(metal::MetalBackend &backend, const Qwen3_6MoeLayout &layout,
-                         const QwenTargetFiles &files) {
+                         const QwenTargetFiles &files, GgufMtpLoader *) {
   return loadQwen3_6MoeWeights(backend, layout, files);
+}
+
+TargetWeights readTarget(metal::MetalBackend &backend, const Qwen4ExpLayout &layout,
+                         const QwenTargetFiles &files, GgufMtpLoader *mtp) {
+  return loadQwen4ExpWeights(backend, layout, files, mtp);
+}
+
+// The one GGUF of a Qwen3.8-Flash-Next MTP head, in mtp/ beside target/.
+std::filesystem::path findMtpGguf(const std::filesystem::path &root) {
+  const auto files = findTargetGgufs(root / "mtp");
+  if (files.size() != 1) throw std::invalid_argument("mtp/ must hold one GGUF");
+  return files.front();
 }
 
 uint64_t imageBytes(const std::vector<gguf::Image> &images) {
   uint64_t total = 0;
   for (const gguf::Image &image : images) total += image.bytes;
   return total;
+}
+
+// The draft vocabulary a target's MTP head drafts from: none but for a
+// Qwen3.8-Flash-Next layout that names one.
+template <class Layout> std::span<const uint32_t> draftTokens(const Layout &layout) {
+  if constexpr (std::is_same_v<Layout, Qwen4ExpLayout>)
+    return qwen4DraftVocabulary(layout.mtpDraftTokens);
+  else
+    return {};
 }
 
 } // namespace
@@ -69,24 +94,36 @@ LoadedModel loadModel(metal::MetalBackend &backend,
   // Every source's metadata is checked before the first image is written:
   // the vision tower's and the draft's here, the target's by its loader.
   const auto vision = planVisionLoader(root, result.descriptor);
-  DraftCheckpointLoader draft(backend, images, root / "draft", result.descriptor.draft);
+  std::optional<DraftCheckpointLoader> draft;
+  if (result.descriptor.hasDraft()) draft.emplace(backend, images, root / "draft", result.descriptor.draft);
+  // Qwen3.8-Flash-Next's MTP head, from mtp/ beside target/.
+  std::unique_ptr<GgufMtpLoader> mtp;
+  if (const auto *qwen4 = std::get_if<Qwen4ExpLayout>(&result.descriptor.target); qwen4 && qwen4->mtpLayers)
+    mtp = std::make_unique<GgufMtpLoader>(backend, images, findMtpGguf(root), *qwen4);
   result.target = std::visit(
       [&](const auto &layout) -> TargetWeights {
         const std::filesystem::path directory = root / "target";
         switch (result.descriptor.targetSource) {
         case TargetSource::Safetensors: {
-          SafetensorsTargetLoader loader(backend, images, directory, layout);
-          return readTarget(backend, layout, std::ref(loader));
+          if constexpr (std::is_same_v<std::remove_cvref_t<decltype(layout)>, Qwen4ExpLayout>) {
+            throw std::invalid_argument("Qwen3.8-Flash-Next loads from a GGUF only");
+          } else {
+            SafetensorsTargetLoader loader(backend, images, directory, layout);
+            return readTarget(backend, layout, std::ref(loader), mtp.get());
+          }
         }
         case TargetSource::Gguf: {
-          GgufTargetLoader loader(backend, images, findTargetGguf(directory), layout);
-          return readTarget(backend, layout, std::ref(loader));
+          GgufTargetLoader loader(backend, images, findTargetGgufs(directory), layout, draftTokens(layout));
+          return readTarget(backend, layout, std::ref(loader), mtp.get());
         }
         }
         throw std::invalid_argument("unknown target source");
       },
       result.descriptor.target);
-  result.draft = loadDFlashDraftWeights(backend, draft, result.descriptor.draft);
+  if (draft)
+    result.draft = loadDFlashDraftWeights(backend, *draft, result.descriptor.draft);
+  else
+    result.draft.layout = result.descriptor.draft;
   result.vision = loadVisionWeights(backend, images, vision.get());
 
   std::vector<WeightFileRecord> records(result.targetFiles().begin(),
@@ -103,16 +140,28 @@ LoadedModel loadModel(metal::MetalBackend &backend,
 uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor) {
   uint64_t bytes = 0;
   if (descriptor.targetSource == TargetSource::Gguf) {
-    WeightSource source(findTargetGguf(root / "target"));
-    const GgufFile file(source);
+    std::deque<WeightSource> sources;
+    std::vector<WeightSource *> files;
+    for (const std::filesystem::path &path : findTargetGgufs(root / "target"))
+      files.push_back(&sources.emplace_back(path));
+    const GgufFile file(files);
     bytes = std::visit(
         [&](const auto &layout) { return imageBytes(gguf::planImages(file, layout)); },
         descriptor.target);
+    if (const auto *qwen4 = std::get_if<Qwen4ExpLayout>(&descriptor.target); qwen4 && qwen4->mtpLayers) {
+      WeightSource mtp(findMtpGguf(root));
+      bytes += gguf::planMtpImage(GgufFile(mtp), *qwen4).bytes;
+      if (qwen4->mtpDraftTokens) bytes += gguf::planDraftHeadImage(file, *qwen4, draftTokens(*qwen4)).bytes;
+    }
   } else {
-    bytes = std::visit([&](const auto &layout) { return safetensorsTargetImageBytes(root / "target", layout); },
-                       descriptor.target);
+    bytes = std::visit([&](const auto &layout) -> uint64_t {
+      if constexpr (std::is_same_v<std::remove_cvref_t<decltype(layout)>, Qwen4ExpLayout>)
+        throw std::invalid_argument("Qwen3.8-Flash-Next loads from a GGUF only");
+      else
+        return safetensorsTargetImageBytes(root / "target", layout);
+    }, descriptor.target);
   }
-  bytes += draftImageBytes(root / "draft", descriptor.draft);
+  if (descriptor.hasDraft()) bytes += draftImageBytes(root / "draft", descriptor.draft);
   if (descriptor.hasVision())
     bytes += visionImageBytes(descriptor.vision);
   return bytes;

@@ -652,6 +652,50 @@ void penalties(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes,
 // stop there with the same correction and next anchor. Sampled lanes accept
 // a one-hot draft token while its uniform is below the token's penalized
 // probability.
+// The same acceptance uniform can accept different deterministic proposals
+// under the same target distribution. Distribution correctness therefore
+// does not imply seeded identity across changes to the drafting policy.
+void proposalDependentSeededOutput(MetalBackend &backend) {
+  constexpr uint32_t vocabulary = 16, lanes = 2;
+  Sampling sampling(vocabulary);
+  const Batch batch = makeBatch(backend, vocabulary, lanes);
+  AcceptanceBuffers acceptance{
+      allocate(backend, lanes * kPositions * sizeof(uint32_t)),
+      batch.buffers.draftCandidates, batch.buffers.draftProbabilities,
+      batch.buffers.vocabularyRows, batch.buffers.uniforms, batch.buffers.outputTokens,
+      allocate(backend, lanes * sizeof(uint32_t)), allocate(backend, lanes * sizeof(uint32_t))};
+  auto *proposed = static_cast<uint32_t *>(acceptance.proposedTokens.contents());
+  auto *ids = static_cast<uint32_t *>(acceptance.candidates.contents());
+  auto *probs = static_cast<float *>(acceptance.proposalProbabilities.contents());
+  std::fill(ids, ids + lanes * kPositions * kDraftCandidates, vocabulary);
+  std::fill(probs, probs + lanes * kPositions * kDraftCandidates, 0.0F);
+  std::fill(batch.uniforms(), batch.uniforms() + lanes * kUniforms, 0.3F);
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    const uint32_t proposal = 3 + lane;
+    for (uint32_t row = 0; row < kRows; ++row) {
+      float *logits = batch.row(lane * kRows + row);
+      std::fill(logits, logits + vocabulary, -INFINITY);
+      logits[3] = std::log(0.6F);
+      logits[4] = std::log(0.4F);
+      batch.inputTokens()[lane * kRows + row] = row ? proposal : 7;
+    }
+    for (uint32_t position = 0; position < kPositions; ++position) {
+      const uint32_t index = lane * kPositions + position;
+      proposed[index] = ids[index * kDraftCandidates] = proposal;
+      probs[index * kDraftCandidates] = 1.0F;
+    }
+  }
+  const std::array<SamplingPolicy, lanes> policies{SamplingPolicy{0, 1.0F, 1.0F},
+                                                SamplingPolicy{0, 1.0F, 1.0F}};
+  const std::array<uint32_t, lanes> remaining{2, 2};
+  CommandGraph graph;
+  sampling.addVerify(graph, policies, batch.buffers, 1, 2, {});
+  sampling.addAcceptance(graph, acceptance, remaining, policies, 1, 2);
+  static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+  require(batch.outputTokens()[0] == 3 && batch.outputTokens()[kRows] == 4,
+          "identical uniforms must expose proposal-dependent sampled output");
+}
+
 void speculativeExactness(MetalBackend &backend, uint32_t samplingMask) {
   constexpr uint32_t vocabulary = 1003;
   constexpr uint32_t lanes = 2;
@@ -2611,6 +2655,8 @@ int main(int argc, char **argv) {
               std::to_string(samplingMask);
       speculativeExactness(backend, samplingMask);
     }
+    stage = "proposal-dependent seeded output";
+    proposalDependentSeededOutput(backend);
     stage = "non-finite rows";
     nonFiniteRowsSelectTheSentinel(backend);
     stage = "ties";

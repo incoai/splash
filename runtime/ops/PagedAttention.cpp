@@ -2,6 +2,7 @@
 
 #include "metal/abi/RoPE.h"
 #include "ops/BufferExtent.hpp"
+#include "metal/abi/Qwen4.h"
 
 #include <algorithm>
 #include <array>
@@ -13,7 +14,7 @@
 namespace splash::ops {
 namespace {
 
-enum class KernelLayout : uint8_t { Kv4Group6, Kv2Group8 };
+enum class KernelLayout : uint8_t { Kv4Group6, Kv2Group8, Kv2Group12 };
 
 // One thread per gate element, across rows x query heads x head dimension.
 uint64_t gateGroups(uint64_t rows, uint32_t queryHeads, uint32_t headDimension) {
@@ -39,12 +40,41 @@ KernelLayout attentionKernelLayout(uint32_t queryHeads, kv::Layout layout) {
   if ((result == KernelLayout::Kv4Group6 && queryHeads == 24) ||
       (result == KernelLayout::Kv2Group8 && queryHeads == 16))
     return result;
+  // Qwen3.8-Flash-Next: 24 query heads over two KV heads; its KV storage is
+  // the two-head layout's.
+  if (result == KernelLayout::Kv2Group8 && queryHeads == 24) return KernelLayout::Kv2Group12;
   throw std::invalid_argument("no paged-attention kernel for layout");
+}
+
+// The kernels of a group of twelve (kernels/*/attention_*.metal _kv2_g12),
+// by their group-of-eight name; the KV stores depend on the KV heads alone.
+constexpr std::pair<std::string_view, std::string_view> kGroup12Kernels[] = {
+    {"prefill_attention_q8_split_kv2_g8", "prefill_attention_q8_split_kv2_g12"},
+    {"prefill_attention_bf16_split_kv2_g8", "prefill_attention_bf16_split_kv2_g12"},
+    {"prefill_attention_reduce_kv2_g8", "prefill_attention_reduce_kv2_g12"},
+    {"prefill_attention_qkv_kv2_g8", "prefill_attention_qkv_kv2_g12"},
+    {"prefill_attention_gate_kv2_g8", "prefill_attention_gate_kv2_g12"},
+    {"verify_attention_q8_split_kv2_g8", "verify_attention_q8_split_kv2_g12"},
+    {"verify_attention_bf16_split_kv2_g8", "verify_attention_bf16_split_kv2_g12"},
+    {"verify_attention_reduce_kv2_g8", "verify_attention_reduce_kv2_g12"},
+    {"verify_attention_qkv_kv2_g8", "verify_attention_qkv_kv2_g12"},
+    {"verify_attention_gate_kv2_g8", "verify_attention_gate_kv2_g12"},
+    // The table gates' suffix (verify_attention_gate_table16_kv2_g12, ...).
+    {"_kv2_g8", "_kv2_g12"},
+};
+
+// The GQA-12 split kernels, which also bind the QSA bitmaps.
+bool masked(std::string_view pipeline) noexcept {
+  return pipeline.ends_with("_split_kv2_g12");
 }
 
 std::string_view pipeline(KernelLayout layout, std::string_view kv4Group6,
                           std::string_view kv2Group8) noexcept {
-  return layout == KernelLayout::Kv4Group6 ? kv4Group6 : kv2Group8;
+  if (layout == KernelLayout::Kv4Group6) return kv4Group6;
+  if (layout == KernelLayout::Kv2Group12)
+    for (const auto &[group8, group12] : kGroup12Kernels)
+      if (group8 == kv2Group8) return group12;
+  return kv2Group8;
 }
 
 // One dispatch normalizes both the queries and the keys, so their norms must
@@ -353,7 +383,7 @@ void PagedAttention::addPrefill(
     metal::MetalBuffer queries, metal::MetalBuffer output,
     metal::MetalBuffer partials, metal::MetalBuffer statistics,
     metal::MetalBuffer pageTable, const kv::ChunkedPrefillParams &chunk,
-    const PrefillAttentionPlan &plan) {
+    const PrefillAttentionPlan &plan, QsaMask mask) {
   if (chunk.chunk_tokens != plan.rows)
     throw std::invalid_argument("prefill attention rows do not match plan");
   const std::string_view error = kv::chunkedPrefillValidationError(chunk);
@@ -371,9 +401,15 @@ void PagedAttention::addPrefill(
   const kv::PrefillAttentionParams params{
       chunk.committed_tokens, chunk.chunk_tokens, chunk.chunk_stride,
       chunk.page_table_entries, layer, plan.splits};
-  graph.add(std::string(plan.splitPipeline),
-            {std::move(queries), partials, statistics, std::move(pageTable)},
-            params, plan.splitGroups);
+  if (masked(plan.splitPipeline))
+    graph.add(std::string(plan.splitPipeline),
+              {std::move(queries), partials, statistics, std::move(pageTable)}, params,
+              {mask.words ? mask.bits : partials}, Qwen4QsaMaskParams{mask.words, mask.row0},
+              plan.splitGroups);
+  else
+    graph.add(std::string(plan.splitPipeline),
+              {std::move(queries), partials, statistics, std::move(pageTable)},
+              params, plan.splitGroups);
   graph.add(std::string(plan.reducePipeline),
             {std::move(partials), std::move(statistics), std::move(output)},
             params, plan.reduceGroups);
@@ -382,7 +418,7 @@ void PagedAttention::addPrefill(
 void PagedAttention::addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
                                PagedVerifyBuffers buffers,
                                std::span<const kv::ChunkedPrefillParams> chunks,
-                               const VerifyAttentionPlan &plan) {
+                               const VerifyAttentionPlan &plan, QsaMask mask) {
   constexpr uint32_t maximumLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
   if (chunks.size() != plan.lanes || buffers.pageTables.size() != maximumLanes) {
     throw std::invalid_argument("invalid paged verify batch");
@@ -415,10 +451,17 @@ void PagedAttention::addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
             {buffers.chunkKeys, buffers.chunkValues, tables[0], tables[1], tables[2],
              tables[3]},
             stores, plan.storeGroups_, plan.storeThreads_);
-  graph.add(std::string(plan.splitPipeline),
-            {buffers.queries, buffers.partials, buffers.statistics, tables[0],
-             tables[1], tables[2], tables[3]},
-            attention, plan.splitGroups);
+  if (masked(plan.splitPipeline))
+    graph.add(std::string(plan.splitPipeline),
+              {buffers.queries, buffers.partials, buffers.statistics, tables[0],
+               tables[1], tables[2], tables[3]},
+              attention, {mask.words ? mask.bits : buffers.partials},
+              Qwen4QsaMaskParams{mask.words, mask.row0}, plan.splitGroups);
+  else
+    graph.add(std::string(plan.splitPipeline),
+              {buffers.queries, buffers.partials, buffers.statistics, tables[0],
+               tables[1], tables[2], tables[3]},
+              attention, plan.splitGroups);
   graph.add(std::string(plan.reducePipeline),
             {buffers.partials, buffers.statistics, buffers.output},
             attention, plan.reduceGroups);

@@ -111,6 +111,51 @@ class BackendRegressionTests(unittest.TestCase):
         self.assertTrue(summary["pass"])
         self.assertEqual(sorted(summary["speed"]), sorted(decode_and_partial))
 
+    def test_captured_prefill_short_rows_from_e5c_baseline(self):
+        # One sample of each short case from the passing M5 e5ce29f round.
+        fixture = json.loads(
+            (
+                Path(__file__).parent / "fixtures/backend_regression_e5c_short.json"
+            ).read_text()
+        )
+
+        def captured_prefills(document):
+            document["measurements"] = [
+                m for m in document["measurements"] if m["scenario"] != "short"
+            ] + fixture["measurements"]
+
+        records = rounds(dict.fromkeys(range(4), captured_prefills))
+        summary = regression.summarize(records, False)
+        self.assertTrue(summary["pass"], summary["failures"])
+        for measurement in fixture["measurements"]:
+            rows = measurement["target_prefill_rows"]
+            self.assertEqual(rows, measurement["prompt_tokens"])
+            self.assertEqual(len(records[0]["short"][rows]), 1)
+            self.assertEqual(
+                summary["speed"][f"short_{rows}_rows_prefill_gpu_ms"]["baseline"],
+                measurement["prefill_gpu_ms"],
+            )
+
+        # A missing case still fails; it cannot borrow a neighbouring prompt.
+        document = benchmark_document()
+        captured_prefills(document)
+        document["measurements"] = [
+            m for m in document["measurements"] if m.get("target_prefill_rows") != 512
+        ]
+        with self.assertRaisesRegex(regression.RegressionError, "lacks short samples"):
+            regression.round_record("baseline", [document], regression.SCENARIOS)
+
+    def test_legacy_short_prompts_report_the_extra_final_row(self):
+        # Before captured prefills, total rows included the final one-row
+        # command; the timing buckets named the preceding chunk's rows.
+        document = benchmark_document()
+        for measurement in document["measurements"]:
+            if measurement["scenario"] == "short":
+                measurement["target_prefill_rows"] = measurement["prompt_tokens"]
+        record = regression.round_record("baseline", [document], regression.SCENARIOS)
+        for rows in regression.SHORT:
+            self.assertEqual(len(record["short"][rows]), 2)
+
     def test_speed_regressions_fail_per_metric(self):
         def slower(field, factor, scenario=None, width=None, tokens=None):
             def change(document):
@@ -214,6 +259,18 @@ class BackendRegressionTests(unittest.TestCase):
             with self.subTest(round=index):
                 summary = regression.summarize(rounds({index: changed_output}), True)
                 self.assertTrue(any("did not repeat" in f for f in summary["failures"]))
+
+    def test_adaptive_counts_do_not_change_token_repeatability(self):
+        def adaptive(document):
+            for sample in document["decode_throughput"]["samples"]:
+                sample["drafted_tokens"] = 48
+                sample["accepted_draft_tokens"] = 39
+
+        # Both within-build repeats and the cross-build comparison retain hashes.
+        self.assertTrue(regression.summarize(rounds({2: adaptive}), False)["pass"])
+        self.assertTrue(
+            regression.summarize(rounds({1: adaptive, 2: adaptive}), False)["pass"]
+        )
 
     def test_identity_is_compared_within_each_build(self):
         # Two builds may load different layouts of one model: allowed.

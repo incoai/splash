@@ -18,6 +18,7 @@ backend_regression passes it.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -34,7 +35,7 @@ def loads_in_memory(build: Path) -> bool:
     return (Path(build) / WEIGHT_DIGESTS).is_file()
 
 
-def digests(build: Path, model_root: Path) -> dict:
+def digests(build: Path, model_root: Path, *, draft_vocabulary=True) -> dict:
     """The SHA-256 of each image, by component, that the build directory's
     engine loads from model_root."""
     tool = Path(build) / WEIGHT_DIGESTS
@@ -42,6 +43,7 @@ def digests(build: Path, model_root: Path) -> dict:
         [str(tool), str(Path(build) / "splash.metallib"), str(model_root)],
         capture_output=True,
         text=True,
+        env=None if draft_vocabulary else {**os.environ, "SPLASH_MTP_DRAFT_VOCAB": "0"},
     )
     if result.returncode:
         raise RuntimeError(
@@ -112,4 +114,20 @@ def compare_builds(
         images = prepared(environment, model_root)
     else:
         raise RuntimeError(f"the baseline build has no {WEIGHT_DIGESTS}")
-    return compare(images, digests(candidate, model_root))
+    candidate_images = digests(candidate, model_root)
+    derived = "target/draft-head.bin"
+    if candidate_images.keys() - images.keys() == {derived}:
+        # The subset projection is derived from the target's output head.
+        # Re-load with that optimization off to compare every original image;
+        # never waive a difference in shared target/draft/vision weights.
+        original = digests(candidate, model_root, draft_vocabulary=False)
+        result = compare(images, original)
+        enabled = compare(
+            original,
+            {key: value for key, value in candidate_images.items() if key != derived},
+        )
+        result["failures"].extend(enabled["failures"])
+        result["pass"] = not result["failures"]
+        result["derived_images"] = {derived: candidate_images[derived]}
+        return result
+    return compare(images, candidate_images)

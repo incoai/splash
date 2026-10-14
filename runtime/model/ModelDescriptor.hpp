@@ -4,6 +4,7 @@
 #include "Model.hpp"
 #include "Qwen3_6Moe.hpp"
 #include "Qwen3_8.hpp"
+#include "Qwen4Exp.hpp"
 #include "ops/Vision.hpp"
 
 #include <cstdint>
@@ -15,7 +16,7 @@
 
 namespace splash::model {
 
-using TargetLayout = std::variant<Qwen3_8Layout, Qwen3_6MoeLayout>;
+using TargetLayout = std::variant<Qwen3_8Layout, Qwen3_6MoeLayout, Qwen4ExpLayout>;
 
 // Where a model's weights come from: a safetensors checkpoint (MLX's, Model
 // Optimizer's or compressed-tensors') or a GGUF, prepared into images when it
@@ -38,6 +39,9 @@ struct ModelDescriptor final {
   // Container selection belongs to loading; runtime dispatch follows each weight.
   TargetSource targetSource{};
   VisionSource visionSource{};
+  // False for a family no DFlash2 draft was trained for (nullDraftLayout,
+  // Qwen3.8-Flash-Next): no draft loads or runs.
+  bool draftModel = true;
   // The SHA-256 of the record that names the digest of every source file,
   // an assembly's model.json, which the installer verifies at every start
   // (inspectModelRoot): what every image is written from
@@ -52,6 +56,7 @@ struct ModelDescriptor final {
   [[nodiscard]] std::string_view family() const noexcept {
     return std::visit([](const auto &layout) { return layout.family; }, target);
   }
+  [[nodiscard]] bool hasDraft() const noexcept { return draftModel; }
   [[nodiscard]] bool valid() const noexcept;
 };
 
@@ -80,5 +85,12 @@ inspectSourceConfiguration(std::string_view targetFormat, std::string_view visio
                            const std::filesystem::path &config,
                            const std::optional<std::filesystem::path> &ggufMetadata,
                            const std::optional<std::filesystem::path> &draft);
+
+// The draft layout of a target that decodes without a DFlash2 draft: no draft
+// model runs, but the engine's composite state keeps its one-layer,
+// eight-wide ring, so the state and cache bookkeeping stay those of a draft
+// (a few tens of KiB per state).
+[[nodiscard]] DFlashDraftLayout nullDraftLayout(uint32_t hiddenSize, uint32_t vocabularySize,
+                                                uint32_t capturedHiddenSize);
 
 } // namespace splash::model

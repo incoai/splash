@@ -4,6 +4,7 @@
 //   gguf-planner
 #include "GgufFixtures.hpp"
 #include "metal/abi/Gguf.h"
+#include "model/Qwen4DraftVocabulary.hpp"
 
 #include <optional>
 
@@ -360,6 +361,63 @@ void checkRotation(const std::filesystem::path &directory) {
   }
 }
 
+// A draft vocabulary's head: the head's rows of its tokens as one repack of
+// a source per run of consecutive tokens, whole tiles of rows, then the
+// tokens; tokens out of order, repeated or past the vocabulary refused. And
+// Qwen3.8's draft vocabulary itself.
+void checkDraftHead(const std::filesystem::path &directory) {
+  const SmallTarget target = smallTarget(false);
+  const model::QwenTargetDimensions &g = target.geometry;
+  const auto path = directory / "draft-head.gguf";
+  writeGguf(path, target.tensors, g);
+  model::WeightSource source(path);
+  const model::GgufFile gguf(source);
+  const model::GgufTensor &head = gguf.require("output.weight");
+  const std::vector<uint32_t> tokens{0, 1, 2, 5, 100, 101, 255};
+  const model::gguf::Image image = model::gguf::planDraftHeadImage(gguf, g, tokens);
+  const uint64_t rowBytes = head.bytes / g.vocabularySize;
+  bool runs = image.repacks.size() == 1 && image.repacks[0].rows == QUANT_TILE_ROWS &&
+              image.repacks[0].columns == g.hiddenSize && image.repacks[0].sources.size() == 4;
+  const std::pair<uint32_t, uint32_t> expected[] = {{0, 3}, {5, 1}, {100, 2}, {255, 1}};
+  for (size_t i = 0; runs && i < 4; ++i) {
+    const model::gguf::TensorRows &rows = image.repacks[0].sources[i];
+    runs = rows.offset == head.offset && rows.first == expected[i].first && rows.rows == expected[i].second &&
+           rows.rowBytes == rowBytes && rows.name == "output.weight";
+  }
+  check(runs, "draft head: a source per run of consecutive tokens, whole tiles of rows");
+  const auto ids = std::find_if(image.fills.begin(), image.fills.end(), [&](const model::gguf::Fill &fill) {
+    return fill.bytes.size() == tokens.size() * sizeof(uint32_t);
+  });
+  check(ids != image.fills.end() && !std::memcmp(ids->bytes.data(), tokens.data(), ids->bytes.size()),
+        "draft head: the tokens after the rows");
+  for (const std::vector<uint32_t> &bad : {std::vector<uint32_t>{2, 1}, std::vector<uint32_t>{3, 3},
+                                          std::vector<uint32_t>{0, 256}, std::vector<uint32_t>{}}) {
+    bool refused = false;
+    try {
+      static_cast<void>(model::gguf::planDraftHeadImage(gguf, g, bad));
+    } catch (const model::GgufError &) {
+      refused = true;
+    }
+    check(refused, "draft head: refuses tokens out of order, repeated, past the vocabulary or none");
+  }
+
+  const std::span<const uint32_t> vocabulary = model::qwen4DraftVocabulary(model::kQwen4DraftVocabularyTokens);
+  check(vocabulary.size() == model::kQwen4DraftVocabularyTokens &&
+            std::is_sorted(vocabulary.begin(), vocabulary.end()) &&
+            std::adjacent_find(vocabulary.begin(), vocabulary.end()) == vocabulary.end() &&
+            vocabulary.back() < model::kQwen4DraftVocabularySource,
+        "Qwen3.8's draft vocabulary: its tokens, ascending, within the vocabulary");
+  bool members = std::all_of(vocabulary.begin(), vocabulary.end(), model::inQwen4DraftVocabulary);
+  // Token 0 (what a row without a finite logit drafts), the stop tokens and
+  // the chat template's, tool-call and thinking tokens.
+  for (const uint32_t token : {0u, 248044u, 248045u, 248046u, 248058u, 248059u, 248066u, 248067u, 248068u, 248069u})
+    members &= model::inQwen4DraftVocabulary(token);
+  check(members && !model::inQwen4DraftVocabulary(model::kQwen4DraftVocabularySource),
+        "Qwen3.8's draft vocabulary: token 0, the stop, chat template, tool-call and thinking tokens");
+  check(model::qwen4DraftVocabulary(0).empty() && model::qwen4DraftTokensFor(1000) == 0,
+        "no draft vocabulary for another vocabulary");
+}
+
 } // namespace
 
 int main() {
@@ -370,6 +428,7 @@ int main() {
     guarded("planner on quantized alpha/beta", [&] { checkQuantizedAlphaBeta(directory.path()); });
     guarded("planner on the rotary metadata", [&] { checkRotary(directory.path()); });
     guarded("planner on a rotated target", [&] { checkRotation(directory.path()); });
+    guarded("planner on a draft vocabulary's head", [&] { checkDraftHead(directory.path()); });
     std::printf("%s (%d failures)\n", failures ? "GGUF planner tests FAILED" : "GGUF planner tests passed", failures);
     return failures ? 1 : 0;
   }
