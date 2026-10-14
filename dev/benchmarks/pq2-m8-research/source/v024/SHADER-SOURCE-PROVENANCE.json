@@ -1,0 +1,20 @@
+{
+  "parent": "/Users/zaiyang/bonsai-pq2-research/splash-110/runtime/metal/kernels/shared/gguf_linear.metal",
+  "parent_sha256": "0f662b680671260a4574b8ad4c5f16367c31d1b255248b6501394fd47cc532bd",
+  "prefix_sha256": "6500e50a51d263e01e7c08b12bfd0af3f826e61512d088a23e1c81f5c5f8923a",
+  "candidate_sha256": "eb9c929e172b08153fe14864d567b435da0e3f70f51cb05a4359ac097b4174f4",
+  "wrapper_old": "  gguf_decode_tile<F, Rows, Ep>(input, w0, w1, meta, output, partials, counters, aux, p, group, simd_lane, simd_group,",
+  "wrapper_new": "  const uint q = group.x + 80 * group.y;\n  const uint2 logicalGroup = uint2(q >> 1, q & 1);\n  gguf_decode_tile<F, Rows, Ep>(input, w0, w1, meta, output, partials, counters, aux, p, logicalGroup, simd_lane, simd_group,",
+  "helpers_original": true,
+  "threadgroup_position_ABI": "uint2 (production); grid.z remains1",
+  "physical_grid": [
+    80,
+    2,
+    1
+  ],
+  "threads": [
+    64,
+    1,
+    1
+  ]
+}

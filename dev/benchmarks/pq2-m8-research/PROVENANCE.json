@@ -1,0 +1,247 @@
+{
+  "research_checkpoint_commit": "9106779861eefaeaebdbc78ba9ff16e9e71f3777",
+  "tested_production_base": "3e1f9ece3e2528f3eb46b82a05911591f34a4317",
+  "qualification_scope": "target-only M8 forward, prefix128",
+  "copies": [
+    {
+      "path": "EXTERNAL-DEPENDENCIES.json",
+      "bytes": 1987,
+      "sha256": "d77c5bc0d9f612a80375b84425a7e87b55151b62654ec85d342462ee51a19508",
+      "source": "/Users/zaiyang/Documents/Codex/2026-09-22/pro-exp-q4km-notes-handoff-md/artifacts/verify-forward-wrap-20261001/verify-forward-20261001/EXTERNAL-DEPENDENCIES.json",
+      "copy_byte_exact": true
+    },
+    {
+      "path": "source/v024/candidate2.metal",
+      "bytes": 12325,
+      "sha256": "d06822dd1a311e009feb3f73ae9af452e17ebdb5ff3c0733287317b2d9df2bfc",
+      "source": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/candidate2.metal",
+      "copy_byte_exact": true
+    },
+    {
+      "path": "source/v024/candidate-source.diff",
+      "bytes": 1979,
+      "sha256": "b3e81849e3312fc2e616d1ff281859e93c7e78a55f397d6bef681a1e1d648eef",
+      "source": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/candidate-source.diff",
+      "copy_byte_exact": true
+    },
+    {
+      "path": "source/v024/SOURCE-INVERSE.json",
+      "bytes": 2069,
+      "sha256": "90623f813fdaa65502174c5423aa9081ea61af4ece8b81dda26461a977e0eadb",
+      "source": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/SOURCE-INVERSE.json",
+      "copy_byte_exact": true
+    },
+    {
+      "path": "source/v024/SHADER-HELPER-INVERSE.json",
+      "bytes": 1475,
+      "sha256": "dd3a458aee4723049a0ffd4d8e45e2532cfd4854f154aa2530f0c86992e9cc85",
+      "source": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/SHADER-HELPER-INVERSE.json",
+      "copy_byte_exact": true
+    },
+    {
+      "path": "source/v024/SHADER-SOURCE-PROVENANCE.json",
+      "bytes": 939,
+      "sha256": "d660118f0ac510cef2d75db63369a0d9149af54c3fae97099208cb81aa4e5b1c",
+      "source": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/SHADER-SOURCE-PROVENANCE.json",
+      "copy_byte_exact": true
+    },
+    {
+      "path": "source/v024/BUILD-IDENTITY.json",
+      "bytes": 8836,
+      "sha256": "c624c926b7b5d6489f646bb8e2ecff0795fccefec68ee6d83d7b2f588b169428",
+      "source": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/BUILD-IDENTITY.json",
+      "copy_byte_exact": true
+    },
+    {
+      "path": "source/v024/verify_host.mm",
+      "bytes": 15980,
+      "sha256": "57c1154a74f581ea5103aecb6fa04717cd1acd84e9b6ff80a657b00a06d14d09",
+      "source": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/verify_host.mm",
+      "copy_byte_exact": true
+    },
+    {
+      "path": "source/v024/FROZEN-GRAPH-CLOSURE.json",
+      "bytes": 2648,
+      "sha256": "9facb25af87622520d6f6c6454fbc0db6ad98637c246e23622dd255d0135bd9c",
+      "source": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/FROZEN-GRAPH-CLOSURE.json",
+      "copy_byte_exact": true
+    },
+    {
+      "path": "source/v025/forward_analysis.py.txt",
+      "bytes": 4734,
+      "sha256": "367173bdef6f0aa1a54b4faa6033274869f34019d3d889e06927d46135527175",
+      "source": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v025-forward-down-controller-prep/forward_analysis.py",
+      "copy_byte_exact": true
+    },
+    {
+      "path": "source/v025/kat1.py.txt",
+      "bytes": 3660,
+      "sha256": "c9cf5d78143f457b6ffa11dce61ab5d04ee3bf74751cb2025b071ef89c14b824",
+      "source": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v025-forward-down-controller-prep/kat1.py",
+      "copy_byte_exact": true
+    },
+    {
+      "path": "source/v025/FROZEN-SOURCE-PINS.json",
+      "bytes": 455,
+      "sha256": "bd9fb4f3ef3bddd950646b8b3dd476432366ebce621cfed0dbb78cbe8b0d0888",
+      "source": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v025-forward-down-controller-prep/FROZEN-SOURCE-PINS.json",
+      "copy_byte_exact": true
+    },
+    {
+      "path": "source/v025/KAT-RESULT.json",
+      "bytes": 2518,
+      "sha256": "3b4ff735edd7cb1b04625aff2e253bfb32ce7a42367f7a5f9a1ef58851852a41",
+      "source": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v025-forward-down-controller-prep/KAT-RESULT.json",
+      "copy_byte_exact": true
+    },
+    {
+      "path": "source/v025/CONTROLLER-AST-REVIEW.json",
+      "bytes": 356,
+      "sha256": "aa35234267758978a876e37b344615675827827c517d3e8cc62280f4e6670d96",
+      "source": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v025-forward-down-controller-prep/CONTROLLER-AST-REVIEW.json",
+      "copy_byte_exact": true
+    },
+    {
+      "path": "reports/FULL-FORWARD-ANALYSIS-FREEZE.json",
+      "bytes": 1444,
+      "sha256": "44cffdd0998a8b5390ec568ad38a563a7645aaa7e65c9814f92dd8ba19241d14",
+      "source": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/reports/verify-forward-20260930T1805Z/FULL-FORWARD-ANALYSIS-FREEZE.json",
+      "copy_byte_exact": true
+    },
+    {
+      "path": "source/v024/source/runtime/model/PrivateLegacyRtnPins.hpp",
+      "bytes": 98058,
+      "sha256": "248460f2690716de899be5a052c7fe1cec336f020a4f82793b9ad0b6bb81a21d",
+      "source": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/source/runtime/model/PrivateLegacyRtnPins.hpp",
+      "copy_byte_exact": true
+    },
+    {
+      "path": "source/v024/source/runtime/model/Runtime.hpp",
+      "bytes": 4168,
+      "sha256": "b59f29300b837ae64743864ee093cbfad465e26579bdf3260717ad71112ecbda",
+      "source": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/source/runtime/model/Runtime.hpp",
+      "copy_byte_exact": true
+    },
+    {
+      "path": "source/v024/source/runtime/model/V024ExpectedGraph.hpp",
+      "bytes": 105275,
+      "sha256": "3c78f6e238663afde9e3f941fa161b3d52bcfce8f32b7197dd45a6c982e7caa7",
+      "source": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/source/runtime/model/V024ExpectedGraph.hpp",
+      "copy_byte_exact": true
+    },
+    {
+      "path": "source/v024/source/runtime/model/Runtime.mm",
+      "bytes": 128655,
+      "sha256": "35b76f453e6c3ebb0d301eefab15cf4a3ae949da46b217a755df91f2859af700",
+      "source": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/source/runtime/model/Runtime.mm",
+      "copy_byte_exact": true
+    },
+    {
+      "path": "source/v024/source/runtime/model/PrivateLegacyRtnDescriptor.hpp",
+      "bytes": 5794,
+      "sha256": "dd26dad90a76a4faf72cbed58926ae99fe5f9766e91e1f33dbc5f314463f1cb6",
+      "source": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/source/runtime/model/PrivateLegacyRtnDescriptor.hpp",
+      "copy_byte_exact": true
+    },
+    {
+      "path": "source/v024/source/runtime/ops/LinearGguf.cpp",
+      "bytes": 29597,
+      "sha256": "1923c465d045f910d5016adb52d5c054df1c76829797b09418429d845e46e281",
+      "source": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v024-forward-down-mapping-prep/source/runtime/ops/LinearGguf.cpp",
+      "copy_byte_exact": true
+    },
+    {
+      "path": "evidence/v004/RESULT.md",
+      "bytes": 1036,
+      "sha256": "eb1ef0fbfd0fcbb7db569b91ef7fbda6fb74574659b6f6acfc1c232d789c882a",
+      "source": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v004-target-forward-qualification-prep/RESULT.md",
+      "copy_byte_exact": true
+    },
+    {
+      "path": "evidence/v004/ROOT-NUMERIC-REVIEW.json",
+      "bytes": 6842,
+      "sha256": "a7ad544ecc80a928fe88120fd02951ed781ce5b51624df6227441a46b95827da",
+      "source": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v004-target-forward-qualification-prep/ROOT-NUMERIC-REVIEW.json",
+      "copy_byte_exact": true
+    },
+    {
+      "path": "evidence/v006/ROOT-INDEPENDENT-STATISTICS.json",
+      "bytes": 10443,
+      "sha256": "0c7e348ed29336a8d7836af6749f72b544558f61d1dc8c012f3f59549912b8ca",
+      "source": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v006-pq2-target-forward-screen/ROOT-INDEPENDENT-STATISTICS.json",
+      "copy_byte_exact": true
+    },
+    {
+      "path": "evidence/v006/SCREEN-ANALYSIS.json",
+      "bytes": 10556,
+      "sha256": "0c3eb395b064f1090b32f9cd7dc9b7a2c85d33ddde505c2b4c6100a249c48709",
+      "source": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v006-pq2-target-forward-screen/SCREEN-ANALYSIS.json",
+      "copy_byte_exact": true
+    },
+    {
+      "path": "evidence/v007/ROOT-INDEPENDENT-STATISTICS.json",
+      "bytes": 9527,
+      "sha256": "d7bbce541a403b9526971bfec058acc6c36159499d18182f22db7427f19d4245",
+      "source": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v007-rtn-target-forward-screen/ROOT-INDEPENDENT-STATISTICS.json",
+      "copy_byte_exact": true
+    },
+    {
+      "path": "evidence/v007/SCREEN-ANALYSIS.json",
+      "bytes": 10035,
+      "sha256": "3af2514fab95a85dd88e33cd43cf283e87dc1c6288aea2f720ed797f4ca30ab4",
+      "source": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v007-rtn-target-forward-screen/SCREEN-ANALYSIS.json",
+      "copy_byte_exact": true
+    },
+    {
+      "path": "evidence/v026/RESULT.md",
+      "bytes": 1488,
+      "sha256": "02961ea83c74fcf609c52d63e469fd8dd234d45323bb0648b003e0ffff39a4b8",
+      "source": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v026-forward-down-numeric/RESULT.md",
+      "copy_byte_exact": true
+    },
+    {
+      "path": "evidence/v026/ROOT-REVIEW.json",
+      "bytes": 10230,
+      "sha256": "b25977d11024be4b98d98eef6b4b0addeb98c0631e1bb4ec172ea53b29a77576",
+      "source": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v026-forward-down-numeric/ROOT-REVIEW.json",
+      "copy_byte_exact": true
+    },
+    {
+      "path": "evidence/v027/RESULT.md",
+      "bytes": 1810,
+      "sha256": "87a8a9e557e9c0fc50fc3aa2b3fdca660e4a2af3d5137456a13d4ac024990578",
+      "source": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v027-forward-down-screen/RESULT.md",
+      "copy_byte_exact": true
+    },
+    {
+      "path": "evidence/v027/ROOT-REVIEW.json",
+      "bytes": 22744,
+      "sha256": "732afd9433500c8d50d6e3cbba4d405f62ee838832e823b3bcfe06b60f5d91af",
+      "source": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v027-forward-down-screen/ROOT-REVIEW.json",
+      "copy_byte_exact": true
+    },
+    {
+      "path": "evidence/v027/SCREEN-ANALYSIS.json",
+      "bytes": 11362,
+      "sha256": "6ea46ef1ae97051ffc9de0a349f28a86fee6e763249c8fb9ccd9daf76837f965",
+      "source": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-v027-forward-down-screen/SCREEN-ANALYSIS.json",
+      "copy_byte_exact": true
+    },
+    {
+      "path": "source/r233-half-gather.metal",
+      "bytes": 6587,
+      "sha256": "73cc4bc58f0f9801754f3e4dde72a4c2ee172786329023d30f16b840e59b4f3b",
+      "source": "/Users/zaiyang/bonsai-pq2-research/bonsai2-study/raw/task-r233-gather-half-construction-prep/candidate.metal",
+      "copy_byte_exact": true
+    },
+    {
+      "path": "evidence/r238/INDEPENDENT-PAIRED-REVIEW.json",
+      "bytes": 4667,
+      "sha256": "665a2030aa9f47fe2afb96c8b7c3562a9e6701ae9a3da3be9bf292c9660413f8",
+      "source": "/Users/zaiyang/Documents/Codex/2026-09-22/pro-exp-q4km-notes-handoff-md/artifacts/bonsai-profile-acquisition-20260929/air-materialization/R238-INDEPENDENT-PAIRED-REVIEW.json",
+      "copy_byte_exact": true
+    }
+  ],
+  "new_pair_spread_excluded": true,
+  "no_weights_binaries_raw_arrays_or_runtime_authority": true
+}

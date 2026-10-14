@@ -1,0 +1,137 @@
+{
+  "status": "PASS",
+  "cases": [
+    {
+      "case": "gain",
+      "pass_check": true
+    },
+    {
+      "case": "regression",
+      "pass_check": true
+    },
+    {
+      "case": "neutral",
+      "pass_check": true
+    },
+    {
+      "case": "gain_boundary",
+      "pass_check": true
+    },
+    {
+      "case": "gain_outside",
+      "pass_check": true
+    },
+    {
+      "case": "wins6",
+      "pass_check": true
+    },
+    {
+      "case": "regression_boundary",
+      "pass_check": true
+    },
+    {
+      "case": "AA_median_0.99",
+      "pass_check": true
+    },
+    {
+      "case": "AA_median_1.01",
+      "pass_check": true
+    },
+    {
+      "case": "AA_median_0.9899999999999999",
+      "pass_check": true
+    },
+    {
+      "case": "AA_median_1.0100000000000002",
+      "pass_check": true
+    },
+    {
+      "case": "AA_block_0.97",
+      "pass_check": true
+    },
+    {
+      "case": "AA_block_1.03",
+      "pass_check": true
+    },
+    {
+      "case": "AA_block_0.9700000000000001",
+      "pass_check": true
+    },
+    {
+      "case": "AA_block_1.0299999999999998",
+      "pass_check": true
+    },
+    {
+      "case": "route_AA_False",
+      "pass_check": true
+    },
+    {
+      "case": "route_AA_True",
+      "pass_check": true
+    },
+    {
+      "case": "thermal",
+      "pass_check": true
+    },
+    {
+      "case": "ratio_of_means_not_mean_of_ratios",
+      "pass_check": true
+    },
+    {
+      "case": "even_median",
+      "pass_check": true
+    },
+    {
+      "case": "invalid_missing",
+      "pass_check": true
+    },
+    {
+      "case": "invalid_duplicate",
+      "pass_check": true
+    },
+    {
+      "case": "invalid_gpu_seconds_0",
+      "pass_check": true
+    },
+    {
+      "case": "invalid_gpu_seconds_-1",
+      "pass_check": true
+    },
+    {
+      "case": "invalid_gpu_seconds_nan",
+      "pass_check": true
+    },
+    {
+      "case": "invalid_gpu_seconds_inf",
+      "pass_check": true
+    },
+    {
+      "case": "invalid_position_3",
+      "pass_check": true
+    },
+    {
+      "case": "invalid_half_1",
+      "pass_check": true
+    },
+    {
+      "case": "invalid_selected_64",
+      "pass_check": true
+    },
+    {
+      "case": "parse_complete",
+      "pass_check": true
+    },
+    {
+      "case": "parse_missing_completion",
+      "pass_check": true
+    },
+    {
+      "case": "parse_malformed",
+      "pass_check": true
+    }
+  ],
+  "count": 32,
+  "analyzer_sha256": "367173bdef6f0aa1a54b4faa6033274869f34019d3d889e06927d46135527175",
+  "no_runtime_data": true,
+  "no_GPU": true
+}

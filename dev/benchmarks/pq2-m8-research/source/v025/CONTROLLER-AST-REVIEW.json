@@ -1,0 +1,22 @@
+{
+  "unchanged": [
+    "sha",
+    "save",
+    "ps",
+    "foreign_workload",
+    "same",
+    "bind_targets",
+    "disk_snapshot",
+    "disk_preflight",
+    "stop_owned_targets",
+    "command",
+    "workload_preflight",
+    "model_stats"
+  ],
+  "changed": [
+    "live",
+    "check_phase"
+  ],
+  "controller_imported": false,
+  "controller_executed": false
+}

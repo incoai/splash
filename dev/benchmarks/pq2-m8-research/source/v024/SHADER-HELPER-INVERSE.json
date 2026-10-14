@@ -1,0 +1,30 @@
+{
+  "original_prefix_inverse_PASS": true,
+  "exception_exact_unused_prefill_line_removed": "constant constexpr uint kPrefillStages = 2 * GGUF_TILE_COLUMNS * GGUF_PREFILL_STEP;\n",
+  "helper_pins": [
+    {
+      "path": "/Users/zaiyang/bonsai-pq2-research/splash-110/runtime/metal/kernels/common/gguf_staged_tile.h",
+      "resolved": "/Users/zaiyang/bonsai-pq2-research/splash-110/runtime/metal/kernels/common/gguf_staged_tile.h",
+      "bytes": 7002,
+      "sha256": "13eb51f4400d808d370fdc0b3b4e1736729d8448f7e6d7ae70a682257b2735ea",
+      "dev": 16777231,
+      "ino": 46219754,
+      "mtime_ns": "1790464762679600699",
+      "ctime_ns": "1790464762679600699"
+    },
+    {
+      "path": "/Users/zaiyang/bonsai-pq2-research/splash-110/runtime/metal/kernels/common/split_reduce.h",
+      "resolved": "/Users/zaiyang/bonsai-pq2-research/splash-110/runtime/metal/kernels/common/split_reduce.h",
+      "bytes": 2013,
+      "sha256": "c0d08d399022edba686509d7d96df4fde2e3065dd9cae5f2219de1eee85f7f89",
+      "dev": 16777231,
+      "ino": 46219765,
+      "mtime_ns": "1790464762680219073",
+      "ctime_ns": "1790464762680219073"
+    }
+  ],
+  "original_candidate_sha256": "eb9c929e172b08153fe14864d567b435da0e3f70f51cb05a4359ac097b4174f4",
+  "actual_candidate_sha256": "d06822dd1a311e009feb3f73ae9af452e17ebdb5ff3c0733287317b2d9df2bfc",
+  "all_decoded_math_sync_helper_source_unchanged": true,
+  "shader_resource_ABI": "buffers0..7 plus16B GgufDecodeParams slot8; uint2 group"
+}
