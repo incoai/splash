@@ -243,7 +243,8 @@ public:
   // makes the cache persistent: its copies are labelled for the next
   // process, and the quota keeps whole restore points by the recency of
   // their states (dropOldestPoint).
-  Cache(KvPool &pool, KvTier *kvTier, std::shared_ptr<model::DiskBudget> diskBudget);
+  Cache(KvPool &pool, KvTier *kvTier, std::shared_ptr<model::DiskBudget> diskBudget,
+        CheckpointHistoryConfig history = {});
   Cache(const Cache &) = delete;
   Cache &operator=(const Cache &) = delete;
 
@@ -386,6 +387,13 @@ public:
   [[nodiscard]] bool stateResident(uint64_t kvBlock) const noexcept;
   // False only while this exact disposable publication is pinned.
   bool retireCheckpointState(StateCheckpoint checkpoint) noexcept;
+  [[nodiscard]] bool retainCheckpointState(StateCheckpoint checkpoint) noexcept {
+    return states_.retainCheckpointState(checkpoint);
+  }
+  [[nodiscard]] bool reclaimCheckpointHistory(
+      const std::function<bool(StateCheckpoint)> &protectedCheckpoint) {
+    return states_.reclaimCheckpointHistory(protectedCheckpoint);
+  }
   // This exact disposable publication is pinned: retireCheckpointState
   // refuses it.
   [[nodiscard]] bool checkpointPinned(StateCheckpoint checkpoint) const noexcept {

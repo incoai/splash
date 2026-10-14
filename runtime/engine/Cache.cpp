@@ -29,10 +29,15 @@ bool older(const std::optional<CacheEvictionCandidate> &left,
 
 } // namespace
 
-Cache::Cache(KvPool &pool, KvTier *kvTier, std::shared_ptr<model::DiskBudget> diskBudget)
+Cache::Cache(KvPool &pool, KvTier *kvTier, std::shared_ptr<model::DiskBudget> diskBudget,
+             CheckpointHistoryConfig history)
     : pool_(pool), tier_(kvTier), persistent_(kvTier && kvTier->persistent()),
       diskBudget_(std::move(diskBudget)), kv_(pool, recency_),
-      states_(kv_, recency_, [this](bool inUse) { return freeDiskSpace(inUse); }, persistent_) {}
+      states_(kv_, recency_, [this](bool inUse) { return freeDiskSpace(inUse); }, persistent_,
+              history) {
+  if (history && (kvTier || diskBudget_ || history.strideTokens % KvCache::pageTokens))
+    throw std::invalid_argument("checkpoint history requires a RAM-only cache and page-aligned stride");
+}
 
 CacheAdoption Cache::adopt(std::vector<PersistedKv> blocks, std::vector<PersistedState> states) {
   if (!persistent_)

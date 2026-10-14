@@ -24,6 +24,19 @@ struct StateCheckpoint final {
   [[nodiscard]] explicit operator bool() const noexcept { return kvBlock != 0; }
 };
 
+// Experimental, cache-wide quota for a subset of existing rolling captures.
+// Any zero disables it. RAM-only, non-offloadable states are eligible; bytes
+// count their payload, not KV, allocator overhead or a model's working memory.
+struct CheckpointHistoryConfig final {
+  uint32_t strideTokens = 0;
+  uint32_t maxEntries = 0;
+  uint64_t maxBytes = 0;
+  [[nodiscard]] explicit operator bool() const noexcept {
+    return strideTokens && maxEntries && maxBytes;
+  }
+};
+
+
 class CompositeStateLease final {
 public:
   CompositeStateLease(const CompositeStateLease &) = delete;
@@ -96,6 +109,8 @@ struct StateCacheSnapshot {
   uint64_t checkpointRetirements = 0;
   // Evictions by a reclaim; rolling retirements are counted separately.
   uint64_t checkpointEvictions = 0;
+  uint32_t historyEntries = 0;
+  uint64_t historyBytes = 0;
 };
 
 struct StateEviction final {
@@ -148,8 +163,10 @@ public:
 
   // makeRoom gives up disk copies for a state's write the quota refuses. In
   // a persistent tier every write labels its disk copy (CompositeState::label).
-  StateCache(KvCache &kv, CacheRecency &recency, DiskRoom makeRoom, bool persistent)
-      : kv_(kv), recency_(recency), makeRoom_(std::move(makeRoom)), persistent_(persistent) {}
+  StateCache(KvCache &kv, CacheRecency &recency, DiskRoom makeRoom, bool persistent,
+             CheckpointHistoryConfig history = {})
+      : kv_(kv), recency_(recency), makeRoom_(std::move(makeRoom)), persistent_(persistent),
+        history_(history) {}
   StateCache(const StateCache &) = delete;
   StateCache &operator=(const StateCache &) = delete;
 
@@ -186,6 +203,15 @@ public:
   // false only when the matching checkpoint is pinned; absent, replaced and
   // upgraded publications already satisfy the postcondition.
   bool retireCheckpointState(StateCheckpoint checkpoint) noexcept;
+  // Marks an existing rolling capture for optional retention, without changing
+  // class, recency or pins. First eligible captures win until either aggregate
+  // quota fills. A hard retirement still removes them, e.g. to recycle lane buffers.
+  [[nodiscard]] bool retainCheckpointState(StateCheckpoint checkpoint) noexcept;
+  // Publication pressure may take the oldest optional history before current
+  // recovery. The synchronous predicate must not mutate the cache; Engine uses
+  // it to protect every unfinished request's exact rolling publication.
+  [[nodiscard]] bool reclaimCheckpointHistory(
+      const std::function<bool(StateCheckpoint)> &protectedCheckpoint);
   // The matching checkpoint is pinned: retireCheckpointState refuses it.
   [[nodiscard]] bool checkpointPinned(StateCheckpoint checkpoint) const noexcept;
   // An unfinished request's conversation resumes from the state at this
@@ -292,6 +318,7 @@ private:
     bool checkpoint = false;
     bool invalid = false;
     uint64_t publication = 0;
+    uint64_t historyBytes = 0;
     RecencyOrder::Node ramNode;
     RecencyOrder::Node diskNode;
   };
@@ -341,6 +368,7 @@ private:
   // An ordinary publication or reuse: the block has held a reusable state,
   // and a checkpoint is upgraded.
   void makeOrdinary(uint64_t kvBlock, Entry &entry);
+  void releaseHistory(Entry &entry) noexcept;
   [[nodiscard]] bool writing(uint64_t kvBlock) const noexcept {
     return pending_ && pending_->kvBlock == kvBlock;
   }
@@ -353,6 +381,9 @@ private:
   CacheRecency &recency_;
   DiskRoom makeRoom_;
   bool persistent_;
+  const CheckpointHistoryConfig history_;
+  uint32_t historyEntries_ = 0;
+  uint64_t historyBytes_ = 0;
   std::function<void()> completion_;
   std::unordered_map<uint64_t, Entry> entries_;
   RecencyOrder ordinary_;

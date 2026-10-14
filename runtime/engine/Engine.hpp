@@ -475,7 +475,7 @@ private:
   // cannot retire (retireCheckpoint), so no checkpoint after it is published
   // meanwhile.
   [[nodiscard]] bool checkpointPinned(const Request &request) const;
-  [[nodiscard]] bool retireCheckpoint(Request &request);
+  [[nodiscard]] bool retireCheckpoint(Request &request, bool keepHistory = false);
   // Publishes the request's complete blocks up to committedTokens and keeps
   // the tokens of those found cached for its next command to read.
   void publishCommittedBlocks(Request &request, uint32_t committedTokens);
@@ -519,6 +519,9 @@ private:
   // only if the pin has gone by then. Null buffers when refused.
   [[nodiscard]] Reservation reserveCapture(Request &request, StateClass kind, uint32_t tokens,
                                            bool followsCheckpoint);
+  // After a refused reservation or snapshot, let eligible optional history
+  // yield before current recovery or native reclaim. Between commands only.
+  template <class Take> [[nodiscard]] bool makeHistoryRoom(Take &&take);
   // Makes room for one state's buffers, a step of what its class may take
   // (Cache::reclaimOneState) at a time, until `take` gets them, nothing more
   // of the class goes, or the extents given cover one state; true once

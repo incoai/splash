@@ -235,10 +235,67 @@ bool StateCache::checkpointPinned(StateCheckpoint checkpoint) const noexcept {
          found->second.publication == checkpoint.publication && found->second.pins;
 }
 
+bool StateCache::retainCheckpointState(StateCheckpoint checkpoint) noexcept {
+  if (!history_)
+    return false;
+  const auto found = entries_.find(checkpoint.kvBlock);
+  if (found == entries_.end())
+    return false;
+  Entry &entry = found->second;
+  if (!entry.checkpoint || entry.invalid || entry.publication != checkpoint.publication) {
+    return false;
+  }
+  if (entry.pins) {
+    return false;
+  }
+  if (entry.historyBytes)
+    return true;
+  // Retain only one immutable RAM payload per marked entry.
+  // Such a state cannot acquire an unaccounted disk copy or a larger RAM copy:
+  // ordinary publication requires the resident copy to have left first.
+  if (persistent_ || entry.disk || !entry.ram || entry.ram->canOffload(true) ||
+      (uint64_t{kv_.chainLength(checkpoint.kvBlock)} * KvCache::pageTokens) %
+          history_.strideTokens)
+    return false;
+  const uint64_t bytes = entry.ram->bytes();
+  if (historyEntries_ >= history_.maxEntries || bytes > history_.maxBytes - historyBytes_) {
+    return false;
+  }
+  entry.historyBytes = bytes;
+  ++historyEntries_;
+  historyBytes_ += bytes;
+  return true;
+}
+
+bool StateCache::reclaimCheckpointHistory(
+    const std::function<bool(StateCheckpoint)> &protectedCheckpoint) {
+  if (!historyEntries_)
+    return false;
+  for (auto candidate = checkpoints_.oldest(); candidate;
+       candidate = checkpoints_.next(*candidate)) {
+    const auto &entry = entries_.at(candidate->id);
+    if (!entry.historyBytes || !entry.checkpoint || entry.invalid || entry.pins ||
+        inUse(candidate->id) || !entry.ram || entry.disk || entry.ram->canOffload(true) ||
+        writing(candidate->id) || persisting(candidate->id) ||
+        protectedCheckpoint({candidate->id, entry.publication}))
+      continue;
+    return reclaim(candidate->id, Unwritten::Wait).evicted;
+  }
+  return false;
+}
+
+void StateCache::releaseHistory(Entry &entry) noexcept {
+  if (entry.historyBytes) {
+    --historyEntries_;
+    historyBytes_ -= std::exchange(entry.historyBytes, 0);
+  }
+}
+
 void StateCache::makeOrdinary(uint64_t kvBlock, Entry &entry) {
   kv_.noteState(kvBlock);
   if (!entry.checkpoint)
     return;
+  releaseHistory(entry);
   --checkpointEntries_;
   checkpointBytes_ -= entry.ram ? entry.ram->bytes() : 0;
   entry.checkpoint = false;
@@ -503,6 +560,7 @@ StateEviction StateCache::erase(uint64_t kvBlock, bool retirement) noexcept {
   if (found == entries_.end() || found->second.pins)
     return {};
   Entry &target = found->second;
+  releaseHistory(target);
   const uint64_t reclaimed = target.ram ? target.ram->bytes() : 0;
   bytes_ -= reclaimed;
   if (target.disk)
@@ -549,6 +607,8 @@ StateCacheSnapshot StateCache::snapshot() const noexcept {
   result.checkpointBytes = checkpointBytes_;
   result.checkpointRetirements = checkpointRetirements_;
   result.checkpointEvictions = checkpointEvictions_;
+  result.historyEntries = historyEntries_;
+  result.historyBytes = historyBytes_;
   return result;
 }
 

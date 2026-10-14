@@ -1,4 +1,5 @@
 #include "Checked.hpp"
+#include "CheckpointHistoryCacheTests.hpp"
 #include "TestCache.hpp"
 #include "TestChecks.hpp"
 #include "TestKvPool.hpp"
@@ -4384,6 +4385,7 @@ int main() {
     testCompactionLeavesAPageBeingDemoted();
     testReplacementKeepsTheExtentItEmpties();
     testReleaseTimeCoversOneExtent();
+    checkpoint_history_tests::run();
     std::cout << "engine cache tests passed\n";
     return 0;
   } catch (const std::exception &error) {

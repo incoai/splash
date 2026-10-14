@@ -10307,6 +10307,8 @@ void testImpossibleSpeculativeCountsFailOnlyTheirOwnLane() {
           "invalid speculative counts poisoned another request's completion");
 }
 
+#include "CheckpointHistoryTests.hpp"
+
 int main() {
   try {
     testSpeculativeCountsStayWithEachConcurrentRequest();
@@ -10545,6 +10547,7 @@ int main() {
     testNonFiniteFirstStepAfterARestoreInvalidatesTheState();
     testNonFiniteLaterStepKeepsTheRestoredState();
     testNonFiniteStepAfterCancellationInvalidatesTheState();
+    testCheckpointHistoryReservationSeams();
     std::cout << "engine tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

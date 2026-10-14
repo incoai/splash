@@ -1102,10 +1102,12 @@ bool Engine::checkpointPinned(const Request &active) const {
   return !checkpointShared(active) && cache_.checkpointPinned(active.latestCheckpoint);
 }
 
-bool Engine::retireCheckpoint(Request &active) {
+bool Engine::retireCheckpoint(Request &active, bool keepHistory) {
   // Shared progress points remain disposable under memory pressure, but a
   // lane's normal rolling replacement must not retire its peer's recovery point.
-  if (!checkpointShared(active) && !cache_.retireCheckpointState(active.latestCheckpoint))
+  if (!checkpointShared(active) &&
+      !(keepHistory && cache_.retainCheckpointState(active.latestCheckpoint)) &&
+      !cache_.retireCheckpointState(active.latestCheckpoint))
     return false;
   active.latestCheckpoint = {};
   return true;
@@ -1182,8 +1184,8 @@ void Engine::publishReachedStateBoundaries(
     } else {
       // The previous recovery point retires here or after the publication.
       // Here, before a checkpoint or a junction is published, a resident one
-      // goes, and gives its buffers to the state of a boundary the command
-      // ended at without them (below). One only on disk gives none: it stays
+      // not kept as optional history goes, and gives its buffers to a state
+      // the command ended at without them (below). One only on disk gives none: it stays
       // the recovery point until this state is published, and retires after
       // the publication, as does the one a reused state leaves. No checkpoint
       // is published while a restore lease pins the one before it. The
@@ -1193,7 +1195,12 @@ void Engine::publishReachedStateBoundaries(
         continue;
       }
       const bool resident = cache_.stateResident(active.latestCheckpoint.kvBlock);
-      if (!replay && resident)
+      // Keep an eligible existing capture beside its successor when it fits.
+      // Its rolling owner stays protected until publication or the native
+      // post-command handoff below; cancelled commands never reach this mark.
+      const bool keepHistory = !replay && resident && !checkpointShared(active) &&
+                               cache_.retainCheckpointState(active.latestCheckpoint);
+      if (!replay && resident && !keepHistory)
         static_cast<void>(retireCheckpoint(active));
       // The command has completed, so the state it ended at for its lane's
       // checkpoint is taken from the lane now. The replay point keeps that
@@ -1202,7 +1209,12 @@ void Engine::publishReachedStateBoundaries(
       // cache the state's class may take.
       if (fromLane) {
         state = model_.snapshot(active.request.id);
-        if (!state && replay && resident && !checkpointShared(active) &&
+        if (!state)
+          recycled = makeHistoryRoom([&] {
+            state = model_.snapshot(active.request.id);
+            return state != nullptr;
+          });
+        if (!state && (replay || keepHistory) && resident && !checkpointShared(active) &&
             retireCheckpoint(active))
           state = model_.snapshot(active.request.id);
         if (!state)
@@ -1245,7 +1257,7 @@ void Engine::publishReachedStateBoundaries(
     // lane's recovery point, unless it retired above to give this state its
     // buffers.
     if (!replay)
-      static_cast<void>(retireCheckpoint(active));
+      static_cast<void>(retireCheckpoint(active, true));
     active.latestCheckpoint = checkpoint ? cache_.checkpointState(block)
                                          : StateCheckpoint{};
     if (!checkpoint)
@@ -1417,10 +1429,15 @@ uint32_t Engine::reserveCaptures(Request &active, const BatchItem &item, Reclaim
       // before it beside buffers of its own, and takes that checkpoint's
       // when refused the pool and the admission, as it takes its lane's
       // after a command.
-      if (std::shared_ptr<StateReservation> buffers =
-              model_.reserveState(active.request.id, tokens)) {
-        states.push_back({tokens, std::move(buffers)});
-        captures.push_back({tokens});
+      Reservation reservation{model_.reserveState(active.request.id, tokens)};
+      if (!reservation.buffers)
+        reservation.recycled = makeHistoryRoom([&] {
+          reservation.buffers = model_.reserveState(active.request.id, tokens);
+          return reservation.buffers != nullptr;
+        });
+      if (reservation.buffers) {
+        states.push_back({tokens, std::move(reservation.buffers)});
+        captures.push_back({tokens, reservation.recycled});
       } else {
         states.back().tokens = tokens;
         captures.back().tokens = tokens;
@@ -1487,6 +1504,14 @@ Engine::Reservation Engine::reserveCapture(Request &active, StateClass kind, uin
   // recovery point until then.
   const bool predecessorPinned =
       kind == StateClass::Checkpoint && followsCheckpoint && checkpointPinned(active);
+  if (!predecessorPinned) {
+    result.recycled = makeHistoryRoom([&] {
+      result.buffers = model_.reserveState(id, tokens);
+      return result.buffers != nullptr;
+    });
+    if (result.buffers)
+      return result;
+  }
   result.fromLane = predecessorPinned || checkpointReclaimable(active);
   if (result.fromLane)
     return result;
@@ -1499,6 +1524,27 @@ Engine::Reservation Engine::reserveCapture(Request &active, StateClass kind, uin
     return result.buffers != nullptr;
   });
   return result;
+}
+
+template <class Take> bool Engine::makeHistoryRoom(Take &&take) {
+  // Changed victim preference after refusal: optional idle history yields
+  // before current recovery or native reclaim. No command is in flight.
+  // Any unfinished owner protects the exact publication; StateCache also
+  // protects leases, uses and transfers. Retries still use native admission.
+  const auto protectedCheckpoint = [this](StateCheckpoint point) {
+    return std::any_of(requests_.begin(), requests_.end(), [&](const auto &entry) {
+      const auto &owner = entry.second;
+      return !owner.finalized && owner.latestCheckpoint.kvBlock == point.kvBlock &&
+             owner.latestCheckpoint.publication == point.publication;
+    });
+  };
+  for (uint32_t remaining = cache_.snapshot().stateCache.historyEntries; remaining; --remaining) {
+    if (!cache_.reclaimCheckpointHistory(protectedCheckpoint))
+      break;
+    if (take())
+      return true;
+  }
+  return false;
 }
 
 template <class Take> bool Engine::makeStateRoom(StateClass kind, Take &&take) {

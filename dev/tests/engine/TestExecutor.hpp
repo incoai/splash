@@ -491,6 +491,7 @@ public:
     if (!requests.at(id).resident || !tokens || tokens % engine::KvCache::pageTokens)
       throw std::logic_error("a state was reserved off a resident lane's page boundary");
     ++reservationAttempts;
+    lastReservationTokens = tokens;
     if (reservationObserver)
       reservationObserver();
     if (deniedReservations) {
@@ -624,6 +625,8 @@ public:
   // State reservations granted, and asked for.
   uint32_t reservations = 0;
   uint32_t reservationAttempts = 0;
+  // Boundary of the current reserve call, for targeted refusal instrumentation.
+  uint32_t lastReservationTokens = 0;
   // Each state a prefill step captured: its request, its boundary and the
   // step's end, past the boundary for one inside the step.
   struct Capture {
