@@ -153,16 +153,6 @@ void Scheduler::remove(uint64_t id) {
   requests_.erase(found);
 }
 
-void Scheduler::setPrefillBoundary(uint64_t id,
-                                         std::optional<uint32_t> boundary) {
-  Request &request = get(id);
-  if (boundary && (*boundary <= request.promptProcessed ||
-                   *boundary > request.spec.prefillTokens)) {
-    throw std::invalid_argument("invalid prefill boundary");
-  }
-  request.prefillBoundary = boundary;
-}
-
 bool Scheduler::expireDeadlines(double now) {
   bool changed = false;
   for (auto &[_, request] : requests_) {
@@ -283,19 +273,11 @@ std::optional<BatchPlan> Scheduler::nextPrefill(std::span<const uint64_t> exclud
   return planPrefill(std::move(ready));
 }
 
-uint32_t Scheduler::dispatchRemaining(const PrefillRequestView &view) noexcept {
-  uint32_t end = view.request->spec.prefillTokens;
-  if (view.request->prefillBoundary)
-    end = std::min(end, *view.request->prefillBoundary);
-  return end - view.promptProcessed;
-}
-
 std::optional<BatchPlan>
 Scheduler::planPrefill(std::vector<PrefillRequestView> ready) const {
   if (ready.empty())
     return std::nullopt;
-  // Order by the complete remaining prompt, independently of state capture
-  // boundaries. After kMaximumOvertakes consecutive skips,
+  // Order by the remaining prompt. After kMaximumOvertakes consecutive skips,
   // an older lane leads the next command to prevent starvation.
   const auto overdue = [](const PrefillRequestView &view) {
     return view.request->overtaken >= kMaximumOvertakes;
@@ -323,7 +305,8 @@ Scheduler::planPrefill(std::vector<PrefillRequestView> ready) const {
     if (!budget || view.request->spec.priority != selectedPriority ||
         plan.width() == model::ExecutionLimits::maximumBatchWidth)
       break;
-    const uint32_t rows = std::min(dispatchRemaining(view), budget);
+    const uint32_t rows =
+        std::min(view.request->spec.prefillTokens - view.promptProcessed, budget);
     plan.items.push_back(
         {view.request->spec.id, rows, view.promptProcessed});
     budget -= rows;
@@ -363,12 +346,10 @@ uint32_t Scheduler::prefillBudget(
   if (contended)
     return rows;
   // A leader that finishes within the full budget ends the command at its
-  // last row, or at its next state boundary: prefill cost is linear above
-  // the slice, so shortest-first sequential commands minimise first-token
-  // latency. Long prefills share a command only when no lane finishes.
-  if (leaderRemaining <= maximum)
-    return dispatchRemaining(leader);
-  return maximum;
+  // last row: prefill cost is linear above the slice, so shortest-first
+  // sequential commands minimise first-token latency. Long prefills share a
+  // command only when no lane finishes.
+  return std::min(leaderRemaining, maximum);
 }
 
 std::optional<BatchPlan> Scheduler::nextDecode(std::span<const uint64_t> excluded) const {
@@ -476,10 +457,6 @@ void Scheduler::complete(const BatchPlan &plan,
         throw std::logic_error("prefill completion row count changed");
       }
       request.promptProcessed += result.consumedPromptTokens;
-      if (request.prefillBoundary &&
-          request.promptProcessed == *request.prefillBoundary) {
-        request.prefillBoundary.reset();
-      }
       // A stop token or a one-token budget is selected by prefill itself; a
       // constrained prompt waits for the mask its first token needs.
       if (result.finished) {

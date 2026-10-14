@@ -40,12 +40,14 @@ struct RuntimeGeometry final {
   DFlashDraftLayout draft;
 
   [[nodiscard]] static RuntimeGeometry from(const LoadedModel &model,
-                                            kv::Format format) {
+                                            kv::Format kvFormat,
+                                            ops::GdnStateFormat stateFormat) {
     RuntimeGeometry result;
     result.target = std::visit(
         [](const auto &weights) { return qwenTargetGeometry(weights); },
         model.target);
-    result.target.kvLayout = model.targetKvLayout(format);
+    result.target.kvLayout = model.targetKvLayout(kvFormat);
+    result.target.stateLayout = model.stateLayout(stateFormat).target;
     result.draft = model.draft.layout;
     if (!result.target.valid() || !result.draft.stateLayout().valid() ||
         result.target.hiddenSize != result.draft.hiddenSize ||

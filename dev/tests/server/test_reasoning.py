@@ -196,21 +196,21 @@ class ReasoningTests(HarnessTestCase):
         self.assertTrue(job.thinking)
         self.assertNotIn("enable_thinking", tokenizer.templates[-1][1])
 
-    def test_explicit_thinking_mode_must_be_honored(self):
-        for prefix, effort in (
-            ("<think>\\n", "none"),
-            ("<think>\\n\\n</think>\\n\\n", "low"),
+    def test_a_template_gives_the_thinking_mode_it_can(self):
+        # A template that always thinks, or never does, renders as it can,
+        # and the request reasons as its prompt does.
+        for prefix, effort, thinking in (
+            ("<think>\\n", "none", True),
+            ("<think>\\n\\n</think>\\n\\n", "low", False),
         ):
             tokenizer = TemplateTokenizer(
                 "{% if add_generation_prompt %}"
                 "{{ '<|im_start|>assistant\\n" + prefix + "' }}{% endif %}"
             )
             app = make_frontend(tokenizer, None, "test-model", 128, 1, 2, vision=True)
-            with (
-                self.subTest(effort=effort),
-                self.assertRaisesRegex(api.APIError, "requested thinking mode"),
-            ):
-                app.prepare(chat_body(reasoning_effort=effort), deadline=FOREVER)
+            with self.subTest(effort=effort):
+                job = app.prepare(chat_body(reasoning_effort=effort), deadline=FOREVER)
+                self.assertEqual(job.thinking, thinking)
 
     def test_generation_prompt_decides_thinking_and_its_token_count(self):
         history = "<|im_start|>assistant\n<think>old</think>answer<|im_end|>\n"

@@ -1,8 +1,10 @@
 #include "Checked.hpp"
 #include "TestCache.hpp"
 #include "TestChecks.hpp"
+#include "TestFiles.hpp"
 #include "TestKvPool.hpp"
 #include "TestKvTier.hpp"
+#include "TestWriteBudget.hpp"
 #include "engine/Cache.hpp"
 #include "engine/DiskLabels.hpp"
 #include "engine/WriteBehind.hpp"
@@ -11,12 +13,14 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <iostream>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -38,6 +42,10 @@ struct Shelf final {
   std::set<const ShelvedState *> disk;
   uint32_t capacity = 8;
   bool ready = true;
+  // The state file takes writes; the write budget it shares with the KV
+  // tier, if any.
+  bool writable = true;
+  std::shared_ptr<const model::DiskBudget> writeBudget;
 };
 
 class ShelvedState final : public CompositeState {
@@ -52,7 +60,10 @@ public:
   }
   uint64_t bytes() const noexcept override { return 100; }
   uint64_t residentBytes() const noexcept override { return disk_ ? 0 : bytes(); }
-  bool canOffload() const noexcept override { return !disk_; }
+  bool canOffload(bool inUse) const noexcept override {
+    return !disk_ && shelf_->writable &&
+           (!shelf_->writeBudget || shelf_->writeBudget->admits(inUse));
+  }
   std::unique_ptr<StateOffload> offload(std::function<void()>) const override {
     if (shelf_->disk.size() >= shelf_->capacity)
       return {};
@@ -107,7 +118,7 @@ struct Process final {
   std::shared_ptr<Shelf> shelf = std::make_shared<Shelf>();
   engine::Cache cache;
 
-  explicit Process(bool persistent, std::shared_ptr<const model::DiskBudget> budget = nullptr)
+  explicit Process(bool persistent, std::shared_ptr<model::DiskBudget> budget = nullptr)
       : tier(persistent), cache(pool, &tier, std::move(budget)) {
     storage.budgetPages = 8;
     tier.capacity = 16;
@@ -116,10 +127,12 @@ struct Process final {
 
   // Caches the prompt through a finished request and returns
   // its blocks, root first.
-  std::vector<uint64_t> cachePrompt(uint64_t requestId, const std::vector<uint32_t> &prompt) {
+  std::vector<uint64_t> cachePrompt(uint64_t requestId, const std::vector<uint32_t> &prompt,
+                                    CacheSalt salt = {}) {
     cache.beginRequest(requestId);
     require(admitTokens(cache, requestId, prompt.size()).granted(), "prompt KV was not admitted");
-    cache.publishCommittedBlocks(requestId, prompt, static_cast<uint32_t>(prompt.size()), {});
+    cache.publishCommittedBlocks(requestId, prompt, static_cast<uint32_t>(prompt.size()),
+                                 {{}, salt});
     std::vector<uint64_t> blocks;
     for (uint32_t end = KvCache::pageTokens; end <= prompt.size(); end += KvCache::pageTokens)
       blocks.push_back(cache.blockAt(requestId, end));
@@ -234,6 +247,26 @@ void testRestorePointsComeBack() {
   next.cache.endRequest(2);
   const std::vector<uint64_t> later = next.cachePrompt(3, promptOf(5000, 1));
   require(later.front() > blocks.back(), "new blocks reused an id taken back");
+}
+
+// A salted restore point comes back under its salt: the next process finds
+// it for that salt alone.
+void testSaltedPointsComeBackUnderTheirSalt() {
+  const std::vector<uint32_t> prompt = promptOf(1000, 2);
+  const CacheSalt salt{0x5151, 0x7373};
+  Process earlier(true);
+  const std::vector<uint64_t> blocks = earlier.cachePrompt(1, prompt, salt);
+  earlier.publish(blocks[1]);
+  earlier.writeEverything();
+  Process next(true);
+  const CacheAdoption adoption = next.adopt(earlier.kvLabels(), earlier.stateLabels());
+  require(adoption.blocks == 2 && adoption.states == 1 && adoption.dropped == 0,
+          "the next process did not take back the salted restore point");
+  std::vector<uint32_t> continued = prompt;
+  continued.push_back(7);
+  require(next.cache.lookup(continued, {{}, salt}).resumeBoundary() == 64 &&
+              next.cache.lookup(continued, {}).resumeBoundary() == 0,
+          "a salted restore point did not come back under its salt alone");
 }
 
 // A restore point whose chain is broken stays behind, and so do KV no state
@@ -420,35 +453,31 @@ private:
   std::shared_ptr<model::SlotFile::Slot> slot_;
 };
 
-// Taken back under a lower quota than the earlier process had, the oldest
-// copies go until the rest fits.
-void testAdoptionTrimsToTheQuota() {
-  const std::filesystem::path directory =
-      std::filesystem::temp_directory_path() / ("splash-adoption-" + std::to_string(::getpid()));
-  std::filesystem::create_directories(directory);
-  const model::SlotFile::Persistence persistence{
-      directory / "state.slots", directory / "state.records", {}, sizeof(StateLabel)};
+// An earlier process's three states, one page each at blocks 1 to 3, the
+// newest last, in a persistent state file in `directory`; returns the labels
+// of their KV blocks.
+std::vector<std::vector<std::byte>> writeThreeStates(const model::SlotFile::Persistence &persistence) {
   std::vector<std::vector<std::byte>> kv;
-  {
-    model::SlotFile file(kHostPageBytes, std::make_shared<model::DiskBudget>(3 * kHostPageBytes),
-                         persistence);
-    file.finishAdoption();
-    std::vector<std::shared_ptr<model::SlotFile::Slot>> kept;
-    std::vector<std::byte> payload(kHostPageBytes, std::byte{1});
-    for (uint64_t block = 1; block <= 3; ++block) {
-      kept.push_back(file.acquire());
-      require(file.write(kept.back(), {payload}, {})->wait(), "state slot write failed");
-      file.label(kept.back(), encodeLabel(StateLabel{block, 10 * block, KvCache::pageTokens, 0}));
-      KvBlockLabel label{block, 0, 10 * block, 0, 0, {}};
-      label.tokens.fill(static_cast<uint32_t>(block));
-      kv.push_back(encodeLabel(label));
-    }
-    require(file.synchronize({})->wait(), "state file did not synchronize");
-    file.seal();
+  model::SlotFile file(kHostPageBytes, std::make_shared<model::DiskBudget>(3 * kHostPageBytes),
+                       persistence);
+  file.finishAdoption();
+  std::vector<std::shared_ptr<model::SlotFile::Slot>> kept;
+  std::vector<std::byte> payload(kHostPageBytes, std::byte{1});
+  for (uint64_t block = 1; block <= 3; ++block) {
+    kept.push_back(file.acquire());
+    require(file.write(kept.back(), {payload}, {})->wait(), "state slot write failed");
+    file.label(kept.back(), encodeLabel(StateLabel{block, 10 * block, KvCache::pageTokens, 0}));
+    KvBlockLabel label{block, 0, 10 * block, 0, 0, {}};
+    label.tokens.fill(static_cast<uint32_t>(block));
+    kv.push_back(encodeLabel(label));
   }
-  auto budget = std::make_shared<model::DiskBudget>(2 * kHostPageBytes);
-  model::SlotFile file(kHostPageBytes, budget, persistence);
-  Process next(true, budget);
+  require(file.synchronize({})->wait(), "state file did not synchronize");
+  file.seal();
+  return kv;
+}
+
+// The next process takes the states back into `next`'s cache.
+void adoptStates(Process &next, model::SlotFile &file, const std::vector<std::vector<std::byte>> &kv) {
   std::vector<PersistedKv> blocks;
   for (const auto &label : kv)
     blocks.push_back({label, [&] { return next.tier.adopt(); }});
@@ -457,18 +486,84 @@ void testAdoptionTrimsToTheQuota() {
     states.push_back({record.label, [&file, record](uint32_t) -> std::shared_ptr<const CompositeState> {
                         return std::make_shared<SlotState>(file.adopt(record));
                       }});
-  const CacheAdoption adoption = next.cache.adopt(std::move(blocks), std::move(states));
+  static_cast<void>(next.cache.adopt(std::move(blocks), std::move(states)));
   file.finishAdoption();
-  require(adoption.states == 2 && budget->usedBytes() == 2 * kHostPageBytes,
-          "adoption past the quota was not trimmed to it");
-  for (uint32_t block = 2; block <= 3; ++block) {
-    const std::vector<uint32_t> prompt(KvCache::pageTokens + 1, block);
-    require(next.cache.lookup(prompt, {}).state.has_value(), "a newer state was given up first");
+}
+
+std::vector<uint32_t> promptOfState(uint32_t block) {
+  return std::vector<uint32_t>(KvCache::pageTokens + 1, block);
+}
+
+// Taken back under a lower limit than the earlier process had, a smaller
+// quota or a volume that leaves less, the oldest copies go until the rest
+// fits.
+void testAdoptionTrimsToTheLimit() {
+  const test::TemporaryDirectory directory("splash-adoption");
+  const model::SlotFile::Persistence persistence{
+      directory.path() / "state.slots", directory.path() / "state.records", {}, sizeof(StateLabel)};
+  const std::vector<std::vector<std::byte>> kv = writeThreeStates(persistence);
+  // The volume leaves less than the quota now.
+  auto budget = std::make_shared<model::DiskBudget>(3 * kHostPageBytes);
+  budget->setLimitBytes(2 * kHostPageBytes);
+  model::SlotFile file(kHostPageBytes, budget, persistence);
+  Process next(true, budget);
+  adoptStates(next, file, kv);
+  require(next.cache.snapshot().stateCache.entries == 2 &&
+              budget->usedBytes() == 2 * kHostPageBytes,
+          "adoption past the limit was not trimmed to it");
+  for (uint32_t block = 2; block <= 3; ++block)
+    require(next.cache.lookup(promptOfState(block), {}).state.has_value(),
+            "a newer state was given up first");
+  require(!next.cache.lookup(promptOfState(1), {}).state,
+          "the oldest state was kept past the limit");
+}
+
+// A limit the volume lowers while the process serves gives up copies at the
+// next measure, at a control pass or at once when a write found the volume
+// full: those not in use go, the oldest first, and one in use stays even
+// past the limit.
+void testLowerLimitKeepsCopiesInUse() {
+  const test::TemporaryDirectory directory("splash-lower-limit");
+  const model::SlotFile::Persistence persistence{
+      directory.path() / "state.slots", directory.path() / "state.records", {}, sizeof(StateLabel)};
+  const std::vector<std::vector<std::byte>> kv = writeThreeStates(persistence);
+  auto budget = std::make_shared<model::DiskBudget>(3 * kHostPageBytes);
+  model::SlotFile file(kHostPageBytes, budget, persistence);
+  Process next(true, budget);
+  adoptStates(next, file, kv);
+  uint32_t measures = 0;
+  uint64_t volumeLeaves = 2 * kHostPageBytes;
+  next.cache.setDiskMeasure([&] {
+    ++measures;
+    static_cast<void>(budget->takeFullReport());
+    budget->setLimitBytes(volumeLeaves);
+  });
+  uint64_t oldest = 0;
+  {
+    const CacheLookup found = next.cache.lookup(promptOfState(1), {});
+    require(found.state.has_value() && budget->usedBytes() == 3 * kHostPageBytes,
+            "the states were not taken back");
+    oldest = found.state->kvBlock();
   }
-  require(!next.cache.lookup(std::vector<uint32_t>(KvCache::pageTokens + 1, 1), {}).state,
-          "the oldest state was kept past the quota");
-  std::error_code ignored;
-  std::filesystem::remove_all(directory, ignored);
+  const StateUse use = next.cache.useState(oldest);
+  next.cache.keepDiskLimit();
+  require(measures == 1 && budget->usedBytes() == 2 * kHostPageBytes &&
+              next.cache.lookup(promptOfState(1), {}).state &&
+              !next.cache.lookup(promptOfState(2), {}).state &&
+              next.cache.lookup(promptOfState(3), {}).state,
+          "a lower limit did not give up the oldest copy not in use");
+  // Transfers polled without a report measure nothing; a write that found
+  // the volume full has it measured at once.
+  volumeLeaves = 0;
+  static_cast<void>(next.cache.pollTransfers());
+  require(measures == 1 && budget->usedBytes() == 2 * kHostPageBytes,
+          "a poll without a full volume measured it");
+  budget->reportFull();
+  static_cast<void>(next.cache.pollTransfers());
+  require(measures == 2 && !budget->fullReported() && budget->usedBytes() == kHostPageBytes &&
+              next.cache.lookup(promptOfState(1), {}).state &&
+              !next.cache.lookup(promptOfState(3), {}).state,
+          "a full volume was not measured at once, or a copy in use went for it");
 }
 
 // A point made durable stays in RAM: the pages of its chain are copied and
@@ -614,28 +709,94 @@ void testPointsWaitTheirTurn() {
           "the clean stop did not leave every point durable");
 }
 
-// While the tier has written its hourly bytes in the last hour, a due point
-// waits, and the limit is looked at again a minute later.
-void testWritesKeepToTheHourlyLimit() {
-  constexpr double kMinute = 60'000.0, kHour = 3'600'000.0;
-  auto budget = std::make_shared<model::DiskBudget>(4 * kHostPageBytes);
-  Process process(true, budget);
-  WriteBehind writes(process.cache, kHostPageBytes);
+// While the write budget is spent a due point waits, nothing of it written,
+// and run() is woken when the budget has room again; then its state is
+// written, and its pages after it. A clean stop writes whatever the budget.
+void testWritesKeepToTheWriteBudget() {
+  constexpr double kDelay = WriteBehind::kDelayMilliseconds;
+  test::WriteBudget budget;
+  Process process(true, budget.budget);
+  process.shelf->writeBudget = budget.budget;
+  WriteBehind writes(process.cache);
   const std::vector<uint64_t> blocks = process.cachePrompt(1, promptOf(1000, 2));
   process.publish(blocks[1]);
-  writes.published(blocks[1], WriteBehind::kMinimumTokens, 0.0);
-  require(!writes.run(0.0), "a point was written before its delay");
-  // Eviction writes the hour's bytes.
-  model::SlotFile file(kHostPageBytes, budget);
-  const std::vector<std::byte> payload(kHostPageBytes, std::byte{1});
-  require(file.write(file.acquire(), {payload}, {})->wait(), "the eviction write failed");
-  require(!writes.run(WriteBehind::kDelayMilliseconds) && !process.tier.demotions &&
-              writes.nextWakeup() == kMinute,
-          "a due point was written past the hourly limit");
-  require(!writes.run(kMinute) && !writes.run(kHour) && !process.tier.demotions,
-          "a due point was written while the hour's writes reached the limit");
-  require(!writes.run(kHour + kMinute) && process.tier.demotions == 2,
-          "a due point waited once the writes were an hour old");
+  writes.published(blocks[1], WriteBehind::kMinimumTokens, budget.now);
+  budget.spend();
+  budget.now = kDelay;
+  require(!writes.run(budget.now) && !process.tier.demotions && process.shelf->disk.empty(),
+          "a due point was written while the write budget was spent");
+  const std::optional<double> wakeup = writes.nextWakeup();
+  require(wakeup && std::abs(*wakeup - test::WriteBudget::kRefillMilliseconds) < 1.0,
+          "the point was not woken when the write budget has room again");
+  budget.refill();
+  require(!writes.run(budget.now) && process.shelf->disk.size() == 1 &&
+              process.tier.demotions == 2,
+          "a due point waited once the write budget had room");
+  process.tier.complete();
+  require(process.cache.pollTransfers() && writes.run(budget.now) &&
+              writes.snapshot().durable == 1,
+          "the point did not become durable once its writes landed");
+
+  const std::vector<uint64_t> next = process.cachePrompt(2, promptOf(2000, 1));
+  process.publish(next[0]);
+  writes.published(next[0], WriteBehind::kMinimumTokens, budget.now);
+  budget.spend();
+  require(!writes.flush() && process.tier.demotions == 3,
+          "the clean stop waited for the write budget");
+  process.tier.complete();
+  require(process.cache.pollTransfers() && writes.flush() && writes.snapshot().durable == 2,
+          "the clean stop did not leave the point durable");
+
+  // Nothing at a stop raises a limit the volume holds below a point.
+  const std::vector<uint64_t> last = process.cachePrompt(3, promptOf(3000, 2));
+  process.publish(last[1]);
+  writes.published(last[1], WriteBehind::kMinimumTokens, budget.now);
+  budget.budget->setLimitBytes(250);
+  require(writes.flush() && writes.snapshot().refused == 1 && process.tier.demotions == 3,
+          "the clean stop waited for a limit below the point");
+}
+
+// A point waits (Busy) while the write budget holds its state back, nothing
+// of it written, its pages neither. One larger than the limit the volume
+// leaves now is refused, as one larger than the quota is, and a file that
+// stopped taking writes refuses every point.
+void testPointsWaitForTheTier() {
+  test::WriteBudget budget;
+  Process process(true, budget.budget);
+  process.shelf->writeBudget = budget.budget;
+  const uint64_t point = process.cachePrompt(1, promptOf(1000, 2))[1];
+  process.publish(point);
+  budget.spend();
+  require(process.cache.persist(point) == PersistStatus::Busy && !process.tier.demotions &&
+              process.shelf->disk.empty(),
+          "a point was written or refused while the write budget was spent");
+  budget.refill();
+  // Two pages and a state are more than the limit, not than the quota.
+  budget.budget->setLimitBytes(250);
+  require(process.cache.persist(point) == PersistStatus::Refused && !process.tier.demotions &&
+              process.shelf->disk.empty(),
+          "a point larger than the limit was written or kept waiting");
+  budget.budget->setLimitBytes(budget.budget->capacityBytes());
+  require(process.cache.persist(point) == PersistStatus::Started &&
+              process.shelf->disk.size() == 1 && process.tier.demotions == 2,
+          "the point was not written once the tier had room");
+  process.tier.complete();
+  require(process.cache.pollTransfers() &&
+              process.cache.persist(point) == PersistStatus::Durable,
+          "the point is not durable");
+
+  const uint64_t second = process.cachePrompt(2, promptOf(2000, 1))[0];
+  process.publish(second);
+  process.shelf->writable = false;
+  require(process.cache.persist(second) == PersistStatus::Refused,
+          "a point was kept waiting for a state file that takes no writes");
+  process.tier.complete();
+  static_cast<void>(process.cache.pollTransfers());
+  const uint64_t third = process.cachePrompt(3, promptOf(3000, 1))[0];
+  process.publish(third);
+  process.tier.writableFile = false;
+  require(process.cache.persist(third) == PersistStatus::Refused,
+          "a point was kept waiting for a KV file that takes no writes");
 }
 
 } // namespace
@@ -644,9 +805,11 @@ int main() {
   try {
     testCopiesAreLabelled();
     testRestorePointsComeBack();
+    testSaltedPointsComeBackUnderTheirSalt();
     testBrokenChainsStayBehind();
     testOldestPointGoes();
-    testAdoptionTrimsToTheQuota();
+    testAdoptionTrimsToTheLimit();
+    testLowerLimitKeepsCopiesInUse();
     testCleanStopRecordsRecency();
     testPointGivenUpForItselfIsRefused();
     testPointLargerThanTheQuotaIsRefused();
@@ -655,7 +818,8 @@ int main() {
     testOnlyTheNewestPointsAreKept();
     testRestoresGoFirst();
     testPointsWaitTheirTurn();
-    testWritesKeepToTheHourlyLimit();
+    testWritesKeepToTheWriteBudget();
+    testPointsWaitForTheTier();
     std::cout << "Persistent cache tests passed\n";
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';

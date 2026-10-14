@@ -680,6 +680,69 @@ void contextWindow(MetalBackend &backend, uint32_t width) {
   require(invalid.empty(), "an invalid context window transfer encoded a dispatch");
 }
 
+// A state captured at s inside a command over [a, b) starts from the lane's
+// window as the command finds it, copied, and stores the command's rows
+// [a, s) into it as the lane's window takes them: the slots of its positions
+// [s - 2048, s) are, byte for byte, those one store of those rows leaves,
+// while the lane's window, which goes on to rows [s, b), has lost the oldest
+// once b passes 2048. Before the window fills and once the ring wraps.
+void contextWindowCapturedInside(MetalBackend &backend, uint32_t width) {
+  const uint64_t windowBytes = DraftAttention::contextWindowBytes(width);
+  const uint64_t rowBytes = uint64_t{width} * 2;
+  const uint64_t codeBytes = width / 2, groupBytes = width / 64 * 4;
+  Random random(0xc0de2000ULL + width);
+  for (const auto [a, s, b] : {std::array{1000U, 1500U, 2900U}, std::array{5000U, 5500U, 6900U}}) {
+    const MetalBuffer rows = randomBfloat(backend, uint64_t{b} * width, random, "draft context rows");
+    const auto store = [&](CommandGraph &graph, uint32_t begin, uint32_t end, const MetalBuffer &window) {
+      DraftAttention::addWindowStore(graph, backend.view(rows, begin * rowBytes, (end - begin) * rowBytes),
+                                     window, end - begin, begin, width);
+    };
+    const auto allocate = [&](const char *label) {
+      MetalBuffer window = backend.allocateBuffer(windowBytes, BufferStorage::Shared, label);
+      std::memset(window.contents(), 0xA5, windowBytes);
+      return window;
+    };
+    const MetalBuffer lane = allocate("lane window"), captured = allocate("captured window"), whole = allocate("whole window");
+    CommandGraph earlier;
+    store(earlier, a - std::min(a, kWindow), a, lane);
+    static_cast<void>(backend.submitCommandAsync(earlier.dispatches()).wait());
+    std::memcpy(captured.contents(), lane.contents(), windowBytes);
+    const std::vector<uint8_t> before(static_cast<const uint8_t *>(lane.contents()),
+                                      static_cast<const uint8_t *>(lane.contents()) + windowBytes);
+    CommandGraph command, reference;
+    store(command, a, b, lane);
+    store(command, a, s, captured);
+    store(reference, s - std::min(s, kWindow), s, whole);
+    static_cast<void>(backend.submitCommandAsync(command.dispatches()).wait());
+    static_cast<void>(backend.submitCommandAsync(reference.dispatches()).wait());
+    const auto slot = [&](const void *window, uint64_t position, bool codes) {
+      const uint64_t index = position % kWindow;
+      return static_cast<const uint8_t *>(window) +
+             (codes ? index * codeBytes : kWindow * codeBytes + index * groupBytes);
+    };
+    uint64_t lost = 0;
+    for (uint64_t position = s - std::min(s, kWindow); position < s; ++position)
+      for (const bool codes : {true, false}) {
+        const uint64_t bytes = codes ? codeBytes : groupBytes;
+        require(std::memcmp(slot(captured.contents(), position, codes), slot(whole.contents(), position, codes),
+                            bytes) == 0,
+                "a captured window's slot is not the one a store of its rows leaves");
+        if (position + kWindow < b) {
+          require(std::memcmp(slot(captured.contents(), position, codes), slot(before.data(), position, codes),
+                              bytes) == 0,
+                  "a captured window's overwritten slot is not the lane's before the command");
+          lost += std::memcmp(slot(lane.contents(), position, codes), slot(whole.contents(), position, codes),
+                              bytes) != 0;
+        } else {
+          require(std::memcmp(slot(captured.contents(), position, codes), slot(lane.contents(), position, codes),
+                              bytes) == 0,
+                  "a captured window's slot is not the lane's after the command");
+        }
+      }
+    require(lost != 0, "the lane's window kept the rows its later rows overwrite");
+  }
+}
+
 // Each buffer the draft phases reach, at its extent and one element short,
 // for three lanes of eight rows: the convolution's rows, the lanes' dynamic
 // weights and the taps' base weights; the prepare's q|k|v rows, its grouped
@@ -800,6 +863,7 @@ int main(int argc, char **argv) {
         surroundingPhases(backend, shape, lanes);
       contextWriters(backend, shape);
       contextWindow(backend, shape.hiddenSize);
+      contextWindowCapturedInside(backend, shape.hiddenSize);
       runCase(backend, 1, shape, {0, 0, 0, 0});
       runCase(backend, 2, shape, {2048, 2047, 0, 0});
       runCase(backend, 3, shape, {2100, 4094, 6143, 0});

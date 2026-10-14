@@ -137,6 +137,10 @@ int main(int argc, char **argv) {
         for (const LinearTile tile : {LinearTile::GgufRegister, LinearTile::GgufStaged})
           for (uint32_t splits = 1; splits <= LinearConfig::kMaximumSplits; splits *= 2) {
             const bool registerTile = tile == LinearTile::GgufRegister;
+            // The register tile takes the formats of quant_register_format only.
+            if (registerTile && !std::all_of(images.begin(), images.end(),
+                                             [](const Image &i) { return quant_register_format(i.format); }))
+              continue;
             if (registerTile ? K / 256 < splits : (K / 32) % splits) continue;
             const LinearConfig config{.tile = tile, .splits = splits, .spread = !registerTile && policy.spread};
             cases.push_back({"L" + std::to_string(lanes),

@@ -18,7 +18,7 @@
 // pins the bytes both sides agree on.
 namespace splash::protocol {
 
-inline constexpr uint16_t kProtocolVersion = 9;
+inline constexpr uint16_t kProtocolVersion = 10;
 // A frame is its header, the magic "SPLH", the u16 protocol version, the
 // u16 FrameType and the u64 payload length, then the payload.
 inline constexpr size_t kFrameHeaderBytes = 16;
@@ -131,9 +131,16 @@ validateLimits(const ProtocolLimits &limits);
 //   74 u32 score token count
 //   78 u32 generationPromptTokens
 //   82 u32 flags
-// then the prompt tokens, the 32-byte image spans, the image pixels and the
-// score tokens.
-inline constexpr uint64_t kRequestFixedBytes = 86;
+//   86 u64 cacheSalt.lo, u64 cacheSalt.hi
+//  102 u32 thinkingBudget.tokens, kNoThinkingBudget for none
+//  106 u32 thinking end token count, u32 thinkingBudget.alsoEnds, zero
+//      without a budget
+// then the prompt tokens, the 32-byte image spans, the image pixels, the
+// score tokens and the thinking end tokens.
+inline constexpr uint64_t kRequestFixedBytes = 114;
+inline constexpr uint32_t kNoThinkingBudget = 0xFFFFFFFFU;
+// A thinking budget's end holds 1 to this many tokens.
+inline constexpr uint32_t kMaximumThinkingEndTokens = 64;
 
 // The request flags word holds the RequestFlag bits and this one, which asks
 // for PromptProgressEvents while the prompt prefills.
@@ -170,6 +177,11 @@ struct RequestFrame {
   uint32_t generationPromptTokens = 0;
   // RequestFlag bits and kReturnProgressFlag.
   uint32_t flags = 0;
+  // The request's cache_salt as the server hashed it; zero without one.
+  engine::CacheSalt cacheSalt;
+  // Only a request that generates inside a thinking block has one; a score
+  // request never does.
+  std::optional<ThinkingBudget> thinkingBudget;
 
   bool operator==(const RequestFrame &) const = default;
 };
@@ -188,7 +200,9 @@ struct RequestFrame {
 //                  u32 count, u32 simulation tokens
 //   Done           u64 requestId, u8 reason, u32 promptTokens,
 //                  u32 completionTokens, u64 prefillMicros, u64 decodeMicros,
-//                  u64 wallMicros, u32 count, f32 option logits
+//                  u64 wallMicros, u32 deduplicatedTokens, u32 draftedTokens,
+//                  u32 acceptedDraftTokens, u32 speculative cycles, u32 count,
+//                  f32 option logits
 //   Error          u8 failureClass, u8 retryable, u64 requestId, u32 code
 //                  bytes, u32 message bytes, the code, the message
 //   StatusJson     u64 correlationId, the JSON
@@ -213,8 +227,9 @@ struct StatusRequestFrame {
 };
 
 // Asks the engine to give its weights back now, as the idle release does, when
-// it holds no request. The answer is a StatusJson with the same correlationId,
-// whose `weights.released` says whether the weights are released.
+// it holds no request and restores none, with the idle release on or off. The
+// answer is a StatusJson with the same correlationId, whose `weights` section
+// says whether the weights are released: `released` and not `restoring`.
 struct ReleaseRequestFrame {
   uint64_t correlationId = 0;
 
@@ -279,6 +294,12 @@ struct DoneEvent {
   // Raw final-prompt-position logits at the request's scoreTokens, in
   // requested order. Empty for generation and for cancelled/failed scoring.
   std::vector<float> optionLogits{};
+  // Tokens whose KV the request read from cached blocks another request
+  // computed, past the cached prefix it started from
+  // (engine::EngineEventSink::completed).
+  uint32_t deduplicatedTokens = 0;
+  // Its speculative decoding; zero without a draft and for scoring.
+  engine::SpeculativeCounts speculation{};
 
   bool operator==(const DoneEvent &) const = default;
 };

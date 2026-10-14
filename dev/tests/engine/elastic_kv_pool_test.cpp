@@ -260,6 +260,35 @@ void testCacheOwnsAPageOnce() {
     pool.releasePage(page, false);
 }
 
+// A page is cleared only while its requester holds it alone: a second
+// request or the cache may already read it.
+void testOnlyAPageItsRequesterHoldsAloneIsCleared() {
+    TestKvStorage storage(4, 100, 4);
+    KvPool pool(storage, 4);
+    auto acquired = pool.acquirePages(2);
+    require(acquired.granted(), "clearing setup failed");
+    const uint32_t alone = acquired.pages[0];
+    const uint32_t shared = acquired.pages[1];
+    storage.content[alone] = 7;
+    storage.content[shared] = 8;
+    pool.clearPage(alone);
+    require(storage.content[alone] == 0 && storage.cleared == std::vector<uint32_t>{alone},
+            "the page its requester holds alone was not cleared");
+    pool.retainPage(shared, false);
+    rejects([&] { pool.clearPage(shared); },
+            "only a page its requester holds alone can be cleared",
+            "a page two requests hold was cleared");
+    pool.releasePage(shared, false);
+    pool.retainPage(shared, true);
+    rejects([&] { pool.clearPage(shared); },
+            "only a page its requester holds alone can be cleared",
+            "a page the cache holds was cleared");
+    require(storage.content[shared] == 8 && storage.cleared.size() == 1,
+            "a refused clear changed the page");
+    pool.releasePage(shared, true);
+    release(pool, acquired.pages);
+}
+
 // The pool with every page allocated and held by a request, less the pages
 // in `released`. Every page starts with content of its own.
 KvPool held(TestKvStorage &storage, const std::vector<uint32_t> &released) {
@@ -385,6 +414,7 @@ int main() {
         testRefusedReleaseChangesNothing();
         testPrefixAndActiveReferencesHoldTheExtent();
         testCacheOwnsAPageOnce();
+        testOnlyAPageItsRequesterHoldsAloneIsCleared();
         testCompactionEmptiesTheExtentWithTheFewestPages();
         testCompactionFillsTheFullestExtentsFirst();
         testCompactionNeedsFreePagesInExtentsInUse();

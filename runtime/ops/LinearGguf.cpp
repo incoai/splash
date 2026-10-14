@@ -116,18 +116,21 @@ bool oneFormat(std::span<const Projection *const> projections) {
 // four, and on Q2_K 24-33% less at two and four lanes but 5-8% more at one.
 // Three lanes pad its 24 rows to 32, where it takes 16-47% more for every
 // format; the other formats keep the register tile, 6-44% faster at one lane.
+// A segment in a format the register tile cannot take (quant_register_format)
+// stages the plan whatever its rows.
 bool apple9Stages(LinearWorkload w, std::span<const Projection *const> projections) {
   const uint32_t lanes = w.rows / SPLASH_TARGET_VERIFY_ROWS;
-  bool quantized = false;
+  bool quantized = false, faster = true;
   for (const Projection *p : projections) {
     if (!p) continue;
     for (const QuantizedSegment &s : p->blocks().segments) {
       if (s.isFloat()) continue;
-      if (!apple9StagesFormat(s.formatId) && !(s.formatId == GGUF_FMT_Q2K && lanes >= 2)) return false;
+      if (!quant_register_format(s.formatId)) return true;
+      faster &= apple9StagesFormat(s.formatId) || (s.formatId == GGUF_FMT_Q2K && lanes >= 2);
       quantized = true;
     }
   }
-  return quantized && stagedTileRows(w.rows) == w.rows;
+  return quantized && faster && stagedTileRows(w.rows) == w.rows;
 }
 
 // The projection is the plan's matrix, and each of its segments (which tile
@@ -265,7 +268,8 @@ LinearScratchSize LinearPlan::scratchSize() const noexcept {
       : LinearScratchSize{};
 }
 
-LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *const> projections) const {
+LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *const> projections,
+                                  bool registerFormats) const {
   const auto [n, k] = w.matrix;
   // Prefill: 128-row tiles. A chunk of up to 32 rows runs the staged tile
   // of its rows (8, 16 or 32, two simdgroups) with the decode split rule:
@@ -283,7 +287,8 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
         : LinearConfig{.tile = LinearTile::GgufPrefill};
   // Apple9 runs matrix operations on the FP32 pipe, so the exact register
   // kernel beats staging but for the projections apple9Stages names.
-  if (family_ == GpuFamilyClass::Apple9 && !apple9Stages(w, projections)) return registerDecode(n, k, gpuCores_);
+  if (family_ == GpuFamilyClass::Apple9 && registerFormats && !apple9Stages(w, projections))
+    return registerDecode(n, k, gpuCores_);
   // Decode tiles walking K in lockstep all fetch the same slice of the input
   // at each step, just written by the operator before and in no cache yet,
   // and the fetch sits on every tile's critical path; starting each column
@@ -495,6 +500,11 @@ void Linear::addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &b,
   const auto [n, k] = w.matrix;
   const uint32_t lanes = w.rows / SPLASH_TARGET_VERIFY_ROWS;
   const std::vector<QuantizedSegment> &segments = p.blocks().segments;
+  for (const Projection *q : {&p, gate})
+    if (q)
+      for (const QuantizedSegment &s : q->blocks().segments)
+        if (!quant_register_format(s.formatId))
+          throw std::invalid_argument(std::string("the register tile does not take ") + s.name() + " weights");
   if (b.prepared.layout != LinearInput::Table16 || !b.prepared.source.sameView(b.input))
     graph.add("decode_linear_gguf_prepare", {b.input, b.scratch.input, b.scratch.sums}, k,
               {k / 32, lanes, 1}, {128, 1, 1});

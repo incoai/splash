@@ -34,6 +34,11 @@ REQUEST_FIELDS = (
     "score_count",
     "generation_prompt_tokens",
     "flags",
+    "cache_salt_lo",
+    "cache_salt_hi",
+    "thinking_tokens",
+    "thinking_end_count",
+    "thinking_also_ends",
 )
 assert len(REQUEST_FIELDS) == len(p._REQUEST.format) - 1
 OFFSET = dict(
@@ -65,6 +70,8 @@ def example_request():
         seed=0xFEDCBA9876543210,
         constraint=p.ConstraintMode.TOKEN_MASK,
         generation_prompt_tokens=2,
+        cache_salt=0x00112233445566778899AABBCCDDEEFF,
+        thinking_budget=p.ThinkingBudget(4096, (198, 248069), 248058),
     )
 
 
@@ -86,6 +93,7 @@ def example_score_request():
         sampling=p.SamplingParameters(),
         constraint=p.ConstraintMode.NONE,
         score_tokens=(101, 202, 303),
+        thinking_budget=None,
     )
 
 
@@ -126,9 +134,11 @@ def engine_events():
         "tokens": p.TokensEvent(91, 17, (10, 11, 12)),
         "mask_request_initial": p.MaskRequestEvent(91, 6, 4, ()),
         "mask_request_verify": p.MaskRequestEvent(91, 7, 4, (101, 102, 103)),
-        "done": p.DoneEvent(91, p.FinishReason.STOP, 4096, 512, 1000, 2000, 3500, ()),
+        "done": p.DoneEvent(
+            91, p.FinishReason.STOP, 4096, 512, 1000, 2000, 3500, (), 64, 350, 280, 50
+        ),
         "done_scored": p.DoneEvent(
-            91, p.FinishReason.STOP, 4096, 0, 1000, 0, 3500, (1.5, -2.25, 0.5)
+            91, p.FinishReason.STOP, 4096, 0, 1000, 0, 3500, (1.5, -2.25, 0.5), 32
         ),
         "error_request": p.ErrorEvent(
             p.FailureClass.REQUEST_ERROR,
@@ -415,10 +425,16 @@ class ProtocolPythonTests(unittest.TestCase):
                 len(request.score_tokens),
                 request.generation_prompt_tokens,
                 int(request.flags),
+                request.cache_salt & 0xFFFFFFFFFFFFFFFF,
+                request.cache_salt >> 64,
+                request.thinking_budget.tokens,
+                len(request.thinking_budget.end),
+                request.thinking_budget.also_ends,
             )
             + struct.pack(f"<{len(request.prompt_tokens)}I", *request.prompt_tokens)
             + struct.pack(p._IMAGE_SPAN.format, *astuple(span))
             + request.image_pixels
+            + struct.pack("<2I", *request.thinking_budget.end)
         )
         header = struct.pack(
             p._HEADER.format,
@@ -461,6 +477,10 @@ class ProtocolPythonTests(unittest.TestCase):
                 p.IssueCode.INVALID_CONSTRAINT,
             ),
             (
+                replace(base, thinking_budget=p.ThinkingBudget(0, (248069,), 248069)),
+                p.IssueCode.INVALID_COUNT,
+            ),
+            (
                 replace(
                     base,
                     image_spans=(p.ImageSpan(0, 1, 2, 2, 1, 2),),
@@ -488,20 +508,54 @@ class ProtocolPythonTests(unittest.TestCase):
 
     def test_done_option_logits_wire_layout_and_roundtrip(self):
         done = p.DoneEvent(
-            91, p.FinishReason.STOP, 4096, 0, 1000, 0, 3500, (1.5, -2.25, 0.5)
+            91, p.FinishReason.STOP, 4096, 0, 1000, 0, 3500, (1.5, -2.25, 0.5), 96
         )
         wire = native_peer.serialize_event(done)
         self.assertEqual(decode_event(wire), done)
+        self.assertEqual(
+            struct.unpack_from("<I", wire, p.FRAME_HEADER_BYTES + 41), (96,)
+        )
         # A wrong logit count must fail closed, not truncate.
         self.assert_protocol_error(
             p.FailureClass.PROTOCOL_FATAL,
             p.IssueCode.INVALID_PAYLOAD_LENGTH,
-            lambda: decode_event(mutate_u32(wire, p.FRAME_HEADER_BYTES + 41, 2)),
+            lambda: decode_event(
+                mutate_u32(wire, p.FRAME_HEADER_BYTES + p._DONE.size - 4, 2)
+            ),
         )
-        # A Done payload without its option-logit count (41 bytes) is below
-        # the minimum.
-        short = mutate_u64(wire[: p.FRAME_HEADER_BYTES + 41], 8, 41)
+        # A Done payload without its option-logit count is below the minimum.
+        size = p._DONE.size - 4
+        short = mutate_u64(wire[: p.FRAME_HEADER_BYTES + size], 8, size)
         self.assertEqual(parser_issue(short).code, p.IssueCode.INVALID_PAYLOAD_LENGTH)
+
+    def test_done_speculative_counts_round_trip_and_reject_inconsistent_totals(self):
+        done = p.DoneEvent(
+            91,
+            p.FinishReason.LENGTH,
+            20,
+            100,
+            1,
+            2,
+            3,
+            (),
+            drafted_tokens=210,
+            accepted_draft_tokens=70,
+            draft_cycles=30,
+        )
+        self.assertEqual(decode_event(native_peer.serialize_event(done)), done)
+        for counts in ((7, 8, 1), (7, 0, 0), (0, 0, 1), (7, 0, 8)):
+            with self.subTest(counts=counts):
+                bad = replace(
+                    done,
+                    drafted_tokens=counts[0],
+                    accepted_draft_tokens=counts[1],
+                    draft_cycles=counts[2],
+                )
+                self.assert_protocol_error(
+                    p.FailureClass.PROTOCOL_FATAL,
+                    p.IssueCode.INVALID_COUNT,
+                    lambda: decode_event(native_peer.serialize_event(bad)),
+                )
 
     def test_done_option_logits_validation(self):
         base = dict(
@@ -559,7 +613,9 @@ class ProtocolPythonTests(unittest.TestCase):
             (
                 p.PROTOCOL_VERSION,
                 int(p.FrameType.REQUEST),
-                p.REQUEST_FIXED_BYTES + 4 * len(request.prompt_tokens),
+                p.REQUEST_FIXED_BYTES
+                + 4 * len(request.prompt_tokens)
+                + 4 * len(request.thinking_budget.end),
             ),
         )
         self.assertEqual(
@@ -605,8 +661,59 @@ class ProtocolPythonTests(unittest.TestCase):
             struct.unpack_from("<IIIIQQ", wire, span_offset),
             (1, 1, 2, 2, 0x1111222233334444, 0x5555666677778888),
         )
-        self.assertEqual(wire[span_offset + 32 :], image.image_pixels)
+        # The thinking end tokens follow the pixels.
+        self.assertEqual(wire[span_offset + 32 : -8], image.image_pixels)
         self.assertEqual(decode_client(wire), image)
+
+    def test_thinking_budget_follows_the_cache_salt(self):
+        offset = p.FRAME_HEADER_BYTES + OFFSET["thinking_tokens"]
+        request = example_request()
+        wire = p.serialize_message(request)
+        # Its tokens, end token count and also_ends follow the cache salt,
+        # and its end tokens end the frame.
+        self.assertEqual(struct.unpack_from("<3I", wire, offset), (4096, 2, 248058))
+        self.assertEqual(struct.unpack_from("<2I", wire, len(wire) - 8), (198, 248069))
+        self.assertEqual(decode_client(wire), request)
+        # Without a budget the tokens word holds the sentinel, the others are
+        # zero and no end token follows; a budget of 0 ends thinking at once.
+        for budget in (
+            None,
+            p.ThinkingBudget(0, (248069,), 248069),
+            p.ThinkingBudget(
+                7, (198,) * (p.MAX_THINKING_END_TOKENS - 1) + (248069,), 248058
+            ),
+        ):
+            with self.subTest(budget=budget):
+                request = replace(example_request(), thinking_budget=budget)
+                encoded = p.serialize_message(request)
+                if budget is None:
+                    self.assertEqual(
+                        struct.unpack_from("<3I", encoded, offset), (0xFFFFFFFF, 0, 0)
+                    )
+                    self.assertEqual(len(encoded) + 8, len(wire))
+                self.assertEqual(decode_client(encoded), request)
+        for budget in (
+            p.ThinkingBudget(0xFFFFFFFF, (248069,), 248069),
+            p.ThinkingBudget(-1, (248069,), 248069),
+            p.ThinkingBudget(True, (248069,), 248069),
+            p.ThinkingBudget(4096, (1 << 32,), 248069),
+            p.ThinkingBudget(4096, [248069], 248069),
+            p.ThinkingBudget(4096, (248069,), 1.0),
+            p.ThinkingBudget(4096, (), 248069),
+            p.ThinkingBudget(4096, (198,) * p.MAX_THINKING_END_TOKENS + (248069,), 0),
+            # Only the last end token may end thinking.
+            p.ThinkingBudget(4096, (248069, 248069), 248069),
+            p.ThinkingBudget(4096, (248058, 248069), 248058),
+        ):
+            with self.subTest(budget=budget):
+                issue = self.assert_protocol_error(
+                    p.FailureClass.REQUEST_ERROR,
+                    p.IssueCode.INVALID_COUNT,
+                    lambda budget=budget: p.serialize_message(
+                        replace(example_request(), thinking_budget=budget)
+                    ),
+                )
+                self.assertEqual(issue.request_id, example_request().request_id)
 
     def test_generation_prompt_must_leave_a_prompt_token(self):
         request = example_request()

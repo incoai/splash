@@ -6,7 +6,6 @@ from unittest import mock
 from openai import OpenAI
 
 from dev.tests.server_fixtures import (
-    FOREVER,
     FakeConstraintFactory,
     FakeRuntime,
     FakeTokenizer,
@@ -16,7 +15,6 @@ from dev.tests.server_fixtures import (
     anthropic_body,
     byte_backend,
     chat_body,
-    make_frontend,
     next_sse_data,
     response_events,
     responses_body,
@@ -24,7 +22,7 @@ from dev.tests.server_fixtures import (
 )
 from server import backend as backend_api
 from server import output as model_output
-from server import server as api
+from server import tool_schema
 
 
 class ToolCallTests(HarnessTestCase):
@@ -564,61 +562,292 @@ class ToolCallTests(HarnessTestCase):
                     (content, names, reason), (prose, ["weather"], "tool_calls")
                 )
 
-    def test_stop_is_refused_only_while_a_tool_can_be_called(self):
-        tokenizer = FakeTokenizer()
-        backend = backend_api.NativeBackend(
-            FakeRuntime(), tokenizer, lambda _record: None
+    def test_stop_cuts_output_beside_tools_as_the_token_limit_does(self):
+        # A stop sequence ends the output wherever the model writes it. One
+        # inside a call cuts it as the token limit would: the call keeps the
+        # arguments it has, unfinished, and does not count as made. A
+        # structured answer it cuts goes unvalidated.
+        factory = FakeConstraintFactory()
+        harness = self.harness(
+            FakeRuntime(
+                Plan([[5]]), Plan([[5], [4]]), Plan([[5]]), Plan([[5]]), Plan([[10]])
+            ),
+            constraint_factory=factory,
         )
-        self.addCleanup(backend.close)
-        app = make_frontend(tokenizer, backend, "test-model", 128, 1, 2, vision=True)
-        tools = [{"type": "function", "function": {"name": "f"}}]
-        job = app.prepare(
-            chat_body(tools=tools, tool_choice="none", stop=["x"]), deadline=FOREVER
-        )
-        self.assertEqual(job.tool_policy.schemas, {})
-        for choice in ("auto", "required"):
-            with (
-                self.subTest(tool_choice=choice),
-                self.assertRaisesRegex(api.APIError, "stop cannot be combined"),
-            ):
-                app.prepare(
-                    chat_body(tools=tools, tool_choice=choice, stop=["x"]),
-                    deadline=FOREVER,
-                )
+        tools = [{"type": "function", "function": {"name": "weather"}}]
 
-    def test_tool_names_accept_long_mcp_names_up_to_128_characters(self):
+        def chat(**fields):
+            status, _, payload = harness.request(
+                "POST",
+                "/v1/chat/completions",
+                chat_body(reasoning_effort="none", **fields),
+            )
+            self.assertEqual(status, 200, payload)
+            return json.loads(payload)["choices"][0]
+
+        choice = chat(tools=tools, stop=["ris"])
+        self.assertEqual(choice["finish_reason"], "stop")
+        call = choice["message"]["tool_calls"][0]["function"]
+        self.assertEqual((call["name"], call["arguments"]), ("weather", "{"))
+        choice = chat(tools=tools, stop=["answer"])
+        self.assertEqual(choice["finish_reason"], "tool_calls")
+        call = choice["message"]["tool_calls"][0]["function"]
+        self.assertEqual(json.loads(call["arguments"]), {"city": "Paris"})
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/messages",
+            anthropic_body(
+                tools=[{"name": "weather", "input_schema": {"type": "object"}}],
+                stop_sequences=["ris"],
+            ),
+        )
+        self.assertEqual(status, 200, payload)
+        message = json.loads(payload)
+        self.assertEqual(message["stop_reason"], "stop_sequence")
+        self.assertNotIn("tool_use", [block["type"] for block in message["content"]])
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/responses",
+            responses_body(
+                tools=[{"type": "function", "name": "weather", "parameters": {}}],
+                stop=["ris"],
+                reasoning={"effort": "none"},
+            ),
+        )
+        self.assertEqual(status, 200, payload)
+        response = json.loads(payload)
+        self.assertEqual(
+            (response["status"], response["output"][-1]["type"]),
+            ("completed", "function_call"),
+        )
+        self.assertEqual(response["output"][-1]["status"], "incomplete")
+        schema = {"type": "object", "required": ["x"]}
+        choice = chat(
+            response_format={"type": "json_schema", "json_schema": {"schema": schema}},
+            stop=[":3"],
+        )
+        self.assertEqual(
+            (choice["finish_reason"], choice["message"]["content"]), ("stop", '{"x"')
+        )
+
+    def test_a_stop_sequence_cuts_only_the_call_it_ends_in(self):
+        # Text before a stop sequence is the text the client asked for, a
+        # trailing "<" included. One inside a call, at its name too, cuts it,
+        # and then no call of the output counts as made.
+        tokenizer = FakeTokenizer()
+        tokenizer.fragments[90] = "a <"
+        tokenizer.fragments[91] = " b more"
+        tokenizer.fragments[92] = (
+            tokenizer.fragments[5] + "<tool_call>\n<function=time>\n</function>\n"
+        )
+        tokenizer.backend_tokenizer = byte_backend(tokenizer.fragments)
+        harness = self.harness(
+            FakeRuntime(Plan([[90], [91]]), Plan([[92]]), Plan([[92]])),
+            tokenizer=tokenizer,
+        )
+        names = ("weather", "time")
+        tools = [{"type": "function", "function": {"name": name}} for name in names]
+        choices = [
+            json.loads(
+                harness.request(
+                    "POST",
+                    "/v1/chat/completions",
+                    chat_body(tools=tools, stop=[stop], reasoning_effort="none"),
+                )[2]
+            )["choices"][0]
+            for stop in (" b", "ime")
+        ]
+        self.assertEqual(
+            [
+                (choice["message"]["content"], choice["finish_reason"])
+                for choice in choices
+            ],
+            [("a <", "stop"), (None, "stop")],
+        )
+        calls = choices[1]["message"]["tool_calls"]
+        self.assertEqual([call["function"]["name"] for call in calls], ["weather"])
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/messages",
+            anthropic_body(
+                tools=[{"name": name, "input_schema": {}} for name in names],
+                stop_sequences=["ime"],
+            ),
+        )
+        self.assertEqual(status, 200, payload)
+        message = json.loads(payload)
+        self.assertEqual(message["stop_reason"], "stop_sequence")
+        self.assertEqual(
+            [
+                block["name"]
+                for block in message["content"]
+                if block["type"] == "tool_use"
+            ],
+            ["weather"],
+        )
+
+    def test_a_stop_sequence_at_a_call_name_leaves_the_item_before_complete(self):
+        # A call a stop sequence cuts at its name has no item: the whole call
+        # or the text before it is the output's last item, and ends complete.
+        tokenizer = FakeTokenizer()
+        cut = "<tool_call>\n<function=time>\n</function>\n"
+        tokenizer.fragments[92] = tokenizer.fragments[5] + cut
+        tokenizer.fragments[93] = "Checking.\n" + cut
+        tokenizer.backend_tokenizer = byte_backend(tokenizer.fragments)
+        harness = self.harness(
+            FakeRuntime(*(Plan([[token]]) for token in (92, 92, 93, 93))),
+            tokenizer=tokenizer,
+        )
+        tools = [
+            {"type": "function", "name": name, "parameters": {}}
+            for name in ("weather", "time")
+        ]
+        for kind in ("function_call", "message"):
+            for stream in (False, True):
+                with self.subTest(kind=kind, stream=stream):
+                    status, _, payload = harness.request(
+                        "POST",
+                        "/v1/responses",
+                        responses_body(
+                            tools=tools,
+                            stop=["ime"],
+                            stream=stream,
+                            reasoning={"effort": "none"},
+                        ),
+                    )
+                    self.assertEqual(status, 200, payload)
+                    if stream:
+                        events = response_events(payload)
+                        self.assertEqual(events[-1]["type"], "response.completed")
+                        response = events[-1]["response"]
+                        done = [
+                            event["item"]
+                            for event in events
+                            if event["type"] == "response.output_item.done"
+                        ]
+                        self.assertEqual(done, response["output"])
+                    else:
+                        response = json.loads(payload)
+                    self.assertEqual(response["status"], "completed")
+                    self.assertEqual(
+                        [(item["type"], item["status"]) for item in response["output"]],
+                        [(kind, "completed")],
+                    )
+
+    def test_tool_names_are_those_the_call_tags_carry(self):
+        # A call reads its function's name back from <function=...> as written.
         runtime = FakeRuntime(Plan([[4]]))
         harness = self.harness(runtime)
-        name = (
-            "mcp__github_enterprise_server__list_pull_request_review_comments_for_repos"
-        )
-        self.assertEqual(len(name), 74)
-        status, _, _ = harness.request(
+        names = [
+            "mcp__github_enterprise_server__list_pull_request_review_comments_for_repos",
+            "mcp.search",
+            "web search",
+            "files:read/v2",
+            "天气",
+            "n" * 256,
+        ]
+        status, _, payload = harness.request(
             "POST",
             "/v1/chat/completions",
             chat_body(
-                tools=[{"type": "function", "function": {"name": name}}],
+                tools=[{"function": {"name": name}} for name in names],
                 reasoning_effort="none",
             ),
         )
-        self.assertEqual(status, 200)
+        self.assertEqual(status, 200, payload)
         _, kwargs = harness.tokenizer.templates[-1]
-        self.assertEqual(kwargs["tools"][0]["function"]["name"], name)
-        cases = (
-            (
-                {"type": "function", "function": {"name": "mcp__" + "a" * 124}},
-                "tool name must match [A-Za-z0-9_-]{1,128}",
-            ),
-            ({"type": "web_search"}, "only function tools are supported"),
+        # A tool that names no type is declared as a function.
+        self.assertEqual(
+            kwargs["tools"],
+            [{"type": "function", "function": {"name": name}} for name in names],
         )
+        rule = (
+            "tool name must be 1 to 256 characters in NFC, without <, >, line "
+            "breaks, lone surrogates or surrounding whitespace"
+        )
+        # A name the tokenizer would write otherwise does not read back: Qwen's
+        # normalizes text to NFC, and none spells a lone surrogate.
+        unreadable = ("cafe\u0301", "\u212bngstrom", "lone\ud800")
+        missing = "a function tool needs a function object"
+        cases = [
+            *(
+                ({"type": "function", "function": {"name": name}}, rule)
+                for name in (
+                    "",
+                    " lead",
+                    "trail\t",
+                    "a>b",
+                    "a<b",
+                    "a\nb",
+                    "n" * 257,
+                    7,
+                    *unreadable,
+                )
+            ),
+            ({"type": "function"}, missing),
+            # A Responses tool sent to Chat.
+            ({"name": "weather", "parameters": {}}, missing),
+            ({"type": "web_search"}, "only function tools are supported"),
+        ]
         for tool, message in cases:
-            with self.subTest(message=message):
+            with self.subTest(tool=tool):
                 status, _, payload = harness.request(
                     "POST", "/v1/chat/completions", chat_body(tools=[tool])
                 )
                 self.assertEqual(status, 400)
                 self.assertEqual(json.loads(payload)["error"]["message"], message)
         self.assertEqual(len(runtime.requests), 1)
+
+    def test_unreadable_schema_only_describes_a_tool_that_is_not_strict(self):
+        # Only a strict tool's grammar is built from its schema. Any other
+        # tool is offered as sent, and its values convert as undeclared ones:
+        # each city below says it is a string, which would keep "3" as text.
+        # The parameters' object, properties map and city take three levels.
+        deep = {"type": "string"}
+        for _ in range(tool_schema.MAX_SCHEMA_DEPTH - 3):
+            deep = {"type": "array", "items": deep}
+        cases = (
+            ({"type": "string", "required": True}, "invalid tool schema for weather: "),
+            (
+                {"type": "string", "$ref": "https://example.com/city"},
+                "remote tool schema reference",
+            ),
+            (
+                {"type": "string", "not": deep},
+                "invalid tool schema for weather: nested more than 64 levels",
+            ),
+        )
+        harness = self.harness(FakeRuntime(*(Plan([[28]]) for _ in cases)))
+        for city, message in cases:
+            for strict in (False, True):
+                tool = {
+                    "type": "function",
+                    "function": {
+                        "name": "weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": city},
+                        },
+                        "strict": strict,
+                    },
+                }
+                with self.subTest(message=message, strict=strict):
+                    status, _, payload = harness.request(
+                        "POST",
+                        "/v1/chat/completions",
+                        chat_body(tools=[tool], reasoning_effort="none"),
+                    )
+                    if strict:
+                        self.assertEqual(status, 400)
+                        self.assertIn(message, json.loads(payload)["error"]["message"])
+                        continue
+                    self.assertEqual(status, 200, payload)
+                    _, kwargs = harness.tokenizer.templates[-1]
+                    self.assertEqual(kwargs["tools"], [tool])
+                    call = json.loads(payload)["choices"][0]["message"]["tool_calls"][0]
+                    self.assertEqual(
+                        json.loads(call["function"]["arguments"]), {"city": 3}
+                    )
 
     def test_pydantic_style_schema_reads_values_through_references(self):
         # The parameter's types come through its local reference, and a value
@@ -644,11 +873,18 @@ class ToolCallTests(HarnessTestCase):
         ]
         named = {"type": "function", "function": {"name": "weather"}}
         cases = (
-            ([4], {"tool_choice": "required"}, []),
-            ([16], {"tool_choice": named}, ["time"]),
-            ([5, 16], {"parallel_tool_calls": False}, ["weather", "time"]),
+            ("required", [4], {"tool_choice": "required"}, []),
+            ("named", [16], {"tool_choice": named}, ["time"]),
+            (
+                "untyped",
+                [16],
+                {"tool_choice": {"function": named["function"]}},
+                ["time"],
+            ),
+            ("single", [5, 16], {"parallel_tool_calls": False}, ["weather", "time"]),
         )
-        for batch, extra, names in cases:
+        grammars = {}
+        for label, batch, extra, names in cases:
             with self.subTest(**extra):
                 factory = FakeConstraintFactory()
                 harness = self.harness(
@@ -660,7 +896,7 @@ class ToolCallTests(HarnessTestCase):
                     chat_body(tools=tools, reasoning_effort="none", **extra),
                 )
                 self.assertEqual(status, 200, payload)
-                self.assertEqual(len(factory.grammars), 1)
+                (grammars[label],) = factory.grammars
                 message = json.loads(payload)["choices"][0]["message"]
                 self.assertEqual(
                     [
@@ -669,6 +905,9 @@ class ToolCallTests(HarnessTestCase):
                     ],
                     names,
                 )
+        # A named choice that names no type names a function.
+        self.assertEqual(grammars["untyped"], grammars["named"])
+        self.assertNotEqual(grammars["named"], grammars["required"])
 
     def test_parallel_calls_stream_as_the_model_writes_them(self):
         # No call is checked against its tool's schema: a value its types
@@ -802,7 +1041,7 @@ class ToolCallTests(HarnessTestCase):
             "POST", "/v1/chat/completions", chat_body(tools=[tool])
         )
         self.assertEqual(status, 400)
-        self.assertIn("tool name must match", json.loads(payload)["error"]["message"])
+        self.assertIn("tool name must be", json.loads(payload)["error"]["message"])
         self.assertEqual(factory.grammars, [])
 
 

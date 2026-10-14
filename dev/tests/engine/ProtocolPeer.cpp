@@ -99,6 +99,13 @@ FrameType write(Writer &out, const RequestFrame &request) {
   out.u32(static_cast<uint32_t>(request.scoreTokens.size()));
   out.u32(request.generationPromptTokens);
   out.u32(request.flags);
+  out.u64(request.cacheSalt.lo);
+  out.u64(request.cacheSalt.hi);
+  const ThinkingBudget thinking =
+      request.thinkingBudget.value_or(ThinkingBudget{.tokens = kNoThinkingBudget});
+  out.u32(thinking.tokens);
+  out.u32(static_cast<uint32_t>(thinking.end.size()));
+  out.u32(thinking.alsoEnds);
   out.words(request.promptTokens);
   for (const ImageSpan &span : request.imageSpans) {
     out.u32(span.offset);
@@ -110,6 +117,7 @@ FrameType write(Writer &out, const RequestFrame &request) {
   }
   out.raw(request.imagePixels);
   out.words(request.scoreTokens);
+  out.words(thinking.end);
   return FrameType::Request;
 }
 
@@ -200,6 +208,8 @@ EngineEvent decodeEvent(FrameType type, Reader &in) {
     event.prefillMicros = in.u64();
     event.decodeMicros = in.u64();
     event.wallMicros = in.u64();
+    event.deduplicatedTokens = in.u32();
+    event.speculation = {in.u32(), in.u32(), in.u32()};
     event.optionLogits.resize(in.u32());
     for (float &logit : event.optionLogits)
       logit = in.f32();

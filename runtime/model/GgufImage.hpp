@@ -66,11 +66,12 @@ struct TensorScale {
   bool bfloat16 = false, reciprocal = false;
 };
 
-// Rows [0, rows) of one source tensor in image order, read from `file`: rows of
-// rowBytes bytes at `offset` of its tensor data, or its format's native rows,
-// which the writer builds from a quantized safetensors tensor's tensors
-// (safetensors.codes or safetensors.bfloat16 set) or from llama.cpp's NVFP4
-// rows (ggufNvfp4RowBytes set: rows of block_nvfp4 that long from `offset` on).
+// Rows [first, first + rows) of one source tensor in image order, read from
+// `file`: rows of rowBytes bytes at `offset` of its tensor data, or its
+// format's native rows, which the writer builds from a quantized safetensors
+// tensor's tensors (safetensors.codes or safetensors.bfloat16 set) or from
+// llama.cpp's NVFP4 rows (ggufNvfp4RowBytes set: rows of block_nvfp4 that long
+// from `offset` on).
 struct TensorRows {
   std::string name;
   uint32_t type = 0;   // ggml type, or a loader's (metal/abi/QuantFormat.h)
@@ -82,6 +83,7 @@ struct TensorRows {
   SafetensorsSource safetensors{};
   TensorScale scale{};
   uint64_t ggufNvfp4RowBytes = 0;
+  uint64_t first = 0; // the source row of image row 0
 };
 
 // Header and descriptor bytes.
@@ -93,12 +95,13 @@ struct Fill {
 // value it equals exactly (rows the kernels read as bf16), widened from BF16
 // to the F32 value it equals (rows the kernels read as F32), as the F32 decay
 // -exp(A_log) of a safetensors GDN's A_log, BF16 or F32, which
-// float(-exp(double)) rounds once, as the F32 values of a quantized
-// safetensors tensor's rows (affine s * code + z, mxfp4, nvfp4 or fp8), which
-// the kernels read unquantized (its MoE router and shared-expert gate, GDN
-// alpha and beta of two formats), or as the F32 1 + w of a BF16 RMSNorm
+// float(-exp(double)) rounds once, as the F32 values of a quantized tensor's
+// native rows, which the GPU decodes as the format's gather does
+// (kernels/common/gguf_embedding_formats.h) and the kernels read unquantized
+// (a safetensors MoE router and shared-expert gate, GDN alpha and beta of two
+// types or of BF16 or F16), or as the F32 1 + w of a BF16 RMSNorm
 // weight w, which transformers stores 1 below the weight the norm multiplies
-// by (exact but for |w| < 2^-16, which it rounds once).
+// by (exact but where |w| < 2^-16 or |w| >= 2^24, which it may round once).
 enum class Conversion : uint8_t { None, NarrowToBfloat16, WidenToFloat32, Decay, DequantizeToFloat32, CenteredNorm };
 // Rows written back to back, each value converted as `conversion` says.
 struct Copy {

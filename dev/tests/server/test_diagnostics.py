@@ -68,7 +68,11 @@ class DiagnosticsTests(HarnessTestCase):
         self.assertNotIn("hello", json.dumps(records))
 
         for logged, pattern in (
-            (started, r"^\d{2}:\d{2}:\d{2} Started · input \d+ · cached \d+\n$"),
+            (
+                started,
+                r"^\d{2}:\d{2}:\d{2} Started · input \d+ · cached \d+"
+                r" · effort none · thinking off\n$",
+            ),
             (record, r"^\d{2}:\d{2}:\d{2} Done · input [^\n]*\n$"),
         ):
             with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
@@ -103,6 +107,50 @@ class DiagnosticsTests(HarnessTestCase):
             " · TTFT 0.8s · 85.0 tok/s\n",
         )
 
+    def test_console_names_tokens_read_from_cached_blocks(self):
+        # A cold request whose first blocks matched cached ones read those
+        # blocks' KV in its later chunks: cached 0 alone would hide it.
+        record = {
+            "outcome": "stop",
+            "prompt_tokens": 168,
+            "completion_tokens": 0,
+            "metrics": {"cache": {"matched_tokens": 0, "deduplicated_tokens": 64}},
+        }
+        with (
+            mock.patch.object(api.time, "strftime", return_value="08:02:27"),
+            mock.patch("sys.stdout", new_callable=io.StringIO) as output,
+        ):
+            diagnostics.print_request(record)
+        self.assertEqual(
+            output.getvalue(),
+            "08:02:27 Done · input 168 · cached 0 · deduplicated 64 · output 0\n",
+        )
+
+    def test_console_names_tokens_per_speculative_cycle(self):
+        # Five verified drafts accepted 20 tokens: each cycle yielded 5.
+        record = {
+            "outcome": "stop",
+            "prompt_tokens": 168,
+            "completion_tokens": 25,
+            "metrics": {
+                "cache": {"matched_tokens": 0},
+                "speculation": {
+                    "drafted_tokens": 35,
+                    "accepted_draft_tokens": 20,
+                    "cycles": 5,
+                },
+            },
+        }
+        with (
+            mock.patch.object(api.time, "strftime", return_value="08:02:27"),
+            mock.patch("sys.stdout", new_callable=io.StringIO) as output,
+        ):
+            diagnostics.print_request(record)
+        self.assertEqual(
+            output.getvalue(),
+            "08:02:27 Done · input 168 · cached 0 · output 25 · 5.0 tok/cycle\n",
+        )
+
     def test_console_request_start(self):
         with (
             mock.patch.object(api.time, "strftime", return_value="19:03:32"),
@@ -117,6 +165,90 @@ class DiagnosticsTests(HarnessTestCase):
             )
         self.assertEqual(
             output.getvalue(), "19:03:32 Started · input 153,545 · cached 23,456\n"
+        )
+
+    def test_console_start_shows_how_a_chat_request_reasons(self):
+        def line(**reasoning):
+            with (
+                mock.patch.object(api.time, "strftime", return_value="19:03:32"),
+                mock.patch("sys.stdout", new_callable=io.StringIO) as output,
+            ):
+                diagnostics.print_request(
+                    {
+                        "outcome": "started",
+                        "prompt_tokens": 2_473,
+                        "cached_tokens": 0,
+                        "reasoning": {
+                            "sent_effort": None,
+                            "effort": None,
+                            "enable_thinking": None,
+                            "thinking": True,
+                            **reasoning,
+                        },
+                    }
+                )
+            return output.getvalue().removeprefix(
+                "19:03:32 Started · input 2,473 · cached 0"
+            )
+
+        self.assertEqual(line(), " · effort absent · thinking on\n")
+        self.assertEqual(line(effort="low"), " · effort absent → low · thinking on\n")
+        self.assertEqual(
+            line(sent_effort="none", effort="none", thinking=False),
+            " · effort none · thinking off\n",
+        )
+        self.assertEqual(
+            line(
+                sent_effort="xhigh",
+                effort="xhigh",
+                enable_thinking=False,
+                thinking=False,
+            ),
+            " · effort xhigh · enable_thinking false · thinking off\n",
+        )
+
+    def test_started_records_carry_chat_reasoning_options(self):
+        records = []
+        harness = self.harness(
+            FakeRuntime(),
+            request_logger=records.append,
+            default_reasoning_effort="low",
+        )
+        for body in (
+            chat_body(),
+            chat_body(reasoning_effort="none"),
+            chat_body(chat_template_kwargs={"enable_thinking": False}),
+        ):
+            status, _, payload = harness.request("POST", "/v1/chat/completions", body)
+            self.assertEqual(status, 200, payload)
+        status, _, payload = harness.request(
+            "POST", "/v1/completions", {"model": "test-model", "prompt": "Hi"}
+        )
+        self.assertEqual(status, 200, payload)
+        started = [record for record in records if record["outcome"] == "started"]
+        self.assertEqual(
+            [record.get("reasoning") for record in started],
+            [
+                {
+                    "sent_effort": None,
+                    "effort": "low",
+                    "enable_thinking": None,
+                    "thinking": True,
+                },
+                {
+                    "sent_effort": "none",
+                    "effort": "none",
+                    "enable_thinking": None,
+                    "thinking": False,
+                },
+                {
+                    "sent_effort": None,
+                    "effort": "low",
+                    "enable_thinking": False,
+                    "thinking": False,
+                },
+                None,
+            ],
         )
 
     def test_console_shows_the_tool_block_signature(self):

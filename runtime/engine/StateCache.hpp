@@ -112,12 +112,13 @@ enum class PersistStatus : uint8_t {
   Durable,
   // Writes it needs are in flight; it is durable once they land.
   Started,
-  // The tier takes no more of these writes for now; a later step may.
+  // The tier takes no more of these writes for now (transfers in flight, or
+  // the write budget holds the state back); a later step may.
   Busy,
   // Nothing to keep: the point is gone, or its conversation went on from it.
   Unneeded,
-  // The tier cannot keep it: its quota holds nothing to give up, or its
-  // writes failed.
+  // The tier cannot keep it: the point is larger than what it may hold now,
+  // making room gave the point itself up, or a file stopped taking writes.
   Refused,
 };
 
@@ -185,6 +186,8 @@ public:
   // false only when the matching checkpoint is pinned; absent, replaced and
   // upgraded publications already satisfy the postcondition.
   bool retireCheckpointState(StateCheckpoint checkpoint) noexcept;
+  // The matching checkpoint is pinned: retireCheckpointState refuses it.
+  [[nodiscard]] bool checkpointPinned(StateCheckpoint checkpoint) const noexcept;
   // An unfinished request's conversation resumes from the state at this
   // block, published or yet to be. Until the handle is released that state
   // is in use, and so is the KV it restores through: the candidates below
@@ -207,10 +210,14 @@ public:
   [[nodiscard]] uint64_t bytes(uint64_t kvBlock) const noexcept;
   // A RAM copy exists.
   [[nodiscard]] bool stateResident(uint64_t kvBlock) const noexcept;
+  // A disk copy exists, written or being written.
+  [[nodiscard]] bool onDisk(uint64_t kvBlock) const noexcept;
   // In a persistent tier, writes a disk copy of a RAM copy from the RAM
   // copy's own buffers, which stay: the next process takes the disk copy
   // back. Until the write lands the RAM copy is no eviction candidate, and
-  // the write is the one in flight. Durable once a disk copy has landed.
+  // the write is the one in flight. Durable once a disk copy has landed;
+  // busy while the write budget holds the state back, and refused once its
+  // file takes no write of a copy in use either.
   [[nodiscard]] PersistStatus persist(uint64_t kvBlock);
   // In a persistent tier, labels every disk copy again, with its state's
   // block, class and current recency.

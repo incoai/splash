@@ -19,8 +19,10 @@ from dev.tests.server_fixtures import (
     FakeRuntime,
     Harness,
     HarnessTestCase,
+    TemplateTokenizer,
     chat_body,
     empty_page_cache,
+    make_frontend,
     no_signed_thinking,
     pdf_bytes,
     request,
@@ -36,23 +38,105 @@ from server.errors import APIError
 
 
 class RequestContractTests(HarnessTestCase):
-    def test_optional_null_parameters_and_timeout_cap(self):
+    def test_a_null_field_is_one_left_out(self):
+        # As clients that write every field they do not set as null mean it:
+        # at the top level of each generation endpoint, and in the optional
+        # fields read inside a request's objects.
         harness = Harness(FakeRuntime())
         self.addCleanup(harness.close)
-        body = {
-            "model": "test-model",
-            "messages": [{"role": "user", "content": "Hi"}],
-            "max_tokens": 16,
-            "stream": None,
-            "temperature": None,
-            "top_p": None,
-            "n": None,
-            "parallel_tool_calls": None,
-            "presence_penalty": None,
-            "frequency_penalty": None,
-        }
-        status, _, payload = harness.request("POST", "/v1/chat/completions", body)
-        self.assertEqual(status, 200, payload)
+        messages = [{"role": "user", "content": "Hi"}]
+        for path, body in (
+            (
+                "/v1/chat/completions",
+                {
+                    "messages": messages,
+                    "max_tokens": 16,
+                    "stream_options": {"include_usage": None},
+                    **dict.fromkeys(
+                        (
+                            "model",
+                            "stream",
+                            "temperature",
+                            "top_p",
+                            "n",
+                            "seed",
+                            "stop",
+                            "priority",
+                            "ignore_eos",
+                            "return_progress",
+                            "tools",
+                            "tool_choice",
+                            "parallel_tool_calls",
+                            "response_format",
+                            "chat_template_kwargs",
+                            "cache_salt",
+                        )
+                    ),
+                },
+            ),
+            (
+                "/v1/completions",
+                {
+                    "prompt": "Hi",
+                    **dict.fromkeys(
+                        ("model", "n", "best_of", "max_tokens", "echo", "logprobs")
+                    ),
+                },
+            ),
+            (
+                "/v1/responses",
+                {
+                    "input": "Hi",
+                    **dict.fromkeys(
+                        ("model", "instructions", "tools", "reasoning", "truncation")
+                    ),
+                },
+            ),
+            (
+                "/v1/messages",
+                {
+                    "model": "test-model",
+                    "max_tokens": 16,
+                    "messages": [
+                        *messages,
+                        {
+                            "role": "assistant",
+                            "content": [
+                                {"type": "thinking", "thinking": "", "signature": None},
+                                {
+                                    "type": "tool_use",
+                                    "id": "t",
+                                    "name": "f",
+                                    "input": {},
+                                },
+                            ],
+                        },
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "t",
+                                    "content": None,
+                                    "is_error": None,
+                                }
+                            ],
+                        },
+                    ],
+                    "tools": [{"name": "f", "type": None, "input_schema": None}],
+                    "tool_choice": {"type": "auto", "disable_parallel_tool_use": None},
+                    "output_config": {"effort": None, "format": None},
+                    **dict.fromkeys(("stream", "system", "thinking", "metadata")),
+                },
+            ),
+        ):
+            with self.subTest(path=path):
+                status, _, payload = harness.request("POST", path, body)
+                self.assertEqual(status, 200, payload)
+
+    def test_a_request_timeout_is_capped_at_the_server_timeout(self):
+        harness = Harness(FakeRuntime())
+        self.addCleanup(harness.close)
         deadline = harness.app.request_deadline({"timeout": 1e6}, 10)
         self.assertEqual(deadline, 10 + harness.app.request_timeout)
 
@@ -72,7 +156,7 @@ class RequestContractTests(HarnessTestCase):
         rendering = "the PDF reached rendering"
         invalid = (
             ({"temperature": 5}, "temperature must be"),
-            ({"seed": -1}, "seed must be"),
+            ({"seed": -(2**63) - 1}, "seed must be"),
             ({"priority": "urgent"}, "priority must be"),
             ({"n": 2}, "n and logprobs"),
         )
@@ -148,6 +232,89 @@ class RequestContractTests(HarnessTestCase):
                 deadline=FOREVER,
             )[1]["tool_calls"][0]["id"],
             "call_42",
+        )
+
+    def test_history_reads_reasoning_and_text_parts_as_clients_send_them(self):
+        image = "data:image/png;base64,AAAA"
+        normalized = normalize_messages(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "output_text", "text": "look"},
+                        {"type": "input_image", "image_url": image},
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "output_text", "text": "I can't "},
+                        {"type": "refusal", "refusal": "do that."},
+                    ],
+                    "reasoning": "thought",
+                },
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning": "other",
+                    "reasoning_content": "own",
+                },
+                # Reasoning that is not text, which some clients send, is left out.
+                {"role": "assistant", "content": "", "reasoning": {"effort": "low"}},
+                {"role": "user", "content": "why?"},
+            ],
+            vision=True,
+            deadline=FOREVER,
+        )
+        self.assertEqual(
+            normalized[0]["content"],
+            [
+                {"type": "text", "text": "look"},
+                {"type": "image_url", "image_url": {"url": image}},
+            ],
+        )
+        self.assertEqual(
+            [
+                (message["content"], message["reasoning_content"])
+                for message in normalized[1:3]
+            ],
+            [("I can't do that.", "thought"), ("", "own")],
+        )
+        self.assertNotIn("reasoning_content", normalized[3])
+        # A part of an unknown kind is refused, whatever JSON names it.
+        for role in ("user", "assistant"):
+            for kind in ([], {}, None, "audio"):
+                with (
+                    self.subTest(role=role, kind=kind),
+                    self.assertRaises(APIError) as caught,
+                ):
+                    normalize_messages(
+                        [
+                            {"role": "user", "content": "Hi"},
+                            {"role": role, "content": [{"type": kind, "text": "x"}]},
+                        ],
+                        vision=True,
+                        deadline=FOREVER,
+                    )
+                self.assertEqual(caught.exception.status, 400)
+
+    def test_a_template_refusal_reaches_the_client(self):
+        tokenizer = TemplateTokenizer(
+            "{% for message in messages %}"
+            "{% if message.content == 'refused' %}"
+            "{{ raise_exception('This template refuses it.') }}"
+            "{% endif %}{% endfor %}"
+            "{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{% endif %}"
+        )
+        app = make_frontend(tokenizer, None, "test-model", 128, 1, 2, vision=True)
+        with self.assertRaises(APIError) as caught:
+            app.prepare(
+                chat_body(messages=[{"role": "user", "content": "refused"}]),
+                deadline=FOREVER,
+            )
+        self.assertEqual(
+            (caught.exception.status, caught.exception.message),
+            (400, "messages could not be rendered: This template refuses it."),
         )
 
     def test_trailing_bytes_do_not_hide_connection_close(self):
@@ -428,7 +595,11 @@ class RequestContractTests(HarnessTestCase):
                     [
                         {
                             "type": "function",
-                            "function": {"name": "test", "parameters": schema},
+                            "function": {
+                                "name": "test",
+                                "parameters": schema,
+                                "strict": True,
+                            },
                         }
                     ],
                     "auto",
@@ -459,7 +630,11 @@ class RequestContractTests(HarnessTestCase):
                     [
                         {
                             "type": "function",
-                            "function": {"name": "test", "parameters": schema},
+                            "function": {
+                                "name": "test",
+                                "parameters": schema,
+                                "strict": True,
+                            },
                         }
                     ],
                     "auto",
@@ -553,11 +728,9 @@ class RequestContractTests(HarnessTestCase):
             (chat, with_field(chat_body(), arrays(limit)), invalid),
             (chat, with_field(chat_body(), arrays(10_000)), invalid),
             (chat, history(objects), (200, None)),
-            (
-                chat,
-                history(arrays(10_000)),
-                (400, "tool call arguments must be valid JSON"),
-            ),
+            # Arguments too deep to read stay text, as any that are not an
+            # object do.
+            (chat, history(arrays(10_000)), (200, None)),
             ("/v1/responses", responses(limit), (200, None)),
             ("/v1/responses", responses(2000), invalid),
         ):

@@ -343,8 +343,9 @@ std::filesystem::path writeGgufTensor(const std::filesystem::path &path,
     return path;
 }
 
-// GGUF image readers hold a tensor to the sizes the layout expects, and a
-// token gather writes only into buffers holding its rows.
+// GGUF image readers hold a tensor to the sizes the layout expects, read F16
+// and BF16 token rows as their formats' native rows, and a token gather
+// writes only into buffers holding its rows.
 void testGgufImageLayout(MetalBackend &backend, const std::filesystem::path &root) {
     constexpr uint32_t rows = 256, columns = 256;
     // Q8_0 planes and native rows as the planner lays them out.
@@ -395,6 +396,18 @@ void testGgufImageLayout(MetalBackend &backend, const std::filesystem::path &roo
             },
             "GGUF embedding does not match the layout",
             "GGUF embedding of other sizes than the layout's was accepted");
+    }
+    // A GGUF's F16 and BF16 token rows read as the native rows of their formats.
+    for (const auto &[type, format] : {std::pair{splash::model::ggml::kF16, GGUF_FMT_F16},
+                                       std::pair{splash::model::ggml::kBF16, GGUF_FMT_BF16}}) {
+        WeightFile file = loaded(writeGgufTensor(root / ("embedding-" + std::to_string(type) + ".bin"),
+                                                 {.type = type,
+                                                  .outputSize = rows,
+                                                  .inputSize = columns,
+                                                  .plane0Bytes = uint64_t{rows} * columns * 2}));
+        const auto table = splash::model::readBlockEmbedding(file, rows, columns, "embedding");
+        file.finish();
+        require(table.blocks().formatId == format, "GGUF 16-bit embedding did not read as its format's rows");
     }
     WeightFile file = loaded(embedding);
     const auto table = splash::model::readBlockEmbedding(file, rows, columns, "embedding");
@@ -696,8 +709,18 @@ void testSyntheticBlockModel(MetalBackend &backend, const std::filesystem::path 
     unquantized("language_model.lm_head");
     rejects([&] { static_cast<void>(loadModel(backend, root, descriptor)); }, "language_model.lm_head is unquantized",
             "an unquantized language_model.lm_head was accepted");
+    // A module the checkpoint lacks altogether is missing, not unquantized.
+    std::vector<splash::test::SyntheticTensor> lacking;
+    for (splash::test::SyntheticTensor &tensor : splash::test::mlxTargetTensors(target, bitsAndGroup))
+        if (!tensor.name.starts_with("language_model.lm_head."))
+            lacking.push_back(std::move(tensor));
+    splash::test::writeSyntheticShard(root / "target" / "model.safetensors", lacking);
+    rejects([&] { static_cast<void>(loadModel(backend, root, descriptor)); },
+            "missing source tensor: language_model.lm_head.weight",
+            "a checkpoint without language_model.lm_head was accepted");
     unquantized("language_model.model.embed_tokens");
-    require(std::get<Qwen3_8Weights>(loadModel(backend, root, descriptor).target).tokenEmbedding.blocks().isBfloat16(),
+    require(std::get<Qwen3_8Weights>(loadModel(backend, root, descriptor).target).tokenEmbedding.blocks().formatId ==
+                GGUF_FMT_BF16,
             "a bf16 token table did not load as its bf16 rows");
 }
 
@@ -739,7 +762,8 @@ void testSyntheticFloatModel(MetalBackend &backend, const std::filesystem::path 
                 segmentFormats(weights.layers[1].gateProjection) == nvfp4 &&
                 segmentFormats(weights.layers[1].upProjection) == nvfp4 &&
                 segmentFormats(weights.layers[1].downProjection) == nvfp4 &&
-                segmentFormats(weights.logitsProjection) == fp8 && weights.tokenEmbedding.blocks().isBfloat16(),
+                segmentFormats(weights.logitsProjection) == fp8 &&
+                weights.tokenEmbedding.blocks().formatId == GGUF_FMT_BF16,
             "a " + name + " target did not keep its modules' formats and its bf16 token table");
     // Every stored norm weight is zero: 1 + w is 1, the gated norm's w 0.
     const auto first = [](const splash::ops::NormWeights &norm) {

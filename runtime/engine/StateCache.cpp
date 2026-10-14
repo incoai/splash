@@ -200,7 +200,7 @@ bool StateCache::publishStateToDisk(uint64_t kvBlock, const StateWriter &write,
   if (stateResident(kvBlock))
     throw std::logic_error("duplicate composite state key");
   // A checkpoint replaces older copies like any state: it is the only
-  // progress a suspended request keeps once the quota is full.
+  // progress a suspended request keeps once the tier is at its limit.
   std::unique_ptr<StateOffload> transfer = startWrite(kvBlock, write);
   if (!transfer)
     return false;
@@ -227,6 +227,12 @@ bool StateCache::retireCheckpointState(StateCheckpoint checkpoint) noexcept {
       found->second.publication != checkpoint.publication)
     return true;
   return erase(checkpoint.kvBlock, true).evicted;
+}
+
+bool StateCache::checkpointPinned(StateCheckpoint checkpoint) const noexcept {
+  const auto found = entries_.find(checkpoint.kvBlock);
+  return found != entries_.end() && found->second.checkpoint &&
+         found->second.publication == checkpoint.publication && found->second.pins;
 }
 
 void StateCache::makeOrdinary(uint64_t kvBlock, Entry &entry) {
@@ -280,6 +286,11 @@ bool StateCache::stateResident(uint64_t kvBlock) const noexcept {
   return found != entries_.end() && found->second.ram != nullptr;
 }
 
+bool StateCache::onDisk(uint64_t kvBlock) const noexcept {
+  const auto found = entries_.find(kvBlock);
+  return found != entries_.end() && found->second.disk != nullptr;
+}
+
 PersistStatus StateCache::persist(uint64_t kvBlock) {
   const auto found = entries_.find(kvBlock);
   if (found == entries_.end() || found->second.invalid)
@@ -289,8 +300,10 @@ PersistStatus StateCache::persist(uint64_t kvBlock) {
     return writing(kvBlock) ? PersistStatus::Started : PersistStatus::Durable;
   if (pending_)
     return PersistStatus::Busy;
-  if (!entry.ram->canOffload())
-    return PersistStatus::Refused;
+  // The write budget holds a write back for later, but never a copy in use's:
+  // a file that refuses that too keeps nothing more.
+  if (!entry.ram->canOffload(false))
+    return entry.ram->canOffload(true) ? PersistStatus::Busy : PersistStatus::Refused;
   std::shared_ptr<const CompositeState> source = entry.ram;
   std::unique_ptr<StateOffload> transfer =
       startWrite(kvBlock, [&source](std::function<void()> done) {
@@ -350,8 +363,8 @@ StateEviction StateCache::reclaim(uint64_t kvBlock, Unwritten unwritten) {
   if (persisting(kvBlock))
     return {false, true};
   const uint64_t reclaimed = entry.ram->bytes();
-  // One write at a time.
-  const bool writable = !entry.disk && entry.ram->canOffload();
+  // One write at a time, of a class the tier takes now.
+  const bool writable = !entry.disk && entry.ram->canOffload(inUse(kvBlock));
   if (writable && pending_ && unwritten != Unwritten::Drop)
     return {false, true};
   if (writable) {

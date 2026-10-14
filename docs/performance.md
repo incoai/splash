@@ -74,24 +74,34 @@ Measured on a 24 GB M6 (12-core GPU), with each model's DFlash2 draft:
 
 | Unsloth GGUF | Code decode | Advertised context limit |
 | --- | ---: | ---: |
-| `Qwen3.8-27B-GGUF:UD-IQ3_XXS` | 43.5 tok/s | 73,721 tokens (102,393 with `--language-only`) |
+| `Qwen3.8-27B-GGUF:UD-IQ3_XXS` | 43.5 tok/s | 53,241 tokens (81,913 with `--language-only`) |
 | `Qwen3.6-35B-A3B-GGUF:UD-Q2_K_XL` | 145 tok/s | 256K tokens |
 
 The context column reports capacity, not the prompt length of the decode
-measurement. Coding agents need about 100K tokens (Claude Code's own prompt is
-about 33K, and at 64K it compacted repeatedly and stopped), so serve the 27B
-with `--language-only` for them.
+measurement. The SSD cache, on by default, sets its state staging aside within
+this memory: on the M6 it costs the 27B 4,096 tokens of advertised context,
+which `--max-cache-disk 0` gives back (57,337 tokens, 86,009 with
+`--language-only`). Coding agents need about 100K tokens (Claude Code's own
+prompt is about 33K, and at 64K it compacted repeatedly and stopped), so serve
+the 27B with `--language-only` for them; with `--disable-ane` and
+`--max-cache-disk 0` as well it advertises 102,393 tokens.
 
-Splash grows its caches only while macOS has 3 GiB free and gives cached memory
-back when it runs short, but a request in service still takes the memory it
-needs within `--max-memory`, so these models leave other applications little
-room. A request that cannot get memory waits for it, then fails with
-`resource_timeout`: close memory-heavy applications, or serve with
-`--language-only`. Critical memory pressure can suspend a long request. Startup
-suggests `--max-cache-disk` when memory may not hold the advertised context.
-The SSD cache then writes whenever memory runs short: serving
+Splash grows its caches only while macOS reports no memory pressure and its
+spare memory, the free, file-backed and purgeable pages and half of what
+compressing other applications would free, keeps a reserve of 7% of the Mac's
+memory (2 to 7 GiB) and a 1 GiB margin, 3 GiB on these Macs. It gives cached
+memory back when that memory runs short or macOS warns, but a request in service
+still takes the memory it needs within `--max-memory`, so these models leave
+other applications little room. A request that cannot get memory waits for it,
+then fails with `resource_timeout`: close memory-heavy applications, or serve
+with `--language-only`. Critical memory pressure can suspend a long request; the
+[SSD cache](../DEVELOPMENT.md#ssd-cache), on by default, keeps its progress and
+cached prefixes, and writes whenever memory runs short: serving
 Ternary-Bonsai-2-27B PQ2_0 to six clients' mixed traffic for 30 minutes, a
 16 GiB SSD cache on the M6 wrote 26 GB, about 50 GB an hour, and read 36 GB.
+`--max-cache-disk-writes` sets a write budget to spare the drive, such as
+`25G` a day on a 256 GB Mac: once it is spent, states other than the ones
+conversations resume from are dropped instead of written.
 
 See [the low-bit GGUF measurements](https://github.com/incoai/splash/pull/160)
 for the workloads, memory pressure, SSD settings and limitations, and

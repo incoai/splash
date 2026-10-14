@@ -15,6 +15,7 @@
 #include "ops/MoE.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -84,10 +85,12 @@ void allocate(MetalBackend &backend, MoeBuffers &m, const MoePlan &plan) {
     m.scratch.*field.buffer = zeros(backend, w.*field.bytes, "moe-scratch");
 }
 
-int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFormat) {
+int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFormat, Fmt sharedFormat) {
   constexpr uint32_t H = 2048, I = 512, E = 256, kRowsMax = 2048;
   // gate and up hold most of the routed expert weights.
-  const MoeShape ggufShape{H, E, 8, I, uint32_t(gateUpFormat)};
+  const MoeShape ggufShape{H, E, 8, I, uint32_t(gateUpFormat),
+                           quant_register_format(gateUpFormat) && quant_register_format(downFormat) &&
+                               quant_register_format(sharedFormat)};
   std::mt19937 local(9);
   // The routing fixture's F32 router, and weights at a model's magnitudes in
   // every format as the tests draw them (scaleRange; an MLX affine format
@@ -101,9 +104,9 @@ int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFor
   const QuantizedSegment routerSegment = floatSegment(backend, router, E, H);
   const QuantizedSegment sharedGateSegment = floatSegment(backend, sharedGate, 1, H);
   const BlockMoeWeights gguf{routerSegment, sharedGateSegment,
-                             {planes(gateUpFormat, E * I, H), planes(Q80, I, H)},
-                             {planes(gateUpFormat, E * I, H), planes(Q80, I, H)},
-                             {planes(downFormat, E * H, I), planes(Q80, H, I)}};
+                             {planes(gateUpFormat, E * I, H), planes(sharedFormat, I, H)},
+                             {planes(gateUpFormat, E * I, H), planes(sharedFormat, I, H)},
+                             {planes(downFormat, E * H, I), planes(sharedFormat, H, I)}};
   // Rows route to 8 of a pool of 24 experts per lane of 8 rows (decode) or of all 256 (prefill).
   const auto input = [&](uint32_t rows, uint32_t pool) {
     std::uniform_real_distribution<float> unit(-1.0f, 1.0f);
@@ -149,7 +152,10 @@ int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFor
     MoeConfig config = plans.moeDecode(ggufShape, lanes).configuration();
     config.ggufTile = other;
     const double g = time(gguf, plans.moeDecode(ggufShape, lanes));
-    const double o = time(gguf, MoE::decodePlan(ggufShape, lanes, config));
+    // The register tile takes the formats of quant_register_format only.
+    const double o = other == MoeGgufTile::Register && !ggufShape.registerFormats
+                         ? std::nan("")
+                         : time(gguf, MoE::decodePlan(ggufShape, lanes, config));
     const double gp = time(gguf, plans.moePrefill(ggufShape, lanes * 8));
     printf("  decode B%u: %s %.3f  %s %.3f  | prefill chunk of %u rows: %.3f\n", lanes,
            device == MoeGgufTile::Register ? "register" : "staged", g,
@@ -182,14 +188,15 @@ int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFor
 
 int main(int argc, const char *argv[]) {
   @autoreleasepool {
-    const Fmt gateUp = argc > 3 ? fmtNamed(argv[3]) : Q4K, down = argc > 4 ? fmtNamed(argv[4]) : Q5K;
-    if (argc < 2 || argc > 5 || gateUp == FMT_COUNT || down == FMT_COUNT) {
-      std::cerr << "usage: gguf-moe-benchmark <metallib> [rounds] [gate/up format] [down format]\n";
+    const Fmt gateUp = argc > 3 ? fmtNamed(argv[3]) : Q4K, down = argc > 4 ? fmtNamed(argv[4]) : Q5K,
+              shared = argc > 5 ? fmtNamed(argv[5]) : Q80;
+    if (argc < 2 || argc > 6 || gateUp == FMT_COUNT || down == FMT_COUNT || shared == FMT_COUNT) {
+      std::cerr << "usage: gguf-moe-benchmark <metallib> [rounds] [gate/up format] [down format] [shared format]\n";
       return 2;
     }
     try {
       MetalBackend backend(argv[1]);
-      return timing(backend, argc > 2 ? std::stoul(argv[2]) : 20, gateUp, down);
+      return timing(backend, argc > 2 ? std::stoul(argv[2]) : 20, gateUp, down, shared);
     } catch (const std::exception &error) {
       std::cerr << "gguf-moe-benchmark: " << error.what() << '\n';
       return 1;

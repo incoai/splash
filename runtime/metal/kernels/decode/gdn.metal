@@ -190,10 +190,12 @@ inline void gdn_decode_prologue(
 // one, which goes to state_out; the step's own rows then advance it only for
 // their outputs, which go to threadgroup memory for the gate. Each row
 // preserves the decay, memory, delta, update, output operation order. The
-// next rows' state is loaded before these rows' state is stored.
-template <uint HeadDim, uint RowsInFlight>
-inline void gdn_decode_scan(device const float *state_in,
-                            device float *state_out,
+// next rows' state is loaded before these rows' state is stored. State is the
+// stored element: float, or bfloat, widened as it is loaded and rounded to
+// nearest even as it is stored; the arithmetic is fp32 with either.
+template <uint HeadDim, uint RowsInFlight, class State>
+inline void gdn_decode_scan(device const State *state_in,
+                            device State *state_out,
                             threadgroup GdnDecodeShared<HeadDim> &shared,
                             uint pending, uint value_head, uint lane,
                             uint simd_group) {
@@ -207,7 +209,7 @@ inline void gdn_decode_scan(device const float *state_in,
   float state[RowsInFlight][4];
   for (uint r = 0; r < RowsInFlight; ++r)
     for (uint i = 0; i < 4; ++i)
-      state[r][i] = state_in[base(0, r) + i];
+      state[r][i] = float(state_in[base(0, r) + i]);
   for (uint batch = 0; batch < Batches; batch += RowsInFlight) {
     uint value_dim[RowsInFlight];
     for (uint r = 0; r < RowsInFlight; ++r)
@@ -239,11 +241,11 @@ inline void gdn_decode_scan(device const float *state_in,
     if (batch + RowsInFlight < Batches) {
       for (uint r = 0; r < RowsInFlight; ++r)
         for (uint i = 0; i < 4; ++i)
-          upcoming[r][i] = state_in[base(batch + RowsInFlight, r) + i];
+          upcoming[r][i] = float(state_in[base(batch + RowsInFlight, r) + i]);
     }
     for (uint r = 0; r < RowsInFlight; ++r)
       for (uint i = 0; i < 4; ++i)
-        state_out[base(batch, r) + i] = state[r][i];
+        state_out[base(batch, r) + i] = State(state[r][i]);
     for (uint token = 0; token < Tokens; ++token) {
       const float d = shared.decay[token];
       const float b = float(shared.beta[token]);
@@ -332,7 +334,7 @@ inline void gdn_decode_gate(threadgroup GdnDecodeShared<HeadDim> &shared,
 
 // Grid {value heads, lanes}.
 template <uint KeyHeads, uint ValueHeads, uint HeadDim, uint ConvDim,
-          uint PackedWidth, uint RowsInFlight, class Table, class W>
+          uint PackedWidth, uint RowsInFlight, class Table, class W, class State>
 inline void gdn_decode_batch_phase(
     device const bfloat *packed, device const bfloat *conv_weights,
     device const uchar *current0, device const uchar *current1,
@@ -356,10 +358,10 @@ inline void gdn_decode_batch_phase(
           current + ulong(params.layer) * params.conv_layer_bytes);
   device bfloat *conv_state_out = reinterpret_cast<device bfloat *>(
       next + ulong(params.layer) * params.conv_layer_bytes);
-  device const float *state_in = reinterpret_cast<device const float *>(
+  device const State *state_in = reinterpret_cast<device const State *>(
       current + params.convolution_state_bytes +
       ulong(params.layer) * params.recurrent_layer_bytes);
-  device float *state_out = reinterpret_cast<device float *>(
+  device State *state_out = reinterpret_cast<device State *>(
       next + params.convolution_state_bytes +
       ulong(params.layer) * params.recurrent_layer_bytes);
 
@@ -376,8 +378,9 @@ inline void gdn_decode_batch_phase(
       packed, conv_weights, history, conv_state_out, pending_tape, pending,
       step_tape, a_scale, dt_bias, shared, group.x, lane, simd_group);
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  gdn_decode_scan<HeadDim, RowsInFlight>(state_in, state_out, shared, pending,
-                                         group.x, lane, simd_group);
+  gdn_decode_scan<HeadDim, RowsInFlight, State>(state_in, state_out, shared,
+                                                pending, group.x, lane,
+                                                simd_group);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const bool tiled = params.tiled_heads != 0;
   gdn_decode_gate<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth>(
@@ -412,26 +415,33 @@ inline void gdn_decode_batch_phase(
 #define GDN_DECODE_THREADS \
     uint2 group [[threadgroup_position_in_grid]], \
     uint lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]]
-#define GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, table, sums, Layout) \
+#define GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, table, sums, Layout, W, State) \
     threadgroup GdnDecodeShared<HeadDim> shared; \
-    gdn_decode_batch_phase<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, 2, Layout>( \
+    gdn_decode_batch_phase<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, 2, Layout, W, State>( \
         packed, conv_weights, current0, current1, current2, current3, next0, \
         next1, next2, next3, tape, a_scale, dt_bias, \
         gdn_norm_weight, gdn_hidden, params, group, lane, simd_group, shared, \
         table, sums);
 // Entries without a table pass null pointers, which skip the write; their Layout only completes the template.
-#define GDN_DECODE_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, W) \
+#define GDN_DECODE_KERNEL(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, W, State) \
   kernel void Name(GDN_DECODE_BUFFERS(W), \
       constant GDNDecodeBatchParams &params [[buffer(15)]], GDN_DECODE_THREADS) { \
-    GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, nullptr, nullptr, gguf_sg::Table16) \
+    GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, nullptr, nullptr, gguf_sg::Table16, W, State) \
   }
 // The out-projection's table (Layout: gguf_sg::Table16).
-#define GDN_DECODE_TABLE_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, Layout, W) \
+#define GDN_DECODE_TABLE_KERNEL(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, Layout, W, State) \
   kernel void Name(GDN_DECODE_BUFFERS(W), \
       device bfloat *table [[buffer(15)]], device float *sums [[buffer(16)]], \
       constant GDNDecodeBatchParams &params [[buffer(17)]], GDN_DECODE_THREADS) { \
-    GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, table, sums, Layout) \
+    GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, table, sums, Layout, W, State) \
   }
+// Each entry over an fp32 state and, as Name_bf16_state, a bf16 one.
+#define GDN_DECODE_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, W) \
+  GDN_DECODE_KERNEL(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, W, float) \
+  GDN_DECODE_KERNEL(Name##_bf16_state, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, W, bfloat)
+#define GDN_DECODE_TABLE_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, Layout, W) \
+  GDN_DECODE_TABLE_KERNEL(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, Layout, W, float) \
+  GDN_DECODE_TABLE_KERNEL(Name##_bf16_state, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, Layout, W, bfloat)
 
 // Two rows overlap reductions and arithmetic without the register cost of four.
 GDN_DECODE_ENTRY(verify_gdn_fused, 16, 48, 128, 10240, 16640, bfloat)
@@ -445,6 +455,8 @@ GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table16_f32, 16, 48, 128, 10240, 16640, 
 GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table16_vh32_f32, 16, 32, 128, 8192, 12544, gguf_sg::Table16, float)
 #undef GDN_DECODE_ENTRY
 #undef GDN_DECODE_TABLE_ENTRY
+#undef GDN_DECODE_KERNEL
+#undef GDN_DECODE_TABLE_KERNEL
 #undef GDN_DECODE_BODY
 #undef GDN_DECODE_THREADS
 #undef GDN_DECODE_BUFFERS

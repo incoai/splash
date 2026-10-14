@@ -11,7 +11,8 @@
 // from that state with the reference q and rounded to bf16. The decode
 // gate's hidden rows are also checked bit for bit against the prefill gate's
 // from the same recurrent rows. Changing multi-step batches are compared
-// bit for bit with independent lanes, with rejected tape rows poisoned.
+// bit for bit with independent lanes, with rejected tape rows poisoned. The
+// decode over a bf16 state is checked against the fp32 decode.
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
 #include "metal/MetalBackend.hpp"
@@ -104,16 +105,14 @@ struct Cell final {
   uint64_t convBytes = 0;
   uint64_t bytes = 0;
 
-  explicit Cell(const GdnShape &shape)
+  explicit Cell(const GdnShape &shape, GdnStateFormat format = GdnStateFormat::Float32)
       : layout{kLayers, splash::model::kGdnConvolutionTaps - 1, shape.convolutionDimension,
-               shape.valueHeads, shape.headDimension, shape.headDimension},
+               shape.valueHeads, shape.headDimension, shape.headDimension, format},
         convLayerBytes(layout.convolutionLayerBytes()),
         recurrentLayerBytes(layout.recurrentLayerBytes()),
         convBytes(layout.convolutionBytes()), bytes(layout.cellBytes()) {}
 
-  GdnStateStrides strides() const {
-    return {convLayerBytes, recurrentLayerBytes, convBytes};
-  }
+  GdnStateStrides strides() const { return layout.strides(); }
   const uint16_t *conv(const uint8_t *cell, uint32_t layer) const {
     return reinterpret_cast<const uint16_t *>(cell + layer * convLayerBytes);
   }
@@ -917,10 +916,14 @@ void bufferExtents(MetalBackend &backend, const GdnShape &shape, LinearInput lay
   // fixture's cells hold either layout.
   const uint64_t carried = uint64_t{fixture.cell.layout.convolutionHistory} * shape.convolutionDimension * 2,
                  recurrent = uint64_t{width} * shape.headDimension * 4;
-  const GdnStateStrides convolutionLast{carried + kLayers * recurrent, recurrent, carried};
+  const GdnStateStrides convolutionLast{carried + kLayers * recurrent, recurrent, carried,
+                                        GdnStateFormat::Float32};
+  // A bf16 state's cells reach half as far into each layer's state.
+  const GdnStateStrides narrow = Cell(shape, GdnStateFormat::BFloat16).strides();
   const auto requireStates = [&](const auto &encode) {
     for (const auto &[strides, bytes, element] : std::initializer_list<std::tuple<GdnStateStrides, uint64_t, uint64_t>>{
              {production, production.convolutionStateBytes + layer * production.recurrentLayerBytes + recurrent, 4},
+             {narrow, narrow.convolutionStateBytes + layer * narrow.recurrentLayerBytes + recurrent / 2, 2},
              {convolutionLast, layer * convolutionLast.convolutionLayerBytes + carried, 2}})
       for (const bool next : {false, true})
         for (uint32_t lane = 0; lane < lanes; ++lane) {
@@ -1017,7 +1020,7 @@ void gateMatchesPrefill(MetalBackend &backend, const GdnShape &shape, bool float
         backend.view(fixture.current[lane], 0, uint64_t{kCarried} * shape.convolutionDimension * 2);
     prefill.recurrentIn = backend.view(fixture.current[lane], fixture.cell.convBytes, stateBytes);
     CommandGraph graph;
-    GDN::addPrefill(graph, prefill, shape, kRows, order);
+    GDN::addPrefill(graph, backend, prefill, shape, kRows, GdnStateFormat::Float32, order);
     (void)backend.submitCommandAsync(graph.dispatches()).wait();
 
     const float *state = fixture.cell.recurrent(fixture.cellBytes(fixture.current[lane]), 0);
@@ -1124,6 +1127,116 @@ void rejectsInvalid(MetalBackend &backend) {
 
 } // namespace
 
+// A bf16 state's decode computes as the fp32 state's does. From recurrent
+// states of the same bf16 values, a first step and a second that folds each
+// count of the first's rows leave the fp32 decode's tape, hidden rows and
+// out-projection table byte for byte and its convolution rows, and store its
+// recurrent state rounded to nearest even.
+void bfloatState(MetalBackend &backend, const GdnShape &shape, uint32_t lanes, bool float32,
+                 LinearInput layout) {
+  const std::string where = caseName("bf16 state", shape, lanes, layout) + (float32 ? " f32 norm" : "");
+  Fixture fixture(backend, shape, lanes, float32);
+  const Cell narrow(shape, GdnStateFormat::BFloat16);
+  const uint64_t elements = uint64_t{shape.valueHeads} * shape.headDimension * shape.headDimension;
+  std::optional<PreparedTables> tables;
+  if (layout != LinearInput::Plain) tables.emplace(backend, layout, shape.valueHeads * shape.headDimension, lanes);
+  std::array<MetalBuffer, kMaxLanes> current, next;
+  for (uint32_t lane = 0; lane < kMaxLanes; ++lane) {
+    current[lane] = sharedBuffer(backend, narrow.bytes);
+    next[lane] = sharedBuffer(backend, narrow.bytes);
+  }
+  const auto wideState = [&](const MetalBuffer &cell, uint32_t layer) {
+    return reinterpret_cast<float *>(static_cast<uint8_t *>(cell.contents()) + fixture.cell.convBytes +
+                                     layer * fixture.cell.recurrentLayerBytes);
+  };
+  const auto narrowState = [&](const MetalBuffer &cell, uint32_t layer) {
+    return reinterpret_cast<uint16_t *>(static_cast<uint8_t *>(cell.contents()) + narrow.convBytes +
+                                        layer * narrow.recurrentLayerBytes);
+  };
+  // The bf16 cells take the fp32 cells' convolution rows and recurrent states
+  // rounded, which the fp32 cells then hold as well.
+  const auto roundStates = [&] {
+    for (uint32_t lane = 0; lane < kMaxLanes; ++lane) {
+      std::memcpy(current[lane].contents(), fixture.current[lane].contents(), narrow.convBytes);
+      for (uint32_t layer = 0; layer < kLayers; ++layer) {
+        float *values = wideState(fixture.current[lane], layer);
+        uint16_t *rounded = narrowState(current[lane], layer);
+        for (uint64_t index = 0; index < elements; ++index) {
+          rounded[index] = floatToBf16(values[index]);
+          values[index] = bf16ToFloat(rounded[index]);
+        }
+      }
+    }
+  };
+  const auto encode = [&](CommandGraph &graph, std::span<const MetalBuffer> currentStates,
+                          std::span<const MetalBuffer> nextStates, const Cell &cell) {
+    for (uint32_t layer = 0; layer < kLayers; ++layer) {
+      GdnDecodeBuffers buffers = fixture.decodeBuffers(layer);
+      buffers.currentStates = currentStates;
+      buffers.nextStates = nextStates;
+      if (tables) buffers.linearScratch = tables->scratch();
+      (void)GDN::addDecode(graph, buffers, shape, lanes, layer, cell.strides(), GdnHeadOrder::Grouped, layout);
+    }
+  };
+  const auto bytesOf = [](const MetalBuffer &buffer) {
+    const auto *bytes = static_cast<const uint8_t *>(buffer.contents());
+    return std::vector<uint8_t>(bytes, bytes + buffer.sizeBytes());
+  };
+  const auto step = [&](const std::string &when) {
+    fixture.clear();
+    for (const MetalBuffer &cell : next) std::memset(cell.contents(), 0, narrow.bytes);
+    CommandGraph wide;
+    encode(wide, fixture.current, fixture.next, fixture.cell);
+    static_cast<void>(backend.submitCommandAsync(wide.dispatches()).wait());
+    const std::vector<uint8_t> hidden = bytesOf(fixture.hidden), tape = bytesOf(fixture.tape);
+    std::vector<uint8_t> table, sums;
+    if (tables) table = bytesOf(tables->table), sums = bytesOf(tables->sums);
+    // The bf16 decode writes them again.
+    std::memset(fixture.hidden.contents(), 0, fixture.hidden.sizeBytes());
+    for (uint32_t lane = 0; lane < lanes; ++lane)
+      std::memset(static_cast<uint8_t *>(fixture.tape.contents()) + fixture.tapeLanes[lane].stepSlot, 0,
+                  kLayers * fixture.tapeBytes);
+    if (tables) {
+      std::memset(tables->table.contents(), 0, tables->table.sizeBytes());
+      std::memset(tables->sums.contents(), 0, tables->sums.sizeBytes());
+    }
+    CommandGraph bfloat;
+    encode(bfloat, current, next, narrow);
+    static_cast<void>(backend.submitCommandAsync(bfloat.dispatches()).wait());
+    const std::string label = where + " " + when;
+    require(bytesOf(fixture.hidden) == hidden, label + ": hidden rows differ from the fp32 decode's");
+    require(bytesOf(fixture.tape) == tape, label + ": tape differs from the fp32 decode's");
+    if (tables)
+      require(bytesOf(tables->table) == table && bytesOf(tables->sums) == sums,
+              label + ": out-projection table differs from the fp32 decode's");
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+      require(!std::memcmp(next[lane].contents(), fixture.next[lane].contents(), narrow.convBytes),
+              label + ": convolution rows differ from the fp32 decode's");
+      for (uint32_t layer = 0; layer < kLayers; ++layer) {
+        const float *values = wideState(fixture.next[lane], layer);
+        const uint16_t *stored = narrowState(next[lane], layer);
+        for (uint64_t index = 0; index < elements; ++index)
+          require(stored[index] == floatToBf16(values[index]),
+                  label + ": the state is not the fp32 decode's rounded to nearest even");
+      }
+    }
+  };
+  roundStates();
+  step("first step");
+  // As in runDecode, lane l retains 1 + (base + l - 1) % 8 rows of the first.
+  std::array<uint32_t, kMaxLanes> retained{};
+  fixture.advance(retained);
+  std::swap(current, next);
+  fixture.fillPacked();
+  roundStates();
+  for (uint32_t base = 1; base <= kRows; ++base) {
+    for (uint32_t lane = 0; lane < kMaxLanes; ++lane)
+      fixture.tapeLanes[lane].pendingRows = 1 + (base + lane - 1) % kRows;
+    step("second step " + std::to_string(base));
+  }
+  std::cout << where << ": the fp32 decode's rows and its state rounded\n";
+}
+
 int main(int argc, char **argv) {
   try {
     if (argc != 2)
@@ -1158,6 +1271,11 @@ int main(int argc, char **argv) {
         for (GdnHeadOrder order : {GdnHeadOrder::Grouped, GdnHeadOrder::Tiled})
           for (LinearInput layout : {LinearInput::Plain, LinearInput::Table16})
             replayAcrossBatches(backend, shape, float32, order, layout);
+    for (const GdnShape &shape : kShapes)
+      for (const uint32_t lanes : {1U, kMaxLanes})
+        for (bool float32 : {false, true})
+          for (LinearInput layout : {LinearInput::Plain, LinearInput::Table16})
+            bfloatState(backend, shape, lanes, float32, layout);
     std::cout << "gdn_decode_metal_test: PASS\n";
     return 0;
   } catch (const std::exception &error) {

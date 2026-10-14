@@ -2,6 +2,7 @@
 
 #include "metal/DeviceCapabilities.hpp"
 #include "model/Model.hpp"
+#include "ops/GDN.hpp"
 #include "ops/PagedKv.hpp"
 
 #include <algorithm>
@@ -53,6 +54,7 @@ struct ModelMemoryProfile final {
   uint32_t maximumContextTokens = 0;
   kv::Layout targetKvLayout;
   ModelMemoryFootprint footprint;
+  ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
 
   [[nodiscard]] std::optional<std::string> validationError() const;
   [[nodiscard]] uint64_t fixedRuntimeBytes() const;
@@ -91,6 +93,15 @@ struct EngineMemoryPolicy {
   [[nodiscard]] static constexpr uint64_t
   hostAvailableReserveBytes(uint64_t physicalMemoryBytes) noexcept {
     return std::min<uint64_t>(physicalMemoryBytes / 10, 2 * kGiB);
+  }
+  // What growth no request in service needs, the cache, leaves of the host's
+  // spare memory to other applications: 7% of the Mac's memory, from 2 to
+  // 7 GiB. With the warning margin above it, such growth stops 3 GiB short of
+  // a 24 GB Mac's spare memory, about 5.5 GiB short of 64 GB and 8 GiB short
+  // of 128 GB or more.
+  [[nodiscard]] static constexpr uint64_t
+  hostSpareReserveBytes(uint64_t physicalMemoryBytes) noexcept {
+    return std::clamp<uint64_t>(physicalMemoryBytes / 100 * 7, 2 * kGiB, 7 * kGiB);
   }
 };
 
@@ -173,9 +184,6 @@ public:
   // model supports or one request's KV capacity holds (less the speculative
   // scratch); requests share the budget dynamically.
   [[nodiscard]] uint32_t maximumContextTokens() const noexcept;
-  // The ceiling this plan would advertise with at most memoryBytes, within
-  // its configured limit; zero when one request cannot fit there.
-  [[nodiscard]] uint32_t contextTokensWithin(uint64_t memoryBytes) const;
 
   [[nodiscard]] std::string toStatusJson() const;
 

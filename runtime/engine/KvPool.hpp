@@ -83,6 +83,10 @@ public:
   [[nodiscard]] KvPageAcquisition acquirePages(uint32_t count);
   void retainPage(uint32_t page, bool prefixOwner);
   void releasePage(uint32_t page, bool prefixOwner);
+  // Zeroes a page its requester holds alone and has not written yet, so the
+  // rows it never writes read zero rather than what the page held before.
+  // std::logic_error for a page anyone else holds.
+  void clearPage(uint32_t page);
 
   [[nodiscard]] uint32_t pageCount() const noexcept;
   [[nodiscard]] uint64_t bytesPerPage() const noexcept;

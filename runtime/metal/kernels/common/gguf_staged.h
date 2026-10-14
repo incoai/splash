@@ -40,6 +40,11 @@ inline void dequant32(typename F::Payload w, typename F::Meta meta, ushort j, th
       const uint2 v = F::values(q);
       lo = half4(float4(quant_e4m3_word(v.x)) * k.s.x);
       hi = half4(float4(quant_e4m3_word(v.y)) * k.s.y);
+    } else if constexpr (F::Kind == QuantFloat16) {   // the values times s in float, then to half
+      typedef vec<typename F::Value, 2> V2;
+      const uint4 v = F::values(q);
+      lo = half4(float4(float2(as_type<V2>(v.x)), float2(as_type<V2>(v.y))) * k.s.x);
+      hi = half4(float4(float2(as_type<V2>(v.z)), float2(as_type<V2>(v.w))) * k.s.y);
     } else {
       const uint2 g = F::grid(q); const uint s = F::signs(q);
       lo = half4(float4(as_type<uchar4>(g.x)) * k.s.x);

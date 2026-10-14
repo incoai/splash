@@ -73,6 +73,7 @@ std::string modelStatusJson(const ModelMemoryProfile &model) {
       << "\"kv_elements_per_scale\":"
       << model.targetKvLayout.elementsPerScale() << ','
       << "\"kv_page_bytes\":" << model.targetKvLayout.bytesPerModelPage() << ','
+      << "\"state_format\":" << json::quote(ops::formatName(model.stateFormat)) << ','
       << "\"memory\":{" << "\"target_weights_bytes\":"
       << model.footprint.targetWeightsBytes << ','
       << "\"draft_weights_bytes\":" << model.footprint.draftWeightsBytes << ','
@@ -115,6 +116,7 @@ std::optional<std::string> ModelMemoryProfile::validationError() const {
     return "invalid_model_context_length";
   }
   if (!targetKvLayout.valid()) return "invalid_target_kv_layout";
+  if (!ops::validFormat(stateFormat)) return "invalid_state_format";
   if (!footprint.targetWeightsBytes) return "target_weight_bytes_required";
   if (!footprint.draftWeightsBytes) return "draft_weight_bytes_required";
   if (!footprint.runtime.laneStatePlannedAllocatedBytes) {
@@ -247,15 +249,6 @@ uint32_t EngineMemoryPlan::maximumContextTokens() const noexcept {
           : 0;
   return static_cast<uint32_t>(
       std::min<uint64_t>(model_.maximumContextTokens, contextTokens));
-}
-
-uint32_t EngineMemoryPlan::contextTokensWithin(uint64_t memoryBytes) const {
-  if (!memoryBytes)
-    return 0;
-  const uint64_t configured = breakdown_.configuredMemoryLimitBytes;
-  const EngineMemoryPlanResult within = evaluateEngineMemoryPlan(
-      device_, model_, configured ? std::min(configured, memoryBytes) : memoryBytes);
-  return within.plan ? within.plan->maximumContextTokens() : 0;
 }
 
 std::string EngineMemoryPlan::toStatusJson() const {

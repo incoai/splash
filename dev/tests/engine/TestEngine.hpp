@@ -23,7 +23,7 @@ namespace splash::test {
   if (!config.growthPaused)
     config.growthPaused = [] { return false; };
   if (!config.serving)
-    config.serving = [](bool) {};
+    config.serving = [](bool) { return false; };
   return config;
 }
 

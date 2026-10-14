@@ -8,7 +8,7 @@ from functools import lru_cache
 import attrs
 import regex
 from jsonschema import ValidationError, validators
-from jsonschema.exceptions import UndefinedTypeCheck
+from jsonschema.exceptions import SchemaError, UndefinedTypeCheck
 from referencing import Registry
 
 from .errors import APIError
@@ -176,8 +176,8 @@ _validator_cache_lock = threading.Lock()
 _validator_cache = LRUCache(8 * 1024 * 1024, capacity=256)
 # Empty: callers refuse remote references, so a schema refers only to itself.
 _REGISTRY = Registry()
-# The sources of the schemas check_schema has passed, apart from the
-# validators response formats keep.
+# The outcome of each schema check_schema has checked, by its source, apart
+# from the validators response formats keep: True, or why it is invalid.
 _checked_schemas_lock = threading.Lock()
 _checked_schemas = LRUCache(8 * 1024 * 1024, capacity=1024)
 
@@ -186,15 +186,22 @@ def check_schema(schema):
     """Raise SchemaError unless `schema` is valid in the dialect it declares.
 
     A tool's schema needs no other check, as its calls are not validated, and
-    a client sends its tools on every turn, so those that pass are kept."""
+    a client sends its tools on every turn, so each outcome is kept: a tool
+    that is not strict keeps an invalid schema to describe itself with."""
     # json.dumps uses ASCII escapes, so character count equals source bytes.
     key = json.dumps(schema, sort_keys=True)
     with _checked_schemas_lock:
-        if _checked_schemas.get(key):
-            return
-    validators.validator_for(schema).check_schema(schema)
-    with _checked_schemas_lock:
-        _checked_schemas.put(key, True, len(key))
+        outcome = _checked_schemas.get(key)
+    if outcome is None:
+        try:
+            validators.validator_for(schema).check_schema(schema)
+            outcome = True
+        except SchemaError as error:
+            outcome = error.message
+        with _checked_schemas_lock:
+            _checked_schemas.put(key, outcome, len(key))
+    if outcome is not True:
+        raise SchemaError(outcome)
 
 
 def build_validator(schema):

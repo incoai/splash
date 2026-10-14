@@ -154,6 +154,11 @@ void ggufMoePlans() {
     require(moeGgufTile(gpuFamilyClass(family), staged) == MoeGgufTile::Staged &&
                 moeGgufTile(gpuFamilyClass(family), q4k) == expected,
             "GGUF expert tile does not follow the experts' format on GPU family 9");
+    // An expert weight in a format the register tile does not take (F16) stages the experts.
+    MoeShape f16 = q4k;
+    f16.registerFormats = false;
+    require(moeGgufTile(gpuFamilyClass(family), f16) == MoeGgufTile::Staged,
+            "GGUF experts with an F16 weight took the register tile");
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
       const MoePlan plan = plans.moeDecode(staged, lanes);
       require(plan.configuration().ggufTile == MoeGgufTile::Staged && plan.workspace().groupedSumsBytes == 0,

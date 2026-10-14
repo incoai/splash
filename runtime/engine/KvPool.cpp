@@ -104,6 +104,13 @@ void KvPool::releasePage(uint32_t page, bool prefixOwner) {
     markFree(page);
 }
 
+void KvPool::clearPage(uint32_t page) {
+  const PageRecord &record = pages_.at(page);
+  if (record.activeReferences != 1 || record.prefixOwned)
+    throw std::logic_error("only a page its requester holds alone can be cleared");
+  storage_.clearPages({&page, 1});
+}
+
 uint32_t KvPool::pageCount() const noexcept {
   return static_cast<uint32_t>(pages_.size());
 }

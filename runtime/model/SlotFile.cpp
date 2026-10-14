@@ -139,7 +139,13 @@ void reportPunchFailure(int error) noexcept {
   static std::atomic<bool> reported{false};
   if (!reported.exchange(true, std::memory_order_relaxed))
     logLine("Freed cache slots cannot return their blocks on this volume (",
-            ErrnoMessage{error}, "); disk use may exceed --max-cache-disk.");
+            ErrnoMessage{error}, "); disk use may exceed the SSD cache's limit.");
+}
+
+// Once per file: the write that stopped it.
+void reportWriteFailure(int error) noexcept {
+  logLine("An SSD cache file takes no more writes after one failed (", ErrnoMessage{error},
+          "); what it holds stays readable.");
 }
 
 template <typename Span>
@@ -219,12 +225,13 @@ private:
 };
 
 // Moves one chunk through io(data, bytes, offset), continuing a short
-// transfer where it stopped.
+// transfer where it stopped; one that moves nothing fails as an IO error.
 template <typename Span, typename Io>
 bool moveChunk(Span chunk, off_t offset, Io io) {
   while (!chunk.empty()) {
     const ssize_t count = io(chunk.data(), chunk.size(), offset);
     if (count < 0 && errno == EINTR) continue;
+    if (!count) errno = EIO;
     if (count <= 0) return false;
     chunk = chunk.subspan(static_cast<size_t>(count));
     offset += count;
@@ -494,7 +501,36 @@ bool SlotFile::writable() const noexcept {
   return !backing_->failed.load(std::memory_order_relaxed);
 }
 
+bool SlotFile::takesWrite(bool inUse) const noexcept {
+  const DiskBudget &budget = *backing_->budget;
+  return writable() && budget.limitBytes() >= backing_->slotBytes && budget.admits(inUse);
+}
+
+bool SlotFile::stop(Backing &backing) noexcept {
+  if (backing.failed.exchange(true, std::memory_order_relaxed))
+    return false;
+  backing.budget->stopped_.store(true, std::memory_order_relaxed);
+  return true;
+}
+
 bool SlotFile::persistent() const noexcept { return backing_->persistent; }
+
+std::optional<struct statfs> SlotFile::volume() const noexcept {
+  struct statfs status {};
+  if (::fstatfs(backing_->descriptor, &status) < 0)
+    return std::nullopt;
+  return status;
+}
+
+uint64_t SlotFile::allocatedBytes() const noexcept {
+  uint64_t bytes = 0;
+  for (const int descriptor : {backing_->descriptor, backing_->records}) {
+    struct stat status {};
+    if (descriptor >= 0 && ::fstat(descriptor, &status) == 0)
+      bytes += static_cast<uint64_t>(status.st_blocks) * 512;
+  }
+  return bytes;
+}
 
 // Adoption runs before the worker takes any operation or punch, so it owns
 // the slots and their blocks (Backing::backed) meanwhile.
@@ -705,8 +741,8 @@ std::shared_ptr<SlotFile::Operation> SlotFile::write(
   if (!writable())
     return nullptr;
   slot->returnsBlocks_ = true;
-  return submit([slot, source = std::move(source)](std::span<std::byte> buffer,
-                                                   const std::atomic<bool> &cancelled) {
+  auto operation = submit([slot, source = std::move(source)](std::span<std::byte> buffer,
+                                                            const std::atomic<bool> &cancelled) {
     Backing &backing = *slot->backing_;
     const off_t start = slotOffset(slot->index_, backing.slotBytes);
     const auto store = [&backing](const std::byte *data, size_t bytes, off_t offset) {
@@ -744,7 +780,13 @@ std::shared_ptr<SlotFile::Operation> SlotFile::write(
         chunk = gathered;
       }
       if (!moveChunk(chunk, start + static_cast<off_t>(done), store)) {
-        backing.failed.store(true, std::memory_order_relaxed);
+        // A full volume is the volume's, which the engine measures again
+        // (DiskBudget::fullReported), and the file goes on. Any other error
+        // stops it.
+        if (errno == ENOSPC || errno == EDQUOT)
+          backing.budget->reportFull();
+        else if (const int error = errno; stop(backing))
+          reportWriteFailure(error);
         return false;
       }
       done += chunk.size();
@@ -754,6 +796,8 @@ std::shared_ptr<SlotFile::Operation> SlotFile::write(
     slot->written_ = true;
     return true;
   }, std::move(completion));
+  backing_->budget->charge(backing_->slotBytes);
+  return operation;
 }
 
 std::shared_ptr<SlotFile::Operation> SlotFile::read(

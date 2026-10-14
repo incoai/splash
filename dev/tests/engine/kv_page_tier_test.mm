@@ -261,12 +261,43 @@ void allocationFailure(metal::MetalBackend &backend, engine::MemoryGovernor &gov
   }
 }
 
-// A write that fails closes the file, and the tier refuses every demotion
-// from then on without throwing. A file-size limit at the file's length
-// fails the next slot's write with EFBIG, as a full disk would. The tier
-// refuses here in canDemote(): its refusal of a null write, for a file
-// that closes between canDemote() and the write, has no test of its own,
-// only slot-file's null write from a closed file.
+// The write budget holds no KV write back: with it spent the tier still
+// takes a demotion, and the demotion's slot is counted against it all the
+// same.
+void demotionsPassTheWriteBudget(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
+                                 kv::Format format) {
+  const kv::Layout layout{2, 2, 256, format};
+  kv::PageStorage pages(backend, governor.allocationAdmission(), layout,
+                        layout.minimumExtentPages(), layout.minimumExtentPages());
+  require(static_cast<bool>(pages.allocateExtent(0)), "the test extent was not allocated");
+  const uint64_t slotBytes = SlotFile::slotBytesFor(pages.bytesPerPage());
+  // The clock stands still: what the budget gives out does not come back.
+  auto budget = std::make_shared<DiskBudget>(4 * slotBytes, [] { return 0.0; });
+  budget->setWriteBudget(slotBytes);
+  auto file = std::make_shared<SlotFile>(slotBytes, budget);
+  KvPageTier tier(pages, file);
+  auto first = tier.demote(0, tier.acquireSlot(), {});
+  require(first != nullptr, "a demotion within the write budget was refused");
+  runUntilReady(tier, *first);
+  require(first->finish(), "the first demotion failed");
+  const int64_t spent = budget->writeBudgetBytes();
+  require(!budget->admits(false) && spent < 0 && tier.canDemote(),
+          "the write budget was not spent, or its being spent refused a demotion");
+  auto second = tier.demote(1, tier.acquireSlot(), {});
+  require(second != nullptr, "a demotion was refused while the write budget was spent");
+  runUntilReady(tier, *second);
+  require(second->finish() &&
+              budget->writeBudgetBytes() == spent - static_cast<int64_t>(slotBytes),
+          "a demotion past the write budget failed or was not counted");
+  std::cout << "write budget tests passed\n";
+}
+
+// A write that fails for another reason than a full volume closes the file,
+// and the tier refuses every demotion from then on without throwing. A
+// file-size limit at the file's length fails the next slot's write with
+// EFBIG. The tier refuses here in canDemote(): its refusal of a null write,
+// for a file that closes between canDemote() and the write, has no test of
+// its own, only slot-file's null write from a closed file.
 void closedFileRefusesDemotion(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
                                kv::Format format) {
   const kv::Layout layout{2, 2, 256, format};
@@ -505,8 +536,8 @@ void persistentRoundTrip(metal::MetalBackend &backend, engine::MemoryGovernor &g
 void run(const std::string &metallib) {
   metal::MetalBackend backend(metallib);
   engine::MemoryGovernor governor(
-      backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
-      engine::queryHostAvailableMemory, 0);
+      backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
+      engine::queryHostMemory, 0);
   for (const auto format : {kv::Format::Int8, kv::Format::BFloat16}) {
     roundTrip(backend, governor, kv::Layout{2, 2, 256, format});
     roundTrip(backend, governor, kv::Layout{10, 2, 256, format}); // Qwen3.6-35B
@@ -515,6 +546,7 @@ void run(const std::string &metallib) {
     persistentRoundTrip(backend, governor, kv::Layout{16, 4, 256, format});
     limits(backend, governor, format);
     allocationFailure(backend, governor, format);
+    demotionsPassTheWriteBudget(backend, governor, format);
     closedFileRefusesDemotion(backend, governor, format);
     besideACommand(backend, governor, format);
     teardown(backend, governor, format);

@@ -94,16 +94,6 @@ StartupRetryWindow::retryUntil(const RuntimeBootstrapReport &failure,
   return deadline_;
 }
 
-bool memoryMayNotHold(const EngineMemoryPlan &plan,
-                      uint64_t hostAvailableBytes, uint32_t contextTokens) {
-  const uint64_t held = EngineMemoryPolicy::hostAvailableReserveBytes(
-                            plan.breakdown().physicalMemoryBytes) +
-                        kHostWarningMarginBytes;
-  return plan.contextTokensWithin(
-             hostAvailableBytes > held ? hostAvailableBytes - held : 0) <
-         contextTokens;
-}
-
 protocol::ProtocolLimits protocolLimitsFor(
     const model::ModelCapabilities &capabilities, uint32_t maxContext) noexcept {
   protocol::ProtocolLimits limits;
@@ -277,9 +267,20 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
     fail(std::move(base), RuntimeBootstrapStage::ModelCreation,
          "memory plan cannot hold one model token");
   }
-  if (!config.nativeLoop.engine.maxContext) {
+  const uint32_t relaunchContext = config.resources.relaunchContext;
+  if (!config.nativeLoop.engine.maxContext && relaunchContext) {
+    // A relaunch serves the context of the server's first engine, which its
+    // split left. A plan that holds less, as once this Mac's memory budget
+    // shrank, has the relaunch serve that, and the server, which serves the
+    // first engine's context, stops relaunching (server/runtime.py).
+    if (relaunchContext > planContext)
+      logLine("The memory plan holds ", planContext, " tokens of context, less than the ",
+              relaunchContext, " the server's first engine served.");
+    config.nativeLoop.engine.maxContext = std::min(relaunchContext, planContext);
+  } else if (!config.nativeLoop.engine.maxContext) {
     // The automatic context, which the plan holds and every start of the
-    // model on this Mac serves alike (AneFfnOutcome::context).
+    // model on this Mac that takes its calibration serves alike
+    // (AneFfnOutcome::context).
     config.nativeLoop.engine.maxContext = resources->aneFfnOutcome().context;
   } else if (config.nativeLoop.engine.maxContext > planContext) {
     // --max-memory sets the budget only below this Mac's own.
@@ -291,20 +292,6 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
              " exceeds the " + std::to_string(planContext) + " tokens the model and " +
              (memoryCapped ? "--max-memory" : "this Mac's memory") +
              " allow; omit it or pass at most " + std::to_string(planContext));
-  }
-  // Without the disk tier a request that runs out of memory cannot publish
-  // its progress checkpoints and replays its prompt.
-  const std::optional<uint64_t> hostAvailable =
-      resources->hostAvailableAtStart();
-  if (!config.resources.maximumCacheDiskBytes && hostAvailable &&
-      memoryMayNotHold(resources->memoryPlan(), *hostAvailable,
-                       config.nativeLoop.engine.maxContext)) {
-    logLine("The ", *hostAvailable / kMiB,
-            " MiB this Mac had available at startup may not hold a ",
-            config.nativeLoop.engine.maxContext,
-            "-token request; one that runs out of memory is suspended"
-            " and replays its prompt. --max-cache-disk SIZE keeps its"
-            " progress and cached prefixes on SSD.");
   }
   config.nativeLoop.engine.vocabularySize =
       config.resources.model.capabilities.vocabularySize;

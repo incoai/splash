@@ -113,6 +113,19 @@ void PageStorage::copyPages(std::span<const PageCopy> copies) {
     }
 }
 
+void PageStorage::clearPages(std::span<const uint32_t> pages) {
+    for (const uint32_t page : pages) {
+        if (!isAllocated(page)) {
+            throw std::logic_error(
+                "cannot clear a KV page of an extent that is not allocated");
+        }
+    }
+    for (const uint32_t page : pages) {
+        for (const std::span<std::byte> tensor : spans(page))
+            std::memset(tensor.data(), 0, tensor.size());
+    }
+}
+
 SplashKvPage PageStorage::entry(uint32_t page) const {
     const size_t extent = extentIndex(page);
     const uint64_t address = extentAddresses_[extent];

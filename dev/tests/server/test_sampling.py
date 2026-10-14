@@ -240,10 +240,21 @@ class SamplingTests(HarnessTestCase):
         body.pop("temperature")
         with mock.patch("server.frontend.secrets.randbits", return_value=123):
             job = app.prepare(body, deadline=FOREVER)
-        self.assertEqual(
-            (job.sampling, job.seed),
-            (native_wire.SamplingParameters(1.0, 0.95, 20), 123),
-        )
+            self.assertEqual(
+                (job.sampling, job.seed),
+                (native_wire.SamplingParameters(1.0, 0.95, 20), 123),
+            )
+            # -1 asks for a random seed too; another negative one is taken
+            # as its 64 bits.
+            for seed, expected in (
+                (-1, 123),
+                (-2, 2**64 - 2),
+                (-(2**63), 2**63),
+                (2**64 - 1, 2**64 - 1),
+            ):
+                with self.subTest(seed=seed):
+                    job = app.prepare(chat_body(seed=seed), deadline=FOREVER)
+                    self.assertEqual(job.seed, expected)
 
 
 if __name__ == "__main__":

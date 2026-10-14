@@ -107,7 +107,8 @@ int main(int argc, char **argv) {
       check(ggml, std::string("load ") + oracle + (ggml ? "" : std::string(": ") + dlerror()));
     }
     const Goldens hashes = goldens(argv[1], @"gguf_dequantization");
-    for (uint32_t f = 0; f < GGUF_FMT_AF2G32; ++f) checkFormat(ggml, hashes, Fmt(f));
+    for (uint32_t f = 0; f < GGUF_FMT_COUNT; ++f)
+      if (!quant_loader_format(f)) checkFormat(ggml, hashes, Fmt(f));
     checkBlockNvfp4(ggml, hashes);
     checkMlx(argv[2]);
     std::printf("%s (%d failures)\n", failures ? "GGUF reference tests FAILED" : "GGUF reference tests passed",

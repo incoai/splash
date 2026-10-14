@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from functools import cached_property, lru_cache
 from urllib.parse import unquote
@@ -19,10 +20,6 @@ from .schema_validation import (
     json_objects,
     subschemas,
 )
-
-# A function tool's name, as a tools list declares it and a tool search's
-# tool_reference names it.
-TOOL_NAME = re.compile(r"[A-Za-z0-9_-]{1,128}")
 
 # The chat template's tool-call tags, as it lays a call out: grammars write
 # calls that way, and the projector reads them that way (output.py). A call
@@ -44,6 +41,25 @@ TOOL_CALL_OPEN_TOKEN_ID = 248058  # and its call-open token
 # with it.
 MAX_NAME_LENGTH = 256
 NAME_SPACE = " \t\n\r"
+TAG_NAME_RULE = (
+    f"1 to {MAX_NAME_LENGTH} characters in NFC, without <, >, line breaks, "
+    "lone surrogates or surrounding whitespace"
+)
+
+
+def is_tag_name(name):
+    """Whether `name` reads back as written from a call's tags, where a
+    function's name and a strict tool's parameter's are written. A tokenizer
+    may normalize text to NFC, as Qwen's does, and none spells a lone
+    surrogate."""
+    return (
+        isinstance(name, str)
+        and 0 < len(name) <= MAX_NAME_LENGTH
+        and name == name.strip(NAME_SPACE)
+        and not any(character in name for character in "<>\n\r")
+        and not any("\ud800" <= character <= "\udfff" for character in name)
+        and unicodedata.is_normalized("NFC", name)
+    )
 
 
 def function_opening(name):
@@ -68,7 +84,8 @@ MAX_FRAMED_SCHEMA_BYTES = 16 * 1024 * 1024
 class ToolPolicy:
     """How a request's tool calls are generated and read."""
 
-    # The declared parameter schema of each tool a call may name.
+    # The declared parameter schema of each tool a call may name; None for a
+    # tool whose schema cannot be read, which only describes it to the model.
     schemas: dict
     required: bool
     parallel: bool
@@ -83,8 +100,9 @@ class ToolPolicy:
     @cached_property
     def argument_schemas(self):
         """The arguments of each tool, framed: a strict tool's as its grammar
-        generates them, any other's as declared. None for a tool whose
-        parameters cannot be framed, which only a strict tool refuses."""
+        generates them, any other's as declared. None for a tool whose schema
+        cannot be read or whose parameters cannot be framed, which only a
+        strict tool refuses."""
         budget = [MAX_FRAMED_SCHEMA_BYTES]
         framed = {}
         for name, schema in self.schemas.items():
@@ -92,7 +110,9 @@ class ToolPolicy:
                 framed[name] = tool_argument_schema(_strict_schema(schema), budget)
                 continue
             try:
-                framed[name] = tool_argument_schema(schema, budget)
+                framed[name] = (
+                    None if schema is None else tool_argument_schema(schema, budget)
+                )
             except APIError:
                 framed[name] = None
         return framed
@@ -762,13 +782,7 @@ def _argument_grammar(schema):
     for index, (name, value_schema) in enumerate(properties.items()):
         rule = f"parameter_{index}"
         prefix = f"{_NAME_OPEN} {json.dumps(name)} {_NAME_CLOSE}"
-        if value_schema is not False and (
-            not isinstance(name, str)
-            or not name
-            or len(name) > MAX_NAME_LENGTH
-            or name != name.strip(NAME_SPACE)
-            or any(character in name for character in "<>\n\r")
-        ):
+        if value_schema is not False and not is_tag_name(name):
             raise APIError(400, "invalid tool parameter name")
         parameter_rules = _parameter_rules(rule, prefix, value_schema)
         if parameter_rules is None:
@@ -837,6 +851,20 @@ def normalize_response_format(value):
     return schema, validator
 
 
+def _check_tool_schema(name, schema):
+    """Refuse tool `name`'s schema if it nests too deep, refers to another
+    document or breaks its dialect's meta-schema."""
+    _check_depth(schema, f"invalid tool schema for {name}")
+    if ref := _remote_ref(schema):
+        raise APIError(400, f"remote tool schema reference is not allowed: {ref}")
+    try:
+        check_schema(schema)
+    except SchemaError as error:
+        raise APIError(
+            400, f"invalid tool schema for {name}: {error.message}"
+        ) from error
+
+
 def normalize_tools(tools, tool_choice, parallel, namespaces=None):
     """The tools of a request and its ToolPolicy."""
     if parallel is None:
@@ -851,13 +879,23 @@ def normalize_tools(tools, tool_choice, parallel, namespaces=None):
         raise APIError(400, "tools must be an array")
     schemas = {}
     marked = set()
+    offered = []
     for tool in tools:
-        if not isinstance(tool, dict) or tool.get("type") != "function":
+        # A tool that names no type is a function, the only kind there is,
+        # and the template declares it as one.
+        if not isinstance(tool, dict) or tool.get("type") not in (None, "function"):
             raise APIError(400, "only function tools are supported")
+        if tool.get("type") is None:
+            tool = {"type": "function"} | {
+                key: value for key, value in tool.items() if key != "type"
+            }
+        offered.append(tool)
         function = tool.get("function")
-        name = function.get("name") if isinstance(function, dict) else None
-        if not isinstance(name, str) or TOOL_NAME.fullmatch(name) is None:
-            raise APIError(400, f"tool name must match {TOOL_NAME.pattern}")
+        if not isinstance(function, dict):
+            raise APIError(400, "a function tool needs a function object")
+        name = function.get("name")
+        if not is_tag_name(name):
+            raise APIError(400, f"tool name must be {TAG_NAME_RULE}")
         if name in schemas:
             raise APIError(400, f"duplicate tool name: {name}")
         schema = function.get("parameters")
@@ -868,15 +906,15 @@ def normalize_tools(tools, tool_choice, parallel, namespaces=None):
         strict = function.get("strict")
         if strict is not None and not isinstance(strict, bool):
             raise APIError(400, f"strict must be a boolean for tool {name}")
-        _check_depth(schema, f"invalid tool schema for {name}")
-        if ref := _remote_ref(schema):
-            raise APIError(400, f"remote tool schema reference is not allowed: {ref}")
         try:
-            check_schema(schema)
-        except SchemaError as error:
-            raise APIError(
-                400, f"invalid tool schema for {name}: {error.message}"
-            ) from error
+            _check_tool_schema(name, schema)
+        except APIError:
+            if strict:
+                raise
+            # Only a strict tool's grammar is built from its schema. Any
+            # other's still describes the tool, and its values convert as
+            # those of a parameter it does not declare.
+            schema = None
         schemas[name] = schema
         if strict:
             marked.add(name)
@@ -887,7 +925,7 @@ def normalize_tools(tools, tool_choice, parallel, namespaces=None):
         return None, None
     if choice == "none":
         # The prompt keeps every tool; the grammar lets no call start.
-        return tools, ToolPolicy(
+        return offered, ToolPolicy(
             schemas={},
             required=False,
             parallel=parallel,
@@ -899,7 +937,7 @@ def normalize_tools(tools, tool_choice, parallel, namespaces=None):
         function = choice.get("function", {})
         name = function.get("name") if isinstance(function, dict) else None
         if (
-            choice.get("type") != "function"
+            choice.get("type") not in (None, "function")
             or not isinstance(name, str)
             or name not in schemas
         ):
@@ -928,7 +966,7 @@ def normalize_tools(tools, tool_choice, parallel, namespaces=None):
         constrained=choice != "auto" or not parallel or bool(strict),
         namespaces=namespaces or {},
     )
-    return tools, policy
+    return offered, policy
 
 
 def tool_grammar(policy, thinking, response_schema=None):

@@ -246,6 +246,76 @@ class ServerRecoveryTests(HarnessTestCase):
         refusal = backend.refusal()
         self.assertEqual((refusal.status, refusal.code), (500, "engine_failed"))
 
+    def test_relaunch_keeps_the_first_engines_context(self):
+        # Without --max-context a relaunch is asked to keep the context the
+        # first engine served, and one that does serves on. One that serves
+        # another, as once the Mac's memory budget shrank, still stops the
+        # restarts at once.
+        args = main_args()
+        first = tuple(api._native_command(args))
+        relaunch = (*first, "--relaunch-context", str(READY.max_context_tokens))
+        for relaunched, serves in (
+            (READY, True),
+            (dataclasses.replace(READY, max_context_tokens=65_536), False),
+        ):
+            with self.subTest(relaunched=relaunched):
+                factory = FakeFactory(handler=answer_status)
+                commands = []
+
+                def spawn(command, factory=factory, commands=commands, **_options):
+                    commands.append(command)
+                    return factory()
+
+                runtime = engine_runtime.MultiplexedRuntime(
+                    first,
+                    relaunch_command=lambda ready: api._native_command(
+                        args, ready.max_context_tokens
+                    ),
+                )
+                trace = mock.Mock(last_dump=None)
+                with (
+                    mock.patch.object(
+                        engine_runtime.subprocess, "Popen", side_effect=spawn
+                    ),
+                    mock.patch.object(runtime, "_crash_trace", trace),
+                    mock.patch.object(backend_api, "print_status"),
+                ):
+                    self.assertTrue(runtime.wait_ready(1))
+                    backend = self.backend(runtime)
+                    factory.initial_output = native_peer.serialize_event(relaunched)
+                    factory.processes[0].kill()
+                    self.wait_until(
+                        lambda: (
+                            backend.fatal_error is not None
+                            or (
+                                len(factory.processes) == 2
+                                and runtime.ready
+                                and backend.recovery is None
+                            )
+                        ),
+                        2,
+                    )
+                self.assertEqual(commands, [first, relaunch])
+                # A crash trace of the relaunch replays its own command.
+                self.assertEqual(
+                    [call.args[2] for call in trace.start_generation.call_args_list],
+                    [first, relaunch],
+                )
+                if serves:
+                    self.assertIsNone(backend.fatal_error)
+                    self.assertIsNone(backend.refusal())
+                    self.assertEqual(runtime.readiness, READY)
+                else:
+                    self.assertEqual(
+                        backend.fatal_error,
+                        "native context window, concurrency or vision changed; "
+                        "restart the Splash server",
+                    )
+                    refusal = backend.refusal()
+                    self.assertEqual(
+                        (refusal.status, refusal.code), (500, "engine_failed")
+                    )
+
     def test_stop_after_failed_relaunches_names_the_last_crash_trace(self):
         factory = FakeFactory()
 

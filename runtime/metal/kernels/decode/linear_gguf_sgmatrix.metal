@@ -31,11 +31,11 @@ namespace gguf_sg {
 template <class F> struct Shape {
   enum : uint {
     Linear = F::Kind == QuantLinear,
-    HasMin = Linear && F::Zero == 0,                          // Q4_K, Q5_K, Q4_1, Q2_K, MLX affine: s code + m
+    HasMin = Linear && F::Zero == 0,                          // Q4_K, Q5_K, Q4_1, Q5_1, Q2_K, MLX affine: s code + m
     // Linear codes past 127 (MLX affine 8-bit), which enter the MMA as the code itself: no bf16 128 + code holds them
     Wide = QuantWideCodes<F>::value,
     // Linear codes chained from the table's seed of their 16 inputs: s (code - zero) with a zero point (Q6_K, Q3_K,
-    // Q4_0, IQ1, PQ2_0), and Q2_K's min per 16 inputs
+    // Q4_0, Q5_0, IQ1, PQ2_0), and Q2_K's min per 16 inputs
     Seeded = Linear && (!HasMin || F::Group == 16),
     // bf16 bits of the operand of code 0: 128, or 160 - zero when seeded
     Operand = 0x4300 + (Seeded ? kZeroPointOffset - 128 - F::Zero : 0),
@@ -58,7 +58,7 @@ template <class F> constant constexpr uint kCoefs = GGUF_TILE_COLUMNS * Shape<F>
 static_assert(GGUF_REGISTER_COLUMNS == 2 * 8, "a simdgroup's columns are its two 8-column MMA fragments");
 constant constexpr uint kCoefFloat2s = kCoefs<FmtQ4K>;
 #define GGUF_SG_COEF_BYTES(F, f) static_assert(kCoefs<F> * sizeof(Coef<F>) <= kCoefFloat2s * sizeof(float2), #f " coefficients fit");
-QUANT_FORMATS(GGUF_SG_COEF_BYTES)
+QUANT_REGISTER_FORMATS(GGUF_SG_COEF_BYTES)
 #undef GGUF_SG_COEF_BYTES
 
 // The exact bf16 operand of pair f of a chunk.
@@ -79,6 +79,9 @@ inline bfloat2 operand(typename F::Chunk ch, uint f, threadgroup const bfloat2 *
     const uint2 v = F::values(ch);
     const uint pair = ((f < 2 ? v.x : v.y) >> (16 * (f & 1))) & 0xFFFFu;
     return bfloat2(float2(quant_e4m3_pair(quant_byte_pairs(pair).x)));
+  } else if constexpr (F::Kind == QuantFloat16) {   // the bf16 values themselves (quant_register_format)
+    static_assert(is_same_v<typename F::Value, bfloat>, "the register tile takes bf16 values only");
+    return as_type<bfloat2>(F::values(ch)[f]);
   } else {
     const uint2 g = F::grid(ch);
     const uchar4 m = as_type<uchar4>(f < 2 ? g.x : g.y);
@@ -330,7 +333,7 @@ kernel void decode_linear_gguf_prepare(device const bfloat *input [[buffer(0)]],
   GGUF_SG_KERNEL(gguf_decode_sg_##f##_l##L##_g, F, L, EpUpWithGate, bfloat)
 #define GGUF_SG_FORMAT(F, f) \
   GGUF_SG_EPILOGUES(F, f, 1) GGUF_SG_EPILOGUES(F, f, 2) GGUF_SG_EPILOGUES(F, f, 3) GGUF_SG_EPILOGUES(F, f, 4)
-QUANT_FORMATS(GGUF_SG_FORMAT)
+QUANT_REGISTER_FORMATS(GGUF_SG_FORMAT)
 #undef GGUF_SG_FORMAT
 #undef GGUF_SG_EPILOGUES
 #undef GGUF_SG_KERNEL
@@ -354,7 +357,7 @@ inline void gguf_sg_fused(device const bfloat *table, device const float *sums, 
   device uchar *meta = s == 0 ? ma : s == 1 ? mb : mc;
   const GgufDecodeParams q{p.input_size, p.splits, p.out_stride, p.offset[s], 0};
   const uint2 local(tg.x - (s == 0 ? 0 : s == 1 ? t0 : t1), tg.y);
-  quant_format_switch(p.fmt[s], [&](auto format) {
+  quant_register_format_switch(p.fmt[s], [&](auto format) {
     typedef decltype(format) F;
     quant_pair_table<F>(lut, tid, GGUF_REGISTER_THREADS);
     gguf_sg::decode<F, L, EpNone>(table, sums, w0, w1, meta, out, partials, counters, out, q, local,
@@ -399,7 +402,7 @@ inline void gguf_sg_expert(device const bfloat *table, device const float *sums,
   const uint K = p.input_size, N = p.output_size;
   const ulong rows = ulong(tg.y) * 8;
   const GgufDecodeParams q{K, 1, N, 0, 0};
-  quant_format_switch(s.format, [&](auto format) {
+  quant_register_format_switch(s.format, [&](auto format) {
     typedef decltype(format) F;
     quant_pair_table<F>(lut, tid, GGUF_REGISTER_THREADS);
     gguf_sg::decode<F, 1, Ep>(

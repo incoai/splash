@@ -199,53 +199,30 @@ void testShortestRemainingFirstUsesActualRows() {
           "initial prefill plan did not carry its absolute token offset");
 }
 
-void testPerRequestBoundary() {
+// The engine ends a lane's command before its planned rows at a state
+// boundary whose state or KV it could not reserve (Engine::prepare): the
+// scheduler takes the rows the shortened item ran, and the lane resumes from
+// them.
+void testShortenedPrefillResumesFromItsRows() {
   engine::Scheduler scheduler(0.0);
   scheduler.submit(request(1, 4096));
-  scheduler.submit(request(2, 4096));
+  scheduler.submit(request(2, 1000));
   scheduler.resourcesReady(1, 0);
   scheduler.resourcesReady(2, 0);
-  scheduler.setPrefillBoundary(1, 32);
   BatchPlan plan = *scheduler.next({});
-  require(plan.items[0].tokenCount == 32 && plan.items[1].tokenCount == 2016,
-          "one sequence boundary incorrectly padded or shortened its peer");
+  require(plan.items.size() == 2 && plan.items[0].requestId == 2 &&
+              plan.items[1].requestId == 1 && plan.items[1].tokenCount == 1048,
+          "the long lane did not take the rest of the budget");
+  plan.items[1].tokenCount = 32;
   completePrefill(scheduler, plan);
-  require(scheduler.phase(1) == engine::Phase::Prefill,
-          "materialization boundary ended the request prefill");
-  // The peer now has fewer remaining rows and takes the next command alone;
-  // the capped lane resumes after it from its scheduler-owned offset.
-  const BatchPlan peer = *scheduler.next({});
-  require(peer.items.size() == 1 && peer.items[0].requestId == 2,
-          "the shorter remaining peer did not take the next command");
-  completePrefill(scheduler, peer);
-  // The peer's 32-row tail still sorts first; the capped lane follows from
-  // its scheduler-owned offset.
+  require(scheduler.promptProcessed(1) == 32 && scheduler.phase(1) == engine::Phase::Prefill,
+          "a shortened command did not keep the rows it ran");
+  completeDecode(scheduler, true);
   const BatchPlan resumed = *scheduler.next({});
-  require(resumed.items.size() == 2 && resumed.items[0].requestId == 2 &&
-              resumed.items[0].tokenCount == 32 &&
-              resumed.items[1].requestId == 1 &&
-              resumed.items[1].promptOffset == 32 &&
-              resumed.items[1].tokenCount == 2016,
-          "resumed prefill lost the scheduler-owned absolute offset");
-}
-
-// complete() consumes a boundary its command reached, so the next one is
-// armed against the progress after that command: a boundary the request has
-// reached is refused.
-void testReachedBoundaryIsConsumedBeforeTheNextIsArmed() {
-  engine::Scheduler scheduler(0.0);
-  scheduler.submit(request(1, 4096));
-  scheduler.resourcesReady(1, 0);
-  scheduler.setPrefillBoundary(1, 64);
-  const BatchPlan reaching = *scheduler.next({});
-  require(reaching.items[0].tokenCount == 64, "the boundary did not cap the command");
-  completePrefill(scheduler, reaching);
-  rejects([&] { scheduler.setPrefillBoundary(1, 64); }, "invalid prefill boundary",
-          "a boundary the request has reached was armed again");
-  scheduler.setPrefillBoundary(1, 128);
-  const BatchPlan next = *scheduler.next({});
-  require(next.items[0].promptOffset == 64 && next.items[0].tokenCount == 64,
-          "the next boundary did not cap the next command");
+  require(resumed.items.size() == 1 && resumed.items[0].requestId == 1 &&
+              resumed.items[0].promptOffset == 32 &&
+              resumed.items[0].tokenCount == model::ExecutionLimits::prefillTokenBudget,
+          "the shortened lane did not resume from the rows it ran");
 }
 
 void testEqualPromptsFinishInArrivalOrder() {
@@ -276,34 +253,6 @@ void testShortArrivalPrecedesLongColdPrompt() {
               plan.items[1].requestId == 1 &&
               plan.items[1].tokenCount == 1348,
           "a later short prompt waited behind an earlier long one");
-}
-
-void testBoundaryCapsDispatchWithoutChangingPriority() {
-  engine::Scheduler scheduler(0.0);
-  scheduler.submit(request(1, 4096));
-  scheduler.submit(request(2, 500));
-  scheduler.resourcesReady(1, 0);
-  scheduler.resourcesReady(2, 0);
-  scheduler.setPrefillBoundary(1, 64);
-  const BatchPlan plan = *scheduler.next({});
-  require(plan.items.size() == 2 && plan.items[0].requestId == 2 &&
-              plan.items[0].tokenCount == 500 &&
-              plan.items[1].requestId == 1 &&
-              plan.items[1].tokenCount == 64,
-          "state capture changed priority or lost its dispatch boundary");
-
-  engine::Scheduler checkpoints(0.0);
-  checkpoints.submit(request(1, 25000));
-  checkpoints.submit(request(2, 10000));
-  checkpoints.resourcesReady(1, 2048);
-  checkpoints.resourcesReady(2, 0);
-  checkpoints.setPrefillBoundary(1, 4096);
-  checkpoints.setPrefillBoundary(2, 4096);
-  const BatchPlan next = *checkpoints.next({});
-  require(next.items.size() == 1 && next.items[0].requestId == 2 &&
-              next.items[0].tokenCount ==
-                  model::ExecutionLimits::prefillTokenBudget,
-          "rolling checkpoints placed a long prompt before a shorter arrival");
 }
 
 void testEqualLanesRunInArrivalOrderWithoutOvertaking() {
@@ -664,7 +613,7 @@ void testMeasuredBudgetUsesActualRowsAndRecovers() {
           "prefill budget did not adapt when measured execution became faster");
 }
 
-void testMeasuredBudgetPreservesPriorityAndStateBoundaries() {
+void testMeasuredBudgetPreservesPriority() {
   engine::Scheduler scheduler(0.0);
   scheduler.submit(request(1, 20'000, false, RequestPriority::Foreground));
   scheduler.resourcesReady(1, 0);
@@ -679,15 +628,12 @@ void testMeasuredBudgetPreservesPriorityAndStateBoundaries() {
   scheduler.submit(request(4, 1, false, RequestPriority::Foreground));
   scheduler.resourcesReady(4, 1);
   completeDecode(scheduler);
-  scheduler.setPrefillBoundary(1, 2080);
   const BatchPlan plan = *scheduler.next({});
-  require(plan.kind == WorkKind::Prefill && plan.items.size() == 2 &&
+  require(plan.kind == WorkKind::Prefill && plan.items.size() == 1 &&
               plan.items[0].requestId == 1 &&
               plan.items[0].promptOffset == 2048 &&
-              plan.items[0].tokenCount == 32 &&
-              plan.items[1].requestId == 3 &&
-              plan.items[1].tokenCount == 96,
-          "adaptive prefill lost a state boundary or exceeded its shared budget");
+              plan.items[0].tokenCount == 128,
+          "adaptive prefill exceeded its shared budget");
 }
 
 void testUnavailableTimingAndMinimumBudget() {
@@ -720,7 +666,9 @@ void testMeasuredBudgetDoesNotCountBlockedPeers() {
           "queued or resource-blocked work reduced resident throughput");
 }
 
-void testMeasuredBudgetPreservesPurePrefillBatching() {
+// Peers that only prefill, none finishing within the measured slice, do not
+// contend: the leader keeps the full budget.
+void testMeasuredBudgetPreservesPurePrefillThroughput() {
   engine::Scheduler scheduler(0.0);
   scheduler.submit(request(1, 20'000));
   scheduler.resourcesReady(1, 0);
@@ -729,12 +677,11 @@ void testMeasuredBudgetPreservesPurePrefillBatching() {
     scheduler.submit(request(id, 20'000));
     scheduler.resourcesReady(id, 0);
   }
-  scheduler.setPrefillBoundary(1, 2080);
   const BatchPlan plan = *scheduler.next({});
-  require(plan.kind == WorkKind::Prefill && plan.width() == 2 &&
-              plan.items[0].tokenCount == 32 &&
-              plan.items[1].tokenCount == 2016,
-          "pure prefill contention lost throughput or stopped batching peers");
+  require(plan.kind == WorkKind::Prefill && plan.width() == 1 &&
+              plan.items[0].requestId == 1 &&
+              plan.items[0].tokenCount == model::ExecutionLimits::prefillTokenBudget,
+          "pure prefill contention lost throughput");
 }
 
 void testTinyTailDoesNotDistortPrefillThroughput() {
@@ -1107,11 +1054,9 @@ int main() {
     testQueuedPrefillCannotBeOvertakenIndefinitely();
     testWarmupTimingSeedsFirstContendedCommand();
     testShortestRemainingFirstUsesActualRows();
-    testPerRequestBoundary();
-    testReachedBoundaryIsConsumedBeforeTheNextIsArmed();
+    testShortenedPrefillResumesFromItsRows();
     testEqualPromptsFinishInArrivalOrder();
     testShortArrivalPrecedesLongColdPrompt();
-    testBoundaryCapsDispatchWithoutChangingPriority();
     testEqualLanesRunInArrivalOrderWithoutOvertaking();
     testLaneOvertakenThreeTimesLeadsTheNextCommand();
     testServedLaneResetsOvertaking();
@@ -1128,10 +1073,10 @@ int main() {
     testMeasuredBudgetOnlyLimitsContendedWork();
     testAuxiliaryWorkDoesNotTrainTextPrefillTiming();
     testMeasuredBudgetUsesActualRowsAndRecovers();
-    testMeasuredBudgetPreservesPriorityAndStateBoundaries();
+    testMeasuredBudgetPreservesPriority();
     testUnavailableTimingAndMinimumBudget();
     testMeasuredBudgetDoesNotCountBlockedPeers();
-    testMeasuredBudgetPreservesPurePrefillBatching();
+    testMeasuredBudgetPreservesPurePrefillThroughput();
     testTinyTailDoesNotDistortPrefillThroughput();
     testMeasuredBudgetFinishesShortPrefillPromptly();
     testShortArrivalBesideLongPrefillEndsAtItsLastRow();

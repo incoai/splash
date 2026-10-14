@@ -4,6 +4,7 @@
 #include "engine/KvPool.hpp"
 #include "engine/KvTier.hpp"
 #include "engine/RecencyOrder.hpp"
+#include "engine/Types.hpp"
 #include "model/Model.hpp"
 #include "ops/PagedKv.hpp"
 
@@ -19,17 +20,25 @@
 
 namespace splash::engine {
 
-struct ImageIdentity final {
+struct BlockIdentity final {
   uint64_t lo = 0;
   uint64_t hi = 0;
 
-  bool operator==(const ImageIdentity &) const = default;
+  bool operator==(const BlockIdentity &) const = default;
 };
 
 // The spans are sorted by offset and disjoint, as Engine::submit requires.
-[[nodiscard]] ImageIdentity
+[[nodiscard]] BlockIdentity
 blockImageIdentity(uint64_t blockBegin, uint32_t blockTokens,
                    std::span<const ImageSpan> spans) noexcept;
+// A block's key beside its parent and tokens: its images' identity, which
+// the first block of a salted request's prompt folds its cache salt into,
+// so that the chains of different salts part at the root. A persistent tier
+// records it with each block, so a change to its values bumps
+// kPersistentCacheFormat; dev/tests/engine/kv_page_cache_test.cpp pins them.
+[[nodiscard]] BlockIdentity blockIdentity(uint64_t blockBegin, uint32_t blockTokens,
+                                          std::span<const ImageSpan> spans,
+                                          CacheSalt salt) noexcept;
 
 // Content-addressed target-KV blocks across two tiers. Matching walks the
 // chained full-page hashes from the root. A block holds a pool page, a disk
@@ -59,23 +68,24 @@ public:
   KvCache &operator=(const KvCache &) = delete;
   ~KvCache() noexcept;
 
-  // Keys are the parent block, the exact tokens, and the identity of any
-  // image content the rows depend on (zero for text-only blocks).
+  // Keys are the parent block, the exact tokens, and the block's identity
+  // (blockIdentity), which is zero for a text-only block of a prompt without
+  // a cache salt.
   [[nodiscard]] std::optional<BlockMatch> find(uint64_t parentBlock,
                                                std::span<const uint32_t> tokens,
-                                               ImageIdentity images) const;
+                                               BlockIdentity identity) const;
   // Existing content is returned as is; a disk-only block adopts the
   // writer's page, and a block in transfer keeps its own.
   [[nodiscard]] BlockMatch insert(uint64_t parentBlock,
                                   std::span<const uint32_t> tokens,
                                   uint32_t physicalPage,
-                                  ImageIdentity images);
+                                  BlockIdentity identity);
   // Takes back a disk-only block an earlier process left in a persistent
   // tier, under its id, key and recency; a parent comes back before its
   // children. New ids continue after it. False, taking nothing, when
   // another block holds the key.
   [[nodiscard]] bool adoptDiskBlock(uint64_t blockId, uint64_t parentBlock,
-                                    std::span<const uint32_t> tokens, ImageIdentity images,
+                                    std::span<const uint32_t> tokens, BlockIdentity identity,
                                     std::shared_ptr<KvDiskSlot> slot, uint64_t lastUsed);
   // New ids continue after this one, which an earlier process recorded.
   void continueIdsAfter(uint64_t blockId) noexcept;
@@ -83,7 +93,7 @@ public:
   struct Key final {
     uint64_t parent = 0;
     std::span<const uint32_t> tokens;
-    ImageIdentity images;
+    BlockIdentity identity;
   };
   [[nodiscard]] Key key(uint64_t blockId) const;
   [[nodiscard]] uint64_t lastUsed(uint64_t blockId) const;
@@ -183,7 +193,7 @@ private:
     uint64_t nextSibling = 0;
     uint64_t indexHash = 0;
     std::array<uint32_t, pageTokens> tokens{};
-    ImageIdentity images;
+    BlockIdentity identity;
     uint32_t page = noPage;
     std::shared_ptr<KvDiskSlot> slot;
     uint32_t children = 0;

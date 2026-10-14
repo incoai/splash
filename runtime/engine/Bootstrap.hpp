@@ -86,14 +86,6 @@ private:
         reached_;
 };
 
-// Whether memory may not hold a request of contextTokens: the plan within
-// what the host had available at startup, beyond its reserve and the warning
-// margin, holds less. The estimate is conservative, since macOS compresses
-// other applications further once the engine loads.
-[[nodiscard]] bool memoryMayNotHold(const EngineMemoryPlan &plan,
-                                    uint64_t hostAvailableBytes,
-                                    uint32_t contextTokens);
-
 // The wire limits of a model served with maxContext tokens: prompts and
 // outputs up to the context, the engine's step and draft query rows, and a
 // mask row per draft query and the anchor.
@@ -103,8 +95,10 @@ protocolLimitsFor(const model::ModelCapabilities &capabilities,
 
 struct RuntimeBootstrapConfig {
     RuntimeResourcesConfig resources;
-    // A zero engine maxContext is what the memory plan holds, as serve's
-    // default; a larger one than that fails the bootstrap.
+    // A zero engine maxContext is a relaunch's context
+    // (RuntimeResourcesConfig::relaunchContext), or else what the memory
+    // plan holds, as serve's default; another one larger than the plan
+    // holds fails the bootstrap.
     NativeLoopConfig nativeLoop;
 };
 
@@ -138,10 +132,13 @@ public:
         return *nativeLoop_;
     }
 
-    // The memory control pass the transport runs at a command-free point
-    // (MemoryControl::run), after it samples the thermal state.
+    // The control pass the transport runs at a command-free point: it
+    // samples the thermal state, keeps the disk tier within what its volume
+    // leaves it (Cache::keepDiskLimit), and runs the memory control pass
+    // (MemoryControl::run).
     [[nodiscard]] bool controlPass(MemoryPressure pressure) {
         sampleThermalState();
+        resources_->cache().keepDiskLimit();
         return memoryControl_.run(pressure);
     }
     // The status document, with the metrics and the loop timing the

@@ -16,6 +16,7 @@ from pathlib import Path
 
 from . import images, origins
 from .http_security import validate_api_key
+from .protocol import MAX_THINKING_END_TOKENS
 
 REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 MAX_CONTEXT_TOKENS = 262144
@@ -24,8 +25,6 @@ DEFAULT_QUEUE_SIZE = 32
 # The port both commands serve on unless --port names another, or for the
 # launcher SPLASH_PORT does.
 DEFAULT_PORT = 8000
-# Where --persistent-cache keeps its files unless --cache-dir says otherwise.
-DEFAULT_CACHE_DIR = Path.home() / "Library/Caches/Splash/prefix-cache"
 _SIZE_UNITS = {
     unit + suffix: 1024**power
     for power, unit in enumerate(("K", "M", "G"), 1)
@@ -121,6 +120,21 @@ def parse_max_memory(value):
 
 
 def parse_max_cache_disk(value):
+    """'auto' (None), 0 for no SSD cache, or a byte count with an optional K, M
+    or G suffix."""
+    if value.strip() == "0":
+        return 0
+    try:
+        return parse_max_memory(value)
+    except argparse.ArgumentTypeError:
+        raise argparse.ArgumentTypeError(
+            "use auto, 0 to disable, or a size such as 16G"
+        ) from None
+
+
+def parse_max_cache_disk_writes(value):
+    """0 for no write budget, or a byte count a day with an optional K, M or G
+    suffix."""
     if value.strip() == "0":
         return 0
     try:
@@ -128,7 +142,7 @@ def parse_max_cache_disk(value):
     except argparse.ArgumentTypeError:
         size = None
     if size is None:
-        raise argparse.ArgumentTypeError("use 0 to disable, or a size such as 5G")
+        raise argparse.ArgumentTypeError("use 0 for no limit, or a size such as 200G")
     return size
 
 
@@ -267,6 +281,16 @@ def parse_reasoning_effort(value):
     return value
 
 
+def parse_thinking_token_budget(value):
+    try:
+        tokens = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a nonnegative integer") from None
+    if tokens < 0:
+        raise argparse.ArgumentTypeError("must be a nonnegative integer")
+    return tokens
+
+
 # The help's option groups, in the order `splash serve --help` lists them:
 # each group's key and title. The launcher's own model options and --port
 # join "model" and "network".
@@ -393,6 +417,16 @@ SERVE_OPTIONS = (
         ),
     ),
     ServeOption(
+        "--state-format",
+        "memory",
+        dict(
+            choices=("fp32", "bf16"),
+            default="fp32",
+            help="recurrent state storage (default: fp32); bf16 halves each "
+            "state, so memory and the SSD cache hold about twice as many",
+        ),
+    ),
+    ServeOption(
         "--idle-release",
         "memory",
         dict(
@@ -401,7 +435,8 @@ SERVE_OPTIONS = (
             metavar="DURATION",
             help="time without a request before the engine unwires its memory and "
             "frees the weights: seconds, or with an s, m or h suffix, e.g. 30m "
-            "(default: 10m); off keeps both",
+            "(default: 10m); off keeps both, though POST /v1/memory/release "
+            "still frees the weights",
         ),
         text=idle_release_text,
     ),
@@ -410,10 +445,23 @@ SERVE_OPTIONS = (
         "cache",
         dict(
             type=parse_max_cache_disk,
+            default=None,
+            metavar="SIZE",
+            help="SSD quota for cached KV pages and states: auto follows the "
+            "volume's free space up to 32G, 0 disables, or a size such as 16G "
+            "(default: auto)",
+        ),
+    ),
+    ServeOption(
+        "--max-cache-disk-writes",
+        "cache",
+        dict(
+            type=parse_max_cache_disk_writes,
             default=0,
             metavar="SIZE",
-            help="SSD quota for cached KV pages and states, e.g. 5G (default: 0, "
-            "disabled)",
+            help="the most the SSD cache writes a day, e.g. 200G; the state a "
+            "conversation resumes from and KV pages pass it (default: 0, no "
+            "limit)",
         ),
     ),
     ServeOption(
@@ -422,7 +470,7 @@ SERVE_OPTIONS = (
         dict(
             action="store_true",
             default=False,
-            help="keep the SSD cache across restarts (needs --max-cache-disk)",
+            help="keep the SSD cache across restarts",
         ),
     ),
     ServeOption(
@@ -471,6 +519,30 @@ SERVE_OPTIONS = (
             "SPLASH_DEFAULT_REASONING_EFFORT, else the model template's)",
         ),
         environment="SPLASH_DEFAULT_REASONING_EFFORT",
+    ),
+    ServeOption(
+        "--thinking-token-budget",
+        "api",
+        dict(
+            type=parse_thinking_token_budget,
+            metavar="N",
+            help="thinking tokens of a thinking request that sets no "
+            "thinking_token_budget, after which its thinking closes (default: "
+            "SPLASH_THINKING_TOKEN_BUDGET, else no cap)",
+        ),
+        environment="SPLASH_THINKING_TOKEN_BUDGET",
+    ),
+    ServeOption(
+        "--thinking-end-text",
+        "api",
+        dict(
+            metavar="TEXT",
+            help="text that ends thinking where a thinking budget runs out, such "
+            "as a sentence that turns to the answer, then </think> as its last "
+            f"token; at most {MAX_THINKING_END_TOKENS} tokens (default: "
+            "SPLASH_THINKING_END_TEXT, else </think> alone)",
+        ),
+        environment="SPLASH_THINKING_END_TEXT",
     ),
     ServeOption(
         "--max-request-size",
@@ -575,8 +647,14 @@ def check_serve_arguments(parser, args):
     """The checks of the shared options that involve more than one."""
     if args.announce_served_name and not args.served_model_name:
         parser.error("--announce-served-name needs --served-model-name")
-    if args.persistent_cache and not args.max_cache_disk:
-        parser.error("--persistent-cache needs --max-cache-disk")
+    if args.persistent_cache and args.max_cache_disk == 0:
+        parser.error(
+            "--persistent-cache needs the SSD cache --max-cache-disk 0 turns off"
+        )
+    if args.max_cache_disk_writes and args.max_cache_disk == 0:
+        parser.error(
+            "--max-cache-disk-writes needs the SSD cache --max-cache-disk 0 turns off"
+        )
     if args.cache_dir is not None and not args.persistent_cache:
         parser.error("--cache-dir needs --persistent-cache")
 

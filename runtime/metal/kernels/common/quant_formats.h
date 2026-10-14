@@ -34,7 +34,10 @@ using namespace metal;
 //   QuantFloat8    values(Chunk) -> uint2, the E4M3 bytes of pairs 0, 1 (x)
 //                  and 2, 3 (y); value = s * quant_e4m3 of the byte, which
 //                  is 2^-8 times the E4M3 value (so s carries the 2^8)
-enum QuantKind : ushort { QuantLinear, QuantCodebook, QuantInt8, QuantGrid, QuantFloat8 };
+//   QuantFloat16   values(Chunk) -> uint4, pair p in component p with e0 at
+//                  bits 0..15 and e1 at 16..31, each of the format's 16-bit
+//                  Value type (bfloat or half); value = s * the Value
+enum QuantKind : ushort { QuantLinear, QuantCodebook, QuantInt8, QuantGrid, QuantFloat8, QuantFloat16 };
 
 // The E4M3 bytes at bits 0..7 and 16..23 of `pair` (sign, four exponent bits of bias 7, three mantissa bits) as
 // halves 2^-8 times their values, exactly: the byte's seven magnitude bits placed so that its exponent field is
@@ -427,6 +430,20 @@ struct FmtQ41 {
     return {float2(float(as_type<half>(ushort(mt & 0xFFFF)))), float2(float(as_type<half>(ushort(mt >> 16))))};
   }
 };
+// Q5_0 and Q5_1 (format F): Q5_K's planes, plane0 the low 4 bits and plane1 the fifth bits; meta and coefficients
+// those of Q4_0 and Q4_1 (Scales), whose zero point the fifth bit doubles. value = d * (q - 16), or d * q + m.
+template <uint F, class Scales> struct FmtQ5 {
+  QUANT_FORMAT(F, QuantLinear, 2 * Scales::Zero, 32, false);
+  typedef FmtQ5K::Payload Payload; typedef FmtQ5K::Chunk Chunk; typedef typename Scales::Meta Meta;
+  static Payload load(device uchar *p0, device uchar *p1) { return FmtQ5K::load(p0, p1); }
+  static Meta loadMeta(device uchar *m) { return Scales::loadMeta(m); }
+  static Chunk chunk(Payload w, ushort c) { return FmtQ5K::chunk(w, c); }
+  static Chunk loadChunk(device uchar *p0, device uchar *p1, ushort c) { return FmtQ5K::loadChunk(p0, p1, c); }
+  static uint4 codes(Chunk q) { return FmtQ5K::codes(q); }
+  static QuantCoef coef(Meta mt, ushort j) { return Scales::coef(mt, j); }
+};
+typedef FmtQ5<GGUF_FMT_Q50, FmtQ40> FmtQ50;
+typedef FmtQ5<GGUF_FMT_Q51, FmtQ41> FmtQ51;
 // MXFP4: plane0 codebook indices; meta the E8M0 exponent e per group. value = 2^(e - 128) * kFP4Values, whose
 // entries are twice the E2M1 values (llama.cpp's GGML_E8M0_TO_FP32_HALF, 2^-128 and 2^-127 subnormal).
 struct FmtMXFP4 {
@@ -469,6 +486,24 @@ struct FmtFP8 {
   static uint2 values(Chunk q) { return q; }
   static QuantCoef coef(Meta g, ushort) { return {float2(256.0f * g)}; }
 };
+// BF16, F16: plane0 the group's 16-bit values (16 bytes 16c..16c+15 = chunk c); meta the FP32 scale g of 256
+// elements (1 for a GGUF tensor). value = g * x.
+template <uint F, class V> struct FmtFloat16 {
+  QUANT_FORMAT(F, QuantFloat16, 0, 32, false);
+  typedef V Value;
+  struct Payload { uint4 a, b, c, d; }; typedef uint4 Chunk; typedef float Meta;
+  static Payload load(device uchar *p0, device uchar *) {
+    device const uint4 *w = (device const uint4 *)p0;
+    return {w[0], w[1], w[2], w[3]};
+  }
+  static Meta loadMeta(device uchar *m) { return *((device float *)m); }
+  static Chunk chunk(Payload w, ushort c) { return c < 2 ? (c ? w.b : w.a) : (c == 2 ? w.c : w.d); }
+  static Chunk loadChunk(device uchar *p0, device uchar *, ushort c) { return *((device uint4 *)(p0 + 16 * c)); }
+  static uint4 values(Chunk q) { return q; }
+  static QuantCoef coef(Meta g, ushort) { return {float2(g)}; }
+};
+typedef FmtFloat16<GGUF_FMT_BF16, bfloat> FmtBF16;
+typedef FmtFloat16<GGUF_FMT_F16, half> FmtF16;
 // PQ2_0 (Prism ML's GGUFs, ggml type 142): plane0 2-bit codes as Q2_K's; meta the half d of the 128-element native
 // block, four groups. value = d * (q - 1).
 struct FmtPQ20 {
@@ -521,33 +556,50 @@ QUANT_AFFINE_GROUPS(8)
 
 #undef QUANT_FORMAT
 
-// Every format as X(format type, kernel name token), the token being its kQuantFormats name.
-#define QUANT_FORMATS(X)                                                                                            \
+// Every format as X(format type, kernel name token), the token being its kQuantFormats name: the formats of the
+// Apple9 register tile (quant_register_format), then the others.
+#define QUANT_REGISTER_FORMATS(X)                                                                                   \
   X(FmtQ4K, q4k) X(FmtIQ4XS, iq4xs) X(FmtIQ4NL, iq4nl) X(FmtQ5K, q5k) X(FmtQ6K, q6k) X(FmtQ3K, q3k) X(FmtQ80, q80) \
   X(FmtIQ3S, iq3s) X(FmtQ2K, q2k) X(FmtIQ3XXS, iq3xxs) X(FmtIQ2XXS, iq2xxs) X(FmtIQ2XS, iq2xs) X(FmtIQ2S, iq2s)      \
   X(FmtIQ1S, iq1s) X(FmtIQ1M, iq1m) X(FmtQ40, q40) X(FmtQ41, q41) X(FmtMXFP4, mxfp4) X(FmtPQ20, pq20)            \
   X(FmtAF2G32, af2g32) X(FmtAF2G64, af2g64) X(FmtAF2G128, af2g128) X(FmtAF3G32, af3g32) X(FmtAF3G64, af3g64)      \
   X(FmtAF3G128, af3g128) X(FmtAF4G32, af4g32) X(FmtAF4G64, af4g64) X(FmtAF4G128, af4g128) X(FmtAF5G32, af5g32)    \
   X(FmtAF5G64, af5g64) X(FmtAF5G128, af5g128) X(FmtAF6G32, af6g32) X(FmtAF6G64, af6g64) X(FmtAF6G128, af6g128)    \
-  X(FmtAF8G32, af8g32) X(FmtAF8G64, af8g64) X(FmtAF8G128, af8g128) X(FmtNVFP4, nvfp4) X(FmtFP8, fp8)
+  X(FmtAF8G32, af8g32) X(FmtAF8G64, af8g64) X(FmtAF8G128, af8g128) X(FmtNVFP4, nvfp4) X(FmtFP8, fp8)            \
+  X(FmtQ50, q50) X(FmtQ51, q51) X(FmtBF16, bf16)
+#define QUANT_FORMATS(X) QUANT_REGISTER_FORMATS(X) X(FmtF16, f16)
 
 // Runs body(F()) with the format type of run-time format id `format` (GGUF_FMT_*), for kernels whose tiles pick
-// their tensor, and so its format, at run time. The branch is uniform in a threadgroup. The host passes known ids
-// only; any other decodes as the first format, so every id runs one body (with a path that runs none, the staged
-// fused kernel failed its test under shader validation).
+// their tensor, and so its format, at run time: any format (quant_format_switch), or one of the register tile's
+// (quant_register_format_switch). The branch is uniform in a threadgroup. The host passes known ids only; any other
+// decodes as the first format, so every id runs one body (with a path that runs none, the staged fused kernel failed
+// its test under shader validation).
+#define QUANT_FORMAT_CASE(F, f) case F::Id: body(F()); break;
 template <class Body>
 inline void quant_format_switch(uint format, Body body) {
-#define QUANT_FORMAT_CASE(F, f) case F::Id: body(F()); break;
   switch (format) {
   default:
     QUANT_FORMATS(QUANT_FORMAT_CASE)
   }
-#undef QUANT_FORMAT_CASE
 }
+template <class Body>
+inline void quant_register_format_switch(uint format, Body body) {
+  switch (format) {
+  default:
+    QUANT_REGISTER_FORMATS(QUANT_FORMAT_CASE)
+  }
+}
+#undef QUANT_FORMAT_CASE
 
-// QUANT_FORMATS lists every format, by its kQuantFormats name, and so does the switch above.
+// QUANT_FORMATS lists every format, by its kQuantFormats name, and so does the switch above; QUANT_REGISTER_FORMATS
+// lists exactly those of quant_register_format.
 #define QUANT_FORMAT_ONE(F, f) +1
+#define QUANT_REGISTER_ONE(F, f) +quant_register_format(F::Id)
 static_assert(0 QUANT_FORMATS(QUANT_FORMAT_ONE) == GGUF_FMT_COUNT, "QUANT_FORMATS lists every format");
+static_assert(0 QUANT_REGISTER_FORMATS(QUANT_REGISTER_ONE) == 0 QUANT_REGISTER_FORMATS(QUANT_FORMAT_ONE) &&
+                  0 QUANT_FORMATS(QUANT_REGISTER_ONE) == 0 QUANT_REGISTER_FORMATS(QUANT_FORMAT_ONE),
+              "QUANT_REGISTER_FORMATS lists the register tile's formats");
+#undef QUANT_REGISTER_ONE
 #undef QUANT_FORMAT_ONE
 template <uint N> constexpr bool quant_format_named(uint id, const constant char (&token)[N]) {
   for (uint i = 0; i < N; ++i)

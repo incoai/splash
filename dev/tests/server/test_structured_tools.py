@@ -544,6 +544,60 @@ class StructuredToolGrammarTest(unittest.TestCase):
                 with self.subTest(strict=strict, name=name):
                     self.assert_not_complete(call.format(name, "1"), **settings)
 
+    def test_a_tool_with_an_unreadable_schema_takes_free_arguments(self):
+        # Its schema, which says n is a string, is not read: a grammar holds
+        # its calls to the tags alone, beside a strict tool or a response
+        # format too, and its values convert untyped.
+        unreadable = {
+            "type": "function",
+            "function": {
+                "name": "note",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"n": {"type": "string", "required": True}},
+                },
+            },
+        }
+        call = (
+            "<tool_call>\n<function=note>\n<parameter=n>\n7\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        for tools, schema in (
+            ([unreadable], None),
+            ([unreadable, *strict_tools(TOOLS[1])], None),
+            ([unreadable], SCHEMA),
+        ):
+            with self.subTest(tools=len(tools), schema=schema is not None):
+                self.assert_complete(
+                    call, choice="required", schema=schema, tools=tools
+                )
+                _, calls, _ = project(call, policy("required", tools=tools))
+                self.assertEqual(
+                    json.loads(calls[0]["function"]["arguments"]), {"n": 7}
+                )
+
+    def test_function_names_read_back_as_the_grammar_writes_them(self):
+        # A name may hold any characters but the tags' delimiters and line
+        # breaks: the grammar writes it as declared, and reading returns it.
+        names = [
+            "mcp.search",
+            "web search",
+            "天气",
+            'say "hi" \\ bye',
+            "n" * tool_schema.MAX_NAME_LENGTH,
+        ]
+        tools = [{"type": "function", "function": {"name": name}} for name in names]
+        settings = {"choice": "required", "schema": None, "tools": tools}
+        call = "<tool_call>\n<function={}>\n</function>\n</tool_call>"
+        for name in names:
+            with self.subTest(name=name):
+                self.assert_complete(call.format(name), **settings)
+                _, calls, _ = project(
+                    call.format(name), policy("required", tools=tools)
+                )
+                self.assertEqual([call["function"]["name"] for call in calls], [name])
+        self.assert_not_complete(call.format("mcp_search"), **settings)
+
     def test_single_member_string_type_array_preserves_enum_grammar(self):
         scalar = {
             "type": "object",
@@ -702,16 +756,21 @@ class StructuredToolProjectionTest(unittest.TestCase):
             public_id="request", tool_policy=policy(), response_validator=validator
         )
 
-    def finalize(self, text, job, incomplete=False, size=None):
+    def finalize(self, text, job, incomplete=False, size=None, stop_sequence=None):
         """Project `text` as a request does, whole or in chunks of `size`
-        characters, and finalize it. Returns the content, the calls and the
-        text the stream sends, the finish's owed text included."""
+        characters, and finalize it as the token limit or `stop_sequence`
+        ended it. Returns the content, the calls and the text the stream
+        sends, the finish's owed text included."""
         projector = model_output.StreamingToolCallProjector(
             job.tool_policy, job.public_id, True
         )
         events = put(projector, text, size)
+        result = SimpleNamespace(
+            reason="length" if incomplete else "stop", stop_sequence=stop_sequence
+        )
+        cut_in_call = projector.in_call and (incomplete or stop_sequence is not None)
         content, calls, owed = api.FrontendHandler._finalize_content(
-            None, "", job, incomplete, projector
+            None, "", job, result, projector, cut_in_call
         )
         return content, calls, streamed_text(events + owed)
 
@@ -757,9 +816,13 @@ class StructuredToolProjectionTest(unittest.TestCase):
 
     def test_finalization_validates_an_answer_without_calls(self):
         # Generation enforces the tool choice; only the answer's schema is
-        # checked on the complete output.
+        # checked on the complete output, not on one a stop sequence cut.
         with self.assertRaisesRegex(api.APIError, "invalid structured output"):
             self.finalize('{"answer":41}', self.job())
+        self.assertEqual(
+            self.finalize('{"answer":', self.job(), stop_sequence="4")[:2],
+            ('{"answer":', []),
+        )
         for text, names in (
             (CALL + "\n" + OTHER_CALL, ["lookup", "finish"]),
             (CALL + ' {"answer":41}', ["lookup"]),

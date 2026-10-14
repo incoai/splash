@@ -53,25 +53,6 @@ class HttpTransportTests(HarnessTestCase):
             nonstandard.encode(), len(nonstandard.encode())
         )
         self.assertEqual(status, 400, payload)
-
-        history = [
-            {"role": "user", "content": "run"},
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {
-                        "type": "function",
-                        "function": {"name": "f", "arguments": '{"x":NaN}'},
-                    }
-                ],
-            },
-            {"role": "user", "content": "continue"},
-        ]
-        status, _, payload = harness.request(
-            "POST", "/v1/chat/completions", chat_body(messages=history)
-        )
-        self.assertEqual(status, 400, payload)
         self.assertEqual(runtime.requests, [])
 
     def test_http_media_type_encoding_and_transfer_are_strict(self):

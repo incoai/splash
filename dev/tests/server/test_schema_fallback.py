@@ -444,7 +444,8 @@ class SchemaFallbackTests(HarnessTestCase):
     def test_remote_references_in_draft3_schema_keywords_are_request_errors(self):
         # Draft 3 nests schemas under extends and in type and disallow lists.
         # A remote reference there was accepted, and every output then failed
-        # validation with an internal error after generation.
+        # validation with an internal error after generation. A strict tool's
+        # grammar needs its schema too.
         remote = {"$ref": "https://example.com/schema.json"}
         for keywords in (
             {"extends": remote},
@@ -458,7 +459,10 @@ class SchemaFallbackTests(HarnessTestCase):
                 **keywords,
             }
             tools = [
-                {"type": "function", "function": {"name": "t", "parameters": schema}}
+                {
+                    "type": "function",
+                    "function": {"name": "t", "parameters": schema, "strict": True},
+                }
             ]
             response_format = {"type": "json_schema", "json_schema": {"schema": schema}}
             for normalize in (
@@ -485,7 +489,7 @@ class SchemaFallbackTests(HarnessTestCase):
         # Draft 4 leaves $ref unchecked and draft 3 accepts any type name;
         # validating an output against either failed with an internal error.
         # A tool's calls are not validated, so only a reference that cannot
-        # be read refuses its schema.
+        # be read refuses its schema, a strict tool's, whose grammar needs it.
         for draft, value in (
             ("draft-04", {"$ref": None}),
             ("draft-04", {"$ref": 5}),
@@ -499,7 +503,10 @@ class SchemaFallbackTests(HarnessTestCase):
                 "properties": {"value": value},
             }
             tools = [
-                {"type": "function", "function": {"name": "t", "parameters": schema}}
+                {
+                    "type": "function",
+                    "function": {"name": "t", "parameters": schema, "strict": True},
+                }
             ]
             response_format = {"type": "json_schema", "json_schema": {"schema": schema}}
             normalizers = [
@@ -612,6 +619,7 @@ class SchemaFallbackTests(HarnessTestCase):
         remote = {"$ref": "https://example.com/city.json"}
         tool = rich_weather_tool()
         tool["function"]["parameters"]["$defs"]["city"] = remote
+        tool["function"]["strict"] = True
         response_format = {
             "type": "json_schema",
             "json_schema": {

@@ -84,31 +84,36 @@ class UpstreamTest(unittest.TestCase):
             (
                 {"num_hidden_layers": 48},
                 UNSUPPORTED.format(
-                    "text config num_hidden_layers: MLX 48, Qwen3.8-27B 64"
+                    "text config num_hidden_layers: safetensors 48, Qwen3.8-27B 64"
                 ),
             ),
             (
                 {"max_position_embeddings": 131072},
                 UNSUPPORTED.format(
-                    "text config max_position_embeddings: MLX 131072, "
+                    "text config max_position_embeddings: safetensors 131072, "
                     "Qwen3.8-27B 262144"
                 ),
             ),
             (
                 {"vocab_size": 151936},
                 UNSUPPORTED.format(
-                    "text config vocab_size: MLX 151936, Qwen3.8-27B 248320"
+                    "text config vocab_size: safetensors 151936, Qwen3.8-27B 248320"
                 ),
             ),
             (
                 {"head_dim": 128},
-                UNSUPPORTED.format("text config head_dim: MLX 128, Qwen3.8-27B 256"),
+                UNSUPPORTED.format(
+                    "text config head_dim: safetensors 128, Qwen3.8-27B 256"
+                ),
             ),
             (
                 {"model_type": "qwen3_moe"},
                 UNSUPPORTED.format("text model type qwen3_moe"),
             ),
-            ({"num_experts": 128}, "num_experts mismatch: MLX 128, runtime 256"),
+            (
+                {"num_experts": 128},
+                "num_experts mismatch: safetensors 128, runtime 256",
+            ),
         ):
             family = MOE if "num_experts" in changes else DENSE
             root = mlx_target(self.root / "changed", family, changes=changes)
@@ -209,12 +214,12 @@ class UpstreamTest(unittest.TestCase):
                 (
                     {"num_hidden_layers": 48},
                     UNSUPPORTED.format(
-                        "text config num_hidden_layers: MLX 48, Qwen3.8-27B 64"
+                        "text config num_hidden_layers: safetensors 48, Qwen3.8-27B 64"
                     ),
                 ),
                 (
                     {"rms_norm_eps": 1e-5},
-                    "text config rms_norm_eps mismatch: MLX 1e-05, runtime 1e-06",
+                    "text config rms_norm_eps mismatch: safetensors 1e-05, runtime 1e-06",
                 ),
                 (
                     {"tie_word_embeddings": True},
@@ -222,7 +227,7 @@ class UpstreamTest(unittest.TestCase):
                 ),
                 (
                     {"rope_parameters": rope | {"type": "yarn"}},
-                    "text config rope_parameters type mismatch: MLX yarn, "
+                    "text config rope_parameters type mismatch: safetensors yarn, "
                     "runtime default",
                 ),
             )
@@ -307,8 +312,8 @@ class UpstreamTest(unittest.TestCase):
         fake = fake_hub(self, self.cache)
         required = (
             r"this model requires an MLX checkpoint \(affine 2, 3, 4, 5, 6 or 8 bits "
-            r"in groups of 32, 64 or 128, mxfp4 or nvfp4\), an NVFP4 checkpoint of "
-            r"Model Optimizer or compressed-tensors, or a supported GGUF"
+            r"in groups of 32, 64 or 128, mxfp4 or nvfp4\), an NVFP4 or FP8 checkpoint "
+            r"of Model Optimizer or compressed-tensors, or a supported GGUF"
         )
         formats = (
             r"; MLX weights load as affine 2, 3, 4, 5, 6 or 8 bits in groups of 32, "
@@ -501,7 +506,7 @@ class UpstreamTest(unittest.TestCase):
                 "Qwen/Qwen3.8-27B",
                 transformers_release,
                 r"this model requires an MLX checkpoint \(affine 2, 3, 4, 5, 6 or 8 "
-                r"bits in groups of 32, 64 or 128, mxfp4 or nvfp4\), an NVFP4 "
+                r"bits in groups of 32, 64 or 128, mxfp4 or nvfp4\), an NVFP4 or FP8 "
                 r"checkpoint of Model Optimizer or compressed-tensors, or a supported "
                 r"GGUF",
             ),
@@ -509,7 +514,7 @@ class UpstreamTest(unittest.TestCase):
                 "mlx-community/Qwen3.5-4B-MLX-4bit",
                 other_size,
                 UNSUPPORTED.format(
-                    "text config hidden_size: MLX 2560, Qwen3.8-27B 5120"
+                    "text config hidden_size: safetensors 2560, Qwen3.8-27B 5120"
                 ),
             ),
         ):
@@ -994,7 +999,7 @@ class UpstreamTest(unittest.TestCase):
         self.assertIn(
             f"Warning: keeping the installed {MODEL}@{'a' * 12}; cannot install "
             f"{MODEL}@{'b' * 40}: no supported model has this architecture (text "
-            "config head_dim: MLX 128, Qwen3.8-27B 256); supported: Qwen3.8-27B, "
+            "config head_dim: safetensors 128, Qwen3.8-27B 256); supported: Qwen3.8-27B, "
             "Qwen3.6-35B-A3B",
             warnings,
         )

@@ -111,8 +111,9 @@ void run(const std::string &metallib) {
     std::optional<uint64_t> elasticHostAvailable = 2ULL * 1024 * 1024 * 1024;
     MemoryGovernor hostGated(
         backend, backend.capabilities().recommendedMaxWorkingSetBytes,
-        128ULL * 1024 * 1024,
-        [&elasticHostAvailable] { return elasticHostAvailable; }, 0);
+        128ULL * 1024 * 1024, 128ULL * 1024 * 1024, [&elasticHostAvailable] {
+          return std::optional<HostMemory>(HostMemory{*elasticHostAvailable, *elasticHostAvailable});
+        }, 0);
     kv::PageStorage hostGatedStorage(
         backend, hostGated.allocationAdmission(), kvLayout, 256, 128);
     require(hostGatedStorage.allocateExtent(0) &&
@@ -131,7 +132,7 @@ void run(const std::string &metallib) {
             "KV growth did not recover after host memory became available");
 
     MemoryGovernor governor(
-        backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, queryHostAvailableMemory, 0);
+        backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1, queryHostMemory, 0);
     rejects([&] { kv::PageStorage(backend, governor.allocationAdmission(), kvLayout, 192, 128); },
             "KV page pool is not a whole number of extents",
             "a pool of a part of an extent was accepted");
@@ -251,6 +252,23 @@ void run(const std::string &metallib) {
     require(holds(200, 10) && holds(255, 60) && holds(5, 10) && holds(6, 60) && holds(201, 160),
             "a copied page does not hold its source's tensors, or its neighbour changed");
 
+    // Clearing zeroes every tensor of every layer of a page and leaves its
+    // neighbours; a page without memory clears nothing.
+    const auto zeroed = [&](uint32_t page) {
+        for (const auto span : storage.spans(page))
+            if (!std::all_of(span.begin(), span.end(),
+                             [](std::byte byte) { return byte == std::byte{0}; }))
+                return false;
+        return true;
+    };
+    rejects([&] { storage.clearPages(std::array<uint32_t, 2>{200, 300}); },
+            "cannot clear a KV page of an extent that is not allocated",
+            "a page of an extent that is not allocated was cleared");
+    require(holds(200, 10), "a refused clear changed a page");
+    storage.clearPages(std::array<uint32_t, 1>{200});
+    require(zeroed(200) && holds(201, 160) && holds(255, 60),
+            "a cleared page kept content, or its neighbour changed");
+
     kv::PageStorage compactStorage(
         backend, governor.allocationAdmission(), compactLayout, 1024, 512);
     require(compactStorage.allocateExtent(0) && compactStorage.layers()[9].extent_pages == 512 &&
@@ -272,6 +290,20 @@ void run(const std::string &metallib) {
                     bf16.actualAllocatedBytes() == extent * layout.bytesPerModelPage(),
                 "BF16 allocated more than its first admitted extent");
         requireSpansTileExtent(bf16, 0);
+        // A BF16 page clears its keys and values, and leaves its neighbour.
+        for (const uint32_t page : {0u, 1u})
+            for (const auto span : bf16.spans(page))
+                std::fill(span.begin(), span.end(), std::byte{0x5a});
+        bf16.clearPages(std::array<uint32_t, 1>{0});
+        const auto all = [&](uint32_t page, std::byte value) {
+            for (const auto span : bf16.spans(page))
+                if (!std::all_of(span.begin(), span.end(),
+                                 [&](std::byte byte) { return byte == value; }))
+                    return false;
+            return true;
+        };
+        require(all(0, std::byte{0}) && all(1, std::byte{0x5a}),
+                "a cleared BF16 page kept content, or its neighbour changed");
         require(bf16.allocateExtent(1) &&
                     bf16.actualAllocatedBytes() == uint64_t{2 * extent} * bf16.bytesPerPage(),
                 "BF16 growth did not account for both extents");

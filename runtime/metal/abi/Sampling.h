@@ -124,6 +124,40 @@ struct SamplingPenaltyParams {
 static_assert(sizeof(SamplingPenaltyParams) == 112,
               "Sampling penalty parameters are 112 bytes on both sides");
 
+// One selection's thinking cutoffs (ops::SamplingPolicy::thinkingCutoff), its
+// rows laid out as in TargetSamplingParams. A lane whose row is below rows
+// selects its end token tokens[i] at row + i for each i below its count and
+// rows - row, unless a draft token before that row is close or also_ends,
+// which ended thinking first; a sampled lane's drafted row then gives its
+// draft token the target probability 1 when it is the row's end token, else
+// 0. The end of a lane in waiting_mask, a constrained one, waits for its
+// mask: its row is instead the first from there whose constraint mask row
+// (mask_row on, of mask_words words, as in TargetSamplingParams) admits
+// tokens[0]. The rows before it keep their own selections, as do all the rows
+// of a selection without one. A row whose selection is the sentinel of a row
+// with no selectable logit (a token outside the vocabulary) keeps it, so the
+// lane still fails. A lane whose row is 0 and whose end does not wait drafts
+// its end tokens before the verify (decode_draft_thinking_cutoff), so
+// acceptance keeps them all.
+struct ThinkingCutoffParams {
+  uint32_t vocabulary;
+  uint32_t rows;
+  uint32_t drafted_rows;
+  uint32_t sampling_mask;
+  uint32_t waiting_mask;
+  uint32_t mask_words;
+  uint32_t mask_row;
+  uint32_t row[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t count[SPLASH_MAXIMUM_BATCH_WIDTH];
+  // The token that closes thinking, the last of the lane's end.
+  uint32_t close[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t also_ends[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t tokens[SPLASH_MAXIMUM_BATCH_WIDTH][SPLASH_TARGET_VERIFY_ROWS];
+};
+
+static_assert(sizeof(ThinkingCutoffParams) == 220,
+              "Thinking cutoff parameters are 220 bytes on both sides");
+
 // The batched selector and acceptance kernels' grids cover exactly the
 // dispatch's lanes: per-lane arrays hold those lanes, and entries past them
 // are zero and unread.

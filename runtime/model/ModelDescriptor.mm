@@ -105,7 +105,7 @@ std::string requireText(id value, std::string_view label) {
 
 // A value that is not the runtime's is refused naming its source, what the
 // model was installed from or the assembly's own record, beside the runtime:
-// "mismatch: MLX 47, runtime 48".
+// "mismatch: safetensors 47, runtime 48".
 void requireEqual(std::string_view actual, std::string_view expected,
                   std::string_view source, std::string_view label) {
   if (actual != expected) {
@@ -224,9 +224,10 @@ ModelDescriptor qwen36Descriptor(std::string name, TargetSource targetSource,
                              targetSource, visionSource);
 }
 
-// The name errors give an upstream target's source.
+// The name errors give an upstream target's source: its format, safetensors
+// for MLX, Model Optimizer and compressed-tensors checkpoints alike.
 std::string_view sourceName(TargetSource source) {
-  return source == TargetSource::Safetensors ? "MLX" : "GGUF";
+  return source == TargetSource::Safetensors ? "safetensors" : "GGUF";
 }
 
 // The refusal of a model of none of the families Splash serves: what tells it
@@ -537,7 +538,7 @@ void requireQuantization(NSDictionary *config, const QwenTargetDimensions &geome
   }
   throw std::invalid_argument(
       "this model requires an MLX checkpoint (affine 2, 3, 4, 5, 6 or 8 bits in groups of 32, 64 or 128, mxfp4 or "
-      "nvfp4), an NVFP4 checkpoint of Model Optimizer or compressed-tensors, or a supported GGUF");
+      "nvfp4), an NVFP4 or FP8 checkpoint of Model Optimizer or compressed-tensors, or a supported GGUF");
 }
 
 // A DFlash2 checkpoint's config: the draft's layout; the block, window,

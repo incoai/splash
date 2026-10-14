@@ -79,13 +79,6 @@ public:
   void fail(uint64_t requestId);
   void remove(uint64_t requestId);
 
-  // A sparse-state materialization point can stop one sequence without
-  // padding or shortening any peer in the same ragged command. The boundary
-  // must lie past the request's progress; complete() consumes a boundary its
-  // command reached.
-  void setPrefillBoundary(uint64_t requestId,
-                          std::optional<uint32_t> absoluteTokens);
-
   [[nodiscard]] bool expireDeadlines(double nowMilliseconds);
   [[nodiscard]] std::vector<uint64_t> admissionOrder() const;
   // Preview the dispatch row budget before allocating new lanes.
@@ -120,7 +113,6 @@ private:
     RequestSpec spec;
     Phase phase = Phase::Queued;
     uint32_t promptProcessed = 0;
-    std::optional<uint32_t> prefillBoundary;
     // Set by suspendForResources: the request comes back through
     // resumeFromResources, never through resourcesReady.
     bool suspended = false;
@@ -148,9 +140,6 @@ private:
   nextDecode(std::span<const uint64_t> excluded) const;
   [[nodiscard]] std::optional<BatchPlan>
   planPrefill(std::vector<PrefillRequestView> ready) const;
-  // The rows the lane can take in one command: up to its prompt's end or its
-  // next state boundary.
-  [[nodiscard]] static uint32_t dispatchRemaining(const PrefillRequestView &view) noexcept;
   [[nodiscard]] uint32_t
   prefillBudget(const PrefillRequestView &leader,
                 std::span<const PrefillRequestView> ready) const;

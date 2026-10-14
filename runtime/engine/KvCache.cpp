@@ -15,20 +15,20 @@ uint64_t mix(uint64_t hash, uint64_t value) noexcept {
 }
 
 uint64_t indexHash(uint64_t parentHash, std::span<const uint32_t> tokens,
-                   ImageIdentity images) noexcept {
+                   BlockIdentity identity) noexcept {
   uint64_t hash = mix(0x6a09e667f3bcc909ULL, parentHash);
   for (uint32_t token : tokens)
     hash = mix(hash, token);
-  hash = mix(hash, images.lo);
-  hash = mix(hash, images.hi);
+  hash = mix(hash, identity.lo);
+  hash = mix(hash, identity.hi);
   return hash;
 }
 
 } // namespace
 
-ImageIdentity blockImageIdentity(uint64_t blockBegin, uint32_t blockTokens,
+BlockIdentity blockImageIdentity(uint64_t blockBegin, uint32_t blockTokens,
                                  std::span<const ImageSpan> spans) noexcept {
-  ImageIdentity identity;
+  BlockIdentity identity;
   const uint64_t blockEnd = blockBegin + blockTokens;
   for (const ImageSpan &span : spans) {
     if (span.offset >= blockEnd)
@@ -51,6 +51,21 @@ ImageIdentity blockImageIdentity(uint64_t blockBegin, uint32_t blockTokens,
   return identity;
 }
 
+BlockIdentity blockIdentity(uint64_t blockBegin, uint32_t blockTokens,
+                            std::span<const ImageSpan> spans, CacheSalt salt) noexcept {
+  BlockIdentity identity = blockImageIdentity(blockBegin, blockTokens, spans);
+  if (blockBegin || salt == CacheSalt{})
+    return identity;
+  // The image chains' seeds again, with the salt in both.
+  uint64_t lo = identity.lo ? identity.lo : 0x243f6a8885a308d3ULL;
+  uint64_t hi = identity.hi ? identity.hi : 0x13198a2e03707344ULL;
+  for (uint64_t value : {salt.lo, salt.hi}) {
+    lo = mix(lo, value);
+    hi = mix(hi, ~value);
+  }
+  return {lo, hi};
+}
+
 KvCache::~KvCache() noexcept {
   for (const auto &[_, entry] : blocks_) {
     if (entry.page == noPage)
@@ -65,18 +80,18 @@ KvCache::~KvCache() noexcept {
 
 std::optional<KvCache::BlockMatch>
 KvCache::find(uint64_t parentBlock, std::span<const uint32_t> tokens,
-              ImageIdentity images) const {
+              BlockIdentity identity) const {
   if (tokens.size() != pageTokens) {
     return std::nullopt;
   }
   if (parentBlock && !blocks_.contains(parentBlock))
     return std::nullopt;
-  const uint64_t hash = indexHash(parentBlock ? block(parentBlock).indexHash : 0, tokens, images);
+  const uint64_t hash = indexHash(parentBlock ? block(parentBlock).indexHash : 0, tokens, identity);
   const auto [first, last] = index_.equal_range(hash);
   for (auto candidate = first; candidate != last; ++candidate) {
     const Block &entry = block(candidate->second);
     // Hashes filter candidates; equality requires the complete key.
-    if (!entry.poisoned && entry.parent == parentBlock && entry.images == images &&
+    if (!entry.poisoned && entry.parent == parentBlock && entry.identity == identity &&
         std::equal(entry.tokens.begin(), entry.tokens.end(), tokens.begin())) {
       return BlockMatch{entry.id, entry.page};
     }
@@ -87,14 +102,14 @@ KvCache::find(uint64_t parentBlock, std::span<const uint32_t> tokens,
 KvCache::BlockMatch KvCache::insert(uint64_t parentBlock,
                                     std::span<const uint32_t> tokens,
                                     uint32_t physicalPage,
-                                    ImageIdentity images) {
+                                    BlockIdentity identity) {
   if (tokens.size() != pageTokens) {
     throw std::invalid_argument("KV cache block must contain one full page");
   }
   if (physicalPage >= pool_.pageCount()) {
     throw std::out_of_range("KV cache physical page is out of range");
   }
-  if (auto existing = find(parentBlock, tokens, images)) {
+  if (auto existing = find(parentBlock, tokens, identity)) {
     BlockMatch result{existing->id, existing->physicalPage};
     if (existing->physicalPage == noPage) {
       adoptPage(existing->id, physicalPage);
@@ -124,9 +139,9 @@ KvCache::BlockMatch KvCache::insert(uint64_t parentBlock,
   Block entry;
   entry.id = nextBlockId_;
   entry.parent = parentBlock;
-  entry.indexHash = indexHash(parentBlock ? block(parentBlock).indexHash : 0, tokens, images);
+  entry.indexHash = indexHash(parentBlock ? block(parentBlock).indexHash : 0, tokens, identity);
   std::copy(tokens.begin(), tokens.end(), entry.tokens.begin());
-  entry.images = images;
+  entry.identity = identity;
   entry.page = physicalPage;
   entry.depth = parentBlock ? block(parentBlock).depth + 1 : 1;
   entry.ramNode = RecencyOrder::allocate();
@@ -158,23 +173,23 @@ KvCache::BlockMatch KvCache::insert(uint64_t parentBlock,
 }
 
 bool KvCache::adoptDiskBlock(uint64_t blockId, uint64_t parentBlock,
-                             std::span<const uint32_t> tokens, ImageIdentity images,
+                             std::span<const uint32_t> tokens, BlockIdentity identity,
                              std::shared_ptr<KvDiskSlot> slot, uint64_t lastUsed) {
   if (!blockId || blockId == std::numeric_limits<uint64_t>::max() || blocks_.contains(blockId) ||
       tokens.size() != pageTokens || !slot)
     throw std::invalid_argument("invalid adopted KV cache block");
   if (parentBlock && !blocks_.contains(parentBlock))
     throw std::invalid_argument("adopted KV cache block's parent is unknown");
-  if (find(parentBlock, tokens, images))
+  if (find(parentBlock, tokens, identity))
     return false;
   if (parentBlock && block(parentBlock).children == std::numeric_limits<uint32_t>::max())
     throw std::overflow_error("KV cache child count overflowed");
   Block entry;
   entry.id = blockId;
   entry.parent = parentBlock;
-  entry.indexHash = indexHash(parentBlock ? block(parentBlock).indexHash : 0, tokens, images);
+  entry.indexHash = indexHash(parentBlock ? block(parentBlock).indexHash : 0, tokens, identity);
   std::copy(tokens.begin(), tokens.end(), entry.tokens.begin());
-  entry.images = images;
+  entry.identity = identity;
   entry.depth = parentBlock ? block(parentBlock).depth + 1 : 1;
   entry.lastUsed = lastUsed;
   entry.ramNode = RecencyOrder::allocate();
@@ -205,7 +220,7 @@ void KvCache::continueIdsAfter(uint64_t blockId) noexcept {
 
 KvCache::Key KvCache::key(uint64_t blockId) const {
   const Block &entry = block(blockId);
-  return {entry.parent, entry.tokens, entry.images};
+  return {entry.parent, entry.tokens, entry.identity};
 }
 
 uint64_t KvCache::lastUsed(uint64_t blockId) const { return block(blockId).lastUsed; }

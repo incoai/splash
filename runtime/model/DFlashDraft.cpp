@@ -123,7 +123,8 @@ void DFlashDraft::addSelection(
 
 void DFlashDraft::addContextPrefill(
     metal::CommandGraph &graph, DFlashPrefillBuffers buffers, uint32_t rows,
-    std::span<const DFlashPrefillSpan> spans) const {
+    std::span<const DFlashPrefillSpan> spans,
+    std::span<const DFlashWindowCapture> windowCaptures) const {
   if (!rows || rows > ExecutionLimits::prefillTokenBudget || spans.empty())
     throw std::invalid_argument("invalid draft context prefill");
   const DFlashDraftLayout &layout = weights_.layout;
@@ -136,10 +137,17 @@ void DFlashDraft::addContextPrefill(
   ops::Normalization::addRms(graph, buffers.projected, weights_.hiddenNorm, buffers.hidden, layout.hiddenSize,
                              rows);
   const uint64_t rowBytes = uint64_t{layout.hiddenSize} * sizeof(uint16_t);
+  const auto store = [&](uint32_t compactRow, uint32_t count, uint32_t startPosition,
+                         const metal::MetalBuffer &window) {
+    ops::DraftAttention::addWindowStore(graph,
+                                        backend_.view(buffers.hidden, compactRow * rowBytes, count * rowBytes),
+                                        window, count, startPosition, layout.hiddenSize);
+  };
   for (const DFlashPrefillSpan &span : spans)
-    ops::DraftAttention::addWindowStore(
-        graph, backend_.view(buffers.hidden, span.compactRow * rowBytes, span.rows * rowBytes),
-        span.window, span.rows, span.startPosition, layout.hiddenSize);
+    store(span.compactRow, span.rows, span.startPosition, span.window);
+  // Only the window: a cached state keeps no rings.
+  for (const DFlashWindowCapture &capture : windowCaptures)
+    store(capture.compactRow, capture.rows, capture.startPosition, capture.window);
   addContextKv(graph, buffers, rows, spans);
 }
 

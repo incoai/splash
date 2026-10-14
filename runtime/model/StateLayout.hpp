@@ -4,6 +4,7 @@
 #include "metal/abi/DraftAttention.h"
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/GDN.h"
+#include "ops/GDN.hpp"
 
 #include <cstdint>
 
@@ -13,8 +14,9 @@ namespace splash::model {
 // keeps the inputs of all taps but the current token's.
 inline constexpr uint32_t kGdnConvolutionTaps = SPLASH_GDN_CONVOLUTION_TAPS;
 
-// Physical state geometry is supplied by the paired target and draft models.
-// The engine sees only opaque CompositeState handles and byte accounting.
+// Physical state geometry is supplied by the paired target and draft models,
+// and the recurrent state's format by the runtime (--state-format). The
+// engine sees only opaque CompositeState handles and byte accounting.
 struct GdnStateLayout final {
   static constexpr uint32_t bfloat16Bytes = 2;
 
@@ -24,10 +26,12 @@ struct GdnStateLayout final {
   uint32_t recurrentGroups = 0;
   uint32_t recurrentRows = 0;
   uint32_t recurrentColumns = 0;
+  ops::GdnStateFormat format = ops::GdnStateFormat::Float32;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
     return layers && convolutionHistory && convolutionChannels &&
-           recurrentGroups && recurrentRows && recurrentColumns;
+           recurrentGroups && recurrentRows && recurrentColumns &&
+           ops::validFormat(format);
   }
   [[nodiscard]] constexpr uint64_t convolutionLayerBytes() const noexcept {
     return alignUp(uint64_t{convolutionHistory} * convolutionChannels *
@@ -38,13 +42,19 @@ struct GdnStateLayout final {
   }
   [[nodiscard]] constexpr uint64_t recurrentLayerBytes() const noexcept {
     return alignUp(uint64_t{recurrentGroups} * recurrentRows *
-                   recurrentColumns * sizeof(float));
+                   recurrentColumns * ops::elementBytes(format));
   }
   [[nodiscard]] constexpr uint64_t recurrentBytes() const noexcept {
     return uint64_t{layers} * recurrentLayerBytes();
   }
   [[nodiscard]] constexpr uint64_t cellBytes() const noexcept {
     return convolutionBytes() + recurrentBytes();
+  }
+  // A cell holds every layer's convolution state, then every layer's
+  // recurrent state.
+  [[nodiscard]] constexpr ops::GdnStateStrides strides() const noexcept {
+    return {convolutionLayerBytes(), recurrentLayerBytes(), convolutionBytes(),
+            format};
   }
 
   bool operator==(const GdnStateLayout &) const = default;

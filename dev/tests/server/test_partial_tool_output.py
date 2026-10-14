@@ -1,7 +1,6 @@
 import json
 import random
 import re
-import tracemalloc
 import unittest
 from unittest import mock
 
@@ -21,7 +20,6 @@ from dev.tests.tool_output import project, streamed_arguments, streamed_text
 from server import api_shapes
 from server import backend as backend_api
 from server import output as model_output
-from server import server as api
 from server.tool_schema import (
     MAX_NAME_LENGTH,
     PARAMETER_CLOSE,
@@ -244,57 +242,6 @@ class SeededRandomChunkStreamer(PassthroughStreamer):
 
 
 class PartialToolOutputTests(unittest.TestCase):
-    def test_prefix_scanner_handles_nested_containers_and_scalar_boundaries(self):
-        values = [
-            [],
-            {},
-            [[], {}, [True, None]],
-            {"a": [{"b": [1, 2]}]},
-            -1.25e-19,
-            'a\\"\n北京😀',
-            True,
-            None,
-        ]
-        for value in values:
-            text = json.dumps(value)
-            for end in range(len(text) + 1):
-                prefix = text[:end]
-                try:
-                    json.loads(prefix)
-                    incomplete = False
-                except ValueError:
-                    incomplete = True
-                with self.subTest(prefix=prefix):
-                    self.assertEqual(api_shapes._unfinished_json(prefix), incomplete)
-        for invalid in (
-            "[1,]",
-            '{"a":1,}',
-            "{1:",
-            "[1 2",
-            "1.2.",
-            "1e2e",
-            "1e2.",
-            "01",
-            "true false",
-            '"\\u0z',
-            '"\x01',
-            '{"a" 1',
-        ):
-            with self.subTest(invalid=invalid):
-                self.assertFalse(api_shapes._unfinished_json(invalid))
-
-    def test_flat_partial_arguments_do_not_allocate_per_element(self):
-        # Input construction is outside the measurement. The prefix scanner
-        # should retain nesting state, not an array of parsed values/matches.
-        arguments = '{"values":[' + ",".join("1" for _ in range(20000)) + ","
-        tracemalloc.start()
-        try:
-            self.assertTrue(api_shapes._unfinished_json(arguments))
-            _, peak = tracemalloc.get_traced_memory()
-        finally:
-            tracemalloc.stop()
-        self.assertLess(peak, 64 * 1024)
-
     def harness(self, *plans):
         value = Harness(FakeRuntime(*plans))
         self.addCleanup(value.close)
@@ -540,15 +487,6 @@ class PartialToolOutputTests(unittest.TestCase):
                         )
                         actual = normalized[0]["tool_calls"][0]["function"]
                         self.assertEqual(actual["arguments"], arguments)
-        for invalid in (
-            '{"a":01',
-            '{"a":"\\q',
-            '{"a":true garbage',
-            '{"a":,',
-            '{"a":1,}',
-        ):
-            with self.subTest(invalid=invalid):
-                self.assertFalse(api_shapes._unfinished_json(invalid))
 
     def test_chat_preserves_same_partial_arguments_in_both_modes(self):
         harness = self.harness(
@@ -1006,100 +944,76 @@ class PartialToolOutputTests(unittest.TestCase):
         for wire in (chat_stream_payload, responses_stream_payload):
             self.assertNotIn(b"<tool_call>", wire)
 
-    def test_unfinished_tool_call_arguments_stay_history_text(self):
-        # A tool call cut short by the client's output limit comes back as
-        # history. The model must see the text it produced; rejecting the
-        # request would leave the agent unable to continue at all.
-        truncated = '{"command": "cat <<EOF > archive/batch4.jsonl\\n{\\"id\\": 1'
-        messages = api_shapes.normalize_messages(
-            [
-                {"role": "user", "content": "save it"},
-                {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [
-                        {
-                            "id": "call_1",
-                            "type": "function",
-                            "function": {"name": "shell", "arguments": truncated},
-                        }
-                    ],
-                },
-                {"role": "tool", "tool_call_id": "call_1", "content": "interrupted"},
-                {"role": "user", "content": "continue"},
-            ],
-            vision=True,
-            deadline=FOREVER,
-        )
-        call = messages[1]["tool_calls"][0]["function"]
-        self.assertEqual(call["name"], "shell")
-        self.assertEqual(call["arguments"], truncated)
-        # Some providers send a call without arguments as "".
-        for arguments, expected in (('{"a": 1}', {"a": 1}), ("", {}), (" \n", {})):
-            with self.subTest(arguments=arguments):
-                complete = api_shapes.normalize_messages(
-                    [
-                        {"role": "user", "content": "x"},
-                        {
-                            "role": "assistant",
-                            "content": None,
-                            "tool_calls": [
-                                {
-                                    "type": "function",
-                                    "function": {
-                                        "name": "shell",
-                                        "arguments": arguments,
-                                    },
-                                }
-                            ],
-                        },
-                    ],
-                    vision=True,
-                    deadline=FOREVER,
-                )
-                self.assertEqual(
-                    complete[1]["tool_calls"][0]["function"]["arguments"], expected
-                )
-        for malformed in ('{"x": 1,}', '{"x": NaN}', "not json", '"abc"', "[1]", "5"):
-            with self.subTest(arguments=malformed), self.assertRaises(api.APIError):
-                api_shapes.normalize_messages(
-                    [
-                        {"role": "user", "content": "x"},
-                        {
-                            "role": "assistant",
-                            "content": None,
-                            "tool_calls": [
-                                {
-                                    "type": "function",
-                                    "function": {
-                                        "name": "shell",
-                                        "arguments": malformed,
-                                    },
-                                }
-                            ],
-                        },
-                    ],
-                    vision=True,
-                    deadline=FOREVER,
-                )
-        with self.assertRaises(api.APIError):
-            api_shapes.normalize_messages(
+    def test_arguments_that_are_not_an_object_stay_history_text(self):
+        # A tool call the client's output limit cut, or that the model wrote
+        # wrong, comes back as history. The model must see the text it
+        # produced; refusing the request would leave the agent unable to
+        # continue at all.
+        def history_arguments(arguments):
+            messages = api_shapes.normalize_messages(
                 [
-                    {"role": "user", "content": "x"},
+                    {"role": "user", "content": "save it"},
                     {
                         "role": "assistant",
                         "content": None,
                         "tool_calls": [
                             {
+                                "id": "call_1",
                                 "type": "function",
-                                "function": {"name": "shell", "arguments": ["list"]},
+                                "function": {"name": "shell", "arguments": arguments},
                             }
                         ],
                     },
+                    {"role": "tool", "tool_call_id": "call_1", "content": "failed"},
+                    {"role": "user", "content": "continue"},
                 ],
                 vision=True,
                 deadline=FOREVER,
             )
+            return messages[1]["tool_calls"][0]["function"]["arguments"]
+
+        truncated = '{"command": "cat <<EOF > archive/batch4.jsonl\\n{\\"id\\": 1'
+        for arguments, expected in (
+            (truncated, truncated),
+            ('{"x": 1,}', '{"x": 1,}'),
+            ('{"x": NaN}', '{"x": NaN}'),
+            ("not json", "not json"),
+            ('"abc"', '"abc"'),
+            ("[1]", "[1]"),
+            ("5", "5"),
+            (["list"], '["list"]'),
+            # Some providers send a call without arguments as "".
+            ('{"a": 1}', {"a": 1}),
+            ({"a": 1}, {"a": 1}),
+            ("", {}),
+            (" \n", {}),
+            (None, {}),
+        ):
+            with self.subTest(arguments=arguments):
+                self.assertEqual(history_arguments(arguments), expected)
+        rendered = api_shapes.template_messages(
+            [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "type": "function",
+                            "function": {"name": "shell", "arguments": "[1]"},
+                        }
+                    ],
+                }
+            ]
+        )
+        self.assertEqual(
+            rendered,
+            [
+                {
+                    "role": "assistant",
+                    "content": 'Incomplete tool call:\n{"name": "shell", "arguments": "[1]"}',
+                }
+            ],
+        )
 
 
 class TextAfterToolCallTests(unittest.TestCase):

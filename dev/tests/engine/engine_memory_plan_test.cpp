@@ -102,6 +102,20 @@ void testBf16BudgetAndStatus() {
           "BF16 startup admitted less than its minimum footprint");
 }
 
+// The memory status names the recurrent state's format, and a profile without
+// one is refused.
+void testStateFormatStatus() {
+  auto profile = model();
+  profile.stateFormat = ops::GdnStateFormat::BFloat16;
+  require(test::requireMemoryPlan(device(), profile).toStatusJson().find("\"state_format\":\"bf16\"") !=
+                  std::string::npos &&
+              test::requireMemoryPlan(device(), model()).toStatusJson().find("\"state_format\":\"fp32\"") !=
+                  std::string::npos,
+          "the memory status did not name the state format");
+  profile.stateFormat = {};
+  require(!evaluateEngineMemoryPlan(device(), profile, 0).plan, "a profile without a state format was planned");
+}
+
 // The minimum holds the KV runway, the whole smallest extents that hold the
 // pages startup warmup runs on: two of the 27B's 32-page BF16 extents.
 void testMinimumHoldsTheWarmupRunway() {
@@ -267,23 +281,6 @@ void testHardBudgetBoundaries() {
           "maximum working set overflowed the preflight ceiling");
 }
 
-// What memory holds below the plan's budget, where the host has less: the
-// plan made there, within the configured limit, and nothing where one request
-// does not fit.
-void testContextTokensWithin() {
-  const EngineMemoryPlan plan = test::requireMemoryPlan(device(), model());
-  const auto &budget = plan.breakdown();
-  const uint64_t ceiling = budget.minimumRequiredBytes + 64 * kMiB;
-  const EngineMemoryPlan limited = test::requireMemoryPlan(device(), model(), ceiling);
-  require(plan.contextTokensWithin(16 * kGiB) == plan.maximumContextTokens() &&
-              plan.contextTokensWithin(ceiling) == limited.maximumContextTokens() &&
-              limited.maximumContextTokens() < plan.maximumContextTokens() &&
-              limited.contextTokensWithin(16 * kGiB) == limited.maximumContextTokens() &&
-              !plan.contextTokensWithin(budget.minimumRequiredBytes - 1) &&
-              !plan.contextTokensWithin(0),
-          "the context memory holds is not the plan's within the host's memory");
-}
-
 void testModelProvidedKvGeometry() {
   ModelMemoryProfile compact = model();
   compact.name = "compact-test-model";
@@ -393,6 +390,7 @@ int main() {
   try {
     testUnifiedElasticBudget();
     testBf16BudgetAndStatus();
+    testStateFormatStatus();
     testMinimumHoldsTheWarmupRunway();
     testMinimumRequiredBytesIsThePlans();
     testUserCeilingAndFailure();
@@ -400,7 +398,6 @@ int main() {
     testNeuralEngineSplitIsBudgeted();
     testReservesAreTheModelConstants();
     testHardBudgetBoundaries();
-    testContextTokensWithin();
     testModelProvidedKvGeometry();
     testExtentSizeFollowsThePool();
     testDeviceValidationNamesTheMacosFloor();

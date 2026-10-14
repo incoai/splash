@@ -8,7 +8,7 @@ from dataclasses import replace
 from server import protocol as wire
 
 _HEADER = struct.Struct("<4sHHQ")
-_REQUEST = struct.Struct("<QBBQQIIIffIffffQIII")
+_REQUEST = struct.Struct("<QBBQQIIIffIffffQIIIQQIII")
 _IMAGE_SPAN = struct.Struct("<IIIIQQ")
 _MASK_RESPONSE = struct.Struct("<QQI")
 _ID = struct.Struct("<Q")
@@ -32,6 +32,7 @@ def request_frame(**overrides) -> wire.RequestFrame:
         score_tokens=(),
         generation_prompt_tokens=0,
         flags=wire.RequestFlag(0),
+        cache_salt=0,
     )
     return replace(request, **overrides)
 
@@ -92,7 +93,7 @@ def _event_payload(event: wire.EngineEvent) -> tuple[wire.FrameType, bytes]:
             )
         case wire.DoneEvent():
             return wire.FrameType.DONE, struct.pack(
-                f"<QBIIQQQI{len(event.option_logits)}f",
+                f"<QBIIQQQIIIII{len(event.option_logits)}f",
                 event.request_id,
                 event.reason,
                 event.prompt_tokens,
@@ -100,6 +101,10 @@ def _event_payload(event: wire.EngineEvent) -> tuple[wire.FrameType, bytes]:
                 event.prefill_micros,
                 event.decode_micros,
                 event.wall_micros,
+                event.deduplicated_tokens,
+                event.drafted_tokens,
+                event.accepted_draft_tokens,
+                event.draft_cycles,
                 len(event.option_logits),
                 *event.option_logits,
             )
@@ -149,6 +154,11 @@ def _decode_request(payload: bytes) -> wire.RequestFrame:
         score_count,
         generation_prompt_tokens,
         flags,
+        salt_lo,
+        salt_hi,
+        thinking_tokens,
+        thinking_end_count,
+        thinking_also_ends,
     ) = _REQUEST.unpack_from(payload)
     offset = _REQUEST.size
     prompt = _words(payload, offset, prompt_count)
@@ -162,7 +172,9 @@ def _decode_request(payload: bytes) -> wire.RequestFrame:
     offset += _IMAGE_SPAN.size * span_count
     pixel_bytes = sum(span.pixel_bytes for span in spans)
     pixels = bytes(payload[offset : offset + pixel_bytes])
-    scores = _words(payload, offset + pixel_bytes, score_count)
+    offset += pixel_bytes
+    scores = _words(payload, offset, score_count)
+    thinking_end = _words(payload, offset + 4 * score_count, thinking_end_count)
     return wire.RequestFrame(
         request_id,
         wire.RequestPriority(priority),
@@ -178,6 +190,10 @@ def _decode_request(payload: bytes) -> wire.RequestFrame:
         scores,
         generation_prompt_tokens,
         wire.RequestFlag(flags),
+        salt_lo | salt_hi << 64,
+        None
+        if thinking_tokens == 0xFFFFFFFF
+        else wire.ThinkingBudget(thinking_tokens, thinking_end, thinking_also_ends),
     )
 
 

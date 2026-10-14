@@ -15,7 +15,7 @@ from dataclasses import dataclass, fields
 from enum import IntEnum, IntFlag
 from typing import TypeAlias
 
-PROTOCOL_VERSION = 9
+PROTOCOL_VERSION = 10
 # A frame is its header, the magic, the protocol version, the frame type and
 # the payload length, then the payload.
 FRAME_HEADER_BYTES = 16
@@ -25,6 +25,8 @@ STATUS_SCHEMA_VERSION = 6
 # final-position logit per requested token, in request order.
 MIN_SCORE_TOKENS = 2
 MAX_SCORE_TOKENS = 255
+# A thinking budget's end holds 1 to this many tokens.
+MAX_THINKING_END_TOKENS = 64
 # Patches per image, the most the vision encoder takes; the server's pixel
 # cap may allow fewer.
 MAX_IMAGE_PATCHES = 16384
@@ -44,7 +46,7 @@ _MAGIC = b"SPLH"
 _HEADER = struct.Struct("<4sHHQ")
 # Replay can update the integer deadlines without decoding sampling floats.
 _REQUEST_HEAD = struct.Struct("<QBBQQ")
-_REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIffIffffQIII")
+_REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIffIffffQIIIQQIII")
 _IMAGE_SPAN = struct.Struct("<IIIIQQ")
 _CANCEL = struct.Struct("<Q")
 _MASK_RESPONSE = struct.Struct("<QQI")
@@ -55,7 +57,7 @@ _START = struct.Struct("<QII")
 _PROMPT_PROGRESS = struct.Struct("<QIQ")
 _TOKENS = struct.Struct("<QII")
 _MASK_REQUEST = struct.Struct("<QQII")
-_DONE = struct.Struct("<QBIIQQQI")
+_DONE = struct.Struct("<QBIIQQQIIIII")
 _ERROR = struct.Struct("<BBQII")
 _STATUS_JSON = struct.Struct("<Q")
 
@@ -65,11 +67,11 @@ assert (
     and sys.byteorder == "little"
 )
 assert _HEADER.size == FRAME_HEADER_BYTES
-assert _REQUEST.size == 86
+assert _REQUEST.size == 114
 assert _IMAGE_SPAN.size == 32
 assert _READY.size == 9
 assert _START.size == 16
-assert _DONE.size == 45
+assert _DONE.size == 61
 assert _ERROR.size == 18
 assert _STATUS_JSON.size == 8
 
@@ -239,6 +241,23 @@ class ImageSpan:
 
 
 @dataclass(slots=True, frozen=True)
+class ThinkingBudget:
+    """A request that generates inside a thinking block may select at most
+    `tokens` thinking tokens; the engine then selects the `end` tokens in
+    order, the last of which closes the block. Thinking also ends where the
+    request selects that close or `also_ends` first, such as a tool call's
+    opening that follows thinking directly; no other end token is either."""
+
+    tokens: int
+    end: tuple[int, ...]
+    also_ends: int
+
+
+# The request frame's thinking budget tokens without one.
+_NO_THINKING_BUDGET = 0xFFFFFFFF
+
+
+@dataclass(slots=True, frozen=True)
 class RequestFrame:
     request_id: int
     priority: RequestPriority
@@ -254,12 +273,19 @@ class RequestFrame:
     image_spans: tuple[ImageSpan, ...]
     image_pixels: bytes
     # Option token ids for score-only requests; empty means ordinary
-    # generation. Score tokens serialize after the image pixel bytes.
+    # generation. Score tokens serialize after the image pixel bytes, and a
+    # thinking budget's end tokens after them.
     score_tokens: tuple[int, ...]
     # Trailing prompt tokens of the chat template's generation prompt; zero
     # when unknown. It must leave at least one prompt token.
     generation_prompt_tokens: int
     flags: RequestFlag
+    # The request's cache_salt hashed to 128 bits (Frontend._cache_salt);
+    # zero without one.
+    cache_salt: int
+    # Only a request that generates inside a thinking block has one; a score
+    # request never does.
+    thinking_budget: ThinkingBudget | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -282,8 +308,9 @@ class StatusRequestFrame:
 
 @dataclass(slots=True, frozen=True)
 class ReleaseRequestFrame:
-    """Give the weights back now when the engine holds no request; answered
-    by a status JSON with the same correlation id."""
+    """Give the weights back now, as the idle release does, when the engine
+    holds no request and restores none, with the idle release on or off;
+    answered by a status JSON with the same correlation id."""
 
     correlation_id: int
 
@@ -354,6 +381,12 @@ class DoneEvent:
     # Raw final-position logits for a score-only request, in requested token
     # order; empty for generation and for cancelled or failed scoring.
     option_logits: tuple[float, ...]
+    # Tokens whose KV the request read from cached blocks another request
+    # computed, past its cached prefix.
+    deduplicated_tokens: int = 0
+    drafted_tokens: int = 0
+    accepted_draft_tokens: int = 0
+    draft_cycles: int = 0
 
 
 @dataclass(slots=True, frozen=True)
@@ -604,10 +637,10 @@ def _image_spans_check(request: RequestFrame, prompt_tokens: int) -> None:
 
 def _validated_request(
     request: RequestFrame,
-) -> tuple[array.array, array.array, tuple]:
-    """The request's prompt and score words as uint32 arrays and its float32
-    sampling block, each checked once; raises a ProtocolError with the first
-    rule the request breaks."""
+) -> tuple[array.array, array.array, tuple, array.array]:
+    """The request's prompt and score words as uint32 arrays, its float32
+    sampling block and its thinking end words, each checked once; raises a
+    ProtocolError with the first rule the request breaks."""
     try:
         request_id = _u64(request.request_id, "request id")
         if not request_id:
@@ -698,6 +731,24 @@ def _validated_request(
             raise ValueError("score requests require default greedy sampling")
     except (AttributeError, ValueError) as error:
         _fail_request(IssueCode.INVALID_SAMPLING, str(error), request_id)
+    thinking = request.thinking_budget
+    end = array.array("I")
+    if thinking is not None:
+        try:
+            if scores:
+                raise ValueError("score requests take no thinking budget")
+            _integer(thinking.tokens, 0, _NO_THINKING_BUDGET - 1, "thinking budget")
+            end = _words(thinking.end, "thinking end tokens")
+            also_ends = _u32(thinking.also_ends, "thinking end token")
+            if not 1 <= len(end) <= MAX_THINKING_END_TOKENS:
+                raise ValueError(
+                    f"thinking end token count must be in [1, {MAX_THINKING_END_TOKENS}]"
+                )
+            # Thinking ends where its end does, and nowhere inside it.
+            if end[-1] in end[:-1] or also_ends in end[:-1]:
+                raise ValueError("only the last thinking end token may end thinking")
+        except (AttributeError, ValueError) as error:
+            _fail_request(IssueCode.INVALID_COUNT, str(error), request_id)
     if scores and constraint is not ConstraintMode.NONE:
         _fail_request(
             IssueCode.INVALID_CONSTRAINT,
@@ -715,9 +766,10 @@ def _validated_request(
         )
     try:
         _u64(request.seed, "seed")
+        _integer(request.cache_salt, 0, (1 << 128) - 1, "cache salt")
     except ValueError as error:
         _fail_request(IssueCode.INTEGER_OVERFLOW, str(error), request_id)
-    return prompt, scores, sampling
+    return prompt, scores, sampling, end
 
 
 def _mask_payload(values):
@@ -740,12 +792,13 @@ def _frame(frame_type: FrameType, payload_bytes: int) -> bytearray:
 def _request_frame(request: RequestFrame) -> bytearray:
     """The whole request frame, header included, in one buffer that each part
     is copied into once: image pixels run to hundreds of MiB."""
-    prompt, scores, sampling = _validated_request(request)
+    prompt, scores, sampling, end = _validated_request(request)
     prompt_offset = FRAME_HEADER_BYTES + _REQUEST.size
     spans_offset = prompt_offset + 4 * len(prompt)
     pixels_offset = spans_offset + _IMAGE_SPAN.size * len(request.image_spans)
     scores_offset = pixels_offset + len(request.image_pixels)
-    payload_bytes = scores_offset + 4 * len(scores) - FRAME_HEADER_BYTES
+    end_offset = scores_offset + 4 * len(scores)
+    payload_bytes = end_offset + 4 * len(end) - FRAME_HEADER_BYTES
     if issue := _payload_length_issue(FrameType.REQUEST, payload_bytes):
         _fail_request(issue.code, issue.message, request.request_id)
     frame = _frame(FrameType.REQUEST, payload_bytes)
@@ -765,6 +818,17 @@ def _request_frame(request: RequestFrame) -> bytearray:
         len(request.score_tokens),
         request.generation_prompt_tokens,
         request.flags,
+        request.cache_salt & 0xFFFFFFFFFFFFFFFF,
+        request.cache_salt >> 64,
+        *(
+            (_NO_THINKING_BUDGET, 0, 0)
+            if request.thinking_budget is None
+            else (
+                request.thinking_budget.tokens,
+                len(end),
+                request.thinking_budget.also_ends,
+            )
+        ),
     )
     for index, span in enumerate(request.image_spans):
         _IMAGE_SPAN.pack_into(
@@ -781,7 +845,8 @@ def _request_frame(request: RequestFrame) -> bytearray:
     with memoryview(frame) as view:
         view[prompt_offset:spans_offset] = memoryview(prompt).cast("B")
         view[pixels_offset:scores_offset] = request.image_pixels
-        view[scores_offset:] = memoryview(scores).cast("B")
+        view[scores_offset:end_offset] = memoryview(scores).cast("B")
+        view[end_offset:] = memoryview(end).cast("B")
     return frame
 
 
@@ -1010,7 +1075,16 @@ def _decode_event(frame: Frame) -> EngineEvent:
             )
         return MaskRequestEvent(request_id, mask_request_id, words_per_mask, tokens)
     if frame_type is FrameType.DONE:
-        request_id, reason, *counts, logit_count = _DONE.unpack_from(payload)
+        (
+            request_id,
+            reason,
+            *counts,
+            deduplicated,
+            drafted,
+            accepted,
+            cycles,
+            logit_count,
+        ) = _DONE.unpack_from(payload)
         logits = _tail(
             payload, _DONE.size, logit_count, "f", "option logit", request_id
         )
@@ -1026,13 +1100,23 @@ def _decode_event(frame: Frame) -> EngineEvent:
             _fatal(
                 IssueCode.INVALID_REQUEST_ID, "done event request id must be non-zero"
             )
-        event = DoneEvent(request_id, reason, *counts, logits)
+        event = DoneEvent(
+            request_id, reason, *counts, logits, deduplicated, drafted, accepted, cycles
+        )
+        # Each cycle verified at least one drafted token and accepted at most all.
+        if accepted > drafted or cycles > drafted or (drafted and not cycles):
+            _fatal(
+                IssueCode.INVALID_COUNT,
+                "done speculative counts are inconsistent",
+                request_id,
+            )
         if logits and (
             len(logits) < MIN_SCORE_TOKENS
             or not all(map(math.isfinite, logits))
             or reason is not FinishReason.STOP
             or event.completion_tokens
             or event.decode_micros
+            or drafted
         ):
             _fatal(
                 IssueCode.INVALID_COUNT,

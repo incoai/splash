@@ -23,8 +23,8 @@ struct KvBlockLabel final {
   uint64_t id = 0;
   uint64_t parent = 0;
   uint64_t lastUsed = 0;
-  uint64_t imagesLo = 0;
-  uint64_t imagesHi = 0;
+  uint64_t identityLo = 0;
+  uint64_t identityHi = 0;
   std::array<uint32_t, KvCache::pageTokens> tokens{};
 };
 

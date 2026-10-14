@@ -3,8 +3,11 @@
 #include "model/SlotFile.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <cmath>
 #include <future>
 #include <csignal>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
@@ -22,6 +25,21 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+
+// While set, a write of this test's files fails with this error, as a full
+// volume fails it: the slot file's pwrite is this one in the test binary,
+// which otherwise passes the call on.
+static std::atomic<int> failingWrites{0};
+
+extern "C" ssize_t pwrite(int descriptor, const void *data, size_t bytes, off_t offset) {
+  if (const int error = failingWrites.load()) {
+    errno = error;
+    return -1;
+  }
+  using Write = ssize_t (*)(int, const void *, size_t, off_t);
+  static const auto next = reinterpret_cast<Write>(::dlsym(RTLD_NEXT, "pwrite"));
+  return next(descriptor, data, bytes, offset);
+}
 
 using splash::kHostPageBytes;
 using splash::model::DiskBudget;
@@ -64,7 +82,8 @@ static void testFailedWriteStopsWriting() {
       require(budget->writtenBytes() == size + size / 2 && budget->readBytes() == 0,
               "IO counters lost a partial write or counted an invalid read");
       require(setrlimit(RLIMIT_FSIZE, &original) == 0, "file limit restore failed");
-      require(!file.writable() && file.write(partial, {source}, {}) == nullptr,
+      require(!file.writable() && budget->writesStopped() &&
+                  file.write(partial, {source}, {}) == nullptr,
               "storage failure did not stop further writes");
       // A closed file still rejects a write that does not fit its slots.
       std::vector<std::byte> oversized(size + 1);
@@ -496,6 +515,104 @@ static void testAdoptionCountsPastTheQuota() {
   require(file.acquire() != nullptr, "the quota did not return once adoption gave it up");
 }
 
+// The limit bounds live slots below the quota; one that falls below what
+// is live grants nothing until enough is freed, and one below a slot takes
+// no write at all. A file's measures name its volume and the blocks it
+// holds.
+static void testTheLimitBoundsLiveSlots() {
+  constexpr size_t size = kHostPageBytes;
+  auto budget = std::make_shared<DiskBudget>(4 * size);
+  SlotFile file(size, budget);
+  budget->setLimitBytes(8 * size);
+  require(budget->limitBytes() == 4 * size, "the limit passed the quota");
+  budget->setLimitBytes(2 * size);
+  auto first = file.acquire(), second = file.acquire();
+  require(first && second && !file.acquire(), "the limit did not bound live slots");
+  budget->setLimitBytes(size - 1);
+  require(!file.takesWrite(false) && !file.takesWrite(true),
+          "a file took a write under a limit that holds no slot");
+  budget->setLimitBytes(size);
+  require(file.takesWrite(true), "a file took no write under a limit that holds a slot");
+  first.reset();
+  require(!file.acquire(), "a slot was granted while more than the limit was live");
+  second.reset();
+  first = file.acquire();
+  require(first != nullptr, "the limit granted nothing once enough was freed");
+  const std::vector<std::byte> payload(size, std::byte{3});
+  require(file.write(first, {payload}, {})->wait() && file.allocatedBytes() >= size &&
+              file.volume() && file.volume()->f_bsize,
+          "a written file did not measure its blocks and volume");
+}
+
+// Every write takes its whole slot from the write budget as it is
+// submitted. Overdrawn, the budget holds writes not in use back until it
+// refills, and when it will is known; a copy in use passes and is counted
+// all the same; a clean stop lifts it. It refills up to a quarter of a
+// day's.
+static void testWritesDrawOnTheWriteBudget() {
+  constexpr size_t size = kHostPageBytes;
+  constexpr double kDay = 86'400'000.0;
+  double now = 0.0;
+  auto budget = std::make_shared<DiskBudget>(8 * size, [&now] { return now; });
+  SlotFile file(size, budget);
+  require(file.takesWrite(false) && !budget->admitsAgainAt() && !budget->writeBudgetBytes(),
+          "a budget without a write budget held a write back");
+  // Four slots a day, one at once.
+  budget->setWriteBudget(4 * size);
+  require(budget->writeBudgetBytes() == static_cast<int64_t>(size) && file.takesWrite(false),
+          "a new write budget did not start full");
+  const std::vector<std::byte> half(size / 2, std::byte{1});
+  std::vector<std::shared_ptr<SlotFile::Slot>> slots;
+  const auto write = [&] {
+    slots.push_back(file.acquire());
+    require(file.write(slots.back(), {half}, {})->wait(), "a slot write failed");
+  };
+  write();
+  require(!budget->writeBudgetBytes() && file.takesWrite(false),
+          "half a slot's payload did not take the whole slot");
+  write();
+  const auto again = budget->admitsAgainAt();
+  require(!file.takesWrite(false) && file.takesWrite(true) && again &&
+              std::abs(*again - kDay / 4) < 1.0,
+          "an overdrawn budget did not hold back what is not in use alone, or say until when");
+  write();
+  require(std::abs(*budget->admitsAgainAt() - kDay / 2) < 1.0,
+          "a copy in use was not counted");
+  now = kDay / 2 + 1.0;
+  require(file.takesWrite(false) && !budget->admitsAgainAt(),
+          "the budget did not refill at its rate");
+  now = 10 * kDay;
+  require(budget->writeBudgetBytes() == static_cast<int64_t>(size),
+          "the budget refilled past a quarter of a day's");
+  write();
+  write();
+  budget->lift();
+  require(file.takesWrite(false) && !budget->admitsAgainAt(), "a lifted budget held a write back");
+}
+
+// A write that found the volume full (ENOSPC, EDQUOT) only reports it, for
+// the engine to measure the volume: the slot it wrote is not readable, and
+// the file goes on taking writes.
+static void testFullVolumeIsReported() {
+  constexpr size_t size = kHostPageBytes;
+  auto budget = std::make_shared<DiskBudget>(4 * size);
+  SlotFile file(size, budget);
+  const std::vector<std::byte> payload(size, std::byte{5});
+  std::vector<std::byte> output(size);
+  for (const int error : {ENOSPC, EDQUOT}) {
+    auto slot = file.acquire();
+    failingWrites = error;
+    const bool written = file.write(slot, {payload}, {})->wait();
+    failingWrites = 0;
+    require(!written && budget->takeFullReport() && file.writable() && !budget->writesStopped() &&
+                !file.read(slot, {output}, {})->wait(),
+            "a write that found the volume full was not reported, or stopped the file");
+    require(file.write(slot, {payload}, {})->wait() && file.read(slot, {output}, {})->wait() &&
+                output == payload && !budget->fullReported(),
+            "the file took no write after its volume was full");
+  }
+}
+
 int main() {
   try {
     testFailedWriteStopsWriting();
@@ -508,6 +625,9 @@ int main() {
     testAdoptedSlotsCheckTheirFirstRead();
     testForeignFilesAndDamagedRecordsAreDropped();
     testAdoptionCountsPastTheQuota();
+    testTheLimitBoundsLiveSlots();
+    testWritesDrawOnTheWriteBudget();
+    testFullVolumeIsReported();
     constexpr size_t size = 4 * kHostPageBytes;
     auto budget = std::make_shared<DiskBudget>(size * 2 + 1);
     SlotFile file(size, budget);

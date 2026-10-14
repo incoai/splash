@@ -162,11 +162,15 @@ class SchemaCheckCacheTests(unittest.TestCase):
         self.enterContext(empty_cache("_validator_cache"))
 
     @staticmethod
-    def tools(*schemas):
+    def tools(*schemas, strict=False):
         tools = [
             {
                 "type": "function",
-                "function": {"name": f"t{index}", "parameters": schema},
+                "function": {
+                    "name": f"t{index}",
+                    "parameters": schema,
+                    "strict": strict,
+                },
             }
             for index, schema in enumerate(schemas)
         ]
@@ -183,15 +187,23 @@ class SchemaCheckCacheTests(unittest.TestCase):
             self.tools(*schemas)
         check.assert_not_called()
 
-    def test_invalid_tool_schema_is_refused_every_time(self):
-        for _ in range(2):
-            with self.assertRaises(APIError) as caught:
-                self.tools({"type": "invalid"})
-            self.assertEqual(caught.exception.status, 400)
-            self.assertTrue(
-                caught.exception.message.startswith("invalid tool schema for t0: ")
-            )
-        self.assertFalse(validation._checked_schemas)
+    def test_invalid_tool_schema_is_checked_once(self):
+        # A strict tool's is refused; any other tool's only goes untyped, and
+        # its client sends it again on every turn.
+        with self.assertRaises(APIError) as first:
+            self.tools({"type": "invalid"}, strict=True)
+        self.assertEqual(first.exception.status, 400)
+        self.assertTrue(
+            first.exception.message.startswith("invalid tool schema for t0: ")
+        )
+        self.assertEqual(len(validation._checked_schemas), 1)
+        with mock.patch.object(validation.validators, "validator_for") as check:
+            with self.assertRaises(APIError) as again:
+                self.tools({"type": "invalid"}, strict=True)
+            _, policy = self.tools({"type": "invalid"})
+        check.assert_not_called()
+        self.assertEqual(again.exception.message, first.exception.message)
+        self.assertEqual(policy.schemas, {"t0": None})
 
     def test_eviction_obeys_both_count_and_source_byte_limits(self):
         for count, budget in ((2, 10000), (1024, 180)):

@@ -5,18 +5,52 @@ import math
 import unittest
 from unittest import mock
 
+from tokenizers import (
+    AddedToken,
+    Tokenizer,
+    decoders,
+    models,
+    pre_tokenizers,
+    processors,
+)
+from transformers import PreTrainedTokenizerFast
+
 from dev.tests.server_fixtures import (
     FOREVER,
     CharTokenizer,
     FakeRuntime,
     HarnessTestCase,
     Plan,
+    byte_alphabet,
     judgment_body,
     make_frontend,
     stays_connected,
 )
 from server import judgments
 from server import server as api
+
+TURNS_TEMPLATE = (
+    "{% for message in messages %}<|im_start|>{{ message.role }}\n"
+    "{{ message.content }}<|im_end|>\n{% endfor %}"
+    "{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}"
+)
+
+
+def byte_tokenizer(template):
+    """A byte-level BPE tokenizer for `template` with Qwen's turn tokens, a
+    token per byte between them. Like a model's, it refuses text that holds a
+    lone surrogate, and a prompt splits after its last <|im_end|>."""
+    vocabulary = {char: byte for byte, char in byte_alphabet().items()}
+    backend = Tokenizer(models.BPE(vocabulary, []))
+    backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    backend.decoder = decoders.ByteLevel()
+    backend.post_processor = processors.ByteLevel(trim_offsets=False)
+    backend.add_special_tokens(
+        [AddedToken(text, normalized=False) for text in ("<|im_start|>", "<|im_end|>")]
+    )
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend)
+    tokenizer.chat_template = template
+    return tokenizer
 
 
 class BoundaryCountingTokenizer(CharTokenizer):
@@ -88,6 +122,29 @@ class JudgmentTests(HarnessTestCase):
             list(request.prompt_tokens) + [ord("A")],
         )
 
+    def test_judgments_send_the_cache_salt(self):
+        # Rows of one salt share cached prompts with each other alone.
+        runtime = FakeRuntime(*(Plan(logits=(1.5, -2.25)) for _ in range(4)))
+        harness = self.harness(runtime, tokenizer=CharTokenizer(), max_context=8192)
+        for salt in ("run-1", "run-1", "run-2", None):
+            body = judgment_body() if salt is None else judgment_body(cache_salt=salt)
+            status, _, payload = harness.request("POST", "/v1/judgments", body)
+            self.assertEqual(status, 200, payload)
+        first, again, other, unsalted = (
+            request.frame.cache_salt for request in runtime.requests
+        )
+        self.assertNotEqual(first, 0)
+        self.assertEqual(first, again)
+        self.assertNotIn(other, (0, first))
+        self.assertEqual(unsalted, 0)
+        for salt in ("", 7, ["run-1"]):
+            status, _, payload = harness.request(
+                "POST", "/v1/judgments", judgment_body(cache_salt=salt)
+            )
+            self.assertEqual(status, 400, payload)
+            self.assertIn("cache_salt must be a non-empty string", payload.decode())
+        self.assertEqual(len(runtime.requests), 4)
+
     def test_judgments_rejects_invalid_rows_before_inference(self):
         runtime = FakeRuntime()
         harness = self.harness(runtime, tokenizer=CharTokenizer(), max_context=8192)
@@ -140,6 +197,51 @@ class JudgmentTests(HarnessTestCase):
         self.assertEqual(response.status, 400)
         connection.close()
         self.assertEqual(runtime.requests, [])
+
+    def test_scoring_reads_a_lone_surrogate_as_a_replacement_character(self):
+        # JSON spells a lone surrogate, such as half of an emoji a client cut,
+        # which the tokenizer refuses. A scoring prompt reads it as U+FFFD, as
+        # any request's does, whether the prompt's end encodes on its own or
+        # the whole prompt does: a judgment row with one answers as the row
+        # with U+FFFD in its place, with the digest of that text, and so does
+        # a System One question.
+        for template in (TURNS_TEMPLATE, TURNS_TEMPLATE.replace("<|im_end|>", "")):
+            split = "<|im_end|>" in template
+            with self.subTest(split=split):
+                runtime = FakeRuntime(*(Plan(logits=(1.5, -2.25)) for _ in range(3)))
+                harness = self.harness(
+                    runtime, tokenizer=byte_tokenizer(template), max_context=8192
+                )
+                digests = []
+                for state in ("half an emoji: \ud83d", "half an emoji: \ufffd"):
+                    status, _, payload = harness.request(
+                        "POST", "/v1/judgments", judgment_body(state=state)
+                    )
+                    self.assertEqual(status, 200, payload)
+                    digests.append(json.loads(payload)["prompt_sha256"])
+                tokens = [request.frame.prompt_tokens for request in runtime.requests]
+                self.assertEqual(tokens[0], tokens[1])
+                prompt = harness.tokenizer.decode(tokens[0])
+                self.assertIn("half an emoji: \ufffd", prompt)
+                digest = hashlib.sha256(prompt.encode()).hexdigest()
+                self.assertEqual(digests, [digest, digest])
+                prompt_tokenizer = harness.app.prompt_tokenizer
+                self.assertEqual(bool(prompt_tokenizer.split(prompt)[0]), split)
+                status, _, payload = harness.request(
+                    "POST",
+                    "/v1/systemone",
+                    {
+                        "model": "test-model",
+                        "state": "half an emoji: \ud83d",
+                        "questions": {
+                            "q": {
+                                "type": "choice",
+                                "criteria": {"yes": "supported", "no": "not supported"},
+                            }
+                        },
+                    },
+                )
+                self.assertEqual(status, 200, payload)
 
     def test_judgments_requires_auth_when_configured(self):
         runtime = FakeRuntime(Plan(logits=(0.0, 1.0)))
@@ -349,6 +451,31 @@ class JudgmentTests(HarnessTestCase):
         self.assertEqual(len(runtime.requests), 2)
         self.assertTrue(blocked.cancelled.is_set())
         self.assertEqual(runtime.cancel_count, 1)
+
+    def test_systemone_sends_the_cache_salt(self):
+        runtime = FakeRuntime(Plan(logits=(1.0, 0.0)), Plan(logits=(1.0, 0.0)))
+        harness = self.harness(runtime, tokenizer=CharTokenizer(), max_context=8192)
+        body = {
+            "model": "test-model",
+            "state": "Some evidence",
+            "questions": {"first": {"type": "noul", "criteria": {}}},
+        }
+        for salt in ("run-1", None):
+            request = body if salt is None else body | {"cache_salt": salt}
+            status, _, payload = harness.request("POST", "/v1/systemone", request)
+            self.assertEqual(status, 200, payload)
+        salted, unsalted = (request.frame.cache_salt for request in runtime.requests)
+        self.assertNotEqual(salted, 0)
+        self.assertEqual(unsalted, 0)
+        status, _, payload = harness.request(
+            "POST", "/v1/systemone", body | {"cache_salt": ""}
+        )
+        self.assertEqual(status, 422, payload)
+        self.assertEqual(
+            [error["loc"] for error in json.loads(payload)["detail"]],
+            [["body", "cache_salt"]],
+        )
+        self.assertEqual(len(runtime.requests), 2)
 
     def test_systemone_question_count_budget_rejects_before_inference(self):
         runtime = FakeRuntime()

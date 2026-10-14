@@ -433,12 +433,18 @@ class StreamingToolCallProjector:
                 self.state = "content"
         return events
 
+    @property
+    def in_call(self):
+        """Whether the output so far ends inside a call, past its opening."""
+        return self.state in ("name", "arguments", "parameter", "value")
+
     def finish(self, incomplete):
         """The content and calls of the output, and the events the stream
         still owes for what put() held back.
 
-        Output cut at the token limit keeps an open call with the arguments
-        it has, and no call whose name it cut; other output that ends inside
+        Output cut short, by the token limit or a stop sequence inside a
+        call, keeps an open call with the arguments it has, and no call whose
+        name it cut; other output that ends inside
         a call closes the call, and what it held back after a value could
         only begin the value's close. Cut output with a call has the content
         the stream published, which leaves out whitespace that no visible

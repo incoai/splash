@@ -3,6 +3,7 @@
 #include "model/Model.hpp"
 
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -31,6 +32,26 @@ enum class EngineFinishReason : uint8_t {
   Cancelled = 2,
 };
 
+// A request's speculative decoding: the tokens its draft proposed, those
+// verification accepted, and the decode steps that verified a draft.
+struct SpeculativeCounts final {
+  uint32_t draftedTokens = 0;
+  uint32_t acceptedDraftTokens = 0;
+  uint32_t cycles = 0;
+
+  bool operator==(const SpeculativeCounts &) const = default;
+};
+
+// A request's cache salt: its API's cache_salt, which the server hashes to
+// 128 bits. Requests share cached KV and states only with requests of the
+// same salt; zero for a request without one.
+struct CacheSalt final {
+  uint64_t lo = 0;
+  uint64_t hi = 0;
+
+  bool operator==(const CacheSalt &) const = default;
+};
+
 struct EngineRequest final {
   uint64_t id = 0;
   RequestPriority priority = RequestPriority::Normal;
@@ -53,10 +74,14 @@ struct EngineRequest final {
   std::vector<uint32_t> scoreTokens{};
   // RequestFlag bits.
   uint32_t flags = 0;
+  // Set only for a request that generates inside a thinking block.
+  std::optional<ThinkingBudget> thinkingBudget;
+  CacheSalt cacheSalt;
 
   [[nodiscard]] ModelRequest modelView() const noexcept {
-    return {id,       prompt,     images,      imagePixels, maxNewTokens,
-            sampling, constraint, scoreTokens, flags};
+    return {id,           prompt,   images,     imagePixels,
+            maxNewTokens, sampling, constraint, scoreTokens,
+            flags,        thinkingBudget ? &*thinkingBudget : nullptr};
   }
 };
 
@@ -119,9 +144,15 @@ public:
   virtual void tokens(uint64_t requestId, std::span<const uint32_t> tokens) = 0;
   virtual void maskRequested(uint64_t requestId,
                              std::span<const uint32_t> simulationTokens) = 0;
+  // deduplicatedTokens: tokens whose KV the request read from cached blocks
+  // another request computed, past the cached prefix it started from: blocks
+  // it computed and then found cached, and blocks a resume after a
+  // suspension restored past those it had published.
   virtual void completed(uint64_t requestId, EngineFinishReason reason,
                          uint32_t promptTokens, uint32_t completionTokens,
-                         std::span<const float> optionLogits) = 0;
+                         uint32_t deduplicatedTokens,
+                         std::span<const float> optionLogits,
+                         const SpeculativeCounts &speculation) = 0;
   virtual void failed(uint64_t requestId, LaneOutcome outcome,
                       std::string message) = 0;
 };

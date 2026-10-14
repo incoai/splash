@@ -5,6 +5,7 @@
 #include "engine/MemoryPlan.hpp"
 #include "engine/Cache.hpp"
 #include "engine/CacheDirectory.hpp"
+#include "engine/DiskSpace.hpp"
 #include "engine/MemoryGovernor.hpp"
 #include "engine/KvPageTier.hpp"
 #include "ops/PageStorage.hpp"
@@ -81,19 +82,40 @@ struct PersistentCacheFiles final {
 // every category the model has must report its allocation and identity.
 void requireLoadedModel(const model::LoadedModel &loaded);
 
+// The disk quota cached KV pages and states share (--max-cache-disk):
+// automatic, the tier sized by its volume up to kAutomaticCacheDiskBytes,
+// its staging set aside only where the memory plan has room for it and its
+// files opened only where their volume has, or `bytes`, zero for no tier.
+struct CacheDiskQuota final {
+  bool automatic = false;
+  uint64_t bytes = 0;
+};
+
 struct RuntimeResourcesConfig {
   kv::Format kvFormat = kv::Format::Int8;
+  ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
   std::filesystem::path metallibPath;
   std::filesystem::path modelRoot;
   model::ModelDescriptor model;
   std::string buildId;
   uint64_t maximumMemoryBytes = 0;
-  // Disk quota shared by cached KV pages and states; zero disables the tier.
-  uint64_t maximumCacheDiskBytes = 0;
-  // Where the tier keeps its files for the next process to take back
-  // (--cache-dir): one directory per persistentCacheNamespace(). Empty for
-  // temporary files that go with the process.
-  std::filesystem::path persistentCacheRoot;
+  // No tier unless set.
+  CacheDiskQuota cacheDisk;
+  // The tier's write budget, the most it writes a day on average
+  // (--max-cache-disk-writes, model::DiskBudget::setWriteBudget); zero for
+  // none, when every write passes.
+  uint64_t cacheDiskWritesPerDay = 0;
+  // Where persistent caches live, one directory per persistentCacheNamespace():
+  // every start removes those nobody used for two weeks. Empty for none.
+  std::filesystem::path cacheRoot;
+  // The tier keeps its files under cacheRoot for the next process to take
+  // back (--persistent-cache), instead of temporary files that go with the
+  // process.
+  bool persistentCache = false;
+  // The volume a directory lives on (volumeOf), which the automatic quota
+  // reads for each place the tier may keep its files before it opens them.
+  std::function<std::optional<DiskVolume>(const std::filesystem::path &directory)> diskVolume =
+      volumeOf;
   // Patches per image, from --max-image-patches: the engine admits images up
   // to it when the model loaded vision and none otherwise. The wire parser
   // keeps the protocol ceiling.
@@ -106,12 +128,19 @@ struct RuntimeResourcesConfig {
   double idleReleaseSeconds = metal::kResidencyKeepAliveSeconds;
   // Reclaimable host memory, sampled at every Metal operation during startup
   // and by the governor afterwards.
-  MemoryGovernor::HostAvailableMemoryProvider hostAvailableMemory =
-      queryHostAvailableMemory;
+  MemoryGovernor::HostMemoryProvider hostMemory = queryHostMemory;
   // The prefill FFN's Neural Engine split (startAneFfn): off with
   // --disable-ane, and a benchmark round runs the split of the first so that
   // rounds repeat one another.
   AneFfnSetting aneFfn;
+  // A relaunch's context (--relaunch-context): the context the server's
+  // first engine served without --max-context, which the server passes to
+  // every relaunch. The relaunch decides the rest as an automatic start, as
+  // that engine did, the SSD cache's staging among it, but its split takes at
+  // most the units whose plan holds this context, the GPU alone where none
+  // does (startAneFfn), and it serves this context where its plan holds it
+  // (RuntimeBootstrap::start). Zero for none.
+  uint32_t relaunchContext = 0;
   // The process's existing pressure observer runs before resource assembly;
   // it only publishes a level. Bootstrap checks it at Metal operation
   // boundaries; after Ready the transport control handler keeps it current.
@@ -165,9 +194,9 @@ private:
 
 // Owns every process-wide native resource exactly once. Members go in
 // reverse declaration order: what the engine gives back while idle -> Neural
-// Engine split -> Cache -> KV pool -> KV disk tier -> state storage -> KV
-// page storage -> governor -> loaded model -> Metal backend -> a persistent
-// tier's directory, whose lock goes last.
+// Engine split -> Cache -> KV pool -> the disk tier's space -> KV disk tier
+// -> state storage -> KV page storage -> governor -> loaded model -> Metal
+// backend -> a persistent tier's directory, whose lock goes last.
 // The KV disk tier must go before the KV page storage: its IO worker reads
 // and writes pages in place in the extents, and its destructor waits for
 // every transfer in flight. A persistent tier's files are sealed first,
@@ -177,7 +206,8 @@ class RuntimeResources final {
 public:
   // `requestedContextTokens` is the context the engine is asked to hold
   // (--max-context), zero for the automatic context (AneFfnOutcome::context),
-  // which the Neural Engine split must leave. A persistent tier takes back
+  // which the Neural Engine split must leave, as it must a relaunch's
+  // (RuntimeResourcesConfig::relaunchContext). A persistent tier takes back
   // what the last process left before create() returns.
   [[nodiscard]] static std::unique_ptr<RuntimeResources>
   create(const RuntimeResourcesConfig &config, uint32_t requestedContextTokens);
@@ -186,9 +216,10 @@ public:
   RuntimeResources &operator=(const RuntimeResources &) = delete;
   ~RuntimeResources();
 
-  // The engine is Ready: a persistent tier's directory marks this process
-  // serving, on probation for its first minute after an unclean end
-  // (CacheDirectory::beginServing).
+  // The engine is Ready: what the start allocated as memory a request in
+  // service needs is in place, so the governor's mark for it ends, and a
+  // persistent tier's directory marks this process serving, on probation for
+  // its first minute after an unclean end (CacheDirectory::beginServing).
   void beginServing();
   // At a clean stop, after the engine's flush (Engine::flushRestorePoints):
   // each state copy's label takes its state's current recency, both files
@@ -208,11 +239,6 @@ public:
   }
   [[nodiscard]] const RuntimeCacheIdentity &cacheIdentity() const noexcept {
     return cacheIdentity_;
-  }
-  // What other applications left, measured before the engine took any;
-  // empty when the host could not be measured.
-  [[nodiscard]] std::optional<uint64_t> hostAvailableAtStart() const noexcept {
-    return hostAvailableAtStart_;
   }
   // The share the prefill FFN's Neural Engine split runs at and the least
   // rows of a chunk it takes; 0 for none.
@@ -241,10 +267,11 @@ private:
                    std::unique_ptr<kv::PageStorage> kvPages,
                    std::unique_ptr<model::QwenStateStorage> stateStorage,
                    std::unique_ptr<KvPageTier> kvTier,
+                   std::unique_ptr<DiskSpace> diskSpace,
                    std::unique_ptr<KvPool> kvPool,
                    std::unique_ptr<engine::Cache> cache,
                    std::unique_ptr<ops::AneFfn> aneFfn, AneFfnOutcome aneFfnOutcome,
-                   std::unique_ptr<ops::Int8Ffn> int8Ffn, std::optional<uint64_t> hostAvailableAtStart);
+                   std::unique_ptr<ops::Int8Ffn> int8Ffn);
   // Takes back the restore points the last process left in a persistent
   // tier (Cache::adopt) and opens its files for this one.
   void adoptPersistentCache();
@@ -260,6 +287,8 @@ private:
   std::unique_ptr<kv::PageStorage> kvPages_;
   std::unique_ptr<model::QwenStateStorage> stateStorage_;
   std::unique_ptr<KvPageTier> kvTier_;
+  // What the cache measures the disk tier's volume with (Cache::keepDiskLimit).
+  std::unique_ptr<DiskSpace> diskSpace_;
   std::unique_ptr<KvPool> kvPool_;
   std::unique_ptr<engine::Cache> cache_;
   std::unique_ptr<ops::AneFfn> aneFfn_;
@@ -268,7 +297,6 @@ private:
   AneFfnOutcome aneFfnOutcome_;
   // The GPU's int8 prefill FFN, on an M5 or later (ops::Int8Ffn::unsupported).
   std::unique_ptr<ops::Int8Ffn> int8Ffn_;
-  std::optional<uint64_t> hostAvailableAtStart_;
   // Ends a probation once it has lasted, unless the process stops first.
   std::thread probation_;
   std::mutex probationMutex_;
@@ -283,12 +311,14 @@ private:
 // remembered beside the programs (ane::recall) under its layers' shapes and
 // formats, the device, the macOS version, the engine's `buildId` and the
 // most units the plan holds.
-// With `int8`, the GPU's int8 FFN of the model, the split runs its GPU part
-// in int8 and is timed and checked against it (ops::AneFfn).
+// With `int8`, which holds the GPU's int8 FFN of the model by the time the
+// split is timed or prepared, the split runs its GPU part in int8 and is
+// timed and checked against that FFN (ops::AneFfn); the plan counts its
+// memory from the start.
 [[nodiscard]] AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &loaded,
                                       const ops::ExecutionPlans &operators, kv::Format format,
                                       std::string_view buildId, std::function<bool()> cancelled,
-                                      ops::Int8Ffn *int8 = nullptr);
+                                      const std::unique_ptr<ops::Int8Ffn> *int8 = nullptr);
 
 // Connects an engine to the governor that admits its memory: the engine asks
 // it whether the host pauses growth, and marks the allocations a request in

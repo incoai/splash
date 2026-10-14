@@ -431,6 +431,10 @@ class MultiplexedRuntime:
         self,
         command: Sequence[str] | None = None,
         *,
+        # The command of every engine started once one was Ready, from that
+        # first engine's ReadyEvent: the server's keeps its context. None
+        # starts `command` again.
+        relaunch_command: Callable[[wire.ReadyEvent], Sequence[str]] | None = None,
         process_factory: Callable[[], ProcessLike] | None = None,
         startup_timeout: float = 30.0,
         pending_limit: int = 64,
@@ -446,7 +450,8 @@ class MultiplexedRuntime:
             raise ValueError("pending_limit must be positive")
 
         self._command = tuple(command) if command else None
-        self._process_factory = process_factory or self._default_process_factory
+        self._relaunch_command = relaunch_command
+        self._process_factory = process_factory
         self._startup_timeout = startup_timeout
         self._pending_limit = pending_limit
         self._admission_slots = threading.BoundedSemaphore(pending_limit)
@@ -491,10 +496,20 @@ class MultiplexedRuntime:
         if eager_start:
             self._ensure_process()
 
-    def _default_process_factory(self) -> ProcessLike:
-        assert self._command is not None
+    def _launch_command(self) -> tuple[str, ...] | None:
+        """The command of the engine to start, a relaunch's once an engine
+        was Ready; None without a command, which a process factory stands
+        in for."""
+        with self._state_lock:
+            first = self._first_ready
+        if self._command is None or first is None or self._relaunch_command is None:
+            return self._command
+        return tuple(self._relaunch_command(first))
+
+    @staticmethod
+    def _spawn(command: Sequence[str]) -> ProcessLike:
         return subprocess.Popen(
-            self._command,
+            command,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=None,
@@ -626,9 +641,10 @@ class MultiplexedRuntime:
         return self._status(timeout, None, fail_unanswered)
 
     def release_weights(self, timeout: float = 5.0) -> wire.StatusJsonEvent:
-        """Asks the engine to give its weights back now. It does so only when
-        it holds no request and no restore is under way; the status JSON that
-        answers shows which (`weights.released`). The next request restores
+        """Asks the engine to give its weights back now. It does so only while
+        it holds no request and no restore is under way, with
+        `--idle-release off` too; the status JSON that answers shows which
+        (`weights`: `released` and not `restoring`). The next request restores
         them, as after the idle release."""
         return self._status(timeout, None, False, release=True)
 
@@ -841,7 +857,12 @@ class MultiplexedRuntime:
 
         process = None
         try:
-            process = self._process_factory()
+            command = self._launch_command()
+            process = (
+                self._spawn(command)
+                if self._process_factory is None
+                else self._process_factory()
+            )
             if process.stdin is None or process.stdout is None:
                 raise EngineUnhealthy(
                     "native process did not expose binary stdin/stdout"
@@ -878,7 +899,7 @@ class MultiplexedRuntime:
                 self._ready_message = None
                 self._last_status = None
                 attempt.generation = generation
-                self._crash_trace.start_generation(generation, process.pid)
+                self._crash_trace.start_generation(generation, process.pid, command)
                 reader = threading.Thread(
                     target=self._reader_loop,
                     args=(process, generation),
@@ -1134,8 +1155,11 @@ class MultiplexedRuntime:
                     first.max_concurrent_requests,
                     first.vision,
                 ):
-                    # The frontend serves the first engine's limits. Every
-                    # relaunch would load the model to announce them again.
+                    # The frontend serves the first engine's limits, and the
+                    # server's relaunch command keeps its context. A relaunch
+                    # that still announces others, as once the Mac's memory
+                    # budget shrank, would at every relaunch, each loading
+                    # the model to announce them again.
                     self._fatal_error = EngineUnhealthy(
                         "native context window, concurrency or vision "
                         "changed; restart the Splash server"

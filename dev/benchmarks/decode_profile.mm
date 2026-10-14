@@ -1,6 +1,8 @@
 // Per-kernel GPU time attribution for the production executor.
 //
 //   decode-profile METALLIB MODEL_ROOT [--prompt-tokens N] [--cycles K] [--kv-format int8|bf16]
+//                  [--state-format fp32|bf16]
+//   decode-profile METALLIB MODEL_ROOT --images HxW[,HxW...] [--cycles K]
 //
 // Drives the real model runtime with Metal dispatch profiling enabled, so
 // every dispatch of a prefill command and B1 through B4 DFlash cycles
@@ -8,13 +10,20 @@
 // The fused (unprofiled) GPU time of the same work is reported alongside, so
 // the gap between the sum of parts and the fused command shows how much a
 // cycle pays in dispatch boundaries rather than kernel work.
+// With --images it profiles the vision encoder instead, loading only the
+// model's vision role: K encodes of a synthetic image per patch grid (height
+// x width in patches), fused and then attributed.
 
 #include "engine/Types.hpp"
 #include "model/Runtime.hpp"
 #include "ops/PageStorage.hpp"
+#include "ops/Vision.hpp"
 #include "metal/BackendInstrumentation.hpp"
+#include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "model/ModelFactory.hpp"
+#include "model/VisionLoader.hpp"
+#include "model/WeightImages.hpp"
 #include "engine/MemoryGovernor.hpp"
 #include "model/QwenState.hpp"
 
@@ -118,6 +127,91 @@ uint32_t parseCount(std::string_view text, std::string_view label) {
   return value;
 }
 
+// HxW[,HxW...]: patch grids of images the encoder accepts.
+std::vector<ops::ImageGrid> parseGrids(std::string_view text) {
+  std::vector<ops::ImageGrid> grids;
+  while (true) {
+    const std::string_view item = text.substr(0, text.find(','));
+    const size_t cross = item.find('x');
+    if (cross == std::string_view::npos)
+      throw std::invalid_argument("--images takes HxW[,HxW...] patch grids");
+    const ops::ImageGrid grid{parseCount(item.substr(0, cross), "grid height"),
+                              parseCount(item.substr(cross + 1), "grid width")};
+    if (!grid.valid() || grid.patches() > ops::kMaximumImagePatches) {
+      throw std::invalid_argument(
+          std::string(item) + " is not a grid of even sides and at most " +
+          std::to_string(ops::kMaximumImagePatches) + " patches");
+    }
+    grids.push_back(grid);
+    if (item.size() == text.size())
+      return grids;
+    text.remove_prefix(item.size() + 1);
+  }
+}
+
+// The vision encoder as the runtime runs it for the largest of the images:
+// an arena sized for that image's patches, and each image's dispatches in
+// one command. Every image is encoded once to warm up, then `cycles` times
+// fused for the median GPU time and `cycles` times attributed.
+void profileImages(metal::MetalBackend &backend,
+                   const std::filesystem::path &root,
+                   std::span<const ops::ImageGrid> grids, uint32_t cycles) {
+  const model::ModelDescriptor descriptor = model::inspectModelRoot(root);
+  if (!descriptor.hasVision())
+    throw std::invalid_argument("the model has no vision role");
+  model::WeightImages images(backend, descriptor.sourceIdentity);
+  const auto loader = model::planVisionLoader(root, descriptor);
+  const model::QwenVisionWeights vision =
+      model::loadVisionWeights(backend, images, loader.get());
+  uint64_t largest = 0;
+  for (const ops::ImageGrid &grid : grids)
+    largest = std::max(largest, grid.patches());
+  const ops::Vision encoder(backend, vision.tensors,
+                            static_cast<uint32_t>(largest));
+
+  for (const ops::ImageGrid &grid : grids) {
+    // Gradients along both axes and a checkerboard of patch-sized squares.
+    const metal::MetalBuffer pixels = backend.allocateBuffer(
+        grid.pixelBytes(), metal::BufferStorage::Shared, "image pixels");
+    const uint32_t height = grid.height * ops::kImagePatchPixels;
+    const uint32_t width = grid.width * ops::kImagePatchPixels;
+    auto *pixel = static_cast<uint8_t *>(pixels.contents());
+    for (uint32_t y = 0; y < height; ++y) {
+      for (uint32_t x = 0; x < width; ++x, pixel += ops::kImageChannels) {
+        pixel[0] = static_cast<uint8_t>(x * 255 / width);
+        pixel[1] = static_cast<uint8_t>(y * 255 / height);
+        pixel[2] = static_cast<uint8_t>(
+            (x / ops::kImagePatchPixels + y / ops::kImagePatchPixels) % 2 * 255);
+      }
+    }
+    const metal::MetalBuffer embeddings = backend.allocateBuffer(
+        uint64_t{ops::Vision::embeddingRows(grid)} *
+            vision.tensors.layout.outputHiddenSize * sizeof(uint16_t),
+        metal::BufferStorage::Private, "image embeddings");
+    const auto encode = [&] {
+      metal::CommandGraph graph;
+      encoder.encode(graph, grid, pixels, embeddings);
+      return backend.submitCommandAsync(graph.dispatches()).wait().gpuSeconds;
+    };
+
+    static_cast<void>(encode());
+    std::vector<double> fused;
+    for (uint32_t cycle = 0; cycle < cycles; ++cycle)
+      fused.push_back(encode());
+    std::sort(fused.begin(), fused.end());
+    BackendInstrumentation::setDispatchProfiling(backend, true);
+    for (uint32_t cycle = 0; cycle < cycles; ++cycle)
+      static_cast<void>(encode());
+    BackendInstrumentation::setDispatchProfiling(backend, false);
+    Table table;
+    accumulate(table, BackendInstrumentation::takeDispatchProfile(backend));
+    print("image " + std::to_string(grid.height) + "x" +
+              std::to_string(grid.width) + " (" +
+              std::to_string(grid.patches()) + " patches) encode",
+          table, cycles, fused[fused.size() / 2]);
+  }
+}
+
 struct Lane final {
   uint64_t id = 0;
   uint32_t stateLane = 0;
@@ -200,31 +294,55 @@ int main(int argc, char **argv) {
     try {
       if (argc < 3) {
         std::cerr << "usage: decode-profile METALLIB MODEL_ROOT "
-                     "[--prompt-tokens N] [--cycles K] [--kv-format int8|bf16]\n";
+                     "[--prompt-tokens N] [--cycles K] [--kv-format int8|bf16] "
+                     "[--state-format fp32|bf16]\n"
+                     "       decode-profile METALLIB MODEL_ROOT "
+                     "--images HxW[,HxW...] [--cycles K]\n";
         return 2;
       }
       uint32_t promptTokens = 512;
       uint32_t cycles = 4;
       kv::Format format = kv::Format::Int8;
+      ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
+      std::vector<ops::ImageGrid> grids;
+      bool textOptions = false;
       for (int index = 3; index < argc; index += 2) {
         const std::string_view option(argv[index]);
         if (index + 1 >= argc)
           throw std::invalid_argument(std::string(option) + " requires a value");
-        if (option == "--prompt-tokens")
+        if (option == "--prompt-tokens") {
           promptTokens = parseCount(argv[index + 1], "--prompt-tokens");
-        else if (option == "--cycles")
+          textOptions = true;
+        } else if (option == "--cycles")
           cycles = parseCount(argv[index + 1], "--cycles");
         else if (option == "--kv-format") {
           const std::string_view value(argv[index + 1]);
           if (value != "int8" && value != "bf16")
             throw std::invalid_argument("--kv-format takes int8 or bf16");
           format = value == "int8" ? kv::Format::Int8 : kv::Format::BFloat16;
-        } else
+          textOptions = true;
+        } else if (option == "--state-format") {
+          const std::string_view value(argv[index + 1]);
+          if (value != "fp32" && value != "bf16")
+            throw std::invalid_argument("--state-format takes fp32 or bf16");
+          stateFormat = value == "fp32" ? ops::GdnStateFormat::Float32 : ops::GdnStateFormat::BFloat16;
+          textOptions = true;
+        } else if (option == "--images")
+          grids = parseGrids(argv[index + 1]);
+        else
           throw std::invalid_argument("unknown option");
       }
+      if (!grids.empty() && textOptions)
+        throw std::invalid_argument("--images takes no other option than --cycles");
 
       metal::MetalBackend backend(argv[1]);
       const std::filesystem::path root(argv[2]);
+      if (!grids.empty()) {
+        std::printf("device %s, %u encodes per image\n",
+                    backend.capabilities().deviceName.c_str(), cycles);
+        profileImages(backend, root, grids, cycles);
+        return 0;
+      }
       model::LoadedModel model =
           model::loadModel(backend, root, model::inspectModelRoot(root));
       ops::ExecutionPlans operators(backend.capabilities());
@@ -241,8 +359,8 @@ int main(int argc, char **argv) {
       const uint32_t pageCount =
           (pagesPerLane * 4 + extentPages - 1) / extentPages * extentPages;
       MemoryGovernor governor(
-          backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
-          queryHostAvailableMemory, 0);
+          backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
+          queryHostMemory, 0);
       kv::PageStorage pages(backend, governor.allocationAdmission(), kvLayout,
                             pageCount, extentPages);
       for (uint32_t extent = 0; extent < pageCount / extentPages; ++extent) {
@@ -251,13 +369,13 @@ int main(int argc, char **argv) {
       }
       model::QwenStateStorage states(backend,
                                       governor.allocationAdmission(),
-                                      model.stateLayout(), nullptr);
+                                      model.stateLayout(stateFormat), nullptr);
       model::RuntimeContext context{backend, model, pages, states, operators};
       model::Runtime executor(context);
 
-      std::printf("device %s, %u prompt tokens, %u cycles per width\n",
+      std::printf("device %s, %u prompt tokens, %u cycles per width, %s state\n",
                   backend.capabilities().deviceName.c_str(), promptTokens,
-                  cycles);
+                  cycles, std::string(ops::formatName(stateFormat)).c_str());
 
       std::array<Lane, 4> lanes;
       for (uint32_t index = 0; index < lanes.size(); ++index) {

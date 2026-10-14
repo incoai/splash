@@ -46,8 +46,10 @@ struct LoadedModel final {
     layout.format = format;
     return layout;
   }
-  [[nodiscard]] CompositeStateLayout stateLayout() const noexcept {
-    return descriptor.stateLayout;
+  [[nodiscard]] CompositeStateLayout stateLayout(ops::GdnStateFormat format) const noexcept {
+    auto layout = descriptor.stateLayout;
+    layout.target.format = format;
+    return layout;
   }
   [[nodiscard]] uint32_t maximumContextTokens() const noexcept {
     return descriptor.capabilities.maximumContextTokens;
@@ -118,7 +120,7 @@ void withPrefillArena(
 [[nodiscard]] ModelMemoryPlan
 plannedRuntimeMemory(const LoadedModel &model,
                      const ops::ExecutionPlans &operators,
-                     kv::Format format);
+                     kv::Format kvFormat, ops::GdnStateFormat stateFormat);
 [[nodiscard]] std::unique_ptr<RuntimeModel>
 createRuntime(RuntimeContext context);
 

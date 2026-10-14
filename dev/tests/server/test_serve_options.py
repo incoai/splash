@@ -52,7 +52,18 @@ OPTIONS = {
         {effort: effort for effort in serve_options.REASONING_EFFORTS},
         ("", "turbo", "XHIGH"),
     ),
+    "--thinking-token-budget": values(
+        "--thinking-token-budget", {"0": 0, "4096": 4096}, ("-1", "1.5", "many")
+    ),
+    "--thinking-end-text": values(
+        "--thinking-end-text",
+        {"</think>": "</think>", "Time is up.\n</think>": "Time is up.\n</think>"},
+        (),
+    ),
     "--kv-format": values("--kv-format", {"int8": "int8", "bf16": "bf16"}, ("fp16",)),
+    "--state-format": values(
+        "--state-format", {"fp32": "fp32", "bf16": "bf16"}, ("fp16", "int8")
+    ),
     "--disable-ane": ([(["--disable-ane"], True)], []),
     "--max-memory": values(
         "--max-memory",
@@ -72,12 +83,27 @@ OPTIONS = {
     ),
     "--max-cache-disk": values(
         "--max-cache-disk",
-        {"0": 0, "5G": 5 * 1024**3},
-        ("auto", "-1", "0G", "5X", "nan"),
+        {"auto": None, "0": 0, "5G": 5 * 1024**3},
+        ("-1", "0G", "5X", "nan"),
+    ),
+    "--max-cache-disk-writes": (
+        [
+            (["--max-cache-disk-writes=0"], 0),
+            (["--max-cache-disk-writes=200G"], 200 * 1024**3),
+        ],
+        [
+            ["--max-cache-disk-writes=200G", "--max-cache-disk=0"],
+            ["--max-cache-disk-writes=-1"],
+            ["--max-cache-disk-writes=5X"],
+            ["--max-cache-disk-writes=auto"],
+        ],
     ),
     "--persistent-cache": (
-        [(["--persistent-cache", "--max-cache-disk=5G"], True)],
-        [["--persistent-cache"], ["--persistent-cache", "--max-cache-disk=0"]],
+        [
+            (["--persistent-cache"], True),
+            (["--persistent-cache", "--max-cache-disk=5G"], True),
+        ],
+        [["--persistent-cache", "--max-cache-disk=0"]],
     ),
     "--cache-dir": (
         [
@@ -164,7 +190,12 @@ class ServeOptionsTests(unittest.TestCase):
     def setUp(self):
         # The parsers' defaults ignore the caller's Splash settings.
         self.enterContext(mock.patch.dict(os.environ))
-        for name in ("SPLASH_API_KEY", "SPLASH_DEFAULT_REASONING_EFFORT"):
+        for name in (
+            "SPLASH_API_KEY",
+            "SPLASH_DEFAULT_REASONING_EFFORT",
+            "SPLASH_THINKING_TOKEN_BUDGET",
+            "SPLASH_THINKING_END_TEXT",
+        ):
             os.environ.pop(name, None)
 
     def refuse(self, parse, arguments):
@@ -200,16 +231,22 @@ class ServeOptionsTests(unittest.TestCase):
                     self.refuse(parse, [*required, *arguments])
 
     def test_both_parsers_check_defaults_from_the_environment(self):
-        for name, value, flag in (
-            ("SPLASH_DEFAULT_REASONING_EFFORT", "low", "--default-reasoning-effort"),
-            ("SPLASH_API_KEY", "environment-key", "--api-key"),
+        for name, value, parsed, flag in (
+            (
+                "SPLASH_DEFAULT_REASONING_EFFORT",
+                "low",
+                "low",
+                "--default-reasoning-effort",
+            ),
+            ("SPLASH_THINKING_TOKEN_BUDGET", "4096", 4096, "--thinking-token-budget"),
+            ("SPLASH_API_KEY", "environment-key", "environment-key", "--api-key"),
         ):
             for parse, required in PARSERS:
                 with (
                     self.subTest(parser=parse.__module__, name=name),
                     mock.patch.dict(os.environ, {name: value}),
                 ):
-                    self.assertEqual(getattr(parse(required), dest(flag)), value)
+                    self.assertEqual(getattr(parse(required), dest(flag)), parsed)
                     # The command line outranks the environment.
                     explicit = OPTIONS[flag][0][0]
                     self.assertEqual(
@@ -221,6 +258,19 @@ class ServeOptionsTests(unittest.TestCase):
                     mock.patch.dict(os.environ, {name: "two words"}),
                 ):
                     self.assertIn(flag, self.refuse(parse, required))
+
+    def test_both_parsers_take_the_thinking_end_text_from_the_environment(self):
+        # Any text parses; the server checks it with the model's tokenizer.
+        text = "Time is up.\n</think>"
+        for parse, required in PARSERS:
+            with (
+                self.subTest(parser=parse.__module__),
+                mock.patch.dict(os.environ, {"SPLASH_THINKING_END_TEXT": text}),
+            ):
+                self.assertEqual(parse(required).thinking_end_text, text)
+                # The command line outranks the environment.
+                given = parse([*required, "--thinking-end-text=</think>"])
+                self.assertEqual(given.thinking_end_text, "</think>")
 
     def test_each_parse_has_its_own_lists(self):
         for parse, required in PARSERS:
@@ -340,21 +390,17 @@ class ServeOptionsTests(unittest.TestCase):
         # the server means it (native_arguments_test.cpp). The engine keeps
         # its own default of an option the server does not pass, and the
         # per-image patch limit is the most patches a resized image within
-        # the pixel cap can have, a whole number of merge units.
+        # the pixel cap can have, a whole number of merge units. A relaunch's
+        # line follows a first engine that served 61433 tokens.
         for name, options, arguments in native_command_lines():
             with self.subTest(name=name):
                 self.assertEqual(
-                    api._native_command(api.parse_args([*required, *options])),
+                    api._native_command(
+                        api.parse_args([*required, *options]),
+                        61433 if name.startswith("relaunch") else None,
+                    ),
                     [args.binary, "serve-native", args.model_root, *arguments],
                 )
-        # A persistent cache names its directory; the server picks the default.
-        persistent_args = api.parse_args(
-            [*required, "--max-cache-disk", "5G", "--persistent-cache"]
-        )
-        self.assertEqual(
-            api._native_command(persistent_args)[-2:],
-            ["--cache-dir", str(serve_options.DEFAULT_CACHE_DIR)],
-        )
 
 
 if __name__ == "__main__":

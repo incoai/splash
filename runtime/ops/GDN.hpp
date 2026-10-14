@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <span>
+#include <string_view>
 
 namespace splash::ops {
 
@@ -35,14 +36,37 @@ struct GdnShape final {
 // value head h at (h % heads per key) * key heads + h / heads per key.
 enum class GdnHeadOrder : uint8_t { Grouped, Tiled };
 
+// The recurrent state's storage, selected once for a runtime and every state
+// it holds: fp32, or bf16 at half the bytes. The kernels compute in fp32 with
+// either; they widen a bf16 state where they load it and round it to nearest
+// even where they store it.
+enum class GdnStateFormat : uint32_t { Float32 = 1, BFloat16 = 2 };
+
+[[nodiscard]] constexpr bool validFormat(GdnStateFormat format) noexcept {
+  return format == GdnStateFormat::Float32 || format == GdnStateFormat::BFloat16;
+}
+
+[[nodiscard]] constexpr std::string_view formatName(GdnStateFormat format) noexcept {
+  switch (format) {
+  case GdnStateFormat::Float32: return "fp32";
+  case GdnStateFormat::BFloat16: return "bf16";
+  }
+  return "invalid";
+}
+
+[[nodiscard]] constexpr uint32_t elementBytes(GdnStateFormat format) noexcept {
+  return format == GdnStateFormat::BFloat16 ? 2 : 4;
+}
+
 struct GdnStateStrides final {
   uint64_t convolutionLayerBytes = 0;
   uint64_t recurrentLayerBytes = 0;
   uint64_t convolutionStateBytes = 0;
+  GdnStateFormat format{};
 
   [[nodiscard]] constexpr bool valid() const noexcept {
     return convolutionLayerBytes && recurrentLayerBytes &&
-           convolutionStateBytes;
+           convolutionStateBytes && validFormat(format);
   }
 };
 
@@ -63,6 +87,15 @@ struct GdnPrefillBuffers final {
   metal::MetalBuffer recurrentRows;
   NormWeights mixerNorm;
   metal::MetalBuffer hidden;
+};
+
+// A state a prefill captures inside its rows: the convolution carry and the
+// recurrent state after its first `tokens` rows, which it stores in these
+// buffers as a prefill ending there would.
+struct GdnPrefillCapture final {
+  uint32_t tokens = 0;
+  metal::MetalBuffer convolution;
+  metal::MetalBuffer recurrent;
 };
 
 // A lane's decode tape (metal/abi/GDN.h): each step leaves its rows'
@@ -97,9 +130,15 @@ struct GdnDecodeBuffers final {
 
 class GDN final {
 public:
-  static void addPrefill(metal::CommandGraph &graph, GdnPrefillBuffers buffers,
-                         GdnShape shape, uint32_t tokens,
-                         GdnHeadOrder order);
+  // Each capture, ascending inside the rows, ends one run of the prepare and
+  // scan dispatches, and the next run starts from the state it stored; the
+  // gate then runs once over every row. The scan is sequential, so with an
+  // fp32 state the runs compute what one run does, and a bf16 state is
+  // rounded at each capture as a prefill ending there rounds it.
+  static void addPrefill(metal::CommandGraph &graph, const metal::MetalBackend &backend,
+                         GdnPrefillBuffers buffers, GdnShape shape, uint32_t tokens,
+                         GdnStateFormat state, GdnHeadOrder order,
+                         std::span<const GdnPrefillCapture> captures = {});
   // Also writes the out-projection's `input` table into
   // buffers.linearScratch when it is not Plain, and throws when the scratch
   // cannot hold it.

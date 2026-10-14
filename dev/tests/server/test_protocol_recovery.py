@@ -26,6 +26,13 @@ def request_body(**fields):
     }
 
 
+def thinking(kind, display):
+    """Messages thinking of a kind, its enabled form with the budget Messages
+    requires."""
+    budget = {"budget_tokens": 1024} if kind == "enabled" else {}
+    return {"type": kind, **budget, "display": display}
+
+
 class ProtocolRecoveryTests(unittest.TestCase):
     def harness(self, runtime, **kwargs):
         harness = Harness(runtime, **kwargs)
@@ -45,7 +52,8 @@ class ProtocolRecoveryTests(unittest.TestCase):
                     "/v1/messages",
                     request_body(
                         stream=stream,
-                        thinking={"type": thinking_type, "display": display},
+                        max_tokens=2048,
+                        thinking=thinking(thinking_type, display),
                     ),
                 )
                 self.assertEqual(status, 200, payload)
@@ -116,7 +124,8 @@ class ProtocolRecoveryTests(unittest.TestCase):
                     "/v1/messages",
                     request_body(
                         stream=stream,
-                        thinking={"type": thinking_type, "display": None},
+                        max_tokens=2048,
+                        thinking=thinking(thinking_type, None),
                     ),
                 )
                 self.assertEqual(status, 200, payload)
@@ -273,7 +282,8 @@ class ProtocolRecoveryTests(unittest.TestCase):
 
     def test_hidden_history_rejects_malformed_signatures_before_submit(self):
         harness = self.harness(FakeRuntime())
-        for signature in (7, None, ["token"]):
+        # A null signature is one left out.
+        for signature in (7, ["token"]):
             for path in ("/v1/messages", "/v1/messages/count_tokens"):
                 body = request_body(
                     messages=[

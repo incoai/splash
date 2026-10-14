@@ -243,6 +243,20 @@ class ServedModelNamesTests(unittest.TestCase):
             harness.request("POST", PATHS[0], request_body(PATHS[0]))[0], 200
         )
 
+    def test_an_empty_model_names_the_served_one(self):
+        # Messages requires a model, as Anthropic's API does.
+        runtime = FakeRuntime()
+        harness = self.harness(runtime)
+        for path in (*PATHS, "/v1/completions"):
+            body = {"prompt": "Hi"} if path == "/v1/completions" else request_body(path)
+            for value in ("", None):
+                with self.subTest(path=path, value=value):
+                    status, _, payload = harness.request(
+                        "POST", path, {**body, "model": value}
+                    )
+                    expected = 400 if path == "/v1/messages" else 200
+                    self.assertEqual(status, expected, payload)
+
     def test_response_history_works_across_aliases(self):
         for announce in (False, True):
             with self.subTest(announce=announce):

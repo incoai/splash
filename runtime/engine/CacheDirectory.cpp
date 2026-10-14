@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <optional>
 #include <stdexcept>
 #include <system_error>
 #include <thread>
@@ -46,10 +47,9 @@ private:
   int descriptor_;
 };
 
-// A namespace is one directory name of lowercase hex digits: nothing a path
-// could take apart.
-bool plainName(std::string_view name) noexcept {
-  return !name.empty() && name.size() <= 64 &&
+// A namespace's name (CacheDirectory::kNamespaceDigits).
+bool namespaceName(std::string_view name) noexcept {
+  return name.size() == CacheDirectory::kNamespaceDigits &&
          std::all_of(name.begin(), name.end(), [](char character) {
            return (character >= '0' && character <= '9') || (character >= 'a' && character <= 'f');
          });
@@ -63,12 +63,17 @@ bool owned(int directory) noexcept {
          !(status.st_mode & (S_IWGRP | S_IWOTH));
 }
 
-Descriptor openDirectory(const std::filesystem::path &path, const char *what) {
+// Makes the directory at path (0700) when missing and opens it; empty when
+// it was removed between the two.
+std::optional<Descriptor> openDirectory(const std::filesystem::path &path, const char *what) {
   if (::mkdir(path.c_str(), 0700) < 0 && errno != EEXIST)
     fail(what);
   Descriptor directory(::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
-  if (directory.get() < 0)
+  if (directory.get() < 0) {
+    if (errno == ENOENT)
+      return std::nullopt;
     fail(what);
+  }
   if (!owned(directory.get()))
     throw std::system_error(std::make_error_code(std::errc::permission_denied),
                             std::string(what) +
@@ -90,46 +95,52 @@ bool named(const std::filesystem::path &path, int lock) noexcept {
          held.st_dev == current.st_dev && held.st_ino == current.st_ino;
 }
 
-// Removes another namespace's cache that nobody has used for staleAfter,
-// once it holds its lock. A cache is used when it opens (its lock's time) and
-// while it serves (its files' times). Anything in the way leaves it as it is.
-void removeStale(const std::filesystem::path &path, std::chrono::hours staleAfter) noexcept {
+// A namespace's directory with its lock taken: nobody else holds it while
+// this is open.
+struct Taken final {
+  Descriptor directory;
+  Descriptor lock;
+};
+
+// Takes the lock of the namespace at path, when nobody holds it.
+std::optional<Taken> take(const std::filesystem::path &path) noexcept {
   Descriptor directory(::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
   if (directory.get() < 0 || !owned(directory.get()))
-    return;
+    return std::nullopt;
   Descriptor lock(::openat(directory.get(), kLock, O_RDWR | O_CLOEXEC | O_NOFOLLOW));
+  if (lock.get() < 0 || ::flock(lock.get(), LOCK_EX | LOCK_NB) < 0 || !named(path, lock.get()))
+    return std::nullopt;
+  return Taken{std::move(directory), std::move(lock)};
+}
+
+// When a taken namespace was last used: when it opened (its lock's time) or
+// served (its files' times). Its files' blocks go to `bytes`.
+std::chrono::system_clock::time_point lastUse(const Taken &taken, uint64_t &bytes) noexcept {
   struct stat status {};
-  if (lock.get() < 0 || ::flock(lock.get(), LOCK_EX | LOCK_NB) < 0 ||
-      !named(path, lock.get()) || ::fstat(lock.get(), &status) < 0)
-    return;
-  auto lastUsed = status.st_mtimespec.tv_sec;
+  auto lastUsed = ::fstat(taken.lock.get(), &status) == 0 ? status.st_mtimespec.tv_sec : 0;
+  bytes = 0;
   for (const char *name : kCacheFiles) {
     struct stat file {};
-    if (::fstatat(directory.get(), name, &file, AT_SYMLINK_NOFOLLOW) == 0)
+    if (::fstatat(taken.directory.get(), name, &file, AT_SYMLINK_NOFOLLOW) == 0) {
       lastUsed = std::max(lastUsed, file.st_mtimespec.tv_sec);
+      bytes += static_cast<uint64_t>(file.st_blocks) * 512;
+    }
   }
-  if (std::chrono::system_clock::now() - std::chrono::system_clock::from_time_t(lastUsed) <
-      staleAfter)
-    return;
-  for (const char *name : kCacheFiles)
-    ::unlinkat(directory.get(), name, 0);
-  for (const char *name : kMarks)
-    ::unlinkat(directory.get(), name, 0);
-  // Fails, leaving it, while anything else is in it.
-  ::rmdir(path.c_str());
+  return std::chrono::system_clock::from_time_t(lastUsed);
 }
 
 } // namespace
 
 std::unique_ptr<CacheDirectory>
 CacheDirectory::open(const std::filesystem::path &root, std::string_view cacheNamespace,
-                     std::chrono::milliseconds lockWait, std::chrono::hours staleAfter,
-                     const std::function<bool()> &cancelled) {
-  if (!plainName(cacheNamespace))
-    throw std::invalid_argument("a cache namespace is a name of lowercase hex digits");
+                     std::chrono::milliseconds lockWait, const std::function<bool()> &cancelled) {
+  if (!namespaceName(cacheNamespace))
+    throw std::invalid_argument("a cache namespace is 32 lowercase hex digits");
   if (root.has_parent_path())
     std::filesystem::create_directories(root.parent_path());
-  static_cast<void>(openDirectory(root, "open cache root"));
+  if (!openDirectory(root, "open cache root"))
+    throw std::system_error(std::make_error_code(std::errc::no_such_file_or_directory),
+                            "open cache root");
   const std::filesystem::path path = root / cacheNamespace;
   // A restarting server's new engine can race the end of the old one.
   const auto deadline = AwakeClock::now() + lockWait;
@@ -138,12 +149,21 @@ CacheDirectory::open(const std::filesystem::path &root, std::string_view cacheNa
   };
   std::unique_ptr<CacheDirectory> result;
   for (;;) {
-    Descriptor directory = openDirectory(path, "open cache directory");
-    Descriptor lock(
-        ::openat(directory.get(), kLock, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600));
-    if (lock.get() < 0)
-      fail("open cache directory lock");
-    result.reset(new CacheDirectory(path, directory.release(), lock.release()));
+    // Another process that removes the namespace as a cache nobody holds
+    // can take its directory away before this one opens it or makes its
+    // lock there: the next turn makes it again, empty.
+    std::optional<Descriptor> directory = openDirectory(path, "open cache directory");
+    Descriptor lock(directory ? ::openat(directory->get(), kLock,
+                                         O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600)
+                              : -1);
+    if (lock.get() < 0) {
+      if (directory && errno != ENOENT)
+        fail("open cache directory lock");
+      if (expired())
+        return nullptr;
+      continue;
+    }
+    result.reset(new CacheDirectory(path, directory->release(), lock.release()));
     while (::flock(result->lock_, LOCK_EX | LOCK_NB) < 0) {
       if (errno == EINTR)
         continue;
@@ -173,14 +193,54 @@ CacheDirectory::open(const std::filesystem::path &root, std::string_view cacheNa
     result->unmark(kProbation);
     result->coldReason_ = "the last start failed within its probation";
   }
-  // Removing stale caches is housekeeping: nothing it meets stops the open.
-  std::error_code ignored;
-  for (const auto &entry : std::filesystem::directory_iterator(root, ignored)) {
-    const std::string name = entry.path().filename().string();
-    if (name != cacheNamespace && plainName(name) && entry.is_directory(ignored))
-      removeStale(entry.path(), staleAfter);
+  return result;
+}
+
+std::vector<CacheDirectory::Idle> CacheDirectory::idle(const std::filesystem::path &root) noexcept {
+  std::vector<Idle> result;
+  try {
+    std::error_code ignored;
+    for (const auto &entry : std::filesystem::directory_iterator(root, ignored)) {
+      if (!namespaceName(entry.path().filename().string()) || !entry.is_directory(ignored))
+        continue;
+      if (const std::optional<Taken> taken = take(entry.path())) {
+        Idle cache{entry.path(), {}, 0};
+        cache.lastUsed = lastUse(*taken, cache.bytes);
+        result.push_back(std::move(cache));
+      }
+    }
+    std::sort(result.begin(), result.end(),
+              [](const Idle &left, const Idle &right) { return left.lastUsed < right.lastUsed; });
+  } catch (...) {
+    // Housekeeping: what it found so far, in any order, is as good.
   }
   return result;
+}
+
+std::vector<CacheDirectory::Idle> CacheDirectory::removeStale(std::vector<Idle> caches,
+                                                              std::chrono::hours staleAfter) noexcept {
+  const auto now = std::chrono::system_clock::now();
+  std::erase_if(caches, [&](const Idle &cache) {
+    if (now - cache.lastUsed < staleAfter)
+      return false;
+    static_cast<void>(remove(cache));
+    return true;
+  });
+  return caches;
+}
+
+bool CacheDirectory::remove(const Idle &cache) noexcept {
+  const std::optional<Taken> taken = take(cache.path);
+  uint64_t bytes = 0;
+  if (!taken || lastUse(*taken, bytes) > cache.lastUsed)
+    return false;
+  for (const char *name : kCacheFiles)
+    ::unlinkat(taken->directory.get(), name, 0);
+  for (const char *name : kMarks)
+    ::unlinkat(taken->directory.get(), name, 0);
+  // Fails, leaving it, while anything else is in it.
+  ::rmdir(cache.path.c_str());
+  return true;
 }
 
 CacheDirectory::CacheDirectory(std::filesystem::path path, int directory, int lock)

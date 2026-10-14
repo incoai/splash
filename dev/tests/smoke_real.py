@@ -788,6 +788,7 @@ def run(port: int, model: str) -> None:
     content = structured.get("choices", [{}])[0].get("message", {}).get("content")
     require(code == 200 and json.loads(content) == {"result": "ok"}, "JSON failed")
     print("structured output: PASS", flush=True)
+    run_thinking_budget_under_grammar(port, model, schema)
 
     code, responses = request(
         port,
@@ -851,6 +852,70 @@ def run(port: int, model: str) -> None:
         run_text_only(port, model, nonce)
     run_protocol_extensions(port, model, vision)
     run_judgments(port, model, nonce)
+
+
+# Words whose characters the Qwen tokenizer splits across two tokens each.
+SPLIT_WORDS = ("饕餮", "魍魉", "耄耋", "龘", "彧")
+
+
+def run_thinking_budget_under_grammar(port: int, model: str, schema: dict) -> None:
+    """Structured output with thinking on and a small thinking budget. The
+    grammar admits the end of thinking only between whole characters, so a
+    budget whose last token is part of one thinks on until it is complete.
+    Greedy requests that think in Chinese about characters the tokenizer
+    splits, at budgets of 1 to 48, must each succeed with reasoning that
+    breaks no character, those that finish with the schema's JSON. Where
+    their reasoning holds such a character, a budget ended inside it, and
+    that request must have thought past its budget; a model that thinks in
+    English may reach none within these budgets."""
+    words = "、".join(SPLIT_WORDS)
+    prompt = f"请用中文思考：{words}这些字分别怎么读？然后按要求返回 JSON。"
+    budgets = range(1, 49)
+    past = 0
+    split = False
+    for budget in budgets:
+        code, chat = request(
+            port,
+            "POST",
+            "/v1/chat/completions",
+            chat_body(
+                model,
+                prompt,
+                reasoning_effort="high",
+                thinking_token_budget=budget,
+                max_completion_tokens=budget + 16,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {"name": "probe", "strict": True, "schema": schema},
+                },
+            ),
+        )
+        require(
+            code == 200, f"thinking budget {budget} under a grammar failed: {chat!r}"
+        )
+        choice = chat["choices"][0]
+        message = choice["message"]
+        reasoning = message.get("reasoning_content") or ""
+        require(
+            "\ufffd" not in reasoning
+            and (
+                choice["finish_reason"] != "stop"
+                or json.loads(message["content"]) == {"result": "ok"}
+            ),
+            f"thinking budget {budget} under a grammar broke its output: {message!r}",
+        )
+        split |= any(character in reasoning for character in "".join(SPLIT_WORDS))
+        past += chat["usage"]["completion_tokens_details"]["reasoning_tokens"] > budget
+    require(
+        past or not split,
+        "the reasoning holds a split character, yet no thinking budget under a "
+        "grammar ended inside one",
+    )
+    print(
+        f"thinking budget under a grammar: PASS ({past} of {len(budgets)} "
+        "thought past their budget)",
+        flush=True,
+    )
 
 
 def run_sampling(port: int, model: str) -> None:
@@ -992,7 +1057,7 @@ def run_protocol_extensions(port: int, model: str, vision: bool = True) -> None:
             "model": model,
             "messages": messages,
             "max_tokens": 256,
-            "thinking": {"type": "enabled", "display": "omitted"},
+            "thinking": {"type": "adaptive", "display": "omitted"},
             "output_config": {"effort": "low"},
         },
     )
@@ -1097,6 +1162,7 @@ def run_protocol_extensions(port: int, model: str, vision: bool = True) -> None:
                     "type": "function",
                     "function": {
                         "name": "lookup",
+                        "strict": True,
                         "parameters": {
                             "type": "object",
                             "properties": {},
@@ -1119,7 +1185,7 @@ def run_protocol_extensions(port: int, model: str, vision: bool = True) -> None:
     )
     require(
         json.loads(calls[0]["function"]["arguments"]) == {},
-        "combined tools/schema changed tool arguments",
+        f"combined tools/schema changed strict tool arguments: {calls!r}",
     )
 
     code, high = request(
@@ -1661,12 +1727,13 @@ def parse_args(argv=None):
         "--persistent-cache",
         action="store_true",
         help="instead of the smoke, check a conversation's prefix across a clean "
-        "restart of a server with --persistent-cache in a fresh cache directory "
-        "(needs --max-cache-disk)",
+        "restart of a server with --persistent-cache in a fresh cache directory",
     )
     arguments = parser.parse_args(argv)
-    if arguments.persistent_cache and arguments.max_cache_disk is None:
-        parser.error("--persistent-cache needs --max-cache-disk")
+    if arguments.persistent_cache and arguments.max_cache_disk == "0":
+        parser.error(
+            "--persistent-cache needs the SSD cache --max-cache-disk 0 turns off"
+        )
     return resolve_server_arguments(arguments)
 
 

@@ -25,7 +25,7 @@ otherwise idle:
 - speed (abba.compare): decode GPU milliseconds per step for B1-B4, the GPU
   time of the 14,096-token cold prefill (partial_4k_cold), the TTFT of its
   partial hit (partial_4k_hit) and the GPU time of each short cold prefill
-  (short_<rows>_rows_prefill_gpu_ms, by the rows of its first chunk).
+  (short_<rows>_rows_prefill_gpu_ms, by the rows of its one chunk).
 - memory plan: the candidate's plan holds no less context without the Neural
   Engine split than the baseline's holds without it, what a baseline before
   the split serves; the split takes its memory from the KV cache. The context
@@ -66,8 +66,7 @@ ACCEPTANCE_TOLERANCE = 0.02
 BENCHMARK = Path("build/engine-tests/backend-benchmark")
 METALLIB = Path("build/splash.metallib")
 PARTIAL = ("partial_4k_cold", "partial_4k_seed", "partial_4k_hit")
-# The rows of the first chunk of the short scenario's cold prefills, whose
-# prompts hold a token more.
+# The rows of the short scenario's cold prefills, one chunk each.
 SHORT = (480, 512, 544, 640, 672, 1024, 1536, 2016)
 # The transcripts scenario's requests, one per case of the benchmark's.
 TRANSCRIPTS = tuple(f"transcript_{case}" for case in range(8))
@@ -200,7 +199,7 @@ def run_round(tree: Path, model_root: Path, round_index: int, version: str, args
 
 def round_record(version: str, documents: list[dict], scenarios) -> dict:
     """What one round of these scenarios measured: decode samples per width,
-    partial and transcript requests per scenario and short requests per first
+    partial and transcript requests per scenario and short requests per
     chunk, with the identity and memory plan each load reported."""
     decode = {width: [] for width in WIDTHS}
     partial = {scenario: [] for scenario in PARTIAL}
