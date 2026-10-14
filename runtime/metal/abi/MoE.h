@@ -84,7 +84,8 @@ static_assert(sizeof(MoeGatherParams) == 12,
 // has a segment of its own. Formats are GGUF_FMT_* (metal/abi/QuantFormat.h).
 // With `in_place` (MoeGroupParams::in_place), the staged expert kernels read
 // every tile's rows from the plan's rows instead of its grouped rows; the
-// register expert kernels, which no such plan runs, leave it unread.
+// register and live-row expert kernels, which no such plan runs, leave it
+// unread.
 struct MoeGgufExpertParams {
   uint32_t input_size;
   uint32_t output_size; // per expert
