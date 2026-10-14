@@ -15,7 +15,7 @@ from dataclasses import dataclass, fields
 from enum import IntEnum, IntFlag
 from typing import TypeAlias
 
-PROTOCOL_VERSION = 10
+PROTOCOL_VERSION = 11
 # A frame is its header, the magic, the protocol version, the frame type and
 # the payload length, then the payload.
 FRAME_HEADER_BYTES = 16
@@ -27,6 +27,9 @@ MIN_SCORE_TOKENS = 2
 MAX_SCORE_TOKENS = 255
 # A thinking budget's end holds 1 to this many tokens.
 MAX_THINKING_END_TOKENS = 64
+# A score DoneEvent also carries the final position's log-sum-exp over the
+# whole vocabulary and its highest logits, at most this many.
+SCORE_TOP_TOKENS = 20
 # Patches per image, the most the vision encoder takes; the server's pixel
 # cap may allow fewer.
 MAX_IMAGE_PATCHES = 16384
@@ -386,6 +389,11 @@ class DoneEvent:
     drafted_tokens: int = 0
     accepted_draft_tokens: int = 0
     draft_cycles: int = 0
+    # With option_logits only: log(sum(exp(logit))) over the whole vocabulary
+    # and the highest logits (ids and values, descending).
+    log_normalizer: float = 0.0
+    top_token_ids: tuple[int, ...] = ()
+    top_logits: tuple[float, ...] = ()
 
 
 @dataclass(slots=True, frozen=True)
@@ -575,7 +583,10 @@ def _payload_bounds(frame_type: FrameType) -> tuple[int, int]:
                 _MASK_REQUEST.size + MAX_SIMULATION_TOKENS * 4,
             )
         case FrameType.DONE:
-            bounds = (_DONE.size, _DONE.size + MAX_SCORE_TOKENS * 4)
+            bounds = (
+                _DONE.size,
+                _DONE.size + MAX_SCORE_TOKENS * 4 + 12 + SCORE_TOP_TOKENS * 8,
+            )
         case FrameType.ERROR:
             bounds = (_ERROR.size, _ERROR.size + MAX_ERROR_STRING_BYTES * 2)
         case FrameType.STATUS_JSON:
@@ -690,8 +701,6 @@ def _validated_request(
         generation = _u32(request.generation_prompt_tokens, "generation prompt tokens")
         if generation >= len(prompt):
             raise ValueError("generation prompt must leave a prompt token")
-        if scores and (request.image_spans or request.image_pixels):
-            raise ValueError("score requests are text-only")
         if scores and (
             len(scores) < MIN_SCORE_TOKENS
             or len(scores) > MAX_SCORE_TOKENS
@@ -1084,9 +1093,59 @@ def _decode_event(frame: Frame) -> EngineEvent:
             cycles,
             logit_count,
         ) = _DONE.unpack_from(payload)
-        logits = _tail(
-            payload, _DONE.size, logit_count, "f", "option logit", request_id
-        )
+        normalizer, top_ids, top_logits = 0.0, (), ()
+        if not logit_count:
+            logits = _tail(
+                payload, _DONE.size, logit_count, "f", "option logit", request_id
+            )
+        else:
+            # Option logits, then the f64 normalizer, the top count, the top
+            # ids and their logits.
+            end = _DONE.size + 4 * logit_count
+            if logit_count > MAX_SCORE_TOKENS:
+                _fatal(
+                    IssueCode.FRAME_TOO_LARGE,
+                    "done option logit count exceeds its limit",
+                    request_id,
+                )
+            if len(payload) < end + 12:
+                _fatal(
+                    IssueCode.INVALID_PAYLOAD_LENGTH,
+                    "option logit count does not match the binary event payload",
+                    request_id,
+                )
+            logits = _tail(
+                payload[:end], _DONE.size, logit_count, "f", "option logit", request_id
+            )
+            normalizer, top_count = struct.unpack_from("<dI", payload, end)
+            if top_count > SCORE_TOP_TOKENS or len(payload) != end + 12 + 8 * top_count:
+                _fatal(
+                    IssueCode.INVALID_PAYLOAD_LENGTH,
+                    "score readout does not match the binary event payload",
+                    request_id,
+                )
+            top_ids = _tail(
+                payload[: end + 12 + 4 * top_count],
+                end + 12,
+                top_count,
+                "I",
+                "top token",
+                request_id,
+            )
+            top_logits = _tail(
+                payload,
+                end + 12 + 4 * top_count,
+                top_count,
+                "f",
+                "top logit",
+                request_id,
+            )
+            if not math.isfinite(normalizer) or not all(map(math.isfinite, top_logits)):
+                _fatal(
+                    IssueCode.INVALID_COUNT,
+                    "score normalizer and top logits must be finite",
+                    request_id,
+                )
         try:
             reason = FinishReason(reason)
         except ValueError:
@@ -1100,7 +1159,17 @@ def _decode_event(frame: Frame) -> EngineEvent:
                 IssueCode.INVALID_REQUEST_ID, "done event request id must be non-zero"
             )
         event = DoneEvent(
-            request_id, reason, *counts, logits, deduplicated, drafted, accepted, cycles
+            request_id,
+            reason,
+            *counts,
+            logits,
+            deduplicated,
+            drafted,
+            accepted,
+            cycles,
+            normalizer,
+            top_ids,
+            top_logits,
         )
         # Each cycle verified at least one drafted token and accepted at most all.
         if accepted > drafted or cycles > drafted or (drafted and not cycles):

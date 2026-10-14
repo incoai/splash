@@ -535,7 +535,8 @@ void NativeRuntime::completed(uint64_t requestId, EngineFinishReason reason,
                               uint32_t promptTokens, uint32_t completionTokens,
                               uint32_t deduplicatedTokens,
                               std::span<const float> optionLogits,
-                              const SpeculativeCounts &speculation) {
+                              const SpeculativeCounts &speculation,
+                              const ScoreReadout &score) {
   RequestTelemetry &telemetry = telemetry_.at(requestId);
   double now = config_.monotonicMilliseconds();
   // A request that ends before it starts counts from its arrival.
@@ -548,7 +549,10 @@ void NativeRuntime::completed(uint64_t requestId, EngineFinishReason reason,
       telemetry.firstTokenMilliseconds ? durationMicros(first, now) : 0,
       durationMicros(telemetry.arrivedMilliseconds, now),
       std::vector<float>(optionLogits.begin(), optionLogits.end()),
-      deduplicatedTokens, speculation});
+      deduplicatedTokens, speculation,
+      optionLogits.empty() ? 0.0 : score.logNormalizer,
+      optionLogits.empty() ? std::vector<uint32_t>{} : score.topIds,
+      optionLogits.empty() ? std::vector<float>{} : score.topLogits});
   ended(requestId, now);
 }
 
