@@ -346,10 +346,33 @@ def normalize_responses_input(instructions, items):
                     "function": {"name": name, "arguments": arguments},
                 }
             )
-        elif kind == "function_call_output":
+        elif kind == "custom_tool_call":
+            call_id, name, value = (
+                item.get("call_id"),
+                item.get("name"),
+                item.get("input"),
+            )
+            if not all(isinstance(value, str) and value for value in (call_id, name)):
+                raise APIError(400, "custom_tool_call requires call_id and name")
+            if not isinstance(value, str):
+                raise APIError(400, "custom_tool_call input must be a string")
+            # The call as the function the model made it (_custom_function).
+            assistant().setdefault("tool_calls", []).append(
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(
+                            {CUSTOM_INPUT: value}, ensure_ascii=False
+                        ),
+                    },
+                }
+            )
+        elif kind in ("function_call_output", "custom_tool_call_output"):
             call_id, output = item.get("call_id"), item.get("output")
             if not isinstance(call_id, str) or not call_id:
-                raise APIError(400, "function_call_output requires call_id")
+                raise APIError(400, f"{kind} requires call_id")
             output = output.get("content") if isinstance(output, dict) else output
             flush()
             messages.append(
@@ -362,8 +385,9 @@ def normalize_responses_input(instructions, items):
         else:
             raise APIError(
                 400,
-                "only message, reasoning, function_call, and "
-                "function_call_output input items are supported",
+                "only message, reasoning, function_call, function_call_output, "
+                "custom_tool_call and custom_tool_call_output input items are "
+                "supported",
             )
     flush()
     return messages
@@ -376,6 +400,13 @@ def canonical_responses_input(items):
     if not isinstance(items, list):
         raise APIError(400, "input must be a non-empty string or array")
     return items
+
+
+# A custom (freeform) Responses tool is the function of one string parameter
+# the model calls (_custom_function); the request's tool names map it to
+# CUSTOM_TOOL, where a namespaced function's alias maps to its namespace.
+CUSTOM_TOOL = None
+CUSTOM_INPUT = "input"
 
 
 def _namespace_alias(namespace, name):
@@ -399,11 +430,66 @@ def _response_function(tool, name=None):
     return {"type": "function", "function": function}
 
 
+def _custom_function(tool):
+    """A custom tool as the function the model calls: one string, its input,
+    which the tool's format, a grammar or plain text, describes. Its calls
+    return as custom_tool_call items (responses_item)."""
+    name = tool.get("name")
+    if not is_tag_name(name):
+        raise APIError(400, f"custom tool name must be {TAG_NAME_RULE}")
+    description = tool.get("description", "")
+    if not isinstance(description, str):
+        raise APIError(400, f"custom tool {name} description must be a string")
+    form = tool.get("format")
+    if form is None:
+        form = {"type": "text"}
+    if not isinstance(form, dict) or form.get("type") not in ("text", "grammar"):
+        raise APIError(400, f"custom tool {name} format must be text or a grammar")
+    explained = "The tool's input, as raw text."
+    if form["type"] == "grammar":
+        syntax, definition = form.get("syntax"), form.get("definition")
+        if not isinstance(syntax, str) or not isinstance(definition, str):
+            raise APIError(
+                400, f"custom tool {name} grammar needs syntax and definition"
+            )
+        explained = (
+            "The tool's input, as raw text that this "
+            f"{syntax} grammar accepts:\n{definition}"
+        )
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    CUSTOM_INPUT: {"type": "string", "description": explained}
+                },
+                "required": [CUSTOM_INPUT],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
 def normalize_responses_tools(tools):
+    """The Chat function tools of a Responses request's tools, and how the
+    request names each one the model sees under another name or shape: a
+    namespaced function's alias maps to its namespace and name, and a custom
+    tool's name to CUSTOM_TOOL and that name."""
     if not isinstance(tools, list):
         raise APIError(400, "tools must be an array")
     output, namespaces = [], {}
     for tool in tools:
+        if isinstance(tool, dict) and tool.get("type") == "custom":
+            function = _custom_function(tool)
+            name = function["function"]["name"]
+            if name in namespaces:
+                raise APIError(400, f"duplicate tool name: {name}")
+            namespaces[name] = (CUSTOM_TOOL, name)
+            output.append(function)
+            continue
         if isinstance(tool, dict) and tool.get("type") == "namespace":
             namespace, children = tool.get("name"), tool.get("tools")
             if not isinstance(children, list):
@@ -420,7 +506,9 @@ def normalize_responses_tools(tools):
             continue
         if not isinstance(tool, dict) or tool.get("type") != "function":
             kind = tool.get("type") if isinstance(tool, dict) else type(tool).__name__
-            raise APIError(400, f"only function tools are supported, not {kind!r}")
+            raise APIError(
+                400, f"only function and custom tools are supported, not {kind!r}"
+            )
         output.append(_response_function(tool))
     return output or None, namespaces
 
@@ -470,11 +558,16 @@ def responses_to_chat_body(body, items):
         chat["tools"], namespaces = normalize_responses_tools(body["tools"])
     choice = body.get("tool_choice")
     if isinstance(choice, dict):
-        if choice.get("type") != "function" or not isinstance(choice.get("name"), str):
+        if choice.get("type") not in ("function", "custom") or not isinstance(
+            choice.get("name"), str
+        ):
             raise APIError(400, "invalid named tool_choice")
         name = choice["name"]
         namespace = choice.get("namespace")
-        if namespace is not None:
+        if choice["type"] == "custom":
+            if namespace is not None or namespaces.get(name) != (CUSTOM_TOOL, name):
+                raise APIError(400, "invalid named tool_choice")
+        elif namespace is not None:
             name = _namespace_alias(namespace, name)
             if namespaces.get(name) != (namespace, choice["name"]):
                 raise APIError(400, "invalid named tool_choice")
@@ -1034,7 +1127,9 @@ def responses_response(model, job, status, output, result=None, error=None):
         "usage": usage,
         "end_turn": result is not None
         and result.reason == "stop"
-        and not any(item["type"] == "function_call" for item in output),
+        and not any(
+            item["type"] in ("function_call", "custom_tool_call") for item in output
+        ),
     }
 
 
@@ -1147,7 +1242,12 @@ def text_completion_chunk(
     )
 
 
-_RESPONSES_ITEM_PREFIXES = {"reasoning": "rs", "text": "msg", "tool": "fc"}
+_RESPONSES_ITEM_PREFIXES = {
+    "reasoning": "rs",
+    "text": "msg",
+    "tool": "fc",
+    "custom": "ctc",
+}
 
 
 def responses_item_id(job, kind, index):
@@ -1155,12 +1255,48 @@ def responses_item_id(job, kind, index):
     return f"{_RESPONSES_ITEM_PREFIXES[kind]}_{job.public_id}_{index}"
 
 
+def is_custom_call(job, block):
+    """Whether `block` calls one of the request's custom tools."""
+    policy = job.tool_policy
+    return (
+        block.kind == "tool"
+        and policy is not None
+        and policy.namespaces.get(block.name) == (CUSTOM_TOOL, block.name)
+    )
+
+
+def custom_input(arguments):
+    """A custom tool's input from the arguments of the function the model
+    called: its one string, or the arguments as written when they are cut
+    short or hold anything else."""
+    try:
+        value = json_codec.loads(arguments)
+    except ValueError:
+        return arguments
+    if isinstance(value, dict):
+        strings = [item for item in value.values() if isinstance(item, str)]
+        if isinstance(value.get(CUSTOM_INPUT), str):
+            return value[CUSTOM_INPUT]
+        if len(value) == 1 and strings:
+            return strings[0]
+    return arguments
+
+
 def responses_item(job, block, index):
     """The Responses output item of `block` at `index`. An item in progress
     carries no text or arguments yet."""
-    item_id = responses_item_id(job, block.kind, index)
     status = block.status
     text = "" if status == "in_progress" else block.text
+    if is_custom_call(job, block):
+        return {
+            "id": responses_item_id(job, "custom", index),
+            "type": "custom_tool_call",
+            "status": status,
+            "call_id": block.call_id,
+            "name": block.name,
+            "input": custom_input(text) if text else "",
+        }
+    item_id = responses_item_id(job, block.kind, index)
     if block.kind == "reasoning":
         return {
             "id": item_id,
