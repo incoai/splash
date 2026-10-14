@@ -64,6 +64,7 @@ SERVER_FILES = (
     "document_worker.py",
     "http_security.py",
     "connections.py",
+    "upstream.py",
     "origins.py",
     "serve_options.py",
     "thinking.py",
