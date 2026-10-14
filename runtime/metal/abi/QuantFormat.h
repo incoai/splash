@@ -226,7 +226,19 @@ inline constexpr uint32_t quant_affine_format_of(uint32_t bits, uint32_t group) 
 // The chunk order slot of element e (0..31) of a group.
 inline constexpr uint32_t quant_slot(uint32_t e) { return 8 * ((e >> 2) & 3) + 4 * (e >> 4) + (e & 3); }
 
-#define QUANT_TILE_ROWS 256u
+// A plane tile holds one GGUF_TILE_COLUMNS column tile of every kernel, so
+// any projection or expert of a multiple of 64 rows starts on a tile.
+#define QUANT_TILE_ROWS 64u
+
+// The columns a [N, K] tensor of format f is a multiple of: one 64-input span
+// of the activation tables for formats of one group per meta unit, else a
+// whole 256-input superblock. The register decode tiles (linear_gguf_sgmatrix)
+// decode the coefficients of four spans together for formats of several
+// groups per meta unit, so PQ2_0's 128-input blocks and the MLX affine
+// formats' groups of 64 and 128 take 256 columns too.
+inline constexpr uint32_t quant_column_unit(uint32_t block_elements) {
+  return block_elements > 32 ? 256 : 64;
+}
 
 // Index of (row, block) in a [rows / T][blocks][T] plane (blocks = G) or meta
 // plane (blocks = meta units per row).

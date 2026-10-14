@@ -9,30 +9,48 @@
 #include <cstddef>
 #include <limits>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 namespace splash::ops {
 namespace {
 
+// The output head order and gate of GDNGatePrefillParams::tiled_heads.
+uint32_t headFlags(GdnShape shape, GdnHeadOrder order) noexcept {
+  return (order == GdnHeadOrder::Tiled ? 1u : 0u) | (shape.sigmoidGate ? GDN_SIGMOID_GATE : 0u);
+}
+
 static_assert(offsetof(GDNDecodeBatchParams, conv_layer_bytes) == 8);
 
-enum class KernelLayout : uint8_t { Value48, Value32 };
+// Value48P16512: Qwen3.8-Flash-Next's 48 value heads, whose packed rows are
+// 16512 columns wide.
+enum class KernelLayout : uint8_t { Value48, Value32, Value48P16512 };
 
 [[nodiscard]] KernelLayout kernelShape(const GdnShape &shape) {
   if (!shape.valid())
     throw std::invalid_argument("invalid GDN shape");
-  if (shape == GdnShape{16, 48, 128, 10240, 16640})
+  GdnShape heads = shape;
+  heads.sigmoidGate = false;
+  if (heads == GdnShape{16, 48, 128, 10240, 16640})
     return KernelLayout::Value48;
-  if (shape == GdnShape{16, 32, 128, 8192, 12544})
+  if (heads == GdnShape{16, 32, 128, 8192, 12544})
     return KernelLayout::Value32;
+  if (heads == GdnShape{16, 48, 128, 10240, 16512})
+    return KernelLayout::Value48P16512;
   throw std::invalid_argument("unsupported compiled GDN shape");
 }
 
-[[nodiscard]] const char *kernelName(KernelLayout shape,
-                                     const char *value48,
-                                     const char *value32) noexcept {
-  return shape == KernelLayout::Value48 ? value48 : value32;
+// A kernel's variant: the scan reads no packed rows, so all 48-head layouts
+// share it (`packed` false).
+[[nodiscard]] std::string kernelName(KernelLayout shape, std::string_view value48,
+                                     std::string_view value32, bool packed = true) {
+  if (shape == KernelLayout::Value32)
+    return std::string(value32);
+  if (shape == KernelLayout::Value48P16512 && packed)
+    return std::string(value48) + "_p16512";
+  return std::string(value48);
 }
 
 uint64_t valueWidth(const GdnShape &shape) { return uint64_t{shape.valueHeads} * shape.headDimension; }
@@ -129,7 +147,8 @@ void GDN::addPrefill(metal::CommandGraph &graph, const metal::MetalBackend &back
     requireBytes(capture.recurrent, recurrentBytes(shape, state), "GDN captured recurrent state");
   }
   const std::string prepare = kernelName(kernel, "prefill_gdn_prepare", "prefill_gdn_prepare_vh32");
-  const std::string scan = stateKernel(kernelName(kernel, "prefill_gdn_scan", "prefill_gdn_scan_vh32"), state);
+  const std::string scan =
+      stateKernel(kernelName(kernel, "prefill_gdn_scan", "prefill_gdn_scan_vh32", false), state);
   metal::MetalBuffer convolution = buffers.convolutionIn;
   metal::MetalBuffer recurrent = buffers.recurrentIn;
   uint32_t begin = 0;
@@ -164,7 +183,7 @@ void GDN::addPrefill(metal::CommandGraph &graph, const metal::MetalBackend &back
     begin = end;
   }
   graph.add(gate, {buffers.recurrentRows, buffers.packed, buffers.mixerNorm.buffer, buffers.hidden},
-            GDNGatePrefillParams{order == GdnHeadOrder::Tiled}, {uint64_t{tokens} * shape.valueHeads, 1, 1},
+            GDNGatePrefillParams{headFlags(shape, order)}, {uint64_t{tokens} * shape.valueHeads, 1, 1},
             {128, 1, 1});
 }
 
@@ -179,7 +198,7 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
   requireBytes(buffers.packed, packedBytes(shape, rows), "GDN packed");
   requireMixerWeights(shape, buffers.convolutionWeights, buffers.decayWeights, buffers.timeBias);
   requireBytes(buffers.hidden, rows * valueWidth(shape) * 2, "GDN hidden");
-  GDNDecodeBatchParams params{order == GdnHeadOrder::Tiled,
+  GDNDecodeBatchParams params{headFlags(shape, order),
                               layer,
                               state.convolutionLayerBytes,
                               state.recurrentLayerBytes,

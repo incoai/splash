@@ -17,7 +17,8 @@ The paths an assembly links, and what reads each:
                          which a release check runs on this installation
   target/<shard>         the MLX safetensors shards except those holding only
                          vision_tower.* (SafetensorsCheckpoint.mm)
-  target/<name>.gguf     the GGUF target (GgufTarget.cpp findTargetGguf)
+  target/<name>.gguf     the GGUF target, or the parts of a split one
+                         (GgufTarget.cpp findTargetGgufs)
   tokenizer/config.json  the same configuration again, from which the
                          server's AutoTokenizer.from_pretrained chooses the
                          tokenizer class
@@ -26,10 +27,13 @@ The paths an assembly links, and what reads each:
                          from the GGUF (server.py --tokenizer)
   draft/config.json, draft/<name>.safetensors
                          the DFlash2 checkpoint (ModelDescriptor.mm,
-                         DraftCheckpoint.cpp)
+                         DraftCheckpoint.cpp); none for a family without one
   vision/<shard>         the MLX shards holding vision_tower.*
                          (VisionLoader.cpp, through SafetensorsCheckpoint.mm)
   vision/mmproj.gguf     the GGUF vision projector (VisionLoader.cpp)
+  mtp/<name>.gguf        Qwen3.8-Flash-Next's MTP head (GgufTarget.cpp
+                         GgufMtpLoader), which drafts in place of a DFlash2
+                         checkpoint
 """
 
 from __future__ import annotations
@@ -180,7 +184,7 @@ def _well_formed(record):
         and record["vision_format"] in VISION_FORMATS
         and (not gguf_target or models.is_hex_digest(record["metadata"], 64))
         and isinstance(sources, dict)
-        and set(sources) == {"target", "draft"}
+        and set(sources) in ({"target"}, {"target", "draft"})
         and all(
             isinstance(source, dict)
             and set(source) == {"repo", "revision"}
@@ -275,12 +279,16 @@ def derived_metadata(models_root: Path, files):
     """The key and the files, by assembly path, of the metadata derived from
     the GGUF files among files (assembly path -> source file): derived once,
     and again when its entry is damaged. Call it under the installation lock."""
-    inputs = [files[name] for name in _metadata_inputs(files)]
+    names = _metadata_inputs(files)
+    inputs = [files[name] for name in names]
     sources = [file_record(path) for path in inputs]
     key = _metadata_key(sources)
+    # A split target's metadata is its first file's (split order is name
+    # order); the vision projector comes last.
+    derive = [inputs[0]] + ([files[GGUF_VISION]] if GGUF_VISION in files else [])
 
     def write(stage):
-        contents = gguf.derived_files(*inputs)
+        contents = gguf.derived_files(*derive)
         if [file_record(path) for path in inputs] != sources:
             raise models.ModelError("GGUF source changed while reading metadata")
         for name, data in contents.items():
