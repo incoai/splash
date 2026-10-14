@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -80,7 +81,8 @@ def _projector_named(name):
 
 
 def select_gguf(files, variant):
-    """The target GGUF among a repository's root files, and whether it was
+    """The target GGUF among a repository's root files, as the list of its
+    files (one, or a split GGUF's parts, split_gguf), and whether it was
     taken by its -VARIANT ending from several, which the caller reports.
     :VARIANT names the file whose name is the model name all of them share,
     then -VARIANT (X-Q4_K_M for Q4_K_M, not X-UD-Q4_K_M); failing that, the
@@ -91,7 +93,7 @@ def select_gguf(files, variant):
     candidates = [n for n in _root_ggufs(files) if not _projector_named(n)]
     if variant is None:
         if len(candidates) == 1:
-            return candidates[0], False
+            return [candidates[0]], False
         choice = "select a GGUF with OWNER/REPO:VARIANT"
     else:
         parts = [Path(name).stem.split("-") for name in candidates]
@@ -102,14 +104,64 @@ def select_gguf(files, variant):
             if "-".join(words[shared:]).lower() == variant.lower()
         ]
         if len(exact) == 1:
-            return exact[0], False
+            return [exact[0]], False
         suffix = "-" + variant.lower()
         ending = [n for n in candidates if Path(n).stem.lower().endswith(suffix)]
         if len(ending) == 1:
-            return ending[0], len(candidates) > 1
+            return [ending[0]], len(candidates) > 1
         choice = "no single GGUF matches :" + variant
+        if split := split_gguf(files, variant):
+            return split, False
     listed = ", ".join(candidates) or "none"
     raise models.ModelError(f"{choice} (files in the repository root: {listed})")
+
+
+SPLIT_NAME = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$")
+
+
+def split_gguf(files, variant):
+    """The split files of a target GGUF that a repository keeps in a folder
+    named after its variant, as Unsloth publishes the files too large for
+    one (VARIANT/MODEL-VARIANT-00001-of-0000N.gguf ...), in split order; None
+    when there is no such folder. Every part from 1 to N must be present."""
+    prefix = variant.lower() + "/"
+    names = [
+        n
+        for n in files
+        if n.lower().startswith(prefix)
+        and n.count("/") == 1
+        and n.endswith(".gguf")
+        and not _projector_named(n)
+    ]
+    if not names:
+        return None
+    parts = {}
+    for name in names:
+        match = SPLIT_NAME.search(name)
+        if not match:
+            raise models.ModelError(
+                f"{name} is not one part of a split GGUF (NAME-0000K-of-0000N.gguf)"
+            )
+        parts[int(match.group(1))] = (int(match.group(2)), name)
+    counts = {count for count, _ in parts.values()}
+    if len(counts) != 1 or sorted(parts) != list(range(1, counts.pop() + 1)):
+        raise models.ModelError(
+            f"the split GGUF in {variant}/ is incomplete: " + ", ".join(sorted(names))
+        )
+    return [parts[number][1] for number in sorted(parts)]
+
+
+MTP_HEAD = re.compile(r"^mtp/mtp-.*-shared-q8_0\.gguf$", re.IGNORECASE)
+
+
+def select_mtp(files):
+    """The MTP head a GGUF repository publishes beside its target, as
+    Unsloth does Qwen3.8-Flash-Next's (MTP/mtp-MODEL-shared-Q8_0.gguf: the
+    head's own block, sharing the target's embedding and output): its name,
+    or None without exactly one. The shared Q8_0 head is the one the native
+    loader reads (GgufTarget.cpp GgufMtpLoader)."""
+    heads = sorted(n for n in files if MTP_HEAD.match(n))
+    return heads[0] if len(heads) == 1 else None
 
 
 def select_vision(repo):
@@ -185,22 +237,35 @@ def inspect_target(repo, variant, language_only, scratch):
 
 
 def _gguf_target(repo, variant, language_only, scratch):
-    name, by_ending = select_gguf(repo.files, variant)
+    names, by_ending = select_gguf(repo.files, variant)
+    name = names[0] if len(names) == 1 else f"{len(names)} split files {names[0]} ..."
     if by_ending:
         print(
             f"No GGUF is named for :{variant} alone; using {name}, the only one "
             f"whose name ends in -{variant}.",
             flush=True,
         )
-    with repo.open(name) as stream:
-        header = gguf.Metadata(stream, tensors=True)
-    files = {"target/" + name: name}
+    headers = []
+    for part in names:
+        with repo.open(part) as stream:
+            headers.append(gguf.Metadata(stream, tensors=True))
+    header = gguf.merged_split(headers)
+    # A split GGUF's parts lie side by side in target/, where the native
+    # loader finds them by their -0000K-of-0000N names.
+    files = {"target/" + Path(part).name: part for part in names}
     config, metadata = scratch / "config.json", scratch / "gguf-metadata.json"
     config.write_bytes(models.json_bytes(gguf.model_config(header)))
     metadata.write_bytes(models.json_bytes(gguf.scalar_metadata(header)))
     # The family bounds the layers whose tensors the screening lists.
     family = check_model("gguf", "none", config, gguf_metadata=metadata)
     gguf.require_loadable(header)
+    # Qwen3.8-Flash-Next drafts with its MTP head, which mtp/ holds
+    # (ModelDescriptor.mm, ModelFactory.cpp).
+    if header.values.get("general.architecture") == "qwen4exp" and (
+        mtp := select_mtp(repo.files)
+    ):
+        files["mtp/" + Path(mtp).name] = mtp
+        print(f"Selected the MTP head {mtp}.", flush=True)
     vision_format = "none"
     if not language_only:
         files[assembly.GGUF_VISION], vision_header = select_vision(repo)
@@ -389,7 +454,11 @@ def _start_installed(selection, target, installed):
         )
     recorded = installed["sources"]["target"]
     family = families.named(installed["family"])
-    draft = family and _resolve_draft(family, selection, installed, target)
+    draft = (
+        family
+        and family.draft_repo
+        and _resolve_draft(family, selection, installed, target)
+    )
     if draft and draft.unreachable_reason:
         print(
             f"Could not reach the Hub ({draft.unreachable_reason}); "
@@ -482,12 +551,20 @@ def _install(selection, repo, installed, draft=None):
         target = inspect_target(
             repo, selection.variant, selection.language_only, Path(scratch)
         )
-        if draft is None:
-            draft = _resolve_draft(target.family, selection, installed, repo)
-        draft, files = _draft(target, installed, draft)
+        if target.family.draft_repo is None:
+            if selection.draft_model:
+                raise models.ModelError(
+                    f"{target.family.name} decodes without a DFlash2 draft; "
+                    "--draft-model does not apply to it"
+                )
+            draft, files = None, {}
+        else:
+            if draft is None:
+                draft = _resolve_draft(target.family, selection, installed, repo)
+            draft, files = _draft(target, installed, draft)
         print(
             f"Installing {selection.model} as {target.family.name} ({target.format}); "
-            f"draft {draft.name}; "
+            f"draft {draft.name if draft else 'none'}; "
             f"vision {'disabled' if selection.language_only else 'enabled'}.",
             flush=True,
         )
@@ -499,7 +576,8 @@ def _install(selection, repo, installed, draft=None):
         "family": target.family.name,
         "target_format": target.format,
         "vision_format": target.vision_format,
-        "sources": {"target": repo.identity(), "draft": draft.identity()},
+        "sources": {"target": repo.identity()}
+        | ({"draft": draft.identity()} if draft else {}),
     }
     models_root = selection.models_root
     models_root.mkdir(parents=True, exist_ok=True)
@@ -537,8 +615,10 @@ def _changes(installed, family, draft):
     if family is None:
         return [f"no supported family is named {installed['family']}"]
     changes = []
-    recorded = installed["sources"]["draft"]
-    if draft.identity() != recorded:
+    recorded = installed["sources"].get("draft")
+    if (draft is None) != (recorded is None):
+        changes.append("its draft changed")
+    elif draft is not None and draft.identity() != recorded:
         changes.append(
             f"{draft.name} moved from {recorded['revision'][:12]} to {draft.revision[:12]}"
             if draft.name == recorded["repo"]
@@ -559,7 +639,7 @@ def _resolve_draft(family, selection, installed, target):
     cache holds for this selection; the installed draft also stands in, with
     the reason, when the draft cannot be resolved."""
     name = selection.draft_model or family.draft_repo
-    recorded = installed and installed["sources"]["draft"]
+    recorded = installed and installed["sources"].get("draft")
     asked = _answered(target)
     if recorded and not asked:
         return hub.Repository(recorded["repo"], recorded["revision"], frozenset())
@@ -590,7 +670,7 @@ def _draft(target, installed, draft):
     the installed one, which is kept too when draft cannot be fetched
     (downloaded and checked for the target)."""
     family = target.family
-    recorded = installed and installed["sources"]["draft"]
+    recorded = installed and installed["sources"].get("draft")
     if draft.identity() != recorded:
         try:
             with hub.as_model_errors(f"cannot fetch the {family.name} draft"):

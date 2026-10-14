@@ -1241,12 +1241,16 @@ bool ringsAreClear(const model::QwenStateStorage &states, uint32_t lane) {
 // or not, and a constrained prompt's last chunk among them, its last row is
 // not finite. The failed lanes emit nothing and the backend stays healthy. The
 // GDN cells they return to the pool are cleared or overwritten before a lane
-// reads them again, and their draft rings, where the failed cycle left rows
-// that are not finite, come back cleared.
+// reads them again, and their draft rings, where the failed cycle of a
+// DFlash2 draft left rows that are not finite, come back cleared. A target
+// without a draft (`hasDraft` false, model::nullDraftLayout) writes no rings:
+// its MTP head keeps its keys and values in the pages, which come cleared as
+// the target's do, and its carried streams in the GDN cell.
 void requireNonFiniteRowFailsOnlyItsLane(model::Runtime &executor,
                                          kv::PageStorage &pages,
                                          const model::QwenStateStorage &states,
                                          const metal::MetalBackend &backend,
+                                         bool hasDraft,
                                          std::span<const uint32_t> chat,
                                          std::span<const uint32_t> prompt) {
   // The chat ends where the assistant starts reasoning, so a greedy lane does
@@ -1288,8 +1292,11 @@ void requireNonFiniteRowFailsOnlyItsLane(model::Runtime &executor,
   require(decoded[1].failure.empty() && !decoded[1].outputTokens.empty() &&
               !decoded[1].finished && inVocabulary(decoded[1]),
           "a non-finite lane disturbed its healthy neighbour");
-  require(ringsHoldNonFinite(states, 0),
-          "the failed decode left no row that is not finite in its draft rings");
+  if (hasDraft)
+    require(ringsHoldNonFinite(states, 0),
+            "the failed decode left no row that is not finite in its draft rings");
+  else
+    require(ringsAreClear(states, 0), "a target without a draft wrote its draft rings");
   executor.end(201);
   // The next start takes the rings the failed lane returned last.
   beginCold(executor, makeRequest(210, prompt40, 16), 0);
@@ -2629,7 +2636,7 @@ int main(int argc, char **argv) {
               "decode request has no current anchor", "score request allowed a decode step");
       executor.end(99);
     }
-    requireNonFiniteRowFailsOnlyItsLane(executor, pages, states, backend,
+    requireNonFiniteRowFailsOnlyItsLane(executor, pages, states, backend, model.hasDraft(),
                                         samplingSeedTokens, prompt128);
     requireThinkingBudgetClosesThinking(executor);
     requireConstrainedThinkingEndWaitsForItsMask(executor);
