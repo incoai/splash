@@ -578,8 +578,6 @@ def anthropic_to_chat_body(body, *, thinking_resolver):
     if not isinstance(body.get("stream", False), bool):
         raise APIError(400, "stream must be a boolean")
     chat, thinking_display = _anthropic_chat(body, thinking_resolver)
-    if chat.get("thinking_token_budget", 0) >= max_tokens:
-        raise APIError(400, "thinking.budget_tokens must be less than max_tokens")
     # Anthropic continues a final assistant message (a prefill); Splash would
     # close that turn and start another, so it refuses it.
     if chat["messages"] and chat["messages"][-1]["role"] == "assistant":
@@ -655,7 +653,8 @@ def _anthropic_thinking(thinking, effort):
 
 def _anthropic_thinking_budget(thinking):
     """The budget_tokens of enabled thinking, which caps it: at least 1024,
-    as Messages requires. Adaptive thinking sets none."""
+    as Messages requires. One at or above max_tokens, which Messages allows
+    with interleaved thinking, caps nothing. Adaptive thinking sets none."""
     if not isinstance(thinking, dict) or thinking.get("type") != "enabled":
         return None
     budget = thinking.get("budget_tokens")

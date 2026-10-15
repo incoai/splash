@@ -1,14 +1,13 @@
 #pragma once
 
 #include "metal/MetalBackend.hpp"
+#include "metal/abi/QuantFormat.h"
 
 #include <compare>
 #include <cstdint>
 #include <stdexcept>
 #include <utility>
 #include <vector>
-
-struct QuantFormat;
 
 namespace splash::ops {
 
@@ -18,6 +17,10 @@ struct ProjectionShape final {
   // Its quantized segments multiply the rotated input (InputRotation), which
   // takes LinearScratch::rotated.
   bool rotated = false;
+  // Its quantized segments are all in formats the Apple9 register tile takes
+  // (quant_register_format); a projection with one in another format stages
+  // whatever its rows (Linear::decodeStorageRows).
+  bool registerFormats = true;
   auto operator<=>(const ProjectionShape &) const = default;
 };
 
@@ -98,7 +101,10 @@ public:
 
   [[nodiscard]] const BlockWeights &blocks() const noexcept { return weights_; }
   [[nodiscard]] ProjectionShape shape() const noexcept {
-    return {outputSize, inputSize, static_cast<bool>(rotation)};
+    bool registerFormats = true;
+    for (const QuantizedSegment &s : weights_.segments)
+      registerFormats &= s.isFloat() || quant_register_format(s.formatId);
+    return {outputSize, inputSize, static_cast<bool>(rotation), registerFormats};
   }
 
   // Views of a projection of one unrotated quantized tensor (Linear.cpp):
@@ -130,24 +136,17 @@ private:
 };
 
 // A token table's rows as stored, gathered, never multiplied (Embedding.cpp):
-// native blocks of a gguf_embedding_format (metal/abi/Gguf.h), or bf16
-// values, which a safetensors checkpoint may keep unquantized. A default value
-// holds no rows, which a reader replaces.
+// native blocks of a gguf_embedding_format (metal/abi/Gguf.h), BF16 and F16
+// values among them, which a GGUF or a safetensors checkpoint may keep
+// unquantized. A default value holds no rows, which a reader replaces.
 struct NativeRows final {
-  // The formatId of bf16 rows, which no kQuantFormats entry describes.
-  static constexpr uint32_t kBfloat16 = 0xffffffff;
-
   NativeRows() = default;
-  // Rows of a gguf_embedding_format or kBfloat16; throws for any other formatId.
+  // Rows of a gguf_embedding_format; throws for any other formatId.
   NativeRows(metal::MetalBuffer rows, uint32_t formatId);
   metal::MetalBuffer rows;
   uint32_t formatId = 0;
-  [[nodiscard]] bool isBfloat16() const noexcept { return formatId == kBfloat16; }
-  // The kernel name suffix of its format ("bf16" for bf16 rows).
-  [[nodiscard]] const char *name() const noexcept;
-  // The elements and bytes of one block: its format's native block, or one bf16 value.
-  [[nodiscard]] uint32_t blockElements() const noexcept;
-  [[nodiscard]] uint32_t blockBytes() const noexcept;
+  // Its format's native block and kernel name suffix.
+  [[nodiscard]] const QuantFormat &format() const noexcept;
 };
 
 // A token table of outputSize rows of inputSize values, which Embedding

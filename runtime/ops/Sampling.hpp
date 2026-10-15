@@ -5,6 +5,7 @@
 #include "metal/abi/Sampling.h"
 #include "metal/MetalBackend.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -25,14 +26,29 @@ struct SamplingPenalties final {
   }
 };
 
-// Where a lane's thinking budget runs out in a selection: its selected row
-// `row` takes `end`, which closes thinking, unless a draft token before that
-// row is `end` or `alsoEnds`, which ended thinking first. A row past the
-// selection's rows cuts nothing in it.
+// Where a lane's thinking budget runs out in a selection: its selected rows
+// from `row` on take the `end` tokens in order, as many as the selection
+// holds, unless a draft token before that row is the last of `end`, which
+// closes thinking, or `alsoEnds`, either of which ended thinking first. A row
+// past the selection's rows cuts nothing in it. At row 0 no draft token comes
+// before the cut, so the end replaces the draft's proposals there too
+// (Sampling::addThinkingDrafts). An end that waits for the mask of a
+// constrained lane starts instead at the first of those rows whose mask
+// admits its first token, the rows before it keeping their own selections;
+// as that is known only at the verify, it replaces no proposals.
 struct ThinkingCutoff final {
   uint32_t row = 0;
-  uint32_t end = 0;
+  std::span<const uint32_t> end{};
   uint32_t alsoEnds = 0;
+  bool waitsForMask = false;
+
+  // How many of the draft's proposals, from the first, the end replaces:
+  // tokens the draft did not propose.
+  [[nodiscard]] uint32_t replacedProposals() const noexcept {
+    return row || waitsForMask
+               ? 0
+               : static_cast<uint32_t>(std::min<size_t>(end.size(), SPLASH_DRAFT_PROPOSAL_TOKENS));
+  }
 };
 
 // One lane's target policy. The defaults are a request's: greedy, and a
@@ -156,8 +172,8 @@ public:
   // rowOffset, and every verify row of a batch. Each selected row's token
   // goes to the output tokens in order, one per lane for the first token
   // and eight for verify; acceptance reads a sampled verify row's draft
-  // token probability from the vocabulary rows. A lane's row at its
-  // thinking cutoff then takes the end of thinking. Both run the same
+  // token probability from the vocabulary rows. A lane's rows from its
+  // thinking cutoff on then take the end of thinking. Both run the same
   // kernels (addSelection).
   void addInitial(metal::CommandGraph &graph,
                   std::span<const SamplingPolicy> policies,
@@ -173,6 +189,14 @@ public:
       std::span<const uint32_t> maximumRetained,
       std::span<const SamplingPolicy> policies, uint32_t stopToken0,
       uint32_t stopToken1) const;
+  // After the draft's selection and before the verify reads its proposals,
+  // the proposals of each lane whose thinking cutoff is at row 0, and whose
+  // end does not wait for its mask, take the end tokens its verify rows will
+  // select, so acceptance keeps them all. A batch without such a lane
+  // dispatches nothing.
+  void addThinkingDrafts(metal::CommandGraph &graph,
+                         std::span<const SamplingPolicy> policies,
+                         metal::MetalBuffer proposedTokens) const;
 
 private:
   // The rows a selection takes from each lane (metal/abi/Sampling.h

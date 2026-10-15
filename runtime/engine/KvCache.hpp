@@ -33,7 +33,9 @@ blockImageIdentity(uint64_t blockBegin, uint32_t blockTokens,
                    std::span<const ImageSpan> spans) noexcept;
 // A block's key beside its parent and tokens: its images' identity, which
 // the first block of a salted request's prompt folds its cache salt into,
-// so that the chains of different salts part at the root.
+// so that the chains of different salts part at the root. A persistent tier
+// records it with each block, so a change to its values bumps
+// kPersistentCacheFormat; dev/tests/engine/kv_page_cache_test.cpp pins them.
 [[nodiscard]] BlockIdentity blockIdentity(uint64_t blockBegin, uint32_t blockTokens,
                                           std::span<const ImageSpan> spans,
                                           CacheSalt salt) noexcept;

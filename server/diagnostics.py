@@ -77,8 +77,8 @@ def print_request(record):
         f"input {record['prompt_tokens']:,}",
         f"cached {cache.get('matched_tokens', 0):,}",
     ]
-    # Tokens the request computed and then read from cached blocks: its
-    # later work used KV another command computed.
+    # Tokens whose KV the request read from cached blocks another request
+    # computed, past its cached prefix.
     if cache.get("deduplicated_tokens"):
         parts.append(f"deduplicated {cache['deduplicated_tokens']:,}")
     parts.append(f"output {record.get('completion_tokens', 0):,}")

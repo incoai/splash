@@ -1,6 +1,6 @@
 // What a start makes of the prefill FFN's Neural Engine split (engine/AneFfnStartup.cpp) on a model the test plays:
-// each outcome, the memory plan it adopts, the automatic context, the calibration a start makes, remembers and checks
-// again, and the line it logs.
+// each outcome, the memory plan it adopts, the automatic context and the context a relaunch keeps, the calibration a
+// start makes, remembers and checks again, and the line it logs.
 
 #include "TestChecks.hpp"
 #include "TestModel.hpp"
@@ -108,9 +108,11 @@ struct Fake {
   bool healthy = true;
   // What this Mac remembers, as lines of text by the most units a plan held.
   std::map<uint32_t, std::string> memory;
-  // The calls the start made: of unavailable() and time(), and of prepare() with its arguments.
+  // The calls the start made: of unavailable() and time(), of prepare() with its arguments, and of recall() with
+  // the most units it asked for.
   uint32_t asked = 0, timings = 0;
   std::optional<std::pair<uint32_t, AneFfnTiming>> prepared;
+  std::optional<uint32_t> recalled;
 
   [[nodiscard]] uint64_t bytes(uint32_t aneUnits) const { return aneUnits * unitBytes; }
   // What the plan holds with the largest split the model could take, the most units whose plan holds any: the
@@ -142,6 +144,7 @@ struct Fake {
       return result;
     };
     result.recall = [this](uint32_t maxAneUnits) -> std::optional<Calibration> {
+      recalled = maxAneUnits;
       const auto found = memory.find(maxAneUnits);
       return found == memory.end() ? std::nullopt : Calibration::parse(found->second);
     };
@@ -158,7 +161,8 @@ struct Started {
   AneFfnStart start;
   std::string log;
 };
-Started start(Fake &fake, AneFfnSetting setting = {}, uint32_t context = 0, std::function<bool()> cancelled = {}) {
+Started start(Fake &fake, AneFfnSetting setting = {}, RequestedContext context = {},
+              std::function<bool()> cancelled = {}) {
   Started result;
   result.log = test::capturedStderr(
       [&] { result.start = startAneFfn(fake.model(), setting, context, planMemory, cancelled); });
@@ -223,7 +227,7 @@ void testRefusedContext() {
   Fake fake;
   const uint32_t without = contextWith(0), most = contextWith(fake.bytes(1));
   require(most < without, "the split's memory does not come out of the KV cache");
-  Started started = start(fake, {}, most + 1);
+  Started started = start(fake, {}, {most + 1});
   require(started.start.outcome.kind == Kind::Refused && started.start.outcome.context == most &&
               started.start.outcome.contextWithout == without && nothingStarted(fake, started),
           "a context no split leaves did not refuse the split");
@@ -232,12 +236,12 @@ void testRefusedContext() {
               has(started.log, "; pass --max-context " + std::to_string(most) +
                                    " or less to run it, or --disable-ane, which also silences this line."),
           "the refusal did not warn with the way out: " + started.log);
-  started = start(fake, {}, without + 1);
+  started = start(fake, {}, {without + 1});
   require(started.start.outcome.kind == Kind::Refused && nothingStarted(fake, started) && started.log.empty(),
           "a context the GPU alone does not hold was warned of");
   // A given share is refused on its own units.
   const uint32_t given = contextWith(fake.bytes(7));
-  started = start(fake, {.given = AneFfnSetting::Given{0.2}}, given + 1);
+  started = start(fake, {.given = AneFfnSetting::Given{0.2}}, {given + 1});
   require(started.start.outcome.kind == Kind::Refused && started.start.outcome.context == given &&
               has(started.log, ", and the given share leaves at most "),
           "a given share was not refused on its own units: " + started.log);
@@ -256,14 +260,65 @@ void testRefusedAutomatic() {
           "a split that leaves no context was not refused: " + started.log);
 }
 
-// Without --max-context the split takes its memory from the KV cache: the start adopts the plan with it, and the
-// engine serves the context the plan holds with the split, which the log names beside the GPU's alone.
+// Whether the plan refuses the split is known before anything is set up: a start finds it refused where even the
+// least share leaves less than the context asked for, or with none asked no context. Memory the plan sets aside for
+// something else can refuse a split the plan without it holds, which a start weighs before it decides the split (the
+// SSD cache's automatic staging gives way to the split). A split that does not run is never refused.
+void testRefusalIsArithmetic() {
+  Fake fake;
+  // The plan with `other` bytes set aside beside the split's.
+  const auto beside = [](uint64_t other) { return [other](uint64_t bytes) { return planMemory(bytes + other); }; };
+  const uint32_t least = contextWith(fake.bytes(1)), lessBeside = contextWith(fake.bytes(1) + kGiB);
+  require(!aneFfnRefused(fake.model(), {}, least, planMemory) &&
+              aneFfnRefused(fake.model(), {}, least + 1, planMemory) && lessBeside < least &&
+              aneFfnRefused(fake.model(), {}, least, beside(kGiB)) &&
+              !aneFfnRefused(fake.model(), {}, lessBeside, beside(kGiB)),
+          "the refusal of a context did not follow what the least split leaves");
+  const AneFfnSetting given{.given = AneFfnSetting::Given{0.2}};
+  const uint32_t givenLeaves = contextWith(fake.bytes(7));
+  require(!aneFfnRefused(fake.model(), given, givenLeaves, planMemory) &&
+              aneFfnRefused(fake.model(), given, givenLeaves + 1, planMemory),
+          "a given share was not refused on its own units");
+  // Without --max-context: a least share that leaves some context, but none beside a GiB more.
+  uint64_t holds = 0, none = 16 * kGiB;
+  while (none - holds > kMiB) {
+    const uint64_t middle = holds + (none - holds) / 2;
+    if (contextWith(middle))
+      holds = middle;
+    else
+      none = middle;
+  }
+  fake.unitBytes = holds;
+  require(!aneFfnRefused(fake.model(), {}, 0, planMemory) && aneFfnRefused(fake.model(), {}, 0, beside(kGiB)),
+          "a split that leaves no context beside other memory was not refused, or one that leaves some was");
+  require(!fake.timings && !fake.prepared && !fake.recalled && fake.memory.empty(),
+          "weighing the refusal set something up");
+  // --disable-ane, a MoE target, layers the split does not take, and a Mac without the interface.
+  Fake moe, unsupported, unavailable;
+  moe.dense = false;
+  unsupported.unsupported = "ANE FFN split needs unrotated quantized projections";
+  unavailable.unavailable = "AppleNeuralEngine lacks _ANEClient";
+  require(!aneFfnRefused(fake.model(), {.enabled = false}, 0, beside(16 * kGiB)) &&
+              !aneFfnRefused(moe.model(), {}, 0, beside(16 * kGiB)) &&
+              !aneFfnRefused(unsupported.model(), {}, 0, beside(16 * kGiB)) &&
+              !aneFfnRefused(unavailable.model(), {}, 0, beside(16 * kGiB)),
+          "a split that does not run was refused");
+}
+
+// Without --max-context the split takes its memory from the KV cache: the start adopts the plan with it and
+// remembers its calibration, and the engine serves the context the plan holds with the split, which the log names
+// beside the GPU's alone.
 void testAutomaticContext() {
   Fake fake;
   const Started started = start(fake);
   const AneFfnOutcome &outcome = started.start.outcome;
-  require(outcome.kind == Kind::Split && fake.timings == 1 && fake.prepared == std::pair(8u, AneFfnTiming::Chunks),
-          "the split of 8 units was not calibrated and prepared");
+  const std::optional<Calibration> remembered =
+      fake.recalled && fake.memory.contains(*fake.recalled) ? Calibration::parse(fake.memory[*fake.recalled])
+                                                             : std::nullopt;
+  require(outcome.kind == Kind::Split && fake.timings == 1 && fake.prepared == std::pair(8u, AneFfnTiming::Chunks) &&
+              fake.memory.size() == 1 && remembered && remembered->aneUnits == 8 && remembered->minimumRows == 553 &&
+              remembered->gpu[1].milliseconds == 20.0 && remembered->split == 15.5 && remembered->ane == 12.0,
+          "the split of 8 units was not calibrated, prepared and remembered");
   require(started.start.plan && started.start.plan->breakdown().aneFfnBytes == fake.bytes(8) &&
               started.start.plan->maximumContextTokens() == contextWith(fake.bytes(8)) &&
               outcome.context == contextWith(fake.bytes(8)) && outcome.context < contextWith(0) &&
@@ -278,8 +333,9 @@ void testAutomaticContext() {
           "the split was not set up and logged with both contexts: " + started.log);
 }
 
-// A start serves the automatic context of its own calibration: the chosen split's units, none for a calibration that
-// found no gain, and the most units the model could take for one that failed. The plan of each holds it.
+// A start serves the automatic context of its own calibration: the chosen split's units or those of the remembered
+// calibration it took, none for a calibration that found no gain, and for one that failed the remembered
+// calibration's units, else the most units the model could take. The plan of each holds it.
 void testServedContext() {
   const auto noGain = [] {
     Timings timings = measured();
@@ -292,6 +348,13 @@ void testServedContext() {
     return prepared;
   };
   const auto fails = [](uint32_t, AneFfnTiming) -> AneFfnPrepared { throw std::runtime_error("an evaluation failed"); };
+  // A calibration of 9 units that a check matches, remembered under the most units whose plan holds any context.
+  const std::string nine = Calibration{9, 700, {{{512, 5.0}, {2048, 20.0}}}, 15.5, 12.0}.text();
+  const uint32_t mostUnits = [] {
+    uint32_t aneUnits = 33;
+    while (aneUnits && !contextWith(Fake{}.bytes(aneUnits))) --aneUnits;
+    return aneUnits;
+  }();
   const uint32_t most = Fake{}.largestSplitContext();
   require(most && most < contextWith(Fake{}.bytes(1)), "the largest split holds no less context");
   struct Case {
@@ -300,19 +363,24 @@ void testServedContext() {
     Kind kind;
     uint32_t context;
   };
-  std::vector<Case> cases(6);
+  std::vector<Case> cases(8);
   cases[1].fake.time = noGain;
   cases[2].fake.prepare = slowChunks;
   cases[3].fake.time = []() -> Timings { throw std::runtime_error("calibration timings are not usable"); };
   cases[4].fake.prepare = fails;
   cases[5].setting = {.given = AneFfnSetting::Given{0.2}};
+  cases[6].fake.memory[mostUnits] = nine;
+  cases[7].fake.memory[mostUnits] = nine;
+  cases[7].fake.prepare = fails;
   const auto split = [](uint32_t aneUnits) { return contextWith(Fake{}.bytes(aneUnits)); };
-  const std::array<std::pair<Kind, uint32_t>, 6> expected{{{Kind::Split, split(8)},
+  const std::array<std::pair<Kind, uint32_t>, 8> expected{{{Kind::Split, split(8)},
                                                            {Kind::NoGain, contextWith(0)},
                                                            {Kind::NoGain, contextWith(0)},
                                                            {Kind::Unavailable, most},
                                                            {Kind::Unavailable, most},
-                                                           {Kind::Split, split(7)}}};
+                                                           {Kind::Split, split(7)},
+                                                           {Kind::Split, split(9)},
+                                                           {Kind::Unavailable, split(9)}}};
   for (size_t index = 0; index < cases.size(); ++index) {
     Case &test = cases[index];
     const auto &[kind, context] = expected[index];
@@ -327,7 +395,7 @@ void testServedContext() {
   }
   // With --max-context the start holds the context asked for, which the log does not name.
   Fake fake;
-  const Started started = start(fake, {}, 4096);
+  const Started started = start(fake, {}, {4096});
   require(started.start.outcome.kind == Kind::Split && started.start.plan->maximumContextTokens() >= 4096 &&
               !has(started.log, "with --disable-ane"),
           "a start given --max-context named the automatic context");
@@ -337,20 +405,83 @@ void testServedContext() {
 void testExplicitContext() {
   Fake fake;
   const uint32_t context = contextWith(fake.bytes(5));
-  const Started started = start(fake, {}, context);
-  require(started.start.outcome.kind == Kind::Split && fake.prepared == std::pair(5u, AneFfnTiming::Chunks) && started.start.plan &&
+  const Started started = start(fake, {}, {context});
+  require(started.start.outcome.kind == Kind::Split && fake.prepared == std::pair(5u, AneFfnTiming::Chunks) &&
+              fake.recalled == 5u && fake.memory.contains(5u) && Calibration::parse(fake.memory[5u])->aneUnits == 5 &&
+              started.start.plan &&
               started.start.plan->maximumContextTokens() >= context && !has(started.log, "with --disable-ane"),
           "the split took more units than the plan holds with the context asked for");
 }
 
-// A failure of the timings or of the prepared split leaves the GPU alone and the plan as it was, and warns;
-// cancellation, an interrupted wait and a backend that stopped serving end the start.
+// A relaunch holds the context the server's first engine served, though a calibration made anew would serve
+// another: once the breaker forgot the calibration that engine took, or after one that failed there. Its split
+// takes at most the units whose plan holds that context, calibrated within them and remembered under them, and
+// the log names no automatic context. Where no split leaves it, as after a first engine that found no gain, the
+// GPU runs alone, untimed, with a plain line instead of the way out a refused --max-context is warned of; a
+// context the GPU alone does not hold either is the start's to report.
+void testRelaunchContext() {
+  const auto relaunch = [](uint32_t context) { return RequestedContext{.tokens = context, .relaunch = true}; };
+  // The most units whose plan holds `context`.
+  const auto mostHolding = [](uint32_t context) {
+    uint32_t aneUnits = 33;
+    while (aneUnits && contextWith(Fake{}.bytes(aneUnits)) < context) --aneUnits;
+    return aneUnits;
+  };
+  const auto relaunched = [](const Started &started, uint32_t context) {
+    return started.start.outcome.kind == Kind::Split && started.start.plan &&
+           started.start.plan->maximumContextTokens() >= context && !has(started.log, "with --disable-ane") &&
+           !has(started.log, "--max-context");
+  };
+  // The first engine took 8 units; once the breaker forgot them, timings an M5 Pro took choose 15.
+  Fake fake;
+  const uint32_t first = start(fake).start.outcome.context;
+  fake = {};
+  fake.time = [] { return Timings{{14.0 / 34, 24.244, 26.277}, {27.0 / 34, 10.147, 45.679}, 38.829}; };
+  Fake automatic = fake;
+  require(first == contextWith(fake.bytes(8)) &&
+              start(automatic).start.outcome.context == contextWith(fake.bytes(15)) &&
+              contextWith(fake.bytes(15)) < first,
+          "a calibration made anew did not change the automatic context");
+  Started started = start(fake, {}, relaunch(first));
+  require(relaunched(started, first) && fake.timings == 1 && fake.recalled == mostHolding(first) &&
+              fake.prepared && fake.prepared->first <= mostHolding(first) && fake.memory.size() == 1 &&
+              fake.memory.contains(mostHolding(first)),
+          "a relaunch did not hold the first engine's context once its calibration was forgotten: " + started.log);
+  // The first engine's calibration failed, which assumed the largest split; the relaunch's chooses 8 units.
+  fake = {};
+  fake.time = []() -> Timings { throw std::runtime_error("calibration timings are not usable"); };
+  const uint32_t failed = start(fake).start.outcome.context;
+  fake = {};
+  automatic = fake;
+  require(failed == fake.largestSplitContext() && start(automatic).start.outcome.context > failed,
+          "a calibration made after one that failed did not change the automatic context");
+  started = start(fake, {}, relaunch(failed));
+  require(relaunched(started, failed) && fake.prepared == std::pair(8u, AneFfnTiming::Chunks),
+          "a relaunch did not hold the first engine's context after its calibration failed: " + started.log);
+  // The first engine found no gain and served the GPU alone's context, which no split leaves.
+  fake = {};
+  const uint32_t without = contextWith(0);
+  started = start(fake, {}, relaunch(without));
+  const std::string reason = "the first engine's context of " + grouped(without) + " tokens cannot be held with it";
+  require(started.start.outcome.kind == Kind::Refused && started.start.outcome.reason == reason &&
+              started.start.outcome.contextWithout == without && nothingStarted(fake, started) &&
+              line(started.log, "Neural Engine FFN split off: " + reason + ".") && !has(started.log, "Warning"),
+          "a relaunch's context no split leaves did not leave the GPU alone with a plain line: " + started.log);
+  started = start(fake, {}, relaunch(without + 1));
+  require(started.start.outcome.kind == Kind::Refused && nothingStarted(fake, started) && started.log.empty() &&
+              started.start.outcome.reason == "the GPU alone does not hold the first engine's context of " +
+                                                  grouped(without + 1) + " tokens either",
+          "a relaunch's context the GPU alone does not hold was logged: " + started.log);
+}
+
+// A failure of the timings or of the prepared split leaves the GPU alone, the plan as it was and nothing
+// remembered, and warns; cancellation, an interrupted wait and a backend that stopped serving end the start.
 void testFailures() {
   Fake fake;
   fake.time = []() -> Timings { throw std::runtime_error("calibration timings are not usable"); };
   Started started = start(fake);
   require(started.start.outcome.kind == Kind::Unavailable && !started.start.plan && !started.start.split &&
-              !fake.prepared,
+              !fake.prepared && fake.memory.empty(),
           "a timing that failed did not leave the GPU alone");
   require(has(started.log, "Warning · Neural Engine FFN split unavailable (calibration timings are not usable); the "
                            "GPU runs the prefill FFN alone; context ") &&
@@ -362,13 +493,13 @@ void testFailures() {
                              "finite)");
   };
   started = start(fake);
-  require(started.start.outcome.kind == Kind::Unavailable && !started.start.plan &&
+  require(started.start.outcome.kind == Kind::Unavailable && !started.start.plan && fake.memory.empty() &&
               has(started.log, "unavailable (ANE FFN split of 640 rows failed"),
           "a split that failed verify() was not unavailable");
   // Chunks that were not timed are not read.
   fake.prepare = [](uint32_t, AneFfnTiming) { return AneFfnPrepared{}; };
   started = start(fake);
-  require(started.start.outcome.kind == Kind::Unavailable && !started.start.plan &&
+  require(started.start.outcome.kind == Kind::Unavailable && !started.start.plan && fake.memory.empty() &&
               has(started.log, "unavailable (the split's chunks were not timed)"),
           "a split of no chunks timed was not unavailable: " + started.log);
 
@@ -377,7 +508,7 @@ void testFailures() {
     cancelled = true;
     throw std::runtime_error("the Metal command was not submitted");
   };
-  rejects([&] { static_cast<void>(start(fake, {}, 0, [&] { return cancelled; })); }, "not submitted",
+  rejects([&] { static_cast<void>(start(fake, {}, {}, [&] { return cancelled; })); }, "not submitted",
           "a cancelled start went on");
   fake.prepare = [](uint32_t, AneFfnTiming) -> AneFfnPrepared { throw ane::Interrupted("the wait was interrupted"); };
   rejects([&] { static_cast<void>(start(fake)); }, "interrupted", "an interrupted wait went on");
@@ -468,7 +599,7 @@ void testForgotten() {
   Fake fake;
   static_cast<void>(start(fake));
   const uint32_t context = contextWith(fake.bytes(5));
-  const Started fewer = start(fake, {}, context);
+  const Started fewer = start(fake, {}, {context});
   require(fewer.start.outcome.kind == Kind::Split && fake.timings == 2 &&
               fake.prepared == std::pair(5u, AneFfnTiming::Chunks) && fake.memory.size() == 2,
           "a start of fewer units took a calibration of more: " + fewer.log);
@@ -496,7 +627,7 @@ void testForgotten() {
   static_cast<void>(start(more));
   const uint32_t five = contextWith(more.bytes(5));
   more.memory[5] = more.memory.begin()->second;
-  const Started held = start(more, {}, five);
+  const Started held = start(more, {}, {five});
   require(held.start.outcome.kind == Kind::Split && more.timings == 2 &&
               more.prepared == std::pair(5u, AneFfnTiming::Chunks),
           "a start took a calibration of more units than its plan holds: " + held.log);
@@ -540,9 +671,11 @@ int main() {
     testUnsupported();
     testRefusedContext();
     testRefusedAutomatic();
+    testRefusalIsArithmetic();
     testAutomaticContext();
     testServedContext();
     testExplicitContext();
+    testRelaunchContext();
     testFailures();
     testNoGain();
     testRemembered();

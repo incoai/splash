@@ -164,6 +164,28 @@ class CrashTraceTest(unittest.TestCase):
                 )
                 self.assertEqual(len(list(directory.glob("*.json"))), 1)
 
+    def test_dump_records_the_command_that_started_its_generation(self):
+        # A relaunch's command keeps the first engine's context; its replay
+        # runs that command, not the first one.
+        relaunch = ("splash", "serve-native", "--relaunch-context", "61433")
+        with tempfile.TemporaryDirectory() as temporary:
+            with mock.patch.object(
+                crash_trace, "DEFAULT_TRACE_DIRECTORY", Path(temporary)
+            ):
+                ring = crash_trace.CrashTraceRing(
+                    ("splash", "serve-native"), enabled=True
+                )
+                ring.start_generation(2, 51, relaunch)
+                ring.record_bytes(
+                    2,
+                    "client_to_engine",
+                    wire.serialize_message(wire.StatusRequestFrame(1)),
+                )
+                path = ring.dump(
+                    2, RuntimeError("failed"), process_returncode=1, last_status=None
+                )
+            self.assertEqual(json.loads(path.read_text())["command"], list(relaunch))
+
     def test_oversized_frame_leaves_a_marker_that_replay_refuses(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)

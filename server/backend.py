@@ -20,6 +20,7 @@ from .metrics import metrics_dict
 from .output import hold_partial
 from .tool_schema import (
     CALL_OPEN,
+    THINK_END,
     THINK_END_TOKEN_ID,
     TOOL_CALL_OPEN_TOKEN_ID,
     ToolPolicy,
@@ -38,6 +39,41 @@ RESTART_BACKOFF_SECONDS = 5.0
 STATUS_REFRESH_TIMEOUT_SECONDS = 0.05
 
 
+# What the engine selects where a thinking budget runs out without
+# --thinking-end-text: the close of thinking alone.
+DEFAULT_THINKING_END = (THINK_END_TOKEN_ID,)
+
+
+class ThinkingEndError(ValueError):
+    """A --thinking-end-text the model's tokenizer cannot end thinking with."""
+
+
+def thinking_end_tokens(tokenizer, text):
+    """The tokens the engine selects where a thinking budget runs out:
+    DEFAULT_THINKING_END, or --thinking-end-text, which must encode as text
+    then the close of thinking as its own token, at most
+    wire.MAX_THINKING_END_TOKENS tokens. The text holds none of the
+    tokenizer's added tokens, the template's special tokens."""
+    if text is None:
+        return DEFAULT_THINKING_END
+    tokens = tuple(tokenizer.encode(text, add_special_tokens=False))
+    if (
+        not tokens
+        or tokens[-1] != THINK_END_TOKEN_ID
+        or not tokenizer.added_tokens_decoder.keys().isdisjoint(tokens[:-1])
+    ):
+        raise ThinkingEndError(
+            f"--thinking-end-text must end with {THINK_END} and hold no other "
+            "special token"
+        )
+    if len(tokens) > wire.MAX_THINKING_END_TOKENS:
+        raise ThinkingEndError(
+            f"--thinking-end-text takes {len(tokens)} tokens; the most is "
+            f"{wire.MAX_THINKING_END_TOKENS}"
+        )
+    return tokens
+
+
 def remaining_request_time(deadline):
     remaining = deadline - time.monotonic()
     if remaining <= 0:
@@ -52,8 +88,8 @@ class CacheInfo:
     status: str = "unknown"
     matched_tokens: int = 0
     lane: int = -1
-    # Of the tokens the request computed, those whose KV it then read from a
-    # cached block's page; known once it is done.
+    # Tokens whose KV the request read from cached blocks another request
+    # computed, past its cached prefix; known once it is done.
     deduplicated_tokens: int = 0
 
 
@@ -296,10 +332,15 @@ class NativeBackend:
         wire.FinishReason.CANCELLED: "cancelled",
     }
 
-    def __init__(self, runtime, tokenizer, request_logger):
+    def __init__(
+        self, runtime, tokenizer, request_logger, thinking_end=DEFAULT_THINKING_END
+    ):
         self.runtime = runtime
         self.tokenizer = tokenizer
         self.request_logger = request_logger
+        # What the engine selects where a thinking budget runs out
+        # (thinking_end_tokens).
+        self.thinking_end = thinking_end
         self.active = {}
         self.closing = False
         self.lock = threading.RLock()
@@ -321,7 +362,9 @@ class NativeBackend:
         # Why the engine cannot serve: its failure, the last failed restart or
         # why restarts stopped.
         self.engine_error = None
-        self.terminals = queue.Queue()
+        # What the finalizer runs, in order: requests' Started lines and
+        # terminals, which must not hold up the runtime's reader thread.
+        self.finalizer_queue = queue.Queue()
         self.finalizer = threading.Thread(
             target=self._finalize_loop,
             name="splash-http-finalizer",
@@ -638,25 +681,29 @@ class NativeBackend:
             frame, job.deadline, self._mask_provider(job), job.image_owner
         )
 
-    @staticmethod
-    def _thinking_budget(job):
-        """The engine's cutoff of the thinking a job generates in: thinking
-        ends where count_reasoning_tokens ends it, at its close or, where a
-        call may follow, at a call's opening token."""
+    def _thinking_budget(self, job):
+        """The engine's cutoff of the thinking a job generates in, which it
+        ends with the server's thinking end. The engine's thinking ends at its
+        close or, where a call may follow, at any call-open token, while
+        count_reasoning_tokens ends the reasoning at a call-open token only
+        where it begins CALL_OPEN: a stray call-open token in the thinking ends
+        the engine's count, and the reasoning can then run past the budget."""
         if job.thinking_token_budget is None:
             return None
         return wire.ThinkingBudget(
             job.thinking_token_budget,
-            THINK_END_TOKEN_ID,
+            self.thinking_end,
             TOOL_CALL_OPEN_TOKEN_ID if job.may_call_tools else THINK_END_TOKEN_ID,
         )
 
     def release_weights(self, timeout=5.0):
         """Asks the engine to give its weights back now; returns its status.
 
-        It releases only while no request is in service and no restore is
-        under way; `weights.released` in the returned snapshot says whether it
-        did. The next request restores the weights as after the idle release.
+        It releases them only while no request is in service and no restore is
+        under way, with `--idle-release off` too; the returned snapshot's
+        `weights` says whether they are released: `released` and not
+        `restoring`. The next request restores the weights as after the idle
+        release.
         """
         with self.lock:
             if self.closing:
@@ -722,7 +769,7 @@ class NativeBackend:
                 if state.call is None:
                     state.call = call
                 state.terminal_enqueued = True
-                self.terminals.put((state, call))
+                self.finalizer_queue.put(functools.partial(self._finalize, state, call))
 
         with self.lock:
             if self.closing:
@@ -795,7 +842,10 @@ class NativeBackend:
                     "enable_thinking": job.reasoning.enable_thinking,
                     "thinking": job.thinking,
                 }
-            self._log(record)
+            # The finalizer prints it, as it prints the Done line: a console
+            # that stops draining must not hold up the reader thread, which
+            # delivers every request's tokens and masks.
+            self.finalizer_queue.put(functools.partial(self._log, record))
             job.events.put(("start", None))
         elif isinstance(event, wire.PromptProgressEvent):
             job.events.put(
@@ -829,16 +879,12 @@ class NativeBackend:
             call.cancel()
 
     def _finalize_loop(self):
-        while True:
-            item = self.terminals.get()
-            if item is None:
-                return
-            state, call = item
-            self._finalize(state, call)
-            # Do not keep the finished request alive while waiting for the
-            # next terminal: its image batch returns the request budget only
-            # once nothing references it.
-            del item, state, call
+        while (work := self.finalizer_queue.get()) is not None:
+            work()
+            # Do not keep a finished request alive while waiting: its image
+            # batch returns the request budget only once nothing references
+            # it.
+            del work
 
     def _finalize(self, state, call):
         job = state.job
@@ -1031,5 +1077,5 @@ class NativeBackend:
                 error = APIError(503, "server is shutting down", "server_shutdown")
                 self._record(state.job, error=error)
                 state.job.events.put(("error", error))
-            self.terminals.put(None)
+            self.finalizer_queue.put(None)
             self.finalizer.join()

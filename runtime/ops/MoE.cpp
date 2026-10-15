@@ -84,6 +84,11 @@ void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const Blo
   const MoeShape shape = plan.shape();
   const uint32_t tiles = plan.maximumTiles();
   const bool table16 = plan.configuration().ggufTile == MoeGgufTile::Register;
+  if (table16)
+    for (const BlockExpertProjection *projection : {&weights.gate, &weights.up, &weights.down})
+      for (const QuantizedSegment *s : {&projection->routed, &projection->shared})
+        if (!quant_register_format(s->formatId))
+          throw std::invalid_argument(std::string("the register expert tile does not take ") + s->name() + " weights");
   const uint32_t threads = table16 ? GGUF_REGISTER_THREADS : GGUF_STAGED_THREADS;
   const std::string kernel = table16 ? "moe_expert_gguf_sg" : "moe_expert_gguf_m" + std::to_string(plan.tileRows());
   const metal::IndirectGrid gateUpGrid{scratch.tileCount, offsetof(MoeTileCount, gate_up_grid)};

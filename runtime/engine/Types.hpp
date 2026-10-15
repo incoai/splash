@@ -79,8 +79,9 @@ struct EngineRequest final {
   CacheSalt cacheSalt;
 
   [[nodiscard]] ModelRequest modelView() const noexcept {
-    return {id,       prompt,     images,      imagePixels, maxNewTokens,
-            sampling, constraint, scoreTokens, flags,       thinkingBudget};
+    return {id,           prompt,   images,     imagePixels,
+            maxNewTokens, sampling, constraint, scoreTokens,
+            flags,        thinkingBudget ? &*thinkingBudget : nullptr};
   }
 };
 
@@ -143,8 +144,10 @@ public:
   virtual void tokens(uint64_t requestId, std::span<const uint32_t> tokens) = 0;
   virtual void maskRequested(uint64_t requestId,
                              std::span<const uint32_t> simulationTokens) = 0;
-  // deduplicatedTokens: of the tokens the request computed, those whose KV it
-  // then read from a cached block's page.
+  // deduplicatedTokens: tokens whose KV the request read from cached blocks
+  // another request computed, past the cached prefix it started from: blocks
+  // it computed and then found cached, and blocks a resume after a
+  // suspension restored past those it had published.
   virtual void completed(uint64_t requestId, EngineFinishReason reason,
                          uint32_t promptTokens, uint32_t completionTokens,
                          uint32_t deduplicatedTokens,

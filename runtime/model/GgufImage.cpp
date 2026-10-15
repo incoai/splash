@@ -17,13 +17,14 @@ namespace {
 static_assert([] {
   for (uint32_t format = 0; format < GGUF_FMT_COUNT; ++format) {
     if (quant_loader_format(format)) continue;
-    const GgmlTypeTraits *type = ggmlTypeTraits(kQuantFormats[format].ggml_type);
-    if (!type || type->blockElements != kQuantFormats[format].block_elements ||
-        type->blockBytes != kQuantFormats[format].block_bytes)
+    const QuantFormat &f = kQuantFormats[format];
+    const GgmlTypeTraits *type = ggmlTypeTraits(f.ggml_type);
+    if (!type || f.block_elements % type->blockElements ||
+        f.block_bytes != f.block_elements / type->blockElements * type->blockBytes)
       return false;
   }
   return true;
-}(), "the GGUF formats' table types are the GGUF types, block for block");
+}(), "a GGUF format's native block is a whole number of its GGUF type's blocks");
 // The repack and the reference find meta unit u in native block u.
 static_assert([] {
   for (const QuantFormat &format : kQuantFormats)
@@ -38,12 +39,14 @@ uint32_t imageFormat(uint32_t type) { return type == ggml::kNVFP4 ? GGUF_FMT_NVF
 
 bool quantizedType(uint32_t type) { return imageFormat(type) != GGUF_FMT_COUNT; }
 bool floatType(uint32_t type) { return type == ggml::kF32; }
-// The token rows the embedding kernel gathers.
+// The 16-bit float types, whose alpha/beta pairs widen to F32 (alphaBeta).
+bool float16Type(uint32_t type) { return type == ggml::kBF16 || type == ggml::kF16; }
+// The token rows the embedding kernels gather: native rows of a format.
 bool embeddingType(uint32_t type) { return gguf_embedding_format(imageFormat(type)); }
-// alpha/beta run as one segment of their shared type: any format of the
-// projections (one repacked tensor) or F32 (one float tensor), which BF16
-// becomes exactly.
-bool alphaBetaType(uint32_t type) { return quantizedType(type) || type == ggml::kF32 || type == ggml::kBF16; }
+// alpha/beta run as one segment: of their format when both are of one
+// quantized type but BF16 and F16 (one repacked tensor), else F32 (one float
+// tensor).
+bool alphaBetaType(uint32_t type) { return quantizedType(type) || type == ggml::kF32; }
 
 // Plans one image. A missing tensor or one of a type this build cannot load
 // is added to `problems` and left out of the image, so the planner can name
@@ -71,29 +74,62 @@ public:
     image_.repack(std::move(repack));
   }
 
-  // beta (value heads rows) | alpha (value heads rows), rows in grouped head
-  // order: one 256-row tensor of their format padded with zero rows, or F32 as
-  // one float tensor, which BF16 is widened to exactly.
-  void alphaBeta(const std::string &betaName, const std::string &alphaName) {
-    const GgufTensor *beta = file_.find(betaName), *alpha = file_.find(alphaName);
-    if (!beta || !alpha || beta->type != alpha->type || !alphaBetaType(beta->type)) {
-      reject(betaName, beta);
-      reject(alphaName, alpha);
+  // The routed experts' gate and up tensors, of `experts` * width rows each:
+  // ffn_gate_exps and ffn_up_exps, or llama.cpp's fused ffn_gate_up_exps
+  // (create_tensor_gate_up_exps), each expert's gate rows then its up rows,
+  // which the two tensors take expert by expert.
+  void gateUpExperts(const std::string &prefix, uint64_t experts, uint64_t width, uint64_t columns) {
+    const std::string fusedName = prefix + "ffn_gate_up_exps.weight";
+    if (!file_.find(fusedName)) {
+      quantized(prefix + "ffn_gate_exps.weight", experts * width, columns);
+      quantized(prefix + "ffn_up_exps.weight", experts * width, columns);
       return;
     }
+    const GgufTensor *fused = find(fusedName, quantizedType);
+    if (!fused) return;
+    if (fused->rows() != 2 * experts * width || fused->columns() != columns)
+      throw GgufError("unexpected shape for " + fusedName);
+    const uint32_t format = imageFormat(fused->type);
+    const TensorRows rows = tensorRows(*fused, 2 * experts * width, ggufRowBytes(kQuantFormats[format], columns));
+    // Expert e's gate rows are rows 2e width.. of the fused tensor, its up rows the next width.
+    for (const uint64_t up : {0, 1}) {
+      Repack repack = image_.planes(format, experts * width, columns, fusedName);
+      for (uint64_t expert = 0; expert < experts; ++expert) {
+        TensorRows expertRows = rows;
+        expertRows.first = (2 * expert + up) * width;
+        expertRows.rows = width;
+        repack.sources.push_back(std::move(expertRows));
+      }
+      image_.repack(std::move(repack));
+    }
+  }
+
+  // beta (value heads rows) | alpha (value heads rows), rows in grouped head
+  // order: one 256-row tensor of their format padded with zero rows when both
+  // are of one quantized type, else one F32 tensor of the values each holds:
+  // F32 as stored, any other type decoded, all exactly. A pair of BF16 or F16
+  // is one F32 tensor too: a float segment reads the input unrotated
+  // (requireRotation), as Prism's BF16 alpha/beta need, and leaves the GDN
+  // input projection on Apple9's register tile, which takes no F16.
+  void alphaBeta(const std::string &betaName, const std::string &alphaName) {
+    const GgufTensor *beta = find(betaName, alphaBetaType), *alpha = find(alphaName, alphaBetaType);
+    if (!beta || !alpha) return;
     const uint32_t heads = geometry_.gdnValueHeads, hidden = geometry_.hiddenSize;
     for (const GgufTensor *t : {beta, alpha})
       if (t->rows() != heads || t->columns() != hidden)
         throw GgufError("alpha/beta must be [" + std::to_string(heads) + ", hidden]: " + t->name);
-    if (beta->type == ggml::kF32 || beta->type == ggml::kBF16) {
-      const uint64_t widening = beta->type == ggml::kBF16 ? 2 : 1;
-      const uint64_t bytes = (beta->bytes + alpha->bytes) * widening;
-      image_.descriptor(ggml::kF32, 2ull * heads, hidden, {}, {bytes, 0, 0}, betaName);
-      uint64_t destination = image_.section(bytes);
+    if (beta->type != alpha->type || !quantizedType(beta->type) || float16Type(beta->type)) {
+      const uint64_t rowBytes = uint64_t{hidden} * sizeof(float);
+      image_.descriptor(ggml::kF32, 2ull * heads, hidden, {}, {2 * heads * rowBytes, 0, 0}, betaName);
+      uint64_t destination = image_.section(2 * heads * rowBytes);
       for (const GgufTensor *t : {beta, alpha}) {
-        image_.copyAt(destination, tensorRows(*t, heads, t->bytes / heads, grouped(0, 1)),
-                      widening == 2 ? Conversion::WidenToFloat32 : Conversion::None);
-        destination += t->bytes * widening;
+        if (quantizedType(t->type)) {
+          const uint64_t native = ggufRowBytes(kQuantFormats[imageFormat(t->type)], hidden);
+          image_.copyAt(destination, tensorRows(*t, heads, native, grouped(0, 1)), Conversion::DequantizeToFloat32);
+        } else {
+          image_.copyAt(destination, tensorRows(*t, heads, t->bytes / heads, grouped(0, 1)), Conversion::None);
+        }
+        destination += heads * rowBytes;
       }
       return;
     }
@@ -255,8 +291,7 @@ Image layerImage(const GgufFile &file, const QwenTargetDimensions &g, std::vecto
   if (g.ffnKind == QwenFfnKind::SparseMoe) {
     const uint64_t routed = g.experts, width = g.expertIntermediateSize;
     b.floatTensor(p + "ffn_gate_inp.weight", routed, g.hiddenSize);
-    b.quantized(p + "ffn_gate_exps.weight", routed * width, g.hiddenSize);
-    b.quantized(p + "ffn_up_exps.weight", routed * width, g.hiddenSize);
+    b.gateUpExperts(p, routed, width, g.hiddenSize);
     b.quantized(p + "ffn_down_exps.weight", routed * g.hiddenSize, width);
     b.quantized(p + "ffn_gate_shexp.weight", width, g.hiddenSize);
     b.quantized(p + "ffn_up_shexp.weight", width, g.hiddenSize);
@@ -272,8 +307,8 @@ Image layerImage(const GgufFile &file, const QwenTargetDimensions &g, std::vecto
 
 // A rotated GGUF (GgufRotation) must name exactly what the loader rotates:
 // every tensor the images of a dense target repack, whose segments read
-// H (D x) (ops::InputRotation) while float segments (F32 or BF16 alpha/beta)
-// read x as it is, and the token table, which the rotated gather decodes from
+// H (D x) (ops::InputRotation) while float segments (alpha/beta in F32) read
+// x as it is, and the token table, which the rotated gather decodes from
 // PQ2_0 rows, with the GDN value heads of the rotated inputs grouped.
 void requireRotation(const GgufFile &file, const QwenTargetDimensions &g, const std::vector<Image> &images) {
   const GgufRotation &rotation = *file.rotation();
@@ -300,7 +335,7 @@ uint64_t convertedBytes(const TensorRows &source, Conversion conversion, uint64_
   case Conversion::Decay: return source.type == ggml::kBF16 ? sourceBytes * 2 : sourceBytes;
   case Conversion::DequantizeToFloat32: {
     const uint32_t format = gguf_format_of(source.type);
-    if (!safetensorsFormat(format)) throw GgufError("not a quantized safetensors tensor: " + source.name);
+    if (format == GGUF_FMT_COUNT) throw GgufError("not a quantized tensor: " + source.name);
     return sourceBytes / kQuantFormats[format].block_bytes * kQuantFormats[format].block_elements * 4;
   }
   case Conversion::None: break;

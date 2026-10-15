@@ -89,6 +89,15 @@ struct GdnPrefillBuffers final {
   metal::MetalBuffer hidden;
 };
 
+// A state a prefill captures inside its rows: the convolution carry and the
+// recurrent state after its first `tokens` rows, which it stores in these
+// buffers as a prefill ending there would.
+struct GdnPrefillCapture final {
+  uint32_t tokens = 0;
+  metal::MetalBuffer convolution;
+  metal::MetalBuffer recurrent;
+};
+
 // A lane's decode tape (metal/abi/GDN.h): each step leaves its rows'
 // convolution inputs, k, v and gates there, and the lane's next step folds
 // the rows it retained into the state before its own, so the state cell a
@@ -121,9 +130,15 @@ struct GdnDecodeBuffers final {
 
 class GDN final {
 public:
-  static void addPrefill(metal::CommandGraph &graph, GdnPrefillBuffers buffers,
-                         GdnShape shape, uint32_t tokens,
-                         GdnStateFormat state, GdnHeadOrder order);
+  // Each capture, ascending inside the rows, ends one run of the prepare and
+  // scan dispatches, and the next run starts from the state it stored; the
+  // gate then runs once over every row. The scan is sequential, so with an
+  // fp32 state the runs compute what one run does, and a bf16 state is
+  // rounded at each capture as a prefill ending there rounds it.
+  static void addPrefill(metal::CommandGraph &graph, const metal::MetalBackend &backend,
+                         GdnPrefillBuffers buffers, GdnShape shape, uint32_t tokens,
+                         GdnStateFormat state, GdnHeadOrder order,
+                         std::span<const GdnPrefillCapture> captures = {});
   // Also writes the out-projection's `input` table into
   // buffers.linearScratch when it is not Plain, and throws when the scratch
   // cannot hold it.

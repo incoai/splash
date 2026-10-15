@@ -93,8 +93,8 @@ std::unique_ptr<KvTransfer> KvPageTier::demote(uint32_t page, std::shared_ptr<Kv
   transfer->demotion = true;
   auto ticket = std::make_unique<Ticket>(transfer);
   transfer->io = file_->write(disk->slot, {bytes.begin(), bytes.end()}, std::move(completion));
-  // A write that failed since canDemote() has closed the file, which
-  // refuses this one as canDemote() does from now on.
+  // A file that stopped taking writes since canDemote() refuses this one as
+  // canDemote() does from now on.
   if (!transfer->io)
     return {};
   ++demotions_;

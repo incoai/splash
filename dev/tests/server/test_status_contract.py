@@ -36,6 +36,10 @@ class StatusContractTests(unittest.TestCase):
         self.assertIn('splash_memory_pressure{state="normal"} 1', lines)
         self.assertIn('splash_thermal_state{state="fair"} 1', lines)
         self.assertIn('splash_thermal_state{state="nominal"} 0', lines)
+        self.assertIn('splash_disk_writes_gated{state="budget"} 1', lines)
+        self.assertIn('splash_disk_writes_gated{state="no"} 0', lines)
+        self.assertIn("splash_disk_read_bytes_total 12345", lines)
+        self.assertIn("splash_disk_written_bytes_total 67890", lines)
 
 
 class StatusRouteTests(HarnessTestCase):

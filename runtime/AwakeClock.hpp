@@ -31,4 +31,12 @@ struct AwakeClock final {
   return std::chrono::duration<double, std::milli>(AwakeClock::now() - start).count();
 }
 
+// The awake clock in milliseconds: the native loop's clock
+// (NativeLoopConfig::monotonicMilliseconds) and the SSD cache's write
+// budget's (model::DiskBudget).
+[[nodiscard]] inline double awakeMilliseconds() noexcept {
+  return std::chrono::duration<double, std::milli>(AwakeClock::now().time_since_epoch())
+      .count();
+}
+
 } // namespace splash

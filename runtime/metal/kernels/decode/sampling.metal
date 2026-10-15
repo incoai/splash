@@ -1523,28 +1523,62 @@ kernel void decode_sample_argmax_reduce(
 }
 
 // After the selection, the thinking cutoff of each lane that has one
-// (ThinkingCutoffParams): its row selects end. Draft token r is verify input
-// row r + 1.
+// (ThinkingCutoffParams): its rows from its row on select its end tokens, or
+// where its end waits for its mask, its rows from the first of those whose
+// mask admits the end's first token. Draft token r is verify input row r + 1.
 kernel void decode_sample_thinking_cutoff(
     device const uint *input_tokens [[buffer(0)]],
-    device uint *tokens [[buffer(1)]],
-    device TargetVocabularyRow *vocabulary_rows [[buffer(2)]],
-    constant ThinkingCutoffParams &params [[buffer(3)]],
+    device const uint *token_mask [[buffer(1)]],
+    device uint *tokens [[buffer(2)]],
+    device TargetVocabularyRow *vocabulary_rows [[buffer(3)]],
+    constant ThinkingCutoffParams &params [[buffer(4)]],
     uint lane [[threadgroup_position_in_grid]]) {
-  const uint row = params.row[lane];
+  uint row = params.row[lane];
+  if (params.waiting_mask & (1u << lane)) {
+    // The lane's mask rows, as selected_row reads them.
+    device const uint *masks =
+        token_mask + (ulong(lane) * (SPLASH_TARGET_VERIFY_ROWS + 1) +
+                      params.mask_row) *
+                         params.mask_words;
+    const uint start = params.tokens[lane][0];
+    for (; row < params.rows; ++row) {
+      if (masks[row * params.mask_words + start / 32] & (1u << (start % 32)))
+        break;
+    }
+  }
   if (row >= params.rows)
     return;
   const uint first = lane * params.rows;
-  const uint end = params.end[lane];
   for (uint r = 0; r < min(row, params.drafted_rows); ++r) {
     const uint draft = input_tokens[first + r + 1];
-    if (draft == end || draft == params.also_ends[lane])
+    if (draft == params.close[lane] || draft == params.also_ends[lane])
       return;
   }
-  tokens[first + row] = end;
-  if ((params.sampling_mask & (1u << lane)) && row < params.drafted_rows)
-    vocabulary_rows[first + row].draft_probability =
-        input_tokens[first + row + 1] == end ? 1.0f : 0.0f;
+  for (uint i = 0; i < min(params.count[lane], params.rows - row); ++i) {
+    // A row with no selectable logit keeps its sentinel, so the lane fails.
+    if (tokens[first + row + i] >= params.vocabulary)
+      continue;
+    const uint end = params.tokens[lane][i];
+    tokens[first + row + i] = end;
+    if ((params.sampling_mask & (1u << lane)) && row + i < params.drafted_rows)
+      vocabulary_rows[first + row + i].draft_probability =
+          input_tokens[first + row + i + 1] == end ? 1.0f : 0.0f;
+  }
+}
+
+// Before the verify, each lane whose thinking cutoff is at row 0
+// (ThinkingCutoffParams) and whose end does not wait for its mask, which
+// only the verify reads, drafts the end tokens its verify rows will select:
+// its draft token r is its row r's.
+kernel void decode_draft_thinking_cutoff(
+    device uint *proposed_tokens [[buffer(0)]],
+    constant ThinkingCutoffParams &params [[buffer(1)]],
+    uint lane [[threadgroup_position_in_grid]]) {
+  if (params.row[lane] != 0 || (params.waiting_mask & (1u << lane)))
+    return;
+  for (uint r = 0; r < min(params.count[lane], params.drafted_rows); ++r)
+    proposed_tokens[lane * SPLASH_DRAFT_PROPOSAL_TOKENS + r] =
+        params.tokens[lane][r];
 }
 
 inline void accept_greedy_lane(device const uint *draft_tokens,

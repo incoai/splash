@@ -6,7 +6,6 @@
 #include <deque>
 #include <optional>
 #include <unordered_set>
-#include <utility>
 
 namespace splash::engine {
 
@@ -28,15 +27,15 @@ struct WriteBehindSnapshot final {
 // a point that is newest only briefly, like a step of a tool loop, costs no
 // write, and a shorter one recomputes in less time than its state takes to
 // write. Points become durable one at a time, in the order they were
-// published. While the tier has written hourlyBytes in the last hour these
-// writes wait; the writes eviction needs never do.
+// published. Like every write of the tier these draw on its write budget,
+// when one is set (model::DiskBudget): a point waits while the budget holds
+// its state back, which is written before its chain.
 class WriteBehind final {
 public:
   static constexpr double kDelayMilliseconds = 10'000.0;
   static constexpr uint32_t kMinimumTokens = 2048;
-  static constexpr uint64_t kHourlyBytes = uint64_t{128} << 30;
 
-  explicit WriteBehind(Cache &cache, uint64_t hourlyBytes = kHourlyBytes);
+  explicit WriteBehind(Cache &cache);
   WriteBehind(const WriteBehind &) = delete;
   WriteBehind &operator=(const WriteBehind &) = delete;
 
@@ -47,10 +46,12 @@ public:
   // given up; a write it starts wakes the engine when it lands.
   [[nodiscard]] bool run(double now);
   // At a clean stop: steps every waiting point, the newest first, due or
-  // not, past the hourly limit. True once none is left.
+  // not, whatever the write budget (Cache::liftDiskWriteBudget). True once
+  // none is left.
   [[nodiscard]] bool flush();
   // When run() next has something to do that no landing write will wake it
-  // for: the next point falling due, or the next look at the hourly limit.
+  // for: the next point falling due, or, for a step the write budget held
+  // back, when the budget admits it again.
   [[nodiscard]] std::optional<double> nextWakeup() const;
   [[nodiscard]] WriteBehindSnapshot snapshot() const noexcept;
 
@@ -61,20 +62,12 @@ private:
   };
   // Counts a step that settled its point; false while it is in progress.
   bool settle(PersistStatus status);
-  // Samples the bytes the tier has written, at most once a minute, and
-  // whether the last hour's reached the limit.
-  void sampleWrites(double now);
 
   Cache &cache_;
-  uint64_t hourlyBytes_;
   std::deque<Point> waiting_;
   std::unordered_set<uint64_t> queued_;
-  // (time, bytes written) samples back to the latest one at least an hour
-  // old. Every write starts in a tick, so the window they span counts the
-  // last hour's writes and at most a minute's from before it.
-  std::deque<std::pair<double, uint64_t>> written_;
-  bool limited_ = false;
-  // The front point is due and waits for its writes, or the tier's, to land.
+  // The front point is due and waits for its writes, or the tier's, to land,
+  // or for the write budget.
   bool stalled_ = false;
   WriteBehindSnapshot counters_;
 };

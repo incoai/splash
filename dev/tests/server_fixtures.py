@@ -42,6 +42,15 @@ FOREVER = math.inf
 READY = wire.ReadyEvent(4, 131_072, False)
 # The generation APIs: Chat Completions, Responses and Messages.
 PATHS = ("/v1/chat/completions", "/v1/responses", "/v1/messages")
+# The weights section of the status document an engine answers a release
+# request with once it gave the weights back (NativeRuntime::handleRelease).
+RELEASED_WEIGHTS = {
+    "idle_release_seconds": 600,
+    "released": True,
+    "restoring": False,
+    "restores": 0,
+    "restore_failures": 0,
+}
 
 
 def stays_connected():
@@ -400,9 +409,7 @@ class FakeRuntime:
         self.restart_count = 0
         self.last_crash_trace = None
         self.status_event = native_peer.status_event()
-        self.release_event = native_peer.status_event(
-            weights={"released": True, "restores": 0, "restore_failures": 0}
-        )
+        self.release_event = native_peer.status_event(weights=RELEASED_WEIGHTS)
         self.release_calls = 0
         self.threads = []
 
@@ -777,10 +784,12 @@ def main_args(**overrides):
             "announce_served_name": False,
             "default_reasoning_effort": None,
             "thinking_token_budget": None,
+            "thinking_end_text": None,
             "max_context": None,
             "max_memory": None,
             "idle_release": None,
-            "max_cache_disk": 0,
+            "max_cache_disk": None,
+            "max_cache_disk_writes": 0,
             "persistent_cache": False,
             "cache_dir": None,
             "decode_share": None,
@@ -870,12 +879,16 @@ class Harness:
         allowed_hosts=(),
         allowed_origins=(),
         vision=True,
+        thinking_end=backend_api.DEFAULT_THINKING_END,
         **frontend_options,
     ):
         self.tokenizer = tokenizer or FakeTokenizer()
         runtime.pending_limit = queue_size
         self.backend = backend_api.NativeBackend(
-            runtime, self.tokenizer, request_logger=request_logger
+            runtime,
+            self.tokenizer,
+            request_logger=request_logger,
+            thinking_end=thinking_end,
         )
         self.app = make_frontend(
             self.tokenizer,

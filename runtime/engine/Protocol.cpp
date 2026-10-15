@@ -370,6 +370,17 @@ std::optional<ProtocolIssue> validateRequest(const RequestFrame &request,
                      "score requests take no thinking budget");
     }
   }
+  if (request.thinkingBudget) {
+    const std::vector<uint32_t> &end = request.thinkingBudget->end;
+    if (end.empty() || end.size() > kMaximumThinkingEndTokens) {
+      return invalid(IssueCode::InvalidCount,
+                     "thinking end token count must be in [1, " +
+                         std::to_string(kMaximumThinkingEndTokens) + "]");
+    }
+    // Thinking ends where its end does, and nowhere inside it.
+    if (const char *reason = request.thinkingBudget->unusable())
+      return invalid(IssueCode::InvalidCount, reason);
+  }
   // A grammar decides where constrained output ends.
   if ((request.flags & RequestIgnoreEndOfSequence) &&
       (scoring || request.constraint != ConstraintMode::None)) {
@@ -678,6 +689,7 @@ ProtocolResult<ClientMessage> decodeRequest(std::vector<uint8_t> &&payload,
   uint32_t promptCount = 0;
   uint32_t imageSpanCount = 0;
   uint32_t scoreCount = 0;
+  uint32_t thinkingEndCount = 0;
   ThinkingBudget thinking;
   if (!reader.u64(request.requestId) || !reader.u8(priority) ||
       !reader.u8(constraint) ||
@@ -696,19 +708,23 @@ ProtocolResult<ClientMessage> decodeRequest(std::vector<uint8_t> &&payload,
       !reader.u32(request.generationPromptTokens) ||
       !reader.u32(request.flags) || !reader.u64(request.cacheSalt.lo) ||
       !reader.u64(request.cacheSalt.hi) || !reader.u32(thinking.tokens) ||
-      !reader.u32(thinking.end) || !reader.u32(thinking.alsoEnds)) {
+      !reader.u32(thinkingEndCount) || !reader.u32(thinking.alsoEnds)) {
     return failure<ClientMessage>(
         makeIssue(FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength,
                   0, "request fixed payload is truncated"));
   }
   request.priority = static_cast<RequestPriority>(priority);
   request.constraint = static_cast<ConstraintMode>(constraint);
-  if (thinking.tokens != kNoThinkingBudget)
-    request.thinkingBudget = thinking;
-  else if (thinking.end || thinking.alsoEnds)
+  if (thinking.tokens == kNoThinkingBudget &&
+      (thinkingEndCount || thinking.alsoEnds))
     return failure<ClientMessage>(
         requestIssue(IssueCode::InvalidCount, request.requestId,
                      "thinking end tokens need a thinking budget"));
+  if (thinkingEndCount > kMaximumThinkingEndTokens) {
+    return failure<ClientMessage>(
+        requestIssue(IssueCode::InvalidCount, request.requestId,
+                     "thinking end token count exceeds its limit"));
+  }
   if (scoreCount > ExecutionLimits::maximumScoreOptions) {
     return failure<ClientMessage>(
         requestIssue(IssueCode::InvalidCount, request.requestId,
@@ -742,17 +758,21 @@ ProtocolResult<ClientMessage> decodeRequest(std::vector<uint8_t> &&payload,
     }
   }
   const size_t pixelsOffset = payload.size() - reader.remaining();
-  uint64_t scoreBytes = 0;
-  if (!checkedMultiply(scoreCount, sizeof(uint32_t), scoreBytes) ||
-      reader.remaining() != pixelBytes + scoreBytes ||
+  const uint64_t wordBytes =
+      (uint64_t{scoreCount} + thinkingEndCount) * sizeof(uint32_t);
+  if (reader.remaining() != pixelBytes + wordBytes ||
       !reader.skip(pixelBytes) ||
-      !reader.words(scoreCount, request.scoreTokens)) {
+      !reader.words(scoreCount, request.scoreTokens) ||
+      !reader.words(thinkingEndCount, thinking.end)) {
     return failure<ClientMessage>(
         requestIssue(IssueCode::InvalidPayloadLength, request.requestId,
-                     "image pixel or score payload does not match its counts"));
+                     "image pixel, score or thinking end payload does not "
+                     "match its counts"));
   }
+  if (thinking.tokens != kNoThinkingBudget)
+    request.thinkingBudget = std::move(thinking);
   // The pixels are most of a large frame, so they stay in its buffer: the
-  // score words behind them are read, and moving the pixels to its front
+  // words behind them are read, and moving the pixels to its front
   // allocates nothing.
   if (pixelBytes) {
     payload.resize(pixelsOffset + pixelBytes);

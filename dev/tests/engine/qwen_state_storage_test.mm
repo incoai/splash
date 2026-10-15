@@ -130,8 +130,8 @@ void testLayoutFormulas() {
 }
 
 void testOffloadAllocationFailure(metal::MetalBackend &backend) {
-  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
-                          queryHostAvailableMemory, 0);
+  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
+                          queryHostMemory, 0);
   constexpr model::CompositeStateLayout layout{{1, 3, 128, 1, 128, 128},
                                                {1, 1, 4, 128}};
   const uint64_t slotBytes = model::SlotFile::slotBytesFor(layout.cachedBytes());
@@ -189,8 +189,8 @@ void testOffloadAllocationFailure(metal::MetalBackend &backend) {
 }
 
 void testDiskRestore(metal::MetalBackend &backend) {
-  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
-                          queryHostAvailableMemory, 0);
+  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
+                          queryHostMemory, 0);
   model::QwenStateStorage storage(
       backend, governor.allocationAdmission(), kStateLayout,
       std::make_shared<model::SlotFile>(kStateSlotBytes,
@@ -268,13 +268,13 @@ void testDiskRestore(metal::MetalBackend &backend) {
 // cache buffer is taken, the disk copy restores every byte of the active
 // parity, and a full quota refuses until a disk copy is dropped.
 void testDirectDiskSnapshot(metal::MetalBackend &backend) {
-  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
-                          queryHostAvailableMemory, 0);
+  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
+                          queryHostMemory, 0);
   model::QwenStateStorage storage(
       backend, governor.allocationAdmission(), kStateLayout,
       std::make_shared<model::SlotFile>(kStateSlotBytes,
                                         std::make_shared<model::DiskBudget>(kStateSlotBytes)));
-  require(storage.canSnapshotToDisk(), "a state file that holds one state refuses writes");
+  require(storage.canSnapshotToDisk(false), "a state file that holds one state refuses writes");
   require(static_cast<bool>(storage.tryActivateLane(0, 321)), "lane activation failed");
   storage.swapParity(0);
   const model::GdnParityBuffers &current = storage.current(0);
@@ -321,6 +321,36 @@ void testDirectDiskSnapshot(metal::MetalBackend &backend) {
   storage.releaseLane(0, 321);
 }
 
+// A state's write, from a lane or from a cached copy, takes its slot from
+// the write budget. Overdrawn, the budget holds back writes not in use
+// until it refills, and lets those in use pass.
+void testStateWritesDrawOnTheWriteBudget(metal::MetalBackend &backend) {
+  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
+                          queryHostMemory, 0);
+  double now = 0.0;
+  auto budget = std::make_shared<model::DiskBudget>(4 * kStateSlotBytes, [&now] { return now; });
+  // Two slots a day, half a slot at once.
+  budget->setWriteBudget(2 * kStateSlotBytes);
+  model::QwenStateStorage storage(backend, governor.allocationAdmission(), kStateLayout,
+                                  std::make_shared<model::SlotFile>(kStateSlotBytes, budget));
+  require(static_cast<bool>(storage.tryActivateLane(0, 456)), "lane activation failed");
+  storage.updateLengths(0, published(4096));
+  auto cached = storage.snapshot(0);
+  require(cached && storage.canSnapshotToDisk(false) && cached->canOffload(false),
+          "a write budget with room held a state back");
+  auto write = storage.snapshotToDisk(0, {});
+  require(write && finishWhenReady(*write), "the lane's state was not written");
+  require(!storage.canSnapshotToDisk(false) && storage.canSnapshotToDisk(true) &&
+              !cached->canOffload(false) && cached->canOffload(true),
+          "an overdrawn write budget did not hold back only what is not in use");
+  now = 86'400'000.0 / 4 + 1.0;
+  require(storage.canSnapshotToDisk(false) && cached->canOffload(false),
+          "the write budget did not admit writes once it refilled");
+  write.reset();
+  cached.reset();
+  storage.releaseLane(0, 456);
+}
+
 // A state need not fill its slot: the write zeros the slot past it and the
 // read leaves the rest, in a slot one host page larger than an aligned state
 // and in the rounded-up slot of a state that is not aligned.
@@ -330,8 +360,8 @@ void testStateSmallerThanSlot(metal::MetalBackend &backend) {
   constexpr model::CompositeStateLayout unaligned{target, {1, 1, 1, 64}};
   static_assert(aligned.cachedBytes() % kHostPageBytes == 0 &&
                 unaligned.cachedBytes() % kHostPageBytes != 0);
-  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
-                          queryHostAvailableMemory, 0);
+  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
+                          queryHostMemory, 0);
   for (const auto &[layout, slotBytes] :
        {std::pair{aligned, aligned.cachedBytes() + kHostPageBytes},
         std::pair{unaligned, model::SlotFile::slotBytesFor(unaligned.cachedBytes())}}) {
@@ -367,8 +397,8 @@ void testStateSmallerThanSlot(metal::MetalBackend &backend) {
 // window, and a state whose slot changed after its record fails its
 // restore.
 void testPersistentStateComesBack(metal::MetalBackend &backend) {
-  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
-                          queryHostAvailableMemory, 0);
+  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
+                          queryHostMemory, 0);
   std::string name = (std::filesystem::temp_directory_path() / "splash-states-XXXXXX").string();
   require(::mkdtemp(name.data()) != nullptr, "temporary directory could not be made");
   const std::filesystem::path directory = name;
@@ -435,8 +465,8 @@ void testPersistentStateComesBack(metal::MetalBackend &backend) {
 // RAM copy's own buffers: no staging, and the RAM copy keeps them. The disk
 // copy restores every byte.
 void testPersistKeepsTheRamCopy(metal::MetalBackend &backend) {
-  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
-                          queryHostAvailableMemory, 0);
+  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
+                          queryHostMemory, 0);
   model::QwenStateStorage storage(
       backend, governor.allocationAdmission(), kStateLayout,
       std::make_shared<model::SlotFile>(kStateSlotBytes,
@@ -464,6 +494,117 @@ void testPersistKeepsTheRamCopy(metal::MetalBackend &backend) {
   storage.releaseLane(0, 7);
 }
 
+// A state a prefill command captures takes its cache slot before the command
+// runs: the pool's buffers, one admission for what the pool lacks, nothing
+// on a refusal. copyWindow() fills the slot's window alone and copyState()
+// the lane's whole state. Sealing moves the slot into the cached state, which
+// carries the tier's file and staging as a snapshot does, and leaves the
+// reservation empty: a dropped reservation returns what it still holds, so
+// each buffer goes back to the pool once, and nothing once its storage is
+// gone.
+void testReservations(metal::MetalBackend &backend) {
+  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
+                          queryHostMemory, 0);
+  bool admitNew = true;
+  uint32_t admissions = 0;
+  const metal::AllocationAdmission admit = [admit = governor.allocationAdmission(), &admitNew, &admissions](
+                                               uint64_t bytes, const std::function<void()> &allocate)
+      -> metal::AllocationResult {
+    if (!admitNew)
+      return metal::AllocationFailure::EngineBudget;
+    const metal::AllocationResult result = admit(bytes, allocate);
+    admissions += static_cast<bool>(result);
+    return result;
+  };
+  constexpr model::CompositeStateLayout layout{{1, 3, 128, 1, 128, 128}, {1, 1, 4, 128}};
+  const uint64_t slotBytes = model::SlotFile::slotBytesFor(layout.cachedBytes());
+  const uint64_t beforeStorage = backend.memoryStats().allocatedBytes;
+  std::shared_ptr<model::QwenStateReservation> outlives;
+  {
+    model::QwenStateStorage storage(
+        backend, admit, layout,
+        std::make_shared<model::SlotFile>(slotBytes, std::make_shared<model::DiskBudget>(slotBytes)));
+    require(static_cast<bool>(storage.tryActivateLane(0, 9)), "lane activation failed");
+    fill(storage.current(0).stateBase, 70);
+    fill(storage.window(0), 71);
+    storage.updateLengths(0, published(4096));
+    const auto images = stateImage(storage, 0);
+    const uint64_t laneBytes = storage.actualAllocatedBytes();
+
+    admitNew = false;
+    require(!storage.reserve() && storage.actualAllocatedBytes() == laneBytes,
+            "a refused reservation allocated its slot");
+    admitNew = true;
+    auto reservation = storage.reserve();
+    require(reservation && admissions == 2 && storage.actualAllocatedBytes() > laneBytes &&
+                storage.idleCells() == 0 && storage.idleWindows() == 0,
+            "a reservation did not take one admission for its slot");
+    const uint64_t slotted = storage.actualAllocatedBytes();
+    reservation.reset();
+    require(storage.idleCells() == 1 && storage.idleWindows() == 1 &&
+                storage.actualAllocatedBytes() == slotted,
+            "a dropped reservation did not return its slot to the pool");
+    admitNew = false;
+    reservation = storage.reserve();
+    require(reservation && storage.idleCells() == 0 && storage.idleWindows() == 0,
+            "a reservation did not take the pooled slot without an admission");
+    admitNew = true;
+
+    // The window alone, then the whole state.
+    const model::QwenCachedBuffers buffers = reservation->buffers();
+    fill(buffers.gdn->buffers().stateBase, 72);
+    const auto cell = bytesOf(buffers.gdn->buffers().stateBase);
+    storage.copyWindow(0, *reservation);
+    require(sameBytes(buffers.window->buffer(), images[1]) &&
+                sameBytes(buffers.gdn->buffers().stateBase, cell),
+            "copyWindow did not copy the lane's window alone");
+    storage.copyState(0, *reservation);
+    require(sameBytes(buffers.gdn->buffers().stateBase, images[0]) &&
+                sameBytes(buffers.window->buffer(), images[1]),
+            "copyState did not copy the lane's cell and window");
+
+    // A refused seal leaves the reservation as it was.
+    rejects([&] { static_cast<void>(storage.seal(*reservation, {4096, 2048, 2048, 4000})); },
+            "a composite snapshot needs the context window of its draft rings",
+            "a state was sealed behind its context window");
+    std::shared_ptr<const model::QwenCompositeState> state = storage.seal(*reservation, published(4096));
+    rejects([&] { static_cast<void>(reservation->buffers()); }, "a sealed state reservation holds no buffers",
+            "a sealed reservation still held its buffers");
+    rejects([&] { static_cast<void>(storage.seal(*reservation, published(4096))); },
+            "composite state buffers are empty", "a reservation was sealed twice");
+    reservation.reset();
+    require(storage.idleCells() == 0 && storage.idleWindows() == 0,
+            "a sealed reservation returned the buffers its state holds");
+    require(state->canOffload(false), "a sealed state cannot be written to the disk tier");
+    auto write = state->offload({});
+    require(write && finishWhenReady(*write), "a sealed state's disk write failed");
+    fill(storage.current(0).stateBase, 99);
+    fill(storage.window(0), 98);
+    auto read = storage.beginRestore(0, *write->state(), true, {}, [] {});
+    require(read && finishWhenReady(*read) && stateImage(storage, 0) == images &&
+                storage.metadata(0).lengths == published(4096),
+            "a sealed state's disk copy did not restore every byte and its lengths");
+    read.reset();
+    write.reset();
+    state.reset();
+    require(storage.idleCells() == 1 && storage.idleWindows() == 1 &&
+                storage.actualAllocatedBytes() == slotted,
+            "a dropped sealed state did not return its slot to the pool once");
+
+    // Another storage's reservation is refused.
+    model::QwenStateStorage other(backend, admit, layout, nullptr);
+    auto foreign = other.reserve();
+    rejects([&] { static_cast<void>(storage.seal(*foreign, published(4096))); },
+            "a state reservation of another storage", "a foreign reservation was sealed");
+    outlives = storage.reserve();
+    storage.releaseLane(0, 9);
+  }
+  // Its storage went first: the reservation frees its buffers.
+  outlives.reset();
+  require(backend.memoryStats().allocatedBytes == beforeStorage,
+          "a reservation that outlived its storage kept its buffers");
+}
+
 void run(const std::string &metallib) {
   using model::QwenCompositeState;
   using model::QwenLogicalLengths;
@@ -474,12 +615,14 @@ void run(const std::string &metallib) {
   testOffloadAllocationFailure(backend);
   testDiskRestore(backend);
   testDirectDiskSnapshot(backend);
+  testStateWritesDrawOnTheWriteBudget(backend);
   testStateSmallerThanSlot(backend);
   testPersistentStateComesBack(backend);
   testPersistKeepsTheRamCopy(backend);
+  testReservations(backend);
   MemoryGovernor governor(
-      backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
-      queryHostAvailableMemory, 0);
+      backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
+      queryHostMemory, 0);
   // Switched off to prove that a pooled cache slot needs no new admission;
   // the count is of the admissions granted.
   bool admitNewAllocations = true;

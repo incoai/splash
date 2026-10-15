@@ -43,7 +43,13 @@ from .api_shapes import (
     text_completion_chunk,
     text_completion_response,
 )
-from .backend import NativeBackend, NativeResult, remaining_request_time
+from .backend import (
+    NativeBackend,
+    NativeResult,
+    ThinkingEndError,
+    remaining_request_time,
+    thinking_end_tokens,
+)
 from .chat_templates import ChatTemplateError, ChatTemplates
 from .connections import ConnectionSlots, HttpAdmission, RequestBodyReservation
 from .constraints import ConstraintFactory, validate_tokenizer
@@ -244,8 +250,9 @@ class Collected:
     def cut(self):
         """Whether the output's end cut its last block short: the token limit
         cuts any block, a stop sequence only a call, as text may end where
-        the client asks."""
-        return self.result.reason == "length" or self.cut_in_call
+        the client asks. A call cut at its name has no block, and a stop
+        sequence there leaves the block before it whole."""
+        return self.result.reason == "length" or self.cut_call is not None
 
     @property
     def called(self):
@@ -799,14 +806,21 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
     def _post_memory_release(self, body, deadline):
         weights = self.app.backend.release_weights().get("weights") or {}
-        if weights.get("released") is not True:
-            raise APIError(
+        # A restore leaves the weights released until its last image is back.
+        if weights.get("released") is True and weights.get("restoring") is False:
+            self._json(200, {"released": True, "weights": weights})
+            return
+        # An answer about the engine's state, not a failure: the console does
+        # not log it.
+        self._safe_error(
+            APIError(
                 409,
-                "the engine is serving requests or restoring its weights; "
-                "the weights stay loaded",
+                "the engine is serving requests or restoring its weights; it "
+                "releases them only while idle",
                 "engine_busy",
-            )
-        self._json(200, {"released": True, "weights": weights})
+            ),
+            log=False,
+        )
 
     def _post_systemone(self, body, deadline):
         answers = {}
@@ -1636,7 +1650,10 @@ def parse_args(argv=None):
     return args
 
 
-def _native_command(args):
+def _native_command(args, relaunch_context=None):
+    """The engine's command line, a relaunch's with `relaunch_context`, the
+    context the first engine served: without --max-context the relaunch keeps
+    it, where its own would follow a Neural Engine split calibrated anew."""
     command = [
         args.binary,
         "serve-native",
@@ -1644,12 +1661,14 @@ def _native_command(args):
         "auto" if args.max_context is None else str(args.max_context),
         "auto" if args.max_memory is None else str(args.max_memory),
     ]
-    if args.max_cache_disk:
+    if args.max_cache_disk is not None:
         command.append(str(args.max_cache_disk))
+    if args.max_cache_disk_writes:
+        command.extend(("--max-cache-disk-writes", str(args.max_cache_disk_writes)))
     if args.persistent_cache:
-        command.extend(
-            ("--cache-dir", str(args.cache_dir or serve_options.DEFAULT_CACHE_DIR))
-        )
+        command.extend(("--persistent-cache", "on"))
+    if args.cache_dir is not None:
+        command.extend(("--cache-dir", str(args.cache_dir)))
     if args.kv_format != "int8":
         command.extend(("--kv-format", args.kv_format))
     if args.state_format != "fp32":
@@ -1668,6 +1687,8 @@ def _native_command(args):
         )
     if args.allow_idle_sleep:
         command.extend(("--idle-sleep", "allow"))
+    if relaunch_context is not None and args.max_context is None:
+        command.extend(("--relaunch-context", str(relaunch_context)))
     return command
 
 
@@ -1728,10 +1749,14 @@ def main():
             args.tokenizer, local_files_only=True, trust_remote_code=False
         )
         validate_tokenizer(tokenizer)
+        thinking_end = thinking_end_tokens(tokenizer, args.thinking_end_text)
         chat_templates = ChatTemplates(tokenizer)
         print_status(f"Chat template · {chat_templates.describe()}")
         runtime = engine_runtime.MultiplexedRuntime(
             _native_command(args),
+            relaunch_command=lambda first: _native_command(
+                args, first.max_context_tokens
+            ),
             startup_timeout=NATIVE_START_TIMEOUT,
             pending_limit=args.queue_size,
         )
@@ -1739,6 +1764,7 @@ def main():
             runtime,
             tokenizer,
             request_logger=print_request,
+            thinking_end=thinking_end,
         )
         if not runtime.wait_ready():
             raise engine_runtime.EngineUnhealthy("native runtime did not become ready")
@@ -1790,6 +1816,7 @@ def main():
         engine_runtime.EngineRuntimeError,
         ThinkingKeyError,
         ChatTemplateError,
+        ThinkingEndError,
     ) as error:
         print_status(f"Error · {error}", error=True)
         raise SystemExit(1) from None

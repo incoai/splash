@@ -1194,12 +1194,12 @@ int main(int argc, char **argv) {
       }
     }
 
-    // Cold prefills whose first chunk holds these rows, around where the
-    // prefill FFN's Neural Engine split starts and where its program's
-    // functions step (ops::AneFfn): a cold prompt prefills up to its replay
-    // point, the last 32-token page boundary before its last token, then the
-    // rest, so a prompt of rows + 1 tokens runs a chunk of those rows and one
-    // of a row. Each prompt is unique and runs on an empty cache.
+    // Cold prefills of one chunk of these rows, around where the prefill
+    // FFN's Neural Engine split starts and where its program's functions step
+    // (ops::AneFfn): a prompt of these tokens runs as one chunk, which
+    // captures its replay point, the last 32-token page boundary before its
+    // last token, inside it. Each prompt is unique and runs on an empty
+    // cache.
     if (selected.shortPrompts) {
       constexpr std::array<uint32_t, 8> shortRows{480, 512, 544, 640, 672, 1024, 1536, 2016};
       for (uint32_t sample = 0; sample < samples; ++sample) {
@@ -1207,7 +1207,7 @@ int main(int argc, char **argv) {
           evictAllCache(resources->cache());
           Measurement result = runRequest(
               engine, driver, *executor, events, progress.get(), requestId++, "short", sample,
-              prompt(rows + 1, (uint64_t{rows} << 32 | sample) ^ 0x53484f5254ULL));
+              prompt(rows, (uint64_t{rows} << 32 | sample) ^ 0x53484f5254ULL));
           if (result.cacheStatus != "miss")
             throw std::runtime_error("short prompt of a " + std::to_string(rows) +
                                      "-row chunk was not a cold miss: " + result.cacheStatus);

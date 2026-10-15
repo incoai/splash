@@ -1,5 +1,6 @@
 #pragma once
 
+#include "AwakeClock.hpp"
 #include "engine/Engine.hpp"
 #include "engine/Protocol.hpp"
 #include "engine/Status.hpp"
@@ -18,9 +19,9 @@ namespace splash::engine {
 
 // The clocks a native loop reads unless told others: the system clock in
 // Unix microseconds, which a request's absolute deadline is on, and the awake
-// clock (AwakeClock) in milliseconds, which it measures every duration on.
+// clock in milliseconds (awakeMilliseconds), which it measures every duration
+// on.
 [[nodiscard]] uint64_t systemUnixMicros() noexcept;
-[[nodiscard]] double awakeMilliseconds() noexcept;
 
 // The loop's constructor refuses a config without its metrics, its weights,
 // their admission or its clocks.
@@ -117,8 +118,8 @@ public:
   // arrival, on the runtime's clock.
   [[nodiscard]] engine::EngineSnapshot statusSnapshot() const;
   [[nodiscard]] WeightsSnapshot weightsSnapshot() const {
-    return {idleReleaseSeconds_, config_.weights->released(), weightRestores_,
-            weightRestoreFailures_};
+    return {idleReleaseSeconds_, config_.weights->released(),
+            restoreStarted_.has_value(), weightRestores_, weightRestoreFailures_};
   }
   // The engine's (Engine::resourceWaitSnapshot), with the requests a refused
   // restore holds waiting for memory.
@@ -148,6 +149,9 @@ private:
 
   bool handle(protocol::ClientMessage &message);
   bool handleRequest(protocol::RequestFrame &request);
+  // Gives the weights back when the engine holds no request and no restore is
+  // under way; true when it did.
+  bool releaseWeights();
   bool restoreWeights();
   bool weightsRefused(metal::AllocationFailure failure);
   bool handleCancel(const protocol::CancelFrame &cancel);

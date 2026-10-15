@@ -42,6 +42,7 @@ from dataclasses import dataclass
 from .chat_templates import render_chat_template, template_options
 from .errors import field_error
 from .protocol import MAX_SCORE_TOKENS
+from .tokenization import tokenizable
 
 LETTERS = "ABCDEFGHIJKLMNOP"
 DIRECT_SYSTEM = (
@@ -180,7 +181,10 @@ def encode_prompt(
     prompt_tokenizer, chat_template, messages, labels, *, admit, checkpoint
 ):
     """Render messages with chat_template, without thinking as a request
-    with effort none renders, and verify single-token answer slots.
+    with effort none renders, and verify single-token answer slots. The
+    prompt is the rendered text as every prompt is tokenized, with each
+    surrogate code point as U+FFFD (tokenizable): the one text its tokens,
+    the slot checks and its digest read.
 
     Mirrors SemIf semif_phase1.direct.encode_prompt: each slot label must be
     one exact round-trip token, and appending the label to the rendered
@@ -193,7 +197,7 @@ def encode_prompt(
     runs once per slot inside it; either may raise to abandon preparation.
     """
     tokenizer = prompt_tokenizer.tokenizer
-    prompt = render_chat_template(
+    rendered = render_chat_template(
         tokenizer,
         messages,
         {
@@ -207,6 +211,7 @@ def encode_prompt(
             ),
         },
     )
+    prompt = tokenizable(rendered)
     head, tail = prompt_tokenizer.split(prompt)
     tail_ids = list(tokenizer.encode(tail, add_special_tokens=False))
     ids = head + tail_ids

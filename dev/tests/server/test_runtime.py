@@ -1140,6 +1140,47 @@ class RuntimeTests(unittest.TestCase):
         self.assertIsInstance(runtime.fatal_error, engine_runtime.EngineUnhealthy)
         self.assertIn("context window", str(runtime.fatal_error))
 
+    def test_engines_after_the_first_ready_run_the_relaunch_command(self):
+        # Engines started before any was Ready run the command, and every one
+        # after it the relaunch command of that first engine's ReadyEvent.
+        factory = FakeFactory(initial_output=b"")
+        commands = []
+
+        def spawn(command, **_options):
+            commands.append(command)
+            process = factory()
+            if factory.initial_output == b"":
+                # It ends before its Ready.
+                process.close_stdout()
+            return process
+
+        runtime = engine_runtime.MultiplexedRuntime(
+            ("splash", "serve-native"),
+            relaunch_command=lambda first: (
+                "splash",
+                "serve-native",
+                str(first.max_context_tokens),
+            ),
+        )
+        self.addCleanup(runtime.close)
+        with (
+            mock.patch.object(engine_runtime.subprocess, "Popen", side_effect=spawn),
+            mock.patch.object(runtime._crash_trace, "dump"),
+        ):
+            with self.assertRaisesRegex(engine_runtime.EngineUnhealthy, "reached EOF"):
+                runtime.wait_ready(1)
+            factory.initial_output = None
+            self.assertTrue(runtime.wait_ready(1))
+            factory.processes[-1].kill()
+            self.assertTrue(runtime.wait_ready(1))
+            factory.processes[-1].kill()
+            self.assertTrue(runtime.wait_ready(1))
+        self.assertEqual(
+            commands,
+            [("splash", "serve-native")] * 2
+            + [("splash", "serve-native", str(READY.max_context_tokens))] * 2,
+        )
+
     def test_unanswered_status_with_fail_unanswered_fails_only_its_generation(self):
         factory = FakeFactory()
         runtime = engine_runtime.MultiplexedRuntime(

@@ -1020,7 +1020,7 @@ void gateMatchesPrefill(MetalBackend &backend, const GdnShape &shape, bool float
         backend.view(fixture.current[lane], 0, uint64_t{kCarried} * shape.convolutionDimension * 2);
     prefill.recurrentIn = backend.view(fixture.current[lane], fixture.cell.convBytes, stateBytes);
     CommandGraph graph;
-    GDN::addPrefill(graph, prefill, shape, kRows, GdnStateFormat::Float32, order);
+    GDN::addPrefill(graph, backend, prefill, shape, kRows, GdnStateFormat::Float32, order);
     (void)backend.submitCommandAsync(graph.dispatches()).wait();
 
     const float *state = fixture.cell.recurrent(fixture.cellBytes(fixture.current[lane]), 0);

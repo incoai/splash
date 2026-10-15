@@ -94,6 +94,13 @@ PROMETHEUS_SERIES = {
     "splash_state_active_lanes": ("state", "active_lanes"),
     "splash_state_publications_total": ("state", "publications"),
     "splash_state_evictions_total": ("state", "evictions"),
+    "splash_disk_capacity_bytes": ("disk", "capacity_bytes"),
+    "splash_disk_limit_bytes": ("disk", "limit_bytes"),
+    "splash_disk_used_bytes": ("disk", "used_bytes"),
+    "splash_disk_volume_available_bytes": ("disk", "volume_available_bytes"),
+    "splash_disk_write_budget_bytes": ("disk", "write_budget_bytes"),
+    "splash_disk_read_bytes_total": ("disk", "read_bytes"),
+    "splash_disk_written_bytes_total": ("disk", "written_bytes"),
     "splash_cache_hits_total": ("cache", "hits"),
     "splash_cache_cold_misses_total": ("cache", "cold_misses"),
     "splash_cache_reused_tokens_total": ("cache", "reused_tokens"),
@@ -210,6 +217,11 @@ def prometheus_metrics(status):
     for state in ("nominal", "fair", "serious", "critical"):
         lines.append(
             f'splash_thermal_state{{state="{state}"}} {1 if thermal == state else 0}'
+        )
+    gated = status.get("disk", {}).get("writes_gated")
+    for state in ("no", "budget", "closed"):
+        lines.append(
+            f'splash_disk_writes_gated{{state="{state}"}} {1 if gated == state else 0}'
         )
     for name, path in PROMETHEUS_SERIES.items():
         metric_value = value(path)

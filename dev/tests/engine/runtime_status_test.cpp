@@ -88,6 +88,8 @@ void testCleanRuntimeStatus(const char *goldenPath) {
   engine.recycledStatePublications = 1;
   engine.scheduler.waitingPrefix = 3;
   engine.diskStatePublications = 4;
+  engine.stateCaptures = 6;
+  engine.captureCuts = 1;
   engine.scheduler.prefillBatches = 4;
   engine.scheduler.prefillRows = 4096;
   engine.scheduler.decodeBatches = 4;
@@ -125,6 +127,11 @@ void testCleanRuntimeStatus(const char *goldenPath) {
   engine.resources.kvTier.readBytes = 12345;
   engine.resources.kvTier.writtenBytes = 67890;
   engine.resources.kvTier.fileBytes = 24680;
+  engine.resources.kvTier.capacityBytes = 34359738368;
+  engine.resources.kvTier.limitBytes = 8589934592;
+  engine.resources.kvTier.usedBytes = 4096;
+  engine.resources.kvTier.volumeAvailableBytes = 46170898432;
+  engine.resources.kvTier.writesGated = engine::DiskWritesGate::Budget;
   engine.resources.persistent = true;
   engine.resources.kvTier.copies = 64;
   engine.resources.adoption = {2, 96, 4096, 1};
@@ -165,6 +172,8 @@ void testCleanRuntimeStatus(const char *goldenPath) {
   governor.hostMeasurementValid = true;
   governor.hostAvailableBytes = 8 * kGiB;
   governor.hostReserveBytes = 2 * kGiB;
+  governor.hostSpareBytes = 8 * kGiB;
+  governor.hostSpareReserveBytes = 2 * kGiB;
   governor.hostHeadroomBytes = 6 * kGiB;
   governor.hostGrowthAllowed = true;
 
@@ -212,7 +221,7 @@ void testCleanRuntimeStatus(const char *goldenPath) {
                                   .oldestWaitMilliseconds = 1250.0, .draining = true};
   const std::string json = runtimeStatusJson(
       memoryPlan, engine, metal, warmup, audit(memoryPlan), metrics, executorTelemetry,
-      identity, governor, true, {}, wait, NativeLoopTiming{1843.25}, {600.0, false, 2, 1}, aneFfn,
+      identity, governor, true, {}, wait, NativeLoopTiming{1843.25}, {600.0, false, false, 2, 1}, aneFfn,
       ThermalState::Fair);
   std::ifstream golden(goldenPath);
   const std::string expected{std::istreambuf_iterator<char>(golden), {}};
@@ -225,6 +234,11 @@ void testCleanRuntimeStatus(const char *goldenPath) {
               json.find("\"written_bytes\":67890") != std::string::npos &&
               json.find("\"file_bytes\":24680,") != std::string::npos,
           "disk byte accounting was not exposed");
+  require(json.find("\"disk\":{\"capacity_bytes\":34359738368,\"limit_bytes\":8589934592,"
+                    "\"used_bytes\":4096,\"file_bytes\":24680,"
+                    "\"volume_available_bytes\":46170898432,\"writes_gated\":\"budget\","
+                    "\"write_budget_bytes\":0,") != std::string::npos,
+          "the disk tier's limit, volume and write budget were not exposed");
   require(json.find("\"persistent\":true,\"kv_copies\":64,\"kv_copy_failures\":0,"
                     "\"taken_back\":{\"states\":2,\"kv_blocks\":96,\"bytes\":4096,"
                     "\"left_behind\":1},\"write_behind\":{\"waiting\":1,\"durable\":5,"
@@ -339,7 +353,8 @@ void testCleanRuntimeStatus(const char *goldenPath) {
           json.find("\"waiting_prefix\":3") != std::string::npos &&
           json.find("\"deduplicated_state_publications\":2,"
                     "\"recycled_state_publications\":1,"
-                    "\"disk_state_publications\":4,") !=
+                    "\"disk_state_publications\":4,"
+                    "\"state_captures\":6,\"capture_cuts\":1,") !=
               std::string::npos &&
           json.find("\"lazy_junctions\":1") != std::string::npos &&
           json.find("\"checkpoint_publications\":3,"
@@ -530,23 +545,29 @@ void testResourceWaitDiagnostics() {
 }
 
 // The weights' idle release, null with --idle-release off, whether they are
-// released, how often they were written back and how often a restore gave up.
+// released and whether a restore is under way, how often they were written
+// back and how often a restore gave up.
 void testWeightsStatus() {
   const auto memoryPlan = plan();
   const auto status = [&](WeightsSnapshot weights) {
     return runtimeStatusJson(memoryPlan, {}, {}, {}, {}, {}, {}, {}, {}, true, {}, {}, {},
                              weights, {}, {});
   };
-  require(status({600.0, true, 2, 1})
+  require(status({600.0, true, false, 2, 1})
                   .find("\"weights\":{\"idle_release_seconds\":600,\"released\":true,"
-                        "\"restores\":2,\"restore_failures\":1}") != std::string::npos,
+                        "\"restoring\":false,\"restores\":2,\"restore_failures\":1}") !=
+              std::string::npos,
           "the weights' status is missing or inaccurate");
-  require(status({1234567.5, false, 0}).find("\"idle_release_seconds\":1234567.5,") !=
+  require(status({600.0, true, true, 2, 1})
+                  .find("\"released\":true,\"restoring\":true,") != std::string::npos,
+          "a restore under way is missing from the weights' status");
+  require(status({1234567.5, false, false, 0}).find("\"idle_release_seconds\":1234567.5,") !=
               std::string::npos,
           "the idle release lost precision");
-  require(status({std::numeric_limits<double>::infinity(), false, 0})
+  require(status({std::numeric_limits<double>::infinity(), false, false, 0})
                   .find("\"weights\":{\"idle_release_seconds\":null,\"released\":false,"
-                        "\"restores\":0,\"restore_failures\":0}") != std::string::npos,
+                        "\"restoring\":false,\"restores\":0,\"restore_failures\":0}") !=
+              std::string::npos,
           "an idle release that is off is not null");
 }
 

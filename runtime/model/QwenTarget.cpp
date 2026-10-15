@@ -55,14 +55,16 @@ void includeProjection(QwenTargetGeometry &geometry, const ops::Projection &proj
 }
 
 // The projections a dense layer's FFN dispatches; a MoE block runs its own
-// plans (ops::MoeShape).
+// plans (ops::MoeShape). Its gate and up run as one gate/up plan, which takes
+// them of one size and rotation in any formats.
 void includeFfn(QwenTargetGeometry &geometry, const Qwen3_8LayerWeights &layer) {
-  if (layer.gateProjection.shape() != layer.upProjection.shape())
+  const ops::ProjectionShape gate = layer.gateProjection.shape(), up = layer.upProjection.shape();
+  if (gate.outputSize != up.outputSize || gate.inputSize != up.inputSize || gate.rotated != up.rotated)
     throw WeightStoreError("fused gate/up projections must have matching shapes");
   includeProjection(geometry, layer.gateProjection);
   includeProjection(geometry, layer.upProjection);
   includeProjection(geometry, layer.downProjection);
-  geometry.gateUpProjections.push_back(layer.upProjection.shape());
+  geometry.gateUpProjections.push_back(up);
 }
 void includeFfn(QwenTargetGeometry &, const Qwen3_6MoeLayerWeights &) {}
 
@@ -79,6 +81,16 @@ uint32_t routedExpertFormat(std::span<const Qwen3_6MoeLayerWeights> layers) {
   }
   const auto most = std::max_element(weights.begin(), weights.end());
   return *most ? uint32_t(most - weights.begin()) : GGUF_FMT_COUNT;
+}
+// Whether every routed and shared expert weight of a target's MoE blocks is in
+// a format the register tile takes (ops::MoeShape::registerFormats).
+bool expertRegisterFormats(std::span<const Qwen3_8LayerWeights>) { return true; }
+bool expertRegisterFormats(std::span<const Qwen3_6MoeLayerWeights> layers) {
+  for (const Qwen3_6MoeLayerWeights &layer : layers)
+    for (const ops::BlockExpertProjection *projection : {&layer.ffn.gate, &layer.ffn.up, &layer.ffn.down})
+      for (const ops::QuantizedSegment *s : {&projection->routed, &projection->shared})
+        if (!s->isFloat() && !quant_register_format(s->formatId)) return false;
+  return true;
 }
 
 } // namespace
@@ -102,6 +114,7 @@ QwenTargetGeometry qwenTargetGeometry(const QwenTargetWeights<Layout, Layer> &we
     includeFfn(geometry, layer);
   }
   geometry.moeExpertFormat = routedExpertFormat(weights.layers);
+  geometry.moeRegisterFormats = expertRegisterFormats(weights.layers);
   geometry.prefillProjections = geometry.decodeProjections;
   includeProjection(geometry, weights.logitsProjection);
   for (auto *shapes : {&geometry.prefillProjections, &geometry.decodeProjections,
@@ -194,11 +207,15 @@ metal::MetalBuffer QwenTarget::addPrefill(
       kvLayers.size() != geometry_.kvLayout.attentionLayers) {
     throw std::invalid_argument("invalid Qwen ragged prefill batch");
   }
+  const auto everyLayer = [&](std::span<const metal::MetalBuffer> views) {
+    return views.size() == geometry_.stateLayout.layers;
+  };
   for (const QwenTargetPrefillSequence &sequence : sequences) {
-    if (sequence.convolutionIn.size() != geometry_.stateLayout.layers ||
-        sequence.convolutionOut.size() != geometry_.stateLayout.layers ||
-        sequence.recurrentIn.size() != geometry_.stateLayout.layers ||
-        sequence.recurrentOut.size() != geometry_.stateLayout.layers) {
+    if (!everyLayer(sequence.convolutionIn) || !everyLayer(sequence.convolutionOut) ||
+        !everyLayer(sequence.recurrentIn) || !everyLayer(sequence.recurrentOut) ||
+        !std::ranges::all_of(sequence.stateCaptures, [&](const QwenTargetStateCapture &capture) {
+          return everyLayer(capture.convolution) && everyLayer(capture.recurrent);
+        })) {
       throw std::invalid_argument("Qwen prefill state layer mismatch");
     }
   }
@@ -255,15 +272,19 @@ metal::MetalBuffer QwenTarget::addPrefillMixer(PrefillStep &step, const QwenGdnW
     const auto f32 = [&](const metal::MetalBuffer &buffer, uint32_t width) {
       return rowsOf<float>(backend_, buffer, sequence.rowBegin, sequence.rows, width);
     };
+    std::vector<ops::GdnPrefillCapture> captures;
+    captures.reserve(sequence.stateCaptures.size());
+    for (const QwenTargetStateCapture &capture : sequence.stateCaptures)
+      captures.push_back({capture.row, capture.convolution[layer], capture.recurrent[layer]});
     ops::GDN::addPrefill(
-        step.graph,
+        step.graph, backend_,
         {u16(b.gdnPacked, geometry_.packedGdnWidth), mixer.convolutionWeights, sequence.convolutionIn[layer],
          sequence.convolutionOut[layer], u16(b.gdnQueries, geometry_.gdnKeyWidth()),
          u16(b.gdnKeys, geometry_.gdnKeyWidth()), u16(b.gdnValues, geometry_.attentionWidth), mixer.decay,
          mixer.timeBias, f32(b.gdnDecay, geometry_.gdnValueHeads), u16(b.gdnBeta, geometry_.gdnValueHeads),
          sequence.recurrentIn[layer], sequence.recurrentOut[layer], u16(b.recurrent, geometry_.attentionWidth),
          mixer.mixerNorm, u16(b.gdnHidden, geometry_.attentionWidth)},
-        geometry_.gdnShape(), sequence.rows, geometry_.stateLayout.format, mixer.outputHeadOrder);
+        geometry_.gdnShape(), sequence.rows, geometry_.stateLayout.format, mixer.outputHeadOrder, captures);
   }
   addPrefillOutput(step, b.gdnHidden, mixer.outputProjection, input, b.gdnOutput);
   return b.gdnOutput;

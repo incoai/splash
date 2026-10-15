@@ -133,12 +133,14 @@ validateLimits(const ProtocolLimits &limits);
 //   82 u32 flags
 //   86 u64 cacheSalt.lo, u64 cacheSalt.hi
 //  102 u32 thinkingBudget.tokens, kNoThinkingBudget for none
-//  106 u32 thinkingBudget.end, u32 thinkingBudget.alsoEnds, zero without a
-//      budget
-// then the prompt tokens, the 32-byte image spans, the image pixels and the
-// score tokens.
+//  106 u32 thinking end token count, u32 thinkingBudget.alsoEnds, zero
+//      without a budget
+// then the prompt tokens, the 32-byte image spans, the image pixels, the
+// score tokens and the thinking end tokens.
 inline constexpr uint64_t kRequestFixedBytes = 114;
 inline constexpr uint32_t kNoThinkingBudget = 0xFFFFFFFFU;
+// A thinking budget's end holds 1 to this many tokens.
+inline constexpr uint32_t kMaximumThinkingEndTokens = 64;
 
 // The request flags word holds the RequestFlag bits and this one, which asks
 // for PromptProgressEvents while the prompt prefills.
@@ -225,8 +227,9 @@ struct StatusRequestFrame {
 };
 
 // Asks the engine to give its weights back now, as the idle release does, when
-// it holds no request. The answer is a StatusJson with the same correlationId,
-// whose `weights.released` says whether the weights are released.
+// it holds no request and restores none, with the idle release on or off. The
+// answer is a StatusJson with the same correlationId, whose `weights` section
+// says whether the weights are released: `released` and not `restoring`.
 struct ReleaseRequestFrame {
   uint64_t correlationId = 0;
 
@@ -291,8 +294,9 @@ struct DoneEvent {
   // Raw final-prompt-position logits at the request's scoreTokens, in
   // requested order. Empty for generation and for cancelled/failed scoring.
   std::vector<float> optionLogits{};
-  // Of the tokens the request computed, those whose KV it then read from a
-  // cached block's page (engine::Cache::publishCommittedBlocks).
+  // Tokens whose KV the request read from cached blocks another request
+  // computed, past the cached prefix it started from
+  // (engine::EngineEventSink::completed).
   uint32_t deduplicatedTokens = 0;
   // Its speculative decoding; zero without a draft and for scoring.
   engine::SpeculativeCounts speculation{};

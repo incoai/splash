@@ -21,11 +21,6 @@ uint64_t systemUnixMicros() noexcept {
       std::chrono::duration_cast<std::chrono::microseconds>(now).count());
 }
 
-double awakeMilliseconds() noexcept {
-  const auto now = AwakeClock::now().time_since_epoch();
-  return std::chrono::duration<double, std::milli>(now).count();
-}
-
 NativeRuntime::NativeRuntime(NativeLoopConfig config, double idleReleaseSeconds,
                              engine::Cache &cache, model::Model &model,
                              ByteSink output, StatusProvider statusProvider,
@@ -132,13 +127,18 @@ bool NativeRuntime::flushRestorePoints() {
 }
 
 void NativeRuntime::releaseIdleWeights() {
-  if (config_.weights->released() || !core_.idle() ||
-      config_.monotonicMilliseconds() - idleSinceMilliseconds_ <
-          1000.0 * idleReleaseSeconds_)
-    return;
+  if (config_.monotonicMilliseconds() - idleSinceMilliseconds_ >=
+          1000.0 * idleReleaseSeconds_ &&
+      releaseWeights())
+    logLine("Weights released after ", idleReleaseSeconds_,
+            " s without a request; the next request restores them");
+}
+
+bool NativeRuntime::releaseWeights() {
+  if (config_.weights->released() || restoreStarted_ || !core_.idle())
+    return false;
   config_.weights->release();
-  logLine("Weights released after ", idleReleaseSeconds_,
-          " s without a request; the next request restores them");
+  return true;
 }
 
 bool NativeRuntime::restoreWeights() {
@@ -363,14 +363,14 @@ bool NativeRuntime::handleStatus(const protocol::StatusRequestFrame &status) {
 }
 
 // The weights go back now, as at the end of the idle release, when the engine
-// holds no request and no restore is under way; otherwise nothing changes. The
-// answer is the status document either way: its `weights.released` tells
-// the caller which.
+// holds no request and no restore is under way, with the idle release on or
+// off; otherwise nothing changes. The answer is the status document either way,
+// whose weights section tells the caller which: `released` and not `restoring`
+// when they are given back, as a restore leaves them `released` until its last
+// image is written back.
 bool NativeRuntime::handleRelease(const protocol::ReleaseRequestFrame &release) {
-  if (!config_.weights->released() && !restoreStarted_ && core_.idle()) {
-    config_.weights->release();
+  if (releaseWeights())
     logLine("Weights released on request; the next request restores them");
-  }
   return handleStatus(protocol::StatusRequestFrame{release.correlationId});
 }
 

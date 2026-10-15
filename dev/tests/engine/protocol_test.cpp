@@ -176,7 +176,7 @@ RequestFrame exampleRequest() {
   request.constraint = ConstraintMode::TokenMask;
   request.generationPromptTokens = 2;
   request.cacheSalt = {0x8899aabbccddeeffULL, 0x0011223344556677ULL};
-  request.thinkingBudget = ThinkingBudget{4096, 248069, 248058};
+  request.thinkingBudget = ThinkingBudget{4096, {198, 248069}, 248058};
   return request;
 }
 
@@ -885,34 +885,67 @@ void testRequestFlags() {
   expectRequestIssue(test, score, IssueCode::InvalidConstraint);
 }
 
-// A thinking budget follows the cache salt; without one, its tokens word is
-// kNoThinkingBudget and its end tokens are zero.
+// A thinking budget's tokens, end token count and alsoEnds follow the cache
+// salt and its end tokens end the frame; without one, the tokens word is
+// kNoThinkingBudget, the others are zero and no end token follows. Its end
+// holds 1 to kMaximumThinkingEndTokens tokens, and only the last may end
+// thinking.
 void testThinkingBudget() {
   constexpr std::string_view test = "thinking budget";
   const size_t at = kFrameHeaderBytes + request_offset::thinkingBudget;
   const std::vector<uint8_t> wire = peer::serialize(exampleRequest());
-  CHECK(test, loadU32(wire, at) == 4096 && loadU32(wire, at + 4) == 248069 &&
+  CHECK(test, loadU32(wire, at) == 4096 && loadU32(wire, at + 4) == 2 &&
                   loadU32(wire, at + 8) == 248058);
+  CHECK(test, loadU32(wire, wire.size() - 8) == 198 &&
+                  loadU32(wire, wire.size() - 4) == 248069);
 
   RequestFrame none = exampleRequest();
   none.thinkingBudget.reset();
   const std::vector<uint8_t> noneWire = peer::serialize(none);
   CHECK(test, loadU32(noneWire, at) == kNoThinkingBudget &&
                   loadU32(noneWire, at + 4) == 0 && loadU32(noneWire, at + 8) == 0);
+  CHECK(test, noneWire.size() + 8 == wire.size());
   CHECK(test, roundTrip(none) == none);
   RequestFrame zero = exampleRequest();
   zero.thinkingBudget->tokens = 0;
   CHECK(test, roundTrip(zero) == zero);
+  RequestFrame longest = exampleRequest();
+  longest.thinkingBudget->end.assign(kMaximumThinkingEndTokens, 198);
+  longest.thinkingBudget->end.back() = 248069;
+  CHECK(test, roundTrip(longest) == longest);
 
-  std::vector<uint8_t> stray = noneWire;
-  storeU32(stray, at + 8, 248058);
-  const auto decoded = decodeClient(stray, kLimits);
+  const auto expectInvalidCount = [&](const std::vector<uint8_t> &bytes) {
+    const auto decoded = decodeClient(bytes, kLimits);
+    CHECK(test, !decoded && decoded.issue &&
+                    decoded.issue->failureClass == FailureClass::RequestError &&
+                    decoded.issue->code == IssueCode::InvalidCount);
+  };
+  for (const size_t word : {at + 4, at + 8}) {
+    std::vector<uint8_t> stray = noneWire;
+    storeU32(stray, word, 1);
+    expectInvalidCount(stray);
+  }
+  // The count is checked before the tokens are read.
+  std::vector<uint8_t> overlong = wire;
+  storeU32(overlong, at + 4, kMaximumThinkingEndTokens + 1);
+  expectInvalidCount(overlong);
+  std::vector<uint8_t> uncounted = wire;
+  storeU32(uncounted, at + 4, 3);
+  const auto decoded = decodeClient(uncounted, kLimits);
   CHECK(test, !decoded && decoded.issue &&
-                  decoded.issue->failureClass == FailureClass::RequestError &&
-                  decoded.issue->code == IssueCode::InvalidCount);
+                  decoded.issue->code == IssueCode::InvalidPayloadLength);
 
+  for (const std::vector<uint32_t> &end :
+       {std::vector<uint32_t>{}, std::vector<uint32_t>(kMaximumThinkingEndTokens + 1, 198),
+        std::vector<uint32_t>{248069, 248069}, std::vector<uint32_t>{248058, 248069}}) {
+    RequestFrame invalid = exampleRequest();
+    invalid.thinkingBudget->end = end;
+    if (!end.empty())
+      invalid.thinkingBudget->end.back() = 248069;
+    expectRequestIssue(test, invalid, IssueCode::InvalidCount);
+  }
   RequestFrame score = exampleScoreRequest();
-  score.thinkingBudget = ThinkingBudget{0, 248069, 248069};
+  score.thinkingBudget = ThinkingBudget{0, {248069}, 248069};
   expectRequestIssue(test, score, IssueCode::InvalidCount);
 }
 

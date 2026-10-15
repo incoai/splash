@@ -143,7 +143,9 @@ Linear::Linear(const DeviceCapabilities &device) noexcept
       gpuCores_(plannedGpuCores(device)) {}
 
 uint32_t Linear::decodeStorageRows(uint32_t rows, ProjectionShape shape) const {
-  return plan({{shape.outputSize, shape.inputSize}, rows, LinearPhase::Decode, LinearEpilogue::None}).storageRows();
+  const LinearWorkload w{{shape.outputSize, shape.inputSize}, rows, LinearPhase::Decode, LinearEpilogue::None};
+  validate(w);
+  return LinearPlan(w, ggufBaseline(w, {}, shape.registerFormats)).storageRows();
 }
 
 LinearPlan Linear::plan(LinearWorkload workload) const {

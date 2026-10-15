@@ -1,7 +1,7 @@
 #include "model/GgufPreparation.hpp"
 
+#include "metal/abi/Gguf.h"
 #include "metal/abi/GgufRepack.h"
-#include "metal/abi/QuantTables.h"
 #include "model/Bfloat16.hpp"
 #include "model/GgufImageLayout.hpp"
 #include "model/WeightImages.hpp"
@@ -27,7 +27,7 @@ static_assert(kGgufRepackStagingBytes <= std::numeric_limits<uint32_t>::max());
 // The source row image row `row` of `rows` is read from.
 uint64_t sourceRow(const gguf::TensorRows &rows, uint64_t row) {
   const gguf::RowOrder &order = rows.order;
-  if (row < order.from) return row;
+  if (row < order.from) return rows.first + row;
   if (!order.headRows || !order.keyHeads || !order.valueHeadsPerKey)
     throw GgufError("invalid weight row permutation");
   const uint64_t head = (row - order.from) / order.headRows;
@@ -35,7 +35,7 @@ uint64_t sourceRow(const gguf::TensorRows &rows, uint64_t row) {
       ((head % order.valueHeadsPerKey) * order.keyHeads + head / order.valueHeadsPerKey) * order.headRows +
       (row - order.from) % order.headRows;
   if (source >= rows.rows) throw GgufError("weight row permutation is out of bounds");
-  return source;
+  return rows.first + source;
 }
 
 void requireRange(uint64_t offset, uint64_t bytes, uint64_t available) {
@@ -303,61 +303,6 @@ void centeredNorm(const uint8_t *values, uint64_t count, uint8_t *to) {
   }
 }
 
-// E4M3 byte b as the kernels read it (quant_e4m3_pair): 2^-8 times its value.
-float e4m3Scaled(uint8_t b) {
-  const int exponent = (b >> 3) & 15, mantissa = b & 7;
-  const float magnitude = exponent ? std::ldexp(float(8 + mantissa), exponent - 18) : std::ldexp(float(mantissa), -17);
-  return b & 0x80 ? -magnitude : magnitude;
-}
-
-// Writes the F32 values, as the kernels compute them, of `count` native
-// blocks of safetensors format `id`: s * code + z (affine), kFP4Values[code]
-// (twice the E2M1 value) times 2^(e - 128) (mxfp4) or times the 16-group's
-// (128 g) * e4m3 / 2^8 (nvfp4), or (256 g) times e4m3 / 2^8 (fp8).
-void dequantize(const uint8_t *blocks, uint64_t count, uint32_t id, uint8_t *to) {
-  const QuantFormat &format = kQuantFormats[id];
-  if (id == GGUF_FMT_NVFP4 || id == GGUF_FMT_FP8) {
-    for (uint64_t block = 0; block < count; ++block) {
-      const uint8_t *in = blocks + block * format.block_bytes;
-      float g;
-      std::memcpy(&g, in + (id == GGUF_FMT_NVFP4 ? QUANT_NVFP4_G : 0), 4);
-      for (uint32_t l = 0; l < format.block_elements; ++l) {
-        const float value = id == GGUF_FMT_NVFP4
-                                ? float(kFP4Values[(in[QUANT_NVFP4_CODES + l / 2] >> (4 * (l % 2))) & 15]) *
-                                      (e4m3Scaled(in[l / 16]) * (128.0F * g))
-                                : e4m3Scaled(in[QUANT_FP8_VALUES + l]) * (256.0F * g);
-        std::memcpy(to + 4 * (block * format.block_elements + l), &value, 4);
-      }
-    }
-    return;
-  }
-  if (id == GGUF_FMT_MXFP4) {
-    for (uint64_t block = 0; block < count; ++block) {
-      const uint8_t *in = blocks + block * format.block_bytes;
-      const float scale = std::ldexp(1.0f, int{in[0]} - 128);
-      for (uint32_t l = 0; l < format.block_elements; ++l) {
-        const float value = float(kFP4Values[(in[1 + l % 16] >> (l < 16 ? 0 : 4)) & 15]) * scale;
-        std::memcpy(to + 4 * (block * format.block_elements + l), &value, 4);
-      }
-    }
-    return;
-  }
-  const uint32_t bits = quant_affine_bits(id), mask = (1u << bits) - 1;
-  for (uint64_t block = 0; block < count; ++block) {
-    const uint8_t *in = blocks + block * format.block_bytes;
-    uint16_t s, z;
-    std::memcpy(&s, in, 2);
-    std::memcpy(&z, in + 2, 2);
-    for (uint32_t l = 0; l < format.block_elements; ++l) {
-      const uint32_t at = l * bits, shift = at % 8;
-      uint32_t word = in[4 + at / 8];
-      if (shift + bits > 8) word |= uint32_t{in[4 + at / 8 + 1]} << 8;
-      const float value = std::fma(static_cast<float>((word >> shift) & mask), widenBfloat16(s), widenBfloat16(z));
-      std::memcpy(to + 4 * (block * format.block_elements + l), &value, 4);
-    }
-  }
-}
-
 uint64_t copiedBytes(const gguf::Copy &copy, uint64_t sourceBytes) {
   return gguf::convertedBytes(copy.source, copy.conversion, sourceBytes);
 }
@@ -400,9 +345,7 @@ void addCopyTasks(uint8_t *image, const gguf::Copy &copy,
           writeGdnDecay(staging.data(), count * width / (bfloat16 ? 2 : 4), bfloat16, to);
           break;
         }
-        case gguf::Conversion::DequantizeToFloat32:
-          dequantize(staging.data(), count * width / nativeFormat(rows).block_bytes, gguf_format_of(rows.type), to);
-          break;
+        case gguf::Conversion::DequantizeToFloat32: // decoded on the GPU (writeDecoded)
         case gguf::Conversion::None: break;
         }
       });
@@ -526,6 +469,40 @@ void writeRepack(metal::MetalBackend &backend, const metal::MetalBuffer &image, 
   }
 }
 
+// The rows of a DequantizeToFloat32 copy that one run decodes: as many as the
+// staging holds, whose elements the gather's 32-bit index counts (no format
+// holds more than eight in a byte).
+uint64_t decodedRun(const gguf::Copy &copy) {
+  const gguf::TensorRows &rows = copy.source;
+  const uint64_t run = std::min(rows.rows, kGgufRepackStagingBytes / rows.rowBytes);
+  if (!run) throw GgufError("weight row exceeds the repack staging: " + rows.name);
+  return run;
+}
+
+// Writes a DequantizeToFloat32 copy: runs of its native rows staged in input,
+// each gathered on the GPU (kernels/shared/embedding.metal,
+// gguf_embed_f32_<format>) into the F32 values of its format's decode, the run's
+// rows by their ids in `ids` (0, 1, ...).
+void writeDecoded(metal::MetalBackend &backend, const metal::MetalBuffer &image, const gguf::Copy &copy,
+                  const metal::MetalBuffer &input, const metal::MetalBuffer &ids) {
+  const gguf::TensorRows &rows = copy.source;
+  const QuantFormat &format = kQuantFormats[gguf_format_of(rows.type)];
+  if (rows.rowBytes % format.block_bytes) throw GgufError("decoded rows are not whole native blocks: " + rows.name);
+  const uint64_t columns = rows.rowBytes / format.block_bytes * format.block_elements, run = decodedRun(copy);
+  for (uint64_t first = 0; first < rows.rows; first += run) {
+    const uint64_t count = std::min(run, rows.rows - first);
+    readRows(rows, first, count, 0, rows.rowBytes, static_cast<uint8_t *>(input.contents()));
+    const GgufEmbedParams params{static_cast<uint32_t>(count), static_cast<uint32_t>(count),
+                                 static_cast<uint32_t>(columns)};
+    const metal::MetalBuffer output = backend.view(image, copy.destination + first * columns * sizeof(float),
+                                                   count * columns * sizeof(float));
+    static_cast<void>(backend.submit({std::string("gguf_embed_f32_") + format.name,
+                                      {{0, ids}, {1, input}, {2, output}},
+                                      {{3, &params, sizeof(params)}}, {(count * columns + 255) / 256, 1, 1},
+                                      {256, 1, 1}}));
+  }
+}
+
 } // namespace
 
 void writeGgufImage(metal::MetalBackend &backend, const metal::MetalBuffer &image, const gguf::Image &plan) {
@@ -533,14 +510,22 @@ void writeGgufImage(metal::MetalBackend &backend, const metal::MetalBuffer &imag
   if (destination.size() != plan.bytes) throw GgufError("GGUF image size differs from its plan");
   std::vector<std::pair<uint64_t, uint64_t>> extents;
   for (const gguf::Fill &fill : plan.fills) extents.emplace_back(fill.offset, fill.bytes.size());
+  // Copies the CPU converts read whole 4-byte values; the GPU decodes the
+  // others from whole native blocks.
+  std::vector<const gguf::Copy *> decoded;
+  uint64_t staging = 0, ids = 0;
   for (const gguf::Copy &copy : plan.copies) {
+    const bool decodes = copy.conversion == gguf::Conversion::DequantizeToFloat32;
     if (!copy.source.rows || !copy.source.rowBytes ||
-        (copy.conversion != gguf::Conversion::None && copy.source.rowBytes % 4))
+        (copy.conversion != gguf::Conversion::None && !decodes && copy.source.rowBytes % 4))
       throw GgufError("invalid prepared weight copy");
     extents.emplace_back(copy.destination, copyBytes(copy));
+    if (!decodes) continue;
+    decoded.push_back(&copy);
+    staging = std::max(staging, decodedRun(copy) * copy.source.rowBytes);
+    ids = std::max(ids, decodedRun(copy));
   }
   std::vector<RepackChunk> chunks;
-  uint64_t staging = 0;
   for (const gguf::Repack &repack : plan.repacks) {
     requireRepack(repack, plan.bytes);
     const auto offsets = planeOffsets(repack);
@@ -555,15 +540,19 @@ void writeGgufImage(metal::MetalBackend &backend, const metal::MetalBuffer &imag
   // Copies keep their source precision and never pass through a
   // quantization operation.
   std::vector<std::function<void(std::vector<uint8_t> &)>> tasks;
-  for (const gguf::Copy &copy : plan.copies) addCopyTasks(destination.data(), copy, tasks);
+  for (const gguf::Copy &copy : plan.copies)
+    if (copy.conversion != gguf::Conversion::DequantizeToFloat32) addCopyTasks(destination.data(), copy, tasks);
   std::vector<std::vector<uint8_t>> copyStaging(loadThreads());
   parallelFor(tasks.size(), [&](size_t index, unsigned thread) { tasks[index](copyStaging[thread]); });
-  // One staging buffer serves every repack of the image.
-  if (!plan.repacks.empty()) {
-    const auto input = backend.allocateBuffer(staging, metal::BufferStorage::Shared, "load/rows");
-    for (size_t i = 0; i < plan.repacks.size(); ++i)
-      writeRepack(backend, image, plan.repacks[i], chunks[i], input);
-  }
+  // One staging buffer serves every repack and decoded copy of the image.
+  if (plan.repacks.empty() && decoded.empty()) return;
+  const auto input = backend.allocateBuffer(staging, metal::BufferStorage::Shared, "load/rows");
+  for (size_t i = 0; i < plan.repacks.size(); ++i) writeRepack(backend, image, plan.repacks[i], chunks[i], input);
+  if (decoded.empty()) return;
+  const auto rowIds = backend.allocateBuffer(ids * sizeof(uint32_t), metal::BufferStorage::Shared, "load/row-ids");
+  auto *id = static_cast<uint32_t *>(rowIds.contents());
+  for (uint32_t row = 0; row < ids; ++row) id[row] = row;
+  for (const gguf::Copy *copy : decoded) writeDecoded(backend, image, *copy, input, rowIds);
 }
 
 } // namespace splash::model

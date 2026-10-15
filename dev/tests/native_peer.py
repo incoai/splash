@@ -157,7 +157,7 @@ def _decode_request(payload: bytes) -> wire.RequestFrame:
         salt_lo,
         salt_hi,
         thinking_tokens,
-        thinking_end,
+        thinking_end_count,
         thinking_also_ends,
     ) = _REQUEST.unpack_from(payload)
     offset = _REQUEST.size
@@ -172,7 +172,9 @@ def _decode_request(payload: bytes) -> wire.RequestFrame:
     offset += _IMAGE_SPAN.size * span_count
     pixel_bytes = sum(span.pixel_bytes for span in spans)
     pixels = bytes(payload[offset : offset + pixel_bytes])
-    scores = _words(payload, offset + pixel_bytes, score_count)
+    offset += pixel_bytes
+    scores = _words(payload, offset, score_count)
+    thinking_end = _words(payload, offset + 4 * score_count, thinking_end_count)
     return wire.RequestFrame(
         request_id,
         wire.RequestPriority(priority),

@@ -25,6 +25,8 @@ STATUS_SCHEMA_VERSION = 6
 # final-position logit per requested token, in request order.
 MIN_SCORE_TOKENS = 2
 MAX_SCORE_TOKENS = 255
+# A thinking budget's end holds 1 to this many tokens.
+MAX_THINKING_END_TOKENS = 64
 # Patches per image, the most the vision encoder takes; the server's pixel
 # cap may allow fewer.
 MAX_IMAGE_PATCHES = 16384
@@ -241,12 +243,13 @@ class ImageSpan:
 @dataclass(slots=True, frozen=True)
 class ThinkingBudget:
     """A request that generates inside a thinking block may select at most
-    `tokens` thinking tokens; the engine then selects `end`, which closes the
-    block. Thinking also ends where the request selects `end` or `also_ends`
-    first, such as a tool call's opening that follows thinking directly."""
+    `tokens` thinking tokens; the engine then selects the `end` tokens in
+    order, the last of which closes the block. Thinking also ends where the
+    request selects that close or `also_ends` first, such as a tool call's
+    opening that follows thinking directly; no other end token is either."""
 
     tokens: int
-    end: int
+    end: tuple[int, ...]
     also_ends: int
 
 
@@ -270,7 +273,8 @@ class RequestFrame:
     image_spans: tuple[ImageSpan, ...]
     image_pixels: bytes
     # Option token ids for score-only requests; empty means ordinary
-    # generation. Score tokens serialize after the image pixel bytes.
+    # generation. Score tokens serialize after the image pixel bytes, and a
+    # thinking budget's end tokens after them.
     score_tokens: tuple[int, ...]
     # Trailing prompt tokens of the chat template's generation prompt; zero
     # when unknown. It must leave at least one prompt token.
@@ -304,8 +308,9 @@ class StatusRequestFrame:
 
 @dataclass(slots=True, frozen=True)
 class ReleaseRequestFrame:
-    """Give the weights back now when the engine holds no request; answered
-    by a status JSON with the same correlation id."""
+    """Give the weights back now, as the idle release does, when the engine
+    holds no request and restores none, with the idle release on or off;
+    answered by a status JSON with the same correlation id."""
 
     correlation_id: int
 
@@ -376,8 +381,8 @@ class DoneEvent:
     # Raw final-position logits for a score-only request, in requested token
     # order; empty for generation and for cancelled or failed scoring.
     option_logits: tuple[float, ...]
-    # Of the tokens the request computed, those whose KV it then read from a
-    # cached block's page.
+    # Tokens whose KV the request read from cached blocks another request
+    # computed, past its cached prefix.
     deduplicated_tokens: int = 0
     drafted_tokens: int = 0
     accepted_draft_tokens: int = 0
@@ -632,10 +637,10 @@ def _image_spans_check(request: RequestFrame, prompt_tokens: int) -> None:
 
 def _validated_request(
     request: RequestFrame,
-) -> tuple[array.array, array.array, tuple]:
-    """The request's prompt and score words as uint32 arrays and its float32
-    sampling block, each checked once; raises a ProtocolError with the first
-    rule the request breaks."""
+) -> tuple[array.array, array.array, tuple, array.array]:
+    """The request's prompt and score words as uint32 arrays, its float32
+    sampling block and its thinking end words, each checked once; raises a
+    ProtocolError with the first rule the request breaks."""
     try:
         request_id = _u64(request.request_id, "request id")
         if not request_id:
@@ -727,13 +732,21 @@ def _validated_request(
     except (AttributeError, ValueError) as error:
         _fail_request(IssueCode.INVALID_SAMPLING, str(error), request_id)
     thinking = request.thinking_budget
+    end = array.array("I")
     if thinking is not None:
         try:
             if scores:
                 raise ValueError("score requests take no thinking budget")
             _integer(thinking.tokens, 0, _NO_THINKING_BUDGET - 1, "thinking budget")
-            _u32(thinking.end, "thinking end token")
-            _u32(thinking.also_ends, "thinking end token")
+            end = _words(thinking.end, "thinking end tokens")
+            also_ends = _u32(thinking.also_ends, "thinking end token")
+            if not 1 <= len(end) <= MAX_THINKING_END_TOKENS:
+                raise ValueError(
+                    f"thinking end token count must be in [1, {MAX_THINKING_END_TOKENS}]"
+                )
+            # Thinking ends where its end does, and nowhere inside it.
+            if end[-1] in end[:-1] or also_ends in end[:-1]:
+                raise ValueError("only the last thinking end token may end thinking")
         except (AttributeError, ValueError) as error:
             _fail_request(IssueCode.INVALID_COUNT, str(error), request_id)
     if scores and constraint is not ConstraintMode.NONE:
@@ -756,7 +769,7 @@ def _validated_request(
         _integer(request.cache_salt, 0, (1 << 128) - 1, "cache salt")
     except ValueError as error:
         _fail_request(IssueCode.INTEGER_OVERFLOW, str(error), request_id)
-    return prompt, scores, sampling
+    return prompt, scores, sampling, end
 
 
 def _mask_payload(values):
@@ -779,12 +792,13 @@ def _frame(frame_type: FrameType, payload_bytes: int) -> bytearray:
 def _request_frame(request: RequestFrame) -> bytearray:
     """The whole request frame, header included, in one buffer that each part
     is copied into once: image pixels run to hundreds of MiB."""
-    prompt, scores, sampling = _validated_request(request)
+    prompt, scores, sampling, end = _validated_request(request)
     prompt_offset = FRAME_HEADER_BYTES + _REQUEST.size
     spans_offset = prompt_offset + 4 * len(prompt)
     pixels_offset = spans_offset + _IMAGE_SPAN.size * len(request.image_spans)
     scores_offset = pixels_offset + len(request.image_pixels)
-    payload_bytes = scores_offset + 4 * len(scores) - FRAME_HEADER_BYTES
+    end_offset = scores_offset + 4 * len(scores)
+    payload_bytes = end_offset + 4 * len(end) - FRAME_HEADER_BYTES
     if issue := _payload_length_issue(FrameType.REQUEST, payload_bytes):
         _fail_request(issue.code, issue.message, request.request_id)
     frame = _frame(FrameType.REQUEST, payload_bytes)
@@ -811,7 +825,7 @@ def _request_frame(request: RequestFrame) -> bytearray:
             if request.thinking_budget is None
             else (
                 request.thinking_budget.tokens,
-                request.thinking_budget.end,
+                len(end),
                 request.thinking_budget.also_ends,
             )
         ),
@@ -831,7 +845,8 @@ def _request_frame(request: RequestFrame) -> bytearray:
     with memoryview(frame) as view:
         view[prompt_offset:spans_offset] = memoryview(prompt).cast("B")
         view[pixels_offset:scores_offset] = request.image_pixels
-        view[scores_offset:] = memoryview(scores).cast("B")
+        view[scores_offset:end_offset] = memoryview(scores).cast("B")
+        view[end_offset:] = memoryview(end).cast("B")
     return frame
 
 

@@ -17,6 +17,7 @@ from transformers import AutoTokenizer
 from dev.tests import fixture_files
 from dev.tests.fixture_files import GGUF_TYPE_ARRAY, GGUF_TYPE_STRING
 from dev.tests.installer_fixtures import (
+    DENSE,
     DRAFT_COMMIT,
     MOE,
     FakeHub,
@@ -36,6 +37,7 @@ GGML = {
     "F32": 0,
     "F16": 1,
     "Q5_0": 6,
+    "Q5_1": 7,
     "Q8_0": 8,
     "Q2_K": 10,
     "Q4_K": 12,
@@ -44,6 +46,7 @@ GGML = {
     "IQ4_XS": 23,
     "IQ1_M": 29,
     "BF16": 30,
+    "TQ2_0": 35,
     "MXFP4": 39,
     "NVFP4": 40,
     "PQ2_0": 142,
@@ -352,44 +355,62 @@ class GgufMetadataTests(unittest.TestCase):
         # Layer 3 is full attention; the others around it GDN.
         self.assertIn("blk.3.attn_q.weight", tensors)
         self.assertNotIn("blk.2.attn_q.weight", tensors)
-        # GDN alpha and beta may be both of any one quantized format or both
-        # F32, and the MTP layer (block 40) is never loaded, so its types do
+        # GDN alpha and beta may be of any one quantized format, F32 or of two
+        # types, and the MTP layer (block 40) is never loaded, so its types do
         # not matter.
         tensors |= {"blk.0.ssm_alpha.weight": GGML["IQ4_XS"]}
         tensors |= {"blk.0.ssm_beta.weight": GGML["IQ4_XS"]}
         tensors |= {"blk.1.ssm_alpha.weight": GGML["F32"]}
         tensors |= {"blk.1.ssm_beta.weight": GGML["F32"]}
         tensors |= {"blk.2.ssm_alpha.weight": GGML["Q8_0"]}
-        tensors |= {"blk.2.ssm_beta.weight": GGML["Q8_0"]}
-        tensors |= {"blk.40.ffn_up_exps.weight": GGML["BF16"]}
+        tensors |= {"blk.2.ssm_beta.weight": GGML["IQ3_XXS"]}
+        tensors |= {"blk.4.ssm_alpha.weight": GGML["F32"]}
+        tensors |= {"blk.4.ssm_beta.weight": GGML["NVFP4"]}
+        tensors |= {"blk.40.ffn_up_exps.weight": GGML["TQ2_0"]}
         tensors |= {"blk.0.ffn_down_exps.weight": GGML["IQ4_XS"]}
         # The low-bit formats of Unsloth's smaller files, the embedding too.
         tensors |= {"blk.4.ffn_gate_exps.weight": GGML["IQ3_XXS"]}
         tensors |= {"blk.2.attn_qkv.weight": GGML["IQ1_M"]}
         tensors |= {"blk.5.ffn_up_exps.weight": GGML["IQ2_XXS"]}
         tensors |= {"token_embd.weight": GGML["Q2_K"]}
+        # Q5_0 and Q5_1, the shared experts of bartowski's Q4_0 and Q4_1.
+        tensors |= {"blk.4.ffn_gate_shexp.weight": GGML["Q5_0"]}
+        tensors |= {"blk.4.ffn_up_shexp.weight": GGML["Q5_1"]}
+        # llama.cpp's fused gate/up experts in place of the two tensors.
+        del tensors["blk.7.ffn_gate_exps.weight"], tensors["blk.7.ffn_up_exps.weight"]
+        tensors |= {"blk.7.ffn_gate_up_exps.weight": GGML["IQ3_XXS"]}
         # llama.cpp's NVFP4, its per-expert tensor scales beside it.
         tensors |= {"blk.6.ffn_up_exps.weight": GGML["NVFP4"]}
         tensors |= {"blk.6.ffn_up_exps.scale": GGML["F32"]}
+        # BF16 and F16 tensors of quantized files: Unsloth's UD-Q8_K_XL keeps
+        # the attention projections and the LM head in BF16.
+        tensors |= {"blk.3.attn_q.weight": GGML["BF16"]}
+        tensors |= {"output.weight": GGML["BF16"]}
+        tensors |= {"blk.0.ffn_down_shexp.weight": GGML["F16"]}
+        tensors |= {"blk.5.ffn_gate_exps.weight": GGML["BF16"]}
+        tensors |= {"blk.5.ssm_alpha.weight": GGML["F16"]}
+        tensors |= {"blk.5.ssm_beta.weight": GGML["F16"]}
         path = write_gguf(self.root / "ok.gguf", values, tensors.items())
         gguf.require_loadable(gguf.Metadata(path, tensors=True))
-        f32 = {name: GGML["F32"] for name in tensors}
         for changes, reason in (
             (
-                {"blk.4.ffn_gate_exps.weight": GGML["Q5_0"]},
-                "ffn_gate_exps.weight Q5_0 [(]1 tensor[)]",
+                {"blk.4.ffn_gate_exps.weight": GGML["TQ2_0"]},
+                "ffn_gate_exps.weight type 35 [(]1 tensor[)]",
             ),
             (
                 {
-                    "blk.0.attn_qkv.weight": GGML["BF16"],
-                    "blk.1.attn_qkv.weight": GGML["BF16"],
+                    "blk.0.attn_qkv.weight": GGML["TQ2_0"],
+                    "blk.1.attn_qkv.weight": GGML["TQ2_0"],
                 },
-                "attn_qkv.weight BF16 [(]2 tensors[)]",
+                "attn_qkv.weight type 35 [(]2 tensors[)]",
             ),
-            ({"token_embd.weight": GGML["IQ2_XXS"]}, "token_embd.weight IQ2_XXS"),
-            ({"blk.3.attn_q.weight": GGML["BF16"]}, "attn_q.weight BF16"),
+            ({"token_embd.weight": GGML["F32"]}, "token_embd.weight F32"),
+            (
+                {"blk.7.ffn_gate_up_exps.weight": GGML["F32"]},
+                "ffn_gate_up_exps.weight F32 [(]1 tensor[)]",
+            ),
             # F32 only where the loader reads floats: not a projection, not
-            # a quantized router or norm, not half an alpha/beta pair.
+            # a quantized router or norm.
             ({"blk.3.attn_q.weight": GGML["F32"]}, "attn_q.weight F32"),
             (
                 {"blk.0.ffn_gate_inp.weight": GGML["Q8_0"]},
@@ -397,18 +418,12 @@ class GgufMetadataTests(unittest.TestCase):
             ),
             ({"output_norm.weight": GGML["F16"]}, "output_norm.weight F16"),
             (
-                {"blk.1.ssm_alpha.weight": GGML["Q8_0"]},
-                "ssm_alpha.weight and ssm_beta.weight of different types",
-            ),
-            (
                 {
-                    "blk.1.ssm_alpha.weight": GGML["F16"],
-                    "blk.1.ssm_beta.weight": GGML["F16"],
+                    "blk.1.ssm_alpha.weight": GGML["TQ2_0"],
+                    "blk.1.ssm_beta.weight": GGML["TQ2_0"],
                 },
-                "ssm_alpha.weight F16",
+                "ssm_alpha.weight type 35",
             ),
-            # An all-F32 file, whose types the loader reads somewhere.
-            (f32, "attn_output.weight F32 [(]10 tensors[)]"),
             # A tensor scale beside a weight of another type than NVFP4.
             (
                 {"blk.0.ffn_down_exps.scale": GGML["F32"]},
@@ -431,10 +446,81 @@ class GgufMetadataTests(unittest.TestCase):
         # Without tensors=True the reader never reads the tensor table.
         self.assertEqual(gguf.Metadata(path).tensors, {})
 
+    def test_screening_refuses_whole_bf16_and_f16_targets(self):
+        # Splash loads quantized GGUFs. A target whose projections and experts
+        # are all unquantized is refused with one message, whatever its token
+        # table, alpha and beta and whatever else in it the loader refuses; a
+        # target that quantizes any of them loads, the others in BF16 or F16.
+        typed = family_config(DENSE, "gguf-metadata.json")
+        dense = typed["unsigned"] | typed["float"] | typed["string"]
+        moe = fixture()
+
+        def converted(values, kind):
+            # As llama.cpp converts a model: every tensor the loader reads in
+            # a format of that kind, the others F32.
+            return {
+                name: GGML[kind] if found == GGML["Q4_K"] else found
+                for name, found in loadable_tensors(values, self.root).items()
+            }
+
+        def screen(values, tensors):
+            path = write_gguf(self.root / "model.gguf", values, tensors.items())
+            gguf.require_loadable(gguf.Metadata(path, tensors=True))
+
+        bf16 = converted(moe, "BF16")
+        small = ("token_embd.weight", ".ssm_alpha.weight", ".ssm_beta.weight")
+        for case, values, tensors in (
+            ("BF16", moe, bf16),
+            ("F16", dense, converted(dense, "F16")),
+            ("F32", moe, converted(moe, "F32")),
+            # The token table, alpha and beta do not count.
+            (
+                "BF16, small tensors Q8_0",
+                moe,
+                bf16 | {n: GGML["Q8_0"] for n in bf16 if n.endswith(small)},
+            ),
+            (
+                "BF16, a BF16 router the loader refuses too",
+                moe,
+                bf16 | {"blk.0.ffn_gate_inp.weight": GGML["BF16"]},
+            ),
+        ):
+            with (
+                self.subTest(case=case),
+                self.assertRaisesRegex(
+                    models.ModelError,
+                    "^this GGUF stores every projection and expert unquantized "
+                    "[(]BF16, F16 or F32[)]: Splash loads quantized GGUFs, not "
+                    "whole-BF16 or F16 models; choose a quantized variant of the "
+                    "repository$",
+                ),
+            ):
+                screen(values, tensors)
+        # Unsloth's UD-Q8_K_XL of Qwen3.8-27B: the attention q, k and v
+        # projections and the LM head in BF16, the rest in Q8_0 or F32.
+        attention = (".attn_q.weight", ".attn_k.weight", ".attn_v.weight")
+        q8 = converted(dense, "Q8_0")
+        q8 |= {
+            n: GGML["BF16"] for n in q8 if n == "output.weight" or n.endswith(attention)
+        }
+        screen(dense, q8)
+        # One quantized projection or expert is enough: the routed experts
+        # alone, as llmfan46's Qwen3.6-35B-A3B NVFP4-Experts-Only file has.
+        screen(moe, bf16 | {n: GGML["NVFP4"] for n in bf16 if "_exps." in n})
+        # A file of the MTP layer alone lacks the target's tensors, which are
+        # listed instead.
+        mtp = {
+            n.replace("blk.3.", "blk.64."): found
+            for n, found in converted(dense, "BF16").items()
+            if n.startswith("blk.3.")
+        }
+        with self.assertRaisesRegex(models.ModelError, "cannot load: .*missing"):
+            screen(dense, mtp)
+
     def test_loadable_types_are_the_native_formats(self):
         # The installer's lists must be the loader's own: kQuantFormats' GGML
         # types (runtime/metal/abi/QuantFormat.h), and those of the formats
-        # gguf_embedding_format names (runtime/metal/abi/Gguf.h).
+        # gguf_embedding_format does not leave out (runtime/metal/abi/Gguf.h).
         abi = Path(__file__).resolve().parents[3] / "runtime/metal/abi"
         header = (abi / "QuantFormat.h").read_text()
         table = header.split("kQuantFormats[GGUF_FMT_COUNT] = {", 1)[1].split("};", 1)[
@@ -456,12 +542,21 @@ class GgufMetadataTests(unittest.TestCase):
         gguf_file = (abi.parents[1] / "model/GgufFile.hpp").read_text()
         nvfp4 = re.search(r"kNVFP4 = (\d+)", gguf_file).group(1)
         types[ids["NVFP4"]] = gguf.TENSOR_TYPES[int(nvfp4)]
-        self.assertEqual(set(types.values()), gguf.QUANTIZED_TYPES)
-        embedding = (abi / "Gguf.h").read_text().split("gguf_embedding_format", 1)[1]
-        embedding = embedding.split("}", 1)[0]
-        names = re.findall(r"GGUF_FMT_(\w+)", embedding)
+        self.assertEqual(set(types.values()), gguf.FORMAT_TYPES)
+        # gguf_embedding_format must keep a form this reads, every format but
+        # those it names with !=, so that another form fails here instead of
+        # being misread.
+        match = re.search(
+            r"bool gguf_embedding_format\(uint32_t format\) \{ return ([^;]*); \}",
+            (abi / "Gguf.h").read_text(),
+        )
+        self.assertIsNotNone(match, "gguf_embedding_format is not one return")
+        self.assertRegex(
+            match[1], r"^format < GGUF_FMT_COUNT( && format != GGUF_FMT_\w+)*$"
+        )
+        left_out = {ids[name] for name in re.findall(r"!= GGUF_FMT_(\w+)", match[1])}
         self.assertEqual(
-            {types[ids[name]] for name in names if ids[name] in types},
+            {name for index, name in types.items() if index not in left_out},
             gguf.EMBEDDING_TYPES,
         )
 

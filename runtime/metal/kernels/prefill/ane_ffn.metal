@@ -100,18 +100,20 @@ kernel void ane_ffn_pack(device const half *rotated [[buffer(0)]],
 // tensor of format F with `groups` groups of 32 inputs per row: pairs 2h and
 // 2h + 1 of chunk c of their group, h = input bit 4 and c = input bits 2, 3
 // (metal/abi/QuantFormat.h), as kernels/common/gguf_staged.h decodes them.
+// Only that chunk is read (and chunk 0, which holds the scale of a format
+// whose scale is in every chunk), as the register tile reads a group.
 template <class F>
 inline void ane_ffn_gguf_values(thread float (&value)[4], device uchar *plane0, device uchar *plane1,
                                 device uchar *meta, uint groups, uint row, uint input) {
   const uint group = input >> 5, h = (input >> 4) & 1;
   const ushort c = (input >> 2) & 3;
   const ulong unit = quant_tile_index(row, group, groups);
-  const typename F::Payload w = F::load(plane0 + unit * F::P0, plane1 + unit * F::P1);
+  device uchar *p0 = plane0 + unit * F::P0, *p1 = plane1 + unit * F::P1;
   const typename F::Meta header =
       F::loadMeta(meta + quant_tile_index(row, group / F::MetaGroups, groups / F::MetaGroups) * F::MetaBytes);
-  const typename F::Chunk q = F::chunk(w, c);
+  const typename F::Chunk q = F::loadChunk(p0, p1, c);
   QuantCoef k;
-  if constexpr (F::ScaleInChunk) k = F::coef(header, F::chunk(w, 0));
+  if constexpr (F::ScaleInChunk) k = F::coef(header, F::loadChunk(p0, p1, 0));
   else k = F::coef(header, ushort(group % F::MetaGroups));
   const float s = h ? k.s.y : k.s.x, m = h ? k.m.y : k.m.x;
   float4 v;
@@ -130,6 +132,10 @@ inline void ane_ffn_gguf_values(thread float (&value)[4], device uchar *plane0, 
   } else if constexpr (F::Kind == QuantFloat8) {
     const uint2 codes = F::values(q);
     v = float4(quant_e4m3_word(h ? codes.y : codes.x)) * s;
+  } else if constexpr (F::Kind == QuantFloat16) {
+    typedef vec<typename F::Value, 2> V2;
+    const uint4 values = F::values(q);
+    v = float4(float2(as_type<V2>(h ? values.z : values.x)), float2(as_type<V2>(h ? values.w : values.y))) * s;
   } else {
     const uint2 grid = F::grid(q);
     const uint signs = F::signs(q) >> (4 * h);

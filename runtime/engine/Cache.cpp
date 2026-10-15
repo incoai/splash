@@ -29,8 +29,7 @@ bool older(const std::optional<CacheEvictionCandidate> &left,
 
 } // namespace
 
-Cache::Cache(KvPool &pool, KvTier *kvTier,
-             std::shared_ptr<const model::DiskBudget> diskBudget)
+Cache::Cache(KvPool &pool, KvTier *kvTier, std::shared_ptr<model::DiskBudget> diskBudget)
     : pool_(pool), tier_(kvTier), persistent_(kvTier && kvTier->persistent()),
       diskBudget_(std::move(diskBudget)), kv_(pool, recency_),
       states_(kv_, recency_, [this](bool inUse) { return freeDiskSpace(inUse); }, persistent_) {}
@@ -128,10 +127,8 @@ CacheAdoption Cache::adopt(std::vector<PersistedKv> blocks, std::vector<Persiste
   }
   recency_.continueAfter(lastUsed);
   kv_.continueIdsAfter(highestId);
-  // A lower quota than the earlier process had takes the oldest copies.
-  while (diskBudget_ && diskBudget_->usedBytes() > diskBudget_->capacityBytes() &&
-         freeDiskSpace(true))
-    ++result.dropped;
+  // A lower limit than the earlier process had takes the oldest copies.
+  result.dropped += fitDiskLimit();
   const StateCacheSnapshot held = states_.snapshot();
   result.states = held.entries;
   result.blocks = kv_.diskBlocks();
@@ -556,18 +553,18 @@ std::optional<Cache::Victim> Cache::reclaimOldest(const VictimScan &scan) {
   return std::nullopt;
 }
 
-StateRoom Cache::reclaimOneState(bool checkpointsOnly, uint64_t forBlock, bool growth) {
+StateRoom Cache::reclaimOneState(StateClass state, bool growth) {
   using Unwritten = StateCache::Unwritten;
-  const bool inUse = !checkpointsOnly && states_.inUse(forBlock);
-  // Only a publication in use cannot leave a victim to the write in flight:
-  // its lane's state moves on with the next command.
-  const Unwritten unwritten = inUse ? Unwritten::Drop : Unwritten::Wait;
-  const auto recycle = [&](const std::optional<CacheEvictionCandidate> &state,
+  const bool checkpointsOnly = state == StateClass::Checkpoint;
+  // Only a state in use cannot leave a victim to the write in flight:
+  // refused, it reaches the disk tier only through that write.
+  const Unwritten unwritten = state == StateClass::InUse ? Unwritten::Drop : Unwritten::Wait;
+  const auto recycle = [&](const std::optional<CacheEvictionCandidate> &candidate,
                            Unwritten mode) {
-    return state && states_.reclaim(state->id, mode).evicted;
+    return candidate && states_.reclaim(candidate->id, mode).evicted;
   };
-  // Without growth an extent's bytes are no room for a snapshot, and only
-  // states go.
+  // Without growth an extent's bytes are no room for a state's buffers, and
+  // only states go.
   if (growth && !checkpointsOnly) {
     if (const CacheReclaimResult released = releaseExtent(false); released.reclaimedBytes)
       return {true, released.reclaimedBytes};
@@ -592,7 +589,7 @@ StateRoom Cache::reclaimOneState(bool checkpointsOnly, uint64_t forBlock, bool g
   } else if (recycle(states_.ordinaryCandidate(false), unwritten)) {
     return {true};
   }
-  if (inUse && recycle(states_.inUseCandidate(), Unwritten::Wait))
+  if (state == StateClass::InUse && recycle(states_.inUseCandidate(), Unwritten::Wait))
     return {true};
   return {};
 }
@@ -653,8 +650,8 @@ Cache::LeafReclaim Cache::reclaimKvLeaf(uint64_t block, ReclaimTiming timing) {
       return demotion;
     // A leaf its disk subtree depends on stays in RAM while the tier may
     // still write it: dropping it would orphan every copy below it. Once a
-    // failed write has closed the tier, the subtree goes with it, as without
-    // a tier, rather than holding the leaf's RAM until the server restarts.
+    // file has stopped taking writes, the subtree goes with it, as without a
+    // tier, rather than holding the leaf's RAM until the server restarts.
     if (kv_.stateBelow(block) && kvTierWritable())
       return LeafReclaim::Impossible;
   }
@@ -867,6 +864,9 @@ void Cache::labelKv(uint64_t block, const std::shared_ptr<KvDiskSlot> &slot) {
 }
 
 std::shared_ptr<KvDiskSlot> Cache::acquireDiskSlot(bool inUse) {
+  // Making room is no use while the limit cannot hold a slot.
+  if (diskBudget_ && diskBudget_->limitBytes() < tier_->slotBytes())
+    return {};
   for (;;) {
     if (auto slot = tier_->acquireSlot())
       return slot;
@@ -926,6 +926,20 @@ bool Cache::dropOldestPoint(bool inUse) {
   return true;
 }
 
+uint32_t Cache::fitDiskLimit() {
+  uint32_t dropped = 0;
+  while (diskBudget_ && diskBudget_->usedBytes() > diskBudget_->limitBytes() &&
+         freeDiskSpace(false))
+    ++dropped;
+  return dropped;
+}
+
+void Cache::keepDiskLimit() {
+  if (diskMeasure_)
+    diskMeasure_();
+  static_cast<void>(fitDiskLimit());
+}
+
 bool Cache::dropUnneededCopy() {
   const auto unneeded = kv_.unneededCopy();
   if (!unneeded)
@@ -939,8 +953,20 @@ bool Cache::dropUnneededCopy() {
 
 bool Cache::pollTransfers() {
   bool progressed = states_.pollOffload();
-  if (!tier_)
-    return progressed;
+  if (tier_ && pollTierTransfers())
+    progressed = true;
+  if (tier_ && progressed)
+    dropPoisoned();
+  // A write that found the volume full has the volume measured at once,
+  // once the writes that landed or failed are collected: what the tier holds
+  // then counts no failed write.
+  if (diskMeasure_ && diskBudget_->fullReported())
+    keepDiskLimit();
+  return progressed;
+}
+
+bool Cache::pollTierTransfers() {
+  bool progressed = false;
   tier_->poll();
   // Waiting restores start in block order and stop at the first the tier
   // refuses: started ones stay a prefix of each chain, and a full tier is
@@ -1022,8 +1048,6 @@ bool Cache::pollTransfers() {
     }
     progressed = true;
   }
-  if (progressed)
-    dropPoisoned();
   return progressed;
 }
 
@@ -1035,12 +1059,20 @@ PersistStatus Cache::persist(uint64_t block) {
   if (!kvTierWritable())
     return PersistStatus::Refused;
   const KvCache::Chain chain = kv_.chain(block);
-  // A point larger than the whole quota is never kept: making room for it
-  // would give up every other copy first.
+  // A point larger than what the tier may hold now is not kept: making room
+  // for it would give up every other copy first, and waiting for room would
+  // hold back the points after it.
   if (diskBudget_ && uint64_t{chain.blocks.size()} * tier_->slotBytes() + states_.bytes(block) >
-                         diskBudget_->capacityBytes())
+                         diskBudget_->limitBytes())
     return PersistStatus::Refused;
-  bool inFlight = false;
+  // Nothing starts while a restore waits: the tier serves the request first.
+  if (!restores_.empty() && !states_.onDisk(block))
+    return PersistStatus::Busy;
+  // The state goes first, as the write budget admits it; its chain follows.
+  const PersistStatus state = states_.persist(block);
+  if (state != PersistStatus::Durable && state != PersistStatus::Started)
+    return state;
+  bool inFlight = state == PersistStatus::Started;
   for (size_t index = 0; index < chain.blocks.size(); ++index) {
     const uint64_t id = chain.blocks[index];
     if (kv_.slot(id)) {
@@ -1053,7 +1085,7 @@ PersistStatus Cache::persist(uint64_t block) {
     std::shared_ptr<KvDiskSlot> slot = acquireDiskSlot(false);
     // Making room gives up the oldest point, which may be this one: it does
     // not fit then. Otherwise its chain stays whole, as a state needs it.
-    if (!slot || !states_.ordinary(block))
+    if (!slot || !states_.onDisk(block))
       return PersistStatus::Refused;
     auto transfer = tier_->demote(chain.pages[index], slot, completionNotifier_);
     if (!transfer)
@@ -1064,10 +1096,7 @@ PersistStatus Cache::persist(uint64_t block) {
     copies_.push_back({id, std::move(transfer)});
     inFlight = true;
   }
-  const PersistStatus state = states_.persist(block);
-  if (state == PersistStatus::Durable || state == PersistStatus::Busy)
-    return inFlight ? PersistStatus::Started : state;
-  return state;
+  return inFlight ? PersistStatus::Started : PersistStatus::Durable;
 }
 
 void Cache::relabelStates() const { states_.relabel(); }
@@ -1105,8 +1134,15 @@ CacheSnapshot Cache::snapshot() const {
   tier.diskBlocks = kv_.diskBlocks();
   if (diskBudget_) {
     tier.capacityBytes = diskBudget_->capacityBytes();
+    tier.limitBytes = diskBudget_->limitBytes();
     tier.usedBytes = diskBudget_->usedBytes();
     tier.fileBytes = diskBudget_->fileBytes();
+    tier.volumeAvailableBytes = diskBudget_->volumeAvailableBytes();
+    tier.writesGated = diskBudget_->writesStopped()  ? DiskWritesGate::Closed
+                       : !diskBudget_->admits(false) ? DiskWritesGate::Budget
+                                                     : DiskWritesGate::No;
+    tier.writeBudgetBytes =
+        static_cast<uint64_t>(std::max<int64_t>(0, diskBudget_->writeBudgetBytes()));
     tier.readBytes = diskBudget_->readBytes();
     tier.writtenBytes = diskBudget_->writtenBytes();
   }

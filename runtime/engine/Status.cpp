@@ -15,7 +15,7 @@ namespace {
 
 const char *boolean(bool value) noexcept { return value ? "true" : "false"; }
 
-// idle_release_seconds is null while the engine keeps them (--idle-release off).
+// idle_release_seconds is null with --idle-release off.
 void appendWeights(std::ostringstream &out, const WeightsSnapshot &weights) {
   out << "{\"idle_release_seconds\":";
   if (std::isinf(weights.idleReleaseSeconds))
@@ -23,6 +23,7 @@ void appendWeights(std::ostringstream &out, const WeightsSnapshot &weights) {
   else
     out << weights.idleReleaseSeconds;
   out << ",\"released\":" << boolean(weights.released)
+      << ",\"restoring\":" << boolean(weights.restoring)
       << ",\"restores\":" << weights.restores
       << ",\"restore_failures\":" << weights.restoreFailures << '}';
 }
@@ -71,6 +72,15 @@ const char *priorityName(engine::RequestPriority priority) noexcept {
   case engine::RequestPriority::Foreground: return "foreground";
   case engine::RequestPriority::Normal: return "normal";
   case engine::RequestPriority::Background: return "background";
+  }
+  return "unknown";
+}
+
+const char *writesGatedName(DiskWritesGate gate) noexcept {
+  switch (gate) {
+  case DiskWritesGate::No: return "no";
+  case DiskWritesGate::Budget: return "budget";
+  case DiskWritesGate::Closed: return "closed";
   }
   return "unknown";
 }
@@ -157,6 +167,8 @@ std::string runtimeStatusJson(
       << boolean(memoryGovernor.hostMeasurementValid)
       << ",\"host_available_bytes\":" << memoryGovernor.hostAvailableBytes
       << ",\"host_reserve_bytes\":" << memoryGovernor.hostReserveBytes
+      << ",\"host_spare_bytes\":" << memoryGovernor.hostSpareBytes
+      << ",\"host_spare_reserve_bytes\":" << memoryGovernor.hostSpareReserveBytes
       << ",\"host_headroom_bytes\":" << memoryGovernor.hostHeadroomBytes << "}"
       << ",\"memory_audit\":" << memoryAudit.toStatusJson()
       << ",\"weights\":";
@@ -201,8 +213,12 @@ std::string runtimeStatusJson(
       << ",\"invalidations\":" << state.invalidations
       << "}"
       << ",\"disk\":{\"capacity_bytes\":" << resources.kvTier.capacityBytes
+      << ",\"limit_bytes\":" << resources.kvTier.limitBytes
       << ",\"used_bytes\":" << resources.kvTier.usedBytes
       << ",\"file_bytes\":" << resources.kvTier.fileBytes
+      << ",\"volume_available_bytes\":" << resources.kvTier.volumeAvailableBytes
+      << ",\"writes_gated\":" << json::quote(writesGatedName(resources.kvTier.writesGated))
+      << ",\"write_budget_bytes\":" << resources.kvTier.writeBudgetBytes
       << ",\"read_bytes\":" << resources.kvTier.readBytes
       << ",\"written_bytes\":" << resources.kvTier.writtenBytes
       << ",\"kv_blocks\":" << resources.kvTier.diskBlocks
@@ -239,6 +255,8 @@ std::string runtimeStatusJson(
       << ",\"recycled_state_publications\":"
       << core.recycledStatePublications
       << ",\"disk_state_publications\":" << core.diskStatePublications
+      << ",\"state_captures\":" << core.stateCaptures
+      << ",\"capture_cuts\":" << core.captureCuts
       << ",\"replay_state_publication_failures\":"
       << core.replayStatePublicationFailures
       << ",\"lazy_junctions\":" << lookup.lazyJunctions

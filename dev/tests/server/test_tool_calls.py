@@ -686,6 +686,54 @@ class ToolCallTests(HarnessTestCase):
             ["weather"],
         )
 
+    def test_a_stop_sequence_at_a_call_name_leaves_the_item_before_complete(self):
+        # A call a stop sequence cuts at its name has no item: the whole call
+        # or the text before it is the output's last item, and ends complete.
+        tokenizer = FakeTokenizer()
+        cut = "<tool_call>\n<function=time>\n</function>\n"
+        tokenizer.fragments[92] = tokenizer.fragments[5] + cut
+        tokenizer.fragments[93] = "Checking.\n" + cut
+        tokenizer.backend_tokenizer = byte_backend(tokenizer.fragments)
+        harness = self.harness(
+            FakeRuntime(*(Plan([[token]]) for token in (92, 92, 93, 93))),
+            tokenizer=tokenizer,
+        )
+        tools = [
+            {"type": "function", "name": name, "parameters": {}}
+            for name in ("weather", "time")
+        ]
+        for kind in ("function_call", "message"):
+            for stream in (False, True):
+                with self.subTest(kind=kind, stream=stream):
+                    status, _, payload = harness.request(
+                        "POST",
+                        "/v1/responses",
+                        responses_body(
+                            tools=tools,
+                            stop=["ime"],
+                            stream=stream,
+                            reasoning={"effort": "none"},
+                        ),
+                    )
+                    self.assertEqual(status, 200, payload)
+                    if stream:
+                        events = response_events(payload)
+                        self.assertEqual(events[-1]["type"], "response.completed")
+                        response = events[-1]["response"]
+                        done = [
+                            event["item"]
+                            for event in events
+                            if event["type"] == "response.output_item.done"
+                        ]
+                        self.assertEqual(done, response["output"])
+                    else:
+                        response = json.loads(payload)
+                    self.assertEqual(response["status"], "completed")
+                    self.assertEqual(
+                        [(item["type"], item["status"]) for item in response["output"]],
+                        [(kind, "completed")],
+                    )
+
     def test_tool_names_are_those_the_call_tags_carry(self):
         # A call reads its function's name back from <function=...> as written.
         runtime = FakeRuntime(Plan([[4]]))

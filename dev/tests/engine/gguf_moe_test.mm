@@ -11,9 +11,10 @@
 //   segments' outputs unchanged, the padding past the segments unwritten.
 // - MoE: every GGUF plan (the staged 8- and 32-row tiles and the Apple9
 //   register tile, whatever GPU runs the test; decode steps and prefill
-//   chunks) for every format, gate, up and down in three formats and the
-//   shared expert in three more, and on the staged tiles also with up in the
-//   gate's formats, which run gate and up in one pass; routes and weights
+//   chunks) for every format the tile takes (the register tile all but F16,
+//   quant_register_format), gate, up and down in three of those formats and
+//   the shared expert in three more, and on the staged tiles also with up in
+//   the gate's formats, which run gate and up in one pass; routes and weights
 //   against the fp64 router, each pass inside the fp64 interval its numerics
 //   allow, the block's output, a row's output bitwise equal at every lane
 //   count and chunk of one tile, the output of the live tiles' grids bitwise
@@ -398,12 +399,24 @@ struct Model {
   std::array<Fmt, 6> formats{};
 };
 
-// Gate, up and down in formats f, f + 1, f + 2 and the shared expert's in
-// f + 3, f + 4, f + 5; with oneGateUp, up in the gate's formats, which the
-// staged tile runs in one pass.
-Model makeModel(MetalBackend &backend, int f, bool oneGateUp) {
+// The formats whose weights `tile` takes, in id order: the register tile takes
+// those of quant_register_format.
+std::vector<Fmt> tileFormats(MoeGgufTile tile) {
+  std::vector<Fmt> formats;
+  for (int f = 0; f < FMT_COUNT; ++f)
+    if (tile == MoeGgufTile::Staged || quant_register_format(uint32_t(f))) formats.push_back(Fmt(f));
+  return formats;
+}
+
+// The model of format f that `tile` runs: gate, up and down in f and the next
+// two formats the tile takes, cyclically, and the shared expert's in the three
+// after them; with oneGateUp, up in the gate's formats, which the staged tile
+// runs in one pass.
+Model makeModel(MetalBackend &backend, int f, bool oneGateUp, MoeGgufTile tile = MoeGgufTile::Staged) {
+  const std::vector<Fmt> formats = tileFormats(tile);
+  const size_t first = std::find(formats.begin(), formats.end(), Fmt(f)) - formats.begin();
   Model m;
-  for (int i = 0; i < 6; ++i) m.formats[i] = Fmt((f + i) % FMT_COUNT);
+  for (size_t i = 0; i < m.formats.size(); ++i) m.formats[i] = formats[(first + i) % formats.size()];
   if (oneGateUp) {
     m.formats[1] = m.formats[0];
     m.formats[4] = m.formats[3];
@@ -788,14 +801,45 @@ int moe(MetalBackend &backend) {
   b.moe.residual = bfloatBuffer(backend, b.residual, "moe-residual");
   b.moe.output = zeros(backend, uint64_t{kMaximumRows} * kHidden * 2, "moe-output");
   const MoeShape shape{kHidden, kExperts, kTopK, kIntermediate};
-  for (int f = 0; f < FMT_COUNT; ++f)
-    for (const bool oneGateUp : {false, true}) {
-      const Model m = makeModel(backend, f, oneGateUp);
-      std::map<std::pair<uint32_t, uint32_t>, GateUp> products;
-      std::string formats;
-      for (Fmt format : m.formats) formats += std::string(formats.empty() ? "" : "/") + fmtName(format);
-      for (const MoeGgufTile tile : {MoeGgufTile::Staged, MoeGgufTile::Register}) {
+  // A model's prefill on the staged 32-row tiles, whose live-row matmuls
+  // (moe_live_rows) differ by chunk, with the router on each float tile: a
+  // row's result is the same in every chunk on one tile (either tile's scores
+  // of a row depend on that row alone).
+  const auto prefill32 = [&](const Model &m, bool oneGateUp, std::map<std::pair<uint32_t, uint32_t>, GateUp> &products,
+                             const std::string &formats) {
+    for (const FloatTile router : {FloatTile::Simdgroup, FloatTile::NeuralAccelerator}) {
+      const int before = failures;
+      Stats stats;
+      std::vector<uint16_t> widest;
+      for (const uint32_t rows : {kMaximumRows, 33u, 16u}) {
+        MoeConfig config{MoeExpertTile::M32};
+        config.ggufRouterTile = router;
+        const MoePlan plan = MoE::prefillPlan(shape, rows, config);
+        const std::string label = formats + " prefill rows=" + std::to_string(rows) +
+                                  (router == FloatTile::NeuralAccelerator ? " (accelerator router)" : "");
+        const std::vector<uint16_t> result = runPlan(backend, m, b, plan, true, oneGateUp, products, stats, label);
+        if (widest.empty()) widest = result;
+        else if (!std::equal(result.begin(), result.end(), widest.begin())) {
+          printf("  %s: rows differ from the %u-row chunk FAIL\n", label.c_str(), kMaximumRows);
+          ++failures;
+        }
+      }
+      printf("%-20s staged   prefill 263/33/16 (32-row tiles, %s router): gate/up %.2f%% and down %.2f%% of outputs "
+             "differ from bf16(fp64), errors at most %.1e/%.1e of sum|x w| %s\n",
+             formats.c_str(), router == FloatTile::NeuralAccelerator ? "accelerator" : "simdgroup",
+             100.0 * stats.gateUpFlips / (stats.outputs / 2), 100.0 * stats.downFlips / stats.outputs, stats.gateUpWorst,
+             stats.downWorst, failures > before ? "FAIL" : "ok");
+    }
+  };
+  // Each tile runs the models of the formats it takes (makeModel).
+  for (const MoeGgufTile tile : {MoeGgufTile::Staged, MoeGgufTile::Register})
+    for (const Fmt f : tileFormats(tile))
+      for (const bool oneGateUp : {false, true}) {
         if (oneGateUp && tile == MoeGgufTile::Register) continue;   // two passes whatever the formats
+        const Model m = makeModel(backend, f, oneGateUp, tile);
+        std::map<std::pair<uint32_t, uint32_t>, GateUp> products;
+        std::string formats;
+        for (Fmt format : m.formats) formats += std::string(formats.empty() ? "" : "/") + fmtName(format);
         const int before = failures;
         Stats stats;
         std::vector<uint16_t> widest;
@@ -835,35 +879,8 @@ int moe(MetalBackend &backend) {
                formats.c_str(), tile == MoeGgufTile::Register ? "register" : "staged  ",
                100.0 * stats.gateUpFlips / (stats.outputs / 2), 100.0 * stats.downFlips / stats.outputs,
                stats.gateUpWorst, stats.downWorst, failures > before ? "FAIL" : "ok");
+        if (tile == MoeGgufTile::Staged) prefill32(m, oneGateUp, products, formats);
       }
-      // The 32-row tiles, whose live-row matmuls (moe_live_rows) differ by
-      // chunk, with the router on each float tile: a row's result is the same
-      // in every chunk on one tile (either tile's scores of a row depend on that
-      // row alone).
-      for (const FloatTile router : {FloatTile::Simdgroup, FloatTile::NeuralAccelerator}) {
-        const int before = failures;
-        Stats stats;
-        std::vector<uint16_t> widest;
-        for (const uint32_t rows : {kMaximumRows, 33u, 16u}) {
-          MoeConfig config{MoeExpertTile::M32};
-          config.ggufRouterTile = router;
-          const MoePlan plan = MoE::prefillPlan(shape, rows, config);
-          const std::string label = formats + " prefill rows=" + std::to_string(rows) +
-                                    (router == FloatTile::NeuralAccelerator ? " (accelerator router)" : "");
-          const std::vector<uint16_t> result = runPlan(backend, m, b, plan, true, oneGateUp, products, stats, label);
-          if (widest.empty()) widest = result;
-          else if (!std::equal(result.begin(), result.end(), widest.begin())) {
-            printf("  %s: rows differ from the %u-row chunk FAIL\n", label.c_str(), kMaximumRows);
-            ++failures;
-          }
-        }
-        printf("%-20s staged   prefill 263/33/16 (32-row tiles, %s router): gate/up %.2f%% and down %.2f%% of outputs "
-               "differ from bf16(fp64), errors at most %.1e/%.1e of sum|x w| %s\n",
-               formats.c_str(), router == FloatTile::NeuralAccelerator ? "accelerator" : "simdgroup",
-               100.0 * stats.gateUpFlips / (stats.outputs / 2), 100.0 * stats.downFlips / stats.outputs, stats.gateUpWorst,
-               stats.downWorst, failures > before ? "FAIL" : "ok");
-      }
-    }
   return failures;
 }
 

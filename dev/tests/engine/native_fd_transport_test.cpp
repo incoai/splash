@@ -103,6 +103,8 @@ struct PersistentHarness final {
     tier.transferLimit = 64;
     tier.capacity = 128;
     executor.prefillAnchor = true;
+    // States the tier writes, whose writes land when the test says so.
+    executor.keptTier = std::make_shared<test::OffloadControl>();
   }
   Pipes pipes;
   test::TestKvStorage storage{72, 4096, 4};

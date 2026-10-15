@@ -320,8 +320,19 @@ void ggufPlans() {
             "Apple9 stages the IQ2, IQ3_XXS and IQ1 formats at unpadded lanes");
     require(plan({GGUF_FMT_Q2K}).configuration().tile == q2k, "Apple9 stages Q2_K from two unpadded lanes");
     for (const uint32_t format : {GGUF_FMT_Q4K, GGUF_FMT_Q6K, GGUF_FMT_IQ4XS, GGUF_FMT_IQ3S, GGUF_FMT_Q80,
-                                  GGUF_FMT_Q40, GGUF_FMT_MXFP4})
+                                  GGUF_FMT_Q40, GGUF_FMT_Q50, GGUF_FMT_Q51, GGUF_FMT_MXFP4, GGUF_FMT_BF16})
       require(plan({format}).configuration().tile == LinearTile::GgufRegister, "Apple9 keeps other formats' registers");
+    // F16, which the register tile does not take (quant_register_format), stages at every lane count, alone or
+    // beside a register format.
+    require(plan({GGUF_FMT_F16}).configuration().tile == LinearTile::GgufStaged &&
+                plan({GGUF_FMT_Q4K, GGUF_FMT_F16}).configuration().tile == LinearTile::GgufStaged,
+            "Apple9 stages a projection with an F16 segment");
+    // Its decode storage holds the staged tile's rows: three lanes' 24 rows pad to 32.
+    const ProjectionShape f16Shape = blockProjection(1024, 5120, std::array<uint32_t, 1>{GGUF_FMT_F16}).shape();
+    require(!f16Shape.registerFormats &&
+                m3.decodeStorageRows(lanes * 8, f16Shape) == plan({GGUF_FMT_F16}).storageRows() &&
+                m3.decodeStorageRows(lanes * 8, ProjectionShape{1024, 5120}) == lanes * 8,
+            "Apple9 decode storage holds an F16 projection's staged rows");
     require(plan({GGUF_FMT_IQ3XXS, GGUF_FMT_Q4K}).configuration().tile == LinearTile::GgufRegister &&
                 plan({GGUF_FMT_IQ3XXS}).storageRows() == plan({GGUF_FMT_Q4K}).storageRows(),
             "Apple9 keeps a mixed projection's registers, and a staged plan binds the register rows");

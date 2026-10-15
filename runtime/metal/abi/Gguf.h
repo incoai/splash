@@ -108,17 +108,11 @@ struct GgufEmbedParams {
   uint32_t hidden;
 };
 static_assert(sizeof(GgufEmbedParams) == 12, "GGUF embedding parameters are 12 bytes on both sides");
-// The formats whose native token rows the embedding kernels gather
-// (kernels/shared/embedding.metal, gguf_embed_<kQuantFormats name>): every
-// format llama-quantize gives a token table by default, IQ1_M (a published IQ2
-// mix's), Prism's PQ2_0, MXFP4 and NVFP4 (an MLX mxfp4 or nvfp4 table's) and
-// every MLX affine format.
-inline constexpr bool gguf_embedding_format(uint32_t format) {
-  return format == GGUF_FMT_Q4K || format == GGUF_FMT_Q5K || format == GGUF_FMT_Q6K || format == GGUF_FMT_Q3K ||
-         format == GGUF_FMT_Q2K || format == GGUF_FMT_Q80 || format == GGUF_FMT_Q40 || format == GGUF_FMT_Q41 ||
-         format == GGUF_FMT_IQ4XS || format == GGUF_FMT_IQ4NL || format == GGUF_FMT_IQ3S || format == GGUF_FMT_IQ1M ||
-         format == GGUF_FMT_PQ20 || format == GGUF_FMT_MXFP4 || format == GGUF_FMT_NVFP4 || quant_affine_format(format);
-}
+// The formats whose native rows the embedding kernels gather, in bf16 as token
+// tables and in fp32 as the F32 values load-time widening writes
+// (kernels/shared/embedding.metal, gguf_embed_<kQuantFormats name> and
+// gguf_embed_f32_<name>): every format.
+inline constexpr bool gguf_embedding_format(uint32_t format) { return format < GGUF_FMT_COUNT; }
 
 // Prism ML's input rotation (kernels/shared/gguf_rotation.metal): weights
 // stored for rotated inputs multiply H (D x), H the normalized Walsh-Hadamard

@@ -215,14 +215,18 @@ class SmokeRealTests(unittest.TestCase):
                         command[index + 1 : index + 3], ["--cache-dir", "/tmp/cache"]
                     )
 
-    def test_persistent_cache_scenario_needs_a_disk_quota(self):
+    def test_persistent_cache_scenario_needs_the_ssd_cache(self):
         model = ["--model", "mlx-community/Qwen3.8-27B-4bit"]
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            smoke_real.parse_args([*model, "--persistent-cache"])
-        arguments = smoke_real.parse_args(
-            [*model, "--persistent-cache", "--max-cache-disk", "4G"]
-        )
-        self.assertTrue(arguments.persistent_cache)
+            smoke_real.parse_args(
+                [*model, "--persistent-cache", "--max-cache-disk", "0"]
+            )
+        for quota in ([], ["--max-cache-disk", "4G"]):
+            with self.subTest(quota=quota):
+                arguments = smoke_real.parse_args(
+                    [*model, "--persistent-cache", *quota]
+                )
+                self.assertTrue(arguments.persistent_cache)
         self.assertFalse(smoke_real.parse_args(model).persistent_cache)
 
     def test_stop_requires_a_clean_exit(self):
@@ -642,11 +646,15 @@ class SmokeRealTests(unittest.TestCase):
                     ) as extensions,
                     mock.patch.object(smoke_real, "run_judgments"),
                     mock.patch.object(smoke_real, "run_sampling") as sampling,
+                    mock.patch.object(
+                        smoke_real, "run_thinking_budget_under_grammar"
+                    ) as thinking_budget,
                     contextlib.redirect_stdout(io.StringIO()),
                 ):
                     smoke_real.run(8000, "test-model")
                 vision = "image" in modalities
                 self.assertTrue(sampling.called)
+                self.assertTrue(thinking_budget.called)
                 self.assertEqual(images.called, vision)
                 self.assertEqual(text_only.called, not vision)
                 self.assertEqual(extensions.call_args.args[2], vision)
@@ -702,6 +710,65 @@ class SmokeRealTests(unittest.TestCase):
                 self.assertRaisesRegex(smoke_real.SmokeFailure, failure),
             ):
                 smoke_real.run_sampling(8000, "test-model")
+
+    def test_thinking_budget_under_grammar_needs_every_answer_and_a_wait(self):
+        schema = {"type": "object"}
+
+        def serve(
+            failing=None,
+            past=(5, 6),
+            content='{"result": "ok"}',
+            reasoning="饕餮",
+            finish="stop",
+            bodies=None,
+        ):
+            def answer(port, method, path, body=None, **_kwargs):
+                if bodies is not None:
+                    bodies.append(body)
+                budget = body["thinking_token_budget"]
+                if budget == failing:
+                    return 400, {"error": {"code": "constraint_error"}}
+                message = {"content": content, "reasoning_content": reasoning}
+                usage = {"reasoning_tokens": budget + (budget in past)}
+                return 200, {
+                    "choices": [{"message": message, "finish_reason": finish}],
+                    "usage": {"completion_tokens_details": usage},
+                }
+
+            return answer
+
+        bodies = []
+        for server in (
+            serve(bodies=bodies),
+            # An answer the output limit cuts short is not checked.
+            serve(content='{"result"', finish="length"),
+            # Reasoning that reached no split character needs no wait.
+            serve(past=(), reasoning="Here is a thinking process"),
+        ):
+            with (
+                mock.patch.object(smoke_real, "request", server),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                smoke_real.run_thinking_budget_under_grammar(8000, "test-model", schema)
+        self.assertEqual(
+            [body["thinking_token_budget"] for body in bodies], list(range(1, 49))
+        )
+        for body in bodies:
+            self.assertNotEqual(body["reasoning_effort"], "none")
+            self.assertEqual(body["response_format"]["json_schema"]["schema"], schema)
+        for failure, server in (
+            ("thinking budget 9 under a grammar failed", serve(failing=9)),
+            ("broke its output", serve(content='{"result": "no"}')),
+            ("broke its output", serve(reasoning="\ufffd")),
+            ("holds a split character, yet no thinking budget", serve(past=())),
+        ):
+            with (
+                self.subTest(failure=failure),
+                mock.patch.object(smoke_real, "request", server),
+                self.assertRaisesRegex(smoke_real.SmokeFailure, failure),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                smoke_real.run_thinking_budget_under_grammar(8000, "test-model", schema)
 
     def test_text_only_refuses_every_media_request_and_serves_text(self):
         def run(server):

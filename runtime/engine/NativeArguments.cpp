@@ -3,6 +3,7 @@
 #include <charconv>
 #include <cmath>
 #include <limits>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -26,13 +27,20 @@ uint64_t parseMaxMemory(std::string_view value) {
   return result;
 }
 
+// Whether `value` is a context of 1 to the model's own tokens, which
+// `result` then holds.
+bool parseContext(std::string_view value,
+                  const model::ModelCapabilities &capabilities, uint32_t &result) {
+  return parsePositive(value, result) &&
+         result <= capabilities.maximumContextTokens;
+}
+
 uint32_t parseMaxContext(std::string_view value,
                          const model::ModelCapabilities &capabilities) {
   if (value == "auto")
     return 0;
   uint32_t result = 0;
-  if (!parsePositive(value, result) ||
-      result > capabilities.maximumContextTokens) {
+  if (!parseContext(value, capabilities, result)) {
     throw UsageError("MAX_CONTEXT must be auto or an integer in [1, " +
                      std::to_string(capabilities.maximumContextTokens) + "]");
   }
@@ -91,10 +99,13 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
     throw UsageError("expected the serve-native command");
   }
   NativeArguments result;
+  // Read once the model's own context is known.
+  std::optional<std::string_view> relaunchContext;
   int next = 5;
   if (next < argc && !std::string_view(argv[next]).starts_with("--")) {
     const std::string_view quota(argv[next++]);
-    if (quota != "0" && !parsePositive(quota, result.maxCacheDiskBytes))
+    result.maxCacheDisk = {};
+    if (quota != "0" && !parsePositive(quota, result.maxCacheDisk.bytes))
       throw UsageError("MAX_CACHE_DISK_BYTES must be a nonnegative integer");
   }
   // Options follow as --name value pairs; a missing value fails its check.
@@ -114,10 +125,17 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
       result.decodeShare = parseDecodeShare(value);
     } else if (option == "--max-image-patches") {
       result.maxImagePatches = parseMaxImagePatches(value);
+    } else if (option == "--persistent-cache") {
+      if (value != "on" && value != "off")
+        throw UsageError("--persistent-cache requires on or off");
+      result.persistentCache = value == "on";
+    } else if (option == "--max-cache-disk-writes") {
+      if (value != "0" && !parsePositive(value, result.maxCacheDiskWritesBytes))
+        throw UsageError("--max-cache-disk-writes requires a nonnegative integer byte count");
     } else if (option == "--cache-dir") {
       if (value.empty())
         throw UsageError("--cache-dir requires a directory");
-      result.persistentCacheRoot = std::filesystem::absolute(std::filesystem::path(value));
+      result.cacheRoot = std::filesystem::absolute(std::filesystem::path(value));
     } else if (option == "--idle-release") {
       result.idleReleaseSeconds = parseIdleRelease(value);
     } else if (option == "--idle-sleep") {
@@ -128,15 +146,28 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
       if (value != "on" && value != "off")
         throw UsageError("--ane requires on or off");
       result.neuralEngine = value == "on";
+    } else if (option == "--relaunch-context") {
+      relaunchContext = value;
     } else {
       throw UsageError("unexpected argument " + std::string(option));
     }
   }
-  if (!result.persistentCacheRoot.empty() && !result.maxCacheDiskBytes)
-    throw UsageError("--cache-dir requires a MAX_CACHE_DISK_BYTES quota");
+  if (result.persistentCache && !result.maxCacheDisk.automatic && !result.maxCacheDisk.bytes)
+    throw UsageError("--persistent-cache requires an SSD cache, which MAX_CACHE_DISK_BYTES 0 turns off");
+  if (result.maxCacheDiskWritesBytes && !result.maxCacheDisk.automatic && !result.maxCacheDisk.bytes)
+    throw UsageError("--max-cache-disk-writes requires an SSD cache, which MAX_CACHE_DISK_BYTES 0 turns off");
+  if (!result.cacheRoot.empty() && !result.persistentCache)
+    throw UsageError("--cache-dir requires --persistent-cache on");
   result.modelRoot = requireModelRoot(argv[2]);
   result.model = model::inspectModelRoot(result.modelRoot);
   result.maxContext = parseMaxContext(argv[3], result.model.capabilities);
+  if (relaunchContext) {
+    if (result.maxContext)
+      throw UsageError("--relaunch-context requires MAX_CONTEXT auto");
+    if (!parseContext(*relaunchContext, result.model.capabilities, result.relaunchContext))
+      throw UsageError("--relaunch-context requires an integer in [1, " +
+                       std::to_string(result.model.capabilities.maximumContextTokens) + "]");
+  }
   result.maxMemoryBytes = parseMaxMemory(argv[4]);
   return result;
 }

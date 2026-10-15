@@ -388,11 +388,13 @@ class Frontend:
             raise ContextLengthError(
                 tokens, self.max_context - 1, image_tokens_only=image_tokens_only
             )
+        # A thinking budget's end tokens follow, at most this many.
         frame_bytes = (
             wire.REQUEST_FIXED_BYTES
             + 4 * tokens
             + wire.IMAGE_SPAN_BYTES * image_count
             + pixel_bytes
+            + 4 * wire.MAX_THINKING_END_TOKENS
         )
         if frame_bytes > wire.MAX_FRAME_PAYLOAD_BYTES:
             raise APIError(400, "images exceed the request size limit")

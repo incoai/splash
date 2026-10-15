@@ -104,7 +104,7 @@ FrameType write(Writer &out, const RequestFrame &request) {
   const ThinkingBudget thinking =
       request.thinkingBudget.value_or(ThinkingBudget{.tokens = kNoThinkingBudget});
   out.u32(thinking.tokens);
-  out.u32(thinking.end);
+  out.u32(static_cast<uint32_t>(thinking.end.size()));
   out.u32(thinking.alsoEnds);
   out.words(request.promptTokens);
   for (const ImageSpan &span : request.imageSpans) {
@@ -117,6 +117,7 @@ FrameType write(Writer &out, const RequestFrame &request) {
   }
   out.raw(request.imagePixels);
   out.words(request.scoreTokens);
+  out.words(thinking.end);
   return FrameType::Request;
 }
 

@@ -113,9 +113,9 @@ void testFamilies(const std::filesystem::path &fixtures) {
     std::string_view from, to, difference;
   };
   for (const Refused &refused : std::initializer_list<Refused>{
-           {R"("hidden_size": 5120)", R"("hidden_size": 2560)", "text config hidden_size: MLX 2560, Qwen3.8-27B 5120"},
+           {R"("hidden_size": 5120)", R"("hidden_size": 2560)", "text config hidden_size: safetensors 2560, Qwen3.8-27B 5120"},
            {R"("num_hidden_layers": 64)", R"("num_hidden_layers": 32)",
-            "text config num_hidden_layers: MLX 32, Qwen3.8-27B 64"},
+            "text config num_hidden_layers: safetensors 32, Qwen3.8-27B 64"},
            {R"("model_type": "qwen3_5_text")", R"("model_type": "gemma3_text")", "text model type gemma3_text"},
            {R"("text_config")", R"("unused")", "its config has no text_config"},
        })
@@ -170,7 +170,7 @@ void testOneRulePerValue(const std::filesystem::path &fixtures) {
             "text config num_hidden_layers must be a number"},
            {&SourceModel::config, R"("head_dim": 256,)", "", "text config head_dim must be a number"},
            {&SourceModel::config, R"("linear_num_value_heads": 48)", R"("linear_num_value_heads": 47)",
-            "text config linear_num_value_heads mismatch: MLX 47, runtime 48"},
+            "text config linear_num_value_heads mismatch: safetensors 47, runtime 48"},
            {&SourceModel::config, R"("attn_output_gate": true)", R"("attn_output_gate": 1)",
             "text config attn_output_gate must be true"},
            {&SourceModel::config, R"("rope_type": "default")", R"("type": "yarn")",
@@ -292,7 +292,7 @@ void testQuantization(const std::filesystem::path &fixtures) {
            // checkpoint (GPTQ, AWQ, ...) states.
            {dense, R"("quantization": {)", R"("unused": {)",
             "this model requires an MLX checkpoint (affine 2, 3, 4, 5, 6 or 8 bits in groups of 32, 64 or 128, mxfp4 "
-            "or nvfp4), an NVFP4 checkpoint of Model Optimizer or compressed-tensors, or a supported GGUF"},
+            "or nvfp4), an NVFP4 or FP8 checkpoint of Model Optimizer or compressed-tensors, or a supported GGUF"},
            {dense, R"("bits": 4)", R"("bits": 7)",
             "quantization is affine 7-bit in groups of 64; MLX weights load as affine 2, 3, 4, 5, 6 or 8 bits in "
             "groups of 32, 64 or 128, or as mxfp4 or nvfp4"},
@@ -551,11 +551,11 @@ void testConfigurationCheck(const std::filesystem::path &fixtures) {
   };
   for (const Refused &refused : std::initializer_list<Refused>{
            {dense, &SourceModel::config, R"("rope_type": "default")", R"("rope_type": "yarn")",
-            "text config rope_parameters rope_type mismatch: MLX yarn, runtime default"},
+            "text config rope_parameters rope_type mismatch: safetensors yarn, runtime default"},
            {dense, &SourceModel::config, R"("tie_word_embeddings": false)", R"("tie_word_embeddings": true)",
             "text config tie_word_embeddings must be false"},
            {dense, &SourceModel::config, R"("rms_norm_eps": 1e-06)", R"("rms_norm_eps": 1e-05)",
-            "text config rms_norm_eps mismatch: MLX 1e-05, runtime 1e-06"},
+            "text config rms_norm_eps mismatch: safetensors 1e-05, runtime 1e-06"},
            // The JSON true equals 1, the first layer this draft reads, in Python.
            {moe, &SourceModel::draft, "[\n      1,", "[\n      true,",
             "draft config target_layer_ids 0 must be a number"},

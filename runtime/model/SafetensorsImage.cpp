@@ -184,7 +184,8 @@ private:
 
   // The module's native rows when the checkpoint holds it quantized, in the
   // format its tensors hold (metal/abi/QuantFormat.h); none when the
-  // checkpoint holds the module's weight unquantized. MLX's format is the one
+  // checkpoint holds the module's weight unquantized; a module without a
+  // weight is a missing source tensor. MLX's format is the one
   // MLX infers from codes [experts, rows, columns * bits / 32] (U32) and
   // scales [experts, rows, columns / group size]: bf16 with bf16 biases
   // (affine), uint8 E8M0 exponents (mxfp4, 4 bits in groups of 32) or uint8
@@ -193,9 +194,9 @@ private:
   std::optional<TensorRows> quantized(const std::string &module, uint64_t rows, uint64_t columns,
                                       uint64_t experts = 1) const {
     if (experts == 1 && checkpoint_.find(module + ".weight_scale")) return floatQuantized(module, rows, columns);
+    const SourceTensor &codes = checkpoint_.require(module + ".weight");
     const SourceTensor *scales = checkpoint_.find(module + ".scales");
     if (!scales) return std::nullopt;
-    const SourceTensor &codes = checkpoint_.require(module + ".weight");
     std::vector<uint64_t> leading{rows};
     if (experts > 1) leading.insert(leading.begin(), experts);
     const auto shaped = [&](const SourceTensor &tensor) {

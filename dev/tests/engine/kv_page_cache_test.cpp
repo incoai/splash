@@ -74,6 +74,33 @@ void testImageIdentityKeysBlocks() {
   std::cout << "KV image identity ok\n";
 }
 
+// A persistent tier records each block's identity (KvBlockLabel), and a later
+// process's lookups compute it again: a change to blockIdentity's mixing or
+// seeds would leave the salted and image chains it holds matching nothing.
+// Such a change bumps kPersistentCacheFormat (engine/RuntimeResources.mm) and
+// pins the new values here.
+void testBlockIdentitiesArePinned() {
+  const CacheSalt salt{0x0123456789abcdefULL, 0xfedcba9876543210ULL};
+  // Two images in the first block, the second through the third.
+  const std::array<ImageSpan, 2> images{
+      ImageSpan{8, 16, 8, 8, 0x1111222233334444ULL, 0x5555666677778888ULL},
+      ImageSpan{24, 72, 12, 24, 0x99990000aaaabbbbULL, 0xccccddddeeeeffffULL}};
+  require(blockIdentity(0, 32, {}, salt) ==
+                  BlockIdentity{0x7ebd72de8d5302c4ULL, 0xfc6aad21c68d9802ULL} &&
+              blockIdentity(0, 32, images, {}) ==
+                  BlockIdentity{0x9979f264297f2e0dULL, 0x2a53365bb9c20351ULL} &&
+              blockIdentity(32, 32, images, {}) ==
+                  BlockIdentity{0xbb5b6de52eeab8baULL, 0xfa8765be1d4ad307ULL} &&
+              blockIdentity(64, 32, images, {}) ==
+                  BlockIdentity{0xbb5b6de52eeab89aULL, 0xfa8765be1d4ad327ULL} &&
+              blockIdentity(0, 32, images, salt) ==
+                  BlockIdentity{0xa23cc0b0f9bab89dULL, 0x386a63737598e476ULL} &&
+              blockIdentity(32, 32, images, salt) == blockIdentity(32, 32, images, {}),
+          "block identities changed: persisted salted and image chains would match "
+          "nothing; bump kPersistentCacheFormat and pin the new values");
+  std::cout << "KV block identities pinned ok\n";
+}
+
 void testExactChainedBlocksAndPhysicalOwnership() {
   test::TestKvStorage storage(8, 100, 1);
   KvPool pool(storage, 8);
@@ -570,6 +597,7 @@ int main() {
   try {
     testExactChainedBlocksAndPhysicalOwnership();
     testImageIdentityKeysBlocks();
+    testBlockIdentitiesArePinned();
     testErasedLeafParentInheritsRecency();
     testInputValidation();
     testCandidateOrderThroughChurn();

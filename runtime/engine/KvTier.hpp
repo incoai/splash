@@ -35,18 +35,21 @@ class KvTier {
 public:
   virtual ~KvTier() = default;
   [[nodiscard]] virtual uint64_t slotBytes() const noexcept = 0;
-  // False once a write has failed; existing copies stay readable.
+  // False once its file stopped taking writes (model::SlotFile::writable);
+  // existing copies stay readable.
   [[nodiscard]] virtual bool writable() const noexcept = 0;
   // The tier's copies outlive the process (model::SlotFile::Persistence).
   [[nodiscard]] virtual bool persistent() const noexcept = 0;
   // In a persistent tier, keeps the label with the slot once the demotion
   // started before it has landed (model::SlotFile::label).
   virtual void label(const std::shared_ptr<KvDiskSlot> &slot, std::vector<std::byte> label) = 0;
-  // Engine-thread admission probe, before replacing any disk copies.
+  // Engine-thread admission probe, before replacing any disk copies: room
+  // for another demotion in flight, in a writable tier. The write budget
+  // holds no KV write back (model::DiskBudget).
   [[nodiscard]] virtual bool canDemote() const noexcept = 0;
   // Engine-thread admission probe, before building a restore's arguments.
   [[nodiscard]] virtual bool canRestore() const noexcept = 0;
-  // Null when the disk quota is full.
+  // Null when the tier is at its limit (model::DiskBudget).
   [[nodiscard]] virtual std::shared_ptr<KvDiskSlot> acquireSlot() = 0;
   // Starts writing the page. Null when the tier takes no more demotions for
   // now; the caller waits while transfers are in flight.

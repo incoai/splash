@@ -27,8 +27,8 @@ namespace splash::test {
 class State final : public CompositeState {
 public:
   State() = default;
-  // A lane's snapshot: once the cache lets go of it, its buffers return to
-  // the model's pool, as QwenStateStorage's do.
+  // A state a prefill command captured: once the cache lets go of it, its
+  // buffers return to the model's pool, as QwenStateStorage's do.
   explicit State(std::shared_ptr<uint64_t> pool) : pool_(std::move(pool)) {}
   ~State() override {
     if (pool_)
@@ -61,6 +61,23 @@ private:
   uint64_t rows_;
 };
 
+// The buffers of a state a prefill command captures (Executor::reserveState):
+// the command seals them into the state, and dropped unsealed they return to
+// the model's pool.
+class Reservation final : public StateReservation {
+public:
+  explicit Reservation(std::shared_ptr<uint64_t> pool) : pool_(std::move(pool)) {}
+  ~Reservation() override {
+    if (pool_)
+      *pool_ += State().bytes();
+  }
+  // The pool the sealed state's buffers return to.
+  std::shared_ptr<uint64_t> seal() noexcept { return std::exchange(pool_, nullptr); }
+
+private:
+  std::shared_ptr<uint64_t> pool_;
+};
+
 struct OffloadControl {
   bool ready = false;
   bool released = false;
@@ -81,7 +98,7 @@ private:
   std::shared_ptr<const CompositeState> disk_ = std::make_shared<DiskState>();
 };
 
-// With a pool, it is a lane's snapshot whose buffers return to the model's
+// With a pool, it is a captured state whose buffers return to the model's
 // pool once the cache lets go of them, like State's.
 class OffloadState final : public CompositeState {
 public:
@@ -94,7 +111,7 @@ public:
       *pool_ += bytes();
   }
   uint64_t bytes() const noexcept override { return 64; }
-  bool canOffload() const noexcept override { return true; }
+  bool canOffload(bool) const noexcept override { return true; }
   std::unique_ptr<StateOffload> offload(std::function<void()>) const override {
     return std::make_unique<OffloadTicket>(control_);
   }
@@ -103,13 +120,13 @@ private:
   std::shared_ptr<uint64_t> pool_;
 };
 
-// A lane's snapshot whose copy a persistent tier writes while it stays in
+// A captured state whose copy a persistent tier writes while it stays in
 // RAM (persist); the copy is a DiskState.
 class KeptState final : public CompositeState {
 public:
   explicit KeptState(std::shared_ptr<OffloadControl> control) : control_(std::move(control)) {}
   uint64_t bytes() const noexcept override { return 64; }
-  bool canOffload() const noexcept override { return true; }
+  bool canOffload(bool) const noexcept override { return true; }
   std::unique_ptr<StateOffload> persist(std::function<void()>) const override {
     return std::make_unique<OffloadTicket>(control_);
   }
@@ -189,10 +206,11 @@ private:
 
 // A model that runs no kernels, for the engine, native loop and transport
 // tests. It behaves as model::Runtime does where those tests rely on it: a
-// request takes the first free one of maximumLanes lanes; the prefill step
-// that completes a prompt asks for a constrained request's first mask, or
-// returns a score request's option logits; every constrained decode cycle
-// after the first token waits for its verify mask inside its command
+// request takes the first free one of maximumLanes lanes; a prefill step that
+// commits returns the states it captures, in their reserved buffers; the
+// prefill step that completes a prompt asks for a constrained request's first
+// mask, or returns a score request's option logits; every constrained decode
+// cycle after the first token waits for its verify mask inside its command
 // (MaskOverlapTicket); and provideMask throws for a request that waits for
 // no mask and refuses one that permits no token. Its other members are the
 // tests' knobs and records.
@@ -320,6 +338,23 @@ public:
       state.position += item.tokenCount;
       prefillRows += item.tokenCount;
       ++prefillChunks[item.requestId];
+      const uint64_t end = item.logicalPosition + item.tokenCount;
+      std::vector<std::shared_ptr<const CompositeState>> captured;
+      uint64_t after = item.logicalPosition;
+      // The production runtime refuses a capture its draft plan leaves no
+      // whole draft window for, and the plan has one for its boundaries.
+      const std::vector<DraftBoundaryPlan> &planned = plans.at(item.requestId).boundaries;
+      for (const StateCapture &capture : item.stateCaptures) {
+        if (capture.tokens <= after || capture.tokens > end || !capture.reservation)
+          throw std::logic_error("a state capture lies outside its step or out of order");
+        if (std::none_of(planned.begin(), planned.end(), [&](const DraftBoundaryPlan &boundary) {
+              return boundary.boundary == capture.tokens;
+            }))
+          throw std::logic_error("a state capture is not a boundary of the request's draft plan");
+        after = capture.tokens;
+        captures.push_back({item.requestId, capture.tokens, end});
+        captured.push_back(seal(static_cast<Reservation &>(*capture.reservation)));
+      }
       // The step that completes the prompt selects its first token; a replay
       // never does again. A constrained prompt's end waits for the first
       // mask instead, and a score request's returns its option logits.
@@ -348,6 +383,9 @@ public:
       } else if (last && firstTokens && !state.constrained) {
         step.firstToken = 42;
       }
+      // A step that fails commits nothing.
+      if (step.failure.empty())
+        step.capturedStates = std::move(captured);
       result.push_back(std::move(step));
     }
     return result;
@@ -443,36 +481,43 @@ public:
     return ticket;
   }
   uint64_t snapshotBytes() const noexcept override { return stateBytes; }
-  // The production model copies the lane's state into a cache slot at its
-  // current page-aligned boundary and returns nullptr when no slot is free
-  // and the governor denies a new one. The fake denies the next
-  // `deniedSnapshots` calls, every call made at `denySnapshotAtBoundary`,
-  // and every call while `snapshotRoom` reports no memory.
+  // The production model takes a cached state's buffers from its pool, or
+  // with one admission, for a resident lane's page-aligned boundary, and
+  // returns nullptr when the governor refuses them. The fake refuses the
+  // next `deniedReservations` calls, every call for the boundary at
+  // `denyReservationAt`, and every call while `reservationRoom` reports no
+  // memory.
+  std::shared_ptr<StateReservation> reserveState(uint64_t id, uint32_t tokens) override {
+    if (!requests.at(id).resident || !tokens || tokens % engine::KvCache::pageTokens)
+      throw std::logic_error("a state was reserved off a resident lane's page boundary");
+    ++reservationAttempts;
+    if (reservationObserver)
+      reservationObserver();
+    if (deniedReservations) {
+      --deniedReservations;
+      return nullptr;
+    }
+    if (denyReservationAt == tokens)
+      return nullptr;
+    if (reservationRoom && !reservationRoom())
+      return nullptr;
+    ++reservations;
+    return std::make_shared<Reservation>(evictedStateBytes);
+  }
+  // The production model copies the lane's state at its position into
+  // buffers it takes as reserveState() does; so does the fake, refusing as
+  // reserveState() refuses.
   std::shared_ptr<const CompositeState> snapshot(uint64_t id) override {
-    ++snapshotAttempts;
-    if (snapshotObserver)
-      snapshotObserver();
-    if (deniedSnapshots) {
-      --deniedSnapshots;
-      return nullptr;
-    }
-    if (denySnapshotAtBoundary &&
-        *denySnapshotAtBoundary == requests.at(id).position) {
-      return nullptr;
-    }
-    if (snapshotRoom && !snapshotRoom())
+    const std::shared_ptr<StateReservation> buffers = reserveState(id, requests.at(id).position);
+    if (!buffers)
       return nullptr;
     ++snapshots;
-    if (keptTier)
-      return std::make_shared<KeptState>(keptTier);
-    if (stateHeldRows)
-      return std::make_shared<RowsHoldingState>(cacheUnits, stateHeldRows);
-    return std::make_shared<State>(evictedStateBytes);
+    return seal(static_cast<Reservation &>(*buffers));
   }
   // Without a cache slot the production model writes the lane's state to
   // the disk tier; the fake has one when `stateTier` is set, with quota for
   // every state.
-  bool canSnapshotToDisk() const noexcept override { return stateTier != nullptr; }
+  bool canSnapshotToDisk(bool) const noexcept override { return stateTier != nullptr; }
   std::unique_ptr<StateOffload> snapshotToDisk(uint64_t, std::function<void()>) override {
     ++diskSnapshots;
     return std::make_unique<OffloadTicket>(stateTier);
@@ -530,11 +575,15 @@ public:
   static uint64_t rows(uint32_t block, uint32_t firstToken) {
     return (uint64_t{block} << 32) | firstToken;
   }
-  // With `kv`, a step finds every prompt block before `position` through
-  // the page table the engine handed it.
+  // With `kv`, a step names pages of allocated extents only and finds every
+  // prompt block before `position` through the page table the engine handed
+  // it.
   void requireRows(const ModelBatchItem &item, uint64_t position) const {
     if (!kv)
       return;
+    for (uint32_t page : item.pageTable)
+      if (!kv->allocated(page / kv->extentPages()))
+        throw std::logic_error("a page table names a page of a released extent");
     const std::vector<uint32_t> &prompt = prompts.at(item.requestId);
     const uint64_t blocks =
         std::min<uint64_t>(position, prompt.size()) / engine::KvCache::pageTokens;
@@ -572,17 +621,29 @@ public:
   uint32_t diskReads = 0;
   uint32_t prefillRows = 0;
   uint32_t restored = 0;
+  // State reservations granted, and asked for.
+  uint32_t reservations = 0;
+  uint32_t reservationAttempts = 0;
+  // Each state a prefill step captured: its request, its boundary and the
+  // step's end, past the boundary for one inside the step.
+  struct Capture {
+    uint64_t requestId = 0;
+    uint32_t tokens = 0;
+    uint64_t end = 0;
+  };
+  std::vector<Capture> captures;
+  // States taken from a lane after its command (snapshot).
   uint32_t snapshots = 0;
-  uint32_t snapshotAttempts = 0;
   uint32_t diskSnapshots = 0;
   std::shared_ptr<OffloadControl> stateTier;
-  // With it, snapshots are KeptStates whose copies land when it says so.
+  // With it, captured states are KeptStates whose copies land when it says
+  // so.
   std::shared_ptr<OffloadControl> keptTier;
-  // What a snapshot allocates; State::bytes() unless a test needs a state
-  // larger than an extent.
+  // What a cached state's buffers take; State::bytes() unless a test needs a
+  // state larger than an extent.
   uint64_t stateBytes = 64;
-  uint32_t deniedSnapshots = 0;
-  std::optional<uint32_t> denySnapshotAtBoundary;
+  uint32_t deniedReservations = 0;
+  std::optional<uint32_t> denyReservationAt;
   uint32_t beginAttempts = 0;
   // The request of the latest begin(), for hooks that refuse only some.
   uint64_t lastBeginId = 0;
@@ -596,8 +657,8 @@ public:
   bool resumeDenied = false;
   uint32_t maximumLanes = model::ExecutionLimits::maximumBatchWidth;
   std::function<void()> beginObserver;
-  std::function<void()> snapshotObserver;
-  std::function<bool()> snapshotRoom;
+  std::function<void()> reservationObserver;
+  std::function<bool()> reservationRoom;
   std::function<bool()> beginGrowthBlocked;
   std::vector<std::vector<uint32_t>> resumedPrompts;
   std::vector<uint32_t> prefillWidths;
@@ -610,8 +671,8 @@ public:
   // laneFootprintBytes, from the buffers of evicted states.
   uint64_t pooledLaneBytes = 0;
   uint64_t laneFootprintBytes = 0;
-  // The buffers of snapshots the cache has let go of, until reclaimIdleState
-  // takes them into the pool.
+  // The buffers of states the cache has let go of, and of reservations no
+  // step sealed, until reclaimIdleState takes them into the pool.
   std::shared_ptr<uint64_t> evictedStateBytes = std::make_shared<uint64_t>(0);
   // The cached states whose buffers the pool lacks for one activation.
   std::function<uint32_t()> statesLacked;
@@ -620,7 +681,7 @@ public:
   // take them once no buffer is idle; cacheReclaims counts those steps.
   std::vector<uint64_t> cacheUnits;
   uint32_t cacheReclaims = 0;
-  // Rows each state snapshotted from then on holds (RowsHoldingState); the
+  // Rows each state captured from then on holds (RowsHoldingState); the
   // executor must outlive the cache that keeps those states.
   uint64_t stateHeldRows = 0;
   bool keptLane = false;
@@ -669,6 +730,15 @@ public:
   }
 
 private:
+  // The state the step that captured it keeps in the reserved buffers.
+  std::shared_ptr<const CompositeState> seal(Reservation &reservation) {
+    std::shared_ptr<uint64_t> pool = reservation.seal();
+    if (keptTier)
+      return std::make_shared<KeptState>(keptTier);
+    if (stateHeldRows)
+      return std::make_shared<RowsHoldingState>(cacheUnits, stateHeldRows);
+    return std::make_shared<State>(std::move(pool));
+  }
   void applyRestore(uint64_t id, uint32_t length,
                     std::shared_ptr<const CompositeState> state,
                     bool restoreDraftState) {

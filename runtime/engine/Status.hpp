@@ -248,11 +248,14 @@ struct NativeLoopTiming {
 };
 
 // The model's weights as the native loop releases and restores them
-// (NativeRuntime::releaseIdleWeights).
+// (NativeRuntime::releaseWeights).
 struct WeightsSnapshot {
-  // --idle-release: infinite while the engine keeps them.
+  // --idle-release: infinite with `off`, when only a release request frees them.
   double idleReleaseSeconds = 0.0;
+  // From a release until the restore has written the last image back.
   bool released = false;
+  // From the request that found them released until the restore ends.
+  bool restoring = false;
   // The times they were written back, each for a request.
   uint64_t restores = 0;
   // The restores that gave up for want of memory: their requests failed

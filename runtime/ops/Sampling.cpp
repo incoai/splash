@@ -31,6 +31,56 @@ void requireVocabulary(std::span<const uint32_t> tokens, size_t vocabulary) {
     throw std::invalid_argument("penalty token is outside the vocabulary");
 }
 
+// The thinking cutoffs of a selection of `rows` rows per lane, the first
+// `draftedRows` of them drafted and their masks from mask row `maskRow` on,
+// and the lanes up to the last one it cuts and up to the last one whose end
+// replaces draft proposals, 0 where it cuts none.
+struct ThinkingCutoffs final {
+  ThinkingCutoffParams params{};
+  uint32_t cutLanes = 0;
+  uint32_t draftingLanes = 0;
+};
+
+ThinkingCutoffs thinkingCutoffs(std::span<const SamplingPolicy> policies, uint32_t vocabulary, uint32_t rows,
+                                uint32_t draftedRows, uint32_t maskRow) {
+  ThinkingCutoffs cutoffs;
+  ThinkingCutoffParams &params = cutoffs.params;
+  params.vocabulary = vocabulary;
+  params.rows = rows;
+  params.drafted_rows = draftedRows;
+  params.mask_words = (vocabulary + 31) / 32;
+  params.mask_row = maskRow;
+  for (uint32_t lane = 0; lane < policies.size(); ++lane) {
+    const SamplingPolicy &policy = policies[lane];
+    if (policy.samples())
+      params.sampling_mask |= uint32_t{1} << lane;
+    const std::optional<ThinkingCutoff> &cutoff = policy.thinkingCutoff;
+    params.row[lane] = cutoff ? cutoff->row : rows;
+    if (params.row[lane] >= rows)
+      continue;
+    if (cutoff->end.empty())
+      throw std::invalid_argument("a thinking cutoff has no end");
+    if (cutoff->waitsForMask) {
+      // Only a constrained lane has mask rows to read, which the kernel
+      // reads at the end's first token.
+      if (!policy.constrained)
+        throw std::invalid_argument("an unconstrained lane's thinking end waits for a mask");
+      if (cutoff->end.front() >= vocabulary)
+        throw std::invalid_argument("a thinking end that waits for a mask starts outside the vocabulary");
+      params.waiting_mask |= uint32_t{1} << lane;
+    }
+    // The rows from the cutoff's on take as many of its end as they hold.
+    params.count[lane] = static_cast<uint32_t>(std::min<size_t>(cutoff->end.size(), rows - cutoff->row));
+    std::copy_n(cutoff->end.begin(), params.count[lane], params.tokens[lane]);
+    params.close[lane] = cutoff->end.back();
+    params.also_ends[lane] = cutoff->alsoEnds;
+    cutoffs.cutLanes = lane + 1;
+    if (cutoff->replacedProposals())
+      cutoffs.draftingLanes = lane + 1;
+  }
+  return cutoffs;
+}
+
 } // namespace
 
 SamplingWorkspace Sampling::workspace(uint32_t rows) {
@@ -267,28 +317,36 @@ void Sampling::addSelection(metal::CommandGraph &graph, const TargetSamplingPara
               {kVocabularyThreads, 1, 1});
   }
   // Only a selection that reaches a lane's thinking cutoff dispatches it.
-  ThinkingCutoffParams cutoffs{};
-  cutoffs.rows = params.rows;
-  cutoffs.drafted_rows = params.drafted_rows;
-  cutoffs.sampling_mask = params.sampling_mask;
-  std::optional<uint32_t> lastCut;
-  for (uint32_t lane = 0; lane < lanes; ++lane) {
-    const std::optional<ThinkingCutoff> &cutoff = policies[lane].thinkingCutoff;
-    cutoffs.row[lane] = cutoff ? cutoff->row : params.rows;
-    if (cutoffs.row[lane] >= params.rows)
-      continue;
-    cutoffs.end[lane] = cutoff->end;
-    cutoffs.also_ends[lane] = cutoff->alsoEnds;
-    lastCut = lane;
-  }
-  if (!lastCut)
+  const ThinkingCutoffs cutoffs =
+      thinkingCutoffs(policies, vocabulary_, params.rows, params.drafted_rows, params.mask_row);
+  if (!cutoffs.cutLanes)
     return;
-  // A cut lane reads its draft tokens up to its drafted rows' last.
-  requireBytes(buffers.inputTokens, (uint64_t{*lastCut} * params.rows + params.drafted_rows + 1) * sizeof(uint32_t),
+  // A cut lane reads its draft tokens up to its drafted rows' last; a lane
+  // whose end waits for its mask, a constrained one, reads its mask rows,
+  // which selection() checked.
+  requireBytes(buffers.inputTokens,
+               (uint64_t{cutoffs.cutLanes - 1} * params.rows + params.drafted_rows + 1) * sizeof(uint32_t),
                "verify input token");
   graph.add("decode_sample_thinking_cutoff",
-            {buffers.inputTokens, buffers.outputTokens, buffers.vocabularyRows},
-            cutoffs, {lanes, 1, 1}, {1, 1, 1});
+            {buffers.inputTokens, buffers.constraintMasks, buffers.outputTokens, buffers.vocabularyRows},
+            cutoffs.params, {lanes, 1, 1}, {1, 1, 1});
+}
+
+void Sampling::addThinkingDrafts(metal::CommandGraph &graph, std::span<const SamplingPolicy> policies,
+                                 metal::MetalBuffer proposedTokens) const {
+  if (policies.empty() || policies.size() > kMaximumLanes)
+    throw std::invalid_argument("invalid sampling batch width");
+  // The cutoffs of the verify that follows (addVerify), whose masks the
+  // drafts do not read.
+  const ThinkingCutoffs cutoffs =
+      thinkingCutoffs(policies, vocabulary_, SPLASH_TARGET_VERIFY_ROWS, SPLASH_DRAFT_PROPOSAL_TOKENS, 1);
+  if (!cutoffs.draftingLanes)
+    return;
+  // Such a lane writes its own proposals.
+  requireBytes(proposedTokens, uint64_t{cutoffs.draftingLanes} * SPLASH_DRAFT_PROPOSAL_TOKENS * sizeof(uint32_t),
+               "proposed token");
+  graph.add("decode_draft_thinking_cutoff", {std::move(proposedTokens)}, cutoffs.params, {policies.size(), 1, 1},
+            {1, 1, 1});
 }
 
 void Sampling::addAcceptance(
