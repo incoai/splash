@@ -172,8 +172,9 @@ def run_round(tree: Path, model_root: Path, round_index: int, version: str, args
             "--progress",
             str(stem.with_suffix(".progress.jsonl")),
         ]
-        # Each start calibrates the split afresh, so later rounds run the
-        # first round's, the GPU alone (share 0) when it ran none.
+        # A later start can calibrate the split again and find a gain the
+        # first did not, so later rounds run the first round's, the GPU alone
+        # (share 0) when it ran none.
         if args.ane_ffn_share is not None and args.takes_ane_ffn_share[version]:
             command += ["--ane-ffn-share", repr(args.ane_ffn_share)]
             if args.ane_ffn_minimum_rows:
