@@ -234,9 +234,9 @@ def round_record(version: str, documents: list[dict], scenarios) -> dict:
                 transcripts[measurement["scenario"]].append(request)
             elif (
                 measurement["scenario"] == "short"
-                and measurement["prompt_tokens"] - 1 in short
+                and measurement["prompt_tokens"] in short
             ):
-                short[measurement["prompt_tokens"] - 1].append(request)
+                short[measurement["prompt_tokens"]].append(request)
     measured = {
         "decode": decode,
         "partial": partial,
