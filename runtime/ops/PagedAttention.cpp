@@ -112,11 +112,16 @@ void requirePageTable(const metal::MetalBuffer &table, const kv::ChunkedPrefillP
   requireBytes(table, uint64_t{kv::chunkedPrefillRequiredPages(chunk)} * sizeof(SplashKvPage), "page table");
 }
 
-// Each query tile's history splits: the maximum shared out over the chunk's
-// tiles, at least one.
+// Each query tile's history splits: the threadgroups a full chunk's tiles
+// fill, shared out over the chunk's tiles, at least one and at most the
+// kernel's maximum. A short chunk over a long history (an agent's turn
+// appended to a cached conversation) otherwise ran one threadgroup per tile
+// and KV head, each walking the whole history alone: 300 rows over 9K
+// tokens were 80 threadgroups on a 40-core GPU. The workspace bound stays
+// the full chunk's, since tiles * splits never exceeds its tiles.
 uint32_t prefillSplits(uint32_t tiles) {
-  constexpr uint32_t maximum = SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS;
-  return std::clamp(maximum / tiles, 1U, maximum);
+  constexpr uint32_t budget = kv::prefillAttentionTiles(kv::kChunkedPrefillMaximumRows);
+  return std::clamp(budget / tiles, 1U, uint32_t{SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS});
 }
 
 } // namespace
