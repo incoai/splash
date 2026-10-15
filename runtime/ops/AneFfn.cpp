@@ -253,6 +253,25 @@ uint64_t AneFfn::plannedBytes(std::span<const SwiGluProjections> layers, uint32_
   return bytes;
 }
 
+bool AneFfn::compiled(std::span<const SwiGluProjections> layers, uint32_t aneUnits,
+                      std::function<bool()> interrupted) {
+  // The program's source names its surfaces' strides only, which surfaces of
+  // no memory hold as the constructor's do.
+  const Shape shape = shapeOf(layers, aneUnits);
+  const Memory memory = allocate(
+      shape, [](uint64_t, const char *) { return metal::MetalBuffer{}; },
+      [](uint32_t, uint32_t width, Element element) {
+        ane::Surface surface;
+        surface.element = element;
+        surface.strideBytes = ane::Surface::rowBytes(width, element);
+        return surface;
+      });
+  const std::vector<Input> inputs = programInputs(shape, memory);
+  return ane::Program::compiled(program(shape, inputs, memory.partial, functionRows()),
+                                rotationBlob(shape.ane, rotationSigns()),
+                                ane::Program::Limits{kProgramLimit, std::move(interrupted)});
+}
+
 // x<k>: the rotated input rows of segment k, channel-major in int8, and tx
 // their per-token scales; wg<k> and wu<k>: gate's and up's rotated int8 rows
 // over segment k, and sg and su their per-row scales; wd<i>: down's rotated

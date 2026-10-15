@@ -58,6 +58,10 @@ struct AneFfnModel final {
   std::function<uint64_t(uint32_t aneUnits)> plannedBytes;
   // Calibration's timings (ops::ane_ffn::Measurement::time).
   std::function<ops::ane_ffn::Timings()> time;
+  // Whether the ANE's service holds the program of a split of `aneUnits`
+  // (ops::AneFfn::compiled), which calibration's choice prefers within its
+  // timings' noise (ops::ane_ffn::choose); none for no preference.
+  std::function<bool(uint32_t aneUnits)> compiled;
   // The split that serves with the ANE taking `aneUnits`, verified, with its
   // chunks timed (ops::ane_ffn::Measurement::chunks) when `timeChunks`. A
   // model a test plays prepares no split.

@@ -716,6 +716,15 @@ AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &
     });
     return timings;
   };
+  model.compiled = [layers, cancelled](uint32_t aneUnits) {
+    try {
+      return ops::AneFfn::compiled(*layers, aneUnits, cancelled);
+    } catch (const ane::Interrupted &) {
+      throw;
+    } catch (const std::exception &) {
+      return false;
+    }
+  };
   model.prepare = [&backend, layers, cancelled, onArena](uint32_t aneUnits, bool timeChunks) {
     AneFfnPrepared prepared;
     onArena([&](const ops::PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden) {

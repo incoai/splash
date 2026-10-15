@@ -140,10 +140,15 @@ ChunkTimings Measurement::chunks(AneFfn &split) {
   ChunkTimings timings{{gpu(rows.front()), gpu(rows.back())}, {}};
   const auto &[low, high] = timings.gpu;
   const double slope = (high.milliseconds - low.milliseconds) / (high.rows - low.rows);
-  for (size_t function = rows.size(); function-- > 0;)
+  // From the most rows down, to the first function in which a chunk does not
+  // split: those of fewer rows decide nothing (minimumRows), and timing them
+  // took a quarter of an M5 Max's calibration.
+  for (size_t function = rows.size(); function-- > 0;) {
     timings.functions.push_back({function ? rows[function - 1] + 1 : rows.front(), rows[function],
                                  layer(layers_, count(rows[function]), rows[function], &split,
                                        low.milliseconds + slope * (rows[function] - low.rows))});
+    if (!splitsEvery(timings, timings.functions.back())) break;
+  }
   return timings;
 }
 

@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -59,8 +60,13 @@ struct Model final {
 // unit either way, is least at its longest (AneFfnCalibration.cpp); none if
 // `model` predicts no gain worth the split there on `gpuAlone` milliseconds
 // of the GPU alone.
+// With `compiled`, which tells whether the ANE's service holds the program
+// of a split of given units, a choice whose program it does not hold gives
+// way to the nearest units it does hold whose T at its longest is within
+// the timings' noise of the choice's.
 [[nodiscard]] std::optional<uint32_t> choose(const Model &model, double gpuAlone, uint32_t units,
-                                             uint32_t maxAneUnits);
+                                             uint32_t maxAneUnits,
+                                             const std::function<bool(uint32_t)> &compiled = {});
 
 // A chunk's FFN layer in milliseconds: the GPU's alone at the least and the
 // most rows of the split's functions, and the split's of each function, from
@@ -79,8 +85,12 @@ struct ChunkTimings final {
 };
 // The least rows of a chunk the split takes: those from which every larger
 // chunk of the functions splits (AneFfnCalibration.cpp); none when not even
-// a chunk of the most rows does.
+// a chunk of the most rows does. Functions past the first in which a chunk
+// does not split decide nothing, so `timings` may end there.
 [[nodiscard]] std::optional<uint32_t> minimumRows(const ChunkTimings &timings);
+// Whether every chunk `function` runs splits, against the GPU alone of
+// `timings`: when one does not, functions of fewer rows decide nothing.
+[[nodiscard]] bool splitsEvery(const ChunkTimings &timings, const ChunkTimings::Function &function);
 
 // When a split that serves loses to the GPU alone (AneFfnCalibration.cpp):
 // over each kWindow commands it finishes, the Neural Engine's milliseconds

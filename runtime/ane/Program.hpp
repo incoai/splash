@@ -95,6 +95,12 @@ public:
   // loads it, under `limits`.
   Program(std::string_view mil, std::span<const uint8_t> weights, Limits limits,
           const std::filesystem::path &cache = cacheDirectory());
+  // Whether constructing the program of `mil` and `weights` would load it
+  // without compiling it: `cache` keeps its source and the service holds
+  // its compilation. Asks the service under `limits`, compiling and loading
+  // nothing.
+  [[nodiscard]] static bool compiled(std::string_view mil, std::span<const uint8_t> weights, Limits limits,
+                                     const std::filesystem::path &cache = cacheDirectory());
   // Unloads the program as unload() does, without throwing: an unload whose
   // wait the limits end stays queued, and the service runs it in turn.
   ~Program();

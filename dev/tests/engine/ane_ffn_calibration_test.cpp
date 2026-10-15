@@ -97,6 +97,19 @@ void testChoice() {
           "the M6 without its bandwidth term did not choose 23 units");
 }
 
+// A choice whose program the ANE's service does not hold gives way to the nearest units it holds within 2% of the
+// choice's T at its longest: of 100 units, 33 (13.6) gives way to 32 (13.8, 1.5% longer), before 34 (14.0, 2.9% longer)
+// as near, and to nothing beyond it; a held choice, or one with no units held near it, stays.
+void testCompiledChoice() {
+  const Model model = fit({0.25, 15, 15}, {0.75, 5, 30});
+  const auto held = [&](std::vector<uint32_t> units) {
+    return choose(model, 20, 100, 99, [units](uint32_t aneUnits) { return std::ranges::count(units, aneUnits) > 0; });
+  };
+  require(held({33}) == 33u && held({}) == 33u && held({20, 50}) == 33u, "a held choice or one held near nothing moved");
+  require(held({32}) == 32u && held({32, 34}) == 32u, "the choice did not give way to units held within the noise");
+  require(held({34}) == 33u && held({31}) == 33u, "the choice gave way to units beyond the noise");
+}
+
 // Timings that put T at zero or below, or that are not numbers, choose nothing.
 void testUnusable() {
   require(!choose(fit({0.5, 1, 1}, {0.6, -0.1, 0.0}), 20, 34, 33), "T of zero chose units");
@@ -185,6 +198,18 @@ void testMinimumRows() {
            {ascending, "ascending functions"}, {gapped, "functions with a gap"}, {empty, "no functions"},
            {reversed, "GPU timings out of order"}})
     rejects([&] { static_cast<void>(minimumRows(timings)); }, "not those of its functions", what + " were taken");
+  // Every chunk of a function splits, or the functions below decide nothing: those timings may end there.
+  const ChunkTimings slow = functions(0.8, {{896, 1.2 * gpuAt(896)}});
+  const auto at = [&](uint32_t rows) {
+    return *std::ranges::find(slow.functions, rows, &ChunkTimings::Function::rows);
+  };
+  require(splitsEvery(slow, at(1024)) && !splitsEvery(slow, at(896)) && !splitsEvery(functions(0.8, {{640, 5.5}}),
+                                                                                       functions(0.8, {{640, 5.5}}).functions[11]),
+          "a function was not judged by its least chunk");
+  ChunkTimings ending = slow;
+  ending.functions.resize(10);
+  require(minimumRows(ending) == minimumRows(slow), "timings ending at the first function that does not split decide "
+                                                     "other least rows");
 }
 
 // The breaker against the GPU alone on the line through 8 ms at 512 rows and 20 at 2048, 4 ms + rows / 128: a window
@@ -240,6 +265,7 @@ int main() {
     testFit();
     testBandwidth();
     testChoice();
+    testCompiledChoice();
     testUnusable();
     testMostUnits();
     testNoGain();

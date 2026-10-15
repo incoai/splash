@@ -79,8 +79,15 @@ Model fit(const Timing &low, const Timing &high) {
 // and it need not. Chunks of fewer rows, which the ANE pads up to its
 // functions' rows, move T's least lower still; minimumRows keeps the split
 // from the chunks it loses. The choice runs only if T there gains
-// kMinimumGain on the GPU alone.
-std::optional<uint32_t> choose(const Model &model, double gpuAlone, uint32_t units, uint32_t maxAneUnits) {
+// kMinimumGain on the GPU alone. Starts calibrate the same split a unit
+// either way within their timings' noise (9 or 10 of Qwen3.8-27B's 34 units
+// on an M5 Max, 27 or 28 on an M4), and a split of other units than the
+// service holds compiles its program, 12 s on an M5 Max and 38 s on an M4:
+// so a choice the service does not hold gives way to the nearest units it
+// does whose T at its longest is within kChunkNoise of the choice's, those
+// before it among two as near.
+std::optional<uint32_t> choose(const Model &model, double gpuAlone, uint32_t units, uint32_t maxAneUnits,
+                               const std::function<bool(uint32_t)> &compiled) {
   if (!maxAneUnits || maxAneUnits >= units) throw std::invalid_argument("ANE FFN choice of no feasible units");
   std::vector<double> at(units);
   for (uint32_t aneUnits = 1; aneUnits < units; ++aneUnits) {
@@ -94,6 +101,13 @@ std::optional<uint32_t> choose(const Model &model, double gpuAlone, uint32_t uni
   for (uint32_t aneUnits = 2; aneUnits <= maxAneUnits; ++aneUnits)
     if (longest(aneUnits) < longest(chosen)) chosen = aneUnits;
   if (!(at[chosen] <= (1.0 - kMinimumGain) * gpuAlone)) return std::nullopt;
+  if (!compiled || compiled(chosen)) return chosen;
+  for (uint32_t distance = 1; distance < units; ++distance)
+    for (const uint32_t aneUnits : {chosen - std::min(distance, chosen), chosen + distance})
+      if (aneUnits >= 1 && aneUnits <= maxAneUnits && aneUnits != chosen &&
+          longest(aneUnits) <= (1.0 + kChunkNoise) * longest(chosen) &&
+          at[aneUnits] <= (1.0 - kMinimumGain) * gpuAlone && compiled(aneUnits))
+        return aneUnits;
   return chosen;
 }
 
@@ -120,6 +134,11 @@ std::optional<uint32_t> minimumRows(const ChunkTimings &timings) {
       minimum = rows;
     }
   return minimum;
+}
+
+bool splitsEvery(const ChunkTimings &timings, const ChunkTimings::Function &function) {
+  // The GPU's layer takes the less the fewer rows: the least rows are the strictest.
+  return function.split <= (1.0 + kChunkNoise) * gpuAlone(timings.gpu)(function.least);
 }
 
 // Each layer the GPU waits for the Neural Engine's evaluation before it joins
