@@ -1863,7 +1863,9 @@ count, and the pass reads it as an indirect dispatch (`ComputeDispatch::indirect
 The staged tile runs gate and up in one pass where they share their routed and their shared
 formats, a gate and an up simdgroup on the same columns, bitwise the two passes' intermediate.
 The float router and alpha/beta projections run in `kernels/shared/gguf_float.metal`, and the
-token rows are gathered by one template in `kernels/shared/embedding.metal`. These plans are
+token rows are gathered by one template in `kernels/shared/embedding.metal`. Families below 9
+(M1, M2) decode and prefill entirely on the staged tiles and never touch the register tile or the
+neural accelerator. These plans are
 fixed rules of GPU family, core count, shape and format.
 
 A rotated projection rotates its input once into `LinearScratch::rotated`

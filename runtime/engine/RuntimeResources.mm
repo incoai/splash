@@ -889,6 +889,7 @@ AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &
                         std::function<bool()> cancelled) {
   auto layers = std::make_shared<const std::vector<ops::SwiGluProjections>>(model::aneFfnLayers(loaded));
   AneFfnModel model;
+  model.appleGpuFamily = backend.capabilities().appleGpuFamily;
   model.dense = !layers->empty();
   if (!model.dense) return model;
   if (const char *reason = ops::AneFfn::unsupported(*layers)) {

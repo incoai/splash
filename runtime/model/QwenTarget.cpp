@@ -248,7 +248,7 @@ metal::MetalBuffer QwenTarget::addPrefill(
 
 // The normalized rows a layer's prefill projections read.
 void QwenTarget::addPrefillNorm(PrefillStep &step, metal::MetalBuffer input, const ops::NormWeights &norm) const {
-  ops::Normalization::addRms(step.graph, input, norm, step.buffers.normalized, geometry_.hiddenSize, step.rows);
+  ops::Normalization::addRms(backend_, step.graph, input, norm, step.buffers.normalized, geometry_.hiddenSize, step.rows);
 }
 
 // The mixer output projection adds the mixer's rows to `input`.
@@ -345,7 +345,7 @@ void QwenTarget::addPrefillFfn(PrefillStep &step, uint32_t index, const Qwen3_8L
 void QwenTarget::addPrefillFfn(PrefillStep &step, uint32_t, const Qwen3_6MoeLayerWeights &layer,
                                metal::MetalBuffer residual, metal::MetalBuffer output) const {
   const QwenTargetPrefillBuffers &b = step.buffers;
-  ops::Normalization::addRms(step.graph, residual, layer.postAttentionNorm, b.normalized, geometry_.hiddenSize,
+  ops::Normalization::addRms(backend_, step.graph, residual, layer.postAttentionNorm, b.normalized, geometry_.hiddenSize,
                              step.rows);
   ops::MoE::add(step.graph, {b.normalized, residual, output, b.moe}, layer.ffn, *step.moe);
 }
@@ -392,7 +392,7 @@ metal::MetalBuffer QwenTarget::addVerifyMixer(VerifyStep &step, const QwenGdnWei
   const ops::Linear &linear = operators_.linear();
   const uint32_t layer = step.gdnLayer++;
   const ops::LinearPlan inputPlan = linear.decodePlan(mixer.inputProjection, step.lanes);
-  const ops::PreparedInput normalized = ops::Normalization::addRms(
+  const ops::PreparedInput normalized = ops::Normalization::addRms(backend_,
       step.graph, input, norm, b.normalized, geometry_.hiddenSize, step.rows, b.linearScratch, inputPlan.input());
   linear.add(step.graph,
              {.input = b.normalized, .output = b.gdnPacked, .scratch = b.linearScratch,
@@ -420,7 +420,7 @@ metal::MetalBuffer QwenTarget::addVerifyMixer(VerifyStep &step, const QwenAttent
   const ops::Linear &linear = operators_.linear();
   const uint32_t layer = step.attentionLayer++;
   const ops::LinearPlan inputPlan = linear.decodePlan(mixer.inputProjection, step.lanes);
-  const ops::PreparedInput normalized = ops::Normalization::addRms(
+  const ops::PreparedInput normalized = ops::Normalization::addRms(backend_,
       step.graph, input, norm, b.normalized, geometry_.hiddenSize, step.rows, b.linearScratch, inputPlan.input());
   linear.add(step.graph,
              {.input = b.normalized, .output = b.fullPacked, .scratch = b.linearScratch, .prepared = normalized},
@@ -450,7 +450,7 @@ void QwenTarget::addVerifyFfn(VerifyStep &step, const Qwen3_8LayerWeights &layer
   const ops::Linear &linear = operators_.linear();
   const ops::LinearPlan gateUpPlan =
       linear.decodePlan(layer.upProjection, step.lanes, ops::LinearEpilogue::GateUp, &layer.gateProjection);
-  const ops::PreparedInput normalized = ops::Normalization::addRms(
+  const ops::PreparedInput normalized = ops::Normalization::addRms(backend_,
       step.graph, residual, layer.postAttentionNorm, b.normalized, geometry_.hiddenSize, step.rows,
       b.linearScratch, gateUpPlan.input());
   linear.add(step.graph,
@@ -466,7 +466,7 @@ void QwenTarget::addVerifyFfn(VerifyStep &step, const Qwen3_8LayerWeights &layer
 void QwenTarget::addVerifyFfn(VerifyStep &step, const Qwen3_6MoeLayerWeights &layer, metal::MetalBuffer residual,
                               metal::MetalBuffer output) const {
   const QwenTargetVerifyBuffers &b = step.buffers;
-  ops::Normalization::addRms(step.graph, residual, layer.postAttentionNorm, b.normalized, geometry_.hiddenSize,
+  ops::Normalization::addRms(backend_, step.graph, residual, layer.postAttentionNorm, b.normalized, geometry_.hiddenSize,
                              step.rows);
   ops::MoE::add(step.graph, {b.normalized, residual, output, b.moe}, layer.ffn, *step.moe);
 }
@@ -476,7 +476,7 @@ void QwenTarget::addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hid
                               ops::LinearScratch scratch) const {
   const ops::Linear &linear = operators_.linear();
   const ops::LinearPlan logitsPlan = linear.decodePlan(vocabularyProjection(), lanes);
-  const ops::PreparedInput normalized = ops::Normalization::addRms(
+  const ops::PreparedInput normalized = ops::Normalization::addRms(backend_,
       graph, std::move(hidden), weightsBase_.finalNorm, finalHidden, geometry_.hiddenSize,
       lanes * ExecutionLimits::targetVerifyRows, scratch, logitsPlan.input());
   linear.add(graph,

@@ -327,7 +327,7 @@ void testDeviceValidationNamesTheMacosFloor() {
   require(older.validationError().value_or("") == "macos_26_4_required",
           "macOS 26.3 was not refused with the macOS reason");
   // The operating system is checked before the device.
-  older.appleGpuFamily = 8;
+  older.appleGpuFamily = 6;
   require(older.validationError().value_or("") == "macos_26_4_required",
           "an older macOS did not take precedence over the device's reason");
   require(older.macosVersion() == "26.3.0",
@@ -356,16 +356,20 @@ void testDeviceValidationMessageNamesWhatTheMacHas() {
   require(!device().validationMessage(),
           "the reference device has a validation message");
   const std::string needs =
-      "Splash needs Apple GPU family 9 or newer (M3 or later) on macOS 26.4 "
+      "Splash needs Apple GPU family 7 or newer (M1 or later) on macOS 26.4 "
       "or newer; this Mac has ";
-  DeviceCapabilities m2 = device();
-  m2.deviceName = "Apple M2 Max";
-  m2.appleGpuFamily = 8;
-  m2.macosPatch = 1;
-  require(m2.validationMessage().value_or("") ==
-              needs + "Apple M2 Max (Apple GPU family 8) on macOS 26.4.1 "
-                      "(apple_gpu_family_9_required)",
-          "a family-8 GPU was not named against the family required");
+  DeviceCapabilities a13 = device();
+  a13.deviceName = "Apple A13 GPU";
+  a13.appleGpuFamily = 6;
+  a13.macosPatch = 1;
+  require(a13.validationMessage().value_or("") ==
+              needs + "Apple A13 GPU (Apple GPU family 6) on macOS 26.4.1 "
+                      "(apple_gpu_family_7_required)",
+          "a family-6 GPU was not named against the family required");
+  DeviceCapabilities m1 = device();
+  m1.deviceName = "Apple M1 Max";
+  m1.appleGpuFamily = 7;
+  require(!m1.validationMessage(), "an Apple M1 Max was refused at the family floor");
   DeviceCapabilities older = device();
   older.macosMinor = 3;
   require(older.validationMessage().value_or("") ==

@@ -52,6 +52,12 @@
 
 namespace {
 
+// The register tile's lane mapping is tuned on Apple9 and later; the engine dispatches it only there (below 9 the
+// staged tiles decode and prefill), so the harness runs it only on Apple9 and later.
+bool registerTile(const splash::metal::MetalBackend &backend) {
+  return backend.capabilities().appleGpuFamily >= 9;
+}
+
 using splash::DeviceCapabilities;
 using splash::metal::BufferStorage;
 using splash::metal::CommandGraph;
@@ -279,7 +285,10 @@ int floatSegments(MetalBackend &backend, uint32_t floatColumns) {
       at(q4k.segment, 256), at(gates.segment, kFloatColumn)}});
   Projection quantizedOnly(N, K, splash::ops::BlockWeights{{at(q80.segment, 0), at(q4k.segment, 256)}});
   int failures = 0;
-  for (const auto [family, cores] : {std::pair{9u, 0u}, std::pair{10u, 0u}, std::pair{10u, 1u}}) {
+  const std::vector<std::pair<uint32_t, uint32_t>> policies =
+      registerTile(backend) ? std::vector<std::pair<uint32_t, uint32_t>>{{9u, 0u}, {10u, 0u}, {10u, 1u}}
+                            : std::vector<std::pair<uint32_t, uint32_t>>{{10u, 0u}, {10u, 1u}};
+  for (const auto [family, cores] : policies) {
     DeviceCapabilities device = backend.capabilities();
     device.appleGpuFamily = family;
     if (cores) device.gpuCoreCount = cores;
@@ -344,8 +353,9 @@ int floatSegments(MetalBackend &backend, uint32_t floatColumns) {
             });
     }
   }
-  printf("float segment: fused Q8_0|Q4_K|F32 (%u float columns) decode B1-4 (register, staged) and prefill "
-         "1/24/33/263 rows, both float tiles %s\n", floatColumns, failures ? "FAIL" : "ok");
+  printf("float segment: fused Q8_0|Q4_K|F32 (%u float columns) decode B1-4 (%s) and prefill 1/24/33/263 rows, both "
+         "float tiles %s\n",
+         floatColumns, registerTile(backend) ? "register, staged" : "staged", failures ? "FAIL" : "ok");
   return failures;
 }
 
@@ -354,6 +364,11 @@ int floatSegments(MetalBackend &backend, uint32_t floatColumns) {
 // on the same input (as the draft chains its head and selector) prepares its
 // own table and writes what it writes alone, bit for bit.
 int floatOnlyChain(MetalBackend &backend) {
+  if (!registerTile(backend)) {
+    printf("float-only projection: skipped, Apple GPU family %u runs the staged tiles\n",
+           backend.capabilities().appleGpuFamily);
+    return 0;
+  }
   constexpr uint32_t K = 1024, N = 256;
   const Tensor gates = floating(backend, N, K, 0.05f), q4k = quantized(backend, Q4K, N, K);
   const Projection floats(N, K, splash::ops::BlockWeights{{gates.segment}});
@@ -750,10 +765,13 @@ void bufferExtents(MetalBackend &backend) {
   b.moe.input = zeros(backend, uint64_t{kMaximumRows} * kHidden * 2, "moe-input");
   b.moe.residual = zeros(backend, uint64_t{kMaximumRows} * kHidden * 2, "moe-residual");
   b.moe.output = zeros(backend, uint64_t{kMaximumRows} * kHidden * 2, "moe-output");
-  for (const MoePlan &plan :
-       {MoE::decodePlan(shape, 4, MoeConfig{.expertTile = MoeExpertTile::M8, .ggufTile = MoeGgufTile::Register}),
-        MoE::decodePlan(shape, 1, MoeConfig{.expertTile = MoeExpertTile::M8, .ggufTile = MoeGgufTile::Staged}),
-        MoE::prefillPlan(shape, 33, MoeConfig{MoeExpertTile::M32})}) {
+  std::vector<MoePlan> plans;
+  if (registerTile(backend))
+    plans.push_back(
+        MoE::decodePlan(shape, 4, MoeConfig{.expertTile = MoeExpertTile::M8, .ggufTile = MoeGgufTile::Register}));
+  plans.push_back(MoE::decodePlan(shape, 1, MoeConfig{.expertTile = MoeExpertTile::M8, .ggufTile = MoeGgufTile::Staged}));
+  plans.push_back(MoE::prefillPlan(shape, 33, MoeConfig{MoeExpertTile::M32}));
+  for (const MoePlan &plan : plans) {
     allocate(backend, b, plan);
     splash::test::requireMoeExtents(backend, b.moe, m.weights, plan);
   }
@@ -831,8 +849,12 @@ int moe(MetalBackend &backend) {
              stats.downWorst, failures > before ? "FAIL" : "ok");
     }
   };
-  // Each tile runs the models of the formats it takes (makeModel).
-  for (const MoeGgufTile tile : {MoeGgufTile::Staged, MoeGgufTile::Register})
+  // Each tile runs the models of the formats it takes (makeModel); the register tile's sections run only where the
+  // engine dispatches it (Apple9 and later).
+  const std::vector<MoeGgufTile> tiles =
+      registerTile(backend) ? std::vector<MoeGgufTile>{MoeGgufTile::Staged, MoeGgufTile::Register}
+                            : std::vector<MoeGgufTile>{MoeGgufTile::Staged};
+  for (const MoeGgufTile tile : tiles)
     for (const Fmt f : tileFormats(tile))
       for (const bool oneGateUp : {false, true}) {
         if (oneGateUp && tile == MoeGgufTile::Register) continue;   // two passes whatever the formats

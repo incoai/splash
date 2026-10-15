@@ -1,7 +1,7 @@
 // GGUF projections through ops::Linear (runtime/ops/LinearGguf.cpp) in every format a tile takes (the register tile
 // all but F16, quant_register_format), against fp64 references over GGML's dequantized weights
-// (GgufFormatReference.hpp). Each check forces its tile with Linear::plan(workload, config), so every GPU runs both
-// decode tiles:
+// (GgufFormatReference.hpp). Each check forces its tile with Linear::plan(workload, config); both decode tiles run
+// on Apple9 and later, where the engine dispatches the register tile (below 9 it stages):
 // - decode: the Apple9 register tile and the staged tile at one to four lanes (three on the staged 32-row tile over
 //   NaN padding rows), every K split, each epilogue, dense inputs and sparse ones past half's range; a lane's rows
 //   equal a one-lane projection of them bitwise; the plain epilogue into fp32 (the logits) holds the values its
@@ -928,7 +928,16 @@ int main(int argc, char **argv) {
     try {
       MetalBackend backend(argv[1]);
       const Linear linear(backend.capabilities());
-      for (const LinearTile tile : {LinearTile::GgufRegister, LinearTile::GgufStaged}) {
+      // The register tile's lane mapping is tuned on Apple9 and later; the engine dispatches it only there (below 9
+      // the staged tiles decode and prefill), so its sections run only on Apple9 and later.
+      const bool registerTiles = backend.capabilities().appleGpuFamily >= 9;
+      if (!registerTiles)
+        std::cout << "register tiles: skipped, Apple GPU family " << backend.capabilities().appleGpuFamily
+                  << " runs the staged tiles\n";
+      const std::vector<LinearTile> tiles =
+          registerTiles ? std::vector<LinearTile>{LinearTile::GgufRegister, LinearTile::GgufStaged}
+                        : std::vector<LinearTile>{LinearTile::GgufStaged};
+      for (const LinearTile tile : tiles) {
         decodeTile(backend, linear, tile, false);
         fusedDecode(backend, linear, tile, false);
         gateUpPairs(backend, linear, tile);
@@ -943,7 +952,7 @@ int main(int argc, char **argv) {
       const SplitOperand down = splitOperand(backend, Q6K, {5120, 17408}, LinearEpilogue::Residual);
       const SplitOperand gdn = splitOperand(backend, IQ4XS, {12288, 5120}, LinearEpilogue::None);
       const SplitOperand gateUp = splitOperand(backend, Q4K, {17408, 5120}, LinearEpilogue::GateUp);
-      for (const LinearTile tile : {LinearTile::GgufRegister, LinearTile::GgufStaged})
+      for (const LinearTile tile : tiles)
         for (const uint32_t lanes : {1u, kMaximumLanes}) {
           splitVisibility(backend, linear, tile, {&out, &down}, lanes);
           splitVisibility(backend, linear, tile, {&gdn, &gateUp}, lanes);

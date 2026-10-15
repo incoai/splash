@@ -3,6 +3,7 @@
 #include "metal/abi/ExecutionGeometry.h"
 #include "ops/BufferExtent.hpp"
 
+#include <algorithm>
 #include <utility>
 #include <stdexcept>
 
@@ -13,7 +14,7 @@ std::string normKernel(std::string_view name, const NormWeights &weights, uint32
   return std::string(name) + (weights.float32 ? "_f32" : "");
 }
 
-PreparedInput Normalization::addRms(metal::CommandGraph &graph,
+PreparedInput Normalization::addRms(metal::MetalBackend &backend, metal::CommandGraph &graph,
                                     metal::MetalBuffer input,
                                     const NormWeights &weight,
                                     metal::MetalBuffer output, uint32_t width,
@@ -28,12 +29,20 @@ PreparedInput Normalization::addRms(metal::CommandGraph &graph,
               {input, weight.buffer, output, scratch.input, scratch.sums}, width, {rows, 1, 1});
     return {std::move(output), layout};
   }
-  if (rows <= SPLASH_STAGED_NORM_ROWS && width <= SPLASH_STAGED_NORM_WIDTH && width % 4 == 0)
-    graph.add(normKernel("norm_rms_staged", weight, width), {std::move(input), weight.buffer, output},
-              width, {rows, 1, 1}, {SPLASH_STAGED_NORM_THREADS, 1, 1});
-  else
-    graph.add(normKernel("norm_rms", weight, width), {std::move(input), weight.buffer, output},
-              width, {rows, 1, 1});
+  if (rows <= SPLASH_STAGED_NORM_ROWS && width <= SPLASH_STAGED_NORM_WIDTH && width % 4 == 0) {
+    const std::string name = normKernel("norm_rms_staged", weight, width);
+    // The driver caps the staged norm's total threads below the design width
+    // on some families (under validation, on Apple7); the kernel strides its
+    // staging/output loops by the dispatch's width, which the design width
+    // keeps elsewhere.
+    const uint32_t threads =
+        std::min<uint32_t>(SPLASH_STAGED_NORM_THREADS, backend.pipelineMaxThreads(name));
+    graph.add(name, {std::move(input), weight.buffer, output}, NormParams{width, threads},
+              {rows, 1, 1}, {threads, 1, 1});
+    return {};
+  }
+  graph.add(normKernel("norm_rms", weight, width), {std::move(input), weight.buffer, output},
+            width, {rows, 1, 1});
   return {};
 }
 

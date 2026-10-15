@@ -373,6 +373,13 @@ public:
   // as it would, but encodes and commits nothing.
   void preparePipelines(std::span<const ComputeDispatch> dispatches);
 
+  // The driver's total-thread cap for a pipeline (its
+  // maxTotalThreadsPerThreadgroup): the widest threadgroup a dispatch of it
+  // may use. Some families cap register-heavy pipelines below the design
+  // width (the vocabulary search kernel on Apple7), so ops dispatch the
+  // lesser of the two and the kernel strides its token loops by the count.
+  [[nodiscard]] uint32_t pipelineMaxThreads(std::string_view name) const;
+
   [[nodiscard]] MetalMemoryStats memoryStats() const noexcept;
   // Explicit safe-point refresh for memory admission/reclamation code. A
   // control-plane status query must use memoryStats() so it can never wait

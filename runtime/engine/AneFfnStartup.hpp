@@ -49,6 +49,10 @@ struct AneFfnModel final {
   bool dense = false;
   // Why the split does not take them; empty when it does.
   std::string unsupported;
+  // The Mac's Apple GPU family (DeviceCapabilities::appleGpuFamily), which
+  // defaults to the family the split's programs were tuned on; a Legacy
+  // family below 9 does not run them (notRunning).
+  uint32_t appleGpuFamily = 9;
   // Why this Mac cannot run the split (ane::unavailable), asked only of a
   // split that may run; none when it can.
   std::function<std::optional<std::string>()> unavailable;
