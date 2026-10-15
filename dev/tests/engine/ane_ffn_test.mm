@@ -11,7 +11,9 @@
 //   most rows compute what the GPU computes alone within int8's error, as do quiet rows, whose intermediate values
 //   fp16 barely holds, and rows of a hidden channel of about 1e5; verify() passes every function of either model and
 //   fails a function bound to another's procedure; layers it is given out of order are refused, and it keeps what it
-//   needs of the layers it was built from; an infinity in the ANE's output stops it; its program unloaded for the idle
+//   needs of the layers it was built from; with its GPU part in int8 (ops/Int8Ffn.hpp), it plans its memory and
+//   computes and verifies against the int8 FFN alone within int8's error; an infinity in the ANE's output stops it; its
+//   program unloaded for the idle
 //   release and loaded again computes what it computed before, and a command encoded or in flight refuses the
 //   release;
 // - faults: each fault of the ANE's evaluations (ane/ProgramInstrumentation.hpp) at each layer of chunks of three
@@ -582,6 +584,57 @@ void split(MetalBackend &backend, const Linear &linear, const Model &model, cons
           "verify() of every function");
 }
 
+// The split with the GPU's part in int8, given the GPU's int8 FFN of the model (ops/Int8Ffn.hpp), whose scratch it
+// shares: its planned memory, its output against that FFN's alone within int8's error, and verify() against it.
+void int8Part(MetalBackend &backend, const Model &model, const Chunk &chunk) {
+  Int8Ffn int8(backend, model.layers);
+  const auto split = std::make_unique<AneFfn>(backend, model.layers, kAneUnits, nullptr, &int8);
+  // The plan takes whole pages of each of its buffers, of which Metal may report less.
+  const uint64_t planned = AneFfn::plannedBytes(model.layers, kAneUnits, true), allocated = split->allocatedBytes();
+  if (allocated > planned || planned - allocated >= 6 * kHostPageBytes)
+    fail(model.name + ", int8: allocated " + std::to_string(allocated) + " bytes, planned " + std::to_string(planned));
+  fillRows(chunk, AneFfn::kMaximumRows, [](uint64_t) { return 1.0f; });
+  // The int8 FFN alone, and the split, over every layer of a chunk's rows.
+  const auto forwardOf = [&](bool splits, uint32_t rows) {
+    const auto &[ffn, hidden] = chunk;
+    std::memset(hidden[0].contents(), 0, hidden[0].sizeBytes());
+    CommandGraph graph;
+    if (splits) static_cast<void>(split->begin());
+    for (uint32_t layer = 0; layer < kLayers; ++layer) {
+      const MetalBuffer &residual = hidden[layer & 1], &output = hidden[(layer & 1) ^ 1];
+      if (splits)
+        split->add(graph, layer, ffn, residual, output, rows);
+      else
+        int8.add(graph, layer, ffn, residual, output, rows);
+    }
+    Forward result;
+    if (splits) {
+      static_cast<void>(split->commit(graph, {}).wait());
+      result.usable = split->finish();
+    } else {
+      run(backend, graph);
+    }
+    const uint16_t *bits = contents<uint16_t>(hidden[kLayers & 1]);
+    result.bits.assign(bits, bits + uint64_t{rows} * kHidden);
+    return result;
+  };
+  for (const uint32_t rows : {AneFfn::kMaximumRows, AneFfn::kMinimumRows, 700u}) {
+    const Forward expected = forwardOf(false, rows), got = forwardOf(true, rows);
+    const auto [error, finite] = difference(expected, got);
+    std::cout << "  " << model.name << ", int8, " << rows << " rows: " << 100.0 * error
+              << "% RMS from the int8 FFN alone\n";
+    if (!got.usable || !finite || !(error <= kMaximumError))
+      fail(model.name + ", int8, " + std::to_string(rows) + " rows: " + std::to_string(100.0 * error) +
+           "% RMS from the int8 FFN alone" + (got.usable ? "" : ", unusable: " + split->reason()));
+  }
+  const double error = split->verify(model.layers, chunk.ffn, chunk.hidden);
+  std::cout << "  " << model.name << ", int8: " << 100.0 * error
+            << "% from the int8 FFN alone on the Neural Engine's part\n";
+  if (split->retired()) fail(model.name + ", int8: verify stopped the split: " + split->reason());
+  section("split: " + model.name + " with the GPU's part in int8, its planned memory, chunks of 2048, 512 and 700 "
+          "rows against the int8 FFN alone, and verify() against it");
+}
+
 // A program whose function of 640 rows is bound to the procedure of 512 rows leaves rows of the ANE's output
 // unwritten, which verify() fails, and the split stops.
 void misbound(MetalBackend &backend, const Model &model, const Chunk &chunk) {
@@ -837,6 +890,8 @@ void split(MetalBackend &backend) {
   const Chunk buffers = chunk(backend, AneFfn::kMaximumRows);
   split(backend, linear, mlx, buffers);
   split(backend, linear, gguf, buffers);
+  int8Part(backend, mlx, buffers);
+  int8Part(backend, gguf, buffers);
   misbound(backend, mlx, buffers);
   refusals(backend, mlx, buffers);
   quietRows(backend, linear, mlx, buffers);

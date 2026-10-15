@@ -7,6 +7,7 @@
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/GDN.h"
 #include "ops/AneFfn.hpp"
+#include "ops/Int8Ffn.hpp"
 #include "ops/Linear.hpp"
 #include "ops/PagedAttention.hpp"
 #include "ops/PagedKv.hpp"
@@ -366,6 +367,7 @@ struct Runtime::Impl {
   QwenTarget targetModel;
   DFlashDraft draftModel;
   ops::AneFfn *aneFfn;
+  ops::Int8Ffn *int8Ffn;
   explicit Impl(RuntimeContext value)
       : backend(value.backend),
         model(value.model),
@@ -382,7 +384,8 @@ struct Runtime::Impl {
                         },
                         value.model.target)),
         draftModel(value.model.draft, value.backend, operators),
-        aneFfn(value.aneFfn) {
+        aneFfn(value.aneFfn),
+        int8Ffn(value.int8Ffn) {
     if (states.layout() != model.stateLayout(states.layout().target.format) ||
         kvPages.layout() != model.targetKvLayout(kvPages.layout().format)) {
       throw std::invalid_argument(
@@ -1494,7 +1497,7 @@ struct Runtime::Impl {
     const MetalBuffer finalHidden = targetModel.addPrefill(
         graph, std::move(buffers),
         std::span(modelSequences).first(batch.sequences.size()), batch.rows,
-        kvPages.layers(), aneFfn);
+        kvPages.layers(), aneFfn, int8Ffn);
     addRaggedDraftContext(graph, batch);
 
     // A lane that finishes its prompt copies the prompt's last row to row 0

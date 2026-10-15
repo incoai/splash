@@ -307,7 +307,8 @@ RuntimeResources::RuntimeResources(
     std::unique_ptr<model::QwenStateStorage> stateStorage,
     std::unique_ptr<KvPageTier> kvTier, std::unique_ptr<DiskSpace> diskSpace,
     std::unique_ptr<KvPool> kvPool, std::unique_ptr<engine::Cache> cache,
-    std::unique_ptr<ops::AneFfn> aneFfn, AneFfnOutcome aneFfnOutcome)
+    std::unique_ptr<ops::AneFfn> aneFfn, AneFfnOutcome aneFfnOutcome,
+    std::unique_ptr<ops::Int8Ffn> int8Ffn)
     : persistentCache_(std::move(persistentCache)),
       backend_(std::move(backend)), model_(std::move(model)),
       operators_(std::move(operators)),
@@ -318,7 +319,7 @@ RuntimeResources::RuntimeResources(
       diskSpace_(std::move(diskSpace)), kvPool_(std::move(kvPool)),
       cache_(std::move(cache)), aneFfn_(std::move(aneFfn)),
       releasableMemory_(*model_.images, idleSplit(aneFfn_.get())),
-      aneFfnOutcome_(std::move(aneFfnOutcome)) {}
+      aneFfnOutcome_(std::move(aneFfnOutcome)), int8Ffn_(std::move(int8Ffn)) {}
 
 std::unique_ptr<RuntimeResources>
 RuntimeResources::create(const RuntimeResourcesConfig &config,
@@ -480,6 +481,15 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         RuntimeResourceStage::MemoryPlanning,
         std::string("model allocated-size plan is invalid: ") + error.what());
   }
+  // A dense target's prefill FFN runs in int8 on the GPU of an M5 or later,
+  // whose int8 matmul runs at about twice its bf16 rate, and so does the GPU's
+  // part of the Neural Engine split there. The FFN is built once the governor
+  // admits Metal operations (below), before the split's timing and
+  // preparation, which take it.
+  const std::vector<ops::SwiGluProjections> ffnLayers = model::aneFfnLayers(loaded);
+  const bool int8 = !ffnLayers.empty() && !ops::Int8Ffn::unsupported(device, ffnLayers);
+  const uint64_t int8FfnBytes = int8 ? ops::Int8Ffn::plannedBytes(ffnLayers) : 0;
+  std::unique_ptr<ops::Int8Ffn> int8Ffn;
   // The engine's memory plan, with `stagingBytes` set aside for the disk
   // tier's state staging and `aneFfnBytes` for the prefill FFN's Neural Engine
   // split.
@@ -491,6 +501,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         modelMemoryPlan,
         stagingBytes,
         aneFfnBytes,
+        int8FfnBytes,
     };
     ModelMemoryProfile modelProfile{
         loaded.name(), loaded.maximumContextTokens(),
@@ -501,7 +512,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   const auto planMemory = [&](uint64_t aneFfnBytes) { return planWith(stateStagingBytes, aneFfnBytes); };
   // The model's side of the split (startAneFfn).
   const AneFfnModel splitModel =
-      aneFfnModel(*backend, loaded, operators, config.kvFormat, config.buildId, config.cancelled);
+      aneFfnModel(*backend, loaded, operators, config.kvFormat, config.buildId, config.cancelled,
+                  int8 ? &int8Ffn : nullptr);
   EngineMemoryPlanResult planResult = planMemory(0);
   // The automatic tier keeps its staging only where the plan holds the model
   // and the requested context beside it. The split wins over it: where the
@@ -568,6 +580,11 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     memoryGovernor->setServing(true);
     logLine("Kernel policy for GPU family ", device.appleGpuFamily,
             " with ", device.gpuCoreCount, " cores.");
+    if (int8) {
+      int8Ffn = std::make_unique<ops::Int8Ffn>(*backend, ffnLayers);
+      logLine("The GPU runs the prefill FFN of chunks of ", ops::Int8Ffn::kMinimumRows,
+              " rows or more in int8, rotated as the Neural Engine split rotates its own.");
+    }
     // The split leaves the context asked for, else a relaunch's.
     const RequestedContext splitContext =
         requestedContextTokens ? RequestedContext{.tokens = requestedContextTokens}
@@ -725,7 +742,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         std::move(operators), std::move(memoryPlan), std::move(cacheIdentity),
         std::move(memoryGovernor), std::move(kvPages), std::move(stateStorage),
         std::move(kvTier), std::move(diskSpace), std::move(kvPool), std::move(cache),
-        std::move(aneFfn.split), std::move(aneFfn.outcome)));
+        std::move(aneFfn.split), std::move(aneFfn.outcome), std::move(int8Ffn)));
     result->adoptPersistentCache();
     return result;
   } catch (const metal::MetalAllocationError &error) {
@@ -840,6 +857,7 @@ model::RuntimeContext RuntimeResources::modelContext() noexcept {
       *stateStorage_,
       operators_,
       aneFfn_.get(),
+      int8Ffn_.get(),
   };
 }
 
@@ -872,6 +890,7 @@ ActualMemoryReport RuntimeResources::actualMemoryReport(
   report.kvAllocatedBytes = kvPool_->allocatedBytes();
   report.stateStagingBytes = modelMemory.stateStagingBytes;
   report.aneFfnBytes = aneFfn_ ? aneFfn_->allocatedBytes() : 0;
+  report.int8FfnBytes = int8Ffn_ ? int8Ffn_->allocatedBytes() : 0;
   // Optional warmup may end with a rolled-back allocation and no subsequent
   // command. Refresh the current counts after that rollback; peaks stay intact.
   metal::MetalMemoryStats memory = backend_->refreshMemoryStats();
@@ -886,7 +905,7 @@ ActualMemoryReport RuntimeResources::actualMemoryReport(
 
 AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &loaded,
                         const ops::ExecutionPlans &operators, kv::Format format, std::string_view buildId,
-                        std::function<bool()> cancelled) {
+                        std::function<bool()> cancelled, const std::unique_ptr<ops::Int8Ffn> *int8) {
   auto layers = std::make_shared<const std::vector<ops::SwiGluProjections>>(model::aneFfnLayers(loaded));
   AneFfnModel model;
   model.dense = !layers->empty();
@@ -897,29 +916,33 @@ AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &
   }
   model.unavailable = [] { return ane::unavailable(); };
   model.units = ops::AneFfn::units(*layers);
-  model.plannedBytes = [layers](uint32_t aneUnits) { return ops::AneFfn::plannedBytes(*layers, aneUnits); };
+  model.plannedBytes = [layers, int8](uint32_t aneUnits) {
+    return ops::AneFfn::plannedBytes(*layers, aneUnits, int8 != nullptr);
+  };
   const auto onArena = [&backend, &loaded, &operators, format](const auto &use) {
     model::withPrefillArena(backend, loaded, operators, format, use);
   };
-  model.time = [&backend, layers, cancelled, onArena] {
+  model.time = [&backend, layers, cancelled, onArena, int8] {
     ops::ane_ffn::Timings timings;
     onArena([&](const ops::PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden) {
-      timings = ops::ane_ffn::Measurement(backend, *layers, ffn, hidden, cancelled).time();
+      timings = ops::ane_ffn::Measurement(backend, *layers, ffn, hidden, cancelled, int8 ? int8->get() : nullptr).time();
     });
     return timings;
   };
-  model.prepare = [&backend, layers, cancelled, onArena](uint32_t aneUnits, bool timeChunks) {
+  model.prepare = [&backend, layers, cancelled, onArena, int8](uint32_t aneUnits, bool timeChunks) {
     AneFfnPrepared prepared;
     onArena([&](const ops::PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden) {
-      prepared.split = std::make_unique<ops::AneFfn>(backend, *layers, aneUnits, cancelled);
+      ops::Int8Ffn *const gpu = int8 ? int8->get() : nullptr;
+      prepared.split = std::make_unique<ops::AneFfn>(backend, *layers, aneUnits, cancelled, gpu);
       prepared.error = prepared.split->verify(*layers, ffn, hidden);
       if (timeChunks)
         prepared.chunks =
-            ops::ane_ffn::Measurement(backend, *layers, ffn, hidden, cancelled).chunks(*prepared.split);
+            ops::ane_ffn::Measurement(backend, *layers, ffn, hidden, cancelled, gpu).chunks(*prepared.split);
     });
     return prepared;
   };
-  const std::string key = calibrationKey(*layers) + " device " + backend.capabilities().deviceName + " macos " +
+  const std::string key = calibrationKey(*layers) + (int8 ? " int8" : "") + " device " +
+                          backend.capabilities().deviceName + " macos " +
                           [[NSProcessInfo processInfo] operatingSystemVersionString].UTF8String + " build " +
                           std::string(buildId) + " most ";
   model.recall = [key](uint32_t maxAneUnits) -> std::optional<ops::ane_ffn::Calibration> {

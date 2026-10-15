@@ -112,7 +112,7 @@ access.
 | `--request-timeout` | None | Time a request may take from its arrival; a request's own `timeout` can only shorten it. |
 | `--queue-size` | `32` | Requests admitted at once, running or waiting; more get 503 with `Retry-After`. |
 | `--decode-share` | `0.5` | Decode time owed per unit of prefill time while other requests generate. Higher keeps their output faster during a long prompt and slows that prompt; `0` alternates one command each. |
-| `--disable-ane` | Off | Prefill on the GPU alone. By default a dense model's long prompts also use the Neural Engine when that is faster. See [Neural Engine prefill](#neural-engine-prefill). |
+| `--disable-ane` | Off | Prefill on the GPU alone. By default a dense model's long prompts also use the Neural Engine when that is faster. See [Neural Engine prefill](#neural-engine-prefill); on an M5 or later the GPU's part runs in int8 either way ([GPU int8 prefill](#gpu-int8-prefill)). |
 | `--allow-idle-sleep` | Off | Let the Mac sleep automatically while requests run; by default it stays awake until they finish (the display may still sleep). |
 
 Sizes (`--max-memory`, `--max-cache-disk`, `--max-cache-disk-writes`,
@@ -1931,7 +1931,8 @@ other GGUF tile.
 Prefill chunks of a dense target split each layer's FFN by intermediate
 channel (`runtime/ops/AneFfn.cpp`), from the least rows startup finds the split
 faster at (below). The GPU runs the leading
-channels on its prefill kernels, its down projection reading a view of the
+channels on its prefill kernels (in int8 on an M5 or later, as
+[GPU int8 prefill](#gpu-int8-prefill) describes), its down projection reading a view of the
 leading inputs of down's rows (`Projection::leadingInputs`) through instances
 of the residual kernels of their own (`<kernel>_leading_inputs`), which run
 the residual kernel's tile on the weight planes advanced past the inputs the
@@ -1996,7 +1997,7 @@ calibrates (below), times the split as a prefill runs it
 of the same layer, a stand-in for the mixer, which the GPU's layer alone timed
 alike takes away again, the median of three. On five FFN layers spread over the
 model's depth, with the ANE taking the 512-channel units nearest 0.4 and 0.8 of
-them in programs of one 2048-row function, which the ANE service keeps once
+them (0.15 and 0.5 with the GPU's part in int8) in programs of one 2048-row function, which the ANE service keeps once
 compiled, it times the split layer and its GPU part alone, and the GPU's layer
 alone, each over commands of the first four full-chunk layers, the fifth
 staged. It fits `T(s) = max(A(s), G(s) + u·A(s))`
@@ -2101,7 +2102,7 @@ context where a calibration made anew would serve another.
 `make test-engine-metal` runs `ane-ffn`: its kernels
 against CPU references for every image format under shader
 validation, then, without it, the split's memory and its output against the GPU
-alone, the same output once its program is unloaded and loaded again, a chunk's
+alone, also with its GPU part in int8 against the int8 FFN alone, the same output once its program is unloaded and loaded again, a chunk's
 rows on the GPU alone as a full chunk's, `verify()` of every function and of a
 function the client's instrumented build
 (`runtime/ane/ProgramInstrumentation.hpp`) binds to another's procedure, each
@@ -2116,6 +2117,51 @@ the model runtime oracle with the GPU alone, with the GPU alone over a BF16
 state (`--state-format bf16`), and with the split as a start makes it, which
 must not be unavailable, and whose automatic context must be what the plan
 holds with the split it runs.
+
+### GPU int8 prefill
+
+On an M5 or later GPU (Apple10), whose int8 matmul runs at about twice its bf16
+rate, prefill chunks of 256 rows or more of a dense target run each layer's FFN
+in int8 by the [Neural Engine split](#neural-engine-prefill)'s W8A8 algorithm
+(`runtime/ops/Int8Ffn.cpp`, `kernels/prefill/int8_ffn.metal`): the normalized
+rows rotated in Hadamard blocks of 128 and the intermediate rows in blocks of
+512, with the split's signs, each quantized to int8 per token, and the weights
+rotated alike and quantized to int8 per row, under scales startup computes once.
+MPP `matmul2d` multiplies them into int32, and each output takes its token's and
+its row's scales in fp32; gate and up run as one dispatch whose epilogue applies
+silu, down as one that adds the residual. The model keeps its weights as they
+are: a command converts each layer's from its planes into one set of int8 rows
+every layer reuses, each GEMM dispatch converting the next one's beside its own
+tiles (gate and up's down's, down's the next layer's gate and up) in
+threadgroups past the GEMM's on a 2D grid, whose order keeps the weight tiles
+cached (a 1D grid ran the GEMM 21% slower). Int4 weight codes (W4A8) ran no
+faster, the GEMM being compute-bound, and requantizing the rotated weights to 4
+bits left 40 times the KL. On Qwen3.8-27B on an M5 Max an FFN layer of 2048
+rows takes 13.9 ms against 22.9 on the bf16 kernels, 512 rows 4.5 against 5.9
+and 256 rows break even, so smaller chunks keep the bf16 kernels; the matmuls
+run at about 92 TOPS, the conversion takes about 1.5 ms a layer. A 2048-token
+prefill takes 1694 against 2273 ms (MLX 4-bit) and 1748 against 2317 ms
+(UD-Q4_K_M). The FFN's output differs from the bf16 kernels' by 2-3% RMS, as
+the split's int8 does, and the logits by a KL of about 5e-4 (24 prompts of 512
+to 2048 tokens, the top token unchanged). Its buffers are a memory category of
+their own (`GPU int8 FFN`, 309 MiB on Qwen3.8-27B), out of the KV cache;
+earlier GPUs run the kernels no faster than bf16 and keep the bf16 kernels.
+There the [Neural Engine split](#neural-engine-prefill) runs its GPU part in
+int8 too, over views of the leading channels, sharing the int8 FFN's scratch
+(two int8 FFNs never add layers to one command, whose layers each converts the
+next one's weights for), and calibration and `verify()` take the int8 FFN as
+the GPU alone, which runs the chunks the split does not. The split's
+stand-in for the mixer stays on the bf16 kernels, timed apart. On Qwen3.8-27B
+on an M5 Max calibration takes 6 of the 34 units over chunks of 1601 rows or
+more (7 units over every chunk from 512 rows measured 2-4% faster, 8 units no
+faster than the GPU alone), and a prompt of 2K, 4K and 8K tokens prefills in
+1761, 3456 and 6985 ms, against 1814, 3581 and 7135 with `--disable-ane`,
+1998, 4025 and 8208 for the split on the bf16 kernels and 2400, 4797 and 9772
+on the bf16 kernels alone; the logits differ from the bf16 kernels' by a KL of
+about 6e-4 (24 prompts, the top token unchanged). `make test-engine-metal` runs `int8-ffn`: the layers, GPUs and
+chunks it takes, its output against the bf16 kernels' on MLX and GGUF layers at
+256, 300 and 2048 rows and with a hidden channel of about 1e5, the rows past a
+chunk untouched, and a layer added out of order.
 
 ### Residency and KV extents
 

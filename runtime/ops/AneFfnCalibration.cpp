@@ -54,10 +54,11 @@ double Model::operator()(double share) const noexcept {
 
 // The model, from the split's layers as they run between stand-ins for the
 // mixer (Measurement). The GPU's part alone gives G at both shares. At the
-// high share, near 0.8, the ANE's part takes the longer on every Mac the
-// split was measured on, whose fastest full chunks of Qwen3.8-27B's split
-// layers take 8-9 of its 34 units on an M5 Max, 14-15 on an M5 Pro and 26-27
-// on an M6: the split layer there is A, which scales with the ANE's channels.
+// high share, near 0.8 (0.5 with the GPU's part in int8), the ANE's part
+// takes the longer on every Mac the split was measured on, whose fastest full
+// chunks of Qwen3.8-27B's split layers take 8-9 of its 34 units on an M5 Max
+// (6-7 with the GPU's part in int8), 14-15 on an M5 Pro and 26-27 on an M6:
+// the split layer there is A, which scales with the ANE's channels.
 // Where the GPU's part takes the longer at the low share, the split layer
 // there exceeds it by the bandwidth the ANE's part takes beside it, which
 // gives u: on an M6 the GPU's part runs a tenth to a third longer beside the

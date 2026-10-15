@@ -15,6 +15,7 @@
 #include "engine/ReleasableMemory.hpp"
 #include "engine/Status.hpp"
 #include "ops/ExecutionPlans.hpp"
+#include "ops/Int8Ffn.hpp"
 
 #include <condition_variable>
 #include <cstdint>
@@ -269,7 +270,8 @@ private:
                    std::unique_ptr<DiskSpace> diskSpace,
                    std::unique_ptr<KvPool> kvPool,
                    std::unique_ptr<engine::Cache> cache,
-                   std::unique_ptr<ops::AneFfn> aneFfn, AneFfnOutcome aneFfnOutcome);
+                   std::unique_ptr<ops::AneFfn> aneFfn, AneFfnOutcome aneFfnOutcome,
+                   std::unique_ptr<ops::Int8Ffn> int8Ffn);
   // Takes back the restore points the last process left in a persistent
   // tier (Cache::adopt) and opens its files for this one.
   void adoptPersistentCache();
@@ -293,6 +295,8 @@ private:
   // Over model_'s images and aneFfn_.
   ReleasableMemory releasableMemory_;
   AneFfnOutcome aneFfnOutcome_;
+  // The GPU's int8 prefill FFN, on an M5 or later (ops::Int8Ffn::unsupported).
+  std::unique_ptr<ops::Int8Ffn> int8Ffn_;
   // Ends a probation once it has lasted, unless the process stops first.
   std::thread probation_;
   std::mutex probationMutex_;
@@ -307,9 +311,14 @@ private:
 // remembered beside the programs (ane::recall) under its layers' shapes and
 // formats, the device, the macOS version, the engine's `buildId` and the
 // most units the plan holds.
+// With `int8`, which holds the GPU's int8 FFN of the model by the time the
+// split is timed or prepared, the split runs its GPU part in int8 and is
+// timed and checked against that FFN (ops::AneFfn); the plan counts its
+// memory from the start.
 [[nodiscard]] AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &loaded,
                                       const ops::ExecutionPlans &operators, kv::Format format,
-                                      std::string_view buildId, std::function<bool()> cancelled);
+                                      std::string_view buildId, std::function<bool()> cancelled,
+                                      const std::unique_ptr<ops::Int8Ffn> *int8 = nullptr);
 
 // Connects an engine to the governor that admits its memory: the engine asks
 // it whether the host pauses growth, and marks the allocations a request in

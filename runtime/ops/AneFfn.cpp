@@ -20,6 +20,14 @@
 #include <utility>
 
 namespace splash::ops {
+
+std::array<float, ANE_FFN_INTERMEDIATE_BLOCK> aneFfnRotationSigns() {
+  std::mt19937 generator(20260930);
+  std::array<float, ANE_FFN_INTERMEDIATE_BLOCK> signs{};
+  for (float &sign : signs) sign = (generator() & 1) ? -1.0f : 1.0f;
+  return signs;
+}
+
 namespace {
 
 using Element = ane::Surface::Element;
@@ -111,15 +119,6 @@ uint32_t blockOf(Rotation rotation) {
 }
 std::string kernel(const char *name, Rotation rotation) {
   return std::string(name) + (rotation == Rotation::Inputs ? "_inputs" : "_intermediate");
-}
-
-// The Hadamard signs D of the rotations R = D H / sqrt(n) of inputs, weights
-// and the ANE's intermediate rows alike: a block of n values takes the first n.
-std::array<float, ANE_FFN_INTERMEDIATE_BLOCK> rotationSigns() {
-  std::mt19937 generator(20260930);
-  std::array<float, ANE_FFN_INTERMEDIATE_BLOCK> signs{};
-  for (float &sign : signs) sign = (generator() & 1) ? -1.0f : 1.0f;
-  return signs;
 }
 
 // The program's constant: the rotation of each of the ANE's intermediate
@@ -238,10 +237,11 @@ AneFfn::Memory AneFfn::allocate(const Shape &shape, MakeBuffer &&buffer, MakeSur
   return memory;
 }
 
-uint64_t AneFfn::plannedBytes(std::span<const SwiGluProjections> layers, uint32_t aneUnits) {
-  uint64_t bytes = 0;
+uint64_t AneFfn::plannedBytes(std::span<const SwiGluProjections> layers, uint32_t aneUnits, bool int8) {
+  const Shape shape = shapeOf(layers, aneUnits);
+  uint64_t bytes = int8 ? Int8Ffn::plannedBytes(shape.hidden, shape.gpu, shape.layers, true) : 0;
   static_cast<void>(allocate(
-      shapeOf(layers, aneUnits),
+      shape,
       [&](uint64_t size, const char *) {
         bytes += alignUp(size);
         return metal::MetalBuffer{};
@@ -387,12 +387,12 @@ std::string AneFfn::program(const Shape &shape, std::span<const Input> inputs, c
 }
 
 AneFfn::AneFfn(metal::MetalBackend &backend, std::span<const SwiGluProjections> layers, uint32_t aneUnits,
-               std::function<bool()> interrupted)
-    : AneFfn(backend, layers, aneUnits, std::move(interrupted), functionRows()) {}
+               std::function<bool()> interrupted, Int8Ffn *int8)
+    : AneFfn(backend, layers, aneUnits, std::move(interrupted), functionRows(), int8) {}
 
 AneFfn::AneFfn(metal::MetalBackend &backend, std::span<const SwiGluProjections> layers, uint32_t aneUnits,
-               std::function<bool()> interrupted, std::span<const uint32_t> functionRows)
-    : backend_(backend), linear_(backend.capabilities()), shape_(shapeOf(layers, aneUnits)),
+               std::function<bool()> interrupted, std::span<const uint32_t> functionRows, Int8Ffn *int8)
+    : backend_(backend), linear_(backend.capabilities()), int8Alone_(int8), shape_(shapeOf(layers, aneUnits)),
       handoff_(backend, kHandoffBound) {
   // What Metal allocates, which the memory audit compares with the plan.
   memory_ = allocate(
@@ -407,7 +407,7 @@ AneFfn::AneFfn(metal::MetalBackend &backend, std::span<const SwiGluProjections> 
         allocatedBytes_ += surface.buffer.allocatedBytes();
         return surface;
       });
-  const std::array<float, ANE_FFN_INTERMEDIATE_BLOCK> signs = rotationSigns();
+  const std::array<float, ANE_FFN_INTERMEDIATE_BLOCK> signs = aneFfnRotationSigns();
   std::memcpy(memory_.signs.contents(), signs.data(), sizeof signs);
   *static_cast<uint32_t *>(memory_.status.contents()) = 0;
 
@@ -416,6 +416,12 @@ AneFfn::AneFfn(metal::MetalBackend &backend, std::span<const SwiGluProjections> 
                        source.gate->leadingRows(backend_, shape_.gpu),
                        source.up->leadingRows(backend_, shape_.gpu),
                        source.down->leadingInputs(shape_.gpu)});
+  if (int8Alone_) {
+    std::vector<SwiGluProjections> views;
+    for (const Layer &layer : layers_) views.push_back({&layer.gate, &layer.up, &layer.down});
+    int8_ = std::make_unique<Int8Ffn>(backend_, views, int8Alone_);
+    allocatedBytes_ += int8_->allocatedBytes();
+  }
 
   const std::vector<Input> inputs = programInputs(shape_, memory_);
   program_ = std::make_unique<ane::Program>(program(shape_, inputs, memory_.partial, functionRows),
@@ -545,7 +551,10 @@ void AneFfn::encode(metal::CommandGraph &graph, uint32_t layer, const PrefillFfn
               {tiles, kSegment / ANE_FFN_TILE, 1}, {ANE_FFN_TILE, ANE_FFN_TILE_ROWS, 1});
   const uint64_t ready = ane ? handoff_.next() : 0;
   if (ane) graph.signal(handoff_.event(), ready);
-  linear_.addPrefillSwiGlu(graph, {&current.gate, &current.up, &current.down}, ffn, residual, output, rows);
+  if (int8_)
+    int8_->add(graph, layer, ffn, residual, output, rows);
+  else
+    linear_.addPrefillSwiGlu(graph, {&current.gate, &current.up, &current.down}, ffn, residual, output, rows);
   if (layer + 1 < layers_.size()) addWeights(graph, layer + 1, set ^ 1);
   const uint64_t done = ane ? handoff_.next() : 0;
   if (ane) graph.wait(handoff_.event(), done);
@@ -685,7 +694,9 @@ double AneFfn::verify(std::span<const SwiGluProjections> layers, const PrefillFf
     metal::CommandGraph graph;
     for (uint32_t layer = 0; layer < count; ++layer) {
       const metal::MetalBuffer &residual = hidden[layer & 1], &output = hidden[(layer & 1) ^ 1];
-      if (way == Way::Gpu)
+      if (way == Way::Gpu && int8Alone_)
+        int8Alone_->add(graph, layer, ffn, residual, output, rows);
+      else if (way == Way::Gpu)
         linear_.addPrefillSwiGlu(graph, layers[layer], ffn, residual, output, rows);
       else
         encode(graph, layer, ffn, residual, output, rows, way == Way::Split ? Parts::Both : Parts::Gpu);

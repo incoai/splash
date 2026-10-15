@@ -44,6 +44,9 @@ struct ModelMemoryFootprint final {
   // The prefill FFN's Neural Engine split (ops::AneFfn::plannedBytes); zero
   // without one.
   uint64_t aneFfnBytes = 0;
+  // The GPU's int8 prefill FFN (ops::Int8Ffn::plannedBytes); zero without
+  // one.
+  uint64_t int8FfnBytes = 0;
 };
 
 struct ModelMemoryProfile final {
@@ -130,6 +133,7 @@ struct EngineMemoryBreakdown {
   uint64_t pipelineReserveBytes = 0;
   uint64_t runtimeOverheadReserveBytes = 0;
   uint64_t aneFfnBytes = 0;
+  uint64_t int8FfnBytes = 0;
   uint64_t stateStagingBytes = 0;
   uint64_t fixedRuntimeBytes = 0;
 

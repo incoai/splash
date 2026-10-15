@@ -37,6 +37,8 @@ struct ActualMemoryReport {
     uint64_t stateStagingBytes = 0;
     // The prefill FFN's Neural Engine split; zero without one.
     uint64_t aneFfnBytes = 0;
+    // The GPU's int8 prefill FFN; zero without one.
+    uint64_t int8FfnBytes = 0;
 
     uint64_t backendAllocatedBytes = 0;
     uint64_t deviceCurrentAllocatedBytes = 0;

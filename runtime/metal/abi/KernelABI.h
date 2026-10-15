@@ -14,6 +14,7 @@
 #include "metal/abi/RowCopy.h"
 #include "metal/abi/Sampling.h"
 #include "metal/abi/Vision.h"
+#include "metal/abi/Int8Ffn.h"
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 #include <metal_stdlib>
 

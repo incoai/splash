@@ -80,6 +80,7 @@ MemoryAuditResult auditActualMemory(const EngineMemoryPlan &plan,
       {"KV", actual.kvAllocatedBytes, budget.kvCapacityBytes},
       {"state staging", actual.stateStagingBytes, budget.stateStagingBytes},
       {"Neural Engine split", actual.aneFfnBytes, budget.aneFfnBytes},
+      {"GPU int8 FFN", actual.int8FfnBytes, budget.int8FfnBytes},
   };
   for (const Category &category : categories) {
     if (category.actual > category.planned) {

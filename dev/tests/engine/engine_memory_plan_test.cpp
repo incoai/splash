@@ -212,9 +212,10 @@ void testDiskTierStateStagingIsBudgeted() {
           "a plan without the disk tier reported state staging");
 }
 
-// The prefill FFN's Neural Engine split is fixed runtime memory of its own
-// category, which the KV cache gives up, so the context it leaves is the
-// plan's to state; the status and description report it.
+// The prefill FFN's Neural Engine split, and the GPU's int8 FFN, are fixed
+// runtime memory of their own categories, which the KV cache gives up, so the
+// context they leave is the plan's to state; the status and description
+// report them.
 void testNeuralEngineSplitIsBudgeted() {
   const EngineMemoryPlan without = test::requireMemoryPlan(device(), model());
   ModelMemoryProfile split = model();
@@ -228,11 +229,22 @@ void testNeuralEngineSplitIsBudgeted() {
               with.maximumContextTokens() < without.maximumContextTokens(),
           "the split was not planned as fixed runtime memory out of the KV cache");
   require(with.toStatusJson().find("\"ane_ffn_bytes\":" + std::to_string(surfaces) +
-                                   ",\"state_staging_bytes\"") != std::string::npos &&
+                                   ",\"int8_ffn_bytes\":0,\"state_staging_bytes\"") != std::string::npos &&
               budget.describe().find("Neural Engine split: " + std::to_string(surfaces)) !=
                   std::string::npos &&
               without.toStatusJson().find("\"ane_ffn_bytes\":0,") != std::string::npos,
           "the split is missing from the memory plan status");
+  // The GPU's int8 FFN of Qwen3.8-27B (ops::Int8Ffn::plannedBytes).
+  ModelMemoryProfile int8 = model();
+  const uint64_t int8Bytes = 309 * kMiB;
+  int8.footprint.int8FfnBytes = int8Bytes;
+  const EngineMemoryPlan withInt8 = test::requireMemoryPlan(device(), int8);
+  require(withInt8.breakdown().int8FfnBytes == int8Bytes &&
+              withInt8.breakdown().fixedRuntimeBytes == without.breakdown().fixedRuntimeBytes + int8Bytes &&
+              withInt8.toStatusJson().find("\"int8_ffn_bytes\":" + std::to_string(int8Bytes) + ",") !=
+                  std::string::npos &&
+              withInt8.breakdown().describe().find("GPU int8 FFN: " + std::to_string(int8Bytes)) != std::string::npos,
+          "the GPU's int8 FFN was not planned as fixed runtime memory");
 }
 
 // The pipeline and runtime reserves are the model constants rather than part
